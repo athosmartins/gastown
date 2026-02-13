@@ -999,6 +999,42 @@ func (t *Tmux) AcceptBypassPermissionsWarning(session string) error {
 	return nil
 }
 
+// AcceptWorkspaceTrustPrompt accepts Claude Code's workspace trust prompt.
+// This prompt appears before the bypass permissions warning and asks
+// "Is this a project you created or one you trust?"
+// Option 1 is "Yes, I trust this folder"
+func (t *Tmux) AcceptWorkspaceTrustPrompt(session string) error {
+	// Wait longer for the dialog to render (trust prompt can be slow)
+	time.Sleep(3 * time.Second)
+
+	// Check if the workspace trust prompt is present
+	content, err := t.CapturePane(session, 30)
+	if err != nil {
+		return err
+	}
+
+	// Look for the characteristic trust prompt text
+	if !strings.Contains(content, "Yes, I trust this folder") {
+		// Prompt not present, nothing to do
+		return nil
+	}
+
+	// Send "1" to select option 1 (Yes, I trust this folder)
+	if _, err := t.run("send-keys", "-t", session, "1"); err != nil {
+		return err
+	}
+
+	// Small delay to let selection update
+	time.Sleep(200 * time.Millisecond)
+
+	// Press Enter to confirm
+	if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // GetPaneCommand returns the current command running in a pane.
 // Returns "bash", "zsh", "claude", "node", etc.
 func (t *Tmux) GetPaneCommand(session string) (string, error) {

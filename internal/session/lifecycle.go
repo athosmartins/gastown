@@ -200,7 +200,14 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (*StartResult, error) {
 		_ = t.ConfigureGasTownSession(cfg.SessionID, *cfg.Theme, cfg.RigName, cfg.AgentName, cfg.Role)
 	}
 
-	// 8. Wait for agent to start.
+	// 8. Accept workspace trust prompt and bypass permissions warning FIRST.
+	// These block Claude from starting, so must come before WaitForAgent.
+	if cfg.AcceptBypass {
+		_ = t.AcceptWorkspaceTrustPrompt(cfg.SessionID)
+		_ = t.AcceptBypassPermissionsWarning(cfg.SessionID)
+	}
+
+	// 9. Wait for agent to start (after accepting prompts).
 	if cfg.WaitForAgent {
 		if err := t.WaitForCommand(cfg.SessionID, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
 			if cfg.WaitFatal {
@@ -210,16 +217,11 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (*StartResult, error) {
 		}
 	}
 
-	// 9. Auto-respawn hook.
+	// 10. Auto-respawn hook.
 	if cfg.AutoRespawn {
 		if err := t.SetAutoRespawnHook(cfg.SessionID); err != nil {
 			fmt.Printf("warning: failed to set auto-respawn hook for %s: %v\n", cfg.Role, err)
 		}
-	}
-
-	// 10. Accept bypass permissions warning.
-	if cfg.AcceptBypass {
-		_ = t.AcceptBypassPermissionsWarning(cfg.SessionID)
 	}
 
 	// 11. Ready delay.

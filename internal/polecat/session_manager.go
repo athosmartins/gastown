@@ -276,11 +276,14 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	agentID := fmt.Sprintf("%s/%s", m.rig.Name, polecat)
 	debugSession("SetPaneDiedHook", m.tmux.SetPaneDiedHook(sessionID, agentID))
 
-	// Wait for Claude to start (non-fatal)
-	debugSession("WaitForCommand", m.tmux.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout))
+	// Accept workspace trust prompt FIRST (blocks Claude from starting)
+	debugSession("AcceptWorkspaceTrustPrompt", m.tmux.AcceptWorkspaceTrustPrompt(sessionID))
 
 	// Accept bypass permissions warning dialog if it appears
 	debugSession("AcceptBypassPermissionsWarning", m.tmux.AcceptBypassPermissionsWarning(sessionID))
+
+	// Wait for Claude to start (non-fatal) - comes AFTER accepting prompts
+	debugSession("WaitForCommand", m.tmux.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout))
 
 	// Wait for runtime to be fully ready at the prompt (not just started)
 	runtime.SleepForReadyDelay(runtimeConfig)
