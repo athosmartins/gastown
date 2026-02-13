@@ -1004,35 +1004,70 @@ func (t *Tmux) AcceptBypassPermissionsWarning(session string) error {
 // "Is this a project you created or one you trust?"
 // Option 1 is "Yes, I trust this folder"
 func (t *Tmux) AcceptWorkspaceTrustPrompt(session string) error {
-	// Wait longer for the dialog to render (trust prompt can be slow)
-	time.Sleep(3 * time.Second)
+	// Poll for the trust prompt to appear, checking every second for up to 15 seconds.
+	// Claude shows the prompt after initialization, but we must catch it before it times out.
+	const maxAttempts = 15
+	const pollInterval = time.Second
 
-	// Check if the workspace trust prompt is present
-	content, err := t.CapturePane(session, 30)
-	if err != nil {
-		return err
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		fmt.Printf("[DEBUG AcceptWorkspaceTrustPrompt] Attempt %d/%d\n", attempt, maxAttempts)
+
+		// Check if session still exists
+		running, _ := t.HasSession(session)
+		if !running {
+			fmt.Printf("[DEBUG AcceptWorkspaceTrustPrompt] Session died, giving up\n")
+			return fmt.Errorf("session %s no longer exists", session)
+		}
+
+		// Capture pane content
+		content, err := t.CapturePane(session, 30)
+		if err != nil {
+			fmt.Printf("[DEBUG AcceptWorkspaceTrustPrompt] CapturePane error: %v\n", err)
+			time.Sleep(pollInterval)
+			continue
+		}
+
+		fmt.Printf("[DEBUG AcceptWorkspaceTrustPrompt] Captured %d bytes\n", len(content))
+
+		// Look for the characteristic trust prompt text
+		if strings.Contains(content, "Yes, I trust this folder") {
+			fmt.Printf("[DEBUG AcceptWorkspaceTrustPrompt] Trust prompt found! Sending '1' + Enter\n")
+
+			// Send "1" to select option 1 (Yes, I trust this folder)
+			if _, err := t.run("send-keys", "-t", session, "1"); err != nil {
+				fmt.Printf("[DEBUG AcceptWorkspaceTrustPrompt] Error sending '1': %v\n", err)
+				return err
+			}
+
+			// Small delay to let selection update
+			time.Sleep(200 * time.Millisecond)
+
+			// Press Enter to confirm
+			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
+				fmt.Printf("[DEBUG AcceptWorkspaceTrustPrompt] Error sending Enter: %v\n", err)
+				return err
+			}
+
+			fmt.Printf("[DEBUG AcceptWorkspaceTrustPrompt] Successfully accepted trust prompt\n")
+			return nil
+		}
+
+		// Prompt not found yet, wait and try again
+		if attempt < maxAttempts {
+			time.Sleep(pollInterval)
+		}
 	}
 
-	// Look for the characteristic trust prompt text
-	if !strings.Contains(content, "Yes, I trust this folder") {
-		// Prompt not present, nothing to do
-		return nil
-	}
-
-	// Send "1" to select option 1 (Yes, I trust this folder)
-	if _, err := t.run("send-keys", "-t", session, "1"); err != nil {
-		return err
-	}
-
-	// Small delay to let selection update
-	time.Sleep(200 * time.Millisecond)
-
-	// Press Enter to confirm
-	if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
-		return err
-	}
-
+	// Trust prompt never appeared - maybe it was already trusted?
+	fmt.Printf("[DEBUG AcceptWorkspaceTrustPrompt] Trust prompt never appeared after %d attempts, continuing\n", maxAttempts)
 	return nil
+}
+
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen]
 }
 
 // GetPaneCommand returns the current command running in a pane.

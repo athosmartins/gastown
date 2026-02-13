@@ -1616,6 +1616,16 @@ func SanitizeAgentEnv(resolvedEnv, callerEnv map[string]string) {
 			resolvedEnv["NODE_OPTIONS"] = ""
 		}
 	}
+
+	// CLAUDECODE is set by parent Claude sessions and prevents nested sessions.
+	// Claude checks this and immediately exits with:
+	// "Error: Claude Code cannot be launched inside another Claude Code session"
+	// Must always clear it for agent sessions spawned from another Claude session.
+	if _, ok := callerEnv["CLAUDECODE"]; !ok {
+		if _, ok := resolvedEnv["CLAUDECODE"]; !ok {
+			resolvedEnv["CLAUDECODE"] = ""
+		}
+	}
 }
 
 // PrependEnv prepends export statements to a command string.

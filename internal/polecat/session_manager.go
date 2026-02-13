@@ -236,6 +236,11 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		return fmt.Errorf("creating session: %w", err)
 	}
 
+	// CRITICAL: Accept workspace trust prompt IMMEDIATELY after session creation.
+	// Claude shows this prompt first and will timeout/exit if not accepted quickly.
+	// Must happen before any other operations to catch the prompt in time.
+	debugSession("AcceptWorkspaceTrustPrompt", m.tmux.AcceptWorkspaceTrustPrompt(sessionID))
+
 	// Set environment (non-fatal: session works without these)
 	// Use centralized AgentEnv for consistency across all role startup paths
 	// Note: townRoot already defined above for ResolveRoleAgentConfig
@@ -276,10 +281,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	agentID := fmt.Sprintf("%s/%s", m.rig.Name, polecat)
 	debugSession("SetPaneDiedHook", m.tmux.SetPaneDiedHook(sessionID, agentID))
 
-	// Accept workspace trust prompt FIRST (blocks Claude from starting)
-	debugSession("AcceptWorkspaceTrustPrompt", m.tmux.AcceptWorkspaceTrustPrompt(sessionID))
-
-	// Accept bypass permissions warning dialog if it appears
+	// Accept bypass permissions warning dialog if it appears (trust prompt already accepted above)
 	debugSession("AcceptBypassPermissionsWarning", m.tmux.AcceptBypassPermissionsWarning(sessionID))
 
 	// Wait for Claude to start (non-fatal) - comes AFTER accepting prompts
