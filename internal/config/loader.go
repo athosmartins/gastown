@@ -1495,6 +1495,10 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 		resolvedEnv[k] = v
 	}
 
+	// Explicitly clear NODE_OPTIONS to prevent debugger flags from breaking agents
+	// (NODE_OPTIONS may be inherited from parent shell/tmux server environment)
+	resolvedEnv["NODE_OPTIONS"] = ""
+
 	// Build environment export prefix
 	var exports []string
 	for k, v := range resolvedEnv {
