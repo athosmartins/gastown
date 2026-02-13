@@ -230,14 +230,14 @@ func (b *Beads) run(args ...string) ([]byte, error) {
 
 	err := cmd.Run()
 	if err != nil {
-		return nil, b.wrapError(err, stderr.String(), args)
+		return nil, b.wrapError(err, stderr.String(), stdout.String(), args)
 	}
 
 	// Handle bd exit code 0 bug: when issue not found,
 	// bd may exit 0 but write error to stderr with empty stdout.
 	// Detect this case and treat as error to avoid JSON parse failures.
 	if stdout.Len() == 0 && stderr.Len() > 0 {
-		return nil, b.wrapError(fmt.Errorf("command produced no output"), stderr.String(), args)
+		return nil, b.wrapError(fmt.Errorf("command produced no output"), stderr.String(), "", args)
 	}
 
 	return stdout.Bytes(), nil
@@ -254,8 +254,9 @@ func (b *Beads) Run(args ...string) ([]byte, error) {
 // ZFC: Avoid parsing stderr to make decisions. Transport errors to agents instead.
 // Exception: ErrNotInstalled (exec.ErrNotFound) and ErrNotFound (issue lookup) are
 // acceptable as they enable basic error handling without decision-making.
-func (b *Beads) wrapError(err error, stderr string, args []string) error {
+func (b *Beads) wrapError(err error, stderr, stdout string, args []string) error {
 	stderr = strings.TrimSpace(stderr)
+	stdout = strings.TrimSpace(stdout)
 
 	// Check for bd not installed
 	if execErr, ok := err.(*exec.Error); ok && errors.Is(execErr.Err, exec.ErrNotFound) {
@@ -263,10 +264,13 @@ func (b *Beads) wrapError(err error, stderr string, args []string) error {
 	}
 
 	// ErrNotFound is widely used for issue lookups - acceptable exception
-	// Match various "not found" error patterns from bd
-	if strings.Contains(stderr, "not found") || strings.Contains(stderr, "Issue not found") ||
-		strings.Contains(stderr, "no issue found") {
-		return ErrNotFound
+	// Match various "not found" error patterns from bd (both stderr and stdout)
+	// When bd is called with --json, errors go to stdout as JSON
+	notFoundPatterns := []string{"not found", "Issue not found", "no issue found"}
+	for _, pattern := range notFoundPatterns {
+		if strings.Contains(stderr, pattern) || strings.Contains(stdout, pattern) {
+			return ErrNotFound
+		}
 	}
 
 	if stderr != "" {

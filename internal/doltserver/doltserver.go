@@ -1056,6 +1056,17 @@ func FindOrCreateRigBeadsDir(townRoot, rigName string) (string, error) {
 func GetActiveConnectionCount(townRoot string) (int, error) {
 	config := DefaultConfig(townRoot)
 
+	// Check if dolt is available before trying to use it
+	// If dolt isn't installed, we're not in server mode, so return 0 (no capacity check needed)
+	if _, err := exec.LookPath("dolt"); err != nil {
+		return 0, nil
+	}
+
+	// Check if Dolt data directory exists - if not, server mode isn't configured
+	if _, err := os.Stat(config.DataDir); os.IsNotExist(err) {
+		return 0, nil
+	}
+
 	// Use dolt sql-client to query the server with a timeout to prevent
 	// hanging indefinitely if the Dolt server is unresponsive.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
