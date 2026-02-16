@@ -47,6 +47,7 @@ Infrastructure checks:
 Cleanup checks (fixable):
   - orphan-sessions          Detect orphaned tmux sessions
   - orphan-processes         Detect orphaned Claude processes
+  - session-names            Detect malformed session names from pre-Feb-15 code
   - wisp-gc                  Detect and clean abandoned wisps (>1h)
   - stale-beads-redirect     Detect stale files in .beads directories with redirects
 
@@ -155,6 +156,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewRoutingModeCheck())
 	d.Register(doctor.NewOrphanSessionCheck())
 	d.Register(doctor.NewZombieSessionCheck())
+	d.Register(doctor.NewSessionNamesCheck())
 	d.Register(doctor.NewOrphanProcessCheck())
 	d.Register(doctor.NewWispGCCheck())
 	d.Register(doctor.NewCheckMisclassifiedWisps())
