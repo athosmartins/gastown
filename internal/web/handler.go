@@ -32,6 +32,7 @@ type ConvoyFetcher interface {
 	FetchHooks() ([]HookRow, error)
 	FetchMayor() (*MayorStatus, error)
 	FetchIssues() ([]IssueRow, error)
+	FetchReadyWork() ([]ReadyWorkRow, error)
 	FetchActivity() ([]ActivityRow, error)
 }
 
@@ -79,12 +80,13 @@ func (h *ConvoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		hooks       []HookRow
 		mayor       *MayorStatus
 		issues      []IssueRow
+		readyWork   []ReadyWorkRow
 		activity    []ActivityRow
 		wg          sync.WaitGroup
 	)
 
 	// Run all fetches in parallel with error logging
-	wg.Add(14)
+	wg.Add(15)
 
 	go func() {
 		defer wg.Done()
@@ -193,6 +195,14 @@ func (h *ConvoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer wg.Done()
 		var err error
+		readyWork, err = h.fetcher.FetchReadyWork()
+		if err != nil {
+			log.Printf("dashboard: FetchReadyWork failed: %v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		var err error
 		activity, err = h.fetcher.FetchActivity()
 		if err != nil {
 			log.Printf("dashboard: FetchActivity failed: %v", err)
@@ -233,6 +243,7 @@ func (h *ConvoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Hooks:       hooks,
 		Mayor:       mayor,
 		Issues:      enrichIssuesWithAssignees(issues, hooks),
+		ReadyWork:   readyWork,
 		Activity:    activity,
 		Summary:     summary,
 		Expand:      expandPanel,

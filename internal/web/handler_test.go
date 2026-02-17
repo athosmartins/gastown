@@ -31,6 +31,7 @@ type MockConvoyFetcher struct {
 	Hooks       []HookRow
 	Mayor       *MayorStatus
 	Issues      []IssueRow
+	ReadyWork   []ReadyWorkRow
 	Activity    []ActivityRow
 	Error       error
 }
@@ -85,6 +86,10 @@ func (m *MockConvoyFetcher) FetchMayor() (*MayorStatus, error) {
 
 func (m *MockConvoyFetcher) FetchIssues() ([]IssueRow, error) {
 	return m.Issues, nil
+}
+
+func (m *MockConvoyFetcher) FetchReadyWork() ([]ReadyWorkRow, error) {
+	return m.ReadyWork, nil
 }
 
 func (m *MockConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
@@ -1052,6 +1057,10 @@ func (m *MockConvoyFetcherWithErrors) FetchMayor() (*MayorStatus, error) {
 }
 
 func (m *MockConvoyFetcherWithErrors) FetchIssues() ([]IssueRow, error) {
+	return nil, nil
+}
+
+func (m *MockConvoyFetcherWithErrors) FetchReadyWork() ([]ReadyWorkRow, error) {
 	return nil, nil
 }
 

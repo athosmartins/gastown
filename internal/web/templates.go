@@ -28,6 +28,7 @@ type ConvoyData struct {
 	Hooks       []HookRow
 	Mayor       *MayorStatus
 	Issues      []IssueRow
+	ReadyWork   []ReadyWorkRow
 	Activity    []ActivityRow
 	Summary     *DashboardSummary
 	Expand      string // Panel to show fullscreen (from ?expand=name)
@@ -121,6 +122,16 @@ type IssueRow struct {
 	Age      string // Time since created
 	Labels   string // Comma-separated labels
 	Assignee string // Who it's hooked to (empty if unassigned)
+}
+
+// ReadyWorkRow represents a ready-to-assign user-facing bead in the Next Ready Work panel.
+type ReadyWorkRow struct {
+	ID       string // Bead ID (e.g., "gt-abc12")
+	Title    string // Issue title (truncated to 60 chars)
+	Type     string // bug, feature, task
+	TypeIcon string // Emoji icon for type
+	Priority int    // 1=critical, 2=high, 3=medium, 4=low
+	Age      string // Time since created
 }
 
 // ActivityRow represents an event in the activity feed.

@@ -3339,3 +3339,28 @@
         .sling-dropdown-item + .sling-dropdown-item {
             border-top: 1px solid var(--border);
         }
+
+        /* Next Ready Work panel */
+        .panel-ready-work {
+            grid-column: 1 / -1; /* Full width */
+        }
+
+        .ready-work-count {
+            background: var(--green);
+            color: var(--bg-dark);
+            border-radius: 12px;
+            padding: 2px 8px;
+            font-size: 0.8rem;
+        }
+
+        .ready-work-row.priority-1 {
+            border-left: 3px solid var(--red);
+        }
+
+        .ready-work-row.priority-2 {
+            border-left: 3px solid var(--orange);
+        }
+
+        .ready-work-type-icon {
+            font-size: 1rem;
+        }

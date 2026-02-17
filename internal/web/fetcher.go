@@ -1586,6 +1586,90 @@ func (f *LiveConvoyFetcher) FetchIssues() ([]IssueRow, error) {
 	return rows, nil
 }
 
+// FetchReadyWork returns up to 10 unblocked, unhooked user-facing beads (task/bug/feature),
+// sorted by priority then age, for the Next Ready Work panel.
+func (f *LiveConvoyFetcher) FetchReadyWork() ([]ReadyWorkRow, error) {
+	stdout, err := f.runBdCmd(f.townRoot, "ready", "--json", "--limit=50")
+	if err != nil {
+		return nil, fmt.Errorf("fetching ready work: %w", err)
+	}
+
+	var beads []struct {
+		ID        string   `json:"id"`
+		Title     string   `json:"title"`
+		IssueType string   `json:"issue_type"`
+		Priority  int      `json:"priority"`
+		Labels    []string `json:"labels"`
+		CreatedAt string   `json:"created_at"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &beads); err != nil {
+		return nil, fmt.Errorf("parsing ready work: %w", err)
+	}
+
+	var rows []ReadyWorkRow
+	for _, b := range beads {
+		// Only include user-facing types
+		switch b.IssueType {
+		case "task", "bug", "feature":
+			// pass
+		default:
+			continue
+		}
+		// Exclude wisps (belt-and-suspenders guard)
+		if strings.Contains(b.ID, "wisp") {
+			continue
+		}
+
+		typeIcon := "✅"
+		switch b.IssueType {
+		case "bug":
+			typeIcon = "🐛"
+		case "feature":
+			typeIcon = "✨"
+		}
+
+		title := b.Title
+		if len(title) > 60 {
+			title = title[:57] + "..."
+		}
+
+		row := ReadyWorkRow{
+			ID:       b.ID,
+			Title:    title,
+			Type:     b.IssueType,
+			TypeIcon: typeIcon,
+			Priority: b.Priority,
+		}
+		if b.CreatedAt != "" {
+			if t, err := time.Parse(time.RFC3339, b.CreatedAt); err == nil {
+				row.Age = formatMailAge(time.Since(t))
+			}
+		}
+
+		rows = append(rows, row)
+		if len(rows) >= 10 {
+			break
+		}
+	}
+
+	// Sort by priority (1=critical first), then age (older first)
+	sort.Slice(rows, func(i, j int) bool {
+		pi, pj := rows[i].Priority, rows[j].Priority
+		if pi == 0 {
+			pi = 5
+		}
+		if pj == 0 {
+			pj = 5
+		}
+		if pi != pj {
+			return pi < pj
+		}
+		return rows[i].Age > rows[j].Age
+	})
+
+	return rows, nil
+}
+
 // FetchActivity returns recent activity from the event log.
 func (f *LiveConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
 	eventsPath := filepath.Join(f.townRoot, ".events.jsonl")

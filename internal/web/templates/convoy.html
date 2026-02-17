@@ -115,6 +115,53 @@
         {{end}}
 
         <div class="panels">
+            <!-- Next Ready Work Panel -->
+            <div class="panel panel-ready-work" id="ready-work-panel">
+                <div class="panel-header">
+                    <h2>🎯 Next Ready Work</h2>
+                    <span class="count{{if .ReadyWork}} ready-work-count{{end}}">{{len .ReadyWork}}</span>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
+                    <button class="expand-btn">Expand</button>
+                </div>
+                <div class="panel-body">
+                    {{if .ReadyWork}}
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Pri</th>
+                                <th>ID</th>
+                                <th>Type</th>
+                                <th>Title</th>
+                                <th>Age</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {{range .ReadyWork}}
+                            <tr class="issue-row ready-work-row priority-{{.Priority}}">
+                                <td>
+                                    {{if eq .Priority 1}}<span class="badge badge-red">P1</span>
+                                    {{else if eq .Priority 2}}<span class="badge badge-orange">P2</span>
+                                    {{else if eq .Priority 3}}<span class="badge badge-yellow">P3</span>
+                                    {{else}}<span class="badge badge-muted">P4</span>{{end}}
+                                </td>
+                                <td><span class="issue-id">{{.ID}}</span></td>
+                                <td><span class="ready-work-type-icon" title="{{.Type}}">{{.TypeIcon}}</span></td>
+                                <td class="issue-title">{{.Title}}</td>
+                                <td>{{.Age}}</td>
+                                <td><button class="sling-btn" data-bead-id="{{.ID}}" title="Sling to rig">Sling</button></td>
+                            </tr>
+                            {{end}}
+                        </tbody>
+                    </table>
+                    {{else}}
+                    <div class="empty-state">
+                        <p>No ready work — all beads blocked</p>
+                    </div>
+                    {{end}}
+                </div>
+            </div>
+
             <!-- Row 1: Convoys, Polecats, Sessions -->
 
             <!-- Convoys Panel -->
