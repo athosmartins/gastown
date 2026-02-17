@@ -1426,6 +1426,15 @@
     // ============================================
     // READY WORK PANEL
     // ============================================
+
+    // Returns a hardcoded emoji for bead type — no user input, safe to use as textContent.
+    function readyTypeIcon(t) {
+        if (t === 'bug')     return '🐛';
+        if (t === 'feature') return '✨';
+        if (t === 'task')    return '✅';
+        return '📋';
+    }
+
     function loadReady() {
         var loading = document.getElementById('ready-loading');
         var table = document.getElementById('ready-table');
@@ -1447,25 +1456,57 @@
 
                     data.items.forEach(function(item) {
                         var tr = document.createElement('tr');
-                        var rowClass = '';
-                        if (item.priority === 1) rowClass = 'ready-p1';
-                        else if (item.priority === 2) rowClass = 'ready-p2';
-                        tr.className = rowClass;
+                        if (item.priority === 1) tr.className = 'ready-p1';
+                        else if (item.priority === 2) tr.className = 'ready-p2';
 
-                        var priBadge = '';
-                        if (item.priority === 1) priBadge = '<span class="badge badge-red">P1</span>';
-                        else if (item.priority === 2) priBadge = '<span class="badge badge-orange">P2</span>';
-                        else if (item.priority === 3) priBadge = '<span class="badge badge-yellow">P3</span>';
-                        else priBadge = '<span class="badge badge-muted">P4</span>';
+                        // Priority badge
+                        var priBadgeClass = 'badge-muted';
+                        if (item.priority === 1) priBadgeClass = 'badge-red';
+                        else if (item.priority === 2) priBadgeClass = 'badge-orange';
+                        else if (item.priority === 3) priBadgeClass = 'badge-yellow';
+                        var tdPri = document.createElement('td');
+                        var priSpan = document.createElement('span');
+                        priSpan.className = 'badge ' + priBadgeClass;
+                        priSpan.textContent = 'P' + (item.priority || '?');
+                        tdPri.appendChild(priSpan);
 
-                        var sourceClass = item.source === 'town' ? 'ready-source ready-source-town' : 'ready-source';
+                        // Bead ID
+                        var tdId = document.createElement('td');
+                        var idSpan = document.createElement('span');
+                        idSpan.className = 'ready-id';
+                        idSpan.textContent = item.id || '';
+                        tdId.appendChild(idSpan);
 
-                        tr.innerHTML =
-                            '<td>' + priBadge + '</td>' +
-                            '<td><span class="ready-id">' + escapeHtml(item.id) + '</span></td>' +
-                            '<td><span class="ready-title">' + escapeHtml(item.title || '') + '</span></td>' +
-                            '<td><span class="' + sourceClass + '">' + escapeHtml(item.source) + '</span></td>' +
-                            '<td><button class="sling-btn" data-bead-id="' + escapeHtml(item.id) + '" title="Sling to rig">Sling</button></td>';
+                        // Title (truncated to 60 chars)
+                        var tdTitle = document.createElement('td');
+                        var titleSpan = document.createElement('span');
+                        titleSpan.className = 'ready-title';
+                        var title = item.title || '';
+                        titleSpan.textContent = title.length > 60 ? title.substring(0, 60) + '…' : title;
+                        tdTitle.appendChild(titleSpan);
+
+                        // Type icon (hardcoded emoji, no user input)
+                        var tdType = document.createElement('td');
+                        var typeSpan = document.createElement('span');
+                        typeSpan.className = 'ready-type';
+                        typeSpan.title = item.type || '';
+                        typeSpan.textContent = readyTypeIcon(item.type);
+                        tdType.appendChild(typeSpan);
+
+                        // Sling action
+                        var tdAction = document.createElement('td');
+                        var slingBtn = document.createElement('button');
+                        slingBtn.className = 'sling-btn';
+                        slingBtn.setAttribute('data-bead-id', item.id || '');
+                        slingBtn.title = 'Sling to rig';
+                        slingBtn.textContent = 'Sling';
+                        tdAction.appendChild(slingBtn);
+
+                        tr.appendChild(tdPri);
+                        tr.appendChild(tdId);
+                        tr.appendChild(tdTitle);
+                        tr.appendChild(tdType);
+                        tr.appendChild(tdAction);
                         tbody.appendChild(tr);
                     });
 
@@ -1482,8 +1523,9 @@
             });
     }
 
-    // Load ready work on page load
+    // Load ready work on page load and refresh every 10s.
     loadReady();
+    setInterval(loadReady, 10000);
     // Expose for refresh after HTMX swaps
     window.refreshReadyPanel = loadReady;
 

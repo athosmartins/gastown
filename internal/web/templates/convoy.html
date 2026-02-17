@@ -115,7 +115,35 @@
         {{end}}
 
         <div class="panels">
-            <!-- Row 1: Convoys, Polecats, Sessions -->
+            <!-- Row 1: Next Ready Work, Convoys, Polecats, Sessions -->
+
+            <!-- Next Ready Work Panel -->
+            <div class="panel" id="ready-panel">
+                <div class="panel-header">
+                    <h2>🎯 Next Ready Work</h2>
+                    <span class="count" id="ready-count">0</span>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
+                    <button class="expand-btn">Expand</button>
+                </div>
+                <div class="panel-body">
+                    <div class="loading-state" id="ready-loading">Loading ready work...</div>
+                    <table id="ready-table" style="display: none;">
+                        <thead>
+                            <tr>
+                                <th>Pri</th>
+                                <th>ID</th>
+                                <th>Title</th>
+                                <th>Type</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="ready-tbody"></tbody>
+                    </table>
+                    <div class="empty-state" id="ready-empty" style="display: none;">
+                        <p>No ready work — all beads blocked</p>
+                    </div>
+                </div>
+            </div>
 
             <!-- Convoys Panel -->
             <div class="panel" id="convoy-panel">

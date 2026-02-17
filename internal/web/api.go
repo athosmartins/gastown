@@ -1741,14 +1741,15 @@ func formatCrewActivityAge(age time.Duration) string {
 	}
 }
 
-// handleReady returns ready work items across town.
+// handleReady returns ready work items across town, filtered to user-facing beads only.
+// Only task, bug, and feature types are returned; wisps and molecule steps are excluded.
 func (h *APIHandler) handleReady(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
 	// Run gt ready --json to get ready work
 	output, err := h.runGtCommand(ctx, 12*time.Second, []string{"ready", "--json"})
-	
+
 	resp := ReadyResponse{
 		Items:    make([]ReadyItem, 0),
 		BySource: make(map[string][]ReadyItem),
@@ -1760,7 +1761,8 @@ func (h *APIHandler) handleReady(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse the JSON output from gt ready
+	// Parse the JSON output from gt ready.
+	// Note: the JSON field is "issue_type" (not "type").
 	var readyData struct {
 		Sources []struct {
 			Name   string `json:"name"`
@@ -1768,7 +1770,7 @@ func (h *APIHandler) handleReady(w http.ResponseWriter, r *http.Request) {
 				ID       string `json:"id"`
 				Title    string `json:"title"`
 				Priority int    `json:"priority"`
-				Type     string `json:"type"`
+				Type     string `json:"issue_type"`
 			} `json:"issues"`
 		} `json:"sources"`
 		Summary struct {
@@ -1785,9 +1787,27 @@ func (h *APIHandler) handleReady(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Convert to ReadyItem format
+	// User-facing bead types shown in the "Next Ready Work" panel.
+	userFacing := map[string]bool{"task": true, "bug": true, "feature": true}
+
+	// Convert to ReadyItem format, filtering to user-facing beads only.
+	const maxItems = 10
 	for _, src := range readyData.Sources {
+		if len(resp.Items) >= maxItems {
+			break
+		}
 		for _, issue := range src.Issues {
+			if len(resp.Items) >= maxItems {
+				break
+			}
+			// Skip infrastructure: wisps, molecule steps.
+			if strings.Contains(issue.ID, "wisp-") || strings.Contains(issue.ID, "mol-") {
+				continue
+			}
+			// Skip non-user-facing types (convoy, event, epic, etc).
+			if !userFacing[issue.Type] {
+				continue
+			}
 			item := ReadyItem{
 				ID:       issue.ID,
 				Title:    issue.Title,

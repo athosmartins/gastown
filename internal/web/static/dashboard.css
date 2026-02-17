@@ -194,6 +194,25 @@
         .activity-red .activity-dot { background: var(--red); box-shadow: 0 0 6px var(--red); }
         .activity-unknown .activity-dot { background: var(--text-muted); }
 
+        /* Ready Work panel */
+        .ready-id {
+            color: var(--cyan);
+            font-family: 'SF Mono', 'Menlo', monospace;
+            font-size: 0.75rem;
+        }
+        .ready-title {
+            color: var(--text-primary);
+        }
+        .ready-type {
+            font-size: 1rem;
+        }
+        .ready-p1 {
+            border-left: 3px solid var(--red);
+        }
+        .ready-p2 {
+            border-left: 3px solid var(--orange);
+        }
+
         /* Convoy-specific styles */
         .convoy-row {
             cursor: pointer;
