@@ -309,6 +309,21 @@ an idle state.
 
 ---
 
+## ntfy Notifications
+
+When the user asks you to "notify me when done" or "send me a notification", use:
+
+```bash
+notify 'Work complete: <description>'
+notify -t 'Title' -p 4 'High priority message'
+notify -p 5 'URGENT: Critical issue found'
+```
+
+The `notify` command is at `~/.local/bin/notify` and works from any agent session.
+Topic is hardcoded — no configuration needed.
+
+---
+
 ## Do NOT
 
 - Push to main (Refinery does this)
