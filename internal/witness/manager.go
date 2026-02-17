@@ -83,6 +83,23 @@ func (m *Manager) witnessDir() string {
 	return m.rig.Path
 }
 
+// killLegacySessions kills witness sessions with old naming formats (pre-gix74).
+// The session naming changed in gt-gix74 from "gt-{rigName}-witness" to
+// "{rigPrefix}-witness". Old sessions survive upgrades as zombies because the
+// new format doesn't match the old name and they are never cleaned up.
+func (m *Manager) killLegacySessions(t *tmux.Tmux) {
+	legacyName := session.LegacyWitnessSessionName(m.rig.Name)
+	// Skip if legacy name matches current name (same prefix and rig name, no-op)
+	if legacyName == m.SessionName() {
+		return
+	}
+	running, _ := t.HasSession(legacyName)
+	if running {
+		log.Printf("witness: killing legacy session %q (old format, replaced by %q)", legacyName, m.SessionName())
+		_ = t.KillSessionWithProcesses(legacyName)
+	}
+}
+
 // Start starts the witness.
 // If foreground is true, returns an error (foreground mode deprecated).
 // Otherwise, spawns a Claude agent in a tmux session.
@@ -97,6 +114,10 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		// Foreground mode is deprecated - patrol logic moved to mol-witness-patrol
 		return fmt.Errorf("foreground mode is deprecated; use background mode (remove --foreground flag)")
 	}
+
+	// Kill any legacy sessions with the old naming format (pre-gix74 cleanup).
+	// This prevents zombie sessions from surviving across upgrades.
+	m.killLegacySessions(t)
 
 	// Check if session already exists
 	running, _ := t.HasSession(sessionID)

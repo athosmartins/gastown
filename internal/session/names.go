@@ -59,3 +59,25 @@ func OverseerSessionName() string {
 func BootSessionName() string {
 	return HQPrefix + "boot"
 }
+
+// legacyGTPrefix is the old hardcoded prefix used before prefix-based naming (gt-gix74).
+// Old format: "gt-{rigName}-{role}", new format: "{rigPrefix}-{role}".
+const legacyGTPrefix = "gt-"
+
+// LegacyWitnessSessionName returns the old-format witness session name from before
+// the prefix-based naming change (gt-gix74). Used to detect and clean up zombie
+// sessions that survive across upgrades.
+// Old format: "gt-{rigName}-witness" (hardcoded gt- prefix + rig name).
+// New format: "{rigPrefix}-witness" (rig-specific beads prefix).
+func LegacyWitnessSessionName(rigName string) string {
+	return legacyGTPrefix + rigName + "-witness"
+}
+
+// LegacyRefinerySessionName returns the old-format refinery session name from before
+// the prefix-based naming change (gt-gix74). Used to detect and clean up zombie
+// sessions that survive across upgrades.
+// Old format: "gt-{rigName}-refinery" (hardcoded gt- prefix + rig name).
+// New format: "{rigPrefix}-refinery" (rig-specific beads prefix).
+func LegacyRefinerySessionName(rigName string) string {
+	return legacyGTPrefix + rigName + "-refinery"
+}

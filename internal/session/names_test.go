@@ -116,3 +116,78 @@ func TestDefaultPrefix(t *testing.T) {
 		t.Errorf("DefaultPrefix = %q, want %q", DefaultPrefix, want)
 	}
 }
+
+func TestLegacyWitnessSessionName(t *testing.T) {
+	tests := []struct {
+		rigName string
+		want    string
+	}{
+		{"gastown", "gt-gastown-witness"},
+		{"beads", "gt-beads-witness"},
+		{"whatsapp_automation", "gt-whatsapp_automation-witness"},
+		{"hop", "gt-hop-witness"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.rigName, func(t *testing.T) {
+			got := LegacyWitnessSessionName(tt.rigName)
+			if got != tt.want {
+				t.Errorf("LegacyWitnessSessionName(%q) = %q, want %q", tt.rigName, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLegacyRefinerySessionName(t *testing.T) {
+	tests := []struct {
+		rigName string
+		want    string
+	}{
+		{"gastown", "gt-gastown-refinery"},
+		{"beads", "gt-beads-refinery"},
+		{"whatsapp_automation", "gt-whatsapp_automation-refinery"},
+		{"hop", "gt-hop-refinery"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.rigName, func(t *testing.T) {
+			got := LegacyRefinerySessionName(tt.rigName)
+			if got != tt.want {
+				t.Errorf("LegacyRefinerySessionName(%q) = %q, want %q", tt.rigName, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLegacyVsCurrentSessionNames verifies legacy names differ from current names
+// for rigs where the prefix differs from the rig name (the typical upgrade scenario).
+func TestLegacyVsCurrentSessionNames(t *testing.T) {
+	tests := []struct {
+		rigName   string
+		rigPrefix string
+	}{
+		{"whatsapp_automation", "wa"},
+		{"beads", "bd"},
+		{"gastown", "gt"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.rigName, func(t *testing.T) {
+			// Verify legacy differs from current when prefix != rig name
+			legacyWitness := LegacyWitnessSessionName(tt.rigName)
+			currentWitness := WitnessSessionName(tt.rigPrefix)
+
+			legacyRefinery := LegacyRefinerySessionName(tt.rigName)
+			currentRefinery := RefinerySessionName(tt.rigPrefix)
+
+			// For rigs where prefix == rig name (e.g., "gastown" with prefix "gt"),
+			// the names will differ (gt-gastown-witness vs gt-witness).
+			// For any rig, they should never be equal.
+			if legacyWitness == currentWitness {
+				t.Errorf("LegacyWitnessSessionName(%q) == WitnessSessionName(%q) = %q; expected different names",
+					tt.rigName, tt.rigPrefix, legacyWitness)
+			}
+			if legacyRefinery == currentRefinery {
+				t.Errorf("LegacyRefinerySessionName(%q) == RefinerySessionName(%q) = %q; expected different names",
+					tt.rigName, tt.rigPrefix, legacyRefinery)
+			}
+		})
+	}
+}
