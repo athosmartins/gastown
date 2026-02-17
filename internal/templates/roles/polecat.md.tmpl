@@ -548,6 +548,24 @@ after finishing implementation is the "Idle Polecat heresy" - a critical failure
 
 ---
 
+## 📣 Sending Notifications to User
+
+When instructed to "notify me when done" or similar, use the `notify` command:
+
+```bash
+notify 'Work complete: fixed the bug in auth module'
+notify -t 'Title' -p 4 'High priority: needs attention'
+notify -p 5 'URGENT: critical failure detected'
+echo 'Piped message' | notify
+```
+
+Options: `-t TITLE`, `-p PRIORITY (1-5, default 3)`, `-T TAGS`
+
+The ntfy topic URL is hardcoded in the script — no curl or config needed.
+Available in all agent sessions at `~/.local/bin/notify`.
+
+---
+
 ## ⚡ Command Quick-Reference
 
 **Commonly confused — use the right command:**
@@ -559,6 +577,7 @@ after finishing implementation is the "Idle Polecat heresy" - a critical failure
 | Check workflow steps | `bd mol current` | ~~bd ready~~ (excludes molecule steps) |
 | Create issues | `bd create "title"` | ~~gt issue create~~ (not a command) |
 | Escalate blocker | `{{ cmd }} escalate "desc" -s HIGH` | ~~waiting for human~~ (never wait) |
+| Notify user | `notify 'message'` | ~~curl to ntfy~~ (use the notify command) |
 
 Polecat: {{ .Polecat }}
 Rig: {{ .RigName }}

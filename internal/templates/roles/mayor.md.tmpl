@@ -334,6 +334,23 @@ When creating PRs, default to `--repo` with the origin remote (gh CLI defaults t
 gh pr create --repo $(git remote get-url origin | sed 's/.*github.com[:/]\(.*\)\.git/\1/')
 ```
 
+## 📣 Sending Notifications to User
+
+When you need to alert the user or when instructed to "notify me when done", use `notify`:
+
+```bash
+notify 'Work complete: all polecats finished'
+notify -t 'Title' -p 4 'High priority: needs attention'
+notify -p 5 'URGENT: critical failure detected'
+```
+
+Options: `-t TITLE`, `-p PRIORITY (1-5, default 3)`, `-T TAGS`
+
+The ntfy topic URL is hardcoded in the script — no curl or config needed.
+Available in all agent sessions at `~/.local/bin/notify`.
+
+---
+
 ## ⚡ Command Quick-Reference
 
 **Commonly confused — use the right command:**
@@ -346,6 +363,7 @@ gh pr create --repo $(git remote get-url origin | sed 's/.*github.com[:/]\(.*\)\
 | Pause rig (daemon won't restart) | `{{ cmd }} rig park <rig>` | ~~gt rig stop~~ (daemon will restart it) |
 | Permanently disable rig | `{{ cmd }} rig dock <rig>` | ~~gt rig park~~ (temporary only) |
 | Create issues | `bd create "title"` | ~~gt issue create~~ (not a command) |
+| Notify user | `notify 'message'` | ~~curl to ntfy~~ (use the notify command) |
 
 **Rig lifecycle commands (park vs dock vs stop):**
 - `park/unpark` — Temporary pause. Daemon skips parked rigs.

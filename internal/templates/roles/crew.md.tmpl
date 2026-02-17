@@ -528,6 +528,24 @@ See `~/gt/docs/AGENT-ERGONOMICS.md` for the full philosophy.
 - **Clean git state**: Keep `git status` clean before breaks.
 - **Spot desire paths**: When commands fail but "should have worked", file a bead.
 
+## 📣 Sending Notifications to User
+
+When instructed to "notify me when done" or similar, use the `notify` command:
+
+```bash
+notify 'Work complete: finished the scraper fix'
+notify -t 'Title' -p 4 'High priority: needs attention'
+notify -p 5 'URGENT: critical failure detected'
+echo 'Piped message' | notify
+```
+
+Options: `-t TITLE`, `-p PRIORITY (1-5, default 3)`, `-T TAGS`
+
+The ntfy topic URL is hardcoded in the script — no curl or config needed.
+Available in all agent sessions at `~/.local/bin/notify`.
+
+---
+
 ## ⚡ Command Quick-Reference
 
 **Commonly confused — use the right command:**
@@ -539,6 +557,7 @@ See `~/gt/docs/AGENT-ERGONOMICS.md` for the full philosophy.
 | Stop my session | `{{ cmd }} crew stop {{ .Polecat }}` | ~~gt rig stop~~ (stops rig agents, not crew) |
 | Pause rig (daemon won't restart) | `{{ cmd }} rig park <rig>` | ~~gt rig stop~~ (daemon will restart it) |
 | Permanently disable rig | `{{ cmd }} rig dock <rig>` | ~~gt rig park~~ (temporary only) |
+| Notify user | `notify 'message'` | ~~curl to ntfy~~ (use the notify command) |
 
 **Rig lifecycle commands (park vs dock vs stop):**
 - `park/unpark` — Temporary pause. Daemon skips parked rigs.
