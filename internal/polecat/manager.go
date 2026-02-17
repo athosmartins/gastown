@@ -1552,10 +1552,30 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 	agentID := m.agentBeadID(name)
 	_, fields, agentErr := m.beads.GetAgentBead(agentID)
 	if agentErr == nil && fields != nil && fields.HookBead != "" {
+		// hook_bead is set, but cross-reference tmux session to detect zombies.
+		// When gt done fails to clear hook_bead (e.g., Dolt error, SIGKILL before
+		// updateAgentStateOnDone runs), the polecat appears working but has no
+		// live session. Without this check, dogs see no idle capacity and get stuck.
+		// (gt-q3n7u: Dogs chronically stuck when polecats in 'working' state with dead sessions)
+		//
+		// Guard: skip zombie detection when agent_state=spawning. During polecat
+		// creation, hook_bead is written to the bead BEFORE the tmux session is
+		// started. Without this guard, a freshly-spawning polecat (hook_bead set,
+		// no session yet) would be incorrectly classified as a zombie and auto-nuked.
+		hookBeadState := StateWorking
+		if m.tmux != nil && fields.AgentState != "spawning" {
+			sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
+			if alive, _ := m.tmux.HasSession(sessionName); !alive {
+				// Session is dead but hook_bead is set: zombie polecat.
+				// Mark as StateDone so callers (dogs, dispatch) skip this polecat.
+				// The Witness will auto-nuke zombie polecats detected during survey.
+				hookBeadState = StateDone
+			}
+		}
 		return &Polecat{
 			Name:      name,
 			Rig:       m.rig.Name,
-			State:     StateWorking,
+			State:     hookBeadState,
 			ClonePath: clonePath,
 			Branch:    branchName,
 			Issue:     fields.HookBead,

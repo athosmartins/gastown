@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -13,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -367,7 +370,76 @@ func runDegradedTriage(b *boot.Boot) (action, target string, err error) {
 		}
 	}
 
+	// Execute any pending death warrants.
+	// Warrants are filed by Deacon/Witness for agents needing forced termination.
+	// Boot is responsible for picking them up during triage.
+	// (gt-q3n7u: Boot should execute pending death warrants more reliably)
+	if warrantsExecuted := executePendingWarrants(townRoot, tm); warrantsExecuted > 0 {
+		return "warrants", fmt.Sprintf("executed-%d-warrants", warrantsExecuted), nil
+	}
+
 	return "nothing", "", nil
+}
+
+// executePendingWarrants finds and executes all unexecuted death warrants.
+// Returns the count of warrants executed. Non-fatal: errors are logged, not returned.
+func executePendingWarrants(townRoot string, tm *tmux.Tmux) int {
+	if townRoot == "" {
+		return 0
+	}
+	warrantDir := filepath.Join(townRoot, "warrants")
+	entries, err := os.ReadDir(warrantDir)
+	if err != nil {
+		return 0 // warrants dir doesn't exist or can't be read — no warrants
+	}
+
+	executed := 0
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".warrant.json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(warrantDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var w Warrant
+		if err := json.Unmarshal(data, &w); err != nil {
+			continue
+		}
+		if w.Executed {
+			continue // already executed
+		}
+
+		// Execute the warrant: determine session name and kill it
+		sessionName, err := targetToSessionName(w.Target)
+		if err != nil {
+			fmt.Printf("Warning: cannot determine session for warrant target %s: %v\n", w.Target, err)
+			continue
+		}
+
+		if has, _ := tm.HasSession(sessionName); has {
+			// Use KillSessionWithProcesses to ensure all descendant processes
+			// (Claude, child tools) are cleaned up, releasing Dolt connections
+			// and file locks. Consistent with other session termination in the codebase.
+			if err := tm.KillSessionWithProcesses(sessionName); err != nil {
+				fmt.Printf("Warning: failed to execute warrant for %s: %v\n", w.Target, err)
+				continue
+			}
+			fmt.Printf("✓ Warrant executed: terminated session %s (reason: %s)\n", sessionName, w.Reason)
+		} else {
+			fmt.Printf("  Warrant for %s: session already dead\n", w.Target)
+		}
+
+		// Mark warrant as executed
+		now := time.Now()
+		w.Executed = true
+		w.ExecutedAt = &now
+		if updated, err := json.MarshalIndent(w, "", "  "); err == nil {
+			_ = os.WriteFile(filepath.Join(warrantDir, entry.Name()), updated, 0644)
+		}
+		executed++
+	}
+	return executed
 }
 
 // isDeaconInBackoff checks if the Deacon is in await-signal backoff mode.

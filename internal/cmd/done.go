@@ -901,6 +901,13 @@ afterDoltMerge:
 		writeDoneCheckpoint(cpBd, agentBeadID, CheckpointWitnessNotified, "ok")
 	}
 
+	// Nudge the witness to process POLECAT_DONE immediately.
+	// Without this, the witness may sleep in await-signal for up to 5 minutes
+	// (exponential backoff), leaving the polecat in 'working' state during that
+	// window. Dogs dispatched during this window see no idle capacity and get stuck.
+	// (gt-q3n7u: Dogs chronically stuck when polecats in 'working' state with dead sessions)
+	wakeRigAgents(rigName)
+
 	// Log done event (townlog and activity feed)
 	if err := LogDone(townRoot, sender, issueID); err != nil {
 		style.PrintWarning("could not log done event: %v", err)
