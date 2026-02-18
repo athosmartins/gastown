@@ -621,8 +621,10 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (*Polecat, error)
 	// This ensures exists() returns false for incomplete polecats, preventing
 	// a partial state where polecatDir exists but the worktree doesn't.
 	// See: br-w2ee9 (worktrees not being created)
+	// Also removes the .pending reservation marker to release the slot.
 	cleanupOnError := func() {
 		_ = os.RemoveAll(polecatDir)
+		m.removePendingMarker(name)
 	}
 
 	// Get the repo base (bare repo or mayor/rig)
@@ -1011,6 +1013,14 @@ func (m *Manager) AllocateName() (string, error) {
 		return "", fmt.Errorf("saving pool state: %w", err)
 	}
 
+	// Create a .pending reservation marker file before releasing the pool lock.
+	// This closes the TOCTOU gap between AllocateName() and AddWithOptions():
+	// a concurrent sling process calling reconcilePoolInternal() will see the
+	// marker and treat the name as in-use, preventing double-allocation.
+	// AddWithOptions() removes the marker once the real directory is in place.
+	// Markers older than pendingMarkerMaxAge are treated as stale (process crash).
+	m.writePendingMarker(name)
+
 	// Kill any lingering tmux session for this name (gt-pqf9x).
 	// ReconcilePool kills sessions for names without directories, but a name
 	// can be allocated after its directory was cleaned up while the tmux session
@@ -1031,6 +1041,61 @@ func (m *Manager) AllocateName() (string, error) {
 func (m *Manager) ReleaseName(name string) {
 	m.namePool.Release(name)
 	_ = m.namePool.Save() // non-fatal: state file update
+}
+
+// pendingMarkerMaxAge is how long a .pending marker is trusted before being
+// treated as stale (the process that created it crashed before completing AddWithOptions).
+const pendingMarkerMaxAge = 2 * time.Minute
+
+// pendingMarkerPath returns the path of the .pending reservation marker for a name.
+// Markers are flat files in polecats/ (not subdirectories) to avoid interfering
+// with m.List(), m.exists(), and m.Get() which scan for polecat subdirectories.
+func (m *Manager) pendingMarkerPath(name string) string {
+	return filepath.Join(m.rig.Path, "polecats", ".pending."+name)
+}
+
+// writePendingMarker creates a reservation marker file for a name.
+// Called from AllocateName() while the pool lock is still held, so concurrent
+// AllocateName() callers will see the marker in reconcilePoolInternal().
+func (m *Manager) writePendingMarker(name string) {
+	polecatsDir := filepath.Join(m.rig.Path, "polecats")
+	_ = os.MkdirAll(polecatsDir, 0755) // no-op if exists
+	content := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
+	_ = os.WriteFile(m.pendingMarkerPath(name), content, 0644)
+}
+
+// removePendingMarker deletes the reservation marker for a name.
+// Called from AddWithOptions() on success and on cleanup-on-error.
+func (m *Manager) removePendingMarker(name string) {
+	_ = os.Remove(m.pendingMarkerPath(name))
+}
+
+// listPendingReservations returns names that have non-stale .pending reservation markers.
+// Stale markers (older than pendingMarkerMaxAge) are removed and excluded.
+func (m *Manager) listPendingReservations() []string {
+	polecatsDir := filepath.Join(m.rig.Path, "polecats")
+	entries, err := os.ReadDir(polecatsDir)
+	if err != nil {
+		return nil
+	}
+	now := time.Now()
+	var names []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), ".pending.") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) > pendingMarkerMaxAge {
+			// Stale: process likely crashed; remove to unblock the slot.
+			_ = os.Remove(filepath.Join(polecatsDir, entry.Name()))
+			continue
+		}
+		names = append(names, strings.TrimPrefix(entry.Name(), ".pending."))
+	}
+	return names
 }
 
 // RepairWorktree repairs a stale polecat by removing it and creating a fresh worktree.
@@ -1195,8 +1260,12 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 		// Remove polecatDir to prevent limbo state where m.exists(name) returns true
 		// but no valid worktree exists. Matches AddWithOptions cleanupOnError behavior.
 		_ = os.RemoveAll(polecatDir)
+		m.removePendingMarker(name)
 		return nil, fmt.Errorf("agent bead required for polecat tracking: %w", err)
 	}
+
+	// Real directory is fully in place; remove the .pending reservation marker.
+	m.removePendingMarker(name)
 
 	// Return fresh polecat in working state (transient model: polecats are spawned with work)
 	now := time.Now()
@@ -1239,6 +1308,22 @@ func (m *Manager) reconcilePoolInternal() {
 	var namesWithDirs []string
 	for _, p := range polecats {
 		namesWithDirs = append(namesWithDirs, p.Name)
+	}
+
+	// Include names with .pending reservation markers as in-use.
+	// These are names allocated by a concurrent AllocateName() call that has not
+	// yet completed AddWithOptions() (the real directory doesn't exist yet).
+	for _, pending := range m.listPendingReservations() {
+		found := false
+		for _, n := range namesWithDirs {
+			if n == pending {
+				found = true
+				break
+			}
+		}
+		if !found {
+			namesWithDirs = append(namesWithDirs, pending)
+		}
 	}
 
 	// Get names with tmux sessions
