@@ -2,12 +2,14 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/steveyegge/gastown/internal/cli"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
@@ -34,8 +36,11 @@ type MoleculeCurrentOutput struct {
 // showMoleculeExecutionPrompt calls bd mol current and shows the current step
 // with execution instructions. This is the core of the Propulsion Principle.
 func showMoleculeExecutionPrompt(workDir, moleculeID string) {
-	// Call bd mol current with JSON output
-	cmd := exec.Command("bd", "mol", "current", moleculeID, "--json")
+	// Call bd mol current with JSON output; use a timeout to prevent indefinite hangs
+	// bd mol current can block for 10+ minutes holding a Dolt exclusive lock
+	molCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(molCtx, "bd", "mol", "current", moleculeID, "--json")
 	cmd.Dir = workDir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
