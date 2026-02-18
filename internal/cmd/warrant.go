@@ -334,6 +334,74 @@ func runWarrantExecute(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// executeAllPendingWarrants scans the warrants directory and executes all
+// pending (non-executed) warrants. For each pending warrant, it terminates
+// the agent's tmux session (if alive) and marks the warrant as executed.
+// Returns the count of warrants executed.
+func executeAllPendingWarrants(townRoot string) (int, error) {
+	warrantDir := filepath.Join(townRoot, "warrants")
+
+	entries, err := os.ReadDir(warrantDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil // No warrants directory - nothing to do
+		}
+		return 0, fmt.Errorf("reading warrants directory: %w", err)
+	}
+
+	tm := tmux.NewTmux()
+	executed := 0
+
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".warrant.json") {
+			continue
+		}
+
+		warrantPath := filepath.Join(warrantDir, entry.Name())
+		data, err := os.ReadFile(warrantPath)
+		if err != nil {
+			continue
+		}
+
+		var w Warrant
+		if err := json.Unmarshal(data, &w); err != nil {
+			continue
+		}
+
+		if w.Executed {
+			continue
+		}
+
+		sessionName, err := targetToSessionName(w.Target)
+		if err != nil {
+			fmt.Printf("Warrant for %s: cannot determine session name: %v\n", w.Target, err)
+			continue
+		}
+
+		if has, _ := tm.HasSession(sessionName); has {
+			if err := tm.KillSession(sessionName); err != nil {
+				fmt.Printf("Warrant for %s: failed to kill session %s: %v\n", w.Target, sessionName, err)
+				continue
+			}
+			fmt.Printf("✓ Warrant executed: terminated session %s (target: %s)\n", sessionName, w.Target)
+		} else {
+			fmt.Printf("✓ Warrant executed: session %s already dead (target: %s)\n", sessionName, w.Target)
+		}
+
+		now := time.Now()
+		w.Executed = true
+		w.ExecutedAt = &now
+
+		if updated, err := json.MarshalIndent(w, "", "  "); err == nil {
+			_ = os.WriteFile(warrantPath, updated, 0644)
+		}
+
+		executed++
+	}
+
+	return executed, nil
+}
+
 // targetToSessionName converts a target path to a tmux session name
 func targetToSessionName(target string) (string, error) {
 	parts := strings.Split(target, "/")

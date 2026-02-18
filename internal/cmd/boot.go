@@ -287,6 +287,17 @@ func runDegradedTriage(b *boot.Boot) (action, target string, err error) {
 		return "nothing", "shutdown-in-progress", nil
 	}
 
+	// Execute any pending death warrants before Deacon health check.
+	// Warrants are urgent — dogs marked for termination should be killed
+	// promptly regardless of Deacon health status.
+	if townRoot != "" {
+		if count, err := executeAllPendingWarrants(townRoot); err != nil {
+			fmt.Printf("Warning: warrant execution failed: %v\n", err)
+		} else if count > 0 {
+			fmt.Printf("Boot: executed %d pending warrant(s)\n", count)
+		}
+	}
+
 	tm := b.Tmux()
 
 	// Check if Deacon session exists

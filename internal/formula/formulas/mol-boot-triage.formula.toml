@@ -19,8 +19,39 @@ formula = "mol-boot-triage"
 version = 1
 
 [[steps]]
+id = "warrant-check"
+title = "Execute pending death warrants"
+description = """
+Before Deacon triage, scan for and execute any pending death warrants.
+Warrants are filed by Deacon/Witness when agents are stuck or need forced termination.
+Boot is responsible for executing them on every triage cycle.
+
+```bash
+# List pending warrants
+gt warrant list
+
+# Execute each pending warrant
+# warrants are in ~/gt/warrants/*.warrant.json
+for f in ~/gt/warrants/*.warrant.json; do
+  [ -f "$f" ] || continue
+  target=$(jq -r '.target' "$f")
+  executed=$(jq -r '.executed // false' "$f")
+  [ "$executed" = "true" ] && continue
+  echo "Executing warrant for: $target"
+  gt warrant execute "$target"
+done
+```
+
+If no warrants directory exists or all warrants are already executed, this step
+is a no-op. Continue to observe regardless.
+
+Record: how many warrants were executed (if any).
+"""
+
+[[steps]]
 id = "observe"
 title = "Observe system state"
+needs = ["warrant-check"]
 description = """
 Observe the current system state to inform triage decisions.
 

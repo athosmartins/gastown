@@ -215,6 +215,155 @@ func TestTargetToSessionName(t *testing.T) {
 	}
 }
 
+// =============================================================================
+// executeAllPendingWarrants Tests
+// =============================================================================
+
+// TestExecuteAllPendingWarrants_NoWarrantsDir verifies that a missing warrants
+// directory is handled gracefully (returns 0, no error).
+func TestExecuteAllPendingWarrants_NoWarrantsDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	// No "warrants" subdirectory created
+
+	count, err := executeAllPendingWarrants(tmpDir)
+	if err != nil {
+		t.Errorf("executeAllPendingWarrants() error = %v, want nil", err)
+	}
+	if count != 0 {
+		t.Errorf("executeAllPendingWarrants() count = %d, want 0", count)
+	}
+}
+
+// TestExecuteAllPendingWarrants_SkipsAlreadyExecuted verifies that warrants
+// already marked as executed are not re-executed.
+func TestExecuteAllPendingWarrants_SkipsAlreadyExecuted(t *testing.T) {
+	setupWarrantTestRegistry(t)
+	tmpDir := t.TempDir()
+	warrantDir := filepath.Join(tmpDir, "warrants")
+	if err := os.MkdirAll(warrantDir, 0755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	// Create an already-executed warrant
+	now := time.Now()
+	warrant := Warrant{
+		ID:         "warrant-already-done",
+		Target:     "gastown/polecats/alpha",
+		Reason:     "Already handled",
+		FiledBy:    "test-agent",
+		FiledAt:    now.Add(-1 * time.Hour),
+		Executed:   true,
+		ExecutedAt: &now,
+	}
+	data, _ := json.MarshalIndent(warrant, "", "  ")
+	warrantPath := filepath.Join(warrantDir, "gastown_polecats_alpha.warrant.json")
+	if err := os.WriteFile(warrantPath, data, 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	count, err := executeAllPendingWarrants(tmpDir)
+	if err != nil {
+		t.Errorf("executeAllPendingWarrants() error = %v, want nil", err)
+	}
+	if count != 0 {
+		t.Errorf("executeAllPendingWarrants() count = %d, want 0 (already executed)", count)
+	}
+}
+
+// TestExecuteAllPendingWarrants_MarksPendingAsExecuted verifies that pending
+// warrants are marked as executed (even when session is already dead/missing).
+// In CI, tmux is not running so HasSession returns false - this is the "already
+// dead" path, which should still mark the warrant as executed.
+func TestExecuteAllPendingWarrants_MarksPendingAsExecuted(t *testing.T) {
+	setupWarrantTestRegistry(t)
+	tmpDir := t.TempDir()
+	warrantDir := filepath.Join(tmpDir, "warrants")
+	if err := os.MkdirAll(warrantDir, 0755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	// Create a pending warrant for a target whose session won't exist in CI
+	warrant := Warrant{
+		ID:       "warrant-pending-test",
+		Target:   "gastown/polecats/alpha",
+		Reason:   "Stuck: no progress in 80 minutes",
+		FiledBy:  "deacon",
+		FiledAt:  time.Now().Add(-80 * time.Minute),
+		Executed: false,
+	}
+	data, _ := json.MarshalIndent(warrant, "", "  ")
+	warrantPath := filepath.Join(warrantDir, "gastown_polecats_alpha.warrant.json")
+	if err := os.WriteFile(warrantPath, data, 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	count, err := executeAllPendingWarrants(tmpDir)
+	if err != nil {
+		t.Errorf("executeAllPendingWarrants() error = %v, want nil", err)
+	}
+	if count != 1 {
+		t.Errorf("executeAllPendingWarrants() count = %d, want 1", count)
+	}
+
+	// Verify the warrant file was updated to mark as executed
+	readData, err := os.ReadFile(warrantPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	var readWarrant Warrant
+	if err := json.Unmarshal(readData, &readWarrant); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if !readWarrant.Executed {
+		t.Error("Executed = false, want true after executeAllPendingWarrants")
+	}
+	if readWarrant.ExecutedAt == nil {
+		t.Error("ExecutedAt = nil, want non-nil after executeAllPendingWarrants")
+	}
+}
+
+// TestExecuteAllPendingWarrants_MultipleWarrants verifies that multiple pending
+// warrants are all executed in a single call.
+func TestExecuteAllPendingWarrants_MultipleWarrants(t *testing.T) {
+	setupWarrantTestRegistry(t)
+	tmpDir := t.TempDir()
+	warrantDir := filepath.Join(tmpDir, "warrants")
+	if err := os.MkdirAll(warrantDir, 0755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	targets := []string{
+		"gastown/polecats/alpha",
+		"gastown/polecats/bravo",
+	}
+
+	for _, target := range targets {
+		safe := target
+		// Create filename manually to match warrantFilePath convention
+		filename := "gastown_polecats_" + target[len("gastown/polecats/"):] + ".warrant.json"
+		warrant := Warrant{
+			ID:       "warrant-" + safe,
+			Target:   target,
+			Reason:   "Stuck",
+			FiledBy:  "deacon",
+			FiledAt:  time.Now().Add(-30 * time.Minute),
+			Executed: false,
+		}
+		data, _ := json.MarshalIndent(warrant, "", "  ")
+		if err := os.WriteFile(filepath.Join(warrantDir, filename), data, 0644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", filename, err)
+		}
+	}
+
+	count, err := executeAllPendingWarrants(tmpDir)
+	if err != nil {
+		t.Errorf("executeAllPendingWarrants() error = %v, want nil", err)
+	}
+	if count != 2 {
+		t.Errorf("executeAllPendingWarrants() count = %d, want 2", count)
+	}
+}
+
 // TestWarrantFilePath verifies warrant file path generation.
 func TestWarrantFilePath(t *testing.T) {
 	tests := []struct {
