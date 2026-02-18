@@ -336,6 +336,11 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 			PromptFlag: "-p",
 			OutputFlag: "--no-session",
 		},
+		// Runtime defaults
+		PromptMode:        "arg",
+		HooksProvider:     "pi",
+		HooksDir:          ".pi/extensions",
+		HooksSettingsFile: "gastown-hooks.js",
 	},
 }
 
