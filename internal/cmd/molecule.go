@@ -6,7 +6,8 @@ import (
 
 // Molecule command flags
 var (
-	moleculeJSON bool
+	moleculeJSON      bool
+	moleculeJitterMax string // max jitter duration for squash (e.g., "10s")
 )
 
 var moleculeCmd = &cobra.Command{
@@ -200,7 +201,12 @@ The digest preserves:
 - Summary of results
 
 Use this for patrol cycles and other operational work that should have
-a permanent (but compact) record.`,
+a permanent (but compact) record.
+
+Use --jitter to add a random delay before squashing. This desynchronizes
+concurrent patrol agents (Deacon, Witness, Refinery) that all wake up on
+the same events-feed signal and would otherwise hammer Dolt's exclusive
+lock simultaneously. Recommended value: 10s for patrol squash cycles.`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runMoleculeSquash,
 }
@@ -242,6 +248,7 @@ func init() {
 
 	// Squash flags
 	moleculeSquashCmd.Flags().BoolVar(&moleculeJSON, "json", false, "Output as JSON")
+	moleculeSquashCmd.Flags().StringVar(&moleculeJitterMax, "jitter", "", "Random delay before squash to reduce lock contention (e.g., '10s')")
 
 	// Add step subcommand with its children
 	moleculeStepCmd.AddCommand(moleculeStepDoneCmd)

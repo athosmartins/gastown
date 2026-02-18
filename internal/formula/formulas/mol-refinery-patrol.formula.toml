@@ -696,9 +696,9 @@ The idle counter was auto-incremented. Continue to next patrol cycle
 
 After await-signal returns (either by signal or timeout):
 1. **Re-assess session health** (check RSS, context, age again — conditions change)
-2. Squash the current wisp:
+2. Squash the current wisp (--jitter staggers concurrent patrol squashes to reduce Dolt lock contention):
 ```bash
-bd mol squash <mol-id> --summary "<patrol-summary>"
+gt mol squash --jitter 10s
 ```
 3. Create and hook a new patrol wisp:
 ```bash

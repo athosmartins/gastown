@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"strings"
 	"time"
@@ -117,8 +118,31 @@ func runMoleculeBurn(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// applyJitter sleeps for a random duration in [0, jitterMax) to desynchronize
+// concurrent callers. Used by patrol agents to stagger Dolt lock acquisitions.
+func applyJitter(jitterMax time.Duration) {
+	if jitterMax <= 0 {
+		return
+	}
+	jitter := time.Duration(rand.Int63n(int64(jitterMax))) //nolint:gosec // G404: non-crypto random is fine for timing jitter
+	if jitter > 0 {
+		time.Sleep(jitter)
+	}
+}
+
 // runMoleculeSquash squashes the current molecule into a digest.
 func runMoleculeSquash(cmd *cobra.Command, args []string) error {
+	// Apply jitter before Dolt writes to reduce lock contention when multiple
+	// patrol agents (Deacon, Witness, Refinery) squash simultaneously after
+	// waking from the same await-signal event. See: hq-vytww2
+	if moleculeJitterMax != "" {
+		jitterDur, err := time.ParseDuration(moleculeJitterMax)
+		if err != nil {
+			return fmt.Errorf("invalid --jitter value %q: %w", moleculeJitterMax, err)
+		}
+		applyJitter(jitterDur)
+	}
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("getting current directory: %w", err)
