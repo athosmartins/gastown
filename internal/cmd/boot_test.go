@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -204,5 +206,104 @@ func TestMolCurrentJSONParsing(t *testing.T) {
 	expected, _ := time.Parse(time.RFC3339, "2026-02-03T05:29:21Z")
 	if !latest.Equal(expected) {
 		t.Errorf("expected latest closed_at to be %v, got %v", expected, latest)
+	}
+}
+
+// =============================================================================
+// executeWarrants Tests
+// =============================================================================
+
+// TestExecuteWarrants_NonExistentDir verifies graceful handling of missing warrants dir.
+func TestExecuteWarrants_NonExistentDir(t *testing.T) {
+	count := executeWarrants("/nonexistent/warrant/town/root")
+	if count != 0 {
+		t.Errorf("expected 0 executed for non-existent dir, got %d", count)
+	}
+}
+
+// TestExecuteWarrants_EmptyDir verifies that an empty warrants dir returns 0.
+func TestExecuteWarrants_EmptyDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	warrantDir := filepath.Join(tmpDir, "warrants")
+	if err := os.MkdirAll(warrantDir, 0755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	count := executeWarrants(tmpDir)
+	if count != 0 {
+		t.Errorf("expected 0 executed for empty dir, got %d", count)
+	}
+}
+
+// TestExecuteWarrants_SkipsExecutedWarrants verifies already-executed warrants are ignored.
+func TestExecuteWarrants_SkipsExecutedWarrants(t *testing.T) {
+	tmpDir := t.TempDir()
+	warrantDir := filepath.Join(tmpDir, "warrants")
+	if err := os.MkdirAll(warrantDir, 0755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	now := time.Now()
+	warrant := Warrant{
+		ID:         "warrant-already-done",
+		Target:     "gastown/polecats/test",
+		Reason:     "Already handled",
+		FiledBy:    "test-agent",
+		FiledAt:    time.Now(),
+		Executed:   true,
+		ExecutedAt: &now,
+	}
+	data, _ := json.MarshalIndent(warrant, "", "  ")
+	warrantPath := filepath.Join(warrantDir, "gastown_polecats_test.warrant.json")
+	if err := os.WriteFile(warrantPath, data, 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	// Should skip the already-executed warrant (gt won't be called)
+	count := executeWarrants(tmpDir)
+	if count != 0 {
+		t.Errorf("expected 0 for already-executed warrant, got %d", count)
+	}
+}
+
+// TestExecuteWarrants_SkipsNonWarrantFiles verifies only .warrant.json files are processed.
+func TestExecuteWarrants_SkipsNonWarrantFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	warrantDir := filepath.Join(tmpDir, "warrants")
+	if err := os.MkdirAll(warrantDir, 0755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	// Write a non-warrant file to the directory
+	if err := os.WriteFile(filepath.Join(warrantDir, "README.txt"), []byte("not a warrant"), 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(warrantDir, "some.json"), []byte(`{}`), 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	count := executeWarrants(tmpDir)
+	if count != 0 {
+		t.Errorf("expected 0 for non-warrant files, got %d", count)
+	}
+}
+
+// TestExecuteWarrants_SkipsMalformedJSON verifies malformed JSON files are silently skipped.
+func TestExecuteWarrants_SkipsMalformedJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	warrantDir := filepath.Join(tmpDir, "warrants")
+	if err := os.MkdirAll(warrantDir, 0755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	// Write malformed JSON as a .warrant.json file
+	if err := os.WriteFile(filepath.Join(warrantDir, "bad.warrant.json"), []byte("not json {{{"), 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	// Should not panic or return an error
+	count := executeWarrants(tmpDir)
+	if count != 0 {
+		t.Errorf("expected 0 for malformed JSON, got %d", count)
 	}
 }

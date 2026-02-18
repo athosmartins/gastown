@@ -19,8 +19,46 @@ formula = "mol-boot-triage"
 version = 1
 
 [[steps]]
+id = "warrants"
+title = "Execute pending death warrants"
+description = """
+Scan for pending death warrants and execute each one before beginning triage.
+
+Warrants are filed by Deacon when agents are stuck or need forced termination.
+Boot is responsible for executing warrants during each triage cycle.
+
+**Step 1: List pending warrants**
+```bash
+gt warrant list
+```
+
+**Step 2: Execute each pending warrant**
+For each target shown as PENDING:
+```bash
+gt warrant execute <target>
+```
+
+For example:
+```bash
+gt warrant execute gastown/polecats/alpha
+gt warrant execute deacon/dogs/bravo
+```
+
+If there are no pending warrants, proceed immediately to the next step.
+
+Warrant execution:
+- Terminates the agent's tmux session (if it exists)
+- Marks the warrant as executed in ~/gt/warrants/
+- If the session is already dead, the warrant is still marked executed
+
+**Important**: Execute ALL pending warrants before observing system state.
+This ensures Deacon gets an accurate count of active agents after cleanup.
+"""
+
+[[steps]]
 id = "observe"
 title = "Observe system state"
+needs = ["warrants"]
 description = """
 Observe the current system state to inform triage decisions.
 

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -276,6 +278,55 @@ func runBootTriage(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// executeWarrants scans the warrants directory for pending death warrants and
+// executes each one via `gt warrant execute`. Returns the count of warrants
+// successfully executed. Errors are logged to stdout but do not stop triage.
+func executeWarrants(townRoot string) int {
+	warrantDir := filepath.Join(townRoot, "warrants")
+	entries, err := os.ReadDir(warrantDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Printf("Warning: cannot read warrants directory: %v\n", err)
+		}
+		return 0
+	}
+
+	executed := 0
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".warrant.json") {
+			continue
+		}
+
+		data, err := os.ReadFile(filepath.Join(warrantDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+
+		var w Warrant
+		if err := json.Unmarshal(data, &w); err != nil || w.Executed {
+			continue
+		}
+
+		fmt.Printf("Executing death warrant for %s: %s\n", w.Target, w.Reason)
+		cmd := exec.Command("gt", "warrant", "execute", w.Target)
+		out, execErr := cmd.CombinedOutput()
+		if execErr != nil {
+			fmt.Printf("  Warning: failed to execute warrant for %s: %v\n", w.Target, execErr)
+			if len(out) > 0 {
+				fmt.Printf("  Output: %s\n", strings.TrimSpace(string(out)))
+			}
+		} else {
+			if len(out) > 0 {
+				fmt.Print(strings.TrimSpace(string(out)))
+				fmt.Println()
+			}
+			executed++
+		}
+	}
+
+	return executed
+}
+
 // runDegradedTriage performs basic Deacon health check without AI reasoning.
 // This is a mechanical fallback when full Claude sessions aren't available.
 func runDegradedTriage(b *boot.Boot) (action, target string, err error) {
@@ -285,6 +336,12 @@ func runDegradedTriage(b *boot.Boot) (action, target string, err error) {
 	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" && daemon.IsShutdownInProgress(townRoot) {
 		return "nothing", "shutdown-in-progress", nil
+	}
+
+	// Execute any pending death warrants before Deacon triage.
+	// Warrants are filed when agents are stuck; Boot is responsible for execution.
+	if townRoot != "" {
+		executeWarrants(townRoot)
 	}
 
 	tm := b.Tmux()
