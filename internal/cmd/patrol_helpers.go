@@ -65,6 +65,14 @@ func findActivePatrol(cfg PatrolConfig) (patrolID, patrolLine string, found bool
 			continue
 		}
 
+		// Defensive: bd list --status=hooked may return wisps with non-hooked
+		// statuses due to a bd bug where the status filter is not applied to
+		// the wisps table (gt-7xhzdkk). Skip beads that don't have hooked status
+		// to avoid treating stale/open wisps as active patrols.
+		if bead.Status != beads.StatusHooked {
+			continue
+		}
+
 		hasOpen, err := checkHasOpenChildren(b, bead.ID)
 		if err != nil {
 			// Transient error — skip this bead entirely to avoid
@@ -165,6 +173,15 @@ func burnPreviousPatrolWisps(cfg PatrolConfig) {
 	var burned int
 	for _, bead := range hookedBeads {
 		if !strings.HasPrefix(bead.Title, cfg.PatrolMolName) {
+			continue
+		}
+
+		// Defensive: only burn beads that are actually hooked (gt-7xhzdkk).
+		// bd list --status=hooked may return wisps with non-hooked statuses
+		// due to a bd bug where the status filter is not applied to the wisps
+		// table. Burning non-hooked wisps would destroy orphaned-but-harmless
+		// data and could corrupt unrelated patrols.
+		if bead.Status != beads.StatusHooked {
 			continue
 		}
 

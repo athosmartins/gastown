@@ -770,3 +770,118 @@ func TestBurnPreviousPatrolWisps_IgnoresOtherBeads(t *testing.T) {
 		t.Errorf("non-patrol bead status = %q, want %q (should not be burned)", otherIssue.Status, beads.StatusHooked)
 	}
 }
+
+// TestFindActivePatrolIgnoresNonHookedWisps verifies that findActivePatrol
+// ignores wisps with matching patrol titles but non-hooked status.
+// This simulates the bd bug (gt-7xhzdkk) where bd list --status=hooked
+// also returns wisps with open/closed status from the wisps table.
+func TestFindActivePatrolIgnoresNonHookedWisps(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+
+	molName := "mol-test-patrol"
+	assignee := "testrig/witness"
+
+	// Simulate a bd bug: create a patrol bead with matching title but open status
+	// (as if bd list --status=hooked returned it despite wrong status)
+	openPatrol, err := b.Create(beads.CreateOptions{
+		Title:    molName + " (open-wrong-status)",
+		Priority: -1,
+	})
+	if err != nil {
+		t.Fatalf("create open patrol: %v", err)
+	}
+	// Set assignee but leave status=open (not hooked) to simulate the bd bug
+	if err := b.Update(openPatrol.ID, beads.UpdateOptions{
+		Assignee: &assignee,
+	}); err != nil {
+		t.Fatalf("update open patrol: %v", err)
+	}
+
+	// Also create the real active patrol with correct hooked status
+	realPatrolID := createHookedPatrol(t, b, molName, assignee, false)
+
+	cfg := PatrolConfig{
+		PatrolMolName: molName,
+		BeadsDir:      tmpDir,
+		Assignee:      assignee,
+		Beads:         b,
+	}
+
+	patrolID, _, found, findErr := findActivePatrol(cfg)
+	if findErr != nil {
+		t.Fatalf("findActivePatrol error: %v", findErr)
+	}
+	if !found {
+		t.Fatal("expected to find the real active patrol")
+	}
+	// Must return the hooked patrol, NOT the open one
+	if patrolID != realPatrolID {
+		t.Errorf("patrolID = %q, want %q (should skip non-hooked wisp)", patrolID, realPatrolID)
+	}
+
+	// The open patrol should remain untouched (not burned)
+	openIssue, err := b.Show(openPatrol.ID)
+	if err != nil {
+		t.Fatalf("show open patrol: %v", err)
+	}
+	if openIssue.Status == "closed" {
+		t.Error("non-hooked open patrol should NOT be burned by findActivePatrol")
+	}
+}
+
+// TestBurnPreviousPatrolWisps_IgnoresNonHookedWisps verifies that burnPreviousPatrolWisps
+// only burns beads that are actually hooked, not open/closed ones with matching titles.
+// This prevents the bd bug (gt-7xhzdkk) from causing burnPreviousPatrolWisps to destroy
+// the currently active patrol when bd list --status=hooked returns stale wisps.
+func TestBurnPreviousPatrolWisps_IgnoresNonHookedWisps(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+
+	molName := "mol-test-patrol"
+	assignee := "testrig/witness"
+
+	// Create real hooked patrol (should be burned)
+	hookedID := createHookedPatrol(t, b, molName, assignee, true)
+
+	// Create a patrol bead with matching title but open status (simulates bd bug)
+	openPatrol, err := b.Create(beads.CreateOptions{
+		Title:    molName + " (open-stale-wisp)",
+		Priority: -1,
+	})
+	if err != nil {
+		t.Fatalf("create open patrol: %v", err)
+	}
+	if err := b.Update(openPatrol.ID, beads.UpdateOptions{
+		Assignee: &assignee,
+	}); err != nil {
+		t.Fatalf("update open patrol: %v", err)
+	}
+
+	cfg := PatrolConfig{
+		PatrolMolName: molName,
+		BeadsDir:      tmpDir,
+		Assignee:      assignee,
+		Beads:         b,
+	}
+
+	burnPreviousPatrolWisps(cfg)
+
+	// The hooked patrol should be closed (burned)
+	hookedIssue, err := b.Show(hookedID)
+	if err != nil {
+		t.Fatalf("show hooked patrol: %v", err)
+	}
+	if hookedIssue.Status != "closed" {
+		t.Errorf("hooked patrol status = %q, want closed after burn", hookedIssue.Status)
+	}
+
+	// The open (non-hooked) patrol should NOT be closed
+	openIssue, err := b.Show(openPatrol.ID)
+	if err != nil {
+		t.Fatalf("show open patrol: %v", err)
+	}
+	if openIssue.Status == "closed" {
+		t.Error("non-hooked open patrol should NOT be burned (gt-7xhzdkk)")
+	}
+}
