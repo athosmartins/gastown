@@ -280,6 +280,20 @@ func GenerateID() string {
 	return "msg-" + hex.EncodeToString(b)
 }
 
+// GenerateEphemeralID creates a correctly-prefixed ephemeral (wisp) ID for bd create.
+// The bd ephemeral SQLite path does not read the prefix from config.yaml and
+// produces empty IDs when --id is not passed, causing UNIQUE constraint failures
+// on the second send. Passing --id with the correct prefix works around this bug.
+// The format is "{prefix}-wisp-{hex}" to match bd's wisp ID convention.
+// Falls back to time-based ID if crypto/rand fails (extremely rare).
+func GenerateEphemeralID(prefix string) string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%s-wisp-%x", prefix, time.Now().UnixNano())
+	}
+	return prefix + "-wisp-" + hex.EncodeToString(b)
+}
+
 // generateThreadID creates a random thread ID.
 // Falls back to time-based ID if crypto/rand fails (extremely rare).
 func generateThreadID() string {

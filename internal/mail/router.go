@@ -1094,10 +1094,14 @@ func (r *Router) sendToSingle(msg *Message) error {
 		labels = append(labels, "cc:"+ccIdentity)
 	}
 
+	beadsDir := r.resolveBeadsDir()
+	if err := r.ensureCustomTypes(beadsDir); err != nil {
+		return err
+	}
+
 	// Build command: bd create --assignee=<recipient> -d <body> --labels=gt:message,... -- <subject>
 	// Flags go first, then -- to end flag parsing, then the positional subject.
 	// This prevents subjects like "--help" from being parsed as flags (see web/api.go).
-	// Let bd auto-generate the ID with the correct database prefix.
 	args := []string{"create",
 		"--assignee", toIdentity,
 		"-d", msg.Body,
@@ -1115,24 +1119,23 @@ func (r *Router) sendToSingle(msg *Message) error {
 	// Add actor for attribution (sender identity)
 	args = append(args, "--actor", msg.From)
 
-	// Do NOT pass --id to bd create. The msg.ID (msg-xxx prefix) is for
-	// in-memory tracking only. bd auto-generates IDs with the correct
-	// database prefix (e.g., hq-wisp-xxx). Passing --id causes prefix
-	// mismatch errors when the msg- prefix does not match the database.
-
-	// Add --ephemeral flag for ephemeral messages (wisps, not synced to git)
+	// Add --ephemeral flag for ephemeral messages (wisps, not synced to git).
+	// IMPORTANT: also pass --id with the correct beads prefix to work around a
+	// bd bug where the ephemeral SQLite insert path does not read the prefix
+	// from config.yaml, producing empty IDs and "UNIQUE constraint failed:
+	// issues.id" errors on the second send. The msg.ID field (msg-xxx) is only
+	// used for in-memory tracking; the --id here must use the database prefix.
 	if r.shouldBeWisp(msg) {
 		args = append(args, "--ephemeral")
+		prefix := beads.DetectBeadsPrefix(beadsDir)
+		ephemeralID := GenerateEphemeralID(prefix)
+		args = append(args, "--id", ephemeralID)
+		msg.ID = ephemeralID // keep in-memory ID in sync with the database ID
 	}
 
 	// End flag parsing with --, then add subject as positional argument.
 	// This prevents subjects like "--help" or "--json" from being parsed as flags.
 	args = append(args, "--", msg.Subject)
-
-	beadsDir := r.resolveBeadsDir()
-	if err := r.ensureCustomTypes(beadsDir); err != nil {
-		return err
-	}
 	ctx, cancel := bdWriteCtx()
 	defer cancel()
 	_, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)

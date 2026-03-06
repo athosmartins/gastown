@@ -310,9 +310,11 @@ func TestSendFromCrewWorkspace_AvoidsEphemeralPrefixMismatch(t *testing.T) {
 		t.Fatalf("write town.json: %v", err)
 	}
 
-	// Stub bd to reproduce the old behavior where --id msg-* with --ephemeral
-	// would fail prefix validation before ephemeral handling.
-	// The fix: sendToSingle no longer passes --id to bd create.
+	// Stub bd to verify two invariants for ephemeral sends:
+	// 1. --id must NOT be msg-* (wrong prefix — causes prefix mismatch with hq- db)
+	// 2. --id MUST be passed with --ephemeral (no-id causes empty ID in SQLite,
+	//    "UNIQUE constraint failed: issues.id" on second send — gt-0uilu6n)
+	// The fix: sendToSingle passes --id {prefix}-wisp-{hex} with the correct prefix.
 	binDir := filepath.Join(tmpDir, "bin")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatalf("mkdir bin: %v", err)
@@ -321,7 +323,7 @@ func TestSendFromCrewWorkspace_AvoidsEphemeralPrefixMismatch(t *testing.T) {
 	script := `#!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "${1:-}" == "config" || "${1:-}" == "init" ]]; then
+if [[ "${1:-}" == "config" || "${1:-}" == "init" || "${1:-}" == "migrate" ]]; then
   exit 0
 fi
 
@@ -357,6 +359,11 @@ if [[ "${1:-}" == "create" ]]; then
     exit 1
   fi
 
+  if [[ "$has_ephemeral" == "true" && -z "$msg_id" ]]; then
+    echo "UNIQUE constraint failed: issues.id" >&2
+    exit 1
+  fi
+
   echo "hq-testmail-1"
   exit 0
 fi
@@ -381,6 +388,131 @@ exit 1
 
 	if err := r.Send(msg); err != nil {
 		t.Fatalf("send from crew workspace should succeed without prefix mismatch: %v", err)
+	}
+}
+
+// TestSendEphemeral_PassesIDToAvoidUniqueConstraint verifies that sending
+// ephemeral (wisp) messages always passes --id to bd create. Without --id,
+// the bd SQLite ephemeral path does not read the prefix from config.yaml and
+// inserts records with id='', causing "UNIQUE constraint failed: issues.id"
+// on the second send (gt-0uilu6n).
+func TestSendEphemeral_PassesIDToAvoidUniqueConstraint(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a bash bd stub")
+	}
+
+	tmpDir := t.TempDir()
+	townRoot := filepath.Join(tmpDir, "town")
+	senderDir := filepath.Join(townRoot, "gastown", "polecats", "alpha")
+	mayorDir := filepath.Join(townRoot, "mayor")
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+
+	for _, dir := range []string{senderDir, mayorDir, townBeadsDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(townBeadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatalf("write beads.db: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+
+	// Stub bd that simulates the SQLite ephemeral empty-ID bug:
+	// without --id, the second create fails with UNIQUE constraint error.
+	var createCalls []string
+	binDir := filepath.Join(tmpDir, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	logFile := filepath.Join(tmpDir, "bd-calls.log")
+	bdStub := filepath.Join(binDir, "bd")
+	script := `#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "config" || "${1:-}" == "init" || "${1:-}" == "migrate" ]]; then
+  exit 0
+fi
+
+if [[ "${1:-}" == "list" ]]; then
+  echo "[]"
+  exit 0
+fi
+
+if [[ "${1:-}" == "mol" && "${2:-}" == "wisp" && "${3:-}" == "list" ]]; then
+  echo "[]"
+  exit 0
+fi
+
+if [[ "${1:-}" == "create" ]]; then
+  has_ephemeral=false
+  msg_id=""
+  i=1
+  while [[ $i -le $# ]]; do
+    arg="${!i}"
+    if [[ "$arg" == "--ephemeral" ]]; then
+      has_ephemeral=true
+    elif [[ "$arg" == "--id" ]]; then
+      ((i++))
+      msg_id="${!i:-}"
+    elif [[ "$arg" == --id=* ]]; then
+      msg_id="${arg#--id=}"
+    fi
+    ((i++))
+  done
+
+  echo "ephemeral=$has_ephemeral id=$msg_id" >> "` + logFile + `"
+
+  if [[ "$has_ephemeral" == "true" && -z "$msg_id" ]]; then
+    echo "UNIQUE constraint failed: issues.id" >&2
+    exit 1
+  fi
+
+  echo "gt-wisp-test1"
+  exit 0
+fi
+
+echo "unsupported bd args: $*" >&2
+exit 1
+`
+	if err := os.WriteFile(bdStub, []byte(script), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	r := NewRouter(senderDir)
+	// Send the same message twice — the second send must not fail with UNIQUE constraint error.
+	for i := 0; i < 2; i++ {
+		msg := &Message{
+			From:           "gastown/polecats/alpha",
+			To:             "gastown/witness",
+			Subject:        "lifecycle: test",
+			Body:           "ping",
+			Wisp:           true,
+			SuppressNotify: true,
+		}
+		if err := r.Send(msg); err != nil {
+			t.Fatalf("send #%d failed (want no UNIQUE constraint error): %v", i+1, err)
+		}
+	}
+
+	// Verify --id was passed in each create call.
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	_ = createCalls
+	for _, line := range strings.Split(strings.TrimSpace(string(logData)), "\n") {
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, "ephemeral=true") && strings.Contains(line, "id=") {
+			// Check that id is not empty
+			if strings.Contains(line, "id= ") || strings.HasSuffix(line, "id=") {
+				t.Errorf("ephemeral create was called without --id: %s", line)
+			}
+		}
 	}
 }
 

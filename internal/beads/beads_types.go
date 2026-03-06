@@ -370,6 +370,16 @@ func ensureDatabaseInitialized(beadsDir string) error {
 // will silently use "gt" instead. Fixing this would require walking up the
 // directory tree to resolve the actual rig name, which is out of scope for
 // this crash-prevention guard.
+
+// DetectBeadsPrefix returns the issue prefix for the given beads directory.
+// Resolution order: rigs.json → config.yaml → default ("gt").
+// Exported for use by callers that need to generate correctly-prefixed IDs
+// before calling bd create (e.g., to work around the ephemeral SQLite path
+// not reading the prefix from config.yaml).
+func DetectBeadsPrefix(beadsDir string) string {
+	return detectPrefix(beadsDir)
+}
+
 func detectPrefix(beadsDir string) string {
 	// 1. Try authoritative source: rigs.json via town root
 	rigDir := filepath.Dir(beadsDir)
