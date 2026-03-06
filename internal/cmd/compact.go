@@ -265,26 +265,71 @@ func runCompact(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// listWisps queries all ephemeral issues from the database.
+// wispIDResult matches the JSON output of `bd mol wisp list --json`.
+type wispIDResult struct {
+	Wisps []struct {
+		ID string `json:"id"`
+	} `json:"wisps"`
+}
+
+// listWisps queries all ephemeral issues (wisps) from the database.
 // Returns extended issue structs with comment_count and wisp_type.
+//
+// Uses a two-phase approach to avoid SQLite's 999-variable IN-clause limit:
+//  1. Fetch all wisp IDs via `bd mol wisp list` (safe path, no large IN clauses).
+//  2. Fetch full issue details in small batches via `bd list --id=...`.
+//
+// The old approach (`bd list --json --all -n 0`) failed when there were many
+// wisps because internal metadata queries (GetDependencyCounts, GetCommentCounts)
+// built unbatched IN clauses over all issue IDs, exceeding SQLite's 999-variable
+// limit. It also silently missed wisps stored in the Dolt wisps table
+// (post-migration) since bd list only searched the issues table by default.
 func listWisps(bd *beads.Beads) ([]*compactIssue, error) {
-	// Use bd list --json --all to get wisps in all statuses, unlimited
-	out, err := bd.Run("list", "--json", "--all", "-n", "0")
+	// Phase 1: Get all wisp IDs. bd mol wisp list routes through the wisps
+	// table (post-migration) or issues table ephemeral filter (pre-migration),
+	// and does not trigger the large unbatched IN-clause metadata queries.
+	out, err := bd.Run("mol", "wisp", "list", "--json", "--all")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("listing wisp IDs: %w", err)
 	}
 
-	var allIssues []*compactIssue
-	if err := json.Unmarshal(out, &allIssues); err != nil {
-		return nil, fmt.Errorf("parsing issue list: %w", err)
+	var wispResult wispIDResult
+	if err := json.Unmarshal(out, &wispResult); err != nil {
+		return nil, fmt.Errorf("parsing wisp ID list: %w", err)
 	}
 
-	// Filter to ephemeral only
+	if len(wispResult.Wisps) == 0 {
+		return nil, nil
+	}
+
+	ids := make([]string, len(wispResult.Wisps))
+	for i, w := range wispResult.Wisps {
+		ids[i] = w.ID
+	}
+
+	// Phase 2: Fetch full issue details in batches of 500. Each batch stays
+	// well under SQLite's 999-variable limit for the internal IN-clause queries.
+	// bd list --id=<ephemeral-ids> routes to the wisps table in beads v0.57+,
+	// falling back to the issues table for pre-migration databases.
+	const batchSize = 500
 	var wisps []*compactIssue
-	for _, issue := range allIssues {
-		if issue.Ephemeral {
-			wisps = append(wisps, issue)
+	for start := 0; start < len(ids); start += batchSize {
+		end := start + batchSize
+		if end > len(ids) {
+			end = len(ids)
 		}
+		batch := ids[start:end]
+
+		batchOut, err := bd.Run("list", "--json", "--id", strings.Join(batch, ","), "--all", "-n", "0")
+		if err != nil {
+			return nil, fmt.Errorf("fetching wisp details (batch %d-%d): %w", start, end, err)
+		}
+
+		var batchIssues []*compactIssue
+		if err := json.Unmarshal(batchOut, &batchIssues); err != nil {
+			return nil, fmt.Errorf("parsing wisp details: %w", err)
+		}
+		wisps = append(wisps, batchIssues...)
 	}
 
 	return wisps, nil
