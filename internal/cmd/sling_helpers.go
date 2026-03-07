@@ -730,7 +730,6 @@ func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, h
 	wispArgs = append(wispArgs, "--json")
 	wispOut, err := BdCmd(wispArgs...).
 		Dir(formulaWorkDir).
-		WithAutoCommit().
 		WithGTRoot(townRoot).
 		Output()
 	if err != nil {
@@ -762,7 +761,6 @@ func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, h
 	bondArgs := []string{"mol", "bond", wispRootID, beadID, "--json"}
 	bondOut, err := BdCmd(bondArgs...).
 		Dir(formulaWorkDir).
-		WithAutoCommit().
 		WithGTRoot(townRoot).
 		Output()
 	if err != nil {
@@ -816,7 +814,6 @@ func bondFormulaDirect(formulaName, beadID, formulaWorkDir, townRoot string, var
 	}
 	bondOut, err := BdCmd(bondArgs...).
 		Dir(formulaWorkDir).
-		WithAutoCommit().
 		WithGTRoot(townRoot).
 		Output()
 	if err != nil {
@@ -984,7 +981,6 @@ func hookBeadWithRetry(beadID, targetAgent, hookDir string) error {
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		err := BdCmd("update", beadID, "--status=hooked", "--assignee="+targetAgent).
 			Dir(hookDir).
-			WithAutoCommit().
 			Run()
 		if err != nil {
 			lastErr = err
