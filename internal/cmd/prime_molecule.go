@@ -228,6 +228,7 @@ func outputDeaconPatrolContext(ctx RoleContext) {
 		Assignee:        "deacon",
 		HeaderEmoji:     "🔄",
 		HeaderTitle:     "Patrol Status (Wisp-based)",
+		RootOnly:        true,
 		WorkLoopSteps: []string{
 			"Work through each patrol step in sequence (see checklist below)",
 			"At cycle end:\n   - If context LOW:\n     * Report and loop: `" + cli.Name() + " patrol report --summary \"<brief summary of observations>\"`\n     * This closes the current patrol and starts a new cycle\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Deacon patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",
@@ -247,6 +248,7 @@ func outputWitnessPatrolContext(ctx RoleContext) {
 		Assignee:        ctx.Rig + "/witness",
 		HeaderEmoji:     constants.EmojiWitness,
 		HeaderTitle:     "Witness Patrol Status",
+		RootOnly:        true,
 		WorkLoopSteps: []string{
 			"Work through each patrol step in sequence (see checklist below)",
 			"At cycle end:\n   - If context LOW:\n     * Report and loop: `" + cli.Name() + " patrol report --summary \"<brief summary of observations>\"`\n     * This closes the current patrol and starts a new cycle\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Witness patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",
@@ -267,6 +269,7 @@ func outputRefineryPatrolContext(ctx RoleContext) {
 		HeaderEmoji:     "🔧",
 		HeaderTitle:     "Refinery Patrol Status",
 		ExtraVars:       buildRefineryPatrolVars(ctx),
+		RootOnly:        true,
 		WorkLoopSteps: []string{
 			"Work through each patrol step in sequence (see checklist below)",
 			"At cycle end:\n   - If context LOW:\n     * Report and loop: `" + cli.Name() + " patrol report --summary \"<brief summary of observations>\"`\n     * This closes the current patrol and starts a new cycle\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Refinery patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",

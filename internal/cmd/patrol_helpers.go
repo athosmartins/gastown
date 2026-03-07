@@ -24,6 +24,14 @@ type PatrolConfig struct {
 	WorkLoopSteps []string     // role-specific instructions
 	ExtraVars     []string     // additional --var key=value args for wisp creation
 	Beads         *beads.Beads // optional injected beads instance (for test isolation)
+
+	// RootOnly signals that patrol wisps for this role are always created with
+	// --root-only (no child steps in the DB). When true, findActivePatrol skips
+	// checkHasOpenChildren entirely — the first hooked patrol is always active
+	// because closed/stale ones have status "closed" and are invisible to the
+	// hooked-beads query. This eliminates per-patrol Dolt round-trips that caused
+	// i/o timeouts on large databases (gt-wcuz6cf).
+	RootOnly bool
 }
 
 // maxStalePurgePerRun caps the number of stale patrol beads cleaned up in a
@@ -45,6 +53,10 @@ const maxStalePurgePerRun = 5
 // e.g. after a squash that didn't close the root). Stale patrols are
 // cleaned up incrementally (up to maxStalePurgePerRun per call); any
 // remaining stale beads are cleaned by burnPreviousPatrolWisps at cycle end.
+//
+// When cfg.RootOnly is true, child-listing is skipped entirely — the first
+// hooked patrol is returned immediately. Root-only wisps have no DB children;
+// stale/closed ones are invisible to the hooked-beads query (gt-wcuz6cf).
 func findActivePatrol(cfg PatrolConfig) (patrolID, patrolLine string, found bool, err error) {
 	b := cfg.Beads
 	if b == nil {
@@ -72,6 +84,16 @@ func findActivePatrol(cfg PatrolConfig) (patrolID, patrolLine string, found bool
 	for _, bead := range hookedBeads {
 		if !strings.HasPrefix(bead.Title, cfg.PatrolMolName) {
 			continue
+		}
+
+		if cfg.RootOnly {
+			// Root-only patrol wisps have no DB children; stale ones have
+			// status "closed" and are invisible to the hooked-beads query
+			// above. The first matching hooked bead is always the active
+			// patrol. Skip checkHasOpenChildren to avoid unnecessary Dolt
+			// round-trips (gt-wcuz6cf).
+			activeBead = bead
+			break
 		}
 
 		hasOpen, err := checkHasOpenChildren(b, bead.ID)
@@ -125,9 +147,39 @@ func findActivePatrol(cfg PatrolConfig) (patrolID, patrolLine string, found bool
 //
 // A parent with zero children is treated as "has open children" (returns true)
 // to protect against a race where a freshly created wisp hasn't had its step
-// children materialized yet. This prevents findActivePatrol from closing a
-// just-created patrol during the window between root creation and step population.
+// children materialized yet, and for root-only patrol wisps which have no DB
+// children by design. This prevents findActivePatrol from closing a just-created
+// patrol during the window between root creation and step population.
+//
+// Uses a two-phase query to minimise Dolt load (gt-wcuz6cf):
+//  1. Fetch at most 1 child (limit=1). Root-only patrols return immediately
+//     (0 results). Non-closed first result short-circuits to "active".
+//  2. Full scan only when the first result is closed — old-style patrols only.
 func checkHasOpenChildren(b *beads.Beads, parentID string) (bool, error) {
+	// Phase 1: fast-path with limit=1 to avoid fetching large child sets.
+	// Root-only patrol wisps return 0 results here and exit immediately,
+	// avoiding full table scans on each call to findActivePatrol (gt-wcuz6cf).
+	first, err := b.List(beads.ListOptions{
+		Parent:   parentID,
+		Status:   "all",
+		Priority: -1,
+		Limit:    1,
+	})
+	if err != nil {
+		return false, err
+	}
+	// Zero children: root-only wisp or still materializing steps — treat as active.
+	if len(first) == 0 {
+		return true, nil
+	}
+	// Non-closed child found on first try — definitely active.
+	if first[0].Status != "closed" {
+		return true, nil
+	}
+
+	// Phase 2: first child is closed; fetch all children to determine whether
+	// the patrol is truly stale (all closed). Only reached for old-style wisps
+	// that have children in the DB (pre-root-only patrols).
 	children, err := b.List(beads.ListOptions{
 		Parent:   parentID,
 		Status:   "all",
@@ -135,11 +187,6 @@ func checkHasOpenChildren(b *beads.Beads, parentID string) (bool, error) {
 	})
 	if err != nil {
 		return false, err
-	}
-	// Zero children means the wisp may still be materializing steps —
-	// treat as active to avoid destroying a just-created patrol.
-	if len(children) == 0 {
-		return true, nil
 	}
 	for _, child := range children {
 		if child.Status != "closed" {
