@@ -531,10 +531,18 @@ func (d *Daemon) compactorCleanup(db *sql.DB, dbName string) {
 }
 
 // compactorOpenDB opens a connection to the Dolt server for the given database.
+// Sets MaxOpenConns(1): compaction is inherently sequential (one transaction at
+// a time per database), so a single connection is sufficient. Prevents pool
+// growth under load (gt-v2p1jxu).
 func (d *Daemon) compactorOpenDB(dbName string) (*sql.DB, error) {
 	dsn := fmt.Sprintf("root@tcp(%s:%d)/%s?parseTime=true&timeout=5s&readTimeout=30s&writeTimeout=30s",
 		"127.0.0.1", d.doltServerPort(), dbName)
-	return sql.Open("mysql", dsn)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	return db, nil
 }
 
 // compactorGetHead returns the current HEAD commit hash of the main branch.

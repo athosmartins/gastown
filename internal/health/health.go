@@ -39,6 +39,7 @@ func LatencyCheck(host string, port int, timeout time.Duration) (time.Duration, 
 		return 0, fmt.Errorf("open connection: %w", err)
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -59,6 +60,7 @@ func DatabaseCount(host string, port int) (int, []string, error) {
 		return 0, nil, err
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

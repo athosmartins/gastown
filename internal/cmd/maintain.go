@@ -288,10 +288,17 @@ func maintainBackupSync(dataDir, dbName, backupName string) error {
 }
 
 // maintainOpenDB opens a connection to the Dolt server for a database.
+// Sets MaxOpenConns(1): maintenance operations are sequential, so a single
+// connection is sufficient. Prevents pool growth under load (gt-v2p1jxu).
 func maintainOpenDB(config *doltserver.Config, dbName string) (*sql.DB, error) {
 	dsn := fmt.Sprintf("%s@tcp(%s)/%s?parseTime=true&timeout=5s&readTimeout=30s&writeTimeout=30s",
 		config.User, config.HostPort(), dbName)
-	return sql.Open("mysql", dsn)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	return db, nil
 }
 
 // maintainFlattenDB flattens a database's commit history to a single commit.

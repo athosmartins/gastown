@@ -12,7 +12,11 @@ import (
 
 const (
 	// bdMolTimeout is the timeout for bd molecule operations.
-	bdMolTimeout = 15 * time.Second
+	// Set to 90s to accommodate slow Dolt writes under load (observed 45s write
+	// times during connection pressure). The previous 15s caused bd close to be
+	// killed mid-transaction, leaving zombie TCP connections that accumulated
+	// until the server crashed (gt-v2p1jxu).
+	bdMolTimeout = 90 * time.Second
 )
 
 // dogMol tracks a molecule (wisp) lifecycle for a daemon dog patrol.

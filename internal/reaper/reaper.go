@@ -22,7 +22,11 @@ import (
 var validDBName = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 
 // DefaultDatabases is the static fallback list of known production databases.
-var DefaultDatabases = []string{"hq", "beads", "gastown"}
+// Used when DiscoverDatabases fails (e.g. Dolt is restarting).
+// "beads" is intentionally excluded — it was a legacy database name that no
+// longer exists. Including it caused connection storms on every fallback cycle
+// as Dolt rejected the "database not found: beads" connections (gt-v2p1jxu).
+var DefaultDatabases = []string{"hq", "gastown"}
 
 // testPollutionPrefixes are database name prefixes created by tests.
 var testPollutionPrefixes = []string{"testdb_", "beads_t", "beads_pt", "doctest_"}
@@ -42,6 +46,7 @@ func DiscoverDatabases(host string, port int) []string {
 		return DefaultDatabases
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -141,6 +146,8 @@ func ValidateDBName(dbName string) error {
 }
 
 // OpenDB opens a connection to the Dolt server for a given database.
+// Sets MaxOpenConns(1) because reaper operations are sequential — a single
+// connection is sufficient and prevents pool growth under load (gt-v2p1jxu).
 func OpenDB(host string, port int, dbName string, readTimeout, writeTimeout time.Duration) (*sql.DB, error) {
 	if err := ValidateDBName(dbName); err != nil {
 		return nil, err
@@ -149,7 +156,12 @@ func OpenDB(host string, port int, dbName string, readTimeout, writeTimeout time
 		host, port, dbName,
 		fmt.Sprintf("%ds", int(readTimeout.Seconds())),
 		fmt.Sprintf("%ds", int(writeTimeout.Seconds())))
-	return sql.Open("mysql", dsn)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	return db, nil
 }
 
 // parentExcludeJoin returns a LEFT JOIN clause and WHERE condition that restricts
