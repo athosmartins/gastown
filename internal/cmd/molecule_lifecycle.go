@@ -376,10 +376,10 @@ func forceCloseDescendants(b *beads.Beads, parentID string) (int, error) {
 }
 
 func closeDescendantsImpl(b *beads.Beads, parentID string, force bool) (int, error) {
-	children, err := b.List(beads.ListOptions{
-		Parent: parentID,
-		Status: "all",
-	})
+	// Use ListChildren (bd show --children) instead of bd list --parent --status all.
+	// The latter triggers a slow full-table scan on large databases, causing i/o
+	// timeouts during patrol report closeout (gt-wcuz6cf).
+	children, err := b.ListChildren(parentID)
 	if err != nil {
 		return 0, fmt.Errorf("listing children of %s: %w", parentID, err)
 	}

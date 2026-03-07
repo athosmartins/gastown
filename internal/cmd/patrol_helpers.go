@@ -128,11 +128,10 @@ func findActivePatrol(cfg PatrolConfig) (patrolID, patrolLine string, found bool
 // children materialized yet. This prevents findActivePatrol from closing a
 // just-created patrol during the window between root creation and step population.
 func checkHasOpenChildren(b *beads.Beads, parentID string) (bool, error) {
-	children, err := b.List(beads.ListOptions{
-		Parent:   parentID,
-		Status:   "all",
-		Priority: -1,
-	})
+	// Use ListChildren (bd show --children) instead of bd list --parent --status all.
+	// The latter triggers a slow full-table scan on large databases, causing i/o
+	// timeouts during patrol validation (gt-wcuz6cf).
+	children, err := b.ListChildren(parentID)
 	if err != nil {
 		return false, err
 	}

@@ -739,6 +739,33 @@ func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
 	return result, nil
 }
 
+// ListChildren returns all child issues of the given parent ID, regardless of status.
+// Uses 'bd show --children --json' which avoids the slow full-table scan that
+// 'bd list --parent --status all' triggers on large databases (gt-wcuz6cf).
+func (b *Beads) ListChildren(parentID string) ([]*Issue, error) {
+	out, err := b.run("show", parentID, "--children", "--json")
+	if err != nil {
+		return nil, err
+	}
+
+	// bd show --children --json returns a map: {"parent-id": [{...}, ...]}
+	// Try the wrapped format first.
+	var wrapped map[string][]*Issue
+	if err := json.Unmarshal(out, &wrapped); err == nil {
+		for _, children := range wrapped {
+			return children, nil
+		}
+		return nil, nil
+	}
+
+	// Fallback: bare array format.
+	var children []*Issue
+	if err := json.Unmarshal(out, &children); err != nil {
+		return nil, fmt.Errorf("parsing bd show --children output: %w", err)
+	}
+	return children, nil
+}
+
 // Blocked returns issues that are blocked by dependencies.
 func (b *Beads) Blocked() ([]*Issue, error) {
 	out, err := b.run("blocked", "--json")

@@ -851,3 +851,64 @@ func TestBurnPreviousPatrolWisps_IgnoresOtherBeads(t *testing.T) {
 		t.Errorf("non-patrol bead status = %q, want %q (should not be burned)", otherIssue.Status, beads.StatusHooked)
 	}
 }
+
+// TestListChildren verifies that ListChildren returns all children including closed ones.
+// This covers the gt-wcuz6cf fix: ListChildren uses bd show --children which avoids
+// the slow full-table scan that bd list --parent --status all triggers on large DBs.
+func TestListChildren(t *testing.T) {
+	requireBd(t)
+	_, b := setupPatrolTestDB(t)
+
+	// Create a parent bead.
+	parent, err := b.Create(beads.CreateOptions{Title: "parent", Priority: -1})
+	if err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+
+	// Create two children: one stays open, one gets closed.
+	child1, err := b.Create(beads.CreateOptions{Title: "child-open", Parent: parent.ID, Priority: -1})
+	if err != nil {
+		t.Fatalf("create child1: %v", err)
+	}
+	child2, err := b.Create(beads.CreateOptions{Title: "child-closed", Parent: parent.ID, Priority: -1})
+	if err != nil {
+		t.Fatalf("create child2: %v", err)
+	}
+	if err := b.ForceCloseWithReason("done", child2.ID); err != nil {
+		t.Fatalf("close child2: %v", err)
+	}
+
+	// ListChildren should return both children (open and closed).
+	children, err := b.ListChildren(parent.ID)
+	if err != nil {
+		t.Fatalf("ListChildren: %v", err)
+	}
+	if len(children) != 2 {
+		t.Errorf("ListChildren returned %d children, want 2", len(children))
+	}
+
+	// Verify statuses.
+	statuses := make(map[string]string)
+	for _, c := range children {
+		statuses[c.ID] = c.Status
+	}
+	if statuses[child1.ID] != "open" {
+		t.Errorf("child1 status = %q, want open", statuses[child1.ID])
+	}
+	if statuses[child2.ID] != "closed" {
+		t.Errorf("child2 status = %q, want closed", statuses[child2.ID])
+	}
+
+	// ListChildren on a bead with no children should return empty slice, no error.
+	lone, err := b.Create(beads.CreateOptions{Title: "no-children", Priority: -1})
+	if err != nil {
+		t.Fatalf("create lone: %v", err)
+	}
+	empty, err := b.ListChildren(lone.ID)
+	if err != nil {
+		t.Fatalf("ListChildren (no children): %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("ListChildren of childless bead returned %d, want 0", len(empty))
+	}
+}
