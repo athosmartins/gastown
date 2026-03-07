@@ -620,6 +620,84 @@ func TestFindActivePatrolZeroChildren(t *testing.T) {
 	}
 }
 
+// TestFindActivePatrolRootOnly verifies that when RootOnly=true, findActivePatrol
+// skips checkHasOpenChildren entirely and returns the first hooked patrol as active.
+// This is the zero-Dolt-query path for root-only patrol wisps (gt-wcuz6cf).
+func TestFindActivePatrolRootOnly(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+
+	molName := "mol-test-patrol"
+	assignee := "testrig/witness"
+
+	// Create a patrol with NO children — simulates a root-only wisp.
+	rootID := createHookedPatrol(t, b, molName, assignee, false /* no children */)
+
+	cfg := PatrolConfig{
+		PatrolMolName: molName,
+		BeadsDir:      tmpDir,
+		Assignee:      assignee,
+		Beads:         b,
+		RootOnly:      true,
+	}
+
+	patrolID, _, found, findErr := findActivePatrol(cfg)
+	if findErr != nil {
+		t.Fatalf("findActivePatrol error: %v", findErr)
+	}
+	if !found {
+		t.Fatal("expected RootOnly patrol to be found as active")
+	}
+	if patrolID != rootID {
+		t.Errorf("patrolID = %q, want %q", patrolID, rootID)
+	}
+
+	// Patrol must remain hooked — RootOnly path must not close it
+	issue, err := b.Show(rootID)
+	if err != nil {
+		t.Fatalf("show patrol: %v", err)
+	}
+	if issue.Status != beads.StatusHooked {
+		t.Errorf("RootOnly patrol status = %q, want %q (must not be closed)", issue.Status, beads.StatusHooked)
+	}
+}
+
+// TestFindActivePatrolRootOnlyMultiple verifies that when RootOnly=true and multiple
+// hooked patrols exist, findActivePatrol returns the first one (no stale detection).
+// In production, burnPreviousPatrolWisps prevents accumulation; this tests the
+// fast path is still correct when extras exist.
+func TestFindActivePatrolRootOnlyMultiple(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+
+	molName := "mol-test-patrol"
+	assignee := "testrig/witness"
+
+	// Create two root-only patrols (no children each)
+	first := createHookedPatrol(t, b, molName, assignee, false)
+	_ = createHookedPatrol(t, b, molName, assignee, false)
+
+	cfg := PatrolConfig{
+		PatrolMolName: molName,
+		BeadsDir:      tmpDir,
+		Assignee:      assignee,
+		Beads:         b,
+		RootOnly:      true,
+	}
+
+	patrolID, _, found, findErr := findActivePatrol(cfg)
+	if findErr != nil {
+		t.Fatalf("findActivePatrol error: %v", findErr)
+	}
+	if !found {
+		t.Fatal("expected to find active patrol")
+	}
+	// RootOnly returns first matching bead (no child scan to distinguish them)
+	if patrolID != first {
+		t.Errorf("patrolID = %q, want %q (first hooked patrol)", patrolID, first)
+	}
+}
+
 func TestFindActivePatrolMultiple(t *testing.T) {
 	requireBd(t)
 	tmpDir, b := setupPatrolTestDB(t)

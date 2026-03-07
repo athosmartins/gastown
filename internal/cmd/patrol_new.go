@@ -55,6 +55,7 @@ func runPatrolNew(cmd *cobra.Command, args []string) error {
 			PatrolMolName: constants.MolDeaconPatrol,
 			BeadsDir:      roleInfo.TownRoot,
 			Assignee:      "deacon",
+			RootOnly:      true,
 		}
 	case RoleWitness:
 		cfg = PatrolConfig{
@@ -62,6 +63,7 @@ func runPatrolNew(cmd *cobra.Command, args []string) error {
 			PatrolMolName: constants.MolWitnessPatrol,
 			BeadsDir:      roleInfo.WorkDir,
 			Assignee:      roleInfo.Rig + "/witness",
+			RootOnly:      true,
 		}
 	case RoleRefinery:
 		cfg = PatrolConfig{
@@ -70,6 +72,7 @@ func runPatrolNew(cmd *cobra.Command, args []string) error {
 			BeadsDir:      roleInfo.WorkDir,
 			Assignee:      roleInfo.Rig + "/refinery",
 			ExtraVars:     buildRefineryPatrolVars(roleInfo),
+			RootOnly:      true,
 		}
 	default:
 		return fmt.Errorf("unsupported role for patrol: %q (expected deacon, witness, or refinery)", roleName)
