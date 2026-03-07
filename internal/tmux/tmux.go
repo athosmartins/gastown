@@ -1462,6 +1462,12 @@ func (t *Tmux) AcceptStartupDialogs(session string) error {
 // Claude hasn't rendered the dialog yet when we first check. Exits early if the
 // agent prompt appears (indicating no dialog will be shown).
 func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
+	// dialogEmptyPollThreshold: exit early after this many consecutive all-whitespace
+	// pane captures. Fancy shell prompts (oh-my-zsh, powerlevel10k) are invisible to
+	// capture-pane but a live trust dialog always has visible text. 4 polls × 500ms = 2s.
+	const dialogEmptyPollThreshold = 4
+	emptyPollCount := 0
+
 	deadline := time.Now().Add(constants.DialogPollTimeout)
 	for time.Now().Before(deadline) {
 		content, err := t.CapturePane(session, 30)
@@ -1486,6 +1492,19 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 		// Also exit if bypass permissions dialog is next (handled by AcceptBypassPermissionsWarning).
 		if containsPromptIndicator(content) || strings.Contains(content, "Bypass Permissions mode") {
 			return nil
+		}
+
+		// Early exit: if the pane has been consistently empty (no dialog text, no visible
+		// prompt), assume no trust dialog will appear. A live dialog always has visible text;
+		// an empty pane means either no agent is running or the agent is at an idle prompt
+		// whose text is invisible to capture-pane (e.g., fancy zsh themes).
+		if strings.TrimSpace(content) == "" {
+			emptyPollCount++
+			if emptyPollCount >= dialogEmptyPollThreshold {
+				return nil
+			}
+		} else {
+			emptyPollCount = 0
 		}
 
 		time.Sleep(constants.DialogPollInterval)
@@ -1529,6 +1548,9 @@ func containsPromptIndicator(content string) bool {
 // Call this after starting Claude and waiting for it to initialize (WaitForCommand),
 // but before sending any prompts.
 func (t *Tmux) AcceptBypassPermissionsWarning(session string) error {
+	const dialogEmptyPollThreshold = 4
+	emptyPollCount := 0
+
 	deadline := time.Now().Add(constants.DialogPollTimeout)
 	for time.Now().Before(deadline) {
 		content, err := t.CapturePane(session, 30)
@@ -1553,6 +1575,16 @@ func (t *Tmux) AcceptBypassPermissionsWarning(session string) error {
 		// Early exit: if agent prompt or shell prompt is visible, no dialog will appear
 		if containsPromptIndicator(content) {
 			return nil
+		}
+
+		// Early exit after consecutive empty polls — see AcceptWorkspaceTrustDialog for rationale.
+		if strings.TrimSpace(content) == "" {
+			emptyPollCount++
+			if emptyPollCount >= dialogEmptyPollThreshold {
+				return nil
+			}
+		} else {
+			emptyPollCount = 0
 		}
 
 		time.Sleep(constants.DialogPollInterval)
