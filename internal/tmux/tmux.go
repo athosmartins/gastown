@@ -3139,22 +3139,30 @@ func (t *Tmux) CleanupOrphanedSessions(isGTSession func(string) bool) (cleaned i
 		return 0, fmt.Errorf("listing sessions: %w", err)
 	}
 
+	// First pass: identify all zombie sessions before killing any.
+	// Killing a session can trigger shell hooks (e.g. tmux session-closed hooks)
+	// that spawn background processes in surviving sessions' process trees.
+	// Those background processes would cause IsAgentAlive to return true for
+	// sessions that are actually zombies, hiding them from cleanup.
+	// By checking all sessions first, we get a consistent snapshot.
+	var zombies []string
 	for _, sess := range sessions {
-		// Only process Gas Town sessions
 		if !isGTSession(sess) {
 			continue
 		}
-
-		// Check if the session is a zombie (tmux alive, agent dead)
 		if !t.IsAgentAlive(sess) {
-			// Kill the zombie session
-			if killErr := t.KillSessionWithProcesses(sess); killErr != nil {
-				// Log but continue - other sessions may still need cleanup
-				fmt.Printf("  warning: failed to kill orphaned session %s: %v\n", sess, killErr)
-				continue
-			}
-			cleaned++
+			zombies = append(zombies, sess)
 		}
+	}
+
+	// Second pass: kill all identified zombies.
+	for _, sess := range zombies {
+		if killErr := t.KillSessionWithProcesses(sess); killErr != nil {
+			// Log but continue - other sessions may still need cleanup
+			fmt.Printf("  warning: failed to kill orphaned session %s: %v\n", sess, killErr)
+			continue
+		}
+		cleaned++
 	}
 
 	return cleaned, nil
