@@ -45,7 +45,9 @@ Spawn ──▶ Hook ──▶ Work ──▶ gt done ──▶ Nuke
 - **Hook:** Molecule assigned via `hook_bead` on agent bead; GUPP fires
 - **Work:** Polecat executes molecule steps, making atomic commits
 - **`gt done`:** Pushes branch, creates MR bead, signals witness, exits
-- **Nuke:** Witness removes sandbox after successful merge
+- **Nuke:** Witness removes sandbox after successful merge (worktree + session deleted).
+  Note: in the persistent polecat model, the sandbox survives `gt done` and is reused
+  for the next work assignment — the diagram above describes the ephemeral model.
 
 **What persists across sessions:**
 - Git state (branch, commits, staged changes)
@@ -301,7 +303,7 @@ still running after 60 seconds, it's hung.
 Detection checklist:
 ```bash
 # 1. Find polecats with done-intent label
-bd list --label=done-intent --status=working
+bd list --label=done-intent --status=in_progress
 
 # 2. Check each one's tmux session
 tmux list-panes -t <session-name> -F "#{pane_current_command}"
