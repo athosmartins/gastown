@@ -73,6 +73,7 @@ var (
 	handoffCycle      bool
 	handoffReason     string
 	handoffNoGitCheck bool
+	handoffAutoCommit bool
 )
 
 func init() {
@@ -86,6 +87,7 @@ func init() {
 	handoffCmd.Flags().BoolVar(&handoffCycle, "cycle", false, "Auto-cycle session (for PreCompact hooks that want full session replacement)")
 	handoffCmd.Flags().StringVar(&handoffReason, "reason", "", "Reason for handoff (e.g., 'compaction', 'idle')")
 	handoffCmd.Flags().BoolVar(&handoffNoGitCheck, "no-git-check", false, "Skip git workspace cleanliness check")
+	handoffCmd.Flags().BoolVar(&handoffAutoCommit, "auto-commit", false, "Auto-commit dirty tracked files before handoff (wip commit)")
 	rootCmd.AddCommand(handoffCmd)
 }
 
@@ -196,6 +198,11 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 	currentSession, err := getCurrentTmuxSession()
 	if err != nil {
 		return fmt.Errorf("getting session name: %w", err)
+	}
+
+	// Auto-commit dirty tracked files before handoff if --auto-commit is set.
+	if handoffAutoCommit {
+		autoCommitHandoffWork()
 	}
 
 	// Warn if workspace has uncommitted or unpushed work (wa-7967c).
@@ -1268,6 +1275,60 @@ func sendHandoffMail(subject, message string) (string, error) {
 	}
 
 	return beadID, nil
+}
+
+// autoCommitHandoffWork commits dirty tracked files as a WIP commit before handoff.
+// Only commits tracked files (modified/added/deleted via git add -u) — untracked
+// files are left alone. Non-fatal: prints warnings and returns on any failure.
+// Pushes after committing if the branch has a remote tracking ref.
+func autoCommitHandoffWork() {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return
+	}
+	g := git.NewGit(cwd)
+	if !g.IsRepo() {
+		return
+	}
+
+	// Stage all tracked changes (modified/deleted) only — git add -u skips untracked files.
+	addOut, addErr := exec.Command("git", "-C", cwd, "add", "-u").CombinedOutput()
+	if addErr != nil {
+		fmt.Fprintf(os.Stderr, "%s auto-commit: git add -u failed: %s\n", ui.IconWarn, strings.TrimSpace(string(addOut)))
+		return
+	}
+
+	// Check if there's anything staged (i.e., tracked changes exist).
+	if diffErr := exec.Command("git", "-C", cwd, "diff", "--cached", "--quiet").Run(); diffErr == nil {
+		// Exit 0 means no staged changes — nothing to commit.
+		return
+	}
+
+	actor := os.Getenv("BD_ACTOR")
+	if actor == "" {
+		actor = os.Getenv("USER")
+	}
+	msg := fmt.Sprintf("wip(%s): auto-commit at session end %s", actor, time.Now().UTC().Format(time.RFC3339))
+	if err := g.Commit(msg); err != nil {
+		fmt.Fprintf(os.Stderr, "%s auto-commit: git commit failed: %v\n", ui.IconWarn, err)
+		return
+	}
+	fmt.Printf("  auto-committed tracked changes: %s\n", msg)
+
+	// Push: pull --rebase first to avoid conflicts, then push.
+	branch, _ := g.CurrentBranch()
+	if branch == "" {
+		return
+	}
+	if out, err := exec.Command("git", "-C", cwd, "pull", "--rebase", "origin", branch).CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "%s auto-commit: git pull --rebase failed: %s\n", ui.IconWarn, strings.TrimSpace(string(out)))
+		return
+	}
+	if err := g.Push("origin", branch, false); err != nil {
+		fmt.Fprintf(os.Stderr, "%s auto-commit: git push failed: %v\n", ui.IconWarn, err)
+		return
+	}
+	fmt.Printf("  pushed wip commit to origin/%s\n", branch)
 }
 
 // warnHandoffGitStatus checks the current workspace for uncommitted or unpushed

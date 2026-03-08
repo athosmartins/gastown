@@ -748,6 +748,92 @@ func TestRecordHandoffTime(t *testing.T) {
 	}
 }
 
+// TestAutoCommitHandoffWork verifies the --auto-commit behavior.
+func TestAutoCommitHandoffWork(t *testing.T) {
+	origCwd, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origCwd) })
+
+	t.Run("no-op on clean repo", func(t *testing.T) {
+		dir := makeTestGitRepo(t)
+		os.Chdir(dir)
+		t.Cleanup(func() { os.Chdir(origCwd) })
+		// Should not panic or error — just return silently
+		autoCommitHandoffWork()
+		// Verify no new commits
+		out, _ := exec.Command("git", "-C", dir, "log", "--oneline").Output()
+		if strings.Count(string(out), "\n") != 1 {
+			t.Errorf("expected exactly 1 commit after no-op, got: %s", out)
+		}
+	})
+
+	t.Run("does not commit untracked files", func(t *testing.T) {
+		dir := makeTestGitRepo(t)
+		os.WriteFile(filepath.Join(dir, "untracked.txt"), []byte("new"), 0644)
+		os.Chdir(dir)
+		t.Cleanup(func() { os.Chdir(origCwd) })
+		autoCommitHandoffWork()
+		// No new commits — untracked files should not be touched
+		out, _ := exec.Command("git", "-C", dir, "log", "--oneline").Output()
+		if strings.Count(string(out), "\n") != 1 {
+			t.Errorf("expected exactly 1 commit (no wip for untracked), got: %s", out)
+		}
+		// Untracked file should still be untracked
+		statusOut, _ := exec.Command("git", "-C", dir, "status", "--porcelain").Output()
+		if !strings.Contains(string(statusOut), "?? untracked.txt") {
+			t.Errorf("expected untracked.txt to remain untracked, got: %s", statusOut)
+		}
+	})
+
+	t.Run("commits modified tracked files", func(t *testing.T) {
+		dir := makeTestGitRepo(t)
+		// Create and commit a tracked file
+		fpath := filepath.Join(dir, "tracked.txt")
+		os.WriteFile(fpath, []byte("original"), 0644)
+		exec.Command("git", "-C", dir, "add", "tracked.txt").Run()
+		exec.Command("git", "-C", dir, "commit", "-m", "add tracked").Run()
+		// Modify it
+		os.WriteFile(fpath, []byte("modified"), 0644)
+		os.Chdir(dir)
+		t.Cleanup(func() { os.Chdir(origCwd) })
+		// git pull/push will fail (no remote) but the commit should succeed
+		autoCommitHandoffWork()
+		// Should have a new wip commit
+		out, _ := exec.Command("git", "-C", dir, "log", "--oneline").Output()
+		if !strings.Contains(string(out), "wip(") {
+			t.Errorf("expected wip commit in log, got: %s", out)
+		}
+		// tracked.txt should be committed (only untracked remain, if any)
+		statusOut, _ := exec.Command("git", "-C", dir, "status", "--porcelain").Output()
+		if strings.Contains(string(statusOut), "tracked.txt") {
+			t.Errorf("expected tracked.txt to be committed, got status: %s", statusOut)
+		}
+	})
+
+	t.Run("does not commit untracked alongside modified tracked", func(t *testing.T) {
+		dir := makeTestGitRepo(t)
+		fpath := filepath.Join(dir, "tracked.txt")
+		os.WriteFile(fpath, []byte("original"), 0644)
+		exec.Command("git", "-C", dir, "add", "tracked.txt").Run()
+		exec.Command("git", "-C", dir, "commit", "-m", "add tracked").Run()
+		// Modify tracked + add untracked
+		os.WriteFile(fpath, []byte("modified"), 0644)
+		os.WriteFile(filepath.Join(dir, "new.txt"), []byte("new"), 0644)
+		os.Chdir(dir)
+		t.Cleanup(func() { os.Chdir(origCwd) })
+		// git pull/push will fail (no remote) but the commit should succeed
+		autoCommitHandoffWork()
+		// new.txt should remain untracked
+		statusOut, _ := exec.Command("git", "-C", dir, "status", "--porcelain").Output()
+		if !strings.Contains(string(statusOut), "?? new.txt") {
+			t.Errorf("expected new.txt to remain untracked, got: %s", statusOut)
+		}
+		// tracked.txt should be committed
+		if strings.Contains(string(statusOut), "tracked.txt") {
+			t.Errorf("expected tracked.txt to be committed, got status: %s", statusOut)
+		}
+	})
+}
+
 // TestEnforceHandoffCooldown verifies the cooldown logic:
 // - No cooldown when no previous handoff recorded
 // - Cooldown triggers when last handoff was recent
