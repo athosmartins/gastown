@@ -208,9 +208,9 @@ event history — if the process crashes, work must be replayed from the last ch
 
 ## 4. AutoGen → Microsoft Agent Framework
 
-AutoGen started as Microsoft Research's conversational multi-agent framework. In October
-2025 it was merged with Semantic Kernel into the **Microsoft Agent Framework**, with
-AutoGen entering maintenance mode (bug fixes only).
+AutoGen started as Microsoft Research's conversational multi-agent framework. In late 2025
+it was consolidated with Semantic Kernel into the **Microsoft Agent Framework**, with
+AutoGen entering maintenance mode (bug fixes only). See [Microsoft's announcement](https://microsoft.github.io/autogen/) for current status.
 
 ### AutoGen v0.4 Architecture (Pre-merger)
 
