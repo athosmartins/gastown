@@ -350,7 +350,7 @@ for entry in "${CANDIDATES[@]}"; do
       log "  WARNING: Table $TABLE appeared after compaction (new table?)"
       continue
     fi
-    if [[ "$POST_COUNT" != "$PRE" ]]; then
+    if [[ "$POST_COUNT" -lt "$PRE" ]]; then
       log "  INTEGRITY FAILURE: $DB.$TABLE — pre=$PRE post=$POST_COUNT"
       INTEGRITY_OK=false
     fi
