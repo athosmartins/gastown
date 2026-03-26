@@ -992,7 +992,19 @@ func (g *Git) IsEmpty() (bool, error) {
 }
 
 // RemoteBranchExists checks if a branch exists on the remote.
+// When remote is a remote name (e.g. "origin"), this checks the push URL so
+// that fork-based workflows (fetch=upstream, push=fork) are handled correctly.
+// Branches are pushed to the push URL, so ls-remote must query the push URL.
 func (g *Git) RemoteBranchExists(remote, branch string) (bool, error) {
+	// Resolve push URL when remote is a name (not a bare URL).
+	// git remote get-url --push returns the fetch URL when no custom push URL
+	// is configured, so this is safe to call unconditionally.
+	fetchURL, fetchErr := g.RemoteURL(remote)
+	pushURL, pushErr := g.GetPushURL(remote)
+	if fetchErr == nil && pushErr == nil && pushURL != fetchURL {
+		// Custom push URL configured: query push URL directly.
+		remote = pushURL
+	}
 	out, err := g.run("ls-remote", "--heads", remote, branch)
 	if err != nil {
 		return false, err

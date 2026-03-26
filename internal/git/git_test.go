@@ -1674,6 +1674,65 @@ func TestClearPushURL(t *testing.T) {
 	}
 }
 
+func TestRemoteBranchExists_SplitURL(t *testing.T) {
+	// Simulate fork-based workflow: fetch URL = upstream, push URL = fork.
+	// Branch is pushed to the fork; RemoteBranchExists must check the push URL.
+	localDir, forkDir, mainBranch := initTestRepoWithRemote(t)
+	_ = mainBranch
+
+	// Create an "upstream" bare repo (the fetch URL)
+	tmp := t.TempDir()
+	upstreamDir := filepath.Join(tmp, "upstream.git")
+	if err := exec.Command("git", "init", "--bare", upstreamDir).Run(); err != nil {
+		t.Fatalf("git init --bare upstream: %v", err)
+	}
+
+	// Configure origin: fetch = upstream (empty), push = fork
+	for _, args := range [][]string{
+		{"git", "remote", "set-url", "origin", upstreamDir},
+		{"git", "remote", "set-url", "--push", "origin", forkDir},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = localDir
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+	}
+
+	// Create and push a branch to the fork (push URL)
+	featureBranch := "feature/test-split-url"
+	for _, args := range [][]string{
+		{"git", "checkout", "-b", featureBranch},
+		{"git", "push", "origin", featureBranch},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = localDir
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+	}
+
+	g := NewGit(localDir)
+
+	// Branch exists on the fork (push URL) — should return true.
+	exists, err := g.RemoteBranchExists("origin", featureBranch)
+	if err != nil {
+		t.Fatalf("RemoteBranchExists: %v", err)
+	}
+	if !exists {
+		t.Error("RemoteBranchExists = false, want true (branch was pushed to fork/push URL)")
+	}
+
+	// Non-existent branch should return false.
+	exists, err = g.RemoteBranchExists("origin", "feature/does-not-exist")
+	if err != nil {
+		t.Fatalf("RemoteBranchExists (missing): %v", err)
+	}
+	if exists {
+		t.Error("RemoteBranchExists = true for non-existent branch, want false")
+	}
+}
+
 func TestIsGasTownRuntimePath(t *testing.T) {
 	tests := []struct {
 		path string
