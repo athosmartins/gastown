@@ -83,6 +83,31 @@ fi
 
 # --- Step 2: JSONL export ----------------------------------------------------
 
+# Find the canonical .beads/dolt directory for a given Dolt database name.
+# bd export requires a directory path (via BEADS_DB), not a database name.
+# The canonical directory is the one whose rig name matches the database name.
+_find_bd_dolt_dir() {
+  local db_name="$1"
+  # Town-root beads always owns "hq"
+  if [[ "$db_name" == "hq" ]]; then
+    echo "$TOWN_ROOT/.beads/dolt"
+    return 0
+  fi
+  # Prefer the canonical mayor/rig/.beads/dolt location first, then fall back
+  # to a direct search under the rig root (excludes polecat/crew/worker paths).
+  local candidates=(
+    "$TOWN_ROOT/$db_name/mayor/rig/.beads/dolt"
+    "$TOWN_ROOT/$db_name/.beads/dolt"
+  )
+  for dolt_dir in "${candidates[@]}"; do
+    if [[ -d "$dolt_dir" ]]; then
+      echo "$dolt_dir"
+      return 0
+    fi
+  done
+  return 1
+}
+
 log "Starting archive cycle (databases: ${PROD_DBS[*]})"
 mkdir -p "$JSONL_EXPORT_DIR"
 
@@ -96,8 +121,10 @@ for DB in "${PROD_DBS[@]}"; do
 
   log "Exporting $DB..."
 
-  # Try bd export first (native beads export)
-  if bd export --db "$DB" --format jsonl > "$EXPORT_FILE" 2>/dev/null; then
+  # Try bd export first (native beads export with labels, dependencies, etc.)
+  # bd export requires the .beads/dolt directory path via BEADS_DB, not the DB name.
+  _BD_DOLT_DIR=$(_find_bd_dolt_dir "$DB")
+  if [[ -n "$_BD_DOLT_DIR" ]] && BEADS_DB="$_BD_DOLT_DIR" bd export > "$EXPORT_FILE" 2>/dev/null && [[ -s "$EXPORT_FILE" ]]; then
     LINE_COUNT=$(wc -l < "$EXPORT_FILE" | tr -d ' ')
     FILE_SIZE=$(du -h "$EXPORT_FILE" | cut -f1)
     log "  $DB: $LINE_COUNT issues exported ($FILE_SIZE) [bd export]"
