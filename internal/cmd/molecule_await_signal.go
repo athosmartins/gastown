@@ -410,8 +410,10 @@ func parseIntSimple(s string) (int, error) {
 
 // updateAgentHeartbeat updates the last_activity timestamp on an agent bead.
 // This proves the agent is alive and processing signals.
+// Uses bd set-state (bd 0.62.0+); bd agent heartbeat was removed in that release.
 func updateAgentHeartbeat(agentBead, beadsDir string) error {
-	cmd := exec.Command("bd", "agent", "heartbeat", agentBead)
+	ts := time.Now().UTC().Format(time.RFC3339)
+	cmd := exec.Command("bd", "set-state", agentBead, "last_activity="+ts) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
 	return cmd.Run()
 }
