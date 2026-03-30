@@ -31,7 +31,8 @@ var (
 	mailThreadJSON    bool
 	mailReplySubject  string
 	mailReplyMessage  string
-	mailStdin         bool // Read message body from stdin
+	mailStdin            bool // Read message body from stdin
+	mailAllowCredentials bool // Bypass credential scan (--allow-credentials)
 
 	// Search flags
 	mailSearchFrom    string
@@ -472,6 +473,7 @@ func init() {
 	mailSendCmd.Flags().StringVar(&mailTo, "to", "", "Recipient address (alternative to positional argument)")
 	mailSendCmd.Flags().BoolVar(&mailSendSelf, "self", false, "Send to self (auto-detect from cwd)")
 	mailSendCmd.Flags().StringArrayVar(&mailCC, "cc", nil, "CC recipients (can be used multiple times)")
+	mailSendCmd.Flags().BoolVar(&mailAllowCredentials, "allow-credentials", false, "Bypass credential scan warning (use with caution — creates permanent record)")
 	_ = mailSendCmd.MarkFlagRequired("subject") // cobra flags: error only at runtime if missing
 
 	// Inbox flags
