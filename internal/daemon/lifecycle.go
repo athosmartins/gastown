@@ -17,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // BeadsMessage represents a message from gt mail inbox --json.
@@ -42,6 +43,7 @@ func (d *Daemon) ProcessLifecycleRequests() {
 	cmd := exec.Command(d.gtPath, "mail", "inbox", "--identity", "deacon/", "--json")
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = os.Environ() // Inherit PATH to find gt executable
+	util.SetDetachedProcessGroup(cmd)
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -558,13 +560,22 @@ func (d *Daemon) getStartCommand(roleConfig *beads.RoleConfig, parsed *ParsedIde
 // setSessionEnvironment sets environment variables for the tmux session.
 // Uses centralized AgentEnv for consistency, plus custom env vars from role config if available.
 func (d *Daemon) setSessionEnvironment(sessionName string, roleConfig *beads.RoleConfig, parsed *ParsedIdentity) {
+	// Resolve CLAUDE_CONFIG_DIR from accounts.json so daemon-restarted sessions
+	// use the correct account. Mirrors the crew startup path (start.go).
+	accountsPath := constants.MayorAccountsPath(d.config.TownRoot)
+	runtimeConfigDir, _, _ := config.ResolveAccountConfigDir(accountsPath, "")
+	if runtimeConfigDir == "" {
+		runtimeConfigDir = os.Getenv("CLAUDE_CONFIG_DIR")
+	}
+
 	// Use centralized AgentEnv for base environment variables
 	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:        parsed.RoleType,
-		Rig:         parsed.RigName,
-		AgentName:   parsed.AgentName,
-		TownRoot:    d.config.TownRoot,
-		SessionName: sessionName,
+		Role:             parsed.RoleType,
+		Rig:              parsed.RigName,
+		AgentName:        parsed.AgentName,
+		TownRoot:         d.config.TownRoot,
+		RuntimeConfigDir: runtimeConfigDir,
+		SessionName:      sessionName,
 	})
 	for k, v := range envVars {
 		_ = d.tmux.SetEnvironment(sessionName, k, v)
@@ -633,6 +644,7 @@ func (d *Daemon) syncWorkspace(workDir string) {
 	fetchCmd.Dir = workDir
 	fetchCmd.Stderr = &stderr
 	fetchCmd.Env = os.Environ() // Inherit PATH to find git executable
+	util.SetDetachedProcessGroup(fetchCmd)
 	if err := fetchCmd.Run(); err != nil {
 		errMsg := strings.TrimSpace(stderr.String())
 		if errMsg == "" {
@@ -655,6 +667,7 @@ func (d *Daemon) syncWorkspace(workDir string) {
 		stashCmd.Dir = workDir
 		stashCmd.Stderr = &stderr
 		stashCmd.Env = os.Environ()
+		util.SetDetachedProcessGroup(stashCmd)
 		if err := stashCmd.Run(); err != nil {
 			errMsg := strings.TrimSpace(stderr.String())
 			if errMsg == "" {
@@ -673,6 +686,7 @@ func (d *Daemon) syncWorkspace(workDir string) {
 	pullCmd.Dir = workDir
 	pullCmd.Stderr = &stderr
 	pullCmd.Env = os.Environ() // Inherit PATH to find git executable
+	util.SetDetachedProcessGroup(pullCmd)
 	if err := pullCmd.Run(); err != nil {
 		errMsg := strings.TrimSpace(stderr.String())
 		if errMsg == "" {
@@ -698,6 +712,7 @@ func (d *Daemon) syncWorkspace(workDir string) {
 		popCmd.Dir = workDir
 		popCmd.Stderr = &stderr
 		popCmd.Env = os.Environ()
+		util.SetDetachedProcessGroup(popCmd)
 		if err := popCmd.Run(); err != nil {
 			errMsg := strings.TrimSpace(stderr.String())
 			if errMsg == "" {
@@ -716,6 +731,7 @@ func (d *Daemon) isWorkingTreeDirty(workDir string) bool {
 	cmd := exec.Command("git", "status", "--porcelain")
 	cmd.Dir = workDir
 	cmd.Env = os.Environ()
+	util.SetDetachedProcessGroup(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		// If we can't check, assume dirty to be safe
@@ -756,6 +772,7 @@ func (d *Daemon) closeMessage(id string) error {
 	cmd := exec.Command(d.gtPath, "mail", "delete", id)
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = os.Environ() // Inherit PATH to find gt executable
+	util.SetDetachedProcessGroup(cmd)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -794,6 +811,7 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 	cmd := exec.Command(d.bdPath, "show", agentBeadID, "--json")
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = os.Environ() // Inherit PATH to find bd executable
+	util.SetDetachedProcessGroup(cmd)
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -854,6 +872,7 @@ func (d *Daemon) getAgentHookBead(agentBeadID string) string {
 	cmd := exec.Command(d.bdPath, "show", agentBeadID, "--json")
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = os.Environ()
+	util.SetDetachedProcessGroup(cmd)
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -945,6 +964,7 @@ func (d *Daemon) listAgentBeadsJSON(dest interface{}) error {
 	cmd := exec.Command(d.bdPath, "list", "--label=gt:agent", "--json", "--flat") //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = os.Environ()
+	util.SetDetachedProcessGroup(cmd)
 
 	issuesOutput, issuesErr := cmd.Output()
 
@@ -952,6 +972,7 @@ func (d *Daemon) listAgentBeadsJSON(dest interface{}) error {
 	wispCmd := exec.Command(d.bdPath, "mol", "wisp", "list", "--json") //nolint:gosec // G204: bd is a trusted internal tool
 	wispCmd.Dir = d.config.TownRoot
 	wispCmd.Env = os.Environ()
+	util.SetDetachedProcessGroup(wispCmd)
 
 	wispOutput, _ := wispCmd.Output() // Best-effort: wisps table may not exist
 
@@ -1124,6 +1145,7 @@ Action needed: Check if agent is alive and responsive. Consider restarting if st
 	cmd := exec.Command(d.gtPath, "mail", "send", witnessAddr, "-s", subject, "-m", body)
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = os.Environ() // Inherit PATH to find gt executable
+	util.SetDetachedProcessGroup(cmd)
 
 	if err := cmd.Run(); err != nil {
 		d.logger.Printf("Warning: failed to notify witness of GUPP violation: %v", err)
@@ -1250,6 +1272,7 @@ Action needed: Either restart the agent or reassign the work.`,
 	cmd := exec.Command(d.gtPath, "mail", "send", witnessAddr, "-s", subject, "-m", body)
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = os.Environ() // Inherit PATH to find gt executable
+	util.SetDetachedProcessGroup(cmd)
 
 	if err := cmd.Run(); err != nil {
 		d.logger.Printf("Warning: failed to notify witness of orphaned work: %v", err)

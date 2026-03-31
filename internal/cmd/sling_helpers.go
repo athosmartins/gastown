@@ -1153,6 +1153,9 @@ func loadRigCommandVars(townRoot, rig string) []string {
 	if mq.MergeStrategy != "" {
 		vars = append(vars, fmt.Sprintf("merge_strategy=%s", mq.MergeStrategy))
 	}
+	if mq.IsRequireReviewEnabled() {
+		vars = append(vars, "require_review=true")
+	}
 	return vars
 }
 

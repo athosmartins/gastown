@@ -18,6 +18,7 @@ import (
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/telemetry"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // Common errors
@@ -70,6 +71,7 @@ func BdSupportsAllowStaleWithEnv(env []string) bool {
 	}
 
 	cmd := exec.Command(bdPath, "--allow-stale", "version") //nolint:gosec // G204: bd is a trusted internal tool
+	util.SetDetachedProcessGroup(cmd)
 	if env != nil {
 		cmd.Env = env
 	}
@@ -432,6 +434,7 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 	// causing prefix mismatches. Use explicit beadsDir if set, otherwise
 	// resolve from working directory.
 	cmd := exec.Command("bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
+	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = b.workDir
 
 	cmd.Env = runEnv
@@ -455,6 +458,7 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 		stdout.Reset()
 		stderr.Reset()
 		cmd = exec.Command("bd", retryArgs...) //nolint:gosec // G204: bd is a trusted internal tool
+		util.SetDetachedProcessGroup(cmd)
 		cmd.Dir = b.workDir
 		cmd.Env = runEnv
 		cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
@@ -492,6 +496,7 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
 
 	cmd := exec.Command("bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
+	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = b.workDir
 
 	cmd.Env = runEnv

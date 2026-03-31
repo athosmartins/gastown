@@ -613,7 +613,7 @@ func TestCreatePolecatCLAUDEmd_WritesToLocalWhenTrackedExists(t *testing.T) {
 	if string(data) != existing {
 		t.Error("CLAUDE.md was modified — tracked file must not be touched when CLAUDE.local.md is used")
 	}
-	if strings.Contains(string(data), polecatLifecycleMarker) {
+	if strings.Contains(string(data), PolecatLifecycleMarker) {
 		t.Error("polecat lifecycle marker written to tracked CLAUDE.md — should go to CLAUDE.local.md")
 	}
 
@@ -690,11 +690,11 @@ func TestCreatePolecatCLAUDEmd_ReusePath(t *testing.T) {
 
 	// Lifecycle instructions are in CLAUDE.local.md, not CLAUDE.md
 	localData, _ := os.ReadFile(claudeLocalPath)
-	if !strings.Contains(string(localData), polecatLifecycleMarker) {
+	if !strings.Contains(string(localData), PolecatLifecycleMarker) {
 		t.Fatal("lifecycle marker not found in CLAUDE.local.md after first provision")
 	}
 	claudeData, _ := os.ReadFile(claudePath)
-	if strings.Contains(string(claudeData), polecatLifecycleMarker) {
+	if strings.Contains(string(claudeData), PolecatLifecycleMarker) {
 		t.Fatal("lifecycle marker written to tracked CLAUDE.md — must not modify tracked file")
 	}
 
@@ -706,7 +706,7 @@ func TestCreatePolecatCLAUDEmd_ReusePath(t *testing.T) {
 
 	// CLAUDE.local.md still has the lifecycle marker (survived git reset)
 	localData, _ = os.ReadFile(claudeLocalPath)
-	if !strings.Contains(string(localData), polecatLifecycleMarker) {
+	if !strings.Contains(string(localData), PolecatLifecycleMarker) {
 		t.Fatal("CLAUDE.local.md lifecycle marker lost — should survive git reset --hard")
 	}
 
@@ -763,7 +763,7 @@ func TestCreatePolecatCLAUDEmd_GitCleanRemovesLocal(t *testing.T) {
 	}
 
 	localData, _ := os.ReadFile(claudeLocalPath)
-	if !strings.Contains(string(localData), polecatLifecycleMarker) {
+	if !strings.Contains(string(localData), PolecatLifecycleMarker) {
 		t.Fatal("lifecycle marker not in recreated CLAUDE.local.md")
 	}
 	// CLAUDE.md must still be unmodified

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -1122,11 +1123,11 @@ func defaultInstructionsFile(provider string) string {
 
 // quoteForShell quotes a string for safe shell usage.
 func quoteForShell(s string) string {
-	// Wrap in double quotes, escaping characters that are special in double-quoted strings:
-	// - backslash (escape character)
-	// - double quote (string delimiter)
-	// - backtick (command substitution)
-	// - dollar sign (variable expansion)
+	if runtime.GOOS == "windows" {
+		// PowerShell: use single quotes (no interpolation). Double embedded single quotes.
+		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	}
+	// POSIX shell: wrap in double quotes, escaping special characters.
 	escaped := strings.ReplaceAll(s, `\`, `\\`)
 	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
 	escaped = strings.ReplaceAll(escaped, "`", "\\`")
@@ -1248,6 +1249,11 @@ type MergeQueueConfig struct {
 	// merges directly to the base branch, "pr" creates a GitHub pull request.
 	MergeStrategy string `json:"merge_strategy,omitempty"`
 
+	// RequireReview controls whether the refinery requires at least one approving
+	// GitHub review before merging a PR. Only meaningful when merge_strategy="pr".
+	// Nil defaults to false (no review required).
+	RequireReview *bool `json:"require_review,omitempty"`
+
 	// OnConflict specifies conflict resolution strategy: "assign_back" or "auto_rebase".
 	OnConflict string `json:"on_conflict"`
 
@@ -1358,6 +1364,15 @@ func (c *MergeQueueConfig) IsJudgmentEnabled() bool {
 		return false
 	}
 	return *c.JudgmentEnabled
+}
+
+// IsRequireReviewEnabled returns whether PR reviews are required before merging.
+// Nil-safe, defaults to false.
+func (c *MergeQueueConfig) IsRequireReviewEnabled() bool {
+	if c.RequireReview == nil {
+		return false
+	}
+	return *c.RequireReview
 }
 
 // GetReviewDepth returns the configured review depth.

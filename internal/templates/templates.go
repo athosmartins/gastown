@@ -213,10 +213,12 @@ func CreateMayorCLAUDEmd(mayorDir, townRoot, townName, mayorSession, deaconSessi
 	return true, os.WriteFile(claudePath, []byte(content), 0644)
 }
 
-// polecatLifecycleMarker is a unique string present in the polecat CLAUDE.md
-// template. If an existing CLAUDE.md lacks this marker, polecat lifecycle
-// instructions are appended — the agent won't know to call `gt done` otherwise.
-const polecatLifecycleMarker = "IDLE POLECAT HERESY"
+// PolecatLifecycleMarker is a unique string present in the polecat CLAUDE.md
+// template. Used to detect whether a CLAUDE.md file contains the Gas Town
+// overlay (vs. project-specific content). If an existing CLAUDE.md lacks this
+// marker, polecat lifecycle instructions are appended — the agent won't know
+// to call `gt done` otherwise.
+const PolecatLifecycleMarker = "IDLE POLECAT HERESY"
 
 // CreatePolecatCLAUDEmd writes the polecat CLAUDE.md template to the worktree.
 // This is the primary mechanism for polecats to learn about `gt done` and other
@@ -243,7 +245,7 @@ func CreatePolecatCLAUDEmd(worktreePath, rigName, polecatName string) (bool, err
 	// Check if lifecycle instructions are already present in either file.
 	for _, path := range []string{claudePath, claudeLocalPath} {
 		if existing, err := os.ReadFile(path); err == nil {
-			if strings.Contains(string(existing), polecatLifecycleMarker) {
+			if strings.Contains(string(existing), PolecatLifecycleMarker) {
 				return false, nil // Already has our instructions
 			}
 		}

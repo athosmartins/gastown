@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	agentconfig "github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/templates"
+	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -193,6 +195,7 @@ func runDaemonStart(cmd *cobra.Command, args []string) error {
 	daemonCmd.Stdin = nil
 	daemonCmd.Stdout = nil
 	daemonCmd.Stderr = nil
+	util.SetDetachedProcessGroup(daemonCmd)
 
 	if err := daemonCmd.Start(); err != nil {
 		return fmt.Errorf("starting daemon: %w", err)
@@ -364,6 +367,16 @@ func runDaemonRun(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
+
+	// Clear agent identity env vars inherited from the launch environment.
+	// When the daemon is started from an agent session (e.g. crew runs
+	// 'gt daemon start'), it inherits GT_ROLE/GT_CREW/etc. Any subprocess
+	// that derives sender identity from ambient env vars (e.g. gt mail send)
+	// would then be misattributed to the launching agent. GH#3006.
+	for _, k := range agentconfig.IdentityEnvVars {
+		os.Unsetenv(k)
+	}
+	os.Setenv("BD_ACTOR", "daemon")
 
 	config := daemon.DefaultConfig(townRoot)
 	d, err := daemon.New(config)

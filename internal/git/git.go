@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // GitError contains raw output from a git command for agent observation.
@@ -91,6 +93,7 @@ func (g *Git) run(args ...string) (string, error) {
 	}
 
 	cmd := exec.Command("git", args...)
+	util.SetDetachedProcessGroup(cmd)
 	if g.workDir != "" {
 		cmd.Dir = g.workDir
 	}
@@ -113,6 +116,7 @@ func (g *Git) runWithEnv(args []string, extraEnv []string) (_ string, _ error) {
 		args = append([]string{"--git-dir=" + g.gitDir}, args...)
 	}
 	cmd := exec.Command("git", args...)
+	util.SetDetachedProcessGroup(cmd)
 	if g.workDir != "" {
 		cmd.Dir = g.workDir
 	}
@@ -213,6 +217,7 @@ func (g *Git) cloneInternal(url, dest string, opts cloneOptions) error {
 	args = append(args, url, tmpDest)
 
 	cmd := exec.Command("git", args...)
+	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = tmpDir
 	cmd.Env = append(os.Environ(), "GIT_CEILING_DIRECTORIES="+tmpDir)
 	var stdout, stderr bytes.Buffer
@@ -320,6 +325,7 @@ func configureHooksPath(repoPath string) error {
 	}
 
 	cmd := exec.Command("git", "-C", repoPath, "config", "core.hooksPath", ".githooks")
+	util.SetDetachedProcessGroup(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -351,6 +357,7 @@ func configureRefspec(repoPath string, singleBranch bool) error {
 
 	var stderr bytes.Buffer
 	configCmd := exec.Command("git", "--git-dir", gitDir, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+	util.SetDetachedProcessGroup(configCmd)
 	configCmd.Stderr = &stderr
 	if err := configCmd.Run(); err != nil {
 		return fmt.Errorf("configuring refspec: %s", strings.TrimSpace(stderr.String()))
@@ -365,11 +372,13 @@ func configureRefspec(repoPath string, singleBranch bool) error {
 		// Detect HEAD branch name, then fetch only that specific branch.
 		var headOut bytes.Buffer
 		headCmd := exec.Command("git", "--git-dir", gitDir, "symbolic-ref", "HEAD")
+		util.SetDetachedProcessGroup(headCmd)
 		headCmd.Stdout = &headOut
 		headCmd.Stderr = &stderr
 		if err := headCmd.Run(); err != nil {
 			// Fallback: if HEAD is detached, try fetching all (shouldn't happen for clones)
 			fetchCmd := exec.Command("git", "--git-dir", gitDir, "fetch", "--depth", "1", "origin")
+			util.SetDetachedProcessGroup(fetchCmd)
 			fetchCmd.Stderr = &stderr
 			if fetchErr := fetchCmd.Run(); fetchErr != nil {
 				return fmt.Errorf("fetching origin: %s", strings.TrimSpace(stderr.String()))
@@ -381,6 +390,7 @@ func configureRefspec(repoPath string, singleBranch bool) error {
 		refspec := branch + ":refs/remotes/origin/" + branch   // e.g. "main:refs/remotes/origin/main"
 
 		fetchCmd := exec.Command("git", "--git-dir", gitDir, "fetch", "--depth", "1", "origin", refspec)
+		util.SetDetachedProcessGroup(fetchCmd)
 		fetchCmd.Stderr = &stderr
 		if err := fetchCmd.Run(); err != nil {
 			return fmt.Errorf("fetching origin %s: %s", branch, strings.TrimSpace(stderr.String()))
@@ -389,6 +399,7 @@ func configureRefspec(repoPath string, singleBranch bool) error {
 	}
 
 	fetchCmd := exec.Command("git", "--git-dir", gitDir, "fetch", "origin")
+	util.SetDetachedProcessGroup(fetchCmd)
 	fetchCmd.Stderr = &stderr
 	if err := fetchCmd.Run(); err != nil {
 		return fmt.Errorf("fetching origin: %s", strings.TrimSpace(stderr.String()))
@@ -535,6 +546,54 @@ func (g *Git) CommitAll(message string) error {
 	return err
 }
 
+// ResetFiles unstages files without modifying the working tree.
+// Equivalent to: git reset HEAD -- <paths>
+func (g *Git) ResetFiles(paths ...string) error {
+	args := append([]string{"reset", "HEAD", "--"}, paths...)
+	_, err := g.run(args...)
+	return err
+}
+
+// ShowFile returns the contents of a file at a given ref (e.g., "origin/main:CLAUDE.md").
+// Returns empty string and no error if the file does not exist at that ref.
+func (g *Git) ShowFile(ref, path string) (string, error) {
+	out, err := g.run("show", ref+":"+path)
+	if err != nil {
+		// "does not exist" or "exists on disk, but not in" are expected for missing files
+		return "", err
+	}
+	return out, nil
+}
+
+// CheckoutFileFromRef restores a file from a given ref (e.g., "origin/main").
+// Equivalent to: git checkout <ref> -- <path>
+func (g *Git) CheckoutFileFromRef(ref string, paths ...string) error {
+	args := append([]string{"checkout", ref, "--"}, paths...)
+	_, err := g.run(args...)
+	return err
+}
+
+// RmCached removes files from the index without deleting from the working tree.
+// Equivalent to: git rm --cached --force <paths>
+func (g *Git) RmCached(paths ...string) error {
+	args := append([]string{"rm", "--cached", "--force", "--ignore-unmatch"}, paths...)
+	_, err := g.run(args...)
+	return err
+}
+
+// DiffNameOnly returns filenames changed between two refs.
+// Equivalent to: git diff --name-only <base>...<head>
+func (g *Git) DiffNameOnly(base, head string) ([]string, error) {
+	out, err := g.run("diff", "--name-only", base+"..."+head)
+	if err != nil {
+		return nil, err
+	}
+	if out == "" {
+		return nil, nil
+	}
+	return strings.Split(strings.TrimSpace(out), "\n"), nil
+}
+
 // GitStatus represents the status of the working directory.
 type GitStatus struct {
 	Clean    bool
@@ -556,6 +615,12 @@ func (g *Git) Status() (*GitStatus, error) {
 		return status, nil
 	}
 
+	// Get skip-worktree files once (sparse checkout). These appear as 'D' in
+	// --porcelain output but are not real deletions — they are hidden by the
+	// sparse-checkout cone. Filtering them prevents gt done from blocking on
+	// 897+ phantom deletions in polecat sparse worktrees.
+	skipWorktree := g.skipWorktreeFiles()
+
 	status.Clean = false
 	for _, line := range strings.Split(out, "\n") {
 		if len(line) < 3 {
@@ -570,13 +635,42 @@ func (g *Git) Status() (*GitStatus, error) {
 		case strings.Contains(code, "A"):
 			status.Added = append(status.Added, file)
 		case strings.Contains(code, "D"):
-			status.Deleted = append(status.Deleted, file)
+			// Skip files hidden by sparse-checkout (skip-worktree bit set).
+			if !skipWorktree[file] {
+				status.Deleted = append(status.Deleted, file)
+			}
 		case strings.Contains(code, "?"):
 			status.Untracked = append(status.Untracked, file)
 		}
 	}
 
+	// Recheck clean: if all entries were skip-worktree deletions, we're actually clean.
+	if len(status.Modified) == 0 && len(status.Added) == 0 &&
+		len(status.Deleted) == 0 && len(status.Untracked) == 0 {
+		status.Clean = true
+	}
+
 	return status, nil
+}
+
+// skipWorktreeFiles returns a set of file paths that have the skip-worktree
+// bit set (sparse-checkout hidden files). Uses `git ls-files -v` and filters
+// for lines starting with 'S' (uppercase = skip-worktree). Non-fatal: returns
+// empty map on error so callers degrade gracefully.
+func (g *Git) skipWorktreeFiles() map[string]bool {
+	out, err := g.run("ls-files", "-v")
+	if err != nil || out == "" {
+		return nil
+	}
+	result := make(map[string]bool)
+	for _, line := range strings.Split(out, "\n") {
+		// Format: "<flag> <path>" where flag is uppercase letter for skip-worktree
+		if len(line) < 3 || line[0] != 'S' {
+			continue
+		}
+		result[line[2:]] = true
+	}
+	return result
 }
 
 // CurrentBranch returns the current branch name.
@@ -781,6 +875,21 @@ func (g *Git) DeleteRemoteBranch(remote, branch string) error {
 	return err
 }
 
+// HasOpenPR checks whether the given branch has an open pull request on GitHub.
+// Uses the gh CLI to query for open PRs with the branch as head ref.
+// Returns false on any error (fail-open: branch deletion proceeds if gh is unavailable).
+func (g *Git) HasOpenPR(branch string) bool {
+	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1")
+	cmd.Dir = g.workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return false // fail-open: can't determine PR state, allow deletion
+	}
+	out = bytes.TrimSpace(out)
+	// Empty array "[]" means no open PRs
+	return len(out) > 2
+}
+
 // ListRemoteRefs returns remote ref names matching a prefix using ls-remote.
 // The prefix filters refs (e.g., "refs/heads/polecat/" for all polecat branches).
 // Returns full ref names like "refs/heads/polecat/furiosa-abc123".
@@ -875,6 +984,7 @@ func (g *Git) CheckConflicts(source, target string) ([]string, error) {
 // ZFC: Returns GitError with raw output for agent observation.
 func (g *Git) runMergeCheck(args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
+	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = g.workDir
 
 	var stdout, stderr bytes.Buffer
@@ -1213,6 +1323,7 @@ func isValidSubmoduleReference(repoPath string) bool {
 	}
 	// Check if shallow — git rev-parse --is-shallow-repository
 	cmd := exec.Command("git", "-C", repoPath, "rev-parse", "--is-shallow-repository")
+	util.SetDetachedProcessGroup(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return false
@@ -1224,6 +1335,7 @@ func isValidSubmoduleReference(repoPath string) bool {
 // This is used by doctor to detect legacy sparse checkout configurations that should be removed.
 func IsSparseCheckoutConfigured(repoPath string) bool {
 	cmd := exec.Command("git", "-C", repoPath, "config", "core.sparseCheckout")
+	util.SetDetachedProcessGroup(cmd)
 	output, err := cmd.Output()
 	return err == nil && strings.TrimSpace(string(output)) == "true"
 }
@@ -1233,6 +1345,7 @@ func IsSparseCheckoutConfigured(repoPath string) bool {
 func RemoveSparseCheckout(repoPath string) error {
 	// Use git sparse-checkout disable which properly restores hidden files
 	cmd := exec.Command("git", "-C", repoPath, "sparse-checkout", "disable")
+	util.SetDetachedProcessGroup(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -1348,6 +1461,11 @@ func (g *Git) BranchCreatedDate(branch string) (string, error) {
 }
 
 // CommitsAhead returns the number of commits that branch has ahead of base.
+// DiffStat returns the --stat output for a diff range (e.g., "main...feature").
+func (g *Git) DiffStat(rangeSpec string) (string, error) {
+	return g.run("diff", "--stat", rangeSpec)
+}
+
 // For example, CommitsAhead("main", "feature") returns how many commits
 // are on feature that are not on main.
 func (g *Git) CommitsAhead(base, branch string) (int, error) {
@@ -1553,6 +1671,11 @@ func isGasTownRuntimePath(path string) bool {
 		if bare == name {
 			return true
 		}
+	}
+	// CLAUDE.local.md is a Gas Town overlay file written by CreatePolecatCLAUDEmd.
+	// It must not be staged by the auto-commit safety net or committed to the repo.
+	if bare == "CLAUDE.local.md" {
+		return true
 	}
 	return false
 }
@@ -1838,6 +1961,7 @@ func InitSubmodules(repoPath string, referencePath ...string) error {
 	}
 
 	cmd := exec.Command("git", args...)
+	util.SetDetachedProcessGroup(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -1866,6 +1990,7 @@ func hasTrackedGitmodules(repoPath string) bool {
 func InitSparseCheckout(repoPath string, paths []string) error {
 	// Initialize sparse checkout in cone mode
 	cmd := exec.Command("git", "-C", repoPath, "sparse-checkout", "init", "--cone")
+	util.SetDetachedProcessGroup(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -1874,6 +1999,7 @@ func InitSparseCheckout(repoPath string, paths []string) error {
 	if len(paths) > 0 {
 		args := append([]string{"-C", repoPath, "sparse-checkout", "set"}, paths...)
 		cmd = exec.Command("git", args...)
+		util.SetDetachedProcessGroup(cmd)
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("setting sparse checkout paths: %s", strings.TrimSpace(stderr.String()))
@@ -1969,6 +2095,7 @@ func (g *Git) submoduleURL(ref, submodulePath string) (string, error) {
 
 	// List all submodule.<name>.path entries to find the section matching our path
 	cmd := exec.Command("git", "config", "-f", tmpFile.Name(), "--get-regexp", `^submodule\..*\.path$`)
+	util.SetDetachedProcessGroup(cmd)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	if err := cmd.Run(); err != nil {
@@ -1997,6 +2124,7 @@ func (g *Git) submoduleURL(ref, submodulePath string) (string, error) {
 
 	// Get the URL for this section
 	urlCmd := exec.Command("git", "config", "-f", tmpFile.Name(), "--get", "submodule."+sectionName+".url")
+	util.SetDetachedProcessGroup(urlCmd)
 	var urlOut bytes.Buffer
 	urlCmd.Stdout = &urlOut
 	if err := urlCmd.Run(); err != nil {
@@ -2020,6 +2148,7 @@ func (g *Git) PushSubmoduleCommit(submodulePath, sha, remote string) error {
 		return fmt.Errorf("detecting default branch for submodule %s: %w", submodulePath, err)
 	}
 	cmd := exec.Command("git", "-C", absPath, "push", remote, sha+":refs/heads/"+defaultBranch)
+	util.SetDetachedProcessGroup(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -2037,6 +2166,7 @@ func (g *Git) PushSubmoduleCommit(submodulePath, sha, remote string) error {
 func submoduleDefaultBranch(submodulePath, remote string) (string, error) {
 	// Try local symbolic-ref first (no network, fastest)
 	symCmd := exec.Command("git", "-C", submodulePath, "symbolic-ref", "refs/remotes/"+remote+"/HEAD")
+	util.SetDetachedProcessGroup(symCmd)
 	if symOut, err := symCmd.Output(); err == nil {
 		ref := strings.TrimSpace(string(symOut))
 		// refs/remotes/origin/HEAD -> refs/remotes/origin/main -> main
@@ -2051,6 +2181,7 @@ func submoduleDefaultBranch(submodulePath, remote string) (string, error) {
 	// Try local tracking refs (no network)
 	for _, candidate := range []string{"main", "master"} {
 		check := exec.Command("git", "-C", submodulePath, "rev-parse", "--verify", "--quiet", "refs/remotes/"+remote+"/"+candidate)
+		util.SetDetachedProcessGroup(check)
 		if check.Run() == nil {
 			return candidate, nil
 		}
@@ -2059,6 +2190,7 @@ func submoduleDefaultBranch(submodulePath, remote string) (string, error) {
 	// Fallback: network query via ls-remote
 	for _, candidate := range []string{"main", "master"} {
 		check := exec.Command("git", "-C", submodulePath, "ls-remote", "--exit-code", remote, "refs/heads/"+candidate)
+		util.SetDetachedProcessGroup(check)
 		if check.Run() == nil {
 			return candidate, nil
 		}
