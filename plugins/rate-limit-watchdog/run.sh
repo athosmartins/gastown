@@ -13,8 +13,8 @@ RATE_LIMIT_REASON="API rate limited (auto-watchdog)"
 
 # --- Preflight ---------------------------------------------------------------
 if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-    echo "ANTHROPIC_API_KEY not set — cannot probe API"
-    exit 1
+    echo "ANTHROPIC_API_KEY not set — skipping rate-limit probe"
+    exit 0
 fi
 
 # --- Probe API ---------------------------------------------------------------
