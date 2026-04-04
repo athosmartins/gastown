@@ -271,5 +271,12 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 	result.Agent = agentID
 	result.Pane = pane
 	result.WorkDir = workDir
+	// Detect self-sling when target resolves to our own tmux pane.
+	// Without this, gt sling deacon deacon resolves the deacon session normally
+	// (IsSelfSling stays false) and runSlingFormula() nudges the caller's own pane,
+	// interrupting the running Bash tool and prompting for retry.
+	if pane == os.Getenv("TMUX_PANE") {
+		result.IsSelfSling = true
+	}
 	return result, nil
 }
