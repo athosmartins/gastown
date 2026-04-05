@@ -183,6 +183,16 @@ func TestAddressToSessionIDs(t *testing.T) {
 		{"mayor", []string{"hq-mayor"}},
 		{"mayor/", []string{"hq-mayor"}},
 		{"deacon", []string{"hq-deacon"}},
+		{"deacon/", []string{"hq-deacon"}},
+
+		// Dog addresses - must NOT route to deacon (was buggy: HasPrefix matched "deacon/dogs/*" as deacon)
+		// Dogs are managed by the deacon but have their own sessions (hq-dog-<name>).
+		// Bug: daemon sends "Plugin: github-sheriff" mail to "deacon/dogs/alpha", which
+		// was incorrectly delivered to hq-deacon via NudgeSession with Escape, interrupting
+		// whatever the deacon was doing and causing the "Interrupted" freeze pattern.
+		{"deacon/dogs/alpha", []string{"hq-dog-alpha"}},
+		{"deacon/dogs/bravo", []string{"hq-dog-bravo"}},
+		{"deacon/dogs/boot", []string{"hq-boot"}}, // Boot watchdog has its own special session name
 
 		// Rig singletons - single session (no crew/polecat ambiguity)
 		{"gastown/refinery", []string{"gt-refinery"}},
