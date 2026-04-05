@@ -46,7 +46,10 @@ log() {
 if [[ -n "$EXPLICIT_DBS" ]]; then
   IFS=',' read -ra PROD_DBS <<< "$EXPLICIT_DBS"
 else
-  mapfile -t PROD_DBS < <(
+  PROD_DBS=()
+  while IFS= read -r name; do
+    PROD_DBS+=("$name")
+  done < <(
     for d in "$DOLT_DATA_DIR"/*/; do
       name="$(basename "$d")"
       [[ -d "$d/.dolt" ]] || continue

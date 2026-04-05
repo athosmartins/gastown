@@ -36,7 +36,7 @@ gt
 
 # Runtime state (ignore contents, but allow setup-hooks to be tracked)
 state.json
-.runtime/*
+.runtime/
 !.runtime/setup-hooks/
 
 # Beads runtime state (not tracked)
