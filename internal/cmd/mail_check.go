@@ -95,10 +95,23 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 				fmt.Fprintf(os.Stderr, "gt mail check: could not list unread for %s: %v\n", address, listErr)
 				return nil
 			}
-			fmt.Print(formatInjectOutput(messages))
-			// Ack after output so message is delivered before being marked acked.
-			if ackErr := mailbox.AcknowledgeDeliveries(address, messages); ackErr != nil {
-				fmt.Fprintf(os.Stderr, "gt mail check: delivery ack update failed for %s: %v\n", address, ackErr)
+			// Filter out messages already delivered in a previous session.
+			// Plugin dispatch mails (and other task mails) accumulate as open beads
+			// if not explicitly closed, causing re-injection on every UserPromptSubmit
+			// turn. Skip messages that have already been acked to prevent context bloat.
+			// See: hq-lsoei (daemon sends permanent mail per plugin, deacon context fills up)
+			var toInject []*mail.Message
+			for _, msg := range messages {
+				if msg.DeliveryState != mail.DeliveryStateAcked {
+					toInject = append(toInject, msg)
+				}
+			}
+			if len(toInject) > 0 {
+				fmt.Print(formatInjectOutput(toInject))
+				// Ack after output so message is delivered before being marked acked.
+				if ackErr := mailbox.AcknowledgeDeliveries(address, toInject); ackErr != nil {
+					fmt.Fprintf(os.Stderr, "gt mail check: delivery ack update failed for %s: %v\n", address, ackErr)
+				}
 			}
 		}
 
