@@ -1839,8 +1839,24 @@ func AddressToSessionIDs(address string) []string {
 		return []string{session.MayorSessionName()}
 	}
 
-	// Deacon address: "deacon/" or "deacon"
-	if strings.HasPrefix(address, constants.RoleDeacon) {
+	// Dog address: "deacon/dogs/<name>" or "deacon/dogs/boot"
+	// Must be checked BEFORE the deacon check since both start with "deacon".
+	// Dogs are town-level agents managed by the deacon, with sessions named hq-dog-<name>.
+	// Boot is a special dog watchdog with session hq-boot.
+	const dogPrefix = constants.RoleDeacon + "/dogs/"
+	if strings.HasPrefix(address, dogPrefix) {
+		dogName := strings.TrimPrefix(address, dogPrefix)
+		if dogName == "" {
+			return nil
+		}
+		if dogName == "boot" {
+			return []string{session.BootSessionName()}
+		}
+		return []string{session.DogSessionName(dogName)}
+	}
+
+	// Deacon address: exactly "deacon" or "deacon/" (NOT sub-paths like "deacon/dogs/*")
+	if address == constants.RoleDeacon || address == constants.RoleDeacon+"/" {
 		return []string{session.DeaconSessionName()}
 	}
 
