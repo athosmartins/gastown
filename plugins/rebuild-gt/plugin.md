@@ -38,11 +38,12 @@ Check binary staleness:
 gt stale --json
 ```
 
-Parse the JSON output and check these fields:
+Parse the JSON output and check these fields in order:
+- If `"error"` field is non-empty → exit silently (can't determine staleness)
 - If `"stale": false` → record success wisp and exit early (binary is fresh)
 - If `"safe_to_rebuild": false` → **DO NOT REBUILD**. Record a skip wisp and exit.
   This means the repo is on a non-main branch or HEAD is not a descendant of the
-  binary commit (would be a downgrade).
+  binary commit (would be a downgrade or diverged history).
 - If `"safe_to_rebuild": true` → proceed to build
 
 If `safe_to_rebuild` is false, record a skip wisp:
@@ -55,12 +56,12 @@ bd create --wisp-type patrol \
 
 ## Pre-flight Checks
 
-Before building, verify the source repo is clean and on main:
+Before building, verify the source repo is clean (no modified/staged tracked files) and on main:
 
 ```bash
 cd ~/gt/gastown/mayor/rig
-git status --porcelain  # Must be clean
-git branch --show-current  # Must be "main"
+git status --porcelain | grep -v '^??'  # Must be empty (untracked files are OK)
+git branch --show-current              # Must be "main"
 ```
 
 If either check fails, skip the rebuild and record a wisp.

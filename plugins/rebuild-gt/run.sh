@@ -20,6 +20,13 @@ STALE_JSON=$(gt stale --json 2>/dev/null) || {
   exit 0
 }
 
+# Check for error field first — an error means gt stale couldn't determine status
+STALE_ERROR=$(echo "$STALE_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('error', ''))" 2>/dev/null || echo "")
+if [ -n "$STALE_ERROR" ]; then
+  log "gt stale returned error: $STALE_ERROR — skipping rebuild"
+  exit 0
+fi
+
 IS_STALE=$(echo "$STALE_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('stale', False))" 2>/dev/null || echo "False")
 SAFE=$(echo "$STALE_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('safe_to_rebuild', False))" 2>/dev/null || echo "False")
 
@@ -48,9 +55,11 @@ if [ ! -d "$RIG_ROOT" ]; then
   exit 0
 fi
 
-DIRTY=$(git -C "$RIG_ROOT" status --porcelain 2>/dev/null)
+# Check for modified/staged tracked files only — untracked files (e.g. .dolt-archive/)
+# should not block rebuilds since they are not part of the source build.
+DIRTY=$(git -C "$RIG_ROOT" status --porcelain 2>/dev/null | grep -v '^??' || true)
 if [ -n "$DIRTY" ]; then
-  log "Repo is dirty, skipping rebuild."
+  log "Repo has uncommitted changes, skipping rebuild."
   bd create "Plugin: rebuild-gt [skipped]" -t chore --ephemeral \
     -l type:plugin-run,plugin:rebuild-gt,rig:gastown,result:skipped \
     -d "Skipped: repo has uncommitted changes" --silent 2>/dev/null || true
