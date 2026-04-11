@@ -1706,7 +1706,7 @@ func checkAndCloseCompletedConvoys(townBeads string, dryRun bool) ([]struct{ ID,
 
 // notifyConvoyCompletion sends notifications to owner and any notify addresses.
 func notifyConvoyCompletion(townBeads, convoyID, title string) {
-	// Get convoy description to find owner and notify addresses
+	// Get convoy description, creation time, and close time for rich notifications
 	showArgs := []string{"show", convoyID, "--json"}
 	showCmd := exec.Command("bd", showArgs...)
 	showCmd.Dir = townBeads
@@ -1719,17 +1719,30 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 
 	var convoys []struct {
 		Description string `json:"description"`
+		CreatedAt   string `json:"created_at"`
+		ClosedAt    string `json:"closed_at,omitempty"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil || len(convoys) == 0 {
 		return
 	}
 
+	// Get tracked issue count (best-effort: don't fail if unavailable)
+	issueCount := 0
+	if tracked, err := getTrackedIssues(townBeads, convoyID); err == nil {
+		issueCount = len(tracked)
+	}
+
+	// Calculate convoy duration
+	duration := formatConvoyDuration(convoys[0].CreatedAt, convoys[0].ClosedAt)
+
+	// Build rich notification body and subject
+	subject := fmt.Sprintf("🚚 Convoy complete: %s", title)
+	body := buildConvoyCompletionBody(convoyID, title, issueCount, duration)
+
 	// ZFC: Use typed accessor instead of parsing description text
 	fields := beads.ParseConvoyFields(&beads.Issue{Description: convoys[0].Description})
 	for _, addr := range fields.NotificationAddresses() {
-		mailArgs := []string{"mail", "send", addr,
-			"-s", fmt.Sprintf("🚚 Convoy landed: %s", title),
-			"-m", fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.", convoyID)}
+		mailArgs := []string{"mail", "send", addr, "-s", subject, "-m", body}
 		mailCmd := exec.Command("gt", mailArgs...)
 		if err := mailCmd.Run(); err != nil {
 			style.PrintWarning("could not notify %s: %v", addr, err)
@@ -1737,21 +1750,22 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 	}
 
 	// Send nudge notifications to nudge watchers
+	nudgeMsg := fmt.Sprintf("🚚 Convoy complete: %s — %s", title, buildConvoyCompletionSummary(convoyID, issueCount, duration))
 	for _, addr := range fields.NudgeNotificationAddresses() {
-		nudgeMsg := fmt.Sprintf("🚚 Convoy landed: %s — Convoy %s has completed. All tracked issues are now closed.", title, convoyID)
 		nudgeCmd := exec.Command("gt", "nudge", addr, "-m", nudgeMsg)
 		if err := nudgeCmd.Run(); err != nil {
 			style.PrintWarning("could not nudge %s: %v", addr, err)
 		}
 	}
 
-	// Push notification to active Mayor session if configured
-	notifyMayorSession(townBeads, convoyID, title)
+	// Mail notification to mayor/ if configured and not already notified above
+	notifyMayorSession(townBeads, convoyID, title, subject, body, fields.NotificationAddresses())
 }
 
-// notifyMayorSession pushes a convoy completion notification into the active
-// Mayor session via nudge, if convoy.notify_on_complete is enabled.
-func notifyMayorSession(townBeads, convoyID, title string) {
+// notifyMayorSession mails a convoy completion notification to mayor/ when
+// convoy.notify_on_complete is enabled. Skips if mayor/ is already in addrs
+// (already notified as owner/watcher) to avoid duplicates.
+func notifyMayorSession(townBeads, convoyID, title, subject, body string, alreadyNotified []string) {
 	settingsPath := config.TownSettingsPath(townBeads)
 	settings, err := config.LoadOrCreateTownSettings(settingsPath)
 	if err != nil {
@@ -1761,11 +1775,87 @@ func notifyMayorSession(townBeads, convoyID, title string) {
 		return
 	}
 
-	nudgeMsg := fmt.Sprintf("🚚 Convoy landed: %s — Convoy %s has completed. All tracked issues are now closed.", title, convoyID)
-	nudgeCmd := exec.Command("gt", "nudge", "mayor", "-m", nudgeMsg)
-	if err := nudgeCmd.Run(); err != nil {
-		style.PrintWarning("could not nudge Mayor session: %v", err)
+	// Avoid double-notification if mayor/ is already in the watcher/owner list
+	for _, addr := range alreadyNotified {
+		if addr == "mayor/" {
+			return
+		}
 	}
+
+	// Send mail to mayor/ so the notification persists even when not online
+	mailArgs := []string{"mail", "send", "mayor/", "-s", subject, "-m", body}
+	mailCmd := exec.Command("gt", mailArgs...)
+	if err := mailCmd.Run(); err != nil {
+		style.PrintWarning("could not mail Mayor: %v", err)
+	}
+}
+
+// formatConvoyDuration computes a human-readable duration string from creation
+// to close timestamps (RFC3339 format). Returns empty string on parse failure.
+func formatConvoyDuration(createdAt, closedAt string) string {
+	created, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return ""
+	}
+	var end time.Time
+	if closedAt != "" {
+		end, err = time.Parse(time.RFC3339, closedAt)
+		if err != nil {
+			end = time.Now()
+		}
+	} else {
+		end = time.Now()
+	}
+
+	d := end.Sub(created)
+	if d < 0 {
+		d = 0
+	}
+
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	minutes := int(d.Minutes()) % 60
+
+	switch {
+	case days > 0 && hours > 0:
+		return fmt.Sprintf("%dd %dh", days, hours)
+	case days > 0:
+		return fmt.Sprintf("%dd", days)
+	case hours > 0 && minutes > 0:
+		return fmt.Sprintf("%dh %dm", hours, minutes)
+	case hours > 0:
+		return fmt.Sprintf("%dh", hours)
+	case minutes > 0:
+		return fmt.Sprintf("%dm", minutes)
+	default:
+		return "<1m"
+	}
+}
+
+// buildConvoyCompletionBody builds the full mail body for a convoy completion notification.
+func buildConvoyCompletionBody(convoyID, title string, issueCount int, duration string) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Convoy %s has completed. All tracked issues are now closed.", convoyID))
+	if duration != "" {
+		sb.WriteString(fmt.Sprintf("\n\nDuration: %s", duration))
+	}
+	if issueCount > 0 {
+		sb.WriteString(fmt.Sprintf("\nIssues:   %d completed", issueCount))
+	}
+	sb.WriteString(fmt.Sprintf("\n\nSummary: %s", title))
+	return sb.String()
+}
+
+// buildConvoyCompletionSummary builds a short one-line summary for nudge notifications.
+func buildConvoyCompletionSummary(convoyID string, issueCount int, duration string) string {
+	parts := []string{fmt.Sprintf("Convoy %s completed", convoyID)}
+	if issueCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d issues", issueCount))
+	}
+	if duration != "" {
+		parts = append(parts, fmt.Sprintf("duration %s", duration))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func runConvoyStatus(cmd *cobra.Command, args []string) error {

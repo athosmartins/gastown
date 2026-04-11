@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	beadsdk "github.com/steveyegge/beads"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/workspace"
 
@@ -96,12 +97,15 @@ func runClose(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// After successful close, check convoy completion for each closed issue.
-	// This is best-effort: failures are silently ignored since the daemon's
+	// After successful close, check convoy completion and cross-rig notifications.
+	// Both are best-effort: failures are silently ignored since the daemon's
 	// event polling and deacon patrol serve as backup mechanisms.
 	beadIDs := extractBeadIDs(filteredArgs)
 	if len(beadIDs) > 0 {
 		checkConvoyCompletion(beadIDs)
+		for _, id := range beadIDs {
+			notifyCrossRigDepResolved(id)
+		}
 	}
 
 	return nil
@@ -272,4 +276,109 @@ func checkConvoyCompletion(beadIDs []string) {
 	for _, beadID := range beadIDs {
 		convoy.CheckConvoysForIssue(ctx, store, townRoot, beadID, "Close", nil, gtPath, nil)
 	}
+}
+
+// notifyCrossRigDepResolved checks if the closed issue was blocking issues in
+// other rigs and notifies those rigs' witnesses. When issue X closes, any rig
+// that had an issue depending on X receives a mail to its witness so it can
+// proceed with previously-blocked work.
+//
+// This is best-effort — failures are silently ignored. The deacon patrol
+// provides the fallback check for any missed notifications.
+func notifyCrossRigDepResolved(closedIssueID string) {
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil || townRoot == "" {
+		return
+	}
+
+	hqBeadsDir := filepath.Join(townRoot, ".beads")
+
+	// Load routes to discover all rig beads directories
+	routes, err := beads.LoadRoutes(hqBeadsDir)
+	if err != nil || len(routes) == 0 {
+		return
+	}
+
+	// Determine which rig the closed issue belongs to
+	closedPrefix := beads.ExtractPrefix(closedIssueID)
+	closedRig := beads.GetRigNameForPrefix(townRoot, closedPrefix)
+
+	// Blocking dep types: when any of these close, dependents may be unblocked
+	blockingTypes := []string{"blocks", "conditional-blocks", "waits-for", "merge-blocks"}
+
+	for _, route := range routes {
+		if route.Path == "." {
+			continue // Town-level beads — skip
+		}
+
+		// Extract rig name from route path (e.g., "gastown" from "gastown")
+		rigName := strings.SplitN(route.Path, "/", 2)[0]
+		if rigName == "" || rigName == closedRig {
+			continue // Skip the same rig as the closed issue
+		}
+
+		rigBeadsDir := filepath.Join(townRoot, route.Path, ".beads")
+		if _, statErr := os.Stat(rigBeadsDir); statErr != nil {
+			continue // Rig has no own beads database
+		}
+
+		// Collect dep IDs across all blocking types (deduplicated)
+		seen := make(map[string]bool)
+		var depIDs []string
+		for _, depType := range blockingTypes {
+			ids, err := bdDepListRawIDs(rigBeadsDir, closedIssueID, "up", depType)
+			if err != nil {
+				continue
+			}
+			for _, id := range ids {
+				if !seen[id] {
+					seen[id] = true
+					depIDs = append(depIDs, id)
+				}
+			}
+		}
+
+		if len(depIDs) == 0 {
+			continue
+		}
+
+		// Notify the rig's witness for each unblocked issue
+		witnessAddr := rigName + "/witness"
+		for _, depID := range depIDs {
+			depTitle := getIssueTitleForNotify(rigBeadsDir, depID)
+			titlePart := ""
+			if depTitle != "" {
+				titlePart = fmt.Sprintf(" (%s)", depTitle)
+			}
+			subject := fmt.Sprintf("Dependency resolved: %s", closedIssueID)
+			body := fmt.Sprintf(
+				"External dependency %s has closed.\nUnblocked: %s%s\nThis issue may now proceed.",
+				closedIssueID, depID, titlePart,
+			)
+			mailArgs := []string{"mail", "send", witnessAddr, "-s", subject, "-m", body}
+			mailCmd := exec.Command("gt", mailArgs...)
+			_ = mailCmd.Run() // best-effort: no error propagation
+		}
+	}
+}
+
+// getIssueTitleForNotify fetches the title of an issue from its rig's beads directory.
+// Returns empty string on any error (best-effort for notification enrichment).
+func getIssueTitleForNotify(rigBeadsDir, issueID string) string {
+	showCmd := exec.Command("bd", "show", issueID, "--json")
+	showCmd.Dir = rigBeadsDir
+	showCmd.Env = filterEnvKey(os.Environ(), "BEADS_DIR")
+	var out []byte
+	var err error
+	if out, err = showCmd.Output(); err != nil {
+		return ""
+	}
+
+	var issues []struct {
+		Title string `json:"title"`
+	}
+	if err := json.Unmarshal(out, &issues); err != nil || len(issues) == 0 {
+		return ""
+	}
+	return issues[0].Title
 }
