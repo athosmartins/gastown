@@ -35,6 +35,10 @@ type ConvoyFetcher interface {
 	FetchMayor() (*MayorStatus, error)
 	FetchIssues() ([]IssueRow, error)
 	FetchActivity() ([]ActivityRow, error)
+	FetchCompletedBeads() ([]CompletedBead, error)
+	FetchReadyQueue() ([]ReadyQueueRow, error)
+	FetchActiveWork() ([]ActiveWorkRow, error)
+	FetchMetrics() (*MetricsData, error)
 }
 
 // expandCacheEntry holds a cached expanded-view response.
@@ -182,32 +186,36 @@ func (h *ConvoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// fetchAndRender runs all 14 fetchers in parallel and renders the template.
+// fetchAndRender runs all 18 fetchers in parallel and renders the template.
 // Returns the rendered HTML bytes, or nil on template error.
 func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []byte {
 	ctx, cancel := context.WithTimeout(r.Context(), h.fetchTimeout)
 	defer cancel()
 
 	var (
-		convoys     []ConvoyRow
-		mergeQueue  []MergeQueueRow
-		workers     []WorkerRow
-		mail        []MailRow
-		rigs        []RigRow
-		dogs        []DogRow
-		escalations []EscalationRow
-		health      *HealthRow
-		queues      []QueueRow
-		sessions    []SessionRow
-		hooks       []HookRow
-		mayor       *MayorStatus
-		issues      []IssueRow
-		activity    []ActivityRow
-		wg          sync.WaitGroup
+		convoys        []ConvoyRow
+		mergeQueue     []MergeQueueRow
+		workers        []WorkerRow
+		mail           []MailRow
+		rigs           []RigRow
+		dogs           []DogRow
+		escalations    []EscalationRow
+		health         *HealthRow
+		queues         []QueueRow
+		sessions       []SessionRow
+		hooks          []HookRow
+		mayor          *MayorStatus
+		issues         []IssueRow
+		activity       []ActivityRow
+		completedBeads []CompletedBead
+		readyQueue     []ReadyQueueRow
+		activeWork     []ActiveWorkRow
+		metrics        *MetricsData
+		wg             sync.WaitGroup
 	)
 
 	// Run all fetches in parallel with error logging
-	wg.Add(14)
+	wg.Add(18)
 
 	go func() {
 		defer wg.Done()
@@ -321,6 +329,38 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 			log.Printf("dashboard: FetchActivity failed: %v", err)
 		}
 	}()
+	go func() {
+		defer wg.Done()
+		var err error
+		completedBeads, err = h.fetcher.FetchCompletedBeads()
+		if err != nil {
+			log.Printf("dashboard: FetchCompletedBeads failed: %v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		var err error
+		readyQueue, err = h.fetcher.FetchReadyQueue()
+		if err != nil {
+			log.Printf("dashboard: FetchReadyQueue failed: %v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		var err error
+		activeWork, err = h.fetcher.FetchActiveWork()
+		if err != nil {
+			log.Printf("dashboard: FetchActiveWork failed: %v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		var err error
+		metrics, err = h.fetcher.FetchMetrics()
+		if err != nil {
+			log.Printf("dashboard: FetchMetrics failed: %v", err)
+		}
+	}()
 
 	// Wait for fetches or timeout
 	done := make(chan struct{})
@@ -343,23 +383,27 @@ func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []by
 	summary := computeSummary(workers, hooks, issues, convoys, escalations, activity)
 
 	data := ConvoyData{
-		Convoys:     convoys,
-		MergeQueue:  mergeQueue,
-		Workers:     workers,
-		Mail:        mail,
-		Rigs:        rigs,
-		Dogs:        dogs,
-		Escalations: escalations,
-		Health:      health,
-		Queues:      queues,
-		Sessions:    sessions,
-		Hooks:       hooks,
-		Mayor:       mayor,
-		Issues:      enrichIssuesWithAssignees(issues, hooks),
-		Activity:    activity,
-		Summary:     summary,
-		Expand:      expandPanel,
-		CSRFToken:   h.csrfToken,
+		Convoys:        convoys,
+		MergeQueue:     mergeQueue,
+		Workers:        workers,
+		Mail:           mail,
+		Rigs:           rigs,
+		Dogs:           dogs,
+		Escalations:    escalations,
+		Health:         health,
+		Queues:         queues,
+		Sessions:       sessions,
+		Hooks:          hooks,
+		Mayor:          mayor,
+		Issues:         enrichIssuesWithAssignees(issues, hooks),
+		Activity:       activity,
+		CompletedBeads: completedBeads,
+		ReadyQueue:     readyQueue,
+		ActiveWork:     activeWork,
+		Metrics:        metrics,
+		Summary:        summary,
+		Expand:         expandPanel,
+		CSRFToken:      h.csrfToken,
 	}
 
 	var buf bytes.Buffer

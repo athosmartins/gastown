@@ -31,8 +31,12 @@ type MockConvoyFetcher struct {
 	Hooks       []HookRow
 	Mayor       *MayorStatus
 	Issues      []IssueRow
-	Activity    []ActivityRow
-	Error       error
+	Activity       []ActivityRow
+	CompletedBeads []CompletedBead
+	ReadyQueue     []ReadyQueueRow
+	ActiveWork     []ActiveWorkRow
+	Metrics        *MetricsData
+	Error          error
 }
 
 func (m *MockConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
@@ -89,6 +93,22 @@ func (m *MockConvoyFetcher) FetchIssues() ([]IssueRow, error) {
 
 func (m *MockConvoyFetcher) FetchActivity() ([]ActivityRow, error) {
 	return m.Activity, nil
+}
+
+func (m *MockConvoyFetcher) FetchCompletedBeads() ([]CompletedBead, error) {
+	return m.CompletedBeads, nil
+}
+
+func (m *MockConvoyFetcher) FetchReadyQueue() ([]ReadyQueueRow, error) {
+	return m.ReadyQueue, nil
+}
+
+func (m *MockConvoyFetcher) FetchActiveWork() ([]ActiveWorkRow, error) {
+	return m.ActiveWork, nil
+}
+
+func (m *MockConvoyFetcher) FetchMetrics() (*MetricsData, error) {
+	return m.Metrics, nil
 }
 
 func TestConvoyHandler_RendersTemplate(t *testing.T) {
@@ -1060,6 +1080,22 @@ func (m *MockConvoyFetcherWithErrors) FetchActivity() ([]ActivityRow, error) {
 	return nil, nil
 }
 
+func (m *MockConvoyFetcherWithErrors) FetchCompletedBeads() ([]CompletedBead, error) {
+	return nil, nil
+}
+
+func (m *MockConvoyFetcherWithErrors) FetchReadyQueue() ([]ReadyQueueRow, error) {
+	return nil, nil
+}
+
+func (m *MockConvoyFetcherWithErrors) FetchActiveWork() ([]ActiveWorkRow, error) {
+	return nil, nil
+}
+
+func (m *MockConvoyFetcherWithErrors) FetchMetrics() (*MetricsData, error) {
+	return nil, nil
+}
+
 // TestConvoyHandler_TemplateErrorReturns500 verifies that template execution errors
 // return a proper 500 status code, not 200 (which would happen if we wrote directly
 // to the ResponseWriter and it failed mid-execution).
@@ -1222,6 +1258,22 @@ func (m *CountingMockFetcher) FetchMayor() (*MayorStatus, error)   { return m.in
 func (m *CountingMockFetcher) FetchIssues() ([]IssueRow, error)    { return m.inner.FetchIssues() }
 func (m *CountingMockFetcher) FetchActivity() ([]ActivityRow, error) {
 	return m.inner.FetchActivity()
+}
+
+func (m *CountingMockFetcher) FetchCompletedBeads() ([]CompletedBead, error) {
+	return m.inner.FetchCompletedBeads()
+}
+
+func (m *CountingMockFetcher) FetchReadyQueue() ([]ReadyQueueRow, error) {
+	return m.inner.FetchReadyQueue()
+}
+
+func (m *CountingMockFetcher) FetchActiveWork() ([]ActiveWorkRow, error) {
+	return m.inner.FetchActiveWork()
+}
+
+func (m *CountingMockFetcher) FetchMetrics() (*MetricsData, error) {
+	return m.inner.FetchMetrics()
 }
 
 func TestConvoyHandler_NonFatalErrors(t *testing.T) {

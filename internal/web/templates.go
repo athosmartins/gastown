@@ -3,6 +3,7 @@ package web
 
 import (
 	"embed"
+	"fmt"
 	"html/template"
 	"io/fs"
 	"strings"
@@ -28,10 +29,14 @@ type ConvoyData struct {
 	Hooks       []HookRow
 	Mayor       *MayorStatus
 	Issues      []IssueRow
-	Activity    []ActivityRow
-	Summary     *DashboardSummary
-	Expand      string // Panel to show fullscreen (from ?expand=name)
-	CSRFToken   string // Token for CSRF protection on POST requests
+	Activity       []ActivityRow
+	CompletedBeads []CompletedBead
+	ReadyQueue     []ReadyQueueRow
+	ActiveWork     []ActiveWorkRow
+	Metrics        *MetricsData
+	Summary        *DashboardSummary
+	Expand         string // Panel to show fullscreen (from ?expand=name)
+	CSRFToken      string // Token for CSRF protection on POST requests
 }
 
 // RigRow represents a registered rig in the dashboard.
@@ -136,6 +141,63 @@ type ActivityRow struct {
 	RawTimestamp string // ISO 8601 timestamp for JS sorting/filtering
 }
 
+// CompletedBead represents a recently completed bead (last 24h).
+type CompletedBead struct {
+	ID       string
+	Title    string
+	ClosedAt string // relative time (e.g., "2h ago")
+	Priority int
+	Assignee string
+}
+
+// ReadyQueueRow represents a ready-to-start bead in the work queue.
+type ReadyQueueRow struct {
+	ID       string
+	Title    string
+	Priority int
+	PriClass string // CSS class for background color
+	PriEmoji string // 🔴 🟠 🔵 ⚪ ⚫
+	PriLabel string // "P0", "P1", "P2", etc.
+	Age      string
+}
+
+// ActiveWorkRow represents an in-progress bead with staleness info.
+type ActiveWorkRow struct {
+	ID          string
+	Title       string
+	Assignee    string
+	AgentShort  string // short display name
+	MinutesIdle int
+	StatusLabel string // "Active", "Slow", "Stalled"
+	StatusClass string // "aw-active", "aw-slow", "aw-stalled"
+	StatusEmoji string // 🟢 🟡 🔴
+}
+
+// MetricsData holds productivity metrics for the dashboard.
+type MetricsData struct {
+	TodayPoints    int
+	P0Count        int
+	P0Points       int
+	P1Count        int
+	P1Points       int
+	P2Count        int
+	P2Points       int
+	SevenDayAvgPts float64
+	AvgLeadTimeHrs float64
+	HighPrioPct    float64
+	DailyHistory   []DayHistory
+	TrendArrow     string // "↑", "↓", "→"
+	LeadTimeTrend  string // "Improving", "Stable", "Degrading"
+	HighPrioStatus string // "On track", "Below target"
+}
+
+// DayHistory holds completion data for one day in the 7-day history.
+type DayHistory struct {
+	Day    string // "Mon", "Tue", etc.
+	Points int
+	Count  int
+}
+
 // DashboardSummary provides at-a-glance stats and alerts.
 type DashboardSummary struct {
 	// Stats
@@ -232,10 +294,16 @@ func LoadTemplates() (*template.Template, error) {
 		"dogStateClass":      dogStateClass,
 		"queueStatusClass":   queueStatusClass,
 		"polecatStatusClass": polecatStatusClass,
-		"activityTypeClass": activityTypeClass,
+		"activityTypeClass":  activityTypeClass,
+		"readyQueueClass":    readyQueueClass,
+		"activeWorkClass":    activeWorkClass,
 		"contains": func(s, substr string) bool {
 			return strings.Contains(s, substr)
 		},
+		"formatFloat": func(f float64) string {
+			return fmt.Sprintf("%.1f", f)
+		},
+		"mul": func(a, b int) int { return a * b },
 	}
 
 	// Get the templates subdirectory
@@ -393,4 +461,25 @@ func activityTypeClass(category string) string {
 	default:
 		return "tl-cat-default"
 	}
+}
+
+// readyQueueClass returns CSS class for a ready queue priority.
+func readyQueueClass(priority int) string {
+	switch priority {
+	case 0:
+		return "pq-p0"
+	case 1:
+		return "pq-p1"
+	case 2:
+		return "pq-p2"
+	case 3:
+		return "pq-p3"
+	default:
+		return "pq-p4"
+	}
+}
+
+// activeWorkClass returns CSS class for an active work row.
+func activeWorkClass(statusClass string) string {
+	return statusClass
 }

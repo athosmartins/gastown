@@ -984,6 +984,158 @@
                     {{end}}
                 </div>
             </div>
+
+            <!-- Completed Beads Panel -->
+            {{if .CompletedBeads}}
+            <div class="panel" id="completed-beads-panel">
+                <div class="panel-header">
+                    <h2>✅ Completed (24h)</h2>
+                    <span class="count">{{len .CompletedBeads}}</span>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
+                    <button class="expand-btn">Expand</button>
+                </div>
+                <div class="panel-body">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Bead</th>
+                                <th>Title</th>
+                                <th>Pri</th>
+                                <th>Assignee</th>
+                                <th>Closed</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {{range .CompletedBeads}}
+                            <tr>
+                                <td><span class="hook-id">{{.ID}}</span></td>
+                                <td>{{.Title}}</td>
+                                <td>P{{.Priority}}</td>
+                                <td class="hook-agent">{{.Assignee}}</td>
+                                <td class="hook-age">{{.ClosedAt}}</td>
+                            </tr>
+                            {{end}}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            {{end}}
+
+            <!-- Work Queue Panel -->
+            {{if or .ReadyQueue .ActiveWork}}
+            <div class="panel" id="work-queue-panel">
+                <div class="panel-header">
+                    <h2>🚦 Work Queue</h2>
+                    <span class="count">{{len .ReadyQueue}}</span>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
+                    <button class="expand-btn">Expand</button>
+                </div>
+                <div class="panel-body">
+                    {{if .ActiveWork}}
+                    <h3 class="pq-section-title">In Progress</h3>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Bead</th>
+                                <th>Title</th>
+                                <th>Assignee</th>
+                                <th>Status</th>
+                                <th>Idle</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {{range .ActiveWork}}
+                            <tr class="{{.StatusClass}}">
+                                <td><span class="hook-id">{{.ID}}</span></td>
+                                <td>{{.Title}}</td>
+                                <td class="hook-agent">{{.AgentShort}}</td>
+                                <td><span class="badge aw-badge-{{.StatusClass}}">{{.StatusEmoji}} {{.StatusLabel}}</span></td>
+                                <td class="hook-age">{{.MinutesIdle}}m</td>
+                            </tr>
+                            {{end}}
+                        </tbody>
+                    </table>
+                    {{end}}
+                    {{if .ReadyQueue}}
+                    <h3 class="pq-section-title">Ready to Pick Up</h3>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Pri</th>
+                                <th>Bead</th>
+                                <th>Title</th>
+                                <th>Age</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {{range .ReadyQueue}}
+                            <tr>
+                                <td><span class="badge {{.PriClass}}">{{.PriEmoji}} {{.PriLabel}}</span></td>
+                                <td><span class="hook-id">{{.ID}}</span></td>
+                                <td>{{.Title}}</td>
+                                <td class="hook-age">{{.Age}}</td>
+                            </tr>
+                            {{end}}
+                        </tbody>
+                    </table>
+                    {{end}}
+                </div>
+            </div>
+            {{end}}
+
+            <!-- Productivity Metrics Panel -->
+            {{if .Metrics}}
+            <div class="panel" id="metrics-panel">
+                <div class="panel-header">
+                    <h2>📊 Productivity</h2>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
+                    <button class="expand-btn">Expand</button>
+                </div>
+                <div class="panel-body">
+                    <div class="metrics-grid">
+                        <div class="metric-card">
+                            <div class="metric-label">Today's Velocity</div>
+                            <div class="metric-value">{{.Metrics.TodayPoints}}</div>
+                            <div class="metric-sub">pts {{.Metrics.TrendArrow}}</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">7-Day Avg</div>
+                            <div class="metric-value">{{formatFloat .Metrics.SevenDayAvgPts}}</div>
+                            <div class="metric-sub">pts/day</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">Avg Lead Time</div>
+                            <div class="metric-value">{{formatFloat .Metrics.AvgLeadTimeHrs}}</div>
+                            <div class="metric-sub">hrs {{.Metrics.LeadTimeTrend}}</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">High-Pri Work</div>
+                            <div class="metric-value">{{formatFloat .Metrics.HighPrioPct}}%</div>
+                            <div class="metric-sub">{{.Metrics.HighPrioStatus}}</div>
+                        </div>
+                    </div>
+                    <div class="metrics-breakdown">
+                        <span class="metrics-pri p0">P0 ×{{.Metrics.P0Count}} = {{.Metrics.P0Points}}pts</span>
+                        <span class="metrics-pri p1">P1 ×{{.Metrics.P1Count}} = {{.Metrics.P1Points}}pts</span>
+                        <span class="metrics-pri p2">P2 ×{{.Metrics.P2Count}} = {{.Metrics.P2Points}}pts</span>
+                    </div>
+                    {{if .Metrics.DailyHistory}}
+                    <div class="metrics-chart">
+                        {{range .Metrics.DailyHistory}}
+                        <div class="chart-bar-col">
+                            <div class="chart-bar-wrap">
+                                <div class="chart-bar" style="height: {{mul .Points 8}}px;" title="{{.Day}}: {{.Points}}pts ({{.Count}} beads)"></div>
+                            </div>
+                            <div class="chart-day">{{.Day}}</div>
+                            <div class="chart-pts">{{.Points}}</div>
+                        </div>
+                        {{end}}
+                    </div>
+                    {{end}}
+                </div>
+            </div>
+            {{end}}
+
         </div>
     </div>
 
