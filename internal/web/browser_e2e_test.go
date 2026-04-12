@@ -78,24 +78,9 @@ type mockFetcher struct {
 	convoys []ConvoyRow
 }
 
-func (m *mockFetcher) FetchConvoys() ([]ConvoyRow, error)              { return m.convoys, nil }
-func (m *mockFetcher) FetchMergeQueue() ([]MergeQueueRow, error)       { return nil, nil }
-func (m *mockFetcher) FetchWorkers() ([]WorkerRow, error)              { return nil, nil }
-func (m *mockFetcher) FetchMail() ([]MailRow, error)                   { return nil, nil }
-func (m *mockFetcher) FetchRigs() ([]RigRow, error)                    { return nil, nil }
-func (m *mockFetcher) FetchDogs() ([]DogRow, error)                    { return nil, nil }
-func (m *mockFetcher) FetchEscalations() ([]EscalationRow, error)      { return nil, nil }
-func (m *mockFetcher) FetchHealth() (*HealthRow, error)                { return nil, nil }
-func (m *mockFetcher) FetchQueues() ([]QueueRow, error)                { return nil, nil }
-func (m *mockFetcher) FetchSessions() ([]SessionRow, error)            { return nil, nil }
-func (m *mockFetcher) FetchHooks() ([]HookRow, error)                  { return nil, nil }
-func (m *mockFetcher) FetchMayor() (*MayorStatus, error)               { return nil, nil }
-func (m *mockFetcher) FetchIssues() ([]IssueRow, error)                { return nil, nil }
-func (m *mockFetcher) FetchActivity() ([]ActivityRow, error)           { return nil, nil }
-func (m *mockFetcher) FetchCompletedBeads() ([]CompletedBead, error)   { return nil, nil }
-func (m *mockFetcher) FetchReadyQueue() ([]ReadyQueueRow, error)       { return nil, nil }
-func (m *mockFetcher) FetchActiveWork() ([]ActiveWorkRow, error)       { return nil, nil }
-func (m *mockFetcher) FetchMetrics() (*MetricsData, error)             { return nil, nil }
+func (m *mockFetcher) FetchConvoys() ([]ConvoyRow, error) {
+	return m.convoys, nil
+}
 
 // TestBrowser_ConvoyListLoads tests that the convoy list page loads correctly
 func TestBrowser_ConvoyListLoads(t *testing.T) {
