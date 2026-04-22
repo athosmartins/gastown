@@ -45,8 +45,7 @@ while IFS='|' read -r RIG PREFIX; do
 
     if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
       # Session dead — check hook
-      HOOK_BEAD=$(gt hook "$RIG/polecats/$PCAT_NAME" 2>/dev/null \
-        | grep -oE 'Hooked: [^ ]+' | head -1 | sed 's/Hooked: //')
+      HOOK_BEAD=$(bd show "$RIG/polecats/$PCAT_NAME" --json 2>/dev/null | jq -r '.[0].hook_bead // empty' 2>/dev/null || echo "")
 
       if [ -n "$HOOK_BEAD" ]; then
         # Check agent_state
@@ -67,8 +66,7 @@ while IFS='|' read -r RIG PREFIX; do
         PROC_COMM=$(ps -o comm= -p "$PANE_PID" 2>/dev/null)
         if [ -z "$PROC_COMM" ]; then
           # Zombie: process dead, session alive
-          HOOK_BEAD=$(gt hook "$RIG/polecats/$PCAT_NAME" 2>/dev/null \
-            | grep -oE 'Hooked: [^ ]+' | head -1 | sed 's/Hooked: //')
+          HOOK_BEAD=$(bd show "$RIG/polecats/$PCAT_NAME" --json 2>/dev/null | jq -r '.[0].hook_bead // empty' 2>/dev/null || echo "")
           if [ -n "$HOOK_BEAD" ]; then
             STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
             log "  ZOMBIE: $SESSION_NAME (pid=$PANE_PID dead, hook=$HOOK_BEAD)"
@@ -141,7 +139,7 @@ except Exception:
 " 2>/dev/null || echo "unknown")
 
       # State-based threshold: 2h for idle (intentional sleep), 20m for working/unknown
-      STUCK_THRESHOLD=1200
+      STUCK_THRESHOLD=3600
       if [ "$HEARTBEAT_STATE" = "idle" ]; then
         STUCK_THRESHOLD=7200
       fi
