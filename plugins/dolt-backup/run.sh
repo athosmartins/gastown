@@ -47,8 +47,8 @@ if [[ -n "$EXPLICIT_DBS" ]]; then
   IFS=',' read -ra PROD_DBS <<< "$EXPLICIT_DBS"
 else
   PROD_DBS=()
-  while IFS= read -r name; do
-    PROD_DBS+=("$name")
+  while IFS= read -r line; do
+    PROD_DBS+=("$line")
   done < <(
     for d in "$DOLT_DATA_DIR"/*/; do
       name="$(basename "$d")"
