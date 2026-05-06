@@ -24,8 +24,9 @@ func runMQList(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Create beads wrapper for the rig - use BeadsPath() to get the git-synced location
-	b := beads.New(r.BeadsPath())
+	// Create beads wrapper for the rig. newRigBeadsClient resolves to the rig DB
+	// by name so MR queries match the destination of `gt mq submit --rig`. (gt-7y7)
+	b := newRigBeadsClient(r)
 
 	// Create git client for branch verification when --verify is set
 	var gitClient *git.Git

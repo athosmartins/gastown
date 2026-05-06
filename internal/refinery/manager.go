@@ -55,6 +55,17 @@ func NewManager(r *rig.Rig) *Manager {
 	}
 }
 
+// beadsClient returns a beads wrapper bound to the rig's actual database.
+// Prefers BeadsDir() (resolved by name via doltserver.FindRigBeadsDir) over
+// rig-root .beads metadata so MR queries reach the same database that
+// upstream PR #3540 routes writes to. (gt-7y7 follow-up)
+func (m *Manager) beadsClient() *beads.Beads {
+	if dir := m.rig.BeadsDir(); dir != "" {
+		return beads.NewWithBeadsDir(m.rig.Path, dir)
+	}
+	return beads.New(m.rig.BeadsPath())
+}
+
 // SetOutput sets the output writer for user-facing messages.
 // This is useful for testing or redirecting output.
 func (m *Manager) SetOutput(w io.Writer) {
@@ -336,7 +347,7 @@ func (m *Manager) Stop() error {
 func (m *Manager) Queue() ([]QueueItem, error) {
 	// Query beads for open merge-request issues
 	// BeadsPath() returns the git-synced beads location
-	b := beads.New(m.rig.BeadsPath())
+	b := m.beadsClient()
 	issues, err := b.ListMergeRequests(beads.ListOptions{
 		Label:    "gt:merge-request",
 		Status:   "open",
@@ -567,7 +578,7 @@ func (m *Manager) RejectMR(idOrBranch string, reason string, notify bool) (*Merg
 	}
 
 	// Close the bead in storage with the rejection reason
-	b := beads.New(m.rig.BeadsPath())
+	b := m.beadsClient()
 	if err := b.CloseWithReason("rejected: "+reason, mr.ID); err != nil {
 		return nil, fmt.Errorf("failed to close MR bead: %w", err)
 	}
@@ -610,7 +621,7 @@ func (m *Manager) PostMerge(idOrBranch string) (*PostMergeResult, error) {
 		SourceIssueID: mr.IssueID,
 	}
 
-	b := beads.New(m.rig.BeadsPath())
+	b := m.beadsClient()
 
 	// Close the MR bead
 	if mr.IsClosed() {

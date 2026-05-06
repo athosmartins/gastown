@@ -55,8 +55,9 @@ func runMQNext(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Create beads wrapper for the rig
-	b := beads.New(r.BeadsPath())
+	// Create beads wrapper for the rig. newRigBeadsClient resolves to the rig DB
+	// by name so MR queries match the destination of `gt mq submit --rig`. (gt-7y7)
+	b := newRigBeadsClient(r)
 
 	// Query for open merge-requests (ready to process).
 	// Use ListMergeRequests to query both issues and wisps tables,

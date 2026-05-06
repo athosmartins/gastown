@@ -292,7 +292,17 @@ func NewEngineer(r *rig.Rig) *Engineer {
 	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
 		gitDir = filepath.Join(r.Path, "mayor", "rig")
 	}
-	beadsClient := beads.New(r.Path)
+	// Resolve to the rig's .beads directory by name rather than by rig-root
+	// metadata. Upstream PR #3540 routes MR creation via `bd create --rig`,
+	// so MRs land in the rig DB regardless of what <rig>/.beads/metadata.json
+	// says. Reading from BeadsDir() keeps writes and reads on the same DB. (gt-7y7)
+	beadsDir := r.BeadsDir()
+	var beadsClient *beads.Beads
+	if beadsDir != "" {
+		beadsClient = beads.NewWithBeadsDir(r.Path, beadsDir)
+	} else {
+		beadsClient = beads.New(r.Path)
+	}
 
 	return &Engineer{
 		rig:     r,
