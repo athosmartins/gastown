@@ -539,6 +539,9 @@ func init() {
 	mailCmd.AddCommand(mailSearchCmd)
 	mailCmd.AddCommand(mailAnnouncesCmd)
 	mailCmd.AddCommand(mailDrainCmd)
+	mailCmd.AddCommand(mailPollCmd)
+	mailCmd.AddCommand(mailPollerInstallCmd)
+	mailCmd.AddCommand(mailPollerUninstallCmd)
 
 	rootCmd.AddCommand(mailCmd)
 }
