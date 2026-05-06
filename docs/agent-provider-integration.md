@@ -346,7 +346,7 @@ config.RegisterHookInstaller("kiro", func(settingsDir, workDir, role, hooksDir, 
 If your agent uses a plugin system (like OpenCode's JS plugins), Gas Town can
 install a plugin file instead of a settings.json.
 
-Reference: `internal/opencode/plugin/gastown.js`
+Reference: `internal/hooks/templates/opencode/gastown.js`
 
 ```javascript
 export const GasTown = async ({ $, directory }) => {
@@ -529,7 +529,7 @@ Current agent capabilities at a glance:
 | Claude | Yes (settings.json) | `--resume` (flag) | Native | Yes | arg | node, claude |
 | Gemini | Yes | `--resume` (flag) | `-p` | No | arg | gemini |
 | Codex | No | `resume` (subcmd) | `exec` subcmd | No | none | codex |
-| Cursor | No | `--resume` (flag) | `-p` | No | arg | cursor-agent |
+| Cursor | Yes (`.cursor/hooks.json`) | `--resume` (flag) | `-p` / `--print` + `--output-format` | No | arg | cursor-agent, agent |
 | Auggie | No | `--resume` (flag) | No | No | arg | auggie |
 | AMP | No | `threads continue` (subcmd) | No | No | arg | amp |
 | OpenCode | Yes (plugin JS) | No | `run` subcmd | No | none | opencode, node, bun |

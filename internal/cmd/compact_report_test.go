@@ -38,6 +38,14 @@ func TestWispTypeToCategory(t *testing.T) {
 	}
 }
 
+func TestWispTypeToCategory_TitlePatrolFallback(t *testing.T) {
+	t.Parallel()
+	got := wispTypeToCategory("", "nightly patrol sweep")
+	if got != "Patrols" {
+		t.Errorf("empty wisp_type + patrol in title = %q, want Patrols", got)
+	}
+}
+
 func TestBuildReport(t *testing.T) {
 	result := &compactResult{
 		Deleted: []compactAction{

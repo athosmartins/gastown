@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -101,6 +100,16 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		fmt.Printf("%s Bead %s is already scheduled (context: %s), no-op\n",
 			style.Dim.Render("○"), beadID, existingCtx.ID)
 		return nil
+	}
+
+	// Guard against scheduling closed/tombstone beads (defense-in-depth, hq-ki2).
+	// Mirrors the closed-bead guards in runSling (sling.go) and executeSling
+	// (sling_dispatch.go). The daemon's stranded scan can route closed cross-prefix
+	// beads through scheduleBead in deferred dispatch mode; without this check, a
+	// fresh ghost convoy is created for already-completed work. Not bypassed by
+	// --force — if you need to re-dispatch, reopen the bead first.
+	if info.Status == "closed" || info.Status == "tombstone" {
+		return fmt.Errorf("bead %s is %s (work already completed)", beadID, info.Status)
 	}
 
 	if (info.Status == "pinned" || info.Status == "hooked" || info.Status == "in_progress") && !opts.Force {
@@ -322,17 +331,8 @@ func areScheduled(beadIDs []string) map[string]bool {
 		return result
 	}
 
-	townBeads := beads.NewWithBeadsDir(townRoot, filepath.Join(townRoot, ".beads"))
-	contexts, err := townBeads.ListOpenSlingContexts()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s Warning: could not list sling contexts: %v (treating all as scheduled)\n",
-			style.Dim.Render("⚠"), err)
-		// Fail closed: treat all as scheduled to avoid duplicate scheduling
-		for _, id := range beadIDs {
-			result[id] = true
-		}
-		return result
-	}
+	// Scan all rig beads dirs (sling contexts live in target rig's DB). (GH#3468)
+	contexts := listAllSlingContexts(townRoot)
 
 	// Build lookup of work bead IDs from open contexts, skipping stale ones.
 	scheduledWorkBeads := make(map[string]bool)

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -14,6 +15,18 @@ func isClaudeCmd(cmd string) bool {
 	base := filepath.Base(cmd)
 	base = strings.TrimSuffix(base, filepath.Ext(base))
 	return base == "claude"
+}
+
+func TestBuiltInAgentPresetSummary(t *testing.T) {
+	t.Parallel()
+	s := BuiltInAgentPresetSummary()
+	if !strings.Contains(s, "cursor") || !strings.Contains(s, "claude") {
+		t.Fatalf("BuiltInAgentPresetSummary() = %q, want cursor and claude", s)
+	}
+	names := strings.Split(s, ", ")
+	if !sort.StringsAreSorted(names) {
+		t.Errorf("BuiltInAgentPresetSummary not sorted: %q", s)
+	}
 }
 
 func TestBuiltinPresets(t *testing.T) {
@@ -409,6 +422,116 @@ func TestResolveProcessNames(t *testing.T) {
 			}
 		}
 	})
+
+	// Regression: custom agents wrapped in `env -u VAR <real-binary>` (or
+	// nohup/sudo/etc.) used to fall through to GT_PROCESS_NAMES=<wrapper>,
+	// which IsAgentAlive could never match — wrapper has exec'd into the real
+	// binary by then. ResolveProcessNames must look past the wrapper.
+	wrapperCases := []struct {
+		name    string
+		agent   AgentPresetInfo
+		want    []string
+		command string // command passed to ResolveProcessNames
+	}{
+		{
+			name: "env -u VAR claude unwraps to claude preset",
+			agent: AgentPresetInfo{
+				Name:    "claude",
+				Command: "env",
+				Args:    []string{"-u", "ANTHROPIC_API_KEY", "claude", "--dangerously-skip-permissions", "--effort", "high"},
+			},
+			command: "env",
+			want:    []string{"node", "claude"},
+		},
+		{
+			name: "env VAR=val claude unwraps past assignments",
+			agent: AgentPresetInfo{
+				Name:    "claude",
+				Command: "env",
+				Args:    []string{"FOO=bar", "BAZ=qux", "claude"},
+			},
+			command: "env",
+			want:    []string{"node", "claude"},
+		},
+		{
+			name: "env -- claude (separator) unwraps to claude",
+			agent: AgentPresetInfo{
+				Name:    "claude",
+				Command: "env",
+				Args:    []string{"-i", "--", "claude", "--foo"},
+			},
+			command: "env",
+			want:    []string{"node", "claude"},
+		},
+		{
+			name: "nohup opencode unwraps to opencode preset",
+			agent: AgentPresetInfo{
+				Name:    "opencode",
+				Command: "nohup",
+				Args:    []string{"opencode", "--quiet"},
+			},
+			command: "nohup",
+			want:    []string{"opencode", "node", "bun"},
+		},
+		{
+			name: "sudo -u runner codex unwraps to codex preset",
+			agent: AgentPresetInfo{
+				Name:    "codex",
+				Command: "sudo",
+				Args:    []string{"-u", "runner", "codex", "--dangerously-bypass-approvals-and-sandbox"},
+			},
+			command: "sudo",
+			want:    []string{"codex"},
+		},
+		{
+			name: "env wrapping unknown binary returns binary basename",
+			agent: AgentPresetInfo{
+				Name:    "my-agent",
+				Command: "env",
+				Args:    []string{"-u", "FOO", "/opt/my-tool", "--flag"},
+			},
+			command: "env",
+			want:    []string{"my-tool"},
+		},
+	}
+	for _, tc := range wrapperCases {
+		t.Run(tc.name, func(t *testing.T) {
+			RegisterAgentForTesting(string(tc.agent.Name), tc.agent)
+			t.Cleanup(ResetRegistryForTesting)
+
+			got := ResolveProcessNames(string(tc.agent.Name), tc.command, tc.agent.Args...)
+			if len(got) != len(tc.want) {
+				t.Fatalf("ResolveProcessNames(%q, %q) = %v, want %v", tc.agent.Name, tc.command, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("got[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+
+	// Real-world scenario: Paul's town settings shadow the canonical claude
+	// preset with a wrapper. The registry still holds the built-in claude
+	// preset; Args live only on the caller's RuntimeConfig. Caller args must
+	// take precedence so wrapper-unwrap finds the real binary.
+	t.Run("caller args used when registry holds canonical preset", func(t *testing.T) {
+		ResetRegistryForTesting()
+		t.Cleanup(ResetRegistryForTesting)
+		// No RegisterAgentForTesting — registry has canonical built-in claude
+		// (Command="claude", ProcessNames=[node, claude], Args=[--dangerously-...]).
+		got := ResolveProcessNames("claude", "env",
+			"-u", "ANTHROPIC_API_KEY", "claude", "--dangerously-skip-permissions", "--effort", "high")
+		want := []string{"node", "claude"}
+		if len(got) != len(want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Errorf("got[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
 }
 
 func TestAgentPresetApprovalFlags(t *testing.T) {
@@ -610,7 +733,7 @@ func TestGetProcessNames(t *testing.T) {
 		{"claude", []string{"node", "claude"}},
 		{"gemini", []string{"gemini"}},
 		{"codex", []string{"codex"}},
-		{"cursor", []string{"cursor-agent"}},
+		{"cursor", []string{"cursor-agent", "agent"}},
 		{"auggie", []string{"auggie"}},
 		{"amp", []string{"amp"}},
 		{"opencode", []string{"opencode", "node", "bun"}},
@@ -754,8 +877,7 @@ func TestCursorAgentPreset(t *testing.T) {
 		t.Errorf("cursor command = %q, want cursor-agent", info.Command)
 	}
 
-	// Check YOLO-equivalent flag (-f for force mode)
-	// Note: -p is for non-interactive mode with prompt, not used for default Args
+	// Check YOLO-equivalent flag (-f for force mode; CLI also documents --force / --yolo)
 	hasF := false
 	for _, arg := range info.Args {
 		if arg == "-f" {
@@ -766,12 +888,16 @@ func TestCursorAgentPreset(t *testing.T) {
 		t.Error("cursor args missing -f (force/YOLO mode)")
 	}
 
-	// Check ProcessNames for detection
-	if len(info.ProcessNames) == 0 {
-		t.Error("cursor ProcessNames is empty")
+	// Check ProcessNames for detection (install script provides both "agent" and "cursor-agent" symlinks).
+	// Tmux only treats "agent" as Cursor when GT_AGENT=cursor or GT_PROCESS_NAMES includes cursor-agent.
+	seen := make(map[string]bool, len(info.ProcessNames))
+	for _, n := range info.ProcessNames {
+		seen[n] = true
 	}
-	if info.ProcessNames[0] != "cursor-agent" {
-		t.Errorf("cursor ProcessNames[0] = %q, want cursor-agent", info.ProcessNames[0])
+	for _, name := range []string{"agent", "cursor-agent"} {
+		if !seen[name] {
+			t.Errorf("cursor ProcessNames missing %q (got %v)", name, info.ProcessNames)
+		}
 	}
 
 	// Check resume support
@@ -780,6 +906,9 @@ func TestCursorAgentPreset(t *testing.T) {
 	}
 	if info.ResumeStyle != "flag" {
 		t.Errorf("cursor ResumeStyle = %q, want flag", info.ResumeStyle)
+	}
+	if info.ReadyDelayMs != 5000 {
+		t.Errorf("cursor ReadyDelayMs = %d, want 5000 (nudge poller + WaitForRuntimeReady)", info.ReadyDelayMs)
 	}
 }
 
@@ -853,6 +982,21 @@ func TestLoadRigAgentRegistry(t *testing.T) {
 
 		if info.Command != "opencode" {
 			t.Errorf("expected opencode agent command to be 'opencode', got %s", info.Command)
+		}
+		if info.ConfigDir != ".opencode" {
+			t.Errorf("expected opencode ConfigDir to inherit '.opencode', got %q", info.ConfigDir)
+		}
+		if info.HooksDir != ".opencode/plugins" {
+			t.Errorf("expected opencode HooksDir to inherit '.opencode/plugins', got %q", info.HooksDir)
+		}
+		if info.HooksSettingsFile != "gastown.js" {
+			t.Errorf("expected opencode HooksSettingsFile to inherit 'gastown.js', got %q", info.HooksSettingsFile)
+		}
+		if len(info.ProcessNames) == 0 {
+			t.Errorf("expected opencode ProcessNames to remain populated after partial override")
+		}
+		if info.ReadyDelayMs != 8000 {
+			t.Errorf("expected opencode ReadyDelayMs to inherit 8000, got %d", info.ReadyDelayMs)
 		}
 	})
 

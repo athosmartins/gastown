@@ -225,9 +225,11 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	parentJoin, parentWhere := parentExcludeJoin(dbName)
 
 	// Count reap candidates: open wisps past max_age with eligible parent status.
+	// Must match Reap() eligibility semantics exactly, including the exclusion of
+	// agent beads, otherwise scan can report candidates that reap will never close.
 	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost (gt-jd1z).
 	reapQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM wisps w %s WHERE w.status IN ('open', 'hooked', 'in_progress') AND w.created_at < ? AND %s",
+		"SELECT COUNT(*) FROM wisps w %s WHERE w.status IN ('open', 'hooked', 'in_progress') AND w.created_at < ? AND w.issue_type != 'agent' AND %s",
 		parentJoin, parentWhere)
 	if err := db.QueryRowContext(ctx, reapQuery, now.Add(-maxAge)).Scan(&result.ReapCandidates); err != nil {
 		return nil, fmt.Errorf("count reap candidates: %w", err)
@@ -501,16 +503,12 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 			return totalDeleted, anomalies, nil
 		}
 		commitMsg := fmt.Sprintf("reaper: purge %d closed wisps from %s", totalDeleted, dbName)
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
-			// "nothing to commit" is expected when wisps are dolt_ignored — deletes
-			// are auto-committed by the SQL layer and Dolt has nothing to version.
-			if !isNothingToCommit(err) {
-				// Non-fatal — log but continue.
-				anomalies = append(anomalies, Anomaly{
-					Type:    "dolt_commit_failed",
-					Message: fmt.Sprintf("dolt commit after purge failed: %v", err),
-				})
-			}
+		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+			// Non-fatal — log but continue.
+			anomalies = append(anomalies, Anomaly{
+				Type:    "dolt_commit_failed",
+				Message: fmt.Sprintf("dolt commit after purge failed: %v", err),
+			})
 		}
 	}
 
@@ -564,7 +562,7 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 			return totalDeleted, fmt.Errorf("sql commit: %w", err)
 		}
 		commitMsg := fmt.Sprintf("reaper: purge %d old mail from %s", totalDeleted, dbName)
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 			// Non-fatal.
 		}
 	}

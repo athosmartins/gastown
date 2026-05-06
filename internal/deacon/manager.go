@@ -26,6 +26,7 @@ type tmuxOps interface {
 	IsAgentAlive(session string) bool
 	KillSessionWithProcesses(name string) error
 	NewSessionWithCommand(name, workDir, command string) error
+	NewSessionWithCommandAndEnv(name, workDir, command string, env map[string]string) error
 	SetRemainOnExit(pane string, on bool) error
 	SetEnvironment(session, key, value string) error
 	GetPaneID(session string) (string, error)
@@ -109,7 +110,7 @@ func (m *Manager) Start(agentOverride string) error {
 		Recipient: "deacon",
 		Sender:    "daemon",
 		Topic:     "patrol",
-	}, "I am Deacon. Start patrol: run gt deacon heartbeat, then check gt hook. If no hook, create mol-deacon-patrol wisp and execute it.")
+	}, "I am Deacon. Start patrol: run gt deacon heartbeat, then check gt hook. If no hook, run gt sling mol-deacon-patrol deacon, then execute the hook it creates.")
 	startupCmd, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
 		Role:        "deacon",
 		TownRoot:    m.townRoot,
@@ -121,9 +122,21 @@ func (m *Manager) Start(agentOverride string) error {
 		return fmt.Errorf("building startup command: %w", err)
 	}
 
-	// Create session with command directly to avoid send-keys race condition.
-	// See: https://github.com/anthropics/gastown/issues/280
-	if err := t.NewSessionWithCommand(sessionID, deaconDir, startupCmd); err != nil {
+	// Compute env vars BEFORE session creation so they reach Claude's
+	// subprocesses (e.g., bd) via tmux -e flags. SetEnvironment after creation
+	// only affects newly spawned panes, not the running pane's tree (gt-neycp).
+	envVars := config.AgentEnv(config.AgentEnvConfig{
+		Role:        "deacon",
+		TownRoot:    m.townRoot,
+		Agent:       agentOverride,
+		SessionName: sessionID,
+	})
+	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
+
+	// Create session with command and env vars via -e flags so the initial
+	// shell (and subprocesses Claude spawns) inherit them from the start.
+	// See: https://github.com/anthropics/gastown/issues/280 (race condition fix)
+	if err := t.NewSessionWithCommandAndEnv(sessionID, deaconDir, startupCmd, envVars); err != nil {
 		return fmt.Errorf("creating tmux session: %w", err)
 	}
 
@@ -132,26 +145,13 @@ func (m *Manager) Start(agentOverride string) error {
 	// The pane will show "[Exited]" status but remain available for respawn.
 	_ = t.SetRemainOnExit(sessionID, true)
 
-	// Set environment variables (non-fatal: session works without these)
-	// Use centralized AgentEnv for consistency across all role startup paths
-	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:        "deacon",
-		TownRoot:    m.townRoot,
-		Agent:       agentOverride,
-		SessionName: sessionID,
-	})
-	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
-	for k, v := range envVars {
-		_ = t.SetEnvironment(sessionID, k, v)
-	}
-
 	// Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
 	if paneID, err := t.GetPaneID(sessionID); err == nil {
 		_ = t.SetEnvironment(sessionID, "GT_PANE_ID", paneID)
 	}
 
 	// Apply Deacon theming (non-fatal: theming failure doesn't affect operation)
-	theme := tmux.ResolveSessionTheme(m.townRoot, "", "deacon")
+	theme := tmux.ResolveSessionTheme(m.townRoot, "", "deacon", "")
 	_ = t.ConfigureGasTownSession(sessionID, theme, "", "Deacon", "health-check")
 
 	// Wait for Claude to start - fatal if Claude fails to launch

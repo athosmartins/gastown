@@ -1205,7 +1205,8 @@ func TestBuildCrewStartupCommand(t *testing.T) {
 }
 
 func TestResolveAgentConfigWithOverride(t *testing.T) {
-	t.Parallel()
+	ResetRegistryForTesting()
+	t.Cleanup(ResetRegistryForTesting)
 	townRoot := t.TempDir()
 	rigPath := filepath.Join(townRoot, "testrig")
 
@@ -5157,13 +5158,13 @@ func TestTryResolveFromEphemeralTier(t *testing.T) {
 		}
 		found := false
 		for i, arg := range rc.Args {
-			if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "sonnet" {
+			if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "sonnet[1m]" {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Errorf("Args %v missing --model sonnet", rc.Args)
+			t.Errorf("Args %v missing --model sonnet[1m]", rc.Args)
 		}
 	})
 
@@ -5267,7 +5268,7 @@ func TestResolveRoleAgentConfig_EphemeralStandardSkipsPersisted(t *testing.T) {
 	for i, arg := range rc.Args {
 		if arg == "--model" && i+1 < len(rc.Args) {
 			model := rc.Args[i+1]
-			if model == "sonnet" || model == "haiku" {
+			if model == "sonnet" || model == "sonnet[1m]" || model == "haiku" {
 				t.Errorf("ephemeral standard should not use stale budget model; got --model %s", model)
 			}
 		}

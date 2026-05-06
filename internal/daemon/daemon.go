@@ -117,6 +117,19 @@ type Daemon struct {
 	// triggers a zombie restart, debouncing transient gaps during handoffs.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	mayorZombieCount int
+
+	// rigPool runs per-rig heartbeat operations (witness checks, refinery checks,
+	// polecat health, idle reaping, branch pruning) with bounded concurrency and
+	// per-rig context timeouts so one slow rig cannot block all others.
+	rigPool *RigWorkerPool
+
+	// knownRigsCache memoizes the result of reading mayor/rigs.json for the
+	// duration of a single heartbeat tick. ~10 call sites per tick otherwise
+	// re-read and re-parse the same file. Invalidated at the start of each
+	// heartbeat so rigs.json changes between ticks are picked up.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	knownRigsCache      []string
+	knownRigsCacheValid bool
 }
 
 // sessionDeath records a detected session death for mass death analysis.
@@ -166,7 +179,11 @@ func New(config *Config) (*Daemon, error) {
 		logger.Printf("Warning: failed to initialize town registry: %v", err)
 	}
 
-	// Set GT_TOWN_ROOT in tmux global environment so run-shell subprocesses
+	// Set GT_TOWN_ROOT in the daemon process env so Go code (e.g.,
+	// sessionPrefixPattern) can read it without relying on GT_ROOT.
+	os.Setenv("GT_TOWN_ROOT", config.TownRoot)
+
+	// Also set GT_TOWN_ROOT in tmux global environment so run-shell subprocesses
 	// (e.g., gt cycle next/prev) can find the workspace even when CWD is $HOME.
 	// Non-fatal: tmux server may not be running yet — daemon creates sessions shortly.
 	t := tmux.NewTmux()
@@ -316,6 +333,7 @@ func New(config *Config) (*Daemon, error) {
 		restartTracker:  restartTracker,
 		otelProvider:    otelProvider,
 		metrics:         dm,
+		rigPool:         newRigWorkerPool(0, 0, logger), // defaults: 10 workers, 30s timeout
 	}, nil
 }
 
@@ -742,6 +760,12 @@ func (d *Daemon) heartbeat(state *State) {
 
 	d.metrics.recordHeartbeat(d.ctx)
 	d.logger.Println("Heartbeat starting (recovery-focused)")
+
+	// Invalidate the per-tick rigs cache so this heartbeat re-reads from disk.
+	// Within a tick the cache coalesces the ~10 getKnownRigs() call sites into
+	// a single read; invalidating here ensures we pick up rigs.json changes
+	// between ticks.
+	d.invalidateKnownRigsCache()
 
 	// 0a. Reload prefix registry so new/changed rigs get correct session names.
 	// Without this, rigs added after daemon startup get the "gt" default prefix,
@@ -1199,6 +1223,21 @@ func (d *Daemon) ensureBootRunning() {
 		return
 	}
 
+	// Idle guard: skip if Deacon is healthy AND no beads are actively in flight.
+	//
+	// Boot's job is to triage a stuck or unresponsive Deacon and to flag stuck
+	// in_progress/hooked work. If Deacon has written a fresh heartbeat and no
+	// beads are in_progress or hooked, there is nothing to triage.
+	//
+	// We deliberately do NOT update bootLastSpawned on an idle skip: the cooldown
+	// is about rate-limiting real spawns; the idle check should re-run every
+	// heartbeat so Boot fires promptly when work actually appears.
+	hb := deacon.ReadHeartbeat(d.config.TownRoot)
+	if hb != nil && hb.IsFresh() && !d.hasActiveWork() {
+		d.logger.Println("Boot spawn skipped: Deacon is healthy and no active work in flight")
+		return
+	}
+
 	b := boot.New(d.config.TownRoot)
 
 	// Check for degraded mode
@@ -1208,6 +1247,26 @@ func (d *Daemon) ensureBootRunning() {
 		d.logger.Println("Degraded mode: running mechanical Boot triage")
 		d.runDegradedBootTriage(b)
 		return
+	}
+
+	// Idle check: run gt-idle-check to see if the system needs waking.
+	// If idle (all rigs parked, no polecats, deacon alive), skip the expensive
+	// Claude Boot session and use degraded mechanical triage instead.
+	// This saves ~480 Claude sessions/day when Gas Town is not in active use.
+	idleCheckBin := filepath.Join(d.config.TownRoot, "bin", "gt-idle-check")
+	if _, err := os.Stat(idleCheckBin); err == nil {
+		//nolint:gosec // G204: path is constructed from config
+		cmd := exec.Command(idleCheckBin)
+		cmd.Env = append(os.Environ(), fmt.Sprintf("PATH=%s:%s",
+			filepath.Join(d.config.TownRoot, "bin"), os.Getenv("PATH")))
+		if output, err := cmd.CombinedOutput(); err == nil {
+			// Exit 0 = idle, use degraded triage (zero tokens)
+			d.runDegradedBootTriage(b)
+			return
+		} else {
+			// Exit 1 = needs waking, proceed to full Claude Boot
+			d.logger.Printf("Idle check: waking — %s", strings.TrimSpace(string(output)))
+		}
 	}
 
 	// Spawn Boot in a fresh tmux session
@@ -1221,6 +1280,39 @@ func (d *Daemon) ensureBootRunning() {
 
 	d.bootLastSpawned = time.Now()
 	d.logger.Println("Boot spawned successfully")
+}
+
+// hasActiveWork returns true if any bead store has in_progress or hooked beads.
+// These are the only states Boot can meaningfully act on: in_progress work may be
+// stuck, and hooked work is waiting on a polecat that may have died.
+//
+// Returns true conservatively on error or when no stores are available, so the
+// caller falls through to spawn Boot rather than suppressing it incorrectly.
+func (d *Daemon) hasActiveWork() bool {
+	if len(d.beadsStores) == 0 {
+		// No stores open — cannot inspect; let Boot run to be safe.
+		return true
+	}
+
+	ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
+	defer cancel()
+
+	for name, store := range d.beadsStores {
+		for _, rawStatus := range []string{"in_progress"} {
+			s := beadsdk.Status(rawStatus)
+			filter := beadsdk.IssueFilter{Status: &s, Limit: 1}
+			issues, err := store.SearchIssues(ctx, "", filter)
+			if err != nil {
+				d.logger.Printf("hasActiveWork: %s/%s query failed: %v — assuming work present",
+					name, rawStatus, err)
+				return true // conservative: don't suppress Boot on query failure
+			}
+			if len(issues) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // runDegradedBootTriage performs mechanical Boot logic without AI reasoning.
@@ -1343,9 +1435,10 @@ func (d *Daemon) checkDeaconHeartbeat() {
 				return
 			}
 			// Grace period expired without any heartbeat - Deacon failed to start
-			// Detection only: stuck-agent-dog plugin handles context-aware restart
+			// Stuck-agent-dog: kill and restart
 			d.logger.Printf("STUCK DEACON: started %s ago but hasn't written heartbeat (session: %s)",
 				timeSinceStart.Round(time.Minute), sessionName)
+			d.restartStuckDeacon(sessionName, fmt.Sprintf("no heartbeat after %s", timeSinceStart.Round(time.Minute)))
 			return
 		}
 
@@ -1358,9 +1451,10 @@ func (d *Daemon) checkDeaconHeartbeat() {
 				return
 			}
 			// Grace period expired but heartbeat still from before start
-			// Detection only: stuck-agent-dog plugin handles context-aware restart
+			// Stuck-agent-dog: kill and restart
 			d.logger.Printf("STUCK DEACON: started %s ago but heartbeat still pre-restart (session: %s)",
 				timeSinceStart.Round(time.Minute), sessionName)
+			d.restartStuckDeacon(sessionName, fmt.Sprintf("heartbeat pre-restart after %s", timeSinceStart.Round(time.Minute)))
 			return
 		}
 
@@ -1397,22 +1491,97 @@ func (d *Daemon) checkDeaconHeartbeat() {
 	}
 
 	// Session exists but heartbeat is stale - Deacon may be stuck.
-	// gt-p7k: Use two-tier response — nudge for stale (5-20 min),
-	// escalate only for very stale (>= 20 min). The previous logic gated on
-	// IsVeryStale() (>= 15 min) then checked age > 10 min, making the
-	// nudge path unreachable (dead code). Now nudge fires for 5-20 min
-	// staleness, giving the Deacon a chance to respond before killing.
-	// Kill threshold must be > backoff-max (15m) to avoid false positive
-	// kills during legitimate await-signal sleep.
+	// Two-tier response: nudge for stale (5-20 min), kill and restart
+	// only for very stale (>= 20 min). Kill threshold must be > backoff-max
+	// to avoid false positive kills during legitimate await-signal sleep.
 	if hb.IsVeryStale() {
-		// Detection only: stuck-agent-dog plugin handles context-aware restart
+		// Stuck-agent-dog: kill and restart
 		d.logger.Printf("STUCK DEACON: heartbeat stale for %s, session %s needs restart", age.Round(time.Minute), sessionName)
+		d.restartStuckDeacon(sessionName, fmt.Sprintf("heartbeat stale for %s", age.Round(time.Minute)))
 	} else {
-		// Stale but not very stale (5-20 min) - nudge to wake up
+		// Stale but not very stale (5-20 min) - nudge to wake up (unless idle).
+		//
+		// Idle guard: skip nudge if no beads are actively in flight.
+		// This mirrors the Boot idle guard (ensureBootRunning). When the Deacon's
+		// heartbeat has gone stale during an await-signal backoff sleep, sending a
+		// nudge interrupts the exponential backoff for no reason — the Deacon will
+		// wake naturally at its next timeout. Only nudge if work is actually in
+		// flight (in_progress or hooked) that the Deacon may need to act on.
+		// Conservative: on store errors hasActiveWork returns true, so nudge fires.
+		// See also: runtime/runtime.go:99-101 — session-started nudge was removed
+		// for the same reason (it interrupted the deacon's await-signal backoff).
+		if !d.hasActiveWork() {
+			d.logger.Println("Deacon nudge skipped: no active work in flight, await-signal will fire naturally")
+			return
+		}
+
 		d.logger.Printf("Deacon stuck for %s - nudging session", age.Round(time.Minute))
 		if err := d.tmux.NudgeSession(sessionName, "HEALTH_CHECK: heartbeat stale, respond to confirm responsiveness"); err != nil {
 			d.logger.Printf("Error nudging stuck Deacon: %v", err)
 		}
+	}
+}
+
+// restartStuckDeacon kills a stuck Deacon session and respawns it.
+// Uses RestartTracker for exponential backoff and crash-loop prevention.
+// Notifies via gt-notify (zero token cost) if the notify script exists.
+func (d *Daemon) restartStuckDeacon(sessionName, reason string) {
+	const agentID = "deacon"
+
+	// Check restart tracker before acting
+	if d.restartTracker != nil {
+		if d.restartTracker.IsInCrashLoop(agentID) {
+			d.logger.Printf("Stuck-agent-dog: Deacon in crash loop, not restarting (use 'gt daemon clear-backoff deacon')")
+			d.notifySlack("admin", "critical", fmt.Sprintf("Deacon crash loop detected — manual intervention required. Reason: %s", reason))
+			return
+		}
+		if !d.restartTracker.CanRestart(agentID) {
+			remaining := d.restartTracker.GetBackoffRemaining(agentID)
+			d.logger.Printf("Stuck-agent-dog: Deacon restart in backoff, %s remaining", remaining.Round(time.Second))
+			return
+		}
+	}
+
+	// Kill the stuck session
+	d.logger.Printf("Stuck-agent-dog: killing stuck Deacon session %s (reason: %s)", sessionName, reason)
+	if err := d.tmux.KillSession(sessionName); err != nil {
+		d.logger.Printf("Stuck-agent-dog: error killing session %s: %v", sessionName, err)
+		// Continue — session may already be dead
+	}
+
+	// Brief pause for tmux cleanup
+	time.Sleep(2 * time.Second)
+
+	// Respawn via ensureDeaconRunning (which uses deacon.Manager)
+	d.ensureDeaconRunning()
+
+	// Verify it came back
+	hasSession, err := d.tmux.HasSession(sessionName)
+	if err != nil || !hasSession {
+		d.logger.Printf("Stuck-agent-dog: FAILED to respawn Deacon after kill")
+		d.notifySlack("admin", "critical", fmt.Sprintf("Deacon restart FAILED — session did not respawn. Reason: %s", reason))
+		return
+	}
+
+	d.logger.Printf("Stuck-agent-dog: Deacon restarted successfully")
+	d.notifySlack("admin", "high", fmt.Sprintf("Deacon was stuck (%s) — auto-restarted successfully", reason))
+}
+
+// notifySlack sends a notification via gt-notify (zero token cost).
+// Channel: "admin" or "status". Priority: "critical", "high", "info", "success".
+// Silently fails if gt-notify is not found — notification is best-effort.
+func (d *Daemon) notifySlack(channel, priority, message string) {
+	notifyBin := filepath.Join(d.config.TownRoot, "bin", "gt-notify")
+	if _, err := os.Stat(notifyBin); err != nil {
+		d.logger.Printf("Stuck-agent-dog: gt-notify not found at %s, skipping notification", notifyBin)
+		return
+	}
+
+	//nolint:gosec // G204: args are constructed internally
+	cmd := exec.Command(notifyBin, "--channel", channel, "--priority", priority, message)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("PATH=%s:%s", filepath.Join(d.config.TownRoot, "bin"), os.Getenv("PATH")))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		d.logger.Printf("Stuck-agent-dog: gt-notify failed: %v (output: %s)", err, string(output))
 	}
 }
 
@@ -1421,9 +1590,10 @@ func (d *Daemon) checkDeaconHeartbeat() {
 // Respects the rigs filter in daemon.json patrol config.
 func (d *Daemon) ensureWitnessesRunning() {
 	rigs := d.getPatrolRigs("witness")
-	for _, rigName := range rigs {
+	d.rigPool.runPerRig(d.ctx, rigs, func(ctx context.Context, rigName string) error {
 		d.ensureWitnessRunning(rigName)
-	}
+		return nil
+	})
 }
 
 // hasPendingEvents checks if there are pending .event files in the given channel directory.
@@ -1497,9 +1667,10 @@ func (d *Daemon) ensureWitnessRunning(rigName string) {
 // Respects the rigs filter in daemon.json patrol config.
 func (d *Daemon) ensureRefineriesRunning() {
 	rigs := d.getPatrolRigs("refinery")
-	for _, rigName := range rigs {
+	d.rigPool.runPerRig(d.ctx, rigs, func(ctx context.Context, rigName string) error {
 		d.ensureRefineryRunning(rigName)
-	}
+		return nil
+	})
 }
 
 // ensureRefineryRunning ensures the refinery for a specific rig is running.
@@ -1700,7 +1871,7 @@ func (d *Daemon) killDeaconSessions() {
 // killWitnessSessions kills leftover witness tmux sessions for all rigs.
 // Called when the witness patrol is disabled. (hq-2mstj)
 func (d *Daemon) killWitnessSessions() {
-	for _, rigName := range d.getKnownRigs() {
+	d.rigPool.runPerRig(d.ctx, d.getKnownRigs(), func(ctx context.Context, rigName string) error {
 		name := session.WitnessSessionName(session.PrefixFor(rigName))
 		exists, _ := d.tmux.HasSession(name)
 		if exists {
@@ -1709,13 +1880,14 @@ func (d *Daemon) killWitnessSessions() {
 				d.logger.Printf("Error killing %s session: %v", name, err)
 			}
 		}
-	}
+		return nil
+	})
 }
 
 // killRefinerySessions kills leftover refinery tmux sessions for all rigs.
 // Called when the refinery patrol is disabled. (hq-2mstj)
 func (d *Daemon) killRefinerySessions() {
-	for _, rigName := range d.getKnownRigs() {
+	d.rigPool.runPerRig(d.ctx, d.getKnownRigs(), func(ctx context.Context, rigName string) error {
 		name := session.RefinerySessionName(session.PrefixFor(rigName))
 		exists, _ := d.tmux.HasSession(name)
 		if exists {
@@ -1724,7 +1896,8 @@ func (d *Daemon) killRefinerySessions() {
 				d.logger.Printf("Error killing %s session: %v", name, err)
 			}
 		}
-	}
+		return nil
+	})
 }
 
 // killDefaultPrefixGhosts kills tmux sessions that use the default "gt" prefix
@@ -1852,7 +2025,28 @@ func (d *Daemon) openBeadsStores() (map[string]beadsdk.Storage, error) {
 }
 
 // getKnownRigs returns list of registered rig names.
+// Results are memoized per heartbeat tick to coalesce the ~10 per-tick callers
+// into a single mayor/rigs.json read. The cache is invalidated at the start of
+// each heartbeat.
 func (d *Daemon) getKnownRigs() []string {
+	if d.knownRigsCacheValid {
+		return d.knownRigsCache
+	}
+	rigs := d.readKnownRigsFromDisk()
+	d.knownRigsCache = rigs
+	d.knownRigsCacheValid = true
+	return rigs
+}
+
+// invalidateKnownRigsCache clears the per-tick cache so the next
+// getKnownRigs() call re-reads mayor/rigs.json from disk.
+func (d *Daemon) invalidateKnownRigsCache() {
+	d.knownRigsCache = nil
+	d.knownRigsCacheValid = false
+}
+
+// readKnownRigsFromDisk reads and parses mayor/rigs.json.
+func (d *Daemon) readKnownRigsFromDisk() []string {
 	rigsPath := filepath.Join(d.config.TownRoot, "mayor", "rigs.json")
 	data, err := os.ReadFile(rigsPath)
 	if err != nil {
@@ -2308,10 +2502,10 @@ func KillOrphanedDaemons(townRoot string) (int, error) {
 // When a crash is detected, the polecat is automatically restarted.
 // This provides faster recovery than waiting for GUPP timeout or Witness detection.
 func (d *Daemon) checkPolecatSessionHealth() {
-	rigs := d.getKnownRigs()
-	for _, rigName := range rigs {
+	d.rigPool.runPerRig(d.ctx, d.getKnownRigs(), func(ctx context.Context, rigName string) error {
 		d.checkRigPolecatHealth(rigName)
-	}
+		return nil
+	})
 }
 
 // checkRigPolecatHealth checks polecat session health for a specific rig.
@@ -2542,8 +2736,14 @@ func (d *Daemon) isBeadClosed(beadID string) bool {
 // field (updateAgentHookBead is a no-op). Without this fallback, the idle reaper
 // kills working polecats whose agent bead hook_bead is stale.
 func (d *Daemon) hasAssignedOpenWork(rigName, assignee string) bool {
+	rigDir := beads.GetRigDirForName(d.config.TownRoot, rigName)
+
 	for _, status := range []string{"hooked", "in_progress", "open"} {
-		cmd := exec.Command(d.bdPath, "list", "--rig="+rigName, "--assignee="+assignee, "--status="+status, "--json") //nolint:gosec // G204: args are constructed internally
+		args := []string{"list", "--assignee=" + assignee, "--status=" + status, "--json"}
+		if rigDir != "" {
+			args = append(args, "--repo="+rigDir)
+		}
+		cmd := exec.Command(d.bdPath, args...) //nolint:gosec // G204: args are constructed internally
 		cmd.Dir = d.config.TownRoot
 		cmd.Env = os.Environ()
 		output, err := cmd.Output()
@@ -2573,7 +2773,7 @@ Restart deferred to stuck-agent-dog plugin for context-aware recovery.`,
 	cmd := exec.Command(d.gtPath, "mail", "send", witnessAddr, "-s", subject, "-m", body) //nolint:gosec // G204: args are constructed internally
 	setSysProcAttr(cmd)
 	cmd.Dir = d.config.TownRoot
-	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")// Identify as daemon, not overseer
+	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon") // Identify as daemon, not overseer
 	if err := cmd.Run(); err != nil {
 		d.logger.Printf("Warning: failed to notify witness of crashed polecat: %v", err)
 	}
@@ -2585,12 +2785,12 @@ Restart deferred to stuck-agent-dog plugin for context-aware recovery.`,
 // This reaper checks heartbeat state and kills sessions idle longer than the threshold.
 func (d *Daemon) reapIdlePolecats() {
 	opCfg := d.loadOperationalConfig().GetDaemonConfig()
-	timeout := opCfg.PolecatIdleSessionTimeoutD()
+	idleTimeout := opCfg.PolecatIdleSessionTimeoutD()
 
-	rigs := d.getKnownRigs()
-	for _, rigName := range rigs {
-		d.reapRigIdlePolecats(rigName, timeout)
-	}
+	d.rigPool.runPerRig(d.ctx, d.getKnownRigs(), func(ctx context.Context, rigName string) error {
+		d.reapRigIdlePolecats(rigName, idleTimeout)
+		return nil
+	})
 }
 
 // reapRigIdlePolecats checks all polecats in a rig and kills idle sessions.
@@ -2650,11 +2850,19 @@ func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout time.Durat
 		agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
 		info, err := d.getAgentBeadInfo(agentBeadID)
 		if err != nil {
-			// Agent bead lookup failed — polecat has no provable work.
-			// If heartbeat is stale enough (2x timeout), reap anyway to prevent
-			// indefinite API burn when bead infrastructure is degraded.
-			// But first check if the agent is actually running (GH#3342).
-			if staleDuration >= timeout*2 && !d.tmux.IsAgentRunning(sessionName) {
+			// Agent bead lookup failed — use the authoritative work bead assignee
+			// to determine whether the polecat has real work before reaping.
+			// Bead infrastructure failures (Dolt issues, version mismatches) cause
+			// spurious lookup errors while the polecat is actively working (GH#3342).
+			assignee := fmt.Sprintf("%s/polecats/%s", rigName, polecatName)
+			if d.hasAssignedOpenWork(rigName, assignee) {
+				return
+			}
+			// No assigned work and agent not running — safe to reap.
+			// Use 3x threshold (not 2x) to avoid killing polecats during transient
+			// infrastructure degradation when the agent process is alive but not
+			// detectable (e.g. long thinking sessions, slow process inspection).
+			if staleDuration >= timeout*3 || !d.tmux.IsAgentRunning(sessionName) && staleDuration >= timeout*2 {
 				d.killIdlePolecat(rigName, polecatName, sessionName, staleDuration, timeout, "working-bead-lookup-failed")
 			}
 			return
@@ -2762,11 +2970,12 @@ func (d *Daemon) pruneStaleBranches() {
 		}
 	}
 
-	// Prune in each rig's git directory
-	for _, rigName := range d.getKnownRigs() {
+	// Prune in each rig's git directory (parallel — each rig is independent).
+	d.rigPool.runPerRig(d.ctx, d.getKnownRigs(), func(ctx context.Context, rigName string) error {
 		rigPath := filepath.Join(d.config.TownRoot, rigName)
 		pruneInDir(rigPath, rigName)
-	}
+		return nil
+	})
 
 	// Also prune in the town root itself (mayor clone)
 	pruneInDir(d.config.TownRoot, "town-root")

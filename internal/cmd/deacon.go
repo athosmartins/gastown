@@ -516,6 +516,14 @@ func startDeaconSession(t *tmux.Tmux, sessionName, agentOverride string) error {
 		return fmt.Errorf("creating deacon directory: %w", err)
 	}
 
+	// Resolve CLAUDE_CONFIG_DIR from accounts.json so deacon sessions
+	// use the correct account. Mirrors the daemon restart path (lifecycle.go).
+	accountsPath := constants.MayorAccountsPath(townRoot)
+	runtimeConfigDir, _, _ := config.ResolveAccountConfigDir(accountsPath, "")
+	if runtimeConfigDir == "" {
+		runtimeConfigDir = os.Getenv("CLAUDE_CONFIG_DIR")
+	}
+
 	// Ensure runtime settings exist (autonomous role needs mail in SessionStart)
 	runtimeConfig := config.ResolveRoleAgentConfig("deacon", townRoot, deaconDir)
 	if err := runtime.EnsureSettingsForRole(deaconDir, deaconDir, "deacon", runtimeConfig); err != nil {
@@ -526,34 +534,35 @@ func startDeaconSession(t *tmux.Tmux, sessionName, agentOverride string) error {
 		Recipient: "deacon",
 		Sender:    "daemon",
 		Topic:     "patrol",
-	}, "I am Deacon. First run `gt deacon heartbeat`. Then check gt hook, if empty create mol-deacon-patrol wisp and execute it.")
+	}, "I am Deacon. First run `gt deacon heartbeat`. Then check gt hook, and if it is empty run `gt sling mol-deacon-patrol deacon`, then execute the hook it creates.")
 	startupCmd, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
-		Role:        "deacon",
-		TownRoot:    townRoot,
-		Prompt:      initialPrompt,
-		Topic:       "patrol",
-		SessionName: sessionName,
+		Role:             "deacon",
+		TownRoot:         townRoot,
+		RuntimeConfigDir: runtimeConfigDir,
+		Prompt:           initialPrompt,
+		Topic:            "patrol",
+		SessionName:      sessionName,
 	}, "", initialPrompt, agentOverride)
 	if err != nil {
 		return fmt.Errorf("building startup command: %w", err)
 	}
 
-	// Create session with command directly to avoid send-keys race condition.
-	// See: https://github.com/anthropics/gastown/issues/280
-	fmt.Println("Starting Deacon session...")
-	if err := t.NewSessionWithCommand(sessionName, deaconDir, startupCmd); err != nil {
-		return fmt.Errorf("creating session: %w", err)
-	}
-
-	// Set environment (non-fatal: session works without these)
-	// Use centralized AgentEnv for consistency across all role startup paths
+	// Compute env vars BEFORE creating the session so they reach the agent's
+	// subprocesses (e.g., bd) via tmux -e flags. SetEnvironment after creation
+	// only affects newly spawned panes, not the running pane's tree (gt-neycp).
 	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:     "deacon",
-		TownRoot: townRoot,
-		Agent:    agentOverride,
+		Role:             "deacon",
+		TownRoot:         townRoot,
+		RuntimeConfigDir: runtimeConfigDir,
+		Agent:            agentOverride,
 	})
-	for k, v := range envVars {
-		_ = t.SetEnvironment(sessionName, k, v)
+
+	// Create session with command and env vars via -e flags so the initial
+	// shell (and subprocesses Claude spawns) inherit them from the start.
+	// See: https://github.com/anthropics/gastown/issues/280 (race condition fix)
+	fmt.Println("Starting Deacon session...")
+	if err := t.NewSessionWithCommandAndEnv(sessionName, deaconDir, startupCmd, envVars); err != nil {
+		return fmt.Errorf("creating session: %w", err)
 	}
 
 	// Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
@@ -563,7 +572,7 @@ func startDeaconSession(t *tmux.Tmux, sessionName, agentOverride string) error {
 
 	// Apply Deacon theme (non-fatal: theming failure doesn't affect operation)
 	// Note: ConfigureGasTownSession includes cycle bindings
-	theme := tmux.ResolveSessionTheme(townRoot, "", "deacon")
+	theme := tmux.ResolveSessionTheme(townRoot, "", "deacon", "")
 	_ = t.ConfigureGasTownSession(sessionName, theme, "", "Deacon", "health-check")
 
 	// Wait for Claude to start
@@ -911,17 +920,21 @@ func runDeaconHealthCheck(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("sending health check nudge: %w", err)
 	}
 
-	// Get baseline time AFTER sending nudge to avoid false positives.
-	// If we get the time before the nudge and the bead doesn't exist (time.Time{}),
-	// any subsequent update would incorrectly appear as a response.
-	// By getting the baseline after the nudge, we ensure we're only detecting
-	// activity that happens in response to our health check.
+	// Get baseline times AFTER sending nudge to avoid false positives.
+	// By sampling after the nudge, we only detect activity caused by our check.
 	baselineTime, err := getAgentBeadUpdateTime(townRoot, beadID)
 	if err != nil {
 		// Bead might not exist yet - use current time as baseline
 		// This way only updates AFTER this point count as responses
 		baselineTime = time.Now()
 	}
+
+	// Also capture baseline tmux session activity time.
+	// This is the secondary response signal: if the session shows new output
+	// after our nudge, the agent is alive and processing — even if it hasn't
+	// updated its bead (e.g., witness agents that respond in prose rather than
+	// via a structured bead-update channel).
+	baselineActivity, activityErr := t.GetSessionActivity(sessionName)
 
 	fmt.Printf("%s Sent HEALTH_CHECK to %s, waiting %s...\n",
 		style.Bold.Render("→"), agent, healthCheckTimeout)
@@ -941,15 +954,23 @@ func runDeaconHealthCheck(cmd *cobra.Command, args []string) error {
 		case <-ctx.Done():
 			goto Done
 		case <-ticker.C:
+			// Primary signal: bead update (structured response channel)
 			newTime, err := getAgentBeadUpdateTime(townRoot, beadID)
-			if err != nil {
-				continue
-			}
-
-			// If bead was updated after our baseline, agent responded
-			if newTime.After(baselineTime) {
+			if err == nil && newTime.After(baselineTime) {
 				responded = true
 				goto Done
+			}
+
+			// Secondary signal: tmux session activity (prose/command response)
+			// Agents like the Witness respond to HEALTH_CHECK by running commands
+			// in their session, producing output, but may not update their bead.
+			// Session activity is a reliable liveness signal for these agents.
+			if activityErr == nil {
+				newActivity, err := t.GetSessionActivity(sessionName)
+				if err == nil && newActivity.After(baselineActivity) {
+					responded = true
+					goto Done
+				}
 			}
 		}
 	}

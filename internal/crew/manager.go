@@ -11,6 +11,7 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
@@ -519,7 +520,7 @@ func (m *Manager) getLocked(name string) (*CrewWorker, error) {
 // saveState persists crew worker state to disk using atomic write.
 func (m *Manager) saveState(crew *CrewWorker) error {
 	stateFile := m.stateFile(crew.Name)
-	if err := util.AtomicWriteJSON(stateFile, crew); err != nil {
+	if err := atomicfile.WriteJSON(stateFile, crew); err != nil {
 		return fmt.Errorf("writing state: %w", err)
 	}
 
@@ -848,7 +849,17 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 	}
 
 	// Apply rig-based theming (non-fatal: theming failure doesn't affect operation)
-	theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "crew")
+	theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "crew", name)
+	if theme != nil {
+		theme.Window = session.ResolveWindowTint(m.rig.Name, "crew")
+		if theme.Window == nil && session.IsWindowTintEnabled(m.rig.Name) {
+			factor := session.ResolveTintFactor(m.rig.Name)
+			theme.Window = &tmux.WindowStyle{
+				BG: tmux.DarkenColor(theme.BG, factor),
+				FG: theme.FG,
+			}
+		}
+	}
 	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, name, "crew")
 
 	// Set up C-b n/p keybindings for crew session cycling (non-fatal)

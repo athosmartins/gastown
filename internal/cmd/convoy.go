@@ -99,6 +99,13 @@ const (
 	convoyStatusClosed         = "closed"
 	convoyStatusStagedReady    = "staged_ready"
 	convoyStatusStagedWarnings = "staged_warnings"
+
+	// trackedStatusUnknown is the sentinel for a tracked dependency whose
+	// status could not be resolved — typically a cross-rig bead whose rig DB
+	// is missing, parked, or unroutable from the convoy owner's cwd. Distinct
+	// from "open" so auto-close does not mistake it for pending work and
+	// `gt convoy status` can label it clearly. (gt-bs6 / GH#2786)
+	trackedStatusUnknown = "unknown"
 )
 
 func normalizeConvoyStatus(status string) string {
@@ -235,7 +242,7 @@ Examples:
   # Auto-discover issues from an epic's children:
   gt convoy create --from-epic gt-epic-abc
   gt convoy create --from-epic gt-epic-abc --owned --merge=direct`,
-	Args: cobra.ArbitraryArgs,
+	Args:         cobra.ArbitraryArgs,
 	SilenceUsage: true,
 	RunE:         runConvoyCreate,
 }
@@ -247,7 +254,7 @@ var convoyStatusCmd = &cobra.Command{
 
 Displays convoy metadata, tracked issues, and completion progress.
 Without an ID, shows status of all active convoys.`,
-	Args: cobra.MaximumNArgs(1),
+	Args:         cobra.MaximumNArgs(1),
 	SilenceUsage: true,
 	RunE:         runConvoyStatus,
 }
@@ -277,7 +284,7 @@ If the convoy is closed, it will be automatically reopened.
 Examples:
   gt convoy add hq-cv-abc gt-new-issue
   gt convoy add hq-cv-abc gt-issue1 gt-issue2 gt-issue3`,
-	Args: cobra.MinimumNArgs(2),
+	Args:         cobra.MinimumNArgs(2),
 	SilenceUsage: true,
 	RunE:         runConvoyAdd,
 }
@@ -298,7 +305,7 @@ Examples:
   gt convoy check              # Check all open convoys
   gt convoy check hq-cv-abc    # Check specific convoy
   gt convoy check --dry-run    # Preview what would close without acting`,
-	Args: cobra.MaximumNArgs(1),
+	Args:         cobra.MaximumNArgs(1),
 	SilenceUsage: true,
 	RunE:         runConvoyCheck,
 }
@@ -340,7 +347,7 @@ Examples:
   gt convoy close hq-cv-abc --force                   # Force close abandoned convoy
   gt convoy close hq-cv-abc --reason="no longer needed" --force
   gt convoy close hq-cv-xyz --notify mayor/`,
-	Args: cobra.ExactArgs(1),
+	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE:         runConvoyClose,
 }
@@ -719,26 +726,11 @@ func runConvoyCreate(cmd *cobra.Command, args []string) error {
 
 	// Notify address is stored in description (line 166-168) and read from there
 
-	// Run dep add from town root so bd routes correctly across rigs via
-	// routes.jsonl. getTownBeadsDir() already returns the town root.
-	// StripBeadsDir prevents inherited BEADS_DIR from overriding routing.
-
 	// Add 'tracks' relations for each tracked issue
 	trackedCount := 0
 	for _, issueID := range trackedIssues {
-		// Use --type=tracks for non-blocking tracking relation
-		var depStderr bytes.Buffer
-		if err := BdCmd("dep", "add", convoyID, issueID, "--type=tracks").
-			WithAutoCommit().
-			Dir(townBeads).
-			StripBeadsDir().
-			Stderr(&depStderr).
-			Run(); err != nil {
-			errMsg := strings.TrimSpace(depStderr.String())
-			if errMsg == "" {
-				errMsg = err.Error()
-			}
-			style.PrintWarning("couldn't track %s: %s", issueID, errMsg)
+		if err := addTrackingRelationFn(townBeads, convoyID, issueID); err != nil {
+			style.PrintWarning("couldn't track %s: %s", issueID, err)
 		} else {
 			trackedCount++
 		}
@@ -839,24 +831,11 @@ func runConvoyAdd(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s Reopened convoy %s\n", style.Bold.Render("↺"), convoyID)
 	}
 
-	// Run dep add from town root so bd routes correctly across rigs via
-	// routes.jsonl. getTownBeadsDir() already returns the town root.
-
 	// Add 'tracks' relations for each issue
 	addedCount := 0
 	for _, issueID := range issuesToAdd {
-		var depStderr bytes.Buffer
-		if err := BdCmd("dep", "add", convoyID, issueID, "--type=tracks").
-			Dir(townBeads).
-			WithAutoCommit().
-			StripBeadsDir().
-			Stderr(&depStderr).
-			Run(); err != nil {
-			errMsg := strings.TrimSpace(depStderr.String())
-			if errMsg == "" {
-				errMsg = err.Error()
-			}
-			style.PrintWarning("couldn't add %s: %s", issueID, errMsg)
+		if err := addTrackingRelationFn(townBeads, convoyID, issueID); err != nil {
+			style.PrintWarning("couldn't add %s: %s", issueID, err)
 		} else {
 			addedCount++
 		}
@@ -921,15 +900,33 @@ func closeConvoyIfComplete(townBeads, convoyID, title string, tracked []trackedI
 
 	allClosed := true
 	openCount := 0
+	unknownCount := 0
 	for _, t := range tracked {
-		if t.Status != "closed" && t.Status != "tombstone" {
+		switch t.Status {
+		case "closed", "tombstone":
+			// counted as complete
+		case trackedStatusUnknown:
+			// Cross-rig DB unreachable — can't verify completion. Leave convoy
+			// open, treat as Info (not a convoy-level failure). (gt-bs6)
+			allClosed = false
+			unknownCount++
+		default:
 			allClosed = false
 			openCount++
 		}
 	}
 
 	if !allClosed {
-		fmt.Printf("%s Convoy %s has %d open issue(s) remaining\n", style.Dim.Render("○"), convoyID, openCount)
+		switch {
+		case unknownCount > 0 && openCount > 0:
+			fmt.Printf("%s Convoy %s has %d open, %d unknown (cross-rig unreachable) issue(s) remaining\n",
+				style.Dim.Render("○"), convoyID, openCount, unknownCount)
+		case unknownCount > 0:
+			fmt.Printf("%s Convoy %s has %d tracked issue(s) with unknown status (cross-rig unreachable)\n",
+				style.Dim.Render("○"), convoyID, unknownCount)
+		default:
+			fmt.Printf("%s Convoy %s has %d open issue(s) remaining\n", style.Dim.Render("○"), convoyID, openCount)
+		}
 		return false, nil
 	}
 
@@ -1887,13 +1884,15 @@ func runConvoyStatus(cmd *cobra.Command, args []string) error {
 	if len(tracked) > 0 {
 		fmt.Printf("\n  %s\n", style.Bold.Render("Tracked Issues:"))
 		for _, t := range tracked {
-			// Status symbol: ✓ closed, ▶ in_progress/hooked, ○ other
+			// Status symbol: ✓ closed, ▶ in_progress/hooked, ? unknown (cross-rig unreachable), ○ other
 			status := "○"
 			switch t.Status {
 			case "closed":
 				status = "✓"
 			case "in_progress", "hooked":
 				status = "▶"
+			case trackedStatusUnknown:
+				status = "?"
 			}
 
 			// Show assignee in brackets (extract short name from path like gastown/polecats/goose -> goose)
@@ -2173,11 +2172,11 @@ func formatConvoyStatus(status string) string {
 
 // trackedIssueInfo holds info about an issue being tracked by a convoy.
 type trackedIssueInfo struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Status    string `json:"status"`
-	Type      string `json:"dependency_type"`
-	IssueType string `json:"issue_type"`
+	ID        string   `json:"id"`
+	Title     string   `json:"title"`
+	Status    string   `json:"status"`
+	Type      string   `json:"dependency_type"`
+	IssueType string   `json:"issue_type"`
 	Blocked   bool     `json:"blocked,omitempty"`    // True if issue currently has blockers
 	Assignee  string   `json:"assignee,omitempty"`   // Assigned agent (e.g., gastown/polecats/goose)
 	Labels    []string `json:"labels,omitempty"`     // Bead labels (propagated from trackedDependency)
@@ -2255,7 +2254,10 @@ func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 	// Fetch fresh issue details via bd show (uses prefix routing for cross-rig).
 	freshDetails := getIssueDetailsBatch(trackedIDs)
 
-	// Build tracked dependency structs from fresh details
+	// Build tracked dependency structs from fresh details. When fresh details
+	// are missing (cross-rig DB unreachable, missing, parked, or unroutable
+	// from town root), mark the dep with trackedStatusUnknown so callers can
+	// distinguish it from a legitimately open bead. (gt-bs6)
 	var deps []trackedDependency
 	for _, id := range trackedIDs {
 		dep := trackedDependency{
@@ -2264,6 +2266,8 @@ func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 		}
 		if details, ok := freshDetails[id]; ok {
 			applyFreshIssueDetails(&dep, details)
+		} else {
+			dep.Status = trackedStatusUnknown
 		}
 		deps = append(deps, dep)
 	}
@@ -2604,7 +2608,7 @@ func getWorkersForIssues(issueIDs []string) map[string]*workerInfo {
 		go func(beadsDir string) {
 			defer wg.Done()
 
-			cmd := exec.Command("bd", "list", "--type=agent", "--status=open", "--json", "--limit=0")
+			cmd := exec.Command("bd", "list", "--label=gt:agent", "--status=open", "--json", "--limit=0")
 			cmd.Dir = beadsDir
 			var stdout bytes.Buffer
 			cmd.Stdout = &stdout

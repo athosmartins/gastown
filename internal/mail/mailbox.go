@@ -490,7 +490,7 @@ func (m *Mailbox) getFromDir(id, beadsDir string) (*Message, error) {
 	defer cancel()
 	stdout, err := runBdCommand(ctx, args, m.workDir, beadsDir)
 	if err != nil {
-		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
+		if bdErr, ok := err.(*bdError); ok && (bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found") || bdErr.ContainsError("no issue found")) {
 			return nil, ErrMessageNotFound
 		}
 		return nil, err
@@ -566,7 +566,7 @@ func (m *Mailbox) closeInDir(id, beadsDir string) error {
 		To: m.identity,
 	}, err)
 	if err != nil {
-		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
+		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found") {
 			return ErrMessageNotFound
 		}
 		return err
@@ -626,14 +626,14 @@ func (m *Mailbox) markReadOnlyBeads(id string) error {
 	defer cancel()
 	_, err := runBdCommand(ctx, args, m.workDir, primary)
 	if err != nil {
-		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
+		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found") {
 			if primary != m.beadsDir {
 				// Cross-rig bead IDs (e.g. ne-*) may live in the home DB. See ne-bgr.
 				ctx2, cancel2 := bdWriteCtx()
 				defer cancel2()
 				_, err2 := runBdCommand(ctx2, args, m.workDir, m.beadsDir)
 				if err2 != nil {
-					if bdErr2, ok := err2.(*bdError); ok && bdErr2.ContainsError("not found") {
+					if bdErr2, ok := err2.(*bdError); ok && bdErr2.ContainsError("not found") || bdErr2.ContainsError("no issue found") {
 						return ErrMessageNotFound
 					}
 					return err2
@@ -671,14 +671,14 @@ func (m *Mailbox) markUnreadOnlyBeads(id string) error {
 	defer cancel()
 	_, err := runBdCommand(ctx, args, m.workDir, primary)
 	if err != nil {
-		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
+		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found") {
 			if primary != m.beadsDir {
 				// Cross-rig bead IDs (e.g. ne-*) may live in the home DB. See ne-bgr.
 				ctx2, cancel2 := bdWriteCtx()
 				defer cancel2()
 				_, err2 := runBdCommand(ctx2, args, m.workDir, m.beadsDir)
 				if err2 != nil {
-					if bdErr2, ok := err2.(*bdError); ok && bdErr2.ContainsError("not found") {
+					if bdErr2, ok := err2.(*bdError); ok && bdErr2.ContainsError("not found") || bdErr2.ContainsError("no issue found") {
 						return ErrMessageNotFound
 					}
 					if bdErr2, ok := err2.(*bdError); ok && bdErr2.ContainsError("does not have label") {
@@ -720,14 +720,14 @@ func (m *Mailbox) markUnreadBeads(id string) error {
 	defer cancel()
 	_, err := runBdCommand(ctx, args, m.workDir, primary)
 	if err != nil {
-		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") {
+		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found") {
 			if primary != m.beadsDir {
 				// Cross-rig bead IDs (e.g. ne-*) may live in the home DB. See ne-bgr.
 				ctx2, cancel2 := bdWriteCtx()
 				defer cancel2()
 				_, err2 := runBdCommand(ctx2, args, m.workDir, m.beadsDir)
 				if err2 != nil {
-					if bdErr2, ok := err2.(*bdError); ok && bdErr2.ContainsError("not found") {
+					if bdErr2, ok := err2.(*bdError); ok && bdErr2.ContainsError("not found") || bdErr2.ContainsError("no issue found") {
 						return ErrMessageNotFound
 					}
 					return err2
@@ -807,6 +807,12 @@ func (m *Mailbox) deleteLegacy(id string) error {
 }
 
 // Archive moves a message to the archive file and removes it from inbox.
+//
+// Archive is a mail cleanup operation, not a bead operation. If the
+// underlying bead has been garbage collected (by `bd mol wisp gc` or
+// `bd compact`), there is nothing to append to the archive and nothing
+// to close — we still return nil so the caller's inbox reference is
+// considered cleared. See aa-6hv.
 func (m *Mailbox) Archive(id string) error {
 	if m.legacy {
 		return m.archiveLegacy(id)
@@ -814,12 +820,24 @@ func (m *Mailbox) Archive(id string) error {
 	// Beads mode: append to archive then close
 	msg, err := m.Get(id)
 	if err != nil {
+		if errors.Is(err, ErrMessageNotFound) {
+			// Underlying bead has been GC'd; nothing to archive or close.
+			return nil
+		}
 		return err
 	}
 	if err := m.appendToArchive(msg); err != nil {
 		return err
 	}
-	return m.Delete(id)
+	if err := m.Delete(id); err != nil {
+		if errors.Is(err, ErrMessageNotFound) {
+			// Bead was GC'd between Get and Delete; metadata is archived,
+			// and there is nothing left to close.
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // archiveLegacy moves a message to the archive file atomically.

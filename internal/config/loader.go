@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/constants"
 )
 
@@ -81,28 +82,43 @@ func SaveTownConfig(path string, config *TownConfig) error {
 }
 
 // LoadRigsConfig loads and validates a rigs registry file.
+// Retries once on read/parse errors to tolerate the brief window during which a
+// concurrent non-atomic writer could leave the file truncated. With
+// SaveRigsConfig now using atomic write-then-rename this is belt-and-suspenders
+// against older versions that may still be writing the file.
 func LoadRigsConfig(path string) (*RigsConfig, error) {
-	data, err := os.ReadFile(path) //nolint:gosec // G304: path is constructed internally, not from user input
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("%w: %s", ErrNotFound, path)
+	readAndParse := func() (*RigsConfig, error) {
+		data, err := os.ReadFile(path) //nolint:gosec // G304: path is constructed internally, not from user input
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, fmt.Errorf("%w: %s", ErrNotFound, path)
+			}
+			return nil, fmt.Errorf("reading config: %w", err)
 		}
-		return nil, fmt.Errorf("reading config: %w", err)
+
+		var config RigsConfig
+		if err := json.Unmarshal(data, &config); err != nil {
+			return nil, fmt.Errorf("parsing config: %w", err)
+		}
+
+		if err := validateRigsConfig(&config); err != nil {
+			return nil, err
+		}
+
+		return &config, nil
 	}
 
-	var config RigsConfig
-	if err := json.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("parsing config: %w", err)
+	cfg, err := readAndParse()
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		cfg, err = readAndParse()
 	}
-
-	if err := validateRigsConfig(&config); err != nil {
-		return nil, err
-	}
-
-	return &config, nil
+	return cfg, err
 }
 
-// SaveRigsConfig saves a rigs registry to a file.
+// SaveRigsConfig saves a rigs registry to a file atomically.
+// Writes to a temp file in the same directory then renames into place; the
+// rename is atomic on POSIX, so concurrent readers never observe a zero-byte
+// or partially-written rigs.json.
 func SaveRigsConfig(path string, config *RigsConfig) error {
 	if err := validateRigsConfig(config); err != nil {
 		return err
@@ -117,7 +133,7 @@ func SaveRigsConfig(path string, config *RigsConfig) error {
 		return fmt.Errorf("encoding config: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := atomicfile.WriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("writing config: %w", err)
 	}
 
@@ -1223,8 +1239,17 @@ func resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride str
 	// If an override is requested, validate it exists
 	if agentOverride != "" {
 		var rc *RuntimeConfig
+		// For subcommand-style overrides (e.g. "opencode acp"), prefer the built-in
+		// preset when one exists. Town agent registry overrides often point at wrappers
+		// like gt-opencode, but ACP/subcommand invocations need the underlying runtime
+		// binary and built-in capability metadata.
+		if len(extraArgs) > 0 {
+			if preset, ok := builtinPresets[AgentPreset(agentName)]; ok {
+				rc = runtimeConfigFromAgentInfo(AgentPreset(agentName), preset)
+			}
+		}
 		// Check rig-level custom agents first
-		if rigSettings != nil && rigSettings.Agents != nil {
+		if rc == nil && rigSettings != nil && rigSettings.Agents != nil {
 			if custom, ok := rigSettings.Agents[agentName]; ok && custom != nil {
 				rc = fillRuntimeDefaults(custom)
 			}
@@ -1397,6 +1422,52 @@ func ResolveWorkerAgentConfig(workerName, townRoot, rigPath string) *RuntimeConf
 	// Tier 3: fall back to crew role resolution (already holds lock; use core function)
 	rc := resolveRoleAgentConfigCore("crew", townRoot, rigPath)
 	return withRoleSettingsFlag(rc, "crew", rigPath)
+}
+
+// ResolveRoleEffort resolves the effort level for a role.
+// Resolution order:
+//  1. Rig's RoleEffort[role]
+//  2. Town's RoleEffort[role]
+//  3. Returns "" (caller falls back to env var / default "high")
+//
+// Invalid effort levels are warned about and skipped.
+func ResolveRoleEffort(role, townRoot, rigPath string) string {
+	// Tier 1: ephemeral cost tier override (mirrors agent resolution)
+	if tierName := os.Getenv("GT_COST_TIER"); tierName != "" && IsValidTier(tierName) {
+		if roleEffort := CostTierRoleEffort(CostTier(tierName)); roleEffort != nil {
+			if effort, ok := roleEffort[role]; ok {
+				return effort
+			}
+		}
+	}
+
+	// Tier 2: rig-level override
+	if rigPath != "" {
+		if rigSettings, err := LoadRigSettings(RigSettingsPath(rigPath)); err == nil && rigSettings != nil {
+			if effort, ok := rigSettings.RoleEffort[role]; ok && effort != "" {
+				if !IsValidEffortLevel(effort) {
+					fmt.Fprintf(os.Stderr, "warning: rig role_effort[%s]=%q is not a valid effort level, ignoring\n", role, effort)
+				} else {
+					return effort
+				}
+			}
+		}
+	}
+
+	// Tier 3: town-level setting
+	if townRoot != "" {
+		if townSettings, err := LoadOrCreateTownSettings(TownSettingsPath(townRoot)); err == nil && townSettings != nil {
+			if effort, ok := townSettings.RoleEffort[role]; ok && effort != "" {
+				if !IsValidEffortLevel(effort) {
+					fmt.Fprintf(os.Stderr, "warning: town role_effort[%s]=%q is not a valid effort level, ignoring\n", role, effort)
+				} else {
+					return effort
+				}
+			}
+		}
+	}
+
+	return "" // Caller uses env var fallback, then "high" default
 }
 
 // IsResolvedAgentClaude returns true if the RuntimeConfig represents a Claude agent.
@@ -2204,8 +2275,9 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 	}
 	// Set GT_PROCESS_NAMES for accurate liveness detection. Custom agents may
 	// shadow built-in preset names (e.g., custom "codex" running "opencode"),
-	// so we resolve process names from both agent name and actual command.
-	processNames := ResolveProcessNames(rc.ResolvedAgent, rc.Command)
+	// or wrap the real binary with a launcher (e.g., `env -u VAR claude ...`).
+	// Pass rc.Args so wrapper-unwrap can find the real binary.
+	processNames := ResolveProcessNames(rc.ResolvedAgent, rc.Command, rc.Args...)
 	resolvedEnv["GT_PROCESS_NAMES"] = strings.Join(processNames, ",")
 	// Merge agent-specific env vars (e.g., OPENCODE_PERMISSION for yolo mode)
 	for k, v := range rc.Env {
@@ -2458,7 +2530,9 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 		resolvedEnv["GT_AGENT"] = rc.ResolvedAgent
 	}
 	// Set GT_PROCESS_NAMES for accurate liveness detection of custom agents.
-	processNamesOverride := ResolveProcessNames(agentForProcess, rc.Command)
+	// Pass rc.Args so wrapper-unwrap (env/sudo/nohup wrapping a real binary)
+	// can find the real agent binary.
+	processNamesOverride := ResolveProcessNames(agentForProcess, rc.Command, rc.Args...)
 	resolvedEnv["GT_PROCESS_NAMES"] = strings.Join(processNamesOverride, ",")
 	// Merge agent-specific env vars (e.g., OPENCODE_PERMISSION for yolo mode)
 	for k, v := range rc.Env {

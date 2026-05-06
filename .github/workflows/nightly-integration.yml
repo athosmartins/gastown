@@ -5,6 +5,9 @@ on:
     - cron: '0 6 * * *' # 06:00 UTC daily
   workflow_dispatch: # Allow manual triggering
 
+permissions:
+  contents: read
+
 jobs:
   integration-full:
     name: Full Integration Tests
@@ -26,14 +29,14 @@ jobs:
 
       - name: Cache beads (bd)
         id: cache-beads
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: ~/go/bin/bd
           key: beads-nightly-${{ hashFiles('.github/workflows/nightly-integration.yml') }}
 
       - name: Install beads (bd)
         if: steps.cache-beads.outputs.cache-hit != 'true'
-        run: go install github.com/steveyegge/beads/cmd/bd@v0.55.4
+        run: go install github.com/steveyegge/beads/cmd/bd@v0.57.0
 
       - name: Install Dolt
         run: |
@@ -44,7 +47,7 @@ jobs:
         run: docker pull dolthub/dolt-sql-server:1.83.0
 
       - name: Add to PATH
-        run: echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Configure Dolt
         run: |

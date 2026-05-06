@@ -135,6 +135,43 @@ func TestDiscoverRigs(t *testing.T) {
 	}
 }
 
+func TestDiscoverRigs_SortedByName(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+
+	// Register rigs in deliberately non-alphabetical order.
+	// Go map iteration is randomized, so without sorting the output
+	// order would be nondeterministic across runs.
+	names := []string{"zebra", "alpha", "middle", "beta"}
+	for _, name := range names {
+		createTestRig(t, root, name)
+		rigsConfig.Rigs[name] = config.RigEntry{
+			GitURL: "git@github.com:test/" + name + ".git",
+		}
+	}
+
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+
+	// Run multiple iterations to catch nondeterminism — a single pass
+	// could accidentally return sorted order from a random map.
+	for i := 0; i < 10; i++ {
+		rigs, err := manager.DiscoverRigs()
+		if err != nil {
+			t.Fatalf("DiscoverRigs (iter %d): %v", i, err)
+		}
+
+		if len(rigs) != len(names) {
+			t.Fatalf("iter %d: rigs count = %d, want %d", i, len(rigs), len(names))
+		}
+
+		want := []string{"alpha", "beta", "middle", "zebra"}
+		for j, rig := range rigs {
+			if rig.Name != want[j] {
+				t.Errorf("iter %d: rigs[%d].Name = %q, want %q", i, j, rig.Name, want[j])
+			}
+		}
+	}
+}
+
 func TestGetRig(t *testing.T) {
 	root, rigsConfig := setupTestTown(t)
 
@@ -900,8 +937,18 @@ func TestConvertToSSH(t *testing.T) {
 			wantSSH: "git@gitlab.com:owner/repo.git",
 		},
 		{
-			name:    "Unknown host returns empty",
+			name:    "Bitbucket with .git suffix",
 			https:   "https://bitbucket.org/owner/repo.git",
+			wantSSH: "git@bitbucket.org:owner/repo.git",
+		},
+		{
+			name:    "Bitbucket without .git suffix",
+			https:   "https://bitbucket.org/owner/repo",
+			wantSSH: "git@bitbucket.org:owner/repo.git",
+		},
+		{
+			name:    "Unknown host returns empty",
+			https:   "https://gitlab.example.com/owner/repo.git",
 			wantSSH: "",
 		},
 		{

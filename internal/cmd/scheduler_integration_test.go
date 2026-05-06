@@ -44,8 +44,10 @@ func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 	args := []string{"init", "--prefix", prefix}
 	// Forward GT_DOLT_PORT so bd connects to the ephemeral test server
 	// instead of defaulting to port 3307.
+	// bd v1.0.0+ defaults to embedded mode; --server is required to use an
+	// external server (v0.57.0 defaulted to server mode and ignored --server).
 	if p := os.Getenv("GT_DOLT_PORT"); p != "" {
-		args = append(args, "--server-port", p)
+		args = append(args, "--server", "--server-port", p)
 	}
 	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
@@ -140,6 +142,10 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 	routes := []beads.Route{
 		{Prefix: hqPrefix + "-", Path: "."},
 		{Prefix: rigPrefix + "-", Path: "testrig/mayor/rig"},
+		// Convoy beads use a literal "hq-cv-" prefix (see install.go — registered
+		// on real towns during `gt install`). Route them to HQ so tests that
+		// look up auto-convoys via `bd show` resolve correctly.
+		{Prefix: "hq-cv-", Path: "."},
 	}
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
@@ -209,19 +215,23 @@ func createSlingContext(t *testing.T, hqPath string, fields *capacity.SlingConte
 	return ctxBead.ID
 }
 
-// findSlingContext finds an open sling context for a work bead in the HQ beads DB.
+// findSlingContext finds an open sling context for a work bead by scanning all
+// rig beads dirs under townRoot. Mirrors production's listAllSlingContexts since
+// sling contexts now live in the target rig's beads dir, not HQ (see dee628d3).
 // Returns nil if none found.
 func findSlingContext(t *testing.T, hqPath, workBeadID string) *capacity.SlingContextFields {
 	t.Helper()
-	townBeads := beads.NewWithBeadsDir(hqPath, filepath.Join(hqPath, ".beads"))
-	_, fields, err := townBeads.FindOpenSlingContext(workBeadID)
-	if err != nil {
-		t.Fatalf("FindOpenSlingContext(%s) failed: %v", workBeadID, err)
+	for _, ctx := range listAllSlingContexts(hqPath) {
+		fields := beads.ParseSlingContextFields(ctx.Description)
+		if fields != nil && fields.WorkBeadID == workBeadID {
+			return fields
+		}
 	}
-	return fields
+	return nil
 }
 
-// hasSlingContext checks if a work bead has an open sling context in HQ.
+// hasSlingContext checks if a work bead has an open sling context anywhere
+// under townRoot (HQ or any rig beads dir).
 func hasSlingContext(t *testing.T, hqPath, workBeadID string) bool {
 	t.Helper()
 	return findSlingContext(t, hqPath, workBeadID) != nil
@@ -280,7 +290,8 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 	beadID := createTestBead(t, rigPath, "Auto convoy test")
 
 	// Schedule via gt sling deferred dispatch (max_polecats > 0)
-	slingToScheduler(t, gtBinary, hqPath, env, beadID, "testrig")
+	slingOut := slingToScheduler(t, gtBinary, hqPath, env, beadID, "testrig")
+	t.Logf("gt sling output: %s", slingOut)
 
 	// Verify: bead should have a sling context
 	fields := findSlingContext(t, hqPath, beadID)
@@ -294,19 +305,23 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 		t.Fatalf("convoy ID not stored in sling context")
 	}
 
-	// Verify: convoy is resolvable via bd show from hq
-	cmd := exec.Command("bd", "show", fields.Convoy, "--json", "--allow-stale")
+	// Verify: convoy is resolvable via bd show from hq.
+	showArgs := beads.MaybePrependAllowStale([]string{"show", fields.Convoy, "--json"})
+	cmd := exec.Command("bd", showArgs...)
 	cmd.Dir = hqPath
 	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("bd show convoy %s failed: %v", fields.Convoy, err)
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			t.Fatalf("bd show convoy %s failed: %v\nstderr: %s\nstdout: %s", fields.Convoy, err, exitErr.Stderr, out)
+		}
+		t.Fatalf("bd show convoy %s failed: %v\noutput: %s", fields.Convoy, err, out)
 	}
 	var convoys []struct {
 		ID        string `json:"id"`
 		IssueType string `json:"issue_type"`
 	}
 	if err := json.Unmarshal(out, &convoys); err != nil {
-		t.Fatalf("parse convoy show: %v", err)
+		t.Fatalf("parse convoy show: %v\nraw output: %s", err, out)
 	}
 	if len(convoys) == 0 {
 		t.Fatalf("convoy %s not found via bd show", fields.Convoy)
@@ -316,23 +331,25 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 	}
 
 	// Verify: convoy has a "tracks" dependency pointing to the rig bead.
-	// This is the core cross-rig link: convoy lives in HQ DB, bead in rig DB.
-	depArgs := beads.MaybePrependAllowStale([]string{"dep", "list", fields.Convoy, "--direction=down", "--type=tracks", "--json"})
+	depArgs := beads.MaybePrependAllowStale([]string{
+		"dep", "list", fields.Convoy, fields.Convoy,
+		"--direction=down", "--type=tracks", "--json",
+	})
 	depCmd := exec.Command("bd", depArgs...)
 	depCmd.Dir = hqPath
 	depOut, err := depCmd.Output()
 	if err != nil {
-		t.Fatalf("bd dep list %s --type=tracks failed: %v", fields.Convoy, err)
+		t.Fatalf("convoy %s dep list failed: %v", fields.Convoy, err)
 	}
 	var deps []struct {
-		ID string `json:"id"`
+		DependsOnID string `json:"depends_on_id"`
 	}
 	if err := json.Unmarshal(depOut, &deps); err != nil {
 		t.Fatalf("parse dep list: %v\nraw: %s", err, depOut)
 	}
 	foundTracked := false
 	for _, dep := range deps {
-		if dep.ID == beadID {
+		if strings.Contains(dep.DependsOnID, beadID) {
 			foundTracked = true
 			break
 		}
@@ -456,14 +473,10 @@ func TestSchedulerSlingContextIdempotency(t *testing.T) {
 	slingToScheduler(t, gtBinary, hqPath, env, beadID, "testrig")
 	slingToScheduler(t, gtBinary, hqPath, env, beadID, "testrig")
 
-	// Verify: only one sling context exists
-	townBeads := beads.NewWithBeadsDir(hqPath, filepath.Join(hqPath, ".beads"))
-	contexts, err := townBeads.ListOpenSlingContexts()
-	if err != nil {
-		t.Fatalf("ListOpenSlingContexts failed: %v", err)
-	}
+	// Verify: only one sling context exists across all rig dirs
+	// (sling contexts live in the target rig's beads dir per dee628d3).
 	count := 0
-	for _, ctx := range contexts {
+	for _, ctx := range listAllSlingContexts(hqPath) {
 		fields := beads.ParseSlingContextFields(ctx.Description)
 		if fields != nil && fields.WorkBeadID == beadID {
 			count++
@@ -579,6 +592,8 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 		{Prefix: hqPrefix + "-", Path: "."},
 		{Prefix: rig1Prefix + "-", Path: "rig1/mayor/rig"},
 		{Prefix: rig2Prefix + "-", Path: "rig2/mayor/rig"},
+		// Convoy beads use a literal "hq-cv-" prefix (see install.go).
+		{Prefix: "hq-cv-", Path: "."},
 	}
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
@@ -725,8 +740,11 @@ func TestSchedulerMultiRigEpicAutoResolve(t *testing.T) {
 	// Link children to epic via depends_on (epic → child).
 	// child1 is local to rig1 — resolves directly.
 	addBeadDependencyOfType(t, epicID, child1, "depends_on", rig1Path)
-	// child2 is in rig2 — resolved via routes.jsonl as an external ref.
-	addBeadDependencyOfType(t, epicID, child2, "depends_on", rig1Path)
+	// child2 is in rig2 — use external ref format so bd doesn't try to resolve
+	// the target in the local store. bd v1.0.0+ validates targets exist locally.
+	child2Prefix := strings.TrimSuffix(beads.ExtractPrefix(child2), "-")
+	child2ExtRef := fmt.Sprintf("external:%s:%s", child2Prefix, child2)
+	addBeadDependencyOfType(t, epicID, child2ExtRef, "depends_on", rig1Path)
 
 	// Dry-run: verify auto-rig-resolution routes each child correctly.
 	// Uses --dry-run to avoid needing formula infrastructure (mol-polecat-work).
@@ -830,7 +848,9 @@ func TestSchedulerEpicDetection(t *testing.T) {
 	child1 := createTestBead(t, rig1Path, "Rig1 child")
 	child2 := createTestBead(t, rig2Path, "Rig2 child")
 	addBeadDependencyOfType(t, epicID, child1, "depends_on", rig1Path)
-	addBeadDependencyOfType(t, epicID, child2, "depends_on", rig1Path)
+	child2Prefix := strings.TrimSuffix(beads.ExtractPrefix(child2), "-")
+	child2ExtRef := fmt.Sprintf("external:%s:%s", child2Prefix, child2)
+	addBeadDependencyOfType(t, epicID, child2ExtRef, "depends_on", rig1Path)
 
 	// gt sling <epic-id> deferred dispatch (max_polecats > 0) --dry-run should auto-detect epic and list children.
 	out := runGTCmdOutput(t, gtBinary, hqPath, env, "sling", epicID, "--dry-run")
@@ -881,8 +901,12 @@ func TestSchedulerMultiRigConvoyAutoResolve(t *testing.T) {
 
 	// Add tracks deps from convoy (HQ) to beads in each rig.
 	// bead1 and bead2 are in different DBs — stored as external refs in HQ.
-	addBeadDependencyOfType(t, convoyID, bead1, "tracks", hqPath)
-	addBeadDependencyOfType(t, convoyID, bead2, "tracks", hqPath)
+	bead1Prefix := strings.TrimSuffix(beads.ExtractPrefix(bead1), "-")
+	bead1ExtRef := fmt.Sprintf("external:%s:%s", bead1Prefix, bead1)
+	addBeadDependencyOfType(t, convoyID, bead1ExtRef, "tracks", hqPath)
+	bead2Prefix := strings.TrimSuffix(beads.ExtractPrefix(bead2), "-")
+	bead2ExtRef := fmt.Sprintf("external:%s:%s", bead2Prefix, bead2)
+	addBeadDependencyOfType(t, convoyID, bead2ExtRef, "tracks", hqPath)
 
 	// Wait for bd's issues.jsonl timestamp to settle (same race as
 	// TestSchedulerDirectConvoyDispatch — 1-second granularity stale check).
@@ -1045,6 +1069,53 @@ func TestSchedulerDeferredNonRigRejection(t *testing.T) {
 	}
 }
 
+// TestSchedulerDeferredAcceptsDogTarget verifies that in deferred mode
+// (max_polecats > 0), dog pool targets (deacon/dogs, dog:) fall through to
+// direct dispatch instead of being rejected as "not a known rig".
+//
+// Regression test for bead aa-4yf2: dispatchFeedDog was broken because the
+// deferred sling path validated that the target was a rig, rejecting the
+// pool target "deacon/dogs". That caused every stranded-convoy feed attempt
+// to fail with "failed to dispatch feed dog: exit status 1" whenever a
+// scheduler was active (i.e., in normal operation on hq).
+//
+// Dogs are a self-managed Deacon-owned pool, not rig polecat slots, and
+// therefore don't participate in the capacity scheduler. They must dispatch
+// directly regardless of scheduler mode.
+func TestSchedulerDeferredAcceptsDogTarget(t *testing.T) {
+	hqPath, rigPath, gtBinary, env := setupSchedulerIntegrationTown(t)
+
+	beadID := createTestBead(t, rigPath, "Dog target accept test")
+
+	// Targets that must NOT be rejected with "deferred dispatch requires a rig target".
+	dogTargets := []string{
+		"deacon/dogs",
+		"deacon/dogs/alpha",
+		"dog:",
+		"dog:alpha",
+	}
+
+	for _, target := range dogTargets {
+		t.Run(target, func(t *testing.T) {
+			// --dry-run so we don't actually spawn a dog; we only care that the
+			// command makes it past the deferred-mode gate.
+			out, _ := runGTCmdMayFail(t, gtBinary, hqPath, env,
+				"sling", beadID, target, "--hook-raw-bead", "--dry-run")
+
+			// The regression we're guarding against: this exact error would
+			// appear if dog targets were rejected by the deferred-rig gate.
+			if strings.Contains(out, "deferred dispatch requires a rig target") {
+				t.Fatalf("dog target %q incorrectly rejected by deferred-rig gate (aa-4yf2 regression):\n%s",
+					target, out)
+			}
+			if strings.Contains(out, "is not a known rig") {
+				t.Fatalf("dog target %q incorrectly rejected with 'is not a known rig' (aa-4yf2 regression):\n%s",
+					target, out)
+			}
+		})
+	}
+}
+
 // TestSchedulerDirectEpicDispatch verifies that gt sling <epic-id> --dry-run
 // with max_polecats=-1 (direct mode) routes to the direct dispatch path.
 func TestSchedulerDirectEpicDispatch(t *testing.T) {
@@ -1058,7 +1129,9 @@ func TestSchedulerDirectEpicDispatch(t *testing.T) {
 	child1 := createTestBead(t, rig1Path, "Rig1 direct child")
 	child2 := createTestBead(t, rig2Path, "Rig2 direct child")
 	addBeadDependencyOfType(t, epicID, child1, "depends_on", rig1Path)
-	addBeadDependencyOfType(t, epicID, child2, "depends_on", rig1Path)
+	child2Prefix := strings.TrimSuffix(beads.ExtractPrefix(child2), "-")
+	child2ExtRef := fmt.Sprintf("external:%s:%s", child2Prefix, child2)
+	addBeadDependencyOfType(t, epicID, child2ExtRef, "depends_on", rig1Path)
 
 	// gt sling <epic-id> --dry-run in direct mode should show direct dispatch, not scheduling
 	out := runGTCmdOutput(t, gtBinary, hqPath, env, "sling", epicID, "--dry-run")
@@ -1146,8 +1219,12 @@ func TestSchedulerDirectConvoyDispatch(t *testing.T) {
 	convoyID := createTestBeadOfType(t, hqPath, "Direct dispatch convoy", "convoy")
 	bead1 := createTestBead(t, rig1Path, "Rig1 direct tracked")
 	bead2 := createTestBead(t, rig2Path, "Rig2 direct tracked")
-	addBeadDependencyOfType(t, convoyID, bead1, "tracks", hqPath)
-	addBeadDependencyOfType(t, convoyID, bead2, "tracks", hqPath)
+	bead1Prefix := strings.TrimSuffix(beads.ExtractPrefix(bead1), "-")
+	bead1ExtRef := fmt.Sprintf("external:%s:%s", bead1Prefix, bead1)
+	addBeadDependencyOfType(t, convoyID, bead1ExtRef, "tracks", hqPath)
+	bead2Prefix := strings.TrimSuffix(beads.ExtractPrefix(bead2), "-")
+	bead2ExtRef := fmt.Sprintf("external:%s:%s", bead2Prefix, bead2)
+	addBeadDependencyOfType(t, convoyID, bead2ExtRef, "tracks", hqPath)
 
 	// Wait for bd's issues.jsonl timestamp to settle. bd checks that the Dolt
 	// import timestamp >= jsonl mtime (1-second granularity). Without this,
@@ -1168,5 +1245,92 @@ func TestSchedulerDirectConvoyDispatch(t *testing.T) {
 	// Direct dispatch uses "Would sling" not "Would schedule"
 	if strings.Contains(out, "Would schedule") {
 		t.Errorf("direct mode should NOT show 'Would schedule'\noutput: %s", out)
+	}
+}
+
+// TestScheduleBead_RefusesClosed verifies that scheduleBead (deferred dispatch
+// path) refuses to schedule a closed bead. Mirrors the closed-bead guards in
+// runSling and executeSling. Regression test for hq-ki2: the daemon's stranded
+// scan was creating ghost convoys for already-closed cross-prefix beads via
+// scheduleBead → CreateSlingContext, because scheduleBead was the only sling
+// entry point missing the closed-bead guard.
+func TestScheduleBead_RefusesClosed(t *testing.T) {
+	hqPath, rigPath, gtBinary, env := setupSchedulerIntegrationTown(t)
+
+	beadID := createTestBead(t, rigPath, "Closed bead refused by scheduleBead")
+
+	// Close the bead before attempting to schedule.
+	closeCmd := exec.Command("bd", "close", beadID)
+	closeCmd.Dir = rigPath
+	if out, err := closeCmd.CombinedOutput(); err != nil {
+		t.Fatalf("bd close %s failed: %v\n%s", beadID, err, out)
+	}
+
+	// Attempt to sling (deferred mode → scheduleBead) — should fail with
+	// "work already completed".
+	out, err := runGTCmdMayFail(t, gtBinary, hqPath, env,
+		"sling", beadID, "testrig", "--hook-raw-bead")
+	if err == nil {
+		t.Fatalf("expected gt sling to fail for closed bead, got success\noutput: %s", out)
+	}
+	if !strings.Contains(out, "closed") || !strings.Contains(out, "work already completed") {
+		t.Errorf("expected error to mention closed/work already completed, got: %s", out)
+	}
+
+	// Verify no sling context was created for the closed bead.
+	if hasSlingContext(t, hqPath, beadID) {
+		t.Errorf("scheduleBead should not have created a sling context for closed bead %s", beadID)
+	}
+}
+
+// TestScheduleBead_RefusesTombstone verifies that scheduleBead refuses to
+// schedule a tombstoned bead. Companion to TestScheduleBead_RefusesClosed.
+func TestScheduleBead_RefusesTombstone(t *testing.T) {
+	hqPath, rigPath, gtBinary, env := setupSchedulerIntegrationTown(t)
+
+	beadID := createTestBead(t, rigPath, "Tombstone bead refused by scheduleBead")
+
+	// Tombstone the bead. bd uses `bd close --tombstone` for terminal removal.
+	closeCmd := exec.Command("bd", "close", beadID, "--tombstone")
+	closeCmd.Dir = rigPath
+	if out, err := closeCmd.CombinedOutput(); err != nil {
+		t.Fatalf("bd close --tombstone %s failed: %v\n%s", beadID, err, out)
+	}
+
+	out, err := runGTCmdMayFail(t, gtBinary, hqPath, env,
+		"sling", beadID, "testrig", "--hook-raw-bead")
+	if err == nil {
+		t.Fatalf("expected gt sling to fail for tombstone bead, got success\noutput: %s", out)
+	}
+	if !strings.Contains(out, "tombstone") || !strings.Contains(out, "work already completed") {
+		t.Errorf("expected error to mention tombstone/work already completed, got: %s", out)
+	}
+
+	if hasSlingContext(t, hqPath, beadID) {
+		t.Errorf("scheduleBead should not have created a sling context for tombstone bead %s", beadID)
+	}
+}
+
+// TestScheduleBead_ClosedForceDoesNotBypass verifies that --force does NOT
+// bypass the closed-bead guard in scheduleBead. To re-dispatch a closed bead,
+// the bead must be reopened first (matching runSling/executeSling semantics).
+func TestScheduleBead_ClosedForceDoesNotBypass(t *testing.T) {
+	hqPath, rigPath, gtBinary, env := setupSchedulerIntegrationTown(t)
+
+	beadID := createTestBead(t, rigPath, "Closed bead --force does not bypass")
+
+	closeCmd := exec.Command("bd", "close", beadID)
+	closeCmd.Dir = rigPath
+	if out, err := closeCmd.CombinedOutput(); err != nil {
+		t.Fatalf("bd close %s failed: %v\n%s", beadID, err, out)
+	}
+
+	out, err := runGTCmdMayFail(t, gtBinary, hqPath, env,
+		"sling", beadID, "testrig", "--hook-raw-bead", "--force")
+	if err == nil {
+		t.Fatalf("expected gt sling --force to still fail for closed bead, got success\noutput: %s", out)
+	}
+	if !strings.Contains(out, "closed") || !strings.Contains(out, "work already completed") {
+		t.Errorf("--force should not bypass closed guard; got: %s", out)
 	}
 }

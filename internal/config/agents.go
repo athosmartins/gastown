@@ -5,9 +5,15 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
+
+type rawAgentRegistry struct {
+	Version int                        `json:"version"`
+	Agents  map[string]json.RawMessage `json:"agents"`
+}
 
 // AgentPreset identifies a supported LLM agent runtime.
 // These presets provide sensible defaults that can be overridden in config.
@@ -36,6 +42,14 @@ const (
 	// AgentOmp is Oh My Pi (OMP) — Pi fork with hook-based lifecycle.
 	// Inspired by github.com/ProbabilityEngineer/pi-mono gastown integration.
 	AgentOmp AgentPreset = "omp"
+	// AgentMistral is Mistral Vibe CLI.
+	AgentMistral AgentPreset = "vibe"
+	// AgentGroqCompound routes the Claude CLI to Groq's compound-beta model via
+	// Groq's OpenAI-compatible API endpoint. The claude binary acts as the SDK
+	// proxy; ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY are overridden at runtime
+	// to redirect traffic to api.groq.com. GROQ_API_KEY must be set in the shell
+	// environment — it is read dynamically and never stored in config files.
+	AgentGroqCompound AgentPreset = "groq-compound"
 )
 
 // AgentPresetInfo contains the configuration details for an agent preset.
@@ -59,7 +73,7 @@ type AgentPresetInfo struct {
 
 	// ProcessNames are the process names to look for when detecting if the agent is running.
 	// Used by tmux.IsAgentRunning to check pane_current_command.
-	// E.g., ["node"] for Claude, ["cursor-agent"] for Cursor.
+	// E.g., ["node"] for Claude, ["cursor-agent", "agent"] for Cursor (install script symlinks both names).
 	ProcessNames []string `json:"process_names,omitempty"`
 
 	// SessionIDEnv is the environment variable for session ID.
@@ -283,15 +297,18 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		InstructionsFile:  "AGENTS.md",
 	},
 	AgentCursor: {
-		Name:                AgentCursor,
-		Command:             "cursor-agent",
-		Args:                []string{"-f"}, // Force mode (YOLO equivalent), -p requires prompt
-		ProcessNames:        []string{"cursor-agent"},
+		Name:    AgentCursor,
+		Command: "cursor-agent",
+		// -f/--force: auto-approve tool use (see cursor-agent --help). Install script also symlinks "agent" -> same binary.
+		Args: []string{"-f"},
+		// cursor-agent + agent (install symlinks). Pane matching for "agent" requires session env (GT_AGENT=cursor or GT_PROCESS_NAMES includes cursor-agent); see internal/tmux processNamesForSession.
+		ProcessNames:        []string{"cursor-agent", "agent"},
 		SessionIDEnv:        "", // Uses --resume with chatId directly
 		ResumeFlag:          "--resume",
 		ResumeStyle:         "flag",
 		SupportsHooks:       true,
 		SupportsForkSession: false,
+		// Non-interactive/headless: -p/--print + --output-format json (matches cursor-agent --help).
 		NonInteractive: &NonInteractiveConfig{
 			PromptFlag: "-p",
 			OutputFlag: "--output-format json",
@@ -301,8 +318,10 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		ConfigDir:         ".cursor",
 		HooksProvider:     "cursor",
 		HooksDir:          ".cursor",
-		HooksSettingsFile: "hooks.json",
+		HooksSettingsFile: "hooks.json", // installed path: .cursor/hooks.json
 		InstructionsFile:  "AGENTS.md",
+		// No stable ReadyPromptPrefix yet; delay before nudge poller / early input (HasTurnBoundaryDrain is false — see Copilot).
+		ReadyDelayMs: 5000,
 	},
 	AgentAuggie: {
 		Name:                AgentAuggie,
@@ -427,6 +446,75 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 			PromptFlag: "--prompt",
 		},
 	},
+	AgentMistral: {
+		Name:                AgentMistral,
+		Command:             "vibe",
+		Args:                []string{"--agent", "auto-approve"},
+		ProcessNames:        []string{"vibe"},
+		SessionIDEnv:        "VIBE_SESSION_ID",
+		ResumeFlag:          "--resume",
+		ContinueFlag:        "--continue",
+		ResumeStyle:         "flag",
+		SupportsHooks:       true,
+		SupportsForkSession: false,
+		NonInteractive: &NonInteractiveConfig{
+			PromptFlag: "-p",
+			OutputFlag: "json",
+		},
+		PromptMode:        "arg",
+		ConfigDir:         ".vibe",
+		HooksProvider:     "vibe",
+		HooksDir:          ".vibe",
+		HooksSettingsFile: "config.toml",
+		ReadyPromptPrefix: "❯ ",
+		ReadyDelayMs:      5000,
+		InstructionsFile:  "AGENTS.md",
+	},
+	// AgentGroqCompound uses the Claude CLI as an SDK proxy but routes all
+	// requests to Groq's OpenAI-compatible endpoint by overriding the two
+	// Anthropic SDK environment variables that control the backend:
+	//
+	//   ANTHROPIC_BASE_URL  → https://api.groq.com/openai/v1
+	//   ANTHROPIC_API_KEY   → $GROQ_API_KEY  (read from the shell env at spawn time)
+	//
+	// The model flag --model groq/compound-beta selects Groq's compound
+	// reasoning model. Because the transport is the Claude binary, all Gas
+	// Town hooks, session tracking, tmux readiness detection, and Claude-SDK
+	// lifecycle events work identically to the standard claude preset.
+	//
+	// Prerequisites:
+	//   export GROQ_API_KEY=gsk_...
+	//
+	// The key is resolved at agent spawn time — never stored in config files.
+	AgentGroqCompound: {
+		Name:    AgentGroqCompound,
+		Command: "claude",
+		Args: []string{
+			"--dangerously-skip-permissions",
+		},
+		Env: map[string]string{
+			"ANTHROPIC_BASE_URL": "https://api.groq.com/openai/v1",
+			"ANTHROPIC_MODEL":    "compound-beta",
+			"ANTHROPIC_API_KEY":  "$GROQ_API_KEY",
+		},
+		ProcessNames:         []string{"node", "claude"},
+		SessionIDEnv:         "CLAUDE_SESSION_ID",
+		ResumeFlag:           "--resume",
+		ContinueFlag:         "--continue",
+		ResumeStyle:          "flag",
+		SupportsHooks:        true,
+		PromptMode:           "arg",
+		ConfigDirEnv:         "CLAUDE_CONFIG_DIR",
+		ConfigDir:            ".claude",
+		HooksProvider:        "claude",
+		HooksDir:             ".claude",
+		HooksSettingsFile:    "settings.json",
+		HooksUseSettingsDir:  true,
+		ReadyPromptPrefix:    "❯ ",
+		ReadyDelayMs:         10000,
+		InstructionsFile:     "CLAUDE.md",
+		HasTurnBoundaryDrain: true,
+	},
 }
 
 // Registry state with proper synchronization.
@@ -477,18 +565,56 @@ func loadAgentRegistryFromPathLocked(path string) error {
 		return err
 	}
 
-	var userRegistry AgentRegistry
+	var userRegistry rawAgentRegistry
 	if err := json.Unmarshal(data, &userRegistry); err != nil {
 		return err
 	}
 
-	for name, preset := range userRegistry.Agents {
-		preset.Name = AgentPreset(name)
-		globalRegistry.Agents[name] = preset
+	for name, rawPreset := range userRegistry.Agents {
+		merged := cloneAgentPresetInfo(globalRegistry.Agents[name])
+		if merged == nil {
+			merged = &AgentPresetInfo{}
+		}
+		if err := json.Unmarshal(rawPreset, merged); err != nil {
+			return err
+		}
+		merged.Name = AgentPreset(name)
+		globalRegistry.Agents[name] = merged
 	}
 
 	loadedPaths[path] = true
 	return nil
+}
+
+func cloneAgentPresetInfo(src *AgentPresetInfo) *AgentPresetInfo {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	if src.Args != nil {
+		clone.Args = append([]string(nil), src.Args...)
+	}
+	if src.Env != nil {
+		clone.Env = make(map[string]string, len(src.Env))
+		for k, v := range src.Env {
+			clone.Env[k] = v
+		}
+	}
+	if src.ProcessNames != nil {
+		clone.ProcessNames = append([]string(nil), src.ProcessNames...)
+	}
+	if src.NonInteractive != nil {
+		nonInteractive := *src.NonInteractive
+		clone.NonInteractive = &nonInteractive
+	}
+	if src.ACP != nil {
+		acp := *src.ACP
+		if src.ACP.Args != nil {
+			acp.Args = append([]string(nil), src.ACP.Args...)
+		}
+		clone.ACP = &acp
+	}
+	return &clone
 }
 
 // LoadAgentRegistry loads agent definitions from a JSON file and merges with built-ins.
@@ -556,6 +682,14 @@ func ListAgentPresets() []string {
 	return names
 }
 
+// BuiltInAgentPresetSummary returns a sorted, comma-separated list of built-in preset names
+// for CLI help text (gt config agent list, default-agent, --provider, etc.).
+func BuiltInAgentPresetSummary() string {
+	names := ListAgentPresets()
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
 // DefaultAgentPreset returns the default agent preset (Claude).
 func DefaultAgentPreset() AgentPreset {
 	return AgentClaude
@@ -566,6 +700,10 @@ func DefaultAgentPreset() AgentPreset {
 // can be accessed separately for extended functionality.
 func RuntimeConfigFromPreset(preset AgentPreset) *RuntimeConfig {
 	info := GetAgentPreset(preset)
+	return runtimeConfigFromAgentInfo(preset, info)
+}
+
+func runtimeConfigFromAgentInfo(preset AgentPreset, info *AgentPresetInfo) *RuntimeConfig {
 	if info == nil {
 		// Fall back to Claude defaults
 		return DefaultRuntimeConfig()
@@ -583,12 +721,10 @@ func RuntimeConfigFromPreset(preset AgentPreset) *RuntimeConfig {
 	rc := &RuntimeConfig{
 		Provider: string(info.Name),
 		Command:  info.Command,
-		Args:     append([]string(nil), info.Args...), // Copy to avoid mutation
+		Args:     append([]string(nil), info.Args...),
 		Env:      envCopy,
 	}
 
-	// Resolve command path for claude preset (handles alias installations)
-	// Uses resolveClaudePath() from types.go which finds ~/.claude/local/claude
 	if preset == AgentClaude && rc.Command == "claude" {
 		rc.Command = resolveClaudePath()
 	}
@@ -654,18 +790,125 @@ func GetProcessNames(agentName string) []string {
 	return info.ProcessNames
 }
 
+// wrapperCommands lists process wrappers that exec into another binary listed
+// in their arguments (e.g., `env -u VAR claude ...`). When the agent's Command
+// is one of these, ResolveProcessNames must look past the wrapper to find the
+// real agent binary in Args, otherwise liveness detection greps for a process
+// named after the wrapper that no longer exists post-exec.
+var wrapperCommands = map[string]bool{
+	"env":    true,
+	"nohup":  true,
+	"setsid": true,
+	"exec":   true,
+	"sudo":   true,
+	"doas":   true,
+	"stdbuf": true,
+	"time":   true,
+}
+
+// wrapperFlagsTakeValue returns the set of short flags that consume the
+// next argument as a value, for the given wrapper. Used by extractWrappedBinary
+// to skip "-flag value" pairs when scanning args for the real binary.
+func wrapperFlagsTakeValue(wrapper string) map[string]bool {
+	switch wrapper {
+	case "env":
+		// env: -u VAR (unset), -C DIR (chdir), -S STRING (split-string)
+		return map[string]bool{"-u": true, "-C": true, "-S": true}
+	case "sudo":
+		// sudo: most options take a value; list the common ones
+		return map[string]bool{
+			"-u": true, "-g": true, "-h": true, "-p": true,
+			"-U": true, "-A": true, "-c": true, "-r": true,
+			"-t": true, "-T": true, "-D": true, "-R": true,
+		}
+	case "stdbuf":
+		// stdbuf: -i, -o, -e all take a value (mode)
+		return map[string]bool{"-i": true, "-o": true, "-e": true}
+	}
+	return nil
+}
+
+// lookupProcessNamesByBinary returns the ProcessNames of the preset whose
+// Command (or its basename) matches realBin. Searches the runtime registry
+// first, then the canonical builtinPresets so shadowed builtins still resolve.
+// Caller must hold registryMu.
+func lookupProcessNamesByBinary(realBin string) []string {
+	for _, preset := range globalRegistry.Agents {
+		if len(preset.ProcessNames) == 0 {
+			continue
+		}
+		if preset.Command == realBin || filepath.Base(preset.Command) == realBin {
+			return preset.ProcessNames
+		}
+	}
+	for _, preset := range builtinPresets {
+		if len(preset.ProcessNames) == 0 {
+			continue
+		}
+		if preset.Command == realBin || filepath.Base(preset.Command) == realBin {
+			return preset.ProcessNames
+		}
+	}
+	return nil
+}
+
+// extractWrappedBinary scans wrapper args for the first non-flag token that
+// looks like a binary, and returns its basename. Returns "" if no real binary
+// is found (e.g., args malformed or wrapper unsupported).
+//
+// Walks args left-to-right: skips short flags (and their values for known
+// value-taking flags), long flags (--foo=bar or --foo), env-style VAR=value
+// assignments (env only), and treats `--` as an end-of-options separator.
+func extractWrappedBinary(wrapper string, args []string) string {
+	flagsTakeValue := wrapperFlagsTakeValue(wrapper)
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			if i+1 < len(args) {
+				return filepath.Base(args[i+1])
+			}
+			return ""
+		}
+		if strings.HasPrefix(a, "-") && a != "-" {
+			// Long option `--foo=bar` carries its own value
+			if strings.HasPrefix(a, "--") && strings.Contains(a, "=") {
+				continue
+			}
+			// Long option `--foo` and unknown short options: assume no value
+			if flagsTakeValue[a] && i+1 < len(args) {
+				i++ // skip the flag's value
+			}
+			continue
+		}
+		// env permits VAR=value assignments interspersed with flags
+		if wrapper == "env" && strings.Contains(a, "=") {
+			continue
+		}
+		return filepath.Base(a)
+	}
+	return ""
+}
+
 // ResolveProcessNames determines the correct process names for liveness detection
 // given an agent name and the actual command binary. This handles custom agents
 // that shadow built-in preset names (e.g., a custom "codex" agent that runs
-// "opencode" instead of the built-in "codex" binary).
+// "opencode" instead of the built-in "codex" binary), and custom agents wrapped
+// in process launchers like `env -u VAR <real-binary>`.
+//
+// args (variadic, optional) is the actual command-line argument slice for the
+// agent invocation. When command is a wrapper (env, sudo, nohup, ...), the
+// real binary is found in args, not on the registered preset's Args (which
+// may belong to the canonical built-in preset, not the user's wrapper).
 //
 // Resolution order:
 //  1. If agentName matches a built-in preset AND the preset's Command matches
 //     the actual command → use the preset's ProcessNames (no mismatch).
-//  2. Otherwise, find a built-in preset whose Command matches the actual command
+//  2. If command is a known wrapper, scan args (or the registered preset's Args
+//     as a fallback) for the real binary and resolve to its preset's ProcessNames.
+//  3. Otherwise, find a built-in preset whose Command matches the actual command
 //     and use its ProcessNames (custom agent using a known launcher).
-//  3. Fallback: [command] (fully custom binary).
-func ResolveProcessNames(agentName, command string) []string {
+//  4. Fallback: [command] (fully custom binary).
+func ResolveProcessNames(agentName, command string, args ...string) []string {
 	registryMu.Lock()
 	initRegistryLocked()
 	defer registryMu.Unlock()
@@ -683,13 +926,36 @@ func ResolveProcessNames(agentName, command string) []string {
 	// Check if agentName matches a built-in/registered preset with matching command.
 	// Compare against both the raw command and basename to handle registry entries
 	// that store absolute-path commands (e.g., "/opt/bin/my-tool").
-	if info, ok := globalRegistry.Agents[agentName]; ok && len(info.ProcessNames) > 0 {
-		if info.Command == command ||
-			info.Command == cmdBase ||
-			filepath.Base(info.Command) == cmdBase ||
-			(info.Command == unwrappedCmdBase && strings.HasPrefix(cmdBase, "gt-")) ||
-			cmdBase == "" {
+	info, infoOK := globalRegistry.Agents[agentName]
+	if infoOK {
+		if len(info.ProcessNames) > 0 &&
+			(info.Command == command ||
+				info.Command == cmdBase ||
+				filepath.Base(info.Command) == cmdBase ||
+				(info.Command == unwrappedCmdBase && strings.HasPrefix(cmdBase, "gt-")) ||
+				cmdBase == "") {
 			return info.ProcessNames
+		}
+	}
+
+	// Wrapper case: command is `env`/`sudo`/etc. — find the real binary in
+	// args (caller-supplied) or the registered preset's Args, and resolve to
+	// THAT binary's preset ProcessNames. Caller args take precedence because
+	// the registered preset may be the canonical built-in (not the wrapper).
+	if wrapperCommands[cmdBase] {
+		argSources := [][]string{args}
+		if infoOK && len(info.Args) > 0 {
+			argSources = append(argSources, info.Args)
+		}
+		for _, src := range argSources {
+			realBin := extractWrappedBinary(cmdBase, src)
+			if realBin == "" {
+				continue
+			}
+			if names := lookupProcessNamesByBinary(realBin); len(names) > 0 {
+				return names
+			}
+			return []string{realBin}
 		}
 	}
 
@@ -780,7 +1046,7 @@ func NewExampleAgentRegistry() *AgentRegistry {
 				ResumeFlag:   "--resume",
 				ResumeStyle:  "flag",
 				NonInteractive: &NonInteractiveConfig{
-					PromptFlag: "-m",
+					PromptFlag: "-p",
 					OutputFlag: "--json",
 				},
 			},
