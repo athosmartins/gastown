@@ -55,9 +55,17 @@ func saveNudgeState(path string, state nudgeState) {
 	_ = os.WriteFile(path, data, 0600)
 }
 
+func init() {
+	mailPollCmd.Flags().BoolVarP(&mailPollDryRun, "dry-run", "n", false, "List candidates without sending nudges")
+	mailPollCmd.Flags().StringVar(&mailPollRig, "rig", "", "Limit scan to this rig (default: all rigs)")
+	mailPollCmd.Flags().DurationVar(&mailPollQuietPeriod, "quiet-period", 10*time.Minute, "Minimum time between nudges for the same identity")
+	mailPollCmd.Flags().StringVar(&mailPollStateFile, "state-file", "/tmp/gt-mail-poller-last-nudge.json", "Path to last-nudge state file")
+}
+
 var mailPollCmd = &cobra.Command{
-	Use:   "poll-and-nudge",
-	Short: "Nudge crew with unread mail (for launchd/cron)",
+	Use:         "poll-and-nudge",
+	Annotations: map[string]string{AnnotationPolecatSafe: "true"},
+	Short:       "Nudge crew with unread mail (for launchd/cron)",
 	Long: `Poll all active agent inboxes and nudge those with unread mail.
 
 For each active crew or polecat session with unread messages, sends a
