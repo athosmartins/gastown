@@ -86,13 +86,7 @@ func runBdCommand(ctx context.Context, args []string, workDir, beadsDir string, 
 	// 5s longer in the happy path (cmd.Run returns immediately on success).
 	cmd.WaitDelay = 5 * time.Second
 
-	env := append(cmd.Environ(), "BEADS_DIR="+beadsDir)
-	if dbEnv := beads.DatabaseEnv(beadsDir); dbEnv != "" {
-		env = append(env, dbEnv)
-	}
-	env = append(env, extraEnv...)
-	env = append(env, telemetry.OTELEnvForSubprocess()...)
-	cmd.Env = env
+	cmd.Env = bdSubprocessEnv(cmd.Environ(), beadsDir, extraEnv)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -115,7 +109,7 @@ func runBdCommand(ctx context.Context, args []string, workDir, beadsDir string, 
 		retryCmd.Dir = workDir
 		util.SetProcessGroup(retryCmd)
 		retryCmd.WaitDelay = 5 * time.Second
-		retryCmd.Env = env
+		retryCmd.Env = cmd.Env
 		retryCmd.Stdout = &stdout
 		retryCmd.Stderr = &stderr
 		runErr = retryCmd.Run()
@@ -137,6 +131,34 @@ func firstArg(args []string) string {
 		return args[0]
 	}
 	return ""
+}
+
+// bdSubprocessEnv builds the environment for a bd subprocess spawned by the
+// mail package. It is split out so the env construction is testable without
+// having to exec a real bd.
+//
+// The env always includes:
+//   - everything from baseEnv (typically cmd.Environ())
+//   - BEADS_DIR pointing at the resolved mailbox dir
+//   - the dolt server selector returned by beads.DatabaseEnv(beadsDir)
+//   - BEADS_NO_AUTO_IMPORT=1 (companion to dc-4dix + dc-6cuw): suppress bd
+//     1.0.3+'s JSONL auto-import fallback. The mail subprocess always
+//     targets an initialized database, so the fallback is dead weight that
+//     re-reads multi-MB issues.jsonl on every call, racks up timeouts, and
+//     prints a noisy banner crew sees on every `gt mail send`. Standalone
+//     bd invocations are unaffected — only mail subprocesses get this.
+//   - any caller-supplied extraEnv
+//   - telemetry.OTELEnvForSubprocess()
+func bdSubprocessEnv(baseEnv []string, beadsDir string, extraEnv []string) []string {
+	env := append([]string(nil), baseEnv...)
+	env = append(env, "BEADS_DIR="+beadsDir)
+	if dbEnv := beads.DatabaseEnv(beadsDir); dbEnv != "" {
+		env = append(env, dbEnv)
+	}
+	env = append(env, "BEADS_NO_AUTO_IMPORT=1")
+	env = append(env, extraEnv...)
+	env = append(env, telemetry.OTELEnvForSubprocess()...)
+	return env
 }
 
 // bdReadCtx returns a context with the standard bd read timeout.
