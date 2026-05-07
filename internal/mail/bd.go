@@ -71,7 +71,20 @@ func runBdCommand(ctx context.Context, args []string, workDir, beadsDir string, 
 
 	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = workDir
-	util.SetDetachedProcessGroup(cmd)
+	// SetProcessGroup (not SetDetachedProcessGroup) installs the Cancel hook
+	// that signals the entire process group on context cancellation. Without
+	// this, a timed-out bd subprocess gets SIGKILL'd while its child Dolt
+	// server lives on, holding port 3307 and the working DB. The next bd
+	// invocation then hangs against the orphan Dolt — which is what produced
+	// the cascade of unkillable poll-and-nudge zombies in dc-5gah. (mail
+	// subprocesses are mail's responsibility to clean up; the fire-and-forget
+	// callers using SetDetachedProcessGroup are a different contract.)
+	util.SetProcessGroup(cmd)
+	// WaitDelay bounds how long Run() lingers after Cancel returns, so a
+	// child that ignores SIGKILL on the process group can't keep us blocked
+	// indefinitely. 5s is enough for normal teardown without making timeouts
+	// 5s longer in the happy path (cmd.Run returns immediately on success).
+	cmd.WaitDelay = 5 * time.Second
 
 	env := append(cmd.Environ(), "BEADS_DIR="+beadsDir)
 	if dbEnv := beads.DatabaseEnv(beadsDir); dbEnv != "" {
@@ -100,7 +113,8 @@ func runBdCommand(ctx context.Context, args []string, workDir, beadsDir string, 
 		stderr.Reset()
 		retryCmd := exec.CommandContext(ctx, "bd", retryArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 		retryCmd.Dir = workDir
-		util.SetDetachedProcessGroup(retryCmd)
+		util.SetProcessGroup(retryCmd)
+		retryCmd.WaitDelay = 5 * time.Second
 		retryCmd.Env = env
 		retryCmd.Stdout = &stdout
 		retryCmd.Stderr = &stderr
