@@ -486,6 +486,118 @@ func TestCheckConflicts_WithConflict(t *testing.T) {
 	}
 }
 
+// TestRebase_PreservesCherryPickEquivalentCommits verifies that Rebase passes
+// --reapply-cherry-picks (on Git ≥2.34) so commits whose patch-id matches an
+// upstream commit are NOT silently dropped. Without the flag, git rebase ≥2.34
+// treats clean cherry-picks as already-applied and removes them as a
+// preliminary step, which silently erases content during `gt done` auto-rebase
+// when parallel work produces content-equivalent commits.
+//
+// Scenario: feature branch has commit A (introduces "fix" content). Main has
+// independently grown commit A' with the same patch content (e.g. a parallel
+// fix from another branch already merged). The `gt done` auto-rebase must
+// preserve A — losing it means the polecat's authored changes are gone even
+// though the file content happens to match upstream.
+func TestRebase_PreservesCherryPickEquivalentCommits(t *testing.T) {
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+	mainBranch, _ := g.CurrentBranch()
+
+	writeFile := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	// On main: commit A with content "fix\n" in a.txt.
+	writeFile("a.txt", "fix\n")
+	if err := g.Add("a.txt"); err != nil {
+		t.Fatalf("Add a.txt: %v", err)
+	}
+	if err := g.Commit("A: original fix"); err != nil {
+		t.Fatalf("Commit A: %v", err)
+	}
+
+	// Branch off into feature and add commit B that depends on A's tree.
+	if err := g.CreateBranch("feature"); err != nil {
+		t.Fatalf("CreateBranch feature: %v", err)
+	}
+	if err := g.Checkout("feature"); err != nil {
+		t.Fatalf("Checkout feature: %v", err)
+	}
+	writeFile("a.txt", "fix\nfix2\n")
+	if err := g.Add("a.txt"); err != nil {
+		t.Fatalf("Add a.txt (feature): %v", err)
+	}
+	if err := g.Commit("B: depends on A"); err != nil {
+		t.Fatalf("Commit B: %v", err)
+	}
+
+	// Rewrite main so A is replaced by A' — same patch content, different SHA —
+	// and add an unrelated commit so the rebase has to actually move feature.
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+	resetCmd := exec.Command("git", "reset", "--hard", "HEAD~1")
+	resetCmd.Dir = dir
+	if out, err := resetCmd.CombinedOutput(); err != nil {
+		t.Fatalf("reset --hard: %v\n%s", err, out)
+	}
+	writeFile("a.txt", "fix\n")
+	if err := g.Add("a.txt"); err != nil {
+		t.Fatalf("Add a.txt (A'): %v", err)
+	}
+	if err := g.Commit("A-prime: same content, different SHA"); err != nil {
+		t.Fatalf("Commit A': %v", err)
+	}
+	writeFile("b.txt", "extra\n")
+	if err := g.Add("b.txt"); err != nil {
+		t.Fatalf("Add b.txt: %v", err)
+	}
+	if err := g.Commit("main moved on"); err != nil {
+		t.Fatalf("Commit main-moved: %v", err)
+	}
+
+	// Rebase feature onto main. With --reapply-cherry-picks we expect both
+	// A and B to land on top of main; without it, A is dropped silently.
+	if err := g.Checkout("feature"); err != nil {
+		t.Fatalf("Checkout feature (post-main-rewrite): %v", err)
+	}
+	if err := g.Rebase(mainBranch); err != nil {
+		t.Fatalf("Rebase: %v", err)
+	}
+
+	// Count commits feature has on top of main. Without the flag this is 1
+	// (only B); with the flag it must be 2 (A reapplied, then B).
+	logCmd := exec.Command("git", "log", "--oneline", mainBranch+"..HEAD")
+	logCmd.Dir = dir
+	out, err := logCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git log: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 2 {
+		t.Errorf("expected 2 commits on top of main after rebase, got %d:\n%s",
+			len(lines), out)
+	}
+
+	// Sanity check: the original commit subjects must both be present.
+	wantSubjects := []string{"A: original fix", "B: depends on A"}
+	for _, want := range wantSubjects {
+		found := false
+		for _, line := range lines {
+			if strings.Contains(line, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("commit %q missing after rebase; got:\n%s", want, out)
+		}
+	}
+}
+
 // TestCloneBareHasOriginRefs verifies that after CloneBare, origin/* refs
 // are available for worktree creation. This was broken before the fix:
 // bare clones had refspec configured but no fetch was run, so origin/main

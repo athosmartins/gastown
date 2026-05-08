@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/util"
@@ -1256,8 +1257,49 @@ func (g *Git) ListPushRemoteRefsWithHashes(remote, prefix string) ([]RemoteRef, 
 	return g.ListRemoteRefsWithHashes(pushURL, prefix)
 }
 
+// rebaseSupportsNoSilentDrop is true when the local git binary supports
+// --reapply-cherry-picks (introduced in Git 2.34). Probed once at first use.
+var (
+	rebaseCapOnce       sync.Once
+	rebaseCapNoSilentDrop bool
+)
+
+func probeRebaseCapability() bool {
+	out, err := exec.Command("git", "rebase", "--help").CombinedOutput()
+	if err != nil {
+		// If --help fails, assume old git and fall back to safe default.
+		return false
+	}
+	return strings.Contains(string(out), "--reapply-cherry-picks")
+}
+
 // Rebase rebases the current branch onto the given ref.
+//
+// On Git ≥2.34, two flags prevent silent commit loss in the `gt done`
+// auto-rebase path:
+//
+//   --reapply-cherry-picks  Skip the cherry-pick dedup pass that silently
+//                           drops commits whose patch-id already exists upstream.
+//   --empty=keep            Preserve commits that become empty after rebase
+//                           (i.e. the patch was genuinely identical) so they
+//                           surface as visible empty commits, not silent loss.
+//
+// On older Git, these flags are unavailable and the function falls back to a
+// plain rebase. The README documents Git 2.25+ as the minimum.
+//
+// Without these flags on ≥2.34, when a `gt done` rebase encounters a commit
+// whose content already exists on the target (a parallel fix, a backport),
+// git silently removes it. Downstream commits then conflict against the target,
+// and the natural conflict resolution ("take HEAD") erases the author's changes
+// with no warning.
 func (g *Git) Rebase(onto string) error {
+	rebaseCapOnce.Do(func() {
+		rebaseCapNoSilentDrop = probeRebaseCapability()
+	})
+	if rebaseCapNoSilentDrop {
+		_, err := g.run("rebase", "--empty=keep", "--reapply-cherry-picks", onto)
+		return err
+	}
 	_, err := g.run("rebase", onto)
 	return err
 }
