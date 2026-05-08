@@ -372,6 +372,35 @@ func TestConvoyFieldsParseFormatRoundTrip(t *testing.T) {
 	}
 }
 
+func TestConvoyFieldsNotificationSentAtRoundTrip(t *testing.T) {
+	original := &ConvoyFields{
+		Owner:              "mayor/",
+		NotificationSentAt: "2026-05-08T03:42:17Z",
+	}
+	formatted := FormatConvoyFields(original)
+	if !strings.Contains(formatted, "notification_sent_at: 2026-05-08T03:42:17Z") {
+		t.Errorf("formatted output missing notification_sent_at line:\n%s", formatted)
+	}
+	parsed := ParseConvoyFields(&Issue{Description: formatted})
+	if parsed == nil {
+		t.Fatal("round-trip parse returned nil")
+	}
+	if parsed.NotificationSentAt != original.NotificationSentAt {
+		t.Errorf("NotificationSentAt: got %q, want %q", parsed.NotificationSentAt, original.NotificationSentAt)
+	}
+
+	// SetConvoyFields should replace an existing notification_sent_at line.
+	issue := &Issue{Description: "Owner: mayor/\nnotification_sent_at: 2026-05-01T00:00:00Z\n"}
+	updated := &ConvoyFields{Owner: "mayor/", NotificationSentAt: "2026-05-08T12:00:00Z"}
+	got := SetConvoyFields(issue, updated)
+	if strings.Contains(got, "2026-05-01T00:00:00Z") {
+		t.Errorf("old notification_sent_at not replaced:\n%s", got)
+	}
+	if !strings.Contains(got, "notification_sent_at: 2026-05-08T12:00:00Z") {
+		t.Errorf("new notification_sent_at missing:\n%s", got)
+	}
+}
+
 func TestSetConvoyFieldsWithMixedContent(t *testing.T) {
 	issue := &Issue{Description: "Convoy tracking 3 issues\nOwner: old/\nSome prose line\nMerge: local\nAnother line"}
 	fields := &ConvoyFields{Owner: "new/", Merge: "direct", Molecule: "gt-mol-xyz"}
