@@ -1741,6 +1741,13 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 	// ZFC: Use typed accessor instead of parsing description text
 	fields := beads.ParseConvoyFields(&beads.Issue{Description: convoys[0].Description})
 
+	// Persistent dedup: if completion notifications already fired, skip. The
+	// refinery patrol's auto-close runs on each cycle and would otherwise
+	// re-fire the same notification stack every iteration (dc-4zss).
+	if fields != nil && fields.NotificationSentAt != "" {
+		return
+	}
+
 	// Compute duration since convoy was created.
 	var durationStr string
 	if t, err := time.Parse(time.RFC3339, convoys[0].CreatedAt); err == nil {
@@ -1799,6 +1806,20 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 		if err := mailCmd.Run(); err != nil {
 			style.PrintWarning("could not notify mayor/ of convoy completion: %v", err)
 		}
+	}
+
+	// Persist dedup flag: stamp NotificationSentAt on the convoy bead so a
+	// subsequent patrol cycle short-circuits at the early-return above.
+	// Best-effort — failures here just mean the next cycle may re-fire, which
+	// is the previous (buggy) behavior.
+	updatedFields := fields
+	if updatedFields == nil {
+		updatedFields = &beads.ConvoyFields{}
+	}
+	updatedFields.NotificationSentAt = time.Now().UTC().Format(time.RFC3339)
+	newDesc := beads.SetConvoyFields(&beads.Issue{Description: convoys[0].Description}, updatedFields)
+	if err := updateConvoyDescription(townBeads, convoyID, newDesc); err != nil {
+		style.PrintWarning("could not stamp NotificationSentAt on %s: %v", convoyID, err)
 	}
 
 	// Push notification to active Mayor session if configured.
