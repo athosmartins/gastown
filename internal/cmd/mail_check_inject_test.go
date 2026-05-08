@@ -7,6 +7,132 @@ import (
 	"github.com/steveyegge/gastown/internal/mail"
 )
 
+func TestParseMinPriorityThreshold(t *testing.T) {
+	tests := []struct {
+		input string
+		want  int
+	}{
+		{"P0", 0}, {"p0", 0}, {"urgent", 0}, {"URGENT", 0}, {"0", 0},
+		{"P1", 1}, {"p1", 1}, {"high", 1}, {"HIGH", 1}, {"1", 1},
+		{"P2", 2}, {"p2", 2}, {"normal", 2}, {"NORMAL", 2}, {"2", 2},
+		{"P3", 3}, {"p3", 3}, {"low", 3}, {"LOW", 3}, {"3", 3},
+		{"", 2}, {"invalid", 2}, {"P4", 2},
+	}
+	for _, tt := range tests {
+		got := parseMinPriorityThreshold(tt.input)
+		if got != tt.want {
+			t.Errorf("parseMinPriorityThreshold(%q) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestInjectThresholdMet(t *testing.T) {
+	mkMsg := func(from, subject string, priority mail.Priority) *mail.Message {
+		return &mail.Message{From: from, Subject: subject, Priority: priority}
+	}
+
+	tests := []struct {
+		name        string
+		msgs        []*mail.Message
+		minPriority string
+		want        bool
+	}{
+		{
+			name:        "no messages",
+			msgs:        nil,
+			minPriority: "P2",
+			want:        false,
+		},
+		{
+			name:        "normal message, P2 threshold (default behavior)",
+			msgs:        []*mail.Message{mkMsg("gastown/toast", "FYI", mail.PriorityNormal)},
+			minPriority: "P2",
+			want:        true,
+		},
+		{
+			name:        "normal message, P1 threshold — suppressed",
+			msgs:        []*mail.Message{mkMsg("gastown/toast", "convoy ack", mail.PriorityNormal)},
+			minPriority: "P1",
+			want:        false,
+		},
+		{
+			name:        "low message, P1 threshold — suppressed",
+			msgs:        []*mail.Message{mkMsg("gastown/nux", "backlog", mail.PriorityLow)},
+			minPriority: "P1",
+			want:        false,
+		},
+		{
+			name:        "high message, P1 threshold — passes",
+			msgs:        []*mail.Message{mkMsg("gastown/wolf", "review needed", mail.PriorityHigh)},
+			minPriority: "P1",
+			want:        true,
+		},
+		{
+			name:        "urgent message, P1 threshold — passes",
+			msgs:        []*mail.Message{mkMsg("mayor/", "fire", mail.PriorityUrgent)},
+			minPriority: "P1",
+			want:        true,
+		},
+		{
+			name:        "urgent message, P0 threshold — passes",
+			msgs:        []*mail.Message{mkMsg("mayor/", "fire", mail.PriorityUrgent)},
+			minPriority: "P0",
+			want:        true,
+		},
+		{
+			name:        "high message, P0 threshold — suppressed",
+			msgs:        []*mail.Message{mkMsg("mayor/", "important", mail.PriorityHigh)},
+			minPriority: "P0",
+			want:        false,
+		},
+		{
+			name:        "overseer sender always passes regardless of priority",
+			msgs:        []*mail.Message{mkMsg("overseer", "check in", mail.PriorityLow)},
+			minPriority: "P0",
+			want:        true,
+		},
+		{
+			name:        "escalation subject always passes regardless of priority",
+			msgs:        []*mail.Message{mkMsg("gastown/toast", "[ESCALATION-HIGH] infra down", mail.PriorityNormal)},
+			minPriority: "P0",
+			want:        true,
+		},
+		{
+			name: "mixed: normal below threshold + high at threshold",
+			msgs: []*mail.Message{
+				mkMsg("gastown/toast", "convoy done", mail.PriorityNormal),
+				mkMsg("gastown/wolf", "review needed", mail.PriorityHigh),
+			},
+			minPriority: "P1",
+			want:        true,
+		},
+		{
+			name: "mixed: all below threshold",
+			msgs: []*mail.Message{
+				mkMsg("gastown/toast", "convoy done", mail.PriorityNormal),
+				mkMsg("gastown/nux", "fyi", mail.PriorityLow),
+			},
+			minPriority: "P1",
+			want:        false,
+		},
+		{
+			name:        "nil message in slice skipped",
+			msgs:        []*mail.Message{nil, mkMsg("gastown/wolf", "review", mail.PriorityHigh)},
+			minPriority: "P1",
+			want:        true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := injectThresholdMet(tt.msgs, tt.minPriority)
+			if got != tt.want {
+				t.Errorf("injectThresholdMet(..., %q) = %v, want %v", tt.minPriority, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestFormatInjectOutput(t *testing.T) {
 	// Helper to build test messages with a given priority.
 	msg := func(id, from, subject string, priority mail.Priority) *mail.Message {

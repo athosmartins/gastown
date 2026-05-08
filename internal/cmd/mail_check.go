@@ -104,7 +104,7 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 					toInject = append(toInject, msg)
 				}
 			}
-			if len(toInject) > 0 {
+			if injectThresholdMet(toInject, mailCheckMinPriority) {
 				fmt.Print(formatInjectOutput(toInject))
 				// Ack after output so message is delivered before being marked acked.
 				if ackErr := mailbox.AcknowledgeDeliveries(address, toInject); ackErr != nil {
@@ -135,6 +135,43 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println("No new mail")
 	return NewSilentExit(1)
+}
+
+// parseMinPriorityThreshold converts a --min-priority flag value to a beads
+// integer threshold. Accepts P0/P1/P2/P3 and their string equivalents.
+// Returns 2 (normal) for unrecognized or empty values.
+func parseMinPriorityThreshold(s string) int {
+	switch strings.ToLower(s) {
+	case "p0", "urgent", "0":
+		return 0
+	case "p1", "high", "1":
+		return 1
+	case "p3", "low", "3":
+		return 3
+	default: // "p2", "normal", "2", ""
+		return 2
+	}
+}
+
+// injectThresholdMet reports whether at least one message in msgs warrants
+// injection given the min-priority setting. A message passes if:
+//   - Its beads priority is <= the threshold (lower int = higher urgency), OR
+//   - Its subject contains "[ESCALATION" (escalation copy always surfaces), OR
+//   - Its sender is "overseer" (human operator messages always surface).
+func injectThresholdMet(msgs []*mail.Message, minPriority string) bool {
+	threshold := parseMinPriorityThreshold(minPriority)
+	for _, msg := range msgs {
+		if msg == nil {
+			continue
+		}
+		if strings.HasPrefix(msg.From, "overseer") || strings.Contains(msg.Subject, "[ESCALATION") {
+			return true
+		}
+		if mail.PriorityToBeads(msg.Priority) <= threshold {
+			return true
+		}
+	}
+	return false
 }
 
 // formatInjectOutput builds the system-reminder text for inject mode.

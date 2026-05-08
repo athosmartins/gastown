@@ -26,9 +26,10 @@ var (
 	mailInboxUnread   bool
 	mailInboxAll      bool
 	mailInboxIdentity string
-	mailCheckInject   bool
-	mailCheckJSON     bool
-	mailCheckIdentity string
+	mailCheckInject      bool
+	mailCheckJSON        bool
+	mailCheckIdentity    string
+	mailCheckMinPriority string
 	mailThreadJSON    bool
 	mailReplySubject  string
 	mailReplyMessage  string
@@ -279,10 +280,16 @@ Exit codes (--inject mode):
 
 Use --identity for polecats to explicitly specify their identity.
 
+Use --min-priority to suppress inject for low-priority messages. Only inject
+if at least one unread message meets or exceeds the threshold. Escalations
+and overseer messages always inject regardless of --min-priority.
+
 Examples:
-  gt mail check                           # Simple check (auto-detect identity)
-  gt mail check --inject                  # For hooks
-  gt mail check --identity greenplace/Toast  # Explicit polecat identity`,
+  gt mail check                                    # Simple check (auto-detect identity)
+  gt mail check --inject                           # For hooks (injects all priorities)
+  gt mail check --inject --min-priority=P1         # Only inject for urgent/high mail
+  gt mail check --inject --min-priority=P0         # Only inject for urgent mail
+  gt mail check --identity greenplace/Toast        # Explicit polecat identity`,
 	RunE: runMailCheck,
 }
 
@@ -493,6 +500,7 @@ func init() {
 	mailCheckCmd.Flags().BoolVar(&mailCheckJSON, "json", false, "Output as JSON")
 	mailCheckCmd.Flags().StringVar(&mailCheckIdentity, "identity", "", "Explicit identity for inbox (e.g., greenplace/Toast)")
 	mailCheckCmd.Flags().StringVar(&mailCheckIdentity, "address", "", "Alias for --identity")
+	mailCheckCmd.Flags().StringVar(&mailCheckMinPriority, "min-priority", "P2", "Minimum priority to trigger inject (P0=urgent, P1=high, P2=normal, P3=low)")
 
 	// Thread flags
 	mailThreadCmd.Flags().BoolVar(&mailThreadJSON, "json", false, "Output as JSON")
