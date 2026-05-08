@@ -1147,12 +1147,28 @@ func runConvoyClose(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// convoyNotifyFrom returns the "from" address used by automated convoy
+// notifications. Format is "convoy/<id>" — full-address syntax is honored
+// directly by mail_identity.detectSenderFromRole and the nudge sender
+// builder, bypassing the cwd fallback that would otherwise resolve to
+// "overseer" (the human user) and impersonate them.
+func convoyNotifyFrom(convoyID string) string {
+	return "convoy/" + convoyID
+}
+
+// convoyNudgeEnv returns the env vars to set on a `gt nudge` subprocess so
+// that the nudge sender is "convoy/<id>" rather than falling through to
+// "overseer". Mail uses the explicit --from flag instead.
+func convoyNudgeEnv(convoyID string) []string {
+	return append(os.Environ(), "GT_ROLE="+convoyNotifyFrom(convoyID))
+}
+
 // sendCloseNotification sends a notification about convoy closure.
 func sendCloseNotification(addr, convoyID, title, reason string) {
 	subject := fmt.Sprintf("🚚 Convoy closed: %s", title)
 	body := fmt.Sprintf("Convoy %s has been closed.\n\nReason: %s", convoyID, reason)
 
-	mailArgs := []string{"mail", "send", addr, "-s", subject, "-m", body}
+	mailArgs := []string{"mail", "send", addr, "-s", subject, "-m", body, "--from", convoyNotifyFrom(convoyID)}
 	mailCmd := exec.Command("gt", mailArgs...)
 	if err := mailCmd.Run(); err != nil {
 		style.PrintWarning("couldn't send notification: %v", err)
@@ -1755,7 +1771,8 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 		notifiedAddrs[addr] = true
 		mailArgs := []string{"mail", "send", addr,
 			"-s", fmt.Sprintf("🚚 Convoy landed: %s", title),
-			"-m", fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.", convoyID)}
+			"-m", fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.", convoyID),
+			"--from", convoyNotifyFrom(convoyID)}
 		mailCmd := exec.Command("gt", mailArgs...)
 		if err := mailCmd.Run(); err != nil {
 			style.PrintWarning("could not notify %s: %v", addr, err)
@@ -1766,6 +1783,7 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 	for _, addr := range fields.NudgeNotificationAddresses() {
 		nudgeMsg := fmt.Sprintf("🚚 Convoy landed: %s — Convoy %s has completed. All tracked issues are now closed.", title, convoyID)
 		nudgeCmd := exec.Command("gt", "nudge", addr, "-m", nudgeMsg)
+		nudgeCmd.Env = convoyNudgeEnv(convoyID)
 		if err := nudgeCmd.Run(); err != nil {
 			style.PrintWarning("could not nudge %s: %v", addr, err)
 		}
@@ -1775,7 +1793,8 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 	if !notifiedAddrs["mayor/"] {
 		mailArgs := []string{"mail", "send", "mayor/",
 			"-s", fmt.Sprintf("Convoy complete: %s", title),
-			"-m", mayorBody}
+			"-m", mayorBody,
+			"--from", convoyNotifyFrom(convoyID)}
 		mailCmd := exec.Command("gt", mailArgs...)
 		if err := mailCmd.Run(); err != nil {
 			style.PrintWarning("could not notify mayor/ of convoy completion: %v", err)
@@ -1800,6 +1819,7 @@ func notifyMayorSession(townBeads, convoyID, title string) {
 
 	nudgeMsg := fmt.Sprintf("🚚 Convoy landed: %s — Convoy %s has completed. All tracked issues are now closed.", title, convoyID)
 	nudgeCmd := exec.Command("gt", "nudge", "mayor", "-m", nudgeMsg)
+	nudgeCmd.Env = convoyNudgeEnv(convoyID)
 	if err := nudgeCmd.Run(); err != nil {
 		style.PrintWarning("could not nudge Mayor session: %v", err)
 	}
