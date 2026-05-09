@@ -34,7 +34,10 @@ func TCPCheck(host string, port int, timeout time.Duration) bool {
 
 // LatencyCheck runs SELECT 1 against the Dolt server and returns the round-trip latency.
 func LatencyCheck(host string, port int, timeout time.Duration) (time.Duration, error) {
-	dsn := fmt.Sprintf("root@tcp(%s:%d)/?timeout=5s&readTimeout=10s", host, port)
+	// Socket-first DSN (gt-5t0kl): use BuildDSN so localhost connections prefer
+	// the unix socket. Health is invoked periodically by the daemon and was a
+	// significant TIME_WAIT contributor pre-migration.
+	dsn := doltserver.BuildDSN("root", host, port, "", doltserver.DSNOpts{Timeout: "5s", ReadTimeout: "10s"})
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return 0, fmt.Errorf("open connection: %w", err)
@@ -54,7 +57,8 @@ func LatencyCheck(host string, port int, timeout time.Duration) (time.Duration, 
 
 // DatabaseCount runs SHOW DATABASES and returns the count (excluding system databases).
 func DatabaseCount(host string, port int) (int, []string, error) {
-	dsn := fmt.Sprintf("root@tcp(%s:%d)/?timeout=5s&readTimeout=10s", host, port)
+	// Socket-first DSN (gt-5t0kl): see LatencyCheck rationale.
+	dsn := doltserver.BuildDSN("root", host, port, "", doltserver.DSNOpts{Timeout: "5s", ReadTimeout: "10s"})
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return 0, nil, err

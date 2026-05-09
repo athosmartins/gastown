@@ -16,6 +16,7 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
 // validDBName matches safe database names (alphanumeric, underscore, hyphen).
@@ -52,7 +53,9 @@ func isTableNotFound(err error) bool {
 // all production databases, filtering out system databases and test pollution.
 // Falls back to DefaultDatabases on any error.
 func DiscoverDatabases(host string, port int) []string {
-	dsn := fmt.Sprintf("root@tcp(%s:%d)/?parseTime=true&timeout=5s", host, port)
+	// Socket-first DSN (gt-5t0kl): runs every reaper cycle, so unmigrated
+	// TCP connections accumulated TIME_WAIT entries across daemon lifetime.
+	dsn := doltserver.BuildDSN("root", host, port, "", doltserver.DSNOpts{ParseTime: true, Timeout: "5s"})
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return DefaultDatabases
@@ -161,10 +164,13 @@ func OpenDB(host string, port int, dbName string, readTimeout, writeTimeout time
 	if err := ValidateDBName(dbName); err != nil {
 		return nil, err
 	}
-	dsn := fmt.Sprintf("root@tcp(%s:%d)/%s?parseTime=true&timeout=5s&readTimeout=%s&writeTimeout=%s",
-		host, port, dbName,
-		fmt.Sprintf("%ds", int(readTimeout.Seconds())),
-		fmt.Sprintf("%ds", int(writeTimeout.Seconds())))
+	// Socket-first DSN (gt-5t0kl): see DiscoverDatabases rationale.
+	dsn := doltserver.BuildDSN("root", host, port, dbName, doltserver.DSNOpts{
+		ParseTime:    true,
+		Timeout:      "5s",
+		ReadTimeout:  fmt.Sprintf("%ds", int(readTimeout.Seconds())),
+		WriteTimeout: fmt.Sprintf("%ds", int(writeTimeout.Seconds())),
+	})
 	return sql.Open("mysql", dsn)
 }
 

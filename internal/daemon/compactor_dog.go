@@ -11,6 +11,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/reaper"
 )
 
@@ -601,8 +602,12 @@ func (d *Daemon) compactorCleanup(db *sql.DB, dbName string) {
 
 // compactorOpenDB opens a connection to the Dolt server for the given database.
 func (d *Daemon) compactorOpenDB(dbName string) (*sql.DB, error) {
-	dsn := fmt.Sprintf("root@tcp(%s:%d)/%s?parseTime=true&timeout=5s&readTimeout=30s&writeTimeout=30s",
-		"127.0.0.1", d.doltServerPort(), dbName)
+	// Socket-first DSN (gt-5t0kl): the compactor runs on a periodic timer,
+	// so each unmigrated TCP connection contributed a TIME_WAIT entry per
+	// cycle — the dominant TIME_WAIT producer pre-migration.
+	dsn := doltserver.BuildDSN("root", "127.0.0.1", d.doltServerPort(), dbName, doltserver.DSNOpts{
+		ParseTime: true, Timeout: "5s", ReadTimeout: "30s", WriteTimeout: "30s",
+	})
 	return sql.Open("mysql", dsn)
 }
 

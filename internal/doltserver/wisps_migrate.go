@@ -296,7 +296,9 @@ func ensureWispsOnGTServer(host string, port int, dbName string) (wispsCreated b
 	if host == "" {
 		host = "127.0.0.1"
 	}
-	dsn := fmt.Sprintf("root@tcp(%s:%d)/%s?parseTime=true&timeout=10s", host, port, dbName)
+	// Socket-first DSN (gt-5t0kl): use BuildDSN so localhost connections prefer
+	// the unix socket, avoiding TIME_WAIT churn under repeated wisps migrations.
+	dsn := BuildDSN("root", host, port, dbName, DSNOpts{ParseTime: true, Timeout: "10s"})
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return false, nil, fmt.Errorf("connect to gt Dolt server: %w", err)
