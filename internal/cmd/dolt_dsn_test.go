@@ -192,3 +192,48 @@ func TestLocalDoltSocketPath_AbsentReturnsEmpty(t *testing.T) {
 		t.Errorf("expected TCP fallback when socket absent, got %q", got)
 	}
 }
+
+// TestDoltSocketCandidates_Ordering covers dc-y69y: the candidate list must
+// include the unprefixed /tmp/mysql.sock as a final fallback, otherwise every
+// non-3306 Dolt setup bypasses the socket and creates TIME_WAIT churn.
+func TestDoltSocketCandidates_Ordering(t *testing.T) {
+	tests := []struct {
+		name string
+		port int
+		want []string
+	}{
+		{
+			name: "non_3306_includes_port_suffixed_then_unprefixed_fallback",
+			port: 3307,
+			want: []string{"/tmp/mysql.3307.sock", "/tmp/mysql.sock"},
+		},
+		{
+			name: "port_3306_only_unprefixed",
+			port: 3306,
+			want: []string{"/tmp/mysql.sock"},
+		},
+		{
+			name: "zero_port_only_unprefixed",
+			port: 0,
+			want: []string{"/tmp/mysql.sock"},
+		},
+		{
+			name: "non_default_port_4567",
+			port: 4567,
+			want: []string{"/tmp/mysql.4567.sock", "/tmp/mysql.sock"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := doltSocketCandidates(tt.port)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("position %d: got %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}

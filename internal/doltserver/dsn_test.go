@@ -125,8 +125,60 @@ func TestLocalSocketPath_RealSocket(t *testing.T) {
 }
 
 func TestLocalSocketPath_AbsentReturnsEmpty(t *testing.T) {
+	// dc-y69y: helper now falls back to DefaultDoltSocketPath when the
+	// port-suffixed candidate is missing. On dev machines that have a Dolt
+	// instance running with the default socket path, this test would
+	// otherwise return that fallback and fail. Skip when the fallback exists.
+	if info, err := os.Stat(DefaultDoltSocketPath); err == nil && info.Mode()&os.ModeSocket != 0 {
+		t.Skipf("skipping: %s exists as a unix socket — fallback would resolve", DefaultDoltSocketPath)
+	}
 	got := LocalSocketPath(19999) // port with no server
 	if got != "" {
 		t.Errorf("expected empty for absent socket, got %q", got)
+	}
+}
+
+// TestSocketCandidates_Ordering covers dc-y69y: the candidate list must
+// include DefaultDoltSocketPath as a final fallback, otherwise every non-3306
+// Dolt setup bypasses the socket and creates TIME_WAIT churn.
+func TestSocketCandidates_Ordering(t *testing.T) {
+	tests := []struct {
+		name string
+		port int
+		want []string
+	}{
+		{
+			name: "non_3306_includes_port_suffixed_then_unprefixed_fallback",
+			port: 3307,
+			want: []string{"/tmp/mysql.3307.sock", DefaultDoltSocketPath},
+		},
+		{
+			name: "port_3306_only_unprefixed",
+			port: 3306,
+			want: []string{DefaultDoltSocketPath},
+		},
+		{
+			name: "zero_port_only_unprefixed",
+			port: 0,
+			want: []string{DefaultDoltSocketPath},
+		},
+		{
+			name: "non_default_port_4567",
+			port: 4567,
+			want: []string{"/tmp/mysql.4567.sock", DefaultDoltSocketPath},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SocketCandidates(tt.port)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("position %d: got %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
 	}
 }

@@ -32,25 +32,45 @@ func (o DSNOpts) queryString() string {
 	return strings.Join(parts, "&")
 }
 
-// LocalSocketPath returns Dolt's unix socket path for a given port if a socket
-// is currently present at that path; otherwise returns "". The path derivation
-// matches Dolt's own logic: /tmp/mysql.sock on port 3306, /tmp/mysql.{port}.sock
-// for any other port.
+// LocalSocketPath returns the path to Dolt's local unix socket if one is
+// listening, or "" if no socket can be found.
+//
+// Path derivation: Dolt's source default is /tmp/mysql.sock regardless of
+// port, unless the user explicitly sets `socket: /tmp/mysql.<port>.sock` in
+// config.yaml. We try the port-suffixed path FIRST (so explicitly-configured
+// setups still resolve correctly), then fall back to the unprefixed default.
+// (dc-y69y) Earlier versions only tried the port-suffixed path, which caused
+// every gt-CLI subcommand on a non-3306 Dolt to bypass the socket and fall
+// back to TCP — recreating the TIME_WAIT pile-up the socket migration was
+// supposed to eliminate.
 //
 // Declared as var so tests can swap it without requiring a real Dolt server.
-var LocalSocketPath = func(port int) string {
-	p := DefaultDoltSocketPath
+// SocketCandidates returns the ordered list of paths LocalSocketPath should
+// try, with the explicitly-port-suffixed candidate first (so user-configured
+// custom-port setups still work) and Dolt's source-default unprefixed path
+// last (the actual fallback for vanilla servers on any port). Pure / no I/O
+// — easy to unit-test the ordering invariants.
+func SocketCandidates(port int) []string {
+	out := make([]string, 0, 2)
 	if port != 0 && port != 3306 {
-		p = fmt.Sprintf("/tmp/mysql.%d.sock", port)
+		out = append(out, fmt.Sprintf("/tmp/mysql.%d.sock", port))
 	}
-	info, err := os.Stat(p)
-	if err != nil {
-		return ""
+	out = append(out, DefaultDoltSocketPath)
+	return out
+}
+
+var LocalSocketPath = func(port int) string {
+	for _, p := range SocketCandidates(port) {
+		info, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if info.Mode()&os.ModeSocket == 0 {
+			continue
+		}
+		return p
 	}
-	if info.Mode()&os.ModeSocket == 0 {
-		return ""
-	}
-	return p
+	return ""
 }
 
 // isLocalHost reports whether host is a local loopback address.
