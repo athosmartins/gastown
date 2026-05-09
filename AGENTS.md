@@ -287,6 +287,36 @@ git push              # Push to remote
 
 <!-- end-beads-agent-instructions -->
 
+---
+
+## Cross-Clone Discipline
+
+**Never run `git -C <other-rig-or-crew-clone> <write-op>` from this session.** Crews own their own clones — reaching across the boundary creates silent merge breaches (see dc-v1fw root cause analysis). The pattern that triggered dc-c6m2 was `git -C ~/gt/whatsapp_automation/crew/<x> commit ...` issued from this session; that pattern is forbidden.
+
+**What "write op" means here**: `commit`, `push`, `merge`, `rebase`, `cherry-pick`, `reset --hard`, `stash drop`, `clean -f`, `branch -D`, `tag -d`, `apply`, `am`. Read-only ops (`log`, `status`, `diff`, `show`, `cat-file`, `rev-parse`, etc) are fine — diagnostic visibility into other clones is useful and not a breach.
+
+**The right pattern for crew-affecting changes:**
+
+1. Make the change in this rig's parent clone (`~/gt/whatsapp_automation/`).
+2. Open an MR via `gt mq submit` (or push to a feature branch + PR).
+3. Refinery merges to `origin/main`.
+4. Each crew's `SessionStart` hook runs `scripts/crew_session_start.sh` (added by dc-x2qs) which fast-forwards their local `main` from `origin/main` automatically when safe.
+
+This is the standard git workflow — the same one every other agent uses. The cross-clone replication that ran before dc-x2qs was a shortcut that bypassed it; we have removed the shortcut.
+
+**Emergency override**: `DEACON_FORCE_REPLICATE=1 git -C <crew-clone> commit ...` works (consistent with PR #5's existing override). Use only when no other option works AND mayor approves; the action is logged and reviewable.
+
+**Diagnostic check before any cross-clone op (manual or scripted)**:
+
+```python
+from lib.crew_sentinel import should_skip_replication
+if should_skip_replication("/path/to/crew-clone"):
+    # active session detected — skip; the wrapper logs WARN automatically
+    continue
+```
+
+The sentinel + PreToolUse hook below are the secondary and primary enforcement, respectively. Both can be bypassed in genuine emergencies; neither replaces the discipline that this section documents.
+
 <!-- gastown-agent-instructions-v1 -->
 
 ---
