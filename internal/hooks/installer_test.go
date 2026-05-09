@@ -117,6 +117,99 @@ func TestInstallForRole_UpgradesStaleExportPath(t *testing.T) {
 	}
 }
 
+// TestInstallForRole_UpgradesManagedInstallMissingCrossCloneBlock simulates a
+// polecat settings.json created before the cross-clone-block hook was added to
+// the template. The file has every other hook (so it passes the legacy
+// "export PATH=" check) but is missing the new critical guard. Without an
+// upgrade trigger, the polecat would never invoke cross-clone-block on
+// `git -C` operations against another crew's clone (the dc-011o regression).
+func TestInstallForRole_UpgradesManagedInstallMissingCrossCloneBlock(t *testing.T) {
+	dir := t.TempDir()
+	hooksPath := filepath.Join(dir, ".claude", "settings.json")
+	os.MkdirAll(filepath.Dir(hooksPath), 0755)
+
+	// Synthetic "old polecat settings": looks like our managed template
+	// (contains pr-workflow marker) but no cross-clone-block.
+	staleContent := `{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash(gh pr create*)",
+        "hooks": [
+          { "type": "command", "command": "/usr/local/bin/gt tap guard pr-workflow" }
+        ]
+      }
+    ]
+  }
+}`
+	os.WriteFile(hooksPath, []byte(staleContent), 0644)
+
+	if err := InstallForRole("claude", dir, dir, "crew", ".claude", "settings.json", true); err != nil {
+		t.Fatalf("InstallForRole: %v", err)
+	}
+
+	got, _ := os.ReadFile(hooksPath)
+	if !strings.Contains(string(got), "tap guard cross-clone-block") {
+		t.Errorf("managed install missing cross-clone-block was not upgraded; got:\n%s", got)
+	}
+}
+
+// TestInstallForRole_PreservesUserCustomizedFile verifies the marker check
+// distinguishes managed installs from user-customized files. A file lacking
+// the pr-workflow marker is treated as user-customized and preserved as-is —
+// even if it doesn't contain the cross-clone-block hook.
+func TestInstallForRole_PreservesUserCustomizedFile(t *testing.T) {
+	dir := t.TempDir()
+	hooksPath := filepath.Join(dir, ".claude", "settings.json")
+	os.MkdirAll(filepath.Dir(hooksPath), 0755)
+
+	// User wrote their own settings.json with no pr-workflow marker.
+	customContent := `{"my":"custom","settings":true}`
+	os.WriteFile(hooksPath, []byte(customContent), 0644)
+
+	if err := InstallForRole("claude", dir, dir, "crew", ".claude", "settings.json", true); err != nil {
+		t.Fatalf("InstallForRole: %v", err)
+	}
+
+	got, _ := os.ReadFile(hooksPath)
+	if string(got) != customContent {
+		t.Errorf("user-customized file was overwritten; got:\n%s", got)
+	}
+}
+
+// TestInstallForRole_PreservesCurrentManagedInstall verifies that a current
+// managed install (has both pr-workflow AND cross-clone-block markers) is
+// not unnecessarily rewritten on subsequent calls.
+func TestInstallForRole_PreservesCurrentManagedInstall(t *testing.T) {
+	dir := t.TempDir()
+	hooksPath := filepath.Join(dir, ".claude", "settings.json")
+	os.MkdirAll(filepath.Dir(hooksPath), 0755)
+
+	currentContent := `{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash(gh pr create*)", "hooks": [{ "command": "gt tap guard pr-workflow" }] },
+      { "matcher": "Bash(git -C *)", "hooks": [{ "command": "gt tap guard cross-clone-block" }] }
+    ]
+  }
+}`
+	os.WriteFile(hooksPath, []byte(currentContent), 0644)
+	mtimeBefore, _ := os.Stat(hooksPath)
+
+	if err := InstallForRole("claude", dir, dir, "crew", ".claude", "settings.json", true); err != nil {
+		t.Fatalf("InstallForRole: %v", err)
+	}
+
+	got, _ := os.ReadFile(hooksPath)
+	if string(got) != currentContent {
+		t.Error("current managed install was unnecessarily rewritten")
+	}
+	mtimeAfter, _ := os.Stat(hooksPath)
+	if !mtimeAfter.ModTime().Equal(mtimeBefore.ModTime()) {
+		t.Error("file was rewritten despite being current")
+	}
+}
+
 func TestSyncForRole_UpdatesStaleContent(t *testing.T) {
 	dir := t.TempDir()
 	hooksPath := filepath.Join(dir, ".opencode/plugins", "gastown.js")

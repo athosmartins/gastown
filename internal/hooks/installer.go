@@ -63,13 +63,57 @@ func InstallForRole(provider, settingsDir, workDir, role, hooksDir, hooksFile st
 }
 
 // needsUpgrade returns true if an existing hooks file contains stale patterns
-// that should be replaced by the current template. This allows the installer
-// to auto-upgrade hooks from earlier versions without requiring manual intervention.
+// (or is a managed install missing critical hook entries) and should be
+// replaced by the current template. This allows the installer to auto-upgrade
+// hooks from earlier versions without requiring manual intervention.
+//
+// "Managed install" detection: a file is considered ours when it contains the
+// `tap guard pr-workflow` marker (present in every Claude template since day
+// one). Files without that marker are treated as user-customized and never
+// touched. Files WITH that marker but missing later-added critical guards are
+// upgraded. Without this, freshly-spawned polecats inherited settings.json
+// created before a critical guard was added and silently lacked it (dc-011o
+// cross-clone-block landed in the binary, was added to the templates only
+// later, and old polecat settings.json files had pr-workflow but no
+// cross-clone-block matcher — Claude Code never invoked the guard against
+// `git -C` operations).
 func needsUpgrade(content []byte) bool {
-	// Stale pattern: export PATH=... && gt — replaced by {{GT_BIN}} in current templates.
-	// The PATH export breaks Gemini CLI's hook runner which expands $PATH into
-	// an enormous string. Also catches files missing GT_HOOK_SOURCE env vars.
-	return bytes.Contains(content, []byte(`export PATH=`))
+	// Stale pattern: export PATH=... && gt — replaced by {{GT_BIN}} in current
+	// templates. The PATH export breaks Gemini CLI's hook runner which expands
+	// $PATH into an enormous string. Also catches files missing GT_HOOK_SOURCE
+	// env vars.
+	if bytes.Contains(content, []byte(`export PATH=`)) {
+		return true
+	}
+
+	// Managed-install marker: every Claude settings template since day one
+	// includes `tap guard pr-workflow`. Use it as the discriminator between
+	// "this looks like our template" and "this is a user-customized file we
+	// must not touch."
+	const managedInstallMarker = "tap guard pr-workflow"
+	if !bytes.Contains(content, []byte(managedInstallMarker)) {
+		return false
+	}
+
+	// Critical-hook drift detection: when a new critical guard ships in the
+	// templates, add its tap-guard subcommand suffix here. Managed installs
+	// missing the marker are detected as stale and rewritten.
+	//
+	// Each marker MUST be unique enough that its absence is reliable evidence
+	// the hook isn't registered. Use the binary's tap-guard subcommand suffix
+	// — `{{GT_BIN}} tap guard <name>` after substitution becomes
+	// `<absolute-path>/gt tap guard <name>`, so we match on the suffix
+	// `tap guard <name>` to be path-independent.
+	criticalHookMarkers := []string{
+		"tap guard cross-clone-block", // dc-011o cross-clone-block guard
+	}
+	for _, marker := range criticalHookMarkers {
+		if !bytes.Contains(content, []byte(marker)) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // SyncResult describes what SyncForRole did.
