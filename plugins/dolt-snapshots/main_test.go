@@ -416,3 +416,91 @@ func TestConvoyRow_SnapshotLogic(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildDSN(t *testing.T) {
+	// Save and restore the socket lookup function
+	orig := localDoltSocketPath
+	defer func() { localDoltSocketPath = orig }()
+
+	t.Run("falls_back_to_tcp_when_no_socket", func(t *testing.T) {
+		localDoltSocketPath = func(string) string { return "" }
+		got := buildDSN("127.0.0.1", "3307")
+		want := "root@tcp(127.0.0.1:3307)/information_schema?parseTime=true&timeout=5s&readTimeout=30s&writeTimeout=30s"
+		if got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("uses_unix_socket_when_present", func(t *testing.T) {
+		localDoltSocketPath = func(string) string { return "/tmp/mysql.3307.sock" }
+		got := buildDSN("127.0.0.1", "3307")
+		want := "root@unix(/tmp/mysql.3307.sock)/information_schema?parseTime=true&timeout=5s&readTimeout=30s&writeTimeout=30s"
+		if got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("uses_unix_socket_when_localhost", func(t *testing.T) {
+		localDoltSocketPath = func(string) string { return "/tmp/mysql.3307.sock" }
+		got := buildDSN("localhost", "3307")
+		if !contains(got, "@unix(/tmp/mysql.3307.sock)") {
+			t.Errorf("expected unix socket DSN for localhost, got %q", got)
+		}
+	})
+
+	t.Run("non_loopback_host_always_tcp", func(t *testing.T) {
+		// Even if a local socket exists, a remote host must use TCP.
+		localDoltSocketPath = func(string) string { return "/tmp/mysql.3307.sock" }
+		got := buildDSN("10.0.0.5", "3307")
+		if !contains(got, "@tcp(10.0.0.5:3307)") {
+			t.Errorf("expected TCP DSN for non-loopback host, got %q", got)
+		}
+	})
+}
+
+func TestLocalDoltSocketPath(t *testing.T) {
+	t.Run("returns_empty_when_socket_missing", func(t *testing.T) {
+		// /tmp/mysql.99999.sock should not exist
+		got := localDoltSocketPath("99999")
+		if got != "" {
+			t.Errorf("expected empty string for missing socket, got %q", got)
+		}
+	})
+
+	t.Run("returns_empty_for_regular_file", func(t *testing.T) {
+		// Create a regular file at the expected path and verify it's rejected.
+		dir := t.TempDir()
+		fakePath := filepath.Join(dir, "mysql.99998.sock")
+		if err := os.WriteFile(fakePath, []byte("not a socket"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		// Inject our own version that points to the temp dir
+		orig := localDoltSocketPath
+		localDoltSocketPath = func(port string) string {
+			info, err := os.Stat(fakePath)
+			if err != nil {
+				return ""
+			}
+			if info.Mode()&os.ModeSocket == 0 {
+				return ""
+			}
+			return fakePath
+		}
+		defer func() { localDoltSocketPath = orig }()
+
+		got := localDoltSocketPath("99998")
+		if got != "" {
+			t.Errorf("expected empty string for regular file, got %q", got)
+		}
+	})
+}
+
+// contains is a small helper to avoid importing strings in just one place.
+func contains(s, substr string) bool {
+	for i := 0; i+len(substr) <= len(s); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}

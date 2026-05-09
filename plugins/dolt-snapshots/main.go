@@ -67,7 +67,7 @@ func main() {
 		return
 	}
 
-	dsn := fmt.Sprintf("root@tcp(%s:%s)/information_schema?parseTime=true&timeout=5s&readTimeout=30s&writeTimeout=30s", h, p)
+	dsn := buildDSN(h, p)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		log.Fatalf("Failed to connect to Dolt: %v", err)
@@ -106,6 +106,54 @@ func main() {
 	if *dryRun {
 		fmt.Printf("(dry-run — no changes made)\n")
 	}
+}
+
+// localDoltSocketPath returns Dolt's default unix socket path for a given
+// port if a unix socket is currently listening at that path; otherwise "".
+// Mirrors the path-derivation logic in gastown's internal/cmd/dolt_dsn.go
+// (wa-d6f): Dolt listens on /tmp/mysql.sock for port 3306, /tmp/mysql.<port>.sock
+// for any other port.
+//
+// Declared as a var so tests can swap it for a temp-dir socket without
+// depending on a real Dolt server.
+var localDoltSocketPath = func(port string) string {
+	p := "/tmp/mysql.sock"
+	if port != "" && port != "3306" {
+		p = fmt.Sprintf("/tmp/mysql.%s.sock", port)
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		return ""
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return ""
+	}
+	return p
+}
+
+// buildDSN produces a Go-MySQL-driver DSN that prefers the local Dolt
+// unix domain socket when present, falling back to TCP loopback otherwise.
+//
+// Rationale: short-lived TCP connections to localhost create TIME_WAIT
+// entries that linger ~30s on macOS (2*MSL with MSL=15s). Background
+// daemons / cron / `gt health` invocations climb past port-monitor alert
+// thresholds. Unix sockets bypass TIME_WAIT entirely.
+//
+// Mirrors the internal/cmd/dolt_dsn.go pattern from wa-d6f. The plugin is
+// a separate Go module so we inline the helper rather than import it.
+//
+// Conservative semantics: callers receive the TCP DSN whenever the default
+// Dolt socket is not currently a unix socket at the expected path
+// (non-localhost host, Windows, no Dolt running, custom socket path). No
+// behavior change for setups without a local Dolt.
+func buildDSN(host, port string) string {
+	const params = "?parseTime=true&timeout=5s&readTimeout=30s&writeTimeout=30s"
+	if (host == "127.0.0.1" || host == "localhost") && port != "" {
+		if sock := localDoltSocketPath(port); sock != "" {
+			return fmt.Sprintf("root@unix(%s)/information_schema%s", sock, params)
+		}
+	}
+	return fmt.Sprintf("root@tcp(%s:%s)/information_schema%s", host, port, params)
 }
 
 func resolveHost(flag string) string {
@@ -603,7 +651,7 @@ func watchEvents(host, port, routesFile string, cleanup bool) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
-	dsn := fmt.Sprintf("root@tcp(%s:%s)/information_schema?parseTime=true&timeout=5s&readTimeout=30s&writeTimeout=30s", host, port)
+	dsn := buildDSN(host, port)
 
 	log.Printf("Watching %s for convoy events...", eventsPath)
 
