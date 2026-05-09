@@ -34,7 +34,7 @@
         ]
       },
       {
-        "matcher": "Bash(git -C *)",
+        "matcher": "Bash(git*)",
         "hooks": [
           {
             "type": "command",
