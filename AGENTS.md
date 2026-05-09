@@ -315,7 +315,29 @@ if should_skip_replication("/path/to/crew-clone"):
     continue
 ```
 
-The sentinel + PreToolUse hook below are the secondary and primary enforcement, respectively. Both can be bypassed in genuine emergencies; neither replaces the discipline that this section documents.
+### PreToolUse Hook Enforcement (Primary)
+
+A `PreToolUse` hook is configured in `.claude/settings.json` to block all cross-clone write operations at the CLI level:
+
+```
+Blocked patterns (exit code 2):
+  - git -C *crew* commit*
+  - git -C *crew* push*
+  - git -C *crew* merge*
+  - git -C *crew* rebase*
+  - git -C *crew* cherry-pick*
+  - git -C *crew* reset*
+  - git -C *crew* stash* drop*
+  - git -C *crew* branch -D*
+  - git -C *crew* tag -d*
+  - git -C *crew* apply*
+  - git -C *crew* am*
+  - git -C *crew* clean*
+```
+
+Any attempt to run these commands exits immediately with a clear error message referencing the incident (`dc-c6m2`/`dc-v1fw`) that necessitated the block. This is the primary enforcement.
+
+The sentinel (`lib.crew_sentinel`) and the hook are dual enforcement: neither replaces the discipline documented in this section; both can be bypassed via `DEACON_FORCE_REPLICATE=1` in genuine emergencies (with mayor approval).
 
 <!-- gastown-agent-instructions-v1 -->
 
