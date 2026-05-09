@@ -34,6 +34,15 @@
         ]
       },
       {
+        "matcher": "Bash(git -C *)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{GT_BIN}} tap guard cross-clone-block"
+          }
+        ]
+      },
+      {
         "matcher": "Bash(sudo *)",
         "hooks": [
           {

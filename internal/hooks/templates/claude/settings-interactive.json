@@ -32,6 +32,15 @@
             "command": "{{GT_BIN}} tap guard pr-workflow"
           }
         ]
+      },
+      {
+        "matcher": "Bash(git -C *)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{GT_BIN}} tap guard cross-clone-block"
+          }
+        ]
       }
     ],
     "SessionStart": [
