@@ -1745,8 +1745,10 @@ func cleanStaleSocket(socketPath string) {
 // the window where SIGTERM hits live storage I/O. Non-fatal: if the drain times
 // out or the server is unreachable, we proceed with SIGTERM anyway.
 func drainConnectionsBeforeStop(config *Config) {
-	dsn := fmt.Sprintf("%s@tcp(%s:%d)/?timeout=3s&readTimeout=5s&writeTimeout=5s",
-		config.User, config.EffectiveHost(), config.Port)
+	// gt-dun29: socket-first DSN (TCP fallback) — eliminates TIME_WAIT churn.
+	dsn := BuildDSN(config.User, config.EffectiveHost(), config.Port, "", DSNOpts{
+		Timeout: "3s", ReadTimeout: "5s", WriteTimeout: "5s",
+	})
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return
@@ -3686,7 +3688,8 @@ func doltSQLWithRecovery(townRoot, rigDB, query string) error {
 func MeasureQueryLatency(townRoot string) (time.Duration, error) {
 	config := DefaultConfig(townRoot)
 
-	dsn := fmt.Sprintf("%s@tcp(%s:%d)/", config.User, config.EffectiveHost(), config.Port)
+	// gt-dun29: socket-first DSN (TCP fallback) — eliminates TIME_WAIT churn.
+	dsn := BuildDSN(config.User, config.EffectiveHost(), config.Port, "", DSNOpts{})
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return 0, fmt.Errorf("opening mysql connection: %w", err)
@@ -3719,7 +3722,8 @@ func MeasureQueryLatency(townRoot string) (time.Duration, error) {
 func GetLastCommitAge(townRoot string) (time.Duration, string, error) {
 	config := DefaultConfig(townRoot)
 
-	dsn := fmt.Sprintf("%s@tcp(%s:%d)/", config.User, config.EffectiveHost(), config.Port)
+	// gt-dun29: socket-first DSN (TCP fallback) — eliminates TIME_WAIT churn.
+	dsn := BuildDSN(config.User, config.EffectiveHost(), config.Port, "", DSNOpts{})
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return 0, "", fmt.Errorf("opening mysql connection: %w", err)
