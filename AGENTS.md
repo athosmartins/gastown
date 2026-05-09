@@ -150,6 +150,78 @@ molecule), run this checklist:
 
 If any check fails, refuse + reassign or escalate. Do not improvise.
 
+### Silence Rule — ack once, do not re-confirm
+
+Default mode is **silent execution**. Mayor's inbox is not a status feed.
+Ack only on explicit state transitions; never re-confirm settled state.
+
+#### No re-ack for stale state
+
+When a bead lands on your hook but its state is already settled —
+status `closed`, an `acknowledged` label is present, mayor or refinery has
+explicitly written that the issue is handled, or a related convoy already
+shows `done` — **silently unhook, do NOT nudge mayor or write a "thanks,
+already resolved" mail.** The audit trail already exists; broadcasting it
+again is noise.
+
+Exception: if the stale state is *unexpected* (e.g., a bead was closed
+while you were mid-cycle on related work, or the close looks wrong) →
+escalate **once** via `gt escalate -s LOW` describing the discrepancy.
+That is a new signal, not a re-ack.
+
+#### No status-update nudges for tasks you are not doing
+
+When the Scope Discipline Protocol (above) detects out-of-scope, post the
+REFUSE comment on the bead and stop. Do **not** also send a mail or nudge
+announcing the refusal — the bead comment is the single source of truth,
+and mayor sees it on next inbox cycle. Never double-broadcast.
+
+#### Ack ONCE per task transition
+
+For each task you legitimately accept:
+
+1. **Receive** (mayor nudge / sling lands) — exactly **one** ack:
+   "got it, starting" or equivalent. Then radio silence.
+2. **Work** — silent. No "still working", no "halfway done", no "running
+   step 2 now". Mayor sees state via `bd show`, convoy surface, commits.
+3. **Complete** — exactly **one** ack: outcome + commit hashes / bead
+   refs / PR URLs. Then unhook.
+
+Multiple acks during work = waste of mayor's attention and a discipline
+failure. If you find yourself drafting a third nudge on the same task,
+**delete it.** Whatever you wanted to say either belongs in the eventual
+completion ack or shouldn't be said at all.
+
+#### No "waiting for X" announcements
+
+When you legitimately need to wait for an external event (another crew's
+merge, mayor decision, refinery cycle, timer gate, dolt cleanup window),
+**wait silently**. Mayor is monitoring; the wait state is visible via
+`bd show`, the convoy surface, and the mail thread. "Still waiting on X"
+nudges do not move state forward — they only push noise into the channel
+that's supposed to carry signal.
+
+Exception: if the wait crosses a threshold mayor has explicitly set
+("ping me if convoy hq-cv-XXX hasn't completed in 24h", "escalate if
+gate hasn't fired by Friday"), then breach the silence with `gt escalate`
+or targeted mail — **once**, with evidence (elapsed time, expected
+trigger, observed state).
+
+#### When in doubt, do not send
+
+If you cannot articulate, in one sentence, what action you want the
+recipient to take in response to your message — do not send the message.
+Status feelings, "checking in" pings, and "FYI I'm still working" updates
+are all noise.
+
+#### Why this rule exists
+
+Post-Phase-1 evidence (2026-05-09): deacon hooked on stale beads
+(dc-9c0o closed, dc-vq64 already merged, dc-94qf bypassed) and
+re-confirmed each one back to mayor. 5+ acks accumulated on the
+wa-wisp-9li merge wait (batista flagged the noise). Silent execution
+eliminates this category of regression entirely.
+
 ---
 
 <!-- beads-agent-instructions-v2 -->
