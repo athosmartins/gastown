@@ -17,6 +17,34 @@ Direct pushes to main are forbidden — the Refinery handles merges.
 
 ## Step 1: Pre-flight checks
 
+### Deacon safety guard — refuse cross-clone ops
+
+```bash
+# Guard: deacon cannot run crew-commit inside crew clones
+if [[ "$GT_ROLE" == */deacon ]]; then
+  # Check if current directory is a crew clone (~/gt/<rig>/crew/<name>/)
+  if [[ "$PWD" =~ /gt/[^/]+/crew/[^/]+/?$ ]]; then
+    cat >&2 <<'EOF'
+❌ BLOCKED: Deacon cannot commit in crew clones
+
+This is a crew clone (path: $PWD). Deacon must not execute git operations
+against crew clones — this is a cross-clone discipline boundary.
+
+→ For replication guidance, see: dc-x2qs
+→ For incident reference, see: dc-c6m2 (cross-clone breach)
+
+STOP. Do not proceed. Work in deacon's own clone only.
+EOF
+    exit 1
+  fi
+fi
+```
+
+---
+
+### Standard pre-flight checks
+
+
 ```bash
 # Verify we're in a git repo
 git rev-parse --is-inside-work-tree
