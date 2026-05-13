@@ -39,6 +39,7 @@ gt
 state.json
 .runtime/
 !.runtime/setup-hooks/
+.crew-active-*
 
 # Beads runtime state (not tracked)
 # Formulas ARE tracked for `go install @latest` - see bottom of file
