@@ -753,7 +753,14 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		// Resume mode: build command without prompt, then append resume flag.
 		// No beacon is passed as prompt - the resumed session already has context.
 		// The SessionStart hook still fires and injects Gas Town metadata.
-		claudeCmd, err = config.BuildCrewStartupCommandWithAgentOverride(m.rig.Name, name, m.rig.Path, "", opts.AgentOverride)
+		// SessionName is passed so --remote-control is injected (enables /remote-control).
+		claudeCmd, err = config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
+			Role:        constants.RoleCrew,
+			Rig:         m.rig.Name,
+			AgentName:   name,
+			TownRoot:    townRoot,
+			SessionName: m.SessionName(name),
+		}, m.rig.Path, "", opts.AgentOverride)
 		if err != nil {
 			return fmt.Errorf("building resume command: %w", err)
 		}

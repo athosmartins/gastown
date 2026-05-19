@@ -447,13 +447,17 @@ func buildPrompt(cfg SessionConfig) string {
 }
 
 // buildCommand creates the startup command using the config package.
+// SessionID is passed as SessionName so BuildStartupCommandFromConfig can inject
+// --remote-control <session> for Claude agents (enables /remote-control in all sessions).
 func buildCommand(cfg SessionConfig, prompt string) (string, error) {
-	if cfg.AgentOverride != "" {
-		return config.BuildAgentStartupCommandWithAgentOverride(
-			cfg.Role, cfg.RigName, cfg.TownRoot, cfg.RigPath, prompt, cfg.AgentOverride)
-	}
-	return config.BuildAgentStartupCommand(
-		cfg.Role, cfg.RigName, cfg.TownRoot, cfg.RigPath, prompt), nil
+	return config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
+		Role:      cfg.Role,
+		Rig:       cfg.RigName,
+		AgentName: cfg.AgentName,
+		TownRoot:  cfg.TownRoot,
+		Prompt:    prompt,
+		SessionName: cfg.SessionID,
+	}, cfg.RigPath, prompt, cfg.AgentOverride)
 }
 
 // ShutdownDelay is the standard delay after session creation.

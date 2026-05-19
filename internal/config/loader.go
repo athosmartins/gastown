@@ -2503,6 +2503,21 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 	// to silently not fire for polecats launched with --agent.
 	rc = withRoleSettingsFlag(rc, role, rigPath)
 
+	// Auto-inject --remote-control for Claude agents when the session name is known.
+	// This enables the /remote-control slash command to connect to any Gas Town session.
+	// GT_SESSION is set when AgentEnvConfig.SessionName is provided by the caller.
+	if sessionName := envVars["GT_SESSION"]; sessionName != "" {
+		rcCmd := rc.Command
+		if rcCmd == "" {
+			rcCmd = "claude"
+		}
+		if rcCmd == "claude" || strings.HasSuffix(rcCmd, "/claude") {
+			rcCopy := *rc
+			rcCopy.Args = append(append([]string{}, rc.Args...), "--remote-control", sessionName)
+			rc = &rcCopy
+		}
+	}
+
 	// Apply exec wrapper from rig/town settings if not already set on the resolved config.
 	if len(rc.ExecWrapper) == 0 {
 		rc.ExecWrapper = resolveExecWrapper(rigPath)
