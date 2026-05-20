@@ -1625,6 +1625,15 @@ func (b *Beads) Close(ids ...string) error {
 		return nil
 	}
 
+	// Route single cross-rig ID to the correct rig database (mirrors Show routing).
+	if !b.noRoute && len(ids) == 1 {
+		targetDir := ResolveRoutingTarget(b.getTownRoot(), ids[0], b.getResolvedBeadsDir())
+		if targetDir != b.getResolvedBeadsDir() {
+			target := NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+			return target.Close(ids...)
+		}
+	}
+
 	if b.store != nil {
 		return b.storeClose("", runtime.SessionIDFromEnv(), ids...)
 	}
@@ -1646,6 +1655,15 @@ func (b *Beads) Close(ids ...string) error {
 func (b *Beads) CloseWithReason(reason string, ids ...string) error {
 	if len(ids) == 0 {
 		return nil
+	}
+
+	// Route single cross-rig ID to the correct rig database (mirrors Show routing).
+	if !b.noRoute && len(ids) == 1 {
+		targetDir := ResolveRoutingTarget(b.getTownRoot(), ids[0], b.getResolvedBeadsDir())
+		if targetDir != b.getResolvedBeadsDir() {
+			target := NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+			return target.CloseWithReason(reason, ids...)
+		}
 	}
 
 	if b.store != nil {
@@ -1670,6 +1688,17 @@ func (b *Beads) CloseWithReason(reason string, ids ...string) error {
 func (b *Beads) ForceCloseWithReason(reason string, ids ...string) error {
 	if len(ids) == 0 {
 		return nil
+	}
+
+	// Route single cross-rig ID to the correct rig database (mirrors Show routing).
+	// Without this, closing e.g. a dc-* source issue from the wa rig would silently
+	// fail because b.run() pins BEADS_DIR to the local rig's database.
+	if !b.noRoute && len(ids) == 1 {
+		targetDir := ResolveRoutingTarget(b.getTownRoot(), ids[0], b.getResolvedBeadsDir())
+		if targetDir != b.getResolvedBeadsDir() {
+			target := NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+			return target.ForceCloseWithReason(reason, ids...)
+		}
 	}
 
 	// In-process store close doesn't enforce dependency checks (no --force
