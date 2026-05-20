@@ -53,6 +53,33 @@ func workDirToTownRoot(workDir string) string {
 	return workDir
 }
 
+// closeBeadWithRoutingFn is the routing-aware bead close used by handleZombieRestart.
+// Package-level for test injection — tests override this to avoid spawning bd.
+var closeBeadWithRoutingFn = closeBeadWithRouting
+
+// closeBeadWithRouting closes a bead using cross-rig prefix routing.
+// BdCli.Run uses the rig-local database and cannot close beads stored in other
+// rigs' databases (e.g., dc-* in the deacon/hq database). This resolves the
+// correct database directory via routes.jsonl before invoking bd close.
+func closeBeadWithRouting(workDir, issueID, reason string) error {
+	townRoot := workDirToTownRoot(workDir)
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	resolvedBeadsDir := beads.ResolveBeadsDirForID(townBeadsDir, issueID)
+	resolvedWorkDir := filepath.Dir(resolvedBeadsDir)
+
+	var stderr bytes.Buffer
+	cmd := beads.Command(resolvedWorkDir, resolvedBeadsDir, beads.MutationPinned,
+		"close", issueID, "--force", "--reason="+reason)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return fmt.Errorf("%s", msg)
+		}
+		return err
+	}
+	return nil
+}
+
 // registryMu serializes calls to initRegistryFromTownRoot so that concurrent
 // callers (including parallel tests) don't race on the global registries.
 var registryMu sync.Mutex
@@ -1725,11 +1752,24 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 	// branch (including via squash merge, which rewrites SHAs and fools a plain
 	// ancestor check), do NOT restart. Restarting would let the polecat push its
 	// pre-squash HEAD and create a duplicate MR for work already in main.
-	// Instead archive the polecat — its work is done.
+	// Instead archive the polecat and close its hook bead — its work is done.
 	if merged, err := verifyBranchAlreadyMerged(workDir, rigName, polecatName); err == nil && merged {
 		zombie.Action = "archived-work-already-merged (aa-apw)"
+		// Close the hook bead: the polecat never ran gt done, so the refinery's
+		// HandleMRInfoSuccess close may have silently failed (cross-rig routing bug
+		// dc-e7c2). Use routing-aware close to handle dc-*, hq-* and other non-local beads.
+		if hookBead != "" {
+			closeReason := fmt.Sprintf("Work already merged (witness zombie patrol: polecat %s/%s)", rigName, polecatName)
+			if closeErr := closeBeadWithRoutingFn(workDir, hookBead, closeReason); closeErr != nil {
+				zombie.Error = fmt.Errorf("close hook bead %s: %w", hookBead, closeErr)
+			}
+		}
 		if nukeErr := NukePolecat(bd, workDir, rigName, polecatName); nukeErr != nil {
-			zombie.Error = fmt.Errorf("archive: %w", nukeErr)
+			if zombie.Error == nil {
+				zombie.Error = fmt.Errorf("archive: %w", nukeErr)
+			} else {
+				zombie.Error = fmt.Errorf("%w; also archive: %v", zombie.Error, nukeErr)
+			}
 			zombie.Action = fmt.Sprintf("archive-failed-work-already-merged: %v", nukeErr)
 		}
 		return

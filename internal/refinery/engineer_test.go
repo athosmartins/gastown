@@ -1180,3 +1180,124 @@ func TestIsClaimStale(t *testing.T) {
 		})
 	}
 }
+
+// TestCloseIssueWithRouting_CrossRig verifies that closeIssueWithRouting resolves
+// the correct beads directory for cross-rig beads (e.g., dc-* stored in the
+// deacon database, not the gastown rig database). This is the dc-e7c2 regression:
+// e.beads uses the rig-local db and silently failed to close dc-* source issues.
+func TestCloseIssueWithRouting_CrossRig(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	deaconDir := filepath.Join(townRoot, "deacon")
+	rigBeadsDir := filepath.Join(rigPath, ".beads")
+	deaconBeadsDir := filepath.Join(deaconDir, ".beads")
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+
+	for _, dir := range []string{rigBeadsDir, deaconBeadsDir, townBeadsDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := beads.WriteRoutes(townBeadsDir, []beads.Route{
+		{Prefix: "gt-", Path: "gastown"},
+		{Prefix: "dc-", Path: "deacon"},
+	}); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "bd.log")
+	script := fmt.Sprintf(`#!/bin/sh
+printf 'BEADS_DIR=%%s args=%%s\n' "${BEADS_DIR:-<unset>}" "$*" >> %q
+case "$1" in
+  version) exit 0 ;;
+  close)   exit 0 ;;
+  *)       exit 0 ;;
+esac
+`, logPath)
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if err := closeIssueWithRouting(rigPath, "dc-e7c2", "Merged in gt-mr-123"); err != nil {
+		t.Fatalf("closeIssueWithRouting: %v", err)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	log := string(logBytes)
+
+	// Must use deacon beads dir, not the rig beads dir.
+	if strings.Contains(log, "BEADS_DIR="+rigBeadsDir) {
+		t.Errorf("used rig BEADS_DIR for dc- bead; want deacon BEADS_DIR\nlog:\n%s", log)
+	}
+	if !strings.Contains(log, "BEADS_DIR="+deaconBeadsDir) {
+		t.Errorf("expected deacon BEADS_DIR=%s in log\nlog:\n%s", deaconBeadsDir, log)
+	}
+	if !strings.Contains(log, "close") || !strings.Contains(log, "dc-e7c2") {
+		t.Errorf("expected 'close dc-e7c2' in bd args\nlog:\n%s", log)
+	}
+}
+
+// TestCloseIssueWithRouting_LocalRig verifies that closeIssueWithRouting works
+// correctly for same-rig beads (e.g., gt-* on the gastown rig).
+func TestCloseIssueWithRouting_LocalRig(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	rigBeadsDir := filepath.Join(rigPath, ".beads")
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+
+	for _, dir := range []string{rigBeadsDir, townBeadsDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := beads.WriteRoutes(townBeadsDir, []beads.Route{
+		{Prefix: "gt-", Path: "gastown"},
+	}); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "bd.log")
+	script := fmt.Sprintf(`#!/bin/sh
+printf 'BEADS_DIR=%%s args=%%s\n' "${BEADS_DIR:-<unset>}" "$*" >> %q
+case "$1" in
+  version) exit 0 ;;
+  close)   exit 0 ;;
+  *)       exit 0 ;;
+esac
+`, logPath)
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if err := closeIssueWithRouting(rigPath, "gt-src-456", "Merged in gt-mr-123"); err != nil {
+		t.Fatalf("closeIssueWithRouting: %v", err)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	log := string(logBytes)
+
+	if !strings.Contains(log, "BEADS_DIR="+rigBeadsDir) {
+		t.Errorf("expected rig BEADS_DIR=%s in log\nlog:\n%s", rigBeadsDir, log)
+	}
+	if !strings.Contains(log, "close") || !strings.Contains(log, "gt-src-456") {
+		t.Errorf("expected 'close gt-src-456' in bd args\nlog:\n%s", log)
+	}
+}

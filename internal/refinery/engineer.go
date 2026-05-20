@@ -1205,17 +1205,17 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 	}
 
 	// 1. Close source issue with reference to MR.
-	// Use ForceCloseWithReason to bypass dependency checks — the source issue
-	// may have an attached molecule (wisp) whose open steps would block a
-	// normal close. This matches how gt done handles closures.
+	// Use closeIssueWithRouting to bypass dependency checks and handle cross-rig
+	// beads (e.g., dc-* stored in the deacon/hq database). e.beads uses the
+	// rig-local database and silently fails for beads in other rigs' databases.
 	if mr.SourceIssue != "" {
 		closeReason := fmt.Sprintf("Merged in %s", mr.ID)
 		if result.MergeCommit != "" {
 			closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.Target, result.MergeCommit)
 		}
-		if err := e.beads.ForceCloseWithReason(closeReason, mr.SourceIssue); err != nil {
+		if err := closeIssueWithRouting(e.rig.Path, mr.SourceIssue, closeReason); err != nil {
 			// Check if already closed (by polecat's gt done) — that's fine
-			if issue, showErr := e.beads.Show(mr.SourceIssue); showErr == nil && beads.IssueStatus(issue.Status).IsTerminal() {
+			if isIssueTerminalWithRouting(e.rig.Path, mr.SourceIssue) {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Source issue already closed: %s\n", mr.SourceIssue)
 			} else {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close source issue %s: %v\n", mr.SourceIssue, err)
@@ -1283,6 +1283,52 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 
 func (e *Engineer) clearAgentActiveMR(agentBeadID string) error {
 	return e.beads.ForAgentBead().UpdateAgentActiveMR(agentBeadID, "")
+}
+
+// closeIssueWithRouting closes a bead using cross-rig prefix routing.
+// rigPath is the rig's root directory; the town root is derived as its parent.
+// e.beads (and b.ForceCloseWithReason) uses the rig-local database and cannot
+// close beads stored in other rigs' databases (e.g., dc-* in the deacon/hq
+// database). This function resolves the correct database via routes.jsonl first.
+func closeIssueWithRouting(rigPath, issueID, reason string) error {
+	townRoot := filepath.Dir(rigPath)
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	resolvedBeadsDir := beads.ResolveBeadsDirForID(townBeadsDir, issueID)
+	workDir := filepath.Dir(resolvedBeadsDir)
+
+	var stderr bytes.Buffer
+	cmd := beads.Command(workDir, resolvedBeadsDir, beads.MutationPinned,
+		"close", issueID, "--force", "--reason="+reason)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return fmt.Errorf("%s", msg)
+		}
+		return err
+	}
+	return nil
+}
+
+// isIssueTerminalWithRouting returns true if the bead is in a terminal status,
+// using cross-rig routing to handle beads outside the rig-local database.
+func isIssueTerminalWithRouting(rigPath, issueID string) bool {
+	townRoot := filepath.Dir(rigPath)
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	resolvedBeadsDir := beads.ResolveBeadsDirForID(townBeadsDir, issueID)
+	workDir := filepath.Dir(resolvedBeadsDir)
+
+	var stdout bytes.Buffer
+	cmd := beads.Command(workDir, resolvedBeadsDir, beads.ReadOnlyPinned,
+		"show", issueID, "--json")
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return false
+	}
+	var issues []struct{ Status string }
+	if err := json.Unmarshal(stdout.Bytes(), &issues); err != nil || len(issues) == 0 {
+		return false
+	}
+	return beads.IssueStatus(issues[0].Status).IsTerminal()
 }
 
 // HandleMRInfoFailure handles a failed merge from MRInfo.

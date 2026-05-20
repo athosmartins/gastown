@@ -2163,3 +2163,71 @@ func TestHandleZombieRestart_RestartsWhenBranchNotMerged(t *testing.T) {
 		t.Errorf("action = %q, should not archive when work is not merged", z.Action)
 	}
 }
+
+// TestHandleZombieRestart_ClosesHookBeadWhenAlreadyMerged verifies dc-e7c2 fix:
+// when a zombie polecat's work is already merged, the witness must close the hook
+// bead (the polecat never ran gt done, so the bead would otherwise remain open).
+//
+// Not parallel: overrides package-level verifyBranchAlreadyMerged and closeBeadWithRoutingFn.
+func TestHandleZombieRestart_ClosesHookBeadWhenAlreadyMerged(t *testing.T) {
+	oldVerify := verifyBranchAlreadyMerged
+	verifyBranchAlreadyMerged = func(workDir, rigName, polecatName string) (bool, error) {
+		return true, nil
+	}
+	t.Cleanup(func() { verifyBranchAlreadyMerged = oldVerify })
+
+	var closedIssueID string
+	oldClose := closeBeadWithRoutingFn
+	closeBeadWithRoutingFn = func(workDir, issueID, reason string) error {
+		closedIssueID = issueID
+		return nil
+	}
+	t.Cleanup(func() { closeBeadWithRoutingFn = oldClose })
+
+	bd, _ := mockBd(
+		func(args []string) (string, error) { return "[]", nil },
+		func(args []string) error { return nil },
+	)
+
+	z := &ZombieResult{PolecatName: "scavenger", HookBead: "dc-e7c2"}
+	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "dc-e7c2", "clean", z)
+
+	if closedIssueID != "dc-e7c2" {
+		t.Errorf("expected hook bead dc-e7c2 to be closed, got closedIssueID=%q", closedIssueID)
+	}
+	if !strings.Contains(z.Action, "work-already-merged") {
+		t.Errorf("action = %q, want it to mention work-already-merged", z.Action)
+	}
+}
+
+// TestHandleZombieRestart_NoHookBeadNoClose verifies that closeBeadWithRoutingFn
+// is NOT called when hookBead is empty (no work was ever assigned).
+//
+// Not parallel: overrides package-level verifyBranchAlreadyMerged and closeBeadWithRoutingFn.
+func TestHandleZombieRestart_NoHookBeadNoClose(t *testing.T) {
+	oldVerify := verifyBranchAlreadyMerged
+	verifyBranchAlreadyMerged = func(workDir, rigName, polecatName string) (bool, error) {
+		return true, nil
+	}
+	t.Cleanup(func() { verifyBranchAlreadyMerged = oldVerify })
+
+	closed := false
+	oldClose := closeBeadWithRoutingFn
+	closeBeadWithRoutingFn = func(workDir, issueID, reason string) error {
+		closed = true
+		return nil
+	}
+	t.Cleanup(func() { closeBeadWithRoutingFn = oldClose })
+
+	bd, _ := mockBd(
+		func(args []string) (string, error) { return "[]", nil },
+		func(args []string) error { return nil },
+	)
+
+	z := &ZombieResult{PolecatName: "scavenger", HookBead: ""}
+	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "", "clean", z)
+
+	if closed {
+		t.Errorf("closeBeadWithRoutingFn should not be called when hookBead is empty")
+	}
+}

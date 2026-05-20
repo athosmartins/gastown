@@ -635,9 +635,9 @@ func (m *Manager) PostMerge(idOrBranch string) (*PostMergeResult, error) {
 		if mr.MergeCommit != "" {
 			closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.TargetBranch, mr.MergeCommit)
 		}
-		if err := b.ForceCloseWithReason(closeReason, mr.IssueID); err != nil {
+		if err := closeIssueWithRouting(m.rig.Path, mr.IssueID, closeReason); err != nil {
 			// Check if already closed (by polecat's gt done) — that's fine
-			if issue, showErr := b.Show(mr.IssueID); showErr == nil && beads.IssueStatus(issue.Status).IsTerminal() {
+			if isIssueTerminalWithRouting(m.rig.Path, mr.IssueID) {
 				_, _ = fmt.Fprintf(m.output, "  %s source issue already closed: %s\n", style.Dim.Render("○"), mr.IssueID)
 				result.SourceIssueClosed = true
 			} else {
