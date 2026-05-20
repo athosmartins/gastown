@@ -25,6 +25,26 @@ escalate to Witness — but you must attempt it.
 
 ---
 
+## Code Discovery — Use Explore Subagent
+
+For ANY code search beyond a single known-file lookup, use the **Explore subagent**
+(`Agent` tool with `subagent_type="Explore"`) instead of sequential grep/find/Bash.
+
+**Why:** Explore consumes 70–80% fewer tokens than naïve grep+read for discovery tasks.
+Measured in WA polecats: 5–8K tokens (Explore) vs 25–40K tokens (grep+Bash) per task.
+Source: dc-8f2y (Nível 1) + dc-8ve6 (Nível 2 A/B).
+
+**Use Explore when:**
+- "Where is X handled?" / "Find all callers of Y" / "How does Z work here?"
+- Any search requiring >2 grep commands
+- Cross-file or cross-daemon discovery
+
+**Use grep/Bash directly when:**
+- Known file path + known exact string (single lookup, <200 tokens output expected)
+- Verifying existence of a specific identifier in a specific file
+
+---
+
 ## 🚨 SINGLE-TASK FOCUS 🚨
 
 **You have ONE job: work your pinned bead until done.**

@@ -32,7 +32,7 @@ whether the other layers work.
 
 ```bash
 DOLT_DATA_DIR="$GT_TOWN_ROOT/.dolt-data"
-PROD_DBS=("hq" "gt" "mo")
+PROD_DBS=("auto")  # auto-discovered from Dolt server
 JSONL_EXPORT_DIR="$GT_TOWN_ROOT/.dolt-archive/jsonl"
 DOLT_HOST="127.0.0.1"
 DOLT_PORT=3307

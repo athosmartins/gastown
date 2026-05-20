@@ -108,46 +108,27 @@ func main() {
 	}
 }
 
-// localDoltSocketPath returns the path to Dolt's local unix socket if one is
-// listening, or "" if no socket can be found.
-//
-// Path derivation: Dolt's source default is /tmp/mysql.sock regardless of
-// port, unless the user explicitly sets `socket: /tmp/mysql.<port>.sock` in
-// config.yaml. We try the port-suffixed path FIRST (so explicitly-configured
-// setups still resolve correctly), then fall back to the unprefixed default.
-// (dc-y69y) Earlier versions only tried the port-suffixed path, which caused
-// every gt-CLI subcommand on a non-3306 Dolt to bypass the socket and fall
-// back to TCP — recreating the TIME_WAIT pile-up the socket migration was
-// supposed to eliminate.
+// localDoltSocketPath returns Dolt's default unix socket path for a given
+// port if a unix socket is currently listening at that path; otherwise "".
+// Mirrors the path-derivation logic in gastown's internal/cmd/dolt_dsn.go
+// (wa-d6f): Dolt listens on /tmp/mysql.sock for port 3306, /tmp/mysql.<port>.sock
+// for any other port.
 //
 // Declared as a var so tests can swap it for a temp-dir socket without
 // depending on a real Dolt server.
-// doltSocketCandidates returns the ordered list of paths the helper should
-// try, with the explicitly-port-suffixed candidate first (so user-configured
-// custom-port setups still work) and Dolt's source-default unprefixed path
-// last (the actual fallback for vanilla servers on any port). Pure / no I/O
-// — easy to unit-test the ordering invariants.
-func doltSocketCandidates(port string) []string {
-	out := make([]string, 0, 2)
-	if port != "" && port != "3306" {
-		out = append(out, fmt.Sprintf("/tmp/mysql.%s.sock", port))
-	}
-	out = append(out, "/tmp/mysql.sock")
-	return out
-}
-
 var localDoltSocketPath = func(port string) string {
-	for _, p := range doltSocketCandidates(port) {
-		info, err := os.Stat(p)
-		if err != nil {
-			continue
-		}
-		if info.Mode()&os.ModeSocket == 0 {
-			continue
-		}
-		return p
+	p := "/tmp/mysql.sock"
+	if port != "" && port != "3306" {
+		p = fmt.Sprintf("/tmp/mysql.%s.sock", port)
 	}
-	return ""
+	info, err := os.Stat(p)
+	if err != nil {
+		return ""
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return ""
+	}
+	return p
 }
 
 // buildDSN produces a Go-MySQL-driver DSN that prefers the local Dolt

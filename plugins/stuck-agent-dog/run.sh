@@ -45,8 +45,7 @@ while IFS='|' read -r RIG PREFIX; do
 
     if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
       # Session dead — check hook
-      HOOK_OUTPUT=$(gt hook show "$RIG/polecats/$PCAT_NAME" 2>/dev/null | head -1)
-      HOOK_BEAD=$(echo "$HOOK_OUTPUT" | grep -v '(empty)' | awk '{print $2}' || true)
+      HOOK_BEAD=$(bd show "$RIG/polecats/$PCAT_NAME" --json 2>/dev/null | jq -r '.[0].hook_bead // empty' 2>/dev/null || echo "")
 
       if [ -n "$HOOK_BEAD" ]; then
         # Check agent_state
@@ -67,8 +66,7 @@ while IFS='|' read -r RIG PREFIX; do
         PROC_COMM=$(ps -o comm= -p "$PANE_PID" 2>/dev/null)
         if [ -z "$PROC_COMM" ]; then
           # Zombie: process dead, session alive
-          HOOK_OUTPUT=$(gt hook show "$RIG/polecats/$PCAT_NAME" 2>/dev/null | head -1)
-          HOOK_BEAD=$(echo "$HOOK_OUTPUT" | grep -v '(empty)' | awk '{print $2}' || true)
+          HOOK_BEAD=$(bd show "$RIG/polecats/$PCAT_NAME" --json 2>/dev/null | jq -r '.[0].hook_bead // empty' 2>/dev/null || echo "")
           if [ -n "$HOOK_BEAD" ]; then
             STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
             log "  ZOMBIE: $SESSION_NAME (pid=$PANE_PID dead, hook=$HOOK_BEAD)"
@@ -140,11 +138,7 @@ except Exception:
     print('unknown')
 " 2>/dev/null || echo "unknown")
 
-      # State-based threshold: 2h for idle (intentional sleep), 1h for working/unknown.
-      # The working threshold was 20m but the deacon patrol formula doesn't reliably
-      # write state=idle before await-signal (depends on deacon Claude agent behavior),
-      # so stateless heartbeats during legitimate patrol sleep kept triggering false
-      # positives every ~25m. 1h is still tight enough to catch a genuinely stuck deacon.
+      # State-based threshold: 2h for idle (intentional sleep), 20m for working/unknown
       STUCK_THRESHOLD=3600
       if [ "$HEARTBEAT_STATE" = "idle" ]; then
         STUCK_THRESHOLD=7200
