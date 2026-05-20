@@ -639,3 +639,76 @@ func TestBeadsGetPrefixForRig(t *testing.T) {
 		})
 	}
 }
+
+// TestBeadsCloseRoutingCrossRig verifies that Close, CloseWithReason, and
+// ForceCloseWithReason route to the correct rig database when closing a
+// cross-rig issue (e.g., closing a dc-* issue from the wa rig).
+// This is a regression test for dc-e7c2.
+func TestBeadsCloseRoutingCrossRig(t *testing.T) {
+	if _, err := exec.LookPath("bd"); err != nil {
+		t.Skip("bd not installed, skipping routing test")
+	}
+	requireDoltServer(t)
+
+	n := routingTestCounter.Add(1)
+	hqP := fmt.Sprintf("crq%d", n)
+	gtP := fmt.Sprintf("crg%d", n)
+	trP := fmt.Sprintf("crt%d", n)
+
+	townRoot := setupRoutingTestTownWithPrefixes(t, hqP, gtP, trP)
+
+	initBeadsDBWithPrefix(t, townRoot, hqP)
+	gastownRigPath := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	testrigRigPath := filepath.Join(townRoot, "testrig", "mayor", "rig")
+	initBeadsDBWithPrefix(t, gastownRigPath, gtP)
+	initBeadsDBWithPrefix(t, testrigRigPath, trP)
+
+	// Create issues in different rigs to be closed cross-rig.
+	hqIssue := createTestIssue(t, townRoot, "HQ issue for cross-rig close test")
+	gtIssue := createTestIssue(t, gastownRigPath, "Gastown issue for cross-rig close test")
+	trIssue := createTestIssue(t, testrigRigPath, "Testrig issue for cross-rig close test")
+
+	// All three close operations run from the gastown rig's Beads instance,
+	// which is pinned to gasRig/.beads. Without routing they would fail to
+	// close hqIssue (different rig) and trIssue (different rig).
+	gasBeads := beads.New(gastownRigPath)
+
+	t.Run("Close_routes_cross_rig", func(t *testing.T) {
+		if err := gasBeads.Close(hqIssue.ID); err != nil {
+			t.Fatalf("Close(%s) from gastown rig failed: %v", hqIssue.ID, err)
+		}
+		issue, err := gasBeads.Show(hqIssue.ID)
+		if err != nil {
+			t.Fatalf("Show(%s) after close failed: %v", hqIssue.ID, err)
+		}
+		if issue.Status != "closed" {
+			t.Errorf("issue %s status = %q after Close, want %q", hqIssue.ID, issue.Status, "closed")
+		}
+	})
+
+	t.Run("CloseWithReason_routes_cross_rig", func(t *testing.T) {
+		if err := gasBeads.CloseWithReason("merged", gtIssue.ID); err != nil {
+			t.Fatalf("CloseWithReason(%s) from gastown rig failed: %v", gtIssue.ID, err)
+		}
+		issue, err := gasBeads.Show(gtIssue.ID)
+		if err != nil {
+			t.Fatalf("Show(%s) after CloseWithReason failed: %v", gtIssue.ID, err)
+		}
+		if issue.Status != "closed" {
+			t.Errorf("issue %s status = %q after CloseWithReason, want %q", gtIssue.ID, issue.Status, "closed")
+		}
+	})
+
+	t.Run("ForceCloseWithReason_routes_cross_rig", func(t *testing.T) {
+		if err := gasBeads.ForceCloseWithReason("merged: dc-e7c2 regression test", trIssue.ID); err != nil {
+			t.Fatalf("ForceCloseWithReason(%s) from gastown rig failed: %v", trIssue.ID, err)
+		}
+		issue, err := gasBeads.Show(trIssue.ID)
+		if err != nil {
+			t.Fatalf("Show(%s) after ForceCloseWithReason failed: %v", trIssue.ID, err)
+		}
+		if issue.Status != "closed" {
+			t.Errorf("issue %s status = %q after ForceCloseWithReason, want %q", trIssue.ID, issue.Status, "closed")
+		}
+	})
+}

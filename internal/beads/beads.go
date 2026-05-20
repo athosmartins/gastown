@@ -341,6 +341,12 @@ type Beads struct {
 	// Populated on first call to getTownRoot() to avoid filesystem walk on every operation.
 	townRoot     string
 	townRootOnce sync.Once
+
+	// noRoute disables prefix-based routing for this Beads instance.
+	// Forward-port stub from steveyegge/gastown@42548305 (ForAgentBead).
+	// Read by dc-e7c2 routing helpers; never set in fork/main until the full
+	// ForAgentBead constructor is ported. Zero value preserves prior routing.
+	noRoute bool
 }
 
 // New creates a new Beads wrapper for the given directory.
@@ -1548,6 +1554,15 @@ func (b *Beads) Close(ids ...string) error {
 		return nil
 	}
 
+	// Route single cross-rig ID to the correct rig database (mirrors Show routing).
+	if !b.noRoute && len(ids) == 1 {
+		targetDir := ResolveRoutingTarget(b.getTownRoot(), ids[0], b.getResolvedBeadsDir())
+		if targetDir != b.getResolvedBeadsDir() {
+			target := NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+			return target.Close(ids...)
+		}
+	}
+
 	if b.store != nil {
 		return b.storeClose("", runtime.SessionIDFromEnv(), ids...)
 	}
@@ -1569,6 +1584,15 @@ func (b *Beads) Close(ids ...string) error {
 func (b *Beads) CloseWithReason(reason string, ids ...string) error {
 	if len(ids) == 0 {
 		return nil
+	}
+
+	// Route single cross-rig ID to the correct rig database (mirrors Show routing).
+	if !b.noRoute && len(ids) == 1 {
+		targetDir := ResolveRoutingTarget(b.getTownRoot(), ids[0], b.getResolvedBeadsDir())
+		if targetDir != b.getResolvedBeadsDir() {
+			target := NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+			return target.CloseWithReason(reason, ids...)
+		}
 	}
 
 	if b.store != nil {
@@ -1593,6 +1617,17 @@ func (b *Beads) CloseWithReason(reason string, ids ...string) error {
 func (b *Beads) ForceCloseWithReason(reason string, ids ...string) error {
 	if len(ids) == 0 {
 		return nil
+	}
+
+	// Route single cross-rig ID to the correct rig database (mirrors Show routing).
+	// Without this, closing e.g. a dc-* source issue from the wa rig would silently
+	// fail because b.run() pins BEADS_DIR to the local rig's database.
+	if !b.noRoute && len(ids) == 1 {
+		targetDir := ResolveRoutingTarget(b.getTownRoot(), ids[0], b.getResolvedBeadsDir())
+		if targetDir != b.getResolvedBeadsDir() {
+			target := NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+			return target.ForceCloseWithReason(reason, ids...)
+		}
 	}
 
 	// In-process store close doesn't enforce dependency checks (no --force
