@@ -515,6 +515,7 @@ type ProcessResult struct {
 	BranchNotFound bool // Source branch no longer exists (e.g. cleaned up after cherry-pick)
 	NoMerge        bool // Source issue has no_merge flag — intentionally blocked, not a failure
 	NeedsApproval  bool // PR exists but lacks required approving review (merge_strategy=pr)
+	AlreadyMerged  bool // Branch commit already in target branch
 }
 
 // doMerge performs the actual git merge operation.
@@ -561,6 +562,25 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	if err := e.git.Pull("origin", target); err != nil {
 		// Pull might fail if nothing to pull, that's ok
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: pull from origin/%s: %v (continuing)\n", target, err)
+	}
+
+	// Step 2.5: Check if branch is already merged into target
+	branchSHA, err := e.git.Rev(branch)
+	if err == nil {
+		targetSHA, err := e.git.Rev(target)
+		if err == nil {
+			// Check if branch commit is already in target's history
+			isMerged, _ := e.git.IsAncestor(branchSHA, targetSHA)
+			if isMerged {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Branch %s already merged into %s (commit %s)\n", branch, target, shortSHA(branchSHA))
+				return ProcessResult{
+					Success:       true,
+					AlreadyMerged: true,
+					MergeCommit:   targetSHA,
+					Error:         fmt.Sprintf("branch name already merged — resubmit with a new bead/branch"),
+				}
+			}
+		}
 	}
 
 	// Step 3: Check for merge conflicts (using local branch)
@@ -1212,7 +1232,11 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 				mrFields = &beads.MRFields{}
 			}
 			mrFields.MergeCommit = result.MergeCommit
-			mrFields.CloseReason = "merged"
+			if result.AlreadyMerged {
+				mrFields.CloseReason = "branch name already merged — resubmit with a new bead/branch"
+			} else {
+				mrFields.CloseReason = "merged"
+			}
 			newDesc := beads.SetMRFields(mrBead, mrFields)
 			if err := e.beads.Update(mr.ID, beads.UpdateOptions{Description: &newDesc}); err != nil {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to update MR %s with merge commit: %v\n", mr.ID, err)
@@ -1232,9 +1256,14 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 	// may have an attached molecule (wisp) whose open steps would block a
 	// normal close. This matches how gt done handles closures.
 	if mr.SourceIssue != "" {
-		closeReason := fmt.Sprintf("Merged in %s", mr.ID)
-		if result.MergeCommit != "" {
-			closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.Target, result.MergeCommit)
+		var closeReason string
+		if result.AlreadyMerged {
+			closeReason = fmt.Sprintf("branch name already merged — resubmit with a new bead/branch\ntarget_branch: %s\ncommit_sha: %s", mr.Target, result.MergeCommit)
+		} else {
+			closeReason = fmt.Sprintf("Merged in %s", mr.ID)
+			if result.MergeCommit != "" {
+				closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.Target, result.MergeCommit)
+			}
 		}
 		if err := e.beads.ForceCloseWithReason(closeReason, mr.SourceIssue); err != nil {
 			// Check if already closed (by polecat's gt done) — that's fine
