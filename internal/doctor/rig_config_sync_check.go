@@ -86,6 +86,10 @@ func (c *RigConfigSyncCheck) Run(ctx *CheckContext) *CheckResult {
 	c.dbCheckErrors = nil
 	var details []string
 
+	// A rig pointing to the town-wide beads DB is a valid configuration after
+	// migration (e.g. deacon migrated to HQ storage). Read town DB name once.
+	townDB := readDoltDatabase(filepath.Join(ctx.TownRoot, ".beads"))
+
 	for rigName, entry := range rigsConfig.Rigs {
 		rigPath := filepath.Join(ctx.TownRoot, rigName)
 		configPath := filepath.Join(rigPath, "config.json")
@@ -189,8 +193,9 @@ func (c *RigConfigSyncCheck) Run(ctx *CheckContext) *CheckResult {
 			expectedDBName := rigName
 
 			if expectedDBName != "" {
-				// Check if database name matches the rig directory name
-				if metadata.DoltDatabase != expectedDBName {
+				// Check if database name matches the rig directory name OR the town
+				// beads DB. rig.db == town.db is valid after HQ storage migration.
+				if metadata.DoltDatabase != expectedDBName && (townDB == "" || metadata.DoltDatabase != townDB) {
 					c.dbNameMismatches = append(c.dbNameMismatches, dbMismatch{
 						rigName:    rigName,
 						prefix:     configPrefix,
