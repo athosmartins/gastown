@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/migration"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -77,6 +78,7 @@ var beadsExemptCommands = map[string]bool{
 	"health":        true, // Health check doesn't require beads
 	"upgrade":       true, // Post-install migration orchestrator
 	"heartbeat":     true, // Heartbeat state update — must be fast and dependency-free
+	"migrate":       true, // gt migrate freeze/thaw — must work when dolt is paused
 }
 
 // Commands exempt from the town root branch warning.
@@ -93,6 +95,7 @@ var branchCheckExemptCommands = map[string]bool{
 	"git-init":    true, // Git setup
 	"upgrade":     true, // Post-install migration
 	"scheduler":   true, // Daemon hot path; scheduler handles beads internally
+	"migrate":     true, // freeze/thaw must work from any branch
 }
 
 // persistentPreRun runs before every command.
@@ -146,6 +149,28 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 	// is alive and actively running gt commands. Used by isSessionProcessDead to
 	// determine liveness without PID signal probing.
 	touchPolecatHeartbeat()
+
+	// Migration freeze gate: refuse blocked write commands when the town has
+	// a MIGRATION-FREEZE sentinel. Read commands and services-management
+	// commands continue to work so the operator can diagnose and recover.
+	if isFreezeBlocked(cmd) {
+		if townRoot := detectTownRootFromCwd(); townRoot != "" && migration.IsFrozen(townRoot) {
+			info := migration.Read(townRoot)
+			operator := "unknown"
+			reason := ""
+			if info != nil {
+				operator = info.Operator
+				reason = info.Reason
+			}
+			fmt.Fprintf(os.Stderr, "%s town is frozen for migration (by %s).\n",
+				style.Bold.Render("⛔ ERROR:"), operator)
+			if reason != "" {
+				fmt.Fprintf(os.Stderr, "   Reason: %s\n", reason)
+			}
+			fmt.Fprintf(os.Stderr, "   Clear the freeze: %s\n", style.Bold.Render("gt migrate thaw"))
+			os.Exit(1)
+		}
+	}
 
 	// Skip beads check for exempt commands
 	if beadsExempt || isRoleCommand(cmd) {
