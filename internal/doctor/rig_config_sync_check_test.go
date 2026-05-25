@@ -3,6 +3,7 @@ package doctor
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -298,5 +299,80 @@ func TestStaleRuntimeFilesCheck_Fix(t *testing.T) {
 	result = check.Run(ctx)
 	if result.Status != StatusOK {
 		t.Errorf("expected StatusOK after fix, got %v", result.Status)
+	}
+}
+
+func TestRigConfigSyncCheck_RigPointingToTownDBIsValid(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake dolt stub is shell-specific")
+	}
+
+	tmpDir := t.TempDir()
+	mayorDir := filepath.Join(tmpDir, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	rigsJSON := `{
+		"version": 1,
+		"rigs": {
+			"deacon": {
+				"git_url": "https://github.com/test/test.git",
+				"beads": {"prefix": "dc"}
+			}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Town-level .beads/metadata.json points to "hq".
+	townBeadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(townBeadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	townMeta := `{"backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`
+	if err := os.WriteFile(filepath.Join(townBeadsDir, "metadata.json"), []byte(townMeta), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deacon rig points to "hq" (the town DB) — legitimate after HQ migration.
+	deaconDir := filepath.Join(tmpDir, "deacon")
+	beadsDir := filepath.Join(deaconDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	configJSON := `{"type":"rig","version":1,"name":"deacon","git_url":"https://github.com/test/test.git","beads":{"prefix":"dc"}}`
+	if err := os.WriteFile(filepath.Join(deaconDir, "config.json"), []byte(configJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("prefix: dc\nissue-prefix: dc\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	deaconMeta := `{"backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(deaconMeta), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fake dolt reports "hq" exists.
+	binDir := t.TempDir()
+	fakeScript := "#!/usr/bin/env bash\necho '{\"databases\":[{\"name\":\"hq\"}]}'\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(binDir, "dolt"), []byte(fakeScript), 0755); err != nil {
+		t.Fatalf("write fake dolt: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GT_DOLT_HOST", "127.0.0.1")
+
+	ctx := &CheckContext{TownRoot: tmpDir}
+	check := NewRigConfigSyncCheck()
+	result := check.Run(ctx)
+
+	if len(check.dbNameMismatches) != 0 {
+		t.Errorf("expected no dbNameMismatches when rig.db == town.db, got: %v", check.dbNameMismatches)
+	}
+	// Strengthened assertion (per review feedback): the check must return
+	// StatusOK, not merely have an empty mismatches slice. This proves the
+	// warning is fully suppressed end-to-end.
+	if result.Status != StatusOK {
+		t.Errorf("expected StatusOK when rig.db == town.db, got %v (message: %s)", result.Status, result.Message)
 	}
 }
