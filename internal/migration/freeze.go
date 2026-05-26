@@ -4,16 +4,29 @@
 // dolt state — agents are free to keep thinking, reading, and using non-gt
 // tools.
 //
+// TOCTOU note: the freeze check in persistentPreRun and the actual Dolt write
+// are seconds apart. If an operator thaws mid-command, the write proceeds. And
+// long-running commands already in flight when freeze is set are unaffected —
+// the gate only fires at command entry. This is acceptable for migration ops
+// where the operator controls the window.
+//
 // See ~/gt/docs/guides/dolt-migration-playbook.md for the operator workflow.
 package migration
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// ErrMigrationFrozen is returned by persistentPreRun when a migration freeze
+// blocks the requested command. The error message is already printed to stderr
+// before this error is returned, so callers should exit without printing it.
+var ErrMigrationFrozen = errors.New("migration freeze active")
 
 // FileName is the freeze sentinel placed at the town root.
 const FileName = "MIGRATION-FREEZE"
@@ -23,6 +36,7 @@ type Info struct {
 	Operator  string    // who initiated the freeze (e.g. "mayor", a username)
 	Reason    string    // human-readable migration reason
 	Timestamp time.Time // when the freeze was set
+	PID       int       // operator process PID; 0 if not recorded or process gone
 }
 
 // FilePath returns the full path to the freeze sentinel file.
