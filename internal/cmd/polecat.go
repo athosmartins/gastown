@@ -1242,7 +1242,7 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 			fmt.Printf("Nuking %s/%s...\n", p.rigName, p.polecatName)
 		}
 
-		if err := nukePolecatFull(p.polecatName, p.rigName, p.mgr, p.r); err != nil {
+		if err := nukePolecatFull(p.polecatName, p.rigName, p.mgr, p.r, polecatNukeForce); err != nil {
 			nukeErrors = append(nukeErrors, fmt.Sprintf("%s/%s: %v", p.rigName, p.polecatName, err))
 			continue
 		}
@@ -1286,10 +1286,12 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 // 3. Delete git branch
 // 4. Close agent bead
 // This is the canonical cleanup path used by both `polecat nuke` and `polecat stale --cleanup`.
-func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.Rig) error {
+func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.Rig, force bool) error {
 	t := tmux.NewTmux()
-	if state, err := mgr.EvaluateWorkState(polecatName); err == nil && state.ActiveMR != "" && !state.SafeToNuke {
-		return fmt.Errorf("cannot nuke %s/%s: active MR %s is not terminal (verdict=%s, reason=%s)", rigName, polecatName, state.ActiveMR, state.Verdict, state.Reason)
+	if !force {
+		if state, err := mgr.EvaluateWorkState(polecatName); err == nil && state.ActiveMR != "" && !state.SafeToNuke {
+			return fmt.Errorf("cannot nuke %s/%s: active MR %s is not terminal (verdict=%s, reason=%s)", rigName, polecatName, state.ActiveMR, state.Verdict, state.Reason)
+		}
 	}
 
 	// Step 1: Kill tmux session unconditionally to prevent ghost sessions
@@ -1592,7 +1594,7 @@ func runPolecatStale(cmd *cobra.Command, args []string) error {
 					continue
 				}
 				fmt.Printf("Nuking %s...\n", info.Name)
-				if err := nukePolecatFull(info.Name, rigName, mgr, r); err != nil {
+				if err := nukePolecatFull(info.Name, rigName, mgr, r, false /* force */); err != nil {
 					fmt.Printf("  %s (%v)\n", style.Error.Render("failed"), err)
 				} else {
 					nuked++
