@@ -1627,6 +1627,15 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			return r.tmux.SendNotificationBanner(sessionID, msg.From, msg.Subject)
 		}
 
+		// Routine overseer notifications (convoy complete, etc.) must not reach
+		// agent sessions via tmux send-keys — they appear as typed text between
+		// turns, disrupting both the AI and the human watching the terminal.
+		// Use banner delivery (echo-only, no Claude input injection) instead.
+		// See: gt-ini3q
+		if msg.From == "overseer" && isRoutineOverseerNotification(msg.Subject) {
+			return r.tmux.SendNotificationBanner(sessionID, msg.From, msg.Subject)
+		}
+
 		notification := formatNotificationMessage(msg)
 		priority := nudgePriorityForMailPriority(msg.Priority)
 
@@ -1704,6 +1713,23 @@ func nudgePriorityForMailPriority(priority Priority) string {
 	default:
 		return nudge.PriorityNormal
 	}
+}
+
+// isRoutineOverseerNotification reports whether an overseer message subject
+// matches a high-volume pattern that should use banner delivery instead of
+// tmux send-keys to avoid injecting text into agent Claude sessions (gt-ini3q).
+func isRoutineOverseerNotification(subject string) bool {
+	lower := strings.ToLower(subject)
+	routinePatterns := []string{
+		"convoy complete",
+		"convoy completed",
+	}
+	for _, p := range routinePatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func formatNotificationMessage(msg *Message) string {
