@@ -86,6 +86,10 @@ func runMigrateFreeze(cmd *cobra.Command, args []string) error {
 
 	if migration.IsFrozen(townRoot) {
 		info := migration.Read(townRoot)
+		if info == nil {
+			fmt.Printf("%s freeze already active\n", style.Warning.Render("!"))
+			return nil
+		}
 		fmt.Printf("%s freeze already active (by %s at %s)\n",
 			style.Warning.Render("!"),
 			info.Operator,
@@ -196,7 +200,6 @@ func runMigrateStatus(cmd *cobra.Command, args []string) error {
 //   - migrate thaw / migrate status — always exempt (parent "migrate" is
 //     listed in beadsExemptCommands and branchCheckExemptCommands)
 //   - estop — freezes tmux sessions, no Dolt writes
-//   - git-level commands (gt commit wraps git; no beads write on its own)
 var freezeBlockedCommands = map[string]bool{
 	// Communication — write beads or send tmux messages that create stranded state
 	"mail send": true,
