@@ -2,12 +2,14 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/migration"
 )
 
 func TestCheckHelpFlag(t *testing.T) {
@@ -246,5 +248,87 @@ func TestPersistentPreRunMalformedAgentRegistry(t *testing.T) {
 	got := config.GetProcessNames("claude")
 	if len(got) < 2 || got[0] != "node" || got[1] != "claude" {
 		t.Fatalf("GetProcessNames(claude) after malformed registry = %v, want builtin [node claude ...]", got)
+	}
+}
+
+// makeFreezeTestTownRoot creates a minimal Gas Town root, cds into it, and
+// registers cleanup to restore the original directory. It also sets
+// BuiltProperly so persistentPreRun doesn't os.Exit on macOS dev builds.
+func makeFreezeTestTownRoot(t *testing.T) string {
+	t.Helper()
+	// persistentPreRun calls os.Exit(1) on macOS when BuiltProperly == "".
+	orig := BuiltProperly
+	BuiltProperly = "1"
+	t.Cleanup(func() { BuiltProperly = orig })
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "mayor", "town.json"), []byte("{}"), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	origDir, _ := os.Getwd()
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origDir) })
+	return root
+}
+
+func TestFreezeGate_BlockedCommandReturnsErrMigrationFrozen(t *testing.T) {
+	// A blocked command (nudge) must return ErrMigrationFrozen when frozen.
+	// NOTE: cannot use t.Parallel() — mutates cwd.
+	root := makeFreezeTestTownRoot(t)
+
+	if err := migration.Freeze(root, "operator", "test"); err != nil {
+		t.Fatalf("Freeze: %v", err)
+	}
+
+	cmd := &cobra.Command{Use: "nudge"}
+	rootCmd.AddCommand(cmd)
+	t.Cleanup(func() { rootCmd.RemoveCommand(cmd) })
+
+	err := persistentPreRun(cmd, nil)
+	if err == nil {
+		t.Fatal("expected error from persistentPreRun when frozen, got nil")
+	}
+	if !errors.Is(err, migration.ErrMigrationFrozen) {
+		t.Errorf("persistentPreRun returned %v, want ErrMigrationFrozen", err)
+	}
+}
+
+func TestFreezeGate_ThawCommandBypassesFreezeGate(t *testing.T) {
+	// 'gt migrate thaw' must bypass the freeze gate (so operators can clear it).
+	// NOTE: cannot use t.Parallel() — mutates cwd.
+	root := makeFreezeTestTownRoot(t)
+
+	if err := migration.Freeze(root, "operator", "test"); err != nil {
+		t.Fatalf("Freeze: %v", err)
+	}
+
+	// The thaw command is a child of migrateCmd which is exempt from the gate.
+	err := persistentPreRun(migrateThawCmd, nil)
+	if errors.Is(err, migration.ErrMigrationFrozen) {
+		t.Error("persistentPreRun for 'migrate thaw' returned ErrMigrationFrozen — thaw must bypass freeze gate")
+	}
+}
+
+func TestFreezeGate_NonBlockedCommandPassesThrough(t *testing.T) {
+	// A non-blocked command (e.g. 'status') must not be affected by the freeze.
+	// NOTE: cannot use t.Parallel() — mutates cwd.
+	root := makeFreezeTestTownRoot(t)
+
+	if err := migration.Freeze(root, "operator", "test"); err != nil {
+		t.Fatalf("Freeze: %v", err)
+	}
+
+	cmd := &cobra.Command{Use: "status"}
+	rootCmd.AddCommand(cmd)
+	t.Cleanup(func() { rootCmd.RemoveCommand(cmd) })
+
+	err := persistentPreRun(cmd, nil)
+	if errors.Is(err, migration.ErrMigrationFrozen) {
+		t.Errorf("persistentPreRun for non-blocked command 'status' returned ErrMigrationFrozen unexpectedly")
 	}
 }
