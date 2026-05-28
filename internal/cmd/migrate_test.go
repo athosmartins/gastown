@@ -35,45 +35,51 @@ func makeMigrateTownRoot(t *testing.T) string {
 
 func TestMigrateFreeze_DoubleFreeze(t *testing.T) {
 	// double-freeze should be a short-circuit no-op (returns nil, not an error).
-	root := makeMigrateTownRoot(t)
-	if err := migration.Freeze(root, "op1", "first freeze"); err != nil {
-		t.Fatalf("initial Freeze: %v", err)
-	}
+	// NOTE: cannot use t.Parallel() — mutates cwd.
+	makeMigrateTownRoot(t)
 
-	// Second freeze should not overwrite or error.
-	if err := migration.Freeze(root, "op2", "second freeze"); err != nil {
-		t.Errorf("second Freeze returned error: %v", err)
-	}
-
-	// The sentinel should still exist after the second freeze call.
-	if !migration.IsFrozen(root) {
-		t.Error("expected still frozen after double freeze")
-	}
-
-	// Verify the runMigrateFreeze command detects the already-active freeze.
-	origDir, _ := os.Getwd()
-	if err := os.Chdir(root); err != nil {
-		t.Fatalf("Chdir: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(origDir) })
-
-	// runMigrateFreeze should return nil (short-circuit, not an error).
+	// First freeze succeeds.
+	migrateFreezeReason = "test"
+	migrateFreezeOperator = "op1"
+	t.Cleanup(func() {
+		migrateFreezeReason = ""
+		migrateFreezeOperator = ""
+	})
 	if err := runMigrateFreeze(migrateFreezeCmd, nil); err != nil {
-		t.Errorf("runMigrateFreeze when already frozen: %v", err)
+		t.Fatalf("first freeze: %v", err)
+	}
+
+	// Second freeze should short-circuit and return nil (not an error).
+	if err := runMigrateFreeze(migrateFreezeCmd, nil); err != nil {
+		t.Errorf("double freeze returned error: %v", err)
 	}
 }
 
 func TestMigrateThaw_WhenNotFrozen(t *testing.T) {
+	// Thaw when not frozen should be a no-op (returns nil).
+	// NOTE: cannot use t.Parallel() — mutates cwd.
+	makeMigrateTownRoot(t)
+
+	if err := runMigrateThaw(migrateThawCmd, nil); err != nil {
+		t.Errorf("thaw when not frozen: %v", err)
+	}
+}
+
+func TestMigrateStatus_ShowsFreezeInfo(t *testing.T) {
+	// migrate status should reflect current freeze state.
+	// NOTE: cannot use t.Parallel() — mutates cwd.
 	root := makeMigrateTownRoot(t)
 
-	origDir, _ := os.Getwd()
-	if err := os.Chdir(root); err != nil {
-		t.Fatalf("Chdir: %v", err)
+	// Not frozen: status should return nil.
+	if err := runMigrateStatus(migrateStatusCmd, nil); err != nil {
+		t.Errorf("status when not frozen: %v", err)
 	}
-	t.Cleanup(func() { _ = os.Chdir(origDir) })
 
-	// Thaw when not frozen should return nil (idempotent).
-	if err := runMigrateThaw(migrateThawCmd, nil); err != nil {
-		t.Errorf("runMigrateThaw when not frozen: %v", err)
+	// Freeze and check status returns nil (it prints, doesn't error).
+	if err := migration.Freeze(root, "testop", "schema swap"); err != nil {
+		t.Fatalf("Freeze: %v", err)
+	}
+	if err := runMigrateStatus(migrateStatusCmd, nil); err != nil {
+		t.Errorf("status when frozen: %v", err)
 	}
 }

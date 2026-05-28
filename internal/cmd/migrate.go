@@ -98,10 +98,19 @@ func runMigrateFreeze(cmd *cobra.Command, args []string) error {
 
 	operator := migrateFreezeOperator
 	if operator == "" {
+		// Prefer BD_ACTOR (Gas Town convention) then $USER.
+		operator = os.Getenv("BD_ACTOR")
+	}
+	if operator == "" {
 		operator = os.Getenv("USER")
 	}
 	if operator == "" {
 		operator = "unknown"
+	}
+
+	if migrateFreezeReason == "" {
+		fmt.Fprintf(os.Stderr, "%s no --reason given; empty reasons make post-mortems harder.\n",
+			style.Warning.Render("!"))
 	}
 
 	if err := migration.Freeze(townRoot, operator, migrateFreezeReason); err != nil {
@@ -152,15 +161,23 @@ func runMigrateStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	info := migration.Read(townRoot)
-	fmt.Printf("%s Migration freeze ACTIVE\n", style.Error.Render("⛔"))
+	staleNote := ""
+	if info.IsStale() {
+		staleNote = style.Warning.Render(" [stale — operator process gone]")
+	}
+	fmt.Printf("%s Migration freeze ACTIVE%s\n", style.Error.Render("⛔"), staleNote)
 	fmt.Printf("  Operator:  %s\n", info.Operator)
 	fmt.Printf("  Since:     %s\n", info.Timestamp.Local().Format("2006-01-02 15:04:05"))
+	if info.PID != 0 {
+		fmt.Printf("  PID:       %d\n", info.PID)
+	}
 	if info.Reason != "" {
 		fmt.Printf("  Reason:    %s\n", info.Reason)
 	}
 	fmt.Printf("  Sentinel:  %s\n", migration.FilePath(townRoot))
 	fmt.Println()
 	fmt.Printf("  Clear with: %s\n", style.Bold.Render("gt migrate thaw"))
+	fmt.Printf("  Note: bd CLI is NOT gated — also unload writer plists per the playbook.\n")
 	return nil
 }
 
