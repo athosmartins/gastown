@@ -587,7 +587,9 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// If criteria exist and are unchecked, warn and skip close — the bead stays
 				// open for witness/mayor to handle.
 				skipClose := false
+				var currentBeadStatus string
 				if issue, err := bd.Show(issueID); err == nil {
+					currentBeadStatus = string(issue.Status)
 					if unchecked := beads.HasUncheckedCriteria(issue); unchecked > 0 {
 						style.PrintWarning("issue %s has %d unchecked acceptance criteria — skipping close", issueID, unchecked)
 						fmt.Printf("  The bead will remain open for witness/mayor review.\n")
@@ -603,7 +605,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						if noMRCommitSHA != "" {
 							closeReason = fmt.Sprintf("%s\nskip_verify: true\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)
 						}
-					} else if !isNoMergeTask {
+					} else if !isNoMergeTask && !shouldSkipNoMRVerify(os.Getenv("GT_POLECAT") != "", currentBeadStatus) {
 						if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
 							noteVerifiedPushFailure(cwd, issueID, defaultBranch, noMRCommitSHA, verifyErr)
 							return fmt.Errorf("cannot close no-MR code bead: %w", verifyErr)
@@ -1496,6 +1498,16 @@ func noteVerifiedPushSkipped(cwd, issueID, branch, commit, reason string) {
 	}
 	msg := fmt.Sprintf("verified_push_skipped: commit %s branch origin/%s reason=%s", commit, branch, reason)
 	_, _ = beads.New(cwd).Run("comments", "add", issueID, msg)
+}
+
+// shouldSkipNoMRVerify returns true when a no-code polecat completing a diagnosis
+// or investigation bead should bypass VerifyPushedCommit in the no-MR close path.
+// The check requires origin/<target> tip to exactly match the polecat's HEAD, which
+// never holds when origin/main has advanced since the polecat branch was created.
+// Polecats with already-closed beads pushed nothing to main — there is nothing to
+// verify. (wa-skj Class 2 fix)
+func shouldSkipNoMRVerify(isPolecat bool, beadStatus string) bool {
+	return isPolecat && beadStatus == "closed"
 }
 
 func verifyPushedCommitWithBareFallback(g *git.Git, townRoot, rigName, branch, commit string) error {

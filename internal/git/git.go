@@ -534,6 +534,18 @@ func (g *Git) FetchBranchShallow(remote, branch string) error {
 	return err
 }
 
+// FetchBranchLocal fetches a branch from remote and creates or updates the
+// local refs/heads/<branch> ref. Unlike FetchBranch (which only updates the
+// remote-tracking ref), this makes the branch visible to BranchExists and
+// mergeable directly. Used by the refinery before BranchExists to close the
+// race where a crew member's push reached origin but the local bare repo
+// hasn't fetched yet. (wa-skj Class 1 fix)
+func (g *Git) FetchBranchLocal(remote, branch string) error {
+	refspec := "refs/heads/" + branch + ":refs/heads/" + branch
+	_, err := g.run("fetch", remote, refspec)
+	return err
+}
+
 // Pull pulls from the remote branch.
 func (g *Git) Pull(remote, branch string) error {
 	_, err := g.run("pull", remote, branch)

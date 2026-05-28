@@ -117,6 +117,12 @@ func (e *Engineer) BuildRebaseStack(ctx context.Context, batch []*MRInfo, target
 	for _, mr := range batch {
 		_, _ = fmt.Fprintf(e.output, "[Batch] Stacking MR %s (branch %s)...\n", mr.ID, mr.Branch)
 
+		// wa-skj Class 1 fix (b): fetch branch from origin before the local
+		// existence check. Crew branches are pushed from separate clones to
+		// origin and may not yet be in the refinery's shared .repo.git.
+		if fetchErr := e.git.FetchBranchLocal("origin", mr.Branch); fetchErr != nil {
+			_, _ = fmt.Fprintf(e.output, "[Batch] Warning: could not fetch origin/%s: %v\n", mr.Branch, fetchErr)
+		}
 		// Check branch exists
 		exists, brErr := e.git.BranchExists(mr.Branch)
 		if brErr != nil || !exists {

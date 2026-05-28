@@ -1611,3 +1611,58 @@ func testRunGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
+// TestShouldSkipNoMRVerify covers the Option A condition introduced for wa-skj:
+// no-code polecats whose bead was already closed should bypass VerifyPushedCommit
+// in the no-MR close path. The check is meaningless there because the polecat
+// never pushed anything to main — calling VerifyPushedCommit("origin","main",HEAD)
+// always fails when origin/main has advanced past the polecat's branch HEAD.
+func TestShouldSkipNoMRVerify(t *testing.T) {
+	tests := []struct {
+		name        string
+		isPolecat   bool
+		beadStatus  string
+		wantSkip    bool
+	}{
+		{
+			name:       "polecat with closed bead — skip verify",
+			isPolecat:  true,
+			beadStatus: "closed",
+			wantSkip:   true,
+		},
+		{
+			name:       "polecat with open bead — run verify",
+			isPolecat:  true,
+			beadStatus: "open",
+			wantSkip:   false,
+		},
+		{
+			name:       "crew (non-polecat) with closed bead — run verify",
+			isPolecat:  false,
+			beadStatus: "closed",
+			wantSkip:   false,
+		},
+		{
+			name:       "crew with open bead — run verify",
+			isPolecat:  false,
+			beadStatus: "open",
+			wantSkip:   false,
+		},
+		{
+			name:       "polecat with in_progress bead — run verify",
+			isPolecat:  true,
+			beadStatus: "in_progress",
+			wantSkip:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldSkipNoMRVerify(tt.isPolecat, tt.beadStatus)
+			if got != tt.wantSkip {
+				t.Errorf("shouldSkipNoMRVerify(isPolecat=%v, beadStatus=%q) = %v, want %v",
+					tt.isPolecat, tt.beadStatus, got, tt.wantSkip)
+			}
+		})
+	}
+}
+

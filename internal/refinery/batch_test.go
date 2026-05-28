@@ -862,6 +862,55 @@ func TestProcessBatch_SingleMR_BranchNotFound(t *testing.T) {
 	}
 }
 
+// TestProcessBatch_BranchOnOriginButNotLocal ensures that when a branch exists
+// on origin (crew pushed from a separate clone) but is NOT yet in the refinery's
+// local .repo.git, ProcessBatch fetches it and succeeds. This is the wa-skj
+// Class 1 gap (b): without a fetch before BranchExists, refinery escalates even
+// though the branch is available on origin.
+func TestProcessBatch_BranchOnOriginButNotLocal(t *testing.T) {
+	workDir, g, cleanup := testGitRepo(t)
+	defer cleanup()
+
+	// Allow local file:// protocol for fetch operations in the code under test.
+	// The test's run() helper adds -c protocol.file.allow=always for setup
+	// commands, but code under test runs git directly without that flag.
+	run(t, workDir, "git", "config", "protocol.file.allow", "always")
+
+	// Simulate a crew member pushing a branch from a separate clone.
+	// The branch lands on origin but is NOT in the refinery's local workDir.
+	originURL := run(t, workDir, "git", "remote", "get-url", "origin")
+	crewClone := t.TempDir()
+	run(t, t.TempDir(), "git", "clone", originURL, crewClone)
+	run(t, crewClone, "git", "config", "user.email", "crew@test.com")
+	run(t, crewClone, "git", "config", "user.name", "Crew")
+	run(t, crewClone, "git", "checkout", "-b", "crew/digo/dc-race")
+	writeFile(t, crewClone, "feature.txt", "crew work\n")
+	run(t, crewClone, "git", "add", ".")
+	run(t, crewClone, "git", "commit", "-m", "crew feature")
+	run(t, crewClone, "git", "push", "origin", "crew/digo/dc-race")
+
+	// Confirm the branch is NOT in the refinery's local workDir.
+	g2 := gitpkg.NewGit(workDir)
+	exists, _ := g2.BranchExists("crew/digo/dc-race")
+	if exists {
+		t.Fatal("precondition failed: branch should not exist locally in refinery workDir")
+	}
+
+	e := newTestEngineer(t, workDir, g)
+	batch := []*MRInfo{makeMR("mr-crew-race", "crew/digo/dc-race", "main")}
+
+	result := e.ProcessBatch(context.Background(), batch, "main", DefaultBatchConfig())
+	if result.Error != nil {
+		t.Fatalf("unexpected fatal error: %v", result.Error)
+	}
+	// Without Option D (fetch before BranchExists), this MR ends up in Conflicts
+	// because BranchExists returns false. With Option D it should be Merged.
+	if len(result.Merged) != 1 {
+		t.Errorf("expected 1 merged MR (branch fetched from origin), got merged=%v conflicts=%v",
+			stackedIDs(result.Merged), stackedIDs(result.Conflicts))
+	}
+}
+
 // --- Helpers ---
 
 func stackedIDs(mrs []*MRInfo) []string {

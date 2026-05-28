@@ -532,7 +532,12 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 		}
 	}
 
-	// Step 1: Verify source branch exists locally (shared .repo.git with polecats)
+	// Step 1: Verify source branch exists locally (shared .repo.git with polecats).
+	// wa-skj Class 1 fix (b): fetch from origin first so crew branches pushed from
+	// separate clones are visible before the local check.
+	if fetchErr := e.git.FetchBranchLocal("origin", branch); fetchErr != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not fetch origin/%s: %v\n", branch, fetchErr)
+	}
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Checking local branch %s...\n", branch)
 	exists, err := e.git.BranchExists(branch)
 	if err != nil {
