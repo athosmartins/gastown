@@ -3,6 +3,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -168,7 +169,7 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 				fmt.Fprintf(os.Stderr, "   Reason: %s\n", reason)
 			}
 			fmt.Fprintf(os.Stderr, "   Clear the freeze: %s\n", style.Bold.Render("gt migrate thaw"))
-			os.Exit(1)
+			return migration.ErrMigrationFrozen
 		}
 	}
 
@@ -343,12 +344,19 @@ func Execute() int {
 		telemetry.SetProcessOTELAttrs()
 	}
 
+	// Suppress cobra's "Error: ..." printing for errors we already formatted.
+	rootCmd.SilenceErrors = true
 	if err := rootCmd.Execute(); err != nil {
 		// Check for silent exit (scripting commands that signal status via exit code)
 		if code, ok := IsSilentExit(err); ok {
 			return code
 		}
-		// Other errors already printed by cobra
+		// Migration freeze: detailed message already printed in persistentPreRun.
+		if errors.Is(err, migration.ErrMigrationFrozen) {
+			return 1
+		}
+		// All other errors: print them (cobra would have done this without SilenceErrors).
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
 	return 0

@@ -169,11 +169,36 @@ func runMigrateStatus(cmd *cobra.Command, args []string) error {
 // blocks) rather than blocking everything by default — read commands and
 // services-management commands must continue to work mid-migration so the
 // operator can diagnose and recover.
+//
+// Inclusion criteria: any top-level gt command that writes a Dolt commit
+// (creates/updates/closes beads, sends mail, hooks/unhooks work, or emits
+// feed events). Commands that only read beads or manage local state (git,
+// tmux, config) are excluded.
+//
+// Exclusions intentionally not in this list:
+//   - migrate thaw / migrate status — always exempt (parent "migrate" is
+//     listed in beadsExemptCommands and branchCheckExemptCommands)
+//   - estop — freezes tmux sessions, no Dolt writes
+//   - git-level commands (gt commit wraps git; no beads write on its own)
 var freezeBlockedCommands = map[string]bool{
+	// Communication — write beads or send tmux messages that create stranded state
 	"mail send": true,
 	"nudge":     true,
-	"sling":     true,
-	"assign":    true,
+	"broadcast": true, // sends nudges to all workers; can recreate stranded-bead scenario
+
+	// Work dispatch — write hook/assignment state to beads
+	"sling":  true,
+	"assign": true,
+
+	// Work completion — close or unhook beads
+	"unsling": true, // also catches alias "unhook"
+	"done":    true,
+	"wl done": true, // wasteland done: closes a wl bead with a Dolt commit
+
+	// Persistent state writes
+	"remember": true, // writes to the beads kv store
+	"feed":     true, // emits structured events to the activity feed (Dolt writes)
+	"commit":   true, // gt commit: git commit wrapper that may update bead state
 }
 
 // isFreezeBlocked reports whether the cobra command (and its full path) is on
