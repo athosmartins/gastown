@@ -609,12 +609,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 							closeReason = fmt.Sprintf("%s\nskip_verify: true\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)
 						}
 					} else if !isNoMergeTask {
-						if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
-							noteVerifiedPushFailure(cwd, issueID, defaultBranch, noMRCommitSHA, verifyErr)
-							return fmt.Errorf("cannot close no-MR code bead: %w", verifyErr)
-						}
-						if noMRCommitSHA != "" {
-							closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)
+						// Polecats use the MR flow and never push directly to main.
+						// In the zero-commit path a polecat has no-code work (investigation/audit).
+						// VerifyPushedCommit checks exact tip of origin/main, which fails whenever
+						// main has advanced since the polecat's branch was created. Skip for polecats.
+						if os.Getenv("GT_POLECAT") == "" {
+							if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
+								noteVerifiedPushFailure(cwd, issueID, defaultBranch, noMRCommitSHA, verifyErr)
+								return fmt.Errorf("cannot close no-MR code bead: %w", verifyErr)
+							}
+							if noMRCommitSHA != "" {
+								closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)
+							}
 						}
 					}
 					// G15 fix: Force-close bypasses molecule dependency checks.
