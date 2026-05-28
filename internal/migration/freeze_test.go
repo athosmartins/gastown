@@ -42,6 +42,9 @@ func TestFreezeReadThawRoundtrip(t *testing.T) {
 	if time.Since(info.Timestamp) > 5*time.Second {
 		t.Errorf("Timestamp too old: %v", info.Timestamp)
 	}
+	if info.PID == 0 {
+		t.Error("expected non-zero PID after Freeze")
+	}
 
 	if err := migration.Thaw(dir); err != nil {
 		t.Fatalf("Thaw: %v", err)
