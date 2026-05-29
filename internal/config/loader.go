@@ -2506,7 +2506,9 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 	// Auto-inject --remote-control for Claude agents when the session name is known.
 	// This enables the /remote-control slash command to connect to any Gas Town session.
 	// GT_SESSION is set when AgentEnvConfig.SessionName is provided by the caller.
-	if sessionName := envVars["GT_SESSION"]; sessionName != "" {
+	// Polecats are excluded — they are ephemeral worker sessions the user does not
+	// drive interactively, and the user opted out of remote-control on them.
+	if sessionName := envVars["GT_SESSION"]; sessionName != "" && ExtractSimpleRole(envVars["GT_ROLE"]) != "polecat" {
 		rcCmd := rc.Command
 		if rcCmd == "" {
 			rcCmd = "claude"
