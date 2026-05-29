@@ -1627,6 +1627,14 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			return r.tmux.SendNotificationBanner(sessionID, msg.From, msg.Subject)
 		}
 
+		// Suppress overseer-sourced convoy-complete notifications: these are
+		// automated patrol artifacts. Mail still lands in the recipient's
+		// inbox (visible via `gt mail inbox`), we just skip the tmux send-keys
+		// notification that disrupts the running agent. (gt-ini3q P0.)
+		if msg.From == "overseer" && strings.Contains(strings.ToLower(msg.Subject), "convoy complete") {
+			return nil
+		}
+
 		notification := formatNotificationMessage(msg)
 		priority := nudgePriorityForMailPriority(msg.Priority)
 
