@@ -132,7 +132,7 @@ func runTapGuardCrossClone(cmd *cobra.Command, args []string) error {
 			continue // read-only op against another crew clone — allowed
 		}
 
-		printCrossCloneBlock(rawPath, subcommand, command)
+		printCrossCloneBlock(rawPath, subcommand)
 		return NewSilentExit(2)
 	}
 
@@ -265,7 +265,7 @@ func isWriteClass(subcommand, trailing string) bool {
 	return true
 }
 
-func printCrossCloneBlock(targetPath, subcommand, fullCommand string) {
+func printCrossCloneBlock(targetPath, subcommand string) {
 	fmt.Fprintln(os.Stderr, "[HOOK BLOCK: gt tap guard cross-clone write] NOT USER CANCELLATION — automated policy enforcement.")
 	fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
 	fmt.Fprintln(os.Stderr, "║  ❌ CROSS-CLONE WRITE BLOCKED                                    ║")

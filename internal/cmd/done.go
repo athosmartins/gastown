@@ -589,7 +589,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				skipClose := false
 				var currentBeadStatus string
 				if issue, err := bd.Show(issueID); err == nil {
-					currentBeadStatus = string(issue.Status)
+					currentBeadStatus = issue.Status
 					if unchecked := beads.HasUncheckedCriteria(issue); unchecked > 0 {
 						style.PrintWarning("issue %s has %d unchecked acceptance criteria — skipping close", issueID, unchecked)
 						fmt.Printf("  The bead will remain open for witness/mayor review.\n")

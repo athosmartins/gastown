@@ -89,7 +89,7 @@ func isLocalHost(host string) bool {
 //
 // Conservative semantics: callers receive the TCP DSN whenever the default
 // Dolt socket is absent or when host is non-local (Windows, remote Dolt,
-// custom socket path). No behaviour change for remote setups.
+// custom socket path). No behavior change for remote setups.
 func BuildDSN(user, host string, port int, dbName string, opts DSNOpts) string {
 	if user == "" {
 		user = "root"
