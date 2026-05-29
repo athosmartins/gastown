@@ -2110,8 +2110,20 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 			Description: convoy.Description,
 		})
 
-		// Send convoy completion notifications (owner + notify addresses)
-		e.notifyConvoyCompletion(townRoot, convoy.ID, convoy.Title, convoy.Description)
+		// Trigger convoy completion notifications via `gt convoy check`,
+		// which routes through cmd/convoy.go::notifyConvoyCompletion. That
+		// path has persistent dedup (NotificationSentAt stamp on the convoy
+		// bead) so subsequent triggers from the ConvoyManager daemon, the
+		// stranded-scan patrol, or another refinery cycle short-circuit
+		// instead of re-firing the same notification. Previously this site
+		// invoked e.notifyConvoyCompletion directly, which lacked dedup and
+		// caused 4-7 duplicate notifications per convoy. (gt-x8tkr Option B.)
+		checkCmd := exec.Command("gt", "convoy", "check", convoy.ID)
+		util.SetDetachedProcessGroup(checkCmd)
+		checkCmd.Dir = townRoot
+		if err := checkCmd.Run(); err != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: gt convoy check %s failed: %v\n", convoy.ID, err)
+		}
 	}
 
 	return closed
