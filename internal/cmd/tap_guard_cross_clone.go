@@ -266,7 +266,7 @@ func isWriteClass(subcommand, trailing string) bool {
 }
 
 func printCrossCloneBlock(targetPath, subcommand, fullCommand string) {
-	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "[HOOK BLOCK: gt tap guard cross-clone write] NOT USER CANCELLATION — automated policy enforcement.")
 	fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
 	fmt.Fprintln(os.Stderr, "║  ❌ CROSS-CLONE WRITE BLOCKED                                    ║")
 	fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════╣")

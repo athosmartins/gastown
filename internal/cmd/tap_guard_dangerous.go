@@ -110,7 +110,7 @@ func runTapGuardDangerous(cmd *cobra.Command, args []string) error {
 
 // printDangerousBlock prints the standard block banner to stderr.
 func printDangerousBlock(reason, originalCommand string) {
-	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "[HOOK BLOCK: gt tap guard dangerous command] NOT USER CANCELLATION — automated policy enforcement.")
 	fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
 	fmt.Fprintln(os.Stderr, "║  ❌ DANGEROUS COMMAND BLOCKED                                    ║")
 	fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════╣")

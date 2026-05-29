@@ -42,7 +42,7 @@ func runTapGuardMolPatrol(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "[HOOK BLOCK: gt tap guard mol patrol] NOT USER CANCELLATION — automated policy enforcement.")
 	fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
 	fmt.Fprintln(os.Stderr, "║  ❌ MOL PATROL BLOCKED                                           ║")
 	fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════╣")

@@ -69,7 +69,7 @@ func init() {
 func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 	// Check if we're in a Gas Town agent context
 	if isGasTownAgentContext() {
-		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "[HOOK BLOCK: gt tap guard PR workflow] NOT USER CANCELLATION — automated policy enforcement.")
 		fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
 		fmt.Fprintln(os.Stderr, "║  ❌ PR WORKFLOW BLOCKED                                          ║")
 		fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════╣")
@@ -87,7 +87,7 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 
 	// Check if origin is the maintainer's repo (steveyegge/gastown)
 	if isMaintainerOrigin() {
-		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "[HOOK BLOCK: gt tap guard PR maintainer origin] NOT USER CANCELLATION — automated policy enforcement.")
 		fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
 		fmt.Fprintln(os.Stderr, "║  ❌ PR BLOCKED - MAINTAINER ORIGIN                               ║")
 		fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════╣")

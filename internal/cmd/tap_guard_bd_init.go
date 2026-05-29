@@ -48,7 +48,7 @@ func runTapGuardBdInit(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "[HOOK BLOCK: gt tap guard bd init] NOT USER CANCELLATION — automated policy enforcement.")
 	fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
 	fmt.Fprintln(os.Stderr, "║  ❌ BD INIT BLOCKED                                              ║")
 	fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════╣")
