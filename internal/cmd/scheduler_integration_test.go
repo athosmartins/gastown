@@ -317,8 +317,9 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 		t.Fatalf("bd show convoy %s failed: %v\noutput: %s", fields.Convoy, err, out)
 	}
 	var convoys []struct {
-		ID        string `json:"id"`
-		IssueType string `json:"issue_type"`
+		ID        string   `json:"id"`
+		IssueType string   `json:"issue_type"`
+		Labels    []string `json:"labels"`
 	}
 	if err := json.Unmarshal(out, &convoys); err != nil {
 		t.Fatalf("parse convoy show: %v\nraw output: %s", err, out)
@@ -326,8 +327,8 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 	if len(convoys) == 0 {
 		t.Fatalf("convoy %s not found via bd show", fields.Convoy)
 	}
-	if convoys[0].IssueType != "convoy" {
-		t.Errorf("convoy issue_type = %q, want %q", convoys[0].IssueType, "convoy")
+	if convoys[0].IssueType != "task" || !hasLabel(convoys[0].Labels, "gt:convoy") {
+		t.Errorf("convoy identity = type %q labels %v, want task with gt:convoy", convoys[0].IssueType, convoys[0].Labels)
 	}
 
 	// Verify: convoy has a "tracks" dependency pointing to the rig bead.
@@ -444,7 +445,7 @@ func TestSchedulerSlingDryRun(t *testing.T) {
 	}
 
 	// Verify: no convoy created (HQ beads DB should have no convoy issues)
-	listArgs := beads.MaybePrependAllowStale([]string{"list", "--type=convoy", "--json"})
+	listArgs := beads.MaybePrependAllowStale([]string{"list", "--label=gt:convoy", "--json"})
 	cmd := exec.Command("bd", listArgs...)
 	cmd.Dir = hqPath
 	out, err := cmd.Output()
@@ -1207,6 +1208,128 @@ func TestSchedulerInvalidJSONContextCleanup(t *testing.T) {
 	}
 }
 
+// TestSchedulerActualDispatchRoutesPollutedEnvToTargetRig verifies the non-dry-run
+// scheduler path uses the same env-routing boundary as direct sling. The parent
+// process is poisoned with HQ BEADS_* selectors; dispatch must still hook and
+// update the rig-owned work bead in the target rig database.
+func TestSchedulerActualDispatchRoutesPollutedEnvToTargetRig(t *testing.T) {
+	hqPath, rigPath, _, _ := setupSchedulerIntegrationTown(t)
+
+	beadID := createTestBead(t, rigPath, "Polluted env actual dispatch")
+	rigBeads := beads.NewWithBeadsDir(rigPath, filepath.Join(rigPath, ".beads"))
+	ctxBead, err := rigBeads.CreateSlingContext("dispatch: "+beadID, beadID, &capacity.SlingContextFields{
+		Version:     1,
+		WorkBeadID:  beadID,
+		TargetRig:   "testrig",
+		HookRawBead: true,
+		EnqueuedAt:  "2026-01-01T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("CreateSlingContext: %v", err)
+	}
+
+	prevSpawn := spawnPolecatForSling
+	t.Cleanup(func() { spawnPolecatForSling = prevSpawn })
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		if rigName != "testrig" {
+			t.Fatalf("spawn rig = %q, want testrig", rigName)
+		}
+		return &SpawnedPolecatInfo{
+			RigName:     rigName,
+			PolecatName: "envtest",
+			ClonePath:   rigPath,
+			Pane:        "test-pane", // StartSession becomes a no-op.
+		}, nil
+	}
+
+	t.Setenv("BEADS_DIR", filepath.Join(hqPath, ".beads"))
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", beads.DatabaseNameFromMetadata(filepath.Join(hqPath, ".beads")))
+	t.Setenv("BEADS_DOLT_DATA_DIR", filepath.Join(hqPath, ".wrong-dolt-data"))
+
+	dispatched, err := dispatchScheduledWork(hqPath, "test", 1, false)
+	if err != nil {
+		t.Fatalf("dispatchScheduledWork: %v", err)
+	}
+	if dispatched != 1 {
+		t.Fatalf("dispatched = %d, want 1", dispatched)
+	}
+
+	issue, err := rigBeads.Show(beadID)
+	if err != nil {
+		t.Fatalf("rig bead show after dispatch: %v", err)
+	}
+	if issue.Status != "hooked" || issue.Assignee != "testrig/polecats/envtest" {
+		t.Fatalf("rig bead state = status:%q assignee:%q, want hooked testrig/polecats/envtest", issue.Status, issue.Assignee)
+	}
+
+	openContexts, err := rigBeads.ListOpenSlingContexts()
+	if err != nil {
+		t.Fatalf("ListOpenSlingContexts: %v", err)
+	}
+	for _, ctx := range openContexts {
+		if ctx.ID == ctxBead.ID {
+			t.Fatalf("sling context %s still open after successful dispatch", ctxBead.ID)
+		}
+	}
+}
+
+func TestSchedulerDispatchFailureRecordedInContextSourceDB(t *testing.T) {
+	hqPath, rigPath, _, _ := setupSchedulerIntegrationTown(t)
+
+	beadID := createTestBead(t, rigPath, "Record dispatch failure in source DB")
+	ctxID := createSlingContext(t, hqPath, &capacity.SlingContextFields{
+		Version:     1,
+		WorkBeadID:  beadID,
+		TargetRig:   "testrig",
+		HookRawBead: true,
+		EnqueuedAt:  "2026-01-01T00:00:00Z",
+	})
+
+	prevSpawn := spawnPolecatForSling
+	t.Cleanup(func() { spawnPolecatForSling = prevSpawn })
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		if rigName != "testrig" {
+			t.Fatalf("spawn rig = %q, want testrig", rigName)
+		}
+		return nil, fmt.Errorf("forced spawn failure")
+	}
+
+	dispatched, err := dispatchScheduledWork(hqPath, "test", 1, false)
+	if err != nil {
+		t.Fatalf("dispatchScheduledWork: %v", err)
+	}
+	if dispatched != 0 {
+		t.Fatalf("dispatched = %d, want 0", dispatched)
+	}
+
+	townBeads := beads.NewWithBeadsDir(hqPath, filepath.Join(hqPath, ".beads"))
+	ctx, err := townBeads.Show(ctxID)
+	if err != nil {
+		t.Fatalf("show HQ context after failure: %v", err)
+	}
+	fields := beads.ParseSlingContextFields(ctx.Description)
+	if fields == nil {
+		t.Fatalf("context fields missing after failure: %q", ctx.Description)
+	}
+	if fields.DispatchFailures != 1 {
+		t.Fatalf("dispatch_failures = %d, want 1 (description: %s)", fields.DispatchFailures, ctx.Description)
+	}
+	if !strings.Contains(fields.LastFailure, "forced spawn failure") {
+		t.Fatalf("last_failure = %q, want forced spawn failure", fields.LastFailure)
+	}
+
+	rigBeads := beads.NewWithBeadsDir(rigPath, filepath.Join(rigPath, ".beads"))
+	rigContexts, err := rigBeads.ListOpenSlingContexts()
+	if err != nil {
+		t.Fatalf("rig ListOpenSlingContexts: %v", err)
+	}
+	for _, rigCtx := range rigContexts {
+		if rigCtx.ID == ctxID {
+			t.Fatalf("context %s unexpectedly exists in rig DB; failure should update source HQ DB", ctxID)
+		}
+	}
+}
+
 // TestSchedulerDirectConvoyDispatch verifies that gt sling <convoy-id> --dry-run
 // with max_polecats=-1 (direct mode) routes to the direct dispatch path.
 func TestSchedulerDirectConvoyDispatch(t *testing.T) {
@@ -1294,6 +1417,9 @@ func TestScheduleBead_RefusesTombstone(t *testing.T) {
 	closeCmd := exec.Command("bd", "close", beadID, "--tombstone")
 	closeCmd.Dir = rigPath
 	if out, err := closeCmd.CombinedOutput(); err != nil {
+		if strings.Contains(string(out), "unknown flag: --tombstone") {
+			t.Skip("bd CLI does not support close --tombstone")
+		}
 		t.Fatalf("bd close --tombstone %s failed: %v\n%s", beadID, err, out)
 	}
 

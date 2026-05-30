@@ -1,16 +1,17 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/style"
@@ -122,13 +123,11 @@ var doltLogsCmd = &cobra.Command{
 
 var doltDumpCmd = &cobra.Command{
 	Use:   "dump",
-	Short: "Dump Dolt server goroutine stacks for debugging",
-	Long: `Send SIGQUIT to the Dolt server to dump goroutine stacks to its log file.
+	Short: "Collect non-fatal Dolt server diagnostics",
+	Long: `Collect a non-fatal Dolt diagnostic snapshot for incident response.
 
-Per Tim Sehn (Dolt CEO): kill -QUIT prints all goroutine stacks to stderr,
-which is redirected to the server log. Useful for diagnosing hung servers.
-
-The dump is written to the server log file. Use 'gt dolt logs' to view it.`,
+This command does not send SIGQUIT. Dolt 1.86.5 terminates sql-server after
+SIGQUIT, so default diagnostics gather process metadata and recent logs only.`,
 	RunE: runDoltDump,
 }
 
@@ -565,6 +564,7 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 				config.HostPort())
 		}
 		fmt.Printf("  Connection: %s\n", doltserver.GetConnectionString(townRoot))
+		printBeadsRuntimeConfig(townRoot)
 		if running {
 			metrics := doltserver.GetHealthMetrics(townRoot)
 			fmt.Printf("\n  %s\n", style.Bold.Render("Resource Metrics:"))
@@ -604,6 +604,7 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 				}
 			}
 			fmt.Printf("  Connection: %s\n", doltserver.GetConnectionString(townRoot))
+			printBeadsRuntimeConfig(townRoot)
 		}
 
 		// Resource metrics
@@ -678,6 +679,86 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+type beadsRuntimeConfig struct {
+	Source   string
+	Database string
+	Host     string
+	Port     int
+}
+
+func currentBeadsRuntimeConfig(townRoot string) (beadsRuntimeConfig, bool) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return beadsRuntimeConfig{}, false
+	}
+	return readBeadsRuntimeConfig(beads.ResolveBeadsDir(cwd), townRoot)
+}
+
+func readBeadsRuntimeConfig(beadsDir, townRoot string) (beadsRuntimeConfig, bool) {
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return beadsRuntimeConfig{}, false
+	}
+
+	var metadata struct {
+		Backend        string `json:"backend"`
+		Database       string `json:"database"`
+		DoltMode       string `json:"dolt_mode"`
+		DoltDatabase   string `json:"dolt_database"`
+		DoltServerHost string `json:"dolt_server_host"`
+		DoltServerPort int    `json:"dolt_server_port"`
+	}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return beadsRuntimeConfig{}, false
+	}
+	if metadata.Backend != "dolt" || metadata.DoltMode != "server" {
+		return beadsRuntimeConfig{}, false
+	}
+
+	host := metadata.DoltServerHost
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := metadata.DoltServerPort
+	if port == 0 {
+		port = doltserver.DefaultConfig(townRoot).Port
+	}
+	database := metadata.DoltDatabase
+	if database == "" {
+		database = metadata.Database
+	}
+
+	return beadsRuntimeConfig{
+		Source:   metadataPath,
+		Database: database,
+		Host:     host,
+		Port:     port,
+	}, true
+}
+
+func printBeadsRuntimeConfig(townRoot string) {
+	cfg, ok := currentBeadsRuntimeConfig(townRoot)
+	if !ok {
+		return
+	}
+	parts := []string{"server metadata"}
+	if cfg.Database != "" {
+		parts = append(parts, "database "+cfg.Database)
+	}
+	if cfg.Host != "" && cfg.Port > 0 {
+		parts = append(parts, netJoinHostPort(cfg.Host, cfg.Port))
+	}
+	if cfg.Source != "" {
+		parts = append(parts, "from "+cfg.Source)
+	}
+	fmt.Printf("  Beads client: %s\n", strings.Join(parts, ", "))
+}
+
+func netJoinHostPort(host string, port int) string {
+	return host + ":" + strconv.Itoa(port)
+}
+
 func runDoltLogs(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
@@ -721,22 +802,48 @@ func runDoltDump(cmd *cobra.Command, args []string) error {
 
 	config := doltserver.DefaultConfig(townRoot)
 
-	// Send SIGQUIT to get goroutine stack dump (written to server's stderr = log file)
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("finding process %d: %w", pid, err)
+	fmt.Printf("Dolt diagnostic snapshot (non-fatal)\n")
+	fmt.Printf("  Live PID:   %d\n", pid)
+	fmt.Printf("  Port:       %d\n", config.Port)
+	fmt.Printf("  Data dir:   %s\n", config.DataDir)
+	fmt.Printf("  Log file:   %s\n", config.LogFile)
+	fmt.Printf("  Connection: %s\n", doltserver.GetConnectionString(townRoot))
+
+	if info, err := doltserver.ReadSQLServerInfo(townRoot); err == nil {
+		fmt.Printf("  SQL metadata: %s\n", info.Path)
+		fmt.Printf("    PID:       %d\n", info.PID)
+		fmt.Printf("    Port:      %d\n", info.Port)
+		if info.ServerID != "" {
+			fmt.Printf("    Server ID: %s\n", info.ServerID)
+		}
+	} else {
+		fmt.Printf("  SQL metadata: unavailable (%v)\n", err)
 	}
 
-	fmt.Printf("Sending SIGQUIT to Dolt server (PID %d)...\n", pid)
-	if err := proc.Signal(syscall.SIGQUIT); err != nil {
-		return fmt.Errorf("sending SIGQUIT: %w", err)
+	if state, err := doltserver.LoadState(townRoot); err == nil && state.PID > 0 {
+		fmt.Printf("  Daemon state: %s\n", doltserver.StateFile(townRoot))
+		fmt.Printf("    PID:       %d", state.PID)
+		if state.PID != pid {
+			fmt.Printf(" (stale; live PID is %d)", pid)
+		}
+		fmt.Println()
+		if !state.StartedAt.IsZero() {
+			fmt.Printf("    Started:   %s\n", state.StartedAt.Format("2006-01-02 15:04:05"))
+		}
+		if state.DataDir != "" {
+			fmt.Printf("    Data dir:  %s\n", state.DataDir)
+		}
 	}
 
-	// Give the server a moment to write the dump
-	time.Sleep(500 * time.Millisecond)
+	fmt.Printf("\nRecent Dolt log lines:\n")
+	tailCmd := exec.Command("tail", "-n", "200", config.LogFile)
+	tailCmd.Stdout = os.Stdout
+	tailCmd.Stderr = os.Stderr
+	if err := tailCmd.Run(); err != nil {
+		fmt.Printf("  (unable to read recent logs: %v)\n", err)
+	}
 
-	fmt.Printf("Goroutine stack dump written to: %s\n", config.LogFile)
-	fmt.Printf("View with: gt dolt logs -n 200\n")
+	fmt.Printf("\nNo signal was sent. Do not use kill -QUIT for routine diagnostics unless the Dolt version has been verified not to terminate on SIGQUIT.\n")
 
 	return nil
 }

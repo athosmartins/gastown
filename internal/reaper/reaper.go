@@ -16,7 +16,6 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
 // validDBName matches safe database names (alphanumeric, underscore, hyphen).
@@ -53,9 +52,7 @@ func isTableNotFound(err error) bool {
 // all production databases, filtering out system databases and test pollution.
 // Falls back to DefaultDatabases on any error.
 func DiscoverDatabases(host string, port int) []string {
-	// Socket-first DSN (gt-5t0kl): runs every reaper cycle, so unmigrated
-	// TCP connections accumulated TIME_WAIT entries across daemon lifetime.
-	dsn := doltserver.BuildDSN("root", host, port, "", doltserver.DSNOpts{ParseTime: true, Timeout: "5s"})
+	dsn := fmt.Sprintf("root@tcp(%s:%d)/?parseTime=true&timeout=5s", host, port)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return DefaultDatabases
@@ -129,12 +126,21 @@ type PurgeResult struct {
 	Anomalies   []Anomaly `json:"anomalies,omitempty"`
 }
 
+// ClosedEntry records an individual issue closure with details for logging.
+type ClosedEntry struct {
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	AgeDays  int    `json:"age_days"`
+	Database string `json:"database"`
+}
+
 // AutoCloseResult holds the results of an auto-close operation.
 type AutoCloseResult struct {
-	Database string    `json:"database"`
-	Closed   int       `json:"closed"`
-	DryRun   bool      `json:"dry_run,omitempty"`
-	Anomalies []Anomaly `json:"anomalies,omitempty"`
+	Database      string        `json:"database"`
+	Closed        int           `json:"closed"`
+	ClosedEntries []ClosedEntry `json:"closed_entries,omitempty"`
+	DryRun        bool          `json:"dry_run,omitempty"`
+	Anomalies     []Anomaly     `json:"anomalies,omitempty"`
 }
 
 // Anomaly represents an unexpected condition found during reaper operations.
@@ -149,6 +155,10 @@ const (
 	DefaultQueryTimeout = 30 * time.Second
 	// DefaultBatchSize is the number of rows per batch DELETE operation.
 	DefaultBatchSize = 100
+	// DefaultAlertThreshold is the open-wisp count above which callers should
+	// surface a warning. Sized above the natural steady-state for the current
+	// dog/deacon emit rate (~23 wisps/h × 24h TTL ≈ 550). See hq-57jr8.
+	DefaultAlertThreshold = 800
 )
 
 // ValidateDBName returns an error if the database name is unsafe.
@@ -164,13 +174,10 @@ func OpenDB(host string, port int, dbName string, readTimeout, writeTimeout time
 	if err := ValidateDBName(dbName); err != nil {
 		return nil, err
 	}
-	// Socket-first DSN (gt-5t0kl): see DiscoverDatabases rationale.
-	dsn := doltserver.BuildDSN("root", host, port, dbName, doltserver.DSNOpts{
-		ParseTime:    true,
-		Timeout:      "5s",
-		ReadTimeout:  fmt.Sprintf("%ds", int(readTimeout.Seconds())),
-		WriteTimeout: fmt.Sprintf("%ds", int(writeTimeout.Seconds())),
-	})
+	dsn := fmt.Sprintf("root@tcp(%s:%d)/%s?parseTime=true&timeout=5s&readTimeout=%s&writeTimeout=%s",
+		host, port, dbName,
+		fmt.Sprintf("%ds", int(readTimeout.Seconds())),
+		fmt.Sprintf("%ds", int(writeTimeout.Seconds())))
 	return sql.Open("mysql", dsn)
 }
 
@@ -608,7 +615,7 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 
 	// Two-step SELECT-then-UPDATE to avoid self-referencing subquery in UPDATE,
 	// which is not valid MySQL (Error 1093) and fragile in Dolt (dolthub/dolt#10600).
-	selectQuery := fmt.Sprintf("SELECT i.id FROM issues i WHERE %s", whereClause)
+	selectQuery := fmt.Sprintf("SELECT i.id, i.title, i.updated_at FROM issues i WHERE %s", whereClause)
 	rows, err := db.QueryContext(ctx, selectQuery, staleCutoff)
 	if err != nil {
 		if isTableNotFound(err) {
@@ -616,16 +623,34 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		}
 		return nil, fmt.Errorf("select stale: %w", err)
 	}
-	var ids []string
+	type candidate struct {
+		id        string
+		title     string
+		updatedAt time.Time
+	}
+	var candidates []candidate
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.title, &c.updatedAt); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan stale id: %w", err)
 		}
-		ids = append(ids, id)
+		candidates = append(candidates, c)
 	}
 	rows.Close()
+
+	// Build per-issue closure log entries.
+	now := time.Now().UTC()
+	ids := make([]string, len(candidates))
+	for i, c := range candidates {
+		ids[i] = c.id
+		result.ClosedEntries = append(result.ClosedEntries, ClosedEntry{
+			ID:       c.id,
+			Title:    c.title,
+			AgeDays:  int(now.Sub(c.updatedAt).Hours() / 24),
+			Database: dbName,
+		})
+	}
 
 	if dryRun {
 		result.Closed = len(ids)
@@ -650,7 +675,7 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		args[i] = id
 	}
 	updateQuery := fmt.Sprintf(
-		"UPDATE `%s`.issues SET status = 'closed', closed_at = NOW() WHERE id IN (%s)",
+		"UPDATE `%s`.issues SET status = 'closed', closed_at = NOW(), close_reason = 'stale:auto-closed by reaper' WHERE id IN (%s)",
 		dbName, strings.Join(placeholders, ","))
 	if _, err := db.ExecContext(ctx, updateQuery, args...); err != nil {
 		return nil, fmt.Errorf("auto-close: %w", err)

@@ -2,8 +2,10 @@ package witness
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -15,6 +17,133 @@ import (
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+func TestNotifyMayorSlotOpen_BlocksNonCompletedExit(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	workDir := filepath.Join(townRoot, "gastown", "witness")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeDeferred))
+
+	events, err := filepath.Glob(filepath.Join(townRoot, "events", "mayor", "*.event"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %v, want one SLOT_BLOCKED event", events)
+	}
+	data, err := os.ReadFile(events[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var event struct {
+		Type    string            `json:"type"`
+		Payload map[string]string `json:"payload"`
+	}
+	if err := json.Unmarshal(data, &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != "SLOT_BLOCKED" {
+		t.Fatalf("event type = %q, want SLOT_BLOCKED", event.Type)
+	}
+	if event.Payload["reason"] != "exit-deferred" {
+		t.Fatalf("reason = %q, want exit-deferred", event.Payload["reason"])
+	}
+}
+
+func TestShouldNotifyMayorSlotOpenRequiresSafeRecovery(t *testing.T) {
+	prev := slotOpenRecoveryCheck
+	t.Cleanup(func() { slotOpenRecoveryCheck = prev })
+
+	tests := []struct {
+		name    string
+		output  string
+		err     error
+		wantOK  bool
+		wantMsg string
+	}{
+		{
+			name:   "safe to nuke notifies",
+			output: `{"verdict":"SAFE_TO_NUKE"}`,
+			wantOK: true,
+		},
+		{
+			name:   "warning-prefixed json notifies",
+			output: "warning: stale binary\n" + `{"verdict":"SAFE_TO_NUKE"}`,
+			wantOK: true,
+		},
+		{
+			name:    "needs recovery suppresses",
+			output:  `{"verdict":"NEEDS_RECOVERY","blockers":["cleanup_status=has_unpushed"]}`,
+			wantMsg: "NEEDS_RECOVERY",
+		},
+		{
+			name:    "needs mq submit suppresses",
+			output:  `{"verdict":"NEEDS_MQ_SUBMIT"}`,
+			wantMsg: "NEEDS_MQ_SUBMIT",
+		},
+		{
+			name:    "check failure suppresses",
+			err:     errors.New("boom"),
+			wantMsg: "check-recovery failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			slotOpenRecoveryCheck = func(workDir, rigName, polecatName string) (string, error) {
+				return tt.output, tt.err
+			}
+
+			gotOK, gotMsg := shouldNotifyMayorSlotOpen("/tmp", "gastown", "nitro")
+			if gotOK != tt.wantOK {
+				t.Fatalf("ok = %v, want %v (msg=%q)", gotOK, tt.wantOK, gotMsg)
+			}
+			if tt.wantMsg != "" && !strings.Contains(gotMsg, tt.wantMsg) {
+				t.Fatalf("message %q does not contain %q", gotMsg, tt.wantMsg)
+			}
+		})
+	}
+}
+
+func TestActiveMRBlockerFromCLIUsesTerminalStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		err    error
+		want   string
+	}{
+		{name: "empty active mr", want: ""},
+		{name: "open mr blocks", output: `[{"status":"open"}]`, want: "active_mr=gt-mr status=open"},
+		{name: "closed mr does not block", output: `[{"status":"closed"}]`, want: ""},
+		{name: "not found does not block", err: fmt.Errorf("issue not found"), want: ""},
+		{name: "lookup error blocks", err: fmt.Errorf("bd unavailable"), want: "active_mr=gt-mr status=lookup_error: bd unavailable"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bd, _ := mockBd(
+				func(args []string) (string, error) { return tt.output, tt.err },
+				func(args []string) error { return nil },
+			)
+			mrID := "gt-mr"
+			if tt.name == "empty active mr" {
+				mrID = ""
+			}
+			if got := activeMRBlockerFromCLI(bd, t.TempDir(), mrID); got != tt.want {
+				t.Fatalf("activeMRBlockerFromCLI() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestHandlePolecatDoneFromBead_NilFields(t *testing.T) {
 	t.Parallel()
@@ -381,6 +510,231 @@ func fakeBd() (*BdCli, *mockBdCalls) {
 		},
 		func(args []string) error { return nil },
 	)
+}
+
+func setupActiveMRGitSafeWorkDir(t *testing.T, rigName, polecatName string) string {
+	t.Helper()
+	townRoot := t.TempDir()
+	clonePath := filepath.Join(townRoot, rigName, "polecats", polecatName, rigName)
+	if err := os.MkdirAll(clonePath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	runGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	runGit(clonePath, "init")
+	runGit(clonePath, "config", "user.email", "test@example.com")
+	runGit(clonePath, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(clonePath, "README.md"), []byte("test\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(clonePath, "add", "README.md")
+	runGit(clonePath, "commit", "-m", "initial")
+	remotePath := filepath.Join(townRoot, "origin.git")
+	runGit(townRoot, "init", "--bare", remotePath)
+	runGit(clonePath, "remote", "add", "origin", remotePath)
+	runGit(clonePath, "push", "-u", "origin", "HEAD")
+	return townRoot
+}
+
+func TestHasPendingMRFromSnapshotAssessesMRStatus(t *testing.T) {
+	issueJSON := func(id, status, desc string) string {
+		b, err := json.Marshal([]map[string]any{{"id": id, "status": status, "description": desc}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+
+	tests := []struct {
+		name string
+		show func(id string) (string, error)
+		want bool
+	}{
+		{
+			name: "open MR is pending",
+			show: func(id string) (string, error) {
+				return issueJSON(id, "open", ""), nil
+			},
+			want: true,
+		},
+		{
+			name: "closed MR with terminal source is not pending",
+			show: func(id string) (string, error) {
+				if id == "gt-mr" {
+					return issueJSON(id, "closed", ""), nil
+				}
+				return issueJSON(id, "closed", ""), nil
+			},
+		},
+		{
+			name: "missing MR with terminal source is not pending",
+			show: func(id string) (string, error) {
+				if id == "gt-mr" {
+					return "", errors.New("not found")
+				}
+				return issueJSON(id, "closed", ""), nil
+			},
+		},
+		{
+			name: "lookup error is pending",
+			show: func(id string) (string, error) { return "", errors.New("bd exploded") },
+			want: true,
+		},
+		{
+			name: "closed MR with open source is pending",
+			show: func(id string) (string, error) {
+				if id == "gt-mr" {
+					return issueJSON(id, "closed", ""), nil
+				}
+				return issueJSON(id, "open", ""), nil
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workDir := setupActiveMRGitSafeWorkDir(t, "gastown", "nux")
+			bd, _ := mockBd(
+				func(args []string) (string, error) {
+					if len(args) == 0 {
+						return "", nil
+					}
+					switch args[0] {
+					case "list":
+						return "[]", nil
+					case "show":
+						return tt.show(args[1])
+					}
+					return "", nil
+				},
+				func(args []string) error { return nil },
+			)
+			snap := &agentBeadSnapshot{ActiveMR: "gt-mr", Fields: &beads.AgentFields{ActiveMR: "gt-mr", LastSourceIssue: "gt-src"}}
+			if got := hasPendingMRFromSnapshot(bd, workDir, "gastown", "nux", snap); got != tt.want {
+				t.Fatalf("hasPendingMRFromSnapshot() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHasPendingMRUsesAgentLastSourceIssue(t *testing.T) {
+	workDir := setupActiveMRGitSafeWorkDir(t, "gastown", "nux")
+	bd, _ := mockBd(
+		func(args []string) (string, error) {
+			if len(args) == 0 {
+				return "", nil
+			}
+			switch args[0] {
+			case "list":
+				return "[]", nil
+			case "show":
+				switch args[1] {
+				case "gt-agent":
+					return `[{"active_mr":"gt-mr","description":"active_mr: gt-mr\nlast_source_issue: gt-src\n"}]`, nil
+				case "gt-mr":
+					return "", errors.New("not found")
+				case "gt-src":
+					return `[{"id":"gt-src","status":"closed"}]`, nil
+				}
+			}
+			return "", errors.New("not found")
+		},
+		func(args []string) error { return nil },
+	)
+
+	if got := hasPendingMR(bd, workDir, "gastown", "nux", "gt-agent"); got {
+		t.Fatalf("hasPendingMR() = true, want false for missing MR with terminal source")
+	}
+}
+
+func TestHasPendingMRFromSnapshotRequiresGitSafe(t *testing.T) {
+	bd, _ := mockBd(
+		func(args []string) (string, error) {
+			if len(args) == 0 {
+				return "", nil
+			}
+			switch args[0] {
+			case "list":
+				return "[]", nil
+			case "show":
+				if args[1] == "gt-mr" {
+					return "", errors.New("not found")
+				}
+				return `[{"id":"gt-src","status":"closed"}]`, nil
+			}
+			return "", nil
+		},
+		func(args []string) error { return nil },
+	)
+	snap := &agentBeadSnapshot{ActiveMR: "gt-mr", Fields: &beads.AgentFields{ActiveMR: "gt-mr", LastSourceIssue: "gt-src"}}
+	if got := hasPendingMRFromSnapshot(bd, t.TempDir(), "gastown", "nux", snap); !got {
+		t.Fatalf("hasPendingMRFromSnapshot() = false, want true when git is unsafe")
+	}
+}
+
+func TestHasPendingMRCleanupWispFailsClosed(t *testing.T) {
+	workDir := setupActiveMRGitSafeWorkDir(t, "gastown", "nux")
+	tests := []struct {
+		name string
+		list string
+		err  error
+	}{
+		{name: "cleanup wisp present", list: `[{"id":"gt-cleanup"}]`},
+		{name: "cleanup wisp lookup error", err: errors.New("bd exploded")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bd, _ := mockBd(
+				func(args []string) (string, error) {
+					if len(args) == 0 {
+						return "", nil
+					}
+					if args[0] == "list" {
+						return tt.list, tt.err
+					}
+					if args[0] == "show" && args[1] == "gt-agent" {
+						return `[{"active_mr":"gt-mr","description":"active_mr: gt-mr\nlast_source_issue: gt-src\n"}]`, nil
+					}
+					if args[0] == "show" && args[1] == "gt-mr" {
+						return "", errors.New("not found")
+					}
+					return `[{"id":"gt-src","status":"closed"}]`, nil
+				},
+				func(args []string) error { return nil },
+			)
+			if got := hasPendingMR(bd, workDir, "gastown", "nux", "gt-agent"); !got {
+				t.Fatalf("hasPendingMR() = false, want true")
+			}
+		})
+	}
+}
+
+func TestTerminalSafeDoneSnapshot(t *testing.T) {
+	workDir := setupActiveMRGitSafeWorkDir(t, "gastown", "nux")
+	bd, _ := mockBd(
+		func(args []string) (string, error) {
+			if len(args) == 0 || args[0] != "show" {
+				return "[]", nil
+			}
+			return `[{"id":"gt-src","status":"closed"}]`, nil
+		},
+		func(args []string) error { return nil },
+	)
+	snap := &agentBeadSnapshot{Fields: &beads.AgentFields{LastSourceIssue: "gt-src"}}
+	if !terminalSafeDoneSnapshot(bd, workDir, "gastown", "nux", snap) {
+		t.Fatalf("terminalSafeDoneSnapshot() = false, want true")
+	}
+	snap.Fields.HookBead = "gt-hook"
+	if terminalSafeDoneSnapshot(bd, workDir, "gastown", "nux", snap) {
+		t.Fatalf("terminalSafeDoneSnapshot() = true with hook set, want false")
+	}
 }
 
 func TestFindCleanupWisp_UsesCorrectBdListFlags(t *testing.T) {
@@ -1705,7 +2059,6 @@ func TestClearCompletionMetadata_NoBd(t *testing.T) {
 	}
 }
 
-
 // --- Heartbeat v2 tests (gt-3vr5) ---
 
 func TestHeartbeatV2_ExitingStateSkipsZombieDetection(t *testing.T) {
@@ -1846,6 +2199,132 @@ func TestZombieAgentSelfReportedStuck_Classification(t *testing.T) {
 	// Should imply active work (agent is alive and asking for help)
 	if !ZombieAgentSelfReportedStuck.ImpliesActiveWork() {
 		t.Error("ZombieAgentSelfReportedStuck should imply active work")
+	}
+}
+
+func TestZombieNeverHeartbeated_Classification(t *testing.T) {
+	t.Parallel()
+	if ZombieNeverHeartbeated != "never-heartbeated" {
+		t.Errorf("ZombieNeverHeartbeated = %q, want %q", ZombieNeverHeartbeated, "never-heartbeated")
+	}
+	if !ZombieNeverHeartbeated.ImpliesActiveWork() {
+		t.Error("ZombieNeverHeartbeated should imply active work")
+	}
+
+	// Session old enough (>5m default) with assigned work and no heartbeat → flag.
+	oldSession := time.Now().Add(-10 * time.Minute)
+	shouldFlag := time.Since(oldSession) > config.DefaultWitnessHeartbeatStartupGrace
+	if !shouldFlag {
+		t.Errorf("expected flag for session age=%v, threshold=%v",
+			time.Since(oldSession).Round(time.Second), config.DefaultWitnessHeartbeatStartupGrace)
+	}
+
+	// Session within grace period → no flag.
+	newSession := time.Now().Add(-2 * time.Minute)
+	shouldNotFlag := time.Since(newSession) <= config.DefaultWitnessHeartbeatStartupGrace
+	if !shouldNotFlag {
+		t.Errorf("expected no flag for session age=%v, threshold=%v",
+			time.Since(newSession).Round(time.Second), config.DefaultWitnessHeartbeatStartupGrace)
+	}
+}
+
+func TestSubmittedStillRunningCandidate(t *testing.T) {
+	t.Parallel()
+
+	baseSnap := &agentBeadSnapshot{
+		AgentState: string(beads.AgentStateDone),
+		HookBead:   "gt-work-123",
+		UpdatedAt:  time.Now().Add(-10 * time.Minute).Format(time.RFC3339),
+		Fields: &beads.AgentFields{
+			CleanupStatus: "clean",
+			MRID:          "gt-mr-123",
+		},
+	}
+	staleHB := &polecat.SessionHeartbeat{
+		Timestamp: time.Now().Add(-10 * time.Minute),
+		State:     polecat.HeartbeatWorking,
+	}
+
+	age, ok := isSubmittedStillRunningCandidate(baseSnap, staleHB, config.DefaultWitnessHeartbeatStartupGrace)
+	if !ok {
+		t.Fatalf("expected submitted still-running candidate, age=%v", age)
+	}
+
+	noHookSnap := *baseSnap
+	noHookSnap.HookBead = ""
+	if _, ok := isSubmittedStillRunningCandidate(&noHookSnap, staleHB, config.DefaultWitnessHeartbeatStartupGrace); !ok {
+		t.Error("no-hook submitted sessions must still be treated as submitted still-running")
+	}
+
+	idleSnap := *baseSnap
+	idleSnap.AgentState = string(beads.AgentStateIdle)
+	if _, ok := isSubmittedStillRunningCandidate(&idleSnap, staleHB, config.DefaultWitnessHeartbeatStartupGrace); ok {
+		t.Error("normal idle polecats with submitted MR metadata must not be treated as submitted still-running")
+	}
+
+	freshHB := &polecat.SessionHeartbeat{
+		Timestamp: time.Now(),
+		State:     polecat.HeartbeatWorking,
+	}
+	if _, ok := isSubmittedStillRunningCandidate(baseSnap, freshHB, config.DefaultWitnessHeartbeatStartupGrace); ok {
+		t.Error("fresh heartbeat must not be treated as submitted still-running")
+	}
+
+	dirtySnap := *baseSnap
+	dirtyFields := *baseSnap.Fields
+	dirtyFields.CleanupStatus = "has_uncommitted"
+	dirtySnap.Fields = &dirtyFields
+	if _, ok := isSubmittedStillRunningCandidate(&dirtySnap, staleHB, config.DefaultWitnessHeartbeatStartupGrace); ok {
+		t.Error("dirty cleanup status must not be treated as safe submitted still-running")
+	}
+
+	noSubmitSnap := *baseSnap
+	noSubmitSnap.AgentState = string(beads.AgentStateWorking)
+	noSubmitSnap.ActiveMR = ""
+	noSubmitSnap.Fields = &beads.AgentFields{CleanupStatus: "clean"}
+	if _, ok := isSubmittedStillRunningCandidate(&noSubmitSnap, staleHB, config.DefaultWitnessHeartbeatStartupGrace); ok {
+		t.Error("open hooked work without submission evidence must not be treated as submitted still-running")
+	}
+
+	completedOnlySnap := *baseSnap
+	completedOnlySnap.ActiveMR = ""
+	completedOnlySnap.Fields = &beads.AgentFields{
+		CleanupStatus:  "clean",
+		ExitType:       string(ExitTypeCompleted),
+		CompletionTime: time.Now().Format(time.RFC3339),
+	}
+	if _, ok := isSubmittedStillRunningCandidate(&completedOnlySnap, staleHB, config.DefaultWitnessHeartbeatStartupGrace); ok {
+		t.Error("COMPLETED metadata alone must not be treated as successful submission evidence")
+	}
+
+	failedSubmitSnap := *baseSnap
+	failedSubmitSnap.Fields = &beads.AgentFields{
+		CleanupStatus: "clean",
+		MRID:          "gt-mr-123",
+		MRFailed:      true,
+	}
+	if _, ok := isSubmittedStillRunningCandidate(&failedSubmitSnap, staleHB, config.DefaultWitnessHeartbeatStartupGrace); ok {
+		t.Error("failed MR submission must not be treated as successful submission evidence")
+	}
+
+	pushFailedSnap := *baseSnap
+	pushFailedSnap.Fields = &beads.AgentFields{
+		CleanupStatus: "clean",
+		MRID:          "gt-mr-123",
+		PushFailed:    true,
+	}
+	if _, ok := isSubmittedStillRunningCandidate(&pushFailedSnap, staleHB, config.DefaultWitnessHeartbeatStartupGrace); ok {
+		t.Error("failed push must not be treated as successful submission evidence")
+	}
+}
+
+func TestZombieSubmittedStillRunning_Classification(t *testing.T) {
+	t.Parallel()
+	if ZombieSubmittedStillRunning != "submitted-still-running" {
+		t.Errorf("ZombieSubmittedStillRunning = %q, want %q", ZombieSubmittedStillRunning, "submitted-still-running")
+	}
+	if ZombieSubmittedStillRunning.ImpliesActiveWork() {
+		t.Error("ZombieSubmittedStillRunning should be classified as orphan/submitted idle, not active failed work")
 	}
 }
 

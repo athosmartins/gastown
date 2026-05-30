@@ -1,7 +1,12 @@
 {
   "skipDangerousModePermissionPrompt": true,
+  "hasCompletedOnboarding": true,
+  "theme": "dark",
   "editorMode": "normal",
+  "feedbackSurveyRate": 0,
+  "awaySummaryEnabled": false,
   "permissions": {
+    "defaultMode": "bypassPermissions",
     "deny": ["mcp__plugin_github_github__create_pull_request"]
   },
   "enabledPlugins": {
@@ -50,7 +55,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gt tap guard dangerous-command"
+            "command": "{{GT_BIN}} tap guard dangerous-command"
           }
         ]
       },
@@ -59,7 +64,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gt tap guard dangerous-command"
+            "command": "{{GT_BIN}} tap guard dangerous-command"
           }
         ]
       },
@@ -68,7 +73,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gt tap guard dangerous-command"
+            "command": "{{GT_BIN}} tap guard dangerous-command"
           }
         ]
       },
@@ -77,7 +82,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gt tap guard dangerous-command"
+            "command": "{{GT_BIN}} tap guard dangerous-command"
           }
         ]
       },
@@ -86,7 +91,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gt tap guard dangerous-command"
+            "command": "{{GT_BIN}} tap guard dangerous-command"
           }
         ]
       },
@@ -95,7 +100,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gt tap guard dangerous-command"
+            "command": "{{GT_BIN}} tap guard dangerous-command"
           }
         ]
       },
@@ -104,7 +109,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gt tap guard dangerous-command"
+            "command": "{{GT_BIN}} tap guard dangerous-command"
           }
         ]
       }
@@ -115,7 +120,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} prime --hook && {{GT_BIN}} mail check --inject"
+            "command": "{{GT_BIN}} prime --hook"
           }
         ]
       }
@@ -137,7 +142,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} mail check --inject"
+            "command": "case \"${GT_ROLE:-}\" in *witness*|*refinery*|deacon*|*boot*) exit 0 ;; *) {{GT_BIN}} mail check --inject ;; esac"
           }
         ]
       }

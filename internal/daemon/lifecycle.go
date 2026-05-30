@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	gtgit "github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -42,7 +43,7 @@ func (d *Daemon) ProcessLifecycleRequests() {
 	// Get mail for deacon identity (using gt mail, not bd mail)
 	cmd := exec.Command(d.gtPath, "mail", "inbox", "--identity", "deacon/", "--json")
 	cmd.Dir = d.config.TownRoot
-	cmd.Env = bdReadOnlyEnv()
+	cmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
 	util.SetDetachedProcessGroup(cmd)
 
 	output, err := cmd.Output()
@@ -340,7 +341,7 @@ func (d *Daemon) identityToSession(identity string) string {
 // Uses role config if available, falls back to hardcoded defaults.
 func (d *Daemon) restartSession(sessionName, identity string) error {
 	// Get role config for this identity
-	config, parsed, err := d.getRoleConfigForIdentity(identity)
+	roleConfig, parsed, err := d.getRoleConfigForIdentity(identity)
 	if err != nil {
 		return fmt.Errorf("parsing identity: %w", err)
 	}
@@ -355,13 +356,13 @@ func (d *Daemon) restartSession(sessionName, identity string) error {
 	}
 
 	// Determine working directory
-	workDir := d.getWorkDir(config, parsed)
+	workDir := d.getWorkDir(roleConfig, parsed)
 	if workDir == "" {
 		return fmt.Errorf("cannot determine working directory for %s", identity)
 	}
 
 	// Determine if pre-sync is needed
-	needsPreSync := d.getNeedsPreSync(config, parsed)
+	needsPreSync := d.getNeedsPreSync(roleConfig, parsed)
 
 	// Pre-sync workspace for agents with git worktrees
 	if needsPreSync {
@@ -373,11 +374,36 @@ func (d *Daemon) restartSession(sessionName, identity string) error {
 	// NewSessionWithCommand (command as initial pane process). This eliminates
 	// the race condition in the old EnsureSessionFresh + SendKeys pattern where
 	// the shell might not be ready to receive keystrokes, producing empty windows.
-	startCmd := d.getStartCommand(config, parsed)
+	startCmd := d.getStartCommand(roleConfig, parsed)
+
+	// Build core identity env vars to pass via -e flags. The startup command
+	// already embeds these via PrependEnv, but -e flags provide defense-in-depth:
+	// they seed the session environment before any shell starts, overriding
+	// global env values (e.g., BD_ACTOR=daemon inherited from the daemon process).
+	// Without this, a polecat session restarted by the daemon could inherit
+	// BD_ACTOR=daemon and have gt done reject it with "you are daemon" (gt-xyr).
+	rigPath := ""
+	if parsed != nil && parsed.RigName != "" {
+		rigPath = filepath.Join(d.config.TownRoot, parsed.RigName)
+	}
+	rc := config.ResolveRoleAgentConfig(parsed.RoleType, d.config.TownRoot, rigPath)
+	var sessionIDEnv string
+	if rc.Session != nil {
+		sessionIDEnv = rc.Session.SessionIDEnv
+	}
+	envVars := config.AgentEnv(config.AgentEnvConfig{
+		Role:         parsed.RoleType,
+		Rig:          parsed.RigName,
+		AgentName:    parsed.AgentName,
+		TownRoot:     d.config.TownRoot,
+		SessionIDEnv: sessionIDEnv,
+	})
+	config.SanitizeAgentEnv(envVars, map[string]string{})
 
 	// Create session with command as initial process (replaces EnsureSessionFresh + SendKeys).
-	// EnsureSessionFreshWithCommand kills zombie sessions and creates a new one atomically.
-	if err := d.tmux.EnsureSessionFreshWithCommand(sessionName, workDir, startCmd); err != nil {
+	// EnsureSessionFreshWithCommandAndEnv kills zombie sessions and creates a new one atomically,
+	// seeding env via -e flags before the shell starts (gt-xyr defense-in-depth).
+	if err := d.tmux.EnsureSessionFreshWithCommandAndEnv(sessionName, workDir, startCmd, envVars); err != nil {
 		if errors.Is(err, tmux.ErrSessionRunning) {
 			d.logger.Printf("Session %s already running with healthy agent, skipping restart", sessionName)
 			return nil
@@ -386,7 +412,7 @@ func (d *Daemon) restartSession(sessionName, identity string) error {
 	}
 
 	// Set environment variables in tmux session table (for debugging/monitoring tools).
-	d.setSessionEnvironment(sessionName, config, parsed)
+	d.setSessionEnvironment(sessionName, roleConfig, parsed)
 
 	// Apply theme (non-fatal: theming failure doesn't affect operation)
 	d.applySessionTheme(sessionName, parsed)
@@ -599,6 +625,11 @@ const syncFailureEscalationThreshold = 3
 // This ensures agents with persistent clones (like refinery) start with current code.
 // Handles dirty working trees by auto-stashing before pull and restoring after.
 func (d *Daemon) syncWorkspace(workDir string) {
+	if err := gtgit.EnsureSafeMutationWorkDir(workDir); err != nil {
+		d.logger.Printf("Error: refusing daemon git sync in unsafe workdir %s: %v", workDir, err)
+		return
+	}
+
 	// Determine default branch from rig config
 	// workDir is like <townRoot>/<rigName>/<role>/rig or <townRoot>/<rigName>/crew/<name>
 	defaultBranch := "main" // fallback
@@ -784,10 +815,18 @@ func (d *Daemon) getAgentBeadState(agentBeadID string) (string, error) {
 }
 
 // getAgentBeadInfo fetches and parses an agent bead by ID.
+//
+// Agent beads (gt:agent-labeled, one per polecat/witness/refinery/dog) live
+// in the town/hq Dolt DB but their IDs carry the rig prefix (e.g. za-zack-
+// polecat-furiosa). Without forcing BEADS_DIR to the town's .beads, prefix
+// routing would send the lookup to the rig's DB and return "issue not found"
+// — which the reaper at daemon.go:2796 interprets as a stale polecat and
+// kills mid-work after 3x threshold (hq-3kri). Pin the lookup to the town
+// .beads so the reaper sees the truth.
 func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 	cmd := exec.Command(d.bdPath, "show", agentBeadID, "--json")
 	cmd.Dir = d.config.TownRoot
-	cmd.Env = bdReadOnlyEnv()
+	cmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
 	util.SetDetachedProcessGroup(cmd)
 
 	output, err := cmd.Output()
@@ -848,7 +887,7 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 func (d *Daemon) getAgentHookBead(agentBeadID string) string {
 	cmd := exec.Command(d.bdPath, "show", agentBeadID, "--json")
 	cmd.Dir = d.config.TownRoot
-	cmd.Env = bdReadOnlyEnv()
+	cmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
 	util.SetDetachedProcessGroup(cmd)
 
 	output, err := cmd.Output()
@@ -940,7 +979,7 @@ func (d *Daemon) listAgentBeadsJSON(dest interface{}) error {
 	// Query issues table (backward compat during migration)
 	cmd := exec.Command(d.bdPath, "list", "--label=gt:agent", "--json", "--flat") //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = d.config.TownRoot
-	cmd.Env = bdReadOnlyEnv()
+	cmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
 	util.SetDetachedProcessGroup(cmd)
 
 	issuesOutput, issuesErr := cmd.Output()
@@ -948,7 +987,7 @@ func (d *Daemon) listAgentBeadsJSON(dest interface{}) error {
 	// Query wisps table (primary source after agent bead migration)
 	wispCmd := exec.Command(d.bdPath, "mol", "wisp", "list", "--json") //nolint:gosec // G204: bd is a trusted internal tool
 	wispCmd.Dir = d.config.TownRoot
-	wispCmd.Env = bdReadOnlyEnv()
+	wispCmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
 	util.SetDetachedProcessGroup(wispCmd)
 
 	wispOutput, _ := wispCmd.Output() // Best-effort: wisps table may not exist

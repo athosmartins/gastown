@@ -22,7 +22,9 @@ import (
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
+	worktreeintegrity "github.com/steveyegge/gastown/internal/worktree"
 )
 
 var primeHookMode bool
@@ -31,6 +33,11 @@ var primeState bool
 var primeStateJSON bool
 var primeExplain bool
 var primeStructuredSessionStartOutput bool
+
+// Prime's external injections are best-effort; role context should still
+// return when bd/mail is slow or wedged.
+var primeExternalToolTimeout = 5 * time.Second
+var primeExternalToolWaitDelay = time.Second
 
 // primeHookSource stores the SessionStart source ("startup", "resume", "clear", "compact")
 // when running in hook mode. Used to provide lighter output on compaction/resume.
@@ -99,7 +106,7 @@ func init() {
 	primeCmd.Flags().BoolVar(&primeHookMode, "hook", false,
 		"Hook mode: read session ID from stdin JSON (for LLM runtime hooks)")
 	primeCmd.Flags().BoolVar(&primeDryRun, "dry-run", false,
-		"Show what would be injected without side effects (no marker removal, no bd prime, no mail)")
+		"Show what would be injected without side effects (no marker removal, no mail)")
 	primeCmd.Flags().BoolVar(&primeState, "state", false,
 		"Show detected session state only (normal/post-handoff/crash/autonomous)")
 	primeCmd.Flags().BoolVar(&primeStateJSON, "json", false,
@@ -127,6 +134,14 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 		return nil // Silent exit - not in workspace and not enabled
 	}
 
+	roleInfo, err := GetRoleWithContext(cwd, townRoot)
+	if err != nil {
+		return fmt.Errorf("detecting role: %w", err)
+	}
+	if err := ensureRoleWorktreeIntegrity(cwd, townRoot, roleInfo.Role); err != nil {
+		return err
+	}
+
 	if primeHookMode {
 		handlePrimeHookMode(townRoot, cwd)
 	}
@@ -136,11 +151,6 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 		checkHandoffMarkerDryRun(cwd)
 	} else {
 		checkHandoffMarker(cwd)
-	}
-
-	roleInfo, err := GetRoleWithContext(cwd, townRoot)
-	if err != nil {
-		return fmt.Errorf("detecting role: %w", err)
 	}
 
 	warnRoleMismatch(roleInfo, cwd)
@@ -217,7 +227,7 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 
 	outputMoleculeContext(ctx)
 	outputCheckpointContext(ctx)
-	runPrimeExternalTools(cwd)
+	runPrimeExternalTools(ctx, cwd)
 
 	if ctx.Role == RoleMayor {
 		checkPendingEscalations(ctx)
@@ -229,6 +239,25 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 	}
 
 	return nil
+}
+
+func ensureRoleWorktreeIntegrity(cwd, townRoot string, role Role) error {
+	if err := worktreeintegrity.Validate(cwd, worktreeintegrity.IntegrityOptions{
+		TownRoot: townRoot,
+		Require:  roleRequiresWorktreeIntegrity(role),
+	}); err != nil {
+		return fmt.Errorf("%w\nRemediation: stop using this worktree and run `gt doctor --fix`", err)
+	}
+	return nil
+}
+
+func roleRequiresWorktreeIntegrity(role Role) bool {
+	switch role {
+	case RolePolecat, RoleCrew, RoleWitness, RoleRefinery, RoleDog, RoleBoot:
+		return true
+	default:
+		return false
+	}
 }
 
 // runPrimeCompactResume runs a lighter prime after compaction or resume.
@@ -507,45 +536,52 @@ func outputRoleContext(ctx RoleContext) (string, error) {
 	return formula, nil
 }
 
-// runPrimeExternalTools runs bd prime, memory injection, and gt mail check --inject.
+// runPrimeExternalTools runs lightweight memory and mail injection.
 // Skipped in dry-run mode with explain output.
-func runPrimeExternalTools(cwd string) {
+func runPrimeExternalTools(ctx RoleContext, cwd string) {
 	if primeDryRun {
-		explain(true, "bd prime: skipped in dry-run mode")
 		explain(true, "memory injection: skipped in dry-run mode")
 		explain(true, "gt mail check --inject: skipped in dry-run mode")
 		return
 	}
-	runBdPrime(cwd)
-	runMemoryInject()
+	runMemoryInject(cwd)
+	if shouldSkipStartupMailInject(string(ctx.Role)) {
+		explain(true, fmt.Sprintf("gt mail check --inject: skipped for patrol role %s", ctx.Role))
+		return
+	}
 	runMailCheckInject(cwd)
 }
 
-// runBdPrime runs `bd prime` and outputs the result.
-// This provides beads workflow context to the agent.
-func runBdPrime(workDir string) {
-	cmd := exec.Command("bd", "prime")
-	cmd.Dir = workDir
-	cmd.Env = os.Environ()
+func shouldSkipStartupMailInject(role string) bool {
+	switch strings.ToLower(role) {
+	case string(RoleWitness), string(RoleRefinery), string(RoleDeacon), string(RoleBoot):
+		return true
+	default:
+		return false
+	}
+}
 
+func runPrimeExternalCommand(workDir, name string, args ...string) (bytes.Buffer, bytes.Buffer, error) {
 	var stdout, stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), primeExternalToolTimeout)
+	defer cancel()
+
+	if name == "bd" {
+		args = beads.InjectFlatForListJSON(args)
+	}
+	cmd := exec.CommandContext(ctx, name, args...)
+	if name == "bd" {
+		beads.ConfigureCommand(cmd, workDir, beads.ResolveBeadsDir(workDir), beads.SubprocessModeForArgs(args))
+	} else {
+		cmd.Dir = workDir
+		cmd.Env = os.Environ()
+		util.SetProcessGroup(cmd)
+	}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	cmd.WaitDelay = primeExternalToolWaitDelay
 
-	if err := cmd.Run(); err != nil {
-		// Skip if bd prime fails (beads might not be available)
-		// But log stderr if present for debugging
-		if errMsg := strings.TrimSpace(stderr.String()); errMsg != "" {
-			fmt.Fprintf(os.Stderr, "bd prime: %s\n", errMsg)
-		}
-		return
-	}
-
-	output := strings.TrimSpace(stdout.String())
-	if output != "" {
-		fmt.Println()
-		fmt.Println(output)
-	}
+	return stdout, stderr, cmd.Run()
 }
 
 // memoryTypeLabels maps type keys to human-readable section headers for prime injection.
@@ -553,14 +589,14 @@ var memoryTypeLabels = map[string]string{
 	"feedback":  "Behavioral Rules (from user feedback)",
 	"user":      "User Context",
 	"project":   "Project Context",
-	"reference":  "Reference Links",
+	"reference": "Reference Links",
 	"general":   "General",
 }
 
 // runMemoryInject loads memories from beads kv and outputs them during prime.
 // Memories are grouped by type and ordered by priority (feedback first).
-func runMemoryInject() {
-	kvs, err := bdKvListJSON()
+func runMemoryInject(workDir string) {
+	kvs, err := bdKvListJSONForPrime(workDir)
 	if err != nil {
 		return // Silently skip if kv list fails
 	}
@@ -610,17 +646,24 @@ func runMemoryInject() {
 	}
 }
 
+func bdKvListJSONForPrime(workDir string) (map[string]string, error) {
+	stdout, _, err := runPrimeExternalCommand(workDir, "bd", "kv", "list", "--json")
+	if err != nil {
+		return nil, err
+	}
+
+	var kvs map[string]string
+	if err := json.Unmarshal(stdout.Bytes(), &kvs); err != nil {
+		return nil, fmt.Errorf("parsing kv list: %w", err)
+	}
+	return kvs, nil
+}
+
 // runMailCheckInject runs `gt mail check --inject` and outputs the result.
 // This injects any pending mail into the agent's context.
 func runMailCheckInject(workDir string) {
-	cmd := exec.Command("gt", "mail", "check", "--inject")
-	cmd.Dir = workDir
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
+	stdout, stderr, err := runPrimeExternalCommand(workDir, "gt", "mail", "check", "--inject")
+	if err != nil {
 		// Skip if mail check fails, but log stderr for debugging
 		if errMsg := strings.TrimSpace(stderr.String()); errMsg != "" {
 			fmt.Fprintf(os.Stderr, "gt mail check: %s\n", errMsg)
@@ -765,6 +808,7 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) (*beads.Issue, error) {
 	// (see sling_helpers.go), so HookBead is typically empty. Kept for backward
 	// compatibility with agent beads that still have hook_bead set.
 	agentBeadID := buildAgentBeadID(agentID, ctx.Role, ctx.TownRoot)
+	var staleHookErr error
 	if agentBeadID != "" {
 		agentBeadDir := beads.ResolveHookDir(ctx.TownRoot, agentBeadID, ctx.WorkDir)
 		ab := beads.New(agentBeadDir)
@@ -782,7 +826,7 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) (*beads.Issue, error) {
 			// fast — never pontificate, the witness will clear the hook on
 			// its next sweep and the dispatcher will (or won't) re-issue.
 			if hookBead == nil || isBeadNotFound(showErr) {
-				return nil, fmt.Errorf("%w: agent=%s hook_bead=%s cwd=%s: %v",
+				staleHookErr = fmt.Errorf("%w: agent=%s hook_bead=%s cwd=%s: %v",
 					ErrHookUnresolvable, agentID, agentBead.HookBead, ctx.WorkDir, showErr)
 			}
 		}
@@ -835,6 +879,9 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) (*beads.Issue, error) {
 	}
 
 	if len(hookedBeads) == 0 {
+		if staleHookErr != nil {
+			return nil, staleHookErr
+		}
 		return nil, nil
 	}
 	return hookedBeads[0], nil
@@ -954,7 +1001,7 @@ func outputMoleculeWorkflow(ctx RoleContext, attachment *beads.AttachmentFields)
 
 	// Show inline formula steps from the embedded binary (root-only: no child wisps to query).
 	if attachment.AttachedFormula != "" {
-		showFormulaStepsFull(attachment.AttachedFormula, ctx.TownRoot, ctx.Rig, strings.Split(attachment.FormulaVars, "\n"))
+		showFormulaStepsFull(attachment.AttachedFormula, ctx.TownRoot, ctx.Rig, attachmentFormulaVars(attachment))
 		fmt.Println()
 		fmt.Printf("%s\n", style.Bold.Render("Work through ALL steps above, including submit and cleanup."))
 		fmt.Println("The base bead is your assignment. The formula steps define your workflow.")
@@ -986,7 +1033,7 @@ func outputRalphLoopDirective(ctx RoleContext, attachment *beads.AttachmentField
 	// the full checklist. Previously this emitted a /ralph-loop slash command
 	// that didn't exist, causing the polecat to die immediately.
 	if attachment.AttachedFormula != "" {
-		showFormulaStepsFull(attachment.AttachedFormula, ctx.TownRoot, ctx.Rig, strings.Split(attachment.FormulaVars, "\n"))
+		showFormulaStepsFull(attachment.AttachedFormula, ctx.TownRoot, ctx.Rig, attachmentFormulaVars(attachment))
 		fmt.Println()
 	}
 
@@ -1008,20 +1055,13 @@ func outputRalphLoopDirective(ctx RoleContext, attachment *beads.AttachmentField
 // outputBeadPreview runs `bd show` and displays a truncated preview of the bead.
 func outputBeadPreview(hookedBead *beads.Issue) {
 	fmt.Println("**Bead details:**")
-	cmd := exec.Command("bd", "show", hookedBead.ID)
-	cmd.Env = os.Environ()
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if errMsg := strings.TrimSpace(stderr.String()); errMsg != "" {
-			fmt.Fprintf(os.Stderr, "  bd show %s: %s\n", hookedBead.ID, errMsg)
-		} else {
-			fmt.Fprintf(os.Stderr, "  bd show %s: %v\n", hookedBead.ID, err)
-		}
-	} else {
-		lines := strings.Split(stdout.String(), "\n")
-		maxLines := 15
+	fmt.Printf("  %s: %s\n", hookedBead.ID, hookedBead.Title)
+	if hookedBead.Status != "" {
+		fmt.Printf("  status: %s\n", hookedBead.Status)
+	}
+	if hookedBead.Description != "" {
+		lines := strings.Split(hookedBead.Description, "\n")
+		maxLines := 12
 		if len(lines) > maxLines {
 			lines = lines[:maxLines]
 			lines = append(lines, "...")
@@ -1188,10 +1228,16 @@ func ensureBeadsRedirect(ctx RoleContext) {
 		return
 	}
 
-	// Check if redirect already exists
 	redirectPath := filepath.Join(ctx.WorkDir, ".beads", "redirect")
-	if _, err := os.Stat(redirectPath); err == nil {
-		return // Redirect exists, nothing to do
+	expected, err := beads.ComputeRedirectTarget(ctx.TownRoot, ctx.WorkDir)
+	if err != nil {
+		// Preserve the old best-effort behavior: if target computation fails but
+		// a redirect exists, do not disturb the worktree during prime.
+		if _, statErr := os.Stat(redirectPath); statErr == nil {
+			return
+		}
+	} else if data, readErr := os.ReadFile(redirectPath); readErr == nil && strings.TrimSpace(string(data)) == expected {
+		return
 	}
 
 	// Use shared helper - silently ignore errors during prime
@@ -1202,7 +1248,7 @@ func ensureBeadsRedirect(ctx RoleContext) {
 // hooked bead and persists it in two places so all subsequent subprocesses carry it:
 //
 //  1. Current process env (GT_WORK_RIG/BEAD/MOL via os.Setenv) — inherited by bd, mail,
-//     and any other subprocess spawned from this gt prime invocation (e.g. bd prime).
+//     and any other subprocess spawned from this gt prime invocation.
 //
 //  2. Tmux session env (via tmux set-environment) — inherited by future processes
 //     spawned in the session after a handoff or compaction (e.g. new Claude Code instance).
@@ -1267,15 +1313,8 @@ func setTmuxWorkContext(workRig, workBead, workMol string) {
 // This is called on Mayor startup to surface issues needing human attention.
 func checkPendingEscalations(ctx RoleContext) {
 	// Query for open escalations using bd list with tag filter
-	cmd := exec.Command("bd", "list", "--status=open", "--tag=escalation", "--json")
-	cmd.Dir = ctx.WorkDir
-	cmd.Env = os.Environ()
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
+	stdout, _, err := runPrimeExternalCommand(ctx.WorkDir, "bd", "list", "--status=open", "--tag=escalation", "--json")
+	if err != nil {
 		// Silently skip - escalation check is best-effort
 		return
 	}

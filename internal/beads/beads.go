@@ -16,6 +16,7 @@ import (
 	"time"
 
 	beadsdk "github.com/steveyegge/beads"
+	gtlock "github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/util"
@@ -89,7 +90,8 @@ func BdSupportsAllowStaleWithEnv(env []string) bool {
 	// Check output for "unknown flag" to detect lack of support. Treat probe
 	// errors/timeouts as unsupported so higher-level commands fail closed
 	// instead of hanging on a wedged bd subprocess.
-	supported := err == nil && !strings.Contains(combinedOut.String(), "unknown flag")
+	probeOut := strings.TrimSpace(combinedOut.String())
+	supported := err == nil && probeOut != "" && !strings.Contains(probeOut, "unknown flag")
 
 	bdAllowStaleMu.Lock()
 	if bdAllowStalePath != bdPath {
@@ -306,7 +308,7 @@ type CreateOptions struct {
 	Parent      string
 	Actor       string // Who is creating this issue (populates created_by)
 	Ephemeral   bool   // Create as ephemeral (wisp) - not synced to git
-	Rig         string // Target rig database (e.g., "gantry"). When set, routes bd create to the rig's directory via --repo.
+	Rig         string // Target rig database (e.g., "gantry"). When set, binds create to the rig's .beads directory.
 }
 
 // UpdateOptions specifies options for updating an issue.
@@ -343,9 +345,11 @@ type Beads struct {
 	townRootOnce sync.Once
 
 	// noRoute disables prefix-based routing for this Beads instance.
-	// Forward-port stub from steveyegge/gastown@42548305 (ForAgentBead).
-	// Read by dc-e7c2 routing helpers; never set in fork/main until the full
-	// ForAgentBead constructor is ported. Zero value preserves prior routing.
+	// Used for agent-bead operations: agent beads (gt:agent label) live in
+	// the town database regardless of their ID prefix, so prefix routing
+	// (which assumes "za-*" → zack DB) misroutes them. When set, Show()
+	// and forIssueID() skip ResolveRoutingTarget and operate against
+	// beadsDir directly.
 	noRoute bool
 }
 
@@ -375,6 +379,48 @@ func NewWithBeadsDir(workDir, beadsDir string) *Beads {
 	return &Beads{workDir: workDir, beadsDir: beadsDir}
 }
 
+// ForAgentBead returns a Beads wrapper suitable for operating on agent beads.
+//
+// Agent beads (labeled gt:agent) live in the TOWN database, but their IDs
+// are prefixed with the rig prefix (e.g. "za-zack-polecat-furiosa"). The
+// default prefix routing in routes.jsonl maps "za-" → zack rig database, so
+// any agent-bead operation issued from a rig context (or any context that
+// triggers routing) gets sent to the wrong DB and fails with "issue not
+// found". This silently breaks gt done's hook clearing, agent state
+// transition, completion metadata, etc.
+//
+// ForAgentBead bypasses that:
+//   - Re-roots the wrapper at the town's .beads directory (so bd CLI itself
+//     opens the town/hq Dolt database where agent beads live).
+//   - Sets noRoute=true so the Go-side routing helpers (Show,
+//     ResolveRoutingTarget, forIssueID) do not redirect lookups by prefix.
+//
+// If the town root cannot be determined, returns the original wrapper to
+// preserve current behavior.
+func (b *Beads) ForAgentBead() *Beads {
+	townRoot := b.getTownRoot()
+	if townRoot == "" {
+		return b
+	}
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	return &Beads{
+		workDir:    townRoot,
+		beadsDir:   townBeadsDir,
+		isolated:   b.isolated,
+		serverPort: b.serverPort,
+		store:      b.store,
+		townRoot:   townRoot,
+		noRoute:    true,
+	}
+}
+
+func (b *Beads) agentBeadTarget() *Beads {
+	if b.noRoute {
+		return b
+	}
+	return b.ForAgentBead()
+}
+
 // getActor returns the BD_ACTOR value for this context.
 // Returns empty string when in isolated mode (tests) to prevent
 // inherited actors from routing to production databases.
@@ -400,15 +446,44 @@ func (b *Beads) getTownRoot() string {
 // This follows any redirects and returns the actual beads directory path.
 func (b *Beads) getResolvedBeadsDir() string {
 	if b.beadsDir != "" {
-		return b.beadsDir
+		return ResolveBeadsDir(b.beadsDir)
 	}
 	return ResolveBeadsDir(b.workDir)
+}
+
+// targetBeadsDirForCreate returns the database a create operation should use.
+// Rig is authoritative for MR/conflict-task creates; otherwise parent-prefixed
+// children should land beside their parent so bd can resolve the relationship.
+func (b *Beads) targetBeadsDirForCreate(opts CreateOptions) string {
+	fallback := b.getResolvedBeadsDir()
+	townRoot := b.getTownRoot()
+
+	if opts.Rig != "" && townRoot != "" {
+		if rigDir := GetRigDirForName(townRoot, opts.Rig); rigDir != "" {
+			if targetDir := ResolveBeadsDir(rigDir); targetDir != "" {
+				return targetDir
+			}
+		}
+	}
+
+	if opts.Parent != "" {
+		return ResolveRoutingTarget(townRoot, opts.Parent, fallback)
+	}
+
+	return fallback
 }
 
 // forIssueID returns a Beads wrapper bound to the correct beads directory for
 // the given issue ID. This is needed for cross-rig write operations that use an
 // ID to determine the owning database.
+//
+// When noRoute is set (see ForAgentBead), routing is skipped: the wrapper is
+// returned unchanged. Used for agent-bead operations whose IDs share the rig
+// prefix but whose data lives in the town DB.
 func (b *Beads) forIssueID(id string) *Beads {
+	if b.noRoute {
+		return b
+	}
 	resolved := ResolveBeadsDirForID(b.getResolvedBeadsDir(), id)
 	if resolved == "" || resolved == b.getResolvedBeadsDir() {
 		return b
@@ -450,6 +525,8 @@ func (b *Beads) Init(prefix string) error {
 // Investigation: dc-1pq8 (forensic report 2026-05-02).
 const bdSubprocessTimeout = 60 * time.Second
 
+const bdReadThrottleTimeout = 5 * time.Second
+
 // resolveBdSubprocessTimeout returns the configured timeout, honoring the
 // GT_BD_TIMEOUT_SEC env var override (must parse as a positive integer).
 func resolveBdSubprocessTimeout() time.Duration {
@@ -462,7 +539,15 @@ func resolveBdSubprocessTimeout() time.Duration {
 }
 
 // run executes a bd command and returns stdout.
-func (b *Beads) run(args ...string) (_ []byte, retErr error) {
+func (b *Beads) run(args ...string) ([]byte, error) {
+	return b.runWithStdin(nil, args...)
+}
+
+// runWithStdin executes a bd command, optionally piping stdinData to bd's stdin.
+// When stdinData is nil, behaves identically to run. Use this for flags like
+// --body-file=- that read multi-line content from stdin (avoids embedding
+// newlines in --description, which bd 1.0.3+ rejects).
+func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr error) {
 	start := time.Now()
 	// Declare buffers before defer so the closure captures them after cmd.Run.
 	var stdout, stderr bytes.Buffer
@@ -477,12 +562,18 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 
 	// Conditionally use --allow-stale to prevent failures when db is temporarily stale
 	// (e.g., after daemon is killed during shutdown). Only if bd supports it.
-	beadsDir := b.beadsDir
-	if beadsDir == "" {
-		beadsDir = ResolveBeadsDir(b.workDir)
-	}
+	beadsDir := b.getResolvedBeadsDir()
 	runEnv := append(b.buildRunEnv(), "BEADS_DIR="+beadsDir)
 	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
+	if shouldThrottleBDRead(fullArgs) {
+		unlock, err := b.acquireBDReadThrottle(bdReadThrottleTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("bd %s: %w", strings.Join(fullArgs, " "), err)
+		}
+		if unlock != nil {
+			defer unlock()
+		}
+	}
 
 	// Bound the subprocess runtime so a slow Dolt response doesn't leave bd
 	// blocking forever (under memory pressure that invites Jetsam SIGKILL).
@@ -502,6 +593,9 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	if stdinData != nil {
+		cmd.Stdin = bytes.NewReader(stdinData)
+	}
 
 	err := cmd.Run()
 
@@ -524,6 +618,9 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 		cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
+		if stdinData != nil {
+			cmd.Stdin = bytes.NewReader(stdinData)
+		}
 		err = cmd.Run()
 	}
 
@@ -539,6 +636,42 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 	}
 
 	return stripStdoutWarnings(stdout.Bytes()), nil
+}
+
+func shouldThrottleBDRead(args []string) bool {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		return arg == "list"
+	}
+	return false
+}
+
+func (b *Beads) acquireBDReadThrottle(timeout time.Duration) (func(), error) {
+	townRoot := b.getTownRoot()
+	if townRoot == "" {
+		return nil, nil
+	}
+	lockDir := filepath.Join(townRoot, ".runtime")
+	if err := os.MkdirAll(lockDir, 0755); err != nil {
+		return nil, err
+	}
+	lockPath := filepath.Join(lockDir, "bd-list-read.flock")
+	deadline := time.Now().Add(timeout)
+	for {
+		unlock, ok, err := gtlock.FlockTryAcquire(lockPath)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return unlock, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for bd list read throttle")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // runWithRouting executes a bd command without setting BEADS_DIR, allowing bd's
@@ -638,14 +771,19 @@ func (b *Beads) buildRunEnv() []string {
 	if b.isolated {
 		env := filterBeadsEnv(os.Environ())
 		if b.serverPort > 0 {
+			env = stripEnvPrefixes(env, "GT_DOLT_PORT=", "BEADS_DOLT_PORT=", "BEADS_DOLT_AUTO_START=")
 			env = append(env, fmt.Sprintf("GT_DOLT_PORT=%d", b.serverPort))
 			env = append(env, fmt.Sprintf("BEADS_DOLT_PORT=%d", b.serverPort))
+			env = append(env, "BEADS_DOLT_AUTO_START=0")
 		}
-		return env
+		return SuppressBDSideEffects(env)
 	}
-	env := stripEnvPrefixes(os.Environ(), "BEADS_DIR=")
-	env = overrideDoltEnvFromBeadsDir(env, b.getResolvedBeadsDir())
-	return translateDoltPort(env)
+	// runWithStdin appends BEADS_DIR after probing bd --allow-stale support, so
+	// keep buildRunEnv focused on Dolt target isolation and avoid duplicate
+	// first-match-sensitive BEADS_DIR entries.
+	env := BuildPinnedBDEnv(os.Environ(), b.getResolvedBeadsDir())
+	env = stripEnvKey(env, "BEADS_DIR")
+	return stripEnvKey(env, "BEADS_DOLT_SERVER_PORT")
 }
 
 // buildRoutingEnv builds the environment for runWithRouting() calls.
@@ -655,14 +793,15 @@ func (b *Beads) buildRoutingEnv() []string {
 	if b.isolated {
 		env := filterBeadsEnv(os.Environ())
 		if b.serverPort > 0 {
+			env = stripEnvPrefixes(env, "GT_DOLT_PORT=", "BEADS_DOLT_PORT=", "BEADS_DOLT_AUTO_START=")
 			env = append(env, fmt.Sprintf("GT_DOLT_PORT=%d", b.serverPort))
 			env = append(env, fmt.Sprintf("BEADS_DOLT_PORT=%d", b.serverPort))
+			env = append(env, "BEADS_DOLT_AUTO_START=0")
 		}
-		return env
+		return SuppressBDSideEffects(env)
 	}
-	env := stripEnvPrefixes(os.Environ(), "BEADS_DIR=")
-	env = overrideDoltEnvFromBeadsDir(env, b.getResolvedBeadsDir())
-	return translateDoltPort(env)
+	env := BuildRoutingBDEnv(os.Environ(), b.getResolvedBeadsDir())
+	return stripEnvKey(env, "BEADS_DOLT_SERVER_PORT")
 }
 
 // filterBeadsEnv removes beads-related environment variables from the given
@@ -730,27 +869,29 @@ func translateDoltPort(env []string) []string {
 
 // overrideDoltEnvFromBeadsDir replaces inherited BEADS_DOLT_* values with the
 // authoritative connection data for the selected beads directory when present.
-// This prevents a parent shell's stale Dolt port from routing bd commands to
-// the wrong server when the command explicitly targets another rig's .beads dir.
+// This prevents a parent shell's stale Dolt config from routing bd commands to
+// the wrong server/database when the command explicitly targets a .beads dir.
 func overrideDoltEnvFromBeadsDir(env []string, beadsDir string) []string {
-	port, host := doltConnectionFromBeadsDir(beadsDir)
+	env = stripEnvPrefixes(env, "BEADS_DOLT_")
+	port, host, database := doltConnectionFromBeadsDir(beadsDir)
 	if port != "" {
-		env = stripEnvPrefixes(env, "BEADS_DOLT_PORT=")
 		env = append(env, "BEADS_DOLT_PORT="+port)
 	}
 	if host != "" {
-		env = stripEnvPrefixes(env, "BEADS_DOLT_SERVER_HOST=")
 		env = append(env, "BEADS_DOLT_SERVER_HOST="+host)
+	}
+	if database != "" {
+		env = append(env, "BEADS_DOLT_SERVER_DATABASE="+database)
 	}
 	return env
 }
 
 // doltConnectionFromBeadsDir reads the preferred Dolt connection info for a
 // beads directory. The per-directory port file is authoritative when present;
-// metadata.json is used as a fallback and to supply the server host.
-func doltConnectionFromBeadsDir(beadsDir string) (port string, host string) {
+// metadata.json is used as a fallback and to supply the server host/database.
+func doltConnectionFromBeadsDir(beadsDir string) (port string, host string, database string) {
 	if beadsDir == "" {
-		return "", ""
+		return "", "", ""
 	}
 
 	if data, err := os.ReadFile(filepath.Join(beadsDir, "dolt-server.port")); err == nil {
@@ -759,22 +900,24 @@ func doltConnectionFromBeadsDir(beadsDir string) (port string, host string) {
 
 	data, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
 	if err != nil {
-		return port, ""
+		return port, "", ""
 	}
 
 	var meta struct {
 		DoltServerPort int    `json:"dolt_server_port"`
 		DoltServerHost string `json:"dolt_server_host"`
+		DoltDatabase   string `json:"dolt_database"`
 	}
 	if err := json.Unmarshal(data, &meta); err != nil {
-		return port, ""
+		return port, "", ""
 	}
 
 	if port == "" && meta.DoltServerPort > 0 {
 		port = strconv.Itoa(meta.DoltServerPort)
 	}
 	host = strings.TrimSpace(meta.DoltServerHost)
-	return port, host
+	database = strings.TrimSpace(meta.DoltDatabase)
+	return port, host, database
 }
 
 // stripEnvPrefixes removes entries matching any of the given prefixes from an
@@ -1143,10 +1286,13 @@ func (b *Beads) ReadyWithType(issueType string) ([]*Issue, error) {
 func (b *Beads) Show(id string) (*Issue, error) {
 	// Route cross-rig queries via routes.jsonl so that rig-level bead IDs
 	// (e.g., "gt-abc123") resolve to the correct rig database.
-	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
-	if targetDir != b.getResolvedBeadsDir() {
-		target := NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
-		return target.Show(id)
+	// noRoute (see ForAgentBead) bypasses this for agent-bead lookups.
+	if !b.noRoute {
+		targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
+		if targetDir != b.getResolvedBeadsDir() {
+			target := NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+			return target.Show(id)
+		}
 	}
 
 	if b.store != nil {
@@ -1260,6 +1406,17 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 		return nil, fmt.Errorf("refusing to create bead: %w (got %q)", ErrFlagTitle, opts.Title)
 	}
 
+	targetDir := b.targetBeadsDirForCreate(opts)
+	if targetDir != "" && targetDir != b.getResolvedBeadsDir() {
+		bdForCreate := &Beads{
+			workDir:    b.workDir,
+			beadsDir:   targetDir,
+			serverPort: b.serverPort,
+			isolated:   b.isolated,
+		}
+		return bdForCreate.Create(opts)
+	}
+
 	if b.store != nil && !opts.Ephemeral {
 		return b.storeCreate(opts)
 	}
@@ -1289,29 +1446,6 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 	if opts.Ephemeral {
 		args = append(args, "--ephemeral")
 	}
-	// When Rig is set, route to the rig's .beads dir via BEADS_DIR rather than
-	// passing --repo=<rigDir>. Using --repo causes bd to open the target database
-	// as a second connection while BEADS_DIR already holds one, triggering a
-	// pthread_cond_wait deadlock when both paths resolve to the same database
-	// (e.g., a polecat running gt done on its own rig's issue). (hq-1uf2)
-	bdForCreate := b
-	if opts.Rig != "" {
-		if townRoot := b.getTownRoot(); townRoot != "" {
-			if rigDir := GetRigDirForName(townRoot, opts.Rig); rigDir != "" {
-				rigBeadsDir := filepath.Join(rigDir, ".beads")
-				if _, statErr := os.Stat(rigBeadsDir); statErr == nil {
-					bdForCreate = &Beads{
-						workDir:    b.workDir,
-						beadsDir:   rigBeadsDir,
-						serverPort: b.serverPort,
-						isolated:   b.isolated,
-					}
-				}
-				// If .beads dir doesn't exist, fall through using b (no --repo flag).
-				// bd will auto-route from BEADS_DIR, which is better than hanging.
-			}
-		}
-	}
 	// Default Actor from BD_ACTOR env var if not specified
 	// Uses getActor() to respect isolated mode (tests)
 	actor := opts.Actor
@@ -1322,7 +1456,7 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 		args = append(args, "--actor="+actor)
 	}
 
-	out, err := bdForCreate.run(args...)
+	out, err := b.run(args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1554,15 +1688,6 @@ func (b *Beads) Close(ids ...string) error {
 		return nil
 	}
 
-	// Route single cross-rig ID to the correct rig database (mirrors Show routing).
-	if !b.noRoute && len(ids) == 1 {
-		targetDir := ResolveRoutingTarget(b.getTownRoot(), ids[0], b.getResolvedBeadsDir())
-		if targetDir != b.getResolvedBeadsDir() {
-			target := NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
-			return target.Close(ids...)
-		}
-	}
-
 	if b.store != nil {
 		return b.storeClose("", runtime.SessionIDFromEnv(), ids...)
 	}
@@ -1584,15 +1709,6 @@ func (b *Beads) Close(ids ...string) error {
 func (b *Beads) CloseWithReason(reason string, ids ...string) error {
 	if len(ids) == 0 {
 		return nil
-	}
-
-	// Route single cross-rig ID to the correct rig database (mirrors Show routing).
-	if !b.noRoute && len(ids) == 1 {
-		targetDir := ResolveRoutingTarget(b.getTownRoot(), ids[0], b.getResolvedBeadsDir())
-		if targetDir != b.getResolvedBeadsDir() {
-			target := NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
-			return target.CloseWithReason(reason, ids...)
-		}
 	}
 
 	if b.store != nil {
@@ -1617,17 +1733,6 @@ func (b *Beads) CloseWithReason(reason string, ids ...string) error {
 func (b *Beads) ForceCloseWithReason(reason string, ids ...string) error {
 	if len(ids) == 0 {
 		return nil
-	}
-
-	// Route single cross-rig ID to the correct rig database (mirrors Show routing).
-	// Without this, closing e.g. a dc-* source issue from the wa rig would silently
-	// fail because b.run() pins BEADS_DIR to the local rig's database.
-	if !b.noRoute && len(ids) == 1 {
-		targetDir := ResolveRoutingTarget(b.getTownRoot(), ids[0], b.getResolvedBeadsDir())
-		if targetDir != b.getResolvedBeadsDir() {
-			target := NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
-			return target.ForceCloseWithReason(reason, ids...)
-		}
 	}
 
 	// In-process store close doesn't enforce dependency checks (no --force

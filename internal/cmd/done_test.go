@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -78,6 +79,47 @@ func TestDoneUsesResolveBeadsDir(t *testing.T) {
 			t.Errorf("ResolveBeadsDir(%s) = %s, want %s", localDir, resolvedDir, mayorRigBeadsDir)
 		}
 	})
+}
+
+func TestForceCloseIssueWithRetryClosesNoMergeIssue(t *testing.T) {
+	var gotReason string
+	var gotIDs []string
+	calls := 0
+
+	err := forceCloseIssueWithRetry(func(reason string, ids ...string) error {
+		calls++
+		gotReason = reason
+		gotIDs = append([]string(nil), ids...)
+		return nil
+	}, "gt-abc", "No-merge work completed; merge queue skipped", "Issue %s closed (no-merge)")
+	if err != nil {
+		t.Fatalf("forceCloseIssueWithRetry returned error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("close calls = %d, want 1", calls)
+	}
+	if gotReason != "No-merge work completed; merge queue skipped" {
+		t.Errorf("reason = %q", gotReason)
+	}
+	if len(gotIDs) != 1 || gotIDs[0] != "gt-abc" {
+		t.Errorf("ids = %v, want [gt-abc]", gotIDs)
+	}
+}
+
+func TestForceCloseIssueWithRetryReturnsFinalError(t *testing.T) {
+	wantErr := errors.New("dolt locked")
+	calls := 0
+
+	err := forceCloseIssueWithRetrySleep(func(string, ...string) error {
+		calls++
+		return wantErr
+	}, "gt-abc", "No-merge work completed; merge queue skipped", "Issue %s closed (no-merge)", func(time.Duration) {})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want %v", err, wantErr)
+	}
+	if calls != 3 {
+		t.Fatalf("close calls = %d, want 3", calls)
+	}
 }
 
 // TestDoneBeadsInitWithoutRedirect verifies that beads initialization works
@@ -274,7 +316,7 @@ func TestFindHookedBeadForAgent(t *testing.T) {
 			setupBeads: func(t *testing.T, bd *beads.Beads) {
 				// Create a task and set it to hooked with assignee
 				_, err := bd.CreateWithID("test-456", beads.CreateOptions{
-					Title: "Task to be hooked",
+					Title:  "Task to be hooked",
 					Labels: []string{"gt:task"},
 				})
 				if err != nil {
@@ -402,6 +444,36 @@ func TestDoneIntentLabelFormat(t *testing.T) {
 	}
 }
 
+// TestShouldNudgeRefinery locks in the gh#3885 invariant: only COMPLETED
+// exits with a created MR bead may wake the refinery. DEFERRED/ESCALATED
+// exits — used by polecats finishing operational tasks with no code changes —
+// must never emit MQ_SUBMIT, even if an mrID is somehow populated. The
+// "stray MR" cases guard against a regression to a bare `mrID != ""` check.
+func TestShouldNudgeRefinery(t *testing.T) {
+	tests := []struct {
+		name     string
+		exitType string
+		mrID     string
+		want     bool
+	}{
+		{"completed with MR nudges", ExitCompleted, "gt-abc123", true},
+		{"completed without MR does not nudge", ExitCompleted, "", false},
+		{"deferred without MR does not nudge", ExitDeferred, "", false},
+		{"deferred with stray MR does not nudge", ExitDeferred, "gt-abc123", false},
+		{"escalated without MR does not nudge", ExitEscalated, "", false},
+		{"escalated with stray MR does not nudge", ExitEscalated, "gt-abc123", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldNudgeRefinery(tt.exitType, tt.mrID); got != tt.want {
+				t.Errorf("shouldNudgeRefinery(%q, %q) = %v, want %v",
+					tt.exitType, tt.mrID, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestClearDoneIntentLabel verifies that clearDoneIntentLabel removes
 // only done-intent labels while preserving other labels.
 func TestClearDoneIntentLabel(t *testing.T) {
@@ -446,89 +518,6 @@ func TestClearDoneIntentLabel(t *testing.T) {
 	}
 }
 
-// TestNukeGateGuardLogic verifies the worktree nuke gate in runDone:
-// nuke only when exitType == COMPLETED && !pushFailed && !mrFailed.
-// GH#1945: mrFailed must block the nuke — otherwise work is lost when MR
-// bead creation fails but push succeeded.
-func TestNukeGateGuardLogic(t *testing.T) {
-	tests := []struct {
-		name       string
-		exitType   string
-		pushFailed bool
-		mrFailed   bool
-		wantNuke   bool
-	}{
-		// Happy path: everything succeeded
-		{"completed+push-ok+mr-ok", ExitCompleted, false, false, true},
-		// Push failed: preserve worktree for recovery
-		{"completed+push-failed+mr-ok", ExitCompleted, true, false, false},
-		// MR creation failed: preserve worktree (GH#1945 fix)
-		{"completed+push-ok+mr-failed", ExitCompleted, false, true, false},
-		// Both failed: definitely preserve
-		{"completed+push-failed+mr-failed", ExitCompleted, true, true, false},
-		// Non-completed exits never nuke
-		{"escalated+push-ok+mr-ok", ExitEscalated, false, false, false},
-		{"deferred+push-ok+mr-ok", ExitDeferred, false, false, false},
-		{"escalated+push-failed+mr-failed", ExitEscalated, true, true, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Replicate the guard condition from runDone (line ~940)
-			shouldNuke := tt.exitType == ExitCompleted && !tt.pushFailed && !tt.mrFailed
-			if shouldNuke != tt.wantNuke {
-				t.Errorf("shouldNuke = %v, want %v", shouldNuke, tt.wantNuke)
-			}
-		})
-	}
-}
-
-// TestSessionKillGateGuardLogic verifies the session kill gate in runDone:
-// session is killed only when !pushFailed && !mrFailed.
-// GH#1945: When push or MR fails, session must be preserved so the Witness
-// can investigate or the polecat can retry. The deferred backstop must also
-// be prevented from killing the session (sessionKilled set to true).
-func TestSessionKillGateGuardLogic(t *testing.T) {
-	tests := []struct {
-		name            string
-		pushFailed      bool
-		mrFailed        bool
-		wantSessionKill bool
-	}{
-		// Happy path: everything succeeded — kill session
-		{"push-ok+mr-ok", false, false, true},
-		// Push failed: preserve session for recovery
-		{"push-failed+mr-ok", true, false, false},
-		// MR creation failed: preserve session (GH#1945 fix)
-		{"push-ok+mr-failed", false, true, false},
-		// Both failed: definitely preserve
-		{"push-failed+mr-failed", true, true, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Replicate the guard condition from runDone's session kill section
-			shouldKillSession := !tt.pushFailed && !tt.mrFailed
-			if shouldKillSession != tt.wantSessionKill {
-				t.Errorf("shouldKillSession = %v, want %v", shouldKillSession, tt.wantSessionKill)
-			}
-
-			// Verify sessionKilled is set in BOTH paths (prevents deferred backstop)
-			sessionKilled := false
-			if tt.pushFailed || tt.mrFailed {
-				// Session preserved path — still sets sessionKilled to block backstop
-				sessionKilled = true
-			} else {
-				// Normal kill path — sets sessionKilled on success
-				sessionKilled = true
-			}
-			if !sessionKilled {
-				t.Error("sessionKilled should always be true after the gate (prevents deferred backstop)")
-			}
-		})
-	}
-}
-
 // TestMRVerificationSetsMRFailed verifies that if MR bead creation returns
 // success but the bead cannot be read back (verification fails), mrFailed
 // is set to true. This is the core fix for GH#1945: without verification,
@@ -537,9 +526,9 @@ func TestSessionKillGateGuardLogic(t *testing.T) {
 func TestMRVerificationSetsMRFailed(t *testing.T) {
 	tests := []struct {
 		name         string
-		createErr    error  // error from bd.Create
-		showErr      error  // error from bd.Show (verification)
-		showReturns  bool   // whether Show returns a non-nil issue
+		createErr    error // error from bd.Create
+		showErr      error // error from bd.Show (verification)
+		showReturns  bool  // whether Show returns a non-nil issue
 		wantMRFailed bool
 	}{
 		{
@@ -607,10 +596,10 @@ func TestMRVerificationSetsMRFailed(t *testing.T) {
 // Without this, the refinery never finds the MR and the branch sits unmerged.
 func TestMRBeadCreationUsesRig(t *testing.T) {
 	tests := []struct {
-		name     string
-		issueID  string
-		rigName  string
-		wantRig  string
+		name    string
+		issueID string
+		rigName string
+		wantRig string
 	}{
 		{
 			name:    "same-rig bead: rig is still set",
@@ -636,10 +625,10 @@ func TestMRBeadCreationUsesRig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Simulate the CreateOptions construction in done.go.
 			opts := beads.CreateOptions{
-				Title:       "Merge: " + tt.issueID,
-				Labels:      []string{"gt:merge-request"},
-				Ephemeral:   true,
-				Rig:         tt.rigName,
+				Title:     "Merge: " + tt.issueID,
+				Labels:    []string{"gt:merge-request"},
+				Ephemeral: true,
+				Rig:       tt.rigName,
 			}
 			if opts.Rig != tt.wantRig {
 				t.Errorf("CreateOptions.Rig = %q, want %q (issue %s)", opts.Rig, tt.wantRig, tt.issueID)
@@ -1024,7 +1013,7 @@ func TestReadDoneCheckpoints(t *testing.T) {
 			},
 		},
 		{
-			name:   "mixed with done-intent and other labels",
+			name: "mixed with done-intent and other labels",
 			labels: []string{
 				"gt:agent",
 				"done-intent:COMPLETED:1738972800",
@@ -1170,12 +1159,12 @@ func TestCheckpointNilMapSafe(t *testing.T) {
 // convoy merge=direct was not propagated because cross-rig dep resolution failed.
 func TestConvoyInfoFallbackChain(t *testing.T) {
 	tests := []struct {
-		name            string
-		attachmentInfo  *ConvoyInfo // Result from getConvoyInfoFromIssue
-		depInfo         *ConvoyInfo // Result from getConvoyInfoForIssue
-		wantConvoyID    string
-		wantMerge       string
-		wantNil         bool
+		name           string
+		attachmentInfo *ConvoyInfo // Result from getConvoyInfoFromIssue
+		depInfo        *ConvoyInfo // Result from getConvoyInfoForIssue
+		wantConvoyID   string
+		wantMerge      string
+		wantNil        bool
 	}{
 		{
 			name:           "attachment fields provide convoy info",
@@ -1241,9 +1230,9 @@ func TestConvoyInfoFallbackChain(t *testing.T) {
 // closing and caused infinite dispatch loops.
 func TestHookedBeadCloseNotRestrictedToHookedStatus(t *testing.T) {
 	tests := []struct {
-		name       string
-		status     string
-		wantClose  bool
+		name      string
+		status    string
+		wantClose bool
 	}{
 		{"status hooked → close", "hooked", true},
 		{"status in_progress → close", "in_progress", true},
@@ -1482,6 +1471,75 @@ func TestAutoCommitSafetyNet(t *testing.T) {
 			t.Error("runtime-only changes should be considered clean excluding runtime")
 		}
 	})
+
+	t.Run("auto-commit excludes runtime artifacts recursively", func(t *testing.T) {
+		repo := t.TempDir()
+		testRunGit(t, repo, "init")
+		testRunGit(t, repo, "config", "user.email", "test@test.com")
+		testRunGit(t, repo, "config", "user.name", "Test")
+		if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# Test\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		testRunGit(t, repo, "add", "README.md")
+		testRunGit(t, repo, "commit", "-m", "initial commit")
+
+		writeFile := func(path, content string) {
+			t.Helper()
+			fullPath := filepath.Join(repo, path)
+			if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		writeFile("src/handler.go", "package main\n\nfunc handler() {}\n")
+		writeFile(".opencode/plugins/gastown.js", "// generated\n")
+		writeFile("services/cyrus/workflow-cyrus-edge/node_modules/pkg/index.js", "module.exports = {}\n")
+		writeFile("dashboard/public/meridian-dashboard/.vite/vitest/hash/results.json", "{}\n")
+		writeFile("services/workflows/collateral-internal/execution_log.db", "sqlite\n")
+		writeFile("api/.pytest_cache/v/cache/nodeids", "[]\n")
+		writeFile("src/__pycache__/handler.cpython-312.pyc", "pyc\n")
+		writeFile(".beads/.runtime/state.json", "{}\n")
+
+		g := gitpkg.NewGit(repo)
+		ws, err := g.CheckUncommittedWork()
+		if err != nil {
+			t.Fatalf("CheckUncommittedWork: %v", err)
+		}
+		if !ws.HasUncommittedChanges || ws.CleanExcludingRuntime() {
+			t.Fatal("expected mixed source and runtime changes")
+		}
+
+		if err := g.Add("-A"); err != nil {
+			t.Fatalf("git add: %v", err)
+		}
+		if runtimePaths := ws.RuntimeArtifactPaths(); len(runtimePaths) > 0 {
+			if err := g.ResetFiles(runtimePaths...); err != nil {
+				t.Fatalf("reset runtime artifacts: %v", err)
+			}
+		}
+		if err := g.Commit("fix: auto-save uncommitted implementation work (gt-pvx safety net)"); err != nil {
+			t.Fatalf("git commit: %v", err)
+		}
+
+		changed, err := g.DiffNameOnly("HEAD~1", "HEAD")
+		if err != nil {
+			t.Fatalf("DiffNameOnly: %v", err)
+		}
+		if len(changed) != 1 || changed[0] != "src/handler.go" {
+			t.Fatalf("auto-save committed %v, want only src/handler.go", changed)
+		}
+
+		wsAfter, err := g.CheckUncommittedWork()
+		if err != nil {
+			t.Fatalf("CheckUncommittedWork after commit: %v", err)
+		}
+		if !wsAfter.HasUncommittedChanges || !wsAfter.CleanExcludingRuntime() {
+			t.Fatalf("runtime artifacts should remain uncommitted and clean-excluded, got %#v", wsAfter)
+		}
+	})
 }
 
 // TestSyncGuardWithUncommittedChanges verifies that the worktree sync guard
@@ -1523,104 +1581,6 @@ func TestSyncGuardWithUncommittedChanges(t *testing.T) {
 	}
 }
 
-// TestClosedBeadGuardSkipsMRCreation verifies that gt done skips MR creation when
-// the source bead is already closed or tombstoned (hq-3r2lb).
-// This prevents spurious duplicate MRs when an idle polecat is recycled via
-// gt sling --force and its stale session runs gt done for the previous bead.
-func TestClosedBeadGuardSkipsMRCreation(t *testing.T) {
-	tests := []struct {
-		name           string
-		issueStatus    string      // status of sourceIssueForNoMerge
-		issueIsNil     bool        // true when bd.Show failed (sourceIssueForNoMerge is nil)
-		wantSkipMR     bool        // true when MR creation should be skipped
-		wantMRFailed   bool
-	}{
-		{
-			name:         "open bead → MR creation proceeds",
-			issueStatus:  "open",
-			wantSkipMR:   false,
-			wantMRFailed: false,
-		},
-		{
-			name:         "in_progress bead → MR creation proceeds",
-			issueStatus:  "in_progress",
-			wantSkipMR:   false,
-			wantMRFailed: false,
-		},
-		{
-			name:         "hooked bead → MR creation proceeds",
-			issueStatus:  "hooked",
-			wantSkipMR:   false,
-			wantMRFailed: false,
-		},
-		{
-			name:         "closed bead → MR creation skipped (hq-3r2lb)",
-			issueStatus:  "closed",
-			wantSkipMR:   true,
-			wantMRFailed: true,
-		},
-		{
-			name:         "tombstone bead → MR creation skipped (hq-3r2lb)",
-			issueStatus:  "tombstone",
-			wantSkipMR:   true,
-			wantMRFailed: true,
-		},
-		{
-			name:         "nil source issue (bd.Show failed) → MR creation proceeds",
-			issueIsNil:   true,
-			wantSkipMR:   false,
-			wantMRFailed: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Simulate the closed-bead guard logic from done.go (hq-3r2lb)
-			var sourceIssue *beads.Issue
-			if !tt.issueIsNil {
-				sourceIssue = &beads.Issue{Status: tt.issueStatus}
-			}
-
-			mrFailed := false
-			skipMR := false
-
-			if sourceIssue != nil &&
-				(sourceIssue.Status == "closed" || sourceIssue.Status == "tombstone") {
-				mrFailed = true
-				skipMR = true
-			}
-
-			if skipMR != tt.wantSkipMR {
-				t.Errorf("skipMR = %v, want %v (status=%q)", skipMR, tt.wantSkipMR, tt.issueStatus)
-			}
-			if mrFailed != tt.wantMRFailed {
-				t.Errorf("mrFailed = %v, want %v (status=%q)", mrFailed, tt.wantMRFailed, tt.issueStatus)
-			}
-		})
-	}
-}
-
-func TestGithubRepoFromURL(t *testing.T) {
-	cases := []struct {
-		in   string
-		want string
-	}{
-		{"https://github.com/athosmartins/gastown.git", "athosmartins/gastown"},
-		{"https://github.com/athosmartins/gastown", "athosmartins/gastown"},
-		{"git@github.com:athosmartins/gastown.git", "athosmartins/gastown"},
-		{"git@github.com:gastownhall/gastown.git", "gastownhall/gastown"},
-		{"https://github.com/org/repo.git", "org/repo"},
-		{"not-a-github-url", ""},
-		{"", ""},
-	}
-	for _, c := range cases {
-		got := githubRepoFromURL(c.in)
-		if got != c.want {
-			t.Errorf("githubRepoFromURL(%q) = %q, want %q", c.in, got, c.want)
-		}
-	}
-}
-
 func testRunGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	fullArgs := append([]string{"-c", "protocol.file.allow=always"}, args...)
@@ -1631,59 +1591,3 @@ func testRunGit(t *testing.T, dir string, args ...string) {
 		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
 	}
 }
-
-// TestShouldSkipNoMRVerify covers the Option A condition introduced for wa-skj:
-// no-code polecats whose bead was already closed should bypass VerifyPushedCommit
-// in the no-MR close path. The check is meaningless there because the polecat
-// never pushed anything to main — calling VerifyPushedCommit("origin","main",HEAD)
-// always fails when origin/main has advanced past the polecat's branch HEAD.
-func TestShouldSkipNoMRVerify(t *testing.T) {
-	tests := []struct {
-		name        string
-		isPolecat   bool
-		beadStatus  string
-		wantSkip    bool
-	}{
-		{
-			name:       "polecat with closed bead — skip verify",
-			isPolecat:  true,
-			beadStatus: "closed",
-			wantSkip:   true,
-		},
-		{
-			name:       "polecat with open bead — run verify",
-			isPolecat:  true,
-			beadStatus: "open",
-			wantSkip:   false,
-		},
-		{
-			name:       "crew (non-polecat) with closed bead — run verify",
-			isPolecat:  false,
-			beadStatus: "closed",
-			wantSkip:   false,
-		},
-		{
-			name:       "crew with open bead — run verify",
-			isPolecat:  false,
-			beadStatus: "open",
-			wantSkip:   false,
-		},
-		{
-			name:       "polecat with in_progress bead — run verify",
-			isPolecat:  true,
-			beadStatus: "in_progress",
-			wantSkip:   false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := shouldSkipNoMRVerify(tt.isPolecat, tt.beadStatus)
-			if got != tt.wantSkip {
-				t.Errorf("shouldSkipNoMRVerify(isPolecat=%v, beadStatus=%q) = %v, want %v",
-					tt.isPolecat, tt.beadStatus, got, tt.wantSkip)
-			}
-		})
-	}
-}
-

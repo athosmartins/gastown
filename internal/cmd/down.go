@@ -264,7 +264,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 	// These background processes respawn per-agent Dolt servers after they're
 	// terminated, creating a race condition where rogues grab the port before
 	// the canonical server can restart. Must be stopped BEFORE Dolt shutdown.
-	idleMonitors := findIdleMonitorProcesses(townRoot)
+	idleMonitors := doltserver.FindIdleMonitorProcesses(townRoot)
 	if len(idleMonitors) > 0 {
 		if downDryRun {
 			printDownStatus("Dolt idle-monitors", true, fmt.Sprintf("%d would stop", len(idleMonitors)))
@@ -730,7 +730,7 @@ func verifyShutdown(t *tmux.Tmux, townRoot string) []string {
 	}
 
 	// Check for respawned idle-monitors
-	if pids := findIdleMonitorProcesses(townRoot); len(pids) > 0 {
+	if pids := doltserver.FindIdleMonitorProcesses(townRoot); len(pids) > 0 {
 		respawned = append(respawned, fmt.Sprintf("bd dolt idle-monitor processes (PIDs: %v)", pids))
 	}
 
@@ -796,193 +796,29 @@ func findOrphanedClaudeProcesses(townRoot string) []int {
 	return orphaned
 }
 
-// legacySocketTmux is the subset of tmux.Tmux used by the legacy socket
-// cleanup functions, extracted to allow test injection.
-type legacySocketTmux interface {
-	ListSessions() ([]string, error)
-	KillSessionWithProcesses(name string) error
-}
-
-// Test hooks — nil in production, set by tests to avoid real tmux calls.
-var (
-	legacyTmuxForTest   func(socket string) legacySocketTmux
-	legacySocketForTest func() string // overrides tmux.GetDefaultSocket()
-)
-
-func getDefaultSocket() string {
-	if legacySocketForTest != nil {
-		return legacySocketForTest()
-	}
-	return tmux.GetDefaultSocket()
-}
-
-func newLegacyTmux(socket string) legacySocketTmux {
-	if legacyTmuxForTest != nil {
-		return legacyTmuxForTest(socket)
-	}
-	return tmux.NewTmuxWithSocket(socket)
-}
-
 // cleanupLegacyDefaultSocket removes Gas Town sessions left on the "default"
 // tmux socket by old binaries. Returns the number of sessions cleaned.
 func cleanupLegacyDefaultSocket() int {
-	currentSocket := getDefaultSocket()
-	if currentSocket == "" || currentSocket == "default" {
-		return 0 // Already on the default socket, nothing to clean up
-	}
-
-	legacyTmux := newLegacyTmux("default")
-	sessions, err := legacyTmux.ListSessions()
-	if err != nil {
-		return 0 // No server on default socket
-	}
-
-	var cleaned int
-	for _, sess := range sessions {
-		if session.IsKnownSession(sess) {
-			if err := legacyTmux.KillSessionWithProcesses(sess); err == nil {
-				cleaned++
-			}
-		}
-	}
-	return cleaned
+	return session.CleanupLegacyDefaultSocket()
 }
 
 // countLegacyDefaultSocketSessions counts Gas Town sessions on the "default"
 // tmux socket (for dry-run output).
 func countLegacyDefaultSocketSessions() int {
-	currentSocket := getDefaultSocket()
-	if currentSocket == "" || currentSocket == "default" {
-		return 0
-	}
-
-	legacyTmux := newLegacyTmux("default")
-	sessions, err := legacyTmux.ListSessions()
-	if err != nil {
-		return 0
-	}
-
-	var count int
-	for _, sess := range sessions {
-		if session.IsKnownSession(sess) {
-			count++
-		}
-	}
-	return count
+	return session.CountLegacyDefaultSocketSessions()
 }
 
 // cleanupLegacyBaseSocket removes Gas Town sessions left on the old basename-only
 // tmux socket (e.g., "gt") by binaries from before path-hashed socket names were
 // introduced (e.g., "gt-a1b2c3"). Returns the number of sessions cleaned.
 func cleanupLegacyBaseSocket(townRoot string) int {
-	currentSocket := getDefaultSocket()
-	legacySocket := session.LegacySocketName(townRoot)
-	if currentSocket == legacySocket {
-		return 0 // Same socket, no migration needed
-	}
-
-	legacyTmux := newLegacyTmux(legacySocket)
-	sessions, err := legacyTmux.ListSessions()
-	if err != nil {
-		return 0 // No server on legacy socket
-	}
-
-	var cleaned int
-	for _, sess := range sessions {
-		if session.IsKnownSession(sess) {
-			if err := legacyTmux.KillSessionWithProcesses(sess); err == nil {
-				cleaned++
-			}
-		}
-	}
-	return cleaned
+	return session.CleanupLegacyBaseSocket(townRoot)
 }
 
 // countLegacyBaseSocketSessions counts Gas Town sessions on the old basename-only
 // tmux socket (for dry-run output).
 func countLegacyBaseSocketSessions(townRoot string) int {
-	currentSocket := getDefaultSocket()
-	legacySocket := session.LegacySocketName(townRoot)
-	if currentSocket == legacySocket {
-		return 0
-	}
-
-	legacyTmux := newLegacyTmux(legacySocket)
-	sessions, err := legacyTmux.ListSessions()
-	if err != nil {
-		return 0
-	}
-
-	var count int
-	for _, sess := range sessions {
-		if session.IsKnownSession(sess) {
-			count++
-		}
-	}
-	return count
-}
-
-// findIdleMonitorProcesses finds bd dolt idle-monitor processes scoped to
-// this town. Matches by town root path in the process args, or by the
-// town's configured Dolt port. Processes from other towns are not matched.
-func findIdleMonitorProcesses(townRoot string) []int {
-	absRoot, _ := filepath.Abs(townRoot)
-	if absRoot == "" {
-		return nil
-	}
-	config := doltserver.DefaultConfig(townRoot)
-	portStr := strconv.Itoa(config.Port)
-
-	out, err := exec.Command("ps", "-eo", "pid,args").Output()
-	if err != nil {
-		return nil
-	}
-
-	var pids []int
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if !strings.Contains(line, "idle-monitor") || !strings.Contains(line, "dolt") {
-			continue
-		}
-		if strings.Contains(line, "grep") {
-			continue
-		}
-
-		// Scope to this town: match by path (with boundary check to avoid
-		// false matches on sibling paths like /tmp/gt matching /tmp/gt-old)
-		matchesTown := containsPathBoundary(line, absRoot) || containsPathBoundary(line, townRoot)
-		if !matchesTown {
-			// Check for --port <portStr> as a discrete argument
-			args := strings.Fields(line)
-			for i, arg := range args {
-				if (arg == "--port" || arg == "-p") && i+1 < len(args) && args[i+1] == portStr {
-					matchesTown = true
-					break
-				}
-				if strings.HasPrefix(arg, "--port="+portStr) {
-					matchesTown = true
-					break
-				}
-			}
-		}
-		if !matchesTown {
-			continue
-		}
-
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		pid, err := strconv.Atoi(fields[0])
-		if err != nil {
-			continue
-		}
-		pids = append(pids, pid)
-	}
-	return pids
+	return session.CountLegacyBaseSocketSessions(townRoot)
 }
 
 // stopIdleMonitors terminates idle-monitor processes.
@@ -1179,29 +1015,4 @@ func isSafeToRemoveBeadsDolt(dir string) bool {
 	}
 
 	return true
-}
-
-// containsPathBoundary checks whether line contains path as a complete path
-// (not a prefix of a longer path). The character after the match must be a
-// path separator, whitespace, or end-of-string.
-func containsPathBoundary(line, path string) bool {
-	if path == "" {
-		return false
-	}
-	for start := 0; start < len(line); {
-		idx := strings.Index(line[start:], path)
-		if idx < 0 {
-			return false
-		}
-		end := start + idx + len(path)
-		if end >= len(line) {
-			return true
-		}
-		c := line[end]
-		if c == filepath.Separator || c == ' ' || c == '\t' {
-			return true
-		}
-		start = start + idx + 1
-	}
-	return false
 }

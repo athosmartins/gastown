@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"text/template"
@@ -117,7 +118,7 @@ the rig's settings/config.json under workflow.default_formula.
 
 Options:
   --pr=N        Run formula on GitHub PR #N
-  --rig=NAME    Target specific rig (default: current or gastown)
+  --rig=NAME    Target specific rig (default: inferred from cwd, or sole registered rig)
   --agent=ALIAS Override agent/runtime for all legs (e.g., gemini, codex)
   --dry-run     Show what would happen without executing
 
@@ -168,7 +169,7 @@ func init() {
 
 	// Run flags
 	formulaRunCmd.Flags().IntVar(&formulaRunPR, "pr", 0, "GitHub PR number to run formula on")
-	formulaRunCmd.Flags().StringVar(&formulaRunRig, "rig", "", "Target rig (default: current or gastown)")
+	formulaRunCmd.Flags().StringVar(&formulaRunRig, "rig", "", "Target rig (default: inferred from cwd, or sole registered rig)")
 	formulaRunCmd.Flags().BoolVar(&formulaRunDryRun, "dry-run", false, "Preview execution without running")
 	formulaRunCmd.Flags().StringVar(&formulaRunAgent, "agent", "", "Override agent/runtime for all legs (e.g., gemini, codex, claude-haiku)")
 	formulaRunCmd.Flags().StringSliceVar(&formulaRunFiles, "files", nil, "Files to pass to formula legs (available as {{.files}} in templates)")
@@ -231,14 +232,20 @@ func runFormulaRun(cmd *cobra.Command, args []string) error {
 					rigPath = r.Path
 				}
 			}
-			// If we still don't have a target rig but have townRoot, use gastown
+			// Still no rig — auto-select when there is exactly one registered rig,
+			// otherwise surface a helpful error (e.g. Deacon at HQ level on
+			// non-default installs where "gastown" rig does not exist).
 			if targetRig == "" {
-				targetRig = "gastown"
-				rigPath = filepath.Join(townRoot, "gastown")
+				name, path, inferErr := autoInferRig(townRoot)
+				if inferErr != nil {
+					return inferErr
+				}
+				targetRig = name
+				rigPath = path
 			}
 		} else {
-			// No town root found, fall back to gastown without rigPath
-			targetRig = "gastown"
+			// No town root found, cannot determine target rig
+			return fmt.Errorf("cannot determine target rig: not in a Gas Town workspace; use --rig=NAME")
 		}
 	} else {
 		// If rig specified, construct path
@@ -467,10 +474,11 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 
 	createArgs := []string{
 		"create",
-		"--type=convoy",
+		"--type=task",
 		"--id=" + convoyID,
 		"--title=" + convoyTitle,
 		"--description=" + description,
+		"--labels=gt:convoy",
 	}
 	if beads.NeedsForceForID(convoyID) {
 		createArgs = append(createArgs, "--force")
@@ -669,18 +677,7 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		// Agent precedence (GH#2118): per-leg > CLI --agent > formula-level
 		legAgent := resolveFormulaLegAgent(leg.Agent, formulaRunAgent, f.Agent)
 
-		// Use gt sling with args for leg-specific context
-		slingArgs := []string{
-			"sling", legBeadID, targetRig,
-			"-a", leg.Description,
-			"-s", leg.Title,
-		}
-		if legAgent != "" {
-			slingArgs = append(slingArgs, "--agent", legAgent)
-		}
-		if leg.ReviewOnly || f.ReviewOnly {
-			slingArgs = append(slingArgs, "--review-only")
-		}
+		slingArgs := buildConvoyLegSlingArgs(legBeadID, targetRig, leg.Description, leg.Title, legAgent, leg.ReviewOnly || f.ReviewOnly)
 
 		slingCmd := exec.Command("gt", slingArgs...)
 		slingCmd.Stdout = os.Stdout
@@ -759,10 +756,11 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 
 	createArgs := []string{
 		"create",
-		"--type=convoy", // reuse convoy type for workflow tracking
+		"--type=task",
 		"--id=" + workflowID,
 		"--title=" + workflowTitle,
 		"--description=" + description,
+		"--labels=gt:convoy,gt:workflow",
 	}
 	if beads.NeedsForceForID(workflowID) {
 		createArgs = append(createArgs, "--force")
@@ -780,13 +778,11 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 
 	// Step 2: Create step beads and wire dependencies
 	stepBeads := make(map[string]string) // step.ID -> bead ID
+	setVars := parseSetVars(formulaRunSet)
 
 	for _, step := range f.Steps {
 		stepBeadID := fmt.Sprintf("%s-wfs-%s", rigPrefix, generateFormulaShortID())
-
-		// Step descriptions contain {{var}} placeholders (e.g., {{problem}},
-		// {{context}}) that are instructions for the executing AGENT, not Go
-		// template vars. Do not render them — pass through verbatim.
+		stepDescription := workflowStepDescription(step, substituteFormulaVars(step.Description, setVars))
 
 		// Use --body-file=- (stdin) for the description to avoid CLI arg
 		// length limits and quoting issues with large markdown descriptions.
@@ -806,7 +802,7 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 			Dir(rigBeadsDir).
 			Stderr(os.Stderr).
 			Build()
-		createCmd.Stdin = strings.NewReader(step.Description)
+		createCmd.Stdin = strings.NewReader(stepDescription)
 		if err := createCmd.Run(); err != nil {
 			fmt.Printf("%s Failed to create step bead for %s: %v\n",
 				style.Dim.Render("Warning:"), step.ID, err)
@@ -881,21 +877,17 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 			continue
 		}
 
-		// Non-interactive step: sling to a polecat
+		// Non-interactive step: sling to the step's target, or to the rig's
+		// polecat pool by default.
 		// Agent precedence: CLI --agent > formula-level
 		stepAgent := formulaRunAgent
 		if stepAgent == "" {
 			stepAgent = f.Agent
 		}
+		stepTarget := workflowStepTarget(step, targetRig)
+		stepDescription := workflowStepDescription(step, substituteFormulaVars(step.Description, setVars))
 
-		slingArgs := []string{
-			"sling", stepBeadID, targetRig,
-			"-a", step.Description,
-			"-s", step.Title,
-		}
-		if stepAgent != "" {
-			slingArgs = append(slingArgs, "--agent", stepAgent)
-		}
+		slingArgs := buildWorkflowStepSlingArgs(stepBeadID, stepTarget, stepDescription, step.Title, stepAgent)
 
 		slingCmd := exec.Command("gt", slingArgs...)
 		slingCmd.Stdout = os.Stdout
@@ -932,6 +924,24 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 	return nil
 }
 
+const workflowTargetField = "workflow_target"
+
+func workflowStepDescription(step formula.Step, description string) string {
+	target := strings.TrimSpace(step.Target)
+	if target == "" {
+		return description
+	}
+	return fmt.Sprintf("%s: %s\n\n%s", workflowTargetField, target, description)
+}
+
+func workflowStepTarget(step formula.Step, targetRig string) string {
+	target := strings.TrimSpace(step.Target)
+	if target == "" || target == "rig" {
+		return targetRig
+	}
+	return target
+}
+
 // truncate shortens a string to maxLen, appending "..." if truncated.
 // Truncates at the first newline if one appears before maxLen.
 func truncate(s string, maxLen int) string {
@@ -944,6 +954,41 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
+// buildConvoyLegSlingArgs constructs the gt-sling argument list for a convoy leg.
+// --no-convoy is always included: legs are tracked by the parent convoy, so per-leg
+// auto-convoy creation is redundant (closes #3856).
+func buildConvoyLegSlingArgs(beadID, targetRig, description, title, agent string, reviewOnly bool) []string {
+	args := []string{
+		"sling", beadID, targetRig,
+		"-a", description,
+		"-s", title,
+		"--no-convoy",
+	}
+	if agent != "" {
+		args = append(args, "--agent", agent)
+	}
+	if reviewOnly {
+		args = append(args, "--review-only")
+	}
+	return args
+}
+
+// buildWorkflowStepSlingArgs constructs the gt-sling argument list for a workflow step.
+// --no-convoy is always included: steps are tracked by the parent workflow bead, so
+// per-step auto-convoy creation is redundant (closes #3856).
+func buildWorkflowStepSlingArgs(beadID, targetRig, description, title, agent string) []string {
+	args := []string{
+		"sling", beadID, targetRig,
+		"-a", description,
+		"-s", title,
+		"--no-convoy",
+	}
+	if agent != "" {
+		args = append(args, "--agent", agent)
+	}
+	return args
+}
+
 // parseSetVars parses --set key=value pairs into a map for template rendering.
 func parseSetVars(setArgs []string) map[string]interface{} {
 	vars := make(map[string]interface{})
@@ -953,6 +998,25 @@ func parseSetVars(setArgs []string) map[string]interface{} {
 		}
 	}
 	return vars
+}
+
+var formulaVarPlaceholder = regexp.MustCompile(`\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}`)
+
+func substituteFormulaVars(text string, vars map[string]interface{}) string {
+	if len(vars) == 0 {
+		return text
+	}
+	return formulaVarPlaceholder.ReplaceAllStringFunc(text, func(match string) string {
+		sub := formulaVarPlaceholder.FindStringSubmatch(match)
+		if len(sub) < 2 {
+			return match
+		}
+		v, ok := vars[sub[1]]
+		if !ok {
+			return match
+		}
+		return fmt.Sprint(v)
+	})
 }
 
 // findFormulaFile searches for a formula file by name

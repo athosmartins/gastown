@@ -96,19 +96,22 @@ if [ "$*" = "--allow-stale version" ]; then
   exit 0
 fi
 
-if [ -n "$BEADS_DIR" ]; then
-  echo "BEADS_DIR leaked: $BEADS_DIR" >&2
+if [ "$BEADS_DIR" != "%s/.beads" ]; then
+  echo "expected hardened BEADS_DIR, got $BEADS_DIR" >&2
   exit 1
 fi
 
 case "$*" in
-  "list --type=convoy --json --all")
-    if [ "$PWD" != "%s" ]; then
-      echo "expected town root, got $PWD" >&2
-      exit 1
-    fi
-    echo '[{"id":"hq-cv-town","title":"Town convoy","status":"open","created_at":"2026-03-09T00:00:00Z"}]'
-    ;;
+	  "list --label=gt:convoy --json --limit=0 --all --flat")
+	    if [ "$PWD" != "%s" ]; then
+	      echo "expected town root, got $PWD" >&2
+	      exit 1
+	    fi
+	    echo '[{"id":"hq-cv-town","title":"Town convoy","status":"open","created_at":"2026-03-09T00:00:00Z","labels":["gt:convoy"]}]'
+	    ;;
+	  "list --json --limit=0 --all --flat")
+	    echo '[]'
+	    ;;
   "dep list hq-cv-town --direction=down --type=tracks --allow-stale --json")
     if [ "$PWD" != "%s" ]; then
       echo "expected town root, got $PWD" >&2
@@ -128,7 +131,7 @@ case "$*" in
     exit 1
     ;;
 esac
-`, expectedWD, expectedWD, expectedWD)
+`, expectedWD, expectedWD, expectedWD, expectedWD)
 	writeRoutingBdStub(t, scriptBody)
 
 	oldJSON, oldAll, oldStatus, oldTree := convoyListJSON, convoyListAll, convoyListStatus, convoyListTree
@@ -169,8 +172,8 @@ if [ "$*" = "--allow-stale version" ]; then
   exit 0
 fi
 
-if [ -n "$BEADS_DIR" ]; then
-  echo "BEADS_DIR leaked: $BEADS_DIR" >&2
+if [ "$BEADS_DIR" != "%s/.beads" ]; then
+  echo "expected hardened BEADS_DIR, got $BEADS_DIR" >&2
   exit 1
 fi
 
@@ -194,7 +197,7 @@ case "$*" in
     exit 1
     ;;
 esac
-`, expectedWD, expectedWD)
+`, expectedWD, expectedWD, expectedWD)
 	writeRoutingBdStub(t, scriptBody)
 
 	oldJSON := convoyStatusJSON

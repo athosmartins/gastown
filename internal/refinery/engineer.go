@@ -26,17 +26,6 @@ import (
 	"github.com/steveyegge/gastown/internal/util"
 )
 
-func stripEnvKey(env []string, key string) []string {
-	prefix := key + "="
-	filtered := env[:0]
-	for _, entry := range env {
-		if !strings.HasPrefix(entry, prefix) {
-			filtered = append(filtered, entry)
-		}
-	}
-	return filtered
-}
-
 // shortSHA returns at most 8 characters of a SHA for display.
 func shortSHA(sha string) string {
 	if len(sha) > 8 {
@@ -251,7 +240,6 @@ type MRAnomaly struct {
 	Detail   string        `json:"detail"`
 }
 
-
 // errMergeSlotTimeout is returned by acquireMainPushSlot when retries are
 // exhausted due to slot contention. Infrastructure errors (beads down,
 // permission errors) return a different error so callers can distinguish
@@ -270,7 +258,7 @@ type Engineer struct {
 	beads                 *beads.Beads
 	git                   *git.Git
 	config                *MergeQueueConfig
-	prProvider            PRProvider   // VCS-specific PR operations (nil when MergeStrategy != "pr")
+	prProvider            PRProvider // VCS-specific PR operations (nil when MergeStrategy != "pr")
 	workDir               string
 	output                io.Writer    // Output destination for user-facing messages
 	router                *mail.Router // Mail router for sending protocol messages
@@ -360,21 +348,21 @@ func (e *Engineer) LoadConfig() error {
 	// Parse merge_queue section into our config struct
 	// We need special handling for poll_interval (string -> Duration)
 	var mqRaw struct {
-		Enabled              *bool                      `json:"enabled"`
-		OnConflict           *string                    `json:"on_conflict"`
-		RunTests             *bool                      `json:"run_tests"`
-		TestCommand          *string                    `json:"test_command"`
-		DeleteMergedBranches *bool                      `json:"delete_merged_branches"`
-		RetryFlakyTests      *int                       `json:"retry_flaky_tests"`
-		PollInterval         *string                    `json:"poll_interval"`
-		MaxConcurrent        *int                       `json:"max_concurrent"`
-		StaleClaimTimeout    *string                    `json:"stale_claim_timeout"`
-		Gates                map[string]*gateConfigRaw  `json:"gates"`
-		GatesParallel        *bool                      `json:"gates_parallel"`
-		AutoPush             *bool                      `json:"auto_push"`
-		MergeStrategy        *string                    `json:"merge_strategy"`
-		VCSProvider          *string                    `json:"vcs_provider"`
-		RequireReview        *bool                      `json:"require_review"`
+		Enabled              *bool                     `json:"enabled"`
+		OnConflict           *string                   `json:"on_conflict"`
+		RunTests             *bool                     `json:"run_tests"`
+		TestCommand          *string                   `json:"test_command"`
+		DeleteMergedBranches *bool                     `json:"delete_merged_branches"`
+		RetryFlakyTests      *int                      `json:"retry_flaky_tests"`
+		PollInterval         *string                   `json:"poll_interval"`
+		MaxConcurrent        *int                      `json:"max_concurrent"`
+		StaleClaimTimeout    *string                   `json:"stale_claim_timeout"`
+		Gates                map[string]*gateConfigRaw `json:"gates"`
+		GatesParallel        *bool                     `json:"gates_parallel"`
+		AutoPush             *bool                     `json:"auto_push"`
+		MergeStrategy        *string                   `json:"merge_strategy"`
+		VCSProvider          *string                   `json:"vcs_provider"`
+		RequireReview        *bool                     `json:"require_review"`
 	}
 
 	if err := json.Unmarshal(rawConfig.MergeQueue, &mqRaw); err != nil {
@@ -888,7 +876,6 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 	}
 }
 
-
 func (e *Engineer) acquireMainPushSlot(ctx context.Context) (string, error) {
 	slotID, err := e.mergeSlotEnsureExists()
 	if err != nil {
@@ -1284,7 +1271,7 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 
 	// 1.5. Clear agent bead's active_mr reference (traceability cleanup)
 	if mr.AgentBead != "" {
-		if err := e.beads.UpdateAgentActiveMR(mr.AgentBead, ""); err != nil {
+		if err := e.clearAgentActiveMR(mr.AgentBead); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to clear agent bead %s active_mr: %v\n", mr.AgentBead, err)
 		}
 	}
@@ -1336,6 +1323,10 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 
 	// 5. Log success
 	_, _ = fmt.Fprintf(e.output, "[Engineer] ✓ Merged: %s (commit: %s)\n", mr.ID, result.MergeCommit)
+}
+
+func (e *Engineer) clearAgentActiveMR(agentBeadID string) error {
+	return e.beads.ForAgentBead().UpdateAgentActiveMR(agentBeadID, "")
 }
 
 // HandleMRInfoFailure handles a failed merge from MRInfo.
@@ -1987,17 +1978,26 @@ type convoyInfo struct {
 	Description string
 }
 
+func refineryHasLabel(labels []string, target string) bool {
+	for _, label := range labels {
+		if label == target {
+			return true
+		}
+	}
+	return false
+}
+
 // checkAndCloseCompletedConvoys finds and closes convoys where all tracked issues
 // are complete. Returns the list of convoys that were closed.
 func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []convoyInfo {
-	bdEnv := stripEnvKey(os.Environ(), "BEADS_DIR")
+	townReadEnv := beads.BuildReadOnlyPinnedBDEnv(os.Environ(), townBeads)
+	townMutationEnv := beads.BuildMutationPinnedBDEnv(os.Environ(), townBeads)
+	routingReadEnv := beads.BuildReadOnlyRoutingBDEnv(os.Environ(), townBeads)
 
-	// List all open convoys
-	listArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"list", "--type=convoy", "--status=open", "--json"})
-	listCmd := exec.Command("bd", listArgs...)
-	util.SetDetachedProcessGroup(listCmd)
-	listCmd.Dir = townBeads
-	listCmd.Env = bdEnv
+	// List all open issues and filter locally so legacy type=convoy beads remain visible.
+	listArgs := beads.InjectFlatForListJSON([]string{"list", "--status=open", "--json", "--limit=0"})
+	listArgs = beads.MaybePrependAllowStaleWithEnv(townReadEnv, listArgs)
+	listCmd := beads.Command(townBeads, townBeads, beads.ReadOnlyPinned, listArgs...)
 	var stdout bytes.Buffer
 	listCmd.Stdout = &stdout
 
@@ -2007,10 +2007,12 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 	}
 
 	var convoys []struct {
-		ID          string `json:"id"`
-		Title       string `json:"title"`
-		Status      string `json:"status"`
-		Description string `json:"description"`
+		ID          string   `json:"id"`
+		Title       string   `json:"title"`
+		Status      string   `json:"status"`
+		Description string   `json:"description"`
+		IssueType   string   `json:"issue_type"`
+		Labels      []string `json:"labels"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to parse convoy list: %v\n", err)
@@ -2020,12 +2022,12 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 	var closed []convoyInfo
 
 	for _, convoy := range convoys {
+		if convoy.IssueType != "convoy" && !refineryHasLabel(convoy.Labels, "gt:convoy") {
+			continue
+		}
 		// Get tracked issues for this convoy via bd dep list
-		depArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"dep", "list", convoy.ID, "--direction=down", "--type=tracks", "--json"})
-		depCmd := exec.Command("bd", depArgs...)
-		util.SetDetachedProcessGroup(depCmd)
-		depCmd.Dir = townRoot
-		depCmd.Env = bdEnv
+		depArgs := beads.MaybePrependAllowStaleWithEnv(townReadEnv, []string{"dep", "list", convoy.ID, "--direction=down", "--type=tracks", "--json"})
+		depCmd := beads.Command(townRoot, townBeads, beads.ReadOnlyPinned, depArgs...)
 		var depOut bytes.Buffer
 		depCmd.Stdout = &depOut
 
@@ -2054,11 +2056,8 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 			}
 
 			// Get fresh status from home rig via bd show with routing
-			showArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"show", depID, "--json"})
-			showCmd := exec.Command("bd", showArgs...)
-			util.SetDetachedProcessGroup(showCmd)
-			showCmd.Dir = townRoot
-			showCmd.Env = bdEnv
+			showArgs := beads.MaybePrependAllowStaleWithEnv(routingReadEnv, []string{"show", depID, "--json"})
+			showCmd := beads.Command(townRoot, townBeads, beads.ReadOnlyRouting, showArgs...)
 			var showOut bytes.Buffer
 			showCmd.Stdout = &showOut
 
@@ -2092,11 +2091,8 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 			reason = "Empty convoy — auto-closed as definitionally complete"
 		}
 
-		closeArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"close", convoy.ID, "-r", reason})
-		closeCmd := exec.Command("bd", closeArgs...)
-		util.SetDetachedProcessGroup(closeCmd)
-		closeCmd.Dir = townBeads
-		closeCmd.Env = bdEnv
+		closeArgs := beads.MaybePrependAllowStaleWithEnv(townMutationEnv, []string{"close", convoy.ID, "-r", reason})
+		closeCmd := beads.Command(townBeads, townBeads, beads.MutationPinned, closeArgs...)
 
 		if err := closeCmd.Run(); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close convoy %s: %v\n", convoy.ID, err)
@@ -2131,8 +2127,10 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 
 // notifyConvoyCompletion sends notifications to convoy owner and notify addresses.
 func (e *Engineer) notifyConvoyCompletion(townRoot, convoyID, title, description string) {
-	// ZFC: Use typed accessor instead of parsing description text
-	fields := beads.ParseConvoyFields(&beads.Issue{Description: description})
+	fields, shouldNotify := e.claimConvoyCompletionNotification(townRoot, convoyID, description)
+	if !shouldNotify {
+		return
+	}
 	for _, addr := range fields.NotificationAddresses() {
 		mailCmd := exec.Command("gt", "mail", "send", addr,
 			"-s", fmt.Sprintf("🚚 Convoy landed: %s", title),
@@ -2143,6 +2141,45 @@ func (e *Engineer) notifyConvoyCompletion(townRoot, convoyID, title, description
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not notify %s: %v\n", addr, err)
 		}
 	}
+}
+
+func (e *Engineer) claimConvoyCompletionNotification(townRoot, convoyID, fallbackDescription string) (*beads.ConvoyFields, bool) {
+	townBeads := filepath.Join(townRoot, ".beads")
+	description := fallbackDescription
+
+	readEnv := beads.BuildReadOnlyPinnedBDEnv(os.Environ(), townBeads)
+	showArgs := beads.MaybePrependAllowStaleWithEnv(readEnv, []string{"show", convoyID, "--json"})
+	showCmd := beads.Command(townBeads, townBeads, beads.ReadOnlyPinned, showArgs...)
+	var showOut bytes.Buffer
+	showCmd.Stdout = &showOut
+	if err := showCmd.Run(); err == nil && showOut.Len() > 0 {
+		var convoys []struct {
+			Description string `json:"description"`
+		}
+		if err := json.Unmarshal(showOut.Bytes(), &convoys); err == nil && len(convoys) > 0 {
+			description = convoys[0].Description
+		}
+	}
+
+	fields := beads.ParseConvoyFields(&beads.Issue{Description: description})
+	if fields == nil {
+		fields = &beads.ConvoyFields{}
+	}
+	if fields.CompletionNotifiedAt != "" {
+		return fields, false
+	}
+
+	fields.CompletionNotifiedAt = time.Now().UTC().Format(time.RFC3339)
+	newDesc := beads.SetConvoyFields(&beads.Issue{Description: description}, fields)
+	mutationEnv := beads.BuildMutationPinnedBDEnv(os.Environ(), townBeads)
+	updateArgs := beads.MaybePrependAllowStaleWithEnv(mutationEnv, []string{"update", convoyID, "--description=" + newDesc})
+	updateCmd := beads.Command(townBeads, townBeads, beads.MutationPinned, updateArgs...)
+	if err := updateCmd.Run(); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not record convoy completion notification state for %s: %v\n", convoyID, err)
+		return fields, false
+	}
+
+	return fields, true
 }
 
 // landConvoySwarm checks if a completed convoy has an associated swarm with an

@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/doltserver"
 )
@@ -35,46 +37,45 @@ func (o dsnOpts) queryString() string {
 	return strings.Join(parts, "&")
 }
 
-// localDoltSocketPath returns the path to Dolt's local unix socket if one is
-// listening, or "" if no socket can be found.
-//
-// Path-derivation: Dolt's source default is `/tmp/mysql.sock` regardless of
-// port, unless the user explicitly sets `socket: /tmp/mysql.<port>.sock` in
-// config.yaml. We try the port-suffixed path FIRST (so explicitly-configured
-// setups still resolve correctly), then fall back to the unprefixed default.
-// (dc-y69y) Earlier versions only tried the port-suffixed path, which caused
-// every gt-CLI subcommand on a non-3306 Dolt to bypass the socket and fall
-// back to TCP — recreating the TIME_WAIT pile-up the socket migration was
-// supposed to eliminate.
+// localDoltSocketPath returns Dolt's default unix socket path for a given
+// port if a unix socket is currently accepting connections at that path;
+// otherwise returns "". Mirrors the path-derivation logic already in this
+// package (see internal/doltserver/doltserver.go cleanStaleDoltSocket):
+// Dolt listens on /tmp/mysql.sock on port 3306, /tmp/mysql.{port}.sock for
+// any other port.
 //
 // Declared as a var (not const) so unit tests can swap it for a temp-dir
 // socket without depending on a real Dolt server.
-// doltSocketCandidates returns the ordered list of paths the helper should
-// try, with the explicitly-port-suffixed candidate first (so user-configured
-// custom-port setups still work) and Dolt's source-default unprefixed path
-// last (the actual fallback for vanilla servers on any port). Pure / no I/O
-// — easy to unit-test the ordering invariants.
-func doltSocketCandidates(port int) []string {
-	out := make([]string, 0, 2)
+var localDoltSocketPath = func(port int) string {
+	p := "/tmp/mysql.sock"
 	if port != 0 && port != 3306 {
-		out = append(out, fmt.Sprintf("/tmp/mysql.%d.sock", port))
+		p = fmt.Sprintf("/tmp/mysql.%d.sock", port)
 	}
-	out = append(out, "/tmp/mysql.sock")
-	return out
+	info, err := os.Stat(p)
+	if err != nil {
+		return ""
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return ""
+	}
+	conn, err := net.DialTimeout("unix", p, 100*time.Millisecond)
+	if err != nil {
+		return ""
+	}
+	_ = conn.Close()
+	return p
 }
 
-var localDoltSocketPath = func(port int) string {
-	for _, p := range doltSocketCandidates(port) {
-		info, err := os.Stat(p)
-		if err != nil {
-			continue
-		}
-		if info.Mode()&os.ModeSocket == 0 {
-			continue
-		}
-		return p
+func formatDoltDSN(user, network, address, dbName string, opts dsnOpts) string {
+	if user == "" {
+		user = "root"
 	}
-	return ""
+	qs := opts.queryString()
+	dsn := fmt.Sprintf("%s@%s(%s)/%s", user, network, address, dbName)
+	if qs == "" {
+		return dsn
+	}
+	return dsn + "?" + qs
 }
 
 // buildDoltDSN produces a Go-MySQL-driver DSN that prefers the local
@@ -96,29 +97,24 @@ var localDoltSocketPath = func(port int) string {
 // point so future callsites get socket-first transport for free.
 //
 // Conservative semantics: callers receive the TCP DSN whenever the
-// default Dolt socket is not currently a unix socket at the expected
-// path (Windows, no Dolt running, custom socket path). No behavior
-// change for setups without a local Dolt.
+// default Dolt socket is not currently usable at the expected path
+// (Windows, no Dolt running, custom socket path). No behavior change for
+// setups without a local Dolt.
 func buildDoltDSN(user string, port int, dbName string, opts dsnOpts) string {
-	if user == "" {
-		user = "root"
-	}
-	qs := opts.queryString()
 	if sock := localDoltSocketPath(port); sock != "" {
-		if qs == "" {
-			return fmt.Sprintf("%s@unix(%s)/%s", user, sock, dbName)
-		}
-		return fmt.Sprintf("%s@unix(%s)/%s?%s", user, sock, dbName, qs)
+		return formatDoltDSN(user, "unix", sock, dbName, opts)
 	}
-	if qs == "" {
-		return fmt.Sprintf("%s@tcp(127.0.0.1:%d)/%s", user, port, dbName)
-	}
-	return fmt.Sprintf("%s@tcp(127.0.0.1:%d)/%s?%s", user, port, dbName, qs)
+	return formatDoltDSN(user, "tcp", fmt.Sprintf("127.0.0.1:%d", port), dbName, opts)
 }
 
-// buildDoltDSNFromConfig is a convenience wrapper that pulls user + port
-// from a *doltserver.Config (matches the maintain.go / dolt_flatten.go
-// / dolt_rebase.go callsite pattern).
+// buildDoltDSNFromConfig is a convenience wrapper that pulls user, port,
+// and host from a *doltserver.Config (matches the maintain.go /
+// dolt_flatten.go / dolt_rebase.go callsite pattern).
 func buildDoltDSNFromConfig(c *doltserver.Config, dbName string, opts dsnOpts) string {
-	return buildDoltDSN(c.User, c.Port, dbName, opts)
+	if !c.IsRemote() {
+		if sock := localDoltSocketPath(c.Port); sock != "" {
+			return formatDoltDSN(c.User, "unix", sock, dbName, opts)
+		}
+	}
+	return formatDoltDSN(c.User, "tcp", c.HostPort(), dbName, opts)
 }

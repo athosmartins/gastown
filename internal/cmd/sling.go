@@ -320,6 +320,13 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 			return err
 		}
 	}
+	if len(args) == 2 {
+		if redirected, err := applyWorkflowStepTargetOverride(args); err != nil {
+			return err
+		} else {
+			args = redirected
+		}
+	}
 
 	// Config-driven dispatch mode: check scheduler.max_polecats
 	deferred, deferErr := shouldDeferDispatch()
@@ -446,7 +453,10 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 			}
 			if verifyBeadExists(args[0]) != nil {
 				if verifyFormulaExists(args[0]) == nil {
-					return fmt.Errorf("standalone formula cannot be scheduled (use --on <bead>)")
+					// Standalone formula slinging (cook+wisp+attach) is not bead-based
+					// dispatch and does not consume a scheduler slot — fall through to
+					// runSlingFormula, which handles polecat spawning via resolveTarget.
+					return runSlingFormula(ctx, args)
 				}
 			}
 			beadID := args[0]
@@ -574,8 +584,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 			// Not a verified bead - try as standalone formula
 			if err := verifyFormulaExists(firstArg); err == nil {
 				// Standalone formula mode: gt sling <formula> [target]
-				// Standalone formula: deferred dispatch is handled above (formula-on-bead),
-				// so no scheduler check needed here.
+				// Deferred dispatch is handled above for the 2-arg rig case (gh#3917).
 				return runSlingFormula(ctx, args)
 			}
 			// Not a formula either - check if it looks like a bead ID (routing issue workaround).
@@ -716,9 +725,35 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	targetPane := resolved.Pane
 	hookWorkDir := resolved.WorkDir
 	hookSetAtomically := resolved.HookSetAtomically
+	var admission *polecatAdmissionHandle
+	if !slingDryRun && !hookSetAtomically && strings.Contains(targetAgent, "/polecats/") {
+		parts := strings.Split(targetAgent, "/")
+		if len(parts) >= 3 {
+			var snapshot polecatCapacitySnapshot
+			admission, snapshot, err = acquirePolecatAdmissionFn(townRoot, parts[0], beadID, "direct-target")
+			if err != nil {
+				return err
+			}
+			defer admission.Release()
+			if snapshot.Max > 0 {
+				fmt.Printf("%s Polecat capacity reserved (%d free of %d)\n", style.Dim.Render("○"), snapshot.Free, snapshot.Max)
+			}
+		}
+	}
 	delayedDogInfo := resolved.DelayedDogInfo
 	newPolecatInfo := resolved.NewPolecatInfo
 	isSelfSling := resolved.IsSelfSling
+	rollbackSpawnedPolecat := func(reason string) {
+		if newPolecatInfo == nil {
+			return
+		}
+		fmt.Printf("%s %s, rolling back spawned polecat %s...\n", style.Warning.Render("⚠"), reason, newPolecatInfo.PolecatName)
+		rollbackSlingArtifactsFn(newPolecatInfo, beadID, hookWorkDir, "")
+		// Under --force, rollback's unhook can clear a pinned bead's original state.
+		if force && originalStatus == "pinned" {
+			restorePinnedBead(townRoot, beadID, originalAssignee)
+		}
+	}
 
 	// Inject base_branch var for formula instantiation (non-main only; formula default handles main)
 	if newPolecatInfo != nil && newPolecatInfo.BaseBranch != "" && newPolecatInfo.BaseBranch != "main" {
@@ -736,6 +771,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// Skip for self-sling (user knows what they're doing) and --force overrides.
 	if strings.Contains(targetAgent, "/polecats/") && !force && !isSelfSling {
 		if err := checkCrossRigGuard(beadID, targetAgent, townRoot); err != nil {
+			rollbackSpawnedPolecat("Cross-rig guard failed")
 			return err
 		}
 	}
@@ -787,9 +823,11 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		}
 
 		// Unhook the bead from old owner (set status back to open)
-		unhookCmd := exec.Command("bd", "update", beadID, "--status=open", "--assignee=")
-		unhookCmd.Dir = beads.ResolveHookDir(townRoot, beadID, "")
-		if err := unhookCmd.Run(); err != nil {
+		unhookDir := beads.ResolveHookDir(townRoot, beadID, "")
+		if err := BdCmd("update", beadID, "--status=open", "--assignee=").
+			Dir(unhookDir).
+			WithAutoCommit().
+			Run(); err != nil {
 			fmt.Printf("%s Could not unhook bead from old owner: %v\n", style.Dim.Render("Warning:"), err)
 		}
 	}
@@ -952,7 +990,8 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	}
 	defer assigneeUnlock()
 	hookDir := beads.ResolveHookDir(townRoot, beadID, hookWorkDir)
-	if err := hookBeadWithRetry(beadID, targetAgent, hookDir); err != nil {
+	if err := hookBeadWithRetryFn(beadID, targetAgent, hookDir); err != nil {
+		rollbackSpawnedPolecat("Hook failed")
 		return err
 	}
 
@@ -1077,7 +1116,13 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 // checkCrossRigGuard validates that a bead's prefix matches the target rig.
 // Polecats work in their rig's worktree and cannot fix code owned by another rig.
 // Returns an error if the bead belongs to a different rig than the target polecat.
-// Town-root beads (hq-*) are rejected — tasks must be created in the target rig.
+//
+// When the prefix maps to town root, the guard warns rather than errors: this
+// ambiguous case arises when a crew member's redirect chain is broken and their
+// rig's .beads dir shares the town-level database and prefix (gt-gbu). Blocking
+// here would silently swallow all polecat work for the affected rig.
+//
+// Truly unknown prefixes (not in routes.jsonl at all) are still hard-rejected.
 func checkCrossRigGuard(beadID, targetAgent, townRoot string) error {
 	beadPrefix := beads.ExtractPrefix(beadID)
 	if beadPrefix == "" {
@@ -1094,9 +1139,25 @@ func checkCrossRigGuard(beadID, targetAgent, townRoot string) error {
 
 	if beadRig != targetRig {
 		if beadRig == "" {
-			return fmt.Errorf("bead %s (prefix %q) is not in rig %q — it belongs to town root\n"+
-				"Create the task from the rig directory: cd %s && bd create --title=...\n"+
-				"Use --force to override", beadID, strings.TrimSuffix(beadPrefix, "-"), targetRig, targetRig)
+			// GetRigNameForPrefix returns "" for two distinct cases:
+			//   (a) prefix is in routes.jsonl with path="." (known town-root prefix)
+			//   (b) prefix is not in routes.jsonl at all (unknown prefix)
+			// GetRigPathForPrefix distinguishes them: it returns townRoot for (a),
+			// empty string for (b).
+			if beads.GetRigPathForPrefix(townRoot, beadPrefix) == "" {
+				// Unknown prefix — no route exists, can't resolve rig.
+				return fmt.Errorf("bead %s (prefix %q) is not in rig %q — prefix not in routes\n"+
+					"Create the task from the rig directory: cd %s && bd create --title=...\n"+
+					"Use --force to override", beadID, strings.TrimSuffix(beadPrefix, "-"), targetRig, targetRig)
+			}
+			// Known town-root prefix — warn but allow. A crew member may have a
+			// broken redirect chain causing rig beads to land in the town DB with
+			// the town prefix. Blocking here silently drops all their polecat work
+			// (gt-gbu). The polecat will surface any true mismatch on execution.
+			fmt.Printf("  %s Bead %s has prefix %q (town root) but target is rig %q — "+
+				"proceeding (broken redirect chain? see gt-gbu)\n",
+				style.Warning.Render("⚠"), beadID, strings.TrimSuffix(beadPrefix, "-"), targetRig)
+			return nil
 		}
 		return fmt.Errorf("cross-rig mismatch: bead %s (prefix %q) belongs to rig %q, but target is rig %q\n"+
 			"Create the task from the target rig: cd %s && bd create --title=...\n"+
@@ -1120,11 +1181,10 @@ func restorePinnedBead(townRoot, beadID, assignee string) {
 		return
 	}
 	dir := beads.ResolveHookDir(townRoot, beadID, "")
-	cmd := exec.Command("bd", "update", beadID, "--status=pinned", "--assignee="+assignee)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	if err := cmd.Run(); err != nil {
+	if err := BdCmd("update", beadID, "--status=pinned", "--assignee="+assignee).
+		Dir(dir).
+		WithAutoCommit().
+		Run(); err != nil {
 		fmt.Printf("  %s Could not restore pinned state for bead %s: %v\n", style.Dim.Render("Warning:"), beadID, err)
 	} else {
 		fmt.Printf("  %s Restored pinned state for bead %s\n", style.Dim.Render("○"), beadID)
@@ -1236,9 +1296,10 @@ func rollbackSlingArtifacts(spawnInfo *SpawnedPolecatInfo, beadID, hookWorkDir, 
 
 			// 2. Unhook the bead (set status back to open so it can be re-slung).
 			unhookDir := beads.ResolveHookDir(townRoot, beadID, hookWorkDir)
-			unhookCmd := exec.Command("bd", "update", beadID, "--status=open", "--assignee=")
-			unhookCmd.Dir = unhookDir
-			if err := unhookCmd.Run(); err != nil {
+			if err := BdCmd("update", beadID, "--status=open", "--assignee=").
+				Dir(unhookDir).
+				WithAutoCommit().
+				Run(); err != nil {
 				fmt.Printf("  %s Could not unhook bead %s: %v\n", style.Dim.Render("Warning:"), beadID, err)
 			} else {
 				fmt.Printf("  %s Unhooked bead %s\n", style.Dim.Render("○"), beadID)

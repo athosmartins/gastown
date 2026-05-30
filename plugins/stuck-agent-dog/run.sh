@@ -11,6 +11,44 @@ RIGS_JSON_PATH="${TOWN_ROOT}/mayor/rigs.json"
 
 log() { echo "[stuck-agent-dog] $*"; }
 
+heartbeat_epoch() {
+  local file="$1"
+  local ts=""
+
+  ts=$(jq -r '(.timestamp // empty) | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601? // empty' "$file" 2>/dev/null || true)
+  if [ -n "$ts" ]; then
+    echo "$ts"
+    return 0
+  fi
+
+  # Fallback for malformed legacy files: use mtime rather than failing open.
+  stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null
+}
+
+has_in_progress_work() {
+  local locations=("$TOWN_ROOT")
+  local rig=""
+  local prefix=""
+  local loc=""
+  local output=""
+  local count=""
+
+  while IFS='|' read -r rig prefix; do
+    [ -z "$rig" ] && continue
+    [ -d "$TOWN_ROOT/$rig" ] && locations+=("$TOWN_ROOT/$rig")
+  done <<< "$RIG_PREFIX_MAP"
+
+  for loc in "${locations[@]}"; do
+    output=$(cd "$loc" && bd list --status=in_progress --json --limit=1 2>/dev/null) || return 0
+    count=$(printf '%s' "$output" | jq 'length' 2>/dev/null || echo 1)
+    if [ "${count:-1}" -gt 0 ]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 # --- Enumerate agents ---------------------------------------------------------
 
 log "=== Checking agent health ==="
@@ -45,7 +83,8 @@ while IFS='|' read -r RIG PREFIX; do
 
     if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
       # Session dead — check hook
-      HOOK_BEAD=$(bd show "$RIG/polecats/$PCAT_NAME" --json 2>/dev/null | jq -r '.[0].hook_bead // empty' 2>/dev/null || echo "")
+      HOOK_OUTPUT=$(gt hook show "$RIG/polecats/$PCAT_NAME" 2>/dev/null | head -1)
+      HOOK_BEAD=$(echo "$HOOK_OUTPUT" | grep -v '(empty)' | awk '{print $2}' || true)
 
       if [ -n "$HOOK_BEAD" ]; then
         # Check agent_state
@@ -66,7 +105,8 @@ while IFS='|' read -r RIG PREFIX; do
         PROC_COMM=$(ps -o comm= -p "$PANE_PID" 2>/dev/null)
         if [ -z "$PROC_COMM" ]; then
           # Zombie: process dead, session alive
-          HOOK_BEAD=$(bd show "$RIG/polecats/$PCAT_NAME" --json 2>/dev/null | jq -r '.[0].hook_bead // empty' 2>/dev/null || echo "")
+          HOOK_OUTPUT=$(gt hook show "$RIG/polecats/$PCAT_NAME" 2>/dev/null | head -1)
+          HOOK_BEAD=$(echo "$HOOK_OUTPUT" | grep -v '(empty)' | awk '{print $2}' || true)
           if [ -n "$HOOK_BEAD" ]; then
             STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
             log "  ZOMBIE: $SESSION_NAME (pid=$PANE_PID dead, hook=$HOOK_BEAD)"
@@ -91,6 +131,7 @@ log "=== Deacon Health ==="
 
 DEACON_SESSION="hq-deacon"
 DEACON_ISSUE=""
+DEACON_PROCESS_ALIVE=0
 
 if ! tmux has-session -t "$DEACON_SESSION" 2>/dev/null; then
   log "  CRASHED: Deacon session is dead"
@@ -103,71 +144,21 @@ else
     DEACON_ISSUE="zombie"
   else
     log "  Process alive: pid=$DEACON_PID comm=$DEACON_COMM"
+    DEACON_PROCESS_ALIVE=1
   fi
 
   HEARTBEAT_FILE="$TOWN_ROOT/deacon/heartbeat.json"
-  if [ -f "$HEARTBEAT_FILE" ]; then
-    HEARTBEAT_TIME=$(stat -f %m "$HEARTBEAT_FILE" 2>/dev/null || stat -c %Y "$HEARTBEAT_FILE" 2>/dev/null)
+  if [ -z "$DEACON_ISSUE" ] && [ -f "$HEARTBEAT_FILE" ]; then
+    HEARTBEAT_TIME=$(heartbeat_epoch "$HEARTBEAT_FILE" || true)
     NOW=$(date +%s)
-    HEARTBEAT_AGE=$(( NOW - HEARTBEAT_TIME ))
+    HEARTBEAT_AGE=$(( NOW - ${HEARTBEAT_TIME:-0} ))
 
     if [ "$HEARTBEAT_AGE" -gt 1200 ]; then
-      # Heartbeat is stale (>20m). Use two signals to avoid false positives:
-      #
-      # Signal 1 — heartbeat state field (gt deacon heartbeat --state=idle):
-      #   state=idle means the Deacon wrote an explicit idle marker before entering
-      #   await-signal. A stale idle heartbeat is expected during patrol sleep.
-      #   Apply a 2h threshold instead of 20m for idle state.
-      #
-      # Signal 2 — bead.updated_at (from main's fix):
-      #   await-signal updates the bead's updated_at on each timeout/signal even
-      #   when heartbeat.json is not refreshed. If the bead was recently updated
-      #   AND the process is alive, the Deacon is idle between cycles, not stuck.
-      #   Used as a final arbiter when the state-based threshold is exceeded.
-      #
-      # Only escalate if ALL evidence points to stuck: both heartbeat AND bead
-      # are stale (or the process is dead).
-
-      HEARTBEAT_STATE=$(python3 -c "
-import json, sys
-try:
-    with open('$HEARTBEAT_FILE') as f:
-        d = json.load(f)
-    print(d.get('state', 'working'))
-except Exception:
-    print('unknown')
-" 2>/dev/null || echo "unknown")
-
-      # State-based threshold: 2h for idle (intentional sleep), 20m for working/unknown
-      STUCK_THRESHOLD=3600
-      if [ "$HEARTBEAT_STATE" = "idle" ]; then
-        STUCK_THRESHOLD=7200
-      fi
-
-      if [ "$HEARTBEAT_AGE" -gt "$STUCK_THRESHOLD" ]; then
-        # Exceeded state-based threshold — check bead activity as final arbiter
-        BEAD_UPDATED_AT=$(bd show hq-deacon --json 2>/dev/null \
-          | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0].get('updated_at',''))" 2>/dev/null || echo "")
-        BEAD_AGE=99999
-        if [ -n "$BEAD_UPDATED_AT" ]; then
-          BEAD_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$BEAD_UPDATED_AT" +%s 2>/dev/null \
-            || date -d "$BEAD_UPDATED_AT" +%s 2>/dev/null || echo 0)
-          if [ "$BEAD_EPOCH" -gt 0 ]; then
-            BEAD_AGE=$(( NOW - BEAD_EPOCH ))
-          fi
-        fi
-
-        if [ -z "$DEACON_COMM" ] || [ "$BEAD_AGE" -gt 1200 ]; then
-          # Process dead OR both heartbeat and bead are stale → genuinely stuck
-          log "  STUCK: Deacon heartbeat stale (${HEARTBEAT_AGE}s old, state=$HEARTBEAT_STATE, bead_age=${BEAD_AGE}s)"
-          DEACON_ISSUE="stuck_heartbeat_${HEARTBEAT_AGE}s"
-        else
-          # Process alive and bead fresh → idle between cycles, not stuck
-          log "  OK (idle): Deacon heartbeat stale (${HEARTBEAT_AGE}s, state=$HEARTBEAT_STATE) but bead updated ${BEAD_AGE}s ago — legitimately idle"
-        fi
+      if [ "$DEACON_PROCESS_ALIVE" -eq 1 ] && ! has_in_progress_work; then
+        log "  SKIP: Deacon heartbeat stale (${HEARTBEAT_AGE}s old) but process is alive and no in_progress work exists"
       else
-        # Within state-based threshold (e.g., state=idle, <2h)
-        log "  OK (${HEARTBEAT_STATE}): Deacon heartbeat ${HEARTBEAT_AGE}s old, within ${STUCK_THRESHOLD}s threshold"
+        log "  STUCK: Deacon heartbeat stale (${HEARTBEAT_AGE}s old, >20m threshold)"
+        DEACON_ISSUE="stuck_heartbeat_${HEARTBEAT_AGE}s"
       fi
     else
       log "  OK: Deacon heartbeat ${HEARTBEAT_AGE}s old"
@@ -188,7 +179,10 @@ fi
 # --- Take action --------------------------------------------------------------
 
 # Crashed polecats: notify witness to restart
-for ENTRY in "${CRASHED[@]}"; do
+# Note: `"${arr[@]:-}"` expands an empty array to a single empty string under
+# `set -u`, which would fire a phantom `RESTART_POLECAT: /` notification. The
+# `${arr[@]+"${arr[@]}"}` form expands to nothing when the array is empty.
+for ENTRY in ${CRASHED[@]+"${CRASHED[@]}"}; do
   IFS='|' read -r SESSION RIG PCAT HOOK <<< "$ENTRY"
   log "Requesting restart for $RIG/polecats/$PCAT (hook=$HOOK)"
   gt mail send "$RIG/witness" -s "RESTART_POLECAT: $RIG/$PCAT" --stdin <<BODY
@@ -199,7 +193,7 @@ BODY
 done
 
 # Zombie polecats: kill zombie session, then request restart
-for ENTRY in "${STUCK[@]}"; do
+for ENTRY in ${STUCK[@]+"${STUCK[@]}"}; do
   IFS='|' read -r SESSION RIG PCAT HOOK REASON <<< "$ENTRY"
   log "Killing zombie session $SESSION and requesting restart"
   tmux kill-session -t "$SESSION" 2>/dev/null || true
@@ -213,8 +207,19 @@ done
 
 # Deacon issues: escalate
 if [ -n "$DEACON_ISSUE" ]; then
-  log "Escalating deacon issue: $DEACON_ISSUE"
-  gt escalate "Deacon $DEACON_ISSUE detected by stuck-agent-dog" -s HIGH 2>/dev/null || true
+	log "Escalating deacon issue: $DEACON_ISSUE"
+	DEACON_SEVERITY="HIGH"
+	DEACON_FINGERPRINT="stuck-agent-dog:deacon:$DEACON_ISSUE"
+	case "$DEACON_ISSUE" in
+		stuck_heartbeat_*)
+			DEACON_SEVERITY="MEDIUM"
+			DEACON_FINGERPRINT="stuck-agent-dog:deacon:stuck-heartbeat"
+			;;
+	esac
+	gt escalate "Deacon $DEACON_ISSUE detected by stuck-agent-dog" \
+		-s "$DEACON_SEVERITY" \
+		--source "plugin:stuck-agent-dog" \
+		--fingerprint "$DEACON_FINGERPRINT" 2>/dev/null || true
 fi
 
 # --- Report -------------------------------------------------------------------

@@ -47,6 +47,7 @@ const (
 	DefaultDoctorMolCooldown               = 5 * time.Minute
 	DefaultRecoveryHeartbeatInterval       = 3 * time.Minute
 	DefaultBootSpawnCooldown               = 2 * time.Minute
+	DefaultBootIdleSuppression             = 15 * time.Minute
 	DefaultDeaconGracePeriod               = 5 * time.Minute
 
 	// Pressure check defaults — fully opt-in. All zero = disabled.
@@ -109,8 +110,9 @@ const (
 	DefaultWitnessStartupStallThreshold  = 90 * time.Second
 	DefaultWitnessStartupActivityGrace   = 60 * time.Second
 	DefaultWitnessMaxBeadRespawns        = 3
-	DefaultWitnessDoneIntentStuckTimeout = 60 * time.Second
-	DefaultWitnessDoneIntentRecentGrace  = 30 * time.Second
+	DefaultWitnessDoneIntentStuckTimeout    = 60 * time.Second
+	DefaultWitnessDoneIntentRecentGrace     = 30 * time.Second
+	DefaultWitnessHeartbeatStartupGrace     = 5 * time.Minute
 )
 
 // LoadOperationalConfig loads operational config from a town root.
@@ -382,6 +384,15 @@ func (d *DaemonThresholds) BootSpawnCooldownD() time.Duration {
 		return ParseDurationOrDefault(d.BootSpawnCooldown, DefaultBootSpawnCooldown)
 	}
 	return DefaultBootSpawnCooldown
+}
+
+// BootIdleSuppressionD returns the configured or default boot idle suppression duration.
+// When Boot's last action was "nothing" (deacon healthy), spawns are suppressed for this long.
+func (d *DaemonThresholds) BootIdleSuppressionD() time.Duration {
+	if d != nil {
+		return ParseDurationOrDefault(d.BootIdleSuppression, DefaultBootIdleSuppression)
+	}
+	return DefaultBootIdleSuppression
 }
 
 // DeaconGracePeriodD returns the configured or default deacon grace period.
@@ -731,4 +742,14 @@ func (wt *WitnessThresholds) DoneIntentRecentGraceD() time.Duration {
 		return ParseDurationOrDefault(wt.DoneIntentRecentGrace, DefaultWitnessDoneIntentRecentGrace)
 	}
 	return DefaultWitnessDoneIntentRecentGrace
+}
+
+// HeartbeatStartupGraceD returns the configured or default heartbeat startup grace period.
+// A live polecat with assigned work but no heartbeat file older than this is flagged
+// for review as possibly stuck at startup (e.g., auth 401). (gt-uk7)
+func (wt *WitnessThresholds) HeartbeatStartupGraceD() time.Duration {
+	if wt != nil {
+		return ParseDurationOrDefault(wt.HeartbeatStartupGrace, DefaultWitnessHeartbeatStartupGrace)
+	}
+	return DefaultWitnessHeartbeatStartupGrace
 }

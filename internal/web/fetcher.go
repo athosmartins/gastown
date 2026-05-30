@@ -45,6 +45,17 @@ func runCmd(timeout time.Duration, name string, args ...string) (*bytes.Buffer, 
 	return &stdout, nil
 }
 
+// runTmuxCmd runs a tmux command using the per-town socket.
+// Without -L, tmux queries the default socket which has no Gas Town sessions.
+func (f *LiveConvoyFetcher) runTmuxCmd(args ...string) (*bytes.Buffer, error) {
+	fullArgs := []string{}
+	if f.tmuxSocket != "" {
+		fullArgs = append(fullArgs, "-L", f.tmuxSocket)
+	}
+	fullArgs = append(fullArgs, args...)
+	return fetcherRunCmd(f.tmuxCmdTimeout, "tmux", fullArgs...)
+}
+
 var fetcherRunCmd = runCmd
 var fetcherGetSessionEnv = func(sessionName, key string) (string, error) {
 	return tmux.NewTmux().GetEnvironment(sessionName, key)
@@ -88,20 +99,30 @@ type fetchCircuitBreaker struct {
 	failures    int
 	lastAttempt time.Time
 	backoff     time.Duration
+	inFlight    bool
 }
 
 // maxBackoff is the maximum backoff duration for the circuit breaker.
 const maxBackoff = 5 * time.Minute
 
 // allow returns true if enough time has passed since the last failure to permit
-// a new attempt. Always allows the first attempt (zero failures).
+// a new attempt, and reserves that attempt so concurrent callers do not all
+// stampede through when backoff opens.
 func (cb *fetchCircuitBreaker) allow() bool {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	if cb.inFlight {
+		return false
+	}
 	if cb.failures == 0 {
+		cb.inFlight = true
 		return true
 	}
-	return time.Since(cb.lastAttempt) >= cb.backoff
+	if time.Since(cb.lastAttempt) < cb.backoff {
+		return false
+	}
+	cb.inFlight = true
+	return true
 }
 
 // recordFailure increments the failure count and sets exponential backoff.
@@ -111,6 +132,7 @@ func (cb *fetchCircuitBreaker) recordFailure() {
 	defer cb.mu.Unlock()
 	cb.failures++
 	cb.lastAttempt = time.Now()
+	cb.inFlight = false
 	// Exponential backoff: 10s, 20s, 40s, 80s, 160s, capped at maxBackoff
 	cb.backoff = time.Duration(1<<min(cb.failures, 10)) * 5 * time.Second
 	if cb.backoff > maxBackoff {
@@ -124,6 +146,7 @@ func (cb *fetchCircuitBreaker) recordSuccess() {
 	defer cb.mu.Unlock()
 	cb.failures = 0
 	cb.backoff = 0
+	cb.inFlight = false
 }
 
 // LiveConvoyFetcher fetches convoy data from beads.
@@ -151,8 +174,13 @@ type LiveConvoyFetcher struct {
 	heartbeatFreshThreshold time.Duration
 	mayorActiveThreshold    time.Duration
 
+	// tmuxSocket is the per-town tmux socket name (e.g., "dipgt-651c6b").
+	// All tmux commands must use -L with this socket; the default socket
+	// has no Gas Town sessions.
+	tmuxSocket string
+
 	// Circuit breaker for FetchConvoys — prevents process storms when
-	// bd list --type=convoy fails persistently (e.g., schema mismatch).
+	// bd list by convoy label fails persistently (e.g., schema mismatch).
 	convoyBreaker fetchCircuitBreaker
 }
 
@@ -190,6 +218,7 @@ func NewLiveConvoyFetcher() (*LiveConvoyFetcher, error) {
 		townRoot:                townRoot,
 		townBeads:               filepath.Join(townRoot, ".beads"),
 		registry:                registry,
+		tmuxSocket:              tmux.GetDefaultSocket(),
 		cmdTimeout:              config.ParseDurationOrDefault(webCfg.CmdTimeout, 15*time.Second),
 		ghCmdTimeout:            config.ParseDurationOrDefault(webCfg.GhCmdTimeout, 10*time.Second),
 		tmuxCmdTimeout:          config.ParseDurationOrDefault(webCfg.TmuxCmdTimeout, 2*time.Second),
@@ -208,26 +237,32 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 		return nil, nil // Backed off — return empty result silently
 	}
 
-	// List all open convoy issues
-	stdout, err := f.runBdCmd(f.townRoot, "list", "--type=convoy", "--status=open", "--json")
+	// List all open issues and filter locally so legacy type=convoy beads remain visible.
+	stdout, err := f.runBdCmd(f.townRoot, "list", "--status=open", "--json", "--limit=0")
 	if err != nil {
 		f.convoyBreaker.recordFailure()
 		return nil, fmt.Errorf("listing convoys: %w", err)
 	}
 
 	var convoys []struct {
-		ID        string `json:"id"`
-		Title     string `json:"title"`
-		Status    string `json:"status"`
-		CreatedAt string `json:"created_at"`
+		ID        string   `json:"id"`
+		Title     string   `json:"title"`
+		Status    string   `json:"status"`
+		CreatedAt string   `json:"created_at"`
+		IssueType string   `json:"issue_type"`
+		Labels    []string `json:"labels"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil {
+		f.convoyBreaker.recordFailure()
 		return nil, fmt.Errorf("parsing convoy list: %w", err)
 	}
 
 	// Build convoy rows with activity data
 	rows := make([]ConvoyRow, 0, len(convoys))
 	for _, c := range convoys {
+		if c.IssueType != "convoy" && !webConvoyHasLabel(c.Labels, "gt:convoy") {
+			continue
+		}
 		row := ConvoyRow{
 			ID:     c.ID,
 			Title:  c.Title,
@@ -329,6 +364,15 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 
 	f.convoyBreaker.recordSuccess()
 	return rows, nil
+}
+
+func webConvoyHasLabel(labels []string, target string) bool {
+	for _, label := range labels {
+		if label == target {
+			return true
+		}
+	}
+	return false
 }
 
 // trackedIssueInfo holds info about an issue being tracked by a convoy.
@@ -509,7 +553,7 @@ func (f *LiveConvoyFetcher) getSessionActivityForAssignee(assignee string) *time
 
 	// Query tmux for session activity
 	// Format: session_activity returns unix timestamp
-	stdout, err := runCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}|#{session_activity}",
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{session_activity}",
 		"-f", fmt.Sprintf("#{==:#{session_name},%s}", sessionName))
 	if err != nil {
 		return nil
@@ -541,7 +585,7 @@ func (f *LiveConvoyFetcher) getSessionActivityForAssignee(assignee string) *time
 func (f *LiveConvoyFetcher) getAllPolecatActivity() *time.Time {
 	// List all tmux sessions matching gt-*-* pattern (polecat sessions)
 	// Format: gt-{rig}-{polecat}
-	stdout, err := runCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}|#{session_activity}")
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{session_activity}")
 	if err != nil {
 		return nil
 	}
@@ -801,7 +845,7 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 	assignedIssues := f.getAssignedIssuesMap()
 
 	// Query all tmux sessions with window_activity for more accurate timing
-	stdout, err := runCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}|#{window_activity}")
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{window_activity}")
 	if err != nil {
 		// tmux not running or no sessions
 		return nil, nil
@@ -964,7 +1008,7 @@ func calculateWorkerWorkStatus(activityAge time.Duration, issueID, workerName st
 
 // getWorkerStatusHint captures the last non-empty line from a worker's pane.
 func (f *LiveConvoyFetcher) getWorkerStatusHint(sessionName string) string {
-	stdout, err := runCmd(f.tmuxCmdTimeout, "tmux", "capture-pane", "-t", sessionName, "-p", "-J")
+	stdout, err := f.runTmuxCmd("capture-pane", "-t", sessionName, "-p", "-J")
 	if err != nil {
 		return ""
 	}
@@ -1424,7 +1468,7 @@ func (f *LiveConvoyFetcher) FetchQueues() ([]QueueRow, error) {
 // FetchSessions returns active tmux sessions with role detection.
 func (f *LiveConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 	// List tmux sessions
-	stdout, err := fetcherRunCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}:#{session_activity}")
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}:#{session_activity}")
 	if err != nil {
 		return nil, nil // tmux not running or no sessions
 	}
@@ -1542,7 +1586,7 @@ func (f *LiveConvoyFetcher) FetchMayor() (*MayorStatus, error) {
 	mayorSessionName := session.MayorSessionName()
 
 	// Check if mayor tmux session exists
-	stdout, err := fetcherRunCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}:#{session_activity}")
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}:#{session_activity}")
 	if err != nil {
 		// tmux not running or no sessions
 		return status, nil
