@@ -4,7 +4,8 @@
   "theme": "dark",
   "editorMode": "normal",
   "permissions": {
-    "defaultMode": "bypassPermissions"
+    "defaultMode": "bypassPermissions",
+    "deny": ["mcp__plugin_github_github__create_pull_request"]
   },
   "enabledPlugins": {
     "beads@beads-marketplace": false

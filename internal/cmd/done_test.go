@@ -1581,6 +1581,27 @@ func TestSyncGuardWithUncommittedChanges(t *testing.T) {
 	}
 }
 
+func TestGithubRepoFromURL(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"https://github.com/athosmartins/gastown.git", "athosmartins/gastown"},
+		{"https://github.com/athosmartins/gastown", "athosmartins/gastown"},
+		{"git@github.com:athosmartins/gastown.git", "athosmartins/gastown"},
+		{"git@github.com:gastownhall/gastown.git", "gastownhall/gastown"},
+		{"https://github.com/org/repo.git", "org/repo"},
+		{"not-a-github-url", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		got := githubRepoFromURL(c.in)
+		if got != c.want {
+			t.Errorf("githubRepoFromURL(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func testRunGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	fullArgs := append([]string{"-c", "protocol.file.allow=always"}, args...)
