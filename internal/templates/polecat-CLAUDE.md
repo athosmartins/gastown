@@ -281,7 +281,7 @@ Your work goes through the merge queue:
 2. `gt done` pushes your branch and submits an MR to the merge queue
 3. Refinery merges to main after Witness verification
 
-**Do NOT create GitHub PRs either.** The merge queue handles everything.
+**Do NOT create GitHub PRs.** Never run `gh pr create` or use the GitHub MCP tool (`mcp__plugin_github_github__create_pull_request`) to open PRs against ANY repository — not gastownhall/*, not steveyegge/*, not athosmartins/*. The merge queue handles everything.
 
 ### The Landing Rule
 

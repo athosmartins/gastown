@@ -941,12 +941,19 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					prBodyBuilder.WriteString("---\n")
 					prBodyBuilder.WriteString(fmt.Sprintf("*Polecat: %s | Issue: %s*\n", worker, issueID))
 					prBody := prBodyBuilder.String()
-					ghCmd := exec.CommandContext(context.Background(), "gh", "pr", "create",
+					ghArgs := []string{"pr", "create",
 						"--base", defaultBranch,
 						"--head", branch,
 						"--title", prTitle,
 						"--body", prBody,
-					)
+					}
+					// Explicitly target the push URL repo so gh CLI doesn't default to upstream.
+					if out, urlErr := exec.Command("git", "-C", cwd, "remote", "get-url", "--push", "origin").Output(); urlErr == nil {
+						if repo := githubRepoFromURL(strings.TrimSpace(string(out))); repo != "" {
+							ghArgs = append(ghArgs, "--repo", repo)
+						}
+					}
+					ghCmd := exec.CommandContext(context.Background(), "gh", ghArgs...)
 					ghCmd.Dir = cwd
 					prOutput, prErr := ghCmd.Output()
 					if prErr != nil {
@@ -2081,6 +2088,19 @@ func stripOverlayCLAUDEmd(g *git.Git, defaultBranch string) bool {
 	fmt.Printf("%s Created cleanup commit to remove Gas Town overlay files\n",
 		style.Bold.Render("✓"))
 	return true
+}
+
+// githubRepoFromURL extracts "owner/repo" from a GitHub remote URL.
+// Handles HTTPS (https://github.com/owner/repo[.git]) and SSH (git@github.com:owner/repo[.git]).
+func githubRepoFromURL(rawURL string) string {
+	rawURL = strings.TrimSuffix(rawURL, ".git")
+	if i := strings.Index(rawURL, "github.com/"); i != -1 {
+		return rawURL[i+len("github.com/"):]
+	}
+	if i := strings.Index(rawURL, "github.com:"); i != -1 {
+		return rawURL[i+len("github.com:"):]
+	}
+	return ""
 }
 
 // purgeClosedEphemeralBeads removes closed ephemeral beads (wisps) that accumulated

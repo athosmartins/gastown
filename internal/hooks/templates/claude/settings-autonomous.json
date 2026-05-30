@@ -1,6 +1,9 @@
 {
   "skipDangerousModePermissionPrompt": true,
   "editorMode": "normal",
+  "permissions": {
+    "deny": ["mcp__plugin_github_github__create_pull_request"]
+  },
   "enabledPlugins": {
     "beads@beads-marketplace": false
   },
