@@ -1795,6 +1795,16 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 			} else if err := bd.Close(hookedBeadID); err != nil {
 				// Non-fatal: warn but continue
 				fmt.Fprintf(os.Stderr, "Warning: couldn't close hooked bead %s: %v\n", hookedBeadID, err)
+			} else {
+				// After successfully closing, explicitly unhook to prevent retry loops.
+				// dc-u98d: Closed beads that remain hooked cause Deacon to retry attaching
+				// work to non-existent/closed beads forever. Unhooking clears the assignee
+				// and prevents this deadlock.
+				emptyAssignee := ""
+				if err := bd.Update(hookedBeadID, beads.UpdateOptions{Assignee: &emptyAssignee}); err != nil {
+					// Non-fatal: warn but don't fail the close
+					fmt.Fprintf(os.Stderr, "Warning: couldn't unhook closed bead %s: %v\n", hookedBeadID, err)
+				}
 			}
 		}
 	}
