@@ -63,7 +63,9 @@ CLAUDE.md
 # .beads/formulas/ is provisioned at runtime by gt install / gt doctor fix.
 
 # Gas Town (added by gt)
-.beads/
+# NOTE: .beads/ must NOT be blanket-ignored here — it blocks bd auto-export's
+# `git add .beads` and silently breaks close-state persistence (gt-t5gii, 3rd
+# regression). Runtime noise is ignored via the specific .beads/* entries above.
 .logs/
 logs/
 settings/
