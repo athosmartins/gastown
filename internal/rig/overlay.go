@@ -75,6 +75,7 @@ func CopyOverlay(rigPath, destPath string) error {
 
 // EnsureGitignorePatterns ensures the .gitignore has required Gas Town patterns.
 // This is called after cloning to add patterns that may be missing from the source repo.
+// It also removes forbidden patterns that must never appear in a tracked .gitignore.
 func EnsureGitignorePatterns(worktreePath string) error {
 	gitignorePath := filepath.Join(worktreePath, ".gitignore")
 
@@ -92,13 +93,24 @@ func EnsureGitignorePatterns(worktreePath string) error {
 	// to fail with "uncommitted changes would be lost" on untracked .claude/ entries.
 	requiredPatterns := gasTownIgnorePatterns()
 
+	// Patterns that must NEVER appear in the tracked .gitignore (gt-t5gii).
+	// If found, strip them — they break bd sync by overriding .beads/.gitignore.
+	// Use the local .git/info/exclude for per-worktree exclusions instead.
+	forbiddenPatterns := []string{".beads/"}
+
 	// Read existing gitignore content
 	var existingContent string
 	if data, err := os.ReadFile(gitignorePath); err == nil {
 		existingContent = string(data)
 	}
 
-	// Find missing patterns
+	// Strip any forbidden patterns from existing content.
+	stripped, modified := stripForbiddenGitignorePatterns(existingContent, forbiddenPatterns)
+	if modified {
+		existingContent = stripped
+	}
+
+	// Find missing required patterns
 	var missing []string
 	for _, pattern := range requiredPatterns {
 		found := false
@@ -114,36 +126,52 @@ func EnsureGitignorePatterns(worktreePath string) error {
 		}
 	}
 
-	if len(missing) == 0 {
-		return nil // All patterns present
+	if len(missing) == 0 && !modified {
+		return nil // Nothing to change
 	}
 
-	// Append missing patterns
-	f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("opening .gitignore: %w", err)
-	}
-	defer f.Close()
-
-	// Add header if appending to existing file
-	if existingContent != "" && !strings.HasSuffix(existingContent, "\n") {
-		if _, err := f.WriteString("\n"); err != nil {
-			return err
+	// Build the new content: stripped base + appended missing patterns
+	newContent := existingContent
+	if len(missing) > 0 {
+		if newContent != "" && !strings.HasSuffix(newContent, "\n") {
+			newContent += "\n"
 		}
-	}
-	if existingContent != "" {
-		if _, err := f.WriteString("\n# Gas Town (added by gt)\n"); err != nil {
-			return err
+		if newContent != "" {
+			newContent += "\n# Gas Town (added by gt)\n"
+		}
+		for _, pattern := range missing {
+			newContent += pattern + "\n"
 		}
 	}
 
-	for _, pattern := range missing {
-		if _, err := f.WriteString(pattern + "\n"); err != nil {
-			return err
-		}
-	}
+	return os.WriteFile(gitignorePath, []byte(newContent), 0644)
+}
 
-	return nil
+// stripForbiddenGitignorePatterns removes lines matching any forbidden pattern.
+// Returns the cleaned content and whether any lines were removed.
+func stripForbiddenGitignorePatterns(content string, forbidden []string) (string, bool) {
+	lines := strings.Split(content, "\n")
+	var kept []string
+	removed := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		isForbidden := false
+		for _, p := range forbidden {
+			if matchesGitignorePattern(trimmed, p) {
+				isForbidden = true
+				break
+			}
+		}
+		if isForbidden {
+			removed = true
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if !removed {
+		return content, false
+	}
+	return strings.Join(kept, "\n"), true
 }
 
 // gasTownLocalExcludePatterns returns the patterns to write to the worktree-local

@@ -406,7 +406,39 @@ func TestEnsureGitignorePatterns_RecognizesVariants(t *testing.T) {
 func TestEnsureGitignorePatterns_AllPatternsPresent(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	// Create existing .gitignore with all required patterns.
+	// Create existing .gitignore with all required patterns but WITHOUT .beads/
+	// (.beads/ must never appear in a tracked .gitignore — gt-t5gii).
+	existing := ".runtime/\n.claude/\n.opencode/\n.logs/\n__pycache__/\nstate.json\nCLAUDE.md\nCLAUDE.local.md\nGEMINI.md\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, ".gitignore"), []byte(existing), 0644); err != nil {
+		t.Fatalf("Failed to create .gitignore: %v", err)
+	}
+
+	err := EnsureGitignorePatterns(tmpDir)
+	if err != nil {
+		t.Fatalf("EnsureGitignorePatterns() error = %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(tmpDir, ".gitignore"))
+	if err != nil {
+		t.Fatalf("Failed to read .gitignore: %v", err)
+	}
+
+	// File should be unchanged (no header added, nothing to add or strip)
+	if containsLine(string(content), "# Gas Town") {
+		t.Error("Should not add header when all patterns already present")
+	}
+
+	// Content should match original
+	if string(content) != existing {
+		t.Errorf("File was modified when it shouldn't be.\nGot: %q\nWant: %q", string(content), existing)
+	}
+}
+
+func TestEnsureGitignorePatterns_StripsBeadsEntry(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Simulate a .gitignore that has .beads/ due to a prior regression
+	// (gt-t5gii: this has regressed three times).
 	existing := ".runtime/\n.claude/\n.opencode/\n.beads/\n.logs/\n__pycache__/\nstate.json\nCLAUDE.md\nCLAUDE.local.md\nGEMINI.md\n"
 	if err := os.WriteFile(filepath.Join(tmpDir, ".gitignore"), []byte(existing), 0644); err != nil {
 		t.Fatalf("Failed to create .gitignore: %v", err)
@@ -422,14 +454,16 @@ func TestEnsureGitignorePatterns_AllPatternsPresent(t *testing.T) {
 		t.Fatalf("Failed to read .gitignore: %v", err)
 	}
 
-	// File should be unchanged (no header added)
-	if containsLine(string(content), "# Gas Town") {
-		t.Error("Should not add header when all patterns already present")
+	// .beads/ must be stripped — it blocks bd sync (gt-t5gii)
+	if containsLine(string(content), ".beads/") {
+		t.Error(".gitignore must NOT contain .beads/ after EnsureGitignorePatterns — beads manages its own .gitignore")
 	}
 
-	// Content should match original
-	if string(content) != existing {
-		t.Errorf("File was modified when it shouldn't be.\nGot: %q\nWant: %q", string(content), existing)
+	// Required patterns must still be present
+	for _, pattern := range []string{".runtime/", ".logs/", "__pycache__/", "state.json"} {
+		if !containsLine(string(content), pattern) {
+			t.Errorf(".gitignore missing required pattern %q after stripping .beads/", pattern)
+		}
 	}
 }
 

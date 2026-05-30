@@ -62,7 +62,6 @@ CLAUDE.md
 # .beads/formulas/ is provisioned at runtime by gt install / gt doctor fix.
 
 # Gas Town (added by gt)
-.beads/
 .logs/
 logs/
 settings/

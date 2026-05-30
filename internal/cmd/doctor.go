@@ -260,6 +260,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	// Crew workspace checks
 	d.Register(doctor.NewCrewStateCheck())
 	d.Register(doctor.NewCrewWorktreeCheck())
+	d.Register(doctor.NewCrewBeadsConfigCheck()) // gt-t5gii: ensure export.auto=false in crew beads
 	d.Register(doctor.NewCommandsCheck())
 
 	// Lifecycle hygiene checks

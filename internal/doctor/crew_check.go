@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 // CrewStateCheck validates crew worker state.json files for completeness.
@@ -363,4 +365,100 @@ func (c *CrewWorktreeCheck) findCrewWorktrees(townRoot string) []staleWorktree {
 	}
 
 	return worktrees
+}
+
+// CrewBeadsConfigCheck verifies that crew member .beads/config.yaml files have
+// export.auto: "false" to prevent bd from attempting git-add of .beads (gt-t5gii).
+// Crew directories are full git clones; their .beads dirs are gitignored runtime
+// state that must not attempt to export to git.
+type CrewBeadsConfigCheck struct {
+	FixableCheck
+	badConfigs []string // crew beads dirs missing export.auto=false
+}
+
+// NewCrewBeadsConfigCheck creates the check.
+func NewCrewBeadsConfigCheck() *CrewBeadsConfigCheck {
+	return &CrewBeadsConfigCheck{
+		FixableCheck: FixableCheck{
+			BaseCheck: BaseCheck{
+				CheckName:        "crew-beads-config",
+				CheckDescription: "Verify crew .beads/config.yaml files disable export.auto",
+				CheckCategory:    CategoryConfig,
+			},
+		},
+	}
+}
+
+// Run scans all crew directories and reports those missing export.auto: "false".
+func (c *CrewBeadsConfigCheck) Run(ctx *CheckContext) *CheckResult {
+	c.badConfigs = nil
+
+	var details []string
+	var checked int
+
+	entries, err := os.ReadDir(ctx.TownRoot)
+	if err != nil {
+		return &CheckResult{Name: c.Name(), Status: StatusWarning, Message: fmt.Sprintf("Could not read town root: %v", err)}
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || entry.Name() == "mayor" {
+			continue
+		}
+		crewPath := filepath.Join(ctx.TownRoot, entry.Name(), "crew")
+		crewEntries, err := os.ReadDir(crewPath)
+		if err != nil {
+			continue
+		}
+		for _, crew := range crewEntries {
+			if !crew.IsDir() || strings.HasPrefix(crew.Name(), ".") {
+				continue
+			}
+			beadsDir := filepath.Join(crewPath, crew.Name(), ".beads")
+			if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
+				continue
+			}
+			checked++
+			configPath := filepath.Join(beadsDir, "config.yaml")
+			data, err := os.ReadFile(configPath)
+			if err != nil {
+				// Missing config — EnsureConfigYAML will create it correctly
+				c.badConfigs = append(c.badConfigs, beadsDir)
+				details = append(details, fmt.Sprintf("%s/crew/%s: .beads/config.yaml missing", entry.Name(), crew.Name()))
+				continue
+			}
+			if !beads.ConfigYAMLDisablesAutoExport(string(data)) {
+				c.badConfigs = append(c.badConfigs, beadsDir)
+				details = append(details, fmt.Sprintf("%s/crew/%s: .beads/config.yaml must disable export.auto", entry.Name(), crew.Name()))
+			}
+		}
+	}
+
+	if len(c.badConfigs) == 0 {
+		msg := "All crew .beads/config.yaml files disable export.auto"
+		if checked == 0 {
+			msg = "No crew .beads directories found"
+		}
+		return &CheckResult{Name: c.Name(), Status: StatusOK, Message: msg}
+	}
+
+	return &CheckResult{
+		Name:     c.Name(),
+		Status:   StatusWarning,
+		Message:  fmt.Sprintf("%d crew beads config(s) missing export.auto=false", len(c.badConfigs)),
+		Details:  details,
+		FixHint:  "Run 'gt doctor --fix' to add export.auto: \"false\" to affected configs",
+		Category: c.CheckCategory,
+	}
+}
+
+// Fix adds export.auto: "false" to all crew beads configs that are missing it.
+func (c *CrewBeadsConfigCheck) Fix(_ *CheckContext) error {
+	for _, beadsDir := range c.badConfigs {
+		prefix := beads.ConfigDefaultsFromMetadata(beadsDir, "")
+		if err := beads.EnsureConfigYAML(beadsDir, prefix); err != nil {
+			return fmt.Errorf("could not update %s: %w", beadsDir, err)
+		}
+	}
+	return nil
 }
