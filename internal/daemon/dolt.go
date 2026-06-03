@@ -1062,7 +1062,6 @@ func (m *DoltServerManager) checkHealthLocked() error {
 	ctx, cancel := context.WithTimeout(context.Background(), doltCmdTimeout)
 	defer cancel()
 
-	start := time.Now()
 	cmd := m.buildDoltSQLCmd(ctx, "-q", "SELECT active_branch()")
 
 	var stderr bytes.Buffer
@@ -1072,11 +1071,21 @@ func (m *DoltServerManager) checkHealthLocked() error {
 		return fmt.Errorf("health check failed: %w (%s)", err, strings.TrimSpace(stderr.String()))
 	}
 
-	latency := time.Since(start)
-	if latency > 1*time.Second {
-		w := fmt.Sprintf("Dolt health check latency %v exceeds 1s threshold — server may be under stress", latency.Round(time.Millisecond))
-		m.lastWarnings = append(m.lastWarnings, w)
-		m.logger("Warning: %s", w)
+	// Measure query latency with the warm MySQL-driver probe rather than timing
+	// the subprocess above. Spawning the `dolt` CLI adds ~1s of process-startup
+	// overhead, so timing cmd.Run() reported ~1s even when the server answered in
+	// ~50ms. That inflated reading tripped the 1s threshold every cycle and
+	// produced hourly false-positive "Dolt health advisory" mail (gt-m0euy).
+	// MeasureQueryLatency reuses the same probe `gc dolt health` uses
+	// (GetHealthMetrics -> MeasureQueryLatency) and reports actual query latency.
+	// Best-effort: a probe error here is non-fatal — the subprocess above already
+	// confirmed reachability, and the other resource checks below are best-effort too.
+	if latency, lerr := doltserver.MeasureQueryLatency(m.townRoot); lerr == nil {
+		if latency > 1*time.Second {
+			w := fmt.Sprintf("Dolt health check latency %v exceeds 1s threshold — server may be under stress", latency.Round(time.Millisecond))
+			m.lastWarnings = append(m.lastWarnings, w)
+			m.logger("Warning: %s", w)
+		}
 	}
 
 	// 2. Connection count (best-effort, non-fatal)
