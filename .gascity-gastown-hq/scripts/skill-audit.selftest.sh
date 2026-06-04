@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# skill-audit.selftest.sh — Prove the skill-publish integrity loop in isolation.
+#
+# Builds a THROWAWAY fixture city under a temp dir and drives skill-audit.sh
+# against it via the SKILL_AUDIT_* env overrides. It NEVER touches the live city,
+# never runs gc, and never runs gc reload — so it is safe to run on a live host
+# (honors the "no live config edit" doctrine).
+#
+# Scenarios:
+#   1. clean             — symlink consumer + manifest matching canonical -> drift=0, offpath=0, ok
+#   2. unmanaged         — skill present, no manifest entry              -> offpath>=1
+#   3. offpath edit      — canonical changed after manifest recorded    -> offpath>=1
+#   4. real-copy drift   — a real (non-symlink) consumer copy differs    -> drift>=1
+#   5. dangling symlink  — consumer symlink target removed               -> drift>=1
+#   6. redirected symlink— consumer symlink points somewhere else        -> drift>=1
+#
+# Exit 0 iff every scenario behaves as expected.
+
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AUDIT="$SELF_DIR/skill-audit.sh"
+LIB="$SELF_DIR/skill-lib.sh"
+source "$LIB"
+
+PASS=0
+FAIL=0
+note() { echo "  $*"; }
+ok()   { echo "  ✓ $*"; PASS=$((PASS+1)); }
+bad()  { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
+
+# json_field <json> <field> — pull a numeric/string field without jq.
+json_field() {
+    printf '%s' "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1]))' "$2" 2>/dev/null
+}
+
+# Run the auditor against a fixture. Echoes the JSON (stdout); summary suppressed.
+run_audit() { # CITY WA MANIFEST SKILLS_JSON
+    SKILL_AUDIT_CITY="$1" SKILL_AUDIT_WA="$2" SKILL_AUDIT_MANIFEST="$3" \
+    SKILL_AUDIT_SKILLS_JSON="$4" "$AUDIT" --json-only --quiet
+}
+
+# ── Build a fresh fixture city for each scenario ──────────────────────────────
+# Layout mirrors the real city:
+#   <root>/city/skills/demo/SKILL.md           (canonical source sink)
+#   <root>/city/.claude/skills/demo -> canonical   (HQ vendor symlink)
+#   <root>/city/.gc/agents/a1/.claude/skills/demo -> canonical (agent symlink)
+#   <root>/wa/crew/m1/.claude/skills/demo -> canonical         (crew symlink)
+#   <root>/city/.gc/state/skill-manifest.json
+make_fixture() {
+    local root="$1"
+    local city="$root/city" wa="$root/wa"
+    mkdir -p "$city/skills/demo" \
+             "$city/.claude/skills" \
+             "$city/.gc/agents/a1/.claude/skills" \
+             "$city/.gc/state" \
+             "$wa/crew/m1/.claude/skills"
+    printf 'canonical v1\n' > "$city/skills/demo/SKILL.md"
+    mkdir -p "$city/skills/demo/references"
+    printf 'ref v1\n' > "$city/skills/demo/references/notes.md"
+    # consumer symlinks -> canonical
+    ln -s "$city/skills/demo" "$city/.claude/skills/demo"
+    ln -s "$city/skills/demo" "$city/.gc/agents/a1/.claude/skills/demo"
+    ln -s "$city/skills/demo" "$wa/crew/m1/.claude/skills/demo"
+}
+
+# Write a manifest entry for demo matching the CURRENT canonical digest.
+write_manifest() { # city
+    local city="$1"
+    local digest
+    digest="$(skilllib_tree_digest "$city/skills/demo")"
+    cat > "$city/.gc/state/skill-manifest.json" <<JSON
+{
+  "schema_version": "1",
+  "skills": {
+    "demo": {
+      "tree_digest": "$digest",
+      "deployed_at": "2026-01-01T00:00:00Z",
+      "deployed_by": "selftest",
+      "source_dir": "fixture"
+    }
+  }
+}
+JSON
+}
+
+# gc skill list --json stand-in: demo is a city skill at skills/demo/SKILL.md
+SKILLS_JSON='{"count":1,"entries":[{"name":"demo","source":"city","path":"skills/demo/SKILL.md"}],"ok":true,"schema_version":"1"}'
+
+scenario() { echo; echo "── scenario: $1 ──"; }
+
+# ══ 1. clean ══════════════════════════════════════════════════════════════════
+scenario "clean (symlinks + matching manifest)"
+ROOT="$(mktemp -d)"
+make_fixture "$ROOT"
+write_manifest "$ROOT/city"
+OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+RC=$?
+note "json: $OUT"
+[[ "$(json_field "$OUT" drift_count)" == "0" ]]   && ok "drift_count=0"   || bad "expected drift_count=0"
+[[ "$(json_field "$OUT" offpath_count)" == "0" ]] && ok "offpath_count=0" || bad "expected offpath_count=0"
+[[ "$RC" == "0" ]] && ok "exit 0" || bad "expected exit 0, got $RC"
+rm -rf "$ROOT"
+
+# ══ 2. unmanaged (no manifest) ════════════════════════════════════════════════
+scenario "unmanaged (no manifest entry)"
+ROOT="$(mktemp -d)"
+make_fixture "$ROOT"
+# deliberately no manifest written
+OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+RC=$?
+note "json: $OUT"
+[[ "$(json_field "$OUT" offpath_count)" -ge 1 ]] && ok "offpath flagged (unmanaged)" || bad "expected offpath>=1"
+[[ "$(json_field "$OUT" drift_count)" == "0" ]]  && ok "drift_count=0 (symlinks intact)" || bad "expected drift_count=0"
+[[ "$RC" == "1" ]] && ok "exit 1" || bad "expected exit 1, got $RC"
+rm -rf "$ROOT"
+
+# ══ 3. off-path edit (canonical changed after manifest) ═══════════════════════
+scenario "off-path edit (canonical changed without redeploy)"
+ROOT="$(mktemp -d)"
+make_fixture "$ROOT"
+write_manifest "$ROOT/city"
+# simulate a direct write to canonical AFTER the official deploy baseline
+printf 'sneaky off-path edit\n' >> "$ROOT/city/skills/demo/SKILL.md"
+OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+RC=$?
+note "json: $OUT"
+[[ "$(json_field "$OUT" offpath_count)" -ge 1 ]] && ok "offpath flagged (canonical drifted from manifest)" || bad "expected offpath>=1"
+# symlinks still resolve to canonical, so consumers are NOT drift — only off-path
+[[ "$(json_field "$OUT" drift_count)" == "0" ]]  && ok "drift_count=0 (consumers still symlinked)" || bad "expected drift_count=0"
+rm -rf "$ROOT"
+
+# ══ 4. real-copy drift ════════════════════════════════════════════════════════
+scenario "real-copy drift (a consumer is a stale real copy)"
+ROOT="$(mktemp -d)"
+make_fixture "$ROOT"
+write_manifest "$ROOT/city"
+# replace the agent's symlink with a STALE real copy
+rm "$ROOT/city/.gc/agents/a1/.claude/skills/demo"
+mkdir -p "$ROOT/city/.gc/agents/a1/.claude/skills/demo"
+printf 'STALE v0 — old version\n' > "$ROOT/city/.gc/agents/a1/.claude/skills/demo/SKILL.md"
+OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+RC=$?
+note "json: $OUT"
+[[ "$(json_field "$OUT" drift_count)" -ge 1 ]] && ok "drift flagged (stale real copy)" || bad "expected drift>=1"
+[[ "$RC" == "1" ]] && ok "exit 1" || bad "expected exit 1, got $RC"
+rm -rf "$ROOT"
+
+# ══ 5. dangling symlink ═══════════════════════════════════════════════════════
+scenario "dangling symlink (canonical target gone for one consumer)"
+ROOT="$(mktemp -d)"
+make_fixture "$ROOT"
+write_manifest "$ROOT/city"
+# point the crew symlink at a now-missing path
+rm "$ROOT/wa/crew/m1/.claude/skills/demo"
+ln -s "$ROOT/city/skills/does-not-exist" "$ROOT/wa/crew/m1/.claude/skills/demo"
+OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+note "json: $OUT"
+[[ "$(json_field "$OUT" drift_count)" -ge 1 ]] && ok "drift flagged (dangling symlink)" || bad "expected drift>=1"
+rm -rf "$ROOT"
+
+# ══ 6. redirected symlink ═════════════════════════════════════════════════════
+scenario "redirected symlink (consumer points away from canonical)"
+ROOT="$(mktemp -d)"
+make_fixture "$ROOT"
+write_manifest "$ROOT/city"
+# create a decoy skill dir and point the vendor symlink at it
+mkdir -p "$ROOT/city/decoy/demo"
+printf 'decoy content\n' > "$ROOT/city/decoy/demo/SKILL.md"
+rm "$ROOT/city/.claude/skills/demo"
+ln -s "$ROOT/city/decoy/demo" "$ROOT/city/.claude/skills/demo"
+OUT="$(run_audit "$ROOT/city" "$ROOT/wa" "$ROOT/city/.gc/state/skill-manifest.json" "$SKILLS_JSON")"
+note "json: $OUT"
+[[ "$(json_field "$OUT" drift_count)" -ge 1 ]] && ok "drift flagged (redirected symlink)" || bad "expected drift>=1"
+rm -rf "$ROOT"
+
+# ══ 7. deploy→manifest→audit integration (real skill-deploy.sh) ═══════════════
+# Proves the deploy side and audit side agree end-to-end: running the REAL
+# skill-deploy.sh against a sandbox city must write a manifest that makes the
+# auditor go green. gc is stubbed absent (GC=__no_gc__) so the deploy degrades
+# gracefully past the session-list / reload steps without touching anything live.
+scenario "deploy→audit integration (real skill-deploy.sh writes manifest)"
+DEPLOY="$SELF_DIR/skill-deploy.sh"
+ROOT="$(mktemp -d)"
+CITYD="$ROOT/city"
+mkdir -p "$CITYD/skills" "$CITYD/.claude/skills" "$CITYD/.gc/state"
+# author a source skill outside the sinks, then deploy it
+SRC="$ROOT/authoring/demo"
+mkdir -p "$SRC/references"
+printf 'deployed canonical v1\n' > "$SRC/SKILL.md"
+printf 'deployed ref v1\n'       > "$SRC/references/notes.md"
+DEPLOY_OUT="$(SKILL_DEPLOY_CITY="$CITYD" GC="__no_gc__" \
+    SKILL_MANIFEST="$CITYD/.gc/state/skill-manifest.json" \
+    "$DEPLOY" demo "$SRC" 2>&1)"
+DRC=$?
+note "deploy exit=$DRC"
+[[ "$DRC" == "0" ]] && ok "skill-deploy.sh succeeded (gc absent, graceful)" || { bad "skill-deploy.sh failed: $DEPLOY_OUT"; }
+[[ -f "$CITYD/.gc/state/skill-manifest.json" ]] && ok "manifest written" || bad "manifest not written"
+# now audit the just-deployed city — vendor sink is a real copy identical to
+# canonical, manifest matches -> fully green.
+OUT="$(run_audit "$CITYD" "$ROOT/wa-empty" "$CITYD/.gc/state/skill-manifest.json" \
+    '{"entries":[{"name":"demo","source":"city","path":"skills/demo/SKILL.md"}]}')"
+RC=$?
+note "json: $OUT"
+[[ "$(json_field "$OUT" offpath_count)" == "0" ]] && ok "offpath_count=0 after official deploy" || bad "expected offpath=0 post-deploy"
+[[ "$(json_field "$OUT" drift_count)" == "0" ]]   && ok "drift_count=0 (vendor copy matches canonical)" || bad "expected drift=0 post-deploy"
+[[ "$RC" == "0" ]] && ok "audit exit 0 (green)" || bad "expected exit 0, got $RC"
+rm -rf "$ROOT"
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo
+echo "════════════════════════════════════════════"
+echo "  skill-audit self-test: $PASS passed, $FAIL failed"
+echo "════════════════════════════════════════════"
+[[ "$FAIL" == "0" ]] && exit 0 || exit 1

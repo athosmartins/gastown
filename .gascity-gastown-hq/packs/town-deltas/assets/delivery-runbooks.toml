@@ -1,0 +1,88 @@
+# delivery-runbooks.toml — Machine-readable per-rig deploy runbooks.
+#
+# Read by story-delivery.sh. Each [[rig]] entry defines:
+#   name            — matches city.toml rig name
+#   runtime_dir     — the deployed worktree / git clone that runs in production
+#   git_repo        — source of truth git repo (bare or clone) used for ff-push
+#   deploy_cmd      — shell command to deploy: pulls runtime_dir to current HEAD.
+#                     MUST be idempotent. Runs as the launchd user.
+#   daemon_restarts — list of launchd label strings to kickstart after deploy.
+#                     Empty list means no daemon restart needed.
+#   prod_test_script — absolute path to a shell script that exits 0 on pass,
+#                     non-zero on failure. If absent, delivery halts with
+#                     "no prod test — cannot mark done".
+#   min_deploy_gap_minutes — don't redeploy if last deploy was < N minutes ago.
+#
+# Safety: story-delivery.sh NEVER auto-reverts. On failure it halts + escalates.
+
+# ─── property_scrapers ────────────────────────────────────────────────────────
+[[rig]]
+name            = "property_scrapers"
+runtime_dir     = "/Users/athos/.property-scrapers/runtime/main"
+git_repo        = "/Users/athos/gt/property_scrapers/.repo.git"
+# Deploy = fast-forward pull on the runtime clone.
+# The runtime is a normal git clone of github.com/athosmartins/property_scrapers.
+# No daemon restart required: runner.py reads SCRAPERS.keys() at startup via
+# --scraper all; the daily launchd job already points at this runtime_dir.
+deploy_cmd      = "git -C /Users/athos/.property-scrapers/runtime/main pull --ff-only"
+daemon_restarts = []   # launchd com.scrapers.daily fires on schedule; no restart needed
+prod_test_script = "/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/prod-tests/property_scrapers/run.sh"
+min_deploy_gap_minutes = 5
+
+# ─── whatsapp_automation ─────────────────────────────────────────────────────
+[[rig]]
+name            = "whatsapp_automation"
+runtime_dir     = "/Users/athos/gt/whatsapp_automation"
+git_repo        = "/Users/athos/gt/whatsapp_automation"
+# Self-repo rig: git pull on the repo root.
+deploy_cmd      = "git -C /Users/athos/gt/whatsapp_automation pull --ff-only"
+daemon_restarts = []   # WA worker managed by gc session; no launchd restart
+prod_test_script = ""  # not yet codified — delivery will HALT if story requires it
+min_deploy_gap_minutes = 5
+
+# ─── gastown (framework) ─────────────────────────────────────────────────────
+[[rig]]
+name            = "gastown"
+runtime_dir     = "/Users/athos/gt"
+git_repo        = "/Users/athos/gt/gastown/.repo.git"
+deploy_cmd      = ""   # gastown binary installed separately; no simple git pull deploys it
+daemon_restarts = []
+prod_test_script = ""
+min_deploy_gap_minutes = 10
+
+# ─── lexbh ───────────────────────────────────────────────────────────────────
+[[rig]]
+name            = "lexbh"
+runtime_dir     = ""   # no active production runtime identified
+git_repo        = "/Users/athos/gt/lexbh/.repo.git"
+deploy_cmd      = ""
+daemon_restarts = []
+prod_test_script = ""
+min_deploy_gap_minutes = 5
+
+# ─── gascity (HQ framework itself) ────────────────────────────────────────────
+[[rig]]
+name            = "gascity"
+runtime_dir     = "/Users/athos/gt/.gascity-gastown-hq"
+git_repo        = "/Users/athos/gt"
+# The HQ framework scripts run IN PLACE from the repo working tree — there is no
+# separate runtime clone, so the live scripts ARE the deployed versions the
+# moment they exist on disk. Deploy therefore does NOT git-pull the town root
+# (the root may legitimately carry unpushed local commits, which makes --ff-only
+# fail and is not a deploy failure). It runs the idempotent bootstrap, which
+# (re)establishes the skill-manifest baseline and ensures the periodic auditor
+# launchd job is registered. A best-effort ff-pull is attempted but never fatal.
+deploy_cmd      = "git -C /Users/athos/gt pull --ff-only 2>/dev/null || true; /Users/athos/gt/.gascity-gastown-hq/scripts/skill-integrity-install.sh"
+daemon_restarts = ["com.gascity.skill-audit"]
+prod_test_script = "/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/prod-tests/gascity/run.sh"
+min_deploy_gap_minutes = 5
+
+# ─── marketing ───────────────────────────────────────────────────────────────
+[[rig]]
+name            = "marketing"
+runtime_dir     = "/Users/athos/gt/marketing"
+git_repo        = "/Users/athos/gt/marketing/.repo.git"
+deploy_cmd      = ""
+daemon_restarts = []
+prod_test_script = ""
+min_deploy_gap_minutes = 5

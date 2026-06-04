@@ -32,8 +32,20 @@
 
 set -euo pipefail
 
-CITY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# CITY_DIR defaults to the city this script lives in. SKILL_DEPLOY_CITY overrides
+# it (used by the self-test to target a throwaway fixture; also lets the same
+# script serve other cities). Default preserves the original behaviour exactly.
+CITY_DIR="${SKILL_DEPLOY_CITY:-$(cd "$_SELF_DIR/.." && pwd)}"
 GC="${GC:-gc}"
+
+# Shared digest helper — the SAME implementation skill-audit.sh uses, so the
+# manifest recorded here and the live hash the auditor computes can never
+# disagree (that disagreement would be a false off-path flag).
+# shellcheck source=skill-lib.sh
+source "$_SELF_DIR/skill-lib.sh"
+
+MANIFEST="${SKILL_MANIFEST:-$CITY_DIR/.gc/state/skill-manifest.json}"
 
 # --- Parse args ---
 if [[ $# -lt 2 ]]; then
@@ -116,6 +128,65 @@ if command -v "$GC" >/dev/null 2>&1; then
 else
     echo >&2 "skill-deploy: WARNING — 'gc' not found in PATH. Cannot run gc reload --soft."
     echo >&2 "skill-deploy: Run 'gc reload --soft --city $CITY_DIR' manually within ~60s to prevent restarts."
+fi
+
+# --- Record the official-deploy manifest entry ---
+# This is the baseline that skill-audit.sh uses for off-path detection: it
+# records the content digest of the canonical skill AS PUBLISHED through this
+# script. A later canonical change that did NOT come through here will diverge
+# from this digest, and the auditor flags it as an off-path write (criterion #3).
+DEPLOY_DIGEST="$(skilllib_tree_digest "$CITY_SOURCE_SINK")"
+DEPLOYED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+DEPLOYED_BY="${BD_ACTOR:-${GIT_AUTHOR_NAME:-${USER:-unknown}}}"
+
+mkdir -p "$(dirname "$MANIFEST")"
+if MANIFEST="$MANIFEST" SKILL_NAME="$SKILL_NAME" DEPLOY_DIGEST="$DEPLOY_DIGEST" \
+   DEPLOYED_AT="$DEPLOYED_AT" DEPLOYED_BY="$DEPLOYED_BY" SOURCE_DIR="$SOURCE_DIR" \
+   python3 - <<'PY'
+import json, os, sys, tempfile
+
+path   = os.environ["MANIFEST"]
+name   = os.environ["SKILL_NAME"]
+
+# Read-merge-write so deploying one skill never clobbers another's entry.
+try:
+    with open(path) as f:
+        m = json.load(f)
+        if not isinstance(m, dict):
+            m = {}
+except (FileNotFoundError, json.JSONDecodeError):
+    m = {}
+
+m.setdefault("schema_version", "1")
+skills = m.setdefault("skills", {})
+skills[name] = {
+    "tree_digest": os.environ["DEPLOY_DIGEST"],
+    "deployed_at": os.environ["DEPLOYED_AT"],
+    "deployed_by": os.environ["DEPLOYED_BY"],
+    "source_dir":  os.environ["SOURCE_DIR"],
+}
+
+# Atomic write: tmp file in the same dir + os.replace, so a crash mid-write
+# can never leave a half-written manifest (which would break the auditor).
+d = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".skill-manifest.", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(m, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+PY
+then
+    echo "skill-deploy: Manifest updated ($SKILL_NAME -> $DEPLOY_DIGEST) at $MANIFEST"
+else
+    echo >&2 "skill-deploy: WARNING — failed to update manifest at $MANIFEST."
+    echo >&2 "skill-deploy: skill-audit.sh will flag '$SKILL_NAME' as unmanaged until the manifest records it."
 fi
 
 echo "skill-deploy: Done. Skill '$SKILL_NAME' deployed to $CITY_DIR."
