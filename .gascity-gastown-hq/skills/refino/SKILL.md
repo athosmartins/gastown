@@ -1,276 +1,286 @@
 ---
 name: refino
 description: >
-  Facilitador interativo de refinamento de histórias de usuário. Conduz o
-  agente pelos 8 campos obrigatórios um a um, reflete cada resposta de volta
-  para confirmação, exige aprovação explícita antes de gravar, e escreve um
-  bead de história com labels e metadados story.* corretos.
-triggers:
-  - "vamos refinar a história"
-  - "refinar história"
-  - "refinamento de história"
+  This skill should be used when Athos says something like "vamos refinar a
+  história", "refinar esse item", "refine this story", "quero refinar",
+  "vamos refinar juntos", or otherwise signals the start of a product
+  refinement session on a feature story. Guides the agent through an
+  interactive, rigid 8-field Definition of Refined — mandatory fields, no
+  skipping, Athos approval gate. Ends by writing/updating the story as a bead.
+version: "1.0.0"
 ---
 
-# Refino — Refinamento de Histórias de Usuário
+# Refino — Product Story Refinement Protocol
 
-Este skill conduz o refinamento de uma história de usuário de forma interativa,
-campo a campo, com reflect-back e gate de aprovação explícita antes de gravar.
+Refino is a RIGID interactive protocol that a crew agent wears to refine a
+feature story WITH Athos. It does NOT end until all 8 mandatory fields are
+filled AND Athos explicitly approves. No field may be skipped or left vague
+based on agent discretion.
 
-## Uso
-
-```
-/refino
-```
-
-Ou ao receber a frase: **"vamos refinar a história"**
+Language: conduct the session in Portuguese unless Athos switches to English.
+Tone: collaborative product partner — not an engineer. Avoid technical jargon
+unless Athos uses it.
 
 ---
 
-## Protocolo de Condução
+## Invocation
 
-> **REGRA FUNDAMENTAL**: Nunca avance para o próximo campo sem refletir a
-> resposta atual de volta e confirmar. Uma resposta vaga NÃO é aprovação.
-> Aprovação explícita significa o usuário dizer "sim", "ok", "aprovado",
-> "correto" ou equivalente inequívoco.
-
-### Abertura
-
-Diga ao usuário:
+Athos says something in the family of "vamos refinar a história". The agent
+immediately enters Refino mode and announces it:
 
 ```
-Vamos refinar a história passo a passo. Vou te fazer 8 perguntas,
-uma de cada vez, e confirmar cada resposta antes de avançar.
-No final, você aprova o resumo completo antes de qualquer coisa ser gravada.
+Entrando no modo Refino. Vamos refinar a história juntos.
+Nenhum campo pode ser pulado — só finalizamos quando os 8 campos
+estiverem preenchidos E você aprovar explicitamente.
+```
 
-Começando:
+If Athos provides a story title or bead ID at invocation, load it. Otherwise
+open with: "Qual história vamos refinar hoje? (título ou ID do bead)"
+
+---
+
+## The 8 Mandatory Fields (Definition of Refined)
+
+Work through the fields in order. After each answer, reflect it back
+concisely, ask "Está correto assim?" and only advance when Athos confirms.
+If an answer is vague, ask a follow-up rather than accepting it.
+
+### Field 1 — Resumo em 1 frase
+
+**Prompt to Athos:**
+> "Me dá o titular da história em uma frase. Deve ser claro o suficiente
+> para qualquer pessoa da equipe entender o que é sem mais contexto."
+
+**Acceptance criterion for this field:**
+- Single sentence, ≤ 15 words.
+- No "sistema deve" or passive constructions. Action-oriented.
+- Example: "Buscar imóveis por nome retorna resultados em menos de 2 segundos."
+
+**If too long or vague:** propose a shorter version and ask for confirmation.
+
+---
+
+### Field 2 — O que é + por que importa
+
+**Prompt to Athos:**
+> "Descreve o que essa história faz e por que ela importa em termos de
+> produto. Pensa no usuário final: qual é o problema que estamos resolvendo
+> e qual o valor gerado?"
+
+**Acceptance criterion:**
+- Two parts present: (1) what it does, (2) why it matters for the product/user.
+- Written in product language, not engineering language.
+- Example: "Permite que corretores encontrem imóveis por nome sem precisar
+  navegar manualmente. Reduz o tempo de atendimento e melhora a experiência
+  em campo."
+
+---
+
+### Field 3 — Estrela-guia (north-star metric)
+
+**Prompt to Athos:**
+> "Qual é a métrica estrela-guia dessa história — como vamos saber que
+> valeu a pena entregar? Um número ou comportamento mensurável que, se
+> atingido, confirma o sucesso."
+
+**Acceptance criterion:**
+- Single, measurable metric or observable outcome.
+- Must be falsifiable (can be measured after ship).
+- Examples: "A busca retorna em menos de 2s na maioria dos casos", "Taxa de
+  conversão da busca aumenta 15%", "Zero reclamações de lentidão no período
+  pós-entrega".
+
+**If vague ("melhorar performance"):** push for a number or threshold.
+
+---
+
+### Field 4 — Equilíbrios (balancing metrics)
+
+**Prompt to Athos:**
+> "O que NÃO pode piorar quando entregarmos isso? Quais métricas ou
+> comportamentos existentes precisam se manter estáveis?"
+
+**Acceptance criterion:**
+- At least one balancing metric stated.
+- Framed as "must not degrade" (e.g., "Latência das outras buscas não
+  pode aumentar", "Taxa de erro da API deve permanecer < 0.5%").
+- If Athos says "nada", challenge: "Tem certeza? Pensa em performance,
+  disponibilidade, experiência de outras features..."
+
+---
+
+### Field 5 — O que o dashboard observa depois de entregue
+
+**Prompt to Athos:**
+> "Depois que essa história estiver em produção, o que vamos monitorar
+> no dashboard ou nos logs para saber que está saudável? Quais sinais
+> operacionais devemos acompanhar?"
+
+**Acceptance criterion:**
+- At least two operational signals named.
+- Examples: "Taxa de erro da busca por nome", "Tempo de resposta da busca
+  na maioria dos casos", "Volume de buscas por nome vs total de buscas",
+  "Alertas de lentidão ou falha no banco".
+
+---
+
+### Field 6 — Critério de aceitação
+
+**Prompt to Athos:**
+> "Lista os critérios de aceitação concretos e verificáveis — o que
+> precisa ser VERDADEIRO para a história estar pronta e funcionando.
+> Escreve como RESULTADO (o que deve acontecer), não como implementação
+> (como fazer). Ex: 'buscar por nome retorna lista em < 2s' — não 'usar
+> índice no banco'."
+
+**Acceptance criterion:**
+- At least 2 criteria.
+- Each criterion: observable result, verifiable by a human tester.
+- No "deveria", "deve usar X tecnologia", or implementation details.
+- Each criterion passes the "can someone check this without source code?" test.
+
+**Enforce result-framing:** if Athos writes implementation steps, say:
+"Esse é um 'como' — vamos reformular como resultado. O que o usuário ou
+sistema vai observar quando isso estiver certo?"
+
+---
+
+### Field 7 — Dependências + fora-de-escopo
+
+**Prompt to Athos:**
+> "Duas partes aqui:
+> 1. **Dependências**: O que essa história precisa que ainda não existe,
+>    ou o que ela depende de outro time/sistema?
+> 2. **Fora de escopo**: O que explicitamente NÃO faz parte dessa história
+>    (para evitar scope creep)?"
+
+**Acceptance criterion:**
+- Both parts present. Can be "nenhuma dependência externa" for part 1 if
+  genuinely none.
+- Fora de escopo must have at least one explicit exclusion — this prevents
+  scope creep. If Athos skips it, ask: "O que alguém razoavelmente poderia
+  achar que está incluído, mas não está?"
+
+---
+
+### Field 8 — Checagem "é história ou épico?"
+
+**Prompt to Athos:**
+> "Essa história cabe em um ciclo de entrega — pode ser desenvolvida e
+> entregue como uma unidade de trabalho? Ou é grande demais e precisa ser
+> dividida em histórias menores?"
+
+**Size heuristics to share with Athos if needed:**
+- A story should be deliverable independently in ~1 sprint (1-2 weeks).
+- If the acceptance criteria list has 6+ items spanning multiple flows:
+  likely an epic.
+- If there are 3+ dependencies between components: likely needs splitting.
+
+**If it's a story:** proceed to approval gate.
+
+**If it's an epic:** initiate the split protocol below.
+
+### Split Protocol (when story is too big)
+
+```
+Essa história parece grande demais para uma única entrega.
+Vamos quebrá-la em histórias menores.
+
+Proposta de split:
+  1. [título da história menor 1] — [razão]
+  2. [título da história menor 2] — [razão]
+  ...
+
+Cada uma dessas pode ser refinada separadamente depois.
+Quer ajustar essa divisão antes de continuar?
+```
+
+After Athos confirms the split, document it as the `notes` of the bead and
+change the bead type to `epic`. Create child bead stubs for each sub-story
+(title only, `story:unrefined` label) using `--no-inherit-labels` so each
+child carries ONLY `story:unrefined` and does not silently inherit
+`story:epic-split` from the parent. Do NOT run full Refino on each sub-story
+in this session — offer to refine each one in a separate session.
+Then close this Refino session.
+
+---
+
+## Approval Gate
+
+After all 8 fields are filled, present the complete summary:
+
+```
+--- HISTÓRIA REFINADA ---
+
+1. Resumo: [...]
+2. O que é + por que importa: [...]
+3. Estrela-guia: [...]
+4. Equilíbrios: [...]
+5. Dashboard pós-entrega: [...]
+6. Critérios de aceitação:
+   - [...]
+   - [...]
+7. Dependências: [...] | Fora de escopo: [...]
+8. Checagem épico/história: [história — tamanho ok]
+
+Você aprova essa história como está? (sim / não / ajustar campo X)
+```
+
+**The story is ONLY approved when Athos explicitly says "sim", "aprovado",
+"ok", "aprovo" or equivalent.** A non-committal response ("parece bom",
+"acho que sim") does NOT count. Ask again: "Confirma a aprovação?"
+
+**If Athos says "ajustar campo X":** go back to that field, re-run it,
+re-present the full summary. Loop until explicit approval.
+
+**After explicit approval, ask ONE priority question before writing the bead:**
+
+```
+Qual a prioridade — Normal / Alta / Baixa?
+```
+
+Map the answer to `--priority` (Alta→1, Normal→2, Baixa→3). If unclear,
+default to Normal (P2). See `references/story-bead-convention.md` for the
+full priority table.
+
+---
+
+## Bead Write-back (on approval)
+
+On approval (after the priority question), create or update the story bead
+using the Story Bead Convention. See `references/story-bead-convention.md`
+for the exact commands and field mapping.
+
+The write-back MUST use `bd -C "$GC_CITY_PATH"` on every command. The
+lifecycle label transition MUST use `--set-labels story:approved` (atomic,
+works from any source lifecycle state — `story:unrefined`,
+`story:refinement-in-progress`, or new bead).
+
+Announce completion:
+
+```
+História aprovada e salva como bead [ID].
+Label: story:approved | Prioridade: [P]
+Pronta para entrar no backlog e ser despachada.
 ```
 
 ---
 
-## Campo 1 — Título
+## Guard Rails
 
-**Pergunta:**
-```
-1/8 TÍTULO
-Qual é o título da história? (formato: feat/fix/chore: descrição ação)
-Exemplo: "feat(viewer): enviar PDF pelo conversation viewer"
-```
-
-**Reflect-back:**
-```
-Título: "<resposta do usuário>"
-Está correto? (sim/corrigir)
-```
-
-Aguarde confirmação explícita antes de prosseguir.
+- **Never self-approve.** The agent cannot approve a story on behalf of Athos.
+- **Never skip a field.** If Athos tries to skip ("isso não importa"), say:
+  "Entendo, mas esse campo é obrigatório no nosso protocolo. Vamos preencher
+  juntos — pode ser curto. [restate the prompt]"
+- **Never fill a field on behalf of Athos without asking.** The agent may
+  propose a draft, but Athos must confirm.
+- **Never close Refino early.** If the session is interrupted, save partial
+  progress to the bead as a note (`story:refinement-in-progress` label) and
+  tell Athos the session can resume.
 
 ---
 
-## Campo 2 — Tipo
+## Additional Resources
 
-**Pergunta:**
-```
-2/8 TIPO
-Qual o tipo?
-  • feature — nova funcionalidade
-  • bug     — correção de defeito
-  • task    — tarefa técnica / refatoração / docs
-  • chore   — manutenção, deps, configuração
-```
-
-**Reflect-back:**
-```
-Tipo: <resposta>
-Está correto? (sim/corrigir)
-```
-
----
-
-## Campo 3 — Prioridade
-
-**Pergunta:**
-```
-3/8 PRIORIDADE
-Qual a prioridade?
-  • P0 — Crítico / produção bloqueada
-  • P1 — Alta / impacto direto no negócio
-  • P2 — Média / melhoria relevante
-  • P3 — Baixa / pode esperar
-```
-
-**Reflect-back:**
-```
-Prioridade: <P0/P1/P2/P3>
-Está correto? (sim/corrigir)
-```
-
----
-
-## Campo 4 — Ator (Como...)
-
-**Pergunta:**
-```
-4/8 ATOR
-Como QUEM? Quem se beneficia desta história?
-Exemplo: "agente de vendas", "usuário administrador", "sistema cron"
-```
-
-**Reflect-back:**
-```
-Ator: "<resposta>"
-Está correto? (sim/corrigir)
-```
-
----
-
-## Campo 5 — O que quer (Quero...)
-
-**Pergunta:**
-```
-5/8 DESEJO
-O que esse ator QUER fazer?
-Exemplo: "enviar documentos PDF pelo conversation viewer"
-```
-
-**Reflect-back:**
-```
-Desejo: "<resposta>"
-Está correto? (sim/corrigir)
-```
-
----
-
-## Campo 6 — Benefício (Para que...)
-
-**Pergunta:**
-```
-6/8 BENEFÍCIO
-Para QUE? Qual o objetivo ou resultado esperado?
-Exemplo: "fechar negócios sem sair do painel"
-```
-
-**Reflect-back:**
-```
-Benefício: "<resposta>"
-Está correto? (sim/corrigir)
-```
-
----
-
-## Campo 7 — Critério de Aceite
-
-**Pergunta:**
-```
-7/8 CRITÉRIO DE ACEITE
-Como saberemos que está PRONTO? Liste 1-3 condições testáveis.
-Exemplo:
-  - Usuário seleciona PDF; arquivo enviado via Whapi
-  - Arquivo aparece na conversa do destinatário
-  - Erro retorna mensagem legível (não stack trace)
-```
-
-**Reflect-back:**
-```
-Critério de aceite:
-<lista refletida de volta>
-Está correto? (sim/corrigir)
-```
-
----
-
-## Campo 8 — Notas e Contexto
-
-**Pergunta:**
-```
-8/8 NOTAS / CONTEXTO
-Algum contexto adicional, restrições, ou referências? (pode dizer "nenhum")
-```
-
-**Reflect-back:**
-```
-Contexto: "<resposta ou 'sem contexto adicional'>"
-Está correto? (sim/corrigir)
-```
-
----
-
-## Gate de Aprovação (OBRIGATÓRIO antes de gravar)
-
-Após coletar todos os 8 campos, apresente o resumo completo:
-
-```
-═══════════════════════════════════════════
-RESUMO DA HISTÓRIA — AGUARDANDO APROVAÇÃO
-═══════════════════════════════════════════
-Título:    <título>
-Tipo:      <tipo>
-Prioridade: <prioridade>
-
-Como <ator>, quero <desejo>, para que <benefício>.
-
-Critério de aceite:
-<critérios listados>
-
-Contexto: <notas>
-═══════════════════════════════════════════
-
-APROVADO para gravar? (responda "aprovado" ou corrija algum campo)
-```
-
-> **GATE**: Só avance se o usuário responder com aprovação EXPLÍCITA e
-> INEQUÍVOCA. Respostas como "acho que sim", "pode ser", "tá bom acho"
-> NÃO são aprovação — peça confirmação clara.
-
----
-
-## Gravação do Bead (após aprovação)
-
-Execute o comando `bd create` com todos os campos coletados:
-
-```bash
-bd create "<título>" \
-  --type <tipo> \
-  --priority <prioridade> \
-  --labels "story.actor=<ator-slug>,story.want=<desejo-slug>,lifecycle=backlog" \
-  --acceptance "<critério de aceite>" \
-  --description "Como <ator>, quero <desejo>, para que <benefício>." \
-  --metadata "{
-    \"story.actor\": \"<ator>\",
-    \"story.want\": \"<desejo>\",
-    \"story.goal\": \"<benefício>\",
-    \"story.acceptance\": \"<critério de aceite>\",
-    \"story.context\": \"<notas>\"
-  }"
-```
-
-**Regras de gravação:**
-- `--type` usa o valor exato escolhido no Campo 2
-- `--priority` usa P0/P1/P2/P3 do Campo 3
-- Labels: `story.actor`, `story.want` e `lifecycle=backlog` (exatamente UMA label lifecycle)
-- Slugs: converter espaços para `-`, remover acentos, lowercase
-- `--metadata` recebe os campos de story.* com valores completos (não slugs)
-
----
-
-## Convenção de Story Beads
-
-Ver: `city-local/references/story-bead-convention.md`
-
-Resumo:
-- Tipo bead: `feature` (ou `bug`/`task`/`chore` conforme o caso)
-- Labels: `story.actor`, `story.want`, `lifecycle` (exatamente UMA)
-- Metadados: `story.actor`, `story.want`, `story.goal`, `story.acceptance`, `story.context`
-- Nunca mais de uma label `lifecycle` no mesmo bead
-
----
-
-## Após Gravar
-
-Informe o ID do bead criado e exiba o comando que foi executado para auditoria.
-
-Exemplo de saída esperada:
-```
-✓ Bead criado: wa-xyzw
-  Título: feat(viewer): enviar PDF pelo conversation viewer
-  Tipo: feature · Prioridade: P1 · lifecycle: backlog
-```
+- **`references/story-bead-convention.md`** — exact bead labels, metadata
+  keys, and `bd` commands for writing/querying story beads.
