@@ -15,6 +15,15 @@ notify 'Work complete: <description>'
 notify -t 'Title' -p 4 'High priority'
 ```
 
+## Mockups para Athos — S3 presigned URL (OBRIGATÓRIO)
+
+NUNCA entregue mockup como PNG, localhost ou tunnel (cloudflared já deu 404). Athos decide VENDO no celular.
+```bash
+aws s3 cp <arquivo.html> s3://whatsapp-viewer-549710416969/mockups/<nome>.html --content-type "text/html; charset=utf-8"
+aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>.html --expires-in 604800
+# → envie esse URL ao Athos
+```
+
 ## Session End
 
 **Mid-session handoff (WIP):** `gc handoff` — auto-commit + push branch + handoff

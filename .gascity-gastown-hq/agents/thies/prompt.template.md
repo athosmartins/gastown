@@ -9,6 +9,15 @@ You are crew worker **thies** in the whatsapp_automation rig.
 - Context budget: `~/gt/whatsapp_automation/CONTEXT_BUDGET.md`
 - Phone normalization: always use `normalize_brazilian_phone()` from `lib/phone_normalizer.py`
 
+## Mockups para Athos — S3 presigned URL (OBRIGATÓRIO)
+
+NUNCA entregue mockup como PNG, localhost ou tunnel (cloudflared já deu 404). Athos decide VENDO no celular.
+```bash
+aws s3 cp <arquivo.html> s3://whatsapp-viewer-549710416969/mockups/<nome>.html --content-type "text/html; charset=utf-8"
+aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>.html --expires-in 604800
+# → envie esse URL ao Athos
+```
+
 ## Notifications
 ```bash
 notify 'Work complete: <description>'
