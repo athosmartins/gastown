@@ -1,0 +1,178 @@
+description = """
+Gate-done work formula — read the bead, work on a feature branch, submit via gate.
+
+This is the standard work lifecycle for pool workers in the contained city model.
+The worker creates a safe feature branch, implements the fix, pushes, and submits
+via gate-done. The autonomous quality gate (G) dispatches independent reviewers,
+merges to main on pass, and closes the source bead. The worker does NOT close the
+bead or set gc.outcome=pass directly.
+
+**Why gate-done (not direct close):**
+- merge_strategy=direct bypasses reviewers and has caused silent drops (wa-n3tu).
+- merge_strategy=mr stalls forever — no human clicks PRs in this city.
+- Gate is the ONLY path to production. Worker closes nothing — G does.
+
+## Branch naming rules (MANDATORY)
+Branch names MUST match `[a-z0-9/_-]+` only.
+- Use: `crew/<your-name>/<bead-id>` (e.g. `crew/batista/wa-xyz`)
+- FORBIDDEN: `+`, uppercase, dots, spaces, or any other special characters.
+- The gate guard rejects branches with unsafe chars (gate-status:error).
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| issue | caller | The work bead ID assigned to this agent |
+"""
+formula = "mol-do-work"
+version = 2
+
+[vars]
+[vars.issue]
+description = "The work bead ID assigned to this agent"
+required = true
+
+[[steps]]
+id = "do-work"
+title = "Read assignment, implement on feature branch, submit via gate-done"
+description = """
+You have been assigned a work bead. Read it, create a feature branch,
+implement the solution, push, submit via gate-done, and drain.
+
+**DO NOT close the bead yourself. DO NOT set merge_strategy=direct or mr.
+The gate (G) closes the bead after it merges to main.**
+
+**1. Read your assignment:**
+```bash
+bd show {{issue}}
+gc mail inbox                     # Check for context/handoff messages
+```
+
+Read the bead's title and description carefully. This is your task.
+
+**2. Create a safe feature branch (MANDATORY before any code change):**
+
+Branch name MUST use only lowercase letters, digits, hyphens, underscores,
+and slashes — NO '+', uppercase, dots, or special characters.
+
+```bash
+git fetch --prune origin
+SAFE_NAME=$(echo "${GC_ALIAS:-worker}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_-' '-' | sed 's/-*$//')
+BRANCH="crew/${SAFE_NAME}/{{issue}}"
+# Verify branch name is safe before creating it
+if ! echo "$BRANCH" | grep -qE '^[a-z0-9/_-]+$'; then
+  echo "ERROR: Branch name '$BRANCH' contains unsafe characters. Abort."
+  exit 1
+fi
+git checkout -B "$BRANCH" origin/main
+bd update {{issue}} --set-metadata branch="$BRANCH"
+echo "Branch: $BRANCH"
+```
+
+**3. Implement the solution:**
+
+Do exactly what the bead describes. Follow existing codebase conventions.
+Run the verification commands requested by the bead. If the bead does not
+name verification commands, run the smallest relevant local test/build check
+you can find.
+
+```bash
+git status --short               # Check what you've changed
+```
+
+Commit your changes with a meaningful message:
+```bash
+git add <files>
+git commit -m "<type>({{issue}}): <brief description>"
+```
+
+Do not commit unrelated runtime metadata, caches, or bead database churn.
+
+**4. Push your branch:**
+```bash
+git push origin "$BRANCH"
+```
+
+If push fails with "not fast-forward":
+```bash
+git fetch origin
+git rebase origin/main
+git push origin "$BRANCH"
+```
+
+**5. Submit via gate-done (NOT direct close):**
+
+This creates a durable marker in the city DB. The launchd guard detects it
+within ~2 minutes and dispatches 3 independent reviewers. G merges to main
+on all-PASS and closes the source bead. You will be notified via nudge.
+
+```bash
+# Gather context for the marker
+BRANCH=$(git branch --show-current)
+if [ -z "$GC_CITY_PATH" ]; then
+  GC_CITY_PATH=$(gc --city . config show 2>/dev/null | grep 'city_path' | head -1 | sed 's/.*=[ ]*//' | tr -d '"' || echo "")
+fi
+BASE_COMMIT=$(git rev-parse origin/main 2>/dev/null || echo "unknown")
+RIG=$(gc --city "$GC_CITY_PATH" rig list --json 2>/dev/null \
+  | jq -r --arg cwd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" \
+      '.rigs[] | select(.path == $cwd) | .name' 2>/dev/null | head -1 || echo "unknown")
+AUTHOR="${GC_ALIAS:-${BEADS_ACTOR:-worker}}"
+
+MARKER_ID=$(bd -C "$GC_CITY_PATH" create \
+  "ready-for-gate: $BRANCH" \
+  -t chore --ephemeral \
+  -l type:quality-gate-marker \
+  -l gate-status:ready \
+  -l "branch:$BRANCH" \
+  -l "source-bead:{{issue}}" \
+  -d "branch: $BRANCH
+bead_id: {{issue}}
+author: $AUTHOR
+base_commit: $BASE_COMMIT
+rig: $RIG
+submitted_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --json 2>/dev/null | jq -r '.id // empty')
+
+if [ -z "$MARKER_ID" ]; then
+  echo "ERROR: Failed to create gate marker. Check Dolt is running: gc dolt status"
+  exit 1
+fi
+echo "Gate marker created: $MARKER_ID"
+echo "The launchd guard will pick this up within ~2 minutes."
+echo "You will be nudged when the gate passes or fails."
+echo "DO NOT close bead {{issue}} — G does it on pass."
+```
+
+**6. Close this formula step (NOT the source bead):**
+
+```bash
+if [ -n "${GC_BEAD_ID:-}" ] && [ "$GC_BEAD_ID" != "{{issue}}" ]; then
+  bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass --status=closed \
+    --notes "Gate marker created: ${MARKER_ID:-unknown}. Branch: $BRANCH. Source bead {{issue}} pending gate review."
+fi
+```
+
+If you get stuck or need clarification, check your inbox:
+```bash
+gc mail inbox
+```
+
+**Exit criteria:** Branch pushed, gate marker created, formula step closed.
+Source bead {{issue}} remains open — G closes it when the gate passes."""
+
+[[steps]]
+id = "drain"
+title = "Close drain step and signal completion"
+needs = ["do-work"]
+description = """
+Work is submitted to the gate. Close this drain step, then signal the
+controller to reclaim this session:
+
+```bash
+if [ -n "${GC_BEAD_ID:-}" ]; then
+  bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass --status=closed --notes "Drain acknowledged. Gate marker submitted."
+fi
+gc runtime drain-ack
+```
+
+Run exactly these commands and nothing else."""
