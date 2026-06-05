@@ -172,6 +172,46 @@ if [ "$GHOST_COUNT" -gt 0 ]; then
   done
 fi
 
+# ── Step 0c: ga-3h8l — sweep orphaned story:in-flight labels ─────────────────
+# story:in-flight is the Pilot's lane-occupancy signal. It is stripped at merge
+# (gate PASS+merge dispatcher path) as of ga-3h8l. But beads can accumulate
+# a stale story:in-flight via paths the dispatcher doesn't cover:
+#   (a) story closed by hand / superseded without going through the gate
+#   (b) story merged outside the full gate flow (no gate:passed set)
+#   (c) any future path that misses the dispatcher's PASS block
+#
+# Sweep condition: story:in-flight bead is CLOSED OR carries gate:passed.
+# Both states mean the build is done — delivery either completed or will complete
+# on its own — so the lane slot is permanently leaked. Strip and log.
+#
+# bd list without --all returns only OPEN beads. To catch closed beads, use --all.
+# We then filter in jq: status==closed OR labels include gate:passed.
+
+log "Checking for orphaned story:in-flight labels (ga-3h8l reconciler)..."
+
+INFLIGHT_JSON=$(bd -C "$GC_CITY" list --json --all \
+  -l "story:in-flight" \
+  -n 0 \
+  2>/dev/null || echo "[]")
+
+INFLIGHT_COUNT=$(echo "$INFLIGHT_JSON" | jq 'length' 2>/dev/null || echo "0")
+
+if [ "$INFLIGHT_COUNT" -gt 0 ]; then
+  ORPHAN_IDS=$(echo "$INFLIGHT_JSON" | jq -r '
+    .[] |
+    select(
+      .status == "closed" or
+      ((.labels // []) | contains(["gate:passed"]))
+    ) | .id' 2>/dev/null || echo "")
+
+  for ORP_ID in $ORPHAN_IDS; do
+    [ -z "$ORP_ID" ] && continue
+    warn "Stripping orphaned story:in-flight from $ORP_ID (ga-3h8l reconciler: closed or gate:passed)"
+    bd -C "$GC_CITY" label remove "$ORP_ID" "story:in-flight" -q 2>/dev/null || true
+    bd -C "$GC_CITY" comment "$ORP_ID" "ga-3h8l reconciler: stripped orphaned story:in-flight (bead is closed or carries gate:passed — lane slot was permanently leaked). Self-healed." 2>/dev/null || true
+  done
+fi
+
 # ── Step 1: Find unclaimed ready-for-gate markers ─────────────────────────────
 
 MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all \

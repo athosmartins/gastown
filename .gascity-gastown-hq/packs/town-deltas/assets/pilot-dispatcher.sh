@@ -294,6 +294,7 @@ fi
 
 # ── Step 2b: Tier 2 — story:approved feature stories (only if Tier 1 empty) ──
 # Dispatchable = story:approved AND NOT story:in-flight AND NOT story:done
+#                AND NOT gate:passed (merged, delivery in progress — ga-3h8l)
 #                AND NOT pilot:dispatching (claim in progress)
 
 if [ "$TIER1_COUNT" -eq "0" ]; then
@@ -303,6 +304,7 @@ if [ "$TIER1_COUNT" -eq "0" ]; then
     -l "story:approved" \
     --exclude-label "story:in-flight" \
     --exclude-label "story:done" \
+    --exclude-label "gate:passed" \
     --exclude-label "pilot:dispatching" \
     --exclude-label "gate:needs-human" \
     -n 0 \
@@ -358,6 +360,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
     RIG_FEATURES=$(bd -C "$rig_path" list --json -l "story:approved" \
       --exclude-label "story:in-flight" \
       --exclude-label "story:done" \
+      --exclude-label "gate:passed" \
       --exclude-label "pilot:dispatching" \
       --exclude-label "gate:needs-human" \
       -n 0 2>/dev/null || echo "[]")

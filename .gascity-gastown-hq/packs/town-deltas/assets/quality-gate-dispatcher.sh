@@ -1164,10 +1164,15 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
       if [ "$IS_STORY" = "1" ]; then
         # STORY → hand off to story-delivery (deploy + prod-test → story:done).
         # Leave it OPEN: delivery needs an open story:approved + gate:passed bead.
-        # Pool re-spawn is already closed (assignee cleared above); the Pilot's
-        # re-pick is excluded by story:in-flight. Do NOT close here.
-        log "Source story $BEAD_ID handed off to delivery (gate:passed set; builder assignee cleared)."
-        bd -C "$GC_CITY" comment "$BEAD_ID" "Gate PASS handoff (ga-esbg): builder assignee cleared; story:approved + gate:passed in place. story-delivery will deploy + prod-test, then mark story:done." 2>/dev/null || true
+        # Pool re-spawn is already closed (assignee cleared above).
+        # ga-3h8l: strip story:in-flight NOW (at merge). The lane slot MUST free
+        # at merge — delivery may lag/fail, permanently eating a lane slot if we
+        # wait. The Pilot's Tier-2 selector excludes gate:passed (see
+        # pilot-dispatcher.sh), so stripping in-flight does NOT re-expose the
+        # bead to re-dispatch.
+        bd -C "$GC_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
+        log "Source story $BEAD_ID handed off to delivery (gate:passed set; story:in-flight cleared; builder assignee cleared)."
+        bd -C "$GC_CITY" comment "$BEAD_ID" "Gate PASS handoff (ga-3h8l fix): builder assignee cleared; story:in-flight stripped (lane slot freed at merge); story:approved + gate:passed in place. story-delivery will deploy + prod-test, then mark story:done." 2>/dev/null || true
       else
         # BUG/TASK → close it. bd list defaults to OPEN-only, so closing removes
         # the bead from EVERY open-work selector (Pilot Tier-1 bug & tech-debt),
@@ -1194,13 +1199,19 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
           RESPAWN_HITS="$RESPAWN_HITS pool:in_progress+assignee=$BUILDER_ASSIGNEE"
         fi
       fi
-      # b/c) Pilot Tier-1 open-bug / open-tech-debt re-pick. Stories are EXEMPT:
-      #      they are intentionally left OPEN for delivery and may legitimately
-      #      carry a tech-debt label; their pool re-spawn is closed by the
-      #      assignee clear and their Pilot re-pick by story:in-flight.
+      # b/c) Pilot Tier-1 open-bug / open-tech-debt re-pick. Stories are EXEMPT
+      #      from Tier-1 checks (open for delivery; not type:bug / tech-debt).
       if [ "$IS_STORY" != "1" ]; then
         if _still_listed -t bug;        then RESPAWN_HITS="$RESPAWN_HITS pilot:open-bug"; fi
         if _still_listed -l tech-debt;  then RESPAWN_HITS="$RESPAWN_HITS pilot:open-tech-debt"; fi
+      fi
+      # d) ga-3h8l: story lane-occupancy check. After PASS, story:in-flight must
+      #    have been stripped (lane slot freed at merge). If still present, the
+      #    slot is permanently leaked — escalate immediately.
+      if [ "$IS_STORY" = "1" ]; then
+        if _still_listed -l "story:in-flight"; then
+          RESPAWN_HITS="$RESPAWN_HITS story:in-flight-leaked"
+        fi
       fi
 
       if [ -n "$RESPAWN_HITS" ]; then
