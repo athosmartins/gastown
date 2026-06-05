@@ -590,8 +590,10 @@ log "Gate-run bead: $GATE_RUN_ID"
 #
 # The dispatcher polls these beads for closed status + verdict label.
 
-DIFF_SUMMARY=$(git_rig diff --stat "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null | tail -5 | tr '\n' ' ' | cut -c1-300)
-DIFF_FULL=$(git_rig diff "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null | head -2000)
+DIFF_SUMMARY=$(git_rig diff --stat "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null | tail -5 | tr '\n' ' ' | cut -c1-300 || true)
+# Note: "|| true" suppresses SIGPIPE (exit 141) from `head` truncating a large diff under pipefail.
+# Without it, the git diff process is killed by SIGPIPE when head exits, causing the script to abort.
+DIFF_FULL=$(git_rig diff "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null | head -2000 || true)
 
 VERDICT_BEAD_IDS=()
 SESSION_IDS=()
