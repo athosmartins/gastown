@@ -28,6 +28,21 @@
 #   • Stays on main. Never checks out another branch (the post-checkout auto-
 #     revert hook only fires on branch checkout; we never trigger it).
 #   • Idempotent: a no-op when already up to date.
+#
+# INTERIM HARDENING (ga-84rm — config-drift drain near-miss; Mayor decision
+# 2026-06-05):  A gate-merge / skill-publish that bumps config_revision races the
+# session reconciler's ~30s tick. If a drain decision lands in the gap before
+# this reconciler's soft-reload accepts the new config, externally-attached /
+# pinned crew (Oracle, Mila, batista-*) receive a real `outcome=drain` decision
+# (Oracle + Mila near-drained 2026-06-05). To SHRINK that race window we:
+#   (a) do a SYNCHRONOUS `gc reload --soft` after an FF pull — block until the
+#       reload is applied so drift is accepted before any reconciler tick can
+#       act — instead of fire-and-forget `--soft --async`; and
+#   (b) poll faster than the reconciler tick (RECONCILE_INTERVAL < 30s).
+# This is a BAND-AID, NOT the durable fix. The durable fix is an ENGINE-level
+# attached/pinned/recently-active guard in the COMPILED gascity binary (not on
+# disk here; gascity v1.2.1 does NOT contain it — verified). ga-84rm stays OPEN;
+# this change does not close it and must not be called "durable".
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
@@ -38,7 +53,7 @@ LOG="$LOG_DIR/town-root-reconciler.log"
 GC="${GC:-gc}"
 REMOTE="${RECONCILE_REMOTE:-origin}"
 BRANCH="${RECONCILE_BRANCH:-main}"
-RECONCILE_INTERVAL="${RECONCILE_INTERVAL:-90}"   # seconds between polls
+RECONCILE_INTERVAL="${RECONCILE_INTERVAL:-25}"   # seconds between polls (ga-84rm: < ~30s reconciler tick to shrink the config-drift drain race)
 DRY_RUN="${DRY_RUN:-0}"
 
 # Keep git from walking above the town root (mirrors crew env per CLAUDE.md).
@@ -184,15 +199,19 @@ reconcile_once() {
     [ "$RECONCILE_COUNT" -gt 0 ] && log "reconciled $RECONCILE_COUNT byte-identical untracked collision(s) — ff-pull can now land the tracked version(s)."
 
     if [ "$DRY_RUN" = "1" ]; then
-      log "DRY_RUN=1 — WOULD: git pull --ff-only $REMOTE $BRANCH ; gc reload --soft --async"
+      log "DRY_RUN=1 — WOULD: git pull --ff-only $REMOTE $BRANCH ; gc reload --soft (sync)"
       return 0
     fi
     if git -C "$ROOT" pull --ff-only "$REMOTE" "$BRANCH" >>"$LOG" 2>&1; then
       log "FF pull OK — now at $(git -C "$ROOT" rev-parse --short "$BRANCH"). Soft-reloading crew config (no drain)."
-      # Soft + async → ~50ms, never drains live sessions (see config-drift-watcher doctrine).
-      "$GC" reload --soft --async --city "$CITY" >>"$LOG" 2>&1 \
-        && log "gc reload --soft --async queued — live dispatchers pick up new code next tick." \
-        || err "gc reload --soft --async failed (files updated on disk regardless; dispatchers still get new code next tick)."
+      # ga-84rm INTERIM: SYNCHRONOUS soft reload (drop --async). Soft never drains
+      # live sessions (config-drift-watcher doctrine); blocking until the reload is
+      # applied means config drift is ACCEPTED before the session reconciler's
+      # ~30s tick can issue a drain against externally-attached/pinned crew. The
+      # extra wall-time (seconds) is the cost of closing the drain race window.
+      "$GC" reload --soft --city "$CITY" >>"$LOG" 2>&1 \
+        && log "gc reload --soft (sync) applied — drift accepted; live dispatchers pick up new code next tick." \
+        || err "gc reload --soft (sync) failed (files updated on disk regardless; dispatchers still get new code next tick)."
     else
       # After the untracked reconcile above, a still-failing FF is the RARE real
       # case (a collision that raced in, or a dirty TRACKED file) — no longer the
