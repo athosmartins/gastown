@@ -532,6 +532,25 @@ FIXSEC
   BUILDER_TARGET=$(rig_to_builder "$STORY_RIG")
   log "  Builder target: $BUILDER_TARGET (rig=$STORY_RIG lane=$LANE)"
 
+  # ── wa-1eos: per-builder mutex ───────────────────────────────────────────────
+  # Single-identity builders (digo=wa, batista-ps=ps, etc.) must have AT MOST ONE
+  # live session. Without this, dispatching a 2nd bead to a busy builder makes
+  # `gc sling` spawn a duplicate (digo → digo-1) that works the SAME crew branch —
+  # branch corruption. If the builder is already live, defer this bead to the next
+  # sweep (release the claim so it stays dispatchable). gastown.dog is a shared
+  # pool (multiple instances by design) — exempt. Fail-safe: any error → count 0 →
+  # dispatch proceeds (never halts the pipeline on a transient `gc` hiccup).
+  if [ "$DRY_RUN" != "1" ] && [ "$BUILDER_TARGET" != "gastown.dog" ]; then
+    local LIVE_BUILDER_SESSIONS
+    LIVE_BUILDER_SESSIONS=$(gc --city "$GC_CITY" session list 2>/dev/null \
+      | awk -v t="$BUILDER_TARGET" '$2==t && $3=="active"' | wc -l | tr -d ' ')
+    if [ "${LIVE_BUILDER_SESSIONS:-0}" -ge 1 ] 2>/dev/null; then
+      log "MUTEX(wa-1eos): builder $BUILDER_TARGET already has ${LIVE_BUILDER_SESSIONS} live session(s) — deferring $STORY_ID to next sweep (no duplicate spawn). Releasing claim."
+      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      return 1
+    fi
+  fi
+
   # ── Build task prompt ────────────────────────────────────────────────────────
   local DISPATCH_TASK
   if [ "$DISPATCH_TIER" = "bug" ]; then
