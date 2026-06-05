@@ -56,6 +56,10 @@ type StaleHookResult struct {
 	WorktreeDirty bool   `json:"worktree_dirty,omitempty"`
 	UnpushedCount int    `json:"unpushed_count,omitempty"`
 	WorktreeError string `json:"worktree_error,omitempty"`
+	// CompletedWork indicates the hooked bead's molecule was fully complete
+	// despite the hook not being cleared. The bead is auto-closed rather than
+	// re-opened, preventing the "1500+ retry loop" anti-pattern (dc-u98d).
+	CompletedWork bool `json:"completed_work,omitempty"`
 }
 
 // StaleHookScanResult contains the full results of a stale hook scan.
@@ -72,7 +76,10 @@ type StaleHookScanResult struct {
 // A hooked bead is considered stale if:
 //  1. The assignee's tmux session is dead (immediate unhook), OR
 //  2. The bead is older than MaxAge AND we can't determine session liveness
-//     (e.g., unknown assignee format)
+//     (e.g., unknown assignee format), OR
+//  3. The bead has a fully-complete molecule (all steps closed), even when the
+//     agent is alive — prevents the "1500+ retry loop" where a live agent keeps
+//     picking up completed work after a crash (dc-u98d)
 func ScanStaleHooks(townRoot string, cfg *StaleHookConfig) (*StaleHookScanResult, error) {
 	if cfg == nil {
 		cfg = DefaultStaleHookConfig()
@@ -116,7 +123,7 @@ func ScanStaleHooks(townRoot string, cfg *StaleHookConfig) (*StaleHookScanResult
 		// Determine if this hook is stale:
 		// - Agent confirmed dead → stale (regardless of age)
 		// - Can't check session + older than MaxAge → stale (fallback)
-		// - Agent alive → not stale
+		// - Agent alive → not stale (unless molecule is complete; see below)
 		isStale := false
 		if sessionChecked && !hookResult.AgentAlive {
 			// Session confirmed dead — unhook immediately regardless of age
@@ -127,14 +134,35 @@ func ScanStaleHooks(townRoot string, cfg *StaleHookConfig) (*StaleHookScanResult
 			isStale = true
 		}
 
+		// Check for completed molecule even when the agent is alive.
+		// A live agent can be stuck re-executing finished work across restarts
+		// when the session crashed after completing all formula steps but before
+		// burning/closing the root bead. The hook persists; every restart picks
+		// up the same completed work and hits the same dead end. (dc-u98d)
+		if !isStale && isMoleculeComplete(townRoot, bead.ID) {
+			isStale = true
+			hookResult.CompletedWork = true
+		}
+
 		if !isStale {
 			continue
 		}
 
 		result.StaleCount++
 
-		// If agent is dead/gone, check worktree state before unhooking
-		if !hookResult.AgentAlive {
+		if hookResult.CompletedWork {
+			// All formula steps are done: close the bead rather than re-opening it.
+			// Unhooking to "open" would re-dispatch the same finished work.
+			if !cfg.DryRun {
+				if err := closeCompleteBead(townRoot, bead.ID); err != nil {
+					hookResult.Error = err.Error()
+				} else {
+					hookResult.Unhooked = true
+					result.Unhooked++
+				}
+			}
+		} else if !hookResult.AgentAlive {
+			// Agent is dead/gone: check worktree state before unhooking
 			checkWorktreeState(townRoot, bead.Assignee, hookResult)
 
 			if !cfg.DryRun {
@@ -250,5 +278,49 @@ func assigneeToWorktreePath(townRoot, assignee string) string {
 // unhookBead sets a bead's status back to 'open'.
 func unhookBead(townRoot, beadID string) error {
 	cmd := beads.Command(townRoot, townBeadsDir(townRoot), beads.MutationRouting, "update", beadID, "--status=open")
+	return cmd.Run()
+}
+
+// isMoleculeComplete returns true when beadID has formula children AND all of
+// them are closed (none are open). Two bd list calls are used: one to check for
+// open children (fast-path: any open → not complete) and one to confirm any
+// children exist at all (no children → plain task, not a molecule). Returns
+// false on any query failure — safe to skip when uncertain.
+func isMoleculeComplete(townRoot, beadID string) bool {
+	// Fast path: any open children means work is not done yet.
+	openCmd := beads.Command(townRoot, townBeadsDir(townRoot), beads.ReadOnlyRouting,
+		"list", "--parent="+beadID, "--status=open", "--json", "--flat", "--limit=1")
+	openOut, err := openCmd.Output()
+	if err != nil {
+		return false
+	}
+	openTrimmed := bytes.TrimSpace(openOut)
+	if hasItems(openTrimmed) {
+		return false
+	}
+
+	// Confirm there are children at all — a bead with no children is a plain
+	// task, not a molecule, and we must not close it here.
+	allCmd := beads.Command(townRoot, townBeadsDir(townRoot), beads.ReadOnlyRouting,
+		"list", "--parent="+beadID, "--all", "--json", "--flat", "--limit=1")
+	allOut, err := allCmd.Output()
+	if err != nil {
+		return false
+	}
+	return hasItems(bytes.TrimSpace(allOut))
+}
+
+// hasItems returns true when a bd list JSON output contains at least one item.
+func hasItems(trimmed []byte) bool {
+	return len(trimmed) > 0 && string(trimmed) != "null" && string(trimmed) != "[]" && trimmed[0] == '['
+}
+
+// closeCompleteBead closes a bead whose molecule is fully complete but whose
+// hook was never cleared (e.g., the agent crashed before burning the wisp).
+// Uses --force because the bead is still in "hooked" status.
+func closeCompleteBead(townRoot, beadID string) error {
+	cmd := beads.Command(townRoot, townBeadsDir(townRoot), beads.MutationRouting,
+		"close", beadID, "--force",
+		"--reason=stale-hook: molecule complete, auto-closed by stale-hooks scan (dc-u98d)")
 	return cmd.Run()
 }

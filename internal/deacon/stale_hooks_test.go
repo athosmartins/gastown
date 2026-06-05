@@ -271,3 +271,57 @@ func TestStaleHookResult_PartialWorkFields(t *testing.T) {
 		t.Errorf("UnpushedCount = %d, want 3", result.UnpushedCount)
 	}
 }
+
+func TestStaleHookResult_CompletedWorkField(t *testing.T) {
+	result := &StaleHookResult{
+		BeadID:        "dc-7d00",
+		Title:         "metrics work",
+		Assignee:      "deacon",
+		AgentAlive:    true,
+		CompletedWork: true,
+	}
+
+	if !result.CompletedWork {
+		t.Error("CompletedWork should be true")
+	}
+	if !result.AgentAlive {
+		t.Error("AgentAlive should be true (agent is alive but work is done)")
+	}
+	if result.PartialWork {
+		t.Error("PartialWork should be false when work is complete")
+	}
+}
+
+func TestHasItems(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []byte
+		want  bool
+	}{
+		{"empty", []byte{}, false},
+		{"null", []byte("null"), false},
+		{"empty array", []byte("[]"), false},
+		{"single item", []byte(`[{"id":"dc-abc"}]`), true},
+		{"whitespace only", []byte("   "), false},
+		{"object not array", []byte(`{"id":"dc-abc"}`), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasItems(tt.input)
+			if got != tt.want {
+				t.Errorf("hasItems(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsMoleculeComplete_NoBdBinary(t *testing.T) {
+	// When bd is not available (e.g. no Dolt server), isMoleculeComplete
+	// must return false safely rather than panic or crash.
+	townRoot := t.TempDir()
+	// bd will fail because there's no beads database — function must return false
+	got := isMoleculeComplete(townRoot, "ga-fake123")
+	if got {
+		t.Error("isMoleculeComplete should return false when bd query fails")
+	}
+}
