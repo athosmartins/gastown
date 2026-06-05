@@ -2508,9 +2508,10 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 	// Auto-inject --remote-control for Claude agents when the session name is known.
 	// This enables the /remote-control slash command to connect to any Gas Town session.
 	// GT_SESSION is set when AgentEnvConfig.SessionName is provided by the caller.
-	// Excluded roles: polecat (ephemeral workers) and boot (deacon triage spawns
-	// every cycle; injecting --remote-control floods the user's mobile session list).
-	rcExcluded := role == "polecat" || role == "boot"
+	// Excluded roles: polecat (ephemeral workers), boot (deacon triage spawns every cycle;
+	// injecting --remote-control floods the user's mobile session list), and dog (utility
+	// pool workers — always headless, never human-attended).
+	rcExcluded := role == "polecat" || role == "boot" || role == "dog"
 	if sessionName := envVars["GT_SESSION"]; sessionName != "" && !rcExcluded {
 		rcCmd := rc.Command
 		if rcCmd == "" {
@@ -2521,6 +2522,20 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 			rcCopy.Args = append(append([]string{}, rc.Args...), "--remote-control", sessionName)
 			rc = &rcCopy
 		}
+	}
+
+	// Disable remoteControlAtStartup for headless/ephemeral roles. The global
+	// ~/.claude/settings.json has remoteControlAtStartup=true; without this override
+	// every ephemeral worker auto-connects to the user's phone remote-control stream,
+	// flooding notifications and exposing disposable sessions. mayor sessions
+	// (human-attended) intentionally inherit the global setting. Covers ga-629k
+	// (pool workers/dogs) and wa-9ye2 (gate reviewers) in one place.
+	headlessRole := role == "polecat" || role == "boot" || role == "dog" ||
+		role == "crew" || role == "witness"
+	if headlessRole && isClaudeAgent(rc) {
+		rcCopy := *rc
+		rcCopy.Args = append(append([]string{}, rc.Args...), "--settings", `{"remoteControlAtStartup": false}`)
+		rc = &rcCopy
 	}
 
 	// Apply exec wrapper from rig/town settings if not already set on the resolved config.

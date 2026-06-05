@@ -5665,9 +5665,10 @@ func TestBuildStartupCommandWithAgentOverride_NoDoubleSettingsOnNonOverridePath(
 		t.Fatalf("SaveRigSettings: %v", err)
 	}
 
-	// No override — ResolveRoleAgentConfig already adds --settings for polecat role.
-	// The new withRoleSettingsFlag call in BuildStartupCommandWithAgentOverride should
-	// be a no-op (idempotency guard), not double-add.
+	// No override — ResolveRoleAgentConfig already adds --settings <file-path> for polecat.
+	// BuildStartupCommandWithAgentOverride's withRoleSettingsFlag call must be a no-op
+	// (idempotency guard — no duplicate file-path), but a second --settings is expected:
+	// the inline JSON override that disables remoteControlAtStartup for headless roles.
 	cmd, err := BuildStartupCommandWithAgentOverride(
 		map[string]string{"GT_ROLE": "testrig/polecats/toast"},
 		rigPath,
@@ -5679,11 +5680,67 @@ func TestBuildStartupCommandWithAgentOverride_NoDoubleSettingsOnNonOverridePath(
 	}
 
 	count := strings.Count(cmd, "--settings")
-	if count > 1 {
-		t.Errorf("expected at most 1 --settings flag (idempotency guard), got %d — cmd: %q", count, cmd)
+	// Expect exactly 2: one file-path (role hooks) and one inline JSON (remoteControlAtStartup override).
+	if count != 2 {
+		t.Errorf("expected exactly 2 --settings flags (file-path + inline JSON headless override), got %d — cmd: %q", count, cmd)
 	}
-	if count == 0 {
-		t.Errorf("default Claude agent on polecat role should still get --settings, got: %q", cmd)
+	if !strings.Contains(cmd, "remoteControlAtStartup") {
+		t.Errorf("expected inline --settings JSON with remoteControlAtStartup override for headless polecat role, got: %q", cmd)
+	}
+}
+
+func TestBuildStartupCommand_HeadlessRolesGetRemoteControlStartupOverride(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	townSettings := NewTownSettings()
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	headlessRoles := []string{"polecat", "boot", "dog", "crew", "witness"}
+	for _, role := range headlessRoles {
+		t.Run(role, func(t *testing.T) {
+			envVars := map[string]string{"GT_ROLE": "testrig/" + role + "/worker"}
+			cmd, err := BuildStartupCommandWithAgentOverride(envVars, rigPath, "", "")
+			if err != nil {
+				t.Fatalf("BuildStartupCommandWithAgentOverride(%s): %v", role, err)
+			}
+			if !strings.Contains(cmd, "remoteControlAtStartup") {
+				t.Errorf("role %s: expected --settings JSON with remoteControlAtStartup=false, got: %q", role, cmd)
+			}
+		})
+	}
+}
+
+func TestBuildStartupCommand_MayorKeepsRemoteControlStartup(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	townSettings := NewTownSettings()
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd, err := BuildStartupCommandWithAgentOverride(
+		map[string]string{"GT_ROLE": "mayor"},
+		rigPath,
+		"",
+		"",
+	)
+	if err != nil {
+		t.Fatalf("BuildStartupCommandWithAgentOverride(mayor): %v", err)
+	}
+	if strings.Contains(cmd, "remoteControlAtStartup") {
+		t.Errorf("mayor role must NOT get remoteControlAtStartup override (human-attended), got: %q", cmd)
 	}
 }
 
