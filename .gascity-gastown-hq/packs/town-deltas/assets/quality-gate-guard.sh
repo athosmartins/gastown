@@ -25,8 +25,72 @@ LOG_DIR="$GC_CITY/.gc/logs"
 LOG="$LOG_DIR/quality-gate-guard.log"
 QG_LOG="$GC_CITY/.gc/quality-gate.jsonl"
 
-# TTL for stuck "claimed" markers: 30 minutes
+# ── Constants ─────────────────────────────────────────────────────────────────
 CLAIM_TTL_MINUTES=30
+DISPATCHING_TTL_MINUTES=30
+GATE_RUN_TTL_MINUTES=90
+MAX_RECLAIMS=3
+
+# ── Pure decision functions (loaded in GATE_GUARD_LIB_ONLY=1 mode by tests/dispatcher) ──
+
+# age_minutes_of <ts_Z> <now_epoch>
+# Returns age of a UTC bead timestamp in whole minutes.
+# Uses date -j -u -f (macOS BSD, UTC) to avoid the TZ-offset bug where local-time
+# parse made every age negative on UTC-offset hosts.
+age_minutes_of() {
+  local ts="$1" now_epoch="${2:-$(date +%s)}"
+  [ -z "$ts" ] && { echo "0"; return; }
+  local ts_epoch
+  ts_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${ts%%Z*}" "+%s" 2>/dev/null \
+    || date -d "$ts" +%s 2>/dev/null || echo "0")
+  echo $(( (now_epoch - ts_epoch) / 60 ))
+}
+
+# parse_marker_id <description_text>
+# Canonical extractor for the marker_id: field in gate-run bead descriptions.
+# Handles space and tab separators, strips trailing whitespace.
+# Both the guard and dispatcher converge on this function (DRY: ga-b92q).
+parse_marker_id() {
+  local desc="$1"
+  [ -z "$desc" ] && { echo ""; return; }
+  local line
+  line=$(printf '%s\n' "$desc" | grep -E "^marker_id:" | head -1 || true)
+  [ -z "$line" ] && { echo ""; return; }
+  printf '%s' "$line" | sed 's/^marker_id:[[:space:]]*//' | sed 's/[[:space:]]*$//'
+}
+
+# reconcile_marker_action <status> <age_min> <ttl_min> <reclaim_count> <max_reclaims>
+# Pure decision: what to do with a marker stuck in a transient state.
+# Returns: skip | requeue:queued | requeue:ready | error
+reconcile_marker_action() {
+  local status="$1" age_min="$2" ttl_min="$3" count="$4" max="$5"
+  case "$status" in
+    dispatching|claimed) ;;
+    *) echo "skip"; return ;;
+  esac
+  [ "$age_min" -le "$ttl_min" ] && { echo "skip"; return; }
+  [ "$count" -ge "$max" ]       && { echo "error"; return; }
+  case "$status" in
+    dispatching) echo "requeue:queued" ;;
+    claimed)     echo "requeue:ready"  ;;
+  esac
+}
+
+# reconcile_gaterun_action <age_min> <ttl_min> <marker_active: 0|1>
+# Pure decision: what to do with a gate-run bead stuck in gate-status:running.
+# Returns: skip | supersede:marker | abort:age
+reconcile_gaterun_action() {
+  local age_min="$1" ttl_min="$2" marker_active="$3"
+  [ "$marker_active" = "0" ] && { echo "supersede:marker"; return; }
+  [ "$age_min" -le "$ttl_min" ] && { echo "skip"; return; }
+  echo "abort:age"
+}
+
+# ── Lib-only mode: source with GATE_GUARD_LIB_ONLY=1 to load pure functions ──
+# without running the live guard sweep. Used by tests and by the dispatcher.
+if [ -n "${GATE_GUARD_LIB_ONLY:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 mkdir -p "$LOG_DIR"
 exec >> "$LOG" 2>&1
@@ -81,94 +145,142 @@ validate_rig() {
   echo "$known_rigs" | grep -qx "$val"
 }
 
-# TTL for stuck gate-run:running beads: 90 minutes.
-# Gate-runs created by the guard but never executed (ghost runs) would otherwise
-# permanently occupy gate-status:running. 90m > the dispatcher's 45m verdict timeout,
-# so any legitimate in-flight run finishes before we would abort it.
-GATE_RUN_TTL_MINUTES=90
+# ── Step 0: Vector A — unified transient-marker reclaim (dispatching + claimed) ─
+# The dispatcher's Step 0a only reclaims gate-status:dispatching when IT runs.
+# When the dispatcher CRASHES mid-dispatch, no one reclaims the marker — it
+# strands forever (ga-tmug Vector A). Fix: guard now reclaims BOTH transient
+# states in ONE authoritative place, with a gate-reclaim-count: thrash cap.
 
-# ── Step 0: TTL recovery — release stuck "claimed" markers ───────────────────
-# If a marker has been in gate-status:claimed for > CLAIM_TTL_MINUTES, the
-# runner likely died without cleaning up. Release it back to "ready" so the
-# next sweep can re-claim it.
+log "Step 0: Vector A reclaim — stuck transient markers (TTL=${CLAIM_TTL_MINUTES}m, MAX_RECLAIMS=${MAX_RECLAIMS})..."
 
-log "Checking for stuck claimed markers (TTL=${CLAIM_TTL_MINUTES}m)..."
-
-CLAIMED_JSON=$(bd -C "$GC_CITY" list --json --all \
-  -l type:quality-gate-marker \
-  -l gate-status:claimed \
+DISP_JSON=$(bd -C "$GC_CITY" list --json --all \
+  -l type:quality-gate-marker -l gate-status:dispatching \
   2>/dev/null || echo "[]")
+CLAIM_JSON_V=$(bd -C "$GC_CITY" list --json --all \
+  -l type:quality-gate-marker -l gate-status:claimed \
+  2>/dev/null || echo "[]")
+TRANSIENT_JSON=$(printf '%s\n%s' "$DISP_JSON" "$CLAIM_JSON_V" \
+  | jq -s 'add | unique_by(.id)' 2>/dev/null || echo "[]")
+TRANSIENT_COUNT=$(echo "$TRANSIENT_JSON" | jq 'length' 2>/dev/null || echo "0")
 
-CLAIMED_COUNT=$(echo "$CLAIMED_JSON" | jq 'length' 2>/dev/null || echo "0")
-
-if [ "$CLAIMED_COUNT" -gt 0 ]; then
+if [ "$TRANSIENT_COUNT" -gt 0 ]; then
   NOW_EPOCH=$(date +%s)
-  for i in $(seq 0 $((CLAIMED_COUNT - 1))); do
-    C_MARKER=$(echo "$CLAIMED_JSON" | jq ".[$i]")
-    C_ID=$(echo "$C_MARKER" | jq -r '.id')
-    C_UPDATED=$(echo "$C_MARKER" | jq -r '.updated_at // .created_at // ""')
+  for i in $(seq 0 $((TRANSIENT_COUNT - 1))); do
+    T=$(echo "$TRANSIENT_JSON" | jq ".[$i]")
+    T_ID=$(echo "$T" | jq -r '.id')
+    T_UPDATED=$(echo "$T" | jq -r '.updated_at // .created_at // ""')
+    T_LABELS=$(echo "$T" | jq -r '(.labels // []) | join(" ")')
 
-    if [ -z "$C_UPDATED" ]; then
-      continue
-    fi
+    T_STATUS=""
+    echo "$T_LABELS" | grep -q "gate-status:dispatching" && T_STATUS="dispatching"
+    echo "$T_LABELS" | grep -q "gate-status:claimed"     && T_STATUS="claimed"
+    [ -z "$T_STATUS" ] && continue
 
-    # Parse ISO8601 updated_at to epoch (macOS-compatible)
-    C_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${C_UPDATED%%Z*}" "+%s" 2>/dev/null \
-      || date -d "$C_UPDATED" +%s 2>/dev/null || echo "0")
+    T_AGE=$(age_minutes_of "$T_UPDATED" "$NOW_EPOCH")
+    T_COUNT=$(echo "$T_LABELS" | tr ' ' '\n' \
+      | sed -n 's/^gate-reclaim-count:\([0-9]*\)$/\1/p' | sort -n | tail -1)
+    [ -z "$T_COUNT" ] && T_COUNT=0
 
-    AGE_MINUTES=$(( (NOW_EPOCH - C_EPOCH) / 60 ))
-
-    if [ "$AGE_MINUTES" -gt "$CLAIM_TTL_MINUTES" ]; then
-      warn "Releasing stale claimed marker $C_ID (age=${AGE_MINUTES}m > TTL=${CLAIM_TTL_MINUTES}m)"
-      bd -C "$GC_CITY" label remove "$C_ID" "gate-status:claimed" -q 2>/dev/null || true
-      bd -C "$GC_CITY" label add    "$C_ID" "gate-status:ready"   -q 2>/dev/null || true
-    fi
+    ACTION=$(reconcile_marker_action "$T_STATUS" "$T_AGE" "$CLAIM_TTL_MINUTES" "$T_COUNT" "$MAX_RECLAIMS")
+    case "$ACTION" in
+      requeue:queued)
+        warn "Vector A: requeueing zombie dispatching marker $T_ID (age=${T_AGE}m, reclaims=${T_COUNT})"
+        bd -C "$GC_CITY" label remove "$T_ID" "gate-status:dispatching" -q 2>/dev/null || true
+        bd -C "$GC_CITY" label add    "$T_ID" "gate-status:queued"      -q 2>/dev/null || true
+        [ "$T_COUNT" -gt 0 ] && \
+          bd -C "$GC_CITY" label remove "$T_ID" "gate-reclaim-count:${T_COUNT}" -q 2>/dev/null || true
+        bd -C "$GC_CITY" label add "$T_ID" "gate-reclaim-count:$((T_COUNT+1))" -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$T_ID" "Vector A (ga-tmug): marker stuck in gate-status:dispatching for ${T_AGE}m (> ${CLAIM_TTL_MINUTES}m TTL). Dispatcher likely crashed. Re-queued for re-processing (reclaim $((T_COUNT+1))/${MAX_RECLAIMS})." 2>/dev/null || true
+        ;;
+      requeue:ready)
+        warn "Vector A: re-readying zombie claimed marker $T_ID (age=${T_AGE}m, reclaims=${T_COUNT})"
+        bd -C "$GC_CITY" label remove "$T_ID" "gate-status:claimed" -q 2>/dev/null || true
+        bd -C "$GC_CITY" label add    "$T_ID" "gate-status:ready"   -q 2>/dev/null || true
+        [ "$T_COUNT" -gt 0 ] && \
+          bd -C "$GC_CITY" label remove "$T_ID" "gate-reclaim-count:${T_COUNT}" -q 2>/dev/null || true
+        bd -C "$GC_CITY" label add "$T_ID" "gate-reclaim-count:$((T_COUNT+1))" -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$T_ID" "Vector A (ga-tmug): marker stuck in gate-status:claimed for ${T_AGE}m (> ${CLAIM_TTL_MINUTES}m TTL). Guard likely crashed. Re-readied for re-claim (reclaim $((T_COUNT+1))/${MAX_RECLAIMS})." 2>/dev/null || true
+        ;;
+      error)
+        warn "Vector A: exhausted reclaims for $T_ID (count=${T_COUNT} >= MAX_RECLAIMS=${MAX_RECLAIMS})"
+        bd -C "$GC_CITY" label remove "$T_ID" "gate-status:$T_STATUS" -q 2>/dev/null || true
+        bd -C "$GC_CITY" label add    "$T_ID" "gate-status:error"      -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$T_ID" "Vector A (ga-tmug): marker exhausted ${MAX_RECLAIMS} reclaim attempts stuck in gate-status:${T_STATUS}. Marking gate-status:error — human/Mayor intervention required." 2>/dev/null || true
+        ;;
+      skip)
+        log "  Marker $T_ID in $T_STATUS for ${T_AGE}m — within TTL, skipping."
+        ;;
+    esac
   done
 fi
 
-# ── Step 0b: TTL recovery — abort ghost gate-run:running beads ────────────────
-# Bug 2a fix: gate-run beads created by the guard (type:quality-gate-run,
-# gate-status:running) that survive longer than GATE_RUN_TTL_MINUTES are
-# "ghost" runs — the corresponding dispatcher sweep never started or crashed.
-# A ghost run with gate-status:running does NOT block the dispatcher from
-# picking up its queued marker (the dispatcher doesn't dedup on gate-runs),
-# but it creates misleading state and burns ephemeral bead quota.
-# Abort them cleanly so the state accurately reflects reality.
+# ── Step 0b: Vector B — reconcile orphan gate-run:running beads ───────────────
+# The guard creates a quality-gate: bead (type:quality-gate-run, gate-status:running)
+# at claim time. The dispatcher drives ITS OWN gate-run: bead but NEVER drives the
+# guard's bead to terminal — leaving orphans pinned in running after their run
+# completed (ga-tmug Vector B, 9 such beads observed).
 #
-# TTL is set to 90m — well above the dispatcher's 45m verdict timeout, so
-# any legitimately in-flight run (reviewers polling) is never aborted.
+# Fix: use reconcile_gaterun_action keyed on the companion marker's state
+# (extracted via parse_marker_id from the gate-run description):
+#   - marker terminal/gone → supersede:marker (immediate, no TTL wait)
+#   - marker active + age > TTL → abort:age (age fallback preserved)
+#   - marker active + within TTL → skip (in-flight, untouched)
+#
+# Keying on marker_id (not just source-bead) prevents false-positives on
+# re-dispatched live runs that share a source bead with an older failed attempt.
 
-log "Checking for ghost gate-run:running beads (TTL=${GATE_RUN_TTL_MINUTES}m)..."
+log "Step 0b: Vector B reconcile — orphan gate-run:running beads (TTL=${GATE_RUN_TTL_MINUTES}m)..."
 
-GHOST_RUNS_JSON=$(bd -C "$GC_CITY" list --json --all \
+GATE_RUNS_JSON=$(bd -C "$GC_CITY" list --json --all \
   -l type:quality-gate-run \
   -l gate-status:running \
   2>/dev/null || echo "[]")
+GATE_RUN_COUNT=$(echo "$GATE_RUNS_JSON" | jq 'length' 2>/dev/null || echo "0")
 
-GHOST_COUNT=$(echo "$GHOST_RUNS_JSON" | jq 'length' 2>/dev/null || echo "0")
-
-if [ "$GHOST_COUNT" -gt 0 ]; then
+if [ "$GATE_RUN_COUNT" -gt 0 ]; then
   NOW_EPOCH=$(date +%s)
-  for i in $(seq 0 $((GHOST_COUNT - 1))); do
-    GR=$(echo "$GHOST_RUNS_JSON" | jq ".[$i]")
+  for i in $(seq 0 $((GATE_RUN_COUNT - 1))); do
+    GR=$(echo "$GATE_RUNS_JSON" | jq ".[$i]")
     GR_ID=$(echo "$GR" | jq -r '.id')
     GR_UPDATED=$(echo "$GR" | jq -r '.updated_at // .created_at // ""')
+    GR_DESC=$(echo "$GR" | jq -r '.description // ""')
 
-    if [ -z "$GR_UPDATED" ]; then
-      continue
+    GR_AGE=$(age_minutes_of "$GR_UPDATED" "$NOW_EPOCH")
+
+    # Determine if the companion marker is still active.
+    # parse_marker_id extracts the marker_id: field written by the guard at Step 6.
+    COMPANION_MARKER_ID=$(parse_marker_id "$GR_DESC")
+    MARKER_ACTIVE=0
+    if [ -n "$COMPANION_MARKER_ID" ]; then
+      MARKER_JSON=$(bd -C "$GC_CITY" show "$COMPANION_MARKER_ID" --json 2>/dev/null || echo "")
+      if [ -n "$MARKER_JSON" ]; then
+        MARKER_LABELS=$(echo "$MARKER_JSON" \
+          | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' \
+          2>/dev/null || echo "")
+        echo "$MARKER_LABELS" | grep -qE "gate-status:(queued|claimed|dispatching)" \
+          && MARKER_ACTIVE=1 || true
+        echo "$MARKER_LABELS" | grep -qE "gate-status:" || MARKER_ACTIVE=1
+      fi
     fi
 
-    GR_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${GR_UPDATED%%Z*}" "+%s" 2>/dev/null \
-      || date -d "$GR_UPDATED" +%s 2>/dev/null || echo "0")
-
-    GR_AGE_MINUTES=$(( (NOW_EPOCH - GR_EPOCH) / 60 ))
-
-    if [ "$GR_AGE_MINUTES" -gt "$GATE_RUN_TTL_MINUTES" ]; then
-      warn "Aborting ghost gate-run $GR_ID (age=${GR_AGE_MINUTES}m > TTL=${GATE_RUN_TTL_MINUTES}m)"
-      bd -C "$GC_CITY" label remove "$GR_ID" "gate-status:running" -q 2>/dev/null || true
-      bd -C "$GC_CITY" label add    "$GR_ID" "gate-status:aborted" -q 2>/dev/null || true
-      bd -C "$GC_CITY" comment "$GR_ID" "Ghost gate-run aborted by guard TTL recovery (age=${GR_AGE_MINUTES}m > ${GATE_RUN_TTL_MINUTES}m TTL). The dispatcher never executed this run. Corresponding marker will be re-processed if still queued." 2>/dev/null || true
-    fi
+    ACTION=$(reconcile_gaterun_action "$GR_AGE" "$GATE_RUN_TTL_MINUTES" "$MARKER_ACTIVE")
+    case "$ACTION" in
+      supersede:marker)
+        warn "Vector B: superseding orphan gate-run $GR_ID (age=${GR_AGE}m, marker $COMPANION_MARKER_ID is terminal/gone)"
+        bd -C "$GC_CITY" label remove "$GR_ID" "gate-status:running"    -q 2>/dev/null || true
+        bd -C "$GC_CITY" label add    "$GR_ID" "gate-status:superseded"  -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-tmug): orphan gate-run superseded — companion marker $COMPANION_MARKER_ID is terminal/gone; run is no longer active. Self-healed by guard." 2>/dev/null || true
+        ;;
+      abort:age)
+        warn "Vector B: aborting gate-run $GR_ID by TTL fallback (age=${GR_AGE}m > ${GATE_RUN_TTL_MINUTES}m, marker_active=${MARKER_ACTIVE})"
+        bd -C "$GC_CITY" label remove "$GR_ID" "gate-status:running"  -q 2>/dev/null || true
+        bd -C "$GC_CITY" label add    "$GR_ID" "gate-status:aborted"  -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-tmug): gate-run aborted by guard TTL fallback (age=${GR_AGE}m > ${GATE_RUN_TTL_MINUTES}m; marker $COMPANION_MARKER_ID still active but run exceeded max wait)." 2>/dev/null || true
+        ;;
+      skip)
+        log "  Gate-run $GR_ID active (age=${GR_AGE}m, marker_active=${MARKER_ACTIVE}) — skipping."
+        ;;
+    esac
   done
 fi
 
