@@ -1019,6 +1019,18 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       warn "All-PASS verdict but merge failed ($MERGE_RESULT). Setting gate to failed."
     fi
 
+    # ── ga-hawi: soft-reload immediately after merge ──────────────────────────
+    # Every gate merge bumps the template config hash (CopyFiles mtime changes).
+    # Without this, the session reconciler's next tick sees config drift and
+    # issues drain decisions against crew, even pinned ones (race window = 0..Ns
+    # until town-root-reconciler's poll).  --soft accepts the new hash in place;
+    # --async returns immediately so we don't block the gate.  Non-fatal if missing.
+    if [[ ! "$MERGE_RESULT" = failed* ]] && [ "$MERGE_RESULT" != "dry_run" ]; then
+      gc reload --soft --async 2>/dev/null \
+        && log "ga-hawi: soft-reload dispatched post-merge (config-drift guard for pinned crew)." \
+        || warn "ga-hawi: gc reload --soft --async failed (non-fatal; binary guard still active)."
+    fi
+
     # ── Bug 1b: Post-merge diff-integrity verification (belt-and-suspenders) ──
     # After a successful merge, verify the branch's changes are actually present
     # in the merged main. This catches silent conflict resolutions where git
