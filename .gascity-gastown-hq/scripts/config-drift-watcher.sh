@@ -55,6 +55,13 @@ err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [drift-watcher] ERROR: $*"; }
 
 log "=== config-drift-watcher started (PID $$) ==="
 
+# Startup marker for delivery freshness verification (ga-fbjg).
+# Prod-test reads this to confirm the live process was restarted, not merely
+# that the script file changed on disk.
+STATE_DIR="$CITY/.gc/state"
+mkdir -p "$STATE_DIR"
+printf '%s %s\n' "$$" "$(date +%s)" > "$STATE_DIR/config-drift-watcher.startup"
+
 # ── Build list of watched paths ───────────────────────────────────────────────
 # Returns hash of all relevant files. Using find+stat over the watched dirs.
 compute_hash() {

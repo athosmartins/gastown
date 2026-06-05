@@ -317,6 +317,13 @@ reconcile_once() {
 
 log "town-root-reconciler started (root=$ROOT remote=$REMOTE branch=$BRANCH interval=${RECONCILE_INTERVAL}s dry_run=$DRY_RUN)"
 
+# Startup marker for delivery freshness verification (ga-fbjg).
+# Prod-test reads this to confirm the live process was restarted, not merely
+# that the script file changed on disk.
+STATE_DIR="$CITY/.gc/state"
+mkdir -p "$STATE_DIR"
+printf '%s %s\n' "$$" "$(date +%s)" > "$STATE_DIR/town-root-reconciler.startup"
+
 # Single-shot mode for tests / manual runs: RECONCILE_ONCE=1
 if [ "${RECONCILE_ONCE:-0}" = "1" ]; then
   reconcile_once
