@@ -53,9 +53,49 @@ DRY_RUN="${DRY_RUN:-0}"
 mkdir -p "$LOG_DIR"
 exec >> "$LOG" 2>&1
 
+# Load guard pure functions (lib-only: no live sweep) — gives us parse_marker_id
+# as the canonical single source of truth (DRY: ga-b92q / ga-tmug).
+GATE_GUARD_LIB_ONLY=1 source "${GC_CITY}/packs/town-deltas/assets/quality-gate-guard.sh" 2>/dev/null || true
+
 log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] $*"; }
 err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] ERROR: $*"; }
 warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] WARN: $*"; }
+
+# ── supersede_sibling_runs — proactively close guard's companion gate-run bead ─
+# The guard creates a quality-gate: sibling bead at claim time. The dispatcher
+# drives ITS OWN gate-run: bead but never drives the sibling to terminal (ga-tmug
+# Vector B). Calling this on BOTH PASS and FAIL terminal paths supersedes any
+# still-running sibling immediately, without waiting for the guard's 90m TTL fallback.
+#
+# Usage: supersede_sibling_runs <marker_id> <branch> <bead_id>
+supersede_sibling_runs() {
+  local this_marker="$1" branch="$2" bead_id="$3"
+  [ -z "$this_marker" ] && return 0
+
+  local running_json count
+  running_json=$(bd -C "$GC_CITY" list --json --all \
+    -l type:quality-gate-run \
+    -l gate-status:running \
+    2>/dev/null || echo "[]")
+  count=$(echo "$running_json" | jq 'length' 2>/dev/null || echo "0")
+  [ "$count" = "0" ] && return 0
+
+  local i sibling sibling_id sibling_desc sibling_marker
+  for i in $(seq 0 $((count - 1))); do
+    sibling=$(echo "$running_json" | jq ".[$i]")
+    sibling_id=$(echo "$sibling" | jq -r '.id')
+    sibling_desc=$(echo "$sibling" | jq -r '.description // ""')
+    sibling_marker=$(parse_marker_id "$sibling_desc")
+
+    if [ "$sibling_marker" = "$this_marker" ] || \
+       { [ -n "$bead_id" ] && echo "$sibling_desc" | grep -q "source_bead: $bead_id"; }; then
+      log "  Superseding sibling gate-run $sibling_id (marker=$sibling_marker, branch=$branch)"
+      bd -C "$GC_CITY" label remove "$sibling_id" "gate-status:running"    -q 2>/dev/null || true
+      bd -C "$GC_CITY" label add    "$sibling_id" "gate-status:superseded"  -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$sibling_id" "Dispatcher: gate-run superseded proactively on terminal path (marker $this_marker reached terminal; branch $branch). No need to wait for 90m TTL fallback. (ga-tmug Vector B)" 2>/dev/null || true
+    fi
+  done
+}
 
 echo ""
 log "=== Dispatcher sweep start (DRY_RUN=${DRY_RUN}) ==="
@@ -267,6 +307,50 @@ git_rig() {
   fi
 }
 
+# ── ga-ljbx: hardened ref resolution (defense-in-depth) ───────────────────────
+# rig_resolve_commit <ref> — resolve <ref> to a real COMMIT object SHA.
+#
+# Plain `git rev-parse origin/main` returns whatever 40-hex string the ref file
+# holds, EVEN IF that object is missing from the object DB (e.g. a ref left
+# dangling by a racing/aborted fetch or a competing reconciler). That garbage SHA
+# then poisons every downstream merge-base/merge-tree computation: merge-base
+# returns empty ("no common ancestor"), the branch is misclassified as having
+# unrelated histories, and a perfectly clean stale branch is bounced to
+# needs-rebase with a non-existent main_sha (observed live on ga-tmug:
+# main_sha=7b03eb9a… / e7949128…, neither of which exists in the repo).
+#
+# `git rev-parse --verify -q <ref>^{commit}` forces the ref to dereference to a
+# real, present commit object. On a missing/garbage object it prints NOTHING and
+# returns nonzero — callers can then distinguish "ref points at garbage" (→ treat
+# as a transient/re-triable error, gate-status:error) from "clean stale branch"
+# (→ auto-rebase). Output is empty on failure so `[ -z "$X" ]` guards trip.
+rig_resolve_commit() {
+  git_rig rev-parse --verify -q "$1^{commit}" 2>/dev/null || echo ""
+}
+
+# ── ga-ljbx: git-2.54 conflict detection ──────────────────────────────────────
+# rig_merge_has_conflict <main_ref> <branch_ref> — echo "1" if merging
+# <branch_ref> into <main_ref> conflicts, "0" if clean, "err" if undeterminable.
+#
+# The legacy 3-arg form `git merge-tree <base> <ours> <theirs>` + grep '^<<<<<<<'
+# is BROKEN on git 2.54: the conflict markers in that output are diff-prefixed
+# (" +<<<<<<<"), so the anchored grep never matches and a real conflict reads as
+# clean (verified empirically on git 2.54.0). The modern
+# `git merge-tree --write-tree <main> <branch>` is authoritative: exit 0 = clean,
+# exit 1 = conflict, exit >1 = error (e.g. unrelated histories / bad ref).
+rig_merge_has_conflict() {
+  local main_ref="$1" branch_ref="$2"
+  git_rig merge-tree --write-tree "$main_ref" "$branch_ref" >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" = "0" ]; then
+    echo "0"
+  elif [ "$rc" = "1" ]; then
+    echo "1"
+  else
+    echo "err"
+  fi
+}
+
 log "  rig_path=$RIG_PATH  git_dir=$GIT_DIR_PATH  container_rig=$IS_CONTAINER_RIG"
 
 # Determine default branch (main unless overridden)
@@ -277,10 +361,11 @@ DEFAULT_BRANCH=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
 log "Fetching remote for rig $RIG ..."
 git_rig fetch origin 2>/dev/null || warn "git fetch failed (continuing with stale refs)"
 
-# Verify branch exists on remote
-BRANCH_SHA=$(git_rig rev-parse "origin/$BRANCH" 2>/dev/null || echo "")
+# Verify branch exists on remote (ga-ljbx: hardened — a ref pointing at a missing
+# object yields EMPTY here, so we fail to gate-status:error, never proceed on garbage)
+BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH")
 if [ -z "$BRANCH_SHA" ]; then
-  err "Branch '$BRANCH' not found on remote origin. Aborting."
+  err "Branch '$BRANCH' not found on remote origin (or ref points at a missing object). Aborting."
   bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
   # wa-uthi: non-terminal (marker error, fixable + resubmittable) — no push. Logged only.
@@ -346,13 +431,25 @@ log "  Branch $BRANCH not yet merged into $DEFAULT_BRANCH — proceeding with re
 # silently resolve conflicts to main's side (as happened with wa-e99e / 52ba4c95).
 # We refuse to proceed and bounce back to the author with gate-status:needs-rebase.
 
-MAIN_HEAD_SHA=$(git_rig rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+# ga-ljbx: hardened — resolve main to a REAL commit object. If the ref points at a
+# missing/garbage object (racing fetch, competing reconciler), we MUST NOT proceed:
+# every downstream merge-base/merge-tree would silently misclassify a clean branch
+# as "no common ancestor" and strand it on needs-rebase (root cause of the ga-tmug
+# bounce: main_sha 7b03eb9a…/e7949128… never existed in the repo). Instead, set
+# gate-status:error (re-triable on the next sweep once the ref settles) and exit.
+MAIN_HEAD_SHA=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
+if [ -z "$MAIN_HEAD_SHA" ]; then
+  err "Cannot resolve origin/$DEFAULT_BRANCH to a real commit (dangling/garbage ref). Marking gate-status:error for retry."
+  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
+  bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
+  bd -C "$GC_CITY" comment "$MARKER_ID" "Gate transient error: origin/$DEFAULT_BRANCH did not resolve to a present commit object (likely a racing fetch). NOT a conflict — will retry on next sweep." 2>/dev/null || true
+  log "SUPPRESSED PUSH (wa-uthi non-terminal): origin/$DEFAULT_BRANCH unresolvable — gate-status:error (retriable)."
+  exit 1
+fi
 BRANCH_IS_CURRENT=0
-if [ -n "$MAIN_HEAD_SHA" ]; then
-  # main is an ancestor of branch iff the branch includes all of main
-  if git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null; then
-    BRANCH_IS_CURRENT=1
-  fi
+# main is an ancestor of branch iff the branch includes all of main
+if git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null; then
+  BRANCH_IS_CURRENT=1
 fi
 
 if [ "$BRANCH_IS_CURRENT" != "1" ]; then
@@ -371,22 +468,32 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
 
   log "  Branch $BRANCH is STALE (main=$MAIN_HEAD_SHA not in branch=$BRANCH_SHA). Attempting auto-rebase ..."
 
-  MERGE_BASE_SHA=$(git_rig merge-base "origin/$BRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+  # ga-ljbx: deterministic conflict detection (git 2.54). The legacy
+  # `merge-tree <base> <ours> <theirs>` + grep '^<<<<<<<' read EVERY real conflict
+  # as clean on git 2.54 (markers are diff-indented), so genuine conflicts slipped
+  # into the rebase and a transient empty merge-base was mislabeled "no common
+  # ancestor" → forced conflict → strand. We now use --write-tree exit codes.
   HAS_CONFLICT=0
   CONFLICT_FILES=""
+  MERGE_BASE_SHA=$(git_rig merge-base "origin/$BRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+  MT_VERDICT=$(rig_merge_has_conflict "origin/$DEFAULT_BRANCH" "origin/$BRANCH")
 
-  if [ -n "$MERGE_BASE_SHA" ]; then
-    # merge-tree <base> <ours=main> <theirs=branch>
-    # A conflict-free rebase is equivalent to a conflict-free three-way merge.
-    MT_OUTPUT=$(git_rig merge-tree "$MERGE_BASE_SHA" "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null || echo "")
-    if echo "$MT_OUTPUT" | grep -q "^<<<<<<<"; then
-      HAS_CONFLICT=1
-      CONFLICT_FILES=$(echo "$MT_OUTPUT" | grep -E "^(<<<|changed in both)" | head -5 | tr '\n' ' ' | cut -c1-300)
-    fi
-  else
-    # No common ancestor — treat as conflict (unrelated histories)
+  if [ "$MT_VERDICT" = "err" ]; then
+    # Undeterminable (unrelated histories OR a ref still settling). Do NOT bounce to
+    # needs-rebase — that strands a possibly-clean branch on a dead author. Mark
+    # gate-status:error so the next sweep re-attempts once refs settle.
+    err "  Conflict pre-check undeterminable for $BRANCH (merge-tree err; base=${MERGE_BASE_SHA:-none}). Marking gate-status:error for retry."
+    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
+    bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
+    bd -C "$GC_CITY" comment "$MARKER_ID" "Gate transient error: merge-tree conflict pre-check for $BRANCH vs $DEFAULT_BRANCH was undeterminable (merge-base=${MERGE_BASE_SHA:-none}). NOT necessarily a conflict — will retry on next sweep." 2>/dev/null || true
+    log "SUPPRESSED PUSH (wa-uthi non-terminal): merge-tree undeterminable for $BRANCH — gate-status:error (retriable)."
+    exit 1
+  elif [ "$MT_VERDICT" = "1" ]; then
     HAS_CONFLICT=1
-    CONFLICT_FILES="no common ancestor with main"
+    # Capture conflicting file names from the structured --write-tree conflict block.
+    CONFLICT_FILES=$(git_rig merge-tree --write-tree --name-only "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null \
+      | tail -n +2 | head -5 | tr '\n' ' ' | cut -c1-300)
+    [ -z "$CONFLICT_FILES" ] && CONFLICT_FILES="merge conflict (files unavailable)"
   fi
 
   if [ "$HAS_CONFLICT" = "0" ]; then
@@ -410,7 +517,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
             bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher auto-rebased $BRANCH onto main ($MAIN_HEAD_SHA). New tip: $NEW_TIP. Proceeding with review." 2>/dev/null || true
             # Re-verify stale check passes now
             git_rig fetch origin 2>/dev/null || true
-            BRANCH_SHA=$(git_rig rev-parse "origin/$BRANCH" 2>/dev/null || echo "$BRANCH_SHA")
+            BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH"); [ -z "$BRANCH_SHA" ] && BRANCH_SHA="$NEW_TIP"
             if git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null; then
               BRANCH_IS_CURRENT=1
             else
@@ -441,7 +548,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
             log "  Auto-rebase success (self-repo): $BRANCH pushed to $NEW_TIP"
             bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher auto-rebased $BRANCH onto main ($MAIN_HEAD_SHA). New tip: $NEW_TIP. Proceeding with review." 2>/dev/null || true
             git_rig fetch origin 2>/dev/null || true
-            BRANCH_SHA=$(git_rig rev-parse "origin/$BRANCH" 2>/dev/null || echo "$BRANCH_SHA")
+            BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH"); [ -z "$BRANCH_SHA" ] && BRANCH_SHA="$NEW_TIP"
             if git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null; then
               BRANCH_IS_CURRENT=1
             else
@@ -472,28 +579,83 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
   fi
 
   if [ "$BRANCH_IS_CURRENT" != "1" ]; then
-    # Conflicts detected or auto-rebase failed — bounce to author
-    warn "Branch $BRANCH: auto-rebase not possible (${CONFLICT_FILES:-conflicts}). Bouncing to author."
-    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
-    bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED: branch $BRANCH is stale and has conflicts that prevent auto-rebase.
-main HEAD is $MAIN_HEAD_SHA. Conflicting regions: ${CONFLICT_FILES:-unknown}.
-Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, resolve conflicts, and re-run /gate-done." 2>/dev/null || true
+    # ── ga-ljbx: never-strand bounce ──────────────────────────────────────────
+    # GENUINE conflict (or auto-rebase worktree/push failure). The old behavior
+    # bounced to needs-rebase + nudged the author. For framework self-fixes the
+    # author is a drained/transient pool dog (AUTHOR empty OR no live session), so
+    # the nudge hit nothing and the bead stranded forever, re-firing needs_rebase
+    # on every re-pick. We now:
+    #   1. Decide if the author is reachable (non-empty AND a live session exists).
+    #   2. If reachable: bounce + nudge as before (author can fix conflicts).
+    #   3. If NOT reachable: track a bounded gate:rebase-attempt:N counter on the
+    #      marker. Below MAX → mark gate-status:error (the next sweep re-attempts
+    #      the auto-rebase; main may have settled / a transient may clear). At/above
+    #      MAX → escalate to the Mayor via mail (durable) and mark needs-rebase, so
+    #      a human-or-Mayor-driven resolution happens — but we NEVER silently strand.
+    MAX_REBASE_ATTEMPTS=3
 
-    if [ -n "$BEAD_ID" ]; then
-      bd -C "$GC_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
-      bd -C "$GC_CITY" comment "$BEAD_ID" "Quality gate blocked: branch $BRANCH has conflicts with current main ($MAIN_HEAD_SHA). Auto-rebase attempted but failed (${CONFLICT_FILES:-conflicts}). Manual rebase required — re-run /gate-done after resolving." 2>/dev/null || true
+    AUTHOR_ALIVE=0
+    if [ -n "$AUTHOR" ]; then
+      if gc --city "$GC_CITY" session list --json 2>/dev/null \
+           | jq -e --arg a "$AUTHOR" 'if type=="array" then . else (.sessions // []) end
+                 | map(select((.alias==$a) or (.name==$a) or (.agent==$a))) | length > 0' >/dev/null 2>&1; then
+        AUTHOR_ALIVE=1
+      fi
     fi
 
-    if [ -n "$AUTHOR" ]; then
+    # Read current rebase-attempt counter from the marker labels.
+    REBASE_ATTEMPT=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null \
+      | sed -n 's/^gate:rebase-attempt:\([0-9]\+\)$/\1/p' | sort -rn | head -1)
+    [ -z "$REBASE_ATTEMPT" ] && REBASE_ATTEMPT=0
+
+    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
+
+    if [ "$AUTHOR_ALIVE" = "1" ]; then
+      # Author can resolve — bounce + nudge (legacy path).
+      warn "Branch $BRANCH: genuine conflict (${CONFLICT_FILES:-conflicts}); author $AUTHOR is live — bouncing for manual rebase."
+      bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED: branch $BRANCH is stale and has conflicts that prevent auto-rebase.
+main HEAD is $MAIN_HEAD_SHA. Conflicting regions: ${CONFLICT_FILES:-unknown}.
+Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, resolve conflicts, and re-run /gate-done." 2>/dev/null || true
+      if [ -n "$BEAD_ID" ]; then
+        bd -C "$GC_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$BEAD_ID" "Quality gate blocked: branch $BRANCH has conflicts with current main ($MAIN_HEAD_SHA). Auto-rebase failed (${CONFLICT_FILES:-conflicts}). Manual rebase required — re-run /gate-done after resolving." 2>/dev/null || true
+      fi
       gc --city "$GC_CITY" session nudge "$AUTHOR" \
         "GATE BLOCKED for branch $BRANCH: stale with conflicts — auto-rebase failed. Conflicts: ${CONFLICT_FILES:-unknown}. Manually rebase onto origin/$DEFAULT_BRANCH (main HEAD: $MAIN_HEAD_SHA), resolve conflicts, re-run /gate-done. Bead: $BEAD_ID" \
         --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR for rebase"
+      REBASE_EVENT="dispatcher_needs_rebase"
+      REBASE_VERDICT="NEEDS_REBASE (conflicts, author live, bounced)"
+    else
+      # Dead/empty author — never strand. Bounded server-side retry, then escalate.
+      NEXT_ATTEMPT=$((REBASE_ATTEMPT + 1))
+      bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:rebase-attempt:$REBASE_ATTEMPT" -q 2>/dev/null || true
+      bd -C "$GC_CITY" label add    "$MARKER_ID" "gate:rebase-attempt:$NEXT_ATTEMPT"  -q 2>/dev/null || true
+      if [ "$NEXT_ATTEMPT" -lt "$MAX_REBASE_ATTEMPTS" ]; then
+        warn "Branch $BRANCH: conflict/auto-rebase-fail, author dead/empty (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — gate-status:error for server-side retry."
+        bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS: branch $BRANCH could not auto-rebase (${CONFLICT_FILES:-conflicts}) and the author session is gone. Re-queued for server-side retry on next sweep (NOT stranded on a dead author)." 2>/dev/null || true
+        REBASE_EVENT="dispatcher_autorebase_retry"
+        REBASE_VERDICT="ERROR (retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, dead author)"
+      else
+        err "Branch $BRANCH: conflict persists after $MAX_REBASE_ATTEMPTS server-side attempts, author dead/empty — escalating to Mayor."
+        bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED: branch $BRANCH has a genuine conflict (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA), auto-rebase failed $MAX_REBASE_ATTEMPTS times, and no live author session exists. Escalated to Mayor for resolution." 2>/dev/null || true
+        if [ -n "$BEAD_ID" ]; then
+          bd -C "$GC_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+        fi
+        gc --city "$GC_CITY" mail send mayor \
+          -s "Gate escalation: $BRANCH stranded conflict (no live author)" \
+          -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) has a genuine conflict vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). Conflicting: ${CONFLICT_FILES:-unknown}. Auto-rebase failed $MAX_REBASE_ATTEMPTS times and the author session is gone — gate cannot self-heal. Needs a manual rebase or a decision." 2>/dev/null \
+          || warn "Could not mail Mayor for gate escalation on $BRANCH"
+        REBASE_EVENT="dispatcher_needs_rebase_escalated"
+        REBASE_VERDICT="NEEDS_REBASE (escalated to Mayor after $MAX_REBASE_ATTEMPTS attempts)"
+      fi
     fi
 
-    # wa-uthi: non-terminal (bounced to author for rebase, retryable) — no push to
-    # Athos. The author is nudged above; Athos only hears about terminal outcomes.
-    log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH needs manual rebase — bounced to $AUTHOR."
+    # wa-uthi: non-terminal (retryable / escalated) — no push to Athos.
+    log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
 
     mkdir -p "$(dirname "$QG_LOG")"
     jq -c -n \
@@ -505,10 +667,11 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
       --arg author "$AUTHOR" \
       --arg main_sha "$MAIN_HEAD_SHA" \
       --arg conflicts "${CONFLICT_FILES:-unknown}" \
-      '{ts: $ts, event: "dispatcher_needs_rebase", branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author, main_sha: $main_sha, conflicts: $conflicts}' \
+      --arg event "$REBASE_EVENT" \
+      '{ts: $ts, event: $event, branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author, main_sha: $main_sha, conflicts: $conflicts}' \
       >> "$QG_LOG" 2>/dev/null || true
 
-    log "=== Dispatcher sweep complete: branch=$BRANCH verdict=NEEDS_REBASE (conflicts, auto-rebase failed) ==="
+    log "=== Dispatcher sweep complete: branch=$BRANCH verdict=$REBASE_VERDICT ==="
     exit 0
   fi
 fi
@@ -876,10 +1039,13 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       #   4. Verify landing
 
       git_rig fetch origin 2>/dev/null || warn "Pre-merge fetch failed (attempt $((MERGE_ATTEMPT+1)))"
+      # ga-ljbx: hardened — resolve to REAL commit objects so a dangling ref
+      # surfaces as failed_sha_resolution (retryable) rather than poisoning the
+      # downstream merge-base/merge-tree with a non-existent SHA.
       local CUR_MAIN
-      CUR_MAIN=$(git_rig rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+      CUR_MAIN=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
       local CUR_BRANCH
-      CUR_BRANCH=$(git_rig rev-parse "origin/$BRANCH" 2>/dev/null || echo "")
+      CUR_BRANCH=$(rig_resolve_commit "origin/$BRANCH")
 
       if [ -z "$CUR_MAIN" ] || [ -z "$CUR_BRANCH" ]; then
         MERGE_RESULT="failed_sha_resolution"
@@ -895,16 +1061,20 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
         local TMP_MR_WT="/tmp/gc-gate-mr-retry-$$-${MERGE_ATTEMPT}"
         local MR_OK=0
 
-        # Conflict pre-check
+        # ga-ljbx: deterministic conflict pre-check (git 2.54) — see
+        # rig_merge_has_conflict. An "err" verdict is treated as a transient
+        # resolution failure (retryable) rather than a phantom conflict.
         local MR_BASE
         MR_BASE=$(git_rig merge-base "origin/$BRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
         local MR_CONFLICT=0
-        if [ -n "$MR_BASE" ]; then
-          local MR_MT
-          MR_MT=$(git_rig merge-tree "$MR_BASE" "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null || echo "")
-          echo "$MR_MT" | grep -q "^<<<<<<" && MR_CONFLICT=1
-        else
+        local MR_VERDICT
+        MR_VERDICT=$(rig_merge_has_conflict "origin/$DEFAULT_BRANCH" "origin/$BRANCH")
+        if [ "$MR_VERDICT" = "1" ]; then
           MR_CONFLICT=1
+        elif [ "$MR_VERDICT" = "err" ]; then
+          err "  Merge-time conflict pre-check undeterminable (base=${MR_BASE:-none}) — treating as transient (attempt $((MERGE_ATTEMPT+1)))"
+          MERGE_RESULT="failed_sha_resolution"
+          return 1
         fi
 
         if [ "$MR_CONFLICT" = "1" ]; then
@@ -957,10 +1127,14 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
           return 1
         fi
 
-        # Re-fetch after rebase push
+        # Re-fetch after rebase push (ga-ljbx: hardened resolution)
         git_rig fetch origin 2>/dev/null || true
-        CUR_BRANCH=$(git_rig rev-parse "origin/$BRANCH" 2>/dev/null || echo "")
-        CUR_MAIN=$(git_rig rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+        CUR_BRANCH=$(rig_resolve_commit "origin/$BRANCH")
+        CUR_MAIN=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
+        if [ -z "$CUR_BRANCH" ] || [ -z "$CUR_MAIN" ]; then
+          MERGE_RESULT="failed_sha_resolution"
+          return 1
+        fi
         IS_ANC=$(git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null && echo "yes" || echo "no")
 
         if [ "$IS_ANC" != "yes" ]; then
@@ -974,7 +1148,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       if git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH" 2>/dev/null; then
         git_rig fetch origin 2>/dev/null || warn "Post-FF-push fetch failed"
         local POST_MAIN
-        POST_MAIN=$(git_rig rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+        POST_MAIN=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
         if [ -n "$POST_MAIN" ] && git_rig merge-base --is-ancestor "$CUR_BRANCH" "$POST_MAIN" 2>/dev/null; then
           MERGE_SHA="$CUR_BRANCH"
           MERGE_RESULT="direct_ff"
@@ -1044,7 +1218,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       log "Post-merge diff-integrity check (Bug 1b belt-and-suspenders) ..."
       git_rig fetch origin 2>/dev/null || warn "Post-merge fetch failed; integrity check may use stale refs"
 
-      MERGED_HEAD=$(git_rig rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+      MERGED_HEAD=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
       INTEGRITY_FAIL=0
       INTEGRITY_MSG=""
 
@@ -1248,6 +1422,7 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
       notify -t "Quality Gate PASSED" -p 2 "Branch $BRANCH merged to $DEFAULT_BRANCH — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
       log "Gate PASSED: branch=$BRANCH tier=$TIER merge_sha=$MERGE_SHA elapsed=${ELAPSED_S}s"
     fi
+    supersede_sibling_runs "$MARKER_ID" "$BRANCH" "$BEAD_ID"
   fi
 
 else
@@ -1349,6 +1524,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
 
   # wa-uthi: TERMINAL FAIL (review rejected, definitive) — this push is KEPT.
   notify -t "Quality Gate FAILED" -p 3 "Branch $BRANCH failed review — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
+  supersede_sibling_runs "$MARKER_ID" "$BRANCH" "$BEAD_ID"
 fi
 
 # ── Step 11: Log to quality-gate.jsonl ───────────────────────────────────────
