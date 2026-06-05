@@ -394,6 +394,16 @@ These were NOT removed — uncommitted prod work is never destroyed. Resolve man
 fi
 
 # ── Step 4: Deploy ─────────────────────────────────────────────────────────────
+# Capture the deploy timestamp + pre-deploy HEAD so Step 5b (ga-iwv0) can tell
+# which source files this deploy changed and prove the affected daemons restart
+# AFTER the deploy. Both are best-effort: only meaningful when runtime_dir is a
+# git work tree (the rigs whose deploy is a git-pull).
+DEPLOY_EPOCH=$(date +%s)
+PRE_DEPLOY_SHA=""
+if [ -n "$RUNTIME_DIR" ] && git -C "$RUNTIME_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  PRE_DEPLOY_SHA=$(git -C "$RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
+fi
+
 if [ "$DRY_RUN" = "1" ]; then
   log "DRY_RUN=1 — WOULD RUN: $DEPLOY_CMD"
 else
@@ -413,6 +423,13 @@ else
   log "Deploy OK"
 fi
 
+# Post-deploy HEAD (the SHA the runtime is now serving). With PRE_DEPLOY_SHA this
+# brackets exactly what the deploy changed.
+POST_DEPLOY_SHA=""
+if [ -n "$RUNTIME_DIR" ] && git -C "$RUNTIME_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  POST_DEPLOY_SHA=$(git -C "$RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
+fi
+
 # ── Step 5: Daemon restarts ────────────────────────────────────────────────────
 DAEMON_LIST=$(get_runbook_field "$RIG" "daemon_restarts" 2>/dev/null || echo "")
 if [ -n "$DAEMON_LIST" ]; then
@@ -427,6 +444,82 @@ if [ -n "$DAEMON_LIST" ]; then
         || warn "launchctl kickstart failed for $daemon (may already be running or label wrong)"
     fi
   done <<< "$DAEMON_LIST"
+fi
+
+# ── Step 5b: Daemon freshness refresh + verification (ga-iwv0) ────────────────
+# THE BUG: the deploy above is a git-pull — it updates files on disk but does
+# NOT restart long-lived launchd daemons. A daemon-side feature merged into an
+# already-running process stays DORMANT until that process restarts for some
+# other reason, while the story is marked story:done (ga-d81: ban-risk-dashboard
+# served 5-day-old code; every new endpoint 404'd). This step closes the gap:
+# it detects which RUNNING daemons the merged files affect, restarts the SAFE
+# (read-only dashboard) ones, and VERIFIES each came up AFTER this deploy.
+# SENSITIVE hot-path daemons (central_sender, webhook_receiver, slot_scheduler,
+# conversation_monitor — from the rig's sensitive_daemons runbook field) are
+# NEVER auto-bounced (in-flight messages/webhooks must drain first); they are
+# flagged for a guarded restart. A dormant or unverifiable daemon HALTS delivery
+# here, BEFORE story:done — making a dormant deploy impossible to mark done.
+#
+# Skipped for the framework/town-root rig: its own engine daemons (this very
+# script, the gate dispatcher, the reconcilers) must not be self-restarted
+# mid-run; they are handled by config-drift-watcher + the static daemon_restarts
+# above. Also skipped when runtime_dir is unset.
+REFRESH_HELPER="$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh"
+if [ -z "$RUNTIME_DIR" ] || [ "$RUNTIME_DIR" = "$GC_CITY" ]; then
+  log "Daemon refresh skipped — framework/town-root or no runtime_dir (RUNTIME_DIR='$RUNTIME_DIR')."
+elif [ ! -f "$REFRESH_HELPER" ]; then
+  warn "daemon-refresh helper missing at $REFRESH_HELPER — skipping freshness verification (degraded; cannot prove daemons are live)."
+else
+  SENSITIVE_DAEMONS=$(get_runbook_field "$RIG" "sensitive_daemons" 2>/dev/null | tr '\n' ' ' || echo "")
+  log "Daemon refresh: pre=$PRE_DEPLOY_SHA post=$POST_DEPLOY_SHA sensitive='$SENSITIVE_DAEMONS' ..."
+  REFRESH_OUT=$(RUNTIME_DIR="$RUNTIME_DIR" \
+    PRE_DEPLOY_SHA="$PRE_DEPLOY_SHA" POST_DEPLOY_SHA="$POST_DEPLOY_SHA" \
+    DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="$SENSITIVE_DAEMONS" \
+    DRY_RUN="$DRY_RUN" \
+    bash "$REFRESH_HELPER" || true)
+  REFRESH_VERDICT=$(echo "$REFRESH_OUT" | grep '^VERDICT=' | head -1 | sed 's/^VERDICT=//')
+  REFRESH_REASON=$(echo  "$REFRESH_OUT" | grep '^REASON='  | head -1 | sed 's/^REASON=//')
+  REFRESH_RESTARTED=$(echo "$REFRESH_OUT" | grep '^RESTARTED=' | head -1 | sed 's/^RESTARTED=//')
+  REFRESH_GUARDED=$(echo "$REFRESH_OUT" | grep '^GUARDED=' | head -1 | sed 's/^GUARDED=//')
+  REFRESH_FRESHFAIL=$(echo "$REFRESH_OUT" | grep '^FRESH_FAIL=' | head -1 | sed 's/^FRESH_FAIL=//')
+  log "Daemon refresh verdict=$REFRESH_VERDICT restarted=[$REFRESH_RESTARTED] guarded=[$REFRESH_GUARDED] freshfail=[$REFRESH_FRESHFAIL] reason=$REFRESH_REASON"
+  case "$REFRESH_VERDICT" in
+    OK|SKIPPED)
+      if [ -n "${REFRESH_RESTARTED// /}" ]; then
+        log "Refreshed + verified live: $REFRESH_RESTARTED"
+      fi
+      ;;
+    *)
+      err "Daemon refresh did NOT pass (verdict=$REFRESH_VERDICT): $REFRESH_REASON"
+      if [ "$REFRESH_VERDICT" = "NEEDS_GUARDED_RESTART" ]; then
+        REFRESH_ACTION="ACTION: perform a guarded/graceful restart of the flagged hot-path daemon(s) ($REFRESH_GUARDED) — drain in-flight messages/webhooks first — then re-run delivery. (Configure a DRAIN_CMD_<label> for daemon-refresh.sh to automate this.)"
+      else
+        REFRESH_ACTION="ACTION: investigate why the restarted daemon(s) ($REFRESH_FRESHFAIL) did not come up fresh (crash on boot? wrong launchd label? port in use?), fix forward, then re-run delivery."
+      fi
+      if [ "$DRY_RUN" != "1" ]; then
+        bd -C "$GC_CITY" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+        bd -C "$GC_CITY" label add    "$STORY_ID" "delivery:failed"  -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh): $REFRESH_VERDICT — $REFRESH_REASON
+A long-lived daemon serving rig '$RIG' is running code OLDER than this deploy and could not be safely refreshed/verified, so the merged feature would be DORMANT in production. story:done is WITHHELD (a dormant deploy must never be marked done).
+$REFRESH_ACTION
+Refresh detail:
+$REFRESH_OUT" 2>/dev/null || true
+        AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
+        if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
+          gc --city "$GC_CITY" session nudge "$AUTHOR" \
+            "DELIVERY HALTED for $STORY_ID (ga-iwv0): $REFRESH_VERDICT — a daemon serving the merge is dormant/unverified. See bead; do NOT mark done." \
+            --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
+        fi
+        gc --city "$GC_CITY" session nudge mayor \
+          "DELIVERY HALTED ($STORY_ID, rig $RIG): daemon refresh $REFRESH_VERDICT — $REFRESH_REASON. story:done withheld." \
+          2>/dev/null || true
+      fi
+      # wa-uthi: non-terminal (delivery:failed re-picked every cycle once the
+      # daemon is refreshed) — no Athos push. Author + Mayor nudged above.
+      warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID daemon refresh $REFRESH_VERDICT."
+      exit 1
+      ;;
+  esac
 fi
 
 # ── Step 6: Run prod test ──────────────────────────────────────────────────────

@@ -6,8 +6,18 @@
 #   git_repo        — source of truth git repo (bare or clone) used for ff-push
 #   deploy_cmd      — shell command to deploy: pulls runtime_dir to current HEAD.
 #                     MUST be idempotent. Runs as the launchd user.
-#   daemon_restarts — list of launchd label strings to kickstart after deploy.
-#                     Empty list means no daemon restart needed.
+#   daemon_restarts — list of launchd label strings to ALWAYS kickstart after
+#                     deploy (static, unconditional). Empty list = none.
+#   sensitive_daemons — (ga-iwv0) launchd-label SUBSTRINGS for long-lived
+#                     hot-path daemons that must NEVER be auto-bounced (live
+#                     send / inbound routing / scheduling — in-flight work must
+#                     drain first). story-delivery.sh's daemon-refresh step
+#                     auto-restarts SAFE (read-only dashboard) daemons whose
+#                     code this deploy changed and verifies they came up fresh;
+#                     any AFFECTED daemon matching one of these substrings is
+#                     instead FLAGGED for a guarded restart and HALTS delivery
+#                     (story:done withheld) so dormant hot-path code is never
+#                     silently marked done. Empty list = treat all as safe.
 #   prod_test_script — absolute path to a shell script that exits 0 on pass,
 #                     non-zero on failure. If absent, delivery halts with
 #                     "no prod test — cannot mark done".
@@ -36,7 +46,13 @@ runtime_dir     = "/Users/athos/gt/whatsapp_automation"
 git_repo        = "/Users/athos/gt/whatsapp_automation"
 # Self-repo rig: git pull on the repo root.
 deploy_cmd      = "git -C /Users/athos/gt/whatsapp_automation pull --ff-only"
-daemon_restarts = []   # WA worker managed by gc session; no launchd restart
+daemon_restarts = []   # WA worker managed by gc session; no STATIC launchd restart
+# ga-iwv0: the daemon-refresh step auto-restarts affected SAFE dashboards after
+# deploy + verifies freshness. These hot-path daemons (live send, inbound
+# webhook routing, slot scheduling, conversation monitoring) are NEVER
+# auto-bounced — they are flagged for a guarded restart (drain first) and halt
+# delivery if their code changed, so dormant hot-path code can't be marked done.
+sensitive_daemons = ["central-sender", "webhook-receiver", "slot-scheduler", "conversation-monitor"]
 # ga-857v FIX 2: rig-level smoke harness — asserts painel :8202 (200 + title +
 # SSTI closed) and the admin :8097 registration. WA deliveries now reach
 # story:done with delivery:tested instead of the ga-dqp interim delivery:untested.

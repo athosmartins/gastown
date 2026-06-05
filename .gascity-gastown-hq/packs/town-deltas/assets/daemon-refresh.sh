@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# daemon-refresh.sh — post-deploy daemon refresh + freshness verification (ga-iwv0).
+#
+# THE BUG (ga-iwv0): the story-delivery deploy step is effectively `git pull`.
+# It updates files on disk but does NOT restart long-lived launchd daemons, so a
+# daemon-side feature merged into an already-running process stays DORMANT until
+# that process happens to restart for some other reason — while the story is
+# marked story:done. (ga-d81: com.whatsapp.ban-risk-dashboard served 5-day-old
+# code; every new endpoint 404'd until an ops agent kickstarted it.)
+#
+# THIS HELPER closes the gap. Called by story-delivery.sh AFTER a deploy, given
+# the pre/post deploy SHAs and the deploy timestamp, it:
+#   1. Computes the source files the deploy actually changed (git diff).
+#   2. Discovers the rig's long-lived launchd daemons from their plists
+#      (ProgramArguments → the .py entrypoint it runs, following wrapper .sh).
+#   3. Marks a daemon AFFECTED when its entrypoint changed, OR when a changed
+#      shared module (routes/*.py, lib/*.py, …) is imported by its entrypoint
+#      (the exact ga-d81 dashboard-mounts-route scenario).
+#   4. SAFE daemons (read-only dashboards): kickstart -k, then VERIFY the new
+#      process actually started AFTER the deploy timestamp. A daemon that stays
+#      stale (restart did not take / crash-loop) FAILS verification.
+#   5. SENSITIVE hot-path daemons (central_sender, webhook_receiver,
+#      slot_scheduler, conversation_monitor — matched via SENSITIVE_DAEMONS):
+#      NEVER auto-bounced (in-flight messages/webhooks must be drained first).
+#      They are FLAGGED for a guarded restart unless a DRAIN_CMD_<label> is
+#      provided, in which case drain → kickstart → verify.
+#
+# VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
+# verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
+#
+# Output: machine-readable key=value lines + a trailing JSON object on STDOUT;
+# all human logging goes to STDERR.
+#   VERDICT=OK|SKIPPED|VERIFY_FAILED|NEEDS_GUARDED_RESTART
+#   AFFECTED=<labels>   RESTARTED=<labels>   FRESH_FAIL=<labels>   GUARDED=<labels>
+#   REASON=<text>
+# Exit 0 when VERDICT is OK/SKIPPED (or DRY_RUN=1); non-zero otherwise.
+#
+# Inputs (env):
+#   RUNTIME_DIR       deployed git work tree (e.g. /Users/athos/gt/whatsapp_automation)
+#   PRE_DEPLOY_SHA    HEAD before deploy
+#   POST_DEPLOY_SHA   HEAD after deploy
+#   DEPLOY_EPOCH      unix epoch captured immediately before deploy
+#   SENSITIVE_DAEMONS space/newline-separated launchd-label substrings (hot-path)
+#   DRY_RUN           1 = report only, no kickstart/verify (default 0)
+#   DRAIN_CMD_<label> optional graceful-drain command for a sensitive daemon
+#                     (<label> sanitized: non-alnum → _)
+# Test seams:
+#   LAUNCH_AGENTS_DIR (default $HOME/Library/LaunchAgents)
+#   LAUNCHCTL_BIN     (default launchctl)
+#   PS_BIN            (default ps)
+#   VERIFY_TIMEOUT    seconds to wait for a fresh process (default 20)
+#   VERIFY_INTERVAL   poll interval seconds (default 1)
+
+set -uo pipefail
+
+RUNTIME_DIR="${RUNTIME_DIR:-}"
+PRE_DEPLOY_SHA="${PRE_DEPLOY_SHA:-}"
+POST_DEPLOY_SHA="${POST_DEPLOY_SHA:-}"
+DEPLOY_EPOCH="${DEPLOY_EPOCH:-0}"
+SENSITIVE_DAEMONS="${SENSITIVE_DAEMONS:-}"
+DRY_RUN="${DRY_RUN:-0}"
+LAUNCH_AGENTS_DIR="${LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
+LAUNCHCTL_BIN="${LAUNCHCTL_BIN:-launchctl}"
+PS_BIN="${PS_BIN:-ps}"
+VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-20}"
+VERIFY_INTERVAL="${VERIFY_INTERVAL:-1}"
+
+log() { echo "[daemon-refresh] $*" >&2; }
+
+# ── emit result + exit ────────────────────────────────────────────────────────
+emit() {  # emit <verdict> <reason>
+  local verdict="$1" reason="$2"
+  echo "VERDICT=$verdict"
+  echo "AFFECTED=${AFFECTED:-}"
+  echo "RESTARTED=${RESTARTED:-}"
+  echo "FRESH_FAIL=${FRESH_FAIL:-}"
+  echo "GUARDED=${GUARDED:-}"
+  echo "REASON=$reason"
+  # Trailing JSON for the caller's bead comment / jsonl log.
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" <<'PY' 2>/dev/null || true
+import json, sys
+v, reason, aff, res, ff, gd = sys.argv[1:7]
+sp = lambda s: [x for x in s.split() if x]
+print("JSON=" + json.dumps({
+    "verdict": v, "reason": reason,
+    "affected": sp(aff), "restarted": sp(res),
+    "fresh_fail": sp(ff), "guarded": sp(gd),
+}))
+PY
+  if [ "$DRY_RUN" = "1" ]; then exit 0; fi
+  case "$verdict" in OK|SKIPPED) exit 0 ;; *) exit 1 ;; esac
+}
+
+AFFECTED=""; RESTARTED=""; FRESH_FAIL=""; GUARDED=""
+
+# ── preconditions ─────────────────────────────────────────────────────────────
+if [ -z "$RUNTIME_DIR" ] || ! git -C "$RUNTIME_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  log "runtime '$RUNTIME_DIR' is not a git work tree — skip (static daemon_restarts still apply)."
+  emit SKIPPED "runtime not a git work tree"
+fi
+if [ -z "$PRE_DEPLOY_SHA" ] || [ -z "$POST_DEPLOY_SHA" ] || [ "$PRE_DEPLOY_SHA" = "$POST_DEPLOY_SHA" ]; then
+  log "no SHA delta ($PRE_DEPLOY_SHA .. $POST_DEPLOY_SHA) — deploy changed nothing — skip."
+  emit SKIPPED "no source change in deploy"
+fi
+
+# ── Step 1: changed files in this deploy ──────────────────────────────────────
+CHANGED="$(git -C "$RUNTIME_DIR" diff --name-only "$PRE_DEPLOY_SHA" "$POST_DEPLOY_SHA" 2>/dev/null || true)"
+CHANGED_PY="$(echo "$CHANGED" | grep -E '\.py$' || true)"
+if [ -z "$CHANGED_PY" ]; then
+  log "deploy changed no *.py files — no daemon code affected — OK."
+  emit OK "no python source changed"
+fi
+log "changed python files:"; echo "$CHANGED_PY" | sed 's/^/[daemon-refresh]   /' >&2
+
+# helper: epoch of a pid's start time (parses `ps -o lstart=`)
+pid_start_epoch() {  # pid_start_epoch <pid>
+  local pid="$1" ls
+  [ -n "$pid" ] || return 1
+  ls="$($PS_BIN -o lstart= -p "$pid" 2>/dev/null)"
+  ls="${ls%"${ls##*[![:space:]]}"}"   # rtrim trailing whitespace ps pads with
+  [ -n "$ls" ] || return 1
+  date -j -f "%a %b %e %T %Y" "$ls" +%s 2>/dev/null
+}
+
+# helper: current PID for a launchd label
+daemon_pid() {  # daemon_pid <label>
+  $LAUNCHCTL_BIN list "$1" 2>/dev/null \
+    | awk -F'=' '/"PID"/ {gsub(/[^0-9]/,"",$2); print $2; exit}'
+}
+
+# ── Step 2: discover the rig's daemons + their entrypoint files ───────────────
+# For each plist, read ProgramArguments. An arg under RUNTIME_DIR that is a .py
+# file is an entrypoint; a wrapper .sh under RUNTIME_DIR is followed to the .py
+# it execs. A plist with no entrypoint under RUNTIME_DIR is not a rig daemon.
+plist_args() {  # plist_args <plist>
+  python3 - "$1" <<'PY' 2>/dev/null
+import sys, plistlib
+try:
+    d = plistlib.load(open(sys.argv[1], 'rb'))
+except Exception:
+    sys.exit(0)
+for a in (d.get('ProgramArguments') or []):
+    print(a)
+PY
+}
+
+# Resolve a (possibly $VAR-prefixed or absolute) .py token to a relpath that
+# exists under RUNTIME_DIR; echoes nothing if it cannot be resolved.
+resolve_relpath() {  # resolve_relpath <token>
+  local t="$1" c
+  # absolute under runtime
+  case "$t" in
+    "$RUNTIME_DIR"/*) c="${t#"$RUNTIME_DIR"/}"; [ -f "$RUNTIME_DIR/$c" ] && { echo "$c"; return; } ;;
+  esac
+  # strip a leading shell-var segment: $BASEDIR/ ${WA_ROOT}/ etc.
+  c="$(echo "$t" | sed -E 's#^.*\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/##')"
+  [ -n "$c" ] && [ "$c" != "$t" ] && [ -f "$RUNTIME_DIR/$c" ] && { echo "$c"; return; }
+  return 1
+}
+
+# label -> space-separated entrypoint relpaths (parallel arrays via temp files)
+DISCO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/daemon-disco.XXXXXX")"
+trap 'rm -rf "$DISCO_DIR"' EXIT
+DAEMON_LABELS=""
+
+shopt -s nullglob
+for plist in "$LAUNCH_AGENTS_DIR"/*.plist; do
+  label="$(basename "$plist" .plist)"
+  entry=""
+  while IFS= read -r arg; do
+    [ -n "$arg" ] || continue
+    case "$arg" in
+      *.py)
+        rel="$(resolve_relpath "$arg" || true)"
+        [ -n "$rel" ] && entry="$entry $rel"
+        ;;
+      *.sh)
+        # wrapper under runtime → follow to the .py it execs
+        wrel="$(resolve_relpath "$arg" || true)"
+        if [ -n "$wrel" ]; then
+          while IFS= read -r tok; do
+            prel="$(resolve_relpath "$tok" || true)"
+            [ -n "$prel" ] && entry="$entry $prel"
+          done < <(grep -oE '[^"[:space:]]+\.py' "$RUNTIME_DIR/$wrel" 2>/dev/null || true)
+        fi
+        ;;
+    esac
+  done < <(plist_args "$plist")
+  entry="$(echo "$entry" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')"
+  [ -n "${entry// /}" ] || continue
+  echo "$entry" > "$DISCO_DIR/$label"
+  DAEMON_LABELS="$DAEMON_LABELS $label"
+done
+shopt -u nullglob
+
+if [ -z "${DAEMON_LABELS// /}" ]; then
+  log "no rig daemons discovered under $LAUNCH_AGENTS_DIR for runtime $RUNTIME_DIR — OK (nothing to refresh)."
+  emit OK "no rig daemons discovered"
+fi
+
+# precompute changed basenames + stems for matching
+CHANGED_BASENAMES="$(echo "$CHANGED_PY" | while read -r f; do [ -n "$f" ] && basename "$f"; done)"
+CHANGED_STEMS="$(echo "$CHANGED_BASENAMES" | sed 's/\.py$//' | grep -v '^$' || true)"
+
+# is_sensitive <label>
+is_sensitive() {
+  local label="$1" sub
+  for sub in $SENSITIVE_DAEMONS; do
+    [ -n "$sub" ] || continue
+    case "$label" in *"$sub"*) return 0 ;; esac
+  done
+  return 1
+}
+
+# ── Step 3: resolve affected daemons ──────────────────────────────────────────
+for label in $DAEMON_LABELS; do
+  entries="$(cat "$DISCO_DIR/$label")"
+  affected=0
+  own_stems=""
+  for e in $entries; do own_stems="$own_stems $(basename "$e" .py)"; done
+
+  # direct: an entrypoint relpath or basename is in the changed set
+  for e in $entries; do
+    if echo "$CHANGED_PY" | grep -qxF "$e"; then affected=1; break; fi
+    eb="$(basename "$e")"
+    if echo "$CHANGED_BASENAMES" | grep -qxF "$eb"; then affected=1; break; fi
+  done
+
+  # import-level: a changed shared module (not this daemon's own entrypoint) is
+  # referenced by name inside one of the entrypoint files.
+  if [ "$affected" -eq 0 ]; then
+    for stem in $CHANGED_STEMS; do
+      case " $own_stems " in *" $stem "*) continue ;; esac   # own entrypoint → handled above
+      for e in $entries; do
+        if [ -f "$RUNTIME_DIR/$e" ] && grep -Eq "\\b${stem}\\b" "$RUNTIME_DIR/$e" 2>/dev/null; then
+          affected=1; break
+        fi
+      done
+      [ "$affected" -eq 1 ] && break
+    done
+  fi
+
+  [ "$affected" -eq 1 ] || continue
+  AFFECTED="$AFFECTED $label"
+  log "AFFECTED: $label (entrypoints:$entries)"
+done
+
+AFFECTED="$(echo "$AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+if [ -z "${AFFECTED// /}" ]; then
+  log "no running daemon is affected by the changed code — OK."
+  emit OK "changed code touches no live daemon"
+fi
+
+# ── Step 4: restart (safe) / flag (sensitive) + verify freshness ──────────────
+verify_fresh() {  # verify_fresh <label> -> 0 if a process started after DEPLOY_EPOCH
+  local label="$1" waited=0 pid se
+  while :; do
+    pid="$(daemon_pid "$label")"
+    if [ -n "$pid" ]; then
+      se="$(pid_start_epoch "$pid" || echo 0)"
+      if [ -n "$se" ] && [ "$se" -gt "$DEPLOY_EPOCH" ] 2>/dev/null; then
+        log "verify $label: pid $pid started $se > deploy $DEPLOY_EPOCH — FRESH."
+        return 0
+      fi
+    fi
+    # bash sleep accepts fractional on macOS
+    awk "BEGIN{exit !($waited < $VERIFY_TIMEOUT)}" || break
+    sleep "$VERIFY_INTERVAL"
+    waited="$(awk "BEGIN{print $waited + $VERIFY_INTERVAL}")"
+  done
+  log "verify $label: no process started after deploy within ${VERIFY_TIMEOUT}s — STALE."
+  return 1
+}
+
+for label in $AFFECTED; do
+  # Only refresh LONG-LIVED daemons that are running RIGHT NOW (have a live PID).
+  # A discovered job with no current PID is a scheduled/one-shot agent (e.g. a
+  # daily scraper) or an already-down daemon — kickstarting it would wrongly
+  # TRIGGER the job, not "refresh" it, and there is no running stale process to
+  # fix. This is precisely the bug's domain: a long-lived process already running
+  # stale code. Skip the rest.
+  if [ -z "$(daemon_pid "$label")" ]; then
+    log "AFFECTED $label is not currently running (scheduled/one-shot or down) — not a dormant-running-daemon; skipping refresh."
+    continue
+  fi
+  if is_sensitive "$label"; then
+    sani="${label//[^A-Za-z0-9_]/_}"
+    drain_var="DRAIN_CMD_${sani}"
+    drain="${!drain_var:-}"
+    if [ -n "$drain" ]; then
+      log "SENSITIVE $label: draining via \$$drain_var then restarting (guarded path)."
+      if [ "$DRY_RUN" != "1" ]; then
+        eval "$drain" >&2 2>&1 || log "WARN: drain command for $label failed (rc=$?) — continuing to restart."
+        $LAUNCHCTL_BIN kickstart -k "gui/$(id -u)/$label" 2>/dev/null \
+          || $LAUNCHCTL_BIN kickstart "$label" 2>/dev/null \
+          || log "WARN: kickstart failed for $label"
+      fi
+      RESTARTED="$RESTARTED $label"
+      if [ "$DRY_RUN" != "1" ] && ! verify_fresh "$label"; then
+        FRESH_FAIL="$FRESH_FAIL $label"
+      fi
+    else
+      log "SENSITIVE $label: NO drain path configured — NOT auto-bounced; flagged for guarded restart."
+      GUARDED="$GUARDED $label"
+    fi
+    continue
+  fi
+
+  # SAFE (read-only dashboard etc.): auto kickstart, then verify freshness.
+  log "SAFE $label: kickstart -k + verify fresh."
+  if [ "$DRY_RUN" != "1" ]; then
+    $LAUNCHCTL_BIN kickstart -k "gui/$(id -u)/$label" 2>/dev/null \
+      || $LAUNCHCTL_BIN kickstart "$label" 2>/dev/null \
+      || log "WARN: kickstart failed for $label (label wrong or not loaded?)"
+  fi
+  RESTARTED="$RESTARTED $label"
+  if [ "$DRY_RUN" != "1" ] && ! verify_fresh "$label"; then
+    FRESH_FAIL="$FRESH_FAIL $label"
+  fi
+done
+
+RESTARTED="$(echo "$RESTARTED" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
+FRESH_FAIL="$(echo "$FRESH_FAIL" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
+GUARDED="$(echo "$GUARDED" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
+
+# ── Step 5: verdict ───────────────────────────────────────────────────────────
+if [ -n "${FRESH_FAIL// /}" ]; then
+  emit VERIFY_FAILED "restarted daemon(s) did not come up fresh:${FRESH_FAIL}"
+elif [ -n "${GUARDED// /}" ]; then
+  emit NEEDS_GUARDED_RESTART "sensitive hot-path daemon(s) need a guarded restart:${GUARDED}"
+else
+  emit OK "all affected daemons restarted + verified fresh:${RESTARTED}"
+fi
