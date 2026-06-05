@@ -60,7 +60,47 @@ warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] WARN: $*
 echo ""
 log "=== Dispatcher sweep start (DRY_RUN=${DRY_RUN}) ==="
 
-# ── Step 0: Find a queued marker ─────────────────────────────────────────────
+# ── Step 0a: TTL recovery — re-queue zombie dispatching markers ───────────────
+# If a marker has been in gate-status:dispatching for > DISPATCHING_TTL_MINUTES,
+# the dispatcher process was killed mid-run (after claiming but before completing).
+# These would otherwise block forever because the dispatcher only processes
+# gate-status:queued markers.  Reset them to queued so this sweep (or the next)
+# can re-process them.
+#
+# TTL is 30m — same as the guard's claimed TTL.  Any legitimate dispatcher run
+# that's been in flight for 30m has either spawned reviewers (verdict poll keeps
+# the bead alive) or should be considered dead.
+#
+# Safety: we only recover markers that are STILL in dispatching — i.e. the
+# dispatcher never finished (no passed/failed/error/needs-rebase was set).
+DISPATCHING_TTL_MINUTES=30
+
+DISPATCHING_JSON=$(bd -C "$GC_CITY" list --json --all \
+  -l type:quality-gate-marker \
+  -l gate-status:dispatching \
+  2>/dev/null || echo "[]")
+DISPATCHING_COUNT=$(echo "$DISPATCHING_JSON" | jq 'length' 2>/dev/null || echo "0")
+
+if [ "$DISPATCHING_COUNT" -gt 0 ]; then
+  NOW_EPOCH_D=$(date +%s)
+  for di in $(seq 0 $((DISPATCHING_COUNT - 1))); do
+    D_MARKER=$(echo "$DISPATCHING_JSON" | jq ".[$di]")
+    D_ID=$(echo "$D_MARKER" | jq -r '.id')
+    D_UPDATED=$(echo "$D_MARKER" | jq -r '.updated_at // .created_at // ""')
+    if [ -z "$D_UPDATED" ]; then continue; fi
+    D_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${D_UPDATED%%Z*}" "+%s" 2>/dev/null \
+      || date -d "$D_UPDATED" +%s 2>/dev/null || echo "0")
+    D_AGE_MINUTES=$(( (NOW_EPOCH_D - D_EPOCH) / 60 ))
+    if [ "$D_AGE_MINUTES" -gt "$DISPATCHING_TTL_MINUTES" ]; then
+      warn "Re-queuing zombie dispatching marker $D_ID (age=${D_AGE_MINUTES}m > TTL=${DISPATCHING_TTL_MINUTES}m — dispatcher died mid-run)"
+      bd -C "$GC_CITY" label remove "$D_ID" "gate-status:dispatching" -q 2>/dev/null || true
+      bd -C "$GC_CITY" label add    "$D_ID" "gate-status:queued"      -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$D_ID" "Dispatcher TTL recovery: marker was stuck in gate-status:dispatching for ${D_AGE_MINUTES}m (> ${DISPATCHING_TTL_MINUTES}m TTL). Dispatcher process died mid-run. Re-queuing for re-processing." 2>/dev/null || true
+    fi
+  done
+fi
+
+# ── Step 0b: Find a queued marker ────────────────────────────────────────────
 # quality-gate-guard.sh claims, validates, derives author, and parks markers as
 # gate-status:queued.  We only process queued markers — the guard already did
 # all the security work.
@@ -313,42 +353,159 @@ if [ -n "$MAIN_HEAD_SHA" ]; then
 fi
 
 if [ "$BRANCH_IS_CURRENT" != "1" ]; then
-  warn "Branch $BRANCH is STALE: origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA) is not an ancestor of origin/$BRANCH ($BRANCH_SHA). Bouncing to author."
-  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
-  bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
-  bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED: branch $BRANCH is stale.
-main HEAD is $MAIN_HEAD_SHA but the branch does not include it (branch base is behind main).
-A merge could silently drop your changes if main has edits to the same regions.
-Action required: rebase $BRANCH onto current origin/$DEFAULT_BRANCH and re-run /gate-done." 2>/dev/null || true
+  # ── ga-we1: Auto-rebase (clean branches only) ─────────────────────────────
+  # Instead of bouncing to the author, the dispatcher attempts a conflict-free
+  # rebase directly.  This eliminates the starvation loop where a branch passes
+  # the stale check, enters review, main moves again during review→merge, and
+  # the whole cycle restarts.
+  #
+  # Strategy:
+  #   1. Use `git merge-tree` to detect conflicts before touching anything.
+  #   2. If conflict-free: create a temp worktree, rebase onto current main,
+  #      push the rebased branch tip, update BRANCH_SHA, and continue.
+  #   3. If conflicts: bounce to author with a targeted conflict report (not
+  #      a generic "rebase and re-run" — we know exactly which files conflict).
 
-  if [ -n "$BEAD_ID" ]; then
-    bd -C "$GC_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
-    bd -C "$GC_CITY" comment "$BEAD_ID" "Quality gate blocked: branch $BRANCH needs rebase on current main ($MAIN_HEAD_SHA) before review can proceed. Rebase and re-run /gate-done." 2>/dev/null || true
+  log "  Branch $BRANCH is STALE (main=$MAIN_HEAD_SHA not in branch=$BRANCH_SHA). Attempting auto-rebase ..."
+
+  MERGE_BASE_SHA=$(git_rig merge-base "origin/$BRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+  HAS_CONFLICT=0
+  CONFLICT_FILES=""
+
+  if [ -n "$MERGE_BASE_SHA" ]; then
+    # merge-tree <base> <ours=main> <theirs=branch>
+    # A conflict-free rebase is equivalent to a conflict-free three-way merge.
+    MT_OUTPUT=$(git_rig merge-tree "$MERGE_BASE_SHA" "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null || echo "")
+    if echo "$MT_OUTPUT" | grep -q "^<<<<<<<"; then
+      HAS_CONFLICT=1
+      CONFLICT_FILES=$(echo "$MT_OUTPUT" | grep -E "^(<<<|changed in both)" | head -5 | tr '\n' ' ' | cut -c1-300)
+    fi
+  else
+    # No common ancestor — treat as conflict (unrelated histories)
+    HAS_CONFLICT=1
+    CONFLICT_FILES="no common ancestor with main"
   fi
 
-  # Nudge the author to rebase
-  if [ -n "$AUTHOR" ]; then
-    gc --city "$GC_CITY" session nudge "$AUTHOR" \
-      "GATE BLOCKED for branch $BRANCH: branch is stale and needs a rebase. Rebase onto current origin/$DEFAULT_BRANCH (main HEAD: $MAIN_HEAD_SHA) to ensure your changes merge cleanly, then re-run /gate-done. Bead: $BEAD_ID" \
-      --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR for rebase"
+  if [ "$HAS_CONFLICT" = "0" ]; then
+    # Clean rebase: perform in a temp worktree, push to origin, continue with review.
+    log "  Auto-rebase: no conflicts detected — rebasing $BRANCH onto $MAIN_HEAD_SHA ..."
+    AUTO_REBASE_OK=0
+    TMP_REBASE_WT="/tmp/gc-gate-autorebase-$$"
+
+    if [ "$IS_CONTAINER_RIG" = "1" ]; then
+      # Container rig (bare repo): worktree uses the bare .repo.git
+      if git_rig worktree add "$TMP_REBASE_WT" "origin/$BRANCH" 2>/dev/null; then
+        # Configure git user inside worktree for the rebase commit
+        git -C "$TMP_REBASE_WT" config user.email "gate-dispatcher@gascity.local" 2>/dev/null || true
+        git -C "$TMP_REBASE_WT" config user.name "Gate Dispatcher" 2>/dev/null || true
+        if git -C "$TMP_REBASE_WT" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+          NEW_TIP=$(git -C "$TMP_REBASE_WT" rev-parse HEAD 2>/dev/null || echo "")
+          if [ -n "$NEW_TIP" ] && git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
+            AUTO_REBASE_OK=1
+            BRANCH_SHA="$NEW_TIP"
+            log "  Auto-rebase success: $BRANCH pushed to $NEW_TIP (rebased onto $MAIN_HEAD_SHA)"
+            bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher auto-rebased $BRANCH onto main ($MAIN_HEAD_SHA). New tip: $NEW_TIP. Proceeding with review." 2>/dev/null || true
+            # Re-verify stale check passes now
+            git_rig fetch origin 2>/dev/null || true
+            BRANCH_SHA=$(git_rig rev-parse "origin/$BRANCH" 2>/dev/null || echo "$BRANCH_SHA")
+            if git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null; then
+              BRANCH_IS_CURRENT=1
+            else
+              warn "  Post-auto-rebase stale check still fails — falling through to bounce."
+              AUTO_REBASE_OK=0
+            fi
+          else
+            warn "  Auto-rebase push failed for $BRANCH"
+          fi
+        else
+          warn "  Auto-rebase git rebase command failed (unexpected — merge-tree reported no conflicts)"
+          git -C "$TMP_REBASE_WT" rebase --abort 2>/dev/null || true
+        fi
+        git_rig worktree remove "$TMP_REBASE_WT" --force 2>/dev/null || true
+      else
+        warn "  Could not create auto-rebase worktree at $TMP_REBASE_WT"
+      fi
+    else
+      # Self-repo rig
+      if git -C "$GIT_DIR_PATH" worktree add "$TMP_REBASE_WT" "origin/$BRANCH" 2>/dev/null; then
+        git -C "$TMP_REBASE_WT" config user.email "gate-dispatcher@gascity.local" 2>/dev/null || true
+        git -C "$TMP_REBASE_WT" config user.name "Gate Dispatcher" 2>/dev/null || true
+        if git -C "$TMP_REBASE_WT" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+          NEW_TIP=$(git -C "$TMP_REBASE_WT" rev-parse HEAD 2>/dev/null || echo "")
+          if [ -n "$NEW_TIP" ] && git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
+            AUTO_REBASE_OK=1
+            BRANCH_SHA="$NEW_TIP"
+            log "  Auto-rebase success (self-repo): $BRANCH pushed to $NEW_TIP"
+            bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher auto-rebased $BRANCH onto main ($MAIN_HEAD_SHA). New tip: $NEW_TIP. Proceeding with review." 2>/dev/null || true
+            git_rig fetch origin 2>/dev/null || true
+            BRANCH_SHA=$(git_rig rev-parse "origin/$BRANCH" 2>/dev/null || echo "$BRANCH_SHA")
+            if git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null; then
+              BRANCH_IS_CURRENT=1
+            else
+              warn "  Post-auto-rebase stale check still fails — falling through to bounce."
+              AUTO_REBASE_OK=0
+            fi
+          else
+            warn "  Auto-rebase push failed (self-repo) for $BRANCH"
+          fi
+        else
+          warn "  Auto-rebase git rebase failed (self-repo)"
+          git -C "$TMP_REBASE_WT" rebase --abort 2>/dev/null || true
+        fi
+        git -C "$GIT_DIR_PATH" worktree remove "$TMP_REBASE_WT" --force 2>/dev/null || true
+      else
+        warn "  Could not create auto-rebase worktree (self-repo) at $TMP_REBASE_WT"
+      fi
+    fi
+
+    if [ "$AUTO_REBASE_OK" = "1" ] && [ "$BRANCH_IS_CURRENT" = "1" ]; then
+      log "  Auto-rebase complete — branch is now current. Continuing with review."
+      # Fall through to Step 5 with updated BRANCH_SHA
+    else
+      # Auto-rebase failed despite no conflicts (worktree/push failure)
+      HAS_CONFLICT=1
+      CONFLICT_FILES="auto-rebase failed (worktree/push error)"
+    fi
   fi
 
-  notify -t "Quality Gate" -p 3 "Branch $BRANCH needs rebase on current main before gate — bounced to $AUTHOR" 2>/dev/null || true
+  if [ "$BRANCH_IS_CURRENT" != "1" ]; then
+    # Conflicts detected or auto-rebase failed — bounce to author
+    warn "Branch $BRANCH: auto-rebase not possible (${CONFLICT_FILES:-conflicts}). Bouncing to author."
+    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
+    bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
+    bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED: branch $BRANCH is stale and has conflicts that prevent auto-rebase.
+main HEAD is $MAIN_HEAD_SHA. Conflicting regions: ${CONFLICT_FILES:-unknown}.
+Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, resolve conflicts, and re-run /gate-done." 2>/dev/null || true
 
-  mkdir -p "$(dirname "$QG_LOG")"
-  jq -c -n \
-    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --arg branch "$BRANCH" \
-    --arg bead "$BEAD_ID" \
-    --arg rig "${RIG:-unknown}" \
-    --arg marker "$MARKER_ID" \
-    --arg author "$AUTHOR" \
-    --arg main_sha "$MAIN_HEAD_SHA" \
-    '{ts: $ts, event: "dispatcher_needs_rebase", branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author, main_sha: $main_sha}' \
-    >> "$QG_LOG" 2>/dev/null || true
+    if [ -n "$BEAD_ID" ]; then
+      bd -C "$GC_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$BEAD_ID" "Quality gate blocked: branch $BRANCH has conflicts with current main ($MAIN_HEAD_SHA). Auto-rebase attempted but failed (${CONFLICT_FILES:-conflicts}). Manual rebase required — re-run /gate-done after resolving." 2>/dev/null || true
+    fi
 
-  log "=== Dispatcher sweep complete: branch=$BRANCH verdict=NEEDS_REBASE (stale base) ==="
-  exit 0
+    if [ -n "$AUTHOR" ]; then
+      gc --city "$GC_CITY" session nudge "$AUTHOR" \
+        "GATE BLOCKED for branch $BRANCH: stale with conflicts — auto-rebase failed. Conflicts: ${CONFLICT_FILES:-unknown}. Manually rebase onto origin/$DEFAULT_BRANCH (main HEAD: $MAIN_HEAD_SHA), resolve conflicts, re-run /gate-done. Bead: $BEAD_ID" \
+        --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR for rebase"
+    fi
+
+    notify -t "Quality Gate" -p 3 "Branch $BRANCH needs manual rebase (conflicts) — bounced to $AUTHOR" 2>/dev/null || true
+
+    mkdir -p "$(dirname "$QG_LOG")"
+    jq -c -n \
+      --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg branch "$BRANCH" \
+      --arg bead "$BEAD_ID" \
+      --arg rig "${RIG:-unknown}" \
+      --arg marker "$MARKER_ID" \
+      --arg author "$AUTHOR" \
+      --arg main_sha "$MAIN_HEAD_SHA" \
+      --arg conflicts "${CONFLICT_FILES:-unknown}" \
+      '{ts: $ts, event: "dispatcher_needs_rebase", branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author, main_sha: $main_sha, conflicts: $conflicts}' \
+      >> "$QG_LOG" 2>/dev/null || true
+
+    log "=== Dispatcher sweep complete: branch=$BRANCH verdict=NEEDS_REBASE (conflicts, auto-rebase failed) ==="
+    exit 0
+  fi
 fi
 
 log "  Branch $BRANCH is current with $DEFAULT_BRANCH — stale-base check passed."
@@ -662,108 +819,162 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
     MERGE_SHA=""
     MERGE_RESULT="failed"
 
-    if [ "$IS_CONTAINER_RIG" = "1" ]; then
-      # Container rig: operate on bare .repo.git via git_rig() wrapper
-      # Get current main sha and branch sha
-      MAIN_SHA=$(git_rig rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
-      BRANCH_MERGE_SHA=$(git_rig rev-parse "origin/$BRANCH" 2>/dev/null || echo "")
+    # ── ga-3b8: Merge-time rebase+retry (starvation fix) ──────────────────────
+    # The review→merge window is the starvation attack surface: another rig merge
+    # can land between "reviewers PASS" and "push main".  We handle this by
+    # re-fetching at merge time and, if main moved, auto-rebasing the branch
+    # (conflict-free only) before the FF push.  If the FF push races again, we
+    # retry the whole rebase→push sequence up to MAX_MERGE_RETRIES times.
+    # Each attempt is fast (seconds), so 3 retries closes the window even on a
+    # very busy rig.
+    MAX_MERGE_RETRIES=3
+    MERGE_ATTEMPT=0
 
-      if [ -z "$MAIN_SHA" ] || [ -z "$BRANCH_MERGE_SHA" ]; then
-        err "Cannot resolve SHAs for merge. main=$MAIN_SHA branch=$BRANCH_MERGE_SHA"
+    do_merge_ff() {
+      # Arguments: IS_CONTAINER_RIG, BRANCH, DEFAULT_BRANCH — all from outer scope.
+      # Returns: sets MERGE_SHA and MERGE_RESULT in outer scope.
+      # Strategy per attempt:
+      #   1. git fetch (get current remote state)
+      #   2. If main moved (branch no longer FF-able): auto-rebase if clean
+      #   3. FF push branch SHA to main
+      #   4. Verify landing
+
+      git_rig fetch origin 2>/dev/null || warn "Pre-merge fetch failed (attempt $((MERGE_ATTEMPT+1)))"
+      local CUR_MAIN
+      CUR_MAIN=$(git_rig rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+      local CUR_BRANCH
+      CUR_BRANCH=$(git_rig rev-parse "origin/$BRANCH" 2>/dev/null || echo "")
+
+      if [ -z "$CUR_MAIN" ] || [ -z "$CUR_BRANCH" ]; then
         MERGE_RESULT="failed_sha_resolution"
-      else
-        # Check if branch is based on (reachable from) current main — required for FF
-        IS_ANCESTOR=$(git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null && echo "yes" || echo "no")
+        return 1
+      fi
 
-        if [ "$IS_ANCESTOR" = "yes" ]; then
-          # Fast-forward: push branch SHA directly to main ref.
-          # This is equivalent to `git push origin <branch>:main` but works from
-          # a bare repo where we only have remote-tracking refs.
-          if git_rig push origin "$BRANCH_MERGE_SHA:refs/heads/$DEFAULT_BRANCH" 2>/dev/null; then
-            # Bug 1 fix: VERIFY landing — fetch + confirm branch SHA is now an ancestor of main.
-            # The push command can return 0 but still fail to advance main in edge cases
-            # (e.g. remote hook rejection). We verify the branch tip is reachable from
-            # origin/main BEFORE recording gc.outcome=pass or closing the source bead.
-            git_rig fetch origin 2>/dev/null || warn "Post-push fetch failed; landing check may use stale refs"
-            POST_PUSH_MAIN=$(git_rig rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
-            if [ -n "$POST_PUSH_MAIN" ] && git_rig merge-base --is-ancestor "$BRANCH_MERGE_SHA" "$POST_PUSH_MAIN" 2>/dev/null; then
-              MERGE_SHA="$BRANCH_MERGE_SHA"
-              MERGE_RESULT="direct_ff"
-              log "FF merge + landing verified: $BRANCH → $DEFAULT_BRANCH (sha=$MERGE_SHA, main=$POST_PUSH_MAIN)"
-            else
-              err "Landing verification FAILED: branch SHA $BRANCH_MERGE_SHA is NOT an ancestor of origin/$DEFAULT_BRANCH ($POST_PUSH_MAIN) after push. Silent drop detected."
-              MERGE_RESULT="failed_landing_not_verified"
-            fi
-          else
-            err "git push failed for FF merge of $BRANCH → $DEFAULT_BRANCH"
-            MERGE_RESULT="failed_push"
-          fi
+      local IS_ANC
+      IS_ANC=$(git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null && echo "yes" || echo "no")
+
+      if [ "$IS_ANC" != "yes" ]; then
+        # Main moved during review — attempt inline rebase before push
+        log "  Merge-time rebase: main moved to $CUR_MAIN after review; rebasing $BRANCH ..."
+        local TMP_MR_WT="/tmp/gc-gate-mr-retry-$$-${MERGE_ATTEMPT}"
+        local MR_OK=0
+
+        # Conflict pre-check
+        local MR_BASE
+        MR_BASE=$(git_rig merge-base "origin/$BRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+        local MR_CONFLICT=0
+        if [ -n "$MR_BASE" ]; then
+          local MR_MT
+          MR_MT=$(git_rig merge-tree "$MR_BASE" "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null || echo "")
+          echo "$MR_MT" | grep -q "^<<<<<<" && MR_CONFLICT=1
         else
-          # Branch is not based on current main: needs merge commit.
-          # Use a temporary worktree to perform the merge and push.
-          warn "Branch $BRANCH is not FF-able onto $DEFAULT_BRANCH — attempting merge commit"
+          MR_CONFLICT=1
+        fi
 
-          TMP_WT="/tmp/gc-gate-merge-$$"
-          if git_rig worktree add "$TMP_WT" "origin/$DEFAULT_BRANCH" 2>/dev/null; then
-            # In the worktree, merge with --no-ff to produce a merge commit
-            if git -C "$TMP_WT" merge --no-ff "origin/$BRANCH" -m "Merge branch '$BRANCH' via quality gate (gate_run=$GATE_RUN_ID)" 2>/dev/null; then
-              if git -C "$TMP_WT" push origin "HEAD:$DEFAULT_BRANCH" 2>/dev/null; then
-                CANDIDATE_SHA=$(git -C "$TMP_WT" rev-parse HEAD 2>/dev/null || echo "unknown")
-                # Bug 1 fix: verify landing for merge-commit path too
-                git_rig fetch origin 2>/dev/null || warn "Post-merge-commit fetch failed"
-                POST_PUSH_MAIN=$(git_rig rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
-                if [ "$CANDIDATE_SHA" != "unknown" ] && [ -n "$POST_PUSH_MAIN" ] && \
-                   git_rig merge-base --is-ancestor "$CANDIDATE_SHA" "$POST_PUSH_MAIN" 2>/dev/null; then
-                  MERGE_SHA="$CANDIDATE_SHA"
-                  MERGE_RESULT="merge_commit"
-                  log "Merge commit + landing verified: $BRANCH → $DEFAULT_BRANCH (sha=$MERGE_SHA)"
-                else
-                  err "Landing verification FAILED for merge commit: $CANDIDATE_SHA not in origin/$DEFAULT_BRANCH ($POST_PUSH_MAIN)."
-                  MERGE_RESULT="failed_landing_not_verified"
-                fi
+        if [ "$MR_CONFLICT" = "1" ]; then
+          err "  Merge-time rebase: conflicts detected — cannot auto-rebase (attempt $((MERGE_ATTEMPT+1)))"
+          MERGE_RESULT="failed_merge_time_conflict"
+          return 1
+        fi
+
+        if [ "$IS_CONTAINER_RIG" = "1" ]; then
+          if git_rig worktree add "$TMP_MR_WT" "origin/$BRANCH" 2>/dev/null; then
+            git -C "$TMP_MR_WT" config user.email "gate-dispatcher@gascity.local" 2>/dev/null || true
+            git -C "$TMP_MR_WT" config user.name "Gate Dispatcher" 2>/dev/null || true
+            if git -C "$TMP_MR_WT" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+              local NEW_TIP_MR
+              NEW_TIP_MR=$(git -C "$TMP_MR_WT" rev-parse HEAD 2>/dev/null || echo "")
+              if [ -n "$NEW_TIP_MR" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
+                MR_OK=1
+                log "  Merge-time rebase: pushed $BRANCH → $NEW_TIP_MR"
               else
-                err "git push failed after merge commit"
-                MERGE_RESULT="failed_push_merge_commit"
+                git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
               fi
             else
-              err "git merge failed (conflict?) for $BRANCH"
-              MERGE_RESULT="failed_merge_conflict"
+              git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
             fi
-            git_rig worktree remove "$TMP_WT" --force 2>/dev/null || true
-          else
-            err "Could not create temp worktree for merge commit"
-            MERGE_RESULT="failed_worktree"
-          fi
-        fi
-      fi
-    else
-      # Self-repo rig: git_rig() uses git -C <rig_path>
-      IS_ANCESTOR=$(git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null && echo "yes" || echo "no")
-
-      if [ "$IS_ANCESTOR" = "yes" ]; then
-        BRANCH_MERGE_SHA=$(git_rig rev-parse "origin/$BRANCH" 2>/dev/null || echo "unknown")
-        if git_rig push origin "$BRANCH_MERGE_SHA:refs/heads/$DEFAULT_BRANCH" 2>/dev/null; then
-          # Bug 1 fix: verify landing for self-repo FF path
-          git_rig fetch origin 2>/dev/null || warn "Post-push fetch failed (self-repo); landing check may use stale refs"
-          POST_PUSH_MAIN=$(git_rig rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
-          if [ "$BRANCH_MERGE_SHA" != "unknown" ] && [ -n "$POST_PUSH_MAIN" ] && \
-             git_rig merge-base --is-ancestor "$BRANCH_MERGE_SHA" "$POST_PUSH_MAIN" 2>/dev/null; then
-            MERGE_SHA="$BRANCH_MERGE_SHA"
-            MERGE_RESULT="direct_ff"
-            log "FF merge + landing verified (self-repo): $BRANCH → $DEFAULT_BRANCH (sha=$MERGE_SHA)"
-          else
-            err "Landing verification FAILED (self-repo): $BRANCH_MERGE_SHA not in origin/$DEFAULT_BRANCH ($POST_PUSH_MAIN). Silent drop."
-            MERGE_RESULT="failed_landing_not_verified"
+            git_rig worktree remove "$TMP_MR_WT" --force 2>/dev/null || true
           fi
         else
-          err "git push failed for self-repo FF merge"
-          MERGE_RESULT="failed_push"
+          if git -C "$GIT_DIR_PATH" worktree add "$TMP_MR_WT" "origin/$BRANCH" 2>/dev/null; then
+            git -C "$TMP_MR_WT" config user.email "gate-dispatcher@gascity.local" 2>/dev/null || true
+            git -C "$TMP_MR_WT" config user.name "Gate Dispatcher" 2>/dev/null || true
+            if git -C "$TMP_MR_WT" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+              local NEW_TIP_MR_SR
+              NEW_TIP_MR_SR=$(git -C "$TMP_MR_WT" rev-parse HEAD 2>/dev/null || echo "")
+              if [ -n "$NEW_TIP_MR_SR" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
+                MR_OK=1
+                log "  Merge-time rebase (self-repo): pushed $BRANCH → $NEW_TIP_MR_SR"
+              else
+                git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
+              fi
+            else
+              git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
+            fi
+            git -C "$GIT_DIR_PATH" worktree remove "$TMP_MR_WT" --force 2>/dev/null || true
+          fi
+        fi
+
+        if [ "$MR_OK" != "1" ]; then
+          err "  Merge-time rebase: worktree/push failed (attempt $((MERGE_ATTEMPT+1)))"
+          MERGE_RESULT="failed_merge_time_rebase"
+          return 1
+        fi
+
+        # Re-fetch after rebase push
+        git_rig fetch origin 2>/dev/null || true
+        CUR_BRANCH=$(git_rig rev-parse "origin/$BRANCH" 2>/dev/null || echo "")
+        CUR_MAIN=$(git_rig rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+        IS_ANC=$(git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null && echo "yes" || echo "no")
+
+        if [ "$IS_ANC" != "yes" ]; then
+          err "  Merge-time rebase: branch still not FF-able after rebase (main moved again?)"
+          MERGE_RESULT="failed_still_not_ff_after_rebase"
+          return 1
+        fi
+      fi
+
+      # FF push
+      if git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH" 2>/dev/null; then
+        git_rig fetch origin 2>/dev/null || warn "Post-FF-push fetch failed"
+        local POST_MAIN
+        POST_MAIN=$(git_rig rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+        if [ -n "$POST_MAIN" ] && git_rig merge-base --is-ancestor "$CUR_BRANCH" "$POST_MAIN" 2>/dev/null; then
+          MERGE_SHA="$CUR_BRANCH"
+          MERGE_RESULT="direct_ff"
+          log "FF merge + landing verified (attempt $((MERGE_ATTEMPT+1))): $BRANCH → $DEFAULT_BRANCH (sha=$MERGE_SHA, main=$POST_MAIN)"
+          return 0
+        else
+          err "Landing verification FAILED (attempt $((MERGE_ATTEMPT+1))): $CUR_BRANCH not in $DEFAULT_BRANCH ($POST_MAIN)"
+          MERGE_RESULT="failed_landing_not_verified"
+          return 1
         fi
       else
-        err "Branch $BRANCH not FF-able; self-repo rebase required (not auto-handled)."
-        MERGE_RESULT="failed_not_ff"
+        # FF push rejected: main moved between our rebase and push (race)
+        warn "  FF push rejected (attempt $((MERGE_ATTEMPT+1))) — main moved during push; will retry"
+        MERGE_RESULT="failed_push_race"
+        return 1
       fi
-    fi
+    }
+
+    while [ "$MERGE_ATTEMPT" -lt "$MAX_MERGE_RETRIES" ]; do
+      MERGE_ATTEMPT=$((MERGE_ATTEMPT + 1))
+      log "Merge attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES ..."
+      if do_merge_ff; then
+        break
+      fi
+      # Only retry on push-race or stale-after-rebase; give up on conflict/worktree failure
+      if [ "$MERGE_RESULT" = "failed_merge_time_conflict" ] || \
+         [ "$MERGE_RESULT" = "failed_merge_time_rebase" ] || \
+         [ "$MERGE_RESULT" = "failed_sha_resolution" ]; then
+        log "  Non-retryable failure ($MERGE_RESULT). Stopping retry loop."
+        break
+      fi
+      if [ "$MERGE_ATTEMPT" -lt "$MAX_MERGE_RETRIES" ]; then
+        log "  Retrying in 2s ..."
+        sleep 2
+      fi
+    done
 
     if [[ "$MERGE_RESULT" = failed* ]]; then
       # Merge failed despite all-PASS verdict — degrade to FAIL
