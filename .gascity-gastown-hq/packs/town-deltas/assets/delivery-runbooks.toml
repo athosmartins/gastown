@@ -37,7 +37,10 @@ git_repo        = "/Users/athos/gt/whatsapp_automation"
 # Self-repo rig: git pull on the repo root.
 deploy_cmd      = "git -C /Users/athos/gt/whatsapp_automation pull --ff-only"
 daemon_restarts = []   # WA worker managed by gc session; no launchd restart
-prod_test_script = ""  # not yet codified — delivery will HALT if story requires it
+# ga-857v FIX 2: rig-level smoke harness — asserts painel :8202 (200 + title +
+# SSTI closed) and the admin :8097 registration. WA deliveries now reach
+# story:done with delivery:tested instead of the ga-dqp interim delivery:untested.
+prod_test_script = "/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/prod-tests/whatsapp_automation/run.sh"
 min_deploy_gap_minutes = 5
 
 # ─── gastown (framework) ─────────────────────────────────────────────────────
