@@ -264,6 +264,7 @@ BUGS_JSON=$(bd -C "$GC_CITY" list --json \
   -t bug \
   --exclude-label "story:in-flight" \
   --exclude-label "story:done" \
+  --exclude-label "gate:passed" \
   --exclude-label "pilot:dispatching" \
   --exclude-label "gate:needs-human" \
   -n 0 \
@@ -274,6 +275,7 @@ DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   -l "tech-debt" \
   --exclude-label "story:in-flight" \
   --exclude-label "story:done" \
+  --exclude-label "gate:passed" \
   --exclude-label "pilot:dispatching" \
   --exclude-label "gate:needs-human" \
   -n 0 \
@@ -348,6 +350,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
     RIG_BUGS=$(bd -C "$rig_path" list --json -t bug \
       --exclude-label "story:in-flight" \
       --exclude-label "story:done" \
+      --exclude-label "gate:passed" \
       --exclude-label "pilot:dispatching" \
       --exclude-label "gate:needs-human" \
       -n 0 2>/dev/null || echo "[]")
@@ -358,6 +361,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
     RIG_DEBT=$(bd -C "$rig_path" list --json -l "tech-debt" \
       --exclude-label "story:in-flight" \
       --exclude-label "story:done" \
+      --exclude-label "gate:passed" \
       --exclude-label "pilot:dispatching" \
       --exclude-label "gate:needs-human" \
       -n 0 2>/dev/null || echo "[]")
