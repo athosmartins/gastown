@@ -70,6 +70,16 @@ var Commands = []Command{
 			},
 		},
 	},
+	{
+		Name:        "gate-done",
+		Description: "Signal work ready for quality gate (writes durable marker; launchd guard picks it up within ~2 min)",
+		AgentFields: map[string][]Field{
+			"claude": {
+				{"allowed-tools", "Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash(git log:*), Bash(git config:*), Bash(bd create:*), Bash(bd label:*)"},
+				{"argument-hint", ""},
+			},
+		},
+	},
 }
 
 // BuildCommand assembles frontmatter + body for an agent.
