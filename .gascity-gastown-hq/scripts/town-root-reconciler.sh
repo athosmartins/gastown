@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# town-root-reconciler.sh  (ga-857v / propagation family — ga-iwv0, ga-84rm)
+# town-root-reconciler.sh  (ga-857v / propagation family — ga-iwv0, ga-84rm, ga-y3tx)
 #
 # PURPOSE — close the origin→live split-brain on the Gas City town root.
 #
@@ -148,6 +148,71 @@ reconcile_untracked_for_ffpull() {
   return 0
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# reconcile_tracked_for_ffpull  (ga-y3tx — fixes tracked IDENTICAL modifications
+# blocking FF that ga-sejv missed)
+#
+# PROBLEM: `git pull --ff-only` aborts with "Your local changes to the following
+# files would be overwritten by merge" when the live working tree has locally-
+# MODIFIED (tracked) files whose content happens to equal the incoming merge —
+# e.g. a script edited in-place while the same change merged via the gate.
+# ga-sejv fixed the UNTRACKED case only; git checks TRACKED dirty files FIRST,
+# so the untracked reconcile never gets a chance and the FF stays jammed.
+# Observed live 2026-06-05: story-delivery.sh + delivery-runbooks.toml were
+# byte-identical dups that pinned the FF for minutes, firing repeated false
+# 'town root diverged' ntfy to Athos.
+#
+# For each tracked file where the working tree differs from HEAD:
+#   IDENTICAL to incoming  → `git checkout -- $path` to restore HEAD copy;
+#                            the ff-pull then advances it to the same bytes.
+#                            Safe: we only discard a modification that equals
+#                            the merge target — nothing is lost.
+#   DIFFERENT from incoming → do NOT touch it; collect into TRACKED_DIFF_LIST
+#                            and return 2 so the caller STOPS + escalates.
+#                            The NEVER-clobber invariant holds.
+# Sets globals TRACKED_DIFF_LIST and TRACKED_COUNT. Honours DRY_RUN.
+TRACKED_DIFF_LIST=""
+TRACKED_COUNT=0
+reconcile_tracked_for_ffpull() {
+  local dir="$1" upstream="$2"
+  TRACKED_DIFF_LIST=""
+  TRACKED_COUNT=0
+
+  [ -n "$dir" ] || { log "reconcile_tracked: no dir — skip"; return 0; }
+  [ -n "$upstream" ] || { log "reconcile_tracked: no upstream — skip"; return 0; }
+  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+    log "reconcile_tracked: $dir is not a git work tree — skip"; return 0; }
+
+  local conflicts=0 u
+  # Enumerate tracked files where working tree differs from HEAD; -z for safety.
+  while IFS= read -r -d '' u; do
+    [ -n "$u" ] || continue
+    # Does the incoming upstream have this path? If deleted upstream, leave it —
+    # a tracked→deleted transition is not our concern here.
+    git -C "$dir" cat-file -e "$upstream:$u" 2>/dev/null || continue
+    # Compare working-tree bytes against the incoming version.
+    if git -C "$dir" show "$upstream:$u" 2>/dev/null | cmp -s - "$dir/$u"; then
+      # IDENTICAL → restore HEAD copy so git pull can advance it cleanly.
+      # The FF pull will land the same bytes regardless; nothing is lost.
+      if [ "$DRY_RUN" = "1" ]; then
+        log "reconcile_tracked: DRY_RUN — WOULD restore HEAD copy of identical tracked '$u'"
+      else
+        git -C "$dir" checkout -- "$u"
+        log "reconcile_tracked: auto-reconciled identical tracked '$u' (restored to HEAD; ff-pull advances to same bytes)"
+      fi
+      TRACKED_COUNT=$((TRACKED_COUNT + 1))
+    else
+      # GENUINELY DIFFERENT → never discard. Record for halt + escalation.
+      warn "reconcile_tracked: CONFLICT — tracked '$u' DIFFERS from incoming $upstream:$u (NOT restored)"
+      TRACKED_DIFF_LIST="$TRACKED_DIFF_LIST $u"
+      conflicts=$((conflicts + 1))
+    fi
+  done < <(git -C "$dir" diff -z --name-only HEAD 2>/dev/null)
+
+  [ "$conflicts" -gt 0 ] && return 2
+  return 0
+}
+
 reconcile_once() {
   # Sanity: real git work tree.
   git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
@@ -184,6 +249,19 @@ reconcile_once() {
     behind=$(git -C "$ROOT" rev-list --count "$BRANCH..$REMOTE/$BRANCH" 2>/dev/null || echo "?")
     log "town root BEHIND $REMOTE/$BRANCH by $behind commit(s) — fast-forwarding live root."
 
+    # ga-y3tx: clear byte-identical TRACKED modifications BEFORE the ff-pull (and
+    # before the untracked reconcile, because git checks tracked dirty files first).
+    # This is a pure FF, so any tracked file whose working-tree bytes equal the
+    # incoming content is a benign in-place duplicate — safe to restore to HEAD so
+    # the ff-pull can advance it cleanly. A genuinely DIFFERENT tracked modification
+    # returns 2 → STOP + escalate (never clobber — real local work is never lost).
+    if ! reconcile_tracked_for_ffpull "$ROOT" "$REMOTE/$BRANCH"; then
+      err "town root FF blocked: tracked modification(s) DIFFER from incoming $REMOTE/$BRANCH (NOT clobbered):$TRACKED_DIFF_LIST"
+      maybe_ntfy "Gas City town root: tracked file(s) differ from incoming $REMOTE/$BRANCH —$TRACKED_DIFF_LIST. NOT overwritten; needs deliberate human/Mayor resolve."
+      return 0
+    fi
+    [ "$TRACKED_COUNT" -gt 0 ] && log "reconciled $TRACKED_COUNT byte-identical tracked modification(s) — ff-pull can now land cleanly."
+
     # ga-sejv: clear byte-identical untracked collisions BEFORE the ff-pull. This
     # is a pure FF (local is an ancestor), so it SHOULD land — but an untracked
     # working-tree copy of a file the merge adds as tracked makes git abort the
@@ -213,11 +291,11 @@ reconcile_once() {
         && log "gc reload --soft (sync) applied — drift accepted; live dispatchers pick up new code next tick." \
         || err "gc reload --soft (sync) failed (files updated on disk regardless; dispatchers still get new code next tick)."
     else
-      # After the untracked reconcile above, a still-failing FF is the RARE real
-      # case (a collision that raced in, or a dirty TRACKED file) — no longer the
-      # benign-duplicate false alarm. Surface it; do not force.
-      err "FF pull FAILED after untracked reconcile — investigate (raced collision or dirty tracked file?)."
-      maybe_ntfy "town root FF pull failed even after untracked reconcile — manual check needed."
+      # After tracked+untracked reconcile, a still-failing FF is the RARE real
+      # case (a raced-in collision, staged index changes, or a genuinely dirty
+      # file that arrived between reconcile and pull). Surface it; do not force.
+      err "FF pull FAILED after tracked+untracked reconcile — investigate (raced collision? staged index changes?)."
+      maybe_ntfy "town root FF pull failed even after tracked+untracked reconcile — manual check needed."
     fi
     return 0
   fi
