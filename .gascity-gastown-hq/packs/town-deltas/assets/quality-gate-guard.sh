@@ -219,6 +219,7 @@ if [ "$TRANSIENT_COUNT" -gt 0 ]; then
       requeue:queued)
         warn "Vector A: requeueing zombie dispatching marker $T_ID (age=${T_AGE}m, reclaims=${T_COUNT})"
         bd -C "$GC_CITY" label remove "$T_ID" "gate-status:dispatching" -q 2>/dev/null || true
+        bd -C "$GC_CITY" label remove "$T_ID" "gate-status:claimed"     -q 2>/dev/null || true
         bd -C "$GC_CITY" label add    "$T_ID" "gate-status:queued"      -q 2>/dev/null || true
         [ "$T_COUNT" -gt 0 ] && \
           bd -C "$GC_CITY" label remove "$T_ID" "gate-reclaim-count:${T_COUNT}" -q 2>/dev/null || true
@@ -227,8 +228,9 @@ if [ "$TRANSIENT_COUNT" -gt 0 ]; then
         ;;
       requeue:ready)
         warn "Vector A: re-readying zombie claimed marker $T_ID (age=${T_AGE}m, reclaims=${T_COUNT})"
-        bd -C "$GC_CITY" label remove "$T_ID" "gate-status:claimed" -q 2>/dev/null || true
-        bd -C "$GC_CITY" label add    "$T_ID" "gate-status:ready"   -q 2>/dev/null || true
+        bd -C "$GC_CITY" label remove "$T_ID" "gate-status:claimed"     -q 2>/dev/null || true
+        bd -C "$GC_CITY" label remove "$T_ID" "gate-status:dispatching" -q 2>/dev/null || true
+        bd -C "$GC_CITY" label add    "$T_ID" "gate-status:ready"       -q 2>/dev/null || true
         [ "$T_COUNT" -gt 0 ] && \
           bd -C "$GC_CITY" label remove "$T_ID" "gate-reclaim-count:${T_COUNT}" -q 2>/dev/null || true
         bd -C "$GC_CITY" label add "$T_ID" "gate-reclaim-count:$((T_COUNT+1))" -q 2>/dev/null || true
@@ -236,8 +238,9 @@ if [ "$TRANSIENT_COUNT" -gt 0 ]; then
         ;;
       error)
         warn "Vector A: exhausted reclaims for $T_ID (count=${T_COUNT} >= MAX_RECLAIMS=${MAX_RECLAIMS})"
-        bd -C "$GC_CITY" label remove "$T_ID" "gate-status:$T_STATUS" -q 2>/dev/null || true
-        bd -C "$GC_CITY" label add    "$T_ID" "gate-status:error"      -q 2>/dev/null || true
+        bd -C "$GC_CITY" label remove "$T_ID" "gate-status:dispatching" -q 2>/dev/null || true
+        bd -C "$GC_CITY" label remove "$T_ID" "gate-status:claimed"     -q 2>/dev/null || true
+        bd -C "$GC_CITY" label add    "$T_ID" "gate-status:error"       -q 2>/dev/null || true
         bd -C "$GC_CITY" comment "$T_ID" "Vector A (ga-tmug): marker exhausted ${MAX_RECLAIMS} reclaim attempts stuck in gate-status:${T_STATUS}. Marking gate-status:error — human/Mayor intervention required." 2>/dev/null || true
         ;;
       skip)
@@ -394,9 +397,7 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
         SESSION_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "{}")
         SESSION_MATCH=$(echo "$SESSION_JSON" | jq -r --arg a "$OI_ASSIGNEE" '
           .sessions // [] |
-          if any(.; .id == $a or .name == $a or
-            (.id != null and .id != "" and ($a | contains(.id))) or
-            (.name != null and .name != "" and ($a | contains(.name))))
+          if any(.; .id == $a or .name == $a)
           then "alive" else "dead" end
         ' 2>/dev/null || echo "uncertain")
         [ "$SESSION_MATCH" != "dead" ] && HAS_LIVE_ASSIGNEE=1
@@ -485,9 +486,7 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
       SC_SESSION_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "{}")
       SC_SESSION_MATCH=$(echo "$SC_SESSION_JSON" | jq -r --arg a "$SC_ASSIGNEE" '
         .sessions // [] |
-        if any(.; .id == $a or .name == $a or
-          (.id != null and .id != "" and ($a | contains(.id))) or
-          (.name != null and .name != "" and ($a | contains(.name))))
+        if any(.; .id == $a or .name == $a)
         then "alive" else "dead" end
       ' 2>/dev/null || echo "uncertain")
       [ "$SC_SESSION_MATCH" != "dead" ] && HAS_SC_ASSIGNEE=1

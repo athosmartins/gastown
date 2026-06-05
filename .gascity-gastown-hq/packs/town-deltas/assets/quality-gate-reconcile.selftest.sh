@@ -167,6 +167,17 @@ grep -q 'gate:needs-fix'            "$GUARD" && ok "guard checks gate:needs-fix 
 grep -q 'free:fail-stranded'        "$GUARD" && ok "guard handles free:fail-stranded action"    || bad "guard missing free:fail-stranded handler"
 grep -q 'free:pass-stranded'        "$GUARD" && ok "guard handles free:pass-stranded action"    || bad "guard missing free:pass-stranded handler"
 grep -q 'merge-base --is-ancestor'  "$GUARD" && ok "guard uses merge-base for branch check (GAP-1)" || bad "guard missing merge-base check"
+# Fix: reconcile_marker_action must remove BOTH transient labels before target state (ga-pa36 gate-feedback)
+[ "$(grep -c 'label remove.*gate-status:dispatching' "$GUARD")" -ge 2 ] \
+  && ok "requeue:ready removes gate-status:dispatching (both transient labels cleared)" \
+  || bad "requeue:ready missing label remove gate-status:dispatching — must clear BOTH transients"
+[ "$(grep -c 'label remove.*gate-status:claimed' "$GUARD")" -ge 2 ] \
+  && ok "requeue:queued removes gate-status:claimed (both transient labels cleared)" \
+  || bad "requeue:queued missing label remove gate-status:claimed — must clear BOTH transients"
+# Fix: live-builder check must use exact match, not substring contains (ga-pa36 gate-feedback)
+! grep -q '| contains(\.' "$GUARD" \
+  && ok "live-builder checks use exact match (no substring contains)" \
+  || bad "live-builder check still uses substring contains — must use exact match"
 
 echo ""
 echo "──────────────────────────────────────────"
