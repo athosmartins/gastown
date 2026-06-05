@@ -91,6 +91,86 @@ sys.exit(1)
 PYEOF
 }
 
+# ── FIX 1 (ga-857v): safe untracked-vs-tracked reconciliation before ff-pull ──
+# Problem: deploy_cmd typically runs `git -C <runtime> pull --ff-only`. If the
+# runtime working tree holds an UNTRACKED copy of a file that the incoming merge
+# adds as TRACKED (e.g. a live-served daemon that ran as an untracked file
+# before its tracked version merged to main), git aborts the ff-pull:
+#   "The following untracked working tree files would be overwritten by merge:
+#    <file> — Please move or remove them before you merge. Aborting"
+# Delivery then sets delivery:failed and the story never reaches story:done,
+# even though the merge to main is durable and the content is byte-identical.
+#
+# This reconciler removes ONLY verified-identical duplicates. For each untracked
+# file the incoming upstream adds as tracked, it compares the working-tree bytes
+# against the upstream version:
+#   IDENTICAL  → back up to /tmp then remove, so the ff-pull lands the tracked
+#                copy (the NEVER-auto-revert invariant holds: we only delete a
+#                proven-identical duplicate, never real content).
+#   DIFFERENT  → do NOT touch it; collect into RECONCILE_DIFF_LIST and return 2
+#                so the caller halts + escalates (uncommitted prod work is never
+#                destroyed).
+# Sets globals RECONCILE_DIFF_LIST (space-separated paths that differ) and
+# RECONCILE_COUNT (number auto-reconciled). Honours DRY_RUN.
+RECONCILE_DIFF_LIST=""
+RECONCILE_COUNT=0
+reconcile_untracked_for_ffpull() {
+  local dir="$1"
+  RECONCILE_DIFF_LIST=""
+  RECONCILE_COUNT=0
+
+  # Only meaningful for a real git working tree.
+  [ -n "$dir" ] || { log "reconcile: no runtime_dir — skip"; return 0; }
+  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+    log "reconcile: $dir is not a git work tree — skip"; return 0; }
+
+  # Determine the incoming upstream ref (e.g. origin/main).
+  local upstream remote branch
+  upstream=$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
+  if [ -z "$upstream" ]; then
+    branch=$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || echo "")
+    [ -n "$branch" ] && upstream="origin/$branch"
+  fi
+  [ -n "$upstream" ] || { log "reconcile: no upstream for $dir — skip"; return 0; }
+  remote="${upstream%%/*}"
+
+  # Refresh remote refs so the comparison reflects what the pull will merge.
+  git -C "$dir" fetch --quiet "$remote" 2>/dev/null \
+    || git -C "$dir" fetch --quiet 2>/dev/null || true
+
+  local conflicts=0 u base ts backup
+  # Enumerate untracked (non-ignored) files; -z keeps paths with spaces safe.
+  while IFS= read -r -d '' u; do
+    [ -n "$u" ] || continue
+    # Does the incoming upstream add this path as tracked? If not, ignore it
+    # (genuine local-only file — leave it completely alone).
+    git -C "$dir" cat-file -e "$upstream:$u" 2>/dev/null || continue
+    # Collision candidate. Compare working-tree bytes against incoming version.
+    if git -C "$dir" show "$upstream:$u" 2>/dev/null | cmp -s - "$dir/$u"; then
+      # IDENTICAL → safe to remove so the ff-pull can land the tracked copy.
+      base=$(basename "$u")
+      ts=$(date +%Y%m%d-%H%M%S)
+      backup="/tmp/${base}.backup.${ts}.$$"
+      if [ "$DRY_RUN" = "1" ]; then
+        log "reconcile: DRY_RUN — WOULD backup+remove identical untracked '$u' (backup $backup)"
+      else
+        cp -p "$dir/$u" "$backup" 2>/dev/null || cp "$dir/$u" "$backup" 2>/dev/null || true
+        rm -f "$dir/$u"
+        log "reconcile: auto-reconciled identical untracked '$u' (backup: $backup)"
+      fi
+      RECONCILE_COUNT=$((RECONCILE_COUNT + 1))
+    else
+      # GENUINELY DIFFERENT → never clobber. Record for halt + escalation.
+      warn "reconcile: CONFLICT — untracked '$u' DIFFERS from incoming $upstream:$u (NOT removed)"
+      RECONCILE_DIFF_LIST="$RECONCILE_DIFF_LIST $u"
+      conflicts=$((conflicts + 1))
+    fi
+  done < <(git -C "$dir" ls-files --others --exclude-standard -z 2>/dev/null)
+
+  [ "$conflicts" -gt 0 ] && return 2
+  return 0
+}
+
 # ── Step 1: Find stories with gate:passed but NOT story:done ──────────────────
 # Stories are identified by label story:approved (type field is null in bd).
 # gate:passed is set by the quality-gate-dispatcher after merge.
@@ -216,14 +296,17 @@ if [ -z "$PROD_TEST_SCRIPT" ]; then
   NO_HARNESS=1
 fi
 
-# wa-l5z9 fix: a MISSING story-specific prod test is NON-BLOCKING.
+# wa-l5z9 + ga-857v FIX 2: a MISSING story-specific prod test is NON-BLOCKING.
 # RATIONALE (flow-never-stops): the pipeline must never stall just because nobody
-# wrote a story-specific test. Previously this case HALTed delivery and fired an
-# NTFY every retry cycle (overnight spam, e.g. ga-0ys). Now it behaves IDENTICALLY
-# to the rig-harness-missing case: the story still delivers and ends at story:done
-# with the delivery:untested label (a single warn signal, no HALT).
-# Harness/test coverage is driven up separately (ga-857v / ga-iwv0), NOT by
-# blocking delivery here.
+# wrote a story-specific test. wa-l5z9 first removed the HALT/per-cycle NTFY for
+# this case by SKIPPING the prod test → delivery:untested.
+# ga-857v FIX 2 finishes the job wa-l5z9's comments deferred to it ("coverage
+# tracked by ga-857v"): instead of skipping, if the rig HAS a harness we now RUN
+# the rig's BASELINE harness (run.sh invoked WITHOUT STORY_ID, so no rig's run.sh
+# can hard-fail on the absent story test) → a passing baseline yields
+# delivery:tested. The flow still never HALTs on a *missing* test; it only fails
+# if the baseline detects genuinely broken prod (which SHOULD halt). The sole
+# remaining delivery:untested case is NO_HARNESS=1 (rig has no harness at all).
 STORY_TEST_MISSING=0
 
 if [ "$NO_HARNESS" = "0" ] && [ ! -f "$PROD_TEST_SCRIPT" ]; then
@@ -256,6 +339,59 @@ if [ "$NO_HARNESS" = "0" ]; then
 fi
 
 log "Runbook loaded: deploy_cmd='$DEPLOY_CMD' runtime='$RUNTIME_DIR' test='$PROD_TEST_SCRIPT'"
+
+# ── Step 3.5: Reconcile untracked-vs-tracked before deploy (ga-857v FIX 1) ────
+# Prevents the ff-pull abort when the runtime holds an untracked copy of a file
+# the incoming merge adds as tracked. Identical duplicates are backed up +
+# removed; a genuine divergence halts + escalates (never clobbered).
+#
+# SCOPE: only run when the deploy will execute a FATAL `pull --ff-only` (the
+# bug's domain — property_scrapers, whatsapp_automation). Rigs whose deploy
+# swallows pull failures (e.g. gascity: "... 2>/dev/null || true") or that don't
+# pull at all are NOT subject to the untracked-overwrite abort, so the reconcile
+# must NOT run for them — otherwise a pre-existing, harmless untracked file in
+# that runtime (e.g. the town root's .gitignore) would wrongly halt delivery.
+RUN_RECONCILE=0
+case "$DEPLOY_CMD" in
+  *"pull --ff-only"*)
+    case "$DEPLOY_CMD" in
+      *"|| true"*) RUN_RECONCILE=0 ;;  # pull failure swallowed → not fatal
+      *)           RUN_RECONCILE=1 ;;
+    esac
+    ;;
+esac
+
+if [ "$RUN_RECONCILE" != "1" ]; then
+  log "Pre-deploy reconcile skipped — deploy_cmd for rig '$RIG' does not run a fatal ff-pull."
+elif reconcile_untracked_for_ffpull "$RUNTIME_DIR"; then
+  if [ "$RECONCILE_COUNT" -gt 0 ]; then
+    log "Pre-deploy reconcile: backed up + removed $RECONCILE_COUNT identical untracked duplicate(s) so the ff-pull can land the tracked version(s)."
+  fi
+else
+  # Return 2 → genuine divergence between an untracked prod file and the merge.
+  err "Pre-deploy reconcile ABORT: untracked working-tree file(s) DIFFER from the incoming tracked version:$RECONCILE_DIFF_LIST"
+  if [ "$DRY_RUN" != "1" ]; then
+    bd -C "$GC_CITY" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+    bd -C "$GC_CITY" label add    "$STORY_ID" "delivery:failed"  -q 2>/dev/null || true
+    bd -C "$GC_CITY" comment "$STORY_ID" "Delivery HALTED (ga-857v FIX 1): the production working tree at $RUNTIME_DIR holds untracked file(s) that the incoming merge adds as tracked, and they GENUINELY DIFFER from the merged version:$RECONCILE_DIFF_LIST
+These were NOT removed — uncommitted prod work is never destroyed. Resolve manually: diff each untracked file against origin's version, preserve any real local changes, then re-run delivery." 2>/dev/null || true
+    # Escalate to author + Mayor via nudge (durable record is the bead comment + label).
+    AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
+    if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
+      gc --city "$GC_CITY" session nudge "$AUTHOR" \
+        "DELIVERY HALTED for story $STORY_ID: untracked prod file(s) differ from the incoming merge:$RECONCILE_DIFF_LIST. NOT clobbered — resolve manually, then re-run delivery." \
+        --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
+    fi
+    gc --city "$GC_CITY" session nudge mayor \
+      "DELIVERY HALTED ($STORY_ID, rig $RIG): untracked working-tree file(s) at $RUNTIME_DIR differ from the incoming merged version:$RECONCILE_DIFF_LIST. Not removed (no data loss). Manual resolution needed before re-running delivery." \
+      2>/dev/null || true
+  fi
+  # wa-uthi: non-terminal (delivery:failed is re-picked every cycle until the
+  # divergence is resolved — retries, not a definitive rejection) — SUPPRESS the
+  # Athos push. Author + Mayor are nudged above; the bead comment is the record.
+  warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID reconcile conflict — untracked prod file differs from merge:$RECONCILE_DIFF_LIST."
+  exit 1
+fi
 
 # ── Step 4: Deploy ─────────────────────────────────────────────────────────────
 if [ "$DRY_RUN" = "1" ]; then
@@ -294,19 +430,20 @@ if [ -n "$DAEMON_LIST" ]; then
 fi
 
 # ── Step 6: Run prod test ──────────────────────────────────────────────────────
-# UNTESTED path covers two cases, treated IDENTICALLY (wa-l5z9):
-#   (a) NO_HARNESS=1        — rig has no prod-test harness at all (ga-dqp)
-#   (b) STORY_TEST_MISSING=1 — rig HAS a harness but no story-specific test (wa-l5z9)
-# Both deliver + warn-only (story:done with delivery:untested), never HALT.
-if [ "$NO_HARNESS" = "1" ] || [ "$STORY_TEST_MISSING" = "1" ]; then
-  if [ "$NO_HARNESS" = "1" ]; then
-    UNTESTED_REASON="rig '$RIG' has no prod-test harness"
-    UNTESTED_FOLLOWUP="a real prod-test harness for rig '$RIG' is needed (ga-dqp DESTINY item)"
-  else
-    UNTESTED_REASON="no story-specific test at $STORY_TEST_FILE"
-    UNTESTED_FOLLOWUP="a story-specific prod test (story-${STORY_ID}.sh) should be authored; coverage tracked by ga-857v/ga-iwv0"
-  fi
-  warn "Skipping prod test — $UNTESTED_REASON (delivery:untested, wa-l5z9 warn-only). Flow never stops."
+# delivery:untested is now reserved for the SINGLE case NO_HARNESS=1 — the rig
+# has no prod-test harness at all (ga-dqp interim). That case skips + warns
+# (story:done with delivery:untested), never HALTs.
+#
+# ga-857v FIX 2: when the rig HAS a harness we ALWAYS run it (→ delivery:tested
+# on pass). If the story-specific test is missing (STORY_TEST_MISSING=1) we run
+# the rig BASELINE only, by invoking run.sh WITHOUT STORY_ID — every rig's run.sh
+# runs its story-specific block solely when STORY_ID is set, so baseline mode can
+# never hard-fail on an absent story test. Flow still never HALTs on a *missing*
+# test; it only fails if the baseline finds genuinely broken prod (correct).
+if [ "$NO_HARNESS" = "1" ]; then
+  UNTESTED_REASON="rig '$RIG' has no prod-test harness"
+  UNTESTED_FOLLOWUP="a real prod-test harness for rig '$RIG' is needed (ga-dqp DESTINY item)"
+  warn "Skipping prod test — $UNTESTED_REASON (delivery:untested, ga-dqp interim). Flow never stops."
   if [ "$DRY_RUN" = "1" ]; then
     log "DRY_RUN=1 — WOULD SKIP PROD TEST ($UNTESTED_REASON); WOULD SET delivery:untested (no NTFY — terminal-only push policy wa-uthi)"
   else
@@ -318,42 +455,52 @@ FOLLOW-UP: $UNTESTED_FOLLOWUP." 2>/dev/null || true
     # single terminal push fires at story:done (Step 8). Mid-flow warnings are
     # suppressed so Athos only gets pushed on terminal outcomes.
   fi
-elif [ "$DRY_RUN" = "1" ]; then
-  log "DRY_RUN=1 — WOULD RUN PROD TEST: STORY_ID=$STORY_ID bash $PROD_TEST_SCRIPT"
-  log "DRY_RUN=1 — Story-specific test: $STORY_TEST_FILE"
 else
-  log "Running prod test: $PROD_TEST_SCRIPT (STORY_ID=$STORY_ID) ..."
-  TEST_OUTPUT=$(STORY_ID="$STORY_ID" bash "$PROD_TEST_SCRIPT" 2>&1) && TEST_RC=$? || TEST_RC=$?
-  log "Test output: $TEST_OUTPUT"
+  # Rig HAS a harness → run it. Baseline-only (no STORY_ID) when the
+  # story-specific test is absent; full (with STORY_ID) when it exists.
+  if [ "$STORY_TEST_MISSING" = "1" ]; then
+    TEST_STORY_ID=""
+    TEST_MODE_DESC="rig baseline harness only — no story-specific test (ga-857v FIX 2)"
+  else
+    TEST_STORY_ID="$STORY_ID"
+    TEST_MODE_DESC="rig harness + story-specific test (story-${STORY_ID}.sh)"
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    log "DRY_RUN=1 — WOULD RUN PROD TEST: STORY_ID='$TEST_STORY_ID' bash $PROD_TEST_SCRIPT ($TEST_MODE_DESC)"
+  else
+    log "Running prod test: $PROD_TEST_SCRIPT (STORY_ID='$TEST_STORY_ID'; $TEST_MODE_DESC) ..."
+    TEST_OUTPUT=$(STORY_ID="$TEST_STORY_ID" bash "$PROD_TEST_SCRIPT" 2>&1) && TEST_RC=$? || TEST_RC=$?
+    log "Test output: $TEST_OUTPUT"
 
-  if [ "$TEST_RC" -ne 0 ]; then
-    err "Prod test FAILED (rc=$TEST_RC)"
-    bd -C "$GC_CITY" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$STORY_ID" "delivery:failed" -q 2>/dev/null || true
-    bd -C "$GC_CITY" comment "$STORY_ID" "Delivery FAILED: prod test did not pass.
-Script: $PROD_TEST_SCRIPT
+    if [ "$TEST_RC" -ne 0 ]; then
+      err "Prod test FAILED (rc=$TEST_RC)"
+      bd -C "$GC_CITY" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+      bd -C "$GC_CITY" label add    "$STORY_ID" "delivery:failed" -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$STORY_ID" "Delivery FAILED: prod test did not pass.
+Script: $PROD_TEST_SCRIPT ($TEST_MODE_DESC)
 Exit code: $TEST_RC
 Output:
 $TEST_OUTPUT
 
 HALT — do NOT auto-revert (DB migration risk). Investigate the failure, fix forward, and re-run delivery." 2>/dev/null || true
 
-    # Escalate: notify author (from bead)
-    AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
-    if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
-      gc --city "$GC_CITY" session nudge "$AUTHOR" \
-        "DELIVERY FAILED for story $STORY_ID ($STORY_TITLE). Prod test failed (exit $TEST_RC). See bead comments. DO NOT auto-revert — investigate and fix forward." \
-        --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
+      # Escalate: notify author (from bead)
+      AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
+      if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
+        gc --city "$GC_CITY" session nudge "$AUTHOR" \
+          "DELIVERY FAILED for story $STORY_ID ($STORY_TITLE). Prod test failed (exit $TEST_RC). See bead comments. DO NOT auto-revert — investigate and fix forward." \
+          --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
+      fi
+
+      # wa-uthi: non-terminal (delivery:failed re-picked every cycle — retries, no
+      # exhaustion counter) — no push to Athos. The author is nudged above; Athos
+      # only hears terminal outcomes (story:done or definitive rejection).
+      warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID prod test FAILED (rc=$TEST_RC) — author nudged."
+      exit 1
     fi
 
-    # wa-uthi: non-terminal (delivery:failed re-picked every cycle — retries, no
-    # exhaustion counter) — no push to Athos. The author is nudged above; Athos
-    # only hears terminal outcomes (story:done or definitive rejection).
-    warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID prod test FAILED (rc=$TEST_RC) — author nudged."
-    exit 1
+    log "Prod test PASS ($TEST_MODE_DESC)"
   fi
-
-  log "Prod test PASS"
 fi
 
 # ── Step 7: Verify refino criteria from story metadata ────────────────────────
@@ -412,17 +559,12 @@ else
   PILOT_PREFIX=""
   [ "$PILOT_ORIGIN" = "1" ] && PILOT_PREFIX="🤖 [Pilot] "
 
-  # UNTESTED terminal success covers both NO_HARNESS and STORY_TEST_MISSING (wa-l5z9).
-  if [ "$NO_HARNESS" = "1" ] || [ "$STORY_TEST_MISSING" = "1" ]; then
-    if [ "$NO_HARNESS" = "1" ]; then
-      DONE_TEST_LINE="SKIPPED — rig '$RIG' has no prod-test harness (interim policy per ga-dqp)."
-      DONE_NOTE="a real prod-test harness for this rig is a DESTINY follow-up item."
-      DONE_PUSH_TAIL="prod test SKIPPED (no harness for $RIG)"
-    else
-      DONE_TEST_LINE="SKIPPED at story level — no story-specific test (story-${STORY_ID}.sh); rig harness not run for this story (wa-l5z9 warn-only)."
-      DONE_NOTE="a story-specific prod test is owed; coverage tracked by ga-857v/ga-iwv0."
-      DONE_PUSH_TAIL="story-level test missing — delivered untested"
-    fi
+  # UNTESTED terminal success is now NO_HARNESS=1 ONLY (ga-857v FIX 2: a missing
+  # story-specific test runs the rig baseline → delivery:tested, handled below).
+  if [ "$NO_HARNESS" = "1" ]; then
+    DONE_TEST_LINE="SKIPPED — rig '$RIG' has no prod-test harness (interim policy per ga-dqp)."
+    DONE_NOTE="a real prod-test harness for this rig is a DESTINY follow-up item."
+    DONE_PUSH_TAIL="prod test SKIPPED (no harness for $RIG)"
     bd -C "$GC_CITY" comment "$STORY_ID" "Delivery COMPLETE. story:done (delivery:untested).
 Rig: $RIG
 Deploy: $DEPLOY_CMD
@@ -433,24 +575,35 @@ NOTE: $DONE_NOTE" 2>/dev/null || true
     # wa-uthi: TERMINAL SUCCESS (story:done) — push KEPT. wa-wzvg: Pilot-differentiated.
     notify -t "${PILOT_PREFIX}Story DONE (untested)" -p 2 "${PILOT_PREFIX}Story $STORY_ID ($STORY_TITLE) — deployed, $DONE_PUSH_TAIL" 2>/dev/null || true
   else
-    bd -C "$GC_CITY" comment "$STORY_ID" "Delivery COMPLETE. story:done.
+    # delivery:tested — rig harness passed (full when a story-specific test exists,
+    # baseline-only when it does not — ga-857v FIX 2). Add an explicit
+    # delivery:tested label so the tested state is queryable (acceptance wording).
+    bd -C "$GC_CITY" label add "$STORY_ID" "delivery:tested" -q 2>/dev/null || true
+    if [ "$STORY_TEST_MISSING" = "1" ]; then
+      DONE_TEST_LINE="$PROD_TEST_SCRIPT — rig BASELINE harness only, no story-specific test (ga-857v FIX 2)"
+      DONE_PUSH_TAIL="deployed + baseline-tested in prod"
+    else
+      DONE_TEST_LINE="$PROD_TEST_SCRIPT (STORY_ID=$STORY_ID)"
+      DONE_PUSH_TAIL="deployed + tested in prod"
+    fi
+    bd -C "$GC_CITY" comment "$STORY_ID" "Delivery COMPLETE. story:done (delivery:tested).
 Rig: $RIG
 Deploy: $DEPLOY_CMD
-Prod test: $PROD_TEST_SCRIPT (STORY_ID=$STORY_ID)
+Prod test: $DONE_TEST_LINE
 Elapsed: ${ELAPSED}s
 Criteria verified: estrela_guia, equilibrios, dashboard (see bead metadata)" 2>/dev/null || true
     # wa-uthi: TERMINAL SUCCESS (story:done) — push KEPT. wa-wzvg: Pilot-differentiated.
-    notify -t "${PILOT_PREFIX}Story DONE" -p 2 "${PILOT_PREFIX}Story $STORY_ID ($STORY_TITLE) — deployed + tested in prod" 2>/dev/null || true
+    notify -t "${PILOT_PREFIX}Story DONE" -p 2 "${PILOT_PREFIX}Story $STORY_ID ($STORY_TITLE) — $DONE_PUSH_TAIL" 2>/dev/null || true
   fi
   log "story:done set on $STORY_ID"
 fi
 
 # ── Step 9: Log to story-delivery.jsonl ───────────────────────────────────────
-# Determine result classification (wa-l5z9: untested covers no-harness AND
-# story-test-missing).
+# Determine result classification. ga-857v FIX 2: untested is NO_HARNESS only;
+# a missing story-specific test now runs the rig baseline → PASS (tested).
 if [ "$DRY_RUN" = "1" ]; then
   DELIVERY_RESULT="dry_run"
-elif [ "$NO_HARNESS" = "1" ] || [ "$STORY_TEST_MISSING" = "1" ]; then
+elif [ "$NO_HARNESS" = "1" ]; then
   DELIVERY_RESULT="PASS_UNTESTED"
 else
   DELIVERY_RESULT="PASS"
