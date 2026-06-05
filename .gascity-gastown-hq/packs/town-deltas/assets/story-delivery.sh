@@ -430,6 +430,93 @@ if [ -n "$RUNTIME_DIR" ] && git -C "$RUNTIME_DIR" rev-parse --is-inside-work-tre
   POST_DEPLOY_SHA=$(git -C "$RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
 fi
 
+# ── Step 4.5: Post-deploy town-root staleness gate (ga-rhtu) ──────────────────
+# THE BUG: rigs whose deploy_cmd runs a BEST-EFFORT, swallowed ff-pull
+# (`git -C <dir> pull --ff-only ... 2>/dev/null || true; <install>` — the
+# gascity / in-place HQ-framework runtime) can silently keep running STALE code.
+# If that runtime's branch carries LOCAL-AHEAD or DIVERGED commits, or its `main`
+# tracks a stale upstream (a fork remote), the ff-pull CANNOT fast-forward to
+# origin/main, the `|| true` eats the failure, and Step 4 logs "Deploy OK" on a
+# tree that never received the just-merged fix. Delivery would then mark
+# story:done while the live engines run outdated code (proven on ga-jb4l).
+# FATAL-pull rigs are NOT affected — a failed `pull --ff-only` already halts
+# Step 4 above — so this gate runs ONLY for the swallowed-pull class.
+#
+# Fail-closed verification: after deploy, the runtime HEAD must CONTAIN
+# origin/<branch> (the canonical merge target the gate pushes to). If
+# origin/<branch> is an ANCESTOR of HEAD (HEAD is current, or merely local-ahead
+# — a documented, legitimate state for the in-place town root) delivery
+# proceeds. If HEAD is BEHIND or DIVERGED (origin/<branch> is NOT an ancestor —
+# the merged fix is missing), or freshness cannot be verified at all, delivery
+# HALTS LOUDLY (delivery:failed, escalate author + Mayor, story:done WITHHELD)
+# and is re-picked next cycle once the town-root reconciler brings the tree
+# current. It does NOT reconcile the tree itself: THIS script runs in-place from
+# that tree, so a self-mutating ff mid-run risks corrupting the running engine —
+# advancing the tree is the reconciler's job, not delivery's.
+STALENESS_GATE=0
+case "$DEPLOY_CMD" in
+  *"pull --ff-only"*)
+    case "$DEPLOY_CMD" in
+      *"|| true"*) STALENESS_GATE=1 ;;   # swallowed ff-pull → the vulnerable class
+    esac
+    ;;
+esac
+if [ "$DRY_RUN" = "1" ]; then
+  log "DRY_RUN=1 — skipping post-deploy staleness gate."
+  STALENESS_GATE=0
+fi
+if [ "$STALENESS_GATE" = "1" ] && [ -n "$RUNTIME_DIR" ] \
+   && git -C "$RUNTIME_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  STALE_BRANCH=$(git -C "$RUNTIME_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  case "$STALE_BRANCH" in ""|HEAD) STALE_BRANCH="main" ;; esac
+  STALE_REF="origin/$STALE_BRANCH"
+  # Best-effort, bounded refresh of the canonical ref. Never fatal on its own —
+  # the deploy's own pull already fetched; this only guards a stale local ref.
+  timeout 30 git -C "$RUNTIME_DIR" fetch origin "$STALE_BRANCH" --quiet 2>/dev/null \
+    || warn "Staleness gate: 'git fetch origin $STALE_BRANCH' failed/timed out — comparing against last-known $STALE_REF."
+  STALE_REMOTE_SHA=$(git -C "$RUNTIME_DIR" rev-parse "$STALE_REF" 2>/dev/null || echo "")
+  STALE_HEAD_SHA=$(git -C "$RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")
+  if [ -z "$STALE_REMOTE_SHA" ]; then
+    STALE_VERDICT="UNVERIFIABLE"
+  elif git -C "$RUNTIME_DIR" merge-base --is-ancestor "$STALE_REF" HEAD 2>/dev/null; then
+    STALE_VERDICT="CURRENT"     # HEAD contains origin/<branch> (current or local-ahead) → fresh
+  else
+    STALE_VERDICT="STALE"       # behind or diverged → the merged fix is NOT live
+  fi
+
+  if [ "$STALE_VERDICT" = "CURRENT" ]; then
+    log "Staleness gate OK: $RUNTIME_DIR HEAD ($STALE_HEAD_SHA) contains $STALE_REF ($STALE_REMOTE_SHA)."
+  else
+    STALE_COUNTS=$(git -C "$RUNTIME_DIR" rev-list --left-right --count "$STALE_REF...HEAD" 2>/dev/null || printf '?\t?')
+    STALE_BEHIND=$(printf '%s' "$STALE_COUNTS" | awk '{print $1}')
+    STALE_AHEAD=$(printf '%s' "$STALE_COUNTS" | awk '{print $2}')
+    if [ "$STALE_VERDICT" = "UNVERIFIABLE" ]; then
+      STALE_MSG="could not resolve $STALE_REF in $RUNTIME_DIR — freshness UNVERIFIABLE (failing closed to avoid a false story:done)"
+    else
+      STALE_MSG="live runtime $RUNTIME_DIR is STALE — HEAD ($STALE_HEAD_SHA) is behind=$STALE_BEHIND / ahead=$STALE_AHEAD vs $STALE_REF ($STALE_REMOTE_SHA); the merged fix did NOT reach the in-place engines"
+    fi
+    err "Staleness gate HALT (ga-rhtu): $STALE_MSG"
+    if [ "$DRY_RUN" != "1" ]; then
+      bd -C "$GC_CITY" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+      bd -C "$GC_CITY" label add    "$STORY_ID" "delivery:failed"  -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$STORY_ID" "Delivery HALTED (ga-rhtu post-deploy staleness gate): $STALE_MSG. story:done WITHHELD — the live framework engines would otherwise be marked done while running outdated code. NON-TERMINAL: the town-root reconciler brings $RUNTIME_DIR current with $STALE_REF, after which delivery is re-picked automatically. If HEAD carries local-ahead commits on the in-place town root, move them to an isolated worktree (ref: 'Shipping framework stories via gate') so the tree stays fast-forwardable." 2>/dev/null || true
+      AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
+      if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
+        gc --city "$GC_CITY" session nudge "$AUTHOR" \
+          "DELIVERY HALTED for story $STORY_ID: $STALE_MSG. story:done withheld; re-picked once the town root is reconciled to $STALE_REF." \
+          --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
+      fi
+      gc --city "$GC_CITY" session nudge mayor \
+        "DELIVERY HALTED ($STORY_ID, rig $RIG): $STALE_MSG. story:done withheld (ga-rhtu staleness gate). Reconcile $RUNTIME_DIR to $STALE_REF; delivery retries next cycle." \
+        2>/dev/null || true
+    fi
+    # Non-terminal (re-picked every cycle until the tree is reconciled — retries,
+    # not a definitive rejection) → SUPPRESS the Athos push (wa-uthi convention).
+    warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID — $STALE_MSG."
+    exit 1
+  fi
+fi
+
 # ── Step 5: Daemon restarts ────────────────────────────────────────────────────
 DAEMON_LIST=$(get_runbook_field "$RIG" "daemon_restarts" 2>/dev/null || echo "")
 if [ -n "$DAEMON_LIST" ]; then
