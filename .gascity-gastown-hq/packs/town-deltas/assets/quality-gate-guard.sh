@@ -212,6 +212,138 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
   done
 fi
 
+# ── Step 0c.1 (ga-pa36 GAP-1): merged-but-OPEN beads ────────────────────────
+# OPEN beads with story:in-flight and no gate:passed whose branch was already
+# merged to origin/main outside the full gate flow. The existing condition above
+# (closed OR gate:passed) misses these because they are OPEN with no gate:passed.
+# Examples: self-referential merges, out-of-band merges that skipped the gate.
+# Safe-default: if branch SHA cannot be positively resolved → do NOT act.
+
+if [ "$INFLIGHT_COUNT" -gt 0 ]; then
+  # Exclude pilot:dispatched beads — those are handled by GAP-2 below.
+  OPEN_INFLIGHT_IDS=$(echo "$INFLIGHT_JSON" | jq -r '
+    .[] |
+    select(
+      .status != "closed" and
+      ((.labels // []) | contains(["gate:passed"]) | not) and
+      ((.labels // []) | contains(["pilot:dispatched"]) | not)
+    ) | .id' 2>/dev/null || echo "")
+
+  if [ -n "$OPEN_INFLIGHT_IDS" ]; then
+    git -C "$GC_CITY" fetch origin main --quiet 2>/dev/null || true
+    MAIN_SHA=$(git -C "$GC_CITY" rev-parse "origin/main" 2>/dev/null || echo "")
+
+    if [ -n "$MAIN_SHA" ]; then
+      for OI_ID in $OPEN_INFLIGHT_IDS; do
+        [ -z "$OI_ID" ] && continue
+
+        # SAFETY: skip if a live builder session is actively assigned (protects in-progress rework).
+        OI_ASSIGNEE=$(echo "$INFLIGHT_JSON" | jq -r --arg id "$OI_ID" \
+          '.[] | select(.id == $id) | .assignee // ""' 2>/dev/null || echo "")
+        if [ -n "$OI_ASSIGNEE" ] && [ "$OI_ASSIGNEE" != "null" ]; then
+          SESSION_ALIVE=$(gc --city "$GC_CITY" session list --json 2>/dev/null \
+            | jq -e --arg a "$OI_ASSIGNEE" 'any(.[]; .id == $a or .name == $a)' \
+            >/dev/null 2>&1 && echo "1" || echo "0")
+          if [ "$SESSION_ALIVE" = "1" ]; then
+            log "GAP-1: $OI_ID has live assignee $OI_ASSIGNEE — safe-skip"
+            continue
+          fi
+        fi
+
+        # Resolve branch SHA: try remote branch matching fix/<id>-* convention,
+        # then local remote-tracking cache (in case remote branch was already pruned).
+        BRANCH_SHA=$(git -C "$GC_CITY" ls-remote origin "refs/heads/fix/${OI_ID}-*" \
+          2>/dev/null | head -1 | awk '{print $1}')
+        if [ -z "$BRANCH_SHA" ]; then
+          BRANCH_SHA=$(git -C "$GC_CITY" for-each-ref \
+            --format='%(objectname)' "refs/remotes/origin/fix/${OI_ID}-*" \
+            2>/dev/null | head -1)
+        fi
+
+        if [ -z "$BRANCH_SHA" ]; then
+          log "GAP-1: $OI_ID — branch SHA not found (convention fix/$OI_ID-*), safe-skip"
+          continue
+        fi
+
+        if git -C "$GC_CITY" merge-base --is-ancestor "$BRANCH_SHA" "$MAIN_SHA" 2>/dev/null; then
+          warn "GAP-1: $OI_ID branch already merged to origin/main (tip=$BRANCH_SHA) — stripping orphaned story:in-flight"
+          bd -C "$GC_CITY" label remove "$OI_ID" "story:in-flight" -q 2>/dev/null || true
+          bd -C "$GC_CITY" comment "$OI_ID" "ga-pa36 GAP-1 reconciler: stripped orphaned story:in-flight (branch already merged to origin/main, no gate:passed, no live builder session). Lane slot freed." 2>/dev/null || true
+        else
+          log "GAP-1: $OI_ID branch tip $BRANCH_SHA not yet merged to main — skip"
+        fi
+      done
+    else
+      log "GAP-1: origin/main SHA unreachable — safe-skip entire sub-step"
+    fi
+  fi
+fi
+
+# ── Step 0c.2 (ga-pa36 GAP-2): parent-story stranding ────────────────────────
+# When the gate runs on a SLING/WORK bead instead of the parent story, the FAIL
+# self-heal strips story:in-flight from the WORK bead but the PARENT STORY
+# retains story:in-flight + pilot:dispatched with no builder — the Pilot's
+# feature-exclusion hides it, so it is never re-dispatched.
+#
+# Detect via "Sling task bead: $ID" comment the Pilot writes at dispatch.
+# Only act if the sling bead is closed (terminal) and no live session owns the parent.
+# Safe-default: if sling bead ID cannot be read from comments or status is
+# ambiguous → do NOT act.
+
+if [ "$INFLIGHT_COUNT" -gt 0 ]; then
+  STRANDED_CANDIDATES=$(echo "$INFLIGHT_JSON" | jq -r '
+    .[] |
+    select(
+      .status != "closed" and
+      ((.labels // []) | contains(["gate:passed"]) | not) and
+      ((.labels // []) | contains(["pilot:dispatched"]))
+    ) | .id' 2>/dev/null || echo "")
+
+  for SC_ID in $STRANDED_CANDIDATES; do
+    [ -z "$SC_ID" ] && continue
+
+    # SAFETY: skip if a live builder session is assigned to the parent story itself.
+    SC_ASSIGNEE=$(echo "$INFLIGHT_JSON" | jq -r --arg id "$SC_ID" \
+      '.[] | select(.id == $id) | .assignee // ""' 2>/dev/null || echo "")
+    if [ -n "$SC_ASSIGNEE" ] && [ "$SC_ASSIGNEE" != "null" ]; then
+      SESSION_ALIVE=$(gc --city "$GC_CITY" session list --json 2>/dev/null \
+        | jq -e --arg a "$SC_ASSIGNEE" 'any(.[]; .id == $a or .name == $a)' \
+        >/dev/null 2>&1 && echo "1" || echo "0")
+      if [ "$SESSION_ALIVE" = "1" ]; then
+        log "GAP-2: $SC_ID has live assignee $SC_ASSIGNEE — safe-skip"
+        continue
+      fi
+    fi
+
+    # Fetch comments to find "Sling task bead: $SLING_ID" (written by pilot-dispatcher).
+    SC_COMMENTS=$(bd -C "$GC_CITY" show "$SC_ID" --json --include-comments 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | .comments // [] | .[].text' \
+      2>/dev/null || echo "")
+    SLING_ID=$(printf '%s' "$SC_COMMENTS" | grep -o "Sling task bead: [a-z][a-z0-9-]*" \
+      | tail -1 | awk '{print $NF}')
+
+    if [ -z "$SLING_ID" ]; then
+      log "GAP-2: $SC_ID — no 'Sling task bead' comment found, safe-skip"
+      continue
+    fi
+
+    SLING_STATUS=$(bd -C "$GC_CITY" show "$SLING_ID" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null || echo "")
+
+    if [ "$SLING_STATUS" = "closed" ]; then
+      warn "GAP-2: $SC_ID parent stranded (sling bead $SLING_ID closed, no live builder) — freeing lane"
+      bd -C "$GC_CITY" label remove "$SC_ID" "story:in-flight"  -q 2>/dev/null || true
+      bd -C "$GC_CITY" label remove "$SC_ID" "pilot:dispatched" -q 2>/dev/null || true
+      bd -C "$GC_CITY" label add    "$SC_ID" "gate:needs-fix"   -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: parent story was stranded after sling work-bead $SLING_ID closed (gate FAIL self-heal acted on work-bead only, not parent). Stripped story:in-flight + pilot:dispatched; labeled gate:needs-fix so Pilot will re-dispatch. See $SLING_ID for gate feedback." 2>/dev/null || true
+    elif [ -z "$SLING_STATUS" ]; then
+      log "GAP-2: $SC_ID sling bead $SLING_ID status unknown — safe-skip"
+    else
+      log "GAP-2: $SC_ID sling bead $SLING_ID is $SLING_STATUS (not terminal) — skip"
+    fi
+  done
+fi
+
 # ── Step 1: Find unclaimed ready-for-gate markers ─────────────────────────────
 
 MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all \
