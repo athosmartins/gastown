@@ -1114,10 +1114,95 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
       bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate PASSED. Branch $BRANCH merged to $DEFAULT_BRANCH. SHA=$MERGE_SHA. Tier=$TIER. Reviewers=$REQUIRED_REVIEWERS. Elapsed=${ELAPSED_S}s. mode=${MERGE_RESULT}." 2>/dev/null || true
     fi
 
-    # Transition source bead toward done (close if appropriate)
+    # ── ga-esbg: DRIVE THE SOURCE BEAD TO ITS TERMINAL/HANDOFF STATE ──────────
+    # A gate PASS+merge MUST NOT leave the source bead in_progress with the live
+    # builder still assigned. The legacy PASS path only added gate:passed + a
+    # comment, so the bead stayed in_progress with a live assignee: the pool
+    # crash-recovery selector (bd list --status in_progress --assignee <builder>)
+    # kept RE-SPAWNING the worker, and the Pilot's Tier-1 selectors kept
+    # re-picking open bugs/tech-debt — a wasteful re-spawn loop (wa-krzm).
+    # Mirror the already-merged short-circuit: drive the bead all the way to its
+    # terminal state — CLOSE bugs/tasks; HAND OFF stories to delivery.
     if [ -n "$BEAD_ID" ] && [ "$DRY_RUN" != "1" ]; then
+      # gate:passed is BOTH the success label AND story-delivery's pickup signal
+      # (story-delivery selects story:approved + gate:passed, excluding story:done).
       bd -C "$GC_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
       bd -C "$GC_CITY" comment "$BEAD_ID" "Quality gate PASSED. Branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) via autonomous dispatcher (gate_run=$GATE_RUN_ID)." 2>/dev/null || true
+
+      # Read the source bead state authoritatively (labels + live assignee).
+      SRC_JSON=$(bd -C "$GC_CITY" show "$BEAD_ID" --json 2>/dev/null \
+        | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
+      SRC_LABELS=$(printf '%s' "$SRC_JSON" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
+      BUILDER_ASSIGNEE=$(printf '%s' "$SRC_JSON" | jq -r '.assignee // ""' 2>/dev/null || echo "")
+      IS_STORY=0
+      if printf '%s' "$SRC_LABELS" | grep -q "story:approved"; then IS_STORY=1; fi
+
+      # (1) Clear the live builder assignee on EVERY source bead. This is what
+      #     removes it from the pool in_progress crash-recovery selector
+      #     (--assignee <builder>) and from the Pilot's assigned-bead exclusion,
+      #     breaking the re-spawn loop even if the close/handoff below fails.
+      if [ -n "$BUILDER_ASSIGNEE" ]; then
+        bd -C "$GC_CITY" assign "$BEAD_ID" "" 2>/dev/null \
+          || warn "Could not clear builder assignee on source bead $BEAD_ID"
+      fi
+
+      # (2) Terminal vs handoff, decided by the canonical story marker
+      #     (label story:approved — the type field is null for stories in bd;
+      #     see story-delivery.sh / pilot-dispatcher.sh).
+      if [ "$IS_STORY" = "1" ]; then
+        # STORY → hand off to story-delivery (deploy + prod-test → story:done).
+        # Leave it OPEN: delivery needs an open story:approved + gate:passed bead.
+        # Pool re-spawn is already closed (assignee cleared above); the Pilot's
+        # re-pick is excluded by story:in-flight. Do NOT close here.
+        log "Source story $BEAD_ID handed off to delivery (gate:passed set; builder assignee cleared)."
+        bd -C "$GC_CITY" comment "$BEAD_ID" "Gate PASS handoff (ga-esbg): builder assignee cleared; story:approved + gate:passed in place. story-delivery will deploy + prod-test, then mark story:done." 2>/dev/null || true
+      else
+        # BUG/TASK → close it. bd list defaults to OPEN-only, so closing removes
+        # the bead from EVERY open-work selector (Pilot Tier-1 bug & tech-debt),
+        # and — combined with the assignee clear — from the pool crash-recovery
+        # query. Closing is the durable fix for non-story source beads.
+        log "Closing source bug/task $BEAD_ID (gate PASS + merged sha=$MERGE_SHA)."
+        bd -C "$GC_CITY" close "$BEAD_ID" \
+          -r "Quality gate PASSED — branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA, gate_run=$GATE_RUN_ID). Closed by autonomous dispatcher (ga-esbg)." \
+          2>/dev/null || warn "Could not close source bead $BEAD_ID"
+      fi
+
+      # (3) POST-MERGE VERIFICATION (ga-esbg): assert the source bead no longer
+      #     appears in any re-spawn / re-pick selector the dispatcher knows about.
+      #     If it does, a live loop vector remains — comment + escalate (never
+      #     silently leave it).
+      RESPAWN_HITS=""
+      _still_listed() {  # 0 (true) iff $BEAD_ID is present in `bd list --json <args>`
+        bd -C "$GC_CITY" list --json "$@" 2>/dev/null \
+          | jq -e --arg id "$BEAD_ID" 'any(.[]?; .id == $id)' >/dev/null 2>&1
+      }
+      # a) Pool in_progress crash-recovery (applies to ALL beads — the core loop).
+      if [ -n "$BUILDER_ASSIGNEE" ]; then
+        if _still_listed --status in_progress --assignee "$BUILDER_ASSIGNEE"; then
+          RESPAWN_HITS="$RESPAWN_HITS pool:in_progress+assignee=$BUILDER_ASSIGNEE"
+        fi
+      fi
+      # b/c) Pilot Tier-1 open-bug / open-tech-debt re-pick. Stories are EXEMPT:
+      #      they are intentionally left OPEN for delivery and may legitimately
+      #      carry a tech-debt label; their pool re-spawn is closed by the
+      #      assignee clear and their Pilot re-pick by story:in-flight.
+      if [ "$IS_STORY" != "1" ]; then
+        if _still_listed -t bug;        then RESPAWN_HITS="$RESPAWN_HITS pilot:open-bug"; fi
+        if _still_listed -l tech-debt;  then RESPAWN_HITS="$RESPAWN_HITS pilot:open-tech-debt"; fi
+      fi
+
+      if [ -n "$RESPAWN_HITS" ]; then
+        warn "POST-MERGE re-spawn vector STILL PRESENT for $BEAD_ID:$RESPAWN_HITS"
+        bd -C "$GC_CITY" comment "$BEAD_ID" "WARNING (ga-esbg post-merge verify): source bead still appears in open-work selector(s) after gate PASS+merge:$RESPAWN_HITS. This is a re-spawn/re-pick vector — the terminal/handoff transition did not fully take." 2>/dev/null || true
+        gc --city "$GC_CITY" mail send mayor \
+          -s "Gate post-merge: $BEAD_ID still re-pickable after PASS+merge" \
+          -m "$(printf 'Source bead %s PASSED the quality gate and merged (branch %s, sha %s, gate_run %s) but still appears in open-work selector(s):%s\n\nThis leaves a re-spawn / re-pick vector (ga-esbg). The dispatcher could not drive it to terminal/handoff state — investigate (close failed? assignee clear failed? unexpected labels?).' \
+            "$BEAD_ID" "$BRANCH" "$MERGE_SHA" "$GATE_RUN_ID" "$RESPAWN_HITS")" \
+          2>/dev/null || warn "Could not mail Mayor post-merge re-spawn escalation for $BEAD_ID"
+        notify -t "Gate post-merge vector" -p 3 "$BEAD_ID still re-pickable after PASS+merge:$RESPAWN_HITS" 2>/dev/null || true
+      else
+        log "Post-merge verify OK (ga-esbg): $BEAD_ID absent from all re-spawn/re-pick selectors."
+      fi
     fi
 
     # wa-uthi: TERMINAL SUCCESS (merged to prod) — this push is KEPT.
