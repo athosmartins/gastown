@@ -67,25 +67,42 @@ fi
 
 echo "City DB path: $GC_CITY_PATH"
 
-# Get bead from current session hook (in_progress assignment) using city DB.
-# Try all session identifiers in order — beads may be assigned using the full
-# session name (GC_SESSION_NAME), session ID, BEADS_ACTOR, or alias.
-BEAD_ID=""
-for _BEAD_ASSIGNEE in "${GC_SESSION_NAME:-}" "${GC_SESSION_ID:-}" "${BEADS_ACTOR:-}" "${GC_ALIAS:-}"; do
-  [ -z "$_BEAD_ASSIGNEE" ] && continue
-  _BEAD_RESULT=$(bd -C "$GC_CITY_PATH" list \
-    --assignee="$_BEAD_ASSIGNEE" --status=in_progress --json 2>/dev/null \
-    | jq -r '.[0].id // empty' 2>/dev/null || echo "")
-  if [ -n "$_BEAD_RESULT" ]; then
-    BEAD_ID="$_BEAD_RESULT"
-    break
-  fi
-done
+# ga-dx5: PRIMARY resolution — extract bead_id from branch name convention.
+# Branch name is the canonical pointer to the owning STORY bead. Session-assigned
+# in_progress beads may include sling/task beads from the gate-dispatcher that are
+# NOT the story bead. If we pick the sling bead, the dispatcher strips story:in-flight
+# from the wrong bead → lane slot never frees. Branch name is always authoritative.
+# Pattern: <prefix>/<STORY_ID>-<desc> (e.g. fix/ga-dx5-my-fix → ga-dx5)
+BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \
+  | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
 
-# Fallback: extract bead ID from branch name (e.g. fix/ga-dx5-some-desc → ga-dx5)
+# SECONDARY: if branch doesn't embed a bead ID (uncommon), fall back to the
+# session's in_progress bead that carries story:in-flight — that label is ONLY on
+# story/bug beads, not on sling/task beads from the gate-dispatcher.
 if [ -z "$BEAD_ID" ]; then
-  BEAD_ID=$(echo "$BRANCH" | tr '/' '\n' \
-    | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,8}$' | head -1 || echo "")
+  for _BEAD_ASSIGNEE in "${GC_SESSION_NAME:-}" "${GC_SESSION_ID:-}" "${BEADS_ACTOR:-}" "${GC_ALIAS:-}"; do
+    [ -z "$_BEAD_ASSIGNEE" ] && continue
+    _BEAD_RESULT=$(bd -C "$GC_CITY_PATH" list \
+      --assignee="$_BEAD_ASSIGNEE" --status=in_progress \
+      --label story:in-flight --json 2>/dev/null \
+      | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+    if [ -n "$_BEAD_RESULT" ]; then
+      BEAD_ID="$_BEAD_RESULT"
+      break
+    fi
+  done
+fi
+
+# FAIL CLOSED: a marker with bead_id=unknown causes gate-status:error (the guard
+# rejects delivery). If we cannot positively identify the story bead, it is safer
+# to abort than to create a marker the gate will reject — the builder can fix the
+# branch name or bead assignment and re-run.
+if [ -z "$BEAD_ID" ]; then
+  echo "ERROR: Cannot resolve owning story bead from branch '$BRANCH' or session assignments."
+  echo "  Expected branch convention: <prefix>/<bead-id>-<desc> (e.g. fix/ga-dx5-my-fix)"
+  echo "  Or ensure you have an in_progress bead with label 'story:in-flight' assigned to you."
+  echo "  Marker NOT created. Fix the branch name or bead assignment and re-run /gate-done."
+  exit 1
 fi
 AUTHOR="${GC_ALIAS:-${BEADS_ACTOR:-$(git config user.name)}}"
 BASE_COMMIT=$(git rev-parse origin/main 2>/dev/null || echo "unknown")
@@ -123,9 +140,11 @@ echo "Rig:         $RIG"
 ```
 
 Verify these values look correct before continuing.
-If `Bead` shows `<unknown>`, check that you have an in-progress bead assigned
-to you. If `Rig` shows `unknown`, the guard may not be able to find the source
-repository — verify you are running from inside a registered rig directory.
+If this step aborts with "Cannot resolve owning story bead", name your branch
+`<prefix>/<bead-id>-<desc>` (e.g. `fix/ga-dx5-my-fix`) or ensure you have an
+in_progress bead with label `story:in-flight` assigned to you. If `Rig` shows
+`unknown`, the guard may not be able to find the source repository — verify you
+are running from inside a registered rig directory.
 
 ## Step 3: Create the ready-for-gate marker
 
@@ -139,9 +158,9 @@ MARKER_ID=$(bd -C "$GC_CITY_PATH" create \
   -l type:quality-gate-marker \
   -l gate-status:ready \
   -l "branch:$BRANCH" \
-  -l "source-bead:${BEAD_ID:-unknown}" \
+  -l "source-bead:$BEAD_ID" \
   -d "branch: $BRANCH
-bead_id: ${BEAD_ID:-unknown}
+bead_id: $BEAD_ID
 author: $AUTHOR
 base_commit: $BASE_COMMIT
 rig: $RIG
@@ -164,7 +183,7 @@ echo "Marker created: $MARKER_ID"
 echo ""
 echo "Ready for quality gate."
 echo "  Branch:  $BRANCH"
-echo "  Bead:    ${BEAD_ID:-<unknown>}"
+echo "  Bead:    $BEAD_ID"
 echo "  Marker:  $MARKER_ID"
 echo "  City DB: $GC_CITY_PATH"
 echo ""
@@ -184,8 +203,11 @@ echo "You are done. The gate-runner handles the rest."
 
 **"working tree not clean"**: Commit or stash your changes first.
 
-**"Bead unknown"**: You may not have an in_progress bead. The gate will still
-run but author-exclusion fallback to `$GC_ALIAS`.
+**"Cannot resolve owning story bead"**: Name your branch `<prefix>/<bead-id>-<desc>`
+(e.g. `fix/ga-dx5-my-fix`) so /gate-done can extract the story bead from the branch
+name. Alternatively, ensure you have an in_progress bead with label `story:in-flight`
+assigned to your session. /gate-done aborts rather than writing a marker with
+`bead_id=unknown` (which the guard would reject with `gate-status:error`).
 
 **Long wait (>5 min)**: Check guard is running:
 ```bash
