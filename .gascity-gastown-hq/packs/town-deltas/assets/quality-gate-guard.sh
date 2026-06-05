@@ -86,6 +86,39 @@ reconcile_gaterun_action() {
   echo "abort:age"
 }
 
+# classify_inflight_gap1 <status> <has_gate_passed> <has_live_assignee> <branch_merged>
+# Pure decision for ga-pa36 GAP-1: OPEN story:in-flight bead whose fix branch
+# was already merged to origin/main but has no gate:passed label.
+# branch_merged: 1=merged, 0=not-merged, anything-else=indeterminate (safe-skip).
+# Returns: strip:merged | skip:already-handled | skip:live-builder | skip:not-merged | skip:indeterminate
+classify_inflight_gap1() {
+  local status="$1" has_gate_passed="$2" has_live_assignee="$3" branch_merged="$4"
+  [ "$status" = "closed" ]       && { echo "skip:already-handled"; return; }
+  [ "$has_gate_passed" = "1" ]   && { echo "skip:already-handled"; return; }
+  [ "$has_live_assignee" = "1" ] && { echo "skip:live-builder"; return; }
+  case "$branch_merged" in
+    1) echo "strip:merged" ;;
+    0) echo "skip:not-merged" ;;
+    *) echo "skip:indeterminate" ;;
+  esac
+}
+
+# classify_parent_gap2 <has_pilot_dispatched> <has_live_assignee> <sling_found> <sling_needs_fix> <sling_closed>
+# Pure decision for ga-pa36 GAP-2: parent story/bug retains story:in-flight after
+# the gate ran on a sling/work bead (Pilot-dispatched path) and that bead is terminal.
+# sling_needs_fix: 1 if sling bead has gate:needs-fix or gate:needs-human (gate FAILED).
+# sling_closed:    1 if sling bead is closed (gate PASSED, work done).
+# Returns: free:fail-stranded | free:pass-stranded | skip:not-dispatched | skip:live-assignee | skip:no-sling | skip:active-sling
+classify_parent_gap2() {
+  local has_pilot_dispatched="$1" has_live_assignee="$2" sling_found="$3" sling_needs_fix="$4" sling_closed="$5"
+  [ "$has_pilot_dispatched" != "1" ] && { echo "skip:not-dispatched"; return; }
+  [ "$has_live_assignee" = "1" ]     && { echo "skip:live-assignee"; return; }
+  [ "$sling_found" != "1" ]          && { echo "skip:no-sling"; return; }
+  [ "$sling_needs_fix" = "1" ]       && { echo "free:fail-stranded"; return; }
+  [ "$sling_closed" = "1" ]          && { echo "free:pass-stranded"; return; }
+  echo "skip:active-sling"
+}
+
 # ── Lib-only mode: source with GATE_GUARD_LIB_ONLY=1 to load pure functions ──
 # without running the live guard sweep. Used by tests and by the dispatcher.
 if [ -n "${GATE_GUARD_LIB_ONLY:-}" ]; then
@@ -321,6 +354,221 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
     warn "Stripping orphaned story:in-flight from $ORP_ID (ga-3h8l reconciler: closed or gate:passed)"
     bd -C "$GC_CITY" label remove "$ORP_ID" "story:in-flight" -q 2>/dev/null || true
     bd -C "$GC_CITY" comment "$ORP_ID" "ga-3h8l reconciler: stripped orphaned story:in-flight (bead is closed or carries gate:passed — lane slot was permanently leaked). Self-healed." 2>/dev/null || true
+  done
+fi
+
+# ── Step 0c.1 (ga-pa36 GAP-1): merged-but-OPEN beads ────────────────────────
+# OPEN story:in-flight beads with no gate:passed whose fix branch was already
+# merged to origin/main (merged via old gate before ga-3h8l strip code, or
+# merged out-of-band). The existing Step-0c misses them because they are OPEN
+# with no gate:passed.
+# Safe-default: if branch SHA cannot be positively resolved → do NOT act.
+# Pilot:dispatched beads are excluded — they are handled by GAP-2 below.
+
+log "Step 0c.1 (ga-pa36 GAP-1): sweep merged-but-OPEN story:in-flight beads..."
+
+if [ "$INFLIGHT_COUNT" -gt 0 ]; then
+  GAP1_IDS=$(echo "$INFLIGHT_JSON" | jq -r '
+    .[] |
+    select(
+      .status != "closed" and
+      ((.labels // []) | contains(["gate:passed"]) | not) and
+      ((.labels // []) | contains(["pilot:dispatched"]) | not)
+    ) | .id' 2>/dev/null || echo "")
+
+  if [ -n "$GAP1_IDS" ]; then
+    G1_MAIN_SHA=""
+    git -C "$GC_CITY" fetch origin main --quiet 2>/dev/null || true
+    G1_MAIN_SHA=$(git -C "$GC_CITY" rev-parse "origin/main" 2>/dev/null || echo "")
+
+    for OI_ID in $GAP1_IDS; do
+      [ -z "$OI_ID" ] && continue
+
+      # Check assignee via bd show (bd list --json does not include assignee).
+      OI_SHOW=$(bd -C "$GC_CITY" show "$OI_ID" --json 2>/dev/null \
+        | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
+      OI_ASSIGNEE=$(echo "$OI_SHOW" | jq -r '.assignee // ""' 2>/dev/null || echo "")
+
+      HAS_LIVE_ASSIGNEE=0
+      if [ -n "$OI_ASSIGNEE" ] && [ "$OI_ASSIGNEE" != "null" ]; then
+        SESSION_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "{}")
+        SESSION_MATCH=$(echo "$SESSION_JSON" | jq -r --arg a "$OI_ASSIGNEE" '
+          .sessions // [] |
+          if any(.; .id == $a or .name == $a or
+            (.id != null and .id != "" and ($a | contains(.id))) or
+            (.name != null and .name != "" and ($a | contains(.name))))
+          then "alive" else "dead" end
+        ' 2>/dev/null || echo "uncertain")
+        [ "$SESSION_MATCH" != "dead" ] && HAS_LIVE_ASSIGNEE=1
+      fi
+
+      ACTION=$(classify_inflight_gap1 "open" "0" "$HAS_LIVE_ASSIGNEE" "unknown")
+      if [ "$ACTION" = "skip:live-builder" ]; then
+        log "GAP-1: $OI_ID has live assignee ($OI_ASSIGNEE) — safe-skip"
+        continue
+      fi
+
+      if [ -z "$G1_MAIN_SHA" ]; then
+        log "GAP-1: origin/main SHA unreachable — safe-skip all GAP-1 candidates"
+        break
+      fi
+
+      # Find branch tip by convention: fix/<id>* or feature/<id>*
+      # Prefer ls-remote (live) with for-each-ref as local cache fallback.
+      OI_BRANCH_SHA=""
+      for PAT in "refs/heads/fix/${OI_ID}" "refs/heads/fix/${OI_ID}-*" \
+                 "refs/heads/feature/${OI_ID}" "refs/heads/feature/${OI_ID}-*"; do
+        SHA=$(git -C "$GC_CITY" ls-remote origin "$PAT" 2>/dev/null | head -1 | awk '{print $1}')
+        if [ -z "$SHA" ]; then
+          RREF="${PAT/refs\/heads\//refs\/remotes\/origin\/}"
+          SHA=$(git -C "$GC_CITY" for-each-ref --format='%(objectname)' "$RREF" 2>/dev/null | head -1)
+        fi
+        [ -n "$SHA" ] && { OI_BRANCH_SHA="$SHA"; break; }
+      done
+
+      if [ -z "$OI_BRANCH_SHA" ]; then
+        log "GAP-1: $OI_ID — no branch matching fix/$OI_ID* or feature/$OI_ID* — safe-skip"
+        continue
+      fi
+
+      BRANCH_MERGED=0
+      git -C "$GC_CITY" merge-base --is-ancestor "$OI_BRANCH_SHA" "$G1_MAIN_SHA" \
+        2>/dev/null && BRANCH_MERGED=1 || true
+
+      ACTION=$(classify_inflight_gap1 "open" "0" "$HAS_LIVE_ASSIGNEE" "$BRANCH_MERGED")
+      case "$ACTION" in
+        strip:merged)
+          warn "GAP-1: $OI_ID branch tip $OI_BRANCH_SHA merged to origin/main, no gate:passed, no live builder — stripping story:in-flight"
+          bd -C "$GC_CITY" label remove "$OI_ID" "story:in-flight" -q 2>/dev/null || true
+          bd -C "$GC_CITY" comment "$OI_ID" "ga-pa36 GAP-1 reconciler: stripped orphaned story:in-flight — branch tip $OI_BRANCH_SHA already merged to origin/main, no gate:passed label, no live builder. Lane slot freed." 2>/dev/null || true
+          ;;
+        skip:not-merged)
+          log "GAP-1: $OI_ID branch tip $OI_BRANCH_SHA not yet merged — skip"
+          ;;
+        *)
+          log "GAP-1: $OI_ID action=$ACTION — skip"
+          ;;
+      esac
+    done
+  fi
+fi
+
+# ── Step 0c.2 (ga-pa36 GAP-2): parent-story stranding ────────────────────────
+# When the gate runs on a SLING/WORK bead (Pilot-dispatched path), the FAIL
+# self-heal strips story:in-flight from the WORK bead but the PARENT retains
+# story:in-flight + pilot:dispatched with no builder — the Pilot's exclusion
+# hides it forever. Detect via "Sling task bead: $ID" comment the Pilot writes.
+# Safe-default: if sling bead ID is absent from comments or state is ambiguous
+# → do NOT act.
+
+log "Step 0c.2 (ga-pa36 GAP-2): sweep stranded parent stories..."
+
+if [ "$INFLIGHT_COUNT" -gt 0 ]; then
+  GAP2_IDS=$(echo "$INFLIGHT_JSON" | jq -r '
+    .[] |
+    select(
+      .status != "closed" and
+      ((.labels // []) | contains(["gate:passed"]) | not) and
+      ((.labels // []) | contains(["pilot:dispatched"]))
+    ) | .id' 2>/dev/null || echo "")
+
+  for SC_ID in $GAP2_IDS; do
+    [ -z "$SC_ID" ] && continue
+
+    # Check parent's own assignee (Pilot does not assign story to builder, but be safe).
+    SC_SHOW=$(bd -C "$GC_CITY" show "$SC_ID" --json --include-comments 2>/dev/null \
+      | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
+    SC_ASSIGNEE=$(echo "$SC_SHOW" | jq -r '.assignee // ""' 2>/dev/null || echo "")
+
+    HAS_SC_ASSIGNEE=0
+    if [ -n "$SC_ASSIGNEE" ] && [ "$SC_ASSIGNEE" != "null" ]; then
+      SC_SESSION_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "{}")
+      SC_SESSION_MATCH=$(echo "$SC_SESSION_JSON" | jq -r --arg a "$SC_ASSIGNEE" '
+        .sessions // [] |
+        if any(.; .id == $a or .name == $a or
+          (.id != null and .id != "" and ($a | contains(.id))) or
+          (.name != null and .name != "" and ($a | contains(.name))))
+        then "alive" else "dead" end
+      ' 2>/dev/null || echo "uncertain")
+      [ "$SC_SESSION_MATCH" != "dead" ] && HAS_SC_ASSIGNEE=1
+    fi
+
+    # Find sling bead ID from Pilot dispatch comment.
+    SLING_ID=$(echo "$SC_SHOW" | jq -r '
+      .comments // [] | sort_by(.created_at) | reverse |
+      .[] | .text // "" | select(test("Sling task bead:")) |
+      capture("Sling task bead: (?P<id>[a-z][a-z0-9-]+)") | .id
+    ' 2>/dev/null | head -1 || echo "")
+
+    SLING_FOUND=0
+    SLING_NEEDS_FIX=0
+    SLING_CLOSED=0
+
+    if [ -n "$SLING_ID" ] && [ "$SLING_ID" != "null" ]; then
+      SLING_FOUND=1
+      SLING_JSON=$(bd -C "$GC_CITY" show "$SLING_ID" --json 2>/dev/null \
+        | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
+      SLING_STATUS=$(echo "$SLING_JSON" | jq -r '.status // ""' 2>/dev/null || echo "")
+      SLING_LABELS=$(echo "$SLING_JSON" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
+
+      [ "$SLING_STATUS" = "closed" ] && SLING_CLOSED=1
+      echo "$SLING_LABELS" | grep -qE "gate:needs-fix|gate:needs-human" && SLING_NEEDS_FIX=1 || true
+    fi
+
+    ACTION=$(classify_parent_gap2 "1" "$HAS_SC_ASSIGNEE" "$SLING_FOUND" "$SLING_NEEDS_FIX" "$SLING_CLOSED")
+
+    case "$ACTION" in
+      free:fail-stranded)
+        warn "GAP-2: $SC_ID stranded (sling $SLING_ID gate-failed) — freeing lane, applying gate:needs-fix"
+
+        # Propagate GATE-FEEDBACK from sling bead to parent.
+        GATE_FEEDBACK=$(bd -C "$GC_CITY" show "$SLING_ID" --json --include-comments 2>/dev/null \
+          | jq -r 'if type=="array" then .[0] else . end |
+            .comments // [] | map(select(.text | test("^GATE-FEEDBACK"))) | last | .text // ""' \
+          2>/dev/null || echo "")
+
+        bd -C "$GC_CITY" label remove "$SC_ID" "story:in-flight"  -q 2>/dev/null || true
+        bd -C "$GC_CITY" label remove "$SC_ID" "pilot:dispatched" -q 2>/dev/null || true
+        bd -C "$GC_CITY" label add    "$SC_ID" "gate:needs-fix"   -q 2>/dev/null || true
+
+        if [ -n "$GATE_FEEDBACK" ]; then
+          bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: parent stranded after sling bead $SLING_ID gate-failed. story:in-flight + pilot:dispatched cleared; gate:needs-fix set so Pilot re-dispatches.
+Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
+        else
+          bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: parent stranded after sling bead $SLING_ID gate-failed (labels: $SLING_LABELS). story:in-flight + pilot:dispatched cleared; gate:needs-fix set. Pilot will re-dispatch." 2>/dev/null || true
+        fi
+        ;;
+      free:pass-stranded)
+        warn "GAP-2: $SC_ID stranded (sling $SLING_ID closed/passed) — freeing lane"
+        SC_LABELS=$(echo "$SC_SHOW" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
+
+        bd -C "$GC_CITY" label remove "$SC_ID" "story:in-flight"  -q 2>/dev/null || true
+        bd -C "$GC_CITY" label remove "$SC_ID" "pilot:dispatched" -q 2>/dev/null || true
+
+        if echo "$SC_LABELS" | grep -q "story:approved"; then
+          # Story-type parent: set gate:passed so story-delivery finalizes it.
+          bd -C "$GC_CITY" label add "$SC_ID" "gate:passed" -q 2>/dev/null || true
+          bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: parent stranded after sling bead $SLING_ID gate-passed+closed. story:in-flight + pilot:dispatched cleared; gate:passed set — story-delivery will deploy and mark story:done." 2>/dev/null || true
+        else
+          # Bug/task parent: close it (work was merged via sling bead).
+          bd -C "$GC_CITY" close "$SC_ID" \
+            -r "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed and closed — work is done; closing parent." \
+            2>/dev/null || warn "Could not close parent $SC_ID after pass-stranded detection"
+        fi
+        ;;
+      skip:live-assignee)
+        log "GAP-2: $SC_ID has live assignee ($SC_ASSIGNEE) — safe-skip"
+        ;;
+      skip:no-sling)
+        log "GAP-2: $SC_ID — no 'Sling task bead' comment found — safe-skip"
+        ;;
+      skip:active-sling)
+        log "GAP-2: $SC_ID sling $SLING_ID is active (status=$SLING_STATUS) — skip"
+        ;;
+      skip:not-dispatched)
+        log "GAP-2: $SC_ID not pilot:dispatched — skip (should not reach here)"
+        ;;
+    esac
   done
 fi
 
