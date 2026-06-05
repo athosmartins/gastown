@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.town-root-reconciler</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/town-root-reconciler.sh</string>
+  </array>
+
+  <!-- KeepAlive: restart immediately if the process exits for any reason -->
+  <key>KeepAlive</key><true/>
+
+  <!-- Run immediately when loaded -->
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/town-root-reconciler-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/town-root-reconciler-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>GC</key>
+    <string>gc</string>
+    <key>GIT_CEILING_DIRECTORIES</key>
+    <string>/Users/athos/gt</string>
+  </dict>
+
+  <!-- Throttle: if the job exits too quickly, launchd waits 10s before restart -->
+  <key>ThrottleInterval</key><integer>10</integer>
+</dict>
+</plist>
