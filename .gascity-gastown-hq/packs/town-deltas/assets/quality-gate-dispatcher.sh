@@ -224,7 +224,8 @@ if [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; then
   err "Cannot derive author authoritatively for bead $BEAD_ID — aborting (fail-safe)."
   bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:deferred"    -q 2>/dev/null || true
-  notify -t "Quality Gate Dispatcher" -p 3 "Author unresolvable for $MARKER_ID — deferred" 2>/dev/null || true
+  # wa-uthi: non-terminal (deferred) — no push to Athos. Logged only.
+  log "SUPPRESSED PUSH (wa-uthi non-terminal): author unresolvable for $MARKER_ID — deferred."
   exit 0
 fi
 
@@ -282,7 +283,8 @@ if [ -z "$BRANCH_SHA" ]; then
   err "Branch '$BRANCH' not found on remote origin. Aborting."
   bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
-  notify -t "Quality Gate Dispatcher" -p 3 "Branch $BRANCH not found on remote — gate error" 2>/dev/null || true
+  # wa-uthi: non-terminal (marker error, fixable + resubmittable) — no push. Logged only.
+  log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH not found on remote — gate-status:error."
   exit 1
 fi
 
@@ -327,7 +329,8 @@ if [ "$ALREADY_MERGED" = "1" ]; then
     '{ts: $ts, event: "dispatcher_superseded", branch: $branch, bead: $bead, rig: $rig, marker: $marker, reason: "already_merged"}' \
     >> "$QG_LOG" 2>/dev/null || true
 
-  notify -t "Quality Gate" -p 1 "Branch $BRANCH already merged — gate marker superseded" 2>/dev/null || true
+  # wa-uthi: non-terminal (marker superseded — no new outcome) — no push. Logged only.
+  log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH already merged — gate marker superseded."
   log "=== Dispatcher sweep complete: branch=$BRANCH verdict=SUPERSEDED (already merged) ==="
   exit 0
 fi
@@ -488,7 +491,9 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
         --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR for rebase"
     fi
 
-    notify -t "Quality Gate" -p 3 "Branch $BRANCH needs manual rebase (conflicts) — bounced to $AUTHOR" 2>/dev/null || true
+    # wa-uthi: non-terminal (bounced to author for rebase, retryable) — no push to
+    # Athos. The author is nudged above; Athos only hears about terminal outcomes.
+    log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH needs manual rebase — bounced to $AUTHOR."
 
     mkdir -p "$(dirname "$QG_LOG")"
     jq -c -n \
@@ -1089,6 +1094,7 @@ Revert: $REVERT_STATUS
 Action required: rebase $BRANCH onto current main, resolve conflicts explicitly, and re-submit via /gate-done." 2>/dev/null || true
         fi
 
+        # wa-uthi: TERMINAL FAIL (merge reverted, definitive) — this push is KEPT.
         notify -t "Quality Gate INTEGRITY FAIL" -p 4 "Branch $BRANCH merge dropped changes — reverted. Author: $AUTHOR" 2>/dev/null || true
         log "Post-merge integrity FAILED: $INTEGRITY_MSG — merge reverted ($REVERT_STATUS)"
       else
@@ -1114,8 +1120,26 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
       bd -C "$GC_CITY" comment "$BEAD_ID" "Quality gate PASSED. Branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) via autonomous dispatcher (gate_run=$GATE_RUN_ID)." 2>/dev/null || true
     fi
 
-    notify -t "Quality Gate PASSED" -p 2 "Branch $BRANCH merged to $DEFAULT_BRANCH — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
-    log "Gate PASSED: branch=$BRANCH tier=$TIER merge_sha=$MERGE_SHA elapsed=${ELAPSED_S}s"
+    # wa-uthi: TERMINAL SUCCESS (merged to prod) — this push is KEPT.
+    # wa-wzvg: differentiate the merge push for Pilot-origin stories. The Pilot
+    # sets a durable "pilot:dispatched" label when it autonomously pulls a story
+    # (see pilot-dispatcher.sh). If present, use a distinct prefix/emoji so Athos
+    # can tell an autonomous Pilot merge apart from a human/Mayor-dispatched one.
+    PILOT_ORIGIN=0
+    if [ -n "$BEAD_ID" ]; then
+      BEAD_LABELS_NOW=$(bd -C "$GC_CITY" show "$BEAD_ID" --json 2>/dev/null \
+        | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
+      if echo "$BEAD_LABELS_NOW" | grep -q "pilot:dispatched"; then
+        PILOT_ORIGIN=1
+      fi
+    fi
+    if [ "$PILOT_ORIGIN" = "1" ]; then
+      notify -t "🤖 Pilot Gate PASSED" -p 2 "🤖 [Pilot] Branch $BRANCH merged to $DEFAULT_BRANCH — $TIER, ${ELAPSED_S}s (autonomous pickup)" 2>/dev/null || true
+      log "Gate PASSED (origin=Pilot): branch=$BRANCH tier=$TIER merge_sha=$MERGE_SHA elapsed=${ELAPSED_S}s"
+    else
+      notify -t "Quality Gate PASSED" -p 2 "Branch $BRANCH merged to $DEFAULT_BRANCH — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
+      log "Gate PASSED: branch=$BRANCH tier=$TIER merge_sha=$MERGE_SHA elapsed=${ELAPSED_S}s"
+    fi
   fi
 
 else
@@ -1144,6 +1168,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR (session may not exist)"
   fi
 
+  # wa-uthi: TERMINAL FAIL (review rejected, definitive) — this push is KEPT.
   notify -t "Quality Gate FAILED" -p 3 "Branch $BRANCH failed review — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
 fi
 

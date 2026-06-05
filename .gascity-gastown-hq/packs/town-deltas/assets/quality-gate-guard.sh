@@ -267,7 +267,8 @@ if [ "$VALIDATION_OK" = "false" ]; then
 branch='$BRANCH' bead_id='$BEAD_ID' rig='$RIG'
 Marker set to gate-status:error. Fix the marker fields and re-submit." 2>/dev/null || true
   fi
-  notify -t "Quality Gate Guard" -p 3 "Invalid marker $MARKER_ID — security check failed (gate-status:error)" 2>/dev/null || true
+  # wa-uthi: non-terminal (marker error, fixable + resubmittable) — no push. Logged only.
+  log "SUPPRESSED PUSH (wa-uthi non-terminal): invalid marker $MARKER_ID — security check failed (gate-status:error)."
   exit 1
 fi
 
@@ -336,7 +337,8 @@ if [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; then
 Marker self-declared author: ${MARKER_AUTHOR:-<empty>}
 Self-review prevention requires an authoritative author source.
 Fix the bead's assignee/created_by field and re-submit." 2>/dev/null || true
-  notify -t "Quality Gate Guard" -p 3 "Author unresolvable for marker $MARKER_ID — deferred (gate-status:deferred)" 2>/dev/null || true
+  # wa-uthi: non-terminal (deferred — bead data issue, fixable + resubmittable) — no push. Logged only.
+  log "SUPPRESSED PUSH (wa-uthi non-terminal): author unresolvable for marker $MARKER_ID — deferred (gate-status:deferred)."
   exit 0
 fi
 
@@ -395,7 +397,9 @@ if [ -n "$AUTHOR" ]; then
     --delivery wait-idle 2>/dev/null || true
 fi
 
-notify -t "Quality Gate" -p 2 "Branch $BRANCH queued for autonomous gate review (G dispatching)" 2>/dev/null || true
+# wa-uthi: non-terminal (queued / entered review) — no push to Athos. The author
+# is nudged above; Athos only hears about terminal outcomes (merged / rejected).
+log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH queued for autonomous gate review (G dispatching)."
 
 log "Marker $MARKER_ID parked as queued, autonomous dispatcher (G) will pick it up (gate-run=$GATE_RUN_ID)"
 
