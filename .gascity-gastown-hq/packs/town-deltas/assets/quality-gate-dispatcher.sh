@@ -757,9 +757,38 @@ while true; do
         : # explicit PASS — continue
       elif echo "$VB_LABELS" | grep -q "verdict:FAIL"; then
         ANY_FAIL=1
-        # Collect the fail reason from comments
-        FAIL_COMMENT=$(bd -C "$GC_CITY" comments "$VB" --json 2>/dev/null \
-          | jq -r '.[0].body // "No reason provided"' 2>/dev/null || echo "No reason provided")
+        # Collect the fail reason from the reviewer's verdict comment.
+        # NOTE (ga-kf0v): the beads "bd comments --json" schema uses .text
+        # (keys: author, created_at, id, issue_id, text) — there is NO .body
+        # field. The old accessor read .[0].body, so jq always fell through to
+        # the "No reason provided" default and EVERY genuine reviewer FAIL lost
+        # its reason. Parse .text (with .body kept as a defensive fallback for
+        # any future schema drift), preferring the comment that starts with
+        # "VERDICT:" (the reviewer convention), else the first non-empty one.
+        VB_COMMENTS_JSON=$(bd -C "$GC_CITY" comments "$VB" --json 2>/dev/null || echo "[]")
+        FAIL_COMMENT=$(printf '%s' "$VB_COMMENTS_JSON" | jq -r '
+            [ .[]? | (.text // .body // "") ]
+            | ( map(select(test("^\\s*VERDICT:"; "i"))) | last )
+              // ( map(select(. != "")) | first )
+              // ""
+          ' 2>/dev/null || echo "")
+        # FORENSICS (ga-kf0v #3): always log the raw comments + verdict labels
+        # for a FAIL so any future schema/field drift is visible in the
+        # dispatcher log without re-deriving from beads.
+        log "  FAIL forensics reviewer $((j+1)) bead=$VB labels=[$VB_LABELS] raw_comments=$(printf '%s' "$VB_COMMENTS_JSON" | jq -c . 2>/dev/null | cut -c1-2000)"
+        if [ -z "$FAIL_COMMENT" ]; then
+          # Reviewer closed verdict:FAIL but left no parseable reason. Now rare
+          # (the .text fix above resolves the common case). Fail-safe: PASS is
+          # the only acceptable verdict, so an empty-reason FAIL still blocks
+          # the merge — but mark it INCONCLUSIVE and warn loudly so it is
+          # distinguishable from a substantive FAIL. (Full per-reviewer session
+          # re-run retry per ga-kf0v #2 is deliberately deferred: re-dispatching
+          # a reviewer mid-collection is higher-risk than this lane:small fix
+          # warrants; making the empty case visible addresses the intent without
+          # destabilising the gate's verdict-collection loop.)
+          warn "Reviewer $((j+1)) (bead $VB) closed verdict:FAIL with no parseable reason — counting as INCONCLUSIVE FAIL (fail-safe)."
+          FAIL_COMMENT="INCONCLUSIVE — verdict:FAIL with empty/unparseable reason (raw bead $VB; see forensics log above)"
+        fi
         FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) FAIL: $FAIL_COMMENT\n"
       else
         # Any other label (TIMEOUT, ABORTED, or missing verdict label) → FAIL.
