@@ -48,6 +48,7 @@ mkdir -p "$LOG_DIR" 2>/dev/null || true
 
 log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [root-reconciler] $*" | tee -a "$LOG" 2>/dev/null; }
 err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [root-reconciler] ERROR: $*" | tee -a "$LOG" 2>/dev/null; }
+warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [root-reconciler] WARN: $*"  | tee -a "$LOG" 2>/dev/null; }
 
 # Throttle ntfy so a persistent divergence pings at most once per hour.
 NTFY_STAMP="$LOG_DIR/.town-root-reconciler.last-ntfy"
@@ -60,6 +61,76 @@ maybe_ntfy() {
     notify -t "Gas City: town root diverged" -p 4 "$msg" 2>/dev/null || true
     echo "$now" > "$NTFY_STAMP" 2>/dev/null || true
   fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# reconcile_untracked_for_ffpull  (ga-sejv — fixes ga-sxbs false-divergence)
+#
+# PROBLEM this fixes: CASE A below is a *pure fast-forward* (local is a strict
+# ancestor of origin) — it SHOULD always land cleanly. But `git pull --ff-only`
+# still ABORTS when the live working tree holds an UNTRACKED copy of a file that
+# the incoming merge adds as TRACKED:
+#   "The following untracked working tree files would be overwritten by merge:
+#    <file> — Please move or remove them before you merge. Aborting"
+# This is exactly how the 13 live scripts collided in ga-sxbs. The old CASE A
+# then logged "FF pull failed though it should be a clean FF" and fired the
+# divergence ntfy — a FALSE "town root diverged" alarm (Athos screenshot,
+# 2026-06-05) on what is really a benign byte-identical duplicate.
+#
+# This helper mirrors the proven ga-857v reconcile in story-delivery.sh. For each
+# untracked file the incoming upstream adds as tracked, it compares working-tree
+# bytes against the upstream version:
+#   IDENTICAL  → back up to /tmp then remove, so the ff-pull lands the tracked
+#                copy. The NEVER-clobber invariant holds: we only delete a
+#                proven-identical duplicate, never real content.
+#   DIFFERENT  → do NOT touch it; collect into RECONCILE_DIFF_LIST and return 2
+#                so the caller STOPS + escalates (uncommitted live work is never
+#                destroyed — a genuine divergence on an untracked file).
+# Sets globals RECONCILE_DIFF_LIST (space-separated paths that differ) and
+# RECONCILE_COUNT (number auto-reconciled). Honours DRY_RUN.
+RECONCILE_DIFF_LIST=""
+RECONCILE_COUNT=0
+reconcile_untracked_for_ffpull() {
+  local dir="$1" upstream="$2"
+  RECONCILE_DIFF_LIST=""
+  RECONCILE_COUNT=0
+
+  [ -n "$dir" ] || { log "reconcile: no dir — skip"; return 0; }
+  [ -n "$upstream" ] || { log "reconcile: no upstream — skip"; return 0; }
+  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+    log "reconcile: $dir is not a git work tree — skip"; return 0; }
+
+  local conflicts=0 u base ts backup
+  # Enumerate untracked (non-ignored) files; -z keeps paths with spaces safe.
+  while IFS= read -r -d '' u; do
+    [ -n "$u" ] || continue
+    # Does the incoming upstream add this path as tracked? If not, leave the
+    # genuine local-only file completely alone — it won't block the ff-pull.
+    git -C "$dir" cat-file -e "$upstream:$u" 2>/dev/null || continue
+    # Collision candidate. Compare working-tree bytes against incoming version.
+    if git -C "$dir" show "$upstream:$u" 2>/dev/null | cmp -s - "$dir/$u"; then
+      # IDENTICAL → safe to remove so the ff-pull can land the tracked copy.
+      base=$(basename "$u")
+      ts=$(date +%Y%m%d-%H%M%S)
+      backup="/tmp/${base}.backup.${ts}.$$"
+      if [ "$DRY_RUN" = "1" ]; then
+        log "reconcile: DRY_RUN — WOULD backup+remove identical untracked '$u' (backup $backup)"
+      else
+        cp -p "$dir/$u" "$backup" 2>/dev/null || cp "$dir/$u" "$backup" 2>/dev/null || true
+        rm -f "$dir/$u"
+        log "reconcile: auto-reconciled identical untracked '$u' (backup: $backup)"
+      fi
+      RECONCILE_COUNT=$((RECONCILE_COUNT + 1))
+    else
+      # GENUINELY DIFFERENT → never clobber. Record for halt + escalation.
+      warn "reconcile: CONFLICT — untracked '$u' DIFFERS from incoming $upstream:$u (NOT removed)"
+      RECONCILE_DIFF_LIST="$RECONCILE_DIFF_LIST $u"
+      conflicts=$((conflicts + 1))
+    fi
+  done < <(git -C "$dir" ls-files --others --exclude-standard -z 2>/dev/null)
+
+  [ "$conflicts" -gt 0 ] && return 2
+  return 0
 }
 
 reconcile_once() {
@@ -97,6 +168,21 @@ reconcile_once() {
     local behind
     behind=$(git -C "$ROOT" rev-list --count "$BRANCH..$REMOTE/$BRANCH" 2>/dev/null || echo "?")
     log "town root BEHIND $REMOTE/$BRANCH by $behind commit(s) — fast-forwarding live root."
+
+    # ga-sejv: clear byte-identical untracked collisions BEFORE the ff-pull. This
+    # is a pure FF (local is an ancestor), so it SHOULD land — but an untracked
+    # working-tree copy of a file the merge adds as tracked makes git abort the
+    # pull. The old code then fired a FALSE "diverged" ntfy on a benign duplicate
+    # (the ga-sxbs pattern). reconcile_untracked_for_ffpull backs up + removes only
+    # PROVEN-identical duplicates; a genuinely DIFFERENT untracked file returns 2
+    # → we STOP + escalate (never clobber), which is a real conflict, not a clean FF.
+    if ! reconcile_untracked_for_ffpull "$ROOT" "$REMOTE/$BRANCH"; then
+      err "town root FF blocked: untracked working-tree file(s) DIFFER from incoming $REMOTE/$BRANCH (NOT clobbered):$RECONCILE_DIFF_LIST"
+      maybe_ntfy "Gas City town root: untracked file(s) differ from incoming $REMOTE/$BRANCH —$RECONCILE_DIFF_LIST. NOT overwritten; needs deliberate human/Mayor resolve before the FF can land."
+      return 0
+    fi
+    [ "$RECONCILE_COUNT" -gt 0 ] && log "reconciled $RECONCILE_COUNT byte-identical untracked collision(s) — ff-pull can now land the tracked version(s)."
+
     if [ "$DRY_RUN" = "1" ]; then
       log "DRY_RUN=1 — WOULD: git pull --ff-only $REMOTE $BRANCH ; gc reload --soft --async"
       return 0
@@ -108,8 +194,11 @@ reconcile_once() {
         && log "gc reload --soft --async queued — live dispatchers pick up new code next tick." \
         || err "gc reload --soft --async failed (files updated on disk regardless; dispatchers still get new code next tick)."
     else
-      err "FF pull FAILED despite ancestor base — investigate (untracked collision?)."
-      maybe_ntfy "town root FF pull failed though it should be a clean FF — manual check needed."
+      # After the untracked reconcile above, a still-failing FF is the RARE real
+      # case (a collision that raced in, or a dirty TRACKED file) — no longer the
+      # benign-duplicate false alarm. Surface it; do not force.
+      err "FF pull FAILED after untracked reconcile — investigate (raced collision or dirty tracked file?)."
+      maybe_ntfy "town root FF pull failed even after untracked reconcile — manual check needed."
     fi
     return 0
   fi
