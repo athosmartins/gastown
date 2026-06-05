@@ -1168,6 +1168,77 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR (session may not exist)"
   fi
 
+  # ── ga-jb4l: SELF-HEALING FAIL LOOP ────────────────────────────────────────
+  # A gate FAIL must not strand the source story forever. The legacy FAIL path
+  # only touched the EPHEMERAL marker/gate-run beads and an ephemeral author
+  # session nudge — no durable feedback reached the SOURCE bead and no actor
+  # ever re-picked it (the Pilot's selection hid it: features by story:in-flight,
+  # bugs by a stale builder assignee). Here we close that loop:
+  #   (a) attach the FAILing reviewer reasons to the SOURCE bead (durable),
+  #   (b) transition it to a Pilot-re-dispatchable gate:needs-fix state, and
+  #   (c) cap auto-retry at N=3, escalating to a human (Mayor) exactly once.
+  # FAIL_REASONS is already populated upstream (and, post-ga-kf0v, carries the
+  # real reviewer .text reasons), so the feedback we attach is substantive.
+  if [ -n "$BEAD_ID" ] && [ "$DRY_RUN" != "1" ]; then
+    GATE_FIX_CAP=3
+
+    # Read the source bead's current labels (story beads live in the HQ/city DB).
+    SRC_LABELS=$(bd -C "$GC_CITY" show "$BEAD_ID" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' \
+      2>/dev/null || echo "")
+
+    # Current fix-attempt count from label gate:fix-attempt:N (default 0). Take
+    # the MAX in case multiple counter labels ever coexist.
+    PREV_ATTEMPT=$(printf '%s' "$SRC_LABELS" | tr ' ' '\n' \
+      | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | tail -1)
+    [ -z "$PREV_ATTEMPT" ] && PREV_ATTEMPT=0
+
+    # (a) ATTACH FEEDBACK TO THE SOURCE BEAD — durable, machine-readable marker
+    #     (prefix "GATE-FEEDBACK") so the Pilot can surface it to the re-dispatched
+    #     builder verbatim.
+    bd -C "$GC_CITY" comment "$BEAD_ID" "$(printf 'GATE-FEEDBACK (gate_run=%s branch=%s): quality gate FAILED. Fix THESE specific blocking issues, then run /gate-done to re-gate.\n\n%s' \
+      "$GATE_RUN_ID" "$BRANCH" "$(echo -e "$FAIL_REASONS")")" \
+      2>/dev/null || warn "Could not attach gate feedback to source bead $BEAD_ID"
+    bd -C "$GC_CITY" label add "$BEAD_ID" "gate:failed" -q 2>/dev/null || true
+
+    if [ "$PREV_ATTEMPT" -ge "$GATE_FIX_CAP" ]; then
+      # (c) RETRY CAP REACHED — stop auto-retry, escalate to the Mayor ONCE.
+      log "Gate fix-attempt cap reached for $BEAD_ID (prev=$PREV_ATTEMPT >= $GATE_FIX_CAP). Escalating; no further auto-retry."
+      bd -C "$GC_CITY" label remove "$BEAD_ID" "gate:needs-fix"   -q 2>/dev/null || true
+      bd -C "$GC_CITY" label add    "$BEAD_ID" "gate:needs-human" -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$BEAD_ID" "Gate auto-fix cap ($GATE_FIX_CAP attempts) exhausted — labeled gate:needs-human. The machine could not resolve this after $GATE_FIX_CAP fix cycles; the Pilot will NOT re-dispatch it. Human/Mayor intervention required." 2>/dev/null || true
+      # Escalate EXACTLY once: only mail if gate:needs-human was not already set.
+      if ! printf '%s' "$SRC_LABELS" | grep -q "gate:needs-human"; then
+        gc --city "$GC_CITY" mail send mayor \
+          -s "Gate needs-human: $BEAD_ID exhausted $GATE_FIX_CAP fix attempts" \
+          -m "$(printf 'Source bead %s failed the quality gate %s times. Auto-retry is now DISABLED (label gate:needs-human); the Pilot will not re-dispatch it.\n\nBranch: %s\nRig: %s\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene.' \
+            "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$BRANCH" "$RIG" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
+          2>/dev/null || warn "Could not mail Mayor escalation for $BEAD_ID"
+        notify -t "Gate needs-human" -p 4 "$BEAD_ID exhausted $GATE_FIX_CAP gate fix attempts — Mayor escalated" 2>/dev/null || true
+      fi
+    else
+      # (b) TRANSITION TO A PILOT-RE-DISPATCHABLE needs-fix STATE.
+      NEW_ATTEMPT=$((PREV_ATTEMPT + 1))
+      log "Marking $BEAD_ID gate:needs-fix (attempt $NEW_ATTEMPT/$GATE_FIX_CAP) for autonomous Pilot re-dispatch."
+      # Bump the attempt counter (drop any stale counters first).
+      for OLD in $(printf '%s' "$SRC_LABELS" | tr ' ' '\n' | grep '^gate:fix-attempt:'); do
+        bd -C "$GC_CITY" label remove "$BEAD_ID" "$OLD" -q 2>/dev/null || true
+      done
+      bd -C "$GC_CITY" label add    "$BEAD_ID" "gate:fix-attempt:${NEW_ATTEMPT}" -q 2>/dev/null || true
+      bd -C "$GC_CITY" label add    "$BEAD_ID" "gate:needs-fix"                  -q 2>/dev/null || true
+      # Remove story:in-flight so the Pilot's feature-exclusion no longer hides it.
+      bd -C "$GC_CITY" label remove "$BEAD_ID" "story:in-flight"  -q 2>/dev/null || true
+      # Clear stale Pilot claim labels left over from the failed dispatch.
+      bd -C "$GC_CITY" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
+      bd -C "$GC_CITY" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
+      # The Pilot's _filter_candidates drops ASSIGNED beads (both Tier-1 bugs and
+      # Tier-2 features), so a stale builder assignee makes a failed bead invisible.
+      # Clear it so the next sweep can re-pick this bead.
+      bd -C "$GC_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight and builder assignee cleared. The Pilot will re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
+    fi
+  fi
+
   # wa-uthi: TERMINAL FAIL (review rejected, definitive) — this push is KEPT.
   notify -t "Quality Gate FAILED" -p 3 "Branch $BRANCH failed review — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
 fi

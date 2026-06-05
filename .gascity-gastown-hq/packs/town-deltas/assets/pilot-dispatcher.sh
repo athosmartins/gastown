@@ -257,6 +257,7 @@ BUGS_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-label "story:in-flight" \
   --exclude-label "story:done" \
   --exclude-label "pilot:dispatching" \
+  --exclude-label "gate:needs-human" \
   -n 0 \
   2>/dev/null || echo "[]")
 BUGS_JSON=$(echo "$BUGS_JSON" | _filter_candidates)
@@ -266,6 +267,7 @@ DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-label "story:in-flight" \
   --exclude-label "story:done" \
   --exclude-label "pilot:dispatching" \
+  --exclude-label "gate:needs-human" \
   -n 0 \
   2>/dev/null || echo "[]")
 DEBT_JSON=$(echo "$DEBT_JSON" | _filter_candidates)
@@ -302,6 +304,7 @@ if [ "$TIER1_COUNT" -eq "0" ]; then
     --exclude-label "story:in-flight" \
     --exclude-label "story:done" \
     --exclude-label "pilot:dispatching" \
+    --exclude-label "gate:needs-human" \
     -n 0 \
     2>/dev/null || echo "[]")
   TIER2_JSON=$(echo "$TIER2_JSON" | _filter_candidates)
@@ -336,6 +339,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "story:in-flight" \
       --exclude-label "story:done" \
       --exclude-label "pilot:dispatching" \
+      --exclude-label "gate:needs-human" \
       -n 0 2>/dev/null || echo "[]")
     RIG_BUGS=$(echo "$RIG_BUGS" | _filter_candidates | _filter_unblocked "$rig_path")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_BUGS" | jq -s 'add // []' 2>/dev/null || echo "[]")
@@ -345,6 +349,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "story:in-flight" \
       --exclude-label "story:done" \
       --exclude-label "pilot:dispatching" \
+      --exclude-label "gate:needs-human" \
       -n 0 2>/dev/null || echo "[]")
     RIG_DEBT=$(echo "$RIG_DEBT" | _filter_candidates | _filter_unblocked "$rig_path")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_DEBT" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
@@ -354,6 +359,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "story:in-flight" \
       --exclude-label "story:done" \
       --exclude-label "pilot:dispatching" \
+      --exclude-label "gate:needs-human" \
       -n 0 2>/dev/null || echo "[]")
     RIG_FEATURES=$(echo "$RIG_FEATURES" | _filter_candidates | _filter_unblocked "$rig_path")
     ALL_RIG_TIER2=$(echo "$ALL_RIG_TIER2 $RIG_FEATURES" | jq -s 'add // []' 2>/dev/null || echo "[]")
@@ -438,6 +444,34 @@ dispatch_one() {
   STORY_CRITERIA=$(echo "$STORY" | jq -r '.acceptance_criteria // .metadata["story.criterios"] // ""')
   STORY_EQUILIBRIOS=$(echo "$STORY" | jq -r '.metadata["story.equilibrios"] // ""')
 
+  # ── ga-jb4l: gate re-dispatch — surface reviewer feedback for needs-fix beads ──
+  # A bead labeled gate:needs-fix previously FAILED the quality gate. The gate
+  # attached the FAILing reviewers' reasons to it as a "GATE-FEEDBACK" comment.
+  # Pull the latest such comment and the attempt counter so the builder prompt
+  # tells the re-dispatched builder to fix THE SPECIFIC issues (not redo the work).
+  local STORY_GATE_FEEDBACK="" STORY_FIX_ATTEMPT="" GATE_FIX_SECTION=""
+  if echo "$STORY_LABELS" | grep -q "gate:needs-fix"; then
+    STORY_FIX_ATTEMPT=$(echo "$STORY_LABELS" | tr ',' '\n' \
+      | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | tail -1)
+    STORY_GATE_FEEDBACK=$(bd -C "$GC_CITY" comments "$STORY_ID" --json 2>/dev/null \
+      | jq -r '[ .[]? | (.text // .body // "") | select(test("^GATE-FEEDBACK")) ] | last // ""' \
+      2>/dev/null || echo "")
+    log "  $STORY_ID is gate:needs-fix (attempt=${STORY_FIX_ATTEMPT:-?}) — injecting reviewer feedback (${#STORY_GATE_FEEDBACK} chars)."
+    if [ -n "$STORY_GATE_FEEDBACK" ]; then
+      GATE_FIX_SECTION=$(cat <<FIXSEC
+
+## ⚠️ GATE RE-DISPATCH — fix THESE specific issues (fix attempt ${STORY_FIX_ATTEMPT:-?}/3)
+This bead previously FAILED the autonomous quality gate. You are being re-dispatched
+to fix the EXACT blocking issues the reviewers found below — do NOT redo unrelated
+work. After fixing, run /gate-done to re-gate. If you genuinely cannot resolve these,
+explain why in a bead comment; after 3 failed attempts the machine escalates to a human.
+
+$STORY_GATE_FEEDBACK
+FIXSEC
+)
+    fi
+  fi
+
   log "Selected $DISPATCH_TIER [$LANE] $STORY_ID (priority=$STORY_PRIORITY): $STORY_TITLE"
   log "  rig=$STORY_RIG  labels=$STORY_LABELS  lane=$LANE  tier=$DISPATCH_TIER"
 
@@ -512,6 +546,7 @@ City: $GC_CITY
 ## Your job
 Fix this bug or tech-debt item completely. Do NOT wait for a human.
 "Só depois do sistema perfeito é que a gente faz novas features." — system quality first.
+$GATE_FIX_SECTION
 
 ## Description / Acceptance Criteria
 $STORY_CRITERIA
@@ -557,6 +592,7 @@ City: $GC_CITY
 
 ## Your job
 Build this story from acceptance criteria to /gate-done. Do NOT wait for a human.
+$GATE_FIX_SECTION
 
 ## Acceptance Criteria
 $STORY_CRITERIA
