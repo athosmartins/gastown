@@ -15,10 +15,14 @@ saturated-but-busy gate; this one keys off a marker that is actually stuck.
 """
 import json, time, datetime, subprocess, os
 
-QG = ".gc/quality-gate.jsonl"
-SD = ".gc/story-delivery.jsonl"
-DISPATCH_LOG = ".gc/logs/quality-gate-dispatcher.log"  # sweeps every ~3min
-GUARDIAN_HEARTBEAT = ".gc/guardian.heartbeat"           # guardian writes on each sweep
+# Derive city root from this script's location: scripts/ → city-root/
+# This allows the monitor to be run from any working directory.
+_CITY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+QG = os.path.join(_CITY_ROOT, ".gc/quality-gate.jsonl")
+SD = os.path.join(_CITY_ROOT, ".gc/story-delivery.jsonl")
+DISPATCH_LOG = os.path.join(_CITY_ROOT, ".gc/logs/quality-gate-dispatcher.log")  # sweeps every ~3min
+GUARDIAN_HEARTBEAT = os.path.join(_CITY_ROOT, ".gc/guardian.heartbeat")           # guardian writes on each sweep
 STUCK_SEC = 1500        # 25min queued-with-no-completion = real wedge
 REALERT_SEC = 900       # re-warn a still-stuck marker every 15min
 ENGINE_STALL_SEC = 900  # dispatcher log silent >15min = engine dead/hung

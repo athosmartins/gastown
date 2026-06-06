@@ -47,6 +47,9 @@ REAL_JAM_SEC=1500           # 25min — marker queued without completion
 FIX_CAP=3                   # max auto-fix attempts before escalation
 REALERT_SEC=900             # re-alert same incident class every 15min
 
+# DRY_RUN=1: report everything, make ZERO state changes (no beads, no launchctl, no mail)
+DRY_RUN="${DRY_RUN:-0}"
+
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
 mkdir -p "$LOG_DIR"
@@ -84,10 +87,21 @@ launchd_exit() {
 # State JSON: { "seen_qg": N, "seen_sd": N, "incidents": { "<key>": {...} } }
 
 state_get() {
-  [ -f "$STATE_FILE" ] && cat "$STATE_FILE" || echo '{"seen_qg":0,"seen_sd":0,"incidents":{}}'
+  local raw
+  raw=$(cat "$STATE_FILE" 2>/dev/null || true)
+  # Guard against empty (truncated write) or invalid JSON
+  if [ -z "$raw" ] || ! printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+    echo '{"seen_qg":0,"seen_sd":0,"incidents":{}}'
+    return
+  fi
+  printf '%s' "$raw"
 }
 
-state_save() { printf '%s' "$1" > "$STATE_FILE"; }
+state_save() {
+  # Atomic write: write to temp then rename to prevent corrupt reads on crash
+  local tmp="${STATE_FILE}.tmp.$$"
+  printf '%s' "$1" > "$tmp" && mv "$tmp" "$STATE_FILE" || rm -f "$tmp"
+}
 
 state_get_seen() {
   local field="$1"
@@ -121,8 +135,16 @@ state_update_seen() {
 
 # open_incident <key> <title> <description> <repair_prompt>
 # Creates a bead + dispatches a repair worker; returns bead ID.
+# DRY_RUN=1: logs WOULD-DO, returns "dry-run-bead", makes no changes.
 open_incident() {
   local key="$1" title="$2" desc="$3" repair_prompt="$4"
+
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    log "DRY_RUN — WOULD open incident bead: $key — $title"
+    log "DRY_RUN — WOULD dispatch gastown.dog worker"
+    echo "dry-run-bead"
+    return 0
+  fi
 
   # Create incident bead in HQ DB
   local bead_id
@@ -166,6 +188,12 @@ escalate_to_mayor() {
   local key="$1" bead_id="$2" reason="$3"
   log "ESCALATING to Mayor: $key ($bead_id) — $reason"
 
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    log "DRY_RUN — WOULD: gc mail send mayor -s 'Guardian: escalation — $key could not auto-heal'"
+    log "DRY_RUN — WOULD: notify '🚨 $key could not auto-heal after $FIX_CAP attempts'"
+    return 0
+  fi
+
   gc --city "$GC_CITY" mail send mayor \
     -s "Guardian: escalation — $key could not auto-heal" \
     -m "$(printf 'Guardian (guardian-dispatch.sh) exhausted %d auto-fix attempts for:\n\nKey: %s\nIncident bead: %s\nReason: %s\n\nThe machine cannot self-heal this. Mayor or human must intervene.' \
@@ -194,10 +222,14 @@ handle_incident() {
     # Problem gone — if we had an open incident, close it
     if [ "$inc" != "null" ]; then
       local bead_id; bead_id=$(printf '%s' "$inc" | jq -r '.bead // ""')
-      if [ -n "$bead_id" ] && ! is_incident_resolved "$bead_id"; then
-        bd -C "$GC_CITY" close "$bead_id" --reason "Guardian: problem resolved on its own — auto-closing incident." \
-          2>/dev/null || true
-        log "Incident $key cleared (problem resolved, bead $bead_id auto-closed)"
+      if [ -n "$bead_id" ] && [ "$bead_id" != "dry-run-bead" ] && ! is_incident_resolved "$bead_id"; then
+        if [ "${DRY_RUN:-0}" = "1" ]; then
+          log "DRY_RUN — WOULD close bead $bead_id (incident $key resolved)"
+        else
+          bd -C "$GC_CITY" close "$bead_id" --reason "Guardian: problem resolved on its own — auto-closing incident." \
+            2>/dev/null || true
+          log "Incident $key cleared (problem resolved, bead $bead_id auto-closed)"
+        fi
       fi
       state_clear_incident "$key"
       log_json "$(printf '{"ts":"%s","event":"incident_resolved","key":"%s","bead":"%s"}' \
@@ -251,18 +283,26 @@ handle_incident() {
 
   if [ "$attempt" -gt "$FIX_CAP" ]; then
     # Cap reached — escalate
-    bd -C "$GC_CITY" label add "$bead_id" "guardian:needs-human" -q 2>/dev/null || true
-    bd -C "$GC_CITY" comment "$bead_id" \
-      "Guardian auto-fix cap ($FIX_CAP attempts) exhausted. Escalated to Mayor. No further auto-retry." \
-      2>/dev/null || true
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+      log "DRY_RUN — WOULD escalate $key to Mayor (cap $FIX_CAP exceeded, attempt=$attempt)"
+    else
+      bd -C "$GC_CITY" label add "$bead_id" "guardian:needs-human" -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$bead_id" \
+        "Guardian auto-fix cap ($FIX_CAP attempts) exhausted. Escalated to Mayor. No further auto-retry." \
+        2>/dev/null || true
+    fi
     escalate_to_mayor "$key" "$bead_id" "${reason:-problem persists after $FIX_CAP fix cycles}"
     state_set_incident "$key" "$(printf '%s' "$inc" \
       | jq -c ".attempt = $attempt | .last_checked = $now | .escalated = true")"
   else
     # Re-dispatch repair worker (new nudge on the same bead)
     log "Re-dispatching repair worker for $key (attempt $attempt)"
-    gc --city "$GC_CITY" sling gastown.dog "$bead_id" --nudge 2>/dev/null || \
-      warn "re-sling failed for $bead_id"
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+      log "DRY_RUN — WOULD: gc sling gastown.dog $bead_id --nudge"
+    else
+      gc --city "$GC_CITY" sling gastown.dog "$bead_id" --nudge 2>/dev/null || \
+        warn "re-sling failed for $bead_id"
+    fi
     log_json "$(printf '{"ts":"%s","event":"incident_redispatch","key":"%s","bead":"%s","attempt":%d}' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$key" "$bead_id" "$attempt")"
   fi
@@ -291,23 +331,30 @@ check_engine_stall() {
   if [ "$inc" = "null" ]; then
     log "First detection — attempting launchctl restart for $class"
     local restarted=0
-    for svc in $launchd_labels; do
-      local pid; pid=$(launchd_pid "$svc")
-      if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
-        log "kickstart -k $svc (PID=$pid, log stale)"
-        launchctl kickstart -k "gui/$(id -u)/$svc" 2>/dev/null && restarted=1 || \
-          launchctl kickstart -k "$svc" 2>/dev/null && restarted=1 || true
-      else
-        log "start $svc (not running, log stale)"
-        launchctl start "$svc" 2>/dev/null && restarted=1 || true
-      fi
-    done
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+      log "DRY_RUN — WOULD restart launchd services: $launchd_labels"
+      restarted=1
+    else
+      for svc in $launchd_labels; do
+        local pid; pid=$(launchd_pid "$svc")
+        if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
+          log "kickstart -k $svc (PID=$pid, log stale)"
+          launchctl kickstart -k "gui/$(id -u)/$svc" 2>/dev/null && restarted=1 || \
+            launchctl kickstart -k "$svc" 2>/dev/null && restarted=1 || true
+        else
+          log "start $svc (not running, log stale)"
+          launchctl start "$svc" 2>/dev/null && restarted=1 || true
+        fi
+      done
+    fi
     if [ "$restarted" = "1" ]; then
       log "Issued launchctl restart for $class — verifying on next cycle"
       log_json "$(printf '{"ts":"%s","event":"engine_restart_attempted","class":"%s","services":"%s"}' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$class" "$launchd_labels")"
-      notify -t "Guardian" "Engine stall: attempted restart of $label — verifying next cycle" \
-        2>/dev/null || true
+      if [ "${DRY_RUN:-0}" != "1" ]; then
+        notify -t "Guardian" "Engine stall: attempted restart of $label — verifying next cycle" \
+          2>/dev/null || true
+      fi
     fi
   fi
 
@@ -373,6 +420,7 @@ check_real_jams() {
 # ── Delivery-fail detection ───────────────────────────────────────────────────
 
 check_delivery_fails() {
+  [ -f "$SD_LOG" ] || return 0
   local seen; seen=$(state_get_seen "seen_sd")
   local total; total=$(wc -l < "$SD_LOG" 2>/dev/null || echo "0")
   total=$(( total + 0 ))

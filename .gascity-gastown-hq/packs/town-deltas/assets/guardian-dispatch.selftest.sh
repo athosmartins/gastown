@@ -192,15 +192,21 @@ grep -q 'notify'              "$GUARDIAN" && ok "sends notify alert"           |
 grep -q 'guardian.heartbeat'  "$GUARDIAN" && ok "writes heartbeat"             || bad "missing heartbeat"
 grep -q 'guardian.lock'       "$GUARDIAN" && ok "has lock (no concurrent runs)" || bad "missing lock"
 grep -q 'GUARDIAN_CITY_OVERRIDE' "$GUARDIAN" && ok "has city override (testable)" || bad "missing GUARDIAN_CITY_OVERRIDE"
+grep -q 'DRY_RUN'             "$GUARDIAN" && ok "implements DRY_RUN flag"      || bad "missing DRY_RUN (documented but unimplemented is a safety trap)"
+grep -q '"1".*DRY_RUN\|DRY_RUN.*"1"' "$GUARDIAN" && ok "DRY_RUN guard present" || bad "DRY_RUN not actually checked in script body"
+grep -q 'mv.*tmp.*STATE_FILE\|tmp.*mv.*STATE_FILE\|STATE_FILE.*tmp' "$GUARDIAN" && \
+  ok "state_save is atomic (tmp+mv)" || bad "state_save non-atomic (corrupt on crash → crash loop)"
 
 # ── 7. Drift-guard: gate-health-monitor.py adds GUARDIAN-STALL ────────────────
 echo "── 7. Drift-guard: gate-health-monitor.py ──"
 
 [ -f "$MONITOR" ] && ok "gate-health-monitor.py exists" || bad "gate-health-monitor.py missing"
-grep -q 'GUARDIAN-STALL'        "$MONITOR" && ok "emits [GUARDIAN-STALL]"           || bad "missing GUARDIAN-STALL"
-grep -q 'guardian.heartbeat'    "$MONITOR" && ok "checks guardian.heartbeat"         || bad "missing guardian.heartbeat check"
-grep -q 'GUARDIAN_STALL_SEC'    "$MONITOR" && ok "has GUARDIAN_STALL_SEC threshold"  || bad "missing GUARDIAN_STALL_SEC"
-grep -q 'guardian_alerted'      "$MONITOR" && ok "has cooldown for guardian stall"   || bad "missing guardian_alerted cooldown"
+grep -q 'GUARDIAN-STALL'        "$MONITOR" && ok "emits [GUARDIAN-STALL]"               || bad "missing GUARDIAN-STALL"
+grep -q 'guardian.heartbeat'    "$MONITOR" && ok "checks guardian.heartbeat"             || bad "missing guardian.heartbeat check"
+grep -q 'GUARDIAN_STALL_SEC'    "$MONITOR" && ok "has GUARDIAN_STALL_SEC threshold"      || bad "missing GUARDIAN_STALL_SEC"
+grep -q 'guardian_alerted'      "$MONITOR" && ok "has cooldown for guardian stall"       || bad "missing guardian_alerted cooldown"
+grep -q '_CITY_ROOT\|abspath.*__file__' "$MONITOR" && \
+  ok "monitor uses absolute paths (runnable from any cwd)" || bad "monitor uses relative paths (cwd-dependent, no deployment guarantee)"
 
 # ── 8. Drift-guard: plist exists and references the script ────────────────────
 echo "── 8. Drift-guard: guardian-dispatch.plist ──"
