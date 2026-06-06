@@ -214,6 +214,12 @@ _claim_bead() {
     | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' \
     2>/dev/null || echo "")
 
+  if [ -z "$_vl" ]; then
+    warn "Could not verify $STORY_ID claim state (bd show returned empty). Releasing claim."
+    bd -C "$BEAD_DB" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+    return 1
+  fi
+
   if printf '%s' "$_vl" | grep -q "story:in-flight"; then
     log "Story $STORY_ID already in-flight (race condition). Releasing claim."
     bd -C "$BEAD_DB" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
@@ -224,6 +230,7 @@ _claim_bead() {
     bd -C "$BEAD_DB" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
     return 1
   fi
+  return 0
 }
 
 # _build_task_prompt — populate _DISPATCH_TASK global.

@@ -64,7 +64,7 @@ grep -q 'COMMON_EXCLUDES=(' "$PILOT" \
 # ── Test 6: story:in-flight added before pilot:dispatching removed ─────────────
 # Extract _transition_bead body with grep -A 50 (avoids awk /^}/ early-termination
 # on any brace-terminated construct that might be added inside the function).
-_fn_body=$(grep -A 50 '^_transition_bead()' "$PILOT" | head -50)
+_fn_body=$(grep -A 50 '^_transition_bead()' "$PILOT" | head -50 || true)
 _inflight=$(printf '%s\n' "$_fn_body" | grep -n 'label add.*story:in-flight' | head -1 | cut -d: -f1 || echo "")
 _rm_dispatch=$(printf '%s\n' "$_fn_body" | grep -n 'label remove.*pilot:dispatching' | head -1 | cut -d: -f1 || echo "")
 if [ -n "$_inflight" ] && [ -n "$_rm_dispatch" ] && [ "$_inflight" -lt "$_rm_dispatch" ]; then
@@ -140,6 +140,26 @@ if grep -A 30 'Step 0.*TTL recovery' "$PILOT" | grep -q '_ttl_rig'; then
 else
   _fail "TTL recovery: no rig DB scan — rig-sourced pilot:dispatching claims never recovered"
 fi
+
+# ── Test 15: rig_to_builder: whatsapp_automation mapping present ──────────────
+grep -A 10 '^rig_to_builder()' "$PILOT" | grep -q "whatsapp_automation" \
+  && _pass "rig_to_builder: whatsapp_automation mapping present" \
+  || _fail "rig_to_builder: whatsapp_automation mapping missing"
+
+# ── Test 16: rig_to_builder: default gastown.dog present ─────────────────────
+grep -A 10 '^rig_to_builder()' "$PILOT" | grep -q "gastown.dog" \
+  && _pass "rig_to_builder: default gastown.dog present" \
+  || _fail "rig_to_builder: default gastown.dog missing"
+
+# ── Test 17: classify_lane: lane:big label check present ─────────────────────
+grep -A 20 '^classify_lane()' "$PILOT" | grep -q "lane:big" \
+  && _pass "classify_lane: lane:big check present" \
+  || _fail "classify_lane: lane:big check missing"
+
+# ── Test 18: classify_lane: BIG_CRITERIA_THRESHOLD used ──────────────────────
+grep -A 20 '^classify_lane()' "$PILOT" | grep -q "BIG_CRITERIA_THRESHOLD" \
+  && _pass "classify_lane: BIG_CRITERIA_THRESHOLD used" \
+  || _fail "classify_lane: BIG_CRITERIA_THRESHOLD missing"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
