@@ -435,7 +435,6 @@ check_delivery_fails() {
   # Read new lines
   local new_lines
   new_lines=$(tail -n "+$((seen + 1))" "$SD_LOG" 2>/dev/null) || { state_update_seen "seen_sd" "$total"; return 0; }
-  state_update_seen "seen_sd" "$total"
 
   while IFS= read -r line; do
     [ -z "$line" ] && continue
@@ -462,6 +461,7 @@ check_delivery_fails() {
       "$(printf 'GUARDIAN DELIVERY-FAIL REPAIR\n\nStory: %s\nRig: %s\nResult: %s\n\n1. Check delivery log: grep %s %s\n2. Check story bead: bd -C $GC_CITY show %s\n3. Check prod-test output for the rig\n4. Identify root cause (deploy conflict, prod-test failure, daemon issue)\n5. Fix root cause, re-run delivery manually or via gate if code change needed\n6. Close this bead when delivery PASS confirmed.' \
         "$story_id" "$rig" "$result" "$story_id" "$SD_LOG" "$story_id")"
   done <<< "$new_lines"
+  state_update_seen "seen_sd" "$total"
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────

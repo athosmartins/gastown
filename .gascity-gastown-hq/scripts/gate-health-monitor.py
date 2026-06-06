@@ -49,12 +49,10 @@ def still_queued(bead):
     """True only if the bead is CURRENTLY a genuinely-stuck gate marker
     (gate-status:queued = accepted but not picked up by the dispatcher). If it's
     dispatching (actively under review, verdicts coming), passed/failed/superseded/
-    terminal, or absent -> NOT a wedge. Unknown -> False (don't alert)."""
-    try:
-        out = subprocess.run(["gc", "bd", "show", bead], capture_output=True,
-                             text=True, timeout=15).stdout.lower()
-    except Exception:
-        return False
+    terminal, or absent -> NOT a wedge. Raises on subprocess failure so the caller
+    can distinguish 'not queued' from 'gc unavailable'."""
+    out = subprocess.run(["gc", "bd", "show", bead], capture_output=True,
+                         text=True, timeout=15).stdout.lower()
     return "gate-status:queued" in out
 
 
@@ -119,7 +117,11 @@ while True:
         if r.get("event") == "guard_queued":
             a = age(r.get("ts", ""))
             if a > STUCK_SEC and (b not in alerted or time.time() - alerted[b] > REALERT_SEC):
-                if not still_queued(b):
+                try:
+                    queued = still_queued(b)
+                except Exception:
+                    continue  # gc unavailable — don't silence alert, retry next cycle
+                if not queued:
                     alerted[b] = time.time()  # dispatched/failed/done — not a wedge; skip
                     continue
                 print("[REAL-JAM] gate marker %s stuck %dmin (queued, no completion) "
