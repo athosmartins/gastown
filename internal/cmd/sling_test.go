@@ -753,7 +753,7 @@ exit /b 0
 	prevSpawn := spawnPolecatForSling
 	prevResolveTargetAgent := resolveTargetAgentFn
 	prevRollback := rollbackSlingArtifactsFn
-	prevHook := hookBeadWithRetryFn
+	prevHookWithTownRoot := hookBeadWithRetryWithTownRootFn
 	t.Cleanup(func() {
 		slingNoConvoy = prevNoConvoy
 		slingNoBoot = prevNoBoot
@@ -761,7 +761,7 @@ exit /b 0
 		spawnPolecatForSling = prevSpawn
 		resolveTargetAgentFn = prevResolveTargetAgent
 		rollbackSlingArtifactsFn = prevRollback
-		hookBeadWithRetryFn = prevHook
+		hookBeadWithRetryWithTownRootFn = prevHookWithTownRoot
 	})
 	slingNoConvoy = true
 	slingNoBoot = true
@@ -773,7 +773,7 @@ exit /b 0
 	resolveTargetAgentFn = func(target string) (agentID string, pane string, hookRoot string, err error) {
 		return "", "", "", errors.New("simulated dead target")
 	}
-	hookBeadWithRetryFn = func(beadID, targetAgent, hookDir string) error {
+	hookBeadWithRetryWithTownRootFn = func(beadID, targetAgent, hookDir, townRoot string) error {
 		return errors.New("simulated hook failure")
 	}
 
