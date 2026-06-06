@@ -7,7 +7,7 @@
 #
 #   1. Determines tier (CODE → 3 independent sessions; NON-CODE → 1 session + tests).
 #   2. Spawns N GENUINELY INDEPENDENT reviewer sessions via
-#      "gc session new gastown.dog --no-attach".  NO shared context. Each
+#      "gc session new gate-reviewer --no-attach".  NO shared context. Each
 #      receives a unique targeted nudge describing exactly its review task.
 #   3. Polls verdict beads until all reviewers post PASS or FAIL (or timeout).
 #   4. On ALL-PASS  → direct-merge to production main + close source bead.
@@ -846,16 +846,26 @@ Run those commands and then exit your session. Do not start other work.
 TASK
 )
 
-  # Spawn an independent dog session (no attach, fresh wake mode)
-  SESSION_JSON=$(gc --city "$GC_CITY" session new gastown.dog \
+  # Spawn an independent reviewer session (no attach, fresh wake mode).
+  # Uses "gate-reviewer" template (not gastown.dog) to avoid consuming the
+  # dog pool's 3 permanent cap slots (ga-mzc3h). The gate-reviewer template has
+  # its own budget (max_active_sessions=6, min=0 → no permanent pool workers).
+  # Stderr is captured to a temp file (not swallowed) so failures are visible.
+  # NOTE: this loop runs at top-level script scope (not a function), so we do
+  # NOT use `local` here — `local` outside a function errors to stderr.
+  _spawn_err_file="/tmp/gate-reviewer-spawn-err-$$.${i}"
+  SESSION_JSON=$(gc --city "$GC_CITY" session new gate-reviewer \
     --no-attach \
     --title "gate-reviewer-$i: $BRANCH" \
-    --json 2>/dev/null || echo "{}")
+    --json \
+    2>"$_spawn_err_file" || echo "{}")
+  _spawn_err=$(head -c 300 "$_spawn_err_file" 2>/dev/null || echo "")
+  rm -f "$_spawn_err_file"
 
   SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.session_id // empty')
 
   if [ -z "$SESSION_ID" ]; then
-    err "Failed to spawn reviewer session $i. Aborting gate."
+    err "Failed to spawn reviewer session $i (ga-mzc3h). Aborting gate. spawn_err=${_spawn_err:-no output}"
     bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
     bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
     exit 1

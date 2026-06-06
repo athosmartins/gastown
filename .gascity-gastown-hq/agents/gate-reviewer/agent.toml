@@ -1,0 +1,23 @@
+# gate-reviewer: dedicated cap-exempt reviewer template for the quality gate.
+#
+# Why a separate template?
+#   gastown.dog has max_active_sessions=3, permanently occupied by the dog pool
+#   (dog-1, dog-2, dog-3). The gate spawns up to 3 independent reviewers per run
+#   (CODE tier), which would exhaust the dog cap and deadlock the gate.
+#   This template has its OWN budget, completely separate from the dog pool,
+#   so reviewer sessions never compete with pool workers for slots.
+#
+# Budget rationale:
+#   max_active_sessions=6 = 3 reviewers × 2 concurrent gate runs.
+#   If more concurrent gates are needed, raise this; the gate will hard-fail
+#   (not silently stall) if the cap is ever hit because we no longer suppress
+#   the spawn stderr (ga-mzc3h fix).
+#
+# min_active_sessions=0: no permanent pool workers. Sessions are spawned
+# on-demand by quality-gate-dispatcher.sh and drain when the review completes.
+
+scope = "city"
+min_active_sessions = 0
+max_active_sessions = 6
+idle_timeout = "1h"
+wake_mode = "fresh"
