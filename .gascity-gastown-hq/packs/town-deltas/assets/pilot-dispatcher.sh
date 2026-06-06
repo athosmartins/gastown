@@ -352,7 +352,6 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "gate:needs-human" \
       -n 0 2>/dev/null || echo "[]")
     RIG_BUGS=$(echo "$RIG_BUGS" | _filter_candidates | _filter_unblocked "$rig_path")
-    RIG_BUGS=$(echo "$RIG_BUGS" | jq --arg db "$rig_path" '[.[] | . + {_bead_db: $db}]' 2>/dev/null || echo "[]")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_BUGS" | jq -s 'add // []' 2>/dev/null || echo "[]")
 
     # Tier 1: tech-debt from rig DB
@@ -363,7 +362,6 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "gate:needs-human" \
       -n 0 2>/dev/null || echo "[]")
     RIG_DEBT=$(echo "$RIG_DEBT" | _filter_candidates | _filter_unblocked "$rig_path")
-    RIG_DEBT=$(echo "$RIG_DEBT" | jq --arg db "$rig_path" '[.[] | . + {_bead_db: $db}]' 2>/dev/null || echo "[]")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_DEBT" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
 
     # Tier 2: story:approved features from rig DB
@@ -375,7 +373,6 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "gate:needs-human" \
       -n 0 2>/dev/null || echo "[]")
     RIG_FEATURES=$(echo "$RIG_FEATURES" | _filter_candidates | _filter_unblocked "$rig_path")
-    RIG_FEATURES=$(echo "$RIG_FEATURES" | jq --arg db "$rig_path" '[.[] | . + {_bead_db: $db}]' 2>/dev/null || echo "[]")
     ALL_RIG_TIER2=$(echo "$ALL_RIG_TIER2 $RIG_FEATURES" | jq -s 'add // []' 2>/dev/null || echo "[]")
   done <<< "$RIG_PATHS"
 
@@ -458,11 +455,6 @@ dispatch_one() {
   STORY_CRITERIA=$(echo "$STORY" | jq -r '.acceptance_criteria // .metadata["story.criterios"] // ""')
   STORY_EQUILIBRIOS=$(echo "$STORY" | jq -r '.metadata["story.equilibrios"] // ""')
 
-  # _bead_db is injected by Step 2c rig fallback; absent for HQ beads → defaults to GC_CITY.
-  local BEAD_DB
-  BEAD_DB=$(echo "$STORY" | jq -r '._bead_db // empty' 2>/dev/null || echo "")
-  [ -z "$BEAD_DB" ] && BEAD_DB="$GC_CITY"
-
   # ── ga-jb4l: gate re-dispatch — surface reviewer feedback for needs-fix beads ──
   # A bead labeled gate:needs-fix previously FAILED the quality gate. The gate
   # attached the FAILing reviewers' reasons to it as a "GATE-FEEDBACK" comment.
@@ -472,7 +464,7 @@ dispatch_one() {
   if echo "$STORY_LABELS" | grep -q "gate:needs-fix"; then
     STORY_FIX_ATTEMPT=$(echo "$STORY_LABELS" | tr ',' '\n' \
       | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | tail -1)
-    STORY_GATE_FEEDBACK=$(bd -C "$BEAD_DB" comments "$STORY_ID" --json 2>/dev/null \
+    STORY_GATE_FEEDBACK=$(bd -C "$GC_CITY" comments "$STORY_ID" --json 2>/dev/null \
       | jq -r '[ .[]? | (.text // .body // "") | select(test("^GATE-FEEDBACK")) ] | last // ""' \
       2>/dev/null || echo "")
     log "  $STORY_ID is gate:needs-fix (attempt=${STORY_FIX_ATTEMPT:-?}) — injecting reviewer feedback (${#STORY_GATE_FEEDBACK} chars)."
@@ -500,7 +492,7 @@ FIXSEC
   if [ "$DRY_RUN" = "1" ]; then
     log "DRY_RUN=1 — WOULD: bd label add $STORY_ID pilot:dispatching"
   else
-    bd -C "$BEAD_DB" label add "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || {
+    bd -C "$GC_CITY" label add "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || {
       warn "Could not add pilot:dispatching to $STORY_ID (race condition or bd error). Skipping."
       return 1
     }
@@ -509,25 +501,19 @@ FIXSEC
   # Verify we won the race.
   if [ "$DRY_RUN" != "1" ]; then
     local VERIFY_JSON VERIFY_LABELS
-    VERIFY_JSON=$(bd -C "$BEAD_DB" show "$STORY_ID" --json 2>/dev/null || echo "[]")
+    VERIFY_JSON=$(bd -C "$GC_CITY" show "$STORY_ID" --json 2>/dev/null || echo "[]")
     VERIFY_LABELS=$(echo "$VERIFY_JSON" \
       | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' \
       2>/dev/null || echo "")
 
-    if [ -z "$VERIFY_LABELS" ]; then
-      warn "Could not verify $STORY_ID claim state (bd show returned empty). Releasing claim."
-      bd -C "$BEAD_DB" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
-      return 1
-    fi
-
     if echo "$VERIFY_LABELS" | grep -q "story:in-flight"; then
       log "Story $STORY_ID is already in-flight (race condition). Releasing claim."
-      bd -C "$BEAD_DB" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
     fi
     if echo "$VERIFY_LABELS" | grep -q "story:done"; then
       log "Story $STORY_ID is already done. Releasing claim."
-      bd -C "$BEAD_DB" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
     fi
   fi
@@ -568,7 +554,7 @@ FIXSEC
       | awk -v t="$BUILDER_TARGET" '$2==t && $3=="active"' | wc -l | tr -d ' ')
     if [ "${LIVE_BUILDER_SESSIONS:-0}" -ge 1 ] 2>/dev/null; then
       log "MUTEX(wa-1eos): builder $BUILDER_TARGET already has ${LIVE_BUILDER_SESSIONS} live session(s) — deferring $STORY_ID to next sweep (no duplicate spawn). Releasing claim."
-      bd -C "$BEAD_DB" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
     fi
   fi
@@ -807,7 +793,6 @@ No human review required."
       "✨ $STORY_TITLE ($STORY_ID, P${STORY_PRIORITY}, lane=$LANE → $BUILDER_TARGET)" \
       2>/dev/null || true
   fi
-  return 0
 }
 
 # ── Step 4: Dispatch into available lane slots ────────────────────────────────
