@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.guardian</string>
+
+  <!-- Gate+Pilot guardian: runs every 300s, detects real engine stalls / gate
+       jams / delivery failures, auto-heals, escalates to Mayor if unable.
+       "O VIGIA É VIGIADO": writes .gc/guardian.heartbeat each run;
+       gate-health-monitor.py emits [GUARDIAN-STALL] if that file goes stale.
+
+       DRAIN-SAFE: only touches scripts/ and this plist — no city.toml edits.
+
+       First-run procedure (supervised, as with pilot/gate-guard):
+         1. DRY_RUN=1 bash scripts/guardian-dispatch.sh  # review output
+         2. bash scripts/guardian-dispatch.sh             # single supervised run
+         3. launchctl load ~/Library/LaunchAgents/com.gascity.guardian.plist
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/guardian-dispatch.sh</string>
+  </array>
+
+  <key>StartInterval</key><integer>300</integer>
+
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/guardian-dispatch-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/guardian-dispatch-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>
