@@ -92,6 +92,41 @@ for _fn in _claim_bead _build_task_prompt _do_sling _transition_bead _notify_dis
     || _fail "sub-function MISSING: ${_fn}"
 done
 
+# ── Test 10: DRY_RUN notify is log-only (no real notify call) ─────────────────
+if awk '/_notify_dispatch\(\)/,/^}/' "$PILOT" \
+    | grep -qE 'if.*DRY_RUN.*=.*1'; then
+  if awk '/_notify_dispatch\(\)/,/^}/' "$PILOT" \
+      | sed -n '/if.*DRY_RUN/,/fi/p' | grep -qE '^\s*notify\b'; then
+    _fail "_notify_dispatch: DRY_RUN branch still calls notify (real HTTP request)"
+  else
+    _pass "_notify_dispatch: DRY_RUN branch does not call notify"
+  fi
+else
+  _fail "_notify_dispatch: no DRY_RUN guard found"
+fi
+
+# ── Test 11: _transition_bead failure captured (no unconditional in-flight log) ─
+if awk '/dispatch_one\(\)/,/^# ── Step 0/' "$PILOT" \
+    | grep -q '_transition_ok'; then
+  _pass "dispatch_one: _transition_bead return captured (no false in-flight log)"
+else
+  _fail "dispatch_one: _transition_bead result not captured (_transition_ok variable absent)"
+fi
+
+# ── Test 12: Untrusted fields sanitized before heredoc ────────────────────────
+if grep -q 'sed.*s.*TASK.*\[TASK\]' "$PILOT"; then
+  _pass "Heredoc delimiter sanitization present (TASK/FIXSEC lines replaced)"
+else
+  _fail "Heredoc delimiter sanitization MISSING — untrusted fields may truncate prompt"
+fi
+
+# ── Test 13: BEAD_ID_STALE guards against literal null ────────────────────────
+if awk '/BEAD_ID_STALE=/,/UPDATED_AT=/' "$PILOT" | grep -q 'continue'; then
+  _pass "BEAD_ID_STALE: empty guard with continue present"
+else
+  _fail "BEAD_ID_STALE: no guard against empty/null id from jq"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 printf "── Results: %d/%d passed ──\n" "$PASS" "$TOTAL"

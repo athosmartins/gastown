@@ -352,7 +352,8 @@ _do_sling() {
   fi
 
   local _sling_err_file _sling_err _sling_out
-  _sling_err_file="/tmp/pilot-sling-err.$$"
+  _sling_err_file=$(mktemp /tmp/pilot-sling-err.XXXXXX 2>/dev/null || echo "/tmp/pilot-sling-err.$$")
+  trap "rm -f '${_sling_err_file}'" RETURN
   _sling_out=$(gc --city "$GC_CITY" sling "$BUILDER_TARGET" \
     "$sling_title" \
     --nudge \
@@ -360,6 +361,7 @@ _do_sling() {
     2>"$_sling_err_file" || echo "{}")
   _sling_err=$(head -c 300 "$_sling_err_file" 2>/dev/null || echo "")
   rm -f "$_sling_err_file"
+  trap - RETURN
 
   _SLING_BEAD_ID=$(printf '%s' "$_sling_out" | jq -r '.bead_id // .id // empty' 2>/dev/null || echo "")
 
@@ -437,14 +439,12 @@ _notify_dispatch() {
   if [ "$DRY_RUN" = "1" ]; then
     local _tier_label
     _tier_label="$([ "$DISPATCH_TIER" = "bug" ] && echo "BUG/DEBT" || echo "feature")"
-    notify -t "Pilot DRY-RUN" -p 1 \
-      "Would dispatch $STORY_ID [$_tier_label/$LANE] (P${STORY_PRIORITY}) → $BUILDER_TARGET [DRY_RUN]" \
-      2>/dev/null || true
-  else
-    notify -t "✨ Pilot pegou uma história" -p 3 \
-      "✨ $STORY_TITLE ($STORY_ID, P${STORY_PRIORITY}, lane=$LANE → $BUILDER_TARGET)" \
-      2>/dev/null || true
+    log "DRY_RUN=1 — WOULD NOTIFY: dispatch $STORY_ID [$_tier_label/$LANE] (P${STORY_PRIORITY}) → $BUILDER_TARGET"
+    return 0
   fi
+  notify -t "✨ Pilot pegou uma história" -p 3 \
+    "✨ $STORY_TITLE ($STORY_ID, P${STORY_PRIORITY}, lane=$LANE → $BUILDER_TARGET)" \
+    2>/dev/null || true
 }
 
 # ── dispatch_one ──────────────────────────────────────────────────────────────
@@ -469,6 +469,12 @@ dispatch_one() {
   STORY_CRITERIA=$(echo "$STORY" | jq -r '.acceptance_criteria // .metadata["story.criterios"] // ""')
   STORY_EQUILIBRIOS=$(echo "$STORY" | jq -r '.metadata["story.equilibrios"] // ""')
 
+  # Sanitize untrusted bead fields: a bare line matching a heredoc delimiter would
+  # silently truncate the task prompt with no error. Replace exact delimiter lines.
+  STORY_CRITERIA=$(printf '%s'    "$STORY_CRITERIA"    | sed 's/^TASK$/[TASK]/; s/^FIXSEC$/[FIXSEC]/')
+  STORY_ESTRELA=$(printf '%s'     "$STORY_ESTRELA"     | sed 's/^TASK$/[TASK]/; s/^FIXSEC$/[FIXSEC]/')
+  STORY_EQUILIBRIOS=$(printf '%s' "$STORY_EQUILIBRIOS" | sed 's/^TASK$/[TASK]/; s/^FIXSEC$/[FIXSEC]/')
+
   # ── Gate re-dispatch: inject reviewer feedback ───────────────────────────────
   STORY_GATE_FEEDBACK="" STORY_FIX_ATTEMPT="" GATE_FIX_SECTION=""
   if echo "$STORY_LABELS" | grep -q "gate:needs-fix"; then
@@ -479,6 +485,7 @@ dispatch_one() {
       2>/dev/null || echo "")
     log "  $STORY_ID is gate:needs-fix (attempt=${STORY_FIX_ATTEMPT:-?}) — injecting reviewer feedback (${#STORY_GATE_FEEDBACK} chars)."
     if [ -n "$STORY_GATE_FEEDBACK" ]; then
+      STORY_GATE_FEEDBACK=$(printf '%s' "$STORY_GATE_FEEDBACK" | sed 's/^TASK$/[TASK]/; s/^FIXSEC$/[FIXSEC]/')
       GATE_FIX_SECTION=$(cat <<FIXSEC
 
 ## ⚠️ GATE RE-DISPATCH — fix THESE specific issues (fix attempt ${STORY_FIX_ATTEMPT:-?}/3)
@@ -547,11 +554,16 @@ FIXSEC
   _do_sling "$SLING_TITLE" || return 1
 
   # ── Transition bead labels ────────────────────────────────────────────────────
-  _transition_bead || true
+  local _transition_ok=1
+  _transition_bead || _transition_ok=0
 
   DISPATCH_END_EPOCH=$(date +%s)
   ELAPSED_S=$((DISPATCH_END_EPOCH - DISPATCH_EPOCH))
-  log "$DISPATCH_TIER [$LANE] $STORY_ID → story:in-flight (builder=$BUILDER_TARGET elapsed=${ELAPSED_S}s)"
+  if [ "$_transition_ok" = "1" ]; then
+    log "$DISPATCH_TIER [$LANE] $STORY_ID → story:in-flight (builder=$BUILDER_TARGET elapsed=${ELAPSED_S}s)"
+  else
+    warn "$DISPATCH_TIER [$LANE] $STORY_ID → story:in-flight FAILED — pilot:dispatching retained for TTL recovery (builder=$BUILDER_TARGET elapsed=${ELAPSED_S}s)"
+  fi
 
   # ── Log to pilot-dispatcher.jsonl ────────────────────────────────────────────
   NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -594,7 +606,8 @@ if [ "$STALE_COUNT" -gt "0" ]; then
   TTL_SECS=$((CLAIM_TTL_MINUTES * 60))
 
   echo "$STALE_JSON" | jq -c '.[]' | while IFS= read -r bead; do
-    BEAD_ID_STALE=$(echo "$bead" | jq -r '.id')
+    BEAD_ID_STALE=$(echo "$bead" | jq -r '.id // empty' 2>/dev/null || echo "")
+    [ -z "$BEAD_ID_STALE" ] && continue
     UPDATED_AT=$(echo "$bead" | jq -r '.updated_at // .created_at // ""')
     if [ -n "$UPDATED_AT" ]; then
       UPDATED_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null \
