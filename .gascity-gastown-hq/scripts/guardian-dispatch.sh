@@ -51,7 +51,7 @@ REALERT_SEC=900             # re-alert same incident class every 15min
 
 mkdir -p "$LOG_DIR"
 
-log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" | tee -a "$LOG"; }
+log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" | tee -a "$LOG" >&2; }
 warn() { log "WARN: $*"; }
 
 # Append a JSON record to guardian.jsonl
@@ -285,47 +285,32 @@ check_engine_stall() {
 
   log "Engine stall detected: $class — $label log stale ${age}s (> ${ENGINE_STALL_SEC}s threshold)"
 
-  # Attempt to restart stalled services inline (attempt 1 recovery)
+  # On first detection, attempt inline launchctl restart as a best-effort pre-step.
+  # Incident lifecycle always routes through handle_incident regardless of outcome.
   local inc; inc=$(state_get_incident "$class")
   if [ "$inc" = "null" ]; then
-    # First detection — try launchctl restart before opening a bead
-    log "Attempting launchctl restart for $class"
+    log "First detection — attempting launchctl restart for $class"
     local restarted=0
     for svc in $launchd_labels; do
       local pid; pid=$(launchd_pid "$svc")
       if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
-        # Service is running (possibly hung) — force restart
         log "kickstart -k $svc (PID=$pid, log stale)"
         launchctl kickstart -k "gui/$(id -u)/$svc" 2>/dev/null && restarted=1 || \
           launchctl kickstart -k "$svc" 2>/dev/null && restarted=1 || true
       else
-        # Service not running — start it
         log "start $svc (not running, log stale)"
         launchctl start "$svc" 2>/dev/null && restarted=1 || true
       fi
     done
     if [ "$restarted" = "1" ]; then
-      log "Issued launchctl restart for $class — will verify on next cycle"
+      log "Issued launchctl restart for $class — verifying on next cycle"
       log_json "$(printf '{"ts":"%s","event":"engine_restart_attempted","class":"%s","services":"%s"}' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$class" "$launchd_labels")"
       notify -t "Guardian" "Engine stall: attempted restart of $label — verifying next cycle" \
         2>/dev/null || true
-      # Open a "monitoring" incident so we track recovery
-      local bead_id
-      bead_id=$(open_incident "$class" \
-        "Guardian: $label engine stall (auto-restart attempted)" \
-        "$(printf 'Guardian detected %s log stale %ds (>%ds threshold).\n\nServices: %s\n\nAuto-restart was attempted via launchctl. Verifying recovery on next guardian cycle (~5min).\n\nIf the engine is still stale on the next cycle, this incident will trigger a repair worker dispatch.' \
-          "$label" "$age" "$ENGINE_STALL_SEC" "$launchd_labels")" \
-        "$(printf 'GUARDIAN ENGINE-STALL REPAIR\n\nEngine: %s\nLog file: %s\nStale: %ds\n\n1. Check: launchctl list %s\n2. If log still stale: launchctl kickstart -k each service\n3. Check logs: tail -50 %s\n4. Once log updates within 5 min, close this bead.\n5. If engine does not recover: escalate via mail to mayor.' \
-          "$label" "$log_file" "$age" "$launchd_labels" "$log_file")") || return 0
-      local now; now=$(date +%s)
-      state_set_incident "$class" "$(printf '{"bead":"%s","attempt":1,"opened_at":%d,"last_checked":%d,"escalated":false}' \
-        "$bead_id" "$now" "$now")"
-      return 0
     fi
   fi
 
-  # No inline fix possible or prior incident open — use handle_incident lifecycle
   handle_incident "$class" "1" \
     "Guardian: $label engine stall" \
     "$(printf 'Guardian detected %s log stale %ds (>%ds threshold).\n\nServices: %s\n\nThe engine is not sweeping. Gate/pilot work may be stalled.' \
