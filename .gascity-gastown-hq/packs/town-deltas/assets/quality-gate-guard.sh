@@ -647,6 +647,14 @@ if [ -z "$BRANCH" ] || ! validate_branch "$BRANCH"; then
   VALIDATION_OK=false
 fi
 
+# ga-mxhf6: protected-branch guard — builders must NEVER commit directly to main/master.
+# branch=main is always an ancestor of itself, so the dispatcher supersedes the marker
+# without running any reviewers, silently bypassing the gate.
+if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+  err "branch '$BRANCH' is a protected branch. Builders must always use feature branches (e.g. fix/<id>-<desc>). Rejecting marker."
+  VALIDATION_OK=false
+fi
+
 if [ -z "$BEAD_ID" ] || ! validate_bead_id "$BEAD_ID"; then
   err "bead_id '$BEAD_ID' is missing or has unexpected format. Deferring."
   VALIDATION_OK=false
