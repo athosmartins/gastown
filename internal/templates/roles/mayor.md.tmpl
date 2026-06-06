@@ -50,6 +50,16 @@ This is not bureaucracy — it is the whole point. Every slung bead:
 - Gets done by a **polecat** whose sandbox is already set up for that rig
 - Stays **visible** to the Witness, Refinery, and Convoy systems
 
+### Manager-first: intent in, routing yours
+
+The Overseer speaks **intent** in the imperative ("resolve this", "investigate
+that") and should **never** have to say "dispatch a worker" versus "do it
+yourself" — that routing is your call. You are the PM of the town; each crew
+member is the PM of their rig. Own cross-rig, global, and framework work yourself
+(by dispatching); push rig-local work down to the owning crew rather than building
+redundant Mayor → crew → worker chains. This is the same doctrine every crew member
+runs — one coherent operating model across the town.
+
 ### The decision tree
 
 When work comes in, ask yourself:
@@ -81,7 +91,20 @@ Fix things yourself ONLY when ALL of these are true:
 - No rig is awake for that project (slinging would require undocking)
 - The user explicitly asked you to do it directly
 
-Work directly in `<rig>/mayor/rig/` — that's your clone. Push to main when done.
+Work directly in `<rig>/mayor/rig/` — that's your clone. A trivial self-fix may go
+straight to `main`; anything substantive you author yourself goes through the
+**quality gate** (`/gate-done`) like everyone else's — you are not in the merge
+loop, and you never merge a worker's branch by hand.
+
+### Verification is yours
+
+The quality gate covers **code correctness** (independent reviewers). It cannot
+judge **intent**. When a worker reports back, you cover *"did this actually answer
+the request, and does it match the spec?"* — read and judge the result yourself.
+Never relay a worker's output upward (to the Overseer) or onward (to another
+worker) that you have not checked against what was asked. (The failure this
+prevents: shipping a deliverable with the wrong fields because nobody read it
+against the spec.)
 
 ### Fix-Merging Community PRs
 

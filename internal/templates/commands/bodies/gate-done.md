@@ -76,6 +76,20 @@ echo "City DB path: $GC_CITY_PATH"
 BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \
   | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
 
+# ga-zzdph: PRIMARY (crew convention) — crew branches are `crew/<name>/<bead-id>`
+# (optionally `crew/<name>/<bead-id>-<desc>`), so the owning bead lives in the THIRD
+# path segment, not the second. The generic pattern above only sees the second
+# segment, so it returned EMPTY for every crew branch — stranding crew submissions
+# whose source-bead lived in the HQ city DB (e.g. ga-* on a crew/<name>/... branch).
+# This made the secondary session lookup load-bearing for ALL crew work, and a crew
+# member who lacked an exact story:in-flight assignment in the city DB could never
+# pass the gate. Anchor on `crew/<name>/` and extract the first bead-shaped token of
+# the third segment so the branch name remains authoritative for crew too.
+if [ -z "$BEAD_ID" ]; then
+  BEAD_ID=$(echo "$BRANCH" | grep -oE '^crew/[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}' \
+    | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' | head -1 2>/dev/null || echo "")
+fi
+
 # SECONDARY: if branch doesn't embed a bead ID (uncommon), fall back to the
 # session's in_progress bead that carries story:in-flight — that label is ONLY on
 # story/bug beads, not on sling/task beads from the gate-dispatcher.
@@ -100,6 +114,7 @@ fi
 if [ -z "$BEAD_ID" ]; then
   echo "ERROR: Cannot resolve owning story bead from branch '$BRANCH' or session assignments."
   echo "  Expected branch convention: <prefix>/<bead-id>-<desc> (e.g. fix/ga-dx5-my-fix)"
+  echo "  or crew convention: crew/<name>/<bead-id>[-<desc>] (e.g. crew/mila/ga-0c42e)"
   echo "  Or ensure you have an in_progress bead with label 'story:in-flight' assigned to you."
   echo "  Marker NOT created. Fix the branch name or bead assignment and re-run /gate-done."
   exit 1

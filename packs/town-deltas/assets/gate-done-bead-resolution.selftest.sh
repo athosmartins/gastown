@@ -36,8 +36,16 @@ bad() { FAIL=$((FAIL+1)); echo "  ✗ $1"; }
 # diverge — we assert the live source still defines the same pattern (section v).
 extract_bead_from_branch() {
   local branch="$1"
-  echo "$branch" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \
-    | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo ""
+  local bead
+  # PRIMARY (generic): <prefix>/<bead-id>-<desc>  (bead in 2nd segment)
+  bead=$(echo "$branch" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \
+    | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
+  # PRIMARY (crew, ga-zzdph): crew/<name>/<bead-id>[-<desc>]  (bead in 3rd segment)
+  if [ -z "$bead" ]; then
+    bead=$(echo "$branch" | grep -oE '^crew/[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}' \
+      | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' | head -1 2>/dev/null || echo "")
+  fi
+  echo "$bead"
 }
 
 echo "── (i) Branch-name extraction: PRIMARY path ──"
@@ -49,6 +57,31 @@ GOT=$(extract_bead_from_branch "feat/ga-abc-new-feature")
 
 GOT=$(extract_bead_from_branch "chore/wa-x1y2-cleanup")
 [ "$GOT" = "wa-x1y2" ] && ok "chore/<ID>-desc → wa-x1y2" || bad "chore/<ID>-desc should give wa-x1y2, got '$GOT'"
+
+echo "── (i-crew) ga-zzdph: crew/<name>/<bead-id> convention (bead in 3rd segment) ──"
+# The incident: Mila's crew/mila/ga-0c42e branch (source-bead ga-0c42e lives in the
+# HQ city DB) extracted EMPTY under the generic pattern, so /gate-done could not bind
+# the marker to the HQ story bead. These assertions lock the crew convention in.
+GOT=$(extract_bead_from_branch "crew/mila/ga-0c42e")
+[ "$GOT" = "ga-0c42e" ] && ok "crew/<name>/<ID> → ga-0c42e (the incident branch)" \
+  || bad "crew/mila/ga-0c42e should give ga-0c42e, got '$GOT'"
+
+GOT=$(extract_bead_from_branch "crew/mila/ga-0c42e-painel-ui")
+[ "$GOT" = "ga-0c42e" ] && ok "crew/<name>/<ID>-desc → ga-0c42e" \
+  || bad "crew/mila/ga-0c42e-painel-ui should give ga-0c42e, got '$GOT'"
+
+GOT=$(extract_bead_from_branch "crew/batista/wa-rlzo")
+[ "$GOT" = "wa-rlzo" ] && ok "crew/<name>/<ID> → wa-rlzo (same-DB case still works)" \
+  || bad "crew/batista/wa-rlzo should give wa-rlzo, got '$GOT'"
+
+# A crew branch whose 3rd segment has no bead-shaped token (no <pfx>-<id> dash)
+# returns empty → falls through to the story:in-flight lookup, then fail-closed.
+# (A 3rd segment that merely LOOKS bead-shaped, e.g. fix-typo, is indistinguishable
+# from a real id by regex — same inherent ambiguity as the generic pattern — and is
+# caught downstream: the guard rejects a marker whose source-bead does not resolve.)
+GOT=$(extract_bead_from_branch "crew/mila/nobeadhere")
+[ -z "$GOT" ] && ok "crew/<name>/<no-dash-slug> → empty (name not mistaken for bead)" \
+  || bad "crew branch without a bead-shaped 3rd segment should return empty, got '$GOT'"
 
 echo "── (ii) Bare branch: no embedded bead-id → branch extraction returns empty ──"
 GOT=$(extract_bead_from_branch "fix/just-a-description-no-id")
@@ -114,6 +147,11 @@ if [ -f "$GATE_DONE" ]; then
   grep -q "grep -oE '^\[^/\]+/\[a-z\]" "$GATE_DONE" \
     && ok "gate-done uses branch-name PRIMARY extraction (grep -oE pattern)" \
     || bad "gate-done missing branch-name primary extraction"
+
+  # ga-zzdph: the crew convention extraction must be present in the source.
+  grep -q "grep -oE '^crew/\[^/\]+/\[a-z\]" "$GATE_DONE" \
+    && ok "gate-done extracts bead from crew/<name>/<bead-id> branches (ga-zzdph)" \
+    || bad "gate-done missing crew/<name>/<bead-id> extraction (ga-zzdph regression)"
 
   grep -q "story:in-flight" "$GATE_DONE" \
     && ok "gate-done filters secondary lookup by story:in-flight label" \
