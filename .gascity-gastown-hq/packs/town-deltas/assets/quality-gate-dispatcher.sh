@@ -491,8 +491,13 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
   elif [ "$MT_VERDICT" = "1" ]; then
     HAS_CONFLICT=1
     # Capture conflicting file names from the structured --write-tree conflict block.
+    # The trailing `|| true` is REQUIRED: merge-tree --write-tree returns rc=1 on a
+    # conflict, and under `set -euo pipefail` (line 30) `pipefail` propagates that
+    # non-zero through the pipe, so the bare `CONFLICT_FILES=$(...)` assignment would
+    # trip `set -e` and SILENTLY kill the dispatcher mid-conflict-handling — head-of-
+    # line-blocking the whole gate on the first conflicting branch (ga-mzc3h follow-up).
     CONFLICT_FILES=$(git_rig merge-tree --write-tree --name-only "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null \
-      | tail -n +2 | head -5 | tr '\n' ' ' | cut -c1-300)
+      | tail -n +2 | head -5 | tr '\n' ' ' | cut -c1-300 || true)
     [ -z "$CONFLICT_FILES" ] && CONFLICT_FILES="merge conflict (files unavailable)"
   fi
 
