@@ -322,7 +322,7 @@ check_engine_stall() {
   local age; age=$(file_age_sec "$log_file")
 
   if [ "$age" -lt "$ENGINE_STALL_SEC" ]; then
-    handle_incident "$class" "0" "" "" ""
+    handle_incident "$class" "0" "" "" "" || true
     return 0
   fi
 
@@ -367,7 +367,7 @@ check_engine_stall() {
       "$label" "$age" "$ENGINE_STALL_SEC" "$launchd_labels")" \
     "$(printf 'GUARDIAN ENGINE-STALL REPAIR\n\nEngine: %s\nLog: %s (stale %ds)\nServices: %s\n\n1. launchctl list each service above\n2. launchctl kickstart -k <hung service> OR launchctl start <stopped service>\n3. Monitor: watch log mtime for 5min\n4. Close bead when engine is sweeping again (log updated within last 3min).' \
       "$label" "$log_file" "$age" "$launchd_labels")" \
-    "$label log stale ${age}s"
+    "$label log stale ${age}s" || true
 }
 
 # ── Real-jam detection ────────────────────────────────────────────────────────
@@ -398,13 +398,19 @@ check_real_jams() {
     local age=$(( now - ts_epoch ))
     [ "$age" -lt "$REAL_JAM_SEC" ] && continue
 
-    # Verify the marker is still actually queued (not already resolved)
-    local still_queued
-    still_queued=$(bd -C "$GC_CITY" show "$marker" --json 2>/dev/null \
+    # Verify the marker is still actually queued (not already resolved).
+    # bd failure (Dolt outage) must not be conflated with "not queued" —
+    # treat it as a skip so valid incidents survive the outage.
+    local still_queued bd_out
+    if ! bd_out=$(bd -C "$GC_CITY" show "$marker" --json 2>/dev/null); then
+      log "bd show $marker failed — skipping jam check for this marker this cycle"
+      continue
+    fi
+    still_queued=$(printf '%s' "$bd_out" \
       | jq -r 'if type=="array" then .[0] else . end | .labels // [] | map(select(. == "gate-status:queued")) | length > 0' \
       2>/dev/null || echo "false")
     if [ "$still_queued" != "true" ]; then
-      handle_incident "real-jam:$marker" "0" "" "" ""
+      handle_incident "real-jam:$marker" "0" "" "" "" || true
       continue
     fi
 
