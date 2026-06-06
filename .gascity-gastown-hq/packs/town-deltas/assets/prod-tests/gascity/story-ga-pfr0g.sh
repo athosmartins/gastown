@@ -20,8 +20,8 @@ fail() { echo "[prod-test:gascity ga-pfr0g] FAIL: $*" >&2; exit 1; }
 # ── 1. Binary version check ────────────────────────────────────────────────────
 log "Checking binary version..."
 VERSION=$("$GC" version 2>/dev/null || echo "unknown")
-if [[ "$VERSION" != *"pfr0g"* ]] && [[ "$VERSION" != *"1.2.3"* ]]; then
-    fail "binary version $VERSION does not include ga-pfr0g fix (want *pfr0g* or >= 1.2.3)"
+if [[ "$VERSION" != *"pfr0g"* ]]; then
+    fail "binary version $VERSION does not include ga-pfr0g fix (want *pfr0g* in version string)"
 fi
 log "  gc version: $VERSION ✓"
 
@@ -29,12 +29,12 @@ log "  gc version: $VERSION ✓"
 log "Checking max_active_sessions enforcement in gc session new..."
 
 # Find a single-identity agent (max_active_sessions=1) that has a live session.
+# Discover agents dynamically from city config rather than a hardcoded list.
 CANDIDATE=""
-for agent in mila-wa batista-wa batista-ps batista-lx oracle-wa thies-wa peter-wa digo-wa; do
-    cfg="$CITY/agents/$agent/agent.toml"
+for cfg in "$CITY"/agents/*/agent.toml; do
     [[ -f "$cfg" ]] || continue
     grep -q "^max_active_sessions = 1" "$cfg" || continue
-    # Check if a session exists for this agent.
+    agent=$(basename "$(dirname "$cfg")")
     if "$GC" --city "$CITY" session list 2>/dev/null | grep -qE "^[[:space:]]*ga-session-[a-f0-9]+[[:space:]]+${agent}[[:space:]]+(active|creating|start-pending)"; then
         CANDIDATE="$agent"
         break
@@ -51,8 +51,10 @@ log "  found live single-identity session for: $CANDIDATE"
 
 # Run gc session new against the agent that's already at capacity.
 # With the fix, this must fail with 'max_active_sessions' in stderr.
-STDERR_OUT=$("$GC" --city "$CITY" session new "$CANDIDATE" --no-attach 2>&1 1>/dev/null || true)
-EXIT_CODE=$("$GC" --city "$CITY" session new "$CANDIDATE" --no-attach 2>/dev/null; echo $?)
+# Single invocation: stderr captured (2>&1 redirected before stdout→/dev/null),
+# exit code captured immediately from the same run.
+STDERR_OUT=$("$GC" --city "$CITY" session new "$CANDIDATE" --no-attach 2>&1 >/dev/null)
+EXIT_CODE=$?
 
 if [[ "$EXIT_CODE" == "0" ]]; then
     # A second session was created — the fix is not working. Close the rogue session.
