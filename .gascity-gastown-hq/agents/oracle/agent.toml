@@ -1,1 +1,2 @@
 work_dir = "/Users/athos/gt/whatsapp_automation/crew/oracle"
+max_active_sessions = 1
