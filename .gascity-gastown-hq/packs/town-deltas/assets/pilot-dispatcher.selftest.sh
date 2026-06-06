@@ -161,6 +161,25 @@ else
   bad "did not pick the highest-priority bug when nothing was blocked"
 fi
 
+# ── Structural tests: classify_lane and rig_to_builder coverage ──────────────
+# Use || true on bare $() grep substitutions to prevent set -e aborts if the
+# function is renamed — the grep exit code is captured into ok/bad, not set -e.
+echo "Structural: classify_lane() and rig_to_builder() coverage"
+
+grep -A 10 "^rig_to_builder()" "$DISPATCHER" | grep -q "whatsapp_automation" \
+  && ok "rig_to_builder: wa mapping present" || bad "rig_to_builder: wa mapping missing"
+
+grep -A 10 "^rig_to_builder()" "$DISPATCHER" | grep -q "gastown.dog" \
+  && ok "rig_to_builder: default gastown.dog" || bad "rig_to_builder: default missing"
+
+_fn_body=$(grep -A 30 "^classify_lane()" "$DISPATCHER" | head -30 || true)
+echo "$_fn_body" | grep -q "lane:big" \
+  && ok "classify_lane: lane:big check" || bad "classify_lane: lane:big missing"
+
+_fn_body=$(grep -A 30 "^classify_lane()" "$DISPATCHER" | head -30 || true)
+echo "$_fn_body" | grep -q "BIG_CRITERIA_THRESHOLD" \
+  && ok "classify_lane: BIG_CRITERIA_THRESHOLD threshold" || bad "classify_lane: threshold missing"
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

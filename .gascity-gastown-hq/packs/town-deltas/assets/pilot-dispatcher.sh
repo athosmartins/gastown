@@ -506,6 +506,12 @@ FIXSEC
       | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' \
       2>/dev/null || echo "")
 
+    if [ -z "$VERIFY_LABELS" ]; then
+      warn "Could not verify $STORY_ID claim state (bd show returned empty). Releasing claim."
+      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      return 1
+    fi
+
     if echo "$VERIFY_LABELS" | grep -q "story:in-flight"; then
       log "Story $STORY_ID is already in-flight (race condition). Releasing claim."
       bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
@@ -793,6 +799,7 @@ No human review required."
       "✨ $STORY_TITLE ($STORY_ID, P${STORY_PRIORITY}, lane=$LANE → $BUILDER_TARGET)" \
       2>/dev/null || true
   fi
+  return 0
 }
 
 # ── Step 4: Dispatch into available lane slots ────────────────────────────────
