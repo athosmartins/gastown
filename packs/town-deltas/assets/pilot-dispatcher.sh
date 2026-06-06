@@ -98,13 +98,9 @@ TIER2_EXCLUDES=(
 rig_to_builder() {
   local rig="$1"
   case "$rig" in
-    gascity)                echo "gastown.dog"  ;;
-    whatsapp_automation|wa) echo "digo"         ;;
-    property_scrapers|ps)   echo "batista-ps"   ;;
-    gastown|gt)             echo "gastown.dog"  ;;
-    lexbh|lx)               echo "gastown.dog"  ;;
-    marketing|ma)           echo "gastown.dog"  ;;
-    *)                      echo "gastown.dog"  ;;
+    whatsapp_automation|wa) echo "digo"      ;;
+    property_scrapers|ps)   echo "batista-ps" ;;
+    *)                      echo "gastown.dog" ;;
   esac
 }
 
@@ -183,7 +179,7 @@ _filter_unblocked() {
   after=$(printf '%s' "$filtered" | jq 'length' 2>/dev/null || echo "0")
 
   if [ "$before" != "$after" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: excluded $((before - after)) blocked candidate(s) in $db_dir (unresolved deps — ga-5ew fix)" >&2
+    warn "excluded $((before - after)) blocked candidate(s) in $db_dir (unresolved deps — ga-5ew fix)" >&2
   fi
   printf '%s' "$filtered"
 }
@@ -233,28 +229,58 @@ _claim_bead() {
 # _build_task_prompt — populate _DISPATCH_TASK global.
 # Reads: STORY_ID STORY_TITLE STORY_PRIORITY STORY_RIG BEAD_DB LANE DISPATCH_TIER
 #        STORY_CRITERIA STORY_ESTRELA STORY_EQUILIBRIOS GATE_FIX_SECTION
+# Tier-specific text is extracted into local variables; shared doctrine, steps header,
+# and claim block are written once in a single heredoc (no duplication).
 _build_task_prompt() {
-  if [ "$DISPATCH_TIER" = "bug" ]; then
-    _DISPATCH_TASK=$(cat <<TASK
-PILOT DISPATCH — Bug/tech-debt assigned for autonomous fix
+  local _hdr _id_label _type_line _job _crit_label _star_label _step3 _step4 \
+        _verb _done_verb _loop_end
 
-Bead ID: $STORY_ID
+  if [ "$DISPATCH_TIER" = "bug" ]; then
+    _hdr="Bug/tech-debt assigned for autonomous fix"
+    _id_label="Bead ID"
+    _type_line="BUG / TECH-DEBT (Tier 1 — dispatched BEFORE new features)"
+    _job="Fix this bug or tech-debt item completely. Do NOT wait for a human.
+\"Só depois do sistema perfeito é que a gente faz novas features.\" — system quality first."
+    _crit_label="Description / Acceptance Criteria"
+    _star_label="Additional Context"
+    _step3="Diagnose root cause, implement fix on a branch (name: fix/${STORY_ID})."
+    _step4="Add a regression test if applicable."
+    _verb="fix"
+    _done_verb="fix is complete"
+    _loop_end="bead closed"
+  else
+    _hdr="Story assigned for autonomous build"
+    _id_label="Story ID"
+    _type_line="FEATURE (Tier 2 — dispatched only because no open bugs/tech-debt)"
+    _job="Build this story from acceptance criteria to /gate-done. Do NOT wait for a human."
+    _crit_label="Acceptance Criteria"
+    _star_label="Estrela Guia (north star)"
+    _step3="Implement the story on a feature branch (name: feat/${STORY_ID} or story/${STORY_ID})."
+    _step4="Add a story-specific prod test at the required path (see delivery-runbooks.toml)."
+    _verb="build"
+    _done_verb="implementation is complete"
+    _loop_end="story:done"
+  fi
+
+  _DISPATCH_TASK=$(cat <<TASK
+PILOT DISPATCH — $_hdr
+
+$_id_label: $STORY_ID
 Title: $STORY_TITLE
 Priority: P${STORY_PRIORITY}
-Type: BUG / TECH-DEBT (Tier 1 — dispatched BEFORE new features)
+Type: $_type_line
 Lane: $LANE
 Rig: $STORY_RIG
 City: $BEAD_DB
 
 ## Your job
-Fix this bug or tech-debt item completely. Do NOT wait for a human.
-"Só depois do sistema perfeito é que a gente faz novas features." — system quality first.
+$_job
 $GATE_FIX_SECTION
 
-## Description / Acceptance Criteria
+## $_crit_label
 $STORY_CRITERIA
 
-## Additional Context
+## $_star_label
 $STORY_ESTRELA
 
 ## Equilibrios (constraints to preserve)
@@ -262,16 +288,16 @@ $STORY_EQUILIBRIOS
 
 ## DOCTRINE — read carefully
 - You are the BUILDER. Human never merges. Gate (G) and Delivery (①) are autonomous.
-- When your fix is complete: run /gate-done — this feeds the autonomous gate.
-- DO NOT ask for approval. DO NOT send to Athos. Just fix, push, gate-done.
-- The autonomous loop: /gate-done → G reviews → merges → ① deploys → bead closed.
+- When your $_done_verb: run /gate-done — this feeds the autonomous gate.
+- DO NOT ask for approval. DO NOT send to Athos. Just $_verb, push, gate-done.
+- The autonomous loop: /gate-done → G reviews → merges → ① deploys → $_loop_end.
 - If /gate-done fails validation (no commits, no branch), fix the issue and retry.
 
 ## Steps
 1. Read the full bead: bd -C "$BEAD_DB" show "$STORY_ID"
 2. Run gc prime to load your full context.
-3. Diagnose root cause, implement fix on a branch (name: fix/$STORY_ID).
-4. Add a regression test if applicable.
+3. $_step3
+4. $_step4
 5. Commit, push, then run /gate-done.
 
 ## Claim your work (do this first)
@@ -281,53 +307,6 @@ bd -C "$BEAD_DB" status in_progress "$STORY_ID"
 Start now. Do not wait for permission.
 TASK
 )
-  else
-    _DISPATCH_TASK=$(cat <<TASK
-PILOT DISPATCH — Story assigned for autonomous build
-
-Story ID: $STORY_ID
-Title: $STORY_TITLE
-Priority: P${STORY_PRIORITY}
-Type: FEATURE (Tier 2 — dispatched only because no open bugs/tech-debt)
-Lane: $LANE
-Rig: $STORY_RIG
-City: $BEAD_DB
-
-## Your job
-Build this story from acceptance criteria to /gate-done. Do NOT wait for a human.
-$GATE_FIX_SECTION
-
-## Acceptance Criteria
-$STORY_CRITERIA
-
-## Estrela Guia (north star)
-$STORY_ESTRELA
-
-## Equilibrios (constraints to preserve)
-$STORY_EQUILIBRIOS
-
-## DOCTRINE — read carefully
-- You are the BUILDER. Human never merges. Gate (G) and Delivery (①) are autonomous.
-- When your implementation is complete: run /gate-done — this feeds the autonomous gate.
-- DO NOT ask for approval. DO NOT send to Athos. Just build, push, gate-done.
-- The autonomous loop: /gate-done → G reviews → merges → ① deploys → story:done.
-- If /gate-done fails validation (no commits, no branch), fix the issue and retry.
-
-## Steps
-1. Read the full story bead: bd -C "$BEAD_DB" show "$STORY_ID"
-2. Run gc prime to load your full context.
-3. Implement the story on a feature branch (name: feat/$STORY_ID or story/$STORY_ID).
-4. Add a story-specific prod test at the required path (see delivery-runbooks.toml).
-5. Commit, push, then run /gate-done.
-
-## Claim your work (do this first)
-bd -C "$BEAD_DB" assign "$STORY_ID" "\$GC_ALIAS"
-bd -C "$BEAD_DB" status in_progress "$STORY_ID"
-
-Start now. Do not wait for permission.
-TASK
-)
-  fi
 }
 
 # _do_sling <sling_title> — dispatch via gc sling, verify bead in Dolt, nudge builder.
@@ -590,36 +569,54 @@ FIXSEC
   _notify_dispatch
 }
 
-# ── Step 0: TTL recovery — release stale pilot:dispatching claims ─────────────
-# Releases any bead whose pilot:dispatching claim is older than CLAIM_TTL_MINUTES.
-# No story:approved filter — Tier 1 (bug/tech-debt) beads never carry story:approved
-# but can get stale pilot:dispatching claims that must also be recovered.
+# ── TTL recovery helper ───────────────────────────────────────────────────────
+# _ttl_recover_db <db_dir> <now_epoch> <ttl_secs>
+# Scans <db_dir> for stale pilot:dispatching claims and releases them.
+_ttl_recover_db() {
+  local _db="$1" _now_epoch="$2" _ttl_secs="$3"
+  local _stale_json _stale_count
+  _stale_json=$(bd -C "$_db" list --json --all \
+    -l "pilot:dispatching" \
+    2>/dev/null || echo "[]")
+  _stale_count=$(echo "$_stale_json" | jq 'length' 2>/dev/null || echo "0")
+  [ "$_stale_count" -eq 0 ] && return 0
 
-STALE_JSON=$(bd -C "$GC_CITY" list --json --all \
-  -l "pilot:dispatching" \
-  2>/dev/null || echo "[]")
-
-STALE_COUNT=$(echo "$STALE_JSON" | jq 'length' 2>/dev/null || echo "0")
-
-if [ "$STALE_COUNT" -gt "0" ]; then
-  NOW_EPOCH=$(date +%s)
-  TTL_SECS=$((CLAIM_TTL_MINUTES * 60))
-
-  echo "$STALE_JSON" | jq -c '.[]' | while IFS= read -r bead; do
+  log "TTL recovery: $_stale_count stale pilot:dispatching candidate(s) in $_db"
+  echo "$_stale_json" | jq -c '.[]' | while IFS= read -r bead; do
     BEAD_ID_STALE=$(echo "$bead" | jq -r '.id // empty' 2>/dev/null || echo "")
     [ -z "$BEAD_ID_STALE" ] && continue
     UPDATED_AT=$(echo "$bead" | jq -r '.updated_at // .created_at // ""')
     if [ -n "$UPDATED_AT" ]; then
       UPDATED_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null \
-        || date -d "$UPDATED_AT" +%s 2>/dev/null || echo "$NOW_EPOCH")
-      AGE_SECS=$((NOW_EPOCH - UPDATED_EPOCH))
-      if [ "$AGE_SECS" -gt "$TTL_SECS" ]; then
-        warn "Releasing stale pilot:dispatching claim on $BEAD_ID_STALE (age=${AGE_SECS}s > TTL=${TTL_SECS}s)"
-        bd -C "$GC_CITY" label remove "$BEAD_ID_STALE" "pilot:dispatching" -q 2>/dev/null || true
+        || date -d "$UPDATED_AT" +%s 2>/dev/null || echo "$_now_epoch")
+      AGE_SECS=$((_now_epoch - UPDATED_EPOCH))
+      if [ "$AGE_SECS" -gt "$_ttl_secs" ]; then
+        warn "Releasing stale pilot:dispatching claim on $BEAD_ID_STALE in $_db (age=${AGE_SECS}s > TTL=${_ttl_secs}s)"
+        bd -C "$_db" label remove "$BEAD_ID_STALE" "pilot:dispatching" -q 2>/dev/null || true
       fi
     fi
   done
-fi
+}
+
+# ── Step 0: TTL recovery — release stale pilot:dispatching claims ─────────────
+# Releases any bead whose pilot:dispatching claim is older than CLAIM_TTL_MINUTES.
+# No story:approved filter — Tier 1 (bug/tech-debt) beads never carry story:approved
+# but can get stale pilot:dispatching claims that must also be recovered.
+# Scans BOTH HQ DB and all rig DBs: _claim_bead writes pilot:dispatching to BEAD_DB,
+# which is a rig DB path for Step 2c (rig-fallback) candidates. Without scanning rig
+# DBs, a crash after claim but before _transition_bead permanently locks those beads.
+
+TTL_NOW_EPOCH=$(date +%s)
+TTL_SECS=$((CLAIM_TTL_MINUTES * 60))
+
+_ttl_recover_db "$GC_CITY" "$TTL_NOW_EPOCH" "$TTL_SECS"
+
+_ttl_rig_paths=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
+  | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
+while IFS= read -r _ttl_rig; do
+  [ -z "$_ttl_rig" ] || [ ! -d "$_ttl_rig" ] && continue
+  _ttl_recover_db "$_ttl_rig" "$TTL_NOW_EPOCH" "$TTL_SECS"
+done <<< "$_ttl_rig_paths"
 
 # ── Step 1: Per-lane capacity check ──────────────────────────────────────────
 

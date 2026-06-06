@@ -6,6 +6,10 @@
 # so the dispatcher reaches "No dispatchable candidates" and exits 0.
 # Structural tests grep the script for design-invariant properties.
 #
+# Function body extraction uses grep -A <N> on the function signature line to
+# avoid fragile awk range patterns that break when comments or brace-terminated
+# constructs are renamed or added inside the function body.
+#
 # Run: bash pilot-dispatcher.selftest.sh
 # Exit: 0 = all pass, 1 = any failure.
 
@@ -21,6 +25,7 @@ _fail() { FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); printf "[FAIL] %s\n" "$1"; }
 
 # ── Test 1: DRY_RUN exits 0 with empty fixture ─────────────────────────────────
 TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/.gc/logs"
 _rc=0
 PILOT_CITY_OVERRIDE="$TMP" DRY_RUN=1 bash "$PILOT" >/dev/null 2>&1 || _rc=$?
@@ -31,6 +36,7 @@ PILOT_CITY_OVERRIDE="$TMP" DRY_RUN=1 bash "$PILOT" >/dev/null 2>&1 || _rc=$?
   && _pass "Log file created" \
   || _fail "Log file not found at $TMP/.gc/logs/pilot-dispatcher.log"
 rm -rf "$TMP"
+trap - EXIT
 
 # ── Test 2: SELF_BEAD_ID not a hardcoded bead literal ─────────────────────────
 grep -qE '^SELF_BEAD_ID="[a-z]+-[0-9a-z]+"' "$PILOT" \
@@ -43,8 +49,8 @@ grep -q 'pilot:self' "$PILOT" \
   || _fail "SELF_BEAD_ID: no pilot:self reference found"
 
 # ── Test 4: TTL recovery has no story:approved filter ─────────────────────────
-# Extract lines from the STALE_JSON block and check for absence of story:approved.
-if awk '/Step 0.*TTL recovery/,/STALE_COUNT/' "$PILOT" | grep -q '"story:approved"'; then
+# Use grep -A to avoid awk anchor fragility on comment text / STALE_COUNT name.
+if grep -A 30 'Step 0.*TTL recovery' "$PILOT" | grep -q '"story:approved"'; then
   _fail "TTL recovery: story:approved filter still present (Tier 1 claims never recovered)"
 else
   _pass "TTL recovery: no story:approved filter"
@@ -56,11 +62,11 @@ grep -q 'COMMON_EXCLUDES=(' "$PILOT" \
   || _fail "COMMON_EXCLUDES: array not defined"
 
 # ── Test 6: story:in-flight added before pilot:dispatching removed ─────────────
-# Within _transition_bead, in-flight must precede the dispatching remove.
-_inflight=$(awk '/_transition_bead\(\)/,/^}/' "$PILOT" \
-  | grep -n 'label add.*story:in-flight' | head -1 | cut -d: -f1 || echo "")
-_rm_dispatch=$(awk '/_transition_bead\(\)/,/^}/' "$PILOT" \
-  | grep -n 'label remove.*pilot:dispatching' | head -1 | cut -d: -f1 || echo "")
+# Extract _transition_bead body with grep -A 50 (avoids awk /^}/ early-termination
+# on any brace-terminated construct that might be added inside the function).
+_fn_body=$(grep -A 50 '^_transition_bead()' "$PILOT" | head -50)
+_inflight=$(printf '%s\n' "$_fn_body" | grep -n 'label add.*story:in-flight' | head -1 | cut -d: -f1 || echo "")
+_rm_dispatch=$(printf '%s\n' "$_fn_body" | grep -n 'label remove.*pilot:dispatching' | head -1 | cut -d: -f1 || echo "")
 if [ -n "$_inflight" ] && [ -n "$_rm_dispatch" ] && [ "$_inflight" -lt "$_rm_dispatch" ]; then
   _pass "transition_bead: story:in-flight set before pilot:dispatching removed"
 else
@@ -69,7 +75,7 @@ fi
 
 # ── Test 7: story:in-flight failure leaves pilot:dispatching for TTL recovery ──
 # _transition_bead must NOT use || true on the story:in-flight add.
-if awk '/_transition_bead\(\)/,/^}/' "$PILOT" \
+if grep -A 50 '^_transition_bead()' "$PILOT" | head -50 \
     | grep 'label add.*story:in-flight' | grep -q '|| true'; then
   _fail "transition_bead: story:in-flight add is || true (silent race condition)"
 else
@@ -77,26 +83,25 @@ else
 fi
 
 # ── Test 8: Task prompt uses BEAD_DB not GC_CITY in bd -C show ────────────────
-# Inside _build_task_prompt, the step-1 read command must reference BEAD_DB.
-if awk '/_build_task_prompt\(\)/,/^}/' "$PILOT" \
+# Extract _build_task_prompt body with grep -A 100 to cover the full single-heredoc body.
+if grep -A 100 '^_build_task_prompt()' "$PILOT" | head -100 \
     | grep 'bd -C.*show.*STORY_ID' | grep -q 'GC_CITY'; then
   _fail "Task prompt: step-1 bd show uses GC_CITY instead of BEAD_DB for rig-sourced beads"
 else
   _pass "Task prompt: step-1 bd show uses BEAD_DB"
 fi
 
-# ── Test 9: All 5 dispatch sub-functions defined ──────────────────────────────
-for _fn in _claim_bead _build_task_prompt _do_sling _transition_bead _notify_dispatch; do
+# ── Test 9: All dispatch sub-functions defined ────────────────────────────────
+for _fn in _claim_bead _build_task_prompt _do_sling _transition_bead _notify_dispatch _ttl_recover_db; do
   grep -q "^${_fn}()" "$PILOT" \
     && _pass "sub-function defined: ${_fn}" \
     || _fail "sub-function MISSING: ${_fn}"
 done
 
 # ── Test 10: DRY_RUN notify is log-only (no real notify call) ─────────────────
-if awk '/_notify_dispatch\(\)/,/^}/' "$PILOT" \
-    | grep -qE 'if.*DRY_RUN.*=.*1'; then
-  if awk '/_notify_dispatch\(\)/,/^}/' "$PILOT" \
-      | sed -n '/if.*DRY_RUN/,/fi/p' | grep -qE '^\s*notify\b'; then
+_notify_body=$(grep -A 30 '^_notify_dispatch()' "$PILOT" | head -30)
+if printf '%s\n' "$_notify_body" | grep -qE 'if.*DRY_RUN.*=.*1'; then
+  if printf '%s\n' "$_notify_body" | sed -n '/if.*DRY_RUN/,/fi/p' | grep -qE '^\s*notify\b'; then
     _fail "_notify_dispatch: DRY_RUN branch still calls notify (real HTTP request)"
   else
     _pass "_notify_dispatch: DRY_RUN branch does not call notify"
@@ -106,8 +111,8 @@ else
 fi
 
 # ── Test 11: _transition_bead failure captured (no unconditional in-flight log) ─
-if awk '/dispatch_one\(\)/,/^# ── Step 0/' "$PILOT" \
-    | grep -q '_transition_ok'; then
+# Extract dispatch_one body with grep -A 200 to avoid anchor fragility on comment text.
+if grep -A 200 '^dispatch_one()' "$PILOT" | head -200 | grep -q '_transition_ok'; then
   _pass "dispatch_one: _transition_bead return captured (no false in-flight log)"
 else
   _fail "dispatch_one: _transition_bead result not captured (_transition_ok variable absent)"
@@ -120,11 +125,20 @@ else
   _fail "Heredoc delimiter sanitization MISSING — untrusted fields may truncate prompt"
 fi
 
-# ── Test 13: BEAD_ID_STALE guards against literal null ────────────────────────
-if awk '/BEAD_ID_STALE=/,/UPDATED_AT=/' "$PILOT" | grep -q 'continue'; then
+# ── Test 13: BEAD_ID_STALE guards against empty/null ─────────────────────────
+# Use grep -A 5 on the assignment to avoid range-anchor fragility on UPDATED_AT name.
+if grep -A 5 'BEAD_ID_STALE=' "$PILOT" | grep -q 'continue'; then
   _pass "BEAD_ID_STALE: empty guard with continue present"
 else
   _fail "BEAD_ID_STALE: no guard against empty/null id from jq"
+fi
+
+# ── Test 14: TTL recovery scans rig DBs (not just HQ) ────────────────────────
+# _ttl_recover_db must be called in a loop over rig paths (not only for GC_CITY).
+if grep -A 30 'Step 0.*TTL recovery' "$PILOT" | grep -q '_ttl_rig'; then
+  _pass "TTL recovery: rig DB scan loop present"
+else
+  _fail "TTL recovery: no rig DB scan — rig-sourced pilot:dispatching claims never recovered"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
