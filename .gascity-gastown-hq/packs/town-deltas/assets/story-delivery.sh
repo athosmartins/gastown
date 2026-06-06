@@ -191,8 +191,67 @@ fi
 COUNT=$(echo "$STORIES_JSON" | jq 'length' 2>/dev/null || echo "0")
 log "Found $COUNT story/stories awaiting delivery"
 
+# ── Step 1b: Task/bug reconciler — close gate:passed non-story beads (ga-tjqe) ─
+# The gate dispatcher (ga-esbg) closes task/bug source beads directly after a
+# verified merge+push. But if the dispatcher crashes BETWEEN setting gate:passed
+# and calling bd close, the bead strands open/in_progress with gate:passed
+# indefinitely — story-delivery only sweeps story:approved beads (Step 1 above),
+# so task beads are invisible to the normal delivery path.
+#
+# This reconciler closes one gate:passed non-story bead per sweep (same "one per
+# run" discipline as story processing). No deploy/prod-test — the gate already
+# verified the merge. Terminal for artifact tasks.
+#
+# Skipped in forced single-story mode (FORCE_STORY_ID set).
+#
+# IMPORTANT: uses --status open,in_progress because stranded task beads are
+# typically in_progress (builder claimed them), not open. bd list default shows
+# only open; without --status open,in_progress they are invisible.
+TASK_COUNT=0
+if [ -z "$FORCE_STORY_ID" ]; then
+  TASK_BEADS_JSON=$(bd -C "$GC_CITY" list --json \
+    --status open,in_progress \
+    -l "gate:passed" \
+    2>/dev/null | jq '[.[] |
+      select((.labels // []) | contains(["story:approved"]) | not) |
+      select((.labels // []) | contains(["story:done"]) | not)
+    ]' || echo "[]")
+  TASK_COUNT=$(echo "$TASK_BEADS_JSON" | jq 'length' 2>/dev/null || echo "0")
+
+  if [ "$TASK_COUNT" -gt 0 ]; then
+    TASK_BEAD=$(echo "$TASK_BEADS_JSON" | jq '.[0]')
+    TASK_BEAD_ID=$(echo "$TASK_BEAD" | jq -r '.id')
+    TASK_BEAD_TITLE=$(echo "$TASK_BEAD" | jq -r '.title // "untitled"' | head -c 80)
+    log "Task reconciler: gate:passed non-story bead $TASK_BEAD_ID ($TASK_BEAD_TITLE) — closing (no deploy/prod-test; merge verified by gate)"
+    if [ "$DRY_RUN" = "1" ]; then
+      log "DRY_RUN=1 — WOULD: bd close $TASK_BEAD_ID (gate:passed task reconciler, ga-tjqe)"
+    else
+      bd -C "$GC_CITY" close "$TASK_BEAD_ID" \
+        -r "Delivery task reconciler (ga-tjqe): gate:passed non-story bead closed — merge verified by gate. Gate dispatcher's direct-close (ga-esbg) was the primary path; this sweep catches beads the dispatcher did not close (e.g., crash between gate:passed + bd close)." \
+        2>/dev/null || warn "Task reconciler: could not close $TASK_BEAD_ID (non-fatal; will retry next sweep)"
+      bd -C "$GC_CITY" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-tjqe): gate:passed is set and this bead is not a story (no story:approved). Closed by delivery sweep — terminal for artifact tasks (no deploy/prod-test needed; merge already verified by gate)." 2>/dev/null || true
+      log "Task reconciler: closed $TASK_BEAD_ID"
+      mkdir -p "$(dirname "$DELIVERY_LOG")"
+      jq -c -n \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg task_id "$TASK_BEAD_ID" \
+        --arg task_title "$TASK_BEAD_TITLE" \
+        --arg result "task_closed" \
+        --arg dry_run "$DRY_RUN" \
+        '{ts: $ts, event: "task_reconcile", task_id: $task_id, task_title: $task_title, result: $result, dry_run: $dry_run}' \
+        >> "$DELIVERY_LOG" 2>/dev/null || true
+    fi
+  fi
+fi
+# ── End Step 1b ──────────────────────────────────────────────────────────────
+
+if [ "$COUNT" = "0" ] && [ "$TASK_COUNT" = "0" ]; then
+  log "No stories or tasks pending delivery. Exiting."
+  exit 0
+fi
+
 if [ "$COUNT" = "0" ]; then
-  log "No stories pending delivery. Exiting."
+  log "No stories pending delivery (task reconciler sweep done). Exiting."
   exit 0
 fi
 
