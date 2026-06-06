@@ -208,7 +208,7 @@ log "  branch=$BRANCH  bead_id=$BEAD_ID  rig=${RIG:-unknown}"
 #   1. Look up the bead via "gc bd show" (cross-rig lookup — works for any rig DB).
 #   2. Try HQ DB directly as a fallback (in case gc bd fails).
 #   3. If assignee is a session-id (contains "adhoc"), map it back to the base
-#      crew role by stripping the adhoc suffix (e.g. "digo-adhoc-e2510107f6" → "digo").
+#      crew role by stripping the adhoc suffix (e.g. "digo-wa-adhoc-e2510107f6" → "digo-wa").
 #
 # SECURITY: We do NOT trust the marker's self-declared author. The resolved value
 # is used solely for self-review exclusion. A partial/approximate match is safe

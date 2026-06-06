@@ -727,7 +727,7 @@ if [ -n "$BEAD_ID" ]; then
 fi
 
 # Session-id normalization: strip adhoc suffix from session IDs to get the crew role.
-# e.g. "digo-adhoc-e2510107f6" → "digo", "batista-adhoc-abc123" → "batista"
+# e.g. "digo-wa-adhoc-e2510107f6" → "digo-wa", "batista-lx-adhoc-abc123" → "batista-lx"
 if [ -n "$AUTHOR" ] && echo "$AUTHOR" | grep -qE "-adhoc-[0-9a-f]+" 2>/dev/null; then
   AUTHOR_NORMALIZED=$(echo "$AUTHOR" | sed 's/-adhoc-[0-9a-f]*$//')
   log "  Author '$AUTHOR' looks like a session-id; normalizing to crew role '$AUTHOR_NORMALIZED'."

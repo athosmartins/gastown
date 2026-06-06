@@ -88,11 +88,19 @@ SELF_BEAD_ID="ga-8c1"
 # ── Rig → Builder routing table ───────────────────────────────────────────────
 # Maps story.rig metadata → gc sling target alias.
 # Priority: prefer the rig's dedicated builder; fall back to gastown.dog.
+#
+# Canonical crew-agent naming convention (ga-nkkku): <name>-<sigla>
+# Sigla → rig mapping (source of truth):
+#   lx = lexbh              (batista-lx)
+#   wa = whatsapp_automation (digo-wa, mila-wa, oracle-wa, peter-wa, thies-wa)
+#   ps = property_scrapers  (batista-ps)
+#   ma = marketing
+#   hq = gastown-hq         (system/infra agents)
 rig_to_builder() {
   local rig="$1"
   case "$rig" in
     gascity)               echo "gastown.dog"    ;;
-    whatsapp_automation|wa) echo "digo"          ;;
+    whatsapp_automation|wa) echo "digo-wa"        ;;
     property_scrapers|ps)  echo "batista-ps"     ;;
     gastown|gt)            echo "gastown.dog"    ;;
     lexbh|lx)              echo "gastown.dog"    ;;
@@ -533,9 +541,9 @@ FIXSEC
   log "  Builder target: $BUILDER_TARGET (rig=$STORY_RIG lane=$LANE)"
 
   # ── wa-1eos: per-builder mutex ───────────────────────────────────────────────
-  # Single-identity builders (digo=wa, batista-ps=ps, etc.) must have AT MOST ONE
+  # Single-identity builders (digo-wa=wa, batista-ps=ps, etc.) must have AT MOST ONE
   # live session. Without this, dispatching a 2nd bead to a busy builder makes
-  # `gc sling` spawn a duplicate (digo → digo-1) that works the SAME crew branch —
+  # `gc sling` spawn a duplicate (digo-wa → digo-wa-1) that works the SAME crew branch —
   # branch corruption. If the builder is already live, defer this bead to the next
   # sweep (release the claim so it stays dispatchable). gastown.dog is a shared
   # pool (multiple instances by design) — exempt. Fail-safe: any error → count 0 →

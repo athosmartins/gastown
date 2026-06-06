@@ -2,8 +2,8 @@
 # prod-tests/gascity/story-ga-i67t.sh — prod test for ga-i67t:
 # single-session-per-identity mutex (refuse-or-reuse live target).
 #
-# Verifies that all single-identity crew agents (digo, batista-ps, batista-wa,
-# batista, mila, oracle, peter, thies) have max_active_sessions = 1 in their
+# Verifies that all single-identity crew agents (digo-wa, batista-ps, batista-wa,
+# batista-lx, mila-wa, oracle-wa, peter-wa, thies-wa) have max_active_sessions = 1 in their
 # effective gc config, preventing the reconciler from spawning phantom
 # "{name}-N" duplicate sessions that race on shared branch namespaces.
 #
@@ -16,7 +16,7 @@ CITY="${CITY:-/Users/athos/gt/.gascity-gastown-hq}"
 log()  { echo "[prod-test:gascity ga-i67t] $*"; }
 fail() { echo "[prod-test:gascity ga-i67t] FAIL: $*" >&2; exit 1; }
 
-SINGLE_IDENTITY_AGENTS=(digo batista-ps batista-wa batista mila oracle peter thies)
+SINGLE_IDENTITY_AGENTS=(digo-wa batista-ps batista-wa batista-lx mila-wa oracle-wa peter-wa thies-wa)
 
 # ── 1. Config verification: max_active_sessions = 1 in agent.toml ─────────────
 log "Checking max_active_sessions = 1 in agent configs..."
