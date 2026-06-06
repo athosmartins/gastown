@@ -31,20 +31,35 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✓ $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  ✗ $1"; }
 
-# ── Helper: replicate the PRIMARY bead_id extraction from the corrected gate-done ──
-# This mirrors the exact grep pipeline used in the fix so the test cannot silently
-# diverge — we assert the live source still defines the same pattern (section v).
+# ── Stub city-DB resolver ──────────────────────────────────────────────────────
+# Mirrors the `bd -C "$GC_CITY_PATH" show <id>` resolve-gate in gate-done.md: only
+# these ids are "real" beads in the city DB for the purposes of this test. A token
+# extracted from a branch is authoritative ONLY if it resolves here.
+CITY_DB_BEADS=" ga-dx5 ga-abc wa-x1y2 ga-0c42e wa-rlzo gt-nqqa3 dc-0jex ga-nkkku ga-story1 "
+bead_resolves() { case "$CITY_DB_BEADS" in *" $1 "*) return 0;; *) return 1;; esac; }
+
+# ── Helper: replicate the corrected PRIMARY bead_id resolution from gate-done ──────
+# This mirrors the exact logic used in the fix so the test cannot silently diverge —
+# we also assert the live source still defines the same structure (section v).
+#   crew/*/* : route AWAY from the generic pattern (a dashed agent name like
+#              gastown-dog-3 would otherwise be mis-matched), isolate the 3rd segment,
+#              take the leading bead-shaped token, and accept it ONLY if it resolves
+#              in the city DB. A descriptive slug (fix-skip, gate-delivery) is
+#              bead-shaped but does NOT resolve → empty → story:in-flight fallback.
+#   other    : generic <prefix>/<bead-id>-<desc> with the trailing-dash anchor.
 extract_bead_from_branch() {
-  local branch="$1"
-  local bead
-  # PRIMARY (generic): <prefix>/<bead-id>-<desc>  (bead in 2nd segment)
-  bead=$(echo "$branch" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \
-    | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
-  # PRIMARY (crew, ga-zzdph): crew/<name>/<bead-id>[-<desc>]  (bead in 3rd segment)
-  if [ -z "$bead" ]; then
-    bead=$(echo "$branch" | grep -oE '^crew/[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}' \
-      | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' | head -1 2>/dev/null || echo "")
-  fi
+  local branch="$1" bead="" seg cand
+  case "$branch" in
+    crew/*/*)
+      seg=${branch#crew/*/}
+      cand=$(printf '%s\n' "$seg" | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
+      if [ -n "$cand" ] && bead_resolves "$cand"; then bead="$cand"; fi
+      ;;
+    *)
+      bead=$(echo "$branch" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \
+        | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
+      ;;
+  esac
   echo "$bead"
 }
 
@@ -60,8 +75,8 @@ GOT=$(extract_bead_from_branch "chore/wa-x1y2-cleanup")
 
 echo "── (i-crew) ga-zzdph: crew/<name>/<bead-id> convention (bead in 3rd segment) ──"
 # The incident: Mila's crew/mila/ga-0c42e branch (source-bead ga-0c42e lives in the
-# HQ city DB) extracted EMPTY under the generic pattern, so /gate-done could not bind
-# the marker to the HQ story bead. These assertions lock the crew convention in.
+# HQ city DB). These assertions lock the crew convention in and guard the two
+# correctness bugs gate review found in round 1.
 GOT=$(extract_bead_from_branch "crew/mila/ga-0c42e")
 [ "$GOT" = "ga-0c42e" ] && ok "crew/<name>/<ID> → ga-0c42e (the incident branch)" \
   || bad "crew/mila/ga-0c42e should give ga-0c42e, got '$GOT'"
@@ -74,11 +89,39 @@ GOT=$(extract_bead_from_branch "crew/batista/wa-rlzo")
 [ "$GOT" = "wa-rlzo" ] && ok "crew/<name>/<ID> → wa-rlzo (same-DB case still works)" \
   || bad "crew/batista/wa-rlzo should give wa-rlzo, got '$GOT'"
 
-# A crew branch whose 3rd segment has no bead-shaped token (no <pfx>-<id> dash)
-# returns empty → falls through to the story:in-flight lookup, then fail-closed.
-# (A 3rd segment that merely LOOKS bead-shaped, e.g. fix-typo, is indistinguishable
-# from a real id by regex — same inherent ambiguity as the generic pattern — and is
-# caught downstream: the guard rejects a marker whose source-bead does not resolve.)
+echo "── (i-crew-bug2) ga-zzdph round-1 issue 2: dashed agent name is NOT the bead ──"
+# A real branch in the repo: the crew agent name itself contains dashes. The 3rd
+# segment must be isolated FIRST, or the generic pattern matches 'gastown-dog'.
+GOT=$(extract_bead_from_branch "crew/gastown-dog-3/gt-nqqa3")
+[ "$GOT" = "gt-nqqa3" ] && ok "crew/gastown-dog-3/gt-nqqa3 → gt-nqqa3 (dashed name isolated)" \
+  || bad "dashed agent name mis-extracted: expected gt-nqqa3, got '$GOT'"
+
+GOT=$(extract_bead_from_branch "crew/foo-bar/ga-0c42e")
+[ "$GOT" = "ga-0c42e" ] && ok "crew/foo-bar/ga-0c42e → ga-0c42e (name never considered)" \
+  || bad "dashed name leaked into extraction: expected ga-0c42e, got '$GOT'"
+
+echo "── (i-crew-bug1) ga-zzdph round-1 issue 1: bead-SHAPED slug must NOT strand work ──"
+# These three crew branches exist in the repos. Their 3rd segment is a descriptive
+# slug whose leading token is bead-SHAPED but is NOT a real bead. The first attempt
+# returned that garbage non-empty, which SKIPPED the story:in-flight fallback and
+# stranded the submission. The resolve-gate makes them return empty so the fallback
+# runs and the crew member can still PASS — exactly the pre-fix behavior. (A bare
+# fail-closed downstream would NOT preserve the fallback; that was the bug.)
+for B in "crew/thies/fix-skip-unchanged-on-error" "crew/thies/pbh-timeout-fix" "crew/build/gate-delivery-ntfy-fixes"; do
+  GOT=$(extract_bead_from_branch "$B")
+  [ -z "$GOT" ] && ok "$B → empty (bead-shaped slug doesn't resolve → fallback preserved)" \
+    || bad "$B should return empty (no real bead), got '$GOT'"
+done
+
+# Isolate the resolve-gate itself: same shape, one resolves, one does not.
+GOT=$(extract_bead_from_branch "crew/qa/dc-0jex")
+[ "$GOT" = "dc-0jex" ] && ok "crew/qa/dc-0jex → dc-0jex (resolves → authoritative)" \
+  || bad "crew/qa/dc-0jex should resolve to dc-0jex, got '$GOT'"
+GOT=$(extract_bead_from_branch "crew/qa/dc-fake9")
+[ -z "$GOT" ] && ok "crew/qa/dc-fake9 → empty (bead-shaped but unresolved → fallback)" \
+  || bad "crew/qa/dc-fake9 should return empty (not a real bead), got '$GOT'"
+
+# A crew branch whose 3rd segment has no bead-shaped token at all → empty → fallback.
 GOT=$(extract_bead_from_branch "crew/mila/nobeadhere")
 [ -z "$GOT" ] && ok "crew/<name>/<no-dash-slug> → empty (name not mistaken for bead)" \
   || bad "crew branch without a bead-shaped 3rd segment should return empty, got '$GOT'"
@@ -148,10 +191,22 @@ if [ -f "$GATE_DONE" ]; then
     && ok "gate-done uses branch-name PRIMARY extraction (grep -oE pattern)" \
     || bad "gate-done missing branch-name primary extraction"
 
-  # ga-zzdph: the crew convention extraction must be present in the source.
-  grep -q "grep -oE '^crew/\[^/\]+/\[a-z\]" "$GATE_DONE" \
-    && ok "gate-done extracts bead from crew/<name>/<bead-id> branches (ga-zzdph)" \
-    || bad "gate-done missing crew/<name>/<bead-id> extraction (ga-zzdph regression)"
+  # ga-zzdph: crew branches must be routed to their own case clause (NOT the generic
+  # 2nd-segment pattern, which mis-matches a dashed agent name).
+  grep -qF 'crew/*/*)' "$GATE_DONE" \
+    && ok "gate-done routes crew/*/* to a dedicated case clause (ga-zzdph issue 2)" \
+    || bad "gate-done missing crew/*/* case clause (ga-zzdph regression)"
+
+  # ga-zzdph issue 2: the 3rd segment must be isolated before extraction.
+  grep -qF '${BRANCH#crew/*/}' "$GATE_DONE" \
+    && ok "gate-done isolates the crew 3rd segment before extraction (ga-zzdph issue 2)" \
+    || bad "gate-done missing crew 3rd-segment isolation (ga-zzdph regression)"
+
+  # ga-zzdph issue 1: a crew-branch token is authoritative ONLY if it resolves in the
+  # city DB — otherwise a bead-shaped descriptive slug would skip the fallback.
+  grep -qF 'bd -C "$GC_CITY_PATH" show "$_CREW_CAND"' "$GATE_DONE" \
+    && ok "gate-done resolve-gates the crew token before trusting it (ga-zzdph issue 1)" \
+    || bad "gate-done missing crew-token resolve-gate (ga-zzdph regression: slug strands work)"
 
   grep -q "story:in-flight" "$GATE_DONE" \
     && ok "gate-done filters secondary lookup by story:in-flight label" \

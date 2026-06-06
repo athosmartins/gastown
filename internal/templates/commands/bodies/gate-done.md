@@ -67,28 +67,50 @@ fi
 
 echo "City DB path: $GC_CITY_PATH"
 
-# ga-dx5: PRIMARY resolution — extract bead_id from branch name convention.
-# Branch name is the canonical pointer to the owning STORY bead. Session-assigned
-# in_progress beads may include sling/task beads from the gate-dispatcher that are
-# NOT the story bead. If we pick the sling bead, the dispatcher strips story:in-flight
-# from the wrong bead → lane slot never frees. Branch name is always authoritative.
-# Pattern: <prefix>/<STORY_ID>-<desc> (e.g. fix/ga-dx5-my-fix → ga-dx5)
-BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \
-  | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
-
-# ga-zzdph: PRIMARY (crew convention) — crew branches are `crew/<name>/<bead-id>`
-# (optionally `crew/<name>/<bead-id>-<desc>`), so the owning bead lives in the THIRD
-# path segment, not the second. The generic pattern above only sees the second
-# segment, so it returned EMPTY for every crew branch — stranding crew submissions
-# whose source-bead lived in the HQ city DB (e.g. ga-* on a crew/<name>/... branch).
-# This made the secondary session lookup load-bearing for ALL crew work, and a crew
-# member who lacked an exact story:in-flight assignment in the city DB could never
-# pass the gate. Anchor on `crew/<name>/` and extract the first bead-shaped token of
-# the third segment so the branch name remains authoritative for crew too.
-if [ -z "$BEAD_ID" ]; then
-  BEAD_ID=$(echo "$BRANCH" | grep -oE '^crew/[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}' \
-    | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' | head -1 2>/dev/null || echo "")
-fi
+# ga-dx5 / ga-zzdph: PRIMARY resolution — the branch name is the canonical pointer
+# to the owning STORY bead. Session-assigned in_progress beads may include sling/task
+# beads from the gate-dispatcher that are NOT the story bead; picking one strips
+# story:in-flight off the wrong bead → the lane slot never frees. So the branch name
+# is authoritative whenever it names a REAL bead. Two conventions place the bead in
+# different path segments:
+#   generic:  <prefix>/<bead-id>-<desc>        → bead in the 2nd segment
+#   crew:     crew/<name>/<bead-id>[-<desc>]   → bead in the 3rd segment
+#
+# ga-zzdph (gate round 1 found two correctness bugs in the first crew attempt):
+#   1. The generic 2nd-segment pattern MUST NOT run on crew branches: a crew agent
+#      name can be bead-shaped with dashes (real: crew/gastown-dog-3/gt-nqqa3), so
+#      the generic pattern matches the NAME fragment ('gastown-dog'), not the bead —
+#      a non-empty wrong answer that also suppresses the crew path. We route crew
+#      branches to their own clause via `case` and ISOLATE the 3rd segment first, so
+#      a dashed name is structurally unreachable.
+#   2. A descriptive 3rd segment is itself bead-shaped (real: crew/thies/
+#      fix-skip-unchanged-on-error → 'fix-skip', crew/build/gate-delivery-ntfy-fixes
+#      → 'gate-delivery'). A pure-regex extract returns garbage that is NOT a real
+#      bead; because it is non-empty it would SKIP the story:in-flight fallback and
+#      strand the submission (the very failure this story removes). Fail-closed is
+#      NOT enough — it does not preserve the fallback. So a crew-branch token is only
+#      treated as authoritative once it RESOLVES to a real bead in the city DB;
+#      otherwise BEAD_ID stays empty and the secondary session lookup runs (exactly
+#      the pre-fix behavior for descriptive crew slugs).
+BEAD_ID=""
+case "$BRANCH" in
+  crew/*/*)
+    # Isolate the 3rd segment (everything after `crew/<name>/`), take the leading
+    # bead-shaped token, and accept it ONLY if it resolves in the city DB.
+    _CREW_SEG=${BRANCH#crew/*/}
+    _CREW_CAND=$(printf '%s\n' "$_CREW_SEG" \
+      | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
+    if [ -n "$_CREW_CAND" ] \
+       && bd -C "$GC_CITY_PATH" show "$_CREW_CAND" >/dev/null 2>&1; then
+      BEAD_ID="$_CREW_CAND"
+    fi
+    ;;
+  *)
+    # Generic: <prefix>/<bead-id>-<desc> (e.g. fix/ga-dx5-my-fix → ga-dx5).
+    BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \
+      | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
+    ;;
+esac
 
 # SECONDARY: if branch doesn't embed a bead ID (uncommon), fall back to the
 # session's in_progress bead that carries story:in-flight — that label is ONLY on
