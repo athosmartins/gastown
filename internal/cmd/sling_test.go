@@ -2726,6 +2726,51 @@ exit /b 0
 	}
 }
 
+// TestHookBeadWithRetryRejectsPhantomBead verifies that hookBeadWithRetry refuses
+// to hook a bead that does not exist in Dolt (gt-q0hon: pre-hook fresh check).
+// This guards against polecats being stranded on non-existent work when upstream
+// AllowStale verification produces a false positive.
+func TestHookBeadWithRetryRejectsPhantomBead(t *testing.T) {
+	beads.ResetBdAllowStaleCacheForTest()
+	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
+
+	binDir := t.TempDir()
+
+	// bd stub: "show" exits non-zero (bead not found), "version" succeeds.
+	bdScript := `#!/bin/sh
+cmd="$1"
+shift || true
+if [ "$cmd" = "--allow-stale" ]; then cmd="$1"; shift || true; fi
+case "$cmd" in
+  show) exit 1 ;;
+  version) echo "bd 0.1.0" ;;
+esac
+exit 0
+`
+	bdScriptWindows := `@echo off
+set "cmd=%1"
+if "%cmd%"=="--allow-stale" set "cmd=%2"
+if "%cmd%"=="show" exit /b 1
+if "%cmd%"=="version" (echo bd 0.1.0 && exit /b 0)
+exit /b 0
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// Do NOT set GT_TEST_SKIP_HOOK_VERIFY so the pre-hook check runs.
+
+	err := hookBeadWithRetry("dc-agdj", "dc/polecats/atom", t.TempDir())
+	if err == nil {
+		t.Fatal("hookBeadWithRetry should have refused to hook a non-existent bead")
+	}
+	if !strings.Contains(err.Error(), "hook refused") {
+		t.Fatalf("expected 'hook refused' error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected 'not found' in error, got: %v", err)
+	}
+}
+
 func TestBuildSlingFieldUpdatesIncludesConvoyFields(t *testing.T) {
 	got := buildSlingFieldUpdates(
 		"mayor",

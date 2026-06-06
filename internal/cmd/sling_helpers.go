@@ -308,6 +308,48 @@ func verifyBeadExists(beadID string) error {
 	return nil
 }
 
+// verifyBeadExistsFreshForHook does a non-stale read of the bead to guard hook
+// assignment (gt-q0hon). AllowStale reads can pass for beads that no longer
+// exist; one fresh probe right before the write ensures phantom-bead hooks fail
+// fast with a clear error instead of leaving the polecat stranded.
+func verifyBeadExistsFreshForHook(townRoot, beadID string) error {
+	// Try direct db path first (no AllowStale, no routing env).
+	var out []byte
+	var err error
+	if townRoot != "" {
+		out, err = BdCmd("show", beadID, "--json").
+			Dir(resolveBeadDirFromTownRoot(townRoot, beadID)).
+			StripBeadsDir().
+			Stderr(io.Discard).
+			Output()
+	} else {
+		out, err = BdCmd("show", beadID, "--json").
+			Dir(resolveBeadDir(beadID)).
+			StripBeadsDir().
+			Stderr(io.Discard).
+			Output()
+	}
+	if err == nil && len(strings.TrimSpace(string(out))) > 0 {
+		return nil
+	}
+	// Fall back to routed lookup (also fresh — no AllowStale).
+	var routedCmd *bdCmd
+	if townRoot != "" {
+		routedCmd = BdCmd("show", beadID, "--json").Dir(townRoot).WithRouting().Stderr(io.Discard)
+	} else {
+		if tr, findErr := workspace.FindFromCwdOrError(); findErr == nil && tr != "" {
+			routedCmd = BdCmd("show", beadID, "--json").Dir(tr).WithRouting().Stderr(io.Discard)
+		} else {
+			routedCmd = BdCmd("show", beadID, "--json").Dir(resolveBeadDir(beadID)).StripBeadsDir().Stderr(io.Discard)
+		}
+	}
+	routedOut, routedErr := routedCmd.Output()
+	if routedErr == nil && len(strings.TrimSpace(string(routedOut))) > 0 {
+		return nil
+	}
+	return fmt.Errorf("bead %s not found (pre-hook fresh check failed — bead may have been deleted after dispatch was queued)", beadID)
+}
+
 // verifyBeadExistsInTargetRigDatabase checks the target rig's beads database
 // directly instead of following prefix routing. This prevents gt sling from
 // spawning polecats or creating molecule/hook side effects for beads that only
@@ -1233,6 +1275,16 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
 	const baseBackoff = 500 * time.Millisecond
 	const maxBackoff = 30 * time.Second
 	skipVerify := os.Getenv("GT_TEST_SKIP_HOOK_VERIFY") != ""
+
+	// Defensive pre-hook existence check (gt-q0hon): verify bead exists with a
+	// fresh (non-stale) read before attempting hook assignment. AllowStale reads
+	// upstream can pass for beads that no longer exist; catching phantom beads
+	// here prevents polecats from being stranded on non-existent work.
+	if !skipVerify {
+		if err := verifyBeadExistsFreshForHook(townRoot, beadID); err != nil {
+			return fmt.Errorf("hook refused: %w\nSafe next action: run `bd show %s` to confirm bead state before re-dispatching", err, beadID)
+		}
+	}
 
 	var lastErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
