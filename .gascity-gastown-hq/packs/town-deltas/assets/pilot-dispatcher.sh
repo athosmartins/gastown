@@ -677,19 +677,43 @@ TASK
       SLING_TITLE="build story $STORY_ID: $STORY_TITLE"
     fi
 
+    local _sling_err_file _sling_err
+    _sling_err_file="/tmp/pilot-sling-err.$$"
     SLING_OUT=$(gc --city "$GC_CITY" sling "$BUILDER_TARGET" \
       "$SLING_TITLE" \
       --nudge \
       --json \
-      2>/dev/null || echo "{}")
+      2>"$_sling_err_file" || echo "{}")
+    _sling_err=$(head -c 300 "$_sling_err_file" 2>/dev/null || echo "")
+    rm -f "$_sling_err_file"
 
     SLING_BEAD_ID=$(echo "$SLING_OUT" | jq -r '.bead_id // .id // empty' 2>/dev/null || echo "")
     DISPATCH_RESULT="sling_ok"
 
+    # gt-q0hon: fail-hard if sling returned no bead ID — do NOT continue with phantom state.
     if [ -z "$SLING_BEAD_ID" ]; then
-      warn "gc sling did not return a bead ID — continuing but routing may have failed."
-      SLING_BEAD_ID="unknown"
+      warn "gc sling failed for $STORY_ID — aborting dispatch (err: ${_sling_err:-no output})"
+      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       DISPATCH_RESULT="sling_no_bead_id"
+      return 1
+    fi
+
+    # gt-q0hon: post-sling Dolt verify — guard against phantom bead (hook set but bead
+    # never committed to Dolt). Retry up to 3x with 2s gap for propagation lag.
+    local _verify_ok=0 _verify_i
+    for _verify_i in 1 2 3; do
+      if bd -C "$GC_CITY" show "$SLING_BEAD_ID" --json 2>/dev/null \
+          | jq -e 'if type=="array" then .[0].id else .id end' >/dev/null 2>&1; then
+        _verify_ok=1; break
+      fi
+      [ "$_verify_i" -lt 3 ] && sleep 2
+    done
+
+    if [ "$_verify_ok" = "0" ]; then
+      warn "PHANTOM BEAD: gc sling returned $SLING_BEAD_ID but not found in Dolt after 3 attempts. Aborting dispatch for $STORY_ID (gt-q0hon)."
+      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      DISPATCH_RESULT="sling_phantom_bead"
+      return 1
     fi
 
     gc --city "$GC_CITY" session nudge "$BUILDER_TARGET" "$DISPATCH_TASK" \
