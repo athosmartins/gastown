@@ -117,7 +117,10 @@ func terminalSourceIssue(reader IssueReader, sourceIssue string) (bool, string) 
 	issue, err := reader.Show(sourceIssue)
 	if err != nil {
 		if errors.Is(err, beads.ErrNotFound) {
-			return false, fmt.Sprintf("source_issue=%s source_status=missing", sourceIssue)
+			// Deleted bead means the work is done or abandoned — treat as terminal so the
+			// polecat slot is not permanently blocked by a stale active_mr reference.
+			// Distinct from a lookup error (network/DB failure) which stays fail-closed.
+			return true, ""
 		}
 		return false, fmt.Sprintf("source_issue=%s source_status=lookup_error: %v", sourceIssue, err)
 	}
