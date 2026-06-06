@@ -275,9 +275,8 @@ func (b *Beads) CloseEscalation(id, closedBy, reason string) error {
 		return err
 	}
 
-	// Close the issue
-	_, err = target.run("close", id, "--reason="+reason)
-	return err
+	// Close the issue via CloseWithReason so the store path and session ID are used.
+	return target.CloseWithReason(reason, id)
 }
 
 // GetEscalationBead retrieves an escalation bead by ID.
@@ -429,6 +428,15 @@ func (b *Beads) ReescalateEscalation(id, reescalatedBy string, maxReescalations 
 		ID:          id,
 		Title:       issue.Title,
 		OldSeverity: fields.Severity,
+	}
+
+	// Guard: skip escalations that were closed after the stale list was fetched.
+	// bd update on a closed bead can inadvertently reopen it, so we must not
+	// proceed with a re-escalation update if the bead is already closed.
+	if issue.Status == "closed" {
+		result.Skipped = true
+		result.SkipReason = "already closed"
+		return result, nil
 	}
 
 	// Check if already at max reescalations

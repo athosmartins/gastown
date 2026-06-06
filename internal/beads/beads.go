@@ -1656,8 +1656,13 @@ func (b *Beads) Update(id string, opts UpdateOptions) error {
 	if opts.Priority != nil {
 		args = append(args, fmt.Sprintf("--priority=%d", *opts.Priority))
 	}
+	// Pass description via stdin (--body-file=-) to avoid embedding newlines in a
+	// flag value. bd 1.0.3+ rejects newline-containing flag values (same issue that
+	// prompted the CreateEscalationBead fix in commit 085d15814).
+	var descriptionBody []byte
 	if opts.Description != nil {
-		args = append(args, "--description="+*opts.Description)
+		args = append(args, "--body-file=-")
+		descriptionBody = []byte(*opts.Description)
 	}
 	if opts.Assignee != nil {
 		args = append(args, "--assignee="+*opts.Assignee)
@@ -1676,7 +1681,7 @@ func (b *Beads) Update(id string, opts UpdateOptions) error {
 		}
 	}
 
-	_, err := b.run(args...)
+	_, err := b.runWithStdin(descriptionBody, args...)
 	return err
 }
 
