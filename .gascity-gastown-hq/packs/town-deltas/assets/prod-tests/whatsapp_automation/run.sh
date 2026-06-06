@@ -9,11 +9,11 @@
 # the baseline smoke checks below always run and gate pass/fail on their own.
 #
 # What this proves (the ga-857v FIX 2 acceptance, all four points):
-#   1. Painel de Visibilidade (:8202) is live and returns HTTP 200.
-#   2. Its served HTML contains the expected title "Painel de Visibilidade".
+#   1. Kanban de histórias (:8202) is live and returns HTTP 200.
+#   2. Its served HTML contains the expected title "Kanban de histórias".
 #   3. SSTI is closed: the painel index route returns the prebuilt HTML directly
 #      and never funnels it through render_template_string (RCE-class fix).
-#   4. The admin console (:8097) shows the Painel de Visibilidade registration.
+#   4. The admin console (:8097) shows the Kanban de histórias registration.
 
 set -uo pipefail
 
@@ -38,10 +38,10 @@ fi
 log "painel HTTP 200 OK"
 
 # ── Check 2: served HTML contains the expected title ──────────────────────────
-log "Check 2: served HTML contains 'Painel de Visibilidade' ..."
-if ! grep -q "Painel de Visibilidade" "$PAINEL_BODY"; then
+log "Check 2: served HTML contains 'Kanban de histórias' ..."
+if ! grep -q "Kanban de histórias" "$PAINEL_BODY"; then
   rm -f "$PAINEL_BODY"
-  fail "served painel HTML does not contain 'Painel de Visibilidade' — wrong page served?"
+  fail "served painel HTML does not contain 'Kanban de histórias' — daemon not restarted after ga-52ib rename, or wrong page served?"
 fi
 rm -f "$PAINEL_BODY"
 log "title present OK"
@@ -63,14 +63,14 @@ if ! grep -Eq '^[[:space:]]*return[[:space:]]+html\b' "$PAINEL_SRC"; then
 fi
 log "SSTI closed OK"
 
-# ── Check 4: admin :8097 shows the Painel de Visibilidade registration ────────
-log "Check 4: admin http://127.0.0.1:${ADMIN_PORT}/ shows Painel de Visibilidade registration ..."
+# ── Check 4: admin :8097 shows the Kanban de histórias registration ────────
+log "Check 4: admin http://127.0.0.1:${ADMIN_PORT}/ shows Kanban de histórias registration ..."
 ADMIN_BODY=$(curl -s --max-time 10 "http://127.0.0.1:${ADMIN_PORT}/" 2>/dev/null || echo "")
 if [ -z "$ADMIN_BODY" ]; then
   fail "admin :${ADMIN_PORT} unreachable or empty — admin console down?"
 fi
-if ! echo "$ADMIN_BODY" | grep -q "Painel de Visibilidade"; then
-  fail "admin :${ADMIN_PORT} does not list 'Painel de Visibilidade' — registration missing."
+if ! echo "$ADMIN_BODY" | grep -q "Kanban de histórias"; then
+  fail "admin :${ADMIN_PORT} does not list 'Kanban de histórias' — registration missing or admin daemon not restarted after ga-52ib rename."
 fi
 if ! echo "$ADMIN_BODY" | grep -q "${PAINEL_PORT}"; then
   log "WARN: admin console lists the painel but not port ${PAINEL_PORT} explicitly (non-fatal)."
