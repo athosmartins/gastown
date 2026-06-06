@@ -66,11 +66,13 @@ log_json() {
 # Write heartbeat for "the watcher is watched" (gate-health-monitor.py checks this)
 heartbeat() { date -u +%Y-%m-%dT%H:%M:%SZ > "$HEARTBEAT"; }
 
-# file_age_sec <path> — seconds since last modification; 999999 if missing
+# file_age_sec <path> — seconds since last modification; 999999 if missing or stat fails
 file_age_sec() {
   local f="$1"
   [ -f "$f" ] || { echo "999999"; return; }
-  echo $(( $(date +%s) - $(stat -f %m "$f" 2>/dev/null || echo "0") ))
+  local mtime
+  mtime=$(stat -f %m "$f" 2>/dev/null) || { echo "999999"; return; }
+  echo $(( $(date +%s) - mtime ))
 }
 
 # launchd_pid <label> — PID of running service; empty if not running
@@ -98,6 +100,7 @@ state_get() {
 }
 
 state_save() {
+  [ "${DRY_RUN:-0}" = "1" ] && return 0
   # Atomic write: write to temp then rename to prevent corrupt reads on crash
   local tmp="${STATE_FILE}.tmp.$$"
   printf '%s' "$1" > "$tmp" && mv "$tmp" "$STATE_FILE" || rm -f "$tmp"
@@ -110,19 +113,19 @@ state_get_seen() {
 
 state_get_incident() {
   local key="$1"
-  state_get | jq -c ".incidents[\"$key\"] // null"
+  state_get | jq -c --arg k "$key" '.incidents[$k] // null'
 }
 
 state_set_incident() {
   local key="$1" val="$2"
   local st; st=$(state_get)
-  state_save "$(printf '%s' "$st" | jq -c ".incidents[\"$key\"] = $val")"
+  state_save "$(printf '%s' "$st" | jq -c --arg k "$key" --argjson v "$val" '.incidents[$k] = $v')"
 }
 
 state_clear_incident() {
   local key="$1"
   local st; st=$(state_get)
-  state_save "$(printf '%s' "$st" | jq -c "del(.incidents[\"$key\"])")"
+  state_save "$(printf '%s' "$st" | jq -c --arg k "$key" 'del(.incidents[$k])')"
 }
 
 state_update_seen() {
@@ -492,16 +495,18 @@ main() {
 }
 
 # ── Guard against concurrent runs ─────────────────────────────────────────────
+# noclobber gives atomic lock creation — avoids TOCTOU race between check and write
 LOCK="$GC_CITY/.gc/guardian.lock"
-if [ -e "$LOCK" ]; then
+if ! ( set -o noclobber; echo $$ > "$LOCK" ) 2>/dev/null; then
   LOCK_PID=$(cat "$LOCK" 2>/dev/null || echo "")
   if [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null; then
     log "Another guardian instance is running (PID $LOCK_PID) — exiting"
     exit 0
   fi
+  # Stale lock (dead PID) — remove and retry once
   rm -f "$LOCK"
+  ( set -o noclobber; echo $$ > "$LOCK" ) 2>/dev/null || exit 0
 fi
-echo $$ > "$LOCK"
 trap 'rm -f "$LOCK"' EXIT
 
 main
