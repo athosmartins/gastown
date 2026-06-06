@@ -290,6 +290,42 @@ export const GasTown = async ({ $ }) => {
 	}
 }
 
+func TestInstallForRole_UpgradesStaleBinaryPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("absolute path check is POSIX-only")
+	}
+	dir := t.TempDir()
+	hooksPath := filepath.Join(dir, ".claude", "settings.json")
+	os.MkdirAll(filepath.Dir(hooksPath), 0755)
+
+	// Write a managed Claude settings.json whose hook commands reference a
+	// binary path that doesn't exist — simulates the gt → gc rename (gt-nqqa3).
+	stale := `{
+		"hooks": {
+			"SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": "/nonexistent/bin/gt prime --hook"}]}],
+			"PreToolUse": [{"matcher": "Bash(gh pr create*)", "hooks": [{"type": "command", "command": "/nonexistent/bin/gt tap guard pr-workflow"}]}]
+		}
+	}`
+	os.WriteFile(hooksPath, []byte(stale), 0644)
+
+	if err := InstallForRole("claude", dir, dir, "polecat", ".claude", "settings.json", true); err != nil {
+		t.Fatalf("InstallForRole: %v", err)
+	}
+
+	got, err := os.ReadFile(hooksPath)
+	if err != nil {
+		t.Fatalf("read upgraded settings: %v", err)
+	}
+	// After upgrade the stale path must be gone.
+	if strings.Contains(string(got), "/nonexistent/bin/gt") {
+		t.Fatal("stale binary path was not replaced by needsUpgrade")
+	}
+	// The upgraded file should have the managed marker (from the claude template).
+	if !strings.Contains(string(got), "tap guard pr-workflow") {
+		t.Fatal("upgraded settings missing managed-install marker")
+	}
+}
+
 func TestOpenCodeTemplateUsesHookModeAndCompoundRoles(t *testing.T) {
 	content, err := resolveAndSubstitute("opencode", "gastown.js", "polecat")
 	if err != nil {

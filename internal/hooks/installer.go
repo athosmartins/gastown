@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/hookutil"
@@ -86,6 +87,17 @@ func needsUpgrade(content []byte) bool {
 		return true
 	}
 
+	// OpenCode stale pattern: the original gastown.js ran "gt prime" directly
+	// without hook mode. Current template uses "prime --hook" for session ID
+	// propagation and compact-resume detection. Managed files are identified
+	// by the "export const GasTown" marker present in all Gas Town OpenCode plugins.
+	if bytes.Contains(content, []byte("export const GasTown")) {
+		if !bytes.Contains(content, []byte("prime --hook")) {
+			return true
+		}
+		return false
+	}
+
 	// Managed-install marker: every Claude settings template since day one
 	// includes `tap guard pr-workflow`. Use it as the discriminator between
 	// "this looks like our template" and "this is a user-customized file we
@@ -113,7 +125,54 @@ func needsUpgrade(content []byte) bool {
 		}
 	}
 
+	// Stale binary path detection: if hook commands reference an absolute binary
+	// path that no longer exists on disk (e.g., after a gt → gc rename), Claude
+	// Code fails to run any hook — including SessionStart/gt prime --hook —
+	// causing polecats to never initialize and session launch to fail (gt-nqqa3).
+	if hasMissingBinaryInHooks(content) {
+		return true
+	}
+
 	return false
+}
+
+// hasMissingBinaryInHooks parses the settings JSON and returns true if any hook
+// command contains an absolute path that does not exist on disk.
+// Used to detect stale binary paths after a binary rename (e.g., gt → gc).
+func hasMissingBinaryInHooks(content []byte) bool {
+	var settings struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(content, &settings); err != nil {
+		return false
+	}
+	for _, hookGroups := range settings.Hooks {
+		for _, group := range hookGroups {
+			for _, hook := range group.Hooks {
+				if path := firstAbsPath(hook.Command); path != "" {
+					if _, err := os.Stat(path); os.IsNotExist(err) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// firstAbsPath returns the first absolute path found among the whitespace-separated
+// fields of a shell command string. Returns empty string if none found.
+func firstAbsPath(cmd string) string {
+	for _, field := range strings.Fields(cmd) {
+		if strings.HasPrefix(field, "/") {
+			return field
+		}
+	}
+	return ""
 }
 
 // SyncResult describes what SyncForRole did.
