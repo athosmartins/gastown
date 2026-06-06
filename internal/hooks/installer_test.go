@@ -326,6 +326,36 @@ func TestInstallForRole_UpgradesStaleBinaryPath(t *testing.T) {
 	}
 }
 
+func TestInstallForRole_UpgradesOpenCodeWithStaleBinaryPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("absolute path check is POSIX-only")
+	}
+	dir := t.TempDir()
+	hooksPath := filepath.Join(dir, ".opencode/plugins", "gastown.js")
+	os.MkdirAll(filepath.Dir(hooksPath), 0755)
+
+	// Simulate an OpenCode plugin that went through the prime --hook upgrade
+	// but still embeds a stale absolute binary path in a template literal.
+	// This exercises the code path previously unreachable due to early return false.
+	stale := "// Gas Town OpenCode plugin.\n" +
+		"export const GasTown = async ({ $ }) => {\n" +
+		"  await $`/nonexistent/bin/gt prime --hook`\n" +
+		"}\n"
+	os.WriteFile(hooksPath, []byte(stale), 0644)
+
+	if err := InstallForRole("opencode", dir, dir, "crew", ".opencode/plugins", "gastown.js", false); err != nil {
+		t.Fatalf("InstallForRole: %v", err)
+	}
+
+	got, err := os.ReadFile(hooksPath)
+	if err != nil {
+		t.Fatalf("read upgraded hook: %v", err)
+	}
+	if strings.Contains(string(got), "/nonexistent/bin/gt") {
+		t.Fatal("stale absolute path in OpenCode plugin was not replaced by needsUpgrade")
+	}
+}
+
 func TestOpenCodeTemplateUsesHookModeAndCompoundRoles(t *testing.T) {
 	content, err := resolveAndSubstitute("opencode", "gastown.js", "polecat")
 	if err != nil {

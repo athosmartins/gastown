@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/atomicfile"
@@ -95,7 +96,11 @@ func needsUpgrade(content []byte) bool {
 		if !bytes.Contains(content, []byte("prime --hook")) {
 			return true
 		}
-		return false
+		// Current OpenCode templates use GT_BIN env var (no hardcoded paths),
+		// so this rarely fires — but check defensively for manually-modified
+		// files that embed a stale absolute binary path (e.g., /old/bin/gt).
+		// hasMissingBinaryInHooks is JSON-only; JS files need a raw text scan.
+		return hasStaleBinaryInRawText(content)
 	}
 
 	// Managed-install marker: every Claude settings template since day one
@@ -158,6 +163,25 @@ func hasMissingBinaryInHooks(content []byte) bool {
 						return true
 					}
 				}
+			}
+		}
+	}
+	return false
+}
+
+// hasStaleBinaryInRawText scans arbitrary file content (any format, including JS)
+// for absolute paths embedded in quoted or template-literal string contexts that
+// no longer exist on disk. Unlike hasMissingBinaryInHooks, this works on non-JSON
+// files by matching paths that immediately follow a string-delimiter character.
+func hasStaleBinaryInRawText(content []byte) bool {
+	// Match an absolute path immediately following ", ', or ` — the common
+	// delimiters for shell commands in JS/TS (e.g., $`/path/bin prime --hook`).
+	// \x22=" \x27=' \x60=`
+	re := regexp.MustCompile(`[\x22\x27\x60](/[^\s\x22\x27\x60\\]+)`)
+	for _, m := range re.FindAllSubmatch(content, -1) {
+		if len(m) > 1 {
+			if _, err := os.Stat(string(m[1])); os.IsNotExist(err) {
+				return true
 			}
 		}
 	}
