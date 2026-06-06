@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.crew-hang-detector</string>
+
+  <!-- Runs every 300 seconds (5 minutes). Lists active persistent CREW sessions,
+       finds any whose engine heartbeat (last_active) has frozen past the
+       thresholds, and recovers them via the existing safe shutdown-dance path:
+         frozen > STALE_SEC (600s)    -> courtesy nudge probe
+         frozen > ESCALATE_SEC (1200s) -> file a `warrant` bead for the dog pool
+       The dog runs mol-shutdown-dance (3 interrogations / 420s) and only kills if
+       the agent never proves ALIVE; the reconciler then restarts the pinned
+       session, resuming its task. Closes the crew-coverage gap (ga-khuz1) left by
+       the suspended deacon and the gate/pilot-only guardian (ga-0wxg).
+
+       DO NOT load this plist unsupervised on first run.
+       Supervised first-dispatch procedure:
+         1. DRY_RUN=1 bash crew-hang-detector.sh   # verify candidate detection
+         2. bash crew-hang-detector.sh             # single supervised real pass
+         3. launchctl bootstrap gui/$(id -u) \
+              ~/Library/LaunchAgents/com.gascity.crew-hang-detector.plist
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/crew-hang-detector.sh</string>
+  </array>
+
+  <key>StartInterval</key><integer>300</integer>
+
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-hang-detector-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-hang-detector-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>

@@ -28,4 +28,17 @@ Fluxo obrigatório:
 1. `aws s3 cp <arquivo.html> s3://whatsapp-viewer-549710416969/mockups/<nome>.html --content-type "text/html; charset=utf-8"`
 2. `aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>.html --expires-in 604800`
 3. Envie ao Athos o URL presigned (abre direto no celular, sem VPN, sem server local).
+
+**Filesystem de rede / CloudStorage pode PENDURAR a sessão (ga-khuz1).** NUNCA
+rode `ls`/`find`/`stat`/`cat`/`grep` direto contra paths do Google Drive ou
+iCloud (`~/Library/CloudStorage/...`) nem qualquer mount FUSE/rede sem limite de
+tempo. Esse I/O pode travar em sleep ininterruptível e PENDURAR a sessão
+indefinidamente — o timeout nativo do Bash NÃO mata de forma confiável um
+processo preso num mount FUSE. Vale para o loop principal E para subagentes
+(Explore/Task): foi um `ls` de subagente num path CloudStorage que pendurou a
+crew thies-wa por 15min. Se PRECISAR tocar num path desses: (1) prefira a fonte
+canônica do dado (DB/API) a varrer a árvore do Drive; (2) envolva SEMPRE em
+`timeout` (ex.: `timeout 15 ls ...`); (3) verifique antes que o mount responde.
+Rede de segurança: o `crew-hang-detector` detecta sessões de crew com heartbeat
+congelado e dispara o shutdown-dance (kill+restart com devido processo).
 {{ end }}

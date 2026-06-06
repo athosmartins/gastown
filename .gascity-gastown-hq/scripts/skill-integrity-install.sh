@@ -38,6 +38,37 @@ source "$SELF_DIR/skill-lib.sh"
 
 say() { echo "[skill-integrity-install] $*"; }
 
+# install_plist <plist_src> <label> — idempotently copy a plist into
+# ~/Library/LaunchAgents and (re)bootstrap + kickstart it. Safe to run
+# repeatedly. Honors SKILL_INTEGRITY_NO_LAUNCHD=true (test/CI seam).
+install_plist() {
+    local src="$1" label="$2"
+    local dst="$LAUNCH_AGENTS/$label.plist"
+    if [[ "$NO_LAUNCHD" == "true" ]]; then
+        say "Skipping launchd install for $label (SKILL_INTEGRITY_NO_LAUNCHD=true)."
+        return 0
+    fi
+    if [[ ! -f "$src" ]]; then
+        say "WARNING: plist source not found ($src) — skipping launchd install for $label."
+        return 0
+    fi
+    mkdir -p "$LAUNCH_AGENTS"
+    cp -f "$src" "$dst"
+    say "Installed plist -> $dst"
+    local uid; uid="$(id -u)"
+    # bootout first (ignore failure if not loaded), then bootstrap. Idempotent.
+    launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+    if launchctl bootstrap "gui/$uid" "$dst" >/dev/null 2>&1; then
+        say "launchd bootstrap OK ($label)"
+    else
+        # Fall back to legacy load for older macOS.
+        launchctl load -w "$dst" >/dev/null 2>&1 \
+            && say "launchd load OK ($label, legacy)" \
+            || say "WARNING: launchd registration failed for $label"
+    fi
+    launchctl kickstart "gui/$uid/$label" >/dev/null 2>&1 || true
+}
+
 # ── 1. Baseline adopt ─────────────────────────────────────────────────────────
 say "Adopting current canonical as baseline for unmanaged skills..."
 mkdir -p "$(dirname "$MANIFEST")"
@@ -102,27 +133,13 @@ else
 fi
 
 # ── 2. Install launchd ────────────────────────────────────────────────────────
-if [[ "$NO_LAUNCHD" == "true" ]]; then
-    say "Skipping launchd install (SKILL_INTEGRITY_NO_LAUNCHD=true)."
-elif [[ ! -f "$PLIST_SRC" ]]; then
-    say "WARNING: plist source not found ($PLIST_SRC) — skipping launchd install."
-else
-    mkdir -p "$LAUNCH_AGENTS"
-    cp -f "$PLIST_SRC" "$PLIST_DST"
-    say "Installed plist -> $PLIST_DST"
-    uid="$(id -u)"
-    # bootout first (ignore failure if not loaded), then bootstrap. Idempotent.
-    launchctl bootout "gui/$uid/$LABEL" >/dev/null 2>&1 || true
-    if launchctl bootstrap "gui/$uid" "$PLIST_DST" >/dev/null 2>&1; then
-        say "launchd bootstrap OK ($LABEL)"
-    else
-        # Fall back to legacy load for older macOS.
-        launchctl load -w "$PLIST_DST" >/dev/null 2>&1 \
-            && say "launchd load OK ($LABEL, legacy)" \
-            || say "WARNING: launchd registration failed for $LABEL"
-    fi
-    launchctl kickstart "gui/$uid/$LABEL" >/dev/null 2>&1 || true
-fi
+# The skill-publish auditor (ga-5lx) — original purpose of this bootstrap.
+install_plist "$PLIST_SRC" "$LABEL"
+# The crew-hang detector (ga-khuz1) — like the auditor, its launchd registration
+# is not in the git tree, so a plain `git pull` deploy cannot bring it live. This
+# bootstrap (run by the gascity deploy_cmd) installs + loads it; story-delivery's
+# daemon_restarts then kickstarts it after every deploy.
+install_plist "$CITY/packs/town-deltas/assets/crew-hang-detector.plist" "com.gascity.crew-hang-detector"
 
 # ── 3. Verify ─────────────────────────────────────────────────────────────────
 say "Running auditor to verify..."

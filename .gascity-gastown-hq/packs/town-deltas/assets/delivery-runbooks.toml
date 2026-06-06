@@ -102,7 +102,10 @@ git_repo        = "/Users/athos/gt"
 # origin/main after this command and HALTS delivery (no story:done) if it does
 # not — so a silently-stale town root can never be marked done.
 deploy_cmd      = "git -C /Users/athos/gt pull --ff-only origin main 2>/dev/null || true; /Users/athos/gt/.gascity-gastown-hq/scripts/skill-integrity-install.sh"
-daemon_restarts = ["com.gascity.skill-audit", "com.gascity.config-drift-watcher", "com.gascity.town-root-reconciler"]
+# crew-hang-detector (ga-khuz1): skill-integrity-install.sh (above) installs +
+# loads its plist; this kickstart fires it immediately after each deploy so the
+# prod-test sees a fresh startup marker.
+daemon_restarts = ["com.gascity.skill-audit", "com.gascity.config-drift-watcher", "com.gascity.town-root-reconciler", "com.gascity.crew-hang-detector"]
 prod_test_script = "/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/prod-tests/gascity/run.sh"
 min_deploy_gap_minutes = 5
 
