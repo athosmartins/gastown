@@ -1271,8 +1271,6 @@ func resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride str
 			return nil, "", fmt.Errorf("agent '%s' not found", agentName)
 		}
 
-		rc.ResolvedAgent = agentName
-
 		// Append extra arguments from the override
 		if len(extraArgs) > 0 {
 			rc.Args = append(rc.Args, extraArgs...)
@@ -2504,6 +2502,25 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 	// non-override ResolveRoleAgentConfig path included it, causing hooks
 	// to silently not fire for polecats launched with --agent.
 	rc = withRoleSettingsFlag(rc, role, rigPath)
+
+	// Auto-inject --remote-control for Claude agents when the session name is known.
+	// This enables the /remote-control slash command to connect to any Gas Town session.
+	// GT_SESSION is set when AgentEnvConfig.SessionName is provided by the caller.
+	// Excluded roles: polecat (ephemeral workers), boot (deacon triage spawns
+	// every cycle; injecting --remote-control floods the user's mobile session list),
+	// and dog (pool utility workers; each run is transient and should not appear in the session list).
+	rcExcluded := role == "polecat" || role == "boot" || role == "dog"
+	if sessionName := envVars["GT_SESSION"]; sessionName != "" && !rcExcluded {
+		rcCmd := rc.Command
+		if rcCmd == "" {
+			rcCmd = "claude"
+		}
+		if rcCmd == "claude" || strings.HasSuffix(rcCmd, "/claude") {
+			rcCopy := *rc
+			rcCopy.Args = append(append([]string{}, rc.Args...), "--remote-control", sessionName)
+			rc = &rcCopy
+		}
+	}
 
 	// Apply exec wrapper from rig/town settings if not already set on the resolved config.
 	if len(rc.ExecWrapper) == 0 {
