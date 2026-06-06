@@ -29,21 +29,26 @@ check_engine() {
 
     log "Checking $label ..."
 
-    # ── 1. Engine is registered + running in launchd ──────────────────────────
-    local pid launchd_pid
-    launchd_pid=$(launchctl list "$label" 2>/dev/null | awk 'NR==1 {print $1}')
-    if [[ -z "$launchd_pid" || "$launchd_pid" == "-" ]]; then
-        fail "$label: not running in launchd (kickstart failed or label wrong)"
-    fi
-    log "$label: launchd PID=$launchd_pid"
-
-    # ── 2. Wait for startup marker (launchd takes a moment to spawn) ──────────
-    local waited=0
-    while [[ ! -f "$marker" ]] && (( waited < max_wait )); do
+    # ── 1+2. Poll until launchd has a PID AND the startup marker exists ───────
+    # Fix: `launchctl list <label>` on macOS returns a plist dict (first line `{`),
+    # so use `launchctl list | awk '$3==label'` to get the real PID.  Also poll for
+    # both the launchd PID and the marker file together so launchd startup latency
+    # doesn't cause an immediate failure before the process has been assigned a PID.
+    local pid launchd_pid waited=0
+    while (( waited < max_wait )); do
+        launchd_pid=$(launchctl list 2>/dev/null | awk -v lbl="$label" '$3==lbl{print $1}')
+        if [[ -n "$launchd_pid" && "$launchd_pid" != "-" && -f "$marker" ]]; then
+            break
+        fi
         sleep 2
         (( waited += 2 ))
     done
+
+    if [[ -z "$launchd_pid" || "$launchd_pid" == "-" ]]; then
+        fail "$label: not running in launchd after ${max_wait}s (kickstart failed or label wrong)"
+    fi
     [[ -f "$marker" ]] || fail "$label: startup marker missing after ${max_wait}s ($marker) — process did not write it; is it running the NEW code?"
+    log "$label: launchd PID=$launchd_pid"
 
     # ── 3. Parse marker: "<pid> <epoch>" ─────────────────────────────────────
     read -r pid epoch < "$marker" 2>/dev/null \
