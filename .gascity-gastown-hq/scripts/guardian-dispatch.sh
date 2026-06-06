@@ -339,29 +339,27 @@ check_engine_stall() {
 
 check_real_jams() {
   local now; now=$(date +%s)
-  local lines
-  lines=$(cat "$QG_LOG" 2>/dev/null) || return 0
 
-  # Find the most recent event per marker bead
-  declare -A last_event
-  declare -A last_ts
-  while IFS= read -r line; do
-    local b ts ev
-    b=$(printf '%s' "$line" | jq -r '.marker // .bead // ""' 2>/dev/null || true)
-    ts=$(printf '%s' "$line" | jq -r '.ts // ""' 2>/dev/null || true)
-    ev=$(printf '%s' "$line" | jq -r '.event // ""' 2>/dev/null || true)
-    [ -z "$b" ] && continue
-    last_event["$b"]="$ev"
-    last_ts["$b"]="$ts"
-  done <<< "$lines"
+  # Reduce QG log to latest event per marker using jq+awk (bash 3.2 compatible).
+  # awk associative arrays are an awk feature — independent of the bash version.
+  local summary
+  summary=$(jq -r '"\(.marker // .bead // "")|\(.event // "")|\(.ts // "")"' \
+    "$QG_LOG" 2>/dev/null | awk -F'|' '
+      NF >= 3 && $1 != "" { ev[$1]=$2; ts[$1]=$3 }
+      END { for (m in ev) printf "%s|%s|%s\n", m, ev[m], ts[m] }
+    ' 2>/dev/null) || return 0
 
-  for marker in "${!last_event[@]}"; do
-    local ev="${last_event[$marker]}" ts="${last_ts[$marker]}"
+  [ -z "$summary" ] && return 0
+
+  while IFS='|' read -r marker ev ts; do
     [ "$ev" != "guard_queued" ] && continue
+    [ -z "$ts" ] && continue  # missing timestamp — skip to avoid false positive
 
-    # Compute age
+    # Compute age; guard against malformed timestamps that produce epoch 0
     local ts_epoch
     ts_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${ts%%Z*}" "+%s" 2>/dev/null || echo "0")
+    [ "$ts_epoch" -eq 0 ] && continue
+
     local age=$(( now - ts_epoch ))
     [ "$age" -lt "$REAL_JAM_SEC" ] && continue
 
@@ -384,7 +382,7 @@ check_real_jams() {
         "$marker" "$age" "$REAL_JAM_SEC" "$ts")" \
       "$(printf 'GUARDIAN REAL-JAM REPAIR\n\nMarker: %s (gate-status:queued for %ds)\n\n1. Check: bd -C $GC_CITY show %s\n2. Check guard log: tail -100 %s\n3. If guard is running but skipping this marker: investigate why (TTL, locked, etc.)\n4. If guard is stalled: see engine-stall incident\n5. Manually re-queue if stuck: bd -C $GC_CITY label set %s gate-status:ready\n6. Close this bead when the gate run completes (PASS or FAIL).' \
         "$marker" "$age" "$marker" "$GATE_GUARD_LOG" "$marker")"
-  done
+  done <<< "$summary"
 }
 
 # ── Delivery-fail detection ───────────────────────────────────────────────────

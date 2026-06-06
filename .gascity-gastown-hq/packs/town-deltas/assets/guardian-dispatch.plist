@@ -18,7 +18,7 @@
   -->
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/bash</string>
+    <string>/opt/homebrew/bin/bash</string>
     <string>/Users/athos/gt/.gascity-gastown-hq/scripts/guardian-dispatch.sh</string>
   </array>
 

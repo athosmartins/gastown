@@ -59,6 +59,7 @@ sd_seen = count(SD)
 alerted = {}
 engine_alerted = 0
 guardian_alerted = 0
+monitor_start = time.time()  # baseline when heartbeat file is absent
 
 while True:
     # --- engine liveness: dispatcher log must keep sweeping ---
@@ -76,13 +77,15 @@ while True:
     try:
         m = os.path.getmtime(GUARDIAN_HEARTBEAT)
         stale = time.time() - m
-        if stale > GUARDIAN_STALL_SEC and time.time() - guardian_alerted > REALERT_SEC:
-            print("[GUARDIAN-STALL] guardian-dispatch.sh heartbeat stale %dmin - "
-                  "guardian may be dead/hung; start com.gascity.guardian" % int(stale / 60),
-                  flush=True)
-            guardian_alerted = time.time()
     except OSError:
-        pass
+        # File absent (not yet created or deleted) — treat as stale since monitor start.
+        # This ensures GUARDIAN-STALL fires even on initial deployment after GUARDIAN_STALL_SEC.
+        stale = time.time() - monitor_start
+    if stale > GUARDIAN_STALL_SEC and time.time() - guardian_alerted > REALERT_SEC:
+        print("[GUARDIAN-STALL] guardian-dispatch.sh heartbeat stale %dmin - "
+              "guardian may be dead/hung; start com.gascity.guardian" % int(stale / 60),
+              flush=True)
+        guardian_alerted = time.time()
 
     # --- gate: new FAILs + stuck-marker detection ---
     try:
