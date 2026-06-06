@@ -217,6 +217,18 @@ grep -q 'com.gascity.guardian' "$PLIST" && ok "plist label is com.gascity.guardi
 grep -q 'guardian-dispatch.sh' "$PLIST" && ok "plist references guardian-dispatch.sh" || bad "plist wrong script path"
 grep -q 'StartInterval'        "$PLIST" && ok "plist has StartInterval"              || bad "plist missing StartInterval"
 
+# ── 9. Drift-guard: gate-health-monitor.plist exists ─────────────────────────
+echo "── 9. Drift-guard: gate-health-monitor.plist ──"
+
+MONITOR_PLIST="$SELF_DIR/gate-health-monitor.plist"
+[ -f "$MONITOR_PLIST" ] && ok "gate-health-monitor.plist exists" || bad "gate-health-monitor.plist missing — monitor has no launch mechanism"
+grep -q 'com.gascity.gate-health-monitor' "$MONITOR_PLIST" 2>/dev/null && \
+  ok "plist label is com.gascity.gate-health-monitor" || bad "wrong plist label for monitor"
+grep -q 'gate-health-monitor.py' "$MONITOR_PLIST" 2>/dev/null && \
+  ok "plist references gate-health-monitor.py" || bad "plist wrong script path for monitor"
+grep -q 'KeepAlive' "$MONITOR_PLIST" 2>/dev/null && \
+  ok "monitor plist has KeepAlive (persistent daemon)" || bad "monitor plist missing KeepAlive"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "guardian-dispatch.selftest: $PASS passed, $FAIL failed"
