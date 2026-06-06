@@ -196,32 +196,42 @@ if [ "$COUNT" = "0" ]; then
   exit 0
 fi
 
-# Process one story per run (avoids long-running sweeps; next launchd interval picks up more)
-STORY=$(echo "$STORIES_JSON" | jq '.[0]')
-STORY_ID=$(echo "$STORY" | jq -r '.id')
-STORY_TITLE=$(echo "$STORY" | jq -r '.description // .title // "untitled"' | head -c 80)
-STORY_LABELS=$(echo "$STORY" | jq -r '(.labels // []) | join(",")')
+# Iterate all eligible stories — avoids head-of-line blocking when .[0] halts.
+while IFS= read -r STORY; do
+  # Reset per-iteration state so a prior story's halt never bleeds into the next.
+  NO_HARNESS=0
+  STORY_TEST_MISSING=0
+  RUN_RECONCILE=0
+  RECONCILE_COUNT=0
+  RECONCILE_DIFF_LIST=""
+  PRE_DEPLOY_SHA=""
+  POST_DEPLOY_SHA=""
+  STALENESS_GATE=0
 
-log "Processing story $STORY_ID: $STORY_TITLE"
-log "Labels: $STORY_LABELS"
+  STORY_ID=$(echo "$STORY" | jq -r '.id')
+  STORY_TITLE=$(echo "$STORY" | jq -r '.description // .title // "untitled"' | head -c 80)
+  STORY_LABELS=$(echo "$STORY" | jq -r '(.labels // []) | join(",")')
+
+  log "Processing story $STORY_ID: $STORY_TITLE"
+  log "Labels: $STORY_LABELS"
 
 # Skip if already marked story:done (idempotency guard)
 if echo "$STORY_LABELS" | grep -q "story:done"; then
   log "Story $STORY_ID already labeled story:done — skipping."
-  exit 0
+  continue
 fi
 
 # Skip if already in delivery (prevents parallel runs)
 if echo "$STORY_LABELS" | grep -q "delivery:running"; then
   log "Story $STORY_ID already has delivery:running — skipping (already in flight)."
-  exit 0
+  continue
 fi
 
 # Mark as running (claim)
 if [ "$DRY_RUN" != "1" ]; then
   bd -C "$GC_CITY" label add "$STORY_ID" "delivery:running" -q 2>/dev/null || {
     warn "Could not add delivery:running to $STORY_ID (race condition?). Skipping."
-    exit 0
+    continue
   }
 fi
 
@@ -261,7 +271,7 @@ if [ -z "$RIG" ]; then
   # wa-uthi: non-terminal (delivery:failed is re-picked every cycle until fixed —
   # retries indefinitely, not a definitive rejection) — no push. Logged + bead comment only.
   warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID rig unknown — add rig:<name> label."
-  exit 1
+  continue
 fi
 
 log "Rig: $RIG"
@@ -280,7 +290,7 @@ if [ -z "$DEPLOY_CMD" ]; then
   fi
   # wa-uthi: non-terminal (config gap, retries every cycle once codified) — no push. Logged + bead comment only.
   warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID — no deploy_cmd for rig $RIG."
-  exit 1
+  continue
 fi
 
 # Bug 2 fix (ga-dqp): warn-only when the rig has NO prod-test harness at all.
@@ -319,7 +329,7 @@ if [ "$NO_HARNESS" = "0" ] && [ ! -f "$PROD_TEST_SCRIPT" ]; then
   # wa-uthi: non-terminal (runbook misconfig — points to a non-existent harness
   # file; retries every cycle until fixed) — no push. Logged + bead comment only.
   warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID — prod_test_script '$PROD_TEST_SCRIPT' not found on disk."
-  exit 1
+  continue
 fi
 
 # Check for story-specific test existence (only if the rig HAS a harness).
@@ -390,7 +400,7 @@ These were NOT removed — uncommitted prod work is never destroyed. Resolve man
   # divergence is resolved — retries, not a definitive rejection) — SUPPRESS the
   # Athos push. Author + Mayor are nudged above; the bead comment is the record.
   warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID reconcile conflict — untracked prod file differs from merge:$RECONCILE_DIFF_LIST."
-  exit 1
+  continue
 fi
 
 # ── Step 4: Deploy ─────────────────────────────────────────────────────────────
@@ -418,7 +428,7 @@ else
     # wa-uthi: non-terminal (delivery:failed is re-picked next cycle — retries, no
     # retry-exhaustion counter) — no push. Logged + bead comment only.
     warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID deploy failed (rc=$DEPLOY_RC)."
-    exit 1
+    continue
   fi
   log "Deploy OK"
 fi
@@ -513,7 +523,7 @@ if [ "$STALENESS_GATE" = "1" ] && [ -n "$RUNTIME_DIR" ] \
     # Non-terminal (re-picked every cycle until the tree is reconciled — retries,
     # not a definitive rejection) → SUPPRESS the Athos push (wa-uthi convention).
     warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID — $STALE_MSG."
-    exit 1
+    continue
   fi
 fi
 
@@ -604,7 +614,7 @@ $REFRESH_OUT" 2>/dev/null || true
       # wa-uthi: non-terminal (delivery:failed re-picked every cycle once the
       # daemon is refreshed) — no Athos push. Author + Mayor nudged above.
       warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID daemon refresh $REFRESH_VERDICT."
-      exit 1
+      continue
       ;;
   esac
 fi
@@ -676,7 +686,7 @@ HALT — do NOT auto-revert (DB migration risk). Investigate the failure, fix fo
       # exhaustion counter) — no push to Athos. The author is nudged above; Athos
       # only hears terminal outcomes (story:done or definitive rejection).
       warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID prod test FAILED (rc=$TEST_RC) — author nudged."
-      exit 1
+      continue
     fi
 
     log "Prod test PASS ($TEST_MODE_DESC)"
@@ -734,7 +744,7 @@ else
   else
     BEAD_LABELS_NOW=$(bd -C "$GC_CITY" show "$STORY_ID" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
-    echo "$BEAD_LABELS_NOW" | grep -q "pilot:dispatched" && PILOT_ORIGIN=1
+    echo "$BEAD_LABELS_NOW" | grep -q "pilot:dispatched" && PILOT_ORIGIN=1 || true
   fi
   PILOT_PREFIX=""
   [ "$PILOT_ORIGIN" = "1" ] && PILOT_PREFIX="🤖 [Pilot] "
@@ -805,3 +815,6 @@ jq -c -n \
   >> "$DELIVERY_LOG" 2>/dev/null || true
 
 log "=== Delivery sweep complete: story=$STORY_ID rig=$RIG result=$([ "$DRY_RUN" = "1" ] && echo dry_run || echo PASS) elapsed=${ELAPSED}s ==="
+
+done < <(echo "$STORIES_JSON" | jq -c '.[]')
+log "=== Delivery sweep finished ==="
