@@ -95,6 +95,12 @@ func needsUpgrade(content []byte) bool {
 		if !bytes.Contains(content, []byte("prime --hook")) {
 			return true
 		}
+		// An OpenCode file may have been upgraded to prime --hook but still embed
+		// a stale absolute binary path (e.g., hardcoded /usr/local/bin/gt before
+		// the GT_BIN env-var approach). Check JS template literals for missing paths.
+		if hasMissingBinaryInJsContent(content) {
+			return true
+		}
 		return false
 	}
 
@@ -158,6 +164,33 @@ func hasMissingBinaryInHooks(content []byte) bool {
 						return true
 					}
 				}
+			}
+		}
+	}
+	return false
+}
+
+// hasMissingBinaryInJsContent scans JavaScript plugin content for backtick
+// template-literal command strings that reference absolute binary paths no
+// longer present on disk. Handles old OpenCode/Pi templates with hardcoded
+// binary paths predating the GT_BIN environment-variable approach (gt-nqqa3).
+func hasMissingBinaryInJsContent(content []byte) bool {
+	s := string(content)
+	for {
+		start := strings.Index(s, "`")
+		if start < 0 {
+			break
+		}
+		s = s[start+1:]
+		end := strings.Index(s, "`")
+		if end < 0 {
+			break
+		}
+		literal := s[:end]
+		s = s[end+1:]
+		if path := firstAbsPath(literal); path != "" {
+			if _, err := os.Stat(path); os.IsNotExist(err) {
+				return true
 			}
 		}
 	}

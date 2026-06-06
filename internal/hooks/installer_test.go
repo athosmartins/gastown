@@ -326,6 +326,41 @@ func TestInstallForRole_UpgradesStaleBinaryPath(t *testing.T) {
 	}
 }
 
+func TestInstallForRole_UpgradesStaleOpenCodeBinaryPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("absolute path check is POSIX-only")
+	}
+	dir := t.TempDir()
+	hooksPath := filepath.Join(dir, ".opencode/plugins", "gastown.js")
+	os.MkdirAll(filepath.Dir(hooksPath), 0755)
+
+	// Simulate an old OpenCode plugin that has already been upgraded to prime --hook
+	// (has both "export const GasTown" and "prime --hook") but still hardcodes a
+	// stale absolute binary path that no longer exists — e.g., after gt → gc rename.
+	// needsUpgrade must return true and trigger a re-install (gt-nqqa3).
+	os.WriteFile(hooksPath, []byte(`// Gas Town OpenCode plugin: hooks SessionStart/Compaction via events.
+export const GasTown = async ({ $ }) => {
+  await $`+"`"+`/nonexistent/bin/gt prime --hook`+"`"+`
+}`), 0644)
+
+	if err := InstallForRole("opencode", dir, dir, "crew", ".opencode/plugins", "gastown.js", false); err != nil {
+		t.Fatalf("InstallForRole: %v", err)
+	}
+
+	got, err := os.ReadFile(hooksPath)
+	if err != nil {
+		t.Fatalf("read upgraded hook: %v", err)
+	}
+	// After upgrade the stale hardcoded path must be gone.
+	if strings.Contains(string(got), "/nonexistent/bin/gt") {
+		t.Fatal("stale binary path in OpenCode plugin was not replaced by needsUpgrade")
+	}
+	// The upgraded file should use the current template's GT_BIN approach.
+	if !strings.Contains(string(got), "prime --hook") {
+		t.Fatal("upgraded OpenCode hook does not run prime --hook")
+	}
+}
+
 func TestOpenCodeTemplateUsesHookModeAndCompoundRoles(t *testing.T) {
 	content, err := resolveAndSubstitute("opencode", "gastown.js", "polecat")
 	if err != nil {
