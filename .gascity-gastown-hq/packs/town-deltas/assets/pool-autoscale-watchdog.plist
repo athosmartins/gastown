@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.pool-autoscale-watchdog</string>
+
+  <!-- Safety-net watchdog that pins idle pool members awake when routed demand
+       exceeds active capacity. Compensates for the engine's buggy auto-scaler
+       (idle members not woken despite queued work; gc session wake does not
+       stick — only gc session pin keeps a member awake).
+
+       Poll cycle: 60s. Silence = healthy. Emits on:
+         [SCALED-UP]         woke+pinned an idle pool member
+         [SCALE-UP-FAILED]   wake or pin command failed
+         [SCALED-DOWN]       unpinned a watchdog-pinned member (demand drained)
+         [STUCK]             demand queued but no capacity/members to wake
+         [STARTUP]           initial state snapshot
+
+       Safety:
+         - Only manages templates in MANAGED_POOLS (currently: gastown.dog).
+         - Only unpins sessions this watchdog pinned (tracked in state file).
+         - One wake+pin per cycle per pool (gentle ramp, hysteresis 180s up / 300s down).
+         - Fails safe on bad/missing data — noop, never crashes.
+         - Does NOT modify Dolt. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/pool-autoscale-watchdog.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/pool-autoscale-watchdog-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/pool-autoscale-watchdog-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>
