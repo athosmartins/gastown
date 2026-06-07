@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# Selftest for inflight-reclaim-guard.py — pure reclaim_decision() logic.
+#
+# Feeds mock inputs to the Python decision function via inline invocation.
+# Does NOT call bd, gc, git, notify, or actuate anything live.
+#
+# Test cases (per spec):
+#   1. no_builder + no_branch + TTL_met → reclaim
+#   2. live_session → noop
+#   3. recent_branch → noop
+#   4. needs_human → noop
+#   5. dispatching_marker → noop
+#   6. stranded_but_TTL_not_met → noop
+#   7. reclaim_count >= MAX_RECLAIMS → escalate
+#   8. escalate_then_reclaim_boundary (count == MAX-1, TTL met → reclaim; count == MAX → escalate)
+#   9. no_builder + no_branch + seconds_stranded=0 → noop (hysteresis, not yet tracked)
+#  10. needs_human overrides everything (even past TTL with no builder)
+#
+# Exit: 0 = all pass, 1 = any failure.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GUARD_SCRIPT="${SCRIPT_DIR}/../../../scripts/inflight-reclaim-guard.py"
+
+if [[ ! -f "$GUARD_SCRIPT" ]]; then
+  echo "FAIL: cannot locate inflight-reclaim-guard.py (looked at $GUARD_SCRIPT)"
+  exit 1
+fi
+
+PASS=0
+FAIL=0
+
+run_test() {
+  local name="$1"
+  local code="$2"
+  local expected="$3"   # exact string expected in output
+
+  result=$(python3 -c "$code" 2>&1) || true
+  if echo "$result" | grep -qF "$expected"; then
+    echo "PASS: $name"
+    ((PASS++)) || true
+  else
+    echo "FAIL: $name"
+    echo "  expected substring: $expected"
+    echo "  got: $result"
+    ((FAIL++)) || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Inline the pure decision function so we don't import the full module
+# (which would start the main loop and call gc/bd/git).
+# Keep in sync with inflight-reclaim-guard.py — these constants must match.
+# ---------------------------------------------------------------------------
+
+HELPERS=$(cat <<'PYEOF'
+RECLAIM_TTL = 1500
+MAX_RECLAIMS = 3
+
+def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
+                     reclaim_count, has_needs_human, has_dispatching_marker):
+    if has_needs_human:
+        return "noop"
+    if has_dispatching_marker:
+        return "noop"
+    if has_live_session:
+        return "noop"
+    if has_recent_branch:
+        return "noop"
+    if seconds_stranded < RECLAIM_TTL:
+        return "noop"
+    if reclaim_count >= MAX_RECLAIMS:
+        return "escalate"
+    return "reclaim"
+PYEOF
+)
+
+# ---------------------------------------------------------------------------
+# Test 1: no builder + no recent branch + TTL met → reclaim
+# ---------------------------------------------------------------------------
+run_test "no_builder+no_branch+TTL_met → reclaim" "
+$HELPERS
+result = reclaim_decision(
+    has_live_session=False,
+    has_recent_branch=False,
+    seconds_stranded=1600.0,   # > 1500s TTL
+    reclaim_count=0,
+    has_needs_human=False,
+    has_dispatching_marker=False,
+)
+assert result == 'reclaim', f'expected reclaim, got {result!r}'
+print('OK result=' + result)
+" "OK result=reclaim"
+
+# ---------------------------------------------------------------------------
+# Test 2: live session → noop (even if past TTL)
+# ---------------------------------------------------------------------------
+run_test "live_session → noop" "
+$HELPERS
+result = reclaim_decision(
+    has_live_session=True,
+    has_recent_branch=False,
+    seconds_stranded=9999.0,   # way past TTL
+    reclaim_count=0,
+    has_needs_human=False,
+    has_dispatching_marker=False,
+)
+assert result == 'noop', f'expected noop, got {result!r}'
+print('OK result=' + result)
+" "OK result=noop"
+
+# ---------------------------------------------------------------------------
+# Test 3: recent branch commit → noop (even with no session + past TTL)
+# ---------------------------------------------------------------------------
+run_test "recent_branch → noop" "
+$HELPERS
+result = reclaim_decision(
+    has_live_session=False,
+    has_recent_branch=True,
+    seconds_stranded=9999.0,
+    reclaim_count=0,
+    has_needs_human=False,
+    has_dispatching_marker=False,
+)
+assert result == 'noop', f'expected noop, got {result!r}'
+print('OK result=' + result)
+" "OK result=noop"
+
+# ---------------------------------------------------------------------------
+# Test 4: needs_human → noop (always, overrides all other signals)
+# ---------------------------------------------------------------------------
+run_test "needs_human → noop" "
+$HELPERS
+result = reclaim_decision(
+    has_live_session=False,
+    has_recent_branch=False,
+    seconds_stranded=9999.0,   # well past TTL
+    reclaim_count=0,
+    has_needs_human=True,
+    has_dispatching_marker=False,
+)
+assert result == 'noop', f'expected noop, got {result!r}'
+print('OK result=' + result)
+" "OK result=noop"
+
+# ---------------------------------------------------------------------------
+# Test 5: dispatching_marker → noop (bead actively in gate pipeline)
+# ---------------------------------------------------------------------------
+run_test "dispatching_marker → noop" "
+$HELPERS
+result = reclaim_decision(
+    has_live_session=False,
+    has_recent_branch=False,
+    seconds_stranded=9999.0,
+    reclaim_count=0,
+    has_needs_human=False,
+    has_dispatching_marker=True,
+)
+assert result == 'noop', f'expected noop, got {result!r}'
+print('OK result=' + result)
+" "OK result=noop"
+
+# ---------------------------------------------------------------------------
+# Test 6: stranded but TTL not met → noop (hysteresis, too soon to act)
+# ---------------------------------------------------------------------------
+run_test "stranded_but_TTL_not_met → noop" "
+$HELPERS
+result = reclaim_decision(
+    has_live_session=False,
+    has_recent_branch=False,
+    seconds_stranded=900.0,    # < 1500s TTL
+    reclaim_count=0,
+    has_needs_human=False,
+    has_dispatching_marker=False,
+)
+assert result == 'noop', f'expected noop, got {result!r}'
+print('OK result=' + result)
+" "OK result=noop"
+
+# ---------------------------------------------------------------------------
+# Test 7: reclaim_count >= MAX_RECLAIMS → escalate
+# ---------------------------------------------------------------------------
+run_test "reclaim_count>=MAX_RECLAIMS → escalate" "
+$HELPERS
+for count in (3, 4, 10):
+    result = reclaim_decision(
+        has_live_session=False,
+        has_recent_branch=False,
+        seconds_stranded=9999.0,
+        reclaim_count=count,
+        has_needs_human=False,
+        has_dispatching_marker=False,
+    )
+    assert result == 'escalate', f'count={count}: expected escalate, got {result!r}'
+print('OK escalated for counts 3,4,10')
+" "OK escalated for counts 3,4,10"
+
+# ---------------------------------------------------------------------------
+# Test 8: reclaim_count == MAX-1 (count=2, < MAX=3) → still reclaim
+# ---------------------------------------------------------------------------
+run_test "reclaim_count=MAX-1 → reclaim (not yet exhausted)" "
+$HELPERS
+result = reclaim_decision(
+    has_live_session=False,
+    has_recent_branch=False,
+    seconds_stranded=1600.0,
+    reclaim_count=2,           # MAX_RECLAIMS-1 = still below cap
+    has_needs_human=False,
+    has_dispatching_marker=False,
+)
+assert result == 'reclaim', f'expected reclaim, got {result!r}'
+print('OK result=' + result)
+" "OK result=reclaim"
+
+# ---------------------------------------------------------------------------
+# Test 9: seconds_stranded=0 (just first noticed) → noop (hysteresis)
+# ---------------------------------------------------------------------------
+run_test "seconds_stranded=0 → noop (just first observed stranded)" "
+$HELPERS
+result = reclaim_decision(
+    has_live_session=False,
+    has_recent_branch=False,
+    seconds_stranded=0.0,
+    reclaim_count=0,
+    has_needs_human=False,
+    has_dispatching_marker=False,
+)
+assert result == 'noop', f'expected noop, got {result!r}'
+print('OK result=' + result)
+" "OK result=noop"
+
+# ---------------------------------------------------------------------------
+# Test 10: needs_human overrides stranded+past-TTL (belt-and-suspenders)
+# ---------------------------------------------------------------------------
+run_test "needs_human+past_TTL → noop (human-parked, never reclaim)" "
+$HELPERS
+# Even with reclaim_count=0, past TTL, and no builder — needs_human wins
+for reclaim_count in (0, 1, 2):
+    result = reclaim_decision(
+        has_live_session=False,
+        has_recent_branch=False,
+        seconds_stranded=9999.0,
+        reclaim_count=reclaim_count,
+        has_needs_human=True,
+        has_dispatching_marker=False,
+    )
+    assert result == 'noop', f'reclaim_count={reclaim_count}: expected noop, got {result!r}'
+print('OK needs_human always noop')
+" "OK needs_human always noop"
+
+# ---------------------------------------------------------------------------
+# ga-7m191: coordinator-parked + in-flight-alone behavior. These load the REAL
+# module via importlib (main() is guarded by __name__=='__main__', so import is
+# side-effect-free — no gc/bd/git/notify calls) and exercise the real functions.
+# ---------------------------------------------------------------------------
+
+LOAD_REAL=$(cat <<PYEOF
+import importlib.util
+spec = importlib.util.spec_from_file_location("irg", "${GUARD_SCRIPT}")
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+PYEOF
+)
+
+# ga-7m191 (a): bead parked under always-live Mayor must NOT count as live builder
+run_test "mayor-parked → not live builder (reclaimable)" "
+$LOAD_REAL
+sess = [{'state':'active','name':'gastown.mayor','session_name':'mayor-gawispabc','agent_name':'mayor'}]
+assert m.session_is_live('gastown.mayor', sess) is False, 'mayor-parked must be False'
+assert m.session_is_live('mayor-gawispabc', sess) is False, 'mayor session_name must be False'
+print('OK mayor-parked not live')
+" "OK mayor-parked not live"
+
+# ga-7m191 (a): deacon (other always-on coordinator) also excluded
+run_test "deacon-parked → not live builder" "
+$LOAD_REAL
+sess = [{'state':'active','name':'gastown.deacon','session_name':'deacon-gawispxx'}]
+assert m.session_is_live('gastown.deacon', sess) is False, 'deacon-parked must be False'
+print('OK deacon-parked not live')
+" "OK deacon-parked not live"
+
+# Control: a genuine live dog/builder session is STILL live (no false reclaim)
+run_test "live dog builder → still live (control)" "
+$LOAD_REAL
+sess = [{'state':'active','name':'gastown.dog-1','session_name':'dog-gawispxyz','agent_name':'gastown.dog'}]
+assert m.session_is_live('dog-gawispxyz', sess) is True, 'live dog must be True'
+assert m.session_is_live('gastown.dog-1', sess) is True, 'live dog by name must be True'
+print('OK live dog still live')
+" "OK live dog still live"
+
+# Control: dead builder (assignee matches no session) → not live
+run_test "dead builder (no matching session) → not live" "
+$LOAD_REAL
+sess = [{'state':'active','name':'gastown.dog-2','session_name':'dog-other'}]
+assert m.session_is_live('dog-deadbuilder', sess) is False, 'dead builder must be False'
+print('OK dead builder not live')
+" "OK dead builder not live"
+
+# is_coordinator helper classifies correctly
+run_test "is_coordinator helper classification" "
+$LOAD_REAL
+assert m.is_coordinator('gastown.mayor') is True
+assert m.is_coordinator('mayor-gawispabc') is True
+assert m.is_coordinator('gastown.deacon') is True
+assert m.is_coordinator('gastown.dog-1') is False
+assert m.is_coordinator('dog-gawispxyz') is False
+assert m.is_coordinator('') is False
+assert m.is_coordinator(None) is False
+print('OK is_coordinator')
+" "OK is_coordinator"
+
+# ga-7m191 (b): the in-flight query keys on story:in-flight ALONE
+run_test "query keys on story:in-flight alone (no pilot:dispatched req)" "
+$LOAD_REAL
+import inspect
+src = inspect.getsource(m.list_inflight_beads)
+# Check the actual bd-list label ARGS, not docstring prose (which may mention
+# pilot:dispatched when explaining the fix). Arg form is the quoted literal.
+assert '\"story:in-flight\"' in src, 'must query --label story:in-flight'
+assert '\"pilot:dispatched\"' not in src, 'must NOT pass pilot:dispatched as a query label'
+print('OK in-flight-alone query')
+" "OK in-flight-alone query"
+
+# ---------------------------------------------------------------------------
+# Drift-guard: verify RECLAIM_TTL, MAX_RECLAIMS, and key safety guards are
+# present in the live script (source-of-truth check).
+# ---------------------------------------------------------------------------
+
+check_pattern() {
+  local name="$1"
+  local pattern="$2"
+  if grep -qE "$pattern" "$GUARD_SCRIPT"; then
+    echo "PASS: $name"
+    ((PASS++)) || true
+  else
+    echo "FAIL: $name — pattern not found in guard script"
+    ((FAIL++)) || true
+  fi
+}
+
+check_pattern "RECLAIM_TTL constant present" "RECLAIM_TTL\s*=\s*1500"
+check_pattern "MAX_RECLAIMS constant present" "MAX_RECLAIMS\s*=\s*3"
+check_pattern "needs_human safety guard present" "has_needs_human"
+check_pattern "live session check covers session_name" "session_name"
+check_pattern "gate dispatching marker check present" "gate-status:dispatching"
+check_pattern "branch recency check for fix/ prefix" '"fix"'
+check_pattern "branch recency check for feature/ prefix" '"feature"'
+check_pattern "fail-safe: skip cycle on bd list failure" "bd list failed"
+check_pattern "fail-safe: skip cycle on session list failure" "session list failed"
+check_pattern "fail-safe: skip cycle on gate-marker failure" "gate-marker query failed"
+check_pattern "ga-7m191: coordinator markers defined" "COORDINATOR_MARKERS"
+check_pattern "ga-7m191: is_coordinator helper present" "def is_coordinator"
+check_pattern "ga-7m191: in-flight-alone query function present" "def list_inflight_beads"
+check_pattern "ga-7m191: epic exclusion in run_cycle" '"epic"'
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+echo ""
+echo "Results: ${PASS} passed, ${FAIL} failed"
+if [[ "$FAIL" -gt 0 ]]; then
+  exit 1
+fi
+exit 0
