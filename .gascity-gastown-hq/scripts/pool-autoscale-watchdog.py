@@ -129,12 +129,24 @@ def save_state(state):
 # ---------------------------------------------------------------------------
 
 def get_pool_demand(pool_template):
-    """Count unassigned tasks routed to this pool. Returns -1 on any error."""
+    """Count unassigned tasks routed to this pool. Returns -1 on any error.
+
+    Excludes story:in-flight / pilot:dispatched labels: a source bead that is
+    already being worked (or already slung) is NOT unmet demand, even if it
+    still carries gc.routed_to. Counting it would inflate demand, spawn a
+    surplus dog, and let that dog re-claim the in-flight bead (double-dispatch,
+    ga-ms1jm / ga-lx7om). bd ready already drops in_progress/hooked *statuses*;
+    these are *labels* on still-open source beads, so they need explicit
+    exclusion. Mirrors the Pilot's own --exclude-label pilot:dispatched guard.
+    """
     try:
         result = subprocess.run(
             ["bd", "ready",
              "--metadata-field", f"gc.routed_to={pool_template}",
-             "--unassigned", "--exclude-type=epic", "--json"],
+             "--unassigned", "--exclude-type=epic",
+             "--exclude-label", "story:in-flight",
+             "--exclude-label", "pilot:dispatched",
+             "--json"],
             capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
             return -1
