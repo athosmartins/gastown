@@ -267,6 +267,7 @@ BUGS_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-label "gate:passed" \
   --exclude-label "pilot:dispatching" \
   --exclude-label "gate:needs-human" \
+  --exclude-label "pilot:dispatched" \
   -n 0 \
   2>/dev/null || echo "[]")
 BUGS_JSON=$(echo "$BUGS_JSON" | _filter_candidates)
@@ -278,6 +279,7 @@ DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-label "gate:passed" \
   --exclude-label "pilot:dispatching" \
   --exclude-label "gate:needs-human" \
+  --exclude-label "pilot:dispatched" \
   -n 0 \
   2>/dev/null || echo "[]")
 DEBT_JSON=$(echo "$DEBT_JSON" | _filter_candidates)
@@ -317,6 +319,7 @@ if [ "$TIER1_COUNT" -eq "0" ]; then
     --exclude-label "gate:passed" \
     --exclude-label "pilot:dispatching" \
     --exclude-label "gate:needs-human" \
+    --exclude-label "pilot:dispatched" \
     -n 0 \
     2>/dev/null || echo "[]")
   TIER2_JSON=$(echo "$TIER2_JSON" | _filter_candidates)
@@ -353,6 +356,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "gate:passed" \
       --exclude-label "pilot:dispatching" \
       --exclude-label "gate:needs-human" \
+      --exclude-label "pilot:dispatched" \
       -n 0 2>/dev/null || echo "[]")
     RIG_BUGS=$(echo "$RIG_BUGS" | _filter_candidates | _filter_unblocked "$rig_path")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_BUGS" | jq -s 'add // []' 2>/dev/null || echo "[]")
@@ -364,6 +368,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "gate:passed" \
       --exclude-label "pilot:dispatching" \
       --exclude-label "gate:needs-human" \
+      --exclude-label "pilot:dispatched" \
       -n 0 2>/dev/null || echo "[]")
     RIG_DEBT=$(echo "$RIG_DEBT" | _filter_candidates | _filter_unblocked "$rig_path")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_DEBT" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
@@ -375,6 +380,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "gate:passed" \
       --exclude-label "pilot:dispatching" \
       --exclude-label "gate:needs-human" \
+      --exclude-label "pilot:dispatched" \
       -n 0 2>/dev/null || echo "[]")
     RIG_FEATURES=$(echo "$RIG_FEATURES" | _filter_candidates | _filter_unblocked "$rig_path")
     ALL_RIG_TIER2=$(echo "$ALL_RIG_TIER2 $RIG_FEATURES" | jq -s 'add // []' 2>/dev/null || echo "[]")
@@ -502,12 +508,18 @@ FIXSEC
     }
   fi
 
-  # Verify we won the race.
+  # Verify we won the race — and apply ga-zzrts eligibility guards.
   if [ "$DRY_RUN" != "1" ]; then
-    local VERIFY_JSON VERIFY_LABELS
+    local VERIFY_JSON VERIFY_LABELS VERIFY_STATUS VERIFY_SOURCEBEAD
     VERIFY_JSON=$(bd -C "$GC_CITY" show "$STORY_ID" --json 2>/dev/null || echo "[]")
     VERIFY_LABELS=$(echo "$VERIFY_JSON" \
       | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' \
+      2>/dev/null || echo "")
+    VERIFY_STATUS=$(echo "$VERIFY_JSON" \
+      | jq -r 'if type=="array" then .[0] else . end | (.status // "")' \
+      2>/dev/null || echo "")
+    VERIFY_SOURCEBEAD=$(echo "$VERIFY_JSON" \
+      | jq -r 'if type=="array" then .[0] else . end | (.metadata["source-bead"] // .metadata["source_bead"] // "")' \
       2>/dev/null || echo "")
 
     if echo "$VERIFY_LABELS" | grep -q "story:in-flight"; then
@@ -519,6 +531,46 @@ FIXSEC
       log "Story $STORY_ID is already done. Releasing claim."
       bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
+    fi
+    # (ga-zzrts fix b) gate:needs-human — bead deliberately parked for human/engine path.
+    # The bd list queries already exclude this label; this guard catches the race where
+    # gate:needs-human is added BETWEEN the query-time snapshot and claim acquisition.
+    if echo "$VERIFY_LABELS" | grep -q "gate:needs-human"; then
+      warn "ga-zzrts(b): $STORY_ID has gate:needs-human at dispatch time — race or stale query. Releasing claim and skipping."
+      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      return 1
+    fi
+    # (ga-zzrts fix c) Duplicate-in-flight guard: already dispatched in a prior sweep.
+    # bd list excludes pilot:dispatched; this is the last-resort guard for the case where
+    # story:in-flight was stripped (crash/race) but pilot:dispatched survived — without
+    # this check the Pilot would emit a second sling for the same source bead (ga-2aigc).
+    if echo "$VERIFY_LABELS" | grep -q "pilot:dispatched"; then
+      warn "ga-zzrts(c): $STORY_ID already has pilot:dispatched — prior-sweep duplicate guard. Releasing claim."
+      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      return 1
+    fi
+    # (ga-zzrts fix a) Closed-bead guard: STATUS is closed but story:done label absent.
+    # Delivery inconsistency can leave a bead closed without the label; never dispatch it.
+    if [ "$VERIFY_STATUS" = "closed" ]; then
+      warn "ga-zzrts(a): $STORY_ID is STATUS:closed without story:done label. Releasing claim."
+      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      return 1
+    fi
+    # (ga-zzrts fix a) Orphan-sling guard: if this bead carries a source-bead metadata
+    # reference (i.e. it is a sling/task bead, not a source story), and the referenced
+    # source bead is already closed, skip — the underlying work is done. This is the
+    # "closed-source sling" class of flood: dogs re-claim sling beads whose source was
+    # closed without the sling being retired.
+    if [ -n "$VERIFY_SOURCEBEAD" ] && [ "$VERIFY_SOURCEBEAD" != "null" ]; then
+      local SOURCE_BEAD_STATUS
+      SOURCE_BEAD_STATUS=$(bd -C "$GC_CITY" show "$VERIFY_SOURCEBEAD" --json 2>/dev/null \
+        | jq -r 'if type=="array" then .[0] else . end | (.status // "")' \
+        2>/dev/null || echo "")
+      if [ "$SOURCE_BEAD_STATUS" = "closed" ]; then
+        warn "ga-zzrts(a): $STORY_ID is a sling/task whose source $VERIFY_SOURCEBEAD is STATUS:closed — orphan sling. Releasing claim."
+        bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+        return 1
+      fi
     fi
   fi
 
