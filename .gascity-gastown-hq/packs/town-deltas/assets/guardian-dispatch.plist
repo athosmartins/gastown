@@ -16,9 +16,13 @@
          2. bash scripts/guardian-dispatch.sh             # single supervised run
          3. launchctl load ~/Library/LaunchAgents/com.gascity.guardian.plist
   -->
+  <!-- /bin/bash (always present on macOS, bash 3.2) — the script is bash-3.2-safe
+       (no associative arrays; real-jam summarization uses jq+awk). Matches every
+       other shell plist in this town. /opt/homebrew/bin/bash is NOT installed and
+       must never be referenced here. -->
   <key>ProgramArguments</key>
   <array>
-    <string>/opt/homebrew/bin/bash</string>
+    <string>/bin/bash</string>
     <string>/Users/athos/gt/.gascity-gastown-hq/scripts/guardian-dispatch.sh</string>
   </array>
 

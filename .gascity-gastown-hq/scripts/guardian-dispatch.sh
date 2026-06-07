@@ -50,6 +50,20 @@ REALERT_SEC=900             # re-alert same incident class every 15min
 # DRY_RUN=1: report everything, make ZERO state changes (no beads, no launchctl, no mail)
 DRY_RUN="${DRY_RUN:-0}"
 
+# ── Dolt-hang resilience ──────────────────────────────────────────────────────
+# The guardian's whole purpose is to stay alive while the engine/Dolt is under
+# stress. A hung `bd`/`gc` (Dolt outage) must NOT block a sweep indefinitely —
+# that would hold the lock, skip the heartbeat, and trigger a FALSE
+# [GUARDIAN-STALL] against the guardian itself. Wrap bd/gc in `timeout` so any
+# single call fails fast (exit 124) and is absorbed by the existing
+# `|| true` / `2>/dev/null` / `|| warn` guards. timeout runs the external binary
+# (it cannot see these shell functions), so there is no recursion.
+if command -v timeout >/dev/null 2>&1; then
+  BD_TIMEOUT="${GUARDIAN_BD_TIMEOUT:-30}"
+  bd() { command timeout "$BD_TIMEOUT" bd "$@"; }
+  gc() { command timeout "$BD_TIMEOUT" gc "$@"; }
+fi
+
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
 mkdir -p "$LOG_DIR"
@@ -386,6 +400,10 @@ check_real_jams() {
 
   [ -z "$summary" ] && return 0
 
+  # Declare loop vars local: bash uses dynamic scoping, so an undeclared
+  # `read ... ts` here would clobber the caller's (main's) `local ts` and
+  # corrupt the "sweep complete" log line.
+  local marker ev ts
   while IFS='|' read -r marker ev ts; do
     [ "$ev" != "guard_queued" ] && continue
     [ -z "$ts" ] && continue  # missing timestamp — skip to avoid false positive
@@ -417,12 +435,15 @@ check_real_jams() {
     local key="real-jam:$marker"
     log "Real jam: marker $marker queued ${age}s (> ${REAL_JAM_SEC}s)"
 
+    # || true: open_incident can return 1 on bd-create failure (Dolt stress);
+    # without this guard, set -e would abort the guardian mid-loop, skip the
+    # heartbeat, and trigger a false [GUARDIAN-STALL].
     handle_incident "$key" "1" \
       "Guardian: gate marker $marker stuck (real jam, ${age}s queued)" \
       "$(printf 'Gate marker %s has been in gate-status:queued for %ds (>%ds threshold).\nQueued at: %s\n\nThis is a TRUE gate jam — the guard has not picked up this marker.\nThe gate reconciler (ga-tmug fix) should handle TTL recovery, but it has not acted yet.' \
         "$marker" "$age" "$REAL_JAM_SEC" "$ts")" \
       "$(printf 'GUARDIAN REAL-JAM REPAIR\n\nMarker: %s (gate-status:queued for %ds)\n\n1. Check: bd -C $GC_CITY show %s\n2. Check guard log: tail -100 %s\n3. If guard is running but skipping this marker: investigate why (TTL, locked, etc.)\n4. If guard is stalled: see engine-stall incident\n5. Manually re-queue if stuck: bd -C $GC_CITY label set %s gate-status:ready\n6. Close this bead when the gate run completes (PASS or FAIL).' \
-        "$marker" "$age" "$marker" "$GATE_GUARD_LOG" "$marker")"
+        "$marker" "$age" "$marker" "$GATE_GUARD_LOG" "$marker")" || true
   done <<< "$summary"
 }
 
@@ -442,9 +463,9 @@ check_delivery_fails() {
   local new_lines
   new_lines=$(tail -n "+$((seen + 1))" "$SD_LOG" 2>/dev/null) || { state_update_seen "seen_sd" "$total"; return 0; }
 
+  local line result story_id rig
   while IFS= read -r line; do
     [ -z "$line" ] && continue
-    local result story_id rig
     result=$(printf '%s' "$line" | jq -r '.result // ""' 2>/dev/null || true)
     story_id=$(printf '%s' "$line" | jq -r '.story_id // .story // ""' 2>/dev/null || true)
     rig=$(printf '%s' "$line" | jq -r '.rig // ""' 2>/dev/null || true)
@@ -460,12 +481,14 @@ check_delivery_fails() {
     local key="delivery-fail:$story_id"
     log "Delivery fail detected: story=$story_id rig=$rig result=$result"
 
+    # || true: same set -e safety as check_real_jams — a bd-create failure in
+    # open_incident must not abort the guardian and skip the heartbeat.
     handle_incident "$key" "1" \
       "Guardian: delivery failed — $story_id ($rig)" \
       "$(printf 'Story delivery FAILED for %s (rig: %s, result: %s).\n\nDelivery log line:\n%s\n\nThis story was merged but delivery/prod-test did not complete successfully.' \
         "$story_id" "$rig" "$result" "$line")" \
       "$(printf 'GUARDIAN DELIVERY-FAIL REPAIR\n\nStory: %s\nRig: %s\nResult: %s\n\n1. Check delivery log: grep %s %s\n2. Check story bead: bd -C $GC_CITY show %s\n3. Check prod-test output for the rig\n4. Identify root cause (deploy conflict, prod-test failure, daemon issue)\n5. Fix root cause, re-run delivery manually or via gate if code change needed\n6. Close this bead when delivery PASS confirmed.' \
-        "$story_id" "$rig" "$result" "$story_id" "$SD_LOG" "$story_id")"
+        "$story_id" "$rig" "$result" "$story_id" "$SD_LOG" "$story_id")" || true
   done <<< "$new_lines"
   state_update_seen "seen_sd" "$total"
 }

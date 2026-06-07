@@ -4,16 +4,21 @@
 <dict>
   <key>Label</key><string>com.gascity.gate-health-monitor</string>
 
-  <!-- Problem-only gate/pilot health monitor. Emits actionable alerts ONLY
-       (silence = healthy). Outputs to StandardOutPath log:
+  <!-- Problem-only gate/pilot health monitor. Long-running polling loop
+       (sleeps 60s between checks). Emits a line ONLY for actionable problems —
+       silence means healthy. Each alert is also pushed via notify CLI to reach
+       Athos on mobile. Alerts on:
          [GATE FAIL]      a review genuinely failed
-         [REAL-JAM]       gate marker stuck queued/claimed (true wedge)
+         [REAL-JAM]       gate marker stuck queued/claimed >25min (true wedge)
+         [GATE-ERROR]     gate marker stuck in gate-status:error >10min (dispatch failure)
          [DELIVERY-FAIL]  delivery failed or HALTed
          [ENGINE-STALL]   gate dispatcher log silent >15min
-         [GUARDIAN-STALL] guardian-dispatch.sh heartbeat stale >15min
+         [GUARDIAN-STALL] guardian-dispatch.sh heartbeat stale >15min (watcher is dead)
 
-       This daemon runs as a persistent loop (checks every 60s).
-       KeepAlive restarts it if it exits unexpectedly.
+       KeepAlive restarts the loop if it exits unexpectedly; RunAtLoad starts it
+       on load. /usr/bin/python3 (system) — always present, no brew dependency;
+       matches every other python plist in this town. The script derives its
+       paths from __file__, but WorkingDirectory is set for belt-and-suspenders.
 
        First-run procedure (read-only — safe to run directly):
          1. python3 scripts/gate-health-monitor.py   # verify output
@@ -21,16 +26,18 @@
   -->
   <key>ProgramArguments</key>
   <array>
-    <string>/opt/homebrew/bin/python3</string>
+    <string>/usr/bin/python3</string>
     <string>/Users/athos/gt/.gascity-gastown-hq/scripts/gate-health-monitor.py</string>
   </array>
 
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
   <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
 
-  <key>RunAtLoad</key><false/>
-
-  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-health-monitor.log</string>
-  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-health-monitor.err</string>
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-health-monitor-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-health-monitor-launchd.err</string>
 
   <key>EnvironmentVariables</key>
   <dict>

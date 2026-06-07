@@ -50,7 +50,9 @@ if [ "$AGE" -lt 5 ]; then ok "fresh file age < 5s (=$AGE)"; else bad "fresh file
 touch -t "$(date -v-20M +%Y%m%d%H%M.%S 2>/dev/null || date -d '20 minutes ago' +%Y%m%d%H%M.%S 2>/dev/null || echo "")" \
   "$TMP_DIR/stale.log" 2>/dev/null || { sleep 1; touch -d "20 minutes ago" "$TMP_DIR/stale.log" 2>/dev/null || touch "$TMP_DIR/stale.log"; }
 STALE=$(file_age_sec_test "$TMP_DIR/stale.log")
-if [ "$STALE" -gt 800 ]; then ok "stale file age > 800s (=$STALE)"; else bad "stale age should be >800s, got $STALE (touch -t may not have worked, skipping)"; fi
+# Clean SKIP (not FAIL) if the runner's touch cannot backdate — a failed
+# backdate is an environment limitation, not a guardian defect.
+if [ "$STALE" -gt 800 ]; then ok "stale file age > 800s (=$STALE)"; else echo "  ⊘ SKIP: stale-file age (touch backdating unavailable on this runner; got $STALE)"; fi
 
 # ── 2. Engine stall classification ────────────────────────────────────────────
 echo "── 2. Engine stall threshold classification ──"
@@ -197,6 +199,38 @@ grep -q '"1".*DRY_RUN\|DRY_RUN.*"1"' "$GUARDIAN" && ok "DRY_RUN guard present" |
 grep -q 'mv.*tmp.*STATE_FILE\|tmp.*mv.*STATE_FILE\|STATE_FILE.*tmp' "$GUARDIAN" && \
   ok "state_save is atomic (tmp+mv)" || bad "state_save non-atomic (corrupt on crash → crash loop)"
 
+# bash-3.2 safety: the guardian plist runs /bin/bash (macOS bash 3.2). Associative
+# arrays (declare -A) abort under set -euo pipefail on 3.2 — this caught the
+# original crash-every-sweep bug. Guard against regression.
+if grep -qE 'declare[[:space:]]+-A' "$GUARDIAN"; then
+  bad "uses 'declare -A' — crashes under /bin/bash 3.2 (use jq+awk instead)"
+else
+  ok "no bash-4 associative arrays (bash-3.2 safe)"
+fi
+if /bin/bash -n "$GUARDIAN" 2>/dev/null; then
+  ok "guardian-dispatch.sh parses under /bin/bash"
+else
+  bad "guardian-dispatch.sh has a syntax error under /bin/bash"
+fi
+
+# Dolt-hang resilience: bd/gc must be timeout-wrapped so a hung Dolt cannot
+# block a sweep (which would hold the lock + skip the heartbeat → false STALL).
+grep -q 'command timeout .*bd\|GUARDIAN_BD_TIMEOUT' "$GUARDIAN" && \
+  ok "bd/gc calls timeout-wrapped (Dolt-hang safe)" || bad "bd/gc not timeout-wrapped (Dolt hang stalls sweep)"
+
+# set -e safety: every problem-detected (handle_incident ... "1" ...) call must be
+# guarded so a bd-create failure in open_incident cannot abort the sweep. Verify
+# no detected-path handle_incident invocation is left unguarded.
+UNGUARDED=$(awk '
+  /handle_incident .* "1" \\$/ { inblk=1; guarded=0; next }
+  inblk {
+    if ($0 ~ /\|\| true/) guarded=1
+    if ($0 !~ /\\$/) { if (!guarded) c++; inblk=0 }
+  }
+  END { print c+0 }
+' "$GUARDIAN")
+eq "all detected handle_incident calls guarded with || true" "$UNGUARDED" "0"
+
 # ── 7. Drift-guard: gate-health-monitor.py adds GUARDIAN-STALL ────────────────
 echo "── 7. Drift-guard: gate-health-monitor.py ──"
 
@@ -207,6 +241,26 @@ grep -q 'GUARDIAN_STALL_SEC'    "$MONITOR" && ok "has GUARDIAN_STALL_SEC thresho
 grep -q 'guardian_alerted'      "$MONITOR" && ok "has cooldown for guardian stall"       || bad "missing guardian_alerted cooldown"
 grep -q '_CITY_ROOT\|abspath.*__file__' "$MONITOR" && \
   ok "monitor uses absolute paths (runnable from any cwd)" || bad "monitor uses relative paths (cwd-dependent, no deployment guarantee)"
+# GATE-ERROR closes the 2026-06-06 town-wide-outage blind spot. The guardian
+# branch must NOT regress it — assert the reconciled monitor keeps it.
+grep -q 'GATE-ERROR'         "$MONITOR" && ok "emits [GATE-ERROR] (outage blind-spot)"   || bad "missing GATE-ERROR (regresses 2026-06-06 outage fix)"
+grep -q 'list_error_markers' "$MONITOR" && ok "queries gate-status:error markers"         || bad "missing list_error_markers"
+grep -q 'ERROR_STUCK_SEC'    "$MONITOR" && ok "has ERROR_STUCK_SEC threshold"             || bad "missing ERROR_STUCK_SEC"
+grep -q 'def emit'           "$MONITOR" && ok "alerts pushed via notify (emit helper)"    || bad "missing emit()/notify integration"
+# Monitor must parse under the interpreter its plist declares.
+if /usr/bin/python3 -m py_compile "$MONITOR" 2>/dev/null; then
+  ok "gate-health-monitor.py compiles under /usr/bin/python3"
+else
+  bad "gate-health-monitor.py has a syntax error under /usr/bin/python3"
+fi
+
+# plist_interp <plist> — first <string> inside the ProgramArguments array (the
+# interpreter). This is the check that was MISSING when guardian-dispatch.plist
+# shipped pointing at /opt/homebrew/bin/bash (which is not installed) — a broken
+# interpreter means launchd can never start the daemon.
+plist_interp() {
+  awk '/<key>ProgramArguments<\/key>/{f=1} f&&/<string>/{gsub(/.*<string>|<\/string>.*/,""); print; exit}' "$1"
+}
 
 # ── 8. Drift-guard: plist exists and references the script ────────────────────
 echo "── 8. Drift-guard: guardian-dispatch.plist ──"
@@ -216,6 +270,8 @@ PLIST="$SELF_DIR/guardian-dispatch.plist"
 grep -q 'com.gascity.guardian' "$PLIST" && ok "plist label is com.gascity.guardian" || bad "wrong plist label"
 grep -q 'guardian-dispatch.sh' "$PLIST" && ok "plist references guardian-dispatch.sh" || bad "plist wrong script path"
 grep -q 'StartInterval'        "$PLIST" && ok "plist has StartInterval"              || bad "plist missing StartInterval"
+GUARD_INTERP=$(plist_interp "$PLIST")
+if [ -x "$GUARD_INTERP" ]; then ok "guardian interpreter exists+executable ($GUARD_INTERP)"; else bad "guardian interpreter MISSING/not-exec: '$GUARD_INTERP' — launchd cannot start it"; fi
 
 # ── 9. Drift-guard: gate-health-monitor.plist exists ─────────────────────────
 echo "── 9. Drift-guard: gate-health-monitor.plist ──"
@@ -228,6 +284,8 @@ grep -q 'gate-health-monitor.py' "$MONITOR_PLIST" 2>/dev/null && \
   ok "plist references gate-health-monitor.py" || bad "plist wrong script path for monitor"
 grep -q 'KeepAlive' "$MONITOR_PLIST" 2>/dev/null && \
   ok "monitor plist has KeepAlive (persistent daemon)" || bad "monitor plist missing KeepAlive"
+MON_INTERP=$(plist_interp "$MONITOR_PLIST")
+if [ -x "$MON_INTERP" ]; then ok "monitor interpreter exists+executable ($MON_INTERP)"; else bad "monitor interpreter MISSING/not-exec: '$MON_INTERP' — launchd cannot start it"; fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
