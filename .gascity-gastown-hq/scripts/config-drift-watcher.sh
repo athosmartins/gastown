@@ -35,6 +35,11 @@
 #   - City config files:
 #       .gascity-gastown-hq/city.toml
 #       .gascity-gastown-hq/pack.toml
+#   - Agent templates (structural config — triggers session churn if missed):
+#       .gascity-gastown-hq/agents/**  (agent.toml + prompt.template.md)
+#   - Daemon scripts (source — *.sh and *.py only; __pycache__/.pyc excluded):
+#       .gascity-gastown-hq/scripts/*.sh
+#       .gascity-gastown-hq/scripts/*.py
 #
 # Deployed as launchd agent: com.gascity.config-drift-watcher (KeepAlive).
 # Log: .gc/logs/config-drift-watcher.log
@@ -75,6 +80,13 @@ compute_hash() {
         # City config files
         [[ -f "$CITY/city.toml" ]] && echo "$CITY/city.toml"
         [[ -f "$CITY/pack.toml" ]] && echo "$CITY/pack.toml"
+        # Agent templates — adding/editing a template changes the effective config hash
+        # for all sessions; catching this here fires gc reload --soft before the
+        # controller's own watcher can queue drains (immediate vs 20s heartbeat fallback).
+        find "$CITY/agents" -type f 2>/dev/null
+        # Daemon scripts (source only — .sh and .py; excludes __pycache__/.pyc which
+        # are regenerated on every python invocation and would cause reload storms).
+        find "$CITY/scripts" -type f \( -name "*.sh" -o -name "*.py" \) 2>/dev/null
     } | sort | while IFS= read -r f; do
         # Include file path + mtime + size (fast, no md5 overhead per file)
         stat -f '%N %m %z' "$f" 2>/dev/null || true
@@ -164,7 +176,7 @@ prev_hash=$(compute_hash)
 last_heartbeat_time=$(date +%s)
 
 log "Initial hash: $prev_hash"
-log "Watching: $CITY/skills, $CITY/.claude/skills, $WA/crew/*/.claude/skills/, $WA/city-local/skills/, city.toml, pack.toml"
+log "Watching: $CITY/skills, $CITY/.claude/skills, $WA/crew/*/.claude/skills/, $WA/city-local/skills/, city.toml, pack.toml, agents/, scripts/*.{sh,py}"
 log "Poll interval: ${POLL_INTERVAL}s, debounce: ${DEBOUNCE_WINDOW}s, heartbeat: ${HEARTBEAT_INTERVAL}s"
 log "Mode: dual-mode (file-watcher + periodic heartbeat reload)"
 
