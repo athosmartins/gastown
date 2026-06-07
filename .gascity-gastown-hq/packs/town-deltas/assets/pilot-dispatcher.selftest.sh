@@ -21,7 +21,14 @@
 # Scenario 2 (no over-filter): blocked-set = {}. Nothing is blocked, so the
 #   dispatcher must pick the highest-priority bug (tt-blkd) and emit NO exclusion.
 #
-# Exit 0 iff both scenarios behave as expected.
+# Scenarios 3 & 4 cover the EXPLICIT-dep filter (ga-do8jj) — the prose-style
+# `story.depends_on_beads` dependency that `bd blocked` cannot see:
+#   Scenario 3 (held): tt-depblk (P0, oldest) declares an OPEN explicit dep →
+#     must be held; tt-blkd dispatched instead.
+#   Scenario 4 (auto-clear): the same dep is CLOSED → tt-depblk must NOT be held
+#     and, being P0+oldest, is dispatched. Proves no over-blocking.
+#
+# Exit 0 iff all scenarios behave as expected.
 
 set -uo pipefail
 
@@ -54,6 +61,21 @@ cat > "$SHIMBIN/bd" <<'SHIM'
 #!/usr/bin/env bash
 args="$*"
 case "$args" in
+  *" show "*)
+    # _filter_explicit_deps (ga-do8jj) probes each declared dep with
+    # `bd show <id> --json`. Resolve the dep id from argv and return a status
+    # keyed off its NAME so a scenario can pick the dep's state:
+    #   *open*   → "open"   (still pending → the dependent MUST be held)
+    #   *closed* → "closed" (satisfied     → the dependent must NOT be held)
+    # Unknown id → empty JSON ([]) → the filter fails open (no hold).
+    sid=""
+    for a in $args; do case "$a" in tt-*) sid="$a" ;; esac; done
+    case "$sid" in
+      *closed*) printf '[{"id":"%s","status":"closed"}]' "$sid" ;;
+      *open*)   printf '[{"id":"%s","status":"open"}]'   "$sid" ;;
+      *)        printf '[]' ;;
+    esac
+    ;;
   *blocked*)
     ids="${FAKE_BLOCKED_IDS:-}"
     if [ -z "$ids" ]; then printf '[]'; exit 0; fi
@@ -72,8 +94,17 @@ case "$args" in
     ;;
   *"-t bug"*)
     # Two open, unassigned bug candidates. tt-blkd is HIGHER priority (P0).
-    cat <<'JSON'
+    # When FAKE_DEP_BEAD is set, ALSO emit tt-depblk: P0 AND created earlier than
+    # tt-blkd (so it WOULD win the priority tie-break absent the filter),
+    # declaring an explicit dependency on FAKE_DEP_BEAD via story.depends_on_beads.
+    dep_bead="${FAKE_DEP_BEAD:-}"
+    prefix=""
+    if [ -n "$dep_bead" ]; then
+      prefix="{\"id\":\"tt-depblk\",\"title\":\"Explicit-dep bug fixture\",\"priority\":0,\"issue_type\":\"bug\",\"status\":\"open\",\"labels\":[],\"assignee\":null,\"created_at\":\"2026-05-01T00:00:00Z\",\"metadata\":{\"story.depends_on_beads\":\"$dep_bead\"}},"
+    fi
+    cat <<JSON
 [
+  ${prefix}
   {"id":"tt-blkd","title":"Blocked bug fixture","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
   {"id":"tt-unblk","title":"Unblocked bug fixture","priority":1,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
 ]
@@ -108,7 +139,7 @@ chmod +x "$SHIMBIN/notify"
 
 # ── Runner ────────────────────────────────────────────────────────────────────
 # Runs the real dispatcher in DRY_RUN with the shims on PATH, returns the log.
-run_dispatch() { # FAKE_BLOCKED_IDS
+run_dispatch() { # $1=FAKE_BLOCKED_IDS  $2=FAKE_DEP_BEAD (optional)
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   env -i \
@@ -117,6 +148,7 @@ run_dispatch() { # FAKE_BLOCKED_IDS
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     FAKE_BLOCKED_IDS="$1" \
+    FAKE_DEP_BEAD="${2:-}" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
@@ -159,6 +191,51 @@ if echo "$LOG2" | grep -q "Lane picks — small: tt-blkd"; then
   ok "picked the highest-priority bug (tt-blkd) when unblocked"
 else
   bad "did not pick the highest-priority bug when nothing was blocked"
+fi
+
+# ── Scenario 3: explicit prose-style dep is enforced (ga-do8jj) ───────────────
+# tt-depblk is P0 AND oldest (would win the tie-break), but declares an OPEN
+# explicit dep via story.depends_on_beads → must be HELD; tt-blkd (P0) dispatched.
+# This is the exact gap behind ga-do8jj: ga-2e605 dispatched before its base
+# ga-e72kf landed because the dep was prose-only, invisible to `bd blocked`.
+echo "Scenario 3: tt-depblk has an OPEN explicit dep — must hold it and dispatch tt-blkd"
+LOG3="$(run_dispatch "" "tt-openbase")"
+
+if echo "$LOG3" | grep -q "holding tt-depblk — explicit dep tt-openbase"; then
+  ok "logged hold on the explicit-dep candidate"
+else
+  bad "did NOT log hold (expected 'holding tt-depblk — explicit dep tt-openbase')"
+fi
+
+if echo "$LOG3" | grep -q "Lane picks — small: tt-blkd"; then
+  ok "dispatched tt-blkd (explicit-dep candidate correctly held back)"
+else
+  bad "did not pick tt-blkd while tt-depblk was held"
+fi
+
+if echo "$LOG3" | grep -q "Lane picks — small: tt-depblk"; then
+  bad "REGRESSION: dispatched a candidate with an open explicit dep (tt-depblk)"
+else
+  ok "did NOT dispatch the explicit-dep candidate"
+fi
+
+# ── Scenario 4: explicit dep is CLOSED — no over-filtering (auto-clear) ────────
+# Same candidate, but its explicit dep is closed → it must NOT be held, and
+# being P0+oldest it now wins the dispatch. Proves the filter auto-clears once
+# the dependency lands and does not over-block.
+echo "Scenario 4: tt-depblk's explicit dep is CLOSED — must NOT hold, picks tt-depblk"
+LOG4="$(run_dispatch "" "tt-closedbase")"
+
+if echo "$LOG4" | grep -q "holding tt-depblk"; then
+  bad "over-filtered: held a candidate whose explicit dep is already closed"
+else
+  ok "no spurious hold when the explicit dep is closed"
+fi
+
+if echo "$LOG4" | grep -q "Lane picks — small: tt-depblk"; then
+  ok "dispatched tt-depblk once its explicit dep was satisfied (auto-clear)"
+else
+  bad "did not pick tt-depblk after its explicit dep closed"
 fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────

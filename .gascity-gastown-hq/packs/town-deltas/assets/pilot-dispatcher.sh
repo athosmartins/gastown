@@ -42,6 +42,12 @@
 #     dependencies. A story is only dispatchable once every bead it hard-depends
 #     on is closed/merged. Uses bd's blocker-aware `bd blocked` set, per-DB,
 #     fail-open. See _filter_unblocked.
+#   - Explicit-dep-aware (ga-do8jj): ALSO skip beads that declare a still-open
+#     dependency via the `story.depends_on_beads` metadata field (space/comma-
+#     separated bead IDs). This catches "de-facto" deps documented in prose but
+#     never encoded as a formal `bd` edge — the gap that let ga-2e605 dispatch
+#     before its base ga-e72kf landed. Auto-clearing, fail-open. See
+#     _filter_explicit_deps.
 #   - Self-exclusion: never dispatch bead ga-8c1 (the Pilot itself) — it cannot
 #     build itself. Excluded by label policy (pilot:self) not hardcode.
 #   - Cross-rig aware: reads HQ DB (authoritative for all story beads per
@@ -260,6 +266,89 @@ _filter_unblocked() {
   printf '%s' "$filtered"
 }
 
+# _filter_explicit_deps <db_dir>   (reads candidate JSON array from stdin)
+# Drops candidates that declare an EXPLICIT, still-open dependency via the
+# `story.depends_on_beads` metadata field — a space/comma/newline-separated list
+# of bead IDs that this bead must be built ON TOP OF.
+#
+# This is the fix for bug ga-do8jj: the Pilot dispatched ga-2e605 BEFORE its
+# real dependency ga-e72kf (the canonical painel base) had landed. The
+# dependency was real, but it lived only in PROSE ("Construir SOBRE a base
+# canônica ga-e72kf …" in story.dependencias) and was never encoded as a formal
+# `bd` blocks-edge — so `bd blocked` (and thus _filter_unblocked above) could
+# not see it, and the dependent story slipped through. This filter is the
+# structured, zero-false-positive realization of the bug's fix-option (b),
+# "convenção de dep explícita": a dedicated field the dispatcher enforces.
+#
+# CONTRACT — deliberately narrow to avoid false-positive deadlocks:
+#   * ONLY bead IDs in the dedicated `story.depends_on_beads` field are honored.
+#     We do NOT parse the free-form `story.dependencias` prose, which mixes hard
+#     deps with coordination/negative references ("coordenar com ga-gzf5a",
+#     "NÃO da wa-rlzo") that must NOT block dispatch.
+#   * A referenced dep is SATISFIED iff it is closed. Any non-closed dep holds
+#     the candidate back for THIS sweep only — AUTO-CLEARING: once the dep
+#     closes, the next sweep dispatches. No manual un-hold, no stale state.
+#   * Self-references are ignored (a bead never blocks itself).
+#
+# FAIL-OPEN: any bd error / unresolvable dep status passes the candidate through
+# UNCHANGED — never stricter than the pre-fix behavior, so a transient Dolt
+# hiccup or a typo'd dep id can never wedge the pipeline. Diagnostics → stderr
+# (routed to the log by the top-level `exec … 2>&1`) so stdout stays pure JSON.
+_filter_explicit_deps() {
+  local db_dir="$1"
+  local arr
+  arr=$(cat)
+  [ -z "$arr" ] && { printf '[]'; return 0; }
+
+  # Fast path: no candidate declares explicit deps → pass through untouched
+  # (zero extra bd calls on the common case — Scenarios 1/2 and normal sweeps).
+  if ! printf '%s' "$arr" \
+      | jq -e 'any(.[]?; (.metadata["story.depends_on_beads"] // "") != "")' \
+        >/dev/null 2>&1; then
+    printf '%s' "$arr"
+    return 0
+  fi
+
+  local held_ids="" bead bid deps dep dep_status
+  while IFS= read -r bead; do
+    [ -z "$bead" ] && continue
+    bid=$(printf '%s' "$bead" | jq -r '.id // ""' 2>/dev/null || echo "")
+    [ -z "$bid" ] && continue
+    deps=$(printf '%s' "$bead" \
+      | jq -r '.metadata["story.depends_on_beads"] // ""' 2>/dev/null || echo "")
+    deps=$(printf '%s' "$deps" | tr ',\n' '  ')
+    for dep in $deps; do
+      dep=$(printf '%s' "$dep" | tr -d '[:space:]')
+      [ -z "$dep" ] && continue
+      [ "$dep" = "$bid" ] && continue
+      dep_status=$(bd -C "$db_dir" show "$dep" --json 2>/dev/null \
+        | jq -r 'if type=="array" then .[0] else . end | .status // ""' \
+          2>/dev/null || echo "")
+      # Non-closed, resolvable dep → HOLD. Empty status (lookup failed) →
+      # fail-open: do not hold on a dep we cannot resolve.
+      if [ -n "$dep_status" ] && [ "$dep_status" != "closed" ]; then
+        held_ids="$held_ids $bid"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: holding $bid — explicit dep $dep is '$dep_status' (not closed) [story.depends_on_beads — ga-do8jj fix]" >&2
+        break
+      fi
+    done
+  done < <(printf '%s' "$arr" | jq -c '.[]?' 2>/dev/null)
+
+  if [ -z "$held_ids" ]; then
+    printf '%s' "$arr"
+    return 0
+  fi
+
+  local held_json filtered
+  held_json=$(printf '%s\n' $held_ids \
+    | jq -R -s 'split("\n") | map(select(length>0))' 2>/dev/null || echo "[]")
+  filtered=$(printf '%s' "$arr" | jq --argjson held "$held_json" \
+    '[.[] | select((.id as $i | $held | index($i)) | not)]' 2>/dev/null) \
+    || { printf '%s' "$arr"; return 0; }
+  [ -z "$filtered" ] && { printf '%s' "$arr"; return 0; }
+  printf '%s' "$filtered"
+}
+
 BUGS_JSON=$(bd -C "$GC_CITY" list --json \
   -t bug \
   --exclude-label "story:in-flight" \
@@ -291,6 +380,9 @@ TIER1_JSON=$(echo "$BUGS_JSON $DEBT_JSON" \
 # Drop candidates blocked by unresolved deps (ga-5ew). Filtering BEFORE the count
 # means an all-blocked Tier 1 correctly falls through to Tier 2 features.
 TIER1_JSON=$(echo "$TIER1_JSON" | _filter_unblocked "$GC_CITY")
+# Also drop candidates with an open EXPLICIT dep (ga-do8jj). Same fall-through
+# semantics: an all-held Tier 1 correctly cascades to Tier 2.
+TIER1_JSON=$(echo "$TIER1_JSON" | _filter_explicit_deps "$GC_CITY")
 
 TIER1_COUNT=$(echo "$TIER1_JSON" | jq 'length' 2>/dev/null || echo "0")
 log "Tier 1 (bugs + tech-debt): $TIER1_COUNT open candidate(s) in HQ DB"
@@ -323,8 +415,9 @@ if [ "$TIER1_COUNT" -eq "0" ]; then
     -n 0 \
     2>/dev/null || echo "[]")
   TIER2_JSON=$(echo "$TIER2_JSON" | _filter_candidates)
-  # Drop features blocked by unresolved deps (ga-5ew).
+  # Drop features blocked by unresolved deps (ga-5ew) or an open explicit dep (ga-do8jj).
   TIER2_JSON=$(echo "$TIER2_JSON" | _filter_unblocked "$GC_CITY")
+  TIER2_JSON=$(echo "$TIER2_JSON" | _filter_explicit_deps "$GC_CITY")
 
   TIER2_COUNT=$(echo "$TIER2_JSON" | jq 'length' 2>/dev/null || echo "0")
   log "Tier 2 (story:approved features): $TIER2_COUNT candidate(s) in HQ DB"
@@ -358,7 +451,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "gate:needs-human" \
       --exclude-label "pilot:dispatched" \
       -n 0 2>/dev/null || echo "[]")
-    RIG_BUGS=$(echo "$RIG_BUGS" | _filter_candidates | _filter_unblocked "$rig_path")
+    RIG_BUGS=$(echo "$RIG_BUGS" | _filter_candidates | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_BUGS" | jq -s 'add // []' 2>/dev/null || echo "[]")
 
     # Tier 1: tech-debt from rig DB
@@ -370,7 +463,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "gate:needs-human" \
       --exclude-label "pilot:dispatched" \
       -n 0 2>/dev/null || echo "[]")
-    RIG_DEBT=$(echo "$RIG_DEBT" | _filter_candidates | _filter_unblocked "$rig_path")
+    RIG_DEBT=$(echo "$RIG_DEBT" | _filter_candidates | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_DEBT" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
 
     # Tier 2: story:approved features from rig DB
@@ -382,7 +475,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "gate:needs-human" \
       --exclude-label "pilot:dispatched" \
       -n 0 2>/dev/null || echo "[]")
-    RIG_FEATURES=$(echo "$RIG_FEATURES" | _filter_candidates | _filter_unblocked "$rig_path")
+    RIG_FEATURES=$(echo "$RIG_FEATURES" | _filter_candidates | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
     ALL_RIG_TIER2=$(echo "$ALL_RIG_TIER2 $RIG_FEATURES" | jq -s 'add // []' 2>/dev/null || echo "[]")
   done <<< "$RIG_PATHS"
 
