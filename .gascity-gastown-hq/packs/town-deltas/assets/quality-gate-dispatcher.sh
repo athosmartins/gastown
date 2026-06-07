@@ -183,7 +183,12 @@ if [ "$COUNT" = "0" ]; then
   exit 0
 fi
 
-MARKER=$(echo "$MARKERS_JSON" | jq '.[0]')
+# FIFO: oldest-first so no queued marker starves (ga-zf61i). bd list returns
+# newest-first; bare .[0] always grabbed the NEWEST → with ~1 marker/sweep
+# throughput, older markers (e.g. iz4a96/ga-mr8ym, + 2-day-old pddg18/pqzl9h)
+# starved indefinitely as newer ones jumped the line. sort_by(created_at) drains
+# the queue in arrival order. (Throughput / parallel dispatch = Phase 2, separate.)
+MARKER=$(echo "$MARKERS_JSON" | jq 'sort_by(.created_at) | .[0]')
 MARKER_ID=$(echo "$MARKER" | jq -r '.id')
 DESC=$(echo "$MARKER" | jq -r '.description // ""')
 
