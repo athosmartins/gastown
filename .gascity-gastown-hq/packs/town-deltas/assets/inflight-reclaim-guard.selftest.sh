@@ -321,6 +321,23 @@ assert '\"pilot:dispatched\"' not in src, 'must NOT pass pilot:dispatched as a q
 print('OK in-flight-alone query')
 " "OK in-flight-alone query"
 
+# ga-6ow4v: on reclaim-cap exhaustion, escalation must ADD gate:needs-human and
+# must NOT re-clear story:in-flight (re-clearing caused the dispatch↔reclaim
+# loop the spec warns about). Inspect the real do_escalate body (the loop-break
+# rail is has_needs_human, exercised by reclaim_decision tests 4 + 10 above).
+run_test "ga-6ow4v: escalate adds gate:needs-human, no re-clear" "
+$LOAD_REAL
+import inspect
+src = inspect.getsource(m.do_escalate)
+assert 'gate:needs-human' in src, 'do_escalate must add gate:needs-human'
+assert '\"add\"' in src, 'do_escalate must ADD the needs-human label'
+# Must NOT issue any bd label-remove / assign-clear in escalation — those would
+# re-clear the bead and re-arm the loop. The reclaim path (do_reclaim) clears;
+# escalation deliberately does not.
+assert '\"remove\"' not in src, 'escalate must not remove labels (no re-clear loop)'
+print('OK escalate adds needs-human, no re-clear')
+" "OK escalate adds needs-human, no re-clear"
+
 # ---------------------------------------------------------------------------
 # Drift-guard: verify RECLAIM_TTL, MAX_RECLAIMS, and key safety guards are
 # present in the live script (source-of-truth check).

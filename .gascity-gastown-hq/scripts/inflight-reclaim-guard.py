@@ -35,10 +35,13 @@ Safety invariants (CRITICAL — actuates on real work beads):
     Checks fix/<bead-id>* and feature/<bead-id>* in both HQ and WA repos.
   - NEVER reclaims beads with a gate-status:dispatching|queued|claimed marker
     (bead is actively being processed by the gate pipeline).
-  - Thrash cap: after MAX_RECLAIMS (3) reclaims, escalates instead of looping.
+  - Thrash cap: after MAX_RECLAIMS (3) reclaims, escalation marks the bead
+    gate:needs-human and RETAINS story:in-flight (ga-6ow4v) — it does NOT
+    re-clear, which would loop the bead through dispatch↔reclaim forever. The
+    has_needs_human rail then parks it quietly until a human re-queues it.
   - Fails safe on bad/empty/unparseable data — skips the entire cycle.
-  - Only modifies pilot/lifecycle labels + assignee. Never deletes beads,
-    never touches gate markers or verdicts.
+  - Only modifies pilot/lifecycle labels (+ gate:needs-human on escalation) and
+    assignee. Never deletes beads, never touches gate markers or verdicts.
 """
 import json
 import os
@@ -435,35 +438,39 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels):
 
 
 def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels):
-    """Strip in-flight labels and emit loud ntfy — thrash cap exhausted.
-    Called only on first escalation (labels stripped → bead leaves query results).
-    """
-    # Strip present labels so bead leaves the in-flight query and we don't loop
-    for lbl in ("story:in-flight", "pilot:dispatched"):
-        if lbl not in labels:
-            continue
-        try:
-            subprocess.run(
-                ["bd", "label", "remove", bead_id, lbl, "-q"],
-                capture_output=True, text=True, timeout=15)
-        except Exception:
-            pass
+    """Mark a permanently-failing bead gate:needs-human — do NOT re-clear it.
 
+    ga-6ow4v: the reclaim cap is exhausted (MAX_RECLAIMS reclaims of the SAME
+    bead all failed to produce a healthy builder). Per spec we must NOT clear
+    story:in-flight again: clearing lets the Pilot re-dispatch the bead, and
+    because the pilot:reclaim-count label persists at the cap, the guard would
+    re-escalate on the very next cycle — an endless dispatch↔reclaim loop that
+    fires a ntfy every REALERT_SEC and never converges.
+
+    Instead we ADD gate:needs-human and leave story:in-flight + assignee intact.
+    This (a) hands the bead to a human/Mayor with an unambiguous flag, and (b)
+    trips the guard's OWN has_needs_human safety rail next cycle (reclaim_decision
+    returns "noop" for needs-human beads), so the bead parks quietly: no loop,
+    no repeat ntfy. One held lane slot is the deliberate tradeoff for a story
+    that has proven un-buildable; a human investigates and re-queues it.
+    """
     try:
         subprocess.run(
-            ["bd", "assign", bead_id, ""],
+            ["bd", "label", "add", bead_id, "gate:needs-human", "-q"],
             capture_output=True, text=True, timeout=15)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] warn: add gate:needs-human {bead_id}: {exc}",
+              flush=True)
 
     try:
         subprocess.run(
             ["bd", "comment", bead_id,
-             f"inflight-reclaim-guard (ga-se62o): ESCALATED — reclaim cap "
-             f"({MAX_RECLAIMS}) exhausted. Bead has been stranded for "
-             f"{idle_min:.0f}min with no live builder or branch progress. "
-             f"story:in-flight + pilot:dispatched cleared. "
-             f"Human/Mayor intervention required to investigate and re-queue."],
+             f"inflight-reclaim-guard (ga-6ow4v): ESCALATED — reclaim cap "
+             f"({MAX_RECLAIMS}) exhausted. Bead stranded {idle_min:.0f}min with no "
+             f"live builder or branch progress across {reclaim_count} reclaims. "
+             f"Marked gate:needs-human; story:in-flight RETAINED (not re-cleared) "
+             f"to avoid a dispatch↔reclaim loop. Human/Mayor must investigate "
+             f"and re-queue."],
             capture_output=True, text=True, timeout=15)
     except Exception:
         pass
@@ -584,7 +591,9 @@ def run_cycle(state, escalated_alerted):
                     f"needs human/Mayor intervention title={title!r}"
                 )
                 escalated_alerted[bead_id] = now
-            # Labels stripped → bead will leave query; remove state
+            # Bead now carries gate:needs-human → next cycle's has_needs_human
+            # rail returns "noop". It stays in the in-flight query but parks
+            # quietly (no further actuation). Drop its stranded-clock state.
             state.pop(bead_id, None)
 
         # action == "noop" → silence
