@@ -4,15 +4,23 @@
 <dict>
   <key>Label</key><string>com.gascity.crew-hang-detector</string>
 
-  <!-- Runs every 300 seconds (5 minutes). Lists active persistent CREW sessions,
-       finds any whose engine heartbeat (last_active) has frozen past the
-       thresholds, and recovers them via the existing safe shutdown-dance path:
-         frozen > STALE_SEC (600s)    -> courtesy nudge probe
-         frozen > ESCALATE_SEC (1200s) -> file a `warrant` bead for the dog pool
-       The dog runs mol-shutdown-dance (3 interrogations / 420s) and only kills if
-       the agent never proves ALIVE; the reconciler then restarts the pinned
-       session, resuming its task. Closes the crew-coverage gap (ga-khuz1) left by
-       the suspended deacon and the gate/pilot-only guardian (ga-0wxg).
+  <!-- Runs every 300 seconds (5 minutes). Lists active persistent CREW sessions
+       (name==template OR name startswith "<template>-gawisp"), peeks each, and
+       tracks any whose ACTIVE-WORK pane is byte-frozen across passes (the hang
+       signature — see crew-hang-detector.sh header for why last_active is NOT a
+       usable signal). Recovers a sustained freeze via the existing safe
+       shutdown-dance path:
+         frozen > STALE_SEC (600s)     -> courtesy nudge probe
+         frozen > ESCALATE_SEC (1200s) -> escalate
+       Escalation is gated by WARRANT_ENABLED (below):
+         WARRANT_ENABLED=0 (default)   -> NOTIFY a human (non-destructive)
+         WARRANT_ENABLED=1             -> file a `warrant` bead for the dog pool;
+            the dog runs mol-shutdown-dance (3 interrogations / 420s) and only
+            kills if the agent never proves ALIVE; the reconciler then restarts
+            the pinned session. Closes the crew-coverage gap (ga-khuz1) left by
+            the suspended deacon and the gate/pilot-only guardian (ga-0wxg).
+       Idle crew never enter the candidate set (no spinner), so they are never
+       flagged — this is the ga-6i82w/ga-yqcdj fix for v1's idle false-positive.
 
        DO NOT load this plist unsupervised on first run.
        Supervised first-dispatch procedure:
@@ -20,6 +28,9 @@
          2. bash crew-hang-detector.sh             # single supervised real pass
          3. launchctl bootstrap gui/$(id -u) \
               ~/Library/LaunchAgents/com.gascity.crew-hang-detector.plist
+       The DESTRUCTIVE auto-recovery (warrant -> shutdown-dance -> kill/restart)
+       stays OFF until the freeze signal is validated against a captured real
+       hang. To enable it then, flip WARRANT_ENABLED 0 -> 1 below and reload.
   -->
   <key>ProgramArguments</key>
   <array>
@@ -42,6 +53,11 @@
     <string>/Users/athos</string>
     <key>GC_CITY_PATH</key>
     <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <!-- Destructive auto-recovery gate. 0 = notify-only (safe default until the
+         freeze signal is validated against a real hang). Flip to 1 to enable
+         warrant -> shutdown-dance -> kill/restart, then reload this agent. -->
+    <key>WARRANT_ENABLED</key>
+    <string>0</string>
   </dict>
 </dict>
 </plist>
