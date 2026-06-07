@@ -795,6 +795,14 @@ DIFF_FULL=$(git_rig diff "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null |
 
 VERDICT_BEAD_IDS=()
 SESSION_IDS=()
+# ga-noxbv: parallel arrays (index-aligned with the two above) backing the
+# post-spawn ACK-verification pass. REVIEW_TASKS keeps each reviewer's exact task
+# text so it can be re-queued; REVIEWER_PEEK_BASELINE snapshots each session's
+# terminal BEFORE the task lands (new output later = the reviewer came alive);
+# REVIEWER_ACKED tracks per-reviewer delivery confirmation.
+REVIEW_TASKS=()
+REVIEWER_PEEK_BASELINE=()
+REVIEWER_ACKED=()
 
 log "Spawning $REQUIRED_REVIEWERS independent reviewer session(s) ..."
 
@@ -943,14 +951,31 @@ TASK
   # Wake the session so it starts immediately
   gc --city "$GC_CITY" session wake "$SESSION_ID" 2>/dev/null || true
 
-  # Deliver the review task via nudge (immediate delivery so it runs on startup)
-  # Small sleep to let session initialize before nudge
-  sleep 3
-  gc --city "$GC_CITY" session nudge "$SESSION_ID" "$REVIEW_TASK" --delivery immediate 2>/dev/null || \
-    gc --city "$GC_CITY" session submit "$SESSION_ID" "$REVIEW_TASK" 2>/dev/null || \
-    warn "Could not deliver review task to session $SESSION_ID via nudge/submit"
+  # ga-noxbv: snapshot the session's terminal BEFORE the task is delivered. The
+  # ACK pass (Step 7b) compares a fresh peek against this baseline — any change
+  # means the reviewer came alive and consumed input. cksum of the peek buffer is
+  # a cheap stable fingerprint. `|| echo ""` keeps set -euo pipefail happy.
+  _peek_base=$(gc --city "$GC_CITY" session peek "$SESSION_ID" --lines 40 2>/dev/null | cksum 2>/dev/null | awk '{print $1}' || echo "")
+  REVIEW_TASKS+=("$REVIEW_TASK")
+  REVIEWER_PEEK_BASELINE+=("$_peek_base")
+  REVIEWER_ACKED+=(0)
 
-  log "  Review task delivered to session $SESSION_ID (reviewer $i)"
+  # Deliver the review task via `queue` (enqueue-and-return). ga-noxbv root cause:
+  # `--delivery immediate` typed the task into a freshly-spawned headless session
+  # that was NOT yet input-ready → keystrokes dropped → reviewer idle forever →
+  # gate hung at N/3 verdicts. `queue` hands the task to the runtime, which
+  # delivers it WHEN the session becomes input-ready (no dropped keystrokes, no
+  # magic sleep needed). NOT `wait-idle`: this spawn loop is sequential, so a
+  # blocking wait on a never-idle reviewer would stall spawning reviewers 2&3 —
+  # `queue` returns immediately. Do NOT log "delivered" here (it would lie on a
+  # send the reviewer never consumed); Step 7b confirms a real ACK.
+  if gc --city "$GC_CITY" session nudge "$SESSION_ID" "$REVIEW_TASK" --delivery queue 2>/dev/null; then
+    log "  Review task QUEUED to session $SESSION_ID (reviewer $i) — ACK pending (Step 7b)"
+  elif gc --city "$GC_CITY" session submit "$SESSION_ID" "$REVIEW_TASK" 2>/dev/null; then
+    log "  Review task SUBMITTED to session $SESSION_ID (reviewer $i) — ACK pending (Step 7b)"
+  else
+    warn "  Initial queue/submit to session $SESSION_ID failed — Step 7b will retry (reviewer $i)"
+  fi
 done
 
 log "All $REQUIRED_REVIEWERS reviewer sessions spawned: ${SESSION_IDS[*]}"
@@ -964,6 +989,63 @@ if [ "$_sa_prev" -gt 0 ]; then
   log "Reviewer-spawn succeeded — clearing consecutive spawn-abort counter (was $_sa_prev)."
 fi
 rm -f "$SPAWN_ABORT_COUNT_FILE" "$SPAWN_ABORT_ALERT_FILE" 2>/dev/null || true
+
+# ── Step 7b: ACK verification — confirm reviewers actually consumed their task ──
+# ga-noxbv reliability fix. `queue` delivery (above) lets the runtime deliver when
+# a session is input-ready, but a session that spawned-then-wedged would still
+# never consume the task → the old gate hung at N/3 forever, invisibly. Here we
+# confirm a real ACK per reviewer and RE-QUEUE only sessions showing NO sign of
+# life, bounded to ~ACK_MAX_RETRIES*ACK_WAIT_SECS (~80s worst case). A reviewer
+# ACKs when EITHER (strong) its verdict bead has progressed past verdict:pending
+# OR (soft) its session has produced new terminal output since the pre-delivery
+# baseline. We only re-queue sessions that show neither — exactly the wedged/idle
+# case — so a live-but-slow reviewer is never spammed with duplicate tasks.
+# NON-fatal by design: the verdict poll, the DISPATCHING_TTL zombie-recovery, and
+# gate-health-monitor's idle-reviewer watchdog remain the ultimate backstops, so
+# we never abort the gate here.
+# HARD CONSTRAINT (memory gate-dispatcher-set-e-pipefail-crash): set -euo pipefail
+# is active — every command below is `|| true`-guarded or used as a condition so a
+# transient failure can never head-of-line-block the gate.
+ACK_MAX_RETRIES="${ACK_MAX_RETRIES:-4}"
+ACK_WAIT_SECS="${ACK_WAIT_SECS:-20}"
+for _ack_attempt in $(seq 1 "$ACK_MAX_RETRIES"); do
+  _all_acked=1
+  for k in "${!VERDICT_BEAD_IDS[@]}"; do
+    if [ "${REVIEWER_ACKED[$k]:-0}" = "1" ]; then continue; fi
+    _vb="${VERDICT_BEAD_IDS[$k]}"
+    _sid="${SESSION_IDS[$k]}"
+    # Strong ACK: verdict bead progressed past verdict:pending (reviewer is acting).
+    _vb_labels=$(bd -C "$GC_CITY" show "$_vb" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "verdict:pending")
+    if ! echo "$_vb_labels" | grep -q "verdict:pending"; then
+      REVIEWER_ACKED[$k]=1
+      log "  ACK (verdict-progressed): reviewer $((k+1)) session=$_sid bead=$_vb"
+      continue
+    fi
+    # Soft ACK: session produced new output since baseline → alive and consuming
+    # input; trust the already-queued task will deliver. Stop re-queuing it.
+    _peek_now=$(gc --city "$GC_CITY" session peek "$_sid" --lines 40 2>/dev/null | cksum 2>/dev/null | awk '{print $1}' || echo "")
+    if [ -n "$_peek_now" ] && [ "$_peek_now" != "${REVIEWER_PEEK_BASELINE[$k]:-}" ]; then
+      REVIEWER_ACKED[$k]=1
+      log "  ACK (session-alive): reviewer $((k+1)) producing output session=$_sid"
+      continue
+    fi
+    # No sign of life. On the FIRST attempt just wait (give the initial queue a
+    # chance); from attempt 2 on, re-queue the exact task into the idle session.
+    _all_acked=0
+    if [ "$_ack_attempt" -gt 1 ]; then
+      warn "  No ACK from reviewer $((k+1)) (attempt $_ack_attempt/$ACK_MAX_RETRIES) — re-queuing task session=$_sid"
+      gc --city "$GC_CITY" session nudge "$_sid" "${REVIEW_TASKS[$k]}" --delivery queue 2>/dev/null || true
+    fi
+  done
+  [ "$_all_acked" = "1" ] && break
+  sleep "$ACK_WAIT_SECS" || true
+done
+for k in "${!VERDICT_BEAD_IDS[@]}"; do
+  if [ "${REVIEWER_ACKED[$k]:-0}" != "1" ]; then
+    warn "  Reviewer $((k+1)) never ACKed after ${ACK_MAX_RETRIES} attempts — relying on verdict-poll + DISPATCHING_TTL + monitor backstops (session=${SESSION_IDS[$k]})"
+  fi
+done
 
 log "Waiting for verdicts (timeout=${VERDICT_TIMEOUT_MINUTES}m, poll=${VERDICT_POLL_INTERVAL}s) ..."
 

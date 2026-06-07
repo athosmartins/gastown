@@ -27,6 +27,7 @@ STUCK_SEC = 1500        # 25min queued-with-no-completion = real wedge
 REALERT_SEC = 900       # re-warn a still-stuck marker every 15min
 ENGINE_STALL_SEC = 900  # dispatcher log silent >15min = engine dead/hung
 ERROR_STUCK_SEC = 600   # 10min in gate-status:error = dispatch failure worth alarming
+VERDICT_STALL_SEC = 1500  # 25min of a gate-run's pending verdicts not changing = idle reviewer(s) (ga-noxbv)
 
 
 def age(ts):
@@ -85,6 +86,48 @@ def list_error_markers():
         return []
 
 
+def pending_verdicts_by_run():
+    """Map gate-run id -> sorted list of its still-OPEN verdict bead ids.
+
+    Each reviewer gets an ephemeral verdict bead labelled gate-run:<id> +
+    verdict:pending; it closes (drops out of this open-only query) the moment the
+    reviewer records its verdict. So a run whose set of pending verdict beads is
+    UNCHANGED over time = reviewers that have made no progress (idle/stuck) —
+    today's ga-noxbv hang signature (stuck at 1/3 for 38min). Returns {} on any
+    failure so the caller simply skips this cycle's idle-reviewer check."""
+    try:
+        result = subprocess.run(
+            ["gc", "bd", "list", "-l", "type:quality-gate-verdict", "--json"],
+            capture_output=True, text=True, timeout=20)
+        if result.returncode != 0 or not result.stdout.strip():
+            return {}
+        runs = {}
+        for v in json.loads(result.stdout):
+            labels = v.get("labels", [])
+            if "verdict:pending" not in labels:
+                continue
+            run = next((l[len("gate-run:"):] for l in labels if l.startswith("gate-run:")), "")
+            if run:
+                runs.setdefault(run, []).append(v["id"])
+        return {r: sorted(ids) for r, ids in runs.items()}
+    except Exception:
+        return {}
+
+
+def dolt_responsive():
+    """Quick probe: can we read beads in <5s? Verdicts travel through Dolt, so a
+    slow/unreachable server makes 'no verdict progress' Dolt's fault, not an idle
+    reviewer. We suppress the idle-reviewer alert in that case (false-positive
+    guard required by ga-noxbv)."""
+    try:
+        t0 = time.time()
+        r = subprocess.run(["gc", "bd", "list", "-l", "type:quality-gate-marker", "--json"],
+                           capture_output=True, text=True, timeout=8)
+        return r.returncode == 0 and (time.time() - t0) < 5
+    except Exception:
+        return False
+
+
 def emit(msg):
     """Print alert line and fire notify CLI (best-effort, never crash on failure)."""
     print(msg, flush=True)
@@ -109,6 +152,7 @@ alerted = {}          # bead_id -> last-alerted timestamp (queued wedge alerts)
 engine_alerted = 0
 error_first_seen = {}  # bead_id -> first-seen timestamp (for error-stuck tracking)
 error_alerted = {}     # bead_id -> last-alerted timestamp (for error re-alert cadence)
+verdict_progress = {}  # gate-run -> {"sig": tuple(pending ids), "since": ts, "alerted": ts} (ga-noxbv idle-reviewer)
 
 while True:
     # --- engine liveness: dispatcher log must keep sweeping ---
@@ -184,6 +228,34 @@ while True:
     for mid in gone:
         error_first_seen.pop(mid, None)
         error_alerted.pop(mid, None)
+
+    # --- IDLE-REVIEWER: a gate-run's verdicts not progressing (ga-noxbv) ---
+    # Closes the 38min observability blind spot from today's hang: the marker was
+    # in gate-status:dispatching (not :queued, so still_queued()/REAL-JAM missed
+    # it) and the dispatcher kept logging "Verdicts 1/3" (so ENGINE-STALL missed
+    # it). We watch the verdict beads directly: if a run's set of still-pending
+    # verdicts is UNCHANGED for VERDICT_STALL_SEC, the reviewer(s) are idle/stuck.
+    # Reset the clock whenever the pending set shrinks (a verdict landed = real
+    # progress). Sample Dolt before alarming — a slow write != a dead reviewer.
+    runs_now = pending_verdicts_by_run()
+    now = time.time()
+    for run, pend_ids in runs_now.items():
+        sig = tuple(pend_ids)
+        st = verdict_progress.get(run)
+        if st is None or st["sig"] != sig:
+            verdict_progress[run] = {"sig": sig, "since": now, "alerted": 0}
+            continue
+        stalled = now - st["since"]
+        if stalled > VERDICT_STALL_SEC and now - st["alerted"] > REALERT_SEC:
+            if not dolt_responsive():
+                continue  # Dolt slow/unreachable — not the reviewer's fault; skip
+            emit("[IDLE-REVIEWER] gate-run %s: %d verdict(s) pending with no progress "
+                 "for %dmin — reviewer(s) idle/stuck; dispatcher re-queues, else gate "
+                 "will FAIL at verdict timeout" % (run, len(pend_ids), int(stalled / 60)))
+            verdict_progress[run]["alerted"] = now
+    # Prune runs whose verdicts are all in (run complete / superseded)
+    for run in set(verdict_progress.keys()) - set(runs_now.keys()):
+        verdict_progress.pop(run, None)
 
     # --- delivery: failures / halts only ---
     try:
