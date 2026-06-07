@@ -61,6 +61,31 @@ log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] $*"; }
 err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] ERROR: $*"; }
 warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] WARN: $*"; }
 
+# ── ga-piscg: systemic spawn-abort escalation (consecutive-abort alert) ───────
+# The dispatcher processes exactly ONE queued marker per sweep. A broken spawn
+# mechanism (gate-reviewer template misconfig / session-cap deadlock — ga-mzc3h)
+# aborts the reviewer-spawn for EVERY marker, but each marker churns
+# error→queued→error too fast for the per-marker [GATE-ERROR] monitor (10min
+# stuck) to fire. We persist a counter across sweeps so K CONSECUTIVE
+# spawn-aborts (across markers, not one branch) PAGE A HUMAN in minutes — the
+# alerting layer that was missing during the 2026-06-06 town-wide 20h outage
+# (dispatcher aborted spawn 7+x, set gate-status:error each time, never escalated).
+SPAWN_ABORT_THRESHOLD="${SPAWN_ABORT_THRESHOLD:-3}"          # consecutive aborts before paging
+SPAWN_ABORT_REALERT_SEC="${SPAWN_ABORT_REALERT_SEC:-1800}"  # re-page cadence (30m) while still broken
+SPAWN_ABORT_COUNT_FILE="$GC_CITY/.gc/gate-spawn-abort-count"     # persisted consecutive count
+SPAWN_ABORT_ALERT_FILE="$GC_CITY/.gc/gate-spawn-abort-alerted"  # last-page epoch (re-alert cadence)
+
+# Pure decision (no IO, set -e safe) so the selftest can drift-guard it:
+# given (consecutive_count, threshold, now_epoch, last_alert_epoch, realert_sec)
+# echo "page" iff count>=threshold AND we are past the re-alert cooldown, else "hold".
+spawn_abort_should_page() {
+  local count="$1" threshold="$2" now="$3" last="$4" realert="$5"
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  case "$last"  in ''|*[!0-9]*) last=0  ;; esac
+  if [ "$count" -lt "$threshold" ]; then echo "hold"; return 0; fi
+  if [ "$((now - last))" -ge "$realert" ]; then echo "page"; else echo "hold"; fi
+}
+
 # ── supersede_sibling_runs — proactively close guard's companion gate-run bead ─
 # The guard creates a quality-gate: sibling bead at claim time. The dispatcher
 # drives ITS OWN gate-run: bead but never drives the sibling to terminal (ga-tmug
@@ -873,6 +898,42 @@ TASK
     err "Failed to spawn reviewer session $i (ga-mzc3h). Aborting gate. spawn_err=${_spawn_err:-no output}"
     bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
     bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
+
+    # ── ga-piscg: account this abort + escalate on K consecutive (across markers).
+    # Every $() is guarded with `|| echo …` and every numeric is sanitized so this
+    # block can NEVER crash the set -euo pipefail dispatcher (cf ga-8fx5e).
+    _sa_count=$(cat "$SPAWN_ABORT_COUNT_FILE" 2>/dev/null || echo 0)
+    case "$_sa_count" in ''|*[!0-9]*) _sa_count=0 ;; esac
+    _sa_count=$((_sa_count + 1))
+    echo "$_sa_count" > "$SPAWN_ABORT_COUNT_FILE" 2>/dev/null || true
+
+    # Structured audit-trail event (carries spawn_err + consecutive count).
+    mkdir -p "$(dirname "$QG_LOG")" 2>/dev/null || true
+    jq -c -n \
+      --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg branch "$BRANCH" \
+      --arg bead "$BEAD_ID" \
+      --arg marker "$MARKER_ID" \
+      --arg reviewer "$i" \
+      --arg spawn_err "${_spawn_err:-no output}" \
+      --argjson consec "$_sa_count" \
+      '{ts:$ts, event:"spawn_abort", branch:$branch, bead:$bead, marker:$marker, reviewer:$reviewer, consecutive:$consec, spawn_err:$spawn_err}' \
+      >> "$QG_LOG" 2>/dev/null || true
+
+    if [ "$_sa_count" -ge "$SPAWN_ABORT_THRESHOLD" ]; then
+      _sa_now=$(date +%s 2>/dev/null || echo 0)
+      _sa_last=$(cat "$SPAWN_ABORT_ALERT_FILE" 2>/dev/null || echo 0)
+      if [ "$(spawn_abort_should_page "$_sa_count" "$SPAWN_ABORT_THRESHOLD" "$_sa_now" "$_sa_last" "$SPAWN_ABORT_REALERT_SEC")" = "page" ]; then
+        err "SYSTEMIC SPAWN OUTAGE: $_sa_count consecutive reviewer-spawn aborts across markers (threshold=$SPAWN_ABORT_THRESHOLD). Paging Athos + Mayor. spawn_err=${_spawn_err:-no output}"
+        notify -t "🚨 Gate spawn OUTAGE" -p 5 "🚨 Quality gate DOWN: $_sa_count consecutive reviewer-spawn aborts across markers — no gate can pass. spawn_err: ${_spawn_err:-no output}" 2>/dev/null || true
+        gc --city "$GC_CITY" mail send mayor \
+          -s "🚨 Gate DOWN: $_sa_count consecutive reviewer-spawn aborts" \
+          -m "$(printf 'The quality-gate dispatcher has aborted reviewer-spawn %s times CONSECUTIVELY across markers (threshold=%s, one marker per sweep). The reviewer-spawn mechanism appears broken town-wide (cf ga-mzc3h: gate-reviewer template / session cap). NO gate can PASS until this is fixed.\n\nLatest marker: %s\nLatest branch: %s\nLatest source bead: %s\nspawn_err: %s\n\nAthos was paged via ntfy. Investigate the gate-reviewer template + session cap immediately; clear the counter at %s once spawn works again.' \
+            "$_sa_count" "$SPAWN_ABORT_THRESHOLD" "$MARKER_ID" "$BRANCH" "$BEAD_ID" "${_spawn_err:-no output}" "$SPAWN_ABORT_COUNT_FILE")" \
+          2>/dev/null || warn "Could not mail Mayor spawn-outage escalation"
+        echo "$_sa_now" > "$SPAWN_ABORT_ALERT_FILE" 2>/dev/null || true
+      fi
+    fi
     exit 1
   fi
 
@@ -893,6 +954,17 @@ TASK
 done
 
 log "All $REQUIRED_REVIEWERS reviewer sessions spawned: ${SESSION_IDS[*]}"
+
+# ── ga-piscg: spawn mechanism is proven working this sweep → reset the
+# consecutive-abort counter + alert state so a FUTURE outage pages fresh (and so
+# we don't carry a stale count from an outage that has since recovered).
+_sa_prev=$(cat "$SPAWN_ABORT_COUNT_FILE" 2>/dev/null || echo 0)
+case "$_sa_prev" in ''|*[!0-9]*) _sa_prev=0 ;; esac
+if [ "$_sa_prev" -gt 0 ]; then
+  log "Reviewer-spawn succeeded — clearing consecutive spawn-abort counter (was $_sa_prev)."
+fi
+rm -f "$SPAWN_ABORT_COUNT_FILE" "$SPAWN_ABORT_ALERT_FILE" 2>/dev/null || true
+
 log "Waiting for verdicts (timeout=${VERDICT_TIMEOUT_MINUTES}m, poll=${VERDICT_POLL_INTERVAL}s) ..."
 
 # ── Step 8: Poll for verdicts ─────────────────────────────────────────────────
