@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# pilot-dispatcher.selftest.sh — Prove the dependency-blocking filter (ga-5ew) in isolation.
+# pilot-dispatcher.selftest.sh — Prove the dependency-blocking filter (ga-5ew) and
+# the engine-window exclusion (ga-6lum3) in isolation.
 #
 # Bug ga-5ew: the Pilot dispatched a story whose hard dependency was not yet
 # merged. The fix (_filter_unblocked) drops candidates that bd reports as BLOCKED
@@ -71,13 +72,37 @@ case "$args" in
     printf '[]'
     ;;
   *"-t bug"*)
-    # Two open, unassigned bug candidates. tt-blkd is HIGHER priority (P0).
-    cat <<'JSON'
+    if [ "${FAKE_INCLUDE_ENGWIN:-0}" = "1" ]; then
+      # Engine-window scenario (ga-6lum3): tt-engwin is a P0 engine-fork bug that
+      # MUST NOT be dispatched. This fake bd honors the exclusion ONLY when the
+      # dispatcher actually passes --exclude-label "needs:engine-window" — so the
+      # bug fixture leaks in (and gets picked, being P0) if the fix is absent.
+      case "$args" in
+        *"needs:engine-window"*)
+          cat <<'JSON'
+[
+  {"id":"tt-keep","title":"Normal bug fixture","priority":1,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
+]
+JSON
+          ;;
+        *)
+          cat <<'JSON'
+[
+  {"id":"tt-engwin","title":"Engine-fork bug fixture","priority":0,"issue_type":"bug","status":"open","labels":["needs:engine-window"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
+  {"id":"tt-keep","title":"Normal bug fixture","priority":1,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
+]
+JSON
+          ;;
+      esac
+    else
+      # Two open, unassigned bug candidates. tt-blkd is HIGHER priority (P0).
+      cat <<'JSON'
 [
   {"id":"tt-blkd","title":"Blocked bug fixture","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
   {"id":"tt-unblk","title":"Unblocked bug fixture","priority":1,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
 ]
 JSON
+    fi
     ;;
   *)
     # tech-debt query, tier-2 features, anything else → empty.
@@ -108,7 +133,7 @@ chmod +x "$SHIMBIN/notify"
 
 # ── Runner ────────────────────────────────────────────────────────────────────
 # Runs the real dispatcher in DRY_RUN with the shims on PATH, returns the log.
-run_dispatch() { # FAKE_BLOCKED_IDS
+run_dispatch() { # FAKE_BLOCKED_IDS [FAKE_INCLUDE_ENGWIN]
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   env -i \
@@ -117,6 +142,7 @@ run_dispatch() { # FAKE_BLOCKED_IDS
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     FAKE_BLOCKED_IDS="$1" \
+    FAKE_INCLUDE_ENGWIN="${2:-0}" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
@@ -159,6 +185,38 @@ if echo "$LOG2" | grep -q "Lane picks — small: tt-blkd"; then
   ok "picked the highest-priority bug (tt-blkd) when unblocked"
 else
   bad "did not pick the highest-priority bug when nothing was blocked"
+fi
+
+# ── Scenario 3: engine-fork bugs are excluded from dispatch (ga-6lum3) ─────────
+# A ready P0 bug labeled needs:engine-window must NEVER be dispatched (it can't be
+# built — engine source isn't on disk). The fake bd only drops it when the
+# dispatcher passes --exclude-label "needs:engine-window", so this fails loudly if
+# any query block loses the exclusion.
+echo "Scenario 3: needs:engine-window bug (P0) must be excluded, keeper (P1) dispatched"
+LOG3="$(run_dispatch "" 1)"
+
+if echo "$LOG3" | grep -q "Lane picks — small: tt-engwin"; then
+  bad "LEAK: dispatched the engine-window bug (tt-engwin)"
+else
+  ok "did NOT dispatch the engine-window bug"
+fi
+
+if echo "$LOG3" | grep -q "Lane picks — small: tt-keep"; then
+  ok "dispatched the normal keeper bug (tt-keep) instead"
+else
+  bad "did not dispatch the keeper bug (tt-keep)"
+fi
+
+# ── Structural: every dispatch query block excludes needs:engine-window ────────
+# Belt to the behavioral test: the exclusion must appear in EVERY block that
+# already excludes gate:needs-human (Tier 1 + Tier 2, HQ + rig paths).
+echo "Structural: needs:engine-window paired with gate:needs-human in all query blocks"
+GNH=$(grep -c 'exclude-label "gate:needs-human"' "$DISPATCHER")
+ENG=$(grep -c 'exclude-label "needs:engine-window"' "$DISPATCHER")
+if [ "$GNH" -gt 0 ] && [ "$ENG" -eq "$GNH" ]; then
+  ok "needs:engine-window present in all $GNH query block(s)"
+else
+  bad "exclusion count mismatch: gate:needs-human=$GNH needs:engine-window=$ENG"
 fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────

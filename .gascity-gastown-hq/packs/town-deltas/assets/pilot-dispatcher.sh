@@ -267,6 +267,7 @@ BUGS_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-label "gate:passed" \
   --exclude-label "pilot:dispatching" \
   --exclude-label "gate:needs-human" \
+  --exclude-label "needs:engine-window" \
   --exclude-label "pilot:dispatched" \
   -n 0 \
   2>/dev/null || echo "[]")
@@ -279,6 +280,7 @@ DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-label "gate:passed" \
   --exclude-label "pilot:dispatching" \
   --exclude-label "gate:needs-human" \
+  --exclude-label "needs:engine-window" \
   --exclude-label "pilot:dispatched" \
   -n 0 \
   2>/dev/null || echo "[]")
@@ -319,6 +321,7 @@ if [ "$TIER1_COUNT" -eq "0" ]; then
     --exclude-label "gate:passed" \
     --exclude-label "pilot:dispatching" \
     --exclude-label "gate:needs-human" \
+    --exclude-label "needs:engine-window" \
     --exclude-label "pilot:dispatched" \
     -n 0 \
     2>/dev/null || echo "[]")
@@ -356,6 +359,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "gate:passed" \
       --exclude-label "pilot:dispatching" \
       --exclude-label "gate:needs-human" \
+      --exclude-label "needs:engine-window" \
       --exclude-label "pilot:dispatched" \
       -n 0 2>/dev/null || echo "[]")
     RIG_BUGS=$(echo "$RIG_BUGS" | _filter_candidates | _filter_unblocked "$rig_path")
@@ -368,6 +372,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "gate:passed" \
       --exclude-label "pilot:dispatching" \
       --exclude-label "gate:needs-human" \
+      --exclude-label "needs:engine-window" \
       --exclude-label "pilot:dispatched" \
       -n 0 2>/dev/null || echo "[]")
     RIG_DEBT=$(echo "$RIG_DEBT" | _filter_candidates | _filter_unblocked "$rig_path")
@@ -380,6 +385,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "gate:passed" \
       --exclude-label "pilot:dispatching" \
       --exclude-label "gate:needs-human" \
+      --exclude-label "needs:engine-window" \
       --exclude-label "pilot:dispatched" \
       -n 0 2>/dev/null || echo "[]")
     RIG_FEATURES=$(echo "$RIG_FEATURES" | _filter_candidates | _filter_unblocked "$rig_path")
