@@ -146,12 +146,52 @@ log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] $*"; }
 err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] ERROR: $*"; }
 warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: $*"; }
 
+# ── Single-instance guard (ga-2azzj fix 2) ────────────────────────────────────
+# Two concurrent sweeps (launchd StartInterval overlap, or a manual run racing
+# the timer) can BOTH pass the so-called "atomic claim" — `bd label add` is
+# idempotent and the post-claim verify only rejects in-flight/done — and then
+# sling the SAME story to two builders (the ga-8nu8x double-build). A whole-run
+# flock closes that window: only one sweep proceeds; a second exits cleanly.
+#
+# flock is NOT in base macOS; it lives in /opt/homebrew/bin (on the launchd
+# plist PATH). If it is somehow unavailable we WARN and PROCEED WITHOUT the lock
+# rather than exit — silently disabling the whole dispatcher on a missing binary
+# would be far worse, and the durable-in-flight fix (#1) is the load-bearing
+# guard regardless; the lock is defense-in-depth.
+PILOT_LOCK="${TMPDIR:-/tmp}/pilot-dispatcher$(printf '%s' "$GC_CITY" | tr '/ ' '__').lock"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$PILOT_LOCK"
+  if ! flock -n 9; then
+    log "Another Pilot sweep holds $PILOT_LOCK — backing off (single-instance guard)."
+    exit 0
+  fi
+else
+  warn "flock not found — proceeding WITHOUT single-instance lock (relying on durable story:in-flight guard, ga-2azzj fix 1)."
+fi
+
 echo ""
 log "=== Pilot sweep start (DRY_RUN=${DRY_RUN}) ==="
 
-# ── Step 0: TTL recovery — release stale pilot:dispatching claims ─────────────
-# A pilot:dispatching story whose updated_at is older than CLAIM_TTL_MINUTES
-# means the dispatcher crashed mid-run. Release it back to dispatchable state.
+# ── Step 0: TTL recovery — release stale pilot:dispatching claims (ga-2azzj) ───
+# A pilot:dispatching label means a dispatch is (or was) in progress. We may only
+# RECYCLE it when it is genuinely STALE — i.e. the dispatcher crashed mid-run.
+#
+# DEFECT A (ga-2azzj, the bug this rewrite fixes): the previous code measured
+# staleness from the bead's updated_at. `bd label add` does NOT bump updated_at
+# to claim time, so an OLD bead's FRESH claim read as age >> TTL (observed
+# 47433s ≈ 13h for a 5-min-old claim) and got released on the very next sweep →
+# the story became re-dispatchable while a builder was already building it →
+# the same story went to two dogs (ga-8nu8x double-build, one wasted cycle).
+#
+# FIX: age is measured from a dedicated metadata stamp `pilot.dispatching_at`,
+# written at claim time (see dispatch_one) BEFORE the label, so the label can
+# never exist without its stamp. Decision rules:
+#   - stamp missing (legacy claim) → DO NOT release; stamp NOW so the clock
+#       starts from this sweep. Never fall back to updated_at (that IS Defect A).
+#   - stamp present, age <= TTL    → keep (the claim is fresh, build in flight).
+#   - stamp present, age >  TTL, but a recorded sling task (pilot.sling_bead) is
+#       still OPEN → a builder is actively working a long build; refuse release.
+#   - stamp present, age >  TTL, no live sling task → release (truly stale).
 
 STALE_JSON=$(bd -C "$GC_CITY" list --json --all \
   -l "story:approved" \
@@ -165,17 +205,37 @@ if [ "$STALE_COUNT" -gt "0" ]; then
   TTL_SECS=$((CLAIM_TTL_MINUTES * 60))
 
   echo "$STALE_JSON" | jq -c '.[]' | while IFS= read -r bead; do
-    BEAD_ID_STALE=$(echo "$bead" | jq -r '.id')
-    UPDATED_AT=$(echo "$bead" | jq -r '.updated_at // .created_at // ""')
-    if [ -n "$UPDATED_AT" ]; then
-      UPDATED_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null \
-        || date -d "$UPDATED_AT" +%s 2>/dev/null || echo "$NOW_EPOCH")
-      AGE_SECS=$((NOW_EPOCH - UPDATED_EPOCH))
-      if [ "$AGE_SECS" -gt "$TTL_SECS" ]; then
-        warn "Releasing stale pilot:dispatching claim on $BEAD_ID_STALE (age=${AGE_SECS}s > TTL=${TTL_SECS}s)"
-        bd -C "$GC_CITY" label remove "$BEAD_ID_STALE" "pilot:dispatching" -q 2>/dev/null || true
+    BEAD_ID_STALE=$(echo "$bead" | jq -r '.id' 2>/dev/null || echo "")
+    [ -z "$BEAD_ID_STALE" ] && continue
+    STAMP=$(echo "$bead" | jq -r '.metadata["pilot.dispatching_at"] // ""' 2>/dev/null || echo "")
+    SLING_REF=$(echo "$bead" | jq -r '.metadata["pilot.sling_bead"] // ""' 2>/dev/null || echo "")
+
+    # Legacy / un-stamped claim: start the clock now, never release this sweep.
+    if [ -z "$STAMP" ] || ! [ "$STAMP" -ge 0 ] 2>/dev/null; then
+      warn "TTL: $BEAD_ID_STALE has pilot:dispatching but no pilot.dispatching_at stamp (legacy) — stamping now, NOT releasing (Defect A guard)."
+      bd -C "$GC_CITY" update "$BEAD_ID_STALE" --set-metadata "pilot.dispatching_at=$NOW_EPOCH" -q 2>/dev/null || true
+      continue
+    fi
+
+    AGE_SECS=$((NOW_EPOCH - STAMP))
+    if [ "$AGE_SECS" -le "$TTL_SECS" ]; then
+      log "TTL: $BEAD_ID_STALE claim is fresh (age=${AGE_SECS}s <= TTL=${TTL_SECS}s, stamp-based) — keeping."
+      continue
+    fi
+
+    # Age exceeds TTL. Refuse to recycle if the slung builder task is still live.
+    if [ -n "$SLING_REF" ]; then
+      SLING_STATUS=$(bd -C "$GC_CITY" show "$SLING_REF" --json 2>/dev/null \
+        | jq -r 'if type=="array" then .[0] else . end | (.status // "")' 2>/dev/null || echo "")
+      if [ -n "$SLING_STATUS" ] && [ "$SLING_STATUS" != "closed" ] && [ "$SLING_STATUS" != "done" ]; then
+        warn "TTL: $BEAD_ID_STALE age=${AGE_SECS}s > TTL but sling task $SLING_REF is still '$SLING_STATUS' — builder active, refusing to release."
+        continue
       fi
     fi
+
+    warn "Releasing stale pilot:dispatching claim on $BEAD_ID_STALE (age=${AGE_SECS}s > TTL=${TTL_SECS}s, stamp-based)."
+    bd -C "$GC_CITY" label remove "$BEAD_ID_STALE" "pilot:dispatching" -q 2>/dev/null || true
+    bd -C "$GC_CITY" update "$BEAD_ID_STALE" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
   done
 fi
 
@@ -506,8 +566,15 @@ FIXSEC
   log "Attempting atomic claim on $STORY_ID (lane=$LANE tier=$DISPATCH_TIER) ..."
 
   if [ "$DRY_RUN" = "1" ]; then
-    log "DRY_RUN=1 — WOULD: bd label add $STORY_ID pilot:dispatching"
+    log "DRY_RUN=1 — WOULD: stamp pilot.dispatching_at then bd label add $STORY_ID pilot:dispatching"
   else
+    # ga-2azzj fix 3: write the claim-time stamp BEFORE the label, so a
+    # pilot:dispatching label can never exist without a pilot.dispatching_at
+    # stamp for TTL recovery to measure age from (Defect A). updated_at is NOT a
+    # reliable claim clock — bd label add does not bump it.
+    local CLAIM_EPOCH
+    CLAIM_EPOCH=$(date +%s)
+    bd -C "$GC_CITY" update "$STORY_ID" --set-metadata "pilot.dispatching_at=$CLAIM_EPOCH" -q 2>/dev/null || true
     bd -C "$GC_CITY" label add "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || {
       warn "Could not add pilot:dispatching to $STORY_ID (race condition or bd error). Skipping."
       return 1
@@ -733,7 +800,7 @@ TASK
     log "  Task title: '$SLING_TITLE_DRY'"
     log "  Rig: $STORY_RIG → builder: $BUILDER_TARGET"
     log "  WOULD: bd label add $STORY_ID lane:${LANE}"
-    log "  WOULD: bd label add $STORY_ID story:in-flight"
+    log "  WOULD: bd label add $STORY_ID story:in-flight (verify durable BEFORE releasing claim)"
     log "  WOULD: bd label remove $STORY_ID pilot:dispatching"
     log "  WOULD: bd label add $STORY_ID pilot:dispatched"
     log "  WOULD: bd comment $STORY_ID 'Pilot dispatched builder $BUILDER_TARGET at $NOW'"
@@ -786,6 +853,12 @@ TASK
       return 1
     fi
 
+    # ga-2azzj fix 3: record the slung builder task so TTL recovery can tell a
+    # genuinely-stuck claim (sling task closed/gone) from an active long build
+    # (sling task still open) and refuse to recycle the latter. Set now — before
+    # finalization — so it survives even the degraded in-flight-unconfirmed path.
+    bd -C "$GC_CITY" update "$STORY_ID" --set-metadata "pilot.sling_bead=$SLING_BEAD_ID" -q 2>/dev/null || true
+
     gc --city "$GC_CITY" session nudge "$BUILDER_TARGET" "$DISPATCH_TASK" \
       --delivery wait-idle 2>/dev/null \
       || warn "Could not nudge $BUILDER_TARGET — builder will see the task bead on next hook cycle"
@@ -793,12 +866,62 @@ TASK
     log "Dispatch complete: sling_bead=$SLING_BEAD_ID target=$BUILDER_TARGET"
   fi
 
-  # ── Transition bead: lane tag + story:in-flight ──────────────────────────────
+  # ── Transition bead: lane tag + DURABLE story:in-flight (ga-2azzj fix 1) ──────
+  # ORDER IS LOAD-BEARING. The candidate queries EXCLUDE story:in-flight; that
+  # label is the ONLY thing that makes a slung bead non-re-dispatchable. So:
+  #   1. lane tag (cosmetic accounting — non-fatal).
+  #   2. add story:in-flight and VERIFY it stuck (read-after-write retry). This
+  #      write is NOT swallowed — a slung-but-unmarked bead is the dangerous
+  #      state that caused the ga-8nu8x double-dispatch.
+  #   3. ONLY after in-flight is confirmed durable, remove the pilot:dispatching
+  #      claim. (The old code removed the claim FIRST, then added in-flight with
+  #      `|| true` — a transient Dolt blip or a set -e exit between the two left
+  #      NEITHER marker, so the bead stayed re-dispatchable.)
+  #   4. pilot:dispatched tag (cosmetic — non-fatal).
+  # If in-flight cannot be confirmed (Dolt down): abort HARD and WARN, leaving
+  # pilot:dispatching ON so TTL recovery — not a fresh sweep — owns the claim.
+  # The builder is already slung; an unmarked re-dispatchable bead is worse than
+  # a claim that TTL recovery cleans up once the sling task is closed.
   if [ "$DRY_RUN" != "1" ]; then
-    bd -C "$GC_CITY" label add    "$STORY_ID" "lane:${LANE}"      -q 2>/dev/null || true
+    bd -C "$GC_CITY" label add "$STORY_ID" "lane:${LANE}" -q 2>/dev/null || true
+
+    local _inflight_ok=0 _inflight_i=1
+    local _inflight_retries="${PILOT_INFLIGHT_RETRIES:-5}"
+    local _inflight_sleep="${PILOT_INFLIGHT_SLEEP:-2}"
+    while [ "$_inflight_i" -le "$_inflight_retries" ]; do
+      bd -C "$GC_CITY" label add "$STORY_ID" "story:in-flight" -q 2>/dev/null || true
+      if bd -C "$GC_CITY" show "$STORY_ID" --json 2>/dev/null \
+          | jq -e 'if type=="array" then .[0] else . end | (.labels // []) | any(. == "story:in-flight")' \
+          >/dev/null 2>&1; then
+        _inflight_ok=1; break
+      fi
+      [ "$_inflight_i" -lt "$_inflight_retries" ] && sleep "$_inflight_sleep"
+      _inflight_i=$((_inflight_i + 1))
+    done
+
+    if [ "$_inflight_ok" = "0" ]; then
+      err "DURABLE-INFLIGHT FAILED on $STORY_ID after ${_inflight_retries} attempts (Dolt down?). Builder '$BUILDER_TARGET' was ALREADY slung (bead=$SLING_BEAD_ID). Leaving pilot:dispatching ON so TTL recovery owns this claim; NOT releasing it (prevents 2nd-builder dispatch, ga-2azzj)."
+      DISPATCH_RESULT="inflight_unconfirmed"
+      mkdir -p "$(dirname "$PILOT_LOG")" 2>/dev/null || true
+      jq -c -n \
+        --arg ts "$NOW" --arg story_id "$STORY_ID" --arg builder "$BUILDER_TARGET" \
+        --arg sling_bead "$SLING_BEAD_ID" --arg lane "$LANE" --arg tier "$DISPATCH_TIER" \
+        '{ts:$ts, event:"pilot_dispatch_degraded", story_id:$story_id, builder:$builder,
+          sling_bead:$sling_bead, lane:$lane, tier:$tier, result:"inflight_unconfirmed",
+          note:"slung but story:in-flight unconfirmed; pilot:dispatching left on for TTL recovery"}' \
+        >> "$PILOT_LOG" 2>/dev/null || true
+      notify -t "⚠️ Pilot dispatch degraded" -p 4 \
+        "$STORY_ID slung to $BUILDER_TARGET but story:in-flight unconfirmed (Dolt?). Claim left for TTL recovery — check pilot-dispatcher.log" \
+        2>/dev/null || true
+      return 1
+    fi
+
+    # in-flight is durable — NOW safe to release the claim and tag dispatched.
     bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$STORY_ID" "story:in-flight"   -q 2>/dev/null || true
     bd -C "$GC_CITY" label add    "$STORY_ID" "pilot:dispatched"  -q 2>/dev/null || true
+    # Claim stamps are now moot (bead is in-flight, excluded from TTL query). Clear
+    # them so a later re-dispatch (gate:needs-fix) starts from a clean slate.
+    bd -C "$GC_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
 
     local DISPATCH_COMMENT
     if [ "$DISPATCH_TIER" = "bug" ]; then

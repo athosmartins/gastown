@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
-# pilot-dispatcher.selftest.sh — Prove the dependency-blocking filter (ga-5ew) and
-# the engine-window exclusion (ga-6lum3) in isolation.
+# pilot-dispatcher.selftest.sh — Regression harness for the Pilot dispatcher.
+#
+# Covers:
+#   Scenarios 1-2 (ga-5ew): dependency-blocking filter — the Pilot must not
+#     dispatch a story whose hard dependency is still open.
+#   Scenario 3 (ga-6lum3): engine-window exclusion — a ready P0 bug labeled
+#     needs:engine-window must NEVER be dispatched (engine source isn't on disk),
+#     and the exclusion must appear in every dispatch query block.
+#   Scenario 4 (ga-2azzj Defect A): TTL recovery measures claim age from the
+#     pilot.dispatching_at STAMP, never updated_at — a fresh claim on an old
+#     bead must not be released (the root of the ga-8nu8x double-dispatch).
+#   Scenario 5 (ga-2azzj fix 1): a real dispatch confirms story:in-flight is
+#     DURABLE before releasing pilot:dispatching; if it can't, it aborts and
+#     leaves the claim on for TTL recovery rather than re-dispatching.
 #
 # Bug ga-5ew: the Pilot dispatched a story whose hard dependency was not yet
 # merged. The fix (_filter_unblocked) drops candidates that bd reports as BLOCKED
@@ -22,7 +34,7 @@
 # Scenario 2 (no over-filter): blocked-set = {}. Nothing is blocked, so the
 #   dispatcher must pick the highest-priority bug (tt-blkd) and emit NO exclusion.
 #
-# Exit 0 iff both scenarios behave as expected.
+# Exit 0 iff every scenario behaves as expected.
 
 set -uo pipefail
 
@@ -46,14 +58,29 @@ trap cleanup EXIT
 
 SHIMBIN="$WORK/bin"
 FIXCITY="$WORK/city"
-mkdir -p "$SHIMBIN" "$FIXCITY/.gc/logs"
+STATE="$WORK/state"
+mkdir -p "$SHIMBIN" "$FIXCITY/.gc/logs" "$STATE"
 
 # ── Fake bd ───────────────────────────────────────────────────────────────────
-# Dispatches on argv. Order matters: blocked check first, then the --all queries
-# (stale recovery + in-flight count → empty), then the bug candidate query.
+# Stateful shim. Dispatches on argv; tracks label state under $PILOT_TEST_STATE
+# so read-after-write verifies (ga-2azzj durable in-flight) can be exercised.
+# Case order matters — most-specific patterns first.
+#   FAKE_BLOCKED_IDS       space-list of ids bd should report as blocked
+#   FAKE_STALE_JSON        JSON array for the Step-0 stale-claim query (default [])
+#   FAKE_BUGS_JSON         JSON array overriding the default 2-bug -t bug fixture
+#   FAKE_INCLUDE_ENGWIN    =1 → inject a P0 needs:engine-window bug (ga-6lum3),
+#                          dropped only when --exclude-label is actually passed
+#   FAKE_SUPPRESS_INFLIGHT =1 → `label add story:in-flight` is silently dropped
+#                          (simulates Dolt swallowing the write → never confirms)
+#   FAKE_SLING_STATUS      status returned for `show <…sling…>` (default open)
 cat > "$SHIMBIN/bd" <<'SHIM'
 #!/usr/bin/env bash
 args="$*"
+STATE="${PILOT_TEST_STATE:-/tmp/pilot-selftest-state}"
+mkdir -p "$STATE" 2>/dev/null || true
+# token immediately following <want> in argv (controlled argv: no spaces in ids)
+after() { local want="$1" prev=""; for a in $args; do [ "$prev" = "$want" ] && { echo "$a"; return; }; prev="$a"; done; }
+
 case "$args" in
   *blocked*)
     ids="${FAKE_BLOCKED_IDS:-}"
@@ -66,13 +93,45 @@ case "$args" in
     done
     printf '%s]' "$out"
     ;;
+  *update*)
+    # metadata writes (stamp / unset). Record stamps for optional assertions.
+    case "$args" in
+      *set-metadata*pilot.dispatching_at*) echo "stamp $(after update)" >> "$STATE/stamps.log" 2>/dev/null || true ;;
+    esac
+    : ;;
+  *"label add"*story:in-flight*)
+    id="$(after add)"
+    [ "${FAKE_SUPPRESS_INFLIGHT:-0}" = "1" ] || touch "$STATE/$id.inflight" 2>/dev/null || true
+    : ;;
+  *"label add"*pilot:dispatching*)
+    touch "$STATE/$(after add).dispatching" 2>/dev/null || true ; : ;;
+  *"label remove"*pilot:dispatching*)
+    id="$(after remove)"
+    rm -f "$STATE/$id.dispatching" 2>/dev/null || true
+    echo "released $id" >> "$STATE/releases.log" 2>/dev/null || true ; : ;;
+  *"label add"*|*"label remove"*)
+    : ;;          # other label ops (lane:*, pilot:dispatched, …) → no-op.
+                  # NOTE: must match the 'label add/remove' SUBCOMMAND, not the
+                  # '--exclude-label' flag that appears in the list queries below.
+  *comments*)
+    printf '[]' ;;                # gate-feedback lookup
+  *show*)
+    id="$(after show)"
+    lbls=""
+    [ -f "$STATE/$id.inflight" ]    && lbls="\"story:in-flight\""
+    [ -f "$STATE/$id.dispatching" ] && lbls="${lbls:+$lbls,}\"pilot:dispatching\""
+    st="open"
+    case "$id" in *sling*) st="${FAKE_SLING_STATUS:-open}" ;; esac
+    printf '{"id":"%s","status":"%s","labels":[%s]}' "$id" "$st" "$lbls" ;;
+  *story:approved*pilot:dispatching*)
+    printf '%s' "${FAKE_STALE_JSON:-[]}" ;;   # Step-0 stale-claim query
   *--all*)
-    # Step 0 (stale story:approved+pilot:dispatching) and Step 1 (story:in-flight)
-    # → empty, so all lane slots are free.
-    printf '[]'
-    ;;
+    printf '[]' ;;                            # in-flight count → lanes free
   *"-t bug"*)
-    if [ "${FAKE_INCLUDE_ENGWIN:-0}" = "1" ]; then
+    if [ -n "${FAKE_BUGS_JSON:-}" ]; then
+      # ga-2azzj: explicit fixture injection (used by the non-dry in-flight test).
+      printf '%s' "$FAKE_BUGS_JSON"
+    elif [ "${FAKE_INCLUDE_ENGWIN:-0}" = "1" ]; then
       # Engine-window scenario (ga-6lum3): tt-engwin is a P0 engine-fork bug that
       # MUST NOT be dispatched. This fake bd honors the exclusion ONLY when the
       # dispatcher actually passes --exclude-label "needs:engine-window" — so the
@@ -102,23 +161,23 @@ JSON
   {"id":"tt-unblk","title":"Unblocked bug fixture","priority":1,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
 ]
 JSON
-    fi
-    ;;
+    fi ;;
   *)
-    # tech-debt query, tier-2 features, anything else → empty.
-    printf '[]'
-    ;;
+    printf '[]' ;;                            # tech-debt, tier-2 features, etc.
 esac
 exit 0
 SHIM
 chmod +x "$SHIMBIN/bd"
 
-# ── Fake gc / notify (no-ops; not reached on the HQ-candidate DRY_RUN path) ────
+# ── Fake gc / notify ──────────────────────────────────────────────────────────
+# DRY scenarios never reach sling; the non-DRY durable-in-flight scenario does.
 cat > "$SHIMBIN/gc" <<'SHIM'
 #!/usr/bin/env bash
-# Only rig-fallback would call `gc ... rig list`; return an empty rig set if so.
 case "$*" in
-  *"rig list"*) printf '{"rigs":[]}' ;;
+  *"rig list"*)      printf '{"rigs":[]}' ;;     # rig fallback → empty
+  *sling*)           printf '{"bead_id":"tt-sling-1"}' ;;  # builder task bead
+  *"session list"*)  : ;;                         # no live builder sessions
+  *"session nudge"*) : ;;
   *) : ;;
 esac
 exit 0
@@ -132,17 +191,57 @@ SHIM
 chmod +x "$SHIMBIN/notify"
 
 # ── Runner ────────────────────────────────────────────────────────────────────
+reset_state() { rm -rf "$STATE"; mkdir -p "$STATE"; }
+
 # Runs the real dispatcher in DRY_RUN with the shims on PATH, returns the log.
 run_dispatch() { # FAKE_BLOCKED_IDS [FAKE_INCLUDE_ENGWIN]
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
     FAKE_BLOCKED_IDS="$1" \
     FAKE_INCLUDE_ENGWIN="${2:-0}" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# Runs Step-0 TTL recovery in DRY_RUN with an injected stale-claim fixture.
+run_step0() { # FAKE_STALE_JSON
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    FAKE_STALE_JSON="$1" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# Runs a REAL (non-dry) dispatch of a single bug candidate through finalization.
+# Arg 1: FAKE_SUPPRESS_INFLIGHT (0|1). Sleep is zeroed so the retry loop is fast.
+run_real_dispatch() { # FAKE_SUPPRESS_INFLIGHT
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=0 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_INFLIGHT_RETRIES=3 \
+    PILOT_INFLIGHT_SLEEP=0 \
+    FAKE_BLOCKED_IDS="" \
+    FAKE_SUPPRESS_INFLIGHT="$1" \
+    FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
@@ -217,6 +316,88 @@ if [ "$GNH" -gt 0 ] && [ "$ENG" -eq "$GNH" ]; then
   ok "needs:engine-window present in all $GNH query block(s)"
 else
   bad "exclusion count mismatch: gate:needs-human=$GNH needs:engine-window=$ENG"
+fi
+
+# ── Scenario 4: stamp-based TTL recovery (ga-2azzj Defect A) ───────────────────
+# Step-0 must measure claim age from the pilot.dispatching_at stamp, NOT
+# updated_at. A FRESH claim on an OLD bead must NOT be released.
+echo "Scenario 4: TTL recovery uses pilot.dispatching_at stamp, not updated_at"
+NOW="$(date +%s)"
+OLD_STAMP="$((NOW - 7200))"   # 2h old   → stale (TTL default 30m)
+FRESH_STAMP="$((NOW - 60))"   # 1m young → fresh
+
+# 4a: old stamp → release.
+STALE_OLD='[{"id":"tt-stale","title":"x","status":"open","updated_at":"2020-01-01T00:00:00Z","labels":["story:approved","pilot:dispatching"],"metadata":{"pilot.dispatching_at":"'"$OLD_STAMP"'"}}]'
+LOG4A="$(run_step0 "$STALE_OLD")"
+if echo "$LOG4A" | grep -q "Releasing stale pilot:dispatching claim on tt-stale"; then
+  ok "old stamp (age>TTL) → released the stale claim"
+else
+  bad "old stamp should have been released"
+fi
+
+# 4b: fresh stamp but ANCIENT updated_at → must KEEP (the actual Defect A repro).
+STALE_FRESH='[{"id":"tt-fresh","title":"x","status":"open","updated_at":"2020-01-01T00:00:00Z","labels":["story:approved","pilot:dispatching"],"metadata":{"pilot.dispatching_at":"'"$FRESH_STAMP"'"}}]'
+LOG4B="$(run_step0 "$STALE_FRESH")"
+if echo "$LOG4B" | grep -q "claim is fresh.*tt-fresh\|tt-fresh.*claim is fresh"; then
+  ok "fresh stamp + ancient updated_at → KEPT (Defect A fixed)"
+else
+  bad "fresh claim was not kept (Defect A regression)"
+fi
+if echo "$LOG4B" | grep -q "Releasing stale pilot:dispatching claim on tt-fresh"; then
+  bad "REGRESSION: released a FRESH claim (the ga-8nu8x double-dispatch bug)"
+else
+  ok "did NOT release the fresh claim"
+fi
+
+# 4c: no stamp (legacy) → must stamp now, NOT release.
+STALE_NOSTAMP='[{"id":"tt-legacy","title":"x","status":"open","updated_at":"2020-01-01T00:00:00Z","labels":["story:approved","pilot:dispatching"],"metadata":{}}]'
+LOG4C="$(run_step0 "$STALE_NOSTAMP")"
+if echo "$LOG4C" | grep -q "no pilot.dispatching_at stamp"; then
+  ok "legacy claim with no stamp → stamped now, not released"
+else
+  bad "legacy claim path did not trigger stamp-now behavior"
+fi
+if echo "$LOG4C" | grep -q "Releasing stale pilot:dispatching claim on tt-legacy"; then
+  bad "REGRESSION: released an un-stamped legacy claim (would re-dispatch fresh work)"
+else
+  ok "did NOT release the un-stamped legacy claim"
+fi
+
+# ── Scenario 5: durable story:in-flight before claim release (ga-2azzj fix 1) ──
+# The load-bearing fix. A real (non-dry) dispatch must confirm story:in-flight
+# BEFORE removing pilot:dispatching. If in-flight can't be confirmed, it must
+# abort and LEAVE pilot:dispatching on (so TTL recovery owns it) — never release.
+echo "Scenario 5: durable story:in-flight gates the claim release (non-dry)"
+
+# 5a: happy path — in-flight confirms, claim released after.
+LOG5A="$(run_real_dispatch 0)"
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  ok "story:in-flight was set"
+else
+  bad "story:in-flight was never set on the happy path"
+fi
+if grep -q "released tt-flight" "$STATE/releases.log" 2>/dev/null; then
+  ok "pilot:dispatching released AFTER in-flight confirmed"
+else
+  bad "claim was not released on the happy path"
+fi
+if echo "$LOG5A" | grep -q "DURABLE-INFLIGHT FAILED"; then
+  bad "happy path wrongly reported DURABLE-INFLIGHT FAILED"
+else
+  ok "no false in-flight failure on the happy path"
+fi
+
+# 5b: failure injection — in-flight write swallowed → must NOT release the claim.
+LOG5B="$(run_real_dispatch 1)"
+if echo "$LOG5B" | grep -q "DURABLE-INFLIGHT FAILED on tt-flight"; then
+  ok "unconfirmed in-flight → aborted hard with a loud error"
+else
+  bad "did not detect/announce the unconfirmed in-flight write"
+fi
+if grep -q "released tt-flight" "$STATE/releases.log" 2>/dev/null; then
+  bad "REGRESSION: released the claim despite unconfirmed in-flight (re-dispatchable!)"
+else
+  ok "left pilot:dispatching ON for TTL recovery (no premature release)"
 fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
