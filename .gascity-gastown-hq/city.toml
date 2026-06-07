@@ -1,0 +1,66 @@
+[workspace]
+provider = "claude"
+global_fragments = ["command-glossary", "operational-awareness", "town-deltas"]
+
+[imports]
+[imports.gastown]
+source = ".gc/system/packs/gastown"
+[imports.town-deltas]
+source = "packs/town-deltas"
+
+[[rigs]]
+name = "property_scrapers"
+prefix = "ps"
+
+[[rigs]]
+name = "marketing"
+prefix = "ma"
+default_branch = "main"
+suspended = true
+
+[[rigs]]
+name = "lexbh"
+prefix = "lx"
+suspended = true
+
+[[rigs]]
+name = "gastown"
+prefix = "gt"
+
+[[rigs]]
+name = "whatsapp_automation"
+prefix = "wa"
+default_branch = "main"
+
+[patches]
+
+[[patches.agent]]
+dir = ""
+name = "gastown.mayor"
+suspended = false
+
+[[patches.agent]]
+dir = ""
+name = "gastown.boot"
+suspended = true
+
+[[patches.agent]]
+dir = ""
+name = "gastown.deacon"
+suspended = true
+
+[providers.claude]
+base = "builtin:claude"
+
+# Headless provider for ephemeral/automated agents (gate reviewers, etc.) — bug wa-9ye2.
+# Identical to the claude provider, but appends a second `--settings` that forces
+# remoteControlAtStartup=false. Gas City spawns every claude with a single
+# `--settings .gc/settings.json` (which omits the key), so without this the session
+# inherits the global ~/.claude/settings.json (remoteControlAtStartup=true) and the
+# headless worker auto-connects to the human's mobile Claude Code app as "Connected".
+# Claude Code deep-merges multiple --settings per-key (later wins), so this overrides
+# only RC while preserving all hooks/keys from .gc/settings.json. Assign via an agent
+# template's `provider = "claude-headless"`. Mayor/crew stay on "claude" (RC ON).
+[providers.claude-headless]
+base = "builtin:claude"
+args_append = ["--settings", "{\"remoteControlAtStartup\":false}"]

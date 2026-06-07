@@ -21,3 +21,15 @@ min_active_sessions = 0
 max_active_sessions = 6
 idle_timeout = "1h"
 wake_mode = "fresh"
+
+# Remote Control OFF for ephemeral reviewers (bug wa-9ye2).
+# Gas City spawns every claude session with `--settings .gc/settings.json`, which has
+# no remoteControlAtStartup key, so it inherits the global ~/.claude/settings.json
+# (remoteControlAtStartup=true) and the reviewer auto-connects to the human's mobile
+# Claude Code app as "Connected". Reviewers are headless/ephemeral and must NOT.
+# Fix: route this template through the dedicated `claude-headless` provider (defined
+# in city.toml), which appends a second `--settings '{"remoteControlAtStartup":false}'`.
+# Claude Code deep-merges multiple --settings per-key (later wins), so this overrides
+# only RC while preserving every hook/key from .gc/settings.json (verified empirically).
+# Mayor/crew templates keep the default "claude" provider and stay RC ON.
+provider = "claude-headless"
