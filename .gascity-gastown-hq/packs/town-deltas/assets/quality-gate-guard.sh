@@ -679,6 +679,39 @@ Marker set to gate-status:error. Fix the marker fields and re-submit." 2>/dev/nu
   exit 1
 fi
 
+# ── Step 4b (ga-e7zk7): detach source bead from the dog pool — gate owns it now ──
+# The builder leaves the source bead in_progress + assignee=<pool alias> for the
+# WHOLE gate duration (the gate closes it on PASS). Markers routinely sit queued
+# for hours behind the single-threaded backlog, and throughout that window the
+# dog-pool startup probes — which are label-blind and engine-baked (cannot be
+# changed without an engine window) — keep re-matching the source bead:
+#   - Step 1a: bd list --status in_progress --assignee=<session id|name|alias>
+#              → every recycle of the builder's pool alias re-finds it (Vector 1a)
+#   - Step 1c: bd ready --metadata-field gc.routed_to=<template> --unassigned
+#              → on dog death the reconciler reset-to-ready re-exposes any residual
+#                gc.routed_to (Vector 1c)
+# Each re-match spins up a no-op dog that verifies-and-exits — pure session burn
+# (ga-noxbv was re-dispatched 15x mid-gate; see ga-e7zk7). The marker is now
+# gate-status:claimed, an active state the inflight-reclaim-guard already excludes,
+# so this is the earliest point where the gate authoritatively owns the bead AND
+# detaching cannot trigger a false reclaim. Neutralize both vectors at the routing
+# layer: clear the source bead's assignee (kills 1a) and strip gc.routed_to (kills
+# 1c). The bead stays in_progress + story:in-flight; the gate closes it on PASS, or
+# on FAIL the Pilot re-dispatches (re-assigning fresh). The marker's source-bead:
+# label — not the bead's assignee — is what the gate and delivery use to find it,
+# so detaching is safe. Best-effort, never fatal (set -euo pipefail discipline).
+if [ -n "$BEAD_ID" ]; then
+  if bd -C "$GC_CITY" assign "$BEAD_ID" "" 2>/dev/null; then
+    log "  detached source bead $BEAD_ID from dog pool (cleared assignee — ga-e7zk7)"
+  else
+    log "  WARN: could not clear assignee on source bead $BEAD_ID (non-fatal — ga-e7zk7)"
+  fi
+  # Strip the metadata-keyed pool route (no-op in the current sling-bead model,
+  # where the source bead carries no gc.routed_to; covers the legacy direct-route
+  # model where it did). Guarded so a missing key never aborts the sweep.
+  bd -C "$GC_CITY" update "$BEAD_ID" --unset-metadata gc.routed_to -q 2>/dev/null || true
+fi
+
 # ── Step 5: Derive author from the authoritative bead record ─────────────────
 # SECURITY: Do NOT use MARKER_AUTHOR (self-declared by worker) for exclusion.
 # Instead, look up the bead's assignee or owner in the DB. This prevents
