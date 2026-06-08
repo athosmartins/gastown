@@ -201,6 +201,10 @@ spawn_abort_should_page() {
   if [ "$((now - last))" -ge "$realert" ]; then echo "page"; else echo "hold"; fi
 }
 
+# NOTE: set_gate_status() is provided by the guard lib sourced above (line ~58,
+# GATE_GUARD_LIB_ONLY=1) — same DRY pattern as parse_marker_id. Single source of
+# truth in quality-gate-guard.sh; no copy here to avoid drift (ga-jhyu).
+
 # ── supersede_sibling_runs — proactively close guard's companion gate-run bead ─
 # The guard creates a quality-gate: sibling bead at claim time. The dispatcher
 # drives ITS OWN gate-run: bead but never drives the sibling to terminal (ga-tmug
@@ -230,9 +234,10 @@ supersede_sibling_runs() {
     if [ "$sibling_marker" = "$this_marker" ] || \
        { [ -n "$bead_id" ] && echo "$sibling_desc" | grep -q "source_bead: $bead_id"; }; then
       log "  Superseding sibling gate-run $sibling_id (marker=$sibling_marker, branch=$branch)"
-      bd -C "$GC_CITY" label remove "$sibling_id" "gate-status:running"    -q 2>/dev/null || true
-      bd -C "$GC_CITY" label add    "$sibling_id" "gate-status:superseded"  -q 2>/dev/null || true
+      set_gate_status "$sibling_id" "superseded"
       bd -C "$GC_CITY" comment "$sibling_id" "Dispatcher: gate-run superseded proactively on terminal path (marker $this_marker reached terminal; branch $branch). No need to wait for 90m TTL fallback. (ga-tmug Vector B)" 2>/dev/null || true
+      # ga-jhyu: CLOSE at terminal so wisp-compact reaps it (was relabel-only → OPEN forever).
+      bd -C "$GC_CITY" close "$sibling_id" -r "gate-run superseded (terminal) — marker $this_marker reached terminal. Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
     fi
   done
 }
@@ -259,14 +264,14 @@ DISPATCHING_JSON=$(bd -C "$GC_CITY" list --json --all \
   -l type:quality-gate-marker \
   -l gate-status:dispatching \
   2>/dev/null || echo "[]")
-DISPATCHING_COUNT=$(echo "$DISPATCHING_JSON" | jq 'length' 2>/dev/null || echo "0")
+DISPATCHING_COUNT=$(printf '%s\n' "$DISPATCHING_JSON" | jq 'length' 2>/dev/null || echo "0")
 
 if [ "$DISPATCHING_COUNT" -gt 0 ]; then
   NOW_EPOCH_D=$(date +%s)
   for di in $(seq 0 $((DISPATCHING_COUNT - 1))); do
-    D_MARKER=$(echo "$DISPATCHING_JSON" | jq ".[$di]")
-    D_ID=$(echo "$D_MARKER" | jq -r '.id')
-    D_UPDATED=$(echo "$D_MARKER" | jq -r '.updated_at // .created_at // ""')
+    D_MARKER=$(printf '%s\n' "$DISPATCHING_JSON" | jq ".[$di]")
+    D_ID=$(printf '%s\n' "$D_MARKER" | jq -r '.id')
+    D_UPDATED=$(printf '%s\n' "$D_MARKER" | jq -r '.updated_at // .created_at // ""')
     if [ -z "$D_UPDATED" ]; then continue; fi
     # updated_at/created_at is UTC ("...Z"). Parse the BSD branch with -u so the
     # epoch is absolute and matches `date +%s`; without -u, macOS `date -j -f`
@@ -359,7 +364,7 @@ MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all \
   -l gate-status:queued \
   2>/dev/null || echo "[]")
 
-COUNT=$(echo "$MARKERS_JSON" | jq 'length' 2>/dev/null || echo "0")
+COUNT=$(printf '%s\n' "$MARKERS_JSON" | jq 'length' 2>/dev/null || echo "0")
 log "Found $COUNT queued marker(s)"
 
 if [ "$COUNT" = "0" ]; then
@@ -372,9 +377,9 @@ fi
 # throughput, older markers (e.g. iz4a96/ga-mr8ym, + 2-day-old pddg18/pqzl9h)
 # starved indefinitely as newer ones jumped the line. sort_by(created_at) drains
 # the queue in arrival order. (Throughput / parallel dispatch = Phase 2, separate.)
-MARKER=$(echo "$MARKERS_JSON" | jq 'sort_by(.created_at) | .[0]')
-MARKER_ID=$(echo "$MARKER" | jq -r '.id')
-DESC=$(echo "$MARKER" | jq -r '.description // ""')
+MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq 'sort_by(.created_at) | .[0]')
+MARKER_ID=$(printf '%s\n' "$MARKER" | jq -r '.id')
+DESC=$(printf '%s\n' "$MARKER" | jq -r '.description // ""')
 
 log "Attempting to claim marker $MARKER_ID ..."
 
@@ -633,9 +638,10 @@ fi
 
 if [ "$ALREADY_MERGED" = "1" ]; then
   log "Branch $BRANCH is already merged into $DEFAULT_BRANCH — superseding marker $MARKER_ID."
-  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching"  -q 2>/dev/null || true
-  bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:superseded"   -q 2>/dev/null || true
+  set_gate_status "$MARKER_ID" "superseded"
   bd -C "$GC_CITY" comment "$MARKER_ID" "Branch $BRANCH is already merged into $DEFAULT_BRANCH (SHA $BRANCH_SHA is ancestor of main). Gate skipped — no reviewers needed." 2>/dev/null || true
+  # ga-jhyu: CLOSE the marker at terminal (superseded) so it is reaped, not left OPEN.
+  bd -C "$GC_CITY" close "$MARKER_ID" -r "Gate marker terminal: SUPERSEDED (branch $BRANCH already merged to $DEFAULT_BRANCH). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
 
   # Also close the source bead cleanly if open
   if [ -n "$BEAD_ID" ]; then
@@ -1797,13 +1803,17 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
 
   if [ "$OVERALL_VERDICT" = "PASS" ]; then
     # Update markers and beads for success
-    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:passed"      -q 2>/dev/null || true
+    set_gate_status "$MARKER_ID" "passed"
+    # ga-jhyu: CLOSE the marker at terminal (passed) so it is reaped, not left
+    # OPEN forever. Safe — no open-marker consumer scans gate-status:passed
+    # (gate-health-monitor.py only scans gate-status:error). Idempotent.
+    bd -C "$GC_CITY" close "$MARKER_ID" -r "Gate marker terminal: PASSED (branch $BRANCH merged sha=$MERGE_SHA). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
 
     if [ "$GATE_RUN_ID" != "unknown" ]; then
-      bd -C "$GC_CITY" label remove "$GATE_RUN_ID" "gate-status:running" -q 2>/dev/null || true
-      bd -C "$GC_CITY" label add    "$GATE_RUN_ID" "gate-status:passed"  -q 2>/dev/null || true
+      set_gate_status "$GATE_RUN_ID" "passed"
       bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate PASSED. Branch $BRANCH merged to $DEFAULT_BRANCH. SHA=$MERGE_SHA. Tier=$TIER. Reviewers=$REQUIRED_REVIEWERS. Elapsed=${ELAPSED_S}s. mode=${MERGE_RESULT}." 2>/dev/null || true
+      # ga-jhyu: CLOSE the gate-run at terminal so wisp-compact reaps it.
+      bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run terminal: PASSED (branch $BRANCH sha=$MERGE_SHA). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
     fi
 
     # ── ga-esbg: DRIVE THE SOURCE BEAD TO ITS TERMINAL/HANDOFF STATE ──────────
@@ -1935,12 +1945,14 @@ else
   # ── FAIL path ─────────────────────────────────────────────────────────────
   log "Gate FAILED: $FAIL_REASONS"
 
-  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
-  bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:failed"      -q 2>/dev/null || true
+  set_gate_status "$MARKER_ID" "failed"
+  # ga-jhyu: CLOSE the marker at terminal (failed) so it is reaped. A FAIL is
+  # terminal for THIS gate attempt — re-running /gate-done mints a fresh marker.
+  # Safe: no open-marker consumer scans gate-status:failed. Idempotent.
+  bd -C "$GC_CITY" close "$MARKER_ID" -r "Gate marker terminal: FAILED (branch $BRANCH). Re-gate mints a new marker. Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
 
   if [ "$GATE_RUN_ID" != "unknown" ]; then
-    bd -C "$GC_CITY" label remove "$GATE_RUN_ID" "gate-status:running" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$GATE_RUN_ID" "gate-status:failed"  -q 2>/dev/null || true
+    set_gate_status "$GATE_RUN_ID" "failed"
     bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate FAILED.
 Branch: $BRANCH
 Tier: $TIER  Reviewers required: $REQUIRED_REVIEWERS
@@ -1948,6 +1960,8 @@ Elapsed: ${ELAPSED_S}s
 
 Blocking reasons:
 $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
+    # ga-jhyu: CLOSE the gate-run at terminal so wisp-compact reaps it.
+    bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run terminal: FAILED (branch $BRANCH). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
   fi
 
   # Notify the author (not the Mayor) via nudge

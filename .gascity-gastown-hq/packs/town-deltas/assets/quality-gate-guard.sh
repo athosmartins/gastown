@@ -86,6 +86,27 @@ reconcile_gaterun_action() {
   echo "abort:age"
 }
 
+# ── set_gate_status <bead_id> <new_status> ─────────────────────────────────
+# Atomic-effect gate-status transition: leave EXACTLY ONE gate-status:* label on
+# the bead. The legacy `label remove <known>; label add <new>` pattern is
+# non-atomic and, when the prior status is unknown or already dual, leaks two
+# gate-status labels (observed live: done+failed, passed+superseded — ga-jhyu).
+# This strips EVERY gate-status:* currently present, then adds the single target.
+# I/O helper (not a pure fn) but defined here in the lib region so the selftest
+# can source + unit-test it with a mock bd. Kept BYTE-IDENTICAL with the
+# dispatcher's copy (drift-guarded by quality-gate-reconcile.selftest.sh).
+set_gate_status() {
+  local _id="$1" _new="$2" _cur _lbl
+  [ -z "$_id" ] && return 0
+  _cur=$(bd -C "$GC_CITY" show "$_id" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]? | select(startswith("gate-status:"))' 2>/dev/null || true)
+  for _lbl in $_cur; do
+    [ "$_lbl" = "gate-status:$_new" ] && continue
+    bd -C "$GC_CITY" label remove "$_id" "$_lbl" -q 2>/dev/null || true
+  done
+  bd -C "$GC_CITY" label add "$_id" "gate-status:$_new" -q 2>/dev/null || true
+}
+
 # classify_inflight_gap1 <status> <has_gate_passed> <has_live_assignee> <branch_merged>
 # Pure decision for ga-pa36 GAP-1: OPEN story:in-flight bead whose fix branch
 # was already merged to origin/main but has no gate:passed label.
@@ -238,9 +259,11 @@ if [ "$TRANSIENT_COUNT" -gt 0 ]; then
         ;;
       error)
         warn "Vector A: exhausted reclaims for $T_ID (count=${T_COUNT} >= MAX_RECLAIMS=${MAX_RECLAIMS})"
-        bd -C "$GC_CITY" label remove "$T_ID" "gate-status:dispatching" -q 2>/dev/null || true
-        bd -C "$GC_CITY" label remove "$T_ID" "gate-status:claimed"     -q 2>/dev/null || true
-        bd -C "$GC_CITY" label add    "$T_ID" "gate-status:error"       -q 2>/dev/null || true
+        set_gate_status "$T_ID" "error"
+        # ga-jhyu: do NOT close on error. gate-health-monitor.py pages a human on
+        # OPEN markers stuck in gate-status:error >10min (ga-piscg). Closing here
+        # would make that escalation blind. The marker is reaped after a human
+        # resolves it (which closes it), not at the error transition.
         bd -C "$GC_CITY" comment "$T_ID" "Vector A (ga-tmug): marker exhausted ${MAX_RECLAIMS} reclaim attempts stuck in gate-status:${T_STATUS}. Marking gate-status:error — human/Mayor intervention required." 2>/dev/null || true
         ;;
       skip)
@@ -303,15 +326,17 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
     case "$ACTION" in
       supersede:marker)
         warn "Vector B: superseding orphan gate-run $GR_ID (age=${GR_AGE}m, marker $COMPANION_MARKER_ID is terminal/gone)"
-        bd -C "$GC_CITY" label remove "$GR_ID" "gate-status:running"    -q 2>/dev/null || true
-        bd -C "$GC_CITY" label add    "$GR_ID" "gate-status:superseded"  -q 2>/dev/null || true
+        set_gate_status "$GR_ID" "superseded"
         bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-tmug): orphan gate-run superseded — companion marker $COMPANION_MARKER_ID is terminal/gone; run is no longer active. Self-healed by guard." 2>/dev/null || true
+        # ga-jhyu: CLOSE at terminal so wisp-compact reaps it (was relabel-only → OPEN forever).
+        bd -C "$GC_CITY" close "$GR_ID" -r "gate-run superseded (terminal) — companion marker $COMPANION_MARKER_ID terminal/gone. Closed by guard (ga-jhyu)." 2>/dev/null || true
         ;;
       abort:age)
         warn "Vector B: aborting gate-run $GR_ID by TTL fallback (age=${GR_AGE}m > ${GATE_RUN_TTL_MINUTES}m, marker_active=${MARKER_ACTIVE})"
-        bd -C "$GC_CITY" label remove "$GR_ID" "gate-status:running"  -q 2>/dev/null || true
-        bd -C "$GC_CITY" label add    "$GR_ID" "gate-status:aborted"  -q 2>/dev/null || true
+        set_gate_status "$GR_ID" "aborted"
         bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-tmug): gate-run aborted by guard TTL fallback (age=${GR_AGE}m > ${GATE_RUN_TTL_MINUTES}m; marker $COMPANION_MARKER_ID still active but run exceeded max wait)." 2>/dev/null || true
+        # ga-jhyu: CLOSE at terminal so wisp-compact reaps it.
+        bd -C "$GC_CITY" close "$GR_ID" -r "gate-run aborted (terminal) by TTL fallback (age=${GR_AGE}m > ${GATE_RUN_TTL_MINUTES}m). Closed by guard (ga-jhyu)." 2>/dev/null || true
         ;;
       skip)
         log "  Gate-run $GR_ID active (age=${GR_AGE}m, marker_active=${MARKER_ACTIVE}) — skipping."
@@ -578,7 +603,7 @@ MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all \
   -l gate-status:ready \
   2>/dev/null || echo "[]")
 
-COUNT=$(echo "$MARKERS_JSON" | jq 'length' 2>/dev/null || echo "0")
+COUNT=$(printf '%s\n' "$MARKERS_JSON" | jq 'length' 2>/dev/null || echo "0")
 log "Found $COUNT unclaimed marker(s)"
 
 if [ "$COUNT" = "0" ]; then
@@ -591,8 +616,8 @@ fi
 # (race), the remove will report nothing changed and the re-fetch below will
 # confirm the claim is ours or not.
 
-MARKER=$(echo "$MARKERS_JSON" | jq '.[0]')
-MARKER_ID=$(echo "$MARKER" | jq -r '.id')
+MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq '.[0]')
+MARKER_ID=$(printf '%s\n' "$MARKER" | jq -r '.id')
 
 log "Attempting to claim marker $MARKER_ID ..."
 
@@ -624,7 +649,7 @@ log "Marker $MARKER_ID claimed."
 
 # ── Step 3: Extract metadata from marker description ─────────────────────────
 
-DESC=$(echo "$MARKER" | jq -r '.description // ""')
+DESC=$(printf '%s\n' "$MARKER" | jq -r '.description // ""')
 
 extract() {
   echo "$DESC" | grep -E "^$1:" | head -1 | sed "s/^$1: *//"
@@ -666,8 +691,9 @@ if [ -n "$RIG" ] && ! validate_rig "$RIG"; then
 fi
 
 if [ "$VALIDATION_OK" = "false" ]; then
-  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:claimed" -q 2>/dev/null || true
-  bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"   -q 2>/dev/null || true
+  # ga-jhyu: atomic single-label transition; do NOT close (gate-health-monitor.py
+  # pages a human on OPEN gate-status:error markers — see Vector A note).
+  set_gate_status "$MARKER_ID" "error"
   # Bug 3 fix: no Mayor mail — autonomous gate; author gets nudge if resolvable
   if [ -n "$BEAD_ID" ]; then
     bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: invalid/unsafe field values.

@@ -113,8 +113,10 @@ grep -q 'gate-status:claimed'                "$GUARD" && ok "guard reclaims clai
 grep -q 'gate-reclaim-count:'                "$GUARD" && ok "guard tracks reclaim-count (thrash cap)"    || bad "guard missing reclaim-count label"
 grep -q 'MAX_RECLAIMS'                       "$GUARD" && ok "guard caps re-queues (MAX_RECLAIMS)"        || bad "guard missing MAX_RECLAIMS"
 # Vector B: supersede orphans by marker state + keep the age fallback.
-grep -q 'gate-status:superseded'             "$GUARD" && ok "guard supersedes orphan gate-runs"          || bad "guard missing gate-status:superseded"
-grep -q 'gate-status:aborted'                "$GUARD" && ok "guard keeps age-TTL abort fallback"         || bad "guard missing gate-status:aborted"
+# (ga-jhyu: terminal transitions now flow through set_gate_status, which emits
+#  the gate-status:superseded/aborted label at runtime — assert the call sites.)
+grep -q 'set_gate_status "$GR_ID" "superseded"' "$GUARD" && ok "guard supersedes orphan gate-runs (via set_gate_status)" || bad "guard missing set_gate_status superseded"
+grep -q 'set_gate_status "$GR_ID" "aborted"'    "$GUARD" && ok "guard keeps age-TTL abort fallback (via set_gate_status)" || bad "guard missing set_gate_status aborted"
 grep -q 'marker_id'                          "$GUARD" && ok "guard keys gate-run cleanup on marker_id"   || bad "guard missing marker_id linkage"
 grep -q 'date -j -u -f'                      "$GUARD" && ok "guard parses bead timestamps as UTC (-u)"   || bad "guard missing -u (TZ bug regressed)"
 # Dispatcher Step 0a (D_EPOCH) + reviewer janitor (R_EPOCH) must ALL parse UTC.
@@ -134,7 +136,7 @@ echo "── 4. drift-guard: dispatcher proactive sibling supersede ──"
 grep -q 'supersede_sibling_runs()'           "$DISPATCHER" && ok "dispatcher defines supersede_sibling_runs"        || bad "dispatcher missing supersede_sibling_runs def"
 eq "dispatcher calls it on BOTH terminal paths (PASS+FAIL)" \
    "$(grep -c 'supersede_sibling_runs "' "$DISPATCHER")" "2"
-grep -q 'gate-status:superseded'             "$DISPATCHER" && ok "dispatcher supersedes (not deletes) siblings"     || bad "dispatcher missing gate-status:superseded"
+grep -q 'set_gate_status "$sibling_id" "superseded"' "$DISPATCHER" && ok "dispatcher supersedes (not deletes) siblings (via set_gate_status)" || bad "dispatcher missing set_gate_status sibling supersede"
 
 # ── 5. classify_inflight_gap1 (ga-pa36 GAP-1: merged-but-OPEN beads) ─────────
 # Signature: classify_inflight_gap1 <status> <has_gate_passed> <has_live_assignee> <branch_merged>
@@ -182,6 +184,70 @@ grep -q 'merge-base --is-ancestor'  "$GUARD" && ok "guard uses merge-base for br
 ! grep -q '| contains(\.' "$GUARD" \
   && ok "live-builder checks use exact match (no substring contains)" \
   || bad "live-builder check still uses substring contains — must use exact match"
+
+echo ""
+# ── 8. ga-jhyu: terminal gate beads are CLOSED (not just relabeled), and
+#       set_gate_status leaves EXACTLY ONE gate-status:* label ────────────────
+# Bug ga-jhyu: terminal transitions relabeled markers/gate-runs (passed/failed/
+# superseded/aborted) but NEVER `bd close`d them — 55+ beads stranded OPEN, then
+# promoted to persistent by wisp-compact. Fix (A): close at every terminal site.
+# Fix (D): a single set_gate_status() that strips ALL gate-status:* then adds one
+# (the legacy remove-then-add leaked dual labels: passed+superseded, done+failed).
+echo "── 8. ga-jhyu: close-at-terminal + atomic set_gate_status ──"
+
+# (D) Single source of truth: guard defines set_gate_status; dispatcher inherits
+#     it via the guard lib source (same DRY contract as parse_marker_id). No
+#     second copy in the dispatcher → impossible to drift.
+grep -q 'set_gate_status()'                  "$GUARD"      && ok "guard defines set_gate_status (canonical)"        || bad "guard missing set_gate_status def"
+! grep -q '^set_gate_status() {'             "$DISPATCHER" && ok "dispatcher does NOT redefine set_gate_status (DRY, sourced from guard)" || bad "dispatcher redefines set_gate_status — drift risk"
+grep -qE 'startswith\("gate-status:"\)'      "$GUARD"      && ok "set_gate_status strips ALL gate-status:* (atomic)"  || bad "set_gate_status not stripping all gate-status:* labels"
+
+# (A) Every terminal transition is followed by a bd close on the SAME id.
+grep -q 'close "$MARKER_ID" -r "Gate marker terminal: PASSED'      "$DISPATCHER" && ok "PASS closes the marker"            || bad "PASS path does not close the marker"
+grep -q 'close "$GATE_RUN_ID" -r "gate-run terminal: PASSED'       "$DISPATCHER" && ok "PASS closes the gate-run"           || bad "PASS path does not close the gate-run"
+grep -q 'close "$MARKER_ID" -r "Gate marker terminal: FAILED'     "$DISPATCHER" && ok "FAIL closes the marker"            || bad "FAIL path does not close the marker"
+grep -q 'close "$GATE_RUN_ID" -r "gate-run terminal: FAILED'      "$DISPATCHER" && ok "FAIL closes the gate-run"          || bad "FAIL path does not close the gate-run"
+grep -q 'close "$MARKER_ID" -r "Gate marker terminal: SUPERSEDED' "$DISPATCHER" && ok "already-merged closes the marker"  || bad "already-merged path does not close the marker"
+grep -q 'close "$sibling_id"'                "$DISPATCHER" && ok "supersede_sibling_runs closes the sibling gate-run"     || bad "sibling supersede does not close the gate-run"
+[ "$(grep -c 'close "$GR_ID"' "$GUARD")" -ge 2 ] && ok "guard Vector B closes superseded+aborted gate-runs" || bad "guard Vector B does not close terminal gate-runs (need >=2)"
+
+# (A-invariant) gate-status:error is terminal-FAILED but must stay OPEN so
+# gate-health-monitor.py can page a human (ga-piscg). Closing it would blind the
+# escalation — assert NO close follows the error transitions.
+! grep -A2 'set_gate_status "$T_ID" "error"'     "$GUARD" | grep -q 'close "$T_ID"'     && ok "Vector A error marker NOT closed (gate-health-monitor invariant)"    || bad "Vector A error marker is closed — breaks human paging (ga-piscg)"
+! grep -A2 'set_gate_status "$MARKER_ID" "error"' "$GUARD" | grep -q 'close "$MARKER_ID"' && ok "validation-error marker NOT closed (gate-health-monitor invariant)" || bad "validation-error marker is closed — breaks human paging (ga-piscg)"
+
+# (D-unit) EXERCISE set_gate_status with a mock bd: a bead carrying TWO leaked
+# gate-status labels must end with exactly ONE (the target), non-gate labels kept.
+echo "── 8b. set_gate_status unit-test (mock bd, real fn from guard) ──"
+# Run inline (NOT a subshell) so ok/bad update the real PASS/FAIL counters. This
+# is the last section; the mock bd is unset immediately after.
+GC_CITY=/tmp/ga-jhyu-fake-city
+_MOCK_LABELS="gate-status:running gate-status:dispatching other:keepme"
+bd() {
+  local verb="$3"
+  if [ "$verb" = "show" ]; then
+    local arr="" l
+    for l in $_MOCK_LABELS; do arr="${arr}\"$l\","; done
+    printf '[{"labels":[%s]}]' "${arr%,}"
+    return 0
+  fi
+  if [ "$verb" = "label" ]; then
+    local op="$4" lbl="$6"
+    case "$op" in
+      remove) _MOCK_LABELS=$(printf '%s\n' $_MOCK_LABELS | grep -vx "$lbl" | tr '\n' ' ' || true) ;;
+      add)    printf '%s\n' $_MOCK_LABELS | grep -qx "$lbl" || _MOCK_LABELS="$_MOCK_LABELS $lbl" ;;
+    esac
+    return 0
+  fi
+  return 0
+}
+set_gate_status fake-bead passed
+_n=$(printf '%s\n' $_MOCK_LABELS | grep -c '^gate-status:' || true)
+eq "exactly ONE gate-status:* label after transition" "$_n" "1"
+printf '%s\n' $_MOCK_LABELS | grep -qx 'gate-status:passed' && ok "surviving gate-status label is the target (passed)" || bad "target label gate-status:passed missing after transition"
+printf '%s\n' $_MOCK_LABELS | grep -qx 'other:keepme'       && ok "non-gate-status labels left untouched"            || bad "set_gate_status clobbered a non-gate-status label"
+unset -f bd
 
 echo ""
 echo "──────────────────────────────────────────"
