@@ -47,6 +47,15 @@ fi
 # Poll interval (seconds) when waiting for verdicts.
 VERDICT_POLL_INTERVAL="${VERDICT_POLL_INTERVAL:-30}"
 
+# ── ga-zl277: orphaned gate-reviewer session TTL ──────────────────────────────
+# A gate-reviewer session older than this cannot belong to any live run: a live
+# dispatcher closes its reviewers in Step 9, and the verdict poll itself caps a
+# run at VERDICT_TIMEOUT_MINUTES. The startup janitor (Step 0a-2) reaps asleep
+# gate-reviewer sessions older than this so SIGKILL/OOM-orphaned reviewers cannot
+# fill the gate-reviewer template's max_active_sessions=6 budget. TTL = verdict
+# timeout + margin (slack over the longest a live run can hold a session open).
+REVIEWER_SESSION_TTL_MINUTES="${REVIEWER_SESSION_TTL_MINUTES:-$((VERDICT_TIMEOUT_MINUTES + 20))}"
+
 # Dry-run mode: skip actual git merge+push.
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -163,6 +172,70 @@ if [ "$DISPATCHING_COUNT" -gt 0 ]; then
       bd -C "$GC_CITY" comment "$D_ID" "Dispatcher TTL recovery: marker was stuck in gate-status:dispatching for ${D_AGE_MINUTES}m (> ${DISPATCHING_TTL_MINUTES}m TTL). Dispatcher process died mid-run. Re-queuing for re-processing." 2>/dev/null || true
     fi
   done
+fi
+
+# ── Step 0a-2 (ga-zl277): reap orphaned gate-reviewer sessions ────────────────
+# Backstop for the EXIT trap below: a dispatcher killed by SIGKILL/OOM/launchd
+# timeout cannot run any trap, so its already-spawned reviewer sessions stay
+# ASLEEP and never get closed. They consume the gate-reviewer template's
+# max_active_sessions=6 budget; once full, runs spawn fewer than 3 reviewers and
+# fail too — the ga-zl277 vicious cycle. Each sweep we close any gate-reviewer
+# session that is NON-active, NON-attached, and older than the TTL.
+#
+# SAFE UNDER CONCURRENCY: launchd fires this dispatcher every ~2 min while a run
+# can hold reviewers open for up to VERDICT_TIMEOUT_MINUTES, so sibling runs DO
+# overlap. A live run closes its reviewers in Step 9 (before the merge) and the
+# verdict poll caps the run at VERDICT_TIMEOUT_MINUTES, so any gate-reviewer
+# older than verdict-timeout+margin cannot belong to a live sibling. We never
+# touch an active or attached session.
+#
+# Pure decision (no IO, set -e safe) — mirrored + drift-guarded by
+# gate-reviewer-orphan-reap.selftest.sh. echo "reap" iff the session is a
+# NON-active, NON-attached gate-reviewer older than the TTL, else "keep".
+reviewer_session_should_reap() {
+  local state="$1" attached="$2" age="$3" ttl="$4"
+  case "$age" in ''|*[!0-9]*) echo "keep"; return 0 ;; esac
+  case "$ttl" in ''|*[!0-9]*) echo "keep"; return 0 ;; esac
+  [ "$attached" = "true" ] && { echo "keep"; return 0; }
+  [ "$state" = "active" ]  && { echo "keep"; return 0; }
+  if [ "$age" -gt "$ttl" ]; then echo "reap"; else echo "keep"; fi
+}
+
+REVIEWER_SESSIONS_RAW=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo '{}')
+REVIEWER_SESSIONS_JSON=$(echo "$REVIEWER_SESSIONS_RAW" \
+  | jq -c '[.sessions[]? | select(.template=="gate-reviewer")]' 2>/dev/null || echo "[]")
+REVIEWER_SESSION_COUNT=$(echo "$REVIEWER_SESSIONS_JSON" | jq 'length' 2>/dev/null || echo "0")
+case "$REVIEWER_SESSION_COUNT" in ''|*[!0-9]*) REVIEWER_SESSION_COUNT=0 ;; esac
+
+if [ "$REVIEWER_SESSION_COUNT" -gt 0 ]; then
+  NOW_EPOCH_R=$(date +%s)
+  REAPED_REVIEWERS=0
+  for ri in $(seq 0 $((REVIEWER_SESSION_COUNT - 1))); do
+    R_SESSION=$(echo "$REVIEWER_SESSIONS_JSON" | jq -c ".[$ri]" 2>/dev/null || echo "{}")
+    R_ID=$(echo "$R_SESSION" | jq -r '.id // empty' 2>/dev/null || echo "")
+    R_STATE=$(echo "$R_SESSION" | jq -r '.state // ""' 2>/dev/null || echo "")
+    R_ATTACHED=$(echo "$R_SESSION" | jq -r '.attached // false' 2>/dev/null || echo "false")
+    R_CREATED=$(echo "$R_SESSION" | jq -r '.created_at // ""' 2>/dev/null || echo "")
+    [ -z "$R_ID" ] && continue
+    [ -z "$R_CREATED" ] && continue
+    # created_at is UTC ("...Z"). Parse the BSD branch with -u so the epoch is
+    # absolute and matches `date +%s`; without -u, macOS `date -j -f` reads the
+    # naive timestamp as LOCAL time and ages come out skewed by the UTC offset
+    # (negative under UTC-3). GNU `date -d` keeps the trailing Z and is already
+    # UTC-correct.
+    R_EPOCH=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${R_CREATED%%Z*}" "+%s" 2>/dev/null \
+      || date -d "$R_CREATED" +%s 2>/dev/null || echo "0")
+    [ "$R_EPOCH" = "0" ] && continue
+    R_AGE_MINUTES=$(( (NOW_EPOCH_R - R_EPOCH) / 60 ))
+    if [ "$(reviewer_session_should_reap "$R_STATE" "$R_ATTACHED" "$R_AGE_MINUTES" "$REVIEWER_SESSION_TTL_MINUTES")" = "reap" ]; then
+      warn "Reaping orphaned gate-reviewer session $R_ID (state=$R_STATE attached=$R_ATTACHED age=${R_AGE_MINUTES}m > TTL=${REVIEWER_SESSION_TTL_MINUTES}m — frees cap slot; ga-zl277)"
+      gc --city "$GC_CITY" session close "$R_ID" 2>/dev/null || true
+      REAPED_REVIEWERS=$((REAPED_REVIEWERS + 1))
+    fi
+  done
+  if [ "$REAPED_REVIEWERS" -gt 0 ]; then
+    log "Reaped $REAPED_REVIEWERS orphaned gate-reviewer session(s) this sweep (ga-zl277)."
+  fi
 fi
 
 # ── Step 0b: Find a queued marker ────────────────────────────────────────────
@@ -809,6 +882,32 @@ REVIEW_TASKS=()
 REVIEWER_PEEK_BASELINE=()
 REVIEWER_ACKED=()
 
+# ── ga-zl277: guaranteed reviewer-session cleanup on EVERY exit path ───────────
+# Reviewer sessions used to be closed ONLY at Step 9 (the success/timeout path).
+# A mid-loop spawn-abort (the `exit 1` in the spawn loop below) or any signal/
+# timeout kill of the dispatcher left already-spawned reviewer sessions ASLEEP
+# and never closed. They pile up against the gate-reviewer template's
+# max_active_sessions=6 budget until the gate can no longer spawn 3 reviewers
+# (vicious cycle). This EXIT/signal trap closes whatever is in SESSION_IDS
+# exactly once, from one place, so every abort path frees its cap slots.
+# (SIGKILL/OOM cannot be trapped — the Step 0a-2 startup janitor backstops those.)
+_gate_cleanup_done=0
+cleanup_reviewer_sessions() {
+  [ "$_gate_cleanup_done" = "1" ] && return 0
+  _gate_cleanup_done=1
+  if [ "${#SESSION_IDS[@]}" -gt 0 ]; then
+    for _SID in "${SESSION_IDS[@]}"; do
+      [ -z "$_SID" ] && continue
+      gc --city "$GC_CITY" session close "$_SID" 2>/dev/null || true
+    done
+    log "Reviewer sessions closed (cleanup): ${SESSION_IDS[*]}"
+  fi
+}
+trap cleanup_reviewer_sessions EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
+
 log "Spawning $REQUIRED_REVIEWERS independent reviewer session(s) ..."
 
 for i in $(seq 1 $REQUIRED_REVIEWERS); do
@@ -1158,10 +1257,11 @@ done
 log "Verdict collection complete: OVERALL=$OVERALL_VERDICT"
 
 # ── Step 9: Close reviewer sessions ──────────────────────────────────────────
-for SID in "${SESSION_IDS[@]}"; do
-  gc --city "$GC_CITY" session close "$SID" 2>/dev/null || true
-done
-log "Reviewer sessions closed."
+# Close promptly here (before the Step 10 merge) to free the gate-reviewer cap
+# slots ASAP. The EXIT trap (ga-zl277) is the safety net for every abort path
+# that never reaches this line; the shared idempotent helper makes the trap a
+# no-op once this has run.
+cleanup_reviewer_sessions
 
 # ── Step 10: Act on verdict ───────────────────────────────────────────────────
 
