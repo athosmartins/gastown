@@ -400,6 +400,30 @@ else
   ok "left pilot:dispatching ON for TTL recovery (no premature release)"
 fi
 
+# ── Scenario 6: source bead never carries dog routing (ga-ms1jm) ──────────────
+# Double-dispatch regression: an older dispatcher slung the SOURCE bead by id,
+# stamping gc.routed_to=<dog-pool> onto it. While story:in-flight (open +
+# unassigned) the dog pool's engine ready-query — which does NOT exclude
+# story:in-flight — re-claimed it, spawning a second builder on already-fixed
+# work and pinning dog slots. ga-zzrts hardened the PILOT side (won't
+# re-dispatch); this guards the DOG side: the dispatcher slings a SEPARATE task
+# bead by title and defensively unsets gc.routed_to on the source bead at the
+# dispatch transition. Structural assertions (grep the real dispatcher source —
+# no live Dolt needed):
+echo "Scenario 6: source bead never carries gc.routed_to (ga-ms1jm double-dispatch)"
+
+if grep -q -- '--unset-metadata gc.routed_to' "$DISPATCHER"; then
+  ok "transition defensively unsets gc.routed_to on the source bead"
+else
+  bad "REGRESSION: source bead not stripped of gc.routed_to (--unset-metadata missing)"
+fi
+
+if grep -qE 'sling[[:space:]]+"\$BUILDER_TARGET"[[:space:]]+"\$STORY_ID"' "$DISPATCHER"; then
+  bad "REGRESSION: dispatcher slings the SOURCE bead by id (would stamp gc.routed_to on it)"
+else
+  ok "dispatcher does not sling the source bead by id"
+fi
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

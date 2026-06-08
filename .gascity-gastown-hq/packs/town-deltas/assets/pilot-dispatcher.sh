@@ -923,6 +923,19 @@ TASK
     # them so a later re-dispatch (gate:needs-fix) starts from a clean slate.
     bd -C "$GC_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
 
+    # ga-ms1jm: a SOURCE bead must NEVER carry gc.routed_to. The builder is
+    # dispatched via the separate sling TASK bead created above — this source
+    # bead is selected only by the Pilot's own tier/label queries, never by
+    # routing. If any path (legacy sling-by-id, manual edit, future regression)
+    # leaves gc.routed_to=<dog-pool> on this now-in-flight source bead, the dog
+    # pool's engine ready-query (`bd ready --metadata-field gc.routed_to=...
+    # --unassigned`, which does NOT exclude story:in-flight) would re-claim it →
+    # double-dispatch, spawning a duplicate builder and pinning dog slots on
+    # already-fixed work. The ga-zzrts guards above stop the PILOT re-dispatching;
+    # this stops the DOG engine query re-claiming. Idempotent (no-op when absent);
+    # || true keeps set -euo pipefail safe.
+    bd -C "$GC_CITY" update "$STORY_ID" --unset-metadata gc.routed_to -q >/dev/null 2>&1 || true
+
     local DISPATCH_COMMENT
     if [ "$DISPATCH_TIER" = "bug" ]; then
       DISPATCH_COMMENT="Pilot dispatched builder '$BUILDER_TARGET' at $NOW (tier=bug/tech-debt, lane=$LANE, rig=$STORY_RIG).
