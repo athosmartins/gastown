@@ -71,6 +71,12 @@ PILOT_LOG="$GC_CITY/.gc/pilot-dispatcher.jsonl"
 MAX_SMALL="${MAX_SMALL:-5}"
 MAX_BIG="${MAX_BIG:-2}"
 
+# Max dispatch ATTEMPTS per lane per sweep before backing off. A single poison bead
+# (e.g. a title that breaks gc sling) must not starve its lane: the dispatcher
+# skips+continues to the next candidate (ga-jjh7w), but this bounds the work so a
+# pile of undispatchable beads can't spin the whole candidate list every sweep.
+MAX_DISPATCH_ATTEMPTS="${MAX_DISPATCH_ATTEMPTS:-12}"
+
 # Acceptance-criteria count threshold for auto-classifying a story as BIG.
 BIG_CRITERIA_THRESHOLD="${BIG_CRITERIA_THRESHOLD:-5}"
 
@@ -184,11 +190,22 @@ _filter_unblocked() {
   printf '%s' "$filtered"
 }
 
-# _top_candidate <json_array>
-# Prints the highest-priority candidate (P0>P1>P2, tie-break oldest).
-_top_candidate() {
-  local arr="$1"
-  printf '%s' "$arr" | jq 'sort_by([(.priority // 99), .created_at]) | .[0]' 2>/dev/null
+# _sort_lane <json_array>
+# Prints the FULL candidate list sorted by priority asc, then created_at asc.
+# Used by _dispatch_lane to walk candidates head-first, skipping ones that fail.
+_sort_lane() {
+  printf '%s' "$1" | jq 'sort_by([(.priority // 99), .created_at])' 2>/dev/null || echo "[]"
+}
+
+# _ascii_fold <str>
+# Strip non-ASCII bytes from a string. The sling TITLE is the only field handed to
+# `gc sling`, and the issues table rejects non-utf8mb4 bytes on insert
+# ("Incorrect string value: '\xC3' for column 'title'") — which silently jammed
+# all dispatch for 8h on an accented title (ga-jhyu/ga-jjh7w). The sling title is a
+# human-readable routing label only (the builder reads the real source bead by ID),
+# so dropping accents here is lossless in practice. Keeps printable ASCII + whitespace.
+_ascii_fold() {
+  LC_ALL=C printf '%s' "$1" | LC_ALL=C tr -cd '\11\12\15\40-\176'
 }
 
 # ── Dispatch sub-functions ────────────────────────────────────────────────────
@@ -535,6 +552,9 @@ FIXSEC
   else
     SLING_TITLE="build story $STORY_ID: $STORY_TITLE"
   fi
+  # Defensive: strip non-ASCII so an accented bead title can't trip gc sling's
+  # bead insert (ga-jjh7w). Title is a routing label only — builder uses the bead ID.
+  SLING_TITLE=$(_ascii_fold "$SLING_TITLE")
 
   DISPATCH_EPOCH=$(date +%s)
   _do_sling "$SLING_TITLE" || return 1
@@ -779,30 +799,58 @@ SMALL_COUNT=$(echo "$SMALL_CANDIDATES" | jq 'length' 2>/dev/null || echo "0")
 BIG_COUNT=$(echo "$BIG_CANDIDATES" | jq 'length' 2>/dev/null || echo "0")
 log "Candidates split: small=${SMALL_COUNT}  big=${BIG_COUNT}"
 
-SMALL_PICK="null"
-BIG_PICK="null"
+SMALL_SORTED=$(_sort_lane "$SMALL_CANDIDATES")
+BIG_SORTED=$(_sort_lane "$BIG_CANDIDATES")
 
-[ "$SMALL_SLOTS" -gt "0" ] && [ "$SMALL_COUNT" -gt "0" ] && \
-  SMALL_PICK=$(_top_candidate "$SMALL_CANDIDATES")
-[ "$BIG_SLOTS"   -gt "0" ] && [ "$BIG_COUNT"   -gt "0" ] && \
-  BIG_PICK=$(_top_candidate "$BIG_CANDIDATES")
+# "Lane picks" logs the HEAD candidate per lane (the first one considered). The
+# actual dispatched bead is logged by dispatch_one — they differ when the head fails
+# to dispatch and is skipped (ga-jjh7w).
+log "Lane picks — small: $(echo "$SMALL_SORTED" | jq -r '.[0].id // "none"')  big: $(echo "$BIG_SORTED" | jq -r '.[0].id // "none"')"
 
-log "Lane picks — small: $(echo "$SMALL_PICK" | jq -r '.id // "none"')  big: $(echo "$BIG_PICK" | jq -r '.id // "none"')"
+# ── Step 4: Dispatch into available lane slots (skip+continue past failures) ──
+# Per lane, walk candidates in priority order and dispatch the FIRST that succeeds.
+# A candidate whose dispatch FAILS (poison title that breaks gc sling, lost race,
+# builder mutex, phantom bead, …) is SKIPPED and the next candidate is tried — so one
+# bad head-of-line bead can no longer starve the whole lane (ga-jjh7w: an accented
+# title jammed all dispatch for 8h). Stops after the FIRST success per lane
+# (preserving the one-successful-dispatch-per-lane-per-sweep cadence), or after
+# MAX_DISPATCH_ATTEMPTS failed attempts (bounds wasted work on an all-poison lane).
 
-# ── Step 4: Dispatch into available lane slots ────────────────────────────────
+# _dispatch_lane <sorted_candidates_json> <lane> <tier> <slots>
+# Returns 0 if a candidate was dispatched, 1 if none were.
+_dispatch_lane() {
+  local cands="$1" lane="$2" tier="$3" slots="$4"
+  if [ "$slots" -le 0 ]; then return 1; fi
+  local n i=0 attempts=0 bead
+  n=$(printf '%s' "$cands" | jq 'length' 2>/dev/null || echo 0)
+  while [ "$i" -lt "$n" ]; do
+    bead=$(printf '%s' "$cands" | jq -c ".[$i]" 2>/dev/null || echo "null")
+    i=$((i + 1))
+    if [ -z "$bead" ] || [ "$bead" = "null" ]; then continue; fi
+    if dispatch_one "$bead" "$lane" "$tier"; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge "$MAX_DISPATCH_ATTEMPTS" ]; then
+      warn "Lane $lane: $attempts dispatch attempt(s) failed this sweep — backing off (poison beads or busy builder). Remaining candidates deferred to next sweep."
+      return 1
+    fi
+  done
+  return 1
+}
 
 DISPATCHED=0
 
-if [ "$SMALL_PICK" != "null" ] && [ "$SMALL_SLOTS" -gt "0" ]; then
-  dispatch_one "$SMALL_PICK" "small" "$ALL_CANDIDATES_TIER" && DISPATCHED=$((DISPATCHED + 1)) || true
+if _dispatch_lane "$SMALL_SORTED" "small" "$ALL_CANDIDATES_TIER" "$SMALL_SLOTS"; then
+  DISPATCHED=$((DISPATCHED + 1))
 fi
 
-if [ "$BIG_PICK" != "null" ] && [ "$BIG_SLOTS" -gt "0" ]; then
-  dispatch_one "$BIG_PICK" "big" "$ALL_CANDIDATES_TIER" && DISPATCHED=$((DISPATCHED + 1)) || true
+if _dispatch_lane "$BIG_SORTED" "big" "$ALL_CANDIDATES_TIER" "$BIG_SLOTS"; then
+  DISPATCHED=$((DISPATCHED + 1))
 fi
 
 if [ "$DISPATCHED" -eq "0" ]; then
-  log "No dispatches this sweep (lane slots may have been won by concurrent process)."
+  log "No dispatches this sweep (all candidates failed to dispatch, or slots won by a concurrent sweep)."
 fi
 
 log "=== Pilot sweep complete: dispatched=$DISPATCHED (small_slots=$SMALL_SLOTS big_slots=$BIG_SLOTS) ==="
