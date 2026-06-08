@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pilot in-flight bead zombie reclaim guard (ga-se62o, ga-7m191).
+"""Pilot in-flight bead zombie reclaim guard (ga-se62o, ga-7m191, ga-vw26y).
 
 Detects beads stranded in story:in-flight whose builder DIED / never engaged /
 got churned by a controller restart, and reclaims them so the Pilot can
@@ -14,8 +14,19 @@ invisible; (2) a bead reassigned to / parked under the always-live Mayor looked
 'owned by a healthy session' forever. Either lied about throughput on the
 Kanban.
 
+ga-vw26y (status blind spot): `bd list` defaults to OPEN-only status. That hid
+a whole stranding class — a story stuck in status:in_progress that lost its
+story:in-flight label. It was invisible to BOTH this guard's label query AND to
+the Pilot's open-only re-dispatch query, so it stranded forever (3 stories sat
+16-19h post-outage). Two changes close it: (1) the queries now explicitly
+include in_progress, and a scoped in_progress sweep (list_stranded_inprogress_
+beads) catches Pilot stories that lost story:in-flight but kept a durable Pilot
+marker (pilot:dispatched / pilot:reclaim-count); (2) do_reclaim now RESETS
+status to open, so a reclaimed bead is actually re-dispatchable (clearing the
+labels/assignee alone left it in_progress → still invisible to the Pilot).
+
 Poll loop (~5min). Silence = healthy. Emits on action only:
-  [INFLIGHT-RECLAIM] [RECLAIMED]   stripped story:in-flight + pilot:dispatched from <id>
+  [INFLIGHT-RECLAIM] [RECLAIMED]   cleared in-flight labels + reset <id> to open
   [INFLIGHT-RECLAIM] [RECLAIM-FAILED] label ops failed; bead may need manual cleanup
   [INFLIGHT-RECLAIM] [ESCALATED]   reclaim cap hit — needs human/Mayor review
   [INFLIGHT-RECLAIM] [STARTUP]     initial state snapshot
@@ -35,6 +46,10 @@ Safety invariants (CRITICAL — actuates on real work beads):
     Checks fix/<bead-id>* and feature/<bead-id>* in both HQ and WA repos.
   - NEVER reclaims beads with a gate-status:dispatching|queued|claimed marker
     (bead is actively being processed by the gate pipeline).
+  - ga-vw26y: the in_progress sweep is SCOPED to Pilot stories — a bead must
+    carry a durable Pilot marker (pilot:dispatched or pilot:reclaim-count) and
+    NO terminal/parked label (story:done, gate:passed, …) to qualify. Crew,
+    gate, and dog task beads carry no Pilot marker → never touched.
   - Thrash cap: after MAX_RECLAIMS (3) reclaims, escalation marks the bead
     gate:needs-human and RETAINS story:in-flight (ga-6ow4v) — it does NOT
     re-clear, which would loop the bead through dispatch↔reclaim forever. The
@@ -83,6 +98,27 @@ GATE_ACTIVE_LABELS = {
     "gate-status:queued",
     "gate-status:claimed",
 }
+
+# ga-vw26y: durable Pilot-story markers. The in_progress sweep keeps ONLY beads
+# carrying one of these (or a pilot:reclaim-count:N label — see
+# is_reclaimable_inprogress_story) so it can never touch a crew/gate/dog task
+# bead that merely happens to be in_progress. pilot:dispatched survives the
+# documented failure mode where story:in-flight is stripped (crash/race); the
+# Pilot stamps both on every dispatch.
+PILOT_STORY_MARKERS = ("pilot:dispatched", "story:in-flight")
+
+# ga-vw26y: terminal / deliberately-parked states. A bead carrying ANY of these
+# is NOT a reclaimable stranded story — it is done, merged, human-parked,
+# engine-queued, or has a claim already in progress. Mirrors the pilot-dispatcher's
+# own exclude set so the guard never resurrects completed or intentionally-held work.
+TERMINAL_PARKED_LABELS = frozenset({
+    "story:done",
+    "gate:passed",
+    "gate:superseded",
+    "gate:needs-human",
+    "needs:engine-window",
+    "pilot:dispatching",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -173,12 +209,18 @@ def list_inflight_beads():
     both-labels query could never see. The reclaim rails (no live builder + no
     recent branch + stranded past TTL) are what gate actuation, not the
     pilot:dispatched label.
+
+    ga-vw26y: the status filter is EXPLICIT (open,in_progress). `bd list`
+    defaults to open-only, so without this an in_progress story:in-flight bead
+    (dispatched, builder set in_progress, then died) was invisible to the guard
+    that is supposed to reclaim it.
     Returns list of bead dicts, or None on any error (fail-safe).
     """
     try:
         result = subprocess.run(
             ["bd", "list",
              "--label", "story:in-flight",
+             "--status", "open,in_progress",
              "--json"],
             capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
@@ -187,6 +229,62 @@ def list_inflight_beads():
         if not isinstance(data, list):
             return None
         return data
+    except Exception:
+        return None
+
+
+def is_reclaimable_inprogress_story(labels):
+    """Pure predicate: True if an in_progress bead is a Pilot story stranded
+    WITHOUT its story:in-flight label (the ga-vw26y blind spot), and is thus a
+    candidate for the in_progress sweep.
+
+    Requires a durable Pilot marker — pilot:dispatched, story:in-flight, or any
+    pilot:reclaim-count:N (the last proves the guard itself already touched this
+    bead, so it is unambiguously a Pilot story whose in-flight label was since
+    stripped). Rejects any bead carrying a terminal/parked label so completed or
+    intentionally-held work is never resurrected.
+
+    SCOPE-CRITICAL: this is the only thing standing between the in_progress
+    sweep and arbitrary in_progress work (crew, gate, dog task beads). Those
+    carry NO Pilot marker → this returns False → they are never actuated on.
+    """
+    has_marker = (
+        any(lbl in PILOT_STORY_MARKERS for lbl in labels)
+        or any(lbl.startswith("pilot:reclaim-count:") for lbl in labels)
+    )
+    if not has_marker:
+        return False
+    if any(lbl in TERMINAL_PARKED_LABELS for lbl in labels):
+        return False
+    return True
+
+
+def list_stranded_inprogress_beads():
+    """List in_progress Pilot stories stranded WITHOUT a story:in-flight label.
+
+    ga-vw26y: `bd list` defaults to open-only, so a story stuck in
+    status:in_progress that lost story:in-flight is invisible to BOTH
+    list_inflight_beads() AND the Pilot's open-only re-dispatch query — it
+    strands forever (3 stories sat 16-19h post-outage). This sweep scans
+    in_progress explicitly and keeps only Pilot-marked beads
+    (is_reclaimable_inprogress_story), so it never touches crew, gate, or dog
+    task beads. The reclaim rails (no live builder + no recent branch + stranded
+    past TTL) still gate every actuation.
+    Returns list of bead dicts, or None on any error (fail-safe).
+    """
+    try:
+        result = subprocess.run(
+            ["bd", "list",
+             "--status", "in_progress",
+             "--json"],
+            capture_output=True, text=True, timeout=20)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        data = json.loads(result.stdout)
+        if not isinstance(data, list):
+            return None
+        return [b for b in data
+                if is_reclaimable_inprogress_story(b.get("labels", []))]
     except Exception:
         return None
 
@@ -404,6 +502,20 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels):
         print(f"[INFLIGHT-RECLAIM] warn: clear assignee {bead_id}: {exc}", flush=True)
         # Non-fatal: Pilot can still re-dispatch without assignee being empty
 
+    # 2b. Reset status to open so the Pilot can actually re-dispatch (ga-vw26y).
+    #     bd list — and the Pilot's re-dispatch query — default to open-only. A
+    #     bead reclaimed but left in_progress is invisible to re-dispatch and
+    #     simply strands again (the exact loop this guard exists to break).
+    #     Idempotent: a harmless no-op on an already-open bead. Non-fatal: if it
+    #     fails, the labels/assignee are already cleared and the next cycle
+    #     re-finds the bead (still in_progress + pilot:reclaim-count) and retries.
+    try:
+        subprocess.run(
+            ["bd", "update", bead_id, "--status", "open"],
+            capture_output=True, text=True, timeout=15)
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] warn: reset status open {bead_id}: {exc}", flush=True)
+
     # 3. Bump reclaim count label (remove old, add new)
     if reclaim_count > 0:
         try:
@@ -421,15 +533,15 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels):
 
     # 4. Audit comment
     cleared = " + ".join(l for l in ("story:in-flight", "pilot:dispatched")
-                         if l in labels) or "story:in-flight"
+                         if l in labels) or "(no in-flight label)"
     try:
         subprocess.run(
             ["bd", "comment", bead_id,
              f"inflight-reclaim-guard (ga-se62o): reclaimed — no live builder and "
              f"no recent branch progress for {idle_min:.0f}min "
              f"(> {RECLAIM_TTL//60}min TTL). {cleared} "
-             f"cleared; assignee unset. Pilot will re-dispatch. "
-             f"(reclaim {new_count}/{MAX_RECLAIMS})"],
+             f"cleared; assignee unset; status reset to open (ga-vw26y). "
+             f"Pilot will re-dispatch. (reclaim {new_count}/{MAX_RECLAIMS})"],
             capture_output=True, text=True, timeout=15)
     except Exception:
         pass  # comment failure is non-fatal
@@ -491,6 +603,22 @@ def run_cycle(state, escalated_alerted):
     if beads is None:
         print("[INFLIGHT-RECLAIM] bd list failed — skipping cycle", flush=True)
         return 0, 0
+
+    # --- ga-vw26y: also sweep in_progress Pilot stories that lost story:in-flight
+    #     (invisible to the label query above AND to the Pilot's open-only
+    #     re-dispatch query). Fail-safe: None → skip cycle. ---
+    inprogress = list_stranded_inprogress_beads()
+    if inprogress is None:
+        print("[INFLIGHT-RECLAIM] in_progress sweep failed — skipping cycle (safe)", flush=True)
+        return len(beads), 0
+
+    # Merge + dedup by id (a bead can match both queries).
+    merged = {}
+    for b in beads + inprogress:
+        bid = b.get("id", "")
+        if bid:
+            merged[bid] = b
+    beads = list(merged.values())
 
     # --- Query live sessions (fail-safe: skip cycle on error) ---
     sessions = list_active_sessions()

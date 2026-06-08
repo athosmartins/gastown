@@ -16,6 +16,9 @@
 #   9. no_builder + no_branch + seconds_stranded=0 → noop (hysteresis, not yet tracked)
 #  10. needs_human overrides everything (even past TTL with no builder)
 #
+# Plus real-module tests: ga-7m191 (coordinator-parked), ga-6ow4v (escalate →
+# needs-human), ga-vw26y (in_progress sweep scope + status-reset on reclaim).
+#
 # Exit: 0 = all pass, 1 = any failure.
 set -euo pipefail
 
@@ -339,6 +342,66 @@ print('OK escalate adds needs-human, no re-clear')
 " "OK escalate adds needs-human, no re-clear"
 
 # ---------------------------------------------------------------------------
+# ga-vw26y: status blind spot. `bd list` defaults to open-only, so a story
+# stuck in status:in_progress without story:in-flight was invisible to both the
+# guard and the Pilot's re-dispatch query. Detection is widened (in_progress
+# sweep, scoped to Pilot markers) and do_reclaim now resets status to open.
+# ---------------------------------------------------------------------------
+
+# ga-vw26y (a): the Pilot-story scope predicate keeps ONLY Pilot-marked,
+# non-terminal beads — never crew/gate/dog task beads.
+run_test "ga-vw26y: is_reclaimable_inprogress_story scope predicate" "
+$LOAD_REAL
+f = m.is_reclaimable_inprogress_story
+# Pilot markers → reclaimable
+assert f(['pilot:dispatched']) is True
+assert f(['pilot:reclaim-count:2']) is True
+assert f(['story:in-flight']) is True
+# No Pilot marker → NOT reclaimable (crew/gate/dog task beads are safe)
+assert f([]) is False
+assert f(['lane:small']) is False
+# Terminal/parked → NOT reclaimable even with a Pilot marker
+assert f(['pilot:dispatched','story:done']) is False
+assert f(['pilot:dispatched','gate:passed']) is False
+assert f(['pilot:dispatched','gate:needs-human']) is False
+assert f(['pilot:dispatched','needs:engine-window']) is False
+# gate:needs-fix is a send-back, NOT terminal → still reclaimable
+assert f(['pilot:dispatched','gate:needs-fix']) is True
+print('OK in_progress scope predicate')
+" "OK in_progress scope predicate"
+
+# ga-vw26y (b): the in_progress sweep queries status=in_progress explicitly.
+run_test "ga-vw26y: in_progress sweep queries status in_progress" "
+$LOAD_REAL
+import inspect
+src = inspect.getsource(m.list_stranded_inprogress_beads)
+assert '\"in_progress\"' in src, 'sweep must query --status in_progress'
+assert '\"--status\"' in src, 'sweep must pass --status'
+print('OK in_progress sweep query')
+" "OK in_progress sweep query"
+
+# ga-vw26y (c): list_inflight_beads now includes in_progress (was open-only by
+# bd default), so an in_progress story:in-flight bead is no longer invisible.
+run_test "ga-vw26y: inflight query includes in_progress status" "
+$LOAD_REAL
+import inspect
+src = inspect.getsource(m.list_inflight_beads)
+assert 'in_progress' in src, 'inflight query must explicitly include in_progress status'
+assert '\"story:in-flight\"' in src, 'inflight query must still key on story:in-flight'
+print('OK inflight includes in_progress')
+" "OK inflight includes in_progress"
+
+# ga-vw26y (d): do_reclaim resets status to open so the bead is re-dispatchable.
+run_test "ga-vw26y: do_reclaim resets status to open" "
+$LOAD_REAL
+import inspect
+src = inspect.getsource(m.do_reclaim)
+assert '\"update\"' in src, 'do_reclaim must call bd update'
+assert '\"--status\"' in src and '\"open\"' in src, 'do_reclaim must reset status to open'
+print('OK do_reclaim resets status open')
+" "OK do_reclaim resets status open"
+
+# ---------------------------------------------------------------------------
 # Drift-guard: verify RECLAIM_TTL, MAX_RECLAIMS, and key safety guards are
 # present in the live script (source-of-truth check).
 # ---------------------------------------------------------------------------
@@ -369,6 +432,11 @@ check_pattern "ga-7m191: coordinator markers defined" "COORDINATOR_MARKERS"
 check_pattern "ga-7m191: is_coordinator helper present" "def is_coordinator"
 check_pattern "ga-7m191: in-flight-alone query function present" "def list_inflight_beads"
 check_pattern "ga-7m191: epic exclusion in run_cycle" '"epic"'
+check_pattern "ga-vw26y: in_progress sweep function present" "def list_stranded_inprogress_beads"
+check_pattern "ga-vw26y: scope predicate present" "def is_reclaimable_inprogress_story"
+check_pattern "ga-vw26y: pilot-story markers defined" "PILOT_STORY_MARKERS"
+check_pattern "ga-vw26y: terminal/parked exclusion set defined" "TERMINAL_PARKED_LABELS"
+check_pattern "ga-vw26y: do_reclaim resets status open" 'bd.*update|"update"'
 
 # ---------------------------------------------------------------------------
 # Summary
