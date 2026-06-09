@@ -887,11 +887,11 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
       bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:rebase-attempt:$REBASE_ATTEMPT" -q 2>/dev/null || true
       bd -C "$GC_CITY" label add    "$MARKER_ID" "gate:rebase-attempt:$NEXT_ATTEMPT"  -q 2>/dev/null || true
       if [ "$NEXT_ATTEMPT" -lt "$MAX_REBASE_ATTEMPTS" ]; then
-        warn "Branch $BRANCH: conflict/auto-rebase-fail, author dead/empty (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — gate-status:error for server-side retry."
-        bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS: branch $BRANCH could not auto-rebase (${CONFLICT_FILES:-conflicts}) and the author session is gone. Re-queued for server-side retry on next sweep (NOT stranded on a dead author)." 2>/dev/null || true
+        warn "Branch $BRANCH: conflict/auto-rebase-fail, author dead/empty (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — gate-status:queued for server-side retry."
+        bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:queued" -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS: branch $BRANCH could not auto-rebase (${CONFLICT_FILES:-conflicts}) and the author session is gone. Queued for server-side retry on next sweep (NOT stranded on a dead author)." 2>/dev/null || true
         REBASE_EVENT="dispatcher_autorebase_retry"
-        REBASE_VERDICT="ERROR (retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, dead author)"
+        REBASE_VERDICT="QUEUED (retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, dead author)"
       else
         err "Branch $BRANCH: conflict persists after $MAX_REBASE_ATTEMPTS server-side attempts, author dead/empty — escalating to Mayor."
         bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
