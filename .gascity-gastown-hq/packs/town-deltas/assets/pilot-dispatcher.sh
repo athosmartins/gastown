@@ -198,52 +198,70 @@ log "=== Pilot sweep start (DRY_RUN=${DRY_RUN}) ==="
 #   - stamp present, age >  TTL, but a recorded sling task (pilot.sling_bead) is
 #       still OPEN → a builder is actively working a long build; refuse release.
 #   - stamp present, age >  TTL, no live sling task → release (truly stale).
+#
+# gt-pm55p: Also scan rig DBs. After the cross-rig fix, pilot:dispatching labels
+# for wa-*/ps-*/etc. beads live in their rig DB, not in GC_CITY. Without rig
+# scanning, stale cross-rig claims would never be cleaned up by TTL recovery.
 
-STALE_JSON=$(bd -C "$GC_CITY" list --json --all \
-  -l "story:approved" \
-  -l "pilot:dispatching" \
-  2>/dev/null || echo "[]")
+# Helper: scan one DB for stale pilot:dispatching claims and release them.
+# Usage: _ttl_recover_db <db_path> <now_epoch> <ttl_secs>
+_ttl_recover_db() {
+  local _db="$1" _now="$2" _ttl="$3"
+  local _stale_json _stale_count
+  _stale_json=$(bd -C "$_db" list --json --all \
+    -l "story:approved" \
+    -l "pilot:dispatching" \
+    2>/dev/null || echo "[]")
+  _stale_count=$(echo "$_stale_json" | jq 'length' 2>/dev/null || echo "0")
+  [ "$_stale_count" -le "0" ] && return 0
 
-STALE_COUNT=$(echo "$STALE_JSON" | jq 'length' 2>/dev/null || echo "0")
+  echo "$_stale_json" | jq -c '.[]' | while IFS= read -r bead; do
+    local _bid _stamp _sling
+    _bid=$(echo "$bead" | jq -r '.id' 2>/dev/null || echo "")
+    [ -z "$_bid" ] && continue
+    _stamp=$(echo "$bead" | jq -r '.metadata["pilot.dispatching_at"] // ""' 2>/dev/null || echo "")
+    _sling=$(echo "$bead" | jq -r '.metadata["pilot.sling_bead"] // ""' 2>/dev/null || echo "")
 
-if [ "$STALE_COUNT" -gt "0" ]; then
-  NOW_EPOCH=$(date +%s)
-  TTL_SECS=$((CLAIM_TTL_MINUTES * 60))
-
-  echo "$STALE_JSON" | jq -c '.[]' | while IFS= read -r bead; do
-    BEAD_ID_STALE=$(echo "$bead" | jq -r '.id' 2>/dev/null || echo "")
-    [ -z "$BEAD_ID_STALE" ] && continue
-    STAMP=$(echo "$bead" | jq -r '.metadata["pilot.dispatching_at"] // ""' 2>/dev/null || echo "")
-    SLING_REF=$(echo "$bead" | jq -r '.metadata["pilot.sling_bead"] // ""' 2>/dev/null || echo "")
-
-    # Legacy / un-stamped claim: start the clock now, never release this sweep.
-    if [ -z "$STAMP" ] || ! [ "$STAMP" -ge 0 ] 2>/dev/null; then
-      warn "TTL: $BEAD_ID_STALE has pilot:dispatching but no pilot.dispatching_at stamp (legacy) — stamping now, NOT releasing (Defect A guard)."
-      bd -C "$GC_CITY" update "$BEAD_ID_STALE" --set-metadata "pilot.dispatching_at=$NOW_EPOCH" -q 2>/dev/null || true
+    if [ -z "$_stamp" ] || ! [ "$_stamp" -ge 0 ] 2>/dev/null; then
+      warn "TTL: $_bid has pilot:dispatching but no pilot.dispatching_at stamp (legacy) — stamping now, NOT releasing (Defect A guard)."
+      bd -C "$_db" update "$_bid" --set-metadata "pilot.dispatching_at=$_now" -q 2>/dev/null || true
       continue
     fi
 
-    AGE_SECS=$((NOW_EPOCH - STAMP))
-    if [ "$AGE_SECS" -le "$TTL_SECS" ]; then
-      log "TTL: $BEAD_ID_STALE claim is fresh (age=${AGE_SECS}s <= TTL=${TTL_SECS}s, stamp-based) — keeping."
+    local _age=$((_now - _stamp))
+    if [ "$_age" -le "$_ttl" ]; then
+      log "TTL: $_bid claim is fresh (age=${_age}s <= TTL=${_ttl}s, stamp-based) — keeping."
       continue
     fi
 
-    # Age exceeds TTL. Refuse to recycle if the slung builder task is still live.
-    if [ -n "$SLING_REF" ]; then
-      SLING_STATUS=$(bd -C "$GC_CITY" show "$SLING_REF" --json 2>/dev/null \
+    if [ -n "$_sling" ]; then
+      local _sling_status
+      # Sling task beads always live in GC_CITY (created by gc sling in HQ).
+      _sling_status=$(bd -C "$GC_CITY" show "$_sling" --json 2>/dev/null \
         | jq -r 'if type=="array" then .[0] else . end | (.status // "")' 2>/dev/null || echo "")
-      if [ -n "$SLING_STATUS" ] && [ "$SLING_STATUS" != "closed" ] && [ "$SLING_STATUS" != "done" ]; then
-        warn "TTL: $BEAD_ID_STALE age=${AGE_SECS}s > TTL but sling task $SLING_REF is still '$SLING_STATUS' — builder active, refusing to release."
+      if [ -n "$_sling_status" ] && [ "$_sling_status" != "closed" ] && [ "$_sling_status" != "done" ]; then
+        warn "TTL: $_bid age=${_age}s > TTL but sling task $_sling is still '$_sling_status' — builder active, refusing to release."
         continue
       fi
     fi
 
-    warn "Releasing stale pilot:dispatching claim on $BEAD_ID_STALE (age=${AGE_SECS}s > TTL=${TTL_SECS}s, stamp-based)."
-    bd -C "$GC_CITY" label remove "$BEAD_ID_STALE" "pilot:dispatching" -q 2>/dev/null || true
-    bd -C "$GC_CITY" update "$BEAD_ID_STALE" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+    warn "Releasing stale pilot:dispatching claim on $_bid (age=${_age}s > TTL=${_ttl}s, stamp-based, db=$_db)."
+    bd -C "$_db" label remove "$_bid" "pilot:dispatching" -q 2>/dev/null || true
+    bd -C "$_db" update "$_bid" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
   done
-fi
+}
+
+TTL_NOW_EPOCH=$(date +%s)
+TTL_SECS=$((CLAIM_TTL_MINUTES * 60))
+
+_ttl_recover_db "$GC_CITY" "$TTL_NOW_EPOCH" "$TTL_SECS"
+
+_ttl_rig_paths=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
+  | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
+while IFS= read -r _ttl_rig; do
+  [ -z "$_ttl_rig" ] || [ ! -d "$_ttl_rig" ] && continue
+  _ttl_recover_db "$_ttl_rig" "$TTL_NOW_EPOCH" "$TTL_SECS"
+done <<< "$_ttl_rig_paths"
 
 # ── Step 1: Per-lane capacity check ──────────────────────────────────────────
 # Count in-flight beads per lane by reading their lane:big / lane:small labels.
@@ -613,7 +631,7 @@ dispatch_one() {
   local LANE="$2"
   local DISPATCH_TIER="$3"
 
-  local STORY_ID STORY_TITLE STORY_PRIORITY STORY_LABELS STORY_RIG
+  local STORY_ID STORY_TITLE STORY_PRIORITY STORY_LABELS STORY_RIG STORY_BEAD_CITY
   local STORY_ESTRELA STORY_CRITERIA STORY_EQUILIBRIOS
   STORY_ID=$(echo "$STORY" | jq -r '.id')
   STORY_TITLE=$(echo "$STORY" | jq -r '.title // .description // "untitled"' | head -c 100)
@@ -624,6 +642,42 @@ dispatch_one() {
   STORY_CRITERIA=$(echo "$STORY" | jq -r '.acceptance_criteria // .metadata["story.criterios"] // ""')
   STORY_EQUILIBRIOS=$(echo "$STORY" | jq -r '.metadata["story.equilibrios"] // ""')
 
+  # ── gt-pm55p: Early rig resolution + STORY_BEAD_CITY ────────────────────────
+  # Infer rig from bead ID prefix if not set in metadata, then derive
+  # STORY_BEAD_CITY — the rig's Dolt DB directory for ALL bd ops on $STORY_ID.
+  #
+  # WHY: bd -C "$GC_CITY" silently no-ops for cross-rig beads (wa-*, ps-*, etc.)
+  # because those beads live in their rig's own Dolt DB, not in HQ. When all
+  # label/metadata writes use GC_CITY, story:in-flight and pilot:dispatched are
+  # NEVER written on cross-rig beads — so the bead stays re-dispatchable on
+  # every sweep → dispatcher keeps re-assigning it in a loop (the dc-io31
+  # incident: deacon/builder kept receiving the same slung work over and over).
+  #
+  # Must happen BEFORE the atomic claim so all claim/verify/transition ops route
+  # to the correct DB. STORY_BEAD_CITY == GC_CITY for ga-* (HQ) beads; only
+  # cross-rig beads (wa-*, ps-*, etc.) get a different path.
+  if [ -z "$STORY_RIG" ] || [ "$STORY_RIG" = "null" ]; then
+    local _early_prefix
+    _early_prefix=$(echo "$STORY_ID" | cut -d'-' -f1)
+    case "$_early_prefix" in
+      ga) STORY_RIG="gascity" ;;
+      ps) STORY_RIG="property_scrapers" ;;
+      wa) STORY_RIG="whatsapp_automation" ;;
+      gt) STORY_RIG="gastown" ;;
+      lx) STORY_RIG="lexbh" ;;
+      ma) STORY_RIG="marketing" ;;
+      *)  STORY_RIG="gascity" ;;
+    esac
+    log "  story.rig inferred from bead prefix '$_early_prefix': $STORY_RIG"
+  fi
+  STORY_BEAD_CITY=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
+    | jq -r --arg name "$STORY_RIG" '.rigs[] | select(.name == $name) | .path' \
+    2>/dev/null | head -1 || echo "")
+  if [ -z "$STORY_BEAD_CITY" ] || [ ! -d "$STORY_BEAD_CITY" ]; then
+    STORY_BEAD_CITY="$GC_CITY"
+  fi
+  log "  rig=$STORY_RIG  bead_city=$STORY_BEAD_CITY"
+
   # ── ga-jb4l: gate re-dispatch — surface reviewer feedback for needs-fix beads ──
   # A bead labeled gate:needs-fix previously FAILED the quality gate. The gate
   # attached the FAILing reviewers' reasons to it as a "GATE-FEEDBACK" comment.
@@ -633,7 +687,7 @@ dispatch_one() {
   if echo "$STORY_LABELS" | grep -q "gate:needs-fix"; then
     STORY_FIX_ATTEMPT=$(echo "$STORY_LABELS" | tr ',' '\n' \
       | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | tail -1)
-    STORY_GATE_FEEDBACK=$(bd -C "$GC_CITY" comments "$STORY_ID" --json 2>/dev/null \
+    STORY_GATE_FEEDBACK=$(bd -C "$STORY_BEAD_CITY" comments "$STORY_ID" --json 2>/dev/null \
       | jq -r '[ .[]? | (.text // .body // "") | select(test("^GATE-FEEDBACK")) ] | last // ""' \
       2>/dev/null || echo "")
     log "  $STORY_ID is gate:needs-fix (attempt=${STORY_FIX_ATTEMPT:-?}) — injecting reviewer feedback (${#STORY_GATE_FEEDBACK} chars)."
@@ -653,7 +707,7 @@ FIXSEC
   fi
 
   log "Selected $DISPATCH_TIER [$LANE] $STORY_ID (priority=$STORY_PRIORITY): $STORY_TITLE"
-  log "  rig=$STORY_RIG  labels=$STORY_LABELS  lane=$LANE  tier=$DISPATCH_TIER"
+  log "  labels=$STORY_LABELS  lane=$LANE  tier=$DISPATCH_TIER"
 
   # ── Atomic claim ────────────────────────────────────────────────────────────
   log "Attempting atomic claim on $STORY_ID (lane=$LANE tier=$DISPATCH_TIER) ..."
@@ -667,8 +721,8 @@ FIXSEC
     # reliable claim clock — bd label add does not bump it.
     local CLAIM_EPOCH
     CLAIM_EPOCH=$(date +%s)
-    bd -C "$GC_CITY" update "$STORY_ID" --set-metadata "pilot.dispatching_at=$CLAIM_EPOCH" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || {
+    bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "pilot.dispatching_at=$CLAIM_EPOCH" -q 2>/dev/null || true
+    bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || {
       warn "Could not add pilot:dispatching to $STORY_ID (race condition or bd error). Skipping."
       return 1
     }
@@ -677,7 +731,7 @@ FIXSEC
   # Verify we won the race — and apply ga-zzrts eligibility guards.
   if [ "$DRY_RUN" != "1" ]; then
     local VERIFY_JSON VERIFY_LABELS VERIFY_STATUS VERIFY_SOURCEBEAD
-    VERIFY_JSON=$(bd -C "$GC_CITY" show "$STORY_ID" --json 2>/dev/null || echo "[]")
+    VERIFY_JSON=$(bd -C "$STORY_BEAD_CITY" show "$STORY_ID" --json 2>/dev/null || echo "[]")
     VERIFY_LABELS=$(echo "$VERIFY_JSON" \
       | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' \
       2>/dev/null || echo "")
@@ -690,12 +744,12 @@ FIXSEC
 
     if echo "$VERIFY_LABELS" | grep -q "story:in-flight"; then
       log "Story $STORY_ID is already in-flight (race condition). Releasing claim."
-      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
     fi
     if echo "$VERIFY_LABELS" | grep -q "story:done"; then
       log "Story $STORY_ID is already done. Releasing claim."
-      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
     fi
     # (ga-zzrts fix b) gate:needs-human — bead deliberately parked for human/engine path.
@@ -703,7 +757,7 @@ FIXSEC
     # gate:needs-human is added BETWEEN the query-time snapshot and claim acquisition.
     if echo "$VERIFY_LABELS" | grep -q "gate:needs-human"; then
       warn "ga-zzrts(b): $STORY_ID has gate:needs-human at dispatch time — race or stale query. Releasing claim and skipping."
-      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
     fi
     # (ga-zzrts fix c) Duplicate-in-flight guard: already dispatched in a prior sweep.
@@ -712,14 +766,14 @@ FIXSEC
     # this check the Pilot would emit a second sling for the same source bead (ga-2aigc).
     if echo "$VERIFY_LABELS" | grep -q "pilot:dispatched"; then
       warn "ga-zzrts(c): $STORY_ID already has pilot:dispatched — prior-sweep duplicate guard. Releasing claim."
-      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
     fi
     # (ga-zzrts fix a) Closed-bead guard: STATUS is closed but story:done label absent.
     # Delivery inconsistency can leave a bead closed without the label; never dispatch it.
     if [ "$VERIFY_STATUS" = "closed" ]; then
       warn "ga-zzrts(a): $STORY_ID is STATUS:closed without story:done label. Releasing claim."
-      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
     fi
     # (ga-zzrts fix a) Orphan-sling guard: if this bead carries a source-bead metadata
@@ -729,12 +783,12 @@ FIXSEC
     # closed without the sling being retired.
     if [ -n "$VERIFY_SOURCEBEAD" ] && [ "$VERIFY_SOURCEBEAD" != "null" ]; then
       local SOURCE_BEAD_STATUS
-      SOURCE_BEAD_STATUS=$(bd -C "$GC_CITY" show "$VERIFY_SOURCEBEAD" --json 2>/dev/null \
+      SOURCE_BEAD_STATUS=$(bd -C "$STORY_BEAD_CITY" show "$VERIFY_SOURCEBEAD" --json 2>/dev/null \
         | jq -r 'if type=="array" then .[0] else . end | (.status // "")' \
         2>/dev/null || echo "")
       if [ "$SOURCE_BEAD_STATUS" = "closed" ]; then
         warn "ga-zzrts(a): $STORY_ID is a sling/task whose source $VERIFY_SOURCEBEAD is STATUS:closed — orphan sling. Releasing claim."
-        bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+        bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
         return 1
       fi
     fi
@@ -743,24 +797,10 @@ FIXSEC
   log "Claim acquired on $STORY_ID."
 
   # ── Determine builder target ─────────────────────────────────────────────────
-  if [ -z "$STORY_RIG" ] || [ "$STORY_RIG" = "null" ]; then
-    local BEAD_PREFIX
-    BEAD_PREFIX=$(echo "$STORY_ID" | cut -d'-' -f1)
-    case "$BEAD_PREFIX" in
-      ga) STORY_RIG="gascity" ;;
-      ps) STORY_RIG="property_scrapers" ;;
-      wa) STORY_RIG="whatsapp_automation" ;;
-      gt) STORY_RIG="gastown" ;;
-      lx) STORY_RIG="lexbh" ;;
-      ma) STORY_RIG="marketing" ;;
-      *)  STORY_RIG="gascity" ;;
-    esac
-    log "  story.rig inferred from bead prefix '$BEAD_PREFIX': $STORY_RIG"
-  fi
-
+  # STORY_RIG and STORY_BEAD_CITY already resolved above (gt-pm55p early rig fix).
   local BUILDER_TARGET
   BUILDER_TARGET=$(rig_to_builder "$STORY_RIG")
-  log "  Builder target: $BUILDER_TARGET (rig=$STORY_RIG lane=$LANE)"
+  log "  Builder target: $BUILDER_TARGET (rig=$STORY_RIG bead_city=$STORY_BEAD_CITY lane=$LANE)"
 
   # ── wa-1eos: per-builder mutex ───────────────────────────────────────────────
   # Single-identity builders (digo-wa=wa, batista-ps=ps, etc.) must have AT MOST ONE
@@ -776,7 +816,7 @@ FIXSEC
       | awk -v t="$BUILDER_TARGET" '$2==t && $3=="active"' | wc -l | tr -d ' ')
     if [ "${LIVE_BUILDER_SESSIONS:-0}" -ge 1 ] 2>/dev/null; then
       log "MUTEX(wa-1eos): builder $BUILDER_TARGET already has ${LIVE_BUILDER_SESSIONS} live session(s) — deferring $STORY_ID to next sweep (no duplicate spawn). Releasing claim."
-      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
     fi
   fi
@@ -794,6 +834,7 @@ Type: BUG / TECH-DEBT (Tier 1 — dispatched BEFORE new features)
 Lane: $LANE
 Rig: $STORY_RIG
 City: $GC_CITY
+Bead DB: $STORY_BEAD_CITY
 
 ## Your job
 Fix this bug or tech-debt item completely. Do NOT wait for a human.
@@ -817,15 +858,15 @@ $STORY_EQUILIBRIOS
 - If /gate-done fails validation (no commits, no branch), fix the issue and retry.
 
 ## Steps
-1. Read the full bead: bd -C "$GC_CITY" show "$STORY_ID"
+1. Read the full bead: bd -C "$STORY_BEAD_CITY" show "$STORY_ID"
 2. Run gc prime to load your full context.
 3. Diagnose root cause, implement fix on a branch (name: fix/$STORY_ID).
 4. Add a regression test if applicable.
 5. Commit, push, then run /gate-done.
 
 ## Claim your work (do this first)
-bd -C "$GC_CITY" assign "$STORY_ID" "\$GC_ALIAS"
-bd -C "$GC_CITY" status in_progress "$STORY_ID"
+bd -C "$STORY_BEAD_CITY" assign "$STORY_ID" "\$GC_ALIAS"
+bd -C "$STORY_BEAD_CITY" status in_progress "$STORY_ID"
 
 Start now. Do not wait for permission.
 TASK
@@ -841,6 +882,7 @@ Type: FEATURE (Tier 2 — dispatched only because no open bugs/tech-debt)
 Lane: $LANE
 Rig: $STORY_RIG
 City: $GC_CITY
+Bead DB: $STORY_BEAD_CITY
 
 ## Your job
 Build this story from acceptance criteria to /gate-done. Do NOT wait for a human.
@@ -863,15 +905,15 @@ $STORY_EQUILIBRIOS
 - If /gate-done fails validation (no commits, no branch), fix the issue and retry.
 
 ## Steps
-1. Read the full story bead: bd -C "$GC_CITY" show "$STORY_ID"
+1. Read the full story bead: bd -C "$STORY_BEAD_CITY" show "$STORY_ID"
 2. Run gc prime to load your full context.
 3. Implement the story on a feature branch (name: feat/$STORY_ID or story/$STORY_ID).
 4. Add a story-specific prod test at the required path (see delivery-runbooks.toml).
 5. Commit, push, then run /gate-done.
 
 ## Claim your work (do this first)
-bd -C "$GC_CITY" assign "$STORY_ID" "\$GC_ALIAS"
-bd -C "$GC_CITY" status in_progress "$STORY_ID"
+bd -C "$STORY_BEAD_CITY" assign "$STORY_ID" "\$GC_ALIAS"
+bd -C "$STORY_BEAD_CITY" status in_progress "$STORY_ID"
 
 Start now. Do not wait for permission.
 TASK
@@ -923,13 +965,14 @@ TASK
     # gt-q0hon: fail-hard if sling returned no bead ID — do NOT continue with phantom state.
     if [ -z "$SLING_BEAD_ID" ]; then
       warn "gc sling failed for $STORY_ID — aborting dispatch (err: ${_sling_err:-no output})"
-      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       DISPATCH_RESULT="sling_no_bead_id"
       return 1
     fi
 
     # gt-q0hon: post-sling Dolt verify — guard against phantom bead (hook set but bead
     # never committed to Dolt). Retry up to 3x with 2s gap for propagation lag.
+    # SLING_BEAD_ID lives in GC_CITY (sling always creates task beads in HQ).
     local _verify_ok=0 _verify_i
     for _verify_i in 1 2 3; do
       if bd -C "$GC_CITY" show "$SLING_BEAD_ID" --json 2>/dev/null \
@@ -941,7 +984,7 @@ TASK
 
     if [ "$_verify_ok" = "0" ]; then
       warn "PHANTOM BEAD: gc sling returned $SLING_BEAD_ID but not found in Dolt after 3 attempts. Aborting dispatch for $STORY_ID (gt-q0hon)."
-      bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       DISPATCH_RESULT="sling_phantom_bead"
       return 1
     fi
@@ -950,7 +993,7 @@ TASK
     # genuinely-stuck claim (sling task closed/gone) from an active long build
     # (sling task still open) and refuse to recycle the latter. Set now — before
     # finalization — so it survives even the degraded in-flight-unconfirmed path.
-    bd -C "$GC_CITY" update "$STORY_ID" --set-metadata "pilot.sling_bead=$SLING_BEAD_ID" -q 2>/dev/null || true
+    bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "pilot.sling_bead=$SLING_BEAD_ID" -q 2>/dev/null || true
 
     gc --city "$GC_CITY" session nudge "$BUILDER_TARGET" "$DISPATCH_TASK" \
       --delivery wait-idle 2>/dev/null \
@@ -976,14 +1019,14 @@ TASK
   # The builder is already slung; an unmarked re-dispatchable bead is worse than
   # a claim that TTL recovery cleans up once the sling task is closed.
   if [ "$DRY_RUN" != "1" ]; then
-    bd -C "$GC_CITY" label add "$STORY_ID" "lane:${LANE}" -q 2>/dev/null || true
+    bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "lane:${LANE}" -q 2>/dev/null || true
 
     local _inflight_ok=0 _inflight_i=1
     local _inflight_retries="${PILOT_INFLIGHT_RETRIES:-5}"
     local _inflight_sleep="${PILOT_INFLIGHT_SLEEP:-2}"
     while [ "$_inflight_i" -le "$_inflight_retries" ]; do
-      bd -C "$GC_CITY" label add "$STORY_ID" "story:in-flight" -q 2>/dev/null || true
-      if bd -C "$GC_CITY" show "$STORY_ID" --json 2>/dev/null \
+      bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "story:in-flight" -q 2>/dev/null || true
+      if bd -C "$STORY_BEAD_CITY" show "$STORY_ID" --json 2>/dev/null \
           | jq -e 'if type=="array" then .[0] else . end | (.labels // []) | any(. == "story:in-flight")' \
           >/dev/null 2>&1; then
         _inflight_ok=1; break
@@ -1010,11 +1053,11 @@ TASK
     fi
 
     # in-flight is durable — NOW safe to release the claim and tag dispatched.
-    bd -C "$GC_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$STORY_ID" "pilot:dispatched"  -q 2>/dev/null || true
+    bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+    bd -C "$STORY_BEAD_CITY" label add    "$STORY_ID" "pilot:dispatched"  -q 2>/dev/null || true
     # Claim stamps are now moot (bead is in-flight, excluded from TTL query). Clear
     # them so a later re-dispatch (gate:needs-fix) starts from a clean slate.
-    bd -C "$GC_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+    bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
 
     # ga-ms1jm: a SOURCE bead must NEVER carry gc.routed_to. The builder is
     # dispatched via the separate sling TASK bead created above — this source
@@ -1027,7 +1070,7 @@ TASK
     # already-fixed work. The ga-zzrts guards above stop the PILOT re-dispatching;
     # this stops the DOG engine query re-claiming. Idempotent (no-op when absent);
     # || true keeps set -euo pipefail safe.
-    bd -C "$GC_CITY" update "$STORY_ID" --unset-metadata gc.routed_to -q >/dev/null 2>&1 || true
+    bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata gc.routed_to -q >/dev/null 2>&1 || true
 
     local DISPATCH_COMMENT
     if [ "$DISPATCH_TIER" = "bug" ]; then
@@ -1042,7 +1085,7 @@ Builder doctrine: implement → /gate-done → autonomous gate+delivery → stor
 No human review required."
     fi
 
-    bd -C "$GC_CITY" comment "$STORY_ID" "$DISPATCH_COMMENT" \
+    bd -C "$STORY_BEAD_CITY" comment "$STORY_ID" "$DISPATCH_COMMENT" \
       2>/dev/null || warn "Could not post dispatch comment to $STORY_ID"
   fi
 
