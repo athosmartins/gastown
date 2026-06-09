@@ -488,16 +488,42 @@ log "Authoritative author: $AUTHOR"
 # ── Step 4: Determine rig path and git references ─────────────────────────────
 
 RIG_PATH=""
+RIG_LIST_JSON=$(gc --city "$GC_CITY" rig list --json 2>/dev/null || echo '{}')
 if [ -n "$RIG" ]; then
-  RIG_PATH=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
-    | jq -r --arg r "$RIG" '.rigs[] | select(.name == $r) | .path' 2>/dev/null | head -1 || echo "")
+  RIG_PATH=$(echo "$RIG_LIST_JSON" \
+    | jq -r --arg r "$RIG" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
+fi
+
+# ga-67hae: COMPOUND rig fallback — /gate-done writes rig=mila-wa or rig=batista-ps
+# (crew-qualified). No rig has that compound name → bead-id prefix is authoritative
+# (wa-ucrq → wa → whatsapp_automation; ps-s27l → ps → property_scrapers).
+if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$BEAD_ID" ]; then
+  _bid_prefix="${BEAD_ID%%-*}"
+  RIG_PATH=$(echo "$RIG_LIST_JSON" \
+    | jq -r --arg r "$_bid_prefix" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
+  [ -n "$RIG_PATH" ] && log "  rig='$RIG' unresolved; derived from bead-id prefix '$_bid_prefix' -> $RIG_PATH"
+fi
+# Trailing-segment fallback: mila-wa → wa
+if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$RIG" ] && printf '%s' "$RIG" | grep -q '-'; then
+  _rig_tail="${RIG##*-}"
+  RIG_PATH=$(echo "$RIG_LIST_JSON" \
+    | jq -r --arg r "$_rig_tail" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
+  [ -n "$RIG_PATH" ] && log "  rig='$RIG' unresolved; derived from trailing segment '$_rig_tail' -> $RIG_PATH"
 fi
 
 if [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; then
-  err "Cannot resolve rig path for rig='$RIG'. Aborting."
+  err "Cannot resolve rig path for rig='$RIG' (bead=$BEAD_ID). Aborting."
   bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
   exit 1
+fi
+
+# ga-67hae: normalize $RIG to the canonical rig name (compound values break
+# downstream select(.name == $RIG) lookups like DEFAULT_BRANCH derivation).
+_RIG_CANON=$(echo "$RIG_LIST_JSON" | jq -r --arg p "$RIG_PATH" '.rigs[] | select(.path == $p) | .name' 2>/dev/null | head -1 || echo "")
+if [ -n "$_RIG_CANON" ] && [ "$_RIG_CANON" != "$RIG" ]; then
+  log "  Normalized rig '$RIG' -> canonical '$_RIG_CANON' for downstream lookups."
+  RIG="$_RIG_CANON"
 fi
 
 # Determine the canonical git repo location.
@@ -568,8 +594,8 @@ rig_merge_has_conflict() {
 log "  rig_path=$RIG_PATH  git_dir=$GIT_DIR_PATH  container_rig=$IS_CONTAINER_RIG"
 
 # Determine default branch (main unless overridden)
-DEFAULT_BRANCH=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
-  | jq -r --arg r "$RIG" '.rigs[] | select(.name == $r) | .default_branch // "main"' 2>/dev/null | head -1 || echo "main")
+DEFAULT_BRANCH=$(echo "$RIG_LIST_JSON" \
+  | jq -r --arg r "$RIG" '.rigs[] | select(.name == $r or .prefix == $r) | .default_branch // "main"' 2>/dev/null | head -1 || echo "main")
 
 # Fetch to ensure we have the latest remote state
 log "Fetching remote for rig $RIG ..."
@@ -613,7 +639,12 @@ if [ "$ALREADY_MERGED" = "1" ]; then
       | jq -r 'if type=="array" then .[0] else . end | .status // "open"')
     if [ "$BD_STATUS" != "closed" ]; then
       bd -C "$GC_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
-      bd -C "$GC_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate superseded (marker $MARKER_ID)." 2>/dev/null || true
+      # ga-67hae PILOT-CASCADE FIX: branch already merged → strip story:in-flight so
+      # the Pilot lane slot frees. The PASS path strips it at merge (ga-3h8l) but this
+      # supersede path did not — phantom in-flight slots wedged the Pilot at capacity.
+      bd -C "$GC_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
+      bd -C "$GC_CITY" assign "$BEAD_ID" "" -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate superseded (marker $MARKER_ID). story:in-flight stripped (Pilot lane slot freed — ga-67hae pilot-cascade fix); work already merged." 2>/dev/null || true
     fi
   fi
 
@@ -1165,6 +1196,18 @@ TASK
 
   # Wake the session so it starts immediately
   gc --city "$GC_CITY" session wake "$SESSION_ID" 2>/dev/null || true
+
+  # ga-67hae: DURABLE PULL CHANNEL — assign verdict bead to this reviewer's
+  # session_name + embed the review task in its comment. The nudge below is a
+  # fast-path; the reviewer's poll loop (`gc bd list --assignee=$GC_SESSION_NAME`)
+  # is the reliable fallback that survives nudge-injection races. All guarded
+  # with || true (set -euo pipefail safe).
+  SESSION_NAME=$(echo "$SESSION_JSON" | jq -r '.session_name // empty')
+  if [ -n "$SESSION_NAME" ]; then
+    bd -C "$GC_CITY" update "$VERDICT_BEAD_ID" --assignee "$SESSION_NAME" --status in_progress -q 2>/dev/null || true
+    bd -C "$GC_CITY" comment "$VERDICT_BEAD_ID" "$REVIEW_TASK" 2>/dev/null || true
+    log "  Verdict bead $VERDICT_BEAD_ID assigned to $SESSION_NAME + task embedded (durable pull, ga-67hae)"
+  fi
 
   # ga-noxbv: snapshot the session's terminal BEFORE the task is delivered. The
   # ACK pass (Step 7b) compares a fresh peek against this baseline — any change
