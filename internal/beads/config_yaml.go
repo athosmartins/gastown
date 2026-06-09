@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -97,6 +98,77 @@ func ConfigYAMLDisablesAutoExport(content string) bool {
 		}
 	}
 	return false
+}
+
+// MergeConfigYAMLCustomTypes reads config.yaml, merges the existing types.custom
+// value (if any) with requiredTypes, deduplicates, sorts, and writes back a clean
+// unquoted comma-separated value. Calling this instead of "bd config set types.custom"
+// avoids the append-after-quote corruption that older bd versions produce when the
+// existing value is YAML-quoted (e.g. "molecule,...,step",newval is invalid YAML).
+func MergeConfigYAMLCustomTypes(beadsDir string, requiredTypes []string) error {
+	configPath := filepath.Join(beadsDir, "config.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // nothing to fix; EnsureConfigYAML will create the file
+		}
+		return err
+	}
+
+	content := strings.ReplaceAll(string(data), "\r\n", "\n")
+	lines := strings.Split(content, "\n")
+
+	typeSet := make(map[string]bool)
+	for _, t := range requiredTypes {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			typeSet[t] = true
+		}
+	}
+
+	found := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "types.custom:") {
+			continue
+		}
+		found = true
+
+		// Parse existing value — strip surrounding YAML quotes, then split on comma.
+		val := strings.TrimSpace(strings.TrimPrefix(trimmed, "types.custom:"))
+		val = strings.Trim(val, `"'`)
+		for _, t := range strings.Split(val, ",") {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				typeSet[t] = true
+			}
+		}
+
+		lines[i] = "types.custom: " + joinSorted(typeSet)
+		break
+	}
+
+	if !found && len(typeSet) > 0 {
+		lines = append(lines, "types.custom: "+joinSorted(typeSet))
+	}
+
+	newContent := strings.Join(lines, "\n")
+	if !strings.HasSuffix(newContent, "\n") {
+		newContent += "\n"
+	}
+	if newContent == content {
+		return nil
+	}
+	return os.WriteFile(configPath, []byte(newContent), 0644)
+}
+
+func joinSorted(m map[string]bool) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
 }
 
 func ensureConfigYAML(beadsDir, prefix string, onlyIfMissing bool) error {

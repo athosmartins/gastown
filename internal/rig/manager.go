@@ -654,10 +654,9 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		// metadata.json was tracked in git (bdDatabaseExists returned true).
 		// The tracked metadata.json tells bd HOW to connect but doesn't guarantee
 		// the server-side database has issue_prefix set for this workspace.
-		configCmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
-		configCmd.Dir = mayorRigPath
-		configCmd.Env = sourceBdEnv
-		_, _ = configCmd.CombinedOutput() // Ignore errors - older beads don't need this
+		if err := beads.MergeConfigYAMLCustomTypes(sourceBeadsDir, constants.BeadsCustomTypesList()); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not set types.custom in config.yaml: %v\n", err)
+		}
 
 		prefixSetCmd := exec.Command("bd", "config", "set", "issue_prefix", opts.BeadsPrefix)
 		prefixSetCmd.Dir = mayorRigPath
@@ -722,10 +721,9 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		if out, err := prefixCmd.CombinedOutput(); err != nil {
 			fmt.Printf("  Warning: Could not set issue_prefix on rig database: %v (%s)\n", err, strings.TrimSpace(string(out)))
 		}
-		typesCmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
-		typesCmd.Dir = rigPath
-		typesCmd.Env = bdEnv
-		_, _ = typesCmd.CombinedOutput()
+		if err := beads.MergeConfigYAMLCustomTypes(resolvedBeadsDir, constants.BeadsCustomTypesList()); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not set types.custom in config.yaml: %v\n", err)
+		}
 	}
 
 	// Auto-create DoltHub remote for the rig's beads database.
@@ -1237,12 +1235,13 @@ func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 		// bd init succeeded - configure the Dolt database
 
 		// Configure custom types for Gas Town (agent, role, rig, convoy).
-		// These were extracted from beads core in v0.46.0 and now require explicit config.
-		configCmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
-		configCmd.Dir = rigPath
-		configCmd.Env = filteredEnv
-		// Ignore errors - older beads versions don't need this
-		_, _ = configCmd.CombinedOutput()
+		// Write directly to config.yaml instead of using bd config set, which on older
+		// beads versions appends CSV after an existing quoted value → invalid YAML
+		// (e.g. "molecule,...,step",molecule,step). MergeConfigYAMLCustomTypes reads
+		// the existing value, merges+dedupes with requiredTypes, and writes a clean value.
+		if err := beads.MergeConfigYAMLCustomTypes(beadsDir, constants.BeadsCustomTypesList()); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not set types.custom in config.yaml: %v\n", err)
+		}
 
 		// Explicitly set issue_prefix config (bd init --prefix may not persist it in newer versions).
 		// Without this, bd create and gt sling fail with "issue_prefix config is missing".
