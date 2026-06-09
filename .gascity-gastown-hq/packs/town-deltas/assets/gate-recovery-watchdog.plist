@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.gate-recovery-watchdog</string>
+
+  <!-- Self-healing gate watchdog (2026-06-07). Detects gate-not-producing-verdicts
+       (2+ TIMEOUTs in 30min, or a marker stuck dispatching with no active reviewers)
+       and — per Athos — PRIMARILY WAKES THE MAYOR with the recovery playbook to fix
+       it autonomously. Athos gets an FYI only; a 🚨 page goes to Athos only as a last
+       resort if the Mayor fails to recover after 2 wake-cycles. This is the automatic
+       "crew member" the 20:00 outage lacked (a human noticed hours later). Polls 60s;
+       silence = healthy. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/gate-recovery-watchdog.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-recovery-watchdog-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-recovery-watchdog-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>
