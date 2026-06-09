@@ -162,7 +162,12 @@ if [ "$DISPATCHING_COUNT" -gt 0 ]; then
     D_ID=$(echo "$D_MARKER" | jq -r '.id')
     D_UPDATED=$(echo "$D_MARKER" | jq -r '.updated_at // .created_at // ""')
     if [ -z "$D_UPDATED" ]; then continue; fi
-    D_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${D_UPDATED%%Z*}" "+%s" 2>/dev/null \
+    # updated_at/created_at is UTC ("...Z"). Parse the BSD branch with -u so the
+    # epoch is absolute and matches `date +%s`; without -u, macOS `date -j -f`
+    # reads the naive timestamp as LOCAL time and ages come out skewed by the UTC
+    # offset (negative under UTC-3), so the DISPATCHING_TTL recovery never fires
+    # (ga-35zp1). GNU `date -d` keeps the trailing Z and is already UTC-correct.
+    D_EPOCH=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${D_UPDATED%%Z*}" "+%s" 2>/dev/null \
       || date -d "$D_UPDATED" +%s 2>/dev/null || echo "0")
     D_AGE_MINUTES=$(( (NOW_EPOCH_D - D_EPOCH) / 60 ))
     if [ "$D_AGE_MINUTES" -gt "$DISPATCHING_TTL_MINUTES" ]; then

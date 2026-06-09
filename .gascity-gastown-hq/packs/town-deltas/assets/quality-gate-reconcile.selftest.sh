@@ -117,6 +117,10 @@ grep -q 'gate-status:superseded'             "$GUARD" && ok "guard supersedes or
 grep -q 'gate-status:aborted'                "$GUARD" && ok "guard keeps age-TTL abort fallback"         || bad "guard missing gate-status:aborted"
 grep -q 'marker_id'                          "$GUARD" && ok "guard keys gate-run cleanup on marker_id"   || bad "guard missing marker_id linkage"
 grep -q 'date -j -u -f'                      "$GUARD" && ok "guard parses bead timestamps as UTC (-u)"   || bad "guard missing -u (TZ bug regressed)"
+# Dispatcher Step 0a (D_EPOCH) + reviewer janitor (R_EPOCH) must ALL parse UTC.
+# A bare `grep 'date -j -u -f'` would false-pass (R_EPOCH already has it), so we
+# assert the buggy non-UTC form is absent everywhere in the dispatcher (ga-35zp1).
+grep -q 'date -j -f "%Y-%m-%dT%H:%M:%S"'     "$DISPATCHER" && bad "dispatcher has a non-UTC BSD date parse (date -j -f without -u — TZ age bug, ga-35zp1)" || ok "dispatcher BSD date parses are all UTC (-u)"
 # parse_marker_id: single canonical definition in guard, both scripts converge on it.
 grep -q 'parse_marker_id()'                  "$GUARD" && ok "guard defines parse_marker_id (canonical)"   || bad "guard missing parse_marker_id def"
 grep -q 'parse_marker_id'                    "$GUARD" && ok "guard Step 0b uses parse_marker_id"          || bad "guard Step 0b not using parse_marker_id"
