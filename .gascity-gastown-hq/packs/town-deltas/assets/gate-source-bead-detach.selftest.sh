@@ -9,17 +9,25 @@
 #   - Step 1a re-matches  in_progress + assignee=<recycled pool alias>   (Vector 1a)
 #   - Step 1c re-matches  unassigned + gc.routed_to=<template>           (Vector 1c)
 #
-# The fix detaches the source bead at the EARLIEST gate-ownership point:
-# quality-gate-guard.sh, right after it claims the marker (gate-status:claimed)
-# and validates the bead_id. There it clears the source bead's assignee (kills
-# 1a) and strips gc.routed_to (kills 1c). gate-status:claimed is an active state
-# the inflight-reclaim-guard already excludes, so the detach cannot trigger a
-# false reclaim.
+# The fix detaches the source bead while the gate owns its marker
+# (gate-status:claimed): quality-gate-guard.sh clears the source bead's assignee
+# (kills 1a) and strips gc.routed_to (kills 1c). gate-status:claimed is an active
+# state the inflight-reclaim-guard already excludes, so the detach cannot trigger
+# a false reclaim.
+#
+# CRITICAL ORDERING (the gate FAIL that produced this revision): the detach must
+# run AFTER Step 5 author derivation, not before it. Step 5 derives the
+# self-review-exclusion author from the source bead, first-choice signal = the
+# bead's assignee (assignee → created_by → owner). Clearing the assignee before
+# Step 5 forces a fall-through to created_by (the FILER), which lets the real
+# builder review their own branch — a self-review bypass. So the detach lives
+# right after `log "Authoritative author: $AUTHOR"`, still inside the
+# gate-status:claimed window (Step 6 has not flipped the marker yet).
 #
 # This test statically guards quality-gate-guard.sh against regressing that
 # behaviour: the detach must exist, clear BOTH vectors, be best-effort (never
-# abort the set -euo pipefail sweep), and be positioned AFTER the marker is
-# claimed/validated but BEFORE Step 5 author derivation.
+# abort the set -euo pipefail sweep), and be positioned AFTER Step 5 author
+# derivation (after the authoritative author is resolved) and before Step 6.
 #
 # Pure bash + grep/awk. Never runs gc/bd, never touches the live city or beads —
 # safe to run on a live host (honors the "no live config edit" doctrine).
@@ -82,17 +90,21 @@ else
   bad "detach is not guarded by a non-empty \$BEAD_ID check"
 fi
 
-# 6. Ordering: the detach must fire AFTER the marker is claimed
-#    (gate-status:claimed added) and BEFORE Step 5 author derivation — i.e. at
-#    the gate-ownership point, where the inflight-reclaim-guard already excludes
-#    the bead. This prevents re-introducing the detach before claim/validation.
-claimed_line=$(grep -nE 'label add "\$MARKER_ID" "gate-status:claimed"' "$GUARD" | head -1 | cut -d: -f1)
-step5_line=$(grep -nE '^# .*Step 5: Derive author' "$GUARD" | head -1 | cut -d: -f1)
-if [ -n "${claimed_line:-}" ] && [ -n "${detach_line:-}" ] && [ -n "${step5_line:-}" ] \
-   && [ "$detach_line" -gt "$claimed_line" ] && [ "$detach_line" -lt "$step5_line" ]; then
-  ok "detach is positioned after marker-claimed and before Step 5 (gate-ownership point)"
+# 6. Ordering: the detach must fire AFTER Step 5 resolves the authoritative author
+#    (the `log "Authoritative author: $AUTHOR"` line) and BEFORE Step 6 — i.e.
+#    still inside the gate-status:claimed window, but only once the source bead's
+#    assignee has been READ for self-review exclusion. Detaching before Step 5
+#    clears the assignee that Step 5 reads first (assignee → created_by → owner),
+#    forcing a fall-through to created_by (the filer) and letting the real builder
+#    review their own branch — the self-review bypass that FAILED the gate. This
+#    assertion locks in the corrected order (after author derivation).
+author_line=$(grep -nE 'log "Authoritative author: \$AUTHOR"' "$GUARD" | head -1 | cut -d: -f1)
+step6_line=$(grep -nE '^# .*Step 6: Create gate-run' "$GUARD" | head -1 | cut -d: -f1)
+if [ -n "${author_line:-}" ] && [ -n "${detach_line:-}" ] && [ -n "${step6_line:-}" ] \
+   && [ "$detach_line" -gt "$author_line" ] && [ "$detach_line" -lt "$step6_line" ]; then
+  ok "detach is positioned after Step 5 author derivation and before Step 6"
 else
-  bad "detach is mis-positioned (claimed=$claimed_line detach=$detach_line step5=$step5_line)"
+  bad "detach is mis-positioned (author=$author_line detach=$detach_line step6=$step6_line)"
 fi
 
 # 7. Traceability: the detach references its bead id so future readers can trace

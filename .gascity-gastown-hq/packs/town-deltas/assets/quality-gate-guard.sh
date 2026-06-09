@@ -679,39 +679,6 @@ Marker set to gate-status:error. Fix the marker fields and re-submit." 2>/dev/nu
   exit 1
 fi
 
-# ── Step 4b (ga-e7zk7): detach source bead from the dog pool — gate owns it now ──
-# The builder leaves the source bead in_progress + assignee=<pool alias> for the
-# WHOLE gate duration (the gate closes it on PASS). Markers routinely sit queued
-# for hours behind the single-threaded backlog, and throughout that window the
-# dog-pool startup probes — which are label-blind and engine-baked (cannot be
-# changed without an engine window) — keep re-matching the source bead:
-#   - Step 1a: bd list --status in_progress --assignee=<session id|name|alias>
-#              → every recycle of the builder's pool alias re-finds it (Vector 1a)
-#   - Step 1c: bd ready --metadata-field gc.routed_to=<template> --unassigned
-#              → on dog death the reconciler reset-to-ready re-exposes any residual
-#                gc.routed_to (Vector 1c)
-# Each re-match spins up a no-op dog that verifies-and-exits — pure session burn
-# (ga-noxbv was re-dispatched 15x mid-gate; see ga-e7zk7). The marker is now
-# gate-status:claimed, an active state the inflight-reclaim-guard already excludes,
-# so this is the earliest point where the gate authoritatively owns the bead AND
-# detaching cannot trigger a false reclaim. Neutralize both vectors at the routing
-# layer: clear the source bead's assignee (kills 1a) and strip gc.routed_to (kills
-# 1c). The bead stays in_progress + story:in-flight; the gate closes it on PASS, or
-# on FAIL the Pilot re-dispatches (re-assigning fresh). The marker's source-bead:
-# label — not the bead's assignee — is what the gate and delivery use to find it,
-# so detaching is safe. Best-effort, never fatal (set -euo pipefail discipline).
-if [ -n "$BEAD_ID" ]; then
-  if bd -C "$GC_CITY" assign "$BEAD_ID" "" 2>/dev/null; then
-    log "  detached source bead $BEAD_ID from dog pool (cleared assignee — ga-e7zk7)"
-  else
-    log "  WARN: could not clear assignee on source bead $BEAD_ID (non-fatal — ga-e7zk7)"
-  fi
-  # Strip the metadata-keyed pool route (no-op in the current sling-bead model,
-  # where the source bead carries no gc.routed_to; covers the legacy direct-route
-  # model where it did). Guarded so a missing key never aborts the sweep.
-  bd -C "$GC_CITY" update "$BEAD_ID" --unset-metadata gc.routed_to -q 2>/dev/null || true
-fi
-
 # ── Step 5: Derive author from the authoritative bead record ─────────────────
 # SECURITY: Do NOT use MARKER_AUTHOR (self-declared by worker) for exclusion.
 # Instead, look up the bead's assignee or owner in the DB. This prevents
@@ -783,6 +750,51 @@ Fix the bead's assignee/created_by field and re-submit." 2>/dev/null || true
 fi
 
 log "Authoritative author: $AUTHOR"
+
+# ── Step 5b (ga-e7zk7): detach source bead from the dog pool — gate owns it now ──
+# Why HERE (after Step 5), not before it: Step 5 derives the self-review-exclusion
+# author from the source bead's record, and its FIRST-CHOICE signal is the bead's
+# assignee (assignee → created_by → owner). assignee and created_by routinely
+# diverge in production (e.g. assignee=oracle-wa, created_by=peter-wa — different
+# crew). Clearing the assignee BEFORE Step 5 (the original ga-e7zk7 attempt) forced
+# author resolution to fall through to created_by (the FILER), which would let the
+# real builder be picked to review their own branch — the exact self-review bypass
+# Step 5's SECURITY block exists to prevent. So the detach MUST run only after
+# AUTHOR is resolved. By this line AUTHOR is final and the author-unresolvable
+# fail-safe above has already `exit 0`d (correctly leaving such beads attached for
+# re-dispatch), so detaching here is safe for both paths.
+#
+# What it fixes: the builder leaves the source bead in_progress + assignee=<pool
+# alias> for the WHOLE gate duration (the gate closes it on PASS). Markers routinely
+# sit queued for hours behind the single-threaded backlog, and throughout that
+# window the dog-pool startup probes — label-blind and engine-baked (cannot be
+# changed without an engine window) — keep re-matching the source bead:
+#   - Step 1a: bd list --status in_progress --assignee=<session id|name|alias>
+#              → every recycle of the builder's pool alias re-finds it (Vector 1a)
+#   - Step 1c: bd ready --metadata-field gc.routed_to=<template> --unassigned
+#              → on dog death the reconciler reset-to-ready re-exposes any residual
+#                gc.routed_to (Vector 1c)
+# Each re-match spins up a no-op dog that verifies-and-exits — pure session burn
+# (ga-noxbv was re-dispatched 15x mid-gate; see ga-e7zk7). The marker is still
+# gate-status:claimed at this point (Step 6 has not flipped it yet), an active state
+# the inflight-reclaim-guard already excludes, so detaching cannot trigger a false
+# reclaim. Neutralize both vectors at the routing layer: clear the source bead's
+# assignee (kills 1a) and strip gc.routed_to (kills 1c). The bead stays in_progress
+# + story:in-flight; the gate closes it on PASS, or on FAIL the Pilot re-dispatches
+# (re-assigning fresh). The marker's source-bead: label — not the bead's assignee —
+# is what the gate and delivery use to find it, so detaching is safe. Best-effort,
+# never fatal (set -euo pipefail discipline).
+if [ -n "$BEAD_ID" ]; then
+  if bd -C "$GC_CITY" assign "$BEAD_ID" "" 2>/dev/null; then
+    log "  detached source bead $BEAD_ID from dog pool (cleared assignee — ga-e7zk7)"
+  else
+    log "  WARN: could not clear assignee on source bead $BEAD_ID (non-fatal — ga-e7zk7)"
+  fi
+  # Strip the metadata-keyed pool route (no-op in the current sling-bead model,
+  # where the source bead carries no gc.routed_to; covers the legacy direct-route
+  # model where it did). Guarded so a missing key never aborts the sweep.
+  bd -C "$GC_CITY" update "$BEAD_ID" --unset-metadata gc.routed_to -q 2>/dev/null || true
+fi
 
 # ── Step 6: Create gate-run tracking bead ─────────────────────────────────────
 
