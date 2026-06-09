@@ -59,6 +59,112 @@ REVIEWER_SESSION_TTL_MINUTES="${REVIEWER_SESSION_TTL_MINUTES:-$((VERDICT_TIMEOUT
 # Dry-run mode: skip actual git merge+push.
 DRY_RUN="${DRY_RUN:-0}"
 
+# ── ga-4u16h: re-convene a DEAD reviewer slot mid-collection ──────────────────
+# The Dolt :52756 server intermittently resets connections (root cause ga-hxhaj).
+# When a reset kills a gate-reviewer SESSION mid-review, its verdict bead stays
+# verdict:pending; pre-ga-4u16h the dispatcher waited the FULL outer timeout and
+# then counted the missing verdict as a FAIL — bouncing a GOOD fix on INFRA.
+# Fix: when a slot's reviewer SESSION is confirmed DEAD (gone from the session
+# list, or closed=true) while its verdict bead is still pending, re-spawn a FRESH
+# reviewer for THAT slot (reusing the still-pending verdict bead), bounded by a
+# per-slot budget. Real verdict:FAIL votes still fail immediately; healthy runs
+# are unaffected. A permanently-broken Dolt converges to FAIL within
+# (1 + MAX_RESPAWNS_PER_SLOT) reviewer cohorts via the unchanged outer timeout.
+#
+# Max re-spawns per reviewer slot. 0 disables re-convene (exact pre-ga-4u16h
+# behavior). Sanitized + ceiling-guarded (mirrors the VERDICT_TIMEOUT floor).
+MAX_RESPAWNS_PER_SLOT="${MAX_RESPAWNS_PER_SLOT:-2}"
+case "$MAX_RESPAWNS_PER_SLOT" in ''|*[!0-9]*) MAX_RESPAWNS_PER_SLOT=2 ;; esac
+if [ "$MAX_RESPAWNS_PER_SLOT" -gt 5 ] 2>/dev/null; then
+  MAX_RESPAWNS_PER_SLOT=5   # ceiling: never thrash spawning >5 cohorts for one slot
+fi
+
+# Grace window (seconds) a freshly-(re)spawned reviewer gets before its session
+# may be judged DEAD — covers slow startup/waking so a live-but-slow reviewer is
+# NEVER re-convened. Floor-guarded.
+RECONVENE_GRACE_SECS="${RECONVENE_GRACE_SECS:-60}"
+case "$RECONVENE_GRACE_SECS" in ''|*[!0-9]*) RECONVENE_GRACE_SECS=60 ;; esac
+[ "$RECONVENE_GRACE_SECS" -lt 20 ] 2>/dev/null && RECONVENE_GRACE_SECS=20
+
+# Consecutive polls a slot must read DEAD before re-convene fires (defends
+# against a transient/partial `gc session list`). Floor-guarded.
+RECONVENE_DEAD_STREAK_MIN="${RECONVENE_DEAD_STREAK_MIN:-2}"
+case "$RECONVENE_DEAD_STREAK_MIN" in ''|*[!0-9]*) RECONVENE_DEAD_STREAK_MIN=2 ;; esac
+[ "$RECONVENE_DEAD_STREAK_MIN" -lt 1 ] 2>/dev/null && RECONVENE_DEAD_STREAK_MIN=1
+
+# session_is_dead <present 0|1> <closed true|false|1|0> → echoes 1 (dead) | 0 (alive)
+# A reviewer session is DEAD iff it is absent from the session list (present=0)
+# OR explicitly closed. A present, non-closed session (active OR asleep) is ALIVE
+# — `asleep` is the normal state of a reviewer that finished or is between turns,
+# so it must NEVER be treated as dead. Pure; no I/O.
+session_is_dead() {
+  local present="$1" closed="$2"
+  if [ "$present" = "0" ]; then echo 1; return 0; fi
+  case "$closed" in true|TRUE|True|1) echo 1 ;; *) echo 0 ;; esac
+}
+
+# classify_slot_action <bead_closed 0|1> <session_dead 0|1> <budget_remaining int>
+# The single decision for ONE reviewer slot in a poll iteration. Pure; no I/O.
+#   received → verdict bead is closed (a verdict — PASS or FAIL — was recorded);
+#              caller's existing logic counts it. NEVER re-spawn (so an explicit
+#              verdict:FAIL fails immediately, as before).
+#   respawn  → bead still pending AND session confirmed dead AND budget remains.
+#   wait     → everything else: a live (slow) reviewer, OR a dead slot whose
+#              budget is exhausted (the outer timeout is the ultimate backstop —
+#              bounded, never spins).
+classify_slot_action() {
+  local bead_closed="$1" session_dead="$2" budget="$3"
+  case "$budget" in ''|*[!0-9-]*) budget=0 ;; esac
+  if [ "$bead_closed" = "1" ]; then echo "received"; return 0; fi
+  if [ "$session_dead" = "1" ] && [ "$budget" -gt 0 ] 2>/dev/null; then echo "respawn"; return 0; fi
+  echo "wait"
+}
+
+# respawn_reviewer_slot <0-based idx> — re-spawn a fresh gate-reviewer session for
+# a dead slot, REUSING the still-pending verdict bead VERDICT_BEAD_IDS[idx] and
+# re-delivering the SAME stored review task REVIEW_TASKS[idx] (it already
+# references the unchanged verdict bead). Updates SESSION_IDS[idx] in place.
+# Returns 0 on a fresh spawn+nudge, 1 if the spawn itself failed (caller has
+# already consumed budget so a permanent spawn failure stays bounded). Reuses the
+# exact gate-reviewer template + independence model of the Step 7/8 spawn block;
+# deliberately omits the spawn-abort escalation (that guards the INITIAL cohort —
+# here the outer timeout + budget already bound the failure). No new verdict bead.
+respawn_reviewer_slot() {
+  local _idx="$1"
+  local _rev=$(( _idx + 1 ))
+  local _err_file="/tmp/gate-reviewer-respawn-err-$$.${_idx}"
+  local _json _new_sid
+  _json=$(gc --city "$GC_CITY" session new gate-reviewer \
+    --no-attach \
+    --title "gate-reviewer-${_rev} (re-convened): $BRANCH" \
+    --json \
+    2>"$_err_file" || echo "{}")
+  rm -f "$_err_file" 2>/dev/null || true
+  _new_sid=$(echo "$_json" | jq -r '.session_id // empty' 2>/dev/null || echo "")
+  if [ -z "$_new_sid" ]; then
+    warn "  Re-convene: failed to spawn replacement reviewer for slot ${_idx} — slot stays dead; outer timeout is the backstop."
+    return 1
+  fi
+  SESSION_IDS[$_idx]="$_new_sid"
+  gc --city "$GC_CITY" session wake "$_new_sid" 2>/dev/null || true
+  if gc --city "$GC_CITY" session nudge "$_new_sid" "${REVIEW_TASKS[$_idx]}" --delivery queue 2>/dev/null; then
+    log "  Re-convene: review task re-queued to fresh session ${_new_sid} (slot ${_idx}, verdict bead ${VERDICT_BEAD_IDS[$_idx]} reused)."
+  elif gc --city "$GC_CITY" session submit "$_new_sid" "${REVIEW_TASKS[$_idx]}" 2>/dev/null; then
+    log "  Re-convene: review task re-submitted to fresh session ${_new_sid} (slot ${_idx})."
+  else
+    warn "  Re-convene: queue/submit to fresh session ${_new_sid} failed (slot ${_idx}) — verdict-poll + outer timeout backstop."
+  fi
+  return 0
+}
+
+# Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
+# above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
+# GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
+# taken in normal `bash quality-gate-dispatcher.sh` execution.
+if [ -n "${GATE_DISPATCHER_LIB_ONLY:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 mkdir -p "$LOG_DIR"
 exec >> "$LOG" 2>&1
 
@@ -1089,6 +1195,21 @@ done
 
 log "All $REQUIRED_REVIEWERS reviewer sessions spawned: ${SESSION_IDS[*]}"
 
+# ── ga-4u16h: per-slot re-convene state (index-aligned with VERDICT_BEAD_IDS /
+# SESSION_IDS / REVIEW_TASKS). RESPAWN_BUDGET caps re-spawns per slot;
+# SLOT_SPAWN_EPOCH anchors each slot's grace window (reset on every re-spawn so a
+# fresh reviewer gets a fair start); SLOT_DEAD_STREAK requires consecutive DEAD
+# reads before acting (transient-list-failure guard).
+RESPAWN_BUDGET=()
+SLOT_SPAWN_EPOCH=()
+SLOT_DEAD_STREAK=()
+_reconvene_init_now=$(date +%s)
+for _ri in "${!SESSION_IDS[@]}"; do
+  RESPAWN_BUDGET+=("$MAX_RESPAWNS_PER_SLOT")
+  SLOT_SPAWN_EPOCH+=("$_reconvene_init_now")
+  SLOT_DEAD_STREAK+=(0)
+done
+
 # ── ga-piscg: spawn mechanism is proven working this sweep → reset the
 # consecutive-abort counter + alert state so a FUTURE outage pages fresh (and so
 # we don't carry a stale count from an outage that has since recovered).
@@ -1191,6 +1312,21 @@ while true; do
   VERDICTS_RECEIVED=0
   ANY_FAIL=0
 
+  # ── ga-4u16h: snapshot reviewer-session liveness ONCE per poll (cheap) so each
+  # still-pending slot can be checked for a DEAD session without N list calls.
+  # Fail-safe: if the list call fails or is unparseable, RECONVENE_LIST_OK stays 0
+  # and NO slot is re-convened this poll (a transient list glitch must never
+  # re-spawn a live reviewer). Skipped entirely when the feature is disabled.
+  RECONVENE_LIST_OK=0
+  RECONVENE_SESS_JSON=""
+  if [ "$MAX_RESPAWNS_PER_SLOT" -gt 0 ]; then
+    RECONVENE_SESS_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "")
+    if [ -n "$RECONVENE_SESS_JSON" ] && echo "$RECONVENE_SESS_JSON" \
+         | jq -e 'if type=="array" then true else has("sessions") end' >/dev/null 2>&1; then
+      RECONVENE_LIST_OK=1
+    fi
+  fi
+
   for j in "${!VERDICT_BEAD_IDS[@]}"; do
     VB="${VERDICT_BEAD_IDS[$j]}"
     VB_JSON=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null || echo "[]")
@@ -1242,6 +1378,50 @@ while true; do
         ANY_FAIL=1
         VERDICT_LABEL=$(echo "$VB_LABELS" | tr ' ' '\n' | grep "^verdict:" | head -1 || echo "no-verdict-label")
         FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) ${VERDICT_LABEL}: verdict bead closed without explicit PASS.\n"
+      fi
+    else
+      # ── ga-4u16h: verdict bead still pending. If this slot's reviewer SESSION
+      # is DEAD (Dolt reset killed it), re-convene a fresh reviewer for THIS slot
+      # rather than waiting the full outer timeout and counting it a false FAIL.
+      # Conservative gating (all must hold): re-convene is enabled, the session
+      # list call succeeded this poll, the slot is past its grace window, the
+      # session reads DEAD for RECONVENE_DEAD_STREAK_MIN consecutive polls, and
+      # respawn budget remains. A live-but-slow reviewer (present + not closed,
+      # incl. `asleep`) is never re-convened.
+      if [ "$MAX_RESPAWNS_PER_SLOT" -gt 0 ] && [ "$RECONVENE_LIST_OK" = "1" ]; then
+        _sid="${SESSION_IDS[$j]}"
+        _spawn_age=$(( NOW_EPOCH - ${SLOT_SPAWN_EPOCH[$j]:-$NOW_EPOCH} ))
+        _present_n=$(echo "$RECONVENE_SESS_JSON" \
+          | jq -r --arg s "$_sid" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | length' 2>/dev/null || echo 1)
+        case "$_present_n" in ''|*[!0-9]*) _present_n=1 ;; esac
+        if [ "$_present_n" -ge 1 ]; then
+          _present_flag=1
+          _closed_flag=$(echo "$RECONVENE_SESS_JSON" \
+            | jq -r --arg s "$_sid" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | .[0].closed // false' 2>/dev/null || echo false)
+        else
+          _present_flag=0
+          _closed_flag=false
+        fi
+        _dead=$(session_is_dead "$_present_flag" "$_closed_flag")
+        # Grace gate: never call a freshly-(re)spawned reviewer dead too early.
+        if [ "$_dead" = "1" ] && [ "$_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
+          SLOT_DEAD_STREAK[$j]=$(( ${SLOT_DEAD_STREAK[$j]:-0} + 1 ))
+        else
+          SLOT_DEAD_STREAK[$j]=0
+        fi
+        _confirmed_dead=0
+        if [ "$_dead" = "1" ] && [ "${SLOT_DEAD_STREAK[$j]:-0}" -ge "$RECONVENE_DEAD_STREAK_MIN" ]; then
+          _confirmed_dead=1
+        fi
+        _action=$(classify_slot_action 0 "$_confirmed_dead" "${RESPAWN_BUDGET[$j]:-0}")
+        if [ "$_action" = "respawn" ]; then
+          RESPAWN_BUDGET[$j]=$(( ${RESPAWN_BUDGET[$j]:-0} - 1 ))
+          _respawn_k=$(( MAX_RESPAWNS_PER_SLOT - ${RESPAWN_BUDGET[$j]} ))
+          log "Re-convening dead reviewer slot $j (respawn ${_respawn_k}/${MAX_RESPAWNS_PER_SLOT}) — session ${SESSION_IDS[$j]} dead, verdict bead ${VERDICT_BEAD_IDS[$j]} still pending."
+          SLOT_SPAWN_EPOCH[$j]="$NOW_EPOCH"   # reset this slot's grace clock
+          SLOT_DEAD_STREAK[$j]=0
+          respawn_reviewer_slot "$j" || true
+        fi
       fi
     fi
   done
