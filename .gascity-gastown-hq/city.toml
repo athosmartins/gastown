@@ -49,6 +49,13 @@ dir = ""
 name = "gastown.deacon"
 suspended = true
 
+# Remote Control OFF for builder dogs (wa-9ye2 / Athos 2026-06-08). Dogs are headless
+# pool builders and must NOT auto-connect to the human's mobile Claude Code app.
+[[patches.agent]]
+dir = ""
+name = "gastown.dog"
+provider = "claude-headless"
+
 [providers.claude]
 base = "builtin:claude"
 
