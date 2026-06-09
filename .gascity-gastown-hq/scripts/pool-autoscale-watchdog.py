@@ -233,11 +233,11 @@ def scale_decision(demand, active, max_active, asleep_available, stuck_count,
                 f"{secs_demand_present:.0f}s/{SCALE_UP_AFTER}s"
             )
         # Hysteresis met — decide scale action
-        if active >= max_active:
-            # Pool saturated: all capacity in use but work still queued
+        if active + watchdog_pins_count >= max_active:
+            # Pool saturated: active sessions + pending watchdog pins reach cap
             return "stuck_alert", (
                 f"demand={demand} queued but pool at max capacity "
-                f"({max_active} active)"
+                f"(active={active} pins={watchdog_pins_count} max={max_active})"
             )
         if asleep_available > 0:
             # Capacity available and a clean asleep member exists → wake it

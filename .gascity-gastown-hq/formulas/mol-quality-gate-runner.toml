@@ -149,7 +149,7 @@ Cannot assign reviewer without risking self-review. Marker left in gate-status:d
 Please investigate the marker bead and either re-queue with correct author or close.
 EOF
 )"
-  gc runtime drain-ack
+  gc runtime drain-ack && exit 0
 fi
 
 if [ "$REVIEWER" = "$AUTHOR" ]; then
@@ -171,7 +171,7 @@ Self-review was blocked. Marker left in gate-status:deferred for Mayor to re-que
 to a different reviewer.
 EOF
 )"
-  gc runtime drain-ack
+  gc runtime drain-ack && exit 0
 fi
 ```
 
@@ -1048,21 +1048,21 @@ R3 (Architecture): $R3_BEAD"
 ```bash
 POLL_START=$(date +%s)
 POLL_TIMEOUT=2700  # 45 minutes for 3 reviewers
-declare -A BEAD_VERDICT
-BEAD_VERDICT[$R1_BEAD]=""
-BEAD_VERDICT[$R2_BEAD]=""
-BEAD_VERDICT[$R3_BEAD]=""
-declare -A BEAD_DONE
-BEAD_DONE[$R1_BEAD]=false
-BEAD_DONE[$R2_BEAD]=false
-BEAD_DONE[$R3_BEAD]=false
+R1_DONE=false; R1_VERDICT=""
+R2_DONE=false; R2_VERDICT=""
+R3_DONE=false; R3_VERDICT=""
 
 while true; do
   ELAPSED=$(( $(date +%s) - POLL_START ))
   ALL_DONE=true
 
   for RBEAD in "$R1_BEAD" "$R2_BEAD" "$R3_BEAD"; do
-    if [ "${BEAD_DONE[$RBEAD]}" = "true" ]; then
+    case "$RBEAD" in
+      "$R1_BEAD") DONE_STATUS="$R1_DONE" ;;
+      "$R2_BEAD") DONE_STATUS="$R2_DONE" ;;
+      *)          DONE_STATUS="$R3_DONE" ;;
+    esac
+    if [ "$DONE_STATUS" = "true" ]; then
       continue
     fi
     BEAD_STATUS=$(bd -C "$GC_CITY_PATH" show "$RBEAD" --json 2>/dev/null \
@@ -1071,8 +1071,11 @@ while true; do
       NOTES=$(bd -C "$GC_CITY_PATH" show "$RBEAD" --json 2>/dev/null \
         | jq -r '.notes // ""' 2>/dev/null || echo "")
       VERDICT=$(echo "$NOTES" | grep -E '^VERDICT:' | head -1 | sed 's/^VERDICT: *//')
-      BEAD_VERDICT[$RBEAD]="$VERDICT"
-      BEAD_DONE[$RBEAD]=true
+      case "$RBEAD" in
+        "$R1_BEAD") R1_VERDICT="$VERDICT"; R1_DONE=true ;;
+        "$R2_BEAD") R2_VERDICT="$VERDICT"; R2_DONE=true ;;
+        *)          R3_VERDICT="$VERDICT"; R3_DONE=true ;;
+      esac
       echo "Reviewer $RBEAD done. VERDICT: $VERDICT"
     else
       ALL_DONE=false
@@ -1086,9 +1089,9 @@ while true; do
   if [ "$ELAPSED" -gt "$POLL_TIMEOUT" ]; then
     echo "ERROR: CODE quorum timed out after ${POLL_TIMEOUT}s."
     PENDING=""
-    for RBEAD in "$R1_BEAD" "$R2_BEAD" "$R3_BEAD"; do
-      [ "${BEAD_DONE[$RBEAD]}" = "false" ] && PENDING="$PENDING $RBEAD"
-    done
+    [ "$R1_DONE" = "false" ] && PENDING="$PENDING $R1_BEAD"
+    [ "$R2_DONE" = "false" ] && PENDING="$PENDING $R2_BEAD"
+    [ "$R3_DONE" = "false" ] && PENDING="$PENDING $R3_BEAD"
     bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "FAIL: CODE quorum timed out. Pending reviewers:$PENDING"
     bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
     bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:failed"  -q 2>/dev/null || true
@@ -1104,10 +1107,7 @@ done
 
 **5. Collect verdicts and make quorum decision:**
 ```bash
-R1_VERDICT="${BEAD_VERDICT[$R1_BEAD]}"
-R2_VERDICT="${BEAD_VERDICT[$R2_BEAD]}"
-R3_VERDICT="${BEAD_VERDICT[$R3_BEAD]}"
-
+# R1_VERDICT, R2_VERDICT, R3_VERDICT already set in the poll loop above
 PASS_COUNT=0
 [ "$R1_VERDICT" = "PASS" ] && PASS_COUNT=$((PASS_COUNT + 1))
 [ "$R2_VERDICT" = "PASS" ] && PASS_COUNT=$((PASS_COUNT + 1))
