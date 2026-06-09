@@ -32,6 +32,14 @@ name = "whatsapp_automation"
 prefix = "wa"
 default_branch = "main"
 
+# deacon repo registered as rig so dc-* bead prefix resolves to the correct DB path
+# (gt-pm55p: cross-rig close failed when bd auto-discovered wrong database from cwd).
+# suspended=true: no crew/witness/refinery workers spawned.
+[[rigs]]
+name = "deacon"
+prefix = "dc"
+suspended = true
+
 [patches]
 
 [[patches.agent]]
