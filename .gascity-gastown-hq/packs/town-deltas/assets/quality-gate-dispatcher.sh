@@ -526,6 +526,10 @@ if [ -n "$_RIG_CANON" ] && [ "$_RIG_CANON" != "$RIG" ]; then
   RIG="$_RIG_CANON"
 fi
 
+# wa-re77: source-bead (BEAD_ID) lives in the RIG's own Dolt DB, not HQ.
+# Use BEAD_CITY for all bd ops on $BEAD_ID; keep GC_CITY for marker/gate-run/verdict ops.
+BEAD_CITY="${RIG_PATH:-$GC_CITY}"
+
 # Determine the canonical git repo location.
 # Container rigs (property_scrapers, lexbh) have a bare .repo.git.
 # Self-repo rigs (gastown, whatsapp_automation, marketing) have .git in root.
@@ -635,16 +639,16 @@ if [ "$ALREADY_MERGED" = "1" ]; then
 
   # Also close the source bead cleanly if open
   if [ -n "$BEAD_ID" ]; then
-    BD_STATUS=$(bd -C "$GC_CITY" show "$BEAD_ID" --json 2>/dev/null \
+    BD_STATUS=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | .status // "open"')
     if [ "$BD_STATUS" != "closed" ]; then
-      bd -C "$GC_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
       # ga-67hae PILOT-CASCADE FIX: branch already merged → strip story:in-flight so
       # the Pilot lane slot frees. The PASS path strips it at merge (ga-3h8l) but this
       # supersede path did not — phantom in-flight slots wedged the Pilot at capacity.
-      bd -C "$GC_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
-      bd -C "$GC_CITY" assign "$BEAD_ID" "" -q 2>/dev/null || true
-      bd -C "$GC_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate superseded (marker $MARKER_ID). story:in-flight stripped (Pilot lane slot freed — ga-67hae pilot-cascade fix); work already merged." 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" assign "$BEAD_ID" "" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate superseded (marker $MARKER_ID). story:in-flight stripped (Pilot lane slot freed — ga-67hae pilot-cascade fix); work already merged." 2>/dev/null || true
     fi
   fi
 
@@ -869,8 +873,8 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
 main HEAD is $MAIN_HEAD_SHA. Conflicting regions: ${CONFLICT_FILES:-unknown}.
 Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, resolve conflicts, and re-run /gate-done." 2>/dev/null || true
       if [ -n "$BEAD_ID" ]; then
-        bd -C "$GC_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$BEAD_ID" "Quality gate blocked: branch $BRANCH has conflicts with current main ($MAIN_HEAD_SHA). Auto-rebase failed (${CONFLICT_FILES:-conflicts}). Manual rebase required — re-run /gate-done after resolving." 2>/dev/null || true
+        bd -C "$BEAD_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate blocked: branch $BRANCH has conflicts with current main ($MAIN_HEAD_SHA). Auto-rebase failed (${CONFLICT_FILES:-conflicts}). Manual rebase required — re-run /gate-done after resolving." 2>/dev/null || true
       fi
       gc --city "$GC_CITY" session nudge "$AUTHOR" \
         "GATE BLOCKED for branch $BRANCH: stale with conflicts — auto-rebase failed. Conflicts: ${CONFLICT_FILES:-unknown}. Manually rebase onto origin/$DEFAULT_BRANCH (main HEAD: $MAIN_HEAD_SHA), resolve conflicts, re-run /gate-done. Bead: $BEAD_ID" \
@@ -893,7 +897,7 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
         bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
         bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED: branch $BRANCH has a genuine conflict (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA), auto-rebase failed $MAX_REBASE_ATTEMPTS times, and no live author session exists. Escalated to Mayor for resolution." 2>/dev/null || true
         if [ -n "$BEAD_ID" ]; then
-          bd -C "$GC_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+          bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
         fi
         gc --city "$GC_CITY" mail send mayor \
           -s "Gate escalation: $BRANCH stranded conflict (no live author)" \
@@ -1775,8 +1779,8 @@ Author must inspect conflict resolution and rebase + resubmit."
 
         # Comment on the source bead explaining what happened
         if [ -n "$BEAD_ID" ]; then
-          bd -C "$GC_CITY" label add "$BEAD_ID" "gate:integrity-fail" -q 2>/dev/null || true
-          bd -C "$GC_CITY" comment "$BEAD_ID" "GATE INTEGRITY FAIL: the merge of branch $BRANCH silently dropped your changes (conflict resolved to main's side).
+          bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:integrity-fail" -q 2>/dev/null || true
+          bd -C "$BEAD_CITY" comment "$BEAD_ID" "GATE INTEGRITY FAIL: the merge of branch $BRANCH silently dropped your changes (conflict resolved to main's side).
 $(echo -e "$INTEGRITY_MSG")
 Revert: $REVERT_STATUS
 Action required: rebase $BRANCH onto current main, resolve conflicts explicitly, and re-submit via /gate-done." 2>/dev/null || true
@@ -1814,11 +1818,11 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
     if [ -n "$BEAD_ID" ] && [ "$DRY_RUN" != "1" ]; then
       # gate:passed is BOTH the success label AND story-delivery's pickup signal
       # (story-delivery selects story:approved + gate:passed, excluding story:done).
-      bd -C "$GC_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
-      bd -C "$GC_CITY" comment "$BEAD_ID" "Quality gate PASSED. Branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) via autonomous dispatcher (gate_run=$GATE_RUN_ID)." 2>/dev/null || true
+      bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED. Branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) via autonomous dispatcher (gate_run=$GATE_RUN_ID)." 2>/dev/null || true
 
       # Read the source bead state authoritatively (labels + live assignee).
-      SRC_JSON=$(bd -C "$GC_CITY" show "$BEAD_ID" --json 2>/dev/null \
+      SRC_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
         | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
       SRC_LABELS=$(printf '%s' "$SRC_JSON" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
       BUILDER_ASSIGNEE=$(printf '%s' "$SRC_JSON" | jq -r '.assignee // ""' 2>/dev/null || echo "")
@@ -1830,7 +1834,7 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
       #     (--assignee <builder>) and from the Pilot's assigned-bead exclusion,
       #     breaking the re-spawn loop even if the close/handoff below fails.
       if [ -n "$BUILDER_ASSIGNEE" ]; then
-        bd -C "$GC_CITY" assign "$BEAD_ID" "" 2>/dev/null \
+        bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null \
           || warn "Could not clear builder assignee on source bead $BEAD_ID"
       fi
 
@@ -1846,16 +1850,16 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
         # wait. The Pilot's Tier-2 selector excludes gate:passed (see
         # pilot-dispatcher.sh), so stripping in-flight does NOT re-expose the
         # bead to re-dispatch.
-        bd -C "$GC_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
         log "Source story $BEAD_ID handed off to delivery (gate:passed set; story:in-flight cleared; builder assignee cleared)."
-        bd -C "$GC_CITY" comment "$BEAD_ID" "Gate PASS handoff (ga-3h8l fix): builder assignee cleared; story:in-flight stripped (lane slot freed at merge); story:approved + gate:passed in place. story-delivery will deploy + prod-test, then mark story:done." 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate PASS handoff (ga-3h8l fix): builder assignee cleared; story:in-flight stripped (lane slot freed at merge); story:approved + gate:passed in place. story-delivery will deploy + prod-test, then mark story:done." 2>/dev/null || true
       else
         # BUG/TASK → close it. bd list defaults to OPEN-only, so closing removes
         # the bead from EVERY open-work selector (Pilot Tier-1 bug & tech-debt),
         # and — combined with the assignee clear — from the pool crash-recovery
         # query. Closing is the durable fix for non-story source beads.
         log "Closing source bug/task $BEAD_ID (gate PASS + merged sha=$MERGE_SHA)."
-        bd -C "$GC_CITY" close "$BEAD_ID" \
+        bd -C "$BEAD_CITY" close "$BEAD_ID" \
           -r "Quality gate PASSED — branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA, gate_run=$GATE_RUN_ID). Closed by autonomous dispatcher (ga-esbg)." \
           2>/dev/null || warn "Could not close source bead $BEAD_ID"
       fi
@@ -1866,7 +1870,7 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
       #     silently leave it).
       RESPAWN_HITS=""
       _still_listed() {  # 0 (true) iff $BEAD_ID is present in `bd list --json <args>`
-        bd -C "$GC_CITY" list --json "$@" 2>/dev/null \
+        bd -C "$BEAD_CITY" list --json "$@" 2>/dev/null \
           | jq -e --arg id "$BEAD_ID" 'any(.[]?; .id == $id)' >/dev/null 2>&1
       }
       # a) Pool in_progress crash-recovery (applies to ALL beads — the core loop).
@@ -1892,7 +1896,7 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
 
       if [ -n "$RESPAWN_HITS" ]; then
         warn "POST-MERGE re-spawn vector STILL PRESENT for $BEAD_ID:$RESPAWN_HITS"
-        bd -C "$GC_CITY" comment "$BEAD_ID" "WARNING (ga-esbg post-merge verify): source bead still appears in open-work selector(s) after gate PASS+merge:$RESPAWN_HITS. This is a re-spawn/re-pick vector — the terminal/handoff transition did not fully take." 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "WARNING (ga-esbg post-merge verify): source bead still appears in open-work selector(s) after gate PASS+merge:$RESPAWN_HITS. This is a re-spawn/re-pick vector — the terminal/handoff transition did not fully take." 2>/dev/null || true
         gc --city "$GC_CITY" mail send mayor \
           -s "Gate post-merge: $BEAD_ID still re-pickable after PASS+merge" \
           -m "$(printf 'Source bead %s PASSED the quality gate and merged (branch %s, sha %s, gate_run %s) but still appears in open-work selector(s):%s\n\nThis leaves a re-spawn / re-pick vector (ga-esbg). The dispatcher could not drive it to terminal/handoff state — investigate (close failed? assignee clear failed? unexpected labels?).' \
@@ -1911,7 +1915,7 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
     # can tell an autonomous Pilot merge apart from a human/Mayor-dispatched one.
     PILOT_ORIGIN=0
     if [ -n "$BEAD_ID" ]; then
-      BEAD_LABELS_NOW=$(bd -C "$GC_CITY" show "$BEAD_ID" --json 2>/dev/null \
+      BEAD_LABELS_NOW=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
         | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
       if echo "$BEAD_LABELS_NOW" | grep -q "pilot:dispatched"; then
         PILOT_ORIGIN=1
@@ -1968,7 +1972,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
     GATE_FIX_CAP=3
 
     # Read the source bead's current labels (story beads live in the HQ/city DB).
-    SRC_LABELS=$(bd -C "$GC_CITY" show "$BEAD_ID" --json 2>/dev/null \
+    SRC_LABELS=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' \
       2>/dev/null || echo "")
 
@@ -1981,17 +1985,17 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
     # (a) ATTACH FEEDBACK TO THE SOURCE BEAD — durable, machine-readable marker
     #     (prefix "GATE-FEEDBACK") so the Pilot can surface it to the re-dispatched
     #     builder verbatim.
-    bd -C "$GC_CITY" comment "$BEAD_ID" "$(printf 'GATE-FEEDBACK (gate_run=%s branch=%s): quality gate FAILED. Fix THESE specific blocking issues, then run /gate-done to re-gate.\n\n%s' \
+    bd -C "$BEAD_CITY" comment "$BEAD_ID" "$(printf 'GATE-FEEDBACK (gate_run=%s branch=%s): quality gate FAILED. Fix THESE specific blocking issues, then run /gate-done to re-gate.\n\n%s' \
       "$GATE_RUN_ID" "$BRANCH" "$(echo -e "$FAIL_REASONS")")" \
       2>/dev/null || warn "Could not attach gate feedback to source bead $BEAD_ID"
-    bd -C "$GC_CITY" label add "$BEAD_ID" "gate:failed" -q 2>/dev/null || true
+    bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:failed" -q 2>/dev/null || true
 
     if [ "$PREV_ATTEMPT" -ge "$GATE_FIX_CAP" ]; then
       # (c) RETRY CAP REACHED — stop auto-retry, escalate to the Mayor ONCE.
       log "Gate fix-attempt cap reached for $BEAD_ID (prev=$PREV_ATTEMPT >= $GATE_FIX_CAP). Escalating; no further auto-retry."
-      bd -C "$GC_CITY" label remove "$BEAD_ID" "gate:needs-fix"   -q 2>/dev/null || true
-      bd -C "$GC_CITY" label add    "$BEAD_ID" "gate:needs-human" -q 2>/dev/null || true
-      bd -C "$GC_CITY" comment "$BEAD_ID" "Gate auto-fix cap ($GATE_FIX_CAP attempts) exhausted — labeled gate:needs-human. The machine could not resolve this after $GATE_FIX_CAP fix cycles; the Pilot will NOT re-dispatch it. Human/Mayor intervention required." 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:needs-fix"   -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate auto-fix cap ($GATE_FIX_CAP attempts) exhausted — labeled gate:needs-human. The machine could not resolve this after $GATE_FIX_CAP fix cycles; the Pilot will NOT re-dispatch it. Human/Mayor intervention required." 2>/dev/null || true
       # Escalate EXACTLY once: only mail if gate:needs-human was not already set.
       if ! printf '%s' "$SRC_LABELS" | grep -q "gate:needs-human"; then
         gc --city "$GC_CITY" mail send mayor \
@@ -2007,20 +2011,20 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       log "Marking $BEAD_ID gate:needs-fix (attempt $NEW_ATTEMPT/$GATE_FIX_CAP) for autonomous Pilot re-dispatch."
       # Bump the attempt counter (drop any stale counters first).
       for OLD in $(printf '%s' "$SRC_LABELS" | tr ' ' '\n' | grep '^gate:fix-attempt:'); do
-        bd -C "$GC_CITY" label remove "$BEAD_ID" "$OLD" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "$OLD" -q 2>/dev/null || true
       done
-      bd -C "$GC_CITY" label add    "$BEAD_ID" "gate:fix-attempt:${NEW_ATTEMPT}" -q 2>/dev/null || true
-      bd -C "$GC_CITY" label add    "$BEAD_ID" "gate:needs-fix"                  -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:fix-attempt:${NEW_ATTEMPT}" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-fix"                  -q 2>/dev/null || true
       # Remove story:in-flight so the Pilot's feature-exclusion no longer hides it.
-      bd -C "$GC_CITY" label remove "$BEAD_ID" "story:in-flight"  -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"  -q 2>/dev/null || true
       # Clear stale Pilot claim labels left over from the failed dispatch.
-      bd -C "$GC_CITY" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
-      bd -C "$GC_CITY" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
       # The Pilot's _filter_candidates drops ASSIGNED beads (both Tier-1 bugs and
       # Tier-2 features), so a stale builder assignee makes a failed bead invisible.
       # Clear it so the next sweep can re-pick this bead.
-      bd -C "$GC_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
-      bd -C "$GC_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight and builder assignee cleared. The Pilot will re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
+      bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight and builder assignee cleared. The Pilot will re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
     fi
   fi
 
