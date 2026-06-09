@@ -1,0 +1,1377 @@
+description = """
+Autonomous quality gate for crew changes before they land on main.
+
+A fresh, independent polecat runs this formula. It receives a branch to
+review and the identity of the original author. The reviewer is NEVER the
+author.
+
+## Two-Tier Review Model
+
+Tier is determined by which files were changed:
+
+| Tier | Files Changed | Gate |
+|------|--------------|------|
+| NON-CODE | Only tests, docs, data (*.md, *_test.go, *.json, *.yaml, *.toml, fixtures/) | 1 separate reviewer session + green test suite |
+| CODE | Any production source file | Quorum of 3 INDEPENDENT reviewer sessions, all must pass |
+
+Any reviewer may escalate the tier UP (e.g., NON-CODE -> CODE if docs change
+touches security-sensitive configuration). Tier can never be downgraded.
+
+Ambiguous files (e.g., a .md file that appears to contain code, or a .json
+that looks like configuration driving security): escalate tier to CODE.
+
+## Independent Quorum Mechanism
+
+DESIGN NOTE: Genuine independence is achieved as follows:
+
+For CODE tier, the gate-runner formula:
+1. Creates 3 separate review-assignment beads (one per reviewer lens).
+2. Sleds each bead to the gastown/claude pool via `gc sling gastown/claude <id>`
+   using `--formula mol-review-leg`. Each spawns a FRESH session (no shared
+   context). Each reviewer writes its verdict (PASS/FAIL + reasoning) into that
+   bead's notes, then closes the bead.
+3. The runner polls all 3 beads (up to a timeout) for completion.
+4. Quorum passes only if ALL 3 beads closed with VERDICT:PASS in notes.
+
+TRADEOFF: `gc session new` requires a human attach; in a headless launchd
+context we use `gc sling` which routes to the pool without interactive attach.
+The pool worker runs in a separate session from the runner — genuine process
+isolation. The 3 reviewer sessions do not share context with each other nor with
+the runner session. There is NO shared Claude context window.
+
+LIMITATION: A single pool worker could pick up multiple review legs sequentially
+if the pool is under-sized. For fully guaranteed simultaneous independence,
+ensure at least 3 idle pool workers exist in gastown/claude. For one-at-a-time
+sequential independence (weaker but still no shared context), the current
+approach is sufficient.
+
+For NON-CODE tier, 1 reviewer bead is created and slid to gastown/claude. That
+reviewer also hard-checks for code disguised as docs (tier escalation).
+
+## Outcome
+
+| Result | Action |
+|--------|--------|
+| PASS (NON-CODE) | 1 reviewer approved + tests green -> merge branch to main |
+| PASS (CODE) | All 3 reviewers approved -> merge branch to main |
+| FAIL | Mark bead, notify author, do NOT merge |
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| branch | guard | Branch to gate (e.g., polecat/Nux/gt-abc) |
+| bead_id | guard | Source issue bead ID |
+| author | guard | Original worker name (reviewer must not be this person) |
+| base_commit | guard | Base commit SHA when work started |
+| rig | guard | The rig this work belongs to |
+| gate_run_id | guard | Tracking bead for this gate run |
+| marker_id | guard | Ready-for-gate marker bead ID |
+
+## CRITICAL Rules
+
+- NEVER touch the author's worktree. Use a detached worktree in /tmp/.
+- NEVER merge if any reviewer has a blocking issue.
+- NEVER downgrade the tier.
+- After merge OR fail, ALWAYS update the gate-run bead and clear the marker.
+- The author variable comes from the guard; if blank, this session MUST NOT
+  proceed -- mail mayor and drain immediately.
+- The bd commands ALWAYS use -C "$GC_CITY_PATH" to target the correct database.
+"""
+formula = "mol-quality-gate-runner"
+version = 3
+
+[vars]
+[vars.branch]
+description = "Branch to gate (e.g., polecat/Nux/gt-abc)"
+required = true
+
+[vars.bead_id]
+description = "Source issue bead ID"
+required = true
+
+[vars.author]
+description = "Original worker name (reviewer is never this person). MUST be non-empty -- fail-safe."
+required = true
+
+[vars.base_commit]
+description = "Base commit SHA when work started (for context)"
+required = false
+
+[vars.rig]
+description = "The rig this work belongs to"
+required = true
+
+[vars.gate_run_id]
+description = "Gate-run tracking bead ID (for structured log)"
+required = true
+
+[vars.marker_id]
+description = "Ready-for-gate marker bead ID (cleared on completion)"
+required = true
+
+[[steps]]
+id = "setup-worktree"
+title = "Set up detached review worktree"
+description = """
+Create a DETACHED worktree in /tmp for the review. NEVER touch the author's
+live worktree.
+
+**0. Author identity fail-safe (FIRST -- before any other work):**
+```bash
+gc prime
+bd prime
+```
+
+Check that `{{author}}` is non-empty and that you (the reviewer) are NOT the author.
+Your identity is `$GC_ALIAS` (or `$BEADS_ACTOR`).
+
+```bash
+REVIEWER="${GC_ALIAS:-${BEADS_ACTOR:-}}"
+AUTHOR="{{author}}"
+
+if [ -z "$AUTHOR" ]; then
+  # Author unknown -- FAIL-SAFE: do NOT proceed, defer marker, alert Mayor.
+  bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "DEFERRED: author field is empty. Cannot safely assign reviewer without risking self-review. Marking for Mayor investigation."
+  bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:deferred" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:deferred" -q 2>/dev/null || true
+  gc mail send gastown.mayor -s "QUALITY GATE: author missing on {{branch}}" -m "$(cat <<'EOF'
+Gate deferred -- author field is empty on marker {{marker_id}}.
+
+Branch: {{branch}}
+Bead:   {{bead_id}}
+Gate:   {{gate_run_id}}
+Rig:    {{rig}}
+
+Cannot assign reviewer without risking self-review. Marker left in gate-status:deferred.
+Please investigate the marker bead and either re-queue with correct author or close.
+EOF
+)"
+  gc runtime drain-ack
+fi
+
+if [ "$REVIEWER" = "$AUTHOR" ]; then
+  # Self-review violation -- fail-safe.
+  bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "DEFERRED: reviewer ($REVIEWER) == author ($AUTHOR). Self-review prevented by fail-safe."
+  bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:deferred" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:deferred" -q 2>/dev/null || true
+  gc mail send gastown.mayor -s "QUALITY GATE: self-review blocked on {{branch}}" -m "$(cat <<'EOF'
+Gate deferred -- guard dispatched author as reviewer.
+
+Branch:   {{branch}}
+Bead:     {{bead_id}}
+Gate:     {{gate_run_id}}
+Rig:      {{rig}}
+
+Self-review was blocked. Marker left in gate-status:deferred for Mayor to re-queue
+to a different reviewer.
+EOF
+)"
+  gc runtime drain-ack
+fi
+```
+
+If either check fires: mail Mayor and drain. Do NOT continue.
+
+**1. Record start time:**
+```bash
+GATE_START=$(date +%s)
+echo "Gate started at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "Reviewer: $REVIEWER  Author: $AUTHOR  (distinct -- safe to proceed)"
+```
+
+**2. Find rig path:**
+```bash
+RIG_PATH=$(gc --city "$GC_CITY_PATH" rig list --json 2>/dev/null \
+  | jq -r --arg name "{{rig}}" '.rigs[] | select(.name == $name) | .path' \
+  2>/dev/null || echo "")
+if [ -z "$RIG_PATH" ]; then
+  # Fallback: derive from city path parent (rigs live alongside the city dir)
+  CITY_PARENT=$(dirname "${GC_CITY_PATH:-$HOME/gt}")
+  RIG_PATH="$CITY_PARENT/{{rig}}"
+fi
+echo "Rig path: $RIG_PATH"
+```
+
+**2b. Resolve the actual git repo root for the rig (DEFECT-1 fix):**
+
+For container rigs (e.g. property_scrapers), `$RIG_PATH` has no `.git` — git walks
+UP to the monorepo, targeting the wrong origin. We resolve with priority:
+  1. `$RIG_PATH` itself, if it is a self-contained git repo root
+  2. `$RIG_PATH/refinery/rig`, if it has `.git` (dedicated clone)
+  3. `$RIG_PATH/.repo.git` as bare git-dir (worktree operations only)
+  4. FAIL CLEANLY — never silently target the wrong repo.
+
+```bash
+# ── repo discovery ──────────────────────────────────────────────────────────
+REPO_PATH=""
+
+# 1. $RIG_PATH itself is its own git repo root
+if [ -e "$RIG_PATH/.git" ]; then
+  TOPLEVEL=$(git -C "$RIG_PATH" rev-parse --show-toplevel 2>/dev/null || echo "")
+  if [ "$TOPLEVEL" = "$RIG_PATH" ]; then
+    REPO_PATH="$RIG_PATH"
+  fi
+fi
+
+# 2. refinery/rig is a dedicated clone with .git
+if [ -z "$REPO_PATH" ] && [ -e "$RIG_PATH/refinery/rig/.git" ]; then
+  REPO_PATH="$RIG_PATH/refinery/rig"
+fi
+
+# 3. bare .repo.git exists (worktree operations can use it as GIT_DIR)
+if [ -z "$REPO_PATH" ] && [ -d "$RIG_PATH/.repo.git" ]; then
+  REPO_PATH="$RIG_PATH/.repo.git"
+fi
+
+# 4. No valid repo found — fail cleanly, never silently target wrong repo
+if [ -z "$REPO_PATH" ]; then
+  echo "ERROR: Cannot resolve git repo for rig '{{rig}}' at $RIG_PATH"
+  bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "ERROR: No git repo found for rig '{{rig}}' at $RIG_PATH. Checked: .git (self), refinery/rig/.git, .repo.git."
+  bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:error"   -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:error"   -q 2>/dev/null || true
+  gc mail send gastown.mayor -s "Quality gate ERROR: no git repo for rig {{rig}}" -m "$(cat <<'EOF'
+Cannot resolve git repo for rig {{rig}} at $RIG_PATH.
+Checked: .git (self), refinery/rig/.git, .repo.git.
+
+Branch: {{branch}}
+Bead:   {{bead_id}}
+Gate:   {{gate_run_id}}
+
+Please verify the rig path and repo structure, then re-queue.
+EOF
+)" 2>/dev/null || true
+  gc runtime drain-ack
+fi
+
+# Defensive: verify origin does NOT point at the gastown monorepo
+# (a telltale sign of misresolution — git walked up from a container path)
+# FM-1 FIX: also reject remotes without .git suffix (bare HTTPS clones) and
+# any path containing /gastown as the repo root (not just /gastown.git).
+REPO_ORIGIN=$(git -C "$REPO_PATH" remote get-url origin 2>/dev/null || echo "")
+if echo "$REPO_ORIGIN" | grep -qiE "/gastown([.]git)?(/|$)"; then
+  echo "ERROR: Resolved repo origin is gastown — this is a misresolution."
+  echo "  REPO_PATH=$REPO_PATH  origin=$REPO_ORIGIN"
+  bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "ERROR: Resolved git repo origin is gastown.git — misresolution. REPO_PATH=$REPO_PATH origin=$REPO_ORIGIN"
+  bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:error"   -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:error"   -q 2>/dev/null || true
+  gc mail send gastown.mayor -s "Quality gate ERROR: repo misresolution for rig {{rig}}" -m "$(cat <<'EOF'
+Git repo resolved to gastown.git — this is wrong.
+
+Rig:        {{rig}}
+RIG_PATH:   $RIG_PATH
+REPO_PATH:  $REPO_PATH
+origin:     $REPO_ORIGIN
+
+This would target the wrong repository. Gate aborted.
+Branch: {{branch}}  Gate: {{gate_run_id}}
+EOF
+)" 2>/dev/null || true
+  gc runtime drain-ack
+fi
+
+echo "Resolved repo: $REPO_PATH  (origin: $REPO_ORIGIN)"
+
+# FM-2: defense-in-depth — validate origin is non-empty and not gastown before use.
+if [ -z "$REPO_ORIGIN" ]; then
+  echo "ERROR: Resolved repo at $REPO_PATH has no 'origin' remote — cannot push or verify."
+  bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "ERROR: REPO_PATH=$REPO_PATH has no origin remote. Cannot proceed safely."
+  bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:error"   -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:error"   -q 2>/dev/null || true
+  gc mail send gastown.mayor -s "Quality gate ERROR: no origin for rig {{rig}}" -m "$(cat <<'EOF'
+Resolved repo has no origin remote — gate aborted.
+
+Rig:       {{rig}}
+REPO_PATH: $REPO_PATH
+Branch:    {{branch}}
+Gate:      {{gate_run_id}}
+EOF
+)" 2>/dev/null || true
+  gc runtime drain-ack
+fi
+# ── end repo discovery ────────────────────────────────────────────────────
+```
+
+**3. Fetch the branch (using resolved REPO_PATH for ALL git operations):**
+```bash
+git -C "$REPO_PATH" fetch --prune origin
+BRANCH_REF=$(git -C "$REPO_PATH" ls-remote origin "refs/heads/{{branch}}" 2>/dev/null | head -1 | awk '{print $1}')
+```
+
+If the branch does not exist on remote (BRANCH_REF is empty):
+```bash
+# Branch missing -- fail the gate
+bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "FAIL: branch {{branch}} not found on remote. Cannot review."
+bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:failed"  -q 2>/dev/null || true
+# Reset marker so author can re-push and re-run /gate-done
+bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:failed"  -q 2>/dev/null || true
+# Notify author via mail (durable, survives session death)
+gc mail send "{{author}}" -s "Quality gate FAILED: branch missing for {{branch}}" -m "$(cat <<'EOF'
+Quality gate FAILED for {{branch}} ({{bead_id}}).
+
+Reason: Branch not found on remote. Please re-push and run /gate-done again.
+
+Gate run: {{gate_run_id}}
+EOF
+)" 2>/dev/null || true
+gc runtime drain-ack
+```
+
+**4. Clean up any leftover worktree from a previous crashed run:**
+```bash
+WORKTREE_PATH="/tmp/gate-review-{{bead_id}}"
+if [ -d "$WORKTREE_PATH" ]; then
+  echo "Stale worktree found at $WORKTREE_PATH from a previous run -- cleaning up."
+  git -C "$REPO_PATH" worktree remove "$WORKTREE_PATH" --force 2>/dev/null || rm -rf "$WORKTREE_PATH"
+fi
+```
+
+**5. Create detached worktree:**
+```bash
+git -C "$REPO_PATH" worktree add "$WORKTREE_PATH" "origin/{{branch}}" 2>&1
+echo "Worktree: $WORKTREE_PATH"
+REVIEW_HEAD_SHA=$(git -C "$WORKTREE_PATH" rev-parse HEAD)
+echo "Review HEAD: $REVIEW_HEAD_SHA"
+```
+
+**Exit criteria:** Author identity verified (reviewer != author), worktree created at `$WORKTREE_PATH`.
+"""
+
+[[steps]]
+id = "classify-tier"
+title = "Classify change tier: NON-CODE or CODE"
+needs = ["setup-worktree"]
+description = """
+Determine the review tier by inspecting changed files.
+
+**1. Get the diff fileset:**
+```bash
+BASE=$(git -C "$WORKTREE_PATH" merge-base HEAD origin/main 2>/dev/null || echo "")
+if [ -z "$BASE" ]; then
+  BASE=$(git -C "$WORKTREE_PATH" rev-parse origin/main 2>/dev/null || echo "")
+fi
+CHANGED_FILES=$(git -C "$WORKTREE_PATH" diff --name-only "${BASE}...HEAD" 2>/dev/null || \
+                git -C "$WORKTREE_PATH" diff --name-only "HEAD" 2>/dev/null || echo "")
+echo "Changed files:"
+echo "$CHANGED_FILES"
+```
+
+**2. Classify each file:**
+
+NON-CODE file patterns (ALL must match for NON-CODE tier):
+- `*.md` -- documentation
+- `*_test.go` or `*.test.*` -- test files
+- `*.json`, `*.yaml`, `*.toml` (non-security, non-config) -- data files
+- `testdata/`, `fixtures/`, `docs/` -- test/docs directories
+
+CODE file patterns (ANY match -> CODE tier):
+- `*.go` (non-test), `*.ts`, `*.js`, `*.py`, `*.sh` -- source code
+- `cmd/`, `internal/`, `pkg/`, `src/` -- source directories
+- `Makefile`, `Dockerfile*`, `*.nix` -- build files
+- `*config*`, `*secret*`, `*credential*` -- config/security files
+
+AMBIGUOUS patterns (any match -> escalate to CODE tier):
+- Any `.md` file containing fenced code blocks longer than 20 lines
+- Any `.json`/`.yaml`/`.toml` file in a `cmd/`, `internal/`, or `secrets/` subtree
+- Any file where the extension does not match its content (e.g., shell commands in a .md)
+
+**3. Determine tier:**
+```bash
+TIER="NON-CODE"  # default; escalate if any file matches CODE patterns
+
+AMBIGUOUS=false
+
+while IFS= read -r FILE; do
+  [ -z "$FILE" ] && continue
+  # Check CODE patterns (exact source code files, non-test)
+  if echo "$FILE" | grep -qE '\\.(go|ts|tsx|js|jsx|py|sh|bash)$' && \
+     ! echo "$FILE" | grep -qE '_test\\.(go|ts|js|py)$'; then
+    TIER="CODE"
+    break
+  fi
+  if echo "$FILE" | grep -qE '^(cmd|internal|pkg|src)/' || \
+     echo "$FILE" | grep -qE '(Makefile|Dockerfile|\\.nix)$' || \
+     echo "$FILE" | grep -qiE '(config|secret|credential)'; then
+    TIER="CODE"
+    break
+  fi
+  # Ambiguous: .md file with large code blocks -- escalate to CODE
+  if echo "$FILE" | grep -qE '\\.md$'; then
+    FULL_PATH="$WORKTREE_PATH/$FILE"
+    if [ -f "$FULL_PATH" ]; then
+      # Count lines inside fenced code blocks
+      CODE_LINES=$(awk '/^```/{if(in_block){in_block=0}else{in_block=1;next}} in_block{count++} END{print count+0}' "$FULL_PATH" 2>/dev/null || echo "0")
+      if [ "$CODE_LINES" -gt 20 ]; then
+        echo "AMBIGUOUS: $FILE contains $CODE_LINES lines of code blocks -- escalating to CODE tier"
+        AMBIGUOUS=true
+        TIER="CODE"
+        break
+      fi
+    fi
+  fi
+done <<< "$CHANGED_FILES"
+
+echo "Tier: $TIER (ambiguous=$AMBIGUOUS)"
+bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "Classified tier: $TIER (ambiguous=$AMBIGUOUS). Changed files: $(echo "$CHANGED_FILES" | wc -l | tr -d ' ') files."
+bd -C "$GC_CITY_PATH" label add {{gate_run_id}} "tier:$TIER" -q 2>/dev/null || true
+```
+
+**Note:** As reviewer, you may UPGRADE the tier (NON-CODE -> CODE) if you believe
+the change touches security-sensitive or architecturally critical code. NEVER downgrade.
+Ambiguous cases ALWAYS escalate to CODE.
+
+**Exit criteria:** `$TIER` set to `NON-CODE` or `CODE`.
+"""
+
+[[steps]]
+id = "run-tests"
+title = "Run test suite (hard gate for both tiers)"
+needs = ["classify-tier"]
+description = """
+Run the test suite. Test failure is a hard gate for BOTH tiers.
+Missing test command is treated as an OPT-OUT (warning), NOT a green pass.
+
+**1. Detect test command (DEFECT-2 fix: includes python/pytest):**
+```bash
+# Auto-detect from project structure only (no gc config get -- command does not exist)
+# Priority: go > npm > python/pytest > (none = opt-out)
+if [ -f "$WORKTREE_PATH/go.mod" ]; then
+  RIG_TEST_CMD="go test ./..."
+  RIG_TEST_SETUP=""
+elif [ -f "$WORKTREE_PATH/package.json" ] && \
+     grep -q '"test"' "$WORKTREE_PATH/package.json" 2>/dev/null; then
+  RIG_TEST_CMD="npm test"
+  RIG_TEST_SETUP=""
+elif [ -f "$WORKTREE_PATH/requirements.txt" ] || \
+     [ -f "$WORKTREE_PATH/pyproject.toml" ] || \
+     [ -f "$WORKTREE_PATH/pytest.ini" ] || \
+     [ -f "$WORKTREE_PATH/setup.cfg" ] || \
+     [ -d "$WORKTREE_PATH/lib/tests" ] || \
+     [ -d "$WORKTREE_PATH/tests" ]; then
+  # Python rig: FM-3 FIX — use a throwaway virtualenv for full isolation.
+  # This prevents stale/host packages from producing false-green test results.
+  # A venv creation failure or dep-install failure MUST block the gate (not opt-out).
+  if [ -d "$WORKTREE_PATH/lib/tests" ]; then
+    RIG_TEST_CMD="python -m pytest lib/tests/ -v"
+  else
+    RIG_TEST_CMD="python -m pytest -q"
+  fi
+  # Setup: create isolated venv, install pytest + requirements into it.
+  # VENV_BIN is exported so RIG_TEST_CMD can use the venv python/pytest.
+  # If venv creation fails → VENV_CREATE_FAIL=1 → gate treats as test failure.
+  # FM-3 FIX: preserve the correct pytest target when building the venv command.
+  # The original setup strings ended with RIG_TEST_CMD="VENV_BIN/python -m pytest -q",
+  # discarding the lib/tests/ -v target computed above.
+  # Fix: setup strings install deps and set VENV_BIN only; RIG_TEST_CMD is
+  # rebuilt AFTER eval using the correct venv python AND the right target.
+  # See the run-tests step below where RIG_TEST_CMD is rebuilt from VENV_BIN.
+  if [ -f "$WORKTREE_PATH/requirements.txt" ]; then
+    RIG_TEST_SETUP='VENV_DIR=$(mktemp -d)/v; python3 -m venv "$VENV_DIR" && VENV_BIN="$VENV_DIR/bin" || { echo "ERROR: venv creation failed — treating as test failure"; exit 1; }; "$VENV_BIN/pip" install -q pytest && timeout 60 "$VENV_BIN/pip" install -q -r requirements.txt || { echo "ERROR: dep install failed — treating as test failure"; exit 1; }'
+  else
+    RIG_TEST_SETUP='VENV_DIR=$(mktemp -d)/v; python3 -m venv "$VENV_DIR" && VENV_BIN="$VENV_DIR/bin" || { echo "ERROR: venv creation failed — treating as test failure"; exit 1; }; "$VENV_BIN/pip" install -q pytest || { echo "ERROR: pytest install failed — treating as test failure"; exit 1; }'
+  fi
+else
+  RIG_TEST_CMD=""
+  RIG_TEST_SETUP=""
+fi
+
+echo "Test command: ${RIG_TEST_CMD:-<none detected>}"
+```
+
+**2. Run tests:**
+```bash
+if [ -n "$RIG_TEST_CMD" ]; then
+  cd "$WORKTREE_PATH"
+  # FM-3 FIX: setup (venv creation + dep install) is NOT best-effort.
+  # A failed setup means we cannot trust the test results — block the gate.
+  if [ -n "$RIG_TEST_SETUP" ]; then
+    echo "Running test setup (isolated venv)"
+    SETUP_OUTPUT=$(eval "$RIG_TEST_SETUP" 2>&1)
+    SETUP_EXIT=$?
+    echo "$SETUP_OUTPUT" | tail -10
+    if [ "$SETUP_EXIT" -ne 0 ]; then
+      TEST_OUTPUT="SETUP FAILED (exit $SETUP_EXIT): cannot establish isolated test environment.
+$SETUP_OUTPUT"
+      TEST_EXIT=1
+    else
+      # FM-3 FIX: rebuild RIG_TEST_CMD using the venv python AND the correct
+      # target (lib/tests/ -v or -q) that was determined above. The setup string
+      # only installs deps and sets $VENV_BIN; it does NOT set RIG_TEST_CMD anymore,
+      # so the target computed before setup is preserved here.
+      if [ -d "$WORKTREE_PATH/lib/tests" ]; then
+        RIG_TEST_CMD="$VENV_BIN/python -m pytest lib/tests/ -v"
+      else
+        RIG_TEST_CMD="$VENV_BIN/python -m pytest -q"
+      fi
+      echo "Running tests: $RIG_TEST_CMD"
+      TEST_OUTPUT=$(timeout 300 bash -c "$RIG_TEST_CMD" 2>&1)
+      TEST_EXIT=$?
+      echo "$TEST_OUTPUT" | tail -20
+    fi
+  else
+    TEST_OUTPUT=$(timeout 300 bash -c "$RIG_TEST_CMD" 2>&1)
+    TEST_EXIT=$?
+    echo "$TEST_OUTPUT" | tail -20
+  fi
+else
+  # NO TEST COMMAND: this is an OPT-OUT, not a pass. Log it, continue with
+  # strong warning. The reviewer will note this in the review.
+  # It does NOT count as green -- reviewers must explicitly accept the gap.
+  echo "WARNING: No test command detected for rig {{rig}}. This is an OPT-OUT from automated testing."
+  echo "Reviewers will be informed. They must explicitly accept the testing gap or FAIL the gate."
+  TEST_EXIT=0
+  TEST_OUTPUT="OPT-OUT: No test command detected for rig {{rig}}. Automated test coverage unknown."
+  bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "WARNING: No test command detected -- test coverage is unverified. Reviewers must explicitly accept or reject this gap."
+  bd -C "$GC_CITY_PATH" label add {{gate_run_id}} "tests:opt-out" -q 2>/dev/null || true
+fi
+```
+
+**3. Handle test failure:**
+
+If `TEST_EXIT != 0`:
+```bash
+# Record failure
+bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "TESTS FAILED (exit $TEST_EXIT):
+$(echo "$TEST_OUTPUT" | tail -30)"
+bd -C "$GC_CITY_PATH" label add {{gate_run_id}} "tests:failed" -q 2>/dev/null || true
+
+# Transition gate-run to failed
+bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:failed"  -q 2>/dev/null || true
+
+# Update marker
+bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:failed"  -q 2>/dev/null || true
+
+# Notify author via mail (durable)
+gc mail send "{{author}}" -s "Quality gate FAILED: tests red for {{branch}}" -m "$(cat <<'EOF'
+Quality gate FAILED for {{branch}} ({{bead_id}}).
+
+Reason: Test suite is red. Fix tests and re-run /gate-done.
+
+Gate run: {{gate_run_id}}
+EOF
+)" 2>/dev/null || true
+
+# Append to structured gate log
+# FM-1 FIX: use -c (compact) so each event is a single line.
+# The painel reads JSON-LINES (one object per line); pretty-printed
+# multi-line JSON breaks json.loads() per line.
+QG_LOG="${GC_CITY_PATH}/.gc/quality-gate.jsonl"
+mkdir -p "$(dirname "$QG_LOG")"
+jq -c -n \
+  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg branch "{{branch}}" \
+  --arg bead "{{bead_id}}" \
+  --arg rig "{{rig}}" \
+  --arg tier "$TIER" \
+  --arg result "FAIL" \
+  --arg reason "test_suite_red" \
+  --arg gate_run "{{gate_run_id}}" \
+  '{ts: $ts, branch: $branch, bead: $bead, rig: $rig, tier: $tier, result: $result, reason: $reason, gate_run: $gate_run}' \
+  >> "$QG_LOG"
+
+# Cleanup worktree
+git -C "$REPO_PATH" worktree remove "$WORKTREE_PATH" --force 2>/dev/null || rm -rf "$WORKTREE_PATH"
+
+gc runtime drain-ack
+```
+
+If `TEST_EXIT == 0`:
+```bash
+echo "Tests PASSED (or opted-out -- reviewers will assess)."
+bd -C "$GC_CITY_PATH" label add {{gate_run_id}} "tests:passed" -q 2>/dev/null || true
+```
+
+**Exit criteria:** Tests passed or opted-out (reviewers will assess); continue to review steps.
+"""
+
+[[steps]]
+id = "review-non-code"
+title = "NON-CODE tier: single independent reviewer session"
+needs = ["run-tests"]
+description = """
+**Only runs when TIER == "NON-CODE". Skip this step if TIER == "CODE".**
+
+For NON-CODE changes, one INDEPENDENT reviewer session (gastown/claude pool
+worker) examines the diff. The reviewer is dispatched via gc sling, runs in
+a separate session with no shared context, and writes its verdict to the
+review bead notes.
+
+**1. Check tier:**
+```bash
+if [ "$TIER" != "NON-CODE" ]; then
+  echo "Tier is CODE -- skipping NON-CODE review step."
+  # Do NOT drain -- continue to code-review-quorum
+  exit 0
+fi
+```
+
+**2. Build the diff for the review prompt:**
+```bash
+cd "$WORKTREE_PATH"
+DIFF=$(git diff "origin/main...HEAD" 2>/dev/null | head -600)
+CHANGED_LIST=$(git diff --name-only "origin/main...HEAD" 2>/dev/null || echo "")
+TESTS_STATUS=$(bd -C "$GC_CITY_PATH" show {{gate_run_id}} --json 2>/dev/null \
+  | jq -r '(.labels // []) | map(select(startswith("tests:"))) | .[0] // "tests:unknown"')
+```
+
+**3. Create the review assignment bead:**
+```bash
+REVIEW_BEAD_ID=$(bd -C "$GC_CITY_PATH" create \
+  "gate-review: {{branch}} (NON-CODE)" \
+  -t chore --ephemeral \
+  -l type:gate-review-assignment \
+  -l gate-review:pending \
+  -l "source-gate:{{gate_run_id}}" \
+  --metadata '{"coordinator": "'"$REVIEWER"'", "gate_run_id": "{{gate_run_id}}", "review_leg": "noncode"}' \
+  -d "## Quality Gate Review Assignment
+
+You are a review session for quality gate on branch **{{branch}}** (bead {{bead_id}}).
+
+**Author (who wrote this):** {{author}}
+**Reviewer (you):** distinct from author
+**Test status:** $TESTS_STATUS
+**Tier:** NON-CODE
+
+## Your review responsibilities
+
+1. Verify documentation changes are accurate and not misleading.
+2. Verify test changes actually test what they claim.
+3. Verify data/config changes are safe and non-breaking.
+4. Check for accidental security-sensitive data included.
+5. **HARD-CHECK: No code disguised as docs/tests.** If you find source code
+   changes hidden in .md or other non-code files, ESCALATE TIER to CODE and
+   record it as FAIL with reason 'tier_escalation_required'. The runner will
+   re-queue through the full CODE quorum.
+6. **FM-4 REQUIRED: If tests opted-out** (test status is 'tests:opt-out'), you
+   MUST include a 'Testing-gap:' line in your verdict. You cannot silently
+   ignore this. Either:
+   - 'Testing-gap: ACCEPTED — <reason why no tests is acceptable here>'
+   - 'Testing-gap: REJECTED — <reason>' (which makes your VERDICT: FAIL)
+   A PASS without a Testing-gap line when tests opted-out is INVALID and will
+   be treated as FAIL by the runner.
+
+## Changed files
+
+$CHANGED_LIST
+
+## Diff (first 600 lines)
+
+```diff
+$DIFF
+```
+
+## Required output format
+
+Write your verdict to the bead notes using EXACTLY this format:
+
+```
+VERDICT: PASS
+Grade: <A|B|C|D|F>
+Blocking: none
+Testing-gap: ACCEPTED — <reason>   (REQUIRED when tests:opt-out; omit otherwise)
+Notes: <summary>
+```
+
+or
+
+```
+VERDICT: FAIL
+Grade: <A|B|C|D|F>
+Blocking: <list of blocking issues>
+Testing-gap: REJECTED — <reason>   (REQUIRED when tests:opt-out; omit otherwise)
+Notes: <summary>
+```
+
+or (if you find hidden code):
+
+```
+VERDICT: ESCALATE
+Reason: tier_escalation_required
+Notes: <what you found>
+```
+
+After writing your verdict to notes, close this bead." \
+  --json 2>/dev/null | jq -r '.id // empty')
+
+if [ -z "$REVIEW_BEAD_ID" ]; then
+  echo "ERROR: Failed to create review assignment bead. Failing gate."
+  bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:failed"  -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:error"   -q 2>/dev/null || true
+  gc runtime drain-ack
+fi
+
+echo "Review assignment bead created: $REVIEW_BEAD_ID"
+```
+
+**4. Sling the review bead to an independent reviewer session:**
+```bash
+# This routes to a gastown/claude pool worker -- a SEPARATE session from this runner.
+# The reviewer runs in a completely isolated context with NO shared Claude context.
+gc --city "$GC_CITY_PATH" sling gastown/claude "$REVIEW_BEAD_ID" --formula mol-review-leg \
+  --no-convoy 2>/dev/null || {
+    echo "WARNING: sling failed, trying without formula"
+    gc --city "$GC_CITY_PATH" sling gastown/claude "$REVIEW_BEAD_ID" --no-convoy 2>/dev/null || true
+  }
+
+echo "Review bead $REVIEW_BEAD_ID dispatched to independent reviewer session."
+```
+
+**5. Poll for review completion (timeout: 20 minutes):**
+```bash
+POLL_START=$(date +%s)
+POLL_TIMEOUT=1200  # 20 minutes
+REVIEW_VERDICT=""
+
+while true; do
+  ELAPSED=$(( $(date +%s) - POLL_START ))
+  if [ "$ELAPSED" -gt "$POLL_TIMEOUT" ]; then
+    echo "ERROR: Review timed out after ${POLL_TIMEOUT}s waiting for $REVIEW_BEAD_ID"
+    bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "FAIL: NON-CODE review timed out after ${POLL_TIMEOUT}s. Reviewer bead: $REVIEW_BEAD_ID"
+    bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+    bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:failed"  -q 2>/dev/null || true
+    bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+    bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:error"   -q 2>/dev/null || true
+    gc runtime drain-ack
+  fi
+
+  # Check if bead is closed (reviewer finished)
+  BEAD_STATUS=$(bd -C "$GC_CITY_PATH" show "$REVIEW_BEAD_ID" --json 2>/dev/null \
+    | jq -r '.status // "open"' 2>/dev/null || echo "open")
+
+  if [ "$BEAD_STATUS" = "closed" ]; then
+    # Extract verdict from notes
+    REVIEW_NOTES=$(bd -C "$GC_CITY_PATH" show "$REVIEW_BEAD_ID" --json 2>/dev/null \
+      | jq -r '.notes // ""' 2>/dev/null || echo "")
+    REVIEW_VERDICT=$(echo "$REVIEW_NOTES" | grep -E '^VERDICT:' | head -1 | sed 's/^VERDICT: *//')
+    echo "Reviewer completed. VERDICT: $REVIEW_VERDICT"
+    break
+  fi
+
+  echo "Waiting for reviewer... (${ELAPSED}s elapsed)"
+  sleep 30
+done
+```
+
+**6. Handle verdict:**
+```bash
+if [ "$REVIEW_VERDICT" = "PASS" ]; then
+  bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "NON-CODE review PASS.
+Reviewer bead: $REVIEW_BEAD_ID
+Notes: $(bd -C "$GC_CITY_PATH" show "$REVIEW_BEAD_ID" --json 2>/dev/null | jq -r '.notes // ""' | head -20)"
+  bd -C "$GC_CITY_PATH" label add {{gate_run_id}} "review-noncode:pass" -q 2>/dev/null || true
+  # Continue to merge-change
+
+elif [ "$REVIEW_VERDICT" = "ESCALATE" ]; then
+  # Reviewer found hidden code -- escalate tier and re-queue as CODE
+  ESCALATE_NOTES=$(bd -C "$GC_CITY_PATH" show "$REVIEW_BEAD_ID" --json 2>/dev/null | jq -r '.notes // ""')
+  bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "TIER ESCALATED: NON-CODE reviewer found code in docs.
+Reviewer bead: $REVIEW_BEAD_ID
+Reason: tier_escalation_required
+Notes: $ESCALATE_NOTES"
+  bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "tier:NON-CODE" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "tier:CODE" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "tier:escalated" -q 2>/dev/null || true
+  # FM-7 FIX: stamp "tier:escalated" on the MARKER so any re-queue knows this
+  # branch was already classified NON-CODE and escalated to CODE by a reviewer.
+  # Without this label the guard would re-classify the next run as NON-CODE again
+  # (reading marker metadata), creating an infinite escalation loop.
+  # The guard/formula MUST check for "tier:escalated" on the marker and skip the
+  # NON-CODE step, going directly to CODE quorum on re-queue.
+  bd -C "$GC_CITY_PATH" label add    {{marker_id}} "tier:escalated" -q 2>/dev/null || true
+  # Re-mark marker as ready to re-enter gate as CODE tier
+  bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:failed"  -q 2>/dev/null || true
+  gc mail send "{{author}}" -s "Quality gate: tier escalated for {{branch}}" -m "$(cat <<'EOF'
+Quality gate tier escalated for {{branch}} ({{bead_id}}).
+
+Reason: NON-CODE reviewer found code changes disguised in documentation files.
+This requires a full CODE quorum (3 independent reviewers).
+
+Please review your changes. If code in docs is intentional, re-submit with
+clear justification. If accidental, extract the code to proper source files.
+
+Gate run: {{gate_run_id}}
+EOF
+)" 2>/dev/null || true
+  TIER="CODE"
+  # Fall through to code-review-quorum by NOT draining
+  # But since we are in the non-code step which is skipped for CODE tier already,
+  # we need to inform the runner -- set TIER=CODE and let merge-change see the label.
+  # The guard's TTL will re-process after the author re-queues.
+  bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:failed"  -q 2>/dev/null || true
+  git -C "$REPO_PATH" worktree remove "$WORKTREE_PATH" --force 2>/dev/null || rm -rf "$WORKTREE_PATH"
+  gc runtime drain-ack
+
+else
+  # FAIL or unexpected
+  FAIL_NOTES=$(bd -C "$GC_CITY_PATH" show "$REVIEW_BEAD_ID" --json 2>/dev/null | jq -r '.notes // ""')
+  bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "NON-CODE review FAIL.
+Reviewer bead: $REVIEW_BEAD_ID
+Verdict: ${REVIEW_VERDICT:-<empty/unexpected>}
+Notes: $(echo "$FAIL_NOTES" | head -30)"
+  bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:failed"  -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:failed"  -q 2>/dev/null || true
+
+  bd -C "$GC_CITY_PATH" reopen {{bead_id}} 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" update {{bead_id}} --notes "Quality gate FAILED (NON-CODE review).
+Blocking issues from reviewer:
+$(echo "$FAIL_NOTES" | grep -E 'Blocking:' | head -5)
+Please fix and re-run /gate-done."
+
+  gc mail send "{{author}}" -s "Quality gate FAILED: NON-CODE review for {{branch}}" -m "$(cat <<'EOF'
+Quality gate FAILED for {{branch}} ({{bead_id}}).
+
+Reason: NON-CODE review FAIL. See reviewer findings in gate-run bead {{gate_run_id}}.
+
+Please fix the issues and re-run /gate-done.
+Gate run: {{gate_run_id}}
+EOF
+)" 2>/dev/null || true
+
+  QG_LOG="${GC_CITY_PATH}/.gc/quality-gate.jsonl"
+  mkdir -p "$(dirname "$QG_LOG")"
+  ELAPSED=$(( $(date +%s) - GATE_START ))
+  # FM-1 FIX: use -c (compact) so each event is a single line.
+  # The painel reads JSON-LINES (one object per line); pretty-printed
+  # multi-line JSON breaks json.loads() per line.
+  jq -c -n \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg branch "{{branch}}" \
+    --arg bead "{{bead_id}}" \
+    --arg rig "{{rig}}" \
+    --arg tier "NON-CODE" \
+    --arg result "FAIL" \
+    --arg reason "noncode_review_fail" \
+    --arg gate_run "{{gate_run_id}}" \
+    --arg reviewer "$REVIEWER" \
+    --argjson elapsed "$ELAPSED" \
+    '{ts: $ts, branch: $branch, bead: $bead, rig: $rig, tier: $tier, result: $result, reason: $reason, gate_run: $gate_run, reviewer: $reviewer, elapsed_s: $elapsed}' \
+    >> "$QG_LOG"
+
+  git -C "$REPO_PATH" worktree remove "$WORKTREE_PATH" --force 2>/dev/null || rm -rf "$WORKTREE_PATH"
+  gc runtime drain-ack
+fi
+```
+
+**Exit criteria (PASS):** Review passed; continue to merge-change.
+"""
+
+[[steps]]
+id = "code-review-quorum"
+title = "CODE tier: quorum of 3 INDEPENDENT reviewer sessions (all must pass)"
+needs = ["review-non-code"]
+description = """
+**Only runs when TIER == "CODE". Skip this step if TIER == "NON-CODE".**
+
+## Architecture: Genuine Independent Quorum
+
+For CODE changes, 3 SEPARATE review-assignment beads are created, one per
+reviewer lens. Each is dispatched to the gastown/claude pool via
+`gc sling gastown/claude <id> --formula mol-review-leg`.
+
+Each sling spawns (or reuses) a DISTINCT pool worker session. Each reviewer
+session starts fresh with NO shared Claude context from the runner or the
+other reviewers. There is no "role-play" -- these are real separate processes.
+
+The runner polls all 3 beads until they close, then checks the VERDICT fields
+written to bead notes. ALL 3 must say VERDICT: PASS.
+
+**1. Check tier:**
+```bash
+if [ "$TIER" != "CODE" ]; then
+  echo "Tier is NON-CODE -- skipping CODE quorum step."
+  exit 0  # already handled by review-non-code -> merge-change
+fi
+
+cd "$WORKTREE_PATH"
+DIFF=$(git diff "origin/main...HEAD" 2>/dev/null | head -800)
+CHANGED_LIST=$(git diff --name-only "origin/main...HEAD" 2>/dev/null || echo "")
+TESTS_STATUS=$(bd -C "$GC_CITY_PATH" show {{gate_run_id}} --json 2>/dev/null \
+  | jq -r '(.labels // []) | map(select(startswith("tests:"))) | .[0] // "tests:unknown"')
+```
+
+**2. Create 3 review assignment beads:**
+
+Each bead gets a distinct reviewer lens so the reviewers examine different
+dimensions without coordinating. The diff is included in each bead description
+so reviewers never need to share context through the runner.
+
+```bash
+# Helper function to create a reviewer bead
+create_reviewer_bead() {
+  local LENS="$1"
+  local LENS_DESC="$2"
+  local LENS_FOCUS="$3"
+
+  bd -C "$GC_CITY_PATH" create \
+    "gate-review: {{branch}} ($LENS)" \
+    -t chore --ephemeral \
+    -l type:gate-review-assignment \
+    -l gate-review:pending \
+    -l "review-lens:$LENS" \
+    -l "source-gate:{{gate_run_id}}" \
+    --metadata "{\"coordinator\": \"$REVIEWER\", \"gate_run_id\": \"{{gate_run_id}}\", \"review_leg\": \"$LENS\"}" \
+    -d "## Quality Gate Review Assignment
+
+You are review session **$LENS_DESC** for quality gate on branch **{{branch}}** (bead {{bead_id}}).
+
+**Author (who wrote this):** {{author}}
+**Your lens:** $LENS_DESC
+**Test status:** $TESTS_STATUS
+**Tier:** CODE
+
+$LENS_FOCUS
+
+## Changed files
+
+$CHANGED_LIST
+
+## Diff (first 800 lines)
+
+```diff
+$DIFF
+```
+
+## Required output format
+
+Write your verdict to the bead notes using EXACTLY this format:
+
+```
+VERDICT: PASS
+Grade: <A|B|C|D|F>
+Blocking: none
+Testing-gap: ACCEPTED — <reason>   (REQUIRED when tests:opt-out; omit otherwise)
+Notes: <summary>
+```
+
+or
+
+```
+VERDICT: FAIL
+Grade: <A|B|C|D|F>
+Blocking: <list of blocking issues>
+Testing-gap: REJECTED — <reason>   (REQUIRED when tests:opt-out; omit otherwise)
+Notes: <summary>
+```
+
+**FM-4 REQUIRED: If tests opted-out** (test status is 'tests:opt-out'), you
+MUST include a 'Testing-gap:' line. You cannot silently ignore missing tests.
+A PASS without a Testing-gap line when tests opted-out is INVALID and will
+be treated as FAIL by the runner.
+
+After writing your verdict to notes, close this bead." \
+    --json 2>/dev/null | jq -r '.id // empty'
+}
+
+# Reviewer 1: Correctness and Logic lens
+R1_BEAD=$(create_reviewer_bead "correctness" \
+  "Reviewer 1 — Correctness and Logic" \
+  "You are a skeptical senior engineer. Your ONLY job is to find correctness bugs,
+race conditions, edge case failures, off-by-one errors, nil pointer dereferences,
+and any logic that will silently produce wrong results. You are not interested
+in style. You are looking for bugs that WILL happen in production.
+If tests opted-out (tests:opt-out label), flag the testing gap as a finding.
+Grade based on severity of correctness risk.")
+
+# Reviewer 2: Security and Trust lens
+R2_BEAD=$(create_reviewer_bead "security" \
+  "Reviewer 2 — Security and Trust" \
+  "You are a security engineer paranoid about supply chain attacks, injection,
+privilege escalation, secrets in code, and unsafe operations.
+Scrutinize every shell invocation, external call, and data flow.
+If tests opted-out (tests:opt-out label), flag the lack of security test coverage.
+Grade based on severity of security risk.")
+
+# Reviewer 3: Architecture and Maintainability lens
+R3_BEAD=$(create_reviewer_bead "architecture" \
+  "Reviewer 3 — Architecture and Maintainability" \
+  "You are a staff engineer who knows this codebase deeply. You look for:
+technical debt that compounds, abstraction leaks, missing error handling on
+external calls, tests that don't test what they claim, and changes that
+violate the existing architecture patterns.
+If tests opted-out (tests:opt-out label), flag architectural risk of untested paths.
+Grade based on long-term maintainability risk.")
+
+echo "Review beads: R1=$R1_BEAD  R2=$R2_BEAD  R3=$R3_BEAD"
+
+# Validate all 3 beads were created
+if [ -z "$R1_BEAD" ] || [ -z "$R2_BEAD" ] || [ -z "$R3_BEAD" ]; then
+  echo "ERROR: Failed to create one or more review beads."
+  bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "ERROR: Failed to create reviewer beads. R1=$R1_BEAD R2=$R2_BEAD R3=$R3_BEAD"
+  bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:failed"  -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:error"   -q 2>/dev/null || true
+  gc runtime drain-ack
+fi
+```
+
+**3. Dispatch all 3 review beads to INDEPENDENT reviewer sessions:**
+```bash
+# Each gc sling routes to a gastown/claude pool worker -- a distinct process
+# with no shared context from this runner or the other reviewers.
+for RBEAD in "$R1_BEAD" "$R2_BEAD" "$R3_BEAD"; do
+  gc --city "$GC_CITY_PATH" sling gastown/claude "$RBEAD" --formula mol-review-leg \
+    --no-convoy 2>/dev/null || {
+      echo "WARNING: sling failed for $RBEAD, trying without formula"
+      gc --city "$GC_CITY_PATH" sling gastown/claude "$RBEAD" --no-convoy 2>/dev/null || true
+    }
+  echo "Dispatched: $RBEAD"
+done
+
+bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "CODE quorum: 3 independent reviewer sessions dispatched.
+R1 (Correctness): $R1_BEAD
+R2 (Security): $R2_BEAD
+R3 (Architecture): $R3_BEAD"
+```
+
+**4. Poll all 3 beads for completion (timeout: 45 minutes):**
+```bash
+POLL_START=$(date +%s)
+POLL_TIMEOUT=2700  # 45 minutes for 3 reviewers
+declare -A BEAD_VERDICT
+BEAD_VERDICT[$R1_BEAD]=""
+BEAD_VERDICT[$R2_BEAD]=""
+BEAD_VERDICT[$R3_BEAD]=""
+declare -A BEAD_DONE
+BEAD_DONE[$R1_BEAD]=false
+BEAD_DONE[$R2_BEAD]=false
+BEAD_DONE[$R3_BEAD]=false
+
+while true; do
+  ELAPSED=$(( $(date +%s) - POLL_START ))
+  ALL_DONE=true
+
+  for RBEAD in "$R1_BEAD" "$R2_BEAD" "$R3_BEAD"; do
+    if [ "${BEAD_DONE[$RBEAD]}" = "true" ]; then
+      continue
+    fi
+    BEAD_STATUS=$(bd -C "$GC_CITY_PATH" show "$RBEAD" --json 2>/dev/null \
+      | jq -r '.status // "open"' 2>/dev/null || echo "open")
+    if [ "$BEAD_STATUS" = "closed" ]; then
+      NOTES=$(bd -C "$GC_CITY_PATH" show "$RBEAD" --json 2>/dev/null \
+        | jq -r '.notes // ""' 2>/dev/null || echo "")
+      VERDICT=$(echo "$NOTES" | grep -E '^VERDICT:' | head -1 | sed 's/^VERDICT: *//')
+      BEAD_VERDICT[$RBEAD]="$VERDICT"
+      BEAD_DONE[$RBEAD]=true
+      echo "Reviewer $RBEAD done. VERDICT: $VERDICT"
+    else
+      ALL_DONE=false
+    fi
+  done
+
+  if [ "$ALL_DONE" = "true" ]; then
+    break
+  fi
+
+  if [ "$ELAPSED" -gt "$POLL_TIMEOUT" ]; then
+    echo "ERROR: CODE quorum timed out after ${POLL_TIMEOUT}s."
+    PENDING=""
+    for RBEAD in "$R1_BEAD" "$R2_BEAD" "$R3_BEAD"; do
+      [ "${BEAD_DONE[$RBEAD]}" = "false" ] && PENDING="$PENDING $RBEAD"
+    done
+    bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "FAIL: CODE quorum timed out. Pending reviewers:$PENDING"
+    bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+    bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:failed"  -q 2>/dev/null || true
+    bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+    bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:error"   -q 2>/dev/null || true
+    gc runtime drain-ack
+  fi
+
+  echo "Waiting for reviewers... (${ELAPSED}s elapsed, pending beads not yet closed)"
+  sleep 30
+done
+```
+
+**5. Collect verdicts and make quorum decision:**
+```bash
+R1_VERDICT="${BEAD_VERDICT[$R1_BEAD]}"
+R2_VERDICT="${BEAD_VERDICT[$R2_BEAD]}"
+R3_VERDICT="${BEAD_VERDICT[$R3_BEAD]}"
+
+PASS_COUNT=0
+[ "$R1_VERDICT" = "PASS" ] && PASS_COUNT=$((PASS_COUNT + 1))
+[ "$R2_VERDICT" = "PASS" ] && PASS_COUNT=$((PASS_COUNT + 1))
+[ "$R3_VERDICT" = "PASS" ] && PASS_COUNT=$((PASS_COUNT + 1))
+
+echo "Quorum: $PASS_COUNT/3 reviewers passed"
+echo "  R1 (Correctness): $R1_VERDICT"
+echo "  R2 (Security): $R2_VERDICT"
+echo "  R3 (Architecture): $R3_VERDICT"
+```
+
+**6. On quorum PASS (3/3):**
+```bash
+# Only if PASS_COUNT == 3
+bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "CODE review quorum PASS (3/3).
+R1 (Correctness) $R1_BEAD: $R1_VERDICT
+R2 (Security) $R2_BEAD: $R2_VERDICT
+R3 (Architecture) $R3_BEAD: $R3_VERDICT"
+bd -C "$GC_CITY_PATH" label add {{gate_run_id}} "review-quorum:pass" -q 2>/dev/null || true
+# Continue to merge-change
+```
+
+**7. On quorum FAIL (<3/3):**
+```bash
+# If PASS_COUNT < 3:
+bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "CODE review quorum FAIL ($PASS_COUNT/3).
+R1 (Correctness) $R1_BEAD: $R1_VERDICT
+R2 (Security) $R2_BEAD: $R2_VERDICT
+R3 (Architecture) $R3_BEAD: $R3_VERDICT
+See individual reviewer beads for full findings."
+bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:failed"  -q 2>/dev/null || true
+bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:failed"  -q 2>/dev/null || true
+
+bd -C "$GC_CITY_PATH" reopen {{bead_id}} 2>/dev/null || true
+bd -C "$GC_CITY_PATH" update {{bead_id}} --notes "Quality gate FAILED (CODE quorum $PASS_COUNT/3 passed).
+Reviewer beads:
+  R1 (Correctness): $R1_BEAD (verdict: $R1_VERDICT)
+  R2 (Security): $R2_BEAD (verdict: $R2_VERDICT)
+  R3 (Architecture): $R3_BEAD (verdict: $R3_VERDICT)
+Please fix blocking issues and re-run /gate-done."
+
+gc mail send "{{author}}" -s "Quality gate FAILED: CODE quorum $PASS_COUNT/3 for {{branch}}" -m "$(cat <<'EOF'
+Quality gate FAILED for {{branch}} ({{bead_id}}).
+
+CODE quorum: $PASS_COUNT/3 reviewers passed.
+  R1 (Correctness): $R1_VERDICT  -> bead $R1_BEAD
+  R2 (Security): $R2_VERDICT     -> bead $R2_BEAD
+  R3 (Architecture): $R3_VERDICT -> bead $R3_BEAD
+
+Read the reviewer beads for full findings.
+Please fix the issues and re-run /gate-done.
+Gate run: {{gate_run_id}}
+EOF
+)" 2>/dev/null || true
+
+QG_LOG="${GC_CITY_PATH}/.gc/quality-gate.jsonl"
+mkdir -p "$(dirname "$QG_LOG")"
+ELAPSED=$(( $(date +%s) - GATE_START ))
+# FM-1 FIX: use -c (compact) so each event is a single line.
+# The painel reads JSON-LINES (one object per line); pretty-printed
+# multi-line JSON breaks json.loads() per line.
+jq -c -n \
+  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg branch "{{branch}}" \
+  --arg bead "{{bead_id}}" \
+  --arg rig "{{rig}}" \
+  --arg tier "CODE" \
+  --arg result "FAIL" \
+  --arg reason "code_quorum_${PASS_COUNT}_of_3" \
+  --arg gate_run "{{gate_run_id}}" \
+  --argjson elapsed "$ELAPSED" \
+  '{ts: $ts, branch: $branch, bead: $bead, rig: $rig, tier: $tier, result: $result, reason: $reason, gate_run: $gate_run, elapsed_s: $elapsed}' \
+  >> "$QG_LOG"
+
+git -C "$REPO_PATH" worktree remove "$WORKTREE_PATH" --force 2>/dev/null || rm -rf "$WORKTREE_PATH"
+gc runtime drain-ack
+```
+
+**Exit criteria (PASS):** 3/3 quorum; continue to merge-change.
+"""
+
+[[steps]]
+id = "merge-change"
+title = "Merge branch to main (push from detached worktree)"
+needs = ["code-review-quorum"]
+description = """
+All gates passed. Merge the branch to main and update all tracking.
+
+IMPORTANT: We NEVER touch the live working tree. We push directly from the
+detached review worktree using `git push origin <SHA>:refs/heads/main`.
+
+**1. Rebase branch onto latest main (in detached worktree):**
+```bash
+cd "$WORKTREE_PATH"
+git fetch origin main
+
+# Check if already on top of main
+MAIN_SHA=$(git rev-parse origin/main)
+MERGE_BASE=$(git merge-base HEAD origin/main 2>/dev/null || echo "")
+
+if [ "$MERGE_BASE" = "$MAIN_SHA" ]; then
+  echo "Branch is already on top of main -- no rebase needed."
+else
+  echo "Rebasing onto origin/main..."
+  git rebase origin/main 2>&1
+  REBASE_EXIT=$?
+  if [ "$REBASE_EXIT" -ne 0 ]; then
+    git rebase --abort 2>/dev/null || true
+    bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "FAIL: rebase conflict after gate pass. Branch needs rebase onto current main."
+    bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+    bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:failed"  -q 2>/dev/null || true
+    bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+    bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:error"   -q 2>/dev/null || true
+    gc mail send "{{author}}" -s "Quality gate: rebase needed for {{branch}}" -m "$(cat <<'EOF'
+Quality gate passed review but rebase failed for {{branch}}.
+
+Please rebase onto main and re-run /gate-done.
+Gate run: {{gate_run_id}}
+EOF
+)" 2>/dev/null || true
+    git -C "$REPO_PATH" worktree remove "$WORKTREE_PATH" --force 2>/dev/null || rm -rf "$WORKTREE_PATH"
+    gc runtime drain-ack
+  fi
+fi
+
+REVIEW_HEAD_SHA=$(git -C "$WORKTREE_PATH" rev-parse HEAD)
+echo "Review HEAD after rebase: $REVIEW_HEAD_SHA"
+```
+
+**2. Push to main from detached worktree (NEVER touch live tree):**
+
+We push the specific SHA directly to refs/heads/main. This avoids any
+interaction with the live working tree or any checked-out branch.
+
+```bash
+PUSH_OUTPUT=$(git -C "$WORKTREE_PATH" push origin "${REVIEW_HEAD_SHA}:refs/heads/main" 2>&1)
+PUSH_EXIT=$?
+echo "$PUSH_OUTPUT"
+```
+
+**3. Handle push result:**
+```bash
+if [ "$PUSH_EXIT" -eq 0 ]; then
+  echo "Push succeeded."
+  LOCAL_SHA="$REVIEW_HEAD_SHA"
+elif echo "$PUSH_OUTPUT" | grep -qE "non-fast-forward|rejected"; then
+  # main advanced while we were reviewing -- rebase needed
+  bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "FAIL: push rejected (non-fast-forward). Main advanced during review. Author must rebase and re-submit."
+  bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:failed"  -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:error"   -q 2>/dev/null || true
+  gc mail send "{{author}}" -s "Quality gate: rebase needed for {{branch}} (main advanced)" -m "$(cat <<'EOF'
+Quality gate passed review but main advanced while reviewing {{branch}}.
+
+Please rebase onto latest main and re-run /gate-done.
+Gate run: {{gate_run_id}}
+EOF
+)" 2>/dev/null || true
+  git -C "$REPO_PATH" worktree remove "$WORKTREE_PATH" --force 2>/dev/null || rm -rf "$WORKTREE_PATH"
+  gc runtime drain-ack
+elif echo "$PUSH_OUTPUT" | grep -qE "Everything up-to-date"; then
+  # Already merged -- treat as success (FM-8: removed loose "already" match)
+  echo "Branch already merged to main. Treating as success."
+  LOCAL_SHA="$REVIEW_HEAD_SHA"
+else
+  # Unexpected push error
+  bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "ERROR: push failed unexpectedly.
+Exit: $PUSH_EXIT
+Output: $PUSH_OUTPUT"
+  bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:error"   -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+  bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:error"   -q 2>/dev/null || true
+  gc mail send gastown.mayor -s "Quality gate ERROR: push failed for {{branch}}" -m "$(cat <<'EOF'
+Quality gate encountered a push error for {{branch}}.
+
+Push exit: $PUSH_EXIT
+Output: $PUSH_OUTPUT
+
+Gate run: {{gate_run_id}}
+Please investigate.
+EOF
+)" 2>/dev/null || true
+  git -C "$REPO_PATH" worktree remove "$WORKTREE_PATH" --force 2>/dev/null || rm -rf "$WORKTREE_PATH"
+  gc runtime drain-ack
+fi
+```
+
+**4. Update gate-run to PASSED:**
+```bash
+ELAPSED=$(( $(date +%s) - GATE_START ))
+bd -C "$GC_CITY_PATH" label remove {{gate_run_id}} "gate-status:running" -q 2>/dev/null || true
+bd -C "$GC_CITY_PATH" label add    {{gate_run_id}} "gate-status:passed"  -q 2>/dev/null || true
+bd -C "$GC_CITY_PATH" update {{gate_run_id}} --notes "MERGED to main at $LOCAL_SHA. elapsed_s: $ELAPSED"
+```
+
+**5. Close marker bead:**
+```bash
+bd -C "$GC_CITY_PATH" label remove {{marker_id}} "gate-status:claimed" -q 2>/dev/null || true
+bd -C "$GC_CITY_PATH" label add    {{marker_id}} "gate-status:passed"  -q 2>/dev/null || true
+bd -C "$GC_CITY_PATH" close {{marker_id}} --reason "Gate passed. Merged to main at $LOCAL_SHA." 2>/dev/null || true
+```
+
+**6. Close source bead:**
+```bash
+bd -C "$GC_CITY_PATH" close {{bead_id}} --reason "Merged to main by quality gate (gate-run={{gate_run_id}})." 2>/dev/null || true
+```
+
+**7. Notify author via mail (durable):**
+```bash
+gc mail send "{{author}}" -s "Quality gate PASSED: {{branch}} merged to main" -m "$(cat <<'EOF'
+Quality gate PASSED for {{branch}}.
+
+Branch {{branch}} has been merged to main at $LOCAL_SHA.
+Bead {{bead_id}} closed.
+
+Gate run: {{gate_run_id}}
+EOF
+)" 2>/dev/null || true
+```
+
+**8. Append to structured gate log:**
+```bash
+ELAPSED=$(( $(date +%s) - GATE_START ))
+QG_LOG="${GC_CITY_PATH}/.gc/quality-gate.jsonl"
+mkdir -p "$(dirname "$QG_LOG")"
+# FM-1 FIX: use -c (compact) so each event is a single line.
+# The painel reads JSON-LINES (one object per line); pretty-printed
+# multi-line JSON breaks json.loads() per line.
+jq -c -n \
+  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg branch "{{branch}}" \
+  --arg bead "{{bead_id}}" \
+  --arg rig "{{rig}}" \
+  --arg tier "$TIER" \
+  --arg result "PASS" \
+  --arg sha "$LOCAL_SHA" \
+  --arg gate_run "{{gate_run_id}}" \
+  --arg reviewer "$REVIEWER" \
+  --argjson elapsed "$ELAPSED" \
+  '{ts: $ts, branch: $branch, bead: $bead, rig: $rig, tier: $tier, result: $result, merged_sha: $sha, gate_run: $gate_run, reviewer: $reviewer, elapsed_s: $elapsed}' \
+  >> "$QG_LOG"
+```
+
+**9. Cleanup worktree:**
+```bash
+git -C "$REPO_PATH" worktree remove "$WORKTREE_PATH" --force 2>/dev/null || rm -rf "$WORKTREE_PATH"
+```
+
+**Exit criteria:** Branch merged to main, all beads updated, author notified, log appended.
+"""
+
+[[steps]]
+id = "complete"
+title = "Self-clean and drain"
+needs = ["merge-change"]
+description = """
+Gate run complete. Self-clean.
+
+```bash
+bd -C "$GC_CITY_PATH" sync 2>/dev/null || true
+gc runtime drain-ack
+```
+"""
