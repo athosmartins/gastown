@@ -17,6 +17,18 @@ DETECTS (gate not producing verdicts — the tonight signature):
   Corroborated by Dolt instability lines in the supervisor log (connection reset /
   bead store closed / invalid connection) — the root cause that night.
 
+DETECTS (head-of-line stale-branch block — the ga-hl0gq signature, 2026-06-10):
+  - the dispatcher keeps re-picking the SAME oldest branch every sweep, its
+    auto-rebase conflicts (dead author), it re-queues gate-status:queued, and the
+    whole queue behind it stops draining (zero merges). Signature: the last
+    >=HEADOFLINE_MIN_SWEEPS "Dispatcher sweep complete" lines are all
+    "verdict=QUEUED (retry ...)" naming the SAME branch.
+  This mode is INVISIBLE to the two checks above: no run reaches verdict
+  collection, so there is no TIMEOUT and no "Verdicts 0/N" poll line — which is
+  exactly why the 2026-06-10 stall ran 49min before a human asked for status.
+  Detected here in ~2 sweeps (~6min). The permanent dispatcher-level auto-skip is
+  ga-q3ig2; this wake is the detection+recovery bridge until it lands.
+
 ON DETECT:
   1. snapshot diagnostics to /tmp/gate-watchdog-diag-<ts>.txt
   2. WAKE the gastown.mayor session + deliver a precise fix task (references the
@@ -43,10 +55,15 @@ TIMEOUT_WINDOW_SEC = 1800      # 2+ timeouts within 30min = gate not producing v
 DISPATCH_STUCK_SEC = 720       # marker dispatching >12min w/ no active reviewers = spawn fail
 PILOT_JAM_WINDOW_SEC = 900     # 2+ sweep-aborts within 15min = Pilot jammed on a bad bead
 PILOT_STALL_SEC = 2400         # pilot log silent >40min = Pilot dead/not sweeping
+HEADOFLINE_MIN_SWEEPS = 2      # >=2 consecutive QUEUED-retry sweeps on the SAME branch = head-of-line block
+HEADOFLINE_LOG_FRESH_SEC = 600 # ignore if dispatcher log is staler than this (that's ENGINE-STALL's job)
 WAKE_COOLDOWN_SEC = 1200       # don't re-wake the Mayor more than once per 20min (per kind)
 ESCALATE_AFTER_WAKES = 2       # after 2 unresolved wake-cycles, page Athos 🚨
 DOLT_SIG = re.compile(r"connection reset|bead store closed|unexpected EOF|invalid connection|provider-health registry unavailable")
 TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
+# "=== Dispatcher sweep complete: branch=<X> verdict=QUEUED (retry N/M, dead author) ==="
+SWEEP_QUEUED_RETRY_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) verdict=QUEUED \(retry")
+SWEEP_COMPLETE_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) verdict=")
 
 
 def sh(args, timeout=20):
@@ -132,6 +149,49 @@ def stuck_dispatching():
         return False
     active = [s for s in sessions if s.get("template") == "gate-reviewer" and s.get("state") == "active"]
     return len(active) == 0
+
+
+def headofline_stall():
+    """Detect the stale-branch FIFO head-of-line block (ga-hl0gq).
+
+    The dispatcher picks the oldest queued marker every sweep; if that branch is
+    stale vs origin/main and its auto-rebase conflicts with a dead/empty author,
+    the marker is re-queued gate-status:queued and the SAME branch is re-picked
+    next sweep — the queue behind it never drains (zero merges). The dispatcher
+    keeps logging (no ENGINE-STALL) and no run reaches verdicts (no TIMEOUT, no
+    'Verdicts 0/N' poll line), so recent_timeouts()/stuck_dispatching() are blind.
+
+    Signature: walking the dispatcher log's 'sweep complete' lines from newest to
+    oldest, the trailing run names the SAME branch with 'verdict=QUEUED (retry'.
+    Returns (branch, count) when count >= HEADOFLINE_MIN_SWEEPS, else (None, 0).
+    Requires a fresh log (dispatcher actively sweeping) — a stale log is dead-
+    engine territory, covered by the health-monitor's ENGINE-STALL."""
+    try:
+        if time.time() - os.path.getmtime(DISPATCH_LOG) > HEADOFLINE_LOG_FRESH_SEC:
+            return (None, 0)
+        with open(DISPATCH_LOG) as f:
+            lines = f.readlines()[-400:]
+    except Exception:
+        return (None, 0)
+    branch = None
+    count = 0
+    for l in reversed(lines):
+        if "Dispatcher sweep complete:" not in l:
+            continue
+        mq = SWEEP_QUEUED_RETRY_RE.search(l)
+        if not mq:
+            # most-recent completion is NOT a QUEUED-retry (a real PASS/FAIL/merge
+            # happened, or a different terminal verdict) → not stalled right now.
+            break
+        b = mq.group(1)
+        if branch is None:
+            branch = b
+        if b != branch:
+            break  # head-of-line moved to a different branch → not a single-branch wedge
+        count += 1
+    if branch and count >= HEADOFLINE_MIN_SWEEPS:
+        return (branch, count)
+    return (None, 0)
 
 
 def dolt_instability():
@@ -239,6 +299,30 @@ def wake_mayor(reason, diag_path, dolt_hits, kind="gate"):
         sh(["gc", "session", "wake", mid], timeout=20)
         r = sh(["gc", "session", "nudge", mid, task], timeout=25)
         return r is not None and r.returncode == 0
+    if kind == "gate-loop":
+        task = (
+            "🔧 ALERTA AUTOMÁTICO DO WATCHDOG — gate em HEAD-OF-LINE BLOCK. Conserta agora, não escale pro Athos a menos que falhe.\n\n"
+            "O gate está preso no MESMO branch stale há vários sweeps: %s. "
+            "O auto-rebase bate em conflito (autor morto/ausente), o marker re-enfileira gate-status:queued, "
+            "e a FILA INTEIRA atrás dele NÃO drena — zero merges. Foi exatamente o stall de 49min de 2026-06-10 (ga-hl0gq).\n\n"
+            "CONSERTO (re-anchor OU supersede — memória [[gate-rebase-error-stale-branch]]):\n"
+            "1. Ache o marker do branch travado:\n"
+            "   bd -C . list --all -l type:quality-gate-marker -l gate-status:queued --json | "
+            "jq -r '.[] | select((.labels//[])[]|contains(\"branch:%s\")) | .id'\n"
+            "2. DECIDA o caminho:\n"
+            "   (a) Branch ainda quer mergear → RE-ANCHOR: num worktree em origin/main, cherry-pick o commit do branch, "
+            "keep-both em conflito de teste, verifique diff additivo (0 deleções), force-push sobre o branch stale, e RE-QUEUE o MESMO marker "
+            "(remove gate-status:error/queued antigo, add gate-status:queued) — NÃO duplique.\n"
+            "   (b) Branch é zombie/obsoleto → SUPERSEDE: set_gate_status do marker p/ superseded + close, e re-despache fresh se a história ainda vale.\n"
+            "3. O objetivo imediato é TIRAR o branch quebrado da cabeça da fila pra os markers saudáveis atrás dele drenarem JÁ.\n"
+            "4. Confirme: nos próximos sweeps aparecem 'Gate PASSED' / outros branches avançando (não só QUEUED-retry no mesmo branch).\n\n"
+            "Diagnóstico salvo em: %s\n"
+            "(Fix permanente do auto-skip no dispatcher = ga-q3ig2 — este wake é a ponte de detecção+recuperação até ele aterrissar. "
+            "Cuidado: o contador gate:rebase-attempt reseta a 0 todo sweep, então o escape de 3-strikes do dispatcher nunca dispara — por isso loopa pra sempre.)"
+        ) % (reason, reason, diag_path)
+        sh(["gc", "session", "wake", mid], timeout=20)
+        r = sh(["gc", "session", "nudge", mid, task], timeout=25)
+        return r is not None and r.returncode == 0
     task = (
         "🔧 ALERTA AUTOMÁTICO DO WATCHDOG (gate-recovery-watchdog) — conserta agora, não escale pro Athos a menos que falhe.\n\n"
         "O gate parou de produzir vereditos. Motivo detectado: %s. "
@@ -275,8 +359,10 @@ def main():
   last_pass_at_wake = 0
   last_pilot_wake = 0
   pilot_wakes = 0
+  last_loop_wake = 0
+  loop_wakes = 0
 
-  print("[watchdog] gate+pilot watchdog started — wakes Mayor on gate-down OR pilot-jam", flush=True)
+  print("[watchdog] gate+pilot watchdog started — wakes Mayor on gate-down OR pilot-jam OR head-of-line block", flush=True)
 
   while True:
     try:
@@ -331,6 +417,28 @@ def main():
                 notify("Pilot travou (%s) — Mayor foi acordado pra consertar. Você não precisa agir." % pj_reason, 3)
                 print("[watchdog] woke Mayor for PILOT (woke=%s) reason=%s diag=%s"
                       % (pwoke, pj_reason, pdiag), flush=True)
+
+        # --- HEAD-OF-LINE block (closes the ga-hl0gq blind spot: 49min undetected) ---
+        hb, hcount = headofline_stall()
+        # recovery: a PASS landed after our last loop-wake → the queue drained
+        if loop_wakes > 0 and lp and lp > last_loop_wake:
+            print("[watchdog] head-of-line cleared (Gate PASSED after loop-wake) — resetting", flush=True)
+            notify("Gate destravou — fila voltou a drenar (head-of-line resolvido).", 3)
+            loop_wakes = 0
+        if hb and (time.time() - last_loop_wake > WAKE_COOLDOWN_SEC):
+            ldiag = snapshot("head-of-line block: %dx QUEUED-retry no branch %s" % (hcount, hb), 0)
+            lwoke = wake_mayor(hb, ldiag, 0, kind="gate-loop")
+            last_loop_wake = time.time()
+            loop_wakes += 1
+            if loop_wakes >= ESCALATE_AFTER_WAKES:
+                notify("🚨 GATE AINDA TRAVADO em branch stale (head-of-line: %s) após o Mayor tentar (%dx). Precisa de você. Diag: %s"
+                       % (hb, loop_wakes, ldiag), 5)
+                print("[watchdog] ESCALATED to Athos (head-of-line %s, %d wakes)" % (hb, loop_wakes), flush=True)
+            else:
+                notify("Gate preso em branch stale (head-of-line: %s, %dx sweeps) — Mayor acordado pra destravar (supersede/re-anchor). Você não precisa agir."
+                       % (hb, hcount), 4)
+                print("[watchdog] woke Mayor for HEAD-OF-LINE (woke=%s) branch=%s count=%d diag=%s"
+                      % (lwoke, hb, hcount, ldiag), flush=True)
     except Exception as e:
         print("[watchdog] loop error (continuing): %r" % e, flush=True)
     time.sleep(POLL_SEC)

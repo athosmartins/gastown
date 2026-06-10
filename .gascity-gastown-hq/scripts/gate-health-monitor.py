@@ -28,6 +28,10 @@ REALERT_SEC = 900       # re-warn a still-stuck marker every 15min
 ENGINE_STALL_SEC = 900  # dispatcher log silent >15min = engine dead/hung
 ERROR_STUCK_SEC = 600   # 10min in gate-status:error = dispatch failure worth alarming
 VERDICT_STALL_SEC = 1500  # 25min of a gate-run's pending verdicts not changing = idle reviewer(s) (ga-noxbv)
+NOMERGE_STALL_SEC = 900   # 15min: queue has not ADVANCED + work queued + no review in flight = stuck (ga-hl0gq)
+# QG events that ADVANCE the queue (a marker reached a handled/terminal state).
+# autorebase_retry + guard_queued do NOT count — they are the non-advancing re-queue loop.
+PROGRESS_EVENTS = {"dispatcher_complete", "dispatcher_superseded", "dispatcher_needs_rebase"}
 
 
 def age(ts):
@@ -128,6 +132,23 @@ def dolt_responsive():
         return False
 
 
+def queued_marker_ids():
+    """IDs of open gate markers currently in gate-status:queued (work waiting to be
+    picked up). Used by the GATE-NOMERGE throughput check to confirm there IS work
+    the gate is failing to advance. Returns [] on any failure (skip the check)."""
+    try:
+        result = subprocess.run(
+            ["gc", "bd", "list", "-l", "type:quality-gate-marker",
+             "-l", "gate-status:queued", "--json"],
+            capture_output=True, text=True, timeout=20)
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        return [m["id"] for m in json.loads(result.stdout)
+                if "gate-status:superseded" not in m.get("labels", [])]
+    except Exception:
+        return []
+
+
 def emit(msg):
     """Print alert line and fire notify CLI (best-effort, never crash on failure)."""
     print(msg, flush=True)
@@ -153,6 +174,7 @@ engine_alerted = 0
 error_first_seen = {}  # bead_id -> first-seen timestamp (for error-stuck tracking)
 error_alerted = {}     # bead_id -> last-alerted timestamp (for error re-alert cadence)
 verdict_progress = {}  # gate-run -> {"sig": tuple(pending ids), "since": ts, "alerted": ts} (ga-noxbv idle-reviewer)
+nomerge_alerted = 0    # last-alerted ts for the GATE-NOMERGE throughput check (ga-hl0gq)
 
 while True:
     # --- engine liveness: dispatcher log must keep sweeping ---
@@ -256,6 +278,37 @@ while True:
     # Prune runs whose verdicts are all in (run complete / superseded)
     for run in set(verdict_progress.keys()) - set(runs_now.keys()):
         verdict_progress.pop(run, None)
+
+    # --- GATE-NOMERGE: queue not advancing while work is queued (ga-hl0gq) ---
+    # The 2026-06-10 49min stall was invisible to every check above: the marker kept
+    # re-queuing (dispatcher_autorebase_retry, a dead-author stale-branch rebase loop)
+    # so its guard_queued event-ts kept refreshing and REAL-JAM's age never crossed
+    # STUCK_SEC; no run reached verdicts (IDLE-REVIEWER blind); the dispatcher kept
+    # logging (ENGINE-STALL blind); no review FAILed (GATE FAIL blind). This check is
+    # mechanism-agnostic: if NO queue-ADVANCING event (complete/superseded/needs-rebase)
+    # has landed for NOMERGE_STALL_SEC while >=1 marker is queued AND nothing is being
+    # actively reviewed, the gate is stuck regardless of the underlying cause. The
+    # "no review in flight" + "queued work exists" guards keep a healthy long-running
+    # review (15-45min) from false-firing. Dolt-guarded (a slow server != a stuck gate).
+    now = time.time()
+    last_prog_age = None
+    for l in lines:
+        try:
+            r = json.loads(l)
+        except Exception:
+            continue
+        if r.get("event") in PROGRESS_EVENTS:
+            a = age(r.get("ts", ""))
+            if a and (last_prog_age is None or a < last_prog_age):
+                last_prog_age = a
+    if (last_prog_age is not None and last_prog_age > NOMERGE_STALL_SEC
+            and not runs_now and now - nomerge_alerted > REALERT_SEC):
+        qids = queued_marker_ids()
+        if qids and dolt_responsive():
+            emit("[GATE-NOMERGE] gate queue has not advanced in %dmin while %d marker(s) "
+                 "queued and no review in flight — dispatcher stuck (e.g. head-of-line "
+                 "stale branch); queue not draining" % (int(last_prog_age / 60), len(qids)))
+            nomerge_alerted = now
 
     # --- delivery: failures / halts only ---
     try:
