@@ -1665,6 +1665,70 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
           MERGE_SHA="$CUR_BRANCH"
           MERGE_RESULT="direct_ff"
           log "FF merge + landing verified (attempt $((MERGE_ATTEMPT+1))): $BRANCH → $DEFAULT_BRANCH (sha=$MERGE_SHA, main=$POST_MAIN)"
+
+          # ── ga-eptel: durable rig-canonical landing + survival audit ─────────
+          # The FF push above advances the REMOTE (origin/$DEFAULT_BRANCH on
+          # GitHub), but for a CONTAINER rig `git_rig` targets the bare
+          # .repo.git — whose OWN local refs/heads/$DEFAULT_BRANCH is NOT touched
+          # by a push. Crew worktrees clone from that bare repo, so a stale local
+          # main makes a gate-verified merge "disappear" from the rig's canonical
+          # main even though it lives on GitHub. This is the root cause of
+          # ga-eptel: ps-l72n (305dd697c) and ga-i5vt (d3cafb679) were reported
+          # "FF merge + landing verified" yet vanished from the rig's main —
+          # because the bare local main was never advanced (verified live: both
+          # SHAs present on origin/main, absent from the bare .repo.git main).
+          #
+          # Fix: advance the bare local main to the merge SHA (FF-only — never
+          # rewrite history), then AUDIT survival by confirming the merge is an
+          # ancestor of BOTH the rig-canonical local main AND origin/main after a
+          # fresh fetch. If it vanished (e.g. a racing town-main push clobbered a
+          # shared remote), do NOT report success: return 1 so the caller
+          # degrades to gate-status:error and the source bead is re-enqueued, not
+          # closed. Self-repo rigs (wa, gascity) are unaffected and untouched —
+          # their deploy reads GitHub directly and they survived the audit (4/4).
+          if [ "$IS_CONTAINER_RIG" = "1" ]; then
+            local RESOLVED_MERGE LOCAL_MAIN AUDIT_LOCAL AUDIT_ORIGIN
+            RESOLVED_MERGE=$(rig_resolve_commit "$CUR_BRANCH")
+            if [ -z "$RESOLVED_MERGE" ]; then
+              err "  Durable-landing: merge SHA unresolvable post-push ($CUR_BRANCH)"
+              MERGE_RESULT="failed_durable_resolution"
+              return 1
+            fi
+            LOCAL_MAIN=$(rig_resolve_commit "refs/heads/$DEFAULT_BRANCH")
+            # FF-only: advance bare local main only if it is an ancestor of the
+            # merge (already-contains → harmless no-op; non-ancestor → refuse).
+            if [ -z "$LOCAL_MAIN" ] || git_rig merge-base --is-ancestor "$LOCAL_MAIN" "$RESOLVED_MERGE" 2>/dev/null; then
+              if ! git_rig update-ref "refs/heads/$DEFAULT_BRANCH" "$RESOLVED_MERGE" 2>/dev/null; then
+                err "  Durable-landing: update-ref of bare $DEFAULT_BRANCH → $RESOLVED_MERGE FAILED"
+                MERGE_RESULT="failed_durable_updateref"
+                return 1
+              fi
+              log "  Durable-landing: advanced bare $DEFAULT_BRANCH (${LOCAL_MAIN:-<none>} → $RESOLVED_MERGE)"
+            else
+              err "  Durable-landing: bare $DEFAULT_BRANCH ($LOCAL_MAIN) not ancestor of merge ($RESOLVED_MERGE) — refusing non-FF ref move"
+              MERGE_RESULT="failed_durable_not_ff"
+              return 1
+            fi
+            # Survival audit: fresh fetch, then confirm the merge survives in BOTH
+            # the rig-canonical local main AND origin/main. A failure here means
+            # the merge was orphaned (shared-remote clobber or lost push) — fail
+            # so the bead is re-enqueued, not closed (ga-eptel audit-guard ask).
+            git_rig fetch origin 2>/dev/null || warn "  Durable-landing: audit re-fetch failed (continuing with stale refs)"
+            AUDIT_LOCAL=$(rig_resolve_commit "refs/heads/$DEFAULT_BRANCH")
+            if [ -z "$AUDIT_LOCAL" ] || ! git_rig merge-base --is-ancestor "$RESOLVED_MERGE" "$AUDIT_LOCAL" 2>/dev/null; then
+              err "  Durable-landing AUDIT FAILED: merge $RESOLVED_MERGE not in rig-canonical $DEFAULT_BRANCH (${AUDIT_LOCAL:-<unresolved>})"
+              MERGE_RESULT="failed_durable_audit_local"
+              return 1
+            fi
+            AUDIT_ORIGIN=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
+            if [ -z "$AUDIT_ORIGIN" ] || ! git_rig merge-base --is-ancestor "$RESOLVED_MERGE" "$AUDIT_ORIGIN" 2>/dev/null; then
+              err "  Durable-landing AUDIT FAILED: merge $RESOLVED_MERGE not in origin/$DEFAULT_BRANCH (${AUDIT_ORIGIN:-<unresolved>}) — possible shared-remote clobber"
+              MERGE_RESULT="failed_durable_audit_origin"
+              return 1
+            fi
+            log "  Durable-landing verified: merge $RESOLVED_MERGE is ancestor of BOTH rig-canonical $DEFAULT_BRANCH ($AUDIT_LOCAL) and origin ($AUDIT_ORIGIN)"
+          fi
+
           return 0
         else
           err "Landing verification FAILED (attempt $((MERGE_ATTEMPT+1))): $CUR_BRANCH not in $DEFAULT_BRANCH ($POST_MAIN)"
