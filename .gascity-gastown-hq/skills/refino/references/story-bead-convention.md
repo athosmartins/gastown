@@ -60,15 +60,40 @@ Set with `--set-metadata key=value` (one call per key, or batch via JSON).
 |---|---|---|
 | `story.resumo` | Field 1 — headline | string |
 | `story.o_que_e` | Field 2 — what + why | string (multiline ok) |
-| `story.estrela_guia` | Field 3 — north-star metric | string |
-| `story.equilibrios` | Field 4 — balancing metrics | string (semicolon-separated list) |
-| `story.dashboard` | Field 5 — post-ship signals | string (semicolon-separated list) |
+| `story.estrela_guia` | Field 3 — north-star metric | string — or the skip sentinel (see below) in simplificado |
+| `story.equilibrios` | Field 4 — balancing metrics | string (semicolon-separated list) — or the skip sentinel in simplificado |
+| `story.dashboard` | Field 5 — post-ship signals | string (semicolon-separated list) — or the skip sentinel in simplificado |
 | `story.criterios` | Field 6 — acceptance criteria | string (newline-separated list) |
 | `story.dependencias` | Field 7a — dependencies | string |
 | `story.fora_de_escopo` | Field 7b — out of scope | string |
 | `story.size_check` | Field 8 — epic/story check result | `"story"` or `"epic"` |
+| `story.refino_mode` | Refino mode used | `"simplificado"`, or **absent** = completo (default) |
 | `story.aprovado_por` | Approval actor | `"athos"` |
 | `story.aprovado_em` | Approval timestamp (ISO 8601) | string |
+
+### Refino mode + the skip sentinel
+
+The `/refino` skill runs in two modes (see the skill's "Mode Selection"):
+
+- **Completo** — all 8 fields. `story.refino_mode` is **not set**; absence of the
+  key means completo. Every existing/legacy bead falls here.
+- **Simplificado** — only F1, F2, F6, F7, F8 are filled. The bead carries
+  `story.refino_mode=simplificado`, and the three cut fields
+  (`story.estrela_guia`, `story.equilibrios`, `story.dashboard`) are written
+  with the literal **skip sentinel**:
+
+  ```
+  — pulado no refino simplificado
+  ```
+
+**Treat the sentinel as absent.** Any consumer reading `story.estrela_guia`,
+`story.equilibrios`, or `story.dashboard` MUST treat a value equal to the skip
+sentinel as "no content" — not as a real metric/signal. In particular, the
+`--has-metadata-key story.estrela_guia` query (below) will return simplificado
+beads as having the key set even though the value is the sentinel; filter the
+sentinel out when you need beads with a *real* north-star metric. The sentinel is
+intentional (it distinguishes "skipped" from "forgotten") and must never be
+silently rendered as data.
 
 ---
 
@@ -254,7 +279,14 @@ echo "Epic: $PARENT_ID | Children: $CHILD1, $CHILD2"
   exact query: `bd list --label story:approved --type feature --exclude-label story:in-flight --exclude-label story:done`.
 - **Metadata completeness:** Before dispatch, the Pilot should verify that
   `story.criterios` and `story.resumo` are set (minimum viable fields for a
-  worker to start). Use `bd show <id> --json` to inspect.
+  worker to start). Use `bd show <id> --json` to inspect. Both fields are filled
+  in **both** refino modes, so simplificado beads pass this check and are fully
+  dispatchable.
+- **Simplificado beads:** A bead with `story.refino_mode=simplificado` is a
+  normal `story:approved`, dispatchable story. Its `story.estrela_guia`,
+  `story.equilibrios` and `story.dashboard` carry the skip sentinel (`— pulado
+  no refino simplificado`) — treat those as absent, never as real
+  metrics/signals (see "Refino mode + the skip sentinel").
 - **Acceptance criteria field:** The `--acceptance` field on the bead is the
   canonical acceptance criteria (same as `story.criterios`). Workers can read
   it directly via `bd show <id>`.

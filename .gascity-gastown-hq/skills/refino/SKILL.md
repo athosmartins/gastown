@@ -5,16 +5,20 @@ description: >
   história", "refinar esse item", "refine this story", "quero refinar",
   "vamos refinar juntos", or otherwise signals the start of a product
   refinement session on a feature story. Guides the agent through an
-  interactive, rigid 8-field Definition of Refined — mandatory fields, no
-  skipping, Athos approval gate. Ends by writing/updating the story as a bead.
-version: "1.0.0"
+  interactive Definition of Refined in two modes — completo (8 mandatory
+  fields) or simplificado (5 essential fields: F1, F2, F6, F7, F8). No
+  skipping within the chosen mode, Athos approval gate. Ends by
+  writing/updating the story as a bead.
+version: "1.1.0"
 ---
 
 # Refino — Product Story Refinement Protocol
 
 Refino is a RIGID interactive protocol that a crew agent wears to refine a
-feature story WITH Athos. It does NOT end until all 8 mandatory fields are
-filled AND Athos explicitly approves. No field may be skipped or left vague
+feature story WITH Athos. It runs in one of two modes — **completo** (all 8
+fields) or **simplificado** (the 5 essential fields F1, F2, F6, F7, F8). It
+does NOT end until every mandatory field *for the chosen mode* is filled AND
+Athos explicitly approves. No mandatory field may be skipped or left vague
 based on agent discretion.
 
 Language: conduct the session in Portuguese unless Athos switches to English.
@@ -30,8 +34,6 @@ immediately enters Refino mode and announces it:
 
 ```
 Entrando no modo Refino. Vamos refinar a história juntos.
-Nenhum campo pode ser pulado — só finalizamos quando os 8 campos
-estiverem preenchidos E você aprovar explicitamente.
 ```
 
 If Athos provides a story title or bead ID at invocation, load it. Otherwise
@@ -39,11 +41,60 @@ open with: "Qual história vamos refinar hoje? (título ou ID do bead)"
 
 ---
 
-## The 8 Mandatory Fields (Definition of Refined)
+## Mode Selection (completo vs. simplificado)
 
-Work through the fields in order. After each answer, reflect it back
-concisely, ask "Está correto assim?" and only advance when Athos confirms.
-If an answer is vague, ask a follow-up rather than accepting it.
+Before working any field, choose the mode. The mode determines which fields
+are mandatory and how each field is presented.
+
+**Ask once, right after the story is identified:**
+> "Refino completo (8 campos) ou simplificado (essenciais: F1, F2, F6, F7,
+> F8)? No simplificado eu já proponho um rascunho de cada campo e você
+> confirma ou ajusta."
+
+**Shortcut — skip the question and enter simplificado directly when** Athos's
+invocation already signals it: he says "Refino Simplificado", "modo
+simplificado", or passes `simplificado` as an argument. In that case do not
+ask; announce the simplified mode and proceed.
+
+**After the mode is known, announce it explicitly so expectations are set:**
+
+- Completo:
+  ```
+  Modo completo. Nenhum campo pode ser pulado — só finalizamos quando os 8
+  campos estiverem preenchidos E você aprovar explicitamente.
+  ```
+- Simplificado:
+  ```
+  Modo simplificado. Vamos preencher os 5 campos essenciais (Resumo, O que é,
+  Critérios, Dependências/fora-de-escopo, e a checagem história/épico).
+  Estrela-guia, equilíbrios e dashboard ficam de fora e são marcados como
+  pulados. Para cada campo eu proponho um rascunho e você confirma ou ajusta.
+  Só finalizamos quando os 5 campos estiverem preenchidos E você aprovar.
+  ```
+
+**Field sets:**
+
+| Mode | Mandatory fields | Skipped |
+|------|------------------|---------|
+| Completo | F1, F2, F3, F4, F5, F6, F7, F8 | none |
+| Simplificado | F1, F2, F6, F7, F8 | F3, F4, F5 |
+
+In **simplificado**, for each mandatory field the agent FIRST proposes a draft
+(derived from the bead title/description and known context), then asks Athos to
+confirm or adjust. The draft is a starting point, not a decision: **per-field
+confirmation remains mandatory** and no field advances without Athos's explicit
+"ok"/"sim"/"isso". The skipped fields (F3, F4, F5) are never asked; they are
+recorded with the skip sentinel at write-back (see Bead Write-back).
+
+---
+
+## The Fields (Definition of Refined)
+
+Work through the fields in order, running only the fields mandatory for the
+chosen mode (see Mode Selection). In **completo** all 8 run; in **simplificado**
+F3, F4 and F5 are skipped. After each answer, reflect it back concisely, ask
+"Está correto assim?" and only advance when Athos confirms. If an answer is
+vague, ask a follow-up rather than accepting it.
 
 ### Field 1 — Resumo em 1 frase
 
@@ -78,6 +129,8 @@ If an answer is vague, ask a follow-up rather than accepting it.
 
 ### Field 3 — Estrela-guia (north-star metric)
 
+*(Pulado no modo simplificado — registrado com a sentinela de skip no write-back.)*
+
 **Prompt to Athos:**
 > "Qual é a métrica estrela-guia dessa história — como vamos saber que
 > valeu a pena entregar? Um número ou comportamento mensurável que, se
@@ -96,6 +149,8 @@ If an answer is vague, ask a follow-up rather than accepting it.
 
 ### Field 4 — Equilíbrios (balancing metrics)
 
+*(Pulado no modo simplificado — registrado com a sentinela de skip no write-back.)*
+
 **Prompt to Athos:**
 > "O que NÃO pode piorar quando entregarmos isso? Quais métricas ou
 > comportamentos existentes precisam se manter estáveis?"
@@ -110,6 +165,8 @@ If an answer is vague, ask a follow-up rather than accepting it.
 ---
 
 ### Field 5 — O que o dashboard observa depois de entregue
+
+*(Pulado no modo simplificado — registrado com a sentinela de skip no write-back.)*
 
 **Prompt to Athos:**
 > "Depois que essa história estiver em produção, o que vamos monitorar
@@ -180,6 +237,10 @@ sistema vai observar quando isso estiver certo?"
 
 **If it's an epic:** initiate the split protocol below.
 
+The size check — and the split protocol — run in **both** modes. F8 is
+mandatory in simplificado too, so a simplified story that turns out to be an
+epic still splits.
+
 ### Split Protocol (when story is too big)
 
 ```
@@ -207,16 +268,18 @@ Then close this Refino session.
 
 ## Approval Gate
 
-After all 8 fields are filled, present the complete summary:
+After all mandatory fields are filled, present the complete summary. In
+**simplificado**, lines 3–5 show the skip sentinel `— pulado no refino
+simplificado` instead of content:
 
 ```
 --- HISTÓRIA REFINADA ---
 
 1. Resumo: [...]
 2. O que é + por que importa: [...]
-3. Estrela-guia: [...]
-4. Equilíbrios: [...]
-5. Dashboard pós-entrega: [...]
+3. Estrela-guia: [... | — pulado no refino simplificado]
+4. Equilíbrios: [... | — pulado no refino simplificado]
+5. Dashboard pós-entrega: [... | — pulado no refino simplificado]
 6. Critérios de aceitação:
    - [...]
    - [...]
@@ -256,6 +319,22 @@ lifecycle label transition MUST use `--set-labels story:approved` (atomic,
 works from any source lifecycle state — `story:unrefined`,
 `story:refinement-in-progress`, or new bead).
 
+**Mode marker + skipped fields.** On write-back, record the mode via the
+`story.refino_mode` metadata key:
+
+- **Simplificado:** set `--set-metadata "story.refino_mode=simplificado"`, and
+  write the three skipped fields with the skip sentinel instead of leaving them
+  null — `--set-metadata "story.estrela_guia=— pulado no refino simplificado"`
+  (idem `story.equilibrios` and `story.dashboard`). The sentinel keeps the cut
+  fields visible-but-marked, so the Pilot/Kanban can tell "skipped" from
+  "forgotten".
+- **Completo:** do **not** set `story.refino_mode`. Absence of the key means
+  completo (the legacy default — existing beads have no key and are completo).
+  Full mode's write-back is otherwise unchanged.
+
+See `references/story-bead-convention.md` for the full key table and the
+treat-as-absent semantics of the skip sentinel.
+
 Announce completion:
 
 ```
@@ -269,11 +348,17 @@ Pronta para entrar no backlog e ser despachada.
 ## Guard Rails
 
 - **Never self-approve.** The agent cannot approve a story on behalf of Athos.
-- **Never skip a field.** If Athos tries to skip ("isso não importa"), say:
-  "Entendo, mas esse campo é obrigatório no nosso protocolo. Vamos preencher
-  juntos — pode ser curto. [restate the prompt]"
+- **Never skip a mandatory field.** The only cuttable fields are F3, F4 and F5,
+  and only in **simplificado** (where they are recorded with the skip sentinel,
+  not silently dropped). Every other field is mandatory in both modes. If Athos
+  tries to skip a mandatory field ("isso não importa"), say: "Entendo, mas esse
+  campo é obrigatório no nosso protocolo. Vamos preencher juntos — pode ser
+  curto. [restate the prompt]"
 - **Never fill a field on behalf of Athos without asking.** The agent may
-  propose a draft, but Athos must confirm.
+  propose a draft, but Athos must confirm. In **simplificado** the draft is the
+  default presentation, but it does NOT replace consent: each mandatory field
+  still requires an explicit confirm/adjust before advancing, and the final
+  approval gate is unchanged.
 - **Never close Refino early.** If the session is interrupted, save partial
   progress to the bead as a note (`story:refinement-in-progress` label) and
   tell Athos the session can resume.
