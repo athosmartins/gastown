@@ -48,6 +48,7 @@ GATE_GUARD_LIB_ONLY=1 source "$GUARD" \
 
 type reconcile_marker_action  >/dev/null 2>&1 || { echo "FATAL: reconcile_marker_action not defined by guard"; exit 1; }
 type reconcile_gaterun_action >/dev/null 2>&1 || { echo "FATAL: reconcile_gaterun_action not defined by guard"; exit 1; }
+type dedup_gaterun_action     >/dev/null 2>&1 || { echo "FATAL: dedup_gaterun_action not defined by guard"; exit 1; }
 type age_minutes_of           >/dev/null 2>&1 || { echo "FATAL: age_minutes_of not defined by guard"; exit 1; }
 type parse_marker_id          >/dev/null 2>&1 || { echo "FATAL: parse_marker_id not defined by guard"; exit 1; }
 type classify_inflight_gap1   >/dev/null 2>&1 || { echo "FATAL: classify_inflight_gap1 not defined by guard"; exit 1; }
@@ -90,7 +91,8 @@ eq "past TTL, count > cap → error"            "$(reconcile_marker_action claim
 eq "unknown status past TTL → skip (safe)"    "$(reconcile_marker_action queued      99 30 0 3)" "skip"
 
 # ── 2. Vector B — gate-run reconcile decision ────────────────────────────────
-# Signature: reconcile_gaterun_action <age_min> <ttl_min> <marker_active 0|1>
+# Signature: reconcile_gaterun_action <age_min> <ttl_min> <marker_active 0|1> \
+#                                     [verdict_timeout_min] [reviewers_alive 0|1]
 echo "── 2. reconcile_gaterun_action (Vector B: orphan gate-run cleanup) ──"
 eq "marker active, young → skip (in-flight)"      "$(reconcile_gaterun_action 5  90 1)" "skip"
 eq "marker active, age==TTL → skip (not >)"       "$(reconcile_gaterun_action 90 90 1)" "skip"
@@ -101,6 +103,35 @@ eq "marker active but age>TTL → abort:age"        "$(reconcile_gaterun_action 
 # 'dispatching' must NOT be killed just because a SIBLING attempt failed —
 # marker_active=1 protects the possibly-live re-dispatch.
 eq "re-dispatch live run (marker active) → skip"  "$(reconcile_gaterun_action 3 90 1)" "skip"
+# BACK-COMPAT: the 3-arg form (no verdict_timeout / reviewers_alive) must behave
+# EXACTLY as the pre-ga-o57gn function — the new dead-reviewer rule stays inert.
+eq "3-arg back-compat: defaults keep old behavior" "$(reconcile_gaterun_action 50 90 1)" "skip"
+
+# ── 2b. ga-o57gn: dead-reviewer zombie rule (5-arg form) ─────────────────────
+# Signature adds: <verdict_timeout_min> <reviewers_alive 0|1>. A run still
+# RUNNING past verdict-timeout with NO live reviewer = abandoned by a dead
+# dispatcher → supersede:dead-reviewers. Both conditions required so a live run
+# (which always reaches terminal by verdict-timeout) is never killed.
+echo "── 2b. reconcile_gaterun_action dead-reviewer rule (ga-o57gn) ──"
+eq "age>verdict-timeout + no reviewer → supersede" "$(reconcile_gaterun_action 46 90 1 45 0)" "supersede:dead-reviewers"
+eq "age within verdict-timeout + no reviewer → skip" "$(reconcile_gaterun_action 30 90 1 45 0)" "skip"
+eq "age==verdict-timeout boundary (not >) → skip"  "$(reconcile_gaterun_action 45 90 1 45 0)" "skip"
+eq "age>verdict-timeout but reviewer ALIVE → skip" "$(reconcile_gaterun_action 50 90 1 45 1)" "skip"
+eq "live reviewer past TTL → abort:age (hard cap)" "$(reconcile_gaterun_action 91 90 1 45 1)" "abort:age"
+eq "marker terminal beats dead-reviewer rule"      "$(reconcile_gaterun_action 50 90 0 45 0)" "supersede:marker"
+eq "dead reviewer past BOTH verdict-timeout+TTL → dead-reviewers wins" "$(reconcile_gaterun_action 99 90 1 45 0)" "supersede:dead-reviewers"
+
+# ── 2c. ga-o57gn (c): dedup decision — ≤1 running gate-run per source-bead ────
+# Signature: dedup_gaterun_action <group_count> <is_newest 0|1>. Keep the
+# newest run in a marker/source-bead group; supersede stale older siblings.
+echo "── 2c. dedup_gaterun_action (ga-o57gn keep-newest dedup) ──"
+eq "lone run → keep"                          "$(dedup_gaterun_action 1 1)" "keep"
+eq "lone run, is_newest irrelevant → keep"    "$(dedup_gaterun_action 1 0)" "keep"
+eq "group of 2, newest → keep"                "$(dedup_gaterun_action 2 1)" "keep"
+eq "group of 2, older → supersede:duplicate"  "$(dedup_gaterun_action 2 0)" "supersede:duplicate"
+eq "group of 3, older → supersede:duplicate"  "$(dedup_gaterun_action 3 0)" "supersede:duplicate"
+eq "group of 0 (ungroupable) → keep (safe)"   "$(dedup_gaterun_action 0 1)" "keep"
+eq "non-numeric group_count → keep (safe)"    "$(dedup_gaterun_action x 0)" "keep"
 
 # ── 3. Drift-guard: the guard still wires both vectors into the live sweep ────
 echo "── 3. drift-guard: guard implements both reconciler vectors ──"
@@ -118,6 +149,20 @@ grep -q 'MAX_RECLAIMS'                       "$GUARD" && ok "guard caps re-queue
 grep -q 'set_gate_status "$GR_ID" "superseded"' "$GUARD" && ok "guard supersedes orphan gate-runs (via set_gate_status)" || bad "guard missing set_gate_status superseded"
 grep -q 'set_gate_status "$GR_ID" "aborted"'    "$GUARD" && ok "guard keeps age-TTL abort fallback (via set_gate_status)" || bad "guard missing set_gate_status aborted"
 grep -q 'marker_id'                          "$GUARD" && ok "guard keys gate-run cleanup on marker_id"   || bad "guard missing marker_id linkage"
+# ── ga-o57gn drift-guards: dead-reviewer zombie sweep + keep-newest dedup ────
+grep -q 'dedup_gaterun_action()'             "$GUARD" && ok "guard defines dedup_gaterun_action (ga-o57gn (c))"        || bad "guard missing dedup_gaterun_action def"
+grep -q 'GATE_VERDICT_TIMEOUT_MINUTES'       "$GUARD" && ok "guard defines verdict-timeout threshold (dead-reviewer rule)" || bad "guard missing GATE_VERDICT_TIMEOUT_MINUTES"
+grep -q 'GATE_ZOMBIE_AGE_MINUTES'            "$GUARD" && ok "guard defines verdict-timeout+margin zombie-age threshold"   || bad "guard missing GATE_ZOMBIE_AGE_MINUTES (merge-window safety margin)"
+grep -q 'reviewers_alive_for_run()'          "$GUARD" && ok "guard defines reviewers_alive_for_run helper"            || bad "guard missing reviewers_alive_for_run"
+grep -q 'reconcile_gaterun_action "$GR_AGE" "$GATE_RUN_TTL_MINUTES" "$MARKER_ACTIVE" "$GATE_ZOMBIE_AGE_MINUTES" "$REVIEWERS_ALIVE"' "$GUARD" \
+  && ok "guard wires zombie-age + reviewers_alive into reconcile call" || bad "guard not passing the dead-reviewer args"
+grep -q 'supersede:dead-reviewers)'          "$GUARD" && ok "guard handles supersede:dead-reviewers action"           || bad "guard missing dead-reviewers handler"
+grep -q 'dedup_gaterun_action "$_group_count" "$_is_newest"' "$GUARD" && ok "guard runs keep-newest dedup per gate-run" || bad "guard not calling dedup_gaterun_action in the sweep"
+grep -q 'supersede:duplicate' "$GUARD" && ok "guard supersedes stale duplicate gate-runs (dedup)" || bad "guard missing supersede:duplicate handler"
+# Both new terminal paths must CLOSE the bead (ga-jhyu invariant: terminal ⇒ closed).
+[ "$(grep -c 'Closed by guard (ga-o57gn)' "$GUARD")" -ge 2 ] \
+  && ok "guard closes dead-reviewer + duplicate gate-runs at terminal (ga-jhyu invariant)" \
+  || bad "guard ga-o57gn terminal paths do not both close the gate-run"
 grep -q 'date -j -u -f'                      "$GUARD" && ok "guard parses bead timestamps as UTC (-u)"   || bad "guard missing -u (TZ bug regressed)"
 # Dispatcher Step 0a (D_EPOCH) + reviewer janitor (R_EPOCH) must ALL parse UTC.
 # A bare `grep 'date -j -u -f'` would false-pass (R_EPOCH already has it), so we

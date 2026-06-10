@@ -30,6 +30,21 @@ CLAIM_TTL_MINUTES=30
 DISPATCHING_TTL_MINUTES=30
 GATE_RUN_TTL_MINUTES=90
 MAX_RECLAIMS=3
+# ga-o57gn: a gate-run legitimately stays gate-status:running only while its
+# owning dispatcher process polls verdicts — capped at VERDICT_TIMEOUT_MINUTES
+# (dispatcher default 45). Past that, a still-running gate-run with no live
+# reviewer is a zombie (dispatcher died/OOM/credit-limited). Kept in sync with
+# the dispatcher's VERDICT_TIMEOUT_MINUTES default so the dead-reviewer sweep
+# fires right after a real run would have driven itself terminal.
+GATE_VERDICT_TIMEOUT_MINUTES="${VERDICT_TIMEOUT_MINUTES:-45}"
+# Margin past verdict-timeout before the dead-reviewer sweep fires. The
+# dispatcher closes reviewer sessions (Step 9) BEFORE it stamps the gate-run
+# terminal (post-merge), so a run whose verdicts land NEAR the timeout has a
+# brief window with reviewers closed but the bead still running. The margin
+# keeps the sweep clear of that window — a live run is terminal well before
+# (verdict-timeout + margin), so only genuinely abandoned runs are caught.
+GATE_DEAD_REVIEWER_MARGIN_MINUTES="${GATE_DEAD_REVIEWER_MARGIN_MINUTES:-10}"
+GATE_ZOMBIE_AGE_MINUTES=$(( GATE_VERDICT_TIMEOUT_MINUTES + GATE_DEAD_REVIEWER_MARGIN_MINUTES ))
 
 # ── Pure decision functions (loaded in GATE_GUARD_LIB_ONLY=1 mode by tests/dispatcher) ──
 
@@ -76,14 +91,50 @@ reconcile_marker_action() {
   esac
 }
 
-# reconcile_gaterun_action <age_min> <ttl_min> <marker_active: 0|1>
+# reconcile_gaterun_action <age_min> <ttl_min> <marker_active: 0|1> \
+#                          [verdict_timeout_min] [reviewers_alive: 0|1]
 # Pure decision: what to do with a gate-run bead stuck in gate-status:running.
-# Returns: skip | supersede:marker | abort:age
+# Returns: skip | supersede:marker | supersede:dead-reviewers | abort:age
+#
+# Priority (most-specific / safest first):
+#   1. marker terminal/gone (marker_active=0) → supersede:marker     [ga-tmug]
+#   2. age > verdict_timeout AND reviewers_alive=0 → supersede:dead-reviewers
+#      [ga-o57gn] The owning dispatcher caps a real run at verdict_timeout, so a
+#      run still RUNNING past that with no live reviewer is abandoned. Requiring
+#      BOTH conditions means we NEVER kill a live run: a live dispatcher reaches
+#      terminal by verdict_timeout, and the reviewer-liveness check is the
+#      corroborating signal the bug (ga-o57gn) asked for.
+#   3. age > ttl (90m hard cap) → abort:age                          [ga-tmug]
+#   4. else → skip (in-flight, untouched)
+#
+# Back-compat: callers may omit the last two args. Defaults (verdict_timeout
+# effectively infinite, reviewers_alive=1) make rule 2 inert, so a 3-arg call
+# behaves EXACTLY as the pre-ga-o57gn function did.
 reconcile_gaterun_action() {
   local age_min="$1" ttl_min="$2" marker_active="$3"
+  local verdict_timeout_min="${4:-999999}" reviewers_alive="${5:-1}"
   [ "$marker_active" = "0" ] && { echo "supersede:marker"; return; }
+  if [ "$reviewers_alive" = "0" ] && [ "$age_min" -gt "$verdict_timeout_min" ]; then
+    echo "supersede:dead-reviewers"; return
+  fi
   [ "$age_min" -le "$ttl_min" ] && { echo "skip"; return; }
   echo "abort:age"
+}
+
+# dedup_gaterun_action <group_count> <is_newest: 0|1>
+# Pure decision: enforce ≤1 running gate-run per source-bead/marker (ga-o57gn (c)).
+# The guard creates a tracking gate-run at claim time and the dispatcher creates
+# its OWN at dispatch time; a re-queued marker (dead-dispatcher recovery) then
+# spawns yet another. Multiple gate-runs sharing a marker_id are thus normal
+# transiently — but only the NEWEST is the live run; older ones are stale and
+# inflate the "GATES RODANDO" count. Keep the newest, supersede the rest.
+# A lone run (group_count<=1) is always kept. Returns: keep | supersede:duplicate
+dedup_gaterun_action() {
+  local group_count="$1" is_newest="$2"
+  case "$group_count" in ''|*[!0-9]*) echo "keep"; return ;; esac
+  [ "$group_count" -le 1 ] && { echo "keep"; return; }
+  [ "$is_newest" = "1" ] && { echo "keep"; return; }
+  echo "supersede:duplicate"
 }
 
 # ── set_gate_status <bead_id> <new_status> ─────────────────────────────────
@@ -288,23 +339,102 @@ fi
 # Keying on marker_id (not just source-bead) prevents false-positives on
 # re-dispatched live runs that share a source bead with an older failed attempt.
 
-log "Step 0b: Vector B reconcile — orphan gate-run:running beads (TTL=${GATE_RUN_TTL_MINUTES}m)..."
+log "Step 0b: Vector B reconcile — orphan gate-run:running beads (TTL=${GATE_RUN_TTL_MINUTES}m, zombie-age=${GATE_ZOMBIE_AGE_MINUTES}m=verdict-timeout+margin)..."
+
+# reviewers_alive_for_run <gate_run_id> — I/O helper (ga-o57gn).
+# Echo 1 iff at least one of this gate-run's still-OPEN verdict beads is assigned
+# to a reviewer session that is present (alive) in SESS_SNAP_JSON, else 0. A
+# gate-run still running past verdict-timeout with zero live reviewers is a
+# zombie whose dispatcher died. (Live section only — uses bd/gc; never called in
+# lib-only mode, so it is intentionally NOT one of the drift-guarded pure fns.)
+reviewers_alive_for_run() {
+  local gr_id="$1" vbs assignees a present
+  [ -z "$gr_id" ] && { echo 0; return; }
+  vbs=$(bd -C "$GC_CITY" list --json --all \
+    -l type:quality-gate-verdict -l "gate-run:$gr_id" 2>/dev/null || echo "[]")
+  # Only OPEN verdict beads matter — a closed verdict means the reviewer finished.
+  assignees=$(printf '%s\n' "$vbs" \
+    | jq -r '.[]? | select((.status // "") != "closed") | .assignee // empty' \
+    2>/dev/null || true)
+  [ -z "$assignees" ] && { echo 0; return; }
+  for a in $assignees; do
+    [ -z "$a" ] && continue
+    present=$(printf '%s\n' "$SESS_SNAP_JSON" \
+      | jq -r --arg s "$a" 'if type=="array" then . else (.sessions // []) end
+          | map(select((.id==$s) or (.session_name==$s) or (.session_id==$s))
+                | select((.closed // false) != true)) | length' \
+      2>/dev/null || echo 0)
+    case "$present" in ''|*[!0-9]*) present=0 ;; esac
+    [ "$present" -ge 1 ] && { echo 1; return; }
+  done
+  echo 0
+}
 
 GATE_RUNS_JSON=$(bd -C "$GC_CITY" list --json --all \
   -l type:quality-gate-run \
   -l gate-status:running \
   2>/dev/null || echo "[]")
-GATE_RUN_COUNT=$(echo "$GATE_RUNS_JSON" | jq 'length' 2>/dev/null || echo "0")
+GATE_RUN_COUNT=$(printf '%s\n' "$GATE_RUNS_JSON" | jq 'length' 2>/dev/null || echo "0")
+case "$GATE_RUN_COUNT" in ''|*[!0-9]*) GATE_RUN_COUNT=0 ;; esac
 
 if [ "$GATE_RUN_COUNT" -gt 0 ]; then
   NOW_EPOCH=$(date +%s)
+
+  # One session snapshot for the whole sweep (reviewer-liveness lookups, ga-o57gn).
+  SESS_SNAP_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo '{}')
+
+  # ── First pass: build the dedup grouping key for every running gate-run. ────
+  # ga-o57gn (c): enforce ≤1 running gate-run per marker. Key on marker_id
+  # (canonical — matches the anti-false-positive guidance below); fall back to
+  # the source-bead label when a description carries no marker_id. created_at is
+  # an ISO-8601 'Z' string, so a lexical compare == a chronological compare.
+  GR_ID_ARR=(); GR_KEY_ARR=(); GR_CREATED_ARR=()
   for i in $(seq 0 $((GATE_RUN_COUNT - 1))); do
-    GR=$(echo "$GATE_RUNS_JSON" | jq ".[$i]")
-    GR_ID=$(echo "$GR" | jq -r '.id')
-    GR_UPDATED=$(echo "$GR" | jq -r '.updated_at // .created_at // ""')
-    GR_DESC=$(echo "$GR" | jq -r '.description // ""')
+    _gr=$(printf '%s\n' "$GATE_RUNS_JSON" | jq ".[$i]")
+    _id=$(printf '%s\n' "$_gr" | jq -r '.id // ""')
+    _created=$(printf '%s\n' "$_gr" | jq -r '.created_at // .updated_at // ""')
+    _desc=$(printf '%s\n' "$_gr" | jq -r '.description // ""')
+    _key=$(parse_marker_id "$_desc")
+    if [ -z "$_key" ]; then
+      _key=$(printf '%s\n' "$_gr" \
+        | jq -r '(.labels // [])[]? | select(startswith("source-bead:"))' 2>/dev/null | head -1 || true)
+    fi
+    GR_ID_ARR+=("$_id"); GR_KEY_ARR+=("$_key"); GR_CREATED_ARR+=("$_created")
+  done
+
+  for i in $(seq 0 $((GATE_RUN_COUNT - 1))); do
+    GR=$(printf '%s\n' "$GATE_RUNS_JSON" | jq ".[$i]")
+    GR_ID="${GR_ID_ARR[$i]}"
+    GR_UPDATED=$(printf '%s\n' "$GR" | jq -r '.updated_at // .created_at // ""')
+    GR_DESC=$(printf '%s\n' "$GR" | jq -r '.description // ""')
 
     GR_AGE=$(age_minutes_of "$GR_UPDATED" "$NOW_EPOCH")
+
+    # ── Dedup decision: does a NEWER running gate-run share this key? ─────────
+    # Keep-newest never supersedes the newest run, so a live re-dispatch (always
+    # the newest) is safe; only the stale older siblings (guard tracking bead,
+    # dead-dispatcher re-queue remnants) are superseded.
+    _key="${GR_KEY_ARR[$i]}"
+    _group_count=0; _is_newest=1
+    if [ -n "$_key" ]; then
+      for j in $(seq 0 $((GATE_RUN_COUNT - 1))); do
+        [ "${GR_KEY_ARR[$j]}" = "$_key" ] || continue
+        _group_count=$((_group_count + 1))
+        [ "$j" -eq "$i" ] && continue
+        _cj="${GR_CREATED_ARR[$j]}"; _ci="${GR_CREATED_ARR[$i]}"
+        if [[ "$_cj" > "$_ci" ]] || { [ "$_cj" = "$_ci" ] && [[ "${GR_ID_ARR[$j]}" > "$GR_ID" ]]; }; then
+          _is_newest=0
+        fi
+      done
+    fi
+    DEDUP_ACTION=$(dedup_gaterun_action "$_group_count" "$_is_newest")
+    if [ "$DEDUP_ACTION" = "supersede:duplicate" ]; then
+      warn "Vector B: superseding STALE DUPLICATE gate-run $GR_ID (a newer running run shares key='$_key'; keep-newest dedup, ga-o57gn)"
+      set_gate_status "$GR_ID" "superseded"
+      bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-o57gn): stale duplicate — a newer running gate-run shares this marker/source-bead. Keep-newest dedup enforces ≤1 running gate-run per source-bead. Self-healed by guard." 2>/dev/null || true
+      bd -C "$GC_CITY" close "$GR_ID" -r "gate-run superseded (terminal) — stale duplicate, newer running run exists. Closed by guard (ga-o57gn)." 2>/dev/null || true
+      continue
+    fi
 
     # Determine if the companion marker is still active.
     # parse_marker_id extracts the marker_id: field written by the guard at Step 6.
@@ -313,16 +443,25 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
     if [ -n "$COMPANION_MARKER_ID" ]; then
       MARKER_JSON=$(bd -C "$GC_CITY" show "$COMPANION_MARKER_ID" --json 2>/dev/null || echo "")
       if [ -n "$MARKER_JSON" ]; then
-        MARKER_LABELS=$(echo "$MARKER_JSON" \
+        MARKER_LABELS=$(printf '%s\n' "$MARKER_JSON" \
           | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' \
           2>/dev/null || echo "")
-        echo "$MARKER_LABELS" | grep -qE "gate-status:(queued|claimed|dispatching)" \
+        printf '%s\n' "$MARKER_LABELS" | grep -qE "gate-status:(queued|claimed|dispatching)" \
           && MARKER_ACTIVE=1 || true
-        echo "$MARKER_LABELS" | grep -qE "gate-status:" || MARKER_ACTIVE=1
+        printf '%s\n' "$MARKER_LABELS" | grep -qE "gate-status:" || MARKER_ACTIVE=1
       fi
     fi
 
-    ACTION=$(reconcile_gaterun_action "$GR_AGE" "$GATE_RUN_TTL_MINUTES" "$MARKER_ACTIVE")
+    # ── Reviewer-liveness (ga-o57gn): computed ONLY when it can change the
+    # outcome — the marker still looks active AND the run is already past
+    # verdict-timeout. This bounds the extra bd/gc round-trip to genuine
+    # zombie candidates and never touches young/in-flight runs.
+    REVIEWERS_ALIVE=1
+    if [ "$MARKER_ACTIVE" = "1" ] && [ "$GR_AGE" -gt "$GATE_ZOMBIE_AGE_MINUTES" ]; then
+      REVIEWERS_ALIVE=$(reviewers_alive_for_run "$GR_ID")
+    fi
+
+    ACTION=$(reconcile_gaterun_action "$GR_AGE" "$GATE_RUN_TTL_MINUTES" "$MARKER_ACTIVE" "$GATE_ZOMBIE_AGE_MINUTES" "$REVIEWERS_ALIVE")
     case "$ACTION" in
       supersede:marker)
         warn "Vector B: superseding orphan gate-run $GR_ID (age=${GR_AGE}m, marker $COMPANION_MARKER_ID is terminal/gone)"
@@ -330,6 +469,12 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
         bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-tmug): orphan gate-run superseded — companion marker $COMPANION_MARKER_ID is terminal/gone; run is no longer active. Self-healed by guard." 2>/dev/null || true
         # ga-jhyu: CLOSE at terminal so wisp-compact reaps it (was relabel-only → OPEN forever).
         bd -C "$GC_CITY" close "$GR_ID" -r "gate-run superseded (terminal) — companion marker $COMPANION_MARKER_ID terminal/gone. Closed by guard (ga-jhyu)." 2>/dev/null || true
+        ;;
+      supersede:dead-reviewers)
+        warn "Vector B: superseding ZOMBIE gate-run $GR_ID (age=${GR_AGE}m > zombie-age=${GATE_ZOMBIE_AGE_MINUTES}m [verdict-timeout ${GATE_VERDICT_TIMEOUT_MINUTES}m + margin ${GATE_DEAD_REVIEWER_MARGIN_MINUTES}m], no live reviewer — dispatcher abandoned it; ga-o57gn)"
+        set_gate_status "$GR_ID" "superseded"
+        bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-o57gn): zombie gate-run superseded — age ${GR_AGE}m exceeds verdict-timeout+margin (${GATE_ZOMBIE_AGE_MINUTES}m) AND no live reviewer is assigned to an open verdict bead. The owning dispatcher died/was killed mid-run. Self-healed by guard." 2>/dev/null || true
+        bd -C "$GC_CITY" close "$GR_ID" -r "gate-run superseded (terminal) — zombie: age>verdict-timeout, no live reviewer. Closed by guard (ga-o57gn)." 2>/dev/null || true
         ;;
       abort:age)
         warn "Vector B: aborting gate-run $GR_ID by TTL fallback (age=${GR_AGE}m > ${GATE_RUN_TTL_MINUTES}m, marker_active=${MARKER_ACTIVE})"
@@ -339,7 +484,7 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
         bd -C "$GC_CITY" close "$GR_ID" -r "gate-run aborted (terminal) by TTL fallback (age=${GR_AGE}m > ${GATE_RUN_TTL_MINUTES}m). Closed by guard (ga-jhyu)." 2>/dev/null || true
         ;;
       skip)
-        log "  Gate-run $GR_ID active (age=${GR_AGE}m, marker_active=${MARKER_ACTIVE}) — skipping."
+        log "  Gate-run $GR_ID active (age=${GR_AGE}m, marker_active=${MARKER_ACTIVE}, reviewers_alive=${REVIEWERS_ALIVE}) — skipping."
         ;;
     esac
   done
