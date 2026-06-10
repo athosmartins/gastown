@@ -377,7 +377,29 @@ fi
 # throughput, older markers (e.g. iz4a96/ga-mr8ym, + 2-day-old pddg18/pqzl9h)
 # starved indefinitely as newer ones jumped the line. sort_by(created_at) drains
 # the queue in arrival order. (Throughput / parallel dispatch = Phase 2, separate.)
-MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq 'sort_by(.created_at) | .[0]')
+#
+# ga-q3ig2 HEAD-OF-LINE FIX: a marker whose branch is stale-with-conflict and
+# whose author is dead/transient gets re-queued — here (dead-author bounded
+# retry re-adds gate-status:queued), by gate-health-monitor, or by a manual
+# re-anchor that resets the gate:rebase-attempt counter. Because the broken
+# marker keeps the OLDEST created_at, a pure FIFO sort re-selects it EVERY
+# sweep, fails the same rebase, and never reaches the N healthy markers behind
+# it ("o FIFO insiste nele"). Result: 2× outages 2026-06-10 (~16:30, ~18:03-18:52
+# = 49min) where one broken branch travou a fila INTEIRA (18 markers), zero
+# merges until manual intervention.
+#
+# Fix: two-tier ordering. Markers with NO prior auto-rebase failure are drained
+# first (FIFO by created_at). Markers that already failed an auto-rebase (they
+# carry a gate:rebase-attempt:N label) sink to the BACK and are only re-attempted
+# when no healthy marker is queued. One broken branch can no longer travar a fila
+# regardless of who re-queues it — the queue drains the healthy markers while the
+# broken one is "tratado à parte" (escalated to needs-rebase by its own bounded
+# retry / gate-health-monitor). Star-guide: gate never idles >15min on 1 stale branch.
+MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq '
+  def has_rebase_fail: ((.labels // []) | map(select(test("^gate:rebase-attempt:[0-9]+$"))) | length) > 0;
+  sort_by(.created_at)
+  | (map(select(has_rebase_fail | not)) + map(select(has_rebase_fail)))
+  | .[0]')
 MARKER_ID=$(printf '%s\n' "$MARKER" | jq -r '.id')
 DESC=$(printf '%s\n' "$MARKER" | jq -r '.description // ""')
 
@@ -730,6 +752,13 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
   # ancestor" → forced conflict → strand. We now use --write-tree exit codes.
   HAS_CONFLICT=0
   CONFLICT_FILES=""
+  # ga-q3ig2: classify WHY a branch can't fast-forward so the dead-author handler
+  # can decide whether a server-side retry is worthwhile. "merge" = a genuine,
+  # deterministic merge conflict vs current main (re-running the rebase yields the
+  # same result; a dead author cannot resolve it → skip retries, escalate at once).
+  # "transient" = auto-rebase worktree/push plumbing failure (main may settle →
+  # bounded retry still makes sense).
+  CONFLICT_KIND=""
   MERGE_BASE_SHA=$(git_rig merge-base "origin/$BRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
   MT_VERDICT=$(rig_merge_has_conflict "origin/$DEFAULT_BRANCH" "origin/$BRANCH")
 
@@ -745,6 +774,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     exit 1
   elif [ "$MT_VERDICT" = "1" ]; then
     HAS_CONFLICT=1
+    CONFLICT_KIND="merge"   # ga-q3ig2: genuine, deterministic merge conflict.
     # Capture conflicting file names from the structured --write-tree conflict block.
     # The trailing `|| true` is REQUIRED: merge-tree --write-tree returns rc=1 on a
     # conflict, and under `set -euo pipefail` (line 30) `pipefail` propagates that
@@ -834,6 +864,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     else
       # Auto-rebase failed despite no conflicts (worktree/push failure)
       HAS_CONFLICT=1
+      CONFLICT_KIND="transient"   # ga-q3ig2: plumbing failure, not a real conflict — retry is worthwhile.
       CONFLICT_FILES="auto-rebase failed (worktree/push error)"
     fi
   fi
@@ -887,27 +918,51 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
         --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR for rebase"
       REBASE_EVENT="dispatcher_needs_rebase"
       REBASE_VERDICT="NEEDS_REBASE (conflicts, author live, bounced)"
+    elif [ "$CONFLICT_KIND" = "merge" ]; then
+      # ga-q3ig2 IDEAL SKIP: a GENUINE merge conflict vs current main is
+      # deterministic — re-running the same rebase next sweep produces the same
+      # conflict, and the author session is gone so no one will resolve it. The
+      # old bounded-retry path (below) burned MAX_REBASE_ATTEMPTS sweeps re-failing
+      # before escalating; with the broken marker keeping the oldest created_at it
+      # also head-of-line-blocked the queue. Go STRAIGHT to needs-rebase + escalate
+      # so the marker leaves the active queue on its FIRST determination and the
+      # gate-health-monitor / a fresh re-dispatch can re-anchor or rebuild it.
+      err "Branch $BRANCH: genuine merge conflict vs $DEFAULT_BRANCH, author dead/empty — immediate needs-rebase (no retry; conflict is deterministic)."
+      bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate SKIPPED + ESCALATED (ga-q3ig2): branch $BRANCH has a genuine, deterministic merge conflict (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) and no live author session exists. A server-side rebase retry would fail identically, so the marker is parked at needs-rebase immediately (NOT re-queued) — it no longer blocks the queue. Needs re-anchor/rebuild or a Mayor decision." 2>/dev/null || true
+      if [ -n "$BEAD_ID" ]; then
+        bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+      fi
+      gc --city "$GC_CITY" mail send mayor \
+        -s "Gate escalation: $BRANCH genuine conflict (no live author)" \
+        -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) has a genuine, deterministic conflict vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). Conflicting: ${CONFLICT_FILES:-unknown}. Author session is gone — gate cannot self-heal, and a rebase retry would fail identically. Parked at needs-rebase (not blocking the queue). Needs a manual re-anchor/rebuild or a decision." 2>/dev/null \
+        || warn "Could not mail Mayor for gate escalation on $BRANCH"
+      REBASE_EVENT="dispatcher_needs_rebase_immediate"
+      REBASE_VERDICT="NEEDS_REBASE (genuine conflict, dead author — immediate skip)"
     else
-      # Dead/empty author — never strand. Bounded server-side retry, then escalate.
+      # Dead/empty author + TRANSIENT auto-rebase failure (worktree/push plumbing).
+      # main may settle on a later sweep, so a bounded server-side retry is worth
+      # it; then escalate. (Genuine merge conflicts take the immediate-skip branch
+      # above — they never reach here.)
       NEXT_ATTEMPT=$((REBASE_ATTEMPT + 1))
       bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:rebase-attempt:$REBASE_ATTEMPT" -q 2>/dev/null || true
       bd -C "$GC_CITY" label add    "$MARKER_ID" "gate:rebase-attempt:$NEXT_ATTEMPT"  -q 2>/dev/null || true
       if [ "$NEXT_ATTEMPT" -lt "$MAX_REBASE_ATTEMPTS" ]; then
-        warn "Branch $BRANCH: conflict/auto-rebase-fail, author dead/empty (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — gate-status:queued for server-side retry."
+        warn "Branch $BRANCH: transient auto-rebase-fail, author dead/empty (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — gate-status:queued for server-side retry."
         bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:queued" -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS: branch $BRANCH could not auto-rebase (${CONFLICT_FILES:-conflicts}) and the author session is gone. Queued for server-side retry on next sweep (NOT stranded on a dead author)." 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS: branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) and the author session is gone. Queued for server-side retry on next sweep (NOT stranded on a dead author). Carries gate:rebase-attempt:$NEXT_ATTEMPT so it sinks behind healthy markers (ga-q3ig2)." 2>/dev/null || true
         REBASE_EVENT="dispatcher_autorebase_retry"
         REBASE_VERDICT="QUEUED (retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, dead author)"
       else
-        err "Branch $BRANCH: conflict persists after $MAX_REBASE_ATTEMPTS server-side attempts, author dead/empty — escalating to Mayor."
+        err "Branch $BRANCH: transient auto-rebase failure persists after $MAX_REBASE_ATTEMPTS server-side attempts, author dead/empty — escalating to Mayor."
         bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED: branch $BRANCH has a genuine conflict (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA), auto-rebase failed $MAX_REBASE_ATTEMPTS times, and no live author session exists. Escalated to Mayor for resolution." 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED: branch $BRANCH could not auto-rebase (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) after $MAX_REBASE_ATTEMPTS attempts, and no live author session exists. Escalated to Mayor for resolution." 2>/dev/null || true
         if [ -n "$BEAD_ID" ]; then
           bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
         fi
         gc --city "$GC_CITY" mail send mayor \
           -s "Gate escalation: $BRANCH stranded conflict (no live author)" \
-          -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) has a genuine conflict vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). Conflicting: ${CONFLICT_FILES:-unknown}. Auto-rebase failed $MAX_REBASE_ATTEMPTS times and the author session is gone — gate cannot self-heal. Needs a manual rebase or a decision." 2>/dev/null \
+          -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) could not auto-rebase vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). ${CONFLICT_FILES:-unknown}. Auto-rebase failed $MAX_REBASE_ATTEMPTS times and the author session is gone — gate cannot self-heal. Needs a manual rebase or a decision." 2>/dev/null \
           || warn "Could not mail Mayor for gate escalation on $BRANCH"
         REBASE_EVENT="dispatcher_needs_rebase_escalated"
         REBASE_VERDICT="NEEDS_REBASE (escalated to Mayor after $MAX_REBASE_ATTEMPTS attempts)"
