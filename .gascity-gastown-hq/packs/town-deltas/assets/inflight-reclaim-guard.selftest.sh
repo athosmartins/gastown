@@ -402,6 +402,87 @@ print('OK do_reclaim resets status open')
 " "OK do_reclaim resets status open"
 
 # ---------------------------------------------------------------------------
+# ga-64usm: alive != working. A credit-limited / hung builder keeps
+# state=active in `gc session list` but produces ZERO output → its last_active
+# timestamp goes stale. The old session_is_live() treated any matched
+# active/awake session as a healthy owner, so a frozen builder's in-flight bead
+# was NEVER reclaimable (it sat story:in-flight for 3h46 on 2026-06-09). The fix
+# adds a freshness gate: a matched live session counts as a HEALTHY owner only
+# if it shows a recent progress signal — terminal activity within
+# STALE_ACTIVITY_TTL, OR a bd update on the bead itself within the same window.
+# ---------------------------------------------------------------------------
+
+# ga-64usm (a): session_owner_is_healthy pure decision matrix.
+run_test "ga-64usm: session_owner_is_healthy decision matrix" "
+$LOAD_REAL
+f = m.session_owner_is_healthy
+TTL = m.STALE_ACTIVITY_TTL
+# No matched live session → never a healthy owner (delegates to dead-builder rail)
+assert f(False, None, None) is False
+assert f(False, 10, 10) is False
+# Matched live, but activity age unknown → conservative: treat as healthy
+assert f(True, None, None) is True
+# Matched live with FRESH terminal activity → healthy (normal working builder)
+assert f(True, 10, None) is True
+assert f(True, TTL, None) is True            # boundary: == TTL still fresh
+# Matched live, STALE activity, NO recent bead update → FROZEN zombie (reclaimable)
+assert f(True, TTL + 1, None) is False
+assert f(True, TTL + 1, TTL + 1) is False    # bead also stale → frozen
+# Matched live, STALE activity, but bead bd-updated recently → progress (keep)
+assert f(True, TTL + 1, 60) is True
+assert f(True, TTL + 1, TTL) is True         # boundary: bead update == TTL still fresh
+print('OK session_owner_is_healthy matrix')
+" "OK session_owner_is_healthy matrix"
+
+# ga-64usm (b): parse_iso_epoch handles offset AND bare-Z (py3.9 fromisoformat
+# rejects bare Z — bd emits Z timestamps, gc session emits offset timestamps).
+run_test "ga-64usm: parse_iso_epoch handles offset and Z" "
+$LOAD_REAL
+p = m.parse_iso_epoch
+a = p('2026-06-10T11:33:28-03:00')
+b = p('2026-06-10T14:33:28Z')
+assert a is not None and b is not None, 'both forms must parse'
+assert abs(a - b) < 1.0, f'offset and Z forms must agree: {a} vs {b}'
+assert p('') is None and p(None) is None and p('garbage') is None, 'bad input → None'
+print('OK parse_iso_epoch')
+" "OK parse_iso_epoch"
+
+# ga-64usm (c): a FROZEN live session (state=active, last_active stale) with no
+# recent bead update is NOT a live owner → bead becomes reclaimable. THE BUG.
+run_test "ga-64usm: frozen active session → not live owner (reclaimable)" "
+$LOAD_REAL
+now   = m.parse_iso_epoch('2026-06-10T12:00:00+00:00')
+stale = '2026-06-10T11:00:00+00:00'   # 60min before now → > 30min STALE_ACTIVITY_TTL
+sess  = [{'state':'active','name':'gastown.dog-1','session_name':'dog-x','last_active': stale}]
+# Frozen + no recent bead update → not a live owner (the bug: must be reclaimable)
+assert m.session_is_live('dog-x', sess, now) is False, 'frozen session must NOT count as live'
+# Frozen BUT bead bd-updated 2min ago → progress signal → keep (conservative)
+assert m.session_is_live('dog-x', sess, now, bead_update_age=120) is True, 'recent bead update → keep'
+print('OK frozen session reclaimable')
+" "OK frozen session reclaimable"
+
+# ga-64usm (d): control — a FRESH live session (recent last_active) is STILL a
+# live owner (no false reclaim of a genuinely-working builder).
+run_test "ga-64usm: fresh active session → still live owner (control)" "
+$LOAD_REAL
+now   = m.parse_iso_epoch('2026-06-10T12:00:00+00:00')
+fresh = '2026-06-10T11:58:00+00:00'   # 2min before now → fresh
+sess  = [{'state':'active','name':'gastown.dog-1','session_name':'dog-x','last_active': fresh}]
+assert m.session_is_live('dog-x', sess, now) is True, 'fresh session must stay live'
+print('OK fresh session still live')
+" "OK fresh session still live"
+
+# ga-64usm (e): backward-compat — sessions WITHOUT last_active (e.g. mock data,
+# or gc output that omits it) fall back to the conservative pre-fix behavior:
+# matched live session → live (no spurious reclaim from a missing timestamp).
+run_test "ga-64usm: missing last_active → conservative (stays live)" "
+$LOAD_REAL
+sess = [{'state':'active','name':'gastown.dog-1','session_name':'dog-x'}]
+assert m.session_is_live('dog-x', sess) is True, 'no last_active → conservative live'
+print('OK missing last_active conservative')
+" "OK missing last_active conservative"
+
+# ---------------------------------------------------------------------------
 # Drift-guard: verify RECLAIM_TTL, MAX_RECLAIMS, and key safety guards are
 # present in the live script (source-of-truth check).
 # ---------------------------------------------------------------------------
@@ -437,6 +518,11 @@ check_pattern "ga-vw26y: scope predicate present" "def is_reclaimable_inprogress
 check_pattern "ga-vw26y: pilot-story markers defined" "PILOT_STORY_MARKERS"
 check_pattern "ga-vw26y: terminal/parked exclusion set defined" "TERMINAL_PARKED_LABELS"
 check_pattern "ga-vw26y: do_reclaim resets status open" 'bd.*update|"update"'
+check_pattern "ga-64usm: STALE_ACTIVITY_TTL constant present" "STALE_ACTIVITY_TTL\s*=\s*1800"
+check_pattern "ga-64usm: session_owner_is_healthy helper present" "def session_owner_is_healthy"
+check_pattern "ga-64usm: parse_iso_epoch helper present" "def parse_iso_epoch"
+check_pattern "ga-64usm: session_activity_age helper present" "def session_activity_age"
+check_pattern "ga-64usm: session_is_live consults last_active" "last_active"
 
 # ---------------------------------------------------------------------------
 # Summary

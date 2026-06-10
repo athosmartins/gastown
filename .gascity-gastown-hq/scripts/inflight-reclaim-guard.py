@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pilot in-flight bead zombie reclaim guard (ga-se62o, ga-7m191, ga-vw26y).
+"""Pilot in-flight bead zombie reclaim guard (ga-se62o, ga-7m191, ga-vw26y, ga-64usm).
 
 Detects beads stranded in story:in-flight whose builder DIED / never engaged /
 got churned by a controller restart, and reclaims them so the Pilot can
@@ -24,6 +24,19 @@ beads) catches Pilot stories that lost story:in-flight but kept a durable Pilot
 marker (pilot:dispatched / pilot:reclaim-count); (2) do_reclaim now RESETS
 status to open, so a reclaimed bead is actually re-dispatchable (clearing the
 labels/assignee alone left it in_progress → still invisible to the Pilot).
+
+ga-64usm (alive != working): the guard used "is the assignee's session alive?"
+as a proxy for "is a builder still working it?" — but a credit-limited or hung
+session stays state=active in `gc session list` while producing zero output, so
+session_is_live() returned True forever and the bead was NEVER reclaimable (one
+sat story:in-flight for 3h46 on 2026-06-09). The fix: a matched live session is
+treated as a HEALTHY owner only if it shows a fresh progress signal — its
+last_active is within STALE_ACTIVITY_TTL (30min), OR the bead itself had a bd
+update within that window (workers should bd-update during long work). A live
+session that is stale on BOTH is a frozen zombie and falls through to the normal
+reclaim rails (no recent branch + continuous stranding past RECLAIM_TTL). The
+check is conservative: a missing/unparseable last_active keeps the pre-fix
+"treat as live" behavior — we never reclaim on the strength of an absent field.
 
 Poll loop (~5min). Silence = healthy. Emits on action only:
   [INFLIGHT-RECLAIM] [RECLAIMED]   cleared in-flight labels + reset <id> to open
@@ -68,6 +81,10 @@ import time
 # ---------------------------------------------------------------------------
 
 RECLAIM_TTL = 1500       # 25min: branch "recent" threshold AND hysteresis window
+STALE_ACTIVITY_TTL = 1800  # 30min (ga-64usm): a matched live session whose
+                         # last_active is older than this — AND with no bd update
+                         # on the bead within the same window — is a frozen /
+                         # credit-limited zombie, NOT a live owner. alive != working.
 MAX_RECLAIMS = 3         # escalate instead of looping after this many reclaims
 POLL_SEC = 300           # 5min poll interval
 REALERT_SEC = 900        # 15min re-alert cadence for escalated beads
@@ -361,7 +378,77 @@ def is_coordinator(identity):
     return any(marker in ident for marker in COORDINATOR_MARKERS)
 
 
-def session_is_live(assignee, sessions):
+def parse_iso_epoch(ts):
+    """Parse an ISO-8601 timestamp to epoch seconds. Returns None on any failure.
+
+    Handles both timestamp dialects this guard sees: `gc session list` emits a
+    local offset form ('2026-06-10T11:33:28-03:00') and `bd` emits a bare-Z UTC
+    form ('2026-06-10T14:33:28Z'). Python 3.9's datetime.fromisoformat() accepts
+    the offset form but REJECTS a trailing 'Z', so normalize it to '+00:00'.
+    """
+    if not ts or not isinstance(ts, str):
+        return None
+    s = ts.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return None
+
+
+def session_activity_age(session, now):
+    """Seconds since a session's last_active timestamp. None if missing/unparseable.
+
+    A None return means "unknown" — callers must treat it conservatively (do not
+    infer staleness from a missing timestamp).
+    """
+    age = parse_iso_epoch(session.get("last_active", ""))
+    if age is None:
+        return None
+    return max(0.0, now - age)
+
+
+def session_owner_is_healthy(matched_live, activity_age, bead_update_age):
+    """Pure predicate (ga-64usm): given that the bead's assignee matched a
+    live-state (active/awake) BUILDER session, decide whether that constitutes a
+    HEALTHY live owner (block reclaim) or a frozen/credit-limited zombie
+    (allow reclaim).
+
+    Args:
+        matched_live:     True if assignee matched a session in LIVE_STATES
+        activity_age:     seconds since session.last_active, or None if unknown
+        bead_update_age:  seconds since the bead's own updated_at, or None if unknown
+
+    A matched live session is a healthy owner UNLESS it is *provably* frozen:
+    its terminal activity is older than STALE_ACTIVITY_TTL AND the bead itself
+    has had no bd update within STALE_ACTIVITY_TTL. Either fresh signal — recent
+    terminal output OR recent bead progress — keeps it classified healthy.
+
+    Conservative by construction: when the activity timestamp is unknown we
+    CANNOT prove staleness, so we keep the pre-fix behavior (treat as live) and
+    never reclaim on the strength of a missing field. The bug this fixes is
+    UNDER-reclaiming (a frozen session was live forever); we must not over-
+    correct into reclaiming a builder that is merely quiet.
+    """
+    if not matched_live:
+        return False
+    # Can't prove staleness without an activity timestamp → stay conservative.
+    if activity_age is None:
+        return True
+    # Recent terminal activity → genuinely working builder.
+    if activity_age <= STALE_ACTIVITY_TTL:
+        return True
+    # Activity is stale. A recent bd update on the bead is the secondary progress
+    # signal (workers should bd-update during long work — ga-64usm secondary).
+    if bead_update_age is not None and bead_update_age <= STALE_ACTIVITY_TTL:
+        return True
+    # Frozen: stale terminal activity AND no recent bead progress → zombie.
+    return False
+
+
+def session_is_live(assignee, sessions, now=None, bead_update_age=None):
     """Return True if assignee matches a live (active/awake) BUILDER session.
 
     Checks session.id, .name, .session_name, .alias, .agent_name because
@@ -376,6 +463,13 @@ def session_is_live(assignee, sessions):
     permanently un-reclaimable. Such matches now return False so the bead is
     reclaimable on the usual rails (no recent branch + stranded past TTL).
 
+    ga-64usm: alive != working. A credit-limited / hung builder keeps
+    state=active but produces no output → its last_active goes stale. A matched
+    live session therefore counts as a live owner only if session_owner_is_healthy
+    confirms a fresh progress signal (recent last_active, OR a recent bd update
+    on the bead — passed via bead_update_age). `now` defaults to time.time();
+    callers in tests inject a fixed reference.
+
     CORRECTNESS-CRITICAL: this is the primary guard against reclaiming
     a bead that a live builder actually owns.
     """
@@ -384,6 +478,8 @@ def session_is_live(assignee, sessions):
     # An assignee naming a coordinator role is parked, never a live builder.
     if is_coordinator(assignee):
         return False
+    if now is None:
+        now = time.time()
     for s in sessions:
         state = s.get("state", "").lower()
         if state not in LIVE_STATES:
@@ -401,7 +497,11 @@ def session_is_live(assignee, sessions):
             # owning builder, even if the assignee string itself is opaque.
             if any(is_coordinator(idv) for idv in identifiers):
                 return False
-            return True
+            # ga-64usm: a matched live-state session is only a HEALTHY owner if
+            # it isn't a frozen/credit-limited zombie. Gate on activity freshness
+            # (+ recent bead progress as a secondary signal).
+            activity_age = session_activity_age(s, now)
+            return session_owner_is_healthy(True, activity_age, bead_update_age)
     return False
 
 
@@ -651,7 +751,12 @@ def run_cycle(state, escalated_alerted):
         # --- Safety flags ---
         has_needs_human      = "gate:needs-human" in labels
         has_dispatching_marker = bead_id in gate_active_beads
-        has_live_session     = session_is_live(assignee, sessions)
+        # ga-64usm: the bead's own last-update age is the secondary progress
+        # signal that rescues a stale-activity session whose builder is still
+        # touching the bead (workers should bd-update during long work).
+        bead_update_epoch = parse_iso_epoch(bead.get("updated_at", ""))
+        bead_update_age = (now - bead_update_epoch) if bead_update_epoch is not None else None
+        has_live_session     = session_is_live(assignee, sessions, now, bead_update_age)
 
         # Branch check is potentially slow (git fetch); only run when needed
         has_recent_branch = False
