@@ -2019,6 +2019,20 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
           2>/dev/null || warn "Could not mail Mayor escalation for $BEAD_ID"
         notify -t "Gate needs-human" -p 4 "$BEAD_ID exhausted $GATE_FIX_CAP gate fix attempts — Mayor escalated" 2>/dev/null || true
       fi
+      # ga-5w0hr: a needs-human bead has NO active worker — the gate just gave up
+      # auto-retry. Mirror the needs-fix-branch cleanup so the bead is honestly
+      # represented as "awaiting human" rather than masquerading as in-flight.
+      # gate:needs-human (which the Pilot EXCLUDES in every candidate query —
+      # pilot-dispatcher.sh) remains the re-dispatch block; this only strips the
+      # contradictory story:in-flight / pilot:* claim + stale builder assignee
+      # left over from the failed dispatch, which otherwise stranded the bead
+      # looking forever in-flight with no worker (ga-jhyu: 21h SEM WORKER after
+      # 3× FAIL). Re-dispatch policy is unchanged — needs-human still requires
+      # Human/Mayor intervention to clear.
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"  -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
     else
       # (b) TRANSITION TO A PILOT-RE-DISPATCHABLE needs-fix STATE.
       NEW_ATTEMPT=$((PREV_ATTEMPT + 1))

@@ -81,6 +81,25 @@ grep -q 'gate:needs-fix'   "$PILOT" && ok "pilot detects gate:needs-fix"        
 grep -q 'GATE-FEEDBACK'    "$PILOT" && ok "pilot reads GATE-FEEDBACK comment"   || bad "pilot missing GATE-FEEDBACK read"
 grep -q 'GATE_FIX_SECTION' "$PILOT" && ok "pilot injects feedback into prompt"  || bad "pilot missing GATE_FIX_SECTION"
 
+echo "── 7. drift-guard: cap (needs-human) branch ALSO clears in-flight markers (ga-5w0hr) ──"
+# ga-5w0hr: the RETRY CAP REACHED branch sets gate:needs-human but historically
+# left story:in-flight / pilot:dispatched / assignee intact, so a capped bead
+# masqueraded as in-flight with NO worker forever (ga-jhyu: 21h SEM WORKER after
+# 3× FAIL). Isolate JUST the cap branch (from "RETRY CAP REACHED" up to the
+# matching `else`, so the needs-fix branch's own cleanup can't mask a regression)
+# and prove it now strips the stale in-flight claim. needs-human still blocks the
+# Pilot (asserted in section 6); this only fixes the lying data-model state.
+CAP_BLOCK="$(awk '/RETRY CAP REACHED/{f=1} f{print} f&&/^    else[[:space:]]*$/{exit}' "$GATE")"
+printf '%s\n' "$CAP_BLOCK" | grep -q 'label remove "\$BEAD_ID" "story:in-flight"' \
+  && ok "cap branch clears story:in-flight" \
+  || bad "cap branch leaves story:in-flight (ga-5w0hr: bead strands SEM WORKER)"
+printf '%s\n' "$CAP_BLOCK" | grep -q 'label remove "\$BEAD_ID" "pilot:dispatched"' \
+  && ok "cap branch clears pilot:dispatched" \
+  || bad "cap branch leaves pilot:dispatched (stale Pilot claim)"
+printf '%s\n' "$CAP_BLOCK" | grep -Eq 'assign "\$BEAD_ID" ""' \
+  && ok "cap branch clears stale builder assignee" \
+  || bad "cap branch leaves stale assignee (hides bead from Pilot _filter_candidates)"
+
 echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"
