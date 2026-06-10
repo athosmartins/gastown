@@ -953,7 +953,6 @@ TASK
     _sling_err_file="/tmp/pilot-sling-err.$$"
     SLING_OUT=$(gc --city "$GC_CITY" sling "$BUILDER_TARGET" \
       "$SLING_TITLE" \
-      --nudge \
       --json \
       2>"$_sling_err_file" || echo "{}")
     _sling_err=$(head -c 300 "$_sling_err_file" 2>/dev/null || echo "")
@@ -995,8 +994,8 @@ TASK
     # finalization — so it survives even the degraded in-flight-unconfirmed path.
     bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "pilot.sling_bead=$SLING_BEAD_ID" -q 2>/dev/null || true
 
-    gc --city "$GC_CITY" session nudge "$BUILDER_TARGET" "$DISPATCH_TASK" \
-      --delivery wait-idle 2>/dev/null \
+    timeout 15 gc --city "$GC_CITY" session nudge "$BUILDER_TARGET" "$DISPATCH_TASK" \
+      2>/dev/null \
       || warn "Could not nudge $BUILDER_TARGET — builder will see the task bead on next hook cycle"
 
     log "Dispatch complete: sling_bead=$SLING_BEAD_ID target=$BUILDER_TARGET"
