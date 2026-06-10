@@ -79,6 +79,12 @@ MAX_SMALL="${MAX_SMALL:-5}"
 # BIG/slow lane: dedicated, prevents big items from blocking small ones.
 MAX_BIG="${MAX_BIG:-2}"
 
+# Gate reviewer pool size — observability only (ga-8c1 AC5). The Pilot dispatches
+# builders, NOT reviewers; this is read-only so each sweep's log can show the
+# whole pipeline's free capacity (builders + gate reviewers) at a glance. Matches
+# the gate-reviewer template's max_active_sessions=6.
+MAX_REVIEWERS="${MAX_REVIEWERS:-6}"
+
 # Acceptance-criteria count threshold for auto-classifying a story as BIG.
 BIG_CRITERIA_THRESHOLD="${BIG_CRITERIA_THRESHOLD:-5}"
 
@@ -286,7 +292,28 @@ BIG_SLOTS=$((MAX_BIG - IN_FLIGHT_BIG))
 
 log "Available slots: small=$SMALL_SLOTS  big=$BIG_SLOTS"
 
+# ── ga-8c1 AC5: gate reviewer slot readout (observability) ───────────────────
+# Surface free gate-reviewer slots every sweep so the log shows the WHOLE
+# pipeline's capacity (builders + reviewers), not just the builder lanes. Read
+# only — counts live gate-reviewer sessions exactly as quality-gate-dispatcher
+# does (.template=="gate-reviewer"). Guarded for set -euo pipefail.
+REVIEWERS_ACTIVE=$(gc --city "$GC_CITY" session list --json 2>/dev/null \
+  | jq '[.sessions[]? | select(.template=="gate-reviewer")] | length' 2>/dev/null || echo "0")
+[ -z "$REVIEWERS_ACTIVE" ] && REVIEWERS_ACTIVE=0
+REVIEWER_SLOTS=$((MAX_REVIEWERS - REVIEWERS_ACTIVE))
+[ "$REVIEWER_SLOTS" -lt "0" ] && REVIEWER_SLOTS=0
+log "Gate reviewers: active=${REVIEWERS_ACTIVE}/${MAX_REVIEWERS}  free=${REVIEWER_SLOTS}"
+
 if [ "$SMALL_SLOTS" -eq "0" ] && [ "$BIG_SLOTS" -eq "0" ]; then
+  # ga-8c1 AC5: even when backing off, surface the dispatch-queue depth so every
+  # sweep's log reports what's waiting (cheap count — no full tier scan).
+  WAITING_APPROVED=$(bd -C "$GC_CITY" list --json \
+    -l "story:approved" \
+    --exclude-label "story:in-flight" \
+    --exclude-label "story:done" \
+    --exclude-label "pilot:dispatched" \
+    -n 0 2>/dev/null | jq 'length' 2>/dev/null || echo "?")
+  log "Dispatch queue: ${WAITING_APPROVED} story:approved waiting (HQ; both lanes full — none can dispatch this sweep)."
   log "Both lanes full (small=${IN_FLIGHT_SMALL}/${MAX_SMALL}, big=${IN_FLIGHT_BIG}/${MAX_BIG}). Pilot backing off."
   exit 0
 fi
@@ -622,6 +649,21 @@ BIG_PICK="null"
   BIG_PICK=$(_top_candidate "$BIG_CANDIDATES")
 
 log "Lane picks — small: $(echo "$SMALL_PICK" | jq -r '.id // "none"')  big: $(echo "$BIG_PICK" | jq -r '.id // "none"')"
+
+# ── ga-8c1 AC5: dispatch-queue preview ───────────────────────────────────────
+# Log the next stories queued for dispatch (priority order, top 3 per lane) so
+# every sweep makes the backlog visible — not just the single bead picked now.
+# Read-only formatting of already-gathered candidates. Guarded for pipefail.
+_queue_preview() {
+  echo "$1" | jq -r --arg lane "$2" \
+    'sort_by([(.priority // 99), (.created_at // "")]) | .[:3][]
+       | "  [\($lane)] \(.id) P\(.priority // "?") — \(.title)"' 2>/dev/null || true
+}
+_QUEUE_LINES=$( { _queue_preview "$SMALL_CANDIDATES" small; _queue_preview "$BIG_CANDIDATES" big; } )
+if [ -n "$_QUEUE_LINES" ]; then
+  log "Dispatch queue (next up, priority order):"
+  while IFS= read -r _q; do [ -n "$_q" ] && log "$_q"; done <<< "$_QUEUE_LINES"
+fi
 
 # ── Dispatch helper ───────────────────────────────────────────────────────────
 # dispatch_one <story_json> <lane> <dispatch_tier>
