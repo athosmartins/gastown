@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.pipeline-throughput-heartbeat</string>
+
+  <!-- Pipeline throughput heartbeat (ga-kcb2b, 2026-06-11). Closes three blind spots
+       the gate-health-monitor and gate-recovery-watchdog miss because they key on
+       gate FAILURE signatures: (a) the Pilot running-but-dispatching-zero while backlog
+       and slots are free (it keeps logging, so the >40min silence detector never trips);
+       (b) the bare-main false-fail storm — a run FF-merges to GitHub yet FAILs the
+       durable-landing audit, so to an outcome-counter it looks like flow; (c) a single
+       in-flight worker session frozen for hours while aggregate flow is nonzero. Built
+       from append-only dispatcher-log timestamps + the runtime session list (NEVER live
+       Dolt queries — a monitor must not wedge on the data plane it polices). On detect it
+       hands off to the ga-afytf repair-agent mechanism (routes a runbook to the
+       gastown.dog pool + spawns a dog), RATE-LIMITED per kind and globally so a saturated
+       system is not flapped with repair dogs that cannot boot. Polls 300s; silence =
+       healthy. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/pipeline-throughput-heartbeat.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/pipeline-throughput-heartbeat-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/pipeline-throughput-heartbeat-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>
