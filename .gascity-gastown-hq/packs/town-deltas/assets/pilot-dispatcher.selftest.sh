@@ -141,7 +141,13 @@ case "$args" in
         [ -f "$STATE/$id.dispatching" ] && lbls="${lbls:+$lbls,}\"pilot:dispatching\""
         st="open"
         case "$id" in *sling*) st="${FAKE_SLING_STATUS:-open}" ;; esac
-        printf '{"id":"%s","status":"%s","labels":[%s]}' "$id" "$st" "$lbls" ;;
+        # ga-e5yw2: the dead-worker correction resolves a sling task's assignee.
+        # FAKE_SLING_ASSIGNEES is a JSON map {"<slingid>":"<assignee>", …}.
+        asg=""
+        if [ -n "${FAKE_SLING_ASSIGNEES:-}" ]; then
+          asg=$(printf '%s' "$FAKE_SLING_ASSIGNEES" | jq -r --arg id "$id" '.[$id] // ""' 2>/dev/null || echo "")
+        fi
+        printf '{"id":"%s","status":"%s","assignee":"%s","labels":[%s]}' "$id" "$st" "$asg" "$lbls" ;;
     esac ;;
   *story:approved*pilot:dispatching*)
     printf '%s' "${FAKE_STALE_JSON:-[]}" ;;   # Step-0 stale-claim query
@@ -207,7 +213,9 @@ cat > "$SHIMBIN/gc" <<'SHIM'
 case "$*" in
   *"rig list"*)      printf '{"rigs":[]}' ;;     # rig fallback → empty
   *sling*)           printf '{"bead_id":"tt-sling-1"}' ;;  # builder task bead
-  *"session list"*)  : ;;                         # no live builder sessions
+  *"session list"*)  # ga-e5yw2 roster seam. Brace-in-default `${x:-{...}}` mis-parses
+                     # (the inner } closes the expansion early) → use an explicit if.
+                     if [ -n "${FAKE_SESSIONS_JSON:-}" ]; then printf '%s' "$FAKE_SESSIONS_JSON"; else printf '{"sessions":[]}'; fi ;;
   *"session nudge"*) : ;;
   *) : ;;
 esac
@@ -285,6 +293,8 @@ run_real_dispatch() { # FAKE_SUPPRESS_INFLIGHT
 #   $2 = FAKE_INFLIGHT_JSON        (in-flight beads for the stale-occupant test)
 #   $3 = DISPATCH_TO_CAPACITY      (default 1)
 #   $4 = FAKE_BUGS_JSON            (override the default 2-bug fixture)
+#   $5 = FAKE_SESSIONS_JSON        (ga-e5yw2 live-session roster; default empty)
+#   $6 = FAKE_SLING_ASSIGNEES      (ga-e5yw2 sling→assignee map; default empty)
 run_capacity() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
@@ -300,6 +310,8 @@ run_capacity() {
     FAKE_INFLIGHT_JSON="${2:-[]}" \
     DISPATCH_TO_CAPACITY="${3:-1}" \
     FAKE_BUGS_JSON="${4:-}" \
+    FAKE_SESSIONS_JSON="${5:-}" \
+    FAKE_SLING_ASSIGNEES="${6:-}" \
     FAKE_BLOCKED_IDS="" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
@@ -619,10 +631,10 @@ else
   bad "did not detect the stale in-flight occupant"
 fi
 
-if echo "$LOG11" | grep -q "live=1 (raw=2 stale=1)"; then
-  ok "slot count corrected: 1 live occupant, 1 stale freed"
+if echo "$LOG11" | grep -q "live=1 (raw=2 stale=1 age=1 dead=0)"; then
+  ok "slot count corrected: 1 live occupant, 1 stale freed (age)"
 else
-  bad "slot count not corrected (expected 'live=1 (raw=2 stale=1)')"
+  bad "slot count not corrected (expected 'live=1 (raw=2 stale=1 age=1 dead=0)')"
 fi
 
 if echo "$LOG11" | grep -q "Stale ids: if-stale"; then
@@ -635,6 +647,66 @@ if echo "$LOG11" | grep -q "Stale ids:.*if-fresh"; then
   bad "REGRESSION: treated the FRESH bead as stale (would over-free slots)"
 else
   ok "fresh bead correctly kept as a live occupant"
+fi
+
+# ── Scenario 12: dead-worker in-flight bead is NOT counted as a live slot ─────
+# (ga-e5yw2) Three FRESH in-flight beads (none age-stale) whose builder sessions
+# differ: one's sling-task assignee is a DEAD session (absent from the roster),
+# one's is LIVE, one's sling-task has NO assignee. Only the dead-worker bead must
+# be freed from the slot count; the live and the unresolved (no-assignee) ones
+# must be kept (fail-safe: never over-free). Proves the raw=N-vs-real over-count
+# that throttled dispatch with a free lane is corrected.
+echo "Scenario 12: dead-worker in-flight freed from slot count (ga-e5yw2)"
+NOW_ISO12="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+INFLIGHT12="[\
+{\"id\":\"if-dead\",\"labels\":[\"story:in-flight\"],\"updated_at\":\"$NOW_ISO12\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-dead\"}},\
+{\"id\":\"if-live\",\"labels\":[\"story:in-flight\"],\"updated_at\":\"$NOW_ISO12\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-live\"}},\
+{\"id\":\"if-noassg\",\"labels\":[\"story:in-flight\"],\"updated_at\":\"$NOW_ISO12\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-none\"}}]"
+SESSIONS12='{"sessions":[{"session_name":"live-sess","template":"gastown.dog","closed":false}]}'
+SLINGMAP12='{"tt-sling-dead":"dead-sess","tt-sling-live":"live-sess","tt-sling-none":""}'
+LOG12="$(run_capacity 10 "$INFLIGHT12" 1 "" "$SESSIONS12" "$SLINGMAP12")"
+
+if echo "$LOG12" | grep -q "live=2 (raw=3 stale=1 age=0 dead=1)"; then
+  ok "slot count corrected: 2 live occupants, 1 dead-worker freed"
+else
+  bad "slot count not corrected (expected 'live=2 (raw=3 stale=1 age=0 dead=1)')"
+fi
+
+if echo "$LOG12" | grep -q "Dead-worker in-flight: 1 bead"; then
+  ok "detected the dead-worker in-flight occupant"
+else
+  bad "did not detect the dead-worker in-flight occupant"
+fi
+
+if echo "$LOG12" | grep -q "Dead ids: if-dead"; then
+  ok "named the dead-worker bead (if-dead)"
+else
+  bad "did not name the dead-worker bead id"
+fi
+
+if echo "$LOG12" | grep -qE "Dead ids:.*(if-live|if-noassg)"; then
+  bad "REGRESSION: freed a LIVE or unresolved bead (would over-dispatch)"
+else
+  ok "live + no-assignee beads correctly kept as live occupants"
+fi
+
+# ── Scenario 12b: roster unreadable/empty → dead-worker check DISABLED ─────────
+# (ga-e5yw2 fail-safe) Same in-flight set, but the session roster comes back
+# EMPTY (a failed/racy `session list`). The dead-worker check must switch OFF
+# entirely — every occupant kept — rather than free all three and over-dispatch.
+echo "Scenario 12b: empty roster disables dead-worker check (fail-safe)"
+LOG12B="$(run_capacity 10 "$INFLIGHT12" 1 "" "" "$SLINGMAP12")"
+
+if echo "$LOG12B" | grep -q "live=3 (raw=3 stale=0 age=0 dead=0)"; then
+  ok "empty roster → all 3 kept, zero freed (no over-dispatch)"
+else
+  bad "empty roster did not fail safe (expected 'live=3 (raw=3 stale=0 age=0 dead=0)')"
+fi
+
+if echo "$LOG12B" | grep -q "Dead-worker in-flight:"; then
+  bad "REGRESSION: ran dead-worker check against an empty roster"
+else
+  ok "dead-worker check correctly suppressed on empty roster"
 fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────

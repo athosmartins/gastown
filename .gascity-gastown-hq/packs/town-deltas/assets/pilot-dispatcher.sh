@@ -128,6 +128,22 @@ PILOT_DOLT_CPU_OVERRIDE="${PILOT_DOLT_CPU_OVERRIDE:-}"
 # story; it only stops an abandoned build from starving the lane forever.
 PILOT_STUCK_INFLIGHT_HOURS="${PILOT_STUCK_INFLIGHT_HOURS:-2}"
 
+# ── Dead-worker in-flight correction (ga-e5yw2) ───────────────────────────────
+# The age cutoff above only frees a slot after PILOT_STUCK_INFLIGHT_HOURS of
+# TOTAL silence on the source row. It misses the dominant phantom: a bead whose
+# source row was touched recently (label/dispatch churn) but whose BUILDER
+# SESSION has already died — crashed, reaped, or killed — without clearing
+# story:in-flight. Those read "live" by age yet hold a slot no worker occupies:
+# the raw=7-vs-real-4 over-count that makes the Pilot see a full lane and throttle
+# dispatch while real capacity sits idle (bug ga-e5yw2). When set to 1 (default)
+# the dispatcher resolves each in-flight bead's sling-task assignee and counts the
+# bead as a live occupant ONLY if that assignee is a live session in
+# `gc session list`; a bead whose worker session is provably gone stops consuming
+# a slot. Fail-safe in every unresolved leg (no sling, no assignee, roster
+# unreadable/empty) → KEEP, so the worst case is the harmless pre-fix over-count,
+# never an over-dispatch. Set to 0 to disable the cross-check entirely.
+PILOT_DEADWORKER_CHECK="${PILOT_DEADWORKER_CHECK:-1}"
+
 # Dry-run mode: show what WOULD happen, make zero changes.
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -459,26 +475,102 @@ IN_FLIGHT_RAW_TOTAL=$(echo "$IN_FLIGHT_RAW_JSON" | jq 'length' 2>/dev/null || ec
 # evaluate → never over-dispatch). The stale bead is NOT re-dispatched here — it
 # keeps story:in-flight and stays out of every candidate query — so freeing its
 # slot only lets OTHER pending work flow; it can never double-dispatch that story.
+# ── Live-session roster (ga-e5yw2) ────────────────────────────────────────────
+# Fetch the session roster ONCE per sweep; reused below for the dead-worker
+# in-flight correction AND the gate-reviewer readout (one gc call, not two).
+_SESSIONS_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo '{}')
+# Newline-delimited identifiers of every session that is NOT closed. A sling
+# bead's assignee is a session_name, but index every name field so any form of
+# the id resolves. `unique` keeps the membership grep cheap.
+_LIVE_SESSION_IDS=$(echo "$_SESSIONS_JSON" \
+  | jq -r '[.sessions[]? | select(.closed != true)
+           | (.session_name, .name, .alias, .id, .agent_name)]
+          | map(select(. != null and . != "")) | unique | .[]' 2>/dev/null || echo "")
+# Gate the dead-worker check OFF unless the roster is a readable, NON-EMPTY array.
+# An unreadable or empty live set is almost always a failed/racy `session list`
+# read, not a town with genuinely zero sessions — disabling the check then is the
+# fail-safe (keep every occupant = the harmless pre-fix over-count, never an
+# over-dispatch). A healthy town always has ≥1 live session.
+_DEADWORKER_OK=1
+echo "$_SESSIONS_JSON" | jq -e '.sessions | type=="array"' >/dev/null 2>&1 || _DEADWORKER_OK=0
+[ -n "$_LIVE_SESSION_IDS" ] || _DEADWORKER_OK=0
+
+# _session_is_live <identifier> — exit 0 iff <identifier> is a non-closed session.
+_session_is_live() {
+  [ -n "${1:-}" ] || return 1
+  printf '%s\n' "$_LIVE_SESSION_IDS" | grep -Fxq -- "$1"
+}
+
+# _inflight_drop_dead_workers — read a JSON array of in-flight beads on stdin and
+# emit it with CONFIRMED dead-worker phantoms removed. A bead is a confirmed
+# phantom iff it carries metadata pilot.sling_bead, that sling task has a
+# non-empty assignee, and that assignee is NOT a live session. EVERY unresolved
+# leg (no sling, no assignee, roster gated off) → KEEP — the same fail-safe the
+# age filter uses: never free a slot we cannot positively evaluate. The dropped
+# bead keeps story:in-flight and stays out of every candidate query, so freeing
+# its slot can only admit OTHER pending work, never re-run the phantom. Falls
+# back to the input on any jq error, so the worst case is the pre-fix count.
+_inflight_drop_dead_workers() {
+  local _arr _n _i _bead _sling _asg _kept
+  _arr=$(cat)
+  { [ "${PILOT_DEADWORKER_CHECK:-1}" = "1" ] && [ "${_DEADWORKER_OK:-0}" = "1" ]; } \
+    || { printf '%s' "$_arr"; return 0; }
+  _n=$(echo "$_arr" | jq 'length' 2>/dev/null || echo "0")
+  [ "$_n" -gt 0 ] 2>/dev/null || { printf '%s' "$_arr"; return 0; }
+  _kept=""
+  _i=0
+  while [ "$_i" -lt "$_n" ]; do
+    _bead=$(echo "$_arr" | jq -c ".[$_i]" 2>/dev/null)
+    _i=$((_i + 1))
+    [ -n "$_bead" ] || continue
+    _sling=$(echo "$_bead" | jq -r '.metadata["pilot.sling_bead"] // ""' 2>/dev/null || echo "")
+    if [ -n "$_sling" ]; then
+      _asg=$(bd -C "$GC_CITY" show "$_sling" --json 2>/dev/null \
+        | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
+      if [ -n "$_asg" ] && ! _session_is_live "$_asg"; then
+        continue   # confirmed dead worker → free this slot
+      fi
+    fi
+    _kept="${_kept}${_bead}"$'\n'
+  done
+  printf '%s' "$_kept" | jq -s '.' 2>/dev/null || printf '%s' "$_arr"
+}
+
 _NOW_EPOCH=$(date +%s)
 _STUCK_CUTOFF=$(( _NOW_EPOCH - PILOT_STUCK_INFLIGHT_HOURS * 3600 ))
-IN_FLIGHT_JSON=$(echo "$IN_FLIGHT_RAW_JSON" | jq --argjson cutoff "$_STUCK_CUTOFF" '
+# Stage 1 — drop age-stale occupants (ga-rk5va constraint c).
+IN_FLIGHT_AGE_JSON=$(echo "$IN_FLIGHT_RAW_JSON" | jq --argjson cutoff "$_STUCK_CUTOFF" '
   [ .[]
     | ( ((.updated_at // "") | if . == "" then null else (try fromdateiso8601 catch null) end) ) as $e
     | select($e == null or $e > $cutoff) ]' 2>/dev/null || echo "$IN_FLIGHT_RAW_JSON")
 # Defensive: if the filter produced nothing usable, fall back to the raw set.
-[ -z "$IN_FLIGHT_JSON" ] && IN_FLIGHT_JSON="$IN_FLIGHT_RAW_JSON"
+[ -z "$IN_FLIGHT_AGE_JSON" ] && IN_FLIGHT_AGE_JSON="$IN_FLIGHT_RAW_JSON"
+_AGE_TOTAL=$(echo "$IN_FLIGHT_AGE_JSON" | jq 'length' 2>/dev/null || echo "0")
+STALE_AGE=$(( IN_FLIGHT_RAW_TOTAL - _AGE_TOTAL ))
+[ "$STALE_AGE" -lt 0 ] 2>/dev/null && STALE_AGE=0
+
+# Stage 2 — drop dead-worker phantoms (ga-e5yw2).
+IN_FLIGHT_JSON=$(echo "$IN_FLIGHT_AGE_JSON" | _inflight_drop_dead_workers)
+[ -z "$IN_FLIGHT_JSON" ] && IN_FLIGHT_JSON="$IN_FLIGHT_AGE_JSON"
 
 IN_FLIGHT_TOTAL=$(echo "$IN_FLIGHT_JSON" | jq 'length' 2>/dev/null || echo "0")
+DEAD_WORKER=$(( _AGE_TOTAL - IN_FLIGHT_TOTAL ))
+[ "$DEAD_WORKER" -lt 0 ] 2>/dev/null && DEAD_WORKER=0
 STALE_INFLIGHT=$(( IN_FLIGHT_RAW_TOTAL - IN_FLIGHT_TOTAL ))
 [ "$STALE_INFLIGHT" -lt 0 ] 2>/dev/null && STALE_INFLIGHT=0
-if [ "$STALE_INFLIGHT" -gt 0 ] 2>/dev/null; then
-  warn "Stale in-flight: ${STALE_INFLIGHT} bead(s) untouched > ${PILOT_STUCK_INFLIGHT_HOURS}h (hung builder?) — NOT counted as live occupants, freeing their slot(s) for pending work (ga-rk5va constraint c). Stale ids: $(echo "$IN_FLIGHT_RAW_JSON" | jq -r --argjson cutoff "$_STUCK_CUTOFF" '[.[] | ((.updated_at // "") | if . == "" then null else (try fromdateiso8601 catch null) end) as $e | select($e != null and $e <= $cutoff) | .id] | join(",")' 2>/dev/null || echo "?")"
+
+if [ "$STALE_AGE" -gt 0 ] 2>/dev/null; then
+  warn "Stale in-flight: ${STALE_AGE} bead(s) untouched > ${PILOT_STUCK_INFLIGHT_HOURS}h (hung builder?) — NOT counted as live occupants, freeing their slot(s) for pending work (ga-rk5va constraint c). Stale ids: $(echo "$IN_FLIGHT_RAW_JSON" | jq -r --argjson cutoff "$_STUCK_CUTOFF" '[.[] | ((.updated_at // "") | if . == "" then null else (try fromdateiso8601 catch null) end) as $e | select($e != null and $e <= $cutoff) | .id] | join(",")' 2>/dev/null || echo "?")"
+fi
+
+if [ "$DEAD_WORKER" -gt 0 ] 2>/dev/null; then
+  warn "Dead-worker in-flight: ${DEAD_WORKER} bead(s) whose builder session is gone — NOT counted as live occupants, freeing their slot(s) for pending work (ga-e5yw2). Dead ids: $(jq -rn --argjson a "$IN_FLIGHT_AGE_JSON" --argjson b "$IN_FLIGHT_JSON" '(($a|map(.id)) - ($b|map(.id))) | join(",")' 2>/dev/null || echo "?")"
 fi
 
 IN_FLIGHT_BIG=$(echo "$IN_FLIGHT_JSON" | jq '[.[] | select((.labels // []) | contains(["lane:big"]))] | length' 2>/dev/null || echo "0")
 IN_FLIGHT_SMALL=$((IN_FLIGHT_TOTAL - IN_FLIGHT_BIG))
 
-log "In-flight: live=$IN_FLIGHT_TOTAL (raw=$IN_FLIGHT_RAW_TOTAL stale=$STALE_INFLIGHT)  small=$IN_FLIGHT_SMALL/${MAX_SMALL}  big=$IN_FLIGHT_BIG/${MAX_BIG}"
+log "In-flight: live=$IN_FLIGHT_TOTAL (raw=$IN_FLIGHT_RAW_TOTAL stale=$STALE_INFLIGHT age=$STALE_AGE dead=$DEAD_WORKER)  small=$IN_FLIGHT_SMALL/${MAX_SMALL}  big=$IN_FLIGHT_BIG/${MAX_BIG}"
 
 SMALL_SLOTS=$((MAX_SMALL - IN_FLIGHT_SMALL))
 BIG_SLOTS=$((MAX_BIG - IN_FLIGHT_BIG))
@@ -492,8 +584,10 @@ log "Available slots: small=$SMALL_SLOTS  big=$BIG_SLOTS"
 # Surface free gate-reviewer slots every sweep so the log shows the WHOLE
 # pipeline's capacity (builders + reviewers), not just the builder lanes. Read
 # only — counts live gate-reviewer sessions exactly as quality-gate-dispatcher
-# does (.template=="gate-reviewer"). Guarded for set -euo pipefail.
-REVIEWERS_ACTIVE=$(gc --city "$GC_CITY" session list --json 2>/dev/null \
+# does (.template=="gate-reviewer"). Reuses the roster fetched once above for the
+# dead-worker correction (ga-e5yw2) — no second `session list` call. Guarded for
+# set -euo pipefail.
+REVIEWERS_ACTIVE=$(echo "$_SESSIONS_JSON" \
   | jq '[.sessions[]? | select(.template=="gate-reviewer")] | length' 2>/dev/null || echo "0")
 [ -z "$REVIEWERS_ACTIVE" ] && REVIEWERS_ACTIVE=0
 REVIEWER_SLOTS=$((MAX_REVIEWERS - REVIEWERS_ACTIVE))
