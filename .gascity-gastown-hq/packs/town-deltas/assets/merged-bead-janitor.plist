@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.merged-bead-janitor</string>
+
+  <!-- Merged-bead janitor (ga-tijv5, 2026-06-11). Closes beads stuck in_progress
+       ("em voo" on the Kanban) whose code is ALREADY merged to origin/main —
+       caused by (1) sibling sub-tasks committed under a parent id, never named
+       in their own gate marker; (2) branches that land via a superseded/errored
+       path so the source-bead close step never fires; (3) cross-store mirrors
+       (rig bead, HQ-repo artifact). Per-rig-store sweep, three OR-signals
+       (commit-msg / terminal marker / branch-ancestor), guarded so epics and
+       beads with an OPEN gate marker are NEVER closed (zero false-positive).
+       Runs once per StartInterval and exits (not resident). Idempotent. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/merged-bead-janitor.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <!-- Sweep cadence: every 15 min. A just-merged bead closes within one cycle
+       (AC2). RunAtLoad fires an immediate sweep on (re)load. -->
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/merged-bead-janitor-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/merged-bead-janitor-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>JANITOR_LOG_STDOUT</key>
+    <string>1</string>
+  </dict>
+</dict>
+</plist>
