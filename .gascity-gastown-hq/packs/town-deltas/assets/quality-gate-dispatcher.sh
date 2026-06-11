@@ -103,6 +103,36 @@ GATE_SPAWN_STAGGER_SECS="${GATE_SPAWN_STAGGER_SECS:-3}"
 case "$GATE_SPAWN_STAGGER_SECS" in ''|*[!0-9]*) GATE_SPAWN_STAGGER_SECS=3 ;; esac
 [ "$GATE_SPAWN_STAGGER_SECS" -gt 15 ] 2>/dev/null && GATE_SPAWN_STAGGER_SECS=15
 
+# ── ga-cw4pm: dynamic-concurrency (Dolt + quota headroom) thresholds ──────────
+# The gate's concurrency was STATIC — the gate-reviewer template's
+# max_active_sessions=6 admits up to 2 CODE runs (3 reviewers each) regardless of
+# how loaded the Dolt :52756 data plane is. When Dolt is already saturated (by a
+# sibling run, the supervisor's per-rig reconcile scan, or the Pilot) the gate
+# STILL spawned a second run × 3 reviewers → thundering herd → Dolt 200%+ →
+# reviewers boot-stall on `gc prime` → verdict timeout → FALSE-FAIL on good code.
+# The headroom gate (Step 0b-1) replaces the static cap with a DYNAMIC ceiling on
+# concurrent reviewer sessions, computed from live Dolt CPU/latency + Claude quota
+# — exactly how the Pilot already gates dispatch-to-capacity (ga-rk5va). Every
+# threshold is env-overridable. CPU% is the live dolt-server process %cpu (per
+# `ps`, can exceed 100 = per-core); latency is `gc dolt health` server.latency_ms.
+#
+# Ladder: cpu>HOT or lat>HOT_MS → ceiling 0 (open NO run — don't pile onto a hot
+# plane); cpu>WARM (≤HOT)        → ceiling = one run (a 2nd concurrent run waits);
+# cpu≤WARM                       → ceiling = MAX (scale up to the static 6).
+# Baseline under one booting run is ~86-90%; 200 (~2 pegged cores) is the
+# documented danger zone — HOT defaults just under it so the gate stops admitting
+# BEFORE the herd reaches 200%.
+GATE_DOLT_CPU_HOT="${GATE_DOLT_CPU_HOT:-180}"          # cpu% above which NO new run opens
+GATE_DOLT_CPU_WARM="${GATE_DOLT_CPU_WARM:-100}"        # cpu% above which only ONE run runs
+GATE_DOLT_LATENCY_HOT_MS="${GATE_DOLT_LATENCY_HOT_MS:-2500}"  # server latency ceiling (matches Pilot)
+GATE_MAX_REVIEWERS="${GATE_MAX_REVIEWERS:-6}"          # full ceiling when calm (= template max_active_sessions)
+GATE_REVIEWERS_PER_RUN="${GATE_REVIEWERS_PER_RUN:-3}"  # a CODE run's reviewer count (worst-case admission unit)
+case "$GATE_DOLT_CPU_HOT"        in ''|*[!0-9]*) GATE_DOLT_CPU_HOT=180 ;; esac
+case "$GATE_DOLT_CPU_WARM"       in ''|*[!0-9]*) GATE_DOLT_CPU_WARM=100 ;; esac
+case "$GATE_DOLT_LATENCY_HOT_MS" in ''|*[!0-9]*) GATE_DOLT_LATENCY_HOT_MS=2500 ;; esac
+case "$GATE_MAX_REVIEWERS"       in ''|*[!0-9]*) GATE_MAX_REVIEWERS=6 ;; esac
+case "$GATE_REVIEWERS_PER_RUN"   in ''|*[!0-9]*) GATE_REVIEWERS_PER_RUN=3 ;; esac
+
 # session_is_dead <present 0|1> <closed true|false|1|0> → echoes 1 (dead) | 0 (alive)
 # A reviewer session is DEAD iff it is absent from the session list (present=0)
 # OR explicitly closed. A present, non-closed session (active OR asleep) is ALIVE
@@ -272,6 +302,97 @@ reconcile_bare_main_to_origin() {
       fi
       echo "reconcile:${lsha}->${osha}(backup:_backup-forked-${branch}-${lsha})"; return 0 ;;
   esac
+}
+# ── ga-cw4pm: dynamic-concurrency headroom helpers ────────────────────────────
+# Mirror the Pilot's Dolt-saturation probe (pilot-dispatcher.sh _dolt_cpu/
+# _dolt_saturated) so the GATE throttles its OWN reviewer spawns the same way the
+# Pilot throttles dispatch. All three are pure/near-pure and selftest-sourceable
+# via GATE_DISPATCHER_LIB_ONLY (defined above this guard).
+
+# gate_dolt_cpu <pid> → integer CPU% of the live dolt-server process, or "" if
+# unknown. `ps` %cpu can exceed 100 (per-core); the fraction is stripped for -gt
+# tests. Honors GATE_DOLT_CPU_OVERRIDE (selftest seam — no live `ps`). No mutation.
+gate_dolt_cpu() {
+  local _pid="${1:-}"
+  if [ -n "${GATE_DOLT_CPU_OVERRIDE:-}" ]; then printf '%s' "$GATE_DOLT_CPU_OVERRIDE"; return 0; fi
+  if [ -z "$_pid" ] || [ "$_pid" = "TEST" ]; then printf ''; return 0; fi
+  ps -o %cpu= -p "$_pid" 2>/dev/null | tr -d ' ' | cut -d. -f1 || true
+  return 0
+}
+
+# gate_quota_limited → "1" iff Claude quota is exhausted (a new run would burn
+# into a hard limit), else "0". Uses the ga-wjlv9 ground-truth checker
+# (claude-quota-check.sh --quiet, exit 2 = LIMITED) when it is deployed;
+# FAIL-OPEN ("0") when the checker is absent or errors, so an unmerged dependency
+# never wedges the gate. Honors GATE_QUOTA_OVERRIDE (selftest seam: "2"=limited,
+# anything else=ok). Bounded by `timeout`. No mutation of gate state.
+gate_quota_limited() {
+  if [ -n "${GATE_QUOTA_OVERRIDE:-}" ]; then
+    [ "$GATE_QUOTA_OVERRIDE" = "2" ] && { printf '1'; return 0; }
+    printf '0'; return 0
+  fi
+  local _qc="${GC_CITY}/scripts/claude-quota-check.sh"
+  [ -x "$_qc" ] || { printf '0'; return 0; }
+  local _rc=0
+  timeout 15 bash "$_qc" --quiet >/dev/null 2>&1 || _rc=$?
+  # 2 = LIMITED (active exhaustion). 0 = ok. 1/other = the checker's own internal
+  # error → fail-open (never block the gate on a flaky checker).
+  [ "$_rc" = "2" ] && { printf '1'; return 0; }
+  printf '0'; return 0
+}
+
+# gate_headroom_decision <cpu> <lat_ms> <quota_limited 0|1> <inflight_reviewers> \
+#   <cpu_hot> <cpu_warm> <lat_hot_ms> <max_reviewers> <reviewers_per_run> <failopen 0|1>
+# → echoes "<verdict> <ceiling> <reason>"  (verdict ∈ admit|defer).
+# PURE; no I/O; set -e safe. Computes a DYNAMIC ceiling on concurrent reviewer
+# sessions from Dolt health + quota, then admits a NEW run iff it fits under it:
+#   quota-limited              → ceiling 0   (defer; never burn into a hard limit)
+#   Dolt hot (cpu>hot|lat>hot) → ceiling 0   (defer; open NO run on a hot plane → AC1/AC3)
+#   no signal + failopen=0     → ceiling 0   (defer; conservative)
+#   no signal + failopen=1     → ceiling max (proceed; a wedged probe must never deadlock the gate)
+#   Dolt warm (cpu>warm)       → ceiling = reviewers_per_run (exactly ONE run; 2nd waits)
+#   Dolt calm                  → ceiling = max_reviewers (scale up to the static cap → AC2)
+# admit iff inflight + reviewers_per_run <= ceiling.
+gate_headroom_decision() {
+  local cpu="$1" lat="$2" qlim="$3" inflight="$4"
+  local cpu_hot="$5" cpu_warm="$6" lat_hot="$7" maxr="$8" perrun="$9" failopen="${10}"
+  case "$cpu"      in ''|*[!0-9]*) cpu="" ;; esac
+  case "$lat"      in ''|*[!0-9]*) lat="" ;; esac
+  case "$inflight" in ''|*[!0-9]*) inflight=0 ;; esac
+  case "$cpu_hot"  in ''|*[!0-9]*) cpu_hot=180 ;; esac
+  case "$cpu_warm" in ''|*[!0-9]*) cpu_warm=100 ;; esac
+  case "$lat_hot"  in ''|*[!0-9]*) lat_hot=2500 ;; esac
+  case "$maxr"     in ''|*[!0-9]*) maxr=6 ;; esac
+  case "$perrun"   in ''|*[!0-9]*) perrun=3 ;; esac
+
+  # 1. Quota hard-stop — independent of Dolt.
+  if [ "$qlim" = "1" ]; then echo "defer 0 quota-limited"; return 0; fi
+
+  # 2. Dolt state from whatever signals we have.
+  local have=0 hot=0 warm=0
+  if [ -n "$cpu" ]; then have=1; [ "$cpu" -gt "$cpu_hot" ] 2>/dev/null && hot=1; fi
+  if [ -n "$lat" ]; then have=1; [ "$lat" -gt "$lat_hot" ] 2>/dev/null && hot=1; fi
+  if [ "$hot" = "0" ] && [ -n "$cpu" ] && [ "$cpu" -gt "$cpu_warm" ] 2>/dev/null; then warm=1; fi
+
+  local ceiling reason
+  if [ "$have" = "0" ]; then
+    if [ "$failopen" = "1" ]; then ceiling="$maxr"; reason="no-signal-failopen"
+    else echo "defer 0 no-signal-failclosed"; return 0; fi
+  elif [ "$hot" = "1" ]; then
+    echo "defer 0 dolt-hot"; return 0
+  elif [ "$warm" = "1" ]; then
+    ceiling="$perrun"; reason="dolt-warm"
+  else
+    ceiling="$maxr"; reason="dolt-calm"
+  fi
+
+  # 3. Admission: does ONE new run (perrun reviewers) fit under the ceiling?
+  if [ "$(( inflight + perrun ))" -le "$ceiling" ] 2>/dev/null; then
+    echo "admit $ceiling $reason"
+  else
+    echo "defer $ceiling ${reason}-cap-reached"
+  fi
+  return 0
 }
 
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
@@ -508,6 +629,15 @@ if [ "$RECON_RIG_COUNT" -gt 0 ]; then
   done
 fi
 
+# ── ga-cw4pm: live reviewer-session count for the headroom gate ───────────────
+# gate-reviewer sessions still alive AFTER this sweep's reaping occupy the
+# template's max_active_sessions budget — they are the denominator for the
+# dynamic-concurrency decision (Step 0b-1). REVIEWER_SESSION_COUNT is set by the
+# Step 0a-2 janitor (0 when no reviewer sessions exist); REAPED_REVIEWERS is only
+# set inside the janitor's >0 branch, so default it to 0 for the no-session sweep.
+LIVE_REVIEWERS=$(( ${REVIEWER_SESSION_COUNT:-0} - ${REAPED_REVIEWERS:-0} ))
+[ "$LIVE_REVIEWERS" -lt 0 ] 2>/dev/null && LIVE_REVIEWERS=0
+
 # ── Step 0b: Find a queued marker ────────────────────────────────────────────
 # quality-gate-guard.sh claims, validates, derives author, and parks markers as
 # gate-status:queued.  We only process queued markers — the guard already did
@@ -524,6 +654,52 @@ log "Found $COUNT queued marker(s)"
 if [ "$COUNT" = "0" ]; then
   log "No queued markers. Exiting."
   exit 0
+fi
+
+# ── Step 0b-1 (ga-cw4pm): dynamic-concurrency headroom gate ───────────────────
+# There IS queued work. Before opening a NEW run (claiming a marker + spawning N
+# reviewers), check whether the Dolt data plane + Claude quota can absorb the
+# added load, and scale the concurrency ceiling dynamically (replacing the static
+# gate-reviewer max_active_sessions=6). On DEFER we exit 0 WITHOUT touching any
+# marker — the FIFO queue is untouched and retried next sweep (~2 min) once Dolt
+# cools or quota recovers. This runs BEFORE the atomic claim below, so a deferred
+# sweep never strands a marker in gate-status:dispatching, and BEFORE the EXIT
+# trap is installed (Step 7), so the early exit needs no reviewer cleanup.
+#
+# FAIL-OPEN is load-bearing: this daemon is town-critical-path; a wedged
+# `gc dolt health` must NEVER deadlock the gate. Only a POSITIVELY-MEASURED hot
+# reading (or a confirmed quota limit) defers. GATE_HEADROOM_ENABLED=0 restores
+# the exact pre-ga-cw4pm behavior (no probe, always proceed).
+if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
+  # 1. Dolt CPU/latency. Override seam (GATE_DOLT_LATENCY_OVERRIDE_MS) keeps the
+  #    selftest off live `gc dolt health`. `gc dolt health` does NOT accept --city
+  #    (errors out) — scope via the GC_CITY env var, exactly like the Pilot probe.
+  if [ -n "${GATE_DOLT_LATENCY_OVERRIDE_MS:-}" ]; then
+    HR_LAT="$GATE_DOLT_LATENCY_OVERRIDE_MS"; HR_PID="TEST"
+  else
+    HR_H=$(GC_CITY="$GC_CITY" timeout 15 gc dolt health --json 2>/dev/null || echo "")
+    HR_LAT=$(printf '%s' "$HR_H" | jq -r '.server.latency_ms // empty' 2>/dev/null || echo "")
+    HR_PID=$(printf '%s' "$HR_H" | jq -r '.server.pid // empty' 2>/dev/null || echo "")
+  fi
+  HR_CPU=$(gate_dolt_cpu "${HR_PID:-}")
+  # 2. Claude quota (optional ga-wjlv9 dep; fail-open when the checker is absent).
+  HR_QLIM=$(gate_quota_limited)
+  # 3. Pure dynamic-concurrency decision.
+  HR_DECISION=$(gate_headroom_decision \
+    "${HR_CPU:-}" "${HR_LAT:-}" "$HR_QLIM" "$LIVE_REVIEWERS" \
+    "$GATE_DOLT_CPU_HOT" "$GATE_DOLT_CPU_WARM" "$GATE_DOLT_LATENCY_HOT_MS" \
+    "$GATE_MAX_REVIEWERS" "$GATE_REVIEWERS_PER_RUN" "${GATE_HEADROOM_FAILOPEN:-1}")
+  HR_VERDICT=$(printf '%s' "$HR_DECISION" | awk '{print $1}')
+  HR_CEILING=$(printf '%s' "$HR_DECISION" | awk '{print $2}')
+  HR_REASON=$(printf '%s' "$HR_DECISION" | cut -d' ' -f3-)
+  # N in-flight runs for the log line = ceil(LIVE_REVIEWERS / reviewers-per-run).
+  HR_RUNS=$(( ( LIVE_REVIEWERS + GATE_REVIEWERS_PER_RUN - 1 ) / GATE_REVIEWERS_PER_RUN ))
+  if [ "$HR_QLIM" = "1" ]; then HR_COTA="LIMITED"; else HR_COTA="ok"; fi
+  if [ "$HR_VERDICT" = "defer" ]; then
+    log "Headroom DEFER: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% lat=${HR_LAT:-?}ms / cota=${HR_COTA}) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, leaving $COUNT marker(s) queued (ga-cw4pm)."
+    exit 0
+  fi
+  log "Headroom OK: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% lat=${HR_LAT:-?}ms / cota=${HR_COTA}) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, admitting a new run (ga-cw4pm)."
 fi
 
 # FIFO: oldest-first so no queued marker starves (ga-zf61i). bd list returns
