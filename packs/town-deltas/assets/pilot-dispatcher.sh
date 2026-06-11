@@ -184,6 +184,59 @@ _filter_unblocked() {
   printf '%s' "$filtered"
 }
 
+# ── ga-qw7y6: defense-in-depth — skip beads already PASSED/SUPERSEDED by the gate ─
+# Even with the gate's cross-store close fixed (quality-gate-dispatcher.sh
+# resolve_bead_city), a close can still fail transiently (Dolt hiccup), leaving a
+# merged source bead OPEN. Pilot must NEVER re-dispatch already-merged work: doing
+# so spins up a builder which discovers the branch is already merged, rebuilds
+# nothing, and burns a lane slot + gate cycle (ga-8tv0s was phantom-re-dispatched
+# 3×: ga-dek6y→ga-6oqok→ga-ztksa). The durable, cross-store signal is the gate
+# MARKER (type:quality-gate-run, ALWAYS resident in the HQ store regardless of
+# which rig built the branch): label source-bead:<id> + gate-status:passed or
+# gate-status:superseded == the work merged.
+#
+# GATED_BEADS — newline-separated set of source-bead IDs carrying a terminal-
+# success gate marker. Built ONCE per sweep via two bounded HQ queries. Stays
+# empty on any error (fail-open: a failed marker scan must never block dispatch).
+GATED_BEADS=""
+_build_gated_set() {
+  local passed superseded
+  # Passed markers stay OPEN (the dispatcher keeps them open); superseded markers
+  # are CLOSED. --all covers both. Markers live in HQ (GC_CITY) for every rig.
+  passed=$(bd -C "$GC_CITY" list --all --json -l "gate-status:passed" 2>/dev/null \
+    | jq -r '.[]?.labels[]? | select(startswith("source-bead:")) | ltrimstr("source-bead:")' 2>/dev/null || true)
+  superseded=$(bd -C "$GC_CITY" list --all --json -l "gate-status:superseded" 2>/dev/null \
+    | jq -r '.[]?.labels[]? | select(startswith("source-bead:")) | ltrimstr("source-bead:")' 2>/dev/null || true)
+  GATED_BEADS=$(printf '%s\n%s\n' "$passed" "$superseded" | grep -vE '^[[:space:]]*$' | sort -u || true)
+  local n
+  n=$(printf '%s' "$GATED_BEADS" | grep -cE '[^[:space:]]' 2>/dev/null || echo 0)
+  n=$(printf '%s' "$n" | tr -d '[:space:]'); n=${n:-0}
+  log "ga-qw7y6 defense: $n bead(s) carry a terminal-success gate marker (passed/superseded) — barred from re-dispatch."
+}
+
+# _filter_gated   (reads candidate JSON array from stdin)
+# Drops candidates whose id is in GATED_BEADS (already merged via the gate). Runs
+# per-tier (before tier selection) so a gated bead never counts toward a tier's
+# candidate total. Fail-open: any jq error returns the input unchanged.
+_filter_gated() {
+  local arr
+  arr=$(cat)
+  [ -z "$GATED_BEADS" ] && { printf '%s' "$arr"; return 0; }
+  local gated_json before after filtered
+  gated_json=$(printf '%s\n' "$GATED_BEADS" \
+    | jq -R -s 'split("\n") | map(select(length>0))' 2>/dev/null || echo "[]")
+  before=$(printf '%s' "$arr" | jq 'length' 2>/dev/null || echo 0)
+  filtered=$(printf '%s' "$arr" | jq --argjson g "$gated_json" \
+    '[.[] | select((.id as $i | $g | index($i)) | not)]' 2>/dev/null) \
+    || { printf '%s' "$arr"; return 0; }
+  [ -z "$filtered" ] && { printf '%s' "$arr"; return 0; }
+  after=$(printf '%s' "$filtered" | jq 'length' 2>/dev/null || echo 0)
+  if [ "$before" != "$after" ]; then
+    warn "ga-qw7y6: excluded $((before - after)) candidate(s) with a terminal-success gate marker (already merged — phantom re-dispatch prevented)" >&2
+  fi
+  printf '%s' "$filtered"
+}
+
 # _top_candidate <json_array>
 # Prints the highest-priority candidate (P0>P1>P2, tie-break oldest).
 _top_candidate() {
@@ -650,6 +703,9 @@ if [ "$SMALL_SLOTS" -eq "0" ] && [ "$BIG_SLOTS" -eq "0" ]; then
   exit 0
 fi
 
+# ── ga-qw7y6: build the terminal-success gate-marker set once for this sweep ──
+_build_gated_set
+
 # ── Step 2: Tier 1 — Find open bugs + tech-debt beads in HQ DB ───────────────
 
 BUGS_JSON=$(bd -C "$GC_CITY" list --json \
@@ -657,14 +713,14 @@ BUGS_JSON=$(bd -C "$GC_CITY" list --json \
   "${COMMON_EXCLUDES[@]}" \
   -n 0 \
   2>/dev/null || echo "[]")
-BUGS_JSON=$(echo "$BUGS_JSON" | _filter_candidates)
+BUGS_JSON=$(echo "$BUGS_JSON" | _filter_candidates | _filter_gated)
 
 DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   -l "tech-debt" \
   "${COMMON_EXCLUDES[@]}" \
   -n 0 \
   2>/dev/null || echo "[]")
-DEBT_JSON=$(echo "$DEBT_JSON" | _filter_candidates)
+DEBT_JSON=$(echo "$DEBT_JSON" | _filter_candidates | _filter_gated)
 
 TIER1_JSON=$(echo "$BUGS_JSON $DEBT_JSON" \
   | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
@@ -692,7 +748,7 @@ if [ "$TIER1_COUNT" -eq "0" ]; then
     "${TIER2_EXCLUDES[@]}" \
     -n 0 \
     2>/dev/null || echo "[]")
-  TIER2_JSON=$(echo "$TIER2_JSON" | _filter_candidates)
+  TIER2_JSON=$(echo "$TIER2_JSON" | _filter_candidates | _filter_gated)
   TIER2_JSON=$(echo "$TIER2_JSON" | _filter_unblocked "$GC_CITY")
 
   TIER2_COUNT=$(echo "$TIER2_JSON" | jq 'length' 2>/dev/null || echo "0")
@@ -719,21 +775,21 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
     RIG_BUGS=$(bd -C "$rig_path" list --json -t bug \
       "${COMMON_EXCLUDES[@]}" \
       -n 0 2>/dev/null || echo "[]")
-    RIG_BUGS=$(echo "$RIG_BUGS" | _filter_candidates | _filter_unblocked "$rig_path")
+    RIG_BUGS=$(echo "$RIG_BUGS" | _filter_candidates | _filter_gated | _filter_unblocked "$rig_path")
     RIG_BUGS=$(echo "$RIG_BUGS" | jq --arg db "$rig_path" '[.[] | . + {_bead_db: $db}]' 2>/dev/null || echo "[]")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_BUGS" | jq -s 'add // []' 2>/dev/null || echo "[]")
 
     RIG_DEBT=$(bd -C "$rig_path" list --json -l "tech-debt" \
       "${COMMON_EXCLUDES[@]}" \
       -n 0 2>/dev/null || echo "[]")
-    RIG_DEBT=$(echo "$RIG_DEBT" | _filter_candidates | _filter_unblocked "$rig_path")
+    RIG_DEBT=$(echo "$RIG_DEBT" | _filter_candidates | _filter_gated | _filter_unblocked "$rig_path")
     RIG_DEBT=$(echo "$RIG_DEBT" | jq --arg db "$rig_path" '[.[] | . + {_bead_db: $db}]' 2>/dev/null || echo "[]")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_DEBT" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
 
     RIG_FEATURES=$(bd -C "$rig_path" list --json -l "story:approved" \
       "${TIER2_EXCLUDES[@]}" \
       -n 0 2>/dev/null || echo "[]")
-    RIG_FEATURES=$(echo "$RIG_FEATURES" | _filter_candidates | _filter_unblocked "$rig_path")
+    RIG_FEATURES=$(echo "$RIG_FEATURES" | _filter_candidates | _filter_gated | _filter_unblocked "$rig_path")
     RIG_FEATURES=$(echo "$RIG_FEATURES" | jq --arg db "$rig_path" '[.[] | . + {_bead_db: $db}]' 2>/dev/null || echo "[]")
     ALL_RIG_TIER2=$(echo "$ALL_RIG_TIER2 $RIG_FEATURES" | jq -s 'add // []' 2>/dev/null || echo "[]")
   done <<< "$RIG_PATHS"

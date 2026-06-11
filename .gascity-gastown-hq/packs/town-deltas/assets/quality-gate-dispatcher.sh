@@ -709,7 +709,47 @@ fi
 
 # wa-re77: source-bead (BEAD_ID) lives in the RIG's own Dolt DB, not HQ.
 # Use BEAD_CITY for all bd ops on $BEAD_ID; keep GC_CITY for marker/gate-run/verdict ops.
-BEAD_CITY="${RIG_PATH:-$GC_CITY}"
+#
+# ── ga-qw7y6: resolve the store that ACTUALLY contains the source bead ─────────
+# BEAD_CITY="${RIG_PATH:-$GC_CITY}" alone is WRONG when an HQ-resident `ga-` bead
+# is built on a RIG branch (e.g. an HQ painel story built on whatsapp_automation's
+# crew branch — see painel-lives-in-wa-rig). There the marker carries
+# rig=whatsapp_automation, so RIG_PATH resolves to the rig store, but the source
+# bead lives in the HQ city store. The PASS-merge close (`bd -C "$BEAD_CITY"
+# close`) and the ga-esbg post-merge verification then target the rig store,
+# can't find the HQ bead, and silently no-op — the source bead stays open, the
+# verification reports "absent" (false OK), and Pilot phantom-re-dispatches the
+# already-merged work (ga-8tv0s re-dispatched 3×: a direct slot/cycle leak).
+# Conversely, wa-re77 rig-native beads DO live in the rig store. The owning store
+# is therefore NOT derivable from RIG_PATH alone — probe which store resolves it.
+#
+# resolve_bead_city <bead-id> — echo the store dir whose Dolt DB owns <bead-id>.
+# Probes RIG_PATH first (preserve wa-re77 rig-native behavior), then GC_CITY (HQ).
+# A store "owns" the bead iff `bd -C <store> show <bead> --json` yields a record
+# with a non-empty .status; a not-found probe returns {"error":...} (no .status →
+# empty → skip). Falls back to a bead-id prefix heuristic (ga-* → HQ) only when
+# NEITHER store resolves (e.g. transient Dolt hiccup), so the close still targets
+# the most-likely-correct store rather than blindly trusting RIG_PATH.
+resolve_bead_city() {
+  local bead="$1" store st
+  [ -z "$bead" ] && { echo "$GC_CITY"; return 0; }
+  for store in "${RIG_PATH:-}" "$GC_CITY"; do
+    [ -z "$store" ] && continue
+    st=$(bd -C "$store" show "$bead" --json 2>/dev/null \
+      | jq -r 'if type=="array" then (.[0] // {}) else . end | .status // empty' 2>/dev/null)
+    if [ -n "$st" ]; then echo "$store"; return 0; fi
+  done
+  # Neither store resolved (transient Dolt issue): prefix heuristic. The HQ city
+  # prefix is `ga` (gascity); every other prefix is a rig.
+  case "$bead" in
+    ga-*) echo "$GC_CITY" ;;
+    *)    echo "${RIG_PATH:-$GC_CITY}" ;;
+  esac
+}
+BEAD_CITY="$(resolve_bead_city "$BEAD_ID")"
+if [ "$BEAD_CITY" != "${RIG_PATH:-$GC_CITY}" ]; then
+  log "  ga-qw7y6: source bead $BEAD_ID resolves to store $BEAD_CITY (NOT rig store ${RIG_PATH:-$GC_CITY}) — cross-store close corrected."
+fi
 
 # Determine the canonical git repo location.
 # Container rigs (property_scrapers, lexbh) have a bare .repo.git.
