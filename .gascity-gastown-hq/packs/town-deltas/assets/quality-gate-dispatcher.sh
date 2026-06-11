@@ -200,6 +200,80 @@ respawn_reviewer_slot() {
   return 0
 }
 
+# ── ga-rstw5: bare-mirror reconcile to origin (durable-landing false-FAIL fix) ─
+# Container rigs keep a bare .repo.git whose OWN refs/heads/<main> a `git push` to
+# origin never advances. When that bare ref drifts/forks from origin/<main> — the
+# canonical durable line the gate merge pushes to — the durable-landing step used
+# to FF-only-or-FAIL, flipping an all-PASS verdict to failed_durable_not_ff the
+# moment the bare ref had FORKED (WA's orphan 'preserve' 9c8c8a20 from the
+# gt-fc02b7 decommission). The merge DID land on origin; the bare mirror must just
+# track it. These two functions (a pure decision + its git plumbing) are defined
+# BEFORE the lib-only guard so gate-durable-landing-reconcile.selftest.sh can
+# exercise both with real temp repos — single source of truth, no copy-drift.
+
+# reconcile_main_action <local_sha> <origin_sha> <local_anc_origin 0|1> <origin_anc_local 0|1>
+#   Pure (no IO, set -e safe). Echoes the ref move that makes the bare mirror track
+#   origin, given the ancestry relationship:
+#     noop      — already equal, OR bare strictly AHEAD of origin (extra local-only
+#                 commits we must NOT discard), OR origin unresolvable (safety).
+#     ff        — bare absent or strictly BEHIND origin (ancestor) → advance to origin.
+#     reconcile — FORKED (neither is the other's ancestor) → reset bare to origin
+#                 (canonical), preserving the forked tip under a backup ref.
+reconcile_main_action() {
+  local lsha="$1" osha="$2" local_anc_origin="$3" origin_anc_local="$4"
+  [ -z "$osha" ] && { echo "noop"; return 0; }
+  [ -z "$lsha" ] && { echo "ff"; return 0; }
+  [ "$lsha" = "$osha" ] && { echo "noop"; return 0; }
+  [ "$local_anc_origin" = "1" ] && { echo "ff"; return 0; }
+  [ "$origin_anc_local" = "1" ] && { echo "noop"; return 0; }
+  echo "reconcile"
+}
+
+# reconcile_bare_main_to_origin <bare_git_dir> <branch>
+#   Git plumbing around reconcile_main_action. Fetches origin/<branch> into the
+#   bare repo, classifies ancestry, and applies the decided ref move. FF-safe and
+#   idempotent (noop when already tracking); only a FORKED ref is rewritten, and
+#   only ever TO origin — the forked tip is first saved under
+#   refs/heads/_backup-forked-<branch>-<sha> for forensics. Echoes a one-token
+#   outcome (noop:* | ff:* | reconcile:* | fetch-failed | origin-unresolved |
+#   updateref-failed); returns 0 on success/no-op, 1 on a hard git failure.
+#   set -e safe: every git call is wrapped in `if`/`||` so a non-zero exit (e.g.
+#   is-ancestor=false) never trips the shell, and callers capture rc via `|| rc=$?`.
+reconcile_bare_main_to_origin() {
+  local gdir="$1" branch="$2"
+  if ! git --git-dir="$gdir" fetch origin "$branch" --quiet 2>/dev/null; then
+    if ! git --git-dir="$gdir" fetch origin --quiet 2>/dev/null; then
+      echo "fetch-failed"; return 1
+    fi
+  fi
+  local osha lsha
+  osha=$(git --git-dir="$gdir" rev-parse --verify -q "origin/$branch^{commit}" 2>/dev/null || echo "")
+  [ -z "$osha" ] && { echo "origin-unresolved"; return 1; }
+  lsha=$(git --git-dir="$gdir" rev-parse --verify -q "refs/heads/$branch^{commit}" 2>/dev/null || echo "")
+  local la=0 oa=0
+  if [ -n "$lsha" ]; then
+    if git --git-dir="$gdir" merge-base --is-ancestor "$lsha" "$osha" 2>/dev/null; then la=1; fi
+    if git --git-dir="$gdir" merge-base --is-ancestor "$osha" "$lsha" 2>/dev/null; then oa=1; fi
+  fi
+  local action
+  action=$(reconcile_main_action "$lsha" "$osha" "$la" "$oa")
+  case "$action" in
+    noop)
+      echo "noop:${lsha:-<none>}"; return 0 ;;
+    ff)
+      if ! git --git-dir="$gdir" update-ref "refs/heads/$branch" "$osha" 2>/dev/null; then
+        echo "updateref-failed"; return 1
+      fi
+      echo "ff:${lsha:-<none>}->$osha"; return 0 ;;
+    reconcile)
+      git --git-dir="$gdir" update-ref "refs/heads/_backup-forked-${branch}-${lsha}" "$lsha" 2>/dev/null || true
+      if ! git --git-dir="$gdir" update-ref "refs/heads/$branch" "$osha" 2>/dev/null; then
+        echo "updateref-failed"; return 1
+      fi
+      echo "reconcile:${lsha}->${osha}(backup:_backup-forked-${branch}-${lsha})"; return 0 ;;
+  esac
+}
+
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
 # above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
 # GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
@@ -395,6 +469,43 @@ if [ "$REVIEWER_SESSION_COUNT" -gt 0 ]; then
   if [ "$REAPED_REVIEWERS" -gt 0 ]; then
     log "Reaped $REAPED_REVIEWERS orphaned gate-reviewer session(s) this sweep (ga-zl277)."
   fi
+fi
+
+# ── Step 0a-3 (ga-rstw5): reconcile container-rig bare mains to origin ─────────
+# Container rigs (.repo.git) keep a LOCAL refs/heads/<main> that a push to origin
+# never advances; when it drifts/forks from origin/<main> the durable-landing step
+# used to false-FAIL an all-PASS verdict (failed_durable_not_ff) and mail crew a
+# spurious FAIL (ga-rstw5). do_merge_ff now reconciles the rig it merges, but this
+# startup sweep additionally keeps EVERY container rig's bare main tracking origin
+# each sweep, healing a stale/forked mirror BEFORE any branch reaches the guard
+# (AC: bare main of every container rig tracks origin/main after a gate run).
+# Cheap + idempotent: a single-ref fetch + ancestry check; only a forked ref is
+# rewritten (to origin; forked tip backed up first). Silent on the common no-op so
+# it does not spam the log every ~2 min.
+RECON_RIG_JSON=$(gc --city "$GC_CITY" rig list --json 2>/dev/null || echo '{}')
+RECON_RIG_COUNT=$(echo "$RECON_RIG_JSON" | jq '.rigs | length' 2>/dev/null || echo "0")
+case "$RECON_RIG_COUNT" in ''|*[!0-9]*) RECON_RIG_COUNT=0 ;; esac
+if [ "$RECON_RIG_COUNT" -gt 0 ]; then
+  for rci in $(seq 0 $((RECON_RIG_COUNT - 1))); do
+    RC_PATH=$(echo "$RECON_RIG_JSON"   | jq -r ".rigs[$rci].path // \"\""               2>/dev/null || echo "")
+    RC_BRANCH=$(echo "$RECON_RIG_JSON" | jq -r ".rigs[$rci].default_branch // \"main\"" 2>/dev/null || echo "main")
+    RC_NAME=$(echo "$RECON_RIG_JSON"   | jq -r ".rigs[$rci].name // \"?\""              2>/dev/null || echo "?")
+    [ -z "$RC_PATH" ] && continue
+    # Only container rigs have a bare .repo.git mirror that can drift; self-repo
+    # rigs (wa, gascity, marketing) read origin directly and are unaffected.
+    [ -d "$RC_PATH/.repo.git" ] || continue
+    RC_OUT=""
+    RC_RC=0
+    RC_OUT=$(reconcile_bare_main_to_origin "$RC_PATH/.repo.git" "$RC_BRANCH") || RC_RC=$?
+    if [ "$RC_RC" != "0" ]; then
+      warn "Startup reconcile: rig $RC_NAME bare $RC_BRANCH FAILED ($RC_OUT) — continuing"
+    else
+      case "$RC_OUT" in
+        noop:*) : ;;  # already tracking origin — silent
+        *) log "Startup reconcile: rig $RC_NAME bare $RC_BRANCH → origin ($RC_OUT)" ;;
+      esac
+    fi
+  done
 fi
 
 # ── Step 0b: Find a queued marker ────────────────────────────────────────────
@@ -1832,21 +1943,25 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
               MERGE_RESULT="failed_durable_resolution"
               return 1
             fi
-            LOCAL_MAIN=$(rig_resolve_commit "refs/heads/$DEFAULT_BRANCH")
-            # FF-only: advance bare local main only if it is an ancestor of the
-            # merge (already-contains → harmless no-op; non-ancestor → refuse).
-            if [ -z "$LOCAL_MAIN" ] || git_rig merge-base --is-ancestor "$LOCAL_MAIN" "$RESOLVED_MERGE" 2>/dev/null; then
-              if ! git_rig update-ref "refs/heads/$DEFAULT_BRANCH" "$RESOLVED_MERGE" 2>/dev/null; then
-                err "  Durable-landing: update-ref of bare $DEFAULT_BRANCH → $RESOLVED_MERGE FAILED"
-                MERGE_RESULT="failed_durable_updateref"
-                return 1
-              fi
-              log "  Durable-landing: advanced bare $DEFAULT_BRANCH (${LOCAL_MAIN:-<none>} → $RESOLVED_MERGE)"
-            else
-              err "  Durable-landing: bare $DEFAULT_BRANCH ($LOCAL_MAIN) not ancestor of merge ($RESOLVED_MERGE) — refusing non-FF ref move"
-              MERGE_RESULT="failed_durable_not_ff"
+            # ga-rstw5: track origin/$DEFAULT_BRANCH (the canonical durable line the
+            # FF push above just advanced — $RESOLVED_MERGE is verified an ancestor
+            # of it), NOT merely the merge SHA. FF when the bare ref is behind; when
+            # it has FORKED off origin (orphan commits — e.g. a decommission
+            # 'preserve' commit) RECONCILE to origin instead of false-FAILing the
+            # all-PASS verdict. The old FF-only-or-fail guard's failed_durable_not_ff
+            # burned a 2nd gate cycle + mailed crew a spurious FAIL the instant the
+            # bare mirror diverged. The survival audit below STILL re-verifies the
+            # merge in BOTH the rig-canonical local main AND origin, so a genuine
+            # clobber/orphan is still caught and re-enqueued (not closed).
+            DURABLE_RECON_OUT=""
+            DURABLE_RECON_RC=0
+            DURABLE_RECON_OUT=$(reconcile_bare_main_to_origin "$GIT_DIR_PATH" "$DEFAULT_BRANCH") || DURABLE_RECON_RC=$?
+            if [ "$DURABLE_RECON_RC" != "0" ]; then
+              err "  Durable-landing: bare $DEFAULT_BRANCH reconcile to origin FAILED ($DURABLE_RECON_OUT)"
+              MERGE_RESULT="failed_durable_updateref"
               return 1
             fi
+            log "  Durable-landing: bare $DEFAULT_BRANCH reconciled to origin ($DURABLE_RECON_OUT)"
             # Survival audit: fresh fetch, then confirm the merge survives in BOTH
             # the rig-canonical local main AND origin/main. A failure here means
             # the merge was orphaned (shared-remote clobber or lost push) — fail
