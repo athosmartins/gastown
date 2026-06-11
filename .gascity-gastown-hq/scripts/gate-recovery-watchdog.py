@@ -50,6 +50,7 @@ PILOT_LOG = os.path.join(CITY, ".gc/logs/pilot-dispatcher.log")
 SUPERVISOR_LOG = "/Users/athos/.gc/supervisor.log"
 SITE_TOML = os.path.join(CITY, ".gc/site.toml")
 NOTIFY = "/Users/athos/.local/bin/notify"
+QUOTA_CHECK = os.path.join(CITY, "scripts/claude-quota-check.sh")
 
 POLL_SEC = 60
 TIMEOUT_WINDOW_SEC = 1800      # 2+ timeouts within 30min = gate not producing verdicts
@@ -83,6 +84,25 @@ def sh(args, timeout=20):
         return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     except Exception:
         return None
+
+
+def quota_verdict():
+    """Ground-truth Claude-quota line for the Mayor's wake-up (ga-wjlv9).
+
+    The 2026-06-10 night was lost diagnosing a gate stall as 'quota exhausted'
+    without being able to verify it (it was NOT quota — only 22% used). Every
+    wake message below tells the Mayor to go fix the INFRA; lead each one with
+    the real quota verdict so the Mayor can rule quota in/out FIRST instead of
+    chasing the wrong cause. Fail-safe: any error returns an explicit unknown
+    line, never blocks the wake."""
+    r = sh([QUOTA_CHECK, "--line"], timeout=18)
+    if r is not None and r.returncode in (0, 2):
+        line = (r.stdout or "").strip().splitlines()
+        if line and line[0].startswith("QUOTA:"):
+            tag = "🔴" if r.returncode == 2 else "🟢"
+            return "%s %s\n   (fonte: claude-quota-check.sh --line — sinal de verdade do transcript, não chute)\n\n" % (tag, line[0])
+    return ("QUOTA: (check indisponível — rode `%s` manualmente p/ confirmar antes de assumir cota)\n\n"
+            % QUOTA_CHECK)
 
 
 def log_ts_epoch(line):
@@ -371,8 +391,9 @@ def wake_mayor(reason, diag_path, dolt_hits, kind="gate"):
     mid = mayor_session()
     if not mid:
         return False
+    qv = quota_verdict()  # lead every wake with the real quota verdict (ga-wjlv9)
     if kind == "pilot":
-        task = (
+        task = qv + (
             "🔧 ALERTA AUTOMÁTICO DO WATCHDOG — Pilot travado. Conserta agora, não escale pro Athos a menos que falhe.\n\n"
             "O Pilot parou de despachar trabalho. Motivo detectado: %s.\nDiagnóstico: %s\n\n"
             "Causa-raiz mais provável (lição de 2026-06-08): o `gc sling` rejeita títulos com acento/travessão "
@@ -389,7 +410,7 @@ def wake_mayor(reason, diag_path, dolt_hits, kind="gate"):
         r = sh(["gc", "session", "nudge", mid, task], timeout=25)
         return r is not None and r.returncode == 0
     if kind == "gate-loop":
-        task = (
+        task = qv + (
             "🔧 ALERTA AUTOMÁTICO DO WATCHDOG — gate em HEAD-OF-LINE BLOCK. Conserta agora, não escale pro Athos a menos que falhe.\n\n"
             "O gate está preso no MESMO branch stale há vários sweeps: %s. "
             "O auto-rebase bate em conflito (autor morto/ausente), o marker re-enfileira gate-status:queued, "
@@ -413,7 +434,7 @@ def wake_mayor(reason, diag_path, dolt_hits, kind="gate"):
         r = sh(["gc", "session", "nudge", mid, task], timeout=25)
         return r is not None and r.returncode == 0
     if kind == "supervisor":
-        task = (
+        task = qv + (
             "🔧 ALERTA AUTOMÁTICO DO WATCHDOG — supervisor em INIT-FAILURE LOOP (spawn-outage town-wide). "
             "Conserta agora, não escale pro Athos a menos que falhe.\n\n"
             "O supervisor está ciclando em init-failure: %s. Config inválido detectado em site.toml: %s.\n"
@@ -436,7 +457,7 @@ def wake_mayor(reason, diag_path, dolt_hits, kind="gate"):
         sh(["gc", "session", "wake", mid], timeout=20)
         r = sh(["gc", "session", "nudge", mid, task], timeout=25)
         return r is not None and r.returncode == 0
-    task = (
+    task = qv + (
         "🔧 ALERTA AUTOMÁTICO DO WATCHDOG (gate-recovery-watchdog) — conserta agora, não escale pro Athos a menos que falhe.\n\n"
         "O gate parou de produzir vereditos. Motivo detectado: %s. "
         "Linhas de instabilidade do Dolt no supervisor.log: %d.\n"
@@ -445,6 +466,9 @@ def wake_mayor(reason, diag_path, dolt_hits, kind="gate"):
         "→ supervisor não computa a demanda de gate-reviewer → revisores nascem e morrem (start-pending) → "
         "todo run dá TIMEOUT. Veja a memória [[gate-reviewer-spawn-failure-playbook]].\n\n"
         "CONSERTO (na ordem, verificando entre os passos):\n"
+        "0. COTA PRIMEIRO (lição de 2026-06-10): olhe a linha QUOTA no topo. Se disser LIMITED, É cota — "
+        "espere o reset, NÃO persiga infra. Se 'not limited', NÃO é cota → siga pros passos de infra abaixo. "
+        "(Confirme você mesmo: scripts/claude-quota-check.sh --json.)\n"
         "1. Colete diagnóstico: grep -E 'connection reset|bead store closed|invalid connection' ~/.gc/supervisor.log | tail\n"
         "2. Menos invasivo primeiro: launchctl kickstart -k gui/$(id -u)/com.gascity.supervisor ; espere 30s ; "
         "dispare um gate run (launchctl kickstart gui/$(id -u)/com.gascity.quality-gate-dispatcher) e veja se os "
