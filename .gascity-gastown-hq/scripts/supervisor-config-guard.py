@@ -277,7 +277,10 @@ def wake_mayor(reason, ladder, fix_output=None):
 # ---- guard cycle ----
 
 def run_cycle(dry_run=False):
-    """One guard pass. Returns (problem:bool, reason:str, ladder, fixed:bool).
+    """One guard pass. Returns (problem:bool, reason:str, ladder, fixed:bool, fix_output).
+
+    Always a 5-tuple so main()'s unconditional unpack is safe on every cycle,
+    including the common healthy path (fix_output is None when no fix ran).
 
     A problem is raised when EITHER the proactive config validation fails (AC#1)
     OR the supervisor is actively looping on init-failure (AC#2). For the known
@@ -287,7 +290,7 @@ def run_cycle(dry_run=False):
     config_bad = bool(probs)
     problem = config_bad or inf
     if not problem:
-        return (False, "", [], False)
+        return (False, "", [], False, None)
 
     if config_bad:
         reason = "config inválido em site.toml — " + "; ".join("%s: %s" % (n, r) for n, r in probs)
