@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.gate-merge-survival-sweep</string>
+
+  <!-- Gate merge-survival sweep (ga-lzj2e, 2026-06-11). Closes the residual
+       ASYNC gap left by ga-eptel's inline durable-landing audit: the gastown rig
+       SHARES remote athosmartins/gastown.git with the town main, so a town-main
+       push minutes/hours AFTER the gate has exited can still orphan a
+       gate-verified container-rig merge — long after the inline audit window
+       closed. quality-gate-dispatcher.sh records every container-rig merge SHA
+       in .gc/merge-survival-ledger.jsonl; this sweep periodically re-fetches each
+       rig's origin and re-verifies recent SHAs are still ancestors of
+       origin/<default_branch>, then SELF-HEALS (FF-only re-push when provably
+       lossless) or ESCALATES (divergent clobber → reopen+label bead, mail Mayor,
+       ntfy). Runs once per StartInterval and exits (not resident). Idempotent;
+       retention-bounded ledger (14d); per-sha rate-limited escalation. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/gate-merge-survival-sweep.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <!-- Sweep cadence: every 30 min. The async clobber window is hours-wide and
+       gastown sees few gate merges, so 30 min is ample to catch an orphan well
+       inside the retention window. RunAtLoad fires an immediate sweep on load. -->
+  <key>StartInterval</key><integer>1800</integer>
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-merge-survival-sweep-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-merge-survival-sweep-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>SURVIVAL_LOG_STDOUT</key>
+    <string>1</string>
+  </dict>
+</dict>
+</plist>

@@ -2159,6 +2159,39 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
   fi
 
   if [ "$OVERALL_VERDICT" = "PASS" ]; then
+    # ── ga-lzj2e: durable merge-survival ledger (async shared-remote defense) ──
+    # ga-eptel's inline durable-landing AUDIT (do_merge_ff) only catches an
+    # IN-FLIGHT clobber: by the time the gate exits, its audit window is closed.
+    # The gastown rig SHARES remote athosmartins/gastown.git with the town main,
+    # so a town-main push minutes/hours LATER can still orphan a just-merged
+    # gastown SHA on the shared remote — fully async, after the gate is gone.
+    # Record every CONTAINER-rig merge in a durable append-only ledger; the
+    # gate-merge-survival-sweep daemon periodically re-fetches and re-verifies
+    # each recent SHA is still an ancestor of origin/<default_branch>, then
+    # self-heals (FF-only re-push when safe) or escalates (divergent clobber).
+    # Container rigs only — a self-repo rig (wa, gascity) has no shared-remote
+    # clobber vector. FULLY GUARDED: a ledger failure must NEVER affect the gate
+    # outcome (every step `|| true` / non-fatal; runs only on a real merge SHA).
+    if [ "$DRY_RUN" != "1" ] && [ "${IS_CONTAINER_RIG:-0}" = "1" ] \
+       && printf '%s' "$MERGE_SHA" | grep -Eq '^[0-9a-f]{7,40}$'; then
+      SURVIVAL_LEDGER="$GC_CITY/.gc/merge-survival-ledger.jsonl"
+      mkdir -p "$GC_CITY/.gc" 2>/dev/null || true
+      LEDGER_LINE=$(jq -nc \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg rig "$RIG" --arg rig_path "$RIG_PATH" \
+        --arg default_branch "$DEFAULT_BRANCH" --arg branch "$BRANCH" \
+        --arg bead "${BEAD_ID:-}" --arg bead_city "${BEAD_CITY:-$GC_CITY}" \
+        --arg marker "${MARKER_ID:-}" --arg gate_run "${GATE_RUN_ID:-}" \
+        --arg merge_sha "$MERGE_SHA" \
+        '{ts:$ts,rig:$rig,rig_path:$rig_path,default_branch:$default_branch,branch:$branch,bead:$bead,bead_city:$bead_city,marker:$marker,gate_run:$gate_run,merge_sha:$merge_sha}' \
+        2>/dev/null || true)
+      if [ -n "$LEDGER_LINE" ]; then
+        printf '%s\n' "$LEDGER_LINE" >> "$SURVIVAL_LEDGER" 2>/dev/null \
+          && log "  Survival-ledger: recorded $RIG merge_sha=$MERGE_SHA (ga-lzj2e async-clobber defense)" \
+          || warn "  Survival-ledger: append failed (non-fatal)"
+      fi
+    fi
+
     # Update markers and beads for success
     set_gate_status "$MARKER_ID" "passed"
     # ga-jhyu: CLOSE the marker at terminal (passed) so it is reaped, not left
