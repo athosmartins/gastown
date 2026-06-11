@@ -71,6 +71,20 @@ eq "(d) pending + alive → wait (slow reviewer, no respawn)"  "$(classify_slot_
 eq "pending + dead + budget negative (sanitized) → wait"     "$(classify_slot_action 0 1 -3)" "wait"
 eq "pending + dead + budget garbage → wait"                  "$(classify_slot_action 0 1 xx)" "wait"
 
+# ── 2b. slot_effectively_dead — ga-mepb0 boot-wedge deadness fold-in ──────────
+# session_is_dead only sees absent/closed sessions. A reviewer wedged at boot
+# (gc prime hung on the Dolt circuit-breaker) is present + asleep
+# (session_dead=0) yet never ACKs — pre-fix it survived to the 45m timeout and
+# FALSE-FAILed a good branch. slot_effectively_dead folds the ACK signal in:
+# effectively-dead iff session is dead OR the slot never showed a sign of life.
+# Signature: slot_effectively_dead <session_dead 0|1> <acked 0|1> → 1|0
+type slot_effectively_dead >/dev/null 2>&1 || { echo "FATAL: slot_effectively_dead not defined by dispatcher (ga-mepb0)"; exit 1; }
+echo "── 2b. slot_effectively_dead (boot-wedge: present-but-never-acked = dead) ──"
+eq "session dead + acked → dead (session wins)"              "$(slot_effectively_dead 1 1)" "1"
+eq "session dead + never-acked → dead"                       "$(slot_effectively_dead 1 0)" "1"
+eq "(ga-mepb0) present + never-acked → effectively DEAD"     "$(slot_effectively_dead 0 0)" "1"
+eq "(safety) present + ACKed → alive (slow reviewer spared)" "$(slot_effectively_dead 0 1)" "0"
+
 # ── 3. respawn_reviewer_slot — real spawn/nudge wiring (mock gc) ──────────────
 # Proves the helper spawns a FRESH session, swaps SESSION_IDS[idx] in place,
 # re-delivers the SAME stored task, and REUSES the still-pending verdict bead
@@ -341,6 +355,27 @@ grep -q 'VERDICTS_RECEIVED=$((VERDICTS_RECEIVED + 1))' "$DISPATCHER" && ok "verd
 # still-pending verdict bead, so the count must stay at the baseline of 2.
 eq "no new 'bd ... create' added by re-convene (baseline 2: gate-run + verdict bead)" \
    "$(grep -cE 'bd -C "\$GC_CITY" create' "$DISPATCHER")" "2"
+
+# ── 5b. drift-guard: the live dispatcher wires the ga-mepb0 boot-wedge fix ─────
+# These assertions fail LOUDLY if a future refactor drops the present-but-never-
+# acked re-convene path (the false-FAIL fix) or the spawn stagger.
+echo "── 5b. drift-guard: dispatcher wires ga-mepb0 boot-wedge + stagger ──"
+grep -q 'slot_effectively_dead()' "$DISPATCHER" && ok "dispatcher defines slot_effectively_dead" || bad "missing slot_effectively_dead def (ga-mepb0 fix dropped)"
+# The poll loop must gate the dead-streak + confirmed-dead on _eff_dead, NOT the
+# raw _dead — otherwise a boot-wedged (present) reviewer is never re-convened.
+grep -q '_eff_dead=$(slot_effectively_dead' "$DISPATCHER" && ok "poll loop computes _eff_dead from slot_effectively_dead" || bad "poll loop does not fold ACK into deadness (ga-mepb0)"
+eq "poll loop gates streak/confirmed-dead on _eff_dead (>=2 sites), not raw _dead" \
+   "$(grep -cE '\[ "\$_eff_dead" = "1" \]' "$DISPATCHER")" "2"
+# Late-life re-check must run so a slow-but-alive reviewer is never killed:
+grep -q 'Late ACK (verdict-progressed)' "$DISPATCHER" && ok "poll loop has strong late-ACK (verdict progressed) re-check" || bad "missing strong late-ACK re-check (slow reviewer at risk)"
+grep -q 'Late ACK (session-alive)' "$DISPATCHER" && ok "poll loop has soft late-ACK (new output) re-check" || bad "missing soft late-ACK re-check (slow reviewer at risk)"
+# respawn must re-arm the ACK gate AND snapshot a real (non-empty) peek baseline
+# so a re-wedged respawn is caught — not falsely ACKed on its boot banner.
+grep -q 'REVIEWER_ACKED\[\$_idx\]=0' "$DISPATCHER" && ok "respawn clears ACK flag for fresh session" || bad "respawn does not re-arm ACK gate (stale ACK masks re-wedge)"
+grep -q 'REVIEWER_PEEK_BASELINE\[\$_idx\]=$(gc' "$DISPATCHER" && ok "respawn snapshots a REAL peek baseline (not empty)" || bad "respawn leaves empty baseline → boot banner falsely soft-ACKs a re-wedge"
+# EDIT #2: spawn stagger so N reviewers do not boot-herd Dolt :52756 at once.
+grep -q 'GATE_SPAWN_STAGGER_SECS' "$DISPATCHER" && ok "dispatcher defines spawn stagger (Dolt boot-herd guard)" || bad "missing GATE_SPAWN_STAGGER_SECS"
+grep -q 'sleep "\$GATE_SPAWN_STAGGER_SECS"' "$DISPATCHER" && ok "spawn loop actually applies the stagger sleep" || bad "GATE_SPAWN_STAGGER_SECS defined but never applied"
 
 # ── 6. dispatcher still parses + lib-only return is a no-op in normal flow ─────
 echo "── 6. syntax + lib-only safety ──"

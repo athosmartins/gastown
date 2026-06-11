@@ -92,6 +92,17 @@ RECONVENE_DEAD_STREAK_MIN="${RECONVENE_DEAD_STREAK_MIN:-2}"
 case "$RECONVENE_DEAD_STREAK_MIN" in ''|*[!0-9]*) RECONVENE_DEAD_STREAK_MIN=2 ;; esac
 [ "$RECONVENE_DEAD_STREAK_MIN" -lt 1 ] 2>/dev/null && RECONVENE_DEAD_STREAK_MIN=1
 
+# ga-mepb0 (defense-in-depth, root cause): seconds to pause after waking each
+# reviewer (except the last) so N reviewers do NOT all boot `gc prime`
+# (SessionStart) against the Dolt :52756 server at the same instant. That
+# thundering herd is what opens the Dolt circuit-breaker and wedges a reviewer
+# at boot in the first place (EDIT #1 re-convenes survivors; this lowers the odds
+# of the wedge at all). 0 disables. Floor 0, capped so a misconfig can't add
+# pathological latency to every gate. Total added latency = stagger × (N-1).
+GATE_SPAWN_STAGGER_SECS="${GATE_SPAWN_STAGGER_SECS:-3}"
+case "$GATE_SPAWN_STAGGER_SECS" in ''|*[!0-9]*) GATE_SPAWN_STAGGER_SECS=3 ;; esac
+[ "$GATE_SPAWN_STAGGER_SECS" -gt 15 ] 2>/dev/null && GATE_SPAWN_STAGGER_SECS=15
+
 # session_is_dead <present 0|1> <closed true|false|1|0> → echoes 1 (dead) | 0 (alive)
 # A reviewer session is DEAD iff it is absent from the session list (present=0)
 # OR explicitly closed. A present, non-closed session (active OR asleep) is ALIVE
@@ -120,6 +131,24 @@ classify_slot_action() {
   echo "wait"
 }
 
+# slot_effectively_dead <session_dead 0|1> <acked 0|1> → 1 (treat as dead for the
+# re-convene decision) | 0. Pure; no I/O.
+# ga-mepb0: session_is_dead only sees absent/closed sessions. A reviewer can be
+# PRESENT + not-closed (session_is_dead=0) yet wedged at boot — its SessionStart
+# `gc prime` hung on the Dolt :52756 circuit-breaker, so the session is asleep
+# with 0 terminal output and a still-pending verdict bead. It NEVER ACKs, so the
+# ga-4u16h liveness gate alone could not see it and only the 45m outer timeout
+# caught it → a FALSE FAIL on a GOOD branch. Fold the ACK signal into deadness: a
+# slot is effectively dead if its session is DEAD *or* it has never shown a sign
+# of life (acked != 1). The caller re-checks for LATE life (verdict progressed or
+# new output) BEFORE trusting acked, so a slow-but-alive reviewer is never killed.
+slot_effectively_dead() {
+  local session_dead="$1" acked="$2"
+  if [ "$session_dead" = "1" ]; then echo 1; return 0; fi
+  if [ "$acked" != "1" ]; then echo 1; return 0; fi
+  echo 0
+}
+
 # respawn_reviewer_slot <0-based idx> — re-spawn a fresh gate-reviewer session for
 # a dead slot, REUSING the still-pending verdict bead VERDICT_BEAD_IDS[idx] and
 # re-delivering the SAME stored review task REVIEW_TASKS[idx] (it already
@@ -146,7 +175,21 @@ respawn_reviewer_slot() {
     return 1
   fi
   SESSION_IDS[$_idx]="$_new_sid"
+  # ga-mepb0: the re-convened session must re-prove life. Clear its ACK flag so
+  # the carried-over ACKED=1 from the since-replaced session cannot mask a fresh
+  # boot-wedge. Index-assignment is safe even if the arrays are sparse.
+  REVIEWER_ACKED[$_idx]=0
   gc --city "$GC_CITY" session wake "$_new_sid" 2>/dev/null || true
+  # ga-mepb0: snapshot a REAL peek baseline for the NEW session here (post-wake,
+  # pre-delivery) — exactly as the initial spawn does. Do NOT leave it empty: an
+  # empty baseline differs from the boot banner's non-empty cksum, so the very
+  # next poll's soft late-ACK would fire on boot output alone and falsely mark a
+  # re-wedged respawn ALIVE — sending it back to the 45m timeout this fix exists
+  # to kill. With a real pre-delivery baseline, only output produced AFTER task
+  # delivery (genuine sign of life) flips the ACK. `|| echo ""` keeps set -e safe;
+  # an empty result here is the conservative case (no false ACK), still backed by
+  # the verdict-progressed strong check.
+  REVIEWER_PEEK_BASELINE[$_idx]=$(gc --city "$GC_CITY" session peek "$_new_sid" --lines 40 2>/dev/null | cksum 2>/dev/null | awk '{print $1}' || echo "")
   if gc --city "$GC_CITY" session nudge "$_new_sid" "${REVIEW_TASKS[$_idx]}" --delivery queue 2>/dev/null; then
     log "  Re-convene: review task re-queued to fresh session ${_new_sid} (slot ${_idx}, verdict bead ${VERDICT_BEAD_IDS[$_idx]} reused)."
   elif gc --city "$GC_CITY" session submit "$_new_sid" "${REVIEW_TASKS[$_idx]}" 2>/dev/null; then
@@ -1299,6 +1342,18 @@ TASK
   else
     warn "  Initial queue/submit to session $SESSION_ID failed — Step 7b will retry (reviewer $i)"
   fi
+
+  # ga-mepb0 (EDIT #2, defense-in-depth): stagger the NEXT reviewer's spawn so the
+  # N reviewers do not all fire `gc prime` (SessionStart) against Dolt :52756 in
+  # the same instant — that thundering herd is what trips the Dolt circuit-breaker
+  # and wedges a reviewer at boot (the false-FAIL root). Skip the pause after the
+  # last reviewer (nothing left to spawn) and when disabled (stagger=0). EDIT #1
+  # still re-convenes any reviewer that wedges despite this; the stagger just
+  # lowers the odds of the wedge. Guarded so a misconfig can't crash the loop.
+  if [ "$GATE_SPAWN_STAGGER_SECS" -gt 0 ] 2>/dev/null && [ "$i" -lt "$REQUIRED_REVIEWERS" ] 2>/dev/null; then
+    log "  Spawn stagger: sleeping ${GATE_SPAWN_STAGGER_SECS}s before reviewer $((i+1)) (ga-mepb0, Dolt boot-herd guard)"
+    sleep "$GATE_SPAWN_STAGGER_SECS" || true
+  fi
 done
 
 log "All $REQUIRED_REVIEWERS reviewer sessions spawned: ${SESSION_IDS[*]}"
@@ -1511,21 +1566,49 @@ while true; do
           _closed_flag=false
         fi
         _dead=$(session_is_dead "$_present_flag" "$_closed_flag")
+        # ── ga-mepb0: late-ACK re-check + boot-wedge deadness ───────────────────
+        # A reviewer wedged at boot (gc prime hung on the Dolt circuit-breaker) is
+        # present + asleep (session_is_dead=0) but never ACKs, so the session-only
+        # liveness gate above left it for the 45m outer timeout to fail — bouncing
+        # a GOOD branch on INFRA. Treat a never-ACKed slot as effectively dead so
+        # it is re-convened in <grace+streak. BUT re-check for LATE life first so a
+        # slow-but-alive reviewer is NEVER killed:
+        #   strong: its verdict bead already dropped verdict:pending — reuse the
+        #           VB_LABELS fetched above, so NO extra bd call; OR
+        #   soft:   its session produced new terminal output since the baseline.
+        # Both checks are skipped once the slot has ACKed (cheap; bounded to the
+        # wedged-looking window only).
+        if [ "${REVIEWER_ACKED[$j]:-0}" != "1" ]; then
+          if ! echo "$VB_LABELS" | grep -q "verdict:pending"; then
+            REVIEWER_ACKED[$j]=1
+            log "  Late ACK (verdict-progressed): reviewer $((j+1)) session=${_sid} bead=$VB"
+          else
+            _peek_now=$(gc --city "$GC_CITY" session peek "$_sid" --lines 40 2>/dev/null | cksum 2>/dev/null | awk '{print $1}' || echo "")
+            if [ -n "$_peek_now" ] && [ "$_peek_now" != "${REVIEWER_PEEK_BASELINE[$j]:-}" ]; then
+              REVIEWER_ACKED[$j]=1
+              log "  Late ACK (session-alive): reviewer $((j+1)) session=${_sid}"
+            fi
+          fi
+        fi
+        _eff_dead=$(slot_effectively_dead "$_dead" "${REVIEWER_ACKED[$j]:-0}")
         # Grace gate: never call a freshly-(re)spawned reviewer dead too early.
-        if [ "$_dead" = "1" ] && [ "$_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
+        if [ "$_eff_dead" = "1" ] && [ "$_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
           SLOT_DEAD_STREAK[$j]=$(( ${SLOT_DEAD_STREAK[$j]:-0} + 1 ))
         else
           SLOT_DEAD_STREAK[$j]=0
         fi
         _confirmed_dead=0
-        if [ "$_dead" = "1" ] && [ "${SLOT_DEAD_STREAK[$j]:-0}" -ge "$RECONVENE_DEAD_STREAK_MIN" ]; then
+        if [ "$_eff_dead" = "1" ] && [ "${SLOT_DEAD_STREAK[$j]:-0}" -ge "$RECONVENE_DEAD_STREAK_MIN" ]; then
           _confirmed_dead=1
         fi
         _action=$(classify_slot_action 0 "$_confirmed_dead" "${RESPAWN_BUDGET[$j]:-0}")
         if [ "$_action" = "respawn" ]; then
           RESPAWN_BUDGET[$j]=$(( ${RESPAWN_BUDGET[$j]:-0} - 1 ))
           _respawn_k=$(( MAX_RESPAWNS_PER_SLOT - ${RESPAWN_BUDGET[$j]} ))
-          log "Re-convening dead reviewer slot $j (respawn ${_respawn_k}/${MAX_RESPAWNS_PER_SLOT}) — session ${SESSION_IDS[$j]} dead, verdict bead ${VERDICT_BEAD_IDS[$j]} still pending."
+          # ga-mepb0: name the deadness cause so a boot-wedge (false-FAIL root) is
+          # distinguishable from a Dolt-killed session in the gate log.
+          if [ "$_dead" = "1" ]; then _dead_reason="session dead"; else _dead_reason="boot-wedged (present but never ACKed — gc prime/Dolt stall)"; fi
+          log "Re-convening dead reviewer slot $j (respawn ${_respawn_k}/${MAX_RESPAWNS_PER_SLOT}) — session ${SESSION_IDS[$j]} ${_dead_reason}, verdict bead ${VERDICT_BEAD_IDS[$j]} still pending."
           SLOT_SPAWN_EPOCH[$j]="$NOW_EPOCH"   # reset this slot's grace clock
           SLOT_DEAD_STREAK[$j]=0
           respawn_reviewer_slot "$j" || true
