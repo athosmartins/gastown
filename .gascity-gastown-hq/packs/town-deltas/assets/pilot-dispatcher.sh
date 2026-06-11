@@ -158,27 +158,92 @@ log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] $*"; }
 err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] ERROR: $*"; }
 warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: $*"; }
 
-# ── Single-instance guard (ga-2azzj fix 2) ────────────────────────────────────
+# ── Single-instance guard (ga-2azzj fix 2; ga-7s0or fd-leak rewrite) ──────────
 # Two concurrent sweeps (launchd StartInterval overlap, or a manual run racing
 # the timer) can BOTH pass the so-called "atomic claim" — `bd label add` is
 # idempotent and the post-claim verify only rejects in-flight/done — and then
 # sling the SAME story to two builders (the ga-8nu8x double-build). A whole-run
-# flock closes that window: only one sweep proceeds; a second exits cleanly.
+# lock closes that window: only one sweep proceeds; a second exits cleanly.
 #
-# flock is NOT in base macOS; it lives in /opt/homebrew/bin (on the launchd
-# plist PATH). If it is somehow unavailable we WARN and PROCEED WITHOUT the lock
-# rather than exit — silently disabling the whole dispatcher on a missing binary
-# would be far worse, and the durable-in-flight fix (#1) is the load-bearing
-# guard regardless; the lock is defense-in-depth.
-PILOT_LOCK="${TMPDIR:-/tmp}/pilot-dispatcher$(printf '%s' "$GC_CITY" | tr '/ ' '__').lock"
-if command -v flock >/dev/null 2>&1; then
-  exec 9>"$PILOT_LOCK"
-  if ! flock -n 9; then
-    log "Another Pilot sweep holds $PILOT_LOCK — backing off (single-instance guard)."
-    exit 0
+# PRIOR DESIGN (ga-2azzj): `exec 9>$LOCK; flock -n 9` held an exclusive flock on
+# fd 9 for the whole sweep. DEFECT (ga-7s0or, P0): fd 9 had NO close-on-exec, so
+# every gc/bd/sling child — and any long-lived daemon they (re)spawned, notably a
+# dolt sql-server or the slung builder session — INHERITED fd 9 and held the
+# flock for its ENTIRE life (5h+ observed: a dolt pid held the lock inode). Every
+# later sweep then logged "backing off" and dispatched ZERO: a silent, unbounded,
+# total dispatch deadlock independent of Dolt load (it would deadlock at 0% CPU).
+#
+# bash 3.2 (the launchd interpreter, /bin/bash) cannot set close-on-exec on a
+# numbered fd (`exec {var}>` auto-CLOEXEC is bash 4.1+), and closing fd 9 before
+# the sling would drop the guard mid-sweep. So we abandon the inheritable-fd
+# flock entirely for an fd-LESS lock that no child can ever hold open:
+#   • an atomic `mkdir` mutex for mutual exclusion (POSIX-atomic; no fd, no
+#     inheritance — a leaked fd cannot keep a directory "locked"), and
+#   • a heartbeat file whose MTIME, written at acquire, marks liveness.
+# A held lock whose heartbeat mtime is older than PILOT_LOCK_MAX_AGE is a
+# dead/zombie holder (a crashed sweep leaves the dir but stops refreshing it) and
+# is recovered automatically WITHOUT rm of any flock inode. PID-liveness is
+# deliberately NOT used (PID recycling = TOCTOU false-"alive", per ga-7s0or AC).
+# Recovery uses an atomic rename (`mv` of the stale dir aside) so two concurrent
+# recoverers can never BOTH proceed — only one rename of a given path can win;
+# the loser gets ENOENT and backs off (ga-7s0or AC3, no double-dispatch).
+PILOT_LOCK_DIR="${TMPDIR:-/tmp}/pilot-dispatcher$(printf '%s' "$GC_CITY" | tr '/ ' '__').lock.d"
+PILOT_LOCK_HB="$PILOT_LOCK_DIR/heartbeat"
+# A real sweep finishes in seconds; 600s (10 min) is a vast margin that still
+# reclaims a wedged holder within two launchd intervals.
+PILOT_LOCK_MAX_AGE="${PILOT_LOCK_MAX_AGE:-600}"
+PILOT_LOCK_TOKEN="$$:${RANDOM}${RANDOM}"
+
+# Age (seconds) of the heartbeat file; a huge number if it is missing.
+_lock_hb_age() {
+  local _mt _now
+  _now=$(date +%s)
+  _mt=$(stat -f %m "$PILOT_LOCK_HB" 2>/dev/null || stat -c %Y "$PILOT_LOCK_HB" 2>/dev/null || echo "")
+  [ -z "$_mt" ] && { echo 999999999; return; }
+  echo $(( _now - _mt ))
+}
+
+_lock_write_hb() { printf '%s\n' "$PILOT_LOCK_TOKEN" > "$PILOT_LOCK_HB" 2>/dev/null || true; }
+
+# Remove the lock dir only if WE still own it (token match) — never clobber a
+# peer that recovered our lock after we were (wrongly) judged stale.
+_release_pilot_lock() {
+  local _own
+  _own=$(head -n1 "$PILOT_LOCK_HB" 2>/dev/null || true)
+  [ "$_own" = "$PILOT_LOCK_TOKEN" ] && rm -rf "$PILOT_LOCK_DIR" 2>/dev/null
+  return 0
+}
+
+# Returns 0 if we own the lock, 1 if a LIVE sweep holds it (back off).
+_acquire_pilot_lock() {
+  if mkdir "$PILOT_LOCK_DIR" 2>/dev/null; then
+    _lock_write_hb
+    return 0
   fi
+  local _age
+  _age=$(_lock_hb_age)
+  if [ "$_age" -lt "$PILOT_LOCK_MAX_AGE" ]; then
+    return 1   # fresh heartbeat → a live sweep is running.
+  fi
+  # Stale holder. Atomically claim the recovery by renaming the dir aside; only
+  # one concurrent recoverer can win this rename (the rest get ENOENT).
+  local _reaped="${PILOT_LOCK_DIR}.reaping.${PILOT_LOCK_TOKEN}"
+  if mv "$PILOT_LOCK_DIR" "$_reaped" 2>/dev/null; then
+    rm -rf "$_reaped" 2>/dev/null || true
+    if mkdir "$PILOT_LOCK_DIR" 2>/dev/null; then
+      _lock_write_hb
+      log "Recovered STALE Pilot lock (heartbeat age ${_age}s ≥ ${PILOT_LOCK_MAX_AGE}s) — taking over (ga-7s0or)."
+      return 0
+    fi
+  fi
+  return 1   # lost the recovery race to a peer, or a fresh sweep beat us.
+}
+
+if _acquire_pilot_lock; then
+  trap '_release_pilot_lock' EXIT
 else
-  warn "flock not found — proceeding WITHOUT single-instance lock (relying on durable story:in-flight guard, ga-2azzj fix 1)."
+  log "Another Pilot sweep holds $PILOT_LOCK_DIR — backing off (single-instance guard)."
+  exit 0
 fi
 
 echo ""
