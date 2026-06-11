@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.supervisor-config-guard</string>
+
+  <!-- Supervisor config guard + spawn-outage auto-recovery (ga-h3w2y). Closes the
+       blind spot behind the ~1h town-wide outage of 2026-06-10: a rig with a
+       missing `path` in site.toml made the supervisor loop on
+       'validate rigs: rig "X": path is required' and NOTHING spawned town-wide
+       (reviewers + dogs stuck start-pending), with no signal but a silent outage.
+       RunAtLoad makes this a PRE-BOOT guard: it validates every rig's path at
+       boot/login (and every 60s after), and on a bad config it WAKES the Mayor +
+       notifies Athos loudly with the exact 'rig X sem path' — instead of letting
+       the supervisor degrade into an unexplained spawn-outage. It also detects the
+       init-failure loop at runtime, runs a diagnostic ladder, and attempts the
+       canonical `gc doctor --fix` for the known config cause. Polls 60s; silence =
+       healthy. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/supervisor-config-guard.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/supervisor-config-guard-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/supervisor-config-guard-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>

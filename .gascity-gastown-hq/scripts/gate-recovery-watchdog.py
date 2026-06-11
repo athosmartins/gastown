@@ -48,6 +48,7 @@ CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
 DISPATCH_LOG = os.path.join(CITY, ".gc/logs/quality-gate-dispatcher.log")
 PILOT_LOG = os.path.join(CITY, ".gc/logs/pilot-dispatcher.log")
 SUPERVISOR_LOG = "/Users/athos/.gc/supervisor.log"
+SITE_TOML = os.path.join(CITY, ".gc/site.toml")
 NOTIFY = "/Users/athos/.local/bin/notify"
 
 POLL_SEC = 60
@@ -64,6 +65,17 @@ TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 # "=== Dispatcher sweep complete: branch=<X> verdict=QUEUED (retry N/M, dead author) ==="
 SWEEP_QUEUED_RETRY_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) verdict=QUEUED \(retry")
 SWEEP_COMPLETE_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) verdict=")
+# supervisor init-failure loop (ga-h3w2y): a rig with no `path` in site.toml makes
+# the supervisor cycle "init failure #N" / "validate rigs: rig \"X\": path is
+# required" and NOTHING spawns town-wide. The supervisor.log lines carry no
+# [timestamp] prefix, so freshness is judged by the recent tail + a config cross-
+# check (the config is STILL broken now) to avoid firing on stale post-fix tails.
+SUP_INIT_FAIL_RE = re.compile(r"init failure #\d+")
+SUP_VALIDATE_RIGS_RE = re.compile(r"validate rigs:\s*(.+?)(?:\s+see:|\s*\(skipping\)|$)")
+SUP_INIT_FAIL_MIN = 2          # >=2 'init failure #' lines in the recent tail = active loop
+RIG_HEADER_RE = re.compile(r"^\s*\[\[\s*rig\s*\]\]\s*$")
+RIG_TABLE_RE = re.compile(r"^\s*\[")
+RIG_KV_RE = re.compile(r'^\s*([A-Za-z0-9_]+)\s*=\s*"([^"]*)"')
 
 
 def sh(args, timeout=20):
@@ -210,6 +222,83 @@ def dolt_instability():
     return len(DOLT_SIG.findall(tail))
 
 
+def _rig_paths_invalid():
+    """Return a short description of site.toml rig-path problems, or "" if valid.
+
+    Self-contained zero-dependency parse (no tomllib) so this works on the
+    plist's /usr/bin/python3. Mirrors the engine's `ValidateRigs` ("path is
+    required") plus a path-exists check. Used to cross-check the supervisor
+    init-failure tail: we only treat the loop as actionable while the config is
+    STILL broken — when the Mayor restores the path, this returns "" and the
+    signal clears (recovery)."""
+    rigs = []
+    cur = None
+    try:
+        with open(SITE_TOML, errors="replace") as f:
+            for line in f:
+                if RIG_HEADER_RE.match(line):
+                    if cur is not None:
+                        rigs.append(cur)
+                    cur = {"name": None, "path": None, "has_path": False}
+                    continue
+                if RIG_TABLE_RE.match(line):
+                    if cur is not None:
+                        rigs.append(cur)
+                    cur = None
+                    continue
+                if cur is None:
+                    continue
+                m = RIG_KV_RE.match(line)
+                if m:
+                    if m.group(1) == "name":
+                        cur["name"] = m.group(2)
+                    elif m.group(1) == "path":
+                        cur["path"] = m.group(2)
+                        cur["has_path"] = True
+        if cur is not None:
+            rigs.append(cur)
+    except Exception:
+        return ""  # unreadable config → don't fire (avoid false positive)
+    probs = []
+    for r in rigs:
+        name = r.get("name") or "(unnamed)"
+        p = r.get("path")
+        if not r.get("has_path") or not p:
+            probs.append("%s: sem path" % name)
+        elif not os.path.isdir(p):
+            probs.append("%s: path inexistente (%s)" % (name, p))
+    return "; ".join(probs)
+
+
+def supervisor_init_failure():
+    """Detect the ga-h3w2y spawn-outage: the supervisor cycling on init-failure
+    because a rig lacks a `path` in site.toml. Returns (reason, detail) when the
+    recent supervisor.log tail shows the loop AND the config is STILL invalid
+    now; else (None, ""). The config cross-check is what keeps a stale post-fix
+    tail (or a non-config init failure already handled elsewhere) from firing."""
+    try:
+        with open(SUPERVISOR_LOG, errors="replace") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 200000))
+            lines = f.read().splitlines()[-400:]
+    except Exception:
+        return (None, "")
+    fails = sum(1 for l in lines if SUP_INIT_FAIL_RE.search(l))
+    if fails < SUP_INIT_FAIL_MIN:
+        return (None, "")
+    invalid = _rig_paths_invalid()
+    if not invalid:
+        return (None, "")  # loop in tail but config valid now → resolved / not config
+    verr = ""
+    for l in reversed(lines):
+        m = SUP_VALIDATE_RIGS_RE.search(l)
+        if m:
+            verr = m.group(1).strip()
+            break
+    return ("supervisor init-failure loop (%s)" % (verr or "validate rigs"), invalid)
+
+
 def mayor_session():
     rs = sh(["gc", "session", "list", "--json"])
     if not rs or rs.returncode != 0:
@@ -323,6 +412,30 @@ def wake_mayor(reason, diag_path, dolt_hits, kind="gate"):
         sh(["gc", "session", "wake", mid], timeout=20)
         r = sh(["gc", "session", "nudge", mid, task], timeout=25)
         return r is not None and r.returncode == 0
+    if kind == "supervisor":
+        task = (
+            "🔧 ALERTA AUTOMÁTICO DO WATCHDOG — supervisor em INIT-FAILURE LOOP (spawn-outage town-wide). "
+            "Conserta agora, não escale pro Athos a menos que falhe.\n\n"
+            "O supervisor está ciclando em init-failure: %s. Config inválido detectado em site.toml: %s.\n"
+            "Diagnóstico: %s\n\n"
+            "Causa-raiz (incidente ga-h3w2y de 2026-06-10): um rig sem `path` no .gc/site.toml (esquecido numa "
+            "migração city.toml→site.toml) faz o supervisor falhar `validate rigs: rig \"X\": path is required` "
+            "e entrar em loop → NADA spawna town-wide (gate-reviewers + dogs presos em start-pending). "
+            "Achar isso à mão custou ~1h; quota/Dolt/bd-hooks foram pistas FALSAS.\n\n"
+            "CONSERTO (verificando entre os passos):\n"
+            "1. Confirme o rig culpado: `gc doctor --json | jq '.checks[] | select(.name==\"config-valid\")'` "
+            "ou `grep 'validate rigs' ~/.gc/supervisor.log | tail`.\n"
+            "2. Restaure o `path` do rig em .gc/site.toml — cada `[[rig]]` precisa de `name=` E "
+            "`path=\"/Users/athos/gt/<rig>\"` (o path TEM que existir no disco). NÃO invente; use o diretório canônico.\n"
+            "3. Re-valide com `gc doctor` (check config-valid verde) e dispare o supervisor: "
+            "`launchctl kickstart -k gui/$(id -u)/com.gascity.supervisor`.\n"
+            "4. Confirme: as sessões voltam a spawnar (saem de start-pending). "
+            "(O supervisor-config-guard já tenta `gc doctor --fix` sozinho; se a config exige um path que só você "
+            "sabe, este wake é pra você restaurá-lo.)\n"
+        ) % (reason, dolt_hits, diag_path)
+        sh(["gc", "session", "wake", mid], timeout=20)
+        r = sh(["gc", "session", "nudge", mid, task], timeout=25)
+        return r is not None and r.returncode == 0
     task = (
         "🔧 ALERTA AUTOMÁTICO DO WATCHDOG (gate-recovery-watchdog) — conserta agora, não escale pro Athos a menos que falhe.\n\n"
         "O gate parou de produzir vereditos. Motivo detectado: %s. "
@@ -361,8 +474,10 @@ def main():
   pilot_wakes = 0
   last_loop_wake = 0
   loop_wakes = 0
+  last_sup_wake = 0
+  sup_wakes = 0
 
-  print("[watchdog] gate+pilot watchdog started — wakes Mayor on gate-down OR pilot-jam OR head-of-line block", flush=True)
+  print("[watchdog] gate+pilot watchdog started — wakes Mayor on gate-down OR pilot-jam OR head-of-line block OR supervisor init-failure", flush=True)
 
   while True:
     try:
@@ -439,6 +554,31 @@ def main():
                        % (hb, hcount), 4)
                 print("[watchdog] woke Mayor for HEAD-OF-LINE (woke=%s) branch=%s count=%d diag=%s"
                       % (lwoke, hb, hcount, ldiag), flush=True)
+
+        # --- SUPERVISOR init-failure loop (closes the ga-h3w2y blind spot:
+        #     a rig with no path in site.toml → spawn-outage town-wide, ~1h to
+        #     find by hand). First-class durable signal; the proactive guard is
+        #     supervisor-config-guard, this is the always-on backstop. ---
+        sup_reason, sup_detail = supervisor_init_failure()
+        if sup_wakes > 0 and not sup_reason:
+            print("[watchdog] supervisor recovered (config valid, no init-failure loop) — resetting", flush=True)
+            notify("Supervisor voltou — config válido e spawn normalizado.", 3)
+            sup_wakes = 0
+        if sup_reason and (time.time() - last_sup_wake > WAKE_COOLDOWN_SEC):
+            sdiag = snapshot("%s | config inválido: %s" % (sup_reason, sup_detail), 0)
+            # 3rd positional carries the config-invalid detail for the kind=supervisor task
+            swoke = wake_mayor(sup_reason, sdiag, sup_detail, kind="supervisor")
+            last_sup_wake = time.time()
+            sup_wakes += 1
+            if sup_wakes >= ESCALATE_AFTER_WAKES:
+                notify("🚨 SUPERVISOR ainda em init-failure (spawn-outage town-wide) após o Mayor tentar (%dx): %s. Precisa de você. Diag: %s"
+                       % (sup_wakes, sup_detail, sdiag), 5)
+                print("[watchdog] ESCALATED to Athos (supervisor init-failure, %d wakes): %s" % (sup_wakes, sup_detail), flush=True)
+            else:
+                notify("Supervisor em init-failure (spawn-outage: %s) — Mayor acordado pra restaurar o path do rig. Você não precisa agir."
+                       % sup_detail, 4)
+                print("[watchdog] woke Mayor for SUPERVISOR (woke=%s) detail=%s diag=%s"
+                      % (swoke, sup_detail, sdiag), flush=True)
     except Exception as e:
         print("[watchdog] loop error (continuing): %r" % e, flush=True)
     time.sleep(POLL_SEC)
