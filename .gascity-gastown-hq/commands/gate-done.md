@@ -1,7 +1,7 @@
 ---
 description: Signal work ready for quality gate (writes durable marker; launchd guard picks it up within ~2 min)
 argument-hint: ""
-allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash(git log:*), Bash(git config:*), Bash(bd create:*), Bash(bd label:*)
+allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash(git log:*), Bash(git config:*), Bash(bd create:*), Bash(bd label:*), Bash(bd list:*), Bash(bd show:*), Bash(gc rig list:*)
 ---
 
 # Gate Done — Signal Work Ready for Quality Gate
@@ -86,14 +86,30 @@ fi
 
 echo "City DB path: $GC_CITY_PATH"
 
-# ga-dx5: PRIMARY resolution — extract bead_id from branch name convention.
+# ga-dx5/ga-owfll: PRIMARY resolution — extract bead_id from branch name convention.
 # Branch name is the canonical pointer to the owning STORY bead. Session-assigned
 # in_progress beads may include sling/task beads from the gate-dispatcher that are
 # NOT the story bead. If we pick the sling bead, the dispatcher strips story:in-flight
 # from the wrong bead → lane slot never frees. Branch name is always authoritative.
-# Pattern: <prefix>/<STORY_ID>-<desc> (e.g. fix/ga-dx5-my-fix → ga-dx5)
-BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \
-  | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
+# Two conventions:
+#   crew/<name>/<STORY_ID>[-desc]  — crew clone branches (e.g. crew/batista/wa-27jn).
+#                                    The bead id is the 3rd path segment's leading
+#                                    token. The generic regex below CANNOT match this
+#                                    form (it requires a trailing '-'), so crew
+#                                    submissions used to fall through to the session
+#                                    lookup and pick the wrong bead — ga-owfll.
+#   <prefix>/<STORY_ID>-<desc>     — builder convention (e.g. fix/ga-dx5-my-fix → ga-dx5)
+case "$BRANCH" in
+  crew/*/*)
+    _CREW_SEG=${BRANCH#crew/*/}
+    BEAD_ID=$(printf '%s\n' "$_CREW_SEG" \
+      | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,8}' | head -1 2>/dev/null || echo "")
+    ;;
+  *)
+    BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \
+      | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}' 2>/dev/null || echo "")
+    ;;
+esac
 
 # SECONDARY: if branch doesn't embed a bead ID (uncommon), fall back to the
 # session's in_progress bead that carries story:in-flight — that label is ONLY on
@@ -125,15 +141,41 @@ if [ -z "$BEAD_ID" ]; then
 fi
 AUTHOR="${GC_ALIAS:-${BEADS_ACTOR:-$(git config user.name)}}"
 BASE_COMMIT=$(git rev-parse origin/main 2>/dev/null || echo "unknown")
-# Derive rig from gc rig list (authoritative)
-RIG=$(gc --city "$GC_CITY_PATH" rig list --json 2>/dev/null \
-  | jq -r --arg cwd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" \
-      '.rigs[] | select(.path == $cwd) | .name' 2>/dev/null | head -1 || echo "")
-# Fallback: extract from GC_AGENT if gc rig list didn't match
+# Derive rig from gc rig list (authoritative).
+RIG_LIST_JSON=$(gc --city "$GC_CITY_PATH" rig list --json 2>/dev/null || echo '{}')
+CWD_TOP=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+
+# ga-owfll PRIMARY: the rig whose registered path == cwd OR is an ANCESTOR of cwd.
+# Crew members work in <rig>/crew/<name> — a SUBDIR of the registered rig path — so
+# the old EXACT match (.path == $cwd) never matched for them. Match by ancestry and
+# take the LONGEST (deepest) path to disambiguate any nested layout.
+RIG=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg cwd "$CWD_TOP" '
+    [ .rigs[] | select(($cwd == .path) or ($cwd | startswith(.path + "/"))) ]
+    | sort_by(.path | length) | last | .name // empty' 2>/dev/null || echo "")
+
+# ga-owfll FALLBACK 1: map the source bead's PREFIX to a rig (wa-27jn → wa →
+# whatsapp_automation). The bead id already encodes its owning rig.
 if [ -z "$RIG" ] || [ "$RIG" = "null" ]; then
-  RIG="${GC_AGENT%%/*}"
+  _BPFX="${BEAD_ID%%-*}"
+  if [ -n "$_BPFX" ] && [ "$_BPFX" != "$BEAD_ID" ]; then
+    RIG=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg p "$_BPFX" \
+      '.rigs[] | select(.prefix == $p or .name == $p) | .name' 2>/dev/null | head -1 || echo "")
+  fi
 fi
-if [ -z "$RIG" ] || [ "$RIG" = "$GC_AGENT" ]; then
+
+# ga-owfll FALLBACK 2: map the agent-name rig SUFFIX to a rig (batista-wa → wa →
+# whatsapp_automation). CRITICAL: we map the suffix THROUGH rig list — we never write
+# the raw agent name as the rig. The old `RIG="${GC_AGENT%%/*}"` fallback emitted
+# `rig: batista-wa` (an invalid rig) into the marker, stranding crew submissions.
+if [ -z "$RIG" ] || [ "$RIG" = "null" ]; then
+  _ASFX="${GC_AGENT##*-}"
+  if [ -n "$_ASFX" ] && [ "$_ASFX" != "$GC_AGENT" ]; then
+    RIG=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg p "$_ASFX" \
+      '.rigs[] | select(.prefix == $p or .name == $p) | .name' 2>/dev/null | head -1 || echo "")
+  fi
+fi
+
+if [ -z "$RIG" ] || [ "$RIG" = "null" ]; then
   RIG="unknown"
 fi
 
@@ -151,19 +193,49 @@ case "$BRANCH" in
     ;;
 esac
 
+# ga-owfll: record which DOLT STORE owns the source bead, independently of the
+# code-rig. The dispatcher closes source-bead in the rig's store by default
+# (BEAD_CITY=RIG_PATH); but framework/story beads live in HQ (gascity) even when the
+# code-rig is wa/ps/lx, so a rig-scoped close silently no-ops and the bead is left
+# open → re-dispatched ("source-bead rig-scoped fora do escopo HQ"). Probe HQ first
+# (GC_CITY_PATH is the gascity store), then the code-rig DB, and record the owning
+# rig so a store-aware consumer targets the right DB. Fail-soft: a store-aware
+# dispatcher probes independently, so we only WARN if neither store resolves it.
+BEAD_RIG=""
+if bd -C "$GC_CITY_PATH" show "$BEAD_ID" >/dev/null 2>&1; then
+  BEAD_RIG="gascity"
+else
+  _BEAD_RIG_PATH=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg r "$RIG" \
+    '.rigs[] | select(.name == $r) | .path' 2>/dev/null | head -1 || echo "")
+  if [ -n "$_BEAD_RIG_PATH" ] && bd -C "$_BEAD_RIG_PATH" show "$BEAD_ID" >/dev/null 2>&1; then
+    BEAD_RIG="$RIG"
+  fi
+fi
+if [ -z "$BEAD_RIG" ]; then
+  echo "Warning: source bead '$BEAD_ID' did not resolve in HQ or rig '$RIG' store."
+  echo "  Recording bead_rig=unknown; a store-aware dispatcher will probe the owner."
+  BEAD_RIG="unknown"
+fi
+
 echo "Branch:      $BRANCH"
 echo "Bead:        ${BEAD_ID:-<unknown>}"
 echo "Author:      $AUTHOR"
 echo "Base commit: $BASE_COMMIT"
 echo "Rig:         $RIG"
+echo "Bead rig:    $BEAD_RIG"
 ```
 
 Verify these values look correct before continuing.
 If this step aborts with "Cannot resolve owning story bead", name your branch
-`<prefix>/<bead-id>-<desc>` (e.g. `fix/ga-dx5-my-fix`) or ensure you have an
-in_progress bead with label `story:in-flight` assigned to you. If `Rig` shows
-`unknown`, the guard may not be able to find the source repository — verify you
-are running from inside a registered rig directory.
+`<prefix>/<bead-id>-<desc>` (e.g. `fix/ga-dx5-my-fix`), or — if you are crew working
+in a clone — `crew/<name>/<bead-id>[-desc]` (e.g. `crew/batista/wa-27jn`); or ensure
+you have an in_progress bead with label `story:in-flight` assigned to you. `Rig` is
+derived from the rig whose registered path contains your working directory, so crew
+clones at `<rig>/crew/<name>` resolve to their owning rig. If `Rig` shows `unknown`,
+the guard may not be able to find the source repository — verify you are running from
+inside a registered rig directory. `Bead rig` shows which Dolt store owns the source
+bead (HQ `gascity` vs the code-rig); it is recorded so the gate closes the bead in
+the correct store.
 
 ## Step 3: Create the ready-for-gate marker
 
@@ -178,11 +250,13 @@ MARKER_ID=$(bd -C "$GC_CITY_PATH" create \
   -l gate-status:ready \
   -l "branch:$BRANCH" \
   -l "source-bead:$BEAD_ID" \
+  -l "bead-rig:$BEAD_RIG" \
   -d "branch: $BRANCH
 bead_id: $BEAD_ID
 author: $AUTHOR
 base_commit: $BASE_COMMIT
 rig: $RIG
+bead_rig: $BEAD_RIG
 submitted_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --json 2>/dev/null | jq -r '.id // empty')
 
