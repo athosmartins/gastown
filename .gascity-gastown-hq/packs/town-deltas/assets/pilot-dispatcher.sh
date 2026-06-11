@@ -91,6 +91,43 @@ BIG_CRITERIA_THRESHOLD="${BIG_CRITERIA_THRESHOLD:-5}"
 # TTL for stuck pilot:dispatching claims (minutes). After this, Pilot recycles them.
 CLAIM_TTL_MINUTES="${CLAIM_TTL_MINUTES:-30}"
 
+# ── Dispatch-to-capacity (ga-rk5va) ───────────────────────────────────────────
+# When 1 (default), each lane dispatches to fill EVERY free slot in a single sweep
+# (looping pick→claim→sling until the lane is full or candidates are exhausted),
+# instead of the legacy one-dispatch-per-lane-per-sweep. This is the user's "máxima
+# lotação" goal: after a drain, 5 free small slots refill in ONE sweep, not ~5.
+# Set 0 to force the legacy single-pick-per-lane behavior.
+DISPATCH_TO_CAPACITY="${DISPATCH_TO_CAPACITY:-1}"
+
+# ── Dolt-saturation backoff (ga-rk5va adversarial constraint a) ────────────────
+# Dispatch-to-capacity multiplies bd/dolt shellouts per sweep (N× the load that
+# drove the fd-leak/CPU incidents). It MUST self-throttle when Dolt is already
+# hot, or it widens a wedged pipe. Before filling slots we probe Dolt health once;
+# if SATURATED we cap each lane to a single dispatch this sweep (== legacy safe
+# behavior, never worse than before). Between dispatches we re-check cheaply and
+# bail the moment Dolt crosses the ceiling. Saturation = server response latency
+# OR the live dolt-server process CPU% exceeds these ceilings. CPU baseline is
+# ~86-90% under normal load (per the gate-falsefail incident); 200 (= ~2 pegged
+# cores) is the documented danger zone, latency baseline is sub-second.
+PILOT_DOLT_LATENCY_MAX_MS="${PILOT_DOLT_LATENCY_MAX_MS:-2500}"
+PILOT_DOLT_CPU_MAX="${PILOT_DOLT_CPU_MAX:-200}"
+# TEST-ONLY seams (mirror PILOT_CITY_OVERRIDE): when set, the health probe uses
+# these instead of shelling out to `gc dolt health` / `ps`. Never set in prod.
+PILOT_DOLT_LATENCY_OVERRIDE_MS="${PILOT_DOLT_LATENCY_OVERRIDE_MS:-}"
+PILOT_DOLT_CPU_OVERRIDE="${PILOT_DOLT_CPU_OVERRIDE:-}"
+
+# ── Stale in-flight slot correction (ga-rk5va adversarial constraint c) ────────
+# A story:in-flight bead normally occupies a builder slot. But a session can hang
+# (the 16h-stuck-session bug) — zero state-transitions for hours while the bead
+# still reads in-flight. Such a bead is a PHANTOM occupant: it pins a slot that no
+# one is working, so capacity math is wrong (slots sit empty). We treat a bead
+# whose last transition (updated_at) is older than this many hours as NOT a live
+# occupant — it stops consuming a slot, freeing it for OTHER pending work. The
+# stale bead itself is NOT re-dispatched (it keeps story:in-flight and stays
+# excluded from candidate queries), so this can never double-dispatch the same
+# story; it only stops an abandoned build from starving the lane forever.
+PILOT_STUCK_INFLIGHT_HOURS="${PILOT_STUCK_INFLIGHT_HOURS:-2}"
+
 # Dry-run mode: show what WOULD happen, make zero changes.
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -249,6 +286,74 @@ fi
 echo ""
 log "=== Pilot sweep start (DRY_RUN=${DRY_RUN}) ==="
 
+# ── Dolt-saturation probe (ga-rk5va constraint a) ─────────────────────────────
+# One health probe per sweep seeds DOLT_PID + DOLT_LATENCY_MS; the cheap CPU
+# recheck used inside the dispatch loop reuses DOLT_PID via `ps` (sub-second, no
+# extra Dolt round-trips). All probes FAIL-SAFE: if Dolt health can't be read we
+# treat it as SATURATED (back off), because adding dispatch load to an unknown /
+# wedged data plane is exactly the incident this constraint guards against.
+DOLT_PID=""
+DOLT_LATENCY_MS=""
+
+# _dolt_probe — populate DOLT_PID + DOLT_LATENCY_MS once. Honors the test seams.
+_dolt_probe() {
+  if [ -n "$PILOT_DOLT_LATENCY_OVERRIDE_MS" ]; then
+    DOLT_LATENCY_MS="$PILOT_DOLT_LATENCY_OVERRIDE_MS"
+    DOLT_PID="TEST"
+    return 0
+  fi
+  local _h
+  # `gc dolt health` bounds each per-db probe internally; cap total wall time so a
+  # wedged server can't stall the sweep. A timeout IS evidence of saturation.
+  # NOTE: `gc dolt health` does NOT accept the global `--city` flag (unlike
+  # `rig list` / `session list`) — passing it errors with "unknown flag: --city"
+  # and the probe returns empty → fail-safe saturated → the feature would be
+  # permanently throttled off. Scope the city via the GC_CITY env var instead
+  # (the leaf walks up from cwd / honors GC_CITY); this is the form that works.
+  _h=$(GC_CITY="$GC_CITY" timeout 15 gc dolt health --json 2>/dev/null || echo "")
+  DOLT_LATENCY_MS=$(printf '%s' "$_h" | jq -r '.server.latency_ms // empty' 2>/dev/null || echo "")
+  DOLT_PID=$(printf '%s' "$_h" | jq -r '.server.pid // empty' 2>/dev/null || echo "")
+}
+
+# _dolt_cpu — echo integer CPU% of the live dolt-server pid (cheap). Honors seam.
+# Always returns 0 (an empty echo means "no signal") so a missing pid / dead ps
+# can never trip `set -e` in the caller's command substitution.
+_dolt_cpu() {
+  if [ -n "$PILOT_DOLT_CPU_OVERRIDE" ]; then printf '%s' "$PILOT_DOLT_CPU_OVERRIDE"; return 0; fi
+  if [ -z "$DOLT_PID" ] || [ "$DOLT_PID" = "TEST" ]; then printf ''; return 0; fi
+  # ps %cpu can exceed 100 (per-core); strip the fraction to an int for -gt tests.
+  ps -o %cpu= -p "$DOLT_PID" 2>/dev/null | tr -d ' ' | cut -d. -f1 || true
+  return 0
+}
+
+# _dolt_saturated — return 0 (saturated → back off) / 1 (healthy). FAIL-SAFE:
+# missing latency AND missing cpu (probe failed) → saturated.
+_dolt_saturated() {
+  local _lat _cpu _have=0
+  _lat="$DOLT_LATENCY_MS"
+  _cpu="$(_dolt_cpu)"
+  if [ -n "$_lat" ] && [ "$_lat" -ge 0 ] 2>/dev/null; then
+    _have=1
+    [ "$_lat" -gt "$PILOT_DOLT_LATENCY_MAX_MS" ] 2>/dev/null && return 0
+  fi
+  if [ -n "$_cpu" ] && [ "$_cpu" -ge 0 ] 2>/dev/null; then
+    _have=1
+    [ "$_cpu" -gt "$PILOT_DOLT_CPU_MAX" ] 2>/dev/null && return 0
+  fi
+  # No usable signal at all → fail-safe to saturated (conservative backoff).
+  [ "$_have" -eq 0 ] && return 0
+  return 1
+}
+
+_dolt_probe
+if _dolt_saturated; then
+  PILOT_DOLT_SATURATED_AT_START=1
+  warn "Dolt SATURATED at sweep start (latency=${DOLT_LATENCY_MS:-?}ms pid=${DOLT_PID:-?} cpu=$(_dolt_cpu)% thresholds: lat>${PILOT_DOLT_LATENCY_MAX_MS} cpu>${PILOT_DOLT_CPU_MAX}). Throttling to 1 dispatch/lane this sweep (ga-rk5va backoff)."
+else
+  PILOT_DOLT_SATURATED_AT_START=0
+  log "Dolt health OK (latency=${DOLT_LATENCY_MS:-?}ms cpu=$(_dolt_cpu)%) — dispatch-to-capacity armed."
+fi
+
 # ── Step 0: TTL recovery — release stale pilot:dispatching claims (ga-2azzj) ───
 # A pilot:dispatching label means a dispatch is (or was) in progress. We may only
 # RECYCLE it when it is genuinely STALE — i.e. the dispatcher crashed mid-run.
@@ -338,16 +443,42 @@ done <<< "$_ttl_rig_paths"
 # Count in-flight beads per lane by reading their lane:big / lane:small labels.
 # Beads without a lane label (manually dispatched) count as small (conservative).
 
-IN_FLIGHT_JSON=$(bd -C "$GC_CITY" list --json --all \
+IN_FLIGHT_RAW_JSON=$(bd -C "$GC_CITY" list --json --all \
   -l "story:in-flight" \
   2>/dev/null || echo "[]")
 
+IN_FLIGHT_RAW_TOTAL=$(echo "$IN_FLIGHT_RAW_JSON" | jq 'length' 2>/dev/null || echo "0")
+
+# ── Stale in-flight slot correction (ga-rk5va constraint c) ───────────────────
+# Drop PHANTOM occupants — beads whose last state-transition (updated_at) is older
+# than PILOT_STUCK_INFLIGHT_HOURS — from the slot count. A hung builder (the
+# 16h-stuck-session bug) leaves a bead reading in-flight while no work happens; if
+# it kept consuming a slot the lane would starve forever (slots sit empty = the
+# exact "sub-max throughput" complaint). FAIL-SAFE: a bead with a missing or
+# unparseable updated_at is KEPT as a live occupant (never free a slot we cannot
+# evaluate → never over-dispatch). The stale bead is NOT re-dispatched here — it
+# keeps story:in-flight and stays out of every candidate query — so freeing its
+# slot only lets OTHER pending work flow; it can never double-dispatch that story.
+_NOW_EPOCH=$(date +%s)
+_STUCK_CUTOFF=$(( _NOW_EPOCH - PILOT_STUCK_INFLIGHT_HOURS * 3600 ))
+IN_FLIGHT_JSON=$(echo "$IN_FLIGHT_RAW_JSON" | jq --argjson cutoff "$_STUCK_CUTOFF" '
+  [ .[]
+    | ( ((.updated_at // "") | if . == "" then null else (try fromdateiso8601 catch null) end) ) as $e
+    | select($e == null or $e > $cutoff) ]' 2>/dev/null || echo "$IN_FLIGHT_RAW_JSON")
+# Defensive: if the filter produced nothing usable, fall back to the raw set.
+[ -z "$IN_FLIGHT_JSON" ] && IN_FLIGHT_JSON="$IN_FLIGHT_RAW_JSON"
+
 IN_FLIGHT_TOTAL=$(echo "$IN_FLIGHT_JSON" | jq 'length' 2>/dev/null || echo "0")
+STALE_INFLIGHT=$(( IN_FLIGHT_RAW_TOTAL - IN_FLIGHT_TOTAL ))
+[ "$STALE_INFLIGHT" -lt 0 ] 2>/dev/null && STALE_INFLIGHT=0
+if [ "$STALE_INFLIGHT" -gt 0 ] 2>/dev/null; then
+  warn "Stale in-flight: ${STALE_INFLIGHT} bead(s) untouched > ${PILOT_STUCK_INFLIGHT_HOURS}h (hung builder?) — NOT counted as live occupants, freeing their slot(s) for pending work (ga-rk5va constraint c). Stale ids: $(echo "$IN_FLIGHT_RAW_JSON" | jq -r --argjson cutoff "$_STUCK_CUTOFF" '[.[] | ((.updated_at // "") | if . == "" then null else (try fromdateiso8601 catch null) end) as $e | select($e != null and $e <= $cutoff) | .id] | join(",")' 2>/dev/null || echo "?")"
+fi
 
 IN_FLIGHT_BIG=$(echo "$IN_FLIGHT_JSON" | jq '[.[] | select((.labels // []) | contains(["lane:big"]))] | length' 2>/dev/null || echo "0")
 IN_FLIGHT_SMALL=$((IN_FLIGHT_TOTAL - IN_FLIGHT_BIG))
 
-log "In-flight: total=$IN_FLIGHT_TOTAL  small=$IN_FLIGHT_SMALL/${MAX_SMALL}  big=$IN_FLIGHT_BIG/${MAX_BIG}"
+log "In-flight: live=$IN_FLIGHT_TOTAL (raw=$IN_FLIGHT_RAW_TOTAL stale=$STALE_INFLIGHT)  small=$IN_FLIGHT_SMALL/${MAX_SMALL}  big=$IN_FLIGHT_BIG/${MAX_BIG}"
 
 SMALL_SLOTS=$((MAX_SMALL - IN_FLIGHT_SMALL))
 BIG_SLOTS=$((MAX_BIG - IN_FLIGHT_BIG))
@@ -1235,23 +1366,96 @@ No human review required."
   fi
 }
 
-# ── Step 4: Dispatch into available lane slots ────────────────────────────────
-# Dispatch small pick (if small lane has room and we have a small candidate).
-# Dispatch big pick (if big lane has room and we have a big candidate).
-# Each is independent — a full big lane does NOT block the small dispatch.
+# ── Step 4: Dispatch-to-capacity per lane (ga-rk5va) ──────────────────────────
+# Fill EVERY free slot in each lane this sweep — not one pick per lane. After a
+# drain this refills all 5 small slots in ONE sweep (~the user's "máxima lotação")
+# instead of ~5 sweeps. Each lane is independent: a full big lane never blocks
+# small dispatches. Caps (MAX_SMALL/MAX_BIG), dedup, and the per-bead atomic claim
+# inside dispatch_one are all preserved, so a lane can never exceed its cap.
+#
+# Throttle (constraint a): when Dolt was SATURATED at sweep start, or the operator
+# disabled the feature, each lane caps at a single dispatch (== legacy behavior —
+# never adds load beyond the old code). Between dispatches we re-check Dolt CPU
+# cheaply and bail the instant it crosses the ceiling, so dispatch-to-capacity
+# can never WIDEN a wedged pipe (the fd-leak/CPU-incident class this guards).
 
 DISPATCHED=0
 
-if [ "$SMALL_PICK" != "null" ] && [ "$SMALL_SLOTS" -gt "0" ]; then
-  dispatch_one "$SMALL_PICK" "small" "$ALL_CANDIDATES_TIER" && DISPATCHED=$((DISPATCHED + 1)) || true
+# dispatch_lane <lane> <candidates_json> <free_slots>
+# Loops pick→dispatch→remove until the lane is full or candidates are exhausted.
+# Mutates the global DISPATCHED (NOT via command-substitution — the script's
+# top-level `exec >> LOG 2>&1` means $(...) would swallow dispatch_one's log lines).
+dispatch_lane() {
+  local lane="$1" pool="$2" slots="$3"
+  local cap="$slots"
+  # Constraint a: saturated-at-start OR feature disabled → throttle to 1 (legacy).
+  if [ "$DISPATCH_TO_CAPACITY" != "1" ] || [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ]; then
+    cap=1
+  fi
+
+  # Hard iteration ceiling: at most one attempt per candidate plus a small margin.
+  # Defense-in-depth so a (near-impossible) jq pool-removal failure — which would
+  # otherwise let a perpetually-skipping pick be re-tried forever — can never spin.
+  local _iter=0 _iter_max
+  _iter_max=$(( $(echo "$pool" | jq 'length' 2>/dev/null || echo "0") + 2 ))
+
+  local filled=0
+  while [ "$filled" -lt "$cap" ] && [ "$slots" -gt 0 ]; do
+    _iter=$((_iter + 1))
+    if [ "$_iter" -gt "$_iter_max" ]; then
+      warn "Lane $lane: iteration guard hit (${_iter}>${_iter_max}) — stopping loop (pool-removal anomaly?)."
+      break
+    fi
+    local n
+    n=$(echo "$pool" | jq 'length' 2>/dev/null || echo "0")
+    [ "${n:-0}" -le 0 ] 2>/dev/null && break
+
+    local pick pick_id
+    pick=$(_top_candidate "$pool")
+    { [ -z "$pick" ] || [ "$pick" = "null" ]; } && break
+    pick_id=$(echo "$pick" | jq -r '.id // ""' 2>/dev/null || echo "")
+    [ -z "$pick_id" ] && break
+
+    # Remove from the IN-MEMORY pool BEFORE dispatch: a skipped pick (lost claim,
+    # builder-mutex defer, race) must not be re-picked (no infinite loop), and
+    # DRY_RUN — which makes zero state changes — still advances through the pool.
+    pool=$(echo "$pool" | jq --arg id "$pick_id" '[.[] | select(.id != $id)]' 2>/dev/null || echo "$pool")
+
+    # Only a SUCCESSFUL dispatch consumes a slot; a skip leaves the slot free and
+    # simply moves to the next candidate. dispatch_one is the atomic-claim owner.
+    if dispatch_one "$pick" "$lane" "$ALL_CANDIDATES_TIER"; then
+      filled=$((filled + 1))
+      slots=$((slots - 1))
+      DISPATCHED=$((DISPATCHED + 1))
+    fi
+
+    # Mid-loop Dolt backoff (constraint a): if work remains, re-check the cheap CPU
+    # signal and stop the moment Dolt is hot, so we never drive a saturated server.
+    if [ "$filled" -lt "$cap" ] && [ "$slots" -gt 0 ]; then
+      local _more
+      _more=$(echo "$pool" | jq 'length' 2>/dev/null || echo "0")
+      if [ "${_more:-0}" -gt 0 ] 2>/dev/null && _dolt_saturated; then
+        warn "Dolt saturated mid-sweep (cpu=$(_dolt_cpu)% lat=${DOLT_LATENCY_MS:-?}ms) — stopping $lane loop after ${filled} dispatch(es) (ga-rk5va backoff)."
+        break
+      fi
+    fi
+  done
+
+  log "Lane $lane: dispatched ${filled} this sweep (cap=${cap}, slots_left=${slots})."
+}
+
+# Small + big lanes are independent. Dispatch the full pool for each (the loop is
+# a no-op when a lane has no slots or no candidates).
+if [ "$SMALL_SLOTS" -gt "0" ] && [ "$SMALL_COUNT" -gt "0" ]; then
+  dispatch_lane "small" "$SMALL_CANDIDATES" "$SMALL_SLOTS"
 fi
 
-if [ "$BIG_PICK" != "null" ] && [ "$BIG_SLOTS" -gt "0" ]; then
-  dispatch_one "$BIG_PICK" "big" "$ALL_CANDIDATES_TIER" && DISPATCHED=$((DISPATCHED + 1)) || true
+if [ "$BIG_SLOTS" -gt "0" ] && [ "$BIG_COUNT" -gt "0" ]; then
+  dispatch_lane "big" "$BIG_CANDIDATES" "$BIG_SLOTS"
 fi
 
 if [ "$DISPATCHED" -eq "0" ]; then
-  log "No dispatches this sweep (lane slots may have been won by concurrent process)."
+  log "No dispatches this sweep (lane slots may have been won by a concurrent process, or all picks skipped)."
 fi
 
-log "=== Pilot sweep complete: dispatched=$DISPATCHED (small_slots=$SMALL_SLOTS big_slots=$BIG_SLOTS) ==="
+log "=== Pilot sweep complete: dispatched=$DISPATCHED (small_slots=$SMALL_SLOTS big_slots=$BIG_SLOTS dolt_saturated_at_start=${PILOT_DOLT_SATURATED_AT_START:-0}) ==="

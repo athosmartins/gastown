@@ -146,7 +146,9 @@ case "$args" in
   *story:approved*pilot:dispatching*)
     printf '%s' "${FAKE_STALE_JSON:-[]}" ;;   # Step-0 stale-claim query
   *--all*)
-    printf '[]' ;;                            # in-flight count → lanes free
+    # in-flight count → lanes free by default. ga-rk5va: a scenario may inject
+    # FAKE_INFLIGHT_JSON to exercise the stale-occupant slot correction.
+    printf '%s' "${FAKE_INFLIGHT_JSON:-[]}" ;;
   *"-t bug"*)
     if [ -n "${FAKE_BUGS_JSON:-}" ]; then
       # ga-2azzj: explicit fixture injection (used by the non-dry in-flight test).
@@ -275,6 +277,43 @@ run_real_dispatch() { # FAKE_SUPPRESS_INFLIGHT
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
+
+# Runs a DRY dispatch with the ga-rk5va dispatch-to-capacity feature exercised:
+# Dolt health is forced via the override seams so the gate is deterministic (no
+# live `gc dolt health` / `ps`). Default fixture = the two small bug candidates.
+#   $1 = PILOT_DOLT_CPU_OVERRIDE   (<=200 healthy, >200 saturated)
+#   $2 = FAKE_INFLIGHT_JSON        (in-flight beads for the stale-occupant test)
+#   $3 = DISPATCH_TO_CAPACITY      (default 1)
+#   $4 = FAKE_BUGS_JSON            (override the default 2-bug fixture)
+run_capacity() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE="${1:-10}" \
+    FAKE_INFLIGHT_JSON="${2:-[]}" \
+    DISPATCH_TO_CAPACITY="${3:-1}" \
+    FAKE_BUGS_JSON="${4:-}" \
+    FAKE_BLOCKED_IDS="" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# Five small, unblocked bug candidates — the exact AC fixture ("5 free small slots
+# + 5 ready candidates dispatches all 5").
+FIVE_SMALL_BUGS='[
+  {"id":"tt-c1","title":"cap bug 1","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}},
+  {"id":"tt-c2","title":"cap bug 2","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}},
+  {"id":"tt-c3","title":"cap bug 3","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:03Z","metadata":{}},
+  {"id":"tt-c4","title":"cap bug 4","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:04Z","metadata":{}},
+  {"id":"tt-c5","title":"cap bug 5","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:05Z","metadata":{}}
+]'
 
 echo "pilot-dispatcher.selftest — dependency-blocking filter (ga-5ew)"
 
@@ -497,6 +536,105 @@ if echo "$LOG8" | grep -q "Lane picks — small: tt-depblk"; then
   ok "dispatched tt-depblk once its explicit dep was satisfied (auto-clear)"
 else
   bad "did not pick tt-depblk after its explicit dep closed"
+fi
+
+# ── Scenario 9: dispatch-to-capacity fills ALL free slots in one sweep (ga-rk5va)
+# Two small bug candidates (tt-blkd, tt-unblk), 5 free small slots, Dolt healthy →
+# BOTH must dispatch in a single sweep (the user's "máxima lotação"), not one.
+echo "Scenario 9: healthy Dolt + 2 candidates + free slots → dispatch BOTH in one sweep"
+LOG9="$(run_capacity 10)"
+
+if echo "$LOG9" | grep -q "Dolt health OK"; then
+  ok "Dolt probed healthy via override seam (dispatch-to-capacity armed)"
+else
+  bad "did not arm dispatch-to-capacity on a healthy Dolt"
+fi
+
+if echo "$LOG9" | grep -q "Lane small: dispatched 2 this sweep"; then
+  ok "dispatched BOTH small candidates in ONE sweep (dispatch-to-capacity)"
+else
+  bad "did NOT fill both slots in one sweep (expected 'Lane small: dispatched 2')"
+fi
+
+# ── Scenario 9b: the literal AC — 5 free small slots + 5 ready candidates → 5 ───
+echo "Scenario 9b: 5 free slots + 5 candidates → dispatch ALL 5 in one sweep, never more"
+LOG9B="$(run_capacity 10 "[]" 1 "$FIVE_SMALL_BUGS")"
+if echo "$LOG9B" | grep -q "Lane small: dispatched 5 this sweep"; then
+  ok "filled all 5 small slots in a single sweep (AC satisfied)"
+else
+  bad "did not dispatch all 5 (expected 'Lane small: dispatched 5')"
+fi
+if echo "$LOG9B" | grep -qE "Lane small: dispatched ([6-9]|[1-9][0-9]+) this sweep"; then
+  bad "REGRESSION: exceeded the small-lane cap of 5"
+else
+  ok "never exceeded the small-lane cap (MAX_SMALL=5)"
+fi
+
+# ── Scenario 10: Dolt saturation throttles to one dispatch per lane ────────────
+# Same 2 candidates + free slots, but CPU override > ceiling → SATURATED at start.
+# Must throttle to the legacy single dispatch (never add load to a hot data plane).
+echo "Scenario 10: saturated Dolt → throttle to 1 dispatch/lane (constraint a backoff)"
+LOG10="$(run_capacity 300)"
+
+if echo "$LOG10" | grep -q "Dolt SATURATED at sweep start"; then
+  ok "detected Dolt saturation at sweep start"
+else
+  bad "did not detect saturation (CPU override 300 > 200 ceiling)"
+fi
+
+if echo "$LOG10" | grep -q "Lane small: dispatched 1 this sweep"; then
+  ok "throttled to a SINGLE dispatch under saturation (legacy-safe)"
+else
+  bad "did not throttle to 1 under saturation (capacity loop ignored the backoff)"
+fi
+
+if echo "$LOG10" | grep -q "Lane small: dispatched 2 this sweep"; then
+  bad "REGRESSION: filled both slots while Dolt was saturated (added load to a hot server)"
+else
+  ok "did NOT fill multiple slots under saturation"
+fi
+
+# ── Scenario 10b: feature switch off → legacy single-pick even when healthy ────
+echo "Scenario 10b: DISPATCH_TO_CAPACITY=0 → single dispatch even on a healthy Dolt"
+LOG10B="$(run_capacity 10 "[]" 0)"
+if echo "$LOG10B" | grep -q "Lane small: dispatched 1 this sweep"; then
+  ok "feature-off honored (legacy one-per-lane)"
+else
+  bad "DISPATCH_TO_CAPACITY=0 did not fall back to single dispatch"
+fi
+
+# ── Scenario 11: stale in-flight bead is NOT counted as a live slot occupant ───
+# One fresh + one stale (>2h untouched) in-flight bead. The stale one must be
+# dropped from the slot count (16h-stuck-session bug) — freeing its slot — while
+# the fresh one still occupies. It must NOT be re-dispatched (just not counted).
+echo "Scenario 11: stale in-flight (>2h) freed from slot count (constraint c)"
+NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+STALE_ISO="$(date -u -v-3H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '3 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+INFLIGHT="[{\"id\":\"if-fresh\",\"labels\":[\"story:in-flight\"],\"updated_at\":\"$NOW_ISO\"},{\"id\":\"if-stale\",\"labels\":[\"story:in-flight\"],\"updated_at\":\"$STALE_ISO\"}]"
+LOG11="$(run_capacity 10 "$INFLIGHT")"
+
+if echo "$LOG11" | grep -q "Stale in-flight: 1 bead"; then
+  ok "detected the stale in-flight occupant"
+else
+  bad "did not detect the stale in-flight occupant"
+fi
+
+if echo "$LOG11" | grep -q "live=1 (raw=2 stale=1)"; then
+  ok "slot count corrected: 1 live occupant, 1 stale freed"
+else
+  bad "slot count not corrected (expected 'live=1 (raw=2 stale=1)')"
+fi
+
+if echo "$LOG11" | grep -q "Stale ids: if-stale"; then
+  ok "named the stale bead (if-stale)"
+else
+  bad "did not name the stale bead id"
+fi
+
+if echo "$LOG11" | grep -q "Stale ids:.*if-fresh"; then
+  bad "REGRESSION: treated the FRESH bead as stale (would over-free slots)"
+else
+  ok "fresh bead correctly kept as a live occupant"
 fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
