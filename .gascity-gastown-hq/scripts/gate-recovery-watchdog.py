@@ -35,6 +35,23 @@ DETECTS (head-of-line stale-branch block — the ga-hl0gq signature, 2026-06-10)
   Detected here in ~2 sweeps (~6min). The permanent dispatcher-level auto-skip is
   ga-q3ig2; this wake is the detection+recovery bridge until it lands.
 
+DETECTS (orphaned queued marker — the gt-mqkwj signature, 2026-06-12):
+  - a gate-status:queued marker created during a dispatcher OUTAGE (a gap with no
+    'sweep complete' lines) whose gate_run was dropped, so on recovery the
+    dispatcher LEAPFROGS it for newer markers — it never gets dispatched, its
+    source bead sits in_progress forever, and the pool reconciler re-spawns a
+    worker onto already-finished work ~6x. INVISIBLE to all three checks above:
+    not 'dispatching' (stuck_dispatching blind), no TIMEOUT (recent_timeouts
+    blind), and not head-of-line (the queue drains for OTHER branches, so
+    headofline_stall sees verdicts advancing for those).
+  Signature (orphaned_queued_marker): a queued marker that is (a) older than
+    ORPHAN_MIN_AGE_SEC, (b) NEVER mentioned in the recent dispatcher log, while
+    (c) the dispatcher is actively draining (newest 'sweep complete' is fresh)
+    and (d) a strictly-NEWER queued marker's branch IS mentioned — proof the
+    dispatcher leapfrogged the older one. The leapfrog proof (d) is what keeps a
+    normal FIFO backlog behind a slow run — many markers older than the newest
+    completed sweep, but none actually skipped — from false-firing.
+
 ON DETECT:
   1. snapshot diagnostics to /tmp/gate-watchdog-diag-<ts>.txt
   2. SPAWN a dedicated repair agent: route the runbook (referencing the
@@ -71,6 +88,9 @@ PILOT_JAM_WINDOW_SEC = 900     # 2+ sweep-aborts within 15min = Pilot jammed on 
 PILOT_STALL_SEC = 2400         # pilot log silent >40min = Pilot dead/not sweeping
 HEADOFLINE_MIN_SWEEPS = 2      # >=2 consecutive QUEUED-retry sweeps on the SAME branch = head-of-line block
 HEADOFLINE_LOG_FRESH_SEC = 600 # ignore if dispatcher log is staler than this (that's ENGINE-STALL's job)
+ORPHAN_LOG_FRESH_SEC = 600     # dispatcher log must be live (process still writing) — else ENGINE-STALL's job
+ORPHAN_DRAIN_FRESH_SEC = 1200  # newest COMPLETED sweep within 20min = dispatcher actively draining (not wedged on one run)
+ORPHAN_MIN_AGE_SEC = 1800      # a queued marker must sit >=30min unmentioned before we call it skipped (rules out a just-created marker)
 WAKE_COOLDOWN_SEC = 1200       # don't dispatch a new repair cycle more than once per 20min (per kind)
 ESCALATE_AFTER_WAKES = 2       # after 2 unresolved repair-cycles, page Athos 🚨
 DOLT_SIG = re.compile(r"connection reset|bead store closed|unexpected EOF|invalid connection|provider-health registry unavailable")
@@ -78,6 +98,7 @@ TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 # "=== Dispatcher sweep complete: branch=<X> verdict=QUEUED (retry N/M, dead author) ==="
 SWEEP_QUEUED_RETRY_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) verdict=QUEUED \(retry")
 SWEEP_COMPLETE_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) verdict=")
+MARKER_BRANCH_RE = re.compile(r"^branch:(.+)$")  # marker label form: branch:crew/<rig>-<name>/<bead>  (gt-mqkwj)
 # supervisor init-failure loop (ga-h3w2y): a rig with no `path` in site.toml makes
 # the supervisor cycle "init failure #N" / "validate rigs: rig \"X\": path is
 # required" and NOTHING spawns town-wide. The supervisor.log lines carry no
@@ -236,6 +257,118 @@ def headofline_stall():
     if branch and count >= HEADOFLINE_MIN_SWEEPS:
         return (branch, count)
     return (None, 0)
+
+
+def _iso_epoch(s):
+    """Parse a bd ISO-8601 UTC timestamp ('2026-06-12T23:09:12Z') to a true Unix
+    epoch, comparable with log_ts_epoch() (which returns the true epoch of a
+    LOCAL dispatcher-log timestamp). Both are absolute Unix epochs, so they
+    compare directly across the timezone difference. Returns None on failure."""
+    if not s:
+        return None
+    try:
+        dt = datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")
+        return dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
+def _queued_markers():
+    """[(id, branch, created_epoch), ...] for every gate-status:queued marker.
+    Returns [] on any error (fail-safe: no markers → no orphan fire)."""
+    r = sh(["bd", "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",
+            "-l", "gate-status:queued", "--json"], timeout=25)
+    if not r or r.returncode != 0:
+        return []
+    try:
+        rows = json.loads(r.stdout)
+    except Exception:
+        return []
+    out = []
+    for row in rows or []:
+        branch = None
+        for lb in (row.get("labels") or []):
+            m = MARKER_BRANCH_RE.match(lb)
+            if m:
+                branch = m.group(1)
+                break
+        out.append((row.get("id"), branch, _iso_epoch(row.get("created_at"))))
+    return out
+
+
+def _dispatcher_log_state(tail=3000):
+    """(sweep_complete_epochs, log_text, log_fresh) for the dispatcher log.
+
+    sweep_complete_epochs: every 'sweep complete' timestamp in the tail (used to
+      judge whether the dispatcher is actively DRAINING vs wedged on one run).
+    log_text: the joined tail (scanned for branch mentions — substring match).
+    log_fresh: the log file was written within ORPHAN_LOG_FRESH_SEC (process alive)."""
+    try:
+        fresh = time.time() - os.path.getmtime(DISPATCH_LOG) <= ORPHAN_LOG_FRESH_SEC
+        with open(DISPATCH_LOG) as f:
+            lines = f.readlines()[-tail:]
+    except Exception:
+        return ([], "", False)
+    epochs = []
+    for l in lines:
+        if "sweep complete" in l:
+            e = log_ts_epoch(l)
+            if e:
+                epochs.append(e)
+    return (epochs, "".join(lines), fresh)
+
+
+def _detect_orphan_markers(markers, sweep_epochs, log_text, now):
+    """Pure core of orphaned_queued_marker() (separated for the selftest).
+
+    Returns the orphaned queued markers as [(id, branch, age_sec), ...], oldest
+    first. A marker is an orphan when ALL hold:
+      (drain) the dispatcher is actively draining — the newest 'sweep complete'
+              is within ORPHAN_DRAIN_FRESH_SEC. If the last completed sweep is
+              stale, the dispatcher is wedged on its CURRENT run (a different
+              failure mode: timeout / drained-reviewer / engine-stall), not
+              leapfrogging — so we stay silent.
+      (a)     the marker has sat queued >= ORPHAN_MIN_AGE_SEC (not just created).
+      (b)     its branch is NEVER mentioned in the recent dispatcher log (zero
+              dispatch attempts — its gate_run was dropped during the outage).
+      (d)     a strictly-NEWER queued marker's branch IS mentioned — PROOF the
+              dispatcher leapfrogged this older one. This is the guard that
+              distinguishes a true orphan from a normal FIFO backlog stuck behind
+              a slow run: in a healthy backlog the OLDEST unmentioned marker is
+              simply next-up and no newer marker is being worked ahead of it."""
+    if not sweep_epochs:
+        return []
+    if now - max(sweep_epochs) > ORPHAN_DRAIN_FRESH_SEC:
+        return []  # dispatcher not actively draining → not this failure mode
+    valid = [(mid, b, c) for (mid, b, c) in markers if mid and b and c]
+    valid.sort(key=lambda m: m[2])  # oldest first
+    orphans = []
+    for (mid, branch, created) in valid:
+        if now - created < ORPHAN_MIN_AGE_SEC:
+            continue
+        if branch in log_text:
+            continue  # mentioned → being / already dispatched, not orphaned
+        leapfrogged = any(c2 > created and b2 != branch and b2 in log_text
+                          for (_m2, b2, c2) in valid)
+        if not leapfrogged:
+            continue
+        orphans.append((mid, branch, int(now - created)))
+    return orphans
+
+
+def orphaned_queued_marker():
+    """Detect a gate-status:queued marker whose gate_run was dropped during a
+    dispatcher outage and is now being leapfrogged (gt-mqkwj). Returns
+    (marker_id, branch, age_sec) for the OLDEST orphan, else (None, None, 0).
+    Fail-safe: any gather error returns no orphan (never wakes spuriously)."""
+    sweep_epochs, log_text, log_fresh = _dispatcher_log_state()
+    if not log_fresh or not sweep_epochs:
+        return (None, None, 0)  # log not live → dead engine, ENGINE-STALL's job
+    orphans = _detect_orphan_markers(_queued_markers(), sweep_epochs, log_text, time.time())
+    if not orphans:
+        return (None, None, 0)
+    orphans.sort(key=lambda o: o[2], reverse=True)  # oldest (largest age) first
+    return orphans[0]
 
 
 def dolt_instability():
@@ -473,6 +606,39 @@ def repair_runbook(reason, diag_path, dolt_hits, kind="gate"):
             "(O supervisor-config-guard já tenta `gc doctor --fix` sozinho; se a config exige um path que só você "
             "sabe, este wake é pra você restaurá-lo.)\n"
         ) % (reason, dolt_hits, diag_path)
+    if kind == "gate-orphan":
+        # `reason` carries the orphan branch; `dolt_hits` carries the marker id.
+        return (
+            "Um marker gate-status:queued ÓRFÃO foi detectado: branch %s (marker %s). "
+            "O gate_run dele foi DERRUBADO durante uma janela de outage do dispatcher (um buraco "
+            "sem linhas 'sweep complete' no log), então na recuperação o dispatcher PULA esse marker "
+            "antigo e despacha os mais novos — ele nunca roda, o bead de origem fica in_progress pra "
+            "SEMPRE, e o reconciler re-spawna worker em cima de trabalho já feito ~6x (incidente gt-mqkwj, "
+            "irmão de [[ga-hl0gq-gate-stall-detection-fix]]).\n\n"
+            "DIAGNÓSTICO (confirme que É órfão antes de agir):\n"
+            "1. Veja o marker: `bd -C . show %s --json | jq '.[0]|{id,status,created_at,labels}'` "
+            "(deve estar gate-status:queued, antigo, com source-bead:<X>).\n"
+            "2. Confirme ZERO menções do branch no log: "
+            "`grep -c '%s' .gc/logs/quality-gate-dispatcher.log` → se 0, o dispatcher nunca tentou despachá-lo.\n"
+            "3. Confirme que o dispatcher está DRENANDO outros branches (há 'sweep complete' recente p/ branches "
+            "DIFERENTES) — senão NÃO é órfão, é o run atual travado (outro modo de falha; não mexa).\n\n"
+            "CONSERTO — DECIDA pelo estado do branch:\n"
+            "  (a) Branch AINDA quer mergear (código não landou): RE-QUEUE o MESMO marker p/ o dispatcher "
+            "redespachá-lo com um run fresco — remova e re-adicione gate-status:queued "
+            "(`bd -C . update %s --remove-label gate-status:queued && bd -C . update %s --add-label gate-status:queued`) "
+            "pra refrescar o created_at e tirá-lo da cabeça órfã da fila. NÃO duplique o marker. "
+            "Confirme no próximo sweep que o branch aparece sendo despachado.\n"
+            "  (b) Branch JÁ mergeou / é zumbi (código já está em origin/main): SUPERSEDE — feche o marker "
+            "(`bd -C . close %s --reason 'orphan run dropped; work already landed (gt-mqkwj)'`) E feche o "
+            "source-bead in_progress (veja o label source-bead:<X> do marker; `bd -C . close <X> --reason "
+            "'merged; orphan marker superseded (gt-mqkwj)'`) pra PARAR o reconciler de re-spawnar worker.\n"
+            "3. O objetivo é tirar o marker órfão do limbo: ou ele roda (re-queue) ou some (supersede+close) — "
+            "em ambos os casos o bead de origem deixa de ficar preso in_progress.\n\n"
+            "Diagnóstico salvo em: %s\n"
+            "Se resolver, avise (notify -p 3). Só acione o Athos (notify 🚨 -p 5) se NÃO conseguir.\n"
+            "(Fix permanente seria o dispatcher detectar markers sem gate_run e re-criar o run — esta detecção+reparo "
+            "é a ponte até lá.)"
+        ) % (reason, dolt_hits, dolt_hits, reason, dolt_hits, dolt_hits, dolt_hits, diag_path)
     return (
         "O gate parou de produzir vereditos. Motivo detectado: %s. "
         "Linhas de instabilidade do Dolt no supervisor.log: %d.\n"
@@ -571,8 +737,10 @@ def main():
   loop_wakes = 0
   last_sup_wake = 0
   sup_wakes = 0
+  last_orphan_wake = 0
+  orphan_wakes = 0
 
-  print("[watchdog] gate+pilot watchdog started — spawns a repair agent (Mayor=fallback) on gate-down OR pilot-jam OR head-of-line block OR supervisor init-failure", flush=True)
+  print("[watchdog] gate+pilot watchdog started — spawns a repair agent (Mayor=fallback) on gate-down OR pilot-jam OR head-of-line block OR supervisor init-failure OR orphaned queued marker", flush=True)
 
   while True:
     try:
@@ -673,6 +841,34 @@ def main():
                        % (sup_detail, show), 4)
                 print("[watchdog] repair dispatch for SUPERVISOR (%s) detail=%s diag=%s"
                       % (show, sup_detail, sdiag), flush=True)
+
+        # --- ORPHANED queued marker (closes the gt-mqkwj blind spot: a marker
+        #     whose gate_run was dropped in an outage is leapfrogged forever →
+        #     bead stuck in_progress → reconciler re-spawns a worker ~6x). The
+        #     leapfrog proof keeps a normal FIFO backlog from false-firing. ---
+        orphan_id, orphan_branch, orphan_age = orphaned_queued_marker()
+        # recovery: a PASS landed after our last orphan dispatch (the re-queued
+        # marker ran, or the queue otherwise moved) → reset
+        if orphan_wakes > 0 and lp and lp > last_orphan_wake:
+            print("[watchdog] orphaned marker cleared (Gate PASSED after repair dispatch) — resetting", flush=True)
+            notify("Marker órfão resolvido — gate voltou a passar (gt-mqkwj).", 3)
+            orphan_wakes = 0
+        if orphan_id and (time.time() - last_orphan_wake > WAKE_COOLDOWN_SEC):
+            odiag = snapshot("orphaned queued marker %s (branch %s, %dmin sem despacho)"
+                             % (orphan_id, orphan_branch, orphan_age // 60), 0)
+            # reason=branch (title), 3rd positional carries the marker id for the runbook
+            ohow = spawn_repair_agent(orphan_branch, odiag, orphan_id, kind="gate-orphan")
+            last_orphan_wake = time.time()
+            orphan_wakes += 1
+            if orphan_wakes >= ESCALATE_AFTER_WAKES:
+                notify("🚨 MARKER ÓRFÃO ainda preso (%s, branch %s) após %dx de reparo autônomo. Precisa de você. Diag: %s"
+                       % (orphan_id, orphan_branch, orphan_wakes, odiag), 5)
+                print("[watchdog] ESCALATED to Athos (orphan marker %s, %d cycles)" % (orphan_id, orphan_wakes), flush=True)
+            else:
+                notify("Marker órfão (run derrubado num outage): %s branch %s, %dmin sem despacho — %s pra re-queue/supersede. Você não precisa agir."
+                       % (orphan_id, orphan_branch, orphan_age // 60, ohow), 4)
+                print("[watchdog] repair dispatch for ORPHAN (%s) marker=%s branch=%s age=%ds diag=%s"
+                      % (ohow, orphan_id, orphan_branch, orphan_age, odiag), flush=True)
     except Exception as e:
         print("[watchdog] loop error (continuing): %r" % e, flush=True)
     time.sleep(POLL_SEC)
