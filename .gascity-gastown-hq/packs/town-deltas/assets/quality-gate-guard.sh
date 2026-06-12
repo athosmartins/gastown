@@ -922,6 +922,67 @@ fi
 
 log "Authoritative author: $AUTHOR"
 
+# ── Resolve the store that OWNS the source bead (gt-gwng6) ────────────────────
+# Step 5b below clears the source bead's assignee and strips its gc.routed_to to
+# stop the dog pool from re-matching it mid-gate. Those writes MUST target the
+# store that actually contains $BEAD_ID. Rig-native beads (wa-*, ps-*, lx-*) live
+# in their RIG's own Dolt DB, NOT the HQ store — `bd -C "$GC_CITY"` (HQ) silently
+# no-ops on them, so the assignee never clears and the reconciler re-spawns pool
+# workers infinitely (wa-nr8o/wa-32fq/wa-tnl5 churned 5x-15x; the guard also
+# re-dispatched duplicate gate runs — wa-tnl5 had 4 markers, 2 running). ga-e7zk7
+# fixed only the dog-side re-claim, NOT this guard leg. Mirror the dispatcher's
+# ga-qw7y6 resolution: resolve RIG_PATH from the marker rig (+ bead-prefix /
+# trailing-segment fallbacks), then probe which store actually owns the bead.
+# UNLIKE the dispatcher, resolution failure here is NON-FATAL — the detach is
+# best-effort (set -euo pipefail discipline below), so we never abort the sweep;
+# resolve_bead_city's prefix heuristic still picks the most-likely store, and a
+# wrong guess only leaves the bead attached — exactly the pre-fix behavior, never
+# worse.
+RIG_PATH=""
+RIG_LIST_JSON=$(gc --city "$GC_CITY" rig list --json 2>/dev/null || echo '{}')
+if [ -n "$RIG" ]; then
+  RIG_PATH=$(echo "$RIG_LIST_JSON" \
+    | jq -r --arg r "$RIG" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
+fi
+# Compound/crew rig fallback (rig=mila-wa) → bead-id prefix is authoritative.
+if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$BEAD_ID" ]; then
+  _bid_prefix="${BEAD_ID%%-*}"
+  RIG_PATH=$(echo "$RIG_LIST_JSON" \
+    | jq -r --arg r "$_bid_prefix" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
+fi
+# Trailing-segment fallback: mila-wa → wa.
+if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$RIG" ] && printf '%s' "$RIG" | grep -q '-'; then
+  _rig_tail="${RIG##*-}"
+  RIG_PATH=$(echo "$RIG_LIST_JSON" \
+    | jq -r --arg r "$_rig_tail" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
+fi
+[ -d "$RIG_PATH" ] || RIG_PATH=""   # never hand a non-existent dir to resolve_bead_city
+
+# resolve_bead_city <bead-id> — echo the store dir whose Dolt DB owns <bead-id>.
+# Probes RIG_PATH first (rig-native beads), then GC_CITY (HQ). A store "owns" the
+# bead iff `bd -C <store> show` yields a record with non-empty .status; a
+# not-found probe returns {"error":...} (no .status → skip). Falls back to a
+# bead-id prefix heuristic (ga-* → HQ; else rig) only when NEITHER store resolves
+# (transient Dolt hiccup). Mirrors quality-gate-dispatcher.sh:resolve_bead_city.
+resolve_bead_city() {
+  local bead="$1" store st
+  [ -z "$bead" ] && { echo "$GC_CITY"; return 0; }
+  for store in "${RIG_PATH:-}" "$GC_CITY"; do
+    [ -z "$store" ] && continue
+    st=$(bd -C "$store" show "$bead" --json 2>/dev/null \
+      | jq -r 'if type=="array" then (.[0] // {}) else . end | .status // empty' 2>/dev/null)
+    if [ -n "$st" ]; then echo "$store"; return 0; fi
+  done
+  case "$bead" in
+    ga-*) echo "$GC_CITY" ;;
+    *)    echo "${RIG_PATH:-$GC_CITY}" ;;
+  esac
+}
+BEAD_CITY="$(resolve_bead_city "$BEAD_ID")"
+if [ "$BEAD_CITY" != "$GC_CITY" ]; then
+  log "  gt-gwng6: source bead $BEAD_ID resolves to store $BEAD_CITY (NOT HQ $GC_CITY) — cross-store detach corrected."
+fi
+
 # ── Step 5b (ga-e7zk7): detach source bead from the dog pool — gate owns it now ──
 # Why HERE (after Step 5), not before it: Step 5 derives the self-review-exclusion
 # author from the source bead's record, and its FIRST-CHOICE signal is the bead's
@@ -956,15 +1017,17 @@ log "Authoritative author: $AUTHOR"
 # is what the gate and delivery use to find it, so detaching is safe. Best-effort,
 # never fatal (set -euo pipefail discipline).
 if [ -n "$BEAD_ID" ]; then
-  if bd -C "$GC_CITY" assign "$BEAD_ID" "" 2>/dev/null; then
-    log "  detached source bead $BEAD_ID from dog pool (cleared assignee — ga-e7zk7)"
+  # gt-gwng6: target $BEAD_CITY (the bead's OWNING store), not $GC_CITY (HQ).
+  # On a rig-native bead these are different stores; HQ-targeted writes no-op.
+  if bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null; then
+    log "  detached source bead $BEAD_ID from dog pool (cleared assignee in $BEAD_CITY — ga-e7zk7/gt-gwng6)"
   else
-    log "  WARN: could not clear assignee on source bead $BEAD_ID (non-fatal — ga-e7zk7)"
+    log "  WARN: could not clear assignee on source bead $BEAD_ID in $BEAD_CITY (non-fatal — ga-e7zk7)"
   fi
   # Strip the metadata-keyed pool route (no-op in the current sling-bead model,
   # where the source bead carries no gc.routed_to; covers the legacy direct-route
   # model where it did). Guarded so a missing key never aborts the sweep.
-  bd -C "$GC_CITY" update "$BEAD_ID" --unset-metadata gc.routed_to -q 2>/dev/null || true
+  bd -C "$BEAD_CITY" update "$BEAD_ID" --unset-metadata gc.routed_to -q 2>/dev/null || true
 fi
 
 # ── Step 6: Create gate-run tracking bead ─────────────────────────────────────
