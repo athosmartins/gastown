@@ -69,6 +69,19 @@ SESSION_ROT_SEC = 7200         # ephemeral worker active+frozen > 2h = rotting
 REPAIR_COOLDOWN_SEC = 1200     # per-kind: at most one repair cycle per 20min
 GLOBAL_SPAWN_COOLDOWN_SEC = 300  # never spawn two repair agents back-to-back (anti-swarm)
 ESCALATE_AFTER = 2             # after N unresolved cycles of a kind, page Athos 🚨
+# Anti-flap hysteresis (ga-vym2m / ga-hwhtt). The gate-merge check flapped: it fired
+# on a single momentary gap (no `Gate PASSED` in the exact 30min window at the instant
+# of the poll) and RECOVERED on the very next tick — proven by every historical spawn in
+# the launchd log being immediately followed by `gate-merge recovered — resetting`. The
+# gate was draining the whole time (slow under Dolt CPU 247%, ~12min/run), not stalled.
+# Require the SAME kind to be detected on CONFIRM_TICKS consecutive ticks before spawning;
+# a stall that clears within one poll never spawns a repair dog (AC1).
+CONFIRM_TICKS = 2              # consecutive detections required before a repair-spawn
+# A heartbeat-spawned repair dog carries this signature in its session title (from the
+# `--title-hint "reparo heartbeat: ..."` at spawn). Used as a restart-resilient fallback
+# to recognise our own live repair dogs when the in-memory tracked-id set was lost to a
+# process restart. Specific enough not to match normal pool dogs ("gastown.dog-N").
+REPAIR_DOG_TITLE_RE = re.compile(r"reparo\s+heartbeat", re.I)
 
 # ── log-line patterns (verified against the live dispatchers) ─────────────────
 TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
@@ -214,21 +227,34 @@ def pilot_dispatch_stall(now=None):
 # ── CHECK B: Gate not merging under demand (with live-review guard) ───────────
 def _fresh_review_in_progress(lines, now):
     """True if the gate is legitimately mid-flight: a Verdicts poll younger than
-    REVIEW_FRESH_SEC, or a 'proceeding to merge' line, appears recently in the tail.
-    This is the guard that keeps a single honest long review from tripping the alarm."""
-    for l in reversed(lines[-40:]):
+    REVIEW_FRESH_SEC, a 'proceeding to merge' line, or a partial verdict (G>0) appears
+    recently. This is the guard that keeps a single honest long review — or a slow run
+    that is still making progress under Dolt load — from tripping the alarm.
+
+    ga-vym2m: scan by TIMESTAMP, not a fixed 40-line tail. Under Dolt CPU saturation the
+    dispatcher logs many headroom-defer / retry lines per sweep, so the in-flight review's
+    last Verdicts poll routinely scrolls past a 40-line window — which made the guard miss
+    a live review and the check false-fire. Walk the recent tail and consider every line
+    whose own timestamp is within the freshness horizon; partial verdicts (G>0) recently
+    received are themselves proof the run is progressing (verdicts rising X/3, not stuck)."""
+    for l in reversed(lines):
+        e = log_ts_epoch(l)
+        # Stop once we walk past the freshness horizon — lines are chronological, so
+        # anything older cannot make the review "fresh" and bounds the scan.
+        if e is not None and now - e > REVIEW_FRESH_SEC:
+            break
         if GATE_MERGING in l:
-            e = log_ts_epoch(l)
             if e and now - e < REVIEW_FRESH_SEC:
                 return True
         vm = VERDICTS_RE.search(l)
         if vm:
+            got = int(vm.group(1))
             elapsed = int(vm.group(3))
-            e = log_ts_epoch(l)
-            # the poll line is recent AND the review's own elapsed is under its timeout
-            if e and now - e < POLL_SEC * 2 and elapsed < REVIEW_FRESH_SEC:
+            # A recent poll under its own timeout → review legitimately running. A recent
+            # poll that has already received >=1 verdict → run is progressing (draining),
+            # not stalled, even if its elapsed is large under Dolt-hot slowness.
+            if e and now - e < POLL_SEC * 2 and (elapsed < REVIEW_FRESH_SEC or got > 0):
                 return True
-            return False  # most-recent verdict poll is stale/over-timeout → not fresh
     return False
 
 
@@ -309,7 +335,42 @@ def session_list():
     return data if isinstance(data, list) else []
 
 
-def rotting_sessions(now=None, self_name=None):
+def live_repair_dogs(sessions, tracked_ids):
+    """Identifiers of heartbeat-spawned repair dogs that are still ALIVE (ga-vym2m).
+
+    A repair dog is "ours and live" when it is a non-closed gastown.dog session that
+    either (a) was spawned by us this process lifetime — its id/session_name is in the
+    in-memory tracked_ids set, or (b) carries the `reparo heartbeat` title signature (the
+    restart-resilient fallback for when tracked_ids was lost to a process restart).
+
+    This is the durable break in the feedback loop: time-based cooldowns alone cannot stop
+    a SECOND repair dog from being spawned while the FIRST is still booting/working — and
+    under the very Dolt saturation that triggers the false alarm, `gc prime` boots slowly,
+    so a 20min cooldown routinely expires before the prior dog finishes. Spawning while a
+    sibling is live is exactly the load-amplifying loop ga-hwhtt describes. Reads the
+    runtime session list (NOT Dolt), so it stays safe when the data plane is sick."""
+    out = []
+    for s in sessions or []:
+        if s.get("closed"):
+            continue
+        if s.get("template") != DOG_TEMPLATE:
+            continue
+        if s.get("state") in ("closed", "exited", "dead", "stopped"):
+            continue
+        ident = s.get("id") or s.get("session_name") or s.get("name") or ""
+        name = s.get("session_name") or s.get("name") or ""
+        title = s.get("title") or ""
+        is_tracked = bool(tracked_ids) and (
+            ident in tracked_ids or name in tracked_ids
+            or s.get("id") in tracked_ids or s.get("name") in tracked_ids)
+        is_signature = bool(REPAIR_DOG_TITLE_RE.search(title))
+        if is_tracked or is_signature:
+            if ident:
+                out.append(ident)
+    return out
+
+
+def rotting_sessions(now=None, self_name=None, sessions=None):
     """List of (agent, age_sec) for ephemeral worker sessions that are active but frozen
     (last_active older than SESSION_ROT_SEC). Excludes attached/closed sessions, this
     process's own session, and non-ephemeral templates (crew is the crew-hang-detector's
@@ -317,7 +378,8 @@ def rotting_sessions(now=None, self_name=None):
     now = now if now is not None else time.time()
     self_name = self_name or os.environ.get("GC_SESSION_NAME") or os.environ.get("GC_ALIAS")
     out = []
-    for s in session_list():
+    sessions = sessions if sessions is not None else session_list()
+    for s in sessions:
         if s.get("closed") or s.get("attached"):
             continue
         if s.get("template") not in EPHEMERAL_WORKER_TEMPLATES:
@@ -399,19 +461,45 @@ def repair_runbook(kind, reason):
     return body
 
 
+def _parse_spawned_id(r):
+    """Best-effort extraction of the new session id/name from `gc session new --json`
+    output, tolerant of several envelope shapes. Returns a string id or None — the live
+    sibling guard's primary signal is this id, so a parse miss degrades gracefully to the
+    title-signature fallback rather than breaking suppression."""
+    if r is None or r.returncode != 0 or not (r.stdout or "").strip():
+        return None
+    try:
+        data = json.loads(r.stdout)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        node = data.get("session") if isinstance(data.get("session"), dict) else data
+        for k in ("id", "session_name", "name", "session_id"):
+            v = node.get(k)
+            if isinstance(v, str) and v:
+                return v
+    return None
+
+
 def spawn_repair_agent(kind, reason, diag_path):
     """PRIMARY recovery (ga-afytf mechanism): route the runbook to the gastown.dog pool
     AND spawn a dog directly so recovery doesn't depend on the demand reconciler the
-    stall may have wedged. Returns True if the repair bead was routed."""
+    stall may have wedged.
+
+    Returns the spawned dog's session id/name (str) on success so the caller can track it
+    as a live sibling (ga-vym2m), the literal string "routed" if the bead routed but the
+    spawned id could not be parsed (still a success — the title signature will catch the
+    dog), or None if routing itself failed."""
     title = "🔧 REPARO AUTÔNOMO heartbeat (%s): %s" % (kind, reason[:80])
     payload = (title + "\n\n" + REPAIR_HEADER + repair_runbook(kind, reason)
                + "\nDiagnóstico salvo em: %s\n" % diag_path)
     r = sh(["gc", "sling", DOG_TEMPLATE, "--stdin", "--json"], stdin=payload, timeout=45)
     routed = r is not None and r.returncode == 0
-    if routed:
-        sh(["gc", "session", "new", DOG_TEMPLATE, "--no-attach",
-            "--title-hint", "reparo heartbeat: " + reason[:50]], timeout=45)
-    return routed
+    if not routed:
+        return None
+    nr = sh(["gc", "session", "new", DOG_TEMPLATE, "--no-attach", "--json",
+             "--title-hint", "reparo heartbeat: " + reason[:50]], timeout=45)
+    return _parse_spawned_id(nr) or "routed"
 
 
 def snapshot(kind, reason):
@@ -438,14 +526,17 @@ def notify(msg, prio):
 
 
 def new_state():
-    """Fresh per-kind recovery state: last spawn epoch + unresolved-cycle counter."""
-    return {k: {"last_spawn": 0.0, "cycles": 0}
+    """Fresh per-kind recovery state: last spawn epoch, unresolved-cycle counter, and the
+    consecutive-detection counter (`pending`) that drives the anti-flap hysteresis."""
+    return {k: {"last_spawn": 0.0, "cycles": 0, "pending": 0}
             for k in ("pilot", "gate-merge", "durable", "session-rot")}
 
 
-def detect(now):
+def detect(now, sessions=None):
     """Run all four checks; return a list of (kind, reason) findings. Pure detection —
-    no side effects — so it is straightforward to unit-test."""
+    no side effects — so it is straightforward to unit-test. `sessions` is the already
+    fetched runtime session list (passed in so the per-tick fetch is shared with the
+    live-sibling guard); None means fetch on demand."""
     findings = []
     r = pilot_dispatch_stall(now)
     if r:
@@ -456,7 +547,7 @@ def detect(now):
     r = durable_landing_fail(now)
     if r:
         findings.append(("durable", r))
-    rot = rotting_sessions(now)
+    rot = rotting_sessions(now, sessions=sessions)
     if rot:
         reason = "; ".join("%s congelada há %dmin" % (lbl, age // 60)
                            for lbl, _name, age in rot)
@@ -464,30 +555,73 @@ def detect(now):
     return findings
 
 
-def run_tick(now, state, last_global_spawn):
-    """One evaluation cycle: detect, reset recovered kinds, and fire rate-limited
-    repair-spawns. Returns the updated last_global_spawn epoch. All spawn/notify/snapshot
-    go through module functions so a test can monkeypatch them."""
-    findings = detect(now)
+def run_tick(now, state, last_global_spawn, tracked=None):
+    """One evaluation cycle: detect, reset recovered kinds, and fire repair-spawns gated by
+    anti-flap hysteresis (ga-vym2m), a live-sibling guard, and the per-kind/global
+    cooldowns. Returns the updated last_global_spawn epoch. `tracked` is a mutable set of
+    live repair-dog ids carried across ticks by the caller (pruned + extended here). All
+    spawn/notify/snapshot/session_list go through module functions so a test can
+    monkeypatch them."""
+    if tracked is None:
+        tracked = set()
+    sessions = session_list()
+    findings = detect(now, sessions)
     fired = {k for k, _ in findings}
 
-    # recovery: a kind that previously alerted but is now clear resets its counter.
+    # Prune the tracked set to repair dogs still alive, and learn the full live set
+    # (tracked ids + title-signature, restart-resilient). One live sibling suppresses ALL
+    # new spawns this tick — the hard guarantee of "at most 1 recovery-dog alive" (AC2)
+    # and the durable break in the load-amplifying feedback loop (AC3).
+    live = live_repair_dogs(sessions, tracked)
+    tracked.clear()
+    tracked.update(live)
+
+    # recovery: a kind that previously alerted OR was mid-confirmation but is now clear
+    # resets both counters. A kind that recovers before confirming never spawned — exactly
+    # the historical flapping case (detected at tick T, recovered at T+1).
     for kind, st in state.items():
-        if kind not in fired and st["cycles"] > 0:
-            print("[heartbeat] %s recovered — resetting" % kind, flush=True)
-            if kind in ("pilot", "gate-merge"):
-                notify("Fluxo recuperado (%s)." % kind, 3)
+        if kind not in fired and (st["cycles"] > 0 or st["pending"] > 0):
+            if st["cycles"] > 0:
+                print("[heartbeat] %s recovered — resetting" % kind, flush=True)
+                if kind in ("pilot", "gate-merge"):
+                    notify("Fluxo recuperado (%s)." % kind, 3)
+            else:
+                print("[heartbeat] %s cleared before confirmation (flap suppressed)"
+                      % kind, flush=True)
             st["cycles"] = 0
+            st["pending"] = 0
 
     for kind, reason in findings:
         st = state[kind]
-        # per-kind cooldown AND global anti-swarm cooldown (AC5)
+        # Anti-flap hysteresis (AC1): require CONFIRM_TICKS consecutive detections. A stall
+        # that clears within one poll (the gate was slow-but-draining, not stuck) never
+        # reaches the spawn path.
+        st["pending"] += 1
+        if st["pending"] < CONFIRM_TICKS:
+            print("[heartbeat] %s detected (%d/%d) — awaiting confirmation: %s"
+                  % (kind, st["pending"], CONFIRM_TICKS, reason), flush=True)
+            continue
+        # Live-sibling guard (AC2/AC3): never run two repair dogs at once.
+        if live:
+            print("[heartbeat] %s confirmed but a repair dog is still alive (%s) — "
+                  "suppressing spawn (anti feedback-loop)" % (kind, ",".join(live)),
+                  flush=True)
+            continue
+        # per-kind cooldown AND global anti-swarm cooldown
         if now - st["last_spawn"] <= REPAIR_COOLDOWN_SEC:
             continue
         if now - last_global_spawn <= GLOBAL_SPAWN_COOLDOWN_SEC:
             continue
         diag = snapshot(kind, reason)
-        routed = spawn_repair_agent(kind, reason, diag)
+        spawned = spawn_repair_agent(kind, reason, diag)
+        if not spawned:
+            print("[heartbeat] %s spawn FAILED to route — will retry next tick" % kind,
+                  flush=True)
+            continue
+        # Track the new dog so the live-sibling guard suppresses further spawns until it
+        # finishes — including for OTHER kinds later in this same tick.
+        tracked.add(spawned)
+        live = list(tracked)
         st["last_spawn"] = now
         last_global_spawn = now
         st["cycles"] += 1
@@ -499,19 +633,21 @@ def run_tick(now, state, last_global_spawn):
         else:
             notify("Pipeline parado (%s) — agente de reparo despachado. "
                    "Você não precisa agir." % kind, 3)
-            print("[heartbeat] repair spawned kind=%s routed=%s reason=%s diag=%s"
-                  % (kind, routed, reason, diag), flush=True)
+            print("[heartbeat] repair spawned kind=%s id=%s reason=%s diag=%s"
+                  % (kind, spawned, reason, diag), flush=True)
     return last_global_spawn
 
 
 def main():
     state = new_state()
+    tracked = set()           # live repair-dog ids, carried across ticks (ga-vym2m)
     last_global_spawn = 0.0
     print("[heartbeat] pipeline throughput heartbeat started — flow-under-demand + "
-          "durable-landing-FAIL + session-rot; rate-limited repair-spawn", flush=True)
+          "durable-landing-FAIL + session-rot; anti-flap hysteresis + live-sibling guard "
+          "+ rate-limited repair-spawn", flush=True)
     while True:
         try:
-            last_global_spawn = run_tick(time.time(), state, last_global_spawn)
+            last_global_spawn = run_tick(time.time(), state, last_global_spawn, tracked)
         except Exception as e:
             print("[heartbeat] loop error (continuing): %r" % e, flush=True)
         time.sleep(POLL_SEC)
