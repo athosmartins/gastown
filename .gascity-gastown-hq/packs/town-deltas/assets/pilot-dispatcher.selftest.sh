@@ -151,6 +151,10 @@ case "$args" in
     esac ;;
   *story:approved*pilot:dispatching*)
     printf '%s' "${FAKE_STALE_JSON:-[]}" ;;   # Step-0 stale-claim query
+  *"-l story:in-flight -l pilot:dispatched"*)
+    # ga-v3z4z: Step-0c never-started detector query. Distinct from the slot query
+    # (single -l) and from candidate queries (--exclude-label, never -l).
+    printf '%s' "${FAKE_NEVERSTARTED_JSON:-[]}" ;;
   *--all*)
     # in-flight count → lanes free by default. ga-rk5va: a scenario may inject
     # FAKE_INFLIGHT_JSON to exercise the stale-occupant slot correction.
@@ -277,6 +281,31 @@ run_step0() { # FAKE_STALE_JSON
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
     FAKE_STALE_JSON="$1" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# Runs Step-0c never-started recovery (ga-v3z4z) with an injected in-flight set.
+# Branch existence is faked via PILOT_TEST_BRANCH_BEADS (hermetic — no real git).
+#   $1 = FAKE_NEVERSTARTED_JSON   (beads from the story:in-flight+pilot:dispatched query)
+#   $2 = PILOT_TEST_BRANCH_BEADS  (space-list of ids that "have a branch")
+#   $3 = FAKE_SESSIONS_JSON       (live-session roster; empty → roster untrustworthy)
+#   $4 = FAKE_SLING_ASSIGNEES     (sling→assignee map for the live-worker guard)
+run_neverstarted() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_NEVERSTARTED_MINUTES=15 \
+    FAKE_NEVERSTARTED_JSON="${1:-[]}" \
+    PILOT_TEST_BRANCH_BEADS="${2:-}" \
+    FAKE_SESSIONS_JSON="${3:-}" \
+    FAKE_SLING_ASSIGNEES="${4:-}" \
+    FAKE_BLOCKED_IDS="" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
@@ -980,6 +1009,130 @@ has "$DISPATCHER" 'rig_to_builders\(\)'                         "rig_to_builders
 has "$DISPATCHER" 'digo-wa mila-wa oracle-wa peter-wa thies-wa' "WA rig maps to the full 5-crew pool"
 has "$DISPATCHER" 'pick_pool_builder\(\)'                       "idle-crew selection function is defined"
 has "$DISPATCHER" 'PILOT_BUSY_BUILDERS'                         "busy-builder exclusion set is wired"
+
+# ── Scenario 16: never-started in-flight recovery (ga-v3z4z) ──────────────────
+# A bead stuck story:in-flight + pilot:dispatched whose dispatch never produced a
+# worker OR a branch must be RELEASED so the next sweep re-dispatches it — while
+# every "real work happened" signal (gate marker, live worker, branch, fresh age)
+# must PROTECT a bead from release.
+echo "Scenario 16: never-started in-flight beads are released; real ones are protected"
+NS_NOW="$(date +%s)"
+NS_OLD="$((NS_NOW - 3600))"     # 1h old → past the 15m threshold
+NS_FRESH="$((NS_NOW - 60))"     # 1m old → fresh
+NS_SESS='{"sessions":[{"session_name":"digo-wa","closed":false}]}'
+
+# 16a: aged, no sling, no branch, no gate → RELEASE.
+NS_REL='[{"id":"tt-ns-rel","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+LOG16A="$(run_neverstarted "$NS_REL" "" "" "")"
+if echo "$LOG16A" | grep -q "releasing never-started in-flight bead tt-ns-rel"; then
+  ok "released a never-started bead (aged, no worker/branch/gate)"
+else
+  bad "did NOT release the never-started bead tt-ns-rel"
+fi
+
+# 16b: fresh dispatch (age < threshold) → KEEP.
+NS_FRESH_J='[{"id":"tt-ns-fresh","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_FRESH"'"}}]'
+LOG16B="$(run_neverstarted "$NS_FRESH_J" "" "" "")"
+if echo "$LOG16B" | grep -q "releasing never-started in-flight bead tt-ns-fresh"; then
+  bad "REGRESSION: released a FRESH dispatch (age < 15m threshold)"
+else
+  ok "fresh dispatch kept (age < threshold — worker may still be spawning)"
+fi
+
+# 16c: a surviving crew branch → KEEP (real work landed before the worker died).
+NS_BR='[{"id":"tt-ns-branch","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+LOG16C="$(run_neverstarted "$NS_BR" "tt-ns-branch" "" "")"
+if echo "$LOG16C" | grep -q "releasing never-started in-flight bead tt-ns-branch"; then
+  bad "REGRESSION: released a bead that HAS a crew branch"
+else
+  ok "bead with a surviving crew branch kept"
+fi
+
+# 16d: a gate:* label → KEEP (it reached the gate, so it was built).
+NS_GATE='[{"id":"tt-ns-gate","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-fix"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+LOG16D="$(run_neverstarted "$NS_GATE" "" "" "")"
+if echo "$LOG16D" | grep -q "releasing never-started in-flight bead tt-ns-gate"; then
+  bad "REGRESSION: released a bead carrying a gate marker (gate:needs-fix)"
+else
+  ok "bead with a gate marker kept"
+fi
+
+# 16e: a sling whose assignee is a LIVE session → KEEP (build in flight).
+NS_LIVE='[{"id":"tt-ns-live","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-live"}}]'
+LOG16E="$(run_neverstarted "$NS_LIVE" "" "$NS_SESS" '{"tt-sling-live":"digo-wa"}')"
+if echo "$LOG16E" | grep -q "releasing never-started in-flight bead tt-ns-live"; then
+  bad "REGRESSION: released a bead whose builder session is LIVE"
+else
+  ok "bead with a live builder session kept"
+fi
+
+# 16f: a sling whose assignee is PROVABLY gone (roster trustworthy) → RELEASE.
+NS_DEAD='[{"id":"tt-ns-dead","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-dead"}}]'
+LOG16F="$(run_neverstarted "$NS_DEAD" "" "$NS_SESS" '{"tt-sling-dead":"ghost-wa"}')"
+if echo "$LOG16F" | grep -q "releasing never-started in-flight bead tt-ns-dead"; then
+  ok "released a bead whose builder session is provably gone"
+else
+  bad "did NOT release the dead-worker never-started bead tt-ns-dead"
+fi
+
+# 16g: legacy bead with NO pilot.dispatched_at stamp → stamp-now, NOT released
+# (the ga-2azzj Defect-A discipline: never release on first sight).
+NS_LEGACY='[{"id":"tt-ns-legacy","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{}}]'
+LOG16G="$(run_neverstarted "$NS_LEGACY" "" "" "")"
+if echo "$LOG16G" | grep -q "no pilot.dispatched_at stamp.*stamping now, NOT releasing"; then
+  ok "legacy bead is stamped, not released on first sight (Defect-A guard)"
+else
+  bad "legacy stamp-now guard did not fire for tt-ns-legacy"
+fi
+if echo "$LOG16G" | grep -q "releasing never-started in-flight bead tt-ns-legacy"; then
+  bad "REGRESSION: released a legacy bead on first sight (Defect-A violation)"
+else
+  ok "legacy bead NOT released on first sight"
+fi
+
+# 16h: sling present but roster untrustworthy (empty) → KEEP (cannot prove dead).
+NS_UNTRUST='[{"id":"tt-ns-untrust","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-x"}}]'
+LOG16H="$(run_neverstarted "$NS_UNTRUST" "" "" "")"
+if echo "$LOG16H" | grep -q "releasing never-started in-flight bead tt-ns-untrust"; then
+  bad "REGRESSION: released a sling-bearing bead while the roster was untrustworthy"
+else
+  ok "sling-bearing bead kept when roster is untrustworthy (cannot prove worker dead)"
+fi
+
+# 16i: PILOT_NEVERSTARTED_MINUTES=0 fully disables the detector.
+echo "Scenario 16i: PILOT_NEVERSTARTED_MINUTES=0 disables the detector"
+: > "$FIXCITY/.gc/logs/pilot-dispatcher.log"; reset_state
+env -i PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" HOME="$HOME" DRY_RUN=1 \
+  PILOT_CITY_OVERRIDE="$FIXCITY" PILOT_TEST_STATE="$STATE" \
+  PILOT_NEVERSTARTED_MINUTES=0 FAKE_NEVERSTARTED_JSON="$NS_REL" \
+  PILOT_TEST_BRANCH_BEADS="" FAKE_BLOCKED_IDS="" \
+  bash "$DISPATCHER" >/dev/null 2>&1 || true
+LOG16I="$(cat "$FIXCITY/.gc/logs/pilot-dispatcher.log")"
+if echo "$LOG16I" | grep -q "releasing never-started in-flight bead"; then
+  bad "detector ran despite PILOT_NEVERSTARTED_MINUTES=0"
+else
+  ok "PILOT_NEVERSTARTED_MINUTES=0 fully disables the detector"
+fi
+
+# 16j: AC#1 (structural) — the MUTEX/pool defer paths release the claim and can
+# NEVER reach the story:in-flight mark, so a deferred dispatch leaves no limbo.
+echo "Scenario 16j: AC#1 — defer releases the claim BEFORE any in-flight mark"
+has "$DISPATCHER" 'MUTEX\(wa-1eos\).+Releasing claim'        "mutex defer logs claim release"
+has "$DISPATCHER" 'all crew busy/used this sweep.+Releasing claim' "pool defer logs claim release"
+ns_inflight_ln=$(grep -nF 'label add "$STORY_ID" "story:in-flight"' "$DISPATCHER" | tail -1 | cut -d: -f1)
+ns_muxdefer_ln=$(grep -nF 'MUTEX(wa-1eos): builder' "$DISPATCHER" | tail -1 | cut -d: -f1)
+if [ -n "$ns_inflight_ln" ] && [ -n "$ns_muxdefer_ln" ] && [ "$ns_inflight_ln" -gt "$ns_muxdefer_ln" ]; then
+  ok "story:in-flight is marked only AFTER the defer paths (defer cannot create limbo)"
+else
+  bad "story:in-flight mark not strictly after defer (in-flight=${ns_inflight_ln:-?} defer=${ns_muxdefer_ln:-?})"
+fi
+
+# 16k: drift-guard — the detector + its clock are wired into the live dispatcher.
+echo "Scenario 16k: drift-guard — never-started recovery wired into the dispatcher"
+has "$DISPATCHER" '_neverstarted_recover_db\(\)'  "never-started recovery function is defined"
+has "$DISPATCHER" '_beadid_has_branch\(\)'        "cross-repo branch detector is defined"
+has "$DISPATCHER" 'pilot.dispatched_at='          "dispatch stamps pilot.dispatched_at (never-started clock)"
+has "$DISPATCHER" 'PILOT_NEVERSTARTED_MINUTES'    "never-started threshold knob is wired"
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""

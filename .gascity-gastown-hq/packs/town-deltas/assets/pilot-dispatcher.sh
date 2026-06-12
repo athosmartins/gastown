@@ -157,6 +157,29 @@ PILOT_STUCK_INFLIGHT_HOURS="${PILOT_STUCK_INFLIGHT_HOURS:-2}"
 # never an over-dispatch. Set to 0 to disable the cross-check entirely.
 PILOT_DEADWORKER_CHECK="${PILOT_DEADWORKER_CHECK:-1}"
 
+# ── Never-started in-flight recovery (ga-v3z4z) ───────────────────────────────
+# The slot corrections above (age-stale ga-rk5va, dead-worker ga-e5yw2) only stop
+# a phantom from COUNTING against the lane cap — they never RE-DISPATCH it. That
+# leaves a distinct failure class permanently stuck: a bead marked story:in-flight
+# + pilot:dispatched whose builder session never materialized (deferred at the
+# session layer, spawn raced, or the worker died before pushing ANYTHING). It has
+# NO branch in any rig, NO live worker, and NO gate marker — "dispatched on paper,
+# nobody picked it up". The Kanban shows it "em voo sem worker" forever, and no
+# sweep ever frees it because pilot:dispatched bars re-pick.
+#
+# This detector RELEASES such never-started beads (strips story:in-flight +
+# pilot:dispatched + claim stamps) so the very next sweep re-dispatches them. It
+# is the active counterpart to the passive slot corrections, and it is mechanism-
+# agnostic: it does not care HOW the bead reached limbo, only that none of the
+# "real work happened" signals are present. FAIL-SAFE by construction — a bead is
+# released ONLY when EVERY positive signal is absent (no gate label, no live
+# worker, no branch) AND it has aged past the threshold measured from a dedicated
+# pilot.dispatched_at stamp (never updated_at — the ga-2azzj Defect-A discipline:
+# a missing stamp is stamped-now and never released on first sight). Distinct
+# from ga-e5yw2 (dead worker: a worker existed and died) and ga-mtlm6 (deliver to
+# existing). Set PILOT_NEVERSTARTED_MINUTES=0 to disable.
+PILOT_NEVERSTARTED_MINUTES="${PILOT_NEVERSTARTED_MINUTES:-15}"
+
 # Dry-run mode: show what WOULD happen, make zero changes.
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -645,6 +668,133 @@ _inflight_drop_dead_workers() {
   done
   printf '%s' "$_kept" | jq -s '.' 2>/dev/null || printf '%s' "$_arr"
 }
+
+# ── Step 0c: never-started in-flight recovery (ga-v3z4z) ──────────────────────
+# Release beads stuck story:in-flight + pilot:dispatched whose dispatch never
+# produced a worker OR a branch (deferred at the session layer / spawn raced /
+# worker died before pushing anything). Unlike the slot corrections above, which
+# only stop a phantom from COUNTING, this RE-DISPATCHES it: strip the in-flight +
+# dispatched labels (story:approved survives) so the next sweep picks it up. Runs
+# unconditionally like the TTL recovery (Step 0) — recovering an abandoned
+# dispatch is reconciliation, not a dispatch change, so it acts even under
+# DRY_RUN (mirrors _ttl_recover_db). FAIL-SAFE: releases ONLY when every positive
+# "real work happened" signal is absent.
+
+# _beadid_has_branch <bead_id> — exit 0 iff some git ref (local or remote) in any
+# town/rig repo names this bead. A surviving crew branch means work was pushed
+# (then the worker died pre-/gate-done); re-dispatch would collide, so KEEP it.
+# Fail-safe: no git / no resolved repos / undecidable → exit 0 (treat as "branch
+# may exist" → KEEP). Test seam PILOT_TEST_BRANCH_BEADS (space-list of branched
+# ids), consulted when DEFINED, keeps the selftest hermetic (no real git).
+_beadid_has_branch() {
+  local _bid="${1:-}" _repo
+  [ -n "$_bid" ] || return 1
+  if [ -n "${PILOT_TEST_BRANCH_BEADS+x}" ]; then
+    case " $PILOT_TEST_BRANCH_BEADS " in *" $_bid "*) return 0 ;; *) return 1 ;; esac
+  fi
+  command -v git >/dev/null 2>&1 || return 0
+  [ -n "${_NS_BRANCH_REPOS:-}" ] || return 0
+  while IFS= read -r _repo; do
+    [ -n "$_repo" ] && [ -d "$_repo" ] || continue
+    if git -C "$_repo" for-each-ref --format='%(refname)' refs/heads refs/remotes 2>/dev/null \
+        | grep -qiF "$_bid"; then
+      return 0
+    fi
+  done <<< "${_NS_BRANCH_REPOS:-}"
+  return 1
+}
+
+# _neverstarted_recover_db <db_path> <now_epoch> — scan one DB for never-started
+# in-flight beads and release them. Decision rules (ALL must hold to release):
+#   - has story:in-flight AND pilot:dispatched (query selects both)
+#   - NO gate:* label (any gate marker = it reached the gate = it was built)
+#   - pilot.dispatched_at present AND age > threshold (missing stamp → stamp NOW,
+#       never release on first sight — the ga-2azzj Defect-A discipline)
+#   - NO live worker: a recorded pilot.sling_bead whose assignee is a live session
+#       means a build is in flight (just slow to push) → KEEP. Roster untrustworthy
+#       (_DEADWORKER_OK!=1) → KEEP (cannot prove the worker dead).
+#   - NO branch in any repo (_beadid_has_branch).
+_neverstarted_recover_db() {
+  local _db="$1" _now="$2"
+  local _thresh=$(( PILOT_NEVERSTARTED_MINUTES * 60 ))
+  local _json _count
+  _json=$(bd -C "$_db" list --json --all \
+    -l "story:in-flight" \
+    -l "pilot:dispatched" \
+    2>/dev/null || echo "[]")
+  _count=$(echo "$_json" | jq 'length' 2>/dev/null || echo "0")
+  [ "${_count:-0}" -le "0" ] 2>/dev/null && return 0
+
+  echo "$_json" | jq -c '.[]' | while IFS= read -r _bead; do
+    local _bid _labels _stamp _age _sling _asg
+    _bid=$(echo "$_bead" | jq -r '.id // ""' 2>/dev/null || echo "")
+    [ -z "$_bid" ] && continue
+    _labels=$(echo "$_bead" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
+
+    # gate-marker guard — any gate:* label (comma-framed so "investigate:" can't
+    # false-match) means the bead was built and reached the gate. KEEP.
+    case ",$_labels," in *,gate:*) continue ;; esac
+
+    # stamp/age guard (Defect-A discipline) — never updated_at, never first-sight.
+    _stamp=$(echo "$_bead" | jq -r '.metadata["pilot.dispatched_at"] // ""' 2>/dev/null || echo "")
+    if [ -z "$_stamp" ] || ! [ "$_stamp" -ge 0 ] 2>/dev/null; then
+      warn "NEVERSTARTED: $_bid is in-flight+dispatched but has no pilot.dispatched_at stamp (legacy) — stamping now, NOT releasing (Defect-A guard, ga-v3z4z)."
+      bd -C "$_db" update "$_bid" --set-metadata "pilot.dispatched_at=$_now" -q 2>/dev/null || true
+      continue
+    fi
+    _age=$(( _now - _stamp ))
+    if [ "$_age" -le "$_thresh" ]; then
+      continue   # too fresh — give the dispatch time to materialize a worker/branch.
+    fi
+
+    # live-worker guard — a sling whose assignee is a live session = active build.
+    _sling=$(echo "$_bead" | jq -r '.metadata["pilot.sling_bead"] // ""' 2>/dev/null || echo "")
+    if [ -n "$_sling" ]; then
+      if [ "${_DEADWORKER_OK:-0}" != "1" ]; then
+        continue   # roster untrustworthy → cannot prove worker dead → KEEP.
+      fi
+      _asg=$(bd -C "$GC_CITY" show "$_sling" --json 2>/dev/null \
+        | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
+      if [ -n "$_asg" ] && _session_is_live "$_asg"; then
+        continue   # worker alive → not never-started.
+      fi
+    fi
+
+    # branch guard — a surviving crew branch means real work landed. KEEP.
+    if _beadid_has_branch "$_bid"; then
+      continue
+    fi
+
+    # Aged past threshold, no gate marker, no live worker, no branch → genuinely
+    # never-started limbo. Release so the next sweep re-dispatches it.
+    warn "NEVERSTARTED: releasing never-started in-flight bead $_bid (age=${_age}s > ${_thresh}s, no live worker, no branch, no gate marker, db=$_db) — back to story:approved for re-dispatch (ga-v3z4z)."
+    bd -C "$_db" label  remove "$_bid" "story:in-flight"   -q 2>/dev/null || true
+    bd -C "$_db" label  remove "$_bid" "pilot:dispatched"  -q 2>/dev/null || true
+    bd -C "$_db" label  remove "$_bid" "pilot:dispatching" -q 2>/dev/null || true
+    bd -C "$_db" update "$_bid" --unset-metadata "pilot.dispatched_at"  -q 2>/dev/null || true
+    bd -C "$_db" update "$_bid" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+    bd -C "$_db" update "$_bid" --unset-metadata "pilot.sling_bead"     -q 2>/dev/null || true
+  done
+}
+
+if [ "${PILOT_NEVERSTARTED_MINUTES:-15}" != "0" ]; then
+  _NS_NOW_EPOCH=$(date +%s)
+  # Repos a crew branch could live in: the shared town root (HQ ga-* branches) +
+  # every rig repo (wa-*/ps-*/lx-* crew branches). Resolved once per sweep.
+  _NS_BRANCH_REPOS=$(
+    { dirname "$GC_CITY"
+      gc --city "$GC_CITY" rig list --json 2>/dev/null \
+        | jq -r '.rigs[]?.path // empty' 2>/dev/null
+    } | awk 'NF && !seen[$0]++'
+  )
+  _neverstarted_recover_db "$GC_CITY" "$_NS_NOW_EPOCH"
+  _ns_rig_paths=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
+    | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
+  while IFS= read -r _ns_rig; do
+    [ -z "$_ns_rig" ] || [ ! -d "$_ns_rig" ] && continue
+    _neverstarted_recover_db "$_ns_rig" "$_NS_NOW_EPOCH"
+  done <<< "$_ns_rig_paths"
+fi
 
 _NOW_EPOCH=$(date +%s)
 _STUCK_CUTOFF=$(( _NOW_EPOCH - PILOT_STUCK_INFLIGHT_HOURS * 3600 ))
@@ -1610,6 +1760,12 @@ TASK
     # in-flight is durable — NOW safe to release the claim and tag dispatched.
     bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
     bd -C "$STORY_BEAD_CITY" label add    "$STORY_ID" "pilot:dispatched"  -q 2>/dev/null || true
+    # ga-v3z4z: stamp the dispatch instant so the never-started detector can age
+    # this bead from a dedicated clock, never updated_at (the ga-2azzj Defect-A
+    # discipline). Written right next to the pilot:dispatched label so the two
+    # always travel together: a dispatched bead carries the clock that decides
+    # when an abandoned dispatch becomes re-dispatchable.
+    bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "pilot.dispatched_at=$(date +%s)" -q 2>/dev/null || true
     # Claim stamps are now moot (bead is in-flight, excluded from TTL query). Clear
     # them so a later re-dispatch (gate:needs-fix) starts from a clean slate.
     bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
