@@ -104,6 +104,38 @@ eq "live reviewer stdout scrollback (empty stderr) → ALIVE"   "$(session_peek_
 eq "transient connection error (NOT not-found) → ALIVE"       "$(session_peek_reports_dead 'connection refused')" "0"
 eq "scrollback words 'not found' w/o 'session' → ALIVE"       "$(session_peek_reports_dead 'build error: file not found')" "0"
 
+# ── 2d. reviewer_last_active_stale — ga-q8tmn frozen-reviewer activity clock ───
+# A reviewer whose Claude WEDGES (quota/credit limit) stays listed + not-closed +
+# ACKed with a SUCCEEDING peek — session_is_dead, slot_effectively_dead AND the
+# ga-h9o17 drained-peek probe ALL read it ALIVE. Its only tell is a stale
+# last_active: a frozen Claude emits no terminal output, so the session activity
+# clock stops. The helper must reap ONLY a clearly-old, parseable timestamp and
+# FAIL-OPEN on everything else (empty / garbage / future / non-numeric now).
+# Signature: reviewer_last_active_stale <last_active_iso> <now_epoch> <thresh_secs> → 1|0
+type reviewer_last_active_stale >/dev/null 2>&1 || { echo "FATAL: reviewer_last_active_stale not defined by dispatcher (ga-q8tmn)"; exit 1; }
+type _ts_to_epoch              >/dev/null 2>&1 || { echo "FATAL: _ts_to_epoch not defined by dispatcher (ga-q8tmn)"; exit 1; }
+echo "── 2d. reviewer_last_active_stale (no activity ≥ threshold = frozen) ──"
+# 1577836800 = 2020-01-01T00:00:00Z. Vary now to land above/below the threshold.
+eq "last_active 1000s old, thresh 300 → frozen/dead"          "$(reviewer_last_active_stale '2020-01-01T00:00:00+00:00' 1577837800 300)" "1"
+eq "last_active 200s old, thresh 300 → alive (under thresh)"  "$(reviewer_last_active_stale '2020-01-01T00:00:00+00:00' 1577837000 300)" "0"
+eq "last_active EXACTLY at threshold (300s) → frozen (>=)"    "$(reviewer_last_active_stale '2020-01-01T00:00:00+00:00' 1577837100 300)" "1"
+# Z-suffix (UTC) form parses identically to the +00:00 offset form.
+eq "Z-suffix (UTC) timestamp parses → frozen"                "$(reviewer_last_active_stale '2020-01-01T00:00:00Z' 1577837800 300)" "1"
+# Non-UTC ±HH:MM offset — the form gc emits LIVE (e.g. -03:00) — must parse with
+# the offset applied: 2020-01-01T00:00:00-03:00 == 1577847600Z; now 1000s later.
+eq "non-UTC ±HH:MM offset parses correctly → frozen"         "$(reviewer_last_active_stale '2020-01-01T00:00:00-03:00' 1577848600 300)" "1"
+eq "same offset ts, now only 100s later → alive"            "$(reviewer_last_active_stale '2020-01-01T00:00:00-03:00' 1577847700 300)" "0"
+# FAIL-OPEN: a missing/garbage/future/non-numeric input must NEVER reap a reviewer.
+eq "(fail-open) empty last_active → alive (never reap)"      "$(reviewer_last_active_stale '' 1577837800 300)" "0"
+eq "(fail-open) unparseable garbage → alive (never reap)"    "$(reviewer_last_active_stale 'not-a-timestamp' 1577837800 300)" "0"
+eq "(fail-open) FUTURE last_active (clock skew) → alive"     "$(reviewer_last_active_stale '2020-01-01T00:00:00+00:00' 1577836000 300)" "0"
+eq "(fail-open) non-numeric now_epoch → alive"               "$(reviewer_last_active_stale '2020-01-01T00:00:00+00:00' xx 300)" "0"
+# _ts_to_epoch directly: offset and Z forms both resolve to the same instant.
+eq "_ts_to_epoch Z form → 1577836800"                        "$(_ts_to_epoch '2020-01-01T00:00:00Z')" "1577836800"
+eq "_ts_to_epoch +00:00 form → 1577836800"                   "$(_ts_to_epoch '2020-01-01T00:00:00+00:00')" "1577836800"
+eq "_ts_to_epoch -03:00 form → 1577847600 (offset applied)"  "$(_ts_to_epoch '2020-01-01T00:00:00-03:00')" "1577847600"
+eq "_ts_to_epoch empty → empty (fail-open)"                  "$(_ts_to_epoch '')" ""
+
 # ── 3. respawn_reviewer_slot — real spawn/nudge wiring (mock gc) ──────────────
 # Proves the helper spawns a FRESH session, swaps SESSION_IDS[idx] in place,
 # re-delivers the SAME stored task, and REUSES the still-pending verdict bead
@@ -212,8 +244,25 @@ sim_poll() {
             *)    peek_dead=$(session_peek_reports_dead "live terminal scrollback for $sid") ;;
           esac
         fi
+        # ga-q8tmn: model the frozen-reviewer staleness probe through the REAL
+        # helper. SLOT_STALE[j]="stale" makes last_active read ≥ threshold old even
+        # though the list shows the session present+not-closed (dead=0) and peek
+        # succeeds (peek_dead=0) — the exact false-FAIL all prior signals missed.
+        # "fresh" (or unset) = a working reviewer whose last_active is current.
+        # Drive the REAL reviewer_last_active_stale with deterministic epoch pairs
+        # (no `date` dependency): base ts 1577836800, now +1000s (stale) or +200s
+        # (fresh), threshold 300. Bounded exactly like the dispatcher (list-alive +
+        # peek-alive + past grace), and only when the scenario opts in.
+        local stale_dead=0
+        if [ "$dead" = "0" ] && [ "$peek_dead" = "0" ] && [ "$spawn_age" -ge "$RECONVENE_GRACE_SECS" ] && [ -n "${SLOT_STALE[$j]:-}" ]; then
+          case "${SLOT_STALE[$j]}" in
+            stale) stale_dead=$(reviewer_last_active_stale "2020-01-01T00:00:00+00:00" 1577837800 300) ;;
+            *)     stale_dead=$(reviewer_last_active_stale "2020-01-01T00:00:00+00:00" 1577837000 300) ;;
+          esac
+        fi
         local eff_dead="$dead"
         [ "$peek_dead" = "1" ] && eff_dead=1
+        [ "$stale_dead" = "1" ] && eff_dead=1
         if [ "$eff_dead" = "1" ] && [ "$spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
           SLOT_DEAD_STREAK[$j]=$(( ${SLOT_DEAD_STREAK[$j]:-0} + 1 ))
         else
@@ -231,7 +280,9 @@ sim_poll() {
           # scenario driver may revive the slot after respawn (see hooks below).
           # ga-h9o17: a re-convened slot also gets a LIVE peek (fresh session) so
           # the drained-peek scenario converges instead of re-firing forever.
-          if [ -n "${REVIVE_ON_RESPAWN:-}" ]; then SLOT_LIVE[$j]="alive"; SLOT_PEEK[$j]="found"; SLOT_BEAD[$j]="$REVIVE_VERDICT"; fi
+          # ga-q8tmn: a re-convened slot also gets a FRESH activity clock (new
+          # session) so the staleness scenario converges instead of re-firing.
+          if [ -n "${REVIVE_ON_RESPAWN:-}" ]; then SLOT_LIVE[$j]="alive"; SLOT_PEEK[$j]="found"; SLOT_STALE[$j]="fresh"; SLOT_BEAD[$j]="$REVIVE_VERDICT"; fi
         fi
         ;;
     esac
@@ -265,7 +316,7 @@ run_sim() {
 }
 
 reset_slots() {
-  RESPAWN_BUDGET=(); SLOT_SPAWN_EPOCH=(); SLOT_DEAD_STREAK=(); SLOT_BEAD=(); SLOT_LIVE=(); SLOT_PEEK=()
+  RESPAWN_BUDGET=(); SLOT_SPAWN_EPOCH=(); SLOT_DEAD_STREAK=(); SLOT_BEAD=(); SLOT_LIVE=(); SLOT_PEEK=(); SLOT_STALE=()
   local j
   for j in 0 1 2; do
     RESPAWN_BUDGET[$j]="$MAX_RESPAWNS_PER_SLOT"
@@ -384,6 +435,45 @@ sim_poll 1000
 eq "(g) listed + peek-gone (drained) → respawn fires (the fix)"         "$SIM_RESPAWNS" "1"
 RECONVENE_GRACE_SECS=0; RECONVENE_DEAD_STREAK_MIN=2
 
+# (h) ga-q8tmn: slot 2 reviewer FROZEN — LISTED + not-closed (session_is_dead=0),
+# ACKed, and `gc session peek` SUCCEEDS (SLOT_PEEK=found → _peek_dead=0): every
+# pre-existing signal reads it ALIVE. Only its last_active is stale (Claude wedged
+# on quota → no terminal output). This is the exact false-FAIL the prior checks
+# missed (observed live 2026-06-10: all 3 reviewers froze with last_active ~35m,
+# 37min stall until the Mayor killed them by hand). The staleness probe must treat
+# it DEAD → re-convene → PASS, well inside the 45m outer timeout.
+VERDICT_BEAD_IDS=( vb0 vb1 vb2 ); SESSION_IDS=( s0 s1 s2 ); REVIEW_TASKS=( t0 t1 t2 )
+reset_slots
+SLOT_BEAD=( PASS PASS pending ); SLOT_LIVE=( alive alive alive ); SLOT_PEEK=( found found found ); SLOT_STALE=( fresh fresh stale )
+SIM_TIMEOUT_AT=99999; REVIVE_ON_RESPAWN=1; REVIVE_VERDICT="PASS"
+run_sim
+unset REVIVE_ON_RESPAWN
+eq "(h) frozen (stale last_active) slot re-convened then PASS → OVERALL=PASS" "$SIM_OVERALL" "PASS"
+eq "(h) exactly ONE respawn fired (streak_min=2)"                            "$SIM_RESPAWNS" "1"
+eq "(h) slot 2 session id was swapped (frozen reviewer replaced)"            "${SESSION_IDS[2]}" "$MOCK_NEW_SID"
+
+# (h2) SAFETY: a reviewer with FRESH last_active (working normally, just slow) is
+# NEVER reaped by the staleness probe — only a STALE last_active reaps. Single
+# poll, streak_min=1 so the decision is immediate either way.
+VERDICT_BEAD_IDS=( vb0 ); SESSION_IDS=( s0 ); REVIEW_TASKS=( t0 )
+RESPAWN_BUDGET=( 2 ); SLOT_DEAD_STREAK=( 0 ); SLOT_SPAWN_EPOCH=( 0 )
+RECONVENE_GRACE_SECS=0; RECONVENE_DEAD_STREAK_MIN=1
+SLOT_BEAD=( pending ); SLOT_LIVE=( alive ); SLOT_PEEK=( found ); SLOT_STALE=( fresh )
+SIM_RESPAWNS=0
+sim_poll 1000
+eq "(h2) fresh last_active (slow-but-alive) → 0 respawns (never reaped)" "$SIM_RESPAWNS" "0"
+eq "(h2) fresh last_active → session id NOT swapped"                    "${SESSION_IDS[0]}" "s0"
+# Converse: SAME slot, last_active now stale → respawn fires.
+SLOT_STALE=( stale ); SLOT_DEAD_STREAK=( 0 ); SLOT_SPAWN_EPOCH=( 0 ); SIM_RESPAWNS=0
+sim_poll 1000
+eq "(h2) stale last_active (frozen) → respawn fires (the fix)"          "$SIM_RESPAWNS" "1"
+# (h3) SAFETY: the peek/staleness probes are SKIPPED inside the grace window even
+# when last_active is stale — a freshly-(re)spawned reviewer is never reaped early.
+SLOT_STALE=( stale ); SLOT_DEAD_STREAK=( 0 ); RECONVENE_GRACE_SECS=300; SLOT_SPAWN_EPOCH=( 1000 ); SIM_RESPAWNS=0
+sim_poll 1100   # only 100s after spawn, grace=300 → must NOT respawn despite stale
+eq "(h3) stale but INSIDE grace window → no respawn (fresh reviewer spared)" "$SIM_RESPAWNS" "0"
+RECONVENE_GRACE_SECS=0; RECONVENE_DEAD_STREAK_MIN=2
+
 # Grace gate: a dead session inside its grace window is NOT re-convened.
 VERDICT_BEAD_IDS=( vb0 ); SESSION_IDS=( s0 ); REVIEW_TASKS=( t0 )
 RESPAWN_BUDGET=( 2 ); SLOT_DEAD_STREAK=( 0 )
@@ -461,6 +551,25 @@ grep -q 'session peek "\$_sid" --lines 5 2>&1 >/dev/null' "$DISPATCHER" && ok "d
 # grace — NOT run on a session the list already calls dead.
 grep -q '\[ "\$_dead" = "0" \] && \[ "\$_spawn_age" -ge "\$RECONVENE_GRACE_SECS" \]' "$DISPATCHER" && ok "drained probe bounded to list-alive + past-grace slots" || bad "drained probe not bounded (runs every poll / inside grace)"
 grep -q 'Drained reviewer detected (ga-h9o17)' "$DISPATCHER" && ok "poll loop logs the drained-reviewer detection" || bad "missing 'Drained reviewer detected' log"
+
+# ── 5d. drift-guard: the live dispatcher wires the ga-q8tmn frozen-reviewer fix ─
+# Fail LOUDLY if a refactor drops the staleness probe (the fix for a reviewer
+# whose Claude WEDGES mid-review — invisible to session_is_dead, slot_effectively_dead,
+# AND the ga-h9o17 drained-peek probe, since the session is present + ACKed + peek-able
+# and only its last_active goes stale).
+echo "── 5d. drift-guard: dispatcher wires ga-q8tmn frozen-reviewer staleness probe ──"
+grep -q 'reviewer_last_active_stale()' "$DISPATCHER" && ok "dispatcher defines reviewer_last_active_stale" || bad "missing reviewer_last_active_stale def (ga-q8tmn fix dropped)"
+grep -q '_ts_to_epoch()' "$DISPATCHER" && ok "dispatcher defines _ts_to_epoch (offset-aware ISO parser)" || bad "missing _ts_to_epoch helper (ga-q8tmn)"
+grep -q 'REVIEWER_STALE_SECS' "$DISPATCHER" && ok "dispatcher reads REVIEWER_STALE_SECS threshold" || bad "missing REVIEWER_STALE_SECS"
+# The probe must compute _stale_dead via the helper and fold it into _eff_dead.
+grep -q '_stale_dead=$(reviewer_last_active_stale' "$DISPATCHER" && ok "poll loop computes _stale_dead via reviewer_last_active_stale" || bad "poll loop does not probe last_active staleness (ga-q8tmn)"
+grep -q '\[ "\$_stale_dead" = "1" \] && _eff_dead=1' "$DISPATCHER" && ok "poll loop folds _stale_dead into _eff_dead" || bad "poll loop does not treat a stale reviewer as dead (ga-q8tmn)"
+# The signal must come from the ALREADY-fetched session list (zero extra I/O), not
+# a new gc call: assert it reads .last_active out of RECONVENE_SESS_JSON.
+grep -q 'last_active' "$DISPATCHER" && ok "probe reads last_active from the session-list JSON (zero extra I/O)" || bad "probe does not read last_active (ga-q8tmn)"
+# Bounded to the suspicious window AND honoring the disable switch (STALE_SECS=0).
+grep -q '\[ "\$REVIEWER_STALE_SECS" != "0" \] && \[ "\$_dead" = "0" \] && \[ "\$_peek_dead" = "0" \] && \[ "\$_spawn_age" -ge "\$RECONVENE_GRACE_SECS" \]' "$DISPATCHER" && ok "staleness probe bounded to enabled + list-alive + peek-alive + past-grace" || bad "staleness probe not bounded/guarded (ga-q8tmn)"
+grep -q 'Frozen reviewer detected (ga-q8tmn)' "$DISPATCHER" && ok "poll loop logs the frozen-reviewer detection" || bad "missing 'Frozen reviewer detected' log"
 
 # ── 6. dispatcher still parses + lib-only return is a no-op in normal flow ─────
 echo "── 6. syntax + lib-only safety ──"

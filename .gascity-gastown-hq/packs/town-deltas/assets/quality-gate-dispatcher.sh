@@ -92,6 +92,23 @@ RECONVENE_DEAD_STREAK_MIN="${RECONVENE_DEAD_STREAK_MIN:-2}"
 case "$RECONVENE_DEAD_STREAK_MIN" in ''|*[!0-9]*) RECONVENE_DEAD_STREAK_MIN=2 ;; esac
 [ "$RECONVENE_DEAD_STREAK_MIN" -lt 1 ] 2>/dev/null && RECONVENE_DEAD_STREAK_MIN=1
 
+# ga-q8tmn: seconds of session inactivity (now − last_active from `gc session
+# list`) after which a reviewer that is LISTED + not-closed + ACKed but whose
+# Claude has WEDGED (quota/credit limit → zero terminal output) is treated as
+# DEAD and re-convened, instead of waiting the full 45m outer timeout. A frozen
+# Claude stops emitting tmux activity entirely, so its last_active stops
+# advancing; a genuinely-working reviewer refreshes it on every tool call.
+# Floored well above normal reviewer output gaps AND above RECONVENE_GRACE_SECS,
+# so it can never reap inside the grace window. Effective detection latency ≈
+# REVIEWER_STALE_SECS + (RECONVENE_DEAD_STREAK_MIN−1)·VERDICT_POLL_INTERVAL — at
+# the defaults ≈ 300 + 30 = 330s, comfortably under the 45m timeout and the
+# ga-q8tmn <8min guiding star. Set to 0 to DISABLE the staleness probe entirely.
+REVIEWER_STALE_SECS="${REVIEWER_STALE_SECS:-300}"
+case "$REVIEWER_STALE_SECS" in ''|*[!0-9]*) REVIEWER_STALE_SECS=300 ;; esac
+if [ "$REVIEWER_STALE_SECS" != "0" ] && [ "$REVIEWER_STALE_SECS" -lt 120 ] 2>/dev/null; then
+  REVIEWER_STALE_SECS=120
+fi
+
 # ga-mepb0 (defense-in-depth, root cause): seconds to pause after waking each
 # reviewer (except the last) so N reviewers do NOT all boot `gc prime`
 # (SessionStart) against the Dolt :52756 server at the same instant. That
@@ -206,6 +223,63 @@ session_peek_reports_dead() {
     *"session not found"*) echo 1 ;;
     *) echo 0 ;;
   esac
+}
+
+# _ts_to_epoch <rfc3339> → unix epoch seconds (stdout) | "" on failure.
+# Handles BOTH a trailing Z (UTC) and a numeric ±HH:MM offset — the two forms
+# `gc session list` emits for last_active (e.g. "...Z" or "...-03:00"). python3
+# parses ISO-8601 offsets natively and is the canonical cross-platform path
+# (ga-ouqtg: macOS BSD `date` mishandles sub-second/offset stamps); GNU `date -d`
+# is the fallback. Deliberately NOT the BSD `date -j -u -f ...${ts%%Z*}` strip
+# used for the UTC-only ("...Z") marker timestamps elsewhere in this script — that
+# strip would silently DISCARD a ±HH:MM offset and return an epoch off by the
+# offset. Empty/garbage in → empty out (caller fail-opens). No global side effects.
+_ts_to_epoch() {
+  local ts="$1"
+  [ -z "$ts" ] && { echo ""; return 0; }
+  python3 -c 'import sys,datetime
+s=sys.argv[1].strip()
+try:
+    if s.endswith("Z"): s=s[:-1]+"+00:00"
+    print(int(datetime.datetime.fromisoformat(s).timestamp()))
+except Exception:
+    sys.exit(1)' "$ts" 2>/dev/null && return 0
+  date -d "$ts" +%s 2>/dev/null && return 0
+  echo ""
+}
+
+# reviewer_last_active_stale <last_active_iso> <now_epoch> <threshold_secs>
+#   → 1 (the session has emitted NO activity for ≥ threshold — frozen/wedged)
+#   | 0 (fresh, OR last_active empty/unparseable/in the future → FAIL-OPEN).
+# ga-q8tmn: a gate-reviewer whose Claude WEDGES mid-review (it hit a session or
+# weekly quota/credit limit) stays PRESENT + not-closed in `gc session list`
+# (session_is_dead=0), has already ACKed (slot_effectively_dead=0), and its
+# `gc session peek` SUCCEEDS with real scrollback (session_peek_reports_dead=0)
+# — EVERY existing deadness signal reads it ALIVE, so its still-pending verdict
+# waited the full 45m outer timeout and false-FAILed a clean branch (observed
+# live 2026-06-10 ~19:35-20:12: all 3 reviewers of wa-ag70 froze with last_active
+# ~35m, the gate sat "Verdicts: 0/3" for 37m, and it only unstuck when the Mayor
+# killed the 3 sessions by hand). The discriminator the others lack is the
+# session's OWN activity clock: a wedged Claude produces no terminal output, so
+# last_active stops advancing, while a working reviewer refreshes it on every
+# tool call. last_active comes straight from the session-list JSON already
+# fetched each poll, so this costs ZERO extra I/O. Parse defensively: an empty
+# or unparseable timestamp, a non-numeric now/threshold, or a FUTURE last_active
+# (clock skew) all yield 0 — staleness can ONLY reap on a clearly-old,
+# successfully-parsed timestamp. The grace + dead-streak guards in the caller
+# remain the backstops above this signal, so one stale read can never reap a
+# live reviewer.
+reviewer_last_active_stale() {
+  local la="$1" now="$2" thresh="$3" la_epoch age
+  [ -z "$la" ] && { echo 0; return 0; }
+  case "$now"    in ''|*[!0-9]*) echo 0; return 0 ;; esac
+  case "$thresh" in ''|*[!0-9]*) echo 0; return 0 ;; esac
+  la_epoch=$(_ts_to_epoch "$la")
+  case "$la_epoch" in ''|*[!0-9]*) echo 0; return 0 ;; esac
+  [ "$la_epoch" -le 0 ] 2>/dev/null && { echo 0; return 0; }
+  age=$(( now - la_epoch ))
+  [ "$age" -lt 0 ] 2>/dev/null && { echo 0; return 0; }   # future ts (clock skew) → never stale
+  if [ "$age" -ge "$thresh" ]; then echo 1; else echo 0; fi
 }
 
 # respawn_reviewer_slot <0-based idx> — re-spawn a fresh gate-reviewer session for
@@ -1973,6 +2047,36 @@ while true; do
         # not-found cannot reap a live reviewer (it must read drained for
         # RECONVENE_DEAD_STREAK_MIN consecutive polls past grace).
         [ "$_peek_dead" = "1" ] && _eff_dead=1
+        # ── ga-q8tmn: frozen-reviewer staleness probe ───────────────────────────
+        # session_is_dead (list-only), the ACK fold (slot_effectively_dead), AND the
+        # ga-h9o17 drained-peek probe ALL read a WEDGED reviewer as alive: when Claude
+        # freezes mid-review (it hit a quota/credit limit) the session stays present +
+        # not-closed (_dead=0), it already ACKed, and `gc session peek` SUCCEEDS with
+        # real scrollback (_peek_dead=0) — so its pending verdict waited the full 45m
+        # outer timeout and false-FAILed a good branch (observed live 2026-06-10: 3
+        # reviewers froze, gate stalled 37m until the Mayor killed them by hand). The
+        # signal the others lack is the session's own activity clock: a frozen Claude
+        # emits NO terminal output, so its last_active — already in the session-list
+        # JSON we fetched this poll (zero extra I/O) — stops advancing, while a working
+        # reviewer refreshes it on every tool call. Treat a slot whose last_active is
+        # ≥ REVIEWER_STALE_SECS old as DEAD. Bounded to the SAME suspicious window as
+        # the peek probe (list-alive + peek-alive + past-grace) and skipped entirely
+        # when disabled (REVIEWER_STALE_SECS=0); fail-open on any missing/unparseable/
+        # future timestamp; the grace + dead-streak guards below stay the backstops, so
+        # one stale read can never reap a live reviewer.
+        _stale_dead=0
+        if [ "$REVIEWER_STALE_SECS" != "0" ] && [ "$_dead" = "0" ] && [ "$_peek_dead" = "0" ] && [ "$_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
+          _last_active=$(echo "$RECONVENE_SESS_JSON" \
+            | jq -r --arg s "$_sid" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | .[0].last_active // ""' 2>/dev/null || echo "")
+          _stale_dead=$(reviewer_last_active_stale "$_last_active" "$NOW_EPOCH" "$REVIEWER_STALE_SECS")
+          if [ "$_stale_dead" = "1" ]; then
+            log "  Frozen reviewer detected (ga-q8tmn): slot $j session=${_sid} listed+not-closed+peek-alive but last_active=${_last_active} is ≥${REVIEWER_STALE_SECS}s stale with verdict bead ${VERDICT_BEAD_IDS[$j]} still pending; treating as DEAD (Claude wedged/quota)."
+          fi
+        fi
+        # ga-q8tmn: fold the staleness-confirmed frozen signal into deadness, exactly
+        # like the ga-h9o17 peek signal — the grace + dead-streak guards below still
+        # apply unchanged, so a single stale read cannot reap a live reviewer.
+        [ "$_stale_dead" = "1" ] && _eff_dead=1
         # Grace gate: never call a freshly-(re)spawned reviewer dead too early.
         if [ "$_eff_dead" = "1" ] && [ "$_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
           SLOT_DEAD_STREAK[$j]=$(( ${SLOT_DEAD_STREAK[$j]:-0} + 1 ))
@@ -1991,6 +2095,7 @@ while true; do
           # distinguishable from a Dolt-killed session in the gate log.
           if [ "$_dead" = "1" ]; then _dead_reason="session dead"
           elif [ "${_peek_dead:-0}" = "1" ]; then _dead_reason="drained (listed+not-closed but peek session-gone — ga-h9o17)"
+          elif [ "${_stale_dead:-0}" = "1" ]; then _dead_reason="frozen (listed+peek-alive but last_active ≥${REVIEWER_STALE_SECS}s stale — Claude wedged/quota, ga-q8tmn)"
           else _dead_reason="boot-wedged (present but never ACKed — gc prime/Dolt stall)"; fi
           log "Re-convening dead reviewer slot $j (respawn ${_respawn_k}/${MAX_RESPAWNS_PER_SLOT}) — session ${SESSION_IDS[$j]} ${_dead_reason}, verdict bead ${VERDICT_BEAD_IDS[$j]} still pending."
           SLOT_SPAWN_EPOCH[$j]="$NOW_EPOCH"   # reset this slot's grace clock
