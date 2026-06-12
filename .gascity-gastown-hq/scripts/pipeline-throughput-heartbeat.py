@@ -29,8 +29,11 @@ DESIGN (adversarially hardened — pure outcome-based is INSUFFICIENT):
         `No dispatchable candidates`), AND lane slots were free. The slots+demand
         guards prevent false positives on an empty backlog or a saturated pool.
       * Gate merge: zero `Gate PASSED` in the window WHILE queued markers exist AND no
-        review is legitimately in-flight younger than its own timeout. The last guard
-        is what stops a single honest 40-minute review from tripping the alarm.
+        review is legitimately in-flight younger than its own timeout AND the gate is not
+        deliberately throttling reviews via the ga-cw4pm headroom logic (a fresh `Headroom
+        DEFER` line — Dolt protection, not a stall; ga-r1u20). The in-flight + throttle
+        guards are what stop a single honest 40-minute review, or an intentional Dolt-hot
+        deferral, from tripping the alarm.
   - SPECIFIC assertion for the bare-main storm (pure-outcome cannot see it): alert on
     the `Durable-landing ... FAILED / not ancestor` log pattern within the window.
   - Per-session liveness: alert on any ephemeral worker session (gate-reviewer / dog)
@@ -99,6 +102,13 @@ GATE_QUEUED_RE = re.compile(r"Found (\d+) queued marker\(s\)")
 # "  Verdicts: G/N received (elapsed: Ys)"
 VERDICTS_RE = re.compile(r"Verdicts:\s*(\d+)/(\d+)\s*received\s*\(elapsed:\s*(\d+)s\)")
 GATE_MERGING = "proceeding to merge branch"
+# ga-cw4pm headroom decision (gate's own throttle self-assessment, one per sweep):
+#   "Headroom DEFER: gate em N runs (...) — dolt-hot; ceiling=0 reviewers, leaving M
+#    marker(s) queued (ga-cw4pm)."   ← consciously NOT admitting a review (Dolt protection)
+#   "Headroom OK:    gate em N runs (...) — dolt-calm; ceiling=6 reviewers, admitting a new
+#    run (ga-cw4pm)."                ← admitting reviews normally
+# A fresh DEFER as the latest decision is throttled-not-stalled (ga-r1u20).
+HEADROOM_DECISION_RE = re.compile(r"Headroom (OK|DEFER)\b")
 # Durable-landing FAIL signatures (quality-gate-dispatcher.sh ~lines 1840/1846/1857/1863):
 #   "Durable-landing AUDIT FAILED: merge <sha> not in rig-canonical main ..."
 #   "Durable-landing AUDIT FAILED: merge <sha> not in origin/main ... shared-remote clobber"
@@ -258,6 +268,30 @@ def _fresh_review_in_progress(lines, now):
     return False
 
 
+def _headroom_deferring(lines, now):
+    """True if the gate's MOST RECENT headroom decision within FLOW_WINDOW is a DEFER — i.e.
+    it is DELIBERATELY throttling reviews to protect Dolt (ga-cw4pm), not stalled (ga-r1u20).
+
+    When Dolt is hot the dispatcher defers every review (ceiling=0 / cap-reached), so it
+    emits no Verdicts polls and _fresh_review_in_progress() sees nothing in flight — which
+    made gate_merge_stall() mistake a healthy intentional throttle for a stall and spawn
+    repair dogs (observed live 2026-06-12 17:00-17:09 under Dolt CPU 102-297%).
+
+    The latest OK/DEFER line is the gate's current self-assessment: a fresh DEFER means 'I
+    chose not to admit a run'. A subsequent OK (gate resumed admitting) does NOT suppress —
+    if it admitted and STILL isn't merging, that is a genuine stall worth surfacing. A
+    decision older than the window is ignored (don't suppress on a stale throttle)."""
+    for l in reversed(lines):
+        m = HEADROOM_DECISION_RE.search(l)
+        if not m:
+            continue
+        e = log_ts_epoch(l)
+        if e is None or now - e > FLOW_WINDOW_SEC:
+            return False  # most recent decision is stale/undated → don't suppress on it
+        return m.group(1) == "DEFER"
+    return False
+
+
 def gate_merge_stall(now=None):
     """Returns a reason string when the gate has queued work but produced no merge in
     the window and no review is legitimately running; else None. Independent of the
@@ -290,6 +324,11 @@ def gate_merge_stall(now=None):
 
     if _fresh_review_in_progress(lines, now):
         return None  # a real review is in flight (incl. a legit long one) → not a stall
+
+    if _headroom_deferring(lines, now):
+        return None  # ga-r1u20: gate is deliberately deferring reviews to protect Dolt
+                     # (ga-cw4pm headroom throttle) → no Verdicts polls is EXPECTED, not a
+                     # stall. Suppress the false-positive at the source.
 
     return ("Gate com %d marker(s) na fila e ZERO merges em %dmin, sem revisão ativa "
             "em andamento — fila não drena sob demanda" % (backlog, FLOW_WINDOW_SEC // 60))

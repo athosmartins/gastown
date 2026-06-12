@@ -307,6 +307,55 @@ print('OK_DETECT_PURE')
 " "OK_DETECT_PURE"
 
 # ---------------------------------------------------------------------------
+# 13. HEADROOM-DEFER suppression (ga-r1u20): a fresh 'Headroom DEFER' as the gate's most
+#     recent decision means it is DELIBERATELY throttling reviews (ga-cw4pm) to protect
+#     Dolt — no Verdicts polls is EXPECTED, not a stall. gate_merge_stall must return None.
+# ---------------------------------------------------------------------------
+run_test "headroom DEFER (deliberate ga-cw4pm throttle) suppresses gate_merge_stall" "
+$HARNESS
+import time
+now = 1_000_000.0
+def ts(epoch):
+    return time.strftime('[%Y-%m-%d %H:%M:%S]', time.localtime(epoch))
+# No Gate PASSED in window, backlog>0, no in-flight Verdicts — WITHOUT the fix this is a
+# stall. The latest headroom decision is a fresh DEFER (dolt-hot, ceiling=0) → throttled.
+lines = [
+  ts(now-200)+' Headroom DEFER: gate em 1 runs (Dolt cpu=237% lat=64ms / cota=ok) — dolt-hot; ceiling=0 reviewers, leaving 3 marker(s) queued (ga-cw4pm).\n',
+  ts(now-100)+' Found 3 queued marker(s)\n',
+]
+m.tail_lines = lambda path, n: lines[-n:]
+m.file_fresh = lambda path, max_age=None, now=None: True
+r = m.gate_merge_stall(now)
+print('STALL=%r' % r)
+assert r is None, 'a fresh Headroom DEFER (intentional throttle) must NOT be flagged as a stall'
+print('OK_DEFER_SUPPRESS')
+" "OK_DEFER_SUPPRESS"
+
+# ---------------------------------------------------------------------------
+# 14. NEGATIVE CONTROL (ga-r1u20): after the gate RECOVERS to 'Headroom OK' (resumed
+#     admitting runs) a continuing no-merge IS a real stall — the DEFER suppression must
+#     not mask it. The most recent decision is OK, so gate_merge_stall must still fire.
+# ---------------------------------------------------------------------------
+run_test "headroom recovered to OK → genuine no-merge stall still fires (no masking)" "
+$HARNESS
+import time
+now = 1_000_000.0
+def ts(epoch):
+    return time.strftime('[%Y-%m-%d %H:%M:%S]', time.localtime(epoch))
+lines = [
+  ts(now-400)+' Headroom DEFER: gate em 1 runs (Dolt cpu=237% lat=64ms / cota=ok) — dolt-hot; ceiling=0 reviewers, leaving 3 marker(s) queued (ga-cw4pm).\n',
+  ts(now-200)+' Headroom OK: gate em 0 runs (Dolt cpu=24% lat=40ms / cota=ok) — dolt-calm; ceiling=6 reviewers, admitting a new run (ga-cw4pm).\n',
+  ts(now-100)+' Found 3 queued marker(s)\n',
+]
+m.tail_lines = lambda path, n: lines[-n:]
+m.file_fresh = lambda path, max_age=None, now=None: True
+r = m.gate_merge_stall(now)
+print('STALL=%r' % r)
+assert r is not None, 'after recovery to Headroom OK, a real no-merge stall must still be detected'
+print('OK_RECOVERED_STILL_FIRES')
+" "OK_RECOVERED_STILL_FIRES"
+
+# ---------------------------------------------------------------------------
 echo "----------------------------------------"
 echo "pipeline-throughput-heartbeat selftest: ${PASS} passed, ${FAIL} failed"
 [[ "$FAIL" -eq 0 ]] || exit 1
