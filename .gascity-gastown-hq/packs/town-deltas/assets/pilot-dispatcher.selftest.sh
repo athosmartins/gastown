@@ -163,6 +163,18 @@ case "$args" in
     if [ -n "${FAKE_BUGS_JSON:-}" ]; then
       # ga-2azzj: explicit fixture injection (used by the non-dry in-flight test).
       printf '%s' "$FAKE_BUGS_JSON"
+    elif [ "${FAKE_INCLUDE_EPIC:-0}" = "1" ]; then
+      # Split-epic scenario (gt-14nya): tt-epic is a P0 type=epic / story:epic-split
+      # shell that MUST NEVER be dispatched (empty diff → gate FAIL / dog refusal).
+      # This fixture leaks it UNCONDITIONALLY into the candidate stream — the
+      # dispatcher's _filter_candidates epic guard is what must drop it. If the
+      # guard is absent, tt-epic (P0) wins the pick and the scenario fails loudly.
+      cat <<'JSON'
+[
+  {"id":"tt-epic","title":"Split-epic shell fixture","priority":0,"issue_type":"epic","status":"open","labels":["story:epic-split"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
+  {"id":"tt-keep","title":"Normal bug fixture","priority":1,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
+]
+JSON
     elif [ "${FAKE_INCLUDE_ENGWIN:-0}" = "1" ]; then
       # Engine-window scenario (ga-6lum3): tt-engwin is a P0 engine-fork bug that
       # MUST NOT be dispatched. This fake bd honors the exclusion ONLY when the
@@ -253,7 +265,7 @@ chmod +x "$SHIMBIN/notify"
 reset_state() { rm -rf "$STATE"; mkdir -p "$STATE"; }
 
 # Runs the real dispatcher in DRY_RUN with the shims on PATH, returns the log.
-run_dispatch() { # $1=FAKE_BLOCKED_IDS  $2=FAKE_INCLUDE_ENGWIN(0|1)  $3=FAKE_DEP_BEAD (optional)
+run_dispatch() { # $1=FAKE_BLOCKED_IDS  $2=FAKE_INCLUDE_ENGWIN(0|1)  $3=FAKE_DEP_BEAD (optional)  $4=FAKE_INCLUDE_EPIC(0|1)
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
@@ -266,6 +278,7 @@ run_dispatch() { # $1=FAKE_BLOCKED_IDS  $2=FAKE_INCLUDE_ENGWIN(0|1)  $3=FAKE_DEP
     FAKE_BLOCKED_IDS="$1" \
     FAKE_INCLUDE_ENGWIN="${2:-0}" \
     FAKE_DEP_BEAD="${3:-}" \
+    FAKE_INCLUDE_EPIC="${4:-0}" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
@@ -468,6 +481,40 @@ if [ "$GNH" -gt 0 ] && [ "$ENG" -eq "$GNH" ]; then
   ok "needs:engine-window present in all $GNH query block(s)"
 else
   bad "exclusion count mismatch: gate:needs-human=$GNH needs:engine-window=$ENG"
+fi
+
+# ── Scenario 3e: split-epic shells are excluded from dispatch (gt-14nya) ───────
+# A type=epic / story:epic-split shell bead is NOT buildable (empty diff → gate
+# FAIL or dog refusal) yet the Pilot re-dispatched it every sweep (ga-z0icp 5×).
+# The fix ports the Mayor probe's (issue_type//type)!=epic guard into the
+# candidate filter. The fake bd leaks a P0 epic into the -t bug stream; if the
+# guard is absent it wins the pick (P0) and shows in "Lane picks".
+echo "Scenario 3e: split-epic shell (P0 epic) must be excluded, keeper (P1 bug) dispatched"
+LOG3E="$(run_dispatch "" 0 "" 1)"
+
+if echo "$LOG3E" | grep -q "Lane picks — small: tt-epic"; then
+  bad "LEAK: dispatched the split-epic shell (tt-epic)"
+else
+  ok "did NOT dispatch the split-epic shell"
+fi
+
+if echo "$LOG3E" | grep -q "Lane picks — small: tt-keep"; then
+  ok "dispatched the normal keeper bug (tt-keep) instead"
+else
+  bad "did not dispatch the keeper bug (tt-keep)"
+fi
+
+# ── Structural: every dispatch query block excludes type=epic natively ─────────
+# Belt to the behavioral test: --exclude-type epic must appear in EVERY block
+# that already excludes gate:needs-human (Tier 1 + Tier 2, HQ + rig paths) so an
+# epic is never even fetched as a candidate.
+echo "Structural: --exclude-type epic paired with gate:needs-human in all query blocks"
+GNH_E=$(grep -c 'exclude-label "gate:needs-human"' "$DISPATCHER")
+EPT=$(grep -c 'exclude-type epic' "$DISPATCHER")
+if [ "$GNH_E" -gt 0 ] && [ "$EPT" -eq "$GNH_E" ]; then
+  ok "--exclude-type epic present in all $GNH_E query block(s)"
+else
+  bad "exclusion count mismatch: gate:needs-human=$GNH_E exclude-type-epic=$EPT"
 fi
 
 # ── Scenario 4: stamp-based TTL recovery (ga-2azzj Defect A) ───────────────────
