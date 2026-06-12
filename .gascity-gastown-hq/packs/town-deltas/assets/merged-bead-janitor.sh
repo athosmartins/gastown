@@ -107,6 +107,61 @@ janitor_decide() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
+# PURE DECISION FUNCTION #2 — story:approved → story:done reconciliation (ga-gosfs).
+#
+# WHY a SECOND sweep: the in_progress sweep above closes merged bug/task beads.
+# STORY beads behave differently. After a gate PASS the dispatcher hands a story
+# OFF to story-delivery: it CLEARS the builder, STRIPS story:in-flight, sets
+# gate:passed, and leaves the bead OPEN with story:approved (delivery's pickup
+# selector is `story:approved + gate:passed`, see story-delivery.sh). Delivery
+# then deploys + prod-tests and adds story:done.
+#
+# The bug (ga-gosfs): that handoff strands stories at story:approved whenever the
+# normal gate→delivery→done path does not complete, e.g.
+#   • CROSS-STORE: an HQ ga-* story merged via a rig path set gate:passed on the
+#     wrong store (pre-ga-qw7y6), so delivery's HQ `story:approved + gate:passed`
+#     query never matches → no story:done.
+#   • SUPERSEDED: the branch landed via a supersede/error path that never set the
+#     gate:passed LABEL on the bead.
+#   • RIG STORIES: story-delivery only scans the HQ store (`bd -C $GC_CITY`), so a
+#     rig-store story with gate:passed is never picked up at all.
+#   • DELIVERY CRASH: delivery died between gate:passed and story:done.
+# A stranded story keeps story:approved (no story:in-flight, no story:done) →
+# the Kanban shows it as backlog though its code is already in origin/main.
+#
+# This sweep is the durable CATCH-ALL. It reuses the SAME merge-evidence
+# triangulation as janitor_decide (commit-in-main / terminal marker / branch
+# ancestry) — which is STRONGER than the gate:passed label: the commit-grep
+# signal (A) heals exactly the cross-store / superseded cases that LACK the
+# label. With merge evidence AND no active rework, it drives story:approved →
+# story:done (the same terminal story-delivery would have reached).
+#
+# janitor_story_decide <is_epic> <has_open_marker> <already_done> <in_flight>
+#                      <has_builder> <delivery_active>
+#                      <sig_commit> <sig_marker> <sig_branch>
+# Each arg is 0|1. Echoes "<verdict>:<reason>", verdict ∈ {done,keep}.
+# Guards are evaluated FIRST and in a fixed precedence — ANY active-rework or
+# not-a-merged-story condition wins over the merge signals (zero false-positive
+# is paramount: a genuinely-pending approved story must NEVER be force-done).
+# ═════════════════════════════════════════════════════════════════════════════
+janitor_story_decide() {
+  local is_epic="$1" has_open_marker="$2" already_done="$3" in_flight="$4" \
+        has_builder="$5" delivery_active="$6" sig_commit="$7" sig_marker="$8" sig_branch="$9"
+  # — Guards (keep) — lower lines win the label when several apply —
+  if [ "$is_epic" = "1" ];         then echo "keep:epic-parent-never-autoclosed"; return 0; fi
+  if [ "$already_done" = "1" ];    then echo "keep:already-story-done"; return 0; fi
+  if [ "$has_open_marker" = "1" ]; then echo "keep:active-open-gate-marker"; return 0; fi
+  if [ "$in_flight" = "1" ];       then echo "keep:story-in-flight-active-rework"; return 0; fi
+  if [ "$has_builder" = "1" ];     then echo "keep:live-builder-assignee"; return 0; fi
+  if [ "$delivery_active" = "1" ]; then echo "keep:delivery-owns-it"; return 0; fi
+  # — Merge evidence (done) — same triangulation as janitor_decide —
+  if [ "$sig_commit" = "1" ];      then echo "done:commit-in-origin-main"; return 0; fi
+  if [ "$sig_marker" = "1" ];      then echo "done:terminal-gate-marker-passed-or-superseded"; return 0; fi
+  if [ "$sig_branch" = "1" ];      then echo "done:branch-ancestor-of-origin-main"; return 0; fi
+  echo "keep:no-merge-evidence"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
 # GIT HELPERS — match the dispatcher's container/self-repo handling exactly.
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -152,6 +207,38 @@ scan_commit_for_bead() {
     [ -z "$sha" ] && continue
     body=$(git_in "$gdir" "$container" log -1 --format='%B' "$sha" 2>/dev/null || true)
     if token_bounded "$id" "$body"; then printf '%s' "$sha"; return 0; fi
+  done <<EOF
+$shas
+EOF
+  return 1
+}
+
+# scan_commit_subject_for_bead <git_dir> <is_container> <ref> <bead_id>
+# STRICTER variant of scan_commit_for_bead used by the story:done reconciliation
+# sweep (ga-gosfs): rc0 + prints the first matching sha iff an ancestor commit of
+# <ref> references the bead id (token-bounded) in its SUBJECT line — the
+# conventional-commit scope an *implementing* commit carries (feat(<id>): /
+# fix(<id>): / "fix bug <id>:" / (<id>)). Body-only mentions are REJECTED.
+#
+# WHY stricter than the in_progress sweep: a story:approved bead can sit OPEN for
+# days (engine-window / deferred work). Unrelated commits routinely name it in
+# their BODY as still-open or future work — "remains open in ga-r471 engine
+# window", "enforce … moves to wa-qggy (after tbbc)". The body-wide scan reads
+# those as "merged" and would falsely mark the story done. Marking a story done
+# is irreversible UX (it leaves the board) so zero false-positive is paramount
+# (AC3) — and a genuine story merge always puts the id in the SUBJECT (gate-done
+# commits as feat(<id>)/fix(<id>)). The unambiguous marker + branch signals still
+# cover the cross-store / superseded cases where no subject-scoped commit exists.
+scan_commit_subject_for_bead() {
+  local gdir="$1" container="$2" ref="$3" id="$4"
+  git_in "$gdir" "$container" rev-parse -q --verify "$ref" >/dev/null 2>&1 || return 1
+  local shas sha subj
+  shas=$(git_in "$gdir" "$container" log "$ref" -F --grep="$id" --format='%H' 2>/dev/null || true)
+  [ -z "$shas" ] && return 1
+  while IFS= read -r sha; do
+    [ -z "$sha" ] && continue
+    subj=$(git_in "$gdir" "$container" log -1 --format='%s' "$sha" 2>/dev/null || true)
+    if token_bounded "$id" "$subj"; then printf '%s' "$sha"; return 0; fi
   done <<EOF
 $shas
 EOF
@@ -232,7 +319,9 @@ fetch_once "$HQ_GITDIR" "$HQ_CONTAINER"
 
 CLOSED_COUNT=0
 SIBLING_ADVISORIES=0
+DONE_COUNT=0   # ga-gosfs: stories reconciled story:approved → story:done
 declare -a CLOSED_SUMMARY=()
+declare -a DONE_SUMMARY=()
 
 # Iterate every rig store.
 RIG_ROWS=$(printf '%s' "$RIG_LIST_JSON" | jq -rc '.rigs[]? | {name,prefix,path,default_branch:(.default_branch // "main"),hq:(.hq // false)}' 2>/dev/null || true)
@@ -337,13 +426,116 @@ EOF
   done <<EOF
 $(printf '%s' "$INPROG" | jq -rc '.[]?')
 EOF
+
+  # ── ga-gosfs: story:done reconciliation sweep ───────────────────────────────
+  # OPEN story:approved beads (distinct from the in_progress sweep above). After a
+  # gate PASS, stories are handed to delivery OPEN with story:approved; if delivery
+  # never completes they strand here and the Kanban shows false backlog. With merge
+  # evidence AND no active rework, drive story:approved → story:done.
+  STORIES=$(bd -C "$RPATH" list --status open --all --json -l story:approved 2>/dev/null || echo '[]')
+  [ -z "$STORIES" ] && STORIES='[]'
+  SN=$(printf '%s' "$STORIES" | jq 'length' 2>/dev/null || echo 0)
+  [ "$SN" = "0" ] || log "rig $RNAME ($RPREFIX): $SN open story:approved bead(s) to check for story:done reconciliation"
+
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    SID=$(printf '%s' "$s" | jq -r '.id' 2>/dev/null || true)
+    [ -z "$SID" ] && continue
+    STYPE=$(printf '%s' "$s" | jq -r '(.issue_type // .type // "")' 2>/dev/null || true)
+    STITLE=$(printf '%s' "$s" | jq -r '(.title // "")[0:60]' 2>/dev/null || true)
+    SLABELS=$(printf '%s' "$s" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || true)
+    SASSIGNEE=$(printf '%s' "$s" | jq -r '.assignee // ""' 2>/dev/null || true)
+
+    S_EPIC=0;     [ "$STYPE" = "epic" ] && S_EPIC=1
+    S_DONE=0;     printf '%s' "$SLABELS" | grep -qw "story:done"      && S_DONE=1
+    S_INFLIGHT=0; printf '%s' "$SLABELS" | grep -qw "story:in-flight" && S_INFLIGHT=1
+    S_BUILDER=0;  [ -n "$SASSIGNEE" ] && S_BUILDER=1
+    # delivery owns the bead while it is actively running OR has a recorded
+    # failure (a failed deploy/prod-test must NOT be masked as story:done).
+    S_DELIV=0
+    if printf '%s' "$SLABELS" | grep -qw "delivery:running" \
+       || printf '%s' "$SLABELS" | grep -qw "delivery:failed"; then S_DELIV=1; fi
+
+    # Markers (HQ-resident, regardless of which store the bead lives in).
+    SMK=$(markers_for_bead "$SID")
+    S_OPENMK=0;  has_open_marker "$SMK"           && S_OPENMK=1
+    S_SIGMK=0;   has_terminal_passed_marker "$SMK" && S_SIGMK=1
+
+    # Only pay for the git scans when no cheap guard already forces keep.
+    S_SIGCOMMIT=0; S_SIGBRANCH=0; S_COMMIT_EVID=""; S_BRANCH_EVID=""
+    if [ "$S_EPIC" = "0" ] && [ "$S_DONE" = "0" ] && [ "$S_OPENMK" = "0" ] \
+       && [ "$S_INFLIGHT" = "0" ] && [ "$S_BUILDER" = "0" ] && [ "$S_DELIV" = "0" ]; then
+      # Signal A — SUBJECT-scoped commit in own-rig repo OR HQ repo (cross-store /
+      # HQ-via-rig). Strict (subject only) to reject incidental body mentions of a
+      # still-open story — see scan_commit_subject_for_bead.
+      if sha=$(scan_commit_subject_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$SID"); then
+        S_SIGCOMMIT=1; S_COMMIT_EVID="$RNAME origin/$RDEFAULT@${sha:0:9}"
+      elif [ "$RGITDIR" != "$HQ_GITDIR" ] && sha=$(scan_commit_subject_for_bead "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$SID"); then
+        S_SIGCOMMIT=1; S_COMMIT_EVID="hq origin/$HQ_DEFAULT@${sha:0:9}"
+      fi
+      # Signal C — branch ancestor of origin/main (marker branch label, else crew/*/<id>).
+      if [ "$S_SIGCOMMIT" = "0" ] && [ "$S_SIGMK" = "0" ]; then
+        declare -a SCANDS=()
+        while IFS= read -r br; do [ -n "$br" ] && SCANDS+=("$br"); done <<EOF
+$(branch_label_from_markers "$SMK")
+EOF
+        while IFS= read -r br; do [ -n "$br" ] && SCANDS+=("$br"); done <<EOF
+$(git_in "$RGITDIR" "$RCONTAINER" for-each-ref --format='%(refname:short)' 'refs/remotes/origin/**' 2>/dev/null | sed 's#^origin/##' | awk -v id="$SID" -F/ '$NF==id' || true)
+EOF
+        for br in "${SCANDS[@]:-}"; do
+          [ -z "$br" ] && continue
+          if branch_merged "$RGITDIR" "$RCONTAINER" "origin/$br" "origin/$RDEFAULT"; then
+            S_SIGBRANCH=1; S_BRANCH_EVID="origin/$br ⊑ origin/$RDEFAULT"; break
+          fi
+        done
+      fi
+    fi
+
+    S_VERDICT_LINE=$(janitor_story_decide "$S_EPIC" "$S_OPENMK" "$S_DONE" "$S_INFLIGHT" \
+                       "$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH")
+    S_VERDICT="${S_VERDICT_LINE%%:*}"; S_REASON="${S_VERDICT_LINE#*:}"
+
+    if [ "$S_VERDICT" = "done" ]; then
+      S_EVID="$S_REASON"
+      [ -n "$S_COMMIT_EVID" ] && S_EVID="$S_EVID [$S_COMMIT_EVID]"
+      [ -n "$S_BRANCH_EVID" ] && S_EVID="$S_EVID [$S_BRANCH_EVID]"
+      [ "$S_SIGMK" = "1" ] && S_EVID="$S_EVID [terminal-marker]"
+      if [ "$DRY_RUN" = "1" ]; then
+        log "WOULD-DONE $SID ($RNAME) — $S_EVID — \"$STITLE\""
+      else
+        # Mirror story-delivery's terminal: leave the bead OPEN (delivered stories
+        # are not closed — story:done is the terminal label), keep story:approved
+        # (the persistent story-type marker the Pilot/gate/delivery selectors rely
+        # on), strip any lingering story:in-flight, add story:done. Idempotent.
+        bd -C "$RPATH" label remove "$SID" "story:in-flight" -q 2>/dev/null || true
+        if bd -C "$RPATH" label add "$SID" "story:done" -q 2>/dev/null; then
+          log "DONE $SID ($RNAME) — $S_EVID"
+          bd -C "$RPATH" comment "$SID" "merged-bead-janitor ($SOURCE_BEAD, ga-gosfs story:done reconciliation): code is in origin/main — $S_EVID — but the story was stranded story:approved (gate→delivery→done did not complete: cross-store gate:passed, superseded path, rig-store delivery never scanned, or a delivery crash). Transitioned story:approved → story:done so the Kanban no longer shows it as false backlog. story:approved kept (story-type marker); bead left open (story:done is the terminal label, matching story-delivery)." 2>/dev/null || true
+          DONE_COUNT=$((DONE_COUNT+1))
+          DONE_SUMMARY+=("$SID ($RNAME): $S_EVID")
+        else
+          err "story:done label add failed for $SID ($RNAME)"
+        fi
+      fi
+    else
+      log "keep-story $SID ($RNAME) — $S_REASON"
+    fi
+  done <<EOF
+$(printf '%s' "$STORIES" | jq -rc '.[]?')
+EOF
 done <<EOF
 $RIG_ROWS
 EOF
 
-log "=== merged-bead-janitor sweep complete — closed=$CLOSED_COUNT advisories=$SIBLING_ADVISORIES dry_run=$DRY_RUN ==="
-if [ "$CLOSED_COUNT" -gt 0 ] && [ "$DRY_RUN" = "0" ]; then
-  SUMMARY=$(printf '%s; ' "${CLOSED_SUMMARY[@]}")
-  notify_athos -t "Kanban janitor" "Auto-closed $CLOSED_COUNT merged-but-stuck bead(s): $SUMMARY"
+log "=== merged-bead-janitor sweep complete — closed=$CLOSED_COUNT story_done=$DONE_COUNT advisories=$SIBLING_ADVISORIES dry_run=$DRY_RUN ==="
+if [ "$DRY_RUN" = "0" ]; then
+  if [ "$CLOSED_COUNT" -gt 0 ]; then
+    SUMMARY=$(printf '%s; ' "${CLOSED_SUMMARY[@]}")
+    notify_athos -t "Kanban janitor" "Auto-closed $CLOSED_COUNT merged-but-stuck bead(s): $SUMMARY"
+  fi
+  if [ "$DONE_COUNT" -gt 0 ]; then
+    DSUMMARY=$(printf '%s; ' "${DONE_SUMMARY[@]}")
+    notify_athos -t "Kanban janitor" "Reconciled $DONE_COUNT merged story/stories → story:done: $DSUMMARY"
+  fi
 fi
 exit 0

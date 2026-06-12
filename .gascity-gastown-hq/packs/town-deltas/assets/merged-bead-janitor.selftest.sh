@@ -26,7 +26,8 @@ rc1() { if "$@" >/dev/null 2>&1; then bad "expected non-zero: $*"; else ok "rc!=
 # ── Load the REAL functions (lib-only = no live sweep) ──────────────────────
 JANITOR_LIB_ONLY=1 source "$JANITOR" \
   || { echo "FATAL: could not source janitor in lib-only mode"; exit 1; }
-for fn in janitor_decide token_bounded scan_commit_for_bead branch_merged \
+for fn in janitor_decide janitor_story_decide token_bounded scan_commit_for_bead \
+          scan_commit_subject_for_bead branch_merged \
           has_open_marker has_terminal_passed_marker branch_label_from_markers rig_gitdir; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by janitor"; exit 1; }
 done
@@ -50,6 +51,40 @@ eq "open-marker beats branch → keep"    "$(janitor_decide 0 1 0 0 1 | cut -d: 
 eq "open-marker reason"                 "$(janitor_decide 0 1 0 0 0)" "keep:active-open-gate-marker"
 # Epic precedence over open-marker (both 'keep' but epic wins the label).
 eq "epic+open → epic reason"            "$(janitor_decide 1 1 0 0 0)" "keep:epic-parent-never-autoclosed"
+
+# ── 1b. janitor_story_decide — merged story:approved → story:done (ga-gosfs) ──
+# Args: <is_epic> <has_open_marker> <already_done> <in_flight> <has_builder>
+#       <delivery_active> <sig_commit> <sig_marker> <sig_branch>
+# Echoes "done:<reason>" (transition story:approved → story:done) or "keep:<reason>".
+# This is the SECOND sweep: stories sit OPEN + story:approved after a gate PASS
+# (handed off to delivery). If delivery never fires (cross-store missing gate:passed,
+# superseded path, rig-store delivery never scans, delivery crash) the merged story
+# is stranded story:approved and the Kanban shows false backlog. With merge evidence
+# AND no active rework, the janitor drives it to story:done.
+echo "── 1b. janitor_story_decide (merged story → story:done) ──"
+# Happy paths: a merge signal + no active rework + not already done → done.
+eq "commit signal → done"               "$(janitor_story_decide 0 0 0 0 0 0 1 0 0)" "done:commit-in-origin-main"
+eq "marker signal → done"               "$(janitor_story_decide 0 0 0 0 0 0 0 1 0)" "done:terminal-gate-marker-passed-or-superseded"
+eq "branch signal → done"               "$(janitor_story_decide 0 0 0 0 0 0 0 0 1)" "done:branch-ancestor-of-origin-main"
+eq "any-signal verb is done"            "$(janitor_story_decide 0 0 0 0 0 0 1 0 0 | cut -d: -f1)" "done"
+# No merge evidence → keep (a genuinely-pending approved story is NOT touched: AC2).
+eq "no merge evidence → keep"           "$(janitor_story_decide 0 0 0 0 0 0 0 0 0)" "keep:no-merge-evidence"
+# Guard precedence — each guard beats every merge signal (all signals = 1):
+eq "epic beats signals → keep"          "$(janitor_story_decide 1 0 0 0 0 0 1 1 1)" "keep:epic-parent-never-autoclosed"
+eq "already-done idempotent → keep"     "$(janitor_story_decide 0 0 1 0 0 0 1 1 1)" "keep:already-story-done"
+eq "open-marker (mid-gate) → keep"      "$(janitor_story_decide 0 1 0 0 0 0 1 1 1)" "keep:active-open-gate-marker"
+eq "in-flight (active build) → keep"    "$(janitor_story_decide 0 0 0 1 0 0 1 1 1)" "keep:story-in-flight-active-rework"
+eq "live builder assignee → keep"       "$(janitor_story_decide 0 0 0 0 1 0 1 1 1)" "keep:live-builder-assignee"
+eq "delivery owns it → keep"            "$(janitor_story_decide 0 0 0 0 0 1 1 1 1)" "keep:delivery-owns-it"
+# Guard ORDER (lower-numbered guard wins the label when several apply):
+eq "epic > already-done"                "$(janitor_story_decide 1 0 1 0 0 0 0 0 0)" "keep:epic-parent-never-autoclosed"
+eq "already-done > open-marker"         "$(janitor_story_decide 0 1 1 0 0 0 0 0 0)" "keep:already-story-done"
+eq "open-marker > in-flight"            "$(janitor_story_decide 0 1 0 1 0 0 0 0 0)" "keep:active-open-gate-marker"
+eq "in-flight > builder"                "$(janitor_story_decide 0 0 0 1 1 0 0 0 0)" "keep:story-in-flight-active-rework"
+eq "builder > delivery"                 "$(janitor_story_decide 0 0 0 0 1 1 0 0 0)" "keep:live-builder-assignee"
+# Signal precedence among the three (commit > marker > branch), cosmetic only.
+eq "commit beats marker+branch"         "$(janitor_story_decide 0 0 0 0 0 0 1 1 1)" "done:commit-in-origin-main"
+eq "marker beats branch"                "$(janitor_story_decide 0 0 0 0 0 0 0 1 1)" "done:terminal-gate-marker-passed-or-superseded"
 
 # ── 2. token_bounded — whole-token id match (no substring false-positives) ──
 echo "── 2. token_bounded ──"
@@ -85,6 +120,28 @@ rc0 scan_commit_for_bead "$R" 0 "main" "tt-1"
 rc1 scan_commit_for_bead "$R" 0 "main" "tt-zzzz"
 # bad ref → rc1 (never crashes the sweep).
 rc1 scan_commit_for_bead "$R" 0 "refs/heads/does-not-exist" "tt-1or2"
+
+# ── 3b. scan_commit_subject_for_bead — STRICT (subject only), ga-gosfs ───────
+# Rejects incidental BODY mentions of a still-open story (the ga-r471 / wa-qggy
+# false-positive class) while still finding genuine implementing-commits whose
+# id is in the conventional-commit SUBJECT scope.
+echo "── 3b. scan_commit_subject_for_bead (strict subject scope) ──"
+# tt-1or2 lives ONLY in the mirror commit's BODY → strict scan must NOT find it.
+rc1 scan_commit_subject_for_bead "$R" 0 "main" "tt-1or2"
+# tt-1 is in the SUBJECT 'fix(tt-1): …' → strict scan FINDS it (genuine impl commit).
+rc0 scan_commit_subject_for_bead "$R" 0 "main" "tt-1"
+GOTS=$(scan_commit_subject_for_bead "$R" 0 "main" "tt-1" 2>/dev/null || true)
+if [ -n "$GOTS" ]; then ok "strict scan prints sha for subject-scoped tt-1 (sha=${GOTS:0:9})"; else bad "strict scan missed subject-scoped tt-1"; fi
+# absent id → not found; bad ref → rc1 (never crashes the sweep).
+rc1 scan_commit_subject_for_bead "$R" 0 "main" "tt-zzzz"
+rc1 scan_commit_subject_for_bead "$R" 0 "refs/heads/does-not-exist" "tt-1"
+# Regression: a commit that names the bead in its body as STILL-OPEN/future work
+# (verbatim shape of the ga-r471 + wa-qggy false positives) → strict scan REJECTS.
+( cd "$R" && echo e > e.txt && git add e.txt && \
+  git commit -q -m "fix(tt-other): rescope budget cap" \
+                -m "enforcement moves to tt-future (after tt-acct); remains open in tt-future engine window" )
+rc1 scan_commit_subject_for_bead "$R" 0 "main" "tt-future"   # body-only future mention → NOT done
+rc0 scan_commit_for_bead         "$R" 0 "main" "tt-future"   # body scan WOULD match (shows why strict is needed)
 
 # branch_merged: topic branch that IS an ancestor of main vs one that is not.
 git -C "$R" branch merged-topic HEAD~1     # points at the mirror commit (ancestor of main)
@@ -138,6 +195,20 @@ grep -q 'scan_commit_for_bead "$HQ_GITDIR"' "$JANITOR" && ok "cross-store HQ-rep
 # set -e/pipefail safety: no `set -e` (sweep tolerates per-bead failures) but
 # the close path guards its mutation with `|| { err ...; continue; }`.
 grep -q 'close failed for' "$JANITOR" && ok "close failure is non-fatal (continue)" || bad "close failure not guarded"
+# ga-gosfs: story:done reconciliation sweep wiring.
+grep -q 'janitor_story_decide()' "$JANITOR" && ok "defines janitor_story_decide"     || bad "missing janitor_story_decide def"
+grep -q 'scan_commit_subject_for_bead()' "$JANITOR" && ok "defines strict subject scanner" || bad "missing scan_commit_subject_for_bead def"
+# The story sweep MUST use the strict subject scanner (not the body scanner) for
+# signal A — guards against the ga-r471/wa-qggy incidental-body-mention class.
+grep -q 'scan_commit_subject_for_bead "\$RGITDIR"' "$JANITOR" && ok "story sweep uses strict subject scan" || bad "story sweep not using strict scanner"
+grep -q 'label add "\$SID" "story:done"' "$JANITOR" && ok "story sweep sets story:done" || bad "story:done transition missing"
+grep -q 'already-story-done' "$JANITOR"          && ok "story idempotency guard present" || bad "story already-done guard missing"
+grep -q 'delivery-owns-it' "$JANITOR"            && ok "delivery-active guard present"   || bad "delivery guard missing"
+grep -q 'story-in-flight-active-rework' "$JANITOR" && ok "story in-flight guard present" || bad "story in-flight guard missing"
+# The story sweep must select OPEN story:approved beads (the stuck-merged shape),
+# distinct from the in_progress sweep above.
+grep -q 'list --status open --all --json -l story:approved' "$JANITOR" \
+  && ok "story sweep selects open story:approved" || bad "story sweep selector missing"
 # plist drift.
 grep -q 'com.gascity.merged-bead-janitor' "$PLIST" && ok "plist Label correct"        || bad "plist Label wrong"
 grep -q '<key>StartInterval</key>' "$PLIST"        && ok "plist uses StartInterval"    || bad "plist missing StartInterval"
