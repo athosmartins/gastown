@@ -921,9 +921,23 @@ fi
 # tech-debt label: use "tech-debt" as canonical label for debt items.
 #
 # Helper: filter out self-bead + already-assigned from a JSON array.
+#
+# gt-14nya: ALSO drop split-epic shells. A type=epic (or story:epic-split-labeled)
+# bead is a non-buildable container — dispatching it produces an empty diff that
+# gate FAILs / the dog refuses, and the Pilot then re-dispatched it every sweep
+# (ga-z0icp was slung 5×). This ports the SAME guard the Mayor's startup probe
+# uses ((issue_type // type) != "epic") into the candidate path. Every candidate
+# array (Tier 1/2, HQ + rig) flows through this helper, so one guard here covers
+# all paths and any future query. The split epic's CHILDREN are ordinary tasks
+# with their own type — they remain dispatchable, exactly as the AC requires.
 _filter_candidates() {
   jq --arg self "$SELF_BEAD_ID" \
-    '[.[] | select(.id != $self and (.assignee == null or .assignee == ""))]' \
+    '[.[] | select(
+        .id != $self
+        and (.assignee == null or .assignee == "")
+        and ((.issue_type // .type // "") != "epic")
+        and (((.labels // []) | index("story:epic-split")) | not)
+     )]' \
     2>/dev/null || echo "[]"
 }
 
@@ -1060,6 +1074,7 @@ BUGS_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-label "gate:needs-human" \
   --exclude-label "needs:engine-window" \
   --exclude-label "pilot:dispatched" \
+  --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
 BUGS_JSON=$(echo "$BUGS_JSON" | _filter_candidates)
@@ -1073,6 +1088,7 @@ DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-label "gate:needs-human" \
   --exclude-label "needs:engine-window" \
   --exclude-label "pilot:dispatched" \
+  --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
 DEBT_JSON=$(echo "$DEBT_JSON" | _filter_candidates)
@@ -1117,6 +1133,7 @@ if [ "$TIER1_COUNT" -eq "0" ]; then
     --exclude-label "gate:needs-human" \
     --exclude-label "needs:engine-window" \
     --exclude-label "pilot:dispatched" \
+    --exclude-type epic \
     -n 0 \
     2>/dev/null || echo "[]")
   TIER2_JSON=$(echo "$TIER2_JSON" | _filter_candidates)
@@ -1156,6 +1173,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "gate:needs-human" \
       --exclude-label "needs:engine-window" \
       --exclude-label "pilot:dispatched" \
+      --exclude-type epic \
       -n 0 2>/dev/null || echo "[]")
     RIG_BUGS=$(echo "$RIG_BUGS" | _filter_candidates | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_BUGS" | jq -s 'add // []' 2>/dev/null || echo "[]")
@@ -1169,6 +1187,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "gate:needs-human" \
       --exclude-label "needs:engine-window" \
       --exclude-label "pilot:dispatched" \
+      --exclude-type epic \
       -n 0 2>/dev/null || echo "[]")
     RIG_DEBT=$(echo "$RIG_DEBT" | _filter_candidates | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_DEBT" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
@@ -1182,6 +1201,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "gate:needs-human" \
       --exclude-label "needs:engine-window" \
       --exclude-label "pilot:dispatched" \
+      --exclude-type epic \
       -n 0 2>/dev/null || echo "[]")
     RIG_FEATURES=$(echo "$RIG_FEATURES" | _filter_candidates | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
     ALL_RIG_TIER2=$(echo "$ALL_RIG_TIER2 $RIG_FEATURES" | jq -s 'add // []' 2>/dev/null || echo "[]")
