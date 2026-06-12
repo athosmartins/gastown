@@ -174,16 +174,63 @@ SELF_BEAD_ID="ga-8c1"
 #   ps = property_scrapers  (batista-ps)
 #   ma = marketing
 #   hq = gastown-hq         (system/infra agents)
-rig_to_builder() {
+# rig_to_builders <rig> — print the rig's ORDERED builder POOL (space-separated).
+# A rig with >1 interchangeable single-identity crew (e.g. whatsapp_automation:
+# digo/mila/oracle/peter/thies-wa) is a POOL: the dispatcher distributes work
+# across its members (ga-mtlm6) instead of piling every bead on one. Pool order
+# is the dispatch preference (first-eligible wins). Single-member rigs are a pool
+# of one — behaviourally identical to the pre-ga-mtlm6 single-target routing.
+rig_to_builders() {
   local rig="$1"
   case "$rig" in
     gascity)               echo "gastown.dog"    ;;
-    whatsapp_automation|wa) echo "digo-wa"        ;;
+    whatsapp_automation|wa) echo "digo-wa mila-wa oracle-wa peter-wa thies-wa" ;;
     property_scrapers|ps)  echo "batista-ps"     ;;
     gastown|gt)            echo "gastown.dog"    ;;
     lexbh|lx)              echo "gastown.dog"    ;;
     marketing|ma)          echo "gastown.dog"    ;;
     *)                     echo "gastown.dog"    ;;
+  esac
+}
+
+# rig_to_builder <rig> — back-compat single target: the first builder of the pool.
+rig_to_builder() {
+  set -- $(rig_to_builders "$1")
+  echo "${1:-gastown.dog}"
+}
+
+# ── Pool selection state (ga-mtlm6) ───────────────────────────────────────────
+# PILOT_BUSY_BUILDERS — builders currently holding LIVE in-flight work (computed
+#   once per sweep from IN_FLIGHT_JSON's sling-task assignees). A busy single-
+#   identity crew must NOT receive a second task (the wa-1eos duplicate-session /
+#   branch-corruption hazard).
+# PILOT_USED_BUILDERS — builders given work earlier in THIS sweep, so consecutive
+#   picks rotate across distinct idle crew rather than all landing on the first.
+# Both are space-padded membership lists, fail-open (empty = no exclusion).
+PILOT_BUSY_BUILDERS=""
+PILOT_USED_BUILDERS=""
+
+# pick_pool_builder <rig> — echo an idle crew from the rig's pool, or nothing (and
+# return 1) if every member is busy or already used this sweep. Pure read of the
+# two sets above; the caller records the winner via mark_pool_builder so the next
+# pick in the same sweep advances to a different crew.
+pick_pool_builder() {
+  local crew
+  for crew in $(rig_to_builders "$1"); do
+    case " $PILOT_BUSY_BUILDERS " in *" $crew "*) continue ;; esac
+    case " $PILOT_USED_BUILDERS " in *" $crew "*) continue ;; esac
+    echo "$crew"
+    return 0
+  done
+  return 1
+}
+
+# mark_pool_builder <builder> — record a builder as used this sweep (idempotent).
+# MUST be called in the main shell (never a subshell) so the global persists.
+mark_pool_builder() {
+  case " $PILOT_USED_BUILDERS " in
+    *" $1 "*) : ;;
+    *) PILOT_USED_BUILDERS="${PILOT_USED_BUILDERS:+$PILOT_USED_BUILDERS }$1" ;;
   esac
 }
 
@@ -634,6 +681,53 @@ IN_FLIGHT_BIG=$(echo "$IN_FLIGHT_JSON" | jq '[.[] | select((.labels // []) | con
 IN_FLIGHT_SMALL=$((IN_FLIGHT_TOTAL - IN_FLIGHT_BIG))
 
 log "In-flight: live=$IN_FLIGHT_TOTAL (raw=$IN_FLIGHT_RAW_TOTAL stale=$STALE_INFLIGHT age=$STALE_AGE dead=$DEAD_WORKER)  small=$IN_FLIGHT_SMALL/${MAX_SMALL}  big=$IN_FLIGHT_BIG/${MAX_BIG}"
+
+# ── Per-builder busy set (ga-mtlm6) ───────────────────────────────────────────
+# For a POOLED rig (multiple interchangeable crew), a builder is BUSY iff it
+# currently holds a LIVE in-flight task — so it must be excluded from this sweep's
+# selection (a second task to a busy single-identity crew is the wa-1eos branch-
+# corruption hazard). Resolve each live in-flight bead's sling-task assignee (the
+# builder identity the crew recorded via `bd assign`) from the SAME, already
+# dead-worker-filtered IN_FLIGHT_JSON the slot math trusts. Best-effort + fail-
+# open per leg: an in-flight bead with no sling task or no resolvable assignee
+# simply omits that builder (the USED-this-sweep set + global lane cap still bound
+# dispatch), mirroring the dead-worker check's never-over-free philosophy.
+_compute_busy_builders() {
+  local _n _i _bead _sling _asg _forms _f
+  _n=$(echo "$IN_FLIGHT_JSON" | jq 'length' 2>/dev/null || echo "0")
+  [ "${_n:-0}" -gt 0 ] 2>/dev/null || return 0
+  _i=0
+  while [ "$_i" -lt "$_n" ]; do
+    _bead=$(echo "$IN_FLIGHT_JSON" | jq -c ".[$_i]" 2>/dev/null)
+    _i=$((_i + 1))
+    [ -n "$_bead" ] || continue
+    _sling=$(echo "$_bead" | jq -r '.metadata["pilot.sling_bead"] // ""' 2>/dev/null || echo "")
+    [ -n "$_sling" ] || continue
+    _asg=$(bd -C "$GC_CITY" show "$_sling" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
+    [ -n "$_asg" ] || continue
+    # Normalize to ALL of that session's identifiers (session_name/name/alias/id/
+    # agent_name). A crew claims its sling task with its GC_SESSION_NAME (verified
+    # live: 'digo-wa-gawispcze4o4'), but the pool lists the alias ('digo-wa'); add
+    # every form so pick_pool_builder's alias match still excludes the busy crew.
+    # Fall back to the raw assignee when the roster can't resolve it (still
+    # excludes by that exact string — never worse than the un-normalized set).
+    _forms=$(echo "$_SESSIONS_JSON" | jq -r --arg a "$_asg" '
+      [ .sessions[]?
+        | select((.session_name==$a) or (.name==$a) or (.alias==$a) or (.id==$a) or (.agent_name==$a))
+        | (.session_name,.name,.alias,.id,.agent_name) ]
+      | map(select(. != null and . != "")) | unique | .[]' 2>/dev/null)
+    [ -n "$_forms" ] || _forms="$_asg"
+    for _f in $_forms; do
+      case " $PILOT_BUSY_BUILDERS " in
+        *" $_f "*) : ;;
+        *) PILOT_BUSY_BUILDERS="${PILOT_BUSY_BUILDERS:+$PILOT_BUSY_BUILDERS }$_f" ;;
+      esac
+    done
+  done
+}
+_compute_busy_builders
+[ -n "$PILOT_BUSY_BUILDERS" ] && log "Busy builders (live in-flight): $PILOT_BUSY_BUILDERS"
 
 SMALL_SLOTS=$((MAX_SMALL - IN_FLIGHT_SMALL))
 BIG_SLOTS=$((MAX_BIG - IN_FLIGHT_BIG))
@@ -1193,26 +1287,52 @@ FIXSEC
 
   # ── Determine builder target ─────────────────────────────────────────────────
   # STORY_RIG and STORY_BEAD_CITY already resolved above (gt-pm55p early rig fix).
-  local BUILDER_TARGET
-  BUILDER_TARGET=$(rig_to_builder "$STORY_RIG")
-  log "  Builder target: $BUILDER_TARGET (rig=$STORY_RIG bead_city=$STORY_BEAD_CITY lane=$LANE)"
+  local BUILDER_TARGET _POOL _POOL_N
+  _POOL=$(rig_to_builders "$STORY_RIG")
+  _POOL_N=$(echo "$_POOL" | wc -w | tr -d ' ')
 
-  # ── wa-1eos: per-builder mutex ───────────────────────────────────────────────
-  # Single-identity builders (digo-wa=wa, batista-ps=ps, etc.) must have AT MOST ONE
-  # live session. Without this, dispatching a 2nd bead to a busy builder makes
-  # `gc sling` spawn a duplicate (digo-wa → digo-wa-1) that works the SAME crew branch —
-  # branch corruption. If the builder is already live, defer this bead to the next
-  # sweep (release the claim so it stays dispatchable). gastown.dog is a shared
-  # pool (multiple instances by design) — exempt. Fail-safe: any error → count 0 →
-  # dispatch proceeds (never halts the pipeline on a transient `gc` hiccup).
-  if [ "$DRY_RUN" != "1" ] && [ "$BUILDER_TARGET" != "gastown.dog" ]; then
-    local LIVE_BUILDER_SESSIONS
-    LIVE_BUILDER_SESSIONS=$(gc --city "$GC_CITY" session list 2>/dev/null \
-      | awk -v t="$BUILDER_TARGET" '$2==t && $3=="active"' | wc -l | tr -d ' ')
-    if [ "${LIVE_BUILDER_SESSIONS:-0}" -ge 1 ] 2>/dev/null; then
-      log "MUTEX(wa-1eos): builder $BUILDER_TARGET already has ${LIVE_BUILDER_SESSIONS} live session(s) — deferring $STORY_ID to next sweep (no duplicate spawn). Releasing claim."
+  if [ "${_POOL_N:-1}" -gt 1 ]; then
+    # ── ga-mtlm6: pooled rig — distribute across idle crew, deliver to existing ──
+    # A rig with several interchangeable single-identity crew (WA: digo/mila/
+    # oracle/peter/thies-wa). Pick a crew that is NEITHER busy with live in-flight
+    # work (PILOT_BUSY_BUILDERS) NOR already loaded this sweep (PILOT_USED_BUILDERS),
+    # so M bugs fan out to M crew instead of all piling on digo-wa. An idle crew
+    # that already has a live session RECEIVES the task — `gc sling` routes the
+    # task bead to it and `--nudge`/session nudge wakes the existing session — it
+    # is NOT deferred. (The pre-ga-mtlm6 path routed every WA bug to one pinned
+    # builder, then the wa-1eos "active session → defer" mutex deferred it forever
+    # while 4 idle crew sat starved.) When every crew is busy/used → defer (release
+    # the claim, retry next sweep): correct backpressure, never a duplicate spawn.
+    BUILDER_TARGET=$(pick_pool_builder "$STORY_RIG" || echo "")
+    if [ -z "$BUILDER_TARGET" ]; then
+      log "POOL($STORY_RIG): all crew busy/used this sweep (pool=[$_POOL] busy=[${PILOT_BUSY_BUILDERS:-none}] used=[${PILOT_USED_BUILDERS:-none}]) — deferring $STORY_ID to next sweep. Releasing claim."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
+    fi
+    mark_pool_builder "$BUILDER_TARGET"
+    log "  Builder target: $BUILDER_TARGET (rig=$STORY_RIG bead_city=$STORY_BEAD_CITY lane=$LANE) [pool: $_POOL]"
+  else
+    # ── Single-member rig (gastown.dog pool, or a lone single-identity crew) ─────
+    BUILDER_TARGET="$_POOL"
+    log "  Builder target: $BUILDER_TARGET (rig=$STORY_RIG bead_city=$STORY_BEAD_CITY lane=$LANE)"
+
+    # ── wa-1eos: per-builder mutex (single-identity, single-member rigs only) ────
+    # A lone single-identity builder (e.g. batista-ps) must have AT MOST ONE live
+    # session. Dispatching a 2nd bead to a busy one makes `gc sling` spawn a
+    # duplicate (batista-ps → batista-ps-1) that works the SAME crew branch —
+    # branch corruption. If already live, defer (release the claim so it stays
+    # dispatchable). gastown.dog is a shared pool (multiple instances by design) —
+    # exempt. Pooled rigs (WA) are handled above by the busy-set, not this mutex.
+    # Fail-safe: any error → count 0 → dispatch proceeds (never halts on a `gc` hiccup).
+    if [ "$DRY_RUN" != "1" ] && [ "$BUILDER_TARGET" != "gastown.dog" ]; then
+      local LIVE_BUILDER_SESSIONS
+      LIVE_BUILDER_SESSIONS=$(gc --city "$GC_CITY" session list 2>/dev/null \
+        | awk -v t="$BUILDER_TARGET" '$2==t && $3=="active"' | wc -l | tr -d ' ')
+      if [ "${LIVE_BUILDER_SESSIONS:-0}" -ge 1 ] 2>/dev/null; then
+        log "MUTEX(wa-1eos): builder $BUILDER_TARGET already has ${LIVE_BUILDER_SESSIONS} live session(s) — deferring $STORY_ID to next sweep (no duplicate spawn). Releasing claim."
+        bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+        return 1
+      fi
     fi
   fi
 

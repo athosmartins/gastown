@@ -866,6 +866,121 @@ else
   bad "quota probe missing the fail-open guard (absent checker must not block dispatch)"
 fi
 
+# ── Scenario 15: pooled-rig crew distribution (ga-mtlm6) ──────────────────────
+# Bug ga-mtlm6: rig_to_builder() hardcoded whatsapp_automation → digo-wa, so EVERY
+# WA bug routed to ONE pinned session. With it already live, the wa-1eos mutex
+# deferred forever — 4 idle WA crew starved while 46 bugs waited. The fix treats a
+# multi-crew rig as a POOL: each dispatch in a sweep picks a DISTINCT idle crew
+# (rotation), a crew already holding live in-flight work is EXCLUDED (busy-set),
+# and an idle crew with a live session RECEIVES the task instead of being deferred.
+#
+# Helper: pull the chosen builder from each "Builder target:" log line.
+builders_of() { echo "$1" | grep 'Builder target:' | sed -E 's/.*Builder target: ([^ ]+).*/\1/'; }
+
+# Five small, unblocked WA-rig bugs (story.rig overrides prefix inference).
+WA_FIVE_BUGS='[
+  {"id":"tt-wa1","title":"wa bug 1","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}},
+  {"id":"tt-wa2","title":"wa bug 2","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{"story.rig":"whatsapp_automation"}},
+  {"id":"tt-wa3","title":"wa bug 3","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:03Z","metadata":{"story.rig":"whatsapp_automation"}},
+  {"id":"tt-wa4","title":"wa bug 4","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:04Z","metadata":{"story.rig":"whatsapp_automation"}},
+  {"id":"tt-wa5","title":"wa bug 5","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:05Z","metadata":{"story.rig":"whatsapp_automation"}}
+]'
+
+echo "Scenario 15a: 5 WA bugs in one sweep fan out to 5 DISTINCT crew (not all digo-wa)"
+LOG15A="$(run_capacity 10 "[]" 1 "$WA_FIVE_BUGS")"
+B15A="$(builders_of "$LOG15A")"
+TOTAL15A=$(echo "$B15A" | grep -c .)
+DISTINCT15A=$(echo "$B15A" | sort -u | grep -c .)
+if [ "$TOTAL15A" -ge 5 ] && [ "$DISTINCT15A" -ge 5 ]; then
+  ok "5 dispatches went to 5 distinct crew (total=$TOTAL15A distinct=$DISTINCT15A)"
+else
+  bad "REGRESSION: WA work not distributed (total=$TOTAL15A distinct=$DISTINCT15A — single-point routing?)"
+fi
+if echo "$B15A" | grep -qvE '^(digo|mila|oracle|peter|thies)-wa$'; then
+  bad "a dispatch targeted a non-WA-crew builder: $(echo "$B15A" | grep -vE '^(digo|mila|oracle|peter|thies)-wa$' | tr '\n' ' ')"
+else
+  ok "every dispatch targeted a member of the WA crew pool"
+fi
+if [ "$(echo "$B15A" | grep -c '^digo-wa$')" -le 1 ]; then
+  ok "digo-wa is no longer the sole sink (appears at most once)"
+else
+  bad "REGRESSION: digo-wa received multiple dispatches in one sweep (pile-up)"
+fi
+
+echo "Scenario 15b: non-pooled rig unchanged — gascity bugs still route to gastown.dog"
+LOG15B="$(run_capacity 10 "[]" 1 "$FIVE_SMALL_BUGS")"
+B15B="$(builders_of "$LOG15B")"
+if [ "$(echo "$B15B" | grep -c .)" -ge 5 ] && [ -z "$(echo "$B15B" | grep -vE '^gastown\.dog$')" ]; then
+  ok "all gascity dispatches still target gastown.dog (no regression)"
+else
+  bad "REGRESSION: gascity routing changed (got: $(echo "$B15B" | sort -u | tr '\n' ' '))"
+fi
+
+echo "Scenario 15c: a busy crew (live in-flight work) is EXCLUDED — next idle crew chosen"
+NOW_ISO15="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+INFLIGHT15C="[{\"id\":\"if-digo\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO15\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-digo\"}}]"
+SESSIONS15C='{"sessions":[{"session_name":"digo-wa","closed":false}]}'
+SLINGMAP15C='{"tt-sling-digo":"digo-wa"}'
+WA_ONE_BUG='[{"id":"tt-wax","title":"wa bug x","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}}]'
+LOG15C="$(run_capacity 10 "$INFLIGHT15C" 1 "$WA_ONE_BUG" "$SESSIONS15C" "$SLINGMAP15C")"
+B15C="$(builders_of "$LOG15C")"
+if echo "$LOG15C" | grep -q "Busy builders (live in-flight): digo-wa"; then
+  ok "computed the busy-builder set from live in-flight work"
+else
+  bad "did not compute/log the busy-builder set (expected 'Busy builders (live in-flight): digo-wa')"
+fi
+if [ "$B15C" = "digo-wa" ]; then
+  bad "REGRESSION: dispatched to the BUSY crew digo-wa (would risk duplicate session)"
+elif echo "$B15C" | grep -qE '^(mila|oracle|peter|thies)-wa$'; then
+  ok "busy digo-wa excluded; work delivered to an idle crew ($B15C)"
+else
+  bad "expected an idle WA crew, got: '$B15C'"
+fi
+
+echo "Scenario 15d: ALL crew busy → defer (backpressure), never pile onto one"
+# 4 small in-flight (digo/mila/oracle/peter busy) + 1 big in-flight (thies busy):
+# leaves 1 small slot FREE yet every WA crew is busy → the lone WA bug must DEFER.
+INFLIGHT15D="[\
+{\"id\":\"if-d\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO15\",\"metadata\":{\"pilot.sling_bead\":\"tt-s-d\"}},\
+{\"id\":\"if-m\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO15\",\"metadata\":{\"pilot.sling_bead\":\"tt-s-m\"}},\
+{\"id\":\"if-o\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO15\",\"metadata\":{\"pilot.sling_bead\":\"tt-s-o\"}},\
+{\"id\":\"if-p\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO15\",\"metadata\":{\"pilot.sling_bead\":\"tt-s-p\"}},\
+{\"id\":\"if-t\",\"labels\":[\"story:in-flight\",\"lane:big\"],\"updated_at\":\"$NOW_ISO15\",\"metadata\":{\"pilot.sling_bead\":\"tt-s-t\"}}]"
+SESSIONS15D='{"sessions":[{"session_name":"digo-wa","closed":false},{"session_name":"mila-wa","closed":false},{"session_name":"oracle-wa","closed":false},{"session_name":"peter-wa","closed":false},{"session_name":"thies-wa","closed":false}]}'
+SLINGMAP15D='{"tt-s-d":"digo-wa","tt-s-m":"mila-wa","tt-s-o":"oracle-wa","tt-s-p":"peter-wa","tt-s-t":"thies-wa"}'
+LOG15D="$(run_capacity 10 "$INFLIGHT15D" 1 "$WA_ONE_BUG" "$SESSIONS15D" "$SLINGMAP15D")"
+B15D="$(builders_of "$LOG15D")"
+if [ -z "$B15D" ] && echo "$LOG15D" | grep -qE "POOL\(whatsapp_automation\): all crew busy"; then
+  ok "all-busy pool deferred the bug (no dispatch, correct backpressure)"
+else
+  bad "all-busy pool did not defer cleanly (builders='$(echo "$B15D" | tr '\n' ' ')')"
+fi
+
+echo "Scenario 15f: busy crew matched by NAME even when sling task records the session_name"
+# Production shape (verified live): a crew claims its sling task with its
+# GC_SESSION_NAME (e.g. 'digo-wa-gawispcze4o4'), NOT the alias 'digo-wa' the pool
+# lists. The busy-set must normalize the assignee through the session roster so
+# the alias-named pool member is still excluded — otherwise exclusion silently
+# no-ops in prod and a busy crew gets a second task.
+INFLIGHT15F="[{\"id\":\"if-digo2\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO15\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-digo2\"}}]"
+SESSIONS15F='{"sessions":[{"session_name":"digo-wa-gawispcze4o4","name":"digo-wa","alias":"digo-wa","id":"ga-wisp-cze4o4","agent_name":"digo-wa","closed":false}]}'
+SLINGMAP15F='{"tt-sling-digo2":"digo-wa-gawispcze4o4"}'
+LOG15F="$(run_capacity 10 "$INFLIGHT15F" 1 "$WA_ONE_BUG" "$SESSIONS15F" "$SLINGMAP15F")"
+B15F="$(builders_of "$LOG15F")"
+if [ "$B15F" = "digo-wa" ]; then
+  bad "REGRESSION: assignee in session_name form not normalized — dispatched to BUSY digo-wa"
+elif echo "$B15F" | grep -qE '^(mila|oracle|peter|thies)-wa$'; then
+  ok "session_name assignee normalized to alias; busy digo-wa excluded (chose $B15F)"
+else
+  bad "expected an idle WA crew, got: '$B15F'"
+fi
+
+echo "Scenario 15e: drift-guard — pool routing + selection wired into the live dispatcher"
+has "$DISPATCHER" 'rig_to_builders\(\)'                         "rig_to_builders pool function is defined"
+has "$DISPATCHER" 'digo-wa mila-wa oracle-wa peter-wa thies-wa' "WA rig maps to the full 5-crew pool"
+has "$DISPATCHER" 'pick_pool_builder\(\)'                       "idle-crew selection function is defined"
+has "$DISPATCHER" 'PILOT_BUSY_BUILDERS'                         "busy-builder exclusion set is wired"
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
