@@ -282,8 +282,15 @@ select_headroom() { # [exclude_label] → label or empty
 # --------------------------------------------------------------------------
 # notify wrapper — label/ETA only, never a token. `log` aborts inline if the
 # message carries a token, so a tainted message never reaches the notifier.
+#
+# The function is named `relog_notify`, NOT `notify`: NOTIFY_CMD defaults to
+# the external `notify` CLI, and a shell function named `notify` would shadow
+# it — `command -v notify` resolves the function, so `"$NOTIFY_CMD" ...` would
+# re-enter this function recursively (each level sees $1="-t") and segfault
+# before any notice is sent. Keeping the names distinct lets the lookup find
+# the real CLI on PATH (or nothing, if absent).
 # --------------------------------------------------------------------------
-notify() { # <message>
+relog_notify() { # <message>
   local msg="$1"
   log "$msg"   # aborts the script if $msg contains a credential token
   if command -v "$NOTIFY_CMD" >/dev/null 2>&1; then
@@ -429,7 +436,7 @@ cmd_auto() {
 
   next="$(select_headroom "$active")"
   if [ -z "$next" ]; then
-    notify "Claude account '$active' at apex (resets ${reset_text:-?}) — NO pool account with headroom → PAUSE (ga-x3nmz fallback)"
+    relog_notify "Claude account '$active' at apex (resets ${reset_text:-?}) — NO pool account with headroom → PAUSE (ga-x3nmz fallback)"
     return 2
   fi
 
@@ -439,10 +446,10 @@ cmd_auto() {
   fi
 
   if do_swap "$next"; then
-    notify "Claude account '$active' at apex (resets ${reset_text:-?}) → relogged to '$next' (headroom). Sessions continue."
+    relog_notify "Claude account '$active' at apex (resets ${reset_text:-?}) → relogged to '$next' (headroom). Sessions continue."
     return 0
   else
-    notify "Claude account '$active' at apex → swap to '$next' FAILED (credential missing/invalid) → PAUSE fallback"
+    relog_notify "Claude account '$active' at apex → swap to '$next' FAILED (credential missing/invalid) → PAUSE fallback"
     return 3
   fi
 }

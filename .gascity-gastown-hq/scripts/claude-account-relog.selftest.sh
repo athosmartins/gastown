@@ -252,6 +252,48 @@ if [ "$RC" != 0 ] && ! printf '%s' "$OUT" | grep -q 'sk-ant-oat01-LEAKMARKER'; t
   ok "redaction guard aborts on a token in a logged field (AC4)"
 else bad "redaction guard fires" "rc=$RC out=$OUT"; fi
 
+# ---------------------------------------------------------------------------
+# CASE 14: the apex notify path must call the EXTERNAL notify command, never a
+# same-named internal shell function. Regression for the self-shadow bug: when
+# the notifier defaults to "notify" (its real production default), `command -v
+# notify` must resolve the CLI on PATH — not a function literally named notify,
+# which would re-enter itself ("-t" → "-t" → …) and segfault before returning.
+# We stage a real `notify` on PATH, leave CLAUDE_RELOG_NOTIFY UNSET so the
+# script uses its default, force the no-headroom PAUSE path, and assert the
+# script returns its true exit code (2) and invoked the external notifier
+# exactly once (no recursion flood, no crash).
+# ---------------------------------------------------------------------------
+NBIN="$SBX/notifybin"; mkdir -p "$NBIN"
+cat > "$NBIN/notify" <<EOF
+#!/bin/bash
+printf '%s\n' "\$*" >> "$SBX/notify.calls"
+EOF
+chmod +x "$NBIN/notify"
+: > "$SBX/notify.calls"
+blob_for alpha > "$KC"; run bash "$SUT" register alpha
+cat > "$STATE_DIR/state.json" <<EOF
+{"alpha":{"limited_until":0},"beta":{"limited_until":$((NOW+9999))},"gamma":{"limited_until":$((NOW+9999))}}
+EOF
+stage_quota true session 60 "6:00pm"
+# NB: CLAUDE_RELOG_NOTIFY intentionally NOT injected here → script default "notify".
+OUT=$(env \
+  PATH="$NBIN:$PATH" \
+  CLAUDE_RELOG_ENABLED=1 \
+  CLAUDE_RELOG_STATE_DIR="$STATE_DIR" \
+  CLAUDE_RELOG_QUOTA_CHECK="$QCHECK" \
+  CLAUDE_RELOG_SECRET_CMD="$SECRET_CMD" \
+  CLAUDE_RELOG_KEYCHAIN_GET="cat '$KC' 2>/dev/null" \
+  CLAUDE_RELOG_KEYCHAIN_SET="cat > '$KC'" \
+  CLAUDE_RELOG_NOW="$NOW" \
+  bash "$SUT" auto 2>&1)
+RC=$?
+NCALLS=$( [ -f "$SBX/notify.calls" ] && wc -l < "$SBX/notify.calls" | tr -d ' ' || echo 0)
+if [ "$RC" = 2 ] && [ "$NCALLS" = 1 ]; then
+  ok "apex notify invokes external notifier once, no self-recursion (exit 2)"
+else
+  bad "notify no-self-recursion" "rc=$RC (want 2) notify_calls=$NCALLS (want 1) out_tail=$(printf '%s' "$OUT" | tail -1)"
+fi
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
