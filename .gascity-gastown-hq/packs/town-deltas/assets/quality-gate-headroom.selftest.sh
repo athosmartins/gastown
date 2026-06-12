@@ -160,6 +160,48 @@ else
   bad "DEFER branch does not exit 0 after the log (would fall through into the claim)"
 fi
 
+echo "── 18. ga-x3nmz: quota-stop re-queue (a quota-exhausted stall is NOT a FAIL) ──"
+type gate_quota_stop_verdict >/dev/null 2>&1 || { echo "FATAL: gate_quota_stop_verdict not defined"; exit 1; }
+type quota_reset_eta         >/dev/null 2>&1 || { echo "FATAL: quota_reset_eta not defined"; exit 1; }
+# Pure decision: a no-verdict stall is a quota-stop (→ requeue) iff quota limited.
+eq "quota LIMITED (1) → requeue"               "$(gate_quota_stop_verdict 1)"  "requeue"
+eq "quota ok (0)      → proceed (genuine fail)" "$(gate_quota_stop_verdict 0)"  "proceed"
+eq "junk/empty arg    → proceed (fail-safe)"   "$(gate_quota_stop_verdict '')" "proceed"
+# Reset-ETA reader: override seam short-circuits the live checker.
+eq "ETA override seam returns the forced text" "$(GATE_QUOTA_ETA_OVERRIDE='resets 5pm (in 9min)' quota_reset_eta)" "resets 5pm (in 9min)"
+eq "ETA absent checker → empty (fail-soft)"    "$(GC_CITY=/nonexistent-x3nmz-test quota_reset_eta)" ""
+
+echo "── 19. ga-x3nmz drift-guard: the re-queue path is wired into the live poll ──"
+has "$DISPATCHER" 'gate_quota_stop_verdict\(\)'                 "pure quota-stop decision is defined"
+has "$DISPATCHER" 'quota_reset_eta\(\)'                         "reset-ETA reader is defined"
+has "$DISPATCHER" 'QUOTA_REQUEUE=0'                             "QUOTA_REQUEUE state initialized"
+has "$DISPATCHER" 'gate_quota_stop_verdict "\$POLL_QUOTA_LIMITED"' "quota decision called from the poll loop"
+has "$DISPATCHER" 'verdict:REQUEUED'                            "pending verdicts parked as REQUEUED (not TIMEOUT)"
+has "$DISPATCHER" 'QUOTA-STOP re-queue'                         "marker re-queue comment present"
+has "$DISPATCHER" 'Gate pausado: cota 5h'                       "AC4 quota-pause notify present"
+
+echo "── 20. ga-x3nmz: a quota-stop re-queues (queued) instead of FAILing the marker ──"
+# The handler must set gate-status:queued (re-runnable), never gate-status:failed.
+if awk '/QUOTA_REQUEUE:-0/{f=1} f&&/label add    "\$MARKER_ID" "gate-status:queued"/{print "ok"; exit}' "$DISPATCHER" | grep -q ok; then
+  ok "re-queue handler restores gate-status:queued"
+else
+  bad "re-queue handler does not set gate-status:queued"
+fi
+if awk '/QUOTA_REQUEUE:-0/{f=1} f&&/exit 0/{print "ok"; exit} f&&/OVERALL_VERDICT" = "PASS"/{exit}' "$DISPATCHER" | grep -q ok; then
+  ok "re-queue handler exits 0 (skips both PASS and FAIL paths)"
+else
+  bad "re-queue handler does not exit 0 before the verdict branches"
+fi
+
+echo "── 21. ORDERING guard: the re-queue handler precedes the merge/FAIL branches ──"
+RQ_LINE=$(grep -n 'QUOTA_REQUEUE:-0' "$DISPATCHER" | head -1 | cut -d: -f1)
+MERGE_LINE=$(grep -n 'ALL PASS — proceeding to merge' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$RQ_LINE" ] && [ -n "$MERGE_LINE" ] && [ "$RQ_LINE" -lt "$MERGE_LINE" ]; then
+  ok "re-queue handler (L$RQ_LINE) precedes the merge branch (L$MERGE_LINE)"
+else
+  bad "ordering wrong: requeue=L${RQ_LINE:-?} merge=L${MERGE_LINE:-?} (quota-stop could fall into PASS/FAIL)"
+fi
+
 echo ""
 echo "──────────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"

@@ -795,6 +795,77 @@ else
   bad "claim was not released after persistent sling failure"
 fi
 
+# ── Scenarios 14: ga-x3nmz Claude 5h-quota back-off ───────────────────────────
+# A builder dispatched while the Claude 5h window is exhausted dies mid-build, so
+# the Pilot must PAUSE the whole sweep (dispatch nothing, mutate no marker) and
+# auto-resume once the window resets. Driven through the REAL dispatcher in
+# DRY_RUN with the Dolt probe seamed healthy and the quota forced via the
+# PILOT_QUOTA_OVERRIDE seam — a candidate bug is present, so a pause proves the
+# gate actually stops dispatch (vs. there being nothing to dispatch).
+run_quota() { # $1=PILOT_QUOTA_OVERRIDE  $2=PILOT_QUOTA_ETA_OVERRIDE
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE=10 \
+    PILOT_QUOTA_OVERRIDE="$1" \
+    PILOT_QUOTA_ETA_OVERRIDE="${2:-}" \
+    FAKE_BLOCKED_IDS="" \
+    FAKE_BUGS_JSON='[{"id":"tt-q","title":"quota fixture bug","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+echo "Scenario 14a: quota LIMITED → PAUSE sweep, dispatch nothing, ETA in notice"
+LOG14A="$(run_quota 2 'resets 5pm (in 12min)')"
+if echo "$LOG14A" | grep -q "PAUSING all dispatch"; then
+  ok "quota-limited sweep logs the pause"
+else
+  bad "quota-limited sweep did NOT pause (expected 'PAUSING all dispatch')"
+fi
+if echo "$LOG14A" | grep -q "dispatched=0 (paused: cota 5h limitada"; then
+  ok "sweep-complete line reports dispatched=0 (paused)"
+else
+  bad "sweep-complete did not report the paused/dispatched=0 state"
+fi
+if echo "$LOG14A" | grep -q "resets 5pm (in 12min)"; then
+  ok "pause notice carries the reset ETA (AC4)"
+else
+  bad "pause notice missing the reset ETA"
+fi
+if echo "$LOG14A" | grep -qE "pegou uma história|gc sling|story:in-flight"; then
+  bad "REGRESSION: dispatched/slung a builder despite exhausted quota"
+else
+  ok "no builder dispatched under exhausted quota (AC1)"
+fi
+
+echo "Scenario 14b: quota OK → no pause, sweep proceeds normally"
+LOG14B="$(run_quota 0)"
+if echo "$LOG14B" | grep -q "PAUSING all dispatch"; then
+  bad "REGRESSION: paused the sweep when quota was fine"
+else
+  ok "quota-OK sweep does not pause (proceeds to dispatch logic)"
+fi
+
+echo "Scenario 14c: drift-guard — the quota back-off is wired into the live sweep"
+has() { if grep -qE "$2" "$1"; then ok "$3"; else bad "$3 — pattern not found: $2"; fi; }
+has "$DISPATCHER" '_pilot_quota_limited\(\)'        "quota probe helper is defined"
+has "$DISPATCHER" '_pilot_quota_eta\(\)'            "reset-ETA helper is defined"
+has "$DISPATCHER" 'PILOT_QUOTA_OVERRIDE'            "quota override seam wired"
+has "$DISPATCHER" 'PAUSING all dispatch this sweep' "pause gate present in the sweep"
+# FAIL-OPEN: an absent checker (and no override) must return '0' (never block).
+if grep -qE '\[ -x "\$_qc" \] \|\| \{ printf .0.; return 0; \}' "$DISPATCHER"; then
+  ok "quota probe fail-opens when the checker is absent"
+else
+  bad "quota probe missing the fail-open guard (absent checker must not block dispatch)"
+fi
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

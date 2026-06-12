@@ -444,6 +444,37 @@ gate_quota_limited() {
   printf '0'; return 0
 }
 
+# ── ga-x3nmz: quota-aware verdict resolution ──────────────────────────────────
+# gate_quota_stop_verdict <quota_limited 0|1> → "requeue" | "proceed"
+# PURE (no IO, set -e safe). A reviewer that stalls or times out with NO
+# substantive verdict is a QUOTA-STOP — its Claude session died on "you've hit
+# your session limit" — iff the 5h window is exhausted RIGHT NOW. In that case
+# the marker must be RE-QUEUED (re-run post-reset; the ga-cw4pm headroom gate
+# holds it deferred until the window resets), NEVER false-FAILed. Otherwise the
+# stall is a genuine boot/infra problem and the caller proceeds with its FAIL.
+gate_quota_stop_verdict() {
+  [ "${1:-0}" = "1" ] && { printf 'requeue'; return 0; }
+  printf 'proceed'; return 0
+}
+
+# quota_reset_eta → echoes a short human ETA like "resets 4:50pm (in 37min)", or
+# "" when unknown. Reads the ga-wjlv9 checker JSON (reset_time_text +
+# reset_in_minutes). Honors GATE_QUOTA_ETA_OVERRIDE (selftest seam). Bounded by
+# `timeout`; fail-soft to "" so a flaky/absent checker only costs the ETA string,
+# never the re-queue itself. Pure-ish (read-only; no gate-state mutation).
+quota_reset_eta() {
+  if [ -n "${GATE_QUOTA_ETA_OVERRIDE:-}" ]; then printf '%s' "$GATE_QUOTA_ETA_OVERRIDE"; return 0; fi
+  local _qc="${GC_CITY}/scripts/claude-quota-check.sh"
+  [ -x "$_qc" ] || { printf ''; return 0; }
+  local _j; _j=$(timeout 15 bash "$_qc" --json 2>/dev/null || echo "")
+  [ -n "$_j" ] || { printf ''; return 0; }
+  printf '%s' "$_j" | jq -r '
+    if (.reset_time_text // "") == "" then ""
+    else "resets " + .reset_time_text
+         + ( if (.reset_in_minutes // null) != null then " (in \(.reset_in_minutes)min)" else "" end )
+    end' 2>/dev/null || printf ''
+}
+
 # gate_headroom_decision <cpu> <lat_ms> <quota_limited 0|1> <inflight_reviewers> \
 #   <cpu_hot> <cpu_warm> <lat_hot_ms> <max_reviewers> <reviewers_per_run> <failopen 0|1>
 # → echoes "<verdict> <ceiling> <reason>"  (verdict ∈ admit|defer).
@@ -1879,12 +1910,32 @@ WAIT_START=$(date +%s)
 ALL_VERDICTS_IN=0
 OVERALL_VERDICT="PASS"
 FAIL_REASONS=""
+# ga-x3nmz: quota-stop re-queue state. QUOTA_REQUEUE flips to 1 when a stall/
+# timeout coincides with an exhausted Claude 5h window; the post-poll handler
+# then re-queues the marker instead of FAILing. The 5h-quota check is memoized
+# to at most ONCE per poll (POLL_QUOTA_CHECKED) and only run on the rare
+# timeout/dead-slot paths, so it never adds per-poll cost on the happy path.
+QUOTA_REQUEUE=0
+POLL_QUOTA_CHECKED=0
+POLL_QUOTA_LIMITED=0
 
 while true; do
   NOW_EPOCH=$(date +%s)
   ELAPSED=$((NOW_EPOCH - WAIT_START))
+  POLL_QUOTA_CHECKED=0   # ga-x3nmz: re-arm the per-poll quota memo each iteration
 
   if [ "$ELAPSED" -gt "$VERDICT_TIMEOUT_SECS" ]; then
+    # ── ga-x3nmz: a timeout that coincides with an EXHAUSTED Claude 5h quota is a
+    # QUOTA-STOP (the reviewer's session died on "you've hit your session limit"),
+    # NOT a logic FAIL. Re-queue the marker so the next sweep re-runs the gate
+    # post-reset rather than false-FAILing a good branch. (Pending verdict beads
+    # are parked + the marker re-queued by the post-poll QUOTA_REQUEUE handler.)
+    if [ "$POLL_QUOTA_CHECKED" != "1" ]; then POLL_QUOTA_LIMITED=$(gate_quota_limited); POLL_QUOTA_CHECKED=1; fi
+    if [ "$(gate_quota_stop_verdict "$POLL_QUOTA_LIMITED")" = "requeue" ]; then
+      QUOTA_REQUEUE=1
+      warn "Verdict timeout after ${ELAPSED}s BUT Claude 5h quota is LIMITED — quota-stop: re-queuing marker $MARKER_ID for re-run post-reset (NOT a FAIL) (ga-x3nmz)."
+      break
+    fi
     warn "Verdict timeout after ${ELAPSED}s (limit=${VERDICT_TIMEOUT_SECS}s). Treating as FAIL."
     OVERALL_VERDICT="FAIL"
     FAIL_REASONS="TIMEOUT: reviewers did not submit verdicts within ${VERDICT_TIMEOUT_MINUTES} minutes."
@@ -2089,6 +2140,20 @@ while true; do
         fi
         _action=$(classify_slot_action 0 "$_confirmed_dead" "${RESPAWN_BUDGET[$j]:-0}")
         if [ "$_action" = "respawn" ]; then
+          # ── ga-x3nmz: quota-stop short-circuit ──────────────────────────────
+          # A slot that is dead because Claude's 5h quota is exhausted will die
+          # the instant it is respawned (and so will every sibling) — respawning
+          # only burns the budget, then the 45m timeout false-FAILs a GOOD branch.
+          # If the window is exhausted RIGHT NOW, stop: flag a quota-stop and let
+          # the post-poll handler re-queue the whole marker for a clean re-run
+          # post-reset. Quota is probed at most once per poll (memoized) and only
+          # on this already-rare dead-slot path.
+          if [ "$POLL_QUOTA_CHECKED" != "1" ]; then POLL_QUOTA_LIMITED=$(gate_quota_limited); POLL_QUOTA_CHECKED=1; fi
+          if [ "$(gate_quota_stop_verdict "$POLL_QUOTA_LIMITED")" = "requeue" ]; then
+            QUOTA_REQUEUE=1
+            warn "Reviewer slot $j is dead AND Claude 5h quota is LIMITED — quota-stop: re-queuing marker $MARKER_ID instead of a futile respawn (ga-x3nmz)."
+            break
+          fi
           RESPAWN_BUDGET[$j]=$(( ${RESPAWN_BUDGET[$j]:-0} - 1 ))
           _respawn_k=$(( MAX_RESPAWNS_PER_SLOT - ${RESPAWN_BUDGET[$j]} ))
           # ga-mepb0: name the deadness cause so a boot-wedge (false-FAIL root) is
@@ -2105,6 +2170,10 @@ while true; do
       fi
     fi
   done
+
+  # ga-x3nmz: a quota-stop tripped at the respawn gate this poll → leave the
+  # poll loop now; the post-poll handler re-queues the marker (never FAIL).
+  if [ "$QUOTA_REQUEUE" = "1" ]; then break; fi
 
   log "  Verdicts: $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS received (elapsed: ${ELAPSED}s)"
 
@@ -2132,6 +2201,39 @@ cleanup_reviewer_sessions
 
 GATE_END_EPOCH=$(date +%s)
 ELAPSED_S=$((GATE_END_EPOCH - GATE_START_EPOCH))
+
+# ── ga-x3nmz: QUOTA-STOP re-queue — never false-FAIL on an exhausted 5h window ─
+# A timeout or dead reviewer slot that coincided with an exhausted Claude 5h
+# quota is a quota-stop, not a logic failure. Re-queue the marker (back to
+# gate-status:queued) so the next sweep re-runs the gate; the ga-cw4pm headroom
+# gate holds it deferred until the window resets, giving automatic resume (AC3).
+# Park any still-pending verdict beads as REQUEUED (not TIMEOUT) so they neither
+# orphan nor read as a FAIL, and the re-run mints fresh ones. Clear notify + ETA
+# (AC4). This branch is mutually exclusive with the PASS/FAIL paths below.
+if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
+  _eta=$(quota_reset_eta)
+  log "QUOTA-STOP (ga-x3nmz): marker $MARKER_ID re-queued — Claude 5h quota exhausted mid-review; gate re-runs automatically post-reset${_eta:+ ($_eta)}. This is NOT a FAIL."
+  # Park pending verdict beads as REQUEUED so they don't orphan or count as FAIL.
+  for VB in "${VERDICT_BEAD_IDS[@]}"; do
+    VB_STATUS=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | .status // "open"')
+    if [ "$VB_STATUS" != "closed" ]; then
+      bd -C "$GC_CITY" label remove "$VB" "verdict:pending" -q 2>/dev/null || true
+      bd -C "$GC_CITY" label add    "$VB" "verdict:REQUEUED" -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (ga-x3nmz) — reviewer session ended on an exhausted Claude 5h quota (quota-stop, NOT a code FAIL). Marker re-queued for re-run post-reset${_eta:+ ($_eta)}." 2>/dev/null || true
+      bd -C "$GC_CITY" close "$VB" 2>/dev/null || true
+    fi
+  done
+  # Re-queue the marker (reverse of the atomic claim): dispatching → queued.
+  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
+  bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:queued"      -q 2>/dev/null || true
+  bd -C "$GC_CITY" comment "$MARKER_ID" "QUOTA-STOP re-queue (ga-x3nmz): reviewer(s) stalled because Claude's 5h session quota is exhausted — a quota-stop, NOT a code FAIL. Marker re-queued; the ga-cw4pm headroom gate holds it deferred until the window resets${_eta:+ ($_eta)}, then the gate re-runs with fresh reviewers." 2>/dev/null || true
+  if [ "$GATE_RUN_ID" != "unknown" ]; then
+    bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run paused (quota-stop, ga-x3nmz): Claude 5h quota exhausted mid-review; marker $MARKER_ID re-queued for re-run post-reset${_eta:+ ($_eta)}. No verdict recorded; this is NOT a FAIL." 2>/dev/null || true
+  fi
+  notify -t "⏸️ Gate pausado: cota 5h" -p 3 "Gate $BRANCH re-enfileirado — cota 5h do Claude esgotada (quota-stop, não é FAIL); retoma quando resetar${_eta:+ ($_eta)} (ga-x3nmz)." 2>/dev/null || true
+  exit 0
+fi
 
 if [ "$OVERALL_VERDICT" = "PASS" ]; then
   log "ALL PASS — proceeding to merge branch $BRANCH → $DEFAULT_BRANCH ..."

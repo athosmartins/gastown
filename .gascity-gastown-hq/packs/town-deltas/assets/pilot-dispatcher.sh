@@ -116,6 +116,19 @@ PILOT_DOLT_CPU_MAX="${PILOT_DOLT_CPU_MAX:-200}"
 PILOT_DOLT_LATENCY_OVERRIDE_MS="${PILOT_DOLT_LATENCY_OVERRIDE_MS:-}"
 PILOT_DOLT_CPU_OVERRIDE="${PILOT_DOLT_CPU_OVERRIDE:-}"
 
+# ── Claude 5h-quota back-off (ga-x3nmz) ───────────────────────────────────────
+# A builder dispatched while the Claude 5h window is exhausted dies mid-build
+# ("you've hit your session limit") → a wasted lane slot + a phantom in-flight
+# bead the dispatcher must later reap. Before filling slots we probe the
+# GROUND-TRUTH quota (ga-wjlv9 checker); if LIMITED we PAUSE all dispatch this
+# sweep — the candidate stories stay queued and are re-picked automatically once
+# the window resets (no marker mutated, nothing lost). FAIL-OPEN: an absent or
+# erroring checker never blocks dispatch (the dependency is optional).
+# PILOT_QUOTA_OVERRIDE is a TEST-ONLY seam (mirrors PILOT_DOLT_CPU_OVERRIDE):
+# "2" = limited, anything else = ok. Never set in prod.
+PILOT_QUOTA_OVERRIDE="${PILOT_QUOTA_OVERRIDE:-}"
+PILOT_QUOTA_ETA_OVERRIDE="${PILOT_QUOTA_ETA_OVERRIDE:-}"
+
 # ── Stale in-flight slot correction (ga-rk5va adversarial constraint c) ────────
 # A story:in-flight bead normally occupies a builder slot. But a session can hang
 # (the 16h-stuck-session bug) — zero state-transitions for hours while the bead
@@ -311,6 +324,41 @@ log "=== Pilot sweep start (DRY_RUN=${DRY_RUN}) ==="
 DOLT_PID=""
 DOLT_LATENCY_MS=""
 
+# ── ga-x3nmz: Claude 5h-quota probe (mirrors gate's gate_quota_limited) ───────
+# _pilot_quota_limited → "1" iff the Claude 5h window is exhausted right now, else
+# "0". Uses the ga-wjlv9 ground-truth checker (claude-quota-check.sh --quiet,
+# exit 2 = LIMITED) when deployed; FAIL-OPEN ("0") when the checker is absent or
+# errors, so an unmerged/flaky dependency never wedges dispatch. Honors the
+# PILOT_QUOTA_OVERRIDE test seam ("2"=limited). Bounded by `timeout`. No mutation.
+_pilot_quota_limited() {
+  if [ -n "$PILOT_QUOTA_OVERRIDE" ]; then
+    [ "$PILOT_QUOTA_OVERRIDE" = "2" ] && { printf '1'; return 0; }
+    printf '0'; return 0
+  fi
+  local _qc="${GC_CITY}/scripts/claude-quota-check.sh"
+  [ -x "$_qc" ] || { printf '0'; return 0; }
+  local _rc=0
+  timeout 15 bash "$_qc" --quiet >/dev/null 2>&1 || _rc=$?
+  [ "$_rc" = "2" ] && { printf '1'; return 0; }
+  printf '0'; return 0
+}
+
+# _pilot_quota_eta → short human ETA ("resets 4:50pm (in 37min)") or "" if
+# unknown. Reads the checker JSON (reset_time_text + reset_in_minutes). Honors
+# PILOT_QUOTA_ETA_OVERRIDE (test seam). Bounded; fail-soft to "".
+_pilot_quota_eta() {
+  if [ -n "$PILOT_QUOTA_ETA_OVERRIDE" ]; then printf '%s' "$PILOT_QUOTA_ETA_OVERRIDE"; return 0; fi
+  local _qc="${GC_CITY}/scripts/claude-quota-check.sh"
+  [ -x "$_qc" ] || { printf ''; return 0; }
+  local _j; _j=$(timeout 15 bash "$_qc" --json 2>/dev/null || echo "")
+  [ -n "$_j" ] || { printf ''; return 0; }
+  printf '%s' "$_j" | jq -r '
+    if (.reset_time_text // "") == "" then ""
+    else "resets " + .reset_time_text
+         + ( if (.reset_in_minutes // null) != null then " (in \(.reset_in_minutes)min)" else "" end )
+    end' 2>/dev/null || printf ''
+}
+
 # _dolt_probe — populate DOLT_PID + DOLT_LATENCY_MS once. Honors the test seams.
 _dolt_probe() {
   if [ -n "$PILOT_DOLT_LATENCY_OVERRIDE_MS" ]; then
@@ -368,6 +416,21 @@ if _dolt_saturated; then
 else
   PILOT_DOLT_SATURATED_AT_START=0
   log "Dolt health OK (latency=${DOLT_LATENCY_MS:-?}ms cpu=$(_dolt_cpu)%) — dispatch-to-capacity armed."
+fi
+
+# ── ga-x3nmz: Claude 5h-quota back-off — PAUSE dispatch when the window is dry ─
+# Probe once per sweep, AFTER the Dolt gate (cheap when quota is fine: one bounded
+# checker call). If the 5h window is exhausted, a builder dispatched now would die
+# mid-build, so PAUSE the whole sweep: dispatch nothing, mutate no marker, and let
+# the candidate stories be re-picked automatically once the window resets. This is
+# a full pause (not a throttle): under exhaustion every new builder dies, so there
+# is no safe non-zero dispatch level. FAIL-OPEN via _pilot_quota_limited.
+if [ "$(_pilot_quota_limited)" = "1" ]; then
+  _q_eta=$(_pilot_quota_eta)
+  warn "Claude 5h quota LIMITED — PAUSING all dispatch this sweep (builders would die mid-build). Stories stay queued; auto-resumes when the window resets${_q_eta:+ ($_q_eta)} (ga-x3nmz)."
+  notify -t "⏸️ Pilot pausado: cota 5h" -p 3 "Pilot pausado — cota 5h do Claude esgotada; nenhum builder despachado, retoma quando resetar${_q_eta:+ ($_q_eta)} (ga-x3nmz)." 2>/dev/null || true
+  log "=== Pilot sweep complete: dispatched=0 (paused: cota 5h limitada${_q_eta:+, $_q_eta}) ==="
+  exit 0
 fi
 
 # ── Step 0: TTL recovery — release stale pilot:dispatching claims (ga-2azzj) ───
