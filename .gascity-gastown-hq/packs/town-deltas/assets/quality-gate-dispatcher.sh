@@ -179,6 +179,35 @@ slot_effectively_dead() {
   echo 0
 }
 
+# session_peek_reports_dead <peek_stderr_text> → 1 (peek CONFIRMS the session is
+# GONE — drained/ended) | 0 (alive, or inconclusive → never reap). Pure; no I/O.
+# ga-h9o17: a gate-reviewer that DRAINS (its session ends normally instead of
+# being hard-killed) transitions to lifecycle asleep/drained but STAYS in
+# `gc session list` with closed!=true. So the list-only session_is_dead() reads
+# it ALIVE (present=1, closed=false → 0), and because a reviewer that drained
+# mid-run had already ACKed, slot_effectively_dead() also reads it alive — the
+# re-convene safety net never fires and the still-pending verdict waits the full
+# 45m outer timeout → a false-FAIL of a clean, FF-mergeable branch (observed live
+# 2026-06-11: 2/3-PASS sat 37min, reviewer-2 drained with verdict:pending).
+#
+# `gc session peek` is the discriminator the list lacks (the two views disagree):
+# a drained/ended session makes peek exit non-zero and print
+#   "gc session peek: session not found: <id>"
+# on STDERR (stdout empty), while a genuinely asleep-but-ALIVE reviewer's peek
+# SUCCEEDS with its real terminal scrollback on STDOUT. Match ONLY that explicit,
+# gc-emitted not-found signal on stderr — never peek's STDOUT content (a live
+# reviewer's scrollback could itself contain the words "not found"), and never a
+# bare transient connection error (which does not say "session not found"). Any
+# non-not-found result is treated as ALIVE, so a transient peek/Dolt glitch can
+# NEVER reap a live reviewer; the grace + dead-streak guards and the outer
+# timeout remain the backstops above this signal.
+session_peek_reports_dead() {
+  case "$1" in
+    *"session not found"*) echo 1 ;;
+    *) echo 0 ;;
+  esac
+}
+
 # respawn_reviewer_slot <0-based idx> — re-spawn a fresh gate-reviewer session for
 # a dead slot, REUSING the still-pending verdict bead VERDICT_BEAD_IDS[idx] and
 # re-delivering the SAME stored review task REVIEW_TASKS[idx] (it already
@@ -1917,7 +1946,33 @@ while true; do
             fi
           fi
         fi
+        # ── ga-h9o17: drained-but-listed reviewer probe ─────────────────────────
+        # session_is_dead is LIST-only and slot_effectively_dead only adds the ACK
+        # signal — neither catches a reviewer that DRAINED after ACKing: it stays
+        # listed + not-closed (_dead=0) and acked=1, so _eff_dead=0 and its pending
+        # verdict waits the full outer timeout (false-FAIL of a good branch). When
+        # the list still says ALIVE but the slot is past its grace window and still
+        # pending, ask `gc session peek`: a drained/ended session answers
+        # "session not found" on STDERR (exit!=0, stdout empty); a real asleep
+        # reviewer answers with stdout output. Bounded to exactly that suspicious
+        # window — one cheap peek per still-pending, past-grace, list-alive slot per
+        # poll — and skipped while _dead already=1 (the list already settled it).
+        # 2>&1 >/dev/null routes ONLY stderr into the capture (stdout → /dev/null),
+        # so a live reviewer's scrollback can never false-trigger the not-found match.
+        _peek_dead=0
+        if [ "$_dead" = "0" ] && [ "$_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
+          _peek_stderr=$(gc --city "$GC_CITY" session peek "$_sid" --lines 5 2>&1 >/dev/null || true)
+          _peek_dead=$(session_peek_reports_dead "$_peek_stderr")
+          if [ "$_peek_dead" = "1" ]; then
+            log "  Drained reviewer detected (ga-h9o17): slot $j session=${_sid} listed+not-closed but peek reports session-gone; treating as DEAD (verdict bead ${VERDICT_BEAD_IDS[$j]} still pending)."
+          fi
+        fi
         _eff_dead=$(slot_effectively_dead "$_dead" "${REVIEWER_ACKED[$j]:-0}")
+        # ga-h9o17: fold the peek-confirmed drained signal into deadness. The grace
+        # + dead-streak guards below still apply unchanged, so a single transient
+        # not-found cannot reap a live reviewer (it must read drained for
+        # RECONVENE_DEAD_STREAK_MIN consecutive polls past grace).
+        [ "$_peek_dead" = "1" ] && _eff_dead=1
         # Grace gate: never call a freshly-(re)spawned reviewer dead too early.
         if [ "$_eff_dead" = "1" ] && [ "$_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
           SLOT_DEAD_STREAK[$j]=$(( ${SLOT_DEAD_STREAK[$j]:-0} + 1 ))
@@ -1934,7 +1989,9 @@ while true; do
           _respawn_k=$(( MAX_RESPAWNS_PER_SLOT - ${RESPAWN_BUDGET[$j]} ))
           # ga-mepb0: name the deadness cause so a boot-wedge (false-FAIL root) is
           # distinguishable from a Dolt-killed session in the gate log.
-          if [ "$_dead" = "1" ]; then _dead_reason="session dead"; else _dead_reason="boot-wedged (present but never ACKed — gc prime/Dolt stall)"; fi
+          if [ "$_dead" = "1" ]; then _dead_reason="session dead"
+          elif [ "${_peek_dead:-0}" = "1" ]; then _dead_reason="drained (listed+not-closed but peek session-gone — ga-h9o17)"
+          else _dead_reason="boot-wedged (present but never ACKed — gc prime/Dolt stall)"; fi
           log "Re-convening dead reviewer slot $j (respawn ${_respawn_k}/${MAX_RESPAWNS_PER_SLOT}) — session ${SESSION_IDS[$j]} ${_dead_reason}, verdict bead ${VERDICT_BEAD_IDS[$j]} still pending."
           SLOT_SPAWN_EPOCH[$j]="$NOW_EPOCH"   # reset this slot's grace clock
           SLOT_DEAD_STREAK[$j]=0

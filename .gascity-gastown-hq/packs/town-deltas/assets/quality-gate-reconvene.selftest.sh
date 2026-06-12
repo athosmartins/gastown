@@ -85,6 +85,25 @@ eq "session dead + never-acked → dead"                       "$(slot_effective
 eq "(ga-mepb0) present + never-acked → effectively DEAD"     "$(slot_effectively_dead 0 0)" "1"
 eq "(safety) present + ACKed → alive (slow reviewer spared)" "$(slot_effectively_dead 0 1)" "0"
 
+# ── 2c. session_peek_reports_dead — ga-h9o17 drained-but-listed discriminator ──
+# A reviewer that DRAINS stays in `gc session list` (present + not-closed → both
+# session_is_dead and slot_effectively_dead read it ALIVE, since it ACKed before
+# draining) yet is functionally gone — its pending verdict would wait the full
+# outer timeout → false-FAIL of a good branch. `gc session peek` is the signal
+# the list lacks: a drained session exits non-zero with
+# "gc session peek: session not found" on STDERR; a live asleep reviewer's peek
+# succeeds with STDOUT scrollback. The helper matches ONLY the gc-emitted
+# not-found stderr string, so a live reviewer's scrollback (which the caller
+# routes to /dev/null) and a bare transient error can NEVER reap a live reviewer.
+# Signature: session_peek_reports_dead <peek_stderr_text> → 1|0
+type session_peek_reports_dead >/dev/null 2>&1 || { echo "FATAL: session_peek_reports_dead not defined by dispatcher (ga-h9o17)"; exit 1; }
+echo "── 2c. session_peek_reports_dead (peek 'session not found' = drained/dead) ──"
+eq "peek 'session not found' → DEAD"                          "$(session_peek_reports_dead 'gc session peek: session not found: "ga-wisp-x"')" "1"
+eq "peek not-found amid a WARN line → DEAD (substring match)" "$(session_peek_reports_dead "$(printf '%s\n%s' 'WARN native_store_unavailable' 'gc session peek: session not found: "ga-wisp-x"')")" "1"
+eq "live reviewer stdout scrollback (empty stderr) → ALIVE"   "$(session_peek_reports_dead '')" "0"
+eq "transient connection error (NOT not-found) → ALIVE"       "$(session_peek_reports_dead 'connection refused')" "0"
+eq "scrollback words 'not found' w/o 'session' → ALIVE"       "$(session_peek_reports_dead 'build error: file not found')" "0"
+
 # ── 3. respawn_reviewer_slot — real spawn/nudge wiring (mock gc) ──────────────
 # Proves the helper spawns a FRESH session, swaps SESSION_IDS[idx] in place,
 # re-delivers the SAME stored task, and REUSES the still-pending verdict bead
@@ -180,13 +199,28 @@ sim_poll() {
           present_flag=0; closed_flag=false
         fi
         dead=$(session_is_dead "$present_flag" "$closed_flag")
-        if [ "$dead" = "1" ] && [ "$spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
+        # ga-h9o17: model the drained-but-listed peek probe through the REAL
+        # helper. SLOT_PEEK[j]="gone" makes `gc session peek` report
+        # session-not-found even though the list still shows the session present
+        # + not-closed (dead=0); default "found" = a live asleep reviewer whose
+        # peek succeeds. Probe only when the list says alive and past grace —
+        # exactly the dispatcher's bounding.
+        local peek_dead=0
+        if [ "$dead" = "0" ] && [ "$spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
+          case "${SLOT_PEEK[$j]:-found}" in
+            gone) peek_dead=$(session_peek_reports_dead "gc session peek: session not found: \"$sid\"") ;;
+            *)    peek_dead=$(session_peek_reports_dead "live terminal scrollback for $sid") ;;
+          esac
+        fi
+        local eff_dead="$dead"
+        [ "$peek_dead" = "1" ] && eff_dead=1
+        if [ "$eff_dead" = "1" ] && [ "$spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
           SLOT_DEAD_STREAK[$j]=$(( ${SLOT_DEAD_STREAK[$j]:-0} + 1 ))
         else
           SLOT_DEAD_STREAK[$j]=0
         fi
         local confirmed=0
-        if [ "$dead" = "1" ] && [ "${SLOT_DEAD_STREAK[$j]:-0}" -ge "$RECONVENE_DEAD_STREAK_MIN" ]; then confirmed=1; fi
+        if [ "$eff_dead" = "1" ] && [ "${SLOT_DEAD_STREAK[$j]:-0}" -ge "$RECONVENE_DEAD_STREAK_MIN" ]; then confirmed=1; fi
         action=$(classify_slot_action 0 "$confirmed" "${RESPAWN_BUDGET[$j]:-0}")
         if [ "$action" = "respawn" ]; then
           RESPAWN_BUDGET[$j]=$(( ${RESPAWN_BUDGET[$j]:-0} - 1 ))
@@ -194,8 +228,10 @@ sim_poll() {
           SLOT_DEAD_STREAK[$j]=0
           SIM_RESPAWNS=$((SIM_RESPAWNS+1))
           respawn_reviewer_slot "$j" || true
-          # scenario driver may revive the slot after respawn (see hooks below)
-          if [ -n "${REVIVE_ON_RESPAWN:-}" ]; then SLOT_LIVE[$j]="alive"; SLOT_BEAD[$j]="$REVIVE_VERDICT"; fi
+          # scenario driver may revive the slot after respawn (see hooks below).
+          # ga-h9o17: a re-convened slot also gets a LIVE peek (fresh session) so
+          # the drained-peek scenario converges instead of re-firing forever.
+          if [ -n "${REVIVE_ON_RESPAWN:-}" ]; then SLOT_LIVE[$j]="alive"; SLOT_PEEK[$j]="found"; SLOT_BEAD[$j]="$REVIVE_VERDICT"; fi
         fi
         ;;
     esac
@@ -229,7 +265,7 @@ run_sim() {
 }
 
 reset_slots() {
-  RESPAWN_BUDGET=(); SLOT_SPAWN_EPOCH=(); SLOT_DEAD_STREAK=(); SLOT_BEAD=(); SLOT_LIVE=()
+  RESPAWN_BUDGET=(); SLOT_SPAWN_EPOCH=(); SLOT_DEAD_STREAK=(); SLOT_BEAD=(); SLOT_LIVE=(); SLOT_PEEK=()
   local j
   for j in 0 1 2; do
     RESPAWN_BUDGET[$j]="$MAX_RESPAWNS_PER_SLOT"
@@ -316,6 +352,38 @@ eq "(d) slow-but-alive → OVERALL=PASS"           "$SIM_OVERALL" "PASS"
 eq "(d) slow-but-alive → 0 respawns"             "$SIM_RESPAWNS" "0"
 eq "(d) slow-but-alive → session id NOT swapped" "${SESSION_IDS[2]}" "s2"
 
+# (f) ga-h9o17: slot 2 reviewer DRAINED — still LISTED + not-closed, so
+# session_is_dead reads it ALIVE (dead=0), but `gc session peek` reports
+# session-gone (SLOT_PEEK=gone). This is the exact false-FAIL the list-only check
+# missed (observed live: 2/3-PASS, reviewer-2 drained with verdict:pending, no
+# re-convene for 37min). The peek probe must treat it DEAD → re-convene → PASS.
+VERDICT_BEAD_IDS=( vb0 vb1 vb2 ); SESSION_IDS=( s0 s1 s2 ); REVIEW_TASKS=( t0 t1 t2 )
+reset_slots
+SLOT_BEAD=( PASS PASS pending ); SLOT_LIVE=( alive alive alive ); SLOT_PEEK=( found found gone )
+SIM_TIMEOUT_AT=99999; REVIVE_ON_RESPAWN=1; REVIVE_VERDICT="PASS"
+run_sim
+unset REVIVE_ON_RESPAWN
+eq "(f) drained-but-listed slot re-convened then PASS → OVERALL=PASS" "$SIM_OVERALL" "PASS"
+eq "(f) exactly ONE respawn fired (streak_min=2)"                    "$SIM_RESPAWNS" "1"
+eq "(f) slot 2 session id was swapped (drained reviewer replaced)"   "${SESSION_IDS[2]}" "$MOCK_NEW_SID"
+
+# (g) SAFETY: the ga-h9o17 peek path must reap ONLY a drained peek — a genuinely
+# asleep-but-ALIVE reviewer (LISTED + not-closed AND peek SUCCEEDS) is NEVER
+# re-convened. Single-poll, streak_min=1 so the decision is immediate either way.
+VERDICT_BEAD_IDS=( vb0 ); SESSION_IDS=( s0 ); REVIEW_TASKS=( t0 )
+RESPAWN_BUDGET=( 2 ); SLOT_DEAD_STREAK=( 0 ); SLOT_SPAWN_EPOCH=( 0 )
+RECONVENE_GRACE_SECS=0; RECONVENE_DEAD_STREAK_MIN=1
+SLOT_BEAD=( pending ); SLOT_LIVE=( alive ); SLOT_PEEK=( found )
+SIM_RESPAWNS=0
+sim_poll 1000
+eq "(g) listed + peek-found (asleep, alive) → 0 respawns (never reaped)" "$SIM_RESPAWNS" "0"
+eq "(g) asleep-but-alive → session id NOT swapped"                      "${SESSION_IDS[0]}" "s0"
+# Converse: SAME slot, peek now reports session-gone (drained) → respawn fires.
+SLOT_PEEK=( gone ); SLOT_DEAD_STREAK=( 0 ); SLOT_SPAWN_EPOCH=( 0 ); SIM_RESPAWNS=0
+sim_poll 1000
+eq "(g) listed + peek-gone (drained) → respawn fires (the fix)"         "$SIM_RESPAWNS" "1"
+RECONVENE_GRACE_SECS=0; RECONVENE_DEAD_STREAK_MIN=2
+
 # Grace gate: a dead session inside its grace window is NOT re-convened.
 VERDICT_BEAD_IDS=( vb0 ); SESSION_IDS=( s0 ); REVIEW_TASKS=( t0 )
 RESPAWN_BUDGET=( 2 ); SLOT_DEAD_STREAK=( 0 )
@@ -376,6 +444,23 @@ grep -q 'REVIEWER_PEEK_BASELINE\[\$_idx\]=$(gc' "$DISPATCHER" && ok "respawn sna
 # EDIT #2: spawn stagger so N reviewers do not boot-herd Dolt :52756 at once.
 grep -q 'GATE_SPAWN_STAGGER_SECS' "$DISPATCHER" && ok "dispatcher defines spawn stagger (Dolt boot-herd guard)" || bad "missing GATE_SPAWN_STAGGER_SECS"
 grep -q 'sleep "\$GATE_SPAWN_STAGGER_SECS"' "$DISPATCHER" && ok "spawn loop actually applies the stagger sleep" || bad "GATE_SPAWN_STAGGER_SECS defined but never applied"
+
+# ── 5c. drift-guard: the live dispatcher wires the ga-h9o17 drained-peek fix ───
+# Fail LOUDLY if a future refactor drops the drained-but-listed peek probe (the
+# fix for a reviewer that DRAINS after ACKing — invisible to both the list-only
+# session_is_dead and the ACK-folding slot_effectively_dead).
+echo "── 5c. drift-guard: dispatcher wires ga-h9o17 drained-peek probe ──"
+grep -q 'session_peek_reports_dead()' "$DISPATCHER" && ok "dispatcher defines session_peek_reports_dead" || bad "missing session_peek_reports_dead def (ga-h9o17 fix dropped)"
+# The probe must run a peek and fold its verdict into _eff_dead in the poll loop.
+grep -q '_peek_dead=$(session_peek_reports_dead' "$DISPATCHER" && ok "poll loop computes _peek_dead via session_peek_reports_dead" || bad "poll loop does not probe peek for drained reviewers (ga-h9o17)"
+grep -q '\[ "\$_peek_dead" = "1" \] && _eff_dead=1' "$DISPATCHER" && ok "poll loop folds _peek_dead into _eff_dead" || bad "poll loop does not treat a drained peek as dead (ga-h9o17)"
+# The peek must capture STDERR ONLY (2>&1 >/dev/null) so a live reviewer's STDOUT
+# scrollback can never false-trigger the not-found match.
+grep -q 'session peek "\$_sid" --lines 5 2>&1 >/dev/null' "$DISPATCHER" && ok "drained probe captures peek STDERR only (stdout→/dev/null)" || bad "drained probe does not isolate stderr (live scrollback could false-match)"
+# The probe must be bounded to the suspicious window: list-alive (_dead=0) + past
+# grace — NOT run on a session the list already calls dead.
+grep -q '\[ "\$_dead" = "0" \] && \[ "\$_spawn_age" -ge "\$RECONVENE_GRACE_SECS" \]' "$DISPATCHER" && ok "drained probe bounded to list-alive + past-grace slots" || bad "drained probe not bounded (runs every poll / inside grace)"
+grep -q 'Drained reviewer detected (ga-h9o17)' "$DISPATCHER" && ok "poll loop logs the drained-reviewer detection" || bad "missing 'Drained reviewer detected' log"
 
 # ── 6. dispatcher still parses + lib-only return is a no-op in normal flow ─────
 echo "── 6. syntax + lib-only safety ──"
