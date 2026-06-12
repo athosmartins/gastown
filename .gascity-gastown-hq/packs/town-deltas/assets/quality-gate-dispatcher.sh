@@ -898,7 +898,14 @@ log "Marker $MARKER_ID claimed for dispatching."
 
 # ── Step 2: Extract fields from marker description ────────────────────────────
 
-extract() { echo "$DESC" | grep -E "^$1:" | head -1 | sed "s/^$1: *//"; }
+# ga-7zjs1: trailing `|| true` keeps a missing field from aborting the dispatcher.
+# Under `set -euo pipefail`, an absent field makes grep exit 1 (no match) and
+# pipefail propagates it, so `RIG=$(extract "rig")` would kill the whole script
+# BEFORE the bead-id-prefix rig fallback below. Crew /gate-done markers omit the
+# `rig:` field, so without this guard every crew marker stalled the gate
+# (claimed→dispatching→died→re-queued, no reviewer ever spawned). A no-match now
+# yields an empty string and the downstream fallbacks resolve the rig.
+extract() { echo "$DESC" | grep -E "^$1:" | head -1 | sed "s/^$1: *//" || true; }
 
 BRANCH=$(extract "branch")
 BEAD_ID=$(extract "bead_id")
