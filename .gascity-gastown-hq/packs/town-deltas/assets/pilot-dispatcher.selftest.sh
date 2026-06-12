@@ -212,7 +212,23 @@ cat > "$SHIMBIN/gc" <<'SHIM'
 #!/usr/bin/env bash
 case "$*" in
   *"rig list"*)      printf '{"rigs":[]}' ;;     # rig fallback → empty
-  *sling*)           printf '{"bead_id":"tt-sling-1"}' ;;  # builder task bead
+  *sling*)
+    # ga-eu8vr: the live gc binary ALWAYS emits this benign warning on stderr —
+    # on success AND failure alike. Mirror it so the test proves the dispatcher
+    # never treats it as the failure cause. Failure injection seams:
+    #   FAKE_SLING_FAIL_TIMES=N  → first N attempts fail (empty bead_id), then succeed
+    #   FAKE_SLING_ALWAYS_FAIL=1 → every attempt fails
+    # The REAL error rides on STDOUT (structured JSON) with a non-zero exit, exactly
+    # like the live binary's `sling: Store is required` path.
+    printf 'WARN native_store_unavailable gate=version_compat reason="bd/beads version compatibility could not be confirmed"\n' >&2
+    _st="${PILOT_TEST_STATE:-/tmp/pilot-selftest-state}"
+    _cnt=$(cat "$_st/sling_n" 2>/dev/null || echo 0); _cnt=$((_cnt + 1)); echo "$_cnt" > "$_st/sling_n"
+    if [ "${FAKE_SLING_ALWAYS_FAIL:-0}" = "1" ] || [ "$_cnt" -le "${FAKE_SLING_FAIL_TIMES:-0}" ]; then
+      printf '{"schema_version":"1","ok":false,"error":{"code":"native_store_unavailable","message":"sling: Store is required"}}'
+      exit 1
+    fi
+    printf '{"bead_id":"tt-sling-1"}'
+    ;;
   *"session list"*)  # ga-e5yw2 roster seam. Brace-in-default `${x:-{...}}` mis-parses
                      # (the inner } closes the expansion early) → use an explicit if.
                      if [ -n "${FAKE_SESSIONS_JSON:-}" ]; then printf '%s' "$FAKE_SESSIONS_JSON"; else printf '{"sessions":[]}'; fi ;;
@@ -281,6 +297,32 @@ run_real_dispatch() { # FAKE_SUPPRESS_INFLIGHT
     PILOT_INFLIGHT_SLEEP=0 \
     FAKE_BLOCKED_IDS="" \
     FAKE_SUPPRESS_INFLIGHT="$1" \
+    FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# Runs a REAL (non-dry) dispatch exercising the sling RETRY path (ga-eu8vr).
+# Sleeps are zeroed so the retry loop is instant. The fake gc sling fails per the
+# injected seams while ALWAYS emitting the benign version_compat warning on stderr.
+run_sling_retry() { # $1=FAKE_SLING_FAIL_TIMES  $2=FAKE_SLING_ALWAYS_FAIL(0|1)
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=0 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_SLING_RETRIES=3 \
+    PILOT_SLING_SLEEP=0 \
+    PILOT_INFLIGHT_RETRIES=3 \
+    PILOT_INFLIGHT_SLEEP=0 \
+    FAKE_BLOCKED_IDS="" \
+    FAKE_SUPPRESS_INFLIGHT=0 \
+    FAKE_SLING_FAIL_TIMES="${1:-0}" \
+    FAKE_SLING_ALWAYS_FAIL="${2:-0}" \
     FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
@@ -707,6 +749,50 @@ if echo "$LOG12B" | grep -q "Dead-worker in-flight:"; then
   bad "REGRESSION: ran dead-worker check against an empty roster"
 else
   ok "dead-worker check correctly suppressed on empty roster"
+fi
+
+# ── Scenario 13: resilient sling — version_compat warning is NOT a failure ────
+# (ga-eu8vr) The live gc binary emits a CONSTANT benign "native_store_unavailable
+# gate=version_compat" warning on stderr for EVERY sling (success and failure
+# alike — verified 20/20). The prior dispatcher made ONE sling attempt and, on an
+# empty bead_id, logged only STDERR (the benign warning) and permanently aborted —
+# stalling a sole-candidate P1 backlog for ~2.5h while the SAME sling op succeeded
+# moments later. The fix RETRIES the sling and attributes failures to the REAL
+# stdout error, probing store reachability so the warning is non-blocking.
+echo "Scenario 13a: sling retries through transient failures then succeeds (ga-eu8vr)"
+LOG13A="$(run_sling_retry 2 0)"   # fail attempts 1-2, succeed on attempt 3
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  ok "transient sling failures retried → dispatch reached story:in-flight (no false abort)"
+else
+  bad "sling did not recover via retry (tt-flight never reached in-flight)"
+fi
+if echo "$LOG13A" | grep -qE "attempt 1/3|attempt 2/3"; then
+  ok "retry path was exercised (logged attempt N/3)"
+else
+  bad "no retry attempt was logged"
+fi
+
+echo "Scenario 13b: persistent sling failure attributed to REAL error, not the warning (ga-eu8vr)"
+LOG13B="$(run_sling_retry 0 1)"   # always fail
+if echo "$LOG13B" | grep -q "store ACCESSIBLE, transient sling-write failure"; then
+  ok "failure correctly degraded: store-accessible transient, claim released for retry"
+else
+  bad "did not emit the store-accessible transient attribution"
+fi
+if echo "$LOG13B" | grep -q "Store is required"; then
+  ok "the REAL stdout error (Store is required) was surfaced"
+else
+  bad "real stdout error was not surfaced"
+fi
+if echo "$LOG13B" | grep -qE "aborting dispatch \(err: .*version_compat"; then
+  bad "REGRESSION: still misattributes the abort to the benign version_compat warning"
+else
+  ok "no longer blames the benign version_compat warning"
+fi
+if grep -q "released tt-flight" "$STATE/releases.log" 2>/dev/null; then
+  ok "claim released after persistent failure (re-dispatchable next sweep)"
+else
+  bad "claim was not released after persistent sling failure"
 fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────

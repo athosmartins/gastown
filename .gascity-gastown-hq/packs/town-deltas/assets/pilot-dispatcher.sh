@@ -1281,21 +1281,62 @@ TASK
       SLING_TITLE="build story $STORY_ID: $STORY_TITLE"
     fi
 
-    local _sling_err_file _sling_err
+    # ── ga-eu8vr: resilient sling with correct failure attribution ──────────────
+    # The live gc binary (gc-patched-connfix) emits a CONSTANT benign warning on
+    # stderr for EVERY invocation:
+    #   WARN native_store_unavailable gate=version_compat reason="bd/beads version
+    #        compatibility could not be confirmed"
+    # It is present on success AND failure alike (verified 20/20), so it is NOT a
+    # failure signal — the real sling error, when one occurs, is the structured
+    # JSON on STDOUT. The prior code made a SINGLE attempt and, on an empty
+    # bead_id, logged only STDERR (the benign warning), misattributing
+    # intermittent, fast-failing sling-write blips to the warning and permanently
+    # aborting the sweep. A sole-candidate P1 then stalled the whole backlog for
+    # ~2.5h while the SAME sling op succeeded moments/sweeps later. Fix:
+    #   (1) RETRY the sling — a transient empty bead_id is no longer fatal;
+    #   (2) attribute failures to the REAL stdout error, probing store
+    #       reachability so the benign version_compat warning is non-blocking.
+    local _sling_err_file _sling_err _sling_attempt _sling_max _sling_sleep
     _sling_err_file="/tmp/pilot-sling-err.$$"
-    SLING_OUT=$(gc --city "$GC_CITY" sling "$BUILDER_TARGET" \
-      "$SLING_TITLE" \
-      --json \
-      2>"$_sling_err_file" || echo "{}")
-    _sling_err=$(head -c 300 "$_sling_err_file" 2>/dev/null || echo "")
+    _sling_max="${PILOT_SLING_RETRIES:-3}"
+    _sling_sleep="${PILOT_SLING_SLEEP:-2}"
+    SLING_OUT=""
+    SLING_BEAD_ID=""
+    _sling_attempt=0
+    while [ "$_sling_attempt" -lt "$_sling_max" ]; do
+      _sling_attempt=$((_sling_attempt + 1))
+      SLING_OUT=$(gc --city "$GC_CITY" sling "$BUILDER_TARGET" \
+        "$SLING_TITLE" \
+        --json \
+        2>"$_sling_err_file" || echo "{}")
+      SLING_BEAD_ID=$(echo "$SLING_OUT" | jq -r '.bead_id // .id // empty' 2>/dev/null || echo "")
+      [ -n "$SLING_BEAD_ID" ] && break
+      if [ "$_sling_attempt" -lt "$_sling_max" ]; then
+        log "  gc sling returned no bead_id for $STORY_ID (attempt ${_sling_attempt}/${_sling_max}) — retrying in ${_sling_sleep}s (version_compat warning is benign)"
+        [ "${_sling_sleep:-0}" -gt 0 ] 2>/dev/null && sleep "$_sling_sleep"
+      fi
+    done
+    # Keep only REAL stderr warnings — strip the constant benign version_compat line.
+    _sling_err=$(grep -v 'native_store_unavailable gate=version_compat' "$_sling_err_file" 2>/dev/null | head -c 300 || echo "")
     rm -f "$_sling_err_file"
 
-    SLING_BEAD_ID=$(echo "$SLING_OUT" | jq -r '.bead_id // .id // empty' 2>/dev/null || echo "")
     DISPATCH_RESULT="sling_ok"
 
-    # gt-q0hon: fail-hard if sling returned no bead ID — do NOT continue with phantom state.
+    # gt-q0hon: fail-hard if sling returned no bead ID — do NOT continue with
+    # phantom state. ga-eu8vr: distinguish a transient sling-write failure (store
+    # reachable → retry next sweep) from a genuine store outage, and report the
+    # REAL stdout error — never the benign version_compat warning.
     if [ -z "$SLING_BEAD_ID" ]; then
-      warn "gc sling failed for $STORY_ID — aborting dispatch (err: ${_sling_err:-no output})"
+      local _sling_real_err _store_ok
+      _sling_real_err=$(echo "$SLING_OUT" | jq -r '.error.message // empty' 2>/dev/null | head -c 200 || echo "")
+      [ -z "$_sling_real_err" ] && _sling_real_err="${_sling_err:-no stdout error}"
+      _store_ok=0
+      bd -C "$GC_CITY" list --limit 1 >/dev/null 2>&1 && _store_ok=1
+      if [ "$_store_ok" = "1" ]; then
+        warn "gc sling returned no bead_id for $STORY_ID after ${_sling_max} attempts — store ACCESSIBLE, transient sling-write failure; releasing claim, will retry next sweep (real-err: ${_sling_real_err}) [version_compat warning is benign, not the cause]"
+      else
+        warn "gc sling failed for $STORY_ID after ${_sling_max} attempts — store UNREACHABLE (real-err: ${_sling_real_err})"
+      fi
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       DISPATCH_RESULT="sling_no_bead_id"
       return 1
