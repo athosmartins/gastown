@@ -246,3 +246,52 @@ func TestScanExcludesAgentBeads(t *testing.T) {
 		t.Fatalf("expected Scan() eligibility to exclude agent beads, scan body was:\n%s", scanBody)
 	}
 }
+
+// TestNoObsoleteDependsOnIdColumn is a regression test for gt-ll1zf: the reaper
+// referenced a `depends_on_id` column on the dependencies / wisp_dependencies
+// tables, but the live Dolt schema split that single polymorphic column into
+// three (depends_on_issue_id, depends_on_wisp_id, depends_on_external). Every
+// reaper query that named the old column failed with
+//
+//	Error 1105 (HY000): table "wd" does not have column "depends_on_id"
+//
+// which aborted `gt reaper scan/reap/auto-close`, blocking wisp pruning and
+// driving the Dolt CPU spiral. The substring "depends_on_id" is NOT a substring
+// of either replacement column, so a plain source scan is a precise guard.
+func TestNoObsoleteDependsOnIdColumn(t *testing.T) {
+	data, err := os.ReadFile("reaper.go")
+	if err != nil {
+		t.Fatalf("read reaper.go: %v", err)
+	}
+	source := string(data)
+
+	if strings.Contains(source, "depends_on_id") {
+		t.Errorf("reaper.go still references obsolete column depends_on_id; the live " +
+			"schema split it into depends_on_issue_id / depends_on_wisp_id / depends_on_external (gt-ll1zf)")
+	}
+
+	// The split columns must be present: issue-parent and wisp-parent joins both
+	// have to resolve, otherwise the parent-exclusion / blocker checks silently
+	// stop matching real parents.
+	for _, col := range []string{"depends_on_issue_id", "depends_on_wisp_id"} {
+		if !strings.Contains(source, col) {
+			t.Errorf("reaper.go should reference %s after the schema split (gt-ll1zf)", col)
+		}
+	}
+}
+
+// TestParentExcludeJoinUsesSplitColumns verifies the parent-child exclusion join
+// resolves wisp parents via depends_on_wisp_id and issue parents via
+// depends_on_issue_id — the polymorphic depends_on_id column no longer exists.
+func TestParentExcludeJoinUsesSplitColumns(t *testing.T) {
+	joinClause, _ := parentExcludeJoin("testdb")
+	if !contains(joinClause, "wd.depends_on_wisp_id") {
+		t.Errorf("parentExcludeJoin should join wisp parents on wd.depends_on_wisp_id, got: %s", joinClause)
+	}
+	if !contains(joinClause, "wd.depends_on_issue_id") {
+		t.Errorf("parentExcludeJoin should join issue parents on wd.depends_on_issue_id, got: %s", joinClause)
+	}
+	if contains(joinClause, "depends_on_id") {
+		t.Errorf("parentExcludeJoin must not reference obsolete depends_on_id, got: %s", joinClause)
+	}
+}
