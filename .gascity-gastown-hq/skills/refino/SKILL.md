@@ -41,6 +41,27 @@ open with: "Qual história vamos refinar hoje? (título ou ID do bead)"
 
 ---
 
+## Claim antes de refinar (anti-overlap — OBRIGATÓRIO)
+
+Workers/crews refinam o MESMO pool `story:unrefined` em paralelo. Os sinais de
+status/label LAGAM — uma história pode parecer livre e já estar sendo refinada
+por outro (visto em campo: bead some do pool de unrefined em minutos). **Antes de
+propor QUALQUER campo**, RESERVE a história atomicamente:
+
+```bash
+bd update <id> --set-labels story:refinement-in-progress --assignee "$BEADS_ACTOR"
+```
+
+Depois **verifique que o claim pegou e é seu** (`bd show <id>` — se o
+assignee/label for de outro ator, OUTRO worker ganhou a corrida: pare e escolha
+outra história). Só então comece a propor campos. Na aprovação, a transição
+`--set-labels story:approved` substitui o `story:refinement-in-progress`.
+
+**Nunca refine uma história que não esteja claimed por você.** Elimina trabalho
+duplicado entre workers/crews.
+
+---
+
 ## Mode Selection (completo vs. simplificado)
 
 Before working any field, choose the mode. The mode determines which fields
