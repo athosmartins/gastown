@@ -202,6 +202,42 @@ else
   bad "ordering wrong: requeue=L${RQ_LINE:-?} merge=L${MERGE_LINE:-?} (quota-stop could fall into PASS/FAIL)"
 fi
 
+echo "── 22. ga-bgvc0: ambient-vs-post-janitor CPU selection (self-deadlock fix) ──"
+# The headroom gate self-deadlocked: it sampled Dolt %cpu AFTER ~30s of its own
+# Step 0a/0a-2/0a-3 janitors inflated the reading (ambient ~155% WARM, but
+# post-janitor ~200% HOT) → permanent DEFER. The fix samples ambient %cpu at
+# sweep start and prefers it. gate_effective_headroom_cpu(ambient, now) is the
+# pure selector.
+type gate_effective_headroom_cpu >/dev/null 2>&1 \
+  && ok "gate_effective_headroom_cpu is defined" \
+  || bad "gate_effective_headroom_cpu not defined"
+eq "ambient present → prefer ambient"            "$(gate_effective_headroom_cpu 155 200)" "155"
+eq "ambient absent  → fall back to post-janitor" "$(gate_effective_headroom_cpu '' 200)"  "200"
+eq "both absent      → empty (→ fail-open)"       "$(gate_effective_headroom_cpu '' '')"   ""
+eq "now absent       → ambient still used"        "$(gate_effective_headroom_cpu 90 '')"  "90"
+# End-to-end VALUE proof: the SAME plane that DEFERs on the post-janitor reading
+# ADMITs one run on the ambient reading — exactly the deadlock this fixes.
+eq "post-janitor reading (200) alone → DEFER"    "$(HD 200 120 0 0)" "defer 0 dolt-hot"
+eq "ambient reading (155) → ADMIT one run"       "$(HD 155 120 0 0)" "admit 3 dolt-warm"
+eq "selector picks ambient → flips DEFER→ADMIT"  "$(HD "$(gate_effective_headroom_cpu 155 200)" 120 0 0)" "admit 3 dolt-warm"
+# A genuinely hot ambient still DEFERs (the fix must not blind the gate).
+eq "ambient genuinely HOT (220) → still DEFER"   "$(HD "$(gate_effective_headroom_cpu 220 240)" 120 0 0)" "defer 0 dolt-hot"
+
+echo "── 23. ga-bgvc0: live wiring drift guards ──"
+has "$DISPATCHER" 'gate_effective_headroom_cpu\(\)'                   "selector helper defined"
+has "$DISPATCHER" 'GATE_AMBIENT_DOLT_CPU=\$\(gate_dolt_cpu'          "ambient %cpu snapshotted at sweep start"
+has "$DISPATCHER" 'HR_CPU=\$\(gate_effective_headroom_cpu'           "headroom decision consumes the ambient-preferred cpu"
+has "$DISPATCHER" 'post-janitor='                                    "log surfaces both ambient + post-janitor readings"
+# ORDERING: the ambient snapshot MUST be captured before the first janitor (Step
+# 0a), else it is just another post-janitor reading and the fix is a no-op.
+AMB_LINE=$(grep -nE 'GATE_AMBIENT_DOLT_CPU=\$\(gate_dolt_cpu' "$DISPATCHER" | head -1 | cut -d: -f1)
+STEP0A_LINE=$(grep -nF 'Step 0a: TTL recovery' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$AMB_LINE" ] && [ -n "$STEP0A_LINE" ] && [ "$AMB_LINE" -lt "$STEP0A_LINE" ]; then
+  ok "ambient snapshot (L$AMB_LINE) precedes Step 0a janitors (L$STEP0A_LINE)"
+else
+  bad "ordering wrong: ambient=L${AMB_LINE:-?} step0a=L${STEP0A_LINE:-?} (ambient must precede janitors)"
+fi
+
 echo ""
 echo "──────────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"

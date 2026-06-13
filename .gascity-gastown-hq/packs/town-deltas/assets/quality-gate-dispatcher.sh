@@ -451,6 +451,25 @@ gate_dolt_cpu() {
   return 0
 }
 
+# gate_effective_headroom_cpu <ambient_cpu> <now_cpu> → the CPU% the Step 0b-1
+# headroom gate should judge the data plane by. The dispatcher runs ~30s of its
+# OWN Dolt-heavy janitors (Step 0a TTL re-queue, Step 0a-2 reviewer-session reap,
+# Step 0a-3 rig bare-main reconcile, Step 0b marker-find) BEFORE the headroom
+# probe, so the post-janitor reading is inflated by this dispatcher's own burst.
+# Live evidence (ga-bgvc0): ambient dolt %cpu = ~130-155% (WARM → ceiling 1 run,
+# would admit) but the post-janitor reading = ~198-200% (HOT > GATE_DOLT_CPU_HOT)
+# → headroom DEFERs ceiling=0 → 0 reviewers → markers never drain = a self-
+# inflicted DEFER deadlock. The AMBIENT reading, sampled at sweep start before
+# any janitor, reflects the real plane load reviewers face when they boot (this
+# dispatcher's janitor burst is over by then). Prefer ambient; fall back to the
+# post-janitor reading when ambient is absent (pgrep miss / headroom disabled) so
+# behavior degrades to the legacy reading, never worse. Pure; set -e safe; no I/O.
+gate_effective_headroom_cpu() {
+  local _ambient="${1:-}" _now="${2:-}"
+  if [ -n "$_ambient" ]; then printf '%s' "$_ambient"; return 0; fi
+  printf '%s' "$_now"
+}
+
 # gate_quota_limited → "1" iff Claude quota is exhausted (a new run would burn
 # into a hard limit), else "0". Uses the ga-wjlv9 ground-truth checker
 # (claude-quota-check.sh --quiet, exit 2 = LIMITED) when it is deployed;
@@ -644,6 +663,19 @@ supersede_sibling_runs() {
 
 echo ""
 log "=== Dispatcher sweep start (DRY_RUN=${DRY_RUN}) ==="
+
+# ── ga-bgvc0: ambient Dolt-CPU snapshot (BEFORE the janitors) ─────────────────
+# The Step 0b-1 headroom gate must judge the data plane by its AMBIENT load, not
+# the spike this dispatcher's own Step 0a/0a-2/0a-3 janitors add. Sample the live
+# dolt-server %cpu HERE, before any janitor runs. This is a pure `ps` read (no
+# Dolt query, no added load) resolved via pgrep; empty on miss → the headroom
+# gate falls back to its legacy post-janitor reading (no regression). Honors the
+# GATE_DOLT_CPU_OVERRIDE selftest seam through gate_dolt_cpu.
+GATE_AMBIENT_DOLT_CPU=""
+if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
+  GATE_AMBIENT_DOLT_PID=$(pgrep -f 'dolt sql-server' 2>/dev/null | head -1 || true)
+  GATE_AMBIENT_DOLT_CPU=$(gate_dolt_cpu "${GATE_AMBIENT_DOLT_PID:-}")
+fi
 
 # ── Step 0a: TTL recovery — re-queue zombie dispatching markers ───────────────
 # If a marker has been in gate-status:dispatching for > DISPATCHING_TTL_MINUTES,
@@ -872,7 +904,11 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
     HR_LAT=$(printf '%s' "$HR_H" | jq -r '.server.latency_ms // empty' 2>/dev/null || echo "")
     HR_PID=$(printf '%s' "$HR_H" | jq -r '.server.pid // empty' 2>/dev/null || echo "")
   fi
-  HR_CPU=$(gate_dolt_cpu "${HR_PID:-}")
+  # ga-bgvc0: judge the plane by its AMBIENT load (sampled at sweep start, before
+  # our own janitors spiked it), not the self-inflated post-janitor reading. Fall
+  # back to the post-janitor reading when the ambient snapshot is absent.
+  HR_CPU_POSTJANITOR=$(gate_dolt_cpu "${HR_PID:-}")
+  HR_CPU=$(gate_effective_headroom_cpu "${GATE_AMBIENT_DOLT_CPU:-}" "${HR_CPU_POSTJANITOR:-}")
   # 2. Claude quota (optional ga-wjlv9 dep; fail-open when the checker is absent).
   HR_QLIM=$(gate_quota_limited)
   # 3. Pure dynamic-concurrency decision.
@@ -887,10 +923,10 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
   HR_RUNS=$(( ( LIVE_REVIEWERS + GATE_REVIEWERS_PER_RUN - 1 ) / GATE_REVIEWERS_PER_RUN ))
   if [ "$HR_QLIM" = "1" ]; then HR_COTA="LIMITED"; else HR_COTA="ok"; fi
   if [ "$HR_VERDICT" = "defer" ]; then
-    log "Headroom DEFER: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% lat=${HR_LAT:-?}ms / cota=${HR_COTA}) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, leaving $COUNT marker(s) queued (ga-cw4pm)."
+    log "Headroom DEFER: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% [ambient; post-janitor=${HR_CPU_POSTJANITOR:-?}%] lat=${HR_LAT:-?}ms / cota=${HR_COTA}) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, leaving $COUNT marker(s) queued (ga-cw4pm)."
     exit 0
   fi
-  log "Headroom OK: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% lat=${HR_LAT:-?}ms / cota=${HR_COTA}) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, admitting a new run (ga-cw4pm)."
+  log "Headroom OK: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% [ambient; post-janitor=${HR_CPU_POSTJANITOR:-?}%] lat=${HR_LAT:-?}ms / cota=${HR_COTA}) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, admitting a new run (ga-cw4pm)."
 fi
 
 # FIFO: oldest-first so no queued marker starves (ga-zf61i). bd list returns
