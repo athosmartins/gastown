@@ -1181,6 +1181,86 @@ has "$DISPATCHER" '_beadid_has_branch\(\)'        "cross-repo branch detector is
 has "$DISPATCHER" 'pilot.dispatched_at='          "dispatch stamps pilot.dispatched_at (never-started clock)"
 has "$DISPATCHER" 'PILOT_NEVERSTARTED_MINUTES'    "never-started threshold knob is wired"
 
+# ── Scenario 17: domain-aware routing (gt-s1saw / wa-ihto) ────────────────────
+# Bug gt-s1saw: the Pilot dispatched by rig POOL only — blind to which crew owns
+# the bead's AREA. Three UI bugs touching lib/urblink_design_system.py (wa-tnl5,
+# wa-rctg, wa-2p8i) landed on digo-wa — the data/email/financeiro owner, NOT the
+# frontend owner — who bounced each back to the kanban; the Pilot then re-
+# dispatched the SAME bug to digo every sweep, burning cycles in a loop (the
+# epic ga-spd2n C3: "Pilot nunca despacha pra domínio errado").
+#
+# The fix consults a DOMAIN MAP before picking from the pool, FAIL-OPEN:
+#   • bead_domain        classifies a bead into frontend / data / infra / "".
+#   • rig_domain_owner   PREFERS the mapped owner (data → digo-wa).
+#   • rig_domain_exclude DROPS a crew KNOWN NOT to own the area (frontend ≠ digo).
+# Unknown domain or unmapped rig ⇒ the pool rotates exactly as before.
+#
+# The discriminating fixture: a FRONTEND bug (oldest, dispatched first) and a
+# DATA bug in the SAME sweep. Blind routing would sink the frontend bug onto
+# digo-wa (pool head); the fix must keep frontend OFF digo and still steer the
+# data bug TO digo via the prefer rule.
+builder_for_domain() { echo "$1" | grep "Builder target:.*domain=$2" | sed -E 's/.*Builder target: ([^ ]+).*/\1/' | head -1; }
+
+WA_DOMAIN_BUGS='[
+  {"id":"tt-wafe","title":"painel-historias: corrigir botao no design-system (lib/urblink_design_system.py)","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}},
+  {"id":"tt-wadata","title":"enrichment: backfill financeiro do ledger por email","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{"story.rig":"whatsapp_automation"}}
+]'
+
+echo "Scenario 17a: frontend bug (design-system) is kept OFF digo-wa (exclude rule)"
+LOG17="$(run_capacity 10 "[]" 1 "$WA_DOMAIN_BUGS")"
+FE_BUILDER="$(builder_for_domain "$LOG17" frontend)"
+if [ -n "$FE_BUILDER" ] && [ "$FE_BUILDER" != "digo-wa" ]; then
+  ok "frontend bug routed to a non-digo crew ($FE_BUILDER)"
+elif [ "$FE_BUILDER" = "digo-wa" ]; then
+  bad "REGRESSION: frontend bug landed on digo-wa (the re-dispatch loop)"
+else
+  bad "frontend bug was not classified/dispatched (no domain=frontend Builder target line)"
+fi
+
+echo "Scenario 17b: data bug (email/financeiro/enrichment) is steered TO digo-wa (prefer rule)"
+DATA_BUILDER="$(builder_for_domain "$LOG17" data)"
+if [ "$DATA_BUILDER" = "digo-wa" ]; then
+  ok "data bug routed to its domain owner digo-wa (prefer)"
+else
+  bad "data bug did not route to digo-wa (got: '${DATA_BUILDER:-none}')"
+fi
+
+echo "Scenario 17c: in one sweep the data bug still reaches digo even though it dispatched second"
+# Proves prefer beats plain rotation: the frontend bug (first) excludes digo and
+# consumes an idle crew; without the prefer rule the data bug would rotate to the
+# NEXT idle crew, not back to digo. The owner must win regardless of dispatch order.
+if [ "$FE_BUILDER" != "digo-wa" ] && [ "$DATA_BUILDER" = "digo-wa" ]; then
+  ok "owner-prefer overrides rotation order (frontend→$FE_BUILDER, data→digo-wa)"
+else
+  bad "domain routing did not hold across the sweep (frontend→'${FE_BUILDER:-none}', data→'${DATA_BUILDER:-none}')"
+fi
+
+echo "Scenario 17d: unknown-domain WA bug still rotates normally (FAIL-OPEN, no over-steer)"
+WA_UNKNOWN='[{"id":"tt-waunk","title":"wa generic bug with no area signal","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}}]'
+LOG17D="$(run_capacity 10 "[]" 1 "$WA_UNKNOWN")"
+UNK_BUILDER="$(builders_of "$LOG17D")"
+if echo "$UNK_BUILDER" | grep -qE '^(digo|mila|oracle|peter|thies)-wa$'; then
+  ok "unknown-domain bug dispatched to a WA crew member ($UNK_BUILDER) — fail-open intact"
+else
+  bad "unknown-domain bug was not dispatched normally (got: '${UNK_BUILDER:-none}')"
+fi
+if echo "$LOG17D" | grep -q "Builder target:.*domain=none"; then
+  ok "unknown domain logged as domain=none (classifier returned empty, no spurious steer)"
+else
+  bad "unknown-domain dispatch did not log domain=none"
+fi
+
+echo "Scenario 17e: drift-guard — the domain map is wired into the live dispatcher"
+has "$DISPATCHER" 'bead_domain\(\)'         "bead_domain classifier is defined"
+has "$DISPATCHER" 'rig_domain_owner\(\)'    "rig_domain_owner (prefer) map is defined"
+has "$DISPATCHER" 'rig_domain_exclude\(\)'  "rig_domain_exclude (negative) map is defined"
+has "$DISPATCHER" 'urblink_design_system'   "frontend classifier keys on the design-system path"
+if grep -qE 'whatsapp_automation/frontend\|wa/frontend\)[[:space:]]*echo "digo-wa"' "$DISPATCHER"; then
+  ok "WA frontend area excludes digo-wa (the reported mis-route)"
+else
+  bad "WA frontend→exclude-digo mapping not present in the dispatcher"
+fi
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
