@@ -233,15 +233,91 @@ rig_to_builder() {
 PILOT_BUSY_BUILDERS=""
 PILOT_USED_BUILDERS=""
 
-# pick_pool_builder <rig> — echo an idle crew from the rig's pool, or nothing (and
-# return 1) if every member is busy or already used this sweep. Pure read of the
-# two sets above; the caller records the winner via mark_pool_builder so the next
+# ── Domain map (gt-s1saw / wa-ihto) ───────────────────────────────────────────
+# Route by AREA, not blind. Before picking from a rig's pool the dispatcher
+# classifies the bead into a coarse DOMAIN and biases the pick toward that
+# domain's owner — and AWAY from a crew KNOWN not to own it. This kills the
+# re-dispatch loop where UI bugs touching lib/urblink_design_system.py landed on
+# digo-wa (the data/email/financeiro owner), got bounced back to the kanban, and
+# were re-dispatched to digo every sweep (wa-tnl5/wa-rctg/wa-2p8i, 2026-06-12/13).
+#
+# Everything here is FAIL-OPEN: an unknown domain or an unmapped rig yields no
+# preference and no exclusion, so the pool rotates EXACTLY as before — domain
+# routing can only ever be neutral or better than blind routing, never worse.
+# The map is intentionally small and data-driven; extend it as crews declare
+# their areas (wa-ihto: "demais áreas a mapear com os crews").
+
+# bead_domain <bead_json> — classify a bead into a coarse domain, or "" if unknown.
+# Matches path/keyword signals across title + description + criteria + labels
+# (case-insensitive). First match wins; order is most-specific-first.
+bead_domain() {
+  local bead="$1" hay
+  hay=$(echo "$bead" | jq -r '
+      [ (.title // ""), (.description // ""),
+        (.acceptance_criteria // .metadata["story.criterios"] // ""),
+        ((.labels // []) | join(" ")) ] | join("  ")
+    ' 2>/dev/null || echo "")
+  [ -z "$hay" ] && { echo ""; return 0; }
+  if printf '%s' "$hay" | grep -iqE 'urblink_design_system|design[ -]system|painel[ -]?hist|\bfrontend\b|\bui\b|\bux\b|\bkanban\b|\bcss\b|stylesheet|layout'; then
+    echo "frontend"; return 0
+  fi
+  if printf '%s' "$hay" | grep -iqE 'financeiro|\bledger\b|enrichment|scraper|mega data set|net ?imoveis|viva ?real|\bemail\b|pipedrive|property data|\bdados\b'; then
+    echo "data"; return 0
+  fi
+  if printf '%s' "$hay" | grep -iqE '\bdolt\b|gate dispatcher|\breviewer\b|\bdispatcher\b|\bframework\b|headroom|\brefinery\b'; then
+    echo "infra"; return 0
+  fi
+  echo ""
+}
+
+# rig_domain_owner <rig> <domain> — the crew that OWNS this domain in this rig
+# (preferred pick if idle), or "" if none is mapped. Positive ownership only.
+rig_domain_owner() {
+  case "$1/$2" in
+    whatsapp_automation/data|wa/data) echo "digo-wa" ;;
+    *)                                echo ""        ;;
+  esac
+}
+
+# rig_domain_exclude <rig> <domain> — space-separated crew KNOWN NOT to own this
+# domain in this rig (dropped from the pool for a bead of that domain), or "".
+# Used when the positive owner isn't mapped yet but a WRONG owner is known — e.g.
+# WA frontend: we don't yet have a named frontend owner, but we DO know digo-wa
+# (data/email/financeiro) is not it, so frontend work must never land on digo.
+rig_domain_exclude() {
+  case "$1/$2" in
+    whatsapp_automation/frontend|wa/frontend) echo "digo-wa" ;;
+    *)                                        echo ""        ;;
+  esac
+}
+
+# pick_pool_builder <rig> [prefer] [exclude] — echo an idle crew from the rig's
+# pool, or nothing (and return 1) if none is eligible. Pure read of the busy/used
+# sets above; the caller records the winner via mark_pool_builder so the next
 # pick in the same sweep advances to a different crew.
+#   prefer  — a domain owner to take FIRST if idle (rig_domain_owner). Ignored if
+#             busy/used, falling through to normal rotation.
+#   exclude — space-list of crew to DROP for this bead (rig_domain_exclude). An
+#             excluded crew is never picked — even when it's the only idle one —
+#             so the bead DEFERS rather than re-enter the wrong-domain loop.
+# Both default empty ⇒ pre-gt-s1saw behaviour (rotate across idle crew).
 pick_pool_builder() {
-  local crew
-  for crew in $(rig_to_builders "$1"); do
+  local rig="$1" prefer="${2:-}" exclude="${3:-}" crew
+  # 1. Domain owner first, if mapped and eligible.
+  if [ -n "$prefer" ]; then
+    for crew in $(rig_to_builders "$rig"); do
+      [ "$crew" = "$prefer" ] || continue
+      case " $PILOT_BUSY_BUILDERS " in *" $crew "*) continue ;; esac
+      case " $PILOT_USED_BUILDERS " in *" $crew "*) continue ;; esac
+      echo "$crew"
+      return 0
+    done
+  fi
+  # 2. Rotate across idle crew, skipping any domain-excluded member.
+  for crew in $(rig_to_builders "$rig"); do
     case " $PILOT_BUSY_BUILDERS " in *" $crew "*) continue ;; esac
     case " $PILOT_USED_BUILDERS " in *" $crew "*) continue ;; esac
+    case " $exclude " in *" $crew "*) continue ;; esac
     echo "$crew"
     return 0
   done
@@ -1453,14 +1529,23 @@ FIXSEC
     # builder, then the wa-1eos "active session → defer" mutex deferred it forever
     # while 4 idle crew sat starved.) When every crew is busy/used → defer (release
     # the claim, retry next sweep): correct backpressure, never a duplicate spawn.
-    BUILDER_TARGET=$(pick_pool_builder "$STORY_RIG" || echo "")
+    #
+    # gt-s1saw: route by AREA, not just rotation. Classify the bead's domain, then
+    # PREFER its mapped owner and EXCLUDE any crew known not to own it — so a UI
+    # bug never re-lands on digo-wa (data owner) and loops. Fail-open: unknown
+    # domain ⇒ empty prefer/exclude ⇒ identical to the pre-gt-s1saw rotation.
+    local _DOMAIN _PREFER _EXCLUDE
+    _DOMAIN=$(bead_domain "$STORY")
+    _PREFER=$(rig_domain_owner   "$STORY_RIG" "$_DOMAIN")
+    _EXCLUDE=$(rig_domain_exclude "$STORY_RIG" "$_DOMAIN")
+    BUILDER_TARGET=$(pick_pool_builder "$STORY_RIG" "$_PREFER" "$_EXCLUDE" || echo "")
     if [ -z "$BUILDER_TARGET" ]; then
-      log "POOL($STORY_RIG): all crew busy/used this sweep (pool=[$_POOL] busy=[${PILOT_BUSY_BUILDERS:-none}] used=[${PILOT_USED_BUILDERS:-none}]) — deferring $STORY_ID to next sweep. Releasing claim."
+      log "POOL($STORY_RIG): all crew busy/used this sweep or domain-excluded (domain=${_DOMAIN:-none} prefer=${_PREFER:-none} exclude=${_EXCLUDE:-none} pool=[$_POOL] busy=[${PILOT_BUSY_BUILDERS:-none}] used=[${PILOT_USED_BUILDERS:-none}]) — deferring $STORY_ID to next sweep. Releasing claim."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       return 1
     fi
     mark_pool_builder "$BUILDER_TARGET"
-    log "  Builder target: $BUILDER_TARGET (rig=$STORY_RIG bead_city=$STORY_BEAD_CITY lane=$LANE) [pool: $_POOL]"
+    log "  Builder target: $BUILDER_TARGET (rig=$STORY_RIG bead_city=$STORY_BEAD_CITY lane=$LANE domain=${_DOMAIN:-none}) [pool: $_POOL]"
   else
     # ── Single-member rig (gastown.dog pool, or a lone single-identity crew) ─────
     BUILDER_TARGET="$_POOL"
