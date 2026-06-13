@@ -35,7 +35,7 @@ LOG="$LOG_DIR/quality-gate-dispatcher.log"
 QG_LOG="$GC_CITY/.gc/quality-gate.jsonl"
 
 # Maximum wall-clock minutes to wait for all reviewer verdicts before timing out.
-VERDICT_TIMEOUT_MINUTES="${VERDICT_TIMEOUT_MINUTES:-45}"
+VERDICT_TIMEOUT_MINUTES="${VERDICT_TIMEOUT_MINUTES:-22}"
 
 # Safety floor: never allow a timeout shorter than 15 minutes regardless of env var.
 # (Prevents accidental short timeouts from leftover test env vars causing false FAILs.)
