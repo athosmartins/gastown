@@ -1599,9 +1599,9 @@ if [ -n "$POLICY_FILES" ]; then
 fi
 
 case "$TIER" in
-  CODE)     REQUIRED_REVIEWERS=3 ;;
+  CODE)     REQUIRED_REVIEWERS="${GATE_CODE_REVIEWERS:-2}" ;;
   NON-CODE) REQUIRED_REVIEWERS=1 ;;
-  *)        REQUIRED_REVIEWERS=3 ;;
+  *)        REQUIRED_REVIEWERS="${GATE_CODE_REVIEWERS:-2}" ;;
 esac
 
 log "Tier: $TIER  required_reviewers: $REQUIRED_REVIEWERS"
