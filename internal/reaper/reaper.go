@@ -161,6 +161,23 @@ const (
 	DefaultAlertThreshold = 800
 )
 
+// agentBeadExclusion is the WHERE predicate that keeps the age-based wisp reaper
+// from closing beads that represent live agents. Two issue_types qualify:
+//
+//   - 'agent'   — persistent-identity beads (hq-mayor, hq-deacon, witness,
+//     refinery, etc.). Excluded so doctor never sees them go missing.
+//   - 'session' — live agent SESSION wisps (crew, dogs, gate-reviewers). An OPEN
+//     session wisp represents a running or recently-running session; closing it
+//     by age kills the session's bead representation regardless of whether the
+//     session is alive or pinned (gt-rlujz: `gt reaper reap --max-age=24h` closed
+//     ACTIVE crew sessions oracle/peter/thies/batista-wa, zeroing whatsapp_automation's
+//     open wisps). The reaper is a blunt SQL tool and must not make liveness
+//     decisions — session lifecycle (close-when-dead) belongs to the controller /
+//     witness / session-aware reapers that peek the real session, not here. Once a
+//     session genuinely ends its wisp is closed by that tooling and Purge() removes
+//     it on the normal closed-wisp path.
+const agentBeadExclusion = "w.issue_type NOT IN ('agent', 'session')"
+
 // ValidateDBName returns an error if the database name is unsafe.
 func ValidateDBName(dbName string) error {
 	if !validDBName.MatchString(dbName) {
@@ -238,12 +255,13 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	parentJoin, parentWhere := parentExcludeJoin(dbName)
 
 	// Count reap candidates: open wisps past max_age with eligible parent status.
-	// Must match Reap() eligibility semantics exactly, including the exclusion of
-	// agent beads, otherwise scan can report candidates that reap will never close.
+	// Must match Reap() eligibility semantics exactly, including agentBeadExclusion
+	// (live agent/session beads), otherwise scan can report candidates that reap
+	// will never close.
 	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost (gt-jd1z).
 	reapQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM wisps w %s WHERE w.status IN ('open', 'hooked', 'in_progress') AND w.created_at < ? AND w.issue_type != 'agent' AND %s",
-		parentJoin, parentWhere)
+		"SELECT COUNT(*) FROM wisps w %s WHERE w.status IN ('open', 'hooked', 'in_progress') AND w.created_at < ? AND %s AND %s",
+		parentJoin, agentBeadExclusion, parentWhere)
 	if err := db.QueryRowContext(ctx, reapQuery, now.Add(-maxAge)).Scan(&result.ReapCandidates); err != nil {
 		return nil, fmt.Errorf("count reap candidates: %w", err)
 	}
@@ -325,10 +343,11 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 
 	cutoff := time.Now().UTC().Add(-maxAge)
 	parentJoin, parentWhere := parentExcludeJoin(dbName)
-	// Exclude agent beads (issue_type='agent') from reaping — they have persistent
-	// identity and should not be closed by the wisp reaper regardless of age.
+	// Exclude live-agent beads (agentBeadExclusion: issue_type 'agent' and
+	// 'session') from reaping — they represent persistent identities or running
+	// agent sessions and must not be closed by the age-based wisp reaper (gt-rlujz).
 	whereClause := fmt.Sprintf(
-		"w.status IN ('open', 'hooked', 'in_progress') AND w.created_at < ? AND w.issue_type != 'agent' AND %s", parentWhere)
+		"w.status IN ('open', 'hooked', 'in_progress') AND w.created_at < ? AND %s AND %s", agentBeadExclusion, parentWhere)
 
 	result := &ReapResult{Database: dbName, DryRun: dryRun}
 

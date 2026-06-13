@@ -242,8 +242,48 @@ func TestScanExcludesAgentBeads(t *testing.T) {
 		t.Fatalf("could not isolate Scan() body in %s", sourcePath)
 	}
 	scanBody := source[scanStart:reapStart]
-	if !strings.Contains(scanBody, "w.issue_type != 'agent'") {
-		t.Fatalf("expected Scan() eligibility to exclude agent beads, scan body was:\n%s", scanBody)
+	if !strings.Contains(scanBody, "agentBeadExclusion") {
+		t.Fatalf("expected Scan() eligibility to apply agentBeadExclusion, scan body was:\n%s", scanBody)
+	}
+}
+
+// TestAgentBeadExclusionExcludesSessionWisps is a regression test for gt-rlujz:
+// `gt reaper reap --max-age=24h` closed wisps with issue_type='session', which
+// represent LIVE agent sessions (crew oracle/peter/thies/batista-wa, dogs,
+// gate-reviewers). Age-closing them kills the session's bead representation
+// regardless of pin or liveness. The age-based reaper must exclude both 'agent'
+// (persistent identity) and 'session' (live session) issue_types.
+func TestAgentBeadExclusionExcludesSessionWisps(t *testing.T) {
+	if !strings.Contains(agentBeadExclusion, "'agent'") {
+		t.Errorf("agentBeadExclusion must exclude issue_type 'agent', got: %q", agentBeadExclusion)
+	}
+	if !strings.Contains(agentBeadExclusion, "'session'") {
+		t.Errorf("agentBeadExclusion must exclude issue_type 'session' (gt-rlujz: "+
+			"age reaper killed live crew sessions), got: %q", agentBeadExclusion)
+	}
+	if !strings.Contains(agentBeadExclusion, "w.issue_type") {
+		t.Errorf("agentBeadExclusion must filter on the wisp issue_type column, got: %q", agentBeadExclusion)
+	}
+}
+
+// TestReapAppliesAgentBeadExclusion verifies that both Scan() and Reap() route
+// their stale-open-wisp eligibility through the shared agentBeadExclusion
+// predicate, so the 'agent'/'session' carve-out can never drift between the two
+// (scan>0 while reap=0, or vice versa).
+func TestReapAppliesAgentBeadExclusion(t *testing.T) {
+	data, err := os.ReadFile("reaper.go")
+	if err != nil {
+		t.Fatalf("read reaper.go: %v", err)
+	}
+	source := string(data)
+	reapStart := strings.Index(source, "func Reap(")
+	purgeStart := strings.Index(source, "func Purge(")
+	if reapStart == -1 || purgeStart == -1 || purgeStart <= reapStart {
+		t.Fatalf("could not isolate Reap() body in reaper.go")
+	}
+	reapBody := source[reapStart:purgeStart]
+	if !strings.Contains(reapBody, "agentBeadExclusion") {
+		t.Fatalf("expected Reap() eligibility to apply agentBeadExclusion, reap body was:\n%s", reapBody)
 	}
 }
 
