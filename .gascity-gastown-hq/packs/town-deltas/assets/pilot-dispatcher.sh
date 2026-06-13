@@ -180,6 +180,31 @@ PILOT_DEADWORKER_CHECK="${PILOT_DEADWORKER_CHECK:-1}"
 # existing). Set PILOT_NEVERSTARTED_MINUTES=0 to disable.
 PILOT_NEVERSTARTED_MINUTES="${PILOT_NEVERSTARTED_MINUTES:-15}"
 
+# ── Reuse existing crew session, never spawn a 2nd one (gt-4st3n) ─────────────
+# A crew identity (e.g. digo-wa, batista-ps) is a single-identity config-agent
+# session. Dispatching to it via `gc sling <identity>` + an immediate
+# `gc session nudge` had two harmful effects when a session ALREADY existed:
+#   1. ASLEEP session → the routed bead made the reconciler RESUME it with
+#      --resume (log: origin=flag resume=--resume) and a parallel runtime came up
+#      ALONGSIDE the drained one; crew-session-dedup then drained the duplicate,
+#      which looks like a "reset" and loses in-progress state (digo/mila 2026-06-13).
+#   2. ACTIVE session → the immediate nudge interrupts whatever the crew is doing
+#      (possibly work for Athos), duplicating/resetting it.
+# The doctrine (Athos + Mayor 2026-06-13): the dispatch signal is the HOOK
+# (assignee + routing on the bead) plus an EPHEMERAL, NON-INTERRUPTING nudge —
+# never a 2nd session.
+#   • ACTIVE session  → hook + `gc session submit --intent follow_up` (queues; the
+#     crew picks it up when it next goes idle; never interrupted, never spawned).
+#   • ASLEEP session  → `gc session wake` the EXISTING session (no parallel), then
+#     hook + follow_up submit. Reuse, not a fresh spawn.
+#   • NO session      → legacy `gc sling <identity>` spawn — the only case where a
+#     spawn is correct (it is the sole instance, not a duplicate).
+# gastown.dog is a DOG POOL (multiple instances by design — IsDogTarget) and is
+# exempt: it always takes the spawn path. Fail-open: any error classifying the
+# session → fall back to the legacy spawn+nudge path (never deadlock dispatch).
+# Set PILOT_REUSE_SESSION=0 to restore the legacy spawn+nudge behaviour.
+PILOT_REUSE_SESSION="${PILOT_REUSE_SESSION:-1}"
+
 # Dry-run mode: show what WOULD happen, make zero changes.
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -708,6 +733,39 @@ echo "$_SESSIONS_JSON" | jq -e '.sessions | type=="array"' >/dev/null 2>&1 || _D
 _session_is_live() {
   [ -n "${1:-}" ] || return 1
   printf '%s\n' "$_LIVE_SESSION_IDS" | grep -Fxq -- "$1"
+}
+
+# _target_session_state <identity> (gt-4st3n) — classify a crew identity's
+# existing session from the once-per-sweep `_SESSIONS_JSON` roster, so the
+# dispatcher can REUSE it instead of spawning a duplicate. Prints one line:
+#   "active <ref>"  — a non-closed, active session matches → reuse, never spawn.
+#   "asleep <ref>"  — a non-closed, asleep/drained session matches → wake & reuse.
+#   "none"          — no matching non-closed session → spawning is correct.
+# <ref> is the session ALIAS when present (e.g. "digo-wa"), else agent_name, else
+# session_name, else id — whichever resolves the session for `gc session
+# submit/wake`. A session matches the identity when ANY of its alias / agent_name
+# / session_name / id equals <identity>. ACTIVE wins over ASLEEP if both exist.
+# Fail-open: an unreadable/empty roster or any jq error → "none" (legacy spawn).
+_target_session_state() {
+  local _id="${1:-}"
+  [ -n "$_id" ] || { printf 'none'; return 0; }
+  echo "$_SESSIONS_JSON" | jq -e '.sessions | type=="array"' >/dev/null 2>&1 \
+    || { printf 'none'; return 0; }
+  echo "$_SESSIONS_JSON" | jq -r --arg id "$_id" '
+      [ .sessions[]?
+        | select(.closed != true)
+        | select(.alias == $id or .agent_name == $id
+                 or .session_name == $id or .id == $id) ] as $m
+      | (if   ([ $m[] | select(.state == "active") ] | length) > 0 then "active"
+         elif ($m | length) > 0                                    then "asleep"
+         else "none" end) as $st
+      | (if $st == "none" then ""
+         else ( [ $m[] | select($st == "active" and .state == "active") ]
+                + $m | .[0]
+                | (.alias // .agent_name // .session_name // .id // "") )
+         end) as $ref
+      | if $st == "none" then "none" else ($st + " " + $ref) end
+    ' 2>/dev/null || printf 'none'
 }
 
 # _inflight_drop_dead_workers — read a JSON array of in-flight beads on stdin and
@@ -1579,7 +1637,14 @@ FIXSEC
     # dispatchable). gastown.dog is a shared pool (multiple instances by design) —
     # exempt. Pooled rigs (WA) are handled above by the busy-set, not this mutex.
     # Fail-safe: any error → count 0 → dispatch proceeds (never halts on a `gc` hiccup).
-    if [ "$DRY_RUN" != "1" ] && [ "$BUILDER_TARGET" != "gastown.dog" ]; then
+    #
+    # gt-4st3n: when PILOT_REUSE_SESSION=1 (default), this defer is SUPERSEDED — a
+    # live crew session is no longer a reason to defer, because the delivery block
+    # below REUSES it (hook + non-interrupting follow_up submit) instead of letting
+    # `gc sling` spawn a duplicate. The mutex only fires in the legacy (reuse=0)
+    # path, where spawn-on-sling is still the delivery mechanism and the duplicate
+    # hazard is real.
+    if [ "${PILOT_REUSE_SESSION:-1}" != "1" ] && [ "$DRY_RUN" != "1" ] && [ "$BUILDER_TARGET" != "gastown.dog" ]; then
       local LIVE_BUILDER_SESSIONS
       LIVE_BUILDER_SESSIONS=$(gc --city "$GC_CITY" session list 2>/dev/null \
         | awk -v t="$BUILDER_TARGET" '$2==t && $3=="active"' | wc -l | tr -d ' ')
@@ -1692,6 +1757,30 @@ TASK
 
   log "  Task prompt built (${#DISPATCH_TASK} chars)"
 
+  # ── gt-4st3n: classify the builder's existing session → REUSE vs SPAWN ────────
+  # Decide BEFORE dispatch whether the target already has a session we must reuse
+  # rather than spawn a second one alongside. gastown.dog is a dog POOL (multiple
+  # instances by design) → always spawn. Any non-dog crew identity with a live
+  # session → reuse it (hook + non-interrupting follow_up submit); asleep → wake
+  # the existing session first; none → legacy spawn. Read-only classification, so
+  # it runs in dry-run too (the actions below are still gated by DRY_RUN).
+  # Fail-open: classification errors leave _DISPATCH_REUSE=0 → legacy spawn path.
+  local _DISPATCH_REUSE=0 _DISPATCH_SESS_STATE="none" _DISPATCH_SESS_REF=""
+  if [ "${PILOT_REUSE_SESSION:-1}" = "1" ] && [ "$BUILDER_TARGET" != "gastown.dog" ]; then
+    local _sess_line
+    _sess_line=$(_target_session_state "$BUILDER_TARGET" 2>/dev/null || echo "none")
+    _DISPATCH_SESS_STATE="${_sess_line%% *}"
+    case "$_DISPATCH_SESS_STATE" in
+      active|asleep)
+        _DISPATCH_REUSE=1
+        _DISPATCH_SESS_REF="${_sess_line#* }"
+        [ "$_DISPATCH_SESS_REF" = "$_sess_line" ] && _DISPATCH_SESS_REF="$BUILDER_TARGET"
+        log "  REUSE(gt-4st3n): $BUILDER_TARGET has an existing $_DISPATCH_SESS_STATE session ($_DISPATCH_SESS_REF) — will hook + non-interrupting follow_up, NOT spawn a 2nd session." ;;
+      *)
+        _DISPATCH_SESS_STATE="none" ;;
+    esac
+  fi
+
   # ── Dispatch via gc sling ────────────────────────────────────────────────────
   local DISPATCH_EPOCH DISPATCH_RESULT SLING_BEAD_ID NOW
   DISPATCH_EPOCH=$(date +%s)
@@ -1701,7 +1790,14 @@ TASK
     local SLING_TITLE_DRY
     SLING_TITLE_DRY="$([ "$DISPATCH_TIER" = "bug" ] && echo "fix bug" || echo "build story") $STORY_ID: $STORY_TITLE"
     log "DRY_RUN=1 — WOULD DISPATCH (tier=$DISPATCH_TIER lane=$LANE):"
-    log "  gc --city $GC_CITY sling $BUILDER_TARGET <task_bead> --nudge"
+    if [ "$_DISPATCH_REUSE" = "1" ]; then
+      [ "$_DISPATCH_SESS_STATE" = "asleep" ] \
+        && log "  WOULD: gc session wake $_DISPATCH_SESS_REF (reuse existing asleep session — gt-4st3n)"
+      log "  gc --city $GC_CITY sling $BUILDER_TARGET <task_bead>   (reuse: routes to existing $_DISPATCH_SESS_STATE session, no spawn)"
+      log "  WOULD: gc session submit $_DISPATCH_SESS_REF <task> --intent follow_up   (non-interrupting hook+nudge — gt-4st3n)"
+    else
+      log "  gc --city $GC_CITY sling $BUILDER_TARGET <task_bead> --nudge   (spawn: no existing session)"
+    fi
     log "  Task title: '$SLING_TITLE_DRY'"
     log "  Rig: $STORY_RIG → builder: $BUILDER_TARGET"
     log "  WOULD: bd label add $STORY_ID lane:${LANE}"
@@ -1717,6 +1813,37 @@ TASK
       SLING_TITLE="fix bug $STORY_ID: $STORY_TITLE"
     else
       SLING_TITLE="build story $STORY_ID: $STORY_TITLE"
+    fi
+
+    # ── gt-4st3n: wake an ASLEEP crew session BEFORE routing, so we reuse it ─────
+    # rather than letting the reconciler resume it into a parallel runtime (the
+    # "origin=flag resume=--resume" duplicate that crew-session-dedup then drains,
+    # which reads as a reset). `gc session wake` acts on the EXISTING session only;
+    # it never creates a second one. Best-effort + bounded: a failed/slow wake is
+    # non-fatal — the routed bead is still a durable hook the crew picks up on its
+    # next cycle. ACTIVE sessions need no wake. gastown.dog never reaches here.
+    if [ "$_DISPATCH_REUSE" = "1" ] && [ "$_DISPATCH_SESS_STATE" = "asleep" ]; then
+      log "  REUSE(gt-4st3n): waking existing asleep session $_DISPATCH_SESS_REF (no parallel spawn) ..."
+      if timeout 15 gc --city "$GC_CITY" session wake "$_DISPATCH_SESS_REF" >/dev/null 2>&1; then
+        # Bounded poll so the sling below routes to a LIVE session (reuse) instead
+        # of racing the reconciler's resume. Each probe is a runtime `session list`
+        # (no Dolt). Falls through after the budget: the routed bead is still a
+        # durable hook and the follow_up submit can wake the session on its own.
+        local _wake_i _wake_max="${PILOT_WAKE_POLL_TRIES:-4}" _wake_sleep="${PILOT_WAKE_POLL_SLEEP:-2}"
+        for _wake_i in $(seq 1 "$_wake_max"); do
+          if gc --city "$GC_CITY" session list --json 2>/dev/null \
+              | jq -e --arg r "$_DISPATCH_SESS_REF" \
+                  '[.sessions[]? | select(.closed != true)
+                    | select(.alias==$r or .agent_name==$r or .session_name==$r or .id==$r)
+                    | select(.state=="active")] | length > 0' >/dev/null 2>&1; then
+            log "  REUSE(gt-4st3n): $_DISPATCH_SESS_REF is now active (woke after ${_wake_i} probe(s))."
+            break
+          fi
+          [ "$_wake_i" -lt "$_wake_max" ] && [ "${_wake_sleep:-0}" -gt 0 ] 2>/dev/null && sleep "$_wake_sleep"
+        done
+      else
+        warn "Could not wake $_DISPATCH_SESS_REF — routed bead remains a durable hook; crew picks it up on next cycle."
+      fi
     fi
 
     # ── ga-eu8vr: resilient sling with correct failure attribution ──────────────
@@ -1805,11 +1932,26 @@ TASK
     # finalization — so it survives even the degraded in-flight-unconfirmed path.
     bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "pilot.sling_bead=$SLING_BEAD_ID" -q 2>/dev/null || true
 
-    timeout 15 gc --city "$GC_CITY" session nudge "$BUILDER_TARGET" "$DISPATCH_TASK" \
-      2>/dev/null \
-      || warn "Could not nudge $BUILDER_TARGET — builder will see the task bead on next hook cycle"
+    # ── Deliver the dispatch prompt ──────────────────────────────────────────
+    # gt-4st3n: when reusing an existing crew session, deliver with `gc session
+    # submit --intent follow_up` — a NON-INTERRUPTING, semantic submit. The
+    # runtime queues it and the crew picks it up when it next goes idle, so we
+    # never interrupt work the crew may be doing for Athos and never reset it.
+    # The routed task bead (the HOOK) is the durable signal; this submit is the
+    # ephemeral nudge. Target the resolved session ref (alias/id), not the bare
+    # identity, so it lands on the SAME session we classified — never a 2nd one.
+    # When spawning (no prior session), keep the legacy nudge to the identity.
+    if [ "$_DISPATCH_REUSE" = "1" ]; then
+      timeout 15 gc --city "$GC_CITY" session submit "$_DISPATCH_SESS_REF" "$DISPATCH_TASK" --intent follow_up \
+        2>/dev/null \
+        || warn "Could not submit to $_DISPATCH_SESS_REF — builder will see the task bead (hook) on next cycle"
+    else
+      timeout 15 gc --city "$GC_CITY" session nudge "$BUILDER_TARGET" "$DISPATCH_TASK" \
+        2>/dev/null \
+        || warn "Could not nudge $BUILDER_TARGET — builder will see the task bead on next hook cycle"
+    fi
 
-    log "Dispatch complete: sling_bead=$SLING_BEAD_ID target=$BUILDER_TARGET"
+    log "Dispatch complete: sling_bead=$SLING_BEAD_ID target=$BUILDER_TARGET reuse=${_DISPATCH_REUSE} session_state=${_DISPATCH_SESS_STATE}"
   fi
 
   # ── Transition bead: lane tag + DURABLE story:in-flight (ga-2azzj fix 1) ──────

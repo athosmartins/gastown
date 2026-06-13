@@ -1260,6 +1260,133 @@ if grep -qE 'whatsapp_automation/frontend\|wa/frontend\)[[:space:]]*echo "digo-w
 else
   bad "WA frontend→exclude-digo mapping not present in the dispatcher"
 fi
+# ── Scenario 17: reuse existing crew session, never spawn a 2nd (gt-4st3n) ────
+# Bug gt-4st3n: the Pilot routed work to a crew identity via `gc sling <identity>`
+# + an immediate nudge. When that crew ALREADY had a session this spawned/resumed
+# a SECOND one alongside (origin=flag resume=--resume → crew-session-dedup drains
+# the dup → looks like a reset) and interrupted work the crew may be doing for
+# Athos. The fix classifies the target's session and, when one exists, REUSES it:
+# ACTIVE → hook + non-interrupting `session submit --intent follow_up`; ASLEEP →
+# `session wake` the existing session, then reuse; NONE → legacy spawn. The dog
+# pool (gastown.dog) is exempt. PILOT_REUSE_SESSION=0 restores legacy behaviour.
+#
+# Helper: run a DRY sweep with PILOT_REUSE_SESSION forced to a chosen value.
+run_capacity_reuse() { # $1=PILOT_REUSE_SESSION  $2=FAKE_BUGS_JSON  $3=FAKE_SESSIONS_JSON
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE=10 \
+    PILOT_REUSE_SESSION="${1:-1}" \
+    FAKE_INFLIGHT_JSON="[]" \
+    DISPATCH_TO_CAPACITY=1 \
+    FAKE_BUGS_JSON="${2:-}" \
+    FAKE_SESSIONS_JSON="${3:-}" \
+    FAKE_SLING_ASSIGNEES="" \
+    FAKE_BLOCKED_IDS="" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# One WA bug → pooled rig; with no in-flight the busy-set is empty so the picker
+# selects the first idle crew (digo-wa), which is the identity we stage a session
+# for below.
+GT4_WA_BUG='[{"id":"tt-gt4wa","title":"gt-4st3n wa bug","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}}]'
+GT4_GC_BUG='[{"id":"tt-gt4gc","title":"gt-4st3n gascity bug","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}]'
+GT4_SESS_ACTIVE='{"sessions":[{"session_name":"digo-wa","alias":"digo-wa","agent_name":"digo-wa","id":"ga-wisp-digo","state":"active","closed":false}]}'
+GT4_SESS_ASLEEP='{"sessions":[{"session_name":"digo-wa","alias":"digo-wa","agent_name":"digo-wa","id":"ga-wisp-digo","state":"asleep","closed":false}]}'
+GT4_SESS_NONE='{"sessions":[]}'
+GT4_SESS_DOG='{"sessions":[{"session_name":"dog-1","alias":"gastown.dog-1","agent_name":"gastown.dog-1","id":"ga-wisp-dog1","state":"active","closed":false}]}'
+
+echo "Scenario 17a: ACTIVE crew session → REUSE (hook + follow_up submit), never spawn/interrupt"
+LOG17A="$(run_capacity_reuse 1 "$GT4_WA_BUG" "$GT4_SESS_ACTIVE")"
+if echo "$LOG17A" | grep -qE "REUSE\(gt-4st3n\): digo-wa has an existing active session"; then
+  ok "classified the active crew session for reuse (no 2nd spawn)"
+else
+  bad "did not classify the active session for reuse (expected REUSE(gt-4st3n) … active)"
+fi
+if echo "$LOG17A" | grep -qE "WOULD: gc session submit digo-wa .* --intent follow_up"; then
+  ok "delivers via non-interrupting follow_up submit to the existing session"
+else
+  bad "did not choose non-interrupting follow_up submit for the active session"
+fi
+if echo "$LOG17A" | grep -q "WOULD: gc session wake"; then
+  bad "must NOT wake an already-active session"
+else
+  ok "active session is not waked (only asleep sessions are)"
+fi
+
+echo "Scenario 17b: ASLEEP crew session → wake the EXISTING session, then reuse (no parallel)"
+LOG17B="$(run_capacity_reuse 1 "$GT4_WA_BUG" "$GT4_SESS_ASLEEP")"
+if echo "$LOG17B" | grep -qE "REUSE\(gt-4st3n\): digo-wa has an existing asleep session"; then
+  ok "classified the asleep crew session for reuse"
+else
+  bad "did not classify the asleep session for reuse (expected REUSE(gt-4st3n) … asleep)"
+fi
+if echo "$LOG17B" | grep -qE "WOULD: gc session wake digo-wa"; then
+  ok "wakes the existing asleep session (no parallel spawn)"
+else
+  bad "did not wake the existing asleep session"
+fi
+if echo "$LOG17B" | grep -qE "WOULD: gc session submit digo-wa .* --intent follow_up"; then
+  ok "asleep path also delivers via non-interrupting follow_up submit"
+else
+  bad "asleep path did not choose follow_up submit"
+fi
+
+echo "Scenario 17c: NO existing session → spawn is correct (legacy sling path), no REUSE"
+LOG17C="$(run_capacity_reuse 1 "$GT4_WA_BUG" "$GT4_SESS_NONE")"
+if echo "$LOG17C" | grep -q "REUSE(gt-4st3n)"; then
+  bad "REGRESSION: claimed reuse when no session exists (would never spawn → starvation)"
+else
+  ok "no session → no reuse (spawn path taken)"
+fi
+if echo "$LOG17C" | grep -q "spawn: no existing session"; then
+  ok "logs the spawn path explicitly when there is no session to reuse"
+else
+  bad "did not log the spawn path for the no-session case"
+fi
+
+echo "Scenario 17d: gastown.dog is a DOG POOL → always spawn, exempt from reuse"
+LOG17D="$(run_capacity_reuse 1 "$GT4_GC_BUG" "$GT4_SESS_DOG")"
+if echo "$LOG17D" | grep -q "Builder target: gastown.dog"; then
+  ok "gascity bug routed to the gastown.dog pool"
+else
+  bad "gascity bug did not route to gastown.dog (fixture drift)"
+fi
+if echo "$LOG17D" | grep -q "REUSE(gt-4st3n)"; then
+  bad "REGRESSION: dog pool must be exempt — reuse would break multi-instance design"
+else
+  ok "dog pool exempt from reuse even with a live gastown.dog session present"
+fi
+
+echo "Scenario 17e: PILOT_REUSE_SESSION=0 restores legacy behaviour (no reuse classification)"
+LOG17E="$(run_capacity_reuse 0 "$GT4_WA_BUG" "$GT4_SESS_ACTIVE")"
+if echo "$LOG17E" | grep -q "REUSE(gt-4st3n)"; then
+  bad "REGRESSION: reuse fired with PILOT_REUSE_SESSION=0 (flag not honoured)"
+else
+  ok "PILOT_REUSE_SESSION=0 disables reuse (legacy spawn+nudge path)"
+fi
+
+echo "Scenario 17f: drift-guard — reuse machinery wired into the live dispatcher"
+has "$DISPATCHER" '_target_session_state\(\)'          "session-state classifier is defined"
+has "$DISPATCHER" 'PILOT_REUSE_SESSION'                "reuse knob is wired"
+has "$DISPATCHER" 'session submit .* --intent follow_up' "non-interrupting follow_up submit is used"
+has "$DISPATCHER" 'gc --city "\$GC_CITY" session wake'  "asleep-session wake is wired"
+# The wa-1eos defer must be gated behind the legacy (reuse=0) path so a live
+# session is reused, not deferred, when reuse is enabled.
+if grep -qE 'PILOT_REUSE_SESSION:-1.+!= "1".+\&\&.+BUILDER_TARGET.+!= "gastown.dog"' "$DISPATCHER" \
+   || grep -B0 -A0 -E '\[ "\$\{PILOT_REUSE_SESSION:-1\}" != "1" \] && \[ "\$DRY_RUN" != "1" \]' "$DISPATCHER" >/dev/null 2>&1; then
+  ok "wa-1eos defer is gated to the legacy (reuse-disabled) path"
+else
+  bad "wa-1eos defer not gated behind PILOT_REUSE_SESSION!=1"
+fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
