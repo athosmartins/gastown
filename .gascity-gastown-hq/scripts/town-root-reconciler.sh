@@ -46,10 +46,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
-ROOT="/Users/athos/gt"
-CITY="/Users/athos/gt/.gascity-gastown-hq"
-LOG_DIR="$CITY/.gc/logs"
-LOG="$LOG_DIR/town-root-reconciler.log"
+# Defaults are the live town root; all four are env-overridable so the selftest
+# harness can point the reconcile_* helpers at a throwaway repo + temp log
+# without touching the live root (defaults are unchanged in production).
+ROOT="${ROOT:-/Users/athos/gt}"
+CITY="${CITY:-/Users/athos/gt/.gascity-gastown-hq}"
+LOG_DIR="${LOG_DIR:-$CITY/.gc/logs}"
+LOG="${LOG:-$LOG_DIR/town-root-reconciler.log}"
 GC="${GC:-gc}"
 REMOTE="${RECONCILE_REMOTE:-origin}"
 BRANCH="${RECONCILE_BRANCH:-main}"
@@ -150,7 +153,7 @@ reconcile_untracked_for_ffpull() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # reconcile_tracked_for_ffpull  (ga-y3tx — fixes tracked IDENTICAL modifications
-# blocking FF that ga-sejv missed)
+# blocking FF that ga-sejv missed; gt-yjr20 — adds the ORTHOGONAL-edit case)
 #
 # PROBLEM: `git pull --ff-only` aborts with "Your local changes to the following
 # files would be overwritten by merge" when the live working tree has locally-
@@ -162,35 +165,66 @@ reconcile_untracked_for_ffpull() {
 # byte-identical dups that pinned the FF for minutes, firing repeated false
 # 'town root diverged' ntfy to Athos.
 #
+# gt-yjr20 (recurring class): the original code blocked on ANY dirty tracked file
+# whose bytes differ from the incoming version — EVEN when the incoming FF does
+# not touch that file at all. A single uncommitted crew edit to a tracked file
+# (skills/refino/SKILL.md, 2026-06-13) then froze EVERY subsequent UNRELATED
+# framework FF until a human committed it. But git only refuses an ff-pull when a
+# file the merge actually CHANGES is dirty; an edit to a file the FF leaves alone
+# is preserved and the FF still lands. So we must classify by "does the incoming
+# FF change this file?" (upstream blob vs HEAD blob), not "does it differ from the
+# incoming version?".
+#
 # For each tracked file where the working tree differs from HEAD:
+#   ORTHOGONAL (upstream blob == HEAD blob) → the FF does not touch this file;
+#                            the ff-pull preserves the edit and still advances.
+#                            Leave it; count ORTHOGONAL_COUNT. NEVER block. This
+#                            is the gt-yjr20 fix.
 #   IDENTICAL to incoming  → `git checkout -- $path` to restore HEAD copy;
 #                            the ff-pull then advances it to the same bytes.
 #                            Safe: we only discard a modification that equals
 #                            the merge target — nothing is lost.
-#   DIFFERENT from incoming → do NOT touch it; collect into TRACKED_DIFF_LIST
-#                            and return 2 so the caller STOPS + escalates.
-#                            The NEVER-clobber invariant holds.
-# Sets globals TRACKED_DIFF_LIST and TRACKED_COUNT. Honours DRY_RUN.
+#   DIFFERENT from incoming (and the FF changes it) → do NOT touch it; collect
+#                            into TRACKED_DIFF_LIST and return 2 so the caller
+#                            STOPS + escalates. The NEVER-clobber invariant holds.
+# Sets globals TRACKED_DIFF_LIST, TRACKED_COUNT, ORTHOGONAL_COUNT. Honours DRY_RUN.
 TRACKED_DIFF_LIST=""
 TRACKED_COUNT=0
+ORTHOGONAL_COUNT=0
 reconcile_tracked_for_ffpull() {
   local dir="$1" upstream="$2"
   TRACKED_DIFF_LIST=""
   TRACKED_COUNT=0
+  ORTHOGONAL_COUNT=0
 
   [ -n "$dir" ] || { log "reconcile_tracked: no dir — skip"; return 0; }
   [ -n "$upstream" ] || { log "reconcile_tracked: no upstream — skip"; return 0; }
   git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
     log "reconcile_tracked: $dir is not a git work tree — skip"; return 0; }
 
-  local conflicts=0 u
+  local conflicts=0 u up_blob head_blob
   # Enumerate tracked files where working tree differs from HEAD; -z for safety.
   while IFS= read -r -d '' u; do
     [ -n "$u" ] || continue
-    # Does the incoming upstream have this path? If deleted upstream, leave it —
+    # Resolve the incoming blob id for this path. If deleted upstream, leave it —
     # a tracked→deleted transition is not our concern here.
-    git -C "$dir" cat-file -e "$upstream:$u" 2>/dev/null || continue
-    # Compare working-tree bytes against the incoming version.
+    up_blob=$(git -C "$dir" rev-parse --quiet --verify "$upstream:$u" 2>/dev/null || echo "")
+    [ -n "$up_blob" ] || continue
+    head_blob=$(git -C "$dir" rev-parse --quiet --verify "HEAD:$u" 2>/dev/null || echo "")
+    # gt-yjr20 — ORTHOGONAL EDIT: the incoming FF does NOT modify this file
+    # (upstream blob == HEAD blob). The dirty working-tree edit is unrelated to the
+    # merge, so `git pull --ff-only` leaves it untouched and STILL advances. Blocking
+    # here was the recurring jam: a single uncommitted crew edit to a tracked file
+    # (e.g. skills/refino/SKILL.md) froze EVERY subsequent unrelated framework FF
+    # until a human resolved it. Preserve the edit; do NOT block. (If a later FF
+    # actually touches this file, upstream≠HEAD and we fall through to the real
+    # conflict check below — never clobbering genuine divergent work.)
+    if [ -n "$head_blob" ] && [ "$head_blob" = "$up_blob" ]; then
+      log "reconcile_tracked: orthogonal local edit '$u' preserved (incoming $upstream does not modify it; ff-pull keeps the edit and still advances)"
+      ORTHOGONAL_COUNT=$((ORTHOGONAL_COUNT + 1))
+      continue
+    fi
+    # The incoming FF DOES change this file. Compare working-tree bytes vs incoming.
     if git -C "$dir" show "$upstream:$u" 2>/dev/null | cmp -s - "$dir/$u"; then
       # IDENTICAL → restore HEAD copy so git pull can advance it cleanly.
       # The FF pull will land the same bytes regardless; nothing is lost.
@@ -261,6 +295,7 @@ reconcile_once() {
       return 0
     fi
     [ "$TRACKED_COUNT" -gt 0 ] && log "reconciled $TRACKED_COUNT byte-identical tracked modification(s) — ff-pull can now land cleanly."
+    [ "${ORTHOGONAL_COUNT:-0}" -gt 0 ] && log "preserved $ORTHOGONAL_COUNT orthogonal local edit(s) the incoming FF does not touch (gt-yjr20) — ff-pull keeps them and still advances."
 
     # ga-sejv: clear byte-identical untracked collisions BEFORE the ff-pull. This
     # is a pure FF (local is an ancestor), so it SHOULD land — but an untracked
@@ -314,6 +349,16 @@ reconcile_once() {
   maybe_ntfy "Gas City town root diverged from $REMOTE/$BRANCH — autonomous reconcile blocked, needs a human/Mayor rebase. Framework fixes may be dormant."
   return 0
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Library-source guard. The selftest harness sources this file with
+# TOWN_ROOT_RECONCILER_LIB=1 to exercise the pure reconcile_* helpers against a
+# throwaway repo, WITHOUT launching the daemon loop or touching the live root.
+# Returns when sourced (the normal launchd exec never sets the var, so the daemon
+# starts as before).
+if [ "${TOWN_ROOT_RECONCILER_LIB:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 log "town-root-reconciler started (root=$ROOT remote=$REMOTE branch=$BRANCH interval=${RECONCILE_INTERVAL}s dry_run=$DRY_RUN)"
 
