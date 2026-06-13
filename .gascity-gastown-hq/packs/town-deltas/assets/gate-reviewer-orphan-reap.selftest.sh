@@ -47,6 +47,19 @@ reviewer_session_should_reap() {
   if [ "$age" -gt "$ttl" ]; then echo "reap"; else echo "keep"; fi
 }
 
+# ── The EXACT pure headroom-denominator decision (mirror of
+#    headroom_live_reviewers; gt-bewtm). live = count - reaped - drained, floored
+#    at 0, every non-numeric arg folding to 0.
+headroom_live_reviewers() {
+  local count="${1:-0}" reaped="${2:-0}" drained="${3:-0}" live
+  case "$count"   in ''|*[!0-9]*) count=0 ;; esac
+  case "$reaped"  in ''|*[!0-9]*) reaped=0 ;; esac
+  case "$drained" in ''|*[!0-9]*) drained=0 ;; esac
+  live=$(( count - reaped - drained ))
+  [ "$live" -lt 0 ] && live=0
+  echo "$live"
+}
+
 TTL=65   # default = VERDICT_TIMEOUT_MINUTES(45) + 20 margin
 
 echo "── 1. NEVER reap a live (active) reviewer, regardless of age ──"
@@ -92,6 +105,38 @@ echo "── 8. drift-guard: TTL default exceeds the verdict timeout (concurrenc
 # open. The default TTL is verdict-timeout + a positive margin.
 has "$GATE" 'REVIEWER_SESSION_TTL_MINUTES:-\$\(\(VERDICT_TIMEOUT_MINUTES \+ [0-9]+\)\)' \
   "TTL default = VERDICT_TIMEOUT_MINUTES + margin"
+
+echo "── 9. gt-bewtm: headroom_live_reviewers excludes drained reviewers from the cap ──"
+# The Step 0b-1 headroom gate's denominator must subtract DRAINED reviewers
+# (young, not-age-reaped, but peek-confirmed-gone) — otherwise the phantom count
+# climbs under Dolt pressure and the gate hits a false 'dolt-calm-cap-reached'
+# ceiling and DEFERs every sweep (the 2026-06-12 town-wide deadlock).
+eq "no reviewers → 0 live"                 "$(headroom_live_reviewers 0 0 0)"   "0"
+eq "3 present, none reaped/drained → 3"    "$(headroom_live_reviewers 3 0 0)"   "3"
+eq "6 present, 2 age-reaped → 4 live"      "$(headroom_live_reviewers 6 2 0)"   "4"
+eq "6 present, 3 DRAINED → 3 live"         "$(headroom_live_reviewers 6 0 3)"   "3"
+eq "6 present, 1 reaped + 2 drained → 3"   "$(headroom_live_reviewers 6 1 2)"   "3"
+eq "all drained → 0 (the deadlock case)"   "$(headroom_live_reviewers 6 0 6)"   "0"
+eq "over-subtract floors at 0 (never <0)"  "$(headroom_live_reviewers 3 2 4)"   "0"
+eq "junk count folds to 0"                 "$(headroom_live_reviewers NaN 0 0)" "0"
+eq "junk drained folds to 0 (live=count)"  "$(headroom_live_reviewers 5 0 x)"   "5"
+eq "missing args default to 0"             "$(headroom_live_reviewers)"         "0"
+
+echo "── 10. drift-guard: the real dispatcher wires the gt-bewtm drained-exclusion ──"
+has "$GATE" 'headroom_live_reviewers\(\)'                  "pure headroom_live_reviewers helper is defined"
+# The headroom denominator must be computed THROUGH the pure helper WITH the
+# drained arg — not the old raw (count - reaped) subtraction.
+has "$GATE" 'LIVE_REVIEWERS=\$\(headroom_live_reviewers .*DRAINED_REVIEWERS' \
+  "LIVE_REVIEWERS computed via headroom_live_reviewers including DRAINED_REVIEWERS"
+# The janitor must PEEK each kept (non-reaped) reviewer and count peek-dead ones.
+has "$GATE" 'DRAINED_REVIEWERS=\$\(\(DRAINED_REVIEWERS \+ 1\)\)' \
+  "janitor increments DRAINED_REVIEWERS for peek-dead sessions"
+has "$GATE" 'session_peek_reports_dead "\$_R_PEEK_ERR"' \
+  "janitor uses session_peek_reports_dead as the drained discriminator"
+# Must capture ONLY stderr (2>&1 >/dev/null) so a live reviewer's scrollback
+# can never false-match 'session not found'.
+has "$GATE" 'session peek "\$R_ID" --lines 1 2>&1 >/dev/null' \
+  "drained peek captures stderr-only (live scrollback can't false-match)"
 
 echo ""
 echo "──────────────────────────────────────────────"

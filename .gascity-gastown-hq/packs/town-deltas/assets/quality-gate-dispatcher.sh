@@ -225,6 +225,34 @@ session_peek_reports_dead() {
   esac
 }
 
+# headroom_live_reviewers <session_count> <reaped> <drained> → the number of
+# gate-reviewer sessions that TRULY occupy the template's max_active_sessions
+# budget after this sweep, floored at 0. Pure; no I/O.
+# gt-bewtm: LIVE_REVIEWERS is the denominator of the Step 0b-1 headroom gate.
+# The original calc was (session_count - reaped), which counts EVERY present,
+# non-closed reviewer as live. But a reviewer that DRAINS (its Claude session
+# ends normally instead of being hard-killed) stays LISTED + not-closed and
+# presents as asleep, so the age-TTL janitor keeps it (age < TTL) and `reaped`
+# misses it — yet it occupies NO real budget. Under Dolt pressure reviewers
+# drain often; the phantom count climbs, headroom hits a false cap
+# ("dolt-calm-cap-reached / gate em N runs") and DEFERs every sweep even with
+# Dolt calm and the queue full (the 2026-06-12 town-wide deadlock). `drained`
+# is the count of those peek-confirmed-gone sessions (session_peek_reports_dead
+# = 1), subtracted so the denominator reflects only genuinely-live reviewers.
+# This is the headroom-calc-only fix: it does NOT lower the age-TTL (which would
+# reap slow-but-alive reviewers mid-review → false-FAILs); peek reports a
+# slow-alive reviewer as alive and a drained one as gone, so it is the safe
+# discriminator. Defensive on junk: any non-numeric arg folds to 0.
+headroom_live_reviewers() {
+  local count="${1:-0}" reaped="${2:-0}" drained="${3:-0}" live
+  case "$count"   in ''|*[!0-9]*) count=0 ;; esac
+  case "$reaped"  in ''|*[!0-9]*) reaped=0 ;; esac
+  case "$drained" in ''|*[!0-9]*) drained=0 ;; esac
+  live=$(( count - reaped - drained ))
+  [ "$live" -lt 0 ] && live=0
+  echo "$live"
+}
+
 # _ts_to_epoch <rfc3339> → unix epoch seconds (stdout) | "" on failure.
 # Handles BOTH a trailing Z (UTC) and a numeric ±HH:MM offset — the two forms
 # `gc session list` emits for last_active (e.g. "...Z" or "...-03:00"). python3
@@ -698,6 +726,7 @@ case "$REVIEWER_SESSION_COUNT" in ''|*[!0-9]*) REVIEWER_SESSION_COUNT=0 ;; esac
 if [ "$REVIEWER_SESSION_COUNT" -gt 0 ]; then
   NOW_EPOCH_R=$(date +%s)
   REAPED_REVIEWERS=0
+  DRAINED_REVIEWERS=0
   for ri in $(seq 0 $((REVIEWER_SESSION_COUNT - 1))); do
     R_SESSION=$(echo "$REVIEWER_SESSIONS_JSON" | jq -c ".[$ri]" 2>/dev/null || echo "{}")
     R_ID=$(echo "$R_SESSION" | jq -r '.id // empty' 2>/dev/null || echo "")
@@ -719,10 +748,33 @@ if [ "$REVIEWER_SESSION_COUNT" -gt 0 ]; then
       warn "Reaping orphaned gate-reviewer session $R_ID (state=$R_STATE attached=$R_ATTACHED age=${R_AGE_MINUTES}m > TTL=${REVIEWER_SESSION_TTL_MINUTES}m — frees cap slot; ga-zl277)"
       gc --city "$GC_CITY" session close "$R_ID" 2>/dev/null || true
       REAPED_REVIEWERS=$((REAPED_REVIEWERS + 1))
+    else
+      # gt-bewtm: a KEPT (young, not-age-reaped) reviewer may have DRAINED — its
+      # Claude session ended normally yet it stays LISTED + not-closed and
+      # presents as asleep, so the age-TTL janitor above keeps it but it occupies
+      # NO real cap budget. Under Dolt pressure reviewers drain often; counting
+      # them as live inflates LIVE_REVIEWERS, the Step 0b-1 headroom gate hits a
+      # false cap and DEFERs every sweep with Dolt calm + queue full (the
+      # town-wide deadlock). `gc session peek` is the discriminator the list
+      # lacks (ga-h9o17): a drained/ended session answers "session not found" on
+      # STDERR, a genuinely asleep-but-alive one answers with scrollback on
+      # STDOUT. `2>&1 >/dev/null` captures ONLY stderr so a live reviewer's
+      # scrollback can never false-match. We do NOT close it here (the age-TTL
+      # janitor owns reaping); we only EXCLUDE it from the headroom denominator,
+      # which is the safe, headroom-calc-only fix — peek reads slow-alive as
+      # alive, so a transient glitch can never under-count live reviewers.
+      _R_PEEK_ERR=$(gc --city "$GC_CITY" session peek "$R_ID" --lines 1 2>&1 >/dev/null || true)
+      if [ "$(session_peek_reports_dead "$_R_PEEK_ERR")" = "1" ]; then
+        log "Drained gate-reviewer session $R_ID (state=$R_STATE age=${R_AGE_MINUTES}m < TTL but peek reports session-gone) — excluding from headroom LIVE_REVIEWERS (gt-bewtm)."
+        DRAINED_REVIEWERS=$((DRAINED_REVIEWERS + 1))
+      fi
     fi
   done
   if [ "$REAPED_REVIEWERS" -gt 0 ]; then
     log "Reaped $REAPED_REVIEWERS orphaned gate-reviewer session(s) this sweep (ga-zl277)."
+  fi
+  if [ "$DRAINED_REVIEWERS" -gt 0 ]; then
+    log "Excluded $DRAINED_REVIEWERS drained gate-reviewer session(s) from headroom LIVE_REVIEWERS this sweep (gt-bewtm)."
   fi
 fi
 
@@ -763,14 +815,19 @@ if [ "$RECON_RIG_COUNT" -gt 0 ]; then
   done
 fi
 
-# ── ga-cw4pm: live reviewer-session count for the headroom gate ───────────────
+# ── ga-cw4pm / gt-bewtm: live reviewer-session count for the headroom gate ────
 # gate-reviewer sessions still alive AFTER this sweep's reaping occupy the
 # template's max_active_sessions budget — they are the denominator for the
 # dynamic-concurrency decision (Step 0b-1). REVIEWER_SESSION_COUNT is set by the
-# Step 0a-2 janitor (0 when no reviewer sessions exist); REAPED_REVIEWERS is only
-# set inside the janitor's >0 branch, so default it to 0 for the no-session sweep.
-LIVE_REVIEWERS=$(( ${REVIEWER_SESSION_COUNT:-0} - ${REAPED_REVIEWERS:-0} ))
-[ "$LIVE_REVIEWERS" -lt 0 ] 2>/dev/null && LIVE_REVIEWERS=0
+# Step 0a-2 janitor (0 when no reviewer sessions exist); REAPED_REVIEWERS and
+# DRAINED_REVIEWERS are only set inside the janitor's >0 branch, so the pure
+# helper defaults both to 0 for the no-session sweep.
+# gt-bewtm: subtract DRAINED_REVIEWERS — young (not-age-reaped) sessions whose
+# Claude has drained but still LIST as asleep+not-closed. Without this, those
+# phantoms inflated the denominator and the headroom gate hit a false
+# "dolt-calm-cap-reached" ceiling, DEFERring every sweep with Dolt calm + queue
+# full (the 2026-06-12 town-wide deadlock).
+LIVE_REVIEWERS=$(headroom_live_reviewers "${REVIEWER_SESSION_COUNT:-0}" "${REAPED_REVIEWERS:-0}" "${DRAINED_REVIEWERS:-0}")
 
 # ── Step 0b: Find a queued marker ────────────────────────────────────────────
 # quality-gate-guard.sh claims, validates, derives author, and parks markers as
