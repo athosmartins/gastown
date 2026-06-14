@@ -36,6 +36,15 @@
     <string>/Users/athos</string>
     <key>GC_CITY_PATH</key>
     <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <!-- Labels that mark a bead as BUILD / INFRA / SCRAPER-CONFIG work — NOT a
+         refinable product story. Any candidate carrying one of these is excluded
+         from the funnel even if it (mis)carries a story:* lifecycle label. This
+         is the PRIMARY defense that keeps scraper-config beads (e.g. dc-yla3:
+         custom,scraper) out of the product-refino funnel. The script also defaults
+         this set, but pinning it here makes it explicit + Mayor-tunable without a
+         code edit and guarantees launchd never runs with an empty exclude set. -->
+    <key>AUTO_REFINO_EXCLUDE_LABELS</key>
+    <string>scraper build infra config deploy migration pipeline</string>
   </dict>
 </dict>
 </plist>

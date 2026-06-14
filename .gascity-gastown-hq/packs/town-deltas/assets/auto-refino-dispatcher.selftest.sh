@@ -79,6 +79,13 @@ EX="scraper build infra config deploy migration pipeline"
 [ "$(auto_refino_is_product_story "story:unrefined,frontend" "$EX")" = "yes" ] && ok "genuine product story (no build label) → yes"        || bad "product story → expected yes"
 [ "$(auto_refino_is_product_story "custom" "$EX")" = "yes" ]                   && ok "custom ALONE → yes (custom NOT excluded — ambiguous)" || bad "custom alone → expected yes"
 [ "$(auto_refino_is_product_story "scraper" "")" = "yes" ]                     && ok "empty exclude set → yes (no filtering)"              || bad "empty exclude → expected yes"
+# The EXACT dc-yla3 RESIDUAL failure mode: old code (--set-labels) had stripped the
+# auto-refino:escalated marker, leaving a scraper bead carrying only a lifecycle
+# label. The product filter MUST still exclude it — the escalated marker is NOT the
+# only thing standing between a scraper bead and the funnel (re-escalation backstop).
+[ "$(auto_refino_is_product_story "story:refinement-in-progress,scraper" "$EX")" = "no" ] \
+  && ok "scraper bead w/o escalated marker (dc-yla3 residual) → no (product filter still excludes)" \
+  || bad "scraper residual → expected no (re-escalation backstop missing)"
 
 # ── Scenario 2: Triagem stories are candidates (fresh); past-states are skipped ─
 echo "Scenario 2: lifecycle classification — fresh Triagem input"
@@ -211,6 +218,32 @@ if grep -qF 'auto_refino_is_product_story "$c_labels"' "$DISPATCHER" \
   ok "candidate selection excludes build/scraper/non-product beads (bug 3)"
 else
   bad "candidate selection does not filter out build/non-product beads"
+fi
+
+# 0d. ESCALATE-LOOP RE-FIX: the escalate path must be TERMINAL — it removes the
+#     lifecycle label (via _clear_lifecycle) so NO candidate query (FRESH/UNREF/
+#     BOUNCE) can re-pick the bead, instead of leaving story:refinement-in-progress
+#     and relying solely on the auto-refino:escalated marker (the single point of
+#     failure that re-escalated dc-yla3 to attempt 5/3 after the prior fix).
+if grep -qF '_clear_lifecycle "$STORY_ID"' "$DISPATCHER"; then
+  ok "escalate path is terminal: _clear_lifecycle removes the lifecycle label (no re-pick)"
+else
+  bad "escalate path does not clear the lifecycle label — re-escalation loop can re-form"
+fi
+# _clear_lifecycle must iterate the FULL lifecycle set and REMOVE (never add) each.
+if awk '/^_clear_lifecycle\(\)/{f=1} f&&/for l in \$AUTO_REFINO_LIFECYCLE_LABELS/{loop=1} f&&/label remove/{rm=1} f&&/^}/&&NR>1{if(f)f=0} END{exit !(loop&&rm)}' "$DISPATCHER"; then
+  ok "_clear_lifecycle iterates AUTO_REFINO_LIFECYCLE_LABELS and removes each"
+else
+  bad "_clear_lifecycle does not remove the full lifecycle set"
+fi
+# The plist must pin AUTO_REFINO_EXCLUDE_LABELS so launchd never runs the daemon
+# with an empty exclude set (defense for bug 3 at the deployment layer).
+PLIST="$SELF_DIR/auto-refino-dispatcher.plist"
+if grep -q 'AUTO_REFINO_EXCLUDE_LABELS' "$PLIST" 2>/dev/null \
+   && grep -A1 'AUTO_REFINO_EXCLUDE_LABELS' "$PLIST" 2>/dev/null | grep -q 'scraper'; then
+  ok "plist pins AUTO_REFINO_EXCLUDE_LABELS incl. scraper (deployment-layer defense)"
+else
+  bad "plist does not pin AUTO_REFINO_EXCLUDE_LABELS"
 fi
 
 # 2. The handoff records story.refino_refiner so the gate bounces FAILs back to us.

@@ -254,6 +254,30 @@ _set_lifecycle() {
   bd_ label add "$sid" "$want" -q 2>/dev/null || true
 }
 
+# _clear_lifecycle <story_id>
+#   Remove EVERY candidate lifecycle label (story:triage / story:unrefined /
+#   story:refinement-in-progress + the rest) WITHOUT adding any back. Non-lifecycle
+#   labels (auto-refino:escalated, domain tags) are untouched — additive, never
+#   --set-labels.
+#   ESCALATE-LOOP RE-FIX: the prior fix's escalate path KEPT story:refinement-in-
+#   progress and relied SOLELY on the auto-refino:escalated marker to exclude the
+#   bead from the BOUNCE query (--label story:refinement-in-progress --assignee us).
+#   That is a single point of failure: the moment auto-refino:escalated is stripped
+#   for ANY reason (old-code --set-labels residue, a manual edit, the Step-0 TTL
+#   recovery dropping auto-refino:refining and leaving a bare in-progress bead) the
+#   story is STRUCTURALLY a bounce candidate again and re-escalates. dc-yla3 reached
+#   attempt 5/3 exactly this way: after the fix deployed, TTL recovery restored a
+#   clean in-progress+assigned bead with NO escalated marker, so the next sweep
+#   re-selected it as state=bounce and escalated again. Removing the lifecycle label
+#   entirely means NO candidate query (FRESH/UNREF/BOUNCE) can match the bead — the
+#   structural belt to the escalated-marker suspenders.
+_clear_lifecycle() {
+  local sid="$1" l
+  for l in $AUTO_REFINO_LIFECYCLE_LABELS; do
+    bd_ label remove "$sid" "$l" -q 2>/dev/null || true
+  done
+}
+
 log "Auto-refino sweep start (actor=$AUTO_REFINO_ACTOR, max_attempts=$AUTO_REFINO_MAX_ATTEMPTS, timeout=${AUTO_REFINO_TIMEOUT_MINUTES}m, dry_run=$DRY_RUN)"
 
 # ── Step 0: TTL recovery — re-queue stories stuck mid-refine ──────────────────
@@ -512,6 +536,11 @@ bd -C "$GC_CITY" update "$STORY_ID" \\
   --set-metadata "story.auto_refino_gaps=<perguntas/lacunas concretas, uma por linha — o que falta para refinar>"
 bd -C "$GC_CITY" label add "$STORY_ID" "auto-refino:escalated"
 bd -C "$GC_CITY" label remove "$STORY_ID" "auto-refino:refining"
+# TERMINAL escalate: remove EVERY lifecycle label so no candidate query can re-pick
+# this story (the dispatcher reconciles this too, but be terminal here as well).
+bd -C "$GC_CITY" label remove "$STORY_ID" "story:refinement-in-progress"
+bd -C "$GC_CITY" label remove "$STORY_ID" "story:triage"
+bd -C "$GC_CITY" label remove "$STORY_ID" "story:unrefined"
 bd -C "$GC_CITY" comment "$STORY_ID" "Auto-refino NÃO conseguiu refinar com confiança (attempt $THIS_ATTEMPT). Perguntas/lacunas para o Athos:
 <liste as perguntas — decisões de produto que só o Athos toma>
 NÃO promovido, NÃO despachado."
@@ -606,14 +635,17 @@ case "$DECISION" in
     bd_ update "$STORY_ID" --set-metadata "story.auto_refino_attempts=$THIS_ATTEMPT" -q 2>/dev/null || true
     bd_ label remove "$STORY_ID" "auto-refino:refining" -q 2>/dev/null || true
     bd_ label add "$STORY_ID" "auto-refino:escalated" -q 2>/dev/null || true
-    # Keep a PRE-approval lifecycle so the Pilot never dispatches it and it is not
-    # in Athos's approval queue. refinement-in-progress = "needs human input".
-    # BUG 1: transition ADDITIVELY — the old --set-labels here wiped the
-    # auto-refino:escalated flag set on the line above (and every other label), so
-    # the story looked fresh next sweep and was re-escalated forever (dc-yla3
-    # 1→2→3→4/3). _set_lifecycle preserves auto-refino:escalated, which the
-    # candidate selector (skip-set + --exclude-label) then durably honours.
-    _set_lifecycle "$STORY_ID" "story:refinement-in-progress"
+    # TERMINAL escalate (ga-flxp6 re-fix). The story now waits on Athos: it must
+    # NOT be dispatchable (Pilot only dispatches story:approved, so removing the
+    # lifecycle label is safe) and — critically — it must NOT match ANY candidate
+    # query again. The prior fix KEPT story:refinement-in-progress and leaned only
+    # on the auto-refino:escalated marker to exclude it; that single marker getting
+    # stripped (old-code residue / manual edit / TTL recovery) re-armed the bounce
+    # query and re-escalated the bead (dc-yla3 → attempt 5/3). _clear_lifecycle
+    # removes EVERY lifecycle label additively (auto-refino:escalated + domain tags
+    # survive), so the FRESH/UNREF/BOUNCE queries can no longer structurally return
+    # it — structural belt to the escalated-marker + product-filter suspenders.
+    _clear_lifecycle "$STORY_ID"
     if [ "$OUTCOME" != "ESCALATE" ]; then
       # Budget-exhaustion escalation (the refiner kept producing REFINED but the
       # gate kept bouncing). Record why.
