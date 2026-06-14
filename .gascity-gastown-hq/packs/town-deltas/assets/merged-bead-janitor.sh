@@ -92,17 +92,43 @@ notify_athos() {
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PURE DECISION FUNCTION — the heart of the janitor; fully unit-testable.
-# janitor_decide <is_epic> <has_open_marker> <sig_commit> <sig_marker> <sig_branch_merged>
+# janitor_decide <is_epic> <has_open_marker> <sig_commit_subject> <sig_commit_body>
+#                <sig_marker> <sig_branch_merged> <unmerged_branch>
 # Each arg is 0|1. Echoes "<verdict>:<reason>" where verdict ∈ {keep,close}.
+#
 # Guards are evaluated FIRST (an open marker or epic always wins over signals).
+#
+# COMMIT SIGNAL is split into two strengths (ga-92o95 fix):
+#   • sig_commit_subject — bead id is in an origin/main commit SUBJECT
+#     (conventional scope feat(<id>)/fix(<id>)): STRONG proof the commit
+#     IMPLEMENTS the bead. Trusted unconditionally.
+#   • sig_commit_body — id appears ONLY in a commit BODY: WEAK/ambiguous. It is
+#     the genuine signal for the SIBLING-UNDER-PARENT and CROSS-STORE MIRROR
+#     cases (the code really is in that merged commit), but it ALSO fires when a
+#     commit merely *mentions* the bead ("rescued from <id>", "supersedes <id>")
+#     without containing its code — the wa-qjym false-close this fix prevents.
+#     It is therefore VETOED by an `unmerged_branch` (the bead's crew/*/<id>
+#     branch resolves and is NOT an ancestor of origin/main → its work is
+#     demonstrably NOT in main). The veto is SCOPED to the weak body signal: a
+#     subject commit, a terminal marker, or branch-ancestry still close even
+#     when a branch lingers (a squash-merge leaves the crew branch non-ancestor
+#     of main yet the changes ARE in main). When in doubt the verdict is KEEP —
+#     a false-CLOSE orphans unmerged code (AC3), a false-KEEP is mere board noise.
 # ═════════════════════════════════════════════════════════════════════════════
 janitor_decide() {
-  local is_epic="$1" has_open_marker="$2" sig_commit="$3" sig_marker="$4" sig_branch="$5"
+  local is_epic="$1" has_open_marker="$2" sig_commit_subject="$3" sig_commit_body="$4" \
+        sig_marker="$5" sig_branch="$6" unmerged_branch="$7"
   if [ "$is_epic" = "1" ]; then            echo "keep:epic-parent-never-autoclosed"; return 0; fi
   if [ "$has_open_marker" = "1" ]; then    echo "keep:active-open-gate-marker"; return 0; fi
-  if [ "$sig_commit" = "1" ]; then         echo "close:commit-in-origin-main"; return 0; fi
+  # — Strong merge signals (trusted even with a lingering unmerged branch) —
   if [ "$sig_marker" = "1" ]; then         echo "close:terminal-gate-marker-passed-or-superseded"; return 0; fi
+  if [ "$sig_commit_subject" = "1" ]; then echo "close:commit-subject-in-origin-main"; return 0; fi
   if [ "$sig_branch" = "1" ]; then         echo "close:branch-ancestor-of-origin-main"; return 0; fi
+  # — Weak body-only mention: trusted ONLY if not disconfirmed by an unmerged branch —
+  if [ "$sig_commit_body" = "1" ]; then
+    if [ "$unmerged_branch" = "1" ]; then  echo "keep:unmerged-branch-disconfirms-commit-mention"; return 0; fi
+    echo "close:commit-body-in-origin-main"; return 0
+  fi
   echo "keep:no-merge-evidence"
 }
 
@@ -253,6 +279,25 @@ branch_merged() {
   git_in "$gdir" "$container" merge-base --is-ancestor "$bref" "$mref" 2>/dev/null
 }
 
+# branch_unmerged <git_dir> <is_container> <branch_ref> <main_ref>
+# rc0 iff branch_ref RESOLVES and is NOT an ancestor of main_ref — i.e. the
+# branch carries commits that are demonstrably NOT in main (its work is
+# un-merged). The disconfirming signal for the ga-92o95 body-mention veto.
+#
+# This is NOT the strict negation of branch_merged: a MISSING branch yields rc1
+# from BOTH (a non-existent branch is neither "merged" nor "unmerged work we can
+# veto on"). A branch that is BEHIND main is an ancestor → rc1 here (no unmerged
+# work). Only a branch with commits absent from main fires rc0.
+branch_unmerged() {
+  local gdir="$1" container="$2" bref="$3" mref="$4"
+  git_in "$gdir" "$container" rev-parse -q --verify "$bref" >/dev/null 2>&1 || return 1
+  # is-ancestor rc0 = merged/behind (NOT unmerged); rc1 = diverged (unmerged).
+  if git_in "$gdir" "$container" merge-base --is-ancestor "$bref" "$mref" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # BEAD / MARKER HELPERS (live Dolt; only used in the sweep, not the pure tests).
 # ═════════════════════════════════════════════════════════════════════════════
@@ -363,20 +408,38 @@ while IFS= read -r rig; do
     HAS_OPEN=0; has_open_marker "$MK" && HAS_OPEN=1
     SIG_MARKER=0; has_terminal_passed_marker "$MK" && SIG_MARKER=1
 
-    # Signal A — commit message in own-rig repo OR HQ repo (mirror).
-    SIG_COMMIT=0; COMMIT_EVID=""
+    # Signal A — commit message in own-rig repo OR HQ repo (mirror). ga-92o95
+    # SPLITS this into STRONG subject-scope vs WEAK body-only mention. The body
+    # scan (%B) is a superset of the subject scan (%s); we try subject first and
+    # only fall through to the body scan when no subject match exists. A subject
+    # match is trusted unconditionally; a body-only match is later vetoable.
+    SIG_SUBJ=0; SIG_BODY=0; COMMIT_EVID=""
     if [ "$IS_EPIC" = "0" ] && [ "$HAS_OPEN" = "0" ]; then
-      if sha=$(scan_commit_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$BID"); then
-        SIG_COMMIT=1; COMMIT_EVID="$RNAME origin/$RDEFAULT@${sha:0:9}"
-      elif [ "$RGITDIR" != "$HQ_GITDIR" ] && sha=$(scan_commit_for_bead "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$BID"); then
-        SIG_COMMIT=1; COMMIT_EVID="hq origin/$HQ_DEFAULT@${sha:0:9}"
+      if sha=$(scan_commit_subject_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$BID"); then
+        SIG_SUBJ=1; COMMIT_EVID="subj $RNAME origin/$RDEFAULT@${sha:0:9}"
+      elif [ "$RGITDIR" != "$HQ_GITDIR" ] && sha=$(scan_commit_subject_for_bead "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$BID"); then
+        SIG_SUBJ=1; COMMIT_EVID="subj hq origin/$HQ_DEFAULT@${sha:0:9}"
+      fi
+      if [ "$SIG_SUBJ" = "0" ]; then
+        if sha=$(scan_commit_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$BID"); then
+          SIG_BODY=1; COMMIT_EVID="body $RNAME origin/$RDEFAULT@${sha:0:9}"
+        elif [ "$RGITDIR" != "$HQ_GITDIR" ] && sha=$(scan_commit_for_bead "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$BID"); then
+          SIG_BODY=1; COMMIT_EVID="body hq origin/$HQ_DEFAULT@${sha:0:9}"
+        fi
       fi
     fi
 
-    # Signal C — branch ancestor of origin/main. Branch from marker labels, else
-    # the crew/*/<id> convention discovered on the remote.
-    SIG_BRANCH=0; BRANCH_EVID=""
-    if [ "$IS_EPIC" = "0" ] && [ "$HAS_OPEN" = "0" ] && [ "$SIG_COMMIT" = "0" ] && [ "$SIG_MARKER" = "0" ]; then
+    # Signal C (branch ancestor of origin/main) + ga-92o95 disconfirming veto.
+    # Enumerate the bead's candidate branches ONCE — from marker branch:<…>
+    # labels, else the crew/*/<id> convention on the remote — and derive BOTH:
+    #   • SIG_BRANCH    — at least one candidate IS an ancestor of main (merged).
+    #   • SIG_UNMERGED  — at least one candidate resolves and is NOT an ancestor
+    #                     (its work is demonstrably NOT in main → vetoes a weak
+    #                     body-only commit mention, the wa-qjym false-close).
+    # Skipped when a cheap strong signal (epic, open marker, terminal marker, or
+    # subject commit) already determines the verdict regardless of branch state.
+    SIG_BRANCH=0; SIG_UNMERGED=0; BRANCH_EVID=""; UNMERGED_EVID=""
+    if [ "$IS_EPIC" = "0" ] && [ "$HAS_OPEN" = "0" ] && [ "$SIG_MARKER" = "0" ] && [ "$SIG_SUBJ" = "0" ]; then
       declare -a CANDS=()
       while IFS= read -r br; do [ -n "$br" ] && CANDS+=("$br"); done <<EOF
 $(branch_label_from_markers "$MK")
@@ -389,11 +452,13 @@ EOF
         [ -z "$br" ] && continue
         if branch_merged "$RGITDIR" "$RCONTAINER" "origin/$br" "origin/$RDEFAULT"; then
           SIG_BRANCH=1; BRANCH_EVID="origin/$br ⊑ origin/$RDEFAULT"; break
+        elif branch_unmerged "$RGITDIR" "$RCONTAINER" "origin/$br" "origin/$RDEFAULT"; then
+          SIG_UNMERGED=1; UNMERGED_EVID="origin/$br ⋢ origin/$RDEFAULT"
         fi
       done
     fi
 
-    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH")
+    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_SUBJ" "$SIG_BODY" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_UNMERGED")
     VERDICT="${VERDICT_LINE%%:*}"; REASON="${VERDICT_LINE#*:}"
 
     if [ "$VERDICT" = "close" ]; then
@@ -413,9 +478,15 @@ EOF
         CLOSED_SUMMARY+=("$BID ($RNAME): $EVID")
       fi
     else
-      # Keep — but if kept only for "no-merge-evidence" and a SIBLING heuristic
-      # suggests it rode a merged parent branch, emit an advisory (never close).
-      log "keep $BID ($RNAME) — $REASON"
+      # Keep — surface the disconfirming-branch evidence when the veto fired so a
+      # ga-92o95-style near-miss (a body mention overruled by an unmerged branch)
+      # is auditable in the log instead of silently kept.
+      KEEP_EVID="$REASON"
+      if [ "$REASON" = "unmerged-branch-disconfirms-commit-mention" ]; then
+        [ -n "$COMMIT_EVID" ]   && KEEP_EVID="$KEEP_EVID [$COMMIT_EVID]"
+        [ -n "$UNMERGED_EVID" ] && KEEP_EVID="$KEEP_EVID [$UNMERGED_EVID]"
+      fi
+      log "keep $BID ($RNAME) — $KEEP_EVID"
       if [ "$REASON" = "no-merge-evidence" ] && [ "$IS_EPIC" = "0" ]; then
         # Advisory sibling detection: a crew/*/<parent> branch that is merged and
         # whose parent != this bead, but this bead shares the rig & is open.

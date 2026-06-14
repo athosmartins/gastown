@@ -27,30 +27,61 @@ rc1() { if "$@" >/dev/null 2>&1; then bad "expected non-zero: $*"; else ok "rc!=
 JANITOR_LIB_ONLY=1 source "$JANITOR" \
   || { echo "FATAL: could not source janitor in lib-only mode"; exit 1; }
 for fn in janitor_decide janitor_story_decide token_bounded scan_commit_for_bead \
-          scan_commit_subject_for_bead branch_merged \
+          scan_commit_subject_for_bead branch_merged branch_unmerged \
           has_open_marker has_terminal_passed_marker branch_label_from_markers rig_gitdir; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by janitor"; exit 1; }
 done
 
 # ── 1. janitor_decide — pure decision, every branch + guard precedence ──────
-# Args: <is_epic> <has_open_marker> <sig_commit> <sig_marker> <sig_branch>
+# Args: <is_epic> <has_open_marker> <sig_commit_subject> <sig_commit_body>
+#       <sig_marker> <sig_branch> <unmerged_branch>
+#
+# ga-92o95 FIX: the commit signal is SPLIT into two strengths:
+#   • sig_commit_subject — the bead id is in an origin/main commit SUBJECT
+#     (conventional scope feat(<id>)/fix(<id>)) → STRONG proof the commit
+#     IMPLEMENTS the bead. Trusted unconditionally.
+#   • sig_commit_body — the id appears ONLY in a commit BODY → WEAK/ambiguous:
+#     it is the genuine signal for the sibling-under-parent and cross-store
+#     mirror cases (code IS in that merged commit), but it ALSO fires when a
+#     commit merely MENTIONS the bead ("rescued from <id>", "supersedes <id>")
+#     without containing its code (the wa-qjym false-close). It is therefore
+#     VETOED by an unmerged branch (the bead's crew/*/<id> branch resolves and
+#     is NOT an ancestor of origin/main → its work is demonstrably NOT merged).
+# The veto applies ONLY to the weak body signal; a subject commit, a terminal
+# marker, or branch-ancestry still close even when a branch lingers (e.g. a
+# squash-merge leaves the crew branch non-ancestor of main).
 echo "── 1. janitor_decide (pure verdict) ──"
-eq "no signals → keep"                  "$(janitor_decide 0 0 0 0 0)" "keep:no-merge-evidence"
-eq "commit signal → close"              "$(janitor_decide 0 0 1 0 0 | cut -d: -f1)" "close"
-eq "marker signal → close"              "$(janitor_decide 0 0 0 1 0 | cut -d: -f1)" "close"
-eq "branch signal → close"              "$(janitor_decide 0 0 0 0 1 | cut -d: -f1)" "close"
-eq "commit reason"                      "$(janitor_decide 0 0 1 0 0)" "close:commit-in-origin-main"
-eq "marker reason"                      "$(janitor_decide 0 0 0 1 0)" "close:terminal-gate-marker-passed-or-superseded"
-eq "branch reason"                      "$(janitor_decide 0 0 0 0 1)" "close:branch-ancestor-of-origin-main"
+eq "no signals → keep"                  "$(janitor_decide 0 0 0 0 0 0 0)" "keep:no-merge-evidence"
+eq "subject signal → close"             "$(janitor_decide 0 0 1 0 0 0 0 | cut -d: -f1)" "close"
+eq "body signal → close"                "$(janitor_decide 0 0 0 1 0 0 0 | cut -d: -f1)" "close"
+eq "marker signal → close"              "$(janitor_decide 0 0 0 0 1 0 0 | cut -d: -f1)" "close"
+eq "branch signal → close"              "$(janitor_decide 0 0 0 0 0 1 0 | cut -d: -f1)" "close"
+eq "subject reason"                     "$(janitor_decide 0 0 1 0 0 0 0)" "close:commit-subject-in-origin-main"
+eq "body reason"                        "$(janitor_decide 0 0 0 1 0 0 0)" "close:commit-body-in-origin-main"
+eq "marker reason"                      "$(janitor_decide 0 0 0 0 1 0 0)" "close:terminal-gate-marker-passed-or-superseded"
+eq "branch reason"                      "$(janitor_decide 0 0 0 0 0 1 0)" "close:branch-ancestor-of-origin-main"
+# ── ga-92o95 regression: the wa-qjym false-close class ──
+# Body-only mention + an unmerged crew branch → the work is provably NOT merged.
+eq "body+unmerged-branch → KEEP (veto)" "$(janitor_decide 0 0 0 1 0 0 1)" "keep:unmerged-branch-disconfirms-commit-mention"
+eq "unmerged branch alone → keep"       "$(janitor_decide 0 0 0 0 0 0 1)" "keep:no-merge-evidence"
+# The veto is SCOPED to the weak body signal — strong signals still close even
+# with a lingering unmerged branch (the squash-merge / errored-then-merged shape).
+eq "subject+unmerged → still close"     "$(janitor_decide 0 0 1 0 0 0 1)" "close:commit-subject-in-origin-main"
+eq "marker+unmerged → still close"      "$(janitor_decide 0 0 0 0 1 0 1)" "close:terminal-gate-marker-passed-or-superseded"
+eq "branch-ancestor+unmerged → close"   "$(janitor_decide 0 0 0 0 0 1 1)" "close:branch-ancestor-of-origin-main"
+# Signal precedence (cosmetic): marker > subject > branch > body.
+eq "subject beats body"                 "$(janitor_decide 0 0 1 1 0 0 0)" "close:commit-subject-in-origin-main"
+eq "marker beats subject"               "$(janitor_decide 0 0 1 0 1 0 0)" "close:terminal-gate-marker-passed-or-superseded"
 # Guard precedence: epic ALWAYS keep, even with every signal set.
-eq "epic beats all signals → keep"      "$(janitor_decide 1 0 1 1 1 | cut -d: -f1)" "keep"
-eq "epic reason"                        "$(janitor_decide 1 0 0 0 0)" "keep:epic-parent-never-autoclosed"
-# Open marker beats signals (protects wa-lstd: queued + branch present).
-eq "open-marker beats commit → keep"    "$(janitor_decide 0 1 1 0 0 | cut -d: -f1)" "keep"
-eq "open-marker beats branch → keep"    "$(janitor_decide 0 1 0 0 1 | cut -d: -f1)" "keep"
-eq "open-marker reason"                 "$(janitor_decide 0 1 0 0 0)" "keep:active-open-gate-marker"
+eq "epic beats all signals → keep"      "$(janitor_decide 1 0 1 1 1 1 1 | cut -d: -f1)" "keep"
+eq "epic reason"                        "$(janitor_decide 1 0 0 0 0 0 0)" "keep:epic-parent-never-autoclosed"
+# Open marker beats signals INCLUDING the body+veto path (protects wa-lstd).
+eq "open-marker beats subject → keep"   "$(janitor_decide 0 1 1 0 0 0 0 | cut -d: -f1)" "keep"
+eq "open-marker beats body+veto → keep" "$(janitor_decide 0 1 0 1 0 0 1 | cut -d: -f1)" "keep"
+eq "open-marker beats branch → keep"    "$(janitor_decide 0 1 0 0 0 1 0 | cut -d: -f1)" "keep"
+eq "open-marker reason"                 "$(janitor_decide 0 1 0 0 0 0 0)" "keep:active-open-gate-marker"
 # Epic precedence over open-marker (both 'keep' but epic wins the label).
-eq "epic+open → epic reason"            "$(janitor_decide 1 1 0 0 0)" "keep:epic-parent-never-autoclosed"
+eq "epic+open → epic reason"            "$(janitor_decide 1 1 0 0 0 0 0)" "keep:epic-parent-never-autoclosed"
 
 # ── 1b. janitor_story_decide — merged story:approved → story:done (ga-gosfs) ──
 # Args: <is_epic> <has_open_marker> <already_done> <in_flight> <has_builder>
@@ -152,6 +183,39 @@ rc0 branch_merged "$R" 0 "merged-topic" "main"     # ancestor → merged
 rc1 branch_merged "$R" 0 "ahead-topic"  "main"     # has commit not in main → not merged
 rc1 branch_merged "$R" 0 "no-such-branch" "main"   # missing branch → not merged (safe)
 
+# ── 3c. branch_unmerged — the ga-92o95 disconfirming-branch veto helper ──────
+# rc0 iff the branch RESOLVES and is NOT an ancestor of main (its work is
+# demonstrably NOT in main). Missing branch → rc1 (no unmerged work to veto on).
+# This is the inverse of branch_merged but distinct on the missing-branch case.
+echo "── 3c. branch_unmerged (disconfirming-branch veto) ──"
+rc0 branch_unmerged "$R" 0 "ahead-topic"  "main"   # diverged → unmerged work exists → veto
+rc1 branch_unmerged "$R" 0 "merged-topic" "main"   # ancestor → NOT unmerged (already in main)
+rc1 branch_unmerged "$R" 0 "no-such-branch" "main" # missing → nothing to veto on (safe)
+
+# ── 3d. END-TO-END regression for ga-92o95 (the wa-qjym false-close) ─────────
+# Shape: a DOCS/supersede commit lands in origin/main and mentions the bead id
+# ONLY in its body ("rescued from <id>"); the bead's REAL code lives on an
+# unmerged crew branch. Body scan fires (SIG_BODY=1), subject scan does NOT
+# (SIG_SUBJ=0), and the crew branch is unmerged → janitor_decide must KEEP.
+echo "── 3d. ga-92o95 end-to-end (body-mention + unmerged crew branch → KEEP) ──"
+( cd "$R" && echo docs > docs.txt && git add docs.txt && \
+  git commit -q -m "docs(tt-docs): rework runbook" \
+                -m "Unrelated docs change; rescued the crawler from tt-orphan into another branch." )
+# crew branch carrying the orphaned bead's real code, NOT merged into main.
+git -C "$R" checkout -q -b crew/claude/tt-orphan main
+( cd "$R" && echo scraper > scraper.py && git add scraper.py && \
+  git commit -q -m "feat(tt-orphan): the real scraper code (never merged)" )
+git -C "$R" checkout -q main
+E2E_SUBJ=0; scan_commit_subject_for_bead "$R" 0 "main" "tt-orphan" >/dev/null 2>&1 && E2E_SUBJ=1
+E2E_BODY=0; scan_commit_for_bead         "$R" 0 "main" "tt-orphan" >/dev/null 2>&1 && E2E_BODY=1
+E2E_UNMG=0; branch_unmerged "$R" 0 "crew/claude/tt-orphan" "main"   && E2E_UNMG=1
+eq "e2e: subject scan does NOT match (0)" "$E2E_SUBJ" "0"
+eq "e2e: body scan DOES match (1)"        "$E2E_BODY" "1"
+eq "e2e: crew branch is unmerged (1)"     "$E2E_UNMG" "1"
+eq "e2e: janitor KEEPS the orphan bead"   \
+   "$(janitor_decide 0 0 "$E2E_SUBJ" "$E2E_BODY" 0 0 "$E2E_UNMG")" \
+   "keep:unmerged-branch-disconfirms-commit-mention"
+
 # ── 4. marker JSON helpers — synthetic fixtures ─────────────────────────────
 echo "── 4. marker helpers ──"
 M_OPEN='[{"status":"open","labels":["gate-status:queued","source-bead:wa-lstd","branch:crew/mila/wa-lstd"]}]'
@@ -201,6 +265,13 @@ grep -q 'scan_commit_subject_for_bead()' "$JANITOR" && ok "defines strict subjec
 # The story sweep MUST use the strict subject scanner (not the body scanner) for
 # signal A — guards against the ga-r471/wa-qggy incidental-body-mention class.
 grep -q 'scan_commit_subject_for_bead "\$RGITDIR"' "$JANITOR" && ok "story sweep uses strict subject scan" || bad "story sweep not using strict scanner"
+# ga-92o95: the in_progress sweep must compute the disconfirming-branch veto and
+# the split subject/body commit signal so a body-only mention + unmerged crew
+# branch (the wa-qjym false-close) is KEPT, not closed.
+grep -q 'branch_unmerged()' "$JANITOR" && ok "defines branch_unmerged veto helper" || bad "missing branch_unmerged def"
+grep -q 'unmerged-branch-disconfirms-commit-mention' "$JANITOR" && ok "in_progress sweep wires the unmerged-branch veto" || bad "unmerged-branch veto missing"
+grep -q 'scan_commit_subject_for_bead "\$RGITDIR" "\$RCONTAINER" "origin/\$RDEFAULT" "\$BID"' "$JANITOR" \
+  && ok "in_progress sweep computes the strong subject signal" || bad "in_progress sweep missing subject signal"
 grep -q 'label add "\$SID" "story:done"' "$JANITOR" && ok "story sweep sets story:done" || bad "story:done transition missing"
 grep -q 'already-story-done' "$JANITOR"          && ok "story idempotency guard present" || bad "story already-done guard missing"
 grep -q 'delivery-owns-it' "$JANITOR"            && ok "delivery-active guard present"   || bad "delivery guard missing"
