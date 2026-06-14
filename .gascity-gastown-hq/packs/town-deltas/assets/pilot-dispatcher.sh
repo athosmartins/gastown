@@ -247,6 +247,64 @@ rig_to_builder() {
   echo "${1:-gastown.dog}"
 }
 
+# ── wa-root-worktree-isolation: rig-root → worktree dispatch directive ─────────
+# Secondary (script-layer) defense for the recurring "production root checked out
+# onto crew branches" bug. The WA rig's REGISTERED path IS its production root
+# (/Users/athos/gt/whatsapp_automation). When the engine slings a wa- bead to a
+# POOL crew, it sets WorkDir = that root (no per-bead worktree in the crew path),
+# and the crew's crew-commit then runs `git checkout -b crew/...` IN-PLACE on the
+# production root → the root goes off main, breaking daemons/painel/siblings.
+#
+# The PRIMARY fix is engine-side (sling provisions a per-bead worktree); the
+# crew-commit SKILL.md Step-1.5 guard is the load-bearing skill-layer fix. This
+# Pilot directive is BEST-EFFORT reinforcement: when a bead would build in a
+# rig's bare production root (any pool-crew rig build), inject an explicit
+# DO-NOT-BRANCH-IN-ROOT / use-a-worktree instruction into the dispatch prompt so
+# the crew runs the guard even if its skill copy is stale. The dispatcher cannot
+# itself change the crew's CWD (that is the engine's WorkDir), so this can only
+# instruct — it never silently flips state. Fail-open: any lookup miss → no
+# directive (identical to pre-change behaviour).
+
+# rig_root_path <rig> — registered production-root path for a rig, or "" if none.
+# Memoized across the sweep in PILOT_RIG_PATHS_JSON (one `gc rig list` per run).
+PILOT_RIG_PATHS_JSON=""
+rig_root_path() {
+  local _rig="$1"
+  [ -z "$_rig" ] && return 0
+  if [ -z "$PILOT_RIG_PATHS_JSON" ]; then
+    PILOT_RIG_PATHS_JSON=$(gc --city "$GC_CITY" rig list --json 2>/dev/null || echo '{}')
+  fi
+  printf '%s' "$PILOT_RIG_PATHS_JSON" \
+    | jq -r --arg n "$_rig" '.rigs[]? | select(.name == $n) | .path' 2>/dev/null \
+    | head -1
+}
+
+# worktree_directive_for <rig> <builder> — echo a prompt block (or nothing).
+# Emits the directive ONLY when the build would land in the rig's bare root:
+#   - a real, on-disk registered rig root exists for $rig, AND
+#   - the builder is NOT the gastown.dog pool (dogs build in HQ dog dirs, never a
+#     rig production root) — every other pool/single crew of a code rig is at risk.
+# HQ/gascity builds never carry a directive (the dog pool is exempt).
+worktree_directive_for() {
+  local _rig="$1" _builder="$2" _root
+  [ "$_builder" = "gastown.dog" ] && return 0
+  _root=$(rig_root_path "$_rig")
+  [ -z "$_root" ] || [ ! -d "$_root" ] && return 0
+  cat <<DIRECTIVE
+
+## ⚠️ Rig-root isolation (MANDATORY before you branch)
+Your rig's production root is: $_root
+If your shell starts there (\`git rev-parse --show-toplevel\` == that path), DO NOT
+\`git checkout -b\` in place — it switches the SHARED production checkout off main
+and breaks daemons, the painel, and sibling crews. Instead isolate first:
+  git -C "$_root" worktree add "$_root/.gc-worktrees/$STORY_ID-\${GC_ALIAS:-crew}" -b "crew/\${GC_ALIAS:-crew}/$STORY_ID" origin/main
+  cd "$_root/.gc-worktrees/$STORY_ID-\${GC_ALIAS:-crew}"
+and do ALL branch/commit work THERE. The /crew-commit skill (Step 1.5) automates
+this guard — run it. If you are already in a crew clone or worktree (NOT the bare
+root), proceed normally. The production root must ALWAYS stay on main.
+DIRECTIVE
+}
+
 # ── Pool selection state (ga-mtlm6) ───────────────────────────────────────────
 # PILOT_BUSY_BUILDERS — builders currently holding LIVE in-flight work (computed
 #   once per sweep from IN_FLIGHT_JSON's sling-task assignees). A busy single-
@@ -1679,6 +1737,12 @@ FIXSEC
     fi
   fi
 
+  # ── wa-root-worktree-isolation: rig-root → worktree directive (best-effort) ───
+  # Compute once; injected into either prompt below. Empty unless this build would
+  # land in a rig's bare production root (see worktree_directive_for). Fail-open.
+  local WORKTREE_DIRECTIVE
+  WORKTREE_DIRECTIVE=$(worktree_directive_for "$STORY_RIG" "$BUILDER_TARGET" 2>/dev/null || echo "")
+
   # ── Build task prompt ────────────────────────────────────────────────────────
   local DISPATCH_TASK
   if [ "$DISPATCH_TIER" = "bug" ]; then
@@ -1714,7 +1778,7 @@ $STORY_EQUILIBRIOS
 - DO NOT ask for approval. DO NOT send to Athos. Just fix, push, gate-done.
 - The autonomous loop: /gate-done → G reviews → merges → ① deploys → bead closed.
 - If /gate-done fails validation (no commits, no branch), fix the issue and retry.
-
+$WORKTREE_DIRECTIVE
 ## Steps
 1. Read the full bead: bd -C "$STORY_BEAD_CITY" show "$STORY_ID"
 2. Run gc prime to load your full context.
@@ -1761,7 +1825,7 @@ $STORY_EQUILIBRIOS
 - DO NOT ask for approval. DO NOT send to Athos. Just build, push, gate-done.
 - The autonomous loop: /gate-done → G reviews → merges → ① deploys → story:done.
 - If /gate-done fails validation (no commits, no branch), fix the issue and retry.
-
+$WORKTREE_DIRECTIVE
 ## Steps
 1. Read the full story bead: bd -C "$STORY_BEAD_CITY" show "$STORY_ID"
 2. Run gc prime to load your full context.

@@ -4,8 +4,8 @@ description: >
   Canonical commit workflow for Gas Town crew members: pre-flight checks,
   branch creation, gt commit with agent identity, push, and PR creation.
   Use when ready to commit and submit work for review.
-allowed-tools: "Bash(git *), Bash(gt *), Bash(gh *)"
-version: "1.0.0"
+allowed-tools: "Bash(git *), Bash(gt *), Bash(gh *), Bash(gc *)"
+version: "1.1.0"
 author: "Gas Town"
 ---
 
@@ -54,7 +54,85 @@ If stuck on a rebase conflict, stop and get help rather than force-pushing.
 
 ---
 
+## Step 1.5: Rig-Root Isolation Guard (CRITICAL — run BEFORE any branching)
+
+> **⚠️ NEVER `git checkout -b` while your CWD's git toplevel IS a registered
+> rig's PRODUCTION ROOT.** Doing so switches the shared production checkout off
+> `main`, breaking every other process that reads that working tree (daemons,
+> the painel, sibling crews). This is the recurring "production root checked out
+> onto crew branches" bug.
+
+When the Pilot slings a rig bead (e.g. a `wa-` bead) to a **pool crew**, the
+engine may set your working directory to the rig's *registered root* itself —
+not an isolated clone. Branching in place there poisons the production tree.
+**Named-crew clones (`<rig>/crew/<name>`) and worktrees are already isolated and
+are safe** — the guard only diverts you when you are standing in the bare root.
+
+Run this guard. It is a no-op (and lets you proceed) unless your toplevel is a
+registered rig root; in that case it creates and moves you into a dedicated
+per-bead worktree, and you branch THERE.
+
+```bash
+# --- Rig-Root Isolation Guard ---------------------------------------------
+# Decide whether the current git toplevel is a REGISTERED rig production root.
+TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null)"
+
+# Registered rig roots (exact paths) from the city registry. EXACT match only:
+# a crew clone or worktree UNDER a rig root must NOT trip the guard.
+IN_RIG_ROOT="$(gc rig list --json 2>/dev/null \
+  | jq -r --arg t "$TOPLEVEL" '.rigs[] | select(.path == $t) | .name' \
+  | head -1)"
+
+if [ -n "$IN_RIG_ROOT" ]; then
+  # We are in the bare production root of rig "$IN_RIG_ROOT" — DO NOT branch here.
+  # Pick a bead id for the worktree name. Prefer $GC_BEAD / the routed bead; fall
+  # back to a timestamp so the guard never blocks on a missing id.
+  BEAD="${GC_BEAD:-${BEAD:-$(date +%s)}}"
+  CREW="${GC_ALIAS:-${GC_AGENT:-crew}}"
+  WT="$TOPLEVEL/.gc-worktrees/${BEAD}-${CREW}"
+  BR="crew/${CREW}/${BEAD}"
+
+  echo "RIG-ROOT GUARD: CWD toplevel is the registered root of '$IN_RIG_ROOT'."
+  echo "  → isolating into a worktree instead of branching in place: $WT"
+
+  # Reuse an existing worktree+branch for this bead if present; else create both.
+  if git -C "$TOPLEVEL" worktree list --porcelain | grep -qx "worktree $WT"; then
+    cd "$WT"
+  else
+    # Branch from the rig's current main; create the worktree on that branch.
+    git -C "$TOPLEVEL" worktree add "$WT" -b "$BR" origin/main \
+      || git -C "$TOPLEVEL" worktree add "$WT" -b "$BR"   # fallback: local HEAD
+    cd "$WT"
+  fi
+
+  # HARD INVARIANT: the production root must still be on main. Verify + abort.
+  ROOT_BRANCH="$(git -C "$TOPLEVEL" symbolic-ref --short HEAD 2>/dev/null)"
+  if [ "$ROOT_BRANCH" != "main" ]; then
+    echo "FATAL: production root '$TOPLEVEL' is on '$ROOT_BRANCH', not main." >&2
+    echo "       Restore it (git -C '$TOPLEVEL' checkout main) before continuing." >&2
+    exit 1
+  fi
+  echo "  ✓ worktree ready ($(pwd)); production root still on main. Skip Step 2."
+fi
+# --------------------------------------------------------------------------
+```
+
+**After the guard runs:**
+- If it isolated you into a worktree, you are already on branch
+  `crew/<name>/<bead>` — **skip Step 2** and go straight to Step 3.
+- If it printed nothing (you were already in an isolated clone/worktree, or in
+  a non-rig repo), continue to Step 2 as normal.
+
+> The guard NEVER leaves the production root off its current branch: it branches
+> the *worktree*, not the root, and aborts loudly if it ever finds the root
+> switched away from `main`.
+
+---
+
 ## Step 2: Create a Feature Branch
+
+> Skip this step if Step 1.5's guard already moved you into an isolated worktree
+> on a `crew/<name>/<bead>` branch.
 
 **If you're already on a feature branch**, skip to Step 3.
 
@@ -69,6 +147,10 @@ Types:
 - `test/` — tests only
 
 ```bash
+# SAFETY: never branch in place while standing in a registered rig root.
+# Step 1.5's guard handles that case. If you reached here, your CWD is an
+# isolated workspace (a crew clone or worktree), so branching in place is safe.
+
 # Create and switch to feature branch
 git checkout -b feat/my-feature-description
 
@@ -204,7 +286,8 @@ notify "PR ready: <brief description> — #<PR number>"
 ## Completion Checklist
 
 - [ ] Synced with origin/main (git fetch + rebase)
-- [ ] On a feature branch (NOT main)
+- [ ] Ran the Step 1.5 rig-root guard — NOT branching in a bare rig root
+- [ ] On a feature branch (NOT main), in an isolated workspace (clone/worktree)
 - [ ] Submodules NOT accidentally staged
 - [ ] Specific files staged (no secrets, no debug code)
 - [ ] Used `gt commit` (not `git commit`)
@@ -217,6 +300,7 @@ notify "PR ready: <brief description> — #<PR number>"
 
 | ❌ Don't | ✅ Do instead |
 |----------|--------------|
+| `git checkout -b` in a bare rig root | Run Step 1.5 guard → branch in a worktree |
 | `git push origin main` | Push feature branch, create PR |
 | `git commit` directly | `gt commit` (sets agent identity) |
 | `git add .` blindly | Stage specific files, verify with `git status` |
