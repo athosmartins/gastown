@@ -85,6 +85,14 @@ AUTO_REFINO_REFINER_TEMPLATE="${AUTO_REFINO_REFINER_TEMPLATE:-auto-refiner}"
 # died mid-run — recover the story back to the Triagem queue. Same spirit as the
 # gate's REFINO_REVIEW_TTL_MINUTES.
 AUTO_REFINO_REFINING_TTL_MINUTES="${AUTO_REFINO_REFINING_TTL_MINUTES:-50}"
+# Labels that mark a bead as BUILD / INFRA / SCRAPER-CONFIG work — NOT a refinable
+# product story. A candidate carrying ANY of these is excluded from the funnel even
+# if it (mis)carries a story:* lifecycle label. This is what keeps scraper-config
+# beads (e.g. dc-yla3: labels custom,scraper) out of the product-refino funnel.
+# JUDGEMENT CALL (bug 3) — env-overridable so the Mayor can tune the set without a
+# code edit. Default is the clearly-non-product set; "custom" is deliberately NOT
+# excluded (too ambiguous — could be a legit product tag).
+AUTO_REFINO_EXCLUDE_LABELS="${AUTO_REFINO_EXCLUDE_LABELS:-scraper build infra config deploy migration pipeline}"
 
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
@@ -198,6 +206,22 @@ auto_refino_next_attempt() {
   echo "$((r + 1))"
 }
 
+# auto_refino_is_product_story <labels_csv> <exclude_labels_space_separated>
+#   Emit "no" iff the bead carries ANY label in the exclude set (build/infra/
+#   scraper/config work — not a refinable product story); else "yes".
+#   BUG 3 (dc-yla3): a scraper-config bead (labels custom,scraper) leaked into the
+#   funnel and was repeatedly re-processed. Type-eligibility alone is not enough —
+#   a build bead can carry type=feature + a story:* lifecycle label. The exclude
+#   set is the discriminator. Empty exclude set ⇒ everything is a product story.
+auto_refino_is_product_story() {
+  local labels=",$1," ex="${2:-}" l
+  for l in $ex; do
+    [ -z "$l" ] && continue
+    case "$labels" in *",$l,"*) echo "no"; return ;; esac
+  done
+  echo "yes"
+}
+
 # If sourced by the selftest, stop here — expose the pure functions only.
 if [ "${AUTO_REFINO_LIB:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
@@ -208,6 +232,27 @@ bd_() { bd -C "$GC_CITY" "$@"; }
 
 # ── helper: read one label-CSV from a bead JSON row ───────────────────────────
 _labels_csv() { echo "$1" | jq -r '(.labels // []) | join(",")'; }
+
+# ── helper: additive lifecycle transition (NEVER --set-labels) ────────────────
+# The mutually-exclusive story:* lifecycle labels. Exactly one should be present.
+AUTO_REFINO_LIFECYCLE_LABELS="story:triage story:unrefined story:refinement-in-progress story:refino-review story:needs-approval story:approved story:in-flight story:done story:cancelled"
+
+# _set_lifecycle <story_id> <new_lifecycle_label>
+#   Move a bead to <new_lifecycle_label> WITHOUT clobbering unrelated labels.
+#   BUG 2: the old `--set-labels X` REPLACED the entire label set, wiping custom /
+#   scraper markers AND — critically (BUG 1) — the auto-refino:escalated skip flag
+#   that the escalate path had just set, so escalated stories looked fresh again
+#   and were re-picked every sweep (dc-yla3: attempt 1→2→3→4/3). This removes only
+#   the OTHER known lifecycle labels then adds the target — additive, so escalate
+#   markers and any non-lifecycle labels survive.
+_set_lifecycle() {
+  local sid="$1" want="$2" l
+  for l in $AUTO_REFINO_LIFECYCLE_LABELS; do
+    [ "$l" = "$want" ] && continue
+    bd_ label remove "$sid" "$l" -q 2>/dev/null || true
+  done
+  bd_ label add "$sid" "$want" -q 2>/dev/null || true
+}
 
 log "Auto-refino sweep start (actor=$AUTO_REFINO_ACTOR, max_attempts=$AUTO_REFINO_MAX_ATTEMPTS, timeout=${AUTO_REFINO_TIMEOUT_MINUTES}m, dry_run=$DRY_RUN)"
 
@@ -285,6 +330,7 @@ while IFS= read -r row; do
   c_labels=$(_labels_csv "$row")
   c_assignee=$(echo "$row" | jq -r '.assignee // empty')
   [ "$(auto_refino_type_eligible "$c_type")" = "yes" ] || { log "  skip $c_id: type '$c_type' not in funnel (bug/chore/task bypass)"; continue; }
+  [ "$(auto_refino_is_product_story "$c_labels" "$AUTO_REFINO_EXCLUDE_LABELS")" = "yes" ] || { log "  skip $c_id: carries build/non-product label (auto-refino excludes: $AUTO_REFINO_EXCLUDE_LABELS) — not a product story"; continue; }
   state=$(auto_refino_lifecycle_state "$c_labels" "$c_assignee" "$AUTO_REFINO_ACTOR")
   case "$state" in
     fresh|bounce) STORY="$row"; break ;;
@@ -313,7 +359,8 @@ log "Selected story for auto-refino: $STORY_ID ($STATE) — $STORY_TITLE"
 if [ "$DRY_RUN" = "1" ]; then
   log "WOULD claim $STORY_ID (set story:refinement-in-progress + auto-refino:refining, assignee=$AUTO_REFINO_ACTOR) — DRY_RUN"
 else
-  bd_ update "$STORY_ID" --set-labels story:refinement-in-progress --assignee "$AUTO_REFINO_ACTOR" -q 2>/dev/null || true
+  _set_lifecycle "$STORY_ID" "story:refinement-in-progress"
+  bd_ update "$STORY_ID" --assignee "$AUTO_REFINO_ACTOR" -q 2>/dev/null || true
   bd_ label add "$STORY_ID" "auto-refino:refining" -q 2>/dev/null || true
   VERIFY=$(bd_ show "$STORY_ID" --json 2>/dev/null || echo "[]")
   V() { echo "$VERIFY" | jq -r "if type==\"array\" then .[0] else . end | $1"; }
@@ -446,8 +493,11 @@ bd -C "$GC_CITY" update "$STORY_ID" \\
   --set-metadata "story.refino_mode=simplificado" \\
   --set-metadata "story.refino_refiner=$AUTO_REFINO_ACTOR"
 # Hand to the refino gate (the 'em revisão' pill keys off story:refino-review).
-# This REPLACES story:refinement-in-progress; it does NOT set needs-approval.
-bd -C "$GC_CITY" update "$STORY_ID" --set-labels story:refino-review
+# Transition ADDITIVELY (remove the in-progress lifecycle, add refino-review) so
+# unrelated labels are preserved; do NOT use --set-labels (it would clobber them).
+# This does NOT set needs-approval — only the gate promotes.
+bd -C "$GC_CITY" label remove "$STORY_ID" "story:refinement-in-progress"
+bd -C "$GC_CITY" label add "$STORY_ID" "story:refino-review"
 bd -C "$GC_CITY" label remove "$STORY_ID" "auto-refino:refining"
 bd -C "$GC_CITY" comment "$STORY_ID" "Auto-refino: refinado autonomamente (simplificado, attempt $THIS_ATTEMPT). Enviado ao gate de refino (ga-gpr2v) para revisão de qualidade."
 # Signal the dispatcher:
@@ -558,7 +608,12 @@ case "$DECISION" in
     bd_ label add "$STORY_ID" "auto-refino:escalated" -q 2>/dev/null || true
     # Keep a PRE-approval lifecycle so the Pilot never dispatches it and it is not
     # in Athos's approval queue. refinement-in-progress = "needs human input".
-    bd_ update "$STORY_ID" --set-labels story:refinement-in-progress -q 2>/dev/null || true
+    # BUG 1: transition ADDITIVELY — the old --set-labels here wiped the
+    # auto-refino:escalated flag set on the line above (and every other label), so
+    # the story looked fresh next sweep and was re-escalated forever (dc-yla3
+    # 1→2→3→4/3). _set_lifecycle preserves auto-refino:escalated, which the
+    # candidate selector (skip-set + --exclude-label) then durably honours.
+    _set_lifecycle "$STORY_ID" "story:refinement-in-progress"
     if [ "$OUTCOME" != "ESCALATE" ]; then
       # Budget-exhaustion escalation (the refiner kept producing REFINED but the
       # gate kept bouncing). Record why.
@@ -579,9 +634,10 @@ case "$DECISION" in
     # gate bounce-back (assigned to us), keeping refinement-in-progress + our
     # assignee is correct; if it was fresh, restore unrefined.
     if [ "$STATE" = "bounce" ]; then
-      bd_ update "$STORY_ID" --set-labels story:refinement-in-progress --assignee "$AUTO_REFINO_ACTOR" -q 2>/dev/null || true
+      _set_lifecycle "$STORY_ID" "story:refinement-in-progress"
+      bd_ update "$STORY_ID" --assignee "$AUTO_REFINO_ACTOR" -q 2>/dev/null || true
     else
-      bd_ update "$STORY_ID" --set-labels story:unrefined -q 2>/dev/null || true
+      _set_lifecycle "$STORY_ID" "story:unrefined"
     fi
     bd_ comment "$STORY_ID" "Auto-refino: refino expirou (timeout ${AUTO_REFINO_TIMEOUT_MINUTES}m) sem desfecho. Re-enfileirada — não consumiu tentativa." 2>/dev/null || true
     log "  $STORY_ID → re-queued (outcome $OUTCOME; attempt not consumed)."

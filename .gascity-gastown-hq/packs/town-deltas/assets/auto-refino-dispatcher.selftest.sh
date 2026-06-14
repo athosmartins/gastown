@@ -68,6 +68,18 @@ echo "Scenario 1: type eligibility — feature/story refine, bug/chore/task bypa
 [ "$(auto_refino_type_eligible task)" = "no" ]     && ok "task → no (bypasses funnel)"  || bad "task → expected no"
 [ "$(auto_refino_type_eligible epic)" = "no" ]     && ok "epic → no" || bad "epic → expected no"
 
+# ── Scenario 1b: build/scraper/config beads are NOT product stories (bug 3) ───
+# dc-yla3 (labels custom,scraper) leaked into the funnel and was re-processed every
+# sweep. Type-eligibility alone is not enough — a build bead can carry type=feature.
+echo "Scenario 1b: product-story filter — build/scraper/config beads excluded (bug 3)"
+EX="scraper build infra config deploy migration pipeline"
+[ "$(auto_refino_is_product_story "custom,scraper" "$EX")" = "no" ]            && ok "custom,scraper (dc-yla3) → no (excluded)"            || bad "custom,scraper → expected no"
+[ "$(auto_refino_is_product_story "story:unrefined,build" "$EX")" = "no" ]     && ok "build label (even with story:* lifecycle) → no"      || bad "build → expected no"
+[ "$(auto_refino_is_product_story "config,deploy" "$EX")" = "no" ]            && ok "config,deploy → no"                                  || bad "config,deploy → expected no"
+[ "$(auto_refino_is_product_story "story:unrefined,frontend" "$EX")" = "yes" ] && ok "genuine product story (no build label) → yes"        || bad "product story → expected yes"
+[ "$(auto_refino_is_product_story "custom" "$EX")" = "yes" ]                   && ok "custom ALONE → yes (custom NOT excluded — ambiguous)" || bad "custom alone → expected yes"
+[ "$(auto_refino_is_product_story "scraper" "")" = "yes" ]                     && ok "empty exclude set → yes (no filtering)"              || bad "empty exclude → expected yes"
+
 # ── Scenario 2: Triagem stories are candidates (fresh); past-states are skipped ─
 echo "Scenario 2: lifecycle classification — fresh Triagem input"
 [ "$(auto_refino_lifecycle_state "story:triage" "" "$ACTOR")" = "fresh" ] && ok "story:triage → fresh" || bad "story:triage → expected fresh"
@@ -97,6 +109,20 @@ D=$(auto_refino_handoff_decision "ESCALATE" 1 3)
 [ "$D" = "escalate" ] && ok "ESCALATE attempt 1 → escalate" || bad "ESCALATE → expected escalate, got '$D'"
 D=$(auto_refino_handoff_decision "ESCALATE" 9 3)
 [ "$D" = "escalate" ] && ok "ESCALATE at any attempt → escalate" || bad "ESCALATE → expected escalate, got '$D'"
+
+# ── Scenario 4b: escalated flag is durable → re-escalation loop cannot form ────
+# BUG 1: the escalate path persists auto-refino:escalated ADDITIVELY (no
+# --set-labels clobber). The post-escalate state is story:refinement-in-progress +
+# auto-refino:escalated, ASSIGNED TO US — which would otherwise classify as a
+# bounce candidate. The escalated flag must win (terminal/skip) so the story is
+# NEVER re-selected (dc-yla3 attempt 1→2→3→4/3).
+echo "Scenario 4b: post-escalate state → skip forever (escalated wins over bounce; bug 1)"
+[ "$(auto_refino_lifecycle_state "story:refinement-in-progress,auto-refino:escalated,custom,scraper" "$ACTOR" "$ACTOR")" = "skip" ] \
+  && ok "in-progress+escalated assigned to us → skip (NOT re-picked as bounce)" \
+  || bad "post-escalate state → expected skip (re-escalation loop would re-form)"
+[ "$(auto_refino_lifecycle_state "story:unrefined,auto-refino:escalated,custom,scraper" "" "$ACTOR")" = "skip" ] \
+  && ok "unrefined+escalated (escalated survives) → skip (not re-classified fresh)" \
+  || bad "unrefined+escalated → expected skip"
 
 # ── Scenario 5: attempt cap terminates a daemon↔gate ping-pong ────────────────
 echo "Scenario 5: REFINED beyond the attempt budget → escalate (loop terminates)"
@@ -149,11 +175,42 @@ D=$(auto_refino_handoff_decision "weird" 1 3)
 # ── DRIFT GUARDS: static assertions on the shipped dispatcher ─────────────────
 echo "Drift guards: live wiring matches the acceptance criteria"
 
-# 1. The refine handoff sets story:refino-review (the gate's input / 'em revisão').
-if grep -q 'set-labels story:refino-review' "$DISPATCHER"; then
-  ok "refine handoff sets story:refino-review (gate input / 'em revisão' pill)"
+# 1. The refine handoff sets story:refino-review (the gate's input / 'em revisão')
+#    ADDITIVELY (label add, not --set-labels — see drift-guard 0/bug 2).
+if grep -qF 'label add "$STORY_ID" "story:refino-review"' "$DISPATCHER"; then
+  ok "refine handoff adds story:refino-review (gate input / 'em revisão' pill, additive)"
 else
-  bad "refine handoff does not set story:refino-review"
+  bad "refine handoff does not add story:refino-review"
+fi
+
+# 0. BUG 2: no --set-labels in actual CODE. --set-labels REPLACES the whole label
+#    set, silently dropping unrelated labels (custom/scraper) AND the
+#    auto-refino:escalated skip marker (bug 1). Every transition must be additive
+#    label add / label remove. (Comment lines that mention the token are ignored —
+#    grep only the non-comment lines.)
+if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -q -- '--set-labels'; then
+  bad "REGRESSION (bug 2): --set-labels present in code — it clobbers unrelated labels; use additive label add/remove"
+else
+  ok "no --set-labels in code (additive label add/remove only — no label clobber)"
+fi
+
+# 0b. BUG 1: the escalate path durably persists auto-refino:escalated (additively)
+#     AND the lifecycle classifier's skip-set honours it — so an escalated story is
+#     NEVER re-selected (dc-yla3 re-escalation loop 1→2→3→4/3).
+if grep -qF 'label add "$STORY_ID" "auto-refino:escalated"' "$DISPATCHER" \
+   && grep -qF '*,auto-refino:escalated,*' "$DISPATCHER"; then
+  ok "escalate persists auto-refino:escalated (additive) + classifier skip-set honours it (no re-escalation)"
+else
+  bad "escalate marker not durably persisted, or not in the classifier skip-set"
+fi
+
+# 0c. BUG 3: candidate selection filters out build/scraper/non-product beads via the
+#     pure auto_refino_is_product_story classifier + an env-overridable exclude set.
+if grep -qF 'auto_refino_is_product_story "$c_labels"' "$DISPATCHER" \
+   && grep -q 'AUTO_REFINO_EXCLUDE_LABELS=' "$DISPATCHER"; then
+  ok "candidate selection excludes build/scraper/non-product beads (bug 3)"
+else
+  bad "candidate selection does not filter out build/non-product beads"
 fi
 
 # 2. The handoff records story.refino_refiner so the gate bounces FAILs back to us.
