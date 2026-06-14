@@ -534,6 +534,11 @@ grep -q 'REVIEWER_PEEK_BASELINE\[\$_idx\]=$(gc' "$DISPATCHER" && ok "respawn sna
 # EDIT #2: spawn stagger so N reviewers do not boot-herd Dolt :52756 at once.
 grep -q 'GATE_SPAWN_STAGGER_SECS' "$DISPATCHER" && ok "dispatcher defines spawn stagger (Dolt boot-herd guard)" || bad "missing GATE_SPAWN_STAGGER_SECS"
 grep -q 'sleep "\$GATE_SPAWN_STAGGER_SECS"' "$DISPATCHER" && ok "spawn loop actually applies the stagger sleep" || bad "GATE_SPAWN_STAGGER_SECS defined but never applied"
+# ga-cvhoj: reviewer 1 must ALSO get a pre-spawn settle (the between-reviewer
+# stagger never pauses before #1, so reviewer 1 boot-herd'd into the dispatcher's
+# own setup Dolt-burst and ~100% stillborn'd). Guard the first-reviewer settle.
+grep -q 'ga-cvhoj' "$DISPATCHER" && ok "dispatcher has the ga-cvhoj reviewer-1 pre-spawn settle" || bad "missing ga-cvhoj reviewer-1 settle (reviewer 1 boots into peak Dolt)"
+grep -Eq '\[ "\$i" = "1" \] && \[ "\$\{GATE_SPAWN_STAGGER_SECS:-0\}" -gt 0 \]' "$DISPATCHER" && ok "reviewer-1 settle gated on i==1 + stagger>0 (same knob)" || bad "reviewer-1 settle not properly gated (ga-cvhoj)"
 
 # ── 5c. drift-guard: the live dispatcher wires the ga-h9o17 drained-peek fix ───
 # Fail LOUDLY if a future refactor drops the drained-but-listed peek probe (the

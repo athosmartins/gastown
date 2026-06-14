@@ -1722,6 +1722,18 @@ trap 'exit 129' HUP
 log "Spawning $REQUIRED_REVIEWERS independent reviewer session(s) ..."
 
 for i in $(seq 1 $REQUIRED_REVIEWERS); do
+  # ga-cvhoj: reviewer 1 spawns FIRST, immediately after the dispatcher's own
+  # Dolt-heavy setup (Step 0a janitors, fetch/rebase, stale-base check, diff) — so
+  # its `gc prime` boot hit peak Dolt and ~100% stillborn'd ("no live reviewer →
+  # dispatcher abandoned it" → zombie run → re-dispatch loop), while reviewer 2+
+  # got the ga-mepb0 BETWEEN-spawn stagger and survived. The existing stagger
+  # (below) only pauses between reviewers, never before #1. Give the FIRST
+  # reviewer the SAME settle window so its boot lands in calmer Dolt too. Uses the
+  # same GATE_SPAWN_STAGGER_SECS knob (0 disables).
+  if [ "$i" = "1" ] && [ "${GATE_SPAWN_STAGGER_SECS:-0}" -gt 0 ] 2>/dev/null; then
+    log "  Spawn stagger: settling ${GATE_SPAWN_STAGGER_SECS}s before reviewer 1 (ga-cvhoj — let the setup Dolt-burst subside before gc prime)"
+    sleep "$GATE_SPAWN_STAGGER_SECS" || true
+  fi
   REVIEWER_LENS=""
   case "$i" in
     1) REVIEWER_LENS="CORRECTNESS: focus on logic errors, edge cases, off-by-one bugs, null/empty handling, error propagation, and incorrect assumptions. Be adversarial." ;;
