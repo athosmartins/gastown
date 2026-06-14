@@ -120,6 +120,44 @@ GATE_SPAWN_STAGGER_SECS="${GATE_SPAWN_STAGGER_SECS:-3}"
 case "$GATE_SPAWN_STAGGER_SECS" in ''|*[!0-9]*) GATE_SPAWN_STAGGER_SECS=3 ;; esac
 [ "$GATE_SPAWN_STAGGER_SECS" -gt 15 ] 2>/dev/null && GATE_SPAWN_STAGGER_SECS=15
 
+# ── ga-dupnv (bug 2 root): bound reviewer task-delivery so a hung `gc session
+# nudge/submit` cannot blow the sweep's wall-clock budget. Observed live
+# (crew/thies/wa-86jr, run ga-wisp-o30v41): the `--delivery queue` nudge for
+# reviewer 1 BLOCKED for ~12 minutes (09:08→09:20) and then failed — long enough
+# that launchd's ~2-min StartInterval overlapped fresh sweeps and the over-running
+# process was SIGTERM'd ("Terminated: 15") BEFORE it ever reached the verdict
+# poll. The downstream damage: (a) the marker was left gate-status:dispatching →
+# Step 0a re-queued it → a later sweep re-claimed it and spawned a DUPLICATE run
+# (bug 1), and (b) the run's reviewers were never watched to a verdict (bug 2 —
+# "alive 53m, no verdict"). The durable-pull channel (ga-67hae: verdict bead
+# assigned to the reviewer's session_name + task embedded as a comment) is the
+# reliable delivery path, so a fast-failing nudge is strictly better than a
+# 12-minute hang. GATE_NUDGE_TIMEOUT is a command PREFIX (not a wrapper fn) so it
+# stays mockable: an external `timeout` cannot see a shell-function `gc` mock, so
+# lib-only selftests run with the prefix EMPTY (see the lib-only override below).
+GATE_NUDGE_TIMEOUT_SECS="${GATE_NUDGE_TIMEOUT_SECS:-45}"
+case "$GATE_NUDGE_TIMEOUT_SECS" in ''|*[!0-9]*) GATE_NUDGE_TIMEOUT_SECS=45 ;; esac
+[ "$GATE_NUDGE_TIMEOUT_SECS" -lt 10 ] 2>/dev/null && GATE_NUDGE_TIMEOUT_SECS=10
+GATE_NUDGE_TIMEOUT="${GATE_NUDGE_TIMEOUT:-timeout $GATE_NUDGE_TIMEOUT_SECS}"
+# Lib-only mode (selftests source this script and replace `gc` with a shell
+# function): the external `timeout` binary cannot see a shell-function mock, so
+# null the prefix and let the real helpers call the mock directly. Production
+# (no GATE_DISPATCHER_LIB_ONLY) keeps the timeout. Honors an explicit override.
+if [ -n "${GATE_DISPATCHER_LIB_ONLY:-}" ] && [ -z "${GATE_NUDGE_TIMEOUT_FORCE:-}" ]; then
+  GATE_NUDGE_TIMEOUT=""
+fi
+
+# ── ga-dupnv (bug 1): one branch = one authoritative gate-run. SIBLING_RUN_STALE
+# is the age (minutes) past which a still-running gate-run for a branch is judged
+# ABANDONED (its dispatcher died mid-run and never drove it terminal) and may be
+# superseded so a fresh run can take over. A genuinely live run terminates within
+# VERDICT_TIMEOUT (≤22m) — once bug 2 is fixed it always reaches the verdict poll
+# — so anything older than this ceiling is presumed dead. Default 90m matches the
+# guard's gate-run TTL fallback referenced by supersede_sibling_runs.
+SIBLING_RUN_STALE_MINUTES="${SIBLING_RUN_STALE_MINUTES:-90}"
+case "$SIBLING_RUN_STALE_MINUTES" in ''|*[!0-9]*) SIBLING_RUN_STALE_MINUTES=90 ;; esac
+[ "$SIBLING_RUN_STALE_MINUTES" -lt 30 ] 2>/dev/null && SIBLING_RUN_STALE_MINUTES=30
+
 # ── ga-cw4pm: dynamic-concurrency (Dolt + quota headroom) thresholds ──────────
 # The gate's concurrency was STATIC — the gate-reviewer template's
 # max_active_sessions=6 admits up to 2 CODE runs (3 reviewers each) regardless of
@@ -351,13 +389,73 @@ respawn_reviewer_slot() {
   # an empty result here is the conservative case (no false ACK), still backed by
   # the verdict-progressed strong check.
   REVIEWER_PEEK_BASELINE[$_idx]=$(gc --city "$GC_CITY" session peek "$_new_sid" --lines 40 2>/dev/null | cksum 2>/dev/null | awk '{print $1}' || echo "")
-  if gc --city "$GC_CITY" session nudge "$_new_sid" "${REVIEW_TASKS[$_idx]}" --delivery queue 2>/dev/null; then
+  if $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session nudge "$_new_sid" "${REVIEW_TASKS[$_idx]}" --delivery queue 2>/dev/null; then
     log "  Re-convene: review task re-queued to fresh session ${_new_sid} (slot ${_idx}, verdict bead ${VERDICT_BEAD_IDS[$_idx]} reused)."
-  elif gc --city "$GC_CITY" session submit "$_new_sid" "${REVIEW_TASKS[$_idx]}" 2>/dev/null; then
+  elif $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session submit "$_new_sid" "${REVIEW_TASKS[$_idx]}" 2>/dev/null; then
     log "  Re-convene: review task re-submitted to fresh session ${_new_sid} (slot ${_idx})."
   else
     warn "  Re-convene: queue/submit to fresh session ${_new_sid} failed (slot ${_idx}) — verdict-poll + outer timeout backstop."
   fi
+  return 0
+}
+
+# ── ga-dupnv (bug 1): live-sibling-run guard — one branch = one authoritative run
+# classify_sibling_run <found 0|1> <age_min> <ceiling> — PURE (no I/O, set -e
+# safe), unit-tested by gate-dup-run-guard.selftest.sh. Decides what to do about
+# another gate-status:running gate-run discovered on THIS branch:
+#   none  — no sibling running for this branch → create our run normally.
+#   live  — a sibling is running within the staleness ceiling → YIELD (the
+#           existing run is authoritative; do NOT spawn a duplicate that could
+#           later write a terminal FAIL over it).
+#   stale — a sibling is running but OLDER than the ceiling: its dispatcher died
+#           mid-run and never drove it terminal → supersede it and proceed.
+# Unparseable / negative age ⇒ LIVE (conservative: never spawn a duplicate on a
+# sibling we cannot PROVE stale).
+classify_sibling_run() {
+  local found="$1" age_min="$2" ceiling="$3"
+  [ "$found" = "1" ] || { echo "none"; return 0; }
+  case "$age_min" in ''|*[!0-9-]*) echo "live"; return 0 ;; esac
+  case "$ceiling" in ''|*[!0-9]*)  echo "live"; return 0 ;; esac
+  if [ "$age_min" -lt 0 ] 2>/dev/null; then echo "live"; return 0; fi
+  if [ "$age_min" -le "$ceiling" ]; then echo "live"; else echo "stale"; fi
+}
+
+# live_sibling_run_for_branch <branch> — runtime resolver for the guard. Scans
+# OPEN gate-status:running gate-runs, matches one whose description names THIS
+# branch (the trailing "." anchors the match so "wa-86jr" never matches
+# "wa-86jr-reland"), computes its age from started_at, and emits exactly one of:
+#   ""  (no live/stale sibling) | "LIVE <id>" | "STALE <id>"
+# FAIL-OPEN: any bd/jq/date failure yields "" so a transient glitch can NEVER
+# block a legitimate run (identical to the pre-guard behavior). The decision it
+# defers to (classify_sibling_run) is the pure, unit-tested core.
+live_sibling_run_for_branch() {
+  local branch="$1" now_epoch run_json count i id desc started started_epoch age_min verdict
+  [ -z "$branch" ] && return 0
+  now_epoch=$(date +%s)
+  run_json=$(bd -C "$GC_CITY" list --json --all \
+    -l type:quality-gate-run \
+    -l gate-status:running \
+    2>/dev/null || echo "[]")
+  count=$(printf '%s\n' "$run_json" | jq 'length' 2>/dev/null || echo 0)
+  case "$count" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$count" = 0 ] && return 0
+  for i in $(seq 0 $((count - 1))); do
+    id=$(printf '%s\n' "$run_json" | jq -r ".[$i].id // empty" 2>/dev/null || echo "")
+    desc=$(printf '%s\n' "$run_json" | jq -r ".[$i].description // \"\"" 2>/dev/null || echo "")
+    [ -z "$id" ] && continue
+    printf '%s\n' "$desc" | grep -qF "Autonomous gate run for ${branch}." || continue
+    started=$(printf '%s\n' "$desc" | grep -E '^started_at:' | head -1 | sed 's/^started_at: *//' || true)
+    if [ -z "$started" ]; then echo "LIVE $id"; return 0; fi   # no ts → conservative LIVE
+    started_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${started%%Z*}" "+%s" 2>/dev/null \
+      || date -d "$started" +%s 2>/dev/null || echo 0)
+    if [ "$started_epoch" -le 0 ] 2>/dev/null; then echo "LIVE $id"; return 0; fi
+    age_min=$(( (now_epoch - started_epoch) / 60 ))
+    verdict=$(classify_sibling_run 1 "$age_min" "$SIBLING_RUN_STALE_MINUTES")
+    case "$verdict" in
+      live)  echo "LIVE $id";  return 0 ;;
+      stale) echo "STALE $id"; return 0 ;;
+    esac
+  done
   return 0
 }
 
@@ -1642,6 +1740,44 @@ esac
 
 log "Tier: $TIER  required_reviewers: $REQUIRED_REVIEWERS"
 
+# ── Step 5b (ga-dupnv, bug 1): live-sibling-run guard — one branch = one run ──
+# A marker can be claimed twice for the SAME branch: the dispatcher dies mid-run
+# (Terminated/SIGTERM/launchd overlap) leaving the marker gate-status:dispatching,
+# Step 0a re-queues it after its TTL, and a later sweep re-claims it — OR a re-gate
+# mints a second marker while the first run is still live. Either way TWO gate-runs
+# for ONE branch then race, and the loser (e.g. a verdict-TIMEOUT) writes a terminal
+# FAIL onto the source bead, clobbering the healthy sibling (observed: dup run
+# ga-wisp-4wa97q false-failed wa-86jr while ga-wisp-mzxm9h had a live reviewer).
+# supersede_sibling_runs only fires at TERMINAL time and made whichever run finished
+# FIRST authoritative — i.e. it superseded the HEALTHY run. Here, BEFORE creating
+# our run, we defer to any gate-run already running for THIS branch. Branch is the
+# correct key (NOT source-bead: wa-86jr and wa-86jr-reland share bead wa-86jr).
+if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
+  SIBLING_VERDICT=$(live_sibling_run_for_branch "$BRANCH" || echo "")
+  case "$SIBLING_VERDICT" in
+    "LIVE "*)
+      SIBLING_RUN_ID="${SIBLING_VERDICT#LIVE }"
+      log "Live sibling gate-run $SIBLING_RUN_ID already running for branch $BRANCH — YIELDING (one branch = one authoritative run). NOT spawning a duplicate."
+      # Leave the marker in gate-status:dispatching (do NOT re-queue): re-queuing
+      # would let this same (oldest) marker be re-selected every sweep and
+      # head-of-line-block other branches. Step 0a re-queues it after its TTL if
+      # the sibling never terminates, so the branch is never permanently stranded.
+      # We touch NEITHER the source bead NOR any verdict, so the duplicate path can
+      # never write a terminal FAIL over the healthy sibling. (Idempotent, fail-safe.)
+      log "  Marker $MARKER_ID left dispatching; Step 0a TTL re-queues it once the sibling terminates."
+      log "=== Dispatcher sweep complete: branch=$BRANCH verdict=YIELDED (live sibling $SIBLING_RUN_ID) ==="
+      exit 0
+      ;;
+    "STALE "*)
+      SIBLING_RUN_ID="${SIBLING_VERDICT#STALE }"
+      warn "Stale sibling gate-run $SIBLING_RUN_ID for branch $BRANCH (older than ${SIBLING_RUN_STALE_MINUTES}m — its dispatcher died mid-run and never drove it terminal). Superseding it and proceeding with a fresh run."
+      set_gate_status "$SIBLING_RUN_ID" "superseded" 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$SIBLING_RUN_ID" "Dispatcher: superseded as STALE (> ${SIBLING_RUN_STALE_MINUTES}m — dispatcher died mid-run) so a fresh gate-run for branch $BRANCH can take over. (ga-dupnv live-sibling guard)" 2>/dev/null || true
+      bd -C "$GC_CITY" close "$SIBLING_RUN_ID" -r "gate-run superseded (stale sibling) — fresh run for branch $BRANCH takes over. (ga-dupnv)" 2>/dev/null || true
+      ;;
+  esac
+fi
+
 # ── Step 6: Create gate-run tracking bead ────────────────────────────────────
 
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -1908,9 +2044,9 @@ TASK
   # blocking wait on a never-idle reviewer would stall spawning reviewers 2&3 —
   # `queue` returns immediately. Do NOT log "delivered" here (it would lie on a
   # send the reviewer never consumed); Step 7b confirms a real ACK.
-  if gc --city "$GC_CITY" session nudge "$SESSION_ID" "$REVIEW_TASK" --delivery queue 2>/dev/null; then
+  if $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session nudge "$SESSION_ID" "$REVIEW_TASK" --delivery queue 2>/dev/null; then
     log "  Review task QUEUED to session $SESSION_ID (reviewer $i) — ACK pending (Step 7b)"
-  elif gc --city "$GC_CITY" session submit "$SESSION_ID" "$REVIEW_TASK" 2>/dev/null; then
+  elif $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session submit "$SESSION_ID" "$REVIEW_TASK" 2>/dev/null; then
     log "  Review task SUBMITTED to session $SESSION_ID (reviewer $i) — ACK pending (Step 7b)"
   else
     warn "  Initial queue/submit to session $SESSION_ID failed — Step 7b will retry (reviewer $i)"
@@ -2001,7 +2137,7 @@ for _ack_attempt in $(seq 1 "$ACK_MAX_RETRIES"); do
     _all_acked=0
     if [ "$_ack_attempt" -gt 1 ]; then
       warn "  No ACK from reviewer $((k+1)) (attempt $_ack_attempt/$ACK_MAX_RETRIES) — re-queuing task session=$_sid"
-      gc --city "$GC_CITY" session nudge "$_sid" "${REVIEW_TASKS[$k]}" --delivery queue 2>/dev/null || true
+      $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session nudge "$_sid" "${REVIEW_TASKS[$k]}" --delivery queue 2>/dev/null || true
     fi
   done
   [ "$_all_acked" = "1" ] && break
