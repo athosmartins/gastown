@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.auto-refino-dispatcher</string>
+
+  <!-- Auto-refino daemon (ga-flxp6). Runs every 5 minutes. Picks the oldest
+       Triagem story (story:triage / story:unrefined, type feature/story only —
+       bug/chore/task bypass the funnel), spawns one Sonnet refiner that refines
+       it autonomously in /refino's simplificado mode, and on the outcome either
+       hands it to the refino gate (story:refino-review — the 'em revisão' pill)
+       or escalates with recorded gaps (auto-refino:escalated). It NEVER approves
+       and NEVER dispatches. One story per sweep; launchd waits for the previous
+       run to finish before re-firing, so a long refine never double-fires.
+       Staggered 120s off the code gate's :00 and 60s off the refino gate's :60
+       cadence to spread the Dolt boot-herd from concurrent reviewer/refiner
+       `gc prime` calls. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/auto-refino-dispatcher.sh</string>
+  </array>
+
+  <key>StartInterval</key><integer>300</integer>
+
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/auto-refino-dispatcher-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/auto-refino-dispatcher-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>

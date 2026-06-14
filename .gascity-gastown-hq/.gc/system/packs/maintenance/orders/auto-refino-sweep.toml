@@ -1,0 +1,17 @@
+# Auto-refino daemon (ga-flxp6). The MOTOR of the triage funnel: refines Triagem
+# stories (story:triage / story:unrefined, type feature/story only) AUTONOMOUSLY
+# in /refino's simplificado mode and hands each to the refino quality gate
+# (ga-gpr2v, story:refino-review) instead of writing story:needs-approval. When
+# it cannot refine with confidence it records the gaps and escalates — it NEVER
+# approves and NEVER dispatches. Unlike the code gate (pure mechanical timer),
+# this needs LLM judgement, so it spawns an independent Sonnet refiner session
+# rather than running inline. One story per sweep; the interval drains the rest.
+#
+# Equivalent to com.gascity.auto-refino-dispatcher.plist (use ONE of the two —
+# the order if the city runs an order controller, the plist on a plain launchd
+# host). Both invoke the same dispatcher script.
+[order]
+description = "Auto-refino — refine Triagem stories autonomously, hand off to the refino gate"
+trigger = "cooldown"
+interval = "5m"
+exec = "$PACK_DIR/../../../../packs/town-deltas/assets/auto-refino-dispatcher.sh"

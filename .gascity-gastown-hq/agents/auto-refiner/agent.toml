@@ -1,0 +1,40 @@
+# auto-refiner: dedicated Sonnet refiner template for the AUTO-REFINO daemon
+# (ga-flxp6). Sibling of the refino gate's `refino-gate-reviewer` template — but
+# it REFINES a Triagem story autonomously (reusing /refino's simplificado mode)
+# instead of REVIEWING an already-refined one.
+#
+# Why a separate template (not refino-gate-reviewer or a crew identity)?
+#   - Clean separation of concerns: refine (this) vs review (gate) are distinct
+#     budgets and must never starve each other.
+#   - It must NOT be a human crew identity: the daemon refines as a stable
+#     logical actor (auto-refino) so the gate can bounce FAILs back to it; a
+#     fresh ephemeral session per story does the work, but on behalf of that one
+#     actor. Keeping it a dedicated template avoids hijacking a person's session.
+#
+# Budget rationale:
+#   max_active_sessions=3 — the daemon refines one story per sweep, so 3 is
+#   generous headroom and lets a slow refine overlap the next sweep without the
+#   cap hard-failing the spawn.
+#
+# min_active_sessions=0: no permanent pool workers. Spawned on-demand by
+# auto-refino-dispatcher.sh; drains when the refine completes.
+
+scope = "city"
+min_active_sessions = 0
+max_active_sessions = 3
+idle_timeout = "1h"
+wake_mode = "fresh"
+
+# Model: Sonnet. Autonomous product refinement is judgement work, but bounded by
+# the simplificado field set + the gate's downstream quality review, so Sonnet is
+# the right cost/quality point (Opus is reserved for rare deep work; the gate
+# re-checks quality regardless). If the Gas City build does not honor a
+# per-template `model` key, the refiner still runs Sonnet by inheriting the city
+# default model; this key makes the intent explicit. (Flagged for the Mayor.)
+model = "sonnet"
+
+# Remote Control OFF for ephemeral refiners (same rationale as the gate reviewer,
+# bug wa-9ye2): headless/ephemeral sessions must NOT auto-connect to the human's
+# mobile Claude Code app. Route through the dedicated claude-headless provider
+# (defined in city.toml) which forces remoteControlAtStartup=false.
+provider = "claude-headless"
