@@ -33,6 +33,46 @@ Only ONE lifecycle label per bead at any time. Prefer `--set-labels` for
 transitions — it atomically replaces the lifecycle label regardless of which
 lifecycle label the bead currently holds:
 
+#### Dispatch eligibility by lifecycle state (Pilot contract — ga-w7wvm)
+
+The Pilot dispatches a **feature** story **only** when it is `story:approved`.
+Every other lifecycle state is a **pre-approval** (or terminal) state and is
+**never** dispatched — this is what keeps unrefined / in-triage work from leaking
+into the build pool and generating re-dispatch loops (the foundation of the
+triage funnel, epic `ga-z0icp`).
+
+| Lifecycle state | Pilot dispatches? | Why |
+|-----------------|-------------------|-----|
+| `story:unrefined` | **No** — pre-approval | Not yet refined / approved |
+| `story:refinement-in-progress` | **No** — pre-approval | Refino underway, not approved |
+| `story:triage` | **No** — pre-approval | Conceptual triage umbrella (forward-compat alias) |
+| `story:approved` | **Yes** | The one dispatchable feature state |
+| `story:in-flight` | No (already building) | Excluded by `--exclude-label story:in-flight` |
+| `story:done` | No (complete) | Terminal |
+| `story:cancelled` | **No** — terminal | Off-ramped, not buildable |
+| *(no lifecycle label)* | No, **fail-open-safe** | A feature with no label simply isn't `story:approved`, so the Tier-2 source query never selects it. Nothing crashes; nothing approved is blocked. |
+
+**Two layers enforce this (defense-in-depth):**
+
+1. **Source query** — the Tier-2 feature queries require `-l story:approved`
+   (and `--exclude-label story:in-flight` / `story:done`). This is the primary
+   gate.
+2. **Candidate-filter blocklist** — the dispatcher's `_filter_candidates` helper
+   *also* drops any candidate still wearing a pre-approval / cancelled lifecycle
+   label (`story:unrefined`, `story:refinement-in-progress`, `story:triage`,
+   `story:cancelled`). This catches the mid-transition / mislabeled leak where a
+   bead carries **both** `story:approved` and a pre-approval label — the source
+   query would pass it, the blocklist disqualifies it. The blocklist is **not**
+   an allowlist: bugs / chores / tasks (which never carry `story:*` lifecycle
+   labels and bypass the refino funnel entirely) pass through untouched.
+
+Only ONE lifecycle label *should* exist per bead, but the blocklist guard does
+not rely on that invariant holding — it disqualifies on the presence of *any*
+pre-approval label regardless of what else the bead carries.
+
+Transition mechanics: prefer `--set-labels` — it atomically replaces the
+lifecycle label regardless of which lifecycle label the bead currently holds:
+
 ```bash
 # Safe atomic transition (preferred — works from any lifecycle state)
 bd -C "$GC_CITY_PATH" update <id> --set-labels story:approved
@@ -277,6 +317,9 @@ echo "Epic: $PARENT_ID | Children: $CHILD1, $CHILD2"
 - **Label for dispatch eligibility:** The Pilot should only dispatch beads with
   `story:approved` label AND without `story:in-flight` or `story:done`. Use the
   exact query: `bd list --label story:approved --type feature --exclude-label story:in-flight --exclude-label story:done`.
+  This source query is backstopped by the candidate-filter blocklist that also
+  drops any bead still wearing a pre-approval / cancelled lifecycle label — see
+  "Dispatch eligibility by lifecycle state" above (ga-w7wvm).
 - **Metadata completeness:** Before dispatch, the Pilot should verify that
   `story.criterios` and `story.resumo` are set (minimum viable fields for a
   worker to start). Use `bd show <id> --json` to inspect. Both fields are filled

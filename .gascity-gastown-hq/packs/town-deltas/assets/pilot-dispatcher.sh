@@ -1064,13 +1064,36 @@ fi
 # array (Tier 1/2, HQ + rig) flows through this helper, so one guard here covers
 # all paths and any future query. The split epic's CHILDREN are ordinary tasks
 # with their own type — they remain dispatchable, exactly as the AC requires.
+#
+# ga-w7wvm: ALSO drop beads carrying a PRE-APPROVAL (or terminal-cancelled)
+# story lifecycle label. The story lifecycle (story-bead-convention.md) runs
+# story:unrefined → story:refinement-in-progress → story:approved → story:in-flight
+# → story:done, with story:cancelled as a terminal off-ramp. Only story:approved
+# is dispatchable. The Tier 2 feature queries already require `-l story:approved`,
+# but that is a single source-gate: a bead mid-transition (or mislabeled) can
+# carry BOTH story:approved AND a pre-approval label, and would then leak through
+# the query. This guard is the defense-in-depth backstop — it disqualifies any
+# candidate still wearing a not-yet-approved lifecycle label, at the one chokepoint
+# every tier flows through, so unrefined/in-triage stories are NEVER dispatched
+# (epic ga-z0icp triage funnel; "story:triage" in the AC is the conceptual
+# pre-approval umbrella — the concrete labels are unrefined/refinement-in-progress,
+# with story:triage recognized too for forward-compat).
+#
+# FAIL-OPEN, by design: the guard is a BLOCKLIST of disqualifying labels, not an
+# allowlist requiring story:approved. So (a) bugs/chores/tasks — which never carry
+# story:* lifecycle labels and bypass the refino funnel entirely — pass through
+# untouched; and (b) a feature with NO lifecycle label at all is not dropped here
+# (it simply fails the Tier 2 `-l story:approved` source-query and so is never
+# dispatched as a feature). Approved stories are never blocked.
+_FILTER_PREAPPROVAL_LABELS='["story:unrefined","story:refinement-in-progress","story:triage","story:cancelled"]'
 _filter_candidates() {
-  jq --arg self "$SELF_BEAD_ID" \
+  jq --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
     '[.[] | select(
         .id != $self
         and (.assignee == null or .assignee == "")
         and ((.issue_type // .type // "") != "epic")
         and (((.labels // []) | index("story:epic-split")) | not)
+        and (((.labels // []) - $preapproval) | length) == ((.labels // []) | length)
      )]' \
     2>/dev/null || echo "[]"
 }

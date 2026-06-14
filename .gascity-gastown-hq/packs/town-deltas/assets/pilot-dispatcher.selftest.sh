@@ -175,6 +175,23 @@ case "$args" in
   {"id":"tt-keep","title":"Normal bug fixture","priority":1,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
 ]
 JSON
+    elif [ "${FAKE_INCLUDE_PREAPPROVAL:-0}" = "1" ]; then
+      # Pre-approval lifecycle scenario (ga-w7wvm): two NON-dispatchable features
+      # leak UNCONDITIONALLY into the candidate stream — the dispatcher's
+      # _filter_candidates lifecycle guard is what must drop them:
+      #   tt-triage   — P0 feature still in triage (story:triage). Pre-approval.
+      #   tt-mislabel — P0 feature carrying BOTH story:approved AND story:unrefined
+      #                 (mid-transition / mislabeled). The single-source query gate
+      #                 (-l story:approved) would pass it; only the blocklist guard
+      #                 disqualifies it. This is the leak the guard exists to close.
+      # Both are P0 so absent the guard they win the pick over the P1 keeper bug.
+      cat <<'JSON'
+[
+  {"id":"tt-triage","title":"In-triage feature fixture","priority":0,"issue_type":"feature","status":"open","labels":["story:triage"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
+  {"id":"tt-mislabel","title":"Mislabeled approved+unrefined fixture","priority":0,"issue_type":"feature","status":"open","labels":["story:approved","story:unrefined"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
+  {"id":"tt-keep","title":"Normal bug fixture","priority":1,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
+]
+JSON
     elif [ "${FAKE_INCLUDE_ENGWIN:-0}" = "1" ]; then
       # Engine-window scenario (ga-6lum3): tt-engwin is a P0 engine-fork bug that
       # MUST NOT be dispatched. This fake bd honors the exclusion ONLY when the
@@ -265,7 +282,7 @@ chmod +x "$SHIMBIN/notify"
 reset_state() { rm -rf "$STATE"; mkdir -p "$STATE"; }
 
 # Runs the real dispatcher in DRY_RUN with the shims on PATH, returns the log.
-run_dispatch() { # $1=FAKE_BLOCKED_IDS  $2=FAKE_INCLUDE_ENGWIN(0|1)  $3=FAKE_DEP_BEAD (optional)  $4=FAKE_INCLUDE_EPIC(0|1)
+run_dispatch() { # $1=FAKE_BLOCKED_IDS  $2=FAKE_INCLUDE_ENGWIN(0|1)  $3=FAKE_DEP_BEAD (optional)  $4=FAKE_INCLUDE_EPIC(0|1)  $5=FAKE_INCLUDE_PREAPPROVAL(0|1)
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
@@ -279,6 +296,7 @@ run_dispatch() { # $1=FAKE_BLOCKED_IDS  $2=FAKE_INCLUDE_ENGWIN(0|1)  $3=FAKE_DEP
     FAKE_INCLUDE_ENGWIN="${2:-0}" \
     FAKE_DEP_BEAD="${3:-}" \
     FAKE_INCLUDE_EPIC="${4:-0}" \
+    FAKE_INCLUDE_PREAPPROVAL="${5:-0}" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
@@ -499,6 +517,34 @@ else
 fi
 
 if echo "$LOG3E" | grep -q "Lane picks — small: tt-keep"; then
+  ok "dispatched the normal keeper bug (tt-keep) instead"
+else
+  bad "did not dispatch the keeper bug (tt-keep)"
+fi
+
+# ── Scenario 3f: pre-approval lifecycle stories are excluded (ga-w7wvm) ─────────
+# The Pilot dispatches ONLY story:approved features; pre-approval lifecycle states
+# (story:triage / story:unrefined / story:refinement-in-progress) and the terminal
+# story:cancelled must NEVER be dispatched. tt-triage (P0, story:triage) and
+# tt-mislabel (P0, story:approved+story:unrefined mid-transition) both leak into the
+# candidate stream; the _filter_candidates blocklist guard must drop BOTH so the
+# P1 keeper bug wins. If the guard is absent, a P0 pre-approval story wins the pick.
+echo "Scenario 3f: pre-approval/in-triage stories must be excluded, keeper (P1 bug) dispatched"
+LOG3F="$(run_dispatch "" 0 "" 0 1)"
+
+if echo "$LOG3F" | grep -q "Lane picks — small: tt-triage"; then
+  bad "LEAK: dispatched an in-triage story (tt-triage)"
+else
+  ok "did NOT dispatch the in-triage story (tt-triage)"
+fi
+
+if echo "$LOG3F" | grep -q "Lane picks — small: tt-mislabel"; then
+  bad "LEAK: dispatched a mislabeled approved+unrefined story (tt-mislabel)"
+else
+  ok "did NOT dispatch the mislabeled approved+unrefined story (tt-mislabel)"
+fi
+
+if echo "$LOG3F" | grep -q "Lane picks — small: tt-keep"; then
   ok "dispatched the normal keeper bug (tt-keep) instead"
 else
   bad "did not dispatch the keeper bug (tt-keep)"
