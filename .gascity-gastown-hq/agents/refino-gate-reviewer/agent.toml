@@ -1,0 +1,36 @@
+# refino-gate-reviewer: dedicated Sonnet reviewer template for the REFINO gate
+# (ga-gpr2v). Sibling of the code gate's `gate-reviewer` template — but it reviews
+# the QUALITY of a refined product story (Definition of Refined) instead of code.
+#
+# Why a separate template (not gate-reviewer)?
+#   - Different budget: refino review is ONE reviewer per story, far less frequent
+#     than code gates. Keeping it separate means a burst of code gates can never
+#     starve refino reviews (and vice-versa).
+#   - Different model intent: this gate is product-judgement work; pinned to Sonnet
+#     per the bead's acceptance criteria ("revisor usa modelo Sonnet").
+#
+# Budget rationale:
+#   max_active_sessions=3 — at most a few concurrent refino reviews. The
+#   dispatcher reviews one story per sweep, so 3 is generous headroom and lets a
+#   slow review overlap the next sweep without the cap hard-failing the spawn.
+#
+# min_active_sessions=0: no permanent pool workers. Spawned on-demand by
+# refino-gate-dispatcher.sh; drains when the review completes.
+
+scope = "city"
+min_active_sessions = 0
+max_active_sessions = 3
+idle_timeout = "1h"
+wake_mode = "fresh"
+
+# Model: Sonnet (AC: "o revisor usa modelo Sonnet"). If the Gas City build does
+# not honor a per-template `model` key, the reviewer still runs Sonnet by
+# inheriting the city default model; this key makes the intent explicit and
+# pins it if the key is supported. (Flagged for the Mayor — see design summary.)
+model = "sonnet"
+
+# Remote Control OFF for ephemeral reviewers (same rationale as gate-reviewer,
+# bug wa-9ye2): headless/ephemeral sessions must NOT auto-connect to the human's
+# mobile Claude Code app. Route through the dedicated claude-headless provider
+# (defined in city.toml) which forces remoteControlAtStartup=false.
+provider = "claude-headless"
