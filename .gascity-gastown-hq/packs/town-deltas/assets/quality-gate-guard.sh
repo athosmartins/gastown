@@ -796,9 +796,17 @@ log "Marker $MARKER_ID claimed."
 
 DESC=$(printf '%s\n' "$MARKER" | jq -r '.description // ""')
 
-extract() {
-  echo "$DESC" | grep -E "^$1:" | head -1 | sed "s/^$1: *//"
-}
+# ga-7zjs1 (ported from the dispatcher's extract, quality-gate-dispatcher.sh): a
+# marker missing a field (e.g. a hand-rolled re-submit marker with no `rig:` line)
+# makes `grep` exit 1 → under `set -euo pipefail` the pipeline status propagates and
+# the bare `RIG=$(extract "rig")` command substitution aborts the guard SILENTLY,
+# right after the "claimed" log and before any branch log. The marker is then
+# stranded at gate-status:claimed → Vector A re-readies it ×3 → gate-status:error
+# (looks like a deterministic dispatcher crash; it's the guard). `|| true` makes a
+# missing field yield "" (safe: validate_rig only runs when RIG is non-empty, and
+# the rig is re-derived from the bead-id prefix downstream). Also absorbs head -1
+# SIGPIPE on a large multi-line $DESC.
+extract() { echo "$DESC" | grep -E "^$1:" | head -1 | sed "s/^$1: *//" || true; }
 
 BRANCH=$(extract "branch")
 BEAD_ID=$(extract "bead_id")

@@ -84,5 +84,40 @@ else
   bad "shipped extract() is missing the '|| true' terminator — set -e abort can recur"
 fi
 
+# ── GUARD copy: the SAME ga-7zjs1 bug lived in quality-gate-guard.sh's extract() ──
+# The guard sets gate-status:claimed then runs RIG=$(extract "rig"); a rig-less
+# hand-rolled marker aborted the guard SILENTLY after "claimed" and before any
+# branch log → marker stuck at gate-status:claimed → Vector A re-ready ×3 →
+# gate-status:error (mis-read as a deterministic dispatcher crash on wa-kjys; it
+# was the guard + a missing rig: field, NOT the painel JS). The dispatcher's
+# `|| true` fix was never ported to the guard until now.
+GUARD="$SELF_DIR/quality-gate-guard.sh"
+GUARD_EXTRACT_DEF="$(grep -E '^extract\(\) \{' "$GUARD" | head -1)"
+if [ -n "$GUARD_EXTRACT_DEF" ]; then ok "located live guard extract() definition"; else bad "could not locate extract() in guard"; fi
+
+GUARD_RESULT="$(
+  bash -c '
+    set -euo pipefail
+    DESC="$1"
+    '"$GUARD_EXTRACT_DEF"'
+    BRANCH=$(extract "branch")
+    BEAD_ID=$(extract "bead_id")
+    BASE_COMMIT=$(extract "base_commit")
+    RIG=$(extract "rig")
+    echo "REACHED|branch=${BRANCH}|rig=${RIG:-unknown}"
+  ' _ "$RIGLESS_DESC" 2>/dev/null
+)"
+GRC=$?
+if [ "$GRC" -eq 0 ]; then ok "guard extract() survives a rig-less description under set -e"; else bad "guard extract() aborted under set -e (rc=$GRC) on rig-less description"; fi
+case "$GUARD_RESULT" in
+  *"|rig=unknown") ok "guard: absent rig: yields empty rig (validate_rig is [-n] guarded; bead-prefix fallback applies)";;
+  *)               bad "guard rig field not empty as expected; got: '$GUARD_RESULT'";;
+esac
+if grep -Eq '^extract\(\) \{ echo .*\| sed .* \|\| true; \}' "$GUARD"; then
+  ok "shipped guard extract() retains '|| true' terminator (drift guard)"
+else
+  bad "shipped guard extract() is missing the '|| true' terminator — guard set -e abort can recur"
+fi
+
 echo "== extract-sete: PASS=$PASS FAIL=$FAIL =="
 [ "$FAIL" -eq 0 ]
