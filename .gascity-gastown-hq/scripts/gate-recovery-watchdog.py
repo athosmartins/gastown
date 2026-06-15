@@ -238,6 +238,31 @@ def stuck_dispatching():
     return len(active) == 0
 
 
+def gate_infra_throttled():
+    """True if the gate dispatcher is ALIVE but currently DEFERRING on INFRA
+    (Dolt-CPU hot or quota), i.e. throttled — NOT wedged. A repair dog cannot
+    lower Dolt CPU or restore quota, so the gate-repair detectors (gate:down,
+    head-of-line, orphan) must NOT fire while this is true — that is the source
+    of the futile 'taskless' dogs (ga-htjni follow-up / dog investigation
+    2026-06-15). Requires a FRESH log: a dead/wedged dispatcher has a stale log
+    → returns False → ENGINE-STALL / gate:down still fire (a real wedge is never
+    masked). Reads the most-recent headroom decision: a fresh 'Headroom OK' or
+    'sweep complete' seen first means the gate is admitting/progressing → False."""
+    try:
+        if time.time() - os.path.getmtime(DISPATCH_LOG) > 180:
+            return False  # stale log → not actively throttling; let other detectors judge
+        with open(DISPATCH_LOG) as f:
+            lines = f.readlines()[-25:]
+    except Exception:
+        return False
+    for l in reversed(lines):
+        if "Headroom OK" in l or "sweep complete" in l:
+            return False  # most recent decision = admitting / concluded → not throttled now
+        if "Headroom DEFER" in l and ("dolt-hot" in l or "quota-limited" in l or "cota=LIMITED" in l):
+            return True
+    return False
+
+
 def headofline_stall():
     """Detect the stale-branch FIFO head-of-line block (ga-hl0gq).
 
@@ -1000,10 +1025,21 @@ def main():
         sessions = _session_list_json()
         lp = last_pass_epoch()
 
+        # ga-htjni follow-up (dog investigation 2026-06-15): if the gate is
+        # ALIVE-but-infra-throttled (Dolt-hot or quota DEFER), a repair dog cannot
+        # fix CPU/quota — suppress the three GATE-repair detectors (gate:down /
+        # head-of-line / orphan) this cycle so we stop spawning futile taskless
+        # dogs. Pilot + supervisor detectors are unaffected (different conditions).
+        # A truly wedged dispatcher has a stale log → infra=False → detectors fire.
+        infra = gate_infra_throttled()
+        if infra:
+            print("[watchdog] gate infra-throttled (Dolt-hot/quota DEFER) — alive but throttled; "
+                  "skipping gate-repair detectors this cycle (a dog can't fix infra).", flush=True)
+
         # ===== gate down: 2+ timeouts OR a marker stuck dispatching w/ no reviewers =====
         n_to, last_to = recent_timeouts()
         stuck = stuck_dispatching()
-        problem = (n_to >= 2) or stuck
+        problem = ((n_to >= 2) or stuck) and not infra
         if saw_gate and lp and lp > last_gate_spawn:
             print("[watchdog] gate recovered (Gate PASSED after repair dispatch) — resetting", flush=True)
             notify("Gate recuperou (agente de reparo/Mayor) — voltou a passar revisões. Tudo certo.", 3)
@@ -1035,7 +1071,7 @@ def main():
             print("[watchdog] head-of-line cleared (Gate PASSED after repair dispatch) — resetting", flush=True)
             notify("Gate destravou — fila voltou a drenar (head-of-line resolvido).", 3)
             gov.reset_prefix("gate-loop:"); saw_loop = False
-        if hb:
+        if hb and not infra:
             ldiag = snapshot("head-of-line block: %dx QUEUED-retry no branch %s" % (hcount, hb), 0)
             lhow = governed_spawn(gov, sessions, now, "gate-loop", hb, ldiag, 0,
                                   "Gate preso em branch stale (head-of-line)", branch=hb)
@@ -1069,7 +1105,7 @@ def main():
             print("[watchdog] orphaned marker cleared (Gate PASSED after repair dispatch) — resetting", flush=True)
             notify("Marker órfão resolvido — gate voltou a passar (gt-mqkwj).", 3)
             gov.reset_prefix("gate-orphan:"); saw_orphan = False
-        if orphan_id:
+        if orphan_id and not infra:
             odiag = snapshot("orphaned queued marker %s (branch %s, %dmin sem despacho)"
                              % (orphan_id, orphan_branch, orphan_age // 60), 0)
             # reason=branch (title), marker id carried for the runbook + dedup key
