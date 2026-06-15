@@ -725,6 +725,25 @@ _gate_lock_path_age() {
 # Age (seconds) of the heartbeat file; a huge number if it is missing.
 _gate_lock_hb_age() { _gate_lock_path_age "$GATE_LOCK_HB"; }
 
+# ga-T1 #7 (kill-recovery): the mtime/MAX_AGE staleness path alone takes up to
+# GATE_LOCK_MAX_AGE (1800s) to reclaim after the dispatcher is KILLED (e.g. a
+# watchdog `kickstart -k`) — a killed holder stops refreshing its heartbeat but
+# its mtime hasn't aged out, so every new sweep yields to the corpse for ~30min
+# (observed in the field, dog-1 ga-wisp-vxq5tup). Fast-path: if the heartbeat's
+# holder PID is provably DEAD, the holder is gone NOW regardless of mtime. PID
+# reuse only makes us fall back to the (still-bounded) mtime path, never a wrong
+# reclaim of a LIVE holder — so this is strictly safe. Empty/non-numeric token
+# (transient hb) is treated as ALIVE (do not fast-reclaim).
+_gate_lock_holder_dead() {
+  local _pid
+  _pid=$(head -n1 "$GATE_LOCK_HB" 2>/dev/null | cut -d: -f1 || true)
+  case "$_pid" in
+    ''|*[!0-9]*) return 1 ;;   # unknown holder → treat as alive
+  esac
+  kill -0 "$_pid" 2>/dev/null && return 1   # pid alive → holder alive
+  return 0                                   # pid dead → holder dead
+}
+
 # How long a .reaping reclaim sentinel may live before a later reclaimer may
 # force-clear it (guards against a reclaimer that died mid-recovery wedging all
 # future reclaims). The real reclaim is a few local-fs ops (sub-ms), so this is
@@ -759,9 +778,10 @@ _acquire_gate_lock() {
   fi
   local _age
   _age=$(_gate_lock_hb_age)
-  if [ "$_age" -lt "$GATE_LOCK_MAX_AGE" ]; then
-    return 1   # fresh heartbeat → a live sweep is running.
+  if [ "$_age" -lt "$GATE_LOCK_MAX_AGE" ] && ! _gate_lock_holder_dead; then
+    return 1   # fresh heartbeat + live holder → a live sweep is running.
   fi
+  # else: heartbeat aged out OR holder PID dead (killed mid-sweep) → reclaim (ga-T1 #7).
   # _age ≥ MAX_AGE means the heartbeat is OLD *or* ABSENT. An absent heartbeat on
   # an existing dir is a holder caught in the µs window between its mkdir and its
   # hb write — NOT a dead holder (ga-T1 #6 guarantees a write-failed acquire tears
@@ -803,7 +823,7 @@ _acquire_gate_lock() {
   # Re-check UNDER the sentinel: if the lock turned fresh while we waited for the
   # sentinel, an earlier reclaimer already took over (and released the sentinel) —
   # backing off here stops us clobbering its brand-new lock (the late-loser race).
-  if [ "$(_gate_lock_hb_age)" -lt "$GATE_LOCK_MAX_AGE" ]; then
+  if [ "$(_gate_lock_hb_age)" -lt "$GATE_LOCK_MAX_AGE" ] && ! _gate_lock_holder_dead; then
     rmdir "$_reaping" 2>/dev/null || true
     return 1
   fi
