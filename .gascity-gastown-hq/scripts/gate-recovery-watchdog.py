@@ -81,7 +81,7 @@ NOTIFY = "/Users/athos/.local/bin/notify"
 DOG_TEMPLATE = "gastown.dog"   # utility pool the repair agent is spawned into (ga-afytf)
 QUOTA_CHECK = os.path.join(CITY, "scripts/claude-quota-check.sh")  # ground-truth quota verdict (ga-wjlv9)
 
-POLL_SEC = 60
+POLL_SEC = 120  # ga-8smq3: was 60; all thresholds below are 12-40min, so 120s loses no detection latency while halving this daemon's Dolt poll load
 TIMEOUT_WINDOW_SEC = 1800      # 2+ timeouts within 30min = gate not producing verdicts
 DISPATCH_STUCK_SEC = 720       # marker dispatching >12min w/ no active reviewers = spawn fail
 PILOT_JAM_WINDOW_SEC = 900     # 2+ sweep-aborts within 15min = Pilot jammed on a bad bead
@@ -91,8 +91,30 @@ HEADOFLINE_LOG_FRESH_SEC = 600 # ignore if dispatcher log is staler than this (t
 ORPHAN_LOG_FRESH_SEC = 600     # dispatcher log must be live (process still writing) — else ENGINE-STALL's job
 ORPHAN_DRAIN_FRESH_SEC = 1200  # newest COMPLETED sweep within 20min = dispatcher actively draining (not wedged on one run)
 ORPHAN_MIN_AGE_SEC = 1800      # a queued marker must sit >=30min unmentioned before we call it skipped (rules out a just-created marker)
-WAKE_COOLDOWN_SEC = 1200       # don't dispatch a new repair cycle more than once per 20min (per kind)
-ESCALATE_AFTER_WAKES = 2       # after 2 unresolved repair-cycles, page Athos 🚨
+WAKE_COOLDOWN_SEC = int(os.environ.get("WAKE_COOLDOWN_SEC", "1200"))   # base: don't dispatch a new repair for the SAME condition more than once per 20min
+ESCALATE_AFTER_WAKES = int(os.environ.get("ESCALATE_AFTER_WAKES", "2"))  # after N unresolved repair-cycles for one condition, page Athos 🚨
+
+# ---- RUNAWAY GOVERNOR knobs (ga-wisp-q9b3as2: the watchdog spawned ~28 repair
+#      dogs — 6 for the SAME marker — because nothing deduped, capped, or backed
+#      off; their collective bd/gc poll load became a PRIMARY Dolt-CPU driver that
+#      WORSENED the reviewer boot-stall the watchdog was reacting to → it spawned
+#      MORE. These bound the loop. All env-overridable; defaults are conservative). ----
+GRW_ENABLED = os.environ.get("GRW_ENABLED", "1") != "0"          # kill switch: "0" = detect+log only, never spawn/wake
+GRW_DRY_RUN = os.environ.get("GRW_DRY_RUN", "0") == "1"          # "1" = log the spawn decision but do not actually spawn (observability/test)
+MAX_ACTIVE_REPAIR_DOGS = int(os.environ.get("MAX_ACTIVE_REPAIR_DOGS", "3"))   # hard cap: never spawn while >= this many watchdog repair dogs are already live
+MAX_SPAWNS_PER_CONDITION = int(os.environ.get("MAX_SPAWNS_PER_CONDITION", "3"))  # after N spawns for the SAME condition (no recovery), stop spawning; notify-once only
+REPAIR_DOG_STALE_SEC = int(os.environ.get("REPAIR_DOG_STALE_SEC", "3600"))    # a repair dog older than this no longer counts (assumed done/reaped) for dedup+cap
+WAKE_BACKOFF_MAX_SEC = int(os.environ.get("WAKE_BACKOFF_MAX_SEC", "7200"))    # exponential per-condition cooldown backoff is capped here (2h)
+REPAIR_DUAL_SPAWN = os.environ.get("REPAIR_DUAL_SPAWN", "0") == "1"           # "0" (default) = direct-spawn first, sling durable bead ONLY if direct fails (halves load); "1" = legacy always-both
+# A repair dog's session title (set by the watchdog's --title-hint, and kept by the
+# dog after it self-renames because the dog naturally echoes the branch/condition)
+# matched broadly so we also catch dogs spawned before this process started (restart
+# amnesia) or pre-fix pile-ups. Over-matching is the SAFE direction (more skips).
+REPAIR_DOG_TITLE_RE = re.compile(
+    r"gate[- ]orphan|gate[- ]watchdog|\bREPAIR\b|\breparo\b|marker stuck|marcador .*travado|"
+    r"head[- ]of[- ]line|branch stale|branch travado|pilot trav|pilot .*jam|supervisor init|"
+    r"init[- ]failure|init failure|gate stall|gate heartbeat|zero merges|sem revisores",
+    re.IGNORECASE)
 DOLT_SIG = re.compile(r"connection reset|bead store closed|unexpected EOF|invalid connection|provider-health registry unavailable")
 TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 # "=== Dispatcher sweep complete: branch=<X> verdict=QUEUED (retry N/M, dead author) ==="
@@ -335,25 +357,38 @@ def _detect_orphan_markers(markers, sweep_epochs, log_text, now):
               dispatcher leapfrogged this older one. This is the guard that
               distinguishes a true orphan from a normal FIFO backlog stuck behind
               a slow run: in a healthy backlog the OLDEST unmentioned marker is
-              simply next-up and no newer marker is being worked ahead of it."""
+              simply next-up and no newer marker is being worked ahead of it.
+      (head)  ONLY the FIFO-oldest queued marker is eligible. A non-head marker is
+              by definition FIFO-blocked behind an older one (the dispatcher takes
+              one marker per sweep, oldest-first) — NOT orphaned. This is the guard
+              that kills the recurring false positive (wa-68su / ga-te7es: a #2
+              marker flagged 'orphan' while the OLDER head was being actively gated
+              or yielding to a live sibling run; refs
+              [[gate-orphan-watchdog-false-positive-headofline-block]],
+              [[ga-te7es-gate-orphan-falsepos-sibling-headofline]]). A true
+              gt-mqkwj orphan (its gate_run dropped in an outage) is always the
+              oldest still-queued marker, so this loses no real detection."""
     if not sweep_epochs:
         return []
     if now - max(sweep_epochs) > ORPHAN_DRAIN_FRESH_SEC:
         return []  # dispatcher not actively draining → not this failure mode
     valid = [(mid, b, c) for (mid, b, c) in markers if mid and b and c]
     valid.sort(key=lambda m: m[2])  # oldest first
-    orphans = []
-    for (mid, branch, created) in valid:
-        if now - created < ORPHAN_MIN_AGE_SEC:
-            continue
-        if branch in log_text:
-            continue  # mentioned → being / already dispatched, not orphaned
-        leapfrogged = any(c2 > created and b2 != branch and b2 in log_text
-                          for (_m2, b2, c2) in valid)
-        if not leapfrogged:
-            continue
-        orphans.append((mid, branch, int(now - created)))
-    return orphans
+    if not valid:
+        return []
+    # (head) only the FIFO-oldest queued marker can be an orphan; everything newer
+    # is FIFO-blocked behind it, not skipped. Evaluating only valid[0] is what
+    # suppresses the head-of-line false positive that drove the 6x-same-marker loop.
+    mid, branch, created = valid[0]
+    if now - created < ORPHAN_MIN_AGE_SEC:
+        return []
+    if branch in log_text:
+        return []  # head mentioned → being / already dispatched (or actively gated), not orphaned
+    leapfrogged = any(c2 > created and b2 != branch and b2 in log_text
+                      for (_m2, b2, c2) in valid)
+    if not leapfrogged:
+        return []
+    return [(mid, branch, int(now - created))]
 
 
 def orphaned_queued_marker():
@@ -686,23 +721,48 @@ def spawn_repair_agent(reason, diag_path, dolt_hits, kind="gate"):
 
     The sling title is kept ASCII — rich/emoji detail lives in the body — because the
     `title` column has rejected non-ASCII before (the Pilot charset abort that aborts
-    a whole dispatch sweep; the description body carries no such constraint)."""
+    a whole dispatch sweep; the description body carries no such constraint).
+
+    Returns (status_str, session_id_or_None). The session_id lets the caller record
+    the spawned dog in the governor ledger so a follow-up detection for the SAME
+    condition dedups against THIS dog instead of spawning a sibling (the 6x-same-
+    marker root). When REPAIR_DUAL_SPAWN is off (default) the durable sling bead is
+    only routed if the direct spawn FAILED — so a healthy spawn produces ONE dog,
+    not two, halving the load this watchdog adds."""
     safe_reason = reason.encode("ascii", "replace").decode("ascii")
     title = "REPAIR gate-watchdog (%s): %s" % (kind, safe_reason)
     payload = title + "\n\n" + REPAIR_HEADER + repair_runbook(reason, diag_path, dolt_hits, kind)
-    r = sh(["gc", "sling", DOG_TEMPLATE, "--stdin", "--json"], stdin=payload, timeout=45)
-    routed = r is not None and r.returncode == 0
-    s = sh(["gc", "session", "new", DOG_TEMPLATE, "--no-attach",
-            "--title-hint", "reparo %s: %s" % (kind, safe_reason[:50])], timeout=45)
-    materialized = s is not None and s.returncode == 0
+
+    def _sling():
+        r = sh(["gc", "sling", DOG_TEMPLATE, "--stdin", "--json"], stdin=payload, timeout=45)
+        return r is not None and r.returncode == 0
+
+    def _direct():
+        s = sh(["gc", "session", "new", DOG_TEMPLATE, "--no-attach", "--json",
+                "--title-hint", "reparo %s: %s" % (kind, safe_reason[:50])], timeout=45)
+        if not s or s.returncode != 0:
+            return (False, None)
+        sid = None
+        try:
+            sid = (json.loads(s.stdout) or {}).get("session_id")
+        except Exception:
+            sid = None
+        return (True, sid)
+
+    routed = False
+    if REPAIR_DUAL_SPAWN:
+        routed = _sling()   # legacy: always route a durable bead first
+    materialized, sid = _direct()
     if materialized:
-        return "agente de reparo despachado" + ("" if routed else " (aviso: bead nao enfileirou)")
-    # No worker materialized directly — do NOT trust a possibly-wedged reconciler to
-    # pick up the routed bead; wake the Mayor as the human-judgment fallback.
+        return ("agente de reparo despachado" + ("" if (routed or not REPAIR_DUAL_SPAWN) else " (aviso: bead nao enfileirou)"), sid)
+    # No worker materialized directly — route the durable bead now (insurance) and do
+    # NOT trust a possibly-wedged reconciler to pick it up: wake the Mayor as fallback.
+    if not routed:
+        routed = _sling()
     woke = wake_mayor(reason, diag_path, dolt_hits, kind)
     if woke:
-        return "reparo enfileirado + Mayor acordado (fallback)" if routed else "Mayor acordado (fallback)"
-    return "reparo so enfileirado — sem worker, Mayor ausente" if routed else "FALHA: sem worker e sem Mayor"
+        return ("reparo enfileirado + Mayor acordado (fallback)" if routed else "Mayor acordado (fallback)", None)
+    return ("reparo so enfileirado — sem worker, Mayor ausente" if routed else "FALHA: sem worker e sem Mayor", None)
 
 
 def wake_mayor(reason, diag_path, dolt_hits, kind="gate"):
@@ -726,149 +786,298 @@ def notify(msg, prio):
     sh([NOTIFY, "-t", "Gate watchdog", "-p", str(prio), msg], timeout=10)
 
 
+def _session_list_json():
+    """[session-dict, ...] or None on query failure (None is distinct from an empty
+    list — the governor treats None as 'cannot verify' and fail-safe SKIPS spawning,
+    so a Dolt/gc outage can never become a blind-spawn amplifier)."""
+    rs = sh(["gc", "session", "list", "--json"])
+    if not rs or rs.returncode != 0:
+        return None
+    try:
+        return json.loads(rs.stdout).get("sessions", [])
+    except Exception:
+        return None
+
+
+def cond_for(kind, reason, marker_id=None, branch=None):
+    """(cond_key, dedup_tokens) for a detected condition. cond_key keys the
+    cooldown/backoff/spawn-count state; dedup_tokens are substrings whose presence
+    in a LIVE repair-dog title means 'already being worked' (skip). For branch/
+    marker-bearing kinds the tokens are the branch + marker id (precise, and they
+    survive the dog's self-rename because the dog echoes the branch). For singleton
+    kinds the key is fixed (one repair at a time) and tokens are kind signatures."""
+    if kind == "gate-orphan":
+        key = "gate-orphan:%s" % (branch or marker_id or "?")
+        return (key, [t for t in (branch, marker_id) if t])
+    if kind == "gate-loop":
+        return ("gate-loop:%s" % (branch or reason or "?"), [t for t in (branch,) if t])
+    if kind == "pilot":
+        return ("pilot:jam", ["pilot"])
+    if kind == "supervisor":
+        return ("supervisor:initfail", ["supervisor init", "init-failure", "init failure"])
+    return ("gate:down", ["marker stuck", "marcador", "sem revisores", "no active reviewer", "stuck"])
+
+
+def _is_repair_dog(s):
+    return s.get("template") == DOG_TEMPLATE and not s.get("closed") \
+        and bool(REPAIR_DOG_TITLE_RE.search(s.get("title") or ""))
+
+
+def _session_fresh(s, now):
+    e = _iso_epoch(s.get("created_at"))
+    if e is None:
+        return True  # unknown age → assume fresh (counts toward cap = safe direction)
+    return (now - e) <= REPAIR_DOG_STALE_SEC
+
+
+class Governor:
+    """Bounds watchdog repair-dog spawning: dedup (same condition already worked),
+    a hard concurrent cap, and a per-condition cooldown with exponential back-off +
+    spawn-count self-limit. Holds in-memory ledger of session_ids it spawned
+    (keyed by cond) so dedup is exact go-forward; title matching is the secondary
+    net for pre-fix pile-ups / restart amnesia. Pure-decision methods are unit-tested."""
+
+    def __init__(self):
+        self.ledger = {}        # cond_key -> [(session_id, spawn_epoch), ...]
+        self.last_spawn = {}    # cond_key -> epoch of last spawn
+        self.spawn_count = {}   # cond_key -> spawns since last recovery
+        self.cooldown = {}      # cond_key -> current effective cooldown sec (back-off)
+        self.escalated = {}     # cond_key -> epoch of last 🚨 (rate-limit the page)
+
+    # ---- live repair-dog accounting ----
+    def _ledger_live(self, cond_key, sessions, now):
+        """session_ids this governor spawned for cond_key that are still present,
+        not closed, and not stale."""
+        by_id = {s.get("id"): s for s in sessions}
+        live = []
+        for (sid, _ts) in self.ledger.get(cond_key, []):
+            s = by_id.get(sid)
+            if s and not s.get("closed") and _session_fresh(s, now):
+                live.append(sid)
+        return live
+
+    def active_repair_dogs(self, sessions, now):
+        """Set of session_ids that are live watchdog repair dogs (ledger ∪ title-
+        matched), for the concurrent cap. Union → robust across restart + rename."""
+        ids = set()
+        for s in sessions:
+            if _is_repair_dog(s) and _session_fresh(s, now):
+                ids.add(s.get("id"))
+        for cond, entries in self.ledger.items():
+            by_id = {s.get("id"): s for s in sessions}
+            for (sid, _ts) in entries:
+                s = by_id.get(sid)
+                if s and not s.get("closed") and _session_fresh(s, now):
+                    ids.add(sid)
+        return ids
+
+    def _dedup_hit(self, cond_key, dedup_tokens, sessions, now):
+        if self._ledger_live(cond_key, sessions, now):
+            return True
+        toks = [t.lower() for t in (dedup_tokens or []) if t]
+        if not toks:
+            return False
+        for s in sessions:
+            if s.get("template") != DOG_TEMPLATE or s.get("closed"):
+                continue
+            if not _session_fresh(s, now):
+                continue
+            title = (s.get("title") or "").lower()
+            if any(t in title for t in toks):
+                return True
+        return False
+
+    def decide(self, cond_key, dedup_tokens, sessions, now):
+        """(allow: bool, reason: str). Order: kill-switch → unavailable-session-list
+        fail-safe → cooldown/back-off → per-condition spawn cap (self-limit) → dedup
+        → global concurrent cap."""
+        if not GRW_ENABLED:
+            return (False, "disabled (GRW_ENABLED=0)")
+        if sessions is None:
+            return (False, "session-list unavailable — fail-safe skip (no blind spawn)")
+        cd = self.cooldown.get(cond_key, WAKE_COOLDOWN_SEC)
+        last = self.last_spawn.get(cond_key, 0)
+        if now - last < cd:
+            return (False, "cooldown %ds left" % int(cd - (now - last)))
+        if self.spawn_count.get(cond_key, 0) >= MAX_SPAWNS_PER_CONDITION:
+            return (False, "maxspawn (%d reached for condition; self-limiting — a repair dog can't fix this root)" % MAX_SPAWNS_PER_CONDITION)
+        if self._dedup_hit(cond_key, dedup_tokens, sessions, now):
+            return (False, "dedup (live repair dog already targeting %s)" % cond_key)
+        n = len(self.active_repair_dogs(sessions, now))
+        if n >= MAX_ACTIVE_REPAIR_DOGS:
+            return (False, "at repair-dog cap (%d/%d) — deferring" % (n, MAX_ACTIVE_REPAIR_DOGS))
+        return (True, "ok")
+
+    def record_spawn(self, cond_key, session_id, now):
+        if session_id:
+            self.ledger.setdefault(cond_key, []).append((session_id, now))
+        self.last_spawn[cond_key] = now
+        self.spawn_count[cond_key] = self.spawn_count.get(cond_key, 0) + 1
+        # exponential back-off: each repeat for the same condition waits longer
+        self.cooldown[cond_key] = min(WAKE_COOLDOWN_SEC * (2 ** (self.spawn_count[cond_key] - 1)),
+                                      WAKE_BACKOFF_MAX_SEC)
+
+    def spawns(self, cond_key):
+        return self.spawn_count.get(cond_key, 0)
+
+    def should_escalate(self, cond_key, now):
+        """True at most once per WAKE_BACKOFF_MAX_SEC for a condition that hit the
+        per-condition spawn cap — page the human ONCE, don't spam."""
+        if self.spawn_count.get(cond_key, 0) < MAX_SPAWNS_PER_CONDITION:
+            return False
+        if now - self.escalated.get(cond_key, 0) < WAKE_BACKOFF_MAX_SEC:
+            return False
+        self.escalated[cond_key] = now
+        return True
+
+    def reset_prefix(self, prefix):
+        """On recovery, clear all per-condition state for a kind (keys start with
+        prefix) so the next genuine incident starts fresh (cooldown + counts)."""
+        for d in (self.last_spawn, self.spawn_count, self.cooldown, self.ledger, self.escalated):
+            for k in [k for k in d if k.startswith(prefix)]:
+                del d[k]
+
+
+def governed_spawn(gov, sessions, now, kind, reason, diag, dolt_hits, label,
+                   marker_id=None, branch=None):
+    """Single entry point for every detection block: apply the governor, then spawn
+    (or skip / escalate). Returns a short status string for logging, or None if the
+    spawn was suppressed. Centralizing this is what makes dedup+cap+back-off apply
+    uniformly to all five detectors instead of each re-implementing a coarse per-kind
+    cooldown (the old design, which gated by KIND only — so 6 different orphan
+    markers, or one marker seen 6 times across cooldown windows, each spawned)."""
+    cond_key, dedup_tokens = cond_for(kind, reason, marker_id=marker_id, branch=branch)
+    allow, why = gov.decide(cond_key, dedup_tokens, sessions, now)
+    if not allow:
+        print("[watchdog] %s repair SKIPPED (%s) cond=%s" % (label, why, cond_key), flush=True)
+        if gov.should_escalate(cond_key, now):
+            notify("🚨 %s: reparo autônomo já tentou %dx p/ %s e não resolveu — precisa de você. Diag: %s"
+                   % (label, MAX_SPAWNS_PER_CONDITION, cond_key, diag), 5)
+            print("[watchdog] ESCALATED to Athos (%s self-limit reached)" % cond_key, flush=True)
+        return None
+    if GRW_DRY_RUN:
+        print("[watchdog] DRY_RUN would spawn repair: kind=%s cond=%s reason=%s diag=%s"
+              % (kind, cond_key, reason, diag), flush=True)
+        gov.record_spawn(cond_key, None, now)
+        return "DRY_RUN (no spawn)"
+    how, sid = spawn_repair_agent(reason, diag, dolt_hits, kind)
+    gov.record_spawn(cond_key, sid, now)
+    n = gov.spawns(cond_key)
+    if n >= ESCALATE_AFTER_WAKES:
+        notify("🚨 %s ainda quebrado após %dx de reparo autônomo (cond %s). Precisa de você. Diag: %s"
+               % (label, n, cond_key, diag), 5)
+        print("[watchdog] ESCALATED to Athos (%s, %d cycles)" % (cond_key, n), flush=True)
+    else:
+        notify("%s (%s) — %s. Você não precisa agir." % (label, reason, how), 3)
+    print("[watchdog] repair dispatch (%s) kind=%s cond=%s reason=%s diag=%s"
+          % (how, kind, cond_key, reason, diag), flush=True)
+    return how
+
+
 def main():
   # ---- state ----
-  last_wake = 0
-  wakes_since_recovery = 0
-  last_pass_at_wake = 0
-  last_pilot_wake = 0
-  pilot_wakes = 0
-  last_loop_wake = 0
-  loop_wakes = 0
-  last_sup_wake = 0
-  sup_wakes = 0
-  last_orphan_wake = 0
-  orphan_wakes = 0
+  gov = Governor()       # dedup + concurrent cap + per-condition cooldown/back-off
+  saw_gate = False       # we dispatched at least one gate-down repair since last recovery
+  saw_pilot = False
+  saw_loop = False
+  saw_sup = False
+  saw_orphan = False
+  last_gate_spawn = 0
+  last_pilot_spawn = 0
+  last_loop_spawn = 0
+  last_orphan_spawn = 0
 
-  print("[watchdog] gate+pilot watchdog started — spawns a repair agent (Mayor=fallback) on gate-down OR pilot-jam OR head-of-line block OR supervisor init-failure OR orphaned queued marker", flush=True)
+  print("[watchdog] gate+pilot watchdog started — governed repair-agent spawner "
+        "(dedup + cap=%d + per-condition back-off + self-limit=%d; enabled=%s dry_run=%s) "
+        "on gate-down OR pilot-jam OR head-of-line block OR supervisor init-failure OR orphaned queued marker"
+        % (MAX_ACTIVE_REPAIR_DOGS, MAX_SPAWNS_PER_CONDITION, GRW_ENABLED, GRW_DRY_RUN), flush=True)
 
   while True:
     try:
+        now = time.time()
+        # One session-list query per loop, shared by every detector's governor check
+        # (replaces the per-block coarse cooldown; bounds this daemon's own gc load).
+        sessions = _session_list_json()
+        lp = last_pass_epoch()
+
+        # ===== gate down: 2+ timeouts OR a marker stuck dispatching w/ no reviewers =====
         n_to, last_to = recent_timeouts()
         stuck = stuck_dispatching()
         problem = (n_to >= 2) or stuck
-
-        # recovery: a PASS landed after our last dispatch → reset
-        lp = last_pass_epoch()
-        if wakes_since_recovery > 0 and lp and lp > last_wake:
+        if saw_gate and lp and lp > last_gate_spawn:
             print("[watchdog] gate recovered (Gate PASSED after repair dispatch) — resetting", flush=True)
             notify("Gate recuperou (agente de reparo/Mayor) — voltou a passar revisões. Tudo certo.", 3)
-            wakes_since_recovery = 0
-            last_pass_at_wake = 0
-
-        if problem and (time.time() - last_wake > WAKE_COOLDOWN_SEC):
+            gov.reset_prefix("gate:"); saw_gate = False
+        if problem:
             reason = ("%d timeouts em %dmin" % (n_to, TIMEOUT_WINDOW_SEC // 60)) if n_to >= 2 \
                      else "marcador dispatching travado sem revisores ativos"
             dolt_hits = dolt_instability()
             diag = snapshot(reason, dolt_hits)
-            how = spawn_repair_agent(reason, diag, dolt_hits)   # routes + spawns + Mayor-fallback
-            last_wake = time.time()
-            wakes_since_recovery += 1
-
-            if wakes_since_recovery >= ESCALATE_AFTER_WAKES:
-                # last resort — the prior repair dispatch didn't fix it
-                notify("🚨 GATE AINDA QUEBRADO após %dx de reparo autônomo. Precisa de você. Diag: %s"
-                       % (wakes_since_recovery, diag), 5)
-                print("[watchdog] ESCALATED to Athos (repair failed to recover, %d cycles)" % wakes_since_recovery, flush=True)
-            else:
-                notify("Gate travou (%s) — %s. Você não precisa agir." % (reason, how), 3)
-                print("[watchdog] repair dispatch (%s) reason=%s dolt_hits=%d diag=%s"
-                      % (how, reason, dolt_hits, diag), flush=True)
+            how = governed_spawn(gov, sessions, now, "gate", reason, diag, dolt_hits, "Gate travou")
+            if how is not None:
+                last_gate_spawn = now; saw_gate = True
 
         # --- PILOT coverage (closes the gap that hid the 2026-06-08 ~8h jam) ---
         pj, pj_reason = pilot_jammed()
-        if pilot_wakes > 0 and not pj:
+        if saw_pilot and not pj:
             print("[watchdog] pilot recovered — resetting", flush=True)
             notify("Pilot voltou a despachar — resolvido.", 3)
-            pilot_wakes = 0
-        if pj and (time.time() - last_pilot_wake > WAKE_COOLDOWN_SEC):
+            gov.reset_prefix("pilot:"); saw_pilot = False
+        if pj:
             pdiag = snapshot(pj_reason, 0)
-            phow = spawn_repair_agent(pj_reason, pdiag, 0, kind="pilot")   # routes + spawns + Mayor-fallback
-            last_pilot_wake = time.time()
-            pilot_wakes += 1
-            if pilot_wakes >= ESCALATE_AFTER_WAKES:
-                notify("🚨 PILOT AINDA TRAVADO após %dx de reparo autônomo. Precisa de você. Diag: %s"
-                       % (pilot_wakes, pdiag), 5)
-                print("[watchdog] ESCALATED to Athos (pilot jam, %d cycles)" % pilot_wakes, flush=True)
-            else:
-                notify("Pilot travou (%s) — %s. Você não precisa agir." % (pj_reason, phow), 3)
-                print("[watchdog] repair dispatch for PILOT (%s) reason=%s diag=%s"
-                      % (phow, pj_reason, pdiag), flush=True)
+            phow = governed_spawn(gov, sessions, now, "pilot", pj_reason, pdiag, 0, "Pilot travou")
+            if phow is not None:
+                last_pilot_spawn = now; saw_pilot = True
 
         # --- HEAD-OF-LINE block (closes the ga-hl0gq blind spot: 49min undetected) ---
         hb, hcount = headofline_stall()
-        # recovery: a PASS landed after our last loop dispatch → the queue drained
-        if loop_wakes > 0 and lp and lp > last_loop_wake:
+        if saw_loop and lp and lp > last_loop_spawn:
             print("[watchdog] head-of-line cleared (Gate PASSED after repair dispatch) — resetting", flush=True)
             notify("Gate destravou — fila voltou a drenar (head-of-line resolvido).", 3)
-            loop_wakes = 0
-        if hb and (time.time() - last_loop_wake > WAKE_COOLDOWN_SEC):
+            gov.reset_prefix("gate-loop:"); saw_loop = False
+        if hb:
             ldiag = snapshot("head-of-line block: %dx QUEUED-retry no branch %s" % (hcount, hb), 0)
-            lhow = spawn_repair_agent(hb, ldiag, 0, kind="gate-loop")   # routes + spawns + Mayor-fallback
-            last_loop_wake = time.time()
-            loop_wakes += 1
-            if loop_wakes >= ESCALATE_AFTER_WAKES:
-                notify("🚨 GATE AINDA TRAVADO em branch stale (head-of-line: %s) após %dx de reparo autônomo. Precisa de você. Diag: %s"
-                       % (hb, loop_wakes, ldiag), 5)
-                print("[watchdog] ESCALATED to Athos (head-of-line %s, %d cycles)" % (hb, loop_wakes), flush=True)
-            else:
-                notify("Gate preso em branch stale (head-of-line: %s, %dx sweeps) — %s pra destravar (supersede/re-anchor). Você não precisa agir."
-                       % (hb, hcount, lhow), 4)
-                print("[watchdog] repair dispatch for HEAD-OF-LINE (%s) branch=%s count=%d diag=%s"
-                      % (lhow, hb, hcount, ldiag), flush=True)
+            lhow = governed_spawn(gov, sessions, now, "gate-loop", hb, ldiag, 0,
+                                  "Gate preso em branch stale (head-of-line)", branch=hb)
+            if lhow is not None:
+                last_loop_spawn = now; saw_loop = True
 
         # --- SUPERVISOR init-failure loop (closes the ga-h3w2y blind spot:
         #     a rig with no path in site.toml → spawn-outage town-wide, ~1h to
         #     find by hand). First-class durable signal; the proactive guard is
         #     supervisor-config-guard, this is the always-on backstop. ---
         sup_reason, sup_detail = supervisor_init_failure()
-        if sup_wakes > 0 and not sup_reason:
+        if saw_sup and not sup_reason:
             print("[watchdog] supervisor recovered (config valid, no init-failure loop) — resetting", flush=True)
             notify("Supervisor voltou — config válido e spawn normalizado.", 3)
-            sup_wakes = 0
-        if sup_reason and (time.time() - last_sup_wake > WAKE_COOLDOWN_SEC):
+            gov.reset_prefix("supervisor:"); saw_sup = False
+        if sup_reason:
             sdiag = snapshot("%s | config inválido: %s" % (sup_reason, sup_detail), 0)
             # 3rd positional carries the config-invalid detail for the kind=supervisor task
-            show = spawn_repair_agent(sup_reason, sdiag, sup_detail, kind="supervisor")   # routes + spawns + Mayor-fallback
-            last_sup_wake = time.time()
-            sup_wakes += 1
-            if sup_wakes >= ESCALATE_AFTER_WAKES:
-                notify("🚨 SUPERVISOR ainda em init-failure (spawn-outage town-wide) após %dx de reparo autônomo: %s. Precisa de você. Diag: %s"
-                       % (sup_wakes, sup_detail, sdiag), 5)
-                print("[watchdog] ESCALATED to Athos (supervisor init-failure, %d cycles): %s" % (sup_wakes, sup_detail), flush=True)
-            else:
-                notify("Supervisor em init-failure (spawn-outage: %s) — %s pra restaurar o path do rig. Você não precisa agir."
-                       % (sup_detail, show), 4)
-                print("[watchdog] repair dispatch for SUPERVISOR (%s) detail=%s diag=%s"
-                      % (show, sup_detail, sdiag), flush=True)
+            show = governed_spawn(gov, sessions, now, "supervisor", sup_reason, sdiag, sup_detail,
+                                  "Supervisor em init-failure (spawn-outage)")
+            if show is not None:
+                saw_sup = True
 
         # --- ORPHANED queued marker (closes the gt-mqkwj blind spot: a marker
         #     whose gate_run was dropped in an outage is leapfrogged forever →
         #     bead stuck in_progress → reconciler re-spawns a worker ~6x). The
-        #     leapfrog proof keeps a normal FIFO backlog from false-firing. ---
+        #     leapfrog proof + FIFO-head guard keep a normal backlog / head-of-line
+        #     block from false-firing (the 6x-same-marker driver). ---
         orphan_id, orphan_branch, orphan_age = orphaned_queued_marker()
-        # recovery: a PASS landed after our last orphan dispatch (the re-queued
-        # marker ran, or the queue otherwise moved) → reset
-        if orphan_wakes > 0 and lp and lp > last_orphan_wake:
+        if saw_orphan and lp and lp > last_orphan_spawn:
             print("[watchdog] orphaned marker cleared (Gate PASSED after repair dispatch) — resetting", flush=True)
             notify("Marker órfão resolvido — gate voltou a passar (gt-mqkwj).", 3)
-            orphan_wakes = 0
-        if orphan_id and (time.time() - last_orphan_wake > WAKE_COOLDOWN_SEC):
+            gov.reset_prefix("gate-orphan:"); saw_orphan = False
+        if orphan_id:
             odiag = snapshot("orphaned queued marker %s (branch %s, %dmin sem despacho)"
                              % (orphan_id, orphan_branch, orphan_age // 60), 0)
-            # reason=branch (title), 3rd positional carries the marker id for the runbook
-            ohow = spawn_repair_agent(orphan_branch, odiag, orphan_id, kind="gate-orphan")
-            last_orphan_wake = time.time()
-            orphan_wakes += 1
-            if orphan_wakes >= ESCALATE_AFTER_WAKES:
-                notify("🚨 MARKER ÓRFÃO ainda preso (%s, branch %s) após %dx de reparo autônomo. Precisa de você. Diag: %s"
-                       % (orphan_id, orphan_branch, orphan_wakes, odiag), 5)
-                print("[watchdog] ESCALATED to Athos (orphan marker %s, %d cycles)" % (orphan_id, orphan_wakes), flush=True)
-            else:
-                notify("Marker órfão (run derrubado num outage): %s branch %s, %dmin sem despacho — %s pra re-queue/supersede. Você não precisa agir."
-                       % (orphan_id, orphan_branch, orphan_age // 60, ohow), 4)
-                print("[watchdog] repair dispatch for ORPHAN (%s) marker=%s branch=%s age=%ds diag=%s"
-                      % (ohow, orphan_id, orphan_branch, orphan_age, odiag), flush=True)
+            # reason=branch (title), marker id carried for the runbook + dedup key
+            ohow = governed_spawn(gov, sessions, now, "gate-orphan", orphan_branch, odiag, orphan_id,
+                                  "Marker órfão (run derrubado num outage)",
+                                  marker_id=orphan_id, branch=orphan_branch)
+            if ohow is not None:
+                last_orphan_spawn = now; saw_orphan = True
     except Exception as e:
         print("[watchdog] loop error (continuing): %r" % e, flush=True)
     time.sleep(POLL_SEC)
