@@ -205,6 +205,42 @@ PILOT_NEVERSTARTED_MINUTES="${PILOT_NEVERSTARTED_MINUTES:-15}"
 # Set PILOT_REUSE_SESSION=0 to restore the legacy spawn+nudge behaviour.
 PILOT_REUSE_SESSION="${PILOT_REUSE_SESSION:-1}"
 
+# ── Ownership / in-flight-collision guard (ga-htjni) ──────────────────────────
+# Bug ga-htjni: the Pilot DOUBLE-DISPATCHED wa-zptm to oracle-wa even though
+# mila-wa already owned it AND a branch `origin/crew/mila/wa-zptm` already existed
+# at the gate. Oracle redid the whole build (wasted cycle) before the collision
+# was detected. The flat-pool distribution ignored EXISTING ownership / in-flight
+# work and slung a NET-NEW dispatch to a DIFFERENT builder for a bead that was
+# already being (or had been) built.
+#
+# This guard REFUSES a fresh dispatch — at the pre-sling chokepoint, AFTER the
+# atomic claim and AFTER all the existing lifecycle/race verify guards — when
+# EITHER signal says the work is already real and owned:
+#   (a) a branch `origin/crew/*/<bead-id>` ALREADY EXISTS in the bead's rig repo
+#       (the STRONGEST signal: code was pushed for this bead → a build happened /
+#       is happening → never start a second builder elsewhere), OR
+#   (b) the bead's CURRENT assignee is a non-empty NAMED crew whose session is
+#       LIVE (it belongs to someone actively working it).
+# On a refusal the bead is SKIPPED (claim released, story untouched) so it stays
+# with its rightful owner; the next sweep re-evaluates.
+#
+# RECONCILED WITH RECLAIM — must NOT deadlock a genuinely-abandoned bead:
+#   • Condition (a) keys on the SAME "branch exists" signal the never-started
+#     (ga-v3z4z) reclaim already uses to KEEP a bead: a branched bead is owned by
+#     the gate/its branch, never reclaimed by the Pilot, so refusing a fresh
+#     dispatch here can never strand it.
+#   • Condition (b) fires ONLY when the assignee's session is LIVE. If the owner
+#     is set but its session is DEAD *and* no branch exists, this is the genuine
+#     orphan the reclaim paths (ga-e5yw2 dead-worker / ga-v3z4z never-started)
+#     release upstream — the guard explicitly does NOT block that case, so the
+#     orphan is freed (re-dispatchable) exactly as before.
+#   • FAIL-OPEN everywhere: any unresolved leg (no git, repo list empty, roster
+#     untrustworthy, jq error) → DO NOT block → dispatch proceeds as pre-guard.
+#     The worst case is the pre-fix behaviour (a possible redundant dispatch),
+#     never a new deadlock.
+# Set PILOT_OWNERSHIP_GUARD=0 to disable (legacy flat-pool behaviour, no redeploy).
+PILOT_OWNERSHIP_GUARD="${PILOT_OWNERSHIP_GUARD:-1}"
+
 # Dry-run mode: show what WOULD happen, make zero changes.
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -893,6 +929,121 @@ _beadid_has_branch() {
       return 0
     fi
   done <<< "${_NS_BRANCH_REPOS:-}"
+  return 1
+}
+
+# ── ga-htjni: ownership / in-flight collision guard helpers ───────────────────
+# _ownership_guard_repos — newline list of repos a `crew/<owner>/<bead>` branch
+# could live in (the shared town root + every registered rig path), de-duped and
+# memoized for the whole sweep. Self-sufficient: it does NOT depend on the
+# never-started block's _NS_BRANCH_REPOS (which is only set when that detector is
+# enabled), so the guard works even with PILOT_NEVERSTARTED_MINUTES=0. Fail-open:
+# any `gc rig list` error yields just the town root (or nothing) → the branch
+# probe then simply finds no branch → no false block.
+_OWNERSHIP_GUARD_REPOS=""
+_OWNERSHIP_GUARD_REPOS_DONE=""
+_ownership_guard_repos() {
+  if [ -z "$_OWNERSHIP_GUARD_REPOS_DONE" ]; then
+    _OWNERSHIP_GUARD_REPOS=$(
+      { dirname "$GC_CITY"
+        gc --city "$GC_CITY" rig list --json 2>/dev/null \
+          | jq -r '.rigs[]?.path // empty' 2>/dev/null
+      } | awk 'NF && !seen[$0]++'
+    )
+    _OWNERSHIP_GUARD_REPOS_DONE=1
+  fi
+  printf '%s' "$_OWNERSHIP_GUARD_REPOS"
+}
+
+# _beadid_has_crew_branch <bead_id> — exit 0 iff a branch named like
+# `crew/<owner>/<bead-id>` exists in ANY town/rig repo, local OR remote-tracking,
+# AND (best-effort) directly on the rig remote via a bounded `ls-remote`. This is
+# the ga-htjni signal-(a): a pushed crew branch means a build is real/in-flight.
+# It is STRICTER than _beadid_has_branch (which matches the id anywhere in any
+# ref) — here we require the `crew/.../<bead>` shape so a stray tag/note never
+# false-fires; the trailing `/<bead>` or exact `<bead>` end-anchor avoids matching
+# a longer id that merely contains this one as a prefix.
+#
+# Test seam: PILOT_TEST_CREW_BRANCH_BEADS (space-list), consulted when DEFINED,
+# keeps the selftest hermetic (no real git / network). When undefined we probe
+# real git read-only. FAIL-OPEN: no git OR no resolvable repos → return 1 (NOT
+# "assume branch") so the guard never blocks on an unprobable environment; the
+# distinct dead-worker/never-started reclaim paths still own true-orphan recovery.
+_beadid_has_crew_branch() {
+  local _bid="${1:-}" _repo
+  [ -n "$_bid" ] || return 1
+  if [ -n "${PILOT_TEST_CREW_BRANCH_BEADS+x}" ]; then
+    case " $PILOT_TEST_CREW_BRANCH_BEADS " in *" $_bid "*) return 0 ;; *) return 1 ;; esac
+  fi
+  command -v git >/dev/null 2>&1 || return 1
+  local _repos _re
+  _repos=$(_ownership_guard_repos)
+  [ -n "$_repos" ] || return 1
+  # crew/<anything>/<bead> at a ref tail, OR a bare crew/<bead> (defensive).
+  _re="crew/([^/]+/)?${_bid}\$"
+  while IFS= read -r _repo; do
+    [ -n "$_repo" ] && [ -d "$_repo" ] || continue
+    # 1. Already-fetched local + remote-tracking refs (cheap, offline).
+    if git -C "$_repo" for-each-ref --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null \
+        | grep -qiE "$_re"; then
+      return 0
+    fi
+    # 2. Best-effort authoritative remote probe (bounded; the live origin/crew/*
+    #    branch ga-htjni hit may not be fetched locally). A timeout / offline
+    #    remote is NOT evidence of a branch → fall through (fail-open), never block.
+    if git -C "$_repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 \
+       || git -C "$_repo" remote 2>/dev/null | grep -q .; then
+      if timeout 8 git -C "$_repo" ls-remote --heads origin "crew/*/${_bid}" "crew/${_bid}" 2>/dev/null \
+          | grep -qiE "refs/heads/${_re}"; then
+        return 0
+      fi
+    fi
+  done <<< "$_repos"
+  return 1
+}
+
+# _ownership_guard_should_refuse <bead_id> <bead_json> <bead_city> — emit a short
+# REASON to stdout and return 0 (REFUSE this dispatch) iff signal (a) or (b) holds;
+# return 1 (allow) otherwise. Pure read; the caller logs + releases the claim.
+#   (a) crew branch exists for <bead_id> (strongest)            → "branch:<...>"
+#   (b) live assignee: a non-empty, NON-pilot crew assignee whose session is live
+#       in the once-per-sweep roster                            → "owner:<crew>"
+# Re-reads the bead's CURRENT assignee (race-safe: the candidate query required an
+# EMPTY assignee, but a competing claim could have set one between snapshot and
+# now — exactly the ga-htjni double-dispatch window). FAIL-OPEN: an unresolvable
+# assignee, an untrustworthy roster (_DEADWORKER_OK!=1, gated like ga-e5yw2), or
+# any jq error → no (b) block. (a) is independent and self-fail-open.
+_ownership_guard_should_refuse() {
+  local _bid="${1:-}" _json="${2:-}" _city="${3:-$GC_CITY}"
+  [ -n "$_bid" ] || return 1
+
+  # (a) crew branch — strongest, evaluated first and standalone.
+  if _beadid_has_crew_branch "$_bid"; then
+    printf 'branch:crew/*/%s' "$_bid"
+    return 0
+  fi
+
+  # (b) live named-crew owner. Re-read CURRENT assignee from the store (race-safe);
+  # fall back to the snapshot's assignee only if the live read is empty/unreadable.
+  local _asg
+  _asg=$(bd -C "$_city" show "$_bid" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
+  if [ -z "$_asg" ] || [ "$_asg" = "null" ]; then
+    _asg=$(printf '%s' "$_json" | jq -r '(.assignee // "")' 2>/dev/null || echo "")
+  fi
+  [ -z "$_asg" ] || [ "$_asg" = "null" ] && return 1   # unowned → allow.
+  # An assignee equal to the dispatcher self-bead / a dog pool is not a "named
+  # crew owner" in the ga-htjni sense; only block on a real crew identity.
+  case "$_asg" in gastown.dog|gastown.dog-*) return 1 ;; esac
+  # Roster must be trustworthy to judge liveness; otherwise fail-open (allow), so
+  # a racy `session list` read can never deadlock a legitimately-orphaned bead.
+  [ "${_DEADWORKER_OK:-0}" = "1" ] || return 1
+  if _session_is_live "$_asg"; then
+    printf 'owner:%s' "$_asg"
+    return 0
+  fi
+  # Owner set but session DEAD and (a) already proved no branch → genuine orphan:
+  # do NOT block — let the upstream reclaim paths (ga-e5yw2 / ga-v3z4z) recover it.
   return 1
 }
 
@@ -1669,6 +1820,28 @@ FIXSEC
   fi
 
   log "Claim acquired on $STORY_ID."
+
+  # ── ga-htjni: ownership / in-flight collision guard ──────────────────────────
+  # REFUSE a NET-NEW dispatch when the work is already real and owned: (a) a crew
+  # branch exists for this bead, or (b) the bead has a live named-crew owner. This
+  # runs AFTER the atomic claim + every lifecycle/race verify above so it composes
+  # with them (it is the LAST gate before builder routing), and BEFORE any sling so
+  # no second builder is ever spawned. Reconciled with the reclaim paths above
+  # (genuine orphans — dead owner AND no branch — are released upstream and NOT
+  # blocked here, see _ownership_guard_should_refuse). On refusal we release the
+  # claim and skip; the rightful owner keeps the bead. FAIL-OPEN by construction.
+  if [ "${PILOT_OWNERSHIP_GUARD:-1}" = "1" ]; then
+    local _OWN_REASON
+    _OWN_REASON=$(_ownership_guard_should_refuse "$STORY_ID" "$STORY" "$STORY_BEAD_CITY" || echo "")
+    if [ -n "$_OWN_REASON" ]; then
+      warn "ga-htjni: REFUSING dispatch of $STORY_ID — already owned/in-flight ($_OWN_REASON). Leaving it for its rightful owner; releasing claim (set PILOT_OWNERSHIP_GUARD=0 to disable)."
+      if [ "$DRY_RUN" != "1" ]; then
+        bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+        bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+      fi
+      return 1
+    fi
+  fi
 
   # ── Determine builder target ─────────────────────────────────────────────────
   # STORY_RIG and STORY_BEAD_CITY already resolved above (gt-pm55p early rig fix).
