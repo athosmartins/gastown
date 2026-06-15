@@ -1,0 +1,9 @@
+# town-deltas override: loosen gate-sweep 30s→60s to halve this order's Dolt poll load
+# (root cause = poll frequency). gate-sweep is mechanical (timer + GitHub status); ≤30s
+# extra latency on gate closes is acceptable. Script vendored into town-deltas/assets so
+# $PACK_DIR resolves here (the embedded maintenance copy is gitignored/ephemeral).
+[order]
+description = "Evaluate and close pending gates (timer, GitHub)"
+trigger = "cooldown"
+interval = "60s"
+exec = "$PACK_DIR/assets/scripts/gate-sweep.sh"

@@ -790,6 +790,11 @@ if [ "$DRY_RUN" = "1" ]; then
   log "DRY_RUN=1 — WOULD: bd label add $STORY_ID story:done"
   log "DRY_RUN=1 — WOULD: bd comment $STORY_ID 'Delivery COMPLETE...'"
   log "DRY_RUN=1 — notify 'Story $STORY_ID done'"
+  # ga-i53ua: durable terminal — the data-level close that takes the executed
+  # story OUT of Aprovadas and INTO Done (label-only story:done never sufficed).
+  log "DRY_RUN=1 — WOULD: bd label remove $STORY_ID story:approved (leave Aprovadas)"
+  log "DRY_RUN=1 — WOULD: bd label remove $STORY_ID story:in-flight"
+  log "DRY_RUN=1 — WOULD: bd close $STORY_ID -r 'Story DELIVERED … (ga-i53ua durable terminal; delivery close_reason → painel Done)'"
 else
   bd -C "$GC_CITY" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
   bd -C "$GC_CITY" label add    "$STORY_ID" "story:done"       -q 2>/dev/null || true
@@ -845,6 +850,44 @@ Criteria verified: estrela_guia, equilibrios, dashboard (see bead metadata)" 2>/
     notify -t "${PILOT_PREFIX}Story DONE" -p 2 "${PILOT_PREFIX}Story $STORY_ID ($STORY_TITLE) — $DONE_PUSH_TAIL" 2>/dev/null || true
   fi
   log "story:done set on $STORY_ID"
+
+  # ── ga-i53ua: DRIVE THE STORY TO ITS DURABLE TERMINAL STATE ─────────────────
+  # THE BUG: the steps above add the story:done LABEL but never (a) remove the
+  # highest cycle label story:approved, nor (b) CLOSE the bead. A delivered story
+  # therefore stays OPEN at story:approved+story:done forever (proven on ga-w7wvm,
+  # ga-v3z4z, ga-sefot — all PASS in story-delivery.jsonl yet still OPEN+approved).
+  # The painel renders open story:approved beads in "Aprovadas" (cycle-column
+  # query is open-only) and only routes CLOSED+delivery-reason beads to "Done"
+  # (_closed_bead_belongs_in_done → _is_delivery_close). So an executed story is
+  # never DATA-done; it just accretes a story:done label while sitting in Aprovadas.
+  #
+  # FORWARD FIX (this is what makes the executed story reach Done by DATA):
+  #   (a) remove story:approved  → it is no longer in the Aprovadas open-query
+  #   (b) remove story:in-flight → defensive (merge usually stripped it already)
+  #   (c) bd close with a close_reason that the painel's _is_delivery_close
+  #       recognizes as a DELIVERY (contains "Delivered"/"delivered"/"merged"/
+  #       "done" — see painel_visibilidade.py _DELIVERY_CLOSE) and contains NO
+  #       non-delivery word (stale/superseded/cancel/…), so the closed bead lands
+  #       in Done. story:done LABEL is RETAINED — the Done column query uses --all,
+  #       so the closed bead still appears there. This reproduces the known-good
+  #       manual end-state (ref ga-mtlm6: story:approved removed + "merged" close).
+  # Fully guarded: every step `|| true`. If close fails (e.g. cross-store no-op),
+  # the merged-bead-janitor remains a backstop, but the story:approved REMOVAL
+  # above still pulls the bead out of Aprovadas even if it stays open.
+  bd -C "$GC_CITY" label remove "$STORY_ID" "story:approved"  -q 2>/dev/null || true
+  bd -C "$GC_CITY" label remove "$STORY_ID" "story:in-flight" -q 2>/dev/null || true
+  DELIVERY_CLOSE_REASON="Story DELIVERED — deployed + verified in prod, story:done (rig $RIG, ${DONE_PUSH_TAIL:-delivered}). Closed by story-delivery (ga-i53ua durable terminal)."
+  CLOSE_STATUS_NOW=$(bd -C "$GC_CITY" show "$STORY_ID" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || echo "open")
+  if [ "$CLOSE_STATUS_NOW" != "closed" ]; then
+    if bd -C "$GC_CITY" close "$STORY_ID" -r "$DELIVERY_CLOSE_REASON" 2>/dev/null; then
+      log "Story $STORY_ID CLOSED (delivery terminal: story:approved removed; delivery close_reason → painel Done)."
+    else
+      warn "Could not close story $STORY_ID at delivery terminal (non-fatal; story:approved already removed so it leaves Aprovadas; merged-bead-janitor backstops the close)."
+    fi
+  else
+    log "Story $STORY_ID already closed — story:approved removed; delivery terminal idempotent."
+  fi
 fi
 
 # ── Step 9: Log to story-delivery.jsonl ───────────────────────────────────────

@@ -2,6 +2,14 @@
 provider = "claude"
 global_fragments = ["command-glossary", "operational-awareness", "town-deltas"]
 
+# Dolt-CPU cure (2026-06-15): the controller's full health/reconcile patrol ran
+# every 30s (default), a primary connection-churn source on the fragile Dolt plane
+# (root cause = poll frequency, not query cost). Patrol is event-driven with a
+# fallback timer — work-assignment pokes/nudges still fire IMMEDIATELY — so slowing
+# the fallback sweep 30s→120s cuts ~75% of patrol churn without delaying real work.
+[daemon]
+patrol_interval = "120s"
+
 [imports]
 [imports.gastown]
 source = ".gc/system/packs/gastown"

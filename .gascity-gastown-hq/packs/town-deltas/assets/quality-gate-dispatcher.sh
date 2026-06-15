@@ -1553,18 +1553,48 @@ if [ "$ALREADY_MERGED" = "1" ]; then
   # ga-jhyu: CLOSE the marker at terminal (superseded) so it is reaped, not left OPEN.
   bd -C "$GC_CITY" close "$MARKER_ID" -r "Gate marker terminal: SUPERSEDED (branch $BRANCH already merged to $DEFAULT_BRANCH). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
 
-  # Also close the source bead cleanly if open
+  # Drive the source bead to its terminal/handoff state if open.
   if [ -n "$BEAD_ID" ]; then
     BD_STATUS=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | .status // "open"')
     if [ "$BD_STATUS" != "closed" ]; then
-      bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
+      # ga-i53ua: route a STORY already-merged through the SAME delivery completion
+      # as the PASS path — do NOT just mark gate:superseded and leave it OPEN at
+      # story:approved (the old behavior delivered NOTHING: no story:done, no
+      # story:approved removal, no delivery-close → the executed story stranded in
+      # the painel "Aprovadas" column forever, exactly the M1 mechanism this bead
+      # tracks). Detect a story by its canonical label story:approved (type is null
+      # for stories in bd; mirrors the PASS path's IS_STORY logic at ga-esbg).
+      SUPERSEDE_SRC_LABELS=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
+        | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
+      SUPERSEDE_IS_STORY=0
+      if printf '%s' "$SUPERSEDE_SRC_LABELS" | grep -q "story:approved"; then SUPERSEDE_IS_STORY=1; fi
+
       # ga-67hae PILOT-CASCADE FIX: branch already merged → strip story:in-flight so
       # the Pilot lane slot frees. The PASS path strips it at merge (ga-3h8l) but this
       # supersede path did not — phantom in-flight slots wedged the Pilot at capacity.
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
       bd -C "$BEAD_CITY" assign "$BEAD_ID" "" -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate superseded (marker $MARKER_ID). story:in-flight stripped (Pilot lane slot freed — ga-67hae pilot-cascade fix); work already merged." 2>/dev/null || true
+
+      if [ "$SUPERSEDE_IS_STORY" = "1" ]; then
+        # STORY → hand off to story-delivery exactly like the PASS path: set
+        # gate:passed (story-delivery's pickup signal), keep it OPEN with
+        # story:approved, and let delivery run deploy→prod-test→story:done+close
+        # (the durable terminal — story:approved removed + delivery close_reason →
+        # painel Done — lives in story-delivery, ga-i53ua Fix A). We do NOT mark
+        # gate:superseded on a story: that label is a non-delivery word the painel
+        # would mis-route, and superseded is not the story's outcome (it WAS merged).
+        bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate skipped (marker $MARKER_ID superseded), but this is a STORY: handed off to story-delivery (gate:passed set; story:approved kept; story:in-flight stripped; builder assignee cleared). Delivery will deploy + prod-test, then mark story:done and CLOSE with a delivery reason so it reaches painel Done (ga-i53ua)." 2>/dev/null || true
+        log "Already-merged STORY $BEAD_ID handed off to delivery (gate:passed set; story:approved kept for delivery pickup)."
+      else
+        # BUG/TASK → superseded close-direct (unchanged behavior). Non-story beads
+        # do NOT route through story-delivery; they close terminal here.
+        bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate superseded (marker $MARKER_ID). story:in-flight stripped (Pilot lane slot freed — ga-67hae pilot-cascade fix); work already merged." 2>/dev/null || true
+        bd -C "$BEAD_CITY" close "$BEAD_ID" -r "Branch $BRANCH already merged to $RIG/$DEFAULT_BRANCH — delivered via prior merge; gate superseded (marker $MARKER_ID). Closed by dispatcher (ga-i53ua: non-story already-merged terminal)." 2>/dev/null \
+          || warn "Could not close already-merged non-story source bead $BEAD_ID (non-fatal)."
+      fi
     fi
   fi
 

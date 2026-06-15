@@ -1,0 +1,8 @@
+# town-deltas override: loosen order-tracking-sweep 1m→5m to cut Dolt poll-churn.
+# Stale order-tracking beads only need cleanup every few minutes, not every minute.
+# Durable: town-deltas pack overrides the embedded system order.
+[order]
+description = "Close stale order-tracking beads and prune expired tracking history"
+trigger = "cooldown"
+interval = "5m"
+exec = "gc order sweep-tracking --stale-after 10m --quiet"
