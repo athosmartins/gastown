@@ -674,6 +674,152 @@ gate_headroom_decision() {
   return 0
 }
 
+# ── Single-instance lock (ported VERBATIM from pilot-dispatcher.sh, ga-7s0or) ──
+# launchd fires this dispatcher every ~2 min, but a gate sweep can run up to the
+# verdict timeout (~22 min). With no guard, 2-3 sweeps overlap and EACH runs the
+# bd-heavy preamble (Step 0a TTL recovery, Step 0a-2 orphan-reviewer reap, the
+# headroom probe, and multiple `bd list --json --all` scans) concurrently → a
+# ~17-connection Dolt spike exactly as reviewers boot → reviewers stall/die →
+# 22-min verdict timeout → FAIL storm. This lock collapses concurrent sweeps to
+# one and removes that boot spike.
+#
+# Mechanism is the pilot's PROVEN fd-LESS lock, copied verbatim:
+#   • an atomic `mkdir` mutex (POSIX-atomic; no fd, no inheritance — a leaked fd
+#     can never keep a directory "locked", so the old flock-inode leak that
+#     deadlocked the pilot for 5h+ cannot recur), plus
+#   • a heartbeat file whose MTIME, written at acquire, marks liveness.
+# A held lock whose heartbeat mtime is older than GATE_LOCK_MAX_AGE is a dead/
+# zombie holder (a SIGKILLed/OOMed sweep leaves the dir but stops refreshing it)
+# and is recovered AUTOMATICALLY, WITHOUT rm of any flock inode — this is the
+# anti-wedge guarantee. PID-liveness is deliberately NOT used (PID recycling =
+# TOCTOU false-"alive", per ga-7s0or AC). Recovery is gated by an atomic sentinel
+# (`mkdir "$GATE_LOCK_DIR.reaping"` — one winner system-wide) and takes the stale
+# dir over IN PLACE, so two concurrent recoverers can never both proceed and no
+# dir-absent window is ever exposed to a racing acquirer (ga-T1 #4). A LIVE sweep
+# keeps its heartbeat fresh by re-stamping it each verdict poll (ga-T1 #1), so
+# MAX_AGE only ever reclaims a TRULY dead holder. Defined BEFORE the lib-only
+# early-return so the lock selftest can source and drive these functions in
+# isolation (mirrors spawn_abort_should_page).
+#
+# Distinct lock path from the pilot so the two dispatchers never share a lock.
+# Kill-switch: GATE_LOCK_ENABLED=0 → legacy (unlocked) behaviour, no redeploy.
+GATE_LOCK_ENABLED="${GATE_LOCK_ENABLED:-1}"
+GATE_LOCK_DIR="${TMPDIR:-/tmp}/quality-gate-dispatcher$(printf '%s' "$GC_CITY" | tr '/ ' '__').lock.d"
+GATE_LOCK_HB="$GATE_LOCK_DIR/heartbeat"
+# A real gate sweep can legitimately run to the verdict timeout (~22m); 1800s
+# (30 min) is a margin past that which still reclaims a wedged holder within a
+# few launchd intervals.
+GATE_LOCK_MAX_AGE="${GATE_LOCK_MAX_AGE:-1800}"
+GATE_LOCK_TOKEN="$$:${RANDOM}${RANDOM}"
+
+# Age (seconds) of an arbitrary path's mtime; a huge number if it is missing.
+# Used for both the heartbeat file and the .reaping reclaim sentinel (ga-T1 #4).
+_gate_lock_path_age() {
+  local _p="$1" _mt _now
+  _now=$(date +%s)
+  _mt=$(stat -f %m "$_p" 2>/dev/null || stat -c %Y "$_p" 2>/dev/null || echo "")
+  [ -z "$_mt" ] && { echo 999999999; return; }
+  echo $(( _now - _mt ))
+}
+
+# Age (seconds) of the heartbeat file; a huge number if it is missing.
+_gate_lock_hb_age() { _gate_lock_path_age "$GATE_LOCK_HB"; }
+
+# How long a .reaping reclaim sentinel may live before a later reclaimer may
+# force-clear it (guards against a reclaimer that died mid-recovery wedging all
+# future reclaims). The real reclaim is a few local-fs ops (sub-ms), so this is
+# pure crash-recovery margin — keep it small.
+GATE_LOCK_REAP_TTL="${GATE_LOCK_REAP_TTL:-10}"
+
+_gate_lock_write_hb() { printf '%s\n' "$GATE_LOCK_TOKEN" > "$GATE_LOCK_HB" 2>/dev/null || true; }
+
+# Remove the lock dir only if WE still own it (token match) — never clobber a
+# peer that recovered our lock after we were (wrongly) judged stale.
+_release_gate_lock() {
+  local _own
+  _own=$(head -n1 "$GATE_LOCK_HB" 2>/dev/null || true)
+  [ "$_own" = "$GATE_LOCK_TOKEN" ] && rm -rf "$GATE_LOCK_DIR" 2>/dev/null
+  return 0
+}
+
+# Returns 0 if we own the lock, 1 if a LIVE sweep holds it (back off).
+_acquire_gate_lock() {
+  if mkdir "$GATE_LOCK_DIR" 2>/dev/null; then
+    _gate_lock_write_hb
+    # ga-T1 #6: _gate_lock_write_hb swallows write errors (|| true). If the hb
+    # write failed after mkdir succeeded we would own a HEARTBEAT-LESS lock →
+    # _gate_lock_hb_age returns 999999999 on the next fire → instant false
+    # reclaim → double sweep. Verify the hb is present+non-empty; if not, undo
+    # the mkdir and return the NON-acquired path so we never proceed blind.
+    if [ ! -s "$GATE_LOCK_HB" ]; then
+      rm -rf "$GATE_LOCK_DIR" 2>/dev/null || true
+      return 1
+    fi
+    return 0
+  fi
+  local _age
+  _age=$(_gate_lock_hb_age)
+  if [ "$_age" -lt "$GATE_LOCK_MAX_AGE" ]; then
+    return 1   # fresh heartbeat → a live sweep is running.
+  fi
+  # _age ≥ MAX_AGE means the heartbeat is OLD *or* ABSENT. An absent heartbeat on
+  # an existing dir is a holder caught in the µs window between its mkdir and its
+  # hb write — NOT a dead holder (ga-T1 #6 guarantees a write-failed acquire tears
+  # its own dir down, so a hb-less dir is only ever transient). Treat it as LIVE
+  # and back off; this also removes the "fresh dir looks stale" race that let a
+  # reclaimer clobber a just-created lock.
+  if [ ! -s "$GATE_LOCK_HB" ]; then
+    return 1
+  fi
+  # ── ga-T1 #4: single-winner stale reclaim (close the check-then-mv TOCTOU) ──
+  # The age-check above and the reclaim below are not one atomic step. The old
+  # code mv'd the stale dir aside and recreated it; that left a window where the
+  # dir was ABSENT, into which a second process's entry-mkdir could slip — two
+  # holders, ~4% under contention → double sweep. Two fixes together make this
+  # provably single-winner:
+  #   (a) gate the reclaim on ONE atomic sentinel at a FIXED path (mkdir has
+  #       exactly one winner system-wide), and
+  #   (b) take the stale dir over IN PLACE (overwrite its heartbeat) — the dir is
+  #       NEVER removed, so no entry-mkdir gap exists at all.
+  local _reaping="${GATE_LOCK_DIR}.reaping"
+  if ! mkdir "$_reaping" 2>/dev/null; then
+    # Sentinel already exists. A LIVE reclaim is sub-millisecond, so a sentinel
+    # older than the TTL is a reclaimer that died mid-recovery and must not wedge
+    # all future reclaims. STEAL it atomically (mv has exactly one winner): the
+    # earlier "check age, then rm" was itself a TOCTOU — a process that read the
+    # sentinel as absent could rm a peer's freshly-created LIVE sentinel and admit
+    # two reclaimers. We only ever touch an EXISTING sentinel here, and age-gate
+    # the steal so a live (age≈0) sentinel is never taken. Then retry the gate.
+    if [ "$(_gate_lock_path_age "$_reaping")" -ge "$GATE_LOCK_REAP_TTL" ]; then
+      local _dead="${_reaping}.dead.${GATE_LOCK_TOKEN}"
+      if mv "$_reaping" "$_dead" 2>/dev/null; then
+        rm -rf "$_dead" 2>/dev/null || true
+      fi
+    fi
+    if ! mkdir "$_reaping" 2>/dev/null; then
+      return 1   # another reclaimer owns the recovery → back off (no double-win).
+    fi
+  fi
+  # Re-check UNDER the sentinel: if the lock turned fresh while we waited for the
+  # sentinel, an earlier reclaimer already took over (and released the sentinel) —
+  # backing off here stops us clobbering its brand-new lock (the late-loser race).
+  if [ "$(_gate_lock_hb_age)" -lt "$GATE_LOCK_MAX_AGE" ]; then
+    rmdir "$_reaping" 2>/dev/null || true
+    return 1
+  fi
+  # Sole reclaimer, stale confirmed. Overwrite the dead heartbeat with ours in
+  # place (dir stays put throughout). Verify the write (ga-T1 #6); release the
+  # sentinel on EVERY exit path so it can never wedge.
+  _gate_lock_write_hb
+  if [ ! -s "$GATE_LOCK_HB" ]; then
+    rmdir "$_reaping" 2>/dev/null || true
+    return 1
+  fi
+  rmdir "$_reaping" 2>/dev/null || true
+  log "Recovered STALE gate lock (heartbeat age ${_age}s ≥ ${GATE_LOCK_MAX_AGE}s) — taking over (ga-7s0or pattern)."
+  return 0
+}
+
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
 # above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
 # GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
@@ -758,6 +904,26 @@ supersede_sibling_runs() {
     fi
   done
 }
+
+# ── Single-instance guard: collapse overlapping launchd sweeps to one ─────────
+# Acquire BEFORE the bd-heavy preamble (ambient-CPU snapshot, Step 0a TTL
+# recovery, Step 0a-2 orphan-reviewer reap, headroom probe, and the marker
+# scans) so a second concurrent sweep yields HERE instead of doubling the Dolt
+# load right when reviewers are booting. The EXIT trap releases only OUR OWN lock
+# (token match); it covers every early-exit path in the preamble window. At Step 7
+# this trap is replaced by `trap cleanup_reviewer_sessions EXIT` — that helper is
+# extended to ALSO call _release_gate_lock, so a full run frees the lock the
+# instant it completes. If neither fires (SIGKILL/OOM), the stale-heartbeat
+# recovery above reclaims it — the anti-wedge guarantee.
+if [ "$GATE_LOCK_ENABLED" = "1" ]; then
+  if _acquire_gate_lock; then
+    trap '_release_gate_lock' EXIT
+  else
+    _gate_holder_pid=$(head -n1 "$GATE_LOCK_HB" 2>/dev/null | cut -d: -f1 || true)
+    log "Live gate sweep already running (pid=${_gate_holder_pid:-?}) — yielding (single-instance guard)."
+    exit 0
+  fi
+fi
 
 echo ""
 log "=== Dispatcher sweep start (DRY_RUN=${DRY_RUN}) ==="
@@ -1849,6 +2015,11 @@ cleanup_reviewer_sessions() {
     done
     log "Reviewer sessions closed (cleanup): ${SESSION_IDS[*]}"
   fi
+  # This EXIT trap REPLACES the early '_release_gate_lock' trap installed at sweep
+  # start, so release the single-instance lock from here too — otherwise the lock
+  # would leak until GATE_LOCK_MAX_AGE on every run that reaches Step 7. Token-
+  # guarded + idempotent → a no-op when GATE_LOCK_ENABLED=0 or we don't own it.
+  _release_gate_lock 2>/dev/null || true
 }
 trap cleanup_reviewer_sessions EXIT
 trap 'exit 143' TERM
@@ -2092,6 +2263,14 @@ if [ "$_sa_prev" -gt 0 ]; then
 fi
 rm -f "$SPAWN_ABORT_COUNT_FILE" "$SPAWN_ABORT_ALERT_FILE" 2>/dev/null || true
 
+# ── ga-T1 #1: refresh the single-instance heartbeat before the long ACK + verdict
+# windows. The hb is written once at acquire; the bd-heavy preamble + the ACK loop
+# (up to ~ACK_MAX_RETRIES*ACK_WAIT_SECS ≈ 80s) can run a sizeable fraction of
+# MAX_AGE before the verdict poll even starts. Stamp it fresh here so a LIVE sweep
+# is never mistaken for stale during this stretch. No-ops cleanly when the lock is
+# disabled or its dir is absent (token-guarded write, 2>/dev/null).
+if [ "$GATE_LOCK_ENABLED" = "1" ]; then _gate_lock_write_hb; fi
+
 # ── Step 7b: ACK verification — confirm reviewers actually consumed their task ──
 # ga-noxbv reliability fix. `queue` delivery (above) lets the runtime deliver when
 # a session is input-ready, but a session that spawned-then-wedged would still
@@ -2171,6 +2350,14 @@ while true; do
   NOW_EPOCH=$(date +%s)
   ELAPSED=$((NOW_EPOCH - WAIT_START))
   POLL_QUOTA_CHECKED=0   # ga-x3nmz: re-arm the per-poll quota memo each iteration
+  # ── ga-T1 #1 (ship-blocker): refresh the single-instance heartbeat every poll.
+  # The verdict wait can legitimately run to VERDICT_TIMEOUT (~22m) + ACK/preamble,
+  # and a 1846s real sweep has been observed > MAX_AGE (1800s). Without a refresh
+  # the hb mtime ages past MAX_AGE mid-sweep and a second launchd fire FALSE-
+  # RECLAIMS the lock → two concurrent sweeps. Stamping it at the TOP of every
+  # poll iteration keeps a LIVE holder fresh for the whole wait, so MAX_AGE only
+  # ever reclaims a TRULY dead holder (the refresh stops the instant we die).
+  if [ "$GATE_LOCK_ENABLED" = "1" ]; then _gate_lock_write_hb; fi
 
   if [ "$ELAPSED" -gt "$VERDICT_TIMEOUT_SECS" ]; then
     # ── ga-x3nmz: a timeout that coincides with an EXHAUSTED Claude 5h quota is a
