@@ -131,6 +131,29 @@ echo "Scenario 4b: post-escalate state → skip forever (escalated wins over bou
   && ok "unrefined+escalated (escalated survives) → skip (not re-classified fresh)" \
   || bad "unrefined+escalated → expected skip"
 
+# ── Scenario 4c: RAW ingestion never re-captures an ESCALATED story (bug ga-it11w)
+# Terminal-escalate strips ALL story:* labels, so an escalated story is left with
+# only auto-refino:escalated and NO story:* — which makes it look RAW (no lifecycle
+# label) to the 4th candidate source. Without the escalated guard it was re-ingested
+# with story:unrefined every sweep → infinite loop (regression: ga-m9gt3, attempts
+# 1/2/3 then re-ingest). is_ingestable_raw MUST disqualify it. (The RAW jq query
+# drops it too — drift-guard 0c below.)
+EX="scraper build infra config deploy migration pipeline"
+echo "Scenario 4c: RAW ingestion excludes escalated stories (bug ga-it11w)"
+# The exact ga-m9gt3 shape: feature, no story:* label, only auto-refino:escalated.
+[ "$(auto_refino_is_ingestable_raw "ga-m9gt3" "feature" "auto-refino:escalated" "false" "$EX")" = "no" ] \
+  && ok "escalated story (only auto-refino:escalated, no story:*) → no (NOT re-ingested)" \
+  || bad "escalated RAW story → expected no (re-ingestion loop ga-it11w would re-form)"
+# escalated alongside an incidental product label is still terminal.
+[ "$(auto_refino_is_ingestable_raw "ga-m9gt3" "feature" "auto-refino:escalated,frontend" "false" "$EX")" = "no" ] \
+  && ok "escalated + product label → no (escalated wins)" \
+  || bad "escalated+product → expected no"
+# A genuine RAW Triagem story (no story:*, no escalated) is STILL ingestable —
+# the guard must not over-reject and starve the funnel.
+[ "$(auto_refino_is_ingestable_raw "ga-fresh1" "feature" "frontend" "false" "$EX")" = "yes" ] \
+  && ok "genuine raw story (no story:*, no escalated) → yes (funnel not starved)" \
+  || bad "genuine raw story → expected yes"
+
 # ── Scenario 5: attempt cap terminates a daemon↔gate ping-pong ────────────────
 echo "Scenario 5: REFINED beyond the attempt budget → escalate (loop terminates)"
 D=$(auto_refino_handoff_decision "REFINED" 4 3)
@@ -218,6 +241,19 @@ if grep -qF 'auto_refino_is_product_story "$c_labels"' "$DISPATCHER" \
   ok "candidate selection excludes build/scraper/non-product beads (bug 3)"
 else
   bad "candidate selection does not filter out build/non-product beads"
+fi
+
+# 0d. BUG ga-it11w: the RAW Triagem source (4th candidate source) MUST drop
+#     already-escalated stories in its jq filter, AND the is_ingestable_raw
+#     classifier MUST disqualify them. Terminal-escalate strips all story:*
+#     labels, so an escalated story looks RAW — both layers must exclude it or it
+#     re-ingests forever (ga-m9gt3). Defense in depth: query drops + classifier
+#     disqualifies (mirrors guards 0b/0c).
+if grep -qF 'any(. == "auto-refino:escalated")) | not' "$DISPATCHER" \
+   && grep -qF '*,auto-refino:escalated,*) echo "no"' "$DISPATCHER"; then
+  ok "RAW ingestion drops escalated stories — jq query AND is_ingestable_raw (bug ga-it11w)"
+else
+  bad "RAW ingestion does not exclude escalated stories — re-ingestion loop ga-it11w can re-form"
 fi
 
 # 0d. ESCALATE-LOOP RE-FIX: the escalate path must be TERMINAL — it removes the
