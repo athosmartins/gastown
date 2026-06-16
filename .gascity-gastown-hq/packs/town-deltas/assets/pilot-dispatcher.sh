@@ -829,6 +829,32 @@ _session_is_live() {
   printf '%s\n' "$_LIVE_SESSION_IDS" | grep -Fxq -- "$1"
 }
 
+# _beadid_live_crew_owner <bead_id> [db] (ga-9yb5s) — echo the live, named-crew
+# owner recorded on this bead and return 0; else return 1. A "named crew owner"
+# is a non-empty assignee ON THE BEAD ITSELF that is NOT a dog-pool builder and
+# whose session is live in the once-per-sweep roster. This is the reclaim-side
+# twin of the ga-htjni dispatch guard's signal (b): a crew claims the STORY bead
+# directly, whereas dogs/polecats claim the SLING task (tracked by the separate
+# pilot.sling_bead live-worker guards). A crew builder is therefore INVISIBLE to
+# the sling-assignee guards, so an active crew-built story reads "no live worker"
+# and gets falsely reclaimed → re-dispatched → two builders on one story. This
+# helper restores parity so the reclaim guards see a live crew as a live builder.
+# FAIL-OPEN: an untrustworthy roster (_DEADWORKER_OK!=1), an empty/unreadable
+# assignee, a dog-pool assignee, or a dead session → return 1 (assert NO owner),
+# so a genuine orphan is never pinned and the existing recovery paths still fire.
+_beadid_live_crew_owner() {
+  local _bid="${1:-}" _db="${2:-$GC_CITY}" _asg
+  [ -n "$_bid" ] || return 1
+  [ "${_DEADWORKER_OK:-0}" = "1" ] || return 1
+  _asg=$(bd -C "$_db" show "$_bid" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
+  { [ -z "$_asg" ] || [ "$_asg" = "null" ]; } && return 1
+  case "$_asg" in gastown.dog|gastown.dog-*) return 1 ;; esac
+  _session_is_live "$_asg" || return 1
+  printf '%s' "$_asg"
+  return 0
+}
+
 # _target_session_state <identity> (gt-4st3n) — classify a crew identity's
 # existing session from the once-per-sweep `_SESSIONS_JSON` roster, so the
 # dispatcher can REUSE it instead of spawning a duplicate. Prints one line:
@@ -1069,7 +1095,7 @@ _neverstarted_recover_db() {
   [ "${_count:-0}" -le "0" ] 2>/dev/null && return 0
 
   echo "$_json" | jq -c '.[]' | while IFS= read -r _bead; do
-    local _bid _labels _stamp _age _sling _asg
+    local _bid _labels _stamp _age _sling _asg _crew_owner
     _bid=$(echo "$_bead" | jq -r '.id // ""' 2>/dev/null || echo "")
     [ -z "$_bid" ] && continue
     _labels=$(echo "$_bead" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
@@ -1102,6 +1128,16 @@ _neverstarted_recover_db() {
         continue   # worker alive → not never-started.
       fi
     fi
+
+    # live-crew-owner guard (ga-9yb5s) — a crew claims the STORY bead directly, so
+    # it is invisible to the sling-assignee guard above. If the bead's own current
+    # assignee is a live named crew, an active crew builder owns it → KEEP (parity
+    # with the ga-htjni dispatch guard). FAIL-OPEN: untrustworthy roster / no owner
+    # / dead session → no keep, so genuine orphans still recover.
+    _crew_owner=$(_beadid_live_crew_owner "$_bid" "$_db") && {
+      warn "NEVERSTARTED: $_bid is owned by live crew '$_crew_owner' (story.assignee) — active crew builder, refusing to release (ga-9yb5s parity with ga-htjni)."
+      continue
+    }
 
     # branch guard — a surviving crew branch means real work landed. KEEP.
     if _beadid_has_branch "$_bid"; then
