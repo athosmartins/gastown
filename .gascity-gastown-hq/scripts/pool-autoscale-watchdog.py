@@ -34,7 +34,7 @@ import time
 
 MANAGED_POOLS = ["gastown.dog"]   # session template names, NOT config short names
 
-POLL_SEC = 60
+POLL_SEC = 120
 SCALE_UP_AFTER = 180    # demand must persist >= 3min before waking a member
 SCALE_DOWN_AFTER = 300  # demand must be 0 for >= 5min before unpinning
 

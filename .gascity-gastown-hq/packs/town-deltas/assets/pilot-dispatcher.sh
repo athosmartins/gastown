@@ -2,13 +2,22 @@
 # pilot-dispatcher.sh — Autonomous Pilot Dispatcher ("Pilot" / "P").
 #
 # Runs every ~300s via launchd (com.gascity.pilot.plist).
-# PRIORITY DIRECTIVE: "Só depois do sistema perfeito é que a gente faz novas features."
-#   Tier 1 (always first): open BUG beads (type:bug) + tech-debt-labeled beads NOT
-#     already in-flight/done/assigned. Dispatched as fix tasks to the builder.
-#   Tier 2 (only when Tier 1 is EMPTY): story:approved feature stories.
-# Picks highest priority within the active tier (P0>P1>P2..., tie-break oldest),
-# atomically claims it, dispatches a builder session via gc sling, then transitions
-# the bead to story:in-flight.
+# PRIORITY DIRECTIVE (wa-tm2a): PRIORITY DOMINATES; type is only a tiebreak.
+#   The dispatcher pulls from ONE merged candidate pool — open BUG beads
+#   (type:bug) + tech-debt-labeled beads + story:approved feature stories — none
+#   already in-flight/done/assigned. The pool is ordered strictly by:
+#       priority (0-4 asc; missing = 99 = last)
+#         > type rank (bug → tech-debt → task → chore → feature/story)
+#           > created_at (oldest first)
+#             > id (final deterministic tiebreak).
+#   So a P0 story is dispatched BEFORE a P3 bug (reversal of the old hard
+#   bugs-before-stories tiering), and within the same priority a bug still beats
+#   a story. epic beads NEVER dispatch (excluded by the epic-type filter). Each
+#   bead is dispatched with the prompt/sling template matching ITS OWN type
+#   (bug/tech-debt → "fix bug …"; feature/story → "build story …").
+# Picks highest-ranked candidate (per the key above), atomically claims it,
+# dispatches a builder session via gc sling, then transitions the bead to
+# story:in-flight.
 #
 # TWO-LANE DISPATCH (anti-deadlock):
 #   SMALL/fast lane (MAX_SMALL, default 5): small items — merge fast, high concurrency.
@@ -24,7 +33,7 @@
 #   ESCALATION: a worker may relabel lane:small → lane:big mid-flight to correct
 #   accounting; Pilot re-counts each sweep from actual bead labels.
 #
-# Bugs-first tiering is preserved WITHIN each lane.
+# Priority-first ordering (wa-tm2a) is preserved WITHIN each lane.
 #
 # This is the FRONT HALF of the autonomous delivery loop:
 #
@@ -128,6 +137,39 @@ PILOT_DOLT_CPU_OVERRIDE="${PILOT_DOLT_CPU_OVERRIDE:-}"
 # "2" = limited, anything else = ok. Never set in prod.
 PILOT_QUOTA_OVERRIDE="${PILOT_QUOTA_OVERRIDE:-}"
 PILOT_QUOTA_ETA_OVERRIDE="${PILOT_QUOTA_ETA_OVERRIDE:-}"
+
+# ── Cross-stage priority — most-advanced-first / WIP-limit (ga-d0hz3) ──────────
+# The 4 stage dispatchers (auto-refino / refino-gate / quality-gate / pilot) are
+# INDEPENDENT launchd timers with no cross-stage coordination, so the system pulls
+# NEW work into the front (Pilot dispatches new builds) while the back congests
+# (Gate reviews pile up). The stages don't share a worker pool, but they DO share
+# Dolt + the Claude quota + the human's attention. Athos's order is
+# most-advanced-first: review in the Gate (1) > pull ready→Gate (2) > approved→
+# execution / Pilot (3, LOWEST). So the Pilot — the lowest stage — must YIELD to a
+# congested higher stage ONLY UNDER GENUINE RESOURCE CONTENTION, and otherwise run
+# freely (parallel is fine; the pools are different — pointless serialization is a
+# bug, not a feature).
+#
+# Concretely, BEFORE the Pilot dispatches a NEW build it DEFERS this sweep (exit
+# cleanly, dispatch nothing, mutate no marker — mirrors the quota PAUSE pattern)
+# IFF:
+#     (gate is CONGESTED: gate-status:queued markers > 0 OR gate-runs in review > 0)
+#   AND
+#     (resources are CONTENDED: Claude quota limited OR Dolt hot)
+# Resources ABUNDANT (quota OK AND Dolt calm) → never defer (dispatch even with a
+# busy gate). Gate empty → never defer. This conditionality is the anti-starvation
+# guarantee: the moment Dolt calms or the quota frees, the Pilot dispatches again,
+# so it can never be starved indefinitely.
+#
+# Gated behind CROSS_STAGE_PRIORITY_ENABLED (default 1; =0 → EXACT current
+# behavior, the gate never even probes). FAIL-OPEN: any error / indeterminate
+# congestion read → PROCEED (dispatch) — this check must never wedge the Pilot.
+#
+# PILOT_GATE_CONGESTED_OVERRIDE is a TEST-ONLY seam (mirrors PILOT_QUOTA_OVERRIDE /
+# PILOT_DOLT_CPU_OVERRIDE): "1" = gate congested, "0" = gate empty, "" = probe the
+# real bead store. Never set in prod.
+CROSS_STAGE_PRIORITY_ENABLED="${CROSS_STAGE_PRIORITY_ENABLED:-1}"
+PILOT_GATE_CONGESTED_OVERRIDE="${PILOT_GATE_CONGESTED_OVERRIDE:-}"
 
 # ── Stale in-flight slot correction (ga-rk5va adversarial constraint c) ────────
 # A story:in-flight bead normally occupies a builder slot. But a session can hang
@@ -674,6 +716,38 @@ _dolt_saturated() {
   return 1
 }
 
+# ── ga-d0hz3: cross-stage gate-congestion probe ───────────────────────────────
+# _pilot_gate_congested → "1" iff the quality gate currently has work backed up,
+# else "0". "Congested" = at least one gate-status:queued marker (work waiting to
+# be reviewed) OR at least one gate-run in review (gate-status:running). Mirrors
+# exactly the two queries the quality-gate-dispatcher itself uses, so the signal is
+# the gate's own bookkeeping — not a heuristic.
+#
+# CRITICAL — FAIL-OPEN ("0"): this probe gates the LOWEST stage's dispatch. If
+# either query errors, returns non-JSON, or is otherwise indeterminate, we report
+# "0" (NOT congested) → the caller PROCEEDS to dispatch. An unreadable gate must
+# never be allowed to wedge the Pilot. Honors the PILOT_GATE_CONGESTED_OVERRIDE
+# test seam ("1"/"0"). No mutation; both queries are bounded by `timeout`.
+_pilot_gate_congested() {
+  if [ -n "$PILOT_GATE_CONGESTED_OVERRIDE" ]; then
+    [ "$PILOT_GATE_CONGESTED_OVERRIDE" = "1" ] && { printf '1'; return 0; }
+    printf '0'; return 0
+  fi
+  local _q _r _n
+  # Queued markers — work waiting at the gate (set by quality-gate-guard.sh).
+  _q=$(GC_CITY="$GC_CITY" timeout 15 bd -C "$GC_CITY" list --json --all \
+        -l type:quality-gate-marker -l gate-status:queued 2>/dev/null || echo "")
+  _n=$(printf '%s' "$_q" | jq 'length' 2>/dev/null || echo "")
+  if [ -n "$_n" ] && [ "$_n" -gt 0 ] 2>/dev/null; then printf '1'; return 0; fi
+  # Runs in review — reviews currently in progress (gate-status:running).
+  _r=$(GC_CITY="$GC_CITY" timeout 15 bd -C "$GC_CITY" list --json --all \
+        -l type:quality-gate-run -l gate-status:running 2>/dev/null || echo "")
+  _n=$(printf '%s' "$_r" | jq 'length' 2>/dev/null || echo "")
+  if [ -n "$_n" ] && [ "$_n" -gt 0 ] 2>/dev/null; then printf '1'; return 0; fi
+  # No queued markers, no running runs, or indeterminate → not congested / fail-open.
+  printf '0'; return 0
+}
+
 _dolt_probe
 if _dolt_saturated; then
   PILOT_DOLT_SATURATED_AT_START=1
@@ -696,6 +770,48 @@ if [ "$(_pilot_quota_limited)" = "1" ]; then
   notify -t "⏸️ Pilot pausado: cota 5h" -p 3 "Pilot pausado — cota 5h do Claude esgotada; nenhum builder despachado, retoma quando resetar${_q_eta:+ ($_q_eta)} (ga-x3nmz)." 2>/dev/null || true
   log "=== Pilot sweep complete: dispatched=0 (paused: cota 5h limitada${_q_eta:+, $_q_eta}) ==="
   exit 0
+fi
+
+# ── ga-d0hz3: CROSS-STAGE admission gate — most-advanced-first / WIP-limit ─────
+# The Pilot is the LOWEST stage (approved→execution). It must YIELD to a congested
+# higher stage (the Gate) ONLY under genuine resource contention; otherwise it runs
+# freely (parallel — the pools differ). DEFER this sweep (dispatch nothing, mutate
+# no marker — identical shape to the quota PAUSE above) IFF:
+#       gate is CONGESTED  (queued markers > 0 OR runs in review > 0)
+#   AND resources CONTENDED (Claude quota limited OR Dolt hot)
+#
+# Note on the quota arm: the quota PAUSE above already exited the sweep when the
+# 5h window is exhausted, so reaching HERE means quota is OK. The resource-contended
+# term therefore resolves through the Dolt signal in practice; the quota term is
+# kept in the predicate for correctness/defensiveness (so reordering the gates can
+# never silently drop it). PILOT_DOLT_SATURATED_AT_START was computed at sweep
+# start (latency OR cpu over ceiling, fail-safe-saturated when the probe is blind).
+#
+# Anti-starvation: the defer is CONDITIONAL on (gate-has-work AND resource-tight).
+# It NEVER fires when resources are abundant, so the moment Dolt calms (or the
+# quota frees) the Pilot dispatches — it can never be starved indefinitely. Gate
+# empty → never defer. FAIL-OPEN: _pilot_gate_congested returns "0" on any error.
+# Gated behind CROSS_STAGE_PRIORITY_ENABLED (=0 → this whole block is skipped =
+# exact pre-ga-d0hz3 behavior).
+if [ "$CROSS_STAGE_PRIORITY_ENABLED" = "1" ]; then
+  _xstage_quota_limited="$(_pilot_quota_limited)"          # "1"/"0" (fail-open "0")
+  _xstage_dolt_hot="${PILOT_DOLT_SATURATED_AT_START:-0}"   # "1"/"0" (fail-safe "1")
+  _xstage_resource_tight=0
+  { [ "$_xstage_quota_limited" = "1" ] || [ "$_xstage_dolt_hot" = "1" ]; } \
+    && _xstage_resource_tight=1
+  # Only pay for the gate-congestion bead query when resources are actually tight —
+  # when resources are abundant we dispatch regardless, so the probe is pointless
+  # load on a calm Dolt. (Cheap-path: skip two bd round-trips on the common case.)
+  if [ "$_xstage_resource_tight" = "1" ]; then
+    _xstage_gate_congested="$(_pilot_gate_congested)"      # "1"/"0" (fail-open "0")
+    if [ "$_xstage_gate_congested" = "1" ]; then
+      warn "Cross-stage YIELD (ga-d0hz3): Gate is CONGESTED and resources are CONTENDED (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot}) — DEFERRING new builds this sweep so the more-advanced Gate stage can drain first. Approved stories stay queued; auto-resumes when Dolt calms / quota frees. Most-advanced-first."
+      notify -t "⏸️ Pilot cede ao Gate" -p 2 "Pilot adiou despachar builds novos — Gate congestionado + recurso contido (dolt_hot=${_xstage_dolt_hot}, quota_limited=${_xstage_quota_limited}). Retoma quando o recurso aliviar (ga-d0hz3)." 2>/dev/null || true
+      log "=== Pilot sweep complete: dispatched=0 (deferred: cross-stage gate-congested + resource-contended, ga-d0hz3) ==="
+      exit 0
+    fi
+    log "Cross-stage check (ga-d0hz3): resources contended (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot}) but Gate NOT congested — dispatching normally."
+  fi
 fi
 
 # ── Step 0: TTL recovery — release stale pilot:dispatching claims (ga-2azzj) ───
@@ -827,6 +943,32 @@ echo "$_SESSIONS_JSON" | jq -e '.sessions | type=="array"' >/dev/null 2>&1 || _D
 _session_is_live() {
   [ -n "${1:-}" ] || return 1
   printf '%s\n' "$_LIVE_SESSION_IDS" | grep -Fxq -- "$1"
+}
+
+# _beadid_live_crew_owner <bead_id> [db] (ga-9yb5s) — echo the live, named-crew
+# owner recorded on this bead and return 0; else return 1. A "named crew owner"
+# is a non-empty assignee ON THE BEAD ITSELF that is NOT a dog-pool builder and
+# whose session is live in the once-per-sweep roster. This is the reclaim-side
+# twin of the ga-htjni dispatch guard's signal (b): a crew claims the STORY bead
+# directly, whereas dogs/polecats claim the SLING task (tracked by the separate
+# pilot.sling_bead live-worker guards). A crew builder is therefore INVISIBLE to
+# the sling-assignee guards, so an active crew-built story reads "no live worker"
+# and gets falsely reclaimed → re-dispatched → two builders on one story. This
+# helper restores parity so the reclaim guards see a live crew as a live builder.
+# FAIL-OPEN: an untrustworthy roster (_DEADWORKER_OK!=1), an empty/unreadable
+# assignee, a dog-pool assignee, or a dead session → return 1 (assert NO owner),
+# so a genuine orphan is never pinned and the existing recovery paths still fire.
+_beadid_live_crew_owner() {
+  local _bid="${1:-}" _db="${2:-$GC_CITY}" _asg
+  [ -n "$_bid" ] || return 1
+  [ "${_DEADWORKER_OK:-0}" = "1" ] || return 1
+  _asg=$(bd -C "$_db" show "$_bid" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
+  { [ -z "$_asg" ] || [ "$_asg" = "null" ]; } && return 1
+  case "$_asg" in gastown.dog|gastown.dog-*) return 1 ;; esac
+  _session_is_live "$_asg" || return 1
+  printf '%s' "$_asg"
+  return 0
 }
 
 # _target_session_state <identity> (gt-4st3n) — classify a crew identity's
@@ -1069,7 +1211,7 @@ _neverstarted_recover_db() {
   [ "${_count:-0}" -le "0" ] 2>/dev/null && return 0
 
   echo "$_json" | jq -c '.[]' | while IFS= read -r _bead; do
-    local _bid _labels _stamp _age _sling _asg
+    local _bid _labels _stamp _age _sling _asg _crew_owner
     _bid=$(echo "$_bead" | jq -r '.id // ""' 2>/dev/null || echo "")
     [ -z "$_bid" ] && continue
     _labels=$(echo "$_bead" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
@@ -1102,6 +1244,16 @@ _neverstarted_recover_db() {
         continue   # worker alive → not never-started.
       fi
     fi
+
+    # live-crew-owner guard (ga-9yb5s) — a crew claims the STORY bead directly, so
+    # it is invisible to the sling-assignee guard above. If the bead's own current
+    # assignee is a live named crew, an active crew builder owns it → KEEP (parity
+    # with the ga-htjni dispatch guard). FAIL-OPEN: untrustworthy roster / no owner
+    # / dead session → no keep, so genuine orphans still recover.
+    _crew_owner=$(_beadid_live_crew_owner "$_bid" "$_db") && {
+      warn "NEVERSTARTED: $_bid is owned by live crew '$_crew_owner' (story.assignee) — active crew builder, refusing to release (ga-9yb5s parity with ga-htjni)."
+      continue
+    }
 
     # branch guard — a surviving crew branch means real work landed. KEEP.
     if _beadid_has_branch "$_bid"; then
@@ -1471,57 +1623,69 @@ TIER1_JSON=$(echo "$TIER1_JSON" | _filter_unblocked "$GC_CITY")
 TIER1_JSON=$(echo "$TIER1_JSON" | _filter_explicit_deps "$GC_CITY")
 
 TIER1_COUNT=$(echo "$TIER1_JSON" | jq 'length' 2>/dev/null || echo "0")
-log "Tier 1 (bugs + tech-debt): $TIER1_COUNT open candidate(s) in HQ DB"
+log "Bugs + tech-debt: $TIER1_COUNT open candidate(s) in HQ DB"
 
 ALL_CANDIDATES_JSON="[]"
+# ALL_CANDIDATES_TIER is retained ONLY as a hint for downstream log lines; the
+# actual per-bead dispatch template is derived from each bead's own type (see
+# _bead_tier / the dispatch loop). With a merged pool the sweep is no longer a
+# single homogeneous tier, so this is informational only ("mixed" when both
+# types are present).
 ALL_CANDIDATES_TIER=""
 
-if [ "$TIER1_COUNT" -gt "0" ]; then
-  ALL_CANDIDATES_JSON="$TIER1_JSON"
-  ALL_CANDIDATES_TIER="bug"
-  log "Tier 1 has candidates — dispatching bugs/debt FIRST (features suppressed)."
-fi
-
-# ── Step 2b: Tier 2 — story:approved feature stories (only if Tier 1 empty) ──
+# ── Step 2b: story:approved feature stories — ALWAYS queried (wa-tm2a) ────────
 # Dispatchable = story:approved AND NOT story:in-flight AND NOT story:done
 #                AND NOT gate:passed (merged, delivery in progress — ga-3h8l)
 #                AND NOT pilot:dispatching (claim in progress)
+#
+# wa-tm2a: stories are NO LONGER suppressed while bugs exist. Bugs/tech-debt and
+# stories are merged into ONE pool and ordered by priority>type>created_at>id, so
+# a P0 story outranks a P3 bug while a same-priority bug still beats a story.
+TIER2_JSON=$(bd -C "$GC_CITY" list --json \
+  -l "story:approved" \
+  --exclude-label "story:in-flight" \
+  --exclude-label "story:done" \
+  --exclude-label "gate:passed" \
+  --exclude-label "pilot:dispatching" \
+  --exclude-label "gate:needs-human" \
+  --exclude-label "needs:engine-window" \
+  --exclude-label "pilot:dispatched" \
+  --exclude-type epic \
+  -n 0 \
+  2>/dev/null || echo "[]")
+TIER2_JSON=$(echo "$TIER2_JSON" | _filter_candidates)
+# Drop features blocked by unresolved deps (ga-5ew) or an open explicit dep (ga-do8jj).
+TIER2_JSON=$(echo "$TIER2_JSON" | _filter_unblocked "$GC_CITY")
+TIER2_JSON=$(echo "$TIER2_JSON" | _filter_explicit_deps "$GC_CITY")
 
-if [ "$TIER1_COUNT" -eq "0" ]; then
-  log "Tier 1 empty — falling back to Tier 2 (story:approved features) ..."
+TIER2_COUNT=$(echo "$TIER2_JSON" | jq 'length' 2>/dev/null || echo "0")
+log "Story:approved features: $TIER2_COUNT candidate(s) in HQ DB"
 
-  TIER2_JSON=$(bd -C "$GC_CITY" list --json \
-    -l "story:approved" \
-    --exclude-label "story:in-flight" \
-    --exclude-label "story:done" \
-    --exclude-label "gate:passed" \
-    --exclude-label "pilot:dispatching" \
-    --exclude-label "gate:needs-human" \
-    --exclude-label "needs:engine-window" \
-    --exclude-label "pilot:dispatched" \
-    --exclude-type epic \
-    -n 0 \
-    2>/dev/null || echo "[]")
-  TIER2_JSON=$(echo "$TIER2_JSON" | _filter_candidates)
-  # Drop features blocked by unresolved deps (ga-5ew) or an open explicit dep (ga-do8jj).
-  TIER2_JSON=$(echo "$TIER2_JSON" | _filter_unblocked "$GC_CITY")
-  TIER2_JSON=$(echo "$TIER2_JSON" | _filter_explicit_deps "$GC_CITY")
-
-  TIER2_COUNT=$(echo "$TIER2_JSON" | jq 'length' 2>/dev/null || echo "0")
-  log "Tier 2 (story:approved features): $TIER2_COUNT candidate(s) in HQ DB"
-
-  if [ "$TIER2_COUNT" -gt "0" ]; then
-    ALL_CANDIDATES_JSON="$TIER2_JSON"
+# Merge both pools into ONE candidate stream (wa-tm2a). dedup by id keeps a bead
+# that somehow matched both queries from being double-counted. The merge is the
+# UNION — eligibility prefilters were applied identically to each pool above, so
+# concatenation preserves them; only the ordering (Step 3, _top_candidate) now
+# decides who goes first.
+ALL_CANDIDATES_JSON=$(echo "$TIER1_JSON $TIER2_JSON" \
+  | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
+HQ_MERGED_COUNT=$(echo "$ALL_CANDIDATES_JSON" | jq 'length' 2>/dev/null || echo "0")
+if [ "$HQ_MERGED_COUNT" -gt "0" ]; then
+  if [ "$TIER1_COUNT" -gt "0" ] && [ "$TIER2_COUNT" -gt "0" ]; then
+    ALL_CANDIDATES_TIER="mixed"
+  elif [ "$TIER1_COUNT" -gt "0" ]; then
+    ALL_CANDIDATES_TIER="bug"
+  else
     ALL_CANDIDATES_TIER="feature"
   fi
+  log "Merged candidate pool: $HQ_MERGED_COUNT (bugs/debt + stories, priority-ordered)."
 fi
 
 # ── Step 2c: Fallback — scan rig DBs if HQ returned nothing ──────────────────
 # Per convention all story beads live in HQ, but check rig DBs as a fallback.
-# Only reached when BOTH tiers returned empty from HQ.
+# Only reached when the merged HQ pool is empty.
 
 if [ -z "$ALL_CANDIDATES_TIER" ]; then
-  log "HQ returned no candidates (both tiers) — scanning rig DBs as fallback ..."
+  log "HQ returned no candidates (bugs/debt + stories) — scanning rig DBs as fallback ..."
   RIG_PATHS=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
     | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
 
@@ -1576,14 +1740,21 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
   RIG_TIER1_COUNT=$(echo "$ALL_RIG_TIER1" | jq 'length' 2>/dev/null || echo "0")
   RIG_TIER2_COUNT=$(echo "$ALL_RIG_TIER2" | jq 'length' 2>/dev/null || echo "0")
 
-  if [ "$RIG_TIER1_COUNT" -gt "0" ]; then
-    log "Rig DBs: $RIG_TIER1_COUNT Tier 1 (bug/tech-debt) candidate(s) — using Tier 1."
-    ALL_CANDIDATES_JSON="$ALL_RIG_TIER1"
-    ALL_CANDIDATES_TIER="bug"
-  elif [ "$RIG_TIER2_COUNT" -gt "0" ]; then
-    log "Rig DBs: $RIG_TIER2_COUNT Tier 2 (feature) candidate(s) — using Tier 2."
-    ALL_CANDIDATES_JSON="$ALL_RIG_TIER2"
-    ALL_CANDIDATES_TIER="feature"
+  # wa-tm2a: merge rig bugs/debt + features into ONE pool, same as HQ. Ordering
+  # (priority>type>created_at>id) — not tier — decides who dispatches first.
+  RIG_MERGED_JSON=$(echo "$ALL_RIG_TIER1 $ALL_RIG_TIER2" \
+    | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
+  RIG_MERGED_COUNT=$(echo "$RIG_MERGED_JSON" | jq 'length' 2>/dev/null || echo "0")
+  if [ "$RIG_MERGED_COUNT" -gt "0" ]; then
+    ALL_CANDIDATES_JSON="$RIG_MERGED_JSON"
+    if [ "$RIG_TIER1_COUNT" -gt "0" ] && [ "$RIG_TIER2_COUNT" -gt "0" ]; then
+      ALL_CANDIDATES_TIER="mixed"
+    elif [ "$RIG_TIER1_COUNT" -gt "0" ]; then
+      ALL_CANDIDATES_TIER="bug"
+    else
+      ALL_CANDIDATES_TIER="feature"
+    fi
+    log "Rig DBs: $RIG_MERGED_COUNT merged candidate(s) (bug/debt=$RIG_TIER1_COUNT, feature=$RIG_TIER2_COUNT) — priority-ordered."
   fi
 fi
 
@@ -1617,10 +1788,51 @@ SMALL_COUNT=$(echo "$SMALL_CANDIDATES" | jq 'length' 2>/dev/null || echo "0")
 BIG_COUNT=$(echo "$BIG_CANDIDATES" | jq 'length' 2>/dev/null || echo "0")
 log "Candidates split: small=${SMALL_COUNT}  big=${BIG_COUNT}"
 
-# Sort each lane by priority asc, then created_at asc.
+# wa-tm2a: ordering key shared by _top_candidate and _queue_preview.
+# Sort strictly by:  priority (0-4 asc; missing = 99 = last)
+#                      > type rank (bug → tech-debt → task → chore → feature/story)
+#                        > created_at (oldest first)
+#                          > id (final deterministic tiebreak).
+# Type rank derives from the bead's OWN type — issue_type (or legacy .type),
+# overridden to "tech-debt" when the tech-debt LABEL is present (tech-debt beads
+# carry issue_type=task/chore but the tech-debt label, and are queried via -l).
+# epic is excluded upstream (by the epic-type query filter) so it never reaches this sort;
+# an unknown/missing type sorts last among same-priority beads (rank 5).
+#
+# The jq program is a string constant so both call sites stay byte-identical.
+_PILOT_SORT_JQ='
+  def trank:
+    ( (.labels // []) ) as $lbls
+    | if ($lbls | index("tech-debt")) then 1
+      else ( (.issue_type // .type // "") | ascii_downcase ) as $t
+        | if   $t == "bug"      then 0
+          elif $t == "tech-debt" then 1
+          elif $t == "task"     then 2
+          elif $t == "chore"    then 3
+          elif ($t == "feature" or $t == "story") then 4
+          else 5 end
+      end;
+  sort_by([ (.priority // 99), (. | trank), (.created_at // ""), (.id // "") ])
+'
+
+# Sort the pool by the wa-tm2a key and return the single top candidate.
 _top_candidate() {
   local arr="$1"
-  echo "$arr" | jq 'sort_by([(.priority // 99), .created_at]) | .[0]' 2>/dev/null
+  echo "$arr" | jq "$_PILOT_SORT_JQ"' | .[0]' 2>/dev/null
+}
+
+# wa-tm2a: derive the dispatch TIER for a SINGLE bead from its own type, so a
+# merged pool dispatches each bead with the correct prompt/sling template:
+#   "bug"     → bugs and tech-debt ("fix bug …")
+#   "feature" → everything else, incl. story/feature ("build story …")
+# (Mirrors the bug/feature branches in dispatch_one. Replaces the old sweep-level
+# tier which is no longer homogeneous once the pools are merged.)
+_bead_tier() {
+  echo "$1" | jq -r '
+    if ((.labels // []) | index("tech-debt")) then "bug"
+    else ((.issue_type // .type // "") | ascii_downcase) as $t
+      | if ($t == "bug" or $t == "tech-debt") then "bug" else "feature" end
+    end' 2>/dev/null || echo "feature"
 }
 
 SMALL_PICK="null"
@@ -1638,8 +1850,8 @@ log "Lane picks — small: $(echo "$SMALL_PICK" | jq -r '.id // "none"')  big: $
 # every sweep makes the backlog visible — not just the single bead picked now.
 # Read-only formatting of already-gathered candidates. Guarded for pipefail.
 _queue_preview() {
-  echo "$1" | jq -r --arg lane "$2" \
-    'sort_by([(.priority // 99), (.created_at // "")]) | .[:3][]
+  # wa-tm2a: same ordering key as _top_candidate so the preview is the real order.
+  echo "$1" | jq -r --arg lane "$2" "$_PILOT_SORT_JQ"' | .[:3][]
        | "  [\($lane)] \(.id) P\(.priority // "?") — \(.title)"' 2>/dev/null || true
 }
 _QUEUE_LINES=$( { _queue_preview "$SMALL_CANDIDATES" small; _queue_preview "$BIG_CANDIDATES" big; } )
@@ -2402,9 +2614,15 @@ dispatch_lane() {
     # DRY_RUN — which makes zero state changes — still advances through the pool.
     pool=$(echo "$pool" | jq --arg id "$pick_id" '[.[] | select(.id != $id)]' 2>/dev/null || echo "$pool")
 
+    # wa-tm2a: derive the tier from THIS bead's own type (the pool is mixed), so a
+    # story gets the "build story" template and a bug gets "fix bug" — independent
+    # of what else is in the pool this sweep.
+    local pick_tier
+    pick_tier=$(_bead_tier "$pick")
+
     # Only a SUCCESSFUL dispatch consumes a slot; a skip leaves the slot free and
     # simply moves to the next candidate. dispatch_one is the atomic-claim owner.
-    if dispatch_one "$pick" "$lane" "$ALL_CANDIDATES_TIER"; then
+    if dispatch_one "$pick" "$lane" "$pick_tier"; then
       filled=$((filled + 1))
       slots=$((slots - 1))
       DISPATCHED=$((DISPATCHED + 1))

@@ -76,6 +76,53 @@ REFINO_REVIEWER_TEMPLATE="${REFINO_REVIEWER_TEMPLATE:-refino-gate-reviewer}"
 # gate's DISPATCHING_TTL.
 REFINO_REVIEW_TTL_MINUTES="${REFINO_REVIEW_TTL_MINUTES:-40}"
 
+# ── ga-4u16h PORT: mid-wait re-convene of a DRAINED/DEAD reviewer ──────────────
+# PROVEN PROBLEM (Mayor live e2e): the refino-gate spawns the Sonnet reviewer and
+# delivers the rubric, but the reviewer session can DRAIN/die WITHOUT writing its
+# verdict — the verdict bead stays verdict:pending and the session is gone. The
+# ONLY recovery today is REFINO_VERDICT_TIMEOUT_MINUTES (20m) → requeue, so every
+# drained reviewer costs ~20m and repeated drains cost 20×N min.
+#
+# This ports the CODE gate's ga-4u16h fix (quality-gate-dispatcher.sh): while
+# polling for the verdict, if the reviewer SESSION is confirmed DEAD (gone from
+# the session list, or closed) for N consecutive polls past a grace window, and
+# the verdict bead is still pending, RE-SPAWN a fresh reviewer for the SAME story
+# — reusing the still-pending verdict bead and re-delivering the SAME rubric —
+# instead of waiting the full 20m. The 20m timeout stays the OUTER backstop.
+#
+# The pure liveness helpers (session_is_dead, session_peek_reports_dead) and the
+# re-convene decision shape are PORTED from the code gate so the behavior matches
+# the gate's proven model. A genuinely slow-but-alive reviewer (present + asleep)
+# is NEVER re-convened.
+#
+# Master flag: 1 = enabled (default). 0 = EXACT pre-port behavior (no re-convene,
+# no extra session probing — the original poll loop).
+REFINO_RECONVENE_ENABLED="${REFINO_RECONVENE_ENABLED:-1}"
+case "$REFINO_RECONVENE_ENABLED" in ''|*[!0-9]*) REFINO_RECONVENE_ENABLED=1 ;; esac
+
+# Max re-spawns of the reviewer for one story before falling through to the outer
+# timeout. 0 ALSO disables re-convene (= exact current behavior), floor-guarded at
+# 0, ceiling-guarded so a misconfig can't thrash. Mirrors MAX_RESPAWNS_PER_SLOT.
+REFINO_REVIEWER_RECONVENE_MAX="${REFINO_REVIEWER_RECONVENE_MAX:-2}"
+case "$REFINO_REVIEWER_RECONVENE_MAX" in ''|*[!0-9]*) REFINO_REVIEWER_RECONVENE_MAX=2 ;; esac
+if [ "$REFINO_REVIEWER_RECONVENE_MAX" -gt 5 ] 2>/dev/null; then
+  REFINO_REVIEWER_RECONVENE_MAX=5   # never thrash >5 cohorts for one story
+fi
+
+# Grace window (seconds) a freshly-(re)spawned reviewer gets before it may be
+# judged DEAD — covers slow startup/wake so a live-but-slow reviewer is NEVER
+# re-convened. Floor-guarded. (= RECONVENE_GRACE_SECS in the code gate.)
+REFINO_RECONVENE_GRACE_SECS="${REFINO_RECONVENE_GRACE_SECS:-60}"
+case "$REFINO_RECONVENE_GRACE_SECS" in ''|*[!0-9]*) REFINO_RECONVENE_GRACE_SECS=60 ;; esac
+[ "$REFINO_RECONVENE_GRACE_SECS" -lt 20 ] 2>/dev/null && REFINO_RECONVENE_GRACE_SECS=20
+
+# Consecutive polls the reviewer must read DEAD before re-convene fires (defends
+# against a transient/partial `gc session list`). Floor-guarded.
+# (= RECONVENE_DEAD_STREAK_MIN in the code gate.)
+REFINO_RECONVENE_DEAD_STREAK_MIN="${REFINO_RECONVENE_DEAD_STREAK_MIN:-2}"
+case "$REFINO_RECONVENE_DEAD_STREAK_MIN" in ''|*[!0-9]*) REFINO_RECONVENE_DEAD_STREAK_MIN=2 ;; esac
+[ "$REFINO_RECONVENE_DEAD_STREAK_MIN" -lt 1 ] 2>/dev/null && REFINO_RECONVENE_DEAD_STREAK_MIN=1
+
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -140,6 +187,56 @@ refino_resolve_refiner() {
   if [ -n "$assignee" ] && [ "$assignee" != "null" ]; then echo "$assignee"; return 0; fi
   if [ -n "$created_by" ] && [ "$created_by" != "null" ]; then echo "$created_by"; return 0; fi
   echo ""
+}
+
+# ── ga-4u16h PORT: pure reviewer-liveness helpers (unit-tested in lib mode) ────
+# These are PORTED VERBATIM (same logic, same names) from the CODE gate
+# (quality-gate-dispatcher.sh) so the refino-gate's re-convene reuses the gate's
+# PROVEN deadness model rather than reimplementing it. Pure; no I/O.
+
+# session_is_dead <present 0|1> <closed true|false|1|0> → 1 (dead) | 0 (alive)
+# A reviewer session is DEAD iff absent from the session list (present=0) OR
+# explicitly closed. A present, non-closed session (active OR asleep) is ALIVE —
+# `asleep` is the normal state of a reviewer between turns, so it must NEVER read
+# as dead. (Verbatim from the code gate.)
+session_is_dead() {
+  local present="$1" closed="$2"
+  if [ "$present" = "0" ]; then echo 1; return 0; fi
+  case "$closed" in true|TRUE|True|1) echo 1 ;; *) echo 0 ;; esac
+}
+
+# session_peek_reports_dead <peek_stderr_text> → 1 (peek CONFIRMS the session is
+# GONE — drained/ended) | 0 (alive, or inconclusive → never reap). Pure; no I/O.
+# A reviewer that DRAINS (its session ends normally instead of being hard-killed)
+# STAYS in `gc session list` with closed!=true, so session_is_dead reads it ALIVE.
+# `gc session peek` is the discriminator the list lacks: a drained/ended session
+# makes peek print "gc session peek: session not found: <id>" on STDERR, while an
+# asleep-but-ALIVE reviewer's peek SUCCEEDS with real scrollback. Match ONLY that
+# explicit not-found signal — never a live reviewer's scrollback, never a bare
+# transient connection error. (Verbatim from the code gate, ga-h9o17.)
+session_peek_reports_dead() {
+  case "$1" in
+    *"session not found"*) echo 1 ;;
+    *) echo 0 ;;
+  esac
+}
+
+# refino_slot_action <bead_closed 0|1> <session_dead 0|1> <budget_remaining int>
+#   → received | respawn | wait. Pure; no I/O.
+# The single decision for the refino reviewer in one poll iteration (the
+# single-reviewer analogue of the code gate's classify_slot_action):
+#   received → the verdict bead is closed (PASS/FAIL recorded) — the poll loop's
+#              existing logic handles it; NEVER respawn (an explicit FAIL fails
+#              immediately, exactly as today).
+#   respawn  → bead still pending AND reviewer confirmed dead AND budget remains.
+#   wait     → everything else: a live (slow) reviewer, OR a dead reviewer whose
+#              budget is spent (the 20m outer timeout is the ultimate backstop).
+refino_slot_action() {
+  local bead_closed="$1" session_dead="$2" budget="$3"
+  case "$budget" in ''|*[!0-9-]*) budget=0 ;; esac
+  if [ "$bead_closed" = "1" ]; then echo "received"; return 0; fi
+  if [ "$session_dead" = "1" ] && [ "$budget" -gt 0 ] 2>/dev/null; then echo "respawn"; return 0; fi
+  echo "wait"
 }
 
 # If sourced by the selftest, stop here — expose the pure functions only.
@@ -334,7 +431,52 @@ TASK
 # ── Step 5: Spawn the Sonnet reviewer session ─────────────────────────────────
 # A genuinely independent Claude session on the refino-gate-reviewer template
 # (model = Sonnet; provider = claude-headless so it never grabs Remote Control).
+#
+# refino_spawn_reviewer <reason-label> — spawn a reviewer for THIS story, wake it,
+# wire the ga-67hae DURABLE-PULL channel (assign the verdict bead to the new
+# session_name + embed the rubric as a comment), and nudge. Used by BOTH the
+# initial spawn and the ga-4u16h mid-wait re-convene, so the durable-pull wiring
+# is IDENTICAL on every (re)spawn — a fresh re-convened reviewer pulls its task
+# from the bead, not from the transient nudge a stillborn session would miss.
+# Sets SESSION_ID / SESSION_NAME in place; returns 0 on a fresh session, 1 if the
+# spawn itself failed (caller decides whether to abort or fall through to timeout).
+# Reuses $REVIEW_TASK / $VERDICT_BEAD_ID / $STORY_ID / $THIS_ROUND from scope.
+refino_spawn_reviewer() {
+  local _reason="${1:-spawn}"
+  local _title_suffix=""
+  [ "$_reason" = "reconvene" ] && _title_suffix=" (re-convened)"
+  local _spawn_err_file="/tmp/refino-reviewer-spawn-err-$$.${_reason}"
+  SESSION_JSON=$(gc --city "$GC_CITY" session new "$REFINO_REVIEWER_TEMPLATE" \
+    --no-attach \
+    --title "refino-reviewer: $STORY_ID (round $THIS_ROUND)${_title_suffix}" \
+    --json \
+    2>"$_spawn_err_file" || echo "{}")
+  _spawn_err=$(head -c 300 "$_spawn_err_file" 2>/dev/null || echo "")
+  rm -f "$_spawn_err_file" 2>/dev/null || true
+  SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.session_id // empty')
+  if [ -z "$SESSION_ID" ]; then
+    return 1
+  fi
+
+  gc --city "$GC_CITY" session wake "$SESSION_ID" 2>/dev/null || true
+
+  # Durable pull channel (ga-67hae): assign the verdict bead to the (new) reviewer
+  # and embed the rubric as a comment, THEN nudge. The nudge is a fast-path; the
+  # bead assignment is the reliable channel a fresh reviewer pulls from durably.
+  SESSION_NAME=$(echo "$SESSION_JSON" | jq -r '.session_name // empty')
+  if [ -n "$SESSION_NAME" ]; then
+    bd_ update "$VERDICT_BEAD_ID" --assignee "$SESSION_NAME" --status in_progress -q 2>/dev/null || true
+    bd_ comment "$VERDICT_BEAD_ID" "$REVIEW_TASK" 2>/dev/null || true
+  fi
+  gc --city "$GC_CITY" session nudge "$SESSION_ID" "$REVIEW_TASK" --delivery queue 2>/dev/null \
+    || gc --city "$GC_CITY" session submit "$SESSION_ID" "$REVIEW_TASK" 2>/dev/null \
+    || warn "  Initial queue/submit to reviewer failed — durable pull channel still active."
+  return 0
+}
+
 SESSION_ID=""
+SESSION_NAME=""
+SESSION_JSON=""
 if [ "$DRY_RUN" = "1" ]; then
   log "WOULD spawn reviewer ($REFINO_REVIEWER_TEMPLATE) for $STORY_ID and deliver rubric — DRY_RUN"
   log "DRY_RUN: no verdict to collect; leaving $STORY_ID claimed for the next real sweep."
@@ -345,17 +487,7 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
-_spawn_err_file="/tmp/refino-reviewer-spawn-err-$$"
-SESSION_JSON=$(gc --city "$GC_CITY" session new "$REFINO_REVIEWER_TEMPLATE" \
-  --no-attach \
-  --title "refino-reviewer: $STORY_ID (round $THIS_ROUND)" \
-  --json \
-  2>"$_spawn_err_file" || echo "{}")
-_spawn_err=$(head -c 300 "$_spawn_err_file" 2>/dev/null || echo "")
-rm -f "$_spawn_err_file"
-SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.session_id // empty')
-
-if [ -z "$SESSION_ID" ]; then
+if ! refino_spawn_reviewer "spawn"; then
   err "Failed to spawn refino reviewer for $STORY_ID — releasing claim (retry next sweep). spawn_err=${_spawn_err:-none}"
   bd_ label remove "$STORY_ID" "refino-gate:reviewing" -q 2>/dev/null || true
   bd_ close "$VERDICT_BEAD_ID" 2>/dev/null || true
@@ -364,22 +496,18 @@ if [ -z "$SESSION_ID" ]; then
   exit 1
 fi
 log "  Reviewer session spawned: $SESSION_ID"
+log "  Rubric delivered to reviewer for $STORY_ID (durable pull, ga-67hae)."
 
-gc --city "$GC_CITY" session wake "$SESSION_ID" 2>/dev/null || true
+# ── Step 6: Poll the verdict bead until PASS/FAIL, re-convene, or timeout ──────
+# ga-4u16h PORT: per-story re-convene state. RECONVENE_BUDGET caps re-spawns;
+# SLOT_SPAWN_EPOCH anchors the grace window (reset on every re-spawn so a fresh
+# reviewer gets a fair start); SLOT_DEAD_STREAK requires consecutive DEAD reads
+# before acting (transient-list-failure guard). All inert when re-convene is off.
+RECONVENE_BUDGET="$REFINO_REVIEWER_RECONVENE_MAX"
+[ "$REFINO_RECONVENE_ENABLED" = "1" ] || RECONVENE_BUDGET=0
+SLOT_SPAWN_EPOCH=$(date +%s)
+SLOT_DEAD_STREAK=0
 
-# Durable pull channel + fast nudge (ga-67hae pattern): assign the verdict bead
-# to the reviewer and embed the rubric as a comment, then nudge.
-SESSION_NAME=$(echo "$SESSION_JSON" | jq -r '.session_name // empty')
-if [ -n "$SESSION_NAME" ]; then
-  bd_ update "$VERDICT_BEAD_ID" --assignee "$SESSION_NAME" --status in_progress -q 2>/dev/null || true
-  bd_ comment "$VERDICT_BEAD_ID" "$REVIEW_TASK" 2>/dev/null || true
-fi
-gc --city "$GC_CITY" session nudge "$SESSION_ID" "$REVIEW_TASK" --delivery queue 2>/dev/null \
-  || gc --city "$GC_CITY" session submit "$SESSION_ID" "$REVIEW_TASK" 2>/dev/null \
-  || warn "  Initial queue/submit to reviewer failed — durable pull channel still active."
-log "  Rubric delivered to reviewer for $STORY_ID."
-
-# ── Step 6: Poll the verdict bead until PASS/FAIL or timeout ──────────────────
 DEADLINE=$(( $(date +%s) + REFINO_VERDICT_TIMEOUT_MINUTES * 60 ))
 VERDICT="TIMEOUT"
 FAIL_NOTES=""
@@ -395,6 +523,81 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
       | grep -A50 "VERDICT: FAIL" | tail -n +2 | head -40 || echo "")
     break
   fi
+
+  # ── ga-4u16h PORT: mid-wait re-convene of a DRAINED/DEAD reviewer ───────────
+  # The verdict bead is still pending. If the reviewer SESSION is confirmed DEAD
+  # (gone from the session list / closed, OR drained-but-listed per the peek
+  # discriminator) for RECONVENE_DEAD_STREAK_MIN consecutive polls past the grace
+  # window, and budget remains, RE-SPAWN a fresh reviewer for THIS story (reusing
+  # the still-pending verdict bead + re-delivering the SAME rubric) instead of
+  # waiting the full 20m. A live-but-slow reviewer (present + asleep) is NEVER
+  # re-convened. Fully gated by RECONVENE_BUDGET>0 (= enabled + budget left).
+  if [ "$RECONVENE_BUDGET" -gt 0 ] 2>/dev/null; then
+    _now=$(date +%s)
+    _spawn_age=$(( _now - SLOT_SPAWN_EPOCH ))
+    # Snapshot session liveness once. Fail-safe: an unparseable/failed list leaves
+    # _list_ok=0 → NO re-convene this poll (a transient glitch must never re-spawn
+    # a live reviewer).
+    _sess_json=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "")
+    _list_ok=0
+    if [ -n "$_sess_json" ] && echo "$_sess_json" \
+         | jq -e 'if type=="array" then true else has("sessions") end' >/dev/null 2>&1; then
+      _list_ok=1
+    fi
+    if [ "$_list_ok" = "1" ]; then
+      _present_n=$(echo "$_sess_json" \
+        | jq -r --arg s "$SESSION_ID" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | length' 2>/dev/null || echo 1)
+      case "$_present_n" in ''|*[!0-9]*) _present_n=1 ;; esac
+      if [ "$_present_n" -ge 1 ]; then
+        _present_flag=1
+        _closed_flag=$(echo "$_sess_json" \
+          | jq -r --arg s "$SESSION_ID" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | .[0].closed // false' 2>/dev/null || echo false)
+      else
+        _present_flag=0
+        _closed_flag=false
+      fi
+      _dead=$(session_is_dead "$_present_flag" "$_closed_flag")
+      # ga-h9o17 PORT: a reviewer that DRAINED stays listed+not-closed (_dead=0).
+      # `gc session peek` is the discriminator: a drained/ended session answers
+      # "session not found" on STDERR. Only probe past the grace window and while
+      # the list still says alive (one cheap peek per suspicious poll). 2>&1
+      # >/dev/null routes ONLY stderr into the capture so a live reviewer's
+      # scrollback can never false-trigger the not-found match.
+      if [ "$_dead" = "0" ] && [ "$_spawn_age" -ge "$REFINO_RECONVENE_GRACE_SECS" ]; then
+        _peek_stderr=$(gc --city "$GC_CITY" session peek "$SESSION_ID" --lines 5 2>&1 >/dev/null || true)
+        if [ "$(session_peek_reports_dead "$_peek_stderr")" = "1" ]; then
+          _dead=1
+          log "  Drained reviewer detected (ga-h9o17): session=$SESSION_ID listed+not-closed but peek reports session-gone; treating as DEAD (verdict bead $VERDICT_BEAD_ID still pending)."
+        fi
+      fi
+      # Grace gate: never call a freshly-(re)spawned reviewer dead too early.
+      if [ "$_dead" = "1" ] && [ "$_spawn_age" -ge "$REFINO_RECONVENE_GRACE_SECS" ]; then
+        SLOT_DEAD_STREAK=$(( SLOT_DEAD_STREAK + 1 ))
+      else
+        SLOT_DEAD_STREAK=0
+      fi
+      _confirmed_dead=0
+      if [ "$_dead" = "1" ] && [ "$SLOT_DEAD_STREAK" -ge "$REFINO_RECONVENE_DEAD_STREAK_MIN" ]; then
+        _confirmed_dead=1
+      fi
+      _action=$(refino_slot_action 0 "$_confirmed_dead" "$RECONVENE_BUDGET")
+      if [ "$_action" = "respawn" ]; then
+        RECONVENE_BUDGET=$(( RECONVENE_BUDGET - 1 ))
+        _respawn_k=$(( REFINO_REVIEWER_RECONVENE_MAX - RECONVENE_BUDGET ))
+        log "Re-convening dead refino reviewer (respawn ${_respawn_k}/${REFINO_REVIEWER_RECONVENE_MAX}) — session $SESSION_ID dead, verdict bead $VERDICT_BEAD_ID still pending (story $STORY_ID)."
+        SLOT_SPAWN_EPOCH="$_now"   # reset the grace clock for the fresh reviewer
+        SLOT_DEAD_STREAK=0
+        if refino_spawn_reviewer "reconvene"; then
+          log "  Re-convene: fresh reviewer $SESSION_ID spawned + rubric re-delivered (verdict bead reused, durable pull)."
+          jq -c -n --arg ts "$(ts)" --arg story "$STORY_ID" --argjson k "$_respawn_k" \
+            '{ts:$ts, event:"reconvene", story:$story, respawn:$k}' >> "$RG_LOG" 2>/dev/null || true
+        else
+          warn "  Re-convene: spawn failed — outer ${REFINO_VERDICT_TIMEOUT_MINUTES}m timeout is the backstop. spawn_err=${_spawn_err:-none}"
+        fi
+      fi
+    fi
+  fi
+
   sleep "$REFINO_VERDICT_POLL_INTERVAL"
 done
 log "  Verdict for $STORY_ID: $VERDICT"

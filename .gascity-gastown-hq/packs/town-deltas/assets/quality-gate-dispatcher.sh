@@ -44,6 +44,30 @@ if [ "$VERDICT_TIMEOUT_MINUTES" -lt 15 ] 2>/dev/null; then
   VERDICT_TIMEOUT_MINUTES=15
 fi
 
+# ── ga-ltr3c: diff-size scaling of the verdict timeout ────────────────────────
+# A reviewer reading a LARGE diff (many files / many lines) legitimately needs
+# more wall-clock than a small one. With the fixed base above, big-but-GREEN
+# packages (build + embed + sweep + tests; 1000s of lines across dozens of files —
+# thies-wa wa-vnqx / digo-wa wa-bu2t) routinely outran the timeout and were killed
+# as a "zombie" (age>verdict-timeout, no live reviewer) BEFORE emitting a verdict
+# → an infinite re-submit loop on good code. The effective timeout is scaled by
+# the diff size (gate_scaled_verdict_timeout, applied once the diff is known) and
+# CAPPED here. The cap bounds worst-case dead-reviewer detection via the OUTER
+# timeout; the ga-4u16h re-convene probe catches a genuinely dead reviewer far
+# sooner (session gone/closed), independent of this ceiling — so raising it never
+# masks a stuck reviewer, only rescues slow-but-live big reviews.
+VERDICT_TIMEOUT_MAX_MINUTES="${VERDICT_TIMEOUT_MAX_MINUTES:-50}"
+case "$VERDICT_TIMEOUT_MAX_MINUTES" in ''|*[!0-9]*) VERDICT_TIMEOUT_MAX_MINUTES=50 ;; esac
+# The cap can never sit below the base timeout — scaling only ADDS time.
+if [ "$VERDICT_TIMEOUT_MAX_MINUTES" -lt "$VERDICT_TIMEOUT_MINUTES" ] 2>/dev/null; then
+  VERDICT_TIMEOUT_MAX_MINUTES="$VERDICT_TIMEOUT_MINUTES"
+fi
+# Per-file and per-100-changed-lines minute increments (0 disables that axis).
+VERDICT_TIMEOUT_PER_FILE_MINUTES="${VERDICT_TIMEOUT_PER_FILE_MINUTES:-1}"
+case "$VERDICT_TIMEOUT_PER_FILE_MINUTES" in ''|*[!0-9]*) VERDICT_TIMEOUT_PER_FILE_MINUTES=1 ;; esac
+VERDICT_TIMEOUT_PER_100_LINES_MINUTES="${VERDICT_TIMEOUT_PER_100_LINES_MINUTES:-1}"
+case "$VERDICT_TIMEOUT_PER_100_LINES_MINUTES" in ''|*[!0-9]*) VERDICT_TIMEOUT_PER_100_LINES_MINUTES=1 ;; esac
+
 # Poll interval (seconds) when waiting for verdicts.
 VERDICT_POLL_INTERVAL="${VERDICT_POLL_INTERVAL:-30}"
 
@@ -54,7 +78,11 @@ VERDICT_POLL_INTERVAL="${VERDICT_POLL_INTERVAL:-30}"
 # gate-reviewer sessions older than this so SIGKILL/OOM-orphaned reviewers cannot
 # fill the gate-reviewer template's max_active_sessions=6 budget. TTL = verdict
 # timeout + margin (slack over the longest a live run can hold a session open).
-REVIEWER_SESSION_TTL_MINUTES="${REVIEWER_SESSION_TTL_MINUTES:-$((VERDICT_TIMEOUT_MINUTES + 20))}"
+# ga-ltr3c: derive from the SCALED ceiling (VERDICT_TIMEOUT_MAX_MINUTES), not the
+# base — a large-diff run can now legitimately hold its reviewers up to the cap,
+# so the reaper's "longest a live run can hold" must track the cap or it would
+# prematurely reap a live big review's session.
+REVIEWER_SESSION_TTL_MINUTES="${REVIEWER_SESSION_TTL_MINUTES:-$((VERDICT_TIMEOUT_MAX_MINUTES + 20))}"
 
 # Dry-run mode: skip actual git merge+push.
 DRY_RUN="${DRY_RUN:-0}"
@@ -840,6 +868,33 @@ _acquire_gate_lock() {
   return 0
 }
 
+# ── ga-ltr3c: scale the verdict timeout by diff size (pure; selftest-sourceable) ─
+# effective = base + files×PER_FILE + (lines÷100)×PER_100L, clamped to [base, MAX].
+# Args: <base_minutes> <changed_files> <changed_lines>. Echoes the effective
+# timeout in minutes (integer). Fail-safe: any non-numeric arg contributes 0, so
+# the result can never drop below the base — a parse failure degrades to today's
+# fixed-timeout behavior, never to a shorter (false-FAIL-prone) timeout.
+# Unit-tested by gate-verdict-timeout-scale.selftest.sh.
+gate_scaled_verdict_timeout() {
+  local base="$1" files="$2" lines="$3"
+  case "$base"  in ''|*[!0-9]*) base=22 ;; esac
+  case "$files" in ''|*[!0-9]*) files=0 ;; esac
+  case "$lines" in ''|*[!0-9]*) lines=0 ;; esac
+  local per_file="${VERDICT_TIMEOUT_PER_FILE_MINUTES:-1}"
+  local per_100l="${VERDICT_TIMEOUT_PER_100_LINES_MINUTES:-1}"
+  local maxm="${VERDICT_TIMEOUT_MAX_MINUTES:-50}"
+  case "$per_file" in ''|*[!0-9]*) per_file=1 ;; esac
+  case "$per_100l" in ''|*[!0-9]*) per_100l=1 ;; esac
+  case "$maxm"     in ''|*[!0-9]*) maxm=50 ;; esac
+  local eff=$(( base + files * per_file + (lines / 100) * per_100l ))
+  # Clamp: scaling only ADDS time (never below base); the cap bounds the ceiling.
+  # An incoherent MAX (< base) is floored at base so the result is never < base.
+  [ "$maxm" -lt "$base" ] && maxm="$base"
+  [ "$eff" -lt "$base" ] && eff="$base"
+  [ "$eff" -gt "$maxm" ] && eff="$maxm"
+  printf '%s' "$eff"
+}
+
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
 # above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
 # GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
@@ -1487,6 +1542,86 @@ rig_resolve_commit() {
   git_rig rev-parse --verify -q "$1^{commit}" 2>/dev/null || echo ""
 }
 
+# ── ga-78n2z: union-aware conflict pre-check ──────────────────────────────────
+# GATE_UNION_AWARE_PRECHECK=1 (default ON) makes the merge-tree pre-check honor
+# the `merge=union` gitattributes driver. =0 restores the EXACT legacy behavior
+# (merge-tree --write-tree exit code is taken at face value).
+#
+# WHY: `git merge-tree --write-tree <main> <branch>` does NOT apply custom/builtin
+# merge=* drivers from .gitattributes — even on git 2.54 (verified empirically on
+# wa-jjea/wa-40xb: merge-tree reports CONFLICT on docs/data_dictionary.md, which
+# carries `merge=union`, yet a REAL `git merge` of the same pair resolves it rc=0
+# with zero conflict markers because union concatenates both sides). The result
+# was a recurring pile of SPURIOUS needs-rebase escalations for branches whose
+# only conflict is in a union-driver file (wa-40xb, wa-jjea, ...).
+GATE_UNION_AWARE_PRECHECK="${GATE_UNION_AWARE_PRECHECK:-1}"
+
+# rig_conflict_paths <main_ref> <branch_ref> — echo the NUL-free newline list of
+# paths merge-tree flags as conflicting (empty on clean / error). Used only to
+# decide union-coverage; the authoritative verdict still comes from exit codes.
+rig_conflict_paths() {
+  local main_ref="$1" branch_ref="$2"
+  # `merge-tree --write-tree --name-only` stdout has THREE sections (git 2.54):
+  #   line 1            : the new tree OID
+  #   lines 2..K        : "Conflicted file info" — one conflicting path per line
+  #   (blank line)      : section separator
+  #   lines K+2..EOF    : "Informational messages" — "Auto-merging…", "CONFLICT…"
+  # We want ONLY the conflicted-path section: drop line 1, then stop at the FIRST
+  # blank line (sed `/^$/q` quits before printing it), which discards the trailing
+  # informational tail (otherwise "Auto-merging X"/"CONFLICT … X" would be mistaken
+  # for paths and break union-coverage detection). `|| true` is REQUIRED: merge-tree
+  # returns rc=1 on conflict and pipefail would trip set -e on the assignment.
+  git_rig merge-tree --write-tree --name-only "$main_ref" "$branch_ref" 2>/dev/null \
+    | tail -n +2 | sed '/^$/q' | sed '/^$/d' || true
+}
+
+# rig_path_is_union_resolvable <merge_ref> <path> — return 0 (true) iff <path> is
+# governed by a merge driver that resolves WITHOUT producing conflict markers
+# (currently only the builtin `union`). check-attr is evaluated against the merge
+# context ref (the branch being merged) so .gitattributes as the author sees it is
+# authoritative. Any unset/unspecified/other driver → return 1 (NOT union-safe).
+rig_path_is_union_resolvable() {
+  local merge_ref="$1" path="$2" drv=""
+  # `git check-attr` on a tree-ish: use --source (git ≥2.40) to read attributes
+  # from <merge_ref> rather than the working tree. Fall back to plain check-attr
+  # (working-tree .gitattributes) if --source is unsupported. Conservative on any
+  # failure: empty/err driver → not union → caller escalates as a real conflict.
+  drv=$(git_rig check-attr --source "$merge_ref" merge -- "$path" 2>/dev/null | sed 's/.*: merge: //' )
+  if [ -z "$drv" ] || [ "$drv" = "merge: unspecified" ]; then
+    drv=$(git_rig check-attr merge -- "$path" 2>/dev/null | sed 's/.*: merge: //')
+  fi
+  [ "$drv" = "union" ]
+}
+
+# rig_real_merge_is_clean <main_ref> <branch_ref> — perform a REAL throwaway
+# test-merge in a detached temp worktree to confirm the merge actually resolves
+# clean (union drivers applied). Return 0 (clean) iff `git merge --no-commit`
+# succeeds with NO unmerged index entries. Any error/uncertainty → return 1
+# (treat as NOT-clean → caller escalates; fail-safe, never green-lights a real
+# conflict). The worktree + a trap guarantee cleanup on every path.
+rig_real_merge_is_clean() {
+  local main_ref="$1" branch_ref="$2"
+  local wt rc=1
+  wt="$(mktemp -d "${TMPDIR:-/tmp}/gc-gate-unioncheck-XXXXXX" 2>/dev/null)" || return 1
+  # Resolve the temp worktree fully so cleanup in the trap is unambiguous.
+  # shellcheck disable=SC2064
+  trap "git_rig worktree remove --force '$wt' >/dev/null 2>&1 || true; rm -rf '$wt' >/dev/null 2>&1 || true" RETURN
+  # Create a detached worktree at main; do the merge there. --no-commit leaves the
+  # index/worktree merged so we can inspect ls-files -u, then we abort.
+  if git_rig worktree add --detach "$wt" "$main_ref" >/dev/null 2>&1; then
+    git -C "$wt" config user.email "gate-dispatcher@gascity.local" >/dev/null 2>&1 || true
+    git -C "$wt" config user.name  "Gate Dispatcher"               >/dev/null 2>&1 || true
+    if git -C "$wt" merge --no-commit --no-ff "$branch_ref" >/dev/null 2>&1; then
+      # Merge stopped-before-commit cleanly. Double-check no unmerged entries.
+      if [ -z "$(git -C "$wt" ls-files -u 2>/dev/null)" ]; then
+        rc=0
+      fi
+    fi
+    git -C "$wt" merge --abort >/dev/null 2>&1 || true
+  fi
+  return "$rc"
+}
+
 # ── ga-ljbx: git-2.54 conflict detection ──────────────────────────────────────
 # rig_merge_has_conflict <main_ref> <branch_ref> — echo "1" if merging
 # <branch_ref> into <main_ref> conflicts, "0" if clean, "err" if undeterminable.
@@ -1497,17 +1632,66 @@ rig_resolve_commit() {
 # clean (verified empirically on git 2.54.0). The modern
 # `git merge-tree --write-tree <main> <branch>` is authoritative: exit 0 = clean,
 # exit 1 = conflict, exit >1 = error (e.g. unrelated histories / bad ref).
+#
+# ga-78n2z: merge-tree --write-tree does NOT apply merge=union drivers, so a
+# branch whose ONLY conflict is in a union-driver file (e.g. docs/data_dictionary.md)
+# reads as a conflict here while a REAL merge resolves it cleanly. When the flag is
+# ON and EVERY conflicting path is union-resolvable, we run a real test-merge in a
+# throwaway worktree; if that confirms clean we report "0" (clean). If ANY path is
+# not union-resolvable, or the test-merge still conflicts, or anything is uncertain,
+# we fall through to the legacy "1" (escalate) — never auto-greenlight a real conflict.
 rig_merge_has_conflict() {
   local main_ref="$1" branch_ref="$2"
   git_rig merge-tree --write-tree "$main_ref" "$branch_ref" >/dev/null 2>&1
   local rc=$?
   if [ "$rc" = "0" ]; then
     echo "0"
-  elif [ "$rc" = "1" ]; then
-    echo "1"
-  else
+    return 0
+  elif [ "$rc" != "1" ]; then
     echo "err"
+    return 0
   fi
+
+  # rc == 1: merge-tree reports a conflict.
+  if [ "$GATE_UNION_AWARE_PRECHECK" != "1" ]; then
+    echo "1"
+    return 0
+  fi
+
+  # Union-aware path: is EVERY conflicting file a union-driver file?
+  local paths p all_union=1 any=0
+  paths="$(rig_conflict_paths "$main_ref" "$branch_ref")"
+  if [ -z "$paths" ]; then
+    # Conservative: rc=1 but we could not enumerate the conflicting paths →
+    # cannot prove union-only → treat as a genuine conflict (legacy behavior).
+    echo "1"
+    return 0
+  fi
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    any=1
+    if ! rig_path_is_union_resolvable "$branch_ref" "$p"; then
+      all_union=0
+      break
+    fi
+  done <<EOF
+$paths
+EOF
+
+  if [ "$any" = "1" ] && [ "$all_union" = "1" ]; then
+    # All conflicting paths are union-driver files. Confirm with a REAL merge.
+    if rig_real_merge_is_clean "$main_ref" "$branch_ref"; then
+      log "  ga-78n2z: union-only merge-tree conflict in [$(printf '%s' "$paths" | tr '\n' ' ')] confirmed CLEAN by real test-merge — treating pre-check as clean." 2>/dev/null || true
+      echo "0"
+      return 0
+    fi
+    # Union-only by attribute but the real merge STILL conflicts → genuine.
+    log "  ga-78n2z: union-only merge-tree conflict but real test-merge ALSO conflicts — genuine conflict, escalating." 2>/dev/null || true
+  fi
+
+  # Default / fail-safe: genuine conflict (a non-union path, or real merge unclean).
+  echo "1"
+  return 0
 }
 
 log "  rig_path=$RIG_PATH  git_dir=$GIT_DIR_PATH  container_rig=$IS_CONTAINER_RIG"
@@ -1923,6 +2107,24 @@ log "  Branch $BRANCH is current with $DEFAULT_BRANCH — stale-base check passe
 # This is the "escalate up, never down" rule from review-merge-policy.md.
 
 CHANGED_FILES=$(git_rig diff --name-only "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null || echo "")
+
+# ── ga-ltr3c: scale this run's verdict timeout by its diff size ───────────────
+# CHANGED_FILES is already in hand; add the changed-line count (insertions +
+# deletions via --numstat, ignoring binary "-" rows) and scale VERDICT_TIMEOUT_
+# MINUTES so a large-but-green package isn't killed as a "zombie" before its
+# reviewer can emit a verdict. Fail-safe: any git/parse failure leaves the counts
+# at 0 → the scaler returns the unchanged base timeout (today's behavior).
+DIFF_FILE_COUNT=$(printf '%s\n' "$CHANGED_FILES" | grep -c . 2>/dev/null || echo 0)
+DIFF_LINE_COUNT=$(git_rig diff --numstat "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null \
+  | awk '{ if ($1 ~ /^[0-9]+$/) s += $1; if ($2 ~ /^[0-9]+$/) s += $2 } END { print s + 0 }' \
+  || echo 0)
+case "$DIFF_FILE_COUNT" in ''|*[!0-9]*) DIFF_FILE_COUNT=0 ;; esac
+case "$DIFF_LINE_COUNT" in ''|*[!0-9]*) DIFF_LINE_COUNT=0 ;; esac
+_VT_BASE="$VERDICT_TIMEOUT_MINUTES"
+VERDICT_TIMEOUT_MINUTES=$(gate_scaled_verdict_timeout "$_VT_BASE" "$DIFF_FILE_COUNT" "$DIFF_LINE_COUNT")
+if [ "$VERDICT_TIMEOUT_MINUTES" != "$_VT_BASE" ]; then
+  log "ga-ltr3c: scaled verdict timeout ${_VT_BASE}m → ${VERDICT_TIMEOUT_MINUTES}m for diff (${DIFF_FILE_COUNT} files, ${DIFF_LINE_COUNT} lines; cap=${VERDICT_TIMEOUT_MAX_MINUTES}m)."
+fi
 
 TIER="CODE"
 if [ -n "$CHANGED_FILES" ]; then
@@ -2502,11 +2704,33 @@ while true; do
         fi
         FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) FAIL: $FAIL_COMMENT\n"
       else
-        # Any other label (TIMEOUT, ABORTED, or missing verdict label) → FAIL.
-        # PASS is the ONLY acceptable verdict; anything else blocks the merge.
-        ANY_FAIL=1
-        VERDICT_LABEL=$(echo "$VB_LABELS" | tr ' ' '\n' | grep "^verdict:" | head -1 || echo "no-verdict-label")
-        FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) ${VERDICT_LABEL}: verdict bead closed without explicit PASS.\n"
+        # ga-86l90a8 (thies): the reviewer writes `label add verdict:PASS` THEN
+        # `comment "VERDICT: PASS"` THEN closes the bead (Step "If PASS" ~L2284).
+        # If the label-add raced / didn't commit before the close but the PASS
+        # COMMENT landed, the label-only check above loses a GENUINE pass and
+        # false-FAILs clean code ("verdict bead closed without explicit PASS").
+        # Rescue it the same way FAIL reasons are read: parse the verdict COMMENT
+        # (.text) and accept ONLY an unambiguous, anchored "VERDICT: PASS" —
+        # anything else still FAILs, so the fail-safe (PASS is the ONLY acceptable
+        # verdict) is fully preserved. A jq glitch leaves PASS_COMMENT empty →
+        # falls through to the existing FAIL path (no regression).
+        VB_COMMENTS_JSON=$(bd -C "$GC_CITY" comments "$VB" --json 2>/dev/null || echo "[]")
+        PASS_COMMENT=$(printf '%s' "$VB_COMMENTS_JSON" | jq -r '
+            [ .[]? | (.text // .body // "") ]
+            | map(select(test("^\\s*VERDICT:\\s*PASS\\b"; "i")))
+            | last // ""
+          ' 2>/dev/null || echo "")
+        if [ -n "$PASS_COMMENT" ]; then
+          VERDICTS_RECEIVED=$VERDICTS_RECEIVED  # already counted at the closed branch
+          log "  Reviewer $((j+1)) (bead $VB) closed WITHOUT a verdict:PASS label but its verdict COMMENT is an explicit PASS — rescuing as PASS (ga-86l90a8 label-race). comment=$(printf '%s' "$PASS_COMMENT" | tr '\n' ' ' | cut -c1-200)"
+          : # treat as PASS — do NOT set ANY_FAIL
+        else
+          # Any other label (TIMEOUT, ABORTED, or missing verdict label) → FAIL.
+          # PASS is the ONLY acceptable verdict; anything else blocks the merge.
+          ANY_FAIL=1
+          VERDICT_LABEL=$(echo "$VB_LABELS" | tr ' ' '\n' | grep "^verdict:" | head -1 || echo "no-verdict-label")
+          FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) ${VERDICT_LABEL}: verdict bead closed without explicit PASS (no verdict:PASS label and no explicit PASS comment).\n"
+        fi
       fi
     else
       # ── ga-4u16h: verdict bead still pending. If this slot's reviewer SESSION

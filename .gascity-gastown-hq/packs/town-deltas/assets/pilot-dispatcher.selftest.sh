@@ -1192,6 +1192,50 @@ else
   ok "sling-bearing bead kept when roster is untrustworthy (cannot prove worker dead)"
 fi
 
+# 16L (ga-9yb5s): a CREW owns the story directly (story.assignee = a live named
+# crew) → KEEP, even with no sling/branch/gate. A crew claims the STORY bead
+# itself; dogs/polecats claim the SLING task instead. The sling-assignee
+# live-worker guard (16e) is therefore BLIND to a crew builder, so an active
+# crew-built story read "no live worker, no branch" and was falsely reclaimed →
+# re-dispatched to the dog pool → two builders on one story (worktree collision).
+# The reclaim guard must treat a live crew owner as a live builder — parity with
+# the ga-htjni dispatch guard signal (b). FAKE_SLING_ASSIGNEES maps the STORY id
+# to the crew, so `bd show <story>` reports that crew as the bead's assignee.
+echo "Scenario 16L: ga-9yb5s — a live crew owner of the story protects it from reclaim"
+NS_CREW_SESS='{"sessions":[{"session_name":"batista-ps","closed":false}]}'
+NS_CREW='[{"id":"tt-ns-crew","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+LOG16L="$(run_neverstarted "$NS_CREW" "" "$NS_CREW_SESS" '{"tt-ns-crew":"batista-ps"}')"
+if echo "$LOG16L" | grep -q "releasing never-started in-flight bead tt-ns-crew"; then
+  bad "REGRESSION (ga-9yb5s): released a story owned by a LIVE crew (false reclaim → double-dispatch)"
+else
+  ok "story owned by a live crew is kept (ga-9yb5s parity with ga-htjni dispatch guard)"
+fi
+
+# 16m (ga-9yb5s): the crew owner is DEAD (roster trustworthy, owner not in it) →
+# RELEASE. The new guard must not pin a genuine orphan whose crew session died;
+# it asserts an owner ONLY when that owner is provably live.
+echo "Scenario 16m: ga-9yb5s — a DEAD crew owner does NOT pin the bead (no deadlock)"
+NS_CREWD='[{"id":"tt-ns-crewdead","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+LOG16M="$(run_neverstarted "$NS_CREWD" "" "$NS_CREW_SESS" '{"tt-ns-crewdead":"ghost-ps"}')"
+if echo "$LOG16M" | grep -q "releasing never-started in-flight bead tt-ns-crewdead"; then
+  ok "story whose crew owner is provably gone is released (no deadlock)"
+else
+  bad "REGRESSION (ga-9yb5s): a DEAD crew owner pinned a genuine orphan (deadlock risk)"
+fi
+
+# 16n (ga-9yb5s): a dog-pool assignee is NOT a crew owner — the dog path is
+# tracked by the SLING task, never by story.assignee. The crew-owner guard must
+# ignore a gastown.dog* assignee so dog reclaim behaviour is unchanged.
+echo "Scenario 16n: ga-9yb5s — a dog-pool assignee is not treated as a crew owner"
+NS_DOG='[{"id":"tt-ns-dog","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+NS_DOG_SESS='{"sessions":[{"session_name":"gastown.dog","closed":false}]}'
+LOG16N="$(run_neverstarted "$NS_DOG" "" "$NS_DOG_SESS" '{"tt-ns-dog":"gastown.dog"}')"
+if echo "$LOG16N" | grep -q "releasing never-started in-flight bead tt-ns-dog"; then
+  ok "dog-pool assignee not mistaken for a crew owner (dog reclaim unchanged)"
+else
+  bad "REGRESSION (ga-9yb5s): a dog-pool assignee blocked reclaim (should be sling-tracked only)"
+fi
+
 # 16i: PILOT_NEVERSTARTED_MINUTES=0 fully disables the detector.
 echo "Scenario 16i: PILOT_NEVERSTARTED_MINUTES=0 disables the detector"
 : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"; reset_state
@@ -1224,6 +1268,8 @@ fi
 echo "Scenario 16k: drift-guard — never-started recovery wired into the dispatcher"
 has "$DISPATCHER" '_neverstarted_recover_db\(\)'  "never-started recovery function is defined"
 has "$DISPATCHER" '_beadid_has_branch\(\)'        "cross-repo branch detector is defined"
+has "$DISPATCHER" '_beadid_live_crew_owner\(\)'   "live-crew-owner guard is defined (ga-9yb5s)"
+has "$DISPATCHER" '_beadid_live_crew_owner "\$_bid" "\$_db"' "live-crew-owner guard is wired into never-started recovery (ga-9yb5s)"
 has "$DISPATCHER" 'pilot.dispatched_at='          "dispatch stamps pilot.dispatched_at (never-started clock)"
 has "$DISPATCHER" 'PILOT_NEVERSTARTED_MINUTES'    "never-started threshold knob is wired"
 

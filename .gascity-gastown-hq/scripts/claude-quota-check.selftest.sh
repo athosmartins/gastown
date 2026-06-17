@@ -10,7 +10,7 @@
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SUT="$HERE/claude-quota-check.sh"
+SUT="${QUOTA_SUT:-/tmp/claude-quota-check-v2.sh}"
 TZ_RESET="America/Sao_Paulo"
 
 PASS=0; FAIL=0
@@ -104,18 +104,50 @@ fi
 rm -f "$FIX/proj-b/session-expired.jsonl"
 
 # ---------------------------------------------------------------------------
-# CASE 5: ACTIVE weekly limit (reset Jun 12 8pm) → LIMITED + weekly.active
+# CASE 5 (ga-ot735, REVISED): ACTIVE weekly limit, NO active session →
+#   ADVISORY by default: NOT hard-limited (exit 0) but weekly.active=true.
+#   This is the exact false-pause the fix kills: the old contract was exit 2.
 # ---------------------------------------------------------------------------
 : > "$FIX/proj-b/weekly-active.jsonl"
 exhaust_line -3600 "You've hit your weekly limit · resets Jun 12 at 8pm (America/Sao_Paulo)" >> "$FIX/proj-b/weekly-active.jsonl"
 run bash "$SUT" --json
-if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.scope')" = "weekly" ] \
-   && [ "$(printf '%s' "$OUT" | jq -r '.weekly.active')" = "true" ]; then
-  ok "active weekly limit → limited (exit 2, scope=weekly, weekly.active=true)"
+if [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "false" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.weekly.active')" = "true" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.weekly.advisory')" = "true" ]; then
+  ok "weekly-only limit → ADVISORY: not hard-limited (exit 0), weekly.active+advisory=true (ga-ot735)"
 else
-  bad "active weekly limit" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,scope,weekly}' 2>/dev/null)"
+  bad "weekly-only advisory" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,scope,weekly}' 2>/dev/null)"
+fi
+
+# CASE 5b: same fixture, CLAUDE_QUOTA_WEEKLY_HARD=1 → LEGACY hard pause (exit 2)
+OUT=$(env CLAUDE_PROJECTS_DIR="$FIX" CLAUDE_QUOTA_NOW="$NOW" CLAUDE_QUOTA_TZ="$TZ_RESET" \
+          CLAUDE_QUOTA_SCAN_ALL=1 CLAUDE_QUOTA_WEEKLY_HARD=1 \
+          bash "$SUT" --json 2>/dev/null); RC=$?
+if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.scope')" = "weekly" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.weekly.hard')" = "true" ]; then
+  ok "weekly + CLAUDE_QUOTA_WEEKLY_HARD=1 → legacy hard pause (exit 2, scope=weekly)"
+else
+  bad "weekly hard-mode opt-in" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,scope,weekly}' 2>/dev/null)"
 fi
 rm -f "$FIX/proj-b/weekly-active.jsonl"
+
+# ---------------------------------------------------------------------------
+# CASE 5c (ga-ot735): SESSION active AND weekly active → SESSION WINS.
+#   Hard pause (exit 2), scope=session, SESSION reset is the headline (not the
+#   days-out weekly one); weekly.active still reported.
+# ---------------------------------------------------------------------------
+: > "$FIX/proj-b/both-active.jsonl"
+exhaust_line -600  "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)"        >> "$FIX/proj-b/both-active.jsonl"
+exhaust_line -3000 "You've hit your weekly limit · resets Jun 12 at 8pm (America/Sao_Paulo)"  >> "$FIX/proj-b/both-active.jsonl"
+run bash "$SUT" --json
+if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.scope')" = "session" ] \
+   && printf '%s' "$OUT" | jq -e '.reset_time_text | test("1:00pm")' >/dev/null 2>&1 \
+   && [ "$(printf '%s' "$OUT" | jq -r '.weekly.active')" = "true" ]; then
+  ok "session+weekly both active → session wins (exit 2, scope=session, session reset is headline)"
+else
+  bad "session beats weekly" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,scope,reset_time_text,weekly}' 2>/dev/null)"
+fi
+rm -f "$FIX/proj-b/both-active.jsonl"
 
 # ---------------------------------------------------------------------------
 # CASE 6: budget % computed when CLAUDE_QUOTA_BUDGET_BILLABLE set
@@ -141,14 +173,18 @@ fi
 rm -f "$FIX/proj-b/session-active2.jsonl"
 
 # ---------------------------------------------------------------------------
-# CASE 8: mixed — expired session but ACTIVE weekly → limited via weekly
+# CASE 8 (ga-ot735, REVISED): EXPIRED session + ACTIVE weekly → ADVISORY.
+#   The session limit already reset; only the multi-day weekly remains → with
+#   the default soft policy this is NOT a hard pause (exit 0), weekly advisory.
+#   (Old contract: limited via weekly, exit 2 — the exact days-long false pause.)
 # ---------------------------------------------------------------------------
 : > "$FIX/proj-b/mixed.jsonl"
 exhaust_line -3600 "You've hit your session limit · resets 11:30am (America/Sao_Paulo)" >> "$FIX/proj-b/mixed.jsonl"
 exhaust_line -3000 "You've hit your weekly limit · resets Jun 12 at 8pm (America/Sao_Paulo)" >> "$FIX/proj-b/mixed.jsonl"
 run bash "$SUT" --json
-if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.scope')" = "weekly" ]; then
-  ok "expired-session + active-weekly → limited via weekly"
+if [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "false" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.weekly.advisory')" = "true" ]; then
+  ok "expired-session + active-weekly → advisory (exit 0, not paused) (ga-ot735)"
 else
   bad "mixed expired-session/active-weekly" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,scope,weekly}' 2>/dev/null)"
 fi

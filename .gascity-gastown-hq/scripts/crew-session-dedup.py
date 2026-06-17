@@ -31,7 +31,7 @@ import json
 import subprocess
 import time
 
-POLL_SEC = 45
+POLL_SEC = 90
 REALERT_SEC = 900   # 15min re-alert cadence for stuck ambiguous groups
 
 # States / reason substrings that identify a session as a bad-state LOSER.

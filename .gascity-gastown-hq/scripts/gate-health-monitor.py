@@ -326,4 +326,4 @@ while True:
                 r.get("story") or r.get("bead", ""), res))
     sd_seen = len(slines)
 
-    time.sleep(60)
+    time.sleep(120)  # ga-8smq3: was 60; alert thresholds are all >=600s (10-40min), so 120s loses no real detection latency while halving Dolt poll load

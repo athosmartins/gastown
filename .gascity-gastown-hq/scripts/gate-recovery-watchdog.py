@@ -763,15 +763,71 @@ def spawn_repair_agent(reason, diag_path, dolt_hits, kind="gate"):
         return r is not None and r.returncode == 0
 
     def _direct():
+        # ga-0bigf ROOT FIX: a dog spawned via `gc session new` carries ONLY a
+        # title hint — NO bead is routed to it, and `gc session new` sets
+        # GC_SESSION_ORIGIN=manual, so the dog's Step-1c routed-pool probe is a
+        # no-op (the dog peeks confirm: "Routed pool work (1c): skipped — origin=
+        # manual"). Step 1a/1b find nothing either, because nothing was assigned to
+        # the session. Result: the repair dog boots TASKLESS with an empty hook and
+        # sits idle (the exact ga-0bigf complaint), while the real mission lived only
+        # in the _sling() payload that — with REPAIR_DUAL_SPAWN off (default) — was
+        # never routed because _direct() "succeeded".
+        #
+        # The three spawners that DO deliver reliably (gate-reviewer, refino-gate
+        # reviewer, auto-refiner) all wire the ga-67hae DURABLE-PULL channel after
+        # `gc session new`: capture the new session_name, create a task bead, assign
+        # it to that session_name (status in_progress) and embed the task as a
+        # comment. Step 1a/1b match `assignee` against $GC_SESSION_NAME/$GC_ALIAS and
+        # are NOT origin-gated, so a manual-origin session pulls the work durably.
+        # Mirror that here: spawn → create durable repair bead → assign to the
+        # session_name + embed the runbook. The dog now boots WITH its mission.
         s = sh(["gc", "session", "new", DOG_TEMPLATE, "--no-attach", "--json",
                 "--title-hint", "reparo %s: %s" % (kind, safe_reason[:50])], timeout=45)
         if not s or s.returncode != 0:
             return (False, None)
         sid = None
+        sname = None
         try:
-            sid = (json.loads(s.stdout) or {}).get("session_id")
+            j = json.loads(s.stdout) or {}
+            sid = j.get("session_id")
+            # `gc session new --json` returns session_name; fall back to alias/agent_name.
+            sname = j.get("session_name") or j.get("alias") or j.get("agent_name")
         except Exception:
             sid = None
+            sname = None
+        # ga-0bigf durable-pull wiring: without a session_name we cannot assign the
+        # task, so the dog would boot taskless — treat that as a FAILED direct spawn
+        # so the caller falls through to _sling() (durable routed bead) + Mayor
+        # fallback rather than leaving an idle dog. The spawned session is harmless:
+        # finding no work, a dog drain-acks/exits (or, manual-origin, sits idle
+        # briefly until reaped) — far better than the silent taskless-forever state.
+        if not sname:
+            return (False, sid)
+        # Create the durable repair bead and assign it to THIS session so the dog's
+        # Step 1a/1b deliver it. The runbook is large, so pass the description via
+        # --stdin (NOT argv) to dodge arg-length limits and quoting. `bd create` has
+        # no --status flag (this bd version), so set in_progress in a follow-up
+        # `bd update` — exactly what the gate/refino/auto-refino spawners do. Best-
+        # effort + guarded: if the CREATE fails we report the spawn as un-delivered
+        # (False) so the caller routes the _sling() insurance bead + Mayor fallback;
+        # the in_progress update is non-fatal (an assigned `open` bead is still found
+        # by Step 1b — status only affects Step 1a).
+        body = REPAIR_HEADER + repair_runbook(reason, diag_path, dolt_hits, kind)
+        cr = sh(["bd", "-C", CITY, "create", title, "-t", "task",
+                 "--assignee", sname, "--stdin", "--json"], stdin=body, timeout=45)
+        if not cr or cr.returncode != 0:
+            return (False, sid)
+        repair_bead_id = None
+        try:
+            cj = json.loads(cr.stdout)
+            repair_bead_id = (cj[0] if isinstance(cj, list) and cj else cj).get("id")
+        except Exception:
+            repair_bead_id = None
+        if repair_bead_id:
+            # in_progress + (re)assert assignee so Step 1a (assigned in-progress) is
+            # the dog's first hit, mirroring the verdict-bead durable-pull wiring.
+            sh(["bd", "-C", CITY, "update", repair_bead_id,
+                "--assignee", sname, "--status", "in_progress", "-q"], timeout=30)
         return (True, sid)
 
     routed = False

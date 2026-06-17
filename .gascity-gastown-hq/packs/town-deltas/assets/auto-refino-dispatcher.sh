@@ -94,6 +94,26 @@ AUTO_REFINO_REFINING_TTL_MINUTES="${AUTO_REFINO_REFINING_TTL_MINUTES:-50}"
 # excluded (too ambiguous — could be a legit product tag).
 AUTO_REFINO_EXCLUDE_LABELS="${AUTO_REFINO_EXCLUDE_LABELS:-scraper build infra config deploy migration pipeline}"
 
+# ── RAW TRIAGEM INGESTION (Mayor-diagnosed funnel starvation) ─────────────────
+# Raw stories enter the board with type=feature/story and NO story:* lifecycle
+# label (the painel "Triagem" column). The original Step-1 candidate query only
+# fetched beads ALREADY labelled story:triage / story:unrefined /
+# story:refinement-in-progress, so these raw stories were NEVER fetched → the
+# classifier never saw them → the funnel starved while ~37 stories piled up in
+# Triagem and never reached Athos's "Sua vez" approval queue.
+#
+# With this flag ON (default), a 4th candidate source picks up raw no-label
+# feature/story beads, applies story:unrefined at SELECTION (the entry label),
+# and lets them flow through the EXISTING "fresh" path (refine simplificado →
+# story:refino-review → gate → needs-approval → Sua vez). Mirrors the painel's
+# _qualifies_for_triagem: open + visible work type + NO story:* label, excluding
+# ephemeral / dc- / *-wisp- / gt:agent|gt:rig automation/identity beads, AND the
+# existing build/non-product exclude set (AUTO_REFINO_EXCLUDE_LABELS).
+#
+# Set AUTO_REFINO_INGEST_RAW_TRIAGEM=0 to restore the EXACT prior behaviour
+# (labelled-input only — no raw ingestion).
+AUTO_REFINO_INGEST_RAW_TRIAGEM="${AUTO_REFINO_INGEST_RAW_TRIAGEM:-1}"
+
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -141,8 +161,13 @@ auto_refino_lifecycle_state() {
   local csv=",$labels,"
 
   # Terminal / past-the-daemon states are NEVER candidates.
+  # story:refino-escalado (ga-lfua3) is the painel's canonical escalation label,
+  # now ALSO set on escalate so the story surfaces in "Sua vez"; it is terminal here
+  # too (waiting on Athos) — a structural belt independent of auto-refino:escalated,
+  # so even if the daemon's own marker is stripped the story is still not re-picked.
   case "$csv" in
     *,auto-refino:refining,*|*,auto-refino:escalated,*|*,refino-gate:reviewing,*|\
+*,story:refino-escalado,*|\
 *,story:refino-review,*|*,story:needs-approval,*|*,story:approved,*|\
 *,story:in-flight,*|*,story:done,*|*,story:cancelled,*)
       echo "skip"; return ;;
@@ -219,6 +244,60 @@ auto_refino_is_product_story() {
     [ -z "$l" ] && continue
     case "$labels" in *",$l,"*) echo "no"; return ;; esac
   done
+  echo "yes"
+}
+
+# auto_refino_has_lifecycle_label <labels_csv>
+#   Emit "yes" iff the bead carries ANY story:* lifecycle label (story:triage,
+#   story:unrefined, story:refinement-in-progress, story:refino-review,
+#   story:needs-approval, story:approved, story:in-flight, story:done,
+#   story:cancelled, or any future story:* tag). Used to detect RAW Triagem
+#   stories (no lifecycle label yet) for ingestion. Mirrors the painel's
+#   `any(str(lbl).startswith("story:") ...)` test verbatim.
+auto_refino_has_lifecycle_label() {
+  local l
+  # Split on commas and test each token for a story: prefix.
+  local IFS=,
+  for l in $1; do
+    case "$l" in story:*) echo "yes"; return ;; esac
+  done
+  echo "no"
+}
+
+# auto_refino_is_ingestable_raw <id> <issue_type> <labels_csv> <ephemeral> <exclude_labels>
+#   Emit "yes" iff this bead is a RAW Triagem story eligible for AUTO-INGESTION
+#   into the funnel — i.e. it qualifies the way the painel's _qualifies_for_triagem
+#   does, restricted to the funnel's product-story scope. ALL must hold:
+#     - type is feature/story (auto_refino_type_eligible) — bug/chore/task bypass;
+#     - NO story:* lifecycle label yet (auto_refino_has_lifecycle_label == no) —
+#       a bead that already owns a lifecycle column is NOT raw;
+#     - NOT an automation/identity/ephemeral bead: ephemeral!=true, id not dc-*,
+#       id not *-wisp-*, no gt:agent / gt:rig label (mirror painel _is_automation_bead);
+#     - it is a product story (auto_refino_is_product_story — build/scraper/config
+#       excluded just like a labelled candidate would be).
+#   Status (open) is enforced at the query level (--status open), exactly as the
+#   labelled queries already are; this pure predicate covers the rest.
+auto_refino_is_ingestable_raw() {
+  local id="$1" itype="$2" labels="$3" ephemeral="$4" ex="${5:-}"
+  local csv=",$labels,"
+  # type must be in the funnel (feature/story).
+  [ "$(auto_refino_type_eligible "$itype")" = "yes" ] || { echo "no"; return; }
+  # must be RAW — no story:* lifecycle label.
+  [ "$(auto_refino_has_lifecycle_label "$labels")" = "no" ] || { echo "no"; return; }
+  # ephemeral beads are engine coordination, never human stories.
+  [ "$ephemeral" = "true" ] && { echo "no"; return; }
+  # dc-* (deacon coordination) and *-wisp-* (reconciler wisps) ids are automation.
+  case "$id" in dc-*) echo "no"; return ;; esac
+  case "$id" in *-wisp-*) echo "no"; return ;; esac
+  # gt:agent / gt:rig identity beads are scaffolding, not work.
+  case "$csv" in *,gt:agent,*|*,gt:rig,*) echo "no"; return ;; esac
+  # already-ESCALATED stories are terminal (bug ga-it11w): terminal-escalate
+  # strips all story:* labels, so an escalated story looks RAW (no lifecycle
+  # label) — re-ingesting it loops forever. Disqualify it here too (the RAW jq
+  # query already drops it; this is the classifier-side defense in depth).
+  case "$csv" in *,auto-refino:escalated,*) echo "no"; return ;; esac
+  # build/scraper/non-product beads are excluded just like labelled candidates.
+  [ "$(auto_refino_is_product_story "$labels" "$ex")" = "yes" ] || { echo "no"; return; }
   echo "yes"
 }
 
@@ -334,8 +413,45 @@ BOUNCE_JSON=$(bd_ list --label story:refinement-in-progress --type feature --sta
   --exclude-label auto-refino:escalated \
   --json 2>/dev/null || echo "[]")
 
+# ── 4th source: RAW Triagem stories with NO story:* lifecycle label ───────────
+# (Mayor-diagnosed starvation fix; gated by AUTO_REFINO_INGEST_RAW_TRIAGEM.)
+# `bd list` has no "missing-label" filter, so we fetch ALL open feature/story
+# beads and filter IN JQ to those carrying NO label matching ^story:, dropping
+# automation/identity/ephemeral beads (dc-/-wisp-/gt:agent/gt:rig/ephemeral) the
+# way the painel's _qualifies_for_triagem does. The pure
+# auto_refino_is_ingestable_raw predicate re-asserts every rule per candidate
+# below (defense in depth: query narrows in jq, classifier disqualifies). These
+# raw candidates carry no lifecycle label, so the classifier alone would skip
+# them — they are PRE-LABELLED story:unrefined at selection (Step 1b) so they
+# flow through the existing "fresh" path unchanged.
+RAW_JSON="[]"
+if [ "$AUTO_REFINO_INGEST_RAW_TRIAGEM" = "1" ]; then
+  # feature type (and `story` if the build models it as a distinct type).
+  _RAW_FEATURE=$(bd_ list --type feature --status open --json 2>/dev/null || echo "[]")
+  _RAW_STORY=$(bd_ list --type story --status open --json 2>/dev/null || echo "[]")
+  RAW_JSON=$(jq -s '
+    (.[0] + .[1])
+    | unique_by(.id)
+    # RAW = carries NO story:* lifecycle label (the painel Triagem criterion).
+    | map(select(((.labels // []) | any(type=="string" and startswith("story:"))) | not))
+    # Drop automation / identity / ephemeral beads (painel _is_automation_bead).
+    | map(select((.ephemeral // false) != true))
+    | map(select(((.id // "") | (startswith("dc-") or contains("-wisp-"))) | not))
+    | map(select(((.labels // []) | any(. == "gt:agent" or . == "gt:rig")) | not))
+    # Drop already-ESCALATED stories (bug ga-it11w): terminal-escalate strips all
+    # story:* labels, so an escalated story (only auto-refino:escalated, no
+    # story:*) would otherwise be re-captured by this RAW source and re-ingested
+    # with story:unrefined every sweep → infinite re-ingestion loop (see ga-m9gt3).
+    | map(select(((.labels // []) | any(. == "auto-refino:escalated")) | not))
+  ' <(echo "$_RAW_FEATURE") <(echo "$_RAW_STORY") 2>/dev/null || echo "[]")
+  _RAWCOUNT=$(echo "$RAW_JSON" | jq 'length' 2>/dev/null || echo 0)
+  log "Raw-Triagem ingestion ON: $_RAWCOUNT no-lifecycle-label feature/story bead(s) eligible (pre-classification)."
+else
+  log "Raw-Triagem ingestion OFF (AUTO_REFINO_INGEST_RAW_TRIAGEM=0) — labelled input only."
+fi
+
 CANDIDATES=$(jq -s 'add | unique_by(.id)' \
-  <(echo "$FRESH_JSON") <(echo "$UNREF_JSON") <(echo "$BOUNCE_JSON") 2>/dev/null || echo "[]")
+  <(echo "$FRESH_JSON") <(echo "$UNREF_JSON") <(echo "$BOUNCE_JSON") <(echo "$RAW_JSON") 2>/dev/null || echo "[]")
 CCOUNT=$(echo "$CANDIDATES" | jq 'length' 2>/dev/null || echo 0)
 if [ "$CCOUNT" -eq 0 ] 2>/dev/null; then
   log "No Triagem stories to auto-refine. Sweep done."
@@ -346,6 +462,7 @@ log "$CCOUNT candidate story(ies) in Triagem (pre-classification)."
 # Classify with the pure core; keep only fresh/bounce candidates of an eligible
 # type. Oldest-first (FIFO) so the backlog drains in arrival order.
 STORY=""
+RAW_INGEST=0   # set to 1 when the selected candidate is a raw no-label story to pre-label
 while IFS= read -r row; do
   [ -z "$row" ] && continue
   c_id=$(echo "$row" | jq -r '.id // empty')
@@ -353,12 +470,25 @@ while IFS= read -r row; do
   c_type=$(echo "$row" | jq -r '.issue_type // .type // "feature"')
   c_labels=$(_labels_csv "$row")
   c_assignee=$(echo "$row" | jq -r '.assignee // empty')
+  c_ephemeral=$(echo "$row" | jq -r 'if (.ephemeral // false)==true then "true" else "false" end')
   [ "$(auto_refino_type_eligible "$c_type")" = "yes" ] || { log "  skip $c_id: type '$c_type' not in funnel (bug/chore/task bypass)"; continue; }
   [ "$(auto_refino_is_product_story "$c_labels" "$AUTO_REFINO_EXCLUDE_LABELS")" = "yes" ] || { log "  skip $c_id: carries build/non-product label (auto-refino excludes: $AUTO_REFINO_EXCLUDE_LABELS) — not a product story"; continue; }
   state=$(auto_refino_lifecycle_state "$c_labels" "$c_assignee" "$AUTO_REFINO_ACTOR")
   case "$state" in
-    fresh|bounce) STORY="$row"; break ;;
-    *) : ;;  # skip
+    fresh|bounce) STORY="$row"; RAW_INGEST=0; break ;;
+    *)
+      # Not a labelled candidate. If raw-ingestion is on and this bead is a RAW
+      # Triagem story (no story:* label, not automation/build), INGEST it: select
+      # it and flag it for story:unrefined pre-labelling (Step 1b), after which it
+      # flows through the identical "fresh" path. The labelled-input behaviour
+      # above is untouched — this branch only ever fires for no-label beads.
+      if [ "$AUTO_REFINO_INGEST_RAW_TRIAGEM" = "1" ] \
+         && [ "$(auto_refino_is_ingestable_raw "$c_id" "$c_type" "$c_labels" "$c_ephemeral" "$AUTO_REFINO_EXCLUDE_LABELS")" = "yes" ]; then
+        STORY="$row"; RAW_INGEST=1
+        log "  ingest $c_id: raw Triagem story (no story:* label) → applying story:unrefined entry label"
+        break
+      fi
+      : ;;  # skip
   esac
 done < <(echo "$CANDIDATES" | jq -c 'sort_by(.created_at // .id) | .[]')
 
@@ -371,6 +501,27 @@ STORY_ID=$(echo "$STORY" | jq -r '.id')
 STORY_TITLE=$(echo "$STORY" | jq -r '.title // ""')
 STORY_DESC=$(echo "$STORY" | jq -r '.description // ""')
 STORY_TYPE=$(echo "$STORY" | jq -r '.issue_type // .type // "feature"')
+
+# ── Step 1b: INGESTION — pre-label a raw Triagem story story:unrefined ─────────
+# A raw candidate (RAW_INGEST=1) carries NO story:* label, so the classifier
+# would call it "skip". Apply story:unrefined NOW (the entry label) so it becomes
+# an ordinary "fresh" candidate and flows through the EXACT existing fresh path
+# (claim → refine simplificado → story:refino-review → gate → needs-approval).
+# Additive (label add, not --set-labels) so any domain/non-lifecycle labels
+# survive. Update the in-memory STORY JSON too so STATE below resolves to "fresh".
+if [ "$RAW_INGEST" = "1" ]; then
+  if [ "$DRY_RUN" = "1" ]; then
+    log "WOULD ingest $STORY_ID: add story:unrefined entry label (raw Triagem) — DRY_RUN"
+  else
+    bd_ label add "$STORY_ID" "story:unrefined" -q 2>/dev/null || true
+    bd_ comment "$STORY_ID" "Auto-refino: história crua da Triagem (sem label de ciclo) ingerida no funil — story:unrefined aplicado. Vai passar pelo refino simplificado → gate → aprovação." 2>/dev/null || true
+    log "  Ingested $STORY_ID into the funnel (story:unrefined applied)."
+  fi
+  # Reflect the new entry label in the in-memory row so the lifecycle classifier
+  # (and every downstream consumer of STORY) sees a fresh, labelled story.
+  STORY=$(echo "$STORY" | jq -c '.labels = ((.labels // []) + ["story:unrefined"] | unique)')
+fi
+
 STORY_LABELS=$(_labels_csv "$STORY")
 STORY_ASSIGNEE=$(echo "$STORY" | jq -r '.assignee // empty')
 STATE=$(auto_refino_lifecycle_state "$STORY_LABELS" "$STORY_ASSIGNEE" "$AUTO_REFINO_ACTOR")
@@ -541,6 +692,11 @@ bd -C "$GC_CITY" label remove "$STORY_ID" "auto-refino:refining"
 bd -C "$GC_CITY" label remove "$STORY_ID" "story:refinement-in-progress"
 bd -C "$GC_CITY" label remove "$STORY_ID" "story:triage"
 bd -C "$GC_CITY" label remove "$STORY_ID" "story:unrefined"
+# SURFACE in the painel "Sua vez" human queue (ga-lfua3): add the canonical
+# escalation label AFTER the removes above so it survives. story:refino-escalado is
+# one of the painel's _SUAVEZ_LABELS; without it an escalated story (only the
+# daemon's auto-refino:escalated marker) renders in TRIAGEM, invisible to Athos.
+bd -C "$GC_CITY" label add "$STORY_ID" "story:refino-escalado"
 bd -C "$GC_CITY" comment "$STORY_ID" "Auto-refino NÃO conseguiu refinar com confiança (attempt $THIS_ATTEMPT). Perguntas/lacunas para o Athos:
 <liste as perguntas — decisões de produto que só o Athos toma>
 NÃO promovido, NÃO despachado."
@@ -646,6 +802,18 @@ case "$DECISION" in
     # survive), so the FRESH/UNREF/BOUNCE queries can no longer structurally return
     # it — structural belt to the escalated-marker + product-filter suspenders.
     _clear_lifecycle "$STORY_ID"
+    # BUG ga-lfua3: SURFACE the escalation in the painel's "Sua vez" human queue.
+    # _SUAVEZ_LABELS (painel_visibilidade.py:135) = {story:needs-approval,
+    # story:refino-escalado}. The daemon's own bookkeeping label
+    # (auto-refino:escalated) is NOT one of them, so an escalated story carrying
+    # only auto-refino:escalated rendered in TRIAGEM (looks un-triaged) and was
+    # invisible to Athos. Add the painel's CANONICAL escalation label so it shows
+    # in "Sua vez". This is ADDED AFTER _clear_lifecycle — and story:refino-escalado
+    # is deliberately NOT in AUTO_REFINO_LIFECYCLE_LABELS, so _clear_lifecycle never
+    # strips it and the candidate classifier (auto_refino_lifecycle_state) treats it
+    # as skip (not fresh/bounce), so it is NOT re-picked. Keep auto-refino:escalated
+    # (the daemon's durable skip/attempt-tracking marker) alongside it.
+    bd_ label add "$STORY_ID" "story:refino-escalado" -q 2>/dev/null || true
     if [ "$OUTCOME" != "ESCALATE" ]; then
       # Budget-exhaustion escalation (the refiner kept producing REFINED but the
       # gate kept bouncing). Record why.

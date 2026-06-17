@@ -35,19 +35,65 @@
 # "no active exhaustion event + only N output tokens in last 5h → NOT quota,
 # investigate the infra" — eliminating the false trail.
 #
+# ─────────────────────────────────────────────────────────────────────────────
+# ga-ot735: WEEKLY vs SESSION scope — STOP THE FALSE PAUSE
+# ─────────────────────────────────────────────────────────────────────────────
+# PROBLEM observed (false-pause, twice in one day): when the Max plan's WEEKLY
+# limit fires, Anthropic writes ONE "You've hit your weekly limit · resets Jun
+# 18 at 1pm" event. That event stays in the FUTURE for up to ~7 days, so EVERY
+# subsequent run read limited=true for DAYS — exit 2 → the gate/pilot fully
+# self-paused → the Mayor had to keep hand-adding GATE_QUOTA_OVERRIDE /
+# PILOT_QUOTA_OVERRIDE (a recurring band-aid flip-flop).
+#
+# WHY THE OLD BEHAVIOR WAS WRONG: the two scopes are NOT equivalent.
+#   • SESSION (5h rolling window): short, self-clearing in ≤5h, RELIABLE. When
+#     it fires, a NEW reviewer/builder session WILL immediately re-hit it and
+#     burn for nothing → pausing is correct.
+#   • WEEKLY: a multi-DAY ceiling. It is the LEAST reliable thing to pause on,
+#     because (a) it lingers for days, (b) on Max20 the 5h window almost always
+#     still has headroom underneath it, and (c) the weekly cap is the one Athos
+#     explicitly wants to keep working through (hence the manual overrides).
+#
+# RESEARCH FINDING (honest): there is NO reliable, documented, stable
+# programmatic source for a claude.ai SUBSCRIPTION account's REAL remaining
+# rolling-window quota. `claude` has no `usage`/`limits` subcommand; `claude
+# auth status` shows only login state; the Admin Usage/Cost/Rate-Limit APIs are
+# API-KEY-org only and do NOT cover subscription rolling windows; the real
+# five_hour/seven_day utilization numbers exist ONLY in-process and are handed
+# to a statusLine command's stdin during an INTERACTIVE session — they are not
+# persisted to any file an external daemon can poll, and are not written into
+# transcripts. So the ground-truth exhaustion EVENT remains the only reliable
+# signal we have. The fix is therefore NOT "read the real account" (impossible)
+# but "stop over-reacting to the unreliable WEEKLY event".
+#
+# THE FIX: the exit-2 / limited binary is now SCOPED.
+#   • An active SESSION (5h) exhaustion event  → limited=true, exit 2 (pause).
+#   • An active WEEKLY exhaustion event, with NO active session event, is
+#     ADVISORY by default: reported (weekly.active=true) but exit 0 — the gate
+#     keeps running on the still-available 5h window. Set
+#     CLAUDE_QUOTA_WEEKLY_HARD=1 to restore the old "weekly also pauses" behavior.
+#   • If BOTH are active, session wins (still exit 2).
+# This removes the days-long false pause and the manual-override flip-flop while
+# keeping the reliable, short, self-clearing 5h pause fully intact.
+# ─────────────────────────────────────────────────────────────────────────────
+#
 # USAGE
 #   claude-quota-check.sh            # human-readable report; exit 2 if limited
 #   claude-quota-check.sh --json     # machine-readable JSON
 #   claude-quota-check.sh --line     # one compact line (for embedding in alerts)
 #   claude-quota-check.sh --quiet    # no output; exit code only
 # EXIT CODES
-#   0 = NOT limited   2 = limited (active exhaustion event)   1 = internal error
+#   0 = NOT limited (incl. weekly-only, advisory)   2 = hard-limited (active 5h
+#       session exhaustion, or weekly when CLAUDE_QUOTA_WEEKLY_HARD=1)   1 = error
 #
 # ENV OVERRIDES (also used by the selftest for determinism)
 #   CLAUDE_PROJECTS_DIR        transcript root (default ~/.claude/projects)
 #   CLAUDE_QUOTA_NOW           epoch seconds to treat as "now" (default: real now)
 #   CLAUDE_QUOTA_TZ            tz for parsing reset clock times (default America/Sao_Paulo)
 #   CLAUDE_QUOTA_SCAN_ALL      1 = scan every transcript (no mtime prefilter; tests)
+#   CLAUDE_QUOTA_WEEKLY_HARD   1 = a weekly-only limit ALSO trips exit 2 (legacy
+#                              behavior). Default 0 = weekly is advisory, only the
+#                              5h session limit hard-pauses (ga-ot735).
 #   CLAUDE_QUOTA_BUDGET_BILLABLE  if set (>0), report billable-token % of this budget
 #                                 Calibrate once: note the billable number printed at
 #                                 the moment a real exhaustion event fires; set that.
@@ -60,6 +106,7 @@ PROJ="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 TZ_RESET="${CLAUDE_QUOTA_TZ:-America/Sao_Paulo}"
 NOW="${CLAUDE_QUOTA_NOW:-$(date +%s)}"
 BUDGET="${CLAUDE_QUOTA_BUDGET_BILLABLE:-0}"
+WEEKLY_HARD="${CLAUDE_QUOTA_WEEKLY_HARD:-0}"   # ga-ot735: 1 = weekly also hard-pauses
 WINDOW_SEC=18000   # 5h rolling session window
 
 MODE="human"
@@ -141,12 +188,20 @@ window_files() {
 
 # ----- Signal A: ground-truth exhaustion events -----
 # Emit "scope<TAB>reset_text<TAB>event_iso" for each quota-hit line.
+# ga-ot735: track the two scopes INDEPENDENTLY. The final hard verdict
+# (LIMITED / LIMIT_SCOPE / headline) is derived AFTER the scan in
+# resolve_verdict(), so a days-out weekly event can no longer mask or override
+# the short, reliable 5h session signal.
 LIMITED=0
 LIMIT_SCOPE="none"
 LIMIT_RESET_TEXT=""
 LIMIT_RESET_EPOCH=0
+SESSION_ACTIVE=0
+SESSION_RESET_TEXT=""
+SESSION_RESET_EPOCH=0
 WEEKLY_ACTIVE=0
 WEEKLY_RESET_TEXT=""
+WEEKLY_RESET_EPOCH=0
 
 scan_exhaustion() {
   local f scope text reset ev_iso ev_epoch reset_epoch matches files
@@ -171,18 +226,21 @@ scan_exhaustion() {
         reset_epoch=$(date_to_epoch "$ev_epoch" "$reset" 2>/dev/null) || reset_epoch=""
       fi
       [ -n "$reset_epoch" ] || continue
-      # active iff reset is still in the future relative to NOW
+      # active iff reset is still in the future relative to NOW. Record the
+      # latest-resetting active event PER SCOPE (independent tracks).
       if [ "$reset_epoch" -gt "$NOW" ]; then
         if [ "$scope" = "weekly" ]; then
           WEEKLY_ACTIVE=1
-          WEEKLY_RESET_TEXT="$reset"
-        fi
-        # prefer the latest-resetting active event as the headline
-        if [ "$reset_epoch" -gt "$LIMIT_RESET_EPOCH" ]; then
-          LIMITED=1
-          LIMIT_SCOPE="$scope"
-          LIMIT_RESET_TEXT="$reset"
-          LIMIT_RESET_EPOCH="$reset_epoch"
+          if [ "$reset_epoch" -gt "$WEEKLY_RESET_EPOCH" ]; then
+            WEEKLY_RESET_TEXT="$reset"
+            WEEKLY_RESET_EPOCH="$reset_epoch"
+          fi
+        else
+          SESSION_ACTIVE=1
+          if [ "$reset_epoch" -gt "$SESSION_RESET_EPOCH" ]; then
+            SESSION_RESET_TEXT="$reset"
+            SESSION_RESET_EPOCH="$reset_epoch"
+          fi
         fi
       fi
     done < <(grep -h "hit your" "$f" 2>/dev/null \
@@ -201,6 +259,41 @@ iso_to_epoch() {
   clean=$(printf '%s' "$iso" | sed -E 's/\.[0-9]+Z?$//; s/Z$//')
   # transcript timestamps are UTC
   TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "$clean" +%s 2>/dev/null || printf ''
+}
+
+# ----- ga-ot735: scope-aware hard verdict -----
+# resolve_verdict — collapse the two independent scope tracks (SESSION_*,
+# WEEKLY_*) into the single hard LIMITED binary the gate/pilot consume via exit
+# code. PURE: reads only the module-level scan results + WEEKLY_HARD; no IO.
+#
+# Precedence (the whole point of the fix):
+#   1. SESSION (5h) active            → LIMITED=1, scope=session. Short, reliable,
+#      self-clearing in ≤5h; a new run WILL re-hit it → pausing is correct.
+#   2. else WEEKLY active + WEEKLY_HARD=1 → LIMITED=1, scope=weekly (legacy opt-in).
+#   3. else WEEKLY active (default)   → LIMITED=0 (ADVISORY). weekly.active is
+#      still reported, but we do NOT pause the gate for days on the multi-day
+#      ceiling while the 5h window underneath it still has headroom. This is the
+#      single change that ends the recurring GATE_QUOTA_OVERRIDE flip-flop.
+#   4. else                          → LIMITED=0, scope=none.
+# When session wins it ALSO wins the headline reset fields, so the ETA the gate
+# logs is the relevant (sooner) 5h reset, not the days-out weekly one.
+resolve_verdict() {
+  if [ "$SESSION_ACTIVE" = "1" ]; then
+    LIMITED=1
+    LIMIT_SCOPE="session"
+    LIMIT_RESET_TEXT="$SESSION_RESET_TEXT"
+    LIMIT_RESET_EPOCH="$SESSION_RESET_EPOCH"
+  elif [ "$WEEKLY_ACTIVE" = "1" ] && [ "$WEEKLY_HARD" = "1" ]; then
+    LIMITED=1
+    LIMIT_SCOPE="weekly"
+    LIMIT_RESET_TEXT="$WEEKLY_RESET_TEXT"
+    LIMIT_RESET_EPOCH="$WEEKLY_RESET_EPOCH"
+  else
+    LIMITED=0
+    LIMIT_SCOPE="none"
+    LIMIT_RESET_TEXT=""
+    LIMIT_RESET_EPOCH=0
+  fi
 }
 
 # ----- Signal B: real token usage over the rolling 5h window -----
@@ -239,6 +332,7 @@ case "$MODE" in human|json) WANT_WINDOW=1 ;; esac
 [ "${CLAUDE_QUOTA_FORCE_WINDOW:-0}" = "1" ] && WANT_WINDOW=1
 
 scan_exhaustion
+resolve_verdict          # ga-ot735: scope the hard verdict (session pauses, weekly advisory)
 [ "$WANT_WINDOW" = "1" ] && scan_window
 
 # budget %
@@ -256,9 +350,15 @@ if [ "$LIMITED" = "1" ]; then
   RESET_ISO=$(date -r "$LIMIT_RESET_EPOCH" +%Y-%m-%dT%H:%M:%S%z 2>/dev/null)
 fi
 
-# headline verdict string
+# headline verdict string. ga-ot735: an advisory weekly limit (active weekly, no
+# active session, default soft mode) is NOT a hard pause — say so explicitly so
+# the log makes clear why the gate keeps running.
+WEEKLY_ADVISORY=0
+[ "$LIMITED" = "0" ] && [ "$WEEKLY_ACTIVE" = "1" ] && WEEKLY_ADVISORY=1
 if [ "$LIMITED" = "1" ]; then
   VERDICT="LIMITED (${LIMIT_SCOPE}) — resets ${LIMIT_RESET_TEXT} (in ${RESET_IN_MIN}min). THIS IS QUOTA."
+elif [ "$WEEKLY_ADVISORY" = "1" ]; then
+  VERDICT="not hard-limited — weekly limit active (advisory, resets ${WEEKLY_RESET_TEXT}) but 5h session window OK; gate keeps running. NOT a pause."
 elif [ "$WANT_WINDOW" = "1" ]; then
   VERDICT="not limited — no active exhaustion event (last 5h: ${TOK_OUTPUT} output / ${TOK_BILLABLE} billable tokens). NOT quota."
 else
@@ -274,6 +374,8 @@ emit_json() {
     --argjson reset_in_min "${RESET_IN_MIN}" \
     --argjson weekly_active "$([ "$WEEKLY_ACTIVE" = 1 ] && echo true || echo false)" \
     --arg weekly_reset "$WEEKLY_RESET_TEXT" \
+    --argjson weekly_hard "$([ "$WEEKLY_HARD" = 1 ] && echo true || echo false)" \
+    --argjson weekly_advisory "$([ "$WEEKLY_ADVISORY" = 1 ] && echo true || echo false)" \
     --argjson input "$TOK_INPUT" --argjson output "$TOK_OUTPUT" \
     --argjson cache_creation "$TOK_CACHE_CREATE" --argjson cache_read "$TOK_CACHE_READ" \
     --argjson billable "$TOK_BILLABLE" --argjson messages "$TOK_MSGS" \
@@ -288,7 +390,8 @@ emit_json() {
        reset_time_text: $reset_text,
        reset_time_iso: $reset_iso,
        reset_in_minutes: $reset_in_min,
-       weekly: { active: $weekly_active, reset_time_text: $weekly_reset },
+       weekly: { active: $weekly_active, reset_time_text: $weekly_reset,
+                 hard: $weekly_hard, advisory: $weekly_advisory },
        window_5h: {
          input_tokens: $input, output_tokens: $output,
          cache_creation_tokens: $cache_creation, cache_read_tokens: $cache_read,
@@ -312,11 +415,17 @@ case "$MODE" in
       echo " 🔴 LIMITED — scope: ${LIMIT_SCOPE}"
       echo "    resets: ${LIMIT_RESET_TEXT}  (in ${RESET_IN_MIN} min)"
       echo "    → This IS quota. Wait for reset; do not chase infra."
+      # weekly underneath an active session limit: note it, but it's not the headline.
+      [ "$LIMIT_SCOPE" = "session" ] && [ "$WEEKLY_ACTIVE" = "1" ] \
+        && echo "    ⚠ weekly limit ALSO active — resets ${WEEKLY_RESET_TEXT}"
+    elif [ "$WEEKLY_ADVISORY" = "1" ]; then
+      echo " 🟡 WEEKLY limit active (ADVISORY) — resets ${WEEKLY_RESET_TEXT}"
+      echo "    No active 5h session limit → the gate/pilot KEEP RUNNING (ga-ot735)."
+      echo "    → Not a hard pause. Set CLAUDE_QUOTA_WEEKLY_HARD=1 to pause on weekly too."
     else
       echo " 🟢 NOT limited — no active exhaustion event in transcripts."
       echo "    → If something is stalled, it is NOT quota. Investigate infra."
     fi
-    [ "$WEEKLY_ACTIVE" = "1" ] && echo "    ⚠ weekly limit ALSO active — resets ${WEEKLY_RESET_TEXT}"
     echo
     echo " Rolling 5h token usage (real, measured):"
     echo "    output:          ${TOK_OUTPUT}"
