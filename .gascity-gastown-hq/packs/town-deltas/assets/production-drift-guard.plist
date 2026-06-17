@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.production-drift-guard</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/production-drift-guard.sh</string>
+  </array>
+
+  <!-- KeepAlive: the script runs its own scan loop; restart if it ever exits. -->
+  <key>KeepAlive</key><true/>
+
+  <!-- Run immediately when loaded -->
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/production-drift-guard-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/production-drift-guard-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <!-- The town root, passed via the DEDICATED var so it never collides with a
+         session's $GT_ROOT (which in a gascity agent is the CITY dir, not the
+         town root). The script re-derives GIT_CEILING_DIRECTORIES from this. -->
+    <key>DRIFT_GT_ROOT</key>
+    <string>/Users/athos/gt</string>
+    <!-- Ceiling at the PARENT of the town root: a ceiling equal to the root
+         would block discovery of the town-root repo's own .git. -->
+    <key>GIT_CEILING_DIRECTORIES</key>
+    <string>/Users</string>
+  </dict>
+
+  <!-- Throttle: if the job exits too quickly, launchd waits 10s before restart -->
+  <key>ThrottleInterval</key><integer>10</integer>
+</dict>
+</plist>
