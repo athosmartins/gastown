@@ -54,6 +54,26 @@
 set -euo pipefail
 
 GC_CITY="${AUTO_REFINO_CITY_OVERRIDE:-${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}}"
+
+# ── Multi-store funnel (Mayor-diagnosed rig-store starvation) ─────────────────
+# Feature stories live in THREE separate bead stores: the HQ city store plus the
+# WhatsApp-automation (WA) and property-scrapers (PS) rig stores. The original
+# daemon only ever queried/wrote HQ ($GC_CITY), so a story created in a rig store
+# (e.g. a WA feature in story:triage, or a PS feature in story:unrefined) was
+# NEVER ingested into the refino funnel — it sat in the painel's "Triagem" column
+# forever, invisible to this daemon.
+#
+# Fix mirrors the PROVEN multi-store shape of context-check-dispatcher.sh: define
+# AUTO_REFINO_STORES (default = HQ + WA + PS), make bd_() target a per-iteration
+# store ($AR_STORE, defaulting to $GC_CITY so single-store callers/tests are
+# unchanged), and loop Step 0 / Step 0c / Step 1 over each store. The one-story-
+# per-sweep cap stays GLOBAL across stores: the FIRST store with an eligible
+# candidate is processed and the daemon returns; the launchd interval drains the
+# rest (a later sweep moves to the next store). Critically, query AND write-back
+# (claim, refiner task heredoc, outcome) all target the bead's OWN store — a WA
+# story's labels/comments/metadata land in the WA store, never in HQ.
+AUTO_REFINO_STORES="${AUTO_REFINO_STORES:-$GC_CITY /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers}"
+
 LOG_DIR="$GC_CITY/.gc/logs"
 LOG="$LOG_DIR/auto-refino-dispatcher.log"
 AR_LOG="$GC_CITY/.gc/auto-refino.jsonl"
@@ -306,8 +326,223 @@ if [ "${AUTO_REFINO_LIB:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
 fi
 
+# ── FIX C: single-instance mkdir-mutex (mirrors the Pilot daemon, ga-7s0or) ──
+# WHY: the refiner timeout (AUTO_REFINO_TIMEOUT_MINUTES, default 25m) is FAR longer
+# than the launchd interval (~5m). Without a lock, launchd starts a fresh sweep
+# every 5m while the previous one is still polling its refiner — so up to 5 sweeps
+# stack concurrently, each spawning a Sonnet refiner, blowing past the
+# auto-refiner template cap (max_active_sessions=3 in agents/auto-refiner/agent.toml).
+# Caught live running 5 refiners against a cap of 3 = real Sonnet + Dolt over-spend
+# while the higher stages sit idle. A single-instance lock caps it at ONE live
+# sweep: a second launchd invocation finds the lock held by a LIVE holder and
+# exits 0 mutating nothing, so the refiner count can never exceed 1-in-flight from
+# this daemon (≤ the cap).
+#
+# Mechanism copied verbatim in spirit from the Pilot daemon's fd-LESS lock:
+#   • atomic `mkdir` mutex (POSIX-atomic; no fd, so a leaked fd in the spawned
+#     refiner can never keep the dir "locked");
+#   • a heartbeat file whose MTIME marks liveness — a crashed sweep leaves the dir
+#     but stops refreshing it, so a stale holder (mtime age ≥ MAX_AGE) is recovered
+#     automatically via an atomic rename (only one recoverer can win the rename);
+#   • released on EXIT via trap, only if WE still own it (token match).
+# Env kill-switch: AUTO_REFINO_LOCK=0 disables the guard entirely (exact prior
+# behaviour). FAIL-OPEN: any error in the lock SYSTEM (mkdir/stat unavailable) must
+# never wedge the funnel — on an unexpected lock-internal failure we proceed.
+AUTO_REFINO_LOCK="${AUTO_REFINO_LOCK:-1}"
+AUTO_REFINO_LOCK_DIR="${TMPDIR:-/tmp}/auto-refino-dispatcher$(printf '%s' "$GC_CITY" | tr '/ ' '__').lock.d"
+AUTO_REFINO_LOCK_HB="$AUTO_REFINO_LOCK_DIR/heartbeat"
+# A real sweep can run up to the refiner timeout; size MAX_AGE above that so a
+# genuinely-busy sweep is never judged stale, while a crashed one is still reclaimed
+# within a couple of launchd intervals. Default = timeout + 10m headroom (seconds).
+AUTO_REFINO_LOCK_MAX_AGE="${AUTO_REFINO_LOCK_MAX_AGE:-$(( (AUTO_REFINO_TIMEOUT_MINUTES + 10) * 60 ))}"
+AUTO_REFINO_LOCK_TOKEN="$$:${RANDOM}${RANDOM}"
+
+# Age (seconds) of the heartbeat file; a huge number if it is missing.
+_ar_lock_hb_age() {
+  local _mt _now
+  _now=$(date +%s)
+  _mt=$(stat -f %m "$AUTO_REFINO_LOCK_HB" 2>/dev/null || stat -c %Y "$AUTO_REFINO_LOCK_HB" 2>/dev/null || echo "")
+  [ -z "$_mt" ] && { echo 999999999; return; }
+  echo $(( _now - _mt ))
+}
+
+_ar_lock_write_hb() { printf '%s\n' "$AUTO_REFINO_LOCK_TOKEN" > "$AUTO_REFINO_LOCK_HB" 2>/dev/null || true; }
+
+# Remove the lock dir only if WE still own it (token match) — never clobber a peer
+# that recovered our lock after we were (wrongly) judged stale.
+_release_ar_lock() {
+  local _own
+  _own=$(head -n1 "$AUTO_REFINO_LOCK_HB" 2>/dev/null || true)
+  [ "$_own" = "$AUTO_REFINO_LOCK_TOKEN" ] && rm -rf "$AUTO_REFINO_LOCK_DIR" 2>/dev/null
+  return 0
+}
+
+# Returns 0 if we own the lock, 1 if a LIVE sweep holds it (back off).
+_acquire_ar_lock() {
+  if mkdir "$AUTO_REFINO_LOCK_DIR" 2>/dev/null; then
+    _ar_lock_write_hb
+    return 0
+  fi
+  local _age
+  _age=$(_ar_lock_hb_age)
+  if [ "$_age" -lt "$AUTO_REFINO_LOCK_MAX_AGE" ] 2>/dev/null; then
+    return 1   # fresh heartbeat → a live sweep is running.
+  fi
+  # Stale holder. Atomically claim the recovery by renaming the dir aside; only one
+  # concurrent recoverer can win this rename (the rest get ENOENT).
+  local _reaped="${AUTO_REFINO_LOCK_DIR}.reaping.${AUTO_REFINO_LOCK_TOKEN}"
+  if mv "$AUTO_REFINO_LOCK_DIR" "$_reaped" 2>/dev/null; then
+    rm -rf "$_reaped" 2>/dev/null || true
+    if mkdir "$AUTO_REFINO_LOCK_DIR" 2>/dev/null; then
+      _ar_lock_write_hb
+      log "Recovered STALE auto-refino lock (heartbeat age ${_age}s ≥ ${AUTO_REFINO_LOCK_MAX_AGE}s) — taking over."
+      return 0
+    fi
+  fi
+  return 1   # lost the recovery race to a peer, or a fresh sweep beat us.
+}
+
+if [ "$AUTO_REFINO_LOCK" = "1" ]; then
+  if _acquire_ar_lock; then
+    trap '_release_ar_lock' EXIT
+  else
+    log "Another auto-refino sweep holds $AUTO_REFINO_LOCK_DIR — backing off (single-instance guard, FIX C). Refiner cap protected."
+    exit 0
+  fi
+fi
+
 # ── bd/gc wrappers ────────────────────────────────────────────────────────────
-bd_() { bd -C "$GC_CITY" "$@"; }
+# Targets the current per-iteration store ($AR_STORE), defaulting to $GC_CITY so
+# any caller outside the per-store loop (and the selftest) keeps single-store HQ
+# behaviour. Mirrors context-check-dispatcher.sh's `bd -C "${CC_STORE:-$GC_CITY}"`.
+bd_() { bd -C "${AR_STORE:-$GC_CITY}" "$@"; }
+
+# ── FIX B: cross-stage contention-yield (mirrors the Pilot daemon, ga-d0hz3) ─
+# WHY: the 3 autonomous daemons run stage-DESCENDING priority — gate-review
+# (highest) > execute-approved (Pilot) > refine-triage (THIS, lowest). The Pilot
+# already YIELDs to a congested Gate under resource contention (ga-d0hz3); refino,
+# the LOWEST stage, had no such guard and kept refining (Sonnet + Dolt churn) even
+# while the gate was backed up and the quota/Dolt were strained. This block makes
+# refino DEFER a sweep (log, exit 0, mutate NOTHING) IFF a higher stage has work
+# AND resources are contended — so the scarce Claude quota + Dolt go to the more
+# advanced stages first.
+#
+# DEFER iff:
+#   ( gate CONGESTED  [queued markers>0 OR running runs>0]
+#     OR the Pilot has approved work waiting [open story:approved, unassigned] )
+#   AND
+#   ( resources CONTENDED [Claude 5h quota limited OR Dolt hot/saturated] )
+#
+# ANTI-STARVATION: the defer is CONDITIONAL on resource-tight. When the quota is OK
+# AND Dolt is calm it NEVER defers — a calm, gate-empty, quota-OK moment ALWAYS
+# runs refino. The instant Dolt calms / the quota frees, refino resumes; it can
+# never be starved indefinitely.
+# FAIL-OPEN: every probe returns the NON-deferring value ("0") on any error, so a
+# bad/blind check can never wedge the refino funnel.
+# Env kill-switch: AUTO_REFINO_YIELD=0 disables the whole gate (exact prior behaviour).
+AUTO_REFINO_YIELD="${AUTO_REFINO_YIELD:-1}"
+# Thresholds + test seams mirror the Pilot's verbatim so both daemons read the same
+# saturation signal. Defaults match the Pilot daemon (lat>2500ms, cpu>200%).
+AUTO_REFINO_DOLT_LATENCY_MAX_MS="${AUTO_REFINO_DOLT_LATENCY_MAX_MS:-2500}"
+AUTO_REFINO_DOLT_CPU_MAX="${AUTO_REFINO_DOLT_CPU_MAX:-200}"
+AUTO_REFINO_DOLT_LATENCY_OVERRIDE_MS="${AUTO_REFINO_DOLT_LATENCY_OVERRIDE_MS:-}"
+AUTO_REFINO_DOLT_CPU_OVERRIDE="${AUTO_REFINO_DOLT_CPU_OVERRIDE:-}"
+AUTO_REFINO_QUOTA_OVERRIDE="${AUTO_REFINO_QUOTA_OVERRIDE:-}"
+AUTO_REFINO_GATE_CONGESTED_OVERRIDE="${AUTO_REFINO_GATE_CONGESTED_OVERRIDE:-}"
+AUTO_REFINO_PILOT_WORK_OVERRIDE="${AUTO_REFINO_PILOT_WORK_OVERRIDE:-}"
+
+# _ar_quota_limited → "1" iff the Claude 5h window is exhausted right now, else "0".
+# Mirrors the Pilot's _pilot_quota_limited (ga-x3nmz): ga-wjlv9 ground-truth
+# checker (exit 2 = LIMITED). FAIL-OPEN "0" when the checker is absent/errors.
+# Honors AUTO_REFINO_QUOTA_OVERRIDE ("2"=limited) test seam. Bounded. No mutation.
+_ar_quota_limited() {
+  if [ -n "$AUTO_REFINO_QUOTA_OVERRIDE" ]; then
+    [ "$AUTO_REFINO_QUOTA_OVERRIDE" = "2" ] && { printf '1'; return 0; }
+    printf '0'; return 0
+  fi
+  local _qc="${GC_CITY}/scripts/claude-quota-check.sh"
+  [ -x "$_qc" ] || { printf '0'; return 0; }
+  local _rc=0
+  timeout 15 bash "$_qc" --quiet >/dev/null 2>&1 || _rc=$?
+  [ "$_rc" = "2" ] && { printf '1'; return 0; }
+  printf '0'; return 0
+}
+
+# _ar_dolt_hot → "1" iff Dolt is saturated (latency OR cpu over ceiling), else "0".
+# Mirrors the Pilot's _dolt_probe/_dolt_saturated (ga-rk5va). NOTE the
+# deliberate difference: the Pilot fail-SAFEs a blind probe to SATURATED because it
+# is about to ADD heavy build load; refino (the lowest stage) instead fail-OPENs a
+# blind probe to "0" (NOT hot) per the FIX-B fail-open contract — a daemon that
+# can't read Dolt must keep refining, not wedge. Honors the latency/cpu test seams.
+_ar_dolt_hot() {
+  local _lat="" _cpu="" _pid="" _h
+  if [ -n "$AUTO_REFINO_DOLT_LATENCY_OVERRIDE_MS" ]; then
+    _lat="$AUTO_REFINO_DOLT_LATENCY_OVERRIDE_MS"
+  else
+    _h=$(GC_CITY="$GC_CITY" timeout 15 gc dolt health --json 2>/dev/null || echo "")
+    _lat=$(printf '%s' "$_h" | jq -r '.server.latency_ms // empty' 2>/dev/null || echo "")
+    _pid=$(printf '%s' "$_h" | jq -r '.server.pid // empty' 2>/dev/null || echo "")
+  fi
+  if [ -n "$AUTO_REFINO_DOLT_CPU_OVERRIDE" ]; then
+    _cpu="$AUTO_REFINO_DOLT_CPU_OVERRIDE"
+  elif [ -n "$_pid" ]; then
+    _cpu=$(ps -o %cpu= -p "$_pid" 2>/dev/null | tr -d ' ' | cut -d. -f1 || true)
+  fi
+  if [ -n "$_lat" ] && [ "$_lat" -ge 0 ] 2>/dev/null; then
+    [ "$_lat" -gt "$AUTO_REFINO_DOLT_LATENCY_MAX_MS" ] 2>/dev/null && { printf '1'; return 0; }
+  fi
+  if [ -n "$_cpu" ] && [ "$_cpu" -ge 0 ] 2>/dev/null; then
+    [ "$_cpu" -gt "$AUTO_REFINO_DOLT_CPU_MAX" ] 2>/dev/null && { printf '1'; return 0; }
+  fi
+  # Blind or healthy → "0" (NOT hot). FAIL-OPEN: refino keeps running.
+  printf '0'; return 0
+}
+
+# _ar_gate_congested → "1" iff the quality gate has work backed up, else "0".
+# Mirrors the Pilot's _pilot_gate_congested (ga-d0hz3): the gate's OWN
+# bookkeeping queries (type:quality-gate-marker + gate-status:queued, then
+# type:quality-gate-run + gate-status:running) against the HQ store where the gate
+# lives. The store is held in a local var (_hq) rather than an inline HQ-store
+# literal so the read here is not confused with the refiner heredoc's store-scoped
+# writes by the selftest's static drift-guard. FAIL-OPEN "0" on any error. Honors
+# AUTO_REFINO_GATE_CONGESTED_OVERRIDE.
+_ar_gate_congested() {
+  if [ -n "$AUTO_REFINO_GATE_CONGESTED_OVERRIDE" ]; then
+    [ "$AUTO_REFINO_GATE_CONGESTED_OVERRIDE" = "1" ] && { printf '1'; return 0; }
+    printf '0'; return 0
+  fi
+  local _hq="$GC_CITY" _q _r _n
+  _q=$(GC_CITY="$_hq" timeout 15 bd -C "$_hq" list --json --all \
+        -l type:quality-gate-marker -l gate-status:queued 2>/dev/null || echo "")
+  _n=$(printf '%s' "$_q" | jq 'length' 2>/dev/null || echo "")
+  if [ -n "$_n" ] && [ "$_n" -gt 0 ] 2>/dev/null; then printf '1'; return 0; fi
+  _r=$(GC_CITY="$_hq" timeout 15 bd -C "$_hq" list --json --all \
+        -l type:quality-gate-run -l gate-status:running 2>/dev/null || echo "")
+  _n=$(printf '%s' "$_r" | jq 'length' 2>/dev/null || echo "")
+  if [ -n "$_n" ] && [ "$_n" -gt 0 ] 2>/dev/null; then printf '1'; return 0; fi
+  printf '0'; return 0
+}
+
+# _ar_pilot_has_work → "1" iff the Pilot has approved work waiting to execute,
+# else "0". "Dispatchable" = an OPEN story:approved bead with a NULL assignee (the
+# Pilot skips any bead with a non-null assignee). Queried across ALL refino stores
+# (the same store set the daemon already ingests from) so an approved WA/PS story
+# counts too. Cheap read-only label count; first hit wins (short-circuit). FAIL-OPEN
+# "0" on any error. Honors AUTO_REFINO_PILOT_WORK_OVERRIDE ("1"/"0") test seam.
+_ar_pilot_has_work() {
+  if [ -n "$AUTO_REFINO_PILOT_WORK_OVERRIDE" ]; then
+    [ "$AUTO_REFINO_PILOT_WORK_OVERRIDE" = "1" ] && { printf '1'; return 0; }
+    printf '0'; return 0
+  fi
+  local _store _j _n
+  for _store in $AUTO_REFINO_STORES; do
+    _j=$(timeout 15 bd -C "$_store" list --label story:approved --status open --json 2>/dev/null || echo "")
+    # Count open approved beads with NO assignee (the Pilot's dispatchable shape).
+    _n=$(printf '%s' "$_j" | jq '[.[] | select((.assignee // "") == "")] | length' 2>/dev/null || echo "")
+    if [ -n "$_n" ] && [ "$_n" -gt 0 ] 2>/dev/null; then printf '1'; return 0; fi
+  done
+  printf '0'; return 0
+}
 
 # ── helper: read one label-CSV from a bead JSON row ───────────────────────────
 _labels_csv() { echo "$1" | jq -r '(.labels // []) | join(",")'; }
@@ -359,6 +594,14 @@ _clear_lifecycle() {
 
 log "Auto-refino sweep start (actor=$AUTO_REFINO_ACTOR, max_attempts=$AUTO_REFINO_MAX_ATTEMPTS, timeout=${AUTO_REFINO_TIMEOUT_MINUTES}m, dry_run=$DRY_RUN)"
 
+# ── Maintenance passes (Step 0 + 0c) run across ALL stores ────────────────────
+# TTL recovery and phantom-assignee reconcile are cheap, bounded, self-healing
+# passes. Run them for EVERY store each sweep (not just the one we end up refining
+# from) so a stuck/leaked claim in any rig store heals promptly. bd_ targets the
+# current $AR_STORE inside this loop.
+for AR_STORE in $AUTO_REFINO_STORES; do
+log "── maintenance store: $AR_STORE ──"
+
 # ── Step 0: TTL recovery — re-queue stories stuck mid-refine ──────────────────
 # If a story has been in auto-refino:refining for > TTL, the refiner (or this
 # dispatcher) died before reaching a terminal state. Drop the claim so a later
@@ -383,6 +626,68 @@ echo "$STUCK_JSON" | jq -c '.[]?' 2>/dev/null | while IFS= read -r row; do
   fi
 done
 
+# ── Step 0c: PHANTOM-ASSIGNEE reconcile — self-heal leaked claims ─────────────
+# Defensive belt for the phantom-assignee bug: the claim step sets
+# assignee=auto-refino so parallel refiners don't collide, but a story that has
+# ALREADY advanced past active refining (handed to the gate, approved, in-flight,
+# escalated, …) must NOT keep that assignee — the Pilot skips any bead with a
+# non-null assignee, so an approved feature stuck with assignee=auto-refino is
+# PERMANENTLY undispatchable (a launchd daemon can never "build" it).
+#
+# Query every open bead assigned to us, then clear the assignee on any that is NO
+# LONGER actively refining (i.e. does NOT carry both auto-refino:refining AND
+# story:refinement-in-progress). This heals the pre-existing leaks (ga-b9xn1,
+# ga-yx2d1, ga-m3n1x, ga-wgcyk) and any future one the terminal-clear missed.
+# Bounded by the assignee filter (only our own claims), idempotent, fail-open.
+RECONCILE_JSON=$(bd_ list --assignee "$AUTO_REFINO_ACTOR" --status open --json 2>/dev/null || echo "[]")
+echo "$RECONCILE_JSON" | jq -c '.[]?' 2>/dev/null | while IFS= read -r row; do
+  r_id=$(echo "$row" | jq -r '.id // empty')
+  [ -z "$r_id" ] && continue
+  r_labels=$(echo "$row" | jq -r '(.labels // []) | join(",")')
+  # Still actively refining (claim marker + in-progress lifecycle) → leave it.
+  case ",$r_labels," in
+    *,auto-refino:refining,*)
+      case ",$r_labels," in *,story:refinement-in-progress,*) continue ;; esac ;;
+  esac
+  # Advanced past refining but still wearing assignee=auto-refino → phantom. Clear.
+  log "  Phantom-assignee reconcile: $r_id no longer actively refining but assignee=$AUTO_REFINO_ACTOR — clearing."
+  if [ "$DRY_RUN" != "1" ]; then
+    bd_ update "$r_id" --assignee "" -q 2>/dev/null || true
+  fi
+done
+done  # end maintenance per-store loop (Step 0 + 0c)
+
+# ── FIX B: CROSS-STAGE contention-yield (mirrors the Pilot daemon, ga-d0hz3) ─
+# Refino is the LOWEST stage. BEFORE gathering candidates / spawning a refiner,
+# DEFER this sweep (mutate NOTHING, exit 0) when a more-advanced stage has work AND
+# resources are contended, so the scarce Claude quota + Dolt drain the higher stages
+# first. Probed AFTER the cheap self-healing maintenance passes (which are safe to
+# run every sweep) and BEFORE any candidate query / claim / spawn.
+#
+# Order (cheap-path first): only pay for the gate/pilot bead queries when resources
+# are ACTUALLY tight — when the quota is OK and Dolt is calm we run refino regardless,
+# so the higher-stage probes are skipped on the common (abundant) case. This is the
+# same cheap-path the Pilot uses (skip the congestion query when resources abundant).
+if [ "$AUTO_REFINO_YIELD" = "1" ]; then
+  _yield_quota_limited="$(_ar_quota_limited)"     # "1"/"0" (fail-open "0")
+  _yield_dolt_hot="$(_ar_dolt_hot)"               # "1"/"0" (fail-open "0")
+  _yield_resource_tight=0
+  { [ "$_yield_quota_limited" = "1" ] || [ "$_yield_dolt_hot" = "1" ]; } \
+    && _yield_resource_tight=1
+  if [ "$_yield_resource_tight" = "1" ]; then
+    # Resources are tight — now check whether a HIGHER stage actually has work.
+    _yield_gate_congested="$(_ar_gate_congested)"   # "1"/"0" (fail-open "0")
+    _yield_pilot_has_work="$(_ar_pilot_has_work)"   # "1"/"0" (fail-open "0")
+    if [ "$_yield_gate_congested" = "1" ] || [ "$_yield_pilot_has_work" = "1" ]; then
+      warn "Cross-stage YIELD (FIX B / ga-d0hz3): a higher stage has work (gate_congested=${_yield_gate_congested} pilot_has_work=${_yield_pilot_has_work}) and resources are CONTENDED (quota_limited=${_yield_quota_limited} dolt_hot=${_yield_dolt_hot}) — DEFERRING refino this sweep so the more-advanced stage drains first. Triagem stays queued; auto-resumes when Dolt calms / quota frees. Most-advanced-first."
+      notify -t "⏸️ Auto-refino cede aos estágios mais avançados" -p 2 "Auto-refino adiou refinar — estágio mais avançado com trabalho (gate=${_yield_gate_congested} pilot=${_yield_pilot_has_work}) + recurso contido (dolt_hot=${_yield_dolt_hot}, quota=${_yield_quota_limited}). Retoma quando o recurso aliviar (FIX B)." 2>/dev/null || true
+      log "Auto-refino sweep deferred (cross-stage yield: higher-stage work + resource-contended, FIX B). No mutation."
+      exit 0
+    fi
+    log "Cross-stage check (FIX B): resources contended (quota_limited=${_yield_quota_limited} dolt_hot=${_yield_dolt_hot}) but NO higher-stage work (gate_congested=${_yield_gate_congested} pilot_has_work=${_yield_pilot_has_work}) — refining normally."
+  fi
+fi
+
 # ── Step 1: Find candidate stories in Triagem (feature/story only) ────────────
 # Primary source query: fresh Triagem stories. We query each lifecycle label and
 # union, then classify each candidate with the pure core (defense in depth: the
@@ -392,6 +697,17 @@ done
 #
 # bug/chore/task NEVER carry story:* lifecycle labels and so never appear here —
 # but we ALSO assert type-eligibility per candidate so a mislabeled bug cannot leak.
+#
+# MULTI-STORE: gather + select across each store in turn (HQ, then WA, then PS).
+# The one-story-per-sweep cap is GLOBAL: the FIRST store that yields an eligible
+# candidate wins, we break out with $AR_STORE pinned to that store, and every
+# downstream write (claim, refiner task, outcome) targets THAT store via bd_. A
+# later sweep advances to the next store. Stores after the winner are simply not
+# visited this sweep (no work multiplied by 3).
+STORY=""
+RAW_INGEST=0   # set to 1 when the selected candidate is a raw no-label story to pre-label
+for AR_STORE in $AUTO_REFINO_STORES; do
+log "── candidate store: $AR_STORE ──"
 FRESH_JSON=$(bd_ list --label story:triage --type feature --status open \
   --exclude-label auto-refino:refining \
   --exclude-label auto-refino:escalated \
@@ -454,15 +770,13 @@ CANDIDATES=$(jq -s 'add | unique_by(.id)' \
   <(echo "$FRESH_JSON") <(echo "$UNREF_JSON") <(echo "$BOUNCE_JSON") <(echo "$RAW_JSON") 2>/dev/null || echo "[]")
 CCOUNT=$(echo "$CANDIDATES" | jq 'length' 2>/dev/null || echo 0)
 if [ "$CCOUNT" -eq 0 ] 2>/dev/null; then
-  log "No Triagem stories to auto-refine. Sweep done."
-  exit 0
+  log "  No Triagem stories in this store — next store."
+  continue
 fi
-log "$CCOUNT candidate story(ies) in Triagem (pre-classification)."
+log "  $CCOUNT candidate story(ies) in Triagem (pre-classification)."
 
 # Classify with the pure core; keep only fresh/bounce candidates of an eligible
 # type. Oldest-first (FIFO) so the backlog drains in arrival order.
-STORY=""
-RAW_INGEST=0   # set to 1 when the selected candidate is a raw no-label story to pre-label
 while IFS= read -r row; do
   [ -z "$row" ] && continue
   c_id=$(echo "$row" | jq -r '.id // empty')
@@ -492,10 +806,22 @@ while IFS= read -r row; do
   esac
 done < <(echo "$CANDIDATES" | jq -c 'sort_by(.created_at // .id) | .[]')
 
+# This store yielded an eligible candidate → stop here. $AR_STORE stays pinned to
+# this store so every downstream write targets the bead's own store.
+[ -n "$STORY" ] && { log "  Candidate selected from store $AR_STORE."; break; }
+log "  No eligible candidate in this store after classification — next store."
+done  # end candidate per-store loop (Step 1)
+
 if [ -z "$STORY" ]; then
-  log "No eligible candidate after classification (all skipped). Sweep done."
+  log "No eligible candidate after classification across all stores. Sweep done."
   exit 0
 fi
+
+# Pin the selected bead's store for ALL downstream writes (claim, refiner task
+# heredoc, outcome handling). bd_ already targets $AR_STORE; the refiner heredoc
+# below uses $AR_BEAD_STORE explicitly so the spawned Sonnet writes to the right
+# store rather than HQ.
+AR_BEAD_STORE="$AR_STORE"
 
 STORY_ID=$(echo "$STORY" | jq -r '.id')
 STORY_TITLE=$(echo "$STORY" | jq -r '.title // ""')
@@ -653,7 +979,7 @@ CONFIDENCE GATE — decide REFINE vs ESCALATE (do NOT guess):
 IF YOU CAN REFINE — write back to the STORY and hand to the gate (NOT
 needs-approval), then close the task bead:
 
-bd -C "$GC_CITY" update "$STORY_ID" \\
+bd -C "$AR_BEAD_STORE" update "$STORY_ID" \\
   --description "<F2: o que é + por que importa>" \\
   --acceptance "<F6 criteria, newline or - bullets>" \\
   --set-metadata "story.resumo=<F1>" \\
@@ -671,38 +997,38 @@ bd -C "$GC_CITY" update "$STORY_ID" \\
 # Transition ADDITIVELY (remove the in-progress lifecycle, add refino-review) so
 # unrelated labels are preserved; do NOT use --set-labels (it would clobber them).
 # This does NOT set needs-approval — only the gate promotes.
-bd -C "$GC_CITY" label remove "$STORY_ID" "story:refinement-in-progress"
-bd -C "$GC_CITY" label add "$STORY_ID" "story:refino-review"
-bd -C "$GC_CITY" label remove "$STORY_ID" "auto-refino:refining"
-bd -C "$GC_CITY" comment "$STORY_ID" "Auto-refino: refinado autonomamente (simplificado, attempt $THIS_ATTEMPT). Enviado ao gate de refino (ga-gpr2v) para revisão de qualidade."
+bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:refinement-in-progress"
+bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "story:refino-review"
+bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "auto-refino:refining"
+bd -C "$AR_BEAD_STORE" comment "$STORY_ID" "Auto-refino: refinado autonomamente (simplificado, attempt $THIS_ATTEMPT). Enviado ao gate de refino (ga-gpr2v) para revisão de qualidade."
 # Signal the dispatcher:
-bd -C "$GC_CITY" label add "$TASK_BEAD_ID" "outcome:REFINED"
-bd -C "$GC_CITY" label remove "$TASK_BEAD_ID" "outcome:pending"
-bd -C "$GC_CITY" close "$TASK_BEAD_ID"
+bd -C "$AR_BEAD_STORE" label add "$TASK_BEAD_ID" "outcome:REFINED"
+bd -C "$AR_BEAD_STORE" label remove "$TASK_BEAD_ID" "outcome:pending"
+bd -C "$AR_BEAD_STORE" close "$TASK_BEAD_ID"
 
 IF YOU CANNOT REFINE CONFIDENTLY — record the gaps/questions, escalate, do NOT
 promote and do NOT dispatch, then close the task bead:
 
-bd -C "$GC_CITY" update "$STORY_ID" \\
+bd -C "$AR_BEAD_STORE" update "$STORY_ID" \\
   --set-metadata "story.auto_refino_gaps=<perguntas/lacunas concretas, uma por linha — o que falta para refinar>"
-bd -C "$GC_CITY" label add "$STORY_ID" "auto-refino:escalated"
-bd -C "$GC_CITY" label remove "$STORY_ID" "auto-refino:refining"
+bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "auto-refino:escalated"
+bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "auto-refino:refining"
 # TERMINAL escalate: remove EVERY lifecycle label so no candidate query can re-pick
 # this story (the dispatcher reconciles this too, but be terminal here as well).
-bd -C "$GC_CITY" label remove "$STORY_ID" "story:refinement-in-progress"
-bd -C "$GC_CITY" label remove "$STORY_ID" "story:triage"
-bd -C "$GC_CITY" label remove "$STORY_ID" "story:unrefined"
+bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:refinement-in-progress"
+bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:triage"
+bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:unrefined"
 # SURFACE in the painel "Sua vez" human queue (ga-lfua3): add the canonical
 # escalation label AFTER the removes above so it survives. story:refino-escalado is
 # one of the painel's _SUAVEZ_LABELS; without it an escalated story (only the
 # daemon's auto-refino:escalated marker) renders in TRIAGEM, invisible to Athos.
-bd -C "$GC_CITY" label add "$STORY_ID" "story:refino-escalado"
-bd -C "$GC_CITY" comment "$STORY_ID" "Auto-refino NÃO conseguiu refinar com confiança (attempt $THIS_ATTEMPT). Perguntas/lacunas para o Athos:
+bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "story:refino-escalado"
+bd -C "$AR_BEAD_STORE" comment "$STORY_ID" "Auto-refino NÃO conseguiu refinar com confiança (attempt $THIS_ATTEMPT). Perguntas/lacunas para o Athos:
 <liste as perguntas — decisões de produto que só o Athos toma>
 NÃO promovido, NÃO despachado."
-bd -C "$GC_CITY" label add "$TASK_BEAD_ID" "outcome:ESCALATE"
-bd -C "$GC_CITY" label remove "$TASK_BEAD_ID" "outcome:pending"
-bd -C "$GC_CITY" close "$TASK_BEAD_ID"
+bd -C "$AR_BEAD_STORE" label add "$TASK_BEAD_ID" "outcome:ESCALATE"
+bd -C "$AR_BEAD_STORE" label remove "$TASK_BEAD_ID" "outcome:pending"
+bd -C "$AR_BEAD_STORE" close "$TASK_BEAD_ID"
 
 RULES: Never write story:approved or story:needs-approval. Never dispatch.
 Never invent a product decision — when in doubt, ESCALATE. Do not start any
@@ -782,6 +1108,13 @@ case "$DECISION" in
     bd_ update "$STORY_ID" --set-metadata "story.auto_refino_attempts=$THIS_ATTEMPT" -q 2>/dev/null || true
     # Defensive: ensure the claim marker is gone even if the refiner forgot.
     bd_ label remove "$STORY_ID" "auto-refino:refining" -q 2>/dev/null || true
+    # PHANTOM-ASSIGNEE FIX: the claim step set assignee=auto-refino so parallel
+    # refiners would not collide. The daemon is a launchd job, NOT a live crew —
+    # it can never "build". Once the story leaves our hands (handed to the gate),
+    # it must carry a NULL assignee, or the Pilot (which skips any bead with a
+    # non-null assignee) treats it as already-owned and NEVER dispatches the
+    # approved feature. Clear it at the terminal handoff. Idempotent / fail-open.
+    bd_ update "$STORY_ID" --assignee "" -q 2>/dev/null || true
     log "  $STORY_ID → handed to refino gate (story:refino-review). Gate decides promotion."
     ;;
   escalate)
@@ -802,6 +1135,11 @@ case "$DECISION" in
     # survive), so the FRESH/UNREF/BOUNCE queries can no longer structurally return
     # it — structural belt to the escalated-marker + product-filter suspenders.
     _clear_lifecycle "$STORY_ID"
+    # PHANTOM-ASSIGNEE FIX: clear the claim assignee on escalate too. The story
+    # now waits on Athos (story:refino-escalado); leaving assignee=auto-refino
+    # would make it undispatchable forever should Athos approve it later, since
+    # the Pilot skips any non-null-assignee bead. Idempotent / fail-open.
+    bd_ update "$STORY_ID" --assignee "" -q 2>/dev/null || true
     # BUG ga-lfua3: SURFACE the escalation in the painel's "Sua vez" human queue.
     # _SUAVEZ_LABELS (painel_visibilidade.py:135) = {story:needs-approval,
     # story:refino-escalado}. The daemon's own bookkeeping label
