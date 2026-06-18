@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -341,8 +340,5 @@ func processAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	if err := syscall.Kill(pid, 0); err != nil {
-		return false
-	}
-	return true
+	return isProcessRunning(pid)
 }

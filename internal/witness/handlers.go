@@ -740,7 +740,7 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 	if townRoot == "" {
 		return
 	}
-	decision := slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType)
+	decision := slotOpenDecision(townRoot, rigName, polecatName, exitType)
 	if !decision.Reusable {
 		_, _ = channelevents.EmitToTown(townRoot, "mayor", "SLOT_BLOCKED", []string{
 			"source=witness",
@@ -779,7 +779,7 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 	_ = cmd.Run()
 }
 
-func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) polecat.SlotReuseDecision {
+func slotOpenDecision(townRoot, rigName, polecatName, exitType string) polecat.SlotReuseDecision {
 	if exitType != string(ExitTypeCompleted) {
 		return polecat.SlotReuseDecision{Reason: "exit-" + strings.ToLower(exitType)}
 	}
