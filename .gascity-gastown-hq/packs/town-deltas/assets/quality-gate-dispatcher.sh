@@ -1740,7 +1740,7 @@ if [ "$ALREADY_MERGED" = "1" ]; then
   # Drive the source bead to its terminal/handoff state if open.
   if [ -n "$BEAD_ID" ]; then
     BD_STATUS=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
-      | jq -r 'if type=="array" then .[0] else . end | .status // "open"')
+      | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
     if [ "$BD_STATUS" != "closed" ]; then
       # ga-i53ua: route a STORY already-merged through the SAME delivery completion
       # as the PASS path — do NOT just mark gate:superseded and leave it OPEN at
@@ -1999,7 +1999,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # Read current rebase-attempt counter from the marker labels.
     REBASE_ATTEMPT=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null \
-      | sed -n 's/^gate:rebase-attempt:\([0-9]\+\)$/\1/p' | sort -rn | head -1)
+      | sed -n 's/^gate:rebase-attempt:\([0-9]\+\)$/\1/p' | sort -rn | head -1 || true)
     [ -z "$REBASE_ATTEMPT" ] && REBASE_ATTEMPT=0
 
     bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
@@ -2629,7 +2629,7 @@ while true; do
     # Close any remaining pending verdict beads as timed-out
     for VB in "${VERDICT_BEAD_IDS[@]}"; do
       VB_STATUS=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null \
-        | jq -r 'if type=="array" then .[0] else . end | .status // "open"')
+        | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
       if [ "$VB_STATUS" != "closed" ]; then
         bd -C "$GC_CITY" label remove "$VB" "verdict:pending" -q 2>/dev/null || true
         bd -C "$GC_CITY" label add    "$VB" "verdict:TIMEOUT" -q 2>/dev/null || true
@@ -2925,7 +2925,7 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
   # Park pending verdict beads as REQUEUED so they don't orphan or count as FAIL.
   for VB in "${VERDICT_BEAD_IDS[@]}"; do
     VB_STATUS=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null \
-      | jq -r 'if type=="array" then .[0] else . end | .status // "open"')
+      | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
     if [ "$VB_STATUS" != "closed" ]; then
       bd -C "$GC_CITY" label remove "$VB" "verdict:pending" -q 2>/dev/null || true
       bd -C "$GC_CITY" label add    "$VB" "verdict:REQUEUED" -q 2>/dev/null || true
