@@ -533,6 +533,17 @@ bead_content_rig() {
         ((.labels // []) | join(" ")) ] | join("  ")
     ' 2>/dev/null || echo "")
   [ -z "$hay" ] && { echo ""; return 0; }
+  # WA-INTEGRATION PRECEDENCE (ga-lt8cw/ga-nq64a, 2026-06-19): the WA orchestration/
+  # integration layer — pipedrive deals, whapi/whatsapp messaging, the urblink painel,
+  # and the Drive bridges that TRIGGER an existing Hex notebook — CONSUMES property data,
+  # so its beads carry property nouns (imóvel/ITBI/Hex/CNPJ) too. Without this guard the
+  # property check below wins on first-match and the build misroutes to property_scrapers
+  # (batista-ps then circuit-breaks → re-dispatch loop). These signals NEVER occur in a
+  # genuine property data-build (scrape/consolidate/classify), so they safely precede it.
+  # Narrow on purpose: e.g. "drive bridge" (the WA itbi_drive_bridge), not bare "Hex".
+  if printf '%s' "$hay" | grep -iqE 'pipedrive|whapi|whatsapp|urblink_design_system|drive[_ ]bridge'; then
+    echo "whatsapp_automation"; return 0
+  fi
   # property_scrapers domain (the recurring misroute family).
   if printf '%s' "$hay" | grep -iqE 'scraper|scrape|\bcadastro\b|cadastr[ao]|\bITBI\b|\bRFB\b|receita federal|\bCNAE\b|\bCNPJ\b|\bPBH\b|motherduck|\bHex\b|hex notebook|geocod|georreferenc|lat[ -/]?lon|point-in-polygon|pesquisa_mercado|propriet[áa]ri|\bim[óo]vel\b|\bim[óo]veis\b|\blote\b|\blotes\b|\bterreno\b|terreno_livre|cart[óo]rio|matr[íi]cula|incorpora|índice cadastral|indice cadastral|mega_data_set|mega data set'; then
     echo "property_scrapers"; return 0

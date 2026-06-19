@@ -1661,6 +1661,44 @@ has "$DISPATCHER" 'PILOT_DOMAIN_ROUTE_GUARD'            "domain-route guard knob
 has "$DISPATCHER" 'bead_content_rig\(\)'               "content→rig classifier is defined"
 has "$DISPATCHER" 'rig_domain_default_builder\(\)'     "domain→persistent-crew map is defined"
 
+# ── Scenario 18g/18h (ga-lt8cw/ga-nq64a): WA-integration beads that CARRY property
+# vocabulary must NOT misroute to property_scrapers/batista-ps. ROOT: bead_content_rig
+# checked property keywords first, so a pipedrive deal ("imóveis do proprietário") or
+# the itbi_drive_bridge ("ITBI/Hex") matched property and landed on batista-ps, which
+# circuit-broke it → re-dispatch loop. The WA-integration precedence (pipedrive/whapi/
+# whatsapp/urblink/drive bridge) must win, so these defer (or route to a live WA owner),
+# never to property_scrapers or a dog.
+echo "Scenario 18g (ga-lt8cw): WA pipedrive feature with property nouns → NOT property_scrapers/dog"
+WA_PIPEDRIVE='[{"id":"ga-lt8test","title":"Pipedrive: incluir demais imoveis do mesmo proprietario ao enviar deal","priority":3,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-06-12T00:00:03Z","metadata":{"story.o_que_e":"ao enviar um deal ao pipedrive o payload inclui os demais imoveis do mesmo proprietario CPF/CNPJ"}}]'
+LOG18G="$(run_capacity 10 "[]" 1 "$WA_PIPEDRIVE")"
+B18G="$(dispatched_builder "$LOG18G")"
+if [ "$B18G" = "batista-ps" ]; then
+  bad "REGRESSION (ga-lt8cw): WA pipedrive feature misrouted to property_scrapers/batista-ps"
+elif echo "$B18G" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION (ga-lt8cw): WA pipedrive feature landed on the dog pool ($B18G)"
+elif echo "$LOG18G" | grep -q "whatsapp_automation domain build" || [ -z "$B18G" ]; then
+  ok "WA pipedrive feature classified WA → deferred/owned, not the property misroute"
+else
+  bad "WA pipedrive feature routed unexpectedly (got: '${B18G:-none}')"
+fi
+
+echo "Scenario 18h (ga-nq64a): WA itbi_drive_bridge feature with ITBI/Hex nouns → NOT property_scrapers/dog"
+WA_BRIDGE='[{"id":"ga-nqtest","title":"ITBI bridge dispara itbi_combiner via Hex API quando espelha mes novo","priority":2,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-06-18T00:00:01Z","metadata":{"story.o_que_e":"o scripts/itbi_drive_bridge.py espelha o relatorio ITBI para a pasta Drive e dispara o notebook itbi_combiner Hex via run API; scrapers PBH"}}]'
+LOG18H="$(run_capacity 10 "[]" 1 "$WA_BRIDGE")"
+B18H="$(dispatched_builder "$LOG18H")"
+if [ "$B18H" = "batista-ps" ]; then
+  bad "REGRESSION (ga-nq64a): WA itbi_drive_bridge feature misrouted to property_scrapers/batista-ps"
+elif echo "$B18H" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION (ga-nq64a): WA bridge feature landed on the dog pool ($B18H)"
+elif echo "$LOG18H" | grep -q "whatsapp_automation domain build" || [ -z "$B18H" ]; then
+  ok "WA bridge feature classified WA → deferred/owned, not the property misroute"
+else
+  bad "WA bridge feature routed unexpectedly (got: '${B18H:-none}')"
+fi
+
+echo "Scenario 18i: drift-guard — WA-integration precedence is wired into bead_content_rig"
+has "$DISPATCHER" 'WA-INTEGRATION PRECEDENCE'          "WA-integration precedence guard is wired"
+
 # ── Scenario 19 (wa-u5r1): dispatchable-queue emit for the painel ─────────────
 echo "Scenario 19a: emit writes valid JSON with the contract shape + count + items"
 F19="$(run_emit)"
