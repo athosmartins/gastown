@@ -51,6 +51,7 @@ WA="/Users/athos/gt/whatsapp_automation"
 LOG_DIR="$CITY/.gc/logs"
 LOG="$LOG_DIR/config-drift-watcher.log"
 GC="${GC:-gc}"
+HOOKS_DIR="${CITY}/.beads/hooks"
 
 # Skip log redirect in lib mode so the selftest can capture its own output.
 if [ "${CONFIG_DRIFT_WATCHER_LIB:-0}" != "1" ]; then
@@ -61,14 +62,16 @@ fi
 log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [drift-watcher] $*"; }
 err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [drift-watcher] ERROR: $*"; }
 
-log "=== config-drift-watcher started (PID $$) ==="
+if [[ "${CONFIG_DRIFT_WATCHER_LIB:-0}" != "1" ]]; then
+    log "=== config-drift-watcher started (PID $$) ==="
 
-# Startup marker for delivery freshness verification (ga-fbjg).
-# Prod-test reads this to confirm the live process was restarted, not merely
-# that the script file changed on disk.
-STATE_DIR="$CITY/.gc/state"
-mkdir -p "$STATE_DIR"
-printf '%s %s\n' "$$" "$(date +%s)" > "$STATE_DIR/config-drift-watcher.startup"
+    # Startup marker for delivery freshness verification (ga-fbjg).
+    # Prod-test reads this to confirm the live process was restarted, not merely
+    # that the script file changed on disk.
+    STATE_DIR="$CITY/.gc/state"
+    mkdir -p "$STATE_DIR"
+    printf '%s %s\n' "$$" "$(date +%s)" > "$STATE_DIR/config-drift-watcher.startup"
+fi
 
 # ── Build list of watched paths ───────────────────────────────────────────────
 # Returns hash of all relevant files. Using find+stat over the watched dirs.
@@ -169,7 +172,6 @@ do_soft_reload_async() {
 # fix keeps the dir empty+locked; a future gc op / gc doctor --fix could silently
 # unlock it. This guard re-asserts the lock on every HOOKS_CHECK_INTERVAL and
 # remediates + notifies on drift so the gate outage cannot silently recur.
-HOOKS_DIR="$CITY/.beads/hooks"
 
 check_hooks_guard() {
     local needs_fix=0 reason_parts=""
@@ -217,7 +219,6 @@ check_hooks_guard() {
         notify -t "Gas City: hooks-guard FAIL" -p 5 ".beads/hooks still drifted after fix attempt ($reason_parts)" 2>/dev/null || true
     fi
 }
-
 # ── Configuration ─────────────────────────────────────────────────────────────
 POLL_INTERVAL=3         # seconds between file-hash checks
 DEBOUNCE_WINDOW=2       # seconds to wait after last file change before reloading
@@ -241,6 +242,9 @@ fi
 prev_hash=$(compute_hash)
 last_heartbeat_time=$(date +%s)
 
+# Assert hooks-lock invariant at startup before first heartbeat.
+check_hooks_guard
+
 log "Initial hash: $prev_hash"
 log "Watching: $CITY/skills, $CITY/.claude/skills, $WA/crew/*/.claude/skills/, $WA/city-local/skills/, city.toml, pack.toml, agents/, scripts/*.{sh,py}"
 log "Poll interval: ${POLL_INTERVAL}s, debounce: ${DEBOUNCE_WINDOW}s, heartbeat: ${HEARTBEAT_INTERVAL}s"
@@ -255,6 +259,7 @@ while true; do
     heartbeat_elapsed=$(( now - last_heartbeat_time ))
     if (( heartbeat_elapsed >= HEARTBEAT_INTERVAL )); then
         do_soft_reload_async "heartbeat at $(date '+%H:%M:%S')"
+        check_hooks_guard
         last_heartbeat_time=$now
     fi
 
