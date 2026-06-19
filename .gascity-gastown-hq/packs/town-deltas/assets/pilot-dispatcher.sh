@@ -286,22 +286,46 @@ PILOT_OWNERSHIP_GUARD="${PILOT_OWNERSHIP_GUARD:-1}"
 # ── ctx:ready auto-dispatch — chore/task/debt with a trusted context check ─────
 # Final phase of the auto-dispatch architecture. A LIVE, LABEL-ONLY context-check
 # daemon now annotates bug/chore/task/debt beads with ctx:ready (context-complete,
-# enough spec for a generic builder) or ctx:thin (under-specified). Today the Pilot
-# queries ONLY type:bug + tech-debt + story:approved features — chore/task beads are
-# NEVER queried (the design's known coverage gap). This knob, when set to 1, adds a
-# new candidate query for chore/task/debt beads (NO story:* label) carrying
-# `-l ctx:ready`, merging them into the SAME priority-ordered pool as Tier-1/Tier-2
-# and passing them through the IDENTICAL filter chain (_filter_candidates incl. the
-# empty-veto, _filter_unblocked, _filter_explicit_deps, domain-routing, lane:big,
-# dedup). The per-bead dispatch template is already type-derived (wa-tm2a) so a
-# chore/task routes to the right builder automatically.
+# enough spec for a generic builder) or ctx:thin (under-specified). The Pilot's
+# legacy queries cover ONLY type:bug + tech-debt + story:approved features —
+# chore/task beads fell in NO tier and were never dispatched (~28 sat idle forever:
+# the design's known coverage gap). This knob adds a new candidate query for
+# chore/task/debt beads (NO story:* label) carrying `-l ctx:ready`, merging them
+# into the SAME priority-ordered pool as Tier-1/Tier-2 and passing them through the
+# IDENTICAL filter chain (_filter_candidates incl. the empty-veto, _filter_unblocked,
+# _filter_explicit_deps, domain-routing, lane:big, dedup). The per-bead dispatch
+# template is already type-derived (wa-tm2a) so a chore/task routes to the right
+# builder automatically. exec:manual beads are NOT excluded — they ARE dispatched;
+# the crew attempts the work and, if blocked by a physical/human action, files an
+# automation-gap follow-up bead (crew behaviour, not a Pilot-script concern).
 #
-# DEFAULT 0 → the new query NEVER runs → this file is INERT (byte-equivalent
-# behaviour to the pre-change dispatcher). The Mayor deploys it OFF and flips it on
-# (PILOT_CTX_READY_QUERIES=1, e.g. in the launchd plist env) once the ctx: labels
-# are trusted. ctx:thin is explicitly excluded as defense-in-depth: an under-spec'd
-# bead must NEVER be dispatched even if it somehow also carried ctx:ready.
-PILOT_CTX_READY_QUERIES="${PILOT_CTX_READY_QUERIES:-0}"
+# DEFAULT 1 (flipped from 0 — Athos directive: the autonomous system must build the
+# whole ready backlog itself, not just the funnel). Still env-gated so the Mayor can
+# turn it OFF (PILOT_CTX_READY_QUERIES=0 in the launchd plist env) if the ctx:
+# labels ever regress. ctx:thin is explicitly excluded as defense-in-depth: an
+# under-spec'd bead must NEVER be dispatched even if it somehow also carried
+# ctx:ready.
+#
+# WHY default-on is now SAFE (the original 0 default was a trust gate on the new
+# ctx: labels + a flood guard — both are addressed):
+#   1. ctx:ready candidates are sourced UPSTREAM of, and merged into, the same
+#      ALL_CANDIDATES_JSON pool the existing tiers use. They are therefore bound by
+#      the EXACT same Step-3 per-lane caps (MAX_SMALL / MAX_BIG): the Pilot can never
+#      dispatch more than the free slots in each lane, regardless of how many
+#      ctx:ready beads are queued. A backlog of 28 cannot flood the crews — it drains
+#      at the lane-cap rate, one slot per freed slot per sweep, exactly like bugs.
+#   2. They are also bound by the ga-d0hz3 cross-stage admission yield, which runs
+#      at the TOP of the sweep (before any candidate sourcing): when the Gate is
+#      congested AND resources are contended (quota-limited or Dolt hot) the WHOLE
+#      sweep defers dispatch — ctx:ready work included — so turning this on can never
+#      pile pressure onto an already-congested Gate or a hot Dolt.
+#   3. Every existing exclusion is preserved verbatim: non-empty assignee (owned),
+#      story:in-flight, story:done, gate:passed, pilot:dispatching, gate:needs-human,
+#      needs:engine-window, pilot:dispatched, epics, pre-approval labels, empty
+#      description, blocked deps, explicit deps. The query only ADDS a source; it
+#      loosens nothing. A bad/empty ctx:ready query fails open to "[]" and can never
+#      break the core bug/story dispatch.
+PILOT_CTX_READY_QUERIES="${PILOT_CTX_READY_QUERIES:-1}"
 
 # Dry-run mode: show what WOULD happen, make zero changes.
 DRY_RUN="${DRY_RUN:-0}"
@@ -986,9 +1010,10 @@ _filter_explicit_deps() {
 # of the Pilot's dispatch queue — EXACTLY the open beads the Pilot would dispatch
 # NOW: NOT in-flight, NOT assigned, NOT braked (gate:needs-human / engine-window /
 # pre-approval lifecycle), and ONLY the types the Pilot actually queries (type:bug
-# + tech-debt + story:approved features; ctx:ready chore/task ONLY when
-# PILOT_CTX_READY_QUERIES=1 — the painel must not show ctx:ready work the Pilot
-# never queries). The PILOT is the single source of truth: it computes its own
+# + tech-debt + story:approved features; ctx:ready chore/task whenever
+# PILOT_CTX_READY_QUERIES=1, which is now the DEFAULT — the painel must not show
+# ctx:ready work the Pilot never queries). The PILOT is the single source of truth:
+# it computes its own
 # eligible set with its own filters and writes it here; the painel renders exactly
 # this file. The set is the FULL eligible queue (every dispatchable candidate),
 # NOT the lane-cap-limited subset the Pilot picks in one sweep — so the painel
@@ -1913,21 +1938,24 @@ TIER2_JSON=$(echo "$TIER2_JSON" | _filter_explicit_deps "$GC_CITY")
 TIER2_COUNT=$(echo "$TIER2_JSON" | jq 'length' 2>/dev/null || echo "0")
 log "Story:approved features: $TIER2_COUNT candidate(s) in HQ DB"
 
-# ── Step 2a-ctx: ctx:ready chore/task/debt beads — OFF by default ─────────────
+# ── Step 2a-ctx: ctx:ready chore/task/debt beads — ON by default ──────────────
 # Final auto-dispatch phase (PILOT_CTX_READY_QUERIES). A context-check daemon now
 # labels bug/chore/task/debt beads ctx:ready (context-complete) or ctx:thin
-# (under-specified). The Pilot's existing queries cover type:bug + tech-debt +
-# story:approved features but NEVER chore/task — the design's known gap. This query
-# closes it: chore/task/debt beads that carry `-l ctx:ready` (and NO story:* label,
-# so this is strictly the non-funnel work) become candidates, merged into the SAME
-# pool below and run through the IDENTICAL filter chain. ctx:thin is excluded
-# explicitly (defense-in-depth) so an under-spec'd bead never dispatches even if it
-# somehow also wore ctx:ready. tech-debt overlap with Tier-1 is harmless: the union
-# dedups by id, so a ctx:ready tech-debt bead already in Tier-1 is not double-listed.
+# (under-specified). The Pilot's legacy queries cover type:bug + tech-debt +
+# story:approved features but NEVER chore/task — the design's known gap that left
+# ~28 ready chore/task beads idle forever. This query closes it: chore/task/debt
+# beads that carry `-l ctx:ready` (and NO story:* label, so this is strictly the
+# non-funnel work) become candidates, merged into the SAME pool below and run
+# through the IDENTICAL filter chain. ctx:thin is excluded explicitly (defense-in-
+# depth) so an under-spec'd bead never dispatches even if it somehow also wore
+# ctx:ready. tech-debt overlap with Tier-1 is harmless: the union dedups by id, so a
+# ctx:ready tech-debt bead already in Tier-1 is not double-listed.
 #
-# GATED OFF (PILOT_CTX_READY_QUERIES default 0) → the query is SKIPPED entirely →
-# CTXREADY_JSON stays "[]" → the union below is byte-equivalent to today. Flip the
-# env to 1 (Mayor, once ctx: labels are trusted) to activate. The same lifecycle/
+# GATED ON (PILOT_CTX_READY_QUERIES default 1) → these candidates flow every sweep.
+# Set the env to 0 (Mayor, in the plist) to disable if the ctx: labels regress. The
+# new candidates are bound by the SAME Step-3 lane caps + the ga-d0hz3 cross-stage
+# yield as every other tier, so turning this on cannot flood the Gate or the crews:
+# a 28-deep backlog drains one-per-free-slot, never faster. The same lifecycle/
 # in-flight/engine-window/epic exclusions as every other query are applied so a
 # ctx:ready bead that is already in-flight, dispatched, or human-gated is skipped.
 CTXREADY_JSON="[]"

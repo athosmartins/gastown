@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+# context-check-dispatcher.selftest.sh — Regression harness for the Context-check
+# creation-gate daemon ("Option D"). Proves the PURE decision core in isolation
+# (no live Dolt/gc/Claude), then DRIFT-GUARDS the live wiring so a future refactor
+# cannot silently break the design contract.
+#
+# Sources the dispatcher in lib-only mode (CONTEXT_CHECK_LIB=1) to unit-test the
+# REAL functions the shipped dispatcher calls, so the tested logic IS the shipped
+# logic (no parallel reimplementation).
+#
+# Contract proven:
+#   - only actionable types judged; plumbing excluded     → Scenarios 1, 2.
+#   - idempotence / anti-loop (ctx:* already present)       → Scenario 3.
+#   - lifecycle-skip (in-flight/done/gate-stuck)            → Scenario 4.
+#   - complete → ctx:ready ; empty/vague → ctx:thin         → Scenarios 5, 6, 7.
+#   - terse-complete is NOT falsely thin (positive label)   → Scenario 6b (uncertain band).
+#   - fail-toward-human: uncertain/timeout → ctx:thin       → Scenario 8.
+#   - verdict vocabulary bounded to ctx:ready/ctx:thin      → Scenario 9.
+#   - LABEL-ONLY: never dispatch/sling/close/lifecycle      → drift guards.
+#   - DRY_RUN proof-mode runs clean (no write, no spawn)    → drift guard.
+#
+# Exit 0 iff every assertion holds.
+
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DISPATCHER="$SELF_DIR/context-check-dispatcher.sh"
+
+PASS=0
+FAIL=0
+ok()  { echo "  ✓ $*"; PASS=$((PASS+1)); }
+bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
+
+if [ ! -f "$DISPATCHER" ]; then
+  echo "FATAL: dispatcher not found at $DISPATCHER" >&2
+  exit 2
+fi
+
+echo "context-check-dispatcher.selftest — pure decision core + drift guards (Option D)"
+
+# Source the dispatcher in lib-only mode (pure functions only, no side effects).
+CONTEXT_CHECK_LIB=1 . "$DISPATCHER"
+
+if declare -F context_check_verdict_label >/dev/null 2>&1; then
+  ok "sourced lib-only: context_check_verdict_label is defined"
+else
+  bad "lib-only source did not expose context_check_verdict_label"
+  echo "PASS=$PASS FAIL=$FAIL"; exit 1
+fi
+
+# Pin the exclude sets the pure plumbing classifier reads (the dispatcher sets
+# defaults; we re-assert them so the selftest is hermetic).
+CONTEXT_CHECK_EXCLUDE_LABELS="gt:agent gt:rig gt:convoy gc:nudge"
+CONTEXT_CHECK_EXCLUDE_PREFIXES="type:quality-gate gate-status: nudge: reviewer-index: verdict: refino-gate: auto-refino: gate-reclaim-count: order-run: ctx:"
+# Pin heuristic thresholds so length-based assertions are deterministic.
+CONTEXT_CHECK_THIN_MAXLEN=40
+CONTEXT_CHECK_READY_MINLEN=120
+
+# ── Scenario 1: type eligibility ──────────────────────────────────────────────
+echo "Scenario 1: type eligibility — bug/chore/task/debt + feature checkable; others not"
+for t in bug chore task debt feature; do
+  [ "$(context_check_type_eligible "$t")" = "yes" ] && ok "$t → yes" || bad "$t → expected yes"
+done
+for t in epic decision molecule gate convoy merge-request; do
+  [ "$(context_check_type_eligible "$t")" = "no" ] && ok "$t → no" || bad "$t → expected no"
+done
+
+# ── Scenario 2: plumbing exclusion (mirrors painel _is_automation_bead + gate family)
+echo "Scenario 2: plumbing exclusion — engine-internal coordination is NOT human work"
+[ "$(context_check_is_plumbing "ga-x" "type:quality-gate-marker" "false")" = "yes" ] && ok "gate marker → plumbing" || bad "gate marker → expected plumbing"
+[ "$(context_check_is_plumbing "ga-x" "gate-status:queued" "false")" = "yes" ]        && ok "gate-status:* → plumbing" || bad "gate-status → expected plumbing"
+[ "$(context_check_is_plumbing "ga-x" "gt:agent" "false")" = "yes" ]                  && ok "gt:agent → plumbing"     || bad "gt:agent → expected plumbing"
+[ "$(context_check_is_plumbing "ga-x" "gc:nudge" "false")" = "yes" ]                  && ok "gc:nudge → plumbing"     || bad "gc:nudge → expected plumbing"
+[ "$(context_check_is_plumbing "dc-abc" "" "false")" = "yes" ]                        && ok "dc- id → plumbing"       || bad "dc- → expected plumbing"
+[ "$(context_check_is_plumbing "ga-wisp-x" "" "false")" = "yes" ]                     && ok "-wisp- id → plumbing"    || bad "-wisp- → expected plumbing"
+[ "$(context_check_is_plumbing "ga-x" "" "true")" = "yes" ]                           && ok "ephemeral → plumbing"    || bad "ephemeral → expected plumbing"
+[ "$(context_check_is_plumbing "ga-real" "tech-debt" "false")" = "no" ]               && ok "real bead (tech-debt) → NOT plumbing" || bad "real bead → expected not plumbing"
+[ "$(context_check_is_plumbing "ga-real" "" "false")" = "no" ]                        && ok "real bead (no labels) → NOT plumbing" || bad "real bead → expected not plumbing"
+
+# ── Scenario 3: idempotence — an already-judged bead is never re-judged ───────
+echo "Scenario 3: idempotence / anti-loop (ga-it11w lesson) — ctx:* already present"
+[ "$(context_check_has_ctx_label "ctx:ready")" = "yes" ] && ok "ctx:ready present → yes" || bad "ctx:ready → expected yes"
+[ "$(context_check_has_ctx_label "ctx:thin,tech-debt")" = "yes" ] && ok "ctx:thin present → yes" || bad "ctx:thin → expected yes"
+[ "$(context_check_has_ctx_label "tech-debt,daily")" = "no" ] && ok "no ctx:* → no (judgeable)" || bad "no ctx:* → expected no"
+# A ctx:thin bead is NEVER re-selected as a candidate (the anti-loop guarantee).
+[ "$(context_check_is_candidate "ga-x" "task" "ctx:thin,tech-debt" "false" "no")" = "no" ] \
+  && ok "ctx:thin bead → NOT a candidate (no re-ingestion loop)" \
+  || bad "ctx:thin bead → expected NOT a candidate (loop would re-form)"
+[ "$(context_check_is_candidate "ga-x" "task" "ctx:ready" "false" "no")" = "no" ] \
+  && ok "ctx:ready bead → NOT a candidate (idempotent)" || bad "ctx:ready → expected NOT a candidate"
+
+# ── Scenario 4: lifecycle-skip — never re-label work already moving ───────────
+echo "Scenario 4: lifecycle-skip — in-flight/done/cancelled/gate-stuck/dispatched"
+for L in story:in-flight story:done story:cancelled pilot:dispatched gate:needs-human gate:needs-fix gate:failed; do
+  [ "$(context_check_lifecycle_skip "$L")" = "yes" ] && ok "$L → skip" || bad "$L → expected skip"
+done
+[ "$(context_check_lifecycle_skip "tech-debt")" = "no" ] && ok "tech-debt (active work) → not skipped" || bad "tech-debt → expected not skipped"
+
+# ── Scenario 4b: master candidate gate composes all the above ─────────────────
+echo "Scenario 4b: context_check_is_candidate composes type+plumbing+ctx+lifecycle"
+[ "$(context_check_is_candidate "ga-good" "task" "tech-debt" "false" "no")" = "yes" ] \
+  && ok "real open task, no ctx, not plumbing/in-flight → candidate" || bad "real task → expected candidate"
+[ "$(context_check_is_candidate "ga-feat" "feature" "story:unrefined" "false" "yes")" = "no" ] \
+  && ok "feature WITH story:* (refino funnel) → NOT a candidate" || bad "feature w/ story:* → expected not candidate"
+[ "$(context_check_is_candidate "ga-feat2" "feature" "frontend" "false" "no")" = "yes" ] \
+  && ok "feature WITHOUT story:* → candidate (raw actionable)" || bad "feature w/o story:* → expected candidate"
+[ "$(context_check_is_candidate "ga-junk" "epic" "" "false" "no")" = "no" ] \
+  && ok "epic → NOT a candidate (type ineligible)" || bad "epic → expected not candidate"
+
+# ── Scenario 5: verifiable-signal detection ───────────────────────────────────
+echo "Scenario 5: verifiable-signal detection (HOW-TO-VERIFY / concrete artifact)"
+[ "$(context_check_has_verifiable_signal "Acceptance criteria: the CLI returns 0")" = "yes" ] && ok "acceptance criteria → signal" || bad "acceptance → expected signal"
+[ "$(context_check_has_verifiable_signal "deve retornar o resultado esperado")" = "yes" ]      && ok "pt verification vocab → signal" || bad "pt verif → expected signal"
+[ "$(context_check_has_verifiable_signal "edit scripts/foo.sh to add retry")" = "yes" ]        && ok "named .sh artifact → signal" || bad ".sh → expected signal"
+[ "$(context_check_has_verifiable_signal "run bd list and confirm output")" = "yes" ]          && ok "named bd command → signal" || bad "bd cmd → expected signal"
+[ "$(context_check_has_verifiable_signal "- [ ] step one
+- [ ] step two")" = "yes" ]                                                                   && ok "task-list checklist → signal" || bad "checklist → expected signal"
+[ "$(context_check_has_verifiable_signal "make it better somehow")" = "no" ]                   && ok "vague prose → no signal" || bad "vague → expected no signal"
+[ "$(context_check_has_verifiable_signal "")" = "no" ]                                         && ok "empty → no signal" || bad "empty → expected no signal"
+
+# ── Scenario 6: mechanical verdict — complete → ready ; empty/vague → thin ────
+echo "Scenario 6: mechanical verdict"
+# Long + signal → ready.
+[ "$(context_check_mechanical_verdict 200 yes 30)" = "ready" ] && ok "long(200) + signal → ready" || bad "long+signal → expected ready"
+# Empty / near-empty → thin regardless of signal.
+[ "$(context_check_mechanical_verdict 0 no 10)" = "thin" ]    && ok "empty(0) → thin" || bad "empty → expected thin"
+[ "$(context_check_mechanical_verdict 20 yes 10)" = "thin" ]  && ok "near-empty(20) even w/ signal → thin" || bad "near-empty → expected thin"
+# Described, no signal, short body → lean thin.
+[ "$(context_check_mechanical_verdict 80 no 10)" = "thin" ]   && ok "described(80) no signal → thin" || bad "described-no-signal → expected thin"
+echo "Scenario 6b: terse-but-maybe-complete → uncertain (NOT falsely thin/ready)"
+# Signal present but short body → uncertain (Sonnet-judged, not auto-ready/thin).
+[ "$(context_check_mechanical_verdict 70 yes 30)" = "uncertain" ] && ok "short(70) + signal → uncertain (terse-complete defended)" || bad "short+signal → expected uncertain"
+# Long body but NO signal → uncertain (long ramble must not auto-ready).
+[ "$(context_check_mechanical_verdict 300 no 30)" = "uncertain" ] && ok "long(300) no signal → uncertain (no false ready)" || bad "long-no-signal → expected uncertain"
+# Byte-count alone can NEVER yield ready (no-signal long stays uncertain, never ready).
+[ "$(context_check_mechanical_verdict 5000 no 30)" != "ready" ] && ok "huge body w/o signal NEVER auto-ready (positive-label invariant)" || bad "huge-no-signal → must not be ready"
+
+# ── Scenario 7: final label resolution ────────────────────────────────────────
+echo "Scenario 7: verdict_label maps mechanical(+sonnet) → ctx:ready | ctx:thin"
+[ "$(context_check_verdict_label ready)" = "ctx:ready" ] && ok "ready → ctx:ready" || bad "ready → expected ctx:ready"
+[ "$(context_check_verdict_label thin)" = "ctx:thin" ]   && ok "thin → ctx:thin" || bad "thin → expected ctx:thin"
+[ "$(context_check_verdict_label uncertain READY)" = "ctx:ready" ] && ok "uncertain + Sonnet READY → ctx:ready" || bad "uncertain+READY → expected ctx:ready"
+[ "$(context_check_verdict_label uncertain THIN)" = "ctx:thin" ]   && ok "uncertain + Sonnet THIN → ctx:thin" || bad "uncertain+THIN → expected ctx:thin"
+
+# ── Scenario 8: fail-toward-human — uncertain without a clear READY → ctx:thin ─
+echo "Scenario 8: fail-toward-human (never falsely ready)"
+[ "$(context_check_verdict_label uncertain TIMEOUT)" = "ctx:thin" ] && ok "uncertain + Sonnet TIMEOUT → ctx:thin" || bad "uncertain+TIMEOUT → expected ctx:thin"
+[ "$(context_check_verdict_label uncertain "")" = "ctx:thin" ]      && ok "uncertain + no Sonnet verdict → ctx:thin (heuristic-only default)" || bad "uncertain+empty → expected ctx:thin"
+[ "$(context_check_verdict_label uncertain GARBAGE)" = "ctx:thin" ] && ok "uncertain + garbage → ctx:thin" || bad "uncertain+garbage → expected ctx:thin"
+[ "$(context_check_resolve_uncertain READY)" = "ctx:ready" ]        && ok "resolve_uncertain READY → ctx:ready" || bad "resolve READY → expected ctx:ready"
+[ "$(context_check_resolve_uncertain FAIL)" = "ctx:thin" ]          && ok "resolve_uncertain FAIL → ctx:thin (only explicit READY is ready)" || bad "resolve FAIL → expected ctx:thin"
+
+# ── Scenario 9: verdict vocabulary is bounded — only ctx:ready / ctx:thin ──────
+echo "Scenario 9: verdict vocabulary bounded (no dispatch/approve/lifecycle token)"
+seen_bad=0
+for m in ready thin uncertain garbage ""; do
+  for s in READY THIN TIMEOUT "" FAIL; do
+    d=$(context_check_verdict_label "$m" "$s")
+    case "$d" in ctx:ready|ctx:thin) : ;; *) seen_bad=1; bad "unexpected verdict label '$d' for mech=$m sonnet=$s" ;; esac
+  done
+done
+[ "$seen_bad" = "0" ] && ok "every input yields ONLY ctx:ready or ctx:thin (no dispatch/approve/lifecycle)" || bad "REGRESSION: verdict label escaped the ctx:ready/ctx:thin set"
+
+# ── Scenario 10: exec-class (automation-debt) classifier ──────────────────────
+# Applied to ctx:ready beads only. exec:manual iff a clear physical-device /
+# human-identity-credential / human-provisioning signal; else exec:auto (default).
+echo "Scenario 10: exec-class — physical/portal/credential → exec:manual; else exec:auto"
+if declare -F context_check_exec_class >/dev/null 2>&1; then
+  ok "context_check_exec_class is defined (exposed lib-only)"
+else
+  bad "context_check_exec_class not exposed by lib-only source"
+fi
+# 10a — PHYSICAL device / hardware / physical proxy → exec:manual (agent has no hands).
+[ "$(context_check_exec_class "experimentar phone-as-Claro-mobile-proxy" "plugar o celular físico como proxy móvel da Claro")" = "exec:manual" ] \
+  && ok "phone-as-proxy (physical phone) → exec:manual" || bad "phone-as-proxy → expected exec:manual"
+[ "$(context_check_exec_class "trocar o SIM do aparelho" "inserir novo chip / SIM no celular de testes")" = "exec:manual" ] \
+  && ok "SIM/chip swap on physical device → exec:manual" || bad "SIM swap → expected exec:manual"
+[ "$(context_check_exec_class "configurar hardware proxy" "ligar o dongle e conectar manualmente")" = "exec:manual" ] \
+  && ok "hardware/dongle + conectar manualmente → exec:manual" || bad "hardware proxy → expected exec:manual"
+# 10b — GOV / 3rd-party PORTAL gated by human identity (CPF+CAPTCHA, e-SIC/LAI, cartório).
+[ "$(context_check_exec_class "pedido e-SIC/LAI Planta Genérica" "abrir pedido no portal e-SIC (LAI) para a Planta Genérica de Valores")" = "exec:manual" ] \
+  && ok "e-SIC/LAI gov portal → exec:manual" || bad "e-SIC/LAI → expected exec:manual"
+[ "$(context_check_exec_class "login no portal da prefeitura" "acessar com identidade CPF e resolver o CAPTCHA")" = "exec:manual" ] \
+  && ok "CPF + CAPTCHA human-identity portal → exec:manual" || bad "CPF+CAPTCHA → expected exec:manual"
+[ "$(context_check_exec_class "obter certidão no cartório" "comparecer ao cartório / protocolo presencial")" = "exec:manual" ] \
+  && ok "cartório / presencial → exec:manual" || bad "cartório → expected exec:manual"
+# 10c — HUMAN-held credential / account / channel provisioning → exec:manual.
+[ "$(context_check_exec_class "canal efêmero — provisionar canal Whapi" "provisionar canal Whapi novo para o número efêmero")" = "exec:manual" ] \
+  && ok "provisionar canal Whapi (credential provisioning) → exec:manual" || bad "provisionar canal Whapi → expected exec:manual"
+# 10d — DEFAULT exec:auto: code/script/verification/data/API/email tasks a crew can do.
+[ "$(context_check_exec_class "inbound_generator: gerar leads" "rodar o script que gera inbound a partir da base, --apply")" = "exec:auto" ] \
+  && ok "inbound_generator script task → exec:auto" || bad "inbound_generator → expected exec:auto"
+[ "$(context_check_exec_class "Contagem declividade: rodar --apply" "executar o scraper com --apply e validar a saída")" = "exec:auto" ] \
+  && ok "scraper --apply → exec:auto" || bad "scraper --apply → expected exec:auto"
+[ "$(context_check_exec_class "Verificar saúde do token PDPJ" "health-check do token via API e reportar o status")" = "exec:auto" ] \
+  && ok "token health-check (API verification) → exec:auto" || bad "health-check → expected exec:auto"
+[ "$(context_check_exec_class "envio de e-mail de cobrança" "montar e disparar e-mail via API de envio")" = "exec:auto" ] \
+  && ok "email-based request via API → exec:auto" || bad "email request → expected exec:auto"
+# 10e — CONSERVATIVE: never over-tag manual. A generic "provision a table" code
+#       task (provisioning verb but NO credential/account/channel noun) stays auto.
+[ "$(context_check_exec_class "provision a new staging table" "create a staging table in the warehouse and backfill it")" = "exec:auto" ] \
+  && ok "provision a TABLE (code, not credential) → exec:auto (conservative default)" || bad "provision table → expected exec:auto"
+[ "$(context_check_exec_class "rename notify wrapper" "edit scripts/notify to rename the wrapper fn so it stops shadowing the CLI")" = "exec:auto" ] \
+  && ok "ambiguous/neutral code task → exec:auto (default)" || bad "neutral code task → expected exec:auto"
+[ "$(context_check_exec_class "" "")" = "exec:auto" ] \
+  && ok "empty title+desc → exec:auto (default, never falsely manual)" || bad "empty → expected exec:auto"
+# 10f — exec vocabulary is bounded to exactly exec:manual | exec:auto.
+ec_bad=0
+for pair in "physical phone proxy|x" "rodar script|y" "|"; do
+  IFS='|' read -r _a _b <<< "$pair"
+  ec=$(context_check_exec_class "$_a" "$_b")
+  case "$ec" in exec:manual|exec:auto) : ;; *) ec_bad=1; bad "exec-class escaped vocabulary: '$ec'" ;; esac
+done
+[ "$ec_bad" = "0" ] && ok "exec-class yields ONLY exec:manual or exec:auto" || bad "exec-class vocabulary escaped"
+
+# ── DRIFT GUARDS: static assertions on the shipped dispatcher ─────────────────
+echo "Drift guards: live wiring matches the design contract"
+
+# 1. LABEL-ONLY: the only bead-state writes are `label add ... ctx:ready|ctx:thin`
+#    and a comment. NO dispatch / sling write in code. (Match an actual INVOCATION
+#    — `gc ... sling` or `pilot-dispatcher` — not the `pilot:dispatched` LABEL the
+#    lifecycle-skip classifier legitimately matches against.)
+if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -qE 'gc .*sling|pilot-dispatcher|pilot dispatch'; then
+  bad "REGRESSION: dispatcher contains a dispatch/sling call — must be LABEL-ONLY"
+else
+  ok "no dispatch/sling invocation in code (LABEL-ONLY)"
+fi
+# It must never CLOSE a candidate bead. (It may close its OWN ephemeral verdict
+# bead — guard that the close target is the verdict bead variable, never a candidate.)
+if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -E 'bd_ close' | grep -qv '_verdict_bead'; then
+  bad "REGRESSION: a bd_ close targets something other than the verdict bead — must not close candidates"
+else
+  ok "bd_ close only ever targets the daemon's own verdict bead (never a candidate)"
+fi
+# It must never write a lifecycle/dispatch label onto a candidate.
+if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -qE 'label add "\$c_id" "(story:|pilot:|gate:)'; then
+  bad "REGRESSION: dispatcher writes a lifecycle/dispatch label onto a candidate"
+else
+  ok "candidate writes are ONLY ctx:* + a comment (no lifecycle/dispatch label)"
+fi
+# The positive verdict label the dispatcher adds to a candidate is the computed
+# $LABEL (ctx:ready/ctx:thin), via `label add "$c_id" "$LABEL"`.
+if grep -qF 'label add "$c_id" "$LABEL"' "$DISPATCHER"; then
+  ok "candidate verdict written via additive label add \$c_id \$LABEL (positive label)"
+else
+  bad "candidate verdict not written via additive label add"
+fi
+
+# 2. Idempotence: the candidate query EXCLUDES ctx:ready and ctx:thin, AND the
+#    pure classifier re-asserts has_ctx_label (defense in depth, anti-loop).
+if grep -qF -- '--exclude-label ctx:ready' "$DISPATCHER" \
+   && grep -qF -- '--exclude-label ctx:thin' "$DISPATCHER" \
+   && grep -qF 'context_check_has_ctx_label' "$DISPATCHER"; then
+  ok "candidate query excludes ctx:ready/ctx:thin + classifier re-asserts (idempotent, anti-loop)"
+else
+  bad "idempotence not enforced at query AND classifier"
+fi
+
+# 3. Anti-Dolt-spike: per-sweep cap + per-sweep Sonnet cap exist and are honored.
+if grep -q 'CONTEXT_CHECK_MAX_PER_SWEEP' "$DISPATCHER" \
+   && grep -q 'JUDGED" -ge "\$CONTEXT_CHECK_MAX_PER_SWEEP' "$DISPATCHER" \
+   && grep -q 'CONTEXT_CHECK_MAX_SONNET_PER_SWEEP' "$DISPATCHER"; then
+  ok "per-sweep bead cap + per-sweep Sonnet cap enforced (anti-Dolt-spike)"
+else
+  bad "per-sweep caps missing or not enforced"
+fi
+
+# 4. Kill-switch: CONTEXT_CHECK_ENABLED=0 → no-op exit before any work.
+if grep -q 'CONTEXT_CHECK_ENABLED' "$DISPATCHER" \
+   && grep -q 'CONTEXT_CHECK_ENABLED" != "1"' "$DISPATCHER"; then
+  ok "kill-switch CONTEXT_CHECK_ENABLED=0 → no-op exit"
+else
+  bad "kill-switch missing"
+fi
+
+# 5. Fail-toward-human in code: the uncertain branch defaults to ctx:thin when
+#    Sonnet is disabled, and any non-READY Sonnet verdict resolves to ctx:thin.
+if grep -q 'context_check_resolve_uncertain' "$DISPATCHER" \
+   && grep -qF 'READY) echo "ctx:ready"' "$DISPATCHER"; then
+  ok "fail-toward-human: only explicit Sonnet READY → ctx:ready; all else → ctx:thin"
+else
+  bad "fail-toward-human resolution missing"
+fi
+
+# 6. The Sonnet judge is spawned on the context-check-reviewer template (Sonnet).
+if grep -q 'session new "\$CONTEXT_CHECK_REVIEWER_TEMPLATE"' "$DISPATCHER"; then
+  ok "Sonnet judge spawned via gc session new on the context-check-reviewer template"
+else
+  bad "Sonnet judge spawn does not use the context-check-reviewer template"
+fi
+# The agent template must pin model = sonnet (sibling .toml shipped alongside).
+_TOML="$SELF_DIR/../../../agents/context-check-reviewer/agent.toml"
+_TOML_ALT="$SELF_DIR/context-check-reviewer-agent.toml"
+if grep -q '^model = "sonnet"' "$_TOML" 2>/dev/null || grep -q '^model = "sonnet"' "$_TOML_ALT" 2>/dev/null; then
+  ok "context-check-reviewer template pins model = sonnet"
+else
+  bad "context-check-reviewer template does not pin model = sonnet (checked $_TOML and $_TOML_ALT)"
+fi
+
+# 7. The plist pins the exclude sets (deployment-layer defense for plumbing).
+PLIST="$SELF_DIR/com.gascity.context-check-dispatcher.plist"
+if grep -q 'CONTEXT_CHECK_EXCLUDE_LABELS' "$PLIST" 2>/dev/null \
+   && grep -q 'CONTEXT_CHECK_EXCLUDE_PREFIXES' "$PLIST" 2>/dev/null \
+   && grep -q 'type:quality-gate' "$PLIST" 2>/dev/null; then
+  ok "plist pins CONTEXT_CHECK_EXCLUDE_LABELS + _PREFIXES incl. quality-gate (deployment defense)"
+else
+  bad "plist does not pin the exclude sets"
+fi
+
+# 8. DRY_RUN must not write labels or spawn. With no live bd the queue is empty →
+#    it exits 0 without spawning, logging the dry-run sweep start.
+_drycity="$(mktemp -d)"
+CONTEXT_CHECK_CITY_OVERRIDE="$_drycity" DRY_RUN=1 \
+  PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  bash "$DISPATCHER" >/dev/null 2>&1
+_dryrc=$?
+_drylog=$(cat "$_drycity/.gc/logs/context-check-dispatcher.log" 2>/dev/null || echo "")
+if [ "$_dryrc" -eq 0 ] && echo "$_drylog" | grep -qiE 'Context-check sweep start.*dry_run=1'; then
+  ok "DRY_RUN executes the sweep harness cleanly (exit 0, proof mode, no spawn)"
+else
+  bad "DRY_RUN did not run cleanly in proof mode (rc=$_dryrc)"
+fi
+rm -rf "$_drycity"
+
+# 9. Kill-switch e2e: CONTEXT_CHECK_ENABLED=0 exits 0 with the no-op log line.
+_kcity="$(mktemp -d)"
+CONTEXT_CHECK_CITY_OVERRIDE="$_kcity" CONTEXT_CHECK_ENABLED=0 \
+  PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  bash "$DISPATCHER" >/dev/null 2>&1
+_krc=$?
+_klog=$(cat "$_kcity/.gc/logs/context-check-dispatcher.log" 2>/dev/null || echo "")
+if [ "$_krc" -eq 0 ] && echo "$_klog" | grep -qi 'DISABLED'; then
+  ok "kill-switch e2e: CONTEXT_CHECK_ENABLED=0 → exit 0 + DISABLED log line (no work)"
+else
+  bad "kill-switch e2e did not no-op cleanly (rc=$_krc)"
+fi
+rm -rf "$_kcity"
+
+# 10. exec-class wiring (automation-debt pill).
+#  a) feature-gated: CONTEXT_CHECK_EXEC_CLASS default 1, applied ONLY when ctx:ready.
+if grep -q 'CONTEXT_CHECK_EXEC_CLASS' "$DISPATCHER" \
+   && grep -qF 'CONTEXT_CHECK_EXEC_CLASS:-1' "$DISPATCHER" \
+   && grep -qF '[ "$LABEL" = "ctx:ready" ] && [ "$CONTEXT_CHECK_EXEC_CLASS" = "1" ]' "$DISPATCHER"; then
+  ok "exec-class env-gated (CONTEXT_CHECK_EXEC_CLASS, default 1) + applied ONLY at ctx:ready"
+else
+  bad "exec-class not env-gated or not scoped to ctx:ready"
+fi
+#  b) exactly ONE exec:* label written, via the multi-store bd_ wrapper (right store).
+if grep -qF 'bd_ label add "$c_id" "$EXEC"' "$DISPATCHER" \
+   && grep -qF 'bd_ label remove "$c_id" "exec:auto"' "$DISPATCHER" \
+   && grep -qF 'bd_ label remove "$c_id" "exec:manual"' "$DISPATCHER"; then
+  ok "exec label written via multi-store bd_ (CC_STORE-targeted), opposite stripped (exactly one)"
+else
+  bad "exec label not written via bd_ or opposite not stripped"
+fi
+#  c) idempotent: only writes if absent/changed (no thrash on re-mark).
+if grep -qF 'echo ",$c_labels," | grep -qF ",$EXEC,"' "$DISPATCHER"; then
+  ok "exec label idempotent (skips write when already present — no thrash)"
+else
+  bad "exec label idempotence guard missing"
+fi
+#  d) fail-open: exec-class computed with || fallback; never on the ctx:thin gap path.
+#     The exec write block must NOT touch the ctx:ready/ctx:thin label add above it.
+if grep -qF 'context_check_exec_class "$c_title" "$c_desc" 2>/dev/null || echo "exec:auto"' "$DISPATCHER"; then
+  ok "exec-class fail-open: classifier failure → exec:auto default, never blocks the verdict"
+else
+  bad "exec-class not fail-open (missing || default)"
+fi
+#  e) exec-class is a PURE function (no bd_/gc/jq side-effects in its body).
+_ecbody=$(awk '/^context_check_exec_class\(\)/{f=1} f{print} /^}/{if(f)exit}' "$DISPATCHER")
+if echo "$_ecbody" | grep -qE 'bd_ |gc |session |sling|--apply'; then
+  bad "REGRESSION: context_check_exec_class has a side-effect (must be pure)"
+else
+  ok "context_check_exec_class is pure (no bd_/gc/sling side-effect — selftest-safe)"
+fi
+
+# 11. exec-class e2e via DRY_RUN: a manual-signal bead projects exec:manual, an
+#     auto bead projects exec:auto, and a ctx:thin bead gets NO exec label — all
+#     written to the candidate's OWN store via a stub bd_ on PATH (multi-store).
+_ecity="$(mktemp -d)"
+mkdir -p "$_ecity/.gc/logs"
+# Stub `bd` so the dispatcher's `bd_ list` returns three crafted candidates and
+# label/comment writes are captured (no live Dolt). One ready+manual, one
+# ready+auto, one thin (empty desc).
+cat > "$_ecity/bd" <<'STUB'
+#!/usr/bin/env bash
+# Minimal bd stub: serve `list` candidates for type=task, no-op everything else.
+case "$1 $2" in
+  "-C "*)
+    shift 2 ;;  # drop -C <store>
+esac
+cmd="$1"; shift || true
+if [ "$cmd" = "list" ]; then
+  want=""
+  while [ $# -gt 0 ]; do case "$1" in --type) want="$2"; shift 2;; *) shift;; esac; done
+  if [ "$want" = "task" ]; then
+    cat <<'JSON'
+[{"id":"ga-manual1","issue_type":"task","title":"experimentar phone-as-Claro-mobile-proxy","description":"Plugar o celular físico como proxy móvel da Claro e medir a latência. Critério de aceitação: a chamada de teste retorna 200 e o IP observado é o da operadora. Passos: ligar o aparelho, conectar manualmente, rodar o probe.","labels":[],"ephemeral":false,"created_at":"2026-01-01T00:00:00Z"},{"id":"ga-auto1","issue_type":"task","title":"Verificar saúde do token PDPJ","description":"Fazer health-check do token PDPJ via API e reportar o status. Critério de aceitação: o script retorna o expected output {status:ok} e grava em scripts/pdpj-health.sh o resultado. Comando: bd list para confirmar.","labels":[],"ephemeral":false,"created_at":"2026-01-02T00:00:00Z"},{"id":"ga-thin1","issue_type":"task","title":"arrumar","description":"x","labels":[],"ephemeral":false,"created_at":"2026-01-03T00:00:00Z"}]
+JSON
+  else
+    echo "[]"
+  fi
+  exit 0
+fi
+# Capture mutating writes to a ledger so the test can assert on them.
+echo "$cmd $*" >> "$LEDGER"
+exit 0
+STUB
+chmod +x "$_ecity/bd"
+LEDGER="$_ecity/ledger.txt"; export LEDGER
+CONTEXT_CHECK_CITY_OVERRIDE="$_ecity" \
+  CONTEXT_CHECK_STORES="$_ecity" \
+  CONTEXT_CHECK_MAX_SONNET_PER_SWEEP=0 \
+  CONTEXT_CHECK_EXEC_CLASS=1 \
+  PATH="$_ecity:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  bash "$DISPATCHER" >/dev/null 2>&1
+_eled=$(cat "$LEDGER" 2>/dev/null || echo "")
+# ga-manual1: ctx:ready + exec:manual.
+if echo "$_eled" | grep -qE 'label add ga-manual1 ctx:ready' \
+   && echo "$_eled" | grep -qE 'label add ga-manual1 exec:manual'; then
+  ok "e2e: manual-signal ready bead → ctx:ready + exec:manual (written to its own store)"
+else
+  bad "e2e: manual bead did not get ctx:ready + exec:manual (ledger: $(echo "$_eled" | tr '\n' ';'))"
+fi
+# ga-auto1: ctx:ready + exec:auto.
+if echo "$_eled" | grep -qE 'label add ga-auto1 ctx:ready' \
+   && echo "$_eled" | grep -qE 'label add ga-auto1 exec:auto'; then
+  ok "e2e: auto ready bead → ctx:ready + exec:auto"
+else
+  bad "e2e: auto bead did not get ctx:ready + exec:auto (ledger: $(echo "$_eled" | tr '\n' ';'))"
+fi
+# ga-thin1: ctx:thin and NO exec label (pill only on ready/Aprovadas).
+if echo "$_eled" | grep -qE 'label add ga-thin1 ctx:thin' \
+   && ! echo "$_eled" | grep -qE 'label add ga-thin1 exec:'; then
+  ok "e2e: thin bead → ctx:thin, NO exec label (no pill on non-ready)"
+else
+  bad "e2e: thin bead wrongly got an exec label or no ctx:thin (ledger: $(echo "$_eled" | tr '\n' ';'))"
+fi
+# Feature-gate OFF: CONTEXT_CHECK_EXEC_CLASS=0 → ctx:ready still written, NO exec label.
+LEDGER="$_ecity/ledger2.txt"; export LEDGER; : > "$LEDGER"
+CONTEXT_CHECK_CITY_OVERRIDE="$_ecity" \
+  CONTEXT_CHECK_STORES="$_ecity" \
+  CONTEXT_CHECK_MAX_SONNET_PER_SWEEP=0 \
+  CONTEXT_CHECK_EXEC_CLASS=0 \
+  PATH="$_ecity:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  bash "$DISPATCHER" >/dev/null 2>&1
+_eled2=$(cat "$LEDGER" 2>/dev/null || echo "")
+if echo "$_eled2" | grep -qE 'label add ga-manual1 ctx:ready' \
+   && ! echo "$_eled2" | grep -qE 'label add ga-manual1 exec:'; then
+  ok "feature-gate OFF: ctx:ready verdict intact, NO exec label (exec-class skipped)"
+else
+  bad "feature-gate OFF did not preserve verdict-without-exec (ledger: $(echo "$_eled2" | tr '\n' ';'))"
+fi
+rm -rf "$_ecity"
+
+echo ""
+echo "context-check-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
+[ "$FAIL" -eq 0 ] || exit 1

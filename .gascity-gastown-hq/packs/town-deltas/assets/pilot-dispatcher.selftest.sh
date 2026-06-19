@@ -149,6 +149,17 @@ case "$args" in
         fi
         printf '{"id":"%s","status":"%s","assignee":"%s","labels":[%s]}' "$id" "$st" "$asg" "$lbls" ;;
     esac ;;
+  *"-l ctx:ready"*)
+    # ctx:ready chore/task/debt candidate query (PILOT_CTX_READY_QUERIES). MUST be
+    # matched BEFORE the *story:approved*pilot:dispatching* stale-claim pattern
+    # below: the ctx:ready query EXCLUDES both of those labels (--exclude-label
+    # story:approved … --exclude-label pilot:dispatching), so argv contains both
+    # substrings and would otherwise be swallowed by that earlier case. Its `-l
+    # ctx:ready` head token is unique to this query. Returns the injected fixture so
+    # a scenario can prove ctx:ready beads ARE sourced as candidates (and that
+    # assigned/thin/braked ones are NOT). Default [] keeps every OTHER scenario
+    # byte-identical to before this seam existed.
+    printf '%s' "${FAKE_CTXREADY_JSON:-[]}" ;;
   *story:approved*pilot:dispatching*)
     printf '%s' "${FAKE_STALE_JSON:-[]}" ;;   # Step-0 stale-claim query
   *"-l story:in-flight -l pilot:dispatched"*)
@@ -414,6 +425,46 @@ run_capacity() {
     FAKE_BUGS_JSON="${4:-}" \
     FAKE_SESSIONS_JSON="${5:-}" \
     FAKE_SLING_ASSIGNEES="${6:-}" \
+    FAKE_BLOCKED_IDS="" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# ── ctx:ready candidate-source runner (PILOT_CTX_READY_QUERIES default-on) ─────
+# Drives a DRY sweep with the ctx:ready candidate query fixture injected. Proves
+# the new candidate source: an unassigned ctx:ready chore/task IS dispatched; an
+# assigned one is NOT (owned); and (via the seams below) that ctx:ready candidates
+# obey the same lane caps + cross-stage congestion yield as every other tier.
+#   $1 = FAKE_CTXREADY_JSON            (the -l ctx:ready query result)
+#   $2 = FAKE_BUGS_JSON                (override the default 2-bug Tier-1 fixture;
+#                                       pass '[]' to make ctx:ready the ONLY source)
+#   $3 = PILOT_CTX_READY_QUERIES       (default 1 — i.e. exercise the new default;
+#                                       pass 0 to prove the env-gate still disables)
+#   $4 = PILOT_GATE_CONGESTED_OVERRIDE ("" probe / "1" congested / "0" empty)
+#   $5 = PILOT_DOLT_CPU_OVERRIDE       (default 10 healthy; >200 → Dolt SATURATED →
+#                                       resource-tight, which + gate-congested arms
+#                                       the ga-d0hz3 cross-stage YIELD. Using Dolt
+#                                       saturation — NOT quota — keeps the sweep from
+#                                       short-circuiting at the earlier quota-pause.)
+#   $6 = FAKE_INFLIGHT_JSON            (occupy lane slots to exercise the cap)
+run_ctxready() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE="${5:-10}" \
+    DISPATCH_TO_CAPACITY=1 \
+    PILOT_CTX_READY_QUERIES="${3:-1}" \
+    FAKE_CTXREADY_JSON="${1:-[]}" \
+    FAKE_BUGS_JSON="${2:-}" \
+    PILOT_GATE_CONGESTED_OVERRIDE="${4:-}" \
+    FAKE_INFLIGHT_JSON="${6:-[]}" \
     FAKE_BLOCKED_IDS="" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
@@ -1701,6 +1752,128 @@ echo "Scenario 19g: drift-guard — the emit is wired into the live dispatcher"
 has "$DISPATCHER" '_pilot_emit_dispatchable'        "emit function is defined"
 has "$DISPATCHER" 'PILOT_EMIT_DISPATCHABLE'         "emit env-gate knob is wired"
 has "$DISPATCHER" 'PILOT_DISPATCHABLE_FILE'         "emit output-path seam is wired"
+
+# ── Scenario 20 (ctx:ready auto-dispatch — PILOT_CTX_READY_QUERIES default-on) ─
+# Athos directive: the Pilot must ALSO pull plain ctx:ready chore/task/debt beads
+# (no story:* label) that fell in no tier and sat idle forever. These four
+# scenarios prove: (a) an unassigned ctx:ready chore IS a candidate and dispatches;
+# (b) an ASSIGNED ctx:ready task is NOT (owned-exclusion preserved); (c) the new
+# candidates respect the per-lane cap; (d) they respect the ga-d0hz3 cross-stage
+# congestion yield; (e) the env-gate still disables them. The fake bd returns
+# FAKE_CTXREADY_JSON for the `-l ctx:ready` query ONLY.
+
+# One unassigned, context-complete chore (small lane, no story:* label).
+CTX_ONE_CHORE='[
+  {"id":"tt-ctx-chore","title":"ctx:ready chore fixture","priority":0,"issue_type":"chore","description":"fixture body — context for the generic builder","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}
+]'
+
+# ── Scenario 20a: an unassigned ctx:ready chore IS dispatched (the whole point) ─
+echo "Scenario 20a: unassigned ctx:ready chore is a candidate and dispatches (default-on)"
+# FAKE_BUGS_JSON='[]' makes the ctx:ready chore the ONLY candidate, so the pick is
+# unambiguous proof the new source fed the pool.
+LOG20A="$(run_ctxready "$CTX_ONE_CHORE" "[]")"
+if echo "$LOG20A" | grep -q "ctx:ready chore/task/debt: 1 candidate"; then
+  ok "ctx:ready query sourced the chore as a candidate (PILOT_CTX_READY_QUERIES=1 default)"
+else
+  bad "ctx:ready chore was NOT sourced (expected 'ctx:ready chore/task/debt: 1 candidate')"
+fi
+if echo "$LOG20A" | grep -q "Lane picks — small: tt-ctx-chore"; then
+  ok "dispatched the unassigned ctx:ready chore"
+else
+  bad "did NOT dispatch the ctx:ready chore (expected 'Lane picks — small: tt-ctx-chore')"
+fi
+
+# ── Scenario 20a2: env-gate still turns it OFF (PILOT_CTX_READY_QUERIES=0) ──────
+echo "Scenario 20a2: PILOT_CTX_READY_QUERIES=0 disables the ctx:ready source (env-gate honored)"
+LOG20A2="$(run_ctxready "$CTX_ONE_CHORE" "[]" 0)"
+if echo "$LOG20A2" | grep -q "ctx:ready chore/task/debt:"; then
+  bad "ctx:ready query ran while gated OFF (env-gate not honored)"
+else
+  ok "ctx:ready query SKIPPED when gated off (byte-equivalent to legacy)"
+fi
+if echo "$LOG20A2" | grep -q "Lane picks — small: tt-ctx-chore"; then
+  bad "dispatched a ctx:ready chore while the source was gated OFF"
+else
+  ok "no ctx:ready dispatch when gated off"
+fi
+
+# ── Scenario 20b: an ASSIGNED ctx:ready task is NOT a candidate (owned) ─────────
+# The owned-exclusion lives in _filter_candidates (assignee == null/empty). A
+# ctx:ready task already claimed by a crew must NEVER be re-dispatched.
+echo "Scenario 20b: an ASSIGNED ctx:ready task is excluded (owned — no double-dispatch)"
+CTX_ASSIGNED='[
+  {"id":"tt-ctx-owned","title":"owned ctx:ready task","priority":0,"issue_type":"task","description":"fixture body — already owned","status":"open","labels":["ctx:ready"],"assignee":"batista-ps","created_at":"2026-06-01T00:00:01Z","metadata":{}},
+  {"id":"tt-ctx-free","title":"free ctx:ready task","priority":1,"issue_type":"task","description":"fixture body — unowned","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}
+]'
+LOG20B="$(run_ctxready "$CTX_ASSIGNED" "[]")"
+if echo "$LOG20B" | grep -q "Lane picks — small: tt-ctx-owned"; then
+  bad "REGRESSION: dispatched an ASSIGNED ctx:ready task (owned-exclusion lost)"
+else
+  ok "did NOT dispatch the assigned ctx:ready task (owned-exclusion preserved)"
+fi
+if echo "$LOG20B" | grep -q "Lane picks — small: tt-ctx-free"; then
+  ok "dispatched the UNASSIGNED ctx:ready task instead (P1, the only eligible one)"
+else
+  bad "did not dispatch the unassigned ctx:ready task"
+fi
+
+# ── Scenario 20c: ctx:ready candidates respect the per-lane cap (no flood) ──────
+# Six small ctx:ready chores, 5 free small slots → exactly 5 dispatch, never 6.
+echo "Scenario 20c: ctx:ready candidates obey the small-lane cap (MAX_SMALL=5) — cannot flood"
+CTX_SIX_CHORES='[
+  {"id":"tt-cx1","title":"ctx chore 1","priority":0,"issue_type":"chore","description":"fixture body — context","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}},
+  {"id":"tt-cx2","title":"ctx chore 2","priority":0,"issue_type":"chore","description":"fixture body — context","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}},
+  {"id":"tt-cx3","title":"ctx chore 3","priority":0,"issue_type":"chore","description":"fixture body — context","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:03Z","metadata":{}},
+  {"id":"tt-cx4","title":"ctx chore 4","priority":0,"issue_type":"chore","description":"fixture body — context","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:04Z","metadata":{}},
+  {"id":"tt-cx5","title":"ctx chore 5","priority":0,"issue_type":"chore","description":"fixture body — context","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:05Z","metadata":{}},
+  {"id":"tt-cx6","title":"ctx chore 6","priority":0,"issue_type":"chore","description":"fixture body — context","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:06Z","metadata":{}}
+]'
+LOG20C="$(run_ctxready "$CTX_SIX_CHORES" "[]")"
+if echo "$LOG20C" | grep -q "Lane small: dispatched 5 this sweep"; then
+  ok "filled exactly the 5 free small slots from the ctx:ready backlog (cap honored)"
+else
+  bad "did not dispatch all 5 ctx:ready chores (expected 'Lane small: dispatched 5')"
+fi
+if echo "$LOG20C" | grep -qE "Lane small: dispatched ([6-9]|[1-9][0-9]+) this sweep"; then
+  bad "REGRESSION: ctx:ready backlog flooded past the small-lane cap of 5"
+else
+  ok "ctx:ready backlog never exceeded MAX_SMALL — cannot flood the crews"
+fi
+
+# ── Scenario 20d: ctx:ready candidates respect the ga-d0hz3 cross-stage yield ──
+# Gate congested + Dolt saturated (resource-tight) → the WHOLE sweep defers BEFORE
+# sourcing candidates, so a ctx:ready backlog can never pile onto a congested Gate.
+echo "Scenario 20d: ctx:ready dispatch DEFERS under the cross-stage gate-congestion yield"
+#                       ctxJSON          bugs  gate gateCongested doltCPU(300=saturated)
+LOG20D="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 300)"
+if echo "$LOG20D" | grep -q "Cross-stage YIELD (ga-d0hz3)"; then
+  ok "ctx:ready sweep yielded to the congested Gate under resource contention"
+else
+  bad "did not yield under gate-congested + resource-tight (ga-d0hz3 not honored for ctx:ready)"
+fi
+if echo "$LOG20D" | grep -q "Lane picks — small: tt-cx"; then
+  bad "REGRESSION: dispatched ctx:ready work while the Gate was congested + Dolt hot"
+else
+  ok "dispatched NO ctx:ready work during the cross-stage yield (no Gate flood)"
+fi
+
+# ── Scenario 20e: drift-guard — ctx:ready default flipped to 1 and stays env-gated
+echo "Scenario 20e: drift-guard — PILOT_CTX_READY_QUERIES defaults to 1 and is env-gated"
+has "$DISPATCHER" 'PILOT_CTX_READY_QUERIES="\$\{PILOT_CTX_READY_QUERIES:-1\}"' \
+  "ctx:ready knob defaults to 1 (ON) and remains overridable via env"
+has "$DISPATCHER" '\-l "ctx:ready"' \
+  "the ctx:ready candidate query is wired into the dispatcher"
+# Every exclusion the other tiers enforce must also gate the ctx:ready query.
+echo "Scenario 20f: structural — the ctx:ready query keeps every existing exclusion"
+CTXBLOCK=$(awk '/Step 2a-ctx:/{f=1} f{print} /CTXREADY_COUNT=\$\(echo/{if(f)exit}' "$DISPATCHER")
+for excl in "story:in-flight" "story:done" "gate:passed" "pilot:dispatching" \
+            "gate:needs-human" "needs:engine-window" "pilot:dispatched" "ctx:thin"; do
+  if echo "$CTXBLOCK" | grep -q "exclude-label \"$excl\""; then
+    ok "ctx:ready query excludes $excl"
+  else
+    bad "ctx:ready query is MISSING the $excl exclusion"
+  fi
+done
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
