@@ -95,7 +95,7 @@ case "$args" in
     out="["; first=1
     for id in $ids; do
       [ "$first" -eq 1 ] || out="$out,"
-      out="$out{\"id\":\"$id\",\"title\":\"blocked fixture\",\"status\":\"open\"}"
+      out="$out{\"id\":\"$id\",\"title\":\"blocked fixture\",\"description\":\"fixture body\",\"status\":\"open\"}"
       first=0
     done
     printf '%s]' "$out"
@@ -133,7 +133,7 @@ case "$args" in
       *base*)
         case "$id" in
           *closed*) printf '{"id":"%s","status":"closed"}' "$id" ;;
-          *)        printf '{"id":"%s","status":"open"}'   "$id" ;;
+          *)        printf '{"id":"%s","description":"fixture body — context for veto test","status":"open"}'   "$id" ;;
         esac ;;
       *)
         lbls=""
@@ -171,8 +171,8 @@ case "$args" in
       # guard is absent, tt-epic (P0) wins the pick and the scenario fails loudly.
       cat <<'JSON'
 [
-  {"id":"tt-epic","title":"Split-epic shell fixture","priority":0,"issue_type":"epic","status":"open","labels":["story:epic-split"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
-  {"id":"tt-keep","title":"Normal bug fixture","priority":1,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
+  {"id":"tt-epic","title":"Split-epic shell fixture","priority":0,"issue_type":"epic","description":"fixture body — context for veto test","status":"open","labels":["story:epic-split"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
+  {"id":"tt-keep","title":"Normal bug fixture","priority":1,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
 ]
 JSON
     elif [ "${FAKE_INCLUDE_PREAPPROVAL:-0}" = "1" ]; then
@@ -187,9 +187,9 @@ JSON
       # Both are P0 so absent the guard they win the pick over the P1 keeper bug.
       cat <<'JSON'
 [
-  {"id":"tt-triage","title":"In-triage feature fixture","priority":0,"issue_type":"feature","status":"open","labels":["story:triage"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
-  {"id":"tt-mislabel","title":"Mislabeled approved+unrefined fixture","priority":0,"issue_type":"feature","status":"open","labels":["story:approved","story:unrefined"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
-  {"id":"tt-keep","title":"Normal bug fixture","priority":1,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
+  {"id":"tt-triage","title":"In-triage feature fixture","priority":0,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["story:triage"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
+  {"id":"tt-mislabel","title":"Mislabeled approved+unrefined fixture","priority":0,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["story:approved","story:unrefined"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
+  {"id":"tt-keep","title":"Normal bug fixture","priority":1,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
 ]
 JSON
     elif [ "${FAKE_INCLUDE_ENGWIN:-0}" = "1" ]; then
@@ -201,15 +201,15 @@ JSON
         *"needs:engine-window"*)
           cat <<'JSON'
 [
-  {"id":"tt-keep","title":"Normal bug fixture","priority":1,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
+  {"id":"tt-keep","title":"Normal bug fixture","priority":1,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
 ]
 JSON
           ;;
         *)
           cat <<'JSON'
 [
-  {"id":"tt-engwin","title":"Engine-fork bug fixture","priority":0,"issue_type":"bug","status":"open","labels":["needs:engine-window"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
-  {"id":"tt-keep","title":"Normal bug fixture","priority":1,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
+  {"id":"tt-engwin","title":"Engine-fork bug fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["needs:engine-window"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
+  {"id":"tt-keep","title":"Normal bug fixture","priority":1,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
 ]
 JSON
           ;;
@@ -222,13 +222,13 @@ JSON
       dep_bead="${FAKE_DEP_BEAD:-}"
       prefix=""
       if [ -n "$dep_bead" ]; then
-        prefix="{\"id\":\"tt-depblk\",\"title\":\"Explicit-dep bug fixture\",\"priority\":0,\"issue_type\":\"bug\",\"status\":\"open\",\"labels\":[],\"assignee\":null,\"created_at\":\"2026-05-01T00:00:00Z\",\"metadata\":{\"story.depends_on_beads\":\"$dep_bead\"}},"
+        prefix="{\"id\":\"tt-depblk\",\"title\":\"Explicit-dep bug fixture\",\"priority\":0,\"issue_type\":\"bug\",\"description\":\"fixture body\",\"status\":\"open\",\"labels\":[],\"assignee\":null,\"created_at\":\"2026-05-01T00:00:00Z\",\"metadata\":{\"story.depends_on_beads\":\"$dep_bead\"}},"
       fi
       cat <<JSON
 [
   ${prefix}
-  {"id":"tt-blkd","title":"Blocked bug fixture","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
-  {"id":"tt-unblk","title":"Unblocked bug fixture","priority":1,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
+  {"id":"tt-blkd","title":"Blocked bug fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
+  {"id":"tt-unblk","title":"Unblocked bug fixture","priority":1,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
 ]
 JSON
     fi ;;
@@ -357,7 +357,7 @@ run_real_dispatch() { # FAKE_SUPPRESS_INFLIGHT
     PILOT_INFLIGHT_SLEEP=0 \
     FAKE_BLOCKED_IDS="" \
     FAKE_SUPPRESS_INFLIGHT="$1" \
-    FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
+    FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
@@ -383,7 +383,7 @@ run_sling_retry() { # $1=FAKE_SLING_FAIL_TIMES  $2=FAKE_SLING_ALWAYS_FAIL(0|1)
     FAKE_SUPPRESS_INFLIGHT=0 \
     FAKE_SLING_FAIL_TIMES="${1:-0}" \
     FAKE_SLING_ALWAYS_FAIL="${2:-0}" \
-    FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
+    FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
@@ -419,14 +419,45 @@ run_capacity() {
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
 
+# ── wa-u5r1: dispatchable-queue emit runner ───────────────────────────────────
+# Drives a full DRY_RUN sweep and redirects the emit to a fixture file so the test
+# can assert on its JSON without touching the live ~/.gc/pilot-dispatchable.json.
+#   $1 = FAKE_BUGS_JSON override (the -t bug fixture; controls the candidate set)
+#   $2 = PILOT_QUOTA_OVERRIDE  ("2" → force the quota-pause early-exit)
+#   $3 = PILOT_EMIT_DISPATCHABLE ("0" → disable the emit; default 1)
+#   $4 = FAKE_INFLIGHT_JSON (occupy slots → exercise the both-lanes-full path)
+# Emits the file path on stdout (caller jq's it). The file is reset each run.
+EMIT_FILE="$WORK/pilot-dispatchable.json"
+run_emit() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl" "$EMIT_FILE"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE=10 \
+    PILOT_DISPATCHABLE_FILE="$EMIT_FILE" \
+    FAKE_BUGS_JSON="${1:-}" \
+    PILOT_QUOTA_OVERRIDE="${2:-}" \
+    PILOT_EMIT_DISPATCHABLE="${3:-1}" \
+    FAKE_INFLIGHT_JSON="${4:-[]}" \
+    FAKE_BLOCKED_IDS="" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  echo "$EMIT_FILE"
+}
+
 # Five small, unblocked bug candidates — the exact AC fixture ("5 free small slots
 # + 5 ready candidates dispatches all 5").
 FIVE_SMALL_BUGS='[
-  {"id":"tt-c1","title":"cap bug 1","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}},
-  {"id":"tt-c2","title":"cap bug 2","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}},
-  {"id":"tt-c3","title":"cap bug 3","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:03Z","metadata":{}},
-  {"id":"tt-c4","title":"cap bug 4","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:04Z","metadata":{}},
-  {"id":"tt-c5","title":"cap bug 5","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:05Z","metadata":{}}
+  {"id":"tt-c1","title":"cap bug 1","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}},
+  {"id":"tt-c2","title":"cap bug 2","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}},
+  {"id":"tt-c3","title":"cap bug 3","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:03Z","metadata":{}},
+  {"id":"tt-c4","title":"cap bug 4","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:04Z","metadata":{}},
+  {"id":"tt-c5","title":"cap bug 5","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:05Z","metadata":{}}
 ]'
 
 echo "pilot-dispatcher.selftest — dependency-blocking filter (ga-5ew)"
@@ -572,7 +603,7 @@ OLD_STAMP="$((NOW - 7200))"   # 2h old   → stale (TTL default 30m)
 FRESH_STAMP="$((NOW - 60))"   # 1m young → fresh
 
 # 4a: old stamp → release.
-STALE_OLD='[{"id":"tt-stale","title":"x","status":"open","updated_at":"2020-01-01T00:00:00Z","labels":["story:approved","pilot:dispatching"],"metadata":{"pilot.dispatching_at":"'"$OLD_STAMP"'"}}]'
+STALE_OLD='[{"id":"tt-stale","title":"x","description":"fixture body — context for veto test","status":"open","updated_at":"2020-01-01T00:00:00Z","labels":["story:approved","pilot:dispatching"],"metadata":{"pilot.dispatching_at":"'"$OLD_STAMP"'"}}]'
 LOG4A="$(run_step0 "$STALE_OLD")"
 if echo "$LOG4A" | grep -q "Releasing stale pilot:dispatching claim on tt-stale"; then
   ok "old stamp (age>TTL) → released the stale claim"
@@ -581,7 +612,7 @@ else
 fi
 
 # 4b: fresh stamp but ANCIENT updated_at → must KEEP (the actual Defect A repro).
-STALE_FRESH='[{"id":"tt-fresh","title":"x","status":"open","updated_at":"2020-01-01T00:00:00Z","labels":["story:approved","pilot:dispatching"],"metadata":{"pilot.dispatching_at":"'"$FRESH_STAMP"'"}}]'
+STALE_FRESH='[{"id":"tt-fresh","title":"x","description":"fixture body — context for veto test","status":"open","updated_at":"2020-01-01T00:00:00Z","labels":["story:approved","pilot:dispatching"],"metadata":{"pilot.dispatching_at":"'"$FRESH_STAMP"'"}}]'
 LOG4B="$(run_step0 "$STALE_FRESH")"
 if echo "$LOG4B" | grep -q "claim is fresh.*tt-fresh\|tt-fresh.*claim is fresh"; then
   ok "fresh stamp + ancient updated_at → KEPT (Defect A fixed)"
@@ -595,7 +626,7 @@ else
 fi
 
 # 4c: no stamp (legacy) → must stamp now, NOT release.
-STALE_NOSTAMP='[{"id":"tt-legacy","title":"x","status":"open","updated_at":"2020-01-01T00:00:00Z","labels":["story:approved","pilot:dispatching"],"metadata":{}}]'
+STALE_NOSTAMP='[{"id":"tt-legacy","title":"x","description":"fixture body — context for veto test","status":"open","updated_at":"2020-01-01T00:00:00Z","labels":["story:approved","pilot:dispatching"],"metadata":{}}]'
 LOG4C="$(run_step0 "$STALE_NOSTAMP")"
 if echo "$LOG4C" | grep -q "no pilot.dispatching_at stamp"; then
   ok "legacy claim with no stamp → stamped now, not released"
@@ -939,7 +970,7 @@ run_quota() { # $1=PILOT_QUOTA_OVERRIDE  $2=PILOT_QUOTA_ETA_OVERRIDE
     PILOT_QUOTA_OVERRIDE="$1" \
     PILOT_QUOTA_ETA_OVERRIDE="${2:-}" \
     FAKE_BLOCKED_IDS="" \
-    FAKE_BUGS_JSON='[{"id":"tt-q","title":"quota fixture bug","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
+    FAKE_BUGS_JSON='[{"id":"tt-q","title":"quota fixture bug","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
@@ -1001,11 +1032,11 @@ builders_of() { echo "$1" | grep 'Builder target:' | sed -E 's/.*Builder target:
 
 # Five small, unblocked WA-rig bugs (story.rig overrides prefix inference).
 WA_FIVE_BUGS='[
-  {"id":"tt-wa1","title":"wa bug 1","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}},
-  {"id":"tt-wa2","title":"wa bug 2","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{"story.rig":"whatsapp_automation"}},
-  {"id":"tt-wa3","title":"wa bug 3","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:03Z","metadata":{"story.rig":"whatsapp_automation"}},
-  {"id":"tt-wa4","title":"wa bug 4","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:04Z","metadata":{"story.rig":"whatsapp_automation"}},
-  {"id":"tt-wa5","title":"wa bug 5","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:05Z","metadata":{"story.rig":"whatsapp_automation"}}
+  {"id":"tt-wa1","title":"wa bug 1","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}},
+  {"id":"tt-wa2","title":"wa bug 2","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{"story.rig":"whatsapp_automation"}},
+  {"id":"tt-wa3","title":"wa bug 3","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:03Z","metadata":{"story.rig":"whatsapp_automation"}},
+  {"id":"tt-wa4","title":"wa bug 4","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:04Z","metadata":{"story.rig":"whatsapp_automation"}},
+  {"id":"tt-wa5","title":"wa bug 5","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:05Z","metadata":{"story.rig":"whatsapp_automation"}}
 ]'
 
 echo "Scenario 15a: 5 WA bugs in one sweep fan out to 5 DISTINCT crew (not all digo-wa)"
@@ -1043,7 +1074,7 @@ NOW_ISO15="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 INFLIGHT15C="[{\"id\":\"if-digo\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO15\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-digo\"}}]"
 SESSIONS15C='{"sessions":[{"session_name":"digo-wa","closed":false}]}'
 SLINGMAP15C='{"tt-sling-digo":"digo-wa"}'
-WA_ONE_BUG='[{"id":"tt-wax","title":"wa bug x","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}}]'
+WA_ONE_BUG='[{"id":"tt-wax","title":"wa bug x","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}}]'
 LOG15C="$(run_capacity 10 "$INFLIGHT15C" 1 "$WA_ONE_BUG" "$SESSIONS15C" "$SLINGMAP15C")"
 B15C="$(builders_of "$LOG15C")"
 if echo "$LOG15C" | grep -q "Busy builders (live in-flight): digo-wa"; then
@@ -1115,7 +1146,7 @@ NS_FRESH="$((NS_NOW - 60))"     # 1m old → fresh
 NS_SESS='{"sessions":[{"session_name":"digo-wa","closed":false}]}'
 
 # 16a: aged, no sling, no branch, no gate → RELEASE.
-NS_REL='[{"id":"tt-ns-rel","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+NS_REL='[{"id":"tt-ns-rel","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 LOG16A="$(run_neverstarted "$NS_REL" "" "" "")"
 if echo "$LOG16A" | grep -q "releasing never-started in-flight bead tt-ns-rel"; then
   ok "released a never-started bead (aged, no worker/branch/gate)"
@@ -1124,7 +1155,7 @@ else
 fi
 
 # 16b: fresh dispatch (age < threshold) → KEEP.
-NS_FRESH_J='[{"id":"tt-ns-fresh","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_FRESH"'"}}]'
+NS_FRESH_J='[{"id":"tt-ns-fresh","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_FRESH"'"}}]'
 LOG16B="$(run_neverstarted "$NS_FRESH_J" "" "" "")"
 if echo "$LOG16B" | grep -q "releasing never-started in-flight bead tt-ns-fresh"; then
   bad "REGRESSION: released a FRESH dispatch (age < 15m threshold)"
@@ -1133,7 +1164,7 @@ else
 fi
 
 # 16c: a surviving crew branch → KEEP (real work landed before the worker died).
-NS_BR='[{"id":"tt-ns-branch","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+NS_BR='[{"id":"tt-ns-branch","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 LOG16C="$(run_neverstarted "$NS_BR" "tt-ns-branch" "" "")"
 if echo "$LOG16C" | grep -q "releasing never-started in-flight bead tt-ns-branch"; then
   bad "REGRESSION: released a bead that HAS a crew branch"
@@ -1142,7 +1173,7 @@ else
 fi
 
 # 16d: a gate:* label → KEEP (it reached the gate, so it was built).
-NS_GATE='[{"id":"tt-ns-gate","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-fix"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+NS_GATE='[{"id":"tt-ns-gate","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-fix"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 LOG16D="$(run_neverstarted "$NS_GATE" "" "" "")"
 if echo "$LOG16D" | grep -q "releasing never-started in-flight bead tt-ns-gate"; then
   bad "REGRESSION: released a bead carrying a gate marker (gate:needs-fix)"
@@ -1151,7 +1182,7 @@ else
 fi
 
 # 16e: a sling whose assignee is a LIVE session → KEEP (build in flight).
-NS_LIVE='[{"id":"tt-ns-live","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-live"}}]'
+NS_LIVE='[{"id":"tt-ns-live","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-live"}}]'
 LOG16E="$(run_neverstarted "$NS_LIVE" "" "$NS_SESS" '{"tt-sling-live":"digo-wa"}')"
 if echo "$LOG16E" | grep -q "releasing never-started in-flight bead tt-ns-live"; then
   bad "REGRESSION: released a bead whose builder session is LIVE"
@@ -1160,7 +1191,7 @@ else
 fi
 
 # 16f: a sling whose assignee is PROVABLY gone (roster trustworthy) → RELEASE.
-NS_DEAD='[{"id":"tt-ns-dead","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-dead"}}]'
+NS_DEAD='[{"id":"tt-ns-dead","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-dead"}}]'
 LOG16F="$(run_neverstarted "$NS_DEAD" "" "$NS_SESS" '{"tt-sling-dead":"ghost-wa"}')"
 if echo "$LOG16F" | grep -q "releasing never-started in-flight bead tt-ns-dead"; then
   ok "released a bead whose builder session is provably gone"
@@ -1170,7 +1201,7 @@ fi
 
 # 16g: legacy bead with NO pilot.dispatched_at stamp → stamp-now, NOT released
 # (the ga-2azzj Defect-A discipline: never release on first sight).
-NS_LEGACY='[{"id":"tt-ns-legacy","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{}}]'
+NS_LEGACY='[{"id":"tt-ns-legacy","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{}}]'
 LOG16G="$(run_neverstarted "$NS_LEGACY" "" "" "")"
 if echo "$LOG16G" | grep -q "no pilot.dispatched_at stamp.*stamping now, NOT releasing"; then
   ok "legacy bead is stamped, not released on first sight (Defect-A guard)"
@@ -1184,7 +1215,7 @@ else
 fi
 
 # 16h: sling present but roster untrustworthy (empty) → KEEP (cannot prove dead).
-NS_UNTRUST='[{"id":"tt-ns-untrust","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-x"}}]'
+NS_UNTRUST='[{"id":"tt-ns-untrust","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-x"}}]'
 LOG16H="$(run_neverstarted "$NS_UNTRUST" "" "" "")"
 if echo "$LOG16H" | grep -q "releasing never-started in-flight bead tt-ns-untrust"; then
   bad "REGRESSION: released a sling-bearing bead while the roster was untrustworthy"
@@ -1203,7 +1234,7 @@ fi
 # to the crew, so `bd show <story>` reports that crew as the bead's assignee.
 echo "Scenario 16L: ga-9yb5s — a live crew owner of the story protects it from reclaim"
 NS_CREW_SESS='{"sessions":[{"session_name":"batista-ps","closed":false}]}'
-NS_CREW='[{"id":"tt-ns-crew","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+NS_CREW='[{"id":"tt-ns-crew","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 LOG16L="$(run_neverstarted "$NS_CREW" "" "$NS_CREW_SESS" '{"tt-ns-crew":"batista-ps"}')"
 if echo "$LOG16L" | grep -q "releasing never-started in-flight bead tt-ns-crew"; then
   bad "REGRESSION (ga-9yb5s): released a story owned by a LIVE crew (false reclaim → double-dispatch)"
@@ -1215,7 +1246,7 @@ fi
 # RELEASE. The new guard must not pin a genuine orphan whose crew session died;
 # it asserts an owner ONLY when that owner is provably live.
 echo "Scenario 16m: ga-9yb5s — a DEAD crew owner does NOT pin the bead (no deadlock)"
-NS_CREWD='[{"id":"tt-ns-crewdead","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+NS_CREWD='[{"id":"tt-ns-crewdead","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 LOG16M="$(run_neverstarted "$NS_CREWD" "" "$NS_CREW_SESS" '{"tt-ns-crewdead":"ghost-ps"}')"
 if echo "$LOG16M" | grep -q "releasing never-started in-flight bead tt-ns-crewdead"; then
   ok "story whose crew owner is provably gone is released (no deadlock)"
@@ -1227,7 +1258,7 @@ fi
 # tracked by the SLING task, never by story.assignee. The crew-owner guard must
 # ignore a gastown.dog* assignee so dog reclaim behaviour is unchanged.
 echo "Scenario 16n: ga-9yb5s — a dog-pool assignee is not treated as a crew owner"
-NS_DOG='[{"id":"tt-ns-dog","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+NS_DOG='[{"id":"tt-ns-dog","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 NS_DOG_SESS='{"sessions":[{"session_name":"gastown.dog","closed":false}]}'
 LOG16N="$(run_neverstarted "$NS_DOG" "" "$NS_DOG_SESS" '{"tt-ns-dog":"gastown.dog"}')"
 if echo "$LOG16N" | grep -q "releasing never-started in-flight bead tt-ns-dog"; then
@@ -1294,8 +1325,8 @@ has "$DISPATCHER" 'PILOT_NEVERSTARTED_MINUTES'    "never-started threshold knob 
 builder_for_domain() { echo "$1" | grep "Builder target:.*domain=$2" | sed -E 's/.*Builder target: ([^ ]+).*/\1/' | head -1; }
 
 WA_DOMAIN_BUGS='[
-  {"id":"tt-wafe","title":"painel-historias: corrigir botao no design-system (lib/urblink_design_system.py)","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}},
-  {"id":"tt-wadata","title":"enrichment: backfill financeiro do ledger por email","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{"story.rig":"whatsapp_automation"}}
+  {"id":"tt-wafe","title":"painel-historias: corrigir botao no design-system (lib/urblink_design_system.py)","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}},
+  {"id":"tt-wadata","title":"enrichment: backfill financeiro do ledger por email","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{"story.rig":"whatsapp_automation"}}
 ]'
 
 echo "Scenario 17a: frontend bug (design-system) is kept OFF digo-wa (exclude rule)"
@@ -1328,7 +1359,7 @@ else
 fi
 
 echo "Scenario 17d: unknown-domain WA bug still rotates normally (FAIL-OPEN, no over-steer)"
-WA_UNKNOWN='[{"id":"tt-waunk","title":"wa generic bug with no area signal","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}}]'
+WA_UNKNOWN='[{"id":"tt-waunk","title":"wa generic bug with no area signal","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}}]'
 LOG17D="$(run_capacity 10 "[]" 1 "$WA_UNKNOWN")"
 UNK_BUILDER="$(builders_of "$LOG17D")"
 if echo "$UNK_BUILDER" | grep -qE '^(digo|mila|oracle|peter|thies)-wa$'; then
@@ -1389,8 +1420,8 @@ run_capacity_reuse() { # $1=PILOT_REUSE_SESSION  $2=FAKE_BUGS_JSON  $3=FAKE_SESS
 # One WA bug → pooled rig; with no in-flight the busy-set is empty so the picker
 # selects the first idle crew (digo-wa), which is the identity we stage a session
 # for below.
-GT4_WA_BUG='[{"id":"tt-gt4wa","title":"gt-4st3n wa bug","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}}]'
-GT4_GC_BUG='[{"id":"tt-gt4gc","title":"gt-4st3n gascity bug","priority":0,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}]'
+GT4_WA_BUG='[{"id":"tt-gt4wa","title":"gt-4st3n wa bug","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}}]'
+GT4_GC_BUG='[{"id":"tt-gt4gc","title":"gt-4st3n gascity bug","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}]'
 GT4_SESS_ACTIVE='{"sessions":[{"session_name":"digo-wa","alias":"digo-wa","agent_name":"digo-wa","id":"ga-wisp-digo","state":"active","closed":false}]}'
 GT4_SESS_ASLEEP='{"sessions":[{"session_name":"digo-wa","alias":"digo-wa","agent_name":"digo-wa","id":"ga-wisp-digo","state":"asleep","closed":false}]}'
 GT4_SESS_NONE='{"sessions":[]}'
@@ -1479,6 +1510,197 @@ if grep -qE 'PILOT_REUSE_SESSION:-1.+!= "1".+\&\&.+BUILDER_TARGET.+!= "gastown.d
 else
   bad "wa-1eos defer not gated behind PILOT_REUSE_SESSION!=1"
 fi
+
+# ── Scenario 18 (ga-lfvs6/ga-wgcyk/ga-m3n1x): DOMAIN-aware no-dog routing ─────
+# A property_scrapers DOMAIN build authored as an HQ ga- bead (story.rig unset →
+# inferred gascity → would route to gastown.dog) must NOT land on the dog: it is
+# re-routed to the owning persistent crew (batista-ps) or DEFERRED, for ANY lane.
+# Generic HQ work with no domain signal must STILL route to the dog (fail-open).
+#
+# These fixtures use ga-* (HQ) ids with NO story.rig, mirroring the real misroutes
+# (ga-wgcyk RFB death-check scraper, ga-m3n1x ITBI/CNAE lote mapping). The default
+# run_capacity has NO live batista-ps session and an empty busy/used set, so the
+# domain build re-routes affirmatively to batista-ps (rule 2).
+#
+# NOTE: the early "Builder target:" log line is emitted at the routing step BEFORE
+# the domain-route guard runs, so it still reads the rig-inferred gastown.dog. The
+# AUTHORITATIVE dispatched builder is the post-guard sling line ("→ builder: X" /
+# "builder=X"). dispatched_builder() reads that, not the pre-guard target.
+dispatched_builder() { echo "$1" | grep -oE '→ story:in-flight \(builder=[^ )]+' | sed -E 's/.*builder=//' | head -1; }
+echo "Scenario 18a: property_scrapers domain build (lane:small, ga- HQ bead) → batista-ps, NOT dog"
+PS_DOMAIN_SMALL='[{"id":"ga-wgtest","title":"Mapeamento automatico de falecimento de proprietarios idosos (scraper RFB semanal)","priority":3,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-06-12T00:00:01Z","metadata":{"story.o_que_e":"scraper semanal que verifica na Receita Federal o CPF dos proprietarios dos imoveis de interesse"}}]'
+LOG18A="$(run_capacity 10 "[]" 1 "$PS_DOMAIN_SMALL")"
+B18A="$(dispatched_builder "$LOG18A")"
+if [ "$B18A" = "batista-ps" ]; then
+  ok "lane:small property_scrapers domain build routed to batista-ps (not the dog)"
+elif echo "$B18A" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION: domain build landed on the dog pool ($B18A) — the recurring misroute"
+else
+  bad "domain build routed unexpectedly (got: '${B18A:-none}')"
+fi
+if echo "$LOG18A" | grep -q "ga-lfvs6: .* domain build .* routing to the owning persistent crew batista-ps"; then
+  ok "domain-route guard logged the re-route to batista-ps"
+else
+  bad "domain-route guard did not log the affirmative re-route"
+fi
+
+echo "Scenario 18b: data-build (ITBI/CNAE, lane:small, ga- HQ bead) → batista-ps, NOT dog"
+PS_DOMAIN_DATA='[{"id":"ga-m3test","title":"Mapear compradores de lotes em BH — segmentacao PF/PJ por CNAE","priority":3,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-06-12T00:00:02Z","metadata":{"story.dependencias":"Acesso aos dados de ITBI de BH e a uma fonte de CNAE por CNPJ (Receita Federal)"}}]'
+LOG18B="$(run_capacity 10 "[]" 1 "$PS_DOMAIN_DATA")"
+B18B="$(dispatched_builder "$LOG18B")"
+if [ "$B18B" = "batista-ps" ]; then
+  ok "lane:small ITBI/CNAE data-build routed to batista-ps (not the dog)"
+elif echo "$B18B" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION: data-build landed on the dog pool ($B18B)"
+else
+  bad "data-build routed unexpectedly (got: '${B18B:-none}')"
+fi
+
+echo "Scenario 18c: generic HQ work (no domain signal) STILL routes to gastown.dog (fail-open)"
+LOG18C="$(run_capacity 10 "[]" 1 "$FIVE_SMALL_BUGS")"
+B18C="$(builders_of "$LOG18C")"
+if [ "$(echo "$B18C" | grep -c .)" -ge 5 ] && [ -z "$(echo "$B18C" | grep -vE '^gastown\.dog$')" ]; then
+  ok "all generic HQ dispatches still target gastown.dog (domain guard is fail-open)"
+else
+  bad "REGRESSION: generic HQ routing changed (got: $(echo "$B18C" | sort -u | tr '\n' ' '))"
+fi
+if echo "$LOG18C" | grep -q "ga-lfvs6:"; then
+  bad "domain-route guard fired on generic HQ work (false positive)"
+else
+  ok "domain-route guard stayed silent on generic HQ work (no false positive)"
+fi
+
+echo "Scenario 18d: lane:big property_scrapers domain build → batista-ps (guard is lane-agnostic)"
+# Proves the new guard generalises the lane:big nodog guard to data-build content:
+# even a lane:big domain build with no story.rig reaches the crew, not the dog.
+PS_DOMAIN_BIG='[{"id":"ga-bigtest","title":"Georreferenciar imoveis Contagem — match cadastral (cadastro PBH + geocode)","priority":2,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["lane:big","story:approved"],"assignee":null,"created_at":"2026-06-16T00:00:01Z","metadata":{"story.notebook":"Hex Compatibilizar ads - Fase 1; pesquisa_mercado.lotes_cadastro_match"}}]'
+LOG18D="$(run_capacity 10 "[]" 1 "$PS_DOMAIN_BIG")"
+B18D="$(dispatched_builder "$LOG18D")"
+if [ "$B18D" = "batista-ps" ]; then
+  ok "lane:big domain build also routed to batista-ps (lane-agnostic)"
+elif echo "$B18D" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION: lane:big domain build landed on the dog pool ($B18D)"
+else
+  bad "lane:big domain build routed unexpectedly (got: '${B18D:-none}')"
+fi
+
+echo "Scenario 18e: domain build DEFERS (no dog) when the owning crew is BUSY this sweep"
+# batista-ps already holds live in-flight work → busy set → the domain build must
+# DEFER (leave queued), never fall back to a dog. Correct backpressure.
+NOW_ISO18="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+INFLIGHT18E="[{\"id\":\"if-ps\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO18\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-ps\"}}]"
+SESSIONS18E='{"sessions":[{"session_name":"batista-ps","closed":false}]}'
+SLINGMAP18E='{"tt-sling-ps":"batista-ps"}'
+LOG18E="$(run_capacity 10 "$INFLIGHT18E" 1 "$PS_DOMAIN_SMALL" "$SESSIONS18E" "$SLINGMAP18E")"
+B18E="$(dispatched_builder "$LOG18E")"
+if echo "$B18E" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION: domain build fell back to a dog while batista-ps was busy ($B18E)"
+elif [ "$B18E" = "batista-ps" ]; then
+  bad "domain build dispatched to batista-ps despite it being busy (mutex bypass)"
+elif echo "$LOG18E" | grep -q "ga-lfvs6: REFUSING"; then
+  ok "domain build DEFERRED (no dispatch, no dog) while owning crew busy — correct backpressure"
+elif [ -z "$B18E" ]; then
+  ok "domain build not dispatched to any builder while owning crew busy (deferred)"
+else
+  bad "domain build routed unexpectedly while busy (got: '${B18E:-none}')"
+fi
+
+echo "Scenario 18f: drift-guard — the domain-route guard is wired into the live dispatcher"
+has "$DISPATCHER" 'PILOT_DOMAIN_ROUTE_GUARD'            "domain-route guard knob is wired"
+has "$DISPATCHER" 'bead_content_rig\(\)'               "content→rig classifier is defined"
+has "$DISPATCHER" 'rig_domain_default_builder\(\)'     "domain→persistent-crew map is defined"
+
+# ── Scenario 19 (wa-u5r1): dispatchable-queue emit for the painel ─────────────
+echo "Scenario 19a: emit writes valid JSON with the contract shape + count + items"
+F19="$(run_emit)"
+if [ ! -f "$F19" ]; then
+  bad "emit did not write a file on a normal sweep"
+elif ! jq -e . "$F19" >/dev/null 2>&1; then
+  bad "emit wrote invalid JSON"
+else
+  ok "emit wrote a file with valid JSON"
+  if jq -e '(.generated_at|type=="string") and (.ttl_seconds|type=="number") and (.count|type=="number") and (.items|type=="array")' "$F19" >/dev/null 2>&1; then
+    ok "emit JSON has the contract keys (generated_at, ttl_seconds, count, items)"
+  else
+    bad "emit JSON missing one of generated_at/ttl_seconds/count/items"
+  fi
+  # Default -t bug fixture yields tt-blkd + tt-unblk (both clean, with descriptions).
+  if jq -e '[.items[].id] | (index("tt-blkd") != null) and (index("tt-unblk") != null)' "$F19" >/dev/null 2>&1; then
+    ok "emit includes the eligible candidates (tt-blkd, tt-unblk)"
+  else
+    bad "emit missing expected eligible candidates"
+  fi
+  if jq -e 'all(.items[]; has("id") and has("title") and has("type") and has("rig") and has("priority") and has("created_at") and has("assignee") and has("store"))' "$F19" >/dev/null 2>&1; then
+    ok "every emit item carries the full per-item key set"
+  else
+    bad "an emit item is missing a contract key"
+  fi
+  if jq -e '.count == (.items|length)' "$F19" >/dev/null 2>&1; then
+    ok "emit count matches items length"
+  else
+    bad "emit count != items length"
+  fi
+fi
+
+echo "Scenario 19b: emit EXCLUDES assigned/braked beads (shared filter chain)"
+# An ASSIGNED bug must be dropped by _filter_candidates; a clean one kept.
+EMIT_BUGS_19B='[{"id":"tt-emit-clean","title":"clean","priority":0,"issue_type":"bug","description":"ctx","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},{"id":"tt-emit-assigned","title":"assigned","priority":0,"issue_type":"bug","description":"ctx","status":"open","labels":[],"assignee":"someone-wa","created_at":"2026-06-01T00:00:00Z","metadata":{}}]'
+F19B="$(run_emit "$EMIT_BUGS_19B")"
+if jq -e '[.items[].id] | (index("tt-emit-clean") != null) and (index("tt-emit-assigned") == null)' "$F19B" >/dev/null 2>&1; then
+  ok "emit kept the clean bead and excluded the assigned one (filter parity)"
+else
+  bad "emit did not apply the assigned-veto correctly (got: $(jq -c '[.items[].id]' "$F19B" 2>/dev/null))"
+fi
+
+echo "Scenario 19c: emit writes count=0 / items=[] when there are NO candidates"
+EMIT_BUGS_19C='[]'
+F19C="$(run_emit "$EMIT_BUGS_19C")"
+# Force ALL queries empty: the default shim returns the 2-bug fixture for -t bug
+# UNLESS FAKE_BUGS_JSON is set; '[]' makes it empty. tech-debt/features default [].
+if jq -e '.count == 0 and (.items == [])' "$F19C" >/dev/null 2>&1; then
+  ok "emit wrote the zero-shape (count=0, items=[]) — 'out of dispatchable work'"
+else
+  bad "emit did not write the zero-shape on an empty pool (got: $(jq -c '{count,items}' "$F19C" 2>/dev/null))"
+fi
+
+echo "Scenario 19d: emit STILL writes on the quota-pause early-exit (queue persists)"
+F19D="$(run_emit "" 2)"   # PILOT_QUOTA_OVERRIDE=2 → quota PAUSE exit
+if [ -f "$F19D" ] && jq -e '.items|type=="array"' "$F19D" >/dev/null 2>&1; then
+  ok "emit refreshed the queue even though the sweep PAUSED for quota (file never goes stale on a paused sweep)"
+else
+  bad "emit did NOT write on the quota-pause path — painel would falsely show stale/empty"
+fi
+
+echo "Scenario 19e: emit is env-gated OFF (PILOT_EMIT_DISPATCHABLE=0 → no file)"
+F19E="$(run_emit "" "" 0)"
+if [ -f "$F19E" ]; then
+  bad "emit wrote a file even though PILOT_EMIT_DISPATCHABLE=0"
+else
+  ok "emit produced no file when disabled (env-gate honored)"
+fi
+
+echo "Scenario 19f: a failed emit does NOT abort the dispatch sweep (fail-open)"
+# Point the emit at an UNWRITABLE path; the sweep must still complete normally.
+: > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+reset_state
+env -i \
+  PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" HOME="$HOME" DRY_RUN=1 \
+  PILOT_CITY_OVERRIDE="$FIXCITY" PILOT_TEST_STATE="$STATE" \
+  PILOT_DOLT_LATENCY_OVERRIDE_MS=100 PILOT_DOLT_CPU_OVERRIDE=10 \
+  PILOT_DISPATCHABLE_FILE="/this/path/does/not/exist/and/cannot/be/made/x.json" \
+  FAKE_BLOCKED_IDS="" \
+  bash "$DISPATCHER" >/dev/null 2>&1 || true
+LOG19F="$(cat "$FIXCITY/.gc/logs/pilot-dispatcher.log")"
+if echo "$LOG19F" | grep -q "=== Pilot sweep complete\|=== Pilot sweep start"; then
+  ok "sweep ran to completion despite an unwritable emit path (fail-open, no abort)"
+else
+  bad "an emit failure aborted the sweep (NOT fail-open)"
+fi
+
+echo "Scenario 19g: drift-guard — the emit is wired into the live dispatcher"
+has "$DISPATCHER" '_pilot_emit_dispatchable'        "emit function is defined"
+has "$DISPATCHER" 'PILOT_EMIT_DISPATCHABLE'         "emit env-gate knob is wired"
+has "$DISPATCHER" 'PILOT_DISPATCHABLE_FILE'         "emit output-path seam is wired"
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""

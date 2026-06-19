@@ -283,6 +283,26 @@ PILOT_REUSE_SESSION="${PILOT_REUSE_SESSION:-1}"
 # Set PILOT_OWNERSHIP_GUARD=0 to disable (legacy flat-pool behaviour, no redeploy).
 PILOT_OWNERSHIP_GUARD="${PILOT_OWNERSHIP_GUARD:-1}"
 
+# ── ctx:ready auto-dispatch — chore/task/debt with a trusted context check ─────
+# Final phase of the auto-dispatch architecture. A LIVE, LABEL-ONLY context-check
+# daemon now annotates bug/chore/task/debt beads with ctx:ready (context-complete,
+# enough spec for a generic builder) or ctx:thin (under-specified). Today the Pilot
+# queries ONLY type:bug + tech-debt + story:approved features — chore/task beads are
+# NEVER queried (the design's known coverage gap). This knob, when set to 1, adds a
+# new candidate query for chore/task/debt beads (NO story:* label) carrying
+# `-l ctx:ready`, merging them into the SAME priority-ordered pool as Tier-1/Tier-2
+# and passing them through the IDENTICAL filter chain (_filter_candidates incl. the
+# empty-veto, _filter_unblocked, _filter_explicit_deps, domain-routing, lane:big,
+# dedup). The per-bead dispatch template is already type-derived (wa-tm2a) so a
+# chore/task routes to the right builder automatically.
+#
+# DEFAULT 0 → the new query NEVER runs → this file is INERT (byte-equivalent
+# behaviour to the pre-change dispatcher). The Mayor deploys it OFF and flips it on
+# (PILOT_CTX_READY_QUERIES=1, e.g. in the launchd plist env) once the ctx: labels
+# are trusted. ctx:thin is explicitly excluded as defense-in-depth: an under-spec'd
+# bead must NEVER be dispatched even if it somehow also carried ctx:ready.
+PILOT_CTX_READY_QUERIES="${PILOT_CTX_READY_QUERIES:-0}"
+
 # Dry-run mode: show what WOULD happen, make zero changes.
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -449,6 +469,66 @@ rig_domain_exclude() {
   case "$1/$2" in
     whatsapp_automation/frontend|wa/frontend) echo "digo-wa" ;;
     *)                                        echo ""        ;;
+  esac
+}
+
+# ── Domain-build → owning-rig inference (ga-lfvs6/ga-wgcyk/ga-m3n1x misroute) ──
+# ROOT (5+ recurrences today: ga-lfvs6, ga-jazy9, ga-m3n1x, ga-wgcyk, ga-yx2d1's
+# property siblings): a DOMAIN build (a property_scrapers scraper, or a WA painel/
+# pipedrive feature) is authored as an HQ bead (ga-* prefix) by mila with NO
+# story.rig metadata and a null assignee. The early rig-inference (gt-pm55p) maps
+# the ga- prefix → rig=gascity → rig_to_builders → the ephemeral gastown.dog pool.
+# A dog (~25-min TTL, no domain data access, no rig git checkout, no git-diff for
+# the gate) CANNOT build a real domain task, so it circuit-breaks and the sweep
+# re-dispatches it — a loop. The lane:big nodog guard (ga-jazy9) only catches
+# lane:big; these are lane:small DOMAIN builds, so they slip through.
+#
+# bead_content_rig <bead_json> — infer the OWNING DOMAIN RIG from the bead's text
+# (title + description + criteria + labels + story.* metadata), independent of the
+# (wrong) story.rig=gascity. Prints the rig name (property_scrapers /
+# whatsapp_automation) for a recognised domain build, or "" for generic/HQ work.
+# Keyword sets are deliberately domain-specific (not generic words like "data"):
+#   property_scrapers — scraper/cadastro/ITBI/RFB/CNAE/PBH/MotherDuck/Hex notebook/
+#     geocod*/lat-lon/lote/imóvel/imovel/pesquisa_mercado/proprietár*/terreno/
+#     cartório/matrícula/incorporação. These are the property-data engineering
+#     signals on ga-lfvs6/ga-wgcyk/ga-m3n1x (and the -ps rig prefix).
+#   whatsapp_automation — painel/whatsapp/whapi/pipedrive/kanban história/
+#     urblink_design_system/frota/canais/disparo/mensagem. (A wa- prefixed bead
+#     already routes correctly via story.rig; this only catches WA-domain features
+#     authored as ga- HQ beads.)
+# FAIL-OPEN by design: no domain match → "" → caller leaves routing unchanged, so
+# genuine generic/HQ work still flows to the dog pool exactly as today. First match
+# wins; property_scrapers is checked first (its signals are the recurring misroute).
+bead_content_rig() {
+  local bead="$1" hay
+  hay=$(echo "$bead" | jq -r '
+      [ (.title // ""), (.description // ""),
+        (.acceptance_criteria // .metadata["story.criterios"] // ""),
+        (.metadata["story.o_que_e"] // ""), (.metadata["story.resumo"] // ""),
+        (.metadata["story.dependencias"] // ""), (.metadata["story.notebook"] // ""),
+        ((.labels // []) | join(" ")) ] | join("  ")
+    ' 2>/dev/null || echo "")
+  [ -z "$hay" ] && { echo ""; return 0; }
+  # property_scrapers domain (the recurring misroute family).
+  if printf '%s' "$hay" | grep -iqE 'scraper|scrape|\bcadastro\b|cadastr[ao]|\bITBI\b|\bRFB\b|receita federal|\bCNAE\b|\bCNPJ\b|\bPBH\b|motherduck|\bHex\b|hex notebook|geocod|georreferenc|lat[ -/]?lon|point-in-polygon|pesquisa_mercado|propriet[áa]ri|\bim[óo]vel\b|\bim[óo]veis\b|\blote\b|\blotes\b|\bterreno\b|terreno_livre|cart[óo]rio|matr[íi]cula|incorpora|índice cadastral|indice cadastral|mega_data_set|mega data set'; then
+    echo "property_scrapers"; return 0
+  fi
+  # whatsapp_automation domain features authored as HQ (ga-) beads.
+  if printf '%s' "$hay" | grep -iqE '\bpainel\b|whatsapp|\bwhapi\b|pipedrive|urblink_design_system|design[ -]system|painel-hist|kanban hist|\bfrota\b|\bcanais\b|\bcanal\b de alerta|disparo|envio de mensagem'; then
+    echo "whatsapp_automation"; return 0
+  fi
+  echo ""
+}
+
+# rig_domain_default_builder <rig> — the PERSISTENT crew that owns a domain rig's
+# builds, or "" if the rig has no single persistent owner. Used by the domain-route
+# guard to pick the affirmative target when a domain build resolved to a dog and
+# the bead has no live crew owner yet. Only rigs with a known persistent crew are
+# listed; everything else → "" → the guard DEFERS rather than guess.
+rig_domain_default_builder() {
+  case "$1" in
+    property_scrapers|ps)   echo "batista-ps" ;;
+    *)                      echo ""           ;;
   esac
 }
 
@@ -748,6 +828,305 @@ _pilot_gate_congested() {
   printf '0'; return 0
 }
 
+# ── wa-u5r1: candidate-filter helpers + dispatchable-queue emit (relocated up) ─
+# These pure helper/emit definitions were moved ABOVE the early-exit gates (quota
+# pause, cross-stage defer, both-lanes-full) so the dispatchable-queue emit can run
+# on EVERY sweep path — including those that exit before the candidate-gathering
+# step. They have no side effects at definition time; the dispatch queries below
+# still call _filter_candidates/_filter_unblocked/_filter_explicit_deps unchanged.
+
+_FILTER_PREAPPROVAL_LABELS='["story:unrefined","story:refinement-in-progress","story:triage","story:cancelled"]'
+_filter_candidates() {
+  jq --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
+    '[.[] | select(
+        .id != $self
+        and (.assignee == null or .assignee == "")
+        and ((.issue_type // .type // "") != "epic")
+        and (((.labels // []) | index("story:epic-split")) | not)
+        and (((.labels // []) - $preapproval) | length) == ((.labels // []) | length)
+        and ((.description // "") | test("\\S"))
+     )]' \
+    2>/dev/null || echo "[]"
+}
+# ── context veto (Athos): a bead with an EMPTY/whitespace-only description can
+# NEVER dispatch — a generic agent has no context to build it. EMPTY-ONLY by
+# design (test("\\S") = keep if any non-whitespace char): NOT a length/byte
+# threshold, so a terse-but-complete bead ("CDP 9223 down, restart") still
+# passes and a legacy/cross-rig bead is never stranded by length. Measured
+# 2026-06-17: 0 false-drops on the current bug/tech-debt/approved pool (none are
+# empty); it only holds the ~7 genuinely-empty/mislabeled beads. Thin-but-non-
+# empty quality is a separate gate (creation-time ctx:thin), not this floor.
+
+# _filter_unblocked <db_dir>   (reads candidate JSON array from stdin)
+# Drops candidates that are currently BLOCKED by unresolved (open) dependencies
+# in <db_dir>, using bd's blocker-aware `bd blocked` set. This is the fix for
+# bug ga-5ew: the Pilot must NOT dispatch a story whose hard dependency is not
+# yet merged/closed (it did — dispatched ga-30v while dep ga-d81 was unmerged).
+# A bead is "blocked" iff it has a dependency that is not yet closed; a dep that
+# is already closed does NOT block (so we cannot simply filter on dependency_count).
+#
+# FAIL-OPEN: if `bd blocked` errors, returns nothing, or the jq filter fails,
+# candidates pass through UNCHANGED — never worse than the pre-fix behavior.
+# Diagnostics go to stderr (which the top-level `exec ... 2>&1` routes to the
+# log) so stdout stays pure JSON for the caller's command-substitution capture.
+_filter_unblocked() {
+  local db_dir="$1"
+  local arr blocked_ids blocked_json before after filtered
+  arr=$(cat)
+
+  blocked_ids=$(bd -C "$db_dir" blocked --json 2>/dev/null \
+    | jq -r '(.[]?.id) // empty' 2>/dev/null || echo "")
+  # Nothing blocked in this DB (or probe failed) → pass through unchanged.
+  if [ -z "$blocked_ids" ]; then
+    printf '%s' "$arr"
+    return 0
+  fi
+
+  blocked_json=$(printf '%s\n' "$blocked_ids" \
+    | jq -R -s 'split("\n") | map(select(length>0))' 2>/dev/null || echo "[]")
+
+  before=$(printf '%s' "$arr" | jq 'length' 2>/dev/null || echo "0")
+  filtered=$(printf '%s' "$arr" | jq --argjson blk "$blocked_json" \
+    '[.[] | select((.id as $i | $blk | index($i)) | not)]' 2>/dev/null) \
+    || { printf '%s' "$arr"; return 0; }
+  [ -z "$filtered" ] && { printf '%s' "$arr"; return 0; }
+  after=$(printf '%s' "$filtered" | jq 'length' 2>/dev/null || echo "0")
+
+  if [ "$before" != "$after" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: excluded $((before - after)) blocked candidate(s) in $db_dir (unresolved deps — ga-5ew fix)" >&2
+  fi
+  printf '%s' "$filtered"
+}
+
+# _filter_explicit_deps <db_dir>   (reads candidate JSON array from stdin)
+# Drops candidates that declare an EXPLICIT, still-open dependency via the
+# `story.depends_on_beads` metadata field — a space/comma/newline-separated list
+# of bead IDs that this bead must be built ON TOP OF.
+#
+# This is the fix for bug ga-do8jj: the Pilot dispatched ga-2e605 BEFORE its
+# real dependency ga-e72kf (the canonical painel base) had landed. The
+# dependency was real, but it lived only in PROSE ("Construir SOBRE a base
+# canônica ga-e72kf …" in story.dependencias) and was never encoded as a formal
+# `bd` blocks-edge — so `bd blocked` (and thus _filter_unblocked above) could
+# not see it, and the dependent story slipped through. This filter is the
+# structured, zero-false-positive realization of the bug's fix-option (b),
+# "convenção de dep explícita": a dedicated field the dispatcher enforces.
+#
+# CONTRACT — deliberately narrow to avoid false-positive deadlocks:
+#   * ONLY bead IDs in the dedicated `story.depends_on_beads` field are honored.
+#     We do NOT parse the free-form `story.dependencias` prose, which mixes hard
+#     deps with coordination/negative references ("coordenar com ga-gzf5a",
+#     "NÃO da wa-rlzo") that must NOT block dispatch.
+#   * A referenced dep is SATISFIED iff it is closed. Any non-closed dep holds
+#     the candidate back for THIS sweep only — AUTO-CLEARING: once the dep
+#     closes, the next sweep dispatches. No manual un-hold, no stale state.
+#   * Self-references are ignored (a bead never blocks itself).
+#
+# FAIL-OPEN: any bd error / unresolvable dep status passes the candidate through
+# UNCHANGED — never stricter than the pre-fix behavior, so a transient Dolt
+# hiccup or a typo'd dep id can never wedge the pipeline. Diagnostics → stderr
+# (routed to the log by the top-level `exec … 2>&1`) so stdout stays pure JSON.
+_filter_explicit_deps() {
+  local db_dir="$1"
+  local arr
+  arr=$(cat)
+  [ -z "$arr" ] && { printf '[]'; return 0; }
+
+  # Fast path: no candidate declares explicit deps → pass through untouched
+  # (zero extra bd calls on the common case — Scenarios 1/2 and normal sweeps).
+  if ! printf '%s' "$arr" \
+      | jq -e 'any(.[]?; (.metadata["story.depends_on_beads"] // "") != "")' \
+        >/dev/null 2>&1; then
+    printf '%s' "$arr"
+    return 0
+  fi
+
+  local held_ids="" bead bid deps dep dep_status
+  while IFS= read -r bead; do
+    [ -z "$bead" ] && continue
+    bid=$(printf '%s' "$bead" | jq -r '.id // ""' 2>/dev/null || echo "")
+    [ -z "$bid" ] && continue
+    deps=$(printf '%s' "$bead" \
+      | jq -r '.metadata["story.depends_on_beads"] // ""' 2>/dev/null || echo "")
+    deps=$(printf '%s' "$deps" | tr ',\n' '  ')
+    for dep in $deps; do
+      dep=$(printf '%s' "$dep" | tr -d '[:space:]')
+      [ -z "$dep" ] && continue
+      [ "$dep" = "$bid" ] && continue
+      dep_status=$(bd -C "$db_dir" show "$dep" --json 2>/dev/null \
+        | jq -r 'if type=="array" then .[0] else . end | .status // ""' \
+          2>/dev/null || echo "")
+      # Non-closed, resolvable dep → HOLD. Empty status (lookup failed) →
+      # fail-open: do not hold on a dep we cannot resolve.
+      if [ -n "$dep_status" ] && [ "$dep_status" != "closed" ]; then
+        held_ids="$held_ids $bid"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: holding $bid — explicit dep $dep is '$dep_status' (not closed) [story.depends_on_beads — ga-do8jj fix]" >&2
+        break
+      fi
+    done
+  done < <(printf '%s' "$arr" | jq -c '.[]?' 2>/dev/null)
+
+  if [ -z "$held_ids" ]; then
+    printf '%s' "$arr"
+    return 0
+  fi
+
+  local held_json filtered
+  held_json=$(printf '%s\n' $held_ids \
+    | jq -R -s 'split("\n") | map(select(length>0))' 2>/dev/null || echo "[]")
+  filtered=$(printf '%s' "$arr" | jq --argjson held "$held_json" \
+    '[.[] | select((.id as $i | $held | index($i)) | not)]' 2>/dev/null) \
+    || { printf '%s' "$arr"; return 0; }
+  [ -z "$filtered" ] && { printf '%s' "$arr"; return 0; }
+  printf '%s' "$filtered"
+}
+
+# ── wa-u5r1: emit the Pilot's FULL dispatchable queue for the painel ──────────
+# Athos's requirement: the painel's "Aprovadas" column must be a FAITHFUL mirror
+# of the Pilot's dispatch queue — EXACTLY the open beads the Pilot would dispatch
+# NOW: NOT in-flight, NOT assigned, NOT braked (gate:needs-human / engine-window /
+# pre-approval lifecycle), and ONLY the types the Pilot actually queries (type:bug
+# + tech-debt + story:approved features; ctx:ready chore/task ONLY when
+# PILOT_CTX_READY_QUERIES=1 — the painel must not show ctx:ready work the Pilot
+# never queries). The PILOT is the single source of truth: it computes its own
+# eligible set with its own filters and writes it here; the painel renders exactly
+# this file. The set is the FULL eligible queue (every dispatchable candidate),
+# NOT the lane-cap-limited subset the Pilot picks in one sweep — so the painel
+# shows the whole backlog of dispatchable work, independent of how many builder
+# slots happen to be free right now.
+#
+# The emit re-runs the SAME candidate queries (identical --exclude-label set) and
+# the SAME filter chain (_filter_candidates → _filter_unblocked →
+# _filter_explicit_deps) the real dispatch uses, across HQ + every rig DB. Unlike
+# the dispatcher's rig scan (a FALLBACK only when HQ is empty), the emit unions
+# HQ + rigs UNCONDITIONALLY: the eligible queue spans all stores, so the painel
+# must see all of it. This does NOT change dispatch behaviour in any way — it is a
+# read-only ADDITIVE step that only writes a file.
+#
+# CONTRACT (kept identical on the painel side, daemons/painel_visibilidade.py):
+#   {"generated_at": "<ISO8601 UTC>", "ttl_seconds": <int>, "count": <int>,
+#    "items": [ {"id","title","type","rig","priority","created_at","assignee",
+#                "store"} , … ]}
+# Written EVEN WHEN ZERO ({...,"count":0,"items":[]}) so the painel can tell
+# "empty queue" (system correctly out of work) from "file stale/missing" (don't
+# trust it). Written ATOMICALLY (tmp + mv) so a reader never sees a partial file.
+#
+# Env-gated PILOT_EMIT_DISPATCHABLE (default 1). FAIL-OPEN by construction: the
+# whole body is wrapped so ANY error logs a warning and returns 0 — a failed emit
+# must NEVER abort or alter a dispatch sweep. PILOT_DISPATCHABLE_FILE overrides the
+# output path (TEST-ONLY seam, mirrors PILOT_CITY_OVERRIDE); production resolves to
+# ~/.gc/pilot-dispatchable.json (HOME is set in the launchd plist).
+PILOT_EMIT_DISPATCHABLE="${PILOT_EMIT_DISPATCHABLE:-1}"
+PILOT_DISPATCHABLE_TTL="${PILOT_DISPATCHABLE_TTL:-600}"
+PILOT_DISPATCHABLE_FILE="${PILOT_DISPATCHABLE_FILE:-${HOME}/.gc/pilot-dispatchable.json}"
+
+# _emit_query_one <db_dir> <store_label> — print the fully-filtered eligible
+# candidate array for ONE store, with a "store" field stamped on each item.
+# Mirrors the Tier-1 (bug + tech-debt), Tier-2 (story:approved) and optional
+# ctx:ready queries + the shared filter chain. Pure read; fail-open to "[]".
+_emit_query_one() {
+  local _db="$1" _store="$2"
+  local _bugs _debt _feat _ctx _merged
+  _bugs=$(bd -C "$_db" list --json -t bug \
+    --exclude-label "story:in-flight" --exclude-label "story:done" \
+    --exclude-label "gate:passed" --exclude-label "pilot:dispatching" \
+    --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" \
+    --exclude-label "pilot:dispatched" --exclude-type epic -n 0 2>/dev/null || echo "[]")
+  _debt=$(bd -C "$_db" list --json -l "tech-debt" \
+    --exclude-label "story:in-flight" --exclude-label "story:done" \
+    --exclude-label "gate:passed" --exclude-label "pilot:dispatching" \
+    --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" \
+    --exclude-label "pilot:dispatched" --exclude-type epic -n 0 2>/dev/null || echo "[]")
+  _feat=$(bd -C "$_db" list --json -l "story:approved" \
+    --exclude-label "story:in-flight" --exclude-label "story:done" \
+    --exclude-label "gate:passed" --exclude-label "pilot:dispatching" \
+    --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" \
+    --exclude-label "pilot:dispatched" --exclude-type epic -n 0 2>/dev/null || echo "[]")
+  _ctx="[]"
+  if [ "$PILOT_CTX_READY_QUERIES" = "1" ]; then
+    _ctx=$(bd -C "$_db" list --json -l "ctx:ready" \
+      --exclude-label "ctx:thin" --exclude-label "story:approved" \
+      --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress" \
+      --exclude-label "story:triage" --exclude-label "story:in-flight" \
+      --exclude-label "story:done" --exclude-label "story:cancelled" \
+      --exclude-label "gate:passed" --exclude-label "pilot:dispatching" \
+      --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" \
+      --exclude-label "pilot:dispatched" --exclude-type epic -n 0 2>/dev/null || echo "[]")
+    _ctx=$(echo "$_ctx" | jq '
+        [ .[] | select(
+            ((.issue_type // .type // "") | ascii_downcase) as $t
+            | ($t == "chore" or $t == "task" or $t == "debt" or $t == "tech-debt")
+              or (((.labels // []) | index("tech-debt")) != null)
+          ) ]' 2>/dev/null || echo "[]")
+  fi
+  _merged=$(echo "$_bugs $_debt $_feat $_ctx" \
+    | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
+  # IDENTICAL filter chain to the real dispatch path.
+  _merged=$(echo "$_merged" | _filter_candidates)
+  _merged=$(echo "$_merged" | _filter_unblocked "$_db")
+  _merged=$(echo "$_merged" | _filter_explicit_deps "$_db")
+  # Stamp the originating store on every item (so the painel knows where it lives).
+  echo "$_merged" | jq --arg store "$_store" '[ .[] | . + {"_emit_store": $store} ]' 2>/dev/null || echo "[]"
+}
+
+# _pilot_emit_dispatchable — compute the full cross-store eligible queue and write
+# PILOT_DISPATCHABLE_FILE atomically. Idempotent per sweep (guarded by
+# PILOT_EMITTED_DONE). FAIL-OPEN: the entire body runs in a subshell-guarded
+# wrapper; any failure logs and returns 0 without touching dispatch state.
+PILOT_EMITTED_DONE=0
+_pilot_emit_dispatchable() {
+  [ "$PILOT_EMIT_DISPATCHABLE" = "1" ] || return 0
+  [ "$PILOT_EMITTED_DONE" = "1" ] && return 0
+  PILOT_EMITTED_DONE=1
+  # Everything below is best-effort; a failure must never break the sweep.
+  {
+    local _all _rig_paths _rp _items _count _now _tmp _dir
+    _all=$(_emit_query_one "$GC_CITY" "hq" 2>/dev/null || echo "[]")
+    # Union every non-HQ rig store too (the eligible queue spans all stores).
+    _rig_paths=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
+      | jq -r '.rigs[] | select(.hq == false) | "\(.path)\t\(.name)"' 2>/dev/null || echo "")
+    while IFS=$'\t' read -r _rp _rname; do
+      [ -z "$_rp" ] || [ ! -d "$_rp" ] && continue
+      [ "$_rp" = "$GC_CITY" ] && continue
+      local _r
+      _r=$(_emit_query_one "$_rp" "${_rname:-rig}" 2>/dev/null || echo "[]")
+      _all=$(echo "$_all $_r" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "$_all")
+    done <<< "$_rig_paths"
+
+    # Project to the painel contract shape + stable order (priority, created_at, id).
+    _items=$(echo "$_all" | jq '
+        sort_by([ (.priority // 99), (.created_at // ""), (.id // "") ])
+        | [ .[] | {
+            id:         .id,
+            title:      (.title // .description // "(sem título)"),
+            type:       ((.issue_type // .type // "task")),
+            rig:        ((.metadata["story.rig"] // "") | tostring),
+            priority:   (.priority // 99),
+            created_at: (.created_at // ""),
+            assignee:   ((.assignee // "") | tostring),
+            store:      (._emit_store // "hq")
+          } ]' 2>/dev/null || echo "[]")
+    [ -z "$_items" ] && _items="[]"
+    _count=$(echo "$_items" | jq 'length' 2>/dev/null || echo "0")
+    _now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    _dir=$(dirname "$PILOT_DISPATCHABLE_FILE")
+    mkdir -p "$_dir" 2>/dev/null || true
+    _tmp="${PILOT_DISPATCHABLE_FILE}.tmp.$$"
+    if jq -n --arg gen "$_now" --argjson ttl "$PILOT_DISPATCHABLE_TTL" \
+         --argjson count "$_count" --argjson items "$_items" \
+         '{generated_at:$gen, ttl_seconds:$ttl, count:$count, items:$items}' \
+         > "$_tmp" 2>/dev/null; then
+      mv -f "$_tmp" "$PILOT_DISPATCHABLE_FILE" 2>/dev/null || rm -f "$_tmp" 2>/dev/null
+      log "Emitted dispatchable queue → $PILOT_DISPATCHABLE_FILE (count=$_count, ttl=${PILOT_DISPATCHABLE_TTL}s, wa-u5r1)."
+    else
+      rm -f "$_tmp" 2>/dev/null || true
+      warn "Could not write dispatchable-queue emit (jq failed) — leaving previous file untouched (wa-u5r1, fail-open)."
+    fi
+  } 2>/dev/null || warn "Dispatchable-queue emit errored — ignored (wa-u5r1, fail-open)."
+  return 0
+}
+
 _dolt_probe
 if _dolt_saturated; then
   PILOT_DOLT_SATURATED_AT_START=1
@@ -756,6 +1135,15 @@ else
   PILOT_DOLT_SATURATED_AT_START=0
   log "Dolt health OK (latency=${DOLT_LATENCY_MS:-?}ms cpu=$(_dolt_cpu)%) — dispatch-to-capacity armed."
 fi
+
+# ── wa-u5r1: emit the FULL dispatchable queue for the painel (ALWAYS, fail-open) ─
+# Computed here — AFTER the lock + Dolt probe, BEFORE every early-exit gate (quota
+# pause, cross-stage defer, both-lanes-full) — so the painel's "Aprovadas" mirror
+# is refreshed on EVERY sweep, even the sweeps that dispatch nothing. The eligible
+# QUEUE exists independently of whether builder slots are free or the sweep is
+# paused; the painel must reflect it regardless. This is purely additive + fully
+# fail-open: it can never abort or alter the dispatch decisions that follow.
+_pilot_emit_dispatchable
 
 # ── ga-x3nmz: Claude 5h-quota back-off — PAUSE dispatch when the window is dry ─
 # Probe once per sweep, AFTER the Dolt gate (cheap when quota is fine: one bounded
@@ -1446,142 +1834,6 @@ fi
 # untouched; and (b) a feature with NO lifecycle label at all is not dropped here
 # (it simply fails the Tier 2 `-l story:approved` source-query and so is never
 # dispatched as a feature). Approved stories are never blocked.
-_FILTER_PREAPPROVAL_LABELS='["story:unrefined","story:refinement-in-progress","story:triage","story:cancelled"]'
-_filter_candidates() {
-  jq --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
-    '[.[] | select(
-        .id != $self
-        and (.assignee == null or .assignee == "")
-        and ((.issue_type // .type // "") != "epic")
-        and (((.labels // []) | index("story:epic-split")) | not)
-        and (((.labels // []) - $preapproval) | length) == ((.labels // []) | length)
-     )]' \
-    2>/dev/null || echo "[]"
-}
-
-# _filter_unblocked <db_dir>   (reads candidate JSON array from stdin)
-# Drops candidates that are currently BLOCKED by unresolved (open) dependencies
-# in <db_dir>, using bd's blocker-aware `bd blocked` set. This is the fix for
-# bug ga-5ew: the Pilot must NOT dispatch a story whose hard dependency is not
-# yet merged/closed (it did — dispatched ga-30v while dep ga-d81 was unmerged).
-# A bead is "blocked" iff it has a dependency that is not yet closed; a dep that
-# is already closed does NOT block (so we cannot simply filter on dependency_count).
-#
-# FAIL-OPEN: if `bd blocked` errors, returns nothing, or the jq filter fails,
-# candidates pass through UNCHANGED — never worse than the pre-fix behavior.
-# Diagnostics go to stderr (which the top-level `exec ... 2>&1` routes to the
-# log) so stdout stays pure JSON for the caller's command-substitution capture.
-_filter_unblocked() {
-  local db_dir="$1"
-  local arr blocked_ids blocked_json before after filtered
-  arr=$(cat)
-
-  blocked_ids=$(bd -C "$db_dir" blocked --json 2>/dev/null \
-    | jq -r '(.[]?.id) // empty' 2>/dev/null || echo "")
-  # Nothing blocked in this DB (or probe failed) → pass through unchanged.
-  if [ -z "$blocked_ids" ]; then
-    printf '%s' "$arr"
-    return 0
-  fi
-
-  blocked_json=$(printf '%s\n' "$blocked_ids" \
-    | jq -R -s 'split("\n") | map(select(length>0))' 2>/dev/null || echo "[]")
-
-  before=$(printf '%s' "$arr" | jq 'length' 2>/dev/null || echo "0")
-  filtered=$(printf '%s' "$arr" | jq --argjson blk "$blocked_json" \
-    '[.[] | select((.id as $i | $blk | index($i)) | not)]' 2>/dev/null) \
-    || { printf '%s' "$arr"; return 0; }
-  [ -z "$filtered" ] && { printf '%s' "$arr"; return 0; }
-  after=$(printf '%s' "$filtered" | jq 'length' 2>/dev/null || echo "0")
-
-  if [ "$before" != "$after" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: excluded $((before - after)) blocked candidate(s) in $db_dir (unresolved deps — ga-5ew fix)" >&2
-  fi
-  printf '%s' "$filtered"
-}
-
-# _filter_explicit_deps <db_dir>   (reads candidate JSON array from stdin)
-# Drops candidates that declare an EXPLICIT, still-open dependency via the
-# `story.depends_on_beads` metadata field — a space/comma/newline-separated list
-# of bead IDs that this bead must be built ON TOP OF.
-#
-# This is the fix for bug ga-do8jj: the Pilot dispatched ga-2e605 BEFORE its
-# real dependency ga-e72kf (the canonical painel base) had landed. The
-# dependency was real, but it lived only in PROSE ("Construir SOBRE a base
-# canônica ga-e72kf …" in story.dependencias) and was never encoded as a formal
-# `bd` blocks-edge — so `bd blocked` (and thus _filter_unblocked above) could
-# not see it, and the dependent story slipped through. This filter is the
-# structured, zero-false-positive realization of the bug's fix-option (b),
-# "convenção de dep explícita": a dedicated field the dispatcher enforces.
-#
-# CONTRACT — deliberately narrow to avoid false-positive deadlocks:
-#   * ONLY bead IDs in the dedicated `story.depends_on_beads` field are honored.
-#     We do NOT parse the free-form `story.dependencias` prose, which mixes hard
-#     deps with coordination/negative references ("coordenar com ga-gzf5a",
-#     "NÃO da wa-rlzo") that must NOT block dispatch.
-#   * A referenced dep is SATISFIED iff it is closed. Any non-closed dep holds
-#     the candidate back for THIS sweep only — AUTO-CLEARING: once the dep
-#     closes, the next sweep dispatches. No manual un-hold, no stale state.
-#   * Self-references are ignored (a bead never blocks itself).
-#
-# FAIL-OPEN: any bd error / unresolvable dep status passes the candidate through
-# UNCHANGED — never stricter than the pre-fix behavior, so a transient Dolt
-# hiccup or a typo'd dep id can never wedge the pipeline. Diagnostics → stderr
-# (routed to the log by the top-level `exec … 2>&1`) so stdout stays pure JSON.
-_filter_explicit_deps() {
-  local db_dir="$1"
-  local arr
-  arr=$(cat)
-  [ -z "$arr" ] && { printf '[]'; return 0; }
-
-  # Fast path: no candidate declares explicit deps → pass through untouched
-  # (zero extra bd calls on the common case — Scenarios 1/2 and normal sweeps).
-  if ! printf '%s' "$arr" \
-      | jq -e 'any(.[]?; (.metadata["story.depends_on_beads"] // "") != "")' \
-        >/dev/null 2>&1; then
-    printf '%s' "$arr"
-    return 0
-  fi
-
-  local held_ids="" bead bid deps dep dep_status
-  while IFS= read -r bead; do
-    [ -z "$bead" ] && continue
-    bid=$(printf '%s' "$bead" | jq -r '.id // ""' 2>/dev/null || echo "")
-    [ -z "$bid" ] && continue
-    deps=$(printf '%s' "$bead" \
-      | jq -r '.metadata["story.depends_on_beads"] // ""' 2>/dev/null || echo "")
-    deps=$(printf '%s' "$deps" | tr ',\n' '  ')
-    for dep in $deps; do
-      dep=$(printf '%s' "$dep" | tr -d '[:space:]')
-      [ -z "$dep" ] && continue
-      [ "$dep" = "$bid" ] && continue
-      dep_status=$(bd -C "$db_dir" show "$dep" --json 2>/dev/null \
-        | jq -r 'if type=="array" then .[0] else . end | .status // ""' \
-          2>/dev/null || echo "")
-      # Non-closed, resolvable dep → HOLD. Empty status (lookup failed) →
-      # fail-open: do not hold on a dep we cannot resolve.
-      if [ -n "$dep_status" ] && [ "$dep_status" != "closed" ]; then
-        held_ids="$held_ids $bid"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: holding $bid — explicit dep $dep is '$dep_status' (not closed) [story.depends_on_beads — ga-do8jj fix]" >&2
-        break
-      fi
-    done
-  done < <(printf '%s' "$arr" | jq -c '.[]?' 2>/dev/null)
-
-  if [ -z "$held_ids" ]; then
-    printf '%s' "$arr"
-    return 0
-  fi
-
-  local held_json filtered
-  held_json=$(printf '%s\n' $held_ids \
-    | jq -R -s 'split("\n") | map(select(length>0))' 2>/dev/null || echo "[]")
-  filtered=$(printf '%s' "$arr" | jq --argjson held "$held_json" \
-    '[.[] | select((.id as $i | $held | index($i)) | not)]' 2>/dev/null) \
-    || { printf '%s' "$arr"; return 0; }
-  [ -z "$filtered" ] && { printf '%s' "$arr"; return 0; }
-  printf '%s' "$filtered"
-}
 
 BUGS_JSON=$(bd -C "$GC_CITY" list --json \
   -t bug \
@@ -1661,12 +1913,70 @@ TIER2_JSON=$(echo "$TIER2_JSON" | _filter_explicit_deps "$GC_CITY")
 TIER2_COUNT=$(echo "$TIER2_JSON" | jq 'length' 2>/dev/null || echo "0")
 log "Story:approved features: $TIER2_COUNT candidate(s) in HQ DB"
 
-# Merge both pools into ONE candidate stream (wa-tm2a). dedup by id keeps a bead
-# that somehow matched both queries from being double-counted. The merge is the
-# UNION — eligibility prefilters were applied identically to each pool above, so
+# ── Step 2a-ctx: ctx:ready chore/task/debt beads — OFF by default ─────────────
+# Final auto-dispatch phase (PILOT_CTX_READY_QUERIES). A context-check daemon now
+# labels bug/chore/task/debt beads ctx:ready (context-complete) or ctx:thin
+# (under-specified). The Pilot's existing queries cover type:bug + tech-debt +
+# story:approved features but NEVER chore/task — the design's known gap. This query
+# closes it: chore/task/debt beads that carry `-l ctx:ready` (and NO story:* label,
+# so this is strictly the non-funnel work) become candidates, merged into the SAME
+# pool below and run through the IDENTICAL filter chain. ctx:thin is excluded
+# explicitly (defense-in-depth) so an under-spec'd bead never dispatches even if it
+# somehow also wore ctx:ready. tech-debt overlap with Tier-1 is harmless: the union
+# dedups by id, so a ctx:ready tech-debt bead already in Tier-1 is not double-listed.
+#
+# GATED OFF (PILOT_CTX_READY_QUERIES default 0) → the query is SKIPPED entirely →
+# CTXREADY_JSON stays "[]" → the union below is byte-equivalent to today. Flip the
+# env to 1 (Mayor, once ctx: labels are trusted) to activate. The same lifecycle/
+# in-flight/engine-window/epic exclusions as every other query are applied so a
+# ctx:ready bead that is already in-flight, dispatched, or human-gated is skipped.
+CTXREADY_JSON="[]"
+CTXREADY_COUNT="0"
+if [ "$PILOT_CTX_READY_QUERIES" = "1" ]; then
+  CTXREADY_RAW=$(bd -C "$GC_CITY" list --json \
+    -l "ctx:ready" \
+    --exclude-label "ctx:thin" \
+    --exclude-label "story:approved" \
+    --exclude-label "story:unrefined" \
+    --exclude-label "story:refinement-in-progress" \
+    --exclude-label "story:triage" \
+    --exclude-label "story:in-flight" \
+    --exclude-label "story:done" \
+    --exclude-label "story:cancelled" \
+    --exclude-label "gate:passed" \
+    --exclude-label "pilot:dispatching" \
+    --exclude-label "gate:needs-human" \
+    --exclude-label "needs:engine-window" \
+    --exclude-label "pilot:dispatched" \
+    --exclude-type epic \
+    -n 0 \
+    2>/dev/null || echo "[]")
+  # Restrict to the chore/task/debt types this phase covers (a ctx:ready bug is
+  # already a Tier-1 candidate; a ctx:ready feature without story:approved is NOT
+  # dispatchable — only the funnel approves features). tech-debt is kept (label or
+  # type) so context-ready debt the funnel skips can dispatch.
+  CTXREADY_JSON=$(echo "$CTXREADY_RAW" | jq '
+      [ .[] | select(
+          ((.issue_type // .type // "") | ascii_downcase) as $t
+          | ($t == "chore" or $t == "task" or $t == "debt" or $t == "tech-debt")
+            or (((.labels // []) | index("tech-debt")) != null)
+        ) ]' 2>/dev/null || echo "[]")
+  # SAME filter chain as Tier-1/Tier-2 (empty-veto, lifecycle blocklist, epic guard,
+  # self-exclusion, unresolved deps, explicit deps).
+  CTXREADY_JSON=$(echo "$CTXREADY_JSON" | _filter_candidates)
+  CTXREADY_JSON=$(echo "$CTXREADY_JSON" | _filter_unblocked "$GC_CITY")
+  CTXREADY_JSON=$(echo "$CTXREADY_JSON" | _filter_explicit_deps "$GC_CITY")
+  CTXREADY_COUNT=$(echo "$CTXREADY_JSON" | jq 'length' 2>/dev/null || echo "0")
+  log "ctx:ready chore/task/debt: $CTXREADY_COUNT candidate(s) in HQ DB (PILOT_CTX_READY_QUERIES=1)."
+fi
+
+# Merge all pools into ONE candidate stream (wa-tm2a). dedup by id keeps a bead
+# that somehow matched more than one query from being double-counted. The merge is
+# the UNION — eligibility prefilters were applied identically to each pool above, so
 # concatenation preserves them; only the ordering (Step 3, _top_candidate) now
-# decides who goes first.
-ALL_CANDIDATES_JSON=$(echo "$TIER1_JSON $TIER2_JSON" \
+# decides who goes first. CTXREADY_JSON is "[]" unless PILOT_CTX_READY_QUERIES=1, so
+# at the default this is byte-equivalent to the prior 2-pool union.
+ALL_CANDIDATES_JSON=$(echo "$TIER1_JSON $TIER2_JSON $CTXREADY_JSON" \
   | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
 HQ_MERGED_COUNT=$(echo "$ALL_CANDIDATES_JSON" | jq 'length' 2>/dev/null || echo "0")
 if [ "$HQ_MERGED_COUNT" -gt "0" ]; then
@@ -1677,7 +1987,11 @@ if [ "$HQ_MERGED_COUNT" -gt "0" ]; then
   else
     ALL_CANDIDATES_TIER="feature"
   fi
-  log "Merged candidate pool: $HQ_MERGED_COUNT (bugs/debt + stories, priority-ordered)."
+  if [ "$CTXREADY_COUNT" -gt "0" ] 2>/dev/null; then
+    log "Merged candidate pool: $HQ_MERGED_COUNT (bugs/debt + stories + ${CTXREADY_COUNT} ctx:ready chore/task, priority-ordered)."
+  else
+    log "Merged candidate pool: $HQ_MERGED_COUNT (bugs/debt + stories, priority-ordered)."
+  fi
 fi
 
 # ── Step 2c: Fallback — scan rig DBs if HQ returned nothing ──────────────────
@@ -2055,6 +2369,41 @@ FIXSEC
     fi
   fi
 
+  # ── ga-cnvy1: live-wrapper dedup — never mint a 2nd sling for the same target ──
+  # ROOT (convoy storm): the Pilot stamps pilot.sling_bead=<id> on a STORY when it
+  # first slings a builder task for it (see the dispatch transition below). If that
+  # sling/convoy wrapper is STILL OPEN, the work is already dispatched — yet a later
+  # sweep that re-acquired the claim (story:in-flight stripped by a crash/race, or a
+  # bead that re-entered a candidate query) would `gc sling` a SECOND wrapper for the
+  # SAME target. Repeated every 5-min sweep, one bug (e.g. wa-uhpy) accumulates ~15
+  # redundant open convoy wrappers. This guard reads the story's CURRENT
+  # pilot.sling_bead and, if that wrapper bead is still open, SKIPS — the existing
+  # wrapper already carries the dispatch. Same family as the ga-9yb5s/ga-htjni
+  # double-dispatch guards: detect "already dispatched" at the pre-sling chokepoint
+  # and refuse the duplicate. FAIL-OPEN by construction: a missing/unreadable
+  # pilot.sling_bead, a closed wrapper, or any bd/jq error → fall through and
+  # dispatch exactly as today (a transient glitch never blocks a real dispatch).
+  if [ "${PILOT_DEDUP_GUARD:-1}" = "1" ]; then
+    local _EXISTING_SLING _EXISTING_SLING_STATUS
+    _EXISTING_SLING=$(bd -C "$STORY_BEAD_CITY" show "$STORY_ID" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | (.metadata["pilot.sling_bead"] // "")' \
+      2>/dev/null || echo "")
+    if [ -n "$_EXISTING_SLING" ] && [ "$_EXISTING_SLING" != "null" ]; then
+      # The sling/wrapper task bead always lives in GC_CITY (created by gc sling in HQ).
+      _EXISTING_SLING_STATUS=$(bd -C "$GC_CITY" show "$_EXISTING_SLING" --json 2>/dev/null \
+        | jq -r 'if type=="array" then .[0] else . end | (.status // "")' \
+        2>/dev/null || echo "")
+      if [ "$_EXISTING_SLING_STATUS" = "open" ] || [ "$_EXISTING_SLING_STATUS" = "in_progress" ]; then
+        warn "ga-cnvy1: SKIPPING dispatch of $STORY_ID — a live wrapper ($_EXISTING_SLING, status=$_EXISTING_SLING_STATUS) already exists for this target; work is already dispatched. Releasing claim, NOT minting a 2nd sling (set PILOT_DEDUP_GUARD=0 to disable)."
+        if [ "$DRY_RUN" != "1" ]; then
+          bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+          bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+        fi
+        return 1
+      fi
+    fi
+  fi
+
   # ── Determine builder target ─────────────────────────────────────────────────
   # STORY_RIG and STORY_BEAD_CITY already resolved above (gt-pm55p early rig fix).
   local BUILDER_TARGET _POOL _POOL_N
@@ -2120,6 +2469,115 @@ FIXSEC
         return 1
       fi
     fi
+  fi
+
+
+  # ── ga-lfvs6/ga-wgcyk/ga-m3n1x: DOMAIN builds must NOT go to the dog pool ─────
+  # ROOT (5+ recurrences today): a property_scrapers scraper / data-build (or a WA
+  # painel/pipedrive feature) authored as an HQ ga- bead with story.rig unset and
+  # assignee null is rig-inferred → gascity → rig_to_builders → gastown.dog. A dog
+  # (~25-min TTL, no domain data access, no rig git checkout, no git-diff for the
+  # gate) cannot build a real domain task, so it circuit-breaks and the sweep
+  # re-dispatches it — a loop. The lane:big nodog guard (ga-jazy9, below) only catches
+  # lane:big and only DEFERS; these misroutes are mostly lane:small DOMAIN builds and
+  # need affirmative re-routing to the owning crew. This guard GENERALISES the nodog
+  # protection to ANY lane via content-based domain inference, and runs BEFORE the
+  # lane:big guard so a lane:big DOMAIN build is re-routed to its crew here rather
+  # than blindly deferred there. After this guard, any residual dog-targeted lane:big
+  # work is generic (no domain) and the lane:big guard correctly defers it. Acts only
+  # when the resolved target is STILL a dog.
+  #
+  # Rules, in order, when BUILDER_TARGET is a dog:
+  #   0. Skip if the bead is NOT a domain build (bead_content_rig == "") → generic/
+  #      HQ work keeps flowing to the dog pool exactly as today (FAIL-OPEN).
+  #   1. Honor an explicit LIVE persistent-crew owner (assignee on the bead) — route
+  #      there, never a dog (ga-9yb5s/ga-htjni ownership family). The ownership guard
+  #      earlier already DEFERS most such cases; this is the affirmative fallback.
+  #   2. Else route to the inferred domain's PERSISTENT crew (rig_domain_default_builder)
+  #      — but ONLY if that crew is not busy/used this sweep (so we never spawn a 2nd
+  #      session on a single-identity crew). If busy/used → DEFER.
+  #   3. Else (no persistent crew for the domain, or it's busy) → DEFER (leave queued)
+  #      rather than burn the build on a dog that will circuit-break it.
+  # FAIL-OPEN: a non-dog target, an unresolvable domain, or any error → no change.
+  # Disable with PILOT_DOMAIN_ROUTE_GUARD=0.
+  if [ "${PILOT_DOMAIN_ROUTE_GUARD:-1}" = "1" ]; then
+    case "$BUILDER_TARGET" in
+      gastown.dog|gastown.dog-*)
+        local _DOMAIN_RIG=""
+        _DOMAIN_RIG=$(bead_content_rig "$STORY" 2>/dev/null || echo "")
+        if [ -n "$_DOMAIN_RIG" ] && [ "$_DOMAIN_RIG" != "gascity" ]; then
+          # (1) explicit live crew owner wins.
+          local _DOM_CREW_OWNER=""
+          _DOM_CREW_OWNER=$(_beadid_live_crew_owner "$STORY_ID" "$STORY_BEAD_CITY" 2>/dev/null || echo "")
+          if [ -n "$_DOM_CREW_OWNER" ]; then
+            log "ga-lfvs6: $STORY_ID is a $_DOMAIN_RIG domain build with a live persistent-crew owner ($_DOM_CREW_OWNER) — honoring it over the dog pool (was target=$BUILDER_TARGET)."
+            BUILDER_TARGET="$_DOM_CREW_OWNER"
+            STORY_RIG="$_DOMAIN_RIG"
+          else
+            # (2) route to the domain's persistent crew if mapped AND idle.
+            local _DOM_DEFAULT=""
+            _DOM_DEFAULT=$(rig_domain_default_builder "$_DOMAIN_RIG" 2>/dev/null || echo "")
+            local _DOM_BUSY=0
+            if [ -n "$_DOM_DEFAULT" ]; then
+              case " $PILOT_BUSY_BUILDERS " in *" $_DOM_DEFAULT "*) _DOM_BUSY=1 ;; esac
+              case " $PILOT_USED_BUILDERS " in *" $_DOM_DEFAULT "*) _DOM_BUSY=1 ;; esac
+            fi
+            if [ -n "$_DOM_DEFAULT" ] && [ "$_DOM_BUSY" = "0" ]; then
+              log "ga-lfvs6: $STORY_ID is a $_DOMAIN_RIG domain build mis-routed to the dog pool (was target=$BUILDER_TARGET, story.rig=$STORY_RIG) — routing to the owning persistent crew $_DOM_DEFAULT instead."
+              BUILDER_TARGET="$_DOM_DEFAULT"
+              STORY_RIG="$_DOMAIN_RIG"
+              mark_pool_builder "$_DOM_DEFAULT"
+            else
+              # (3) no idle persistent crew for the domain → DEFER, never a dog.
+              warn "ga-lfvs6: REFUSING to dispatch $_DOMAIN_RIG domain build $STORY_ID to the ephemeral dog pool ($BUILDER_TARGET) — a dog cannot build a real domain task (no domain data, no rig checkout, no git-diff for the gate). Owning crew ${_DOM_DEFAULT:-none} is ${_DOM_DEFAULT:+busy/unavailable}${_DOM_DEFAULT:-unmapped}. Deferring (leaving queued) until a persistent crew is available; releasing claim (set PILOT_DOMAIN_ROUTE_GUARD=0 to disable)."
+              if [ "$DRY_RUN" != "1" ]; then
+                bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+                bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+              fi
+              return 1
+            fi
+          fi
+        fi
+        ;;
+    esac
+  fi
+
+  # ── ga-jazy9: lane:big must NOT go to the ephemeral dog pool ──────────────────
+  # ROOT: a lane:big daemon/subsystem story (ga-jazy9) was repeatedly dispatched to
+  # the gastown.dog adhoc pool. Dogs have a ~25-min TTL — they cannot build a
+  # lane:big subsystem — so each dog circuit-broke it, and the cycle re-dispatched
+  # it (3+ times), ignoring the Mayor's explicit assignee=batista-ps routing. The
+  # dog pool is for lane:small / ephemeral work ONLY; lane:big needs a PERSISTENT
+  # crew. This guard runs AFTER builder routing (so the dog target is visible) and
+  # BEFORE any sling. Rules, in order:
+  #   1. If the story has an explicit, LIVE persistent-crew owner (assignee), honor
+  #      it — route there, never reroute a crew-owned big story to a dog
+  #      (ga-9yb5s/ga-htjni ownership family). (The ownership guard above already
+  #      DEFERS most such cases; this is the affirmative routing fallback.)
+  #   2. Else, if BUILDER_TARGET is the dog pool, DEFER (leave queued) — a lane:big
+  #      item must wait for a persistent crew rather than burn on a 25-min dog.
+  # FAIL-OPEN: a non-big lane, a non-dog target, or any error → no change (dispatch
+  # exactly as today). Disable with PILOT_BIG_NODOG_GUARD=0.
+  if [ "${PILOT_BIG_NODOG_GUARD:-1}" = "1" ] && [ "$LANE" = "big" ]; then
+    case "$BUILDER_TARGET" in
+      gastown.dog|gastown.dog-*)
+        # (1) honor an explicit live crew owner before deferring.
+        local _BIG_CREW_OWNER=""
+        _BIG_CREW_OWNER=$(_beadid_live_crew_owner "$STORY_ID" "$STORY_BEAD_CITY" 2>/dev/null || echo "")
+        if [ -n "$_BIG_CREW_OWNER" ]; then
+          log "ga-jazy9: $STORY_ID is lane:big with a live persistent-crew owner ($_BIG_CREW_OWNER) — honoring it over the dog pool (was target=$BUILDER_TARGET)."
+          BUILDER_TARGET="$_BIG_CREW_OWNER"
+        else
+          # (2) no live crew owner → DEFER; a dog cannot build a lane:big subsystem.
+          warn "ga-jazy9: REFUSING to dispatch lane:big $STORY_ID to the ephemeral dog pool ($BUILDER_TARGET) — dogs (~25-min TTL) cannot build a big subsystem. Deferring (leaving queued) until a persistent crew is available; releasing claim (set PILOT_BIG_NODOG_GUARD=0 to disable)."
+          if [ "$DRY_RUN" != "1" ]; then
+            bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+            bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+          fi
+          return 1
+        fi
+        ;;
+    esac
   fi
 
   # ── wa-root-worktree-isolation: rig-root → worktree directive (best-effort) ───
