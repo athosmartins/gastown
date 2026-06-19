@@ -46,14 +46,17 @@
 
 set -uo pipefail
 
-CITY="/Users/athos/gt/.gascity-gastown-hq"
+CITY="${CITY:-/Users/athos/gt/.gascity-gastown-hq}"
 WA="/Users/athos/gt/whatsapp_automation"
 LOG_DIR="$CITY/.gc/logs"
 LOG="$LOG_DIR/config-drift-watcher.log"
 GC="${GC:-gc}"
 
-mkdir -p "$LOG_DIR"
-exec >> "$LOG" 2>&1
+# Skip log redirect in lib mode so the selftest can capture its own output.
+if [ "${CONFIG_DRIFT_WATCHER_LIB:-0}" != "1" ]; then
+    mkdir -p "$LOG_DIR"
+    exec >> "$LOG" 2>&1
+fi
 
 log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [drift-watcher] $*"; }
 err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [drift-watcher] ERROR: $*"; }
@@ -160,16 +163,79 @@ do_soft_reload_async() {
     fi
 }
 
+# ── Hooks lock-guard (ga-tctky) ───────────────────────────────────────────────
+# Asserts $CITY/.beads/hooks is empty AND uchg-locked. bd 1.0.5 auto-installs
+# legacy hooks that gc's native store rejects (ga-rfq1j outage). The permanent
+# fix keeps the dir empty+locked; a future gc op / gc doctor --fix could silently
+# unlock it. This guard re-asserts the lock on every HOOKS_CHECK_INTERVAL and
+# remediates + notifies on drift so the gate outage cannot silently recur.
+HOOKS_DIR="$CITY/.beads/hooks"
+
+check_hooks_guard() {
+    local needs_fix=0 reason_parts=""
+
+    if [ ! -d "$HOOKS_DIR" ]; then
+        needs_fix=1
+        reason_parts="hooks dir missing"
+    else
+        local count
+        count=$(find "$HOOKS_DIR" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
+        if [ "${count:-0}" -gt 0 ]; then
+            needs_fix=1
+            reason_parts="${reason_parts:+$reason_parts, }non-empty ($count files)"
+        fi
+        local flags
+        flags=$(stat -f '%Sf' "$HOOKS_DIR" 2>/dev/null || echo "-")
+        if [[ "$flags" != *uchg* ]]; then
+            needs_fix=1
+            reason_parts="${reason_parts:+$reason_parts, }uchg missing (flags: $flags)"
+        fi
+    fi
+
+    [ "$needs_fix" -eq 0 ] && return 0
+
+    log "HOOKS-GUARD: drift detected ($reason_parts) — re-asserting empty+locked"
+
+    # Unlock → remove files → re-lock
+    chflags -R nouchg "$HOOKS_DIR" 2>/dev/null || true
+    if [ -d "$HOOKS_DIR" ]; then
+        find "$HOOKS_DIR" -mindepth 1 -delete 2>/dev/null || true
+    else
+        mkdir -p "$HOOKS_DIR" || { err "HOOKS-GUARD: cannot mkdir $HOOKS_DIR"; return 1; }
+    fi
+    chflags uchg "$HOOKS_DIR" || { err "HOOKS-GUARD: chflags uchg failed on $HOOKS_DIR"; return 1; }
+
+    local new_count new_flags
+    new_count=$(find "$HOOKS_DIR" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
+    new_flags=$(stat -f '%Sf' "$HOOKS_DIR" 2>/dev/null || echo "-")
+
+    if [ "${new_count:-1}" -eq 0 ] && [[ "$new_flags" == *uchg* ]]; then
+        log "HOOKS-GUARD: remediated OK (empty+uchg-locked) — was: $reason_parts"
+        notify -t "Gas City: hooks-guard" -p 3 ".beads/hooks drift remediated: $reason_parts" 2>/dev/null || true
+    else
+        err "HOOKS-GUARD: remediation FAILED (count=${new_count:-?} flags=${new_flags:-?}) — native store at risk"
+        notify -t "Gas City: hooks-guard FAIL" -p 5 ".beads/hooks still drifted after fix attempt ($reason_parts)" 2>/dev/null || true
+    fi
+}
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 POLL_INTERVAL=3         # seconds between file-hash checks
 DEBOUNCE_WINDOW=2       # seconds to wait after last file change before reloading
 HEARTBEAT_INTERVAL=20   # seconds between unconditional async soft reloads
+HOOKS_CHECK_INTERVAL=60 # seconds between hooks-lock-guard sweeps (ga-tctky)
 
 # ── Main poll loop ────────────────────────────────────────────────────────────
 prev_hash=""
 last_change_time=0
 pending_reload=false
 last_heartbeat_time=0
+last_hooks_check=0
+
+# Library-source guard — selftest sources with CONFIG_DRIFT_WATCHER_LIB=1 to
+# exercise check_hooks_guard without starting the daemon loop.
+if [ "${CONFIG_DRIFT_WATCHER_LIB:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 # Initialize hash (don't trigger on start)
 prev_hash=$(compute_hash)
@@ -190,6 +256,13 @@ while true; do
     if (( heartbeat_elapsed >= HEARTBEAT_INTERVAL )); then
         do_soft_reload_async "heartbeat at $(date '+%H:%M:%S')"
         last_heartbeat_time=$now
+    fi
+
+    # ── HOOKS LOCK-GUARD: periodic assertion (ga-tctky) ─────────────────────
+    hooks_elapsed=$(( now - last_hooks_check ))
+    if (( hooks_elapsed >= HOOKS_CHECK_INTERVAL )); then
+        check_hooks_guard
+        last_hooks_check=$now
     fi
 
     # ── FILE WATCHER: detect and debounce file changes ──────────────────────
