@@ -144,6 +144,9 @@ echo "── 3. respawn_reviewer_slot (array swap + bead reuse + spawn-fail safe
 
 # In-shell mocks (everything runs in one sourced shell, so functions win).
 MOCK_NEW_SID="ga-resp-NEW"
+# ga-vdurb: the re-convened spawn JSON must carry a session_name (the durable-pull
+# key the verdict bead is re-assigned to). Slot the name through the spawn mock.
+MOCK_NEW_SNAME="gate-reviewer-resp-NEW"
 MOCK_SPAWN_OK=1
 # respawn_reviewer_slot calls `gc` inside $(...) (a subshell), so a shell-var
 # counter would be lost. Count spawns via a temp file that survives subshells.
@@ -153,14 +156,54 @@ gc() {
   case " $* " in
     *" session new "*)
       echo x >> "$GC_NEW_CALL_FILE"
-      if [ "$MOCK_SPAWN_OK" = "1" ]; then echo "{\"session_id\":\"$MOCK_NEW_SID\"}"; else echo "{}"; fi
+      if [ "$MOCK_SPAWN_OK" = "1" ]; then echo "{\"session_id\":\"$MOCK_NEW_SID\",\"session_name\":\"$MOCK_NEW_SNAME\"}"; else echo "{}"; fi
       ;;
     *" session list "*) echo "$MOCK_SESS_JSON" ;;
     *) : ;;  # wake / nudge / submit → no-op success
   esac
   return 0
 }
-bd() { return 0; }
+# ga-vdurb: model the durable-pull assignment store. `bd update --assignee <name>`
+# on a verdict bead records "<bead> <name>" to BD_ASSIGN_FILE; `bd show <bead>
+# --json` reads it back (so assign_verdict_bead_verified's read-back + retry
+# exercises real code, not a stub). A temp FILE (not a declare -A array — the
+# system bash is 3.2, no associative arrays, and respawn runs `bd` inside $(...)
+# subshells anyway). MOCK_BD_LOSE_FIRST_WRITE=1 drops the FIRST update of a bead
+# (the intermittent-lost-write the hardening defends against) so the retry path
+# is tested too. Everything else (comment/label/close/create) is a no-op success.
+BD_ASSIGN_FILE="$(mktemp)"
+BD_WRITES_FILE="$(mktemp)"
+MOCK_BD_LOSE_FIRST_WRITE=0
+bd_assign_reset() { : > "$BD_ASSIGN_FILE"; : > "$BD_WRITES_FILE"; }
+# bd_assignee_of <bead> — last recorded assignee for a bead ("" if none).
+bd_assignee_of() { awk -v b="$1" '$1==b{v=$2} END{print v}' "$BD_ASSIGN_FILE"; }
+bd() {
+  local _is_update=0 _is_show=0 _bead="" _assignee="" _prev="" _t _seen
+  for _t in "$@"; do
+    [ "$_prev" = "update" ] && _bead="$_t"
+    [ "$_prev" = "show" ]   && _bead="$_t"
+    [ "$_prev" = "--assignee" ] && _assignee="$_t"
+    [ "$_t" = "update" ] && _is_update=1
+    [ "$_t" = "show" ]   && _is_show=1
+    _prev="$_t"
+  done
+  if [ "$_is_update" = "1" ] && [ -n "$_bead" ] && [ -n "$_assignee" ]; then
+    _seen=$(grep -c "^${_bead} " "$BD_WRITES_FILE" 2>/dev/null || echo 0)
+    echo "$_bead" >> "$BD_WRITES_FILE"
+    if [ "$MOCK_BD_LOSE_FIRST_WRITE" = "1" ] && [ "$_seen" = "0" ]; then
+      :   # swallow the FIRST write to this bead (assignment lost under load)
+    else
+      echo "$_bead $_assignee" >> "$BD_ASSIGN_FILE"
+    fi
+    return 0
+  fi
+  # `bd show <bead> --json` → emit the recorded assignee for the read-back.
+  if [ "$_is_show" = "1" ] && [ -n "$_bead" ]; then
+    echo "{\"assignee\":\"$(bd_assignee_of "$_bead")\"}"
+    return 0
+  fi
+  return 0
+}
 
 GC_CITY="/tmp/reconvene-test-city"
 BRANCH="fix/ga-test"
@@ -170,10 +213,41 @@ REVIEW_TASKS=( "task-0" "task-1" "task-2" )
 
 # Success path: slot 2 re-convened.
 MOCK_SPAWN_OK=1; : > "$GC_NEW_CALL_FILE"
+bd_assign_reset; MOCK_BD_LOSE_FIRST_WRITE=0
 respawn_reviewer_slot 2
 eq "respawn swaps SESSION_IDS[2] to the fresh session id" "${SESSION_IDS[2]}" "$MOCK_NEW_SID"
 eq "respawn did NOT touch SESSION_IDS[0]"                  "${SESSION_IDS[0]}" "ga-old0"
 eq "respawn spawned exactly one new session"              "$(gc_new_calls)" "1"
+# ── ga-vdurb (PRIMARY): the re-convened slot's verdict bead is RE-ASSIGNED to the
+# NEW session's NAME (not id) — this is the durable-pull channel the dead session
+# used to own. Without this, the fresh reviewer's `gc bd list --assignee=$NAME`
+# poll matches nothing and it stands down unused → 0 verdicts.
+_vb2_assignee="$(bd_assignee_of vb2)"
+eq "respawn re-assigns slot-2 verdict bead to the NEW session NAME" "${_vb2_assignee:-NONE}" "$MOCK_NEW_SNAME"
+[ "$_vb2_assignee" != "$MOCK_NEW_SID" ] && ok "respawn did NOT assign the session id by mistake" || bad "respawn assigned session_id, not session_name (durable-pull query would miss)"
+eq "respawn did NOT touch slot-0/slot-1 verdict beads"    "$(bd_assignee_of vb0)$(bd_assignee_of vb1)" ""
+
+# ── ga-vdurb (SECONDARY/hardening): a LOST first --assignee write is RECOVERED by
+# the verified-assign read-back + single retry, so even an intermittent write loss
+# under load still ends with the durable channel wired (not silently None).
+MOCK_SPAWN_OK=1; : > "$GC_NEW_CALL_FILE"
+SESSION_IDS=( "ga-old0" "ga-old1" "ga-old2" )
+bd_assign_reset; MOCK_BD_LOSE_FIRST_WRITE=1
+respawn_reviewer_slot 2
+eq "respawn recovers a LOST first assignee write via read-back+retry" "$(bd_assignee_of vb2)" "$MOCK_NEW_SNAME"
+MOCK_BD_LOSE_FIRST_WRITE=0
+
+# ── ga-vdurb: spawn JSON without a session_name → durable channel NOT wired, but
+# the respawn still succeeds (non-fatal: nudge + outer timeout remain the backstop).
+MOCK_SPAWN_OK=1; : > "$GC_NEW_CALL_FILE"
+SESSION_IDS=( "ga-old0" "ga-old1" "ga-old2" )
+bd_assign_reset
+_saved_sname="$MOCK_NEW_SNAME"; MOCK_NEW_SNAME=""
+_rc=0; respawn_reviewer_slot 2 || _rc=$?
+MOCK_NEW_SNAME="$_saved_sname"
+eq "respawn with no session_name still returns success (non-fatal)" "$_rc" "0"
+eq "respawn with no session_name leaves verdict bead UNASSIGNED (no bad write)" "$(bd_assignee_of vb2 | sed 's/^$/NONE/')" "NONE"
+eq "respawn with no session_name still swapped the session id" "${SESSION_IDS[2]}" "$MOCK_NEW_SID"
 
 # Failure path: spawn returns {} → SESSION_IDS unchanged, returns non-zero.
 SESSION_IDS=( "ga-old0" "ga-old1" "ga-keep2" )
@@ -503,6 +577,14 @@ grep -q 'RESPAWN_BUDGET\[\$j\]=\$(( ' "$DISPATCHER" && ok "poll loop decrements 
 grep -q 'SLOT_SPAWN_EPOCH\[\$j\]="\$NOW_EPOCH"' "$DISPATCHER" && ok "poll loop resets slot grace clock on respawn" || bad "slot grace clock not reset on respawn"
 grep -q 'session list --json' "$DISPATCHER" && ok "poll loop snapshots session liveness"          || bad "missing session list snapshot"
 grep -q 'REVIEW_TASKS\[\$_idx\]' "$DISPATCHER" && ok "respawn reuses the stored review task"       || bad "respawn does not reuse stored review task"
+# ── ga-vdurb drift-guard: respawn MUST re-point the durable-pull channel at the
+# NEW session NAME, else the re-convened reviewer's --assignee poll misses → 0
+# verdicts. Fail LOUDLY if a refactor drops the re-assignment or the read-back.
+grep -q 'assign_verdict_bead_verified()' "$DISPATCHER" && ok "dispatcher defines assign_verdict_bead_verified (verified durable assign)" || bad "missing assign_verdict_bead_verified def (ga-vdurb)"
+grep -q '_new_sname=$(echo "$_json" | jq -r .\.session_name' "$DISPATCHER" && ok "respawn extracts the NEW session_name from the spawn JSON" || bad "respawn does not extract session_name (durable channel never re-pointed, ga-vdurb)"
+grep -q 'assign_verdict_bead_verified "\${VERDICT_BEAD_IDS\[\$_idx\]}" "\$_new_sname"' "$DISPATCHER" && ok "respawn re-assigns the slot's verdict bead to the NEW session NAME" || bad "respawn does not re-assign verdict bead to new session name (ga-vdurb PRIMARY)"
+grep -q 'assign_verdict_bead_verified "\$VERDICT_BEAD_ID" "\$SESSION_NAME"' "$DISPATCHER" && ok "initial spawn uses the verified-assign helper (hardened, ga-vdurb SECONDARY)" || bad "initial spawn assign not hardened (still |\| true-swallowed, ga-vdurb)"
+grep -q 'show "\$_vb" --json' "$DISPATCHER" && ok "verified-assign reads the assignee back (not a blind write)" || bad "verified-assign does not read back the assignee (ga-vdurb)"
 # the outer 45m timeout backstop must still exist (do NOT remove it):
 grep -q 'Verdict timeout after' "$DISPATCHER" && ok "outer verdict timeout backstop preserved"     || bad "outer verdict timeout REMOVED (ultimate backstop gone!)"
 grep -q 'VERDICT_TIMEOUT_SECS' "$DISPATCHER" && ok "VERDICT_TIMEOUT_SECS cap preserved"            || bad "VERDICT_TIMEOUT_SECS cap removed"
@@ -575,6 +657,22 @@ grep -q 'last_active' "$DISPATCHER" && ok "probe reads last_active from the sess
 # Bounded to the suspicious window AND honoring the disable switch (STALE_SECS=0).
 grep -q '\[ "\$REVIEWER_STALE_SECS" != "0" \] && \[ "\$_dead" = "0" \] && \[ "\$_peek_dead" = "0" \] && \[ "\$_spawn_age" -ge "\$RECONVENE_GRACE_SECS" \]' "$DISPATCHER" && ok "staleness probe bounded to enabled + list-alive + peek-alive + past-grace" || bad "staleness probe not bounded/guarded (ga-q8tmn)"
 grep -q 'Frozen reviewer detected (ga-q8tmn)' "$DISPATCHER" && ok "poll loop logs the frozen-reviewer detection" || bad "missing 'Frozen reviewer detected' log"
+
+# ── 5e. drift-guard: dispatcher pins reviewer sessions for drain-exemption ───────
+# ga-67hae: the reviewer template has min_active_sessions=0, so a supervisor
+# config-drift event (e.g. CopyFiles hash change on scripts/) can DRAIN reviewer
+# sessions mid-review — the reviewer dies, verdict bead stays pending, gate times
+# out.  Fix: call `gc session pin` right after wake, for BOTH the initial spawn
+# AND the re-convene respawn.  Fail LOUDLY if a refactor drops either call.
+echo "── 5e. drift-guard: dispatcher pins reviewer sessions (ga-67hae drain-exempt) ──"
+# Initial spawn path: pin fires after wake inside the spawn loop.
+grep -q 'session pin "\$SESSION_ID"' "$DISPATCHER" && ok "initial spawn pins reviewer (drain-exempt, ga-67hae)" || bad "initial spawn missing 'session pin \$SESSION_ID' (reviewers drainable mid-review, ga-67hae)"
+# Re-convene path: pin fires in respawn_reviewer_slot after wake.
+grep -q 'session pin "\$_new_sid"' "$DISPATCHER" && ok "re-convened respawn pins reviewer (ga-67hae)" || bad "re-convene respawn missing 'session pin \$_new_sid' (re-convened reviewer drainable, ga-67hae)"
+# Both pin calls must be non-fatal (|| true guards), since a pin failure must never
+# abort the gate — it just leaves the session unprotected, with re-convene as backstop.
+grep -q 'session pin "\$SESSION_ID" 2>/dev/null || true' "$DISPATCHER" && ok "initial-spawn pin is non-fatal (|| true)" || bad "initial-spawn pin is not || true-guarded (could abort gate on pin failure)"
+grep -q 'session pin "\$_new_sid" 2>/dev/null || true' "$DISPATCHER" && ok "re-convene pin is non-fatal (|| true)" || bad "re-convene pin is not || true-guarded (could abort gate on pin failure)"
 
 # ── 6. dispatcher still parses + lib-only return is a no-op in normal flow ─────
 echo "── 6. syntax + lib-only safety ──"

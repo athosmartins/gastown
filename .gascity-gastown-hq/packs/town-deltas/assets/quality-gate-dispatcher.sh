@@ -376,6 +376,40 @@ reviewer_last_active_stale() {
   if [ "$age" -ge "$thresh" ]; then echo 1; else echo 0; fi
 }
 
+# ── ga-vdurb: VERIFIED verdict-bead assignment to a reviewer's session NAME ─────
+# The reviewer's durable-pull channel is `gc bd list --assignee=$GC_SESSION_NAME
+# -l type:quality-gate-verdict` — it keys on the session NAME, not the id. A lost
+# `--assignee` write silently kills that channel (the bead's assignee stays None /
+# stale), leaving only the racy nudge — which misses → 0 verdicts → 0 merges.
+# This helper does the assign, reads it back, and RETRIES ONCE on mismatch, then
+# WARNs (visible, not silent) if it still fails. NEVER fatal: a failed assignment
+# must not abort the merge path (the outer verdict-poll + timeout are the backstop)
+# — but it must not vanish silently either. Returns 0 if verified, 1 if not.
+# Args: <verdict_bead_id> <session_name> <context-label-for-logs>
+assign_verdict_bead_verified() {
+  local _vb="$1" _sname="$2" _ctx="${3:-}" _seen _try
+  [ -z "$_vb" ] && return 1
+  [ -z "$_sname" ] && { warn "  Verdict-assign (${_ctx}): empty session name for bead ${_vb} — durable channel NOT wired."; return 1; }
+  for _try in 1 2; do
+    bd -C "$GC_CITY" update "$_vb" --assignee "$_sname" --status in_progress -q 2>/dev/null || true
+    # Read it back. bd show --json may fail transiently; treat unreadable as a
+    # mismatch so we retry once rather than declaring success blindly.
+    # NOTE: `bd show --json` returns a JSON ARRAY ([{...}]), not a bare object, so
+    # a plain `.assignee` filter throws "Cannot index array" → jq exits non-zero →
+    # _seen="" → the write reads back as [None] EVEN WHEN IT PERSISTED (the
+    # false-alarm that masqueraded as a lost --assignee write, ga-vephl). Use the
+    # array-safe `if type=="array" then .[0] else . end` pattern that the rest of
+    # this dispatcher already uses for every other `bd show --json` parse.
+    _seen=$(bd -C "$GC_CITY" show "$_vb" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .assignee // empty' 2>/dev/null || echo "")
+    if [ "$_seen" = "$_sname" ]; then
+      [ "$_try" -gt 1 ] && log "  Verdict-assign (${_ctx}): bead ${_vb} → ${_sname} verified on retry ${_try}."
+      return 0
+    fi
+  done
+  warn "  Verdict-assign (${_ctx}): bead ${_vb} assignee read back as [${_seen:-None}], expected [${_sname}] after retry — durable pull channel may be DEGRADED (verdict-poll + outer timeout remain as backstop)."
+  return 1
+}
+
 # respawn_reviewer_slot <0-based idx> — re-spawn a fresh gate-reviewer session for
 # a dead slot, REUSING the still-pending verdict bead VERDICT_BEAD_IDS[idx] and
 # re-delivering the SAME stored review task REVIEW_TASKS[idx] (it already
@@ -402,11 +436,35 @@ respawn_reviewer_slot() {
     return 1
   fi
   SESSION_IDS[$_idx]="$_new_sid"
+  # ── ga-vdurb (PRIMARY FIX): re-point the DURABLE PULL channel at the NEW
+  # session. The initial-spawn block (~Step 7/8) assigned this slot's verdict bead
+  # VERDICT_BEAD_IDS[_idx] to the FIRST session's NAME; that session is now dead,
+  # so the reviewer's `gc bd list --assignee=$GC_SESSION_NAME` poll on the fresh
+  # session matched NOTHING and it stood down as "unused" → 0 verdicts. Re-assign
+  # the SAME (still-pending) verdict bead to the NEW session's NAME so the durable
+  # channel survives the re-convene; the nudge/submit below stays the fast-path.
+  # We must use the session NAME (what --assignee + the reviewer's poll key on),
+  # NOT the session id — extract it from the same spawn JSON the id came from.
+  _new_sname=$(echo "$_json" | jq -r '.session_name // empty' 2>/dev/null || echo "")
+  if [ -n "$_new_sname" ]; then
+    assign_verdict_bead_verified "${VERDICT_BEAD_IDS[$_idx]}" "$_new_sname" "re-convene slot ${_idx}" || true
+    # Re-embed the stored review task as a comment too (mirrors initial spawn:
+    # the durable pull reads the task from the bead, independent of the nudge).
+    bd -C "$GC_CITY" comment "${VERDICT_BEAD_IDS[$_idx]}" "${REVIEW_TASKS[$_idx]}" 2>/dev/null || true
+    log "  Re-convene: verdict bead ${VERDICT_BEAD_IDS[$_idx]} re-assigned to NEW session name ${_new_sname} (durable pull re-pointed, ga-vdurb)."
+  else
+    warn "  Re-convene: spawn JSON had no session_name for slot ${_idx} — durable channel NOT re-pointed (verdict-poll + outer timeout backstop)."
+  fi
   # ga-mepb0: the re-convened session must re-prove life. Clear its ACK flag so
   # the carried-over ACKED=1 from the since-replaced session cannot mask a fresh
   # boot-wedge. Index-assignment is safe even if the arrays are sparse.
   REVIEWER_ACKED[$_idx]=0
   gc --city "$GC_CITY" session wake "$_new_sid" 2>/dev/null || true
+  # ga-67hae: pin the re-convened session for the same drain-exemption reason as
+  # the initial spawn. A re-convened session is just as vulnerable to config-drift
+  # drain as the first — without a pin it can be killed between its ACK and its
+  # verdict submission, leaving the slot pending again and wasting a respawn budget.
+  gc --city "$GC_CITY" session pin "$_new_sid" 2>/dev/null || true
   # ga-mepb0: snapshot a REAL peek baseline for the NEW session here (post-wake,
   # pre-delivery) — exactly as the initial spawn does. Do NOT leave it empty: an
   # empty baseline differs from the boot banner's non-empty cksum, so the very
@@ -2300,10 +2358,18 @@ for i in $(seq 1 $REQUIRED_REVIEWERS); do
     3) REVIEWER_LENS="DESIGN & MAINTAINABILITY: focus on architectural concerns, code duplication, missing tests, test quality, unclear naming, violation of existing conventions, and tech debt introduced." ;;
   esac
 
-  # Create a verdict bead for this reviewer
+  # Create a verdict bead for this reviewer.
+  # NOTE: deliberately NOT --ephemeral. The reviewer's durable-pull channel
+  # (ga-67hae) is `gc bd list --assignee=$GC_SESSION_NAME -l type:quality-gate-verdict`,
+  # and `bd list` EXCLUDES ephemeral beads by default. The live bd (v1.0.5) has NO
+  # `--include-ephemeral` flag, so an ephemeral verdict bead is invisible to the
+  # reviewer's poll → it finds nothing → self-drains → 0 verdicts → 0 merges
+  # (ga-vephl root cause). A non-ephemeral verdict bead is found by the exact poll
+  # (verified live: ga-moog2). The reviewer closes the bead when done and the wisp
+  # reaper sweeps closed gate beads, so dropping --ephemeral does not leak.
   VERDICT_BEAD_ID=$(bd -C "$GC_CITY" create \
     "reviewer-verdict: $BRANCH (reviewer $i/$REQUIRED_REVIEWERS)" \
-    -t chore --ephemeral \
+    -t chore \
     -l type:quality-gate-verdict \
     -l "gate-run:$GATE_RUN_ID" \
     -l "reviewer-index:$i" \
@@ -2436,6 +2502,15 @@ TASK
 
   # Wake the session so it starts immediately
   gc --city "$GC_CITY" session wake "$SESSION_ID" 2>/dev/null || true
+  # ga-67hae: pin reviewer so config-drift drain can't kill it mid-review.
+  # Reviewer sessions have min_active_sessions=0 and no persistent pin, so a
+  # supervisor config-drift event (CopyFiles hash change) would drain them — the
+  # reviewer dies, its verdict bead stays pending, gate times out. Pinning sets
+  # the durable pin override on the session bead so drain is a no-op for this
+  # session for its lifetime. Non-fatal: if pin fails the reviewer still runs,
+  # just unprotected (the re-convene + outer timeout remain backstops).
+  gc --city "$GC_CITY" session pin "$SESSION_ID" 2>/dev/null || true
+  log "  Reviewer session $SESSION_ID pinned (drain-exempt, ga-67hae)"
 
   # ga-67hae: DURABLE PULL CHANNEL — assign verdict bead to this reviewer's
   # session_name + embed the review task in its comment. The nudge below is a
@@ -2444,9 +2519,16 @@ TASK
   # with || true (set -euo pipefail safe).
   SESSION_NAME=$(echo "$SESSION_JSON" | jq -r '.session_name // empty')
   if [ -n "$SESSION_NAME" ]; then
-    bd -C "$GC_CITY" update "$VERDICT_BEAD_ID" --assignee "$SESSION_NAME" --status in_progress -q 2>/dev/null || true
+    # ga-vdurb (SECONDARY FIX): the assign used to be a bare `|| true`-swallowed
+    # write, so an intermittent lost write under load left the bead assignee=None
+    # even for the FIRST cohort — silently killing the durable pull from the start.
+    # Use the verified-assign helper (assign + read-back + 1 retry + WARN-on-fail);
+    # still NON-fatal, but a lost assignment is now visible in the log, not silent.
+    assign_verdict_bead_verified "$VERDICT_BEAD_ID" "$SESSION_NAME" "initial slot $i" || true
     bd -C "$GC_CITY" comment "$VERDICT_BEAD_ID" "$REVIEW_TASK" 2>/dev/null || true
     log "  Verdict bead $VERDICT_BEAD_ID assigned to $SESSION_NAME + task embedded (durable pull, ga-67hae)"
+  else
+    warn "  Initial slot $i: spawn JSON had no session_name — durable pull channel NOT wired (verdict-poll + outer timeout backstop)."
   fi
 
   # ga-noxbv: snapshot the session's terminal BEFORE the task is delivered. The
@@ -3454,6 +3536,57 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
         notify -t "Gate post-merge vector" -p 3 "$BEAD_ID still re-pickable after PASS+merge:$RESPAWN_HITS" 2>/dev/null || true
       else
         log "Post-merge verify OK (ga-esbg): $BEAD_ID absent from all re-spawn/re-pick selectors."
+      fi
+    fi
+
+    # ── ga-dcclose: REAP THE ORIGINATING COORDINATION WRAPPER AT THE MERGE ──────
+    # BOUNDARY. The Pilot files a type:convoy sling wrapper per dispatch and the
+    # engine deacon files dc-* coordination beads ("Merge failed", "Rebase
+    # required", "T8.x merge-cycle"). Each is wired as a DEPENDENT that TRACKS the
+    # source bead (dependency_type:tracks; the wrapper depends-on the source). When
+    # the source PASS-merges, the wrapper's tracked work is DONE but nothing closes
+    # it → it accrues OPEN forever. merged-bead-janitor's convoy-reconciler is the
+    # eventual backstop (closes when ALL deps closed); closing HERE, at the merge
+    # boundary, is immediate.
+    #
+    # SAFETY (mirrors the janitor's discipline — NO commit-matching, dependency
+    # linkage ONLY): we ask "who TRACKS / depends-on the just-merged source?" via
+    # `bd dep list <source> --direction=up` and close only OPEN dependents that are
+    # unambiguous coordination wrappers (issue_type:convoy OR id prefix dc-). Any
+    # other dependent (real follow-on work, stories, bugs) is LEFT UNTOUCHED. If we
+    # cannot confidently enumerate wrappers (query fails / unreadable), we do
+    # NOTHING and let the janitor backstop handle it. EVERY step is `|| true`-
+    # guarded and idempotent: a close failure here MUST NEVER abort the merge — the
+    # merge is the critical operation; this cleanup is strictly best-effort. Runs
+    # ONLY on the PASS/merge-success path (inside `if OVERALL_VERDICT = PASS`,
+    # after a real MERGE_SHA), never on FAIL.
+    if [ -n "$BEAD_ID" ] && [ "$DRY_RUN" != "1" ]; then
+      WRAPPER_DEPS_JSON="$(bd -C "$BEAD_CITY" dep list "$BEAD_ID" --direction=up --json 2>/dev/null || echo "")"
+      # Select OPEN (non-closed) dependents that are coordination wrappers:
+      # issue_type:convoy OR id prefixed dc-. Closed ones are already reaped.
+      WRAPPER_IDS="$(printf '%s' "$WRAPPER_DEPS_JSON" \
+        | jq -r '(if type=="array" then . else [] end)
+                 | [ .[]?
+                     | select((.status // "") != "closed")
+                     | select(((.issue_type // .type // "") == "convoy")
+                              or (((.id // "") | startswith("dc-"))))
+                     | .id ] | unique | .[]' 2>/dev/null || echo "")"
+      if [ -n "$WRAPPER_IDS" ]; then
+        for _WID in $WRAPPER_IDS; do
+          [ -z "$_WID" ] && continue
+          [ "$_WID" = "$BEAD_ID" ] && continue   # never self-close the source
+          if bd -C "$BEAD_CITY" close "$_WID" \
+               -r "reaped: work merged (gate PASS) — coordination wrapper closed (source $BEAD_ID, branch $BRANCH, sha=$MERGE_SHA, gate_run=$GATE_RUN_ID; ga-dcclose)" \
+               2>/dev/null; then
+            log "ga-dcclose: reaped coordination wrapper $_WID (tracks merged source $BEAD_ID)."
+          else
+            # Non-fatal: an already-closed/obsolete sibling dep can make bd refuse a
+            # clean close. Leave it for the janitor convoy-reconciler backstop.
+            warn "ga-dcclose: could not close wrapper $_WID for $BEAD_ID (non-fatal — janitor backstop will retry)."
+          fi
+        done
+      else
+        log "ga-dcclose: no open coordination wrapper depends on $BEAD_ID — nothing to reap."
       fi
     fi
 
