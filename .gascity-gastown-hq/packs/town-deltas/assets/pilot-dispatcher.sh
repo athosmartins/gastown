@@ -646,6 +646,52 @@ _crew_is_suspended() {
   case " $susp " in *" $crew "*) return 0 ;; *) return 1 ;; esac
 }
 
+# ── per-crew in-flight CAP (over-assignment / load-balance) ───────────────────
+# The Pilot picks an idle-THIS-SWEEP crew without seeing the crew's ACCUMULATED
+# in-flight backlog, so over many sweeps one crew piles up beads it builds
+# sequentially (observed: mila-wa 7 in-flight, builds ~2 at a time → 5 queued ~a day)
+# while peers sit idle. _crew_at_inflight_cap caps how many story:in-flight beads a
+# crew may own (PILOT_MAX_INFLIGHT_PER_CREW, default 3); the rotation loop in
+# pick_pool_builder then SKIPS a full crew so the bead lands on a less-loaded peer (or
+# defers if all are full — better than piling on one). Counts are memoized per rig-DB
+# for the sweep (1 bd query per rig). Matches the crew by exact name, short name
+# (mila-wa→mila) and session-id forms (mila-wa-<sid>). PILOT_MAX_INFLIGHT_PER_CREW=0
+# disables. FAIL-OPEN: no rig context / probe error → not capped (never blocks dispatch).
+PILOT_MAX_INFLIGHT_PER_CREW="${PILOT_MAX_INFLIGHT_PER_CREW:-3}"
+_PILOT_INFLIGHT_RIGS_DONE=""
+_PILOT_INFLIGHT_MAP=""
+_crew_inflight_count() {
+  local crew="$1" rig="$2" short="${1%-*}" kv rows
+  [ -z "$crew" ] || [ -z "$rig" ] && { echo 0; return; }
+  # Test seam: PILOT_TEST_INFLIGHT_COUNTS="crew:N crew:N" (hermetic, no bd).
+  if [ -n "${PILOT_TEST_INFLIGHT_COUNTS+x}" ]; then
+    for kv in $PILOT_TEST_INFLIGHT_COUNTS; do
+      case "$kv" in "$crew:"*) echo "${kv#*:}"; return ;; esac
+    done
+    echo 0; return
+  fi
+  case " $_PILOT_INFLIGHT_RIGS_DONE " in
+    *" $rig "*) : ;;
+    *)
+      rows=$(bd -C "$rig" list --json -l story:in-flight -n 0 2>/dev/null \
+        | jq -r '.[] | (.assignee // "") | select(length>0)' 2>/dev/null \
+        | awk -v r="$rig" '{print r"\t"$0}')
+      _PILOT_INFLIGHT_MAP="${_PILOT_INFLIGHT_MAP}${rows}"$'\n'
+      _PILOT_INFLIGHT_RIGS_DONE="$_PILOT_INFLIGHT_RIGS_DONE $rig"
+      ;;
+  esac
+  printf '%s\n' "$_PILOT_INFLIGHT_MAP" | awk -F'\t' -v r="$rig" -v c="$crew" -v s="$short" '
+    $1==r { a=$2; if (a==c || a==s || index(a,c"-")==1 || index(a,s"-")==1) n++ }
+    END { print n+0 }'
+}
+_crew_at_inflight_cap() {
+  local crew="$1" rig="${PILOT_INFLIGHT_RIG_OVERRIDE:-${STORY_BEAD_CITY:-}}" n
+  [ "${PILOT_MAX_INFLIGHT_PER_CREW:-0}" -gt 0 ] 2>/dev/null || return 1   # disabled
+  [ -n "$rig" ] || return 1                                              # no rig → fail-open
+  n="$(_crew_inflight_count "$crew" "$rig")"
+  [ "${n:-0}" -ge "$PILOT_MAX_INFLIGHT_PER_CREW" ] 2>/dev/null
+}
+
 # pick_pool_builder <rig> [prefer] [exclude] — echo an idle crew from the rig's
 # pool, or nothing (and return 1) if none is eligible. Pure read of the busy/used
 # sets above; the caller records the winner via mark_pool_builder so the next
@@ -672,6 +718,7 @@ pick_pool_builder() {
   # 2. Rotate across idle crew, skipping any domain-excluded member.
   for crew in $(rig_to_builders "$rig"); do
     _crew_is_suspended "$crew" && continue   # ga-mfeip gate (e): never a suspended crew
+    _crew_at_inflight_cap "$crew" && continue   # per-crew in-flight cap (load-balance over-assignment)
     case " $PILOT_BUSY_BUILDERS " in *" $crew "*) continue ;; esac
     case " $PILOT_USED_BUILDERS " in *" $crew "*) continue ;; esac
     case " $exclude " in *" $crew "*) continue ;; esac

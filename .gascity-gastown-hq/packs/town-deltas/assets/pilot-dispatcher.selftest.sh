@@ -2167,6 +2167,32 @@ fi
 has "$DISPATCHER" '_crew_is_suspended()'                 "_crew_is_suspended gate (e) helper defined"
 has "$DISPATCHER" '_crew_is_suspended "\$crew" && continue' "suspended-crew skip wired into pick_pool_builder"
 
+# ── Scenario 22e2: per-crew in-flight CAP — an overloaded crew is skipped (load-balance)
+echo "Scenario 22e2: per-crew in-flight cap — crew at/over the cap is capped, light crew is not"
+_CAP_FNS="$(awk '/^PILOT_MAX_INFLIGHT_PER_CREW=/{p=1} p{print} /_crew_at_inflight_cap\(\)/{c=1} c&&/^}$/{exit}' "$DISPATCHER")"
+CAP_RESULT="$(
+  eval "$_CAP_FNS"
+  export PILOT_TEST_INFLIGHT_COUNTS="mila-wa:5 oracle-wa:1"
+  export PILOT_INFLIGHT_RIG_OVERRIDE="/tmp/dummy-rig"   # non-empty rig context (not fail-open)
+  PILOT_MAX_INFLIGHT_PER_CREW=3
+  if _crew_at_inflight_cap mila-wa;   then printf 'mila=capped ';  else printf 'mila=OK ';  fi
+  if _crew_at_inflight_cap oracle-wa; then printf 'oracle=CAPPED'; else printf 'oracle=ok'; fi
+)"
+if [ "$CAP_RESULT" = "mila=capped oracle=ok" ]; then
+  ok "per-crew cap: mila-wa (5≥3) capped, oracle-wa (1<3) not (real helper logic)"
+else
+  bad "per-crew cap logic wrong (got: '$CAP_RESULT')"
+fi
+CAP_OFF="$(
+  eval "$_CAP_FNS"
+  export PILOT_TEST_INFLIGHT_COUNTS="mila-wa:99"; export PILOT_INFLIGHT_RIG_OVERRIDE="/tmp/x"
+  PILOT_MAX_INFLIGHT_PER_CREW=0
+  _crew_at_inflight_cap mila-wa && echo "CAPPED" || echo "uncapped"
+)"
+[ "$CAP_OFF" = "uncapped" ] && ok "PILOT_MAX_INFLIGHT_PER_CREW=0 disables the cap" || bad "cap fired while disabled (got: $CAP_OFF)"
+has "$DISPATCHER" '_crew_at_inflight_cap()'                   "_crew_at_inflight_cap helper defined"
+has "$DISPATCHER" '_crew_at_inflight_cap "\$crew" && continue' "in-flight cap wired into pick_pool_builder rotation"
+
 # ── Scenario 22f: gate (f) — rig-native dedup re-check before assign (structural) ─
 echo "Scenario 22f: gate (f) — rig-native dispatch re-checks the live assignee before assigning (dedup)"
 has "$DISPATCHER" 'rig_dedup_skip'  "gate (f) dedup-skip result code present"
