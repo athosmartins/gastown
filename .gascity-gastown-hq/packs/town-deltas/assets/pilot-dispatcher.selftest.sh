@@ -357,6 +357,7 @@ run_neverstarted() {
     PILOT_TEST_BRANCH_BEADS="${2:-}" \
     FAKE_SESSIONS_JSON="${3:-}" \
     FAKE_SLING_ASSIGNEES="${4:-}" \
+    PILOT_TEST_CREW_PROGRESSED="${5:-}" \
     FAKE_BLOCKED_IDS="" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
@@ -1327,6 +1328,48 @@ if echo "$LOG16N" | grep -q "releasing never-started in-flight bead tt-ns-dog"; 
 else
   bad "REGRESSION (ga-9yb5s): a dog-pool assignee blocked reclaim (should be sling-tracked only)"
 fi
+
+# ── ga-mfeip owner-grace: a live crew that OWNS but NEVER STARTED a bead (no branch),
+# past the owner-grace window, with proof the crew progressed ELSEWHERE, is RELEASED
+# (it was declined/skipped, not slow-built). Without that proof, or within the grace
+# window, it is KEPT — the conservative default that protects a genuinely slow build.
+NS_VERYOLD="$((NS_NOW - 90000))"   # 25h old → past the 24h owner-grace window
+
+# 16o: aged>24h + no branch + live crew owner + owner progressed elsewhere → RELEASE.
+NS_OG='[{"id":"tt-ns-ograce","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_VERYOLD"'"}}]'
+LOG16O="$(run_neverstarted "$NS_OG" "" "$NS_CREW_SESS" '{"tt-ns-ograce":"batista-ps"}' "batista-ps")"
+echo "Scenario 16o: owner-grace releases a never-started owned bead whose crew progressed elsewhere"
+if echo "$LOG16O" | grep -q "releasing never-started in-flight bead tt-ns-ograce"; then
+  ok "owner-grace: aged>24h + no branch + owner pushed other branches → released (ga-mfeip)"
+else
+  bad "owner-grace did NOT release a 25h-stale never-started owned bead whose crew progressed"
+fi
+
+# 16p: same but the owner has NOT progressed elsewhere → KEEP (may be slow-building).
+NS_OG2='[{"id":"tt-ns-ograce2","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_VERYOLD"'"}}]'
+LOG16P="$(run_neverstarted "$NS_OG2" "" "$NS_CREW_SESS" '{"tt-ns-ograce2":"batista-ps"}' "")"
+echo "Scenario 16p: owner-grace KEEPS when the crew shows no progress elsewhere (conservative)"
+if echo "$LOG16P" | grep -q "releasing never-started in-flight bead tt-ns-ograce2"; then
+  bad "REGRESSION: released an owned bead with NO skip-proof (crew not progressed) — false-reclaim risk"
+else
+  ok "owner-grace KEEPS the bead when the crew has not progressed elsewhere (slow-build safe)"
+fi
+
+# 16q: aged only 1h (< owner-grace) even with progress proof → KEEP (age gates it).
+NS_OG3='[{"id":"tt-ns-ograce3","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+LOG16Q="$(run_neverstarted "$NS_OG3" "" "$NS_CREW_SESS" '{"tt-ns-ograce3":"batista-ps"}' "batista-ps")"
+echo "Scenario 16q: owner-grace KEEPS a bead still within the grace window (age gates the release)"
+if echo "$LOG16Q" | grep -q "releasing never-started in-flight bead tt-ns-ograce3"; then
+  bad "REGRESSION: released an owned bead aged only 1h (< 24h owner-grace) — premature reclaim"
+else
+  ok "owner-grace KEEPS a bead within the grace window even with progress proof (age gates it)"
+fi
+
+# 16r: structural — the knob + skip-proof helper are wired.
+echo "Scenario 16r: owner-grace knob + skip-proof helper are wired (ga-mfeip)"
+has "$DISPATCHER" 'PILOT_NEVERSTARTED_OWNER_GRACE_HOURS' "owner-grace window knob defined"
+has "$DISPATCHER" '_crew_progressed_since()' "_crew_progressed_since skip-proof helper defined"
+has "$DISPATCHER" 'owner-grace' "owner-grace release path wired into the never-started detector"
 
 # 16i: PILOT_NEVERSTARTED_MINUTES=0 fully disables the detector.
 echo "Scenario 16i: PILOT_NEVERSTARTED_MINUTES=0 disables the detector"

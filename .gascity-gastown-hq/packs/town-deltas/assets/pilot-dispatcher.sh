@@ -222,6 +222,20 @@ PILOT_DEADWORKER_CHECK="${PILOT_DEADWORKER_CHECK:-1}"
 # existing). Set PILOT_NEVERSTARTED_MINUTES=0 to disable.
 PILOT_NEVERSTARTED_MINUTES="${PILOT_NEVERSTARTED_MINUTES:-15}"
 
+# ── Owner-grace for never-started release (ga-mfeip in-flight pileup) ──────────
+# The live-crew-owner guard below (ga-9yb5s) KEEPS any bead whose story.assignee is a
+# live named crew — it assumes "owner alive == actively building this bead". But the
+# rig ctx:ready dispatch ASSIGNS + marks story:in-flight on a busy crew that may never
+# pick the bead up (declined operational/blocked work, or a queue it never drains).
+# Such a bead has NO branch yet sits story:in-flight forever, inflating the in-flight
+# count / painel (12 WA beads, 0 branches — wa-zybp 41h). After a generous OWNER GRACE
+# window, release a still-branchless owned bead ONLY when the owner has DEMONSTRABLY
+# progressed elsewhere (pushed branches for OTHER beads since this one's dispatch) — i.e.
+# the crew is working but SKIPPED this bead, so it was declined, not slow-built. Without
+# that proof we KEEP (a genuinely slow build that hasn't branched yet is never reclaimed).
+# Conservative by construction: 24h default, dual-signal, fail-safe to KEEP.
+PILOT_NEVERSTARTED_OWNER_GRACE_HOURS="${PILOT_NEVERSTARTED_OWNER_GRACE_HOURS:-24}"
+
 # ── Reuse existing crew session, never spawn a 2nd one (gt-4st3n) ─────────────
 # A crew identity (e.g. digo-wa, batista-ps) is a single-identity config-agent
 # session. Dispatching to it via `gc sling <identity>` + an immediate
@@ -1578,6 +1592,34 @@ _beadid_has_branch() {
   return 1
 }
 
+# _crew_progressed_since <crew> <since_epoch> — true (0) iff the crew has pushed a
+# branch (crew/<crew>/* or crew/<crew-short>/* in any _NS_BRANCH_REPOS) whose latest
+# commit is NEWER than <since_epoch>. Proof the crew is actively building (producing
+# branches) — so a bead it OWNS but never branched, past the owner-grace window, was
+# SKIPPED/declined rather than slow-built. Hermetic test seam: PILOT_TEST_CREW_PROGRESSED
+# (space-list of crews treated as "progressed"). FAIL-SAFE: any error / no repos / no
+# git → return 1 (cannot prove progress → caller KEEPS the bead — the conservative side).
+_crew_progressed_since() {
+  local _crew="${1:-}" _since="${2:-}" _repo _short _pat _latest
+  [ -n "$_crew" ] && [ -n "$_since" ] || return 1
+  if [ -n "${PILOT_TEST_CREW_PROGRESSED+x}" ]; then
+    case " $PILOT_TEST_CREW_PROGRESSED " in *" $_crew "*) return 0 ;; *) return 1 ;; esac
+  fi
+  command -v git >/dev/null 2>&1 || return 1
+  [ -n "${_NS_BRANCH_REPOS:-}" ] || return 1
+  _short="${_crew%-*}"   # mila-wa -> mila (the crew/<short>/<bead> branch convention)
+  while IFS= read -r _repo; do
+    [ -n "$_repo" ] && [ -d "$_repo" ] || continue
+    for _pat in "crew/$_crew/" "crew/$_short/"; do
+      _latest=$(git -C "$_repo" for-each-ref --sort=-committerdate \
+        --format='%(committerdate:unix)' \
+        "refs/remotes/origin/${_pat}*" "refs/heads/${_pat}*" 2>/dev/null | head -1)
+      [ -n "$_latest" ] && [ "$_latest" -gt "$_since" ] 2>/dev/null && return 0
+    done
+  done <<< "${_NS_BRANCH_REPOS:-}"
+  return 1
+}
+
 # ── ga-htjni: ownership / in-flight collision guard helpers ───────────────────
 # _ownership_guard_repos — newline list of repos a `crew/<owner>/<bead>` branch
 # could live in (the shared town root + every registered rig path), de-duped and
@@ -1755,8 +1797,20 @@ _neverstarted_recover_db() {
     # with the ga-htjni dispatch guard). FAIL-OPEN: untrustworthy roster / no owner
     # / dead session → no keep, so genuine orphans still recover.
     _crew_owner=$(_beadid_live_crew_owner "$_bid" "$_db") && {
-      warn "NEVERSTARTED: $_bid is owned by live crew '$_crew_owner' (story.assignee) — active crew builder, refusing to release (ga-9yb5s parity with ga-htjni)."
-      continue
+      # ga-mfeip owner-grace: a live crew may OWN a bead it never started (assigned via
+      # the rig ctx:ready dispatch but the busy crew never picked it up). Release ONLY
+      # when ALL hold: aged past the owner-grace window AND no branch for this bead AND
+      # the owner pushed branches for OTHER beads since this dispatch (working but skipped
+      # it). Otherwise KEEP (the conservative ga-9yb5s default — a slow build is safe).
+      _owner_grace=$(( ${PILOT_NEVERSTARTED_OWNER_GRACE_HOURS:-24} * 3600 ))
+      if [ "$_age" -gt "$_owner_grace" ] 2>/dev/null \
+         && ! _beadid_has_branch "$_bid" \
+         && _crew_progressed_since "$_crew_owner" "$_stamp"; then
+        warn "NEVERSTARTED: $_bid owned by live crew '$_crew_owner' but NEVER started (no branch, age=${_age}s > owner-grace ${_owner_grace}s, owner pushed other branches since dispatch) — releasing as declined/skipped (ga-mfeip owner-grace)."
+      else
+        warn "NEVERSTARTED: $_bid is owned by live crew '$_crew_owner' (story.assignee) — active crew builder, refusing to release (ga-9yb5s parity with ga-htjni)."
+        continue
+      fi
     }
 
     # branch guard — a surviving crew branch means real work landed. KEEP.
