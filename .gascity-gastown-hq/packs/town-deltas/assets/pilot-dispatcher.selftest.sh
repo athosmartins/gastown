@@ -2148,6 +2148,31 @@ has "$DISPATCHER" 'PILOT_CTX_MIN_SPEC_CHARS' "spec-floor knob (gate b) is wired 
 has "$DISPATCHER" 'PILOT_CTX_READY_RIGS' "rig-scan scope allowlist defined (default whatsapp_automation)"
 has "$DISPATCHER" 'whatsapp_automation}"' "rig-scan scope defaults to whatsapp_automation (ga-mfeip scope)"
 
+# ── Scenario 22g: HOL-block fix — built/gate-failed beads excluded from ctx:ready pool
+# A bead that is already built (has a crew branch) or gate-failed must NOT be a ctx:ready
+# candidate: it is picked first by priority, refused by the ownership guard, and head-of-
+# line-blocks the lane every sweep (wa-xrdv / wa-vn5o → dispatched=0 while fresh beads wait).
+echo "Scenario 22g: HOL-block fix — built + gate-failed beads are excluded from the ctx:ready pool"
+# Layer 1 — query excludes the gate-failed states (both HQ and rig ctx:ready queries).
+has "$DISPATCHER" 'exclude-label "gate:failed"'    "ctx:ready query excludes gate:failed (HOL-block layer 1)"
+has "$DISPATCHER" 'exclude-label "gate:needs-fix"' "ctx:ready query excludes gate:needs-fix (HOL-block layer 1)"
+# Layer 2 — _filter_built drops branched (built) candidates; behavioral unit + wiring.
+_FB_FN="$(awk '/^_filter_built\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+FB_OUT="$(eval "$_FB_FN"; export PILOT_TEST_BRANCH_BEADS="wa-built"; printf '%s' '[{"id":"wa-built"},{"id":"wa-fresh"}]' | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
+if [ "$FB_OUT" = '["wa-fresh"]' ]; then
+  ok "_filter_built drops the built (branched) bead, keeps the fresh candidate"
+else
+  bad "_filter_built logic wrong (got: '$FB_OUT')"
+fi
+FB_OPEN="$(eval "$_FB_FN"; printf '%s' '[{"id":"wa-built"},{"id":"wa-fresh"}]' | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
+if [ "$FB_OPEN" = '["wa-built","wa-fresh"]' ]; then
+  ok "_filter_built FAIL-OPEN keeps all candidates when branches are unprobeable (no false drop)"
+else
+  bad "_filter_built fail-open broke (got: '$FB_OPEN')"
+fi
+has "$DISPATCHER" '_filter_built()'                        "_filter_built helper defined (HOL-block layer 2)"
+has "$DISPATCHER" '_filter_dispatch_gates | _filter_built' "_filter_built applied in the ctx:ready filter chain"
+
 # ── Scenario 22e: gate (e) — suspended crews are excluded (unit + structural) ───
 echo "Scenario 22e: gate (e) — _crew_is_suspended excludes a suspended crew, keeps an active one"
 # Behavioral unit test: extract the two real helper fns and exercise them through the

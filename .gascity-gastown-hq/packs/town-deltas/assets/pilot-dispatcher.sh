@@ -2193,6 +2193,44 @@ _filter_dispatch_gates() {
       and ((((.title) // "") + " " + ((.description) // "")) | ascii_downcase | test("design[ -]?first") | not)
     )]' 2>/dev/null || cat
 }
+# _filter_built — drop ctx:ready candidates that ALREADY have a crew branch (built work
+# awaiting gate/delivery, NOT a fresh dispatch candidate). Such a bead — if it kept or
+# re-acquired ctx:ready (lost story:in-flight, or gate-failed) — is picked first by
+# priority, REFUSED by the ownership guard (its branch exists), and HEAD-OF-LINE-BLOCKS
+# the lane every sweep (the wa-xrdv / wa-vn5o stall: dispatched=0 while fresh beads wait).
+# Self-sufficient repo list (does not need the never-started block). FAIL-OPEN to KEEP:
+# no git / no repo set / jq error → keep the candidate (never drop a real one on an
+# unresolved probe — the opposite of the reclaim-side fail-open).
+_filter_built() {
+  local repos arr id r built_ids=""
+  # Hermetic test seam: PILOT_TEST_BRANCH_BEADS lists ids treated as "built" (no git) —
+  # the same seam _beadid_has_branch uses.
+  if [ -n "${PILOT_TEST_BRANCH_BEADS+x}" ]; then
+    arr=$(cat)
+    printf '%s' "$arr" | jq --arg b "$PILOT_TEST_BRANCH_BEADS" \
+      '($b|split(" ")) as $bi | [ .[] | select((.id as $i | $bi | index($i)) | not) ]' \
+      2>/dev/null || printf '%s' "$arr"
+    return
+  fi
+  command -v git >/dev/null 2>&1 || { cat; return; }
+  repos="$(_ownership_guard_repos)"
+  [ -n "$repos" ] || { cat; return; }
+  arr=$(cat)
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    while IFS= read -r r; do
+      [ -n "$r" ] && [ -d "$r" ] || continue
+      if git -C "$r" for-each-ref --format='%(refname)' \
+           "refs/remotes/origin/crew/*/$id" "refs/heads/crew/*/$id" 2>/dev/null | grep -q .; then
+        built_ids="${built_ids:+$built_ids }$id"; break
+      fi
+    done <<< "$repos"
+  done < <(printf '%s' "$arr" | jq -r '.[]?.id // empty' 2>/dev/null)
+  [ -z "$built_ids" ] && { printf '%s' "$arr"; return; }
+  printf '%s' "$arr" | jq --arg b "$built_ids" \
+    '($b|split(" ")) as $bi | [ .[] | select((.id as $i | $bi | index($i)) | not) ]' \
+    2>/dev/null || printf '%s' "$arr"
+}
 if [ "$PILOT_CTX_READY_QUERIES" = "1" ]; then
   CTXREADY_RAW=$(bd -C "$GC_CITY" list --json \
     -l "ctx:ready" \
@@ -2214,6 +2252,8 @@ if [ "$PILOT_CTX_READY_QUERIES" = "1" ]; then
     --exclude-label "story:done" \
     --exclude-label "story:cancelled" \
     --exclude-label "gate:passed" \
+    --exclude-label "gate:failed" \
+    --exclude-label "gate:needs-fix" \
     --exclude-label "pilot:dispatching" \
     --exclude-label "gate:needs-human" \
     --exclude-label "needs:engine-window" \
@@ -2234,7 +2274,7 @@ if [ "$PILOT_CTX_READY_QUERIES" = "1" ]; then
   # SAME filter chain as Tier-1/Tier-2 (empty-veto, lifecycle blocklist, epic guard,
   # self-exclusion, unresolved deps, explicit deps). exec:manual safety belt applied
   # even though the query already excludes that label (defense-in-depth, fail-open).
-  CTXREADY_JSON=$(echo "$CTXREADY_JSON" | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates)
+  CTXREADY_JSON=$(echo "$CTXREADY_JSON" | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built)
   CTXREADY_JSON=$(echo "$CTXREADY_JSON" | _filter_unblocked "$GC_CITY")
   CTXREADY_JSON=$(echo "$CTXREADY_JSON" | _filter_explicit_deps "$GC_CITY")
   CTXREADY_COUNT=$(echo "$CTXREADY_JSON" | jq 'length' 2>/dev/null || echo "0")
@@ -2289,6 +2329,8 @@ if [ "$PILOT_CTX_READY_RIG_QUERIES" = "1" ]; then
       --exclude-label "story:done" \
       --exclude-label "story:cancelled" \
       --exclude-label "gate:passed" \
+      --exclude-label "gate:failed" \
+      --exclude-label "gate:needs-fix" \
       --exclude-label "pilot:dispatching" \
       --exclude-label "gate:needs-human" \
       --exclude-label "needs:engine-window" \
@@ -2304,7 +2346,7 @@ if [ "$PILOT_CTX_READY_RIG_QUERIES" = "1" ]; then
               or (((.labels // []) | index("tech-debt")) != null)
           ) ]' 2>/dev/null || echo "[]")
     # Same filter chain + exec:manual safety belt + ga-mfeip dispatch quality gates.
-    _rig_ctx_typed=$(echo "$_rig_ctx_typed" | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates)
+    _rig_ctx_typed=$(echo "$_rig_ctx_typed" | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built)
     _rig_ctx_typed=$(echo "$_rig_ctx_typed" | _filter_unblocked "$_rig_ctx_path")
     _rig_ctx_typed=$(echo "$_rig_ctx_typed" | _filter_explicit_deps "$_rig_ctx_path")
     _rig_ctx_n=$(echo "$_rig_ctx_typed" | jq 'length' 2>/dev/null || echo "0")
