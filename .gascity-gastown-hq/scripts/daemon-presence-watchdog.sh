@@ -33,6 +33,22 @@ DPW_RELOAD="${DPW_RELOAD:-1}"     # 1 = auto-reload absent critical daemons; 0 =
 
 DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector}"
 
+HQ="${DPW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
+
+# Heartbeat-WEDGE config — "label|heartbeat-logfile|max-stale-seconds". A LOADED daemon
+# whose heartbeat log has NOT advanced past max-stale is WEDGED: loaded + "running" but
+# its sweep/loop is stuck (e.g. hung on a Dolt query). launchd will NOT restart it (it is
+# alive) and the absent/crash-loop checks miss it (it IS loaded) — so it stalls delivery
+# silently. Only daemons that emit a per-cycle heartbeat line are listed; thresholds are
+# ≈5× the cycle so a merely slow cycle never trips. A wedge → launchctl kickstart -k
+# (un-stick) + alert. Override via DPW_HEARTBEAT; a daemon NOT listed is wedge-unchecked.
+DPW_HEARTBEAT="${DPW_HEARTBEAT:-com.gascity.pilot|$HQ/.gc/logs/pilot-dispatcher.log|1500
+com.gascity.inflight-reclaim-guard|$HQ/.gc/logs/inflight-reclaim-guard-launchd.out|1500
+com.gascity.context-check-dispatcher|$HQ/.gc/logs/context-check-dispatcher.log|3000
+com.gascity.quality-gate-dispatcher|$HQ/.gc/logs/quality-gate-dispatcher.log|900
+com.gascity.auto-refino-dispatcher|$HQ/.gc/logs/auto-refino-dispatcher.log|1500
+com.gascity.story-delivery|$HQ/.gc/logs/story-delivery.log|1500}"
+
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
 
@@ -42,9 +58,12 @@ _loaded()    { launchctl list "$1" >/dev/null 2>&1; }
 _last_exit() { launchctl list 2>/dev/null | awk -v l="$1" '$3==l {print $2}'; }
 # Previous exit recorded for a label (from the state file); empty if none.
 _prev_exit() { awk -v l="$1" '$1==l {print $2}' "$STATE" 2>/dev/null; }
+# Seconds since <file> was last modified ("$2"=now epoch); empty if missing / stat fails.
+_log_age()   { local f="$1" now="$2" m; [ -f "$f" ] || return 0; m=$(stat -f %m "$f" 2>/dev/null) && echo $(( now - m )); }
 
 run_sweep() {
-  local absent="" reloaded="" crashloop="" healthy=0 newstate="" lbl plist ex prev
+  local absent="" reloaded="" crashloop="" wedged="" healthy=0 newstate="" lbl plist ex prev _hb _hblog _hbmax _age
+  local NOW; NOW="$(date +%s)"
   for lbl in $DPW_CRITICAL; do
     plist="$LAUNCH_DIR/$lbl.plist"
     if _loaded "$lbl"; then
@@ -56,6 +75,20 @@ run_sweep() {
         crashloop="$crashloop $lbl(exit=$ex)"
       else
         healthy=$((healthy + 1))
+      fi
+      # WEDGE: loaded but its per-cycle heartbeat log went stale past threshold = stuck.
+      _hb="$(printf '%s\n' "$DPW_HEARTBEAT" | awk -F'|' -v l="$lbl" '$1==l{print $2"\t"$3; exit}')"
+      if [ -n "$_hb" ]; then
+        _hblog="${_hb%%$'\t'*}"; _hbmax="${_hb##*$'\t'}"
+        _age="$(_log_age "$_hblog" "$NOW")"
+        if [ -n "$_age" ] && [ "$_age" -gt "$_hbmax" ] 2>/dev/null; then
+          wedged="$wedged $lbl(stale=${_age}s)"
+          if [ "$DPW_RELOAD" = "1" ] && launchctl kickstart -k "gui/$UID_NUM/$lbl" 2>/dev/null; then
+            log "KICKSTARTED wedged daemon: $lbl (heartbeat stale ${_age}s > ${_hbmax}s)"
+          else
+            log "WEDGED daemon NOT kickstarted: $lbl (stale ${_age}s, DPW_RELOAD=$DPW_RELOAD or kickstart failed)"
+          fi
+        fi
       fi
       newstate="$newstate$lbl $ex"$'\n'
     else
@@ -76,13 +109,14 @@ run_sweep() {
 
   printf '%s' "$newstate" > "$STATE" 2>/dev/null || true
 
-  if [ -n "$absent" ] || [ -n "$crashloop" ]; then
+  if [ -n "$absent" ] || [ -n "$crashloop" ] || [ -n "$wedged" ]; then
     local msg="Daemon-presence watchdog:"
     [ -n "$absent" ]    && msg="$msg ABSENT:${absent} (reloaded:${reloaded:- none})."
     [ -n "$crashloop" ] && msg="$msg CRASH-LOOP:${crashloop} (loaded but failing — NOT reloaded, investigate)."
+    [ -n "$wedged" ]    && msg="$msg WEDGED:${wedged} (loaded but heartbeat stale — kickstarted)."
     log "ALERT $msg"
     command -v notify >/dev/null 2>&1 && notify -t "Daemon watchdog" -p 4 "$msg" 2>/dev/null || true
-    command -v gc >/dev/null 2>&1 && gc mail send mayor -s "Daemon-presence: critical daemon absent/crash-looping" -m "$msg" 2>/dev/null || true
+    command -v gc >/dev/null 2>&1 && gc mail send mayor -s "Daemon-presence: critical daemon absent/crash-looping/wedged" -m "$msg" 2>/dev/null || true
     return 1
   fi
   log "OK: all $(echo $DPW_CRITICAL | wc -w | tr -d ' ') critical daemons loaded + healthy (heartbeat)"
@@ -110,6 +144,7 @@ case "$1" in
       printf '%s\t%s\t%s\n' "-" "$e" "$l"
     done ;;
   bootstrap) echo "$2 $3" >> "$DPW_TEST_BOOTSTRAPS"; exit 0 ;;
+  kickstart) echo "$*" >> "$DPW_TEST_KICKSTARTS"; exit 0 ;;
 esac
 exit 0
 STUB
@@ -123,6 +158,8 @@ STUB
   LOG="$TMP/log"; STATE="$TMP/state"
   DPW_CRITICAL="com.gascity.alpha com.gascity.beta com.gascity.gamma"
   export DPW_TEST_BOOTSTRAPS="$TMP/bootstraps"; : > "$DPW_TEST_BOOTSTRAPS"
+  export DPW_TEST_KICKSTARTS="$TMP/kicks";      : > "$DPW_TEST_KICKSTARTS"
+  DPW_HEARTBEAT=""   # scenarios 1–5 do not exercise the wedge check; 6–7 set it explicitly
   : > "$LAUNCH_DIR/com.gascity.alpha.plist"
   : > "$LAUNCH_DIR/com.gascity.beta.plist"
   : > "$LAUNCH_DIR/com.gascity.gamma.plist"
@@ -154,6 +191,19 @@ STUB
   : > "$STATE"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT="com.gascity.beta:-15"
   run_sweep >/dev/null 2>&1
   run_sweep && ok "signal exit (-15) never treated as crash-loop" || bad "signal exit falsely flagged as crash-loop"
+
+  echo "Scenario 6: loaded daemon with a STALE heartbeat log → WEDGED + kickstart"
+  : > "$STATE"; : > "$DPW_TEST_KICKSTARTS"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT=""
+  HB="$TMP/beta-hb.log"; DPW_HEARTBEAT="com.gascity.beta|$HB|300"
+  touch -t "$(date -v-1H +%Y%m%d%H%M 2>/dev/null || echo 202601010000)" "$HB"   # mtime ~1h ago
+  run_sweep && bad "wedged should return 1" || ok "wedged daemon (stale heartbeat) returns 1 (alert)"
+  grep -q "com.gascity.beta" "$DPW_TEST_KICKSTARTS" && ok "wedged beta was kickstarted" || bad "wedged beta NOT kickstarted"
+
+  echo "Scenario 7: FRESH heartbeat log → not wedged, no kickstart"
+  : > "$DPW_TEST_KICKSTARTS"; touch "$HB"   # mtime = now
+  run_sweep && ok "fresh heartbeat → no wedge (return 0)" || bad "fresh heartbeat falsely wedged"
+  [ ! -s "$DPW_TEST_KICKSTARTS" ] && ok "no kickstart when heartbeat fresh" || bad "kickstarted despite fresh heartbeat"
+  DPW_HEARTBEAT=""
 
   echo ""
   echo "daemon-presence-watchdog selftest: PASS=$PASS FAIL=$FAIL"
