@@ -330,6 +330,46 @@ def list_active_sessions():
         return None
 
 
+def list_suspended_agents():
+    """Return the set of agent NAMES that are deliberately SUSPENDED
+    (gc agent list --json → agents[].suspended == true).
+
+    A suspended crew's in-flight beads must NOT be reclaimed. Suspension is a
+    DELIBERATE stop (the human paused the crew), not a crash — the work should WAIT
+    for the crew to resume, not re-pool into the Pilot's ctx:ready queue where another
+    crew picks it up and (correctly) declines it. That re-pool churn is the wa-wbub /
+    digo-wa bug: digo-wa was suspended, its in-flight beads lost their owner and got
+    re-dispatched repeatedly.
+
+    The set includes BOTH the full agent name ("digo-wa") and its short form with the
+    trailing -<rig> suffix stripped ("digo"), because beads are assigned by either
+    form. Returns an EMPTY set on any error (fail-open: a failed probe must never
+    cause a bead to be held — that would re-introduce the un-reclaimable-zombie class
+    this guard exists to kill).
+    """
+    try:
+        result = subprocess.run(
+            ["gc", "agent", "list", "--json"],
+            capture_output=True, text=True, timeout=20)
+        out = (result.stdout or "").strip()
+        idx = out.find("{")
+        if result.returncode != 0 or idx < 0:
+            return set()
+        data = json.loads(out[idx:])
+        names = {
+            a.get("name") for a in data.get("agents", [])
+            if isinstance(a, dict) and a.get("suspended") and a.get("name")
+        }
+        expanded = set(names)
+        for nm in names:
+            # short form: drop a single trailing -<rig> suffix (digo-wa -> digo).
+            if "-" in nm:
+                expanded.add(nm.rsplit("-", 1)[0])
+        return expanded
+    except Exception:
+        return set()
+
+
 def list_gate_active_source_beads():
     """Return set of source-bead IDs that currently have an active gate marker
     (gate-status:dispatching, queued, or claimed).
@@ -726,6 +766,10 @@ def run_cycle(state, escalated_alerted):
         print("[INFLIGHT-RECLAIM] session list failed — skipping cycle", flush=True)
         return len(beads), 0
 
+    # Deliberately-suspended crews: their in-flight beads HOLD (wait for resume), never
+    # re-pool. Fail-open: empty set on probe error (current reclaim behavior preserved).
+    suspended_agents = list_suspended_agents()
+
     # --- Query gate active markers (fail-safe: None → skip cycle entirely) ---
     gate_active_beads = list_gate_active_source_beads()
     if gate_active_beads is None:
@@ -751,6 +795,9 @@ def run_cycle(state, escalated_alerted):
         # --- Safety flags ---
         has_needs_human      = "gate:needs-human" in labels
         has_dispatching_marker = bead_id in gate_active_beads
+        # Owner deliberately SUSPENDED → the bead is parked, not stranded. Holds (waits
+        # for the crew to resume) instead of re-pooling — the wa-wbub / digo-wa churn.
+        has_suspended_owner  = bool(assignee) and assignee in suspended_agents
         # ga-64usm: the bead's own last-update age is the secondary progress
         # signal that rescues a stale-activity session whose builder is still
         # touching the bead (workers should bd-update during long work).
@@ -760,7 +807,8 @@ def run_cycle(state, escalated_alerted):
 
         # Branch check is potentially slow (git fetch); only run when needed
         has_recent_branch = False
-        if not has_live_session and not has_needs_human and not has_dispatching_marker:
+        if (not has_live_session and not has_needs_human
+                and not has_dispatching_marker and not has_suspended_owner):
             has_recent_branch = get_branch_recent(bead_id)
 
         # --- Update stranded timestamp in state ---
@@ -769,8 +817,17 @@ def run_cycle(state, escalated_alerted):
             not has_live_session and
             not has_recent_branch and
             not has_needs_human and
-            not has_dispatching_marker
+            not has_dispatching_marker and
+            not has_suspended_owner
         )
+        if has_suspended_owner:
+            if not bead_state.get("suspended_hold_logged"):
+                print(f"[INFLIGHT-RECLAIM] HOLD (suspended owner): bead={bead_id} "
+                      f"assignee={assignee!r} — not re-pooling; waits for crew resume "
+                      f"or human reassign", flush=True)
+                bead_state["suspended_hold_logged"] = True
+        else:
+            bead_state.pop("suspended_hold_logged", None)
 
         if is_currently_stranded:
             if "first_seen_stranded" not in bead_state:
