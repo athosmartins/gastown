@@ -352,6 +352,14 @@ PILOT_CTX_READY_QUERIES="${PILOT_CTX_READY_QUERIES:-1}"
 # without blocking HQ ctx:ready dispatch). Defaults to inherit PILOT_CTX_READY_QUERIES.
 PILOT_CTX_READY_RIG_QUERIES="${PILOT_CTX_READY_RIG_QUERIES:-$PILOT_CTX_READY_QUERIES}"
 
+# Which rigs the rig ctx:ready scan covers (space-list of rig NAMES). Default
+# "whatsapp_automation" — ga-mfeip's stated scope ("rigs além de whatsapp_automation
+# não faz parte desta entrega"). Set to "all" to scan every non-HQ rig. Scoping this
+# avoids wasted ctx:ready queries against rigs with no dispatchable backlog
+# (property_scrapers/marketing/lexbh/gastown/deacon are empty) → lighter Dolt footprint
+# per sweep. Expand the list deliberately when another rig is dispatch-ready.
+PILOT_CTX_READY_RIGS="${PILOT_CTX_READY_RIGS:-whatsapp_automation}"
+
 # Dry-run mode: show what WOULD happen, make zero changes.
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -2150,10 +2158,16 @@ fi
 CTXREADY_RIG_JSON="[]"
 CTXREADY_RIG_COUNT="0"
 if [ "$PILOT_CTX_READY_RIG_QUERIES" = "1" ]; then
-  _rig_ctx_paths=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
-    | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
-  while IFS= read -r _rig_ctx_path; do
+  _rig_ctx_rows=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
+    | jq -r '.rigs[] | select(.hq == false) | "\(.name)\t\(.path)"' 2>/dev/null || echo "")
+  while IFS=$'\t' read -r _rig_ctx_name _rig_ctx_path; do
     [ -z "$_rig_ctx_path" ] || [ ! -d "$_rig_ctx_path" ] && continue
+    # ga-mfeip scope gate: only scan rigs in PILOT_CTX_READY_RIGS (default WA-only).
+    case " $PILOT_CTX_READY_RIGS " in
+      *" all "*) : ;;
+      *" $_rig_ctx_name "*) : ;;
+      *) continue ;;
+    esac
     _rig_ctx_raw=$(bd -C "$_rig_ctx_path" list --json \
       -l "ctx:ready" \
       --exclude-label "ctx:thin" \
@@ -2198,7 +2212,7 @@ if [ "$PILOT_CTX_READY_RIG_QUERIES" = "1" ]; then
       CTXREADY_RIG_JSON=$(echo "$CTXREADY_RIG_JSON $_rig_ctx_typed" \
         | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "$CTXREADY_RIG_JSON")
     fi
-  done <<< "$_rig_ctx_paths"
+  done <<< "$_rig_ctx_rows"
   CTXREADY_RIG_COUNT=$(echo "$CTXREADY_RIG_JSON" | jq 'length' 2>/dev/null || echo "0")
   [ "${CTXREADY_RIG_COUNT:-0}" -gt 0 ] 2>/dev/null \
     && log "ctx:ready rig candidates total: $CTXREADY_RIG_COUNT (across all rig DBs, ga-mfeip)."

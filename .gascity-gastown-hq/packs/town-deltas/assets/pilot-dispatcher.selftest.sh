@@ -2100,6 +2100,10 @@ echo "Scenario 22d: gates (b)+(c) — _filter_dispatch_gates defined and applied
 has "$DISPATCHER" '_filter_dispatch_gates()' "_filter_dispatch_gates function defined"
 has "$DISPATCHER" '_filter_candidates | _filter_dispatch_gates' "dispatch gates applied after _filter_candidates"
 has "$DISPATCHER" 'PILOT_CTX_MIN_SPEC_CHARS' "spec-floor knob (gate b) is wired and tunable"
+# ── rig-scope allowlist (ga-mfeip WA-only default — honors the bead's scope, cuts
+# wasted ctx:ready queries against empty rigs → lighter Dolt footprint per sweep).
+has "$DISPATCHER" 'PILOT_CTX_READY_RIGS' "rig-scan scope allowlist defined (default whatsapp_automation)"
+has "$DISPATCHER" 'whatsapp_automation}"' "rig-scan scope defaults to whatsapp_automation (ga-mfeip scope)"
 
 # ── Scenario 22e: gate (e) — suspended crews are excluded (unit + structural) ───
 echo "Scenario 22e: gate (e) — _crew_is_suspended excludes a suspended crew, keeps an active one"
