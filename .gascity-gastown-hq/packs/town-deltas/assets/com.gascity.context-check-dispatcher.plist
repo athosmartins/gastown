@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.context-check-dispatcher</string>
+
+  <!-- Context-check creation-gate daemon ("Option D"). Runs every 10 minutes.
+       For each open actionable bead (bug/chore/task/debt, plus feature WITHOUT a
+       story:* lifecycle label) that carries NO ctx:* verdict yet and is neither
+       plumbing nor in-flight/done/gate-stuck, it judges context-COMPLETENESS
+       against a 3-field rubric (WHAT / HOW-TO-VERIFY / SCOPE) and writes a
+       POSITIVE verdict label: ctx:ready (a generic agent could build it) or
+       ctx:thin + a gap comment (under-specified — needs a human/refinement).
+
+       A cheap heuristic resolves the clear majority; only the ambiguous middle
+       band escalates to ONE on-demand Sonnet judge per sweep (capped). When
+       neither can tell, the daemon defaults to ctx:thin — fail toward "needs
+       human", never falsely ready.
+
+       LABEL-ONLY: it NEVER dispatches, slings, closes, or changes lifecycle. The
+       Pilot's chore/task dispatch queries stay OFF and the empty-veto stays; a
+       LATER phase wires ctx:ready -> dispatchable.
+
+       Caps (CONTEXT_CHECK_MAX_PER_SWEEP=8 beads, MAX_SONNET_PER_SWEEP=1) keep
+       Dolt + Claude load gentle; the 10-minute interval drains the backlog.
+       Kill-switch: CONTEXT_CHECK_ENABLED=0 -> no-op exit.
+
+       Staggered: 10-min interval, offset to avoid colliding with the code gate
+       (:00), refino gate (:00 +60s), and auto-refino (5-min :00 +120s) boot-herd
+       of concurrent reviewer `gc prime` calls. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/context-check-dispatcher.sh</string>
+  </array>
+
+  <key>StartInterval</key><integer>600</integer>
+
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/context-check-dispatcher-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/context-check-dispatcher-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <!-- Start pure-heuristic: no Sonnet spawns (model="sonnet" support unconfirmed
+         in this build + avoids Opus/Dolt load). The heuristic classified 19 ready /
+         4 thin in DRY_RUN with 0 spawns. Raise to 1 once the heuristic baseline is trusted. -->
+    <key>MAX_SONNET_PER_SWEEP</key>
+    <string>0</string>
+    <!-- Pin the plumbing exclude set at the deployment layer (defense-in-depth so
+         launchd never runs the daemon with an empty exclude set). -->
+    <key>CONTEXT_CHECK_EXCLUDE_LABELS</key>
+    <string>gt:agent gt:rig gt:convoy gc:nudge</string>
+    <key>CONTEXT_CHECK_EXCLUDE_PREFIXES</key>
+    <string>type:quality-gate gate-status: nudge: reviewer-index: verdict: refino-gate: auto-refino: gate-reclaim-count: order-run: ctx:</string>
+  </dict>
+</dict>
+</plist>

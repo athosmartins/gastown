@@ -378,6 +378,24 @@ context_check_exec_class() {
 *"cadastrar conta"*|*"canal whapi"*)
       echo "exec:manual"; return ;;
   esac
+  # 4. HUMAN DESIGN / BUSINESS-DECISION GATE — the work itself is gated on a human
+  #    design approval or a cost/business decision BEFORE any code (not physical, not
+  #    a credential — the spec needs a human call first). A crew that auto-builds these
+  #    wastes the build and produces unreviewed design. Phrases are deliberate gate
+  #    markers (low false-positive), paired where a lone word would be too broad.
+  #    Caught the recurring design-first mis-dispatch: wa-tozk ("DESIGN-FIRST —
+  #    aguardando OK do thies/Athos antes de qualquer código"), wa-1my1 ("spec aprovado
+  #    por Athos antes de codar"), wa-yma9 ("bloqueado em decisão de custo").
+  case "$t" in
+    *"design-first"*|*"design first"*|\
+*"antes de qualquer código"*|*"antes de qualquer codigo"*|\
+*"aprovad"*"antes de codar"*|*"aprovad"*"antes de programar"*|\
+*"aguardando ok do"*|*"aguardando aprovação"*|*"aguardando aprovacao"*|\
+*"aguardando review humano"*|*"aguardando decisão"*|*"aguardando decisao"*|\
+*"aprovação do design"*|*"aprovacao do design"*|\
+*"decisão de custo"*|*"decisao de custo"*|*"cost decision"*|*"business decision"*)
+      echo "exec:manual"; return ;;
+  esac
   # Default: a crew agent can try it.
   echo "exec:auto"
 }

@@ -187,6 +187,16 @@ fi
 # 10c — HUMAN-held credential / account / channel provisioning → exec:manual.
 [ "$(context_check_exec_class "canal efêmero — provisionar canal Whapi" "provisionar canal Whapi novo para o número efêmero")" = "exec:manual" ] \
   && ok "provisionar canal Whapi (credential provisioning) → exec:manual" || bad "provisionar canal Whapi → expected exec:manual"
+# 10c2 — HUMAN DESIGN / BUSINESS-DECISION GATE → exec:manual (the design-first mis-dispatch class).
+[ "$(context_check_exec_class "F2 inbound on-device v2" "DESIGN-FIRST: spec aprovado por Athos antes de codar. Acceptance criteria a definir.")" = "exec:manual" ] \
+  && ok "design-first + spec aprovado antes de codar → exec:manual (wa-1my1)" || bad "design-first → expected exec:manual"
+[ "$(context_check_exec_class "F11 inbound nunca perder" "Status: DESIGN-FIRST — aguardando OK do thies/Athos antes de qualquer código.")" = "exec:manual" ] \
+  && ok "design-first + aguardando OK antes de qualquer código → exec:manual (wa-tozk)" || bad "wa-tozk class → expected exec:manual"
+[ "$(context_check_exec_class "multi-arm IP survival" "bloqueado em decisão de custo: free phone-proxy vs paid .156")" = "exec:manual" ] \
+  && ok "decisão de custo (business decision) → exec:manual (wa-yma9)" || bad "decisão de custo → expected exec:manual"
+# CONSERVATIVE: an ordinary task that merely mentions 'design' (not design-first) stays auto.
+[ "$(context_check_exec_class "refatorar o design system" "ajustar os tokens de cor do design system e rodar os testes")" = "exec:auto" ] \
+  && ok "ordinary 'design system' code task → exec:auto (no over-tag on bare 'design')" || bad "design system task → expected exec:auto"
 # 10d — DEFAULT exec:auto: code/script/verification/data/API/email tasks a crew can do.
 [ "$(context_check_exec_class "inbound_generator: gerar leads" "rodar o script que gera inbound a partir da base, --apply")" = "exec:auto" ] \
   && ok "inbound_generator script task → exec:auto" || bad "inbound_generator → expected exec:auto"
