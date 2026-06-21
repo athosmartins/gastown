@@ -295,9 +295,10 @@ PILOT_OWNERSHIP_GUARD="${PILOT_OWNERSHIP_GUARD:-1}"
 # IDENTICAL filter chain (_filter_candidates incl. the empty-veto, _filter_unblocked,
 # _filter_explicit_deps, domain-routing, lane:big, dedup). The per-bead dispatch
 # template is already type-derived (wa-tm2a) so a chore/task routes to the right
-# builder automatically. exec:manual beads are NOT excluded — they ARE dispatched;
-# the crew attempts the work and, if blocked by a physical/human action, files an
-# automation-gap follow-up bead (crew behaviour, not a Pilot-script concern).
+# builder automatically. exec:manual beads ARE excluded — they require physical
+# device or human-credential interaction that a crew cannot perform autonomously
+# (ga-mfeip AC3). exec:auto and unlabelled beads dispatch normally (conservative
+# default: missing exec: label → auto-dispatch is safe, never suppresses work).
 #
 # DEFAULT 1 (flipped from 0 — Athos directive: the autonomous system must build the
 # whole ready backlog itself, not just the funnel). Still env-gated so the Mayor can
@@ -326,6 +327,30 @@ PILOT_OWNERSHIP_GUARD="${PILOT_OWNERSHIP_GUARD:-1}"
 #      loosens nothing. A bad/empty ctx:ready query fails open to "[]" and can never
 #      break the core bug/story dispatch.
 PILOT_CTX_READY_QUERIES="${PILOT_CTX_READY_QUERIES:-1}"
+
+# ── ga-mfeip: WA-store ctx:ready dispatch ─────────────────────────────────────
+# Extends ctx:ready scanning to rig DBs (whatsapp_automation, etc.). WA-store
+# beads (wa-* prefix) live in the rig's own Dolt DB, not in HQ, so the HQ
+# ctx:ready query at Step 2a-ctx never sees them. This knob gates an ADDITIONAL
+# rig-DB scan that runs alongside the HQ scan whenever PILOT_CTX_READY_QUERIES=1.
+#
+# Dispatch path for rig-native beads: `gc sling <gascity-crew> <wa-bead>` is
+# REFUSED by the engine ("cross-store routes wedge pools — tr-6s7yx"). The
+# correct path is `bd -C <rig-db> update --assignee <crew>` to claim the bead,
+# then `gc session nudge <crew> <prompt>` to deliver the task. The crew still
+# learns of the work and marks it in-flight in the rig DB exactly as the standard
+# path does for HQ beads, using the same STORY_BEAD_CITY / pilot:* label writes.
+#
+# exec:manual beads are EXCLUDED from auto-dispatch (AC3 of ga-mfeip): a bead
+# labelled exec:manual requires human action (physical device, gov-portal CAPTCHA,
+# human credential) and must NEVER be autonomously built by a crew. The crew would
+# be dispatched with no way to complete the task. exec:auto and unlabelled beads
+# are dispatched normally (conservative default: missing label = auto is fine).
+#
+# Env-gated + fail-open: set PILOT_CTX_READY_RIG_QUERIES=0 in the launchd plist
+# to disable independently of the HQ query (useful when WA rig DB is unstable
+# without blocking HQ ctx:ready dispatch). Defaults to inherit PILOT_CTX_READY_QUERIES.
+PILOT_CTX_READY_RIG_QUERIES="${PILOT_CTX_READY_RIG_QUERIES:-$PILOT_CTX_READY_QUERIES}"
 
 # Dry-run mode: show what WOULD happen, make zero changes.
 DRY_RUN="${DRY_RUN:-0}"
@@ -567,6 +592,38 @@ rig_domain_default_builder() {
   esac
 }
 
+# ── ga-mfeip gate (e): suspended-crew exclusion ───────────────────────────────
+# A suspended crew (e.g. digo-wa) must NEVER receive a dispatch: the bead would sit
+# assigned-but-unbuilt forever (the wa-n0vv→digo phantom). The authoritative source
+# is `gc agent list` (STATUS column == "suspended"). The set is probed ONCE per
+# process and cached. Only EXPLICITLY-suspended NAMED crews are excluded — an
+# unlisted pool member (e.g. an ephemeral gastown.dog) is never in the suspended set,
+# so dog dispatch is untouched. Fail-open: if the probe yields nothing (gc absent or
+# errored), the suspended set is empty → no crew is excluded → dispatch never blocks
+# on a probe failure. PILOT_SUSPENDED_CREWS_OVERRIDE is a test seam (set it to a
+# space-list to inject a suspended roster without calling gc).
+_PILOT_SUSPENDED_CREWS=""
+_PILOT_SUSPENDED_CREWS_LOADED=0
+_pilot_suspended_crews() {
+  if [ "$_PILOT_SUSPENDED_CREWS_LOADED" != "1" ]; then
+    if [ -n "${PILOT_SUSPENDED_CREWS_OVERRIDE+x}" ]; then
+      _PILOT_SUSPENDED_CREWS="$PILOT_SUSPENDED_CREWS_OVERRIDE"
+    else
+      _PILOT_SUSPENDED_CREWS=$(gc agent list 2>/dev/null \
+        | awk '$2=="suspended"{print $1}' | tr '\n' ' ' 2>/dev/null || echo "")
+    fi
+    _PILOT_SUSPENDED_CREWS_LOADED=1
+  fi
+  printf '%s' "$_PILOT_SUSPENDED_CREWS"
+}
+# _crew_is_suspended <crew> — return 0 (true) iff the crew is in the suspended set.
+_crew_is_suspended() {
+  local crew="$1" susp
+  susp=$(_pilot_suspended_crews)
+  [ -z "$susp" ] && return 1
+  case " $susp " in *" $crew "*) return 0 ;; *) return 1 ;; esac
+}
+
 # pick_pool_builder <rig> [prefer] [exclude] — echo an idle crew from the rig's
 # pool, or nothing (and return 1) if none is eligible. Pure read of the busy/used
 # sets above; the caller records the winner via mark_pool_builder so the next
@@ -583,6 +640,7 @@ pick_pool_builder() {
   if [ -n "$prefer" ]; then
     for crew in $(rig_to_builders "$rig"); do
       [ "$crew" = "$prefer" ] || continue
+      _crew_is_suspended "$crew" && continue   # ga-mfeip gate (e): never a suspended crew
       case " $PILOT_BUSY_BUILDERS " in *" $crew "*) continue ;; esac
       case " $PILOT_USED_BUILDERS " in *" $crew "*) continue ;; esac
       echo "$crew"
@@ -591,6 +649,7 @@ pick_pool_builder() {
   fi
   # 2. Rotate across idle crew, skipping any domain-excluded member.
   for crew in $(rig_to_builders "$rig"); do
+    _crew_is_suspended "$crew" && continue   # ga-mfeip gate (e): never a suspended crew
     case " $PILOT_BUSY_BUILDERS " in *" $crew "*) continue ;; esac
     case " $PILOT_USED_BUILDERS " in *" $crew "*) continue ;; esac
     case " $exclude " in *" $crew "*) continue ;; esac
@@ -1268,8 +1327,13 @@ fi
 _ttl_recover_db() {
   local _db="$1" _now="$2" _ttl="$3"
   local _stale_json _stale_count
+  # ga-mfeip: extend TTL recovery to cover ctx:ready rig-native beads that carry
+  # pilot:dispatching but NOT story:approved (chore/task type beads). Query ALL
+  # pilot:dispatching beads unconditionally: story:approved + ctx:ready rig beads
+  # both wear pilot:dispatching, so a single query covers both. The story:approved
+  # constraint is dropped here; it was belt-and-suspenders filtering, not a
+  # correctness requirement (the label state machine is the real guard).
   _stale_json=$(bd -C "$_db" list --json --all \
-    -l "story:approved" \
     -l "pilot:dispatching" \
     2>/dev/null || echo "[]")
   _stale_count=$(echo "$_stale_json" | jq 'length' 2>/dev/null || echo "0")
@@ -1295,12 +1359,20 @@ _ttl_recover_db() {
     fi
 
     if [ -n "$_sling" ]; then
-      local _sling_status
-      # Sling task beads always live in GC_CITY (created by gc sling in HQ).
-      _sling_status=$(bd -C "$GC_CITY" show "$_sling" --json 2>/dev/null \
+      local _sling_status _sling_db
+      # ga-mfeip: for rig-native beads (pilot.sling_bead == bead id itself),
+      # the "sling task" lives in $_db, not in GC_CITY. Detect self-referential
+      # sling (rig-native dispatch) and look in the correct DB.
+      if [ "$_sling" = "$_bid" ]; then
+        _sling_db="$_db"
+      else
+        # Standard HQ sling task beads always live in GC_CITY.
+        _sling_db="$GC_CITY"
+      fi
+      _sling_status=$(bd -C "$_sling_db" show "$_sling" --json 2>/dev/null \
         | jq -r 'if type=="array" then .[0] else . end | (.status // "")' 2>/dev/null || echo "")
       if [ -n "$_sling_status" ] && [ "$_sling_status" != "closed" ] && [ "$_sling_status" != "done" ]; then
-        warn "TTL: $_bid age=${_age}s > TTL but sling task $_sling is still '$_sling_status' — builder active, refusing to release."
+        warn "TTL: $_bid age=${_age}s > TTL but sling task $_sling is still '$_sling_status' (db=$_sling_db) — builder active, refusing to release."
         continue
       fi
     fi
@@ -1971,10 +2043,60 @@ log "Story:approved features: $TIER2_COUNT candidate(s) in HQ DB"
 # ctx:ready bead that is already in-flight, dispatched, or human-gated is skipped.
 CTXREADY_JSON="[]"
 CTXREADY_COUNT="0"
+# _filter_exec_manual — drop any bead labelled exec:manual from a JSON array.
+# exec:manual means the task requires physical device interaction, gov-portal
+# CAPTCHAs, or human credentials that a crew cannot supply autonomously (ga-mfeip
+# AC3). Crews SKIP such beads; dispatching them is wasted capacity + a stuck
+# pilot:dispatching claim. exec:auto and unlabelled beads pass through unchanged
+# (conservative default: absent exec: label → dispatch is fine, never suppress).
+# Pure read (no side effects); fail-open → pass through unchanged on jq error.
+_filter_exec_manual() {
+  jq '[ .[] | select(((.labels // []) | index("exec:manual")) == null) ]' \
+    2>/dev/null || cat
+}
+# _filter_dispatch_gates — ga-mfeip dispatch quality gates (a)+(b)+(c). Drop ctx:ready
+# candidates that are not safely auto-buildable by a crew:
+#   (a) BLOCKED / TERMINAL STATUS. A bead whose `status` FIELD is "blocked" (a crew or
+#       triage gated it — e.g. design-first awaiting Athos: wa-tozk F11, wa-1my1 F2) or
+#       "closed" must NEVER dispatch. `bd list -l ctx:ready` does NOT filter the status
+#       field (only labels), so a status=blocked bead leaks past the label exclusions —
+#       this jq check is the belt+suspenders that makes a crew/triage lock HOLD.
+#       ALSO drops beads whose title/description carries a "design-first" marker (a
+#       deliberate "spec needs Athos's approval before coding" gate: wa-1my1, wa-tozk) —
+#       narrow literal phrase, not ambiguous-noun matching, so ~zero false positives.
+#   (b) NO ACTIONABLE SPEC. A refined story carries story.criterios; a context-ready
+#       task carries its spec in the description. A bead with empty story.criterios
+#       AND a description below the spec floor (PILOT_CTX_MIN_SPEC_CHARS, default 20)
+#       is "not refined → can't build" (the wa-tozk empty-AC regression). The floor is
+#       deliberately low: real WA tasks run 180–2200 chars, so only one-liner/stub
+#       beads are dropped; it never false-drops a genuine task. Raise it in the plist
+#       to enforce a stricter spec minimum.
+#   (c) AN UNSATISFIED PRECONDITION LABEL. A `blocked-on:*` or `depends-on:*` label is
+#       a free-text precondition the bd dep-graph can't see (e.g. blocked-on:ata-dedicada,
+#       depends-on:contact-sync). Such a bead is not ready regardless of ctx:ready.
+# Pure read, no side effects; fail-open → pass through unchanged on any jq error.
+_filter_dispatch_gates() {
+  jq --argjson floor "${PILOT_CTX_MIN_SPEC_CHARS:-20}" '[ .[] | select(
+      (((.status) // "open") as $s | ($s != "blocked" and $s != "closed"))
+      and ( (((.metadata["story.criterios"]) // "") | test("\\S"))
+        or (((.description) // "") | length) >= $floor )
+      and (((.labels // []) | map(select(test("^(blocked-on|depends-on):"))) | length) == 0)
+      and ((((.title) // "") + " " + ((.description) // "")) | ascii_downcase | test("design[ -]?first") | not)
+    )]' 2>/dev/null || cat
+}
 if [ "$PILOT_CTX_READY_QUERIES" = "1" ]; then
   CTXREADY_RAW=$(bd -C "$GC_CITY" list --json \
     -l "ctx:ready" \
     --exclude-label "ctx:thin" \
+    --exclude-label "exec:manual" \
+    --exclude-label "story:blocked" \
+    --exclude-label "type:future" \
+    --exclude-label "needs-human" \
+    --exclude-label "needs-human-decision" \
+    --exclude-label "cost-decision" \
+    --exclude-label "prod-experiment" \
+    --exclude-label "ban-risk" \
+    --exclude-label "phone-proxy" \
     --exclude-label "story:approved" \
     --exclude-label "story:unrefined" \
     --exclude-label "story:refinement-in-progress" \
@@ -2001,21 +2123,94 @@ if [ "$PILOT_CTX_READY_QUERIES" = "1" ]; then
             or (((.labels // []) | index("tech-debt")) != null)
         ) ]' 2>/dev/null || echo "[]")
   # SAME filter chain as Tier-1/Tier-2 (empty-veto, lifecycle blocklist, epic guard,
-  # self-exclusion, unresolved deps, explicit deps).
-  CTXREADY_JSON=$(echo "$CTXREADY_JSON" | _filter_candidates)
+  # self-exclusion, unresolved deps, explicit deps). exec:manual safety belt applied
+  # even though the query already excludes that label (defense-in-depth, fail-open).
+  CTXREADY_JSON=$(echo "$CTXREADY_JSON" | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates)
   CTXREADY_JSON=$(echo "$CTXREADY_JSON" | _filter_unblocked "$GC_CITY")
   CTXREADY_JSON=$(echo "$CTXREADY_JSON" | _filter_explicit_deps "$GC_CITY")
   CTXREADY_COUNT=$(echo "$CTXREADY_JSON" | jq 'length' 2>/dev/null || echo "0")
   log "ctx:ready chore/task/debt: $CTXREADY_COUNT candidate(s) in HQ DB (PILOT_CTX_READY_QUERIES=1)."
 fi
 
+# ── Step 2b-ctx-rig: ctx:ready scan for rig DBs (ga-mfeip) ───────────────────
+# The HQ ctx:ready query above NEVER sees rig-native beads (wa-*, ps-* etc.)
+# because those live in each rig's own Dolt DB, not in HQ. This step runs the
+# IDENTICAL ctx:ready query against every non-HQ rig DB, merging results into
+# CTXREADY_JSON alongside the HQ candidates.
+#
+# Dispatch path for rig-native beads is different: `gc sling <crew> <wa-bead>`
+# is REFUSED by the engine ("cross-store routes wedge pools — tr-6s7yx"). The
+# dispatch_one function detects STORY_BEAD_CITY != GC_CITY and uses the
+# rig-native path: `bd -C <rig-db> update --assignee <crew>` + crew nudge.
+#
+# Gated independently via PILOT_CTX_READY_RIG_QUERIES (defaults to inheriting
+# PILOT_CTX_READY_QUERIES). Set to 0 in the plist to disable rig scanning
+# without affecting HQ ctx:ready dispatch. Fail-open: any rig-DB error → skip
+# that rig, never break the sweep. exec:manual beads are excluded (GA-MFEIP AC3).
+CTXREADY_RIG_JSON="[]"
+CTXREADY_RIG_COUNT="0"
+if [ "$PILOT_CTX_READY_RIG_QUERIES" = "1" ]; then
+  _rig_ctx_paths=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
+    | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
+  while IFS= read -r _rig_ctx_path; do
+    [ -z "$_rig_ctx_path" ] || [ ! -d "$_rig_ctx_path" ] && continue
+    _rig_ctx_raw=$(bd -C "$_rig_ctx_path" list --json \
+      -l "ctx:ready" \
+      --exclude-label "ctx:thin" \
+      --exclude-label "exec:manual" \
+      --exclude-label "story:blocked" \
+      --exclude-label "type:future" \
+      --exclude-label "needs-human" \
+      --exclude-label "needs-human-decision" \
+      --exclude-label "cost-decision" \
+      --exclude-label "prod-experiment" \
+      --exclude-label "ban-risk" \
+      --exclude-label "phone-proxy" \
+      --exclude-label "story:approved" \
+      --exclude-label "story:unrefined" \
+      --exclude-label "story:refinement-in-progress" \
+      --exclude-label "story:triage" \
+      --exclude-label "story:in-flight" \
+      --exclude-label "story:done" \
+      --exclude-label "story:cancelled" \
+      --exclude-label "gate:passed" \
+      --exclude-label "pilot:dispatching" \
+      --exclude-label "gate:needs-human" \
+      --exclude-label "needs:engine-window" \
+      --exclude-label "pilot:dispatched" \
+      --exclude-type epic \
+      -n 0 \
+      2>/dev/null || echo "[]")
+    # Same type restriction: chore/task/debt only (not features, not bugs).
+    _rig_ctx_typed=$(echo "$_rig_ctx_raw" | jq '
+        [ .[] | select(
+            ((.issue_type // .type // "") | ascii_downcase) as $t
+            | ($t == "chore" or $t == "task" or $t == "debt" or $t == "tech-debt")
+              or (((.labels // []) | index("tech-debt")) != null)
+          ) ]' 2>/dev/null || echo "[]")
+    # Same filter chain + exec:manual safety belt + ga-mfeip dispatch quality gates.
+    _rig_ctx_typed=$(echo "$_rig_ctx_typed" | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates)
+    _rig_ctx_typed=$(echo "$_rig_ctx_typed" | _filter_unblocked "$_rig_ctx_path")
+    _rig_ctx_typed=$(echo "$_rig_ctx_typed" | _filter_explicit_deps "$_rig_ctx_path")
+    _rig_ctx_n=$(echo "$_rig_ctx_typed" | jq 'length' 2>/dev/null || echo "0")
+    if [ "${_rig_ctx_n:-0}" -gt 0 ] 2>/dev/null; then
+      log "ctx:ready rig DB $_rig_ctx_path: $_rig_ctx_n candidate(s) (ga-mfeip, PILOT_CTX_READY_RIG_QUERIES=1)."
+      CTXREADY_RIG_JSON=$(echo "$CTXREADY_RIG_JSON $_rig_ctx_typed" \
+        | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "$CTXREADY_RIG_JSON")
+    fi
+  done <<< "$_rig_ctx_paths"
+  CTXREADY_RIG_COUNT=$(echo "$CTXREADY_RIG_JSON" | jq 'length' 2>/dev/null || echo "0")
+  [ "${CTXREADY_RIG_COUNT:-0}" -gt 0 ] 2>/dev/null \
+    && log "ctx:ready rig candidates total: $CTXREADY_RIG_COUNT (across all rig DBs, ga-mfeip)."
+fi
+
 # Merge all pools into ONE candidate stream (wa-tm2a). dedup by id keeps a bead
 # that somehow matched more than one query from being double-counted. The merge is
 # the UNION — eligibility prefilters were applied identically to each pool above, so
 # concatenation preserves them; only the ordering (Step 3, _top_candidate) now
-# decides who goes first. CTXREADY_JSON is "[]" unless PILOT_CTX_READY_QUERIES=1, so
-# at the default this is byte-equivalent to the prior 2-pool union.
-ALL_CANDIDATES_JSON=$(echo "$TIER1_JSON $TIER2_JSON $CTXREADY_JSON" \
+# decides who goes first. CTXREADY_JSON is "[]" unless PILOT_CTX_READY_QUERIES=1,
+# CTXREADY_RIG_JSON is "[]" unless PILOT_CTX_READY_RIG_QUERIES=1 (ga-mfeip).
+ALL_CANDIDATES_JSON=$(echo "$TIER1_JSON $TIER2_JSON $CTXREADY_JSON $CTXREADY_RIG_JSON" \
   | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
 HQ_MERGED_COUNT=$(echo "$ALL_CANDIDATES_JSON" | jq 'length' 2>/dev/null || echo "0")
 if [ "$HQ_MERGED_COUNT" -gt "0" ]; then
@@ -2026,8 +2221,9 @@ if [ "$HQ_MERGED_COUNT" -gt "0" ]; then
   else
     ALL_CANDIDATES_TIER="feature"
   fi
-  if [ "$CTXREADY_COUNT" -gt "0" ] 2>/dev/null; then
-    log "Merged candidate pool: $HQ_MERGED_COUNT (bugs/debt + stories + ${CTXREADY_COUNT} ctx:ready chore/task, priority-ordered)."
+  _ctx_total=$(( ${CTXREADY_COUNT:-0} + ${CTXREADY_RIG_COUNT:-0} )) || _ctx_total=0
+  if [ "${_ctx_total:-0}" -gt 0 ] 2>/dev/null; then
+    log "Merged candidate pool: $HQ_MERGED_COUNT (bugs/debt + stories + ${_ctx_total} ctx:ready chore/task [HQ=${CTXREADY_COUNT} rig=${CTXREADY_RIG_COUNT}], priority-ordered)."
   else
     log "Merged candidate pool: $HQ_MERGED_COUNT (bugs/debt + stories, priority-ordered)."
   fi
@@ -2750,7 +2946,15 @@ TASK
     esac
   fi
 
-  # ── Dispatch via gc sling ────────────────────────────────────────────────────
+  # ── ga-mfeip: rig-native vs cross-store dispatch path selector ────────────────
+  # When STORY_BEAD_CITY != GC_CITY (a rig-native bead, e.g. wa-*), `gc sling
+  # <crew> <bead>` is REFUSED by the engine ("cross-store routes wedge pools —
+  # tr-6s7yx"). Use the rig-native path instead: `bd update --assignee` + nudge.
+  # When STORY_BEAD_CITY == GC_CITY (HQ bead), use the standard gc sling path.
+  local _IS_RIG_NATIVE=0
+  [ "$STORY_BEAD_CITY" != "$GC_CITY" ] && _IS_RIG_NATIVE=1
+
+  # ── Dispatch via gc sling (HQ beads) or bd assign (rig-native beads) ─────────
   local DISPATCH_EPOCH DISPATCH_RESULT SLING_BEAD_ID NOW
   DISPATCH_EPOCH=$(date +%s)
   NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -2758,8 +2962,11 @@ TASK
   if [ "$DRY_RUN" = "1" ]; then
     local SLING_TITLE_DRY
     SLING_TITLE_DRY="$([ "$DISPATCH_TIER" = "bug" ] && echo "fix bug" || echo "build story") $STORY_ID: $STORY_TITLE"
-    log "DRY_RUN=1 — WOULD DISPATCH (tier=$DISPATCH_TIER lane=$LANE):"
-    if [ "$_DISPATCH_REUSE" = "1" ]; then
+    log "DRY_RUN=1 — WOULD DISPATCH (tier=$DISPATCH_TIER lane=$LANE rig_native=$_IS_RIG_NATIVE):"
+    if [ "$_IS_RIG_NATIVE" = "1" ]; then
+      log "  RIG-NATIVE path (ga-mfeip): bd -C $STORY_BEAD_CITY update $STORY_ID --assignee $BUILDER_TARGET"
+      log "  WOULD: gc --city $GC_CITY session nudge $BUILDER_TARGET <task_prompt>"
+    elif [ "$_DISPATCH_REUSE" = "1" ]; then
       [ "$_DISPATCH_SESS_STATE" = "asleep" ] \
         && log "  WOULD: gc session wake $_DISPATCH_SESS_REF (reuse existing asleep session — gt-4st3n)"
       log "  gc --city $GC_CITY sling $BUILDER_TARGET <task_bead>   (reuse: routes to existing $_DISPATCH_SESS_STATE session, no spawn)"
@@ -2776,6 +2983,45 @@ TASK
     log "  WOULD: bd comment $STORY_ID 'Pilot dispatched builder $BUILDER_TARGET at $NOW'"
     SLING_BEAD_ID="DRY_RUN_NO_SLING"
     DISPATCH_RESULT="dry_run"
+  elif [ "$_IS_RIG_NATIVE" = "1" ]; then
+    # ── ga-mfeip: rig-native dispatch path — bd assign + nudge ─────────────────
+    # The bead lives in the rig's own Dolt DB. Cross-store sling is refused, so
+    # we assign the bead directly in the rig DB and nudge the crew. The bead ID
+    # itself acts as the task hook (no separate sling task created). pilot.sling_bead
+    # is set to STORY_ID so TTL recovery can track builder activity via assignee.
+    log "  RIG-NATIVE dispatch (ga-mfeip): assigning $STORY_ID → $BUILDER_TARGET in $STORY_BEAD_CITY"
+    # ── ga-mfeip gate (f): dedup — never put two crews on one bead ─────────────
+    # The candidate snapshot was taken at the top of the sweep; a sibling claim may have
+    # assigned this bead since. Re-read its CURRENT assignee straight from the rig DB.
+    # A DIFFERENT crew already owns it ⇒ abort and release our claim (the wa-6m6h
+    # two-crew regression). null/own assignee ⇒ proceed. Fail-open: a failed re-read
+    # yields empty → we proceed (never block a dispatch on a probe error).
+    _cur_asg=$(timeout 10 bd -C "$STORY_BEAD_CITY" show "$STORY_ID" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
+    if [ -n "$_cur_asg" ] && [ "$_cur_asg" != "$BUILDER_TARGET" ]; then
+      warn "ga-mfeip gate-f: $STORY_ID already assigned to $_cur_asg — skipping dispatch to $BUILDER_TARGET (dedup)."
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+      DISPATCH_RESULT="rig_dedup_skip"
+      return 1
+    fi
+    if ! timeout 15 bd -C "$STORY_BEAD_CITY" update "$STORY_ID" \
+        --assignee "$BUILDER_TARGET" -q 2>/dev/null; then
+      warn "ga-mfeip: bd update --assignee failed for $STORY_ID → $BUILDER_TARGET. Releasing claim."
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+      DISPATCH_RESULT="rig_assign_failed"
+      return 1
+    fi
+    # Record the rig bead itself as the "sling bead" for TTL compatibility.
+    bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "pilot.sling_bead=$STORY_ID" -q 2>/dev/null || true
+    SLING_BEAD_ID="$STORY_ID"
+    DISPATCH_RESULT="rig_native_ok"
+    log "  ga-mfeip: rig assign OK — $STORY_ID.assignee=$BUILDER_TARGET. Nudging crew."
+    timeout 15 gc --city "$GC_CITY" session nudge "$BUILDER_TARGET" "$DISPATCH_TASK" \
+      2>/dev/null \
+      || warn "ga-mfeip: Could not nudge $BUILDER_TARGET — crew will see $STORY_ID on next hook cycle"
+    log "Dispatch complete (rig-native): bead=$STORY_ID target=$BUILDER_TARGET (ga-mfeip)"
   else
     local SLING_TITLE SLING_OUT
     if [ "$DISPATCH_TIER" = "bug" ]; then

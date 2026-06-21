@@ -89,7 +89,11 @@ mkdir -p "$STATE" 2>/dev/null || true
 after() { local want="$1" prev=""; for a in $args; do [ "$prev" = "$want" ] && { echo "$a"; return; }; prev="$a"; done; }
 
 case "$args" in
-  *blocked*)
+  *" blocked"*)
+    # The `bd blocked` SUBCOMMAND (space-prefixed token), NOT the `--exclude-label
+    # story:blocked` flag that the ctx:ready candidate queries now pass (ga-mfeip
+    # gate-a). `story:blocked` is colon-prefixed, so `* blocked*` never matches it —
+    # the query falls through to the `-l ctx:ready` case below as intended.
     ids="${FAKE_BLOCKED_IDS:-}"
     if [ -z "$ids" ]; then printf '[]'; exit 0; fi
     out="["; first=1
@@ -151,16 +155,22 @@ case "$args" in
     esac ;;
   *"-l ctx:ready"*)
     # ctx:ready chore/task/debt candidate query (PILOT_CTX_READY_QUERIES). MUST be
-    # matched BEFORE the *story:approved*pilot:dispatching* stale-claim pattern
-    # below: the ctx:ready query EXCLUDES both of those labels (--exclude-label
-    # story:approved … --exclude-label pilot:dispatching), so argv contains both
-    # substrings and would otherwise be swallowed by that earlier case. Its `-l
-    # ctx:ready` head token is unique to this query. Returns the injected fixture so
-    # a scenario can prove ctx:ready beads ARE sourced as candidates (and that
+    # matched BEFORE the *pilot:dispatching* stale-claim pattern below: the
+    # ctx:ready query EXCLUDES both --exclude-label story:approved AND
+    # --exclude-label pilot:dispatching, so argv contains both substrings and
+    # would otherwise be swallowed by the stale-claim case. Its `-l ctx:ready`
+    # head token is unique to this query. Returns the injected fixture so a
+    # scenario can prove ctx:ready beads ARE sourced as candidates (and that
     # assigned/thin/braked ones are NOT). Default [] keeps every OTHER scenario
     # byte-identical to before this seam existed.
     printf '%s' "${FAKE_CTXREADY_JSON:-[]}" ;;
-  *story:approved*pilot:dispatching*)
+  *--all*-l*pilot:dispatching*)
+    # ga-mfeip: TTL recovery query — `bd list --all -l pilot:dispatching`. Changed
+    # from the old `*story:approved*pilot:dispatching*` pattern: the TTL query no
+    # longer filters on story:approved so it also covers rig-native ctx:ready beads
+    # (chore/task) that carry pilot:dispatching but NOT story:approved. Must be
+    # matched BEFORE the generic *--all* in-flight count branch below (which would
+    # otherwise swallow it). This case continues to return FAKE_STALE_JSON.
     printf '%s' "${FAKE_STALE_JSON:-[]}" ;;   # Step-0 stale-claim query
   *"-l story:in-flight -l pilot:dispatched"*)
     # ga-v3z4z: Step-0c never-started detector query. Distinct from the slot query
@@ -1912,6 +1922,215 @@ for excl in "story:in-flight" "story:done" "gate:passed" "pilot:dispatching" \
     bad "ctx:ready query is MISSING the $excl exclusion"
   fi
 done
+
+# ── Scenario 21 (ga-mfeip: exec:manual exclusion + rig-native ctx:ready dispatch)
+# ga-mfeip AC3: exec:manual beads must NOT be auto-dispatched — they require
+# physical-device / gov-portal / human-credential interaction that a crew cannot
+# perform. exec:auto and unlabelled beads dispatch normally.
+# ga-mfeip: rig-native dispatch (cross-store sling refused) goes through
+# `bd update --assignee` + nudge path, gated by PILOT_CTX_READY_RIG_QUERIES.
+
+# ── Scenario 21a: exec:manual ctx:ready beads are NOT dispatched ─────────────
+echo "Scenario 21a: exec:manual ctx:ready bead is EXCLUDED from auto-dispatch (ga-mfeip AC3)"
+CTX_MANUAL='[
+  {"id":"tt-ctx-manual","title":"exec:manual task fixture","priority":0,"issue_type":"task","description":"fixture body — requires physical device","status":"open","labels":["ctx:ready","exec:manual"],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}},
+  {"id":"tt-ctx-auto","title":"exec:auto task fixture","priority":1,"issue_type":"task","description":"fixture body — fully automatable","status":"open","labels":["ctx:ready","exec:auto"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}
+]'
+LOG21A="$(run_ctxready "$CTX_MANUAL" "[]")"
+if echo "$LOG21A" | grep -q "Lane picks — small: tt-ctx-manual"; then
+  bad "REGRESSION: dispatched an exec:manual ctx:ready bead (ga-mfeip AC3 violation)"
+else
+  ok "exec:manual ctx:ready bead was NOT dispatched (ga-mfeip AC3 preserved)"
+fi
+if echo "$LOG21A" | grep -q "Lane picks — small: tt-ctx-auto"; then
+  ok "exec:auto ctx:ready bead WAS dispatched (only manual is excluded)"
+else
+  bad "exec:auto bead was NOT dispatched — over-filtered or no candidate sourced"
+fi
+
+# ── Scenario 21b: unlabelled (no exec:) ctx:ready bead IS dispatched ─────────
+echo "Scenario 21b: ctx:ready bead with NO exec: label dispatches normally (conservative default)"
+CTX_NOLABEL='[
+  {"id":"tt-ctx-nolabel","title":"no-exec-label ctx:ready task","priority":0,"issue_type":"task","description":"fixture body — no exec label","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}
+]'
+LOG21B="$(run_ctxready "$CTX_NOLABEL" "[]")"
+if echo "$LOG21B" | grep -q "Lane picks — small: tt-ctx-nolabel"; then
+  ok "ctx:ready task with no exec: label IS dispatched (conservative default: auto-OK)"
+else
+  bad "ctx:ready task with no exec: label was NOT dispatched — over-filter regression"
+fi
+
+# ── Scenario 21c: structural — exec:manual is excluded at query + filter level ─
+echo "Scenario 21c: structural — exec:manual exclusion wired at query AND filter level"
+# Query-level: the bd list command must pass --exclude-label exec:manual.
+# grep -E treats leading '--' as options; anchor the search on exclude-label.
+has "$DISPATCHER" 'exclude-label "exec:manual"' \
+  "ctx:ready query excludes exec:manual at the bd list query level"
+# Filter-level: _filter_exec_manual function is defined (defense-in-depth safety belt).
+has "$DISPATCHER" '_filter_exec_manual()' \
+  "_filter_exec_manual function defined (defense-in-depth exec:manual filter)"
+# Applied in the HQ ctx:ready chain.
+has "$DISPATCHER" '_filter_exec_manual | _filter_candidates' \
+  "exec:manual filter applied in HQ ctx:ready filter chain"
+
+# ── Scenario 21d: structural — rig-native ctx:ready dispatch path wired ────────
+echo "Scenario 21d: structural — rig-native dispatch path and env gate are wired (ga-mfeip)"
+has "$DISPATCHER" 'PILOT_CTX_READY_RIG_QUERIES' \
+  "PILOT_CTX_READY_RIG_QUERIES env gate defined (ga-mfeip)"
+has "$DISPATCHER" 'CTXREADY_RIG_JSON' \
+  "CTXREADY_RIG_JSON variable wired (rig ctx:ready pool)"
+has "$DISPATCHER" '_IS_RIG_NATIVE' \
+  "rig-native dispatch selector _IS_RIG_NATIVE defined in dispatch_one"
+has "$DISPATCHER" 'rig_assign_failed' \
+  "rig-native assign-failure result code present"
+has "$DISPATCHER" 'rig_native_ok' \
+  "rig-native success result code present"
+# Verify the sling bead self-reference for TTL compatibility.
+has "$DISPATCHER" 'pilot.sling_bead=\$STORY_ID' \
+  "rig-native dispatch sets pilot.sling_bead=STORY_ID for TTL compatibility"
+
+# ── Scenario 21e: structural — TTL recovery extended to cover rig ctx:ready ────
+echo "Scenario 21e: structural — TTL recovery covers rig ctx:ready beads (no story:approved filter)"
+# The TTL query must NOT require story:approved so it catches chore/task rig beads.
+_ttl_block=$(awk '/Helper: scan one DB for stale pilot:dispatching/{f=1} f{print} /^}$/{if(f)exit}' "$DISPATCHER")
+if echo "$_ttl_block" | grep -q '"story:approved"'; then
+  bad "REGRESSION: TTL recovery still requires story:approved — rig ctx:ready beads won't be cleaned up"
+else
+  ok "TTL recovery does NOT require story:approved — covers rig ctx:ready beads (ga-mfeip)"
+fi
+# TTL must handle self-referential sling_bead (rig-native: _sling == _bid).
+has "$DISPATCHER" '_sling_db.*_db' \
+  "TTL recovery routes sling-status lookup to rig DB for rig-native beads"
+
+# ── Scenario 22 (ga-mfeip DISPATCH QUALITY GATES a–f) ─────────────────────────
+# The six gates required before re-enabling rig ctx:ready dispatch (Mayor escalation
+# 2026-06-20). A ctx:ready bead must be SKIPPED (not autonomous-built) when it is:
+#   (a) blocked / needs-human;  (b) un-spec'd (empty AC + thin desc);
+#   (c) carrying a blocked-on:/depends-on: precondition label;  (d) on an unmet dep;
+#   (e) about to be assigned to a SUSPENDED crew (digo-wa);  (f) already owned (dedup).
+# (d) is already covered by Scenarios using _filter_unblocked/_filter_explicit_deps.
+
+# ── Scenario 22a: gate (b) — a thin, un-spec'd ctx:ready bead is NOT dispatched ─
+echo "Scenario 22a: gate (b) — un-spec'd ctx:ready bead (empty AC + thin desc) is NOT dispatched"
+CTX_THIN='[
+  {"id":"tt-thin","title":"stub","priority":0,"issue_type":"task","description":"todo","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}},
+  {"id":"tt-spec","title":"specced task","priority":1,"issue_type":"task","description":"fixture body — a properly specified task with enough context for a crew to build it","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}
+]'
+LOG22A="$(run_ctxready "$CTX_THIN" "[]")"
+if echo "$LOG22A" | grep -q "Lane picks — small: tt-thin"; then
+  bad "REGRESSION: dispatched a thin/un-spec'd ctx:ready bead (gate (b) violation)"
+else
+  ok "thin/un-spec'd ctx:ready bead was NOT dispatched (gate (b))"
+fi
+if echo "$LOG22A" | grep -q "Lane picks — small: tt-spec"; then
+  ok "the well-specified ctx:ready bead WAS dispatched (only the stub is dropped)"
+else
+  bad "the well-specified bead was NOT dispatched — gate (b) over-filtered"
+fi
+
+# ── Scenario 22b: gate (c) — a blocked-on:/depends-on: labelled bead is excluded ─
+echo "Scenario 22b: gate (c) — ctx:ready bead with a blocked-on: precondition label is NOT dispatched"
+CTX_BLKLABEL='[
+  {"id":"tt-blklabel","title":"has precondition","priority":0,"issue_type":"task","description":"fixture body — carries an unsatisfied precondition label that bd cannot see","status":"open","labels":["ctx:ready","blocked-on:ata-dedicada"],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}},
+  {"id":"tt-noblk","title":"no precondition","priority":1,"issue_type":"task","description":"fixture body — a clean task with no precondition labels whatsoever here","status":"open","labels":["ctx:ready"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}
+]'
+LOG22B="$(run_ctxready "$CTX_BLKLABEL" "[]")"
+if echo "$LOG22B" | grep -q "Lane picks — small: tt-blklabel"; then
+  bad "REGRESSION: dispatched a blocked-on:-labelled ctx:ready bead (gate (c) violation)"
+else
+  ok "blocked-on:-labelled ctx:ready bead was NOT dispatched (gate (c))"
+fi
+if echo "$LOG22B" | grep -q "Lane picks — small: tt-noblk"; then
+  ok "the clean ctx:ready bead WAS dispatched (only the precondition-labelled one is dropped)"
+else
+  bad "the clean bead was NOT dispatched — gate (c) over-filtered"
+fi
+
+# ── Scenario 22b2: gate (a) — a status=blocked bead is NOT dispatched (status FIELD) ─
+# wa-tozk/wa-1my1 regression: a crew/triage gates a design-first bead by setting its
+# status FIELD to "blocked". `bd list -l ctx:ready` does NOT filter the status field, so
+# it leaks past the label exclusions; _filter_dispatch_gates must drop it.
+echo "Scenario 22b2: gate (a) — a status=blocked ctx:ready bead is NOT dispatched (status FIELD leak)"
+CTX_BLOCKED_STATUS='[
+  {"id":"tt-blocked-status","title":"design-first locked","priority":0,"issue_type":"task","description":"fixture body — design-first, locked by a crew pending Athos approval (wa-tozk class)","status":"blocked","labels":["ctx:ready","exec:auto"],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}},
+  {"id":"tt-open-ok","title":"open buildable","priority":1,"issue_type":"task","description":"fixture body — a normal open task with enough context to build right here","status":"open","labels":["ctx:ready","exec:auto"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}
+]'
+LOG22B2="$(run_ctxready "$CTX_BLOCKED_STATUS" "[]")"
+if echo "$LOG22B2" | grep -q "Lane picks — small: tt-blocked-status"; then
+  bad "REGRESSION: dispatched a status=blocked ctx:ready bead (gate (a) violation — wa-tozk/wa-1my1 class)"
+else
+  ok "status=blocked ctx:ready bead was NOT dispatched (gate (a) — crew/triage lock holds)"
+fi
+if echo "$LOG22B2" | grep -q "Lane picks — small: tt-open-ok"; then
+  ok "the status=open bead WAS dispatched (only the blocked-status one is gated)"
+else
+  bad "the status=open bead was NOT dispatched — gate (a) status-check over-filtered"
+fi
+has "$DISPATCHER" '!= "blocked" and ' "gate (a) status=blocked/closed exclusion wired in _filter_dispatch_gates"
+
+# ── Scenario 22b3: gate (a) — a "design-first" bead is NOT dispatched (needs approval) ─
+echo "Scenario 22b3: gate (a) — a design-first ctx:ready bead is NOT dispatched (spec needs Athos approval)"
+CTX_DESIGNFIRST='[
+  {"id":"tt-designfirst","title":"F2 inbound on-device v2","priority":0,"issue_type":"task","description":"DESIGN-FIRST: spec aprovado por Athos antes de codar. Acceptance criteria a definir.","status":"open","labels":["ctx:ready","exec:auto"],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}},
+  {"id":"tt-buildable","title":"normal task","priority":1,"issue_type":"task","description":"fixture body — a normal open task with enough context to build right here now","status":"open","labels":["ctx:ready","exec:auto"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}
+]'
+LOG22B3="$(run_ctxready "$CTX_DESIGNFIRST" "[]")"
+if echo "$LOG22B3" | grep -q "Lane picks — small: tt-designfirst"; then
+  bad "REGRESSION: dispatched a design-first ctx:ready bead (gate (a) violation — wa-1my1 class)"
+else
+  ok "design-first ctx:ready bead was NOT dispatched (gate (a) — needs Athos design approval)"
+fi
+if echo "$LOG22B3" | grep -q "Lane picks — small: tt-buildable"; then
+  ok "the normal buildable bead WAS dispatched (only the design-first one is gated)"
+else
+  bad "the normal bead was NOT dispatched — design-first gate over-filtered"
+fi
+
+# ── Scenario 22c: gate (a) — structural — query excludes blocked/needs-human/etc ─
+echo "Scenario 22c: gate (a) — ctx:ready query excludes blocked / needs-human / future markers"
+has "$DISPATCHER" 'exclude-label "story:blocked"'        "query excludes story:blocked (gate a)"
+has "$DISPATCHER" 'exclude-label "needs-human"'          "query excludes needs-human (gate a)"
+has "$DISPATCHER" 'exclude-label "needs-human-decision"' "query excludes needs-human-decision (gate a)"
+has "$DISPATCHER" 'exclude-label "type:future"'          "query excludes type:future (gate c)"
+has "$DISPATCHER" 'exclude-label "cost-decision"'        "query excludes cost-decision (gate c)"
+has "$DISPATCHER" 'exclude-label "phone-proxy"'          "query excludes phone-proxy (gate c — digo's ban-sensitive operational domain)"
+
+# ── Scenario 22d: gates (b)+(c) — structural — filter defined and wired both chains
+echo "Scenario 22d: gates (b)+(c) — _filter_dispatch_gates defined and applied in HQ + rig chains"
+has "$DISPATCHER" '_filter_dispatch_gates()' "_filter_dispatch_gates function defined"
+has "$DISPATCHER" '_filter_candidates | _filter_dispatch_gates' "dispatch gates applied after _filter_candidates"
+has "$DISPATCHER" 'PILOT_CTX_MIN_SPEC_CHARS' "spec-floor knob (gate b) is wired and tunable"
+
+# ── Scenario 22e: gate (e) — suspended crews are excluded (unit + structural) ───
+echo "Scenario 22e: gate (e) — _crew_is_suspended excludes a suspended crew, keeps an active one"
+# Behavioral unit test: extract the two real helper fns and exercise them through the
+# PILOT_SUSPENDED_CREWS_OVERRIDE seam (no gc dependency). Proves the membership logic.
+_SUSP_FNS="$(awk '/_PILOT_SUSPENDED_CREWS=""/{p=1} p{print} /_crew_is_suspended\(\)/{c=1} c&&/^}$/{exit}' "$DISPATCHER")"
+SUSP_RESULT="$(
+  eval "$_SUSP_FNS"
+  export PILOT_SUSPENDED_CREWS_OVERRIDE="digo-wa gastown.boot"
+  if _crew_is_suspended digo-wa; then printf 'digo=excluded '; else printf 'digo=KEPT '; fi
+  if _crew_is_suspended thies-wa; then printf 'thies=EXCLUDED'; else printf 'thies=active'; fi
+)"
+if [ "$SUSP_RESULT" = "digo=excluded thies=active" ]; then
+  ok "gate (e): suspended digo-wa excluded, active thies-wa kept (real helper logic)"
+else
+  bad "gate (e): _crew_is_suspended logic wrong (got: '$SUSP_RESULT')"
+fi
+has "$DISPATCHER" '_crew_is_suspended()'                 "_crew_is_suspended gate (e) helper defined"
+has "$DISPATCHER" '_crew_is_suspended "\$crew" && continue' "suspended-crew skip wired into pick_pool_builder"
+
+# ── Scenario 22f: gate (f) — rig-native dedup re-check before assign (structural) ─
+echo "Scenario 22f: gate (f) — rig-native dispatch re-checks the live assignee before assigning (dedup)"
+has "$DISPATCHER" 'rig_dedup_skip'  "gate (f) dedup-skip result code present"
+# The dedup re-reads the CURRENT assignee from the rig DB right before assigning.
+_dedup_block="$(awk '/RIG-NATIVE dispatch \(ga-mfeip\)/{f=1} f{print} /rig_native_ok/{if(f)exit}' "$DISPATCHER")"
+if printf '%s' "$_dedup_block" | grep -q 'bd -C "\$STORY_BEAD_CITY" show "\$STORY_ID"' \
+   && printf '%s' "$_dedup_block" | grep -q '_cur_asg.*!=.*BUILDER_TARGET'; then
+  ok "gate (f): fresh assignee re-read + mismatch-skip wired before the rig-native assign"
+else
+  bad "gate (f): dedup re-check missing from the rig-native dispatch path"
+fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
