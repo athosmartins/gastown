@@ -35,21 +35,32 @@ _open() {   # store id
   [ "$LCJ_DRY_RUN" = "1" ] && { log "  DRY: would set $2 status=open"; return 0; }
   "$BD" -C "$1" update "$2" --status open -q >/dev/null 2>&1 || true
 }
+_add() {    # store id label
+  [ "$LCJ_DRY_RUN" = "1" ] && { log "  DRY: would add $3 to $2"; return 0; }
+  "$BD" -C "$1" label add "$2" "$3" -q >/dev/null 2>&1 || true
+}
 _ids() {    # store + list-args → bead ids (one per line), jq-filtered
   "$BD" -C "$1" "${@:2}" --json -n 0 2>/dev/null | jq -r "$JQ" 2>/dev/null
 }
 
 run_sweep() {
   if [ "$LCJ_ENABLED" != "1" ]; then log "disabled (LCJ_ENABLED!=1)"; return 0; fi
-  local store id n=0 JQ='.[].id'
+  local store id n=0 lbl
   for store in $LCJ_STORES; do
     [ -d "$store" ] || continue
 
-    # R1: terminal status carrying story:in-flight → strip the vestigial execution label.
-    for id in $(JQ='.[].id'; "$BD" -C "$store" list -l story:in-flight --status closed --json -n 0 2>/dev/null | jq -r '.[].id' 2>/dev/null); do
-      [ -n "$id" ] || continue
-      _strip "$store" "$id" story:in-flight; _strip "$store" "$id" pilot:dispatched
-      log "R1 closed-vestigial: $id ($(basename "$store")) — stripped story:in-flight"; n=$((n+1))
+    # R1: terminal status carrying an ACTIVE lifecycle label (story:in-flight OR story:approved)
+    # → strip it + transition to story:done. The close path skipped the lifecycle update, so a
+    # DONE/implemented bead lingered in the painel's Em-Execução / Aprovadas columns (Athos:
+    # "várias coisas em aprovados que já foram implementadas"). A bead explicitly marked
+    # story:cancelled is left cancelled (never re-labelled done).
+    for lbl in story:in-flight story:approved; do
+      for id in $("$BD" -C "$store" list -l "$lbl" --status closed --json -n 0 2>/dev/null \
+                  | jq -r '.[] | select(([.labels[]?]|index("story:cancelled"))|not) | .id' 2>/dev/null); do
+        [ -n "$id" ] || continue
+        _strip "$store" "$id" "$lbl"; _strip "$store" "$id" pilot:dispatched; _add "$store" "$id" story:done
+        log "R1 closed-vestigial: $id ($(basename "$store")) — stripped $lbl, set story:done"; n=$((n+1))
+      done
     done
 
     # R2: blocked status carrying story:in-flight → strip (blocked ≠ executing). Keep blocked.
@@ -81,9 +92,10 @@ if [ "${1:-}" = "--selftest" ]; then
 a="\$*"
 case "\$a" in
   *"list -l story:in-flight --status closed"*)  echo '[{"id":"cl-1"},{"id":"cl-2"}]' ;;
+  *"list -l story:approved --status closed"*)   echo '[{"id":"ca-1"},{"id":"ca-cancel","labels":["story:cancelled","story:approved"]}]' ;;
   *"list -l story:in-flight --status blocked"*) echo '[{"id":"bl-1"}]' ;;
   *"list --status in_progress"*)                echo '[{"id":"ip-noasg","assignee":""},{"id":"ip-asg","assignee":"mila-wa"}]' ;;
-  *"label remove"*|*"update"*)                  echo "\$a" >> "$ACT" ;;
+  *"label remove"*|*"label add"*|*"update"*)    echo "\$a" >> "$ACT" ;;
   *) echo '[]' ;;
 esac
 SHIM
@@ -93,6 +105,9 @@ SHIM
   run_sweep
   echo "Scenario: janitor normalizes the 3 incoherences, never touches coherent beads"
   grep -q 'label remove cl-1 story:in-flight' "$ACT" && ok "R1: closed+story:in-flight → stripped"            || bad "R1 not stripped"
+  grep -q 'label add cl-1 story:done'         "$ACT" && ok "R1: closed bead transitioned to story:done"       || bad "R1 did not set story:done"
+  grep -q 'label remove ca-1 story:approved'  "$ACT" && ok "R1: closed+story:approved → stripped (Aprovadas pollution fix)" || bad "R1 approved-vestigial not stripped"
+  grep -q 'ca-cancel'                         "$ACT" && bad "TOUCHED a story:cancelled closed bead (must stay cancelled)" || ok "left the story:cancelled closed bead alone"
   grep -q 'label remove bl-1 story:in-flight' "$ACT" && ok "R2: blocked+story:in-flight → stripped"           || bad "R2 not stripped"
   grep -q 'update ip-noasg --status open'     "$ACT" && ok "R3: in_progress + no assignee → status=open"      || bad "R3 not opened"
   grep -q 'ip-asg'                            "$ACT" && bad "TOUCHED an in_progress bead WITH an assignee (unsafe!)" || ok "left the assigned in_progress bead alone (safe)"
