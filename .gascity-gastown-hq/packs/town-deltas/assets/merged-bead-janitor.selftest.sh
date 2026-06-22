@@ -190,8 +190,15 @@ grep -q 'label remove "$BID" "story:in-flight"' "$JANITOR" && ok "drops story:in
 grep -q 'JANITOR_DRY_RUN' "$JANITOR"             && ok "dry-run supported"                       || bad "dry-run support missing"
 grep -q 'gate-status:passed' "$JANITOR" && grep -q 'gate-status:superseded' "$JANITOR" \
   && ok "terminal signal checks passed+superseded" || bad "terminal marker labels missing"
-# Cross-store: own-rig repo scan falls back to HQ repo (mirror case).
-grep -q 'scan_commit_for_bead "$HQ_GITDIR"' "$JANITOR" && ok "cross-store HQ-repo mirror scan wired" || bad "HQ-repo mirror scan missing"
+# Cross-store: own-rig repo scan falls back to HQ repo (mirror case) using strict subject scan.
+grep -q 'scan_commit_subject_for_bead "$HQ_GITDIR"' "$JANITOR" && ok "cross-store HQ-repo mirror scan wired (strict)" || bad "HQ-repo mirror scan missing or not strict"
+# The in_progress sweep MUST use the strict subject scanner (not the body scanner) for
+# signal A — guards against the wa-oxkg false-positive class: an unrelated commit that
+# merely MENTIONS a bead id in its body (incident description, cross-ref) must NOT close
+# that bead. Only a conventional-commit scoped as feat(<id>)/fix(<id>)/etc. in the SUBJECT
+# qualifies as delivery evidence.
+grep -q 'scan_commit_subject_for_bead "\$RGITDIR" "\$RCONTAINER" "origin/\$RDEFAULT" "\$BID"' "$JANITOR" \
+  && ok "in_progress sweep uses strict subject scan for BID" || bad "in_progress sweep not using strict scanner for BID"
 # set -e/pipefail safety: no `set -e` (sweep tolerates per-bead failures) but
 # the close path guards its mutation with `|| { err ...; continue; }`.
 grep -q 'close failed for' "$JANITOR" && ok "close failure is non-fatal (continue)" || bad "close failure not guarded"
@@ -200,7 +207,8 @@ grep -q 'janitor_story_decide()' "$JANITOR" && ok "defines janitor_story_decide"
 grep -q 'scan_commit_subject_for_bead()' "$JANITOR" && ok "defines strict subject scanner" || bad "missing scan_commit_subject_for_bead def"
 # The story sweep MUST use the strict subject scanner (not the body scanner) for
 # signal A — guards against the ga-r471/wa-qggy incidental-body-mention class.
-grep -q 'scan_commit_subject_for_bead "\$RGITDIR"' "$JANITOR" && ok "story sweep uses strict subject scan" || bad "story sweep not using strict scanner"
+grep -q 'scan_commit_subject_for_bead "\$RGITDIR" "\$RCONTAINER" "origin/\$RDEFAULT" "\$SID"' "$JANITOR" \
+  && ok "story sweep uses strict subject scan for SID" || bad "story sweep not using strict scanner"
 grep -q 'label add "\$SID" "story:done"' "$JANITOR" && ok "story sweep sets story:done" || bad "story:done transition missing"
 grep -q 'already-story-done' "$JANITOR"          && ok "story idempotency guard present" || bad "story already-done guard missing"
 grep -q 'delivery-owns-it' "$JANITOR"            && ok "delivery-active guard present"   || bad "delivery guard missing"
@@ -213,6 +221,67 @@ grep -q 'list --status open --all --json -l story:approved' "$JANITOR" \
 grep -q 'com.gascity.merged-bead-janitor' "$PLIST" && ok "plist Label correct"        || bad "plist Label wrong"
 grep -q '<key>StartInterval</key>' "$PLIST"        && ok "plist uses StartInterval"    || bad "plist missing StartInterval"
 grep -q '<key>RunAtLoad</key><true/>' "$PLIST"     && ok "plist RunAtLoad=true"        || bad "plist missing RunAtLoad"
+
+# ── 7. Signal A tightening: body-only mention must NOT close; scoped subject MUST ──
+# Regression scenario for the wa-oxkg false-positive (2026-06-22):
+#   commit 2adc87e3f had subject fix(pilot): … and mentioned "wa-oxkg" only in the
+#   BODY (incident description). The original scan_commit_for_bead (body-wide) matched
+#   it and falsely closed wa-oxkg. The fix: Signal A now uses scan_commit_subject_for_bead
+#   which requires the bead id to be the conventional-commit SCOPE in the SUBJECT line.
+echo "── 7. Signal A tightening: body-mention → KEEP; subject-scoped → CLOSE ──"
+# Build a fresh repo with two commits that model the wa-oxkg incident:
+#   C_INCIDENT: unrelated fix, body MENTIONS the bead id — must NOT trigger close.
+#   C_DELIVERY: scoped feat(<id>): …  — MUST trigger close.
+T7="$(mktemp -d 2>/dev/null || mktemp -d -t janitor-t7)"
+trap 'rm -rf "$T7" 2>/dev/null || true; rm -rf "$T" 2>/dev/null || true' EXIT
+R7="$T7/repo7"
+git init -q -b main "$R7"
+# Baseline commit.
+( cd "$R7" && echo base > base.txt && git add base.txt && git commit -q -m "base commit" )
+# Incident commit: subject is about pilot, body mentions tt-oxkg as context only.
+# This models fix(pilot): … whose body says "a tt-oxkg dispatch surfaced mid-conversation".
+( cd "$R7" && echo pilot > pilot.txt && git add pilot.txt && \
+  git commit -q -m "fix(pilot): never dispatch into a human-attached crew" \
+               -m "TWO dispatch-protection fixes from an incident where a tt-oxkg dispatch surfaced mid-conversation in peter-wa's session while Athos was working WITH peter." )
+INCIDENT_SHA=$(git -C "$R7" rev-parse HEAD)
+# Delivery commit: subject IS scoped to tt-oxkg — this is the genuine delivery.
+( cd "$R7" && echo delivery > delivery.txt && git add delivery.txt && \
+  git commit -q -m "feat(tt-oxkg): implement whatsapp automation component" )
+DELIVERY_SHA=$(git -C "$R7" rev-parse HEAD)
+
+# Assertion A: strict subject scan must NOT match the incident commit for tt-oxkg
+#   (id appears only in body — unrelated commit). This is the wa-oxkg false-positive class.
+rc1 scan_commit_subject_for_bead "$R7" 0 "$INCIDENT_SHA" "tt-oxkg"   # body-only — must NOT close
+
+# Assertion B: strict subject scan MUST match the delivery commit for tt-oxkg
+#   (id is the conventional-commit scope in the subject line — genuine delivery).
+rc0 scan_commit_subject_for_bead "$R7" 0 "main" "tt-oxkg"   # subject-scoped — MUST close
+GOTT=$(scan_commit_subject_for_bead "$R7" 0 "main" "tt-oxkg" 2>/dev/null || true)
+WANT_SHA=$(git -C "$R7" rev-parse --short=9 "$DELIVERY_SHA")
+if [ "${GOTT:0:9}" = "$WANT_SHA" ]; then
+  ok "strict scan returns DELIVERY sha for tt-oxkg (${GOTT:0:9}), not incident sha"
+else
+  bad "strict scan returned wrong sha for tt-oxkg: got [${GOTT:0:9}], want [$WANT_SHA]"
+fi
+
+# Assertion C: the LOOSE body scan WOULD match (shows why strict is needed and
+#   why the old code was broken — this assertion validates the test setup).
+rc0 scan_commit_for_bead "$R7" 0 "main" "tt-oxkg"   # body scan finds incident mention (loose)
+
+# Assertion D: a different bead id mentioned only in the incident commit body is
+#   also rejected by the strict scan (cross-contamination guard).
+( cd "$R7" && echo extra > extra.txt && git add extra.txt && \
+  git commit -q -m "chore(housekeeping): tidy up" \
+               -m "see also: tt-other bead that was incidentally referenced here" )
+rc1 scan_commit_subject_for_bead "$R7" 0 "main" "tt-other"   # body-only in chore body → keep
+
+# Assertion E: signal C (branch ancestor) still works alongside the tightened signal A —
+#   a crew/<rig>/<id> branch that is merged qualifies via branch_merged independent of
+#   whether any commit subject is scoped to the bead. This ensures the tightened signal A
+#   does not blind us to real merges that lack a scoped-subject commit.
+git -C "$R7" checkout -q -b "crew/mila/tt-oxkg" HEAD~2   # points at base+incident (pre-delivery)
+git -C "$R7" checkout -q main
+rc0 branch_merged "$R7" 0 "crew/mila/tt-oxkg" "main"   # crew branch IS ancestor of main → signal C fires
 
 echo ""
 echo "──────────────────────────────────────────"

@@ -22,8 +22,15 @@
 #
 # FIX — a periodic per-rig-store janitor. For every in_progress bead it asks
 # "is this bead's work in origin/main?" via THREE independent signals (OR):
-#   (A) COMMIT  — the bead id appears (token-bounded) in an origin/main commit
-#                 message of the bead's own rig repo OR the HQ repo (mirror).
+#   (A) COMMIT  — the bead id appears as the conventional-commit SCOPE in the
+#                 SUBJECT line of an origin/main commit in the bead's own rig
+#                 repo OR the HQ repo (mirror): `feat(<id>):` / `fix(<id>):` /
+#                 etc. Body-only mentions of an id in an unrelated commit are
+#                 REJECTED — they are incident reports, not deliveries. Uses
+#                 scan_commit_subject_for_bead (same strict fn as the story
+#                 sweep). False-negative (real merge missed this sweep) is far
+#                 safer than a false-positive (unbuilt work silently closed);
+#                 signal C (crew/*/<id> branch-ancestor) is the reliable catch-up.
 #   (B) MARKER  — the bead has a CLOSED gate marker (source-bead:<id>) whose
 #                 terminal label is gate-status:passed or gate-status:superseded.
 #   (C) BRANCH  — the bead's branch (from a marker's branch:<…> label, or the
@@ -162,6 +169,40 @@ janitor_story_decide() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
+# PURE DECISION FUNCTION #3 — convoy/coordination wrapper reconciliation.
+#
+# WHY a THIRD sweep: the Pilot/gate create CONVOY wrapper beads (issue_type:convoy,
+# "build story X" / "fix bug X" slings) and the engine deacon creates dc-*
+# coordination beads ("Merge failed", "Rebase required") per failed merge. NO
+# daemon ever closes them when the underlying work completes. Audit: ~700 open
+# junk beads; 100% of still-open convoy wrappers DEPEND ON a bead that is already
+# CLOSED (work done, wrapper orphaned). The Pilot also re-slings the same target
+# every sweep, multiplying them.
+#
+# SAFETY — dependency-closure ONLY, NO commit-matching. Sibling bug ga-92o95
+# proved commit-matching false-closes (a docs commit body-mentioned an unrelated
+# in-flight bead). This sweep is evidence-free of "merged": it asserts ONLY "this
+# wrapper's tracked work is done" by reading the wrapper's OWN dependency list and
+# checking that EVERY DEPENDS-ON target is CLOSED. That dodges the commit-mismatch
+# hazard entirely. A wrapper with ≥1 dependency, all of them CLOSED → orphaned →
+# close. ANY open dep, OR no deps at all, OR an unreadable dep list → KEEP.
+#
+# janitor_convoy_decide <dep_count> <open_dep_count> <deps_readable>
+#   dep_count       — total DEPENDS-ON targets (integer ≥0)
+#   open_dep_count  — how many of those are NOT closed (integer ≥0)
+#   deps_readable   — 0|1; 0 when the wrapper's show JSON could not be parsed
+# Echoes "<verdict>:<reason>", verdict ∈ {close,keep}. KEEP-biased: every
+# uncertain or work-still-pending condition resolves to keep (zero false-close).
+# ═════════════════════════════════════════════════════════════════════════════
+janitor_convoy_decide() {
+  local dep_count="$1" open_dep_count="$2" deps_readable="$3"
+  if [ "$deps_readable" != "1" ];        then echo "keep:deps-unreadable"; return 0; fi
+  if [ "$dep_count" -lt 1 ] 2>/dev/null; then echo "keep:no-dependencies"; return 0; fi
+  if [ "$open_dep_count" -gt 0 ] 2>/dev/null; then echo "keep:dependency-still-open"; return 0; fi
+  echo "close:all-dependencies-closed"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
 # GIT HELPERS — match the dispatcher's container/self-repo handling exactly.
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -288,6 +329,26 @@ branch_label_from_markers() {
     | awk 'NF && !seen[$0]++' || true
 }
 
+# convoy_dep_counts <show_json> — parse a `bd show <id> --json` blob and echo a
+# single line "<dep_count> <open_dep_count> <deps_readable>" for the convoy
+# reconciler (PURE: jq-only, no live store, so the selftest can exercise it on
+# synthetic fixtures).
+#   • `bd show` may return an object OR a 1-element array → normalize both.
+#   • dependency list lives in `.dependencies[]`; each entry's `.status` field is
+#     the DEPENDS-ON target's status. A dep is CLOSED iff `.status == "closed"`;
+#     anything else (open/in_progress/null/missing) counts as OPEN (KEEP-biased).
+#   • If jq cannot parse the blob (bd emits unescaped control chars in some
+#     descriptions — observed live), echo "0 0 0" so the decider KEEPS the bead.
+convoy_dep_counts() {
+  local out
+  out=$(printf '%s' "$1" | jq -r '
+      (if type=="array" then .[0] else . end) as $b
+      | ($b.dependencies // []) as $d
+      | "\($d | length) \([$d[] | select((.status // "") != "closed")] | length) 1"
+    ' 2>/dev/null) || out=""
+  if [ -z "$out" ]; then echo "0 0 0"; else echo "$out"; fi
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Guard: when sourced for tests, stop here (no live sweep).
 # ═════════════════════════════════════════════════════════════════════════════
@@ -320,8 +381,11 @@ fetch_once "$HQ_GITDIR" "$HQ_CONTAINER"
 CLOSED_COUNT=0
 SIBLING_ADVISORIES=0
 DONE_COUNT=0   # ga-gosfs: stories reconciled story:approved → story:done
+CONVOY_COUNT=0 # convoy-reconciler: orphaned wrapper/coordination beads closed
+CONVOY_MAX_PER_SWEEP="${CONVOY_MAX_PER_SWEEP:-60}" # anti-Dolt-spike: cap REAL closes/sweep; the ~480 backlog drains over a few 15min sweeps instead of 480 commits at once
 declare -a CLOSED_SUMMARY=()
 declare -a DONE_SUMMARY=()
+declare -a CONVOY_SUMMARY=()
 
 # Iterate every rig store.
 RIG_ROWS=$(printf '%s' "$RIG_LIST_JSON" | jq -rc '.rigs[]? | {name,prefix,path,default_branch:(.default_branch // "main"),hq:(.hq // false)}' 2>/dev/null || true)
@@ -347,8 +411,13 @@ while IFS= read -r rig; do
   [ -z "$INPROG" ] && INPROG='[]'
   N=$(printf '%s' "$INPROG" | jq 'length' 2>/dev/null || echo 0)
   log "rig $RNAME ($RPREFIX): $N in_progress bead(s) [store=$RPATH git=$RGITDIR default=$RDEFAULT]"
-  [ "$N" = "0" ] && continue
 
+  # NOTE (convoy-reconciler): the in_progress pass below is now GUARDED rather
+  # than `continue`-ing the whole rig on N==0 — the original early-continue also
+  # skipped the story:done (ga-gosfs) AND this convoy sweep for any rig with no
+  # in_progress beads (e.g. gascity routinely has 0). Only the in_progress body
+  # is conditional; the story + convoy sweeps always run for every rig.
+  if [ "$N" != "0" ]; then
   while IFS= read -r b; do
     [ -z "$b" ] && continue
     BID=$(printf '%s' "$b" | jq -r '.id' 2>/dev/null || true)
@@ -363,12 +432,16 @@ while IFS= read -r rig; do
     HAS_OPEN=0; has_open_marker "$MK" && HAS_OPEN=1
     SIG_MARKER=0; has_terminal_passed_marker "$MK" && SIG_MARKER=1
 
-    # Signal A — commit message in own-rig repo OR HQ repo (mirror).
+    # Signal A — commit SUBJECT-scoped to this bead id in own-rig repo OR HQ repo (mirror).
+    # Uses the STRICT subject scanner (same as the story sweep): only a conventional-commit
+    # whose SCOPE is this bead id (feat(<id>)/fix(<id>)/etc.) counts as delivery evidence.
+    # Body-only mentions — incident descriptions, cross-references, "wa-oxkg dispatch
+    # surfaced mid-conversation" — are REJECTED. See scan_commit_subject_for_bead.
     SIG_COMMIT=0; COMMIT_EVID=""
     if [ "$IS_EPIC" = "0" ] && [ "$HAS_OPEN" = "0" ]; then
-      if sha=$(scan_commit_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$BID"); then
+      if sha=$(scan_commit_subject_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$BID"); then
         SIG_COMMIT=1; COMMIT_EVID="$RNAME origin/$RDEFAULT@${sha:0:9}"
-      elif [ "$RGITDIR" != "$HQ_GITDIR" ] && sha=$(scan_commit_for_bead "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$BID"); then
+      elif [ "$RGITDIR" != "$HQ_GITDIR" ] && sha=$(scan_commit_subject_for_bead "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$BID"); then
         SIG_COMMIT=1; COMMIT_EVID="hq origin/$HQ_DEFAULT@${sha:0:9}"
       fi
     fi
@@ -426,6 +499,7 @@ EOF
   done <<EOF
 $(printf '%s' "$INPROG" | jq -rc '.[]?')
 EOF
+  fi  # end in_progress pass guard (N != 0)
 
   # ── ga-gosfs: story:done reconciliation sweep ───────────────────────────────
   # OPEN story:approved beads (distinct from the in_progress sweep above). After a
@@ -523,11 +597,69 @@ EOF
   done <<EOF
 $(printf '%s' "$STORIES" | jq -rc '.[]?')
 EOF
+
+  # ── convoy-reconciler: orphaned wrapper / coordination bead sweep ───────────
+  # Closes Pilot/gate CONVOY wrapper beads (issue_type:convoy, "build story X" /
+  # "fix bug X" slings) and engine-deacon dc-* coordination beads ("Merge failed",
+  # "Rebase required") whose tracked work is DONE — proven PURELY by dependency
+  # closure (NO commit-matching; see janitor_convoy_decide + ga-92o95). A wrapper
+  # with ≥1 dependency where EVERY DEPENDS-ON target is CLOSED is orphaned → close.
+  # No deps / any open dep / unreadable deps → KEEP. dc-* beads live in the HQ
+  # store but accrue per-rig too, so this runs in every rig store like the sweeps
+  # above. Idempotent; DRY_RUN-aware.
+  CONVOYS=$(bd -C "$RPATH" list --status open --all --limit 0 --json 2>/dev/null \
+              | jq -c '[.[]? | select((.issue_type // .type // "") == "convoy" or ((.id // "") | startswith("dc-")))]' 2>/dev/null || echo '[]')
+  [ -z "$CONVOYS" ] && CONVOYS='[]'
+  CN=$(printf '%s' "$CONVOYS" | jq 'length' 2>/dev/null || echo 0)
+  [ "$CN" = "0" ] || log "rig $RNAME ($RPREFIX): $CN open convoy/coordination wrapper(s) to check for orphan reconciliation"
+
+  while IFS= read -r c; do
+    [ -z "$c" ] && continue
+    CID=$(printf '%s' "$c" | jq -r '.id' 2>/dev/null || true)
+    [ -z "$CID" ] && continue
+    # anti-Dolt-spike cap: stop CLOSING once the per-sweep limit is hit (real runs
+    # only — dry-run stays unbounded for auditing). Remaining orphans drain next sweep.
+    if [ "$DRY_RUN" != "1" ] && [ "$CONVOY_COUNT" -ge "$CONVOY_MAX_PER_SWEEP" ]; then
+      log "convoy-reconciler: per-sweep cap $CONVOY_MAX_PER_SWEEP reached — deferring remaining orphans to next sweep (anti-Dolt-spike)"
+      break
+    fi
+    CTITLE=$(printf '%s' "$c" | jq -r '(.title // "")[0:60]' 2>/dev/null || true)
+
+    # Read the wrapper's OWN dependency list (the only signal — no commit scan).
+    CSHOW=$(bd -C "$RPATH" show "$CID" --json 2>/dev/null || true)
+    read -r C_DEPN C_OPENN C_READABLE <<<"$(convoy_dep_counts "$CSHOW")"
+
+    C_VERDICT_LINE=$(janitor_convoy_decide "$C_DEPN" "$C_OPENN" "$C_READABLE")
+    C_VERDICT="${C_VERDICT_LINE%%:*}"; C_REASON="${C_VERDICT_LINE#*:}"
+
+    if [ "$C_VERDICT" = "close" ]; then
+      C_EVID="$C_REASON [deps=$C_DEPN open=$C_OPENN]"
+      if [ "$DRY_RUN" = "1" ]; then
+        log "WOULD-CLOSE-CONVOY $CID ($RNAME) — $C_EVID — \"$CTITLE\""
+      else
+        C_REASON_MSG="reaped: convoy/coordination wrapper orphaned — all dependencies closed (merged-bead-janitor convoy-reconciler)"
+        # First try a clean close; if blocked (e.g. an already-closed/obsolete
+        # dependency makes bd refuse), retry once with --force.
+        if bd -C "$RPATH" close "$CID" -r "$C_REASON_MSG" 2>/dev/null \
+           || bd -C "$RPATH" close "$CID" --force -r "$C_REASON_MSG" 2>/dev/null; then
+          log "CLOSED-CONVOY $CID ($RNAME) — $C_EVID"
+          CONVOY_COUNT=$((CONVOY_COUNT+1))
+          CONVOY_SUMMARY+=("$CID ($RNAME): $C_EVID")
+        else
+          err "convoy close failed for $CID ($RNAME)"; continue
+        fi
+      fi
+    else
+      log "keep-convoy $CID ($RNAME) — $C_REASON"
+    fi
+  done <<EOF
+$(printf '%s' "$CONVOYS" | jq -rc '.[]?')
+EOF
 done <<EOF
 $RIG_ROWS
 EOF
 
-log "=== merged-bead-janitor sweep complete — closed=$CLOSED_COUNT story_done=$DONE_COUNT advisories=$SIBLING_ADVISORIES dry_run=$DRY_RUN ==="
+log "=== merged-bead-janitor sweep complete — closed=$CLOSED_COUNT story_done=$DONE_COUNT convoy_reaped=$CONVOY_COUNT advisories=$SIBLING_ADVISORIES dry_run=$DRY_RUN ==="
 if [ "$DRY_RUN" = "0" ]; then
   if [ "$CLOSED_COUNT" -gt 0 ]; then
     SUMMARY=$(printf '%s; ' "${CLOSED_SUMMARY[@]}")
@@ -536,6 +668,13 @@ if [ "$DRY_RUN" = "0" ]; then
   if [ "$DONE_COUNT" -gt 0 ]; then
     DSUMMARY=$(printf '%s; ' "${DONE_SUMMARY[@]}")
     notify_athos -t "Kanban janitor" "Reconciled $DONE_COUNT merged story/stories → story:done: $DSUMMARY"
+  fi
+  if [ "$CONVOY_COUNT" -gt 0 ]; then
+    # The first sweep may reap hundreds of orphaned wrappers — cap the message to
+    # a count + a short sample so the notification stays readable.
+    CSAMPLE=$(printf '%s; ' "${CONVOY_SUMMARY[@]:0:8}")
+    [ "$CONVOY_COUNT" -gt 8 ] && CSAMPLE="$CSAMPLE…(+$((CONVOY_COUNT-8)) more)"
+    notify_athos -t "Kanban janitor" "Reaped $CONVOY_COUNT orphaned convoy/coordination wrapper(s) (all deps closed): $CSAMPLE"
   fi
 fi
 exit 0
