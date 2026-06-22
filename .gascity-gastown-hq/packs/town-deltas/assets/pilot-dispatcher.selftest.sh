@@ -253,6 +253,12 @@ JSON
 ]
 JSON
     fi ;;
+  *"-l story:approved"*)
+    # HQ story:approved TIER2 candidate query. FAKE_TIER2_JSON lets scenarios
+    # inject specific approved-feature fixtures to exercise _filter_dispatch_gates
+    # on the HQ TIER2 path (ga-25-hq-tier2-gates). Default [] keeps every other
+    # scenario byte-identical to before this seam existed.
+    printf '%s' "${FAKE_TIER2_JSON:-[]}" ;;
   *)
     printf '[]' ;;                            # tech-debt, tier-2 features, etc.
 esac
@@ -2452,6 +2458,78 @@ if awk '/PILOT_WA_RIG_TIER2_OVERRIDE\+x/,/PILOT_WA_RIG_APPROVED_QUERIES/' "$DISP
   ok "Override test seam also applies _filter_exec_manual (hermetic tests exercise the gate)"
 else
   bad "Override test seam does NOT apply _filter_exec_manual — filter tests are hollow"
+fi
+
+# ── Scenario 25: HQ TIER2 story:approved path now applies the full gate chain ─
+# Before this fix, the HQ TIER2 path (Step 2b) used only _filter_candidates +
+# _filter_unblocked + _filter_explicit_deps — no _filter_exec_manual,
+# _filter_dispatch_gates, or _filter_built. An empty-spec approved feature with
+# no story.criterios and a stub description would be dispatched to a crew that
+# has no context to build it. The fix applies the IDENTICAL gate chain as the
+# WA rig tier-2 and ctx:ready paths.
+# Test seam: FAKE_TIER2_JSON — injected into the fake bd's `-l story:approved`
+# branch. Companion seam FAKE_BUGS_JSON="[]" empties TIER1 so the TIER2
+# candidate is the sole dispatch candidate (no bug outranks it).
+echo "Scenario 25: HQ TIER2 story:approved path applies full gate chain (_filter_dispatch_gates)"
+
+# runner: inject a TIER2 fixture and collect the dispatch log.
+#   $1 = FAKE_TIER2_JSON  (JSON array of HQ approved features)
+run_hq_tier2() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE=10 \
+    DISPATCH_TO_CAPACITY=1 \
+    FAKE_TIER2_JSON="${1:-[]}" \
+    FAKE_BUGS_JSON="[]" \
+    FAKE_BLOCKED_IDS="" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# ── Scenario 25a: empty-spec HQ approved feature is EXCLUDED (gate b) ────────
+echo "Scenario 25a: empty-spec HQ approved feature is EXCLUDED by gate (b)"
+HQ_EMPTYSPEC_FX='[{"id":"tt-hq-empty","title":"Empty-spec HQ approved feature","priority":2,"issue_type":"feature","description":"stub","status":"open","labels":["story:approved"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]'
+LOG25A="$(run_hq_tier2 "$HQ_EMPTYSPEC_FX")"
+if echo "$LOG25A" | grep -q "Lane picks.*tt-hq-empty\|dispatched.*tt-hq-empty"; then
+  bad "REGRESSION: empty-spec HQ approved feature (tt-hq-empty) dispatched — gate (b) not applied to HQ TIER2"
+else
+  ok "empty-spec HQ approved feature (tt-hq-empty) NOT dispatched (gate b enforced on HQ TIER2)"
+fi
+
+# ── Scenario 25b: exec:manual HQ approved feature is EXCLUDED ────────────────
+echo "Scenario 25b: exec:manual HQ approved feature is EXCLUDED from HQ TIER2"
+HQ_EXECMANUAL_FX='[{"id":"tt-hq-manual","title":"Manual HQ feature requiring gov portal login","priority":1,"issue_type":"feature","description":"Submit e-SIC request on Fala.BR using Athos credentials — requires human login to the portal","status":"open","labels":["story:approved","exec:manual"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]'
+LOG25B="$(run_hq_tier2 "$HQ_EXECMANUAL_FX")"
+if echo "$LOG25B" | grep -q "Lane picks.*tt-hq-manual\|dispatched.*tt-hq-manual"; then
+  bad "REGRESSION: exec:manual HQ approved feature (tt-hq-manual) dispatched — _filter_exec_manual not applied to HQ TIER2"
+else
+  ok "exec:manual HQ approved feature (tt-hq-manual) NOT dispatched (exec:manual gate applied to HQ TIER2)"
+fi
+
+# ── Scenario 25c: well-specified HQ approved feature IS dispatched ────────────
+echo "Scenario 25c: well-specified HQ approved feature IS dispatched (no false-drop regression)"
+HQ_GOODSPEC_FX='[{"id":"tt-hq-good","title":"Pipedrive: incluir demais imóveis do proprietário ao enviar deal","priority":2,"issue_type":"feature","description":"Ao enviar um deal ao Pipedrive o payload inclui os demais imóveis vinculados ao mesmo CPF/CNPJ do proprietário — consulta na base consolidada e monta o campo imoveis_vinculados no corpo do request","status":"open","labels":["story:approved"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{"story.criterios":"CPF/CNPJ do proprietário buscado na base; lista de imóveis montada; deal criado com imoveis_vinculados preenchido"}}]'
+LOG25C="$(run_hq_tier2 "$HQ_GOODSPEC_FX")"
+if echo "$LOG25C" | grep -q "Lane picks.*tt-hq-good\|dispatched.*tt-hq-good\|small.*tt-hq-good\|big.*tt-hq-good"; then
+  ok "Well-specified HQ approved feature (tt-hq-good) dispatched — no false-drop on HQ TIER2"
+else
+  bad "Well-specified HQ approved feature (tt-hq-good) NOT dispatched — false-drop regression on HQ TIER2"
+fi
+
+# ── Scenario 25d: structural — TIER2 now applies the full gate chain ──────────
+echo "Scenario 25d: structural — HQ TIER2 filter chain now includes _filter_exec_manual + _filter_dispatch_gates + _filter_built"
+if grep -qF 'TIER2_JSON=$(echo "$TIER2_JSON" | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built)' "$DISPATCHER"; then
+  ok "HQ TIER2 filter chain includes full gate set (_filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built)"
+else
+  bad "HQ TIER2 filter chain does NOT include full gate set — gate (b) regression on HQ TIER2"
 fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────

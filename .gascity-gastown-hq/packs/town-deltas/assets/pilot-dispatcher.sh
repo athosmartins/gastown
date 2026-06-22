@@ -1189,6 +1189,85 @@ _filter_explicit_deps() {
   [ -z "$filtered" ] && { printf '%s' "$arr"; return 0; }
   printf '%s' "$filtered"
 }
+# _filter_exec_manual — drop any bead labelled exec:manual from a JSON array.
+# exec:manual means the task requires physical device interaction, gov-portal
+# CAPTCHAs, or human credentials that a crew cannot supply autonomously (ga-mfeip
+# AC3). Crews SKIP such beads; dispatching them is wasted capacity + a stuck
+# pilot:dispatching claim. exec:auto and unlabelled beads pass through unchanged
+# (conservative default: absent exec: label → dispatch is fine, never suppress).
+# Pure read (no side effects); fail-open → pass through unchanged on jq error.
+_filter_exec_manual() {
+  jq '[ .[] | select(((.labels // []) | index("exec:manual")) == null) ]' \
+    2>/dev/null || cat
+}
+# _filter_dispatch_gates — ga-mfeip dispatch quality gates (a)+(b)+(c). Drop ctx:ready
+# candidates that are not safely auto-buildable by a crew:
+#   (a) BLOCKED / TERMINAL STATUS. A bead whose `status` FIELD is "blocked" (a crew or
+#       triage gated it — e.g. design-first awaiting Athos: wa-tozk F11, wa-1my1 F2) or
+#       "closed" must NEVER dispatch. `bd list -l ctx:ready` does NOT filter the status
+#       field (only labels), so a status=blocked bead leaks past the label exclusions —
+#       this jq check is the belt+suspenders that makes a crew/triage lock HOLD.
+#       ALSO drops beads whose title/description carries a "design-first" marker (a
+#       deliberate "spec needs Athos's approval before coding" gate: wa-1my1, wa-tozk) —
+#       narrow literal phrase, not ambiguous-noun matching, so ~zero false positives.
+#   (b) NO ACTIONABLE SPEC. A refined story carries story.criterios; a context-ready
+#       task carries its spec in the description. A bead with empty story.criterios
+#       AND a description below the spec floor (PILOT_CTX_MIN_SPEC_CHARS, default 20)
+#       is "not refined → can't build" (the wa-tozk empty-AC regression). The floor is
+#       deliberately low: real WA tasks run 180–2200 chars, so only one-liner/stub
+#       beads are dropped; it never false-drops a genuine task. Raise it in the plist
+#       to enforce a stricter spec minimum.
+#   (c) AN UNSATISFIED PRECONDITION LABEL. A `blocked-on:*` or `depends-on:*` label is
+#       a free-text precondition the bd dep-graph can't see (e.g. blocked-on:ata-dedicada,
+#       depends-on:contact-sync). Such a bead is not ready regardless of ctx:ready.
+# Pure read, no side effects; fail-open → pass through unchanged on any jq error.
+_filter_dispatch_gates() {
+  jq --argjson floor "${PILOT_CTX_MIN_SPEC_CHARS:-20}" '[ .[] | select(
+      (((.status) // "open") as $s | ($s != "blocked" and $s != "closed"))
+      and ( (((.metadata["story.criterios"]) // "") | test("\\S"))
+        or (((.description) // "") | length) >= $floor )
+      and (((.labels // []) | map(select(test("^(blocked-on|depends-on):"))) | length) == 0)
+      and ((((.title) // "") + " " + ((.description) // "")) | ascii_downcase | test("design[ -]?first") | not)
+    )]' 2>/dev/null || cat
+}
+# _filter_built — drop ctx:ready candidates that ALREADY have a crew branch (built work
+# awaiting gate/delivery, NOT a fresh dispatch candidate). Such a bead — if it kept or
+# re-acquired ctx:ready (lost story:in-flight, or gate-failed) — is picked first by
+# priority, REFUSED by the ownership guard (its branch exists), and HEAD-OF-LINE-BLOCKS
+# the lane every sweep (the wa-xrdv / wa-vn5o stall: dispatched=0 while fresh beads wait).
+# Self-sufficient repo list (does not need the never-started block). FAIL-OPEN to KEEP:
+# no git / no repo set / jq error → keep the candidate (never drop a real one on an
+# unresolved probe — the opposite of the reclaim-side fail-open).
+_filter_built() {
+  local repos arr id r built_ids=""
+  # Hermetic test seam: PILOT_TEST_BRANCH_BEADS lists ids treated as "built" (no git) —
+  # the same seam _beadid_has_branch uses.
+  if [ -n "${PILOT_TEST_BRANCH_BEADS+x}" ]; then
+    arr=$(cat)
+    printf '%s' "$arr" | jq --arg b "$PILOT_TEST_BRANCH_BEADS" \
+      '($b|split(" ")) as $bi | [ .[] | select((.id as $i | $bi | index($i)) | not) ]' \
+      2>/dev/null || printf '%s' "$arr"
+    return
+  fi
+  command -v git >/dev/null 2>&1 || { cat; return; }
+  repos="$(_ownership_guard_repos)"
+  [ -n "$repos" ] || { cat; return; }
+  arr=$(cat)
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    while IFS= read -r r; do
+      [ -n "$r" ] && [ -d "$r" ] || continue
+      if git -C "$r" for-each-ref --format='%(refname)' \
+           "refs/remotes/origin/crew/*/$id" "refs/heads/crew/*/$id" 2>/dev/null | grep -q .; then
+        built_ids="${built_ids:+$built_ids }$id"; break
+      fi
+    done <<< "$repos"
+  done < <(printf '%s' "$arr" | jq -r '.[]?.id // empty' 2>/dev/null)
+  [ -z "$built_ids" ] && { printf '%s' "$arr"; return; }
+  printf '%s' "$arr" | jq --arg b "$built_ids" \
+    '($b|split(" ")) as $bi | [ .[] | select((.id as $i | $bi | index($i)) | not) ]' \
+    2>/dev/null || printf '%s' "$arr"
+}
 
 # ── wa-u5r1: emit the Pilot's FULL dispatchable queue for the painel ──────────
 # Athos's requirement: the painel's "Aprovadas" column must be a FAITHFUL mirror
@@ -2227,7 +2306,7 @@ TIER2_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-TIER2_JSON=$(echo "$TIER2_JSON" | _filter_candidates)
+TIER2_JSON=$(echo "$TIER2_JSON" | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built)
 # Drop features blocked by unresolved deps (ga-5ew) or an open explicit dep (ga-do8jj).
 TIER2_JSON=$(echo "$TIER2_JSON" | _filter_unblocked "$GC_CITY")
 TIER2_JSON=$(echo "$TIER2_JSON" | _filter_explicit_deps "$GC_CITY")
@@ -2257,85 +2336,6 @@ log "Story:approved features: $TIER2_COUNT candidate(s) in HQ DB"
 # ctx:ready bead that is already in-flight, dispatched, or human-gated is skipped.
 CTXREADY_JSON="[]"
 CTXREADY_COUNT="0"
-# _filter_exec_manual — drop any bead labelled exec:manual from a JSON array.
-# exec:manual means the task requires physical device interaction, gov-portal
-# CAPTCHAs, or human credentials that a crew cannot supply autonomously (ga-mfeip
-# AC3). Crews SKIP such beads; dispatching them is wasted capacity + a stuck
-# pilot:dispatching claim. exec:auto and unlabelled beads pass through unchanged
-# (conservative default: absent exec: label → dispatch is fine, never suppress).
-# Pure read (no side effects); fail-open → pass through unchanged on jq error.
-_filter_exec_manual() {
-  jq '[ .[] | select(((.labels // []) | index("exec:manual")) == null) ]' \
-    2>/dev/null || cat
-}
-# _filter_dispatch_gates — ga-mfeip dispatch quality gates (a)+(b)+(c). Drop ctx:ready
-# candidates that are not safely auto-buildable by a crew:
-#   (a) BLOCKED / TERMINAL STATUS. A bead whose `status` FIELD is "blocked" (a crew or
-#       triage gated it — e.g. design-first awaiting Athos: wa-tozk F11, wa-1my1 F2) or
-#       "closed" must NEVER dispatch. `bd list -l ctx:ready` does NOT filter the status
-#       field (only labels), so a status=blocked bead leaks past the label exclusions —
-#       this jq check is the belt+suspenders that makes a crew/triage lock HOLD.
-#       ALSO drops beads whose title/description carries a "design-first" marker (a
-#       deliberate "spec needs Athos's approval before coding" gate: wa-1my1, wa-tozk) —
-#       narrow literal phrase, not ambiguous-noun matching, so ~zero false positives.
-#   (b) NO ACTIONABLE SPEC. A refined story carries story.criterios; a context-ready
-#       task carries its spec in the description. A bead with empty story.criterios
-#       AND a description below the spec floor (PILOT_CTX_MIN_SPEC_CHARS, default 20)
-#       is "not refined → can't build" (the wa-tozk empty-AC regression). The floor is
-#       deliberately low: real WA tasks run 180–2200 chars, so only one-liner/stub
-#       beads are dropped; it never false-drops a genuine task. Raise it in the plist
-#       to enforce a stricter spec minimum.
-#   (c) AN UNSATISFIED PRECONDITION LABEL. A `blocked-on:*` or `depends-on:*` label is
-#       a free-text precondition the bd dep-graph can't see (e.g. blocked-on:ata-dedicada,
-#       depends-on:contact-sync). Such a bead is not ready regardless of ctx:ready.
-# Pure read, no side effects; fail-open → pass through unchanged on any jq error.
-_filter_dispatch_gates() {
-  jq --argjson floor "${PILOT_CTX_MIN_SPEC_CHARS:-20}" '[ .[] | select(
-      (((.status) // "open") as $s | ($s != "blocked" and $s != "closed"))
-      and ( (((.metadata["story.criterios"]) // "") | test("\\S"))
-        or (((.description) // "") | length) >= $floor )
-      and (((.labels // []) | map(select(test("^(blocked-on|depends-on):"))) | length) == 0)
-      and ((((.title) // "") + " " + ((.description) // "")) | ascii_downcase | test("design[ -]?first") | not)
-    )]' 2>/dev/null || cat
-}
-# _filter_built — drop ctx:ready candidates that ALREADY have a crew branch (built work
-# awaiting gate/delivery, NOT a fresh dispatch candidate). Such a bead — if it kept or
-# re-acquired ctx:ready (lost story:in-flight, or gate-failed) — is picked first by
-# priority, REFUSED by the ownership guard (its branch exists), and HEAD-OF-LINE-BLOCKS
-# the lane every sweep (the wa-xrdv / wa-vn5o stall: dispatched=0 while fresh beads wait).
-# Self-sufficient repo list (does not need the never-started block). FAIL-OPEN to KEEP:
-# no git / no repo set / jq error → keep the candidate (never drop a real one on an
-# unresolved probe — the opposite of the reclaim-side fail-open).
-_filter_built() {
-  local repos arr id r built_ids=""
-  # Hermetic test seam: PILOT_TEST_BRANCH_BEADS lists ids treated as "built" (no git) —
-  # the same seam _beadid_has_branch uses.
-  if [ -n "${PILOT_TEST_BRANCH_BEADS+x}" ]; then
-    arr=$(cat)
-    printf '%s' "$arr" | jq --arg b "$PILOT_TEST_BRANCH_BEADS" \
-      '($b|split(" ")) as $bi | [ .[] | select((.id as $i | $bi | index($i)) | not) ]' \
-      2>/dev/null || printf '%s' "$arr"
-    return
-  fi
-  command -v git >/dev/null 2>&1 || { cat; return; }
-  repos="$(_ownership_guard_repos)"
-  [ -n "$repos" ] || { cat; return; }
-  arr=$(cat)
-  while IFS= read -r id; do
-    [ -z "$id" ] && continue
-    while IFS= read -r r; do
-      [ -n "$r" ] && [ -d "$r" ] || continue
-      if git -C "$r" for-each-ref --format='%(refname)' \
-           "refs/remotes/origin/crew/*/$id" "refs/heads/crew/*/$id" 2>/dev/null | grep -q .; then
-        built_ids="${built_ids:+$built_ids }$id"; break
-      fi
-    done <<< "$repos"
-  done < <(printf '%s' "$arr" | jq -r '.[]?.id // empty' 2>/dev/null)
-  [ -z "$built_ids" ] && { printf '%s' "$arr"; return; }
-  printf '%s' "$arr" | jq --arg b "$built_ids" \
-    '($b|split(" ")) as $bi | [ .[] | select((.id as $i | $bi | index($i)) | not) ]' \
-    2>/dev/null || printf '%s' "$arr"
-}
 if [ "$PILOT_CTX_READY_QUERIES" = "1" ]; then
   CTXREADY_RAW=$(bd -C "$GC_CITY" list --json \
     -l "ctx:ready" \
