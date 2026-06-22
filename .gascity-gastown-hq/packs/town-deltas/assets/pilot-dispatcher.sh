@@ -2464,13 +2464,77 @@ if [ "$PILOT_CTX_READY_RIG_QUERIES" = "1" ]; then
     && log "ctx:ready rig candidates total: $CTXREADY_RIG_COUNT (across all rig DBs, ga-mfeip)."
 fi
 
+# ── Step 2b-rig-tier2: WA rig story:approved features — UNCONDITIONAL (Bug A fix)
+# WA-native story:approved FEATURES live in rig DBs (e.g. whatsapp_automation), NOT
+# in HQ. Step 2b above queries HQ only — it never sees wa-zybp, wa-0gs8, wa-0z8e, etc.
+# The old Step 2c fallback (below) only runs when HQ returns NOTHING, so these beads
+# were invisible on every sweep where HQ had any candidates at all (which is almost
+# always). Fix: scan the same rig DBs UNCONDITIONALLY here, in the primary merge path,
+# exactly like CTXREADY_RIG_JSON does for ctx:ready tasks.
+#
+# Same PILOT_CTX_READY_RIGS scoping (default "whatsapp_automation") so the allowlist
+# controls both the ctx:ready rig scan and the story:approved rig scan — one knob.
+# Same filter chain (type/lifecycle/deps/unblocked) as the HQ TIER2_JSON query above.
+# Gated by PILOT_WA_RIG_APPROVED_QUERIES (default 1). Set to 0 in the plist to
+# disable independently (e.g. if the WA rig DB is unstable). Fail-open: any rig-DB
+# error → skip that rig, never break the sweep.
+# Test seam: PILOT_WA_RIG_TIER2_OVERRIDE — when set, bypass the gc/bd loop and use
+# this JSON directly (hermetic selftest; no real gc/bd needed).
+WA_RIG_TIER2_JSON="[]"
+WA_RIG_TIER2_COUNT="0"
+PILOT_WA_RIG_APPROVED_QUERIES="${PILOT_WA_RIG_APPROVED_QUERIES:-1}"
+if [ "$PILOT_WA_RIG_APPROVED_QUERIES" = "1" ]; then
+  if [ -n "${PILOT_WA_RIG_TIER2_OVERRIDE+x}" ]; then
+    # Hermetic test seam: use the override JSON directly (skips gc/bd, no rig loop).
+    WA_RIG_TIER2_JSON=$(echo "$PILOT_WA_RIG_TIER2_OVERRIDE" \
+      | _filter_candidates | _filter_unblocked "${GC_CITY}" | _filter_explicit_deps "${GC_CITY}")
+  else
+    _wa_rig2_rows=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
+      | jq -r '.rigs[] | select(.hq == false) | "\(.name)\t\(.path)"' 2>/dev/null || echo "")
+    while IFS=$'\t' read -r _wa_rig2_name _wa_rig2_path; do
+      [ -z "$_wa_rig2_path" ] || [ ! -d "$_wa_rig2_path" ] && continue
+      # Same scope gate as ctx:ready rig scan: only rigs in PILOT_CTX_READY_RIGS.
+      case " $PILOT_CTX_READY_RIGS " in
+        *" all "*) : ;;
+        *" $_wa_rig2_name "*) : ;;
+        *) continue ;;
+      esac
+      _wa_rig2_raw=$(bd -C "$_wa_rig2_path" list --json \
+        -l "story:approved" \
+        --exclude-label "story:in-flight" \
+        --exclude-label "story:done" \
+        --exclude-label "gate:passed" \
+        --exclude-label "pilot:dispatching" \
+        --exclude-label "gate:needs-human" \
+        --exclude-label "needs:engine-window" \
+        --exclude-label "pilot:dispatched" \
+        --exclude-type epic \
+        -n 0 \
+        2>/dev/null || echo "[]")
+      # Apply same filter chain as HQ TIER2_JSON (lifecycle/blocklist/deps).
+      _wa_rig2_filtered=$(echo "$_wa_rig2_raw" | _filter_candidates \
+        | _filter_unblocked "$_wa_rig2_path" | _filter_explicit_deps "$_wa_rig2_path")
+      _wa_rig2_n=$(echo "$_wa_rig2_filtered" | jq 'length' 2>/dev/null || echo "0")
+      if [ "${_wa_rig2_n:-0}" -gt 0 ] 2>/dev/null; then
+        log "story:approved rig DB $_wa_rig2_path: $_wa_rig2_n feature(s) (Bug A fix, WA_RIG_TIER2)."
+        WA_RIG_TIER2_JSON=$(echo "$WA_RIG_TIER2_JSON $_wa_rig2_filtered" \
+          | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "$WA_RIG_TIER2_JSON")
+      fi
+    done <<< "$_wa_rig2_rows"
+  fi
+  WA_RIG_TIER2_COUNT=$(echo "$WA_RIG_TIER2_JSON" | jq 'length' 2>/dev/null || echo "0")
+  [ "${WA_RIG_TIER2_COUNT:-0}" -gt 0 ] 2>/dev/null \
+    && log "story:approved rig features total: $WA_RIG_TIER2_COUNT (across all rig DBs, Bug A fix)."
+fi
+
 # Merge all pools into ONE candidate stream (wa-tm2a). dedup by id keeps a bead
 # that somehow matched more than one query from being double-counted. The merge is
 # the UNION — eligibility prefilters were applied identically to each pool above, so
 # concatenation preserves them; only the ordering (Step 3, _top_candidate) now
 # decides who goes first. CTXREADY_JSON is "[]" unless PILOT_CTX_READY_QUERIES=1,
 # CTXREADY_RIG_JSON is "[]" unless PILOT_CTX_READY_RIG_QUERIES=1 (ga-mfeip).
-ALL_CANDIDATES_JSON=$(echo "$TIER1_JSON $TIER2_JSON $CTXREADY_JSON $CTXREADY_RIG_JSON" \
+# WA_RIG_TIER2_JSON is "[]" unless PILOT_WA_RIG_APPROVED_QUERIES=1 (Bug A fix).
+ALL_CANDIDATES_JSON=$(echo "$TIER1_JSON $TIER2_JSON $CTXREADY_JSON $CTXREADY_RIG_JSON $WA_RIG_TIER2_JSON" \
   | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
 HQ_MERGED_COUNT=$(echo "$ALL_CANDIDATES_JSON" | jq 'length' 2>/dev/null || echo "0")
 if [ "$HQ_MERGED_COUNT" -gt "0" ]; then
@@ -2483,9 +2547,9 @@ if [ "$HQ_MERGED_COUNT" -gt "0" ]; then
   fi
   _ctx_total=$(( ${CTXREADY_COUNT:-0} + ${CTXREADY_RIG_COUNT:-0} )) || _ctx_total=0
   if [ "${_ctx_total:-0}" -gt 0 ] 2>/dev/null; then
-    log "Merged candidate pool: $HQ_MERGED_COUNT (bugs/debt + stories + ${_ctx_total} ctx:ready chore/task [HQ=${CTXREADY_COUNT} rig=${CTXREADY_RIG_COUNT}], priority-ordered)."
+    log "Merged candidate pool: $HQ_MERGED_COUNT (bugs/debt + stories + ${_ctx_total} ctx:ready chore/task [HQ=${CTXREADY_COUNT} rig=${CTXREADY_RIG_COUNT}] + ${WA_RIG_TIER2_COUNT} WA rig story:approved, priority-ordered)."
   else
-    log "Merged candidate pool: $HQ_MERGED_COUNT (bugs/debt + stories, priority-ordered)."
+    log "Merged candidate pool: $HQ_MERGED_COUNT (bugs/debt + stories + ${WA_RIG_TIER2_COUNT} WA rig story:approved, priority-ordered)."
   fi
 fi
 

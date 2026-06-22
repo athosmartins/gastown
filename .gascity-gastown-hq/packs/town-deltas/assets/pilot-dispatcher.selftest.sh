@@ -2314,6 +2314,82 @@ else
   bad "gate (f): dedup re-check missing from the rig-native dispatch path"
 fi
 
+# ── Scenario 23 (Bug A fix: WA rig story:approved features in primary pool) ───
+# Before this fix, the WA-rig story:approved FEATURE scan lived ONLY in Step 2c
+# (fallback — only reached when HQ returned ZERO candidates). Since HQ almost always
+# returns something (bugs, debt, HQ features), Step 2c never fired and 8 approved WA
+# features (wa-zybp, wa-0gs8, wa-0z8e, wa-wdot, wa-oxkg, wa-i02u, wa-oly1, wa-nvn9)
+# were never dispatched. Fix: lift them into the unconditional Step 2b-rig-tier2
+# merge, alongside CTXREADY_RIG_JSON. Test seam: PILOT_WA_RIG_TIER2_OVERRIDE lets us
+# inject a WA rig feature array hermetically (no gc/bd loop needed for selftests).
+echo "Scenario 23: Bug A fix — WA rig story:approved features ARE in primary pool (not fallback-only)"
+
+# run_wa_rig_tier2: runner that injects WA-rig approved features via the override
+# seam AND sets FAKE_BUGS_JSON so HQ is non-empty (Step 2c fallback must NOT fire).
+# $1 = PILOT_WA_RIG_TIER2_OVERRIDE  (JSON array of WA rig features)
+# $2 = FAKE_BUGS_JSON               (HQ bugs — non-empty so HQ returns candidates)
+# $3 = PILOT_WA_RIG_APPROVED_QUERIES (default "1")
+run_wa_rig_tier2() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE=10 \
+    DISPATCH_TO_CAPACITY=1 \
+    FAKE_BUGS_JSON="${2:-}" \
+    FAKE_BLOCKED_IDS="" \
+    PILOT_WA_RIG_TIER2_OVERRIDE="${1:-[]}" \
+    PILOT_WA_RIG_APPROVED_QUERIES="${3:-1}" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# ── Scenario 23a: behavioral — WA rig feature IS dispatched even when HQ has bugs ─
+echo "Scenario 23a: WA rig story:approved feature IS dispatched when HQ also has bugs"
+WA_RIG_FEATURE_FX='[{"id":"wa-zybp","title":"WA rig approved feature fixture","priority":0,"issue_type":"feature","description":"fixture body — WA rig story:approved feature, 80+ chars to clear spec floor","status":"open","labels":["story:approved"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{"story.rig":"whatsapp_automation"}}]'
+HQ_BUG_FX='[{"id":"tt-hq-bug","title":"HQ bug fixture","priority":1,"issue_type":"bug","description":"fixture body","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}]'
+LOG23A="$(run_wa_rig_tier2 "$WA_RIG_FEATURE_FX" "$HQ_BUG_FX")"
+if echo "$LOG23A" | grep -q "Lane picks.*wa-zybp\|WOULD DISPATCH.*wa-zybp\|Dispatch:.*wa-zybp\|small: wa-zybp\|big: wa-zybp"; then
+  ok "WA rig story:approved feature (wa-zybp) dispatched even though HQ bug also present"
+else
+  bad "WA rig story:approved feature NOT dispatched when HQ has bugs — Bug A regression"
+fi
+# The WA rig feature must appear in the pool log (merged into primary, not fallback).
+if echo "$LOG23A" | grep -q "WA_RIG_TIER2\|story:approved rig\|Bug A fix"; then
+  ok "WA_RIG_TIER2 pool was scanned and logged in primary merge (not fallback-only)"
+else
+  bad "WA rig tier-2 pool scan log not found — may not have run in primary merge path"
+fi
+
+# ── Scenario 23b: env-gate OFF — PILOT_WA_RIG_APPROVED_QUERIES=0 disables scan ─
+echo "Scenario 23b: PILOT_WA_RIG_APPROVED_QUERIES=0 disables WA rig approved scan"
+LOG23B="$(run_wa_rig_tier2 "$WA_RIG_FEATURE_FX" "$HQ_BUG_FX" "0")"
+if echo "$LOG23B" | grep -q "Lane picks.*wa-zybp\|WOULD DISPATCH.*wa-zybp\|small: wa-zybp\|big: wa-zybp"; then
+  bad "WA rig feature dispatched even though PILOT_WA_RIG_APPROVED_QUERIES=0 — gate not honored"
+else
+  ok "WA rig feature NOT dispatched when PILOT_WA_RIG_APPROVED_QUERIES=0 (env-gate honored)"
+fi
+
+# ── Scenario 23c: structural checks ─────────────────────────────────────────────
+echo "Scenario 23c: structural — Bug A fix wiring verified in dispatcher source"
+has "$DISPATCHER" 'WA_RIG_TIER2_JSON'              "WA_RIG_TIER2_JSON variable wired (Bug A fix)"
+has "$DISPATCHER" 'PILOT_WA_RIG_APPROVED_QUERIES'  "PILOT_WA_RIG_APPROVED_QUERIES env gate defined"
+has "$DISPATCHER" 'PILOT_WA_RIG_TIER2_OVERRIDE'    "PILOT_WA_RIG_TIER2_OVERRIDE test seam defined"
+has "$DISPATCHER" 'Step 2b-rig-tier2'              "Step 2b-rig-tier2 block comment present (not in fallback 2c)"
+# The merge line must include WA_RIG_TIER2_JSON alongside the other pools.
+# Use fixed-string grep to avoid ERE interpretation of the $ variable sigil.
+if grep -qF '"$TIER1_JSON $TIER2_JSON $CTXREADY_JSON $CTXREADY_RIG_JSON $WA_RIG_TIER2_JSON"' "$DISPATCHER"; then
+  ok "WA_RIG_TIER2_JSON merged into primary candidate pool (Bug A fix)"
+else
+  bad "WA_RIG_TIER2_JSON NOT in primary merge echo — pool merge incomplete (Bug A fix regression)"
+fi
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
