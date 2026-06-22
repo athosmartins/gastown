@@ -78,6 +78,19 @@ run_sweep() {
       log "R3 in_progress-no-worker: $id ($(basename "$store")) — set status=open"; n=$((n+1))
     done
   done
+  # CRITICAL: Dolt auto-commit is OFF (dolt.auto-commit=off). A `bd label remove`/`update` writes
+  # to the WORKING SET but does NOT commit — so OTHER processes that read committed HEAD (the
+  # painel's `bd list`, a fresh bd) never see the change, and the phantom card persists despite
+  # this janitor running. We MUST commit, or the normalization is invisible to exactly the reader
+  # it exists to fix. (Diagnosed 2026-06-22: stripped labels stayed visible to the painel until an
+  # explicit `bd dolt commit`.)
+  if [ "$n" -gt 0 ] && [ "$LCJ_DRY_RUN" != "1" ]; then
+    for store in $LCJ_STORES; do
+      [ -d "$store" ] || continue
+      "$BD" -C "$store" dolt commit -m "lifecycle-coherence-janitor: persist label/status normalization" >/dev/null 2>&1 || true
+    done
+    log "committed Dolt working set across stores (auto-commit is off → uncommitted strips stay invisible to the painel)"
+  fi
   log "sweep complete: normalized $n bead(s)$([ "$LCJ_DRY_RUN" = "1" ] && echo ' (DRY)')"
   return 0
 }
@@ -95,7 +108,7 @@ case "\$a" in
   *"list -l story:approved --status closed"*)   echo '[{"id":"ca-1"},{"id":"ca-cancel","labels":["story:cancelled","story:approved"]}]' ;;
   *"list -l story:in-flight --status blocked"*) echo '[{"id":"bl-1"}]' ;;
   *"list --status in_progress"*)                echo '[{"id":"ip-noasg","assignee":""},{"id":"ip-asg","assignee":"mila-wa"}]' ;;
-  *"label remove"*|*"label add"*|*"update"*)    echo "\$a" >> "$ACT" ;;
+  *"label remove"*|*"label add"*|*"update"*|*"dolt commit"*)    echo "\$a" >> "$ACT" ;;
   *) echo '[]' ;;
 esac
 SHIM
@@ -111,6 +124,7 @@ SHIM
   grep -q 'label remove bl-1 story:in-flight' "$ACT" && ok "R2: blocked+story:in-flight → stripped"           || bad "R2 not stripped"
   grep -q 'update ip-noasg --status open'     "$ACT" && ok "R3: in_progress + no assignee → status=open"      || bad "R3 not opened"
   grep -q 'ip-asg'                            "$ACT" && bad "TOUCHED an in_progress bead WITH an assignee (unsafe!)" || ok "left the assigned in_progress bead alone (safe)"
+  grep -q 'dolt commit'                       "$ACT" && ok "commits the Dolt working set (auto-commit off → else strips invisible to painel)" || bad "did NOT commit → normalization invisible to readers"
   # DRY-RUN makes no changes
   : > "$ACT"; LCJ_DRY_RUN=1; run_sweep
   [ ! -s "$ACT" ] && ok "DRY_RUN performs zero mutations" || bad "DRY_RUN mutated beads"
