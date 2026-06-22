@@ -573,6 +573,14 @@ for CC_STORE in $CONTEXT_CHECK_STORES; do
   fi
   log "  $CCOUNT open actionable bead(s) fetched (pre-classification)."
 
+  # Built-bead exclusion set: bead-ids that ALREADY have a crew branch in this store's repo.
+  # A coded bead is NOT "ready to code" — it must not (re)enter ctx:ready and thus the painel's
+  # Aprovadas column ("tudo pronto pra codar, independente de quem coda"). One git scan per store;
+  # O(1) membership in the loop. FAIL-OPEN (git fails → empty set → no exclusion). The Pilot already
+  # filters these from dispatch (_filter_built); this keeps the CLASSIFIER from re-labelling them.
+  # Test seam CONTEXT_CHECK_TEST_BUILT_IDS; kill-switch CONTEXT_CHECK_EXCLUDE_BUILT=0. (2026-06-22)
+  CC_BUILT_IDS="${CONTEXT_CHECK_TEST_BUILT_IDS-$(git -C "$CC_STORE" for-each-ref --format='%(refname)' 2>/dev/null | grep -oE 'crew/[^/]+/[^/]+$' | sed -E 's@crew/[^/]+/@@' | sort -u)}"
+
 # Iterate oldest-first (FIFO) so the backlog drains in arrival order.
 while IFS= read -r row; do
   [ -z "$row" ] && continue
@@ -580,6 +588,14 @@ while IFS= read -r row; do
 
   c_id=$(echo "$row" | jq -r '.id // empty')
   [ -z "$c_id" ] && continue
+  # Skip beads already CODED (a crew branch exists) — coded ≠ ready-to-code. Without this, the
+  # classifier re-marks a built-but-still-open bead ctx:ready every sweep and it re-appears in
+  # the painel's Aprovadas. FAIL-OPEN, env-gated (CONTEXT_CHECK_EXCLUDE_BUILT=0 disables).
+  if [ "${CONTEXT_CHECK_EXCLUDE_BUILT:-1}" = "1" ] && [ -n "$CC_BUILT_IDS" ] \
+     && printf '%s\n' "$CC_BUILT_IDS" | grep -qx "$c_id" 2>/dev/null; then
+    log "  $c_id: skip — already built (crew branch exists), not ready-to-code"
+    continue
+  fi
   c_type=$(echo "$row" | jq -r '.issue_type // .type // "task"')
   c_labels=$(_labels_csv "$row")
   c_ephemeral=$(echo "$row" | jq -r 'if (.ephemeral // false)==true then "true" else "false" end')
