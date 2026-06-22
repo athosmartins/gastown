@@ -513,6 +513,15 @@ bead_domain() {
   if printf '%s' "$hay" | grep -iqE 'urblink_design_system|design[ -]system|painel[ -]?hist|\bfrontend\b|\bui\b|\bux\b|\bkanban\b|\bcss\b|stylesheet|layout'; then
     echo "frontend"; return 0
   fi
+  # real-estate BEFORE data: property enrichment carries "enrichment" (a data keyword) but
+  # is a real-estate build (ArcGIS/zoneamento/ITBI/quarteirão/imóvel) owned by peter/thies,
+  # NOT oracle (warming). This is the wa-nvn9/wa-o65d round-robin-to-oracle loop oracle hit.
+  if printf '%s' "$hay" | grep -iqE 'arcgis|zoneamento|geometria|geo-?match|quarteir|cadastr|\bitbi\b|[ií]ndice cadastral|im[oó]ve(l|is)|funil[ _-]?im[oó]vel|deals?.*(fora de bh|im[oó]ve)'; then
+    echo "real-estate"; return 0
+  fi
+  if printf '%s' "$hay" | grep -iqE 'warming|warm-?up|aquecimento|\bchip(s)?\b|ban-?prevention|ban-?risk|on-?device send|group-?send'; then
+    echo "warming"; return 0
+  fi
   if printf '%s' "$hay" | grep -iqE 'financeiro|\bledger\b|enrichment|scraper|mega data set|net ?imoveis|viva ?real|\bemail\b|pipedrive|property data|\bdados\b'; then
     echo "data"; return 0
   fi
@@ -526,8 +535,10 @@ bead_domain() {
 # (preferred pick if idle), or "" if none is mapped. Positive ownership only.
 rig_domain_owner() {
   case "$1/$2" in
-    whatsapp_automation/data|wa/data) echo "digo-wa" ;;
-    *)                                echo ""        ;;
+    whatsapp_automation/data|wa/data)               echo "digo-wa"   ;;
+    whatsapp_automation/real-estate|wa/real-estate) echo "peter-wa"  ;;
+    whatsapp_automation/warming|wa/warming)         echo "oracle-wa" ;;
+    *)                                              echo ""          ;;
   esac
 }
 
@@ -538,8 +549,10 @@ rig_domain_owner() {
 # (data/email/financeiro) is not it, so frontend work must never land on digo.
 rig_domain_exclude() {
   case "$1/$2" in
-    whatsapp_automation/frontend|wa/frontend) echo "digo-wa" ;;
-    *)                                        echo ""        ;;
+    whatsapp_automation/frontend|wa/frontend)       echo "digo-wa" ;;
+    whatsapp_automation/real-estate|wa/real-estate) echo "oracle-wa digo-wa" ;;
+    whatsapp_automation/warming|wa/warming)         echo "peter-wa thies-wa" ;;
+    *)                                              echo ""        ;;
   esac
 }
 

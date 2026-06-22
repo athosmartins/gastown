@@ -1501,6 +1501,24 @@ if grep -qE 'whatsapp_automation/frontend\|wa/frontend\)[[:space:]]*echo "digo-w
 else
   bad "WA frontend→exclude-digo mapping not present in the dispatcher"
 fi
+
+# Scenario 17f: real-estate routes to peter + EXCLUDES oracle (the wa-nvn9/wa-o65d loop —
+# property enrichment round-robined to oracle, a warming crew; oracle released, Pilot re-grabbed).
+echo "Scenario 17f: real-estate → peter + exclude oracle; warming → oracle (owner-domain routing)"
+_BD_FN="$(awk '/^bead_domain\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_RO_FN="$(awk '/^rig_domain_owner\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_RE_FN="$(awk '/^rig_domain_exclude\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_dom() { ( eval "$_BD_FN"; bead_domain "$1" ); }
+_own() { ( eval "$_RO_FN"; rig_domain_owner whatsapp_automation "$1" ); }
+_exc() { ( eval "$_RE_FN"; rig_domain_exclude whatsapp_automation "$1" ); }
+RE_BEAD='{"title":"enriquecer deals/imóveis fora de BH com geometria+zoneamento do ArcGIS","description":"funil imovel-to-campanha + quarteirao_map"}'
+WARM_BEAD='{"title":"aquecimento de chip novo no grupo","description":"on-device send"}'
+[ "$(_dom "$RE_BEAD")" = real-estate ]          && ok "ArcGIS/imóvel enrichment → real-estate (not data→digo)" || bad "real-estate misclassified: '$(_dom "$RE_BEAD")'"
+[ "$(_own real-estate)" = peter-wa ]            && ok "real-estate prefers peter-wa"                            || bad "real-estate owner wrong: '$(_own real-estate)'"
+echo "$(_exc real-estate)" | grep -q oracle-wa  && ok "real-estate EXCLUDES oracle-wa (kills the loop oracle reported)" || bad "real-estate does not exclude oracle"
+[ "$(_dom "$WARM_BEAD")" = warming ]            && ok "chip/aquecimento → warming"                              || bad "warming misclassified: '$(_dom "$WARM_BEAD")'"
+[ "$(_own warming)" = oracle-wa ]               && ok "warming prefers oracle-wa"                               || bad "warming owner wrong: '$(_own warming)'"
+
 # ── Scenario 17: reuse existing crew session, never spawn a 2nd (gt-4st3n) ────
 # Bug gt-4st3n: the Pilot routed work to a crew identity via `gc sling <identity>`
 # + an immediate nudge. When that crew ALREADY had a session this spawned/resumed
