@@ -715,12 +715,31 @@ _crew_at_inflight_cap() {
 #             excluded crew is never picked — even when it's the only idle one —
 #             so the bead DEFERS rather than re-enter the wrong-domain loop.
 # Both default empty ⇒ pre-gt-s1saw behaviour (rotate across idle crew).
+# _crew_session_human_engaged <crew> — return 0 iff a tmux session for this crew is ATTACHED
+# (a human — almost always Athos — is viewing/typing in it RIGHT NOW). Dispatching into such a
+# session derails that live conversation: even the "non-interrupting" follow_up submit surfaces
+# at the next turn boundary and hijacks the human's thread (2026-06-22: a dispatch of wa-oxkg to
+# peter-wa landed mid-conversation while Athos was working WITH peter). So the dispatcher treats
+# an attached crew as ineligible — the bead simply waits a sweep. PILOT_PROTECT_ATTACHED=0
+# disables; test seam PILOT_TEST_ATTACHED_CREWS (space-sep crews to treat as attached).
+_crew_session_human_engaged() {
+  [ "${PILOT_PROTECT_ATTACHED:-1}" = "1" ] || return 1
+  local _crew="${1:-}"; [ -n "$_crew" ] || return 1
+  if [ -n "${PILOT_TEST_ATTACHED_CREWS+x}" ]; then
+    case " $PILOT_TEST_ATTACHED_CREWS " in *" $_crew "*) return 0 ;; *) return 1 ;; esac
+  fi
+  command -v tmux >/dev/null 2>&1 || return 1
+  tmux list-sessions -F '#{session_name} #{session_attached}' 2>/dev/null \
+    | awk -v c="$_crew" 'index($1, c)==1 && ($2+0)>=1 { f=1 } END { exit(f?0:1) }'
+}
+
 pick_pool_builder() {
   local rig="$1" prefer="${2:-}" exclude="${3:-}" crew
   # 1. Domain owner first, if mapped and eligible.
   if [ -n "$prefer" ]; then
     for crew in $(rig_to_builders "$rig"); do
       [ "$crew" = "$prefer" ] || continue
+      _crew_session_human_engaged "$crew" && continue   # NEVER interrupt a human-attached crew (Athos conversing)
       _crew_is_suspended "$crew" && continue   # ga-mfeip gate (e): never a suspended crew
       case " $PILOT_BUSY_BUILDERS " in *" $crew "*) continue ;; esac
       case " $PILOT_USED_BUILDERS " in *" $crew "*) continue ;; esac
@@ -730,6 +749,7 @@ pick_pool_builder() {
   fi
   # 2. Rotate across idle crew, skipping any domain-excluded member.
   for crew in $(rig_to_builders "$rig"); do
+    _crew_session_human_engaged "$crew" && continue   # NEVER interrupt a human-attached crew (Athos conversing)
     _crew_is_suspended "$crew" && continue   # ga-mfeip gate (e): never a suspended crew
     _crew_at_inflight_cap "$crew" && continue   # per-crew in-flight cap (load-balance over-assignment)
     case " $PILOT_BUSY_BUILDERS " in *" $crew "*) continue ;; esac
@@ -1460,8 +1480,13 @@ _ttl_recover_db() {
       _sling_status=$(bd -C "$_sling_db" show "$_sling" --json 2>/dev/null \
         | jq -r 'if type=="array" then .[0] else . end | (.status // "")' 2>/dev/null || echo "")
       if [ -n "$_sling_status" ] && [ "$_sling_status" != "closed" ] && [ "$_sling_status" != "done" ]; then
-        warn "TTL: $_bid age=${_age}s > TTL but sling task $_sling is still '$_sling_status' (db=$_sling_db) — builder active, refusing to release."
-        continue
+        if _sling_is_live "$_sling" "$_sling_db" "$_bid"; then
+          warn "TTL: $_bid age=${_age}s > TTL but sling task $_sling is still '$_sling_status' (db=$_sling_db) + LIVE (branch/fresh activity) — builder active, refusing to release."
+          continue
+        fi
+        warn "TTL: $_bid age=${_age}s > TTL, sling $_sling open ('$_sling_status') but STALE (no crew branch, idle >${STALE_SLING_SECONDS}s) — DEAD sling (worker leaked it open), closing it + releasing the claim."
+        bd -C "$_sling_db" close "$_sling" --reason "Stale sling auto-closed by Pilot TTL-release: open but idle >${STALE_SLING_SECONDS}s with no crew branch — was HOL-blocking $_bid (dead-builder leak)." -q 2>/dev/null || true
+        # fall through to release the claim below
       fi
     fi
 
@@ -1527,6 +1552,60 @@ echo "$_SESSIONS_JSON" | jq -e '.sessions | type=="array"' >/dev/null 2>&1 || _D
 _session_is_live() {
   [ -n "${1:-}" ] || return 1
   printf '%s\n' "$_LIVE_SESSION_IDS" | grep -Fxq -- "$1"
+}
+
+# ── Stale-sling liveness (dead-builder HOL-block fix) ─────────────────────────
+# An OPEN sling/wrapper whose worker DIED leaks open forever, and both the TTL-release
+# and the dedup guard trusted open-ness as "builder active" → the bead is HOL-blocked
+# indefinitely (ga-gbu87/ga-vp0c3 sat open 3 DAYS with no session/branch/activity,
+# blocking ga-wm12t/ga-a3lmo — the "beads travadas em execução"). _sling_is_live tells a
+# live sling from a dead one. Default idle window 180min (4-6× a normal build) so a slow
+# live builder is NEVER false-released.
+STALE_SLING_SECONDS="${PILOT_STALE_SLING_SECONDS:-10800}"
+case "$STALE_SLING_SECONDS" in ''|*[!0-9]*) STALE_SLING_SECONDS=10800 ;; esac
+
+# _iso_to_epoch <iso8601> — best-effort ISO→epoch (BSD then GNU); echoes "" on failure.
+_iso_to_epoch() {
+  local _t="${1%%.*}"; _t="${_t%Z}"
+  date -j -u -f "%Y-%m-%dT%H:%M:%S" "$_t" +%s 2>/dev/null \
+    || date -u -d "$1" +%s 2>/dev/null || echo ""
+}
+
+# _target_has_real_branch <bead_id> — return 0 ONLY if a crew branch for the bead actually
+# exists. Self-contained repo list. Any uncertainty → return 1 (assert NO branch) so this
+# only ever ADDS a keep-signal, never forces a release.
+_target_has_real_branch() {
+  command -v git >/dev/null 2>&1 || return 1
+  local _repos _r
+  _repos="$(_ownership_guard_repos 2>/dev/null)" || return 1
+  [ -n "$_repos" ] || return 1
+  while IFS= read -r _r; do
+    [ -n "$_r" ] && [ -d "$_r" ] || continue
+    git -C "$_r" for-each-ref --format='%(refname)' \
+        "refs/remotes/origin/crew/*/$1" "refs/heads/crew/*/$1" 2>/dev/null | grep -q . && return 0
+  done <<< "$_repos"
+  return 1
+}
+
+# _sling_is_live <sling_id> <sling_db> <target_bead_id> — return 0 iff an OPEN sling is backed
+# by a REAL live builder: a crew branch for its target (work in progress) OR sling activity
+# within STALE_SLING_SECONDS. FAIL-OPEN to LIVE — any unreadable/unparseable signal → assume
+# live, so a genuine active builder is NEVER false-released; only a provably-idle, branch-less
+# sling is declared dead. Test seam: PILOT_TEST_DEAD_SLINGS (space-sep ids treated as dead).
+_sling_is_live() {
+  local _sid="${1:-}" _sdb="${2:-$GC_CITY}" _tid="${3:-}" _upd _epoch _nowts
+  [ -n "$_sid" ] || return 0
+  if [ -n "${PILOT_TEST_DEAD_SLINGS+x}" ]; then
+    case " $PILOT_TEST_DEAD_SLINGS " in *" $_sid "*) return 1 ;; *) return 0 ;; esac
+  fi
+  [ -n "$_tid" ] && _target_has_real_branch "$_tid" && return 0
+  _upd=$(bd -C "$_sdb" show "$_sid" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.updated_at // "")' 2>/dev/null || echo "")
+  _epoch="$(_iso_to_epoch "$_upd")"
+  [ -z "$_epoch" ] && return 0                       # unparseable → cannot prove idle → LIVE
+  _nowts="${_now:-$(date +%s)}"
+  [ $(( _nowts - _epoch )) -le "$STALE_SLING_SECONDS" ] && return 0
+  return 1                                            # no branch + idle beyond window → DEAD
 }
 
 # _beadid_live_crew_owner <bead_id> [db] (ga-9yb5s) — echo the live, named-crew
@@ -2805,12 +2884,19 @@ FIXSEC
         | jq -r 'if type=="array" then .[0] else . end | (.status // "")' \
         2>/dev/null || echo "")
       if [ "$_EXISTING_SLING_STATUS" = "open" ] || [ "$_EXISTING_SLING_STATUS" = "in_progress" ]; then
-        warn "ga-cnvy1: SKIPPING dispatch of $STORY_ID — a live wrapper ($_EXISTING_SLING, status=$_EXISTING_SLING_STATUS) already exists for this target; work is already dispatched. Releasing claim, NOT minting a 2nd sling (set PILOT_DEDUP_GUARD=0 to disable)."
-        if [ "$DRY_RUN" != "1" ]; then
-          bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
-          bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+        if _sling_is_live "$_EXISTING_SLING" "$GC_CITY" "$STORY_ID"; then
+          warn "ga-cnvy1: SKIPPING dispatch of $STORY_ID — a LIVE wrapper ($_EXISTING_SLING, status=$_EXISTING_SLING_STATUS, branch/fresh) already exists for this target; work is already dispatched. Releasing claim, NOT minting a 2nd sling (set PILOT_DEDUP_GUARD=0 to disable)."
+          if [ "$DRY_RUN" != "1" ]; then
+            bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+            bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+          fi
+          return 1
         fi
-        return 1
+        warn "ga-cnvy1: existing wrapper ($_EXISTING_SLING, status=$_EXISTING_SLING_STATUS) for $STORY_ID is STALE (no crew branch, idle >${STALE_SLING_SECONDS}s) — DEAD wrapper (worker leaked it open), closing it + dispatching fresh (NOT a duplicate)."
+        if [ "$DRY_RUN" != "1" ]; then
+          bd -C "$GC_CITY" close "$_EXISTING_SLING" --reason "Stale wrapper auto-closed by Pilot dedup-guard: open but idle >${STALE_SLING_SECONDS}s with no crew branch — was HOL-blocking $STORY_ID (dead-builder leak)." -q 2>/dev/null || true
+        fi
+        # fall through to dispatch a fresh sling for this still-pending target
       fi
     fi
   fi

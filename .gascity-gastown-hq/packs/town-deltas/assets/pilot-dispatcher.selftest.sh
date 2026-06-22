@@ -702,6 +702,33 @@ else
   ok "did NOT release the un-stamped legacy claim"
 fi
 
+# 4d: stale-sling liveness — a DEAD open sling (no branch, idle) must NOT block its bead's
+# TTL-release / re-dispatch; a LIVE one (branch or fresh activity) must. The dead-builder
+# HOL-block: ga-gbu87/ga-vp0c3 sat open 3 DAYS, no session/branch, blocking ga-wm12t/ga-a3lmo
+# ("beads travadas em execução"). Both the TTL-release and the dedup guard now gate on this.
+echo "Scenario 4d: _sling_is_live — dead open sling stops HOL-blocking, live one is kept"
+_SIL_FN="$(awk '/^_sling_is_live\(\)/{g=1} g{print} g&&/^}$/{exit}' "$DISPATCHER")"
+_sil() { ( eval "$_SIL_FN"; PILOT_TEST_DEAD_SLINGS="$1" _sling_is_live "$2" /tmp "" && echo LIVE || echo DEAD ); }
+[ "$(_sil 'ga-dead' 'ga-dead')" = DEAD ] && ok "a dead sling → DEAD (releases the HOL-blocked bead)"     || bad "dead sling not detected"
+[ "$(_sil 'ga-dead' 'ga-live')" = LIVE ] && ok "a sling not in the dead set → LIVE (kept, no false-release)" || bad "live sling misread as dead"
+# inline grep (the `has` helper is defined later in the file, ~L1100 — not yet in scope here)
+grep -qE '_sling_is_live\(\)'         "$DISPATCHER" && ok "_sling_is_live helper defined"                        || bad "_sling_is_live not defined"
+grep -qE 'PILOT_STALE_SLING_SECONDS'  "$DISPATCHER" && ok "stale-sling idle window tunable (PILOT_STALE_SLING_SECONDS)" || bad "PILOT_STALE_SLING_SECONDS missing"
+grep -qE 'DEAD sling .worker leaked'  "$DISPATCHER" && ok "TTL-release closes a dead sling + releases the claim"   || bad "TTL-release stale path missing"
+grep -qE 'DEAD wrapper .worker leaked' "$DISPATCHER" && ok "dedup-guard closes a dead wrapper + dispatches fresh"  || bad "dedup-guard stale path missing"
+
+# 4e: human-conversation protection — the dispatcher must NEVER pick a crew whose tmux session
+# is ATTACHED (a human, ~always Athos, is conversing in it). 2026-06-22: a dispatch of wa-oxkg
+# to peter-wa surfaced mid-conversation and hijacked Athos's thread. pick_pool_builder now skips
+# an attached crew → the bead routes to a free peer or waits a sweep, never interrupts.
+echo "Scenario 4e: a human-attached crew is never picked for dispatch (no conversation hijack)"
+_CHE_FN="$(awk '/^_crew_session_human_engaged\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_che() { ( eval "$_CHE_FN"; PILOT_TEST_ATTACHED_CREWS="$1" _crew_session_human_engaged "$2" && echo ENGAGED || echo FREE ); }
+[ "$(_che 'peter-wa thies-wa' 'peter-wa')" = ENGAGED ] && ok "an attached crew → ENGAGED (skipped from dispatch)"  || bad "attached crew not detected"
+[ "$(_che 'peter-wa' 'mila-wa')" = FREE ]              && ok "a non-attached crew → FREE (still dispatchable)"     || bad "free crew misread as engaged"
+grep -qE '_crew_session_human_engaged\(\)' "$DISPATCHER" && ok "_crew_session_human_engaged helper defined"        || bad "helper missing"
+[ "$(grep -cE '_crew_session_human_engaged "\$crew" && continue' "$DISPATCHER")" -ge 2 ] && ok "engaged-skip wired in BOTH pick_pool_builder loops" || bad "engaged-skip not wired in both loops"
+
 # ── Scenario 5: durable story:in-flight before claim release (ga-2azzj fix 1) ──
 # The load-bearing fix. A real (non-dry) dispatch must confirm story:in-flight
 # BEFORE removing pilot:dispatching. If in-flight can't be confirmed, it must
