@@ -1811,6 +1811,20 @@ fi
 echo "Scenario 18i: drift-guard — WA-integration precedence is wired into bead_content_rig"
 has "$DISPATCHER" 'WA-INTEGRATION PRECEDENCE'          "WA-integration precedence guard is wired"
 
+# Scenario 18j (batista-ps 2026-06-22): painel/kanban/dashboard beads carry property nouns
+# (they DISPLAY property data, and "contagem"=count reads as the city Contagem) so they were
+# misrouting to property_scrapers. The painel UI is mila's (WA) domain — property_scrapers
+# builds the SCRAPERS, not the UI. bead_content_rig's WA precedence now includes painel/kanban.
+echo "Scenario 18j: painel/kanban dashboard → whatsapp_automation, not property_scrapers (ga-wm12t)"
+_BCR_FN="$(awk '/^bead_content_rig\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_bcr() { ( eval "$_BCR_FN"; bead_content_rig "$1" ); }
+WM='{"title":"Dashboard: multi-rig kanban + filter pills por rig/tipo com contagem","description":"painel.urblink.com.br"}'
+PROP='{"title":"Scraper de cadastro ITBI de imóveis e lotes em Contagem","description":"consolidar MotherDuck"}'
+HEXD='{"title":"Hex notebook dashboard de lotes/proprietários","description":"RFB CNPJ"}'
+[ "$(_bcr "$WM")" = whatsapp_automation ] && ok "ga-wm12t kanban/painel dashboard → whatsapp_automation (misroute fixed)"    || bad "painel dashboard still misroutes: '$(_bcr "$WM")'"
+[ "$(_bcr "$PROP")" = property_scrapers ] && ok "genuine ITBI/lote scraper still → property_scrapers (no regression)"        || bad "property scraper broke: '$(_bcr "$PROP")'"
+[ "$(_bcr "$HEXD")" = property_scrapers ] && ok "Hex-notebook dashboard (no painel/kanban) stays property_scrapers (edge safe)" || bad "Hex dashboard over-caught: '$(_bcr "$HEXD")'"
+
 # ── Scenario 19 (wa-u5r1): dispatchable-queue emit for the painel ─────────────
 echo "Scenario 19a: emit writes valid JSON with the contract shape + count + items"
 F19="$(run_emit)"

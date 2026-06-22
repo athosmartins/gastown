@@ -593,15 +593,19 @@ bead_content_rig() {
         ((.labels // []) | join(" ")) ] | join("  ")
     ' 2>/dev/null || echo "")
   [ -z "$hay" ] && { echo ""; return 0; }
-  # WA-INTEGRATION PRECEDENCE (ga-lt8cw/ga-nq64a, 2026-06-19): the WA orchestration/
-  # integration layer — pipedrive deals, whapi/whatsapp messaging, the urblink painel,
-  # and the Drive bridges that TRIGGER an existing Hex notebook — CONSUMES property data,
-  # so its beads carry property nouns (imóvel/ITBI/Hex/CNPJ) too. Without this guard the
-  # property check below wins on first-match and the build misroutes to property_scrapers
-  # (batista-ps then circuit-breaks → re-dispatch loop). These signals NEVER occur in a
+  # WA-INTEGRATION PRECEDENCE (ga-lt8cw/ga-nq64a, 2026-06-19; +painel/kanban 2026-06-22):
+  # the WA orchestration/integration layer — pipedrive deals, whapi/whatsapp messaging, the
+  # urblink PAINEL (painel.urblink.com.br: kanban, filter pills, dashboards), and the Drive
+  # bridges that TRIGGER an existing Hex notebook — CONSUMES property data, so its beads carry
+  # property nouns (imóvel/ITBI/Hex/CNPJ) AND counting words ("contagem") too. Without this
+  # guard the property check below wins on first-match and the build misroutes to
+  # property_scrapers (batista-ps circuit-breaks → re-dispatch loop — ga-wm12t "multi-rig
+  # kanban ... com contagem" hit exactly this). painel/kanban/filter-pills NEVER occur in a
   # genuine property data-build (scrape/consolidate/classify), so they safely precede it.
-  # Narrow on purpose: e.g. "drive bridge" (the WA itbi_drive_bridge), not bare "Hex".
-  if printf '%s' "$hay" | grep -iqE 'pipedrive|whapi|whatsapp|urblink_design_system|drive[_ ]bridge'; then
+  # The painel UI is mila's (WA) domain; property_scrapers builds the SCRAPERS, not the UI.
+  # Narrow on purpose: "drive bridge" (the WA itbi_drive_bridge) not bare "Hex"; "painel"/
+  # "kanban"/"filter pills" not bare "dashboard" (a Hex-notebook dashboard stays property).
+  if printf '%s' "$hay" | grep -iqE 'pipedrive|whapi|whatsapp|urblink_design_system|drive[_ ]bridge|\bpainel\b|painel\.urblink|\bkanban\b|filter[ -]?pills'; then
     echo "whatsapp_automation"; return 0
   fi
   # property_scrapers domain (the recurring misroute family).
