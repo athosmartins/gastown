@@ -514,8 +514,10 @@ bead_domain() {
     echo "frontend"; return 0
   fi
   # real-estate BEFORE data: property enrichment carries "enrichment" (a data keyword) but
-  # is a real-estate build (ArcGIS/zoneamento/ITBI/quarteirão/imóvel) owned by peter/thies,
-  # NOT oracle (warming). This is the wa-nvn9/wa-o65d round-robin-to-oracle loop oracle hit.
+  # is a real-estate build (ArcGIS/zoneamento/ITBI/quarteirão/imóvel) owned by peter-wa,
+  # NOT oracle (warming) or thies (satmap visual layer only). This is the wa-nvn9/wa-o65d
+  # round-robin-to-oracle loop oracle hit, and the wa-nvn9 misroute-to-thies when peter was
+  # human-engaged.
   if printf '%s' "$hay" | grep -iqE 'arcgis|zoneamento|geometria|geo-?match|quarteir|cadastr|\bitbi\b|[ií]ndice cadastral|im[oó]ve(l|is)|funil[ _-]?im[oó]vel|deals?.*(fora de bh|im[oó]ve)'; then
     echo "real-estate"; return 0
   fi
@@ -550,7 +552,7 @@ rig_domain_owner() {
 rig_domain_exclude() {
   case "$1/$2" in
     whatsapp_automation/frontend|wa/frontend)       echo "digo-wa" ;;
-    whatsapp_automation/real-estate|wa/real-estate) echo "oracle-wa digo-wa" ;;
+    whatsapp_automation/real-estate|wa/real-estate) echo "oracle-wa digo-wa thies-wa" ;;
     whatsapp_automation/warming|wa/warming)         echo "peter-wa thies-wa" ;;
     *)                                              echo ""        ;;
   esac

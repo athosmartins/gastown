@@ -1554,6 +1554,12 @@ WARM_BEAD='{"title":"aquecimento de chip novo no grupo","description":"on-device
 [ "$(_dom "$RE_BEAD")" = real-estate ]          && ok "ArcGIS/imóvel enrichment → real-estate (not data→digo)" || bad "real-estate misclassified: '$(_dom "$RE_BEAD")'"
 [ "$(_own real-estate)" = peter-wa ]            && ok "real-estate prefers peter-wa"                            || bad "real-estate owner wrong: '$(_own real-estate)'"
 echo "$(_exc real-estate)" | grep -q oracle-wa  && ok "real-estate EXCLUDES oracle-wa (kills the loop oracle reported)" || bad "real-estate does not exclude oracle"
+# wa-nvn9 root: peter-wa human-engaged → pool rotation picked thies-wa (not excluded). thies owns
+# the satmap/visual layer only; peter owns the ArcGIS/zoneamento/imóvel enrichment pipeline.
+echo "$(_exc real-estate)" | grep -q thies-wa  && ok "real-estate EXCLUDES thies-wa (wa-nvn9 misroute to thies when peter human-engaged)" || bad "real-estate does not exclude thies-wa"
+# Confirm the wa-nvn9 title/description keywords (geometria+zoneamento+ArcGIS+quarteirao_map) classify real-estate.
+NVNBEAD='{"title":"Contagem: enriquecer deals/imóveis fora de BH com geometria+zoneamento do ArcGIS (plugar no funil imovel-to-campanha + quarteirao_map)","description":"API ArcGIS pública de Contagem sem auth, f=geojson."}'
+[ "$(_dom "$NVNBEAD")" = real-estate ]          && ok "wa-nvn9 exact title (geometria+zoneamento+ArcGIS+quarteirao_map) → real-estate" || bad "wa-nvn9 bead misclassified: '$(_dom "$NVNBEAD")'"
 [ "$(_dom "$WARM_BEAD")" = warming ]            && ok "chip/aquecimento → warming"                              || bad "warming misclassified: '$(_dom "$WARM_BEAD")'"
 [ "$(_own warming)" = oracle-wa ]               && ok "warming prefers oracle-wa"                               || bad "warming owner wrong: '$(_own warming)'"
 
