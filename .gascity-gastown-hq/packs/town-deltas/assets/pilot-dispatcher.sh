@@ -1049,6 +1049,7 @@ _filter_candidates() {
         and (.assignee == null or .assignee == "")
         and ((.issue_type // .type // "") != "epic")
         and (((.labels // []) | index("story:epic-split")) | not)
+        and (((.labels // []) | index("pilot:held")) | not)
         and (((.labels // []) - $preapproval) | length) == ((.labels // []) | length)
         and ((.description // "") | test("\\S"))
      )]' \

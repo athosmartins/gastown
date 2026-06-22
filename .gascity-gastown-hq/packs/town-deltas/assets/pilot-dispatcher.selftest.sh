@@ -616,6 +616,17 @@ else
   bad "did not dispatch the keeper bug (tt-keep)"
 fi
 
+# Scenario 3e2 (wa-tis4, mila-wa 2026-06-22): the painel "Soltar worker" action zeroes the
+# assignee AND stamps a durable pilot:held label. The Pilot must EXCLUDE pilot:held beads from
+# the candidate pool — else story:approved + empty assignee re-dispatches the held worker in
+# ~2min. One clause in _filter_candidates (the single chokepoint for every dispatch path).
+echo "Scenario 3e2: a pilot:held bead is excluded from the candidate pool (durable worker release)"
+_FC_FN="$(awk '/^_FILTER_PREAPPROVAL_LABELS=/{print} /^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_fc() { ( eval "$_FC_FN"; SELF_BEAD_ID=""; echo "$1" | _filter_candidates | jq -rc '[.[].id]' ); }
+HELD='[{"id":"bd-held","assignee":null,"labels":["story:approved","pilot:held"],"description":"x"},{"id":"bd-free","assignee":null,"labels":["story:approved"],"description":"x"}]'
+[ "$(_fc "$HELD")" = '["bd-free"]' ] && ok "pilot:held bead excluded; free story:approved kept (durable release holds)" || bad "pilot:held not excluded (got: $(_fc "$HELD"))"
+grep -qE 'index..pilot:held' "$DISPATCHER" && ok "_filter_candidates carries the pilot:held clause"                      || bad "pilot:held clause missing from _filter_candidates"
+
 # ── Scenario 3f: pre-approval lifecycle stories are excluded (ga-w7wvm) ─────────
 # The Pilot dispatches ONLY story:approved features; pre-approval lifecycle states
 # (story:triage / story:unrefined / story:refinement-in-progress) and the terminal
