@@ -2488,8 +2488,10 @@ PILOT_WA_RIG_APPROVED_QUERIES="${PILOT_WA_RIG_APPROVED_QUERIES:-1}"
 if [ "$PILOT_WA_RIG_APPROVED_QUERIES" = "1" ]; then
   if [ -n "${PILOT_WA_RIG_TIER2_OVERRIDE+x}" ]; then
     # Hermetic test seam: use the override JSON directly (skips gc/bd, no rig loop).
+    # Apply the FULL filter chain — same as the real loop — so tests exercise the gates.
     WA_RIG_TIER2_JSON=$(echo "$PILOT_WA_RIG_TIER2_OVERRIDE" \
-      | _filter_candidates | _filter_unblocked "${GC_CITY}" | _filter_explicit_deps "${GC_CITY}")
+      | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built \
+      | _filter_unblocked "${GC_CITY}" | _filter_explicit_deps "${GC_CITY}")
   else
     _wa_rig2_rows=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
       | jq -r '.rigs[] | select(.hq == false) | "\(.name)\t\(.path)"' 2>/dev/null || echo "")
@@ -2513,8 +2515,14 @@ if [ "$PILOT_WA_RIG_APPROVED_QUERIES" = "1" ]; then
         --exclude-type epic \
         -n 0 \
         2>/dev/null || echo "[]")
-      # Apply same filter chain as HQ TIER2_JSON (lifecycle/blocklist/deps).
-      _wa_rig2_filtered=$(echo "$_wa_rig2_raw" | _filter_candidates \
+      # Apply full filter chain: exec:manual + quality-gates + built-check + lifecycle.
+      # Mirrors ctx:ready rig path (_filter_exec_manual | _filter_candidates |
+      # _filter_dispatch_gates | _filter_built | _filter_unblocked | _filter_explicit_deps).
+      # Without _filter_exec_manual + _filter_dispatch_gates, underspecified and
+      # human-dependent approved features (e.g. wa-i02u Fala.BR CPF, wa-0z8e R&D device)
+      # dispatch autonomously instead of deferring (gap reported mila mail ga-wisp-a1radr).
+      _wa_rig2_filtered=$(echo "$_wa_rig2_raw" \
+        | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built \
         | _filter_unblocked "$_wa_rig2_path" | _filter_explicit_deps "$_wa_rig2_path")
       _wa_rig2_n=$(echo "$_wa_rig2_filtered" | jq 'length' 2>/dev/null || echo "0")
       if [ "${_wa_rig2_n:-0}" -gt 0 ] 2>/dev/null; then

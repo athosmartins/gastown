@@ -2396,6 +2396,64 @@ else
   bad "WA_RIG_TIER2_JSON NOT in primary merge echo — pool merge incomplete (Bug A fix regression)"
 fi
 
+# ── Scenario 24 (gap fix: WA rig step-2b-rig-tier2 must apply full filter chain) ─
+# Mila flagged (mail ga-wisp-a1radr): Step 2b-rig-tier2 dispatched wa-i02u (needs
+# Athos's Fala.BR/CPF identity) and wa-0z8e (R&D, no AC, needs test device) because
+# the block applied only _filter_candidates | _filter_unblocked | _filter_explicit_deps
+# — missing _filter_exec_manual AND _filter_dispatch_gates. The fix adds both.
+echo "Scenario 24: WA rig tier-2 gap fix — exec:manual + empty-spec features are EXCLUDED"
+
+# ── Scenario 24a: exec:manual WA story:approved feature must NOT dispatch ────
+echo "Scenario 24a: exec:manual WA story:approved feature is EXCLUDED from WA rig tier-2"
+WA_RIG_EXECMANUAL_FX='[{"id":"wa-i02u-fx","title":"LAI e-SIC fixture — exec:manual","priority":2,"issue_type":"feature","description":"Submit LAI request on Fala.BR using Athos CPF credentials — requires human login","status":"open","labels":["story:approved","exec:manual"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{"story.rig":"whatsapp_automation"}}]'
+LOG24A="$(run_wa_rig_tier2 "$WA_RIG_EXECMANUAL_FX" "$HQ_BUG_FX")"
+if echo "$LOG24A" | grep -q "Lane picks.*wa-i02u-fx\|WOULD DISPATCH.*wa-i02u-fx\|small: wa-i02u-fx\|big: wa-i02u-fx"; then
+  bad "REGRESSION: exec:manual WA story:approved feature (wa-i02u-fx) dispatched — ga-wisp-a1radr gap not fixed"
+else
+  ok "exec:manual WA story:approved feature (wa-i02u-fx) NOT dispatched (gap fixed, mila ga-wisp-a1radr)"
+fi
+
+# ── Scenario 24b: empty-spec WA story:approved feature must NOT dispatch ─────
+echo "Scenario 24b: empty-AC/empty-spec WA story:approved feature is EXCLUDED from WA rig tier-2"
+# wa-0z8e-style: open, story:approved, empty description (below 20-char floor) and
+# no story.criterios. The dispatch gate (b) must reject it.
+WA_RIG_EMPTYSPEC_FX='[{"id":"wa-0z8e-fx","title":"Android FLAG_SECURE R&D","priority":2,"issue_type":"feature","description":"","status":"open","labels":["story:approved"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{"story.rig":"whatsapp_automation"}}]'
+LOG24B="$(run_wa_rig_tier2 "$WA_RIG_EMPTYSPEC_FX" "$HQ_BUG_FX")"
+if echo "$LOG24B" | grep -q "Lane picks.*wa-0z8e-fx\|WOULD DISPATCH.*wa-0z8e-fx\|small: wa-0z8e-fx\|big: wa-0z8e-fx"; then
+  bad "REGRESSION: empty-spec WA story:approved feature (wa-0z8e-fx) dispatched — ga-wisp-a1radr gap not fixed"
+else
+  ok "empty-spec WA story:approved feature (wa-0z8e-fx) NOT dispatched (spec-floor gate b enforced)"
+fi
+
+# ── Scenario 24c: a well-specified, non-exec:manual feature still dispatches ─
+echo "Scenario 24c: well-specified WA story:approved feature still dispatches (no regression)"
+WA_RIG_GOODSPEC_FX='[{"id":"wa-good-fx","title":"Well-specified WA feature fixture","priority":2,"issue_type":"feature","description":"Implement WhatsApp group membership sync with Pipedrive contacts — at least 80 chars of genuine spec","status":"open","labels":["story:approved"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{"story.rig":"whatsapp_automation"}}]'
+LOG24C="$(run_wa_rig_tier2 "$WA_RIG_GOODSPEC_FX" "$HQ_BUG_FX")"
+# Match the log patterns the dispatcher emits for a DRY_RUN dispatch:
+#   "build story wa-good-fx:" appears in the Task title line inside the WOULD DISPATCH block.
+#   "→ story:in-flight.*wa-good-fx" appears in the post-dispatch summary line.
+if echo "$LOG24C" | grep -q "wa-good-fx.*story:in-flight\|story:in-flight.*wa-good-fx\|build story wa-good-fx\|Selected.*wa-good-fx"; then
+  ok "Well-specified WA story:approved feature (wa-good-fx) dispatched (no false-drop)"
+else
+  bad "Well-specified WA story:approved feature (wa-good-fx) NOT dispatched — false-drop regression"
+fi
+
+# ── Scenario 24d: structural — full filter chain wired in the override seam ──
+echo "Scenario 24d: structural — _filter_exec_manual + _filter_dispatch_gates wired in WA rig tier-2"
+if grep -qF '_filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built' "$DISPATCHER"; then
+  ok "_filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built found in dispatcher (full chain)"
+else
+  bad "Full filter chain NOT found in dispatcher — WA rig tier-2 gap fix may be incomplete"
+fi
+# The override seam must also apply the full chain (test coverage would be hollow otherwise).
+# Check that the override block feeds into _filter_exec_manual (not just _filter_candidates).
+if awk '/PILOT_WA_RIG_TIER2_OVERRIDE\+x/,/PILOT_WA_RIG_APPROVED_QUERIES/' "$DISPATCHER" \
+    | grep -qF '_filter_exec_manual'; then
+  ok "Override test seam also applies _filter_exec_manual (hermetic tests exercise the gate)"
+else
+  bad "Override test seam does NOT apply _filter_exec_manual — filter tests are hollow"
+fi
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
