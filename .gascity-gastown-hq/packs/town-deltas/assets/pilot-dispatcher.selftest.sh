@@ -413,7 +413,8 @@ run_sling_retry() { # $1=FAKE_SLING_FAIL_TIMES  $2=FAKE_SLING_ALWAYS_FAIL(0|1)
 # Runs a DRY dispatch with the ga-rk5va dispatch-to-capacity feature exercised:
 # Dolt health is forced via the override seams so the gate is deterministic (no
 # live `gc dolt health` / `ps`). Default fixture = the two small bug candidates.
-#   $1 = PILOT_DOLT_CPU_OVERRIDE   (<=200 healthy, >200 saturated)
+#   $1 = PILOT_DOLT_CPU_OVERRIDE   (<=200 healthy, >200 saturated; since latency is now the
+#        AUTHORITATIVE signal, >200 also forces latency=3000 so the fixture reads saturated)
 #   $2 = FAKE_INFLIGHT_JSON        (in-flight beads for the stale-occupant test)
 #   $3 = DISPATCH_TO_CAPACITY      (default 1)
 #   $4 = FAKE_BUGS_JSON            (override the default 2-bug fixture)
@@ -429,7 +430,7 @@ run_capacity() {
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
-    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS="$([ "${1:-10}" -gt 200 ] 2>/dev/null && echo 3000 || echo 100)" \
     PILOT_DOLT_CPU_OVERRIDE="${1:-10}" \
     FAKE_INFLIGHT_JSON="${2:-[]}" \
     DISPATCH_TO_CAPACITY="${3:-1}" \
@@ -468,7 +469,7 @@ run_ctxready() {
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
-    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS="$([ "${5:-10}" -gt 200 ] 2>/dev/null && echo 3000 || echo 100)" \
     PILOT_DOLT_CPU_OVERRIDE="${5:-10}" \
     DISPATCH_TO_CAPACITY=1 \
     PILOT_CTX_READY_QUERIES="${3:-1}" \
@@ -862,6 +863,19 @@ if echo "$LOG10" | grep -q "Lane small: dispatched 2 this sweep"; then
 else
   ok "did NOT fill multiple slots under saturation"
 fi
+
+# Scenario 10b: REGRESSION (2026-06-22 overnight pipeline stall). Latency is the AUTHORITATIVE
+# health signal — high Dolt CPU with HEALTHY latency must NOT read as saturated. Chronic CPU
+# 150-303% (amplified by memory pressure) was false-tripping the old cpu>200 ceiling → the
+# Pilot throttled ALL dispatch to 0 for hours → nothing built/gated/delivered overnight.
+echo "Scenario 10b: high CPU + healthy latency → NOT saturated (latency authoritative)"
+_DS_FN="$(awk '/^_dolt_cpu\(\)/{c=1} c{print} c&&/^}$/{c=0} /^_dolt_saturated\(\)/{s=1} s{print} s&&/^}$/{exit}' "$DISPATCHER")"
+_ds() { ( eval "$_DS_FN"; PILOT_DOLT_LATENCY_MAX_MS=2500; PILOT_DOLT_CPU_MAX=200; \
+          DOLT_LATENCY_MS="$1" PILOT_DOLT_CPU_OVERRIDE="$2" _dolt_saturated && echo SAT || echo OK ); }
+[ "$(_ds 62 303)" = OK ]   && ok "lat=62ms cpu=303% → healthy (the exact overnight bug, fixed)" || bad "lat=62 cpu=303 still SATURATED (bug)"
+[ "$(_ds 3000 50)" = SAT ] && ok "lat=3000ms → saturated (real storm still caught)"             || bad "high latency not caught"
+[ "$(_ds '' 303)" = SAT ]  && ok "latency blind + cpu=303% → saturated (CPU fallback)"          || bad "CPU fallback broken"
+[ "$(_ds '' '')" = SAT ]   && ok "both probes blind → saturated (fail-safe)"                    || bad "fail-safe broken"
 
 # ── Scenario 10b: feature switch off → legacy single-pick even when healthy ────
 echo "Scenario 10b: DISPATCH_TO_CAPACITY=0 → single dispatch even on a healthy Dolt"

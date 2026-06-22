@@ -943,20 +943,26 @@ _dolt_cpu() {
 # _dolt_saturated — return 0 (saturated → back off) / 1 (healthy). FAIL-SAFE:
 # missing latency AND missing cpu (probe failed) → saturated.
 _dolt_saturated() {
-  local _lat _cpu _have=0
+  local _lat _cpu
   _lat="$DOLT_LATENCY_MS"
   _cpu="$(_dolt_cpu)"
+  # Latency is the AUTHORITATIVE health signal. When present it DECIDES: a healthy
+  # latency with high CPU means Dolt is working efficiently (chronically 150-300% on
+  # this 10-core box, especially under memory pressure) — NOT saturated. CPU is
+  # consulted ONLY as a fallback when the latency probe is blind. (2026-06-22: cpu>200
+  # was false-tripping at latency=62ms cpu=303%, throttling ALL dispatch to 0 → the
+  # whole pipeline stalled overnight. Same chronic-CPU-not-latency class as the gate's
+  # GATE_DOLT_CPU_HOT recalibration.)
   if [ -n "$_lat" ] && [ "$_lat" -ge 0 ] 2>/dev/null; then
-    _have=1
     [ "$_lat" -gt "$PILOT_DOLT_LATENCY_MAX_MS" ] 2>/dev/null && return 0
+    return 1   # latency healthy → NOT saturated, regardless of CPU
   fi
   if [ -n "$_cpu" ] && [ "$_cpu" -ge 0 ] 2>/dev/null; then
-    _have=1
     [ "$_cpu" -gt "$PILOT_DOLT_CPU_MAX" ] 2>/dev/null && return 0
+    return 1
   fi
-  # No usable signal at all → fail-safe to saturated (conservative backoff).
-  [ "$_have" -eq 0 ] && return 0
-  return 1
+  # No usable signal at all (both probes blind) → fail-safe to saturated.
+  return 0
 }
 
 # ── ga-d0hz3: cross-stage gate-congestion probe ───────────────────────────────
