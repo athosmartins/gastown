@@ -553,7 +553,7 @@ rig_domain_exclude() {
   case "$1/$2" in
     whatsapp_automation/frontend|wa/frontend)       echo "digo-wa" ;;
     whatsapp_automation/real-estate|wa/real-estate) echo "oracle-wa digo-wa thies-wa" ;;
-    whatsapp_automation/warming|wa/warming)         echo "peter-wa thies-wa" ;;
+    whatsapp_automation/warming|wa/warming)         echo "digo-wa mila-wa peter-wa thies-wa" ;;  # warming → SÓ oracle-wa (dono) ou DEFER; nunca mila/digo (ga-wisp-jmrn5q)
     *)                                              echo ""        ;;
   esac
 }
