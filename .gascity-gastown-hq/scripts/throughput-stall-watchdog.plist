@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.throughput-stall-watchdog</string>
+
+  <!-- Throughput-stall watchdog (2026-06-23). Fills the blind spot that let the
+       pipeline sit idle for ~13h on 2026-06-23 without any existing monitor firing:
+
+       WHAT THE EXISTING MONITORS MISS:
+         • pipeline-throughput-heartbeat.py — detects dispatched=0 ONLY when the Pilot
+           log shows "Dispatch tier: X (N candidate(s))" with free slots. If the Pilot's
+           BD query returns 0 candidates (wrong rig scope, filter bug, ctx:ready missing),
+           it logs "No dispatchable candidates" and the heartbeat treats that as a
+           legitimately empty backlog — stays silent. Blind to "pilot can't see the backlog".
+         • production-stall-watchdog.py — merge-stall fires ONLY when queued>0 in the
+           gate. If work never gets dispatched there are no gate markers, so queued==0
+           and this check explicitly returns None ("starved/idle, not merge-stalled").
+           Story:approved count alone was removed as a trigger because it false-fired
+           on a healthy-but-starved-gate (no markers = no gate demand).
+         • Neither monitor cross-checks actual bead state vs pipeline output independently.
+
+       THIS WATCHDOG: every 1800s it independently:
+         1. Counts real dispatchable backlog: bd list story:approved + ctx:ready across
+            all rig stores, excluding braked (gate:needs-human / exec:manual / blocked /
+            in-flight) beads. If backlog < TSW_BACKLOG_MIN (default 1) → idle, no alert.
+         2. Checks dispatch signal in TSW_STALL_HOURS (default 6h): any "dispatched=N"
+            (N>0) sweep-complete lines in the pilot log → flow, no alert.
+         3. Checks merge signal in the window: any "Gate PASSED" in the gate log AND/OR
+            git commits to any rig origin/main → flow, no alert.
+         4. If backlog >= 1 AND dispatch==0 AND merge==0 → STALL DETECTED. Requires
+            TSW_CONFIRM_SWEEPS (default 2) consecutive detections before escalating.
+            A non-stall sweep resets the counter. Per-dimension cooldown suppresses
+            re-escalation while the Mayor is still handling a prior alert.
+         5. On confirmed stall: notify -p 4 (high priority) + gc mail send mayor with
+            backlog count, hours since last dispatch/merge, and top-5 starved bead ids.
+         6. FAIL-SAFE: any unreadable signal → treated as flow present, never fires.
+
+       Anti-flap: 2 consecutive sweeps confirm (a transient gap never pages anyone).
+       Cooldown: TSW_COOLDOWN_SEC (default 6h) suppresses re-page while Mayor handles it.
+       State: persisted in .gc/throughput-stall-watchdog-state.json (survives restart).
+       Kill-switch: TSW_ENABLED=0 → no-op.
+
+       DPW_CRITICAL: add com.gascity.throughput-stall-watchdog to DPW_CRITICAL after
+       Mayor deploys (edit daemon-presence-watchdog.sh default set; do NOT do it here).
+
+       Cadence: 1800s (30min). Stall is a slow-moving condition; a 30min interval with
+       2-sweep confirmation means minimum 1h to alert — appropriate for a 6h window.
+       RunAtLoad ensures it starts on boot without waiting the first interval.
+       KeepAlive restarts on crash; the script's internal sleep sets real cadence. -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/throughput-stall-watchdog.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+
+  <!-- Stagger 10min off boot to avoid lockstep with other monitors. -->
+  <key>ThrottleInterval</key><integer>600</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/throughput-stall-watchdog-launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/throughput-stall-watchdog-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>TSW_ENABLED</key>
+    <string>1</string>
+    <key>TSW_DRY_RUN</key>
+    <string>0</string>
+    <!-- Stall window: 6h. Increase to 8 or 12 if legitimate "quiet hours" cause false alarms. -->
+    <key>TSW_STALL_HOURS</key>
+    <string>6</string>
+    <!-- Min backlog to consider a stall: 1 ready bead is enough to trigger on 0-flow -->
+    <key>TSW_BACKLOG_MIN</key>
+    <string>1</string>
+    <!-- Consecutive stall sweeps required before escalating (anti-flap) -->
+    <key>TSW_CONFIRM_SWEEPS</key>
+    <string>2</string>
+    <!-- 6h cooldown: don't re-page while Mayor is already handling a prior alert -->
+    <key>TSW_COOLDOWN_SEC</key>
+    <string>21600</string>
+  </dict>
+</dict>
+</plist>
