@@ -39,6 +39,10 @@ _add() {    # store id label
   [ "$LCJ_DRY_RUN" = "1" ] && { log "  DRY: would add $3 to $2"; return 0; }
   "$BD" -C "$1" label add "$2" "$3" -q >/dev/null 2>&1 || true
 }
+_unassign() {  # store id — clear a stale assignee (R4)
+  [ "$LCJ_DRY_RUN" = "1" ] && { log "  DRY: would clear assignee of $2"; return 0; }
+  "$BD" -C "$1" update "$2" --assignee "" -q >/dev/null 2>&1 || true
+}
 _ids() {    # store + list-args → bead ids (one per line), jq-filtered
   "$BD" -C "$1" "${@:2}" --json -n 0 2>/dev/null | jq -r "$JQ" 2>/dev/null
 }
@@ -76,6 +80,27 @@ run_sweep() {
       [ -n "$id" ] || continue
       _open "$store" "$id"; _strip "$store" "$id" pilot:dispatched
       log "R3 in_progress-no-worker: $id ($(basename "$store")) — set status=open"; n=$((n+1))
+    done
+
+    # R4: READY (story:approved OR ctx:ready), status=open, WITH an assignee but NOT being built
+    # (no story:in-flight) → the assignee is a STALE/phantom worker. Athos: "quase todas as Aprovadas
+    # com worker desnecessário" — manual cleanups kept recurring (the Pilot/refiner leaves an assignee
+    # on a bead that then sits ready, not building). Clear it so the painel shows it unassigned and the
+    # Pilot re-routes cleanly on real dispatch. EXCLUDE intentional assignments: exec:manual (held for
+    # a human), gate:needs-human (braked for review), story:blocked (assignee may be unblocking).
+    _r4_seen=" "
+    for _rlbl in story:approved ctx:ready; do
+      for id in $("$BD" -C "$store" list -l "$_rlbl" --status open --json -n 0 2>/dev/null \
+                  | jq -r '.[] | select((.assignee // "") != "" and (.assignee // "") != "mayor")
+                          | ([.labels[]?]) as $l
+                          | select(($l|index("story:in-flight"))==null and ($l|index("exec:manual"))==null and ($l|index("gate:needs-human"))==null and ($l|index("story:blocked"))==null)
+                          | .id' 2>/dev/null); do
+        [ -n "$id" ] || continue
+        case "$_r4_seen" in *" $id "*) continue ;; esac
+        _r4_seen="$_r4_seen$id "
+        _unassign "$store" "$id"; _strip "$store" "$id" pilot:dispatched
+        log "R4 ready-stale-assignee: $id ($(basename "$store")) — cleared phantom assignee"; n=$((n+1))
+      done
     done
   done
   # CRITICAL: Dolt auto-commit is OFF (dolt.auto-commit=off). A `bd label remove`/`update` writes
