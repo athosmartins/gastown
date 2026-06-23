@@ -1224,7 +1224,7 @@ _filter_exec_manual() {
 # Pure read, no side effects; fail-open → pass through unchanged on any jq error.
 _filter_dispatch_gates() {
   jq --argjson floor "${PILOT_CTX_MIN_SPEC_CHARS:-20}" '[ .[] | select(
-      (((.status) // "open") as $s | ($s != "blocked" and $s != "closed"))
+      (((.status) // "open") as $s | ($s != "blocked" and $s != "closed" and $s != "deferred"))
       and ( (((.metadata["story.criterios"]) // "") | test("\\S"))
         or (((.description) // "") | length) >= $floor )
       and (((.labels // []) | map(select(test("^(blocked-on|depends-on):"))) | length) == 0)
