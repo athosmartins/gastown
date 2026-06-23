@@ -629,6 +629,7 @@ bead_content_rig() {
 rig_domain_default_builder() {
   case "$1" in
     property_scrapers|ps)   echo "batista-ps" ;;
+    whatsapp_automation|wa) echo "mila-wa"    ;;
     *)                      echo ""           ;;
   esac
 }
@@ -2443,11 +2444,12 @@ if [ "$PILOT_CTX_READY_RIG_QUERIES" = "1" ]; then
       --exclude-type epic \
       -n 0 \
       2>/dev/null || echo "[]")
-    # Same type restriction: chore/task/debt only (not features, not bugs).
+    # Type restriction: chore/task/debt/bug (NOT features — features flow via refino-gate→approved).
+    # Bugs are ctx-complete (ctx:ready) and skip the refinement funnel, so they dispatch here.
     _rig_ctx_typed=$(echo "$_rig_ctx_raw" | jq '
         [ .[] | select(
             ((.issue_type // .type // "") | ascii_downcase) as $t
-            | ($t == "chore" or $t == "task" or $t == "debt" or $t == "tech-debt")
+            | ($t == "chore" or $t == "task" or $t == "debt" or $t == "tech-debt" or $t == "bug")
               or (((.labels // []) | index("tech-debt")) != null)
           ) ]' 2>/dev/null || echo "[]")
     # Same filter chain + exec:manual safety belt + ga-mfeip dispatch quality gates.

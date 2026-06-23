@@ -245,7 +245,22 @@ if [ "${REFINO_GATE_LIB:-0}" = "1" ]; then
 fi
 
 # ── bd/gc wrappers ────────────────────────────────────────────────────────────
-bd_() { bd -C "$GC_CITY" "$@"; }
+# Multi-store: the refino-gate must scan ALL rig stores — WA/PS features live in
+# their OWN stores, not HQ. A hardwired `bd -C HQ` left 13 WA features stuck in
+# refino-review purgatory for DAYS (never promoted → never approved → never
+# dispatched = 0 throughput). bd_ targets the store of the story currently being
+# processed (REFINO_GATE_STORE), set per-story after selection (and per stuck bead
+# in the TTL loop). Default = HQ.
+REFINO_GATE_STORES="${REFINO_GATE_STORES:-$GC_CITY /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers}"
+REFINO_GATE_STORE="${REFINO_GATE_STORE:-$GC_CITY}"
+_refino_store_for() {  # resolve a bead's store from its id prefix
+  case "${1%%-*}" in
+    wa) echo "/Users/athos/gt/whatsapp_automation" ;;
+    ps) echo "/Users/athos/gt/property_scrapers" ;;
+    *)  echo "$GC_CITY" ;;
+  esac
+}
+bd_() { bd -C "$REFINO_GATE_STORE" "$@"; }
 
 # ── Step 0: TTL recovery — re-queue stories stuck mid-review ──────────────────
 # If a story has been in refino-gate:reviewing for > TTL, the dispatcher that
@@ -253,12 +268,18 @@ bd_() { bd -C "$GC_CITY" "$@"; }
 # a later) sweep re-reviews it. Mirrors the code gate's dispatching-TTL recovery.
 log "Refino gate sweep start (max_rounds=$REFINO_MAX_ROUNDS, timeout=${REFINO_VERDICT_TIMEOUT_MINUTES}m, dry_run=$DRY_RUN)"
 
-STUCK_JSON=$(bd_ list --label story:refino-review --label refino-gate:reviewing \
-  --type feature --status open --json 2>/dev/null || echo "[]")
+STUCK_JSON="[]"
+for _s in $REFINO_GATE_STORES; do
+  [ -d "$_s" ] || continue
+  _st=$(bd -C "$_s" list --label story:refino-review --label refino-gate:reviewing \
+    --type feature --status open --json 2>/dev/null || echo "[]")
+  STUCK_JSON=$(printf '%s\n%s' "$STUCK_JSON" "$_st" | jq -s 'add // []' 2>/dev/null || echo "$STUCK_JSON")
+done
 NOW_EPOCH=$(date +%s)
 echo "$STUCK_JSON" | jq -c '.[]?' 2>/dev/null | while IFS= read -r row; do
   s_id=$(echo "$row" | jq -r '.id // empty')
   [ -z "$s_id" ] && continue
+  REFINO_GATE_STORE=$(_refino_store_for "$s_id")   # TTL ops hit the stuck bead's own store
   s_upd=$(echo "$row" | jq -r '.updated_at // empty')
   [ -z "$s_upd" ] && continue
   upd_epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$s_upd" +%s 2>/dev/null \
@@ -277,11 +298,16 @@ done
 # ── Step 1: Find queued stories (refined, awaiting refino-gate) ───────────────
 # Eligible = story:refino-review, NOT already being reviewed, NOT escalated, and
 # NOT already promoted. FIFO by creation: oldest refined story first.
-QUEUE_JSON=$(bd_ list --label story:refino-review --type feature --status open \
-  --exclude-label refino-gate:reviewing \
-  --exclude-label story:needs-approval \
-  --exclude-label story:approved \
-  --json 2>/dev/null || echo "[]")
+QUEUE_JSON="[]"
+for _s in $REFINO_GATE_STORES; do
+  [ -d "$_s" ] || continue
+  _q=$(bd -C "$_s" list --label story:refino-review --type feature --status open \
+    --exclude-label refino-gate:reviewing \
+    --exclude-label story:needs-approval \
+    --exclude-label story:approved \
+    --json 2>/dev/null || echo "[]")
+  QUEUE_JSON=$(printf '%s\n%s' "$QUEUE_JSON" "$_q" | jq -s 'add // []' 2>/dev/null || echo "$QUEUE_JSON")
+done
 
 QCOUNT=$(echo "$QUEUE_JSON" | jq 'length' 2>/dev/null || echo 0)
 if [ "$QCOUNT" -eq 0 ] 2>/dev/null; then
@@ -296,6 +322,8 @@ STORY=$(echo "$QUEUE_JSON" | jq -c 'sort_by(.created_at // .id) | .[0]')
 STORY_ID=$(echo "$STORY" | jq -r '.id')
 STORY_TITLE=$(echo "$STORY" | jq -r '.title // ""')
 log "Selected story for review: $STORY_ID — $STORY_TITLE"
+REFINO_GATE_STORE=$(_refino_store_for "$STORY_ID")   # claim/review/promote hit the story's OWN store
+log "  Story store: $REFINO_GATE_STORE (prefix ${STORY_ID%%-*})"
 
 # ── Step 2: Atomic claim — mark as under review (pill 'em revisão' keys here) ──
 # Add refino-gate:reviewing alongside story:refino-review (do NOT drop the
