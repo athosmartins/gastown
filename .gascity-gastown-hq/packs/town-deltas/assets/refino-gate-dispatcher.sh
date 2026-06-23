@@ -487,6 +487,9 @@ refino_spawn_reviewer() {
   fi
 
   gc --city "$GC_CITY" session wake "$SESSION_ID" 2>/dev/null || true
+  # Pin the reviewer drain-exempt (mirrors the code gate's reviewer pin) so a
+  # CopyFiles config-drift supervisor event can't drain it mid-review.
+  gc --city "$GC_CITY" session pin "$SESSION_ID" 2>/dev/null || true
 
   # Durable pull channel (ga-67hae): assign the verdict bead to the (new) reviewer
   # and embed the rubric as a comment, THEN nudge. The nudge is a fast-path; the
