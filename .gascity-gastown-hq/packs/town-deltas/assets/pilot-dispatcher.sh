@@ -1583,17 +1583,11 @@ _ttl_recover_db() {
   done
 }
 
-TTL_NOW_EPOCH=$(date +%s)
-TTL_SECS=$((CLAIM_TTL_MINUTES * 60))
-
-_ttl_recover_db "$GC_CITY" "$TTL_NOW_EPOCH" "$TTL_SECS"
-
-_ttl_rig_paths=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
-  | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
-while IFS= read -r _ttl_rig; do
-  [ -z "$_ttl_rig" ] || [ ! -d "$_ttl_rig" ] && continue
-  _ttl_recover_db "$_ttl_rig" "$TTL_NOW_EPOCH" "$TTL_SECS"
-done <<< "$_ttl_rig_paths"
+# ── TTL claim-recovery — INVOCATION RELOCATED below (ga-wisp-1gdiik crash-loop fix) ──
+# _ttl_recover_db calls _sling_is_live / uses STALE_SLING_SECONDS / _ownership_guard_repos,
+# all defined ~290 lines down. Invoking here aborted under `set -u` (STALE_SLING_SECONDS
+# unbound) the moment a stale sling existed → Pilot exit=1 crash-loop. The whole block now
+# runs right after those helpers are defined — search "TTL claim-recovery (relocated)".
 
 # ── Step 1: Per-lane capacity check ──────────────────────────────────────────
 # Count in-flight beads per lane by reading their lane:big / lane:small labels.
@@ -1874,6 +1868,22 @@ _ownership_guard_repos() {
   fi
   printf '%s' "$_OWNERSHIP_GUARD_REPOS"
 }
+
+# ── TTL claim-recovery (relocated from ~L1586, ga-wisp-1gdiik) ────────────────
+# Runs HERE, after the stale-sling helpers + _ownership_guard_repos are defined, so
+# _ttl_recover_db has every symbol it needs (was a define-after-use crash under set -u).
+# Still runs before the candidate/dispatch queries, so released claims flow this sweep.
+TTL_NOW_EPOCH=$(date +%s)
+TTL_SECS=$((CLAIM_TTL_MINUTES * 60))
+
+_ttl_recover_db "$GC_CITY" "$TTL_NOW_EPOCH" "$TTL_SECS"
+
+_ttl_rig_paths=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
+  | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
+while IFS= read -r _ttl_rig; do
+  [ -z "$_ttl_rig" ] || [ ! -d "$_ttl_rig" ] && continue
+  _ttl_recover_db "$_ttl_rig" "$TTL_NOW_EPOCH" "$TTL_SECS"
+done <<< "$_ttl_rig_paths"
 
 # _beadid_has_crew_branch <bead_id> — exit 0 iff a branch named like
 # `crew/<owner>/<bead-id>` exists in ANY town/rig repo, local OR remote-tracking,
