@@ -34,6 +34,11 @@ LOG_DIR="$GC_CITY/.gc/logs"
 LOG="$LOG_DIR/quality-gate-dispatcher.log"
 QG_LOG="$GC_CITY/.gc/quality-gate.jsonl"
 
+# imp18: Per-repo git mutation mutex lib — source fail-soft; provides git_mutex_acquire/release.
+_GLH_SCRIPT="${GC_CITY}/scripts/git-lock-hygiene.sh"
+[ -f "$_GLH_SCRIPT" ] && { GIT_LOCK_HYGIENE_LIB=1 source "$_GLH_SCRIPT" 2>/dev/null; } || true
+unset _GLH_SCRIPT
+
 # Maximum wall-clock minutes to wait for all reviewer verdicts before timing out.
 VERDICT_TIMEOUT_MINUTES="${VERDICT_TIMEOUT_MINUTES:-22}"
 
@@ -2009,7 +2014,23 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     AUTO_REBASE_OK=0
     TMP_REBASE_WT="/tmp/gc-gate-autorebase-$$"
 
-    if [ "$IS_CONTAINER_RIG" = "1" ]; then
+    # imp18: Acquire per-repo mutation mutex before any git worktree/rebase/push ops.
+    # If a live holder exists, treat as transient (next sweep retries; mutex + janitor
+    # together ensure locks never block a rig permanently). Skipped gracefully when the
+    # mutex lib was not sourced (git_mutex_acquire not defined).
+    _REBASE_MUTEX_HELD=0
+    if type git_mutex_acquire >/dev/null 2>&1; then
+      if git_mutex_acquire "$RIG_PATH" 2>/dev/null; then
+        _REBASE_MUTEX_HELD=1
+      else
+        warn "  Auto-rebase (imp18): per-repo mutex held for $RIG_PATH — transient skip; janitor will clear stale locks"
+        HAS_CONFLICT=1
+        CONFLICT_KIND="transient"
+        CONFLICT_FILES="per-repo git mutex held (imp18 — another git op in progress)"
+      fi
+    fi
+
+    if [ "$IS_CONTAINER_RIG" = "1" ] && [ "$HAS_CONFLICT" = "0" ]; then
       # Container rig (bare repo): worktree uses the bare .repo.git
       if git_rig worktree add "$TMP_REBASE_WT" "origin/$BRANCH" 2>/dev/null; then
         # Configure git user inside worktree for the rebase commit
@@ -2042,7 +2063,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       else
         warn "  Could not create auto-rebase worktree at $TMP_REBASE_WT"
       fi
-    else
+    elif [ "$HAS_CONFLICT" = "0" ]; then
       # Self-repo rig
       if git -C "$GIT_DIR_PATH" worktree add "$TMP_REBASE_WT" "origin/$BRANCH" 2>/dev/null; then
         git -C "$TMP_REBASE_WT" config user.email "gate-dispatcher@gascity.local" 2>/dev/null || true
@@ -2074,6 +2095,8 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
         warn "  Could not create auto-rebase worktree (self-repo) at $TMP_REBASE_WT"
       fi
     fi
+    # imp18: release the per-repo mutex (noop if never acquired or lib not loaded)
+    [ "$_REBASE_MUTEX_HELD" = "1" ] && { type git_mutex_release >/dev/null 2>&1 && git_mutex_release "$RIG_PATH" 2>/dev/null || true; }
 
     if [ "$AUTO_REBASE_OK" = "1" ] && [ "$BRANCH_IS_CURRENT" = "1" ]; then
       log "  Auto-rebase complete — branch is now current. Continuing with review."

@@ -31,7 +31,7 @@ STATE="${DPW_STATE:-/Users/athos/gt/.gascity-gastown-hq/.gc/daemon-presence-stat
 UID_NUM="$(id -u)"
 DPW_RELOAD="${DPW_RELOAD:-1}"     # 1 = auto-reload absent critical daemons; 0 = alert only.
 
-DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector com.gascity.lifecycle-coherence-janitor com.gascity.crew-autopin-guard com.gascity.lifecycle-correctness-auditor com.gascity.throughput-stall-watchdog}"
+DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector com.gascity.lifecycle-coherence-janitor com.gascity.crew-autopin-guard com.gascity.lifecycle-correctness-auditor com.gascity.throughput-stall-watchdog com.gascity.git-lock-hygiene}"
 
 HQ="${DPW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 
@@ -93,6 +93,15 @@ DPW_GC_PROVENANCE_MARKER="${DPW_GC_PROVENANCE_MARKER:-IsTransientDoltError}"
 DPW_CHECK_GT_PROVENANCE="${DPW_CHECK_GT_PROVENANCE:-1}"
 DPW_GT_PROVENANCE_MARKER="${DPW_GT_PROVENANCE_MARKER:-BuiltProperly}"
 
+# ── imp17: crash-loop auto-heal tier ─────────────────────────────────────────
+# On a crash-loop (2 consecutive nonzero exits), automatically attempt a targeted
+# kickstart -k before paging a human. DPW_CRASHLOOP_HEAL_MAX attempts are made;
+# if the daemon is still crash-looping after the budget is exhausted (or if
+# kickstart itself fails), escalate to Mayor. DPW_CRASHLOOP_AUTOHEAL=0 reverts
+# to legacy alert-only behaviour (no auto-restart, for testing/audit).
+DPW_CRASHLOOP_AUTOHEAL="${DPW_CRASHLOOP_AUTOHEAL:-1}"   # 1=on, 0=alert-only
+DPW_CRASHLOOP_HEAL_MAX="${DPW_CRASHLOOP_HEAL_MAX:-2}"   # max kickstart attempts before escalation
+
 # A label is loaded iff `launchctl list <label>` succeeds.
 _loaded()    { launchctl list "$1" >/dev/null 2>&1; }
 # The last-exit-status column (2nd field) for a loaded label; empty if not listed.
@@ -108,6 +117,14 @@ _fail_count_file() { echo "${STATE}.fail-counts/$1"; }
 _fail_count_get()  { local f; f="$(_fail_count_file "$1")"; [ -f "$f" ] && cat "$f" 2>/dev/null || echo 0; }
 _fail_count_set()  { local f; f="$(_fail_count_file "$1")"; mkdir -p "$(dirname "$f")" 2>/dev/null || true; printf '%s\n' "$2" > "$f" 2>/dev/null || true; }
 _fail_count_reset(){ local f; f="$(_fail_count_file "$1")"; rm -f "$f" 2>/dev/null || true; }
+
+# ── imp17: crash-loop heal-attempt tracking ────────────────────────────────────
+# Per-daemon heal-attempt counter living in ${STATE}.crashloop-heals/<label>.
+# Content: single integer (attempt count). Resets on clean exit or daemon absence.
+_cl_heal_file()  { echo "${STATE}.crashloop-heals/$1"; }
+_cl_heal_get()   { local f; f="$(_cl_heal_file "$1")"; [ -f "$f" ] && cat "$f" 2>/dev/null || echo 0; }
+_cl_heal_set()   { local f; f="$(_cl_heal_file "$1")"; mkdir -p "$(dirname "$f")" 2>/dev/null || true; printf '%s\n' "$2" > "$f" 2>/dev/null || true; }
+_cl_heal_reset() { rm -f "$(_cl_heal_file "$1")" 2>/dev/null || true; }
 
 # ── imp05: ProgramArguments path extraction ───────────────────────────────────
 # Parse the ProgramArguments from a launchd plist (XML). Returns the first
@@ -264,7 +281,7 @@ run_recycle_sweep() {
 }
 
 run_sweep() {
-  local absent="" reloaded="" crashloop="" failing="" wedged="" path_missing="" healthy=0 newstate="" lbl plist ex prev _hb _hblog _hbmax _age fc prog
+  local absent="" reloaded="" crashloop="" failing="" wedged="" path_missing="" healthy=0 newstate="" lbl plist ex prev _hb _hblog _hbmax _age fc prog heal_n
   local NOW; NOW="$(date +%s)"
   for lbl in $DPW_CRITICAL; do
     plist="$LAUNCH_DIR/$lbl.plist"
@@ -286,7 +303,27 @@ run_sweep() {
       # CRASH-LOOP = a POSITIVE exit (a real error, not a negative=signal restart) seen
       # on TWO consecutive checks. One transient nonzero exit never alerts.
       if [ "$ex" -gt 0 ] 2>/dev/null && [ -n "$prev" ] && [ "$prev" -gt 0 ] 2>/dev/null; then
-        crashloop="$crashloop $lbl(exit=$ex)"
+        # imp17: attempt auto-heal before paging a human
+        if [ "${DPW_CRASHLOOP_AUTOHEAL:-1}" = "1" ]; then
+          heal_n=$(( $(_cl_heal_get "$lbl") + 1 ))
+          _cl_heal_set "$lbl" "$heal_n"
+          if [ "$heal_n" -le "${DPW_CRASHLOOP_HEAL_MAX:-2}" ]; then
+            log "CRASH-LOOP-AUTOHEAL: $lbl (exit=$ex) attempt $heal_n/${DPW_CRASHLOOP_HEAL_MAX:-2} — kickstart -k"
+            if launchctl kickstart -k "gui/$UID_NUM/$lbl" 2>/dev/null; then
+              log "CRASH-LOOP-AUTOHEAL: kickstart -k succeeded for $lbl (attempt $heal_n)"
+              command -v notify >/dev/null 2>&1 && notify -t "Daemon auto-heal" -p 3 \
+                "Crash-loop auto-healed: $lbl attempt $heal_n/${DPW_CRASHLOOP_HEAL_MAX:-2}" 2>/dev/null || true
+            else
+              log "CRASH-LOOP-AUTOHEAL: kickstart -k FAILED for $lbl (attempt $heal_n) — escalating"
+              crashloop="$crashloop $lbl(exit=$ex,heal-kickstart-failed:$heal_n)"
+            fi
+          else
+            log "CRASH-LOOP-AUTOHEAL: $lbl heal budget exhausted ($heal_n/${DPW_CRASHLOOP_HEAL_MAX:-2}) — escalating to human"
+            crashloop="$crashloop $lbl(exit=$ex,heals-exhausted:$heal_n)"
+          fi
+        else
+          crashloop="$crashloop $lbl(exit=$ex)"
+        fi
       else
         healthy=$((healthy + 1))
       fi
@@ -305,6 +342,7 @@ run_sweep() {
         fi
       else
         _fail_count_reset "$lbl"
+        _cl_heal_reset "$lbl"   # imp17: daemon recovered — reset heal counter
       fi
 
       # WEDGE: loaded but its per-cycle heartbeat log went stale past threshold = stuck.
@@ -325,6 +363,7 @@ run_sweep() {
     else
       newstate="$newstate$lbl absent"$'\n'
       _fail_count_reset "$lbl"   # reset on absence (will be loaded fresh)
+      _cl_heal_reset "$lbl"      # imp17: will be reloaded fresh; reset heal counter
       if [ -f "$plist" ]; then
         absent="$absent $lbl"
         if [ "$DPW_RELOAD" = "1" ] && launchctl bootstrap "gui/$UID_NUM" "$plist" 2>/dev/null; then
@@ -381,7 +420,7 @@ run_sweep() {
   if [ -n "$absent" ] || [ -n "$crashloop" ] || [ -n "$failing" ] || [ -n "$wedged" ] || [ -n "$path_missing" ]; then
     local msg="Daemon-presence watchdog:"
     [ -n "$absent" ]      && msg="$msg ABSENT:${absent} (reloaded:${reloaded:- none})."
-    [ -n "$crashloop" ]   && msg="$msg CRASH-LOOP:${crashloop} (loaded but failing — NOT reloaded, investigate)."
+    [ -n "$crashloop" ]   && msg="$msg CRASH-LOOP:${crashloop} (auto-heal exhausted or disabled — needs Mayor/human)."
     [ -n "$failing" ]     && msg="$msg FAILING:${failing} (nonzero exit ≥${DPW_FAIL_THRESHOLD} consecutive sweeps — investigate)."
     [ -n "$wedged" ]      && msg="$msg WEDGED:${wedged} (loaded but heartbeat stale — kickstarted)."
     [ -n "$path_missing" ] && msg="$msg PATH-MISSING:${path_missing} (ProgramArguments script absent from disk — daemon will fail on restart)."
@@ -656,6 +695,74 @@ PLIST
   run_sweep && ok "gc marker present: sweep returns 0 (no alert)" || bad "gc marker present: unexpected non-zero"
   grep -q "PROVENANCE-FAIL" "$LOG" && bad "gc marker present: PROVENANCE-FAIL wrongly logged" || ok "gc marker present: no PROVENANCE-FAIL in log"
   unset -f _binary_has_marker
+  DPW_CHECK_GC_PROVENANCE=1; DPW_CHECK_GT_PROVENANCE=1
+
+  # ── imp17 selftest scenarios 18–21 ───────────────────────────────────────
+  # Re-disable provenance checks to isolate crash-loop-autoheal logic.
+  DPW_CHECK_GC_PROVENANCE=0; DPW_CHECK_GT_PROVENANCE=0
+  # Restore gc stub to silent-success (chronic-leak scenario may have changed it)
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/gc"; chmod +x "$TMP/gc"
+
+  echo "Scenario 18 (imp17): crash-loop + AUTOHEAL=1, first attempt → kickstart issued, no Mayor mail"
+  : > "$STATE"; rm -rf "${STATE}.crashloop-heals" "${STATE}.fail-counts"
+  : > "$DPW_TEST_KICKSTARTS"
+  MAILSENT18="$TMP/mailsent18"; : > "$MAILSENT18"
+  cat > "$TMP/gc" <<GCSTUB18
+#!/usr/bin/env bash
+[ "\$1" = "mail" ] && echo "\$*" >> "$MAILSENT18"
+exit 0
+GCSTUB18
+  chmod +x "$TMP/gc"
+  DPW_CRASHLOOP_AUTOHEAL=1 DPW_CRASHLOOP_HEAL_MAX=2 DPW_TEST_LOADED="$ALL" DPW_TEST_EXIT="com.gascity.beta:1"
+  run_sweep >/dev/null 2>&1    # first sweep: prev empty, no crash-loop yet
+  run_sweep && ok "AUTOHEAL=1 first attempt: kickstart succeeded → sweep returns 0 (healing in progress)" || bad "AUTOHEAL=1 first attempt: unexpected non-zero return"
+  grep -q "com.gascity.beta" "$DPW_TEST_KICKSTARTS" && ok "AUTOHEAL=1: kickstart -k issued for crash-looping daemon" || bad "AUTOHEAL=1: kickstart NOT issued"
+  [ ! -s "$MAILSENT18" ] && ok "AUTOHEAL=1: no Mayor mail on first auto-heal attempt" || bad "AUTOHEAL=1: Mayor mail sent prematurely before exhaustion"
+
+  echo "Scenario 19 (imp17): crash-loop + AUTOHEAL=0 → no kickstart, immediate escalation"
+  : > "$STATE"; rm -rf "${STATE}.crashloop-heals" "${STATE}.fail-counts"
+  : > "$DPW_TEST_KICKSTARTS"
+  MAILSENT19="$TMP/mailsent19"; : > "$MAILSENT19"
+  cat > "$TMP/gc" <<GCSTUB19
+#!/usr/bin/env bash
+[ "\$1" = "mail" ] && echo "\$*" >> "$MAILSENT19"
+exit 0
+GCSTUB19
+  chmod +x "$TMP/gc"
+  DPW_CRASHLOOP_AUTOHEAL=0 DPW_TEST_LOADED="$ALL" DPW_TEST_EXIT="com.gascity.beta:1"
+  run_sweep >/dev/null 2>&1    # first sweep: no crash-loop yet
+  : > "$DPW_TEST_KICKSTARTS"  # clear kickstarts from first sweep
+  run_sweep && bad "AUTOHEAL=0: crash-loop should escalate (return 1)" || ok "AUTOHEAL=0: crash-loop immediately escalates (return 1)"
+  [ ! -s "$DPW_TEST_KICKSTARTS" ] && ok "AUTOHEAL=0: no kickstart issued (legacy alert-only)" || bad "AUTOHEAL=0: kickstart unexpectedly issued"
+
+  echo "Scenario 20 (imp17): heal budget exhausted → escalate to human"
+  : > "$STATE"; rm -rf "${STATE}.crashloop-heals" "${STATE}.fail-counts"
+  # Pre-seed heal counter to HEAL_MAX (simulate prior attempts already consumed)
+  mkdir -p "${STATE}.crashloop-heals"
+  printf '2\n' > "${STATE}.crashloop-heals/com.gascity.beta"
+  # STATE shows beta exited 1 previously (crash-loop condition requires prev>0)
+  printf '%s\n' "com.gascity.alpha 0" "com.gascity.beta 1" "com.gascity.gamma 0" > "$STATE"
+  MAILSENT20="$TMP/mailsent20"; : > "$MAILSENT20"
+  cat > "$TMP/gc" <<GCSTUB20
+#!/usr/bin/env bash
+[ "\$1" = "mail" ] && echo "\$*" >> "$MAILSENT20"
+exit 0
+GCSTUB20
+  chmod +x "$TMP/gc"
+  DPW_CRASHLOOP_AUTOHEAL=1 DPW_CRASHLOOP_HEAL_MAX=2 DPW_TEST_LOADED="$ALL" DPW_TEST_EXIT="com.gascity.beta:1"
+  run_sweep && bad "heal budget exhausted: should escalate (return 1)" || ok "heal budget exhausted (3rd attempt > max=2): escalates to human (return 1)"
+  grep -q "heals-exhausted" "$LOG" 2>/dev/null && ok "heal budget exhausted: 'heals-exhausted' in log" || bad "heal budget exhausted: missing log entry"
+
+  echo "Scenario 21 (imp17): daemon recovers (clean exit) → heal counter reset"
+  : > "$STATE"; rm -rf "${STATE}.crashloop-heals" "${STATE}.fail-counts"
+  mkdir -p "${STATE}.crashloop-heals"
+  printf '1\n' > "${STATE}.crashloop-heals/com.gascity.beta"
+  DPW_CRASHLOOP_AUTOHEAL=1 DPW_TEST_LOADED="$ALL" DPW_TEST_EXIT=""  # all exit 0
+  run_sweep && ok "daemon recovered (ex=0): sweep returns 0 (healthy)" || bad "clean exit after heal: unexpected non-zero"
+  [ ! -f "${STATE}.crashloop-heals/com.gascity.beta" ] && ok "daemon recovered: heal counter file removed" || bad "daemon recovered: heal counter NOT reset"
+
+  # Restore gc stub
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/gc"; chmod +x "$TMP/gc"
   DPW_CHECK_GC_PROVENANCE=1; DPW_CHECK_GT_PROVENANCE=1
 
   echo ""
