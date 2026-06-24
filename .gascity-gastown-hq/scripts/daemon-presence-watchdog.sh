@@ -81,16 +81,19 @@ log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] $*" >> "
 # crash-loop) but override-able for daemons that occasionally fail transiently.
 DPW_FAIL_THRESHOLD="${DPW_FAIL_THRESHOLD:-2}"
 
-# ── imp05: binary-provenance config ──────────────────────────────────────────
-# gc must carry the f8r9e Dolt-retry patch (IsTransientDoltError); if strings returns no
-# match the binary has been rebuilt/reverted from source without the patch. Fail-open:
-# if `strings` or `which gc` is unavailable, skip silently.
-DPW_CHECK_GC_PROVENANCE="${DPW_CHECK_GC_PROVENANCE:-1}"
+# ── imp05: binary-provenance config (DEFAULT-OFF — false-positive under launchd) ─
+# These check that a build marker is present in the gc/gt binary (gc: IsTransientDoltError,
+# gt: BuiltProperly) via `strings`. Under launchd's LOW run priority `strings` on the big
+# Go binary TIMES OUT → the marker reads "absent" when it is present → a false "binary
+# provenance" alert that spams ntfy. Confirmed 2026-06-24: gc HAS IsTransientDoltError(×1),
+# gt HAS BuiltProperly(×2) — both PASS a manual strings|grep; the alerts were ALL false.
+# The deploy-time Makefile gate (gt rebuild requires BuiltProperly) already blocks a real
+# reverted build, so this runtime check is redundant + unreliable → DEFAULTED OFF.
+# Re-enable per-host with DPW_CHECK_G{C,T}_PROVENANCE=1 ONLY after a launchd-safe check is
+# wired (e.g. nice'd strings with a long timeout, nm, or a precomputed checksum).
+DPW_CHECK_GC_PROVENANCE="${DPW_CHECK_GC_PROVENANCE:-0}"
 DPW_GC_PROVENANCE_MARKER="${DPW_GC_PROVENANCE_MARKER:-IsTransientDoltError}"
-
-# gt must carry BuiltProperly=1 in its ldflags (ensures the version was built with the
-# Makefile, not plain go build). Same fail-open behaviour.
-DPW_CHECK_GT_PROVENANCE="${DPW_CHECK_GT_PROVENANCE:-1}"
+DPW_CHECK_GT_PROVENANCE="${DPW_CHECK_GT_PROVENANCE:-0}"
 DPW_GT_PROVENANCE_MARKER="${DPW_GT_PROVENANCE_MARKER:-BuiltProperly}"
 
 # ── imp17: crash-loop auto-heal tier ─────────────────────────────────────────
