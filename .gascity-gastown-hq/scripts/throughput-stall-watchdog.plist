@@ -93,6 +93,8 @@
     <!-- 6h cooldown: don't re-page while Mayor is already handling a prior alert -->
     <key>TSW_COOLDOWN_SEC</key>
     <string>21600</string>
+    <key>BD_ACTOR</key>
+    <string>automation</string>
   </dict>
 </dict>
 </plist>

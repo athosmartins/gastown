@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.production-stall-watchdog</string>
+
+  <!-- Production-stall watchdog (2026-06-18). Closes the gap that left the system
+       producing NOTHING for ~2h: the WA rig root was AHEAD of origin/main (unpushed
+       commits) → the deploy cron's `git pull --ff-only` aborted → no daemon deployed,
+       and NO monitor acted. town-root-reconciler only ntfy-alerts a sleeping human and
+       won't auto-reconcile an ahead/diverged root; pipeline-throughput-heartbeat
+       watches only gate-merge / pilot FLOW (blind to deploy-block + stuck execution).
+
+       This watchdog detects production-stall across three dimensions —
+       (1) DEPLOY-BLOCK: any rig root (HQ / whatsapp_automation / property_scrapers)
+           ahead of origin/main (unpushed = ff-pull deploy blocked) or diverged;
+       (2) MERGE-STALL: no gate merge for 3h WHILE pending work exists;
+       (3) STUCK-EXEC: an in_progress bead not updated for 8h —
+       and ESCALATES TO THE MAYOR (`gc mail send mayor`, durable, an agent that can
+       ACT) plus a notify -p 4 to Athos. It NEVER auto-reconciles (a blind reset is
+       destructive with uncommitted edits) — the Mayor reconciles deliberately.
+
+       Anti-flap: two consecutive ticks confirm before escalating; a per-dimension 3h
+       cooldown suppresses re-paging while the Mayor handles it. Fail-safe: every
+       external call is guarded; any ambiguity → treated as healthy (no false alarm on
+       an empty/idle system). Kill-switch: PROD_STALL_WATCHDOG_ENABLED=0 → no-op.
+
+       Cadence 1500s (25min), STAGGERED 5min off the 5-min/300s throughput heartbeat and
+       the 25s root-reconciler via StartInterval+ThrottleInterval (KeepAlive false so it
+       runs on the interval, not continuously). -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/production-stall-watchdog.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <!-- The script has its own internal loop (sleep POLL_SEC). We run it under KeepAlive
+       so a crash is restarted, and the internal 1500s poll sets the real cadence. The
+       internal loop is the source of truth for the 25-min cadence; launchd just keeps
+       the long-lived process alive (same model as pipeline-throughput-heartbeat). -->
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+
+  <!-- Stagger startup ~5min after load so it does not fire in lockstep with the other
+       monitors at boot. -->
+  <key>ThrottleInterval</key><integer>300</integer>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/production-stall-watchdog-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/production-stall-watchdog-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>PROD_STALL_WATCHDOG_ENABLED</key>
+    <string>1</string>
+    <key>BD_ACTOR</key>
+    <string>automation</string>
+  </dict>
+</dict>
+</plist>

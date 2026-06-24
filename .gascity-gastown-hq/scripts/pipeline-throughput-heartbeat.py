@@ -50,6 +50,9 @@ Recovers silently: when the corresponding flow resumes, that kind's state resets
 Never crashes (every external call guarded); silence = healthy.
 """
 import json, time, subprocess, os, re
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+from gc_ledger import gc_ledger_append as _ledger
 
 CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
 PILOT_LOG = os.path.join(CITY, ".gc/logs/pilot-dispatcher.log")
@@ -667,6 +670,7 @@ def run_tick(now, state, last_global_spawn, tracked=None):
         if st["cycles"] >= ESCALATE_AFTER:
             notify("🚨 PIPELINE ainda parado (%s) após %d ciclos de reparo. "
                    "Precisa de você. Diag: %s" % (kind, st["cycles"], diag), 5)
+            _ledger("human-touch", {"ts": __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "source_daemon": "pipeline-throughput-heartbeat", "stage": "executa", "kind": "technical", "bead_id": "", "reason": "PIPELINE parado %s após %d ciclos de reparo" % (kind, st["cycles"])}, fail_open=True)
             print("[heartbeat] ESCALATED to Athos (%s, %d cycles)"
                   % (kind, st["cycles"]), flush=True)
         else:

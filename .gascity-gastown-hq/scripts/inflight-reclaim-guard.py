@@ -75,6 +75,10 @@ import json
 import os
 import subprocess
 import time
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+from gc_ledger import gc_ledger_append as _irg_ledger
+import datetime as _irg_datetime
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -880,6 +884,7 @@ def run_cycle(state, escalated_alerted):
                     f"reclaimed {reclaim_count}x idle={idle_min:.0f}min — "
                     f"needs human/Mayor intervention title={title!r}"
                 )
+                _irg_ledger("human-touch", {"ts": _irg_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "source_daemon": "inflight-reclaim-guard", "stage": "executa", "kind": "technical", "bead_id": bead_id, "reason": f"Reclaim cap exhausted ({reclaim_count}x) — needs human intervention"}, fail_open=True)
                 escalated_alerted[bead_id] = now
             # Bead now carries gate:needs-human → next cycle's has_needs_human
             # rail returns "noop". It stays in the in-flight query but parks

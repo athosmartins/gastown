@@ -71,6 +71,9 @@ Recovers silently: when a Gate PASSED appears after a dispatch, reset state (sol
 Never crashes (every external call guarded); silence = healthy.
 """
 import json, time, datetime, subprocess, os, re
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+from gc_ledger import gc_ledger_append as _grw_ledger
 
 CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
 DISPATCH_LOG = os.path.join(CITY, ".gc/logs/quality-gate-dispatcher.log")
@@ -1034,6 +1037,7 @@ def governed_spawn(gov, sessions, now, kind, reason, diag, dolt_hits, label,
         if gov.should_escalate(cond_key, now):
             notify("🚨 %s: reparo autônomo já tentou %dx p/ %s e não resolveu — precisa de você. Diag: %s"
                    % (label, MAX_SPAWNS_PER_CONDITION, cond_key, diag), 5)
+            _grw_ledger("human-touch", {"ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "source_daemon": "gate-recovery-watchdog", "stage": "revisa", "kind": "technical", "bead_id": "", "reason": "%s: reparo autônomo %dx não resolveu cond=%s" % (label, MAX_SPAWNS_PER_CONDITION, cond_key)}, fail_open=True)
             print("[watchdog] ESCALATED to Athos (%s self-limit reached)" % cond_key, flush=True)
         return None
     if GRW_DRY_RUN:
@@ -1047,6 +1051,7 @@ def governed_spawn(gov, sessions, now, kind, reason, diag, dolt_hits, label,
     if n >= ESCALATE_AFTER_WAKES:
         notify("🚨 %s ainda quebrado após %dx de reparo autônomo (cond %s). Precisa de você. Diag: %s"
                % (label, n, cond_key, diag), 5)
+        _grw_ledger("human-touch", {"ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "source_daemon": "gate-recovery-watchdog", "stage": "revisa", "kind": "technical", "bead_id": "", "reason": "%s ainda quebrado após %dx reparo autônomo cond=%s" % (label, n, cond_key)}, fail_open=True)
         print("[watchdog] ESCALATED to Athos (%s, %d cycles)" % (cond_key, n), flush=True)
     else:
         notify("%s (%s) — %s. Você não precisa agir." % (label, reason, how), 3)

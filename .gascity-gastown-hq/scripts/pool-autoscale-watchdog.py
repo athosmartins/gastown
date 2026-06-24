@@ -27,6 +27,10 @@ import os
 import re
 import subprocess
 import time
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+from gc_ledger import gc_ledger_append as _paw_ledger
+import datetime as _paw_datetime
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -432,6 +436,7 @@ def run_cycle(pool_caps, state, stuck_alerted):
                     f"asleep={asleep_count} stuck_sessions={stuck_count} "
                     f"reason: {reason}"
                 )
+                _paw_ledger("human-touch", {"ts": _paw_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "source_daemon": "pool-autoscale-watchdog", "stage": "crew-liveness", "kind": "technical", "bead_id": "", "reason": reason}, fail_open=True)
                 stuck_alerted[pool] = now
 
         # action == "noop" → silence

@@ -34,6 +34,8 @@
     <string>/Users/athos</string>
     <key>GC_CITY_PATH</key>
     <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>BD_ACTOR</key>
+    <string>automation</string>
   </dict>
 </dict>
 </plist>

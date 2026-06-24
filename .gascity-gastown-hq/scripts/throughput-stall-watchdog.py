@@ -59,6 +59,10 @@ import os
 import re
 import subprocess
 import time
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+from gc_ledger import gc_ledger_append as _tsw_ledger
+import datetime as _tsw_datetime
 
 # ── paths ────────────────────────────────────────────────────────────────────
 CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
@@ -449,6 +453,8 @@ def _escalate(backlog_count, dispatch_count, last_dispatch_epoch,
         _do_notify(notify_msg, 4)
     else:
         _sh([NOTIFY_BIN, "-t", "Throughput stall", "-p", "4", notify_msg], timeout=10)
+
+    _tsw_ledger("human-touch", {"ts": _tsw_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "source_daemon": "throughput-stall-watchdog", "stage": "executa", "kind": "technical", "bead_id": "", "reason": notify_msg}, fail_open=True)
 
     if not ok_mail:
         _log("WARN: gc mail send mayor FAILED — notify still sent")
