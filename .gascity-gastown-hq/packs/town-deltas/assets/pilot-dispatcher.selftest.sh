@@ -243,7 +243,7 @@ JSON
       dep_bead="${FAKE_DEP_BEAD:-}"
       prefix=""
       if [ -n "$dep_bead" ]; then
-        prefix="{\"id\":\"tt-depblk\",\"title\":\"Explicit-dep bug fixture\",\"priority\":0,\"issue_type\":\"bug\",\"description\":\"fixture body\",\"status\":\"open\",\"labels\":[],\"assignee\":null,\"created_at\":\"2026-05-01T00:00:00Z\",\"metadata\":{\"story.depends_on_beads\":\"$dep_bead\"}},"
+        prefix="{\"id\":\"tt-depblk\",\"title\":\"Explicit-dep bug fixture\",\"priority\":0,\"issue_type\":\"bug\",\"description\":\"fixture body\",\"status\":\"open\",\"labels\":[],\"assignee\":null,\"created_at\":\"2026-06-15T00:00:00Z\",\"metadata\":{\"story.depends_on_beads\":\"$dep_bead\"}},"  # newer than tt-blkd (2026-06-01) so newest-first still picks tt-depblk in Scenario 8 (dep-clear intent preserved)
       fi
       cat <<JSON
 [
