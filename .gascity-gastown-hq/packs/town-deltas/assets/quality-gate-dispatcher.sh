@@ -2414,7 +2414,7 @@ required_reviewers: $REQUIRED_REVIEWERS
 branch_sha: $BRANCH_SHA
 marker_id: $MARKER_ID
 started_at: $NOW" \
-  --json 2>/dev/null | jq -r '.id // empty')
+  --json 2>/dev/null | jq -r '.id // empty' || echo "")
 
 if [ -z "$GATE_RUN_ID" ]; then
   warn "Could not create gate-run tracking bead. Continuing without it."
@@ -2520,7 +2520,7 @@ branch: $BRANCH
 author: $AUTHOR
 lens: $REVIEWER_LENS
 This bead ID will be delivered to the reviewer session via nudge with exact commands." \
-    --json 2>/dev/null | jq -r '.id // empty')
+    --json 2>/dev/null | jq -r '.id // empty' || echo "")
 
   if [ -z "$VERDICT_BEAD_ID" ]; then
     err "Failed to create verdict bead for reviewer $i. Aborting gate."

@@ -91,6 +91,18 @@ else
   bad "fewer than 2 VB_STATUS pipelines are guarded (count=${VB_GUARDED_COUNT:-0}) — ga-8fx5e"
 fi
 
+# ── 6. Drift-guard: GATE_RUN_ID (gate-run bead creation, Step 6) ─────────────
+# bd create --json ... | jq -r '.id // empty' — the bd create call can fail
+# (transient Dolt i/o-timeout) and without || guard, pipefail silently kills the
+# dispatcher before the empty-check at line ~2419 can fire.  The fix adds || echo "".
+# Downstream: GATE_RUN_ID="" → guarded by `if [ -z "$GATE_RUN_ID" ]` (warn + set "unknown").
+GATE_RUN_GUARDED=$(grep -c "jq -r '.id // empty' || echo \"\")" "$GATE" 2>/dev/null || echo 0)
+if [ "${GATE_RUN_GUARDED:-0}" -ge 2 ]; then
+  ok "GATE_RUN_ID and VERDICT_BEAD_ID '.id // empty' pipelines both guarded with '|| echo \"\"' (count=$GATE_RUN_GUARDED)"
+else
+  bad "GATE_RUN_ID or VERDICT_BEAD_ID '.id // empty' pipeline(s) unguarded (count=${GATE_RUN_GUARDED:-0}) — silent-crash on bd create failure kills dispatcher before empty-check guard fires (ga-8fx5e follow-up)"
+fi
+
 echo
 echo "── results: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ]
