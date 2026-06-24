@@ -45,7 +45,7 @@ HQ="${DPW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 DPW_HEARTBEAT="${DPW_HEARTBEAT:-com.gascity.pilot|$HQ/.gc/logs/pilot-dispatcher.log|1500
 com.gascity.inflight-reclaim-guard|$HQ/.gc/logs/inflight-reclaim-guard-launchd.out|1500
 com.gascity.context-check-dispatcher|$HQ/.gc/logs/context-check-dispatcher.log|3000
-com.gascity.quality-gate-dispatcher|$HQ/.gc/logs/quality-gate-dispatcher.log|900
+com.gascity.quality-gate-dispatcher|$HQ/.gc/logs/quality-gate-dispatcher.log|86400
 com.gascity.auto-refino-dispatcher|$HQ/.gc/logs/auto-refino-dispatcher.log|1500
 com.gascity.story-delivery|$HQ/.gc/logs/story-delivery.log|1500}"
 
