@@ -441,6 +441,16 @@ def _escalate(backlog_count, dispatch_count, last_dispatch_epoch,
         _log("DRY_RUN: body=\n%s" % body)
         return True
 
+    # imp07 Dolt-INDEPENDENT invariant: notify is PRIMARY (zero Dolt dependency),
+    # fired FIRST and unconditionally. gc mail send mayor is SECONDARY (best-effort);
+    # its failure NEVER blocks or follows the notify. If Dolt is down, notify still fires.
+    if _do_notify is not None:
+        _do_notify(notify_msg, 4)
+    else:
+        _sh([NOTIFY_BIN, "-t", "Throughput stall", "-p", "4", notify_msg], timeout=10)
+
+    _tsw_ledger("human-touch", {"ts": _tsw_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "source_daemon": "throughput-stall-watchdog", "stage": "executa", "kind": "technical", "bead_id": "", "reason": notify_msg}, fail_open=True)
+
     ok_mail = False
     if _do_mail_mayor is not None:
         ok_mail = _do_mail_mayor(subject, body)
@@ -449,15 +459,8 @@ def _escalate(backlog_count, dispatch_count, last_dispatch_epoch,
                 timeout=45)
         ok_mail = bool(r and r.returncode == 0)
 
-    if _do_notify is not None:
-        _do_notify(notify_msg, 4)
-    else:
-        _sh([NOTIFY_BIN, "-t", "Throughput stall", "-p", "4", notify_msg], timeout=10)
-
-    _tsw_ledger("human-touch", {"ts": _tsw_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "source_daemon": "throughput-stall-watchdog", "stage": "executa", "kind": "technical", "bead_id": "", "reason": notify_msg}, fail_open=True)
-
     if not ok_mail:
-        _log("WARN: gc mail send mayor FAILED — notify still sent")
+        _log("WARN: gc mail send mayor FAILED — notify still sent (imp07 invariant)")
     return ok_mail
 
 

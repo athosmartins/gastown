@@ -401,20 +401,19 @@ def run_tick(now, state):
             print("[prod-stall] %s confirmed but within cooldown — suppressing re-escalation"
                   % dim, flush=True)
             continue
+        # imp07 Dolt-INDEPENDENT invariant: notify is PRIMARY (zero Dolt dependency),
+        # fired FIRST and unconditionally. gc mail send mayor is SECONDARY (best-effort).
+        # If Dolt is down, notify fires regardless; mail failure never silences the alert.
+        notify_athos("STALL de produção (%s) — escalando pro Mayor investigar. Motivo: %s"
+                     % (dim, reason[:140]), 4)
+        _ledger("human-touch", {"ts": _datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "source_daemon": "production-stall-watchdog", "stage": "executa", "kind": "technical", "bead_id": "", "reason": "STALL de produção (%s): %s" % (dim, reason[:120])}, fail_open=True)
         ok = escalate_mayor(dim, reason)
         if not ok:
-            print("[prod-stall] %s mail to mayor FAILED — will retry next tick" % dim,
+            print("[prod-stall] %s mail to mayor FAILED — notify already sent (imp07 invariant)" % dim,
                   flush=True)
-            # still ntfy Athos so a stall is never fully silent if mail is down
-            notify_athos("⚠ STALL de produção (%s) mas o mail pro Mayor falhou: %s"
-                         % (dim, reason[:120]), 4)
-            _ledger("human-touch", {"ts": _datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "source_daemon": "production-stall-watchdog", "stage": "executa", "kind": "technical", "bead_id": "", "reason": "STALL de produção (%s): %s" % (dim, reason[:120])}, fail_open=True)
             continue
         st["last_escalate"] = now
         st["escalations"] += 1
-        notify_athos("STALL de produção (%s) — escalei pro Mayor investigar. Motivo: %s"
-                     % (dim, reason[:140]), 4)
-        _ledger("human-touch", {"ts": _datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "source_daemon": "production-stall-watchdog", "stage": "executa", "kind": "technical", "bead_id": "", "reason": "STALL de produção (%s): %s" % (dim, reason[:120])}, fail_open=True)
         print("[prod-stall] ESCALATED to mayor dim=%s reason=%s" % (dim, reason), flush=True)
 
 

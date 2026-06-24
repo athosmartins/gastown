@@ -230,6 +230,8 @@ handle_signature() {
       local body="Funnel signature '$sig' (daemon $label) remained stalled (demand present + log frozen >${freeze}min) through $MAX_REMEDIATIONS kickstarts without clearing. Auto-remediation exhausted; STOPPING kickstarts for this component and handing to you (the next auto-heal layer).
 CENSUS at $TS: $census
 Log: $logf (age=${age}min). Please diagnose + fix root cause. NTFY to Athos will fire ONLY if this persists >$((ESCALATION_NTFY_WINDOW/3600))h beyond now. (auto-sent by funnel-flow-healer)"
+      # imp07 Dolt-INDEPENDENT invariant: notify PRIMARY (unconditional), mail SECONDARY.
+      do_notify "Flow-healer escalou" "Funnel '$sig' não auto-sana após $MAX_REMEDIATIONS kickstarts — escalado pro Mayor."
       do_mail_mayor "$subj" "$body"
       gc_ledger_append human-touch "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"source_daemon\":\"funnel-flow-healer\",\"stage\":\"refina\",\"kind\":\"technical\",\"bead_id\":\"\",\"reason\":\"ESCALATE after $MAX_REMEDIATIONS kickstarts: $sig\"}" 2>/dev/null || true
       emit "escalation" ",\"sig\":\"$sig\",\"label\":\"$label\",\"to\":\"mayor\",\"after_kickstarts\":$MAX_REMEDIATIONS"
