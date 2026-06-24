@@ -117,6 +117,18 @@ DELIVERY_STALL_MIN_BEADS = int(os.environ.get("TSW_DELIVERY_STALL_MIN_BEADS", "1
 DELIVERY_CONFIRM_SWEEPS = int(os.environ.get("TSW_DELIVERY_CONFIRM_SWEEPS", "2"))
 DELIVERY_COOLDOWN_SEC = int(os.environ.get("TSW_DELIVERY_COOLDOWN_SEC", "10800"))  # 3h cooldown
 
+# ── imp24: heal-action branch knobs ──────────────────────────────────────────
+# When TSW_HEAL_ENABLED=1, before escalating a confirmed throughput or delivery
+# stall the watchdog first attempts auto-heal by invoking funnel-flow-healer.sh.
+# Success is validated on stall-cleared (dispatch/merge resumes on the NEXT tick),
+# NOT on daemon-green status — a kicked daemon may still not move work.
+# TSW_HEAL_SUPPRESS_SEC: after a heal attempt, suppress re-escalation for this
+# long to give the system time to recover before re-evaluating.
+HEAL_ENABLED = os.environ.get("TSW_HEAL_ENABLED", "0") == "1"
+HEAL_SUPPRESS_SEC = int(os.environ.get("TSW_HEAL_SUPPRESS_SEC", "600"))  # 10min
+FUNNEL_FLOW_HEALER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "funnel-flow-healer.sh")
+
 # ── log-line patterns ─────────────────────────────────────────────────────────
 TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 # "=== Pilot sweep complete: dispatched=N ..."
@@ -139,6 +151,7 @@ _bd_delivery = None            # (rig_root) -> list[dict]; None = run bd (imp23 
 _do_notify = None              # (msg, prio) -> None; None = run notify binary
 _do_mail_mayor = None          # (subject, body) -> bool; None = run gc mail
 _do_dolt_probe = None          # () -> int; 0=healthy 1=unhealthy 2=unknown; None = run probe
+_do_heal_throughput = None     # () -> bool; True=heal attempted; None = call funnel-flow-healer.sh
 
 
 # ── guarded subprocess ────────────────────────────────────────────────────────
@@ -697,9 +710,48 @@ def _tick_delivery(now, state):
 
     _log("DELIVERY ESCALATING: %d in-flight bead(s) stalled (confirmed %d sweeps)" % (
          count, state["delivery_pending"]))
+    # imp24: attempt auto-heal before escalating; success = stall-cleared next tick
+    if _attempt_heal(now, state):
+        return False
     _escalate_delivery(count, sample, now)
     state["delivery_last_escalate"] = now
     return True
+
+
+# ── imp24: heal-action branch ─────────────────────────────────────────────────
+def _attempt_heal(now, state):
+    """Attempt auto-heal before escalating a confirmed stall (imp24).
+
+    Calls funnel-flow-healer.sh if TSW_HEAL_ENABLED=1 and the suppress window
+    is not active. Returns True if a heal was attempted (caller should suppress
+    escalation for this tick and validate stall-cleared on the next tick).
+
+    Validation invariant: success = dispatch/merge resumes (stall-cleared) on
+    the NEXT evaluation, NOT daemon-green status. A kicked daemon may still not
+    dispatch work. The suppress window gives the system time to show actual flow
+    before we re-evaluate and potentially escalate."""
+    if not HEAL_ENABLED:
+        return False
+    heal_last = state.get("heal_last_attempt", 0.0)
+    if heal_last > 0.0 and (now - heal_last) <= HEAL_SUPPRESS_SEC:
+        _log("imp24 HEAL: suppress window active (%.0fmin remaining) — suppress escalation" % (
+             (HEAL_SUPPRESS_SEC - (now - heal_last)) / 60))
+        return True   # suppress escalation; stall-cleared validation window still open
+
+    _log("imp24 HEAL: stall confirmed — attempting auto-heal via funnel-flow-healer.sh")
+    if _do_heal_throughput is not None:
+        healed = _do_heal_throughput()
+    else:
+        r = _sh([FUNNEL_FLOW_HEALER], timeout=30)
+        healed = bool(r and r.returncode == 0)
+
+    state["heal_last_attempt"] = now
+    if healed:
+        _log("imp24 HEAL: healer returned success — suppressing escalation for %.0fmin; "
+             "stall-cleared validated on next tick (not daemon-green)" % (HEAL_SUPPRESS_SEC / 60))
+    else:
+        _log("imp24 HEAL: healer returned non-zero — no fix applied, proceeding to escalate")
+    return healed
 
 
 # ── state persistence ─────────────────────────────────────────────────────────
@@ -719,6 +771,8 @@ def _load_state():
                 # imp23 keys (backward-compat: absent in pre-imp23 state files)
                 d.setdefault("delivery_pending", 0)
                 d.setdefault("delivery_last_escalate", 0.0)
+                # imp24 keys (backward-compat: absent in pre-imp24 state files)
+                d.setdefault("heal_last_attempt", 0.0)
                 return d
     except Exception:
         pass
@@ -932,6 +986,10 @@ def run_tick(now, state):
          "dispatched=%d, merged=%d in %.0fh" % (
          state["pending"], backlog_count, dispatch_count, merge_count, STALL_HOURS))
 
+    # imp24: attempt auto-heal before escalating; success = stall-cleared next tick
+    if _attempt_heal(now, state):
+        return False
+
     ok = _escalate(backlog_count, dispatch_count, last_dispatch_epoch,
                    merge_count, last_merge_epoch, sample_beads, now, window_sec)
     state["last_escalate"] = now
@@ -1031,7 +1089,8 @@ def _selftest():
         return {"pending": 0, "last_escalate": 0.0, "escalations": 0,
                 "blind_pending": 0, "blind_last_escalate": 0.0,
                 "dolt_pending": 0, "dolt_last_escalate": 0.0,
-                "delivery_pending": 0, "delivery_last_escalate": 0.0}
+                "delivery_pending": 0, "delivery_last_escalate": 0.0,
+                "heal_last_attempt": 0.0}
 
     def _stub_mail(subject, body):
         mail_calls.append((subject, body))
@@ -1048,6 +1107,8 @@ def _selftest():
     # imp23: stub delivery signal as no stalled beads by default so existing scenarios
     # are not affected.
     _bd_delivery = lambda root: []   # no stalled beads — overridden in L/M/N scenarios
+    # imp24: heal disabled by default so existing scenarios are not affected.
+    _do_heal_throughput = None   # overridden in P scenarios
 
     print("\n[tsw selftest] running scenarios...\n")
 
@@ -1383,6 +1444,71 @@ def _selftest():
     else:
         _bad("N", "should not fire delivery alert on signal error, got: %r" % notify_calls)
 
+    # ── imp24-P: heal-action branch wiring ───────────────────────────────────────
+    print("\nimp24 Scenario P1: HEAL_ENABLED=0 → heal not attempted, stall escalates normally")
+    _read_pilot_log_lines = lambda: _pilot_lines(0, 3)
+    _read_gate_log_lines  = lambda: []
+    _git_log_count        = lambda root, since: 0
+    _bd_backlog           = lambda root: _backlog(3)
+    _bd_delivery          = lambda root: []
+    _do_dolt_probe        = lambda: 0
+    heal_calls_p1 = []
+    globals()["_do_heal_throughput"] = lambda: (heal_calls_p1.append(1), True)[1]
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    globals()["HEAL_ENABLED"] = False
+    run_tick(NOW, st); run_tick(NOW + 1800, st)
+    if st["escalations"] >= 1 and not heal_calls_p1:
+        _ok("P1: HEAL_ENABLED=0 → stall escalates normally, healer not called")
+    else:
+        _bad("P1", "escalations=%d heal_calls=%d" % (st["escalations"], len(heal_calls_p1)))
+
+    print("\nimp24 Scenario P2: HEAL_ENABLED=1 + healer succeeds → escalation suppressed this tick")
+    heal_calls_p2 = []
+    globals()["_do_heal_throughput"] = lambda: (heal_calls_p2.append(1), True)[1]
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    globals()["HEAL_ENABLED"] = True
+    run_tick(NOW, st)            # first sweep: pending=1, no escalation yet
+    run_tick(NOW + 1800, st)     # second sweep: stall confirmed, healer fires, escalation suppressed
+    globals()["HEAL_ENABLED"] = False
+    if heal_calls_p2 and not mail_calls:
+        _ok("P2: HEAL_ENABLED=1 + healer ok → escalation suppressed; heal attempted")
+    else:
+        _bad("P2", "heal_calls=%d mail_calls=%d" % (len(heal_calls_p2), len(mail_calls)))
+
+    print("\nimp24 Scenario P3: HEAL_ENABLED=1 + healer fails → stall escalates anyway")
+    heal_calls_p3 = []
+    globals()["_do_heal_throughput"] = lambda: (heal_calls_p3.append(1), False)[1]
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    globals()["HEAL_ENABLED"] = True
+    run_tick(NOW, st); run_tick(NOW + 1800, st)
+    globals()["HEAL_ENABLED"] = False
+    if heal_calls_p3 and mail_calls:
+        _ok("P3: HEAL_ENABLED=1 + healer fails → stall still escalates")
+    else:
+        _bad("P3", "heal_calls=%d mail_calls=%d" % (len(heal_calls_p3), len(mail_calls)))
+
+    print("\nimp24 Scenario P4: suppress window — heal attempted once, re-run within window skips re-heal")
+    heal_calls_p4 = []
+    globals()["_do_heal_throughput"] = lambda: (heal_calls_p4.append(1), True)[1]
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    globals()["HEAL_ENABLED"] = True
+    run_tick(NOW, st)              # pending=1
+    run_tick(NOW + 1800, st)       # confirmed → heal fires at NOW+1800, suppressed until NOW+1800+600=NOW+2400
+    run_tick(NOW + 2200, st)       # NOW+2200 < NOW+2400 → still in suppress window → no re-heal
+    globals()["HEAL_ENABLED"] = False
+    if len(heal_calls_p4) == 1 and not mail_calls:
+        _ok("P4: suppress window active → healer called only once, escalation still suppressed")
+    else:
+        _bad("P4", "heal_calls=%d mail_calls=%d (expected 1 heal, 0 mails)" % (len(heal_calls_p4), len(mail_calls)))
+
+    # Reset imp24 global knobs
+    globals()["HEAL_ENABLED"] = False
+    globals()["_do_heal_throughput"] = None
+
     # ── cleanup ───────────────────────────────────────────────────────────────────
     _read_pilot_log_lines = None
     _read_gate_log_lines  = None
@@ -1392,6 +1518,7 @@ def _selftest():
     _do_notify            = None
     _do_mail_mayor        = None
     _do_dolt_probe        = None
+    _do_heal_throughput   = None
 
     print("\n[tsw selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
     sys.exit(0 if fail_count[0] == 0 else 1)
