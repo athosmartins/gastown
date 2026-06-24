@@ -1,19 +1,34 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.gascity.crew-liveness-probe</string>
-  <key>ProgramArguments</key><array>
-    <string>/bin/bash</string>
-    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/crew-liveness-probe.sh</string>
-  </array>
-  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
-  <key>StartInterval</key><integer>600</integer>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-liveness-probe-launchd.out</string>
-  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-liveness-probe-launchd.err</string>
-  <key>EnvironmentVariables</key><dict>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
-    <key>HOME</key><string>/Users/athos</string>
-    <key>CLP_ENABLED</key><string>1</string>
-  </dict>
-</dict></plist>
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>CLP_ENABLED</key>
+		<string>1</string>
+		<key>CLP_HEAL_ENABLED</key>
+		<string>1</string>
+		<key>HOME</key>
+		<string>/Users/athos</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+	</dict>
+	<key>Label</key>
+	<string>com.gascity.crew-liveness-probe</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/athos/gt/.gascity-gastown-hq/scripts/crew-liveness-probe.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-liveness-probe-launchd.err</string>
+	<key>StandardOutPath</key>
+	<string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-liveness-probe-launchd.out</string>
+	<key>StartInterval</key>
+	<integer>600</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/athos/gt/.gascity-gastown-hq</string>
+</dict>
+</plist>
