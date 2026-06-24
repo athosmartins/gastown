@@ -2950,8 +2950,20 @@ for _ack_attempt in $(seq 1 "$ACK_MAX_RETRIES"); do
     # chance); from attempt 2 on, re-queue the exact task into the idle session.
     _all_acked=0
     if [ "$_ack_attempt" -gt 1 ]; then
-      warn "  No ACK from reviewer $((k+1)) (attempt $_ack_attempt/$ACK_MAX_RETRIES) — re-queuing task session=$_sid"
-      $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session nudge "$_sid" "${REVIEW_TASKS[$k]}" --delivery queue 2>/dev/null || true
+      # ga-aknox: skip nudge (and its 45s GATE_NUDGE_TIMEOUT) when the session has
+      # already drained — peek reports "session not found" on STDERR for gone sessions.
+      # A reviewer that lost its start to a supervisor config-reload race (stale_async_start)
+      # drains without ACKing; re-queuing a dead session burns 45s×(N-1) ≈ 135s before the
+      # ACK loop gives up. Early-exit here saves that time; the verdict-poll re-convene
+      # (ga-4u16h) fires sooner and gets the branch reviewed. Guarded: non-not-found peek
+      # results (live sessions, Dolt glitches) still nudge as before.
+      _ack_peek_stderr=$(gc --city "$GC_CITY" session peek "$_sid" --lines 5 2>&1 >/dev/null || true)
+      if [ "$(session_peek_reports_dead "$_ack_peek_stderr")" = "1" ]; then
+        warn "  ACK skip (ga-aknox): reviewer $((k+1)) session=$_sid drained during startup (stale_async_start race) — nudge skipped, re-convene will re-spawn"
+      else
+        warn "  No ACK from reviewer $((k+1)) (attempt $_ack_attempt/$ACK_MAX_RETRIES) — re-queuing task session=$_sid"
+        $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session nudge "$_sid" "${REVIEW_TASKS[$k]}" --delivery queue 2>/dev/null || true
+      fi
     fi
   done
   [ "$_all_acked" = "1" ] && break
