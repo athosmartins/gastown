@@ -146,7 +146,7 @@ correct city database explicitly. Never rely on CWD auto-discovery.
 
 ```bash
 # 1. Create the bead with title, type, and lifecycle label
-#    --priority is set interactively — see Priority Convention below
+#    --priority comes from Field 9 (confirmed with Athos before the approval gate)
 ID=$(bd -C "$GC_CITY_PATH" create "Título da história" --type feature --silent \
   --label story:approved \
   --priority "$PRIORITY")
@@ -206,11 +206,12 @@ bd -C "$GC_CITY_PATH" update "$ID" \
 
 ## Priority Convention
 
-After Athos approves the story, the agent asks a single priority question
-(in Portuguese, product language) and maps the answer to `--priority`:
+Priority is **Field 9** of the Refino protocol — asked and confirmed WITH Athos
+before the approval gate, not after. By the time Athos approves, the priority is
+already locked in. The prompt used in Field 9:
 
 ```
-Qual a prioridade — Normal / Alta / Baixa?
+Qual a prioridade dessa história — Normal, Alta ou Baixa?
 ```
 
 | Athos answer | --priority flag |

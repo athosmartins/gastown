@@ -1,2 +1,3 @@
 work_dir = "/Users/athos/gt/whatsapp_automation/crew/mila"
 max_active_sessions = 1
+min_active_sessions = 1

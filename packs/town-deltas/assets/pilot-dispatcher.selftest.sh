@@ -161,6 +161,140 @@ grep -A 20 '^classify_lane()' "$PILOT" | grep -q "BIG_CRITERIA_THRESHOLD" \
   && _pass "classify_lane: BIG_CRITERIA_THRESHOLD used" \
   || _fail "classify_lane: BIG_CRITERIA_THRESHOLD missing"
 
+# ── ga-mfeip tests: WA ctx:ready dispatch + 6 quality gates ──────────────────
+#
+# Tests 19-32 verify the ga-mfeip WA ctx:ready dispatch and all 6 quality gates.
+# Gate filter function tests use _wa_ctx_ready_passes_gates directly by sourcing
+# a minimal stub of the pilot. Structural tests grep the pilot script.
+
+# Source a minimal environment to call _wa_ctx_ready_passes_gates:
+_GATE_TMP=$(mktemp -d)
+trap 'rm -rf "$_GATE_TMP"' EXIT
+mkdir -p "$_GATE_TMP/.gc/logs"
+# Extract and eval just the function + minimal deps (log/warn no-op stubs)
+eval "$(grep -A 140 '^_wa_ctx_ready_passes_gates()' "$PILOT" | head -140)" 2>/dev/null || true
+eval 'log() { true; }; warn() { true; }' 2>/dev/null || true
+WA_RIG_PATH="$_GATE_TMP"  # dummy — not used by the gate function
+
+# Helper: build a minimal bead JSON for gate tests
+_mk_bead() {
+  # _mk_bead <id> <status> <labels_csv> <ac> <body> <blocked_by_count>
+  local id="$1" status="$2" labels="$3" ac="$4" body="$5" blocked="${6:-0}"
+  local labels_json
+  labels_json=$(printf '%s' "$labels" | tr ',' '\n' \
+    | jq -R -s 'split("\n") | map(select(length>0))' 2>/dev/null || echo "[]")
+  jq -c -n \
+    --arg id "$id" --arg status "$status" --arg ac "$ac" \
+    --arg body "$body" --argjson labels "$labels_json" \
+    --argjson blocked_by_count "$blocked" \
+    '{id: $id, status: $status, labels: $labels, acceptance_criteria: $ac,
+      description: $body, notes: "", blocked_by_count: $blocked_by_count,
+      assignee: null, priority: 1, created_at: "2026-01-01T00:00:00Z"}' 2>/dev/null
+}
+
+# ── Test 19: Gate 1 — blocked status is skipped ───────────────────────────────
+_bead=$(_mk_bead "wa-test1" "blocked" "ctx:ready,exec:auto" "Do X" "Body" 0)
+_wa_ctx_ready_passes_gates "$_bead" "" 2>/dev/null \
+  && _fail "Gate1: blocked bead should be SKIPPED (returned 0 = passes)" \
+  || _pass "Gate1: blocked bead correctly SKIPPED"
+
+# ── Test 20: Gate 1 — needs-human label is skipped ───────────────────────────
+_bead=$(_mk_bead "wa-test2" "open" "ctx:ready,exec:auto,needs-human" "Do X" "Body" 0)
+_wa_ctx_ready_passes_gates "$_bead" "" 2>/dev/null \
+  && _fail "Gate1: needs-human bead should be SKIPPED" \
+  || _pass "Gate1: needs-human bead correctly SKIPPED"
+
+# ── Test 21: Gate 2 — empty acceptance criteria is skipped ───────────────────
+_bead=$(_mk_bead "wa-test3" "open" "ctx:ready,exec:auto" "" "Body" 0)
+_wa_ctx_ready_passes_gates "$_bead" "" 2>/dev/null \
+  && _fail "Gate2: empty-AC bead should be SKIPPED" \
+  || _pass "Gate2: empty-AC bead correctly SKIPPED"
+
+# ── Test 22: Gate 3 — cost-risk body keyword is skipped ──────────────────────
+_bead=$(_mk_bead "wa-test4" "open" "ctx:ready,exec:auto" "Do X" "bloqueado em decisão de custo do Athos" 0)
+_wa_ctx_ready_passes_gates "$_bead" "" 2>/dev/null \
+  && _fail "Gate3: cost-risk body bead should be SKIPPED" \
+  || _pass "Gate3: cost-risk body bead correctly SKIPPED"
+
+# ── Test 23: Gate 3 — ban-risk body keyword is skipped ───────────────────────
+_bead=$(_mk_bead "wa-test5" "open" "ctx:ready,exec:auto" "Do X" "never logout primary, never send, abort on anything unexpected" 0)
+_wa_ctx_ready_passes_gates "$_bead" "" 2>/dev/null \
+  && _fail "Gate3: ban-risk body bead should be SKIPPED" \
+  || _pass "Gate3: ban-risk body bead correctly SKIPPED"
+
+# ── Test 24: Gate 4 — unmet dep (blocked_by_count>0) is skipped ──────────────
+_bead=$(_mk_bead "wa-test6" "open" "ctx:ready,exec:auto" "Do X" "Body" 1)
+_wa_ctx_ready_passes_gates "$_bead" "" 2>/dev/null \
+  && _fail "Gate4: unmet-dep bead should be SKIPPED" \
+  || _pass "Gate4: unmet-dep bead correctly SKIPPED"
+
+# ── Test 25: Gate 5 — exec:manual is skipped ─────────────────────────────────
+_bead=$(_mk_bead "wa-test7" "open" "ctx:ready,exec:manual" "Do X" "Body" 0)
+_wa_ctx_ready_passes_gates "$_bead" "" 2>/dev/null \
+  && _fail "Gate5: exec:manual bead should be SKIPPED" \
+  || _pass "Gate5: exec:manual bead correctly SKIPPED"
+
+# ── Test 26: Gate 5 — no exec:auto label is skipped ─────────────────────────
+_bead=$(_mk_bead "wa-test8" "open" "ctx:ready" "Do X" "Body" 0)
+_wa_ctx_ready_passes_gates "$_bead" "" 2>/dev/null \
+  && _fail "Gate5: no exec:auto bead should be SKIPPED" \
+  || _pass "Gate5: no exec:auto bead correctly SKIPPED"
+
+# ── Test 27: Gate 6 — already-assigned bead is skipped ───────────────────────
+_bead=$(jq -c '. + {assignee: "thies-wa"}' \
+  <<< "$(_mk_bead "wa-test9" "open" "ctx:ready,exec:auto" "Do X" "Body" 0)" 2>/dev/null)
+_wa_ctx_ready_passes_gates "$_bead" "" 2>/dev/null \
+  && _fail "Gate6: assigned bead should be SKIPPED" \
+  || _pass "Gate6: assigned bead correctly SKIPPED"
+
+# ── Test 28: Gate 6 — within-sweep dedup: same bead ID dispatched twice ───────
+_bead=$(_mk_bead "wa-test10" "open" "ctx:ready,exec:auto" "Do X" "Body" 0)
+_wa_ctx_ready_passes_gates "$_bead" "wa-test10" 2>/dev/null \
+  && _fail "Gate6: sweep-dedup bead should be SKIPPED" \
+  || _pass "Gate6: sweep-dedup bead correctly SKIPPED"
+
+# ── Test 29: Positive — clean exec:auto bead passes all gates ─────────────────
+_bead=$(_mk_bead "wa-testP" "open" "ctx:ready,exec:auto" "Ship feature X" "Normal description" 0)
+_wa_ctx_ready_passes_gates "$_bead" "" 2>/dev/null \
+  && _pass "Positive: clean exec:auto bead passes all gates" \
+  || _fail "Positive: clean exec:auto bead was SKIPPED (should PASS)"
+
+# ── Test 30: WA crew pool excludes digo-wa and oracle-wa ─────────────────────
+if grep -q 'WA_CTX_CREWS=' "$PILOT"; then
+  _crew_line=$(grep 'WA_CTX_CREWS=' "$PILOT" | head -1)
+  if printf '%s' "$_crew_line" | grep -q 'digo-wa'; then
+    _fail "WA_CTX_CREWS: digo-wa (suspended) is in the pool"
+  else
+    _pass "WA_CTX_CREWS: digo-wa not in pool"
+  fi
+  if printf '%s' "$_crew_line" | grep -q 'oracle-wa'; then
+    _fail "WA_CTX_CREWS: oracle-wa (human-operated) is in the pool"
+  else
+    _pass "WA_CTX_CREWS: oracle-wa not in pool"
+  fi
+else
+  _fail "WA_CTX_CREWS: array not defined in pilot script"
+  _fail "WA_CTX_CREWS: (second check skipped)"
+fi
+
+# ── Test 31: HQ-lanes-full does NOT exit early — WA ctx:ready still runs ─────
+# The "Both HQ lanes full … Pilot backing off" block must NOT contain "exit 0".
+if grep -A 3 'Both HQ lanes full' "$PILOT" | grep -q 'exit 0'; then
+  _fail "HQ-lanes-full: still contains 'exit 0' — WA ctx:ready blocked when HQ full"
+else
+  _pass "HQ-lanes-full: no exit 0 — WA ctx:ready runs even when HQ lanes full"
+fi
+
+# ── Test 32: WA dispatch functions defined ────────────────────────────────────
+for _fn in _wa_ctx_ready_passes_gates _wa_crew_capacity _dispatch_wa_ctx_ready; do
+  grep -q "^${_fn}()" "$PILOT" \
+    && _pass "WA sub-function defined: ${_fn}" \
+    || _fail "WA sub-function MISSING: ${_fn}"
+done
+
+rm -rf "$_GATE_TMP"
+trap - EXIT
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 printf "── Results: %d/%d passed ──\n" "$PASS" "$TOTAL"

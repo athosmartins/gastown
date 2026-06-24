@@ -231,7 +231,12 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 			"--id=" + id,
 			"--title=" + title,
 			"--description=" + description,
-			"--type=task",
+			// First-class "agent" type (ga-m05wd): identity beads are a
+			// distinct engine type (registered via EnsureCustomTypes above,
+			// same as CreateRigBead's --type=rig), so they no longer leak into
+			// the generic open-work/Triagem pool. IsAgentBead still accepts the
+			// gt:agent label too, so legacy task-typed beads remain recognized.
+			"--type=agent",
 			"--labels=gt:agent",
 		}
 		if NeedsForceForID(id) {
@@ -320,8 +325,9 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 	}
 
 	// Update the bead with new fields and ensure gt:agent label is set.
-	// Agent beads use type=task (a valid built-in type) and are identified
-	// by the gt:agent label, not by type (see IsAgentBead).
+	// Agent beads use the first-class "agent" type (ga-m05wd) and carry the
+	// gt:agent label; IsAgentBead recognizes either, so legacy task-typed
+	// agent beads (created before ga-m05wd) are still identified correctly.
 	description := FormatAgentDescription(title, fields)
 	updateOpts := UpdateOptions{
 		Title:       &title,

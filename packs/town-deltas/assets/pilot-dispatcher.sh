@@ -95,14 +95,24 @@ TIER2_EXCLUDES=(
 )
 
 # ── Rig → Builder routing table ───────────────────────────────────────────────
+# WA rig-native dispatch (ctx:ready) uses _dispatch_wa_ctx_ready below — it picks
+# from the live WA crew pool directly. rig_to_builder is used ONLY for HQ/rig-fallback
+# Tier 1/2 sling paths, so the WA mapping here now falls through to gastown.dog (safe
+# fallback; HQ story:approved wa-* beads will still go through sling if they appear).
 rig_to_builder() {
   local rig="$1"
   case "$rig" in
-    whatsapp_automation|wa) echo "digo"      ;;
-    property_scrapers|ps)   echo "batista-ps" ;;
+    property_scrapers|ps) echo "batista-ps"  ;;
+    whatsapp_automation|wa) echo "gastown.dog" ;;
     *)                      echo "gastown.dog" ;;
   esac
 }
+
+# ── WA crew pool (ga-mfeip) ───────────────────────────────────────────────────
+# Live WA crews eligible for ctx:ready dispatch.
+# EXCLUDED: digo-wa (suspended=true in agent.toml) and oracle-wa (human-operated).
+WA_CTX_CREWS=("thies-wa" "peter-wa" "batista-wa" "mila-wa")
+WA_RIG_PATH="/Users/athos/gt/whatsapp_automation"
 
 # ── Lane classification ───────────────────────────────────────────────────────
 classify_lane() {
@@ -235,6 +245,258 @@ _filter_gated() {
     warn "ga-qw7y6: excluded $((before - after)) candidate(s) with a terminal-success gate marker (already merged — phantom re-dispatch prevented)" >&2
   fi
   printf '%s' "$filtered"
+}
+
+# ── ga-mfeip: WA ctx:ready quality gates ─────────────────────────────────────
+#
+# _wa_ctx_ready_passes_gates <bead_json> <dispatched_ids_newline_sep>
+#
+# Returns 0 (passes) or 1 (skip) for a single WA ctx:ready bead.
+# Implements all 6 quality gates:
+#   Gate 1 — NOT status=blocked AND NOT labeled needs-human/needs-human-decision/gate:needs-human
+#   Gate 2 — Acceptance Criteria NON-EMPTY (story.criterios / acceptance_criteria)
+#   Gate 3 — No cost-decision / prod-experiment / ban-risk markers
+#   Gate 4 — No UNMET dependencies (bd blocked set, fail-open)
+#   Gate 5 — Only exec:auto (never exec:manual)
+#   Gate 6 — Not already assigned/in-flight (dedup)
+#
+# <dispatched_ids_newline_sep> is a newline-separated set of bead IDs already
+# dispatched in this sweep (within-sweep dedup across crews).
+_wa_ctx_ready_passes_gates() {
+  local bead_json="$1"
+  local sweep_dispatched="$2"  # newline-separated IDs dispatched this sweep
+
+  local bead_id labels_csv status assignee
+
+  bead_id=$(printf '%s' "$bead_json" | jq -r '.id // empty' 2>/dev/null || echo "")
+  [ -z "$bead_id" ] && return 1  # malformed
+
+  labels_csv=$(printf '%s' "$bead_json" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
+  status=$(printf '%s' "$bead_json" | jq -r '.status // ""' 2>/dev/null || echo "")
+  assignee=$(printf '%s' "$bead_json" | jq -r '.assignee // ""' 2>/dev/null || echo "")
+
+  # Gate 1: skip blocked status or human-gated labels
+  if [ "$status" = "blocked" ]; then
+    log "  WA gate1 SKIP $bead_id: status=blocked"
+    return 1
+  fi
+  if printf '%s' "$labels_csv" | grep -qE '(^|,)(needs-human|needs-human-decision|gate:needs-human)(,|$)'; then
+    log "  WA gate1 SKIP $bead_id: has needs-human label"
+    return 1
+  fi
+
+  # Gate 5: only exec:auto (check early to avoid false-positives on unclassified beads)
+  if printf '%s' "$labels_csv" | grep -qE '(^|,)exec:manual(,|$)'; then
+    log "  WA gate5 SKIP $bead_id: exec:manual (human-only)"
+    return 1
+  fi
+  # Beads without exec:auto label are not explicitly auto-approved — skip them too.
+  if ! printf '%s' "$labels_csv" | grep -qE '(^|,)exec:auto(,|$)'; then
+    log "  WA gate5 SKIP $bead_id: no exec:auto label (not classified for autonomous dispatch)"
+    return 1
+  fi
+
+  # Gate 2: acceptance criteria must be non-empty
+  local ac
+  ac=$(printf '%s' "$bead_json" | jq -r '.acceptance_criteria // .metadata["story.criterios"] // ""' 2>/dev/null || echo "")
+  # Strip whitespace; empty after strip = skip
+  ac_stripped=$(printf '%s' "$ac" | tr -d '[:space:]')
+  if [ -z "$ac_stripped" ]; then
+    log "  WA gate2 SKIP $bead_id: empty acceptance criteria (not refined)"
+    return 1
+  fi
+
+  # Gate 3: cost-decision / prod-experiment / ban-risk markers
+  # Check labels for known risk markers
+  if printf '%s' "$labels_csv" | grep -qiE '(^|,)(cost-decision|prod-experiment|ban-risk|experiment)(,|$)'; then
+    log "  WA gate3 SKIP $bead_id: has cost/prod-risk label"
+    return 1
+  fi
+  # Conservative body keyword scan — when in doubt, skip
+  local body
+  body=$(printf '%s' "$bead_json" | jq -r '(.description // "") + " " + (.notes // "")' 2>/dev/null || echo "")
+  if printf '%s' "$body" | grep -qiE \
+      'decisão de custo|bloqueado em decisão|ban[- ]risk|session.logout|prod-experiment|criar zona paga|adicionar fundos|budget|never.?(logout|send)|guardrail'; then
+    log "  WA gate3 SKIP $bead_id: body contains cost/ban-risk/prod-experiment keywords"
+    return 1
+  fi
+
+  # Gate 6: dedup — not already assigned/in-flight, not already dispatched this sweep
+  if [ -n "$assignee" ] && [ "$assignee" != "null" ]; then
+    log "  WA gate6 SKIP $bead_id: already assigned to '$assignee'"
+    return 1
+  fi
+  if printf '%s' "$labels_csv" | grep -qE '(^|,)(story:in-flight|pilot:dispatched|pilot:dispatching)(,|$)'; then
+    log "  WA gate6 SKIP $bead_id: already in-flight/dispatched"
+    return 1
+  fi
+  # Within-sweep dedup
+  if printf '%s\n' "$sweep_dispatched" | grep -qxF "$bead_id" 2>/dev/null; then
+    log "  WA gate6 SKIP $bead_id: already dispatched this sweep (dedup)"
+    return 1
+  fi
+
+  # Gate 4: no unmet dependencies (use bd blocked set, fail-open)
+  # _filter_unblocked already does this on the full array — but we verify per-bead
+  # using the blocked_by field already present in bd --json output.
+  local blocked_by_count
+  blocked_by_count=$(printf '%s' "$bead_json" | jq -r '.blocked_by_count // 0' 2>/dev/null || echo "0")
+  blocked_by_count=$(printf '%s' "$blocked_by_count" | tr -d '[:space:]'); blocked_by_count=${blocked_by_count:-0}
+  if [ "$blocked_by_count" -gt 0 ] 2>/dev/null; then
+    local blocked_by_ids
+    blocked_by_ids=$(printf '%s' "$bead_json" | jq -r '(.blocked_by // []) | join(",")' 2>/dev/null || echo "?")
+    log "  WA gate4 SKIP $bead_id: has $blocked_by_count unmet dep(s): $blocked_by_ids"
+    return 1
+  fi
+
+  return 0
+}
+
+# _wa_crew_capacity <crew_name> <wa_rig_path>
+# Prints the number of ctx:ready beads currently in-flight (story:in-flight) for
+# this crew in the WA store. Fail-open (returns 99 on error → crew treated as busy).
+_wa_crew_capacity() {
+  local crew="$1" wa_path="$2"
+  local count
+  count=$(bd -C "$wa_path" list --json \
+    -l "ctx:ready" \
+    -l "story:in-flight" \
+    -n 0 2>/dev/null \
+    | jq --arg c "$crew" '[.[] | select(.assignee == $c)] | length' 2>/dev/null \
+    || echo "99")
+  count=$(printf '%s' "$count" | tr -d '[:space:]'); count=${count:-99}
+  printf '%s' "$count"
+}
+
+# WA_CTX_CAPACITY_PER_CREW — max ctx:ready in-flight per WA crew per sweep.
+WA_CTX_CAPACITY_PER_CREW="${WA_CTX_CAPACITY_PER_CREW:-1}"
+
+# _dispatch_wa_ctx_ready <bead_json> <crew>
+# Dispatches one WA ctx:ready bead to a live WA crew via the rig-native path:
+#   1. Claim via pilot:dispatching label in WA store
+#   2. Assign via bd -C <wa_path> update <bead> --assignee <crew>
+#   3. Add story:in-flight + pilot:dispatched labels
+#   4. Nudge crew
+#   5. Post dispatch comment + emit JSONL event + notify
+# Returns 0 on success, 1 on failure (claim released on failure).
+_dispatch_wa_ctx_ready() {
+  local bead_json="$1"
+  local crew="$2"
+
+  local wa_bead_id wa_bead_title wa_bead_priority
+
+  wa_bead_id=$(printf '%s' "$bead_json" | jq -r '.id' 2>/dev/null || echo "")
+  wa_bead_title=$(printf '%s' "$bead_json" | jq -r '.title // .description // "untitled"' 2>/dev/null | head -c 100)
+  wa_bead_priority=$(printf '%s' "$bead_json" | jq -r '.priority // 99' 2>/dev/null || echo "99")
+
+  log "  WA ctx:ready dispatch: $wa_bead_id → $crew (P${wa_bead_priority}: $wa_bead_title)"
+
+  if [ "$DRY_RUN" = "1" ]; then
+    log "  DRY_RUN=1 — WOULD: bd -C $WA_RIG_PATH label add $wa_bead_id pilot:dispatching"
+    log "  DRY_RUN=1 — WOULD: bd -C $WA_RIG_PATH update $wa_bead_id --assignee $crew"
+    log "  DRY_RUN=1 — WOULD: bd -C $WA_RIG_PATH label add $wa_bead_id story:in-flight pilot:dispatched"
+    log "  DRY_RUN=1 — WOULD: gc session nudge $crew <task prompt>"
+    return 0
+  fi
+
+  # Atomic claim
+  bd -C "$WA_RIG_PATH" label add "$wa_bead_id" "pilot:dispatching" -q 2>/dev/null || {
+    warn "WA ctx:ready: could not claim $wa_bead_id (pilot:dispatching label add failed). Skipping."
+    return 1
+  }
+
+  # Verify claim / race check
+  local _verify_labels
+  _verify_labels=$(bd -C "$WA_RIG_PATH" show "$wa_bead_id" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
+  if printf '%s' "$_verify_labels" | grep -qE '(^|,)(story:in-flight|pilot:dispatched)(,|$)'; then
+    log "  WA ctx:ready: $wa_bead_id already in-flight after claim check (race). Releasing."
+    bd -C "$WA_RIG_PATH" label remove "$wa_bead_id" "pilot:dispatching" -q 2>/dev/null || true
+    return 1
+  fi
+
+  # Rig-native assignment
+  if ! bd -C "$WA_RIG_PATH" update "$wa_bead_id" --assignee "$crew" -q 2>/dev/null; then
+    warn "WA ctx:ready: bd update --assignee failed for $wa_bead_id. Releasing claim."
+    bd -C "$WA_RIG_PATH" label remove "$wa_bead_id" "pilot:dispatching" -q 2>/dev/null || true
+    return 1
+  fi
+
+  # Transition labels — story:in-flight BEFORE removing pilot:dispatching
+  if ! bd -C "$WA_RIG_PATH" label add "$wa_bead_id" "story:in-flight" -q 2>/dev/null; then
+    warn "WA ctx:ready: story:in-flight label failed for $wa_bead_id — pilot:dispatching retained for TTL recovery."
+    return 1
+  fi
+  bd -C "$WA_RIG_PATH" label remove "$wa_bead_id" "pilot:dispatching" -q 2>/dev/null || true
+  bd -C "$WA_RIG_PATH" label add    "$wa_bead_id" "pilot:dispatched"  -q 2>/dev/null || true
+
+  # Store dispatch metadata
+  local _now_epoch _now_ts
+  _now_epoch=$(date +%s)
+  _now_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  bd -C "$WA_RIG_PATH" update "$wa_bead_id" \
+    --set-metadata "pilot.dispatched_at=$_now_epoch" \
+    --set-metadata "pilot.crew=$crew" \
+    -q 2>/dev/null || true
+
+  # Post dispatch comment
+  local _cmt
+  _cmt="Pilot (ga-mfeip) dispatched ctx:ready bead to '$crew' at $_now_ts.
+Builder doctrine: build → /gate-done → autonomous gate+delivery → story:done.
+Dispatched via rig-native path (bd -C whatsapp_automation update --assignee)."
+  bd -C "$WA_RIG_PATH" comment "$wa_bead_id" "$_cmt" 2>/dev/null || true
+
+  # Nudge crew with task context
+  local _task_prompt
+  _task_prompt="PILOT WA DISPATCH (ga-mfeip) — ctx:ready bead assigned
+
+Bead ID: $wa_bead_id
+Title: $wa_bead_title
+Priority: P${wa_bead_priority}
+Rig: whatsapp_automation
+City: $WA_RIG_PATH
+
+## Your job
+Build this task from acceptance criteria to /gate-done. Do NOT wait for a human.
+
+## Steps
+1. Read the full bead: bd -C \"$WA_RIG_PATH\" show \"$wa_bead_id\"
+2. Run gc prime to load your full context.
+3. Implement on a branch (feat/${wa_bead_id} or crew/\$GC_ALIAS/${wa_bead_id}).
+4. Commit, push, then run /gate-done.
+
+## Claim your work (do this first)
+bd -C \"$WA_RIG_PATH\" assign \"$wa_bead_id\" \"\$GC_ALIAS\"
+bd -C \"$WA_RIG_PATH\" status in_progress \"$wa_bead_id\"
+
+Start now. Do not wait for permission."
+
+  gc --city "$GC_CITY" session nudge "$crew" "$_task_prompt" \
+    --delivery wait-idle 2>/dev/null \
+    || warn "WA ctx:ready: could not nudge $crew — crew will see the task on next hook cycle"
+
+  # JSONL event
+  mkdir -p "$(dirname "$PILOT_LOG")"
+  jq -c -n \
+    --arg ts "$_now_ts" \
+    --arg bead_id "$wa_bead_id" \
+    --arg title "$wa_bead_title" \
+    --arg crew "$crew" \
+    --arg rig "whatsapp_automation" \
+    --arg wa_path "$WA_RIG_PATH" \
+    --argjson priority "$wa_bead_priority" \
+    --arg dry_run "$DRY_RUN" \
+    '{ts: $ts, event: "pilot_wa_ctx_dispatch", bead_id: $bead_id, title: $title,
+      crew: $crew, rig: $rig, wa_path: $wa_path, priority: $priority,
+      tier: "wa_ctx_ready", dry_run: $dry_run}' \
+    >> "$PILOT_LOG" 2>/dev/null || true
+
+  notify -t "Pilot WA dispatch" -p 3 \
+    "$wa_bead_id (P${wa_bead_priority}) → $crew | $wa_bead_title" \
+    2>/dev/null || true
+
+  log "  WA ctx:ready dispatched: $wa_bead_id → $crew DONE"
+  return 0
 }
 
 # _top_candidate <json_array>
@@ -698,13 +960,21 @@ BIG_SLOTS=$((MAX_BIG - IN_FLIGHT_BIG))
 
 log "Available slots: small=$SMALL_SLOTS  big=$BIG_SLOTS"
 
+HQ_LANES_FULL=0
 if [ "$SMALL_SLOTS" -eq "0" ] && [ "$BIG_SLOTS" -eq "0" ]; then
-  log "Both lanes full (small=${IN_FLIGHT_SMALL}/${MAX_SMALL}, big=${IN_FLIGHT_BIG}/${MAX_BIG}). Pilot backing off."
-  exit 0
+  log "Both HQ lanes full (small=${IN_FLIGHT_SMALL}/${MAX_SMALL}, big=${IN_FLIGHT_BIG}/${MAX_BIG}) — HQ dispatch skipped. WA ctx:ready still runs."
+  HQ_LANES_FULL=1
 fi
 
 # ── ga-qw7y6: build the terminal-success gate-marker set once for this sweep ──
+# Runs even when HQ lanes are full — needed for WA ctx:ready gated-bead filter too.
 _build_gated_set
+
+if [ "$HQ_LANES_FULL" = "1" ]; then
+  # Skip HQ Tier 1/2/2c dispatch — both HQ lanes full. Jump straight to WA ctx:ready.
+  DISPATCHED=0
+  ALL_CANDIDATES_COUNT=0
+else
 
 # ── Step 2: Tier 1 — Find open bugs + tech-debt beads in HQ DB ───────────────
 
@@ -810,55 +1080,138 @@ fi
 
 ALL_CANDIDATES_COUNT=$(echo "$ALL_CANDIDATES_JSON" | jq 'length' 2>/dev/null || echo "0")
 
-if [ "$ALL_CANDIDATES_COUNT" = "0" ]; then
-  log "No dispatchable candidates (Tier 1 or Tier 2). Exiting."
-  exit 0
-fi
-
-log "Dispatch tier: $ALL_CANDIDATES_TIER (${ALL_CANDIDATES_COUNT} candidate(s))"
-
 # ── Step 3: Split candidates by lane, pick one per available lane ─────────────
-
-SMALL_CANDIDATES="[]"
-BIG_CANDIDATES="[]"
-
-while IFS= read -r bead; do
-  lane=$(classify_lane "$bead")
-  if [ "$lane" = "big" ]; then
-    BIG_CANDIDATES=$(echo "$BIG_CANDIDATES" | jq --argjson b "$bead" '. + [$b]' 2>/dev/null || echo "$BIG_CANDIDATES")
-  else
-    SMALL_CANDIDATES=$(echo "$SMALL_CANDIDATES" | jq --argjson b "$bead" '. + [$b]' 2>/dev/null || echo "$SMALL_CANDIDATES")
-  fi
-done < <(echo "$ALL_CANDIDATES_JSON" | jq -c '.[]')
-
-SMALL_COUNT=$(echo "$SMALL_CANDIDATES" | jq 'length' 2>/dev/null || echo "0")
-BIG_COUNT=$(echo "$BIG_CANDIDATES" | jq 'length' 2>/dev/null || echo "0")
-log "Candidates split: small=${SMALL_COUNT}  big=${BIG_COUNT}"
-
-SMALL_PICK="null"
-BIG_PICK="null"
-
-[ "$SMALL_SLOTS" -gt "0" ] && [ "$SMALL_COUNT" -gt "0" ] && \
-  SMALL_PICK=$(_top_candidate "$SMALL_CANDIDATES")
-[ "$BIG_SLOTS"   -gt "0" ] && [ "$BIG_COUNT"   -gt "0" ] && \
-  BIG_PICK=$(_top_candidate "$BIG_CANDIDATES")
-
-log "Lane picks — small: $(echo "$SMALL_PICK" | jq -r '.id // "none"')  big: $(echo "$BIG_PICK" | jq -r '.id // "none"')"
-
-# ── Step 4: Dispatch into available lane slots ────────────────────────────────
+# NOTE: no early exit here — Step 5 (WA ctx:ready dispatch) runs regardless.
 
 DISPATCHED=0
 
-if [ "$SMALL_PICK" != "null" ] && [ "$SMALL_SLOTS" -gt "0" ]; then
-  dispatch_one "$SMALL_PICK" "small" "$ALL_CANDIDATES_TIER" && DISPATCHED=$((DISPATCHED + 1)) || true
+if [ "$ALL_CANDIDATES_COUNT" = "0" ]; then
+  log "No dispatchable candidates (Tier 1 or Tier 2) — HQ/rig-fallback pass skipped."
+else
+  log "Dispatch tier: $ALL_CANDIDATES_TIER (${ALL_CANDIDATES_COUNT} candidate(s))"
+
+  SMALL_CANDIDATES="[]"
+  BIG_CANDIDATES="[]"
+
+  while IFS= read -r bead; do
+    lane=$(classify_lane "$bead")
+    if [ "$lane" = "big" ]; then
+      BIG_CANDIDATES=$(echo "$BIG_CANDIDATES" | jq --argjson b "$bead" '. + [$b]' 2>/dev/null || echo "$BIG_CANDIDATES")
+    else
+      SMALL_CANDIDATES=$(echo "$SMALL_CANDIDATES" | jq --argjson b "$bead" '. + [$b]' 2>/dev/null || echo "$SMALL_CANDIDATES")
+    fi
+  done < <(echo "$ALL_CANDIDATES_JSON" | jq -c '.[]')
+
+  SMALL_COUNT=$(echo "$SMALL_CANDIDATES" | jq 'length' 2>/dev/null || echo "0")
+  BIG_COUNT=$(echo "$BIG_CANDIDATES" | jq 'length' 2>/dev/null || echo "0")
+  log "Candidates split: small=${SMALL_COUNT}  big=${BIG_COUNT}"
+
+  SMALL_PICK="null"
+  BIG_PICK="null"
+
+  [ "$SMALL_SLOTS" -gt "0" ] && [ "$SMALL_COUNT" -gt "0" ] && \
+    SMALL_PICK=$(_top_candidate "$SMALL_CANDIDATES")
+  [ "$BIG_SLOTS"   -gt "0" ] && [ "$BIG_COUNT"   -gt "0" ] && \
+    BIG_PICK=$(_top_candidate "$BIG_CANDIDATES")
+
+  log "Lane picks — small: $(echo "$SMALL_PICK" | jq -r '.id // "none"')  big: $(echo "$BIG_PICK" | jq -r '.id // "none"')"
+
+  # ── Step 4: Dispatch into available lane slots ────────────────────────────────
+
+  if [ "$SMALL_PICK" != "null" ] && [ "$SMALL_SLOTS" -gt "0" ]; then
+    dispatch_one "$SMALL_PICK" "small" "$ALL_CANDIDATES_TIER" && DISPATCHED=$((DISPATCHED + 1)) || true
+  fi
+
+  if [ "$BIG_PICK" != "null" ] && [ "$BIG_SLOTS" -gt "0" ]; then
+    dispatch_one "$BIG_PICK" "big" "$ALL_CANDIDATES_TIER" && DISPATCHED=$((DISPATCHED + 1)) || true
+  fi
+
+  if [ "$DISPATCHED" -eq "0" ]; then
+    log "No HQ/rig dispatches this sweep (lane slots may have been won by concurrent process)."
+  fi
 fi
 
-if [ "$BIG_PICK" != "null" ] && [ "$BIG_SLOTS" -gt "0" ]; then
-  dispatch_one "$BIG_PICK" "big" "$ALL_CANDIDATES_TIER" && DISPATCHED=$((DISPATCHED + 1)) || true
+fi  # end HQ_LANES_FULL guard (else branch)
+
+# ── Step 5: WA ctx:ready dispatch (ga-mfeip) ─────────────────────────────────
+#
+# Independent of the HQ Tier 1/2 lanes. Runs every sweep regardless of HQ
+# dispatch state. Queries the WA store for ctx:ready exec:auto beads and
+# distributes them to idle WA crews (capacity: WA_CTX_CAPACITY_PER_CREW per
+# crew per sweep). All 6 quality gates applied before any dispatch.
+# Env-gated: WA_CTX_DISPATCH=0 disables (fail-open: absent/empty → enabled).
+
+WA_CTX_DISPATCH="${WA_CTX_DISPATCH:-1}"
+WA_CTX_DISPATCHED=0
+
+if [ "$WA_CTX_DISPATCH" = "0" ]; then
+  log "WA ctx:ready dispatch DISABLED (WA_CTX_DISPATCH=0) — skipping."
+else
+  log "── WA ctx:ready dispatch (ga-mfeip) ──"
+
+  # Fetch all ctx:ready beads from WA store (fail-open)
+  WA_CTX_RAW=$(bd -C "$WA_RIG_PATH" list --json \
+    -l "ctx:ready" \
+    --exclude-label "story:in-flight" \
+    --exclude-label "pilot:dispatching" \
+    --exclude-label "pilot:dispatched" \
+    -n 0 2>/dev/null || echo "[]")
+
+  # Validate JSON
+  WA_CTX_COUNT=$(printf '%s' "$WA_CTX_RAW" | jq 'if type=="array" then length else 0 end' 2>/dev/null || echo "0")
+  WA_CTX_COUNT=$(printf '%s' "$WA_CTX_COUNT" | tr -d '[:space:]'); WA_CTX_COUNT=${WA_CTX_COUNT:-0}
+
+  if [ "$WA_CTX_COUNT" = "0" ]; then
+    log "WA ctx:ready: no candidates in WA store (or bd error — fail-open)."
+  else
+    log "WA ctx:ready: $WA_CTX_COUNT raw candidate(s) in WA store."
+
+    # Also apply ga-qw7y6 gated-bead filter (already-merged work)
+    WA_CTX_CANDIDATES=$(printf '%s' "$WA_CTX_RAW" | _filter_gated)
+
+    # Sort by priority asc, then created_at asc
+    WA_CTX_SORTED=$(printf '%s' "$WA_CTX_CANDIDATES" \
+      | jq 'sort_by([(.priority // 99), .created_at])' 2>/dev/null || echo "[]")
+
+    # Within-sweep dedup set (bead IDs dispatched to any crew so far)
+    WA_SWEEP_DISPATCHED=""
+
+    # Iterate WA crews; for each crew with capacity, pick best passing candidate
+    for _wa_crew in "${WA_CTX_CREWS[@]}"; do
+      _crew_inflight=$(_wa_crew_capacity "$_wa_crew" "$WA_RIG_PATH")
+      if [ "${_crew_inflight:-0}" -ge "${WA_CTX_CAPACITY_PER_CREW:-1}" ] 2>/dev/null; then
+        log "WA ctx:ready: $_wa_crew at capacity ($_crew_inflight in-flight) — skip."
+        continue
+      fi
+
+      # Find first candidate that passes all 6 gates for this crew
+      _wa_picked=""
+      while IFS= read -r _wa_bead; do
+        [ -z "$_wa_bead" ] && continue
+        if _wa_ctx_ready_passes_gates "$_wa_bead" "$WA_SWEEP_DISPATCHED"; then
+          _wa_picked="$_wa_bead"
+          break
+        fi
+      done < <(printf '%s' "$WA_CTX_SORTED" | jq -c '.[]' 2>/dev/null || true)
+
+      if [ -z "$_wa_picked" ]; then
+        log "WA ctx:ready: no gate-passing candidate for $_wa_crew."
+        continue
+      fi
+
+      _wa_pick_id=$(printf '%s' "$_wa_picked" | jq -r '.id' 2>/dev/null || echo "")
+      if _dispatch_wa_ctx_ready "$_wa_picked" "$_wa_crew"; then
+        WA_CTX_DISPATCHED=$((WA_CTX_DISPATCHED + 1))
+        DISPATCHED=$((DISPATCHED + 1))
+        WA_SWEEP_DISPATCHED=$(printf '%s\n%s' "$WA_SWEEP_DISPATCHED" "$_wa_pick_id")
+        log "WA ctx:ready: dispatch OK → $wa_pick_id to $_wa_crew."
+      else
+        log "WA ctx:ready: dispatch FAILED for $_wa_pick_id → $_wa_crew."
+      fi
+    done
+
+    log "WA ctx:ready dispatch done: WA_CTX_DISPATCHED=$WA_CTX_DISPATCHED"
+  fi
 fi
 
-if [ "$DISPATCHED" -eq "0" ]; then
-  log "No dispatches this sweep (lane slots may have been won by concurrent process)."
-fi
-
-log "=== Pilot sweep complete: dispatched=$DISPATCHED (small_slots=$SMALL_SLOTS big_slots=$BIG_SLOTS) ==="
+log "=== Pilot sweep complete: dispatched=$DISPATCHED (small_slots=$SMALL_SLOTS big_slots=$BIG_SLOTS wa_ctx=$WA_CTX_DISPATCHED) ==="

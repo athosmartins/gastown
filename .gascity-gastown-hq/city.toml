@@ -2,13 +2,14 @@
 provider = "claude"
 global_fragments = ["command-glossary", "operational-awareness", "town-deltas"]
 
-# Dolt-CPU cure (2026-06-15): the controller's full health/reconcile patrol ran
-# every 30s (default), a primary connection-churn source on the fragile Dolt plane
-# (root cause = poll frequency, not query cost). Patrol is event-driven with a
-# fallback timer — work-assignment pokes/nudges still fire IMMEDIATELY — so slowing
-# the fallback sweep 30s→120s cuts ~75% of patrol churn without delaying real work.
-[daemon]
-patrol_interval = "120s"
+[providers]
+[providers.claude]
+base = "builtin:claude"
+ready_delay_ms = 0
+[providers.claude-headless]
+base = "builtin:claude"
+args_append = ["--settings", "{\"remoteControlAtStartup\":false}", "--model", "sonnet"]
+ready_delay_ms = 0
 
 [imports]
 [imports.gastown]
@@ -40,9 +41,6 @@ name = "whatsapp_automation"
 prefix = "wa"
 default_branch = "main"
 
-# deacon repo registered as rig so dc-* bead prefix resolves to the correct DB path
-# (gt-pm55p: cross-rig close failed when bd auto-discovered wrong database from cwd).
-# suspended=true: no crew/witness/refinery workers spawned.
 [[rigs]]
 name = "deacon"
 prefix = "dc"
@@ -65,25 +63,11 @@ dir = ""
 name = "gastown.deacon"
 suspended = true
 
-# Remote Control OFF for builder dogs (wa-9ye2 / Athos 2026-06-08). Dogs are headless
-# pool builders and must NOT auto-connect to the human's mobile Claude Code app.
 [[patches.agent]]
 dir = ""
 name = "gastown.dog"
 provider = "claude-headless"
 
-[providers.claude]
-base = "builtin:claude"
-
-# Headless provider for ephemeral/automated agents (gate reviewers, etc.) — bug wa-9ye2.
-# Identical to the claude provider, but appends a second `--settings` that forces
-# remoteControlAtStartup=false. Gas City spawns every claude with a single
-# `--settings .gc/settings.json` (which omits the key), so without this the session
-# inherits the global ~/.claude/settings.json (remoteControlAtStartup=true) and the
-# headless worker auto-connects to the human's mobile Claude Code app as "Connected".
-# Claude Code deep-merges multiple --settings per-key (later wins), so this overrides
-# only RC while preserving all hooks/keys from .gc/settings.json. Assign via an agent
-# template's `provider = "claude-headless"`. Mayor/crew stay on "claude" (RC ON).
-[providers.claude-headless]
-base = "builtin:claude"
-args_append = ["--settings", "{\"remoteControlAtStartup\":false}"]
+[daemon]
+formula_v2 = true
+patrol_interval = "120s"
