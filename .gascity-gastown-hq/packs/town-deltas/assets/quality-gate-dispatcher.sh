@@ -2004,12 +2004,19 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       _RIG_GIT_DIR="${GIT_DIR_PATH}/.git"
     fi
     if [ -n "$_RIG_GIT_DIR" ] && [ -d "$_RIG_GIT_DIR" ]; then
-      if [ -f "$_RIG_GIT_DIR/ORIG_HEAD" ] || [ -f "$_RIG_GIT_DIR/MERGE_HEAD" ] || [ -f "$_RIG_GIT_DIR/index.lock" ]; then
+      # GATE-HANG FIX (2026-06-24): ORIG_HEAD is a BENIGN backup ref that git writes
+      # after EVERY rebase/reset/merge — NOT a sign of an interrupted op. Gating on it
+      # froze the gate for ~15h: every stale-branch sweep skipped the rebase then hung,
+      # and ORIG_HEAD regenerates on each git op so it never cleared. Only REAL
+      # in-progress markers count (rebase dirs / MERGE_HEAD / CHERRY_PICK_HEAD / index.lock).
+      if [ -d "$_RIG_GIT_DIR/rebase-merge" ] || [ -d "$_RIG_GIT_DIR/rebase-apply" ] || [ -f "$_RIG_GIT_DIR/MERGE_HEAD" ] || [ -f "$_RIG_GIT_DIR/CHERRY_PICK_HEAD" ] || [ -f "$_RIG_GIT_DIR/index.lock" ]; then
         REBASE_IN_ENVELOPE=0
         _LOCK_FILES=""
-        [ -f "$_RIG_GIT_DIR/ORIG_HEAD"  ] && _LOCK_FILES="${_LOCK_FILES}ORIG_HEAD "
-        [ -f "$_RIG_GIT_DIR/MERGE_HEAD" ] && _LOCK_FILES="${_LOCK_FILES}MERGE_HEAD "
-        [ -f "$_RIG_GIT_DIR/index.lock" ] && _LOCK_FILES="${_LOCK_FILES}index.lock "
+        [ -d "$_RIG_GIT_DIR/rebase-merge"     ] && _LOCK_FILES="${_LOCK_FILES}rebase-merge "
+        [ -d "$_RIG_GIT_DIR/rebase-apply"     ] && _LOCK_FILES="${_LOCK_FILES}rebase-apply "
+        [ -f "$_RIG_GIT_DIR/MERGE_HEAD"       ] && _LOCK_FILES="${_LOCK_FILES}MERGE_HEAD "
+        [ -f "$_RIG_GIT_DIR/CHERRY_PICK_HEAD" ] && _LOCK_FILES="${_LOCK_FILES}CHERRY_PICK_HEAD "
+        [ -f "$_RIG_GIT_DIR/index.lock"       ] && _LOCK_FILES="${_LOCK_FILES}index.lock "
         REBASE_SKIP_REASON="${REBASE_SKIP_REASON:+${REBASE_SKIP_REASON}; }rig .git is unclean (${_LOCK_FILES% }) — prior interrupted git op"
       fi
     fi
