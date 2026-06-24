@@ -102,6 +102,13 @@
 #                                 this AND the stated reset is still in the future, the
 #                                 latch is cleared (defer-without-spawn starves re-log).
 #                                 Default 1200 (20 min). Set to 0 to disable.
+#   CLAUDE_QUOTA_BURST_MIN_COUNT  ga-burst: minimum number of session-limit 429 events
+#                                 required within CLAUDE_QUOTA_BURST_WINDOW_SECS to declare
+#                                 SESSION LIMITED. A single/sporadic 429 does NOT pause.
+#                                 Default 2. Set to 1 to restore the old single-event latch.
+#   CLAUDE_QUOTA_BURST_WINDOW_SECS  ga-burst: the recent window (in seconds) in which
+#                                 BURST_MIN_COUNT events must appear to declare LIMITED.
+#                                 Default 300 (5 min).
 #
 # Dependencies: bash, jq, find, grep, date (BSD/macOS date semantics).
 
@@ -113,6 +120,8 @@ NOW="${CLAUDE_QUOTA_NOW:-$(date +%s)}"
 BUDGET="${CLAUDE_QUOTA_BUDGET_BILLABLE:-0}"
 WEEKLY_HARD="${CLAUDE_QUOTA_WEEKLY_HARD:-0}"   # ga-ot735: 1 = weekly also hard-pauses
 FRESHNESS_MAX_SECS="${CLAUDE_QUOTA_FRESHNESS_SECS:-1200}"  # ga-z0n9f: 20 min default; 0=disable
+BURST_MIN_COUNT="${CLAUDE_QUOTA_BURST_MIN_COUNT:-2}"       # ga-burst: min events in window to be LIMITED
+BURST_WINDOW_SECS="${CLAUDE_QUOTA_BURST_WINDOW_SECS:-300}" # ga-burst: 5 min recent window for burst test
 WINDOW_SEC=18000   # 5h rolling session window
 
 MODE="human"
@@ -220,6 +229,7 @@ SESSION_RESET_TEXT=""
 SESSION_RESET_EPOCH=0
 SESSION_LAST_EVENT_EPOCH=0   # ga-z0n9f: most-recent session exhaustion event time
 SESSION_STALE=0              # ga-z0n9f: 1 = freshness guard cleared the latch
+SESSION_BURST_COUNT=0        # ga-burst: # of session-limit events within BURST_WINDOW_SECS
 WEEKLY_ACTIVE=0
 WEEKLY_RESET_TEXT=""
 WEEKLY_RESET_EPOCH=0
@@ -247,6 +257,10 @@ scan_exhaustion() {
       if [ "$scope" = "session" ]; then
         [ "$ev_epoch" -gt "$SESSION_LAST_EVENT_EPOCH" ] 2>/dev/null \
           && SESSION_LAST_EVENT_EPOCH="$ev_epoch"
+        # ga-burst: count events within the burst window for the burst-rate test.
+        if [ "$((NOW - ev_epoch))" -le "$BURST_WINDOW_SECS" ] 2>/dev/null; then
+          SESSION_BURST_COUNT=$((SESSION_BURST_COUNT + 1))
+        fi
       else
         [ "$ev_epoch" -gt "$WEEKLY_LAST_EVENT_EPOCH" ] 2>/dev/null \
           && WEEKLY_LAST_EVENT_EPOCH="$ev_epoch"
@@ -299,8 +313,10 @@ iso_to_epoch() {
 # code. PURE: reads only the module-level scan results + WEEKLY_HARD; no IO.
 #
 # Precedence (the whole point of the fix):
-#   1. SESSION (5h) active            → LIMITED=1, scope=session. Short, reliable,
-#      self-clearing in ≤5h; a new run WILL re-hit it → pausing is correct.
+#   1. SESSION (5h) active AND burst ≥ BURST_MIN_COUNT in BURST_WINDOW_SECS →
+#      LIMITED=1, scope=session. Requires a SUSTAINED BURST, not a single 429.
+#      Sporadic/borderline 429s (every ~10min) do NOT cross the burst threshold
+#      and therefore do NOT pause (ga-burst).
 #   2. else WEEKLY active + WEEKLY_HARD=1 → LIMITED=1, scope=weekly (legacy opt-in).
 #   3. else WEEKLY active (default)   → LIMITED=0 (ADVISORY). weekly.active is
 #      still reported, but we do NOT pause the gate for days on the multi-day
@@ -311,7 +327,16 @@ iso_to_epoch() {
 # logs is the relevant (sooner) 5h reset, not the days-out weekly one.
 resolve_verdict() {
   SESSION_STALE=0
+  SESSION_BURST_LIMITED=0   # 1 = burst threshold met; 0 = sporadic (not a hard limit)
   if [ "$SESSION_ACTIVE" = "1" ]; then
+    # ga-burst: require ≥ BURST_MIN_COUNT session-limit events within BURST_WINDOW_SECS.
+    # A single or sporadic 429 (e.g. one every ~10 min on a borderline account)
+    # must NOT hold LIMITED. Only a sustained burst (near-every request failing)
+    # signals a real hard exhaustion and warrants pausing the gate.
+    # BURST_MIN_COUNT=1 restores the old single-event latch (escape hatch).
+    if [ "$SESSION_BURST_COUNT" -ge "$BURST_MIN_COUNT" ] 2>/dev/null; then
+      SESSION_BURST_LIMITED=1
+    fi
     # ga-z0n9f freshness guard: when the gate defers (quota=LIMITED) it stops
     # spawning sessions, so no fresh "hit your limit" events appear in transcripts.
     # The latch then holds until the STATED reset time even when the real server
@@ -322,12 +347,16 @@ resolve_verdict() {
        && [ $(( NOW - SESSION_LAST_EVENT_EPOCH )) -gt "$FRESHNESS_MAX_SECS" ]; then
       SESSION_STALE=1
       SESSION_ACTIVE=0
+      SESSION_BURST_LIMITED=0
       LIMITED=0; LIMIT_SCOPE="none"; LIMIT_RESET_TEXT=""; LIMIT_RESET_EPOCH=0
-    else
+    elif [ "$SESSION_BURST_LIMITED" = "1" ]; then
       LIMITED=1
       LIMIT_SCOPE="session"
       LIMIT_RESET_TEXT="$SESSION_RESET_TEXT"
       LIMIT_RESET_EPOCH="$SESSION_RESET_EPOCH"
+    else
+      # Sporadic 429(s) but not a sustained burst — treat as not limited.
+      LIMITED=0; LIMIT_SCOPE="none"; LIMIT_RESET_TEXT=""; LIMIT_RESET_EPOCH=0
     fi
   elif [ "$WEEKLY_ACTIVE" = "1" ] && [ "$WEEKLY_HARD" = "1" ]; then
     LIMITED=1
@@ -401,11 +430,16 @@ fi
 # the log makes clear why the gate keeps running.
 WEEKLY_ADVISORY=0
 [ "$LIMITED" = "0" ] && [ "$WEEKLY_ACTIVE" = "1" ] && WEEKLY_ADVISORY=1
+# ga-burst: sporadic = session_active but burst threshold NOT met (not hard limited)
+SESSION_SPORADIC=0
+[ "$SESSION_ACTIVE" = "1" ] && [ "$SESSION_BURST_LIMITED" = "0" ] && [ "$SESSION_STALE" = "0" ] && SESSION_SPORADIC=1
 if [ "$LIMITED" = "1" ]; then
   VERDICT="LIMITED (${LIMIT_SCOPE}) — resets ${LIMIT_RESET_TEXT} (in ${RESET_IN_MIN}min). THIS IS QUOTA."
 elif [ "$SESSION_STALE" = "1" ]; then
   _stale_age=$(( (NOW - SESSION_LAST_EVENT_EPOCH) / 60 ))
   VERDICT="not limited — session-limit stale (last event ${_stale_age}min ago > threshold ${FRESHNESS_MAX_SECS}s; freshness guard cleared latch, ga-z0n9f). NOT quota."
+elif [ "$SESSION_SPORADIC" = "1" ]; then
+  VERDICT="not limited — sporadic 429(s) (burst_count=${SESSION_BURST_COUNT} < threshold ${BURST_MIN_COUNT} in ${BURST_WINDOW_SECS}s window; not a sustained exhaustion, ga-burst). NOT quota."
 elif [ "$WEEKLY_ADVISORY" = "1" ]; then
   VERDICT="not hard-limited — weekly limit active (advisory, resets ${WEEKLY_RESET_TEXT}) but 5h session window OK; gate keeps running. NOT a pause."
 elif [ "$WANT_WINDOW" = "1" ]; then
@@ -424,6 +458,10 @@ emit_json() {
     --argjson session_stale "$([ "$SESSION_STALE" = 1 ] && echo true || echo false)" \
     --argjson session_last_event_secs_ago "$([ "$SESSION_LAST_EVENT_EPOCH" -gt 0 ] 2>/dev/null && echo $(( NOW - SESSION_LAST_EVENT_EPOCH )) || echo 0)" \
     --argjson freshness_threshold_secs "$FRESHNESS_MAX_SECS" \
+    --argjson session_burst_count "$SESSION_BURST_COUNT" \
+    --argjson session_burst_min "$BURST_MIN_COUNT" \
+    --argjson session_burst_window_secs "$BURST_WINDOW_SECS" \
+    --argjson session_sporadic "$([ "$SESSION_SPORADIC" = 1 ] && echo true || echo false)" \
     --argjson weekly_active "$([ "$WEEKLY_ACTIVE" = 1 ] && echo true || echo false)" \
     --arg weekly_reset "$WEEKLY_RESET_TEXT" \
     --argjson weekly_hard "$([ "$WEEKLY_HARD" = 1 ] && echo true || echo false)" \
@@ -445,6 +483,12 @@ emit_json() {
        session_stale: $session_stale,
        session_last_event_secs_ago: $session_last_event_secs_ago,
        freshness_threshold_secs: $freshness_threshold_secs,
+       session_burst: {
+         count: $session_burst_count,
+         min_required: $session_burst_min,
+         window_secs: $session_burst_window_secs,
+         sporadic: $session_sporadic
+       },
        weekly: { active: $weekly_active, reset_time_text: $weekly_reset,
                  hard: $weekly_hard, advisory: $weekly_advisory },
        window_5h: {
@@ -478,6 +522,11 @@ case "$MODE" in
       echo "    Last session-limit event: $(( (NOW - SESSION_LAST_EVENT_EPOCH) / 60 )) min ago (threshold: ${FRESHNESS_MAX_SECS}s)"
       echo "    → Defer-without-spawn starved the re-log signal; latch cleared."
       echo "    → Set CLAUDE_QUOTA_FRESHNESS_SECS=0 to disable this guard."
+    elif [ "$SESSION_SPORADIC" = "1" ]; then
+      echo " 🟢 NOT limited — sporadic 429(s), NOT a sustained burst (ga-burst)"
+      echo "    Burst count: ${SESSION_BURST_COUNT} in last ${BURST_WINDOW_SECS}s (threshold: ${BURST_MIN_COUNT} required)"
+      echo "    → Borderline account: occasional 429s but not exhausted; gate keeps running."
+      echo "    → Set CLAUDE_QUOTA_BURST_MIN_COUNT=1 to restore single-event latch."
     elif [ "$WEEKLY_ADVISORY" = "1" ]; then
       echo " 🟡 WEEKLY limit active (ADVISORY) — resets ${WEEKLY_RESET_TEXT}"
       echo "    No active 5h session limit → the gate/pilot KEEP RUNNING (ga-ot735)."

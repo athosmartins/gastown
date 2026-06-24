@@ -75,16 +75,43 @@ if [ "$BILL2" = "335" ]; then ok "out-of-window tokens excluded (still 335)"; el
 rm -f "$FIX/proj-b/old.jsonl"
 
 # ---------------------------------------------------------------------------
-# CASE 3: ACTIVE session limit (reset 1:00pm > now 12:00) → LIMITED (exit 2)
+# CASE 3 (ga-burst): SINGLE recent session-limit event → NOT limited (sporadic).
+#   A borderline account fires occasional 429s (~6/hour) but the account is NOT
+#   hard-exhausted. One event must NOT latch LIMITED for 20 minutes.
+#   Expected: exit 0, limited=false, session_burst.sporadic=true.
 # ---------------------------------------------------------------------------
 : > "$FIX/proj-b/session-active.jsonl"
 exhaust_line -600 "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-active.jsonl"
 run bash "$SUT" --json
+if [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "false" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_burst.sporadic')" = "true" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_burst.count')" = "0" ]; then
+  ok "single recent 429 → NOT limited (sporadic, exit 0, burst.count=0 < threshold 2) (ga-burst)"
+else
+  bad "single recent 429 should be sporadic" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,scope,session_burst}' 2>/dev/null)"
+fi
+# CASE 3b (ga-burst): BURST of ≥2 session-limit events in 5-min window → LIMITED (exit 2)
+#   Two 429 events BOTH within 300s = real sustained exhaustion.
+#   (The existing -600 event is outside the 300s window; add two fresh ones.)
+exhaust_line -240 "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-active.jsonl"
+exhaust_line -60  "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-active.jsonl"
+run bash "$SUT" --json
+if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "true" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.scope')" = "session" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_burst.count')" = "2" ]; then
+  ok "burst of 2 recent 429s (both in 300s window) → LIMITED (exit 2, scope=session, burst.count=2) (ga-burst)"
+else
+  bad "burst of 2 events should be limited" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,scope,session_burst}' 2>/dev/null)"
+fi
+# CASE 3c (ga-burst): BURST_MIN_COUNT=1 restores old single-event latch (escape hatch)
+OUT=$(env CLAUDE_PROJECTS_DIR="$FIX" CLAUDE_QUOTA_NOW="$NOW" CLAUDE_QUOTA_TZ="$TZ_RESET" \
+          CLAUDE_QUOTA_SCAN_ALL=1 CLAUDE_QUOTA_BURST_MIN_COUNT=1 \
+          bash "$SUT" --json 2>/dev/null); RC=$?
 if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "true" ] \
    && [ "$(printf '%s' "$OUT" | jq -r '.scope')" = "session" ]; then
-  ok "active session limit → limited (exit 2, scope=session)"
+  ok "CLAUDE_QUOTA_BURST_MIN_COUNT=1 → single-event latch restored (exit 2) (ga-burst)"
 else
-  bad "active session limit" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,scope}' 2>/dev/null)"
+  bad "BURST_MIN_COUNT=1 should restore single-event latch" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,scope}' 2>/dev/null)"
 fi
 rm -f "$FIX/proj-b/session-active.jsonl"
 
@@ -132,20 +159,23 @@ fi
 rm -f "$FIX/proj-b/weekly-active.jsonl"
 
 # ---------------------------------------------------------------------------
-# CASE 5c (ga-ot735): SESSION active AND weekly active → SESSION WINS.
-#   Hard pause (exit 2), scope=session, SESSION reset is the headline (not the
-#   days-out weekly one); weekly.active still reported.
+# CASE 5c (ga-ot735 + ga-burst): SESSION burst AND weekly active → SESSION WINS.
+#   Burst (≥2 events in 5-min window) + weekly → hard pause on session scope.
+#   SESSION reset is the headline (not the days-out weekly one); weekly.active
+#   still reported.
 # ---------------------------------------------------------------------------
 : > "$FIX/proj-b/both-active.jsonl"
-exhaust_line -600  "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)"        >> "$FIX/proj-b/both-active.jsonl"
+exhaust_line -240  "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)"        >> "$FIX/proj-b/both-active.jsonl"
+exhaust_line -60   "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)"        >> "$FIX/proj-b/both-active.jsonl"
 exhaust_line -3000 "You've hit your weekly limit · resets Jun 12 at 8pm (America/Sao_Paulo)"  >> "$FIX/proj-b/both-active.jsonl"
 run bash "$SUT" --json
 if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.scope')" = "session" ] \
    && printf '%s' "$OUT" | jq -e '.reset_time_text | test("1:00pm")' >/dev/null 2>&1 \
-   && [ "$(printf '%s' "$OUT" | jq -r '.weekly.active')" = "true" ]; then
-  ok "session+weekly both active → session wins (exit 2, scope=session, session reset is headline)"
+   && [ "$(printf '%s' "$OUT" | jq -r '.weekly.active')" = "true" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_burst.count')" = "2" ]; then
+  ok "session-burst(2)+weekly both active → session wins (exit 2, scope=session, session reset headline, burst.count=2) (ga-burst+ga-ot735)"
 else
-  bad "session beats weekly" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,scope,reset_time_text,weekly}' 2>/dev/null)"
+  bad "session burst beats weekly" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,scope,reset_time_text,weekly,session_burst}' 2>/dev/null)"
 fi
 rm -f "$FIX/proj-b/both-active.jsonl"
 
@@ -166,44 +196,86 @@ else
 fi
 rm -f "$FIX/proj-b/session-stale.jsonl"
 
-# CASE 9b (ga-z0n9f): FRESH session latch (5 min old < 20 min threshold) → still LIMITED
+# CASE 9b (ga-z0n9f + ga-burst): FRESH session latch (5 min old < 20 min threshold).
+#   With ga-burst: a single fresh event is SPORADIC → NOT limited (burst.count=0 < 2).
+#   A sustained burst (2 events in 5min) IS limited even when fresh.
 : > "$FIX/proj-b/session-fresh.jsonl"
 exhaust_line -300 "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-fresh.jsonl"
 run bash "$SUT" --json
-if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "true" ] \
-   && [ "$(printf '%s' "$OUT" | jq -r '.session_stale')" = "false" ]; then
-  ok "fresh session latch (5 min old < threshold 20 min) → still limited (exit 2) (ga-z0n9f)"
+if [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "false" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_stale')" = "false" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_burst.sporadic')" = "true" ]; then
+  ok "single fresh event (5 min, < burst threshold 2) → sporadic, NOT limited (exit 0) (ga-burst supersedes ga-z0n9f single-event)"
 else
-  bad "fresh session latch still limited" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,session_stale}' 2>/dev/null)"
+  bad "single fresh event should be sporadic not limited" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,session_stale,session_burst}' 2>/dev/null)"
+fi
+# 9b-burst: two fresh events within 300s → LIMITED despite freshness
+exhaust_line -60 "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-fresh.jsonl"
+run bash "$SUT" --json
+if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "true" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_burst.count')" = "2" ]; then
+  ok "2 fresh events in burst window → LIMITED (exit 2, burst.count=2) (ga-burst)"
+else
+  bad "2 fresh events should be limited" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,session_burst}' 2>/dev/null)"
 fi
 rm -f "$FIX/proj-b/session-fresh.jsonl"
 
-# CASE 9c (ga-z0n9f): CLAUDE_QUOTA_FRESHNESS_SECS=0 disables guard → stale latch stays LIMITED
+# CASE 9c (ga-z0n9f + ga-burst): FRESHNESS_SECS=0 disables freshness guard.
+#   With ga-burst: a SINGLE stale event + freshness disabled → still sporadic (NOT limited).
+#   To be limited, must cross burst threshold regardless of freshness setting.
 : > "$FIX/proj-b/session-stale2.jsonl"
 exhaust_line -1500 "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-stale2.jsonl"
 OUT=$(env CLAUDE_PROJECTS_DIR="$FIX" CLAUDE_QUOTA_NOW="$NOW" CLAUDE_QUOTA_TZ="$TZ_RESET" \
           CLAUDE_QUOTA_SCAN_ALL=1 CLAUDE_QUOTA_FRESHNESS_SECS=0 \
           bash "$SUT" --json 2>/dev/null); RC=$?
-if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "true" ] \
-   && [ "$(printf '%s' "$OUT" | jq -r '.session_stale')" = "false" ]; then
-  ok "CLAUDE_QUOTA_FRESHNESS_SECS=0 disables freshness guard → stale latch stays limited (exit 2) (ga-z0n9f)"
+if [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "false" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_stale')" = "false" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_burst.sporadic')" = "true" ]; then
+  ok "single stale event + FRESHNESS_SECS=0: burst gate still applies → sporadic (exit 0) (ga-burst+ga-z0n9f)"
 else
-  bad "freshness guard disabled" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,session_stale}' 2>/dev/null)"
+  bad "single stale event freshness-disabled should be sporadic" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,session_stale,session_burst}' 2>/dev/null)"
+fi
+# 9c-burst: burst (2 events stale) + freshness disabled → LIMITED (burst wins)
+exhaust_line -1400 "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-stale2.jsonl"
+OUT=$(env CLAUDE_PROJECTS_DIR="$FIX" CLAUDE_QUOTA_NOW="$NOW" CLAUDE_QUOTA_TZ="$TZ_RESET" \
+          CLAUDE_QUOTA_SCAN_ALL=1 CLAUDE_QUOTA_FRESHNESS_SECS=0 \
+          bash "$SUT" --json 2>/dev/null); RC=$?
+# Note: both events are outside the 300s burst window (1500s and 1400s ago), so
+# SESSION_BURST_COUNT=0 → sporadic. Freshness check: last event=1400s ago < 1200s threshold
+# BUT freshness is disabled. Burst gate applies: burst_count=0 < 2 → sporadic.
+if [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "false" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_burst.sporadic')" = "true" ]; then
+  ok "2 stale events outside burst window + freshness disabled → sporadic (exit 0, burst.count=0) (ga-burst)"
+else
+  bad "2 stale-old events should be sporadic (outside burst window)" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,session_burst}' 2>/dev/null)"
 fi
 rm -f "$FIX/proj-b/session-stale2.jsonl"
 
-# CASE 9d (ga-z0n9f): multiple events — fresh event among stale ones → guard does NOT fire
-#   One stale event (25 min) + one fresh event (5 min), both with future reset.
-#   The most-recent event is 5 min old < threshold → still LIMITED (fresh wins).
+# CASE 9d (ga-z0n9f + ga-burst): mixed stale+fresh events.
+#   One stale event (25 min, outside 300s burst window) + one fresh event (5 min, inside window).
+#   Burst window count = 1 (only the fresh one is within 300s) < threshold 2 → sporadic.
+#   Freshness guard: last event = 300s ago < 1200s threshold → guard does not fire.
+#   Combined result: sporadic (NOT limited).
 : > "$FIX/proj-b/session-mixed-age.jsonl"
 exhaust_line -1500 "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-mixed-age.jsonl"
 exhaust_line -300  "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-mixed-age.jsonl"
 run bash "$SUT" --json
-if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "true" ] \
-   && [ "$(printf '%s' "$OUT" | jq -r '.session_stale')" = "false" ]; then
-  ok "stale+fresh events: fresh one (5 min) resets guard; latch stays limited (exit 2) (ga-z0n9f)"
+if [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "false" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_stale')" = "false" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_burst.sporadic')" = "true" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_burst.count')" = "1" ]; then
+  ok "stale+single-fresh events: burst.count=1 < 2 → sporadic (exit 0, not stale, not limited) (ga-burst+ga-z0n9f)"
 else
-  bad "stale+fresh: fresh event should prevent guard" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,session_stale,session_last_event_secs_ago}' 2>/dev/null)"
+  bad "stale+single-fresh: should be sporadic (burst.count=1)" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,session_stale,session_burst}' 2>/dev/null)"
+fi
+# 9d-burst: add a SECOND fresh event → burst.count=2 → LIMITED
+exhaust_line -60   "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-mixed-age.jsonl"
+run bash "$SUT" --json
+if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "true" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_burst.count')" = "2" ]; then
+  ok "stale+2-fresh events: burst.count=2 → LIMITED (exit 2) — genuine sustained exhaustion (ga-burst)"
+else
+  bad "stale+2-fresh should be limited (burst.count=2)" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,session_burst}' 2>/dev/null)"
 fi
 rm -f "$FIX/proj-b/session-mixed-age.jsonl"
 
@@ -218,15 +290,26 @@ PCT=$(printf '%s' "$OUT" | jq -r '.window_5h.pct_of_budget')
 if [ "$PCT" = "33.5" ]; then ok "budget % computed (335/1000 = 33.5%)"; else bad "budget %" "got $PCT want 33.5"; fi
 
 # ---------------------------------------------------------------------------
-# CASE 7: --line mode emits a single QUOTA: line and is exit-coded
+# CASE 7: --line mode emits a single QUOTA: line and is exit-coded.
+#   ga-burst: single event is sporadic → exit 0, line says "sporadic".
+#   burst of 2 events → LIMITED (exit 2), line says "LIMITED (session)".
 # ---------------------------------------------------------------------------
 : > "$FIX/proj-b/session-active2.jsonl"
 exhaust_line -600 "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-active2.jsonl"
 run bash "$SUT" --line
-if [ "$RC" = "2" ] && printf '%s' "$OUT" | grep -q '^QUOTA: LIMITED (session)'; then
-  ok "--line limited → 'QUOTA: LIMITED (session)…' (exit 2)"
+if [ "$RC" = "0" ] && printf '%s' "$OUT" | grep -q '^QUOTA: not limited — sporadic'; then
+  ok "--line single sporadic → 'QUOTA: not limited — sporadic…' (exit 0) (ga-burst)"
 else
-  bad "--line limited" "rc=$RC out=$OUT"
+  bad "--line single sporadic" "rc=$RC out=$OUT"
+fi
+# add TWO events within burst window to cross threshold (the existing -600 is outside 300s)
+exhaust_line -240 "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-active2.jsonl"
+exhaust_line -60  "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-active2.jsonl"
+run bash "$SUT" --line
+if [ "$RC" = "2" ] && printf '%s' "$OUT" | grep -q '^QUOTA: LIMITED (session)'; then
+  ok "--line burst(2) → 'QUOTA: LIMITED (session)…' (exit 2) (ga-burst)"
+else
+  bad "--line burst limited" "rc=$RC out=$OUT"
 fi
 rm -f "$FIX/proj-b/session-active2.jsonl"
 
