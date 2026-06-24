@@ -38,6 +38,8 @@ QG_LOG="$GC_CITY/.gc/quality-gate.jsonl"
 _GLH_SCRIPT="${GC_CITY}/scripts/git-lock-hygiene.sh"
 [ -f "$_GLH_SCRIPT" ] && { GIT_LOCK_HYGIENE_LIB=1 source "$_GLH_SCRIPT" 2>/dev/null; } || true
 unset _GLH_SCRIPT
+# glh source clobbers LOG with its own jsonl path — restore ours (ga-l47b7 log-redirect fix)
+LOG="$LOG_DIR/quality-gate-dispatcher.log"
 
 # Maximum wall-clock minutes to wait for all reviewer verdicts before timing out.
 VERDICT_TIMEOUT_MINUTES="${VERDICT_TIMEOUT_MINUTES:-22}"
