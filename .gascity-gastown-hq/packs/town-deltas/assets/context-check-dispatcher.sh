@@ -685,9 +685,26 @@ while IFS= read -r row; do
   # bead (automation-debt pill). Idempotent: only write if absent/changed, and
   # strip the opposite so a re-judge can't leave both. Fail-OPEN — every bd_ here
   # is best-effort (|| true); a failure can NEVER unwind the ctx:ready verdict.
+  #
+  # ga-l5ud0 ROOT B FIX: NEVER downgrade exec:manual → exec:auto. exec:manual is
+  # an authoritative human/Mayor-set signal that a task requires a physical device,
+  # human credential, or explicit human trigger. The content classifier is conservative
+  # (defaults exec:auto) — it CANNOT determine that exec:manual is wrong; only a human
+  # can demote it. If a bead already carries exec:manual and the classifier returns
+  # exec:auto, we SKIP the write (the existing exec:manual wins). The classifier MAY
+  # upgrade exec:auto → exec:manual if it discovers a new physical/credential signal,
+  # but NEVER the reverse. Without this guard, the context-check-dispatcher silently
+  # clobbers a Mayor-set exec:manual on every re-judge sweep, causing the dispatch
+  # loop: exec:manual cleared → Pilot sees exec:auto + ctx:ready → dispatches a crew
+  # that cannot complete the task → mila clears it → Pilot re-dispatches → repeat.
   if [ -n "$EXEC" ]; then
     if echo ",$c_labels," | grep -qF ",$EXEC,"; then
       : # already correctly labeled — no thrash
+    elif [ "$EXEC" = "exec:auto" ] && echo ",$c_labels," | grep -qF ",exec:manual,"; then
+      # AUTHORITATIVE-HOLD: bead already has exec:manual; classifier returned exec:auto
+      # (conservative default). Never demote — exec:manual wins. Log and skip.
+      log "  $c_id: exec-class hold — existing exec:manual is authoritative; classifier returned exec:auto (conservative default) — NOT downgrading (ga-l5ud0)"
+      EXEC="exec:manual"    # reflect the kept label in the log line and JSON event below
     else
       case "$EXEC" in
         exec:manual) bd_ label remove "$c_id" "exec:auto"   -q 2>/dev/null || true ;;

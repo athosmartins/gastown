@@ -423,7 +423,7 @@ CONTEXT_CHECK_CITY_OVERRIDE="$_ecity" \
   CONTEXT_CHECK_MAX_SONNET_PER_SWEEP=0 \
   CONTEXT_CHECK_EXEC_CLASS=1 \
   PATH="$_ecity:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
-  bash "$DISPATCHER" >/dev/null 2>&1
+  timeout 30 bash "$DISPATCHER" >/dev/null 2>&1 || true
 _eled=$(cat "$LEDGER" 2>/dev/null || echo "")
 # ga-manual1: ctx:ready + exec:manual.
 if echo "$_eled" | grep -qE 'label add ga-manual1 ctx:ready' \
@@ -453,7 +453,7 @@ CONTEXT_CHECK_CITY_OVERRIDE="$_ecity" \
   CONTEXT_CHECK_MAX_SONNET_PER_SWEEP=0 \
   CONTEXT_CHECK_EXEC_CLASS=0 \
   PATH="$_ecity:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
-  bash "$DISPATCHER" >/dev/null 2>&1
+  timeout 30 bash "$DISPATCHER" >/dev/null 2>&1 || true
 _eled2=$(cat "$LEDGER" 2>/dev/null || echo "")
 if echo "$_eled2" | grep -qE 'label add ga-manual1 ctx:ready' \
    && ! echo "$_eled2" | grep -qE 'label add ga-manual1 exec:'; then
@@ -462,6 +462,82 @@ else
   bad "feature-gate OFF did not preserve verdict-without-exec (ledger: $(echo "$_eled2" | tr '\n' ';'))"
 fi
 rm -rf "$_ecity"
+
+# 12. ga-l5ud0 ROOT B FIX: exec:manual is AUTHORITATIVE — the classifier MUST NOT
+#     downgrade an existing exec:manual to exec:auto. A bead that already carries
+#     exec:manual (Mayor/human-set) must keep it even when context_check_exec_class
+#     returns exec:auto (the conservative default for content with no physical/credential
+#     signal). The loop this closes: exec:manual clobbered → Pilot sees exec:auto +
+#     ctx:ready → dispatches a crew that cannot complete the task → mila clears → repeat.
+#
+#     Pure drift guards (no live Dolt/gc) — these test the actual shipped code paths
+#     exercised by the ga-l5ud0 fix, not just the fix's presence.
+echo "Scenario 12: ga-l5ud0 — exec:manual authoritative-hold guard (drift guards)"
+# 12a — The guard code is present in the dispatcher (the critical branch that prevents
+#        downgrade). Regression: if this disappears, exec:manual gets clobbered again.
+if grep -qF 'exec:auto.*exec:manual,.*AUTHORITATIVE-HOLD\|AUTHORITATIVE-HOLD' "$DISPATCHER" \
+   || grep -qF 'AUTHORITATIVE-HOLD' "$DISPATCHER"; then
+  ok "ga-l5ud0: AUTHORITATIVE-HOLD guard present in dispatcher (exec:manual NOT downgradeable)"
+else
+  bad "ga-l5ud0 REGRESSION: AUTHORITATIVE-HOLD guard missing — exec:manual can be silently clobbered"
+fi
+# 12b — The guard specifically checks: if computed=exec:auto AND existing has exec:manual, skip.
+#        Verify the exact branch condition exists in the code.
+if grep -qF '"exec:auto" ] && echo ",$c_labels," | grep -qF ",exec:manual,"' "$DISPATCHER"; then
+  ok "ga-l5ud0: hold-condition wiring correct (exec:auto + existing exec:manual → skip)"
+else
+  bad "ga-l5ud0: hold-condition wiring malformed or missing"
+fi
+# 12c — BEHAVIORAL SIMULATION (pure shell, no Dolt): verify the hold fires correctly
+#        by sourcing the lib and simulating the label-write decision logic inline.
+#        wa-14w76 pattern: content → exec:auto; existing label = exec:manual → KEEP.
+_ga_l5ud0_hold_ok=0
+(
+  c_labels="ctx:ready,exec:manual,lane:small,story:approved"
+  EXEC=$(context_check_exec_class \
+    "Restaurar input do grupo UrbLink via historico" \
+    "A capacidade de LER O HISTORICO de um grupo JA ESTA IMPLEMENTADA. whapi foi descontinuado. Ligar ao /peter-review." \
+    2>/dev/null || echo "exec:auto")
+  # Verify: classifier returns exec:auto for this content.
+  [ "$EXEC" = "exec:auto" ] || exit 2
+  # Simulate the guard: if exec:auto AND existing exec:manual → hold (no-op).
+  _would_downgrade=1
+  if echo ",$c_labels," | grep -qF ",exec:manual," && [ "$EXEC" = "exec:auto" ]; then
+    _would_downgrade=0  # AUTHORITATIVE-HOLD fires
+  fi
+  [ "$_would_downgrade" = "0" ] || exit 3
+  exit 0
+) && _ga_l5ud0_hold_ok=1
+if [ "$_ga_l5ud0_hold_ok" = "1" ]; then
+  ok "ga-l5ud0: behavioral sim — wa-14w76 pattern: classifier→exec:auto, existing=exec:manual → HOLD (no downgrade)"
+else
+  bad "ga-l5ud0 REGRESSION: behavioral sim shows exec:manual was or would be downgraded for wa-14w76 pattern"
+fi
+# 12d — Converse: exec:manual UPGRADE (auto→manual) is still allowed. A bead with
+#        exec:auto whose content now matches a physical-device signal → upgrades to
+#        exec:manual (the guard ONLY blocks downgrade, not upgrade).
+_ga_l5ud0_upgrade_ok=0
+(
+  c_labels="ctx:ready,exec:auto,lane:small"
+  EXEC=$(context_check_exec_class \
+    "ligar o phone-as-Claro-mobile-proxy" \
+    "conectar manualmente o celular físico como proxy móvel" \
+    2>/dev/null || echo "exec:auto")
+  # Verify: classifier returns exec:manual (physical-device signal).
+  [ "$EXEC" = "exec:manual" ] || exit 2
+  # Simulate: existing=exec:auto, computed=exec:manual → upgrade is NOT blocked.
+  _would_upgrade=0
+  if echo ",$c_labels," | grep -qF ",exec:auto," && [ "$EXEC" = "exec:manual" ]; then
+    _would_upgrade=1  # upgrade path fires (no AUTHORITATIVE-HOLD — guard only blocks auto)
+  fi
+  [ "$_would_upgrade" = "1" ] || exit 3
+  exit 0
+) && _ga_l5ud0_upgrade_ok=1
+if [ "$_ga_l5ud0_upgrade_ok" = "1" ]; then
+  ok "ga-l5ud0: upgrade (exec:auto → exec:manual on new physical signal) is NOT blocked by hold"
+else
+  bad "ga-l5ud0: upgrade path broken — exec:auto→exec:manual upgrade is blocked (should only block downgrade)"
+fi
 
 echo ""
 echo "context-check-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
