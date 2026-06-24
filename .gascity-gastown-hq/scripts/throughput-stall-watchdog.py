@@ -172,6 +172,30 @@ _bd_backlog = None             # (rig_root) -> list[dict]; None = run bd
 _bd_delivery = None            # (rig_root) -> list[dict]; None = run bd (imp23 delivery)
 _do_notify = None              # (msg, prio) -> None; None = run notify binary
 _do_mail_mayor = None          # (subject, body) -> bool; None = run gc mail
+
+# imp14: flow-authority advisory file — TSW is the elected flow authority. When TSW
+# escalates to Mayor, it writes this file so PSW/PTH/FFF can check and defer their own
+# Mayor mail (avoiding the "4 daemons page Mayor for the same stall" storm).
+FLOW_AUTHORITY_FILE = os.environ.get(
+    "TSW_FLOW_AUTHORITY_FILE",
+    os.path.join(CITY, ".gc/runtime/flow-authority.json"))
+FLOW_AUTHORITY_TTL_SEC = int(os.environ.get("TSW_FLOW_AUTHORITY_TTL_SEC", "7200"))  # 2h
+
+
+def _write_flow_authority(now, dimension):
+    """Write the flow-authority marker file (imp14). Called after TSW mails Mayor."""
+    try:
+        import json as _json
+        runtime_dir = os.path.dirname(FLOW_AUTHORITY_FILE)
+        os.makedirs(runtime_dir, exist_ok=True)
+        with open(FLOW_AUTHORITY_FILE, "w") as f:
+            _json.dump({"escalated_at": now, "dimension": dimension,
+                        "authority": "throughput-stall-watchdog",
+                        "expires_at": now + FLOW_AUTHORITY_TTL_SEC}, f)
+        _log("imp14: wrote flow-authority marker (dimension=%s, expires in %dh)" % (
+            dimension, FLOW_AUTHORITY_TTL_SEC // 3600))
+    except Exception as e:
+        _log("imp14: WARNING: failed to write flow-authority marker: %s" % e)
 _do_dolt_probe = None          # () -> int; 0=healthy 1=unhealthy 2=unknown; None = run probe
 _do_heal_throughput = None     # () -> bool; True=heal attempted; None = call funnel-flow-healer.sh
 _do_check_quota = None         # () -> bool; True=quota available; None = call quota-check.sh (imp12)
@@ -931,6 +955,10 @@ def _escalate(backlog_count, dispatch_count, last_dispatch_epoch,
 
     if not ok_mail:
         _log("WARN: gc mail send mayor FAILED — notify still sent (imp07 invariant)")
+
+    # imp14: write flow-authority marker so PSW/PTH/FFF can defer their own Mayor mail.
+    _write_flow_authority(now, "throughput")
+
     return ok_mail
 
 

@@ -51,6 +51,15 @@ PILOT_FREEZE_MIN="${PILOT_FREEZE_MIN:-15}"
 
 BD_TIMEOUT="${FLOW_HEALER_BD_TIMEOUT:-25}"
 
+# imp14: flow-authority advisory file (written by TSW when it escalates to Mayor).
+# When TSW is the active flow authority, FFF suppresses kickstarts AND Mayor mail for
+# the gate/pilot signatures (those overlap with TSW's merge/dispatch signals).
+# auto-refino and refino-gate are UPSTREAM of TSW's window — always retain their actions.
+FLOW_AUTHORITY_FILE="${FFF_FLOW_AUTHORITY_FILE:-$CITY/.gc/runtime/flow-authority.json}"
+FFF_FLOW_AUTHORITY_DEFER="${FFF_FLOW_AUTHORITY_DEFER:-1}"
+# Signatures whose kickstart+escalation is suppressed when TSW is active (gate/pilot overlap).
+FFF_TSW_SUPPRESS_SIGS="${FFF_TSW_SUPPRESS_SIGS:-gate pilot}"
+
 # launchd labels (discovered from `launchctl list | grep gascity` on 2026-06-15)
 LABEL_AUTO_REFINO="${LABEL_AUTO_REFINO:-com.gascity.auto-refino-dispatcher}"
 LABEL_REFINO_GATE="${LABEL_REFINO_GATE:-com.gascity.refino-gate-dispatcher}"
@@ -136,6 +145,29 @@ sf() { echo "$STATE_DIR/$1"; }                       # state-file path for key
 get() { cat "$(sf "$1")" 2>/dev/null || echo "$2"; } # get <key> <default>
 put() { echo "$2" > "$(sf "$1")" 2>/dev/null || true; }
 
+# imp14: return 0 (true) if TSW has written a flow-authority marker that has not yet expired.
+_tsw_flow_authority_active() {
+  [ "$FFF_FLOW_AUTHORITY_DEFER" = "1" ] || return 1
+  [ -f "$FLOW_AUTHORITY_FILE" ] || return 1
+  local expires_at now
+  now=$(date +%s)
+  # Parse expires_at from JSON without a Python dependency (portable jq / awk fallback)
+  if command -v jq >/dev/null 2>&1; then
+    expires_at=$(jq -r '.expires_at // 0' "$FLOW_AUTHORITY_FILE" 2>/dev/null) || return 1
+  else
+    expires_at=$(awk -F'"expires_at":' '{print $2}' "$FLOW_AUTHORITY_FILE" 2>/dev/null \
+                 | tr -d ' },' | head -1) || return 1
+  fi
+  [ -n "$expires_at" ] && [ "$(( expires_at + 0 ))" -gt "$now" ] 2>/dev/null
+}
+
+# imp14: return 0 (true) if this signature's actions should be suppressed because TSW is active.
+_tsw_suppresses_sig() {  # sig
+  local sig="$1"
+  case " $FFF_TSW_SUPPRESS_SIGS " in *" $sig "*) ;; *) return 1 ;; esac  # not in list
+  _tsw_flow_authority_active
+}
+
 # ------------------------------------------------------------------ DECISION CORE
 # decide_action: PURE decision logic for one signature. Reads state, returns the
 # action to take on stdout (one of: NONE | KICKSTART | ESCALATE | NTFY) and updates
@@ -216,6 +248,19 @@ handle_signature() {
   local remediations; remediations=$(get "$sig.remediations" 0)
 
   emit "signature" ",\"sig\":\"$sig\",\"demand\":$demand,\"log_age_min\":$age,\"frozen\":$frozen,\"stalled\":$stalled,\"strikes\":$strikes,\"remediations\":$remediations,\"decision\":\"$action\""
+
+  # imp14: gate and pilot signals overlap with TSW's merge/dispatch signals. When TSW is
+  # the elected flow authority (wrote flow-authority.json and is actively escalating),
+  # suppress kickstarts AND Mayor mail for those two sigs so we don't stack redundant
+  # kickstarts or multi-page the Mayor with duplicate escalations. Census/JSONL still runs.
+  local tsw_suppressing=0
+  if [ "$action" = "KICKSTART" ] || [ "$action" = "ESCALATE" ]; then
+    if _tsw_suppresses_sig "$sig"; then
+      tsw_suppressing=1
+      emit "tsw-defer" ",\"sig\":\"$sig\",\"action\":\"$action\",\"reason\":\"TSW flow-authority active — deferring to TSW\""
+      action="NONE"
+    fi
+  fi
 
   case "$action" in
     KICKSTART)

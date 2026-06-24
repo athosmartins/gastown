@@ -121,6 +121,30 @@ run_sweep() {
         log "R4 ready-stale-assignee: $id ($(basename "$store")) — cleared phantom assignee"; n=$((n+1))
       done
     done
+    # R6 (imp19 pilot:held expiry): pilot:held + pilot:held-until:<past-epoch> → strip both
+    # (the hold expired). pilot:held + NO pilot:held-until:* → set a 24h default expiry so
+    # permanent trapdoors are impossible: every hold now has a ceiling.
+    _now_lcj=$(date +%s)
+    for id in $("$BD" -C "$store" list -l pilot:held --json -n 0 2>/dev/null | jq -r '.[].id' 2>/dev/null); do
+      [ -n "$id" ] || continue
+      _bead_locked "$id" && { log "R6 skip-locked (imp10): $id"; continue; }
+      # Get label list
+      _lbls=$("$BD" -C "$store" show "$id" --json 2>/dev/null \
+              | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | .[]' 2>/dev/null) || continue
+      _expiry_lbl=$(printf '%s\n' "$_lbls" | grep -E '^pilot:held-until:[0-9]+$' | head -1)
+      if [ -n "$_expiry_lbl" ]; then
+        _expiry_ep=$(echo "$_expiry_lbl" | cut -d: -f3)
+        if [ "$(( _expiry_ep + 0 ))" -lt "$_now_lcj" ] 2>/dev/null; then
+          _strip "$store" "$id" pilot:held; _strip "$store" "$id" "$_expiry_lbl"
+          log "R6 pilot-held-expired: $id ($(basename "$store")) — hold expired at $(date -r "$_expiry_ep" 2>/dev/null || echo "$_expiry_ep"), stripped"; n=$((n+1))
+        fi
+      else
+        # No expiry: stamp a 24h ceiling so the hold can't be permanent
+        _default_expiry="pilot:held-until:$(( _now_lcj + 86400 ))"
+        _add "$store" "$id" "$_default_expiry"
+        log "R6 pilot-held-no-expiry: $id ($(basename "$store")) — stamped default 24h expiry ($_default_expiry)"; n=$((n+1))
+      fi
+    done
     # R5 (imp15 invariant auditor): ctx:ready + status=closed → strip ctx:ready + set
     # story:done. R1 already handles story:in-flight and story:approved on closed beads;
     # ctx:ready was missing. A closed bead carrying ctx:ready shows up in the Aprovadas
@@ -175,6 +199,10 @@ case "\$a" in
   *"list -l ctx:ready --status open"*)          echo '[]' ;;
   *"list -l ctx:ready --status closed"*)        echo '[{"id":"r5","labels":["ctx:ready"]},{"id":"r5-locked","labels":["ctx:ready"]},{"id":"r5-cancel","labels":["ctx:ready","story:cancelled"]}]' ;;
   *"show r5 "*|*"show r5-locked "*)             echo '[{"id":"r5","labels":["ctx:ready"]}]' ;;
+  # R6 (imp19): r6-exp has an expired held-until; r6-noexp has pilot:held but no expiry
+  *"list -l pilot:held"*)                       echo '[{"id":"r6-exp","labels":["pilot:held","pilot:held-until:1000000"]},{"id":"r6-noexp","labels":["pilot:held"]}]' ;;
+  *"show r6-exp"*) echo '[{"id":"r6-exp","labels":["pilot:held","pilot:held-until:1000000"]}]' ;;
+  *"show r6-noexp"*) echo '[{"id":"r6-noexp","labels":["pilot:held"]}]' ;;
   *"label remove"*|*"label add"*|*"update"*|*"dolt commit"*) echo "\$a" >> "$ACT" ;;
   *) echo '[]' ;;
 esac
@@ -197,6 +225,9 @@ SHIM
   grep -q 'update ip-noasg --status open'     "$ACT" && ok "R3: in_progress + no assignee → status=open"      || bad "R3 not opened"
   grep -q 'ip-asg'                            "$ACT" && bad "TOUCHED an in_progress bead WITH an assignee (unsafe!)" || ok "left the assigned in_progress bead alone (safe)"
   grep -q 'update r4-asg --assignee'          "$ACT" && ok "R4: open story:approved with stale assignee → cleared (phantom worker)" || bad "R4 did not clear stale assignee"
+  grep -q 'label remove r6-exp pilot:held'     "$ACT" && ok "R6 (imp19): expired pilot:held-until → stripped pilot:held" || bad "R6 did not strip expired pilot:held"
+  grep -q 'label remove r6-exp pilot:held-until:1000000' "$ACT" && ok "R6 (imp19): stripped the expiry label" || bad "R6 did not strip expiry label"
+  grep -q 'label add r6-noexp pilot:held-until:' "$ACT" && ok "R6 (imp19): pilot:held with no expiry → stamped default 24h expiry" || bad "R6 did not stamp default expiry"
   grep -q 'label remove r5 ctx:ready'         "$ACT" && ok "R5 (imp15): closed+ctx:ready → stripped (Aprovadas zombie fix)" || bad "R5 did not strip ctx:ready"
   grep -q 'label add r5 story:done'           "$ACT" && ok "R5 (imp15): closed ctx:ready bead → set story:done" || bad "R5 did not set story:done"
   grep -q 'r5-locked'                         "$ACT" && bad "imp10: touched a lifecycle-locked bead (must be skipped)" || ok "imp10: skipped the advisory-locked bead (r5-locked)"

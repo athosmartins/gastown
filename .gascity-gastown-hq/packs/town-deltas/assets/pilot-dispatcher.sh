@@ -1046,13 +1046,26 @@ _pilot_gate_congested() {
 
 _FILTER_PREAPPROVAL_LABELS='["story:unrefined","story:refinement-in-progress","story:triage","story:cancelled"]'
 _filter_candidates() {
+  # imp19: pilot:held is now a TIMED hold — pass a bead with pilot:held only if a
+  # pilot:held-until:<epoch> label exists AND the epoch is in the past (expired hold).
+  # The janitor R6 removes expired labels on its next sweep; this filter lets the
+  # Pilot bypass the hold without waiting for the janitor when the expiry is clear.
+  local _now_ts; _now_ts=$(date +%s)
   jq --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
+     --argjson now_ts "$_now_ts" \
     '[.[] | select(
         .id != $self
         and (.assignee == null or .assignee == "")
         and ((.issue_type // .type // "") != "epic")
         and (((.labels // []) | index("story:epic-split")) | not)
-        and (((.labels // []) | index("pilot:held")) | not)
+        and (
+          (((.labels // []) | index("pilot:held")) | not)
+          or
+          ((.labels // []) | map(select(startswith("pilot:held-until:"))) |
+            if length > 0
+            then (.[0] | ltrimstr("pilot:held-until:") | tonumber) < $now_ts
+            else false end)
+        )
         and (((.labels // []) - $preapproval) | length) == ((.labels // []) | length)
         and ((.description // "") | test("\\S"))
      )]' \
@@ -2764,12 +2777,16 @@ dispatch_one() {
   local DISPATCH_TIER="$3"
 
   local STORY_ID STORY_TITLE STORY_PRIORITY STORY_LABELS STORY_RIG STORY_BEAD_CITY
-  local STORY_ESTRELA STORY_CRITERIA STORY_EQUILIBRIOS
+  local STORY_ESTRELA STORY_CRITERIA STORY_EQUILIBRIOS STORY_RIG_EXPLICIT
   STORY_ID=$(echo "$STORY" | jq -r '.id')
   STORY_TITLE=$(echo "$STORY" | jq -r '.title // .description // "untitled"' | head -c 100)
   STORY_PRIORITY=$(echo "$STORY" | jq -r '.priority // 99')
   STORY_LABELS=$(echo "$STORY" | jq -r '(.labels // []) | join(",")')
   STORY_RIG=$(echo "$STORY" | jq -r '.metadata["story.rig"] // ""')
+  # imp20: track whether story.rig was explicitly set in metadata vs inferred from prefix.
+  # An explicit rig wins over bead_content_rig inference in the domain routing guard.
+  STORY_RIG_EXPLICIT="0"
+  [ -n "$STORY_RIG" ] && [ "$STORY_RIG" != "null" ] && STORY_RIG_EXPLICIT="1"
   STORY_ESTRELA=$(echo "$STORY" | jq -r '.metadata["story.estrela_guia"] // ""' | head -c 200)
   STORY_CRITERIA=$(echo "$STORY" | jq -r '.acceptance_criteria // .metadata["story.criterios"] // ""')
   STORY_EQUILIBRIOS=$(echo "$STORY" | jq -r '.metadata["story.equilibrios"] // ""')
@@ -3092,7 +3109,15 @@ FIXSEC
     case "$BUILDER_TARGET" in
       gastown.dog|gastown.dog-*)
         local _DOMAIN_RIG=""
-        _DOMAIN_RIG=$(bead_content_rig "$STORY" 2>/dev/null || echo "")
+        # imp20: if story.rig is EXPLICITLY set in metadata (STORY_RIG_EXPLICIT=1), honor it
+        # as authoritative over content-based inference. bead_content_rig uses keyword matching
+        # which can false-positive on WA features that mention property/CNAE/ITBI nouns.
+        if [ "$STORY_RIG_EXPLICIT" = "1" ] && [ "$STORY_RIG" != "gascity" ] && [ "$STORY_RIG" != "null" ] && [ -n "$STORY_RIG" ]; then
+          _DOMAIN_RIG="$STORY_RIG"
+          log "imp20: $STORY_ID story.rig=$STORY_RIG is explicit — using authoritative rig over bead_content_rig inference"
+        else
+          _DOMAIN_RIG=$(bead_content_rig "$STORY" 2>/dev/null || echo "")
+        fi
         if [ -n "$_DOMAIN_RIG" ] && [ "$_DOMAIN_RIG" != "gascity" ]; then
           # (1) explicit live crew owner wins.
           local _DOM_CREW_OWNER=""
@@ -3116,11 +3141,21 @@ FIXSEC
               STORY_RIG="$_DOMAIN_RIG"
               mark_pool_builder "$_DOM_DEFAULT"
             else
-              # (3) no idle persistent crew for the domain → DEFER, never a dog.
-              warn "ga-lfvs6: REFUSING to dispatch $_DOMAIN_RIG domain build $STORY_ID to the ephemeral dog pool ($BUILDER_TARGET) — a dog cannot build a real domain task (no domain data, no rig checkout, no git-diff for the gate). Owning crew ${_DOM_DEFAULT:-none} is ${_DOM_DEFAULT:+busy/unavailable}${_DOM_DEFAULT:-unmapped}. Deferring (leaving queued) until a persistent crew is available; releasing claim (set PILOT_DOMAIN_ROUTE_GUARD=0 to disable)."
+              # (3) no idle persistent crew for the domain → DEFER with timed hold.
+              # imp20: stamp pilot:held + pilot:held-until:<epoch+3600> instead of just
+              # returning 1 (plain defer). Without a timed hold, the bead is queued
+              # immediately and Pilot re-dispatches on the next sweep — the claim-but-park
+              # loop that required gate:needs-human (which release re-strips) to stop.
+              # A 1h hold prevents the re-dispatch loop while the owning crew becomes
+              # available; the janitor R6 clears it when expired.
+              warn "ga-lfvs6: REFUSING to dispatch $_DOMAIN_RIG domain build $STORY_ID to the ephemeral dog pool ($BUILDER_TARGET) — a dog cannot build a real domain task (no domain data, no rig checkout, no git-diff for the gate). Owning crew ${_DOM_DEFAULT:-none} is ${_DOM_DEFAULT:+busy/unavailable}${_DOM_DEFAULT:-unmapped}. Stamping timed pilot:held (1h) to prevent re-dispatch loop; releasing claim (set PILOT_DOMAIN_ROUTE_GUARD=0 to disable)."
               if [ "$DRY_RUN" != "1" ]; then
                 bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
                 bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+                local _hold_until; _hold_until=$(( $(date +%s) + 3600 ))
+                bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "pilot:held" -q 2>/dev/null || true
+                bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "pilot:held-until:${_hold_until}" -q 2>/dev/null || true
+                log "ga-lfvs6/imp20: $STORY_ID stamped pilot:held + pilot:held-until:${_hold_until} (1h timed hold — janitor R6 will clear when expired)"
               fi
               return 1
             fi

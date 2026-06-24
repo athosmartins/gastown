@@ -60,6 +60,29 @@ DISPATCH_LOG = os.path.join(CITY, ".gc/logs/quality-gate-dispatcher.log")
 NOTIFY = "/Users/athos/.local/bin/notify"
 DOG_TEMPLATE = "gastown.dog"   # utility pool the repair agent is spawned into (ga-afytf)
 
+# imp14: flow-authority advisory file (written by TSW after it escalates to Mayor).
+# PTH defers repair-dog spawning for pilot/gate-merge kinds when TSW is the active
+# authority — those signals overlap and stacking repair dogs adds load without benefit.
+# durable and session-rot are UNIQUE to PTH and are never suppressed.
+_FLOW_AUTHORITY_FILE = os.environ.get(
+    "PTH_FLOW_AUTHORITY_FILE",
+    os.path.join(CITY, ".gc/runtime/flow-authority.json"))
+_PTH_FLOW_AUTHORITY_DEFER = os.environ.get("PTH_FLOW_AUTHORITY_DEFER", "1") == "1"
+# Kinds whose repair-dog spawn is suppressed when TSW is active (overlap with TSW signals).
+_PTH_TSW_SUPPRESS_KINDS = frozenset(["pilot", "gate-merge"])
+
+
+def _tsw_flow_authority_active(now):
+    """imp14: return True if TSW has escalated and is the active flow authority."""
+    if not _PTH_FLOW_AUTHORITY_DEFER:
+        return False
+    try:
+        with open(_FLOW_AUTHORITY_FILE) as f:
+            data = json.load(f)
+        return float(data.get("expires_at", 0)) > now
+    except Exception:
+        return False
+
 # ── cadence / thresholds ─────────────────────────────────────────────────────
 POLL_SEC = 300                 # throughput cadence (matches Pilot/delivery 5-min sweep)
 FLOW_WINDOW_SEC = 1800         # rolling window for flow-under-demand judgements (30min)
@@ -648,6 +671,13 @@ def run_tick(now, state, last_global_spawn, tracked=None):
             print("[heartbeat] %s confirmed but a repair dog is still alive (%s) — "
                   "suppressing spawn (anti feedback-loop)" % (kind, ",".join(live)),
                   flush=True)
+            continue
+        # imp14: for pilot/gate-merge, defer repair-dog spawn when TSW is the active
+        # flow authority — those signals overlap with TSW's and stacking repair dogs adds
+        # load without benefit. durable and session-rot are unique to PTH; always spawn.
+        if kind in _PTH_TSW_SUPPRESS_KINDS and _tsw_flow_authority_active(now):
+            print("[heartbeat] imp14: %s detected but TSW flow-authority active — "
+                  "deferring repair-dog spawn (no redundant kickstart)" % kind, flush=True)
             continue
         # per-kind cooldown AND global anti-swarm cooldown
         if now - st["last_spawn"] <= REPAIR_COOLDOWN_SEC:

@@ -93,6 +93,14 @@ ESCALATE_COOLDOWN_SEC = int(os.environ.get("PROD_STALL_COOLDOWN_SEC", "10800")) 
 GIT_FETCH_TIMEOUT = int(os.environ.get("PROD_STALL_FETCH_TIMEOUT", "30"))
 MAYOR_ADDR = os.environ.get("PROD_STALL_MAYOR_ADDR", "mayor")
 
+# imp14: flow-authority advisory file path (shared with TSW, the elected authority).
+# When TSW has already escalated a stall, PSW defers its own Mayor mail to avoid the
+# "4 daemons independently page Mayor" escalation storm.
+FLOW_AUTHORITY_FILE = os.environ.get(
+    "PROD_STALL_FLOW_AUTHORITY_FILE",
+    os.path.join(CITY, ".gc/runtime/flow-authority.json"))
+FLOW_AUTHORITY_DEFER = os.environ.get("PROD_STALL_FLOW_AUTHORITY_DEFER", "1") == "1"
+
 DIMENSIONS = ("deploy-block", "merge-stall", "stuck-exec")
 
 # ── log-line patterns (verified against the live dispatcher) ──────────────────
@@ -333,8 +341,30 @@ REMEDY = {
 }
 
 
+def _tsw_flow_authority_active(now):
+    """imp14: return True if TSW has already escalated and is the active flow authority."""
+    if not FLOW_AUTHORITY_DEFER:
+        return False
+    try:
+        with open(FLOW_AUTHORITY_FILE) as f:
+            data = json.load(f)
+        expires_at = float(data.get("expires_at", 0))
+        if expires_at > now:
+            print("[prod-stall] imp14: TSW flow-authority active (expires in %.0fmin) — "
+                  "deferring Mayor mail to avoid escalation storm" % ((expires_at - now) / 60),
+                  flush=True)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def escalate_mayor(dimension, reason):
     """Durable escalation to the Mayor. Returns True if the mail send reported success."""
+    # imp14: check if TSW (the elected flow authority) has already escalated.
+    # If yes, suppress this Mayor mail to prevent the escalation storm.
+    if _tsw_flow_authority_active(time.time()):
+        return False  # suppressed; TSW is handling it
     subject = "Watchdog: STALL de produção (%s)" % dimension
     body = MAYOR_HEADER + ("DIMENSÃO: %s\nMOTIVO: %s\n\n" % (dimension, reason)) \
         + REMEDY.get(dimension, "")
