@@ -958,6 +958,68 @@ gate_scaled_verdict_timeout() {
   printf '%s' "$eff"
 }
 
+# ── ga-acb: Auto-circuit-break decision (pure; selftest-sourceable) ─────────────
+# Determines whether a marker is PROVABLY un-mergeable and should be permanently
+# circuit-broken (gate:needs-human on source bead, marker closed) instead of
+# re-queuing. Three conditions are checked:
+#
+#   no_branch   → branch is absent from origin (cannot review)
+#   ahead_dead  → branch has >GATE_REBASE_AHEAD_MAX own commits AND author is
+#                 dead/empty (no live session to re-anchor the divergence)
+#   retry_dead  → rebase-attempt counter ≥ MAX AND author is dead/empty
+#                 (replaces the existing "escalate to needs-rebase" path)
+#
+# Arguments: <condition> <ahead_count_or_blank> <author_alive_0_1> <rebase_attempt> <rebase_attempt_max> <ahead_max>
+# Echoes: "circuit-break:<reason>" when the marker should be circuit-broken,
+#         "ok" otherwise. FAIL-OPEN: any unexpected input yields "ok".
+# Env: GATE_AUTO_CIRCUIT_BREAK (default 1; set to 0 to disable).
+gate_circuit_break_check() {
+  local condition="${1:-}"         # "no_branch" | "ahead_dead" | "retry_dead"
+  local ahead="${2:-}"             # commit-count or empty
+  local author_alive="${3:-0}"     # 0 = dead/empty, 1 = alive
+  local rebase_attempt="${4:-0}"   # current gate:rebase-attempt:N counter
+  local rebase_max="${5:-3}"       # MAX_REBASE_ATTEMPTS
+  local ahead_max="${6:-10}"       # GATE_REBASE_AHEAD_MAX
+
+  # Sanitise numeric inputs
+  case "$author_alive"   in ''|*[!0-9]*) author_alive=0 ;; esac
+  case "$rebase_attempt" in ''|*[!0-9]*) rebase_attempt=0 ;; esac
+  case "$rebase_max"     in ''|*[!0-9]*|0) rebase_max=3 ;; esac
+  case "$ahead_max"      in ''|*[!0-9]*|0) ahead_max=10 ;; esac
+
+  # Feature gate — default ON; set GATE_AUTO_CIRCUIT_BREAK=0 to disable
+  if [ "${GATE_AUTO_CIRCUIT_BREAK:-1}" = "0" ]; then
+    printf 'ok'; return 0
+  fi
+
+  case "$condition" in
+    no_branch)
+      # Branch is absent from origin — no reviewer can ever merge it.
+      printf 'circuit-break:no_branch'
+      ;;
+    ahead_dead)
+      # Branch is over the rebase envelope AND no live author to re-anchor.
+      case "$ahead" in ''|*[!0-9]*) printf 'ok'; return 0 ;; esac
+      if [ "$ahead" -gt "$ahead_max" ] && [ "$author_alive" = "0" ]; then
+        printf 'circuit-break:ahead_dead'
+      else
+        printf 'ok'
+      fi
+      ;;
+    retry_dead)
+      # Rebase retries exhausted AND no live author — will never self-heal.
+      if [ "$rebase_attempt" -ge "$rebase_max" ] && [ "$author_alive" = "0" ]; then
+        printf 'circuit-break:retry_dead'
+      else
+        printf 'ok'
+      fi
+      ;;
+    *)
+      printf 'ok'
+      ;;
+  esac
+}
+
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
 # above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
 # GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
@@ -1787,6 +1849,29 @@ git_rig fetch origin 2>/dev/null || warn "git fetch failed (continuing with stal
 BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH")
 if [ -z "$BRANCH_SHA" ]; then
   err "Branch '$BRANCH' not found on remote origin (or ref points at a missing object). Aborting."
+  # ga-acb: branch absent on origin is PROVABLY un-mergeable — circuit-break immediately.
+  _ACB=$(gate_circuit_break_check "no_branch" "" "0" "0" "3" "10")
+  if [ "$_ACB" != "ok" ]; then
+    err "  ga-acb: circuit-breaking marker $MARKER_ID (${_ACB}) — branch $BRANCH is GONE from origin."
+    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
+    bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
+    bd -C "$GC_CITY" comment "$MARKER_ID" "ga-acb AUTO-CIRCUIT-BREAK (${_ACB}): branch '$BRANCH' is absent from origin. No reviewer can ever merge a non-existent branch. Marker permanently parked at gate-status:error. Source bead $BEAD_ID set gate:needs-human so the guard does NOT recreate a marker." 2>/dev/null || true
+    if [ -n "$BEAD_ID" ]; then
+      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human"           -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human:technical" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"            -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"           -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""                           -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-acb AUTO-CIRCUIT-BREAK: branch '$BRANCH' is absent from origin (marker $MARKER_ID). Gate cannot review or merge a non-existent branch. Set gate:needs-human — human or Mayor must re-anchor the work. story:in-flight + pilot:dispatched stripped (Pilot lane slot freed)." 2>/dev/null || true
+    fi
+    gc --city "$GC_CITY" mail send mayor \
+      -s "Gate circuit-break: $BRANCH absent from origin (${BEAD_ID:-unknown})" \
+      -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) is ABSENT from origin — gate cannot review or merge it. Auto-circuit-broken (ga-acb): marker permanently parked at gate-status:error; source bead set gate:needs-human. Human or Mayor decision required: re-push the branch or close the bead." 2>/dev/null \
+      || warn "Could not mail Mayor for circuit-break on $BRANCH"
+    log "ga-acb circuit-break: branch $BRANCH absent from origin — marker $MARKER_ID parked, bead $BEAD_ID needs-human."
+    exit 1
+  fi
+  # GATE_AUTO_CIRCUIT_BREAK=0: fall through to legacy gate-status:error (retriable).
   bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
   # wa-uthi: non-terminal (marker error, fixable + resubmittable) — no push. Logged only.
@@ -2164,6 +2249,46 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
 
     bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
 
+    # ga-acb: ahead_dead circuit-break — branch has more own commits than the
+    # rebase envelope allows AND no live author to re-anchor a large divergence.
+    # Checked BEFORE the retry/bounce branching so the marker never enters the
+    # bounded-retry churn cycle on a provably un-mergeable branch.
+    _ACB_AHEAD=$(gate_circuit_break_check "ahead_dead" "${REBASE_AHEAD:-}" "$AUTHOR_ALIVE" "$REBASE_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX")
+    if [ "$_ACB_AHEAD" != "ok" ]; then
+      err "  ga-acb: circuit-breaking marker $MARKER_ID (${_ACB_AHEAD}): ahead=${REBASE_AHEAD:-?} > GATE_REBASE_AHEAD_MAX=${GATE_REBASE_AHEAD_MAX} and author dead/empty."
+      bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$MARKER_ID" "ga-acb AUTO-CIRCUIT-BREAK (${_ACB_AHEAD}): branch $BRANCH is ${REBASE_AHEAD:-?} commits ahead of main (> GATE_REBASE_AHEAD_MAX=${GATE_REBASE_AHEAD_MAX}) with no live author session. A server-side rebase of a large divergence with no one to resolve conflicts is futile. Marker permanently parked at gate-status:error. Source bead $BEAD_ID set gate:needs-human." 2>/dev/null || true
+      if [ -n "$BEAD_ID" ]; then
+        bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human"           -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human:technical" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"            -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"           -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""                           -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-acb AUTO-CIRCUIT-BREAK (${_ACB_AHEAD}): branch $BRANCH is ${REBASE_AHEAD:-?} commits ahead (> ${GATE_REBASE_AHEAD_MAX} max) with no live author (marker $MARKER_ID). Large divergence + dead author = un-mergeable. Set gate:needs-human; story:in-flight + pilot:dispatched stripped (Pilot lane slot freed)." 2>/dev/null || true
+      fi
+      gc --city "$GC_CITY" mail send mayor \
+        -s "Gate circuit-break: $BRANCH large divergence + dead author (${BEAD_ID:-unknown})" \
+        -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) is ${REBASE_AHEAD:-?} commits ahead of main (> ${GATE_REBASE_AHEAD_MAX} max) with no live author session. Auto-circuit-broken (ga-acb): marker parked at gate-status:error; source bead set gate:needs-human. Human or Mayor must re-anchor the work or close the bead." 2>/dev/null \
+        || warn "Could not mail Mayor for ahead_dead circuit-break on $BRANCH"
+      REBASE_EVENT="dispatcher_circuit_break_ahead_dead"
+      REBASE_VERDICT="CIRCUIT-BREAK (ahead=${REBASE_AHEAD:-?} > max=${GATE_REBASE_AHEAD_MAX}, dead author)"
+      log "ga-acb circuit-break: $BRANCH ahead_dead — marker $MARKER_ID parked, bead $BEAD_ID needs-human."
+      log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
+      mkdir -p "$(dirname "$QG_LOG")"
+      jq -c -n \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg branch "$BRANCH" \
+        --arg bead "$BEAD_ID" \
+        --arg rig "${RIG:-unknown}" \
+        --arg marker "$MARKER_ID" \
+        --arg author "$AUTHOR" \
+        --arg event "$REBASE_EVENT" \
+        '{ts: $ts, event: $event, branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author}' \
+        >> "$QG_LOG" 2>/dev/null || true
+      log "=== Dispatcher sweep complete: branch=$BRANCH verdict=$REBASE_VERDICT ==="
+      exit 1
+    fi
+
     if [ "$AUTHOR_ALIVE" = "1" ] && [ "$CONFLICT_KIND" = "merge" ]; then
       # gt-4tk5m fix: only bounce to needs-rebase when the conflict is GENUINE
       # (deterministic merge conflict). A TRANSIENT failure (worktree/push plumbing
@@ -2261,18 +2386,47 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
         REBASE_EVENT="dispatcher_autorebase_retry"
         REBASE_VERDICT="QUEUED (retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, dead author)"
       else
-        err "Branch $BRANCH: transient auto-rebase failure persists after $MAX_REBASE_ATTEMPTS server-side attempts, author dead/empty — escalating to Mayor."
-        bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED: branch $BRANCH could not auto-rebase (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) after $MAX_REBASE_ATTEMPTS attempts, and no live author session exists. Escalated to Mayor for resolution." 2>/dev/null || true
-        if [ -n "$BEAD_ID" ]; then
-          bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+        # ga-acb: retry_dead circuit-break — retries exhausted + dead author.
+        # Previously this set gate-status:needs-rebase, which the guard's Vector A
+        # does NOT reclaim (needs-rebase is a terminal label the guard ignores), but
+        # the gate-health-monitor leaves it as an open error marker AND the guard's
+        # own reclaim path could re-ready it if the marker somehow regained claimed/
+        # dispatching. Promote to gate:needs-human on the SOURCE BEAD so Pilot knows
+        # not to re-dispatch, and park the marker permanently at gate-status:error.
+        _ACB_RETRY=$(gate_circuit_break_check "retry_dead" "" "$AUTHOR_ALIVE" "$NEXT_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX")
+        if [ "$_ACB_RETRY" != "ok" ]; then
+          err "Branch $BRANCH: retries exhausted ($NEXT_ATTEMPT >= $MAX_REBASE_ATTEMPTS) + dead author — ga-acb circuit-break (${_ACB_RETRY})."
+          bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
+          bd -C "$GC_CITY" comment "$MARKER_ID" "ga-acb AUTO-CIRCUIT-BREAK (${_ACB_RETRY}): branch $BRANCH could not auto-rebase (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) after $MAX_REBASE_ATTEMPTS attempts, and no live author session exists. Marker permanently parked at gate-status:error. Source bead $BEAD_ID set gate:needs-human so Pilot does NOT re-dispatch." 2>/dev/null || true
+          if [ -n "$BEAD_ID" ]; then
+            bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human"           -q 2>/dev/null || true
+            bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human:technical" -q 2>/dev/null || true
+            bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"            -q 2>/dev/null || true
+            bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"           -q 2>/dev/null || true
+            bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""                           -q 2>/dev/null || true
+            bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-acb AUTO-CIRCUIT-BREAK (${_ACB_RETRY}): branch $BRANCH failed auto-rebase $MAX_REBASE_ATTEMPTS times with no live author (marker $MARKER_ID). Set gate:needs-human; story:in-flight + pilot:dispatched stripped (Pilot lane slot freed). Human or Mayor must re-anchor or close." 2>/dev/null || true
+          fi
+          gc --city "$GC_CITY" mail send mayor \
+            -s "Gate circuit-break: $BRANCH retries exhausted + dead author (${BEAD_ID:-unknown})" \
+            -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) could not auto-rebase vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). ${CONFLICT_FILES:-unknown}. Auto-rebase failed $MAX_REBASE_ATTEMPTS times and the author session is gone. Auto-circuit-broken (ga-acb): marker parked at gate-status:error; source bead set gate:needs-human. Human or Mayor decision required." 2>/dev/null \
+            || warn "Could not mail Mayor for retry_dead circuit-break on $BRANCH"
+          REBASE_EVENT="dispatcher_circuit_break_retry_dead"
+          REBASE_VERDICT="CIRCUIT-BREAK (retry_dead: ${MAX_REBASE_ATTEMPTS} attempts exhausted, dead author)"
+        else
+          # GATE_AUTO_CIRCUIT_BREAK=0: fall through to legacy needs-rebase escalation.
+          err "Branch $BRANCH: transient auto-rebase failure persists after $MAX_REBASE_ATTEMPTS server-side attempts, author dead/empty — escalating to Mayor."
+          bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
+          bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED: branch $BRANCH could not auto-rebase (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) after $MAX_REBASE_ATTEMPTS attempts, and no live author session exists. Escalated to Mayor for resolution." 2>/dev/null || true
+          if [ -n "$BEAD_ID" ]; then
+            bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+          fi
+          gc --city "$GC_CITY" mail send mayor \
+            -s "Gate escalation: $BRANCH stranded conflict (no live author)" \
+            -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) could not auto-rebase vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). ${CONFLICT_FILES:-unknown}. Auto-rebase failed $MAX_REBASE_ATTEMPTS times and the author session is gone — gate cannot self-heal. Needs a manual rebase or a decision." 2>/dev/null \
+            || warn "Could not mail Mayor for gate escalation on $BRANCH"
+          REBASE_EVENT="dispatcher_needs_rebase_escalated"
+          REBASE_VERDICT="NEEDS_REBASE (escalated to Mayor after $MAX_REBASE_ATTEMPTS attempts)"
         fi
-        gc --city "$GC_CITY" mail send mayor \
-          -s "Gate escalation: $BRANCH stranded conflict (no live author)" \
-          -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) could not auto-rebase vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). ${CONFLICT_FILES:-unknown}. Auto-rebase failed $MAX_REBASE_ATTEMPTS times and the author session is gone — gate cannot self-heal. Needs a manual rebase or a decision." 2>/dev/null \
-          || warn "Could not mail Mayor for gate escalation on $BRANCH"
-        REBASE_EVENT="dispatcher_needs_rebase_escalated"
-        REBASE_VERDICT="NEEDS_REBASE (escalated to Mayor after $MAX_REBASE_ATTEMPTS attempts)"
       fi
     fi
 
