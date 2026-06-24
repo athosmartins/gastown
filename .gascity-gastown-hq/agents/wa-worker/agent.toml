@@ -1,0 +1,41 @@
+# wa-worker: ephemeral rig-scoped worker for whatsapp_automation beads.
+#
+# ARCHITECTURE: This is a PROTOTYPE template proving that an ephemeral pool
+# agent CAN carry WA rig context. The Pilot dispatch redesign will route
+# WA beads with no story.assignee here instead of to named crew (mila-wa,
+# oracle-wa, etc.). Named crew are persistent PMs/domain-owners; wa-workers
+# are disposable build slots.
+#
+# RIG CONTEXT comes from work_dir=/Users/athos/gt/whatsapp_automation/crew/worker
+# — placing the agent's CWD inside the WA rig clone. This is the same mechanism
+# that gives mila-wa its rig context (work_dir = .../crew/mila). From there:
+#   - `bd` resolves to the WA bead store (wa-* prefix)
+#   - `git` operates on the WA rig repo
+#   - `gc sling` routes within the WA rig scope
+#
+# EPHEMERAL: min_active_sessions=0 means no permanent instances.
+# The supervisor spawns a wa-worker on demand (via gc sling or future
+# Pilot dispatch) and the agent drains + exits after /gate-done.
+# wake_mode=fresh ensures each spawn starts with a clean session (no
+# context from prior runs — correct for a disposable build agent).
+#
+# LIFECYCLE: spawn → claim bead → create worktree → build → commit
+# → git push → /gate-done → gc runtime drain-ack → exit
+#
+# POOL SIZE: max_active_sessions=4 matches oracle-wa + mila-wa combined
+# capacity (2 named crew × 1 slot each) so this pool never starves the gate.
+# Raise if concurrency proves insufficient.
+#
+# MODEL: Sonnet. Build work is well within Sonnet's capabilities. Keeps wa-worker
+# off the scarce weekly Opus budget (which is reserved for Mayor / named crew).
+#
+# PROVIDER: claude-headless (RC OFF). wa-workers are headless/ephemeral and must
+# NOT auto-connect to the human's mobile Claude Code app (bug wa-9ye2 pattern).
+
+work_dir = "/Users/athos/gt/whatsapp_automation/crew/worker"
+min_active_sessions = 0
+max_active_sessions = 4
+idle_timeout = "2h"
+wake_mode = "fresh"
+model = "sonnet"
+provider = "claude-headless"
