@@ -129,6 +129,28 @@ HEAL_SUPPRESS_SEC = int(os.environ.get("TSW_HEAL_SUPPRESS_SEC", "600"))  # 10min
 FUNNEL_FLOW_HEALER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "funnel-flow-healer.sh")
 
+# ── imp11: anti-thrash budget + circuit-breaker ───────────────────────────────
+# TSW_HEAL_BUDGET: max lifetime heal attempts before the circuit-breaker triggers.
+# After budget is exhausted the watchdog stops attempting heals and escalates
+# directly so a human gets paged instead of a retry loop that never converges.
+# Set TSW_HEAL_BUDGET=0 to disable the budget ceiling.
+# TSW_CIRCUIT_BREAK_ESCALATIONS: after this many CONSECUTIVE escalations (healer
+# fired but stall re-confirmed) extend the suppress window by 4× to slow down the
+# thrash cycle and give more time for the system to recover. 0 = disabled.
+HEAL_BUDGET = int(os.environ.get("TSW_HEAL_BUDGET", "3"))
+CIRCUIT_BREAK_ESCALATIONS = int(os.environ.get("TSW_CIRCUIT_BREAK_ESCALATIONS", "2"))
+
+# ── imp12: quota-aware suppression ────────────────────────────────────────────
+# When TSW_QUOTA_AWARE=1, the watchdog queries claude-quota-check.sh before each
+# heal attempt. If the quota is exhausted (exit 2 = LIMITED) the attempt is
+# SKIPPED (suppresses escalation for this tick) WITHOUT consuming a budget slot
+# — no point invoking funnel-flow-healer.sh when no Claude sessions can run.
+# Default=0 (off) for safety; enable after verifying quota-check.sh is stable.
+QUOTA_AWARE = os.environ.get("TSW_QUOTA_AWARE", "0") == "1"
+QUOTA_CHECK_SH = os.environ.get(
+    "TSW_QUOTA_CHECK_SH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "claude-quota-check.sh"))
+
 # ── log-line patterns ─────────────────────────────────────────────────────────
 TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 # "=== Pilot sweep complete: dispatched=N ..."
@@ -152,6 +174,7 @@ _do_notify = None              # (msg, prio) -> None; None = run notify binary
 _do_mail_mayor = None          # (subject, body) -> bool; None = run gc mail
 _do_dolt_probe = None          # () -> int; 0=healthy 1=unhealthy 2=unknown; None = run probe
 _do_heal_throughput = None     # () -> bool; True=heal attempted; None = call funnel-flow-healer.sh
+_do_check_quota = None         # () -> bool; True=quota available; None = call quota-check.sh (imp12)
 
 
 # ── guarded subprocess ────────────────────────────────────────────────────────
@@ -718,25 +741,55 @@ def _tick_delivery(now, state):
     return True
 
 
-# ── imp24: heal-action branch ─────────────────────────────────────────────────
+# ── imp12: quota check ────────────────────────────────────────────────────────
+def _check_quota():
+    """Return True if Claude quota is available (not exhausted). imp12.
+
+    Calls claude-quota-check.sh: exit 2 = LIMITED, 0 = OK, else = unknown.
+    Fail-open on errors so quota check never false-blocks a heal."""
+    if _do_check_quota is not None:
+        return _do_check_quota()
+    r = _sh([QUOTA_CHECK_SH], timeout=10)
+    return not (r and r.returncode == 2)  # exit 2 = LIMITED; fail-open on error
+
+
+# ── imp24+imp11+imp12: heal-action branch ────────────────────────────────────
 def _attempt_heal(now, state):
-    """Attempt auto-heal before escalating a confirmed stall (imp24).
+    """Attempt auto-heal before escalating a confirmed stall (imp24+imp11+imp12).
 
-    Calls funnel-flow-healer.sh if TSW_HEAL_ENABLED=1 and the suppress window
-    is not active. Returns True if a heal was attempted (caller should suppress
-    escalation for this tick and validate stall-cleared on the next tick).
-
-    Validation invariant: success = dispatch/merge resumes (stall-cleared) on
-    the NEXT evaluation, NOT daemon-green status. A kicked daemon may still not
-    dispatch work. The suppress window gives the system time to show actual flow
-    before we re-evaluate and potentially escalate."""
+    imp11 adds a lifetime budget ceiling (HEAL_BUDGET) and a consecutive-escalation
+    circuit-breaker (CIRCUIT_BREAK_ESCALATIONS). imp12 adds quota awareness: skip
+    heal if Claude quota is exhausted (preserves budget for when it resets)."""
     if not HEAL_ENABLED:
         return False
     heal_last = state.get("heal_last_attempt", 0.0)
+    heal_count = state.get("heal_attempt_count", 0)
+
+    # imp11: budget ceiling — stop healing so a human gets paged
+    if HEAL_BUDGET > 0 and heal_count >= HEAL_BUDGET:
+        _log("imp11 CIRCUIT-BREAK: heal budget exhausted (%d/%d lifetime attempts) — "
+             "escalating; set TSW_HEAL_BUDGET=0 to disable" % (heal_count, HEAL_BUDGET))
+        return False
+
+    # imp11: consecutive-escalation circuit-breaker → extended suppress window
+    consec = state.get("consecutive_escalations", 0)
+    if CIRCUIT_BREAK_ESCALATIONS > 0 and consec >= CIRCUIT_BREAK_ESCALATIONS:
+        extended = HEAL_SUPPRESS_SEC * 4
+        if heal_last > 0.0 and (now - heal_last) <= extended:
+            _log("imp11 CIRCUIT-BREAK: %d consecutive escalations — extended suppress window "
+                 "(%.0fmin remaining)" % (consec, (extended - (now - heal_last)) / 60))
+            return True  # suppress escalation during extended cooling window
+
+    # Standard suppress window (imp24)
     if heal_last > 0.0 and (now - heal_last) <= HEAL_SUPPRESS_SEC:
         _log("imp24 HEAL: suppress window active (%.0fmin remaining) — suppress escalation" % (
              (HEAL_SUPPRESS_SEC - (now - heal_last)) / 60))
         return True   # suppress escalation; stall-cleared validation window still open
+
+    # imp12: quota-aware gate — skip heal (suppress this tick) if quota=0
+    if QUOTA_AWARE and not _check_quota():
+        _log("imp12 QUOTA-AWARE: quota exhausted — skipping heal attempt (budget preserved)")
+        return True  # suppress; stall may clear when quota resets
 
     _log("imp24 HEAL: stall confirmed — attempting auto-heal via funnel-flow-healer.sh")
     if _do_heal_throughput is not None:
@@ -746,6 +799,7 @@ def _attempt_heal(now, state):
         healed = bool(r and r.returncode == 0)
 
     state["heal_last_attempt"] = now
+    state["heal_attempt_count"] = heal_count + 1  # imp11: consume one budget slot
     if healed:
         _log("imp24 HEAL: healer returned success — suppressing escalation for %.0fmin; "
              "stall-cleared validated on next tick (not daemon-green)" % (HEAL_SUPPRESS_SEC / 60))
@@ -773,13 +827,18 @@ def _load_state():
                 d.setdefault("delivery_last_escalate", 0.0)
                 # imp24 keys (backward-compat: absent in pre-imp24 state files)
                 d.setdefault("heal_last_attempt", 0.0)
+                # imp11 keys (backward-compat: absent in pre-imp11 state files)
+                d.setdefault("heal_attempt_count", 0)
+                d.setdefault("consecutive_escalations", 0)
                 return d
     except Exception:
         pass
     return {"pending": 0, "last_escalate": 0.0, "escalations": 0,
             "blind_pending": 0, "blind_last_escalate": 0.0,
             "dolt_pending": 0, "dolt_last_escalate": 0.0,
-            "delivery_pending": 0, "delivery_last_escalate": 0.0}
+            "delivery_pending": 0, "delivery_last_escalate": 0.0,
+            "heal_last_attempt": 0.0,
+            "heal_attempt_count": 0, "consecutive_escalations": 0}
 
 
 def _save_state(state):
@@ -994,8 +1053,10 @@ def run_tick(now, state):
                    merge_count, last_merge_epoch, sample_beads, now, window_sec)
     state["last_escalate"] = now
     state["escalations"] += 1
-    _log("escalation %s (total escalations: %d)" % ("OK" if ok else "FAILED (notify still sent)",
-                                                     state["escalations"]))
+    state["consecutive_escalations"] = state.get("consecutive_escalations", 0) + 1  # imp11
+    _log("escalation %s (total escalations: %d, consecutive: %d)" % (
+         "OK" if ok else "FAILED (notify still sent)",
+         state["escalations"], state["consecutive_escalations"]))
     return True
 
 
@@ -1004,6 +1065,7 @@ def _maybe_recover(state, reason):
         _log("RECOVERED (%s): stall cleared (was pending=%d escalations=%d)" % (
              reason, state["pending"], state["escalations"]))
         state["pending"] = 0
+        state["consecutive_escalations"] = 0  # imp11: reset circuit-breaker on recovery
         # Note: do NOT reset last_escalate — cooldown still applies on recovery+redetect.
         # (If the stall immediately re-appears after recovery, we want the cooldown to hold.)
 
@@ -1090,7 +1152,8 @@ def _selftest():
                 "blind_pending": 0, "blind_last_escalate": 0.0,
                 "dolt_pending": 0, "dolt_last_escalate": 0.0,
                 "delivery_pending": 0, "delivery_last_escalate": 0.0,
-                "heal_last_attempt": 0.0}
+                "heal_last_attempt": 0.0,
+                "heal_attempt_count": 0, "consecutive_escalations": 0}
 
     def _stub_mail(subject, body):
         mail_calls.append((subject, body))
@@ -1108,7 +1171,10 @@ def _selftest():
     # are not affected.
     _bd_delivery = lambda root: []   # no stalled beads — overridden in L/M/N scenarios
     # imp24: heal disabled by default so existing scenarios are not affected.
-    _do_heal_throughput = None   # overridden in P scenarios
+    _do_heal_throughput = None   # overridden in P/Q scenarios
+    # imp12: quota check stubbed as available by default
+    globals()["_do_check_quota"] = lambda: True
+    globals()["QUOTA_AWARE"] = False
 
     print("\n[tsw selftest] running scenarios...\n")
 
@@ -1509,6 +1575,72 @@ def _selftest():
     globals()["HEAL_ENABLED"] = False
     globals()["_do_heal_throughput"] = None
 
+    # ── imp11 Scenario Q: anti-thrash budget + circuit-breaker ───────────────────
+    _read_pilot_log_lines = lambda: _pilot_lines(0, 3)
+    _read_gate_log_lines  = lambda: []
+    _git_log_count        = lambda root, since: 0
+    _bd_backlog           = lambda root: _backlog(3)
+    _bd_delivery          = lambda root: []
+    _do_dolt_probe        = lambda: 0
+
+    print("\nimp11 Scenario Q1: budget=1 — after 1 heal, second stall escalates (budget exhausted)")
+    heal_calls_q1 = []
+    globals()["_do_heal_throughput"] = lambda: (heal_calls_q1.append(1), True)[1]
+    globals()["HEAL_ENABLED"] = True
+    globals()["HEAL_BUDGET"] = 1
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)   # heal fires, consumes budget slot
+    run_tick(NOW + 5400, st)   # beyond suppress window, budget=1/1 → circuit-break → escalates
+    globals()["HEAL_ENABLED"] = False
+    globals()["HEAL_BUDGET"] = 3
+    if len(heal_calls_q1) == 1 and mail_calls:
+        _ok("Q1: budget=1 exhausted → second confirmed stall escalates directly")
+    else:
+        _bad("Q1", "heal_calls=%d mail_calls=%d" % (len(heal_calls_q1), len(mail_calls)))
+
+    print("\nimp11 Scenario Q2: CIRCUIT_BREAK_ESCALATIONS=1 → extended suppress window after 1 escalation")
+    heal_calls_q2 = []
+    globals()["_do_heal_throughput"] = lambda: (heal_calls_q2.append(1), False)[1]  # healer fails → escalates
+    globals()["HEAL_ENABLED"] = True
+    globals()["CIRCUIT_BREAK_ESCALATIONS"] = 1
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)   # stall confirmed → heal attempted (fails) → escalates → consec=1
+    mail_calls.clear(); notify_calls.clear()
+    # Re-check at NOW+2000: WITHIN extended window (HEAL_SUPPRESS_SEC*4=2400s from first heal at NOW+1800)
+    run_tick(NOW + 3000, st)   # 1200s after first heal: within extended 2400s window → suppress
+    globals()["HEAL_ENABLED"] = False
+    globals()["CIRCUIT_BREAK_ESCALATIONS"] = 2
+    globals()["_do_heal_throughput"] = None
+    if not mail_calls and st.get("consecutive_escalations", 0) >= 1:
+        _ok("Q2: circuit-break extended suppress window → re-run within window suppressed")
+    else:
+        _bad("Q2", "mail_calls=%d consec=%d" % (len(mail_calls), st.get("consecutive_escalations", 0)))
+
+    # ── imp12 Scenario R: quota-aware suppression ─────────────────────────────────
+    print("\nimp12 Scenario R1: quota exhausted → heal skipped (budget preserved), escalation suppressed")
+    heal_calls_r1 = []
+    globals()["_do_heal_throughput"] = lambda: (heal_calls_r1.append(1), True)[1]
+    globals()["_do_check_quota"] = lambda: False  # quota exhausted
+    globals()["HEAL_ENABLED"] = True
+    globals()["QUOTA_AWARE"] = True
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)  # stall confirmed but quota=0 → suppress without healing
+    globals()["HEAL_ENABLED"] = False
+    globals()["QUOTA_AWARE"] = False
+    globals()["_do_check_quota"] = None
+    globals()["_do_heal_throughput"] = None
+    if not heal_calls_r1 and not mail_calls and st.get("heal_attempt_count", 0) == 0:
+        _ok("R1: quota exhausted → heal skipped, budget preserved (attempt_count=0), escalation suppressed")
+    else:
+        _bad("R1", "heal_calls=%d mail_calls=%d attempt_count=%d" % (
+             len(heal_calls_r1), len(mail_calls), st.get("heal_attempt_count", 0)))
+
     # ── cleanup ───────────────────────────────────────────────────────────────────
     _read_pilot_log_lines = None
     _read_gate_log_lines  = None
@@ -1519,6 +1651,7 @@ def _selftest():
     _do_mail_mayor        = None
     _do_dolt_probe        = None
     _do_heal_throughput   = None
+    globals()["_do_check_quota"] = None
 
     print("\n[tsw selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
     sys.exit(0 if fail_count[0] == 0 else 1)
