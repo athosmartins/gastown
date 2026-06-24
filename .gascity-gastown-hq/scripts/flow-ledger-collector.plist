@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.flow-ledger-collector</string>
+
+  <!-- Flow-ledger collector (imp04, 2026-06-23).
+
+       PURE OBSERVABILITY — no healing, no Dolt calls, no gc commands.
+
+       Writes per-interval snapshots to:
+         .gc/logs/flow-ledger.jsonl
+       Schema: {"ts":"...","kind":"interval_snapshot","dispatched":N,"merged":N,
+                "refined":N,"backlog":N}
+
+       Counts are derived exclusively from daemon log files (pilot-dispatcher.log,
+       quality-gate-dispatcher.log, refino-gate-dispatcher.log) using grep within
+       a rolling window. NEVER calls bd/gc/dolt — survives a Dolt outage cleanly.
+
+       FAIL-OPEN: any unreadable log or parse failure → that field = 0 (skipped),
+       never a fabricated value or crash.
+
+       This is the measurement backbone for the imparável epic (imp04).
+       Later beads consume this ledger:
+         imp02 — human-touch events append bead_transition lines
+         imp24 — heal-wiring reads episodes to decide actions
+         imp25 — 7-day soak reads aggregated snapshots for unstoppability metric
+
+       Cadence: FLC_POLL_SEC=300 (5 min). A snapshot every 5 min gives ~288 data
+       points/day — sufficient resolution for hourly episode detection.
+
+       DPW_CRITICAL: add com.gascity.flow-ledger-collector after Mayor deploys
+       (edit daemon-presence-watchdog.sh default set; do NOT do it here).
+
+       Kill-switch: FLC_ENABLED=0 → no-op (safe to deploy, enable later). -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/flow-ledger-collector.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+
+  <!-- Stagger 3min off boot to avoid lockstep with other monitors. -->
+  <key>ThrottleInterval</key><integer>180</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/flow-ledger-collector-launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/flow-ledger-collector-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>GC_LEDGER_DIR</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs</string>
+    <!-- Kill-switch: set to 0 to disable without unloading the plist -->
+    <key>FLC_ENABLED</key>
+    <string>1</string>
+    <key>FLC_DRY_RUN</key>
+    <string>0</string>
+    <!-- Snapshot interval: 300s = 5 min -->
+    <key>FLC_POLL_SEC</key>
+    <string>300</string>
+    <!-- Rolling window for log-grep counts: 300s = last 5 min -->
+    <key>FLC_WINDOW_SEC</key>
+    <string>300</string>
+  </dict>
+</dict>
+</plist>
