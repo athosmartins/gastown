@@ -97,6 +97,11 @@
 #   CLAUDE_QUOTA_BUDGET_BILLABLE  if set (>0), report billable-token % of this budget
 #                                 Calibrate once: note the billable number printed at
 #                                 the moment a real exhaustion event fires; set that.
+#   CLAUDE_QUOTA_FRESHNESS_SECS  ga-z0n9f: freshness guard threshold in seconds.
+#                                 If the most-recent session-limit event is older than
+#                                 this AND the stated reset is still in the future, the
+#                                 latch is cleared (defer-without-spawn starves re-log).
+#                                 Default 1200 (20 min). Set to 0 to disable.
 #
 # Dependencies: bash, jq, find, grep, date (BSD/macOS date semantics).
 
@@ -107,6 +112,7 @@ TZ_RESET="${CLAUDE_QUOTA_TZ:-America/Sao_Paulo}"
 NOW="${CLAUDE_QUOTA_NOW:-$(date +%s)}"
 BUDGET="${CLAUDE_QUOTA_BUDGET_BILLABLE:-0}"
 WEEKLY_HARD="${CLAUDE_QUOTA_WEEKLY_HARD:-0}"   # ga-ot735: 1 = weekly also hard-pauses
+FRESHNESS_MAX_SECS="${CLAUDE_QUOTA_FRESHNESS_SECS:-1200}"  # ga-z0n9f: 20 min default; 0=disable
 WINDOW_SEC=18000   # 5h rolling session window
 
 MODE="human"
@@ -130,10 +136,23 @@ command -v jq >/dev/null 2>&1 || { echo "claude-quota-check: jq not found" >&2; 
 clock_to_epoch() {
   local ref="$1" clock="$2" day e
   day=$(TZ="$TZ_RESET" date -r "$ref" +%Y-%m-%d 2>/dev/null) || return 1
-  # try "%I:%M%p" then "%I%p"
+  # Normalize an hour-only clock ("3pm" -> "3:00pm"). CRITICAL: BSD `date -j -f`
+  # fills any field absent from the format from the CURRENT wall clock — so
+  # parsing "3pm" with "%I%p" yields 3:<current-minute>:<current-second>, not
+  # 3:00:00. That caused a false-pause: "resets 3pm" read at 3:32pm became
+  # 15:32 (≈now → "resets in 0 min"), and once the clock passed that inherited
+  # minute the next-day rollforward below fired → the limit looked active until
+  # tomorrow 3pm even though the real 5h window had already reset at 3:00pm.
+  case "$clock" in
+    *:*) : ;;                                                   # already has minutes
+    *[0-9]am|*[0-9]pm) clock=$(printf '%s' "$clock" | sed -E 's/^([0-9]+)(am|pm)$/\1:00\2/') ;;
+  esac
   e=$(TZ="$TZ_RESET" date -j -f "%Y-%m-%d %I:%M%p" "$day $clock" +%s 2>/dev/null) \
     || e=$(TZ="$TZ_RESET" date -j -f "%Y-%m-%d %I%p" "$day $clock" +%s 2>/dev/null) \
     || return 1
+  # floor to the minute: drop any seconds still inherited from the current clock
+  # (the %M format above pins minutes, but seconds remain wall-clock-derived).
+  e=$(( e - (e % 60) ))
   # if that clock time already passed at the reference instant, it's the next day
   if [ "$e" -lt "$ref" ]; then e=$((e + 86400)); fi
   printf '%s' "$e"
@@ -199,9 +218,12 @@ LIMIT_RESET_EPOCH=0
 SESSION_ACTIVE=0
 SESSION_RESET_TEXT=""
 SESSION_RESET_EPOCH=0
+SESSION_LAST_EVENT_EPOCH=0   # ga-z0n9f: most-recent session exhaustion event time
+SESSION_STALE=0              # ga-z0n9f: 1 = freshness guard cleared the latch
 WEEKLY_ACTIVE=0
 WEEKLY_RESET_TEXT=""
 WEEKLY_RESET_EPOCH=0
+WEEKLY_LAST_EVENT_EPOCH=0   # ga-z0n9f: most-recent weekly exhaustion event time
 
 scan_exhaustion() {
   local f scope text reset ev_iso ev_epoch reset_epoch matches files
@@ -219,6 +241,16 @@ scan_exhaustion() {
       # event epoch from ISO timestamp (UTC). Strip fractional + Z.
       ev_epoch=$(iso_to_epoch "$ev_iso")
       [ -n "$ev_epoch" ] || ev_epoch="$NOW"
+      # ga-z0n9f: track most-recent event epoch per scope for the freshness guard.
+      # Updated for ALL events (not just active) so the guard can detect when the
+      # re-log signal has gone quiet (no sessions hitting the limit = limit cleared).
+      if [ "$scope" = "session" ]; then
+        [ "$ev_epoch" -gt "$SESSION_LAST_EVENT_EPOCH" ] 2>/dev/null \
+          && SESSION_LAST_EVENT_EPOCH="$ev_epoch"
+      else
+        [ "$ev_epoch" -gt "$WEEKLY_LAST_EVENT_EPOCH" ] 2>/dev/null \
+          && WEEKLY_LAST_EVENT_EPOCH="$ev_epoch"
+      fi
       reset=$(printf '%s' "$text" | sed -E 's/.*resets +//; s/ *\(.*\)$//')
       if [ "$scope" = "session" ]; then
         reset_epoch=$(clock_to_epoch "$ev_epoch" "$reset" 2>/dev/null) || reset_epoch=""
@@ -278,11 +310,25 @@ iso_to_epoch() {
 # When session wins it ALSO wins the headline reset fields, so the ETA the gate
 # logs is the relevant (sooner) 5h reset, not the days-out weekly one.
 resolve_verdict() {
+  SESSION_STALE=0
   if [ "$SESSION_ACTIVE" = "1" ]; then
-    LIMITED=1
-    LIMIT_SCOPE="session"
-    LIMIT_RESET_TEXT="$SESSION_RESET_TEXT"
-    LIMIT_RESET_EPOCH="$SESSION_RESET_EPOCH"
+    # ga-z0n9f freshness guard: when the gate defers (quota=LIMITED) it stops
+    # spawning sessions, so no fresh "hit your limit" events appear in transcripts.
+    # The latch then holds until the STATED reset time even when the real server
+    # limit cleared earlier. If no session-limit event in FRESHNESS_MAX_SECS (and
+    # the guard is enabled via FRESHNESS_MAX_SECS > 0), clear the stale latch.
+    if [ "$FRESHNESS_MAX_SECS" -gt 0 ] \
+       && [ "$SESSION_LAST_EVENT_EPOCH" -gt 0 ] \
+       && [ $(( NOW - SESSION_LAST_EVENT_EPOCH )) -gt "$FRESHNESS_MAX_SECS" ]; then
+      SESSION_STALE=1
+      SESSION_ACTIVE=0
+      LIMITED=0; LIMIT_SCOPE="none"; LIMIT_RESET_TEXT=""; LIMIT_RESET_EPOCH=0
+    else
+      LIMITED=1
+      LIMIT_SCOPE="session"
+      LIMIT_RESET_TEXT="$SESSION_RESET_TEXT"
+      LIMIT_RESET_EPOCH="$SESSION_RESET_EPOCH"
+    fi
   elif [ "$WEEKLY_ACTIVE" = "1" ] && [ "$WEEKLY_HARD" = "1" ]; then
     LIMITED=1
     LIMIT_SCOPE="weekly"
@@ -357,6 +403,9 @@ WEEKLY_ADVISORY=0
 [ "$LIMITED" = "0" ] && [ "$WEEKLY_ACTIVE" = "1" ] && WEEKLY_ADVISORY=1
 if [ "$LIMITED" = "1" ]; then
   VERDICT="LIMITED (${LIMIT_SCOPE}) — resets ${LIMIT_RESET_TEXT} (in ${RESET_IN_MIN}min). THIS IS QUOTA."
+elif [ "$SESSION_STALE" = "1" ]; then
+  _stale_age=$(( (NOW - SESSION_LAST_EVENT_EPOCH) / 60 ))
+  VERDICT="not limited — session-limit stale (last event ${_stale_age}min ago > threshold ${FRESHNESS_MAX_SECS}s; freshness guard cleared latch, ga-z0n9f). NOT quota."
 elif [ "$WEEKLY_ADVISORY" = "1" ]; then
   VERDICT="not hard-limited — weekly limit active (advisory, resets ${WEEKLY_RESET_TEXT}) but 5h session window OK; gate keeps running. NOT a pause."
 elif [ "$WANT_WINDOW" = "1" ]; then
@@ -372,6 +421,9 @@ emit_json() {
     --arg reset_text "$LIMIT_RESET_TEXT" \
     --arg reset_iso "$RESET_ISO" \
     --argjson reset_in_min "${RESET_IN_MIN}" \
+    --argjson session_stale "$([ "$SESSION_STALE" = 1 ] && echo true || echo false)" \
+    --argjson session_last_event_secs_ago "$([ "$SESSION_LAST_EVENT_EPOCH" -gt 0 ] 2>/dev/null && echo $(( NOW - SESSION_LAST_EVENT_EPOCH )) || echo 0)" \
+    --argjson freshness_threshold_secs "$FRESHNESS_MAX_SECS" \
     --argjson weekly_active "$([ "$WEEKLY_ACTIVE" = 1 ] && echo true || echo false)" \
     --arg weekly_reset "$WEEKLY_RESET_TEXT" \
     --argjson weekly_hard "$([ "$WEEKLY_HARD" = 1 ] && echo true || echo false)" \
@@ -390,6 +442,9 @@ emit_json() {
        reset_time_text: $reset_text,
        reset_time_iso: $reset_iso,
        reset_in_minutes: $reset_in_min,
+       session_stale: $session_stale,
+       session_last_event_secs_ago: $session_last_event_secs_ago,
+       freshness_threshold_secs: $freshness_threshold_secs,
        weekly: { active: $weekly_active, reset_time_text: $weekly_reset,
                  hard: $weekly_hard, advisory: $weekly_advisory },
        window_5h: {
@@ -418,6 +473,11 @@ case "$MODE" in
       # weekly underneath an active session limit: note it, but it's not the headline.
       [ "$LIMIT_SCOPE" = "session" ] && [ "$WEEKLY_ACTIVE" = "1" ] \
         && echo "    ⚠ weekly limit ALSO active — resets ${WEEKLY_RESET_TEXT}"
+    elif [ "$SESSION_STALE" = "1" ]; then
+      echo " 🟢 NOT limited — session-limit STALE (freshness guard, ga-z0n9f)"
+      echo "    Last session-limit event: $(( (NOW - SESSION_LAST_EVENT_EPOCH) / 60 )) min ago (threshold: ${FRESHNESS_MAX_SECS}s)"
+      echo "    → Defer-without-spawn starved the re-log signal; latch cleared."
+      echo "    → Set CLAUDE_QUOTA_FRESHNESS_SECS=0 to disable this guard."
     elif [ "$WEEKLY_ADVISORY" = "1" ]; then
       echo " 🟡 WEEKLY limit active (ADVISORY) — resets ${WEEKLY_RESET_TEXT}"
       echo "    No active 5h session limit → the gate/pilot KEEP RUNNING (ga-ot735)."

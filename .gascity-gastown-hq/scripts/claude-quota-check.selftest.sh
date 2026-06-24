@@ -150,6 +150,64 @@ fi
 rm -f "$FIX/proj-b/both-active.jsonl"
 
 # ---------------------------------------------------------------------------
+# CASE 9 (ga-z0n9f): STALE session latch — freshness guard clears it (exit 0)
+#   Session limit event 25 min ago, stated reset still 60 min out (future), but
+#   no fresh re-log in 25 min > 20 min threshold → defer-without-spawn scenario.
+#   Expected: exit 0, limited=false, session_stale=true.
+# ---------------------------------------------------------------------------
+: > "$FIX/proj-b/session-stale.jsonl"
+exhaust_line -1500 "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-stale.jsonl"
+run bash "$SUT" --json
+if [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "false" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_stale')" = "true" ]; then
+  ok "stale session latch (25 min old > 20 min threshold) → freshness guard clears latch (exit 0, session_stale=true) (ga-z0n9f)"
+else
+  bad "stale session latch freshness guard" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,session_stale,session_last_event_secs_ago}' 2>/dev/null)"
+fi
+rm -f "$FIX/proj-b/session-stale.jsonl"
+
+# CASE 9b (ga-z0n9f): FRESH session latch (5 min old < 20 min threshold) → still LIMITED
+: > "$FIX/proj-b/session-fresh.jsonl"
+exhaust_line -300 "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-fresh.jsonl"
+run bash "$SUT" --json
+if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "true" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_stale')" = "false" ]; then
+  ok "fresh session latch (5 min old < threshold 20 min) → still limited (exit 2) (ga-z0n9f)"
+else
+  bad "fresh session latch still limited" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,session_stale}' 2>/dev/null)"
+fi
+rm -f "$FIX/proj-b/session-fresh.jsonl"
+
+# CASE 9c (ga-z0n9f): CLAUDE_QUOTA_FRESHNESS_SECS=0 disables guard → stale latch stays LIMITED
+: > "$FIX/proj-b/session-stale2.jsonl"
+exhaust_line -1500 "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-stale2.jsonl"
+OUT=$(env CLAUDE_PROJECTS_DIR="$FIX" CLAUDE_QUOTA_NOW="$NOW" CLAUDE_QUOTA_TZ="$TZ_RESET" \
+          CLAUDE_QUOTA_SCAN_ALL=1 CLAUDE_QUOTA_FRESHNESS_SECS=0 \
+          bash "$SUT" --json 2>/dev/null); RC=$?
+if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "true" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_stale')" = "false" ]; then
+  ok "CLAUDE_QUOTA_FRESHNESS_SECS=0 disables freshness guard → stale latch stays limited (exit 2) (ga-z0n9f)"
+else
+  bad "freshness guard disabled" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,session_stale}' 2>/dev/null)"
+fi
+rm -f "$FIX/proj-b/session-stale2.jsonl"
+
+# CASE 9d (ga-z0n9f): multiple events — fresh event among stale ones → guard does NOT fire
+#   One stale event (25 min) + one fresh event (5 min), both with future reset.
+#   The most-recent event is 5 min old < threshold → still LIMITED (fresh wins).
+: > "$FIX/proj-b/session-mixed-age.jsonl"
+exhaust_line -1500 "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-mixed-age.jsonl"
+exhaust_line -300  "You've hit your session limit · resets 1:00pm (America/Sao_Paulo)" >> "$FIX/proj-b/session-mixed-age.jsonl"
+run bash "$SUT" --json
+if [ "$RC" = "2" ] && [ "$(printf '%s' "$OUT" | jq -r '.limited')" = "true" ] \
+   && [ "$(printf '%s' "$OUT" | jq -r '.session_stale')" = "false" ]; then
+  ok "stale+fresh events: fresh one (5 min) resets guard; latch stays limited (exit 2) (ga-z0n9f)"
+else
+  bad "stale+fresh: fresh event should prevent guard" "rc=$RC out=$(printf '%s' "$OUT" | jq -c '{limited,session_stale,session_last_event_secs_ago}' 2>/dev/null)"
+fi
+rm -f "$FIX/proj-b/session-mixed-age.jsonl"
+
+# ---------------------------------------------------------------------------
 # CASE 6: budget % computed when CLAUDE_QUOTA_BUDGET_BILLABLE set
 #         billable=335, budget=1000 → 33.5%
 # ---------------------------------------------------------------------------
