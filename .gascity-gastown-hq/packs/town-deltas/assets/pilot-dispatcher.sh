@@ -2730,8 +2730,8 @@ _PILOT_SORT_JQ='
           elif ($t == "feature" or $t == "story") then 4
           else 5 end
       end;
-  sort_by([ (.priority // 99), (. | trank), (.created_at // ""), (.id // "") ])
-'
+  sort_by([ (.priority // 99), (. | trank), -(((.created_at // "1970-01-01T00:00:00Z")[0:19] + "Z") | fromdateiso8601? // 0), (.id // "") ])
+'  # created_at DESC = newest-first tiebreak (Athos prioridade 2026-06-24); prio+trank(bug>story) unchanged
 
 # Sort the pool by the wa-tm2a key and return the single top candidate.
 _top_candidate() {
