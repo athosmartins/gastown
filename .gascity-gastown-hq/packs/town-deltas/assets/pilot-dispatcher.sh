@@ -3116,7 +3116,37 @@ FIXSEC
           _DOMAIN_RIG="$STORY_RIG"
           log "imp20: $STORY_ID story.rig=$STORY_RIG is explicit — using authoritative rig over bead_content_rig inference"
         else
-          _DOMAIN_RIG=$(bead_content_rig "$STORY" 2>/dev/null || echo "")
+          # ga-nlh79: OWNER-AUTHORITATIVE rig precedence — a bead whose creator (created_by)
+          # or assignee is a *-wa crew belongs to whatsapp_automation by definition, BEFORE
+          # any content-keyword inference. bead_content_rig's keyword match fails when the
+          # bead title/description has no WA magic keyword (e.g. "code-mode MCP servers",
+          # "Contagem cadastre bulk-load") but DOES have property-ish nouns (ITBI, Contagem,
+          # Hex) that trigger the property_scrapers branch — the root of the ga-wuzeg/ga-nq64a/
+          # ga-lt8cw/wa-86jr misroute-to-batista-ps infinite loop. The owner signal is more
+          # authoritative than keyword inference: whoever CREATED or is ASSIGNED to a bead
+          # is the ground-truth rig signal. Gated by PILOT_OWNER_RIG_GUARD (default 1).
+          # Fail-open: if the jq extract fails or the field is empty, fall through to the
+          # normal bead_content_rig path (behavior unchanged).
+          if [ "${PILOT_OWNER_RIG_GUARD:-1}" = "1" ]; then
+            local _BEAD_CREATED_BY _BEAD_ASSIGNEE_RAW _OWNER_RIG_SIGNAL=""
+            _BEAD_CREATED_BY=$(echo "$STORY" | jq -r '(.created_by // "") | select(length>0)' 2>/dev/null || echo "")
+            _BEAD_ASSIGNEE_RAW=$(echo "$STORY" | jq -r '(.assignee // "") | select(length>0)' 2>/dev/null || echo "")
+            # Strip dog-pool assignees — only persistent named-crew owners count.
+            case "$_BEAD_ASSIGNEE_RAW" in gastown.dog|gastown.dog-*) _BEAD_ASSIGNEE_RAW="" ;; esac
+            # Check created_by first (the FILER = true domain owner), then assignee as fallback.
+            case "$_BEAD_CREATED_BY" in *-wa) _OWNER_RIG_SIGNAL="whatsapp_automation" ;; esac
+            if [ -z "$_OWNER_RIG_SIGNAL" ]; then
+              case "$_BEAD_ASSIGNEE_RAW" in *-wa) _OWNER_RIG_SIGNAL="whatsapp_automation" ;; esac
+            fi
+            if [ -n "$_OWNER_RIG_SIGNAL" ]; then
+              _DOMAIN_RIG="$_OWNER_RIG_SIGNAL"
+              log "ga-nlh79: $STORY_ID owner-authoritative rig (created_by='$_BEAD_CREATED_BY' assignee='$_BEAD_ASSIGNEE_RAW') → $_DOMAIN_RIG (BEFORE content-keyword inference, preventing misroute to property_scrapers)"
+            else
+              _DOMAIN_RIG=$(bead_content_rig "$STORY" 2>/dev/null || echo "")
+            fi
+          else
+            _DOMAIN_RIG=$(bead_content_rig "$STORY" 2>/dev/null || echo "")
+          fi
         fi
         if [ -n "$_DOMAIN_RIG" ] && [ "$_DOMAIN_RIG" != "gascity" ]; then
           # (1) explicit live crew owner wins.

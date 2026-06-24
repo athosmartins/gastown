@@ -1871,6 +1871,56 @@ HEXD='{"title":"Hex notebook dashboard de lotes/proprietários","description":"R
 [ "$(_bcr "$PROP")" = property_scrapers ] && ok "genuine ITBI/lote scraper still → property_scrapers (no regression)"        || bad "property scraper broke: '$(_bcr "$PROP")'"
 [ "$(_bcr "$HEXD")" = property_scrapers ] && ok "Hex-notebook dashboard (no painel/kanban) stays property_scrapers (edge safe)" || bad "Hex dashboard over-caught: '$(_bcr "$HEXD")'"
 
+# ── Scenario 18k (ga-nlh79): OWNER-AUTHORITATIVE rig precedence ────────────────
+# A ga-* bead whose created_by is a *-wa crew must route to whatsapp_automation
+# even when the bead title/description contains property-vocabulary nouns (ITBI,
+# Contagem, Hex) that would otherwise trigger property_scrapers in bead_content_rig.
+# This is the ga-wuzeg/ga-nq64a/ga-lt8cw/wa-86jr root: the *-wa OWNER is more
+# authoritative than keyword inference — the creator IS the domain signal.
+# Also verifies: a genuine property bead (created_by=batista-ps) still → property.
+echo "Scenario 18k (ga-nlh79): *-wa owner → whatsapp_automation BEFORE content inference"
+# Fixture: ga-* bead, created_by=batista-wa, title mentions ITBI/Contagem (property nouns)
+WA_OWNER_ITBI='[{"id":"ga-wuztest","title":"Contagem cadastre bulk-load via ITBI bridge — code-mode MCP servers","priority":3,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"batista-wa","created_at":"2026-06-01T00:00:01Z","metadata":{}}]'
+LOG18K="$(run_capacity 10 "[]" 1 "$WA_OWNER_ITBI")"
+B18K="$(dispatched_builder "$LOG18K")"
+if [ "$B18K" = "batista-ps" ]; then
+  bad "REGRESSION (ga-nlh79): *-wa-owned bead with ITBI/Contagem nouns misrouted to batista-ps — owner-authoritative guard not firing"
+elif echo "$B18K" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION (ga-nlh79): *-wa-owned bead landed on dog pool — owner guard not promoting to WA crew"
+elif echo "$LOG18K" | grep -q "ga-nlh79.*owner-authoritative\|whatsapp_automation.*domain build\|REFUSING.*whatsapp_automation" || [ -z "$B18K" ]; then
+  ok "ga-nlh79: *-wa-owned bead with property nouns → WA domain (not batista-ps), owner guard fired"
+else
+  bad "ga-nlh79: *-wa-owned bead routed unexpectedly (got: '${B18K:-none}')"
+fi
+# Fixture: created_by=mila-wa, no WA magic keyword in title (code-mode MCP servers)
+WA_OWNER_NOMATCH='[{"id":"ga-miltest","title":"code-mode MCP servers configuration for context injection","priority":3,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"mila-wa","created_at":"2026-06-01T00:00:02Z","metadata":{}}]'
+LOG18K2="$(run_capacity 10 "[]" 1 "$WA_OWNER_NOMATCH")"
+B18K2="$(dispatched_builder "$LOG18K2")"
+if [ "$B18K2" = "batista-ps" ]; then
+  bad "REGRESSION (ga-nlh79): mila-wa-owned bead with no WA keyword misrouted to batista-ps"
+elif echo "$B18K2" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION (ga-nlh79): mila-wa-owned bead landed on dog pool"
+elif echo "$LOG18K2" | grep -q "ga-nlh79.*owner-authoritative\|whatsapp_automation.*domain build\|REFUSING.*whatsapp_automation" || [ -z "$B18K2" ]; then
+  ok "ga-nlh79: mila-wa-owned bead with no WA keyword → WA domain, owner guard fired"
+else
+  bad "ga-nlh79: mila-wa-owned bead routed unexpectedly (got: '${B18K2:-none}')"
+fi
+# Preservation: genuine property bead (no *-wa owner) still → property_scrapers
+PS_OWNER_GENUINE='[{"id":"ga-pstest","title":"Scraper RFB: mapear proprietarios de imoveis em Contagem via CNAE/ITBI","priority":3,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"batista-ps","created_at":"2026-06-01T00:00:03Z","metadata":{"story.o_que_e":"scraper semanal que verifica na Receita Federal o CPF dos proprietarios"}}]'
+LOG18K3="$(run_capacity 10 "[]" 1 "$PS_OWNER_GENUINE")"
+B18K3="$(dispatched_builder "$LOG18K3")"
+if [ "$B18K3" = "batista-ps" ]; then
+  ok "ga-nlh79 preservation: genuine property bead (batista-ps owner) still routes to batista-ps"
+elif echo "$B18K3" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION: genuine property bead landed on dog (owner guard over-fired on ps owner)"
+else
+  bad "REGRESSION: genuine property bead routed unexpectedly (got: '${B18K3:-none}')"
+fi
+echo "Scenario 18k: drift-guard — owner-authoritative rig guard is wired"
+has "$DISPATCHER" 'ga-nlh79'                            "ga-nlh79 owner-authoritative guard is wired"
+has "$DISPATCHER" 'PILOT_OWNER_RIG_GUARD'               "PILOT_OWNER_RIG_GUARD env-gate is wired"
+has "$DISPATCHER" 'owner-authoritative rig'             "ga-nlh79 log message wired"
+
 # ── Scenario 19 (wa-u5r1): dispatchable-queue emit for the painel ─────────────
 echo "Scenario 19a: emit writes valid JSON with the contract shape + count + items"
 F19="$(run_emit)"
