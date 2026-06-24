@@ -108,6 +108,15 @@ DOLT_PROBE_TIMEOUT = int(os.environ.get("TSW_DOLT_PROBE_TIMEOUT", "10"))
 DOLT_CONFIRM_SWEEPS = int(os.environ.get("TSW_DOLT_CONFIRM_SWEEPS", "2"))
 DOLT_COOLDOWN_SEC = int(os.environ.get("TSW_DOLT_COOLDOWN_SEC", "10800"))   # 3h cooldown
 
+# ── imp23: delivery-stall knobs ───────────────────────────────────────────────
+# DELIVERY: in-flight beads not updated for > DELIVERY_STALL_HOURS → delivery stall.
+# Catches: (1) merged-but-undeployed pile-up (delivery daemon didn't close after gate PASSED),
+# (2) dispatched-but-abandoned (crew died silently, no branch push, no heartbeat).
+DELIVERY_STALL_HOURS = float(os.environ.get("TSW_DELIVERY_STALL_HOURS", "3"))
+DELIVERY_STALL_MIN_BEADS = int(os.environ.get("TSW_DELIVERY_STALL_MIN_BEADS", "1"))
+DELIVERY_CONFIRM_SWEEPS = int(os.environ.get("TSW_DELIVERY_CONFIRM_SWEEPS", "2"))
+DELIVERY_COOLDOWN_SEC = int(os.environ.get("TSW_DELIVERY_COOLDOWN_SEC", "10800"))  # 3h cooldown
+
 # ── log-line patterns ─────────────────────────────────────────────────────────
 TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 # "=== Pilot sweep complete: dispatched=N ..."
@@ -126,6 +135,7 @@ _read_pilot_log_lines = None   # () -> [str]; None = read from disk
 _read_gate_log_lines = None    # () -> [str]; None = read from disk
 _git_log_count = None          # (root, since_iso) -> int; None = run git
 _bd_backlog = None             # (rig_root) -> list[dict]; None = run bd
+_bd_delivery = None            # (rig_root) -> list[dict]; None = run bd (imp23 delivery)
 _do_notify = None              # (msg, prio) -> None; None = run notify binary
 _do_mail_mayor = None          # (subject, body) -> bool; None = run gc mail
 _do_dolt_probe = None          # () -> int; 0=healthy 1=unhealthy 2=unknown; None = run probe
@@ -532,6 +542,166 @@ def backlog_signal():
     return len(unique), sample
 
 
+# ── imp23: delivery-stall signal ─────────────────────────────────────────────
+def delivery_signal(now):
+    """Returns (count, sample_beads) of story:in-flight beads stalled past DELIVERY_STALL_HOURS.
+
+    A bead is delivery-stalled when it carries story:in-flight AND its updated_at is older
+    than DELIVERY_STALL_HOURS — the delivery daemon (or the gate itself) has not closed it
+    despite the branch presumably being merged (or the crew having abandoned work).
+
+    On any error returns (None, []) — fail-open (no false alert).
+    Test seam: _bd_delivery(rig_root) -> list[dict]; None = run bd."""
+    stall_sec = DELIVERY_STALL_HOURS * 3600
+    stalled = {}
+    at_least_one_success = False
+
+    for root in RIG_ROOTS:
+        root = root.strip()
+        if not root:
+            continue
+        if _bd_delivery is not None:
+            beads = _bd_delivery(root)
+            at_least_one_success = True
+        else:
+            r = _sh([BD_BIN, "-C", root, "list", "-l", "story:in-flight",
+                     "--status", "open", "--json", "-n", "100"],
+                    timeout=BD_TIMEOUT)
+            if r is None or r.returncode != 0:
+                _log("delivery_signal: bd list story:in-flight in %s failed (rc=%s) — skipping" % (
+                     root, r.returncode if r else "err"))
+                continue
+            at_least_one_success = True
+            beads = _parse_bd_json(r.stdout)
+
+        if beads is None:
+            continue
+
+        for b in beads:
+            if not isinstance(b, dict):
+                continue
+            bid = b.get("id") or b.get("issue_id") or ""
+            if not bid or bid in stalled:
+                continue
+            updated_raw = (b.get("updated_at") or b.get("updated") or
+                           b.get("created_at") or b.get("created") or "")
+            if not updated_raw:
+                continue
+            updated_epoch = None
+            for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    updated_epoch = time.mktime(time.strptime(updated_raw[:19], fmt))
+                    break
+                except Exception:
+                    pass
+            if updated_epoch is None:
+                continue
+            if now - updated_epoch > stall_sec:
+                stalled[bid] = b
+
+    if not at_least_one_success:
+        _log("delivery_signal: all bd queries failed — ERROR (fail-open)")
+        return None, []
+
+    unique = list(stalled.values())
+    sample = [{"id": b.get("id", "?"), "title": (b.get("title") or b.get("name") or "?")[:80]}
+              for b in unique[:5]]
+    return len(unique), sample
+
+
+def _escalate_delivery(count, sample, now):
+    """Notify + mail Mayor on a confirmed delivery stall (imp23)."""
+    notify_msg = ("DELIVERY STALL: %d bead(s) story:in-flight > %.0fh sem atualização — "
+                  "possível merged-but-undeployed. Mayor notificado." % (count, DELIVERY_STALL_HOURS))
+    subject = ("Watchdog: DELIVERY STALL — %d bead(s) in-flight > %.0fh sem atualização"
+               % (count, DELIVERY_STALL_HOURS))
+    lines = [
+        "WATCHDOG DE ENTREGA: beads in-flight parados sem progresso — DELIVERY STALL",
+        "",
+        "Beads com story:in-flight não atualizados há > %.0fh (amostra):" % DELIVERY_STALL_HOURS,
+    ]
+    for b in sample:
+        lines.append("  • %s — %s" % (b["id"], b["title"]))
+    lines += [
+        "",
+        "POSSÍVEIS CAUSAS:",
+        "1. Branch mergeado mas o daemon de entrega não fechou o bead (merged-but-undeployed).",
+        "2. Entregável fora do git (habilidade em ~/.claude/) — sem merge path, loop de re-despacho.",
+        "3. Crew falhou silenciosamente — sem heartbeat, sem branch push.",
+        "",
+        "INVESTIGAÇÃO:",
+        "  bd -C <rig> show <bead_id>  — confirme labels e última atualização",
+        "  git -C <rig> branch -r --merged origin/main | grep <bead_id>  — branch já merged?",
+        "  Se merged+não-fechado: gc bd close <id> --reason 'entrega manual (delivery stall)'",
+        "  Se fora do git: adicione gate:needs-human para freiar o Pilot (imp13 :technical)",
+    ]
+    body = "\n".join(lines)
+
+    _tsw_ledger("human-touch", {
+        "ts": _tsw_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source_daemon": "throughput-stall-watchdog",
+        "stage": "entrega",
+        "kind": "technical",
+        "bead_id": sample[0]["id"] if sample else "",
+        "reason": notify_msg,
+    }, fail_open=True)
+
+    if DRY_RUN:
+        _log("DRY_RUN: would escalate delivery stall: %r" % notify_msg)
+        return
+
+    if _do_notify is not None:
+        _do_notify(notify_msg, 4)
+    else:
+        _sh([NOTIFY_BIN, "-t", "Delivery stall", "-p", "4", notify_msg], timeout=10)
+
+    if _do_mail_mayor is not None:
+        _do_mail_mayor(subject, body)
+    else:
+        _sh([GC_BIN, "mail", "send", MAYOR_ADDR, "-s", subject, "-m", body, "--notify"],
+            timeout=45)
+
+
+def _tick_delivery(now, state):
+    """Handle the delivery-stall dimension (imp23).
+
+    Fires when story:in-flight beads go stale for > DELIVERY_STALL_HOURS.
+    Runs every tick independently of the main throughput-stall logic.
+    Updates state["delivery_pending"] and state["delivery_last_escalate"].
+    Returns True if a delivery stall was escalated this tick."""
+    state.setdefault("delivery_pending", 0)
+    state.setdefault("delivery_last_escalate", 0.0)
+
+    count, sample = delivery_signal(now)
+    if count is None:
+        _log("delivery_signal ERROR → fail-open (no delivery verdict)")
+        state["delivery_pending"] = 0
+        return False
+
+    if count < DELIVERY_STALL_MIN_BEADS:
+        if state["delivery_pending"] > 0:
+            _log("delivery: no stalled beads (count=%d) — cleared" % count)
+        state["delivery_pending"] = 0
+        return False
+
+    state["delivery_pending"] += 1
+    _log("delivery: %d in-flight bead(s) stalled > %.0fh (pending=%d/%d)" % (
+         count, DELIVERY_STALL_HOURS, state["delivery_pending"], DELIVERY_CONFIRM_SWEEPS))
+
+    if state["delivery_pending"] < DELIVERY_CONFIRM_SWEEPS:
+        return False
+
+    if (now - state["delivery_last_escalate"]) <= DELIVERY_COOLDOWN_SEC:
+        _log("delivery: stall confirmed but within cooldown — suppressing")
+        return False
+
+    _log("DELIVERY ESCALATING: %d in-flight bead(s) stalled (confirmed %d sweeps)" % (
+         count, state["delivery_pending"]))
+    _escalate_delivery(count, sample, now)
+    state["delivery_last_escalate"] = now
+    return True
+
+
 # ── state persistence ─────────────────────────────────────────────────────────
 def _load_state():
     try:
@@ -546,12 +716,16 @@ def _load_state():
                 d.setdefault("blind_last_escalate", 0.0)
                 d.setdefault("dolt_pending", 0)
                 d.setdefault("dolt_last_escalate", 0.0)
+                # imp23 keys (backward-compat: absent in pre-imp23 state files)
+                d.setdefault("delivery_pending", 0)
+                d.setdefault("delivery_last_escalate", 0.0)
                 return d
     except Exception:
         pass
     return {"pending": 0, "last_escalate": 0.0, "escalations": 0,
             "blind_pending": 0, "blind_last_escalate": 0.0,
-            "dolt_pending": 0, "dolt_last_escalate": 0.0}
+            "dolt_pending": 0, "dolt_last_escalate": 0.0,
+            "delivery_pending": 0, "delivery_last_escalate": 0.0}
 
 
 def _save_state(state):
@@ -681,6 +855,10 @@ def run_tick(now, state):
 
     # imp08: blind-floor + Dolt-health check (runs every tick regardless of signal state)
     is_blind, _dolt_esc = _tick_blind_and_dolt(signals_errored, now, state)
+
+    # imp23: delivery-stall check (runs every tick, independent of throughput stall)
+    _tick_delivery(now, state)
+
     if is_blind:
         # Blind sweep: skip stall logic entirely (can't make a verdict).
         # Stall pending counter is NOT reset — we don't know if it's a stall or not.
@@ -808,7 +986,7 @@ def _selftest():
     # We are executing in __main__ context, so the module globals ARE our globals.
     # Use `global` to inject into the correct namespace.
     global _read_pilot_log_lines, _read_gate_log_lines, _git_log_count
-    global _bd_backlog, _do_mail_mayor, _do_notify, _do_dolt_probe
+    global _bd_backlog, _bd_delivery, _do_mail_mayor, _do_notify, _do_dolt_probe
 
     ok_count = [0]
     fail_count = [0]
@@ -852,7 +1030,8 @@ def _selftest():
     def _reset():
         return {"pending": 0, "last_escalate": 0.0, "escalations": 0,
                 "blind_pending": 0, "blind_last_escalate": 0.0,
-                "dolt_pending": 0, "dolt_last_escalate": 0.0}
+                "dolt_pending": 0, "dolt_last_escalate": 0.0,
+                "delivery_pending": 0, "delivery_last_escalate": 0.0}
 
     def _stub_mail(subject, body):
         mail_calls.append((subject, body))
@@ -866,6 +1045,9 @@ def _selftest():
     # imp08: stub Dolt probe as healthy by default so existing scenarios A-G are
     # not affected by whatever the live Dolt state is during the selftest.
     _do_dolt_probe = lambda: 0   # 0=healthy — overridden per imp08 scenario as needed
+    # imp23: stub delivery signal as no stalled beads by default so existing scenarios
+    # are not affected.
+    _bd_delivery = lambda root: []   # no stalled beads — overridden in L/M/N scenarios
 
     print("\n[tsw selftest] running scenarios...\n")
 
@@ -1112,11 +1294,101 @@ def _selftest():
     else:
         _bad("K2", "expected Dolt notify, got: %r" % notify_calls)
 
+    # ── imp23-L: delivery stall confirms after DELIVERY_CONFIRM_SWEEPS ──────────
+    print("\nimp23 Scenario L: %d stalled in-flight beads → delivery stall after %d sweeps" % (
+          2, DELIVERY_CONFIRM_SWEEPS))
+
+    def _stale_bead(bid, hours_ago):
+        stale_epoch = NOW - hours_ago * 3600
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(stale_epoch))
+        return {"id": bid, "title": "Stale in-flight %s" % bid,
+                "labels": ["story:in-flight", "pilot:dispatched"],
+                "updated_at": ts}
+
+    _read_pilot_log_lines = lambda: _pilot_lines(0, 3)   # no dispatch
+    _read_gate_log_lines  = lambda: []
+    _git_log_count        = lambda root, since: 0
+    _bd_backlog           = lambda root: []               # no ready work (avoid throughput stall noise)
+    _bd_delivery          = lambda root: [_stale_bead("wa-d001", DELIVERY_STALL_HOURS + 1),
+                                          _stale_bead("wa-d002", DELIVERY_STALL_HOURS + 2)]
+    _do_dolt_probe        = lambda: 0
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+
+    run_tick(NOW, st)
+    if st.get("delivery_pending", 0) == 1 and not notify_calls:
+        _ok("L1: first delivery-stall sweep → delivery_pending=1, no notify yet")
+    else:
+        _bad("L1", "delivery_pending=%d notifies=%d" % (st.get("delivery_pending", 0), len(notify_calls)))
+
+    run_tick(NOW + 1800, st)
+    delivery_notifies = [n for n in notify_calls if "DELIVERY" in n[0].upper() or "delivery" in n[0].lower()]
+    if delivery_notifies:
+        _ok("L2: second sweep → delivery stall escalated (notify fired)")
+    else:
+        _bad("L2", "expected delivery notify, got: %r" % notify_calls)
+    delivery_mails = [m for m in mail_calls if "delivery" in m[0].lower() or "DELIVERY" in m[0]]
+    if delivery_mails:
+        _ok("L3: delivery stall escalation sent Mayor mail")
+    else:
+        _bad("L3", "expected delivery mail, got: %r" % mail_calls)
+
+    # Cooldown: re-running should not re-escalate
+    mail_calls.clear(); notify_calls.clear()
+    run_tick(NOW + 3600, st)
+    delivery_notifies2 = [n for n in notify_calls if "DELIVERY" in n[0].upper()]
+    if not delivery_notifies2:
+        _ok("L4: cooldown suppresses re-escalation on delivery stall")
+    else:
+        _bad("L4: cooldown should suppress delivery re-escalation", str(notify_calls))
+
+    # ── imp23-M: fresh in-flight beads → no delivery stall ───────────────────────
+    print("\nimp23 Scenario M: fresh in-flight beads → no delivery stall")
+    _bd_delivery = lambda root: [_stale_bead("wa-f001", 0.5)]  # only 30min old — under threshold
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st); run_tick(NOW + 1800, st)
+    delivery_notifies3 = [n for n in notify_calls if "DELIVERY" in n[0].upper()]
+    if not delivery_notifies3 and st.get("delivery_pending", 0) == 0:
+        _ok("M: fresh in-flight beads (< %.0fh) → no delivery stall alert" % DELIVERY_STALL_HOURS)
+    else:
+        _bad("M", "delivery_pending=%d delivery_notifies=%d" % (
+             st.get("delivery_pending", 0), len(delivery_notifies3)))
+
+    # ── imp23-N: delivery signal error → fail-open, no false alert ───────────────
+    print("\nimp23 Scenario N: delivery signal error → fail-open, no alert")
+    _bd_delivery = None                   # use real bd path (will fail in selftest context)
+    _bd_delivery = lambda root: None      # stub returning None = error sentinel
+    # But delivery_signal converts None-per-bead to skips. For ERROR: return None from _bd_delivery
+    # The actual test seam check is: if _bd_delivery is not None: beads = _bd_delivery(root);
+    # at_least_one_success = True. Even returning None from stub → beads=None → continue (no stall).
+    # To simulate full signal failure we need at_least_one_success=False. We do this by
+    # making _bd_delivery raise (not return None), but that bypasses at_least_one_success.
+    # Simplest: keep _bd_delivery=None (use real bd which will fail in selftest) for one rig.
+    # Actually: the cleanest approach is a stub that sets at_least_one_success=False via
+    # returning a sentinel. The existing code: `beads = _bd_delivery(root); at_least_one_success=True`.
+    # So any _bd_delivery call sets at_least_one_success=True. To force ERROR (None, []) return
+    # from delivery_signal, we need all RIG_ROOTS to be skipped. We can do this by temporarily
+    # overriding RIG_ROOTS to empty.
+    _saved_rig_roots = globals().get("RIG_ROOTS", [])
+    globals()["RIG_ROOTS"] = []    # empty → at_least_one_success stays False → (None, [])
+    _bd_delivery = lambda root: []  # irrelevant when RIG_ROOTS=[]
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st); run_tick(NOW + 1800, st)
+    globals()["RIG_ROOTS"] = _saved_rig_roots
+    delivery_notifies4 = [n for n in notify_calls if "DELIVERY" in n[0].upper()]
+    if not delivery_notifies4:
+        _ok("N: delivery signal error (empty RIG_ROOTS) → fail-open, no delivery alert")
+    else:
+        _bad("N", "should not fire delivery alert on signal error, got: %r" % notify_calls)
+
     # ── cleanup ───────────────────────────────────────────────────────────────────
     _read_pilot_log_lines = None
     _read_gate_log_lines  = None
     _git_log_count        = None
     _bd_backlog           = None
+    _bd_delivery          = None
     _do_notify            = None
     _do_mail_mayor        = None
     _do_dolt_probe        = None
