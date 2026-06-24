@@ -239,6 +239,8 @@ auto_refino_handoff_decision() {
         echo "handoff"
       fi
       ;;
+    # imp16: info-gap = thin/duplicate/trivial — technical, not a product decision
+    "ESCALATE:info-gap") echo "escalate-info-gap" ;;
     ESCALATE) echo "escalate" ;;
     *) echo "requeue" ;;   # TIMEOUT, empty, or any unexpected token
   esac
@@ -968,13 +970,19 @@ CONFIDENCE GATE — decide REFINE vs ESCALATE (do NOT guess):
   REFINE only if you can write ALL of F1, F2, F6 (>=2 verifiable criteria), F7,
   F8 from the title/description WITHOUT inventing product scope or making a
   product/priority/tradeoff decision that only Athos can make.
-  ESCALATE (do NOT promote) if ANY of:
-    - the "what" or "why" (F2) is unclear / not derivable from the given context;
-    - the scope is ambiguous and resolving it is a product decision (not a
-      wording choice);
-    - you cannot produce >=2 concrete verifiable acceptance criteria without
-      guessing;
+
+  ESCALATE as INFO-GAP (technical gap — NOT a product decision; no human page) if:
+    - the story has NO description or only placeholder text (thin spec);
+    - the story appears to be a DUPLICATE of an existing story;
+    - the story is TRIVIAL or MIS-PASTED (no meaningful product intent visible).
+    → Use the INFO-GAP escalation path below. Do NOT page Athos.
+
+  ESCALATE as POLICY-GAP (genuine product decision — needs Athos) if ANY of:
+    - the "what" or "why" (F2) exists but needs a product decision to resolve;
+    - scope ambiguity that only Athos can decide (not just a wording choice);
+    - you cannot produce >=2 verifiable criteria WITHOUT guessing product scope;
     - F8 says "epic" (needs an Athos-driven split decision).
+    → Use the POLICY-GAP escalation path below. Page Athos.
 
 IF YOU CAN REFINE — write back to the STORY and hand to the gate (NOT
 needs-approval), then close the task bead:
@@ -1006,11 +1014,32 @@ bd -C "$AR_BEAD_STORE" label add "$TASK_BEAD_ID" "outcome:REFINED"
 bd -C "$AR_BEAD_STORE" label remove "$TASK_BEAD_ID" "outcome:pending"
 bd -C "$AR_BEAD_STORE" close "$TASK_BEAD_ID"
 
-IF YOU CANNOT REFINE CONFIDENTLY — record the gaps/questions, escalate, do NOT
-promote and do NOT dispatch, then close the task bead:
+IF YOU CANNOT REFINE CONFIDENTLY — choose the escalation path (imp16):
+
+[PATH A — INFO-GAP: thin/duplicate/trivial — technical gap, NOT a product decision]
+Use this when the story lacks enough information to refine (no description, duplicate,
+trivial, or mis-pasted). Do NOT page Athos — this is a technical context gap.
+
+bd -C "$AR_BEAD_STORE" update "$STORY_ID" \\
+  --set-metadata "story.auto_refino_gaps=<what context is missing — one item per line>"
+bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "refino:info-gap"
+bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "auto-refino:refining"
+bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:refinement-in-progress"
+bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:triage"
+bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:unrefined"
+bd -C "$AR_BEAD_STORE" comment "$STORY_ID" "Auto-refino INFO-GAP: história sem contexto suficiente (attempt $THIS_ATTEMPT). Lacuna técnica — não é decisão de produto. Aguardando mais contexto."
+bd -C "$AR_BEAD_STORE" label add "$TASK_BEAD_ID" "outcome:ESCALATE:info-gap"
+bd -C "$AR_BEAD_STORE" label remove "$TASK_BEAD_ID" "outcome:pending"
+bd -C "$AR_BEAD_STORE" close "$TASK_BEAD_ID"
+
+[PATH B — POLICY-GAP: genuine product decision — needs Athos]
+Use this when the story has intent but resolving it requires a product decision
+that only Athos can make. Page Athos via story:refino-escalado.
 
 bd -C "$AR_BEAD_STORE" update "$STORY_ID" \\
   --set-metadata "story.auto_refino_gaps=<perguntas/lacunas concretas, uma por linha — o que falta para refinar>"
+bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "refino:policy-gap"
+bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "gate:needs-human:product"
 bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "auto-refino:escalated"
 bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "auto-refino:refining"
 # TERMINAL escalate: remove EVERY lifecycle label so no candidate query can re-pick
@@ -1018,12 +1047,9 @@ bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "auto-refino:refining"
 bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:refinement-in-progress"
 bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:triage"
 bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:unrefined"
-# SURFACE in the painel "Sua vez" human queue (ga-lfua3): add the canonical
-# escalation label AFTER the removes above so it survives. story:refino-escalado is
-# one of the painel's _SUAVEZ_LABELS; without it an escalated story (only the
-# daemon's auto-refino:escalated marker) renders in TRIAGEM, invisible to Athos.
+# SURFACE in the painel "Sua vez" human queue (ga-lfua3): story:refino-escalado
 bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "story:refino-escalado"
-bd -C "$AR_BEAD_STORE" comment "$STORY_ID" "Auto-refino NÃO conseguiu refinar com confiança (attempt $THIS_ATTEMPT). Perguntas/lacunas para o Athos:
+bd -C "$AR_BEAD_STORE" comment "$STORY_ID" "Auto-refino POLICY-GAP: não conseguiu refinar — precisa de decisão de produto do Athos (attempt $THIS_ATTEMPT). Perguntas/lacunas:
 <liste as perguntas — decisões de produto que só o Athos toma>
 NÃO promovido, NÃO despachado."
 bd -C "$AR_BEAD_STORE" label add "$TASK_BEAD_ID" "outcome:ESCALATE"
@@ -1088,6 +1114,8 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   TB_LABELS=$(echo "$TB" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")')
   if echo "$TB_LABELS" | grep -q "outcome:REFINED"; then
     OUTCOME="REFINED"; break
+  elif echo "$TB_LABELS" | grep -q "outcome:ESCALATE:info-gap"; then
+    OUTCOME="ESCALATE:info-gap"; break
   elif echo "$TB_LABELS" | grep -q "outcome:ESCALATE"; then
     OUTCOME="ESCALATE"; break
   fi
@@ -1117,9 +1145,22 @@ case "$DECISION" in
     bd_ update "$STORY_ID" --assignee "" -q 2>/dev/null || true
     log "  $STORY_ID → handed to refino gate (story:refino-review). Gate decides promotion."
     ;;
+  escalate-info-gap)
+    # imp16: info-gap escalation — story is thin/duplicate/trivial (technical gap,
+    # NOT a product decision). Do NOT page Athos. The refiner already set refino:info-gap;
+    # ensure cleanup + skip markers. Story waits for context without a human page.
+    bd_ update "$STORY_ID" --set-metadata "story.auto_refino_attempts=$THIS_ATTEMPT" -q 2>/dev/null || true
+    bd_ label remove "$STORY_ID" "auto-refino:refining" -q 2>/dev/null || true
+    bd_ label add "$STORY_ID" "auto-refino:escalated" -q 2>/dev/null || true
+    bd_ label add "$STORY_ID" "refino:info-gap" -q 2>/dev/null || true
+    _clear_lifecycle "$STORY_ID"
+    bd_ update "$STORY_ID" --assignee "" -q 2>/dev/null || true
+    # NOT story:refino-escalado (not in Athos's queue), NOT notify, NOT mail mayor
+    log "  $STORY_ID → INFO-GAP (thin/duplicate/trivial) — refino:info-gap set, no human page."
+    ;;
   escalate)
-    # Either the refiner said ESCALATE, or the attempt budget is spent. Make sure
-    # the bead is flagged + NOT promoted + NOT dispatched, record the attempt,
+    # Either the refiner said ESCALATE (policy-gap), or the attempt budget is spent.
+    # Make sure the bead is flagged + NOT promoted + NOT dispatched, record the attempt,
     # and tell Athos/Mayor. (If the refiner already escalated, these are idempotent.)
     bd_ update "$STORY_ID" --set-metadata "story.auto_refino_attempts=$THIS_ATTEMPT" -q 2>/dev/null || true
     bd_ label remove "$STORY_ID" "auto-refino:refining" -q 2>/dev/null || true

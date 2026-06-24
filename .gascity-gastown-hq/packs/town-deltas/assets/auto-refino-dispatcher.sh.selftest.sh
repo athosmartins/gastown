@@ -123,6 +123,13 @@ D=$(auto_refino_handoff_decision "ESCALATE" 1 3)
 D=$(auto_refino_handoff_decision "ESCALATE" 9 3)
 [ "$D" = "escalate" ] && ok "ESCALATE at any attempt → escalate" || bad "ESCALATE → expected escalate, got '$D'"
 
+# ── Scenario 4d: imp16 ESCALATE:info-gap → escalate-info-gap (no human page) ──
+echo "Scenario 4d (imp16): ESCALATE:info-gap (thin/duplicate/trivial) → escalate-info-gap"
+D=$(auto_refino_handoff_decision "ESCALATE:info-gap" 1 3)
+[ "$D" = "escalate-info-gap" ] && ok "ESCALATE:info-gap → escalate-info-gap (not in Athos queue)" || bad "ESCALATE:info-gap → expected escalate-info-gap, got '$D'"
+D=$(auto_refino_handoff_decision "ESCALATE:info-gap" 9 3)
+[ "$D" = "escalate-info-gap" ] && ok "ESCALATE:info-gap at any attempt → escalate-info-gap" || bad "ESCALATE:info-gap high-attempt → expected escalate-info-gap, got '$D'"
+
 # ── Scenario 4b: escalated flag is durable → re-escalation loop cannot form ────
 # BUG 1: the escalate path persists auto-refino:escalated ADDITIVELY (no
 # --set-labels clobber). The post-escalate state is story:refinement-in-progress +
