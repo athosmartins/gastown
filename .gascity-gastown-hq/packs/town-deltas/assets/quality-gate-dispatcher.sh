@@ -2062,22 +2062,67 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
 
     bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
 
-    if [ "$AUTHOR_ALIVE" = "1" ]; then
-      # Author can resolve — bounce + nudge (legacy path).
-      warn "Branch $BRANCH: genuine conflict (${CONFLICT_FILES:-conflicts}); author $AUTHOR is live — bouncing for manual rebase."
+    if [ "$AUTHOR_ALIVE" = "1" ] && [ "$CONFLICT_KIND" = "merge" ]; then
+      # gt-4tk5m fix: only bounce to needs-rebase when the conflict is GENUINE
+      # (deterministic merge conflict). A TRANSIENT failure (worktree/push plumbing
+      # race — e.g. the author force-pushed a rebase while this marker was queued
+      # and --force-with-lease rejected our push) must NOT set needs-rebase and
+      # exit: that silently drops the branch from the queue (catch-22: the author
+      # already rebased and expects the gate to pick it up, but needs-rebase tells
+      # them to rebase again). Re-queue instead (same logic as dead-author transient
+      # path) so the next sweep re-reads the author's rebased tip and proceeds.
+      warn "Branch $BRANCH: genuine merge conflict (${CONFLICT_FILES:-conflicts}); author $AUTHOR is live — bouncing for manual rebase."
       bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
-      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED: branch $BRANCH is stale and has conflicts that prevent auto-rebase.
+      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED: branch $BRANCH is stale and has a genuine merge conflict that auto-rebase cannot resolve.
 main HEAD is $MAIN_HEAD_SHA. Conflicting regions: ${CONFLICT_FILES:-unknown}.
 Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, resolve conflicts, and re-run /gate-done." 2>/dev/null || true
       if [ -n "$BEAD_ID" ]; then
         bd -C "$BEAD_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate blocked: branch $BRANCH has conflicts with current main ($MAIN_HEAD_SHA). Auto-rebase failed (${CONFLICT_FILES:-conflicts}). Manual rebase required — re-run /gate-done after resolving." 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate blocked: branch $BRANCH has a genuine merge conflict with current main ($MAIN_HEAD_SHA). Auto-rebase failed (${CONFLICT_FILES:-conflicts}). Manual rebase required — re-run /gate-done after resolving." 2>/dev/null || true
       fi
       gc --city "$GC_CITY" session nudge "$AUTHOR" \
-        "GATE BLOCKED for branch $BRANCH: stale with conflicts — auto-rebase failed. Conflicts: ${CONFLICT_FILES:-unknown}. Manually rebase onto origin/$DEFAULT_BRANCH (main HEAD: $MAIN_HEAD_SHA), resolve conflicts, re-run /gate-done. Bead: $BEAD_ID" \
+        "GATE BLOCKED for branch $BRANCH: stale with merge conflicts — auto-rebase cannot resolve. Conflicts: ${CONFLICT_FILES:-unknown}. Manually rebase onto origin/$DEFAULT_BRANCH (main HEAD: $MAIN_HEAD_SHA), resolve conflicts, re-run /gate-done. Bead: $BEAD_ID" \
         --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR for rebase"
       REBASE_EVENT="dispatcher_needs_rebase"
-      REBASE_VERDICT="NEEDS_REBASE (conflicts, author live, bounced)"
+      REBASE_VERDICT="NEEDS_REBASE (genuine merge conflict, author live, bounced)"
+    elif [ "$AUTHOR_ALIVE" = "1" ] && [ "$CONFLICT_KIND" = "transient" ]; then
+      # gt-4tk5m fix: author is live but failure is TRANSIENT (worktree/push plumbing
+      # race — e.g. author force-pushed a rebase while marker was queued and our
+      # --force-with-lease was rejected). The branch may already be correctly rebased
+      # by the author. Re-queue (with a rebase-attempt counter to sink it behind
+      # healthy markers) so the next sweep re-reads the updated branch tip. No
+      # needs-rebase bounce — that would tell the author to re-run /gate-done when
+      # their branch is already fine, and silently drop it from the queue if they
+      # don't (the catch-22 this bead fixes).
+      NEXT_ATTEMPT=$((REBASE_ATTEMPT + 1))
+      bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:rebase-attempt:$REBASE_ATTEMPT" -q 2>/dev/null || true
+      bd -C "$GC_CITY" label add    "$MARKER_ID" "gate:rebase-attempt:$NEXT_ATTEMPT"  -q 2>/dev/null || true
+      if [ "$NEXT_ATTEMPT" -lt "$MAX_REBASE_ATTEMPTS" ]; then
+        warn "Branch $BRANCH: transient auto-rebase-fail (author $AUTHOR live; likely rebase-while-queued race — attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — gate-status:queued for server-side retry."
+        bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:queued" -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS (gt-4tk5m): branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) — likely a rebase-while-queued race (author $AUTHOR may have force-pushed while this marker was queued). Re-queued for next sweep; no /gate-done re-run needed. Carries gate:rebase-attempt:$NEXT_ATTEMPT so it sinks behind healthy markers (ga-q3ig2)." 2>/dev/null || true
+        gc --city "$GC_CITY" session nudge "$AUTHOR" \
+          "Gate auto-retry for branch $BRANCH (${BEAD_ID:-unknown}): transient rebase push race detected (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — re-queued for next sweep. No action needed unless this keeps retrying." \
+          --delivery wait-idle 2>/dev/null || true
+        REBASE_EVENT="dispatcher_autorebase_retry_alive"
+        REBASE_VERDICT="QUEUED (transient rebase race, author $AUTHOR live, retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS)"
+      else
+        err "Branch $BRANCH: transient auto-rebase failure persists after $MAX_REBASE_ATTEMPTS attempts even with live author $AUTHOR — escalating."
+        bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED (gt-4tk5m): branch $BRANCH hit persistent transient auto-rebase failures ($MAX_REBASE_ATTEMPTS attempts) despite live author $AUTHOR. Possible stuck push race or corrupt ref. Parked at needs-rebase for human/Mayor resolution." 2>/dev/null || true
+        if [ -n "$BEAD_ID" ]; then
+          bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+        fi
+        gc --city "$GC_CITY" session nudge "$AUTHOR" \
+          "GATE ESCALATED for branch $BRANCH (${BEAD_ID:-unknown}): persistent transient auto-rebase failures after $MAX_REBASE_ATTEMPTS retries. Please check your branch and re-run /gate-done, or contact Mayor." \
+          --delivery wait-idle 2>/dev/null || true
+        gc --city "$GC_CITY" mail send mayor \
+          -s "Gate escalation: $BRANCH transient rebase race (live author, $MAX_REBASE_ATTEMPTS attempts)" \
+          -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) hit persistent transient auto-rebase failures ($MAX_REBASE_ATTEMPTS attempts) even with live author $AUTHOR. ${CONFLICT_FILES:-unknown}. Possible stuck push race or corrupt ref. Parked at needs-rebase. (gt-4tk5m)" 2>/dev/null \
+          || warn "Could not mail Mayor for gate escalation on $BRANCH"
+        REBASE_EVENT="dispatcher_needs_rebase_transient_escalated"
+        REBASE_VERDICT="NEEDS_REBASE (persistent transient race, escalated after $MAX_REBASE_ATTEMPTS attempts)"
+      fi
     elif [ "$CONFLICT_KIND" = "merge" ]; then
       # ga-q3ig2 IDEAL SKIP: a GENUINE merge conflict vs current main is
       # deterministic — re-running the same rebase next sweep produces the same
@@ -3680,8 +3725,13 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       # (c) RETRY CAP REACHED — stop auto-retry, escalate to the Mayor ONCE.
       log "Gate fix-attempt cap reached for $BEAD_ID (prev=$PREV_ATTEMPT >= $GATE_FIX_CAP). Escalating; no further auto-retry."
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:needs-fix"   -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human"           -q 2>/dev/null || true
+      # imp13: sub-label classifies this as a TECHNICAL circuit-breaker park (not a product decision).
+      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human:technical" -q 2>/dev/null || true
       bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate auto-fix cap ($GATE_FIX_CAP attempts) exhausted — labeled gate:needs-human. The machine could not resolve this after $GATE_FIX_CAP fix cycles; the Pilot will NOT re-dispatch it. Human/Mayor intervention required." 2>/dev/null || true
+      # imp13: emit human-touch ledger entry (technical kind) for 99% metric.
+      { source "$GC_CITY/scripts/gc-ledger.sh" 2>/dev/null && \
+        gc_ledger_append "human-touch" "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"source_daemon\":\"quality-gate-dispatcher\",\"stage\":\"executa\",\"kind\":\"technical\",\"bead_id\":\"${BEAD_ID}\",\"reason\":\"Gate fix-cap exhausted (${GATE_FIX_CAP} attempts) — circuit-breaker park\"}"; } 2>/dev/null || true
       # Escalate EXACTLY once: only mail if gate:needs-human was not already set.
       if ! printf '%s' "$SRC_LABELS" | grep -q "gate:needs-human"; then
         gc --city "$GC_CITY" mail send mayor \

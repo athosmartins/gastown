@@ -717,6 +717,14 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels):
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] warn: add gate:needs-human {bead_id}: {exc}",
               flush=True)
+    # imp13: sub-label classifies this as a TECHNICAL circuit-breaker park (not a product decision).
+    try:
+        subprocess.run(
+            ["bd", "label", "add", bead_id, "gate:needs-human:technical", "-q"],
+            capture_output=True, text=True, timeout=15)
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] warn: add gate:needs-human:technical {bead_id}: {exc}",
+              flush=True)
 
     try:
         subprocess.run(
