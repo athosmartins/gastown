@@ -74,6 +74,25 @@ RECYCLE_STATE_DIR="${RECYCLE_STATE_DIR:-$HQ/.gc/recycle-state}"
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
 
+# ── imp05: exit-code failure tracking ────────────────────────────────────────
+# A job is FAILING (not just crash-looping) when it exits nonzero on DPW_FAIL_THRESHOLD
+# consecutive sweeps. This supplements crash-loop (which is 2 consecutive) with a named
+# "FAILING" state so the alert message is unambiguous. Default threshold = 2 (same as
+# crash-loop) but override-able for daemons that occasionally fail transiently.
+DPW_FAIL_THRESHOLD="${DPW_FAIL_THRESHOLD:-2}"
+
+# ── imp05: binary-provenance config ──────────────────────────────────────────
+# gc must carry the f8r9e Dolt-retry patch (IsTransientDoltError); if strings returns no
+# match the binary has been rebuilt/reverted from source without the patch. Fail-open:
+# if `strings` or `which gc` is unavailable, skip silently.
+DPW_CHECK_GC_PROVENANCE="${DPW_CHECK_GC_PROVENANCE:-1}"
+DPW_GC_PROVENANCE_MARKER="${DPW_GC_PROVENANCE_MARKER:-IsTransientDoltError}"
+
+# gt must carry BuiltProperly=1 in its ldflags (ensures the version was built with the
+# Makefile, not plain go build). Same fail-open behaviour.
+DPW_CHECK_GT_PROVENANCE="${DPW_CHECK_GT_PROVENANCE:-1}"
+DPW_GT_PROVENANCE_MARKER="${DPW_GT_PROVENANCE_MARKER:-BuiltProperly}"
+
 # A label is loaded iff `launchctl list <label>` succeeds.
 _loaded()    { launchctl list "$1" >/dev/null 2>&1; }
 # The last-exit-status column (2nd field) for a loaded label; empty if not listed.
@@ -82,6 +101,59 @@ _last_exit() { launchctl list 2>/dev/null | awk -v l="$1" '$3==l {print $2}'; }
 _prev_exit() { awk -v l="$1" '$1==l {print $2}' "$STATE" 2>/dev/null; }
 # Seconds since <file> was last modified ("$2"=now epoch); empty if missing / stat fails.
 _log_age()   { local f="$1" now="$2" m; [ -f "$f" ] || return 0; m=$(stat -f %m "$f" 2>/dev/null) && echo $(( now - m )); }
+
+# ── imp05: count consecutive nonzero exits for a label ───────────────────────
+# State files for consecutive-exit tracking live in STATE.fail-counts/; format "COUNT".
+_fail_count_file() { echo "${STATE}.fail-counts/$1"; }
+_fail_count_get()  { local f; f="$(_fail_count_file "$1")"; [ -f "$f" ] && cat "$f" 2>/dev/null || echo 0; }
+_fail_count_set()  { local f; f="$(_fail_count_file "$1")"; mkdir -p "$(dirname "$f")" 2>/dev/null || true; printf '%s\n' "$2" > "$f" 2>/dev/null || true; }
+_fail_count_reset(){ local f; f="$(_fail_count_file "$1")"; rm -f "$f" 2>/dev/null || true; }
+
+# ── imp05: ProgramArguments path extraction ───────────────────────────────────
+# Parse the ProgramArguments from a launchd plist (XML). Returns the first
+# non-interpreter path (skipping /bin/bash, /usr/bin/env, etc.).
+# Uses only awk — no external deps. Handles both compact (<key>ProgramArguments</key><array>
+# on the same line as the key) and expanded plist formats.
+_plist_program_path() {
+  local plist="$1"
+  [ -f "$plist" ] || return 1
+  awk '
+    /<key>ProgramArguments<\/key>/,/<\/array>/ {
+      if (/<string>/) {
+        gsub(/.*<string>/, ""); gsub(/<\/string>.*/, "")
+        # Skip common shell interpreters
+        if ($0 !~ /^(\/bin\/bash|\/bin\/sh|\/usr\/bin\/env|\/bin\/zsh)$/ && $0 != "") {
+          print; exit
+        }
+      }
+    }
+  ' "$plist" 2>/dev/null
+}
+
+# ── imp05: binary-provenance check ───────────────────────────────────────────
+# Returns 0 if the marker is found, 1 if not, 2 if the binary is missing/unreadable (skip).
+_binary_has_marker() {
+  local bin="$1" marker="$2" resolved
+  # Resolve symlink if possible
+  resolved="$(readlink -f "$bin" 2>/dev/null)" || resolved="$bin"
+  [ -f "$resolved" ] || return 2
+  strings "$resolved" 2>/dev/null | grep -qF "$marker" && return 0 || return 1
+}
+
+# ── imp05: ledger append (wired by imp02/imp04 once gc_ledger_append lands) ──
+_ledger_touch() {
+  # imp02 wires the ledger — this call is a no-op until gc_ledger_append is on PATH.
+  command -v gc_ledger_append >/dev/null 2>&1 && gc_ledger_append "dpw" "$*" 2>/dev/null || true
+}
+
+# ── imp05: alert helper (ntfy primary, gc mail secondary, ledger best-effort) ─
+_alert() {
+  local subject="$1" msg="$2"
+  log "ALERT $subject — $msg"
+  command -v notify >/dev/null 2>&1 && notify -t "Daemon watchdog: $subject" -p 4 "$msg" 2>/dev/null || true
+  command -v gc >/dev/null 2>&1 && gc mail send mayor -s "Daemon-presence: $subject" -m "$msg" 2>/dev/null || true
+  _ledger_touch "$subject" "$msg"
+}
 
 # _rss_mb <label> — return current RSS in MiB for the process running under <label>.
 # Uses launchctl list to get the PID, then ps -o rss= to read RSS in KiB.
@@ -192,10 +264,22 @@ run_recycle_sweep() {
 }
 
 run_sweep() {
-  local absent="" reloaded="" crashloop="" wedged="" healthy=0 newstate="" lbl plist ex prev _hb _hblog _hbmax _age
+  local absent="" reloaded="" crashloop="" failing="" wedged="" path_missing="" healthy=0 newstate="" lbl plist ex prev _hb _hblog _hbmax _age fc prog
   local NOW; NOW="$(date +%s)"
   for lbl in $DPW_CRITICAL; do
     plist="$LAUNCH_DIR/$lbl.plist"
+
+    # ── imp05 check 2: ProgramArguments PATH-EXISTS ───────────────────────────
+    # Even before checking loaded state, verify the script the plist points to exists.
+    # A rebuild or stale patch can silently leave a plist pointing at a missing file.
+    if [ -f "$plist" ]; then
+      prog="$(_plist_program_path "$plist" 2>/dev/null)" || prog=""
+      if [ -n "$prog" ] && [ ! -f "$prog" ]; then
+        path_missing="$path_missing $lbl(missing:$prog)"
+        log "PATH-MISSING: $lbl ProgramArguments script not on disk: $prog"
+      fi
+    fi
+
     if _loaded "$lbl"; then
       ex="$(_last_exit "$lbl")"; ex="${ex:-0}"
       prev="$(_prev_exit "$lbl")"
@@ -206,6 +290,23 @@ run_sweep() {
       else
         healthy=$((healthy + 1))
       fi
+
+      # ── imp05 check 1: EXIT-CODE consecutive-failure tracking ─────────────
+      # Independently from crash-loop (which uses the STATE file), track consecutive
+      # nonzero exits in per-label fail-count files. This lets us raise a FAILING alert
+      # even when the prev/cur approach in crash-loop might miss it (e.g. state file
+      # cleared between checks). DPW_FAIL_THRESHOLD consecutive sweeps with exit>0.
+      if [ "$ex" -gt 0 ] 2>/dev/null; then
+        fc=$(( $(_fail_count_get "$lbl") + 1 ))
+        _fail_count_set "$lbl" "$fc"
+        if [ "$fc" -ge "${DPW_FAIL_THRESHOLD:-2}" ]; then
+          failing="$failing $lbl(exit=$ex,sweeps=$fc)"
+          log "FAILING: $lbl exiting non-zero (exit=$ex) for $fc consecutive sweeps"
+        fi
+      else
+        _fail_count_reset "$lbl"
+      fi
+
       # WEDGE: loaded but its per-cycle heartbeat log went stale past threshold = stuck.
       _hb="$(printf '%s\n' "$DPW_HEARTBEAT" | awk -F'|' -v l="$lbl" '$1==l{print $2"\t"$3; exit}')"
       if [ -n "$_hb" ]; then
@@ -223,6 +324,7 @@ run_sweep() {
       newstate="$newstate$lbl $ex"$'\n'
     else
       newstate="$newstate$lbl absent"$'\n'
+      _fail_count_reset "$lbl"   # reset on absence (will be loaded fresh)
       if [ -f "$plist" ]; then
         absent="$absent $lbl"
         if [ "$DPW_RELOAD" = "1" ] && launchctl bootstrap "gui/$UID_NUM" "$plist" 2>/dev/null; then
@@ -239,14 +341,54 @@ run_sweep() {
 
   printf '%s' "$newstate" > "$STATE" 2>/dev/null || true
 
-  if [ -n "$absent" ] || [ -n "$crashloop" ] || [ -n "$wedged" ]; then
+  # ── imp05 check 3: binary-provenance ─────────────────────────────────────
+  local provenance_alerts=""
+  if [ "${DPW_CHECK_GC_PROVENANCE:-1}" = "1" ]; then
+    local _gc_bin; _gc_bin="$(command -v gc 2>/dev/null)" || _gc_bin=""
+    if [ -n "$_gc_bin" ]; then
+      local _pv_rc=0
+      _binary_has_marker "$_gc_bin" "${DPW_GC_PROVENANCE_MARKER:-IsTransientDoltError}" || _pv_rc=$?
+      if [ "$_pv_rc" -eq 1 ]; then
+        local _pv_msg="gc rebuild reverted Dolt-resilience (marker '${DPW_GC_PROVENANCE_MARKER:-IsTransientDoltError}' absent from binary)"
+        provenance_alerts="$provenance_alerts gc-missing-marker"
+        log "PROVENANCE-FAIL: $_pv_msg"
+        _alert "gc binary provenance" "$_pv_msg"
+      elif [ "$_pv_rc" -eq 2 ]; then
+        log "PROVENANCE-SKIP: gc binary not readable by strings — skipping"
+      fi
+    else
+      log "PROVENANCE-SKIP: gc not on PATH — skipping gc provenance check"
+    fi
+  fi
+  if [ "${DPW_CHECK_GT_PROVENANCE:-1}" = "1" ]; then
+    local _gt_bin; _gt_bin="$(command -v gt 2>/dev/null)" || _gt_bin=""
+    if [ -n "$_gt_bin" ]; then
+      local _gtpv_rc=0
+      _binary_has_marker "$_gt_bin" "${DPW_GT_PROVENANCE_MARKER:-BuiltProperly}" || _gtpv_rc=$?
+      if [ "$_gtpv_rc" -eq 1 ]; then
+        local _gtpv_msg="gt binary was NOT built with Makefile (marker '${DPW_GT_PROVENANCE_MARKER:-BuiltProperly}' absent) — plain go build silently breaks runtime"
+        provenance_alerts="$provenance_alerts gt-missing-marker"
+        log "PROVENANCE-FAIL: $_gtpv_msg"
+        _alert "gt binary provenance" "$_gtpv_msg"
+      elif [ "$_gtpv_rc" -eq 2 ]; then
+        log "PROVENANCE-SKIP: gt binary not readable by strings — skipping"
+      fi
+    else
+      log "PROVENANCE-SKIP: gt not on PATH — skipping gt provenance check"
+    fi
+  fi
+
+  if [ -n "$absent" ] || [ -n "$crashloop" ] || [ -n "$failing" ] || [ -n "$wedged" ] || [ -n "$path_missing" ]; then
     local msg="Daemon-presence watchdog:"
-    [ -n "$absent" ]    && msg="$msg ABSENT:${absent} (reloaded:${reloaded:- none})."
-    [ -n "$crashloop" ] && msg="$msg CRASH-LOOP:${crashloop} (loaded but failing — NOT reloaded, investigate)."
-    [ -n "$wedged" ]    && msg="$msg WEDGED:${wedged} (loaded but heartbeat stale — kickstarted)."
+    [ -n "$absent" ]      && msg="$msg ABSENT:${absent} (reloaded:${reloaded:- none})."
+    [ -n "$crashloop" ]   && msg="$msg CRASH-LOOP:${crashloop} (loaded but failing — NOT reloaded, investigate)."
+    [ -n "$failing" ]     && msg="$msg FAILING:${failing} (nonzero exit ≥${DPW_FAIL_THRESHOLD} consecutive sweeps — investigate)."
+    [ -n "$wedged" ]      && msg="$msg WEDGED:${wedged} (loaded but heartbeat stale — kickstarted)."
+    [ -n "$path_missing" ] && msg="$msg PATH-MISSING:${path_missing} (ProgramArguments script absent from disk — daemon will fail on restart)."
     log "ALERT $msg"
     command -v notify >/dev/null 2>&1 && notify -t "Daemon watchdog" -p 4 "$msg" 2>/dev/null || true
-    command -v gc >/dev/null 2>&1 && gc mail send mayor -s "Daemon-presence: critical daemon absent/crash-looping/wedged" -m "$msg" 2>/dev/null || true
+    command -v gc >/dev/null 2>&1 && gc mail send mayor -s "Daemon-presence: critical daemon absent/crash-looping/failing/wedged/path-missing" -m "$msg" 2>/dev/null || true
+    _ledger_touch "sweep-alert" "$msg"
     return 1
   fi
   log "OK: all $(echo $DPW_CRITICAL | wc -w | tr -d ' ') critical daemons loaded + healthy (heartbeat)"
@@ -290,12 +432,28 @@ STUB
   export DPW_TEST_BOOTSTRAPS="$TMP/bootstraps"; : > "$DPW_TEST_BOOTSTRAPS"
   export DPW_TEST_KICKSTARTS="$TMP/kicks";      : > "$DPW_TEST_KICKSTARTS"
   DPW_HEARTBEAT=""   # scenarios 1–5 do not exercise the wedge check; 6–7 set it explicitly
-  : > "$LAUNCH_DIR/com.gascity.alpha.plist"
-  : > "$LAUNCH_DIR/com.gascity.beta.plist"
-  : > "$LAUNCH_DIR/com.gascity.gamma.plist"
+  # Minimal valid plist for all 3 test labels (pointing at a real script for path checks)
+  for _lbl in com.gascity.alpha com.gascity.beta com.gascity.gamma; do
+    cat > "$LAUNCH_DIR/$_lbl.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$_lbl</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string>
+    <string>$TMP/fake-script.sh</string>
+  </array>
+</dict></plist>
+PLIST
+  done
+  # A real script that exists (used for path-exists positive cases)
+  printf '#!/bin/bash\nexit 0\n' > "$TMP/fake-script.sh"; chmod +x "$TMP/fake-script.sh"
 
   export DPW_TEST_LOADED DPW_TEST_EXIT DPW_RELOAD   # exported so the stub subprocess sees them
   ALL="com.gascity.alpha com.gascity.beta com.gascity.gamma"
+
+  # Disable provenance checks for scenarios 1-12 (tested explicitly in scenarios 13-17)
+  DPW_CHECK_GC_PROVENANCE=0; DPW_CHECK_GT_PROVENANCE=0
 
   echo "Scenario 1: all loaded + clean → OK (exit 0), no bootstrap"
   DPW_RELOAD=1; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT=""
@@ -313,17 +471,17 @@ STUB
   DPW_RELOAD=1
 
   echo "Scenario 4: crash-loop needs TWO consecutive nonzero exits"
-  : > "$STATE"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT="com.gascity.beta:1"
+  : > "$STATE"; rm -rf "${STATE}.fail-counts"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT="com.gascity.beta:1"
   run_sweep && ok "single nonzero exit does NOT alert (transient)" || bad "transient nonzero exit falsely alerted"
   run_sweep && bad "2nd consecutive nonzero should alert (return 1)" || ok "persistent crash-loop alerts on 2nd consecutive nonzero exit"
 
   echo "Scenario 5: negative exit (signal restart) is NOT a crash-loop"
-  : > "$STATE"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT="com.gascity.beta:-15"
+  : > "$STATE"; rm -rf "${STATE}.fail-counts"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT="com.gascity.beta:-15"
   run_sweep >/dev/null 2>&1
   run_sweep && ok "signal exit (-15) never treated as crash-loop" || bad "signal exit falsely flagged as crash-loop"
 
   echo "Scenario 6: loaded daemon with a STALE heartbeat log → WEDGED + kickstart"
-  : > "$STATE"; : > "$DPW_TEST_KICKSTARTS"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT=""
+  : > "$STATE"; rm -rf "${STATE}.fail-counts"; : > "$DPW_TEST_KICKSTARTS"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT=""
   HB="$TMP/beta-hb.log"; DPW_HEARTBEAT="com.gascity.beta|$HB|300"
   touch -t "$(date -v-1H +%Y%m%d%H%M 2>/dev/null || echo 202601010000)" "$HB"   # mtime ~1h ago
   run_sweep && bad "wedged should return 1" || ok "wedged daemon (stale heartbeat) returns 1 (alert)"
@@ -422,6 +580,83 @@ GCSTUB
 
   # Restore _rss_mb to real implementation for subsequent use.
   unset -f _rss_mb
+
+  # ── imp05 selftest scenarios 13–17 ───────────────────────────────────────
+  # Re-enable provenance checks; use stub strings/gc/gt binaries.
+  DPW_CHECK_GC_PROVENANCE=1; DPW_CHECK_GT_PROVENANCE=1
+  DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT=""; : > "$STATE"; rm -rf "${STATE}.fail-counts"
+  # Restore gc stub from the chronic-leak scenario back to silent-success.
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/gc"; chmod +x "$TMP/gc"
+
+  echo "Scenario 13 (imp05): exit-code consecutive-failure tracking (FAILING alert after DPW_FAIL_THRESHOLD sweeps)"
+  # Use threshold=3 and clear STATE before each sweep so crash-loop (which needs prev in STATE)
+  # never fires independently — we isolate just the FAILING counter logic.
+  rm -rf "${STATE}.fail-counts"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT="com.gascity.alpha:2"
+  DPW_FAIL_THRESHOLD=3
+  : > "$STATE"; run_sweep && ok "1st nonzero exit: no FAILING alert yet (threshold=3)" || bad "1st nonzero exit falsely triggered FAILING alert"
+  : > "$STATE"; run_sweep && ok "2nd nonzero exit: still below threshold (threshold=3)" || bad "2nd nonzero exit falsely triggered FAILING alert"
+  : > "$STATE"; run_sweep && bad "3rd consecutive nonzero: FAILING alert should fire" || ok "3rd consecutive nonzero triggers FAILING alert (return 1)"
+  # Reset and confirm a clean sweep clears the counter
+  DPW_TEST_EXIT=""; : > "$STATE"
+  run_sweep && ok "clean exit after failure: clears counter (no alert)" || bad "clean sweep after failure returned non-zero unexpectedly"
+  DPW_FAIL_THRESHOLD=2   # restore default
+
+  echo "Scenario 14 (imp05): ProgramArguments PATH-EXISTS — script missing from disk → PATH-MISSING alert"
+  rm -rf "${STATE}.fail-counts"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT=""
+  # Rewrite beta's plist to point at a non-existent script.
+  MISSING_SCRIPT="$TMP/nonexistent-script.sh"
+  cat > "$LAUNCH_DIR/com.gascity.beta.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gascity.beta</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string>
+    <string>$MISSING_SCRIPT</string>
+  </array>
+</dict></plist>
+PLIST
+  run_sweep && bad "PATH-MISSING beta: should return 1 (alert)" || ok "PATH-MISSING: plist pointing to absent script triggers alert (return 1)"
+  grep -q "PATH-MISSING" "$LOG" && ok "PATH-MISSING: logged PATH-MISSING entry" || bad "PATH-MISSING: no log entry found"
+  # Restore beta's plist to valid script
+  cat > "$LAUNCH_DIR/com.gascity.beta.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gascity.beta</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string>
+    <string>$TMP/fake-script.sh</string>
+  </array>
+</dict></plist>
+PLIST
+
+  echo "Scenario 15 (imp05): ProgramArguments PATH-EXISTS — script present → no PATH-MISSING alert"
+  rm -rf "${STATE}.fail-counts"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT=""
+  run_sweep && ok "PATH-EXISTS: all scripts present → no alert (return 0)" || bad "PATH-EXISTS: falsely triggered PATH-MISSING"
+
+  echo "Scenario 16 (imp05): binary-provenance — gc missing marker → PROVENANCE-FAIL alert"
+  rm -rf "${STATE}.fail-counts"; : > "$LOG"; : > "$STATE"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT=""
+  DPW_CHECK_GC_PROVENANCE=1; DPW_CHECK_GT_PROVENANCE=0   # isolate gc test
+  DPW_GC_PROVENANCE_MARKER="IsTransientDoltError"
+  # Override _binary_has_marker to simulate missing marker (return 1 = not found).
+  # Provenance failures are logged via _alert but do NOT cause run_sweep to return non-zero.
+  _binary_has_marker() { return 1; }
+  run_sweep || true   # sweep may or may not return non-zero; we only check the log
+  grep -q "PROVENANCE-FAIL" "$LOG" && ok "gc missing marker: PROVENANCE-FAIL logged" || bad "gc missing marker: PROVENANCE-FAIL not logged"
+  # Also verify the log says "gc rebuild reverted" (the specific message)
+  grep -q "gc rebuild reverted Dolt-resilience" "$LOG" && ok "gc missing marker: correct Dolt-resilience message logged" || bad "gc missing marker: Dolt-resilience message not found in log"
+  unset -f _binary_has_marker
+
+  echo "Scenario 17 (imp05): binary-provenance — gc has marker → no alert"
+  rm -rf "${STATE}.fail-counts"; : > "$LOG"; : > "$STATE"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT=""
+  DPW_CHECK_GC_PROVENANCE=1; DPW_CHECK_GT_PROVENANCE=0
+  # Override _binary_has_marker to simulate marker present (return 0 = found).
+  _binary_has_marker() { return 0; }
+  run_sweep && ok "gc marker present: sweep returns 0 (no alert)" || bad "gc marker present: unexpected non-zero"
+  grep -q "PROVENANCE-FAIL" "$LOG" && bad "gc marker present: PROVENANCE-FAIL wrongly logged" || ok "gc marker present: no PROVENANCE-FAIL in log"
+  unset -f _binary_has_marker
+  DPW_CHECK_GC_PROVENANCE=1; DPW_CHECK_GT_PROVENANCE=1
 
   echo ""
   echo "daemon-presence-watchdog selftest: PASS=$PASS FAIL=$FAIL"
