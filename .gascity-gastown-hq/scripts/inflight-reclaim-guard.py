@@ -675,16 +675,50 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels):
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] warn: set reclaim-count label {bead_id}: {exc}", flush=True)
 
+    # 3b. ga-l5ud0 FIX #2: re-loop cooldown — stamp pilot:held + pilot:held-until:<now+1h>
+    #     on the 2nd+ reclaim (reclaim_count >= 1) to prevent the Pilot from immediately
+    #     re-dispatching to the same crew pool before the underlying routing issue is resolved.
+    #     ROOT: a bead repeatedly dispatched→abandoned (no branch, crew declines or is off-domain)
+    #     re-enters the open pool on reclaim and Pilot picks the same crew again on the next
+    #     3-min sweep — the re-stamp loop. imp19's pilot:held mechanism exists in the Pilot's
+    #     domain-route-guard (for the DEFER path), but is never stamped after a reclaim.
+    #     Stamping it here closes the gap: the Pilot's _filter_candidates honors pilot:held,
+    #     so the bead is invisible to auto-dispatch for 1h, giving a Mayor sweep time to
+    #     triage and re-route or assign an explicit owner.
+    #     THRESHOLD: only on reclaim_count >= 1 (2nd+ reclaim without progress). A first-time
+    #     reclaim may be a transient crew churn (config drift, restart); we don't hold on that.
+    #     FAIL-OPEN: if the bd calls fail, the hold is not stamped — identical to pre-fix
+    #     behaviour (Pilot may re-dispatch, which is acceptable on a first-time transient).
+    #     Env-gate: RECLAIM_RELOOP_HOLD_SECS (default 3600 = 1h). Set 0 to disable.
+    _reloop_hold = int(os.environ.get("RECLAIM_RELOOP_HOLD_SECS", "3600"))
+    if reclaim_count >= 1 and _reloop_hold > 0:
+        _held_until = int(time.time()) + _reloop_hold
+        try:
+            subprocess.run(
+                ["bd", "label", "add", bead_id, "pilot:held", "-q"],
+                capture_output=True, text=True, timeout=15)
+            subprocess.run(
+                ["bd", "label", "add", bead_id, f"pilot:held-until:{_held_until}", "-q"],
+                capture_output=True, text=True, timeout=15)
+            print(f"[INFLIGHT-RECLAIM] ga-l5ud0: {bead_id} stamped pilot:held (reloop-cooldown, reclaim {new_count}, hold {_reloop_hold}s until {_held_until})",
+                  flush=True)
+        except Exception as _exc:
+            print(f"[INFLIGHT-RECLAIM] warn: could not stamp pilot:held cooldown on {bead_id}: {_exc}",
+                  flush=True)
+
     # 4. Audit comment
     cleared = " + ".join(l for l in ("story:in-flight", "pilot:dispatched")
                          if l in labels) or "(no in-flight label)"
+    _hold_note = (f" pilot:held stamped for {_reloop_hold//60}min cooldown to prevent re-loop (reclaim {new_count-1}+)."
+                  if reclaim_count >= 1 and _reloop_hold > 0 else "")
     try:
         subprocess.run(
             ["bd", "comment", bead_id,
              f"inflight-reclaim-guard (ga-se62o): reclaimed — no live builder and "
              f"no recent branch progress for {idle_min:.0f}min "
              f"(> {RECLAIM_TTL//60}min TTL). {cleared} "
-             f"cleared; assignee unset; status reset to open (ga-vw26y). "
+             f"cleared; assignee unset; status reset to open (ga-vw26y)."
+             f"{_hold_note} "
              f"Pilot will re-dispatch. (reclaim {new_count}/{MAX_RECLAIMS})"],
             capture_output=True, text=True, timeout=15)
     except Exception:

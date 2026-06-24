@@ -1921,6 +1921,41 @@ has "$DISPATCHER" 'ga-nlh79'                            "ga-nlh79 owner-authorit
 has "$DISPATCHER" 'PILOT_OWNER_RIG_GUARD'               "PILOT_OWNER_RIG_GUARD env-gate is wired"
 has "$DISPATCHER" 'owner-authoritative rig'             "ga-nlh79 log message wired"
 
+# ── Scenario 18l (ga-l5ud0): launchd bundle-ID strip — bead_content_rig must NOT
+# match "whatsapp" from a plist bundle-ID token (com.whatsapp.peter-predeploy-check).
+# ROOT: ga-h55xa "repointar com.whatsapp.peter-predeploy-check pra root worktree" was
+# classified as whatsapp_automation because bare "whatsapp" matched the WA-integration
+# precedence regex — the plist daemon name, NOT the bead's actual domain. Fix: strip
+# reverse-DNS bundle-ID patterns (com.<word>.<word>) before the regex fires.
+echo "Scenario 18l (ga-l5ud0): launchd bundle-ID in bead → NOT whatsapp_automation (FIX #1)"
+_BCR_FN18L="$(awk '/^bead_content_rig\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_bcr_18l() { ( eval "$_BCR_FN18L"; bead_content_rig "$1" ); }
+# ga-h55xa fixture: plist bundle-ID in title/description — infra/peter domain, NOT WA
+PETER_PLIST='{"id":"ga-h55xa","title":"Produção canônica (peter): repointar com.whatsapp.peter-predeploy-check pra root worktree","description":"launchd com.whatsapp.peter-predeploy-check roda de crew/peter/scripts/peter/predeploy_check.sh. AÇÃO: repointar plist pra scripts/peter/predeploy_check.sh","labels":["ctx:ready","exec:manual"]}'
+PLIST_RIG="$(_bcr_18l "$PETER_PLIST")"
+if [ "$PLIST_RIG" = "whatsapp_automation" ]; then
+  bad "REGRESSION (ga-l5ud0): com.whatsapp.peter plist bundle-ID still misroutes to whatsapp_automation — bundle-ID strip not applied"
+elif [ -z "$PLIST_RIG" ]; then
+  ok "ga-l5ud0: com.whatsapp.* plist bundle-ID stripped → no domain inferred (infra/HQ, correct)"
+else
+  ok "ga-l5ud0: plist bead classified as '$PLIST_RIG' (not WA — bundle-ID strip working)"
+fi
+# Preservation: a genuine WA messaging bead must still → whatsapp_automation
+LEGIT_WA='{"id":"ga-watest","title":"integrar whatsapp via whapi para disparo de mensagem","description":"envio de mensagem automatica via pipedrive","labels":["lane:small"]}'
+LEGIT_RIG="$(_bcr_18l "$LEGIT_WA")"
+[ "$LEGIT_RIG" = "whatsapp_automation" ] \
+  && ok "ga-l5ud0 preservation: genuine WA messaging bead still → whatsapp_automation" \
+  || bad "REGRESSION (ga-l5ud0): genuine WA bead broken by bundle-ID strip: '$LEGIT_RIG'"
+# Verify: com.gascity.* bundle-IDs also stripped (no infra plist names leak domain)
+GASCITY_PLIST='{"id":"ga-infra","title":"repointar com.gascity.context-check-dispatcher para scripts/","description":"o daemon com.gascity.pilot-dispatcher.plist aponta pro diretório errado","labels":[]}'
+GC_RIG="$(_bcr_18l "$GASCITY_PLIST")"
+[ "$GC_RIG" = "whatsapp_automation" ] \
+  && bad "REGRESSION (ga-l5ud0): com.gascity.* plist still matches WA regex — bundle-ID strip incomplete" \
+  || ok "ga-l5ud0: com.gascity.* infra plist → no WA match (correct)"
+echo "Scenario 18l: drift-guard — bundle-ID strip is wired into bead_content_rig"
+has "$DISPATCHER" 'ga-l5ud0 FIX #1'                    "ga-l5ud0 bundle-ID strip comment wired"
+has "$DISPATCHER" 'bundle-ID'                           "bundle-ID strip keyword wired"
+
 # ── Scenario 19 (wa-u5r1): dispatchable-queue emit for the painel ─────────────
 echo "Scenario 19a: emit writes valid JSON with the contract shape + count + items"
 F19="$(run_emit)"

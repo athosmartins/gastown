@@ -595,6 +595,16 @@ bead_content_rig() {
         ((.labels // []) | join(" ")) ] | join("  ")
     ' 2>/dev/null || echo "")
   [ -z "$hay" ] && { echo ""; return 0; }
+  # ga-l5ud0 FIX #1: strip launchd bundle-ID tokens (e.g. "com.whatsapp.peter-predeploy-check",
+  # "com.gascity.pilot-dispatcher") from the haystack BEFORE any domain regex fires.
+  # A launchd bundle-ID is an infra/config reference, NOT a domain-content signal — it names a
+  # daemon, not the work's subject. Without this strip, a bead about repointar peter's plist
+  # contains "com.whatsapp.peter-predeploy-check" and the bare `whatsapp` substring falsely wins
+  # the WA-INTEGRATION PRECEDENCE check below, routing a peter/infra bead to mila-wa.
+  # Pattern: com.<word>.<word...> — matches dotted reverse-DNS bundle IDs only.
+  # BSD sed: use -E for extended regex; the substitution is global (/g).
+  # FAIL-OPEN: if sed fails (never observed), hay is left intact — same as pre-fix behaviour.
+  hay=$(printf '%s' "$hay" | sed -E 's/com\.[a-zA-Z0-9_-]+(\.[a-zA-Z0-9_.-]+)+//g' 2>/dev/null || printf '%s' "$hay")
   # WA-INTEGRATION PRECEDENCE (ga-lt8cw/ga-nq64a, 2026-06-19; +painel/kanban 2026-06-22):
   # the WA orchestration/integration layer — pipedrive deals, whapi/whatsapp messaging, the
   # urblink PAINEL (painel.urblink.com.br: kanban, filter pills, dashboards), and the Drive
