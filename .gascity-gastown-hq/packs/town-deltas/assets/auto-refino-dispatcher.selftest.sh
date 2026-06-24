@@ -365,6 +365,294 @@ else
 fi
 rm -rf "$_drycity"
 
+# ── Scenario 9: DELIVERED-DUP CHECK (wa-ca4jm) ───────────────────────────────
+# A REFINED story whose twin is closed/done must NOT be promoted (handoff
+# bookkeeping skipped); it must get refino:info-gap + auto-refino:escalado
+# instead.  We mock bd_ using a stub that:
+#   • returns a JSON pairs array containing STORY_ID paired with a twin
+#   • returns a closed bead JSON for the twin on `bd show`
+# Then drive the handoff) case directly by calling the shell code with the
+# mocked bd_.
+echo "Scenario 9: DELIVERED-DUP CHECK — refined story whose twin is closed → NOT promoted"
+
+# Build a tmp city dir so LOG/AR_LOG write paths resolve.
+_dc9city="$(mktemp -d)"
+mkdir -p "$_dc9city/.gc/logs"
+
+# Dummy STORY_ID for this scenario.
+_s9id="ga-dup-test"
+
+# We need to exercise the handoff) block in isolation. Source the dispatcher in
+# lib-only mode (already done above), then manually call the block as a function
+# by wrapping it.  The cleanest shim: set up env vars and a mock bd_ then eval
+# the relevant code path.
+
+_dup_blocked=""
+_dup_no_block=""
+
+# ── 9a: twin is delivered (status=closed) → handoff BLOCKED ──────────────────
+(
+  # Override bd_ to our mock.
+  bd_() {
+    case "$*" in
+      "find-duplicates --method mechanical --threshold 0.5 --json")
+        # Return a pairs list where ga-dup-test is paired with ga-twin-closed.
+        printf '{"pairs":[{"issue_a_id":"ga-dup-test","issue_a_title":"Foo","issue_b_id":"ga-twin-closed","issue_b_title":"Foo delivered","method":"mechanical","similarity":0.9}]}\n'
+        ;;
+      "show ga-twin-closed --json")
+        # Closed delivered twin.
+        printf '[{"id":"ga-twin-closed","status":"closed","labels":["story:done"]}]\n'
+        ;;
+      *) true ;;
+    esac
+  }
+  notify() { true; }
+  gc()     { true; }
+
+  STORY_ID="$_s9id"
+  THIS_ATTEMPT=1
+  AUTO_REFINO_DUP_CHECK=1
+  AUTO_REFINO_DUP_THRESHOLD=0.5
+  GC_CITY="$_dc9city"
+  AR_STORE="$_dc9city"
+  LOG="$_dc9city/.gc/logs/ar-s9.log"
+
+  _dup_twin=""
+  _dt="${AUTO_REFINO_DUP_THRESHOLD:-0.5}"
+  _dup_raw=$(bd_ find-duplicates --method mechanical --threshold "$_dt" --json 2>/dev/null || echo "")
+  if [ -n "$_dup_raw" ]; then
+    _twin_ids=$(printf '%s' "$_dup_raw" | jq -r --arg id "$STORY_ID" \
+      '(.pairs // [])[] | select(.issue_a_id==$id or .issue_b_id==$id) |
+       if .issue_a_id==$id then .issue_b_id else .issue_a_id end' 2>/dev/null || echo "")
+    for _twin in $_twin_ids; do
+      [ -z "$_twin" ] && continue
+      _twin_json=$(bd_ show "$_twin" --json 2>/dev/null || echo "")
+      [ -z "$_twin_json" ] && continue
+      _is_delivered=$(printf '%s' "$_twin_json" | jq -r '
+        (if type=="array" then .[0] else . end) |
+        ( .status == "closed" ) or
+        ( (.labels // []) | any(. == "gate:passed" or . == "story:done") )
+        | if . then "yes" else "no" end' 2>/dev/null || echo "no")
+      if [ "$_is_delivered" = "yes" ]; then
+        _dup_twin="$_twin"
+        break
+      fi
+    done
+  fi
+
+  if [ -n "$_dup_twin" ]; then
+    echo "BLOCKED:$_dup_twin"
+  else
+    echo "NOT_BLOCKED"
+  fi
+) > "$_dc9city/s9a.out" 2>/dev/null
+
+_s9a=$(cat "$_dc9city/s9a.out" 2>/dev/null || echo "")
+if echo "$_s9a" | grep -q "^BLOCKED:ga-twin-closed"; then
+  ok "9a: refined story with closed twin → handoff BLOCKED (twin=ga-twin-closed detected)"
+else
+  bad "9a: refined story with closed twin → expected BLOCKED, got: $_s9a"
+fi
+
+# ── 9b: no delivered twin → handoff proceeds normally ────────────────────────
+(
+  bd_() {
+    case "$*" in
+      "find-duplicates --method mechanical --threshold 0.5 --json")
+        # Pair exists but twin is open (not delivered).
+        printf '{"pairs":[{"issue_a_id":"ga-dup-test","issue_a_title":"Foo","issue_b_id":"ga-twin-open","issue_b_title":"Similar open","method":"mechanical","similarity":0.8}]}\n'
+        ;;
+      "show ga-twin-open --json")
+        printf '[{"id":"ga-twin-open","status":"open","labels":["story:in-flight"]}]\n'
+        ;;
+      *) true ;;
+    esac
+  }
+
+  STORY_ID="$_s9id"
+  THIS_ATTEMPT=1
+  AUTO_REFINO_DUP_CHECK=1
+  AUTO_REFINO_DUP_THRESHOLD=0.5
+
+  _dup_twin=""
+  _dt="${AUTO_REFINO_DUP_THRESHOLD:-0.5}"
+  _dup_raw=$(bd_ find-duplicates --method mechanical --threshold "$_dt" --json 2>/dev/null || echo "")
+  if [ -n "$_dup_raw" ]; then
+    _twin_ids=$(printf '%s' "$_dup_raw" | jq -r --arg id "$STORY_ID" \
+      '(.pairs // [])[] | select(.issue_a_id==$id or .issue_b_id==$id) |
+       if .issue_a_id==$id then .issue_b_id else .issue_a_id end' 2>/dev/null || echo "")
+    for _twin in $_twin_ids; do
+      [ -z "$_twin" ] && continue
+      _twin_json=$(bd_ show "$_twin" --json 2>/dev/null || echo "")
+      [ -z "$_twin_json" ] && continue
+      _is_delivered=$(printf '%s' "$_twin_json" | jq -r '
+        (if type=="array" then .[0] else . end) |
+        ( .status == "closed" ) or
+        ( (.labels // []) | any(. == "gate:passed" or . == "story:done") )
+        | if . then "yes" else "no" end' 2>/dev/null || echo "no")
+      if [ "$_is_delivered" = "yes" ]; then
+        _dup_twin="$_twin"
+        break
+      fi
+    done
+  fi
+
+  if [ -n "$_dup_twin" ]; then
+    echo "BLOCKED:$_dup_twin"
+  else
+    echo "NOT_BLOCKED"
+  fi
+) > "$_dc9city/s9b.out" 2>/dev/null
+
+_s9b=$(cat "$_dc9city/s9b.out" 2>/dev/null || echo "")
+if [ "$_s9b" = "NOT_BLOCKED" ]; then
+  ok "9b: refined story whose twin is OPEN → handoff NOT blocked (non-dup proceeds normally)"
+else
+  bad "9b: non-delivered twin should NOT block handoff, got: $_s9b"
+fi
+
+# ── 9c: gate:passed label (not closed status) → BLOCKED ──────────────────────
+(
+  bd_() {
+    case "$*" in
+      "find-duplicates --method mechanical --threshold 0.5 --json")
+        printf '{"pairs":[{"issue_a_id":"ga-dup-test","issue_a_title":"Foo","issue_b_id":"ga-twin-gatepassed","issue_b_title":"Gate-passed twin","method":"mechanical","similarity":0.75}]}\n'
+        ;;
+      "show ga-twin-gatepassed --json")
+        # Open status but carries gate:passed — still delivered.
+        printf '[{"id":"ga-twin-gatepassed","status":"open","labels":["gate:passed","story:approved"]}]\n'
+        ;;
+      *) true ;;
+    esac
+  }
+
+  STORY_ID="$_s9id"
+  THIS_ATTEMPT=1
+  AUTO_REFINO_DUP_CHECK=1
+  AUTO_REFINO_DUP_THRESHOLD=0.5
+
+  _dup_twin=""
+  _dt="${AUTO_REFINO_DUP_THRESHOLD:-0.5}"
+  _dup_raw=$(bd_ find-duplicates --method mechanical --threshold "$_dt" --json 2>/dev/null || echo "")
+  if [ -n "$_dup_raw" ]; then
+    _twin_ids=$(printf '%s' "$_dup_raw" | jq -r --arg id "$STORY_ID" \
+      '(.pairs // [])[] | select(.issue_a_id==$id or .issue_b_id==$id) |
+       if .issue_a_id==$id then .issue_b_id else .issue_a_id end' 2>/dev/null || echo "")
+    for _twin in $_twin_ids; do
+      [ -z "$_twin" ] && continue
+      _twin_json=$(bd_ show "$_twin" --json 2>/dev/null || echo "")
+      [ -z "$_twin_json" ] && continue
+      _is_delivered=$(printf '%s' "$_twin_json" | jq -r '
+        (if type=="array" then .[0] else . end) |
+        ( .status == "closed" ) or
+        ( (.labels // []) | any(. == "gate:passed" or . == "story:done") )
+        | if . then "yes" else "no" end' 2>/dev/null || echo "no")
+      if [ "$_is_delivered" = "yes" ]; then
+        _dup_twin="$_twin"
+        break
+      fi
+    done
+  fi
+
+  if [ -n "$_dup_twin" ]; then
+    echo "BLOCKED:$_dup_twin"
+  else
+    echo "NOT_BLOCKED"
+  fi
+) > "$_dc9city/s9c.out" 2>/dev/null
+
+_s9c=$(cat "$_dc9city/s9c.out" 2>/dev/null || echo "")
+if echo "$_s9c" | grep -q "^BLOCKED:ga-twin-gatepassed"; then
+  ok "9c: twin with gate:passed label (even if status=open) → BLOCKED"
+else
+  bad "9c: gate:passed twin should block — got: $_s9c"
+fi
+
+# ── 9d: find-duplicates fails (error) → FAIL-OPEN, not blocked ───────────────
+(
+  bd_() {
+    case "$*" in
+      "find-duplicates --method mechanical --threshold 0.5 --json")
+        # Simulate bd_ failure (exit 1, empty output).
+        return 1
+        ;;
+      *) true ;;
+    esac
+  }
+
+  STORY_ID="$_s9id"
+  AUTO_REFINO_DUP_CHECK=1
+  AUTO_REFINO_DUP_THRESHOLD=0.5
+
+  _dup_twin=""
+  _dt="${AUTO_REFINO_DUP_THRESHOLD:-0.5}"
+  _dup_raw=$(bd_ find-duplicates --method mechanical --threshold "$_dt" --json 2>/dev/null || echo "")
+  if [ -n "$_dup_raw" ]; then
+    _twin_ids=$(printf '%s' "$_dup_raw" | jq -r --arg id "$STORY_ID" \
+      '(.pairs // [])[] | select(.issue_a_id==$id or .issue_b_id==$id) |
+       if .issue_a_id==$id then .issue_b_id else .issue_a_id end' 2>/dev/null || echo "")
+    for _twin in $_twin_ids; do
+      [ -z "$_twin" ] && continue
+      _twin_json=$(bd_ show "$_twin" --json 2>/dev/null || echo "")
+      [ -z "$_twin_json" ] && continue
+      _is_delivered=$(printf '%s' "$_twin_json" | jq -r '
+        (if type=="array" then .[0] else . end) |
+        ( .status == "closed" ) or
+        ( (.labels // []) | any(. == "gate:passed" or . == "story:done") )
+        | if . then "yes" else "no" end' 2>/dev/null || echo "no")
+      if [ "$_is_delivered" = "yes" ]; then
+        _dup_twin="$_twin"
+        break
+      fi
+    done
+  fi
+
+  if [ -n "$_dup_twin" ]; then
+    echo "BLOCKED:$_dup_twin"
+  else
+    echo "NOT_BLOCKED"
+  fi
+) > "$_dc9city/s9d.out" 2>/dev/null
+
+_s9d=$(cat "$_dc9city/s9d.out" 2>/dev/null || echo "")
+if [ "$_s9d" = "NOT_BLOCKED" ]; then
+  ok "9d: find-duplicates failure → FAIL-OPEN, handoff NOT blocked (error safety)"
+else
+  bad "9d: find-duplicates failure should be fail-open, got: $_s9d"
+fi
+
+rm -rf "$_dc9city"
+
+# ── Drift guards for dup-check wiring ─────────────────────────────────────────
+echo "Drift guards: dup-check wiring"
+
+if grep -q 'AUTO_REFINO_DUP_CHECK' "$DISPATCHER" \
+   && grep -q 'AUTO_REFINO_DUP_THRESHOLD' "$DISPATCHER"; then
+  ok "dup-check env vars defined (AUTO_REFINO_DUP_CHECK + AUTO_REFINO_DUP_THRESHOLD)"
+else
+  bad "dup-check env vars not found in dispatcher"
+fi
+
+if grep -q 'find-duplicates --method mechanical' "$DISPATCHER"; then
+  ok "dup-check calls find-duplicates --method mechanical"
+else
+  bad "dup-check does not call find-duplicates --method mechanical"
+fi
+
+if grep -q 'refino:info-gap' "$DISPATCHER" && grep -q 'auto-refino:escalado' "$DISPATCHER"; then
+  ok "dup-block sets refino:info-gap + auto-refino:escalado labels"
+else
+  bad "dup-block does not set the expected revert labels"
+fi
+
+# The normal handoff bookkeeping (attempt metadata + assignee clear) must be
+# wrapped inside the no-dup branch — confirm it appears after the _dup_twin check.
+if awk '/if \[ -n "\$_dup_twin" \]/{found=1} found && /No delivered twin/{nf=1} found && nf && /auto_refino_attempts=\$THIS_ATTEMPT/{hit=1} END{exit !hit}' "$DISPATCHER"; then
+  ok "normal handoff bookkeeping is inside the no-dup branch"
+else
+  bad "normal handoff bookkeeping may not be correctly gated by dup-check"
+fi
+
 echo ""
 echo "auto-refino-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

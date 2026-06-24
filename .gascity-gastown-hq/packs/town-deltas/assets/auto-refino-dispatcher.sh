@@ -134,6 +134,24 @@ AUTO_REFINO_EXCLUDE_LABELS="${AUTO_REFINO_EXCLUDE_LABELS:-scraper build infra co
 # (labelled-input only — no raw ingestion).
 AUTO_REFINO_INGEST_RAW_TRIAGEM="${AUTO_REFINO_INGEST_RAW_TRIAGEM:-1}"
 
+# ── DELIVERED-DUPLICATE CHECK (wa-ca4jm) ──────────────────────────────────────
+# Before promoting a freshly-refined story to refino-gate, check whether a
+# DELIVERED twin already exists in the same store. A twin is "delivered" when
+# its status=closed OR it carries gate:passed OR story:done.  If one is found,
+# the handoff is blocked: the story is reverted to refino:info-gap +
+# auto-refino:escalado and Athos is paged — preventing the gate from re-approving
+# already-built work (wa-v3tz, wa-nvn9, wa-cqh5 slipped through this week).
+#
+# FAIL-OPEN: any error in the dup-check (bad JSON, bd failure) is swallowed and
+# the normal handoff proceeds — a false-negative is safer than a false-positive
+# blocking a non-dup story.
+# ENV:
+#   AUTO_REFINO_DUP_CHECK=1    (default ON; set 0 to disable entirely)
+#   AUTO_REFINO_DUP_THRESHOLD  similarity threshold passed to find-duplicates
+#                              (default 0.5 = bd's own default)
+AUTO_REFINO_DUP_CHECK="${AUTO_REFINO_DUP_CHECK:-1}"
+AUTO_REFINO_DUP_THRESHOLD="${AUTO_REFINO_DUP_THRESHOLD:-0.5}"
+
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -1133,17 +1151,65 @@ case "$DECISION" in
     # The refiner already wrote story:refino-review + removed auto-refino:refining.
     # The daemon only records the attempt + an audit comment. It does NOT promote
     # to needs-approval — that is the GATE's job. It does NOT dispatch.
-    bd_ update "$STORY_ID" --set-metadata "story.auto_refino_attempts=$THIS_ATTEMPT" -q 2>/dev/null || true
-    # Defensive: ensure the claim marker is gone even if the refiner forgot.
-    bd_ label remove "$STORY_ID" "auto-refino:refining" -q 2>/dev/null || true
-    # PHANTOM-ASSIGNEE FIX: the claim step set assignee=auto-refino so parallel
-    # refiners would not collide. The daemon is a launchd job, NOT a live crew —
-    # it can never "build". Once the story leaves our hands (handed to the gate),
-    # it must carry a NULL assignee, or the Pilot (which skips any bead with a
-    # non-null assignee) treats it as already-owned and NEVER dispatches the
-    # approved feature. Clear it at the terminal handoff. Idempotent / fail-open.
-    bd_ update "$STORY_ID" --assignee "" -q 2>/dev/null || true
-    log "  $STORY_ID → handed to refino gate (story:refino-review). Gate decides promotion."
+
+    # ── DELIVERED-DUPLICATE CHECK (wa-ca4jm) ────────────────────────────────
+    # Before completing the handoff, verify no DELIVERED twin exists in this
+    # store. FAIL-OPEN: any error → _dup_twin="" → proceed normally.
+    _dup_twin=""
+    if [ "${AUTO_REFINO_DUP_CHECK:-1}" = "1" ]; then
+      _dt="${AUTO_REFINO_DUP_THRESHOLD:-0.5}"
+      _dup_raw=$(bd_ find-duplicates --method mechanical --threshold "$_dt" --json 2>/dev/null || echo "")
+      if [ -n "$_dup_raw" ]; then
+        # Extract all twins of STORY_ID from the pairs list.
+        _twin_ids=$(printf '%s' "$_dup_raw" | jq -r --arg id "$STORY_ID" \
+          '(.pairs // [])[] | select(.issue_a_id==$id or .issue_b_id==$id) |
+           if .issue_a_id==$id then .issue_b_id else .issue_a_id end' 2>/dev/null || echo "")
+        for _twin in $_twin_ids; do
+          [ -z "$_twin" ] && continue
+          _twin_json=$(bd_ show "$_twin" --json 2>/dev/null || echo "")
+          [ -z "$_twin_json" ] && continue
+          # A twin is "delivered" if status=closed OR it carries gate:passed or story:done.
+          _is_delivered=$(printf '%s' "$_twin_json" | jq -r '
+            (if type=="array" then .[0] else . end) |
+            ( .status == "closed" ) or
+            ( (.labels // []) | any(. == "gate:passed" or . == "story:done") )
+            | if . then "yes" else "no" end' 2>/dev/null || echo "no")
+          if [ "$_is_delivered" = "yes" ]; then
+            _dup_twin="$_twin"
+            break
+          fi
+        done
+      fi
+    fi
+
+    if [ -n "$_dup_twin" ]; then
+      # DELIVERED duplicate found — block the handoff.
+      log "  $STORY_ID → DUP-BLOCKED: delivered twin $_dup_twin found — reverting to refino:info-gap + escalating to Athos."
+      bd_ label remove "$STORY_ID" "story:refino-review" -q 2>/dev/null || true
+      bd_ label remove "$STORY_ID" "auto-refino:refining" -q 2>/dev/null || true
+      bd_ label add "$STORY_ID" "refino:info-gap" -q 2>/dev/null || true
+      bd_ label add "$STORY_ID" "auto-refino:escalado" -q 2>/dev/null || true
+      bd_ update "$STORY_ID" --set-metadata "story.auto_refino_attempts=$THIS_ATTEMPT" -q 2>/dev/null || true
+      bd_ update "$STORY_ID" --assignee "" -q 2>/dev/null || true
+      bd_ comment "$STORY_ID" "Auto-refino: história BLOQUEADA — twin entregue detectado: $_dup_twin. Se for distinta, remova refino:info-gap + auto-refino:escalado e re-submeta." 2>/dev/null || true
+      bd_ dolt commit -m "auto-refino: dup-block $STORY_ID (twin=$_dup_twin)" 2>/dev/null || true
+      notify -t "Auto-refino: dup bloqueado $STORY_ID" -p 3 "Não promovi $STORY_ID ao gate — twin entregue: $_dup_twin. Verifique se são histórias distintas." 2>/dev/null || true
+      gc --city "$GC_CITY" mail send mayor -s "Auto-refino: dup-block em $STORY_ID" \
+        -m "$STORY_ID (refinada, pronta pro gate) bloqueada: twin entregue encontrado ($_dup_twin). Labels: refino:info-gap + auto-refino:escalado. Se forem histórias distintas, remova esses labels e o gate retomará." 2>/dev/null || true
+    else
+      # No delivered twin — complete the normal handoff.
+      bd_ update "$STORY_ID" --set-metadata "story.auto_refino_attempts=$THIS_ATTEMPT" -q 2>/dev/null || true
+      # Defensive: ensure the claim marker is gone even if the refiner forgot.
+      bd_ label remove "$STORY_ID" "auto-refino:refining" -q 2>/dev/null || true
+      # PHANTOM-ASSIGNEE FIX: the claim step set assignee=auto-refino so parallel
+      # refiners would not collide. The daemon is a launchd job, NOT a live crew —
+      # it can never "build". Once the story leaves our hands (handed to the gate),
+      # it must carry a NULL assignee, or the Pilot (which skips any bead with a
+      # non-null assignee) treats it as already-owned and NEVER dispatches the
+      # approved feature. Clear it at the terminal handoff. Idempotent / fail-open.
+      bd_ update "$STORY_ID" --assignee "" -q 2>/dev/null || true
+      log "  $STORY_ID → handed to refino gate (story:refino-review). Gate decides promotion."
+    fi
     ;;
   escalate-info-gap)
     # imp16: info-gap escalation — story is thin/duplicate/trivial (technical gap,
