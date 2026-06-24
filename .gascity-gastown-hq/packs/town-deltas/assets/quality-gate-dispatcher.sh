@@ -3289,6 +3289,10 @@ while true; do
     break
   fi
 
+  # GATE-HANG FIX (2026-06-24): touch the heartbeat each poll iteration so a long
+  # legit review (scaled up to VERDICT_TIMEOUT_MAX ~50min) doesn't go heartbeat-stale
+  # and trip the DPW's 600s wedge-kickstart — which would KILL the in-flight review.
+  touch "$LOG_DIR/quality-gate-dispatcher.heartbeat" 2>/dev/null || true
   sleep "$VERDICT_POLL_INTERVAL"
 done
 
