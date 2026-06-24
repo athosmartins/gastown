@@ -1,0 +1,482 @@
+#!/usr/bin/env bash
+# gate-throughput-stall-watchdog.sh — catches a silently-stalled quality gate.
+#
+# WHY THIS EXISTS (2026-06-24, ga-ozcr4 root-cause):
+#   The quality gate froze ~15h undetected. Root cause: a code bug skipped the
+#   rebase then hung inside the gate sweep. The DPW (daemon-presence-watchdog)
+#   could NOT catch it because the gate dispatcher writes its heartbeat at the
+#   VERY START of every run (anti-false-WEDGE during quota-defer), so the
+#   heartbeat stayed fresh even while the gate hung AFTER it. DPW checks
+#   heartbeat freshness, not OUTPUT. This creates a blind spot: DPW = liveness,
+#   this watchdog = throughput.
+#
+# LOGIC (runs every ~600s via launchd):
+#   1. Parse the gate dispatcher log (last GTSW_LOG_TAIL lines) for evidence of
+#      a non-empty queue: "Found N queued marker(s)" with N>0.
+#   2. Scan the same window for evidence of progress: "Gate PASSED:" within
+#      GTSW_STALL_HOURS (default 2h).
+#   3. FALSE-POSITIVE GUARDS (all must fail to declare a stall):
+#      a. Empty queue → NOT a stall (idle pipeline).
+#      b. "cota=LIMITED" or "quota-limited" in any Headroom DEFER line in the
+#         tail → quota-limited, self-heals on window reset; suppress.
+#      c. A "Gate PASSED:" line within the window → progress; not a stall.
+#      d. An active gate-reviewer session running (gc session list shows a live
+#         session named gate-reviewer*) → reviewer in-flight; not a stall.
+#   4. STALL = queue non-empty AND 0 Gate PASSED in window AND not quota-limited
+#      AND no active reviewer.
+#   5. On stall: notify -p 4 + gc mail send mayor.
+#      If GTSW_AUTORECOVER=1 (default): kickstart -k supervisor AND
+#      quality-gate-dispatcher to unstick the gate.
+#
+# FAIL-SAFE: any signal read error → treat as "flow present" (never false-alarm).
+# An idle gate (empty queue) NEVER fires.
+#
+# KILL-SWITCH: GTSW_ENABLED=0 → no-op.
+# DRY-RUN: GTSW_DRY_RUN=1 → log decisions but skip notify/mail/kickstart.
+#
+# Selftest: bash gate-throughput-stall-watchdog.sh --selftest
+#   Scenarios: stall→alert, empty-queue→no-alert, quota-limited→no-alert,
+#   recent-progress→no-alert, active-reviewer→no-alert, autorecover-path.
+set -uo pipefail
+
+# ── config (all env-overridable) ──────────────────────────────────────────────
+GTSW_ENABLED="${GTSW_ENABLED:-1}"
+GTSW_DRY_RUN="${GTSW_DRY_RUN:-0}"
+GTSW_STALL_HOURS="${GTSW_STALL_HOURS:-2}"      # hours without Gate PASSED = stall
+GTSW_AUTORECOVER="${GTSW_AUTORECOVER:-1}"        # 1=kickstart supervisor+dispatcher on stall
+GTSW_LOG_TAIL="${GTSW_LOG_TAIL:-2000}"           # lines to tail from the dispatcher log
+
+HQ="${GTSW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
+DISPATCH_LOG="${GTSW_DISPATCH_LOG:-$HQ/.gc/logs/quality-gate-dispatcher.log}"
+QUOTA_CHECK="${GTSW_QUOTA_CHECK:-$HQ/scripts/claude-quota-check.sh}"
+LOG="${GTSW_LOG:-$HQ/.gc/logs/gate-throughput-stall-watchdog.log}"
+NOTIFY_BIN="${GTSW_NOTIFY_BIN:-/Users/athos/.local/bin/notify}"
+GC_BIN="${GTSW_GC_BIN:-gc}"
+UID_NUM="$(id -u)"
+
+# Launchd labels for auto-recover kickstart
+SUPERVISOR_LABEL="${GTSW_SUPERVISOR_LABEL:-com.gascity.supervisor}"
+GATE_LABEL="${GTSW_GATE_LABEL:-com.gascity.quality-gate-dispatcher}"
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
+log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] [gtsw] $*" >> "$LOG" 2>/dev/null || true; }
+
+# ── main sweep function (pure-ish; all I/O goes through overrideable vars) ───
+# Test seams: override these vars to inject fake data without touching disk/net.
+#   GTSW_TEST_LOG_LINES    — newline-separated fake log content (replaces tail)
+#   GTSW_TEST_QUOTA_RC     — fake exit code for quota-check (0=ok, 2=limited)
+#   GTSW_TEST_SESSIONS     — fake gc session list output
+#   GTSW_TEST_KICKSTARTS   — file to record kickstart calls (for assertions)
+#   GTSW_TEST_NOTIFIED     — file to record notify calls
+#   GTSW_TEST_MAILED       — file to record gc mail calls
+
+run_sweep() {
+  # Kill-switch
+  if [ "${GTSW_ENABLED:-1}" != "1" ]; then
+    log "disabled (GTSW_ENABLED=0) — no-op"
+    return 0
+  fi
+
+  local now; now="$(date +%s)"
+  local stall_window_sec; stall_window_sec=$(( ${GTSW_STALL_HOURS:-2} * 3600 ))
+
+  # ── SIGNAL READ: tail the dispatcher log ─────────────────────────────────
+  local log_lines
+  if [ -n "${GTSW_TEST_LOG_LINES+x}" ]; then
+    # Test seam: use injected lines
+    log_lines="${GTSW_TEST_LOG_LINES}"
+  elif [ ! -f "$DISPATCH_LOG" ]; then
+    log "WARN: dispatcher log not found ($DISPATCH_LOG) — fail-open (no stall verdict)"
+    return 0
+  else
+    log_lines="$(tail -n "${GTSW_LOG_TAIL:-2000}" "$DISPATCH_LOG" 2>/dev/null)" || {
+      log "WARN: could not tail dispatcher log — fail-open"
+      return 0
+    }
+  fi
+
+  if [ -z "$log_lines" ]; then
+    log "WARN: dispatcher log empty/unreadable — fail-open"
+    return 0
+  fi
+
+  # ── FALSE-POSITIVE GUARD A: empty queue ───────────────────────────────────
+  # Look for "Found N queued marker(s)" with N>0 anywhere in the tail.
+  # If the queue has been 0 throughout, the gate is legitimately idle.
+  local queued_found=0
+  while IFS= read -r line; do
+    if echo "$line" | grep -qE "Found ([1-9][0-9]*) queued marker"; then
+      queued_found=1
+      break
+    fi
+  done <<< "$log_lines"
+
+  if [ "$queued_found" -eq 0 ]; then
+    log "OK: no queued markers found in tail — gate idle (not a stall)"
+    return 0
+  fi
+
+  # ── FALSE-POSITIVE GUARD B: quota-limited ────────────────────────────────
+  # Two sub-checks:
+  # B1. Scan the log tail for Headroom DEFER lines with "cota=LIMITED" or
+  #     "quota-limited". If the MOST RECENT queued-markers line is followed
+  #     (or accompanied) by such a DEFER line, quota is the reason — suppress.
+  # B2. Run claude-quota-check.sh (exit 2 = LIMITED). Use B1 as primary (faster,
+  #     no disk scan) and B2 as confirmation. Either → suppress.
+  local quota_limited=0
+
+  # B1: log-pattern check (fast, Dolt-independent)
+  if echo "$log_lines" | grep -qE "(cota=LIMITED|quota-limited)"; then
+    quota_limited=1
+    log "FALSE-POSITIVE GUARD B1: dispatcher log shows quota-limited — suppressing stall alert"
+  fi
+
+  # B2: live quota-check (only if B1 didn't already confirm)
+  if [ "$quota_limited" -eq 0 ]; then
+    local quota_rc
+    if [ -n "${GTSW_TEST_QUOTA_RC+x}" ]; then
+      quota_rc="${GTSW_TEST_QUOTA_RC}"
+    elif [ -x "$QUOTA_CHECK" ]; then
+      "$QUOTA_CHECK" --quiet >/dev/null 2>&1; quota_rc=$?
+    else
+      quota_rc=0  # quota-check not available → fail-open (don't suppress on missing tool)
+      log "WARN: quota-check not available ($QUOTA_CHECK) — skipping B2 guard (fail-open)"
+    fi
+    if [ "$quota_rc" -eq 2 ]; then
+      quota_limited=1
+      log "FALSE-POSITIVE GUARD B2: claude-quota-check.sh exit 2 (LIMITED) — suppressing"
+    fi
+  fi
+
+  if [ "$quota_limited" -eq 1 ]; then
+    log "OK: gate queue non-empty but quota-limited — self-heals on window reset (not a stall)"
+    return 0
+  fi
+
+  # ── FALSE-POSITIVE GUARD C: recent gate progress ──────────────────────────
+  # Scan the tail for "Gate PASSED:" lines. Parse the timestamp and check if
+  # any falls within the stall window. A PASSED within GTSW_STALL_HOURS → OK.
+  local last_passed_epoch=0
+  while IFS= read -r line; do
+    if echo "$line" | grep -q "Gate PASSED:"; then
+      # Timestamp format: [2026-06-23 17:33:31]
+      local ts_str; ts_str="$(echo "$line" | grep -oE '\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\]' | tr -d '[]')"
+      if [ -n "$ts_str" ]; then
+        local ep; ep="$(date -j -f "%Y-%m-%d %H:%M:%S" "$ts_str" +%s 2>/dev/null)" || ep=0
+        if [ "$ep" -gt "$last_passed_epoch" ] 2>/dev/null; then
+          last_passed_epoch="$ep"
+        fi
+      fi
+    fi
+  done <<< "$log_lines"
+
+  if [ "$last_passed_epoch" -gt 0 ] && [ $(( now - last_passed_epoch )) -le "$stall_window_sec" ] 2>/dev/null; then
+    local age_min; age_min=$(( (now - last_passed_epoch) / 60 ))
+    log "OK: Gate PASSED ${age_min}min ago (within ${GTSW_STALL_HOURS}h window) — not a stall"
+    return 0
+  fi
+
+  # ── FALSE-POSITIVE GUARD D: active gate-reviewer session ─────────────────
+  # If a gate-reviewer* session is live in gc session list, a reviewer is
+  # actively working — the gate is not stalled, just slow.
+  local active_reviewer=0
+  local session_output
+  if [ -n "${GTSW_TEST_SESSIONS+x}" ]; then
+    session_output="${GTSW_TEST_SESSIONS}"
+    active_reviewer=0
+    if echo "$session_output" | grep -q "gate-reviewer"; then
+      active_reviewer=1
+    fi
+  elif command -v "$GC_BIN" >/dev/null 2>&1; then
+    session_output="$("$GC_BIN" session list 2>/dev/null)" || session_output=""
+    if echo "$session_output" | grep -q "gate-reviewer"; then
+      active_reviewer=1
+    fi
+  else
+    log "WARN: gc not on PATH — skipping guard D (active-reviewer check); fail-open (no suppression)"
+    # Don't set active_reviewer=1 on error — could mask a real stall
+  fi
+
+  if [ "$active_reviewer" -eq 1 ]; then
+    log "OK: active gate-reviewer session detected — reviewer in-flight (not a stall)"
+    return 0
+  fi
+
+  # ── STALL CONFIRMED ───────────────────────────────────────────────────────
+  local last_passed_desc
+  if [ "$last_passed_epoch" -gt 0 ] 2>/dev/null; then
+    local hours_ago; hours_ago=$(( (now - last_passed_epoch) / 3600 ))
+    last_passed_desc="${hours_ago}h ago"
+  else
+    last_passed_desc="not found in log tail"
+  fi
+
+  local msg="GATE THROUGHPUT STALL: queue non-empty, 0 Gate PASSED in ${GTSW_STALL_HOURS}h, not quota-limited, no active reviewer. Last pass: ${last_passed_desc}. Gate froze silently (heartbeat ≠ output). Kickstarting supervisor+gate (GTSW_AUTORECOVER=${GTSW_AUTORECOVER:-1})."
+  log "ALERT: $msg"
+
+  if [ "${GTSW_DRY_RUN:-0}" = "1" ]; then
+    log "DRY_RUN: would notify + mail mayor + autorecover"
+    return 1
+  fi
+
+  # NOTIFY (primary — Dolt-independent, always fires first)
+  if [ -n "${GTSW_TEST_NOTIFIED+x}" ]; then
+    echo "notify:$msg" >> "${GTSW_TEST_NOTIFIED}" 2>/dev/null || true
+  else
+    command -v "${NOTIFY_BIN}" >/dev/null 2>&1 && \
+      "${NOTIFY_BIN}" -t "Gate stall" -p 4 "$msg" 2>/dev/null || true
+  fi
+
+  # GC MAIL (secondary — best-effort; failure never silences the notify)
+  local mail_body
+  mail_body="$(cat <<BODY
+GATE THROUGHPUT STALL detectado pelo gate-throughput-stall-watchdog.
+
+CONDIÇÃO: queue não-vazia + 0 Gate PASSED em ${GTSW_STALL_HOURS}h + não quota-limited + sem gate-reviewer ativo.
+
+Último Gate PASSED: ${last_passed_desc}
+Janela de análise: ${GTSW_STALL_HOURS}h
+
+POR QUE O DPW NÃO PEGOU: o heartbeat do gate é tocado no INÍCIO de cada sweep
+(anti-false-WEDGE durante quota-defer) — então o heartbeat fica fresco mesmo quando
+o gate trava DEPOIS. DPW mede liveness; este watchdog mede throughput.
+
+INVESTIGAÇÃO:
+1. tail -40 $DISPATCH_LOG
+   Procure: sweep sem "Gate PASSED:" seguido de silêncio vs. linhas de erro (merge conflict? rebase hung?)
+2. ls -la $HQ/scripts/gate-lock/ 2>/dev/null  — lock preso?
+3. gc session list | grep gate  — sessão de reviewer ativa ou travada?
+4. gc dolt status  — coleta antes de reiniciar
+5. Se o GTSW_AUTORECOVER=1 kickstart já foi feito (ver log abaixo), confirme se
+   o gate voltou: grep 'Gate PASSED' $DISPATCH_LOG | tail -3
+
+SE A RECUPERAÇÃO FALHAR: investigue o lock (gate-lock-hygiene.sh) e/ou faça
+kickstart manual do supervisor + quality-gate-dispatcher.
+BODY
+)"
+
+  if [ -n "${GTSW_TEST_MAILED+x}" ]; then
+    echo "mail:gate-throughput-stall:$msg" >> "${GTSW_TEST_MAILED}" 2>/dev/null || true
+  else
+    command -v "$GC_BIN" >/dev/null 2>&1 && \
+      "$GC_BIN" mail send mayor \
+        -s "Watchdog: GATE THROUGHPUT STALL — ${GTSW_STALL_HOURS}h sem Gate PASSED com fila cheia" \
+        -m "$mail_body" 2>/dev/null || true
+  fi
+
+  # ── AUTO-RECOVER ──────────────────────────────────────────────────────────
+  if [ "${GTSW_AUTORECOVER:-1}" = "1" ]; then
+    log "AUTORECOVER: kickstarting supervisor ($SUPERVISOR_LABEL) + gate ($GATE_LABEL)"
+
+    if [ -n "${GTSW_TEST_KICKSTARTS+x}" ]; then
+      echo "kickstart:$SUPERVISOR_LABEL" >> "${GTSW_TEST_KICKSTARTS}" 2>/dev/null || true
+      echo "kickstart:$GATE_LABEL" >> "${GTSW_TEST_KICKSTARTS}" 2>/dev/null || true
+    else
+      # Kickstart supervisor first (it manages crew lifecycle)
+      if launchctl kickstart -k "gui/$UID_NUM/$SUPERVISOR_LABEL" 2>/dev/null; then
+        log "AUTORECOVER: supervisor kickstarted OK"
+      else
+        log "AUTORECOVER: supervisor kickstart FAILED (may not be loaded)"
+      fi
+      # Then kickstart the gate dispatcher
+      if launchctl kickstart -k "gui/$UID_NUM/$GATE_LABEL" 2>/dev/null; then
+        log "AUTORECOVER: quality-gate-dispatcher kickstarted OK"
+      else
+        log "AUTORECOVER: quality-gate-dispatcher kickstart FAILED (may not be loaded)"
+      fi
+    fi
+  else
+    log "AUTORECOVER disabled (GTSW_AUTORECOVER=0) — alert only"
+  fi
+
+  return 1
+}
+
+# ── selftest ──────────────────────────────────────────────────────────────────
+if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
+  PASS=0; FAIL=0
+  ok()  { PASS=$((PASS+1)); echo "  ok  $1"; }
+  bad() { FAIL=$((FAIL+1)); echo "  FAIL $1"; }
+  TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+
+  # Override all I/O paths to the temp dir
+  LOG="$TMP/gtsw.log"
+  GTSW_LOG="$LOG"
+  DISPATCH_LOG="$TMP/gate-dispatcher.log"   # not used in tests (log injected via env)
+  NOTIFY_BIN="$TMP/notify"
+  GC_BIN="$TMP/gc"
+  GTSW_ENABLED=1
+  GTSW_DRY_RUN=0
+  GTSW_STALL_HOURS=2
+  GTSW_AUTORECOVER=1
+  GTSW_SUPERVISOR_LABEL="com.gascity.supervisor"
+  GTSW_GATE_LABEL="com.gascity.quality-gate-dispatcher"
+
+  # Stub notify and gc so they record calls but have no side effects
+  printf '#!/usr/bin/env bash\necho "notify:$*" >> "$GTSW_TEST_NOTIFIED" 2>/dev/null; exit 0\n' > "$TMP/notify"
+  printf '#!/usr/bin/env bash\n[ "$1" = "mail" ] && echo "mail:$*" >> "$GTSW_TEST_MAILED" 2>/dev/null; [ "$1" = "session" ] && echo "${GTSW_TEST_SESSIONS:-}" ; exit 0\n' > "$TMP/gc"
+  chmod +x "$TMP/notify" "$TMP/gc"
+
+  # Helper: generate realistic gate log lines with a given queue count and
+  # optionally a "Gate PASSED" line at a given age in seconds.
+  make_log() {
+    local queue_n="$1" passed_age_sec="${2:-}"
+    local now; now="$(date +%s)"
+    # Queued-markers line (always present if queue_n > 0)
+    if [ "$queue_n" -gt 0 ]; then
+      local ts_q; ts_q="$(date -u -r $((now - 60)) '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u -d "@$((now - 60))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u '+%Y-%m-%d %H:%M:%S')"
+      echo "[${ts_q}] [quality-gate-dispatcher] Found ${queue_n} queued marker(s)"
+    fi
+    # Gate PASSED line (if requested)
+    if [ -n "$passed_age_sec" ] && [ "$passed_age_sec" -gt 0 ]; then
+      local ts_p; ts_p="$(date -u -r $((now - passed_age_sec)) '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u -d "@$((now - passed_age_sec))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+      if [ -n "$ts_p" ]; then
+        echo "[${ts_p}] [quality-gate-dispatcher] Gate PASSED: branch=crew/test/ga-test tier=CODE merge_sha=abc123 elapsed=300s"
+      fi
+    fi
+  }
+
+  # ── Scenario 1: STALL CONFIRMED ───────────────────────────────────────────
+  echo "Scenario 1: queue non-empty + no progress + not quota-limited + no reviewer → STALL"
+  KICKS1="$TMP/kicks1"; : > "$KICKS1"
+  NOTIF1="$TMP/notif1"; : > "$NOTIF1"
+  MAIL1="$TMP/mail1";   : > "$MAIL1"
+  GTSW_TEST_LOG_LINES="$(make_log 5)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_KICKSTARTS="$KICKS1"
+  GTSW_TEST_NOTIFIED="$NOTIF1"
+  GTSW_TEST_MAILED="$MAIL1"
+  run_sweep && bad "scenario 1: stall should return 1 (alert)" || ok "scenario 1: stall detected (return 1)"
+  grep -q "notify:" "$NOTIF1" 2>/dev/null && ok "scenario 1: notify fired" || bad "scenario 1: notify NOT fired"
+  grep -q "mail:" "$MAIL1" 2>/dev/null && ok "scenario 1: gc mail sent" || bad "scenario 1: gc mail NOT sent"
+  grep -q "kickstart:$GTSW_SUPERVISOR_LABEL" "$KICKS1" 2>/dev/null && ok "scenario 1: supervisor kickstarted" || bad "scenario 1: supervisor NOT kickstarted"
+  grep -q "kickstart:$GTSW_GATE_LABEL" "$KICKS1" 2>/dev/null && ok "scenario 1: gate kickstarted" || bad "scenario 1: gate NOT kickstarted"
+
+  # ── Scenario 2: EMPTY QUEUE → no alert ───────────────────────────────────
+  echo "Scenario 2: empty queue (0 queued markers) → NOT a stall"
+  NOTIF2="$TMP/notif2"; : > "$NOTIF2"
+  GTSW_TEST_LOG_LINES="$(make_log 0)"    # no queued-markers line at all
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_NOTIFIED="$NOTIF2"
+  GTSW_TEST_MAILED="$TMP/mail2"
+  unset GTSW_TEST_KICKSTARTS
+  run_sweep && ok "scenario 2: empty queue returns 0 (no alert)" || bad "scenario 2: empty queue falsely alerted"
+  [ ! -s "$NOTIF2" ] && ok "scenario 2: no notify on empty queue" || bad "scenario 2: notify fired on empty queue (false positive)"
+
+  # ── Scenario 3: QUOTA-LIMITED (B1: log pattern) → suppress ───────────────
+  echo "Scenario 3: quota-limited via log pattern (B1) → suppressed"
+  NOTIF3="$TMP/notif3"; : > "$NOTIF3"
+  _sc3_now="$(date -u '+%Y-%m-%d %H:%M:%S')"
+  GTSW_TEST_LOG_LINES="[${_sc3_now}] [quality-gate-dispatcher] Found 8 queued marker(s)
+[${_sc3_now}] [quality-gate-dispatcher] Headroom DEFER: gate em 0 runs (Dolt cpu=200% lat=100ms / cota=LIMITED) — quota-limited; ceiling=0 reviewers, leaving 8 marker(s) queued (ga-cw4pm)."
+  GTSW_TEST_QUOTA_RC=0   # B2 says OK but B1 catches it
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_NOTIFIED="$NOTIF3"
+  GTSW_TEST_MAILED="$TMP/mail3"
+  unset GTSW_TEST_KICKSTARTS
+  run_sweep && ok "scenario 3: quota-limited (B1) suppresses alert (return 0)" || bad "scenario 3: quota-limited B1 did NOT suppress (false positive)"
+  [ ! -s "$NOTIF3" ] && ok "scenario 3: no notify on quota-limited" || bad "scenario 3: notify fired despite quota-limited (false positive)"
+
+  # ── Scenario 4: QUOTA-LIMITED (B2: live check) → suppress ────────────────
+  echo "Scenario 4: quota-limited via live quota-check (B2) → suppressed"
+  NOTIF4="$TMP/notif4"; : > "$NOTIF4"
+  _sc4_now="$(date -u '+%Y-%m-%d %H:%M:%S')"
+  GTSW_TEST_LOG_LINES="[${_sc4_now}] [quality-gate-dispatcher] Found 5 queued marker(s)"
+  GTSW_TEST_QUOTA_RC=2   # B2: quota check returns LIMITED
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_NOTIFIED="$NOTIF4"
+  GTSW_TEST_MAILED="$TMP/mail4"
+  unset GTSW_TEST_KICKSTARTS
+  run_sweep && ok "scenario 4: quota-limited (B2) suppresses alert (return 0)" || bad "scenario 4: quota-limited B2 did NOT suppress (false positive)"
+  [ ! -s "$NOTIF4" ] && ok "scenario 4: no notify when quota exit=2" || bad "scenario 4: notify fired despite quota exit=2 (false positive)"
+
+  # ── Scenario 5: RECENT PROGRESS → no alert ───────────────────────────────
+  echo "Scenario 5: Gate PASSED within the stall window → NOT a stall"
+  NOTIF5="$TMP/notif5"; : > "$NOTIF5"
+  # Gate PASSED 30 minutes ago (well within the 2h window)
+  GTSW_TEST_LOG_LINES="$(make_log 3 1800)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_NOTIFIED="$NOTIF5"
+  GTSW_TEST_MAILED="$TMP/mail5"
+  unset GTSW_TEST_KICKSTARTS
+  run_sweep && ok "scenario 5: recent Gate PASSED suppresses alert (return 0)" || bad "scenario 5: recent Gate PASSED did NOT suppress (false positive)"
+  [ ! -s "$NOTIF5" ] && ok "scenario 5: no notify when Gate PASSED recently" || bad "scenario 5: notify fired despite recent Gate PASSED (false positive)"
+
+  # ── Scenario 6: ACTIVE REVIEWER → no alert ───────────────────────────────
+  echo "Scenario 6: active gate-reviewer session → NOT a stall"
+  NOTIF6="$TMP/notif6"; : > "$NOTIF6"
+  GTSW_TEST_LOG_LINES="$(make_log 4)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS="gate-reviewer-adhoc-abc123 (running)"
+  GTSW_TEST_NOTIFIED="$NOTIF6"
+  GTSW_TEST_MAILED="$TMP/mail6"
+  unset GTSW_TEST_KICKSTARTS
+  run_sweep && ok "scenario 6: active reviewer suppresses alert (return 0)" || bad "scenario 6: active reviewer did NOT suppress (false positive)"
+  [ ! -s "$NOTIF6" ] && ok "scenario 6: no notify when reviewer active" || bad "scenario 6: notify fired despite active reviewer (false positive)"
+
+  # ── Scenario 7: AUTORECOVER disabled → alert but no kickstart ────────────
+  echo "Scenario 7: stall detected with GTSW_AUTORECOVER=0 → alert but no kickstart"
+  KICKS7="$TMP/kicks7"; : > "$KICKS7"
+  NOTIF7="$TMP/notif7"; : > "$NOTIF7"
+  GTSW_AUTORECOVER=0
+  GTSW_TEST_LOG_LINES="$(make_log 6)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_KICKSTARTS="$KICKS7"
+  GTSW_TEST_NOTIFIED="$NOTIF7"
+  GTSW_TEST_MAILED="$TMP/mail7"
+  run_sweep && bad "scenario 7: stall should return 1" || ok "scenario 7: stall detected (return 1) with AUTORECOVER=0"
+  grep -q "notify:" "$NOTIF7" 2>/dev/null && ok "scenario 7: notify fired" || bad "scenario 7: notify NOT fired"
+  [ ! -s "$KICKS7" ] && ok "scenario 7: no kickstart when AUTORECOVER=0" || bad "scenario 7: kickstart fired despite AUTORECOVER=0"
+  GTSW_AUTORECOVER=1   # restore
+
+  # ── Scenario 8: KILL-SWITCH → no-op ─────────────────────────────────────
+  echo "Scenario 8: GTSW_ENABLED=0 → no-op (return 0, no notify)"
+  NOTIF8="$TMP/notif8"; : > "$NOTIF8"
+  GTSW_ENABLED=0
+  GTSW_TEST_LOG_LINES="$(make_log 10)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_NOTIFIED="$NOTIF8"
+  GTSW_TEST_MAILED="$TMP/mail8"
+  unset GTSW_TEST_KICKSTARTS
+  run_sweep && ok "scenario 8: GTSW_ENABLED=0 returns 0 (no-op)" || bad "scenario 8: ENABLED=0 unexpectedly non-zero"
+  [ ! -s "$NOTIF8" ] && ok "scenario 8: no notify when disabled" || bad "scenario 8: notify fired despite ENABLED=0"
+  GTSW_ENABLED=1   # restore
+
+  # ── Scenario 9: DRY-RUN → logs but no side effects ───────────────────────
+  echo "Scenario 9: GTSW_DRY_RUN=1 → stall detected, logs intent, no notify/mail/kickstart"
+  KICKS9="$TMP/kicks9"; : > "$KICKS9"
+  NOTIF9="$TMP/notif9"; : > "$NOTIF9"
+  GTSW_DRY_RUN=1
+  GTSW_TEST_LOG_LINES="$(make_log 3)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_KICKSTARTS="$KICKS9"
+  GTSW_TEST_NOTIFIED="$NOTIF9"
+  GTSW_TEST_MAILED="$TMP/mail9"
+  run_sweep && bad "scenario 9: stall+DRY_RUN should still return 1" || ok "scenario 9: DRY_RUN returns 1 (stall confirmed, dry)"
+  [ ! -s "$NOTIF9" ] && ok "scenario 9: no notify in DRY_RUN" || bad "scenario 9: notify fired in DRY_RUN"
+  [ ! -s "$KICKS9" ] && ok "scenario 9: no kickstart in DRY_RUN" || bad "scenario 9: kickstart fired in DRY_RUN"
+  grep -q "DRY_RUN" "$LOG" 2>/dev/null && ok "scenario 9: DRY_RUN logged intent" || bad "scenario 9: DRY_RUN intent not logged"
+  GTSW_DRY_RUN=0   # restore
+
+  # ── Scenario 10: BASH -N CHECK ───────────────────────────────────────────
+  echo "Scenario 10: bash -n syntax check (catch regressions)"
+  bash -n "$0" 2>/dev/null && ok "scenario 10: bash -n syntax check passes" || bad "scenario 10: bash -n FAILED — syntax error"
+
+  # ── CLEANUP / SUMMARY ─────────────────────────────────────────────────────
+  # Unset test seams so no state leaks
+  unset GTSW_TEST_LOG_LINES GTSW_TEST_QUOTA_RC GTSW_TEST_SESSIONS
+  unset GTSW_TEST_KICKSTARTS GTSW_TEST_NOTIFIED GTSW_TEST_MAILED
+
+  echo ""
+  echo "gate-throughput-stall-watchdog selftest: PASS=$PASS FAIL=$FAIL"
+  [ "$FAIL" -eq 0 ] && exit 0 || exit 1
+fi
+
+run_sweep

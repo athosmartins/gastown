@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gascity.gate-throughput-stall-watchdog</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/gate-throughput-stall-watchdog.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-throughput-stall-watchdog-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-throughput-stall-watchdog-launchd.err</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key><string>/Users/athos</string>
+    <!-- Stall threshold: hours without Gate PASSED before alerting. Default: 2h.
+         Set GTSW_STALL_HOURS=1 in testing, or raise to 3-4 if false-positives appear
+         on slow weekends. -->
+    <!-- <key>GTSW_STALL_HOURS</key><string>2</string> -->
+    <!-- Auto-recover: kickstart supervisor + gate dispatcher on confirmed stall.
+         Set GTSW_AUTORECOVER=0 to alert-only (no kickstart). Default: 1 (on). -->
+    <!-- <key>GTSW_AUTORECOVER</key><string>1</string> -->
+    <!-- Kill-switch: GTSW_ENABLED=0 disables the watchdog entirely. -->
+    <!-- <key>GTSW_ENABLED</key><string>1</string> -->
+  </dict>
+</dict></plist>
