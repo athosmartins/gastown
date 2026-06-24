@@ -72,6 +72,8 @@ PILOT_DISPATCHABLE_JSON = os.path.join(os.path.expanduser("~"), ".gc/pilot-dispa
 NOTIFY_BIN = os.environ.get("NOTIFY_BIN", "/Users/athos/.local/bin/notify")
 GC_BIN = os.environ.get("GC_BIN", "gc")
 BD_BIN = os.environ.get("BD_BIN", "bd")
+# Path of the Dolt-probe bash script (imp07 shared probe).
+DOLT_PROBE_SH = os.path.join(CITY, "scripts/gc-dolt-probe.sh")
 
 # Rig roots for git-log merge signal and bd backlog queries.
 RIG_ROOTS = os.environ.get(
@@ -95,6 +97,17 @@ BD_TIMEOUT = int(os.environ.get("TSW_BD_TIMEOUT", "25"))
 GIT_TIMEOUT = int(os.environ.get("TSW_GIT_TIMEOUT", "30"))
 LOG_TAIL = int(os.environ.get("TSW_LOG_TAIL", "3000"))   # lines to tail from pilot log
 
+# ── imp08: blind-floor and Dolt-health knobs ──────────────────────────────────
+# BLIND: 2+ signals ERROR in same sweep → the watchdog cannot assess flow at all.
+# After BLIND_CONFIRM_SWEEPS consecutive blind sweeps, escalate "cannot assess".
+# DOLT: confirmed unreachable → a distinct "dolt" stall episode, escalated independently.
+BLIND_SIGNAL_THRESHOLD = int(os.environ.get("TSW_BLIND_THRESHOLD", "2"))  # 2+ errors = blind
+BLIND_CONFIRM_SWEEPS = int(os.environ.get("TSW_BLIND_CONFIRM_SWEEPS", "2"))
+BLIND_COOLDOWN_SEC = int(os.environ.get("TSW_BLIND_COOLDOWN_SEC", "10800"))  # 3h cooldown
+DOLT_PROBE_TIMEOUT = int(os.environ.get("TSW_DOLT_PROBE_TIMEOUT", "10"))
+DOLT_CONFIRM_SWEEPS = int(os.environ.get("TSW_DOLT_CONFIRM_SWEEPS", "2"))
+DOLT_COOLDOWN_SEC = int(os.environ.get("TSW_DOLT_COOLDOWN_SEC", "10800"))   # 3h cooldown
+
 # ── log-line patterns ─────────────────────────────────────────────────────────
 TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 # "=== Pilot sweep complete: dispatched=N ..."
@@ -115,6 +128,7 @@ _git_log_count = None          # (root, since_iso) -> int; None = run git
 _bd_backlog = None             # (rig_root) -> list[dict]; None = run bd
 _do_notify = None              # (msg, prio) -> None; None = run notify binary
 _do_mail_mayor = None          # (subject, body) -> bool; None = run gc mail
+_do_dolt_probe = None          # () -> int; 0=healthy 1=unhealthy 2=unknown; None = run probe
 
 
 # ── guarded subprocess ────────────────────────────────────────────────────────
@@ -172,20 +186,181 @@ def _parse_bd_json(raw):
     return []
 
 
+# ── imp08: Dolt-health probe (Dolt-independent path) ─────────────────────────
+def _dolt_probe_rc():
+    """Probe Dolt via gc-dolt-probe.sh. Returns 0=healthy 1=unhealthy 2=unknown.
+    Test seam: if _do_dolt_probe is set, calls it instead of spawning bash."""
+    if _do_dolt_probe is not None:
+        return _do_dolt_probe()
+    r = _sh(["bash", DOLT_PROBE_SH], timeout=DOLT_PROBE_TIMEOUT)
+    if r is None:
+        return 2  # spawn failed → unknown
+    return r.returncode  # 0=healthy 1=unhealthy 2=unknown
+
+
+def _dolt_probe_is_confirmed_unhealthy():
+    """True only on a confirmed UNHEALTHY result (rc=1). rc=2 (unknown) is NOT confirmed."""
+    return _dolt_probe_rc() == 1
+
+
+def _escalate_blind(signals_errored, now, state):
+    """Fire a 'blind, cannot assess flow' escalation via notify (PRIMARY)."""
+    names = ", ".join(signals_errored)
+    msg = ("TSW BLIND: %d/%d throughput signals errored (%s) — cannot assess flow. "
+           "City-down? Investigate." % (len(signals_errored), 3, names))
+    _tsw_ledger("flow-ledger", {
+        "ts": _tsw_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "stage": "blind-sweep",
+        "signals_errored": signals_errored,
+        "blind_pending": state.get("blind_pending", 0),
+        "escalated": True,
+    }, fail_open=True)
+    if DRY_RUN:
+        _log("DRY_RUN: would escalate blind: %s" % msg)
+        return True
+    # PRIMARY: notify (Dolt-independent, always fires first)
+    if _do_notify is not None:
+        _do_notify(msg, 4)
+    else:
+        _sh([NOTIFY_BIN, "-t", "TSW BLIND", "-p", "4", msg], timeout=10)
+    return True
+
+
+def _escalate_dolt(now, state):
+    """Fire a Dolt-unreachable escalation via notify (PRIMARY) + gc mail (SECONDARY)."""
+    msg = "TSW: Dolt UNREACHABLE — data plane down, bd/gc/mail all at risk."
+    _tsw_ledger("flow-ledger", {
+        "ts": _tsw_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "stage": "dolt",
+        "dolt_reachable": False,
+        "dolt_pending": state.get("dolt_pending", 0),
+        "escalated": True,
+    }, fail_open=True)
+    if DRY_RUN:
+        _log("DRY_RUN: would escalate dolt: %s" % msg)
+        return True
+    # PRIMARY: notify unconditionally (Dolt is DOWN so gc mail may not work)
+    if _do_notify is not None:
+        _do_notify(msg, 5)
+    else:
+        _sh([NOTIFY_BIN, "-t", "Dolt UNREACHABLE", "-p", "5", msg], timeout=10)
+    # SECONDARY: gc mail best-effort (may fail if Dolt is down — that's OK)
+    body = ("Dolt confirmed UNREACHABLE by throughput-stall-watchdog probe.\n\n"
+            "The data plane is down. bd/gc/mail calls will fail until Dolt is restored.\n"
+            "gc dolt status — collect diagnostics before restarting.\n"
+            "See CLAUDE.md §Dolt troubleshooting for the goroutine-dump protocol.")
+    subject = "Watchdog: Dolt UNREACHABLE (confirmed %d sweeps)" % state.get("dolt_pending", 1)
+    if _do_mail_mayor is not None:
+        _do_mail_mayor(subject, body)
+    else:
+        _sh([GC_BIN, "mail", "send", MAYOR_ADDR, "-s", subject, "-m", body, "--notify"],
+            timeout=45)
+    return True
+
+
+def _tick_blind_and_dolt(signals_errored, now, state):
+    """Handle the blind-floor (imp08) and Dolt-health dimensions.
+
+    signals_errored: list of signal names that ERRORed this sweep.
+
+    Updates state in-place:
+      state["blind_pending"]        — consecutive blind sweep count
+      state["blind_last_escalate"]  — epoch of last blind escalation
+      state["dolt_pending"]         — consecutive confirmed-unhealthy Dolt count
+      state["dolt_last_escalate"]   — epoch of last Dolt escalation
+
+    Returns (is_blind, dolt_escalated) booleans so the caller can decide
+    whether to skip the normal stall logic (blind sweep = no stall verdict)."""
+
+    # Ensure state keys exist (backward-compat with pre-imp08 state files)
+    state.setdefault("blind_pending", 0)
+    state.setdefault("blind_last_escalate", 0.0)
+    state.setdefault("dolt_pending", 0)
+    state.setdefault("dolt_last_escalate", 0.0)
+
+    # ── Blind-floor check ────────────────────────────────────────────────────
+    is_blind = len(signals_errored) >= BLIND_SIGNAL_THRESHOLD
+    if is_blind:
+        state["blind_pending"] += 1
+        _tsw_ledger("flow-ledger", {
+            "ts": _tsw_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "stage": "blind-sweep",
+            "signals_errored": signals_errored,
+            "blind_pending": state["blind_pending"],
+            "escalated": False,
+        }, fail_open=True)
+        _log("imp08 BLIND: %d/%d signals errored (%s) — blind sweep %d/%d" % (
+             len(signals_errored), 3, ", ".join(signals_errored),
+             state["blind_pending"], BLIND_CONFIRM_SWEEPS))
+        if state["blind_pending"] >= BLIND_CONFIRM_SWEEPS:
+            cooldown_ok = (now - state["blind_last_escalate"]) > BLIND_COOLDOWN_SEC
+            if cooldown_ok:
+                _escalate_blind(signals_errored, now, state)
+                state["blind_last_escalate"] = now
+                _log("imp08 BLIND escalated after %d consecutive blind sweeps" % state["blind_pending"])
+            else:
+                _log("imp08 BLIND: confirmed but within cooldown — suppressing")
+    else:
+        if state["blind_pending"] > 0:
+            _log("imp08 BLIND: cleared (signals readable again)")
+        state["blind_pending"] = 0
+
+    # ── Dolt-health check (Dolt-independent probe) ───────────────────────────
+    dolt_escalated = False
+    dolt_rc = _dolt_probe_rc()
+    if dolt_rc == 1:
+        # Confirmed unhealthy (rc=1). rc=2 (unknown/transient) never counts.
+        state["dolt_pending"] += 1
+        _tsw_ledger("flow-ledger", {
+            "ts": _tsw_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "stage": "dolt",
+            "dolt_reachable": False,
+            "dolt_pending": state["dolt_pending"],
+            "escalated": False,
+        }, fail_open=True)
+        _log("imp08 DOLT: confirmed unhealthy sweep %d/%d" % (
+             state["dolt_pending"], DOLT_CONFIRM_SWEEPS))
+        if state["dolt_pending"] >= DOLT_CONFIRM_SWEEPS:
+            cooldown_ok = (now - state["dolt_last_escalate"]) > DOLT_COOLDOWN_SEC
+            if cooldown_ok:
+                _escalate_dolt(now, state)
+                state["dolt_last_escalate"] = now
+                dolt_escalated = True
+            else:
+                _log("imp08 DOLT: confirmed but within cooldown — suppressing")
+    elif dolt_rc == 2:
+        _log("imp08 DOLT: probe returned unknown (transient?) — not counting")
+        # Do NOT reset dolt_pending on unknown — only a healthy (rc=0) clears it.
+    else:
+        # rc=0 → healthy
+        if state["dolt_pending"] > 0:
+            _log("imp08 DOLT: healthy again — clearing dolt_pending")
+        state["dolt_pending"] = 0
+
+    return is_blind, dolt_escalated
+
+
 # ── SIGNAL 1: dispatch signal ─────────────────────────────────────────────────
+# Return convention for all three signals:
+#   (None, None)  → ERROR: the signal could not be read at all (fail-open + counted for blind-floor)
+#   (0, ...)      → readable, genuinely zero (idle, no false alarm)
+#   (N>0, ...)    → readable, flow present
+_SIGNAL_ERROR = (None, None)
+
 def dispatch_signal(now, window_sec):
     """Returns (count, last_dispatch_epoch) where count is dispatches in window.
-    On any error returns (None, None) — caller treats as fail-open (count present).
-    count=0 + last_dispatch_epoch=None means "zero dispatches, no evidence of ever having dispatched
-    in the tail". last_dispatch_epoch may be an epoch OUTSIDE the window (most recent historical)."""
+    On any ERROR returns _SIGNAL_ERROR — caller treats as fail-open (count present) AND counts
+    toward the blind-floor (imp08). count=0 + last_dispatch_epoch=None means "zero dispatches,
+    no evidence of ever having dispatched in the tail". last_dispatch_epoch may be an epoch
+    OUTSIDE the window (most recent historical)."""
     if _read_pilot_log_lines is not None:
         lines = _read_pilot_log_lines()
     else:
         lines = _tail(PILOT_LOG, LOG_TAIL)
 
     if not lines:
-        _log("dispatch_signal: pilot log empty/missing — fail-open (treating as dispatched)")
-        return None, None  # fail-open: can't read log = can't claim stall
+        _log("dispatch_signal: pilot log empty/missing — ERROR (fail-open; counted for blind-floor)")
+        return _SIGNAL_ERROR  # ERROR: can't read log = can't claim stall
 
     count = 0
     last_epoch = None
@@ -246,9 +421,10 @@ def merge_signal(now, window_sec):
         if not root:
             continue
         if _git_log_count is not None:
-            # Test seam: stub provided.
+            # Test seam: stub provided. None return means "simulated git failure".
             n = _git_log_count(root, since_iso)
-            git_any_success = True
+            if n is not None:
+                git_any_success = True
         else:
             r = _sh(["git", "-C", root, "log", "--oneline",
                      "--since=%s" % since_iso, "origin/main"],
@@ -268,8 +444,8 @@ def merge_signal(now, window_sec):
     # we have a valid (possibly-zero) count and should NOT treat it as fail-open.
     if not gate_log_read and not git_any_success:
         _log("merge_signal: gate log missing/unreadable AND all git queries failed — "
-             "fail-open (treating as merged)")
-        return None, None
+             "ERROR (fail-open; counted for blind-floor)")
+        return _SIGNAL_ERROR
 
     return count, last_epoch
 
@@ -340,8 +516,8 @@ def backlog_signal():
             all_beads.append(b)
 
     if not at_least_one_success:
-        _log("backlog_signal: all bd queries failed — fail-open (treating as backlog=0)")
-        return None, []
+        _log("backlog_signal: all bd queries failed — ERROR (fail-open; counted for blind-floor)")
+        return None, []   # (None,[]) is the backlog-error sentinel; [] is never confused with results
 
     # Deduplicate across rigs (same bead id)
     seen = {}
@@ -365,10 +541,17 @@ def _load_state():
                 d.setdefault("pending", 0)
                 d.setdefault("last_escalate", 0.0)
                 d.setdefault("escalations", 0)
+                # imp08 keys (backward-compat: absent in pre-imp08 state files)
+                d.setdefault("blind_pending", 0)
+                d.setdefault("blind_last_escalate", 0.0)
+                d.setdefault("dolt_pending", 0)
+                d.setdefault("dolt_last_escalate", 0.0)
                 return d
     except Exception:
         pass
-    return {"pending": 0, "last_escalate": 0.0, "escalations": 0}
+    return {"pending": 0, "last_escalate": 0.0, "escalations": 0,
+            "blind_pending": 0, "blind_last_escalate": 0.0,
+            "dolt_pending": 0, "dolt_last_escalate": 0.0}
 
 
 def _save_state(state):
@@ -467,22 +650,51 @@ def _escalate(backlog_count, dispatch_count, last_dispatch_epoch,
 # ── main detection tick ───────────────────────────────────────────────────────
 def run_tick(now, state):
     """One evaluation cycle. Mutates state in-place. Returns True if a stall was confirmed
-    and escalated this tick; False otherwise. All signals are fail-open: an error in reading
-    any signal is treated as 'flow present', never false-alarming."""
+    and escalated this tick; False otherwise.
+
+    FAIL-OPEN (readable-but-zero): a signal that is readable but returns 0 is treated as
+    genuine idle — no alert. This preserves the original behavior for a legitimately quiet
+    pipeline.
+
+    FAIL-CLOSED (blind-floor, imp08): if 2+ signals ERROR in the same sweep, the system is
+    BLIND — we call _tick_blind_and_dolt which escalates after BLIND_CONFIRM_SWEEPS consecutive
+    blind sweeps. A blind sweep still returns False (no stall verdict) but the blind escalation
+    fires via notify (PRIMARY).
+
+    DOLT-HEALTH (imp08): Dolt is probed every tick independently of the three throughput signals.
+    A confirmed unhealthy Dolt → distinct "dolt" escalation after DOLT_CONFIRM_SWEEPS sweeps."""
     window_sec = STALL_HOURS * 3600
+    signals_errored = []   # names of signals that ERROR this sweep (for imp08 blind-floor)
 
     # SIGNAL 1: dispatch
     dispatch_count, last_dispatch_epoch = dispatch_signal(now, window_sec)
     if dispatch_count is None:
-        # Fail-open: can't read pilot log
-        _log("tick: dispatch_signal fail-open → treating as dispatched, resetting stall counter")
-        _maybe_recover(state, "dispatch-signal unavailable")
-        return False
+        # ERROR: fail-open for stall logic; count for blind-floor
+        _log("tick: dispatch_signal ERROR → fail-open (treat as dispatched)")
+        signals_errored.append("dispatch")
 
     # SIGNAL 2: merge
     merge_count, last_merge_epoch = merge_signal(now, window_sec)
     if merge_count is None:
-        # Fail-open: can't read gate log or git
+        _log("tick: merge_signal ERROR → fail-open (treat as merged)")
+        signals_errored.append("merge")
+
+    # imp08: blind-floor + Dolt-health check (runs every tick regardless of signal state)
+    is_blind, _dolt_esc = _tick_blind_and_dolt(signals_errored, now, state)
+    if is_blind:
+        # Blind sweep: skip stall logic entirely (can't make a verdict).
+        # Stall pending counter is NOT reset — we don't know if it's a stall or not.
+        _log("tick: BLIND SWEEP — skipping stall verdict (signals_errored=%s)" % signals_errored)
+        return False
+
+    # If dispatch or merge errored but we're NOT blind (only one errored), treat it as
+    # fail-open (flow present) for the stall detector — same as before imp08.
+    if dispatch_count is None:
+        _log("tick: dispatch_signal fail-open → treating as dispatched, resetting stall counter")
+        _maybe_recover(state, "dispatch-signal unavailable")
+        return False
+
+    if merge_count is None:
         _log("tick: merge_signal fail-open → treating as merged, resetting stall counter")
         _maybe_recover(state, "merge-signal unavailable")
         return False
@@ -501,8 +713,14 @@ def run_tick(now, state):
     # SIGNAL 3: backlog (only evaluate if dispatch+merge are both 0 to save BD load on healthy system)
     backlog_count, sample_beads = backlog_signal()
     if backlog_count is None:
-        # Fail-open: can't read BD
-        _log("tick: backlog_signal fail-open → treating as no backlog, resetting stall counter")
+        # ERROR: backlog signal failed — count toward blind-floor too
+        signals_errored.append("backlog")
+        _log("tick: backlog_signal ERROR → fail-open (treat as no backlog)")
+        # Re-check blind-floor with the newly errored backlog signal
+        is_blind, _ = _tick_blind_and_dolt(signals_errored, now, state)
+        if is_blind:
+            _log("tick: BLIND SWEEP (all 3 signals errored) — skipping stall verdict")
+            return False
         _maybe_recover(state, "backlog-signal unavailable")
         return False
 
@@ -590,7 +808,7 @@ def _selftest():
     # We are executing in __main__ context, so the module globals ARE our globals.
     # Use `global` to inject into the correct namespace.
     global _read_pilot_log_lines, _read_gate_log_lines, _git_log_count
-    global _bd_backlog, _do_mail_mayor, _do_notify
+    global _bd_backlog, _do_mail_mayor, _do_notify, _do_dolt_probe
 
     ok_count = [0]
     fail_count = [0]
@@ -632,7 +850,9 @@ def _selftest():
                  "labels": ["story:approved"]} for i in range(count)]
 
     def _reset():
-        return {"pending": 0, "last_escalate": 0.0, "escalations": 0}
+        return {"pending": 0, "last_escalate": 0.0, "escalations": 0,
+                "blind_pending": 0, "blind_last_escalate": 0.0,
+                "dolt_pending": 0, "dolt_last_escalate": 0.0}
 
     def _stub_mail(subject, body):
         mail_calls.append((subject, body))
@@ -643,6 +863,9 @@ def _selftest():
 
     _do_mail_mayor = _stub_mail
     _do_notify = _stub_notify
+    # imp08: stub Dolt probe as healthy by default so existing scenarios A-G are
+    # not affected by whatever the live Dolt state is during the selftest.
+    _do_dolt_probe = lambda: 0   # 0=healthy — overridden per imp08 scenario as needed
 
     print("\n[tsw selftest] running scenarios...\n")
 
@@ -783,6 +1006,120 @@ def _selftest():
         _ok("G: all braked/in-flight/manual beads excluded → no false alarm")
     else:
         _bad("G", "escalations=%d mails=%d" % (st["escalations"], len(mail_calls)))
+
+    # ── imp08-H: 2 signals error → blind, escalates after BLIND_CONFIRM_SWEEPS ─────
+    print("\nimp08 Scenario H: 2-signal error → blind-floor escalates after %d sweeps" % BLIND_CONFIRM_SWEEPS)
+    # To make dispatch_signal ERROR: return [] (empty = unreadable log)
+    _read_pilot_log_lines = lambda: []
+    # To make merge_signal ERROR: stub returns empty list but set gate_log_read=False by
+    # temporarily overriding DISPATCH_LOG to a non-existent path AND making git fail.
+    import sys as _h_sys
+    _saved_dispatch_log = globals().get("DISPATCH_LOG", "")
+    # Inject a non-existent DISPATCH_LOG into the module's global namespace
+    _h_sys.modules[__name__]  # no-op; we're in __main__ so globals() IS module globals
+    _orig_DISPATCH_LOG = DISPATCH_LOG
+    # We can't rebind the module-level name from inside a function easily without globals().
+    # But _read_gate_log_lines=None means merge_signal uses _tail(DISPATCH_LOG).
+    # _tail returns [] on any exception; gate_log_read = os.path.exists(DISPATCH_LOG).
+    # Solution: provide the stub as a list-returning callable, but also make git fail.
+    # The merge_signal considers itself "read" if _read_gate_log_lines is not None (stub).
+    # But an empty gate-log stub + no git = count=0, not an error. We need BOTH to fail.
+    # Correct approach: the merge_signal seam _read_gate_log_lines returns a list
+    # (even empty). To force _SIGNAL_ERROR we need gate_log_read=False AND git to fail.
+    # Use a workaround: make _read_gate_log_lines=None (no stub) so _tail runs on a bogus
+    # path (which returns []) but gate_log_read becomes os.path.exists(bogus_path)=False.
+    # We do this by patching DISPATCH_LOG in our globals() temporarily.
+    _read_gate_log_lines  = None   # use _tail(DISPATCH_LOG) path in merge_signal
+    _git_log_count        = lambda root, since: None   # all git fail → git_any_success=False
+    _bd_backlog           = lambda root: _backlog(3)   # backlog present (readable)
+    _do_dolt_probe        = lambda: 0                  # healthy Dolt (don't conflate)
+    # Patch DISPATCH_LOG to a guaranteed non-existent path so gate_log_read=False
+    globals()["DISPATCH_LOG"] = "/tmp/__tsw_selftest_nonexistent_dispatch_log__"
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+
+    # sweep 1: dispatch+merge error (2 signals) → blind_pending=1, no escalation yet
+    run_tick(NOW, st)
+    if st["blind_pending"] >= 1 and not notify_calls:
+        _ok("H1: 2-signal error sweep 1 → blind_pending incremented, no escalation yet")
+    else:
+        _bad("H1", "blind_pending=%d notifies=%d" % (st.get("blind_pending", -1), len(notify_calls)))
+
+    # sweep 2: same errors → blind_pending=2 >= BLIND_CONFIRM_SWEEPS → escalate
+    run_tick(NOW + 1800, st)
+    if notify_calls and "BLIND" in notify_calls[-1][0].upper():
+        _ok("H2: 2nd blind sweep → notify escalation fired (BLIND in message)")
+    else:
+        _bad("H2", "expected notify with BLIND, got: %r" % notify_calls)
+    # Restore DISPATCH_LOG
+    globals()["DISPATCH_LOG"] = _orig_DISPATCH_LOG
+
+    # ── imp08-I: 1 signal error (not blind) → no blind escalation ────────────────
+    print("\nimp08 Scenario I: 1-signal error → NOT blind, no blind escalation")
+    _read_pilot_log_lines = lambda: []   # dispatch: ERROR
+    # merge: readable (gate log has lines)
+    _read_gate_log_lines  = lambda: []   # empty but readable
+    _git_log_count        = lambda root, since: 0  # git works, returns 0
+    _bd_backlog           = lambda root: []   # empty backlog → legitimate idle
+    _do_dolt_probe        = lambda: 0         # Dolt healthy
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st); run_tick(NOW + 1800, st)
+    blind_notifies = [n for n in notify_calls if "BLIND" in n[0].upper()]
+    if not blind_notifies and st.get("blind_pending", 0) == 0:
+        _ok("I: 1-signal error → blind_pending=0, no BLIND notification")
+    else:
+        _bad("I", "blind_pending=%d blind_notifies=%d" % (st.get("blind_pending", 0), len(blind_notifies)))
+
+    # ── imp08-J: all-readable-zero → idle, no stall, no blind alert ──────────────
+    print("\nimp08 Scenario J: all signals readable and zero → legitimate idle, no alert")
+    _read_pilot_log_lines = lambda: _pilot_lines(0, 3)   # readable, 0 dispatches
+    _read_gate_log_lines  = lambda: []                    # readable, 0 gate-pass
+    _git_log_count        = lambda root, since: 0         # readable, 0 commits
+    _bd_backlog           = lambda root: []               # readable, 0 backlog
+    _do_dolt_probe        = lambda: 0                     # Dolt healthy
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st); run_tick(NOW + 1800, st)
+    if not mail_calls and not notify_calls and st.get("blind_pending", 0) == 0:
+        _ok("J: all-readable-zero → idle, no escalation, no blind alert")
+    else:
+        _bad("J", "mails=%d notifies=%d blind_pending=%d" % (
+             len(mail_calls), len(notify_calls), st.get("blind_pending", 0)))
+
+    # ── imp08-K: Dolt confirmed unreachable → dolt stall escalation ──────────────
+    print("\nimp08 Scenario K: Dolt unreachable (rc=1) → dolt escalation after %d sweeps" % DOLT_CONFIRM_SWEEPS)
+    _read_pilot_log_lines = lambda: _pilot_lines(1, 3)   # dispatch readable (flow present)
+    _read_gate_log_lines  = lambda: []
+    _git_log_count        = lambda root, since: 0
+    _bd_backlog           = lambda root: []
+    _do_dolt_probe        = lambda: 1   # CONFIRMED UNHEALTHY
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+
+    # sweep 1: Dolt unhealthy, but no stall (dispatch=1). dolt_pending=1, no escalation yet.
+    run_tick(NOW, st)
+    if st.get("dolt_pending", 0) >= 1 and not notify_calls:
+        _ok("K1: dolt_pending=1 after first unhealthy sweep, no notify yet")
+    else:
+        _bad("K1", "dolt_pending=%d notifies=%d" % (st.get("dolt_pending", 0), len(notify_calls)))
+
+    # sweep 2: same Dolt unhealthy → dolt_pending=2 >= DOLT_CONFIRM_SWEEPS → escalate
+    run_tick(NOW + 1800, st)
+    dolt_notifies = [n for n in notify_calls if "DOLT" in n[0].upper() or "dolt" in n[0].lower()]
+    if dolt_notifies:
+        _ok("K2: dolt confirmed unhealthy → Dolt escalation notify fired")
+    else:
+        _bad("K2", "expected Dolt notify, got: %r" % notify_calls)
+
+    # ── cleanup ───────────────────────────────────────────────────────────────────
+    _read_pilot_log_lines = None
+    _read_gate_log_lines  = None
+    _git_log_count        = None
+    _bd_backlog           = None
+    _do_notify            = None
+    _do_mail_mayor        = None
+    _do_dolt_probe        = None
 
     print("\n[tsw selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
     sys.exit(0 if fail_count[0] == 0 else 1)
