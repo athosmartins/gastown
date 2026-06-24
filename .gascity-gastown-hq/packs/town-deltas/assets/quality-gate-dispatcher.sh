@@ -977,6 +977,21 @@ log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] $*"; }
 err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] ERROR: $*"; }
 warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] WARN: $*"; }
 
+# ── Per-cycle heartbeat (DPW anti-false-WEDGE) ────────────────────────────────
+# Touch a dedicated heartbeat file at the VERY START of every run — including
+# runs that exit early (lock-contention yield, no-work, headroom DEFER). The
+# daemon-presence-watchdog checks THIS file's mtime (not the main log, which
+# only advances on STATE-CHANGE) to verify liveness. During a sustained quota/
+# headroom defer the main log freezes for hours while the daemon fires every
+# 180s; without this touch, DPW reads a frozen log as "WEDGED" and kickstarts
+# + spams ntfy every 300s (false positive). Fail-open: a touch failure (e.g.
+# tmpfs full) is silently swallowed — it must never abort the dispatcher.
+# The heartbeat file path is $HQ/.gc/logs/quality-gate-dispatcher.heartbeat;
+# $LOG_DIR is set above and mkdir -p'd before exec >> "$LOG".
+_GATE_HB_FILE="$LOG_DIR/quality-gate-dispatcher.heartbeat"
+touch "$_GATE_HB_FILE" 2>/dev/null || true
+unset _GATE_HB_FILE
+
 # ── ga-piscg: systemic spawn-abort escalation (consecutive-abort alert) ───────
 # The dispatcher processes exactly ONE queued marker per sweep. A broken spawn
 # mechanism (gate-reviewer template misconfig / session-cap deadlock — ga-mzc3h)
