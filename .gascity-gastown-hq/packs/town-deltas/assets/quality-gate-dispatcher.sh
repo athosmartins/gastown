@@ -1371,7 +1371,7 @@ fi
 # retry / gate-health-monitor). Star-guide: gate never idles >15min on 1 stale branch.
 MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq '
   def has_rebase_fail: ((.labels // []) | map(select(test("^gate:rebase-attempt:[0-9]+$"))) | length) > 0;
-  sort_by(.created_at)
+  sort_by(.created_at) | reverse
   | (map(select(has_rebase_fail | not)) + map(select(has_rebase_fail)))
   | .[0]')
 MARKER_ID=$(printf '%s\n' "$MARKER" | jq -r '.id')

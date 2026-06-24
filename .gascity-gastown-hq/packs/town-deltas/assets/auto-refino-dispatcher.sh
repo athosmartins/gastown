@@ -806,7 +806,7 @@ while IFS= read -r row; do
       fi
       : ;;  # skip
   esac
-done < <(echo "$CANDIDATES" | jq -c 'sort_by(.created_at // .id) | .[]')
+done < <(echo "$CANDIDATES" | jq -c 'sort_by(.created_at // .id) | reverse | .[]')  # newest-first tiebreak (Athos prioridade 2026-06-24)
 
 # This store yielded an eligible candidate → stop here. $AR_STORE stays pinned to
 # this store so every downstream write targets the bead's own store.
