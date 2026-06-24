@@ -1946,9 +1946,66 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     [ -z "$CONFLICT_FILES" ] && CONFLICT_FILES="merge conflict (files unavailable)"
   fi
 
+  # imp22: Constrain auto-rebase to the FF-only / behind-only / clean-tree envelope.
+  # The gate only attempts a server-side rebase when the branch is within a safe
+  # divergence envelope AND the rig git state is clean.  Outside this envelope the
+  # rebase is skipped (treated as transient) so it enters the bounded-retry / Mayor-
+  # escalation path rather than blindly rebasing large or unclean branches:
+  #   (a) Divergence ahead cap (GATE_REBASE_AHEAD_MAX): branch has at most N own
+  #       commits not yet on main.  A large ahead-count risks logical conflicts even
+  #       when textually clean (merge-tree is textual-only).
+  #   (b) Divergence behind cap (GATE_REBASE_BEHIND_MAX): main has moved at most M
+  #       commits since the branch base.  A huge main-delta compounds that risk.
+  #   (c) Clean-tree guard: no ORIG_HEAD / MERGE_HEAD / index.lock in the rig's
+  #       .git dir — signs of a prior interrupted git operation that a worktree
+  #       rebase would collide with.
+  GATE_REBASE_AHEAD_MAX="${GATE_REBASE_AHEAD_MAX:-10}"
+  GATE_REBASE_BEHIND_MAX="${GATE_REBASE_BEHIND_MAX:-50}"
+  REBASE_IN_ENVELOPE=1
+  REBASE_SKIP_REASON=""
+
   if [ "$HAS_CONFLICT" = "0" ]; then
-    # Clean rebase: perform in a temp worktree, push to origin, continue with review.
-    log "  Auto-rebase: no conflicts detected — rebasing $BRANCH onto $MAIN_HEAD_SHA ..."
+    REBASE_AHEAD=$(git_rig rev-list --count "origin/$DEFAULT_BRANCH..origin/$BRANCH" 2>/dev/null || echo "")
+    REBASE_BEHIND=$(git_rig rev-list --count "origin/$BRANCH..origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+
+    if [ -n "$REBASE_AHEAD" ] && [ "$REBASE_AHEAD" -gt "$GATE_REBASE_AHEAD_MAX" ]; then
+      REBASE_IN_ENVELOPE=0
+      REBASE_SKIP_REASON="branch has $REBASE_AHEAD own commits not on main (> GATE_REBASE_AHEAD_MAX=${GATE_REBASE_AHEAD_MAX}) — large divergence risks logical conflicts"
+    fi
+    if [ -n "$REBASE_BEHIND" ] && [ "$REBASE_BEHIND" -gt "$GATE_REBASE_BEHIND_MAX" ]; then
+      REBASE_IN_ENVELOPE=0
+      REBASE_SKIP_REASON="${REBASE_SKIP_REASON:+${REBASE_SKIP_REASON}; }main moved $REBASE_BEHIND commits ahead of branch base (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}) — large main delta compounds conflict risk"
+    fi
+
+    # Clean-tree guard: check rig .git dir for signs of an interrupted git op.
+    if [ "$IS_CONTAINER_RIG" = "1" ]; then
+      _RIG_GIT_DIR=$(git_rig rev-parse --git-dir 2>/dev/null || echo "")
+    else
+      _RIG_GIT_DIR="${GIT_DIR_PATH}/.git"
+    fi
+    if [ -n "$_RIG_GIT_DIR" ] && [ -d "$_RIG_GIT_DIR" ]; then
+      if [ -f "$_RIG_GIT_DIR/ORIG_HEAD" ] || [ -f "$_RIG_GIT_DIR/MERGE_HEAD" ] || [ -f "$_RIG_GIT_DIR/index.lock" ]; then
+        REBASE_IN_ENVELOPE=0
+        _LOCK_FILES=""
+        [ -f "$_RIG_GIT_DIR/ORIG_HEAD"  ] && _LOCK_FILES="${_LOCK_FILES}ORIG_HEAD "
+        [ -f "$_RIG_GIT_DIR/MERGE_HEAD" ] && _LOCK_FILES="${_LOCK_FILES}MERGE_HEAD "
+        [ -f "$_RIG_GIT_DIR/index.lock" ] && _LOCK_FILES="${_LOCK_FILES}index.lock "
+        REBASE_SKIP_REASON="${REBASE_SKIP_REASON:+${REBASE_SKIP_REASON}; }rig .git is unclean (${_LOCK_FILES% }) — prior interrupted git op"
+      fi
+    fi
+
+    if [ "$REBASE_IN_ENVELOPE" = "0" ]; then
+      warn "  Auto-rebase skipped (imp22 envelope): ${REBASE_SKIP_REASON}"
+      HAS_CONFLICT=1
+      CONFLICT_KIND="transient"
+      CONFLICT_FILES="out-of-envelope: ${REBASE_SKIP_REASON}"
+    fi
+  fi
+
+  if [ "$HAS_CONFLICT" = "0" ]; then
+    # Clean rebase within the safe envelope: perform in a temp worktree, push to
+    # origin, continue with review.
+    log "  Auto-rebase: no conflicts detected (ahead=${REBASE_AHEAD:-?} behind=${REBASE_BEHIND:-?}) — rebasing $BRANCH onto $MAIN_HEAD_SHA ..."
     AUTO_REBASE_OK=0
     TMP_REBASE_WT="/tmp/gc-gate-autorebase-$$"
 
