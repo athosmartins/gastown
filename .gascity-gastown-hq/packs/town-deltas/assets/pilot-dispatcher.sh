@@ -3120,8 +3120,27 @@ FIXSEC
         fi
         if [ -n "$_DOMAIN_RIG" ] && [ "$_DOMAIN_RIG" != "gascity" ]; then
           # (1) explicit live crew owner wins.
+          # imp20: honor an EXPLICIT story.assignee (Mayor-set persistent-crew owner) even
+          # when the dead-worker roster is unavailable (_DEADWORKER_OK!=1). The roster is
+          # only needed to DISCOVER liveness — but an explicit Mayor-set assignee is
+          # authoritative by definition. "Roster unavailable" must NOT silently drop the
+          # owner; only "roster available AND assignee confirmed dead" should fall through.
+          # We extract the assignee from the already-loaded STORY JSON (no extra bd call)
+          # and use it directly when the roster is unavailable. When the roster IS
+          # available, _beadid_live_crew_owner already handles the liveness check correctly
+          # (returns 1 for a dead session → correct fall-through to pilot:held).
           local _DOM_CREW_OWNER=""
-          _DOM_CREW_OWNER=$(_beadid_live_crew_owner "$STORY_ID" "$STORY_BEAD_CITY" 2>/dev/null || echo "")
+          local _EXPLICIT_ASSIGNEE=""
+          _EXPLICIT_ASSIGNEE=$(echo "$STORY" | jq -r '(.assignee // "") | select(length>0)' 2>/dev/null || echo "")
+          # Strip dog-pool assignees — those are not authoritative persistent-crew owners.
+          case "$_EXPLICIT_ASSIGNEE" in gastown.dog|gastown.dog-*) _EXPLICIT_ASSIGNEE="" ;; esac
+          if [ "${_DEADWORKER_OK:-0}" != "1" ] && [ -n "$_EXPLICIT_ASSIGNEE" ]; then
+            # Roster unavailable: trust the explicit Mayor-set assignee as authoritative.
+            _DOM_CREW_OWNER="$_EXPLICIT_ASSIGNEE"
+            log "imp20: $STORY_ID has explicit assignee=$_EXPLICIT_ASSIGNEE but roster unavailable (_DEADWORKER_OK!=1) — honoring the Mayor-set owner authoritatively (roster needed only to confirm death, not to discover owner)."
+          else
+            _DOM_CREW_OWNER=$(_beadid_live_crew_owner "$STORY_ID" "$STORY_BEAD_CITY" 2>/dev/null || echo "")
+          fi
           if [ -n "$_DOM_CREW_OWNER" ]; then
             log "ga-lfvs6: $STORY_ID is a $_DOMAIN_RIG domain build with a live persistent-crew owner ($_DOM_CREW_OWNER) — honoring it over the dog pool (was target=$BUILDER_TARGET)."
             BUILDER_TARGET="$_DOM_CREW_OWNER"
@@ -3153,9 +3172,13 @@ FIXSEC
                 bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
                 bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
                 local _hold_until; _hold_until=$(( $(date +%s) + 3600 ))
-                bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "pilot:held" -q 2>/dev/null || true
+                # imp19: atomicity — stamp pilot:held-until:<epoch> FIRST so that if the
+                # process dies between the two label ops the bead is never left as
+                # pilot:held-without-until (which _filter_candidates treats as skip-forever).
+                # The until label alone is harmless (no skip); pilot:held alone is the trap.
                 bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "pilot:held-until:${_hold_until}" -q 2>/dev/null || true
-                log "ga-lfvs6/imp20: $STORY_ID stamped pilot:held + pilot:held-until:${_hold_until} (1h timed hold — janitor R6 will clear when expired)"
+                bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "pilot:held" -q 2>/dev/null || true
+                log "ga-lfvs6/imp20: $STORY_ID stamped pilot:held-until:${_hold_until} then pilot:held (1h timed hold — janitor R6 will clear when expired)"
               fi
               return 1
             fi

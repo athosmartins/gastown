@@ -633,6 +633,29 @@ HELD='[{"id":"bd-held","assignee":null,"labels":["story:approved","pilot:held"],
 [ "$(_fc "$HELD")" = '["bd-free"]' ] && ok "pilot:held bead excluded; free story:approved kept (durable release holds)" || bad "pilot:held not excluded (got: $(_fc "$HELD"))"
 grep -qE 'index..pilot:held' "$DISPATCHER" && ok "_filter_candidates carries the pilot:held clause"                      || bad "pilot:held clause missing from _filter_candidates"
 
+# imp19 timed-hold cases: pilot:held + pilot:held-until:<epoch> (both labels present).
+# (a) FUTURE expiry → bead is still held → must be SKIPPED (not dispatchable).
+# (b) PAST expiry   → hold has expired  → must be PASSED THROUGH (dispatchable).
+echo "Scenario 3e2a (imp19): pilot:held + pilot:held-until:<FUTURE> → bead must be SKIPPED"
+_FC_NOW="$(date +%s)"
+_FC_FUTURE=$(( _FC_NOW + 3600 ))
+_FC_PAST=$(( _FC_NOW - 1 ))
+HELD_FUTURE='[{"id":"bd-held-future","assignee":null,"labels":["story:approved","pilot:held","pilot:held-until:'"$_FC_FUTURE"'"],"description":"x"},{"id":"bd-free2","assignee":null,"labels":["story:approved"],"description":"x"}]'
+_fc_res_future="$(_fc "$HELD_FUTURE")"
+case "$_fc_res_future" in
+  *bd-held-future*) bad "imp19: held+future-until bead leaked into candidates (should be SKIPPED): $(_fc "$HELD_FUTURE")" ;;
+  *) ok "imp19(a): pilot:held + pilot:held-until:<FUTURE> → SKIPPED (hold still active)" ;;
+esac
+[ "$(_fc "$HELD_FUTURE")" = '["bd-free2"]' ] && ok "imp19(a): only the free bead passes through" || bad "imp19(a): unexpected candidate set: $(_fc "$HELD_FUTURE")"
+
+echo "Scenario 3e2b (imp19): pilot:held + pilot:held-until:<PAST> → bead must be PASSED THROUGH (dispatchable)"
+HELD_PAST='[{"id":"bd-held-past","assignee":null,"labels":["story:approved","pilot:held","pilot:held-until:'"$_FC_PAST"'"],"description":"x"},{"id":"bd-free3","assignee":null,"labels":["story:approved"],"description":"x"}]'
+_fc_res_past="$(_fc "$HELD_PAST")"
+case "$_fc_res_past" in
+  *bd-held-past*) ok "imp19(b): pilot:held + pilot:held-until:<PAST> → PASSED THROUGH (hold expired)" ;;
+  *) bad "imp19(b): expired-hold bead was incorrectly skipped (should be dispatchable): $_fc_res_past" ;;
+esac
+
 # ── Scenario 3f: pre-approval lifecycle stories are excluded (ga-w7wvm) ─────────
 # The Pilot dispatches ONLY story:approved features; pre-approval lifecycle states
 # (story:triage / story:unrefined / story:refinement-in-progress) and the terminal
