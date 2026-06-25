@@ -94,6 +94,18 @@ MAX_BIG="${MAX_BIG:-2}"
 # the gate-reviewer template's max_active_sessions=6.
 MAX_REVIEWERS="${MAX_REVIEWERS:-6}"
 
+# ── wa-worker spawn cap (ga-v3o6i runaway fix) ────────────────────────────────
+# Max concurrent live (active + creating) wa-worker sessions. Mirrors the agent's
+# max_active_sessions=4. Before spawning, Pilot counts live sessions via `gc
+# session list`; if >= cap, it skips the spawn and relies on the supervisor
+# reconciler to start a session once a slot is free. This prevents the runaway
+# that spawned 39 sessions when earlier sweeps' workers hadn't drained yet.
+# Override via plist env or test seam: PILOT_WA_WORKER_MAX=4
+PILOT_WA_WORKER_MAX="${PILOT_WA_WORKER_MAX:-4}"
+# TEST-ONLY seam: when set, overrides the live `gc session list` count.
+# Format: a raw integer (e.g. "0" = pool empty, "4" = pool full).
+PILOT_TEST_WA_WORKER_LIVE_COUNT="${PILOT_TEST_WA_WORKER_LIVE_COUNT:-}"
+
 # Acceptance-criteria count threshold for auto-classifying a story as BIG.
 BIG_CRITERIA_THRESHOLD="${BIG_CRITERIA_THRESHOLD:-5}"
 
@@ -3573,13 +3585,31 @@ TASK
         # counts it as pool demand (capped at max_active_sessions=4).
         bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "gc.routed_to=wa-worker" -q 2>/dev/null || true
         if [ "${PILOT_SPAWN_WA_WORKER:-1}" = "1" ]; then
-          log "  ga-mfeip: rig assign OK — $STORY_ID.assignee=$_SLING_TARGET (slot=$BUILDER_TARGET). Spawning ephemeral worker (pilot-spawn)."
-          if timeout 30 gc --city "$GC_CITY" session new wa-worker --no-attach \
-              --title-hint "build $STORY_ID: $STORY_TITLE" \
-              >/dev/null 2>&1; then
-            log "  ga-mfeip: wa-worker session spawned for $STORY_ID (slot=$BUILDER_TARGET)."
+          # ── ga-v3o6i: max-cap guard — count live sessions before spawning ──────
+          # Each sweep dispatches a bead then spawns a session. Without a cap check,
+          # rapid re-sweeps (or slow session startup) spawn N sessions for M beads
+          # where N >> M (the prior 39-session runaway). Count active + creating
+          # sessions; skip the spawn if at cap (bead is assigned+gc.routed_to set —
+          # the reconciler will start a session when a slot frees, or the supervisor
+          # will pick it up on its next scale_check tick). Fail-open on probe error.
+          if [ -n "${PILOT_TEST_WA_WORKER_LIVE_COUNT:-}" ]; then
+            _live_wa_count="$PILOT_TEST_WA_WORKER_LIVE_COUNT"
           else
-            warn "ga-mfeip: Could not spawn wa-worker for $STORY_ID — gc.routed_to=wa-worker set; supervisor reconcile will pick it up"
+            _live_wa_count=$(timeout 10 gc --city "$GC_CITY" session list --json 2>/dev/null \
+              | jq '[.sessions[]? | select(.template=="wa-worker" and (.state=="active" or .state=="creating"))] | length' 2>/dev/null || echo "0")
+          fi
+          _live_wa_count="${_live_wa_count:-0}"
+          if [ "${_live_wa_count:-0}" -ge "${PILOT_WA_WORKER_MAX:-4}" ] 2>/dev/null; then
+            log "  ga-mfeip: wa-worker pool at session cap ($_live_wa_count active/creating >= ${PILOT_WA_WORKER_MAX:-4} max) — skip spawn for $STORY_ID (bead stays assigned=wa-worker, gc.routed_to set; supervisor picks it up when slot frees)"
+          else
+            log "  ga-mfeip: rig assign OK — $STORY_ID.assignee=$_SLING_TARGET (slot=$BUILDER_TARGET). Spawning ephemeral worker (pilot-spawn, live=$_live_wa_count < ${PILOT_WA_WORKER_MAX:-4})."
+            if timeout 30 gc --city "$GC_CITY" session new wa-worker --no-attach \
+                --title-hint "build $STORY_ID: $STORY_TITLE" \
+                >/dev/null 2>&1; then
+              log "  ga-mfeip: wa-worker session spawned for $STORY_ID (slot=$BUILDER_TARGET)."
+            else
+              warn "ga-mfeip: Could not spawn wa-worker for $STORY_ID — gc.routed_to=wa-worker set; supervisor reconcile will pick it up"
+            fi
           fi
         else
           log "  ga-mfeip: PILOT_SPAWN_WA_WORKER=0 — skipping auto-spawn for $STORY_ID (wa-worker; bead stays assigned until manual start)"
