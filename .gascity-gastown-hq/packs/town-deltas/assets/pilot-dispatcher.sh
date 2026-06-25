@@ -3461,7 +3461,10 @@ TASK
     log "DRY_RUN=1 — WOULD DISPATCH (tier=$DISPATCH_TIER lane=$LANE rig_native=$_IS_RIG_NATIVE):"
     if [ "$_IS_RIG_NATIVE" = "1" ]; then
       log "  RIG-NATIVE path (ga-mfeip): bd -C $STORY_BEAD_CITY update $STORY_ID --assignee $_SLING_TARGET (slot=$BUILDER_TARGET)"
-      log "  WOULD: gc --city $GC_CITY session nudge $_SLING_TARGET <task_prompt>"
+      case "$_SLING_TARGET" in
+        wa-worker*) log "  WOULD: gc --city $GC_CITY session new wa-worker --no-attach --title-hint 'build $STORY_ID: ...' (pilot-spawn: ephemeral worker, not nudge)" ;;
+        *)          log "  WOULD: gc --city $GC_CITY session nudge $_SLING_TARGET <task_prompt>" ;;
+      esac
     elif [ "$_DISPATCH_REUSE" = "1" ]; then
       [ "$_DISPATCH_SESS_STATE" = "asleep" ] \
         && log "  WOULD: gc session wake $_DISPATCH_SESS_REF (reuse existing asleep session — gt-4st3n)"
@@ -3515,10 +3518,40 @@ TASK
     bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "pilot.sling_bead=$STORY_ID" -q 2>/dev/null || true
     SLING_BEAD_ID="$STORY_ID"
     DISPATCH_RESULT="rig_native_ok"
-    log "  ga-mfeip: rig assign OK — $STORY_ID.assignee=$_SLING_TARGET (slot=$BUILDER_TARGET). Nudging crew."
-    timeout 15 gc --city "$GC_CITY" session nudge "$_SLING_TARGET" "$DISPATCH_TASK" \
-      2>/dev/null \
-      || warn "ga-mfeip: Could not nudge $_SLING_TARGET — crew will see $STORY_ID on next hook cycle"
+    # ── pilot-spawn: ephemeral pool worker vs persistent crew ──────────────────
+    # wa-worker has min_active_sessions=0 and wake_mode=fresh — there is NO running
+    # session to nudge and NO hook cycle to "see it next time". Instead, spawn a fresh
+    # headless session so it starts immediately, runs its startup protocol (prompt.template.md),
+    # and finds the bead via AssignedReadyQuery (assignee=wa-worker matches the session's
+    # GC_AGENT/GC_TEMPLATE) or RoutedPoolQuery (gc.routed_to=wa-worker, set below).
+    # Named crew (mila-wa, oracle-wa, …) remain on the nudge path: they have persistent
+    # sessions with a running hook cycle. Set PILOT_SPAWN_WA_WORKER=0 to disable spawning
+    # and revert to nudge-only (for debugging; bead stays assigned until manual start).
+    case "$_SLING_TARGET" in
+      wa-worker*)
+        # Set gc.routed_to so RoutedPoolQuery finds the bead AND supervisor scale_check
+        # counts it as pool demand (capped at max_active_sessions=4).
+        bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "gc.routed_to=wa-worker" -q 2>/dev/null || true
+        if [ "${PILOT_SPAWN_WA_WORKER:-1}" = "1" ]; then
+          log "  ga-mfeip: rig assign OK — $STORY_ID.assignee=$_SLING_TARGET (slot=$BUILDER_TARGET). Spawning ephemeral worker (pilot-spawn)."
+          if timeout 30 gc --city "$GC_CITY" session new wa-worker --no-attach \
+              --title-hint "build $STORY_ID: $STORY_TITLE" \
+              >/dev/null 2>&1; then
+            log "  ga-mfeip: wa-worker session spawned for $STORY_ID (slot=$BUILDER_TARGET)."
+          else
+            warn "ga-mfeip: Could not spawn wa-worker for $STORY_ID — gc.routed_to=wa-worker set; supervisor reconcile will pick it up"
+          fi
+        else
+          log "  ga-mfeip: PILOT_SPAWN_WA_WORKER=0 — skipping auto-spawn for $STORY_ID (wa-worker; bead stays assigned until manual start)"
+        fi
+        ;;
+      *)
+        log "  ga-mfeip: rig assign OK — $STORY_ID.assignee=$_SLING_TARGET (slot=$BUILDER_TARGET). Nudging crew."
+        timeout 15 gc --city "$GC_CITY" session nudge "$_SLING_TARGET" "$DISPATCH_TASK" \
+          2>/dev/null \
+          || warn "ga-mfeip: Could not nudge $_SLING_TARGET — crew will see $STORY_ID on next hook cycle"
+        ;;
+    esac
     log "Dispatch complete (rig-native): bead=$STORY_ID target=$_SLING_TARGET slot=$BUILDER_TARGET (ga-mfeip)"
   else
     local SLING_TITLE SLING_OUT

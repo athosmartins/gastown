@@ -2697,7 +2697,7 @@ else
 fi
 
 echo "Scenario NEW-E: gate FAIL wa-worker nudge routes to Mayor (ephemeral, already drained)"
-GATE_DISP="/Users/athos/gt/.claude/worktrees/agent-adedcf590ff10195e/.gascity-gastown-hq/packs/town-deltas/assets/quality-gate-dispatcher.sh"
+GATE_DISP="${PILOT_CITY_OVERRIDE:-/Users/athos/gt/.gascity-gastown-hq}/packs/town-deltas/assets/quality-gate-dispatcher.sh"
 if grep -qE 'wa-worker.*ephemeral|routing FAIL nudge to Mayor' "$GATE_DISP" 2>/dev/null; then
   ok "wa-worker FAIL nudge normalized to Mayor (gate-dispatcher wired)"
 else
@@ -2709,6 +2709,39 @@ if grep -q 'CREW PM-CHOICE ESCAPE HATCH' "$DISPATCHER"; then
   ok "PM-choice escape hatch documented in dispatcher (pilot-rewire spec item 8)"
 else
   bad "PM-choice escape hatch comment MISSING — mechanism exists but undocumented"
+fi
+
+# ── Scenario NEW-G through NEW-J: pilot-spawn auto-spawn checks ───────────────
+# Verify the FOLLOW-UP #2 fix: ephemeral wa-worker spawns via gc session new,
+# not nudge-and-wait. These are structural pattern checks on the dispatcher source.
+
+echo "Scenario NEW-G: wa-worker dispatch uses gc session new (spawn), not nudge"
+if grep -q "session new wa-worker --no-attach" "$DISPATCHER"; then
+  ok "dispatcher spawns wa-worker via 'gc session new wa-worker --no-attach' (pilot-spawn fix)"
+else
+  bad "dispatcher does NOT spawn wa-worker — missing 'gc session new wa-worker --no-attach' (FOLLOW-UP #2 not applied)"
+fi
+
+echo "Scenario NEW-H: crew dispatch (non-wa-worker) still uses session nudge"
+# The nudge must still exist for named crew in the rig-native path
+if grep -qE 'session nudge.*_SLING_TARGET.*DISPATCH_TASK|session nudge.*SLING_TARGET.*DISPATCH_TASK' "$DISPATCHER"; then
+  ok "named crew (non-wa-worker) rig-native dispatch still uses session nudge (spawn only for ephemeral pool)"
+else
+  bad "session nudge path MISSING — named crew rig-native dispatch may be broken"
+fi
+
+echo "Scenario NEW-I: gc.routed_to=wa-worker metadata set before spawn (supervisor demand visibility)"
+if grep -q 'set-metadata "gc.routed_to=wa-worker"' "$DISPATCHER"; then
+  ok "gc.routed_to=wa-worker stamped before spawn (supervisor scale_check + RoutedPoolQuery)"
+else
+  bad "gc.routed_to=wa-worker NOT stamped — supervisor demand count blind; RoutedPoolQuery misses the bead"
+fi
+
+echo "Scenario NEW-J: PILOT_SPAWN_WA_WORKER guard present (spawn path is toggleable)"
+if grep -q 'PILOT_SPAWN_WA_WORKER' "$DISPATCHER"; then
+  ok "PILOT_SPAWN_WA_WORKER toggle present (set to 0 to revert to nudge-only for debugging)"
+else
+  bad "PILOT_SPAWN_WA_WORKER toggle MISSING — no way to disable auto-spawn without patching"
 fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────

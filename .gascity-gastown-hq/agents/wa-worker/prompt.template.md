@@ -22,6 +22,9 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # Step 1b: If none, check for assigned ready work (claimed by the sling, verify+start)
 {{ .AssignedReadyQuery }}
 
+# Step 1b2: If none, check for ROUTED pool demand (gc.routed_to=wa-worker metadata)
+{{ .RoutedPoolQuery }}
+
 # Step 1c: If none, no work — drain and exit.
 gc runtime drain-ack && exit
 ```

@@ -39,3 +39,12 @@ idle_timeout = "2h"
 wake_mode = "fresh"
 model = "sonnet"
 provider = "claude-headless"
+# NOTE: dir= intentionally ABSENT (pilot-spawn fix). Setting dir="whatsapp_automation"
+# makes the agent rig-scoped, which prevents `gc session new wa-worker` from
+# discovering it (city-level command only finds city-scoped agents). The Pilot
+# spawns wa-workers explicitly via `gc session new wa-worker --no-attach` after
+# bd assign (rig-native path); rig context comes from work_dir (not dir=).
+# Without dir=, the supervisor scale_check reads the HQ store (not WA); that is
+# acceptable because we spawn explicitly — we do NOT rely on supervisor auto-spawn.
+# If gc sling cross-store routing is ever needed add --force; rig-native path uses
+# bd assign directly and never needs gc sling for WA beads.
