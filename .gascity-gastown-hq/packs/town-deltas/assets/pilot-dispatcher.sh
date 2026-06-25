@@ -387,26 +387,30 @@ SELF_BEAD_ID="ga-8c1"
 # Canonical crew-agent naming convention (ga-nkkku): <name>-<sigla>
 # Sigla → rig mapping (source of truth):
 #   lx = lexbh              (batista-lx)
-#   wa = whatsapp_automation (digo-wa, mila-wa, oracle-wa, peter-wa, thies-wa)
+#   wa = whatsapp_automation (wa-worker pool — ephemeral; 4 virtual slots wa-worker-1..4)
 #   ps = property_scrapers  (batista-ps)
 #   ma = marketing
 #   hq = gastown-hq         (system/infra agents)
 # rig_to_builders <rig> — print the rig's ORDERED builder POOL (space-separated).
-# A rig with >1 interchangeable single-identity crew (e.g. whatsapp_automation:
-# digo/mila/oracle/peter/thies-wa) is a POOL: the dispatcher distributes work
-# across its members (ga-mtlm6) instead of piling every bead on one. Pool order
-# is the dispatch preference (first-eligible wins). Single-member rigs are a pool
-# of one — behaviourally identical to the pre-ga-mtlm6 single-target routing.
+# A rig with >1 interchangeable single-identity crew is a POOL: the dispatcher
+# distributes work across its members (ga-mtlm6) instead of piling every bead on
+# one. Pool order is the dispatch preference (first-eligible wins). Single-member
+# rigs are a pool of one — behaviourally identical to the pre-ga-mtlm6 routing.
+#
+# pilot-rewire: WA now uses 4 VIRTUAL SLOTS (wa-worker-1..4) instead of named crews.
+# Each slot maps to the wa-worker agent template via wa_worker_template(). PILOT_USED_BUILDERS
+# tracks slots so up to 4 WA beads can dispatch in one sweep (one per slot). The actual
+# sling/assign/nudge target is always "wa-worker" (the template), never a slot name.
 rig_to_builders() {
   local rig="$1"
   case "$rig" in
-    gascity)               echo "gastown.dog"    ;;
-    whatsapp_automation|wa) echo "digo-wa mila-wa oracle-wa peter-wa thies-wa" ;;
-    property_scrapers|ps)  echo "batista-ps"     ;;
-    gastown|gt)            echo "gastown.dog"    ;;
-    lexbh|lx)              echo "gastown.dog"    ;;
-    marketing|ma)          echo "gastown.dog"    ;;
-    *)                     echo "gastown.dog"    ;;
+    gascity)               echo "gastown.dog"                                  ;;
+    whatsapp_automation|wa) echo "wa-worker-1 wa-worker-2 wa-worker-3 wa-worker-4" ;;
+    property_scrapers|ps)  echo "batista-ps"                                   ;;
+    gastown|gt)            echo "gastown.dog"                                  ;;
+    lexbh|lx)              echo "gastown.dog"                                  ;;
+    marketing|ma)          echo "gastown.dog"                                  ;;
+    *)                     echo "gastown.dog"                                  ;;
   esac
 }
 
@@ -414,6 +418,18 @@ rig_to_builders() {
 rig_to_builder() {
   set -- $(rig_to_builders "$1")
   echo "${1:-gastown.dog}"
+}
+
+# wa_worker_template <slot> — map a wa-worker-N pool slot to the actual agent template.
+# Pool slots (wa-worker-1..4) are virtual identities used ONLY for PILOT_USED_BUILDERS
+# tracking so distinct slots can be used in one sweep. The real agent template is
+# "wa-worker"; `gc session nudge` and `bd update --assignee` must use this name.
+# For any non-wa-worker identity, the identity itself is returned unchanged.
+wa_worker_template() {
+  case "$1" in
+    wa-worker-[0-9]*) echo "wa-worker" ;;
+    *)                echo "$1"        ;;
+  esac
 }
 
 # ── wa-root-worktree-isolation: rig-root → worktree dispatch directive ─────────
@@ -639,7 +655,7 @@ bead_content_rig() {
 rig_domain_default_builder() {
   case "$1" in
     property_scrapers|ps)   echo "batista-ps" ;;
-    whatsapp_automation|wa) echo "mila-wa"    ;;
+    whatsapp_automation|wa) echo ""           ;;  # WA uses the pool (wa-worker), not a named-crew domain default — no spurious pilot:held
     *)                      echo ""           ;;
   esac
 }
@@ -1732,7 +1748,7 @@ _beadid_live_crew_owner() {
   _asg=$(bd -C "$_db" show "$_bid" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
   { [ -z "$_asg" ] || [ "$_asg" = "null" ]; } && return 1
-  case "$_asg" in gastown.dog|gastown.dog-*) return 1 ;; esac
+  case "$_asg" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*) return 1 ;; esac
   _session_is_live "$_asg" || return 1
   printf '%s' "$_asg"
   return 0
@@ -3141,12 +3157,14 @@ FIXSEC
             local _BEAD_CREATED_BY _BEAD_ASSIGNEE_RAW _OWNER_RIG_SIGNAL=""
             _BEAD_CREATED_BY=$(echo "$STORY" | jq -r '(.created_by // "") | select(length>0)' 2>/dev/null || echo "")
             _BEAD_ASSIGNEE_RAW=$(echo "$STORY" | jq -r '(.assignee // "") | select(length>0)' 2>/dev/null || echo "")
-            # Strip dog-pool assignees — only persistent named-crew owners count.
-            case "$_BEAD_ASSIGNEE_RAW" in gastown.dog|gastown.dog-*) _BEAD_ASSIGNEE_RAW="" ;; esac
+            # Strip dog-pool and ephemeral-worker assignees — only persistent named-crew owners count.
+            # wa-worker* is ephemeral (not a named crew) so it must not be treated as a domain signal.
+            case "$_BEAD_ASSIGNEE_RAW" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*) _BEAD_ASSIGNEE_RAW="" ;; esac
             # Check created_by first (the FILER = true domain owner), then assignee as fallback.
-            case "$_BEAD_CREATED_BY" in *-wa) _OWNER_RIG_SIGNAL="whatsapp_automation" ;; esac
+            # wa-worker* as creator also signals WA domain (it ran a WA build that created this bead).
+            case "$_BEAD_CREATED_BY" in *-wa|wa-worker*) _OWNER_RIG_SIGNAL="whatsapp_automation" ;; esac
             if [ -z "$_OWNER_RIG_SIGNAL" ]; then
-              case "$_BEAD_ASSIGNEE_RAW" in *-wa) _OWNER_RIG_SIGNAL="whatsapp_automation" ;; esac
+              case "$_BEAD_ASSIGNEE_RAW" in *-wa|wa-worker*) _OWNER_RIG_SIGNAL="whatsapp_automation" ;; esac
             fi
             if [ -n "$_OWNER_RIG_SIGNAL" ]; then
               _DOMAIN_RIG="$_OWNER_RIG_SIGNAL"
@@ -3172,8 +3190,23 @@ FIXSEC
           local _DOM_CREW_OWNER=""
           local _EXPLICIT_ASSIGNEE=""
           _EXPLICIT_ASSIGNEE=$(echo "$STORY" | jq -r '(.assignee // "") | select(length>0)' 2>/dev/null || echo "")
-          # Strip dog-pool assignees — those are not authoritative persistent-crew owners.
-          case "$_EXPLICIT_ASSIGNEE" in gastown.dog|gastown.dog-*) _EXPLICIT_ASSIGNEE="" ;; esac
+          # Strip dog-pool and ephemeral-worker assignees — not authoritative persistent-crew owners.
+          case "$_EXPLICIT_ASSIGNEE" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*) _EXPLICIT_ASSIGNEE="" ;; esac
+          # ITEM 6 (pilot-rewire): strip suspended explicit assignees — dispatching to a
+          # suspended crew leaves the bead assigned-but-unbuilt. Clear the assignee so the
+          # bead falls through to pool routing (pick_pool_builder) instead.
+          # Applied BEFORE the imp20 roster-unavailable path to prevent suspended-crew routing
+          # even when the roster is absent. Fail-open: _crew_is_suspended is already fail-open.
+          if [ -n "$_EXPLICIT_ASSIGNEE" ] && _crew_is_suspended "$_EXPLICIT_ASSIGNEE"; then
+            log "pilot-rewire: $STORY_ID has explicit assignee=$_EXPLICIT_ASSIGNEE but that crew is SUSPENDED — clearing to allow pool routing"
+            _EXPLICIT_ASSIGNEE=""
+          fi
+          # CREW PM-CHOICE ESCAPE HATCH (pilot-rewire spec §8):
+          # A crew sets story.assignee=<self> in its PM session to claim a bead.
+          # This explicit-assignee path dispatches to it, bypassing the wa-worker pool.
+          # Example: `bd assign wa-1234 mila-wa` from mila-wa's session → this guard
+          # honors it and slings to mila-wa, not to wa-worker-*.
+          # Suspended-crew check is applied BEFORE honoring (item 6 above).
           if [ "${_DEADWORKER_OK:-0}" != "1" ] && [ -n "$_EXPLICIT_ASSIGNEE" ]; then
             # Roster unavailable: trust the explicit Mayor-set assignee as authoritative.
             _DOM_CREW_OWNER="$_EXPLICIT_ASSIGNEE"
@@ -3373,25 +3406,37 @@ TASK
 
   log "  Task prompt built (${#DISPATCH_TASK} chars)"
 
+  # ── pilot-rewire: compute _SLING_TARGET (slot → template mapping) ─────────────
+  # wa-worker-N are VIRTUAL POOL SLOTS tracked in PILOT_USED_BUILDERS. The real agent
+  # template name is "wa-worker". All dispatch operations (gc sling, bd --assignee, gc
+  # session nudge) must use _SLING_TARGET (the template), while BUILDER_TARGET continues
+  # tracking the slot identity for per-sweep pool distribution. For non-wa-worker identities
+  # _SLING_TARGET == BUILDER_TARGET (unchanged). Computed here, before the reuse block,
+  # so it is available for session classification and all dispatch paths below.
+  local _SLING_TARGET
+  _SLING_TARGET=$(wa_worker_template "$BUILDER_TARGET")
+
   # ── gt-4st3n: classify the builder's existing session → REUSE vs SPAWN ────────
   # Decide BEFORE dispatch whether the target already has a session we must reuse
-  # rather than spawn a second one alongside. gastown.dog is a dog POOL (multiple
-  # instances by design) → always spawn. Any non-dog crew identity with a live
-  # session → reuse it (hook + non-interrupting follow_up submit); asleep → wake
-  # the existing session first; none → legacy spawn. Read-only classification, so
-  # it runs in dry-run too (the actions below are still gated by DRY_RUN).
+  # rather than spawn a second one alongside. gastown.dog and wa-worker* are ephemeral
+  # pools (multiple instances by design, or short-lived) → always spawn. Any non-dog,
+  # non-ephemeral crew identity with a live session → reuse it (hook + non-interrupting
+  # follow_up submit); asleep → wake the existing session first; none → legacy spawn.
+  # Read-only classification, so it runs in dry-run too (actions below are DRY_RUN gated).
   # Fail-open: classification errors leave _DISPATCH_REUSE=0 → legacy spawn path.
   local _DISPATCH_REUSE=0 _DISPATCH_SESS_STATE="none" _DISPATCH_SESS_REF=""
-  if [ "${PILOT_REUSE_SESSION:-1}" = "1" ] && [ "$BUILDER_TARGET" != "gastown.dog" ]; then
+  local _skip_reuse=0
+  case "$BUILDER_TARGET" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*) _skip_reuse=1 ;; esac
+  if [ "${PILOT_REUSE_SESSION:-1}" = "1" ] && [ "$_skip_reuse" = "0" ]; then
     local _sess_line
-    _sess_line=$(_target_session_state "$BUILDER_TARGET" 2>/dev/null || echo "none")
+    _sess_line=$(_target_session_state "$_SLING_TARGET" 2>/dev/null || echo "none")
     _DISPATCH_SESS_STATE="${_sess_line%% *}"
     case "$_DISPATCH_SESS_STATE" in
       active|asleep)
         _DISPATCH_REUSE=1
         _DISPATCH_SESS_REF="${_sess_line#* }"
-        [ "$_DISPATCH_SESS_REF" = "$_sess_line" ] && _DISPATCH_SESS_REF="$BUILDER_TARGET"
-        log "  REUSE(gt-4st3n): $BUILDER_TARGET has an existing $_DISPATCH_SESS_STATE session ($_DISPATCH_SESS_REF) — will hook + non-interrupting follow_up, NOT spawn a 2nd session." ;;
+        [ "$_DISPATCH_SESS_REF" = "$_sess_line" ] && _DISPATCH_SESS_REF="$_SLING_TARGET"
+        log "  REUSE(gt-4st3n): $_SLING_TARGET has an existing $_DISPATCH_SESS_STATE session ($_DISPATCH_SESS_REF) — will hook + non-interrupting follow_up, NOT spawn a 2nd session." ;;
       *)
         _DISPATCH_SESS_STATE="none" ;;
     esac
@@ -3415,18 +3460,18 @@ TASK
     SLING_TITLE_DRY="$([ "$DISPATCH_TIER" = "bug" ] && echo "fix bug" || echo "build story") $STORY_ID: $STORY_TITLE"
     log "DRY_RUN=1 — WOULD DISPATCH (tier=$DISPATCH_TIER lane=$LANE rig_native=$_IS_RIG_NATIVE):"
     if [ "$_IS_RIG_NATIVE" = "1" ]; then
-      log "  RIG-NATIVE path (ga-mfeip): bd -C $STORY_BEAD_CITY update $STORY_ID --assignee $BUILDER_TARGET"
-      log "  WOULD: gc --city $GC_CITY session nudge $BUILDER_TARGET <task_prompt>"
+      log "  RIG-NATIVE path (ga-mfeip): bd -C $STORY_BEAD_CITY update $STORY_ID --assignee $_SLING_TARGET (slot=$BUILDER_TARGET)"
+      log "  WOULD: gc --city $GC_CITY session nudge $_SLING_TARGET <task_prompt>"
     elif [ "$_DISPATCH_REUSE" = "1" ]; then
       [ "$_DISPATCH_SESS_STATE" = "asleep" ] \
         && log "  WOULD: gc session wake $_DISPATCH_SESS_REF (reuse existing asleep session — gt-4st3n)"
-      log "  gc --city $GC_CITY sling $BUILDER_TARGET <task_bead>   (reuse: routes to existing $_DISPATCH_SESS_STATE session, no spawn)"
+      log "  gc --city $GC_CITY sling $_SLING_TARGET <task_bead>   (reuse: routes to existing $_DISPATCH_SESS_STATE session, no spawn)"
       log "  WOULD: gc session submit $_DISPATCH_SESS_REF <task> --intent follow_up   (non-interrupting hook+nudge — gt-4st3n)"
     else
-      log "  gc --city $GC_CITY sling $BUILDER_TARGET <task_bead> --nudge   (spawn: no existing session)"
+      log "  gc --city $GC_CITY sling $_SLING_TARGET <task_bead> --nudge   (spawn: no existing session)"
     fi
     log "  Task title: '$SLING_TITLE_DRY'"
-    log "  Rig: $STORY_RIG → builder: $BUILDER_TARGET"
+    log "  Rig: $STORY_RIG → builder: $_SLING_TARGET (slot=$BUILDER_TARGET)"
     log "  WOULD: bd label add $STORY_ID lane:${LANE}"
     log "  WOULD: bd label add $STORY_ID story:in-flight (verify durable BEFORE releasing claim)"
     log "  WOULD: bd label remove $STORY_ID pilot:dispatching"
@@ -3440,7 +3485,9 @@ TASK
     # we assign the bead directly in the rig DB and nudge the crew. The bead ID
     # itself acts as the task hook (no separate sling task created). pilot.sling_bead
     # is set to STORY_ID so TTL recovery can track builder activity via assignee.
-    log "  RIG-NATIVE dispatch (ga-mfeip): assigning $STORY_ID → $BUILDER_TARGET in $STORY_BEAD_CITY"
+    # _SLING_TARGET is already computed above (before the reuse block).
+    # For wa-worker-N slots, _SLING_TARGET = "wa-worker"; for others, = BUILDER_TARGET.
+    log "  RIG-NATIVE dispatch (ga-mfeip): assigning $STORY_ID → $_SLING_TARGET (slot=$BUILDER_TARGET) in $STORY_BEAD_CITY"
     # ── ga-mfeip gate (f): dedup — never put two crews on one bead ─────────────
     # The candidate snapshot was taken at the top of the sweep; a sibling claim may have
     # assigned this bead since. Re-read its CURRENT assignee straight from the rig DB.
@@ -3449,16 +3496,16 @@ TASK
     # yields empty → we proceed (never block a dispatch on a probe error).
     _cur_asg=$(timeout 10 bd -C "$STORY_BEAD_CITY" show "$STORY_ID" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
-    if [ -n "$_cur_asg" ] && [ "$_cur_asg" != "$BUILDER_TARGET" ]; then
-      warn "ga-mfeip gate-f: $STORY_ID already assigned to $_cur_asg — skipping dispatch to $BUILDER_TARGET (dedup)."
+    if [ -n "$_cur_asg" ] && [ "$_cur_asg" != "$_SLING_TARGET" ]; then
+      warn "ga-mfeip gate-f: $STORY_ID already assigned to $_cur_asg — skipping dispatch to $_SLING_TARGET (dedup)."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
       DISPATCH_RESULT="rig_dedup_skip"
       return 1
     fi
     if ! timeout 15 bd -C "$STORY_BEAD_CITY" update "$STORY_ID" \
-        --assignee "$BUILDER_TARGET" -q 2>/dev/null; then
-      warn "ga-mfeip: bd update --assignee failed for $STORY_ID → $BUILDER_TARGET. Releasing claim."
+        --assignee "$_SLING_TARGET" -q 2>/dev/null; then
+      warn "ga-mfeip: bd update --assignee failed for $STORY_ID → $_SLING_TARGET. Releasing claim."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
       DISPATCH_RESULT="rig_assign_failed"
@@ -3468,11 +3515,11 @@ TASK
     bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "pilot.sling_bead=$STORY_ID" -q 2>/dev/null || true
     SLING_BEAD_ID="$STORY_ID"
     DISPATCH_RESULT="rig_native_ok"
-    log "  ga-mfeip: rig assign OK — $STORY_ID.assignee=$BUILDER_TARGET. Nudging crew."
-    timeout 15 gc --city "$GC_CITY" session nudge "$BUILDER_TARGET" "$DISPATCH_TASK" \
+    log "  ga-mfeip: rig assign OK — $STORY_ID.assignee=$_SLING_TARGET (slot=$BUILDER_TARGET). Nudging crew."
+    timeout 15 gc --city "$GC_CITY" session nudge "$_SLING_TARGET" "$DISPATCH_TASK" \
       2>/dev/null \
-      || warn "ga-mfeip: Could not nudge $BUILDER_TARGET — crew will see $STORY_ID on next hook cycle"
-    log "Dispatch complete (rig-native): bead=$STORY_ID target=$BUILDER_TARGET (ga-mfeip)"
+      || warn "ga-mfeip: Could not nudge $_SLING_TARGET — crew will see $STORY_ID on next hook cycle"
+    log "Dispatch complete (rig-native): bead=$STORY_ID target=$_SLING_TARGET slot=$BUILDER_TARGET (ga-mfeip)"
   else
     local SLING_TITLE SLING_OUT
     if [ "$DISPATCH_TIER" = "bug" ]; then
@@ -3536,7 +3583,7 @@ TASK
     _sling_attempt=0
     while [ "$_sling_attempt" -lt "$_sling_max" ]; do
       _sling_attempt=$((_sling_attempt + 1))
-      SLING_OUT=$(gc --city "$GC_CITY" sling "$BUILDER_TARGET" \
+      SLING_OUT=$(gc --city "$GC_CITY" sling "$_SLING_TARGET" \
         "$SLING_TITLE" \
         --json \
         2>"$_sling_err_file" || echo "{}")
@@ -3612,12 +3659,12 @@ TASK
         2>/dev/null \
         || warn "Could not submit to $_DISPATCH_SESS_REF — builder will see the task bead (hook) on next cycle"
     else
-      timeout 15 gc --city "$GC_CITY" session nudge "$BUILDER_TARGET" "$DISPATCH_TASK" \
+      timeout 15 gc --city "$GC_CITY" session nudge "$_SLING_TARGET" "$DISPATCH_TASK" \
         2>/dev/null \
-        || warn "Could not nudge $BUILDER_TARGET — builder will see the task bead on next hook cycle"
+        || warn "Could not nudge $_SLING_TARGET — builder will see the task bead on next hook cycle"
     fi
 
-    log "Dispatch complete: sling_bead=$SLING_BEAD_ID target=$BUILDER_TARGET reuse=${_DISPATCH_REUSE} session_state=${_DISPATCH_SESS_STATE}"
+    log "Dispatch complete: sling_bead=$SLING_BEAD_ID target=$_SLING_TARGET slot=$BUILDER_TARGET reuse=${_DISPATCH_REUSE} session_state=${_DISPATCH_SESS_STATE}"
   fi
 
   # ── Transition bead: lane tag + DURABLE story:in-flight (ga-2azzj fix 1) ──────

@@ -1545,6 +1545,13 @@ if [ -n "$AUTHOR" ] && echo "$AUTHOR" | grep -qE "-adhoc-[0-9a-f]+" 2>/dev/null;
   log "  Author '$AUTHOR' looks like a session-id; normalized to base role '$AUTHOR_BASE'."
   AUTHOR="$AUTHOR_BASE"
 fi
+# wa-worker FAIL normalizer (pilot-rewire): a wa-worker build uses an ephemeral session
+# (wa-worker or wa-worker-<sid>) that has already drained by FAIL time.
+# Route FAIL to the Mayor so the human always gets a signal, never a dead-session nudge.
+if [ -n "$AUTHOR" ] && echo "$AUTHOR" | grep -qE "^wa-worker" 2>/dev/null; then
+  log "  Author '$AUTHOR' is a wa-worker ephemeral session — routing FAIL nudge to Mayor (the human signal)"
+  AUTHOR="mayor"
+fi
 
 if [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; then
   err "Cannot derive author authoritatively for bead $BEAD_ID — aborting (fail-safe)."

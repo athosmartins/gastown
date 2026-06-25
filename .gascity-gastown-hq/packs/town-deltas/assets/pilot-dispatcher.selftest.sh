@@ -1182,25 +1182,27 @@ WA_FIVE_BUGS='[
   {"id":"tt-wa5","title":"wa bug 5","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:05Z","metadata":{"story.rig":"whatsapp_automation"}}
 ]'
 
-echo "Scenario 15a: 5 WA bugs in one sweep fan out to 5 DISTINCT crew (not all digo-wa)"
+echo "Scenario 15a: 5 WA bugs — 4 dispatch to distinct wa-worker slots, 5th defers (4-slot pool)"
+# pilot-rewire: WA pool has 4 virtual slots (wa-worker-1..4) all mapping to the wa-worker
+# template. 5 bugs → 4 dispatches fill all slots → 5th correctly defers.
 LOG15A="$(run_capacity 10 "[]" 1 "$WA_FIVE_BUGS")"
 B15A="$(builders_of "$LOG15A")"
 TOTAL15A=$(echo "$B15A" | grep -c .)
 DISTINCT15A=$(echo "$B15A" | sort -u | grep -c .)
-if [ "$TOTAL15A" -ge 5 ] && [ "$DISTINCT15A" -ge 5 ]; then
-  ok "5 dispatches went to 5 distinct crew (total=$TOTAL15A distinct=$DISTINCT15A)"
+if [ "$TOTAL15A" -ge 4 ] && [ "$DISTINCT15A" -ge 4 ]; then
+  ok "4 dispatches went to 4 distinct wa-worker slots (total=$TOTAL15A distinct=$DISTINCT15A)"
 else
-  bad "REGRESSION: WA work not distributed (total=$TOTAL15A distinct=$DISTINCT15A — single-point routing?)"
+  bad "REGRESSION: WA work not distributed to 4 slots (total=$TOTAL15A distinct=$DISTINCT15A — slot exhaustion not working?)"
 fi
-if echo "$B15A" | grep -qvE '^(digo|mila|oracle|peter|thies)-wa$'; then
-  bad "a dispatch targeted a non-WA-crew builder: $(echo "$B15A" | grep -vE '^(digo|mila|oracle|peter|thies)-wa$' | tr '\n' ' ')"
+if echo "$B15A" | grep -qvE '^wa-worker-[0-9]+$'; then
+  bad "a dispatch targeted a non-wa-worker-slot builder: $(echo "$B15A" | grep -vE '^wa-worker-[0-9]+$' | tr '\n' ' ')"
 else
-  ok "every dispatch targeted a member of the WA crew pool"
+  ok "every dispatch targeted a wa-worker-N slot (pilot-rewire: ephemeral pool)"
 fi
-if [ "$(echo "$B15A" | grep -c '^digo-wa$')" -le 1 ]; then
-  ok "digo-wa is no longer the sole sink (appears at most once)"
+if [ "$TOTAL15A" -le 4 ]; then
+  ok "5th WA bug deferred (all 4 slots exhausted — correct slot-based backpressure)"
 else
-  bad "REGRESSION: digo-wa received multiple dispatches in one sweep (pile-up)"
+  bad "REGRESSION: more than 4 dispatches in one sweep (total=$TOTAL15A — slot limit not enforced)"
 fi
 
 echo "Scenario 15b: non-pooled rig unchanged — gascity bugs still route to gastown.dog"
@@ -1212,7 +1214,10 @@ else
   bad "REGRESSION: gascity routing changed (got: $(echo "$B15B" | sort -u | tr '\n' ' '))"
 fi
 
-echo "Scenario 15c: a busy crew (live in-flight work) is EXCLUDED — next idle crew chosen"
+echo "Scenario 15c: WA pool (wa-worker slots) is NOT blocked by named-crew busy-set"
+# pilot-rewire: PILOT_BUSY_BUILDERS tracks named crew but wa-worker-N slots are not named crew.
+# Even when digo-wa has live in-flight work, wa-worker-1 is always available (the busy-set
+# for named crew does not block the ephemeral pool).
 NOW_ISO15="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 INFLIGHT15C="[{\"id\":\"if-digo\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO15\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-digo\"}}]"
 SESSIONS15C='{"sessions":[{"session_name":"digo-wa","closed":false}]}'
@@ -1221,61 +1226,60 @@ WA_ONE_BUG='[{"id":"tt-wax","title":"wa bug x","priority":0,"issue_type":"bug","
 LOG15C="$(run_capacity 10 "$INFLIGHT15C" 1 "$WA_ONE_BUG" "$SESSIONS15C" "$SLINGMAP15C")"
 B15C="$(builders_of "$LOG15C")"
 if echo "$LOG15C" | grep -q "Busy builders (live in-flight): digo-wa"; then
-  ok "computed the busy-builder set from live in-flight work"
+  ok "busy-builder set still computed from live in-flight work (digo-wa busy)"
 else
   bad "did not compute/log the busy-builder set (expected 'Busy builders (live in-flight): digo-wa')"
 fi
-if [ "$B15C" = "digo-wa" ]; then
-  bad "REGRESSION: dispatched to the BUSY crew digo-wa (would risk duplicate session)"
-elif echo "$B15C" | grep -qE '^(mila|oracle|peter|thies)-wa$'; then
-  ok "busy digo-wa excluded; work delivered to an idle crew ($B15C)"
+if echo "$B15C" | grep -qE '^wa-worker-[0-9]+$'; then
+  ok "WA bug dispatched to wa-worker slot ($B15C) — named-crew busy-set does not block ephemeral pool"
+elif [ -z "$B15C" ]; then
+  bad "WA bug deferred (wa-worker slot available but not dispatched — pool routing broken?)"
 else
-  bad "expected an idle WA crew, got: '$B15C'"
+  bad "WA bug dispatched to unexpected target: '$B15C' (expected wa-worker-N)"
 fi
 
-echo "Scenario 15d: ALL crew busy → defer (backpressure), never pile onto one"
-# 4 small in-flight (digo/mila/oracle/peter busy) + 1 big in-flight (thies busy):
-# leaves 1 small slot FREE yet every WA crew is busy → the lone WA bug must DEFER.
-INFLIGHT15D="[\
-{\"id\":\"if-d\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO15\",\"metadata\":{\"pilot.sling_bead\":\"tt-s-d\"}},\
-{\"id\":\"if-m\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO15\",\"metadata\":{\"pilot.sling_bead\":\"tt-s-m\"}},\
-{\"id\":\"if-o\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO15\",\"metadata\":{\"pilot.sling_bead\":\"tt-s-o\"}},\
-{\"id\":\"if-p\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO15\",\"metadata\":{\"pilot.sling_bead\":\"tt-s-p\"}},\
-{\"id\":\"if-t\",\"labels\":[\"story:in-flight\",\"lane:big\"],\"updated_at\":\"$NOW_ISO15\",\"metadata\":{\"pilot.sling_bead\":\"tt-s-t\"}}]"
-SESSIONS15D='{"sessions":[{"session_name":"digo-wa","closed":false},{"session_name":"mila-wa","closed":false},{"session_name":"oracle-wa","closed":false},{"session_name":"peter-wa","closed":false},{"session_name":"thies-wa","closed":false}]}'
-SLINGMAP15D='{"tt-s-d":"digo-wa","tt-s-m":"mila-wa","tt-s-o":"oracle-wa","tt-s-p":"peter-wa","tt-s-t":"thies-wa"}'
-LOG15D="$(run_capacity 10 "$INFLIGHT15D" 1 "$WA_ONE_BUG" "$SESSIONS15D" "$SLINGMAP15D")"
+echo "Scenario 15d: slot-based backpressure — 4 slots exhausted → 5th WA bug defers"
+# pilot-rewire: the wa-worker pool has 4 virtual slots. Within one sweep, each slot
+# can be used ONCE (PILOT_USED_BUILDERS). After 4 dispatches, the 5th WA bug must
+# defer — even though there is still lane capacity. Run with WA_FIVE_BUGS to prove this.
+LOG15D="$(run_capacity 10 "[]" 1 "$WA_FIVE_BUGS")"
 B15D="$(builders_of "$LOG15D")"
-if [ -z "$B15D" ] && echo "$LOG15D" | grep -qE "POOL\(whatsapp_automation\): all crew busy"; then
-  ok "all-busy pool deferred the bug (no dispatch, correct backpressure)"
+TOTAL15D=$(echo "$B15D" | grep -c . 2>/dev/null || echo 0)
+if [ "$TOTAL15D" -le 4 ]; then
+  ok "at most 4 WA dispatches in one sweep (slot-based backpressure enforced; total=$TOTAL15D)"
 else
-  bad "all-busy pool did not defer cleanly (builders='$(echo "$B15D" | tr '\n' ' ')')"
+  bad "REGRESSION: $TOTAL15D WA dispatches in one sweep — 4-slot per-sweep limit not enforced"
+fi
+DISTINCT15D=$(echo "$B15D" | sort -u | grep -c . 2>/dev/null || echo 0)
+if [ "$DISTINCT15D" -eq "$TOTAL15D" ] && [ "$TOTAL15D" -gt 0 ]; then
+  ok "each dispatch used a DISTINCT slot ($DISTINCT15D unique slots — no slot reused in sweep)"
+else
+  bad "slot uniqueness broken (total=$TOTAL15D distinct=$DISTINCT15D — same slot reused?)"
 fi
 
-echo "Scenario 15f: busy crew matched by NAME even when sling task records the session_name"
-# Production shape (verified live): a crew claims its sling task with its
-# GC_SESSION_NAME (e.g. 'digo-wa-gawispcze4o4'), NOT the alias 'digo-wa' the pool
-# lists. The busy-set must normalize the assignee through the session roster so
-# the alias-named pool member is still excluded — otherwise exclusion silently
-# no-ops in prod and a busy crew gets a second task.
+echo "Scenario 15f: WA dispatch goes to wa-worker slot regardless of named-crew session_name in busy-set"
+# pilot-rewire: named crew (e.g. digo-wa) with a session_name-form assignee in the sling-map
+# is still computed into PILOT_BUSY_BUILDERS — but the WA pool no longer contains named crew.
+# The WA bug must dispatch to a wa-worker slot; the digo-wa busy-set is irrelevant.
 INFLIGHT15F="[{\"id\":\"if-digo2\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO15\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-digo2\"}}]"
 SESSIONS15F='{"sessions":[{"session_name":"digo-wa-gawispcze4o4","name":"digo-wa","alias":"digo-wa","id":"ga-wisp-cze4o4","agent_name":"digo-wa","closed":false}]}'
 SLINGMAP15F='{"tt-sling-digo2":"digo-wa-gawispcze4o4"}'
 LOG15F="$(run_capacity 10 "$INFLIGHT15F" 1 "$WA_ONE_BUG" "$SESSIONS15F" "$SLINGMAP15F")"
 B15F="$(builders_of "$LOG15F")"
-if [ "$B15F" = "digo-wa" ]; then
-  bad "REGRESSION: assignee in session_name form not normalized — dispatched to BUSY digo-wa"
-elif echo "$B15F" | grep -qE '^(mila|oracle|peter|thies)-wa$'; then
-  ok "session_name assignee normalized to alias; busy digo-wa excluded (chose $B15F)"
+if echo "$B15F" | grep -qE '^wa-worker-[0-9]+$'; then
+  ok "WA bug dispatched to wa-worker slot ($B15F) — digo-wa session_name busy-set irrelevant to ephemeral pool"
+elif [ -z "$B15F" ]; then
+  bad "WA bug deferred when a wa-worker slot is available — pool routing broken"
 else
-  bad "expected an idle WA crew, got: '$B15F'"
+  bad "WA bug went to unexpected target: '$B15F' (expected wa-worker-N)"
 fi
 
 echo "Scenario 15e: drift-guard — pool routing + selection wired into the live dispatcher"
-has "$DISPATCHER" 'rig_to_builders\(\)'                         "rig_to_builders pool function is defined"
-has "$DISPATCHER" 'digo-wa mila-wa oracle-wa peter-wa thies-wa' "WA rig maps to the full 5-crew pool"
-has "$DISPATCHER" 'pick_pool_builder\(\)'                       "idle-crew selection function is defined"
-has "$DISPATCHER" 'PILOT_BUSY_BUILDERS'                         "busy-builder exclusion set is wired"
+has "$DISPATCHER" 'rig_to_builders\(\)'                                     "rig_to_builders pool function is defined"
+has "$DISPATCHER" 'wa-worker-1 wa-worker-2 wa-worker-3 wa-worker-4'        "WA rig maps to 4 wa-worker slots (pilot-rewire)"
+has "$DISPATCHER" 'wa_worker_template\(\)'                                  "wa_worker_template slot→template mapping function is defined"
+has "$DISPATCHER" 'pick_pool_builder\(\)'                                   "idle-crew selection function is defined"
+has "$DISPATCHER" 'PILOT_BUSY_BUILDERS'                                     "busy-builder exclusion set is wired"
 
 # ── Scenario 16: never-started in-flight recovery (ga-v3z4z) ──────────────────
 # A bead stuck story:in-flight + pilot:dispatched whose dispatch never produced a
@@ -1525,32 +1529,39 @@ else
   bad "frontend bug was not classified/dispatched (no domain=frontend Builder target line)"
 fi
 
-echo "Scenario 17b: data bug (email/financeiro/enrichment) is steered TO digo-wa (prefer rule)"
+echo "Scenario 17b: data bug (email/financeiro/enrichment) dispatched to wa-worker pool (digo-wa no longer in pool)"
+# pilot-rewire: domain prefer for digo-wa is now a no-op because digo-wa is not in the
+# wa-worker pool. Data bugs dispatch to a wa-worker slot (not held for digo-wa).
 DATA_BUILDER="$(builder_for_domain "$LOG17" data)"
-if [ "$DATA_BUILDER" = "digo-wa" ]; then
-  ok "data bug routed to its domain owner digo-wa (prefer)"
+if echo "$DATA_BUILDER" | grep -qE '^wa-worker-[0-9]+$'; then
+  ok "data bug dispatched to wa-worker slot ($DATA_BUILDER) — domain prefer no-op for ephemeral pool"
+elif [ -z "$DATA_BUILDER" ]; then
+  bad "data bug was not dispatched (no domain=data Builder target line)"
 else
-  bad "data bug did not route to digo-wa (got: '${DATA_BUILDER:-none}')"
+  bad "data bug went to unexpected target: '${DATA_BUILDER:-none}' (expected wa-worker-N)"
 fi
 
-echo "Scenario 17c: in one sweep the data bug still reaches digo even though it dispatched second"
-# Proves prefer beats plain rotation: the frontend bug (first) excludes digo and
-# consumes an idle crew; without the prefer rule the data bug would rotate to the
-# NEXT idle crew, not back to digo. The owner must win regardless of dispatch order.
-if [ "$FE_BUILDER" != "digo-wa" ] && [ "$DATA_BUILDER" = "digo-wa" ]; then
-  ok "owner-prefer overrides rotation order (frontend→$FE_BUILDER, data→digo-wa)"
+echo "Scenario 17c: both frontend and data WA bugs go to distinct wa-worker slots (no domain pinning)"
+# pilot-rewire: with ephemeral pool, both frontend and data bugs pick from the same
+# wa-worker-1..4 rotation. Domain routing (prefer/exclude) is a no-op for the new pool.
+if [ -n "$FE_BUILDER" ] && [ -n "$DATA_BUILDER" ] && [ "$FE_BUILDER" != "$DATA_BUILDER" ]; then
+  ok "frontend and data bugs dispatched to distinct wa-worker slots (frontend→$FE_BUILDER, data→$DATA_BUILDER)"
+elif [ -n "$FE_BUILDER" ] && [ -n "$DATA_BUILDER" ] && [ "$FE_BUILDER" = "$DATA_BUILDER" ]; then
+  bad "frontend and data bugs dispatched to SAME slot ($FE_BUILDER) — per-sweep slot uniqueness broken"
 else
-  bad "domain routing did not hold across the sweep (frontend→'${FE_BUILDER:-none}', data→'${DATA_BUILDER:-none}')"
+  bad "domain routing incomplete (frontend='${FE_BUILDER:-none}', data='${DATA_BUILDER:-none}')"
 fi
 
-echo "Scenario 17d: unknown-domain WA bug still rotates normally (FAIL-OPEN, no over-steer)"
+echo "Scenario 17d: unknown-domain WA bug dispatched to wa-worker slot (FAIL-OPEN, no over-steer)"
 WA_UNKNOWN='[{"id":"tt-waunk","title":"wa generic bug with no area signal","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}}]'
 LOG17D="$(run_capacity 10 "[]" 1 "$WA_UNKNOWN")"
 UNK_BUILDER="$(builders_of "$LOG17D")"
-if echo "$UNK_BUILDER" | grep -qE '^(digo|mila|oracle|peter|thies)-wa$'; then
-  ok "unknown-domain bug dispatched to a WA crew member ($UNK_BUILDER) — fail-open intact"
+if echo "$UNK_BUILDER" | grep -qE '^wa-worker-[0-9]+$'; then
+  ok "unknown-domain WA bug dispatched to wa-worker slot ($UNK_BUILDER) — fail-open, pool rotation"
+elif [ -z "$UNK_BUILDER" ]; then
+  bad "unknown-domain WA bug not dispatched (wa-worker slot available but not taken)"
 else
-  bad "unknown-domain bug was not dispatched normally (got: '${UNK_BUILDER:-none}')"
+  bad "unknown-domain WA bug went to unexpected target: '${UNK_BUILDER:-none}'"
 fi
 if echo "$LOG17D" | grep -q "Builder target:.*domain=none"; then
   ok "unknown domain logged as domain=none (classifier returned empty, no spurious steer)"
@@ -1626,24 +1637,27 @@ run_capacity_reuse() { # $1=PILOT_REUSE_SESSION  $2=FAKE_BUGS_JSON  $3=FAKE_SESS
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
 
-# One WA bug → pooled rig; with no in-flight the busy-set is empty so the picker
-# selects the first idle crew (digo-wa), which is the identity we stage a session
-# for below.
+# pilot-rewire: wa-worker-* are ephemeral (like gastown.dog) → excluded from session reuse.
+# Use a property_scrapers bug (routes to batista-ps, a persistent named crew) to test
+# the REUSE mechanism, which only applies to non-ephemeral crew identities.
+GT4_PS_BUG='[{"id":"ps-gt4test","title":"gt-4st3n ps bug","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"property_scrapers"}}]'
 GT4_WA_BUG='[{"id":"tt-gt4wa","title":"gt-4st3n wa bug","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}}]'
 GT4_GC_BUG='[{"id":"tt-gt4gc","title":"gt-4st3n gascity bug","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}]'
-GT4_SESS_ACTIVE='{"sessions":[{"session_name":"digo-wa","alias":"digo-wa","agent_name":"digo-wa","id":"ga-wisp-digo","state":"active","closed":false}]}'
-GT4_SESS_ASLEEP='{"sessions":[{"session_name":"digo-wa","alias":"digo-wa","agent_name":"digo-wa","id":"ga-wisp-digo","state":"asleep","closed":false}]}'
+GT4_SESS_ACTIVE='{"sessions":[{"session_name":"batista-ps","alias":"batista-ps","agent_name":"batista-ps","id":"ga-wisp-batista","state":"active","closed":false}]}'
+GT4_SESS_ASLEEP='{"sessions":[{"session_name":"batista-ps","alias":"batista-ps","agent_name":"batista-ps","id":"ga-wisp-batista","state":"asleep","closed":false}]}'
 GT4_SESS_NONE='{"sessions":[]}'
 GT4_SESS_DOG='{"sessions":[{"session_name":"dog-1","alias":"gastown.dog-1","agent_name":"gastown.dog-1","id":"ga-wisp-dog1","state":"active","closed":false}]}'
 
 echo "Scenario 17a: ACTIVE crew session → REUSE (hook + follow_up submit), never spawn/interrupt"
-LOG17A="$(run_capacity_reuse 1 "$GT4_WA_BUG" "$GT4_SESS_ACTIVE")"
-if echo "$LOG17A" | grep -qE "REUSE\(gt-4st3n\): digo-wa has an existing active session"; then
+# Uses a PS bug → routes to batista-ps (persistent crew, reuse applies).
+# wa-worker-* are ephemeral (like gastown.dog) → excluded from reuse.
+LOG17A="$(run_capacity_reuse 1 "$GT4_PS_BUG" "$GT4_SESS_ACTIVE")"
+if echo "$LOG17A" | grep -qE "REUSE\(gt-4st3n\): batista-ps has an existing active session"; then
   ok "classified the active crew session for reuse (no 2nd spawn)"
 else
-  bad "did not classify the active session for reuse (expected REUSE(gt-4st3n) … active)"
+  bad "did not classify the active session for reuse (expected REUSE(gt-4st3n) … batista-ps … active)"
 fi
-if echo "$LOG17A" | grep -qE "WOULD: gc session submit digo-wa .* --intent follow_up"; then
+if echo "$LOG17A" | grep -qE "WOULD: gc session submit batista-ps .* --intent follow_up"; then
   ok "delivers via non-interrupting follow_up submit to the existing session"
 else
   bad "did not choose non-interrupting follow_up submit for the active session"
@@ -1655,25 +1669,25 @@ else
 fi
 
 echo "Scenario 17b: ASLEEP crew session → wake the EXISTING session, then reuse (no parallel)"
-LOG17B="$(run_capacity_reuse 1 "$GT4_WA_BUG" "$GT4_SESS_ASLEEP")"
-if echo "$LOG17B" | grep -qE "REUSE\(gt-4st3n\): digo-wa has an existing asleep session"; then
+LOG17B="$(run_capacity_reuse 1 "$GT4_PS_BUG" "$GT4_SESS_ASLEEP")"
+if echo "$LOG17B" | grep -qE "REUSE\(gt-4st3n\): batista-ps has an existing asleep session"; then
   ok "classified the asleep crew session for reuse"
 else
-  bad "did not classify the asleep session for reuse (expected REUSE(gt-4st3n) … asleep)"
+  bad "did not classify the asleep session for reuse (expected REUSE(gt-4st3n) … batista-ps … asleep)"
 fi
-if echo "$LOG17B" | grep -qE "WOULD: gc session wake digo-wa"; then
+if echo "$LOG17B" | grep -qE "WOULD: gc session wake batista-ps"; then
   ok "wakes the existing asleep session (no parallel spawn)"
 else
   bad "did not wake the existing asleep session"
 fi
-if echo "$LOG17B" | grep -qE "WOULD: gc session submit digo-wa .* --intent follow_up"; then
+if echo "$LOG17B" | grep -qE "WOULD: gc session submit batista-ps .* --intent follow_up"; then
   ok "asleep path also delivers via non-interrupting follow_up submit"
 else
   bad "asleep path did not choose follow_up submit"
 fi
 
 echo "Scenario 17c: NO existing session → spawn is correct (legacy sling path), no REUSE"
-LOG17C="$(run_capacity_reuse 1 "$GT4_WA_BUG" "$GT4_SESS_NONE")"
+LOG17C="$(run_capacity_reuse 1 "$GT4_PS_BUG" "$GT4_SESS_NONE")"
 if echo "$LOG17C" | grep -q "REUSE(gt-4st3n)"; then
   bad "REGRESSION: claimed reuse when no session exists (would never spawn → starvation)"
 else
@@ -1699,7 +1713,9 @@ else
 fi
 
 echo "Scenario 17e: PILOT_REUSE_SESSION=0 restores legacy behaviour (no reuse classification)"
-LOG17E="$(run_capacity_reuse 0 "$GT4_WA_BUG" "$GT4_SESS_ACTIVE")"
+# Use a PS bug (batista-ps — persistent crew, reuse applies when flag=1).
+# With flag=0, reuse must not fire even for persistent crew.
+LOG17E="$(run_capacity_reuse 0 "$GT4_PS_BUG" "$GT4_SESS_ACTIVE")"
 if echo "$LOG17E" | grep -q "REUSE(gt-4st3n)"; then
   bad "REGRESSION: reuse fired with PILOT_REUSE_SESSION=0 (flag not honoured)"
 else
@@ -1711,13 +1727,12 @@ has "$DISPATCHER" '_target_session_state\(\)'          "session-state classifier
 has "$DISPATCHER" 'PILOT_REUSE_SESSION'                "reuse knob is wired"
 has "$DISPATCHER" 'session submit .* --intent follow_up' "non-interrupting follow_up submit is used"
 has "$DISPATCHER" 'gc --city "\$GC_CITY" session wake'  "asleep-session wake is wired"
-# The wa-1eos defer must be gated behind the legacy (reuse=0) path so a live
-# session is reused, not deferred, when reuse is enabled.
-if grep -qE 'PILOT_REUSE_SESSION:-1.+!= "1".+\&\&.+BUILDER_TARGET.+!= "gastown.dog"' "$DISPATCHER" \
-   || grep -B0 -A0 -E '\[ "\$\{PILOT_REUSE_SESSION:-1\}" != "1" \] && \[ "\$DRY_RUN" != "1" \]' "$DISPATCHER" >/dev/null 2>&1; then
-  ok "wa-1eos defer is gated to the legacy (reuse-disabled) path"
+# The reuse gate: PILOT_REUSE_SESSION=1 AND NOT an ephemeral pool target.
+# pilot-rewire: wa-worker-* and gastown.dog are ephemeral → _skip_reuse=1 → exempt.
+if grep -q '_skip_reuse' "$DISPATCHER" && grep -qE 'gastown\.dog.*wa-worker' "$DISPATCHER"; then
+  ok "reuse gate uses _skip_reuse flag; gastown.dog and wa-worker excluded (pilot-rewire)"
 else
-  bad "wa-1eos defer not gated behind PILOT_REUSE_SESSION!=1"
+  bad "reuse gate structure changed — _skip_reuse or ephemeral exclusion missing"
 fi
 
 # ── Scenario 18 (ga-lfvs6/ga-wgcyk/ga-m3n1x): DOMAIN-aware no-dog routing ─────
@@ -2428,8 +2443,8 @@ has "$DISPATCHER" 'rig_dedup_skip'  "gate (f) dedup-skip result code present"
 # The dedup re-reads the CURRENT assignee from the rig DB right before assigning.
 _dedup_block="$(awk '/RIG-NATIVE dispatch \(ga-mfeip\)/{f=1} f{print} /rig_native_ok/{if(f)exit}' "$DISPATCHER")"
 if printf '%s' "$_dedup_block" | grep -q 'bd -C "\$STORY_BEAD_CITY" show "\$STORY_ID"' \
-   && printf '%s' "$_dedup_block" | grep -q '_cur_asg.*!=.*BUILDER_TARGET'; then
-  ok "gate (f): fresh assignee re-read + mismatch-skip wired before the rig-native assign"
+   && printf '%s' "$_dedup_block" | grep -q '_cur_asg.*!=.*_SLING_TARGET'; then
+  ok "gate (f): fresh assignee re-read + mismatch-skip wired before the rig-native assign (_SLING_TARGET)"
 else
   bad "gate (f): dedup re-check missing from the rig-native dispatch path"
 fi
@@ -2638,6 +2653,62 @@ if grep -qF 'TIER2_JSON=$(echo "$TIER2_JSON" | _filter_exec_manual | _filter_can
   ok "HQ TIER2 filter chain includes full gate set (_filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built)"
 else
   bad "HQ TIER2 filter chain does NOT include full gate set — gate (b) regression on HQ TIER2"
+fi
+
+# ── Scenario NEW-A through NEW-F: pilot-rewire structural checks ───────────────
+# These verify the 8-item pilot-rewire-spec.md changes structurally (source patterns)
+# without requiring a full dispatch run. Complement the runtime Scenario 15 tests.
+
+echo "Scenario NEW-A: _beadid_live_crew_owner excludes wa-worker (not a named crew)"
+if grep -qE 'gastown\.dog\|gastown\.dog-\*\|wa-worker\|wa-worker-\*\)' "$DISPATCHER"; then
+  ok "wa-worker excluded from _beadid_live_crew_owner (like gastown.dog — ephemeral, not a named crew)"
+else
+  bad "wa-worker NOT excluded from _beadid_live_crew_owner — ephemeral worker falsely pins beads"
+fi
+
+echo "Scenario NEW-B (ga-nlh79 + wa-worker): wa-worker* owner/creator → WA rig, not misroute"
+if grep -qE '\*-wa\|wa-worker\*\)' "$DISPATCHER"; then
+  ok "ga-nlh79 case extended to wa-worker* (prevents property misroute for WA builds)"
+else
+  bad "ga-nlh79 case NOT extended — wa-worker-built beads may misroute to property_scrapers"
+fi
+
+echo "Scenario NEW-C: rig_domain_default_builder returns '' for WA (no spurious pilot:held)"
+_RDDB_FN="$(awk '/^rig_domain_default_builder\(\)/{f=1} f{print} f&&/^\}$/{exit}' "$DISPATCHER")"
+_rddb() { ( eval "$_RDDB_FN"; rig_domain_default_builder "$1" ); }
+_rddb_wa="$(_rddb whatsapp_automation 2>/dev/null || echo "ERROR")"
+_rddb_ps="$(_rddb property_scrapers 2>/dev/null || echo "ERROR")"
+_rddb_wa_alias="$(_rddb wa 2>/dev/null || echo "ERROR")"
+[ "$_rddb_wa" = "" ] \
+  && ok "rig_domain_default_builder('whatsapp_automation') = '' (no domain hold for WA)" \
+  || bad "rig_domain_default_builder('whatsapp_automation') = '$_rddb_wa' (expected '' — WA beads may get spurious pilot:held)"
+[ "$_rddb_ps" = "batista-ps" ] \
+  && ok "rig_domain_default_builder('property_scrapers') = 'batista-ps' (unchanged)" \
+  || bad "property_scrapers domain builder regression (got '$_rddb_ps')"
+[ "$_rddb_wa_alias" = "" ] \
+  && ok "rig_domain_default_builder('wa') = '' (short alias also returns empty)" \
+  || bad "wa short alias regression (got '$_rddb_wa_alias')"
+
+echo "Scenario NEW-D: suspended explicit assignee is blocked, bead falls to pool routing"
+if awk '/explicit assignee.*SUSPENDED|crew is SUSPENDED.*clearing/{found=1} END{exit !found}' "$DISPATCHER"; then
+  ok "suspended-crew check wired on explicit-assignee path (pilot-rewire spec item 6)"
+else
+  bad "suspended-crew check MISSING on explicit-assignee path — dispatches to suspended crew"
+fi
+
+echo "Scenario NEW-E: gate FAIL wa-worker nudge routes to Mayor (ephemeral, already drained)"
+GATE_DISP="/Users/athos/gt/.claude/worktrees/agent-adedcf590ff10195e/.gascity-gastown-hq/packs/town-deltas/assets/quality-gate-dispatcher.sh"
+if grep -qE 'wa-worker.*ephemeral|routing FAIL nudge to Mayor' "$GATE_DISP" 2>/dev/null; then
+  ok "wa-worker FAIL nudge normalized to Mayor (gate-dispatcher wired)"
+else
+  bad "wa-worker FAIL nudge NOT normalized — FAIL on wa-worker build goes to a dead session"
+fi
+
+echo "Scenario NEW-F: escape hatch documented — explicit assignee = crew PM-choice mechanism"
+if grep -q 'CREW PM-CHOICE ESCAPE HATCH' "$DISPATCHER"; then
+  ok "PM-choice escape hatch documented in dispatcher (pilot-rewire spec item 8)"
+else
+  bad "PM-choice escape hatch comment MISSING — mechanism exists but undocumented"
 fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
