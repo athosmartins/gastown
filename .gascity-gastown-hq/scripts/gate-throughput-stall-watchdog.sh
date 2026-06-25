@@ -54,6 +54,10 @@ NOTIFY_BIN="${GTSW_NOTIFY_BIN:-/Users/athos/.local/bin/notify}"
 GC_BIN="${GTSW_GC_BIN:-gc}"
 UID_NUM="$(id -u)"
 
+GATE_STALL_COOLDOWN_S="${GATE_STALL_COOLDOWN_S:-7200}"    # 2h dedup window between stall alerts
+GTSW_STATE_DIR="${GTSW_STATE_DIR:-$HOME/.gastown/state}"
+COOLDOWN_FILE="${GTSW_COOLDOWN_FILE:-$GTSW_STATE_DIR/gate-stall-watchdog-last-alert}"
+
 # Launchd labels for auto-recover kickstart
 SUPERVISOR_LABEL="${GTSW_SUPERVISOR_LABEL:-com.gascity.supervisor}"
 GATE_LABEL="${GTSW_GATE_LABEL:-com.gascity.quality-gate-dispatcher}"
@@ -113,6 +117,8 @@ run_sweep() {
   done <<< "$log_lines"
 
   if [ "$queued_found" -eq 0 ]; then
+    # COOLDOWN RESET: queue empty → stall cleared; disarm so next episode re-alerts immediately
+    [ -f "${COOLDOWN_FILE}" ] && { rm -f "${COOLDOWN_FILE}" 2>/dev/null || true; log "COOLDOWN RESET: queue empty — cooldown disarmed"; }
     log "OK: no queued markers found in tail — gate idle (not a stall)"
     return 0
   fi
@@ -173,6 +179,8 @@ run_sweep() {
 
   if [ "$last_passed_epoch" -gt 0 ] && [ $(( now - last_passed_epoch )) -le "$stall_window_sec" ] 2>/dev/null; then
     local age_min; age_min=$(( (now - last_passed_epoch) / 60 ))
+    # COOLDOWN RESET: Gate PASSED recently → stall cleared; disarm so next episode re-alerts immediately
+    [ -f "${COOLDOWN_FILE}" ] && { rm -f "${COOLDOWN_FILE}" 2>/dev/null || true; log "COOLDOWN RESET: Gate PASSED ${age_min}min ago — cooldown disarmed"; }
     log "OK: Gate PASSED ${age_min}min ago (within ${GTSW_STALL_HOURS}h window) — not a stall"
     return 0
   fi
@@ -210,6 +218,24 @@ run_sweep() {
     last_passed_desc="${hours_ago}h ago"
   else
     last_passed_desc="not found in log tail"
+  fi
+
+  # ── COOLDOWN CHECK: suppress dup alerts within GATE_STALL_COOLDOWN_S ─────
+  # Returns 1 (stall still detected) but skips notify/mail so Athos doesn't
+  # get 16 copies of the same alert during a sustained stall episode.
+  # Cooldown is RESET (file deleted) by Guards A and C when the stall clears,
+  # so a genuinely new stall episode re-alerts immediately.
+  local cooldown_s="${GATE_STALL_COOLDOWN_S:-7200}"
+  if [ -f "${COOLDOWN_FILE}" ]; then
+    local last_alert_ep; last_alert_ep="$(cat "${COOLDOWN_FILE}" 2>/dev/null)" || last_alert_ep=0
+    if [ -n "$last_alert_ep" ] && [ "$last_alert_ep" -gt 0 ] 2>/dev/null; then
+      local cd_elapsed; cd_elapsed=$(( now - last_alert_ep ))
+      if [ "$cd_elapsed" -lt "$cooldown_s" ] 2>/dev/null; then
+        local cd_remain; cd_remain=$(( (cooldown_s - cd_elapsed) / 60 ))
+        log "STALL PERSISTS (cooldown active — ${cd_elapsed}s elapsed / ${cooldown_s}s window, ${cd_remain}min remaining — suppressing dup alert). Last pass: ${last_passed_desc}"
+        return 1
+      fi
+    fi
   fi
 
   local msg="GATE THROUGHPUT STALL: queue non-empty, 0 Gate PASSED in ${GTSW_STALL_HOURS}h, not quota-limited, no active reviewer. Last pass: ${last_passed_desc}. Gate froze silently (heartbeat ≠ output). Kickstarting supervisor+gate (GTSW_AUTORECOVER=${GTSW_AUTORECOVER:-1})."
@@ -265,6 +291,11 @@ BODY
         -m "$mail_body" 2>/dev/null || true
   fi
 
+  # ── COOLDOWN WRITE: arm dedup for next GATE_STALL_COOLDOWN_S seconds ─────
+  mkdir -p "${GTSW_STATE_DIR}" 2>/dev/null || true
+  echo "$now" > "${COOLDOWN_FILE}" 2>/dev/null || true
+  log "COOLDOWN ARMED: epoch $now written — dup alerts suppressed for ${cooldown_s}s"
+
   # ── AUTO-RECOVER ──────────────────────────────────────────────────────────
   if [ "${GTSW_AUTORECOVER:-1}" = "1" ]; then
     log "AUTORECOVER: kickstarting supervisor ($SUPERVISOR_LABEL) + gate ($GATE_LABEL)"
@@ -312,6 +343,9 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   GTSW_AUTORECOVER=1
   GTSW_SUPERVISOR_LABEL="com.gascity.supervisor"
   GTSW_GATE_LABEL="com.gascity.quality-gate-dispatcher"
+  COOLDOWN_FILE="$TMP/cooldown"
+  GTSW_STATE_DIR="$TMP"
+  GATE_STALL_COOLDOWN_S=7200
 
   # Stub notify and gc so they record calls but have no side effects
   printf '#!/usr/bin/env bash\necho "notify:$*" >> "$GTSW_TEST_NOTIFIED" 2>/dev/null; exit 0\n' > "$TMP/notify"
@@ -339,6 +373,7 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
 
   # ── Scenario 1: STALL CONFIRMED ───────────────────────────────────────────
   echo "Scenario 1: queue non-empty + no progress + not quota-limited + no reviewer → STALL"
+  rm -f "$TMP/cooldown" 2>/dev/null || true   # ensure no stale cooldown from a previous run
   KICKS1="$TMP/kicks1"; : > "$KICKS1"
   NOTIF1="$TMP/notif1"; : > "$NOTIF1"
   MAIL1="$TMP/mail1";   : > "$MAIL1"
@@ -450,6 +485,7 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
 
   # ── Scenario 9: DRY-RUN → logs but no side effects ───────────────────────
   echo "Scenario 9: GTSW_DRY_RUN=1 → stall detected, logs intent, no notify/mail/kickstart"
+  rm -f "$TMP/cooldown" 2>/dev/null || true   # scenario 7 wrote cooldown file; clear so DRY_RUN path runs
   KICKS9="$TMP/kicks9"; : > "$KICKS9"
   NOTIF9="$TMP/notif9"; : > "$NOTIF9"
   GTSW_DRY_RUN=1
@@ -468,6 +504,60 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   # ── Scenario 10: BASH -N CHECK ───────────────────────────────────────────
   echo "Scenario 10: bash -n syntax check (catch regressions)"
   bash -n "$0" 2>/dev/null && ok "scenario 10: bash -n syntax check passes" || bad "scenario 10: bash -n FAILED — syntax error"
+
+  # ── Scenario 11: COOLDOWN DEDUP ───────────────────────────────────────────
+  echo "Scenario 11: cooldown dedup — alert fires once, 2nd run within window suppresses dup"
+  rm -f "$TMP/cooldown" 2>/dev/null || true  # ensure clean slate
+  NOTIF11a="$TMP/notif11a"; : > "$NOTIF11a"
+  MAIL11a="$TMP/mail11a";   : > "$MAIL11a"
+  KICKS11a="$TMP/kicks11a"; : > "$KICKS11a"
+  GTSW_TEST_LOG_LINES="$(make_log 5)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_KICKSTARTS="$KICKS11a"
+  GTSW_TEST_NOTIFIED="$NOTIF11a"
+  GTSW_TEST_MAILED="$MAIL11a"
+  run_sweep && bad "scenario 11a: 1st stall should return 1" || ok "scenario 11a: 1st stall detected (return 1)"
+  grep -q "notify:" "$NOTIF11a" 2>/dev/null && ok "scenario 11a: notify fired on 1st run" || bad "scenario 11a: notify NOT fired on 1st run"
+  [ -f "$TMP/cooldown" ] && ok "scenario 11a: cooldown file written after alert" || bad "scenario 11a: cooldown file NOT written after alert"
+  # 2nd run — same stall conditions, cooldown should suppress notify+mail
+  NOTIF11b="$TMP/notif11b"; : > "$NOTIF11b"
+  MAIL11b="$TMP/mail11b";   : > "$MAIL11b"
+  KICKS11b="$TMP/kicks11b"; : > "$KICKS11b"
+  GTSW_TEST_NOTIFIED="$NOTIF11b"
+  GTSW_TEST_MAILED="$MAIL11b"
+  GTSW_TEST_KICKSTARTS="$KICKS11b"
+  run_sweep && bad "scenario 11b: 2nd stall should return 1 (stall persists)" || ok "scenario 11b: 2nd stall still returns 1 (cooldown suppressed dup)"
+  [ ! -s "$NOTIF11b" ] && ok "scenario 11b: notify suppressed by cooldown" || bad "scenario 11b: notify fired despite cooldown (dup alert!)"
+  [ ! -s "$MAIL11b" ] && ok "scenario 11b: mail suppressed by cooldown" || bad "scenario 11b: mail fired despite cooldown (dup alert!)"
+  [ ! -s "$KICKS11b" ] && ok "scenario 11b: kickstart suppressed by cooldown" || bad "scenario 11b: kickstart fired despite cooldown"
+  grep -q "cooldown active" "$LOG" 2>/dev/null && ok "scenario 11b: cooldown suppression logged" || bad "scenario 11b: cooldown suppression NOT logged"
+
+  # ── Scenario 12: COOLDOWN RESET ON STALL-CLEAR ────────────────────────────
+  echo "Scenario 12: stall-clear resets cooldown → next stall episode re-alerts immediately"
+  # Pre-condition: cooldown file from 1 minute ago (within 2h window → would suppress)
+  echo "$(( $(date +%s) - 60 ))" > "$TMP/cooldown"
+  # Stall CLEARS via empty queue (Guard A should delete the cooldown file).
+  # make_log 0 produces empty output which hits fail-open before Guard A; use a
+  # non-empty log line with 0 queued markers so Guard A path actually executes.
+  _sc12_now="$(date -u '+%Y-%m-%d %H:%M:%S')"
+  GTSW_TEST_LOG_LINES="[${_sc12_now}] [quality-gate-dispatcher] Found 0 queued marker(s) — gate idle"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  unset GTSW_TEST_KICKSTARTS
+  run_sweep && ok "scenario 12a: stall-clear (empty queue) returns 0" || bad "scenario 12a: stall-clear should return 0"
+  [ ! -f "$TMP/cooldown" ] && ok "scenario 12a: cooldown file deleted on stall-clear (Guard A)" || bad "scenario 12a: cooldown file NOT deleted on stall-clear"
+  # Fresh stall after clear — cooldown was reset, alert should fire again immediately
+  NOTIF12b="$TMP/notif12b"; : > "$NOTIF12b"
+  KICKS12b="$TMP/kicks12b"; : > "$KICKS12b"
+  GTSW_TEST_LOG_LINES="$(make_log 3)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_KICKSTARTS="$KICKS12b"
+  GTSW_TEST_NOTIFIED="$NOTIF12b"
+  GTSW_TEST_MAILED="$TMP/mail12b"
+  run_sweep && bad "scenario 12b: fresh stall after clear should return 1" || ok "scenario 12b: fresh stall after clear detected (return 1 — cooldown re-armed)"
+  grep -q "notify:" "$NOTIF12b" 2>/dev/null && ok "scenario 12b: notify fired on re-armed stall (not suppressed)" || bad "scenario 12b: notify NOT fired on re-armed stall (re-arm failed!)"
 
   # ── CLEANUP / SUMMARY ─────────────────────────────────────────────────────
   # Unset test seams so no state leaks
