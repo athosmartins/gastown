@@ -236,6 +236,12 @@ PILOT_NEVERSTARTED_MINUTES="${PILOT_NEVERSTARTED_MINUTES:-15}"
 # Conservative by construction: 24h default, dual-signal, fail-safe to KEEP.
 PILOT_NEVERSTARTED_OWNER_GRACE_HOURS="${PILOT_NEVERSTARTED_OWNER_GRACE_HOURS:-24}"
 
+# ── Phantom-claim guard threshold (FOLLOW-UP #1, ga-9yb5s+) ──────────────────
+# How long a crew-assigned bead may sit with NO branch before it is treated as a
+# phantom claim (crew took the assignee slot but never started). Default 2700 = 45min.
+# A branch OR a fresh updated_at (within this window) always overrides the threshold.
+PILOT_PHANTOM_STALE_SECS="${PILOT_PHANTOM_STALE_SECS:-2700}"
+
 # ── Reuse existing crew session, never spawn a 2nd one (gt-4st3n) ─────────────
 # A crew identity (e.g. digo-wa, batista-ps) is a single-identity config-agent
 # session. Dispatching to it via `gc sling <identity>` + an immediate
@@ -1741,15 +1747,49 @@ _sling_is_live() {
 # FAIL-OPEN: an untrustworthy roster (_DEADWORKER_OK!=1), an empty/unreadable
 # assignee, a dog-pool assignee, or a dead session → return 1 (assert NO owner),
 # so a genuine orphan is never pinned and the existing recovery paths still fire.
+#
+# PHANTOM-AWARE (FOLLOW-UP #1, ga-9yb5s+): a crew session may be live yet the
+# bead was never started — no crew/<crew>/<bead> branch AND stale > 45min. In
+# that case return 1 (phantom) so the bead releases and flows to the wa-worker
+# pool. Only releases when BOTH confirmed: no branch + stale. Fail-conservative:
+# git/repos undecidable, or updated_at missing/unparseable → KEEP (return owner).
+# Knob: PILOT_PHANTOM_STALE_SECS (default 2700 = 45min).
+# Test seam: PILOT_TEST_PHANTOM_STALE_BEADS (space-list of ids treated as stale).
 _beadid_live_crew_owner() {
-  local _bid="${1:-}" _db="${2:-$GC_CITY}" _asg
+  local _bid="${1:-}" _db="${2:-$GC_CITY}" _asg _bead_json
   [ -n "$_bid" ] || return 1
   [ "${_DEADWORKER_OK:-0}" = "1" ] || return 1
-  _asg=$(bd -C "$_db" show "$_bid" --json 2>/dev/null \
+  _bead_json=$(bd -C "$_db" show "$_bid" --json 2>/dev/null || echo "")
+  _asg=$(printf '%s' "$_bead_json" \
     | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
   { [ -z "$_asg" ] || [ "$_asg" = "null" ]; } && return 1
   case "$_asg" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*) return 1 ;; esac
   _session_is_live "$_asg" || return 1
+
+  # ── Phantom-claim guard ─────────────────────────────────────────────────────
+  local _is_stale=0
+  if [ -n "${PILOT_TEST_PHANTOM_STALE_BEADS+x}" ]; then
+    # Hermetic test seam: bead ids listed here are treated as stale (>45min).
+    case " $PILOT_TEST_PHANTOM_STALE_BEADS " in *" $_bid "*) _is_stale=1 ;; esac
+  else
+    local _upd_epoch _phantom_now
+    _upd_epoch=$(printf '%s' "$_bead_json" | jq -r \
+      'if type=="array" then .[0] else . end | (.updated_at // "")
+       | if . == "" then "0" else (try (fromdateiso8601 | tostring) catch "0") end' \
+      2>/dev/null || echo "0")
+    _phantom_now=$(date +%s)
+    [ "$_upd_epoch" != "0" ] \
+      && [ "$(( _phantom_now - _upd_epoch ))" -gt "${PILOT_PHANTOM_STALE_SECS:-2700}" ] \
+      2>/dev/null && _is_stale=1
+  fi
+  if [ "$_is_stale" = "1" ] \
+     && command -v git >/dev/null 2>&1 \
+     && [ -n "$(_ownership_guard_repos 2>/dev/null)" ] \
+     && ! _beadid_has_crew_branch "$_bid"; then
+    return 1   # phantom: stale + no branch → release for wa-worker re-dispatch
+  fi
+  # ── end phantom-claim guard ─────────────────────────────────────────────────
+
   printf '%s' "$_asg"
   return 0
 }

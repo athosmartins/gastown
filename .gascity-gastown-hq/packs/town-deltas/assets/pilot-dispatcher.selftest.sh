@@ -345,10 +345,13 @@ run_step0() { # FAKE_STALE_JSON
 
 # Runs Step-0c never-started recovery (ga-v3z4z) with an injected in-flight set.
 # Branch existence is faked via PILOT_TEST_BRANCH_BEADS (hermetic — no real git).
-#   $1 = FAKE_NEVERSTARTED_JSON   (beads from the story:in-flight+pilot:dispatched query)
-#   $2 = PILOT_TEST_BRANCH_BEADS  (space-list of ids that "have a branch")
-#   $3 = FAKE_SESSIONS_JSON       (live-session roster; empty → roster untrustworthy)
-#   $4 = FAKE_SLING_ASSIGNEES     (sling→assignee map for the live-worker guard)
+#   $1 = FAKE_NEVERSTARTED_JSON         (beads from the story:in-flight+pilot:dispatched query)
+#   $2 = PILOT_TEST_BRANCH_BEADS        (space-list of ids that "have a branch" via _beadid_has_branch)
+#   $3 = FAKE_SESSIONS_JSON             (live-session roster; empty → roster untrustworthy)
+#   $4 = FAKE_SLING_ASSIGNEES           (sling→assignee map for the live-worker guard)
+#   $5 = PILOT_TEST_CREW_PROGRESSED     (crews treated as "progressed" for owner-grace)
+#   $6 = PILOT_TEST_CREW_BRANCH_BEADS   (space-list of ids with a crew/<crew>/<id> branch — _beadid_has_crew_branch seam)
+#   $7 = PILOT_TEST_PHANTOM_STALE_BEADS (space-list of ids treated as stale >45min — phantom guard seam)
 run_neverstarted() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   reset_state
@@ -364,6 +367,8 @@ run_neverstarted() {
     FAKE_SESSIONS_JSON="${3:-}" \
     FAKE_SLING_ASSIGNEES="${4:-}" \
     PILOT_TEST_CREW_PROGRESSED="${5:-}" \
+    PILOT_TEST_CREW_BRANCH_BEADS="${6:-}" \
+    PILOT_TEST_PHANTOM_STALE_BEADS="${7:-}" \
     FAKE_BLOCKED_IDS="" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
@@ -2743,6 +2748,59 @@ if grep -q 'PILOT_SPAWN_WA_WORKER' "$DISPATCHER"; then
 else
   bad "PILOT_SPAWN_WA_WORKER toggle MISSING — no way to disable auto-spawn without patching"
 fi
+
+# ── Scenario 16s–16v: phantom-claim guard (FOLLOW-UP #1, ga-9yb5s+) ──────────
+# A live crew member may hold story.assignee but NEVER start the build (phantom).
+# The phantom-claim guard inside _beadid_live_crew_owner must RELEASE (return 1)
+# when NO crew branch exists AND the bead is stale (>45min). It must KEEP when
+# a branch exists OR the bead is recent. PILOT_TEST_CREW_BRANCH_BEADS controls
+# _beadid_has_crew_branch; PILOT_TEST_PHANTOM_STALE_BEADS controls staleness.
+
+NS_ORACLE_SESS='{"sessions":[{"session_name":"oracle-wa","closed":false}]}'
+
+# 16s: phantom — crew assignee live, no branch, stale → RELEASE (not "refusing to release").
+NS_PHANTOM='[{"id":"tt-ns-phantom","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+echo "Scenario 16s: phantom-guard — stale crew-owned bead with no branch is released"
+LOG16S="$(run_neverstarted "$NS_PHANTOM" "" "$NS_ORACLE_SESS" '{"tt-ns-phantom":"oracle-wa"}' "" "" "tt-ns-phantom")"
+if echo "$LOG16S" | grep -q "releasing never-started in-flight bead tt-ns-phantom"; then
+  ok "phantom-guard: stale crew-assigned bead with no branch is released (FOLLOW-UP #1)"
+else
+  bad "phantom-guard DID NOT release stale crew-assigned no-branch bead tt-ns-phantom (still blocking wa-worker pool)"
+fi
+if echo "$LOG16S" | grep -q "refusing to release"; then
+  bad "phantom-guard still logged 'refusing to release' for phantom bead tt-ns-phantom (ga-9yb5s not phantom-aware)"
+else
+  ok "phantom-guard: 'refusing to release' log NOT emitted for phantom bead (correct)"
+fi
+
+# 16t: active branch — crew assignee live, branch exists, stale → KEEP (real work).
+NS_PHANTOM_BR='[{"id":"tt-ns-phantom-br","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+echo "Scenario 16t: phantom-guard — crew-owned bead WITH a branch is kept (active build)"
+LOG16T="$(run_neverstarted "$NS_PHANTOM_BR" "" "$NS_ORACLE_SESS" '{"tt-ns-phantom-br":"oracle-wa"}' "" "tt-ns-phantom-br" "tt-ns-phantom-br")"
+if echo "$LOG16T" | grep -q "releasing never-started in-flight bead tt-ns-phantom-br"; then
+  bad "REGRESSION (phantom-guard): released a crew-owned bead that HAS a branch (active build stolen)"
+else
+  ok "phantom-guard KEEPS crew-owned bead when a branch exists (active build protected)"
+fi
+
+# 16u: recent — crew assignee live, no branch, fresh (<45min dispatch) → KEEP.
+NS_FRESH_DISP="$((NS_NOW - 600))"   # 10 min ago — within the 45min phantom window
+NS_PHANTOM_FR='[{"id":"tt-ns-phantom-fr","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_FRESH_DISP"'"}}]'
+echo "Scenario 16u: phantom-guard — recent crew-owned bead (no branch, <45min) is kept"
+# PILOT_TEST_PHANTOM_STALE_BEADS is empty → the guard uses the timestamp path;
+# since the bd shim returns no updated_at the epoch parse yields 0 → fail-conservative KEEP.
+LOG16U="$(run_neverstarted "$NS_PHANTOM_FR" "" "$NS_ORACLE_SESS" '{"tt-ns-phantom-fr":"oracle-wa"}' "" "" "")"
+if echo "$LOG16U" | grep -q "releasing never-started in-flight bead tt-ns-phantom-fr"; then
+  bad "REGRESSION (phantom-guard): released a crew-owned bead that is within the 45min window"
+else
+  ok "phantom-guard KEEPS crew-owned bead that is within the staleness window (recent claim safe)"
+fi
+
+# 16v: structural checks for the phantom-guard knob and seam.
+echo "Scenario 16v: phantom-guard structural — knob and test seam wired"
+has "$DISPATCHER" 'PILOT_PHANTOM_STALE_SECS'             "phantom staleness knob defined (default 2700 = 45min)"
+has "$DISPATCHER" 'PILOT_TEST_PHANTOM_STALE_BEADS'       "phantom staleness test seam wired"
+has "$DISPATCHER" 'phantom: stale.*no branch'            "phantom-guard release path has identifying log/comment"
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
