@@ -1553,6 +1553,16 @@ if [ -n "$AUTHOR" ] && echo "$AUTHOR" | grep -qE "^wa-worker" 2>/dev/null; then
   AUTHOR="mayor"
 fi
 
+# Ephemeral-pool fallback (pilot-rewire): a worker-built bead (branch crew/wa-worker/<id>)
+# has assignee cleared/null by dispatch time and no created_by/owner — so AUTHOR is empty
+# here even though the work is real and merge-ready. Route its author to the Mayor (the
+# human signal) instead of deferring forever. Without this, every worker-built bead defers
+# permanently at the fail-safe below (observed: wa-14w76/wa-oly1 stuck gate-status:deferred).
+if { [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; } && echo "$BRANCH" | grep -qE "^crew/wa-worker/" 2>/dev/null; then
+  log "  Author unresolved but branch '$BRANCH' is an ephemeral wa-worker build — routing author to Mayor."
+  AUTHOR="mayor"
+fi
+
 if [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; then
   err "Cannot derive author authoritatively for bead $BEAD_ID — aborting (fail-safe)."
   bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
