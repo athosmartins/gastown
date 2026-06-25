@@ -569,4 +569,4 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   [ "$FAIL" -eq 0 ] && exit 0 || exit 1
 fi
 
-run_sweep
+run_sweep; exit 0  # daemon health = "ran OK"; stall result already sent via notify+mail
