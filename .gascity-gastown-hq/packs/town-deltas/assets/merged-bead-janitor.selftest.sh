@@ -215,7 +215,7 @@ grep -q 'delivery-owns-it' "$JANITOR"            && ok "delivery-active guard pr
 grep -q 'story-in-flight-active-rework' "$JANITOR" && ok "story in-flight guard present" || bad "story in-flight guard missing"
 # The story sweep must select OPEN story:approved beads (the stuck-merged shape),
 # distinct from the in_progress sweep above.
-grep -q 'list --status open --all --json -l story:approved' "$JANITOR" \
+grep -q 'list --status open --json -l story:approved' "$JANITOR" \
   && ok "story sweep selects open story:approved" || bad "story sweep selector missing"
 # plist drift.
 grep -q 'com.gascity.merged-bead-janitor' "$PLIST" && ok "plist Label correct"        || bad "plist Label wrong"

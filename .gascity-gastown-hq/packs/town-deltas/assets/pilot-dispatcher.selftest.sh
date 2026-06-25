@@ -164,21 +164,26 @@ case "$args" in
     # assigned/thin/braked ones are NOT). Default [] keeps every OTHER scenario
     # byte-identical to before this seam existed.
     printf '%s' "${FAKE_CTXREADY_JSON:-[]}" ;;
-  *--all*-l*pilot:dispatching*)
-    # ga-mfeip: TTL recovery query — `bd list --all -l pilot:dispatching`. Changed
-    # from the old `*story:approved*pilot:dispatching*` pattern: the TTL query no
-    # longer filters on story:approved so it also covers rig-native ctx:ready beads
-    # (chore/task) that carry pilot:dispatching but NOT story:approved. Must be
-    # matched BEFORE the generic *--all* in-flight count branch below (which would
-    # otherwise swallow it). This case continues to return FAKE_STALE_JSON.
+  *" -l pilot:dispatching"*)
+    # TTL recovery query — `bd list --json -l pilot:dispatching` (--all removed:
+    # dolt-load opt; no closed bead ever carries pilot:dispatching in production).
+    # Pattern matches the literal substring " -l pilot:dispatching" (space before
+    # the flag), which differentiates the bare -l filter from --exclude-label
+    # (the latter embeds "label pilot:dispatching" without a leading space-dash).
+    # ctx:ready queries use --exclude-label and are caught first by *"-l ctx:ready"*.
     printf '%s' "${FAKE_STALE_JSON:-[]}" ;;   # Step-0 stale-claim query
   *"-l story:in-flight -l pilot:dispatched"*)
     # ga-v3z4z: Step-0c never-started detector query. Distinct from the slot query
     # (single -l) and from candidate queries (--exclude-label, never -l).
     printf '%s' "${FAKE_NEVERSTARTED_JSON:-[]}" ;;
-  *--all*)
-    # in-flight count → lanes free by default. ga-rk5va: a scenario may inject
-    # FAKE_INFLIGHT_JSON to exercise the stale-occupant slot correction.
+  *" -l story:in-flight"*|*gate-status:queued*|*gate-status:running*)
+    # in-flight count (single -l story:in-flight, --all removed: dolt-load opt)
+    # and gate-congestion probes (gate-status:queued / gate-status:running, also
+    # --all removed). Never-started (double -l) is caught by the case above.
+    # --exclude-label story:in-flight in candidate queries embeds "label story:in-flight"
+    # WITHOUT a leading space-dash, so " -l story:in-flight" won't match them.
+    # ga-rk5va: FAKE_INFLIGHT_JSON injection exercises the stale-occupant slot
+    # correction (overrides the [] default for slot scenarios only).
     printf '%s' "${FAKE_INFLIGHT_JSON:-[]}" ;;
   *"-t bug"*)
     if [ -n "${FAKE_BUGS_JSON:-}" ]; then

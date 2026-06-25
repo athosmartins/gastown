@@ -90,7 +90,7 @@ STALE_ACTIVITY_TTL = 1800  # 30min (ga-64usm): a matched live session whose
                          # on the bead within the same window — is a frozen /
                          # credit-limited zombie, NOT a live owner. alive != working.
 MAX_RECLAIMS = 3         # escalate instead of looping after this many reclaims
-POLL_SEC = 300           # 5min poll interval
+POLL_SEC = int(os.environ.get("RECLAIM_POLL_SEC", "600"))  # default 10min; was 5min
 REALERT_SEC = 900        # 15min re-alert cadence for escalated beads
 
 STATE_FILE = ".gc/state/inflight-reclaim-guard.json"

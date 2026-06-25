@@ -86,8 +86,11 @@ case "$args" in
   *blocked*)
     printf '[]'
     ;;
-  *--all*)
-    # Step 0 (stale) and Step 1 (in-flight) → empty, all slots free.
+  *" -l pilot:dispatching"*|*" -l story:in-flight"*)
+    # Step 0 (stale pilot:dispatching) and Step 1 (in-flight story:in-flight)
+    # → empty, all slots free. --all removed (dolt-load opt); " -l <label>"
+    # literal-space pattern avoids matching --exclude-label args in candidate
+    # queries (those embed "label pilot:dispatching" without a leading space-dash).
     printf '[]'
     ;;
   *"-t bug"*)

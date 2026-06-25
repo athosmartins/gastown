@@ -1068,12 +1068,12 @@ _pilot_gate_congested() {
   fi
   local _q _r _n
   # Queued markers — work waiting at the gate (set by quality-gate-guard.sh).
-  _q=$(GC_CITY="$GC_CITY" timeout 15 bd -C "$GC_CITY" list --json --all \
+  _q=$(GC_CITY="$GC_CITY" timeout 15 bd -C "$GC_CITY" list --json \
         -l type:quality-gate-marker -l gate-status:queued 2>/dev/null || echo "")
   _n=$(printf '%s' "$_q" | jq 'length' 2>/dev/null || echo "")
   if [ -n "$_n" ] && [ "$_n" -gt 0 ] 2>/dev/null; then printf '1'; return 0; fi
   # Runs in review — reviews currently in progress (gate-status:running).
-  _r=$(GC_CITY="$GC_CITY" timeout 15 bd -C "$GC_CITY" list --json --all \
+  _r=$(GC_CITY="$GC_CITY" timeout 15 bd -C "$GC_CITY" list --json \
         -l type:quality-gate-run -l gate-status:running 2>/dev/null || echo "")
   _n=$(printf '%s' "$_r" | jq 'length' 2>/dev/null || echo "")
   if [ -n "$_n" ] && [ "$_n" -gt 0 ] 2>/dev/null; then printf '1'; return 0; fi
@@ -1585,7 +1585,7 @@ _ttl_recover_db() {
   # both wear pilot:dispatching, so a single query covers both. The story:approved
   # constraint is dropped here; it was belt-and-suspenders filtering, not a
   # correctness requirement (the label state machine is the real guard).
-  _stale_json=$(bd -C "$_db" list --json --all \
+  _stale_json=$(bd -C "$_db" list --json \
     -l "pilot:dispatching" \
     2>/dev/null || echo "[]")
   _stale_count=$(echo "$_stale_json" | jq 'length' 2>/dev/null || echo "0")
@@ -1650,7 +1650,7 @@ _ttl_recover_db() {
 # Count in-flight beads per lane by reading their lane:big / lane:small labels.
 # Beads without a lane label (manually dispatched) count as small (conservative).
 
-IN_FLIGHT_RAW_JSON=$(bd -C "$GC_CITY" list --json --all \
+IN_FLIGHT_RAW_JSON=$(bd -C "$GC_CITY" list --json \
   -l "story:in-flight" \
   2>/dev/null || echo "[]")
 
@@ -2082,7 +2082,7 @@ _neverstarted_recover_db() {
   local _db="$1" _now="$2"
   local _thresh=$(( PILOT_NEVERSTARTED_MINUTES * 60 ))
   local _json _count
-  _json=$(bd -C "$_db" list --json --all \
+  _json=$(bd -C "$_db" list --json \
     -l "story:in-flight" \
     -l "pilot:dispatched" \
     2>/dev/null || echo "[]")

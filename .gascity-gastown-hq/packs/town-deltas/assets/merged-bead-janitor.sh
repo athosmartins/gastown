@@ -407,7 +407,7 @@ while IFS= read -r rig; do
   fetch_once "$RGITDIR" "$RCONTAINER"
 
   # in_progress beads in this rig's store.
-  INPROG=$(bd -C "$RPATH" list --status in_progress --all --json 2>/dev/null || echo '[]')
+  INPROG=$(bd -C "$RPATH" list --status in_progress --json 2>/dev/null || echo '[]')
   [ -z "$INPROG" ] && INPROG='[]'
   N=$(printf '%s' "$INPROG" | jq 'length' 2>/dev/null || echo 0)
   log "rig $RNAME ($RPREFIX): $N in_progress bead(s) [store=$RPATH git=$RGITDIR default=$RDEFAULT]"
@@ -506,7 +506,7 @@ EOF
   # gate PASS, stories are handed to delivery OPEN with story:approved; if delivery
   # never completes they strand here and the Kanban shows false backlog. With merge
   # evidence AND no active rework, drive story:approved → story:done.
-  STORIES=$(bd -C "$RPATH" list --status open --all --json -l story:approved 2>/dev/null || echo '[]')
+  STORIES=$(bd -C "$RPATH" list --status open --json -l story:approved 2>/dev/null || echo '[]')
   [ -z "$STORIES" ] && STORIES='[]'
   SN=$(printf '%s' "$STORIES" | jq 'length' 2>/dev/null || echo 0)
   [ "$SN" = "0" ] || log "rig $RNAME ($RPREFIX): $SN open story:approved bead(s) to check for story:done reconciliation"
@@ -607,7 +607,7 @@ EOF
   # No deps / any open dep / unreadable deps → KEEP. dc-* beads live in the HQ
   # store but accrue per-rig too, so this runs in every rig store like the sweeps
   # above. Idempotent; DRY_RUN-aware.
-  CONVOYS=$(bd -C "$RPATH" list --status open --all --limit 0 --json 2>/dev/null \
+  CONVOYS=$(bd -C "$RPATH" list --status open --limit 0 --json 2>/dev/null \
               | jq -c '[.[]? | select((.issue_type // .type // "") == "convoy" or ((.id // "") | startswith("dc-")))]' 2>/dev/null || echo '[]')
   [ -z "$CONVOYS" ] && CONVOYS='[]'
   CN=$(printf '%s' "$CONVOYS" | jq 'length' 2>/dev/null || echo 0)

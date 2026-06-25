@@ -525,7 +525,7 @@ live_sibling_run_for_branch() {
   local branch="$1" now_epoch run_json count i id desc started started_epoch age_min verdict
   [ -z "$branch" ] && return 0
   now_epoch=$(date +%s)
-  run_json=$(bd -C "$GC_CITY" list --json --all \
+  run_json=$(bd -C "$GC_CITY" list --json \
     -l type:quality-gate-run \
     -l gate-status:running \
     2>/dev/null || echo "[]")
@@ -1097,7 +1097,7 @@ supersede_sibling_runs() {
   [ -z "$this_marker" ] && return 0
 
   local running_json count
-  running_json=$(bd -C "$GC_CITY" list --json --all \
+  running_json=$(bd -C "$GC_CITY" list --json \
     -l type:quality-gate-run \
     -l gate-status:running \
     2>/dev/null || echo "[]")
@@ -1173,7 +1173,7 @@ fi
 # dispatcher never finished (no passed/failed/error/needs-rebase was set).
 DISPATCHING_TTL_MINUTES=30
 
-DISPATCHING_JSON=$(bd -C "$GC_CITY" list --json --all \
+DISPATCHING_JSON=$(bd -C "$GC_CITY" list --json \
   -l type:quality-gate-marker \
   -l gate-status:dispatching \
   2>/dev/null || echo "[]")
@@ -1347,7 +1347,7 @@ LIVE_REVIEWERS=$(headroom_live_reviewers "${REVIEWER_SESSION_COUNT:-0}" "${REAPE
 # gate-status:queued.  We only process queued markers — the guard already did
 # all the security work.
 
-MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all \
+MARKERS_JSON=$(bd -C "$GC_CITY" list --json \
   -l type:quality-gate-marker \
   -l gate-status:queued \
   2>/dev/null || echo "[]")
