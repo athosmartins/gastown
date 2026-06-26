@@ -232,9 +232,7 @@ log "=== Guard sweep start ==="
 
 # ── Input validation helpers ──────────────────────────────────────────────────
 
-# Validate branch: lowercase alphanumeric, hyphens, underscores, slashes only.
-# Explicitly rejects uppercase, dots, '+', shell metacharacters, spaces, etc.
-# This enforces the gate doctrine for safe branch names ([a-z0-9/_-]+).
+# Validate branch: lowercase alphanumeric, hyphens, underscores, slashes, dots.
 # Uppercase is excluded to avoid case-insensitive filesystem collisions.
 # Bug 4 fix: '+' and other unsafe chars (as used in "worktree-fix+wa-..." branches)
 # are rejected here, producing gate-status:error with a clear diagnostic.
