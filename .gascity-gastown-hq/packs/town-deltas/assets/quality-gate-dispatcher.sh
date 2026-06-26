@@ -1879,9 +1879,10 @@ if [ -z "$BRANCH_SHA" ]; then
       bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human"           -q 2>/dev/null || true
       bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human:technical" -q 2>/dev/null || true
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"            -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"             -q 2>/dev/null || true  # wa-qq33j
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"           -q 2>/dev/null || true
       bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""                           -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-acb AUTO-CIRCUIT-BREAK: branch '$BRANCH' is absent from origin (marker $MARKER_ID). Gate cannot review or merge a non-existent branch. Set gate:needs-human — human or Mayor must re-anchor the work. story:in-flight + pilot:dispatched stripped (Pilot lane slot freed)." 2>/dev/null || true
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-acb AUTO-CIRCUIT-BREAK: branch '$BRANCH' is absent from origin (marker $MARKER_ID). Gate cannot review or merge a non-existent branch. Set gate:needs-human — human or Mayor must re-anchor the work. story:in-flight + pilot:dispatched stripped (Pilot lane slot freed). gate:reviewing cleared (wa-qq33j)." 2>/dev/null || true
     fi
     gc --city "$GC_CITY" mail send mayor \
       -s "Gate circuit-break: $BRANCH absent from origin (${BEAD_ID:-unknown})" \
@@ -2281,9 +2282,10 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
         bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human"           -q 2>/dev/null || true
         bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human:technical" -q 2>/dev/null || true
         bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"            -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"             -q 2>/dev/null || true  # wa-qq33j
         bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"           -q 2>/dev/null || true
         bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""                           -q 2>/dev/null || true
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-acb AUTO-CIRCUIT-BREAK (${_ACB_AHEAD}): branch $BRANCH is ${REBASE_AHEAD:-?} commits ahead (> ${GATE_REBASE_AHEAD_MAX} max) with no live author (marker $MARKER_ID). Large divergence + dead author = un-mergeable. Set gate:needs-human; story:in-flight + pilot:dispatched stripped (Pilot lane slot freed)." 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-acb AUTO-CIRCUIT-BREAK (${_ACB_AHEAD}): branch $BRANCH is ${REBASE_AHEAD:-?} commits ahead (> ${GATE_REBASE_AHEAD_MAX} max) with no live author (marker $MARKER_ID). Large divergence + dead author = un-mergeable. Set gate:needs-human; story:in-flight + gate:reviewing (wa-qq33j) + pilot:dispatched stripped." 2>/dev/null || true
       fi
       gc --city "$GC_CITY" mail send mayor \
         -s "Gate circuit-break: $BRANCH large divergence + dead author (${BEAD_ID:-unknown})" \
@@ -3818,14 +3820,16 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
         # pilot-dispatcher.sh), so stripping in-flight does NOT re-expose the
         # bead to re-dispatch.
         bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
-        log "Source story $BEAD_ID handed off to delivery (gate:passed set; story:in-flight cleared; builder assignee cleared)."
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate PASS handoff (ga-3h8l fix): builder assignee cleared; story:in-flight stripped (lane slot freed at merge); story:approved + gate:passed in place. story-delivery will deploy + prod-test, then mark story:done." 2>/dev/null || true
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
+        log "Source story $BEAD_ID handed off to delivery (gate:passed set; story:in-flight + gate:reviewing cleared; builder assignee cleared)."
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate PASS handoff (ga-3h8l fix): builder assignee cleared; story:in-flight stripped (lane slot freed at merge); gate:reviewing cleared (wa-qq33j); story:approved + gate:passed in place. story-delivery will deploy + prod-test, then mark story:done." 2>/dev/null || true
       else
         # BUG/TASK → close it. bd list defaults to OPEN-only, so closing removes
         # the bead from EVERY open-work selector (Pilot Tier-1 bug & tech-debt),
         # and — combined with the assignee clear — from the pool crash-recovery
         # query. Closing is the durable fix for non-story source beads.
         log "Closing source bug/task $BEAD_ID (gate PASS + merged sha=$MERGE_SHA)."
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
         bd -C "$BEAD_CITY" close "$BEAD_ID" \
           -r "Quality gate PASSED — branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA, gate_run=$GATE_RUN_ID). Closed by autonomous dispatcher (ga-esbg)." \
           2>/dev/null || warn "Could not close source bead $BEAD_ID"
@@ -4043,6 +4047,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       # 3× FAIL). Re-dispatch policy is unchanged — needs-human still requires
       # Human/Mayor intervention to clear.
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"  -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"   -q 2>/dev/null || true  # wa-qq33j: clear in-review state (cap/needs-human)
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
       bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
@@ -4058,6 +4063,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-fix"                  -q 2>/dev/null || true
       # Remove story:in-flight so the Pilot's feature-exclusion no longer hides it.
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"  -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"   -q 2>/dev/null || true  # wa-qq33j: clear in-review state (FAIL/needs-fix)
       # Clear stale Pilot claim labels left over from the failed dispatch.
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
@@ -4065,7 +4071,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       # Tier-2 features), so a stale builder assignee makes a failed bead invisible.
       # Clear it so the next sweep can re-pick this bead.
       bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
-      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight and builder assignee cleared. The Pilot will re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) and builder assignee cleared. The Pilot will re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
     fi
   fi
 

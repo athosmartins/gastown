@@ -1145,6 +1145,23 @@ bd -C "$GC_CITY" update "$GATE_RUN_ID" \
   --notes "Guard claimed marker and created gate-run bead. Marker queued for autonomous dispatcher (G)." \
   2>/dev/null || true
 
+# ── wa-qq33j: kanban sync — stamp source-bead + marker so the board shows in-review ──
+# (a) Add source-bead:$BEAD_ID and branch:$BRANCH labels to the marker so the
+#     painel's _parse_gate_marker can map marker → source-bead WITHOUT parsing
+#     the description. Pre-wa-qq33j markers lacked these labels → Gate column
+#     was always empty; every in-review bead showed in triagem (looks idle).
+bd -C "$GC_CITY" label add "$MARKER_ID" "source-bead:$BEAD_ID" -q 2>/dev/null || true
+bd -C "$GC_CITY" label add "$MARKER_ID" "branch:$BRANCH"       -q 2>/dev/null || true
+# (b) Set gate:reviewing on the source bead itself (label-based belt-and-suspenders:
+#     the painel sweeps gate:reviewing beads → Gate column even if the marker lookup
+#     fails). Cleared by the dispatcher on PASS (merge) and FAIL (needs-fix). Uses
+#     BEAD_CITY (resolved cross-rig store) so WA/PS beads update in their own DB.
+if [ -n "$BEAD_ID" ]; then
+  gc --city "$GC_CITY" bd label add "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || \
+    bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true
+  log "  wa-qq33j: gate:reviewing set on $BEAD_ID (kanban: in-review state)"
+fi
+
 # Notify the author (not Mayor) that their branch is queued for autonomous review
 if [ -n "$AUTHOR" ]; then
   gc --city "$GC_CITY" session nudge "$AUTHOR" \
