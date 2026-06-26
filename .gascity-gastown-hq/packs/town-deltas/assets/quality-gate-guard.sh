@@ -191,6 +191,29 @@ classify_parent_gap2() {
   echo "skip:active-sling"
 }
 
+# check_source_bead_park <space_sep_labels>
+# Pure decision: should the gate park a marker because the source-bead is in a
+# state that must not enter the review cycle?
+#   story:needs-approval — bead was never product-approved; the gate would spawn
+#     reviewers who reject it, the crew re-submits, and the cycle repeats forever.
+#   gate:needs-human / gate:needs-human:* — bead is circuit-broken and requires
+#     human intervention; the same re-submit loop applies.
+#   gate:needs-fix ALONE is NOT a park reason — it is the normal fix-iterate path
+#     (crew fixed, re-submitted; gate should review it).
+# The check is FAIL-OPEN: if labels are empty/unrecognized, returns "ok" so a
+# network hiccup never blocks a legitimate story:approved submission.
+# Returns: ok | park:needs-approval | park:needs-human
+check_source_bead_park() {
+  local labels="$1" lbl
+  for lbl in $labels; do
+    case "$lbl" in
+      story:needs-approval)         echo "park:needs-approval"; return ;;
+      gate:needs-human|gate:needs-human:*) echo "park:needs-human"; return ;;
+    esac
+  done
+  echo "ok"
+}
+
 # ── Lib-only mode: source with GATE_GUARD_LIB_ONLY=1 to load pure functions ──
 # without running the live guard sweep. Used by tests and by the dispatcher.
 if [ -n "${GATE_GUARD_LIB_ONLY:-}" ]; then
@@ -929,6 +952,44 @@ Fix the bead's assignee/created_by field and re-submit." 2>/dev/null || true
 fi
 
 log "Authoritative author: $AUTHOR"
+
+# ── Step 5a: park markers whose source-bead is not approved or circuit-broken ──
+# BEAD_RAW was fetched in Step 5 above. Extract labels and run the pure decision.
+# This check fires BEFORE the gate-run bead is created (Step 6) so no reviewer is
+# ever spawned for an ineligible source bead. FAIL-OPEN: if BEAD_RAW is empty
+# (transient Dolt hiccup) we cannot determine labels → proceed normally (don't
+# block a legitimate story:approved submission over a lookup failure).
+if [ -n "$BEAD_RAW" ]; then
+  SRC_LABELS_PARK=$(printf '%s\n' "$BEAD_RAW" \
+    | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' \
+    2>/dev/null || echo "")
+  PARK_ACTION=$(check_source_bead_park "$SRC_LABELS_PARK")
+  if [ "$PARK_ACTION" != "ok" ]; then
+    case "$PARK_ACTION" in
+      park:needs-approval) PARK_REASON="source bead $BEAD_ID carries story:needs-approval (not yet product-approved)" ;;
+      park:needs-human)    PARK_REASON="source bead $BEAD_ID carries gate:needs-human (circuit-broken — human intervention required)" ;;
+      *)                   PARK_REASON="source bead $BEAD_ID is not eligible for gate review ($PARK_ACTION)" ;;
+    esac
+    warn "Step 5a: parking marker $MARKER_ID — $PARK_REASON"
+    # Transition: claimed → parked-needs-human (terminal; Step 1 only picks gate-status:ready).
+    set_gate_status "$MARKER_ID" "parked-needs-human"
+    bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard Step 5a: marker parked — $PARK_REASON.
+No gate-run was created and no reviewer was spawned.
+To re-enter the gate: resolve the blocking condition on $BEAD_ID (get it approved / clear gate:needs-human), then submit a fresh gate marker." \
+      2>/dev/null || true
+    # Best-effort comment on the source bead. gc bd is cross-rig; bd -C HQ is fallback.
+    gc --city "$GC_CITY" bd comment "$BEAD_ID" \
+      "Gate guard Step 5a: blocked gate submission — $PARK_REASON. Gate marker $MARKER_ID was parked (gate-status:parked-needs-human); no reviewer was spawned. Resolve the blocking condition, then re-submit a fresh gate marker." \
+      2>/dev/null || bd -C "$GC_CITY" comment "$BEAD_ID" \
+      "Gate guard Step 5a: blocked gate submission — $PARK_REASON. Gate marker $MARKER_ID was parked (gate-status:parked-needs-human); no reviewer was spawned. Resolve the blocking condition, then re-submit a fresh gate marker." \
+      2>/dev/null || true
+    bd -C "$GC_CITY" close "$MARKER_ID" \
+      -r "Gate guard Step 5a: marker parked (terminal) — $PARK_REASON. No gate-run created." \
+      2>/dev/null || true
+    log "SUPPRESSED PUSH (wa-uthi non-terminal): marker $MARKER_ID parked (Step 5a: $PARK_ACTION)."
+    exit 0
+  fi
+fi
 
 # ── Resolve the store that OWNS the source bead (gt-gwng6) ────────────────────
 # Step 5b below clears the source bead's assignee and strips its gc.routed_to to
