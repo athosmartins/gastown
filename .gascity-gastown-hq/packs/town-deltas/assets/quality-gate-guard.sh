@@ -235,22 +235,23 @@ log "=== Guard sweep start ==="
 # Validate branch: lowercase alphanumeric, hyphens, underscores, slashes only.
 # Explicitly rejects uppercase, dots, '+', shell metacharacters, spaces, etc.
 # This enforces the gate doctrine for safe branch names ([a-z0-9/_-]+).
-# Dots are excluded to prevent confusion with remote-tracking ref syntax.
 # Uppercase is excluded to avoid case-insensitive filesystem collisions.
 # Bug 4 fix: '+' and other unsafe chars (as used in "worktree-fix+wa-..." branches)
 # are rejected here, producing gate-status:error with a clear diagnostic.
+# Dots are allowed (sub-bead branches like feat/ga-qw3p.1-desc) but consecutive
+# dots (..) are blocked to prevent remote-tracking ref confusion (origin/main..HEAD).
 validate_branch() {
   local val="$1"
-  if [[ "$val" =~ ^[a-z0-9/_-]{1,200}$ ]]; then
+  if [[ "$val" =~ ^[a-z0-9/_.-]{1,200}$ ]] && ! [[ "$val" =~ \.\. ]]; then
     return 0
   fi
   return 1
 }
 
-# Validate bead ID: e.g. "gt-abc123", "wa-xyz" — prefix/id pattern.
+# Validate bead ID: e.g. "gt-abc123", "wa-xyz", "ga-qw3p.1" (sub-beads).
 validate_bead_id() {
   local val="$1"
-  if [[ "$val" =~ ^[a-z]{1,8}-[a-z0-9]{2,16}$ ]]; then
+  if [[ "$val" =~ ^[a-z]{1,8}-[a-z0-9]{2,16}(\.[0-9]{1,4})?$ ]]; then
     return 0
   fi
   return 1
