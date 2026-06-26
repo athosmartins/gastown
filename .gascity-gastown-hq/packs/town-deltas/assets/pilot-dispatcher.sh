@@ -3558,8 +3558,12 @@ TASK
       DISPATCH_RESULT="rig_dedup_skip"
       return 1
     fi
+    # ga-v3o6i: assign WITH --status in_progress (a real CLAIM, not a soft assign).
+    # The wa-worker startup query is `bd list --status in_progress --assignee=wa-worker`;
+    # a bare --assignee leaves status=open, so the worker never finds its bead → claims-
+    # but-never-builds (88 phantom drains observed 06-26). --status in_progress closes the gap.
     if ! timeout 15 bd -C "$STORY_BEAD_CITY" update "$STORY_ID" \
-        --assignee "$_SLING_TARGET" -q 2>/dev/null; then
+        --assignee "$_SLING_TARGET" --status in_progress -q 2>/dev/null; then
       warn "ga-mfeip: bd update --assignee failed for $STORY_ID → $_SLING_TARGET. Releasing claim."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true

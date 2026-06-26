@@ -154,13 +154,18 @@ janitor_decide() {
 janitor_story_decide() {
   local is_epic="$1" has_open_marker="$2" already_done="$3" in_flight="$4" \
         has_builder="$5" delivery_active="$6" sig_commit="$7" sig_marker="$8" sig_branch="$9"
-  # — Guards (keep) — lower lines win the label when several apply —
+  # — Guards (keep) — first match wins (each returns) —
+  # SECURITY (sibling-path parity, ga-v3o6i sweep): ACTIVE-WORK guards MUST precede
+  # already_done. A bead can carry a stale story:done label AND be re-opened (open
+  # gate-marker / in-flight rework / live builder / delivery-active). If already_done
+  # were checked first (it was — bug), such a bead verdicts "already-story-done" and the
+  # orphan-close backstop would FALSE-CLOSE active rework. Order: active-work → already_done.
   if [ "$is_epic" = "1" ];         then echo "keep:epic-parent-never-autoclosed"; return 0; fi
-  if [ "$already_done" = "1" ];    then echo "keep:already-story-done"; return 0; fi
   if [ "$has_open_marker" = "1" ]; then echo "keep:active-open-gate-marker"; return 0; fi
   if [ "$in_flight" = "1" ];       then echo "keep:story-in-flight-active-rework"; return 0; fi
   if [ "$has_builder" = "1" ];     then echo "keep:live-builder-assignee"; return 0; fi
   if [ "$delivery_active" = "1" ]; then echo "keep:delivery-owns-it"; return 0; fi
+  if [ "$already_done" = "1" ];    then echo "keep:already-story-done"; return 0; fi
   # — Merge evidence (done) — same triangulation as janitor_decide —
   if [ "$sig_commit" = "1" ];      then echo "done:commit-in-origin-main"; return 0; fi
   if [ "$sig_marker" = "1" ];      then echo "done:terminal-gate-marker-passed-or-superseded"; return 0; fi

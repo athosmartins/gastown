@@ -76,9 +76,11 @@ eq "open-marker (mid-gate) → keep"      "$(janitor_story_decide 0 1 0 0 0 0 1 
 eq "in-flight (active build) → keep"    "$(janitor_story_decide 0 0 0 1 0 0 1 1 1)" "keep:story-in-flight-active-rework"
 eq "live builder assignee → keep"       "$(janitor_story_decide 0 0 0 0 1 0 1 1 1)" "keep:live-builder-assignee"
 eq "delivery owns it → keep"            "$(janitor_story_decide 0 0 0 0 0 1 1 1 1)" "keep:delivery-owns-it"
-# Guard ORDER (lower-numbered guard wins the label when several apply):
+# Guard ORDER (first match wins; ACTIVE-WORK guards precede already_done — security fix):
 eq "epic > already-done"                "$(janitor_story_decide 1 0 1 0 0 0 0 0 0)" "keep:epic-parent-never-autoclosed"
-eq "already-done > open-marker"         "$(janitor_story_decide 0 1 1 0 0 0 0 0 0)" "keep:already-story-done"
+# SECURITY: a bead with a STALE story:done AND an active open gate-marker must keep as
+# active-open-gate-marker (NOT already-story-done) — else the orphan-close backstop false-closes it.
+eq "open-marker > already-done"         "$(janitor_story_decide 0 1 1 0 0 0 0 0 0)" "keep:active-open-gate-marker"
 eq "open-marker > in-flight"            "$(janitor_story_decide 0 1 0 1 0 0 0 0 0)" "keep:active-open-gate-marker"
 eq "in-flight > builder"                "$(janitor_story_decide 0 0 0 1 1 0 0 0 0)" "keep:story-in-flight-active-rework"
 eq "builder > delivery"                 "$(janitor_story_decide 0 0 0 0 1 1 0 0 0)" "keep:live-builder-assignee"
@@ -329,11 +331,15 @@ eq "already-story-done beats merge signals → keep (orphan-close covers termina
    "$(janitor_story_decide 0 0 1 0 0 0 1 1 1)" \
    "keep:already-story-done"
 
-# (D) has story:done + has_open_marker → still "already-story-done" wins (already done,
-#     orphan-close will fire only when S_EPIC=0 + S_DELIV=0 in the sweep).
-eq "already-done + open-marker → already-story-done (not open-marker)" \
+# (D) SECURITY: has story:done + an ACTIVE open gate-marker → active-open-gate-marker WINS
+#     (NOT already-story-done). A stale story:done label must NOT let the orphan-close backstop
+#     close a bead that is back under active review. Active-work guards precede already_done.
+eq "open-marker beats stale already-done (no false-close)" \
    "$(janitor_story_decide 0 1 1 0 0 0 0 0 0)" \
-   "keep:already-story-done"
+   "keep:active-open-gate-marker"
+eq "in-flight beats stale already-done (rework not false-closed)" \
+   "$(janitor_story_decide 0 0 1 1 0 0 0 0 0)" \
+   "keep:story-in-flight-active-rework"
 
 # (E) in-flight guard must NOT be bypassed by story:done when NOT already done
 #     (a bead currently being built: in-flight=1, done=0, sig_commit=1 — mid-gate).
