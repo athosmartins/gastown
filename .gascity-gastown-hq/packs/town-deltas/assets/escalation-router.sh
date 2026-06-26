@@ -112,8 +112,11 @@ escalation_classify_topic() {
   fi
 
   # phone-proxy / WAP / IP-pool / relay — narrow signals that never appear in other topics
+  # NOTE: ban/IP patterns use word boundaries to avoid false positives like
+  # "kanban pipedrive" matching case-insensitive ban.*IP (kanban→ban, pipedrive→ip).
+  # \bban ensures "ban" starts a word (not inside kanban); \bIP\b ensures "IP" is whole-word.
   if printf '%s' "$text" | grep -iqE \
-      'phone-?proxy|phone.proxy|\bWAP\b|IP[ _-]?pool|relay[ _-]?IP|relay[ _-]?server|proxy[ _-]?pool|ban.*IP|IP.*ban|sms.?proxy|proxy.*slot'; then
+      'phone-?proxy|phone.proxy|\bWAP\b|\bIP[ _-]?pool\b|relay[ _-]?IP|relay[ _-]?server|proxy[ _-]?pool|\bban.*\bIP\b|\bIP.*\bban\b|sms.?proxy|proxy.*slot'; then
     echo "phone-proxy"; return 0
   fi
 

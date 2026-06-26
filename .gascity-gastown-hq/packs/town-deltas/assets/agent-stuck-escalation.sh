@@ -36,6 +36,16 @@ COOLDOWN_SEC="${COOLDOWN_SEC:-10800}"        # 3h antes de re-escalar o mesmo be
 MAYOR_ADDR="${MAYOR_ADDR:-mayor}"
 DRY_RUN="${DRY_RUN:-0}"
 
+# ── Escalation router (Layer 1, ga-qw3p.1) ───────────────────────────────────
+# Source in library mode to get classify/route functions. Fail-open: if the
+# router is absent, all escalations fall back to Mayor (zero regression).
+_ROUTER="${CITY}/packs/town-deltas/assets/escalation-router.sh"
+_ROUTER_AVAILABLE=0
+if [ -f "$_ROUTER" ] && [ -r "$_ROUTER" ]; then
+    # shellcheck source=/dev/null
+    ESCALATION_CITY="$CITY" . "$_ROUTER" --lib 2>/dev/null && _ROUTER_AVAILABLE=1
+fi
+
 # Types to skip — utility/infrastructure beads, not work items
 SKIP_TYPES="warrant sling wisp"
 
@@ -253,8 +263,20 @@ Limiar configurável via STUCK_AGENT_SEC (atual: ${STUCK_AGENT_SEC}s).
 BODY
 )"
 
+    # Layer 1 routing (ga-qw3p.1): classify bead title+labels to find domain owner.
+    # Falls back to Mayor when router unavailable or topic unrecognised.
+    _esc_target="$MAYOR_ADDR"
+    _esc_topic=""
+    if [ "$_ROUTER_AVAILABLE" = "1" ] && command -v escalation_classify_topic >/dev/null 2>&1; then
+        _esc_topic=$(escalation_classify_topic "$title $labels" 2>/dev/null || echo "")
+        if [ -n "$_esc_topic" ]; then
+            _esc_target=$(escalation_topic_to_crew "$_esc_topic" 2>/dev/null || echo "$MAYOR_ADDR")
+        fi
+    fi
+    log "$bead_id: escalation target=$_esc_target (topic=${_esc_topic:-none})"
+
     if [ "$DRY_RUN" = "1" ]; then
-        log "  [DRY_RUN] would send Mayor mail + notify for $bead_id"
+        log "  [DRY_RUN] would send mail to $_esc_target for $bead_id"
         log "  [DRY_RUN] subject: Agente travado: $bead_id (${age_min}min sem progresso)"
         printf '%s' "$now" > "$sf"
         continue
@@ -263,15 +285,15 @@ BODY
     # imp07 invariant: notify FIRST (Dolt-independent), mail SECONDARY (best-effort)
     if command -v "$NOTIFY" >/dev/null 2>&1; then
         "$NOTIFY" -t "Agente travado" -p 4 \
-            "$bead_id (${assignee:-?}) sem progresso há ${age_min}min — escalando ao Mayor" \
+            "$bead_id (${assignee:-?}) sem progresso há ${age_min}min — escalando → ${_esc_target}" \
             >/dev/null 2>&1 || true
     fi
 
-    if timeout 45 "$GC" mail send "$MAYOR_ADDR" \
+    if timeout 45 "$GC" mail send "$_esc_target" \
             -s "Agente travado: $bead_id — ${age_min}min sem progresso (assignee=${assignee:-?})" \
             -m "$body" \
             >/dev/null 2>&1; then
-        log "  mail enviado ao Mayor para $bead_id"
+        log "  mail enviado a $_esc_target (topic=${_esc_topic:-none}) para $bead_id"
         printf '%s\n' "$now" > "$sf"
     else
         log "  WARN: gc mail send falhou para $bead_id — notify já disparado"
