@@ -217,6 +217,20 @@ grep -q 'story-in-flight-active-rework' "$JANITOR" && ok "story in-flight guard 
 # distinct from the in_progress sweep above.
 grep -q 'list --status open --json -l story:approved' "$JANITOR" \
   && ok "story sweep selects open story:approved" || bad "story sweep selector missing"
+# ga-<story-close>: durable terminal — story sweep must also remove story:approved and CLOSE
+# the bead (not just add story:done label). Absence of close left wa-7nz9l + wa-14w76 in
+# Aprovadas for 36h+ even after story:done was added. story-delivery.sh L886 explicitly
+# delegates the close to the janitor: "merged-bead-janitor backstops the close".
+grep -q 'label remove "\$SID" "story:approved"' "$JANITOR" \
+  && ok "story sweep removes story:approved (exits Aprovadas)" || bad "story:approved removal missing from story sweep"
+grep -q 'close "\$SID" -r "\$JCLOSE_MSG"' "$JANITOR" \
+  && ok "story sweep closes bead with delivery close_reason" || bad "story sweep missing close (bead stays open = Aprovadas inflation)"
+# Orphan-close backstop: beads that already have story:done but are still open (prior janitor
+# pass added the label but missed the close) must also be driven to the durable terminal.
+grep -q 'ORPHAN-CLOSED' "$JANITOR" \
+  && ok "orphan-close backstop present (already-story-done + open → close)" || bad "orphan-close backstop missing"
+grep -q "S_REASON.*already-story-done.*S_EPIC.*0\|already-story-done.*S_EPIC" "$JANITOR" \
+  && ok "orphan-close guards epic exclusion" || bad "orphan-close missing epic guard"
 # plist drift.
 grep -q 'com.gascity.merged-bead-janitor' "$PLIST" && ok "plist Label correct"        || bad "plist Label wrong"
 grep -q '<key>StartInterval</key>' "$PLIST"        && ok "plist uses StartInterval"    || bad "plist missing StartInterval"
@@ -282,6 +296,50 @@ rc1 scan_commit_subject_for_bead "$R7" 0 "main" "tt-other"   # body-only in chor
 git -C "$R7" checkout -q -b "crew/mila/tt-oxkg" HEAD~2   # points at base+incident (pre-delivery)
 git -C "$R7" checkout -q main
 rc0 branch_merged "$R7" 0 "crew/mila/tt-oxkg" "main"   # crew branch IS ancestor of main → signal C fires
+
+
+# ── 8. story:done + close: subject-scoped commit in main → DONE verdict; body-only → KEEP ──
+# Regression scenario for wa-7nz9l / wa-14w76 (2026-06-26):
+#   Beads had fix(wa-7nz9l): / fix(wa-14w76): commits in origin/main.
+#   janitor_story_decide correctly returned "done:commit-in-origin-main" — the pure
+#   function was fine. The sweep ACTION then added story:done label but did NOT close
+#   the bead or remove story:approved → beads stayed open + story:approved in Aprovadas
+#   for 36h+ until Mayor fixed manually. Fix: sweep now does story:done + remove
+#   story:approved + close (mirrors story-delivery ga-i53ua).
+#   These tests confirm:
+#   (A) subject-scoped commit (genuine delivery) → janitor_story_decide returns "done"
+#   (B) body-only mention (incidental) → janitor_story_decide returns "keep"
+#   (C) already-story-done bead (open, prior pass) → janitor_story_decide still
+#       returns "keep:already-story-done" (pure fn unchanged); orphan-close fires in sweep
+echo "── 8. story:done scenario: subject-scoped in main → done; body-only → keep; already-done → keep ──"
+
+# (A) no open-marker, no rework, sig_commit=1 → should be done
+eq "wa-7nz9l shape: sig_commit + no guards → done" \
+   "$(janitor_story_decide 0 0 0 0 0 0 1 0 0)" \
+   "done:commit-in-origin-main"
+
+# (B) no merge evidence at all → keep
+eq "body-only mention (not in subject) → keep:no-merge-evidence" \
+   "$(janitor_story_decide 0 0 0 0 0 0 0 0 0)" \
+   "keep:no-merge-evidence"
+
+# (C) already has story:done (S_DONE=1) even with all sig_* set → "keep:already-story-done"
+#     The sweep detects this and fires orphan-close (covered by drift-guard above).
+eq "already-story-done beats merge signals → keep (orphan-close covers terminal)" \
+   "$(janitor_story_decide 0 0 1 0 0 0 1 1 1)" \
+   "keep:already-story-done"
+
+# (D) has story:done + has_open_marker → still "already-story-done" wins (already done,
+#     orphan-close will fire only when S_EPIC=0 + S_DELIV=0 in the sweep).
+eq "already-done + open-marker → already-story-done (not open-marker)" \
+   "$(janitor_story_decide 0 1 1 0 0 0 0 0 0)" \
+   "keep:already-story-done"
+
+# (E) in-flight guard must NOT be bypassed by story:done when NOT already done
+#     (a bead currently being built: in-flight=1, done=0, sig_commit=1 — mid-gate).
+eq "in-flight active (not yet done): in-flight guard wins over commit signal" \
+   "$(janitor_story_decide 0 0 0 1 0 0 1 0 0)" \
+   "keep:story-in-flight-active-rework"
 
 echo ""
 echo "──────────────────────────────────────────"

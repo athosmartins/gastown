@@ -576,23 +576,50 @@ EOF
       [ "$S_SIGMK" = "1" ] && S_EVID="$S_EVID [terminal-marker]"
       if [ "$DRY_RUN" = "1" ]; then
         log "WOULD-DONE $SID ($RNAME) — $S_EVID — \"$STITLE\""
+        log "WOULD-DONE: story:done added, story:approved removed, story:in-flight removed, bead closed (delivery close_reason → painel Done)"
       else
-        # Mirror story-delivery's terminal: leave the bead OPEN (delivered stories
-        # are not closed — story:done is the terminal label), keep story:approved
-        # (the persistent story-type marker the Pilot/gate/delivery selectors rely
-        # on), strip any lingering story:in-flight, add story:done. Idempotent.
+        # Drive to the durable terminal — mirrors story-delivery (ga-i53ua):
+        #   1. add story:done          (terminal label)
+        #   2. remove story:approved   (exits Aprovadas query; safe even if close fails)
+        #   3. remove story:in-flight  (defensive cleanup)
+        #   4. close with delivery reason → painel routes closed bead to Done
+        #      (_closed_bead_belongs_in_done/_is_delivery_close: "merged" triggers Done)
+        # story-delivery.sh L886 explicitly delegates this close to the janitor:
+        #   "merged-bead-janitor backstops the close".
+        # All steps || true — idempotent.
+        bd -C "$RPATH" label add "$SID" "story:done" -q 2>/dev/null || true
+        bd -C "$RPATH" label remove "$SID" "story:approved" -q 2>/dev/null || true
         bd -C "$RPATH" label remove "$SID" "story:in-flight" -q 2>/dev/null || true
-        if bd -C "$RPATH" label add "$SID" "story:done" -q 2>/dev/null; then
+        JCLOSE_MSG="merged-bead-janitor ($SOURCE_BEAD): code merged to origin/main — $S_EVID. Gate→delivery→done did not complete (cross-store, superseded path, rig-store delivery blind spot, or delivery crash); janitor drives durable terminal: story:done added, story:approved removed, bead closed. Mirrors story-delivery ga-i53ua."
+        if bd -C "$RPATH" close "$SID" -r "$JCLOSE_MSG" 2>/dev/null; then
           log "DONE $SID ($RNAME) — $S_EVID"
-          bd -C "$RPATH" comment "$SID" "merged-bead-janitor ($SOURCE_BEAD, ga-gosfs story:done reconciliation): code is in origin/main — $S_EVID — but the story was stranded story:approved (gate→delivery→done did not complete: cross-store gate:passed, superseded path, rig-store delivery never scanned, or a delivery crash). Transitioned story:approved → story:done so the Kanban no longer shows it as false backlog. story:approved kept (story-type marker); bead left open (story:done is the terminal label, matching story-delivery)." 2>/dev/null || true
+          bd -C "$RPATH" comment "$SID" "merged-bead-janitor ($SOURCE_BEAD, ga-gosfs story:done reconciliation): code is in origin/main — $S_EVID — but the story was stranded story:approved (gate→delivery→done did not complete: cross-store gate:passed, superseded path, rig-store delivery never scanned, or a delivery crash). Driven to durable terminal: story:done added, story:approved removed (exits Aprovadas), bead closed (painel Done via delivery close_reason). Mirrors story-delivery ga-i53ua." 2>/dev/null || true
           DONE_COUNT=$((DONE_COUNT+1))
           DONE_SUMMARY+=("$SID ($RNAME): $S_EVID")
         else
-          err "story:done label add failed for $SID ($RNAME)"
+          err "story close failed for $SID ($RNAME)"
+          DONE_COUNT=$((DONE_COUNT+1))
+          DONE_SUMMARY+=("$SID ($RNAME): $S_EVID [close-failed-but-story:approved-removed]")
         fi
       fi
     else
       log "keep-story $SID ($RNAME) — $S_REASON"
+      # Orphan-close backstop: a bead that already has story:done (from a prior
+      # janitor pass) but was never closed — the close step was missing until this
+      # fix. The bead keeps appearing in Aprovadas because:
+      #   • The story:approved label was NOT removed (prior janitor left it).
+      #   • The status is still "open" (prior janitor did not close it).
+      # Close + remove story:approved now to complete the durable terminal.
+      # Guard: skip epics and delivery-active beads (delivery owns the terminal).
+      if [ "$S_REASON" = "already-story-done" ] && [ "$S_EPIC" = "0" ] \
+         && [ "$S_DELIV" = "0" ] && [ "$DRY_RUN" != "1" ]; then
+        bd -C "$RPATH" label remove "$SID" "story:approved"  -q 2>/dev/null || true
+        bd -C "$RPATH" label remove "$SID" "story:in-flight" -q 2>/dev/null || true
+        JORPHAN_MSG="merged-bead-janitor ($SOURCE_BEAD): orphan-close — story:done label was set by a prior janitor pass but the bead was never closed (story:approved not removed). Completing the durable terminal: story:approved removed, bead closed. Mirrors story-delivery ga-i53ua. wa-7nz9l/wa-14w76 shape."
+        bd -C "$RPATH" close "$SID" -r "$JORPHAN_MSG" 2>/dev/null \
+          && log "ORPHAN-CLOSED $SID ($RNAME) — already had story:done, closing now" \
+          || warn "orphan-close failed for $SID ($RNAME) (non-fatal; story:approved already removed)"
+      fi
     fi
   done <<EOF
 $(printf '%s' "$STORIES" | jq -rc '.[]?')
