@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.agent-stuck-escalation</string>
+
+  <!-- Camada 2 da hierarquia de escalação autônoma (épico ga-qw3p / ga-qw3p.2).
+
+       CONTEXTO: quando um agente/crew não consegue resolver um item de trabalho,
+       o sistema escala autonomamente em camadas:
+         Camada 1 (ga-qw3p.1): roteamento por tópico → crew certo
+         Camada 2 (ESTE):      sem progresso em 30min → Mayor
+         Camada 3 (ga-qw3p.3): Mayor travado → quórum 2-de-3
+         Camada 4 (ga-qw3p.4): quórum falhou → notify 🚨 humano
+
+       DETECÇÃO: lista beads in_progress; qualquer bead cujo updated_at é >30min
+       atrás é "travado". Exclui tipos de infraestrutura (warrant/sling/wisp).
+
+       ESCALAÇÃO: gc mail send mayor com diagnóstico (bead, assignee, tempo parado,
+       status da sessão, marcadores de falha). Notify -p 4 ao Athos primeiro
+       (imp07 invariant: Dolt-independent).
+
+       ANTI-SPAM: uma escalação por bead por 3h (state: .gc/state/agent-stuck-escalation/).
+       Quando bead fecha ou avança (updated_at move) → estado limpo no próximo pass.
+
+       Limiares configuráveis via EnvironmentVariables:
+         STUCK_AGENT_SEC (padrão 1800 = 30min)
+         COOLDOWN_SEC    (padrão 10800 = 3h)
+       Kill-switch: .gc/state/agent-stuck-escalation.disabled
+
+       Cadência: StartInterval 300 (5min). RunAtLoad false (não dispara no boot
+       — mesma convenção do crew-hang-detector para evitar alarme falso na startup
+       enquanto o sistema ainda está subindo). -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/agent-stuck-escalation.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>300</integer>
+
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/agent-stuck-escalation-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/agent-stuck-escalation-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>BD_ACTOR</key>
+    <string>automation</string>
+    <!-- Threshold: beads in_progress sem update por este tempo são "travados". -->
+    <key>STUCK_AGENT_SEC</key>
+    <string>1800</string>
+    <!-- Re-escalation cooldown por bead (3h). Evita spam enquanto Mayor age. -->
+    <key>COOLDOWN_SEC</key>
+    <string>10800</string>
+  </dict>
+</dict>
+</plist>
