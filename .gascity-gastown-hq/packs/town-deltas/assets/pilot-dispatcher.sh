@@ -3214,9 +3214,12 @@ FIXSEC
             case "$_BEAD_ASSIGNEE_RAW" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*) _BEAD_ASSIGNEE_RAW="" ;; esac
             # Check created_by first (the FILER = true domain owner), then assignee as fallback.
             # wa-worker* as creator also signals WA domain (it ran a WA build that created this bead).
-            case "$_BEAD_CREATED_BY" in *-wa|wa-worker*) _OWNER_RIG_SIGNAL="whatsapp_automation" ;; esac
+            # ga-nlh79 fix: created_by/assignee carry a session-id suffix (e.g. mila-wa-gawispsqpzr0),
+            # so `*-wa` alone MISSES the suffixed form → fell through to content-rig → property-noun
+            # beads (ITBI/CNPJ/sócios) owned by mila-wa misrouted to batista-ps. Match `*-wa-*` too.
+            case "$_BEAD_CREATED_BY" in *-wa|*-wa-*|wa-worker*) _OWNER_RIG_SIGNAL="whatsapp_automation" ;; esac
             if [ -z "$_OWNER_RIG_SIGNAL" ]; then
-              case "$_BEAD_ASSIGNEE_RAW" in *-wa|wa-worker*) _OWNER_RIG_SIGNAL="whatsapp_automation" ;; esac
+              case "$_BEAD_ASSIGNEE_RAW" in *-wa|*-wa-*|wa-worker*) _OWNER_RIG_SIGNAL="whatsapp_automation" ;; esac
             fi
             if [ -n "$_OWNER_RIG_SIGNAL" ]; then
               _DOMAIN_RIG="$_OWNER_RIG_SIGNAL"
