@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.quorum-convergence-watchdog</string>
+
+  <!-- Quorum-convergence watchdog (ga-qw3p.3). Layer 3 of the autonomous
+       escalation hierarchy: when a blocker reaches the Mayor but the Mayor doesn't
+       resolve it in 30min, this daemon convenes a quorum of 3 named crews who
+       each propose a resolution. If 2-of-3 agree, the action is executed
+       autonomously. If no majority after 15min, the human is paged via 🚨.
+
+       TRIGGERS (either):
+         A. Primary: bead has 'escalation:mayor-escalated' label + metadata field
+            escalation.mayor_escalated_at older than 30min (set by ga-qw3p.2).
+         B. Fallback: bead has 'gate:needs-human:technical' + 'story:in-flight' +
+            updated_at older than 30min (inflight-reclaim-guard max-cap escalation).
+
+       QUORUM: topic owner + 2 seniors from the active named-crew roster.
+       VOTE COLLECTION: crews comment on the quorum bead with "QUORUM_VOTE: <action>".
+       DECISION: 2-of-3 agree → execute; no majority after 15min → 🚨 notify.
+
+       Kill-switch (no-op): QUORUM_WATCHDOG_ENABLED=0 or touch
+         .gc/state/quorum-convergence-watchdog.disabled
+       DRY_RUN: set QUORUM_DRY_RUN=1 to log decisions without acting.
+
+       Poll cadence: 300s (5min) via internal sleep; KeepAlive restarts on crash. -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/quorum-convergence-watchdog.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+
+  <!-- Stagger startup 180s (3min) after load to avoid lockstep with other monitors. -->
+  <key>ThrottleInterval</key><integer>180</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/quorum-convergence-watchdog-launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/quorum-convergence-watchdog-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>QUORUM_WATCHDOG_ENABLED</key>
+    <string>1</string>
+    <key>BD_ACTOR</key>
+    <string>quorum-convergence-watchdog</string>
+  </dict>
+</dict>
+</plist>
