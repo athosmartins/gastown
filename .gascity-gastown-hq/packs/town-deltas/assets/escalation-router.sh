@@ -44,6 +44,12 @@
 #   ESCALATION_FALLBACK_CREW   default mayor
 #   DRY_RUN                    1 = classify + log, no mail (default 0)
 #
+# RIG-ORIGIN ROUTING (secondary signal, used when content classification returns ""):
+#   Pass --rig <rig-name> (CLI) or escalation_route subject body "" rig (library).
+#   Rig patterns: wa-* → wa | property-*/ps-* → property | geo-* → geo |
+#                 phone-*/proxy-* → phone-proxy | oracle-*/warming-* → warming |
+#                 gastown/gascity → infra | unknown/missing → fallback to content
+#
 # LOGGING: appends to $GC_CITY/.gc/logs/escalation-router.jsonl
 
 set -uo pipefail
@@ -69,6 +75,26 @@ _er_log() {
   printf '{"ts":"%s","level":"%s","msg":%s}\n' "$ts" "$level" \
     "$(printf '%s' "$msg" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || printf '"%s"' "$msg")" \
     >> "$JSONL" 2>/dev/null || true
+}
+
+# ── escalation_classify_rig_origin <rig> ─────────────────────────────────────
+# Secondary routing signal: map the caller's rig name to a topic.
+# Story spec (ga-qw3p.1): "reusa a classificação que o Pilot já tem
+#   (conteúdo + rig de origem)" — this is the rig-de-origem part.
+# Used as a fallback when content classification returns "".
+# Prints one of: warming, phone-proxy, wa, geo, property, infra, ""
+escalation_classify_rig_origin() {
+  local rig="${1:-}"
+  [ -z "$rig" ] && { echo ""; return 0; }
+  case "$rig" in
+    wa-*|wa_*|whatsapp*)        echo "wa"           ;;
+    property-*|ps-*|scrapers*)  echo "property"     ;;
+    geo-*|arcgis-*)             echo "geo"           ;;
+    phone-*|proxy-*|wap-*)      echo "phone-proxy"   ;;
+    oracle-*|warming-*)         echo "warming"       ;;
+    gastown|gascity)            echo "infra"         ;;
+    *)                          echo ""              ;;
+  esac
 }
 
 # ── escalation_classify_topic <text> ─────────────────────────────────────────
@@ -137,12 +163,14 @@ escalation_topic_to_crew() {
   esac
 }
 
-# ── escalation_route <subject> <body> [topic_override] ───────────────────────
+# ── escalation_route <subject> <body> [topic_override] [rig] ─────────────────
 # High-level function: classify + map + (optionally) send mail.
 # Returns 0 on success; prints "ROUTED:<topic>:<crew>" to stdout.
 # Set DRY_RUN=1 to skip the actual mail send (classify + log only).
+# $4 rig: caller's rig name for secondary rig-origin classification signal.
+#   Used only when content classification and topic_override both return "".
 escalation_route() {
-  local subject="${1:-}" body="${2:-}" topic_override="${3:-}"
+  local subject="${1:-}" body="${2:-}" topic_override="${3:-}" rig="${4:-}"
   local topic crew combined
 
   combined="$subject $body"
@@ -152,6 +180,10 @@ escalation_route() {
     _er_log "INFO" "escalation_route: topic override=$topic subject=${subject:0:60}"
   else
     topic=$(escalation_classify_topic "$combined")
+    if [ -z "$topic" ] && [ -n "$rig" ]; then
+      topic=$(escalation_classify_rig_origin "$rig")
+      [ -n "$topic" ] && _er_log "INFO" "escalation_route: rig-origin match rig=$rig topic=$topic subject=${subject:0:60}"
+    fi
     _er_log "INFO" "escalation_route: classified topic=${topic:-<none>} subject=${subject:0:60}"
   fi
 
@@ -176,23 +208,25 @@ escalation_route() {
 _cli_subject=""
 _cli_body=""
 _cli_topic=""
+_cli_rig=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     -s|--subject) _cli_subject="$2"; shift 2 ;;
     -m|--message) _cli_body="$2"; shift 2 ;;
     -t|--topic)   _cli_topic="$2"; shift 2 ;;
+    -r|--rig)     _cli_rig="$2"; shift 2 ;;
     --dry-run)    DRY_RUN=1; shift ;;
     -h|--help)
-      grep '^# ' "$0" | head -30 | sed 's/^# //'
+      grep '^# ' "$0" | head -40 | sed 's/^# //'
       exit 0 ;;
     *) shift ;;
   esac
 done
 
 if [ -z "$_cli_subject" ]; then
-  printf 'Usage: escalation-router.sh -s SUBJECT -m BODY [-t TOPIC] [--dry-run]\n' >&2
+  printf 'Usage: escalation-router.sh -s SUBJECT -m BODY [-t TOPIC] [-r RIG] [--dry-run]\n' >&2
   exit 1
 fi
 
-escalation_route "$_cli_subject" "$_cli_body" "$_cli_topic"
+escalation_route "$_cli_subject" "$_cli_body" "$_cli_topic" "$_cli_rig"

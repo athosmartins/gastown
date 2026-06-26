@@ -140,6 +140,43 @@ eq "explicit topic override ignores text" "$result" "ROUTED:property:batista-ps"
 
 DRY_RUN=0
 
+# ── 3b. rig-origin classification ───────────────────────────────────────────
+echo ""
+echo "── 3b. escalation_classify_rig_origin ──"
+eq "wa rig → wa topic"           "$(escalation_classify_rig_origin wa-whatsapp)"   "wa"
+eq "wa_ prefix → wa topic"       "$(escalation_classify_rig_origin wa_integration)" "wa"
+eq "whatsapp prefix → wa"        "$(escalation_classify_rig_origin whatsapp-rig)"  "wa"
+eq "property rig → property"     "$(escalation_classify_rig_origin property-data)" "property"
+eq "ps rig → property"           "$(escalation_classify_rig_origin ps-scrapers)"   "property"
+eq "geo rig → geo"               "$(escalation_classify_rig_origin geo-indexer)"   "geo"
+eq "phone rig → phone-proxy"     "$(escalation_classify_rig_origin phone-pool)"    "phone-proxy"
+eq "proxy rig → phone-proxy"     "$(escalation_classify_rig_origin proxy-server)"  "phone-proxy"
+eq "oracle rig → warming"        "$(escalation_classify_rig_origin oracle-device)" "warming"
+eq "warming rig → warming"       "$(escalation_classify_rig_origin warming-chips)" "warming"
+eq "gastown rig → infra"         "$(escalation_classify_rig_origin gastown)"       "infra"
+eq "gascity rig → infra"         "$(escalation_classify_rig_origin gascity)"       "infra"
+eq "unknown rig → empty"         "$(escalation_classify_rig_origin some-rig)"      ""
+eq "empty rig → empty"           "$(escalation_classify_rig_origin "")"            ""
+
+# rig-origin as fallback in escalation_route (content empty, rig provides signal)
+DRY_RUN=1
+result=$(escalation_route "daemon restart needed" "server error" "" "wa-whatsapp" 2>/dev/null)
+eq "rig fallback wa → mila-wa" "$result" "ROUTED:wa:mila-wa"
+
+result=$(escalation_route "something broke" "no details" "" "property-scrapers" 2>/dev/null)
+eq "rig fallback property → batista-ps" "$result" "ROUTED:property:batista-ps"
+
+result=$(escalation_route "daemon restart needed" "no details" "" "gastown" 2>/dev/null)
+eq "rig fallback infra → mayor" "$result" "ROUTED:infra:mayor"
+
+result=$(escalation_route "daemon restart needed" "no details" "" "" 2>/dev/null)
+eq "no rig, no content → mayor fallback" "$result" "ROUTED:none:mayor"
+
+# content classification wins over rig-origin
+result=$(escalation_route "chip warming error" "oracle socket" "" "property-scrapers" 2>/dev/null)
+eq "content wins over rig: warming beats property-rig" "$result" "ROUTED:warming:oracle-wa"
+DRY_RUN=0
+
 # ── 4. file structure guards ─────────────────────────────────────────────────
 echo ""
 echo "── 4. file structure ──"
@@ -155,6 +192,8 @@ grep -q 'mila-wa'                    "$ROUTER" && ok "wa crew wired"            
 grep -q 'oracle-wa'                  "$ROUTER" && ok "warming crew wired"          || bad "warming crew missing"
 grep -q 'digo-wa'                    "$ROUTER" && ok "phone crew wired"            || bad "phone crew missing"
 grep -q 'peter-wa'                   "$ROUTER" && ok "geo crew wired"              || bad "geo crew missing"
+grep -q 'escalation_classify_rig_origin' "$ROUTER" && ok "rig-origin fn defined"   || bad "rig-origin fn missing"
+grep -q '\-\-rig\|\-r)'              "$ROUTER" && ok "--rig CLI flag present"       || bad "--rig CLI flag missing"
 
 # ── result ────────────────────────────────────────────────────────────────────
 echo ""
