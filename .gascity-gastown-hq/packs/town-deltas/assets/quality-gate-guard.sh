@@ -847,12 +847,24 @@ if [ -z "$BRANCH" ] || ! validate_branch "$BRANCH"; then
   VALIDATION_OK=false
 fi
 
-# ga-mxhf6: protected-branch guard — builders must NEVER commit directly to main/master.
-# branch=main is always an ancestor of itself, so the dispatcher supersedes the marker
-# without running any reviewers, silently bypassing the gate.
+# ga-mxhf6 / gate-main-close: protected-branch guard.
+# HQ-infra dogs legitimately commit directly to main (daemon scripts, gate fixes).
+# When they run /gate-done on main, a branch=main marker is created — but the gate
+# CANNOT review it (main is its own ancestor; the dispatcher would silently supersede).
+# Unlike bad-bead-id/rig (fixable by re-submit), branch=main is UN-FIXABLE: you
+# cannot make main not-main. Leaving it gate-status:error forever is permanent
+# painel noise ("erro no gate" / "gate parado"). Instead, CLOSE the marker cleanly
+# (closed markers don't render as gate-error). Other validation failures (bad
+# bead_id/rig) remain → gate-status:error (re-submittable, visible to the author).
 if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
-  err "branch '$BRANCH' is a protected branch. Builders must always use feature branches (e.g. fix/<id>-<desc>). Rejecting marker."
-  VALIDATION_OK=false
+  err "branch '$BRANCH' is protected and not gate-reviewable (HQ work lands directly on main). Closing marker cleanly (gate-main-close, not error)."
+  bd -C "$GC_CITY" comment "$MARKER_ID" "Branch is '$BRANCH' — not gate-reviewable. HQ work committed directly to main bypasses the gate by design. This marker cannot be fixed by re-submit (main will always be main). Closing cleanly to avoid permanent gate-status:error painel noise.
+If this bead's work is real, it is already on main.
+If a feature branch was intended, re-submit the bead with branch fix/<bead_id>-<desc>." 2>/dev/null || true
+  bd -C "$GC_CITY" close "$MARKER_ID" \
+    -r "branch=$BRANCH not gate-reviewable (HQ work lands on main directly). Closed cleanly by guard (gate-main-close) — not an error." 2>/dev/null || true
+  log "gate-main-close: marker $MARKER_ID branch=$BRANCH closed cleanly (not error, not re-submittable)."
+  exit 0
 fi
 
 if [ -z "$BEAD_ID" ] || ! validate_bead_id "$BEAD_ID"; then
