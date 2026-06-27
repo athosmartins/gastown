@@ -41,7 +41,9 @@ DESIGN:
   • BACKLOG SIGNAL — bd list across HQ + WA + PS rig stores for open story:approved and
     ctx:ready beads that are NOT braked (gate:needs-human | exec:manual | blocked | in-flight).
     This is the key gate against false alarms on a legitimately idle pipeline.
-  • STALL = backlog_count >= TSW_BACKLOG_MIN AND dispatch_count == 0 AND merge_count == 0.
+  • STALL = backlog_count >= TSW_BACKLOG_MIN AND merge_count == 0 (NOTHING completed in
+    the window). dispatch_count is NO LONGER part of the flow check — a dispatch that
+    builds nothing must not mask a stall (ga-dbibq). It is still reported as context.
   • ANTI-FLAP: TSW_CONFIRM_SWEEPS consecutive detections before escalating; a non-stall
     sweep resets the counter; re-escalation suppressed while cooldown active.
   • FAIL-SAFE: any error in any signal → treat that signal as "flow present" (fail-open,
@@ -88,7 +90,11 @@ STATE_FILE = os.environ.get("TSW_STATE_FILE",
 # ── knobs (all env-overridable) ───────────────────────────────────────────────
 ENABLED = os.environ.get("TSW_ENABLED", "1") == "1"
 DRY_RUN = os.environ.get("TSW_DRY_RUN", "0") == "1"
-STALL_HOURS = float(os.environ.get("TSW_STALL_HOURS", "6"))
+# 4h (was 6h): the merge window must be tight enough that a completion several hours ago
+# does NOT read as "recent flow". With the 6h window + merge-based flow check, the 2 merges
+# from 5h ago (the 2026-06-27 outage) kept merge_count>0 → no alarm. 4h + CONFIRM_SWEEPS
+# means an alarm after ~5h of zero completions against a real backlog.
+STALL_HOURS = float(os.environ.get("TSW_STALL_HOURS", "4"))
 BACKLOG_MIN = int(os.environ.get("TSW_BACKLOG_MIN", "1"))
 CONFIRM_SWEEPS = int(os.environ.get("TSW_CONFIRM_SWEEPS", "2"))
 ESCALATE_COOLDOWN_SEC = int(os.environ.get("TSW_COOLDOWN_SEC", "21600"))  # 6h cooldown
@@ -1034,18 +1040,24 @@ def run_tick(now, state):
         _maybe_recover(state, "merge-signal unavailable")
         return False
 
-    # Short-circuit: if there's any dispatch or merge, no stall
-    if dispatch_count > 0 or merge_count > 0:
+    # Short-circuit: FLOW == actual COMPLETIONS (merges / gate-PASSED), NOT dispatches.
+    # ga-dbibq lesson (2026-06-27): a dispatch that builds NOTHING still increments
+    # dispatch_count, so keying "flow" on dispatch let a fully-stalled pipeline (workers
+    # churning, 0 builds, 0 merges for 5h) read as "flow detected — healthy". Only a merge
+    # in the window proves work is actually reaching done. dispatch_count is still reported
+    # in the escalation body as context ("N dispatches but 0 completions = broken downstream").
+    if merge_count > 0:
         if state["pending"] > 0 or state["escalations"] > 0:
-            _log("tick: flow detected (dispatched=%d merged=%d) — stall cleared" % (
-                 dispatch_count, merge_count))
+            _log("tick: flow detected (merged=%d, dispatched=%d) — stall cleared" % (
+                 merge_count, dispatch_count))
             _maybe_recover(state, "flow resumed")
         else:
-            _log("tick: flow present (dispatched=%d merged=%d in %.0fh) — healthy" % (
-                 dispatch_count, merge_count, STALL_HOURS))
+            _log("tick: flow present (merged=%d dispatched=%d in %.0fh) — healthy" % (
+                 merge_count, dispatch_count, STALL_HOURS))
         return False
 
-    # SIGNAL 3: backlog (only evaluate if dispatch+merge are both 0 to save BD load on healthy system)
+    # SIGNAL 3: backlog (only evaluate when merge_count == 0 — i.e. nothing completed —
+    # to save BD load on a healthy system; dispatch activity no longer suppresses this)
     backlog_count, sample_beads = backlog_signal()
     if backlog_count is None:
         # ERROR: backlog signal failed — count toward blind-floor too
@@ -1255,17 +1267,18 @@ def _selftest():
     else:
         _bad("A4: cooldown should suppress", "%d mails sent" % len(mail_calls))
 
-    # ── B: backlog>0 but recent dispatch → NO stall ───────────────────────────────
-    print("\nScenario B: recent dispatch → no stall")
-    _read_pilot_log_lines = lambda: _pilot_lines(1, 2)  # dispatched=1
+    # ── B: backlog>0, dispatches>0 but merges=0 → IS a stall (ga-dbibq: dispatch≠throughput)
+    print("\nScenario B: recent dispatch but 0 merges → IS a stall (dispatch no longer masks stall)")
+    _read_pilot_log_lines = lambda: _pilot_lines(1, 2)  # dispatched=1, but builds nothing
     _read_gate_log_lines  = lambda: []
     _git_log_count        = lambda root, since: 0
     _bd_backlog           = lambda root: _backlog(5)
     mail_calls.clear(); notify_calls.clear()
     st = _reset()
     run_tick(NOW, st); run_tick(NOW + 1800, st)
-    if not st["pending"] and not st["escalations"] and not mail_calls:
-        _ok("B: recent dispatch → no stall")
+    if st["escalations"] >= 1 and mail_calls:
+        _ok("B: dispatch-only (0 merges) → stall confirmed and escalated (pending=%d escalations=%d)" % (
+            st["pending"], st["escalations"]))
     else:
         _bad("B", "pending=%d escalations=%d mails=%d" % (st["pending"], st["escalations"], len(mail_calls)))
 
@@ -1298,13 +1311,15 @@ def _selftest():
         _bad("D", "pending=%d escalations=%d mails=%d" % (st["pending"], st["escalations"], len(mail_calls)))
 
     # ── E: confirm-reset on a non-stall sweep ────────────────────────────────────
-    print("\nScenario E: confirm-reset: stall T0, flow T1, stall T2 → counter starts over")
+    # Flow is now MERGE-only (ga-dbibq). Use a merge in the "flow" sweep to reset
+    # the counter; dispatch alone no longer qualifies as flow.
+    print("\nScenario E: confirm-reset: stall T0, merge-flow T1, stall T2 → counter starts over")
     _calls = [0]
-    def _pilot_e():
+    def _gate_e():
         _calls[0] += 1
-        return _pilot_lines(0, 2) if _calls[0] != 2 else _pilot_lines(1, 1)
-    _read_pilot_log_lines = _pilot_e
-    _read_gate_log_lines  = lambda: []
+        return _gate_lines(1) if _calls[0] == 2 else []   # merge only on 2nd call
+    _read_pilot_log_lines = lambda: _pilot_lines(0, 2)
+    _read_gate_log_lines  = _gate_e
     _git_log_count        = lambda root, since: 0
     _bd_backlog           = lambda root: _backlog(3)
     mail_calls.clear(); notify_calls.clear()
