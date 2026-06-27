@@ -249,6 +249,7 @@ def _rig_name(root):
         return "whatsapp_automation"
     if "property_scrapers" in root:
         return "property_scrapers"
+    _log("_rig_name: unrecognized root %r — falling back to 'gascity'" % root)
     return "gascity"
 
 
@@ -549,6 +550,7 @@ def merge_signal(now, window_sec):
     since_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - window_sec))
     git_any_success = False
     per_rig_git = {}   # rig_name -> int commit count in window
+    git_ok_rigs = set()  # rigs whose git read succeeded; absent rig = fail-open (skip in stall check)
     for root in RIG_ROOTS:
         root = root.strip()
         if not root:
@@ -559,6 +561,7 @@ def merge_signal(now, window_sec):
             n = _git_log_count(root, since_iso)
             if n is not None:
                 git_any_success = True
+                git_ok_rigs.add(rig)
         else:
             r = _sh(["git", "-C", root, "log", "--oneline",
                      "--since=%s" % since_iso, "origin/main"],
@@ -567,6 +570,7 @@ def merge_signal(now, window_sec):
                 _log("merge_signal: git log failed for %s — skipping rig" % root)
                 continue
             git_any_success = True
+            git_ok_rigs.add(rig)
             n = len([l for l in (r.stdout or "").splitlines() if l.strip()])
         if n is None:
             continue
@@ -585,7 +589,10 @@ def merge_signal(now, window_sec):
         # Gate-PASSED (no rig tag) stored under "_gate_passed" — caller uses it as
         # a global "flow present" signal that does NOT defeat per-rig stall detection
         # but DOES suppress per-rig stalls globally (same as current: any gate-PASS = flow).
+        # "_git_ok_rigs": set of rigs whose git read succeeded; a rig absent from this set
+        # had a git failure and is treated as fail-open (not eligible for the stall check).
         per_rig_git["_gate_passed"] = gate_passed
+        per_rig_git["_git_ok_rigs"] = git_ok_rigs
         return per_rig_git, last_epoch
 
     # PER_RIG=0: original global sum
@@ -1119,7 +1126,9 @@ def run_tick(now, state):
     # cross-rig masking where HQ git commits were hiding a dead WA worker pool.
     if PER_RIG and isinstance(merge_count, dict):
         gate_passed = merge_count.get("_gate_passed", 0)
-        merge_per_rig = {k: v for k, v in merge_count.items() if k != "_gate_passed"}
+        merge_ok_rigs = merge_count.get("_git_ok_rigs", set())  # fail-open guard: only check rigs read ok
+        merge_per_rig = {k: v for k, v in merge_count.items()
+                         if k not in ("_gate_passed", "_git_ok_rigs")}
         total_git = sum(merge_per_rig.values())
 
         if gate_passed > 0:
@@ -1153,6 +1162,7 @@ def run_tick(now, state):
         stalled_rigs = sorted([
             rig for rig in backlog_per_rig
             if backlog_per_rig.get(rig, 0) >= BACKLOG_MIN
+            and rig in merge_ok_rigs              # fail-open: skip rigs whose git read failed
             and merge_per_rig.get(rig, 0) == 0
             and rig not in susp
         ])
@@ -1922,9 +1932,23 @@ def _selftest():
     else:
         _bad("PR2", "esc=%d mails=%d — suspended rig false-alarmed" % (st["escalations"], len(mail_calls)))
 
-    # Restore PER_RIG to False for cleanup (default production value is True;
-    # restored here so global-path scenarios above were NOT affected by PER_RIG=True)
-    globals()["PER_RIG"] = False
+    # ── PR3: per-rig fail-open — partial git failure on a backlogged rig must NOT false-alarm ──
+    print("\nScenario PR3: per-rig — WA git fails (None), WA backlog >= MIN → NO alarm (fail-open)")
+    globals()["RIG_ROOTS"] = PR_RIG_ROOTS
+    _read_pilot_log_lines = lambda: _pilot_lines(0, 2)
+    _read_gate_log_lines  = lambda: []
+    # WA git fails (returns None); HQ git succeeds (returns 3) — WA must not false-alarm
+    _git_log_count        = lambda root, since: (3 if ("gascity" in root or root.rstrip("/").endswith(".gascity-gastown-hq")) else None)
+    _bd_backlog           = lambda root: (_backlog(5) if "whatsapp" in root else [])
+    globals()["_suspended_rigs"] = lambda: set()
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st); run_tick(NOW + 1800, st)
+    globals()["RIG_ROOTS"] = _saved_rig_roots_pr
+    if st["escalations"] == 0 and not mail_calls:
+        _ok("PR3: WA git failure + WA backlog → fail-open, no false STALL alarm")
+    else:
+        _bad("PR3", "esc=%d mails=%d — partial git failure caused false alarm" % (st["escalations"], len(mail_calls)))
 
     # ── cleanup ───────────────────────────────────────────────────────────────────
     _read_pilot_log_lines = None
