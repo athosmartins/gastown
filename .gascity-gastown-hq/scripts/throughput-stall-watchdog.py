@@ -259,10 +259,12 @@ def _query_suspended_rigs_via_gc():
         r = _sh([GC_BIN, "rig", "list", "--json"], timeout=10)
         if r is None or r.returncode != 0:
             return set()
-        data = json.loads(r.stdout or "[]")
-        if not isinstance(data, list):
-            return set()
-        return {d["name"] for d in data if isinstance(d, dict) and d.get("status") == "suspended"}
+        data = json.loads(r.stdout or "{}")
+        # gc rig list --json returns {"rigs":[{"name":..,"suspended":bool}, ...]};
+        # tolerate a bare list too, just in case.
+        rigs = data.get("rigs", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        return {d["name"] for d in rigs
+                if isinstance(d, dict) and d.get("suspended") is True and d.get("name")}
     except Exception:
         return set()
 
@@ -1949,6 +1951,36 @@ def _selftest():
         _ok("PR3: WA git failure + WA backlog → fail-open, no false STALL alarm")
     else:
         _bad("PR3", "esc=%d mails=%d — partial git failure caused false alarm" % (st["escalations"], len(mail_calls)))
+
+    # ── PR4: _query_suspended_rigs_via_gc parses the real gc rig list --json shape ──
+    print("\nScenario PR4a: _query_suspended_rigs_via_gc — real JSON shape, wa suspended → {\"whatsapp_automation\"}")
+    _real_gc_json = (
+        '{"city_name":"gascity","ok":true,"rigs":['
+        '{"name":"gascity","prefix":"ga","hq":true,"suspended":false,"running":true},'
+        '{"name":"property_scrapers","suspended":false},'
+        '{"name":"whatsapp_automation","suspended":true}'
+        ']}'
+    )
+    import types as _types
+    _fake_ok = _types.SimpleNamespace(returncode=0, stdout=_real_gc_json)
+    _saved_sh = globals().get("_sh")
+    globals()["_sh"] = lambda *a, **kw: _fake_ok
+    _result_pr4a = _query_suspended_rigs_via_gc()
+    globals()["_sh"] = _saved_sh
+    if _result_pr4a == {"whatsapp_automation"}:
+        _ok("PR4a: real gc rig list JSON parsed correctly → {\"whatsapp_automation\"}")
+    else:
+        _bad("PR4a", "got %r — expected {\"whatsapp_automation\"}" % (_result_pr4a,))
+
+    print("\nScenario PR4b: _query_suspended_rigs_via_gc — returncode=1 (error) → fail-open set()")
+    _fake_err = _types.SimpleNamespace(returncode=1, stdout="")
+    globals()["_sh"] = lambda *a, **kw: _fake_err
+    _result_pr4b = _query_suspended_rigs_via_gc()
+    globals()["_sh"] = _saved_sh
+    if _result_pr4b == set():
+        _ok("PR4b: gc rig list error → fail-open set()")
+    else:
+        _bad("PR4b", "got %r — expected set()" % (_result_pr4b,))
 
     # ── cleanup ───────────────────────────────────────────────────────────────────
     _read_pilot_log_lines = None
