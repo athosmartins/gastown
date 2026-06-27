@@ -81,9 +81,13 @@ BD_BIN = os.environ.get("BD_BIN", "bd")
 DOLT_PROBE_SH = os.path.join(CITY, "scripts/gc-dolt-probe.sh")
 
 # Rig roots for git-log merge signal and bd backlog queries.
+# IMPORTANT: each root must be the BEAD STORE path (bd -C <root>), NOT the git repo root.
+# For HQ the bead store is .gascity-gastown-hq (== CITY), NOT /Users/athos/gt — those are
+# different paths even though git -C .gascity-gastown-hq resolves to the same repo (subdir).
+# Using the bare git root (/Users/athos/gt) causes bd -C to fail silently (rc=1, fail-open).
 RIG_ROOTS = os.environ.get(
     "TSW_RIG_ROOTS",
-    "/Users/athos/gt:/Users/athos/gt/whatsapp_automation:/Users/athos/gt/property_scrapers",
+    "/Users/athos/gt/.gascity-gastown-hq:/Users/athos/gt/whatsapp_automation:/Users/athos/gt/property_scrapers",
 ).split(":")
 
 MAYOR_ADDR = os.environ.get("TSW_MAYOR_ADDR", "mayor")
@@ -1006,7 +1010,7 @@ def _format_body(backlog_count, dispatch_count, last_dispatch_epoch,
         "1. tail -40 .gc/logs/pilot-dispatcher.log — confirme 'No dispatchable candidates'",
         "   com 'No candidate(s)' em TODAS as queries de rig? Ou 'Dispatch tier: X (N)'",
         "   mas 'dispatched=0' repetido? Esses são assinaturas distintas.",
-        "2. bd -C /Users/athos/gt list -l story:approved --status open",
+        "2. bd -C /Users/athos/gt/.gascity-gastown-hq list -l story:approved --status open",
         "   bd -C /Users/athos/gt/whatsapp_automation list -l story:approved --status open",
         "   bd -C /Users/athos/gt/property_scrapers list -l story:approved --status open",
         "   Quantos aparecem? Se mais de 0 mas Pilot diz 0 → bug de query de BD no Pilot.",
@@ -1981,6 +1985,20 @@ def _selftest():
         _ok("PR4b: gc rig list error → fail-open set()")
     else:
         _bad("PR4b", "got %r — expected set()" % (_result_pr4b,))
+
+    # ── PR5: default HQ rig root must equal CITY (bead store), not bare git root ──
+    # _saved_rig_roots_pr was captured from the module-level RIG_ROOTS before any PR override,
+    # so it reflects the real default (un-overridden). The HQ root is the entry whose
+    # _rig_name returns "gascity" (the else-branch fall-through). Asserting it equals CITY
+    # catches a future regression that accidentally points HQ back at /Users/athos/gt (git
+    # root, no bead store there → bd -C fails silently, TSW blind to HQ backlog/delivery).
+    print("\nScenario PR5: default RIG_ROOTS HQ entry == CITY (bead store), not bare git root")
+    _hq_roots_pr5 = [r for r in _saved_rig_roots_pr if _rig_name(r) == "gascity"]
+    if _hq_roots_pr5 and _hq_roots_pr5[0] == CITY:
+        _ok("PR5: default HQ rig root == CITY (%s) — bead store path confirmed" % CITY)
+    else:
+        _bad("PR5", "HQ root=%r  CITY=%r — HQ root does NOT equal bead store (bd -C will fail)" % (
+             _hq_roots_pr5[0] if _hq_roots_pr5 else None, CITY))
 
     # ── cleanup ───────────────────────────────────────────────────────────────────
     _read_pilot_log_lines = None
