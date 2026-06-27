@@ -14,7 +14,7 @@
 #   1. Parse the gate dispatcher log (last GTSW_LOG_TAIL lines) for evidence of
 #      a non-empty queue: "Found N queued marker(s)" with N>0.
 #   2. Scan the same window for evidence of progress: "Gate PASSED:" within
-#      GTSW_STALL_HOURS (default 2h).
+#      GTSW_STALL_MINUTES (default 165min; data: inter-merge p95=127min, p99=240min).
 #   3. FALSE-POSITIVE GUARDS (all must fail to declare a stall):
 #      a. Empty queue → NOT a stall (idle pipeline).
 #      b. "cota=LIMITED" or "quota-limited" in any Headroom DEFER line in the
@@ -42,7 +42,7 @@ set -uo pipefail
 # ── config (all env-overridable) ──────────────────────────────────────────────
 GTSW_ENABLED="${GTSW_ENABLED:-1}"
 GTSW_DRY_RUN="${GTSW_DRY_RUN:-0}"
-GTSW_STALL_HOURS="${GTSW_STALL_HOURS:-2}"      # hours without Gate PASSED = stall
+GTSW_STALL_MINUTES="${GTSW_STALL_MINUTES:-165}"  # minutes without Gate PASSED = stall (p95=127min, p99=240min)
 GTSW_AUTORECOVER="${GTSW_AUTORECOVER:-1}"        # 1=kickstart supervisor+dispatcher on stall
 GTSW_LOG_TAIL="${GTSW_LOG_TAIL:-2000}"           # lines to tail from the dispatcher log
 
@@ -83,7 +83,7 @@ run_sweep() {
   fi
 
   local now; now="$(date +%s)"
-  local stall_window_sec; stall_window_sec=$(( ${GTSW_STALL_HOURS:-2} * 3600 ))
+  local stall_window_sec; stall_window_sec=$(( ${GTSW_STALL_MINUTES:-165} * 60 ))
 
   # ── SIGNAL READ: tail the dispatcher log ─────────────────────────────────
   local log_lines
@@ -166,7 +166,7 @@ run_sweep() {
 
   # ── FALSE-POSITIVE GUARD C: recent gate progress ──────────────────────────
   # Scan the tail for "Gate PASSED:" lines. Parse the timestamp and check if
-  # any falls within the stall window. A PASSED within GTSW_STALL_HOURS → OK.
+  # any falls within the stall window. A PASSED within GTSW_STALL_MINUTES → OK.
   local last_passed_epoch=0
   while IFS= read -r line; do
     if echo "$line" | grep -q "Gate PASSED:"; then
@@ -185,7 +185,7 @@ run_sweep() {
     local age_min; age_min=$(( (now - last_passed_epoch) / 60 ))
     # COOLDOWN RESET: Gate PASSED recently → stall cleared; disarm so next episode re-alerts immediately
     [ -f "${COOLDOWN_FILE}" ] && { rm -f "${COOLDOWN_FILE}" 2>/dev/null || true; log "COOLDOWN RESET: Gate PASSED ${age_min}min ago — cooldown disarmed"; }
-    log "OK: Gate PASSED ${age_min}min ago (within ${GTSW_STALL_HOURS}h window) — not a stall"
+    log "OK: Gate PASSED ${age_min}min ago (within ${GTSW_STALL_MINUTES}min window) — not a stall"
     return 0
   fi
 
@@ -242,7 +242,7 @@ run_sweep() {
     fi
   fi
 
-  local msg="GATE THROUGHPUT STALL: queue non-empty, 0 Gate PASSED in ${GTSW_STALL_HOURS}h, not quota-limited, no active reviewer. Last pass: ${last_passed_desc}. Gate froze silently (heartbeat ≠ output). Kickstarting supervisor+gate (GTSW_AUTORECOVER=${GTSW_AUTORECOVER:-1})."
+  local msg="GATE THROUGHPUT STALL: queue non-empty, 0 Gate PASSED in ${GTSW_STALL_MINUTES}min, not quota-limited, no active reviewer. Last pass: ${last_passed_desc}. Gate froze silently (heartbeat ≠ output). Kickstarting supervisor+gate (GTSW_AUTORECOVER=${GTSW_AUTORECOVER:-1})."
   log "ALERT: $msg"
 
   if [ "${GTSW_DRY_RUN:-0}" = "1" ]; then
@@ -263,10 +263,10 @@ run_sweep() {
   mail_body="$(cat <<BODY
 GATE THROUGHPUT STALL detectado pelo gate-throughput-stall-watchdog.
 
-CONDIÇÃO: queue não-vazia + 0 Gate PASSED em ${GTSW_STALL_HOURS}h + não quota-limited + sem gate-reviewer ativo.
+CONDIÇÃO: queue não-vazia + 0 Gate PASSED em ${GTSW_STALL_MINUTES}min + não quota-limited + sem gate-reviewer ativo.
 
 Último Gate PASSED: ${last_passed_desc}
-Janela de análise: ${GTSW_STALL_HOURS}h
+Janela de análise: ${GTSW_STALL_MINUTES}min
 
 POR QUE O DPW NÃO PEGOU: o heartbeat do gate é tocado no INÍCIO de cada sweep
 (anti-false-WEDGE durante quota-defer) — então o heartbeat fica fresco mesmo quando
@@ -291,7 +291,7 @@ BODY
   else
     command -v "$GC_BIN" >/dev/null 2>&1 && \
       "$GC_BIN" mail send mayor \
-        -s "Watchdog: GATE THROUGHPUT STALL — ${GTSW_STALL_HOURS}h sem Gate PASSED com fila cheia" \
+        -s "Watchdog: GATE THROUGHPUT STALL — ${GTSW_STALL_MINUTES}min sem Gate PASSED com fila cheia" \
         -m "$mail_body" 2>/dev/null || true
   fi
 
@@ -343,7 +343,7 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   GC_BIN="$TMP/gc"
   GTSW_ENABLED=1
   GTSW_DRY_RUN=0
-  GTSW_STALL_HOURS=2
+  GTSW_STALL_MINUTES=165
   GTSW_AUTORECOVER=1
   GTSW_SUPERVISOR_LABEL="com.gascity.supervisor"
   GTSW_GATE_LABEL="com.gascity.quality-gate-dispatcher"
