@@ -93,6 +93,12 @@ MAX_RECLAIMS = 3         # escalate instead of looping after this many reclaims
 POLL_SEC = int(os.environ.get("RECLAIM_POLL_SEC", "600"))  # default 10min; was 5min
 REALERT_SEC = 900        # 15min re-alert cadence for escalated beads
 
+# Pool-dead alert configuration (ga-dbibq)
+# Emit a [POOL-DEAD] Mayor mail when >= POOL_DEAD_MIN beads from the SAME pool
+# are zombie (no branch + dead session + stranded > TTL) for 2 consecutive cycles.
+POOL_DEAD_MIN      = int(os.environ.get("IRG_POOL_DEAD_MIN", "3"))
+POOL_DEAD_COOLDOWN = int(os.environ.get("IRG_POOL_DEAD_COOLDOWN_SEC", "1800"))
+
 STATE_FILE = ".gc/state/inflight-reclaim-guard.json"
 GC_CITY = "/Users/athos/gt/.gascity-gastown-hq"
 
@@ -215,6 +221,110 @@ def save_state(state):
             json.dump(state, f, indent=2)
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] state save failed: {exc}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Pool-dead detection state (ga-dbibq)
+# Per-pool state file: ${STATE_FILE}.pool-dead/<safe_pool_name>
+# Stores {"pool": "<name>", "consecutive_cycles": N, "last_alert_epoch": T}
+# ---------------------------------------------------------------------------
+
+def _pool_dead_state_path(pool):
+    """Path to per-pool dead-detection state file (alongside the main state file)."""
+    safe = pool.replace("/", "_").replace(".", "_")
+    return os.path.join(STATE_FILE + ".pool-dead", safe)
+
+
+def _load_pool_dead_state(pool):
+    """Load pool-dead state. Returns default dict on any error."""
+    try:
+        with open(_pool_dead_state_path(pool)) as f:
+            return json.load(f)
+    except Exception:
+        return {"consecutive_cycles": 0, "last_alert_epoch": 0}
+
+
+def _save_pool_dead_state(pool, ps):
+    """Save pool-dead state. Best-effort; never crashes."""
+    try:
+        path = _pool_dead_state_path(pool)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(ps, f)
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] pool-dead state save failed (pool={pool}): {exc}",
+              flush=True)
+
+
+def _check_pool_dead(pool_zombies, now):
+    """Emit a [POOL-DEAD] Mayor alert when a whole worker pool produces nothing.
+
+    Called in run_cycle BEFORE per-bead actuation, with the set of beads already
+    classified as zombie this cycle (no live session + no recent branch + stranded
+    > TTL, regardless of whether they'll be reclaimed or escalated).
+
+    pool_zombies: dict mapping pool-name → list[bead_id] for THIS cycle.
+
+    Hysteresis: pool must have >= POOL_DEAD_MIN zombie beads for 2 consecutive
+    cycles before an alert is emitted. Cooldown: at most one alert per pool per
+    POOL_DEAD_COOLDOWN seconds. Fail-open: any error (including mail failure) is
+    logged and the cycle continues — never crashes.
+    """
+    pool_dead_dir = STATE_FILE + ".pool-dead"
+    seen_pools = set(pool_zombies.keys())
+
+    # Reset consecutive_cycles for pools that had state but are NOT zombie this cycle
+    # (recovery: the pool started building again — don't alert after a 1-cycle blip).
+    try:
+        if os.path.isdir(pool_dead_dir):
+            for fname in os.listdir(pool_dead_dir):
+                fpath = os.path.join(pool_dead_dir, fname)
+                try:
+                    with open(fpath) as fh:
+                        ps = json.load(fh)
+                    pool_name = ps.get("pool", "")
+                    if pool_name and pool_name not in seen_pools and ps.get("consecutive_cycles", 0) > 0:
+                        ps["consecutive_cycles"] = 0
+                        with open(fpath, "w") as fh:
+                            json.dump(ps, fh)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    for pool, bead_ids in pool_zombies.items():
+        n = len(bead_ids)
+        ps = _load_pool_dead_state(pool)
+        ps["pool"] = pool  # stored for recovery-reset lookups above
+
+        if n >= POOL_DEAD_MIN:
+            ps["consecutive_cycles"] = ps.get("consecutive_cycles", 0) + 1
+        else:
+            # Below threshold — reset; might be a transient single-bead stale.
+            ps["consecutive_cycles"] = 0
+            _save_pool_dead_state(pool, ps)
+            continue
+
+        if (ps["consecutive_cycles"] >= 2
+                and now - ps.get("last_alert_epoch", 0) > POOL_DEAD_COOLDOWN):
+            ids_str = " ".join(bead_ids)
+            emit(f"[INFLIGHT-RECLAIM] [POOL-DEAD] pool={pool} zombies={n} "
+                 f"(no branch + dead session, stranded > TTL)")
+            # Fail-open: mail failure is logged, never crashes the cycle.
+            try:
+                subprocess.run(
+                    ["gc", "mail", "mayor",
+                     "-s", f"[POOL-DEAD] {pool} producing nothing",
+                     "-m", (f"{n} beads dispatched to {pool} are in_progress with no branch "
+                            f"and no live worker for >TTL: {ids_str}. The pool is not building. "
+                            f"Existing healers notified via flow-authority.")],
+                    timeout=20, capture_output=True)
+            except Exception as exc:
+                print(f"[INFLIGHT-RECLAIM] [POOL-DEAD] mail failed (pool={pool}): {exc}",
+                      flush=True)
+            ps["last_alert_epoch"] = now
+
+        _save_pool_dead_state(pool, ps)
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +717,25 @@ def parse_reclaim_count(labels):
     return 0
 
 
+def _pool_of(assignee):
+    """Normalize a bead assignee to its worker-pool name for pool-dead tracking (ga-dbibq).
+
+    wa-worker / wa-worker-* → 'wa-worker'
+    gastown.dog / dog-*     → 'gastown.dog'
+    anything else           → the assignee as-is (crew name)
+    empty / None            → '' (callers skip empty pool)
+    """
+    if not assignee:
+        return ""
+    a = str(assignee)
+    al = a.lower()
+    if al == "wa-worker" or al.startswith("wa-worker-"):
+        return "wa-worker"
+    if al == "gastown.dog" or al.startswith("dog-"):
+        return "gastown.dog"
+    return a
+
+
 # ---------------------------------------------------------------------------
 # Actuation helpers (label + assignee ops on real beads — CONSERVATIVE)
 # ---------------------------------------------------------------------------
@@ -824,7 +953,11 @@ def run_cycle(state, escalated_alerted):
 
     stranded_count = 0
     active_bead_ids = set()
+    # ga-dbibq: two-pass structure so pool-dead alert fires BEFORE per-bead actuation.
+    classified = []    # (bead_id, title, labels, action, idle_min, reclaim_count)
+    pool_zombies = {}  # pool -> [bead_id] for beads classified zombie this cycle
 
+    # --- Pass 1: classify all beads (no actuation yet) ---
     for bead in beads:
         bead_id = bead.get("id", "")
         if not bead_id:
@@ -905,6 +1038,23 @@ def run_cycle(state, escalated_alerted):
 
         idle_min = seconds_stranded / 60.0
 
+        # Bucket zombie beads by pool for pool-dead detection (ga-dbibq).
+        # "Zombie" = would-reclaim or would-escalate: no live session, no recent
+        # branch, stranded past TTL. Per-bead actuation follows in Pass 2.
+        if action in ("reclaim", "escalate"):
+            pool = _pool_of(assignee)
+            if pool:
+                pool_zombies.setdefault(pool, []).append(bead_id)
+
+        classified.append((bead_id, title, labels, action, idle_min, reclaim_count))
+
+    # --- Pool-dead alert (BEFORE per-bead actuation, ga-dbibq) ---
+    # Emits [POOL-DEAD] Mayor mail when >= POOL_DEAD_MIN beads from the same pool
+    # are zombie for 2 consecutive cycles. Fail-open; never crashes the cycle.
+    _check_pool_dead(pool_zombies, now)
+
+    # --- Pass 2: per-bead actuation (logic unchanged from prior single-pass) ---
+    for bead_id, title, labels, action, idle_min, reclaim_count in classified:
         if action == "reclaim":
             ok = do_reclaim(bead_id, title, reclaim_count, idle_min, labels)
             status = "RECLAIMED" if ok else "RECLAIM-FAILED"
@@ -942,6 +1092,142 @@ def run_cycle(state, escalated_alerted):
         escalated_alerted.pop(bid, None)
 
     return len(beads), stranded_count
+
+
+# ---------------------------------------------------------------------------
+# Hermetic selftest (ga-dbibq) — python3 inflight-reclaim-guard.py --selftest
+# Tests _pool_of() and _check_pool_dead() cycle behavior.
+# Does NOT call bd, gc, git, or notify live.
+# ---------------------------------------------------------------------------
+
+def _selftest():
+    """Run hermetic POOL-DEAD selftest. Returns True if all checks pass."""
+    import tempfile as _tempfile
+    import shutil as _shutil
+
+    PASS = 0
+    FAIL = 0
+
+    def check(name, cond, detail=""):
+        nonlocal PASS, FAIL
+        if cond:
+            print(f"PASS: {name}")
+            PASS += 1
+        else:
+            print(f"FAIL: {name}" + (f" — {detail}" if detail else ""))
+            FAIL += 1
+
+    # -----------------------------------------------------------------------
+    # Section 1: _pool_of() pure function
+    # -----------------------------------------------------------------------
+    check("_pool_of: wa-worker exact",         _pool_of("wa-worker")             == "wa-worker")
+    check("_pool_of: wa-worker-adhoc",         _pool_of("wa-worker-adhoc-x")     == "wa-worker")
+    check("_pool_of: wa-worker-adhoc-long",    _pool_of("wa-worker-adhoc-123abc")== "wa-worker")
+    check("_pool_of: gastown.dog exact",       _pool_of("gastown.dog")           == "gastown.dog")
+    check("_pool_of: dog- prefix",             _pool_of("dog-gawispy8c0mr")      == "gastown.dog")
+    check("_pool_of: dog-short",               _pool_of("dog-3")                 == "gastown.dog")
+    check("_pool_of: crew name passthrough",   _pool_of("oracle-wa")             == "oracle-wa")
+    check("_pool_of: mila-wa passthrough",     _pool_of("mila-wa")               == "mila-wa")
+    check("_pool_of: batista-ps passthrough",  _pool_of("batista-ps")            == "batista-ps")
+    check("_pool_of: empty string",            _pool_of("") == "")
+
+    # -----------------------------------------------------------------------
+    # Section 2: _check_pool_dead() cycle behavior with temp state dir
+    # -----------------------------------------------------------------------
+    _tmpdir = _tempfile.mkdtemp(prefix="irg-selftest-")
+    try:
+        global STATE_FILE
+        _orig_state = STATE_FILE
+        STATE_FILE = os.path.join(_tmpdir, "state.json")
+
+        _mail_log = []
+        _orig_run = subprocess.run
+
+        def _stub_run(cmd, **kw):
+            """Capture gc mail calls; silently swallow everything else (notify, etc.)."""
+            if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == "gc" and cmd[1] == "mail":
+                _mail_log.append(list(cmd))
+            class _R:
+                returncode = 0
+            return _R()
+
+        subprocess.run = _stub_run
+        try:
+            T = 1_782_400_000.0  # fixed epoch for determinism
+
+            # --- Scenario POOL-DEAD-1: 1 cycle with 3 wa-worker zombies → NO alert ---
+            _check_pool_dead({"wa-worker": ["wa-b1", "wa-b2", "wa-b3"]}, T)
+            check("POOL-DEAD-1: 1 cycle → no alert (2-cycle hysteresis required)",
+                  len(_mail_log) == 0, f"mail_log={_mail_log}")
+
+            # --- Scenario POOL-DEAD-2: 2nd cycle → [POOL-DEAD] alert fires ---
+            _check_pool_dead({"wa-worker": ["wa-b1", "wa-b2", "wa-b3"]}, T + 10)
+            check("POOL-DEAD-2: 2 cycles → [POOL-DEAD] mail emitted",
+                  len(_mail_log) == 1,
+                  f"mail_log={_mail_log}")
+            check("POOL-DEAD-2: mail subject contains [POOL-DEAD]",
+                  len(_mail_log) == 1 and "[POOL-DEAD]" in " ".join(_mail_log[0]),
+                  f"mail_log={_mail_log}")
+            check("POOL-DEAD-2: mail subject names wa-worker",
+                  len(_mail_log) == 1 and "wa-worker" in " ".join(_mail_log[0]),
+                  f"mail_log={_mail_log}")
+
+            # --- Scenario POOL-DEAD-3: 3rd cycle within cooldown → NO repeat alert ---
+            _check_pool_dead({"wa-worker": ["wa-b1", "wa-b2", "wa-b3"]}, T + 20)
+            check("POOL-DEAD-3: within cooldown → no repeat alert",
+                  len(_mail_log) == 1, f"mail_log={_mail_log}")
+
+            # --- Scenario POOL-DEAD-4: after cooldown expires → alert fires again ---
+            _check_pool_dead({"wa-worker": ["wa-b1", "wa-b2", "wa-b3"]},
+                             T + POOL_DEAD_COOLDOWN + 30)
+            check("POOL-DEAD-4: after cooldown → second alert fires",
+                  len(_mail_log) == 2, f"mail_log={_mail_log}")
+
+            # Reset state for remaining scenarios
+            _shutil.rmtree(STATE_FILE + ".pool-dead", ignore_errors=True)
+            _mail_log.clear()
+
+            # --- Scenario POOL-DEAD-5: <POOL_DEAD_MIN zombies → no alert even after 2 cycles ---
+            _check_pool_dead({"wa-worker": ["wa-b1", "wa-b2"]}, T)        # 2 < POOL_DEAD_MIN=3
+            _check_pool_dead({"wa-worker": ["wa-b1", "wa-b2"]}, T + 10)
+            check("POOL-DEAD-5: below threshold (<3 zombies) → no alert",
+                  len(_mail_log) == 0, f"mail_log={_mail_log}")
+
+            # --- Scenario POOL-DEAD-6: pool recovers between cycles → counter resets ---
+            _shutil.rmtree(STATE_FILE + ".pool-dead", ignore_errors=True)
+            _mail_log.clear()
+            _check_pool_dead({"wa-worker": ["wa-b1", "wa-b2", "wa-b3"]}, T)        # cycle 1: zombie
+            _check_pool_dead({}, T + 10)                                             # cycle 2: recovered (0 zombies)
+            _check_pool_dead({"wa-worker": ["wa-b1", "wa-b2", "wa-b3"]}, T + 20)  # cycle 3: zombie again
+            check("POOL-DEAD-6: recovery resets counter → no premature alert",
+                  len(_mail_log) == 0, f"mail_log={_mail_log}")
+
+            # --- Scenario POOL-DEAD-7: gastown.dog pool also triggers correctly ---
+            _shutil.rmtree(STATE_FILE + ".pool-dead", ignore_errors=True)
+            _mail_log.clear()
+            _check_pool_dead({"gastown.dog": ["d1", "d2", "d3", "d4"]}, T)
+            _check_pool_dead({"gastown.dog": ["d1", "d2", "d3", "d4"]}, T + 10)
+            check("POOL-DEAD-7: gastown.dog pool fires after 2 cycles",
+                  len(_mail_log) == 1 and "gastown.dog" in " ".join(_mail_log[0]),
+                  f"mail_log={_mail_log}")
+
+            # --- Scenario POOL-DEAD-8: live session bead excluded (not in zombie list) ---
+            # Simulate: pool has 2 real zombies + 1 live-session bead (not passed in)
+            _shutil.rmtree(STATE_FILE + ".pool-dead", ignore_errors=True)
+            _mail_log.clear()
+            _check_pool_dead({"wa-worker": ["wa-b1", "wa-b2"]}, T)        # 2 zombies (live bead excluded)
+            _check_pool_dead({"wa-worker": ["wa-b1", "wa-b2"]}, T + 10)
+            check("POOL-DEAD-8: live-session bead excluded → stays below threshold",
+                  len(_mail_log) == 0, f"mail_log={_mail_log}")
+
+        finally:
+            subprocess.run = _orig_run
+            STATE_FILE = _orig_state
+    finally:
+        _shutil.rmtree(_tmpdir, ignore_errors=True)
+
+    print(f"\nResults: {PASS} passed, {FAIL} failed")
+    return FAIL == 0
 
 
 # ---------------------------------------------------------------------------
@@ -983,4 +1269,7 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--selftest" in _sys.argv:
+        ok = _selftest()
+        _sys.exit(0 if ok else 1)
     main()
