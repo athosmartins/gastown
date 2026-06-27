@@ -106,15 +106,19 @@ run_sweep() {
   fi
 
   # ── FALSE-POSITIVE GUARD A: empty queue ───────────────────────────────────
-  # Look for "Found N queued marker(s)" with N>0 anywhere in the tail.
-  # If the queue has been 0 throughout, the gate is legitimately idle.
-  local queued_found=0
+  # Use the MOST RECENT "Found N queued marker(s)" line — that is the CURRENT
+  # queue state. The old code matched ANY N>0 anywhere in the tail and broke on
+  # the FIRST (oldest) hit, so a transient marker that already CLEARED left a stale
+  # "Found 1" line and the watchdog treated an idle gate as a non-empty queue →
+  # false STALL on an idle gate (observed 06-27: queued=0 now, but a brief marker
+  # earlier in the tail tripped it). Scan all lines, keep the LAST N, test that.
+  local queued_found=0 latest_found_n=""
   while IFS= read -r line; do
-    if echo "$line" | grep -qE "Found ([1-9][0-9]*) queued marker"; then
-      queued_found=1
-      break
+    if echo "$line" | grep -qE "Found [0-9]+ queued marker"; then
+      latest_found_n=$(echo "$line" | grep -oE "Found [0-9]+ queued marker" | grep -oE "[0-9]+" | head -1)
     fi
   done <<< "$log_lines"
+  [ -n "$latest_found_n" ] && [ "$latest_found_n" -gt 0 ] 2>/dev/null && queued_found=1
 
   if [ "$queued_found" -eq 0 ]; then
     # COOLDOWN RESET: queue empty → stall cleared; disarm so next episode re-alerts immediately
