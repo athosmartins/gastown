@@ -313,7 +313,7 @@ def _check_pool_dead(pool_zombies, now):
             # Fail-open: mail failure is logged, never crashes the cycle.
             try:
                 result = subprocess.run(
-                    ["gc", "mail", "mayor",
+                    ["gc", "mail", "send", "mayor",
                      "-s", f"[POOL-DEAD] {pool} producing nothing",
                      "-m", (f"{n} beads dispatched to {pool} are in_progress with no branch "
                             f"and no live worker for >TTL: {ids_str}. The pool is not building. "
@@ -1149,6 +1149,7 @@ def _selftest():
         def _stub_run(cmd, **kw):
             """Capture gc mail calls; silently swallow everything else (notify, etc.)."""
             if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == "gc" and cmd[1] == "mail":
+                assert len(cmd) >= 3 and cmd[2] == "send", f"gc mail missing 'send' subcommand: {cmd}"
                 _mail_log.append(list(cmd))
             class _R:
                 returncode = 0
@@ -1231,6 +1232,7 @@ def _selftest():
             def _stub_run_fail(cmd, **kw):
                 """Like _stub_run but gc mail returns rc=1 (simulate Dolt down / args rejected)."""
                 if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == "gc" and cmd[1] == "mail":
+                    assert len(cmd) >= 3 and cmd[2] == "send", f"gc mail missing 'send' subcommand: {cmd}"
                     _mail_log.append(list(cmd))
                     class _RF:
                         returncode = 1

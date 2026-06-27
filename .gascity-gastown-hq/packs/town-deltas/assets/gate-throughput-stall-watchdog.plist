@@ -14,10 +14,10 @@
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
     <key>HOME</key><string>/Users/athos</string>
-    <!-- Stall threshold: hours without Gate PASSED before alerting. Default: 2h.
-         Set GTSW_STALL_HOURS=1 in testing, or raise to 3-4 if false-positives appear
+    <!-- Stall threshold: minutes without Gate PASSED before alerting. Default: 165 min.
+         Set GTSW_STALL_MINUTES=30 in testing, or raise to 240+ if false-positives appear
          on slow weekends. -->
-    <!-- <key>GTSW_STALL_HOURS</key><string>2</string> -->
+    <!-- <key>GTSW_STALL_MINUTES</key><string>165</string> -->
     <!-- Auto-recover: kickstart supervisor + gate dispatcher on confirmed stall.
          Set GTSW_AUTORECOVER=0 to alert-only (no kickstart). Default: 1 (on). -->
     <!-- <key>GTSW_AUTORECOVER</key><string>1</string> -->
