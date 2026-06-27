@@ -253,6 +253,10 @@ def _rig_name(root):
         return "whatsapp_automation"
     if "property_scrapers" in root:
         return "property_scrapers"
+    # HQ rig: its bead store is the city dir (.gascity-gastown-hq); the git repo
+    # root (/Users/athos/gt) maps here too. Both are the HQ/"gascity" rig — not unknown.
+    if "gascity-gastown-hq" in root or root == "/Users/athos/gt" or "gascity" in root:
+        return "gascity"
     _log("_rig_name: unrecognized root %r — falling back to 'gascity'" % root)
     return "gascity"
 
