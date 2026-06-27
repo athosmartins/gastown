@@ -3561,44 +3561,59 @@ TASK
       DISPATCH_RESULT="rig_dedup_skip"
       return 1
     fi
-    # ga-v3o6i: assign WITH --status in_progress (a real CLAIM, not a soft assign).
-    # The wa-worker startup query is `bd list --status in_progress --assignee=wa-worker`;
-    # a bare --assignee leaves status=open, so the worker never finds its bead → claims-
-    # but-never-builds (88 phantom drains observed 06-26). --status in_progress closes the gap.
-    if ! timeout 15 bd -C "$STORY_BEAD_CITY" update "$STORY_ID" \
-        --assignee "$_SLING_TARGET" --status in_progress -q 2>/dev/null; then
-      warn "ga-mfeip: bd update --assignee failed for $STORY_ID → $_SLING_TARGET. Releasing claim."
-      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
-      bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
-      DISPATCH_RESULT="rig_assign_failed"
-      return 1
-    fi
+    # ga-dbibq: POOL targets (wa-worker*) vs NAMED CREWS need DIFFERENT ownership.
+    #   • Pool (wa-worker*): leave the bead UNASSIGNED + open. The ephemeral worker finds it
+    #     via RoutedPoolQuery (`bd ready --metadata-field gc.routed_to=wa-worker --unassigned`,
+    #     routed_to set in the spawn block below) and CLAIMS it (assignee = its session id).
+    #     The prior ga-v3o6i code assigned the bead to the bare TEMPLATE name "wa-worker"
+    #     + in_progress, on the WRONG assumption that the worker queries `--assignee=wa-worker`.
+    #     It actually queries --assignee=$GC_SESSION_ID/NAME/ALIAS (never the template) AND the
+    #     routed-pool query requires --unassigned → an assigned+in_progress bead was invisible
+    #     to BOTH → the worker spawned, found nothing, drained WITHOUT building (the exact stall;
+    #     confirmed via worker transcript 2026-06-27). story:in-flight (added post-dispatch) still
+    #     blocks Pilot re-selection; NEVERSTARTED still releases it if no worker ever claims.
+    #   • Named crew (mila-wa, oracle-wa, …): assign directly — their GC_ALIAS == the crew name,
+    #     so --assignee=<crew> matches the crew session's identity (unchanged behaviour).
+    case "$_SLING_TARGET" in
+      wa-worker*)
+        : # pool: leave UNASSIGNED + open so RoutedPoolQuery finds it (claim happens worker-side)
+        ;;
+      *)
+        if ! timeout 15 bd -C "$STORY_BEAD_CITY" update "$STORY_ID" \
+            --assignee "$_SLING_TARGET" --status in_progress -q 2>/dev/null; then
+          warn "ga-mfeip: bd update --assignee failed for $STORY_ID → $_SLING_TARGET. Releasing claim."
+          bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+          bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+          DISPATCH_RESULT="rig_assign_failed"
+          return 1
+        fi
+        ;;
+    esac
     # Record the rig bead itself as the "sling bead" for TTL compatibility.
     bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "pilot.sling_bead=$STORY_ID" -q 2>/dev/null || true
     SLING_BEAD_ID="$STORY_ID"
     DISPATCH_RESULT="rig_native_ok"
     # ── pilot-spawn: ephemeral pool worker vs persistent crew ──────────────────
     # wa-worker has min_active_sessions=0 and wake_mode=fresh — there is NO running
-    # session to nudge and NO hook cycle to "see it next time". Instead, spawn a fresh
-    # headless session so it starts immediately, runs its startup protocol (prompt.template.md),
-    # and finds the bead via AssignedReadyQuery (assignee=wa-worker matches the session's
-    # GC_AGENT/GC_TEMPLATE) or RoutedPoolQuery (gc.routed_to=wa-worker, set below).
+    # session to nudge and NO hook cycle to "see it next time". Spawn a fresh headless
+    # session; it starts immediately, runs its startup protocol (prompt.template.md),
+    # and finds the bead via RoutedPoolQuery (gc.routed_to=wa-worker, set below;
+    # bead is UNASSIGNED per ga-dbibq fix — worker self-claims on first find).
     # Named crew (mila-wa, oracle-wa, …) remain on the nudge path: they have persistent
     # sessions with a running hook cycle. Set PILOT_SPAWN_WA_WORKER=0 to disable spawning
-    # and revert to nudge-only (for debugging; bead stays assigned until manual start).
+    # and revert to nudge-only (for debugging; bead stays unassigned+routed until manual start).
     case "$_SLING_TARGET" in
       wa-worker*)
-        # Set gc.routed_to so RoutedPoolQuery finds the bead AND supervisor scale_check
-        # counts it as pool demand (capped at max_active_sessions=4).
+        # Set gc.routed_to so RoutedPoolQuery finds the unassigned bead AND the supervisor
+        # scale_check counts it as pool demand (capped at max_active_sessions=4).
         bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "gc.routed_to=wa-worker" -q 2>/dev/null || true
         if [ "${PILOT_SPAWN_WA_WORKER:-1}" = "1" ]; then
           # ── ga-v3o6i: max-cap guard — count live sessions before spawning ──────
           # Each sweep dispatches a bead then spawns a session. Without a cap check,
           # rapid re-sweeps (or slow session startup) spawn N sessions for M beads
           # where N >> M (the prior 39-session runaway). Count active + creating
-          # sessions; skip the spawn if at cap (bead is assigned+gc.routed_to set —
-          # the reconciler will start a session when a slot frees, or the supervisor
-          # will pick it up on its next scale_check tick). Fail-open on probe error.
+          # sessions; skip the spawn if at cap (gc.routed_to=wa-worker set —
+          # the supervisor picks it up on its next scale_check tick). Fail-open on probe error.
           if [ -n "${PILOT_TEST_WA_WORKER_LIVE_COUNT:-}" ]; then
             _live_wa_count="$PILOT_TEST_WA_WORKER_LIVE_COUNT"
           else
@@ -3607,9 +3622,9 @@ TASK
           fi
           _live_wa_count="${_live_wa_count:-0}"
           if [ "${_live_wa_count:-0}" -ge "${PILOT_WA_WORKER_MAX:-4}" ] 2>/dev/null; then
-            log "  ga-mfeip: wa-worker pool at session cap ($_live_wa_count active/creating >= ${PILOT_WA_WORKER_MAX:-4} max) — skip spawn for $STORY_ID (bead stays assigned=wa-worker, gc.routed_to set; supervisor picks it up when slot frees)"
+            log "  ga-mfeip: wa-worker pool at session cap ($_live_wa_count active/creating >= ${PILOT_WA_WORKER_MAX:-4} max) — skip spawn for $STORY_ID (gc.routed_to=wa-worker set; supervisor picks it up when slot frees)"
           else
-            log "  ga-mfeip: rig assign OK — $STORY_ID.assignee=$_SLING_TARGET (slot=$BUILDER_TARGET). Spawning ephemeral worker (pilot-spawn, live=$_live_wa_count < ${PILOT_WA_WORKER_MAX:-4})."
+            log "  ga-mfeip: spawning wa-worker for $STORY_ID (slot=$BUILDER_TARGET, live=$_live_wa_count < ${PILOT_WA_WORKER_MAX:-4})."
             if timeout 30 gc --city "$GC_CITY" session new wa-worker --no-attach \
                 --title-hint "build $STORY_ID: $STORY_TITLE" \
                 >/dev/null 2>&1; then
@@ -3619,7 +3634,7 @@ TASK
             fi
           fi
         else
-          log "  ga-mfeip: PILOT_SPAWN_WA_WORKER=0 — skipping auto-spawn for $STORY_ID (wa-worker; bead stays assigned until manual start)"
+          log "  ga-mfeip: PILOT_SPAWN_WA_WORKER=0 — skipping auto-spawn for $STORY_ID (gc.routed_to=wa-worker set; bead unassigned until worker claims)"
         fi
         ;;
       *)
@@ -3840,18 +3855,19 @@ TASK
     # them so a later re-dispatch (gate:needs-fix) starts from a clean slate.
     bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
 
-    # ga-ms1jm: a SOURCE bead must NEVER carry gc.routed_to. The builder is
-    # dispatched via the separate sling TASK bead created above — this source
-    # bead is selected only by the Pilot's own tier/label queries, never by
-    # routing. If any path (legacy sling-by-id, manual edit, future regression)
-    # leaves gc.routed_to=<dog-pool> on this now-in-flight source bead, the dog
-    # pool's engine ready-query (`bd ready --metadata-field gc.routed_to=...
-    # --unassigned`, which does NOT exclude story:in-flight) would re-claim it →
-    # double-dispatch, spawning a duplicate builder and pinning dog slots on
-    # already-fixed work. The ga-zzrts guards above stop the PILOT re-dispatching;
-    # this stops the DOG engine query re-claiming. Idempotent (no-op when absent);
-    # || true keeps set -euo pipefail safe.
-    bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata gc.routed_to -q >/dev/null 2>&1 || true
+    # ga-ms1jm: strip gc.routed_to from non-rig-native source beads only.
+    # For the sling path (_IS_RIG_NATIVE=0), the source bead lives in HQ — the
+    # same DB that dog-pool queries via `bd ready --metadata-field gc.routed_to=...
+    # --unassigned` (which does NOT exclude story:in-flight). Leaving gc.routed_to
+    # on a HQ source bead would allow dog re-claiming → double-dispatch.
+    # For rig-native wa-worker beads (_IS_RIG_NATIVE=1): the source bead lives in
+    # the WA rig's own Dolt DB, which dog-pool never queries — no re-claim risk.
+    # Moreover, gc.routed_to=wa-worker MUST survive here so: (a) the spawned
+    # worker's RoutedPoolQuery finds the unassigned bead (ga-dbibq fix), and (b)
+    # the supervisor's scale_check counts live demand for spawn gating.
+    if [ "${_IS_RIG_NATIVE:-0}" != "1" ]; then
+      bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata gc.routed_to -q >/dev/null 2>&1 || true
+    fi
 
     local DISPATCH_COMMENT
     if [ "$DISPATCH_TIER" = "bug" ]; then
