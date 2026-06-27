@@ -25,7 +25,18 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # Step 1b2: If none, check for ROUTED pool demand (gc.routed_to=wa-worker metadata)
 {{ .RoutedPoolQuery }}
 
-# Step 1c: If none, no work — drain and exit.
+# Step 1b3 (ga-dbibq — CRITICAL, do NOT skip): the rendered RoutedPoolQuery above is
+# GATED on GC_SESSION_ORIGIN=ephemeral. A pilot-spawned worker (gc session new) gets a
+# NON-ephemeral origin, so that gated probe is silently SKIPPED and you would wrongly drain
+# while real pool work waits unclaimed. You ARE a dedicated wa-worker — ALWAYS run this
+# UN-GATED routed-pool probe directly:
+bd ready --metadata-field "gc.routed_to=wa-worker" --unassigned --exclude-type=epic --json --sort oldest --limit=1
+# If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
+#     gc bd update <id> --claim
+# verify the claim set assignee to your session, then go to the Build Protocol and build it.
+# Do NOT drain while this probe returns a bead.
+
+# Step 1c: ONLY if Steps 1a / 1b / 1b2 / 1b3 are ALL empty — no work — drain and exit.
 gc runtime drain-ack && exit
 ```
 
