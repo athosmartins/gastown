@@ -159,9 +159,24 @@ PILOT_COMPLETE_RE = re.compile(r"Pilot sweep complete: dispatched=(\d+)")
 GATE_PASS_RE = re.compile(r"Gate PASSED")
 # Exclude labels for the backlog query: a bead with ANY of these is not "ready to dispatch"
 EXCLUDE_LABELS_BACKLOG = frozenset({
-    "gate:needs-human", "exec:manual", "blocked", "story:in-flight",
+    "gate:needs-human", "exec:manual", "blocked", "story:blocked", "story:in-flight",
     "pilot:dispatched", "pilot:dispatching", "story:done",
 })
+
+
+def _bead_is_braked(labels):
+    """True iff any bead label marks it not-ready-to-dispatch. Matches an exclude
+    label EXACTLY or as a colon-suffixed VARIANT (e.g. EXCLUDE 'gate:needs-human'
+    also matches the real labels 'gate:needs-human:product' / ':technical'). The
+    old exact set-intersection MISSED these suffixed variants → product/technical-
+    braked + story:blocked beads were counted as dispatchable backlog → false STALL
+    (observed 2026-06-27: wa-43k needs-human:product, wa-el8t/n0vv story:blocked,
+    wa-f5q4 story:done all miscounted). Same session-suffix matcher class."""
+    for lab in labels:
+        for ex in EXCLUDE_LABELS_BACKLOG:
+            if lab == ex or lab.startswith(ex + ":"):
+                return True
+    return False
 
 # ── test seams (monkeypatched in --selftest) ──────────────────────────────────
 # These are module-level callables so tests can substitute them without patching subprocess.
@@ -580,8 +595,9 @@ def backlog_signal():
                 labels = {str(l).strip() for l in raw_labels}
             elif isinstance(raw_labels, str):
                 labels = {x.strip() for x in raw_labels.split(",") if x.strip()}
-            # Exclude braked beads
-            if labels & EXCLUDE_LABELS_BACKLOG:
+            # Exclude braked beads (variant-aware: catches gate:needs-human:product,
+            # story:blocked, etc. — not just exact base labels)
+            if _bead_is_braked(labels):
                 continue
             all_beads.append(b)
 
