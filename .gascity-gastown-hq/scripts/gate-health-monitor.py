@@ -2,10 +2,12 @@
 """Problem-only gate/loop health monitor.
 
 Emits a line ONLY for actionable problems (silence = healthy):
-  [GATE FAIL]      a review genuinely failed
-  [REAL-JAM]       a gate marker is queued/claimed but not completing (true wedge)
-  [GATE-ERROR]     one or more gate markers stuck in gate-status:error (spawn/dispatch failure)
-  [DELIVERY-FAIL]  a delivery failed or HALTed
+  [GATE FAIL]           a review genuinely failed
+  [REAL-JAM]            a gate marker is queued/claimed but not completing (true wedge)
+  [GATE-ERROR]          one or more gate markers stuck in gate-status:error (spawn/dispatch failure)
+  [DELIVERY-FAIL]       a delivery failed or HALTed
+  [ASYNC-START-REGRESS] the stale_async_start race fix is MISSING from the live gc binary
+  [ASYNC-START-RACE]    stale_async_start race rate spiked above threshold
 
 Deliberately does NOT emit routine GATE PASS / PILOT dispatch / DELIVERY PASS —
 those are normal operation and were the source of the old monitor's noise.
@@ -17,6 +19,13 @@ markers landing in gate-status:error (spawn/dispatch failure) were invisible
 to the old four checks. Now alerts when any open error marker stays in error
 past ERROR_STUCK_SEC (10min). Uses first-seen tracking to avoid alerting on
 normal churn (error→queued→error during rebase-attempt cycles).
+
+[ASYNC-START-REGRESS] + [ASYNC-START-RACE] close the regression blind spot for
+the stale_async_start race fix shipped in gc-patched-asyncstart (4f57fbac4):
+the fix adds a 3rd config-drift-drain exemption for gate-reviewers in state=
+creating, identified by 'async-start (fresh creating)' in the binary. If the
+binary is rebuilt without the fix, reviewer-spawn flakiness resurges silently.
+Env: GATE_REVIEWER_RACE_CHECK=1 (default on), GATE_REVIEWER_RACE_MAX (default 8/h).
 """
 import json, time, datetime, subprocess, os
 
@@ -29,9 +38,16 @@ ENGINE_STALL_SEC = 900  # dispatcher log silent >15min = engine dead/hung
 ERROR_STUCK_SEC = 600   # 10min in gate-status:error = dispatch failure worth alarming
 VERDICT_STALL_SEC = 1500  # 25min of a gate-run's pending verdicts not changing = idle reviewer(s) (ga-noxbv)
 NOMERGE_STALL_SEC = 900   # 15min: queue has not ADVANCED + work queued + no review in flight = stuck (ga-hl0gq)
+RACE_WINDOW_SEC = 3600    # 1h rolling window for stale_async_start race-rate check
 # QG events that ADVANCE the queue (a marker reached a handled/terminal state).
 # autorebase_retry + guard_queued do NOT count — they are the non-advancing re-queue loop.
 PROGRESS_EVENTS = {"dispatcher_complete", "dispatcher_superseded", "dispatcher_needs_rebase"}
+
+# Env knobs for the async-start regression checks.
+# GATE_REVIEWER_RACE_CHECK=0 disables both checks (default on = "1").
+# GATE_REVIEWER_RACE_MAX sets the per-hour spike threshold (default 8).
+_RACE_CHECK = os.environ.get("GATE_REVIEWER_RACE_CHECK", "1") != "0"
+_RACE_MAX   = int(os.environ.get("GATE_REVIEWER_RACE_MAX", "8"))
 
 
 def age(ts):
@@ -167,163 +183,293 @@ def count(path):
         return 0
 
 
-qg_seen = count(QG)
-sd_seen = count(SD)
-alerted = {}          # bead_id -> last-alerted timestamp (queued wedge alerts)
-engine_alerted = 0
-error_first_seen = {}  # bead_id -> first-seen timestamp (for error-stuck tracking)
-error_alerted = {}     # bead_id -> last-alerted timestamp (for error re-alert cadence)
-verdict_progress = {}  # gate-run -> {"sig": tuple(pending ids), "since": ts, "alerted": ts} (ga-noxbv idle-reviewer)
-nomerge_alerted = 0    # last-alerted ts for the GATE-NOMERGE throughput check (ga-hl0gq)
+# ---------------------------------------------------------------------------
+# Async-start race regression helpers (4f57fbac4 / gc-patched-asyncstart)
+# ---------------------------------------------------------------------------
 
-while True:
-    # --- engine liveness: dispatcher log must keep sweeping ---
+def _disp_log_ts(line):
+    """Parse the local-time epoch from a dispatcher log line '[YYYY-MM-DD HH:MM:SS]'.
+    Returns None on any failure (missing prefix, malformed timestamp, etc.)."""
     try:
-        m = os.path.getmtime(DISPATCH_LOG)
-        stale = time.time() - m
-        if stale > ENGINE_STALL_SEC and time.time() - engine_alerted > REALERT_SEC:
-            emit("[ENGINE-STALL] gate dispatcher log silent %dmin - dispatcher may be "
-                 "dead/hung" % int(stale / 60))
-            engine_alerted = time.time()
-    except OSError:
-        pass
+        if not line.startswith("["):
+            return None
+        ts = line[1:20]  # "YYYY-MM-DD HH:MM:SS"
+        return time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return None
 
-    # --- gate: new FAILs + stuck-marker detection ---
+
+def _gc_binary_path():
+    """Resolve the live gc binary path (follows symlinks). Returns None on failure."""
     try:
-        lines = open(QG).read().splitlines()
-    except FileNotFoundError:
-        lines = []
-    for l in lines[qg_seen:]:
-        try:
-            r = json.loads(l)
-        except Exception:
-            continue
-        if r.get("event") == "dispatcher_complete" and str(r.get("result", "")).upper() == "FAIL":
-            emit("[GATE FAIL] %s %s — %s" % (
-                r.get("bead"), r.get("branch", ""), (r.get("reason") or "")[:80]))
-    qg_seen = len(lines)
+        r = subprocess.run(["which", "gc"], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        rl = subprocess.run(["readlink", "-f", r.stdout.strip()],
+                             capture_output=True, text=True, timeout=5)
+        p = (rl.stdout or "").strip()
+        return p if p else r.stdout.strip()
+    except Exception:
+        return None
 
-    last = {}
-    for l in lines:
-        try:
-            r = json.loads(l)
-        except Exception:
-            continue
-        b = r.get("bead")
-        if b:
-            last[b] = r
-    for b, r in last.items():
-        if r.get("event") == "guard_queued":
-            a = age(r.get("ts", ""))
-            if a > STUCK_SEC and (b not in alerted or time.time() - alerted[b] > REALERT_SEC):
-                if not still_queued(b):
-                    alerted[b] = time.time()  # dispatched/failed/done — not a wedge; skip
-                    continue
-                emit("[REAL-JAM] gate marker %s stuck %dmin (queued, no completion) "
-                     "- gate may be wedged" % (b, int(a / 60)))
-                alerted[b] = time.time()
 
-    # --- GATE-ERROR: markers stuck in gate-status:error (dispatch/spawn failure) ---
-    # This is the blind spot from the 2026-06-06 outage: the dispatcher kept logging
-    # (no ENGINE-STALL), markers were :error not :queued (no REAL-JAM), no review FAIL.
-    # Strategy: query open error markers each cycle; track first-seen per marker.
-    # Alert only after ERROR_STUCK_SEC (10min) to absorb normal rebase-attempt churn
-    # (error→queued→error). Re-alert every REALERT_SEC (15min) until resolved.
-    current_error_ids = set()
-    for em in list_error_markers():
-        mid = em["id"]
-        current_error_ids.add(mid)
+def _binary_has_async_start_fix(path):
+    """Check if the gc binary at `path` contains the async-start race fix string.
+
+    The fix (4f57fbac4) added the config-drift-drain exemption message:
+      'Skipping config-drift drain for ...: gate-reviewer in async-start (fresh creating)'
+    We probe for the distinctive substring 'async-start (fresh creating)' via
+    `strings` so the check works on a compiled binary.
+
+    Returns:
+      True  — fix is present (binary is patched)
+      False — fix is absent (regression: binary was rebuilt/reverted without the fix)
+      None  — binary unreadable / `strings` failed (fail-open: do NOT alert)
+    """
+    if not path:
+        return None
+    try:
+        r = subprocess.run(["strings", path], capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return None
+        return "async-start (fresh creating)" in r.stdout
+    except Exception:
+        return None
+
+
+def _count_async_start_races_in_text(lines, window_sec, now=None):
+    """Pure core: count 'stale_async_start race' occurrences in `lines` that fall
+    within the last `window_sec` seconds. `now` defaults to time.time().
+    Separated from I/O so the selftest can drive it with synthetic log lines."""
+    if now is None:
         now = time.time()
-        if mid not in error_first_seen:
-            error_first_seen[mid] = now  # just appeared, start the clock
-        stuck_for = now - error_first_seen[mid]
-        if stuck_for > ERROR_STUCK_SEC:
-            last_alert = error_alerted.get(mid, 0)
-            if now - last_alert > REALERT_SEC:
-                emit("[GATE-ERROR] marker %s (%s) stuck in gate-status:error for %dmin "
-                     "— branch: %s source: %s" % (
-                         mid, em["source_bead"], int(stuck_for / 60),
-                         em["branch"], em["source_bead"]))
-                error_alerted[mid] = now
-    # Prune markers that are no longer in error (resolved/superseded/closed)
-    gone = set(error_first_seen.keys()) - current_error_ids
-    for mid in gone:
-        error_first_seen.pop(mid, None)
-        error_alerted.pop(mid, None)
-
-    # --- IDLE-REVIEWER: a gate-run's verdicts not progressing (ga-noxbv) ---
-    # Closes the 38min observability blind spot from today's hang: the marker was
-    # in gate-status:dispatching (not :queued, so still_queued()/REAL-JAM missed
-    # it) and the dispatcher kept logging "Verdicts 1/3" (so ENGINE-STALL missed
-    # it). We watch the verdict beads directly: if a run's set of still-pending
-    # verdicts is UNCHANGED for VERDICT_STALL_SEC, the reviewer(s) are idle/stuck.
-    # Reset the clock whenever the pending set shrinks (a verdict landed = real
-    # progress). Sample Dolt before alarming — a slow write != a dead reviewer.
-    runs_now = pending_verdicts_by_run()
-    now = time.time()
-    for run, pend_ids in runs_now.items():
-        sig = tuple(pend_ids)
-        st = verdict_progress.get(run)
-        if st is None or st["sig"] != sig:
-            verdict_progress[run] = {"sig": sig, "since": now, "alerted": 0}
-            continue
-        stalled = now - st["since"]
-        if stalled > VERDICT_STALL_SEC and now - st["alerted"] > REALERT_SEC:
-            if not dolt_responsive():
-                continue  # Dolt slow/unreachable — not the reviewer's fault; skip
-            emit("[IDLE-REVIEWER] gate-run %s: %d verdict(s) pending with no progress "
-                 "for %dmin — reviewer(s) idle/stuck; dispatcher re-queues, else gate "
-                 "will FAIL at verdict timeout" % (run, len(pend_ids), int(stalled / 60)))
-            verdict_progress[run]["alerted"] = now
-    # Prune runs whose verdicts are all in (run complete / superseded)
-    for run in set(verdict_progress.keys()) - set(runs_now.keys()):
-        verdict_progress.pop(run, None)
-
-    # --- GATE-NOMERGE: queue not advancing while work is queued (ga-hl0gq) ---
-    # The 2026-06-10 49min stall was invisible to every check above: the marker kept
-    # re-queuing (dispatcher_autorebase_retry, a dead-author stale-branch rebase loop)
-    # so its guard_queued event-ts kept refreshing and REAL-JAM's age never crossed
-    # STUCK_SEC; no run reached verdicts (IDLE-REVIEWER blind); the dispatcher kept
-    # logging (ENGINE-STALL blind); no review FAILed (GATE FAIL blind). This check is
-    # mechanism-agnostic: if NO queue-ADVANCING event (complete/superseded/needs-rebase)
-    # has landed for NOMERGE_STALL_SEC while >=1 marker is queued AND nothing is being
-    # actively reviewed, the gate is stuck regardless of the underlying cause. The
-    # "no review in flight" + "queued work exists" guards keep a healthy long-running
-    # review (15-45min) from false-firing. Dolt-guarded (a slow server != a stuck gate).
-    now = time.time()
-    last_prog_age = None
+    hits = 0
     for l in lines:
-        try:
-            r = json.loads(l)
-        except Exception:
+        if "stale_async_start race" not in l:
             continue
-        if r.get("event") in PROGRESS_EVENTS:
-            a = age(r.get("ts", ""))
-            if a and (last_prog_age is None or a < last_prog_age):
-                last_prog_age = a
-    if (last_prog_age is not None and last_prog_age > NOMERGE_STALL_SEC
-            and not runs_now and now - nomerge_alerted > REALERT_SEC):
-        qids = queued_marker_ids()
-        if qids and dolt_responsive():
-            emit("[GATE-NOMERGE] gate queue has not advanced in %dmin while %d marker(s) "
-                 "queued and no review in flight — dispatcher stuck (e.g. head-of-line "
-                 "stale branch); queue not draining" % (int(last_prog_age / 60), len(qids)))
-            nomerge_alerted = now
+        ts = _disp_log_ts(l)
+        if ts and now - ts <= window_sec:
+            hits += 1
+    return hits
 
-    # --- delivery: failures / halts only ---
+
+def _count_async_start_races(window_sec=RACE_WINDOW_SEC):
+    """Count 'stale_async_start race' occurrences in DISPATCH_LOG within the last
+    `window_sec` seconds. Returns 0 on any error (fail-open: log absent or
+    unreadable → no alert, never false-alarm)."""
     try:
-        slines = open(SD).read().splitlines()
-    except FileNotFoundError:
-        slines = []
-    for l in slines[sd_seen:]:
-        try:
-            r = json.loads(l)
-        except Exception:
-            continue
-        res = str(r.get("result", "")).upper()
-        if "FAIL" in res or "HALT" in res:
-            emit("[DELIVERY-FAIL] %s %s" % (
-                r.get("story") or r.get("bead", ""), res))
-    sd_seen = len(slines)
+        with open(DISPATCH_LOG) as f:
+            lines = f.readlines()[-4000:]
+    except Exception:
+        return 0
+    return _count_async_start_races_in_text(lines, window_sec)
 
-    time.sleep(120)  # ga-8smq3: was 60; alert thresholds are all >=600s (10-40min), so 120s loses no real detection latency while halving Dolt poll load
+
+if __name__ == "__main__":
+    qg_seen = count(QG)
+    sd_seen = count(SD)
+    alerted = {}          # bead_id -> last-alerted timestamp (queued wedge alerts)
+    engine_alerted = 0
+    error_first_seen = {}  # bead_id -> first-seen timestamp (for error-stuck tracking)
+    error_alerted = {}     # bead_id -> last-alerted timestamp (for error re-alert cadence)
+    verdict_progress = {}  # gate-run -> {"sig": tuple(pending ids), "since": ts, "alerted": ts} (ga-noxbv idle-reviewer)
+    nomerge_alerted = 0    # last-alerted ts for the GATE-NOMERGE throughput check (ga-hl0gq)
+    binary_regress_alerted = 0  # last-alerted ts for ASYNC-START-REGRESS binary check
+    race_spike_alerted = 0      # last-alerted ts for ASYNC-START-RACE spike check
+
+    while True:
+        # --- engine liveness: dispatcher log must keep sweeping ---
+        try:
+            m = os.path.getmtime(DISPATCH_LOG)
+            stale = time.time() - m
+            if stale > ENGINE_STALL_SEC and time.time() - engine_alerted > REALERT_SEC:
+                emit("[ENGINE-STALL] gate dispatcher log silent %dmin - dispatcher may be "
+                     "dead/hung" % int(stale / 60))
+                engine_alerted = time.time()
+        except OSError:
+            pass
+
+        # --- gate: new FAILs + stuck-marker detection ---
+        try:
+            lines = open(QG).read().splitlines()
+        except FileNotFoundError:
+            lines = []
+        for l in lines[qg_seen:]:
+            try:
+                r = json.loads(l)
+            except Exception:
+                continue
+            if r.get("event") == "dispatcher_complete" and str(r.get("result", "")).upper() == "FAIL":
+                emit("[GATE FAIL] %s %s — %s" % (
+                    r.get("bead"), r.get("branch", ""), (r.get("reason") or "")[:80]))
+        qg_seen = len(lines)
+
+        last = {}
+        for l in lines:
+            try:
+                r = json.loads(l)
+            except Exception:
+                continue
+            b = r.get("bead")
+            if b:
+                last[b] = r
+        for b, r in last.items():
+            if r.get("event") == "guard_queued":
+                a = age(r.get("ts", ""))
+                if a > STUCK_SEC and (b not in alerted or time.time() - alerted[b] > REALERT_SEC):
+                    if not still_queued(b):
+                        alerted[b] = time.time()  # dispatched/failed/done — not a wedge; skip
+                        continue
+                    emit("[REAL-JAM] gate marker %s stuck %dmin (queued, no completion) "
+                         "- gate may be wedged" % (b, int(a / 60)))
+                    alerted[b] = time.time()
+
+        # --- GATE-ERROR: markers stuck in gate-status:error (dispatch/spawn failure) ---
+        # This is the blind spot from the 2026-06-06 outage: the dispatcher kept logging
+        # (no ENGINE-STALL), markers were :error not :queued (no REAL-JAM), no review FAIL.
+        # Strategy: query open error markers each cycle; track first-seen per marker.
+        # Alert only after ERROR_STUCK_SEC (10min) to absorb normal rebase-attempt churn
+        # (error→queued→error). Re-alert every REALERT_SEC (15min) until resolved.
+        current_error_ids = set()
+        for em in list_error_markers():
+            mid = em["id"]
+            current_error_ids.add(mid)
+            now = time.time()
+            if mid not in error_first_seen:
+                error_first_seen[mid] = now  # just appeared, start the clock
+            stuck_for = now - error_first_seen[mid]
+            if stuck_for > ERROR_STUCK_SEC:
+                last_alert = error_alerted.get(mid, 0)
+                if now - last_alert > REALERT_SEC:
+                    emit("[GATE-ERROR] marker %s (%s) stuck in gate-status:error for %dmin "
+                         "— branch: %s source: %s" % (
+                             mid, em["source_bead"], int(stuck_for / 60),
+                             em["branch"], em["source_bead"]))
+                    error_alerted[mid] = now
+        # Prune markers that are no longer in error (resolved/superseded/closed)
+        gone = set(error_first_seen.keys()) - current_error_ids
+        for mid in gone:
+            error_first_seen.pop(mid, None)
+            error_alerted.pop(mid, None)
+
+        # --- IDLE-REVIEWER: a gate-run's verdicts not progressing (ga-noxbv) ---
+        # Closes the 38min observability blind spot from today's hang: the marker was
+        # in gate-status:dispatching (not :queued, so still_queued()/REAL-JAM missed
+        # it) and the dispatcher kept logging "Verdicts 1/3" (so ENGINE-STALL missed
+        # it). We watch the verdict beads directly: if a run's set of still-pending
+        # verdicts is UNCHANGED for VERDICT_STALL_SEC, the reviewer(s) are idle/stuck.
+        # Reset the clock whenever the pending set shrinks (a verdict landed = real
+        # progress). Sample Dolt before alarming — a slow write != a dead reviewer.
+        runs_now = pending_verdicts_by_run()
+        now = time.time()
+        for run, pend_ids in runs_now.items():
+            sig = tuple(pend_ids)
+            st = verdict_progress.get(run)
+            if st is None or st["sig"] != sig:
+                verdict_progress[run] = {"sig": sig, "since": now, "alerted": 0}
+                continue
+            stalled = now - st["since"]
+            if stalled > VERDICT_STALL_SEC and now - st["alerted"] > REALERT_SEC:
+                if not dolt_responsive():
+                    continue  # Dolt slow/unreachable — not the reviewer's fault; skip
+                emit("[IDLE-REVIEWER] gate-run %s: %d verdict(s) pending with no progress "
+                     "for %dmin — reviewer(s) idle/stuck; dispatcher re-queues, else gate "
+                     "will FAIL at verdict timeout" % (run, len(pend_ids), int(stalled / 60)))
+                verdict_progress[run]["alerted"] = now
+        # Prune runs whose verdicts are all in (run complete / superseded)
+        for run in set(verdict_progress.keys()) - set(runs_now.keys()):
+            verdict_progress.pop(run, None)
+
+        # --- GATE-NOMERGE: queue not advancing while work is queued (ga-hl0gq) ---
+        # The 2026-06-10 49min stall was invisible to every check above: the marker kept
+        # re-queuing (dispatcher_autorebase_retry, a dead-author stale-branch rebase loop)
+        # so its guard_queued event-ts kept refreshing and REAL-JAM's age never crossed
+        # STUCK_SEC; no run reached verdicts (IDLE-REVIEWER blind); the dispatcher kept
+        # logging (ENGINE-STALL blind); no review FAILed (GATE FAIL blind). This check is
+        # mechanism-agnostic: if NO queue-ADVANCING event (complete/superseded/needs-rebase)
+        # has landed for NOMERGE_STALL_SEC while >=1 marker is queued AND nothing is being
+        # actively reviewed, the gate is stuck regardless of the underlying cause. The
+        # "no review in flight" + "queued work exists" guards keep a healthy long-running
+        # review (15-45min) from false-firing. Dolt-guarded (a slow server != a stuck gate).
+        now = time.time()
+        last_prog_age = None
+        for l in lines:
+            try:
+                r = json.loads(l)
+            except Exception:
+                continue
+            if r.get("event") in PROGRESS_EVENTS:
+                a = age(r.get("ts", ""))
+                if a and (last_prog_age is None or a < last_prog_age):
+                    last_prog_age = a
+        if (last_prog_age is not None and last_prog_age > NOMERGE_STALL_SEC
+                and not runs_now and now - nomerge_alerted > REALERT_SEC):
+            qids = queued_marker_ids()
+            if qids and dolt_responsive():
+                emit("[GATE-NOMERGE] gate queue has not advanced in %dmin while %d marker(s) "
+                     "queued and no review in flight — dispatcher stuck (e.g. head-of-line "
+                     "stale branch); queue not draining" % (int(last_prog_age / 60), len(qids)))
+                nomerge_alerted = now
+
+        # --- ASYNC-START-REGRESS: verify the stale_async_start race fix is in the binary ---
+        # The engine fix (gc-patched-asyncstart, 4f57fbac4) adds a config-drift-drain
+        # exemption for gate-reviewers in state=creating, logged as:
+        #   "Skipping config-drift drain for ...: gate-reviewer in async-start (fresh creating)"
+        # If the gc binary is rebuilt from an unpatched commit or reverted, this string
+        # disappears and reviewer-spawn flakiness will resurge silently. This check catches
+        # the regression the moment the binary changes, before reviews start failing.
+        # Highest-value signal: directly catches the fix disappearing from the binary.
+        # Fail-open: if the binary cannot be read (None), the check is skipped.
+        # Env: GATE_REVIEWER_RACE_CHECK=0 disables; no env override for binary path
+        # (the live binary is always resolved via `which gc` + `readlink -f`).
+        if _RACE_CHECK:
+            _gc_path = _gc_binary_path()
+            _fix_present = _binary_has_async_start_fix(_gc_path)
+            if _fix_present is False:  # explicitly absent (not None = unreadable)
+                now = time.time()
+                if now - binary_regress_alerted > REALERT_SEC:
+                    emit("[ASYNC-START-REGRESS] gate-reviewer async-start fix MISSING from "
+                         "live gc binary (%s) — regression: binary rebuilt/reverted without "
+                         "the stale_async_start race fix; reviewer-spawn flakiness will "
+                         "resurge" % (_gc_path or "unknown path"))
+                    binary_regress_alerted = now
+
+        # --- ASYNC-START-RACE: alert on elevated stale_async_start race rate (1h window) ---
+        # After the engine fix, the race count should be ~0 per hour. A spike (> _RACE_MAX
+        # in the past RACE_WINDOW_SEC) means the fix may be ineffective, partially reverted,
+        # or a new code path reintroduced the condition. Complements the binary check above:
+        # the binary check catches a full regression; this catches a partial/novel one where
+        # the fix string is still present but not exercised on the active code path.
+        # The dispatcher logs the race as:
+        #   "... drained during startup (stale_async_start race) — re-convene will re-spawn"
+        # Tune threshold via GATE_REVIEWER_RACE_MAX env var (default 8/hour).
+        # Fail-open: log absent or unreadable returns 0 (no alert).
+        if _RACE_CHECK:
+            _race_count = _count_async_start_races()
+            if _race_count > _RACE_MAX:
+                now = time.time()
+                if now - race_spike_alerted > REALERT_SEC:
+                    emit("[ASYNC-START-RACE] stale_async_start race spiked: %d occurrence(s) "
+                         "in the last %dmin (threshold: %d/h) — reviewer-spawn reliability "
+                         "degraded; check if binary regression is partial or a new code path "
+                         "triggers the race (GATE_REVIEWER_RACE_MAX to tune)"
+                         % (_race_count, RACE_WINDOW_SEC // 60, _RACE_MAX))
+                    race_spike_alerted = now
+
+        # --- delivery: failures / halts only ---
+        try:
+            slines = open(SD).read().splitlines()
+        except FileNotFoundError:
+            slines = []
+        for l in slines[sd_seen:]:
+            try:
+                r = json.loads(l)
+            except Exception:
+                continue
+            res = str(r.get("result", "")).upper()
+            if "FAIL" in res or "HALT" in res:
+                emit("[DELIVERY-FAIL] %s %s" % (
+                    r.get("story") or r.get("bead", ""), res))
+        sd_seen = len(slines)
+
+        time.sleep(120)  # ga-8smq3: was 60; alert thresholds are all >=600s (10-40min), so 120s loses no real detection latency while halving Dolt poll load
