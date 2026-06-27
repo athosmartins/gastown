@@ -30,6 +30,10 @@ LOG="${DPW_LOG:-/Users/athos/gt/.gascity-gastown-hq/.gc/logs/daemon-presence-wat
 STATE="${DPW_STATE:-/Users/athos/gt/.gascity-gastown-hq/.gc/daemon-presence-state}"
 UID_NUM="$(id -u)"
 DPW_RELOAD="${DPW_RELOAD:-1}"     # 1 = auto-reload absent critical daemons; 0 = alert only.
+# 1 = suppress a heartbeat-WEDGE flag when the machine only just booted/woke (the
+# staleness is then attributable to launchd suspending StartInterval timers during
+# system sleep, NOT to a hung daemon); 0 = legacy behaviour (flag regardless).
+DPW_WAKE_GRACE="${DPW_WAKE_GRACE:-1}"
 
 DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector com.gascity.lifecycle-coherence-janitor com.gascity.crew-autopin-guard com.gascity.lifecycle-correctness-auditor com.gascity.throughput-stall-watchdog com.gascity.gate-throughput-stall-watchdog com.gascity.git-lock-hygiene com.gascity.crew-liveness-probe com.gascity.agent-stuck-escalation com.gascity.quorum-convergence-watchdog}"
 
@@ -113,6 +117,29 @@ _last_exit() { launchctl list 2>/dev/null | awk -v l="$1" '$3==l {print $2}'; }
 _prev_exit() { awk -v l="$1" '$1==l {print $2}' "$STATE" 2>/dev/null; }
 # Seconds since <file> was last modified ("$2"=now epoch); empty if missing / stat fails.
 _log_age()   { local f="$1" now="$2" m; [ -f "$f" ] || return 0; m=$(stat -f %m "$f" 2>/dev/null) && echo $(( now - m )); }
+
+# Seconds the machine has actually been awake-and-up since it last became available,
+# i.e. now − max(boot_epoch, wake_epoch). Used to suppress heartbeat-WEDGE false
+# positives after a system sleep: while asleep, launchd suspends every StartInterval
+# timer, so ALL daemon heartbeats go stale through no fault of the daemon.
+#   • kern.boottime — on Apple Silicon this SHIFTS FORWARD across sleep (boottime is
+#     derived as now − monotonic_uptime, and uptime freezes while asleep), so a recent
+#     boottime captures BOTH a real reboot AND a wake-from-sleep.
+#   • kern.waketime — populated on Intel-style sleep where boottime stays put; reads
+#     "{ sec = 0 }" when unpopulated (Apple Silicon), which we ignore.
+# Taking the MAX epoch (=min age) is the conservative "most recently available" moment.
+# Echoes the age in seconds, or nothing if neither sysctl parses (caller fails safe).
+_secs_since_avail() {
+  local now="$1" bt wt latest=0
+  # NB: the regex anchors a LEADING SPACE before "sec" (".* sec = ") so it captures
+  # the `sec` field and NOT the `usec` field — ", usec = 355743" contains the literal
+  # "sec = 355743", which an unanchored ".*sec = " would greedily match instead.
+  bt="$(sysctl -n kern.boottime  2>/dev/null | sed -nE 's/.* sec = ([0-9]+).*/\1/p')"
+  wt="$(sysctl -n kern.waketime  2>/dev/null | sed -nE 's/.* sec = ([0-9]+).*/\1/p')"
+  [ -n "$bt" ] && [ "$bt" -gt "$latest" ] 2>/dev/null && latest="$bt"
+  [ -n "$wt" ] && [ "$wt" -gt "$latest" ] 2>/dev/null && latest="$wt"
+  [ "$latest" -gt 0 ] 2>/dev/null && echo $(( now - latest ))
+}
 
 # ── imp05: count consecutive nonzero exits for a label ───────────────────────
 # State files for consecutive-exit tracking live in STATE.fail-counts/; format "COUNT".
@@ -286,6 +313,9 @@ run_recycle_sweep() {
 run_sweep() {
   local absent="" reloaded="" crashloop="" failing="" wedged="" path_missing="" healthy=0 newstate="" lbl plist ex prev _hb _hblog _hbmax _age fc prog heal_n
   local NOW; NOW="$(date +%s)"
+  # How long the machine has been awake-and-up (for WEDGE sleep/boot suppression).
+  # DPW_TEST_AVAIL_AGE lets the selftest inject a value without calling sysctl.
+  local _AVAIL_AGE; _AVAIL_AGE="${DPW_TEST_AVAIL_AGE:-$(_secs_since_avail "$NOW")}"
   for lbl in $DPW_CRITICAL; do
     plist="$LAUNCH_DIR/$lbl.plist"
 
@@ -354,11 +384,22 @@ run_sweep() {
         _hblog="${_hb%%$'\t'*}"; _hbmax="${_hb##*$'\t'}"
         _age="$(_log_age "$_hblog" "$NOW")"
         if [ -n "$_age" ] && [ "$_age" -gt "$_hbmax" ] 2>/dev/null; then
-          wedged="$wedged $lbl(stale=${_age}s)"
-          if [ "$DPW_RELOAD" = "1" ] && launchctl kickstart -k "gui/$UID_NUM/$lbl" 2>/dev/null; then
-            log "KICKSTARTED wedged daemon: $lbl (heartbeat stale ${_age}s > ${_hbmax}s)"
+          # Sleep/boot-aware suppression: during system sleep launchd suspends every
+          # StartInterval timer, so this heartbeat is stale through no fault of the
+          # daemon. If the machine has been awake-and-up for LESS than this daemon's
+          # own stale threshold, the staleness cannot yet prove a hang (the daemon
+          # could not have run before the machine woke). Grant a grace pass — it will
+          # self-heal on its next coalesced launch. A daemon that is GENUINELY wedged
+          # post-wake is re-flagged a cycle later, once avail-age exceeds the threshold.
+          if [ "${DPW_WAKE_GRACE:-1}" = "1" ] && [ -n "$_AVAIL_AGE" ] && [ "$_AVAIL_AGE" -lt "$_hbmax" ] 2>/dev/null; then
+            log "WEDGE-SUPPRESSED (recent wake/boot): $lbl heartbeat stale ${_age}s but system only up ${_AVAIL_AGE}s (< ${_hbmax}s) — expected post-sleep, self-heals on next launch"
           else
-            log "WEDGED daemon NOT kickstarted: $lbl (stale ${_age}s, DPW_RELOAD=$DPW_RELOAD or kickstart failed)"
+            wedged="$wedged $lbl(stale=${_age}s)"
+            if [ "$DPW_RELOAD" = "1" ] && launchctl kickstart -k "gui/$UID_NUM/$lbl" 2>/dev/null; then
+              log "KICKSTARTED wedged daemon: $lbl (heartbeat stale ${_age}s > ${_hbmax}s)"
+            else
+              log "WEDGED daemon NOT kickstarted: $lbl (stale ${_age}s, DPW_RELOAD=$DPW_RELOAD or kickstart failed)"
+            fi
           fi
         fi
       fi
@@ -533,7 +574,41 @@ PLIST
   : > "$DPW_TEST_KICKSTARTS"; touch "$HB"   # mtime = now
   run_sweep && ok "fresh heartbeat → no wedge (return 0)" || bad "fresh heartbeat falsely wedged"
   [ ! -s "$DPW_TEST_KICKSTARTS" ] && ok "no kickstart when heartbeat fresh" || bad "kickstarted despite fresh heartbeat"
+
+  echo "Scenario 7b: STALE heartbeat but machine recently woke/booted → WEDGE SUPPRESSED"
+  : > "$STATE"; rm -rf "${STATE}.fail-counts"; : > "$DPW_TEST_KICKSTARTS"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT=""
+  DPW_HEARTBEAT="com.gascity.beta|$HB|300"
+  touch -t "$(date -v-1H +%Y%m%d%H%M 2>/dev/null || echo 202601010000)" "$HB"   # stale ~1h
+  DPW_TEST_AVAIL_AGE=120
+  run_sweep && ok "recent wake (up 120s < 300s) suppresses WEDGE (return 0)" || bad "WEDGE not suppressed despite recent wake"
+  [ ! -s "$DPW_TEST_KICKSTARTS" ] && ok "no kickstart when staleness explained by recent wake" || bad "kickstarted despite recent wake (false positive)"
+
+  echo "Scenario 7c: STALE heartbeat AND machine up past threshold → genuine WEDGE still fires"
+  : > "$STATE"; rm -rf "${STATE}.fail-counts"; : > "$DPW_TEST_KICKSTARTS"
+  DPW_TEST_AVAIL_AGE=999
+  run_sweep && bad "genuine wedge (up 999s > 300s) should still alert" || ok "genuine wedge survives when machine up past threshold"
+  grep -q "com.gascity.beta" "$DPW_TEST_KICKSTARTS" && ok "genuine wedge still kickstarted" || bad "genuine wedge NOT kickstarted"
+
+  echo "Scenario 7d: DPW_WAKE_GRACE=0 → legacy behaviour, wedge fires even right after wake"
+  : > "$STATE"; rm -rf "${STATE}.fail-counts"; : > "$DPW_TEST_KICKSTARTS"
+  DPW_TEST_AVAIL_AGE=10; DPW_WAKE_GRACE=0
+  run_sweep && bad "WAKE_GRACE=0 should not suppress" || ok "DPW_WAKE_GRACE=0 reverts to legacy (wedge fires)"
+  DPW_WAKE_GRACE=1; unset DPW_TEST_AVAIL_AGE
   DPW_HEARTBEAT=""
+
+  echo "Scenario 7e: _secs_since_avail parses kern.boottime 'sec' (NOT the usec collision)"
+  cat > "$TMP/sysctl" <<'SYS'
+#!/usr/bin/env bash
+# Mimic macOS sysctl output, including the ", usec = N" trap a greedy regex mis-captures.
+case "$2" in
+  kern.boottime) echo "{ sec = 1000000000, usec = 999999 } Fake Boot Date" ;;
+  kern.waketime) echo "{ sec = 0, usec = 0 } Thu Jan  1 00:00:00 1970" ;;
+esac
+SYS
+  chmod +x "$TMP/sysctl"
+  _av="$(_secs_since_avail 1000000500)"   # now = boot_epoch + 500s
+  [ "$_av" = "500" ] && ok "_secs_since_avail returns 500s (parsed sec, ignored usec + waketime=0)" || bad "_secs_since_avail mis-parsed boottime (got '$_av'; expected 500 — usec-collision regex regression?)"
+  rm -f "$TMP/sysctl"
 
   # ── RECYCLER selftests (scenarios 8–12) ──────────────────────────────────
   # All recycler scenarios use seams: a stub `ps` that returns a controlled RSS,
