@@ -41,9 +41,12 @@ DESIGN:
   • BACKLOG SIGNAL — bd list across HQ + WA + PS rig stores for open story:approved and
     ctx:ready beads that are NOT braked (gate:needs-human | exec:manual | blocked | in-flight).
     This is the key gate against false alarms on a legitimately idle pipeline.
-  • STALL = backlog_count >= TSW_BACKLOG_MIN AND merge_count == 0 (NOTHING completed in
-    the window). dispatch_count is NO LONGER part of the flow check — a dispatch that
-    builds nothing must not mask a stall (ga-dbibq). It is still reported as context.
+  • STALL = ANY rig has backlog[rig] >= TSW_BACKLOG_MIN AND merge[rig] == 0 AND not
+    suspended (TSW_PER_RIG=1, default). Cross-rig git merges no longer mask a dead rig/pool
+    (ga-dbibq: 2026-06-27 WA worker pool dead 5h while HQ merging). Gate-PASSED events
+    (no rig tag) remain a global flow signal: if any Gate PASSED in the window, no per-rig
+    stall fires. TSW_PER_RIG=0 reverts to the old global sum behaviour. dispatch_count is
+    NO LONGER part of the flow check — a dispatch that builds nothing must not mask a stall.
   • ANTI-FLAP: TSW_CONFIRM_SWEEPS consecutive detections before escalating; a non-stall
     sweep resets the counter; re-escalation suppressed while cooldown active.
   • FAIL-SAFE: any error in any signal → treat that signal as "flow present" (fail-open,
@@ -100,6 +103,9 @@ CONFIRM_SWEEPS = int(os.environ.get("TSW_CONFIRM_SWEEPS", "2"))
 ESCALATE_COOLDOWN_SEC = int(os.environ.get("TSW_COOLDOWN_SEC", "21600"))  # 6h cooldown
 POLL_SEC = int(os.environ.get("TSW_POLL_SEC", "1800"))                    # 30min cadence
 BD_TIMEOUT = int(os.environ.get("TSW_BD_TIMEOUT", "25"))
+# ga-dbibq per-rig: when 1 (default) a stall fires if ANY rig has backlog>=MIN AND merge==0
+# (cross-rig git merges no longer mask a dead rig/pool). TSW_PER_RIG=0 → old global sum.
+PER_RIG = os.environ.get("TSW_PER_RIG", "1") == "1"
 GIT_TIMEOUT = int(os.environ.get("TSW_GIT_TIMEOUT", "30"))
 LOG_TAIL = int(os.environ.get("TSW_LOG_TAIL", "3000"))   # lines to tail from pilot log
 
@@ -220,6 +226,7 @@ def _write_flow_authority(now, dimension):
 _do_dolt_probe = None          # () -> int; 0=healthy 1=unhealthy 2=unknown; None = run probe
 _do_heal_throughput = None     # () -> bool; True=heal attempted; None = call funnel-flow-healer.sh
 _do_check_quota = None         # () -> bool; True=quota available; None = call quota-check.sh (imp12)
+_suspended_rigs = None         # () -> set[str]; None = query via gc rig list (ga-dbibq per-rig)
 
 
 # ── guarded subprocess ────────────────────────────────────────────────────────
@@ -233,6 +240,37 @@ def _sh(args, timeout=20, stdin=None):
 
 def _log(msg):
     print("[tsw] %s" % msg, flush=True)
+
+
+def _rig_name(root):
+    """Map a rig root path to a canonical rig name for per-rig keying."""
+    root = root.rstrip("/")
+    if "whatsapp" in root:
+        return "whatsapp_automation"
+    if "property_scrapers" in root:
+        return "property_scrapers"
+    return "gascity"
+
+
+def _query_suspended_rigs_via_gc():
+    """Query gc rig list for suspended rigs. Fail-open: return empty set on any error."""
+    try:
+        r = _sh([GC_BIN, "rig", "list", "--json"], timeout=10)
+        if r is None or r.returncode != 0:
+            return set()
+        data = json.loads(r.stdout or "[]")
+        if not isinstance(data, list):
+            return set()
+        return {d["name"] for d in data if isinstance(d, dict) and d.get("status") == "suspended"}
+    except Exception:
+        return set()
+
+
+def suspended_rigs():
+    """Return the set of currently suspended rig names. Fail-open: returns empty set on error."""
+    if _suspended_rigs is not None:
+        return _suspended_rigs()
+    return _query_suspended_rigs_via_gc()
 
 
 def _ts_epoch(line):
@@ -472,15 +510,18 @@ def dispatch_signal(now, window_sec):
 
 # ── SIGNAL 2: merge signal ────────────────────────────────────────────────────
 def merge_signal(now, window_sec):
-    """Returns (count, last_merge_epoch) of gate-PASSED events and/or git commits in window.
+    """Returns (result, last_merge_epoch) of gate-PASSED events and/or git commits in window.
     On any error returns (None, None) — fail-open.
 
-    The gate-log read is the authoritative signal. If both the gate log is truly
-    unavailable (not stubbed, not a fresh file) AND all git queries fail, we return
-    (None, None) to be fail-open. An empty-but-readable log (stub returns [] or file is
-    just empty) combined with working git stubs returns (0, None) — a real zero, not a
-    read failure."""
-    count = 0
+    When TSW_PER_RIG=1 (default): result is a dict mapping rig name → git-commit count plus
+    a special "_gate_passed" key for unattributed gate-PASSED events (no clean rig tag in log
+    line). Gate-PASSED is a global flow signal — it suppresses per-rig stall detection when
+    present. Per-rig STALL uses only the per-root git counts.
+
+    When TSW_PER_RIG=0: result is an int (sum of all counts) — original behaviour.
+
+    Fail-open: if gate log is missing AND all git queries fail → (None, None)."""
+    gate_passed = 0   # gate-PASSED events in window (unattributed — no clean rig tag)
     last_epoch = None
     gate_log_read = False   # True once we have a gate log list (even if empty)
 
@@ -502,15 +543,17 @@ def merge_signal(now, window_sec):
                 if last_epoch is None or epoch > last_epoch:
                     last_epoch = epoch
                 if now - epoch <= window_sec:
-                    count += 1
+                    gate_passed += 1
 
-    # 2b. Git commits to rig origin/main in the window.
+    # 2b. Git commits to rig origin/main in the window — tracked per rig.
     since_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - window_sec))
     git_any_success = False
+    per_rig_git = {}   # rig_name -> int commit count in window
     for root in RIG_ROOTS:
         root = root.strip()
         if not root:
             continue
+        rig = _rig_name(root)
         if _git_log_count is not None:
             # Test seam: stub provided. None return means "simulated git failure".
             n = _git_log_count(root, since_iso)
@@ -527,8 +570,7 @@ def merge_signal(now, window_sec):
             n = len([l for l in (r.stdout or "").splitlines() if l.strip()])
         if n is None:
             continue
-        count += n
-        # We don't have exact epoch from git count, but presence of commits means recent flow.
+        per_rig_git[rig] = per_rig_git.get(rig, 0) + n
 
     # Fail-open ONLY when we genuinely could not read either signal source.
     # If the gate log was readable (even empty) or git succeeded for at least one rig,
@@ -538,6 +580,16 @@ def merge_signal(now, window_sec):
              "ERROR (fail-open; counted for blind-floor)")
         return _SIGNAL_ERROR
 
+    if PER_RIG:
+        # Per-rig dict: each rig mapped to its git commit count.
+        # Gate-PASSED (no rig tag) stored under "_gate_passed" — caller uses it as
+        # a global "flow present" signal that does NOT defeat per-rig stall detection
+        # but DOES suppress per-rig stalls globally (same as current: any gate-PASS = flow).
+        per_rig_git["_gate_passed"] = gate_passed
+        return per_rig_git, last_epoch
+
+    # PER_RIG=0: original global sum
+    count = gate_passed + sum(per_rig_git.values())
     return count, last_epoch
 
 
@@ -555,10 +607,13 @@ def backlog_signal():
     all_beads = []
     at_least_one_success = False
 
+    per_rig_raw = {}   # rig_name -> unbraked bead count (per-root, pre cross-rig dedup)
+
     for root in RIG_ROOTS:
         root = root.strip()
         if not root:
             continue
+        rig = _rig_name(root)
 
         if _bd_backlog is not None:
             # Test seam: stub provided. A stub returning [] is a valid "empty rig",
@@ -592,6 +647,7 @@ def backlog_signal():
         if beads:
             at_least_one_success = True
 
+        rig_unbraked = 0
         for b in beads:
             if not isinstance(b, dict):
                 continue
@@ -606,6 +662,8 @@ def backlog_signal():
             if _bead_is_braked(labels):
                 continue
             all_beads.append(b)
+            rig_unbraked += 1
+        per_rig_raw[rig] = per_rig_raw.get(rig, 0) + rig_unbraked
 
     if not at_least_one_success:
         _log("backlog_signal: all bd queries failed — ERROR (fail-open; counted for blind-floor)")
@@ -621,6 +679,12 @@ def backlog_signal():
     unique = list(seen.values())
     sample = [{"id": b.get("id", "?"), "title": (b.get("title") or b.get("name") or "?")[:80]}
               for b in unique[:5]]
+
+    if PER_RIG:
+        # per_rig_raw already has per-root unbraked counts. Each rig has its own bd store
+        # so cross-rig dedup is not needed per rig. Return raw per-rig counts.
+        return per_rig_raw, sample
+
     return len(unique), sample
 
 
@@ -898,13 +962,15 @@ def _save_state(state):
 
 # ── escalation ────────────────────────────────────────────────────────────────
 def _format_body(backlog_count, dispatch_count, last_dispatch_epoch,
-                 merge_count, last_merge_epoch, sample_beads, now, window_sec):
+                 merge_count, last_merge_epoch, sample_beads, now, window_sec,
+                 stalled_rigs=None):
     hrs = window_sec / 3600
     def _age(epoch):
         if epoch is None:
             return "desconhecido (nenhum registro no tail)"
         return "%.1fh atrás" % ((now - epoch) / 3600)
 
+    rig_line = ("  Rigs parados: %s" % ", ".join(stalled_rigs)) if stalled_rigs else ""
     lines = [
         "WATCHDOG DE THROUGHPUT: pipeline parado com backlog pronto — STALL CONFIRMADO",
         "",
@@ -913,7 +979,10 @@ def _format_body(backlog_count, dispatch_count, last_dispatch_epoch,
         "Dispatches no período: %d  (último: %s)" % (dispatch_count or 0, _age(last_dispatch_epoch)),
         "Merges/Gate-PASSED no período: %d  (último: %s)" % (merge_count or 0, _age(last_merge_epoch)),
         "",
-        "CONDIÇÃO DE STALL: backlog >= %d E 0 dispatches E 0 merges em %.0fh." % (BACKLOG_MIN, hrs),
+        "CONDIÇÃO DE STALL: backlog[rig] >= %d E merge[rig] == 0 E não suspenso em %.0fh." % (BACKLOG_MIN, hrs)
+            if stalled_rigs else
+            "CONDIÇÃO DE STALL: backlog >= %d E 0 dispatches E 0 merges em %.0fh." % (BACKLOG_MIN, hrs),
+    ] + ([rig_line] if rig_line else []) + [
         "O Pilot está varrendo mas não consegue ver ou despachar o backlog real.",
         "",
         "BEADS PRONTOS NÃO DESPACHADOS (amostra — até 5):",
@@ -944,11 +1013,13 @@ def _format_body(backlog_count, dispatch_count, last_dispatch_epoch,
 
 
 def _escalate(backlog_count, dispatch_count, last_dispatch_epoch,
-              merge_count, last_merge_epoch, sample_beads, now, window_sec):
+              merge_count, last_merge_epoch, sample_beads, now, window_sec,
+              stalled_rigs=None):
     subject = "Watchdog: THROUGHPUT STALL — %d bead(s) prontos, 0 dispatches + 0 merges em %.0fh" % (
         backlog_count, window_sec / 3600)
     body = _format_body(backlog_count, dispatch_count, last_dispatch_epoch,
-                        merge_count, last_merge_epoch, sample_beads, now, window_sec)
+                        merge_count, last_merge_epoch, sample_beads, now, window_sec,
+                        stalled_rigs=stalled_rigs)
     notify_msg = ("THROUGHPUT STALL: %d bead(s) prontos, 0 dispatches + 0 merges em %.0fh"
                   " — Mayor notificado p/ investigar." % (backlog_count, window_sec / 3600))
 
@@ -979,7 +1050,8 @@ def _escalate(backlog_count, dispatch_count, last_dispatch_epoch,
         _log("WARN: gc mail send mayor FAILED — notify still sent (imp07 invariant)")
 
     # imp14: write flow-authority marker so PSW/PTH/FFF can defer their own Mayor mail.
-    _write_flow_authority(now, "throughput")
+    dimension = ("throughput:" + stalled_rigs[0]) if stalled_rigs else "throughput"
+    _write_flow_authority(now, dimension)
 
     return ok_mail
 
@@ -1040,6 +1112,106 @@ def run_tick(now, state):
         _maybe_recover(state, "merge-signal unavailable")
         return False
 
+    # ── per-rig path (TSW_PER_RIG=1, default) ────────────────────────────────────
+    # merge_signal returns a dict when PER_RIG=1. Gate-PASSED (global, no rig tag) is
+    # a global flow signal: when present it suppresses all per-rig stalls. Only when
+    # gate-PASSED==0 do we check each rig's git count individually — this removes the
+    # cross-rig masking where HQ git commits were hiding a dead WA worker pool.
+    if PER_RIG and isinstance(merge_count, dict):
+        gate_passed = merge_count.get("_gate_passed", 0)
+        merge_per_rig = {k: v for k, v in merge_count.items() if k != "_gate_passed"}
+        total_git = sum(merge_per_rig.values())
+
+        if gate_passed > 0:
+            # Global gate activity → flow present, no stall possible this tick
+            if state["pending"] > 0 or state["escalations"] > 0:
+                _log("tick: per-rig: gate-PASSED=%d → global flow, stall cleared" % gate_passed)
+                _maybe_recover(state, "flow resumed (gate-PASSED global)")
+            else:
+                _log("tick: per-rig: gate-PASSED=%d (dispatched=%d) in %.0fh — healthy" % (
+                     gate_passed, dispatch_count, STALL_HOURS))
+            return False
+
+        # No gate-PASSED events. Evaluate backlog per rig.
+        backlog_count, sample_beads = backlog_signal()
+        if backlog_count is None:
+            signals_errored.append("backlog")
+            _log("tick: backlog_signal ERROR → fail-open (treat as no backlog)")
+            is_blind, _ = _tick_blind_and_dolt(signals_errored, now, state)
+            if is_blind:
+                _log("tick: BLIND SWEEP (all 3 signals errored) — skipping stall verdict")
+                return False
+            _maybe_recover(state, "backlog-signal unavailable")
+            return False
+
+        # backlog_count is a dict[rig_name, int] when PER_RIG=1
+        backlog_per_rig = backlog_count if isinstance(backlog_count, dict) else {}
+        susp = suspended_rigs()
+
+        # STALL iff any rig has backlog >= MIN AND git-merges == 0 AND not suspended.
+        # A rig with 0 backlog is not a stall source even if merge==0.
+        stalled_rigs = sorted([
+            rig for rig in backlog_per_rig
+            if backlog_per_rig.get(rig, 0) >= BACKLOG_MIN
+            and merge_per_rig.get(rig, 0) == 0
+            and rig not in susp
+        ])
+
+        if not stalled_rigs:
+            total_backlog = sum(backlog_per_rig.values())
+            if total_backlog < BACKLOG_MIN:
+                if state["pending"] > 0 or state["escalations"] > 0:
+                    _log("tick: per-rig: backlog=0 → legitimately idle, resetting")
+                    _maybe_recover(state, "backlog empty (legitimate idle)")
+                else:
+                    _log("tick: per-rig: 0 gate-PASSED + 0 git-merges in %.0fh but "
+                         "backlog=%d < %d — legitimate idle" % (STALL_HOURS, total_backlog, BACKLOG_MIN))
+            else:
+                # Backlog present but all stalled rigs either have git merges or are suspended
+                if state["pending"] > 0 or state["escalations"] > 0:
+                    _log("tick: per-rig: all backlogged rigs have merges or are suspended → stall cleared "
+                         "(backlog=%d git=%d susp=%s)" % (total_backlog, total_git, sorted(susp)))
+                    _maybe_recover(state, "flow resumed (per-rig)")
+                else:
+                    _log("tick: per-rig: backlog=%d but all rigs merging or suspended — healthy "
+                         "(git=%d susp=%s)" % (total_backlog, total_git, sorted(susp)))
+            return False
+
+        # Per-rig stall: at least one rig has backlog >= MIN and 0 git-merges and not suspended
+        stall_backlog = sum(backlog_per_rig.get(r, 0) for r in stalled_rigs)
+        state["pending"] += 1
+        _log("tick: per-rig STALL DETECTED (%d/%d): stalled_rigs=%s backlog=%d "
+             "git=%d dispatched=%d in %.0fh" % (
+             state["pending"], CONFIRM_SWEEPS, stalled_rigs, stall_backlog,
+             total_git, dispatch_count, STALL_HOURS))
+
+        if state["pending"] < CONFIRM_SWEEPS:
+            _log("tick: awaiting confirmation (%d/%d sweeps)" % (state["pending"], CONFIRM_SWEEPS))
+            return False
+
+        if (state["last_escalate"] > 0 and
+                now - state["last_escalate"] <= ESCALATE_COOLDOWN_SEC):
+            _log("tick: per-rig STALL confirmed but within cooldown — suppressing")
+            return False
+
+        _log("ESCALATING: per-rig THROUGHPUT STALL (%d sweeps), stalled_rigs=%s backlog=%d" % (
+             state["pending"], stalled_rigs, stall_backlog))
+
+        if _attempt_heal(now, state):
+            return False
+
+        ok = _escalate(stall_backlog, dispatch_count, last_dispatch_epoch,
+                       total_git, last_merge_epoch, sample_beads, now, window_sec,
+                       stalled_rigs=stalled_rigs)
+        state["last_escalate"] = now
+        state["escalations"] += 1
+        state["consecutive_escalations"] = state.get("consecutive_escalations", 0) + 1
+        _log("escalation %s (total: %d, consecutive: %d)" % (
+             "OK" if ok else "FAILED (notify still sent)",
+             state["escalations"], state["consecutive_escalations"]))
+        return True
+
+    # ── global path (TSW_PER_RIG=0 or merge_count is int) ────────────────────────
     # Short-circuit: FLOW == actual COMPLETIONS (merges / gate-PASSED), NOT dispatches.
     # ga-dbibq lesson (2026-06-27): a dispatch that builds NOTHING still increments
     # dispatch_count, so keying "flow" on dispatch let a fully-stalled pipeline (workers
@@ -1163,6 +1335,7 @@ def _selftest():
     # Use `global` to inject into the correct namespace.
     global _read_pilot_log_lines, _read_gate_log_lines, _git_log_count
     global _bd_backlog, _bd_delivery, _do_mail_mayor, _do_notify, _do_dolt_probe
+    global _suspended_rigs
 
     ok_count = [0]
     fail_count = [0]
@@ -1231,6 +1404,9 @@ def _selftest():
     # imp12: quota check stubbed as available by default
     globals()["_do_check_quota"] = lambda: True
     globals()["QUOTA_AWARE"] = False
+    # ga-dbibq: stub suspended_rigs as empty set to avoid real gc subprocess calls.
+    # Per-rig scenarios PR1/PR2 override this as needed.
+    _suspended_rigs = lambda: set()
 
     print("\n[tsw selftest] running scenarios...\n")
 
@@ -1700,6 +1876,56 @@ def _selftest():
         _bad("R1", "heal_calls=%d mail_calls=%d attempt_count=%d" % (
              len(heal_calls_r1), len(mail_calls), st.get("heal_attempt_count", 0)))
 
+    # ── PR1/PR2: per-rig stall decision (ga-dbibq) ───────────────────────────────
+    # These scenarios require TSW_PER_RIG=1 (the default in production).
+    # RIG_ROOTS is overridden in PR1 so the HQ root (.gascity-gastown-hq) matches
+    # the stub condition ("gascity" in root OR root.endswith(".gascity-gastown-hq")).
+    _saved_rig_roots_pr = globals().get("RIG_ROOTS", [])
+    PR_RIG_ROOTS = [
+        "/Users/athos/gt/.gascity-gastown-hq",
+        "/Users/athos/gt/whatsapp_automation",
+        "/Users/athos/gt/property_scrapers",
+    ]
+    globals()["PER_RIG"] = True
+    _bd_delivery = lambda root: []   # no delivery stalls in per-rig scenarios
+    _do_dolt_probe = lambda: 0       # Dolt healthy
+
+    # ── PR1 (ga-dbibq resilience): per-rig — one rig stalled while another merges → STALL ──
+    print("\nScenario PR1: per-rig — WA backlog + 0 WA merges, HQ merging → STALL (no cross-rig mask)")
+    globals()["RIG_ROOTS"] = PR_RIG_ROOTS
+    _read_pilot_log_lines = lambda: _pilot_lines(0, 2)      # dispatch aggregate irrelevant
+    _read_gate_log_lines  = lambda: []                       # no gate-PASSED lines in the log tail
+    # git merges only on the HQ root; WA root has zero:
+    _git_log_count        = lambda root, since: (3 if ("gascity" in root or root.rstrip("/").endswith(".gascity-gastown-hq")) else 0)
+    _bd_backlog           = lambda root: (_backlog(5) if "whatsapp" in root else [])   # only WA has ready backlog
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st); run_tick(NOW + 1800, st)
+    globals()["RIG_ROOTS"] = _saved_rig_roots_pr
+    if st["escalations"] >= 1:
+        _ok("PR1: WA stall (backlog + 0 merges) escalates despite HQ merging (cross-rig mask removed)")
+    else:
+        _bad("PR1", "pending=%d esc=%d — HQ merges masked the WA-rig stall" % (st["pending"], st["escalations"]))
+
+    # ── PR2: per-rig — a rig with backlog but SUSPENDED must NOT false-alarm ──
+    print("\nScenario PR2: per-rig — suspended rig with backlog → no alarm")
+    _bd_backlog           = lambda root: (_backlog(5) if "whatsapp" in root else [])
+    _git_log_count        = lambda root, since: 0            # nobody merging
+    # mark WA suspended via the seam the impl must add (see Step 3): _suspended_rigs returns a set
+    globals()["_suspended_rigs"] = lambda: {"whatsapp_automation"}
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st); run_tick(NOW + 1800, st)
+    globals()["_suspended_rigs"] = None
+    if not st["escalations"] and not mail_calls:
+        _ok("PR2: suspended rig with backlog does not false-alarm")
+    else:
+        _bad("PR2", "esc=%d mails=%d — suspended rig false-alarmed" % (st["escalations"], len(mail_calls)))
+
+    # Restore PER_RIG to False for cleanup (default production value is True;
+    # restored here so global-path scenarios above were NOT affected by PER_RIG=True)
+    globals()["PER_RIG"] = False
+
     # ── cleanup ───────────────────────────────────────────────────────────────────
     _read_pilot_log_lines = None
     _read_gate_log_lines  = None
@@ -1710,6 +1936,7 @@ def _selftest():
     _do_mail_mayor        = None
     _do_dolt_probe        = None
     _do_heal_throughput   = None
+    _suspended_rigs       = None
     globals()["_do_check_quota"] = None
 
     print("\n[tsw selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
