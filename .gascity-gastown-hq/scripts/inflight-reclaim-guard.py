@@ -312,13 +312,16 @@ def _check_pool_dead(pool_zombies, now):
                  f"(no branch + dead session, stranded > TTL)")
             # Fail-open: mail failure is logged, never crashes the cycle.
             try:
-                subprocess.run(
+                result = subprocess.run(
                     ["gc", "mail", "mayor",
                      "-s", f"[POOL-DEAD] {pool} producing nothing",
                      "-m", (f"{n} beads dispatched to {pool} are in_progress with no branch "
                             f"and no live worker for >TTL: {ids_str}. The pool is not building. "
                             f"Existing healers notified via flow-authority.")],
                     timeout=20, capture_output=True)
+                if result.returncode != 0:
+                    print(f"[INFLIGHT-RECLAIM] [POOL-DEAD] mail non-zero exit (pool={pool} rc={result.returncode}): "
+                          f"{result.stderr.decode(errors='replace').strip()}", flush=True)
             except Exception as exc:
                 print(f"[INFLIGHT-RECLAIM] [POOL-DEAD] mail failed (pool={pool}): {exc}",
                       flush=True)
@@ -1219,6 +1222,42 @@ def _selftest():
             _check_pool_dead({"wa-worker": ["wa-b1", "wa-b2"]}, T + 10)
             check("POOL-DEAD-8: live-session bead excluded → stays below threshold",
                   len(_mail_log) == 0, f"mail_log={_mail_log}")
+
+            # --- Scenario POOL-DEAD-9: mail non-zero exit → failure log is emitted ---
+            import io as _io
+            _shutil.rmtree(STATE_FILE + ".pool-dead", ignore_errors=True)
+            _mail_log.clear()
+
+            def _stub_run_fail(cmd, **kw):
+                """Like _stub_run but gc mail returns rc=1 (simulate Dolt down / args rejected)."""
+                if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == "gc" and cmd[1] == "mail":
+                    _mail_log.append(list(cmd))
+                    class _RF:
+                        returncode = 1
+                        stderr = b"dolt: connection refused"
+                    return _RF()
+                class _R:
+                    returncode = 0
+                return _R()
+
+            subprocess.run = _stub_run_fail
+            _cap = _io.StringIO()
+            _orig_stdout = _sys.stdout
+            _sys.stdout = _cap
+            try:
+                _check_pool_dead({"wa-worker": ["wa-b1", "wa-b2", "wa-b3"]}, T)         # cycle 1
+                _check_pool_dead({"wa-worker": ["wa-b1", "wa-b2", "wa-b3"]}, T + 10)    # cycle 2 → fires
+            finally:
+                _sys.stdout = _orig_stdout
+                subprocess.run = _stub_run  # restore main test stub
+
+            _out = _cap.getvalue()
+            check("POOL-DEAD-9: mail non-zero exit → failure log emitted",
+                  "[POOL-DEAD] mail non-zero exit" in _out,
+                  f"captured={_out!r}")
+            check("POOL-DEAD-9: failure log names the pool",
+                  "wa-worker" in _out and "rc=1" in _out,
+                  f"captured={_out!r}")
 
         finally:
             subprocess.run = _orig_run
