@@ -56,7 +56,9 @@ Safety invariants (CRITICAL — actuates on real work beads):
     Checks session.id, .name, .session_name, .alias, .agent_name because bd typically
     assigns session_name (e.g. 'dog-gawispy8c0mr') not session.name ('gastown.dog-3').
   - NEVER reclaims beads with recent branch progress (commit within RECLAIM_TTL).
-    Checks fix/<bead-id>* and feature/<bead-id>* in both HQ and WA repos.
+    Checks any remote branch whose final segment matches <bead-id> (incl.
+    crew/<pool>/<bead-id>, feat/<id>*, fix/<id>*, feature/<id>*, polecat/<id>*)
+    in both HQ and WA repos. Fails safe on git error (→ branch-might-exist).
   - NEVER reclaims beads with a gate-status:dispatching|queued|claimed marker
     (bead is actively being processed by the gate pipeline).
   - ga-vw26y: the in_progress sweep is SCOPED to Pilot stories — a bead must
@@ -104,6 +106,11 @@ POOL_DEAD_COOLDOWN = int(os.environ.get("IRG_POOL_DEAD_COOLDOWN_SEC", "1800"))
 # a Pilot pool dispatch that never engaged — no Pilot markers (pilot:dispatched /
 # story:in-flight) are required to qualify for the in_progress sweep.
 EPHEMERAL_POOL_ASSIGNEES = frozenset({"wa-worker"})
+# gastown.dog deliberately excluded: dogs are min_active pools assigned a
+# concrete session name at dispatch time (not a bare template name), so the
+# bare-template zombie detection path does not apply to them.  If future
+# dog-pool dispatch changes to use bare template assignees, add "gastown.dog"
+# here and verify that dog branches follow crew/gastown.dog/<id> convention.
 
 # ga-hkpwv: minimum stranding window for bare-template pool zombies.
 # Longer than RECLAIM_TTL (25min): no Pilot marker is a weaker signal, and a
@@ -112,7 +119,13 @@ POOL_ZOMBIE_TTL = 7200  # 2 hours
 
 # ga-hkpwv: session states that definitively prove a non-working session.
 # Used in pool_has_live_worker() to distinguish dead vs unknown states.
-_POOL_DEAD_STATES = frozenset({"asleep", "drained", "closed"})
+# archived/quarantined/failed-create: exotic terminal states that also cannot
+# be doing any work; without them a lingering un-closed dead worker in one of
+# these states would permanently block reclaim for all beads in that pool.
+_POOL_DEAD_STATES = frozenset({
+    "asleep", "drained", "closed",
+    "archived", "quarantined", "failed-create",
+})
 
 STATE_FILE = ".gc/state/inflight-reclaim-guard.json"
 GC_CITY = "/Users/athos/gt/.gascity-gastown-hq"
@@ -759,11 +772,21 @@ def pool_has_live_worker(pool_template, sessions, now=None, bead_update_age=None
 
 
 def get_branch_recent(bead_id):
-    """Return True if any fix/<bead-id>* or feature/<bead-id>* branch on origin
-    has a commit within RECLAIM_TTL seconds of now.
+    """Return True if any remote branch whose final path segment equals <bead-id>
+    (or starts with <bead-id> followed by '-'/'_'/'.') has a commit within
+    RECLAIM_TTL seconds of now.
 
-    Fetches both HQ and WA repos (fail-safe: repo error → skip that repo).
-    Returns False if no matching branch, or all branches are stale / all fetches fail.
+    Matches ALL branch naming conventions regardless of prefix:
+      crew/<pool>/<bead-id>     (dominant: 416 branches, e.g. crew/wa-worker/wa-quoy)
+      feat/<bead-id>*           (30 branches)
+      fix/<bead-id>*
+      feature/<bead-id>*
+      polecat/<bead-id>*
+    Prefix-collision guard: segment must equal bead_id EXACTLY or be followed by
+    a separator char ('-', '_', '.') — so bead 'wa-oly' does NOT match 'wa-oly1'.
+
+    Fetches both HQ and WA repos. Fail-safe: ANY git error (fetch or list)
+    → return True (branch-might-exist, do NOT reclaim). Logs on error.
 
     CORRECTNESS-CRITICAL: this is the secondary guard against reclaiming beads
     where a builder is actively pushing but their session has a different name
@@ -771,37 +794,64 @@ def get_branch_recent(bead_id):
     """
     now = time.time()
     for repo in REPOS:
-        # Fetch to update remote-tracking refs (fail-safe: skip repo on failure)
+        # Fetch to update remote-tracking refs.
+        # Fail-safe: fetch error → branch might exist → do NOT reclaim.
         try:
             subprocess.run(
                 ["git", "-C", repo, "fetch", "origin", "--prune", "--quiet"],
                 capture_output=True, timeout=30)
-        except Exception:
-            continue  # skip this repo on fetch failure
+        except Exception as _fe:
+            print(
+                f"[INFLIGHT-RECLAIM] branch-rail: fetch failed for {repo}: {_fe}"
+                " — treating as branch-might-exist (fail-safe)",
+                flush=True)
+            return True
 
-        for prefix in ("fix", "feature"):
-            pat = f"refs/remotes/origin/{prefix}/{bead_id}*"
-            try:
-                r = subprocess.run(
-                    ["git", "-C", repo, "for-each-ref",
-                     "--sort=-committerdate",
-                     "--format=%(committerdate:unix)",
-                     pat],
-                    capture_output=True, text=True, timeout=10)
-                if r.returncode != 0 or not r.stdout.strip():
+        # List all remote refs with timestamps in a single pass.
+        # Fail-safe: ref-list error → branch might exist → do NOT reclaim.
+        try:
+            r = subprocess.run(
+                ["git", "-C", repo, "for-each-ref",
+                 "--sort=-committerdate",
+                 "--format=%(refname) %(committerdate:unix)",
+                 "refs/remotes/origin/"],
+                capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                print(
+                    f"[INFLIGHT-RECLAIM] branch-rail: for-each-ref failed"
+                    f" (rc={r.returncode}) for {repo}"
+                    " — treating as branch-might-exist (fail-safe)",
+                    flush=True)
+                return True
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if not line:
                     continue
-                for line in r.stdout.strip().splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        ts = float(line)
-                        if now - ts < RECLAIM_TTL:
-                            return True
-                    except ValueError:
-                        continue
-            except Exception:
-                continue
+                parts = line.rsplit(None, 1)
+                if len(parts) != 2:
+                    continue
+                refname, ts_str = parts
+                # Final path segment of the ref (e.g. 'wa-quoy' from
+                # refs/remotes/origin/crew/wa-worker/wa-quoy).
+                segment = refname.rsplit("/", 1)[-1]
+                # Match: exact OR bead_id + separator (prefix-collision guard).
+                if not (segment == bead_id
+                        or segment.startswith(bead_id + "-")
+                        or segment.startswith(bead_id + "_")
+                        or segment.startswith(bead_id + ".")):
+                    continue
+                try:
+                    ts = float(ts_str)
+                    if now - ts < RECLAIM_TTL:
+                        return True
+                except ValueError:
+                    continue
+        except Exception as _re:
+            print(
+                f"[INFLIGHT-RECLAIM] branch-rail: ref-list failed for {repo}: {_re}"
+                " — treating as branch-might-exist (fail-safe)",
+                flush=True)
+            return True
     return False
 
 
@@ -1053,7 +1103,7 @@ def run_cycle(state, escalated_alerted):
     stranded_count = 0
     active_bead_ids = set()
     # ga-dbibq: two-pass structure so pool-dead alert fires BEFORE per-bead actuation.
-    classified = []    # (bead_id, title, labels, action, idle_min, reclaim_count)
+    classified = []    # (bead_id, title, labels, action, idle_min, reclaim_count, assignee)
     pool_zombies = {}  # pool -> [bead_id] for beads classified zombie this cycle
 
     # --- Pass 1: classify all beads (no actuation yet) ---
@@ -1444,8 +1494,8 @@ def _selftest():
               [_asleep_sessions[1]], T_pz))
 
     # --- PZ-4: pool_has_live_worker — active session with recent last_active → True ---
-    _active_fresh_ts = _irg_datetime.datetime.utcfromtimestamp(
-        T_pz - 60).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _active_fresh_ts = _irg_datetime.datetime.fromtimestamp(
+        T_pz - 60, tz=_irg_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     _active_sessions = [
         {"template": "wa-worker", "session_name": "wa-worker-adhoc-ccc",
          "agent_name": "wa-worker-adhoc-ccc", "state": "active",
@@ -1532,6 +1582,112 @@ def _selftest():
                 "name": "x", "session_name": "x", "alias": "", "agent_name": "x",
                 "last_active": _active_fresh_ts}],
               T_pz))
+
+    # -----------------------------------------------------------------------
+    # Section 4: get_branch_recent — segment-based matching (BR-*)
+    # Verifies that crew/<pool>/<id> branches are correctly matched, that
+    # prefix-collisions are rejected, and that git errors fail safe.
+    # Uses monkeypatched subprocess.run — no real git calls.
+    # -----------------------------------------------------------------------
+    T_br = 1_782_500_000.0  # fixed epoch for determinism
+
+    _orig_run_br = subprocess.run
+    _orig_time_fn = time.time
+
+    def _make_git_stub(refs_lines, fetch_ok=True):
+        """Return a subprocess.run stub serving fake git ref output."""
+        def _stub(cmd, **kw):
+            class _R:
+                returncode = 0
+                stdout = ""
+                stderr = b""
+            if not isinstance(cmd, (list, tuple)):
+                return _R()
+            if "fetch" in cmd:
+                if not fetch_ok:
+                    raise OSError("simulated fetch failure")
+                return _R()
+            if "for-each-ref" in cmd:
+                r = _R()
+                r.stdout = ("\n".join(refs_lines) + "\n") if refs_lines else ""
+                return r
+            return _R()
+        return _stub
+
+    try:
+        time.time = lambda: T_br  # freeze "now" so age comparisons are deterministic
+
+        # BR-1: crew/wa-worker/<id> with recent commit → True (branch rail blocks reclaim).
+        # This is the previously-broken false-reclaim scenario (ga-hkpwv):
+        # before the fix, only fix/* / feature/* prefixes were checked, so this
+        # branch was invisible and the bead would have been reclaimed (RED → GREEN).
+        subprocess.run = _make_git_stub([
+            f"refs/remotes/origin/crew/wa-worker/wa-quoy {int(T_br - 60)}"
+        ])
+        check("BR-1: crew/wa-worker/<id> recent branch → True (branch rail blocks reclaim; was RED before fix)",
+              get_branch_recent("wa-quoy"))
+
+        # BR-2: prefix-collision — bead wa-oly, branch crew/wa-worker/wa-oly1 → False.
+        # wa-oly1 must NOT match wa-oly (no separator after the bead-id).
+        subprocess.run = _make_git_stub([
+            f"refs/remotes/origin/crew/wa-worker/wa-oly1 {int(T_br - 60)}"
+        ])
+        check("BR-2: prefix-collision wa-oly vs wa-oly1 → False (no false match, still reclaimable)",
+              not get_branch_recent("wa-oly"))
+
+        # BR-3: feat/<id> branch → True (new prefix, previously unchecked).
+        subprocess.run = _make_git_stub([
+            f"refs/remotes/origin/feat/wa-quoy {int(T_br - 60)}"
+        ])
+        check("BR-3: feat/<id> recent branch → True",
+              get_branch_recent("wa-quoy"))
+
+        # BR-4: fix/<id> branch → True (legacy pattern; preserved).
+        subprocess.run = _make_git_stub([
+            f"refs/remotes/origin/fix/wa-quoy {int(T_br - 60)}"
+        ])
+        check("BR-4: fix/<id> recent branch → True (legacy pattern preserved)",
+              get_branch_recent("wa-quoy"))
+
+        # BR-5: for-each-ref returns non-zero → True (fail-safe: do NOT reclaim).
+        def _fail_on_for_each_ref(cmd, **kw):
+            class _Err:
+                returncode = 1
+                stdout = ""
+                stderr = b"error"
+            class _OK:
+                returncode = 0
+                stdout = ""
+                stderr = b""
+            if isinstance(cmd, (list, tuple)) and "for-each-ref" in cmd:
+                return _Err()
+            return _OK()
+        subprocess.run = _fail_on_for_each_ref
+        check("BR-5: for-each-ref non-zero exit → True (fail-safe: do NOT reclaim)",
+              get_branch_recent("wa-quoy"))
+
+        # BR-6: fetch raises exception → True (fail-safe: do NOT reclaim).
+        subprocess.run = _make_git_stub([], fetch_ok=False)
+        check("BR-6: fetch exception → True (fail-safe: do NOT reclaim)",
+              get_branch_recent("wa-quoy"))
+
+        # BR-7: branch exists but commit is stale (> RECLAIM_TTL ago) → False.
+        subprocess.run = _make_git_stub([
+            f"refs/remotes/origin/crew/wa-worker/wa-quoy {int(T_br - RECLAIM_TTL - 100)}"
+        ])
+        check("BR-7: stale branch (>RECLAIM_TTL old) → False (reclaim allowed)",
+              not get_branch_recent("wa-quoy"))
+
+        # BR-8: no branch matching bead-id at all → False (reclaim allowed).
+        subprocess.run = _make_git_stub([
+            f"refs/remotes/origin/crew/wa-worker/other-bead {int(T_br - 60)}"
+        ])
+        check("BR-8: no matching branch → False (reclaim allowed)",
+              not get_branch_recent("wa-quoy"))
+
+    finally:
+        time.time = _orig_time_fn
+        subprocess.run = _orig_run_br
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0
