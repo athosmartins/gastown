@@ -29,9 +29,12 @@ ACTIONS="$WORK/actions.log"
 : > "$ACTIONS"
 
 # ── bd shim ───────────────────────────────────────────────────────────────────
-# bd list --status in_progress --json → reads $WORK/beads.json
+# bd [-C <store>] list --status in_progress --json → reads $WORK/beads.json
+# Accepts the new multi-store -C <store> prefix transparently.
 cat > "$SHIM/bd" <<'SHIM'
 #!/usr/bin/env bash
+# Consume -C <store> prefix so existing fixture logic works unchanged
+if [ "$1" = "-C" ]; then shift 2; fi
 if [ "$1 $2" = "list --status" ] && [ "$3" = "in_progress" ]; then
     cat "${BEADS_FIXTURE:-/dev/null}"
     exit 0
@@ -88,6 +91,7 @@ run_script() {
     ACTIONS_FILE="$ACTIONS" \
     STUCK_AGENT_SEC="${STUCK_AGENT_SEC:-1800}" \
     COOLDOWN_SEC="${COOLDOWN_SEC:-10800}" \
+    ESCALATION_STORES="$WORK/city" \
     bash "$SCRIPT" 2>&1
 }
 

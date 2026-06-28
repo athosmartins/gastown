@@ -35,6 +35,8 @@ STUCK_AGENT_SEC="${STUCK_AGENT_SEC:-1800}"   # 30min sem update → travado
 COOLDOWN_SEC="${COOLDOWN_SEC:-10800}"        # 3h antes de re-escalar o mesmo bead
 MAYOR_ADDR="${MAYOR_ADDR:-mayor}"
 DRY_RUN="${DRY_RUN:-0}"
+# Bead stores to scan (space-separated paths; HQ must be .gascity-gastown-hq, NOT the gt root)
+ESCALATION_STORES="${ESCALATION_STORES:-/Users/athos/gt/.gascity-gastown-hq /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers}"
 
 # ── Escalation router (Layer 1, ga-qw3p.1) ───────────────────────────────────
 # Source in library mode to get classify/route functions. Fail-open: if the
@@ -68,8 +70,35 @@ fi
 
 now="$(date +%s)"
 
-# ── Fetch in_progress beads ───────────────────────────────────────────────────
-BEADS_RAW="$(timeout 30 "$BD" list --status in_progress --json 2>/dev/null || true)"
+# ── Fetch in_progress beads (multi-store: HQ + WA + PS) ──────────────────────
+# Collect each store's results into a temp file (separator-delimited) then merge
+# in Python. Per-store failures are non-fatal (skipped). Dedup by bead id.
+_TMP_PARTS="$(mktemp)"
+for _store in $ESCALATION_STORES; do
+    [ -d "$_store" ] || continue
+    _part="$(timeout 30 "$BD" -C "$_store" list --status in_progress --json 2>/dev/null || true)"
+    [ -z "$_part" ] || [ "$_part" = "[]" ] && continue
+    printf '%s\n###STORESEP###\n' "$_part" >> "$_TMP_PARTS"
+done
+BEADS_RAW="$(python3 - "$_TMP_PARTS" <<'PY' || true
+import json, sys
+seen = {}
+parts = open(sys.argv[1]).read().split('###STORESEP###')
+for p in parts:
+    p = p.strip()
+    if not p:
+        continue
+    try:
+        for b in json.loads(p) or []:
+            bid = b.get('id', '')
+            if bid and bid not in seen:
+                seen[bid] = b
+    except Exception:
+        pass
+print(json.dumps(list(seen.values())))
+PY
+)"
+rm -f "$_TMP_PARTS"
 if [ -z "$BEADS_RAW" ] || [ "$BEADS_RAW" = "[]" ]; then
     log "no in_progress beads or bd unavailable — healthy, nothing to check"
     # GC state for any leftover state files (all beads closed)

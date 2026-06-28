@@ -82,6 +82,16 @@ VOTE_TIMEOUT_SEC = int(os.environ.get("QUORUM_VOTE_TIMEOUT_SEC", "900"))   # 15m
 POLL_SEC = int(os.environ.get("QUORUM_POLL_SEC", "300"))                   # 5min
 BD_TIMEOUT = int(os.environ.get("QUORUM_BD_TIMEOUT", "25"))
 GC_TIMEOUT = int(os.environ.get("QUORUM_GC_TIMEOUT", "20"))
+# Bead stores to scan for triggered beads (HQ must be .gascity-gastown-hq, NOT gt root).
+_DEFAULT_STORES = [
+    "/Users/athos/gt/.gascity-gastown-hq",
+    "/Users/athos/gt/whatsapp_automation",
+    "/Users/athos/gt/property_scrapers",
+]
+STORES: list[str] = os.environ.get(
+    "QUORUM_STORES",
+    " ".join(_DEFAULT_STORES),
+).split()
 
 STATE_FILE = os.path.join(CITY, ".gc/state/quorum-convergence-watchdog.json")
 KILL_SWITCH = os.path.join(CITY, ".gc/state/quorum-convergence-watchdog.disabled")
@@ -235,14 +245,24 @@ def _select_quorum_crews(title: str, desc: str, active: list[str]) -> list[str]:
 # ── bead discovery ────────────────────────────────────────────────────────────
 
 def _list_beads(extra_args: list[str]) -> list[dict]:
-    cmd = [BD, "list", "--json", "--limit", "0"] + extra_args
-    out = _run(cmd, timeout=BD_TIMEOUT)
-    if not out:
-        return []
-    try:
-        return json.loads(out) or []
-    except Exception:
-        return []
+    """Query all configured stores; dedup by bead id. Per-store failures are non-fatal."""
+    seen: dict[str, dict] = {}
+    for store in STORES:
+        if not os.path.isdir(store):
+            continue
+        cmd = [BD, "-C", store, "list", "--json", "--limit", "0"] + extra_args
+        out = _run(cmd, timeout=BD_TIMEOUT)
+        if not out:
+            continue
+        try:
+            beads = json.loads(out) or []
+        except Exception:
+            continue
+        for b in beads:
+            bid = b.get("id", "")
+            if bid and bid not in seen:
+                seen[bid] = b
+    return list(seen.values())
 
 
 def _show_bead(bead_id: str) -> dict | None:
