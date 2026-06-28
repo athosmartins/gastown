@@ -267,6 +267,15 @@ if [ -z "$MARKER_ID" ]; then
   exit 1
 fi
 
+# Stamp gate:queued on the SOURCE bead (ga-dt6bu / ga-oonk3 thrash fix). Without it, a
+# bead created with no lifecycle label sits RAW between marker creation and the gate
+# guard's first sweep (~2min), and the auto-refino raw-Triagem ingestion re-ingests it
+# as a fresh story (ga-oonk3 thrashed 3x). gate:queued gives it a gate:* label so the
+# auto-refino gate:* exclusion guard skips it. Stamp in the bead's OWN store (HQ or rig).
+_BEAD_STORE="$GC_CITY_PATH"
+[ "$BEAD_RIG" != "gascity" ] && [ "$BEAD_RIG" != "unknown" ] && [ -n "${_BEAD_RIG_PATH:-}" ] && _BEAD_STORE="$_BEAD_RIG_PATH"
+bd -C "$_BEAD_STORE" label add "$BEAD_ID" "gate:queued" -q 2>/dev/null || true
+
 echo "Marker created: $MARKER_ID"
 ```
 

@@ -336,6 +336,11 @@ auto_refino_is_ingestable_raw() {
   # label) — re-ingesting it loops forever. Disqualify it here too (the RAW jq
   # query already drops it; this is the classifier-side defense in depth).
   case "$csv" in *,auto-refino:escalated,*) echo "no"; return ;; esac
+  # already in the BUILD/GATE pipeline (ga-dt6bu / ga-oonk3 thrash): /gate-done +
+  # circuit-break can leave a gate:* label but NO story:* label, so the bead looks
+  # RAW and gets re-ingested every sweep. Any gate:* label disqualifies it (the RAW
+  # jq query also drops it; classifier-side defense in depth). csv is comma-wrapped.
+  case "$csv" in *,gate:*) echo "no"; return ;; esac
   # build/scraper/non-product beads are excluded just like labelled candidates.
   [ "$(auto_refino_is_product_story "$labels" "$ex")" = "yes" ] || { echo "no"; return; }
   echo "yes"
@@ -779,6 +784,14 @@ if [ "$AUTO_REFINO_INGEST_RAW_TRIAGEM" = "1" ]; then
     # story:*) would otherwise be re-captured by this RAW source and re-ingested
     # with story:unrefined every sweep → infinite re-ingestion loop (see ga-m9gt3).
     | map(select(((.labels // []) | any(. == "auto-refino:escalated")) | not))
+    # Drop beads already in the BUILD/GATE pipeline (ga-dt6bu / ga-oonk3 thrash fix).
+    # /gate-done + the gate circuit-break can leave a bead carrying a gate:* label but
+    # NO story:* label (gate:needs-human after circuit-break strips story:in-flight;
+    # gate:reviewing; gate:passed; gate:needs-rebase). The story:* filter above misses
+    # those, so they were re-ingested as raw Triagem every sweep → wasted refino cycles
+    # (ga-oonk3 re-ingested 3x). Any gate:* label means NOT a raw Triagem story.
+    # Mirrors the auto-refino:escalated guard directly above.
+    | map(select(((.labels // []) | any(type=="string" and startswith("gate:"))) | not))
   ' <(echo "$_RAW_FEATURE") <(echo "$_RAW_STORY") 2>/dev/null || echo "[]")
   _RAWCOUNT=$(echo "$RAW_JSON" | jq 'length' 2>/dev/null || echo 0)
   log "Raw-Triagem ingestion ON: $_RAWCOUNT no-lifecycle-label feature/story bead(s) eligible (pre-classification)."
