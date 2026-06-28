@@ -1111,10 +1111,30 @@ _filter_candidates() {
             else false end)
         )
         and (((.labels // []) - $preapproval) | length) == ((.labels // []) | length)
+        and ((.labels // []) | map(select(
+          startswith("gate:needs-human")
+          or . == "story:needs-human"
+          or . == "story:needs-device"
+          or . == "on-device"
+          or . == "story:blocked"
+        )) | length) == 0
         and ((.description // "") | test("\\S"))
      )]' \
     2>/dev/null || echo "[]"
 }
+# ── parking-label pre-filter (upstream of dispatch, additive to ga-zzrts) ─────
+# The bd list queries use exact --exclude-label matching. Labels like
+# gate:needs-human:mayor-fixing and gate:needs-human:on-device are SUB-VARIANTS
+# that do NOT match the exact "gate:needs-human" exclude — they leak through the
+# query and are only caught at dispatch time (ga-zzrts fix b, grep-based prefix
+# match), causing selected-and-released every sweep → dispatched=0 stalls.
+# The jq condition above moves this filter UPSTREAM into _filter_candidates so
+# sub-variants are excluded at SELECTION time (prefix startswith match), matching
+# the dispatch-time behavior. The ga-zzrts(b) check is PRESERVED as defense-in-
+# depth for genuine races; this is purely additive. All tiers and the emitted
+# pilot-dispatchable.json flow through _filter_candidates, so one change here
+# covers all paths (HQ bugs/debt/features, HQ ctx:ready, rig ctx:ready, rig
+# story:approved) and fixes the painel Aprovadas inflation simultaneously.
 # ── context veto (Athos): a bead with an EMPTY/whitespace-only description can
 # NEVER dispatch — a generic agent has no context to build it. EMPTY-ONLY by
 # design (test("\\S") = keep if any non-whitespace char): NOT a length/byte
