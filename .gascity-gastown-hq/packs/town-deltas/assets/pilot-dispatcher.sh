@@ -1674,9 +1674,23 @@ _ttl_recover_db() {
 # Count in-flight beads per lane by reading their lane:big / lane:small labels.
 # Beads without a lane label (manually dispatched) count as small (conservative).
 
-IN_FLIGHT_RAW_JSON=$(bd -C "$GC_CITY" list --json \
-  -l "story:in-flight" \
-  2>/dev/null || echo "[]")
+# ga-mfeip: fan-out to HQ + every non-HQ rig store so rig-native in-flight beads
+# (wa-*/ps-*/lx-* prefixes, living in rig-own Dolt stores) are visible to the
+# dead-worker detector and busy-builder tracker below. Attach _rig_db to each bead
+# so store-aware sling lookups can route to the right Dolt instance.
+_IN_FLIGHT_HQ=$(bd -C "$GC_CITY" list --json -l "story:in-flight" 2>/dev/null \
+  | jq --arg db "$GC_CITY" '[ .[] | . + {"_rig_db": $db} ]' 2>/dev/null || echo "[]")
+IN_FLIGHT_RAW_JSON="$_IN_FLIGHT_HQ"
+_in_flight_rig_paths=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
+  | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
+while IFS= read -r _in_flight_rig; do
+  [ -z "$_in_flight_rig" ] || [ ! -d "$_in_flight_rig" ] && continue
+  _rig_inflight=$(bd -C "$_in_flight_rig" list --json -l "story:in-flight" 2>/dev/null \
+    | jq --arg db "$_in_flight_rig" '[ .[] | . + {"_rig_db": $db} ]' 2>/dev/null || echo "[]")
+  IN_FLIGHT_RAW_JSON=$(printf '%s\n%s' "$IN_FLIGHT_RAW_JSON" "$_rig_inflight" \
+    | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "$IN_FLIGHT_RAW_JSON")
+done <<< "$_in_flight_rig_paths"
+unset _IN_FLIGHT_HQ _in_flight_rig_paths _in_flight_rig _rig_inflight
 
 IN_FLIGHT_RAW_TOTAL=$(echo "$IN_FLIGHT_RAW_JSON" | jq 'length' 2>/dev/null || echo "0")
 
@@ -1873,7 +1887,7 @@ _target_session_state() {
 # its slot can only admit OTHER pending work, never re-run the phantom. Falls
 # back to the input on any jq error, so the worst case is the pre-fix count.
 _inflight_drop_dead_workers() {
-  local _arr _n _i _bead _sling _asg _kept
+  local _arr _n _i _bead _sling _asg _kept _ddw_bid _ddw_bead_db _ddw_sling_db
   _arr=$(cat)
   { [ "${PILOT_DEADWORKER_CHECK:-1}" = "1" ] && [ "${_DEADWORKER_OK:-0}" = "1" ]; } \
     || { printf '%s' "$_arr"; return 0; }
@@ -1887,7 +1901,16 @@ _inflight_drop_dead_workers() {
     [ -n "$_bead" ] || continue
     _sling=$(echo "$_bead" | jq -r '.metadata["pilot.sling_bead"] // ""' 2>/dev/null || echo "")
     if [ -n "$_sling" ]; then
-      _asg=$(bd -C "$GC_CITY" show "$_sling" --json 2>/dev/null \
+      # ga-mfeip cross-DB fix: a self-referential sling (pilot.sling_bead == bead id) is the
+      # routed-pool pattern — the "sling" IS the rig-native bead, living in its own store
+      # (_rig_db field attached when IN_FLIGHT_RAW_JSON was built), NOT in HQ ($GC_CITY).
+      # Reading it from $GC_CITY returns a null assignee → dead-worker false-drop of a live
+      # rig-native worker whose session is still active. Mirror the _neverstarted_recover_db guard.
+      _ddw_sling_db="$GC_CITY"
+      _ddw_bid=$(echo "$_bead" | jq -r '.id // ""' 2>/dev/null || echo "")
+      _ddw_bead_db=$(echo "$_bead" | jq -r '._rig_db // ""' 2>/dev/null || echo "")
+      [ -n "$_ddw_bead_db" ] && [ -n "$_ddw_bid" ] && [ "$_sling" = "$_ddw_bid" ] && _ddw_sling_db="$_ddw_bead_db"
+      _asg=$(bd -C "$_ddw_sling_db" show "$_sling" --json 2>/dev/null \
         | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
       if [ -n "$_asg" ] && ! _session_is_live "$_asg"; then
         continue   # confirmed dead worker → free this slot
@@ -2260,7 +2283,7 @@ log "In-flight: live=$IN_FLIGHT_TOTAL (raw=$IN_FLIGHT_RAW_TOTAL stale=$STALE_INF
 # simply omits that builder (the USED-this-sweep set + global lane cap still bound
 # dispatch), mirroring the dead-worker check's never-over-free philosophy.
 _compute_busy_builders() {
-  local _n _i _bead _sling _asg _forms _f
+  local _n _i _bead _sling _asg _forms _f _cbb_bid _cbb_bead_db _cbb_sling_db
   _n=$(echo "$IN_FLIGHT_JSON" | jq 'length' 2>/dev/null || echo "0")
   [ "${_n:-0}" -gt 0 ] 2>/dev/null || return 0
   _i=0
@@ -2270,7 +2293,13 @@ _compute_busy_builders() {
     [ -n "$_bead" ] || continue
     _sling=$(echo "$_bead" | jq -r '.metadata["pilot.sling_bead"] // ""' 2>/dev/null || echo "")
     [ -n "$_sling" ] || continue
-    _asg=$(bd -C "$GC_CITY" show "$_sling" --json 2>/dev/null \
+    # ga-mfeip cross-DB fix: self-referential sling means the bead IS the rig-native task;
+    # look it up in its own store (_rig_db), not in $GC_CITY (where it doesn't exist).
+    _cbb_sling_db="$GC_CITY"
+    _cbb_bid=$(echo "$_bead" | jq -r '.id // ""' 2>/dev/null || echo "")
+    _cbb_bead_db=$(echo "$_bead" | jq -r '._rig_db // ""' 2>/dev/null || echo "")
+    [ -n "$_cbb_bead_db" ] && [ -n "$_cbb_bid" ] && [ "$_sling" = "$_cbb_bid" ] && _cbb_sling_db="$_cbb_bead_db"
+    _asg=$(bd -C "$_cbb_sling_db" show "$_sling" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
     [ -n "$_asg" ] || continue
     # Normalize to ALL of that session's identifiers (session_name/name/alias/id/
