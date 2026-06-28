@@ -31,6 +31,7 @@ BD = os.environ.get("BD_BIN", "bd")
 GC = os.environ.get("GC_BIN", "gc")
 
 STARVE_MIN = int(os.environ.get("IMP_STARVE_MIN", "20"))      # aprovada parada além disso = stuck
+HELD_LOOP_MAX = int(os.environ.get("IMP_HELD_LOOP_MAX", "5")) # > N held-until empilhados = held-LOOP (preso, não legit held)
 GATE_STALL_MIN = int(os.environ.get("IMP_GATE_STALL_MIN", "165"))  # 0 merges nessa janela + fila + sem reviewer = stall
 PILOT_DEAD_MIN = int(os.environ.get("IMP_PILOT_DEAD_MIN", "20"))   # pilot sem sweep além disso = morto
 
@@ -102,13 +103,32 @@ def check_approved():
                 ok_reasons["mayor"] += 1; continue
             if any(r in ls for r in ROUTED_OUT):
                 continue  # mislabeled but already routed — reconciler will clean story:approved
+            # held? distinguish a LEGIT hold (few held-until, future) from a HELD-LOOP
+            # (many stacked re-holds = the pilot can't dispatch it and re-holds forever = STUCK).
+            held = [l for l in labs if l.startswith("pilot:held-until:")]
+            if held:
+                if len(held) > HELD_LOOP_MAX:
+                    stuck.append({"rig": name, "id": b.get("id"),
+                                  "title": (b.get("title", "") or "")[:55],
+                                  "age_min": "held-loop:%dx" % len(held)})
+                    continue
+                future = False
+                for l in held:
+                    try:
+                        if float(l.rsplit(":", 1)[1]) > NOW:
+                            future = True; break
+                    except Exception:
+                        pass
+                if future:
+                    ok_reasons["held"] += 1; continue
+                # only-expired holds → not held anymore → fall through to staleness check
             age = _age_min(b.get("updated_at"))
             if age is not None and age <= STARVE_MIN:
                 ok_reasons["fresh"] += 1; continue  # just dispatched / transient
             # story:approved, not flowing, not held, not mayor, not routed, and stale → STUCK
             stuck.append({"rig": name, "id": b.get("id"),
                           "title": (b.get("title", "") or "")[:55],
-                          "age_min": round(age) if age is not None else "?"})
+                          "age_min": ("%dmin" % round(age)) if age is not None else "idade?"})
     return {"total": total, "stuck": stuck, "ok_reasons": ok_reasons, "read_err": read_err}
 
 
@@ -200,7 +220,7 @@ def main():
     fails, warns = [], []
     if a["stuck"] and (p.get("alive") is not False):
         fails.append("%d bead(s) APROVADA(s) parada(s) em silêncio (pilot vivo, não construindo, não roteada): %s"
-                     % (len(a["stuck"]), ", ".join("%s/%s (%smin)" % (s["rig"], s["id"], s["age_min"]) for s in a["stuck"][:6])))
+                     % (len(a["stuck"]), ", ".join("%s/%s (%s)" % (s["rig"], s["id"], s["age_min"]) for s in a["stuck"][:6])))
     if a["read_err"]:
         warns.append("não consegui ler story:approved de: %s (Dolt/bd) — investigar, não posso afirmar ✅" % ", ".join(a["read_err"]))
     if g.get("read_err"):
