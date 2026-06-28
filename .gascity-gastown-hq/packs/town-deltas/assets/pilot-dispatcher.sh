@@ -2141,7 +2141,14 @@ _neverstarted_recover_db() {
       if [ "${_DEADWORKER_OK:-0}" != "1" ]; then
         continue   # roster untrustworthy → cannot prove worker dead → KEEP.
       fi
-      _asg=$(bd -C "$GC_CITY" show "$_sling" --json 2>/dev/null \
+      # ga-mfeip cross-DB fix: a self-referential sling (pilot.sling_bead == bead id) is the
+      # routed-pool pattern — the "sling" IS the rig-native bead, living in $_db (the rig DB),
+      # NOT in HQ ($GC_CITY). Reading it from $GC_CITY returns a null assignee → false
+      # NEVERSTARTED release of a LIVE ps-worker/wa-worker build that just hasn't pushed a
+      # branch yet (>thresh, no gate label). Read the sling from the bead's own DB.
+      local _sling_db="$GC_CITY"
+      [ "$_sling" = "$_bid" ] && _sling_db="$_db"
+      _asg=$(bd -C "$_sling_db" show "$_sling" --json 2>/dev/null \
         | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
       if [ -n "$_asg" ] && _session_is_live "$_asg"; then
         continue   # worker alive → not never-started.
