@@ -205,6 +205,29 @@ def _has_needs_human_label(labels):
     )
 
 
+def _is_ephemeral_pool_assignee(assignee):
+    """True if assignee is an ephemeral-pool bead assignee (bare template OR concrete adhoc form).
+
+    Covers:
+    - Bare template in EPHEMERAL_POOL_ASSIGNEES (e.g. 'wa-worker')
+    - Concrete adhoc form: '<template>-adhoc-<hex>' (e.g. 'wa-worker-adhoc-faac43db2d')
+
+    ga-hkpwv gap fix: the Pilot pool dispatcher assigns concrete adhoc session names
+    like 'wa-worker-adhoc-<hash>' to beads rather than the bare template 'wa-worker'.
+    Both forms must qualify as ephemeral pool dispatches so that the pool-zombie reclaim
+    path (POOL_ZOMBIE_TTL + per-session liveness) handles them correctly.
+    """
+    if not assignee:
+        return False
+    if assignee in EPHEMERAL_POOL_ASSIGNEES:
+        return True
+    al = assignee.lower()
+    for template in EPHEMERAL_POOL_ASSIGNEES:
+        if al.startswith(template + "-adhoc-"):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Pure decision function (unit-testable, zero side effects)
 # ---------------------------------------------------------------------------
@@ -427,11 +450,13 @@ def is_reclaimable_inprogress_story(labels, assignee=None):
     intentionally-held work is never resurrected.
 
     ga-hkpwv (pool-zombie path): also qualifies when assignee is a bare pool
-    template in EPHEMERAL_POOL_ASSIGNEES (e.g. 'wa-worker'). The Pilot's pool
-    dispatch stamps assignee=<template> but NO pilot:dispatched / story:in-flight —
+    template in EPHEMERAL_POOL_ASSIGNEES (e.g. 'wa-worker') OR a concrete adhoc
+    session name of that pool (e.g. 'wa-worker-adhoc-faac43db2d'). The Pilot's pool
+    dispatch stamps assignee=<session-name> but NO pilot:dispatched / story:in-flight —
     these beads are unambiguously pool dispatches, so requiring a Pilot marker
     would leave them permanently invisible. The reclaim rails (pool_has_live_worker
-    + POOL_ZOMBIE_TTL + branch check) gate actuation conservatively.
+    / concrete_adhoc_session_is_live + POOL_ZOMBIE_TTL + branch check) gate
+    actuation conservatively.
 
     SCOPE-CRITICAL: this is the only thing standing between the in_progress
     sweep and arbitrary in_progress work (crew, gate, dog task beads). Those
@@ -442,7 +467,7 @@ def is_reclaimable_inprogress_story(labels, assignee=None):
     are treated identically to the bare gate:needs-human — deliberately parked.
     """
     is_pool_zombie_candidate = (
-        assignee is not None and assignee in EPHEMERAL_POOL_ASSIGNEES
+        assignee is not None and _is_ephemeral_pool_assignee(assignee)
     )
     has_marker = (
         is_pool_zombie_candidate
@@ -768,6 +793,61 @@ def pool_has_live_worker(pool_template, sessions, now=None, bead_update_age=None
             continue  # stale active (frozen zombie) — check remaining sessions
         # Unknown/unrecognized/missing state — conservative: treat pool as alive
         return True
+    return False
+
+
+def concrete_adhoc_session_is_live(assignee, sessions, now=None, bead_update_age=None):
+    """Per-session liveness for concrete ephemeral-adhoc workers (e.g. 'wa-worker-adhoc-<hex>').
+
+    Unlike pool_has_live_worker() (pool-wide: any live pool worker blocks ALL reclaims),
+    this checks ONLY the session named exactly by assignee — more precise because the
+    specific session identity is known at dispatch time.
+
+    Conservative (ga-64usm / ga-hkpwv gap fix):
+    - Session found, state in _POOL_DEAD_STATES → False (definitively dead → eligible)
+    - Session found, state in LIVE_STATES → apply session_owner_is_healthy() staleness check
+    - Session found, state unknown (not in either set) → True (ambiguous → NOOP)
+    - Session not found (gone / never started / purged) → False (dead → eligible)
+    - Missing/unparseable last_active on a LIVE session → True (conservative;
+      can't prove staleness per ga-64usm: NEVER reclaim on absent field)
+
+    Coordinator exclusion (ga-7m191): assignee naming mayor/deacon → False.
+
+    CORRECTNESS-CRITICAL: this is the primary guard against false-reclaiming a bead
+    whose concrete adhoc builder session is still alive.
+    """
+    if not assignee or is_coordinator(assignee):
+        return False
+    if now is None:
+        now = time.time()
+
+    for s in sessions:
+        identifiers = {
+            s.get("id", ""),
+            s.get("name", ""),
+            s.get("session_name", ""),
+            s.get("alias", ""),
+            s.get("agent_name", ""),
+        }
+        identifiers.discard("")
+        if assignee not in identifiers:
+            continue
+        # Found the matching session — skip coordinator identities.
+        if any(is_coordinator(idv) for idv in identifiers):
+            return False
+
+        state = s.get("state", "").lower()
+        if state in _POOL_DEAD_STATES:
+            return False  # Definitively dead/drained — eligible for reclaim
+        if state in LIVE_STATES:
+            # Apply ga-64usm staleness check: alive != working
+            activity_age = session_activity_age(s, now)
+            return session_owner_is_healthy(True, activity_age, bead_update_age)
+        # Unknown/unrecognized state — conservative: treat as alive (NOOP).
+        # NEVER reclaim on ambiguous session state.
+        return True
+
+    # Session not found in the session list → gone → treat as dead.
     return False
 
 
@@ -1133,12 +1213,24 @@ def run_cycle(state, escalated_alerted):
         # touching the bead (workers should bd-update during long work).
         bead_update_epoch = parse_iso_epoch(bead.get("updated_at", ""))
         bead_update_age = (now - bead_update_epoch) if bead_update_epoch is not None else None
-        # ga-hkpwv: bare pool-template assignees (e.g. 'wa-worker') never match any
-        # concrete session identifier — session_is_live() always returns False for them.
-        # Use pool_has_live_worker() instead, which matches via session.template.
-        is_pool_zombie_bead = assignee in EPHEMERAL_POOL_ASSIGNEES
-        if is_pool_zombie_bead:
+        # ga-hkpwv: ephemeral pool assignees come in two forms:
+        #   - Bare template (e.g. 'wa-worker'): no concrete session matches this name.
+        #     Use pool_has_live_worker() — pool-wide: ANY live wa-worker session
+        #     blocks ALL bare-template reclaims (conservative/coarse-grained).
+        #   - Concrete adhoc (e.g. 'wa-worker-adhoc-faac43db2d'): a specific session
+        #     was named at dispatch time. Use concrete_adhoc_session_is_live() for a
+        #     per-session check — more precise; only THAT session's liveness matters.
+        is_bare_pool_zombie = assignee in EPHEMERAL_POOL_ASSIGNEES
+        is_adhoc_pool_zombie = (
+            not is_bare_pool_zombie
+            and _is_ephemeral_pool_assignee(assignee)
+        )
+        is_pool_zombie_bead = is_bare_pool_zombie or is_adhoc_pool_zombie
+        if is_bare_pool_zombie:
             has_live_session = pool_has_live_worker(assignee, sessions, now, bead_update_age)
+        elif is_adhoc_pool_zombie:
+            has_live_session = concrete_adhoc_session_is_live(
+                assignee, sessions, now, bead_update_age)
         else:
             has_live_session = session_is_live(assignee, sessions, now, bead_update_age)
 
@@ -1184,9 +1276,10 @@ def run_cycle(state, escalated_alerted):
 
         reclaim_count = parse_reclaim_count(labels)
 
-        # ga-hkpwv: pool-zombie beads use POOL_ZOMBIE_TTL (2h) instead of the
-        # standard RECLAIM_TTL (25min) — a longer window compensates for the
-        # weaker signal (no Pilot marker) and prevents false reclaims.
+        # ga-hkpwv: pool-zombie beads (bare template AND concrete adhoc forms) use
+        # POOL_ZOMBIE_TTL (2h) instead of the standard RECLAIM_TTL (25min) — a longer
+        # window compensates for the weaker signal (no Pilot marker) and prevents
+        # false reclaims on slow-starting builds.
         min_stranding_secs = POOL_ZOMBIE_TTL if is_pool_zombie_bead else RECLAIM_TTL
 
         # --- Pure decision ---
@@ -1246,7 +1339,7 @@ def run_cycle(state, escalated_alerted):
                 _irg_ledger("human-touch", {"ts": _irg_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "source_daemon": "inflight-reclaim-guard", "stage": "executa", "kind": "technical", "bead_id": bead_id, "reason": f"Reclaim cap exhausted ({reclaim_count}x) — needs human intervention"}, fail_open=True)
                 # ga-hkpwv: pool-zombie escalation also mails Mayor directly
                 # (POOL-DEAD handles pool-level alerts; this covers single-bead cap exhaustion)
-                if assignee in EPHEMERAL_POOL_ASSIGNEES:
+                if _is_ephemeral_pool_assignee(assignee):
                     try:
                         subprocess.run(
                             ["gc", "mail", "send", "mayor",
@@ -1688,6 +1781,107 @@ def _selftest():
     finally:
         time.time = _orig_time_fn
         subprocess.run = _orig_run_br
+
+    # -----------------------------------------------------------------------
+    # Section 5: ga-hkpwv gap fix — concrete wa-worker-adhoc-<hex> scenarios
+    # Tests _is_ephemeral_pool_assignee(), concrete_adhoc_session_is_live(),
+    # is_reclaimable_inprogress_story() for concrete adhoc, and the full
+    # reclaim pipeline for concrete adhoc assignees. No bd/gc/git calls.
+    # -----------------------------------------------------------------------
+
+    T_az = 1_782_600_000.0  # fixed epoch for determinism
+
+    # --- AZ-0: _is_ephemeral_pool_assignee() — covers bare template + concrete adhoc ---
+    check("AZ-0a: _is_ephemeral_pool_assignee: bare wa-worker → True",
+          _is_ephemeral_pool_assignee("wa-worker"))
+    check("AZ-0b: _is_ephemeral_pool_assignee: wa-worker-adhoc-deadbeef → True",
+          _is_ephemeral_pool_assignee("wa-worker-adhoc-deadbeef"))
+    check("AZ-0c: _is_ephemeral_pool_assignee: gastown.dog → False (not in scope)",
+          not _is_ephemeral_pool_assignee("gastown.dog"))
+    check("AZ-0d: _is_ephemeral_pool_assignee: oracle-wa (crew) → False",
+          not _is_ephemeral_pool_assignee("oracle-wa"))
+
+    # --- AZ-1: concrete adhoc qualifies in is_reclaimable_inprogress_story without Pilot markers ---
+    check("AZ-1a: is_reclaimable_inprogress_story: wa-worker-adhoc-deadbeef without markers → True",
+          is_reclaimable_inprogress_story([], assignee="wa-worker-adhoc-deadbeef"))
+    check("AZ-1b: _pool_of: wa-worker-adhoc-deadbeef → wa-worker (feeds POOL-DEAD bucket)",
+          _pool_of("wa-worker-adhoc-deadbeef") == "wa-worker")
+
+    # --- AZ-2: concrete_adhoc_session_is_live — asleep session → False (eligible for reclaim) ---
+    _adhoc_dead_session = [
+        {"id": "sid-x1", "name": "wa-worker-adhoc-1",
+         "session_name": "wa-worker-adhoc-deadbeef",
+         "alias": "", "agent_name": "wa-worker-adhoc-deadbeef",
+         "state": "asleep", "last_active": "0001-01-01T00:00:00Z"},
+    ]
+    check("AZ-2: concrete_adhoc_session_is_live: session asleep → False (eligible for reclaim)",
+          not concrete_adhoc_session_is_live(
+              "wa-worker-adhoc-deadbeef", _adhoc_dead_session, T_az))
+
+    # --- AZ-3: full pipeline — concrete adhoc + dead session + stranded 2h+ → reclaim ---
+    check("AZ-3: reclaim_decision: adhoc+dead session, no branch, stranded>POOL_ZOMBIE_TTL → reclaim",
+          reclaim_decision(
+              has_live_session=concrete_adhoc_session_is_live(
+                  "wa-worker-adhoc-deadbeef", _adhoc_dead_session, T_az),
+              has_recent_branch=False,
+              seconds_stranded=POOL_ZOMBIE_TTL + 1,
+              reclaim_count=0,
+              has_needs_human=False,
+              has_dispatching_marker=False,
+              min_stranding_secs=POOL_ZOMBIE_TTL,
+          ) == "reclaim")
+
+    # --- AZ-4: concrete_adhoc_session_is_live — ACTIVE + fresh last_active → True (no false reclaim) ---
+    _adhoc_fresh_ts = _irg_datetime.datetime.fromtimestamp(
+        T_az - 60, tz=_irg_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _adhoc_live_session = [
+        {"id": "sid-x2", "name": "wa-worker-adhoc-2",
+         "session_name": "wa-worker-adhoc-deadbeef",
+         "alias": "", "agent_name": "wa-worker-adhoc-deadbeef",
+         "state": "active", "last_active": _adhoc_fresh_ts},
+    ]
+    check("AZ-4: concrete_adhoc_session_is_live: active + fresh last_active → True (NOOP; no false reclaim)",
+          concrete_adhoc_session_is_live(
+              "wa-worker-adhoc-deadbeef", _adhoc_live_session, T_az))
+
+    # --- AZ-5: branch rail — concrete adhoc + branch exists → NOOP ---
+    check("AZ-5: reclaim_decision: adhoc dead session BUT branch exists → noop (branch rail)",
+          reclaim_decision(
+              has_live_session=False,
+              has_recent_branch=True,
+              seconds_stranded=POOL_ZOMBIE_TTL + 1,
+              reclaim_count=0,
+              has_needs_human=False,
+              has_dispatching_marker=False,
+              min_stranding_secs=POOL_ZOMBIE_TTL,
+          ) == "noop")
+
+    # --- AZ-6: conservatism — unknown state → ALIVE → NOOP ---
+    _adhoc_unknown_state_session = [
+        {"id": "sid-x3", "name": "wa-worker-adhoc-3",
+         "session_name": "wa-worker-adhoc-deadbeef",
+         "alias": "", "agent_name": "wa-worker-adhoc-deadbeef",
+         "state": "unknown_state", "last_active": "0001-01-01T00:00:00Z"},
+    ]
+    check("AZ-6: concrete_adhoc_session_is_live: unknown state → True (conservative; NOOP)",
+          concrete_adhoc_session_is_live(
+              "wa-worker-adhoc-deadbeef", _adhoc_unknown_state_session, T_az))
+
+    # --- AZ-7: session gone (not in session list at all) → dead → eligible for reclaim ---
+    check("AZ-7: concrete_adhoc_session_is_live: session gone (empty list) → False (eligible)",
+          not concrete_adhoc_session_is_live("wa-worker-adhoc-deadbeef", [], T_az))
+
+    # --- AZ-8: non-wa-worker assignees NOT swept (scope stays wa-worker family) ---
+    check("AZ-8: _is_ephemeral_pool_assignee: dog-gawispy8c0mr → False (not in scope)",
+          not _is_ephemeral_pool_assignee("dog-gawispy8c0mr"))
+    check("AZ-8b: is_reclaimable_inprogress_story: dog-gawispy8c0mr without markers → False",
+          not is_reclaimable_inprogress_story([], assignee="dog-gawispy8c0mr"))
+
+    # --- AZ-9: bare wa-worker regression — existing pool-wide behavior unchanged ---
+    check("AZ-9: _is_ephemeral_pool_assignee: bare wa-worker still detected (regression check)",
+          _is_ephemeral_pool_assignee("wa-worker"))
+    check("AZ-9b: is_reclaimable_inprogress_story: bare wa-worker still qualifies (regression check)",
+          is_reclaimable_inprogress_story([], assignee="wa-worker"))
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0
