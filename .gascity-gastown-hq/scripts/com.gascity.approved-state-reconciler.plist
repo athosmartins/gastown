@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.approved-state-reconciler</string>
+
+  <!-- Approved-State Reconciler (2026-06-28). Kills the "18 beads approved, 0 building"
+       silent symptom by making it structurally impossible:
+
+       CORE GUARANTEE (spec §4 v1, imparável forcing-function):
+       For every story:approved open bead, within STARVE_MIN (default 20min), exactly one:
+         1. It is IN-FLIGHT or DISPATCHED (story:in-flight / pilot:dispatched / live assignee)
+         2. It is ROUTED OUT to its true state (story:needs-device / story:needs-human /
+            story:blocked) with an audit comment + operator notification
+         3. It is assumed buildable but NOT flowing → ALARM: gc mail send mayor + notify
+            "buildable bead <id> starving: story:approved <age>min, not dispatched,
+            pilot alive — dispatch path failing"
+
+       ROUTING SIGNALS (explicit only — never routes on ambiguous content):
+         • needs-device: label story:needs-device, OR title/AC matches on-device patterns
+           (on-device, aquecimento, warming, UIAutomator, screencap, tela do, celular,
+           DPR foreground)
+         • needs-human: label gate:needs-human* (prefix) or story:needs-human
+         • blocked: label blocked/story:blocked, OR wording bloqueado por /
+           quando o datastore / aguardando <serviço>
+         • post-build: gate:passed present → remove story:approved only (delivery owns it)
+
+       SAFE DEFAULT: no explicit signal → bead stays approved → ALARMS if starving.
+       NEVER routes on ambiguous content — hiding buildable work is the cardinal sin.
+
+       CADENCE: StartInterval=600 (10min). No KeepAlive — this is a one-shot script
+       launched by launchd every 10 minutes. An internal sleep loop is NOT used.
+
+       KILL-SWITCH: APPROVED_RECONCILER_ENABLED=0 → no-op (safe to disable).
+       DRY-RUN: APPROVED_RECONCILER_DRY_RUN=1 → logs intended actions, mutates nothing.
+
+       STATE: .gc/approved-state-reconciler-state.json — per-bead route/alarm cooldowns
+       (~30min) to prevent spam on repeated cycles.
+
+       DPW_CRITICAL: add com.gascity.approved-state-reconciler to DPW_CRITICAL after
+       Mayor deploys (edit daemon-presence-watchdog.sh default set; not here). -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/approved-state-reconciler.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <!-- One-shot cadence: launchd runs the script every 600s (10min). -->
+  <key>StartInterval</key><integer>600</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/approved-state-reconciler.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/approved-state-reconciler.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+    <!-- Kill-switch: set to 0 to disable the reconciler entirely (safe no-op). -->
+    <key>APPROVED_RECONCILER_ENABLED</key>
+    <string>1</string>
+
+    <!-- DRY_RUN: set to 1 to log intended actions without mutating any bead. -->
+    <key>APPROVED_RECONCILER_DRY_RUN</key>
+    <string>0</string>
+
+    <!-- STARVE_MIN: minutes before a buildable undispatched bead triggers an alarm.
+         Default 20 = ~2 pilot sweeps (5min each) + margin. -->
+    <key>STARVE_MIN</key>
+    <string>20</string>
+
+    <!-- FLOW_GRACE_MIN: minutes a recently-dispatched bead is assumed to be flowing.
+         Exposed for operator tuning; the operative threshold is STARVE_MIN. -->
+    <key>FLOW_GRACE_MIN</key>
+    <string>10</string>
+
+    <!-- Cooldowns: per-bead route and alarm suppression to prevent spam. -->
+    <key>ARC_ROUTE_COOLDOWN_SEC</key>
+    <string>1800</string>
+    <key>ARC_ALARM_COOLDOWN_SEC</key>
+    <string>1800</string>
+
+    <!-- Pilot alive window: if no sweep-complete in this many minutes → pilot dead. -->
+    <key>ARC_PILOT_ALIVE_WINDOW_MIN</key>
+    <string>20</string>
+
+    <key>BD_ACTOR</key>
+    <string>automation</string>
+  </dict>
+</dict>
+</plist>
