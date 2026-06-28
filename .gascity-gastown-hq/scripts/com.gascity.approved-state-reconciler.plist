@@ -16,17 +16,17 @@
             "buildable bead <id> starving: story:approved <age>min, not dispatched,
             pilot alive — dispatch path failing"
 
-       ROUTING SIGNALS (explicit only — never routes on ambiguous content):
-         • needs-device: label story:needs-device, OR title/AC matches on-device patterns
-           (on-device, aquecimento, warming, UIAutomator, screencap, tela do, celular,
-           DPR foreground)
-         • needs-human: label gate:needs-human* (prefix) or story:needs-human
-         • blocked: label blocked/story:blocked, OR wording bloqueado por /
-           quando o datastore / aguardando <serviço>
-         • post-build: gate:passed present → remove story:approved only (delivery owns it)
+       ROUTING SIGNALS (LABELS ONLY — review fix 95726bf9b; keywords NEVER auto-route):
+         • needs-device: label story:needs-device
+         • needs-human:  label gate:needs-human* (prefix) or story:needs-human
+         • blocked:      label blocked / story:blocked
+         • post-build:   gate:passed present → remove story:approved only (delivery owns it)
+       Title/body KEYWORDS (warming, aquecimento, celular, on-device, etc.) do NOT route —
+       they only emit a low-priority FLAG suggesting a human add the right label. This is
+       because keywords over-match buildable code (e.g. "painel warming" is a buildable
+       dashboard). Hiding buildable work is the cardinal sin; only explicit LABELS route.
 
-       SAFE DEFAULT: no explicit signal → bead stays approved → ALARMS if starving.
-       NEVER routes on ambiguous content — hiding buildable work is the cardinal sin.
+       SAFE DEFAULT: no explicit LABEL → bead stays approved → ALARMS if starving.
 
        CADENCE: StartInterval=600 (10min). No KeepAlive — this is a one-shot script
        launched by launchd every 10 minutes. An internal sleep loop is NOT used.
@@ -70,7 +70,9 @@
     <key>APPROVED_RECONCILER_ENABLED</key>
     <string>1</string>
 
-    <!-- DRY_RUN: set to 1 to log intended actions without mutating any bead. -->
+    <!-- DRY_RUN: set to 1 to log intended actions without mutating any bead.
+         Deployed DRY_RUN=1 first (2026-06-28), validated 1 clean live cycle, then flipped
+         to 0 (enforcing). Labels-only routing + reversible (labels + audit comment). -->
     <key>APPROVED_RECONCILER_DRY_RUN</key>
     <string>0</string>
 
