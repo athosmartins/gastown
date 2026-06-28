@@ -1647,10 +1647,11 @@ run_capacity_reuse() { # $1=PILOT_REUSE_SESSION  $2=FAKE_BUGS_JSON  $3=FAKE_SESS
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
 
-# pilot-rewire: wa-worker-* are ephemeral (like gastown.dog) → excluded from session reuse.
-# Use a property_scrapers bug (routes to batista-ps, a persistent named crew) to test
-# the REUSE mechanism, which only applies to non-ephemeral crew identities.
-GT4_PS_BUG='[{"id":"ps-gt4test","title":"gt-4st3n ps bug","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"property_scrapers"}}]'
+# pilot-rewire: wa-worker-* and ps-worker are ephemeral (like gastown.dog) → excluded
+# from session reuse. Use a ga-* HQ bug with property_scrapers content keywords so the
+# domain guard routes it to batista-ps (a persistent named crew) to test the REUSE
+# mechanism, which only applies to non-ephemeral crew identities.
+GT4_PS_BUG='[{"id":"ga-gt4ps","title":"Mapear proprietarios falecidos scraper RFB (semanal)","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}]'
 GT4_WA_BUG='[{"id":"tt-gt4wa","title":"gt-4st3n wa bug","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{"story.rig":"whatsapp_automation"}}]'
 GT4_GC_BUG='[{"id":"tt-gt4gc","title":"gt-4st3n gascity bug","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}]'
 GT4_SESS_ACTIVE='{"sessions":[{"session_name":"batista-ps","alias":"batista-ps","agent_name":"batista-ps","id":"ga-wisp-batista","state":"active","closed":false}]}'
@@ -2669,15 +2670,17 @@ fi
 # These verify the 8-item pilot-rewire-spec.md changes structurally (source patterns)
 # without requiring a full dispatch run. Complement the runtime Scenario 15 tests.
 
-echo "Scenario NEW-A: _beadid_live_crew_owner excludes wa-worker (not a named crew)"
-if grep -qE 'gastown\.dog\|gastown\.dog-\*\|wa-worker\|wa-worker-\*\)' "$DISPATCHER"; then
-  ok "wa-worker excluded from _beadid_live_crew_owner (like gastown.dog — ephemeral, not a named crew)"
+echo "Scenario NEW-A: _beadid_live_crew_owner excludes wa-worker and ps-worker (ephemeral, not named crews)"
+# Pattern extended (ga-mfeip mirror): wa-worker AND ps-worker both excluded alongside gastown.dog.
+if grep -qE 'gastown\.dog\|gastown\.dog-\*\|wa-worker\|wa-worker-\*\|ps-worker' "$DISPATCHER"; then
+  ok "wa-worker and ps-worker excluded from _beadid_live_crew_owner (ephemeral — not named crews)"
 else
-  bad "wa-worker NOT excluded from _beadid_live_crew_owner — ephemeral worker falsely pins beads"
+  bad "wa-worker/ps-worker NOT excluded from _beadid_live_crew_owner — ephemeral workers falsely pin beads"
 fi
 
 echo "Scenario NEW-B (ga-nlh79 + wa-worker): wa-worker* owner/creator → WA rig, not misroute"
-if grep -qE '\*-wa\|wa-worker\*\)' "$DISPATCHER"; then
+# ga-nlh79: case includes *-wa|*-wa-*|wa-worker* so wa-worker-created beads signal WA domain.
+if grep -qE '\*-wa\|\*-wa-\*\|wa-worker\*\)' "$DISPATCHER"; then
   ok "ga-nlh79 case extended to wa-worker* (prevents property misroute for WA builds)"
 else
   bad "ga-nlh79 case NOT extended — wa-worker-built beads may misroute to property_scrapers"
@@ -2854,6 +2857,88 @@ echo "Scenario 16v: phantom-guard structural — knob and test seam wired"
 has "$DISPATCHER" 'PILOT_PHANTOM_STALE_SECS'             "phantom staleness knob defined (default 2700 = 45min)"
 has "$DISPATCHER" 'PILOT_TEST_PHANTOM_STALE_BEADS'       "phantom staleness test seam wired"
 has "$DISPATCHER" 'phantom: stale.*no branch'            "phantom-guard release path has identifying log/comment"
+
+# ── Scenario PS-WORKER: ps-worker ephemeral pool routing (ga-mfeip mirror) ───
+# A ps-* rig-native story:approved bead must route to ps-worker (NOT batista-ps).
+# Uses a custom gc shim that returns the property_scrapers rig path so
+# STORY_BEAD_CITY != GC_CITY → _IS_RIG_NATIVE=1, and the DRY_RUN log emits
+# "WOULD: gc ... session new ps-worker --no-attach". Mirrors the wa-worker test seam.
+PS_FAKE_RIG_DIR="$WORK/fake-ps-rig"
+mkdir -p "$PS_FAKE_RIG_DIR"
+PS_SHIMBIN="$WORK/ps-bin"
+mkdir -p "$PS_SHIMBIN"
+
+# Custom gc shim: returns property_scrapers rig at PS_FAKE_RIG_DIR (makes _IS_RIG_NATIVE=1).
+cat > "$PS_SHIMBIN/gc" <<PS_GC_EOF
+#!/usr/bin/env bash
+case "\$*" in
+  *"rig list"*)      printf '{"rigs":[{"name":"property_scrapers","path":"$PS_FAKE_RIG_DIR","hq":false}]}' ;;
+  *sling*)           printf '{"bead_id":"tt-ps-sling-1"}' ;;
+  *"session list"*)  printf '{"sessions":[]}' ;;
+  *"session new"*)   : ;;
+  *"session nudge"*) : ;;
+  *) : ;;
+esac
+exit 0
+PS_GC_EOF
+chmod +x "$PS_SHIMBIN/gc"
+# Reuse the standard bd and notify shims.
+ln -sf "$SHIMBIN/bd"     "$PS_SHIMBIN/bd"
+ln -sf "$SHIMBIN/notify" "$PS_SHIMBIN/notify"
+
+# ps-* rig-native story:approved fixture — spatial join MDS bug, no external deps.
+PS_WORKER_FX='[{"id":"ps-test1","title":"Corrigir spatial join MDS — area poligono sem intersecao","priority":2,"issue_type":"feature","description":"fixture body — spatial join bug, no external deps (canary bead analogue for ps-worker pool test)","status":"open","labels":["story:approved","lane:small"],"assignee":null,"created_at":"2026-06-16T00:00:00Z","metadata":{"story.rig":"property_scrapers"}}]'
+
+# Helper: run a DRY sweep with PS_SHIMBIN and PILOT_WA_RIG_TIER2_OVERRIDE.
+# $1=FAKE_BUGS_JSON (use "[]" for ps-only test)
+# $2=PILOT_WA_RIG_TIER2_OVERRIDE (the ps bead fixture JSON)
+# $3=PILOT_TEST_PS_WORKER_LIVE_COUNT (pool slot count to inject)
+run_ps_worker_dispatch() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$PS_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE=10 \
+    DISPATCH_TO_CAPACITY=1 \
+    FAKE_BUGS_JSON="${1:-[]}" \
+    FAKE_BLOCKED_IDS="" \
+    PILOT_WA_RIG_APPROVED_QUERIES=1 \
+    PILOT_WA_RIG_TIER2_OVERRIDE="${2:-[]}" \
+    PILOT_TEST_PS_WORKER_LIVE_COUNT="${3:-0}" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+echo "Scenario PS-WORKER-A: property_scrapers rig-native story:approved bead routes to ps-worker (NOT batista-ps)"
+LOG_PSW="$(run_ps_worker_dispatch "[]" "$PS_WORKER_FX" "0")"
+if echo "$LOG_PSW" | grep -q "Builder target: ps-worker"; then
+  ok "ps-worker: Builder target is ps-worker (property_scrapers routing correct)"
+else
+  bad "ps-worker: Builder target is NOT ps-worker — routing broken (expected ps-worker, not batista-ps)"
+fi
+if echo "$LOG_PSW" | grep -q "session new ps-worker --no-attach"; then
+  ok "ps-worker: DRY_RUN log shows rig-native spawn 'WOULD: gc ... session new ps-worker --no-attach'"
+else
+  bad "ps-worker: 'session new ps-worker --no-attach' NOT in log — spawn arm missing or rig-native path not triggered"
+fi
+if echo "$LOG_PSW" | grep -q "batista-ps"; then
+  bad "ps-worker: batista-ps appeared in dispatch log — old routing NOT replaced"
+else
+  ok "ps-worker: batista-ps NOT in dispatch log (routing correctly migrated to ps-worker)"
+fi
+
+echo "Scenario PS-WORKER-B: structural — ps-worker pool wiring verified in dispatcher"
+has "$DISPATCHER" 'PILOT_PS_WORKER_MAX'               "PILOT_PS_WORKER_MAX cap knob defined"
+has "$DISPATCHER" 'PILOT_TEST_PS_WORKER_LIVE_COUNT'   "PILOT_TEST_PS_WORKER_LIVE_COUNT test seam wired"
+has "$DISPATCHER" 'PILOT_SPAWN_PS_WORKER'             "PILOT_SPAWN_PS_WORKER toggle wired"
+has "$DISPATCHER" 'gc\.routed_to=ps-worker'           "gc.routed_to=ps-worker stamped before spawn"
+has "$DISPATCHER" 'session new ps-worker --no-attach' "spawn arm uses gc session new ps-worker --no-attach"
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""

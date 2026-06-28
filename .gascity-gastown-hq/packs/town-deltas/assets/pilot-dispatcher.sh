@@ -105,6 +105,10 @@ PILOT_WA_WORKER_MAX="${PILOT_WA_WORKER_MAX:-4}"
 # TEST-ONLY seam: when set, overrides the live `gc session list` count.
 # Format: a raw integer (e.g. "0" = pool empty, "4" = pool full).
 PILOT_TEST_WA_WORKER_LIVE_COUNT="${PILOT_TEST_WA_WORKER_LIVE_COUNT:-}"
+# ps-worker ephemeral pool cap (mirror of wa-worker; property_scrapers rig).
+PILOT_PS_WORKER_MAX="${PILOT_PS_WORKER_MAX:-2}"
+# TEST-ONLY seam: override live gc session list count for ps-worker pool.
+PILOT_TEST_PS_WORKER_LIVE_COUNT="${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}"
 
 # Acceptance-criteria count threshold for auto-classifying a story as BIG.
 BIG_CRITERIA_THRESHOLD="${BIG_CRITERIA_THRESHOLD:-5}"
@@ -424,7 +428,7 @@ rig_to_builders() {
   case "$rig" in
     gascity)               echo "gastown.dog"                                  ;;
     whatsapp_automation|wa) echo "wa-worker-1 wa-worker-2 wa-worker-3 wa-worker-4" ;;
-    property_scrapers|ps)  echo "batista-ps"                                   ;;
+    property_scrapers|ps)  echo "ps-worker"                                    ;;
     gastown|gt)            echo "gastown.dog"                                  ;;
     lexbh|lx)              echo "gastown.dog"                                  ;;
     marketing|ma)          echo "gastown.dog"                                  ;;
@@ -1795,7 +1799,7 @@ _beadid_live_crew_owner() {
   _asg=$(printf '%s' "$_bead_json" \
     | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
   { [ -z "$_asg" ] || [ "$_asg" = "null" ]; } && return 1
-  case "$_asg" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*) return 1 ;; esac
+  case "$_asg" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*) return 1 ;; esac
   _session_is_live "$_asg" || return 1
 
   # ── Phantom-claim guard ─────────────────────────────────────────────────────
@@ -3230,8 +3234,8 @@ FIXSEC
             _BEAD_CREATED_BY=$(echo "$STORY" | jq -r '(.created_by // "") | select(length>0)' 2>/dev/null || echo "")
             _BEAD_ASSIGNEE_RAW=$(echo "$STORY" | jq -r '(.assignee // "") | select(length>0)' 2>/dev/null || echo "")
             # Strip dog-pool and ephemeral-worker assignees — only persistent named-crew owners count.
-            # wa-worker* is ephemeral (not a named crew) so it must not be treated as a domain signal.
-            case "$_BEAD_ASSIGNEE_RAW" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*) _BEAD_ASSIGNEE_RAW="" ;; esac
+            # wa-worker* and ps-worker* are ephemeral (not named crews) so must not be domain signals.
+            case "$_BEAD_ASSIGNEE_RAW" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*) _BEAD_ASSIGNEE_RAW="" ;; esac
             # Check created_by first (the FILER = true domain owner), then assignee as fallback.
             # wa-worker* as creator also signals WA domain (it ran a WA build that created this bead).
             # ga-nlh79 fix: created_by/assignee carry a session-id suffix (e.g. mila-wa-gawispsqpzr0),
@@ -3240,6 +3244,10 @@ FIXSEC
             case "$_BEAD_CREATED_BY" in *-wa|*-wa-*|wa-worker*) _OWNER_RIG_SIGNAL="whatsapp_automation" ;; esac
             if [ -z "$_OWNER_RIG_SIGNAL" ]; then
               case "$_BEAD_ASSIGNEE_RAW" in *-wa|*-wa-*|wa-worker*) _OWNER_RIG_SIGNAL="whatsapp_automation" ;; esac
+            fi
+            # ps-worker* as creator signals PS domain (it ran a PS build that created this bead).
+            if [ -z "$_OWNER_RIG_SIGNAL" ]; then
+              case "$_BEAD_CREATED_BY" in ps-worker*) _OWNER_RIG_SIGNAL="property_scrapers" ;; esac
             fi
             if [ -n "$_OWNER_RIG_SIGNAL" ]; then
               _DOMAIN_RIG="$_OWNER_RIG_SIGNAL"
@@ -3266,7 +3274,7 @@ FIXSEC
           local _EXPLICIT_ASSIGNEE=""
           _EXPLICIT_ASSIGNEE=$(echo "$STORY" | jq -r '(.assignee // "") | select(length>0)' 2>/dev/null || echo "")
           # Strip dog-pool and ephemeral-worker assignees — not authoritative persistent-crew owners.
-          case "$_EXPLICIT_ASSIGNEE" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*) _EXPLICIT_ASSIGNEE="" ;; esac
+          case "$_EXPLICIT_ASSIGNEE" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*) _EXPLICIT_ASSIGNEE="" ;; esac
           # ITEM 6 (pilot-rewire): strip suspended explicit assignees — dispatching to a
           # suspended crew leaves the bead assigned-but-unbuilt. Clear the assignee so the
           # bead falls through to pool routing (pick_pool_builder) instead.
@@ -3501,7 +3509,7 @@ TASK
   # Fail-open: classification errors leave _DISPATCH_REUSE=0 → legacy spawn path.
   local _DISPATCH_REUSE=0 _DISPATCH_SESS_STATE="none" _DISPATCH_SESS_REF=""
   local _skip_reuse=0
-  case "$BUILDER_TARGET" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*) _skip_reuse=1 ;; esac
+  case "$BUILDER_TARGET" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*) _skip_reuse=1 ;; esac
   if [ "${PILOT_REUSE_SESSION:-1}" = "1" ] && [ "$_skip_reuse" = "0" ]; then
     local _sess_line
     _sess_line=$(_target_session_state "$_SLING_TARGET" 2>/dev/null || echo "none")
@@ -3538,6 +3546,7 @@ TASK
       log "  RIG-NATIVE path (ga-mfeip): bd -C $STORY_BEAD_CITY update $STORY_ID --assignee $_SLING_TARGET (slot=$BUILDER_TARGET)"
       case "$_SLING_TARGET" in
         wa-worker*) log "  WOULD: gc --city $GC_CITY session new wa-worker --no-attach --title-hint 'build $STORY_ID: ...' (pilot-spawn: ephemeral worker, not nudge)" ;;
+        ps-worker*) log "  WOULD: gc --city $GC_CITY session new ps-worker --no-attach --title-hint 'build $STORY_ID: ...' (pilot-spawn: ephemeral worker, not nudge)" ;;
         *)          log "  WOULD: gc --city $GC_CITY session nudge $_SLING_TARGET <task_prompt>" ;;
       esac
     elif [ "$_DISPATCH_REUSE" = "1" ]; then
@@ -3595,7 +3604,7 @@ TASK
     #   • Named crew (mila-wa, oracle-wa, …): assign directly — their GC_ALIAS == the crew name,
     #     so --assignee=<crew> matches the crew session's identity (unchanged behaviour).
     case "$_SLING_TARGET" in
-      wa-worker*)
+      wa-worker*|ps-worker*)
         : # pool: leave UNASSIGNED + open so RoutedPoolQuery finds it (claim happens worker-side)
         ;;
       *)
@@ -3655,6 +3664,34 @@ TASK
           fi
         else
           log "  ga-mfeip: PILOT_SPAWN_WA_WORKER=0 — skipping auto-spawn for $STORY_ID (gc.routed_to=wa-worker set; bead unassigned until worker claims)"
+        fi
+        ;;
+      ps-worker*)
+        # Set gc.routed_to so RoutedPoolQuery finds the unassigned bead AND the supervisor
+        # scale_check counts it as pool demand (capped at max_active_sessions=2).
+        bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "gc.routed_to=ps-worker" -q 2>/dev/null || true
+        if [ "${PILOT_SPAWN_PS_WORKER:-1}" = "1" ]; then
+          if [ -n "${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}" ]; then
+            _live_ps_count="$PILOT_TEST_PS_WORKER_LIVE_COUNT"
+          else
+            _live_ps_count=$(timeout 10 gc --city "$GC_CITY" session list --json 2>/dev/null \
+              | jq '[.sessions[]? | select(.template=="ps-worker" and (.state=="active" or .state=="creating"))] | length' 2>/dev/null || echo "0")
+          fi
+          _live_ps_count="${_live_ps_count:-0}"
+          if [ "${_live_ps_count:-0}" -ge "${PILOT_PS_WORKER_MAX:-2}" ] 2>/dev/null; then
+            log "  ga-mfeip: ps-worker pool at session cap ($_live_ps_count active/creating >= ${PILOT_PS_WORKER_MAX:-2} max) — skip spawn for $STORY_ID (gc.routed_to=ps-worker set; supervisor picks it up when slot frees)"
+          else
+            log "  ga-mfeip: spawning ps-worker for $STORY_ID (live=$_live_ps_count < ${PILOT_PS_WORKER_MAX:-2})."
+            if timeout 30 gc --city "$GC_CITY" session new ps-worker --no-attach \
+                --title-hint "build $STORY_ID: $STORY_TITLE" \
+                >/dev/null 2>&1; then
+              log "  ga-mfeip: ps-worker session spawned for $STORY_ID."
+            else
+              warn "ga-mfeip: Could not spawn ps-worker for $STORY_ID — gc.routed_to=ps-worker set; supervisor reconcile will pick it up"
+            fi
+          fi
+        else
+          log "  ga-mfeip: PILOT_SPAWN_PS_WORKER=0 — skipping auto-spawn for $STORY_ID (gc.routed_to=ps-worker set; bead unassigned until worker claims)"
         fi
         ;;
       *)

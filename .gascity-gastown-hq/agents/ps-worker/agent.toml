@@ -1,0 +1,18 @@
+# ps-worker: ephemeral rig-scoped worker for property_scrapers beads.
+# Mirrors wa-worker (the proven ephemeral pool). RIG CONTEXT comes from
+# work_dir inside the property_scrapers rig clone:
+#   - `bd` resolves to the PS bead store (ps-* prefix)
+#   - `git` operates on the PS rig repo
+# EPHEMERAL: min_active_sessions=0 → supervisor/Pilot spawns on demand;
+# wake_mode=fresh → clean session per spawn; drains + exits after /gate-done.
+# MODEL: Sonnet (build work; off the scarce Opus budget).
+# PROVIDER: claude-headless (no mobile RC auto-connect — wa-9ye2 pattern).
+work_dir = "/Users/athos/gt/property_scrapers/crew/worker"
+min_active_sessions = 0
+max_active_sessions = 2
+idle_timeout = "2h"
+wake_mode = "fresh"
+model = "sonnet"
+provider = "claude-headless"
+# NOTE: dir= intentionally ABSENT (same rationale as wa-worker: keeps the agent
+# city-discoverable for `gc session new ps-worker`; rig context comes from work_dir).
