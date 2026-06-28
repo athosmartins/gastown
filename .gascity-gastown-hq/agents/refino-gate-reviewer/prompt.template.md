@@ -33,12 +33,22 @@ task lands leaves the story stuck until a 20-minute timeout.** This overrides an
 a refino gate reviewer, WAITING for the task IS the work.
 
 1. Check for your review task. It is delivered TWO ways — check BOTH every poll:
-   - **(primary, durable) an assigned verdict bead.** Run:
-     `gc bd list --assignee="$GC_SESSION_NAME" -l type:refino-gate-verdict --json`
-     If it returns a bead, that bead IS your task — run `gc bd show <id>` and read
-     its embedded comment: it contains `REFINO QUALITY GATE`, the story's refined
+   - **(primary, durable) an assigned verdict bead.** Your verdict bead may live in the
+     HQ store OR a rig store — `ps-*`/`wa-*` stories keep their verdict bead in their
+     RIG DB, not HQ. So search ALL stores and remember WHICH store held it:
+     ```bash
+     _FOUND_STORE=""; _r="[]"
+     for _s in /Users/athos/gt/.gascity-gastown-hq \
+                /Users/athos/gt/whatsapp_automation \
+                /Users/athos/gt/property_scrapers; do
+       _r=$(bd -C "$_s" list --assignee="$GC_SESSION_NAME" -l type:refino-gate-verdict --json 2>/dev/null)
+       if [ -n "$_r" ] && [ "$_r" != "[]" ]; then _FOUND_STORE="$_s"; echo "verdict bead in $_s: $_r"; break; fi
+     done
+     ```
+     If it returns a bead, that bead IS your task — run `bd -C "$_FOUND_STORE" show <id>`
+     and read its embedded comment: it contains `REFINO QUALITY GATE`, the story's refined
      fields (the Definition of Refined rubric: F1–F8), and the EXACT `bd` commands to
-     submit your verdict. Use that bead's ID.
+     submit your verdict (those commands already target the correct store). Use that bead's ID.
    - **(fast-path) a nudge message** containing `REFINO QUALITY GATE` with the same
      content. Either source is sufficient; whichever you see first, act on it.
 2. **If neither is present yet, run `sleep 15` (as a real Bash tool call) and

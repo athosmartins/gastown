@@ -438,19 +438,19 @@ EVALUATE (PASS only if ALL hold):
 
 RECORD YOUR VERDICT with EXACTLY these commands, then exit:
 
-bd -C "$GC_CITY" label remove "$VERDICT_BEAD_ID" "verdict:pending"
+bd -C "$REFINO_GATE_STORE" label remove "$VERDICT_BEAD_ID" "verdict:pending"
 # If the refinement is good enough for Athos's queue:
-bd -C "$GC_CITY" label add "$VERDICT_BEAD_ID" "verdict:PASS"
-bd -C "$GC_CITY" comment "$VERDICT_BEAD_ID" "VERDICT: PASS
+bd -C "$REFINO_GATE_STORE" label add "$VERDICT_BEAD_ID" "verdict:PASS"
+bd -C "$REFINO_GATE_STORE" comment "$VERDICT_BEAD_ID" "VERDICT: PASS
 Resumo: <1-2 frases do que você checou e por que passa>"
-bd -C "$GC_CITY" close "$VERDICT_BEAD_ID"
+bd -C "$REFINO_GATE_STORE" close "$VERDICT_BEAD_ID"
 
 # If it needs more refinement (bounced back to the refiner):
-# bd -C "$GC_CITY" label add "$VERDICT_BEAD_ID" "verdict:FAIL"
-# bd -C "$GC_CITY" comment "$VERDICT_BEAD_ID" "VERDICT: FAIL
+# bd -C "$REFINO_GATE_STORE" label add "$VERDICT_BEAD_ID" "verdict:FAIL"
+# bd -C "$REFINO_GATE_STORE" comment "$VERDICT_BEAD_ID" "VERDICT: FAIL
 # Problema 1: <o que corrigir, concreto e acionável>
 # Problema 2: <...>"
-# bd -C "$GC_CITY" close "$VERDICT_BEAD_ID"
+# bd -C "$REFINO_GATE_STORE" close "$VERDICT_BEAD_ID"
 
 Do not start other work. Record the verdict and exit.
 TASK
