@@ -99,6 +99,21 @@ REALERT_SEC = 900        # 15min re-alert cadence for escalated beads
 POOL_DEAD_MIN      = int(os.environ.get("IRG_POOL_DEAD_MIN", "3"))
 POOL_DEAD_COOLDOWN = int(os.environ.get("IRG_POOL_DEAD_COOLDOWN_SEC", "1800"))
 
+# ga-hkpwv: bare pool-template assignee names (NOT concrete session names like
+# 'wa-worker-adhoc-<hash>'). A bead in_progress with one of these assignees is
+# a Pilot pool dispatch that never engaged — no Pilot markers (pilot:dispatched /
+# story:in-flight) are required to qualify for the in_progress sweep.
+EPHEMERAL_POOL_ASSIGNEES = frozenset({"wa-worker"})
+
+# ga-hkpwv: minimum stranding window for bare-template pool zombies.
+# Longer than RECLAIM_TTL (25min): no Pilot marker is a weaker signal, and a
+# genuine build (even slow) won't go branchless for 2h.
+POOL_ZOMBIE_TTL = 7200  # 2 hours
+
+# ga-hkpwv: session states that definitively prove a non-working session.
+# Used in pool_has_live_worker() to distinguish dead vs unknown states.
+_POOL_DEAD_STATES = frozenset({"asleep", "drained", "closed"})
+
 STATE_FILE = ".gc/state/inflight-reclaim-guard.json"
 GC_CITY = "/Users/athos/gt/.gascity-gastown-hq"
 
@@ -163,12 +178,27 @@ def emit(msg):
         pass
 
 
+def _has_needs_human_label(labels):
+    """True if labels contain gate:needs-human (exact) OR any gate:needs-human:* variant.
+
+    ga-hkpwv / bead-spec: the Mayor's circuit-breaker uses sub-labels like
+    gate:needs-human:on-device, :routing, :technical. An exact-match check misses
+    these, allowing pool-zombie sweep to re-reclaim a deliberately-parked bead —
+    a safety-critical false reclaim. Prefix check closes the gap.
+    """
+    return any(
+        lbl == "gate:needs-human" or lbl.startswith("gate:needs-human:")
+        for lbl in labels
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pure decision function (unit-testable, zero side effects)
 # ---------------------------------------------------------------------------
 
 def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
-                     reclaim_count, has_needs_human, has_dispatching_marker):
+                     reclaim_count, has_needs_human, has_dispatching_marker,
+                     min_stranding_secs=None):
     """Compute the reclaim action for one stranded in-flight bead.
 
     Args:
@@ -176,12 +206,17 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
         has_recent_branch:       True if any origin branch for bead has commit within TTL
         seconds_stranded:        seconds since first seen as stranded (0.0 if not tracked yet)
         reclaim_count:           current pilot:reclaim-count:N from bead labels (int)
-        has_needs_human:         True if bead carries gate:needs-human label
+        has_needs_human:         True if bead carries gate:needs-human (or :* variant)
         has_dispatching_marker:  True if quality-gate-marker with active gate state exists
+        min_stranding_secs:      minimum continuous stranding before action; defaults to
+                                 RECLAIM_TTL (25min). Pass POOL_ZOMBIE_TTL (2h) for
+                                 bare-template pool-zombie beads (ga-hkpwv).
 
     Returns:
         action in {"reclaim", "escalate", "noop"}
     """
+    if min_stranding_secs is None:
+        min_stranding_secs = RECLAIM_TTL
     # Safety guards: never touch deliberately-parked or in-progress beads
     if has_needs_human:
         return "noop"
@@ -192,7 +227,7 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
     if has_recent_branch:
         return "noop"
     # Bead is stranded — enforce hysteresis (wait for continuous stranding)
-    if seconds_stranded < RECLAIM_TTL:
+    if seconds_stranded < min_stranding_secs:
         return "noop"
     # Stranded past TTL — check thrash cap
     if reclaim_count >= MAX_RECLAIMS:
@@ -367,7 +402,7 @@ def list_inflight_beads():
         return None
 
 
-def is_reclaimable_inprogress_story(labels):
+def is_reclaimable_inprogress_story(labels, assignee=None):
     """Pure predicate: True if an in_progress bead is a Pilot story stranded
     WITHOUT its story:in-flight label (the ga-vw26y blind spot), and is thus a
     candidate for the in_progress sweep.
@@ -378,17 +413,36 @@ def is_reclaimable_inprogress_story(labels):
     stripped). Rejects any bead carrying a terminal/parked label so completed or
     intentionally-held work is never resurrected.
 
+    ga-hkpwv (pool-zombie path): also qualifies when assignee is a bare pool
+    template in EPHEMERAL_POOL_ASSIGNEES (e.g. 'wa-worker'). The Pilot's pool
+    dispatch stamps assignee=<template> but NO pilot:dispatched / story:in-flight —
+    these beads are unambiguously pool dispatches, so requiring a Pilot marker
+    would leave them permanently invisible. The reclaim rails (pool_has_live_worker
+    + POOL_ZOMBIE_TTL + branch check) gate actuation conservatively.
+
     SCOPE-CRITICAL: this is the only thing standing between the in_progress
     sweep and arbitrary in_progress work (crew, gate, dog task beads). Those
-    carry NO Pilot marker → this returns False → they are never actuated on.
+    carry NO Pilot marker AND have no EPHEMERAL_POOL_ASSIGNEES assignee →
+    this returns False → they are never actuated on.
+
+    ga-hkpwv / prefix fix: gate:needs-human:* variants (e.g. :on-device, :routing)
+    are treated identically to the bare gate:needs-human — deliberately parked.
     """
+    is_pool_zombie_candidate = (
+        assignee is not None and assignee in EPHEMERAL_POOL_ASSIGNEES
+    )
     has_marker = (
-        any(lbl in PILOT_STORY_MARKERS for lbl in labels)
+        is_pool_zombie_candidate
+        or any(lbl in PILOT_STORY_MARKERS for lbl in labels)
         or any(lbl.startswith("pilot:reclaim-count:") for lbl in labels)
     )
     if not has_marker:
         return False
-    if any(lbl in TERMINAL_PARKED_LABELS for lbl in labels):
+    # Reject any terminal/parked label (exact OR gate:needs-human:* prefix)
+    if any(
+        lbl in TERMINAL_PARKED_LABELS or lbl.startswith("gate:needs-human:")
+        for lbl in labels
+    ):
         return False
     return True
 
@@ -418,7 +472,8 @@ def list_stranded_inprogress_beads():
         if not isinstance(data, list):
             return None
         return [b for b in data
-                if is_reclaimable_inprogress_story(b.get("labels", []))]
+                if is_reclaimable_inprogress_story(
+                    b.get("labels", []), b.get("assignee"))]
     except Exception:
         return None
 
@@ -659,6 +714,47 @@ def session_is_live(assignee, sessions, now=None, bead_update_age=None):
             # (+ recent bead progress as a secondary signal).
             activity_age = session_activity_age(s, now)
             return session_owner_is_healthy(True, activity_age, bead_update_age)
+    return False
+
+
+def pool_has_live_worker(pool_template, sessions, now=None, bead_update_age=None):
+    """Return True if any session from pool_template is live and working.
+
+    ga-hkpwv: for bare pool-template assignees (e.g. 'wa-worker'), bead.assignee
+    equals the template name, NOT a concrete session name like 'wa-worker-adhoc-<hash>'.
+    The existing session_is_live() matches assignee against session identifiers
+    (id, name, session_name, alias, agent_name) — none of which equals the bare
+    template — so it always returns False for bare-template beads even when the
+    pool is actively building. This function uses session.template to detect live
+    pool workers instead.
+
+    Conservative (aligns with ga-64usm):
+    - Missing/unparseable last_active → treated alive (session_owner_is_healthy).
+    - Unknown/unrecognized state (not in _POOL_DEAD_STATES, not in LIVE_STATES) →
+      treated alive (return True immediately). Never reclaim on unclear state.
+    - Only _POOL_DEAD_STATES = {asleep, drained, closed} are definitively dead.
+
+    CORRECTNESS-CRITICAL: overly conservative — ANY active session from the pool
+    (even if building a different bead) blocks ALL bare-template reclaims from
+    that pool. Belt-and-suspenders: POOL_ZOMBIE_TTL (2h) ensures no live build
+    is false-reclaimed even if the pool-worker→bead mapping is imperfect.
+    """
+    if now is None:
+        now = time.time()
+    for s in sessions:
+        if s.get("template", "") != pool_template:
+            continue
+        state = s.get("state", "").lower()
+        if state in _POOL_DEAD_STATES:
+            continue  # definitively dead/sleeping — skip
+        if state in LIVE_STATES:
+            # Active/awake — apply ga-64usm staleness check
+            activity_age = session_activity_age(s, now)
+            if session_owner_is_healthy(True, activity_age, bead_update_age):
+                return True
+            continue  # stale active (frozen zombie) — check remaining sessions
+        # Unknown/unrecognized/missing state — conservative: treat pool as alive
+        return True
     return False
 
 
@@ -975,7 +1071,9 @@ def run_cycle(state, escalated_alerted):
         title = bead.get("title", "")[:60]
 
         # --- Safety flags ---
-        has_needs_human      = "gate:needs-human" in labels
+        # ga-hkpwv: catch gate:needs-human:* prefix variants (e.g. :on-device, :routing)
+        # in addition to the bare gate:needs-human — all are deliberately-parked beads.
+        has_needs_human      = _has_needs_human_label(labels)
         has_dispatching_marker = bead_id in gate_active_beads
         # Owner deliberately SUSPENDED → the bead is parked, not stranded. Holds (waits
         # for the crew to resume) instead of re-pooling — the wa-wbub / digo-wa churn.
@@ -985,7 +1083,14 @@ def run_cycle(state, escalated_alerted):
         # touching the bead (workers should bd-update during long work).
         bead_update_epoch = parse_iso_epoch(bead.get("updated_at", ""))
         bead_update_age = (now - bead_update_epoch) if bead_update_epoch is not None else None
-        has_live_session     = session_is_live(assignee, sessions, now, bead_update_age)
+        # ga-hkpwv: bare pool-template assignees (e.g. 'wa-worker') never match any
+        # concrete session identifier — session_is_live() always returns False for them.
+        # Use pool_has_live_worker() instead, which matches via session.template.
+        is_pool_zombie_bead = assignee in EPHEMERAL_POOL_ASSIGNEES
+        if is_pool_zombie_bead:
+            has_live_session = pool_has_live_worker(assignee, sessions, now, bead_update_age)
+        else:
+            has_live_session = session_is_live(assignee, sessions, now, bead_update_age)
 
         # Branch check is potentially slow (git fetch); only run when needed
         has_recent_branch = False
@@ -1029,6 +1134,11 @@ def run_cycle(state, escalated_alerted):
 
         reclaim_count = parse_reclaim_count(labels)
 
+        # ga-hkpwv: pool-zombie beads use POOL_ZOMBIE_TTL (2h) instead of the
+        # standard RECLAIM_TTL (25min) — a longer window compensates for the
+        # weaker signal (no Pilot marker) and prevents false reclaims.
+        min_stranding_secs = POOL_ZOMBIE_TTL if is_pool_zombie_bead else RECLAIM_TTL
+
         # --- Pure decision ---
         action = reclaim_decision(
             has_live_session=has_live_session,
@@ -1037,6 +1147,7 @@ def run_cycle(state, escalated_alerted):
             reclaim_count=reclaim_count,
             has_needs_human=has_needs_human,
             has_dispatching_marker=has_dispatching_marker,
+            min_stranding_secs=min_stranding_secs,
         )
 
         idle_min = seconds_stranded / 60.0
@@ -1044,12 +1155,15 @@ def run_cycle(state, escalated_alerted):
         # Bucket zombie beads by pool for pool-dead detection (ga-dbibq).
         # "Zombie" = would-reclaim or would-escalate: no live session, no recent
         # branch, stranded past TTL. Per-bead actuation follows in Pass 2.
+        # ga-hkpwv: pool-zombie beads feed into this bucket automatically since
+        # _pool_of("wa-worker") == "wa-worker".
         if action in ("reclaim", "escalate"):
             pool = _pool_of(assignee)
             if pool:
                 pool_zombies.setdefault(pool, []).append(bead_id)
 
-        classified.append((bead_id, title, labels, action, idle_min, reclaim_count))
+        # Include assignee in classified tuple for Pass 2 escalation mail (ga-hkpwv)
+        classified.append((bead_id, title, labels, assignee, action, idle_min, reclaim_count))
 
     # --- Pool-dead alert (BEFORE per-bead actuation, ga-dbibq) ---
     # Emits [POOL-DEAD] Mayor mail when >= POOL_DEAD_MIN beads from the same pool
@@ -1057,7 +1171,7 @@ def run_cycle(state, escalated_alerted):
     _check_pool_dead(pool_zombies, now)
 
     # --- Pass 2: per-bead actuation (logic unchanged from prior single-pass) ---
-    for bead_id, title, labels, action, idle_min, reclaim_count in classified:
+    for bead_id, title, labels, assignee, action, idle_min, reclaim_count in classified:
         if action == "reclaim":
             ok = do_reclaim(bead_id, title, reclaim_count, idle_min, labels)
             status = "RECLAIMED" if ok else "RECLAIM-FAILED"
@@ -1080,6 +1194,21 @@ def run_cycle(state, escalated_alerted):
                     f"needs human/Mayor intervention title={title!r}"
                 )
                 _irg_ledger("human-touch", {"ts": _irg_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "source_daemon": "inflight-reclaim-guard", "stage": "executa", "kind": "technical", "bead_id": bead_id, "reason": f"Reclaim cap exhausted ({reclaim_count}x) — needs human intervention"}, fail_open=True)
+                # ga-hkpwv: pool-zombie escalation also mails Mayor directly
+                # (POOL-DEAD handles pool-level alerts; this covers single-bead cap exhaustion)
+                if assignee in EPHEMERAL_POOL_ASSIGNEES:
+                    try:
+                        subprocess.run(
+                            ["gc", "mail", "send", "mayor",
+                             "-s", f"[POOL-ZOMBIE-ESCALATED] {assignee}: bead {bead_id} reclaimed {reclaim_count}x",
+                             "-m", (f"Pool-zombie bead {bead_id!r} ({title!r}) exhausted reclaim cap "
+                                    f"({reclaim_count}/{MAX_RECLAIMS}) with assignee={assignee!r}, "
+                                    f"no branch, no active pool session. Marked gate:needs-human. "
+                                    f"Needs human investigation + re-queue.")],
+                            timeout=20, capture_output=True)
+                    except Exception as _exc:
+                        print(f"[INFLIGHT-RECLAIM] warn: pool-zombie escalation mail ({bead_id}): {_exc}",
+                              flush=True)
                 escalated_alerted[bead_id] = now
             # Bead now carries gate:needs-human → next cycle's has_needs_human
             # rail returns "noop". It stays in the in-flight query but parks
@@ -1266,6 +1395,143 @@ def _selftest():
             STATE_FILE = _orig_state
     finally:
         _shutil.rmtree(_tmpdir, ignore_errors=True)
+
+    # -----------------------------------------------------------------------
+    # Section 3: ga-hkpwv pool-zombie reclaim scenarios (pure-function tests)
+    # Tests is_reclaimable_inprogress_story(), pool_has_live_worker(),
+    # reclaim_decision(), and _has_needs_human_label(). No bd/gc/git calls.
+    # -----------------------------------------------------------------------
+
+    T_pz = 1_782_500_000.0  # fixed epoch for determinism
+
+    # --- PZ-1: bare pool-template assignee qualifies WITHOUT Pilot markers ---
+    check("PZ-1a: bare wa-worker assignee qualifies without Pilot markers",
+          is_reclaimable_inprogress_story([], assignee="wa-worker"))
+    check("PZ-1b: non-pool assignee without markers → False (scope unchanged)",
+          not is_reclaimable_inprogress_story([], assignee="oracle-wa"))
+    check("PZ-1c: no assignee, no markers → False",
+          not is_reclaimable_inprogress_story([], assignee=None))
+
+    # --- PZ-2: gate:needs-human / prefix variants block pool-zombie reclaim ---
+    check("PZ-2a: wa-worker + gate:needs-human (exact) → False (parked)",
+          not is_reclaimable_inprogress_story(["gate:needs-human"], assignee="wa-worker"))
+    check("PZ-2b: wa-worker + gate:needs-human:on-device → False (prefix variant)",
+          not is_reclaimable_inprogress_story(["gate:needs-human:on-device"], assignee="wa-worker"))
+    check("PZ-2c: wa-worker + gate:needs-human:routing → False (prefix variant)",
+          not is_reclaimable_inprogress_story(["gate:needs-human:routing"], assignee="wa-worker"))
+    check("PZ-2d: _has_needs_human_label exact match",
+          _has_needs_human_label(["gate:needs-human"]))
+    check("PZ-2e: _has_needs_human_label prefix variant",
+          _has_needs_human_label(["gate:needs-human:technical"]))
+    check("PZ-2f: _has_needs_human_label absent → False",
+          not _has_needs_human_label(["story:in-flight", "pilot:dispatched"]))
+
+    # --- PZ-3: pool_has_live_worker — asleep/drained sessions → pool dead ---
+    _asleep_sessions = [
+        {"template": "wa-worker", "session_name": "wa-worker-adhoc-aaa",
+         "agent_name": "wa-worker-adhoc-aaa", "state": "asleep",
+         "id": "sid-s1", "name": "wa-worker-adhoc-1", "alias": "",
+         "last_active": "0001-01-01T00:00:00Z"},
+        {"template": "wa-worker", "session_name": "wa-worker-adhoc-bbb",
+         "agent_name": "wa-worker-adhoc-bbb", "state": "drained",
+         "id": "sid-s2", "name": "wa-worker-adhoc-2", "alias": "",
+         "last_active": "0001-01-01T00:00:00Z"},
+    ]
+    check("PZ-3a: pool_has_live_worker: all asleep → False (reclaim eligible)",
+          not pool_has_live_worker("wa-worker", _asleep_sessions, T_pz))
+    check("PZ-3b: pool_has_live_worker: drained included → False",
+          not pool_has_live_worker("wa-worker",
+              [_asleep_sessions[1]], T_pz))
+
+    # --- PZ-4: pool_has_live_worker — active session with recent last_active → True ---
+    _active_fresh_ts = _irg_datetime.datetime.utcfromtimestamp(
+        T_pz - 60).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _active_sessions = [
+        {"template": "wa-worker", "session_name": "wa-worker-adhoc-ccc",
+         "agent_name": "wa-worker-adhoc-ccc", "state": "active",
+         "id": "sid-a1", "name": "wa-worker-adhoc-3", "alias": "",
+         "last_active": _active_fresh_ts},
+    ]
+    check("PZ-4: pool_has_live_worker: active + fresh last_active → True (NOT reclaimed)",
+          pool_has_live_worker("wa-worker", _active_sessions, T_pz))
+
+    # --- PZ-5: pool_has_live_worker — unparseable last_active → conservative → True ---
+    _active_bad_ts_sessions = [
+        {"template": "wa-worker", "session_name": "wa-worker-adhoc-ddd",
+         "agent_name": "wa-worker-adhoc-ddd", "state": "active",
+         "id": "sid-b1", "name": "wa-worker-adhoc-4", "alias": "",
+         "last_active": "not-a-timestamp"},
+    ]
+    check("PZ-5: pool_has_live_worker: active + unparseable last_active → True (conservative)",
+          pool_has_live_worker("wa-worker", _active_bad_ts_sessions, T_pz))
+
+    # --- PZ-5b: pool_has_live_worker — unknown session state → conservative → True ---
+    _unknown_state_sessions = [
+        {"template": "wa-worker", "session_name": "wa-worker-adhoc-eee",
+         "agent_name": "wa-worker-adhoc-eee", "state": "unknown_state",
+         "id": "sid-c1", "name": "wa-worker-adhoc-5", "alias": "",
+         "last_active": "0001-01-01T00:00:00Z"},
+    ]
+    check("PZ-5b: pool_has_live_worker: unknown state → True (conservative, NOT reclaimed)",
+          pool_has_live_worker("wa-worker", _unknown_state_sessions, T_pz))
+
+    # --- PZ-6: reclaim_decision with POOL_ZOMBIE_TTL, stranded 2h+ → reclaim ---
+    check("PZ-6a: reclaim_decision: pool zombie, stranded>POOL_ZOMBIE_TTL → reclaim",
+          reclaim_decision(
+              has_live_session=False, has_recent_branch=False,
+              seconds_stranded=POOL_ZOMBIE_TTL + 1, reclaim_count=0,
+              has_needs_human=False, has_dispatching_marker=False,
+              min_stranding_secs=POOL_ZOMBIE_TTL,
+          ) == "reclaim")
+    check("PZ-6b: reclaim_decision: pool zombie, stranded<POOL_ZOMBIE_TTL → noop (still waiting)",
+          reclaim_decision(
+              has_live_session=False, has_recent_branch=False,
+              seconds_stranded=POOL_ZOMBIE_TTL - 1, reclaim_count=0,
+              has_needs_human=False, has_dispatching_marker=False,
+              min_stranding_secs=POOL_ZOMBIE_TTL,
+          ) == "noop")
+
+    # --- PZ-7: has_recent_branch → noop (safety rail, even for pool zombies) ---
+    check("PZ-7: reclaim_decision: branch exists → noop (branch safety rail holds)",
+          reclaim_decision(
+              has_live_session=False, has_recent_branch=True,
+              seconds_stranded=POOL_ZOMBIE_TTL + 1, reclaim_count=0,
+              has_needs_human=False, has_dispatching_marker=False,
+              min_stranding_secs=POOL_ZOMBIE_TTL,
+          ) == "noop")
+
+    # --- PZ-8: has_live_session → noop (live pool worker blocks reclaim) ---
+    check("PZ-8: reclaim_decision: live session → noop (live pool worker safety rail)",
+          reclaim_decision(
+              has_live_session=True, has_recent_branch=False,
+              seconds_stranded=POOL_ZOMBIE_TTL + 1, reclaim_count=0,
+              has_needs_human=False, has_dispatching_marker=False,
+              min_stranding_secs=POOL_ZOMBIE_TTL,
+          ) == "noop")
+
+    # --- PZ-9: 3 thrashes → escalate (no 4th reclaim) ---
+    check("PZ-9: reclaim_decision: reclaim_count=MAX_RECLAIMS(3) → escalate",
+          reclaim_decision(
+              has_live_session=False, has_recent_branch=False,
+              seconds_stranded=POOL_ZOMBIE_TTL + 1, reclaim_count=MAX_RECLAIMS,
+              has_needs_human=False, has_dispatching_marker=False,
+              min_stranding_secs=POOL_ZOMBIE_TTL,
+          ) == "escalate")
+    check("PZ-9b: reclaim_decision: reclaim_count=2 (< MAX_RECLAIMS) → reclaim not yet escalate",
+          reclaim_decision(
+              has_live_session=False, has_recent_branch=False,
+              seconds_stranded=POOL_ZOMBIE_TTL + 1, reclaim_count=MAX_RECLAIMS - 1,
+              has_needs_human=False, has_dispatching_marker=False,
+              min_stranding_secs=POOL_ZOMBIE_TTL,
+          ) == "reclaim")
+
+    # --- PZ-10: non-wa-worker pool not affected ---
+    check("PZ-10: pool_has_live_worker: no matching template → False (empty pool)",
+          not pool_has_live_worker("wa-worker",
+              [{"template": "oracle-wa", "state": "active", "id": "x",
+                "name": "x", "session_name": "x", "alias": "", "agent_name": "x",
+                "last_active": _active_fresh_ts}],
+              T_pz))
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0
