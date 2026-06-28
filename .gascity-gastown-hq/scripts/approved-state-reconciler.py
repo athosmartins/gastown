@@ -21,13 +21,15 @@ non-buildable signal. Ambiguous content → stays approved + ALARMS if starving.
 NEVER route out a bead lacking an explicit signal — hiding real work is the one outcome
 worse than the status quo.
 
-ROUTING SIGNALS (explicit only):
-  • needs-device: label story:needs-device, OR title/AC matches on-device patterns
-    (on-device, aquecimento, warming, UIAutomator, screencap, tela do, celular, DPR foreground)
-  • needs-human: label gate:needs-human* (prefix) or story:needs-human
-  • blocked: label blocked/story:blocked OR wording bloqueado por / quando o datastore /
-    aguardando <serviço>
-  • post-build: label gate:passed → remove story:approved only (delivery owns it)
+ROUTING SIGNALS (explicit LABELS only — keywords NEVER trigger routing):
+  • needs-device: label story:needs-device ONLY.
+  • needs-human: label gate:needs-human* (prefix) or story:needs-human ONLY.
+  • blocked: label blocked/story:blocked ONLY.
+  • post-build: label gate:passed → remove story:approved only (delivery owns it).
+  Keywords (warming, aquecimento, celular, etc.) trigger a LOW-PRIORITY FLAG only
+  (ledger note + comment); the bead stays story:approved until a human/refino adds the
+  explicit label. This prevents buildable beads like "Consolidar painel warming
+  (/aquecimento)" — a frontend dashboard — from being hidden (wa-yez60 regression).
 
 SAFETY:
   • DRY_RUN (APPROVED_RECONCILER_DRY_RUN=1): log intended actions, mutate nothing.
@@ -154,10 +156,12 @@ def _load_state():
             if isinstance(d, dict):
                 d.setdefault("routed", {})
                 d.setdefault("alarmed", {})
+                d.setdefault("first_seen_approved", {})
+                d.setdefault("flagged", {})
                 return d
     except Exception:
         pass
-    return {"routed": {}, "alarmed": {}}
+    return {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
 
 
 def _save_state(state):
@@ -169,6 +173,22 @@ def _save_state(state):
         _log("WARN: failed to save state: %r" % e)
 
 
+def _prune_state(state, now):
+    """Prune state entries older than 7 days to prevent unbounded growth.
+
+    Pruning is conservative: a stale entry that survives at worst suppresses one
+    cooldown re-trigger — not a safety issue. Better than unbounded memory growth.
+    """
+    cutoff = now - 7 * 24 * 3600
+    for key in ("routed", "alarmed", "first_seen_approved", "flagged"):
+        bucket = state.get(key, {})
+        stale = [bid for bid, ts in bucket.items() if ts < cutoff]
+        for bid in stale:
+            del bucket[bid]
+        if stale:
+            _log("  pruned %d stale %s entries" % (len(stale), key))
+
+
 # ── bd JSON parse ─────────────────────────────────────────────────────────────
 def _parse_bd_json(raw):
     """Parse bd --json output (array or {issues:[]} envelope). Returns [] on any failure."""
@@ -177,6 +197,8 @@ def _parse_bd_json(raw):
     try:
         d = json.loads(raw)
     except json.JSONDecodeError as e:
+        _log("WARN: _parse_bd_json: partial JSON at pos=%d — truncating; "
+             "dropped beads stay story:approved (safe) but investigate bd output" % e.pos)
         try:
             d = json.loads(raw[:e.pos])
         except Exception:
@@ -232,18 +254,19 @@ def _bead_age_min(bead, now):
     return 0.0
 
 
-# ── classification — explicit non-buildable signals only ─────────────────────
+# ── classification — explicit LABELS only, no keyword routing ────────────────
 def _classify(bead):
-    """Return (route_to, signal) or (None, None) if NO explicit non-buildable signal.
+    """Return (route_to, signal) or (None, None) if NO explicit label-based signal.
 
     route_to: one of 'needs-device', 'needs-human', 'blocked', 'post-build', or None.
     signal: human-readable string naming the exact signal that triggered the route.
 
-    SAFETY: this function returns (None, None) when no EXPLICIT signal is found.
-    A bead with ambiguous or unrecognized content is NEVER classified non-buildable here.
+    §4 HARD RAIL: ONLY explicit LABELS trigger routing. Keywords in title/body are NOT
+    sufficient — they appear in buildable code beads (e.g., "Consolidar painel warming
+    (/aquecimento)" is a frontend dashboard, not an on-device bead — wa-yez60 regression).
+    Keyword detection is handled separately by _keyword_flags() for FLAG EMISSION ONLY.
     """
     labels = _get_labels(bead)
-    text = _bead_text(bead)
 
     # 1. post-build: gate:passed — the bead already built; delivery owns next state.
     if _has_prefix(labels, "gate:passed"):
@@ -252,32 +275,48 @@ def _classify(bead):
                 return "post-build", "label %s" % lab
         return "post-build", "gate:passed label present"
 
-    # 2. needs-device: label OR title/AC pattern (explicit on-device signal).
+    # 2. needs-device: LABEL ONLY.
     if "story:needs-device" in labels:
         return "needs-device", "label story:needs-device"
-    for pat in _ONDEVICE_PATS:
-        m = pat.search(text)
-        if m:
-            return "needs-device", "on-device pattern %r in title/AC" % m.group(0)
 
-    # 3. needs-human: gate:needs-human* (prefix) OR story:needs-human.
+    # 3. needs-human: gate:needs-human* (prefix) OR story:needs-human LABEL ONLY.
     if "story:needs-human" in labels:
         return "needs-human", "label story:needs-human"
     for lab in labels:
         if lab.startswith("gate:needs-human"):
             return "needs-human", "label %s" % lab
 
-    # 4. blocked: label OR explicit external-dependency wording.
+    # 4. blocked: LABEL ONLY (blocked or story:blocked).
     for lab in ("blocked", "story:blocked"):
         if lab in labels:
             return "blocked", "label %s" % lab
+
+    # No explicit label signal → caller assumes buildable (SAFE DEFAULT).
+    # Keywords are checked by _keyword_flags() for low-priority flag emission only.
+    return None, None
+
+
+def _keyword_flags(bead):
+    """Detect on-device/blocked KEYWORDS in bead text — for FLAG EMISSION ONLY.
+
+    Returns list of (category, keyword_match) tuples.
+    NEVER used for routing. Used to emit a low-priority human-review flag when a bead
+    has keyword signals but no explicit routing label, so a human/refino can confirm
+    and add the real label before the reconciler acts.
+    """
+    text = _bead_text(bead)
+    flags = []
+    for pat in _ONDEVICE_PATS:
+        m = pat.search(text)
+        if m:
+            flags.append(("on-device", m.group(0)))
+            break  # one flag per category is sufficient
     for pat in _BLOCKED_PATS:
         m = pat.search(text)
         if m:
-            return "blocked", "blocked wording %r in title/AC" % m.group(0)
-
-    # No explicit signal found → caller assumes buildable (SAFE DEFAULT).
-    return None, None
+            flags.append(("blocked", m.group(0)))
+            break
+    return flags
 
 
 # ── pilot liveness ────────────────────────────────────────────────────────────
@@ -398,6 +437,23 @@ def _write_flow_authority(now, dimension):
         _log("WARN: failed to write flow-authority marker: %s" % e)
 
 
+# ── pool capacity check ───────────────────────────────────────────────────────
+def _pool_has_capacity(rig_root, now):
+    """Check if the target builder pool for rig_root has at least one free slot.
+
+    Returns (has_capacity, note):
+    - (True, note): pool has capacity OR capacity cannot be determined (conservative alarm).
+    - (False, note): pool definitively saturated; bead legitimately queued (no alarm).
+
+    Per spec §4: unknown capacity → alarm conservatively (True return), logging the gap.
+    Silently swallowing a starve alarm is worse than a checkable false-positive alarm.
+
+    v1: capacity detection not yet implemented (requires pilot log slot parsing or a
+    pool-status API). Always returns (True, "unknown — conservative alarm").
+    """
+    return True, "capacity unknown — conservative alarm (pool slot detection not yet implemented)"
+
+
 # ── route a bead out of story:approved ───────────────────────────────────────
 def _route_bead(rig_root, bead, route_to, signal, now, state):
     """Route bead out of story:approved into its true state.
@@ -437,8 +493,15 @@ def _route_bead(rig_root, bead, route_to, signal, now, state):
         new_label = "story:" + route_to
         comment = ("approved-state-reconciler: routed story:approved → %s "
                    "— explicit signal: %s" % (new_label, signal))
+        # IMPORTANT 3 (add-before-remove): add new label FIRST; only if that succeeds,
+        # remove story:approved. Prevents orphan-limbo (bead with no lifecycle label)
+        # if bd fails mid-sequence. If add fails: log, skip remove, skip cooldown → retry.
+        add_ok = _do_label_add(rig_root, bead_id, new_label)
+        if not add_ok:
+            _log("  WARN: label add %s on %s FAILED — NOT removing story:approved; "
+                 "skipping cooldown so next cycle retries" % (new_label, bead_id))
+            return False  # not counted as routed; no cooldown set
         _do_label_remove(rig_root, bead_id, "story:approved")
-        _do_label_add(rig_root, bead_id, new_label)
         _do_comment_add(rig_root, bead_id, comment)
 
     # Emit human-touch ledger entry.
@@ -461,6 +524,8 @@ def _route_bead(rig_root, bead, route_to, signal, now, state):
         _sh([NOTIFY_BIN, "-t", "Reconciler route", "-p", "2", msg], timeout=10)
 
     state.setdefault("routed", {})[bead_id] = now
+    # Clear daemon starve-age so it resets if bead ever returns to story:approved.
+    state.setdefault("first_seen_approved", {}).pop(bead_id, None)
     return True
 
 
@@ -577,7 +642,7 @@ def _process_store(rig_root, now, state, pilot_alive):
         bead_id = bead.get("id") or bead.get("issue_id") or "?"
         labels = _get_labels(bead)
 
-        # ── Step 1: explicit non-buildable signal → route out ──────────────
+        # ── Step 1: explicit label-based signal → route out ────────────────
         route_to, signal = _classify(bead)
 
         if route_to is not None:
@@ -585,6 +650,37 @@ def _process_store(rig_root, now, state, pilot_alive):
             if ok:
                 routed += 1
             continue  # classification done regardless of DRY_RUN/cooldown
+
+        # ── Step 1b: keyword flag (no routing label) — flag only, NEVER route ─
+        # §4 HARD RAIL: if _classify returned (None,None) but keywords match,
+        # emit a low-priority flag so a human/refino can add the real label.
+        # The bead STAYS story:approved. This is the wa-yez60 regression fix.
+        kw_flags = _keyword_flags(bead)
+        if kw_flags:
+            last_flagged = state.get("flagged", {}).get(bead_id, 0.0)
+            if now - last_flagged >= ALARM_COOLDOWN_SEC:
+                for cat, kw in kw_flags:
+                    _log("  %s: keyword flag [%s] %r — no routing label; "
+                         "bead stays approved, flag emitted for human review" % (
+                         bead_id, cat, kw))
+                if not DRY_RUN:
+                    flag_note = (
+                        "approved-state-reconciler: bead parece %s (keyword %r) mas sem "
+                        "label explícito. Um humano/refino deve confirmar e adicionar o label "
+                        "correto. Bead permanece story:approved." % (
+                        kw_flags[0][0], kw_flags[0][1]))
+                    _do_comment_add(rig_root, bead_id, flag_note)
+                    _arc_ledger("flow-ledger", {
+                        "ts": datetime.datetime.now(
+                            datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "source_daemon": "approved-state-reconciler",
+                        "stage": "keyword-flag",
+                        "bead_id": bead_id,
+                        "flags": [{"cat": c, "kw": k} for c, k in kw_flags],
+                        "note": "keyword match without routing label — flag emitted, "
+                                "bead stays approved",
+                    }, fail_open=True)
+                    state.setdefault("flagged", {})[bead_id] = now
 
         # ── Step 2: no explicit signal → assumed buildable ─────────────────
         # Safety: we NEVER route here. Only flow-or-alarm.
@@ -608,27 +704,47 @@ def _process_store(rig_root, now, state, pilot_alive):
             _log("  %s: flowing (story:in-flight / pilot:dispatched / assignee) — OK" % bead_id)
             continue
 
-        # Grace window: too fresh to alarm.
-        age_min = _bead_age_min(bead, now)
-        if age_min < STARVE_MIN:
-            _log("  %s: no signal, not flowing, age=%.1fmin < STARVE_MIN=%d — grace" % (
-                 bead_id, age_min, STARVE_MIN))
+        # IMPORTANT 2: track approved-age in daemon state, not updated_at.
+        # updated_at resets on any label-touch or comment, which would suppress the starve
+        # alarm for beads that have been quietly stuck for hours. We track the FIRST cycle
+        # the daemon sees the bead as story:approved-and-not-flowing, and compute starve-age
+        # from that. The entry is cleared when the bead is successfully routed.
+        fsa = state.setdefault("first_seen_approved", {})
+        if bead_id not in fsa:
+            fsa[bead_id] = now
+        starve_age_min = (now - fsa[bead_id]) / 60.0
+
+        # Grace window: too fresh (daemon-side) to alarm.
+        if starve_age_min < STARVE_MIN:
+            _log("  %s: no signal, not flowing, first-seen-approved=%.1fmin "
+                 "< STARVE_MIN=%d — grace" % (bead_id, starve_age_min, STARVE_MIN))
             continue
 
         # pilot:held-until — pilot explicitly parked this bead.
         if _has_prefix(labels, "pilot:held-until"):
-            _log("  %s: no signal, age=%.0fmin, pilot:held-until — no alarm" % (
-                 bead_id, age_min))
+            _log("  %s: no signal, daemon-age=%.0fmin, pilot:held-until — no alarm" % (
+                 bead_id, starve_age_min))
             continue
 
         # Pilot dead → can't blame dispatch; don't alarm.
         if not pilot_alive:
-            _log("  %s: no signal, age=%.0fmin, starving BUT pilot dead — no alarm" % (
-                 bead_id, age_min))
+            _log("  %s: no signal, daemon-age=%.0fmin, starving BUT pilot dead — no alarm" % (
+                 bead_id, starve_age_min))
             continue
 
-        # ALARM: buildable bead starving, pilot alive, dispatch path failing.
-        _alarm_starving(rig_root, bead, age_min, now, state)
+        # IMPORTANT 1: capacity check — only alarm if builder pool has free slots.
+        # A saturated pool means the bead is legitimately queued behind active work.
+        has_cap, cap_note = _pool_has_capacity(rig_root, now)
+        if not has_cap:
+            _log("  %s: starving but pool SATURATED — skip alarm "
+                 "(bead legitimately queued; %s)" % (bead_id, cap_note))
+            continue
+        if "unknown" in cap_note:
+            _log("  %s: pool capacity unknown — alarming conservatively (%s)" % (
+                 bead_id, cap_note))
+
+        # ALARM: buildable bead starving, pilot alive, pool has capacity, dispatch failing.
+        _alarm_starving(rig_root, bead, starve_age_min, now, state)
         alarmed += 1
 
     return processed, routed, alarmed
@@ -641,6 +757,7 @@ def run_cycle(now, state):
          datetime.datetime.fromtimestamp(now, tz=datetime.timezone.utc).strftime(
              "%Y-%m-%d %H:%M:%SZ"))
 
+    _prune_state(state, now)
     pilot_alive = _is_pilot_alive(now)
     _log("pilot alive: %s (window=%dmin)" % (pilot_alive, PILOT_ALIVE_WINDOW_MIN))
 
@@ -691,19 +808,22 @@ def _selftest():
     """Hermetic selftest — stubs all I/O via module globals. sys.exit(1) if any fail.
 
     Scenarios:
-      (a) on-device-labeled → routed to needs-device
-      (b) on-device by TITLE keyword (no label) → routed
-      (c) needs-human label → routed
-      (d) blocked wording in title → routed
-      (e) gate:passed → story:approved removed, no new state label added
-      (f) NO signal + in-flight label → no action
-      (g) NO signal + age>STARVE_MIN + pilot alive → ALARM (gc mail send mayor)
-      (h) NO signal + age>STARVE_MIN + pilot DEAD → no alarm
-      (i) mayor-assigned + starving → ledger note only, NO alarm
-      (j) NO explicit signal + ambiguous content → NEVER routed (safety)
-      (k) DRY_RUN=1 → zero label/comment/mail mutations
-      (l) idempotency — already-routed bead no longer has story:approved → no-op
-      (m) per-store bd error → that store skipped, others processed, no crash
+      (a)       on-device-labeled → routed to needs-device
+      (b)       on-device by TITLE keyword (no label) → NOT routed + flag emitted [INVERTED]
+      (wa-yez60) buildable bead "Consolidar painel warming (/aquecimento)" → NEVER routed
+      (c)       needs-human label → routed
+      (d)       story:blocked label → routed (label-based, not keyword)
+      (e)       gate:passed → story:approved removed, no new state label added
+      (f)       NO signal + in-flight label → no action
+      (g)       NO signal + daemon-age>STARVE_MIN + pilot alive → ALARM
+      (h)       NO signal + daemon-age>STARVE_MIN + pilot DEAD → no alarm
+      (i)       mayor-assigned + starving → ledger note only, NO alarm
+      (j)       NO explicit signal + ambiguous content → NEVER routed (safety)
+      (k)       DRY_RUN=1 → zero label/comment/mail mutations
+      (l)       idempotency — already-routed bead no longer has story:approved → no-op
+      (m)       per-store bd error → that store skipped, others processed, no crash
+      (n)       add-before-remove: label add fails → story:approved NOT removed
+      (o)       first_seen_approved: starve alarm fires despite fresh updated_at
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines
@@ -796,7 +916,15 @@ def _selftest():
         comments.clear()
         mail_calls.clear()
         notify_calls.clear()
-        return {"routed": {}, "alarmed": {}}
+        return {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+
+    def _reset_captures():
+        """Clear capture lists only — preserves state dict (for multi-cycle tests)."""
+        label_adds.clear()
+        label_removes.clear()
+        comments.clear()
+        mail_calls.clear()
+        notify_calls.clear()
 
     globals()["DRY_RUN"] = False
 
@@ -816,17 +944,38 @@ def _selftest():
     else:
         _bad("(a)", "removes=%s adds=%s" % (label_removes, label_adds))
 
-    # ── (b) on-device by TITLE keyword (no label) → routed ───────────────────
-    print("\nScenario (b): on-device title keyword (no label) → needs-device route")
+    # ── (b) on-device title keyword + NO label → NOT routed + flag emitted ──────
+    # §4 HARD RAIL: keywords alone must NEVER route (INVERTED from original scenario).
+    print("\nScenario (b): on-device title keyword (no label) → NOT routed + flag emitted")
     _bd_approved = lambda root: [
         _make_bead("hq-002", title="feat: warming chip via UIAutomator")]
     st = _reset()
     run_cycle(NOW, st)
-    if ("hq-002", "story:approved") in label_removes and \
-       ("hq-002", "story:needs-device") in label_adds:
-        _ok("(b): on-device title keyword → routed to story:needs-device")
+    not_removed_b = ("hq-002", "story:approved") not in label_removes
+    not_added_device_b = ("hq-002", "story:needs-device") not in label_adds
+    flag_comment_b = any(bid == "hq-002" for bid, _ in comments)
+    if not_removed_b and not_added_device_b and flag_comment_b:
+        _ok("(b): keyword-in-title + no label → NOT routed; story:approved kept; flag emitted")
     else:
-        _bad("(b)", "removes=%s adds=%s" % (label_removes, label_adds))
+        _bad("(b): SAFETY VIOLATION — keyword alone should not route bead",
+             "not_removed=%s not_added=%s flag_comment=%s removes=%s adds=%s" % (
+             not_removed_b, not_added_device_b, flag_comment_b,
+             label_removes, label_adds))
+
+    # ── (wa-yez60 regression) buildable bead with keywords → NEVER routed ──────
+    print("\nScenario (wa-yez60): 'Consolidar painel warming (/aquecimento)' + no label → NOT routed")
+    _bd_approved = lambda root: [
+        _make_bead("wa-yez60", title="Consolidar painel warming (/aquecimento)",
+                   labels=["story:approved"])]
+    st = _reset()
+    run_cycle(NOW, st)
+    not_removed_waz = ("wa-yez60", "story:approved") not in label_removes
+    not_added_waz = ("wa-yez60", "story:needs-device") not in label_adds
+    if not_removed_waz and not_added_waz:
+        _ok("(wa-yez60): keyword-in-title buildable bead → NOT routed (regression guard)")
+    else:
+        _bad("(wa-yez60): REGRESSION — wa-yez60 bead was hidden by keyword route!",
+             "removes=%s adds=%s" % (label_removes, label_adds))
 
     # ── (c) needs-human label → routed ───────────────────────────────────────
     print("\nScenario (c): gate:needs-human:product label → needs-human route")
@@ -840,15 +989,16 @@ def _selftest():
     else:
         _bad("(c)", "removes=%s adds=%s" % (label_removes, label_adds))
 
-    # ── (d) blocked wording → routed ─────────────────────────────────────────
-    print("\nScenario (d): blocked wording in title → blocked route")
+    # ── (d) story:blocked label → routed ─────────────────────────────────────
+    # Keywords alone no longer route; test label-based blocked routing instead.
+    print("\nScenario (d): story:blocked label → blocked route (label-based only)")
     _bd_approved = lambda root: [
-        _make_bead("hq-004", title="bloqueado por dependência externa")]
+        _make_bead("hq-004", labels=["story:approved", "story:blocked"])]
     st = _reset()
     run_cycle(NOW, st)
     if ("hq-004", "story:approved") in label_removes and \
        ("hq-004", "story:blocked") in label_adds:
-        _ok("(d): blocked wording → routed to story:blocked")
+        _ok("(d): story:blocked label → routed to story:blocked")
     else:
         _bad("(d)", "removes=%s adds=%s" % (label_removes, label_adds))
 
@@ -882,11 +1032,13 @@ def _selftest():
     else:
         _bad("(f)", "removes=%s adds=%s mails=%d" % (label_removes, label_adds, len(mail_calls)))
 
-    # ── (g) NO signal + age>STARVE + pilot alive → ALARM ─────────────────────
-    print("\nScenario (g): NO signal + age>STARVE_MIN + pilot alive → ALARM")
+    # ── (g) NO signal + daemon-age>STARVE + pilot alive → ALARM ──────────────
+    # Pre-seed first_seen_approved: daemon has tracked this bead as approved for STARVE+5 min.
+    print("\nScenario (g): NO signal + daemon-age>STARVE_MIN + pilot alive → ALARM")
     _bd_approved = lambda root: [_make_bead("hq-007", age_min=_STARVE + 5.0)]
     _read_pilot_log_lines = lambda: _pilot_recent()
     st = _reset()
+    st["first_seen_approved"]["hq-007"] = NOW - (_STARVE + 5) * 60
     run_cycle(NOW, st)
     mailed_g = any("hq-007" in subj for subj, _ in mail_calls)
     notified_g = any("hq-007" in msg for msg, _ in notify_calls)
@@ -895,11 +1047,12 @@ def _selftest():
     else:
         _bad("(g): expected ALARM", "mail_calls=%s notify_calls=%s" % (mail_calls, notify_calls))
 
-    # ── (h) NO signal + age>STARVE + pilot DEAD → no alarm ───────────────────
-    print("\nScenario (h): NO signal + age>STARVE + pilot DEAD → no alarm")
+    # ── (h) NO signal + daemon-age>STARVE + pilot DEAD → no alarm ────────────
+    print("\nScenario (h): NO signal + daemon-age>STARVE + pilot DEAD → no alarm")
     _bd_approved = lambda root: [_make_bead("hq-008", age_min=_STARVE + 5.0)]
     _read_pilot_log_lines = lambda: _pilot_old()
     st = _reset()
+    st["first_seen_approved"]["hq-008"] = NOW - (_STARVE + 5) * 60
     run_cycle(NOW, st)
     if not mail_calls and not notify_calls:
         _ok("(h): pilot dead → no alarm (can't blame dispatch path when pilot is down)")
@@ -937,10 +1090,11 @@ def _selftest():
     globals()["DRY_RUN"] = True
     _bd_approved = lambda root: [
         _make_bead("hq-011", labels=["story:approved", "story:needs-device"]),
-        _make_bead("hq-012", age_min=_STARVE + 5.0),   # would alarm
+        _make_bead("hq-012", age_min=_STARVE + 5.0),   # would alarm if not DRY_RUN
     ]
     _read_pilot_log_lines = lambda: _pilot_recent()
     st = _reset()
+    st["first_seen_approved"]["hq-012"] = NOW - (_STARVE + 5) * 60  # would trigger alarm
     run_cycle(NOW, st)
     if not label_removes and not label_adds and not comments and not mail_calls:
         _ok("(k): DRY_RUN=1 → zero label/comment/mail mutations (logs only)")
@@ -984,6 +1138,46 @@ def _selftest():
                  label_removes, label_adds, call_count[0]))
     except Exception as exc:
         _bad("(m): raised unexpected exception: %r" % exc)
+
+    # ── (n) add-before-remove: label add fails → story:approved NOT removed ─────
+    print("\nScenario (n): label add fails → story:approved NOT removed (orphan-limbo prevention)")
+
+    def _stub_add_always_fail_for_014(root, bid, label):
+        if bid == "hq-014":
+            return False  # always fail for this bead (across all stores)
+        label_adds.append((bid, label))
+        return True
+
+    _bd_label_add = _stub_add_always_fail_for_014
+    _bd_approved = lambda root: [
+        _make_bead("hq-014", labels=["story:approved", "story:needs-device"])]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    run_cycle(NOW, st)
+    not_removed_n = ("hq-014", "story:approved") not in label_removes
+    if not_removed_n:
+        _ok("(n): add-before-remove — add failed → story:approved NOT removed; no orphan-limbo")
+    else:
+        _bad("(n): SAFETY VIOLATION — story:approved removed despite add failure!",
+             "removes=%s adds=%s" % (label_removes, label_adds))
+    _bd_label_add = _stub_label_add  # restore
+
+    # ── (o) first_seen_approved: starve alarm fires despite fresh updated_at ───
+    print("\nScenario (o): first_seen_approved — starve age not reset by updated_at touch")
+    # Bead has very fresh updated_at (age_min=0.1) but daemon has tracked it approved
+    # for STARVE_MIN+5 minutes → alarm should fire (daemon-side age, not updated_at).
+    _bd_approved = lambda root: [_make_bead("hq-015", age_min=0.1)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_o = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_o["first_seen_approved"]["hq-015"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_o)
+    alarmed_o = any("hq-015" in subj for subj, _ in mail_calls)
+    if alarmed_o:
+        _ok("(o): first_seen_approved — alarm fires despite fresh updated_at (daemon-side age)")
+    else:
+        _bad("(o): first_seen_approved not working — alarm not fired despite daemon age > STARVE_MIN",
+             "mail_calls=%s" % mail_calls)
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
