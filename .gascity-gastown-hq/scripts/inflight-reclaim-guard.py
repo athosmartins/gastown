@@ -804,12 +804,13 @@ def concrete_adhoc_session_is_live(assignee, sessions, now=None, bead_update_age
     specific session identity is known at dispatch time.
 
     Conservative (ga-64usm / ga-hkpwv gap fix):
-    - Session found, state in _POOL_DEAD_STATES → False (definitively dead → eligible)
+    - Session found, state in _POOL_DEAD_STATES → keep scanning (a live successor wins)
     - Session found, state in LIVE_STATES → apply session_owner_is_healthy() staleness check
     - Session found, state unknown (not in either set) → True (ambiguous → NOOP)
     - Session not found (gone / never started / purged) → False (dead → eligible)
     - Missing/unparseable last_active on a LIVE session → True (conservative;
       can't prove staleness per ga-64usm: NEVER reclaim on absent field)
+    - Duplicate identifier: dead first, live later → live wins (scan-all hardening)
 
     Coordinator exclusion (ga-7m191): assignee naming mayor/deacon → False.
 
@@ -821,6 +822,7 @@ def concrete_adhoc_session_is_live(assignee, sessions, now=None, bead_update_age
     if now is None:
         now = time.time()
 
+    found_dead = False
     for s in sessions:
         identifiers = {
             s.get("id", ""),
@@ -838,7 +840,8 @@ def concrete_adhoc_session_is_live(assignee, sessions, now=None, bead_update_age
 
         state = s.get("state", "").lower()
         if state in _POOL_DEAD_STATES:
-            return False  # Definitively dead/drained — eligible for reclaim
+            found_dead = True
+            continue  # Keep scanning — a live successor with the same identifier must win
         if state in LIVE_STATES:
             # Apply ga-64usm staleness check: alive != working
             activity_age = session_activity_age(s, now)
@@ -847,7 +850,8 @@ def concrete_adhoc_session_is_live(assignee, sessions, now=None, bead_update_age
         # NEVER reclaim on ambiguous session state.
         return True
 
-    # Session not found in the session list → gone → treat as dead.
+    # No live session found. Whether session was dead (found_dead) or gone
+    # (no match at all) → eligible for reclaim. Mirrors pool_has_live_worker.
     return False
 
 
@@ -1882,6 +1886,30 @@ def _selftest():
           _is_ephemeral_pool_assignee("wa-worker"))
     check("AZ-9b: is_reclaimable_inprogress_story: bare wa-worker still qualifies (regression check)",
           is_reclaimable_inprogress_story([], assignee="wa-worker"))
+
+    # --- AZ-DUP: duplicate identifier — dead first, live second → live wins (scan-all hardening) ---
+    # Scenario: two sessions share the same concrete adhoc identifier.
+    # The FIRST is asleep/drained (dead). The SECOND is active with a fresh last_active.
+    # Before the fix an early `return False` on the dead session would declare the bead
+    # reclaimable even though a live successor exists → false reclaim that kills a live build.
+    # After the fix: continue scanning; the live session wins → bead is NOT reclaimed.
+    _fresh_az_dup = _irg_datetime.datetime.fromtimestamp(
+        T_az - 60, tz=_irg_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _adhoc_dup_sessions = [
+        {"id": "sid-dup1", "name": "wa-worker-adhoc-dupbeef",
+         "session_name": "wa-worker-adhoc-dupbeef",
+         "alias": "", "agent_name": "wa-worker-adhoc-dupbeef",
+         "state": "asleep",
+         "last_active": "0001-01-01T00:00:00Z"},
+        {"id": "sid-dup2", "name": "wa-worker-adhoc-dupbeef",
+         "session_name": "wa-worker-adhoc-dupbeef",
+         "alias": "", "agent_name": "wa-worker-adhoc-dupbeef",
+         "state": "active",
+         "last_active": _fresh_az_dup},
+    ]
+    check("AZ-DUP: concrete_adhoc_session_is_live: dead first + live second → True (live successor wins; no false reclaim)",
+          concrete_adhoc_session_is_live(
+              "wa-worker-adhoc-dupbeef", _adhoc_dup_sessions, T_az))
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0
