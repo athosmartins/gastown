@@ -42,9 +42,18 @@ GATE_STALL_MIN = int(os.environ.get("IMP_GATE_STALL_MIN", "165"))
 PILOT_DEAD_MIN = int(os.environ.get("IMP_PILOT_DEAD_MIN", "20"))
 MAX_CLASSIFY = int(os.environ.get("IMP_MAX_CLASSIFY", "40"))  # cap to avoid hanging
 
-# Labels that mark a bead as NOT code-buildable right now (not a silent stall):
+# Labels that mark a bead as NOT auto-dispatchable right now (not a silent stall).
+# A bead carrying ANY of these is parked for a real reason — the Pilot correctly
+# won't auto-dispatch it, so it is NOT a "buildable bead silently stuck".
 PARKING_LABELS = ("gate:needs-human", "story:needs-human", "on-device",
-                  "story:needs-device", "blocked", "story:blocked")
+                  "story:needs-device", "blocked", "story:blocked",
+                  # found 2026-06-28 peeling layers: these ALSO mean "not auto-dispatchable":
+                  "exec:manual",        # manual execution — Pilot doesn't auto-dispatch
+                  "waiting-on",         # waiting-on:<dep> — blocked on a dependency/bead
+                  "next-action",        # next-action:<human> — needs a human action
+                  "needs:rehome",       # needs:rehome-property — needs re-homing to a store
+                  "pilot:held",         # the Pilot itself is holding it (held / held-loop)
+                  "status")             # synthetic status:deferred / status:blocked (see _bd_show_labels_text)
 
 NOW = time.time()
 
@@ -106,22 +115,34 @@ def _root_for_bead(bead_id, store=None):
 
 def _bd_show_labels_text(root, bead_id):
     """Get labels list from `bd show` plain-text output. NEVER uses --json (broken).
-    Returns list of label strings, empty list if no LABELS line, or None on read error."""
+    Returns list of label strings, [] if none, or None on read error.
+    ALSO synthesizes a 'status:deferred'/'status:blocked' parking label from the bead's
+    STATUS — the Pilot won't dispatch a DEFERRED/BLOCKED bead, and status is NOT a label
+    (it lives in the header line '... [● P2 · DEFERRED]'), so the check must read it too."""
     r = _sh([BD, "-C", root, "show", bead_id], timeout=15)
     if r is None or r.returncode != 0:
         return None
+    labels = []
+    upper = r.stdout.upper()
+    if "· DEFERRED]" in upper or " DEFERRED]" in upper:
+        labels.append("status:deferred")
+    if "· BLOCKED]" in upper or " BLOCKED]" in upper:
+        labels.append("status:blocked")
     for line in r.stdout.splitlines():
         stripped = line.strip()
         if stripped.startswith("LABELS:"):
             raw = stripped.split("LABELS:", 1)[1].strip()
-            return [l.strip() for l in raw.split(",") if l.strip()]
-    return []  # no LABELS line → assume no labels
+            labels.extend(l.strip() for l in raw.split(",") if l.strip())
+            break
+    return labels
 
 
 def _label_is_parking(label):
-    """Returns True if this label means the bead is not code-buildable right now."""
+    """Returns True if this label means the bead is not auto-dispatchable right now.
+    Matches exact, colon-suffixed (gate:needs-human:on-device), and dash-suffixed
+    (needs:rehome-property, pilot:held-until:...) forms."""
     for park in PARKING_LABELS:
-        if label == park or label.startswith(park + ":"):
+        if label == park or label.startswith(park + ":") or label.startswith(park + "-"):
             return True
     return False
 
