@@ -130,6 +130,33 @@ _POOL_DEAD_STATES = frozenset({
 STATE_FILE = ".gc/state/inflight-reclaim-guard.json"
 GC_CITY = "/Users/athos/gt/.gascity-gastown-hq"
 
+
+def _list_rig_stores():
+    """Return list of (name, path) for non-HQ rig stores. Fail-open: [] on error.
+
+    ga-mfeip: used by list_inflight_beads / list_stranded_inprogress_beads to
+    fan-out queries across every Dolt store so rig-native in-flight beads
+    (wa-*/ps-*/lx-*/ma-* prefixes, living in rig-own stores) are visible to
+    the cross-store reclaim sweep. HQ-native beads are unaffected.
+    """
+    try:
+        result = subprocess.run(
+            ["gc", "--city", GC_CITY, "rig", "list", "--json"],
+            capture_output=True, text=True, timeout=20)
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        data = json.loads(result.stdout)
+        rigs = data.get("rigs", [])
+        return [
+            (r.get("name", ""), r["path"])
+            for r in rigs
+            if not r.get("hq", False)
+            and r.get("path")
+            and os.path.isdir(r.get("path", ""))
+        ]
+    except Exception:
+        return []
+
 # Repos to search for builder branches
 REPOS = [
     "/Users/athos/gt",
@@ -406,7 +433,7 @@ def _check_pool_dead(pool_zombies, now):
 # ---------------------------------------------------------------------------
 
 def list_inflight_beads():
-    """List open beads carrying story:in-flight.
+    """List open beads carrying story:in-flight from HQ + all rig stores.
 
     ga-7m191: keys on story:in-flight ALONE (NOT story:in-flight AND
     pilot:dispatched). pilot:dispatched can be absent — never set, or stripped
@@ -419,8 +446,15 @@ def list_inflight_beads():
     defaults to open-only, so without this an in_progress story:in-flight bead
     (dispatched, builder set in_progress, then died) was invisible to the guard
     that is supposed to reclaim it.
-    Returns list of bead dicts, or None on any error (fail-safe).
+
+    ga-mfeip (cross-store): also queries non-HQ rig stores so rig-native in-flight
+    beads (wa-*/ps-*/lx-*/ma-* prefixes, living in rig-own Dolt stores) are
+    visible. Attaches rig_root to each bead dict for store-aware bd routing in
+    do_reclaim(). Fail-open per rig store: a rig query error skips that store but
+    never aborts the cycle. HQ failure still returns None per existing contract.
+    Returns list of bead dicts (each with a rig_root key), or None on HQ error.
     """
+    # HQ query — fail-safe: return None on error per existing contract.
     try:
         result = subprocess.run(
             ["bd", "list",
@@ -433,9 +467,41 @@ def list_inflight_beads():
         data = json.loads(result.stdout)
         if not isinstance(data, list):
             return None
-        return data
     except Exception:
         return None
+
+    # Tag HQ beads: rig_root=None (HQ-native, bd mutations need no -C override)
+    merged = {}
+    for b in data:
+        bid = b.get("id", "")
+        if bid:
+            b.setdefault("rig_root", None)
+            merged[bid] = b
+
+    # Rig stores — fail-open per store (a rig error must not skip HQ results)
+    for _rig_name, rig_path in _list_rig_stores():
+        try:
+            r = subprocess.run(
+                ["bd", "-C", rig_path,
+                 "list",
+                 "--label", "story:in-flight",
+                 "--status", "open,in_progress",
+                 "--json"],
+                capture_output=True, text=True, timeout=20)
+            if r.returncode != 0 or not r.stdout.strip():
+                continue
+            rig_data = json.loads(r.stdout)
+            if not isinstance(rig_data, list):
+                continue
+            for b in rig_data:
+                bid = b.get("id", "")
+                if bid and bid not in merged:
+                    b["rig_root"] = rig_path
+                    merged[bid] = b
+        except Exception:
+            continue   # fail-open: skip this rig
+
+    return list(merged.values())
 
 
 def is_reclaimable_inprogress_story(labels, assignee=None):
@@ -496,8 +562,13 @@ def list_stranded_inprogress_beads():
     (is_reclaimable_inprogress_story), so it never touches crew, gate, or dog
     task beads. The reclaim rails (no live builder + no recent branch + stranded
     past TTL) still gate every actuation.
-    Returns list of bead dicts, or None on any error (fail-safe).
+
+    ga-mfeip (cross-store): also queries non-HQ rig stores for the same reason
+    as list_inflight_beads(). Attaches rig_root to each qualifying bead.
+    Fail-open per rig store. HQ failure returns None per existing contract.
+    Returns list of bead dicts (each with a rig_root key), or None on HQ error.
     """
+    # HQ query — fail-safe: return None on error per existing contract.
     try:
         result = subprocess.run(
             ["bd", "list",
@@ -509,11 +580,44 @@ def list_stranded_inprogress_beads():
         data = json.loads(result.stdout)
         if not isinstance(data, list):
             return None
-        return [b for b in data
-                if is_reclaimable_inprogress_story(
-                    b.get("labels", []), b.get("assignee"))]
     except Exception:
         return None
+
+    # Tag HQ beads: rig_root=None; filter to Pilot stories
+    merged = {}
+    for b in data:
+        if not is_reclaimable_inprogress_story(b.get("labels", []), b.get("assignee")):
+            continue
+        bid = b.get("id", "")
+        if bid:
+            b.setdefault("rig_root", None)
+            merged[bid] = b
+
+    # Rig stores — fail-open per store
+    for _rig_name, rig_path in _list_rig_stores():
+        try:
+            r = subprocess.run(
+                ["bd", "-C", rig_path,
+                 "list",
+                 "--status", "in_progress",
+                 "--json"],
+                capture_output=True, text=True, timeout=20)
+            if r.returncode != 0 or not r.stdout.strip():
+                continue
+            rig_data = json.loads(r.stdout)
+            if not isinstance(rig_data, list):
+                continue
+            for b in rig_data:
+                if not is_reclaimable_inprogress_story(b.get("labels", []), b.get("assignee")):
+                    continue
+                bid = b.get("id", "")
+                if bid and bid not in merged:
+                    b["rig_root"] = rig_path
+                    merged[bid] = b
+        except Exception:
+            continue   # fail-open: skip this rig
+
+    return list(merged.values())
 
 
 def list_active_sessions():
@@ -973,13 +1077,21 @@ def _pool_of(assignee):
 # Actuation helpers (label + assignee ops on real beads — CONSERVATIVE)
 # ---------------------------------------------------------------------------
 
-def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels):
+def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=None):
     """Strip story:in-flight (+pilot:dispatched if present), clear assignee,
     bump reclaim label.
+
+    ga-mfeip (cross-store): rig_root, when set, routes every bd mutation to the
+    bead's own rig store (bd -C rig_root) instead of defaulting to HQ. HQ-native
+    beads pass rig_root=None and use plain bd (existing behavior unchanged).
+
     Returns True if all bd ops succeeded, False if any failed (still best-effort).
     """
     new_count = reclaim_count + 1
     ok = True
+
+    # Build the bd prefix: rig-native beads route to their own store.
+    _bd = ["bd", "-C", rig_root] if rig_root else ["bd"]
 
     # 1. Remove lifecycle labels that are actually present. ga-7m191:
     #    pilot:dispatched may be absent (stripped by a partial prior reclaim);
@@ -989,7 +1101,7 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels):
             continue
         try:
             r = subprocess.run(
-                ["bd", "label", "remove", bead_id, lbl, "-q"],
+                _bd + ["label", "remove", bead_id, lbl, "-q"],
                 capture_output=True, text=True, timeout=15)
             if r.returncode != 0:
                 print(f"[INFLIGHT-RECLAIM] warn: remove {lbl} from {bead_id} rc={r.returncode}",
@@ -1002,7 +1114,7 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels):
     # 2. Clear assignee so Pilot can claim it fresh
     try:
         subprocess.run(
-            ["bd", "assign", bead_id, ""],
+            _bd + ["assign", bead_id, ""],
             capture_output=True, text=True, timeout=15)
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] warn: clear assignee {bead_id}: {exc}", flush=True)
@@ -1017,7 +1129,7 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels):
     #     re-finds the bead (still in_progress + pilot:reclaim-count) and retries.
     try:
         subprocess.run(
-            ["bd", "update", bead_id, "--status", "open"],
+            _bd + ["update", bead_id, "--status", "open"],
             capture_output=True, text=True, timeout=15)
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] warn: reset status open {bead_id}: {exc}", flush=True)
@@ -1026,13 +1138,13 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels):
     if reclaim_count > 0:
         try:
             subprocess.run(
-                ["bd", "label", "remove", bead_id, f"pilot:reclaim-count:{reclaim_count}", "-q"],
+                _bd + ["label", "remove", bead_id, f"pilot:reclaim-count:{reclaim_count}", "-q"],
                 capture_output=True, text=True, timeout=15)
         except Exception:
             pass  # old label may already be missing; ignore
     try:
         subprocess.run(
-            ["bd", "label", "add", bead_id, f"pilot:reclaim-count:{new_count}", "-q"],
+            _bd + ["label", "add", bead_id, f"pilot:reclaim-count:{new_count}", "-q"],
             capture_output=True, text=True, timeout=15)
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] warn: set reclaim-count label {bead_id}: {exc}", flush=True)
@@ -1057,10 +1169,10 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels):
         _held_until = int(time.time()) + _reloop_hold
         try:
             subprocess.run(
-                ["bd", "label", "add", bead_id, "pilot:held", "-q"],
+                _bd + ["label", "add", bead_id, "pilot:held", "-q"],
                 capture_output=True, text=True, timeout=15)
             subprocess.run(
-                ["bd", "label", "add", bead_id, f"pilot:held-until:{_held_until}", "-q"],
+                _bd + ["label", "add", bead_id, f"pilot:held-until:{_held_until}", "-q"],
                 capture_output=True, text=True, timeout=15)
             print(f"[INFLIGHT-RECLAIM] ga-l5ud0: {bead_id} stamped pilot:held (reloop-cooldown, reclaim {new_count}, hold {_reloop_hold}s until {_held_until})",
                   flush=True)
@@ -1075,7 +1187,7 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels):
                   if reclaim_count >= 1 and _reloop_hold > 0 else "")
     try:
         subprocess.run(
-            ["bd", "comment", bead_id,
+            _bd + ["comment", bead_id,
              f"inflight-reclaim-guard (ga-se62o): reclaimed — no live builder and "
              f"no recent branch progress for {idle_min:.0f}min "
              f"(> {RECLAIM_TTL//60}min TTL). {cleared} "
@@ -1089,7 +1201,7 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels):
     return ok
 
 
-def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels):
+def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=None):
     """Mark a permanently-failing bead gate:needs-human — do NOT re-clear it.
 
     ga-6ow4v: the reclaim cap is exhausted (MAX_RECLAIMS reclaims of the SAME
@@ -1105,10 +1217,16 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels):
     returns "noop" for needs-human beads), so the bead parks quietly: no loop,
     no repeat ntfy. One held lane slot is the deliberate tradeoff for a story
     that has proven un-buildable; a human investigates and re-queues it.
+
+    ga-mfeip (cross-store): rig_root routes bd mutations to the bead's own rig
+    store when set. HQ-native beads pass rig_root=None (existing behavior).
     """
+    # Build the bd prefix: rig-native beads route to their own store.
+    _bd = ["bd", "-C", rig_root] if rig_root else ["bd"]
+
     try:
         subprocess.run(
-            ["bd", "label", "add", bead_id, "gate:needs-human", "-q"],
+            _bd + ["label", "add", bead_id, "gate:needs-human", "-q"],
             capture_output=True, text=True, timeout=15)
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] warn: add gate:needs-human {bead_id}: {exc}",
@@ -1116,7 +1234,7 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels):
     # imp13: sub-label classifies this as a TECHNICAL circuit-breaker park (not a product decision).
     try:
         subprocess.run(
-            ["bd", "label", "add", bead_id, "gate:needs-human:technical", "-q"],
+            _bd + ["label", "add", bead_id, "gate:needs-human:technical", "-q"],
             capture_output=True, text=True, timeout=15)
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] warn: add gate:needs-human:technical {bead_id}: {exc}",
@@ -1124,7 +1242,7 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels):
 
     try:
         subprocess.run(
-            ["bd", "comment", bead_id,
+            _bd + ["comment", bead_id,
              f"inflight-reclaim-guard (ga-6ow4v): ESCALATED — reclaim cap "
              f"({MAX_RECLAIMS}) exhausted. Bead stranded {idle_min:.0f}min with no "
              f"live builder or branch progress across {reclaim_count} reclaims. "
@@ -1203,6 +1321,7 @@ def run_cycle(state, escalated_alerted):
         labels = bead.get("labels", [])
         assignee = bead.get("assignee") or ""
         title = bead.get("title", "")[:60]
+        rig_root = bead.get("rig_root")  # ga-mfeip: None=HQ-native, path=rig store
 
         # --- Safety flags ---
         # ga-hkpwv: catch gate:needs-human:* prefix variants (e.g. :on-device, :routing)
@@ -1309,8 +1428,8 @@ def run_cycle(state, escalated_alerted):
             if pool:
                 pool_zombies.setdefault(pool, []).append(bead_id)
 
-        # Include assignee in classified tuple for Pass 2 escalation mail (ga-hkpwv)
-        classified.append((bead_id, title, labels, assignee, action, idle_min, reclaim_count))
+        # Include assignee + rig_root in classified tuple for Pass 2 (ga-hkpwv, ga-mfeip)
+        classified.append((bead_id, title, labels, assignee, action, idle_min, reclaim_count, rig_root))
 
     # --- Pool-dead alert (BEFORE per-bead actuation, ga-dbibq) ---
     # Emits [POOL-DEAD] Mayor mail when >= POOL_DEAD_MIN beads from the same pool
@@ -1318,9 +1437,9 @@ def run_cycle(state, escalated_alerted):
     _check_pool_dead(pool_zombies, now)
 
     # --- Pass 2: per-bead actuation (logic unchanged from prior single-pass) ---
-    for bead_id, title, labels, assignee, action, idle_min, reclaim_count in classified:
+    for bead_id, title, labels, assignee, action, idle_min, reclaim_count, rig_root in classified:
         if action == "reclaim":
-            ok = do_reclaim(bead_id, title, reclaim_count, idle_min, labels)
+            ok = do_reclaim(bead_id, title, reclaim_count, idle_min, labels, rig_root=rig_root)
             status = "RECLAIMED" if ok else "RECLAIM-FAILED"
             emit(
                 f"[INFLIGHT-RECLAIM] [{status}] bead={bead_id} "
@@ -1334,7 +1453,7 @@ def run_cycle(state, escalated_alerted):
             # Rate-limit to avoid repeat ntfy on the same bead within REALERT_SEC
             last_alert = escalated_alerted.get(bead_id, 0)
             if now - last_alert > REALERT_SEC:
-                do_escalate(bead_id, title, reclaim_count, idle_min, labels)
+                do_escalate(bead_id, title, reclaim_count, idle_min, labels, rig_root=rig_root)
                 emit(
                     f"[INFLIGHT-RECLAIM] [ESCALATED] bead={bead_id} "
                     f"reclaimed {reclaim_count}x idle={idle_min:.0f}min — "
