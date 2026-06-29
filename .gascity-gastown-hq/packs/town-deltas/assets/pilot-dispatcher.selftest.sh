@@ -2403,6 +2403,36 @@ fi
 has "$DISPATCHER" '_filter_built()'                        "_filter_built helper defined (HOL-block layer 2)"
 has "$DISPATCHER" '_filter_dispatch_gates | _filter_built' "_filter_built applied in the ctx:ready filter chain"
 
+# ── Scenario 22h: ownership guard exempts gate:needs-fix from the branch-exists refusal
+# A gate-failed bead in the gate-fix loop OWNS its branch crew/*/<bead> from the prior
+# attempt; _filter_built is blind to it on CONTAINER rigs (branch is remote-only, not a
+# local ref), so it reaches the ownership guard, which would refuse forever (ps-2w5d
+# attempt-3 refused every sweep 40+min). The gate cleared the assignee, so there is no
+# live owner — signal (a) must be skipped for gate:needs-fix; signal (b) still guards a
+# live crew owner. This is HOL-block layer 2b (guard-level), complementing layer 1/2.
+echo "Scenario 22h: ownership guard exempts gate:needs-fix from the branch-exists refusal"
+_OG_FNS="$(awk '/^_beadid_has_crew_branch\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")
+$(awk '/^_ownership_guard_should_refuse\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+# (1) gate:needs-fix bead WITH a branch → signal (a) suppressed → NOT refused on branch.
+OG_FIX="$( bd() { echo ""; }; eval "$_OG_FNS"
+  export PILOT_TEST_CREW_BRANCH_BEADS="ps-2w5d" _DEADWORKER_OK=0
+  _ownership_guard_should_refuse "ps-2w5d" '{"labels":["story:approved","gate:needs-fix"]}' "/nonexistent" 2>/dev/null
+  printf 'rc=%s' "$?" )"
+case "$OG_FIX" in
+  *branch:*) bad "ownership guard STILL refuses a gate:needs-fix bead on its own branch (got: '$OG_FIX')" ;;
+  *rc=1*)    ok  "ownership guard does NOT refuse a gate:needs-fix bead despite an existing branch (fix)" ;;
+  *)         bad "unexpected ownership-guard result for gate:needs-fix (got: '$OG_FIX')" ;;
+esac
+# (2) control — a non-gate:needs-fix bead WITH a branch → signal (a) STILL refuses (ga-htjni intact).
+OG_CTL="$( bd() { echo ""; }; eval "$_OG_FNS"
+  export PILOT_TEST_CREW_BRANCH_BEADS="wa-built" _DEADWORKER_OK=0
+  _ownership_guard_should_refuse "wa-built" '{"labels":["story:approved"]}' "/nonexistent" 2>/dev/null
+  printf 'rc=%s' "$?" )"
+case "$OG_CTL" in
+  *branch:crew/*/wa-built*) ok "ownership guard STILL refuses a plain branched bead (ga-htjni double-dispatch guard intact)" ;;
+  *) bad "ownership guard no longer refuses a plain branched bead — ga-htjni regression (got: '$OG_CTL')" ;;
+esac
+
 # ── Scenario 22e: gate (e) — suspended crews are excluded (unit + structural) ───
 echo "Scenario 22e: gate (e) — _crew_is_suspended excludes a suspended crew, keeps an active one"
 # Behavioral unit test: extract the two real helper fns and exercise them through the

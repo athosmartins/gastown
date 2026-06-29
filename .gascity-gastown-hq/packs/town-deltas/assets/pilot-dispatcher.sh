@@ -2126,11 +2126,27 @@ _ownership_guard_should_refuse() {
   local _bid="${1:-}" _json="${2:-}" _city="${3:-$GC_CITY}"
   [ -n "$_bid" ] || return 1
 
-  # (a) crew branch — strongest, evaluated first and standalone.
-  if _beadid_has_crew_branch "$_bid"; then
-    printf 'branch:crew/*/%s' "$_bid"
-    return 0
-  fi
+  # gate:needs-fix exemption (ga-htjni × autonomous gate-fix loop). A bead the gate
+  # FAILed carries gate:needs-fix and OWNS the branch crew/*/<bead> from its prior
+  # attempt — that branch is EXPECTED to exist, and the re-dispatch IS the loop
+  # re-fixing it, not a competing owner. The gate also cleared the assignee + story:
+  # in-flight on FAIL, so there is NO live owner to "leave it for". Without this,
+  # signal (a) refuses EVERY fix attempt forever (observed: ps-2w5d attempt 3 refused
+  # every sweep for 40+min). Skip the standalone branch refusal for gate:needs-fix;
+  # signal (b) below still blocks a genuinely LIVE crew owner (an in-flight fixer).
+  local _og_labels
+  _og_labels=$(printf '%s' "$_json" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
+  case ",$_og_labels," in
+    *,gate:needs-fix,*)
+      : ;;   # in the gate-fix loop → its own branch is not a competing owner
+    *)
+      # (a) crew branch — strongest, evaluated first and standalone.
+      if _beadid_has_crew_branch "$_bid"; then
+        printf 'branch:crew/*/%s' "$_bid"
+        return 0
+      fi
+      ;;
+  esac
 
   # (b) live named-crew owner. Re-read CURRENT assignee from the store (race-safe);
   # fall back to the snapshot's assignee only if the live read is empty/unreadable.
