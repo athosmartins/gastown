@@ -2268,6 +2268,13 @@ _neverstarted_recover_db() {
     bd -C "$_db" label  remove "$_bid" "story:in-flight"   -q 2>/dev/null || true
     bd -C "$_db" label  remove "$_bid" "pilot:dispatched"  -q 2>/dev/null || true
     bd -C "$_db" label  remove "$_bid" "pilot:dispatching" -q 2>/dev/null || true
+    # ga-mrfb: CLEAR the dead worker's assignee. _filter_candidates requires an empty
+    # assignee (it never re-dispatches a bead someone "owns"); a never-started bead still
+    # carries its dead builder's assignee, so without this it is released back to
+    # story:approved yet stays INVISIBLE to every candidate query forever (ps-mrfb/ps-joc0
+    # sat assigned to drained ps-worker-adhoc sessions). The gate-FAIL path already does
+    # this unassign; NEVERSTARTED must too (beads that drained BEFORE reaching the gate).
+    bd -C "$_db" assign "$_bid" "" -q 2>/dev/null || true
     bd -C "$_db" update "$_bid" --unset-metadata "pilot.dispatched_at"  -q 2>/dev/null || true
     bd -C "$_db" update "$_bid" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
     bd -C "$_db" update "$_bid" --unset-metadata "pilot.sling_bead"     -q 2>/dev/null || true

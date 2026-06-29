@@ -2421,6 +2421,12 @@ has "$DISPATCHER" '_filter_dispatch_gates | _filter_built' "_filter_built applie
 # (ps-mrfb/ps-joc0) starves. Contiguous (escaped) match so it can't pass on a partial chain.
 has "$DISPATCHER" '_filter_exec_manual \| _filter_candidates \| _filter_dispatch_gates \| _filter_built \| _filter_unblocked "\$rig_path"' \
   "HQ-empty rig FALLBACK applies the full filter chain (exec_manual+dispatch_gates+built) — HOL-block + exec:manual leak fix"
+# NEVERSTARTED release MUST clear the dead worker's assignee — _filter_candidates requires an
+# empty assignee, so a bead released back to story:approved while still carrying its drained
+# builder's assignee is INVISIBLE to every candidate query forever (ps-mrfb/ps-joc0 stuck behind
+# dead ps-worker-adhoc sessions). The gate-FAIL path unassigns; NEVERSTARTED must too.
+has "$DISPATCHER" 'assign "\$_bid" ""' \
+  "NEVERSTARTED release clears the dead-worker assignee (ga-mrfb: else _filter_candidates hides the released bead)"
 
 # ── Scenario 22h: ownership guard exempts gate:needs-fix from the branch-exists refusal
 # A gate-failed bead in the gate-fix loop OWNS its branch crew/*/<bead> from the prior
