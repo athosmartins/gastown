@@ -726,6 +726,22 @@ def _process_store(rig_root, now, state, pilot_alive):
                  bead_id, starve_age_min))
             continue
 
+        # gate:needs-fix — bead is in the autonomous gate-fix loop, NOT starving.
+        # When a build FAILs the gate, the gate clears story:in-flight + assignee and
+        # labels the bead gate:needs-fix (+ gate:fix-attempt:N); the Pilot then re-dispatches
+        # a fixer with the reviewer feedback on its OWN cadence. Between a gate FAIL and the
+        # next re-dispatch the bead is briefly story:approved + unassigned — which looks
+        # identical to a starving approved bead (and starve-age counts from first-seen-approved,
+        # so a bead cycling the loop for >STARVE_MIN trips this every gap). It is NOT a dispatch
+        # failure: the gate-fix loop owns re-dispatch, and its own fix-cap (gate:fix-attempt:N →
+        # gate:needs-human at cap, escalated by the gate itself) is the real backstop — and
+        # gate:needs-human is already excluded as a non-buildable signal above. Suppress here.
+        if "gate:needs-fix" in labels:
+            _log("  %s: no signal, daemon-age=%.0fmin, gate:needs-fix (gate-fix loop owns "
+                 "re-dispatch; cap→needs-human is the backstop) — no alarm" % (
+                 bead_id, starve_age_min))
+            continue
+
         # Pilot dead → can't blame dispatch; don't alarm.
         if not pilot_alive:
             _log("  %s: no signal, daemon-age=%.0fmin, starving BUT pilot dead — no alarm" % (
@@ -1177,6 +1193,27 @@ def _selftest():
         _ok("(o): first_seen_approved — alarm fires despite fresh updated_at (daemon-side age)")
     else:
         _bad("(o): first_seen_approved not working — alarm not fired despite daemon age > STARVE_MIN",
+             "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (p): gate:needs-fix bead in gate-fix loop → no starve alarm")
+    # A bead cycling the autonomous gate-fix loop sits story:approved + unassigned between a
+    # gate FAIL and the Pilot's re-dispatch. Its daemon-age exceeds STARVE_MIN (it has been
+    # looping for a while), so without the exclusion it would FALSELY alarm "dispatch failing".
+    # gate:needs-fix means the gate-fix loop owns re-dispatch (cap → gate:needs-human is the
+    # real backstop) — it must NOT trip the starve alarm. (Regression guard for the false
+    # ps-2w5d "starving 90min" reconciler mail.)
+    _bd_approved = lambda root: [_make_bead(
+        "hq-016", labels=["story:approved", "gate:needs-fix", "gate:fix-attempt:2"], age_min=0.1)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_p = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_p["first_seen_approved"]["hq-016"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_p)
+    alarmed_p = any("hq-016" in subj for subj, _ in mail_calls)
+    if not alarmed_p:
+        _ok("(p): gate:needs-fix bead — no starve alarm (gate-fix loop owns re-dispatch)")
+    else:
+        _bad("(p): gate:needs-fix bead FALSELY alarmed as starving (false dispatch-failure mail)",
              "mail_calls=%s" % mail_calls)
 
     # ── result ────────────────────────────────────────────────────────────────
