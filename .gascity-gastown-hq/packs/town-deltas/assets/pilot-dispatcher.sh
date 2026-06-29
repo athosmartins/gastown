@@ -1724,10 +1724,51 @@ _DEADWORKER_OK=1
 echo "$_SESSIONS_JSON" | jq -e '.sessions | type=="array"' >/dev/null 2>&1 || _DEADWORKER_OK=0
 [ -n "$_LIVE_SESSION_IDS" ] || _DEADWORKER_OK=0
 
+# ── Asleep-session roster (ga-mrfb: drained ephemeral worker ≠ live builder) ───
+# A non-closed session whose state is "asleep". An EPHEMERAL pool worker
+# (…-adhoc-…, wake_mode=fresh) goes state=="asleep" once it drain-acks — it has
+# finished and will NEVER resume THIS build (a fresh wake re-claims from the pool,
+# it does not continue prior work). But it keeps closed!=true for a while, so the
+# broad _session_is_live counts it "live" → its in-flight bead wedges (NEVERSTARTED
+# keeps it) AND its pool slot stays falsely occupied (dead-worker slot-correction
+# keeps it). Observed: ps-mrfb/ps-joc0 stuck story:in-flight 80+min behind asleep
+# adhoc workers that `gc session peek` reports "not found". Indexed here so the
+# "is this worker ACTIVELY building?" checks can treat such a worker as dead.
+# NOTE: named crews that are merely asleep are NOT dead-builders — the dispatch
+# REUSE path (gt-4st3n) wakes asleep sessions on purpose — so this set is consulted
+# ONLY for …-adhoc-… workers (see _session_is_live_builder); _session_is_live and
+# the ownership/crew-owner guards keep their full not-closed semantics.
+_ASLEEP_SESSION_IDS=$(echo "$_SESSIONS_JSON" \
+  | jq -r '[.sessions[]? | select(.closed != true) | select(.state == "asleep")
+           | (.session_name, .name, .alias, .id, .agent_name)]
+          | map(select(. != null and . != "")) | unique | .[]' 2>/dev/null || echo "")
+
 # _session_is_live <identifier> — exit 0 iff <identifier> is a non-closed session.
 _session_is_live() {
   [ -n "${1:-}" ] || return 1
   printf '%s\n' "$_LIVE_SESSION_IDS" | grep -Fxq -- "$1"
+}
+
+# _session_is_asleep <identifier> — exit 0 iff <identifier> is a non-closed, asleep session.
+_session_is_asleep() {
+  [ -n "${1:-}" ] || return 1
+  printf '%s\n' "$_ASLEEP_SESSION_IDS" | grep -Fxq -- "$1"
+}
+
+# _session_is_live_builder <identifier> — exit 0 iff the session is a worker that
+# is ACTIVELY building right now: non-closed AND not a drained ephemeral pool
+# worker. A …-adhoc-… worker that has gone asleep has drain-acked (wake_mode=fresh
+# → it will never resume the in-flight build it was dispatched for); treating it as
+# a live builder wedges its bead (NEVERSTARTED) and falsely holds its pool slot.
+# Named/non-adhoc sessions keep full _session_is_live semantics (an asleep crew is
+# still its bead's owner, and the dispatch REUSE path wakes it deliberately).
+_session_is_live_builder() {
+  [ -n "${1:-}" ] || return 1
+  _session_is_live "$1" || return 1
+  case "$1" in
+    *-adhoc-*) _session_is_asleep "$1" && return 1 ;;   # drained ephemeral worker → dead builder
+  esac
+  return 0
 }
 
 # ── Stale-sling liveness (dead-builder HOL-block fix) ─────────────────────────
@@ -1912,8 +1953,8 @@ _inflight_drop_dead_workers() {
       [ -n "$_ddw_bead_db" ] && [ -n "$_ddw_bid" ] && [ "$_sling" = "$_ddw_bid" ] && _ddw_sling_db="$_ddw_bead_db"
       _asg=$(bd -C "$_ddw_sling_db" show "$_sling" --json 2>/dev/null \
         | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
-      if [ -n "$_asg" ] && ! _session_is_live "$_asg"; then
-        continue   # confirmed dead worker → free this slot
+      if [ -n "$_asg" ] && ! _session_is_live_builder "$_asg"; then
+        continue   # confirmed dead worker (incl. drained-asleep adhoc) → free this slot
       fi
     fi
     _kept="${_kept}${_bead}"$'\n'
@@ -2173,8 +2214,8 @@ _neverstarted_recover_db() {
       [ "$_sling" = "$_bid" ] && _sling_db="$_db"
       _asg=$(bd -C "$_sling_db" show "$_sling" --json 2>/dev/null \
         | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
-      if [ -n "$_asg" ] && _session_is_live "$_asg"; then
-        continue   # worker alive → not never-started.
+      if [ -n "$_asg" ] && _session_is_live_builder "$_asg"; then
+        continue   # worker actively building → not never-started (asleep adhoc = drained/dead).
       fi
     fi
 
