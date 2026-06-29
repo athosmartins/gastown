@@ -2402,6 +2402,13 @@ else
 fi
 has "$DISPATCHER" '_filter_built()'                        "_filter_built helper defined (HOL-block layer 2)"
 has "$DISPATCHER" '_filter_dispatch_gates | _filter_built' "_filter_built applied in the ctx:ready filter chain"
+# The HQ-empty rig FALLBACK scan (RIG_BUGS/RIG_DEBT/RIG_FEATURES) MUST apply the same
+# filter chain as WA_RIG_TIER2 — else built beads (wa-huo0d: branch + ready-for-gate, still
+# story:approved) and exec:manual bugs (ga-v3o6i) leak in, get picked first by priority, are
+# REFUSED by the ownership guard, and head-of-line-block the lane so lower-priority rig work
+# (ps-mrfb/ps-joc0) starves. Contiguous (escaped) match so it can't pass on a partial chain.
+has "$DISPATCHER" '_filter_exec_manual \| _filter_candidates \| _filter_dispatch_gates \| _filter_built \| _filter_unblocked "\$rig_path"' \
+  "HQ-empty rig FALLBACK applies the full filter chain (exec_manual+dispatch_gates+built) — HOL-block + exec:manual leak fix"
 
 # ── Scenario 22h: ownership guard exempts gate:needs-fix from the branch-exists refusal
 # A gate-failed bead in the gate-fix loop OWNS its branch crew/*/<bead> from the prior

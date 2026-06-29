@@ -2808,7 +2808,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "pilot:dispatched" \
       --exclude-type epic \
       -n 0 2>/dev/null || echo "[]")
-    RIG_BUGS=$(echo "$RIG_BUGS" | _filter_candidates | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
+    RIG_BUGS=$(echo "$RIG_BUGS" | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_BUGS" | jq -s 'add // []' 2>/dev/null || echo "[]")
 
     # Tier 1: tech-debt from rig DB
@@ -2822,7 +2822,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "pilot:dispatched" \
       --exclude-type epic \
       -n 0 2>/dev/null || echo "[]")
-    RIG_DEBT=$(echo "$RIG_DEBT" | _filter_candidates | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
+    RIG_DEBT=$(echo "$RIG_DEBT" | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
     ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_DEBT" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
 
     # Tier 2: story:approved features from rig DB
@@ -2836,7 +2836,7 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
       --exclude-label "pilot:dispatched" \
       --exclude-type epic \
       -n 0 2>/dev/null || echo "[]")
-    RIG_FEATURES=$(echo "$RIG_FEATURES" | _filter_candidates | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
+    RIG_FEATURES=$(echo "$RIG_FEATURES" | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
     ALL_RIG_TIER2=$(echo "$ALL_RIG_TIER2 $RIG_FEATURES" | jq -s 'add // []' 2>/dev/null || echo "[]")
   done <<< "$RIG_PATHS"
 
