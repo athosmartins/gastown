@@ -134,6 +134,7 @@ _bd_comment = None          # (rig_root, bead_id, text) -> bool
 _do_notify = None           # (msg, prio) -> None
 _do_mail_mayor = None       # (subject, body) -> bool
 _read_pilot_log_lines = None  # () -> list[str]
+_bd_gate_markers = None     # (rig_root) -> list[dict]|None; OPEN quality-gate-markers in the store
 
 
 # ── guarded subprocess ────────────────────────────────────────────────────────
@@ -601,6 +602,35 @@ def _alarm_starving(rig_root, bead, age_min, now, state):
     state.setdefault("alarmed", {})[bead_id] = now
 
 
+# ── built-bead index ──────────────────────────────────────────────────────────
+def _gate_marker_source_beads(rig_root):
+    """Set of bead ids that an OPEN quality-gate-marker in this store points at (label
+    source-bead:<id>). Such a bead is BUILT and awaiting the gate — PAST the dispatch
+    stage — so the starve alarm must skip it: a built-but-still-story:approved bead is NOT
+    a dispatch failure. (A marker can even be orphaned by the HQ-only gate scan — ga-pnugy
+    — leaving the bead story:approved forever; that is a GATE bug, not a dispatch failure.)
+    FAIL-SAFE: any query/parse error → empty set (never SUPPRESS a real dispatch alarm on an
+    unreadable marker query — the same fail-toward-alarming bias as the rest of the daemon)."""
+    if _bd_gate_markers is not None:
+        rows = _bd_gate_markers(rig_root)          # test seam
+    else:
+        r = _sh([BD_BIN, "-C", rig_root, "list", "-l", "type:quality-gate-marker",
+                 "--json", "-n", "200"], timeout=BD_TIMEOUT)
+        if r is None or r.returncode != 0:
+            return set()
+        rows = _parse_bd_json(r.stdout)
+    out = set()
+    for m in (rows or []):
+        if not isinstance(m, dict):
+            continue
+        if (m.get("status") or "open") == "closed":
+            continue
+        for lab in _get_labels(m):
+            if lab.startswith("source-bead:"):
+                out.add(lab[len("source-bead:"):])
+    return out
+
+
 # ── process one store ─────────────────────────────────────────────────────────
 def _process_store(rig_root, now, state, pilot_alive):
     """Scan story:approved open beads in rig_root; classify and act on each one.
@@ -632,6 +662,10 @@ def _process_store(rig_root, now, state, pilot_alive):
 
     _log("  [%s] %d story:approved open bead(s) to evaluate" % (
          os.path.basename(rig_root), len(beads)))
+
+    # Beads an OPEN gate marker points at are BUILT + awaiting the gate (past dispatch) →
+    # the starve alarm skips them below (a built bead is not a dispatch failure).
+    built_ids = _gate_marker_source_beads(rig_root)
 
     processed = routed = alarmed = 0
 
@@ -759,6 +793,14 @@ def _process_store(rig_root, now, state, pilot_alive):
             _log("  %s: pool capacity unknown — alarming conservatively (%s)" % (
                  bead_id, cap_note))
 
+        # BUILT (open gate marker references it) → past dispatch, awaiting the gate. NOT a
+        # dispatch failure — the reconciler's scope is dispatch. (If the gate never reviews it,
+        # that's a GATE bug — ga-pnugy — surfaced elsewhere, not as a false "dispatch failing".)
+        if bead_id in built_ids:
+            _log("  %s: no signal, daemon-age=%.0fmin, BUILT (open gate marker) — awaiting "
+                 "gate, not a dispatch failure — no alarm" % (bead_id, starve_age_min))
+            continue
+
         # ALARM: buildable bead starving, pilot alive, pool has capacity, dispatch failing.
         _alarm_starving(rig_root, bead, starve_age_min, now, state)
         alarmed += 1
@@ -842,7 +884,7 @@ def _selftest():
       (o)       first_seen_approved: starve alarm fires despite fresh updated_at
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
-    global _do_notify, _do_mail_mayor, _read_pilot_log_lines
+    global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers
     global DRY_RUN, STARVE_MIN, FLOW_GRACE_MIN, ROUTE_COOLDOWN_SEC, ALARM_COOLDOWN_SEC
 
     ok_count = [0]
@@ -1215,6 +1257,26 @@ def _selftest():
     else:
         _bad("(p): gate:needs-fix bead FALSELY alarmed as starving (false dispatch-failure mail)",
              "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (q): BUILT bead (open gate marker) → no starve alarm (not a dispatch failure)")
+    # A bead an OPEN quality-gate-marker points at is built + awaiting the gate; it may sit
+    # story:approved (e.g. wa-huo0d, whose marker the HQ-only gate scan never picks up — ga-pnugy)
+    # yet is NOT a dispatch failure. The reconciler must not false-alarm "dispatch failing" on it.
+    _bd_approved = lambda root: [_make_bead("hq-017", labels=["story:approved"], age_min=0.1)]
+    _bd_gate_markers = lambda root: [
+        {"id": "wisp-q", "status": "open",
+         "labels": ["type:quality-gate-marker", "source-bead:hq-017", "gate-status:ready"]}]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_q = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_q["first_seen_approved"]["hq-017"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_q)
+    alarmed_q = any("hq-017" in subj for subj, _ in mail_calls)
+    _bd_gate_markers = None
+    if not alarmed_q:
+        _ok("(q): built bead (open gate marker) — no starve alarm (real issue is the gate, ga-pnugy)")
+    else:
+        _bad("(q): built bead FALSELY alarmed as starving/dispatch-failing", "mail_calls=%s" % mail_calls)
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
