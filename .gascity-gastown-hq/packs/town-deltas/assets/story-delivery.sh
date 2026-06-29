@@ -171,21 +171,47 @@ reconcile_untracked_for_ffpull() {
   return 0
 }
 
+# ── Cross-store enumeration (ga-mt03s) ────────────────────────────────────────
+# Enumerate ALL rig stores dynamically so gate:passed beads in ps-/wa-/lx-/ma-/
+# dc-/gastown rigs are found by the delivery scan — not just HQ (gascity store).
+# Fail-open: if gc rig list fails, fall back to HQ only so HQ stories are never
+# blocked by a failing rig-list call.
+ALL_STORES=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
+  | jq -r '.rigs[].path' 2>/dev/null || echo "")
+[ -z "$ALL_STORES" ] && ALL_STORES="$GC_CITY"
+log "Stores to scan: $(echo "$ALL_STORES" | tr '\n' ' ')"
+
 # ── Step 1: Find stories with gate:passed but NOT story:done ──────────────────
 # Stories are identified by label story:approved (type field is null in bd).
 # gate:passed is set by the quality-gate-dispatcher after merge.
 # story:done is set by this script after successful delivery.
 if [ -n "$FORCE_STORY_ID" ]; then
   log "Forced single-story mode: $FORCE_STORY_ID"
-  STORIES_JSON=$(bd -C "$GC_CITY" list --json \
-    -l "story:approved" \
-    -l "gate:passed" \
-    2>/dev/null | jq --arg id "$FORCE_STORY_ID" '[.[] | select(.id == $id)]' || echo "[]")
+  STORIES_JSON="[]"
+  for _store_path in $ALL_STORES; do
+    [ -d "$_store_path" ] || continue
+    _chunk=$(bd -C "$_store_path" list --json \
+      -l "story:approved" \
+      -l "gate:passed" \
+      2>/dev/null \
+      | jq --arg id "$FORCE_STORY_ID" --arg sp "$_store_path" \
+          '[.[] | select(.id == $id) | . + {_store: $sp}]' \
+      || echo "[]")
+    STORIES_JSON=$(printf '%s\n%s' "$STORIES_JSON" "$_chunk" | jq -s 'add // []' || echo "$STORIES_JSON")
+  done
 else
-  STORIES_JSON=$(bd -C "$GC_CITY" list --json \
-    -l "story:approved" \
-    -l "gate:passed" \
-    2>/dev/null | jq '[.[] | select(.labels | map(select(. == "story:done")) | length == 0)]' || echo "[]")
+  STORIES_JSON="[]"
+  for _store_path in $ALL_STORES; do
+    [ -d "$_store_path" ] || continue
+    _chunk=$(bd -C "$_store_path" list --json \
+      -l "story:approved" \
+      -l "gate:passed" \
+      2>/dev/null \
+      | jq --arg sp "$_store_path" \
+          '[.[] | select(.labels | map(select(. == "story:done")) | length == 0) | . + {_store: $sp}]' \
+      || echo "[]")
+    STORIES_JSON=$(printf '%s\n%s' "$STORIES_JSON" "$_chunk" | jq -s 'add // []' || echo "$STORIES_JSON")
+  done
 fi
 
 COUNT=$(echo "$STORIES_JSON" | jq 'length' 2>/dev/null || echo "0")
@@ -209,27 +235,38 @@ log "Found $COUNT story/stories awaiting delivery"
 # only open; without --status open,in_progress they are invisible.
 TASK_COUNT=0
 if [ -z "$FORCE_STORY_ID" ]; then
-  TASK_BEADS_JSON=$(bd -C "$GC_CITY" list --json \
-    --status open,in_progress \
-    -l "gate:passed" \
-    2>/dev/null | jq '[.[] |
-      select((.labels // []) | contains(["story:approved"]) | not) |
-      select((.labels // []) | contains(["story:done"]) | not)
-    ]' || echo "[]")
+  # Fan-out over ALL stores (ga-mt03s): task beads in ps-/wa-/etc. rigs live in
+  # their own stores, not HQ. Inject _store so mutations target the right store.
+  TASK_BEADS_JSON="[]"
+  for _store_path in $ALL_STORES; do
+    [ -d "$_store_path" ] || continue
+    _chunk=$(bd -C "$_store_path" list --json \
+      --status open,in_progress \
+      -l "gate:passed" \
+      2>/dev/null \
+      | jq --arg sp "$_store_path" '[.[] |
+          select((.labels // []) | contains(["story:approved"]) | not) |
+          select((.labels // []) | contains(["story:done"]) | not) |
+          . + {_store: $sp}
+        ]' || echo "[]")
+    TASK_BEADS_JSON=$(printf '%s\n%s' "$TASK_BEADS_JSON" "$_chunk" | jq -s 'add // []' || echo "$TASK_BEADS_JSON")
+  done
   TASK_COUNT=$(echo "$TASK_BEADS_JSON" | jq 'length' 2>/dev/null || echo "0")
 
   if [ "$TASK_COUNT" -gt 0 ]; then
     TASK_BEAD=$(echo "$TASK_BEADS_JSON" | jq '.[0]')
     TASK_BEAD_ID=$(echo "$TASK_BEAD" | jq -r '.id')
     TASK_BEAD_TITLE=$(echo "$TASK_BEAD" | jq -r '.title // "untitled"' | head -c 80)
-    log "Task reconciler: gate:passed non-story bead $TASK_BEAD_ID ($TASK_BEAD_TITLE) — closing (no deploy/prod-test; merge verified by gate)"
+    TASK_STORE=$(echo "$TASK_BEAD" | jq -r '._store // ""')
+    [ -z "$TASK_STORE" ] && TASK_STORE="$GC_CITY"
+    log "Task reconciler: gate:passed non-story bead $TASK_BEAD_ID ($TASK_BEAD_TITLE) in store $TASK_STORE — closing (no deploy/prod-test; merge verified by gate)"
     if [ "$DRY_RUN" = "1" ]; then
-      log "DRY_RUN=1 — WOULD: bd close $TASK_BEAD_ID (gate:passed task reconciler, ga-tjqe)"
+      log "DRY_RUN=1 — WOULD: bd -C $TASK_STORE close $TASK_BEAD_ID (gate:passed task reconciler, ga-tjqe)"
     else
-      bd -C "$GC_CITY" close "$TASK_BEAD_ID" \
+      bd -C "$TASK_STORE" close "$TASK_BEAD_ID" \
         -r "Delivery task reconciler (ga-tjqe): gate:passed non-story bead closed — merge verified by gate. Gate dispatcher's direct-close (ga-esbg) was the primary path; this sweep catches beads the dispatcher did not close (e.g., crash between gate:passed + bd close)." \
         2>/dev/null || warn "Task reconciler: could not close $TASK_BEAD_ID (non-fatal; will retry next sweep)"
-      bd -C "$GC_CITY" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-tjqe): gate:passed is set and this bead is not a story (no story:approved). Closed by delivery sweep — terminal for artifact tasks (no deploy/prod-test needed; merge already verified by gate)." 2>/dev/null || true
+      bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-tjqe): gate:passed is set and this bead is not a story (no story:approved). Closed by delivery sweep — terminal for artifact tasks (no deploy/prod-test needed; merge already verified by gate)." 2>/dev/null || true
       log "Task reconciler: closed $TASK_BEAD_ID"
       mkdir -p "$(dirname "$DELIVERY_LOG")"
       jq -c -n \
@@ -268,6 +305,10 @@ while IFS= read -r STORY; do
   STALENESS_GATE=0
 
   STORY_ID=$(echo "$STORY" | jq -r '.id')
+  # Cross-store (ga-mt03s): each bead carries a _store field set during fan-out.
+  # All bd mutations for this story target STORY_STORE, not hardwired GC_CITY.
+  STORY_STORE=$(echo "$STORY" | jq -r '._store // ""')
+  [ -z "$STORY_STORE" ] && STORY_STORE="$GC_CITY"
   STORY_TITLE=$(echo "$STORY" | jq -r '.description // .title // "untitled"' | head -c 80)
   STORY_LABELS=$(echo "$STORY" | jq -r '(.labels // []) | join(",")')
 
@@ -288,7 +329,7 @@ fi
 
 # Mark as running (claim)
 if [ "$DRY_RUN" != "1" ]; then
-  bd -C "$GC_CITY" label add "$STORY_ID" "delivery:running" -q 2>/dev/null || {
+  bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:running" -q 2>/dev/null || {
     warn "Could not add delivery:running to $STORY_ID (race condition?). Skipping."
     continue
   }
@@ -312,7 +353,7 @@ fi
 
 if [ -z "$RIG" ]; then
   # Parse the gate dispatcher comment: "merged to property_scrapers/main (sha=...)"
-  GATE_COMMENT=$(bd -C "$GC_CITY" comments "$STORY_ID" 2>/dev/null \
+  GATE_COMMENT=$(bd -C "$STORY_STORE" comments "$STORY_ID" 2>/dev/null \
     | grep -oE "merged to [a-z_]+/main" | head -1 || echo "")
   if [ -n "$GATE_COMMENT" ]; then
     RIG=$(echo "$GATE_COMMENT" | sed 's/merged to //' | sed 's|/main||')
@@ -323,9 +364,9 @@ fi
 if [ -z "$RIG" ]; then
   err "Cannot determine rig for story $STORY_ID. Add label rig:<name> or metadata story.rig to the bead."
   if [ "$DRY_RUN" != "1" ]; then
-    bd -C "$GC_CITY" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$STORY_ID" "delivery:failed" -q 2>/dev/null || true
-    bd -C "$GC_CITY" comment "$STORY_ID" "Delivery FAILED: cannot determine rig. Add label rig:<name> or metadata field story.rig to this bead." 2>/dev/null || true
+    bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+    bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:failed" -q 2>/dev/null || true
+    bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery FAILED: cannot determine rig. Add label rig:<name> or metadata field story.rig to this bead." 2>/dev/null || true
   fi
   # wa-uthi: non-terminal (delivery:failed is re-picked every cycle until fixed —
   # retries indefinitely, not a definitive rejection) — no push. Logged + bead comment only.
@@ -343,9 +384,9 @@ PROD_TEST_SCRIPT=$(get_runbook_field "$RIG" "prod_test_script" 2>/dev/null || ec
 if [ -z "$DEPLOY_CMD" ]; then
   err "No deploy_cmd for rig '$RIG' in runbook. Story delivery blocked."
   if [ "$DRY_RUN" != "1" ]; then
-    bd -C "$GC_CITY" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$STORY_ID" "delivery:failed" -q 2>/dev/null || true
-    bd -C "$GC_CITY" comment "$STORY_ID" "Delivery HALTED: no deploy_cmd for rig '$RIG'. Codify the deploy runbook before retrying." 2>/dev/null || true
+    bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+    bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:failed" -q 2>/dev/null || true
+    bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED: no deploy_cmd for rig '$RIG'. Codify the deploy runbook before retrying." 2>/dev/null || true
   fi
   # wa-uthi: non-terminal (config gap, retries every cycle once codified) — no push. Logged + bead comment only.
   warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID — no deploy_cmd for rig $RIG."
@@ -381,9 +422,9 @@ STORY_TEST_MISSING=0
 if [ "$NO_HARNESS" = "0" ] && [ ! -f "$PROD_TEST_SCRIPT" ]; then
   err "prod_test_script '$PROD_TEST_SCRIPT' not found on disk."
   if [ "$DRY_RUN" != "1" ]; then
-    bd -C "$GC_CITY" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$STORY_ID" "delivery:failed" -q 2>/dev/null || true
-    bd -C "$GC_CITY" comment "$STORY_ID" "Delivery HALTED: prod_test_script '$PROD_TEST_SCRIPT' not found. File must exist." 2>/dev/null || true
+    bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+    bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:failed" -q 2>/dev/null || true
+    bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED: prod_test_script '$PROD_TEST_SCRIPT' not found. File must exist." 2>/dev/null || true
   fi
   # wa-uthi: non-terminal (runbook misconfig — points to a non-existent harness
   # file; retries every cycle until fixed) — no push. Logged + bead comment only.
@@ -440,9 +481,9 @@ else
   # Return 2 → genuine divergence between an untracked prod file and the merge.
   err "Pre-deploy reconcile ABORT: untracked working-tree file(s) DIFFER from the incoming tracked version:$RECONCILE_DIFF_LIST"
   if [ "$DRY_RUN" != "1" ]; then
-    bd -C "$GC_CITY" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$STORY_ID" "delivery:failed"  -q 2>/dev/null || true
-    bd -C "$GC_CITY" comment "$STORY_ID" "Delivery HALTED (ga-857v FIX 1): the production working tree at $RUNTIME_DIR holds untracked file(s) that the incoming merge adds as tracked, and they GENUINELY DIFFER from the merged version:$RECONCILE_DIFF_LIST
+    bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+    bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:failed"  -q 2>/dev/null || true
+    bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-857v FIX 1): the production working tree at $RUNTIME_DIR holds untracked file(s) that the incoming merge adds as tracked, and they GENUINELY DIFFER from the merged version:$RECONCILE_DIFF_LIST
 These were NOT removed — uncommitted prod work is never destroyed. Resolve manually: diff each untracked file against origin's version, preserve any real local changes, then re-run delivery." 2>/dev/null || true
     # Escalate to author + Mayor via nudge (durable record is the bead comment + label).
     AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
@@ -481,9 +522,9 @@ else
   log "Deploy output: $DEPLOY_OUTPUT"
   if [ "$DEPLOY_RC" -ne 0 ]; then
     err "Deploy failed (rc=$DEPLOY_RC): $DEPLOY_OUTPUT"
-    bd -C "$GC_CITY" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$STORY_ID" "delivery:failed" -q 2>/dev/null || true
-    bd -C "$GC_CITY" comment "$STORY_ID" "Delivery FAILED at deploy step. Command: $DEPLOY_CMD. Output: $DEPLOY_OUTPUT. HALT — investigate before retrying." 2>/dev/null || true
+    bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+    bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:failed" -q 2>/dev/null || true
+    bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery FAILED at deploy step. Command: $DEPLOY_CMD. Output: $DEPLOY_OUTPUT. HALT — investigate before retrying." 2>/dev/null || true
     # wa-uthi: non-terminal (delivery:failed is re-picked next cycle — retries, no
     # retry-exhaustion counter) — no push. Logged + bead comment only.
     warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID deploy failed (rc=$DEPLOY_RC)."
@@ -566,9 +607,9 @@ if [ "$STALENESS_GATE" = "1" ] && [ -n "$RUNTIME_DIR" ] \
     fi
     err "Staleness gate HALT (ga-rhtu): $STALE_MSG"
     if [ "$DRY_RUN" != "1" ]; then
-      bd -C "$GC_CITY" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
-      bd -C "$GC_CITY" label add    "$STORY_ID" "delivery:failed"  -q 2>/dev/null || true
-      bd -C "$GC_CITY" comment "$STORY_ID" "Delivery HALTED (ga-rhtu post-deploy staleness gate): $STALE_MSG. story:done WITHHELD — the live framework engines would otherwise be marked done while running outdated code. NON-TERMINAL: the town-root reconciler brings $RUNTIME_DIR current with $STALE_REF, after which delivery is re-picked automatically. If HEAD carries local-ahead commits on the in-place town root, move them to an isolated worktree (ref: 'Shipping framework stories via gate') so the tree stays fast-forwardable." 2>/dev/null || true
+      bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+      bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:failed"  -q 2>/dev/null || true
+      bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-rhtu post-deploy staleness gate): $STALE_MSG. story:done WITHHELD — the live framework engines would otherwise be marked done while running outdated code. NON-TERMINAL: the town-root reconciler brings $RUNTIME_DIR current with $STALE_REF, after which delivery is re-picked automatically. If HEAD carries local-ahead commits on the in-place town root, move them to an isolated worktree (ref: 'Shipping framework stories via gate') so the tree stays fast-forwardable." 2>/dev/null || true
       AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
       if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
         gc --city "$GC_CITY" session nudge "$AUTHOR" \
@@ -653,9 +694,9 @@ else
         REFRESH_ACTION="ACTION: investigate why the restarted daemon(s) ($REFRESH_FRESHFAIL) did not come up fresh (crash on boot? wrong launchd label? port in use?), fix forward, then re-run delivery."
       fi
       if [ "$DRY_RUN" != "1" ]; then
-        bd -C "$GC_CITY" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
-        bd -C "$GC_CITY" label add    "$STORY_ID" "delivery:failed"  -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh): $REFRESH_VERDICT — $REFRESH_REASON
+        bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+        bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:failed"  -q 2>/dev/null || true
+        bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh): $REFRESH_VERDICT — $REFRESH_REASON
 A long-lived daemon serving rig '$RIG' is running code OLDER than this deploy and could not be safely refreshed/verified, so the merged feature would be DORMANT in production. story:done is WITHHELD (a dormant deploy must never be marked done).
 $REFRESH_ACTION
 Refresh detail:
@@ -696,8 +737,8 @@ if [ "$NO_HARNESS" = "1" ]; then
   if [ "$DRY_RUN" = "1" ]; then
     log "DRY_RUN=1 — WOULD SKIP PROD TEST ($UNTESTED_REASON); WOULD SET delivery:untested (no NTFY — terminal-only push policy wa-uthi)"
   else
-    bd -C "$GC_CITY" label add "$STORY_ID" "delivery:untested" -q 2>/dev/null || true
-    bd -C "$GC_CITY" comment "$STORY_ID" "WARNING: prod test skipped — $UNTESTED_REASON.
+    bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:untested" -q 2>/dev/null || true
+    bd -C "$STORY_STORE" comment "$STORY_ID" "WARNING: prod test skipped — $UNTESTED_REASON.
 Story is being marked story:done with delivery:untested label.
 FOLLOW-UP: $UNTESTED_FOLLOWUP." 2>/dev/null || true
     # wa-uthi: NO push here. "delivery:untested" is a non-terminal warning; the
@@ -723,9 +764,9 @@ else
 
     if [ "$TEST_RC" -ne 0 ]; then
       err "Prod test FAILED (rc=$TEST_RC)"
-      bd -C "$GC_CITY" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
-      bd -C "$GC_CITY" label add    "$STORY_ID" "delivery:failed" -q 2>/dev/null || true
-      bd -C "$GC_CITY" comment "$STORY_ID" "Delivery FAILED: prod test did not pass.
+      bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+      bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:failed" -q 2>/dev/null || true
+      bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery FAILED: prod test did not pass.
 Script: $PROD_TEST_SCRIPT ($TEST_MODE_DESC)
 Exit code: $TEST_RC
 Output:
@@ -761,7 +802,7 @@ if [ "$DRY_RUN" = "1" ]; then
   log "DRY_RUN=1 — WOULD VERIFY refino criteria (story.estrela_guia, story.equilibrios, story.dashboard)"
 else
   log "Verifying refino criteria metadata ..."
-  STORY_META=$(bd -C "$GC_CITY" show "$STORY_ID" --json 2>/dev/null \
+  STORY_META=$(bd -C "$STORY_STORE" show "$STORY_ID" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | .metadata // {}' 2>/dev/null || echo "{}")
 
   ESTRELA=$(echo "$STORY_META" | jq -r '.["story.estrela_guia"] // ""')
@@ -775,7 +816,7 @@ else
 
   if [ -n "$MISSING_META" ]; then
     warn "Missing refino criteria fields:$MISSING_META — story lacks /refino metadata"
-    bd -C "$GC_CITY" comment "$STORY_ID" "Delivery WARNING: missing refino metadata fields:$MISSING_META. /refino may not have been run. Story marked done but refino incomplete." 2>/dev/null || true
+    bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery WARNING: missing refino metadata fields:$MISSING_META. /refino may not have been run. Story marked done but refino incomplete." 2>/dev/null || true
   else
     log "Refino criteria present: estrela_guia, equilibrios, dashboard"
   fi
@@ -796,8 +837,8 @@ if [ "$DRY_RUN" = "1" ]; then
   log "DRY_RUN=1 — WOULD: bd label remove $STORY_ID story:in-flight"
   log "DRY_RUN=1 — WOULD: bd close $STORY_ID -r 'Story DELIVERED … (ga-i53ua durable terminal; delivery close_reason → painel Done)'"
 else
-  bd -C "$GC_CITY" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
-  bd -C "$GC_CITY" label add    "$STORY_ID" "story:done"       -q 2>/dev/null || true
+  bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+  bd -C "$STORY_STORE" label add    "$STORY_ID" "story:done"       -q 2>/dev/null || true
 
   # wa-wzvg: detect Pilot origin (durable "pilot:dispatched" label set by the
   # Pilot when it autonomously pulled the story). Used to differentiate the
@@ -806,7 +847,7 @@ else
   if echo "$STORY_LABELS" | grep -q "pilot:dispatched"; then
     PILOT_ORIGIN=1
   else
-    BEAD_LABELS_NOW=$(bd -C "$GC_CITY" show "$STORY_ID" --json 2>/dev/null \
+    BEAD_LABELS_NOW=$(bd -C "$STORY_STORE" show "$STORY_ID" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
     echo "$BEAD_LABELS_NOW" | grep -q "pilot:dispatched" && PILOT_ORIGIN=1 || true
   fi
@@ -819,7 +860,7 @@ else
     DONE_TEST_LINE="SKIPPED — rig '$RIG' has no prod-test harness (interim policy per ga-dqp)."
     DONE_NOTE="a real prod-test harness for this rig is a DESTINY follow-up item."
     DONE_PUSH_TAIL="prod test SKIPPED (no harness for $RIG)"
-    bd -C "$GC_CITY" comment "$STORY_ID" "Delivery COMPLETE. story:done (delivery:untested).
+    bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery COMPLETE. story:done (delivery:untested).
 Rig: $RIG
 Deploy: $DEPLOY_CMD
 Prod test: $DONE_TEST_LINE
@@ -832,7 +873,7 @@ NOTE: $DONE_NOTE" 2>/dev/null || true
     # delivery:tested — rig harness passed (full when a story-specific test exists,
     # baseline-only when it does not — ga-857v FIX 2). Add an explicit
     # delivery:tested label so the tested state is queryable (acceptance wording).
-    bd -C "$GC_CITY" label add "$STORY_ID" "delivery:tested" -q 2>/dev/null || true
+    bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:tested" -q 2>/dev/null || true
     if [ "$STORY_TEST_MISSING" = "1" ]; then
       DONE_TEST_LINE="$PROD_TEST_SCRIPT — rig BASELINE harness only, no story-specific test (ga-857v FIX 2)"
       DONE_PUSH_TAIL="deployed + baseline-tested in prod"
@@ -840,7 +881,7 @@ NOTE: $DONE_NOTE" 2>/dev/null || true
       DONE_TEST_LINE="$PROD_TEST_SCRIPT (STORY_ID=$STORY_ID)"
       DONE_PUSH_TAIL="deployed + tested in prod"
     fi
-    bd -C "$GC_CITY" comment "$STORY_ID" "Delivery COMPLETE. story:done (delivery:tested).
+    bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery COMPLETE. story:done (delivery:tested).
 Rig: $RIG
 Deploy: $DEPLOY_CMD
 Prod test: $DONE_TEST_LINE
@@ -874,13 +915,13 @@ Criteria verified: estrela_guia, equilibrios, dashboard (see bead metadata)" 2>/
   # Fully guarded: every step `|| true`. If close fails (e.g. cross-store no-op),
   # the merged-bead-janitor remains a backstop, but the story:approved REMOVAL
   # above still pulls the bead out of Aprovadas even if it stays open.
-  bd -C "$GC_CITY" label remove "$STORY_ID" "story:approved"  -q 2>/dev/null || true
-  bd -C "$GC_CITY" label remove "$STORY_ID" "story:in-flight" -q 2>/dev/null || true
+  bd -C "$STORY_STORE" label remove "$STORY_ID" "story:approved"  -q 2>/dev/null || true
+  bd -C "$STORY_STORE" label remove "$STORY_ID" "story:in-flight" -q 2>/dev/null || true
   DELIVERY_CLOSE_REASON="Story DELIVERED — deployed + verified in prod, story:done (rig $RIG, ${DONE_PUSH_TAIL:-delivered}). Closed by story-delivery (ga-i53ua durable terminal)."
-  CLOSE_STATUS_NOW=$(bd -C "$GC_CITY" show "$STORY_ID" --json 2>/dev/null \
+  CLOSE_STATUS_NOW=$(bd -C "$STORY_STORE" show "$STORY_ID" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || echo "open")
   if [ "$CLOSE_STATUS_NOW" != "closed" ]; then
-    if bd -C "$GC_CITY" close "$STORY_ID" -r "$DELIVERY_CLOSE_REASON" 2>/dev/null; then
+    if bd -C "$STORY_STORE" close "$STORY_ID" -r "$DELIVERY_CLOSE_REASON" 2>/dev/null; then
       log "Story $STORY_ID CLOSED (delivery terminal: story:approved removed; delivery close_reason → painel Done)."
     else
       warn "Could not close story $STORY_ID at delivery terminal (non-fatal; story:approved already removed so it leaves Aprovadas; merged-bead-janitor backstops the close)."
