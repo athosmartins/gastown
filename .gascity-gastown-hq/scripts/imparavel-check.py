@@ -419,6 +419,24 @@ def main():
     if not d.get("responsive"):
         fails.append("DOLT não responde (bd query falhou) — coletar diagnóstico antes de reiniciar")
 
+    # REAL building count across ALL stores (HQ+rigs). The dispatchable flowing_count is
+    # ~0 by construction (dispatchable = not-yet-dispatched); rig-native builds (ps-/wa-)
+    # carry story:in-flight in their OWN store, invisible to an HQ-only view (the same
+    # cross-store class that bit the daemons). This is the honest "is the machine
+    # producing RIGHT NOW?" signal — without it the check under-reports active builds.
+    building_ids = []
+    for _bn_name, _bn_root in RIGS:
+        try:
+            _bn_out = subprocess.run([BD, "-C", _bn_root, "list", "-l", "story:in-flight", "--json"],
+                                     capture_output=True, text=True, timeout=15)
+            for _bn_b in json.loads(_bn_out.stdout or "[]"):
+                _bn_id = _bn_b.get("id", "")
+                if _bn_id and "wisp" not in _bn_id:
+                    building_ids.append("%s/%s" % (_bn_name, _bn_id))
+        except Exception:
+            pass
+    building_now = len(building_ids)
+
     # --- Report ---
     print("═══ CHECK IMPARÁVEL — %s ═══" % time.strftime("%Y-%m-%d %H:%M %Z"))
     print("")
@@ -457,6 +475,9 @@ def main():
     last_sw_s = ("%.1f" % last_sw) if isinstance(last_sw, float) else str(last_sw)
     print("PILOT vivo=%s (último sweep há %s min)   DOLT responde=%s (%sms)"
           % (p.get("alive"), last_sw_s, d.get("responsive"), d.get("latency_ms")))
+    if building_now:
+        print("🔨 EM BUILD AGORA (real, todos os stores): %d — %s"
+              % (building_now, ", ".join(building_ids[:8])))
     print("")
 
     if fails:
@@ -475,9 +496,14 @@ def main():
         sys.exit(2)
     else:
         print("VEREDITO: ✅ IMPARÁVEL agora")
+        if building_now:
+            print("  🔨 Construindo %d agora (%s) — a máquina ESTÁ produzindo, não ociosa."
+                  % (building_now, ", ".join(building_ids[:6])))
         if a.get("from_dispatchable") and a["buildable_count"] == 0 and a["parked_count"] > 0:
             print("  Fila inflada com needs-human/on-device/blocked, mas 0 genuinamente construível"
-                  " → ocioso correto (%d parked)." % a["parked_count"])
+                  " → %s (%d parked)."
+                  % ("ocioso correto" if not building_now else "fila dispatchable parqueada (mas há build ativo acima)",
+                     a["parked_count"]))
         else:
             print("  Nenhuma construível parada em silêncio; gate fluindo ou ocioso-com-fila-vazia;"
                   " pilot e Dolt vivos.")
