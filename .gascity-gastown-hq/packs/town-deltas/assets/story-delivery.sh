@@ -259,24 +259,44 @@ if [ -z "$FORCE_STORY_ID" ]; then
     TASK_BEAD_TITLE=$(echo "$TASK_BEAD" | jq -r '.title // "untitled"' | head -c 80)
     TASK_STORE=$(echo "$TASK_BEAD" | jq -r '._store // ""')
     [ -z "$TASK_STORE" ] && TASK_STORE="$GC_CITY"
-    log "Task reconciler: gate:passed non-story bead $TASK_BEAD_ID ($TASK_BEAD_TITLE) in store $TASK_STORE — closing (no deploy/prod-test; merge verified by gate)"
-    if [ "$DRY_RUN" = "1" ]; then
-      log "DRY_RUN=1 — WOULD: bd -C $TASK_STORE close $TASK_BEAD_ID (gate:passed task reconciler, ga-tjqe)"
+    # ga-iwv0 (done==deployed, not merged): a gate:passed bead that ALSO carries delivery:failed
+    # went THROUGH the delivery path and did NOT complete (e.g. daemon-refresh
+    # NEEDS_GUARDED_RESTART → deploy pending; or a prod-test halt). It is a deploy-PENDING story,
+    # NOT a no-deploy artifact task — closing it here would mark "done" while the merged code is
+    # NOT live in prod (the exact gap that closed wa-t4olb before its daemon was restarted). Do
+    # NOT close: re-arm story:approved so Step 1 re-picks it and runs delivery to REAL completion
+    # (story:done is set only after the daemon-refresh + prod-test verify). A bead with
+    # delivery:failed is, by construction, one that ran delivery → it is a story, never an
+    # artifact task, so re-arming story:approved is correct.
+    TASK_DEPLOY_PENDING=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | contains(["delivery:failed"])) then "1" else "0" end' 2>/dev/null || echo "0")
+    if [ "$TASK_DEPLOY_PENDING" = "1" ]; then
+      log "Task reconciler: $TASK_BEAD_ID has delivery:failed (deploy PENDING) — NOT closing; re-arming story:approved for delivery retry (ga-iwv0: done must mean deployed, not merged)."
+      if [ "$DRY_RUN" = "1" ]; then
+        log "DRY_RUN=1 — WOULD: bd -C $TASK_STORE label add $TASK_BEAD_ID story:approved (re-arm delivery retry; do NOT close)"
+      else
+        bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "story:approved" -q 2>/dev/null || true
+        bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-iwv0): NOT closed — this bead carries delivery:failed, i.e. delivery ran and did NOT complete (deploy pending — e.g. a hot-path daemon needs a guarded restart). Closing here would mark done while the merged code is not live in prod. Re-armed story:approved so the delivery sweep retries to completion; story:done is set only after the deploy (daemon-refresh) + prod-test verify." 2>/dev/null || true
+      fi
     else
-      bd -C "$TASK_STORE" close "$TASK_BEAD_ID" \
-        -r "Delivery task reconciler (ga-tjqe): gate:passed non-story bead closed — merge verified by gate. Gate dispatcher's direct-close (ga-esbg) was the primary path; this sweep catches beads the dispatcher did not close (e.g., crash between gate:passed + bd close)." \
-        2>/dev/null || warn "Task reconciler: could not close $TASK_BEAD_ID (non-fatal; will retry next sweep)"
-      bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-tjqe): gate:passed is set and this bead is not a story (no story:approved). Closed by delivery sweep — terminal for artifact tasks (no deploy/prod-test needed; merge already verified by gate)." 2>/dev/null || true
-      log "Task reconciler: closed $TASK_BEAD_ID"
-      mkdir -p "$(dirname "$DELIVERY_LOG")"
-      jq -c -n \
-        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        --arg task_id "$TASK_BEAD_ID" \
-        --arg task_title "$TASK_BEAD_TITLE" \
-        --arg result "task_closed" \
-        --arg dry_run "$DRY_RUN" \
-        '{ts: $ts, event: "task_reconcile", task_id: $task_id, task_title: $task_title, result: $result, dry_run: $dry_run}' \
-        >> "$DELIVERY_LOG" 2>/dev/null || true
+      log "Task reconciler: gate:passed non-story bead $TASK_BEAD_ID ($TASK_BEAD_TITLE) in store $TASK_STORE — closing (no deploy/prod-test; merge verified by gate)"
+      if [ "$DRY_RUN" = "1" ]; then
+        log "DRY_RUN=1 — WOULD: bd -C $TASK_STORE close $TASK_BEAD_ID (gate:passed task reconciler, ga-tjqe)"
+      else
+        bd -C "$TASK_STORE" close "$TASK_BEAD_ID" \
+          -r "Delivery task reconciler (ga-tjqe): gate:passed non-story bead closed — merge verified by gate. Gate dispatcher's direct-close (ga-esbg) was the primary path; this sweep catches beads the dispatcher did not close (e.g., crash between gate:passed + bd close)." \
+          2>/dev/null || warn "Task reconciler: could not close $TASK_BEAD_ID (non-fatal; will retry next sweep)"
+        bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-tjqe): gate:passed is set and this bead is not a story (no story:approved). Closed by delivery sweep — terminal for artifact tasks (no deploy/prod-test needed; merge already verified by gate)." 2>/dev/null || true
+        log "Task reconciler: closed $TASK_BEAD_ID"
+        mkdir -p "$(dirname "$DELIVERY_LOG")"
+        jq -c -n \
+          --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          --arg task_id "$TASK_BEAD_ID" \
+          --arg task_title "$TASK_BEAD_TITLE" \
+          --arg result "task_closed" \
+          --arg dry_run "$DRY_RUN" \
+          '{ts: $ts, event: "task_reconcile", task_id: $task_id, task_title: $task_title, result: $result, dry_run: $dry_run}' \
+          >> "$DELIVERY_LOG" 2>/dev/null || true
+      fi
     fi
   fi
 fi
