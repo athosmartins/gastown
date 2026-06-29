@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.auto-rehome-janitor</string>
+
+  <!-- Auto-Rehome Janitor (2026-06-28). Moves HQ beads tagged needs:rehome-<rig>
+       into their target rig store, preserving full refino lineage.
+
+       PROBLEM: beads approved in HQ that belong to a non-HQ rig sit in HQ forever.
+       The rig's builder pool only dispatches from its own store. Confirmed stuck:
+         ga-3v288, ga-fhir7, ga-s97zl (story:approved + needs:rehome-property in HQ).
+
+       OPERATION per sweep (MAX_PER_SWEEP=1 default — conservative pace):
+         1. Scan HQ for beads with any needs:rehome-<rig> label.
+         2. Resolve label suffix → target rig (e.g. 'property' → property_scrapers).
+         3. Create equivalent bead in rig store: preserves title, description,
+            acceptance_criteria, all story.* metadata, story:approved, lane:*, gate:*
+            labels. DROPS: needs:rehome-* (satisfied) + pilot:held-until:* (HQ cruft).
+         4. Verify new bead exists (safety check before touching HQ original).
+         5. Mark HQ bead gc.rehomed_to=<new_id> (idempotency anchor).
+         6. Comment both beads with cross-link ids.
+         7. Close HQ original.
+
+       SAFETY: HQ bead is only closed AFTER new bead is created AND verified.
+       Any failure leaves HQ bead completely untouched (no data loss).
+
+       IDEMPOTENCY: gc.rehomed_to metadata on HQ bead prevents re-processing.
+       State file (.gc/auto-rehome-janitor-state.json) provides secondary guard.
+
+       KILL-SWITCH: REHOME_JANITOR_ENABLED=0 → safe no-op.
+       DRY-RUN: REHOME_JANITOR_DRY_RUN=1 → logs intended actions, mutates nothing.
+
+       CADENCE: StartInterval=600 (10min). No KeepAlive — one-shot script.
+
+       DPW_CRITICAL: add com.gascity.auto-rehome-janitor to DPW_CRITICAL after
+       Mayor deploys (edit daemon-presence-watchdog.sh default set; not here). -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/auto-rehome-janitor.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <!-- One-shot cadence: launchd runs the script every 600s (10min). -->
+  <key>StartInterval</key><integer>600</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/auto-rehome-janitor.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/auto-rehome-janitor.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+    <!-- Kill-switch: set to 0 to disable the janitor entirely (safe no-op). -->
+    <key>REHOME_JANITOR_ENABLED</key>
+    <string>1</string>
+
+    <!-- DRY_RUN: set to 1 to log intended actions without mutating any bead.
+         Recommended: deploy DRY_RUN=1 first, validate one clean cycle, then flip to 0. -->
+    <key>REHOME_JANITOR_DRY_RUN</key>
+    <string>0</string>
+
+    <!-- MAX_PER_SWEEP: re-home at most N beads per 10-min cycle. Default 1 for safe pace.
+         Raise to 5 if you want to drain the backlog faster (still conservative). -->
+    <key>REHOME_MAX_PER_SWEEP</key>
+    <string>1</string>
+
+    <!-- BD_TIMEOUT: seconds before bd subcommands time out. -->
+    <key>REHOME_BD_TIMEOUT</key>
+    <string>30</string>
+
+    <!-- SKIP_SUSPENDED: set to 1 to skip re-homing to suspended rigs.
+         Default 0: re-home even to suspended rigs (bead waits there for rig restart). -->
+    <key>REHOME_SKIP_SUSPENDED</key>
+    <string>0</string>
+
+    <key>BD_ACTOR</key>
+    <string>automation</string>
+  </dict>
+</dict>
+</plist>
