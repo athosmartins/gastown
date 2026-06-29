@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.sling-task-janitor</string>
+
+  <!-- Sling-Task Janitor (2026-06-29). Closes orphaned dispatch sling-task stubs.
+
+       PROBLEM: the Pilot mints a ctx:thin type:task bead at dispatch time, titled
+       "build story <id>" / "fix bug <id>", to hand work to a builder. When the
+       dispatch fails/reclaims or the parent parks/closes, the stub lingers OPEN with
+       no lifecycle label — polluting the Triagem column (no-lifecycle-label work).
+       42 orphans accumulated by 2026-06-29 (parents blocked/deferred/done; e.g.
+       "build story ga-wuzeg" x5, "ga-a3lmo" x10, "ga-sf661" x4).
+
+       CLOSE a stub when ALL hold (conservative, fail-toward-KEEP):
+         - type==task AND title matches the sling pattern (parent id extracted)
+         - NOT itself story:in-flight/approved/done (not tracked work)
+         - NO live assignee (a live builder session = active build → KEEP)
+         - parent NOT story:in-flight (in-flight parent = active build → KEEP;
+           closed/deferred/blocked/parked/missing parent = orphan → CLOSE)
+         - age > MIN_AGE_MIN (60) — NEVER race a just-minted dispatch stub
+
+       KILL-SWITCH: SLING_JANITOR_ENABLED=0 → safe no-op.
+       DRY-RUN: SLING_JANITOR_DRY_RUN=1 → logs intended actions, mutates nothing.
+       CADENCE: StartInterval=900 (15min). No KeepAlive — one-shot script.
+
+       DPW_CRITICAL: registered in daemon-presence-watchdog.sh after deploy. -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/sling-task-janitor.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>900</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/sling-task-janitor.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/sling-task-janitor.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+    <!-- Kill-switch: set to 0 to disable entirely (safe no-op). -->
+    <key>SLING_JANITOR_ENABLED</key>
+    <string>1</string>
+
+    <!-- DRY_RUN: set to 1 to log intended actions without closing any bead. -->
+    <key>SLING_JANITOR_DRY_RUN</key>
+    <string>0</string>
+
+    <!-- MAX_PER_SWEEP: close at most N orphan stubs per 15-min cycle. -->
+    <key>SLING_MAX_PER_SWEEP</key>
+    <string>10</string>
+
+    <!-- MIN_AGE_MIN: never close a stub younger than this (avoid racing a fresh dispatch). -->
+    <key>SLING_MIN_AGE_MIN</key>
+    <string>60</string>
+
+    <key>SLING_BD_TIMEOUT</key>
+    <string>30</string>
+
+    <key>BD_ACTOR</key>
+    <string>automation</string>
+  </dict>
+</dict>
+</plist>
