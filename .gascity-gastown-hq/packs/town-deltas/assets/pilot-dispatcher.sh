@@ -1327,7 +1327,7 @@ _filter_built() {
   if [ -n "${PILOT_TEST_BRANCH_BEADS+x}" ]; then
     arr=$(cat)
     printf '%s' "$arr" | jq --arg b "$PILOT_TEST_BRANCH_BEADS" \
-      '($b|split(" ")) as $bi | [ .[] | select((.id as $i | $bi | index($i)) | not) ]' \
+      '($b|split(" ")) as $bi | [ .[] | select(((.id as $i | $bi | index($i)) | not) or ((.labels // []) | index("gate:needs-fix"))) ]' \
       2>/dev/null || printf '%s' "$arr"
     return
   fi
@@ -1347,7 +1347,7 @@ _filter_built() {
   done < <(printf '%s' "$arr" | jq -r '.[]?.id // empty' 2>/dev/null)
   [ -z "$built_ids" ] && { printf '%s' "$arr"; return; }
   printf '%s' "$arr" | jq --arg b "$built_ids" \
-    '($b|split(" ")) as $bi | [ .[] | select((.id as $i | $bi | index($i)) | not) ]' \
+    '($b|split(" ")) as $bi | [ .[] | select(((.id as $i | $bi | index($i)) | not) or ((.labels // []) | index("gate:needs-fix"))) ]' \
     2>/dev/null || printf '%s' "$arr"
 }
 

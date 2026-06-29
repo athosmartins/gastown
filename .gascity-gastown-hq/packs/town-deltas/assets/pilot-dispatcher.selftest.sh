@@ -2400,6 +2400,18 @@ if [ "$FB_OPEN" = '["wa-built","wa-fresh"]' ]; then
 else
   bad "_filter_built fail-open broke (got: '$FB_OPEN')"
 fi
+# gate:needs-fix EXEMPTION: a built bead in the gate-fix loop carries its fix branch but
+# MUST stay a candidate for re-dispatch (parity with the ownership-guard exemption 025b0cf58).
+# Dropping it would silently kill the gate-fix loop for self-repo rigs (local branch visible
+# to _filter_built), now that the HQ-empty fallback applies _filter_built (f7990dcf6).
+FB_NF="$(eval "$_FB_FN"; export PILOT_TEST_BRANCH_BEADS="wa-built wa-nf"
+  printf '%s' '[{"id":"wa-built","labels":["story:approved"]},{"id":"wa-nf","labels":["story:approved","gate:needs-fix"]},{"id":"wa-fresh","labels":[]}]' \
+    | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
+if [ "$FB_NF" = '["wa-nf","wa-fresh"]' ]; then
+  ok "_filter_built EXEMPTS gate:needs-fix (built fix-loop bead kept for re-dispatch; plain built dropped)"
+else
+  bad "_filter_built gate:needs-fix exemption broke (got: '$FB_NF')"
+fi
 has "$DISPATCHER" '_filter_built()'                        "_filter_built helper defined (HOL-block layer 2)"
 has "$DISPATCHER" '_filter_dispatch_gates | _filter_built' "_filter_built applied in the ctx:ready filter chain"
 # The HQ-empty rig FALLBACK scan (RIG_BUGS/RIG_DEBT/RIG_FEATURES) MUST apply the same
