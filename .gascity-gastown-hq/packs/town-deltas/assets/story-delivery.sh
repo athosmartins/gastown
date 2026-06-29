@@ -259,23 +259,24 @@ if [ -z "$FORCE_STORY_ID" ]; then
     TASK_BEAD_TITLE=$(echo "$TASK_BEAD" | jq -r '.title // "untitled"' | head -c 80)
     TASK_STORE=$(echo "$TASK_BEAD" | jq -r '._store // ""')
     [ -z "$TASK_STORE" ] && TASK_STORE="$GC_CITY"
-    # ga-iwv0 (done==deployed, not merged): a gate:passed bead that ALSO carries delivery:failed
-    # went THROUGH the delivery path and did NOT complete (e.g. daemon-refresh
-    # NEEDS_GUARDED_RESTART → deploy pending; or a prod-test halt). It is a deploy-PENDING story,
-    # NOT a no-deploy artifact task — closing it here would mark "done" while the merged code is
-    # NOT live in prod (the exact gap that closed wa-t4olb before its daemon was restarted). Do
-    # NOT close: re-arm story:approved so Step 1 re-picks it and runs delivery to REAL completion
-    # (story:done is set only after the daemon-refresh + prod-test verify). A bead with
-    # delivery:failed is, by construction, one that ran delivery → it is a story, never an
-    # artifact task, so re-arming story:approved is correct.
-    TASK_DEPLOY_PENDING=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | contains(["delivery:failed"])) then "1" else "0" end' 2>/dev/null || echo "0")
+    # ga-iwv0 (done==deployed, not merged): a gate:passed bead that ALSO carries
+    # delivery:deploy-pending went THROUGH delivery and the DEPLOY did not complete (a hot-path
+    # daemon needs a guarded restart / did not come up fresh → merged code is NOT live). It is a
+    # deploy-PENDING story, NOT a no-deploy artifact task — closing it here would mark "done"
+    # while the code is dormant in prod (the exact gap that closed wa-t4olb before its daemon was
+    # restarted). Do NOT close: re-arm story:approved so Step 1 re-picks it and runs delivery to
+    # REAL completion (story:done only after daemon-refresh verifies live). NOTE: we key on the
+    # specific delivery:deploy-pending label, NOT generic delivery:failed — a prod-test
+    # delivery:failed must NOT auto-retry here (a flaky test would loop forever); that path stays
+    # author-driven.
+    TASK_DEPLOY_PENDING=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | contains(["delivery:deploy-pending"])) then "1" else "0" end' 2>/dev/null || echo "0")
     if [ "$TASK_DEPLOY_PENDING" = "1" ]; then
-      log "Task reconciler: $TASK_BEAD_ID has delivery:failed (deploy PENDING) — NOT closing; re-arming story:approved for delivery retry (ga-iwv0: done must mean deployed, not merged)."
+      log "Task reconciler: $TASK_BEAD_ID has delivery:deploy-pending (deploy NOT live) — NOT closing; re-arming story:approved for delivery retry (ga-iwv0: done must mean deployed, not merged)."
       if [ "$DRY_RUN" = "1" ]; then
         log "DRY_RUN=1 — WOULD: bd -C $TASK_STORE label add $TASK_BEAD_ID story:approved (re-arm delivery retry; do NOT close)"
       else
         bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "story:approved" -q 2>/dev/null || true
-        bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-iwv0): NOT closed — this bead carries delivery:failed, i.e. delivery ran and did NOT complete (deploy pending — e.g. a hot-path daemon needs a guarded restart). Closing here would mark done while the merged code is not live in prod. Re-armed story:approved so the delivery sweep retries to completion; story:done is set only after the deploy (daemon-refresh) + prod-test verify." 2>/dev/null || true
+        bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-iwv0): NOT closed — this bead carries delivery:deploy-pending, i.e. delivery ran and the deploy did NOT go live (a hot-path daemon needs a guarded restart). Closing here would mark done while the merged code is dormant in prod. Re-armed story:approved so the delivery sweep retries to completion; story:done is set only after the deploy (daemon-refresh) verifies the daemon is live on the new code." 2>/dev/null || true
       fi
     else
       log "Task reconciler: gate:passed non-story bead $TASK_BEAD_ID ($TASK_BEAD_TITLE) in store $TASK_STORE — closing (no deploy/prod-test; merge verified by gate)"
@@ -716,6 +717,11 @@ else
       if [ "$DRY_RUN" != "1" ]; then
         bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
         bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:failed"  -q 2>/dev/null || true
+        # ga-iwv0: mark the DEPLOY-PENDING cause distinctly (code merged but NOT live — a
+        # daemon needs a guarded restart / did not come up fresh). The task reconciler keys on
+        # THIS label to re-arm story:approved (retry to real deploy), vs. a prod-test
+        # delivery:failed which must NOT auto-retry (e.g. a flaky test → infinite loop).
+        bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:deploy-pending" -q 2>/dev/null || true
         bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-iwv0 daemon refresh): $REFRESH_VERDICT — $REFRESH_REASON
 A long-lived daemon serving rig '$RIG' is running code OLDER than this deploy and could not be safely refreshed/verified, so the merged feature would be DORMANT in production. story:done is WITHHELD (a dormant deploy must never be marked done).
 $REFRESH_ACTION
@@ -937,6 +943,11 @@ Criteria verified: estrela_guia, equilibrios, dashboard (see bead metadata)" 2>/
   # above still pulls the bead out of Aprovadas even if it stays open.
   bd -C "$STORY_STORE" label remove "$STORY_ID" "story:approved"  -q 2>/dev/null || true
   bd -C "$STORY_STORE" label remove "$STORY_ID" "story:in-flight" -q 2>/dev/null || true
+  # ga-iwv0: this terminal is reached only after the daemon-refresh verified the deploy is LIVE,
+  # so clear any deploy-pending/failed markers left by an earlier halted attempt — the bead is
+  # now genuinely deployed; stale markers must not linger on a delivered story.
+  bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:deploy-pending" -q 2>/dev/null || true
+  bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:failed"          -q 2>/dev/null || true
   DELIVERY_CLOSE_REASON="Story DELIVERED — deployed + verified in prod, story:done (rig $RIG, ${DONE_PUSH_TAIL:-delivered}). Closed by story-delivery (ga-i53ua durable terminal)."
   CLOSE_STATUS_NOW=$(bd -C "$STORY_STORE" show "$STORY_ID" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || echo "open")
