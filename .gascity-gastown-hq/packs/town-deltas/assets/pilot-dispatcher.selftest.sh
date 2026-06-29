@@ -2016,12 +2016,31 @@ fi
 
 echo "Scenario 19b: emit EXCLUDES assigned/braked beads (shared filter chain)"
 # An ASSIGNED bug must be dropped by _filter_candidates; a clean one kept.
-EMIT_BUGS_19B='[{"id":"tt-emit-clean","title":"clean","priority":0,"issue_type":"bug","description":"ctx","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},{"id":"tt-emit-assigned","title":"assigned","priority":0,"issue_type":"bug","description":"ctx","status":"open","labels":[],"assignee":"someone-wa","created_at":"2026-06-01T00:00:00Z","metadata":{}}]'
+EMIT_BUGS_19B='[{"id":"tt-emit-clean","title":"clean","priority":0,"issue_type":"bug","description":"clean ready bug with a full description for the assigned-veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},{"id":"tt-emit-assigned","title":"assigned","priority":0,"issue_type":"bug","description":"assigned bug with a full description for the assigned-veto test","status":"open","labels":[],"assignee":"someone-wa","created_at":"2026-06-01T00:00:00Z","metadata":{}}]'
 F19B="$(run_emit "$EMIT_BUGS_19B")"
 if jq -e '[.items[].id] | (index("tt-emit-clean") != null) and (index("tt-emit-assigned") == null)' "$F19B" >/dev/null 2>&1; then
   ok "emit kept the clean bead and excluded the assigned one (filter parity)"
 else
   bad "emit did not apply the assigned-veto correctly (got: $(jq -c '[.items[].id]' "$F19B" 2>/dev/null))"
+fi
+
+echo "Scenario 19h: emit chain = real dispatch chain (ga-aprov: no blocked/manual/waiting leak into Aprovadas)"
+# The emit feeds the painel 'Aprovadas' column AND the imparavel-check. It MUST exclude
+# exactly what real dispatch excludes — else blocked/manual/waiting work shows as READY.
+# (a) structural drift-guard: the emit chain string carries the full filter set.
+has "$DISPATCHER" '_filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "\$_db" | _filter_explicit_deps "\$_db"' \
+  "emit applies the FULL real-dispatch filter chain (exec_manual+dispatch_gates+built) — Aprovadas honest"
+# (b) behavioral: _filter_dispatch_gates drops waiting-on:* and next-action:* (were missing everywhere).
+_FDG="$(awk '/^_filter_dispatch_gates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+FDG_OUT="$(eval "$_FDG"; printf '%s' '[
+  {"id":"fdg-clean","status":"open","description":"a ready bead with a full description over the floor length","labels":["lane:small"]},
+  {"id":"fdg-wait","status":"open","description":"a ready bead with a full description over the floor length","labels":["waiting-on:survival-wa-flba"]},
+  {"id":"fdg-next","status":"open","description":"a ready bead with a full description over the floor length","labels":["next-action:athos+oracle"]}
+]' | _filter_dispatch_gates | jq -rc '[.[].id]' 2>/dev/null)"
+if [ "$FDG_OUT" = '["fdg-clean"]' ]; then
+  ok "_filter_dispatch_gates excludes waiting-on:* and next-action:* (waiting work never dispatchable)"
+else
+  bad "_filter_dispatch_gates waiting-on/next-action exclusion broke (got: '$FDG_OUT')"
 fi
 
 echo "Scenario 19c: emit writes count=0 / items=[] when there are NO candidates"

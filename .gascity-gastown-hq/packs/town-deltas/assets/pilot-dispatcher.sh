@@ -1310,6 +1310,7 @@ _filter_dispatch_gates() {
         or (((.description) // "") | length) >= $floor )
       and (((.labels // []) | map(select(test("^(blocked-on|depends-on):"))) | length) == 0)
       and ((((.title) // "") + " " + ((.description) // "")) | ascii_downcase | test("design[ -]?first") | not)
+      and (((.labels // []) | map(select(test("^(waiting-on|next-action):"))) | length) == 0)
     )]' 2>/dev/null || cat
 }
 # _filter_built — drop ctx:ready candidates that ALREADY have a crew branch (built work
@@ -1432,10 +1433,13 @@ _emit_query_one() {
   fi
   _merged=$(echo "$_bugs $_debt $_feat $_ctx" \
     | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
-  # IDENTICAL filter chain to the real dispatch path.
-  _merged=$(echo "$_merged" | _filter_candidates)
-  _merged=$(echo "$_merged" | _filter_unblocked "$_db")
-  _merged=$(echo "$_merged" | _filter_explicit_deps "$_db")
+  # IDENTICAL filter chain to the real dispatch path (ga-aprov: the emit feeds BOTH the
+  # painel "Aprovadas" column AND the imparavel-check, so it MUST exclude exactly what
+  # real dispatch excludes. Previously it ran only _filter_candidates|_unblocked|_explicit_deps,
+  # leaking exec:manual + status=blocked/deferred + blocked-on:* + design-first into
+  # "dispatchable" — so blocked/manual work showed as READY in Aprovadas. Now matches the
+  # real chain: + _filter_exec_manual + _filter_dispatch_gates + _filter_built.)
+  _merged=$(echo "$_merged" | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "$_db" | _filter_explicit_deps "$_db")
   # Stamp the originating store on every item (so the painel knows where it lives).
   echo "$_merged" | jq --arg store "$_store" '[ .[] | . + {"_emit_store": $store} ]' 2>/dev/null || echo "[]"
 }
