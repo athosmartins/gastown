@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.gate-marker-rehome-janitor</string>
+
+  <!-- Gate-Marker Re-home Janitor (2026-06-29, ga-pnugy). Re-homes orphaned
+       quality-gate markers rig → HQ.
+
+       PROBLEM: the quality-gate dispatcher + guard scan ONLY the HQ store for
+       type:quality-gate-marker beads. But /gate-done creates the marker with
+       `bd -C "$GC_CITY_PATH"`, and for a SELF-REPO rig (whatsapp_automation,
+       marketing, gastown) the worker's GC_CITY_PATH is the RIG, not HQ — so the
+       marker lands in the rig store where the gate NEVER sees it. The branch is
+       ready-for-gate but is never reviewed/merged → silent stall. (Container rigs
+       like property_scrapers are unaffected: their workers' GC_CITY_PATH is HQ.)
+       Fixing /gate-done is a deploy nightmare (~10 .claude/commands/gate-done.md
+       copies across crew worktrees); this janitor is the robust, isolated fix.
+
+       OPERATION per sweep (MAX_PER_SWEEP cap): scan every NON-HQ rig store for an
+       OPEN type:quality-gate-marker with gate-status:ready|queued not already
+       re-homed. Recreate it in HQ (verbatim title/desc + labels, gate-status:ready),
+       VERIFY, stamp the rig original gc.rehomed_to=<hq-id>, then CLOSE it. The source
+       STORY bead stays in the rig (dispatcher resolves it cross-store, like for
+       container rigs). Does NOT touch the fragile gate/guard processing loop.
+
+       SAFETY: rig marker closed only AFTER the HQ copy is created + verified.
+       gc.rehomed_to prevents double-recreation. error/needs-rebase markers are
+       parked (a human moves them) → left untouched.
+
+       KILL-SWITCH: GATE_MARKER_REHOME_ENABLED=0 → no-op.
+       DRY-RUN: GATE_MARKER_REHOME_DRY_RUN=1.
+       CADENCE: StartInterval=300 (5min, matches the gate sweep). No KeepAlive.
+       DPW_CRITICAL: registered in daemon-presence-watchdog.sh. -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/gate-marker-rehome-janitor.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>300</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-marker-rehome-janitor.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-marker-rehome-janitor.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>GATE_MARKER_REHOME_ENABLED</key>
+    <string>1</string>
+    <key>GATE_MARKER_REHOME_DRY_RUN</key>
+    <string>0</string>
+    <key>GATE_MARKER_REHOME_MAX_PER_SWEEP</key>
+    <string>5</string>
+    <key>BD_ACTOR</key>
+    <string>automation</string>
+  </dict>
+</dict>
+</plist>
