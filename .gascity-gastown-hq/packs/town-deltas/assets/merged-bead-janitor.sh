@@ -295,6 +295,14 @@ EOF
 # rc0 iff branch_ref resolves and is an ancestor of main_ref.
 branch_merged() {
   local gdir="$1" container="$2" bref="$3" mref="$4"
+  # ga-tijv5 (2026-06-30): REJECT the degenerate self-referential check. A bref that
+  # resolved to the main ref itself (a bad marker-label, or a molecule fold-linkage
+  # giving "main") makes "origin/main ⊑ origin/main" trivially true → it FALSE-closed an
+  # in_progress bead whose real crew branch was 3 commits AHEAD of main, unmerged
+  # (wa-85iv8). A branch signal must compare a SEPARATE crew branch against main, never
+  # main against itself. (Primary root fix: the caller's basename==bead-id guard.)
+  [ -z "$bref" ] && return 1
+  [ "$bref" = "$mref" ] && return 1
   git_in "$gdir" "$container" rev-parse -q --verify "$bref" >/dev/null 2>&1 || return 1
   git_in "$gdir" "$container" merge-base --is-ancestor "$bref" "$mref" 2>/dev/null
 }
@@ -465,6 +473,14 @@ $(git_in "$RGITDIR" "$RCONTAINER" for-each-ref --format='%(refname:short)' 'refs
 EOF
       for br in "${CANDS[@]:-}"; do
         [ -z "$br" ] && continue
+        # ga-tijv5 (2026-06-30): a branch signal MUST be the bead's OWN crew/*/<id>
+        # branch — its final path segment must equal this bead id. branch_label_from_markers
+        # can return "main" or a FOLDED bead's branch (shared molecule_id — wa-85iv8's notes
+        # said "FOLDED into wa-zjkll"), which then self-matches origin/main ⊑ origin/main and
+        # FALSE-closes an in_progress bead with unmerged work. Skip any candidate whose final
+        # path segment != this bead id (the convention fallback already enforces this; this
+        # extends the same guard to the marker-label source).
+        case "$br" in */"$BID") : ;; *) continue ;; esac
         if branch_merged "$RGITDIR" "$RCONTAINER" "origin/$br" "origin/$RDEFAULT"; then
           SIG_BRANCH=1; BRANCH_EVID="origin/$br ⊑ origin/$RDEFAULT"; break
         fi

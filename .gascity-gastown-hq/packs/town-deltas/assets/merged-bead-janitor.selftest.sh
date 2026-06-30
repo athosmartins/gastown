@@ -153,6 +153,12 @@ git -C "$R" checkout -q main
 rc0 branch_merged "$R" 0 "merged-topic" "main"     # ancestor → merged
 rc1 branch_merged "$R" 0 "ahead-topic"  "main"     # has commit not in main → not merged
 rc1 branch_merged "$R" 0 "no-such-branch" "main"   # missing branch → not merged (safe)
+# ga-tijv5 regression: the degenerate self-referential check (bref == mref) must NOT
+# count as merged. A bad marker-label / fold-linkage that resolved the branch to "main"
+# itself made "main ⊑ main" trivially true and FALSE-closed an in_progress bead whose
+# real crew branch was AHEAD of main, unmerged (wa-85iv8 2026-06-30).
+rc1 branch_merged "$R" 0 "main" "main"             # main vs main → degenerate, NOT merged
+rc1 branch_merged "$R" 0 ""     "main"             # empty bref → not merged (safe)
 
 # ── 4. marker JSON helpers — synthetic fixtures ─────────────────────────────
 echo "── 4. marker helpers ──"
