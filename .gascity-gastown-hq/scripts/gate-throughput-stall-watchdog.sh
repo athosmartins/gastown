@@ -54,9 +54,21 @@ NOTIFY_BIN="${GTSW_NOTIFY_BIN:-/Users/athos/.local/bin/notify}"
 GC_BIN="${GTSW_GC_BIN:-gc}"
 UID_NUM="$(id -u)"
 
-GATE_STALL_COOLDOWN_S="${GATE_STALL_COOLDOWN_S:-7200}"    # 2h dedup window between stall alerts
+GATE_STALL_COOLDOWN_S="${GATE_STALL_COOLDOWN_S:-7200}"    # 2h dedup window between Athos pages
 GTSW_STATE_DIR="${GTSW_STATE_DIR:-$HOME/.gastown/state}"
 COOLDOWN_FILE="${GTSW_COOLDOWN_FILE:-$GTSW_STATE_DIR/gate-stall-watchdog-last-alert}"
+# ── recover-first escalation (gate-recovery philosophy) ───────────────────────
+# A confirmed stall does NOT immediately page Athos's phone — most are transient and
+# the auto-recovery (kickstart) clears them. On FIRST detection we mail the Mayor (who
+# can fix infra) + auto-recover and stamp a recover-marker; Athos's phone (notify -p4)
+# fires ONLY when the stall PERSISTS past GTSW_RECOVER_GRACE_SECS after that recovery
+# attempt — i.e. recovery demonstrably failed and a human is genuinely needed. This
+# kills the false-positive phone noise of paging Athos for stalls the machine self-heals
+# (Athos 2026-06-30: "só me notifique quando a máquina precisar de mim"). The marker is
+# reset (with the cooldown) by the stall-clear guards so a new episode starts fresh.
+RECOVER_MARKER_FILE="${GTSW_RECOVER_MARKER_FILE:-$GTSW_STATE_DIR/gate-stall-watchdog-recover-attempted}"
+GTSW_RECOVER_GRACE_SECS="${GTSW_RECOVER_GRACE_SECS:-420}"   # 7min for a kickstart to land before paging Athos
+case "$GTSW_RECOVER_GRACE_SECS" in ''|*[!0-9]*) GTSW_RECOVER_GRACE_SECS=420 ;; esac
 
 # Launchd labels for auto-recover kickstart
 SUPERVISOR_LABEL="${GTSW_SUPERVISOR_LABEL:-com.gascity.supervisor}"
@@ -123,6 +135,8 @@ run_sweep() {
   if [ "$queued_found" -eq 0 ]; then
     # COOLDOWN RESET: queue empty → stall cleared; disarm so next episode re-alerts immediately
     [ -f "${COOLDOWN_FILE}" ] && { rm -f "${COOLDOWN_FILE}" 2>/dev/null || true; log "COOLDOWN RESET: queue empty — cooldown disarmed"; }
+    # ga-evjs2: also clear the recover-marker so a NEW episode starts recover-first (no stale escalation)
+    [ -f "${RECOVER_MARKER_FILE}" ] && { rm -f "${RECOVER_MARKER_FILE}" 2>/dev/null || true; log "RECOVER-MARKER RESET: queue empty — next episode recovers before paging Athos"; }
     log "OK: no queued markers found in tail — gate idle (not a stall)"
     return 0
   fi
@@ -185,6 +199,8 @@ run_sweep() {
     local age_min; age_min=$(( (now - last_passed_epoch) / 60 ))
     # COOLDOWN RESET: Gate PASSED recently → stall cleared; disarm so next episode re-alerts immediately
     [ -f "${COOLDOWN_FILE}" ] && { rm -f "${COOLDOWN_FILE}" 2>/dev/null || true; log "COOLDOWN RESET: Gate PASSED ${age_min}min ago — cooldown disarmed"; }
+    # ga-evjs2: also clear the recover-marker so a NEW episode starts recover-first (no stale escalation)
+    [ -f "${RECOVER_MARKER_FILE}" ] && { rm -f "${RECOVER_MARKER_FILE}" 2>/dev/null || true; log "RECOVER-MARKER RESET: Gate PASSED ${age_min}min ago — next episode recovers before paging Athos"; }
     log "OK: Gate PASSED ${age_min}min ago (within ${GTSW_STALL_MINUTES}min window) — not a stall"
     return 0
   fi
@@ -242,23 +258,66 @@ run_sweep() {
     fi
   fi
 
-  local msg="GATE THROUGHPUT STALL: queue non-empty, 0 Gate PASSED in ${GTSW_STALL_MINUTES}min, not quota-limited, no active reviewer. Last pass: ${last_passed_desc}. Gate froze silently (heartbeat ≠ output). Kickstarting supervisor+gate (GTSW_AUTORECOVER=${GTSW_AUTORECOVER:-1})."
-  log "ALERT: $msg"
+  local msg="GATE THROUGHPUT STALL: queue non-empty, 0 Gate PASSED in ${GTSW_STALL_MINUTES}min, not quota-limited, no active reviewer. Last pass: ${last_passed_desc}."
+  log "STALL DETECTED: $msg"
 
   if [ "${GTSW_DRY_RUN:-0}" = "1" ]; then
-    log "DRY_RUN: would notify + mail mayor + autorecover"
+    log "DRY_RUN: would mail mayor + autorecover (+ page Athos only if it persists past ${GTSW_RECOVER_GRACE_SECS}s)"
     return 1
   fi
 
-  # NOTIFY (primary — Dolt-independent, always fires first)
-  if [ -n "${GTSW_TEST_NOTIFIED+x}" ]; then
-    echo "notify:$msg" >> "${GTSW_TEST_NOTIFIED}" 2>/dev/null || true
+  mkdir -p "${GTSW_STATE_DIR}" 2>/dev/null || true
+
+  # ── RECOVER-FIRST escalation (gate-recovery philosophy) ─────────────────────
+  # FIRST detection → stamp a recover-marker, mail the Mayor + auto-recover, and do
+  # NOT page Athos. While within GTSW_RECOVER_GRACE_SECS of that attempt → just wait
+  # (the kickstart needs time to land). Only when the stall PERSISTS past the grace
+  # do we page Athos's phone (recovery demonstrably failed → a human is genuinely
+  # needed). _page_athos gates the phone notify; the mail+autorecover below run on
+  # both the first detection and the escalation.
+  local recovered_at=0
+  [ -f "${RECOVER_MARKER_FILE}" ] && recovered_at="$(cat "${RECOVER_MARKER_FILE}" 2>/dev/null || echo 0)"
+  case "$recovered_at" in ''|*[!0-9]*) recovered_at=0 ;; esac
+
+  local _page_athos=0
+  if [ "$recovered_at" = "0" ]; then
+    echo "$now" > "${RECOVER_MARKER_FILE}" 2>/dev/null || true
+    log "STALL (first detection): auto-recovering + mailing Mayor; Athos NOT paged — recovery has ${GTSW_RECOVER_GRACE_SECS}s to land before escalation."
   else
-    command -v "${NOTIFY_BIN}" >/dev/null 2>&1 && \
-      "${NOTIFY_BIN}" -t "Gate stall" -p 4 "$msg" 2>/dev/null || true
+    local _recover_age=$(( now - recovered_at ))
+    if [ "$_recover_age" -lt "$GTSW_RECOVER_GRACE_SECS" ] 2>/dev/null; then
+      log "STALL persists but recovery is within grace (${_recover_age}s/${GTSW_RECOVER_GRACE_SECS}s) — not paging Athos yet."
+      return 1
+    fi
+    # recovery had its grace window and the stall PERSISTS → page Athos (cooldown-deduped)
+    local cooldown_s="${GATE_STALL_COOLDOWN_S:-7200}"
+    if [ -f "${COOLDOWN_FILE}" ]; then
+      local _last_pg; _last_pg="$(cat "${COOLDOWN_FILE}" 2>/dev/null)" || _last_pg=0
+      case "$_last_pg" in ''|*[!0-9]*) _last_pg=0 ;; esac
+      if [ "$_last_pg" -gt 0 ] 2>/dev/null && [ "$(( now - _last_pg ))" -lt "$cooldown_s" ] 2>/dev/null; then
+        log "STALL PERSISTS post-recovery (${_recover_age}s) but Athos already paged (cooldown) — suppressing dup page."
+        return 1
+      fi
+    fi
+    _page_athos=1
   fi
 
-  # GC MAIL (secondary — best-effort; failure never silences the notify)
+  # ── PAGE ATHOS (phone) — ONLY on escalation: recovery failed past the grace ─────
+  if [ "$_page_athos" = "1" ]; then
+    local page="GATE STALL PERSISTE após auto-recuperação: ${msg} O kickstart NÃO resolveu — precisa de intervenção."
+    if [ -n "${GTSW_TEST_NOTIFIED+x}" ]; then
+      echo "notify:$page" >> "${GTSW_TEST_NOTIFIED}" 2>/dev/null || true
+    else
+      command -v "${NOTIFY_BIN}" >/dev/null 2>&1 && \
+        "${NOTIFY_BIN}" -t "Gate stall (recovery failed)" -p 4 "$page" 2>/dev/null || true
+    fi
+    echo "$now" > "${COOLDOWN_FILE}" 2>/dev/null || true
+    log "ESCALATED to Athos (notify -p4): auto-recovery did not clear the stall within ${GTSW_RECOVER_GRACE_SECS}s. Athos-page cooldown armed (${GATE_STALL_COOLDOWN_S}s)."
+  fi
+
+  # ── MAIL MAYOR (can fix infra — informed on first detection AND on escalation) ──
+  local mail_subject="Watchdog: GATE THROUGHPUT STALL — ${GTSW_STALL_MINUTES}min sem Gate PASSED com fila cheia"
+  [ "$_page_athos" = "1" ] && mail_subject="Watchdog: GATE STALL PERSISTE após auto-recuperação (${GTSW_STALL_MINUTES}min) — precisa de intervenção"
   local mail_body
   mail_body="$(cat <<BODY
 GATE THROUGHPUT STALL detectado pelo gate-throughput-stall-watchdog.
@@ -267,6 +326,7 @@ CONDIÇÃO: queue não-vazia + 0 Gate PASSED em ${GTSW_STALL_MINUTES}min + não 
 
 Último Gate PASSED: ${last_passed_desc}
 Janela de análise: ${GTSW_STALL_MINUTES}min
+Escalado ao Athos: $([ "$_page_athos" = "1" ] && echo "SIM (auto-recuperação falhou após ${GTSW_RECOVER_GRACE_SECS}s)" || echo "NÃO (auto-recuperando; Athos só é paginado se persistir)")
 
 POR QUE O DPW NÃO PEGOU: o heartbeat do gate é tocado no INÍCIO de cada sweep
 (anti-false-WEDGE durante quota-defer) — então o heartbeat fica fresco mesmo quando
@@ -291,14 +351,9 @@ BODY
   else
     command -v "$GC_BIN" >/dev/null 2>&1 && \
       "$GC_BIN" mail send mayor \
-        -s "Watchdog: GATE THROUGHPUT STALL — ${GTSW_STALL_MINUTES}min sem Gate PASSED com fila cheia" \
+        -s "$mail_subject" \
         -m "$mail_body" 2>/dev/null || true
   fi
-
-  # ── COOLDOWN WRITE: arm dedup for next GATE_STALL_COOLDOWN_S seconds ─────
-  mkdir -p "${GTSW_STATE_DIR}" 2>/dev/null || true
-  echo "$now" > "${COOLDOWN_FILE}" 2>/dev/null || true
-  log "COOLDOWN ARMED: epoch $now written — dup alerts suppressed for ${cooldown_s}s"
 
   # ── AUTO-RECOVER ──────────────────────────────────────────────────────────
   if [ "${GTSW_AUTORECOVER:-1}" = "1" ]; then
@@ -348,6 +403,7 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   GTSW_SUPERVISOR_LABEL="com.gascity.supervisor"
   GTSW_GATE_LABEL="com.gascity.quality-gate-dispatcher"
   COOLDOWN_FILE="$TMP/cooldown"
+  RECOVER_MARKER_FILE="$TMP/recover-marker"
   GTSW_STATE_DIR="$TMP"
   GATE_STALL_COOLDOWN_S=7200
 
@@ -375,9 +431,12 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
     fi
   }
 
-  # ── Scenario 1: STALL CONFIRMED ───────────────────────────────────────────
-  echo "Scenario 1: queue non-empty + no progress + not quota-limited + no reviewer → STALL"
-  rm -f "$TMP/cooldown" 2>/dev/null || true   # ensure no stale cooldown from a previous run
+  # ── Scenario 1: STALL FIRST DETECTION → recover + mail Mayor, do NOT page Athos ──
+  # ga-evjs2 recover-first: a confirmed stall on FIRST sight auto-recovers + informs the
+  # Mayor but does NOT buzz Athos's phone (most stalls self-heal). The phone fires only
+  # if it persists past the grace (scenario 1b).
+  echo "Scenario 1: first stall detection → auto-recover + mail Mayor, Athos NOT paged (recover-first)"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true   # fresh episode
   KICKS1="$TMP/kicks1"; : > "$KICKS1"
   NOTIF1="$TMP/notif1"; : > "$NOTIF1"
   MAIL1="$TMP/mail1";   : > "$MAIL1"
@@ -388,10 +447,40 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   GTSW_TEST_NOTIFIED="$NOTIF1"
   GTSW_TEST_MAILED="$MAIL1"
   run_sweep && bad "scenario 1: stall should return 1 (alert)" || ok "scenario 1: stall detected (return 1)"
-  grep -q "notify:" "$NOTIF1" 2>/dev/null && ok "scenario 1: notify fired" || bad "scenario 1: notify NOT fired"
-  grep -q "mail:" "$MAIL1" 2>/dev/null && ok "scenario 1: gc mail sent" || bad "scenario 1: gc mail NOT sent"
+  grep -q "notify:" "$NOTIF1" 2>/dev/null && bad "scenario 1: Athos paged on FIRST detection (should recover-first)" || ok "scenario 1: Athos NOT paged on first detection (recover-first)"
+  grep -q "mail:" "$MAIL1" 2>/dev/null && ok "scenario 1: Mayor mailed on first detection" || bad "scenario 1: Mayor NOT mailed"
   grep -q "kickstart:$GTSW_SUPERVISOR_LABEL" "$KICKS1" 2>/dev/null && ok "scenario 1: supervisor kickstarted" || bad "scenario 1: supervisor NOT kickstarted"
   grep -q "kickstart:$GTSW_GATE_LABEL" "$KICKS1" 2>/dev/null && ok "scenario 1: gate kickstarted" || bad "scenario 1: gate NOT kickstarted"
+  [ -f "$TMP/recover-marker" ] && ok "scenario 1: recover-marker stamped" || bad "scenario 1: recover-marker NOT stamped"
+
+  # ── Scenario 1b: STALL PERSISTS past recover-grace → PAGE ATHOS ───────────
+  echo "Scenario 1b: stall persists past recover-grace → Athos paged + cooldown armed"
+  rm -f "$TMP/cooldown" 2>/dev/null || true
+  KICKS1B="$TMP/kicks1b"; : > "$KICKS1B"
+  NOTIF1B="$TMP/notif1b"; : > "$NOTIF1B"
+  MAIL1B="$TMP/mail1b";   : > "$MAIL1B"
+  GTSW_RECOVER_GRACE_SECS=420
+  echo "$(( $(date +%s) - 420 - 100 ))" > "$TMP/recover-marker"   # recovery attempted, grace elapsed
+  GTSW_TEST_KICKSTARTS="$KICKS1B"
+  GTSW_TEST_NOTIFIED="$NOTIF1B"
+  GTSW_TEST_MAILED="$MAIL1B"
+  run_sweep && bad "scenario 1b: stall should return 1" || ok "scenario 1b: stall detected (return 1)"
+  grep -q "notify:" "$NOTIF1B" 2>/dev/null && ok "scenario 1b: Athos PAGED (recovery failed past grace)" || bad "scenario 1b: Athos NOT paged despite persistent stall"
+  [ -f "$TMP/cooldown" ] && ok "scenario 1b: Athos-page cooldown armed" || bad "scenario 1b: cooldown NOT armed"
+
+  # ── Scenario 1c: stall WITHIN recover-grace → do NOT page Athos yet ───────
+  echo "Scenario 1c: stall within recover-grace → Athos NOT paged yet (recovery still landing)"
+  rm -f "$TMP/cooldown" 2>/dev/null || true
+  NOTIF1C="$TMP/notif1c"; : > "$NOTIF1C"
+  GTSW_RECOVER_GRACE_SECS=420
+  echo "$(date +%s)" > "$TMP/recover-marker"   # recovery JUST attempted (age ~0 < grace)
+  GTSW_TEST_KICKSTARTS="$TMP/kicks1c"; : > "$TMP/kicks1c"
+  GTSW_TEST_NOTIFIED="$NOTIF1C"
+  GTSW_TEST_MAILED="$TMP/mail1c"; : > "$TMP/mail1c"
+  run_sweep && bad "scenario 1c: stall should return 1" || ok "scenario 1c: stall detected (return 1)"
+  grep -q "notify:" "$NOTIF1C" 2>/dev/null && bad "scenario 1c: Athos paged too early (within grace)" || ok "scenario 1c: Athos NOT paged within grace (correct)"
+  # restore a clean slate for downstream scenarios
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
 
   # ── Scenario 2: EMPTY QUEUE → no alert ───────────────────────────────────
   echo "Scenario 2: empty queue (0 queued markers) → NOT a stall"
@@ -468,8 +557,10 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   GTSW_TEST_KICKSTARTS="$KICKS7"
   GTSW_TEST_NOTIFIED="$NOTIF7"
   GTSW_TEST_MAILED="$TMP/mail7"
+  rm -f "$TMP/recover-marker" 2>/dev/null || true   # fresh episode (first detection)
   run_sweep && bad "scenario 7: stall should return 1" || ok "scenario 7: stall detected (return 1) with AUTORECOVER=0"
-  grep -q "notify:" "$NOTIF7" 2>/dev/null && ok "scenario 7: notify fired" || bad "scenario 7: notify NOT fired"
+  # recover-first: first detection mails the Mayor but does NOT page Athos; AUTORECOVER=0 also means no kickstart
+  [ ! -s "$NOTIF7" ] && ok "scenario 7: Athos NOT paged on first detection" || bad "scenario 7: Athos paged on first detection (should recover-first)"
   [ ! -s "$KICKS7" ] && ok "scenario 7: no kickstart when AUTORECOVER=0" || bad "scenario 7: kickstart fired despite AUTORECOVER=0"
   GTSW_AUTORECOVER=1   # restore
 
@@ -509,9 +600,14 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   echo "Scenario 10: bash -n syntax check (catch regressions)"
   bash -n "$0" 2>/dev/null && ok "scenario 10: bash -n syntax check passes" || bad "scenario 10: bash -n FAILED — syntax error"
 
-  # ── Scenario 11: COOLDOWN DEDUP ───────────────────────────────────────────
-  echo "Scenario 11: cooldown dedup — alert fires once, 2nd run within window suppresses dup"
+  # ── Scenario 11: ATHOS-PAGE COOLDOWN DEDUP ────────────────────────────────
+  # Recover-first: the cooldown dedups the ATHOS PAGE, which only fires on ESCALATION
+  # (recovery failed past grace). Pre-stamp an old recover-marker so the 1st run takes
+  # the escalation path (pages Athos + arms cooldown); the 2nd run is then suppressed.
+  echo "Scenario 11: Athos-page cooldown dedup — page fires once on escalation, 2nd run suppressed"
   rm -f "$TMP/cooldown" 2>/dev/null || true  # ensure clean slate
+  GTSW_RECOVER_GRACE_SECS=420
+  echo "$(( $(date +%s) - 420 - 100 ))" > "$TMP/recover-marker"   # recovery attempted, grace elapsed → escalation
   NOTIF11a="$TMP/notif11a"; : > "$NOTIF11a"
   MAIL11a="$TMP/mail11a";   : > "$MAIL11a"
   KICKS11a="$TMP/kicks11a"; : > "$KICKS11a"
@@ -522,8 +618,8 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   GTSW_TEST_NOTIFIED="$NOTIF11a"
   GTSW_TEST_MAILED="$MAIL11a"
   run_sweep && bad "scenario 11a: 1st stall should return 1" || ok "scenario 11a: 1st stall detected (return 1)"
-  grep -q "notify:" "$NOTIF11a" 2>/dev/null && ok "scenario 11a: notify fired on 1st run" || bad "scenario 11a: notify NOT fired on 1st run"
-  [ -f "$TMP/cooldown" ] && ok "scenario 11a: cooldown file written after alert" || bad "scenario 11a: cooldown file NOT written after alert"
+  grep -q "notify:" "$NOTIF11a" 2>/dev/null && ok "scenario 11a: Athos paged on escalation (1st run)" || bad "scenario 11a: Athos NOT paged on escalation"
+  [ -f "$TMP/cooldown" ] && ok "scenario 11a: cooldown file written after page" || bad "scenario 11a: cooldown file NOT written after page"
   # 2nd run — same stall conditions, cooldown should suppress notify+mail
   NOTIF11b="$TMP/notif11b"; : > "$NOTIF11b"
   MAIL11b="$TMP/mail11b";   : > "$MAIL11b"
@@ -560,8 +656,12 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   GTSW_TEST_KICKSTARTS="$KICKS12b"
   GTSW_TEST_NOTIFIED="$NOTIF12b"
   GTSW_TEST_MAILED="$TMP/mail12b"
-  run_sweep && bad "scenario 12b: fresh stall after clear should return 1" || ok "scenario 12b: fresh stall after clear detected (return 1 — cooldown re-armed)"
-  grep -q "notify:" "$NOTIF12b" 2>/dev/null && ok "scenario 12b: notify fired on re-armed stall (not suppressed)" || bad "scenario 12b: notify NOT fired on re-armed stall (re-arm failed!)"
+  run_sweep && bad "scenario 12b: fresh stall after clear should return 1" || ok "scenario 12b: fresh stall after clear detected (return 1)"
+  # recover-first: the clear (Guard A) reset BOTH cooldown and recover-marker, so the
+  # fresh episode re-engages recovery (re-stamps the marker + re-mails the Mayor) rather
+  # than staying stale-suppressed. Athos is paged only if THIS episode persists past grace.
+  [ -f "$TMP/recover-marker" ] && ok "scenario 12b: recovery re-engaged after clear (marker re-stamped — not stale-suppressed)" || bad "scenario 12b: marker NOT re-stamped (clear-reset failed!)"
+  [ ! -s "$NOTIF12b" ] && ok "scenario 12b: Athos NOT paged on the fresh episode's first detection (recover-first)" || bad "scenario 12b: Athos paged on first detection of fresh episode"
 
   # ── CLEANUP / SUMMARY ─────────────────────────────────────────────────────
   # Unset test seams so no state leaks
