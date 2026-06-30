@@ -144,6 +144,28 @@ if [ "$REVIEWER_STALE_SECS" != "0" ] && [ "$REVIEWER_STALE_SECS" -lt 120 ] 2>/de
   REVIEWER_STALE_SECS=120
 fi
 
+# ── ga-evjs2: scale the frozen-reviewer staleness window by DIFF SIZE ──────────
+# REVIEWER_STALE_SECS above is the SILENCE window before a listed+peek-alive reviewer
+# is declared frozen (ga-q8tmn). A reviewer reading a LARGE diff is legitimately quiet
+# longer than one on a 1-file change, so a FIXED 300s window false-reaps big-diff
+# reviewers at 5min → respawn → it re-reads the same huge diff, silent >5min again →
+# reaped again → DEATH-SPIRAL (observed 2026-06-30: a 3885-line re-land bead drove a
+# 72% reviewer-death rate over 3h, 213 respawns, burning Claude quota + Dolt CPU, the
+# gate merged nothing for ~10h). The verdict TIMEOUT already scales with diff size
+# (ga-ltr3c) — the staleness window did not. Scale it the SAME way
+# (gate_scaled_reviewer_stale), capped at REVIEWER_STALE_MAX_SECS so a genuinely-frozen
+# reviewer is still reaped well under the outer verdict timeout. Small diffs are ~unchanged.
+# Set REVIEWER_STALE_MAX_SECS=REVIEWER_STALE_SECS (or the per-axis knobs to 0) to disable scaling.
+REVIEWER_STALE_PER_FILE_SECS="${REVIEWER_STALE_PER_FILE_SECS:-20}"
+case "$REVIEWER_STALE_PER_FILE_SECS" in ''|*[!0-9]*) REVIEWER_STALE_PER_FILE_SECS=20 ;; esac
+REVIEWER_STALE_PER_100_LINES_SECS="${REVIEWER_STALE_PER_100_LINES_SECS:-15}"
+case "$REVIEWER_STALE_PER_100_LINES_SECS" in ''|*[!0-9]*) REVIEWER_STALE_PER_100_LINES_SECS=15 ;; esac
+REVIEWER_STALE_MAX_SECS="${REVIEWER_STALE_MAX_SECS:-900}"
+case "$REVIEWER_STALE_MAX_SECS" in ''|*[!0-9]*) REVIEWER_STALE_MAX_SECS=900 ;; esac
+if [ "$REVIEWER_STALE_SECS" != "0" ] && [ "$REVIEWER_STALE_MAX_SECS" -lt "$REVIEWER_STALE_SECS" ] 2>/dev/null; then
+  REVIEWER_STALE_MAX_SECS="$REVIEWER_STALE_SECS"
+fi
+
 # ga-mepb0 (defense-in-depth, root cause): seconds to pause after waking each
 # reviewer (except the last) so N reviewers do NOT all boot `gc prime`
 # (SessionStart) against the Dolt :52756 server at the same instant. That
@@ -957,6 +979,34 @@ gate_scaled_verdict_timeout() {
   [ "$maxm" -lt "$base" ] && maxm="$base"
   [ "$eff" -lt "$base" ] && eff="$base"
   [ "$eff" -gt "$maxm" ] && eff="$maxm"
+  printf '%s' "$eff"
+}
+
+# ── ga-evjs2: scale the frozen-reviewer staleness window by diff size ───────────
+# Mirror of gate_scaled_verdict_timeout but in SECONDS with its own cap. base is
+# REVIEWER_STALE_SECS (the silence window before a listed+peek-alive reviewer is
+# declared frozen). Scaling only ADDS — a bigger diff buys a longer legitimate silence
+# window so a reviewer heads-down reading 3000+ lines is not false-reaped at 5min and
+# respawn-stormed. Capped at REVIEWER_STALE_MAX_SECS so a genuinely-frozen reviewer is
+# still reaped well under the outer verdict timeout (the grace + dead-streak guards in
+# the caller remain the backstops). A base of 0 (probe disabled) passes straight
+# through. FAIL-SAFE: any non-numeric input contributes 0 → result never below base.
+gate_scaled_reviewer_stale() {
+  local base="$1" files="$2" lines="$3"
+  case "$base" in ''|*[!0-9]*) base=300 ;; esac
+  [ "$base" = "0" ] && { printf '0'; return 0; }   # probe disabled → stay disabled
+  case "$files" in ''|*[!0-9]*) files=0 ;; esac
+  case "$lines" in ''|*[!0-9]*) lines=0 ;; esac
+  local per_file="${REVIEWER_STALE_PER_FILE_SECS:-20}"
+  local per_100l="${REVIEWER_STALE_PER_100_LINES_SECS:-15}"
+  local maxs="${REVIEWER_STALE_MAX_SECS:-900}"
+  case "$per_file" in ''|*[!0-9]*) per_file=20 ;; esac
+  case "$per_100l" in ''|*[!0-9]*) per_100l=15 ;; esac
+  case "$maxs"     in ''|*[!0-9]*) maxs=900 ;; esac
+  [ "$maxs" -lt "$base" ] && maxs="$base"
+  local eff=$(( base + files * per_file + (lines / 100) * per_100l ))
+  [ "$eff" -lt "$base" ] && eff="$base"
+  [ "$eff" -gt "$maxs" ] && eff="$maxs"
   printf '%s' "$eff"
 }
 
@@ -2506,6 +2556,15 @@ if [ "$VERDICT_TIMEOUT_MINUTES" != "$_VT_BASE" ]; then
   log "ga-ltr3c: scaled verdict timeout ${_VT_BASE}m → ${VERDICT_TIMEOUT_MINUTES}m for diff (${DIFF_FILE_COUNT} files, ${DIFF_LINE_COUNT} lines; cap=${VERDICT_TIMEOUT_MAX_MINUTES}m)."
 fi
 
+# ga-evjs2: scale the frozen-reviewer staleness window by the SAME diff size, so a
+# reviewer reading a large diff is not false-reaped at the fixed 300s (→ respawn
+# death-spiral). Computed here (diff known) and consumed by the reconvene staleness
+# probe below. Falls back to REVIEWER_STALE_SECS for any path that skips this block.
+REVIEWER_STALE_SECS_SCALED=$(gate_scaled_reviewer_stale "$REVIEWER_STALE_SECS" "$DIFF_FILE_COUNT" "$DIFF_LINE_COUNT")
+if [ "$REVIEWER_STALE_SECS_SCALED" != "$REVIEWER_STALE_SECS" ]; then
+  log "ga-evjs2: scaled reviewer-staleness window ${REVIEWER_STALE_SECS}s → ${REVIEWER_STALE_SECS_SCALED}s for diff (${DIFF_FILE_COUNT} files, ${DIFF_LINE_COUNT} lines; cap=${REVIEWER_STALE_MAX_SECS}s)."
+fi
+
 TIER="CODE"
 if [ -n "$CHANGED_FILES" ]; then
   NON_CODE_PATTERN='^(docs/|tests?/|test_|.*_test\.(py|go|js|ts)|.*\.test\.(js|ts|jsx|tsx)|.*\.spec\.(js|ts)|.*\.(md|txt|csv)$|\.github/)'
@@ -3241,12 +3300,16 @@ while true; do
         # future timestamp; the grace + dead-streak guards below stay the backstops, so
         # one stale read can never reap a live reviewer.
         _stale_dead=0
+        # ga-evjs2: use the diff-scaled staleness window (bigger diff → longer legit
+        # silence) instead of the fixed base, falling back to the base for any path
+        # that did not compute it. The disable-gate stays on the BASE knob (0=off).
+        _stale_thresh="${REVIEWER_STALE_SECS_SCALED:-$REVIEWER_STALE_SECS}"
         if [ "$REVIEWER_STALE_SECS" != "0" ] && [ "$_dead" = "0" ] && [ "$_peek_dead" = "0" ] && [ "$_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
           _last_active=$(echo "$RECONVENE_SESS_JSON" \
             | jq -r --arg s "$_sid" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | .[0].last_active // ""' 2>/dev/null || echo "")
-          _stale_dead=$(reviewer_last_active_stale "$_last_active" "$NOW_EPOCH" "$REVIEWER_STALE_SECS")
+          _stale_dead=$(reviewer_last_active_stale "$_last_active" "$NOW_EPOCH" "$_stale_thresh")
           if [ "$_stale_dead" = "1" ]; then
-            log "  Frozen reviewer detected (ga-q8tmn): slot $j session=${_sid} listed+not-closed+peek-alive but last_active=${_last_active} is ≥${REVIEWER_STALE_SECS}s stale with verdict bead ${VERDICT_BEAD_IDS[$j]} still pending; treating as DEAD (Claude wedged/quota)."
+            log "  Frozen reviewer detected (ga-q8tmn): slot $j session=${_sid} listed+not-closed+peek-alive but last_active=${_last_active} is ≥${_stale_thresh}s stale (diff-scaled, ga-evjs2) with verdict bead ${VERDICT_BEAD_IDS[$j]} still pending; treating as DEAD (Claude wedged/quota)."
           fi
         fi
         # ga-q8tmn: fold the staleness-confirmed frozen signal into deadness, exactly
@@ -3285,7 +3348,7 @@ while true; do
           # distinguishable from a Dolt-killed session in the gate log.
           if [ "$_dead" = "1" ]; then _dead_reason="session dead"
           elif [ "${_peek_dead:-0}" = "1" ]; then _dead_reason="drained (listed+not-closed but peek session-gone — ga-h9o17)"
-          elif [ "${_stale_dead:-0}" = "1" ]; then _dead_reason="frozen (listed+peek-alive but last_active ≥${REVIEWER_STALE_SECS}s stale — Claude wedged/quota, ga-q8tmn)"
+          elif [ "${_stale_dead:-0}" = "1" ]; then _dead_reason="frozen (listed+peek-alive but last_active ≥${_stale_thresh:-$REVIEWER_STALE_SECS}s stale, diff-scaled ga-evjs2 — Claude wedged/quota, ga-q8tmn)"
           else _dead_reason="boot-wedged (present but never ACKed — gc prime/Dolt stall)"; fi
           log "Re-convening dead reviewer slot $j (respawn ${_respawn_k}/${MAX_RESPAWNS_PER_SLOT}) — session ${SESSION_IDS[$j]} ${_dead_reason}, verdict bead ${VERDICT_BEAD_IDS[$j]} still pending."
           SLOT_SPAWN_EPOCH[$j]="$NOW_EPOCH"   # reset this slot's grace clock
