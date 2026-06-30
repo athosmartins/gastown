@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.gatefix-deadworker-recovery</string>
+
+  <!-- Gate-fix Dead-Worker Recovery Janitor (ga-pdrij scope C, 2026-06-30).
+
+       PROBLEM: a worker dispatched for the autonomous gate-fix loop (gate:needs-fix)
+       can DIE/drain mid-fix, leaving an orphan crew/<owner>/<bead> branch + a per-bead
+       worktree. Those orphans BLOCK the Pilot from re-dispatching the bead — it sits
+       gate:needs-fix forever (the worktree-reaper only reaps CLEAN worktrees >24h).
+       Bit wa-85iv8 + wa-5otq4 the same day; manual recovery (reap worktree + delete
+       branch + clear the dead worker's claim) reliably unblocked them (wa-85iv8 then
+       PASSED + merged).
+
+       OPERATION per sweep (MAX_PER_SWEEP=10): for each gate:needs-fix bead that is NOT
+       story:in-flight, whose recorded worker (gc.session_name) is DEAD (drained/asleep/
+       absent in `gc session list`): reap its orphan worktree (force) + delete its crew/*
+       branch (SHA logged, recoverable) + clear its stale claim (gc.session_name/work_dir/
+       sling + dead assignee) → the next Pilot sweep re-dispatches it fresh.
+
+       SAFETY: acts ONLY on a DEMONSTRABLY-DEAD worker (live/no-session beads are left).
+       FAIL-SAFE: an unreadable session roster → no-op (never reaps blind). The deleted
+       branch is FAILED gate work (gate already rejected it); SHA is logged. Cap bounds
+       the blast radius per sweep.
+
+       CADENCE: StartInterval=600 (10min). One-shot script (no KeepAlive).
+       KILL-SWITCH: GATEFIX_RECOVERY_ENABLED=0. DRY-RUN: GATEFIX_RECOVERY_DRY_RUN=1.
+       DPW_CRITICAL: add com.gascity.gatefix-deadworker-recovery to the daemon-presence
+       -watchdog DPW_CRITICAL set after deploy. -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/gatefix-deadworker-recovery.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>600</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gatefix-deadworker-recovery.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gatefix-deadworker-recovery.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>GATEFIX_RECOVERY_ENABLED</key>
+    <string>1</string>
+    <key>GATEFIX_RECOVERY_DRY_RUN</key>
+    <string>0</string>
+    <key>GATEFIX_RECOVERY_MAX_PER_SWEEP</key>
+    <string>10</string>
+    <key>BD_ACTOR</key>
+    <string>automation</string>
+  </dict>
+</dict>
+</plist>
