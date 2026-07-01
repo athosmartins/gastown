@@ -518,13 +518,19 @@ HQ_DEFAULT=$(printf '%s' "$RIG_LIST_JSON" | jq -r '.rigs[] | select(.hq == true)
 # also harmless to the commit/marker/branch signals of the other sweeps.
 declare -a FETCHED=()
 fetch_once() {
-  local gdir="$1" container="$2" key
+  local gdir="$1" container="$2" key prune=""
+  # --prune ONLY when the branch-prune sweep is enabled — it enumerates local
+  # remote-tracking refs, so it must not act on stale ones. Gated behind
+  # PRUNE_BRANCHES so the deployed job's behaviour is byte-for-byte unchanged
+  # until the Mayor flips the switch (staged posture). The commit/marker/branch
+  # signals of the other sweeps are unaffected by pruning stale tracking refs.
+  [ "$PRUNE_BRANCHES" = "1" ] && prune="--prune"
   key="$gdir"
   for k in "${FETCHED[@]:-}"; do [ "$k" = "$key" ] && return 0; done
   FETCHED+=("$key")
   timeout "$FETCH_TIMEOUT" sh -c '
-    if [ "$2" = "1" ]; then git --git-dir="$1" fetch origin --prune --quiet; else git -C "$1" fetch origin --prune --quiet; fi
-  ' _ "$gdir" "$container" 2>/dev/null || warn "fetch failed/timeout for $gdir (continuing with stale refs)"
+    if [ "$3" = "1" ]; then git --git-dir="$1" fetch origin $2 --quiet; else git -C "$1" fetch origin $2 --quiet; fi
+  ' _ "$gdir" "$prune" "$container" 2>/dev/null || warn "fetch failed/timeout for $gdir (continuing with stale refs)"
 }
 fetch_once "$HQ_GITDIR" "$HQ_CONTAINER"
 

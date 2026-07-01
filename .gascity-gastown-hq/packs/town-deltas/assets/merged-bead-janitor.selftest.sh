@@ -250,7 +250,8 @@ grep -q 'has-unmerged-commits' "$JANITOR"        && ok "never prunes ahead>0 (lo
 grep -q 'bead-read-error-failopen' "$JANITOR"    && ok "fail-open on bad bead read"              || bad "fail-open guard missing"
 grep -q 'recheck ahead=' "$JANITOR"              && ok "re-verifies ahead==0 at delete time"     || bad "delete-time ahead recheck missing"
 grep -q 'BRANCH_PRUNE_MAX_PER_SWEEP' "$JANITOR"  && ok "per-sweep deletion cap present"          || bad "deletion cap missing"
-grep -q 'fetch origin --prune' "$JANITOR"        && ok "fetch --prune (no stale tracking refs)"  || bad "fetch must prune for branch sweep"
+grep -q 'prune="--prune"' "$JANITOR" && grep -q 'PRUNE_BRANCHES" = "1" \] && prune' "$JANITOR" \
+  && ok "fetch --prune gated behind PRUNE_BRANCHES (staged; no stale refs when active)" || bad "fetch prune gating missing"
 grep -q 'remote moved since decision' "$JANITOR" && ok "delete-time remote-SHA CAS guard present" || bad "remote-SHA CAS guard missing"
 # STAGED, not deployed: the plist must NOT enable branch pruning (the Mayor's deploy step).
 if grep -q 'JANITOR_PRUNE_BRANCHES' "$PLIST" 2>/dev/null; then bad "plist must NOT enable branch prune (staging violated)"; else ok "plist does NOT enable branch prune (correctly staged)"; fi
