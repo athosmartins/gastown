@@ -2669,8 +2669,6 @@ if [ "$PILOT_CTX_READY_RIG_QUERIES" = "1" ]; then
       --exclude-label "story:done" \
       --exclude-label "story:cancelled" \
       --exclude-label "gate:passed" \
-      --exclude-label "gate:failed" \
-      --exclude-label "gate:needs-fix" \
       --exclude-label "pilot:dispatching" \
       --exclude-label "gate:needs-human" \
       --exclude-label "needs:engine-window" \
@@ -2680,6 +2678,10 @@ if [ "$PILOT_CTX_READY_RIG_QUERIES" = "1" ]; then
       2>/dev/null || echo "[]")
     # Type restriction: chore/task/debt/bug (NOT features — features flow via refino-gate→approved).
     # Bugs are ctx-complete (ctx:ready) and skip the refinement funnel, so they dispatch here.
+    # ga-4aree/wa-iy9s8: gate:failed/gate:needs-fix are deliberately NOT excluded above — a rig-store
+    # bug that FAILED the gate needs a re-fix dispatch, exactly as the HQ bug query allows (which is
+    # why HQ re-fixes worked but rig ones stranded forever). _filter_built exempts gate:needs-fix so
+    # it re-dispatches; gate:reviewing/gate:passed beads stay held by _filter_built (built branch).
     _rig_ctx_typed=$(echo "$_rig_ctx_raw" | jq '
         [ .[] | select(
             ((.issue_type // .type // "") | ascii_downcase) as $t
