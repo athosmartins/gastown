@@ -79,7 +79,7 @@
     <!-- STARVE_MIN: minutes before a buildable undispatched bead triggers an alarm.
          Default 20 = ~2 pilot sweeps (5min each) + margin. -->
     <key>STARVE_MIN</key>
-    <string>20</string>
+    <string>45</string>
 
     <!-- FLOW_GRACE_MIN: minutes a recently-dispatched bead is assumed to be flowing.
          Exposed for operator tuning; the operative threshold is STARVE_MIN. -->

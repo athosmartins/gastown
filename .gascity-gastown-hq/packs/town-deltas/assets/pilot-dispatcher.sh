@@ -3758,7 +3758,10 @@ TASK
             log "  ga-mfeip: wa-worker pool at session cap ($_live_wa_count active/creating >= ${PILOT_WA_WORKER_MAX:-4} max) — skip spawn for $STORY_ID (gc.routed_to=wa-worker set; supervisor picks it up when slot frees)"
           else
             log "  ga-mfeip: spawning wa-worker for $STORY_ID (slot=$BUILDER_TARGET, live=$_live_wa_count < ${PILOT_WA_WORKER_MAX:-4})."
-            if timeout 30 gc --city "$GC_CITY" session new wa-worker --no-attach \
+            # spawn timeout raised 30→60 (env PILOT_SPAWN_TIMEOUT_SECS): under a HOT Dolt
+            # (~300% CPU) `gc session new` routinely took >30s → 157 "Could not spawn" in one
+            # session → routed beads starved waiting for the supervisor fallback (2026-06-30).
+            if timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new wa-worker --no-attach \
                 --title-hint "build $STORY_ID: $STORY_TITLE" \
                 >/dev/null 2>&1; then
               log "  ga-mfeip: wa-worker session spawned for $STORY_ID (slot=$BUILDER_TARGET)."
@@ -3786,7 +3789,7 @@ TASK
             log "  ga-mfeip: ps-worker pool at session cap ($_live_ps_count active/creating >= ${PILOT_PS_WORKER_MAX:-2} max) — skip spawn for $STORY_ID (gc.routed_to=ps-worker set; supervisor picks it up when slot frees)"
           else
             log "  ga-mfeip: spawning ps-worker for $STORY_ID (live=$_live_ps_count < ${PILOT_PS_WORKER_MAX:-2})."
-            if timeout 30 gc --city "$GC_CITY" session new ps-worker --no-attach \
+            if timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new ps-worker --no-attach \
                 --title-hint "build $STORY_ID: $STORY_TITLE" \
                 >/dev/null 2>&1; then
               log "  ga-mfeip: ps-worker session spawned for $STORY_ID."
