@@ -660,7 +660,27 @@ gate_dolt_cpu() {
   local _pid="${1:-}"
   if [ -n "${GATE_DOLT_CPU_OVERRIDE:-}" ]; then printf '%s' "$GATE_DOLT_CPU_OVERRIDE"; return 0; fi
   if [ -z "$_pid" ] || [ "$_pid" = "TEST" ]; then printf ''; return 0; fi
-  ps -o %cpu= -p "$_pid" 2>/dev/null | tr -d ' ' | cut -d. -f1 || true
+  # Dolt %cpu is violently bursty: the supervisor's per-rig full-table hydration
+  # scan of hq.issues (all rows, 97% closed) spikes it 5%<->400% every few seconds
+  # (ga-ftmci). A SINGLE ps sample makes the headroom gate DEFER on a transient
+  # spike ~1 sweep in 4 even when the plane is calm at the median — the "gate keeps
+  # failing" symptom. Sample 5x over ~2s and return the MEDIAN so the reading
+  # reflects sustained load, not a spike instant. Genuinely-hot planes still read
+  # hot (their median stays high, so booting reviewers are still protected).
+  # GATE_DOLT_CPU_SAMPLES (space-separated) is a selftest seam bypassing live `ps`.
+  local _raw
+  if [ -n "${GATE_DOLT_CPU_SAMPLES:-}" ]; then
+    _raw="$GATE_DOLT_CPU_SAMPLES"
+  else
+    local _n _s _acc=""
+    for _n in 1 2 3 4 5; do
+      _s=$(ps -o %cpu= -p "$_pid" 2>/dev/null | tr -d ' ' | cut -d. -f1)
+      [ -n "$_s" ] && _acc="$_acc $_s"
+      [ "$_n" -lt 5 ] && sleep 0.5
+    done
+    _raw="$_acc"
+  fi
+  printf '%s' "$_raw" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n | awk '{a[NR]=$0} END{if(NR)print a[int((NR+1)/2)]}'
   return 0
 }
 
