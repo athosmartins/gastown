@@ -237,39 +237,62 @@ janitor_convoy_decide() {
 # work lands in origin/<default>. They pile up on the shared remotes (495 on
 # whatsapp-automation, 14 on property_scrapers when measured) and never shrink.
 #
-# SAFETY POSTURE — provably lossless. A branch is pruned ONLY when it is FULLY
-# MERGED (ahead==0 vs origin/<default>: every one of its commits is already an
-# ancestor of the default branch, so deleting the ref removes nothing that isn't
-# in main). A branch with ANY unique commit (ahead>0) is NEVER pruned here — that
-# would be the destructive case, and it is categorically excluded. On top of the
-# ahead==0 gate, three KEEP guards protect against edge cases:
+# SAFETY POSTURE — provably lossless. A branch is pruned ONLY when its CONTENT is
+# fully in origin/<default>, established by EITHER of two lossless signals:
+#   • ahead==0                — every commit is a strict ancestor of the default
+#                               branch (fast-forward / merge landing).
+#   • content_in_main (cim==1) — the branch landed via SQUASH / re-commit: its tip
+#                               is NOT an ancestor (a new sha), but every one of its
+#                               patches is already present in main by patch-id
+#                               equivalence (git --cherry-pick). This is the
+#                               wa-fvxj1 class: feat(warming/wa-fvxj1) was
+#                               re-committed onto main, so the crew branch tip
+#                               (ahead>0) is not an ancestor yet loses nothing when
+#                               deleted. See content_in_main() for the exact check.
+# A branch that has ANY unique patch NOT in main (ahead>0 AND cim!=1) is NEVER
+# pruned here — that is the destructive case and it is categorically excluded. On
+# top of the merged-by-content gate, three KEEP guards protect edge cases:
 #   • live worktree  — an agent has the branch checked out locally (active work).
 #   • fresh          — tip younger than BRANCH_FRESH_DAYS (grace: just-merged work
 #                      an agent might still push follow-ups to).
 #   • bead active    — the branch's bead is open/in_progress/blocked/deferred/etc
-#                      (kept as a courtesy even though ahead==0 loses nothing).
+#                      (kept as a courtesy even though the content is already in main).
 # And it is FAIL-OPEN: if the bead status could not be read (Dolt hiccup), the
 # state is "readerror" → KEEP. Only a definitively-closed or definitively-gone
 # bead (clean not-found in BOTH the rig store AND the HQ store) permits a prune.
 #
-# janitor_branch_decide <ahead> <bead_state> <live_worktree> <is_fresh>
-#   ahead        — integer string; commits on the branch NOT in origin/<default>.
-#                  Non-numeric (e.g. "ERR" from a failed rev-list) → treated as
-#                  "unmerged" → KEEP (fail-safe: never prune on a bad ahead read).
-#   bead_state   — closed | active | gone | readerror  (see resolve_bead_state).
-#   live_worktree— 0|1.   is_fresh — 0|1.
+# janitor_branch_decide <ahead> <content_in_main> <bead_state> <live_worktree> <is_fresh>
+#   ahead           — integer string; commits on the branch NOT in origin/<default>
+#                     by SHA. Non-numeric (e.g. "ERR" from a failed rev-list) is
+#                     treated as ahead>0; only cim==1 can then permit a prune.
+#   content_in_main — 0|1; 1 iff every branch patch is already in main (ahead==0 OR
+#                     squash/re-commit). The lossless gate. Non-1 with ahead>0 = KEEP.
+#   bead_state      — closed | active | gone | readerror  (see resolve_bead_state).
+#   live_worktree   — 0|1.   is_fresh — 0|1.
 # Echoes "<verdict>:<reason>", verdict ∈ {prune,keep}. KEEP-biased: every guard
 # and every uncertain state resolves to keep. Guards evaluated in fixed precedence.
+# The prune reason distinguishes the strict-ancestor case (merged-*) from the
+# squash/re-commit case (squash-merged-*) for auditability of the dry-run log.
 # ═════════════════════════════════════════════════════════════════════════════
 janitor_branch_decide() {
-  local ahead="$1" bead_state="$2" live="$3" fresh="$4"
+  local ahead="$1" cim="$2" bead_state="$3" live="$4" fresh="$5"
   if [ "$live" = "1" ];               then echo "keep:live-worktree"; return 0; fi
-  if [ "$ahead" != "0" ];             then echo "keep:has-unmerged-commits"; return 0; fi
+  # MERGED-BY-CONTENT gate: keep only if there is unique unmerged work — i.e.
+  # ahead>0 (by sha) AND the content is NOT patch-present in main (cim!=1). A
+  # squash/re-commit (ahead>0 but cim==1) is lossless to prune and falls through.
+  if [ "$ahead" != "0" ] && [ "$cim" != "1" ]; then echo "keep:has-unmerged-commits"; return 0; fi
   if [ "$fresh" = "1" ];              then echo "keep:fresh-branch-grace-window"; return 0; fi
   if [ "$bead_state" = "readerror" ]; then echo "keep:bead-read-error-failopen"; return 0; fi
   if [ "$bead_state" = "active" ];    then echo "keep:bead-open-or-active"; return 0; fi
-  if [ "$bead_state" = "closed" ];    then echo "prune:merged-and-bead-closed"; return 0; fi
-  if [ "$bead_state" = "gone" ];      then echo "prune:merged-and-bead-gone"; return 0; fi
+  # Prune paths — distinguish strict-ancestor (ahead==0) from squash/re-commit
+  # (ahead>0 but content patch-present in main) purely for log auditability.
+  if [ "$ahead" = "0" ]; then
+    if [ "$bead_state" = "closed" ];  then echo "prune:merged-and-bead-closed"; return 0; fi
+    if [ "$bead_state" = "gone" ];    then echo "prune:merged-and-bead-gone"; return 0; fi
+  else
+    if [ "$bead_state" = "closed" ];  then echo "prune:squash-merged-and-bead-closed"; return 0; fi
+    if [ "$bead_state" = "gone" ];    then echo "prune:squash-merged-and-bead-gone"; return 0; fi
+  fi
   echo "keep:unknown-bead-state-failsafe"
 }
 
@@ -383,6 +406,37 @@ branch_merged() {
   [ "$bref" = "$mref" ] && return 1
   git_in "$gdir" "$container" rev-parse -q --verify "$bref" >/dev/null 2>&1 || return 1
   git_in "$gdir" "$container" merge-base --is-ancestor "$bref" "$mref" 2>/dev/null
+}
+
+# content_in_main <git_dir> <is_container> <branch_ref> <main_ref>
+# rc0 iff EVERY commit unique to <branch_ref> already has its patch present in
+# <main_ref> — the SQUASH-AWARE "is the work merged" test. Unlike branch_merged
+# (which requires the tip to be a strict git ANCESTOR), this recognises a branch
+# whose content landed via a SQUASH-merge or a re-commit: main carries a NEW sha
+# with the same diff, so the branch tip is not an ancestor (ahead>0 by sha) yet
+# nothing on the branch is missing from main.
+#
+#   git rev-list --count --cherry-pick --right-only <main>...<branch>
+#     counts the commits reachable from <branch> but not <main> whose patch is NOT
+#     also present on the <main> side (git matches squashed/re-committed changes by
+#     patch-id). A count of 0 ⟺ every branch patch is already in main ⟺ deleting
+#     the branch loses NOTHING. This is provably lossless: a false "merged" verdict
+#     would require a genuinely-unique diff to collide with an identical diff in
+#     main, in which case the content IS byte-for-byte in main and nothing is lost.
+#
+# FAIL-CLOSED: any non-"0" / empty / error count → rc1 (treated as NOT merged), so
+# the janitor's destructive prune path keeps the branch on any doubt. Rejects the
+# degenerate self-check (bref==mref) and unresolvable refs. Verified 2026-07-01 on
+# wa-fvxj1 (squash: count 0 → rc0) vs a genuinely-unmerged branch (count>0 → rc1).
+content_in_main() {
+  local gdir="$1" container="$2" bref="$3" mref="$4"
+  [ -z "$bref" ] && return 1
+  [ "$bref" = "$mref" ] && return 1
+  git_in "$gdir" "$container" rev-parse -q --verify "$bref" >/dev/null 2>&1 || return 1
+  git_in "$gdir" "$container" rev-parse -q --verify "$mref" >/dev/null 2>&1 || return 1
+  local n
+  n=$(git_in "$gdir" "$container" rev-list --count --cherry-pick --right-only "$mref...$bref" 2>/dev/null || echo ERR)
+  [ "$n" = "0" ]
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -850,10 +904,12 @@ $(printf '%s' "$CONVOYS" | jq -rc '.[]?')
 EOF
 
   # ── branch-prune sweep (ga-tijv5 extension) — OPT-IN, default OFF ────────────
-  # Prune FULLY-MERGED crew branches (crew/<persona>/<id>, ahead==0 vs
-  # origin/<default>) whose bead is closed/gone, with no live worktree, past the
-  # freshness grace. NEVER prunes a branch with unique commits (ahead>0). Every
-  # real deletion RE-VERIFIES ahead==0 immediately before `push --delete` (a
+  # Prune crew branches (crew/<persona>/<id>) whose CONTENT is fully in
+  # origin/<default> — either ahead==0 (strict ancestor) OR squash/re-committed
+  # (content_in_main: ahead>0 by sha but every patch already in main, the wa-fvxj1
+  # class) — whose bead is closed/gone, with no live worktree, past the freshness
+  # grace. NEVER prunes a branch with a unique patch NOT in main. Every real
+  # deletion RE-VERIFIES content-in-main immediately before `push --delete` (a
   # destructive, outward-facing op), and is capped per sweep.
   if [ "$PRUNE_BRANCHES" = "1" ]; then
     CREW_BRANCHES=$(git_in "$RGITDIR" "$RCONTAINER" for-each-ref --format='%(refname:short)' 'refs/remotes/origin/crew/**' 2>/dev/null | sed 's#^origin/##' || true)
@@ -871,11 +927,23 @@ EOF
       AHEAD=$(git_in "$RGITDIR" "$RCONTAINER" rev-list --count "origin/$RDEFAULT..origin/$cb" 2>/dev/null || echo "ERR")
       LWT=0; printf '%s\n' "$WT_CREW" | grep -Fxq "$cb" && LWT=1
       FRESH=$(branch_is_fresh "$RGITDIR" "$RCONTAINER" "origin/$cb" "$BRANCH_FRESH_DAYS")
+      # CONTENT-IN-MAIN (squash-aware merge test). ahead==0 is the cheap fast-path
+      # (strict ancestor ⟹ trivially content-in-main, no extra git call). Otherwise
+      # a branch with ahead>0 may still be a squash / re-commit whose patches are all
+      # in main (the wa-fvxj1 class) — verify by patch-id equivalence, but ONLY for a
+      # branch that is otherwise prunable (no live worktree, not fresh, readable
+      # ahead) so the (bounded) cherry-pick cost is never paid for a kept branch.
+      CIM=0
+      if [ "$AHEAD" = "0" ]; then
+        CIM=1
+      elif [ "$AHEAD" != "ERR" ] && [ "$LWT" = "0" ] && [ "$FRESH" = "0" ]; then
+        content_in_main "$RGITDIR" "$RCONTAINER" "origin/$cb" "origin/$RDEFAULT" && CIM=1
+      fi
       # Only pay the Dolt read when the branch could actually be pruned
-      # (ahead==0, not fresh, no live worktree). Otherwise the decider KEEPs on a
-      # cheaper guard before it ever consults the bead state.
+      # (content-in-main, not fresh, no live worktree). Otherwise the decider KEEPs
+      # on a cheaper guard before it ever consults the bead state.
       BSTATE="active"; BID="${cb##*/}"
-      if [ "$LWT" = "0" ] && [ "$AHEAD" = "0" ] && [ "$FRESH" = "0" ]; then
+      if [ "$LWT" = "0" ] && [ "$CIM" = "1" ] && [ "$FRESH" = "0" ]; then
         BSTATE=$(resolve_bead_state "$RPATH" "$BID")
         # Suffix convention: crew/<persona>/<id>-<slug> (e.g. ga-kpaym-hardening)
         # → the bead is the <prefix>-<token> head (ga-kpaym). Only fall back when
@@ -888,17 +956,20 @@ EOF
           fi
         fi
       fi
-      BV=$(janitor_branch_decide "$AHEAD" "$BSTATE" "$LWT" "$FRESH")
+      BV=$(janitor_branch_decide "$AHEAD" "$CIM" "$BSTATE" "$LWT" "$FRESH")
       BVERD="${BV%%:*}"; BREASON="${BV#*:}"
       if [ "$BVERD" = "prune" ]; then
-        # RE-VERIFY ahead==0 at delete time — the remote may have advanced since
-        # the decision. ahead==0 is monotone-safe, but a bad/failed recheck aborts.
-        RECHECK=$(git_in "$RGITDIR" "$RCONTAINER" rev-list --count "origin/$RDEFAULT..origin/$cb" 2>/dev/null || echo "ERR")
-        if [ "$RECHECK" != "0" ]; then
-          log "branch-prune SKIP origin/$cb ($RNAME) — recheck ahead=$RECHECK (changed since decision)"; continue
+        # RE-VERIFY content still fully in main at delete time — the remote may have
+        # advanced since the decision. Uses the SAME squash-aware patch-equivalence
+        # check (covers both strict-ancestor and squash/re-commit); any unique patch
+        # now present → abort (fail-closed). A strict ahead recheck alone would
+        # WRONGLY abort every legitimate squash prune (those have ahead>0 by sha).
+        if ! content_in_main "$RGITDIR" "$RCONTAINER" "origin/$cb" "origin/$RDEFAULT"; then
+          RECHECK=$(git_in "$RGITDIR" "$RCONTAINER" rev-list --count --cherry-pick --right-only "origin/$RDEFAULT...origin/$cb" 2>/dev/null || echo "ERR")
+          log "branch-prune SKIP origin/$cb ($RNAME) — recheck content-in-main failed (cherry-ahead=$RECHECK, changed since decision)"; continue
         fi
         if [ "$DRY_RUN" = "1" ]; then
-          log "WOULD-PRUNE-BRANCH origin/$cb ($RNAME) — $BREASON [bead=$BID state=$BSTATE ahead=0]"
+          log "WOULD-PRUNE-BRANCH origin/$cb ($RNAME) — $BREASON [bead=$BID state=$BSTATE ahead=$AHEAD cim=$CIM]"
           BRANCH_PRUNE_COUNT=$((BRANCH_PRUNE_COUNT+1))
           BRANCH_PRUNE_SUMMARY+=("$cb ($RNAME): $BREASON")
         else
@@ -922,7 +993,7 @@ EOF
           fi
           if git_in "$RGITDIR" "$RCONTAINER" push origin --delete "$cb" >/dev/null 2>&1; then
             git_in "$RGITDIR" "$RCONTAINER" update-ref -d "refs/remotes/origin/$cb" 2>/dev/null || true
-            log "PRUNED-BRANCH origin/$cb ($RNAME) — $BREASON [bead=$BID state=$BSTATE ahead=0 sha=${REMOTE_SHA:0:9}]"
+            log "PRUNED-BRANCH origin/$cb ($RNAME) — $BREASON [bead=$BID state=$BSTATE ahead=$AHEAD cim=$CIM sha=${REMOTE_SHA:0:9}]"
             BRANCH_PRUNE_COUNT=$((BRANCH_PRUNE_COUNT+1))
             BRANCH_PRUNE_SUMMARY+=("$cb ($RNAME): $BREASON")
           else

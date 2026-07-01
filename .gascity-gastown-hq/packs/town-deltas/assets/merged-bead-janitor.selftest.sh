@@ -27,7 +27,7 @@ rc1() { if "$@" >/dev/null 2>&1; then bad "expected non-zero: $*"; else ok "rc!=
 JANITOR_LIB_ONLY=1 source "$JANITOR" \
   || { echo "FATAL: could not source janitor in lib-only mode"; exit 1; }
 for fn in janitor_decide janitor_story_decide token_bounded scan_commit_for_bead \
-          scan_commit_subject_for_bead branch_merged \
+          scan_commit_subject_for_bead branch_merged content_in_main \
           has_open_marker has_terminal_passed_marker branch_label_from_markers rig_gitdir \
           janitor_branch_decide normalize_bead_status branch_is_fresh \
           bead_lookup_one resolve_bead_state; do
@@ -91,32 +91,47 @@ eq "commit beats marker+branch"         "$(janitor_story_decide 0 0 0 0 0 0 1 1 
 eq "marker beats branch"                "$(janitor_story_decide 0 0 0 0 0 0 0 1 1)" "done:terminal-gate-marker-passed-or-superseded"
 
 # ── 1c. janitor_branch_decide — crew-branch prune (ga-tijv5 extension) ──────
-# Args: <ahead> <bead_state> <live_worktree> <is_fresh>. The ONLY prune verdicts
-# are ahead==0 AND bead closed|gone AND no worktree AND not fresh. Every other
-# combination — and every uncertain state — must KEEP (lossless-only posture).
-echo "── 1c. janitor_branch_decide (crew-branch prune) ──"
-# The two (and only two) prune paths: fully-merged + bead closed / gone.
-eq "merged + bead closed → prune"       "$(janitor_branch_decide 0 closed 0 0)" "prune:merged-and-bead-closed"
-eq "merged + bead gone → prune"         "$(janitor_branch_decide 0 gone   0 0)" "prune:merged-and-bead-gone"
-eq "prune verb (closed)"                "$(janitor_branch_decide 0 closed 0 0 | cut -d: -f1)" "prune"
-# ahead>0 (unique commits) is the destructive case — NEVER pruned, whatever else.
-eq "unmerged commits → keep"            "$(janitor_branch_decide 5 closed 0 0)" "keep:has-unmerged-commits"
-eq "unmerged even if bead gone → keep"  "$(janitor_branch_decide 1 gone   0 0)" "keep:has-unmerged-commits"
-eq "bad ahead read (ERR) → keep"        "$(janitor_branch_decide ERR closed 0 0)" "keep:has-unmerged-commits"
+# Args: <ahead> <content_in_main> <bead_state> <live_worktree> <is_fresh>. A branch
+# is prunable iff its CONTENT is fully in main — either ahead==0 (strict ancestor;
+# cim trivially 1) OR ahead>0 but cim==1 (squash / re-commit, the wa-fvxj1 class) —
+# AND bead closed|gone AND no worktree AND not fresh. A branch with a unique patch
+# NOT in main (ahead>0 AND cim!=1) must NEVER prune. Every uncertain state → KEEP.
+echo "── 1c. janitor_branch_decide (crew-branch prune, squash-aware) ──"
+# Strict-ancestor prune paths (ahead==0 ⟹ cim==1): fully-merged + bead closed / gone.
+eq "merged + bead closed → prune"       "$(janitor_branch_decide 0 1 closed 0 0)" "prune:merged-and-bead-closed"
+eq "merged + bead gone → prune"         "$(janitor_branch_decide 0 1 gone   0 0)" "prune:merged-and-bead-gone"
+eq "prune verb (closed)"                "$(janitor_branch_decide 0 1 closed 0 0 | cut -d: -f1)" "prune"
+# SQUASH-MERGE prune paths (ahead>0 by sha BUT content patch-present in main, cim==1):
+# the wa-fvxj1 class — now prunable (was the systemic blind spot). Distinct reason.
+eq "squash-merged + bead closed → prune" "$(janitor_branch_decide 1 1 closed 0 0)" "prune:squash-merged-and-bead-closed"
+eq "squash-merged + bead gone → prune"   "$(janitor_branch_decide 3 1 gone   0 0)" "prune:squash-merged-and-bead-gone"
+eq "squash prune verb"                   "$(janitor_branch_decide 1 1 closed 0 0 | cut -d: -f1)" "prune"
+# CRITICAL negative direction — genuinely-unique content (ahead>0 AND cim!=1) is the
+# destructive case: NEVER pruned, whatever the bead state. A false merged-verdict here
+# would DELETE real work off the remote.
+eq "unmerged content → keep"            "$(janitor_branch_decide 5 0 closed 0 0)" "keep:has-unmerged-commits"
+eq "unmerged even if bead gone → keep"  "$(janitor_branch_decide 1 0 gone   0 0)" "keep:has-unmerged-commits"
+# bad ahead read (ERR) with unverified content (cim=0) → keep (fail-safe).
+eq "bad ahead read + cim=0 → keep"      "$(janitor_branch_decide ERR 0 closed 0 0)" "keep:has-unmerged-commits"
+# bad ahead read BUT content verified in main (cim=1) → still lossless → squash prune.
+eq "bad ahead read + cim=1 → prune"     "$(janitor_branch_decide ERR 1 closed 0 0)" "prune:squash-merged-and-bead-closed"
 # Live worktree wins over everything (active agent), even fully merged + closed.
-eq "live worktree → keep"               "$(janitor_branch_decide 0 closed 1 0)" "keep:live-worktree"
-eq "worktree beats prune (gone)"        "$(janitor_branch_decide 0 gone   1 0)" "keep:live-worktree"
+eq "live worktree → keep"               "$(janitor_branch_decide 0 1 closed 1 0)" "keep:live-worktree"
+eq "worktree beats prune (gone)"        "$(janitor_branch_decide 0 1 gone   1 0)" "keep:live-worktree"
+eq "worktree beats squash prune"        "$(janitor_branch_decide 2 1 closed 1 0)" "keep:live-worktree"
 # Freshness grace: a just-merged branch is kept even with a closed bead.
-eq "fresh branch → keep"                "$(janitor_branch_decide 0 closed 0 1)" "keep:fresh-branch-grace-window"
-# Open/active bead → keep (courtesy; ahead==0 loses nothing but we don't touch it).
-eq "open/active bead → keep"            "$(janitor_branch_decide 0 active 0 0)" "keep:bead-open-or-active"
+eq "fresh branch → keep"                "$(janitor_branch_decide 0 1 closed 0 1)" "keep:fresh-branch-grace-window"
+eq "fresh squash branch → keep"         "$(janitor_branch_decide 2 1 closed 0 1)" "keep:fresh-branch-grace-window"
+# Open/active bead → keep (courtesy; content already in main loses nothing but we don't touch it).
+eq "open/active bead → keep"            "$(janitor_branch_decide 0 1 active 0 0)" "keep:bead-open-or-active"
+eq "open/active bead (squash) → keep"   "$(janitor_branch_decide 2 1 active 0 0)" "keep:bead-open-or-active"
 # FAIL-OPEN: an unreadable bead status must never be pruned (transient Dolt).
-eq "bead read error → keep (failopen)"  "$(janitor_branch_decide 0 readerror 0 0)" "keep:bead-read-error-failopen"
-# Guard precedence: worktree > ahead > fresh > readerror > active > closed/gone.
-eq "worktree > unmerged"                "$(janitor_branch_decide 9 closed 1 0)" "keep:live-worktree"
-eq "unmerged > fresh"                   "$(janitor_branch_decide 3 closed 0 1)" "keep:has-unmerged-commits"
-eq "fresh > readerror"                  "$(janitor_branch_decide 0 readerror 0 1)" "keep:fresh-branch-grace-window"
-eq "readerror > active"                 "$(janitor_branch_decide 0 active 0 0)" "keep:bead-open-or-active"
+eq "bead read error → keep (failopen)"  "$(janitor_branch_decide 0 1 readerror 0 0)" "keep:bead-read-error-failopen"
+# Guard precedence: worktree > unmerged-content > fresh > readerror > active > closed/gone.
+eq "worktree > unmerged"                "$(janitor_branch_decide 9 0 closed 1 0)" "keep:live-worktree"
+eq "unmerged > fresh"                   "$(janitor_branch_decide 3 0 closed 0 1)" "keep:has-unmerged-commits"
+eq "fresh > readerror"                  "$(janitor_branch_decide 0 1 readerror 0 1)" "keep:fresh-branch-grace-window"
+eq "readerror > active"                 "$(janitor_branch_decide 0 1 active 0 0)" "keep:bead-open-or-active"
 
 # ── 1d. normalize_bead_status — raw bd status → coarse closed|active ─────────
 echo "── 1d. normalize_bead_status ──"
@@ -204,6 +219,37 @@ rc1 branch_merged "$R" 0 "no-such-branch" "main"   # missing branch → not merg
 rc1 branch_merged "$R" 0 "main" "main"             # main vs main → degenerate, NOT merged
 rc1 branch_merged "$R" 0 ""     "main"             # empty bref → not merged (safe)
 
+# ── 3c. content_in_main — SQUASH-AWARE merge detection (the wa-fvxj1 fix) ────
+# A crew branch whose tip is NOT a git ancestor of main (a new sha) but whose
+# entire diff is already in main via a SQUASH / re-commit. branch_merged (strict
+# ancestry) says "not merged"; content_in_main correctly says "merged" (lossless to
+# prune). The NEGATIVE direction — a branch with a UNIQUE patch not in main — MUST
+# return "not merged" so the janitor never green-lights deleting real work.
+echo "── 3c. content_in_main (squash-aware merge detection) ──"
+# Build the squash case: crew branch commits a change; main RE-COMMITS the same diff
+# under a new sha (exactly what a squash-merge / re-land produces — cf. wa-fvxj1's
+# feat(warming/wa-fvxj1) re-commit). Tip != ancestor, but content present in main.
+git -C "$R" checkout -q -b crew/x/tt-squash main
+( cd "$R" && printf 'squash-feature\n' > squash.txt && git add squash.txt && git commit -q -m "work(tt-squash): feature on crew branch" )
+git -C "$R" checkout -q main
+( cd "$R" && printf 'squash-feature\n' > squash.txt && git add squash.txt && git commit -q -m "feat(warm/tt-squash): re-land squashed lane" )
+# Sanity: strict ancestry says NOT merged (tip is a different sha) …
+rc1 branch_merged   "$R" 0 "crew/x/tt-squash" "main"    # strict ancestry → NOT merged
+# … but the CONTENT is fully in main (patch-equivalent) → content_in_main rc0.
+rc0 content_in_main "$R" 0 "crew/x/tt-squash" "main"    # squash-aware → MERGED (lossless)
+# strict ahead is >0 — this is precisely why the ahead==0 gate ALONE never pruned it.
+eq "squash branch strict-ahead > 0" "$(git -C "$R" rev-list --count main..crew/x/tt-squash)" "1"
+# NEGATIVE direction (the destructive case): a branch with a UNIQUE patch not in main
+# must be reported NOT merged — content_in_main must NEVER green-light a delete of it.
+# ahead-topic (built in §3b) carries a unique "ahead-only commit" (d.txt) not in main.
+rc1 content_in_main "$R" 0 "ahead-topic" "main"         # unique patch → NOT merged (KEEP)
+# A strict-ancestor branch is trivially content-in-main.
+rc0 content_in_main "$R" 0 "merged-topic" "main"        # ancestor → merged
+# Degenerate / bad inputs → NOT merged (fail-closed); never crash the sweep.
+rc1 content_in_main "$R" 0 "main" "main"                # self-check (bref==mref) rejected
+rc1 content_in_main "$R" 0 ""     "main"                # empty bref
+rc1 content_in_main "$R" 0 "no-such-branch" "main"      # unresolvable ref
+
 # ── 4. marker JSON helpers — synthetic fixtures ─────────────────────────────
 echo "── 4. marker helpers ──"
 M_OPEN='[{"status":"open","labels":["gate-status:queued","source-bead:wa-lstd","branch:crew/mila/wa-lstd"]}]'
@@ -246,10 +292,16 @@ grep -q 'gate-status:passed' "$JANITOR" && grep -q 'gate-status:superseded' "$JA
 grep -q 'janitor_branch_decide()' "$JANITOR"     && ok "defines janitor_branch_decide"           || bad "missing janitor_branch_decide def"
 grep -q 'PRUNE_BRANCHES="${JANITOR_PRUNE_BRANCHES:-0}"' "$JANITOR" && ok "branch-prune is OPT-IN, default OFF (staged)" || bad "branch-prune not default-off"
 grep -q 'if \[ "$PRUNE_BRANCHES" = "1" \]' "$JANITOR" && ok "branch-prune sweep gated behind PRUNE_BRANCHES" || bad "branch-prune sweep not gated"
-grep -q 'has-unmerged-commits' "$JANITOR"        && ok "never prunes ahead>0 (lossless-only)"    || bad "unmerged-commits guard missing"
+grep -q 'has-unmerged-commits' "$JANITOR"        && ok "never prunes unique content (ahead>0 & cim!=1)" || bad "unmerged-commits guard missing"
 grep -q 'bead-read-error-failopen' "$JANITOR"    && ok "fail-open on bad bead read"              || bad "fail-open guard missing"
-grep -q 'recheck ahead=' "$JANITOR"              && ok "re-verifies ahead==0 at delete time"     || bad "delete-time ahead recheck missing"
+grep -q 'recheck content-in-main' "$JANITOR"     && ok "re-verifies content-in-main at delete time" || bad "delete-time content-in-main recheck missing"
 grep -q 'BRANCH_PRUNE_MAX_PER_SWEEP' "$JANITOR"  && ok "per-sweep deletion cap present"          || bad "deletion cap missing"
+# Squash-aware merge detection (the wa-fvxj1 fix): content_in_main via patch-id
+# equivalence recognises a squash/re-commit (ahead>0 by sha, content in main).
+grep -q 'content_in_main()' "$JANITOR"           && ok "defines content_in_main (squash-aware)"  || bad "missing content_in_main def"
+grep -q 'cherry-pick --right-only' "$JANITOR"    && ok "uses git patch-id equivalence (--cherry-pick)" || bad "cherry-pick content check missing"
+grep -q 'squash-merged-and-bead-closed' "$JANITOR" && ok "squash-merged prune reason wired"      || bad "squash prune reason missing"
+grep -q 'janitor_branch_decide "\$AHEAD" "\$CIM"' "$JANITOR" && ok "branch decider fed content-in-main (CIM) signal" || bad "branch decider not passed CIM"
 grep -q 'prune="--prune"' "$JANITOR" && grep -q 'PRUNE_BRANCHES" = "1" \] && prune' "$JANITOR" \
   && ok "fetch --prune gated behind PRUNE_BRANCHES (staged; no stale refs when active)" || bad "fetch prune gating missing"
 grep -q 'remote moved since decision' "$JANITOR" && ok "delete-time remote-SHA CAS guard present" || bad "remote-SHA CAS guard missing"
