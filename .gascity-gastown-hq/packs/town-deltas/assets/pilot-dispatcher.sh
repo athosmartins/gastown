@@ -1109,9 +1109,14 @@ _filter_candidates() {
         and (
           (((.labels // []) | index("pilot:held")) | not)
           or
-          ((.labels // []) | map(select(startswith("pilot:held-until:"))) |
+          # ga-4aree: use the MAX (latest) held-until epoch, NOT .[0]. held-until labels
+          # ACCUMULATE (the stamp adds one per hold without pruning), so .[0] was the
+          # OLDEST/expired stamp → the filter judged an actively-held bead "expired" →
+          # re-selected it every sweep → refused → re-stamped → the clog loop. The bead is
+          # still held iff its LATEST hold is in the future.
+          ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) |
             if length > 0
-            then (.[0] | ltrimstr("pilot:held-until:") | tonumber) < $now_ts
+            then (max < $now_ts)
             else false end)
         )
         and (((.labels // []) - $preapproval) | length) == ((.labels // []) | length)
@@ -3438,7 +3443,14 @@ FIXSEC
                 # The until label alone is harmless (no skip); pilot:held alone is the trap.
                 bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "pilot:held-until:${_hold_until}" -q 2>/dev/null || true
                 bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "pilot:held" -q 2>/dev/null || true
-                log "ga-lfvs6/imp20: $STORY_ID stamped pilot:held-until:${_hold_until} then pilot:held (1h timed hold — janitor R6 will clear when expired)"
+                # ga-4aree: purge PRIOR held-until stamps (keep only the just-added one) so they
+                # don't accumulate unboundedly. Safe order: the fresh held-until + pilot:held are
+                # already present (above), so removing OLD stamps never leaves the
+                # pilot:held-without-until trap even if this loop dies partway.
+                for _stale in $(bd -C "$STORY_BEAD_CITY" show "$STORY_ID" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[] | select(startswith("pilot:held-until:"))' 2>/dev/null); do
+                  [ "$_stale" = "pilot:held-until:${_hold_until}" ] || bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "$_stale" -q 2>/dev/null || true
+                done
+                log "ga-lfvs6/imp20: $STORY_ID stamped pilot:held-until:${_hold_until} then pilot:held (1h timed hold; prior held-until stamps purged — ga-4aree)"
               fi
               return 1
             fi

@@ -666,6 +666,29 @@ case "$_fc_res_past" in
   *) bad "imp19(b): expired-hold bead was incorrectly skipped (should be dispatchable): $_fc_res_past" ;;
 esac
 
+# ── Scenario 3e2c/d (ga-4aree): ACCUMULATED held-until stamps ──────────────────
+# The stamp adds one held-until per hold; if they accumulate, a naive .[0] check reads the
+# OLDEST (expired) stamp and wrongly judges the bead dispatchable → it is re-selected every
+# sweep → the recurring dog-pool-refusal clog that starved buildable work. The filter must
+# use the MAX (latest) epoch: a bead whose LATEST hold is still in the future must be SKIPPED
+# even when older stamps have expired.
+echo "Scenario 3e2c (ga-4aree): accumulated held-until (.[0]=PAST, max=FUTURE) → must be SKIPPED"
+HELD_ACCUM='[{"id":"bd-held-accum","assignee":null,"labels":["story:approved","pilot:held","pilot:held-until:'"$_FC_PAST"'","pilot:held-until:'"$_FC_FUTURE"'"],"description":"x"},{"id":"bd-free4","assignee":null,"labels":["story:approved"],"description":"x"}]'
+_fc_res_accum="$(_fc "$HELD_ACCUM")"
+case "$_fc_res_accum" in
+  *bd-held-accum*) bad "ga-4aree: accumulated held-until with FUTURE max leaked into candidates (the clog bug): $_fc_res_accum" ;;
+  *) ok "ga-4aree: accumulated held-until, max=FUTURE → SKIPPED (uses MAX epoch, not .[0])" ;;
+esac
+[ "$(_fc "$HELD_ACCUM")" = '["bd-free4"]' ] && ok "ga-4aree: only the free bead passes (accumulated hold honored)" || bad "ga-4aree: unexpected candidate set: $(_fc "$HELD_ACCUM")"
+
+echo "Scenario 3e2d (ga-4aree): accumulated held-until ALL PAST (max=PAST) → PASSED THROUGH"
+_FC_PAST2=$(( _FC_NOW - 100 ))
+HELD_ACCUM_EXP='[{"id":"bd-accum-exp","assignee":null,"labels":["story:approved","pilot:held","pilot:held-until:'"$_FC_PAST2"'","pilot:held-until:'"$_FC_PAST"'"],"description":"x"}]'
+case "$(_fc "$HELD_ACCUM_EXP")" in
+  *bd-accum-exp*) ok "ga-4aree: accumulated held-until all expired (max=PAST) → PASSED THROUGH" ;;
+  *) bad "ga-4aree: all-expired accumulated hold incorrectly skipped: $(_fc "$HELD_ACCUM_EXP")" ;;
+esac
+
 # ── Scenario 3f: pre-approval lifecycle stories are excluded (ga-w7wvm) ─────────
 # The Pilot dispatches ONLY story:approved features; pre-approval lifecycle states
 # (story:triage / story:unrefined / story:refinement-in-progress) and the terminal
