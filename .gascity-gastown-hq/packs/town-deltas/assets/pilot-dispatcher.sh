@@ -2157,14 +2157,68 @@ _ownership_guard_should_refuse() {
       ;;
   esac
 
-  # (b) live named-crew owner. Re-read CURRENT assignee from the store (race-safe);
-  # fall back to the snapshot's assignee only if the live read is empty/unreadable.
-  local _asg
-  _asg=$(bd -C "$_city" show "$_bid" --json 2>/dev/null \
-    | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
+  # ── Fresh, rig-DB-aware re-read (race-safe) — serves (c) AND (b) ──────────────
+  # ONE authoritative read of the bead from its OWNING store ($_city == the rig DB
+  # for wa-*/ps-* beads, HQ for ga-*). The candidate snapshot required an EMPTY
+  # assignee + non-terminal status, but a competing claim can land BETWEEN snapshot
+  # and now (the ga-htjni double-dispatch window). Both (c) and (b) judge on THIS
+  # read, not the stale snapshot. FAIL-OPEN: an unreadable field falls back to the
+  # snapshot / allows.
+  local _fresh _asg _cur_status _has_pilot_fp
+  _fresh=$(bd -C "$_city" show "$_bid" --json 2>/dev/null \
+    | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
+  _asg=$(printf '%s' "$_fresh" | jq -r '(.assignee // "")' 2>/dev/null || echo "")
   if [ -z "$_asg" ] || [ "$_asg" = "null" ]; then
     _asg=$(printf '%s' "$_json" | jq -r '(.assignee // "")' 2>/dev/null || echo "")
   fi
+  _cur_status=$(printf '%s' "$_fresh" | jq -r '(.status // "")' 2>/dev/null || echo "")
+  [ -z "$_cur_status" ] && _cur_status=$(printf '%s' "$_json" | jq -r '(.status // "")' 2>/dev/null || echo "")
+  # Pilot's OWN dispatch fingerprint — a bead the Pilot itself slung/dispatched (or a
+  # dead-worker orphan of one) carries pilot:dispatched / pilot.dispatched_at /
+  # pilot.sling_bead. That is NOT a fresh EXTERNAL claim; the reclaim paths
+  # (NEVERSTARTED / ga-e5yw2 / ga-v3z4z) own it, so (c) must NOT block it (else
+  # re-dispatch of a legitimately-released bead would deadlock). gate:needs-fix is
+  # likewise the Pilot's own gate-fix loop (assignee already cleared by the gate).
+  _has_pilot_fp=$(printf '%s' "$_fresh" | jq -r '
+      (((.labels // []) | index("pilot:dispatched")) != null)
+      or (((.metadata["pilot.dispatched_at"]) // "") != "")
+      or (((.metadata["pilot.sling_bead"]) // "") != "")
+      | if . then "1" else "0" end' 2>/dev/null || echo "0")
+  case ",$_og_labels," in *,gate:needs-fix,*) _has_pilot_fp="1" ;; esac
+
+  # ── (c) EXTERNAL ACTIVE CLAIM (ga-htjni ext; wa-5wv49 / wa-xnuxd) ─────────────
+  # The reported systemic double-dispatch: a crew/human creates a bead intending to
+  # build it THEMSELVES and claims it (status=in_progress + assignee=<self>) — yet
+  # the Pilot still slung a PARALLEL wa-worker on the same bead. Signal (b) below
+  # MISSES this: it blocks ONLY an assignee that resolves to a LIVE gc SESSION via a
+  # grep -Fxq EXACT match, but a self-claiming crew's assignee is session-suffixed
+  # (observed: created_by=thies-wa-awispr9ofspp on both repro beads) so it never
+  # matches — and (b) also needs a trustworthy roster (_DEADWORKER_OK=1). STATUS —
+  # the decisive "someone is actively building this" signal — was never consulted at
+  # dispatch time. (c) closes the gap: judge on the FRESH rig-DB status+assignee and
+  # skip the roster entirely. Runs BEFORE the HQ/rig path split, so it covers BOTH
+  # ga-* (HQ) and wa-*/ps-* (rig-native) dispatch. Distinguished from the states that
+  # MUST still dispatch:
+  #   • Mayor explicit-assignee routing (imp20): assignee set but status=OPEN → allow.
+  #   • Pilot's own dispatch / dead-worker orphan: has fingerprint → allow (reclaim owns it).
+  #   • NEVERSTARTED-released residue: assignee cleared to "" → allow (re-dispatchable).
+  # FAIL-OPEN: an unreadable status → no (c) block.
+  if [ "$_has_pilot_fp" != "1" ]; then
+    # A status that raced into terminal/blocked past the _filter_dispatch_gates snapshot.
+    case "$_cur_status" in
+      blocked|closed|deferred) printf 'status:%s' "$_cur_status"; return 0 ;;
+    esac
+    # Actively being built by a REAL external crew (not a pool worker / dog / self).
+    if [ "$_cur_status" = "in_progress" ] && [ -n "$_asg" ] && [ "$_asg" != "null" ]; then
+      case "$_asg" in
+        gastown.dog|gastown.dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*) : ;;
+        "$SELF_BEAD_ID") : ;;
+        *) printf 'external-claim:%s@in_progress' "$_asg"; return 0 ;;
+      esac
+    fi
+  fi
+
+  # (b) live named-crew owner. Judge on the fresh $_asg captured above (race-safe).
   [ -z "$_asg" ] || [ "$_asg" = "null" ] && return 1   # unowned → allow.
   # An assignee equal to the dispatcher self-bead / a dog pool is not a "named
   # crew owner" in the ga-htjni sense; only block on a real crew identity.

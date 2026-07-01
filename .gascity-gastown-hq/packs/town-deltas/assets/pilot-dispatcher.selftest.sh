@@ -689,6 +689,65 @@ case "$(_fc "$HELD_ACCUM_EXP")" in
   *) bad "ga-4aree: all-expired accumulated hold incorrectly skipped: $(_fc "$HELD_ACCUM_EXP")" ;;
 esac
 
+# ── Scenario OWN-GUARD (ga-htjni ext; wa-5wv49 / wa-xnuxd) ──────────────────────
+# The reported systemic double-dispatch: a crew/human creates a bead intending to
+# build it THEMSELVES and claims it (status=in_progress + assignee=<self>) — yet the
+# Pilot still slung a PARALLEL wa-worker on the SAME bead. Root cause: the ga-htjni
+# ownership guard's (b) branch blocked ONLY an assignee that resolves to a LIVE gc
+# SESSION (exact grep -Fxq match) with a trustworthy roster — a self-claiming crew's
+# assignee is session-suffixed (thies-wa-awispr9ofspp on both repro beads) so it never
+# matched, and STATUS was never consulted at dispatch time. Signal (c) re-reads the
+# bead FRESH from its OWNING store and refuses an external in_progress claim (or a
+# raced terminal/blocked status), while still allowing the states that must dispatch.
+# Extracted-function harness (mirrors _fc): stub bd/branch/session, assert the reason.
+echo "Scenario OWN-GUARD (ga-htjni ext): guard refuses external in_progress crew self-claim, allows the legit states"
+_OG_FN="$(awk '/^_ownership_guard_should_refuse\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_og() { (
+    eval "$_OG_FN"
+    SELF_BEAD_ID=""; _DEADWORKER_OK=1
+    bd() { case "$*" in *" show "*) printf '%s' "${OG_BEAD_JSON:-}" ;; *) : ;; esac; }
+    _beadid_has_crew_branch() { return 1; }   # no crew branch → signal (a) does not fire
+    _session_is_live()        { return 1; }   # never a live session → isolate (c) from (b)
+    _ownership_guard_should_refuse "$1" "$2" "ignored-db"
+); }
+
+# (1) EXTERNAL CLAIM — in_progress + session-suffixed crew assignee, NO pilot fingerprint → REFUSE.
+OG_BEAD_JSON='[{"id":"wa-ext","status":"in_progress","assignee":"thies-wa-awispr9ofspp","labels":[],"metadata":{}}]'
+_OG_R1="$(_og "wa-ext" '{"id":"wa-ext","assignee":"","status":"open","labels":[]}')"
+case "$_OG_R1" in
+  external-claim:thies-wa-awispr9ofspp@in_progress) ok "OWN-GUARD(1): external in_progress crew self-claim REFUSED (reason: $_OG_R1)" ;;
+  *) bad "OWN-GUARD(1): external in_progress self-claim NOT refused (got: '$_OG_R1') — the double-dispatch bug is back" ;;
+esac
+
+# (2) MAYOR ROUTING — assignee set but status=OPEN (imp20) → must NOT be refused by (c).
+OG_BEAD_JSON='[{"id":"wa-may","status":"open","assignee":"batista-ps","labels":[],"metadata":{}}]'
+_OG_R2="$(_og "wa-may" '{"id":"wa-may","assignee":"","status":"open","labels":[]}')"
+[ -z "$_OG_R2" ] && ok "OWN-GUARD(2): Mayor-routed open+assignee bead allowed (imp20 preserved)" \
+                 || bad "OWN-GUARD(2): open+assignee bead wrongly refused (got: '$_OG_R2') — would break imp20 routing"
+
+# (3) PILOT-FINGERPRINTED ORPHAN — in_progress + pool assignee WITH pilot:dispatched → allow (reclaim owns it).
+OG_BEAD_JSON='[{"id":"wa-orph","status":"in_progress","assignee":"wa-worker-adhoc-xyz","labels":["pilot:dispatched"],"metadata":{"pilot.dispatched_at":"123"}}]'
+_OG_R3="$(_og "wa-orph" '{"id":"wa-orph","assignee":"","status":"open","labels":[]}')"
+[ -z "$_OG_R3" ] && ok "OWN-GUARD(3): Pilot-fingerprinted orphan allowed (NEVERSTARTED/ga-e5yw2 reclaim owns it, no deadlock)" \
+                 || bad "OWN-GUARD(3): fingerprinted orphan wrongly refused (got: '$_OG_R3') — would deadlock reclaim"
+
+# (4) RACED TERMINAL STATUS — status=blocked (claimed past the snapshot), no assignee → REFUSE.
+OG_BEAD_JSON='[{"id":"wa-blk","status":"blocked","assignee":"","labels":[],"metadata":{}}]'
+_OG_R4="$(_og "wa-blk" '{"id":"wa-blk","assignee":"","status":"open","labels":[]}')"
+[ "$_OG_R4" = "status:blocked" ] && ok "OWN-GUARD(4): raced status=blocked REFUSED (reason: $_OG_R4)" \
+                                 || bad "OWN-GUARD(4): raced blocked status NOT refused (got: '$_OG_R4')"
+
+# (5) NEVERSTARTED-RELEASED RESIDUE — in_progress but assignee cleared to "" , no fingerprint → allow (re-dispatchable).
+OG_BEAD_JSON='[{"id":"wa-ns","status":"in_progress","assignee":"","labels":[],"metadata":{}}]'
+_OG_R5="$(_og "wa-ns" '{"id":"wa-ns","assignee":"","status":"open","labels":[]}')"
+[ -z "$_OG_R5" ] && ok "OWN-GUARD(5): in_progress+empty-assignee residue allowed (released bead re-dispatchable, no deadlock)" \
+                 || bad "OWN-GUARD(5): empty-assignee residue wrongly refused (got: '$_OG_R5') — would strand NEVERSTARTED releases"
+
+# Structural: the (c) external-claim clause is present in the live dispatcher source.
+grep -qE 'external-claim:%s@in_progress' "$DISPATCHER" \
+  && ok "OWN-GUARD: dispatcher carries the (c) external-claim clause" \
+  || bad "OWN-GUARD: (c) external-claim clause missing from dispatcher"
+
 # ── Scenario 3f: pre-approval lifecycle stories are excluded (ga-w7wvm) ─────────
 # The Pilot dispatches ONLY story:approved features; pre-approval lifecycle states
 # (story:triage / story:unrefined / story:refinement-in-progress) and the terminal
