@@ -2120,10 +2120,61 @@ _beadid_has_crew_branch() {
   return 1
 }
 
+# _beadid_has_active_gate_artifact <bead_id> — ga-wisp gate-handoff signal (d).
+# Exit 0 iff an OPEN quality-gate artifact in the HQ store (GC_CITY) references
+# <bead_id> as its source-bead AND is ACTIVELY processing its branch right now.
+# Gate artifacts are HQ-store beads (ga-wisp-*):
+#   • type:quality-gate-marker — labels source-bead:<bead> + branch:crew/<crew>/<bead>
+#     + gate-status:<state>. ACTIVE marker states (the gate is holding/working the
+#     branch): ready → claimed → queued → dispatching → reviewing (the guard→queue→
+#     dispatch→review pipeline).
+#   • type:quality-gate-run — labels source-bead:<bead> + gate-status:running (reviewer live).
+# NON-active (parked/terminal → the bead may LEGITIMATELY need re-dispatch): error,
+# needs-rebase, passed, failed, superseded, done, deferred, parked-needs-human, OR a
+# CLOSED artifact. Critically, the gate:needs-fix RE-FIX loop's only marker is
+# failed/error → NON-active → this returns 1 (allow), so (d) NEVER deadlocks re-fix
+# (the rig-scan / held-until fixes stay intact). Matches on the EXACT source-bead:<bead>
+# label (no id-prefix collision), in ONE read of the HQ store.
+# Test seam: PILOT_TEST_GATE_ACTIVE_BEADS (space-list), consulted when DEFINED, keeps the
+# selftest hermetic (no live Dolt). FAIL-OPEN: no bd, any bd/jq error, or an empty/
+# ambiguous read → return 1 (allow) — a bad gate-artifact read must never wedge dispatch.
+_beadid_has_active_gate_artifact() {
+  local _bid="${1:-}"
+  [ -n "$_bid" ] || return 1
+  if [ -n "${PILOT_TEST_GATE_ACTIVE_BEADS+x}" ]; then
+    case " $PILOT_TEST_GATE_ACTIVE_BEADS " in *" $_bid "*) return 0 ;; *) return 1 ;; esac
+  fi
+  command -v bd >/dev/null 2>&1 || return 1
+  local _arts _hit
+  _arts=$(bd -C "$GC_CITY" list -l "source-bead:$_bid" --json 2>/dev/null \
+    | jq -c 'if type=="array" then . else [.] end' 2>/dev/null || echo "")
+  [ -n "$_arts" ] || return 1
+  # Count OPEN gate markers/runs for this source-bead carrying an ACTIVELY-processing
+  # gate-status. index() yields a number (truthy, incl. 0) when present, null when
+  # absent; a parked/terminal or closed artifact contributes 0.
+  _hit=$(printf '%s' "$_arts" | jq -r '
+      [ .[]
+        | select(.status == "open")
+        | (.labels // []) as $l
+        | select( ($l | index("type:quality-gate-marker")) or ($l | index("type:quality-gate-run")) )
+        | select(
+            ($l | index("gate-status:ready"))       or
+            ($l | index("gate-status:claimed"))     or
+            ($l | index("gate-status:queued"))      or
+            ($l | index("gate-status:dispatching")) or
+            ($l | index("gate-status:reviewing"))   or
+            ($l | index("gate-status:running"))
+          )
+      ] | length' 2>/dev/null || echo "0")
+  case "$_hit" in ''|0) return 1 ;; *) return 0 ;; esac
+}
+
 # _ownership_guard_should_refuse <bead_id> <bead_json> <bead_city> — emit a short
-# REASON to stdout and return 0 (REFUSE this dispatch) iff signal (a) or (b) holds;
-# return 1 (allow) otherwise. Pure read; the caller logs + releases the claim.
+# REASON to stdout and return 0 (REFUSE this dispatch) iff signal (a), (b), (c) or (d)
+# holds; return 1 (allow) otherwise. Pure read; the caller logs + releases the claim.
 #   (a) crew branch exists for <bead_id> (strongest)            → "branch:<...>"
+#   (d) a live gate marker/run is ACTIVELY gating its branch    → "gating:active"
+#   (c) fresh rig-DB re-read shows an EXTERNAL active claim      → "external-claim:<...>"
 #   (b) live assignee: a non-empty, NON-pilot crew assignee whose session is live
 #       in the once-per-sweep roster                            → "owner:<crew>"
 # Re-reads the bead's CURRENT assignee (race-safe: the candidate query required an
@@ -2156,6 +2207,33 @@ _ownership_guard_should_refuse() {
       fi
       ;;
   esac
+
+  # ── (d) LIVE GATE HAND-OFF (wa-0hnsi / wa-62qbd / wa-xnuxd / wa-1tb9b) ────────
+  # The recurring "open-during-gate-handoff" race: when a fix-worker RELEASES its bead
+  # (status=open, assignee="") and the gate-submit is in flight, there is a window
+  # where the bead reads open + unassigned + buildable — signals (a)/(b)/(c) are all
+  # structurally blind to it (no live assignee, non-terminal status, and the git-branch
+  # probe (a) FAILS-OPEN under a slow/offline rig remote). A pool-worker probe samples
+  # it and slings a PARALLEL worker that then discovers the in-flight gate-run and
+  # stands down — low harm, but it recurs and burns spin-up cycles. (d) closes it with
+  # a RELIABLE Dolt read (not a network git probe): if a live quality-gate marker OR run
+  # is ACTIVELY processing this bead's branch RIGHT NOW, the work is already in the gate
+  # → refuse the duplicate. ACTIVELY-PROCESSING ONLY (ready/claimed/queued/dispatching/
+  # reviewing marker, running run); a parked/terminal artifact (error/needs-rebase/
+  # passed/failed/superseded/done/…) is NOT gating and the bead may legitimately need
+  # re-dispatch — in particular the gate:needs-fix re-fix loop, whose ONLY marker is
+  # failed/error, MUST still dispatch, so (d) never regresses the rig-scan/held-until
+  # re-fix fixes. Independent of the pilot fingerprint on purpose: an ACTIVE artifact is
+  # a definitive "being-gated-now" discriminator regardless of pilot:dispatched (the bug
+  # bead is itself pilot-dispatched, so gating (d) behind the fingerprint would skip the
+  # very race we close). It composes with — never conflicts with — signal (c)'s
+  # fingerprint/needs-fix carve-out below: that carve-out only gates (c)'s status/
+  # assignee refusal, whereas (d) refuses on a DISJOINT artifact signal. FAIL-OPEN by
+  # construction (an unreadable gate-artifact query never blocks dispatch).
+  if _beadid_has_active_gate_artifact "$_bid"; then
+    printf 'gating:active'
+    return 0
+  fi
 
   # ── Fresh, rig-DB-aware re-read (race-safe) — serves (c) AND (b) ──────────────
   # ONE authoritative read of the bead from its OWNING store ($_city == the rig DB
@@ -3214,7 +3292,9 @@ FIXSEC
 
   # ── ga-htjni: ownership / in-flight collision guard ──────────────────────────
   # REFUSE a NET-NEW dispatch when the work is already real and owned: (a) a crew
-  # branch exists for this bead, or (b) the bead has a live named-crew owner. This
+  # branch exists, (d) a live gate marker/run is ACTIVELY gating its branch (the
+  # open-during-gate-handoff race), (c) an external active claim, or (b) a live
+  # named-crew owner. This
   # runs AFTER the atomic claim + every lifecycle/race verify above so it composes
   # with them (it is the LAST gate before builder routing), and BEFORE any sling so
   # no second builder is ever spawned. Reconciled with the reclaim paths above

@@ -702,8 +702,14 @@ esac
 # Extracted-function harness (mirrors _fc): stub bd/branch/session, assert the reason.
 echo "Scenario OWN-GUARD (ga-htjni ext): guard refuses external in_progress crew self-claim, allows the legit states"
 _OG_FN="$(awk '/^_ownership_guard_should_refuse\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+# Also extract signal (d)'s helper so the guard's real composition is tested (not a
+# stub). With PILOT_TEST_GATE_ACTIVE_BEADS UNDEFINED (the default in the (1)-(5)
+# cases below) it short-circuits to the stubbed bd → empty → return 1 (no active
+# gate artifact → allow), so signal (d) is inert there and (a)/(b)/(c) behave exactly
+# as before. The (d1)-(d5) cases DEFINE the seam to exercise (d) hermetically.
+_GATE_FN="$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 _og() { (
-    eval "$_OG_FN"
+    eval "$_OG_FN"; eval "$_GATE_FN"
     SELF_BEAD_ID=""; _DEADWORKER_OK=1
     bd() { case "$*" in *" show "*) printf '%s' "${OG_BEAD_JSON:-}" ;; *) : ;; esac; }
     _beadid_has_crew_branch() { return 1; }   # no crew branch → signal (a) does not fire
@@ -747,6 +753,74 @@ _OG_R5="$(_og "wa-ns" '{"id":"wa-ns","assignee":"","status":"open","labels":[]}'
 grep -qE 'external-claim:%s@in_progress' "$DISPATCHER" \
   && ok "OWN-GUARD: dispatcher carries the (c) external-claim clause" \
   || bad "OWN-GUARD: (c) external-claim clause missing from dispatcher"
+
+# ── Scenario OWN-GUARD (d): live gate-handoff artifact refuses duplicate dispatch ──
+# The recurring "open-during-gate-handoff" race (wa-0hnsi/wa-62qbd/wa-xnuxd/wa-1tb9b):
+# a bead released to open+unassigned while its gate-submit is in flight gets a
+# duplicate pool-worker (signals a/b/c are all blind to it). Signal (d) refuses when a
+# live quality-gate marker/run is ACTIVELY processing the bead's branch. The CRITICAL
+# constraint: a parked/terminal artifact (failed/error/needs-rebase/passed/superseded)
+# must NOT count as active — the gate:needs-fix re-fix loop (whose only marker is
+# failed/error) MUST still dispatch, else we reintroduce the deadlock the rig-scan /
+# held-until fixes cured. Two layers: (d1)-(d2) test the guard composition via the seam;
+# (d3)-(d8) test the function's ACTIVE-state whitelist against real artifact JSON.
+echo "Scenario OWN-GUARD (d): gate-handoff refuses active gating, allows parked/terminal (re-fix stays dispatchable)"
+
+# (d1) guard REFUSES when signal (d) reports an active artifact (seam DEFINES the bead).
+OG_BEAD_JSON='[{"id":"wa-hoff","status":"open","assignee":"","labels":[],"metadata":{}}]'
+_OG_D1="$(PILOT_TEST_GATE_ACTIVE_BEADS="wa-hoff" _og "wa-hoff" '{"id":"wa-hoff","assignee":"","status":"open","labels":[]}')"
+[ "$_OG_D1" = "gating:active" ] && ok "OWN-GUARD(d1): active gate-handoff artifact REFUSED (reason: $_OG_D1)" \
+                               || bad "OWN-GUARD(d1): active gate artifact NOT refused (got: '$_OG_D1') — dup-dispatch race open"
+
+# (d2) guard ALLOWS when no active artifact (seam DEFINED but bead absent) → open+unassigned dispatches.
+_OG_D2="$(PILOT_TEST_GATE_ACTIVE_BEADS="some-other" _og "wa-hoff" '{"id":"wa-hoff","assignee":"","status":"open","labels":[]}')"
+[ -z "$_OG_D2" ] && ok "OWN-GUARD(d2): bead with no active gate artifact allowed (normal dispatch preserved)" \
+                 || bad "OWN-GUARD(d2): non-gated bead wrongly refused (got: '$_OG_D2')"
+
+# Function-level ACTIVE-state whitelist (real artifact JSON; seam unset → hits the jq path).
+_GATE_FN="$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_gate() { (
+    eval "$_GATE_FN"
+    unset PILOT_TEST_GATE_ACTIVE_BEADS
+    GC_CITY="ignored-city"
+    bd() { case "$*" in *" list "*"source-bead:"*) printf '%s' "${GATE_ARTS_JSON:-}" ;; *) : ;; esac; }
+    _beadid_has_active_gate_artifact "$1"
+); }
+
+# (d3) ACTIVE marker (reviewing) → gating (return 0).
+GATE_ARTS_JSON='[{"id":"ga-w1","status":"open","labels":["type:quality-gate-marker","source-bead:wa-x","gate-status:reviewing"]}]'
+_gate "wa-x" && ok "OWN-GUARD(d3): reviewing marker counts as ACTIVE gating" \
+             || bad "OWN-GUARD(d3): reviewing marker missed — race would stay open"
+
+# (d4) ACTIVE run (running) → gating (return 0).
+GATE_ARTS_JSON='[{"id":"ga-w2","status":"open","labels":["type:quality-gate-run","source-bead:wa-x","gate-status:running"]}]'
+_gate "wa-x" && ok "OWN-GUARD(d4): running gate-run counts as ACTIVE gating" \
+             || bad "OWN-GUARD(d4): running run missed — race would stay open"
+
+# (d5) RE-FIX loop: only a failed marker → NOT active → allow (MUST dispatch, the critical carve-out).
+GATE_ARTS_JSON='[{"id":"ga-w3","status":"open","labels":["type:quality-gate-marker","source-bead:wa-x","gate-status:failed"]}]'
+_gate "wa-x" && bad "OWN-GUARD(d5): failed marker wrongly ACTIVE — would DEADLOCK gate:needs-fix re-fix!" \
+             || ok "OWN-GUARD(d5): failed marker NOT active → re-fix dispatch preserved (rig-scan/held-until intact)"
+
+# (d6) errored marker → NOT active → allow (parked, re-dispatchable).
+GATE_ARTS_JSON='[{"id":"ga-w4","status":"open","labels":["type:quality-gate-marker","source-bead:wa-x","gate-status:error"]}]'
+_gate "wa-x" && bad "OWN-GUARD(d6): error marker wrongly ACTIVE — would strand recovery re-queue" \
+             || ok "OWN-GUARD(d6): error marker NOT active → parked bead re-dispatchable"
+
+# (d7) superseded/needs-rebase → NOT active → allow.
+GATE_ARTS_JSON='[{"id":"ga-w5","status":"open","labels":["type:quality-gate-run","source-bead:wa-x","gate-status:superseded"]}]'
+_gate "wa-x" && bad "OWN-GUARD(d7): superseded run wrongly ACTIVE" \
+             || ok "OWN-GUARD(d7): superseded run NOT active → allowed"
+
+# (d8) FAIL-OPEN: no artifacts at all → allow (a bad/empty gate read must never wedge dispatch).
+GATE_ARTS_JSON='[]'
+_gate "wa-x" && bad "OWN-GUARD(d8): empty gate read wrongly refused — would wedge dispatch" \
+             || ok "OWN-GUARD(d8): empty gate artifact set → fail-open allow (dispatch never wedged)"
+
+# Structural: signal (d) clause + its actively-processing whitelist live in the dispatcher source.
+grep -qE 'gating:active' "$DISPATCHER" \
+  && ok "OWN-GUARD: dispatcher carries the (d) gating:active clause" \
+  || bad "OWN-GUARD: (d) gating:active clause missing from dispatcher"
 
 # ── Scenario 3f: pre-approval lifecycle stories are excluded (ga-w7wvm) ─────────
 # The Pilot dispatches ONLY story:approved features; pre-approval lifecycle states
