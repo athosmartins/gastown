@@ -10,7 +10,10 @@ e traz o veredito honesto. Este script NÃO dá opinião — mede a definição:
         "Fila do Pilot" = pilot-dispatchable.json (~/.gc/pilot-dispatchable.json).
         "Genuinamente construível" = na fila do Pilot SEM label de bloqueio
         (gate:needs-human, story:needs-human, on-device, story:needs-device, blocked,
-        story:blocked — esses são PARKED, não falha silenciosa).
+        story:blocked — esses são PARKED, não falha silenciosa) E que NÃO esteja
+        JÁ CONSTRUÍDA / no pipeline do gate (bead com quality-gate-marker aberto
+        apontando pra ela, ou label gate:* de ciclo-de-vida) — essa é responsabilidade
+        do GATE (check 2), não uma falha silenciosa de dispatch do Pilot.
         Uma construível sem story:in-flight, sem hold legítimo, com pilot vivo = FALHA.
     (2) O gate não está travado em silêncio
         (se há marker queued/dispatching, tem que haver progresso: um merge
@@ -137,14 +140,85 @@ def _bd_show_labels_text(root, bead_id):
     return labels
 
 
+def _label_matches(label, base):
+    """A label matches a base if it is the base exactly, or a colon-suffixed
+    (gate:needs-human:on-device) or dash-suffixed (needs:rehome-property) variant."""
+    return label == base or label.startswith(base + ":") or label.startswith(base + "-")
+
+
 def _label_is_parking(label):
-    """Returns True if this label means the bead is not auto-dispatchable right now.
-    Matches exact, colon-suffixed (gate:needs-human:on-device), and dash-suffixed
-    (needs:rehome-property, pilot:held-until:...) forms."""
-    for park in PARKING_LABELS:
-        if label == park or label.startswith(park + ":") or label.startswith(park + "-"):
-            return True
-    return False
+    """Returns True if this label means the bead is not auto-dispatchable right now."""
+    return any(_label_matches(label, park) for park in PARKING_LABELS)
+
+
+def _label_is_gate_inflight(label):
+    """Returns True if this label means the bead is ALREADY BUILT and in the
+    quality-gate pipeline (reviewing / needs-rebase / error / passed / merging /
+    queued / dispatching / fix-attempt / …) — i.e. downstream of the Pilot's dispatch,
+    NOT a silent buildable stall. That is the GATE's domain (check_gate), so the
+    buildable-queue verdict must not double-count it as a Pilot dispatch failure.
+
+    EXCEPTION — gate:needs-fix: the gate bounced the bead back for a code fix, so it
+    is a fresh dispatch candidate again (mirrors the Pilot's _filter_built carve-out).
+    The caller gates the label path on `bounced` so gate:needs-fix stays eligible to
+    be flagged when there is NO active gate run (no open marker) holding it.
+    gate:needs-human is handled by PARKING_LABELS above; excluded here defensively."""
+    if not (label == "gate" or label.startswith("gate:")):
+        return False
+    if _label_matches(label, "gate:needs-fix") or _label_matches(label, "gate:needs-human"):
+        return False
+    return True
+
+
+def _gate_source_beads():
+    """Set of bead ids that have an OPEN quality-gate-marker (label source-bead:<id>).
+    Such a bead is already built and in the gate pipeline — the gate owns it now
+    (whether the gate is progressing is check_gate's job), so it is NOT a silent
+    Pilot-dispatch stall. Read once per run; returns an EMPTY set on any read error
+    so a Dolt hiccup never SUPPRESSES a real stall (fail-open toward flagging)."""
+    ids = set()
+    markers, ok = _bd_json(CITY, "type:quality-gate-marker")
+    if not ok or not markers:
+        return ids
+    for m in markers:
+        for l in _labels(m):
+            s = str(l)
+            if s.startswith("source-bead:"):
+                bid = s.split("source-bead:", 1)[1].strip()
+                if bid:
+                    ids.add(bid)
+    return ids
+
+
+def classify_bead(bead_id, labels, gate_source_beads, held_loop_max=HELD_LOOP_MAX):
+    """PURE classifier (no I/O — unit-testable). Given a bead's LIVE labels + the set
+    of in-gate source-bead ids, return (kind, reason) where kind is one of:
+      'parked'  — not a silent stall (parking label, OR already-built/in-gate).
+      'flowing' — story:in-flight (building now).
+      'held'    — pilot:held-until:* within the loop budget (legit temporary defer).
+      'stuck'   — genuinely buildable, not flowing/held → a silent stall (reason set
+                  to 'held-loop:Nx' when a held bead exceeded the re-hold budget).
+    Precedence: parking-label > active-gate-marker > in-gate-label(non-needs-fix) >
+    in-flight > held > stuck."""
+    if any(_label_is_parking(l) for l in labels):
+        return ("parked", "label")
+    # An ACTIVE gate marker names it → the gate owns it (gate-stall = check_gate's job),
+    # regardless of gate:needs-fix (a re-queued fix-attempt is still in the gate now).
+    if bead_id in gate_source_beads:
+        return ("parked", "in-gate")
+    # No active marker: a gate:* lifecycle label still means already-built/in-gate,
+    # UNLESS the gate bounced it back for a fix (needs-fix ⇒ re-dispatchable candidate).
+    bounced = any(_label_matches(l, "gate:needs-fix") for l in labels)
+    if not bounced and any(_label_is_gate_inflight(l) for l in labels):
+        return ("parked", "in-gate")
+    if "story:in-flight" in labels:
+        return ("flowing", "")
+    held = [l for l in labels if l.startswith("pilot:held-until:")]
+    if held:
+        if len(held) > held_loop_max:
+            return ("stuck", "held-loop:%dx" % len(held))
+        return ("held", "")
+    return ("stuck", "")
 
 
 # ── CHECK 1: pilot dispatchable queue ────────────────────────────────────────
@@ -186,8 +260,11 @@ def check_approved():
         return _check_approved_fallback(warns)
 
     # --- classify each dispatchable bead (cap at MAX_CLASSIFY) ---
+    # Read the in-gate set ONCE (beads with an open quality-gate-marker): an
+    # already-built bead awaiting the gate must NEVER count as a silent Pilot stall.
+    gate_source_beads = _gate_source_beads()
     parked, buildable, stuck = [], [], []
-    flowing_count, held_count = 0, 0
+    flowing_count, held_count, in_gate_count = 0, 0, 0
     read_err = []
 
     for item in items[:MAX_CLASSIFY]:
@@ -201,35 +278,32 @@ def check_approved():
             read_err.append(bead_id)
             continue
 
-        # PARKED: has a non-buildable label → not a silent stall, correct to skip
-        if any(_label_is_parking(l) for l in labels):
-            parked.append({"id": bead_id, "title": title, "rig": rig})
+        kind, reason = classify_bead(bead_id, labels, gate_source_beads)
+
+        # PARKED: parking label OR already-built/in-gate → not a silent stall.
+        if kind == "parked":
+            parked.append({"id": bead_id, "title": title, "rig": rig, "reason": reason})
+            if reason == "in-gate":
+                in_gate_count += 1
             continue
 
-        # GENUINELY BUILDABLE
-        is_flowing = "story:in-flight" in labels
-        # held: pilot:held-until:* — temporarily deferred, not silently stuck
-        held_labels = [l for l in labels if l.startswith("pilot:held-until:")]
-        is_held = bool(held_labels)
-        is_held_loop = is_held and len(held_labels) > HELD_LOOP_MAX
-
+        # GENUINELY BUILDABLE (everything not parked: flowing / held / stuck)
         buildable.append({"id": bead_id, "title": title, "rig": rig,
-                          "flowing": is_flowing, "held": is_held and not is_held_loop})
-
-        if is_flowing:
+                          "flowing": kind == "flowing", "held": kind == "held"})
+        if kind == "flowing":
             flowing_count += 1
-        elif is_held_loop:
-            # too many re-holds → pilot can't dispatch it → stuck (not a legit hold)
-            stuck.append({"id": bead_id, "rig": rig, "title": title,
-                          "reason": "held-loop:%dx" % len(held_labels)})
-        elif is_held:
+        elif kind == "held":
             held_count += 1
-        else:
-            stuck.append({"id": bead_id, "rig": rig, "title": title})
+        else:  # 'stuck' (plain, or held-loop — reason carries "held-loop:Nx")
+            s = {"id": bead_id, "rig": rig, "title": title}
+            if reason:
+                s["reason"] = reason
+            stuck.append(s)
 
     return {
         "total": len(items),
         "parked_count": len(parked),
+        "in_gate_count": in_gate_count,
         "buildable_count": len(buildable),
         "flowing_count": flowing_count,
         "held_count": held_count,
@@ -244,8 +318,9 @@ def check_approved():
 def _check_approved_fallback(inherited_warns):
     """Fallback: story:approved-only logic when pilot-dispatchable.json is unavailable."""
     stuck, total = [], 0
-    ok_in_flight, ok_held, ok_mayor, ok_fresh = 0, 0, 0, 0
+    ok_in_flight, ok_held, ok_mayor, ok_fresh, ok_in_gate = 0, 0, 0, 0, 0
     warns = list(inherited_warns)
+    gate_source_beads = _gate_source_beads()
 
     for name, root in RIGS:
         beads, ok = _bd_json(root, "story:approved")
@@ -265,6 +340,13 @@ def _check_approved_fallback(inherited_warns):
                 ok_mayor += 1; continue
             if any(r in ls for r in ("story:needs-device", "story:needs-human", "story:blocked")):
                 continue
+            # already-built / in the gate pipeline → the gate owns it, not a silent
+            # Pilot stall (open marker is authoritative; gate:* label unless needs-fix).
+            if b.get("id") in gate_source_beads:
+                ok_in_gate += 1; continue
+            if (not any(_label_matches(l, "gate:needs-fix") for l in labs)
+                    and any(_label_is_gate_inflight(l) for l in labs)):
+                ok_in_gate += 1; continue
             held = [l for l in labs if l.startswith("pilot:held-until:")]
             if held:
                 if len(held) > HELD_LOOP_MAX:
@@ -290,7 +372,8 @@ def _check_approved_fallback(inherited_warns):
 
     return {
         "total": total,
-        "parked_count": ok_held + ok_mayor,
+        "parked_count": ok_held + ok_mayor + ok_in_gate,
+        "in_gate_count": ok_in_gate,
         "buildable_count": total - len(stuck) - ok_in_flight,
         "flowing_count": ok_in_flight,
         "held_count": ok_held,
@@ -300,7 +383,7 @@ def _check_approved_fallback(inherited_warns):
         "from_dispatchable": False,
         "snap_age_min": None,
         "_ok_reasons": {"in-flight": ok_in_flight, "held": ok_held,
-                        "mayor": ok_mayor, "fresh": ok_fresh},
+                        "mayor": ok_mayor, "fresh": ok_fresh, "in-gate": ok_in_gate},
         "_total_approved": total,
     }
 
@@ -445,9 +528,10 @@ def main():
         snap_note = ("snapshot %.0fmin atrás" % a["snap_age_min"]) if a.get("snap_age_min") is not None else ""
         print("FILA DO PILOT (dispatchable%s): %d total"
               % ((" — " + snap_note) if snap_note else "", a["total"]))
-        print("  • parked (needs-human/on-device/blocked): %d   • genuinamente construíveis: %d"
-              "   • em build agora (in-flight): %d   • held: %d"
-              % (a["parked_count"], a["buildable_count"], a["flowing_count"], a["held_count"]))
+        print("  • parked (needs-human/on-device/blocked/já-no-gate): %d (já-construídas-no-gate: %d)"
+              "   • genuinamente construíveis: %d   • em build agora (in-flight): %d   • held: %d"
+              % (a["parked_count"], a.get("in_gate_count", 0),
+                 a["buildable_count"], a["flowing_count"], a["held_count"]))
         if a["stuck"]:
             print("  • CONSTRUÍVEIS MAS PARADAS (%d): %s"
                   % (len(a["stuck"]),
