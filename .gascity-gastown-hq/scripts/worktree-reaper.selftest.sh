@@ -5,7 +5,14 @@
 # Asserts: (1) a stale+CLEAN pool worktree (under <rig>/crew/worker-*) is reaped; (2) its
 # orphan local branch is deleted IFF merged into origin/<default>; (3) an UNMERGED branch's
 # worktree is reaped but the branch is KEPT (no data loss); (4) a DIRTY pool worktree is
-# skipped (live WIP protected); (5) a FRESH worktree is kept (age gate). Exit 0 iff all hold.
+# skipped (live WIP protected); (5) a FRESH worktree is kept (age gate).
+#
+# ZOMBIE-LOCK (wa-8y45): a worktree LOCKED by a stuck/ancient agent. Asserts a DEAD-pid lock
+# and an ANCIENT+IDLE-pid lock are unlock+reaped; a YOUNG/ACTIVE-pid lock and an ANCIENT-but-
+# BUSY lock are KEPT (never reap a live agent); .claude/worktrees + .gc-worktrees paths are
+# covered; an UNPARSEABLE lock is KEPT (fail-safe); the SIGTERM guard kills a crew claude proc
+# but never a supervisor/pilot; kill is default-OFF; the feature has a kill-switch + dry-run.
+# Process probes are faked so it's hermetic. Exit 0 iff all hold.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -95,6 +102,158 @@ _capreaped=$(grep -c '"event":"reaped_pool".*caprig' "$TMP/reaper3.jsonl" 2>/dev
 _capsurv=$(git -C "$RIG2" worktree list --porcelain 2>/dev/null | grep -cE "^worktree .*/crew/worker-cap[0-9]\$")
 [ "$_capsurv" = "1" ] && ok "1 capped worktree survives this sweep (drains next)" || bad "expected 1 survivor, got $_capsurv"
 grep -q '"event":"pool_cap_hit"' "$TMP/reaper3.jsonl" 2>/dev/null && ok "cap-hit logged (no silent truncation)" || bad "cap-hit NOT logged"
+
+# ══ ZOMBIE-LOCK reaping (wa-8y45): a worktree LOCKED by a stuck/ancient agent ══════
+# Proves: (i) DEAD-pid lock → reap; (ii) ANCIENT+IDLE-pid lock → reap; (iii) YOUNG/ACTIVE
+# -pid lock → KEEP (critical: never reap a live agent); (iii-b) ANCIENT-but-BUSY → KEEP;
+# (iv) .claude/worktrees + .gc-worktrees path coverage; (v) UNPARSEABLE lock → KEEP.
+# Process probes are faked (WORKTREE_REAPER_FAKE_PS) so the suite is hermetic.
+echo "── zombie-lock detection (wa-8y45) ──"
+TOWNZ="$TMP/townz"; mkdir -p "$TOWNZ"
+ZREMOTE="$TMP/zremote.git"; git init -q --bare "$ZREMOTE"
+ZRIG="$TOWNZ/zrig"; git init -q -b main "$ZRIG"
+( cd "$ZRIG"
+  git remote add origin "$ZREMOTE"
+  echo z > z.txt; git add z.txt; git commit -qm zbase
+  git push -q origin main; git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  mkdir -p "$ZRIG/.claude/worktrees" "$ZRIG/.gc-worktrees"
+  # (a) DEAD holder, crew branch merged into origin/main → reap + delete merged branch
+  git branch crew/z/dead main
+  git worktree add -q "$ZRIG/.claude/worktrees/agent-dead" crew/z/dead
+  git worktree lock --reason "claude agent agent-dead pid 1001 start 2026-06-27T00:00:00" "$ZRIG/.claude/worktrees/agent-dead"
+  # (b) ANCIENT+IDLE holder, NON-crew branch → reap worktree, KEEP branch (no data loss)
+  git worktree add -q "$ZRIG/.claude/worktrees/agent-ancient" -b wa-ancient-sortfix main
+  git worktree lock --reason "claude agent agent-ancient pid 1002 start 2026-06-26T00:00:00" "$ZRIG/.claude/worktrees/agent-ancient"
+  # (c) YOUNG/ACTIVE holder → KEEP (never reap a live agent's tree)
+  git worktree add -q "$ZRIG/.claude/worktrees/agent-young" -b crew/z/young main
+  git worktree lock --reason "claude agent agent-young pid 1003 start now" "$ZRIG/.claude/worktrees/agent-young"
+  # (d) ANCIENT but BUSY (recent CPU) holder → KEEP (not idle)
+  git worktree add -q "$ZRIG/.claude/worktrees/agent-busy" -b crew/z/busy main
+  git worktree lock --reason "claude agent agent-busy pid 1004 start old" "$ZRIG/.claude/worktrees/agent-busy"
+  # (e) gate-review tree under .gc-worktrees, DEAD holder, detached → reap (path coverage)
+  git worktree add -q --detach "$ZRIG/.gc-worktrees/zb-mainbase" main
+  git worktree lock --reason "claude agent agent-gate pid 1005 start x" "$ZRIG/.gc-worktrees/zb-mainbase"
+  # (f) UNPARSEABLE lock (no pid in reason) → KEEP (fail-safe)
+  git worktree add -q "$ZRIG/.claude/worktrees/agent-noreason" -b crew/z/noreason main
+  git worktree lock --reason "manual hold by human" "$ZRIG/.claude/worktrees/agent-noreason"
+  # (g) UNLOCKED stale+clean under .claude/worktrees, crew merged → normal reap + branch del
+  git branch crew/z/unlocked main
+  git worktree add -q "$ZRIG/.claude/worktrees/agent-unlocked" crew/z/unlocked
+) >/dev/null 2>&1
+
+# backdate every zrig worktree past the age gate (dir mtime) — agent-young is OLD by dir-age
+# yet must be KEPT because its HOLDER is young/active (proves holder-age, not dir-age, decides).
+for w in agent-dead agent-ancient agent-young agent-busy agent-noreason agent-unlocked; do
+  touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$ZRIG/.claude/worktrees/$w" 2>/dev/null || true
+done
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$ZRIG/.gc-worktrees/zb-mainbase" 2>/dev/null || true
+
+# fake process table: "<pid> <alive|dead> <elapsed_secs> <cpu_x10>"  (thr: 48h=172800s, cpu<=50)
+FAKEPS="$TMP/fakeps.txt"
+{ echo "1001 dead 0 0"            # (a) dead                         → zombie
+  echo "1002 alive 370000 3"      # (b) ~4.3d @ 0.3% → ancient+idle  → zombie
+  echo "1003 alive 3600 250"      # (c) 1h @ 25%     → young+active  → LIVE
+  echo "1004 alive 400000 850"    # (d) ~4.6d @ 85%  → ancient+BUSY  → LIVE
+} > "$FAKEPS"                      # 1005 absent → probed as dead     → zombie
+
+WORKTREE_REAPER_GT="$TOWNZ" WORKTREE_REAPER_LOG="$TMP/reaperZ.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+WORKTREE_REAPER_ZOMBIE_HOURS=48 WORKTREE_REAPER_ZOMBIE_MAX_CPU=5 \
+WORKTREE_REAPER_FAKE_PS="$FAKEPS" \
+  bash "$REAPER" >/dev/null 2>&1
+
+zwt() { git -C "$ZRIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/$1\$"; }
+zbr() { git -C "$ZRIG" rev-parse --verify -q "refs/heads/$1" >/dev/null 2>&1; }
+
+zwt ".claude/worktrees/agent-dead"     && bad "DEAD-locked worktree NOT reaped"                 || ok "DEAD-locked worktree reaped"
+zbr crew/z/dead                        && bad "dead's merged crew branch NOT deleted"           || ok "dead's merged crew branch deleted"
+zwt ".claude/worktrees/agent-ancient"  && bad "ANCIENT+IDLE-locked worktree NOT reaped"         || ok "ANCIENT+IDLE-locked worktree reaped"
+zbr wa-ancient-sortfix                 && ok "ancient's NON-crew branch KEPT (no data loss)"    || bad "ancient's non-crew branch wrongly deleted"
+zwt ".claude/worktrees/agent-young"    && ok "YOUNG/ACTIVE-locked worktree KEPT (never reap live agent)" || bad "YOUNG/ACTIVE worktree wrongly reaped — DESTROYS LIVE WORK!"
+zwt ".claude/worktrees/agent-busy"     && ok "ANCIENT-but-BUSY-locked worktree KEPT (not idle)" || bad "busy worktree wrongly reaped"
+zwt ".gc-worktrees/zb-mainbase"        && bad "gate-review DEAD-locked tree NOT reaped"         || ok "gate-review DEAD-locked tree reaped (.gc-worktrees coverage)"
+zwt ".claude/worktrees/agent-noreason" && ok "UNPARSEABLE lock KEPT (fail-safe)"                || bad "unparseable lock wrongly reaped"
+zwt ".claude/worktrees/agent-unlocked" && bad "unlocked stale+clean .claude tree NOT reaped"    || ok "unlocked stale+clean .claude/worktrees tree reaped (path coverage)"
+zbr crew/z/unlocked                    && bad "unlocked's merged crew branch NOT deleted"       || ok "unlocked's merged crew branch deleted"
+grep -q '"event":"reaped_zombie_lock"' "$TMP/reaperZ.jsonl" 2>/dev/null && ok "reaped_zombie_lock logged" || bad "reaped_zombie_lock NOT logged"
+grep -q '"event":"kept_locked_live"'   "$TMP/reaperZ.jsonl" 2>/dev/null && ok "kept_locked_live logged (live holder)" || bad "kept_locked_live NOT logged"
+
+# ── zombie SIGTERM guard: kill a crew claude agent, NEVER a supervisor/pilot ──────
+echo "── zombie kill guard (guarded when ON) ──"
+KTOWN="$TMP/ktown"; mkdir -p "$KTOWN"; KRIG="$KTOWN/krig"; git init -q -b main "$KRIG"
+( cd "$KRIG"; echo k>k.txt; git add k.txt; git commit -qm kbase; mkdir -p "$KRIG/.claude/worktrees"
+  git worktree add -q "$KRIG/.claude/worktrees/agent-crew"  -b crew/k/crew  main
+  git worktree lock --reason "claude agent agent-crew pid 2001 start x" "$KRIG/.claude/worktrees/agent-crew"
+  git worktree add -q "$KRIG/.claude/worktrees/agent-super" -b crew/k/super main
+  git worktree lock --reason "claude agent agent-super pid 2002 start x" "$KRIG/.claude/worktrees/agent-super"
+) >/dev/null 2>&1
+for w in agent-crew agent-super; do
+  touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$KRIG/.claude/worktrees/$w" 2>/dev/null || true
+done
+KFAKEPS="$TMP/kfakeps.txt"; { echo "2001 alive 400000 2"; echo "2002 alive 400000 2"; } > "$KFAKEPS"  # both ancient+idle=zombie
+KCMD="$TMP/kcmd.txt"
+{ echo "2001 /Users/athos/.local/bin/claude --agent agent-crew wa-worker build"
+  echo "2002 /Users/athos/.local/bin/claude pilot-dispatcher.sh supervisor"; } > "$KCMD"
+KSINK="$TMP/ksink.txt"; : > "$KSINK"
+WORKTREE_REAPER_GT="$KTOWN" WORKTREE_REAPER_LOG="$TMP/reaperK.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+WORKTREE_REAPER_FAKE_PS="$KFAKEPS" WORKTREE_REAPER_FAKE_CMDLINE="$KCMD" \
+WORKTREE_REAPER_KILL_ZOMBIE=1 WORKTREE_REAPER_KILL_SINK="$KSINK" \
+  bash "$REAPER" >/dev/null 2>&1
+grep -qx 2001 "$KSINK" 2>/dev/null && ok "crew claude zombie SIGTERM'd (kill enabled)"      || bad "crew claude zombie NOT killed"
+grep -qx 2002 "$KSINK" 2>/dev/null && bad "SUPERVISOR/pilot wrongly SIGTERM'd (guard FAILED!)" || ok "supervisor/pilot process NOT killed (guard holds)"
+grep -q '"event":"kill_skipped_protected"' "$TMP/reaperK.jsonl" 2>/dev/null && ok "protected-kill-skip logged" || bad "protected kill-skip NOT logged"
+
+# ── kill DEFAULT-OFF: zombie reaped, but process NEVER signaled ───────────────────
+echo "── zombie kill default-OFF ──"
+DTOWN="$TMP/dtown"; mkdir -p "$DTOWN"; DRIG="$DTOWN/drig"; git init -q -b main "$DRIG"
+( cd "$DRIG"; echo d>d.txt; git add d.txt; git commit -qm dbase; mkdir -p "$DRIG/.claude/worktrees"
+  git worktree add -q "$DRIG/.claude/worktrees/agent-d" -b crew/d/d main
+  git worktree lock --reason "claude agent agent-d pid 3001 start x" "$DRIG/.claude/worktrees/agent-d" ) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$DRIG/.claude/worktrees/agent-d" 2>/dev/null || true
+DFAKEPS="$TMP/dfakeps.txt"; echo "3001 alive 400000 2" > "$DFAKEPS"
+DCMD="$TMP/dcmd.txt"; echo "3001 /Users/athos/.local/bin/claude --agent agent-d build" > "$DCMD"
+DSINK="$TMP/dsink.txt"; : > "$DSINK"
+WORKTREE_REAPER_GT="$DTOWN" WORKTREE_REAPER_LOG="$TMP/reaperD.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+WORKTREE_REAPER_FAKE_PS="$DFAKEPS" WORKTREE_REAPER_FAKE_CMDLINE="$DCMD" \
+WORKTREE_REAPER_KILL_SINK="$DSINK" \
+  bash "$REAPER" >/dev/null 2>&1
+[ -s "$DSINK" ] && bad "KILL default-OFF but a pid was signaled" || ok "KILL default-OFF: process NOT signaled"
+git -C "$DRIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/.claude/worktrees/agent-d\$" \
+  && bad "kill-off: zombie worktree NOT reaped" || ok "kill-off: zombie worktree still reaped (kill is orthogonal)"
+
+# ── feature kill-switch: ZOMBIE_LOCK_ENABLED=0 → ALL locked trees skipped (old behavior) ─
+echo "── zombie feature kill-switch (ZOMBIE_LOCK_ENABLED=0) ──"
+OTOWN="$TMP/otown"; mkdir -p "$OTOWN"; ORIG="$OTOWN/orig"; git init -q -b main "$ORIG"
+( cd "$ORIG"; echo o>o.txt; git add o.txt; git commit -qm obase; mkdir -p "$ORIG/.claude/worktrees"
+  git worktree add -q "$ORIG/.claude/worktrees/agent-o" -b crew/o/o main
+  git worktree lock --reason "claude agent agent-o pid 4001 start x" "$ORIG/.claude/worktrees/agent-o" ) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$ORIG/.claude/worktrees/agent-o" 2>/dev/null || true
+OFAKEPS="$TMP/ofakeps.txt"; echo "4001 dead 0 0" > "$OFAKEPS"
+WORKTREE_REAPER_GT="$OTOWN" WORKTREE_REAPER_LOG="$TMP/reaperO.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+WORKTREE_REAPER_ZOMBIE_LOCK_ENABLED=0 WORKTREE_REAPER_FAKE_PS="$OFAKEPS" \
+  bash "$REAPER" >/dev/null 2>&1
+git -C "$ORIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/.claude/worktrees/agent-o\$" \
+  && ok "ZOMBIE_LOCK_ENABLED=0: dead-locked tree KEPT (old behavior preserved)" || bad "ZOMBIE_LOCK_ENABLED=0 still reaped a locked tree"
+
+# ── dry-run: ENABLED=0 logs would_reap_zombie_lock, removes nothing ───────────────
+echo "── zombie dry-run (ENABLED=0) ──"
+YTOWN="$TMP/ytown"; mkdir -p "$YTOWN"; YRIG="$YTOWN/yrig"; git init -q -b main "$YRIG"
+( cd "$YRIG"; echo y>y.txt; git add y.txt; git commit -qm ybase; mkdir -p "$YRIG/.claude/worktrees"
+  git worktree add -q "$YRIG/.claude/worktrees/agent-y" -b crew/y/y main
+  git worktree lock --reason "claude agent agent-y pid 5001 start x" "$YRIG/.claude/worktrees/agent-y" ) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$YRIG/.claude/worktrees/agent-y" 2>/dev/null || true
+YFAKEPS="$TMP/yfakeps.txt"; echo "5001 dead 0 0" > "$YFAKEPS"
+WORKTREE_REAPER_GT="$YTOWN" WORKTREE_REAPER_LOG="$TMP/reaperY.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=0 \
+WORKTREE_REAPER_FAKE_PS="$YFAKEPS" \
+  bash "$REAPER" >/dev/null 2>&1
+git -C "$YRIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/.claude/worktrees/agent-y\$" \
+  && ok "ENABLED=0: zombie-locked tree NOT removed (dry-run)" || bad "ENABLED=0 removed a zombie-locked tree"
+grep -q '"event":"would_reap_zombie_lock"' "$TMP/reaperY.jsonl" 2>/dev/null && ok "ENABLED=0: logged would_reap_zombie_lock intent" || bad "ENABLED=0: no zombie dry intent logged"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
