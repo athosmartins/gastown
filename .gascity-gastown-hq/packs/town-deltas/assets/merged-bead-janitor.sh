@@ -73,10 +73,33 @@ FETCH_TIMEOUT="${JANITOR_FETCH_TIMEOUT:-30}"
 DRY_RUN="${JANITOR_DRY_RUN:-0}"
 # Optional rig filter (space-separated prefixes/names); empty = all rigs.
 RIGS_FILTER="${JANITOR_RIGS:-}"
+
+# ── Branch-prune sweep (ga-tijv5 extension, 2026-07-01) — OPT-IN, default OFF ─
+# Merged crew branches (crew/<persona>/<id>) accumulate on the shared remotes and
+# are NEVER pruned after merge (measured 2026-07-01: 495 on whatsapp-automation,
+# 14 on property_scrapers). This sweep prunes the FULLY-MERGED cruft (ahead=0 vs
+# origin/<default>) whose bead is closed/gone, that has no live worktree, and is
+# past a freshness grace window. It is DELIBERATELY conservative — it NEVER touches
+# a branch with unique unmerged commits (ahead>0), so remote history is never lost.
+#
+# STAGED, not deployed: default OFF so the already-loaded launchd job keeps its
+# current behaviour untouched. Enable per-run with --prune-branches / JANITOR_PRUNE_BRANCHES=1,
+# or durably by adding <key>JANITOR_PRUNE_BRANCHES</key><string>1</string> to the
+# plist's EnvironmentVariables (the Mayor's deploy step, after reviewing a dry-run:
+#   JANITOR_PRUNE_BRANCHES=1 JANITOR_DRY_RUN=1 ./merged-bead-janitor.sh).
+PRUNE_BRANCHES="${JANITOR_PRUNE_BRANCHES:-0}"
+# Freshness grace: never prune a branch whose tip is younger than this many days,
+# even if merged (an agent may still reference a just-merged branch).
+BRANCH_FRESH_DAYS="${BRANCH_FRESH_DAYS:-7}"
+# Anti-Dolt-spike / anti-runaway: cap real branch deletions per sweep. The first
+# real run drains a large backlog over several cadence cycles instead of at once.
+BRANCH_PRUNE_MAX_PER_SWEEP="${BRANCH_PRUNE_MAX:-100}"
+
 for arg in "$@"; do
   case "$arg" in
-    --dry-run) DRY_RUN=1 ;;
-    --rig=*)   RIGS_FILTER="$RIGS_FILTER ${arg#--rig=}" ;;
+    --dry-run)        DRY_RUN=1 ;;
+    --prune-branches) PRUNE_BRANCHES=1 ;;
+    --rig=*)          RIGS_FILTER="$RIGS_FILTER ${arg#--rig=}" ;;
   esac
 done
 
@@ -205,6 +228,61 @@ janitor_convoy_decide() {
   if [ "$dep_count" -lt 1 ] 2>/dev/null; then echo "keep:no-dependencies"; return 0; fi
   if [ "$open_dep_count" -gt 0 ] 2>/dev/null; then echo "keep:dependency-still-open"; return 0; fi
   echo "close:all-dependencies-closed"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PURE DECISION FUNCTION #4 — crew-branch prune (ga-tijv5 extension, 2026-07-01).
+#
+# WHY: merged crew branches (crew/<persona>/<id>) are never pruned after their
+# work lands in origin/<default>. They pile up on the shared remotes (495 on
+# whatsapp-automation, 14 on property_scrapers when measured) and never shrink.
+#
+# SAFETY POSTURE — provably lossless. A branch is pruned ONLY when it is FULLY
+# MERGED (ahead==0 vs origin/<default>: every one of its commits is already an
+# ancestor of the default branch, so deleting the ref removes nothing that isn't
+# in main). A branch with ANY unique commit (ahead>0) is NEVER pruned here — that
+# would be the destructive case, and it is categorically excluded. On top of the
+# ahead==0 gate, three KEEP guards protect against edge cases:
+#   • live worktree  — an agent has the branch checked out locally (active work).
+#   • fresh          — tip younger than BRANCH_FRESH_DAYS (grace: just-merged work
+#                      an agent might still push follow-ups to).
+#   • bead active    — the branch's bead is open/in_progress/blocked/deferred/etc
+#                      (kept as a courtesy even though ahead==0 loses nothing).
+# And it is FAIL-OPEN: if the bead status could not be read (Dolt hiccup), the
+# state is "readerror" → KEEP. Only a definitively-closed or definitively-gone
+# bead (clean not-found in BOTH the rig store AND the HQ store) permits a prune.
+#
+# janitor_branch_decide <ahead> <bead_state> <live_worktree> <is_fresh>
+#   ahead        — integer string; commits on the branch NOT in origin/<default>.
+#                  Non-numeric (e.g. "ERR" from a failed rev-list) → treated as
+#                  "unmerged" → KEEP (fail-safe: never prune on a bad ahead read).
+#   bead_state   — closed | active | gone | readerror  (see resolve_bead_state).
+#   live_worktree— 0|1.   is_fresh — 0|1.
+# Echoes "<verdict>:<reason>", verdict ∈ {prune,keep}. KEEP-biased: every guard
+# and every uncertain state resolves to keep. Guards evaluated in fixed precedence.
+# ═════════════════════════════════════════════════════════════════════════════
+janitor_branch_decide() {
+  local ahead="$1" bead_state="$2" live="$3" fresh="$4"
+  if [ "$live" = "1" ];               then echo "keep:live-worktree"; return 0; fi
+  if [ "$ahead" != "0" ];             then echo "keep:has-unmerged-commits"; return 0; fi
+  if [ "$fresh" = "1" ];              then echo "keep:fresh-branch-grace-window"; return 0; fi
+  if [ "$bead_state" = "readerror" ]; then echo "keep:bead-read-error-failopen"; return 0; fi
+  if [ "$bead_state" = "active" ];    then echo "keep:bead-open-or-active"; return 0; fi
+  if [ "$bead_state" = "closed" ];    then echo "prune:merged-and-bead-closed"; return 0; fi
+  if [ "$bead_state" = "gone" ];      then echo "prune:merged-and-bead-gone"; return 0; fi
+  echo "keep:unknown-bead-state-failsafe"
+}
+
+# normalize_bead_status <raw_bd_status> — map a raw bd `status` string to the
+# coarse {closed|active} classification the branch decider uses. Pure/testable.
+# "closed" → closed; any other non-empty status (open/in_progress/blocked/
+# deferred/hooked/pinned/…) → active; empty → active (a found-but-blank status
+# is treated as active, i.e. KEEP — the safe direction).
+normalize_bead_status() {
+  case "$1" in
+    closed) echo "closed" ;;
+    *)      echo "active" ;;
+  esac
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -362,6 +440,60 @@ convoy_dep_counts() {
   if [ -z "$out" ]; then echo "0 0 0"; else echo "$out"; fi
 }
 
+# ── Branch-prune live helpers (ga-tijv5 extension) ───────────────────────────
+
+# branch_is_fresh <git_dir> <container> <ref> <days> — echoes 1 iff <ref>'s tip
+# committer date is within <days> of now, else 0. Unknown/unreadable date → 0
+# (a branch with no resolvable tip date is not treated as fresh; the ahead==0 +
+# closed/gone-bead gates still protect it). Pure-git (no Dolt) → selftest-able.
+branch_is_fresh() {
+  local gdir="$1" container="$2" ref="$3" days="$4" ts now
+  ts=$(git_in "$gdir" "$container" log -1 --format='%ct' "$ref" 2>/dev/null || echo "")
+  case "$ts" in ''|*[!0-9]*) echo 0; return 0 ;; esac
+  now=$(date +%s)
+  if [ "$(( (now - ts) / 86400 ))" -lt "$days" ] 2>/dev/null; then echo 1; else echo 0; fi
+}
+
+# bead_lookup_one <store_path> <bead_id> — echoes "found:<status>" | "notfound" |
+# "readerror". A clean not-found is bd emitting {"error":"no issue(s) found …"}
+# with rc0; anything unparseable / empty / a non-not-found error → readerror
+# (fail-open: the caller keeps the branch). Single-bead read (cheap).
+bead_lookup_one() {
+  local store="$1" id="$2" out st
+  out=$(bd -C "$store" show "$id" --json 2>/dev/null) || { echo "readerror"; return 0; }
+  [ -z "$out" ] && { echo "readerror"; return 0; }
+  if printf '%s' "$out" | jq -e '(.error // "") | test("no issue")' >/dev/null 2>&1; then
+    echo "notfound"; return 0
+  fi
+  st=$(printf '%s' "$out" | jq -r '(if type=="array" then .[0] else . end) | .status // ""' 2>/dev/null) \
+    || { echo "readerror"; return 0; }
+  [ -z "$st" ] && { echo "readerror"; return 0; }
+  echo "found:$st"
+}
+
+# resolve_bead_state <rig_store> <bead_id> — echoes closed | active | gone |
+# readerror. Queries the rig store first, then the HQ store (crew branches in a
+# rig repo are routinely tied to HQ-store ga-*/dc-* beads). "gone" is returned
+# ONLY when BOTH stores CLEANLY report not-found — a read error in EITHER store
+# yields "readerror" so the decider fails open (keeps the branch). This is the
+# guard that prevents a transient Dolt hiccup from ever being read as "no bead".
+resolve_bead_state() {
+  local rig_store="$1" id="$2" r h
+  r=$(bead_lookup_one "$rig_store" "$id")
+  case "$r" in
+    found:*)   normalize_bead_status "${r#found:}"; return 0 ;;
+    readerror) echo "readerror"; return 0 ;;
+  esac
+  # rig store said notfound → consult HQ store.
+  h=$(bead_lookup_one "$GC_CITY" "$id")
+  case "$h" in
+    found:*)   normalize_bead_status "${h#found:}"; return 0 ;;
+    readerror) echo "readerror"; return 0 ;;
+    notfound)  echo "gone"; return 0 ;;
+  esac
+  echo "readerror"
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Guard: when sourced for tests, stop here (no live sweep).
 # ═════════════════════════════════════════════════════════════════════════════
@@ -379,6 +511,11 @@ HQ_DEFAULT=$(printf '%s' "$RIG_LIST_JSON" | jq -r '.rigs[] | select(.hq == true)
 
 # Best-effort fetch of every repo we will inspect (deduped), bounded so a bad
 # remote can never hang the sweep. Stale refs are tolerated (next sweep retries).
+# --prune is REQUIRED: the branch-prune sweep enumerates local remote-tracking
+# refs (refs/remotes/origin/crew/*) to decide deletions; without --prune a stale
+# tracking ref for a branch already deleted (or deleted-then-recreated) on the
+# remote would make the sweep act on outdated state. Pruning tracking refs is
+# also harmless to the commit/marker/branch signals of the other sweeps.
 declare -a FETCHED=()
 fetch_once() {
   local gdir="$1" container="$2" key
@@ -386,7 +523,7 @@ fetch_once() {
   for k in "${FETCHED[@]:-}"; do [ "$k" = "$key" ] && return 0; done
   FETCHED+=("$key")
   timeout "$FETCH_TIMEOUT" sh -c '
-    if [ "$2" = "1" ]; then git --git-dir="$1" fetch origin --quiet; else git -C "$1" fetch origin --quiet; fi
+    if [ "$2" = "1" ]; then git --git-dir="$1" fetch origin --prune --quiet; else git -C "$1" fetch origin --prune --quiet; fi
   ' _ "$gdir" "$container" 2>/dev/null || warn "fetch failed/timeout for $gdir (continuing with stale refs)"
 }
 fetch_once "$HQ_GITDIR" "$HQ_CONTAINER"
@@ -396,9 +533,11 @@ SIBLING_ADVISORIES=0
 DONE_COUNT=0   # ga-gosfs: stories reconciled story:approved → story:done
 CONVOY_COUNT=0 # convoy-reconciler: orphaned wrapper/coordination beads closed
 CONVOY_MAX_PER_SWEEP="${CONVOY_MAX_PER_SWEEP:-60}" # anti-Dolt-spike: cap REAL closes/sweep; the ~480 backlog drains over a few 15min sweeps instead of 480 commits at once
+BRANCH_PRUNE_COUNT=0 # ga-tijv5 extension: merged crew branches pruned this sweep
 declare -a CLOSED_SUMMARY=()
 declare -a DONE_SUMMARY=()
 declare -a CONVOY_SUMMARY=()
+declare -a BRANCH_PRUNE_SUMMARY=()
 
 # Iterate every rig store.
 RIG_ROWS=$(printf '%s' "$RIG_LIST_JSON" | jq -rc '.rigs[]? | {name,prefix,path,default_branch:(.default_branch // "main"),hq:(.hq // false)}' 2>/dev/null || true)
@@ -703,11 +842,99 @@ EOF
   done <<EOF
 $(printf '%s' "$CONVOYS" | jq -rc '.[]?')
 EOF
+
+  # ── branch-prune sweep (ga-tijv5 extension) — OPT-IN, default OFF ────────────
+  # Prune FULLY-MERGED crew branches (crew/<persona>/<id>, ahead==0 vs
+  # origin/<default>) whose bead is closed/gone, with no live worktree, past the
+  # freshness grace. NEVER prunes a branch with unique commits (ahead>0). Every
+  # real deletion RE-VERIFIES ahead==0 immediately before `push --delete` (a
+  # destructive, outward-facing op), and is capped per sweep.
+  if [ "$PRUNE_BRANCHES" = "1" ]; then
+    CREW_BRANCHES=$(git_in "$RGITDIR" "$RCONTAINER" for-each-ref --format='%(refname:short)' 'refs/remotes/origin/crew/**' 2>/dev/null | sed 's#^origin/##' || true)
+    NCREW=$(printf '%s' "$CREW_BRANCHES" | grep -c . 2>/dev/null || echo 0)
+    [ "$NCREW" = "0" ] || log "rig $RNAME ($RPREFIX): $NCREW crew branch(es) to check for merged-branch prune"
+    # Crew branches currently checked out in a local worktree (never delete these).
+    WT_CREW=$(git_in "$RGITDIR" "$RCONTAINER" worktree list --porcelain 2>/dev/null | awk '/^branch refs\/heads\/crew\//{sub("branch refs/heads/","");print}' || true)
+    while IFS= read -r cb; do
+      [ -z "$cb" ] && continue
+      # Per-sweep cap (real runs only; dry-run stays unbounded for auditing).
+      if [ "$DRY_RUN" != "1" ] && [ "$BRANCH_PRUNE_COUNT" -ge "$BRANCH_PRUNE_MAX_PER_SWEEP" ]; then
+        log "branch-prune: per-sweep cap $BRANCH_PRUNE_MAX_PER_SWEEP reached — deferring remaining to next sweep"
+        break
+      fi
+      AHEAD=$(git_in "$RGITDIR" "$RCONTAINER" rev-list --count "origin/$RDEFAULT..origin/$cb" 2>/dev/null || echo "ERR")
+      LWT=0; printf '%s\n' "$WT_CREW" | grep -Fxq "$cb" && LWT=1
+      FRESH=$(branch_is_fresh "$RGITDIR" "$RCONTAINER" "origin/$cb" "$BRANCH_FRESH_DAYS")
+      # Only pay the Dolt read when the branch could actually be pruned
+      # (ahead==0, not fresh, no live worktree). Otherwise the decider KEEPs on a
+      # cheaper guard before it ever consults the bead state.
+      BSTATE="active"; BID="${cb##*/}"
+      if [ "$LWT" = "0" ] && [ "$AHEAD" = "0" ] && [ "$FRESH" = "0" ]; then
+        BSTATE=$(resolve_bead_state "$RPATH" "$BID")
+        # Suffix convention: crew/<persona>/<id>-<slug> (e.g. ga-kpaym-hardening)
+        # → the bead is the <prefix>-<token> head (ga-kpaym). Only fall back when
+        # the full segment was cleanly gone (never override a found/readerror).
+        if [ "$BSTATE" = "gone" ]; then
+          PREF=$(printf '%s' "$BID" | awk -F- '{if(NF>=2)print $1"-"$2; else print $0}')
+          if [ "$PREF" != "$BID" ]; then
+            P2=$(resolve_bead_state "$RPATH" "$PREF")
+            [ "$P2" != "gone" ] && { BSTATE="$P2"; BID="$PREF"; }
+          fi
+        fi
+      fi
+      BV=$(janitor_branch_decide "$AHEAD" "$BSTATE" "$LWT" "$FRESH")
+      BVERD="${BV%%:*}"; BREASON="${BV#*:}"
+      if [ "$BVERD" = "prune" ]; then
+        # RE-VERIFY ahead==0 at delete time — the remote may have advanced since
+        # the decision. ahead==0 is monotone-safe, but a bad/failed recheck aborts.
+        RECHECK=$(git_in "$RGITDIR" "$RCONTAINER" rev-list --count "origin/$RDEFAULT..origin/$cb" 2>/dev/null || echo "ERR")
+        if [ "$RECHECK" != "0" ]; then
+          log "branch-prune SKIP origin/$cb ($RNAME) — recheck ahead=$RECHECK (changed since decision)"; continue
+        fi
+        if [ "$DRY_RUN" = "1" ]; then
+          log "WOULD-PRUNE-BRANCH origin/$cb ($RNAME) — $BREASON [bead=$BID state=$BSTATE ahead=0]"
+          BRANCH_PRUNE_COUNT=$((BRANCH_PRUNE_COUNT+1))
+          BRANCH_PRUNE_SUMMARY+=("$cb ($RNAME): $BREASON")
+        else
+          # AUTHORITATIVE delete-time guard (compare-and-swap approximation). git
+          # has no --force-with-lease for deletes, so before removing an
+          # outward-facing ref we confirm via ls-remote that the remote branch
+          # STILL exists and STILL points at the exact SHA our (pruned) tracking
+          # ref recorded. If it is gone → already deleted (skip). If it moved →
+          # the branch was advanced or deleted-then-recreated with new work since
+          # we judged it merged → SKIP (never delete on a mismatch). This closes
+          # the stale-tracking-ref / re-create race for the destructive op.
+          REMOTE_SHA=$(git_in "$RGITDIR" "$RCONTAINER" ls-remote origin "refs/heads/$cb" 2>/dev/null | awk 'NR==1{print $1}')
+          LOCAL_SHA=$(git_in "$RGITDIR" "$RCONTAINER" rev-parse "origin/$cb" 2>/dev/null || echo "")
+          if [ -z "$REMOTE_SHA" ]; then
+            log "branch-prune SKIP origin/$cb ($RNAME) — no longer on remote (already gone)"
+            git_in "$RGITDIR" "$RCONTAINER" update-ref -d "refs/remotes/origin/$cb" 2>/dev/null || true
+            continue
+          fi
+          if [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; then
+            log "branch-prune SKIP origin/$cb ($RNAME) — remote moved since decision (remote=${REMOTE_SHA:0:9} local=${LOCAL_SHA:0:9})"; continue
+          fi
+          if git_in "$RGITDIR" "$RCONTAINER" push origin --delete "$cb" >/dev/null 2>&1; then
+            git_in "$RGITDIR" "$RCONTAINER" update-ref -d "refs/remotes/origin/$cb" 2>/dev/null || true
+            log "PRUNED-BRANCH origin/$cb ($RNAME) — $BREASON [bead=$BID state=$BSTATE ahead=0 sha=${REMOTE_SHA:0:9}]"
+            BRANCH_PRUNE_COUNT=$((BRANCH_PRUNE_COUNT+1))
+            BRANCH_PRUNE_SUMMARY+=("$cb ($RNAME): $BREASON")
+          else
+            err "branch-prune push --delete failed for origin/$cb ($RNAME) — kept"; continue
+          fi
+        fi
+      elif [ "${JANITOR_BRANCH_VERBOSE:-0}" = "1" ]; then
+        log "keep-branch origin/$cb ($RNAME) — $BREASON [ahead=$AHEAD fresh=$FRESH wt=$LWT bead=$BSTATE]"
+      fi
+    done <<EOF
+$CREW_BRANCHES
+EOF
+  fi
 done <<EOF
 $RIG_ROWS
 EOF
 
-log "=== merged-bead-janitor sweep complete — closed=$CLOSED_COUNT story_done=$DONE_COUNT convoy_reaped=$CONVOY_COUNT advisories=$SIBLING_ADVISORIES dry_run=$DRY_RUN ==="
+log "=== merged-bead-janitor sweep complete — closed=$CLOSED_COUNT story_done=$DONE_COUNT convoy_reaped=$CONVOY_COUNT branches_pruned=$BRANCH_PRUNE_COUNT advisories=$SIBLING_ADVISORIES dry_run=$DRY_RUN ==="
 if [ "$DRY_RUN" = "0" ]; then
   if [ "$CLOSED_COUNT" -gt 0 ]; then
     SUMMARY=$(printf '%s; ' "${CLOSED_SUMMARY[@]}")
@@ -723,6 +950,12 @@ if [ "$DRY_RUN" = "0" ]; then
     CSAMPLE=$(printf '%s; ' "${CONVOY_SUMMARY[@]:0:8}")
     [ "$CONVOY_COUNT" -gt 8 ] && CSAMPLE="$CSAMPLE…(+$((CONVOY_COUNT-8)) more)"
     notify_athos -t "Kanban janitor" "Reaped $CONVOY_COUNT orphaned convoy/coordination wrapper(s) (all deps closed): $CSAMPLE"
+  fi
+  if [ "$BRANCH_PRUNE_COUNT" -gt 0 ]; then
+    # The first real run may prune a large merged-branch backlog — cap the message.
+    BSAMPLE=$(printf '%s; ' "${BRANCH_PRUNE_SUMMARY[@]:0:8}")
+    [ "$BRANCH_PRUNE_COUNT" -gt 8 ] && BSAMPLE="$BSAMPLE…(+$((BRANCH_PRUNE_COUNT-8)) more)"
+    notify_athos -t "Kanban janitor" "Pruned $BRANCH_PRUNE_COUNT fully-merged crew branch(es): $BSAMPLE"
   fi
 fi
 exit 0

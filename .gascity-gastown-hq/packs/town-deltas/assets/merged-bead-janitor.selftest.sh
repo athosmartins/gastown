@@ -28,7 +28,9 @@ JANITOR_LIB_ONLY=1 source "$JANITOR" \
   || { echo "FATAL: could not source janitor in lib-only mode"; exit 1; }
 for fn in janitor_decide janitor_story_decide token_bounded scan_commit_for_bead \
           scan_commit_subject_for_bead branch_merged \
-          has_open_marker has_terminal_passed_marker branch_label_from_markers rig_gitdir; do
+          has_open_marker has_terminal_passed_marker branch_label_from_markers rig_gitdir \
+          janitor_branch_decide normalize_bead_status branch_is_fresh \
+          bead_lookup_one resolve_bead_state; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by janitor"; exit 1; }
 done
 
@@ -88,6 +90,43 @@ eq "builder > delivery"                 "$(janitor_story_decide 0 0 0 0 1 1 0 0 
 eq "commit beats marker+branch"         "$(janitor_story_decide 0 0 0 0 0 0 1 1 1)" "done:commit-in-origin-main"
 eq "marker beats branch"                "$(janitor_story_decide 0 0 0 0 0 0 0 1 1)" "done:terminal-gate-marker-passed-or-superseded"
 
+# ── 1c. janitor_branch_decide — crew-branch prune (ga-tijv5 extension) ──────
+# Args: <ahead> <bead_state> <live_worktree> <is_fresh>. The ONLY prune verdicts
+# are ahead==0 AND bead closed|gone AND no worktree AND not fresh. Every other
+# combination — and every uncertain state — must KEEP (lossless-only posture).
+echo "── 1c. janitor_branch_decide (crew-branch prune) ──"
+# The two (and only two) prune paths: fully-merged + bead closed / gone.
+eq "merged + bead closed → prune"       "$(janitor_branch_decide 0 closed 0 0)" "prune:merged-and-bead-closed"
+eq "merged + bead gone → prune"         "$(janitor_branch_decide 0 gone   0 0)" "prune:merged-and-bead-gone"
+eq "prune verb (closed)"                "$(janitor_branch_decide 0 closed 0 0 | cut -d: -f1)" "prune"
+# ahead>0 (unique commits) is the destructive case — NEVER pruned, whatever else.
+eq "unmerged commits → keep"            "$(janitor_branch_decide 5 closed 0 0)" "keep:has-unmerged-commits"
+eq "unmerged even if bead gone → keep"  "$(janitor_branch_decide 1 gone   0 0)" "keep:has-unmerged-commits"
+eq "bad ahead read (ERR) → keep"        "$(janitor_branch_decide ERR closed 0 0)" "keep:has-unmerged-commits"
+# Live worktree wins over everything (active agent), even fully merged + closed.
+eq "live worktree → keep"               "$(janitor_branch_decide 0 closed 1 0)" "keep:live-worktree"
+eq "worktree beats prune (gone)"        "$(janitor_branch_decide 0 gone   1 0)" "keep:live-worktree"
+# Freshness grace: a just-merged branch is kept even with a closed bead.
+eq "fresh branch → keep"                "$(janitor_branch_decide 0 closed 0 1)" "keep:fresh-branch-grace-window"
+# Open/active bead → keep (courtesy; ahead==0 loses nothing but we don't touch it).
+eq "open/active bead → keep"            "$(janitor_branch_decide 0 active 0 0)" "keep:bead-open-or-active"
+# FAIL-OPEN: an unreadable bead status must never be pruned (transient Dolt).
+eq "bead read error → keep (failopen)"  "$(janitor_branch_decide 0 readerror 0 0)" "keep:bead-read-error-failopen"
+# Guard precedence: worktree > ahead > fresh > readerror > active > closed/gone.
+eq "worktree > unmerged"                "$(janitor_branch_decide 9 closed 1 0)" "keep:live-worktree"
+eq "unmerged > fresh"                   "$(janitor_branch_decide 3 closed 0 1)" "keep:has-unmerged-commits"
+eq "fresh > readerror"                  "$(janitor_branch_decide 0 readerror 0 1)" "keep:fresh-branch-grace-window"
+eq "readerror > active"                 "$(janitor_branch_decide 0 active 0 0)" "keep:bead-open-or-active"
+
+# ── 1d. normalize_bead_status — raw bd status → coarse closed|active ─────────
+echo "── 1d. normalize_bead_status ──"
+eq "closed → closed"                    "$(normalize_bead_status closed)" "closed"
+eq "open → active"                      "$(normalize_bead_status open)" "active"
+eq "in_progress → active"               "$(normalize_bead_status in_progress)" "active"
+eq "blocked → active"                   "$(normalize_bead_status blocked)" "active"
+eq "deferred → active"                  "$(normalize_bead_status deferred)" "active"
+eq "empty → active (safe)"              "$(normalize_bead_status '')" "active"
+
 # ── 2. token_bounded — whole-token id match (no substring false-positives) ──
 echo "── 2. token_bounded ──"
 rc0 token_bounded "wa-1or2" "feat(wa-1or2): add simplified mode"
@@ -122,6 +161,11 @@ rc0 scan_commit_for_bead "$R" 0 "main" "tt-1"
 rc1 scan_commit_for_bead "$R" 0 "main" "tt-zzzz"
 # bad ref → rc1 (never crashes the sweep).
 rc1 scan_commit_for_bead "$R" 0 "refs/heads/does-not-exist" "tt-1or2"
+
+# branch_is_fresh (ga-tijv5 extension) — HEAD was committed "now" by this test.
+eq "just-committed tip is fresh (7d)"   "$(branch_is_fresh "$R" 0 "main" 7)" "1"
+eq "zero-day window → not fresh"        "$(branch_is_fresh "$R" 0 "main" 0)" "0"
+eq "unknown ref date → not fresh"       "$(branch_is_fresh "$R" 0 "refs/heads/does-not-exist" 7)" "0"
 
 # ── 3b. scan_commit_subject_for_bead — STRICT (subject only), ga-gosfs ───────
 # Rejects incidental BODY mentions of a still-open story (the ga-r471 / wa-qggy
@@ -198,6 +242,18 @@ grep -q 'label remove "$BID" "story:in-flight"' "$JANITOR" && ok "drops story:in
 grep -q 'JANITOR_DRY_RUN' "$JANITOR"             && ok "dry-run supported"                       || bad "dry-run support missing"
 grep -q 'gate-status:passed' "$JANITOR" && grep -q 'gate-status:superseded' "$JANITOR" \
   && ok "terminal signal checks passed+superseded" || bad "terminal marker labels missing"
+# Branch-prune extension (ga-tijv5, 2026-07-01) — wired, conservative, and STAGED (off by default).
+grep -q 'janitor_branch_decide()' "$JANITOR"     && ok "defines janitor_branch_decide"           || bad "missing janitor_branch_decide def"
+grep -q 'PRUNE_BRANCHES="${JANITOR_PRUNE_BRANCHES:-0}"' "$JANITOR" && ok "branch-prune is OPT-IN, default OFF (staged)" || bad "branch-prune not default-off"
+grep -q 'if \[ "$PRUNE_BRANCHES" = "1" \]' "$JANITOR" && ok "branch-prune sweep gated behind PRUNE_BRANCHES" || bad "branch-prune sweep not gated"
+grep -q 'has-unmerged-commits' "$JANITOR"        && ok "never prunes ahead>0 (lossless-only)"    || bad "unmerged-commits guard missing"
+grep -q 'bead-read-error-failopen' "$JANITOR"    && ok "fail-open on bad bead read"              || bad "fail-open guard missing"
+grep -q 'recheck ahead=' "$JANITOR"              && ok "re-verifies ahead==0 at delete time"     || bad "delete-time ahead recheck missing"
+grep -q 'BRANCH_PRUNE_MAX_PER_SWEEP' "$JANITOR"  && ok "per-sweep deletion cap present"          || bad "deletion cap missing"
+grep -q 'fetch origin --prune' "$JANITOR"        && ok "fetch --prune (no stale tracking refs)"  || bad "fetch must prune for branch sweep"
+grep -q 'remote moved since decision' "$JANITOR" && ok "delete-time remote-SHA CAS guard present" || bad "remote-SHA CAS guard missing"
+# STAGED, not deployed: the plist must NOT enable branch pruning (the Mayor's deploy step).
+if grep -q 'JANITOR_PRUNE_BRANCHES' "$PLIST" 2>/dev/null; then bad "plist must NOT enable branch prune (staging violated)"; else ok "plist does NOT enable branch prune (correctly staged)"; fi
 # Cross-store: own-rig repo scan falls back to HQ repo (mirror case) using strict subject scan.
 grep -q 'scan_commit_subject_for_bead "$HQ_GITDIR"' "$JANITOR" && ok "cross-store HQ-repo mirror scan wired (strict)" || bad "HQ-repo mirror scan missing or not strict"
 # The in_progress sweep MUST use the strict subject scanner (not the body scanner) for
