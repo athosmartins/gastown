@@ -1460,11 +1460,23 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
   log "Headroom OK: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% [ambient; post-janitor=${HR_CPU_POSTJANITOR:-?}%] lat=${HR_LAT:-?}ms / cota=${HR_COTA}) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, admitting a new run (ga-cw4pm)."
 fi
 
-# FIFO: oldest-first so no queued marker starves (ga-zf61i). bd list returns
-# newest-first; bare .[0] always grabbed the NEWEST → with ~1 marker/sweep
-# throughput, older markers (e.g. iz4a96/ga-mr8ym, + 2-day-old pddg18/pqzl9h)
-# starved indefinitely as newer ones jumped the line. sort_by(created_at) drains
-# the queue in arrival order. (Throughput / parallel dispatch = Phase 2, separate.)
+# QUEUE ORDER: newest-first tiebreak (4cae0a2c49, 2026-06-24 — Athos: gate>
+# execute>refine>create, bugs>stories, desempate=mais novo). Originally this
+# was oldest-first FIFO (ga-zf61i: bd list returns newest-first, and a bare
+# .[0] always grabbed the NEWEST → with ~1 marker/sweep throughput, older
+# markers like iz4a96/ga-mr8ym + 2-day-old pddg18/pqzl9h starved indefinitely).
+# 4cae0a2c49 deliberately flipped that: sort_by(.created_at) | reverse now
+# picks the NEWEST of the no-rebase-fail markers each sweep — an explicit
+# priority policy, not a regression of the ga-zf61i fix.
+#
+# created_at is IMMUTABLE via `bd label add/remove` — cycling a marker's
+# gate-status:queued label off and on does NOT refresh created_at and CANNOT
+# change its queue rank under this (or any) ordering. A marker starved by the
+# newest-first tiebreak (distinct from the ga-q3ig2 dead-rebase case below)
+# can only regain priority by being closed and replaced with a fresh
+# type:quality-gate-marker bead cloning its description fields — see
+# docs/gate-marker-recipe.md. (ga-gsh1e / gt-mqkwj — a repair dog burned a
+# full cycle on the label-cycle trick before finding this out the hard way.)
 #
 # ga-q3ig2 HEAD-OF-LINE FIX: a marker whose branch is stale-with-conflict and
 # whose author is dead/transient gets re-queued — here (dead-author bounded
