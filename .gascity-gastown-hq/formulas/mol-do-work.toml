@@ -18,6 +18,17 @@ Branch names MUST match `[a-z0-9/_-]+` only.
 - FORBIDDEN: `+`, uppercase, dots, spaces, or any other special characters.
 - The gate guard rejects branches with unsafe chars (gate-status:error).
 
+## Shared-root isolation (ga-xau4z)
+If your CWD is the repo's single shared MAIN worktree (e.g. an HQ/gascity Dog
+whose only checkout is the shared /Users/athos/gt tree) rather than an
+already-isolated per-rig/per-agent worktree, step 2 automatically creates and
+moves you into `.gc-worktrees/<bead>-<safe-name>` before branching. This stops
+concurrent sessions on the same shared checkout from sweeping up each other's
+uncommitted edits into one session's commit. The guard always resets the
+branch to the latest `origin/main` inside the isolated worktree — whether it
+was just created or is being reused from a prior attempt — so a redispatched
+bead never silently builds on a stale base.
+
 ## Variables
 
 | Variable | Source | Description |
@@ -25,7 +36,7 @@ Branch names MUST match `[a-z0-9/_-]+` only.
 | issue | caller | The STORY/bug bead you are fixing (e.g. `ga-xau4z`) — **NOT** your own ephemeral sling/task dispatch bead (e.g. `ga-e1yv1`, often available as `$GC_BEAD_ID`). Both are "assigned to this agent," but this formula's own step 5 writes `{{issue}}` directly into the gate marker's `bead_id`/`source-bead` fields when it creates the marker — a wrong `{{issue}}` corrupts those fields at that moment, independent of the branch name (see ga-pyxar). |
 """
 formula = "mol-do-work"
-version = 2
+version = 3
 
 [vars]
 [vars.issue]
@@ -74,7 +85,81 @@ if ! echo "$BRANCH" | grep -qE '^[a-z0-9/_-]+$'; then
   echo "ERROR: Branch name '$BRANCH' contains unsafe characters. Abort."
   exit 1
 fi
-git checkout -B "$BRANCH" origin/main
+
+# === MOL-DO-WORK ISOLATION GUARD BEGIN (ga-xau4z) ===
+# Concurrent pool-worker sessions can share ONE working tree (every builder
+# fixing HQ/gascity cd's into the same /Users/athos/gt checkout). Branching+
+# editing+committing there lets one session's commit sweep up another's
+# unrelated uncommitted edit (root cause of ga-xau4z). Detect the MAIN
+# (shared) worktree via git's own topology — in the main worktree, --git-dir
+# and --git-common-dir resolve to the same path; in any linked worktree
+# (from `git worktree add`) they differ. A rig-registry path lookup can't do
+# this for HQ: gascity's registered path is a SUBDIR of the git toplevel,
+# never equal to it.
+ISOLATED=0
+GIT_DIR_RAW="$(git rev-parse --git-dir 2>/dev/null)"
+GIT_COMMON_DIR_RAW="$(git rev-parse --git-common-dir 2>/dev/null)"
+if [ -n "$GIT_DIR_RAW" ] && [ -n "$GIT_COMMON_DIR_RAW" ]; then
+  GIT_DIR_ABS="$(cd "$GIT_DIR_RAW" 2>/dev/null && pwd -P)"
+  GIT_COMMON_DIR_ABS="$(cd "$GIT_COMMON_DIR_RAW" 2>/dev/null && pwd -P)"
+else
+  GIT_DIR_ABS=""
+  GIT_COMMON_DIR_ABS="not-comparable"
+fi
+
+if [ -n "$GIT_DIR_ABS" ] && [ "$GIT_DIR_ABS" = "$GIT_COMMON_DIR_ABS" ]; then
+  SHARED_ROOT="$(pwd)"
+  BEFORE_BRANCH="$(git branch --show-current)"
+  BEAD="${BRANCH##*/}"
+  WT="$SHARED_ROOT/.gc-worktrees/${BEAD}-${SAFE_NAME}"
+  HOOKS="/tmp/empty-hooks"
+  mkdir -p "$HOOKS" 2>/dev/null || true
+  echo "ISOLATION GUARD: CWD is the shared main worktree — isolating into $WT"
+
+  if [ -e "$WT/.git" ]; then
+    cd "$WT" || { echo "FATAL: isolation guard could not enter existing worktree $WT" >&2; exit 1; }
+  else
+    # Clear stale admin metadata for any worktree dir removed without
+    # `git worktree remove` (e.g. reaped) — otherwise git refuses to reuse
+    # its branch, claiming the branch is "already used by worktree at ...".
+    git -C "$SHARED_ROOT" worktree prune 2>/dev/null || true
+    if ! git -C "$SHARED_ROOT" -c core.hooksPath="$HOOKS" worktree add "$WT" -b "$BRANCH" origin/main; then
+      # -b requires $BRANCH not exist. It can already exist as an orphaned
+      # local ref (prior attempt's worktree dir was removed, ref wasn't) —
+      # attach that existing branch to the new worktree instead of failing.
+      git -C "$SHARED_ROOT" -c core.hooksPath="$HOOKS" worktree add "$WT" "$BRANCH" \
+        || { echo "FATAL: isolation guard could not create or attach a worktree at $WT for branch $BRANCH" >&2; exit 1; }
+    fi
+    cd "$WT" || { echo "FATAL: isolation guard created $WT but could not enter it" >&2; exit 1; }
+  fi
+
+  # Always reset the branch to the latest origin/main inside the isolated
+  # worktree — restores the freshness guarantee the old unconditional
+  # `git checkout -B "$BRANCH" origin/main` gave on every invocation, whether
+  # this worktree was just created or is being reused/reattached from a
+  # prior attempt. `checkout -B` on the branch you're already on refuses to
+  # clobber conflicting uncommitted changes rather than silently discarding
+  # them, so a resumed session's non-conflicting WIP survives the refresh.
+  git -c core.hooksPath="$HOOKS" checkout -B "$BRANCH" origin/main \
+    || { echo "FATAL: isolation guard could not reset $BRANCH to origin/main in $WT" >&2; exit 1; }
+
+  ISOLATED=1
+
+  # HARD INVARIANT: the shared root must still be on its original branch —
+  # never leave it mid-checkout for another session to trip over.
+  ROOT_BRANCH="$(git -C "$SHARED_ROOT" branch --show-current)"
+  if [ "$ROOT_BRANCH" != "$BEFORE_BRANCH" ]; then
+    echo "FATAL: shared root '$SHARED_ROOT' moved from '$BEFORE_BRANCH' to '$ROOT_BRANCH'." >&2
+    echo "       Restore it: git -C '$SHARED_ROOT' checkout '$BEFORE_BRANCH'" >&2
+    exit 1
+  fi
+  echo "  Isolated worktree ready: $(pwd) (shared root untouched on $ROOT_BRANCH)"
+fi
+# === MOL-DO-WORK ISOLATION GUARD END (ga-xau4z) ===
+
+if [ "$ISOLATED" != "1" ]; then
+  git checkout -B "$BRANCH" origin/main
+fi
 bd update {{issue}} --set-metadata branch="$BRANCH"
 echo "Branch: $BRANCH"
 ```
