@@ -172,8 +172,10 @@ def get_pool_sessions(pool_template):
     Returns None on any error (caller should skip cycle).
     """
     try:
+        # Option C: cached session-list shim (8s TTL, fail-open) — this 120s poller
+        # shares one Dolt read with other pollers instead of issuing its own.
         result = subprocess.run(
-            ["gc", "session", "list", "--json"],
+            ["bash", "/Users/athos/gt/.gascity-gastown-hq/scripts/gc-session-list-cached.sh"],
             capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
             return None

@@ -141,8 +141,10 @@ def rig_from_session(session):
 def list_active_sessions():
     """Call `gc session list --json` and return parsed session list."""
     try:
+        # Option C: cached session-list shim (8s TTL, fail-open) — this 90s poller
+        # shares one Dolt read with other pollers instead of issuing its own.
         result = subprocess.run(
-            ["gc", "session", "list", "--json"],
+            ["bash", "/Users/athos/gt/.gascity-gastown-hq/scripts/gc-session-list-cached.sh"],
             capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
             return []

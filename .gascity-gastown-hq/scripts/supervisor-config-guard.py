@@ -207,7 +207,9 @@ def notify(msg, prio):
 
 
 def mayor_session():
-    rs = sh(["gc", "session", "list", "--json"])
+    # Option C: cached session-list shim (8s TTL, fail-open) — collapses this 60s
+    # poller's read with other pollers' identical reads to cut Dolt query volume.
+    rs = sh(["bash", "/Users/athos/gt/.gascity-gastown-hq/scripts/gc-session-list-cached.sh"])
     if not rs or rs.returncode != 0:
         return None
     try:
