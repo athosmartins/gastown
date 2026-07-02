@@ -44,6 +44,11 @@ RIG_STORES = [
 ]
 OUT = os.path.join(HQ, ".gc", "machine-utilization.jsonl")
 BUILD_FRESH_SEC = int(os.environ.get("UTIL_BUILD_FRESH_SEC", "7200"))  # 2h: matches Pilot stale-in-flight
+# Gate-stall threshold: a marker queued longer than this means the gate is NOT keeping
+# up — counted as gate-stalled even if one reviewer is breathing on another branch.
+# Kept IDENTICAL to imparavel-check's gate-stall threshold (165min) so the panel's
+# gate sub-metric and the imparável check can never disagree about a gate stall.
+GATE_STALL_MIN = int(os.environ.get("UTIL_GATE_STALL_MIN", "165"))
 SAMPLE_EPOCH = int(os.environ.get("UTIL_SAMPLE_EPOCH", str(int(time.time()))))
 
 
@@ -138,6 +143,14 @@ def sample():
         1 for b in hq_markers if marker_status(b) in ("reviewing", "running", "dispatching")
     )
     queued_markers = sum(1 for b in hq_markers if marker_status(b) in ("queued", "ready", "claimed"))
+    # oldest waiting marker's age (the gate SLA signal — a starved head marker is the
+    # exact failure the whole-machine metric masked while builders stayed busy).
+    gate_oldest_queued_min = 0
+    for b in hq_markers:
+        if marker_status(b) in ("queued", "ready", "claimed"):
+            a = int(age_sec(b.get("updated_at", "")) / 60)
+            if a > gate_oldest_queued_min:
+                gate_oldest_queued_min = a
 
     reviewer_procs = ps_count(r"[c]laude.*gate-reviewer")
     refino_procs = ps_count(r"[c]laude.*(refino|refin)")
@@ -171,6 +184,39 @@ def sample():
 
     had_work = 1 if (queued_markers + approved + ready_bugs + refine_pending) > 0 else 0
 
+    # ── per-pipeline states (so a stall in ONE pipeline lights red even when the
+    #    others are busy — a busy build/refino must NOT mask a starved gate). ──────
+    # GATE: had-work = queued markers exist. Working requires a live reviewer AND no
+    # marker starved past GATE_STALL_MIN. A marker waiting longer than that = the gate
+    # is NOT keeping up = stalled, even if a reviewer breathes on another branch. This
+    # is the reading the whole-machine metric hid; threshold matches imparavel-check.
+    gate_had_work = 1 if queued_markers > 0 else 0
+    gate_live = 1 if (reviewer_procs > 0 or active_review_markers > 0) else 0
+    gate_starved = 1 if gate_oldest_queued_min > GATE_STALL_MIN else 0
+    gate_working = 1 if (gate_had_work and gate_live and not gate_starved) else 0
+    gate_state = (
+        "productive" if (gate_had_work and gate_working)
+        else "idle_stalled" if gate_had_work        # work waiting but starved or no reviewer
+        else "winding_down" if gate_live
+        else "idle_correct"
+    )
+    # BUILD: had-work = dispatchable approved/ready bugs. Working = a fresh builder.
+    build_had_work = 1 if (approved + ready_bugs) > 0 else 0
+    build_state = (
+        "productive" if (build_had_work and is_building)
+        else "idle_stalled" if (build_had_work and not is_building)
+        else "winding_down" if is_building
+        else "idle_correct"
+    )
+    # REFINO: had-work = refinement pending. Working = a live refino process.
+    refino_had_work = 1 if refine_pending > 0 else 0
+    refino_state = (
+        "productive" if (refino_had_work and refining)
+        else "idle_stalled" if (refino_had_work and not refining)
+        else "winding_down" if refining
+        else "idle_correct"
+    )
+
     return {
         "ts": SAMPLE_EPOCH,
         "working": working,
@@ -182,6 +228,10 @@ def sample():
             else "winding_down" if (working and not had_work)
             else "idle_correct"
         ),
+        "gate_state": gate_state,
+        "build_state": build_state,
+        "refino_state": refino_state,
+        "gate_oldest_queued_min": gate_oldest_queued_min,
         "reviewing": reviewing,
         "building": is_building,
         "refining": refining,

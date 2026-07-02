@@ -67,6 +67,20 @@ def load(since):
     return rows
 
 
+def pipeline_util(rows, key):
+    """Utilization for ONE pipeline (gate/build/refino), over the samples that carry
+    its per-pipeline state. Old samples (pre-breakdown) lack the key and are skipped,
+    so a pipeline number simply starts accumulating from when the breakdown shipped."""
+    vals = [r.get(key) for r in rows if r.get(key)]
+    prod = sum(1 for v in vals if v == "productive")
+    stalled = sum(1 for v in vals if v == "idle_stalled")
+    denom = prod + stalled
+    return {
+        "n": len(vals), "productive": prod, "stalled": stalled,
+        "util": (prod / denom * 100) if denom else None,
+    }
+
+
 def main():
     since, label = parse_window(sys.argv[1:])
     rows = load(since)
@@ -98,6 +112,11 @@ def main():
     denom = working + stalled
     util = (working / denom * 100) if denom else None
 
+    # per-pipeline breakdown — a gate stall must light red even when builders are busy.
+    gate = pipeline_util(rows, "gate_state")
+    build = pipeline_util(rows, "build_state")
+    refino = pipeline_util(rows, "refino_state")
+
     def pct(x):
         return f"{x / n * 100:.0f}%"
 
@@ -110,6 +129,12 @@ def main():
             "reviewing_pct": round(reviewing / n * 100, 1),
             "building_pct": round(building / n * 100, 1),
             "refining_pct": round(refining / n * 100, 1),
+            "gate_utilization_pct": round(gate["util"], 1) if gate["util"] is not None else None,
+            "gate_stalled_min": gate["stalled"], "gate_samples_min": gate["n"],
+            "build_utilization_pct": round(build["util"], 1) if build["util"] is not None else None,
+            "build_stalled_min": build["stalled"], "build_samples_min": build["n"],
+            "refino_utilization_pct": round(refino["util"], 1) if refino["util"] is not None else None,
+            "refino_stalled_min": refino["stalled"], "refino_samples_min": refino["n"],
         }, indent=2))
         return
 
@@ -129,6 +154,17 @@ def main():
     print(f"  🔵 encerrando:     {pct(winding)} ({winding}min) — trabalhando sem fila")
     print()
     print(f"  breakdown do tempo trabalhando: revisando {pct(reviewing)} · construindo {pct(building)} · refinando {pct(refining)}")
+    print()
+    print("  ─── por pipeline (um travado NÃO é mascarado pelos outros) ───")
+    for name, pp in (("gate  ", gate), ("build ", build), ("refino", refino)):
+        if pp["n"] == 0:
+            print(f"  {name}: — (sem amostras com breakdown ainda)")
+            continue
+        u = pp["util"]
+        mark = "✅" if (u is None or u >= 90) else "⚠️" if u >= 70 else "❌"
+        utxt = f"{u:.0f}%" if u is not None else "— (nunca teve trabalho → ocioso-correto)"
+        st = f"  🔴 travado {pp['stalled']}min" if pp["stalled"] else ""
+        print(f"  {name}: {mark} {utxt}{st}")
     if stalled:
         # surface the worst stalled stretch's diagnostics
         worst = [r for r in rows if r.get("state") == "idle_stalled"]
