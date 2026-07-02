@@ -109,6 +109,30 @@ MAX_SPAWNS_PER_CONDITION = int(os.environ.get("MAX_SPAWNS_PER_CONDITION", "3")) 
 REPAIR_DOG_STALE_SEC = int(os.environ.get("REPAIR_DOG_STALE_SEC", "3600"))    # a repair dog older than this no longer counts (assumed done/reaped) for dedup+cap
 WAKE_BACKOFF_MAX_SEC = int(os.environ.get("WAKE_BACKOFF_MAX_SEC", "7200"))    # exponential per-condition cooldown backoff is capped here (2h)
 REPAIR_DUAL_SPAWN = os.environ.get("REPAIR_DUAL_SPAWN", "0") == "1"           # "0" (default) = direct-spawn first, sling durable bead ONLY if direct fails (halves load); "1" = legacy always-both
+
+# ---- DIRECT SELF-HEAL knobs (the two toils the Mayor fixed BY HAND ~6x/day) ----
+# Unlike the spawn-a-dog / wake-the-Mayor detectors above, these two features
+# perform the recovery MUTATION DIRECTLY (the same `bd close/update/label` +
+# `gc session close` the Mayor ran by hand) so the gate self-heals without waiting
+# on a dog (which itself can hang) or a Mayor (who may be asleep). Both are bounded,
+# fail-SAFE (any query error → skip, never a blind mutation), honor GRW_DRY_RUN
+# (log the decision, mutate nothing — used for the live sanity pass) and the
+# GRW_ENABLED master kill-switch. They are cheap bd ops, so they run every sweep
+# even while the spawn-detectors are infra-throttled (a reap FREES load; a fail-safe
+# skip fires automatically if Dolt is wedged and the queries fail).
+#
+# FIX 1 — auto-reap a HUNG gate-reviewer / stale gate-status:running gate-run.
+GRW_REAP_HUNG_ENABLED = os.environ.get("GRW_REAP_HUNG_ENABLED", "1") != "0"
+REVIEW_HANG_MINUTES = int(os.environ.get("GRW_REVIEW_HANG_MINUTES", "18"))       # a run must be >this old before reap is even considered — well above a normal 9-min review and below the guard's 55m/90m TTLs so the toil is caught EARLY, not after 30-40m
+REAP_MAX_PER_SWEEP = int(os.environ.get("GRW_REAP_MAX_PER_SWEEP", "3"))          # hard cap on hung-run reaps per sweep
+LIVENESS_RESAMPLE_SEC = int(os.environ.get("GRW_LIVENESS_RESAMPLE_SEC", "8"))    # gap between the two liveness samples that confirm SUSTAINED-idle (never reap on a single snapshot — a real review can blip asleep between heartbeats)
+# FIX 2 — auto-requeue a STUCK gate-status:error marker (error → queued).
+GRW_REQUEUE_ERROR_ENABLED = os.environ.get("GRW_REQUEUE_ERROR_ENABLED", "1") != "0"
+ERROR_REQUEUE_MINUTES = int(os.environ.get("GRW_ERROR_REQUEUE_MINUTES", "8"))    # a marker must sit in error >this before requeue, so a transient error self-clears on the dispatcher's own next sweep first
+ERROR_REQUEUE_MAX_PER_SWEEP = int(os.environ.get("GRW_ERROR_REQUEUE_MAX_PER_SWEEP", "5"))
+ERROR_REQUEUE_MAX_ATTEMPTS = int(os.environ.get("GRW_ERROR_REQUEUE_MAX_ATTEMPTS", "3"))  # after K watchdog-requeues of the SAME marker (it keeps re-erroring), STOP and escalate to the Mayor — mirror the gate's own fix-attempt cap philosophy instead of an infinite requeue loop
+RECOVERY_LOG = os.path.join(CITY, ".gc/logs/gate-recovery-actions.jsonl")        # durable jsonl audit of every direct reap/requeue (evidence)
+GRW_REQUEUE_LABEL_RE = re.compile(r"^grw-requeue:(\d+)$")                          # restart-safe per-marker requeue counter, stamped on the marker as a label
 # A repair dog's session title (set by the watchdog's --title-hint, and kept by the
 # dog after it self-renames because the dog naturally echoes the branch/condition)
 # matched broadly so we also catch dogs spawned before this process started (restart
@@ -1060,9 +1084,519 @@ def governed_spawn(gov, sessions, now, kind, reason, diag, dolt_hits, label,
     return how
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# DIRECT SELF-HEAL — the two toils the Mayor fixed BY HAND ~6x/day
+# (1) reap a HUNG gate-reviewer / stale gate-status:running gate-run, and
+# (2) auto-requeue a STUCK gate-status:error marker.
+# These perform the recovery MUTATION themselves (no dog, no Mayor). Every pure
+# DECISION is factored into a *_verdict() function so the selftest unit-tests the
+# reap/keep + requeue/close/escalate logic against synthetic fixtures with no live
+# Dolt — mirroring reconcile_gaterun_action / classify_sibling_run / gatefix_recovery_decide.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _recovery_ledger(event, fields):
+    """Append a durable jsonl evidence record for every direct reap/requeue.
+    Best-effort; never raises (audit must never break recovery)."""
+    try:
+        rec = {"ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "event": event}
+        rec.update(fields or {})
+        with open(RECOVERY_LOG, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
+def _parse_run_field(desc, field):
+    """Extract a `field: value` line from a gate-run bead description (the same
+    key=value block the guard/dispatcher write: source_bead, marker_id, started_at,
+    required_reviewers). Canonical, whitespace-tolerant. '' if absent."""
+    if not desc:
+        return ""
+    for line in desc.splitlines():
+        if line.startswith(field + ":"):
+            return line[len(field) + 1:].strip()
+    return ""
+
+
+def _label_value(bead, prefix):
+    """First label value for a `prefix` (e.g. 'source-bead:'), or '' — reads the
+    label list already present on a bead dict (no extra query)."""
+    for lb in (bead.get("labels") or []):
+        if lb.startswith(prefix):
+            return lb[len(prefix):]
+    return ""
+
+
+def set_gate_status_py(bead_id, new_status):
+    """Python mirror of the shell set_gate_status (byte-for-byte SEMANTICS, ga-jhyu):
+    strip EVERY gate-status:* label currently on the bead, then add exactly the one
+    target — so a bead never leaks two gate-status labels (observed live: done+failed,
+    passed+superseded). Best-effort; never raises."""
+    if not bead_id:
+        return
+    r = sh(["bd", "-C", CITY, "show", bead_id, "--json"])
+    cur = []
+    try:
+        j = json.loads(r.stdout) if (r and r.returncode == 0) else None
+        row = (j[0] if isinstance(j, list) and j else j) or {}
+        cur = [l for l in (row.get("labels") or []) if str(l).startswith("gate-status:")]
+    except Exception:
+        cur = []
+    for lbl in cur:
+        if lbl == "gate-status:%s" % new_status:
+            continue
+        sh(["bd", "-C", CITY, "label", "remove", bead_id, lbl, "-q"])
+    sh(["bd", "-C", CITY, "label", "add", bead_id, "gate-status:%s" % new_status, "-q"])
+
+
+def _bead_is_open(bead_id):
+    """True/False if a bead is open; None on query failure (caller fail-safe)."""
+    if not bead_id:
+        return None
+    r = sh(["bd", "-C", CITY, "show", bead_id, "--json"])
+    if not r or r.returncode != 0:
+        return None
+    try:
+        j = json.loads(r.stdout)
+        row = (j[0] if isinstance(j, list) and j else j) or {}
+        return row.get("status") != "closed"
+    except Exception:
+        return None
+
+
+_RIG_PATHS = {"ts": 0.0, "map": {}}
+
+
+def _rig_paths():
+    """{rig_name: repo_path} from `gc rig list`, cached ~10min. A marker's source
+    bead lives in its RIG store, not HQ, so resolving 'is the source bead closed'
+    needs the rig path (mirrors gatefix-deadworker-recovery). {} on failure."""
+    if time.time() - _RIG_PATHS["ts"] < 600 and _RIG_PATHS["map"]:
+        return _RIG_PATHS["map"]
+    r = sh(["gc", "--city", CITY, "rig", "list", "--json"])
+    m = {}
+    try:
+        j = json.loads(r.stdout) if (r and r.returncode == 0) else {}
+        for rg in (j.get("rigs", []) if isinstance(j, dict) else []):
+            nm, p = rg.get("name"), rg.get("path")
+            if nm and p:
+                m[nm] = p
+    except Exception:
+        m = {}
+    if m:
+        _RIG_PATHS["map"] = m
+        _RIG_PATHS["ts"] = time.time()
+    return _RIG_PATHS["map"]
+
+
+def _source_bead_state(bead_id, rig_name=""):
+    """(resolved, closed, needs_human) for a marker's source bead. Tries HQ first,
+    then the bead's rig store. resolved=False on any failure → the caller treats the
+    source as UNKNOWN and proceeds to requeue (fail toward recovery; the dispatcher
+    re-validates the branch, and the oscillation cap bounds a bad requeue)."""
+    if not bead_id:
+        return (False, False, False)
+    rigp = _rig_paths().get(rig_name) if rig_name else None
+    tries = [[CITY]]
+    if rigp and rigp != CITY:
+        tries.append([rigp])
+    for st in tries:
+        r = sh(["bd", "-C", st[0], "show", bead_id, "--json"])
+        if not r or r.returncode != 0:
+            continue
+        try:
+            j = json.loads(r.stdout)
+            row = (j[0] if isinstance(j, list) and j else j) or {}
+        except Exception:
+            continue
+        if not row or not row.get("id"):
+            continue
+        closed = (row.get("status") == "closed")
+        nh = any(str(l).startswith("gate:needs-human") for l in (row.get("labels") or []))
+        return (True, closed, nh)
+    return (False, False, False)
+
+
+def _session_index(sessions):
+    """{identifier: session-dict} across every name field a verdict-bead assignee
+    could carry (session_name/name/alias/agent_name/id — verified equal live)."""
+    idx = {}
+    for s in (sessions or []):
+        for k in ("session_name", "name", "alias", "agent_name", "id"):
+            v = s.get(k)
+            if v:
+                idx[str(v)] = s
+    return idx
+
+
+def _any_reviewer_active(sessions, names):
+    """True if ANY of a run's reviewer sessions (by verdict-bead assignee name) is
+    state=='active' (the authoritative session-manager liveness signal — NOT a
+    session-id proc grep, which is unreliable because a reviewer's claude cmdline
+    carries no session id). False if all non-active/absent. None if the session
+    list is unavailable → caller fail-safe SKIPS (a gc/Dolt outage can never
+    become a blind reaper)."""
+    if sessions is None:
+        return None
+    if not names:
+        return False
+    idx = _session_index(sessions)
+    for nm in names:
+        s = idx.get(str(nm))
+        if s and not s.get("closed") and str(s.get("state", "")).lower() == "active":
+            return True
+    return False
+
+
+def _run_verdicts(run_id):
+    """(reviewer_names:set, delivered:int, total:int) for a gate-run's verdict beads
+    (label gate-run:<id>). delivered = CLOSED verdict beads (a closed verdict bead =
+    a verdict was recorded; open/in_progress = pending). Returns (set(), -1, -1) on
+    query failure so the caller fail-safe skips."""
+    r = sh(["bd", "-C", CITY, "list", "--all", "-l", "gate-run:%s" % run_id, "--json"])
+    if not r or r.returncode != 0:
+        return (set(), -1, -1)
+    try:
+        rows = json.loads(r.stdout) or []
+    except Exception:
+        return (set(), -1, -1)
+    names, delivered = set(), 0
+    for row in rows:
+        a = row.get("assignee")
+        if a:
+            names.add(a)
+        if row.get("status") == "closed":
+            delivered += 1
+    return (names, delivered, len(rows))
+
+
+def hung_run_verdict(age_sec, hang_sec, n_verdict_beads, n_delivered,
+                     reviewer_active, delivered_after_resample):
+    """PURE decision: should a gate-status:running gate-run be reaped as HUNG?
+    Returns 'reap' or 'skip:<reason>'. Ordered fail-SAFE — every branch that could
+    be a genuinely-working (just slow) review returns skip:
+
+      skip:young            — younger than REVIEW_HANG_MINUTES (a real review takes 9+m)
+      skip:verdict-query-failed — could not read verdict beads (never reap blind)
+      skip:not-a-review-run — 0 verdict beads = a guard CLAIM-time tracking run, not a
+                              dispatcher review run; leave it to the guard's own reconcile
+      skip:producing        — >=1 verdict already delivered → reviewers ARE working
+      skip:liveness-unknown — session list unavailable → never reap blind
+      skip:reviewer-active  — a reviewer session is state=active → working, not hung
+      skip:verdict-landed   — a verdict landed between the two samples → working
+      reap                  — old AND a real review run AND 0 delivered AND the reviewer
+                              is dead/idle SUSTAINED across both samples.
+    """
+    if age_sec <= hang_sec:
+        return "skip:young"
+    if n_verdict_beads < 0:
+        return "skip:verdict-query-failed"
+    if n_verdict_beads == 0:
+        return "skip:not-a-review-run"
+    if n_delivered > 0:
+        return "skip:producing"
+    if reviewer_active is None:
+        return "skip:liveness-unknown"
+    if reviewer_active:
+        return "skip:reviewer-active"
+    if delivered_after_resample and delivered_after_resample > 0:
+        return "skip:verdict-landed"
+    return "reap"
+
+
+def error_requeue_verdict(age_sec, threshold_sec, source_resolved, source_closed,
+                          source_needs_human, requeue_count, max_attempts):
+    """PURE decision for a gate-status:error marker. Returns:
+      close:source-done      — the source bead is CLOSED (work merged/abandoned) → the
+                               marker is a leftover; close it, do NOT requeue (checked
+                               FIRST, before the age gate: a done marker never waits)
+      skip:young             — in error < threshold; let a transient self-clear first
+      skip:parked-needs-human— source bead carries gate:needs-human (ga-acb permanent
+                               park) → deliberately awaiting a human; never requeue
+      escalate:oscillating   — already requeued max_attempts times and it keeps
+                               re-erroring → stop the infinite loop, page the Mayor
+      requeue                — genuinely stuck transient error → error→queued
+    """
+    if source_resolved and source_closed:
+        return "close:source-done"
+    if age_sec <= threshold_sec:
+        return "skip:young"
+    if source_resolved and source_needs_human:
+        return "skip:parked-needs-human"
+    if requeue_count >= max_attempts:
+        return "escalate:oscillating"
+    return "requeue"
+
+
+class RecoveryState:
+    """Tiny in-memory state for the two direct-action features: a per-marker requeue
+    counter (backs the durable grw-requeue:N label so oscillation detection survives
+    even mid-process) and an escalate-once dedup so a stuck condition pages the Mayor
+    at most once per back-off window."""
+    def __init__(self):
+        self.error_requeues = {}   # marker_id -> requeues this process has done
+        self.escalated = {}        # key -> last-escalation epoch
+
+    def escalate_once(self, key, now, window=None):
+        w = WAKE_BACKOFF_MAX_SEC if window is None else window
+        if now - self.escalated.get(key, 0) < w:
+            return False
+        self.escalated[key] = now
+        return True
+
+
+def _open_running_runs():
+    """[gate-run dicts] with type:quality-gate-run + gate-status:running + open.
+    None on query failure (fail-safe: caller skips — never reap during a Dolt glitch)."""
+    r = sh(["bd", "-C", CITY, "list", "--all", "-l", "type:quality-gate-run",
+            "-l", "gate-status:running", "--status", "open", "--json"], timeout=25)
+    if not r or r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout) or []
+    except Exception:
+        return None
+
+
+def reap_hung_runs(sessions, now, rstate):
+    """FIX 1: reap a HUNG gate-reviewer. For every open gate-status:running gate-run
+    past REVIEW_HANG_MINUTES with 0 verdicts delivered whose reviewer session is
+    dead/idle SUSTAINED across two samples, do the FULL manual reap the Mayor did by
+    hand: drain the zombie reviewer session(s), supersede+close the run, and re-queue
+    its marker so a fresh run reviews it. Bounded, dry-run-aware, fully fail-safe."""
+    if not GRW_ENABLED or not GRW_REAP_HUNG_ENABLED:
+        return
+    runs = _open_running_runs()
+    if runs is None:
+        print("[watchdog] reap: gate-run query unavailable — fail-safe skip (no blind reap)", flush=True)
+        return
+    reaped = 0
+    for run in runs:
+        if reaped >= REAP_MAX_PER_SWEEP:
+            break
+        rid = run.get("id")
+        if not rid:
+            continue
+        desc = run.get("description") or ""
+        started = _parse_run_field(desc, "started_at")
+        se = _iso_epoch(started)
+        if not se:
+            continue  # no parseable started_at → cannot age → fail-safe skip
+        age = int(now - se)
+        if age <= REVIEW_HANG_MINUTES * 60:
+            continue  # too young — a real review can take 9+ min; never reap early
+        names, delivered, total = _run_verdicts(rid)
+        active1 = _any_reviewer_active(sessions, names)
+        v1 = hung_run_verdict(age, REVIEW_HANG_MINUTES * 60, total, delivered, active1, 0)
+        if v1 != "reap":
+            if GRW_DRY_RUN:
+                print("[watchdog] reap DRY skip run=%s (%s) age=%dm beads=%d delivered=%d reviewers=%r"
+                      % (rid, v1, age // 60, total, delivered, sorted(names)), flush=True)
+            continue
+        # CANDIDATE — confirm SUSTAINED-idle: re-sample liveness + verdicts after a gap.
+        # A genuinely-working reviewer that blipped asleep will read active on the
+        # second sample, or will have LANDED a verdict — either aborts the reap.
+        time.sleep(LIVENESS_RESAMPLE_SEC)
+        sessions2 = _session_list_json()
+        names2, delivered2, total2 = _run_verdicts(rid)
+        active2 = _any_reviewer_active(sessions2, names2)
+        both_active = None if (active1 is None or active2 is None) else (active1 or active2)
+        eff_total = total2 if total2 >= 0 else total
+        eff_delivered = delivered2 if delivered2 >= 0 else delivered
+        v2 = hung_run_verdict(age, REVIEW_HANG_MINUTES * 60, eff_total, eff_delivered,
+                              both_active, eff_delivered)
+        if v2 != "reap":
+            print("[watchdog] reap: run=%s NOT reaped after resample (%s) age=%dm — fail-safe KEPT (working/slow review)"
+                  % (rid, v2, age // 60), flush=True)
+            continue
+        marker_id = _parse_run_field(desc, "marker_id")
+        source_bead = _parse_run_field(desc, "source_bead") or _label_value(run, "source-bead:")
+        if GRW_DRY_RUN:
+            print("[watchdog] REAP DRY-RUN would reap HUNG run=%s age=%dm 0/%d verdicts reviewers=%r → supersede+close run, drain session(s), re-queue marker=%s"
+                  % (rid, age // 60, eff_total, sorted(names), marker_id), flush=True)
+            _recovery_ledger("would_reap_hung_run", {"run": rid, "age_min": age // 60,
+                             "verdict_beads": eff_total, "delivered": eff_delivered,
+                             "reviewers": sorted(names), "marker": marker_id, "dry_run": True})
+            reaped += 1
+            continue
+        # 1) drain the zombie reviewer session(s) — only the NON-active ones (freeing
+        #    the max_active_sessions / LIVE_REVIEWERS slot the hung reviewer occupied).
+        idx = _session_index(sessions2 if sessions2 is not None else sessions)
+        drained = []
+        for nm in names:
+            s = idx.get(str(nm))
+            if s and not s.get("closed") and str(s.get("state", "")).lower() != "active":
+                sid = s.get("id")
+                if sid:
+                    sh(["gc", "session", "close", sid], timeout=20)
+                    drained.append(sid)
+        # 2) supersede + close the run (mirrors the dispatcher's own ga-jhyu close).
+        set_gate_status_py(rid, "superseded")
+        sh(["bd", "-C", CITY, "comment", rid,
+            "gate-recovery-watchdog: reaped HUNG run (age=%dm, 0/%d verdicts delivered, reviewer session(s) [%s] dead/idle SUSTAINED across 2 samples %ds apart). Superseding + closing so marker %s re-reviews fresh. (grw hung-reviewer self-heal — the manual toil the Mayor did ~6x/day)"
+            % (age // 60, eff_total, ",".join(sorted(names)) or "none", LIVENESS_RESAMPLE_SEC, marker_id or "unknown")], timeout=25)
+        sh(["bd", "-C", CITY, "close", rid,
+            "-r", "gate-run superseded: reviewer hung (grw auto-reap — 0 verdicts, dead reviewer, age %dm)" % (age // 60)], timeout=25)
+        # 3) re-queue the marker (with the same carve-outs as FIX 2).
+        marker_action = "no-marker"
+        if marker_id:
+            m_open = _bead_is_open(marker_id)
+            if m_open is False:
+                marker_action = "marker-already-closed"
+            elif m_open is None:
+                marker_action = "marker-state-unknown-skip"
+            else:
+                resolved, sclosed, needs_human = _source_bead_state(
+                    source_bead, _label_value(run, "bead-rig:"))
+                if resolved and sclosed:
+                    set_gate_status_py(marker_id, "superseded")
+                    sh(["bd", "-C", CITY, "close", marker_id,
+                        "-r", "source bead %s closed — gate work done/abandoned; marker superseded (grw)" % source_bead], timeout=25)
+                    marker_action = "closed:source-done"
+                elif resolved and needs_human:
+                    marker_action = "left:needs-human"
+                else:
+                    set_gate_status_py(marker_id, "queued")
+                    sh(["bd", "-C", CITY, "comment", marker_id,
+                        "gate-recovery-watchdog: re-queued (→gate-status:queued) after reaping its HUNG run %s (reviewer dead, 0 verdicts, %dm). A fresh dispatcher sweep will re-review this branch. (grw hung-reviewer self-heal)"
+                        % (rid, age // 60)], timeout=25)
+                    marker_action = "requeued"
+        _recovery_ledger("reap_hung_run", {"run": rid, "age_min": age // 60,
+                         "verdict_beads": eff_total, "delivered": eff_delivered,
+                         "reviewers": sorted(names), "drained_sessions": drained,
+                         "marker": marker_id, "marker_action": marker_action,
+                         "source_bead": source_bead})
+        notify("Gate self-heal: revisor travado reapado (run %s, %dmin, 0 vereditos) — marker %s %s. Você não precisa agir."
+               % (rid, age // 60, marker_id or "?", marker_action), 3)
+        print("[watchdog] REAPED hung run=%s age=%dm 0/%d verdicts reviewers=%r drained=%r marker=%s action=%s"
+              % (rid, age // 60, eff_total, sorted(names), drained, marker_id, marker_action), flush=True)
+        reaped += 1
+    if reaped:
+        print("[watchdog] reap sweep: %d hung run(s) reaped%s" % (reaped, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
+
+
+def _open_error_markers():
+    """[marker dicts] type:quality-gate-marker + gate-status:error + open, in HQ (the
+    dispatcher's domain — it only re-processes HQ queued markers). None on query
+    failure (fail-safe skip)."""
+    r = sh(["bd", "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",
+            "-l", "gate-status:error", "--status", "open", "--json"], timeout=25)
+    if not r or r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout) or []
+    except Exception:
+        return None
+
+
+def requeue_error_markers(now, rstate):
+    """FIX 2: auto-requeue a STUCK gate-status:error marker (error → queued) — the
+    error→queued flip the Mayor did by hand ~6x today. Bounded per sweep, dry-run
+    aware, fully fail-safe. Carve-outs: a marker whose SOURCE BEAD is closed is
+    closed (not requeued); a ga-acb needs-human park is left alone; a marker that
+    keeps re-erroring past ERROR_REQUEUE_MAX_ATTEMPTS is escalated to the Mayor
+    instead of looped forever."""
+    if not GRW_ENABLED or not GRW_REQUEUE_ERROR_ENABLED:
+        return
+    markers = _open_error_markers()
+    if markers is None:
+        print("[watchdog] requeue: error-marker query unavailable — fail-safe skip", flush=True)
+        return
+    # oldest-error first (created_at asc) so the longest-stuck marker is served first
+    markers.sort(key=lambda m: _iso_epoch(m.get("created_at")) or 0.0)
+    acted = 0
+    for mk in markers:
+        if acted >= ERROR_REQUEUE_MAX_PER_SWEEP:
+            break
+        mid = mk.get("id")
+        if not mid:
+            continue
+        upd = _iso_epoch(mk.get("updated_at")) or _iso_epoch(mk.get("created_at"))
+        age = int(now - upd) if upd else 0
+        labels = mk.get("labels") or []
+        source_bead = _label_value(mk, "source-bead:")
+        rig_name = _label_value(mk, "bead-rig:")
+        branch = _label_value(mk, "branch:")
+        label_count = 0
+        for l in labels:
+            m = GRW_REQUEUE_LABEL_RE.match(l)
+            if m:
+                try:
+                    label_count = int(m.group(1))
+                except Exception:
+                    label_count = 0
+        req_count = max(label_count, rstate.error_requeues.get(mid, 0))
+        resolved, sclosed, needs_human = _source_bead_state(source_bead, rig_name)
+        verdict = error_requeue_verdict(age, ERROR_REQUEUE_MINUTES * 60, resolved,
+                                        sclosed, needs_human, req_count, ERROR_REQUEUE_MAX_ATTEMPTS)
+
+        if verdict == "skip:young":
+            continue
+        if verdict == "skip:parked-needs-human":
+            if rstate.escalate_once("error-parked:%s" % mid, now):
+                print("[watchdog] error marker %s parked (source %s needs-human) — left for human (grw)"
+                      % (mid, source_bead), flush=True)
+            continue
+
+        if verdict == "close:source-done":
+            if GRW_DRY_RUN:
+                print("[watchdog] requeue DRY-RUN would CLOSE error marker %s (source bead %s closed — work done)"
+                      % (mid, source_bead), flush=True)
+                _recovery_ledger("would_close_done_marker", {"marker": mid, "source_bead": source_bead, "branch": branch, "dry_run": True})
+                acted += 1
+                continue
+            set_gate_status_py(mid, "superseded")
+            sh(["bd", "-C", CITY, "close", mid,
+                "-r", "source bead %s closed — gate work done/abandoned; error marker superseded (grw error-marker self-heal)" % source_bead], timeout=25)
+            _recovery_ledger("closed_done_marker", {"marker": mid, "source_bead": source_bead, "branch": branch})
+            print("[watchdog] CLOSED done error marker %s (source %s closed)" % (mid, source_bead), flush=True)
+            acted += 1
+            continue
+
+        if verdict == "escalate:oscillating":
+            if rstate.escalate_once("error-osc:%s" % mid, now):
+                notify("🚨 Gate: marker %s (branch %s) re-erra em loop — já re-enfileirei %dx e continua falhando. Precisa de você (não é transiente). (grw)"
+                       % (mid, branch or "?", req_count), 5)
+                _grw_ledger("human-touch", {"ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "source_daemon": "gate-recovery-watchdog", "stage": "revisa", "kind": "technical",
+                            "bead_id": source_bead or "", "reason": "error marker %s oscillating (%d watchdog requeues, still re-errors) — needs human" % (mid, req_count)}, fail_open=True)
+                print("[watchdog] ESCALATED oscillating error marker %s (%d requeues, still re-errors) — NOT requeued again" % (mid, req_count), flush=True)
+            continue
+
+        # verdict == "requeue"
+        if GRW_DRY_RUN:
+            print("[watchdog] requeue DRY-RUN would re-queue error marker %s (branch %s, %dm in error, attempt %d/%d) → gate-status:queued"
+                  % (mid, branch or "?", age // 60, req_count + 1, ERROR_REQUEUE_MAX_ATTEMPTS), flush=True)
+            _recovery_ledger("would_requeue_error", {"marker": mid, "branch": branch, "age_min": age // 60,
+                             "attempt": req_count + 1, "dry_run": True})
+            acted += 1
+            continue
+        # stamp the restart-safe counter FIRST (so a crash mid-op cannot lose the
+        # oscillation history and loop forever), then flip error→queued.
+        for l in labels:
+            if GRW_REQUEUE_LABEL_RE.match(l):
+                sh(["bd", "-C", CITY, "label", "remove", mid, l, "-q"])
+        sh(["bd", "-C", CITY, "label", "add", mid, "grw-requeue:%d" % (req_count + 1), "-q"])
+        rstate.error_requeues[mid] = req_count + 1
+        set_gate_status_py(mid, "queued")
+        sh(["bd", "-C", CITY, "comment", mid,
+            "gate-recovery-watchdog: auto-requeued gate-status:error→queued after %dm stuck in error (attempt %d/%d). A transient dispatcher error/ghost-yield/reclaim left this marker stranded; the dispatcher only re-processes queued markers. (grw error-marker self-heal — the manual error→queued the Mayor did ~6x/day)"
+            % (age // 60, req_count + 1, ERROR_REQUEUE_MAX_ATTEMPTS)], timeout=25)
+        _recovery_ledger("requeue_error", {"marker": mid, "branch": branch, "source_bead": source_bead,
+                         "age_min": age // 60, "attempt": req_count + 1})
+        notify("Gate self-heal: marker %s re-enfileirado (error→queued, branch %s, %dmin travado, tentativa %d/%d). Você não precisa agir."
+               % (mid, branch or "?", age // 60, req_count + 1, ERROR_REQUEUE_MAX_ATTEMPTS), 3)
+        print("[watchdog] REQUEUED error marker %s (branch %s, %dm, attempt %d/%d)"
+              % (mid, branch or "?", age // 60, req_count + 1, ERROR_REQUEUE_MAX_ATTEMPTS), flush=True)
+        acted += 1
+    if acted:
+        print("[watchdog] error-requeue sweep: %d marker(s) actioned%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
+
+
 def main():
   # ---- state ----
   gov = Governor()       # dedup + concurrent cap + per-condition cooldown/back-off
+  rstate = RecoveryState()  # direct self-heal: per-marker requeue count + escalate-once
   saw_gate = False       # we dispatched at least one gate-down repair since last recovery
   saw_pilot = False
   saw_loop = False
@@ -1077,6 +1611,11 @@ def main():
         "(dedup + cap=%d + per-condition back-off + self-limit=%d; enabled=%s dry_run=%s) "
         "on gate-down OR pilot-jam OR head-of-line block OR supervisor init-failure OR orphaned queued marker"
         % (MAX_ACTIVE_REPAIR_DOGS, MAX_SPAWNS_PER_CONDITION, GRW_ENABLED, GRW_DRY_RUN), flush=True)
+  print("[watchdog] + DIRECT self-heal each sweep: reap HUNG reviewers (run>%dm, 0 verdicts, dead reviewer sustained; enabled=%s) "
+        "AND auto-requeue STUCK gate-status:error markers (>%dm in error, cap %d/sweep, osc-escalate after %d; enabled=%s). "
+        "Both bounded + fail-safe + dry_run=%s."
+        % (REVIEW_HANG_MINUTES, GRW_REAP_HUNG_ENABLED, ERROR_REQUEUE_MINUTES,
+           ERROR_REQUEUE_MAX_PER_SWEEP, ERROR_REQUEUE_MAX_ATTEMPTS, GRW_REQUEUE_ERROR_ENABLED, GRW_DRY_RUN), flush=True)
 
   while True:
     try:
@@ -1085,6 +1624,19 @@ def main():
         # (replaces the per-block coarse cooldown; bounds this daemon's own gc load).
         sessions = _session_list_json()
         lp = last_pass_epoch()
+
+        # ===== DIRECT SELF-HEAL (no dog, no Mayor) — runs EVERY sweep, independent
+        # of the infra-throttle gate below (these are cheap bounded bd mutations that
+        # DIRECTLY heal the two toils the Mayor fixed by hand; a reap FREES load, and
+        # if Dolt is wedged the queries fail → fail-safe skip). Each is fully guarded.
+        try:
+            reap_hung_runs(sessions, now, rstate)
+        except Exception as e:
+            print("[watchdog] reap_hung_runs error (continuing): %r" % e, flush=True)
+        try:
+            requeue_error_markers(now, rstate)
+        except Exception as e:
+            print("[watchdog] requeue_error_markers error (continuing): %r" % e, flush=True)
 
         # ga-htjni follow-up (dog investigation 2026-06-15): if the gate is
         # ALIVE-but-infra-throttled (Dolt-hot or quota DEFER), a repair dog cannot

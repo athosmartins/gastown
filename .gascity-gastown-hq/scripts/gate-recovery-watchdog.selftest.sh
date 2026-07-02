@@ -188,13 +188,83 @@ for needle, desc in [
     ("def _detect_orphan_markers(", "pure _detect_orphan_markers() is defined"),
     ("def _iso_epoch(", "_iso_epoch() helper is defined"),
     ("orphan_id, orphan_branch, orphan_age = orphaned_queued_marker()", "main() calls the detector each loop"),
-    ('kind="gate-orphan"', "gate-orphan repair is dispatched"),
+    ('"gate-orphan", orphan_branch', "gate-orphan repair is dispatched"),  # ga: needle updated to the governed_spawn refactor (was stale kind="gate-orphan")
     ("ORPHAN_DRAIN_FRESH_SEC", "drain-freshness guard constant present"),
+    # direct self-heal (the two manual toils) — defined + wired into main()
+    ("def hung_run_verdict(", "FIX1 pure reap decision is defined"),
+    ("def reap_hung_runs(", "FIX1 reap_hung_runs() driver is defined"),
+    ("def error_requeue_verdict(", "FIX2 pure requeue decision is defined"),
+    ("def requeue_error_markers(", "FIX2 requeue_error_markers() driver is defined"),
+    ("reap_hung_runs(sessions, now, rstate)", "main() reaps hung reviewers each loop"),
+    ("requeue_error_markers(now, rstate)", "main() requeues stuck error markers each loop"),
+    ("def set_gate_status_py(", "canonical gate-status transition helper is defined"),
 ]:
     if needle in src:
         ok(desc)
     else:
         bad("MISSING: %s (needle %r)" % (desc, needle))
+
+# ═══ DIRECT SELF-HEAL — the two toils the Mayor fixed by hand (pure decisions) ═══
+HANG = m.REVIEW_HANG_MINUTES * 60
+
+# ── Scenario 11 (FIX1 i): a genuinely HUNG run is reaped ──────────────────────
+print("Scenario 11 (FIX1 i): old run + 0 verdicts + dead reviewer sustained → reap + (marker re-queued)")
+if m.hung_run_verdict(HANG + 1800, HANG, 3, 0, False, 0) == "reap":
+    ok("age>threshold, real review run (3 verdict beads), 0 delivered, reviewer inactive both samples → reap")
+else:
+    bad("expected reap, got %r" % (m.hung_run_verdict(HANG + 1800, HANG, 3, 0, False, 0),))
+
+# ── Scenario 12 (FIX1 ii): a genuinely-working / slow review is NEVER reaped ──
+print("Scenario 12 (FIX1 ii): a working-or-slow review is fail-safe KEPT (6 ways)")
+keep_cases = [
+    ("young",            m.hung_run_verdict(HANG - 60,   HANG, 3, 0, False, 0), "skip:young"),
+    ("reviewer-active",  m.hung_run_verdict(HANG + 1800, HANG, 3, 0, True,  0), "skip:reviewer-active"),
+    ("producing",        m.hung_run_verdict(HANG + 1800, HANG, 3, 1, False, 0), "skip:producing"),
+    ("verdict-landed",   m.hung_run_verdict(HANG + 1800, HANG, 3, 0, False, 1), "skip:verdict-landed"),
+    ("liveness-unknown", m.hung_run_verdict(HANG + 1800, HANG, 3, 0, None,  0), "skip:liveness-unknown"),
+    ("tracking-run",     m.hung_run_verdict(HANG + 1800, HANG, 0, 0, False, 0), "skip:not-a-review-run"),
+]
+_all = True
+for name, got, want in keep_cases:
+    if got != want:
+        _all = False; bad("keep case %s: got %r want %r" % (name, got, want))
+if _all:
+    ok("slow/working review NEVER reaped: young, reviewer-active, producing, verdict-landed, liveness-unknown, guard-tracking-run all → skip")
+
+# ── Scenario 13 (FIX2 iii): stuck error marker, branch unmerged → requeue ─────
+ETH = m.ERROR_REQUEUE_MINUTES * 60
+KMAX = m.ERROR_REQUEUE_MAX_ATTEMPTS
+print("Scenario 13 (FIX2 iii): error>threshold, source bead OPEN (branch unmerged), under cap → requeue")
+if m.error_requeue_verdict(ETH + 600, ETH, True, False, False, 0, KMAX) == "requeue":
+    ok("old error marker whose source bead is still open → error→queued requeue")
+else:
+    bad("expected requeue, got %r" % (m.error_requeue_verdict(ETH + 600, ETH, True, False, False, 0, KMAX),))
+if m.error_requeue_verdict(ETH + 600, ETH, False, False, False, 0, KMAX) == "requeue":
+    ok("unresolved source (rig bead unreadable) fails toward recovery → requeue (dispatcher re-validates)")
+else:
+    bad("expected requeue for unresolved source")
+
+# ── Scenario 14 (FIX2 iv): error marker whose source bead is CLOSED → close ───
+print("Scenario 14 (FIX2 iv): source bead CLOSED (merged/abandoned) → close marker, NOT requeue")
+if m.error_requeue_verdict(ETH + 600, ETH, True, True, False, 0, KMAX) == "close:source-done":
+    ok("done marker (closed source bead) is closed, never re-queued")
+else:
+    bad("expected close:source-done, got %r" % (m.error_requeue_verdict(ETH + 600, ETH, True, True, False, 0, KMAX),))
+if m.error_requeue_verdict(30, ETH, True, True, False, 0, KMAX) == "close:source-done":
+    ok("closed source short-circuits BEFORE the age gate — a done marker closes immediately, doesn't wait")
+else:
+    bad("expected close:source-done for young+closed")
+
+# ── Scenario 15 (FIX2 v): oscillating marker (K re-errors) → escalate ─────────
+print("Scenario 15 (FIX2 v): marker re-errored ERROR_REQUEUE_MAX_ATTEMPTS times → escalate, NOT infinite requeue")
+if m.error_requeue_verdict(ETH + 600, ETH, True, False, False, KMAX, KMAX) == "escalate:oscillating":
+    ok("at the requeue cap the marker escalates to the Mayor instead of looping forever")
+else:
+    bad("expected escalate:oscillating, got %r" % (m.error_requeue_verdict(ETH + 600, ETH, True, False, False, KMAX, KMAX),))
+if m.error_requeue_verdict(ETH + 600, ETH, True, False, True, 0, KMAX) == "skip:parked-needs-human":
+    ok("a ga-acb needs-human parked marker is left for the human, never requeued")
+else:
+    bad("expected skip:parked-needs-human")
 
 print("")
 print("Results: %d passed, %d failed" % (PASS, FAIL))
