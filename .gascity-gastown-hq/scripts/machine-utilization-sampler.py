@@ -108,7 +108,26 @@ def active_sessions():
 
 
 # ── the reading ───────────────────────────────────────────────────────────────
+def dolt_ok():
+    """Fast reachability probe. When Dolt is transiently unreachable (CPU burst /
+    connection pressure), bd reads time out and return [] — which would otherwise
+    mislabel the minute (had_work=0 -> 'idle_correct', OR working from procs ->
+    'winding_down'). Neither is true: the machine may be working AND have work; we
+    simply couldn't MEASURE it. So on a failed probe we emit state='unknown' and the
+    report/panel EXCLUDE it (a measurement gap, never counted as machine failure)."""
+    out = sh(["bash", "-c",
+              "timeout 6 env DOLT_CLI_PASSWORD='' dolt --host 127.0.0.1 --port 52756 "
+              "--user root --no-tls sql -q 'SELECT 1;' 2>/dev/null"], timeout=10)
+    return "1" in out
+
+
 def sample():
+    if not dolt_ok():
+        # measurement gap — do NOT blame the machine for our own read failure.
+        return {
+            "ts": SAMPLE_EPOCH, "working": 0, "had_work": 0, "state": "unknown",
+            "dolt_ok": False, "reviewing": 0, "building": 0, "refining": 0,
+        }
     hq_markers = bd_list(HQ, "type:quality-gate-marker")
     def marker_status(b):
         for l in labels_of(b):
@@ -156,6 +175,7 @@ def sample():
         "ts": SAMPLE_EPOCH,
         "working": working,
         "had_work": had_work,
+        "dolt_ok": True,
         "state": (
             "productive" if (working and had_work)
             else "idle_stalled" if (had_work and not working)

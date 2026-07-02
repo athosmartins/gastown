@@ -76,6 +76,15 @@ def main():
         print("  (sem amostras ainda — o sampler roda 1x/min; volte em alguns minutos)")
         return
 
+    # Exclude measurement gaps (Dolt transiently unreachable → couldn't read state).
+    unknown = sum(1 for r in rows if r.get("state") == "unknown")
+    rows = [r for r in rows if r.get("state") != "unknown"]
+    n = len(rows)
+    if n == 0:
+        print(f"═══ UTILIZAÇÃO DA MÁQUINA — {label} ═══")
+        print(f"  (só houve gaps de medição — Dolt inacessível em {unknown}min; sem dado utilizável)")
+        return
+
     prod = sum(1 for r in rows if r.get("state") == "productive")
     stalled = sum(1 for r in rows if r.get("state") == "idle_stalled")
     winding = sum(1 for r in rows if r.get("state") == "winding_down")
@@ -105,7 +114,8 @@ def main():
         return
 
     print(f"═══ UTILIZAÇÃO DA MÁQUINA — {label} ═══")
-    print(f"  amostras: {n} min (~{n/60:.1f}h de cobertura)")
+    _gap = f" · {unknown}min gap-de-medição (Dolt inacessível, excluído)" if unknown else ""
+    print(f"  amostras: {n} min (~{n/60:.1f}h){_gap}")
     print()
     if util is not None:
         verdict = "✅" if util >= 90 else "⚠️" if util >= 70 else "❌"
