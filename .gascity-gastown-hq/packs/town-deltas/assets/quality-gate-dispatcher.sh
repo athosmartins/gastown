@@ -1553,7 +1553,7 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   --argjson now "$GATE_MARKER_NOW_EPOCH" \
   --argjson age_threshold "$GATE_MARKER_AGE_PROMOTE_SECONDS" '
   def has_rebase_fail: ((.labels // []) | map(select(test("^gate:rebase-attempt:[0-9]+$"))) | length) > 0;
-  def is_aged: ($now - (.created_at | fromdateiso8601)) > $age_threshold;
+  def is_aged: try (($now - (.created_at | fromdateiso8601)) > $age_threshold) catch false;
   (map(select((has_rebase_fail | not) and is_aged))           | sort_by(.created_at))
   + (map(select((has_rebase_fail | not) and (is_aged | not))) | sort_by(.created_at) | reverse)
   + (map(select(has_rebase_fail))                             | sort_by(.created_at) | reverse)

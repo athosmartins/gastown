@@ -153,6 +153,46 @@ else
   bad "tier order drifted (aged=$AGED_LINE fresh=$FRESH_LINE broken=$BROKEN_LINE) — re-check concat order"
 fi
 
+echo "── (8) gate-feedback regression: malformed created_at must not crash the whole sweep ──"
+# Live gate review on this fix (2026-07-02, gate_run=ga-wisp-calttxm) found:
+# is_aged's fromdateiso8601 call was unguarded, and MARKER=$(... | jq ...) has
+# no `|| echo` fallback (unlike sibling MARKERS_JSON/VERIFY_JSON reads in the
+# same file). Under `set -euo pipefail` (as the live dispatcher runs), a
+# single healthy marker with a null/malformed created_at threw inside
+# fromdateiso8601 and aborted the ENTIRE sweep at this assignment — not just
+# that one marker. Run the extracted block under set -euo pipefail explicitly
+# so a regression here fails the same way it would live.
+# (8a) reviewer's exact empirical repro: created_at=null must not crash, and
+# must resolve to 'not aged' so the well-formed marker still wins fairly.
+FIX=$(printf '[{"id":"bad","created_at":null,"labels":["gate-status:queued"]},%s]' \
+  "$(mk good "$(ago 60)")")
+SEL=$(MARKERS_JSON="$FIX" GATE_MARKER_NOW_OVERRIDE_EPOCH="$NOW_EPOCH" GATE_MARKER_AGE_PROMOTE_SECONDS="$THRESH" \
+  bash -c "set -euo pipefail; $SELECT_BLOCK"$'\necho "$MARKER_ID"' 2>/dev/null)
+STATUS=$?
+if [ "$STATUS" = "0" ] && [ "$SEL" = "good" ]; then
+  ok "created_at=null degrades to 'not aged' instead of crashing the sweep (exit=$STATUS, selected=$SEL)"
+else
+  bad "created_at=null broke selection (exit=$STATUS, selected='$SEL') — is_aged must catch fromdateiso8601 errors"
+fi
+
+# (8b) reviewer also named "not exactly strict format" as a crash trigger.
+# Assert only non-crash here — WHICH marker wins is a separate, lower-
+# severity sort-fairness question (sort_by(.created_at) does raw string
+# comparison, so a garbage string can lexicographically look "newest"),
+# out of scope for this fix: bd-managed created_at is never a malformed
+# non-null string in practice, unlike the empirically-observed null case
+# above. Tracked separately, not blocking here.
+FIX=$(printf '[{"id":"bad","created_at":"not-a-date","labels":["gate-status:queued"]},%s]' \
+  "$(mk good "$(ago 60)")")
+SEL=$(MARKERS_JSON="$FIX" GATE_MARKER_NOW_OVERRIDE_EPOCH="$NOW_EPOCH" GATE_MARKER_AGE_PROMOTE_SECONDS="$THRESH" \
+  bash -c "set -euo pipefail; $SELECT_BLOCK"$'\necho "$MARKER_ID"' 2>/dev/null)
+STATUS=$?
+if [ "$STATUS" = "0" ] && [ -n "$SEL" ]; then
+  ok "created_at=malformed-string no longer crashes the sweep (exit=$STATUS, selected=$SEL)"
+else
+  bad "created_at=malformed-string broke selection (exit=$STATUS, selected='$SEL') — is_aged must catch fromdateiso8601 errors"
+fi
+
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"
 if [ "$FAIL" = 0 ]; then echo "  RESULT: PASS"; exit 0; else echo "  RESULT: FAIL"; exit 1; fi
