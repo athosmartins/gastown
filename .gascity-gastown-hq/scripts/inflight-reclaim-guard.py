@@ -2118,10 +2118,11 @@ def _selftest():
         def _run(cmd, **kw):
             if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == "bd" and cmd[1] == "list":
                 if list_fails:
-                    # rc=0 + unparseable stdout — a bare non-zero exit is deliberately
-                    # NOT fail-safe here (existing contract: "no beads matching this
-                    # label combo is not an error" — see SB-7b). Only a genuine
-                    # exception (bad JSON) or a non-list payload trips the fail-safe.
+                    # rc=0 + unparseable stdout simulates a parse failure (SB-7:
+                    # fail-SAFE → None). A bare non-zero exit is a separate scenario,
+                    # stubbed directly in SB-7b below — also fail-SAFE → None as of
+                    # ga-ap7od (a non-zero exit means the query FAILED; real `bd list`
+                    # returns rc=0 + "[]" for zero matches, verified live).
                     return _R(0, "{not valid json")
                 # cmd shape: ["bd","list","--label","type:quality-gate-marker","--label",gate_lbl,"--json"]
                 gate_lbl = cmd[5] if len(cmd) > 5 else ""
@@ -2205,9 +2206,13 @@ def _selftest():
         check("SB-7: bd-list unparseable JSON → fail-SAFE None (pre-existing contract unchanged)",
               _sb7 is None, f"got={_sb7!r}")
 
-        # --- SB-7b: bd-list non-zero exit (e.g. "no beads matched") is deliberately
-        # NOT a failure — pre-existing contract, regression check. active_source_beads
-        # stays empty in this case, so bd show is never invoked either. ---
+        # --- SB-7b: bd-list non-zero exit → fail-SAFE None (ga-ap7od). Real `bd list`
+        # returns rc=0 + "[]" for zero matches (verified live); a non-zero exit only
+        # ever signals a query FAILURE (e.g. transient Dolt contention), so it must
+        # trip the same fail-safe as SB-7 rather than being silently treated as "no
+        # results". This inverts what this check locked in prior to ga-ap7od — that
+        # old assumption was itself the bug: a real query failure on just one
+        # gate_lbl silently dropped that label's active markers from the set. ---
         def _stub_bd_nonzero(cmd, **kw):
             class _RC:
                 returncode = 1
@@ -2216,8 +2221,8 @@ def _selftest():
             return _RC()
         subprocess.run = _stub_bd_nonzero
         _sb7b = list_gate_active_source_beads()
-        check("SB-7b: bd-list non-zero exit → treated as empty, NOT fail-safe (pre-existing contract)",
-              _sb7b == frozenset(), f"got={_sb7b!r}")
+        check("SB-7b: bd-list non-zero exit → fail-SAFE None (ga-ap7od: was wrongly treated as empty)",
+              _sb7b is None, f"got={_sb7b!r}")
 
         # --- SB-8: multiple active markers, only SOME are slings → mixed
         # resolution (direct ids + resolved back-refs, no cross-contamination) ---
