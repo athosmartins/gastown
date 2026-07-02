@@ -1549,6 +1549,14 @@ fi
 # SELFTEST-EXTRACT marker-select: BEGIN
 GATE_MARKER_AGE_PROMOTE_SECONDS="${GATE_MARKER_AGE_PROMOTE_SECONDS:-1800}"
 GATE_MARKER_NOW_EPOCH="${GATE_MARKER_NOW_OVERRIDE_EPOCH:-$(date -u +%s)}"
+# GATE-FEEDBACK (gate_run=ga-wisp-a7b4r5): every sibling GATE_* tunable (see
+# GATE_DOLT_CPU_HOT etc. above) gets a case-guard right after its ${VAR:-default}
+# assignment; these two didn't, so a non-numeric override (config typo) made
+# `jq --argjson` exit 2 BEFORE the marker array was even read — under this
+# script's `set -euo pipefail`, that aborts the entire dispatcher sweep, not
+# just this marker. Same guard convention, applied here.
+case "$GATE_MARKER_AGE_PROMOTE_SECONDS" in ''|*[!0-9]*) GATE_MARKER_AGE_PROMOTE_SECONDS=1800 ;; esac
+case "$GATE_MARKER_NOW_EPOCH"           in ''|*[!0-9]*) GATE_MARKER_NOW_EPOCH=$(date -u +%s) ;; esac
 MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   --argjson now "$GATE_MARKER_NOW_EPOCH" \
   --argjson age_threshold "$GATE_MARKER_AGE_PROMOTE_SECONDS" '

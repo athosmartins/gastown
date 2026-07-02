@@ -193,6 +193,36 @@ else
   bad "created_at=malformed-string broke selection (exit=$STATUS, selected='$SEL') — is_aged must catch fromdateiso8601 errors"
 fi
 
+echo "── (9) gate-feedback regression: malformed GATE_* tunables must not crash the whole sweep ──"
+# Live gate review on this fix (2026-07-02, gate_run=ga-wisp-a7b4r5) found:
+# GATE_MARKER_AGE_PROMOTE_SECONDS and GATE_MARKER_NOW_EPOCH were passed to
+# `jq --argjson` with no numeric validation, unlike every sibling GATE_*
+# tunable in this file (GATE_DOLT_CPU_HOT etc.), which all get a
+# `case ... in ''|*[!0-9]*) VAR=default ;; esac` guard. A non-numeric value
+# (e.g. a config typo) makes jq exit 2 BEFORE the marker array is read, which
+# — under this script's `set -euo pipefail` — aborts the ENTIRE sweep, not a
+# graceful per-marker skip. Reproduce both tunables' bad-input paths under
+# set -euo pipefail exactly as case (8) does for created_at.
+FIX=$(printf '[%s,%s]' "$(mk h1 "$(ago 600)")" "$(mk h2 "$(ago 60)")")
+
+SEL=$(MARKERS_JSON="$FIX" GATE_MARKER_NOW_OVERRIDE_EPOCH="$NOW_EPOCH" GATE_MARKER_AGE_PROMOTE_SECONDS="not-a-number" \
+  bash -c "set -euo pipefail; $SELECT_BLOCK"$'\necho "$MARKER_ID"' 2>/dev/null)
+STATUS=$?
+if [ "$STATUS" = "0" ] && [ "$SEL" = "h2" ]; then
+  ok "malformed GATE_MARKER_AGE_PROMOTE_SECONDS falls back to default instead of crashing the sweep (exit=$STATUS, selected=$SEL)"
+else
+  bad "malformed GATE_MARKER_AGE_PROMOTE_SECONDS broke selection (exit=$STATUS, selected='$SEL') — needs the same case-guard as sibling GATE_* tunables"
+fi
+
+SEL=$(MARKERS_JSON="$FIX" GATE_MARKER_NOW_OVERRIDE_EPOCH="not-a-number" GATE_MARKER_AGE_PROMOTE_SECONDS="$THRESH" \
+  bash -c "set -euo pipefail; $SELECT_BLOCK"$'\necho "$MARKER_ID"' 2>/dev/null)
+STATUS=$?
+if [ "$STATUS" = "0" ] && [ -n "$SEL" ]; then
+  ok "malformed GATE_MARKER_NOW_OVERRIDE_EPOCH falls back to real wall clock instead of crashing the sweep (exit=$STATUS, selected=$SEL)"
+else
+  bad "malformed GATE_MARKER_NOW_OVERRIDE_EPOCH broke selection (exit=$STATUS, selected='$SEL') — needs the same case-guard as sibling GATE_* tunables"
+fi
+
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"
 if [ "$FAIL" = 0 ]; then echo "  RESULT: PASS"; exit 0; else echo "  RESULT: FAIL"; exit 1; fi
