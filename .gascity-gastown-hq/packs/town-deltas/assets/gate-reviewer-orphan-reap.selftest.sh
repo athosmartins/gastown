@@ -102,9 +102,11 @@ has "$GATE" 'session close "\$R_ID"'                       "janitor closes the o
 
 echo "── 8. drift-guard: TTL default exceeds the verdict timeout (concurrency-safe) ──"
 # A reaped session must be older than any live run could legitimately keep one
-# open. The default TTL is verdict-timeout + a positive margin.
-has "$GATE" 'REVIEWER_SESSION_TTL_MINUTES:-\$\(\(VERDICT_TIMEOUT_MINUTES \+ [0-9]+\)\)' \
-  "TTL default = VERDICT_TIMEOUT_MINUTES + margin"
+# open. The default TTL is verdict-timeout + a positive margin. ga-ltr3c
+# (diff-size verdict-timeout scaling) rebased this off the SCALED ceiling
+# VERDICT_TIMEOUT_MAX_MINUTES rather than the unscaled VERDICT_TIMEOUT_MINUTES.
+has "$GATE" 'REVIEWER_SESSION_TTL_MINUTES:-\$\(\(VERDICT_TIMEOUT_MAX_MINUTES \+ [0-9]+\)\)' \
+  "TTL default = VERDICT_TIMEOUT_MAX_MINUTES + margin"
 
 echo "── 9. gt-bewtm: headroom_live_reviewers excludes drained reviewers from the cap ──"
 # The Step 0b-1 headroom gate's denominator must subtract DRAINED reviewers
