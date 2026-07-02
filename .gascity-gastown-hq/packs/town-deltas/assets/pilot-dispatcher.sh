@@ -3592,6 +3592,43 @@ FIXSEC
             _DOMAIN_RIG=$(bead_content_rig "$STORY" 2>/dev/null || echo "")
           fi
         fi
+        # ── framework-dog-exempt (ga-tgo7q/ga-evjs2, 2026-07-02): gascity-framework
+        # work is DOG-APPROPRIATE — must NOT be refused. ──────────────────────────
+        # bead_content_rig is CONTENT-keyword inference and can false-positive to a
+        # PRODUCT rig on an INCIDENTAL token: an infra bead that merely NAMES the rig
+        # it reproduces on ("this repro is on whatsapp_automation, 5 active crews")
+        # or uses a Portuguese verb overlapping a WA keyword ("Disparou o watchdog" ⊃
+        # "disparo") gets _DOMAIN_RIG=whatsapp_automation. WA has no
+        # rig_domain_default_builder (→ ""), so such a mis-inferred bead falls to rule
+        # (3): REFUSING to the dog pool + stamping a 1h pilot:held EVERY sweep — the
+        # ga-tgo7q/ga-evjs2 stall (336 select→refuse→hold→re-select loops, 2026-07-01/02),
+        # dispatching NOTHING while these were the ONLY buildable beads in the queue.
+        #
+        # ROOT INSIGHT: gate/dispatcher/dolt/reviewer/headroom/refinery/framework work is
+        # gascity-FRAMEWORK, and the ephemeral gastown.dog pool is its CORRECT builder — a
+        # dog HAS the HQ/gascity checkout, git-diff, and gate access this work needs. That
+        # is the OPPOSITE of a PRODUCT-domain build (property scraper / WA feature), which
+        # needs a rig repo + domain data the dog lacks. So an HQ/gascity infra bead reaching
+        # the dog pool must FAIL-OPEN (dispatch) — exactly as this guard's header promises
+        # for an unmapped/unknown domain — never be refused.
+        #
+        # FIX (minimal, fail-open): if the bead's COARSE domain is infra (bead_domain, which
+        # checks the four PRODUCT domains frontend/real-estate/warming/data FIRST and infra
+        # LAST — so it returns "infra" ONLY when NO product keyword matched), it is framework
+        # work: CLEAR the mis-inferred product rig so the routing block below is skipped and
+        # dispatch to the dog proceeds. A genuine product build (property scraper, WA warming/
+        # real-estate/data/painel) is classified as that PRODUCT by bead_domain — NEVER
+        # "infra" — so it is untouched here and still steered to its owning crew (rule 2) or
+        # held away from the dog (rule 3). Gated by PILOT_FRAMEWORK_DOG_EXEMPT (default 1);
+        # fail-open: any bead_domain error → empty → no exemption → prior behaviour.
+        if [ -n "$_DOMAIN_RIG" ] && [ "$_DOMAIN_RIG" != "gascity" ] && [ "${PILOT_FRAMEWORK_DOG_EXEMPT:-1}" = "1" ]; then
+          local _FW_DOMAIN=""
+          _FW_DOMAIN=$(bead_domain "$STORY" 2>/dev/null || echo "")
+          if [ "$_FW_DOMAIN" = "infra" ]; then
+            log "framework-dog-exempt: $STORY_ID is gascity-framework work (bead_domain=infra) but bead_content_rig mis-inferred rig=$_DOMAIN_RIG from an incidental keyword — the dog pool ($BUILDER_TARGET) IS its correct builder (HQ checkout, git-diff, gate access). Clearing product-rig inference so the domain-route guard FAILS OPEN (dispatch, not REFUSE+1h-hold). Disable with PILOT_FRAMEWORK_DOG_EXEMPT=0."
+            _DOMAIN_RIG=""
+          fi
+        fi
         if [ -n "$_DOMAIN_RIG" ] && [ "$_DOMAIN_RIG" != "gascity" ]; then
           # (1) explicit live crew owner wins.
           # imp20: honor an EXPLICIT story.assignee (Mayor-set persistent-crew owner) even
@@ -3945,6 +3982,35 @@ TASK
     #     so --assignee=<crew> matches the crew session's identity (unchanged behaviour).
     case "$_SLING_TARGET" in
       wa-worker*|ps-worker*)
+        # ── ga-sndpm: re-verify ownership guard before routing to the pool ──────
+        # The ga-htjni guard (~L3392) ran ONCE, early in this dispatch_one() call —
+        # BEFORE the pool-distribution/crew-availability logic above, which runs
+        # several bd/gc calls deep and can take real wall-clock time. RoutedPoolQuery
+        # (`bd ready --metadata-field gc.routed_to=$target --unassigned`) is later
+        # self-claimed by a SEPARATE worker/dog session that has NO ownership-guard
+        # logic of its own — it just grabs the first unassigned+routed bead it finds.
+        # If a crew branch or an active gate marker appears for STORY_ID in the
+        # window since the early check — a parallel dispatch, or the actual incident
+        # pattern (wa-ya17c, wa-1tb9b 2x, wa-6j2b6): a stale gc.routed_to=wa-worker
+        # surviving from a PRIOR pool attempt while the bead is mid gate-handoff
+        # (momentarily open+unassigned with its gate-run ACTIVE) — stamping
+        # gc.routed_to here hands a live pool worker a bead someone already owns.
+        # Re-run the SAME fail-open guard (signals a/b/c/d; a=branch and
+        # d=active-gate-marker are the ones that actually fired in the reported
+        # incidents) right before the write, so the check can never be tens-of-
+        # seconds stale. Same kill switch as the main guard: PILOT_OWNERSHIP_GUARD=0
+        # disables both.
+        if [ "${PILOT_OWNERSHIP_GUARD:-1}" = "1" ]; then
+          local _RP_OWN_REASON
+          _RP_OWN_REASON=$(_ownership_guard_should_refuse "$STORY_ID" "$STORY" "$STORY_BEAD_CITY" || echo "")
+          if [ -n "$_RP_OWN_REASON" ]; then
+            warn "ga-sndpm: REFUSING routed-pool dispatch of $STORY_ID to $_SLING_TARGET — already owned/in-flight ($_RP_OWN_REASON). NOT stamping gc.routed_to (would let the pool self-claim collide with active crew work). Releasing claim (set PILOT_OWNERSHIP_GUARD=0 to disable)."
+            bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+            bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+            DISPATCH_RESULT="pool_ownership_refuse"
+            return 1
+          fi
+        fi
         : # pool: leave UNASSIGNED + open so RoutedPoolQuery finds it (claim happens worker-side)
         ;;
       *)

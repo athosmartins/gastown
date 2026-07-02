@@ -446,6 +446,7 @@ run_capacity() {
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_FRAMEWORK_DOG_EXEMPT="${PILOT_FRAMEWORK_DOG_EXEMPT:-}" \
     PILOT_DOLT_LATENCY_OVERRIDE_MS="$([ "${1:-10}" -gt 200 ] 2>/dev/null && echo 3000 || echo 100)" \
     PILOT_DOLT_CPU_OVERRIDE="${1:-10}" \
     FAKE_INFLIGHT_JSON="${2:-[]}" \
@@ -2138,6 +2139,89 @@ echo "Scenario 18l: drift-guard — bundle-ID strip is wired into bead_content_r
 has "$DISPATCHER" 'ga-l5ud0 FIX #1'                    "ga-l5ud0 bundle-ID strip comment wired"
 has "$DISPATCHER" 'bundle-ID'                           "bundle-ID strip keyword wired"
 
+# ── Scenario 18m/18n (ga-tgo7q/ga-evjs2, 2026-07-02): gascity-FRAMEWORK beads that
+# bead_content_rig mis-infers as a PRODUCT rig on an INCIDENTAL keyword must still
+# DISPATCH to the dog pool (framework work builds on the HQ checkout the dog HAS),
+# NEVER be REFUSED + 1h-held. ROOT of the ~22h / 336-loop pipeline stall: an infra
+# bead whose text merely NAMES "whatsapp_automation" (the rig it repros on) or says
+# "Disparou" (⊃ the WA keyword "disparo") → bead_content_rig=whatsapp_automation →
+# rule (3) REFUSING (WA has no rig_domain_default_builder) → pilot:held every sweep,
+# dispatching NOTHING though these were the ONLY buildable beads. FIX: bead_domain
+# (which checks the 4 PRODUCT domains BEFORE infra) == infra ⇒ clear the mis-inferred
+# product rig ⇒ the guard fails open (dispatches to the dog). dispatched_builder reads
+# the POST-guard sling line, so it is populated ONLY if the bead actually dispatched
+# (a REFUSED bead returns before that line → empty).
+echo "Scenario 18m (ga-tgo7q): infra bead naming 'whatsapp_automation' → dog dispatch, NOT refused/held"
+INFRA_LIFO='[{"id":"ga-tgtest","title":"quality-gate-dispatcher marker selection is newest-first (LIFO), not FIFO — starves old healthy markers","priority":2,"issue_type":"bug","description":"packs/town-deltas/assets/quality-gate-dispatcher.sh marker-selection jq is LIFO; fix the dispatcher sort to FIFO. NB this repro is on whatsapp_automation, 5 active crews.","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-01T00:00:01Z","metadata":{}}]'
+INFRA_LIFO_OBJ="$(echo "$INFRA_LIFO" | jq -c '.[0]')"
+# Precondition: bead_content_rig STILL mis-infers WA (the classifier the guard used to refuse on)…
+[ "$(_bcr "$INFRA_LIFO_OBJ")" = whatsapp_automation ] && ok "precondition: bead_content_rig still mis-infers whatsapp_automation (incidental 'whatsapp' token)" || bad "precondition changed: bead_content_rig='$(_bcr "$INFRA_LIFO_OBJ")'"
+# …but bead_domain classifies it as framework (infra), which is the exemption's key.
+[ "$(_dom "$INFRA_LIFO_OBJ")" = infra ] && ok "bead_domain classifies ga-tgo7q shape as infra (framework)" || bad "bead_domain not infra: '$(_dom "$INFRA_LIFO_OBJ")'"
+LOG18M="$(run_capacity 10 "[]" 1 "$INFRA_LIFO")"
+B18M="$(dispatched_builder "$LOG18M")"
+if echo "$B18M" | grep -qE '^gastown\.dog'; then
+  ok "infra bead DISPATCHED to the dog pool ($B18M) — framework work builds on the dog (fix works)"
+elif [ -z "$B18M" ] && echo "$LOG18M" | grep -q "REFUSING"; then
+  bad "REGRESSION: infra bead REFUSED to the dog pool + held (the ga-tgo7q 336-loop stall)"
+else
+  bad "infra bead routed unexpectedly (got: '${B18M:-none}')"
+fi
+echo "$LOG18M" | grep -q "framework-dog-exempt: ga-tgtest" && ok "exemption logged for ga-tgo7q shape" || bad "framework-dog-exempt not logged for ga-tgo7q shape"
+echo "$LOG18M" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-tgtest" && bad "ga-tgo7q shape still refused (bug present)" || ok "ga-tgo7q shape NOT refused (no pilot:held loop)"
+
+echo "Scenario 18m2 (ga-tgo7q, guard OFF): PILOT_FRAMEWORK_DOG_EXEMPT=0 reproduces the REFUSE+hold bug"
+LOG18M0="$(PILOT_FRAMEWORK_DOG_EXEMPT=0 run_capacity 10 "[]" 1 "$INFRA_LIFO")"
+B18M0="$(dispatched_builder "$LOG18M0")"
+if [ -z "$B18M0" ] && echo "$LOG18M0" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-tgtest"; then
+  ok "with exemption OFF the bead is REFUSED+held (proves the fix is EXACTLY what flips the behaviour)"
+else
+  bad "toggle-off did not reproduce the refuse (knob not wired?) got builder='${B18M0:-none}'"
+fi
+
+echo "Scenario 18n (ga-evjs2): infra bead saying 'Disparou' (⊃ disparo) → dog dispatch, NOT refused"
+INFRA_REVIEWER='[{"id":"ga-evtest","title":"Gate reviewer death-spiral on LARGE diffs: REVIEWER_STALE_SECS=300 fixed freeze-kill doesnt scale with diff size","priority":1,"issue_type":"bug","description":"big-diff reviewers false-reaped at 5min. Disparou throughput-stall watchdog + agent respawns; Dolt+quota burn. Scale the reviewer stale timeout with diff size.","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-01T00:00:02Z","metadata":{}}]'
+INFRA_REV_OBJ="$(echo "$INFRA_REVIEWER" | jq -c '.[0]')"
+[ "$(_bcr "$INFRA_REV_OBJ")" = whatsapp_automation ] && ok "precondition: bead_content_rig still mis-infers whatsapp_automation (incidental 'disparo' token)" || bad "precondition changed: bead_content_rig='$(_bcr "$INFRA_REV_OBJ")'"
+[ "$(_dom "$INFRA_REV_OBJ")" = infra ] && ok "bead_domain classifies ga-evjs2 shape as infra (framework)" || bad "bead_domain not infra: '$(_dom "$INFRA_REV_OBJ")'"
+LOG18N="$(run_capacity 10 "[]" 1 "$INFRA_REVIEWER")"
+B18N="$(dispatched_builder "$LOG18N")"
+if echo "$B18N" | grep -qE '^gastown\.dog'; then
+  ok "gate-reviewer infra bead DISPATCHED to the dog pool ($B18N) — fix works"
+elif [ -z "$B18N" ] && echo "$LOG18N" | grep -q "REFUSING"; then
+  bad "REGRESSION: gate-reviewer infra bead REFUSED to the dog pool + held (the ga-evjs2 stall)"
+else
+  bad "gate-reviewer infra bead routed unexpectedly (got: '${B18N:-none}')"
+fi
+echo "$LOG18N" | grep -q "framework-dog-exempt: ga-evtest" && ok "exemption logged for ga-evjs2 shape" || bad "framework-dog-exempt not logged for ga-evjs2 shape"
+
+echo "Scenario 18o (no regression): genuine PRODUCT-domain beads are NEVER infra-exempted → still steered to crew"
+# The exemption keys on bead_domain=infra; a real product build classifies as its PRODUCT
+# domain (checked BEFORE infra), so it is untouched. Prove both the classifier and the e2e route.
+[ "$(_dom "$WARM_BEAD")" = warming ]        && ok "warming bead stays warming (NOT infra) → owner steering intact" || bad "warming reclassified: '$(_dom "$WARM_BEAD")'"
+[ "$(_dom "$RE_BEAD")" = real-estate ]      && ok "real-estate bead stays real-estate (NOT infra)"                 || bad "real-estate reclassified: '$(_dom "$RE_BEAD")'"
+[ "$(_own warming)" = oracle-wa ]           && ok "warming still owned by oracle-wa (steering preserved)"          || bad "warming owner changed: '$(_own warming)'"
+[ "$(_own real-estate)" = peter-wa ]        && ok "real-estate still owned by peter-wa (steering preserved)"       || bad "real-estate owner changed: '$(_own real-estate)'"
+# End-to-end: the property_scrapers domain build (18a fixture) must STILL reach batista-ps,
+# not the dog — proving the exemption did not swallow product-domain routing.
+LOG18O="$(run_capacity 10 "[]" 1 "$PS_DOMAIN_SMALL")"
+B18O="$(dispatched_builder "$LOG18O")"
+[ "$B18O" = batista-ps ] && ok "property_scrapers domain build STILL → batista-ps (product routing not regressed)" || bad "REGRESSION: property build → '${B18O:-none}' (expected batista-ps)"
+echo "$LOG18O" | grep -q "framework-dog-exempt" && bad "exemption wrongly fired on a property build" || ok "exemption stayed silent on the property build (bead_domain≠infra)"
+
+echo "Scenario 18p (fail-open): a ga- HQ bead with NO domain signal → dog dispatch, exemption silent"
+NODOMAIN='[{"id":"ga-nodtest","title":"bump the sweep log verbosity flag default","priority":3,"issue_type":"bug","description":"flip a logging default; no domain content whatsoever","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-01T00:00:03Z","metadata":{}}]'
+NODOMAIN_OBJ="$(echo "$NODOMAIN" | jq -c '.[0]')"
+[ -z "$(_bcr "$NODOMAIN_OBJ")" ] && ok "no-domain bead: bead_content_rig empty (nothing to exempt)" || bad "no-domain bead unexpectedly inferred rig: '$(_bcr "$NODOMAIN_OBJ")'"
+LOG18P="$(run_capacity 10 "[]" 1 "$NODOMAIN")"
+B18P="$(dispatched_builder "$LOG18P")"
+echo "$B18P" | grep -qE '^gastown\.dog' && ok "unknown-domain HQ bead dispatched to the dog (fail-open unchanged)" || bad "unknown-domain HQ bead routed unexpectedly: '${B18P:-none}'"
+echo "$LOG18P" | grep -q "framework-dog-exempt" && bad "exemption fired on a no-domain bead (should only touch an inferred product rig)" || ok "exemption silent on no-domain bead (only acts on a mis-inferred product rig)"
+
+echo "Scenario 18q: drift-guard — framework-dog-exempt is wired into the live dispatcher"
+has "$DISPATCHER" 'PILOT_FRAMEWORK_DOG_EXEMPT'   "framework-dog-exempt knob is wired"
+has "$DISPATCHER" 'framework-dog-exempt'         "framework-dog-exempt log/tag is wired"
+
 # ── Scenario 19 (wa-u5r1): dispatchable-queue emit for the painel ─────────────
 echo "Scenario 19a: emit writes valid JSON with the contract shape + count + items"
 F19="$(run_emit)"
@@ -3228,6 +3312,73 @@ has "$DISPATCHER" 'PILOT_TEST_PS_WORKER_LIVE_COUNT'   "PILOT_TEST_PS_WORKER_LIVE
 has "$DISPATCHER" 'PILOT_SPAWN_PS_WORKER'             "PILOT_SPAWN_PS_WORKER toggle wired"
 has "$DISPATCHER" 'gc\.routed_to=ps-worker'           "gc.routed_to=ps-worker stamped before spawn"
 has "$DISPATCHER" 'session new ps-worker --no-attach' "spawn arm uses gc session new ps-worker --no-attach"
+
+# Helper: same as run_ps_worker_dispatch but also injects the ga-htjni ownership-
+# guard test seams (ga-sndpm), so a scenario can simulate the routed candidate
+# already having a crew branch (signal a) or an active gate marker (signal d).
+# $4=PILOT_TEST_CREW_BRANCH_BEADS  $5=PILOT_TEST_GATE_ACTIVE_BEADS
+run_ps_worker_dispatch_own_guard() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$PS_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE=10 \
+    DISPATCH_TO_CAPACITY=1 \
+    FAKE_BUGS_JSON="${1:-[]}" \
+    FAKE_BLOCKED_IDS="" \
+    PILOT_WA_RIG_APPROVED_QUERIES=1 \
+    PILOT_WA_RIG_TIER2_OVERRIDE="${2:-[]}" \
+    PILOT_TEST_PS_WORKER_LIVE_COUNT="${3:-0}" \
+    PILOT_TEST_CREW_BRANCH_BEADS="${4:-}" \
+    PILOT_TEST_GATE_ACTIVE_BEADS="${5:-}" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+echo "Scenario POOL-OWN-A (ga-sndpm): routed-pool dispatch REFUSED when candidate already has a crew branch (signal a)"
+LOG_POA="$(run_ps_worker_dispatch_own_guard "[]" "$PS_WORKER_FX" "0" "ps-test1" "")"
+if echo "$LOG_POA" | grep -q "ga-sndpm: REFUSING routed-pool dispatch of ps-test1"; then
+  ok "pool-own(a): routed-pool dispatch refused when a crew branch already exists for the candidate"
+else
+  bad "pool-own(a): REGRESSION — no ga-sndpm refusal logged; a bead with an existing crew branch would still get gc.routed_to stamped (collision risk)"
+fi
+if echo "$LOG_POA" | grep -q "session new ps-worker --no-attach"; then
+  bad "pool-own(a): REGRESSION — pool worker spawn happened despite an existing crew branch for the candidate"
+else
+  ok "pool-own(a): pool worker spawn correctly skipped"
+fi
+
+echo "Scenario POOL-OWN-D (ga-sndpm): routed-pool dispatch REFUSED when candidate has an ACTIVE gate marker (signal d)"
+LOG_POD="$(run_ps_worker_dispatch_own_guard "[]" "$PS_WORKER_FX" "0" "" "ps-test1")"
+if echo "$LOG_POD" | grep -q "ga-sndpm: REFUSING routed-pool dispatch of ps-test1"; then
+  ok "pool-own(d): routed-pool dispatch refused when an active gate marker already exists for the candidate"
+else
+  bad "pool-own(d): REGRESSION — no ga-sndpm refusal logged; a bead being actively gated would still get gc.routed_to stamped (collision risk)"
+fi
+if echo "$LOG_POD" | grep -q "session new ps-worker --no-attach"; then
+  bad "pool-own(d): REGRESSION — pool worker spawn happened despite an active gate marker for the candidate"
+else
+  ok "pool-own(d): pool worker spawn correctly skipped"
+fi
+
+echo "Scenario POOL-OWN-CTL (ga-sndpm): control — routed-pool dispatch STILL proceeds when candidate is genuinely free"
+LOG_POCTL="$(run_ps_worker_dispatch_own_guard "[]" "$PS_WORKER_FX" "0" "" "")"
+if echo "$LOG_POCTL" | grep -q "ga-sndpm: REFUSING routed-pool dispatch"; then
+  bad "pool-own(control): REGRESSION — a genuinely free candidate was refused (over-blocking)"
+else
+  ok "pool-own(control): a genuinely free candidate is NOT refused (no over-blocking)"
+fi
+if echo "$LOG_POCTL" | grep -q "session new ps-worker --no-attach"; then
+  ok "pool-own(control): pool worker spawn still proceeds for a genuinely free candidate"
+else
+  bad "pool-own(control): REGRESSION — pool worker spawn missing even with no competing ownership signal"
+fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
