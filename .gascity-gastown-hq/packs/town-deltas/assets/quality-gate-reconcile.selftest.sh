@@ -90,6 +90,28 @@ eq "past TTL, count == cap → error (thrash)"  "$(reconcile_marker_action dispa
 eq "past TTL, count > cap → error"            "$(reconcile_marker_action claimed     99 30 9 3)" "error"
 eq "unknown status past TTL → skip (safe)"    "$(reconcile_marker_action queued      99 30 0 3)" "skip"
 
+# ── 1b. ga-cgynn: has_live_companion_run (6th, optional arg) ────────────────
+# A dispatcher yield-bounce ("live sibling gate-run already running for this
+# branch") is a label-only dispatching→queued touch, which does NOT bump
+# updated_at — so a perfectly healthy marker can look "stuck" for 60+ minutes
+# to age_min alone. A live companion gate-run (its marker_id: back-reference
+# points at this marker) is decisive counter-evidence and must win over BOTH
+# the age check and the reclaim-count cap — otherwise the false reclaims
+# still accumulate to error and Vector B kills the still-live gate-run next.
+echo "── 1b. reconcile_marker_action has_live_companion_run (ga-cgynn) ──"
+eq "past TTL but live companion run → skip (not stuck)" \
+   "$(reconcile_marker_action dispatching 99 30 0 3 1)" "skip"
+eq "past TTL + AT reclaim cap but live companion → skip (not error)" \
+   "$(reconcile_marker_action dispatching 99 30 3 3 1)" "skip"
+eq "claimed, past TTL, live companion → skip" \
+   "$(reconcile_marker_action claimed     99 30 2 3 1)" "skip"
+eq "live companion=0 explicit → unchanged (requeues)" \
+   "$(reconcile_marker_action dispatching 31 30 0 3 0)" "requeue:queued"
+# BACK-COMPAT: the 5-arg form (no has_live_companion_run) must behave EXACTLY
+# as the pre-ga-cgynn function — the new skip-override stays inert.
+eq "5-arg back-compat: requeue unaffected"  "$(reconcile_marker_action dispatching 31 30 0 3)" "requeue:queued"
+eq "5-arg back-compat: error unaffected"    "$(reconcile_marker_action claimed     99 30 3 3)" "error"
+
 # ── 2. Vector B — gate-run reconcile decision ────────────────────────────────
 # Signature: reconcile_gaterun_action <age_min> <ttl_min> <marker_active 0|1> \
 #                                     [verdict_timeout_min] [reviewers_alive 0|1]
@@ -143,6 +165,16 @@ grep -q 'gate-status:dispatching'            "$GUARD" && ok "guard reclaims disp
 grep -q 'gate-status:claimed'                "$GUARD" && ok "guard reclaims claimed markers"             || bad "guard does not scan claimed"
 grep -q 'gate-reclaim-count:'                "$GUARD" && ok "guard tracks reclaim-count (thrash cap)"    || bad "guard missing reclaim-count label"
 grep -q 'MAX_RECLAIMS'                       "$GUARD" && ok "guard caps re-queues (MAX_RECLAIMS)"        || bad "guard missing MAX_RECLAIMS"
+# ga-cgynn: Vector A must not miscount a legitimate sibling-yield bounce as a
+# stuck-marker reclaim — a live companion gate-run is decisive counter-evidence.
+grep -q 'RUNNING_GATERUN_MARKER_IDS'         "$GUARD" && ok "guard builds RUNNING_GATERUN_MARKER_IDS (companion-liveness index, ga-cgynn)" || bad "guard missing RUNNING_GATERUN_MARKER_IDS"
+grep -q 'HAS_LIVE_COMPANION=0'               "$GUARD" && ok "guard computes HAS_LIVE_COMPANION per transient marker"                       || bad "guard missing HAS_LIVE_COMPANION"
+grep -q 'reconcile_marker_action "\$T_STATUS" "\$T_AGE" "\$CLAIM_TTL_MINUTES" "\$T_COUNT" "\$MAX_RECLAIMS" "\$HAS_LIVE_COMPANION"' "$GUARD" \
+  && ok "guard wires HAS_LIVE_COMPANION into the reconcile_marker_action call (ga-cgynn)" \
+  || bad "guard not passing has_live_companion_run into reconcile_marker_action"
+[ "$(grep -c 'GATE_RUNS_JSON=\$(bd' "$GUARD")" -eq 1 ] \
+  && ok "GATE_RUNS_JSON fetched exactly once (hoisted shared prelude, no duplicate bd round-trip)" \
+  || bad "GATE_RUNS_JSON fetch count != 1 (duplicate-fetch regression, or the ga-cgynn hoist was reverted)"
 # Vector B: supersede orphans by marker state + keep the age fallback.
 # (ga-jhyu: terminal transitions now flow through set_gate_status, which emits
 #  the gate-status:superseded/aborted label at runtime — assert the call sites.)

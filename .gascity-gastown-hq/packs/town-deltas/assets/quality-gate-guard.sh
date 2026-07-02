@@ -74,15 +74,32 @@ parse_marker_id() {
   printf '%s' "$line" | sed 's/^marker_id:[[:space:]]*//' | sed 's/[[:space:]]*$//'
 }
 
-# reconcile_marker_action <status> <age_min> <ttl_min> <reclaim_count> <max_reclaims>
+# reconcile_marker_action <status> <age_min> <ttl_min> <reclaim_count> <max_reclaims> \
+#                          [has_live_companion_run: 0|1]
 # Pure decision: what to do with a marker stuck in a transient state.
 # Returns: skip | requeue:queued | requeue:ready | error
+#
+# has_live_companion_run (ga-cgynn): 1 iff a currently-running (non-terminal)
+# gate-run bead's marker_id: back-reference points at THIS marker. A
+# dispatcher yield-bounce ("live sibling gate-run already running for this
+# branch" — dispatching flipped straight back toward queued) is a label-only
+# change, which does NOT bump the marker's updated_at. So age_min alone
+# cannot tell "just touched, real work is in flight elsewhere" apart from
+# "genuinely abandoned an hour ago" — every subsequent sweep miscounts the
+# bounce as a fresh stuck-reclaim event, exhausts MAX_RECLAIMS, and forces
+# gate-status:error on a marker whose review is healthy (which then makes
+# Vector B kill the still-live gate-run as an "orphan"). A live companion run
+# is decisive counter-evidence: never reclaim-count or error a marker whose
+# own gate-run is actively running, no matter how stale updated_at looks.
+# Defaults to 0 so pre-existing 5-arg callers are unaffected.
 reconcile_marker_action() {
   local status="$1" age_min="$2" ttl_min="$3" count="$4" max="$5"
+  local has_live_companion_run="${6:-0}"
   case "$status" in
     dispatching|claimed) ;;
     *) echo "skip"; return ;;
   esac
+  [ "$has_live_companion_run" = "1" ] && { echo "skip"; return; }
   [ "$age_min" -le "$ttl_min" ] && { echo "skip"; return; }
   [ "$count" -ge "$max" ]       && { echo "error"; return; }
   case "$status" in
@@ -272,6 +289,30 @@ validate_rig() {
   echo "$known_rigs" | grep -qx "$val"
 }
 
+# ── Shared prelude: currently-running gate-runs (ga-cgynn) ───────────────────
+# Fetched ONCE here — reused unchanged by Vector B below (was previously a
+# second, separate bd round-trip in Step 0b) AND by Vector A's companion-
+# liveness check right below. Both vectors must see the identical snapshot;
+# two separate fetches could observe different states across the gap.
+GATE_RUNS_JSON=$(bd -C "$GC_CITY" list --json --all \
+  -l type:quality-gate-run \
+  -l gate-status:running \
+  2>/dev/null || echo "[]")
+GATE_RUN_COUNT=$(printf '%s\n' "$GATE_RUNS_JSON" | jq 'length' 2>/dev/null || echo "0")
+case "$GATE_RUN_COUNT" in ''|*[!0-9]*) GATE_RUN_COUNT=0 ;; esac
+
+# marker_id: back-references of every currently-running gate-run. Membership
+# here is the has_live_companion_run signal reconcile_marker_action needs.
+RUNNING_GATERUN_MARKER_IDS=""
+if [ "$GATE_RUN_COUNT" -gt 0 ]; then
+  for _gi in $(seq 0 $((GATE_RUN_COUNT - 1))); do
+    _gr_desc=$(printf '%s\n' "$GATE_RUNS_JSON" | jq -r ".[$_gi].description // \"\"")
+    _gr_mid=$(parse_marker_id "$_gr_desc")
+    [ -n "$_gr_mid" ] && RUNNING_GATERUN_MARKER_IDS="${RUNNING_GATERUN_MARKER_IDS}${_gr_mid}
+"
+  done
+fi
+
 # ── Step 0: Vector A — unified transient-marker reclaim (dispatching + claimed) ─
 # The dispatcher's Step 0a only reclaims gate-status:dispatching when IT runs.
 # When the dispatcher CRASHES mid-dispatch, no one reclaims the marker — it
@@ -308,7 +349,13 @@ if [ "$TRANSIENT_COUNT" -gt 0 ]; then
       | sed -n 's/^gate-reclaim-count:\([0-9]*\)$/\1/p' | sort -n | tail -1)
     [ -z "$T_COUNT" ] && T_COUNT=0
 
-    ACTION=$(reconcile_marker_action "$T_STATUS" "$T_AGE" "$CLAIM_TTL_MINUTES" "$T_COUNT" "$MAX_RECLAIMS")
+    HAS_LIVE_COMPANION=0
+    if [ -n "$RUNNING_GATERUN_MARKER_IDS" ] \
+      && printf '%s\n' "$RUNNING_GATERUN_MARKER_IDS" | grep -qx "$T_ID"; then
+      HAS_LIVE_COMPANION=1
+    fi
+
+    ACTION=$(reconcile_marker_action "$T_STATUS" "$T_AGE" "$CLAIM_TTL_MINUTES" "$T_COUNT" "$MAX_RECLAIMS" "$HAS_LIVE_COMPANION")
     case "$ACTION" in
       requeue:queued)
         warn "Vector A: requeueing zombie dispatching marker $T_ID (age=${T_AGE}m, reclaims=${T_COUNT})"
@@ -340,7 +387,11 @@ if [ "$TRANSIENT_COUNT" -gt 0 ]; then
         bd -C "$GC_CITY" comment "$T_ID" "Vector A (ga-tmug): marker exhausted ${MAX_RECLAIMS} reclaim attempts stuck in gate-status:${T_STATUS}. Marking gate-status:error — human/Mayor intervention required." 2>/dev/null || true
         ;;
       skip)
-        log "  Marker $T_ID in $T_STATUS for ${T_AGE}m — within TTL, skipping."
+        if [ "$HAS_LIVE_COMPANION" = "1" ]; then
+          log "  Marker $T_ID in $T_STATUS has a live companion gate-run — legitimate yield-bounce, not stuck (ga-cgynn). Skipping."
+        else
+          log "  Marker $T_ID in $T_STATUS for ${T_AGE}m — within TTL, skipping."
+        fi
         ;;
     esac
   done
@@ -392,12 +443,10 @@ reviewers_alive_for_run() {
   echo 0
 }
 
-GATE_RUNS_JSON=$(bd -C "$GC_CITY" list --json --all \
-  -l type:quality-gate-run \
-  -l gate-status:running \
-  2>/dev/null || echo "[]")
-GATE_RUN_COUNT=$(printf '%s\n' "$GATE_RUNS_JSON" | jq 'length' 2>/dev/null || echo "0")
-case "$GATE_RUN_COUNT" in ''|*[!0-9]*) GATE_RUN_COUNT=0 ;; esac
+# GATE_RUNS_JSON / GATE_RUN_COUNT: already fetched once in the shared prelude
+# above Step 0 (ga-cgynn) — reused here unchanged so Vector A's companion-
+# liveness check and Vector B see the identical snapshot instead of two
+# separate bd round-trips that could observe different states.
 
 if [ "$GATE_RUN_COUNT" -gt 0 ]; then
   NOW_EPOCH=$(date +%s)
