@@ -3910,6 +3910,59 @@ TASK
   local _IS_RIG_NATIVE=0
   [ "$STORY_BEAD_CITY" != "$GC_CITY" ] && _IS_RIG_NATIVE=1
 
+  # ── ga-88g2: pre-dispatch freshness re-check (candidate-to-dispatch TOCTOU) ───
+  # The ga-zzrts verify above (~L3316) re-fetches immediately after the atomic
+  # claim, but everything since — ga-htjni ownership guard, ga-cnvy1 dedup guard,
+  # domain routing, pool-builder selection, session classification — runs several
+  # more bd/gc calls deep and can take real wall-clock time. A bead that flips to
+  # a terminal/escalated state DURING that window (e.g. inflight-reclaim-guard's
+  # do_escalate() landing gate:needs-human + retained story:in-flight once the
+  # MAX_RECLAIMS cap is hit) is never re-checked, so Pilot still dispatches
+  # against a stale snapshot. Confirmed via ga-w5agg's 9th dispatch: dog-gab3fg
+  # observed gate:needs-human + gate:needs-human:technical + retained
+  # story:in-flight already present at 2026-07-02T17:22:11Z, yet Pilot posted a
+  # dispatch comment for the SAME bead at 2026-07-02T17:26:24Z — 4+ minutes
+  # later, well after the escalation was durable. Re-fetch ONE more time here,
+  # immediately before the first externally-visible dispatch action (sling / bd
+  # assign / session wake / nudge), so the circuit breaker can't be raced by
+  # builder-target-resolution latency. This is the SAME class of fix as
+  # ga-sndpm's late re-verification below (~L4005) — that one re-checks
+  # ownership right before the wa-worker/ps-worker pool write; this one
+  # re-checks the escalation labels right before ANY dispatch path (sling,
+  # rig-native, or pool). FAIL-OPEN by construction: an unreadable re-check
+  # never blocks a real dispatch.
+  if [ "$DRY_RUN" != "1" ]; then
+    local _PREDISPATCH_JSON _PREDISPATCH_LABELS
+    _PREDISPATCH_JSON=$(bd -C "$STORY_BEAD_CITY" show "$STORY_ID" --json 2>/dev/null || echo "[]")
+    _PREDISPATCH_LABELS=$(echo "$_PREDISPATCH_JSON" \
+      | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' \
+      2>/dev/null || echo "")
+    if echo "$_PREDISPATCH_LABELS" | grep -q "gate:needs-human"; then
+      warn "ga-88g2: $STORY_ID now has gate:needs-human (escalated during builder-target resolution, after the ga-zzrts claim-verify passed clean). Releasing claim and skipping — NOT dispatching a builder onto a circuit-broken bead."
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+      return 1
+    fi
+    if echo "$_PREDISPATCH_LABELS" | grep -q "story:in-flight"; then
+      warn "ga-88g2: $STORY_ID now has story:in-flight (raced by a concurrent dispatch/reclaim during builder-target resolution). Releasing claim and skipping."
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+      return 1
+    fi
+    if echo "$_PREDISPATCH_LABELS" | grep -q "story:done"; then
+      warn "ga-88g2: $STORY_ID now has story:done (completed during builder-target resolution). Releasing claim and skipping."
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+      return 1
+    fi
+    if echo "$_PREDISPATCH_LABELS" | grep -q "pilot:dispatched"; then
+      warn "ga-88g2: $STORY_ID now has pilot:dispatched (dispatched via another path during builder-target resolution). Releasing claim and skipping."
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+      return 1
+    fi
+  fi
+
   # ── Dispatch via gc sling (HQ beads) or bd assign (rig-native beads) ─────────
   local DISPATCH_EPOCH DISPATCH_RESULT SLING_BEAD_ID NOW
   DISPATCH_EPOCH=$(date +%s)

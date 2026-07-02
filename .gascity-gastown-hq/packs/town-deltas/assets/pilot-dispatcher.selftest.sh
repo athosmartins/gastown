@@ -156,6 +156,21 @@ case "$args" in
         lbls=""
         [ -f "$STATE/$id.inflight" ]    && lbls="\"story:in-flight\""
         [ -f "$STATE/$id.dispatching" ] && lbls="${lbls:+$lbls,}\"pilot:dispatching\""
+        # ga-88g2: simulate a concurrent inflight-reclaim-guard escalation landing
+        # gate:needs-human MID-DISPATCH — i.e. AFTER the ga-zzrts claim-verify's
+        # `bd show` has already read this id once. Counter-based (per-id, in
+        # $STATE) so the race is deterministic instead of depending on real
+        # wall-clock concurrency. FAKE_ESCALATE_AFTER_SHOWS=N: the Nth and
+        # earlier `bd show <id>` calls return clean; the (N+1)th and later
+        # calls carry gate:needs-human. Unset/empty (the default) never escalates
+        # — every existing scenario is byte-identical to before this seam existed.
+        if [ -n "${FAKE_ESCALATE_AFTER_SHOWS:-}" ]; then
+          _scf="$STATE/$id.showcount"
+          _sc=$(cat "$_scf" 2>/dev/null || echo 0)
+          _sc=$((_sc + 1))
+          echo "$_sc" > "$_scf"
+          [ "$_sc" -gt "$FAKE_ESCALATE_AFTER_SHOWS" ] && lbls="${lbls:+$lbls,}\"gate:needs-human\""
+        fi
         st="open"
         case "$id" in *sling*) st="${FAKE_SLING_STATUS:-open}" ;; esac
         # ga-e5yw2: the dead-worker correction resolves a sling task's assignee.
@@ -408,6 +423,31 @@ run_real_dispatch() { # FAKE_SUPPRESS_INFLIGHT
     PILOT_INFLIGHT_SLEEP=0 \
     FAKE_BLOCKED_IDS="" \
     FAKE_SUPPRESS_INFLIGHT="$1" \
+    FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# Runs a REAL (non-dry) dispatch where gate:needs-human lands on the candidate
+# MID-DISPATCH — after N `bd show` reads have already happened — simulating a
+# concurrent inflight-reclaim-guard escalation racing the builder-target-
+# resolution window (ga-88g2). Arg 1: FAKE_ESCALATE_AFTER_SHOWS (unset/empty
+# = never escalates, i.e. the plain happy path).
+run_real_dispatch_escalate() { # FAKE_ESCALATE_AFTER_SHOWS
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=0 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_INFLIGHT_RETRIES=3 \
+    PILOT_INFLIGHT_SLEEP=0 \
+    FAKE_BLOCKED_IDS="" \
+    FAKE_SUPPRESS_INFLIGHT=0 \
+    FAKE_ESCALATE_AFTER_SHOWS="${1:-}" \
     FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
@@ -984,6 +1024,49 @@ if grep -q "released tt-flight" "$STATE/releases.log" 2>/dev/null; then
   bad "REGRESSION: released the claim despite unconfirmed in-flight (re-dispatchable!)"
 else
   ok "left pilot:dispatching ON for TTL recovery (no premature release)"
+fi
+
+# ── Scenario 5c/5d: pre-dispatch freshness re-check (ga-88g2) ──────────────────
+# The ga-w5agg 9th-dispatch incident: the ga-zzrts claim-verify (Scenario 5's own
+# happy path) passes clean, but gate:needs-human lands on the SAME bead later,
+# during builder-target resolution — well before the actual sling/nudge. Without
+# a re-check immediately before dispatch, Pilot sails through and dispatches a
+# builder onto a bead the circuit breaker already parked for a human. The fix
+# adds exactly that re-check; these scenarios prove it fails-before/passes-after.
+echo "Scenario 5c: gate:needs-human landing mid-dispatch aborts BEFORE a builder is dispatched (ga-88g2)"
+
+# 5c: escalation injected after the 1st `bd show` (the ga-zzrts claim-verify) —
+# i.e. exactly the ga-w5agg race: clean at claim-verify time, escalated after.
+LOG5C="$(run_real_dispatch_escalate 1)"
+if echo "$LOG5C" | grep -q "ga-88g2:.*tt-flight now has gate:needs-human"; then
+  ok "pre-dispatch re-check detected the mid-dispatch escalation and logged it"
+else
+  bad "REGRESSION: no ga-88g2 pre-dispatch re-check fired — the race is unguarded (would dispatch onto a circuit-broken bead, as ga-w5agg's 9th dispatch did)"
+fi
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  bad "REGRESSION: story:in-flight was set despite the mid-dispatch escalation — the builder dispatch was NOT stopped"
+else
+  ok "story:in-flight was never set — dispatch correctly aborted before finalization"
+fi
+if echo "$LOG5C" | grep -q "Dispatch complete:"; then
+  bad "REGRESSION: dispatch completed (builder notified) despite the mid-dispatch escalation"
+else
+  ok "no builder was notified — aborted before the sling/nudge step"
+fi
+
+# 5d: control — no escalation injected (FAKE_ESCALATE_AFTER_SHOWS unset) → the
+# new re-check must be a pure no-op on the ordinary happy path (no false positive).
+echo "Scenario 5d: control — no escalation → new re-check never false-positives (ga-88g2)"
+LOG5D="$(run_real_dispatch_escalate "")"
+if echo "$LOG5D" | grep -q "ga-88g2:"; then
+  bad "REGRESSION: pre-dispatch re-check fired with no escalation injected (false positive)"
+else
+  ok "no false positive — re-check stayed silent on the plain happy path"
+fi
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  ok "story:in-flight still set normally when nothing escalated"
+else
+  bad "REGRESSION: adding the re-check broke the ordinary happy-path dispatch"
 fi
 
 # ── Scenario 6: source bead never carries dog routing (ga-ms1jm) ──────────────
