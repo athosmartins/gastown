@@ -131,6 +131,20 @@ GRW_REQUEUE_ERROR_ENABLED = os.environ.get("GRW_REQUEUE_ERROR_ENABLED", "1") != 
 ERROR_REQUEUE_MINUTES = int(os.environ.get("GRW_ERROR_REQUEUE_MINUTES", "8"))    # a marker must sit in error >this before requeue, so a transient error self-clears on the dispatcher's own next sweep first
 ERROR_REQUEUE_MAX_PER_SWEEP = int(os.environ.get("GRW_ERROR_REQUEUE_MAX_PER_SWEEP", "5"))
 ERROR_REQUEUE_MAX_ATTEMPTS = int(os.environ.get("GRW_ERROR_REQUEUE_MAX_ATTEMPTS", "3"))  # after K watchdog-requeues of the SAME marker (it keeps re-erroring), STOP and escalate to the Mayor — mirror the gate's own fix-attempt cap philosophy instead of an infinite requeue loop
+# FIX 3 — kill a FROZEN gate-reviewer (state=active but last_active silent past the
+# threshold). reap_hung_runs (FIX 1) CANNOT catch this: its reviewer reads active, so
+# hung_run_verdict returns skip:reviewer-active. The dispatcher's own ga-q8tmn detects
+# the freeze and re-convenes, but only MAX_RESPAWNS_PER_SLOT (2) times — after that it
+# waits the full 45m outer timeout. That is the ~90-min stall the Mayor cleared by hand
+# with `gc session kill` (2026-07-02: reviewer 6ohacd silent 34m, queue starved to
+# 531m). A working reviewer refreshes last_active on EVERY tool call, so >this-many
+# seconds of silence is a wedged Claude. `gc session kill` makes the reconciler revive
+# it in place (same id, fresh runtime → the dispatcher's slot ref stays valid). This is
+# the BACKSTOP after the dispatcher gives up, so the threshold sits WELL past its
+# ~9-min diff-scaled detection + 2 respawns.
+GRW_REAP_FROZEN_ENABLED = os.environ.get("GRW_REAP_FROZEN_ENABLED", "1") != "0"
+FROZEN_KILL_SECS = int(os.environ.get("GRW_FROZEN_KILL_SECS", "900"))            # 15min of last_active silence on a STILL-active reviewer = definitively wedged (past the dispatcher's own detect+respawn cycle); SUSTAINED-confirmed on a resample before any kill
+FROZEN_KILL_MAX_PER_SWEEP = int(os.environ.get("GRW_FROZEN_KILL_MAX_PER_SWEEP", "2"))  # blast-radius cap: if MANY reviewers are silent at once (systemic Dolt/quota outage) killing them only churns — cap it and let the infra detectors + Mayor escalation handle a mass outage
 RECOVERY_LOG = os.path.join(CITY, ".gc/logs/gate-recovery-actions.jsonl")        # durable jsonl audit of every direct reap/requeue (evidence)
 GRW_REQUEUE_LABEL_RE = re.compile(r"^grw-requeue:(\d+)$")                          # restart-safe per-marker requeue counter, stamped on the marker as a label
 # A repair dog's session title (set by the watchdog's --title-hint, and kept by the
@@ -345,6 +359,38 @@ def _iso_epoch(s):
         return dt.replace(tzinfo=datetime.timezone.utc).timestamp()
     except Exception:
         return None
+
+
+def _last_active_epoch(s):
+    """Parse a `gc session list --json` last_active to a true Unix epoch. Unlike bd's
+    UTC-'Z' timestamps (handled by _iso_epoch), session last_active carries a tz OFFSET
+    ('2026-07-02T16:06:29-03:00') — fromisoformat handles both. Returns None on
+    empty/unparseable (fail-safe: a session we cannot age is NEVER treated as frozen)."""
+    if not s:
+        return None
+    try:
+        t = s.strip()
+        if t.endswith("Z"):
+            t = t[:-1] + "+00:00"
+        dt = datetime.datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def frozen_reviewer_verdict(state, silence_sec, threshold_sec):
+    """PURE decision (no I/O, set -e safe, unit-tested) for FIX 3. 'kill' iff the
+    reviewer session is state=active AND has been silent (no last_active refresh) for
+    >= threshold; else 'keep'. Fail-safe toward KEEP: a non-active state (the hung-run
+    reaper / dispatcher own it), or a None/negative silence (unparseable/future
+    last_active) never kills."""
+    if str(state or "").lower() != "active":
+        return "keep"
+    if silence_sec is None or silence_sec < 0:
+        return "keep"
+    return "kill" if silence_sec >= threshold_sec else "keep"
 
 
 def _queued_markers():
@@ -1475,6 +1521,75 @@ def reap_hung_runs(sessions, now, rstate):
         print("[watchdog] reap sweep: %d hung run(s) reaped%s" % (reaped, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
 
 
+def reap_frozen_reviewers(sessions, now):
+    """FIX 3: kill a FROZEN gate-reviewer — state=active but last_active silent past
+    FROZEN_KILL_SECS. This is the gap reap_hung_runs (FIX 1) can't see: a frozen
+    reviewer reads active, so hung_run_verdict returns skip:reviewer-active and the
+    run is KEPT; meanwhile the dispatcher's ga-q8tmn re-convene runs out of respawn
+    budget (2) and waits the full 45m outer timeout — the exact 90-min stall the Mayor
+    cleared by hand (2026-07-02: 6ohacd silent 34m, queue starved to 531m). `gc session
+    kill` makes the reconciler revive the reviewer in place. SUSTAINED-confirmed (a
+    reviewer mid-think that resumes between samples is never killed) + bounded +
+    dry-run-aware + fully fail-safe (unparseable/future/fresh last_active → never
+    killed; a gc/Dolt outage returns sessions=None → skip)."""
+    if not GRW_ENABLED or not GRW_REAP_FROZEN_ENABLED:
+        return
+    if sessions is None:
+        return  # cannot verify liveness → fail-safe skip (never a blind kill)
+    # candidates: active gate-reviewer sessions silent past the threshold
+    cand = []
+    for s in sessions:
+        if s.get("template") != "gate-reviewer" or s.get("closed"):
+            continue
+        la = _last_active_epoch(s.get("last_active"))
+        if la is None:
+            continue
+        silence = int(now - la)
+        if frozen_reviewer_verdict(s.get("state"), silence, FROZEN_KILL_SECS) == "kill":
+            cand.append((s.get("id"), s.get("last_active"), silence))
+    if not cand:
+        return
+    # SUSTAINED confirm: re-sample after a gap. A reviewer whose last_active ADVANCED
+    # (it was mid-think, not wedged) is dropped — only STILL-silent sessions are killed.
+    time.sleep(LIVENESS_RESAMPLE_SEC)
+    s2 = _session_list_json()
+    idx2 = {str(s.get("id")): s for s in s2} if s2 else None
+    killed = 0
+    for sid, la_iso, silence in cand:
+        if killed >= FROZEN_KILL_MAX_PER_SWEEP:
+            break
+        if not sid:
+            continue
+        if idx2 is not None:
+            s = idx2.get(str(sid))
+            if s is None:
+                continue  # session gone on its own (reconciler/dispatcher acted) → done
+            la2 = _last_active_epoch(s.get("last_active"))
+            now2 = time.time()
+            if frozen_reviewer_verdict(s.get("state"),
+                                       (int(now2 - la2) if la2 is not None else None),
+                                       FROZEN_KILL_SECS) != "kill":
+                print("[watchdog] frozen-reviewer %s RESUMED/changed on resample — NOT killing (fail-safe)" % sid, flush=True)
+                continue
+        if GRW_DRY_RUN:
+            print("[watchdog] FROZEN DRY-RUN would kill reviewer %s (last_active=%s, silent %dm) → reconciler revives fresh"
+                  % (sid, la_iso, silence // 60), flush=True)
+            _recovery_ledger("would_kill_frozen_reviewer",
+                             {"session": sid, "last_active": la_iso, "silent_min": silence // 60, "dry_run": True})
+            killed += 1
+            continue
+        sh(["gc", "session", "kill", sid], timeout=20)
+        _recovery_ledger("kill_frozen_reviewer",
+                         {"session": sid, "last_active": la_iso, "silent_min": silence // 60})
+        notify("Gate self-heal: revisor CONGELADO morto (%s, %dmin sem atividade, active-mas-mudo) — reconciler sobe fresco. Você não precisa agir."
+               % (sid, silence // 60), 3)
+        print("[watchdog] KILLED frozen reviewer %s (last_active=%s, silent %dm) — reconciler revives fresh (grw FIX3 frozen-reviewer self-heal)"
+              % (sid, la_iso, silence // 60), flush=True)
+        killed += 1
+    if killed:
+        print("[watchdog] frozen-reviewer sweep: %d killed%s" % (killed, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
+
+
 def _open_error_markers():
     """[marker dicts] type:quality-gate-marker + gate-status:error + open, in HQ (the
     dispatcher's domain — it only re-processes HQ queued markers). None on query
@@ -1612,10 +1727,11 @@ def main():
         "on gate-down OR pilot-jam OR head-of-line block OR supervisor init-failure OR orphaned queued marker"
         % (MAX_ACTIVE_REPAIR_DOGS, MAX_SPAWNS_PER_CONDITION, GRW_ENABLED, GRW_DRY_RUN), flush=True)
   print("[watchdog] + DIRECT self-heal each sweep: reap HUNG reviewers (run>%dm, 0 verdicts, dead reviewer sustained; enabled=%s) "
+        "AND kill FROZEN reviewers (active-but-last_active-silent>%ds, cap %d/sweep, sustained-confirmed; enabled=%s) "
         "AND auto-requeue STUCK gate-status:error markers (>%dm in error, cap %d/sweep, osc-escalate after %d; enabled=%s). "
-        "Both bounded + fail-safe + dry_run=%s."
-        % (REVIEW_HANG_MINUTES, GRW_REAP_HUNG_ENABLED, ERROR_REQUEUE_MINUTES,
-           ERROR_REQUEUE_MAX_PER_SWEEP, ERROR_REQUEUE_MAX_ATTEMPTS, GRW_REQUEUE_ERROR_ENABLED, GRW_DRY_RUN), flush=True)
+        "All bounded + fail-safe + dry_run=%s."
+        % (REVIEW_HANG_MINUTES, GRW_REAP_HUNG_ENABLED, FROZEN_KILL_SECS, FROZEN_KILL_MAX_PER_SWEEP, GRW_REAP_FROZEN_ENABLED,
+           ERROR_REQUEUE_MINUTES, ERROR_REQUEUE_MAX_PER_SWEEP, ERROR_REQUEUE_MAX_ATTEMPTS, GRW_REQUEUE_ERROR_ENABLED, GRW_DRY_RUN), flush=True)
 
   while True:
     try:
@@ -1633,6 +1749,10 @@ def main():
             reap_hung_runs(sessions, now, rstate)
         except Exception as e:
             print("[watchdog] reap_hung_runs error (continuing): %r" % e, flush=True)
+        try:
+            reap_frozen_reviewers(sessions, now)
+        except Exception as e:
+            print("[watchdog] reap_frozen_reviewers error (continuing): %r" % e, flush=True)
         try:
             requeue_error_markers(now, rstate)
         except Exception as e:
@@ -1732,5 +1852,33 @@ def main():
     time.sleep(POLL_SEC)
 
 
+def _selftest():
+    """Pure-logic regression checks for FIX 3 (no I/O). Run: --selftest."""
+    p = f = 0
+    def ok(c, m):
+        nonlocal p, f
+        if c: p += 1; print("  ✓", m)
+        else: f += 1; print("  ✗", m)
+    # frozen_reviewer_verdict — the kill/keep core
+    ok(frozen_reviewer_verdict("active", 900, 900) == "kill", "active + silent==threshold → kill")
+    ok(frozen_reviewer_verdict("active", 2040, 900) == "kill", "active + silent 34m (the live incident) → kill")
+    ok(frozen_reviewer_verdict("active", 300, 900) == "keep", "active + silent 5m (< threshold) → keep")
+    ok(frozen_reviewer_verdict("asleep", 5000, 900) == "keep", "non-active state → keep (hung-run reaper/dispatcher own it)")
+    ok(frozen_reviewer_verdict("active", None, 900) == "keep", "unparseable silence → keep (fail-safe)")
+    ok(frozen_reviewer_verdict("active", -10, 900) == "keep", "future last_active (negative silence) → keep (fail-safe)")
+    ok(frozen_reviewer_verdict("", 5000, 900) == "keep", "empty state → keep")
+    # _last_active_epoch — must parse the tz-OFFSET form (session JSON), not just UTC-Z
+    ok(_last_active_epoch("2026-07-02T16:06:29-03:00") is not None, "tz-offset last_active parses (the session-JSON form)")
+    ok(_last_active_epoch("2026-07-02T19:06:29Z") is not None, "UTC-Z last_active parses too")
+    ok(_last_active_epoch("") is None and _last_active_epoch("garbage") is None, "empty/garbage → None (never frozen)")
+    # the two forms above name the SAME instant → equal epochs (offset math correct)
+    a = _last_active_epoch("2026-07-02T16:06:29-03:00"); b = _last_active_epoch("2026-07-02T19:06:29Z")
+    ok(a is not None and b is not None and abs(a - b) < 1, "-03:00 and its UTC-Z equivalent map to the same epoch")
+    print("gate-recovery-watchdog FIX3 selftest: PASS=%d FAIL=%d" % (p, f))
+    return 0 if f == 0 else 1
+
+
 if __name__ == "__main__":
+    if "--selftest" in _sys.argv:
+        _sys.exit(_selftest())
     main()
