@@ -62,7 +62,11 @@ Safety invariants (CRITICAL — actuates on real work beads):
   - NEVER reclaims beads with a gate-status:ready|dispatching|queued|claimed
     marker (bead is actively being processed by the gate pipeline; "ready" is
     the fresh-marker state /gate-done writes before a separate sweep promotes
-    it to queued, so it must count as active too — ga-cxzby).
+    it to queued, so it must count as active too — ga-cxzby). This also
+    protects the ORIGINAL bug/story of a sling-dispatched fix whose marker is
+    keyed on the SLING bead's id, not the original's — list_gate_active_
+    source_beads() resolves that back-reference from the sling's own title
+    (ga-lrglm).
   - ga-vw26y: the in_progress sweep is SCOPED to Pilot stories — a bead must
     carry a durable Pilot marker (pilot:dispatched or pilot:reclaim-count) and
     NO terminal/parked label (story:done, gate:passed, …) to qualify. Crew,
@@ -77,6 +81,7 @@ Safety invariants (CRITICAL — actuates on real work beads):
 """
 import json
 import os
+import re
 import subprocess
 import time
 import sys as _sys
@@ -686,6 +691,13 @@ def list_suspended_agents():
         return set()
 
 
+# ga-lrglm: matches the Pilot dispatch-title convention set in pilot-dispatcher.sh's
+# SLING_TITLE ("fix bug <ID>: ..." for bug/tech-debt, "build story <ID>: ..." for
+# feature/story), so a sling bead's own title can be resolved back to the ORIGINAL
+# bug/story it was dispatched to fix. See list_gate_active_source_beads() below.
+_SLING_TITLE_RE = re.compile(r'^(?:fix bug|build story)\s+(\S+):')
+
+
 def list_gate_active_source_beads():
     """Return set of source-bead IDs that currently have an active gate marker
     (gate-status:ready, dispatching, queued, or claimed).
@@ -694,6 +706,25 @@ def list_gate_active_source_beads():
     promotion to "queued" happens later via a separate sweep, so omitting
     "ready" opens a race window where a just-submitted fix's marker is
     invisible to this check (ga-cxzby).
+
+    ga-lrglm: a bug/story dispatched through the standard sling-task wrapper
+    ("fix bug <ID>: ..." / "build story <ID>: ...") gets its gate marker keyed
+    on the SLING bead's id (source-bead:<sling-id>), never the ORIGINAL bug's
+    id — so a plain `bead_id in <result>` membership check can never protect
+    the original bead while its sling sits queued/dispatching/claimed at the
+    gate, and this guard reclaims (re-dispatches) it out from under a fix
+    that's already built and sitting healthy at the gate. For each directly-
+    active source-bead this resolves ITS OWN title and parses the dispatch-
+    title convention back out; the referenced original bead is added to the
+    returned set alongside the sling bead itself. Resolving from the ACTIVE
+    MARKER side — not the bug's own pilot.sling_bead metadata, which is
+    single-valued and gets overwritten on every redispatch — keeps this
+    correct across multiple historical re-dispatches of the same bug:
+    whichever historical sling currently owns the live marker, its own title
+    alone resolves the original, no dispatch-history metadata required.
+    Title resolution is best-effort / fail-OPEN per lookup (a bd error or
+    unparseable title just skips that one back-reference); it never widens
+    the fail-safe contract below.
 
     Returns a frozenset, or None on error (fail-safe: caller treats None as unknown
     and skips the cycle rather than risking a false reclaim).
@@ -721,6 +752,26 @@ def list_gate_active_source_beads():
                         active_source_beads.add(lbl[len("source-bead:"):])
         except Exception:
             return None  # Any exception → fail-safe
+
+    # ga-lrglm: resolve sling → original-bug back-references. Best-effort/fail-open —
+    # a lookup failure here must never turn into a whole-cycle fail-safe skip; it just
+    # means this cycle stays as protective as it was before this back-reference existed.
+    if active_source_beads:
+        try:
+            result = subprocess.run(
+                ["bd", "show", *sorted(active_source_beads), "--json"],
+                capture_output=True, text=True, timeout=20)
+            if result.returncode == 0 and result.stdout.strip():
+                data = json.loads(result.stdout)
+                if isinstance(data, list):
+                    for b in data:
+                        title = b.get("title") or ""
+                        match = _SLING_TITLE_RE.match(title)
+                        if match:
+                            active_source_beads.add(match.group(1))
+        except Exception:
+            pass  # best-effort: keep the directly-active set as-is
+
     return frozenset(active_source_beads)
 
 
@@ -2036,6 +2087,165 @@ def _selftest():
     check("AZ-DUP: concrete_adhoc_session_is_live: dead first + live second → True (live successor wins; no false reclaim)",
           concrete_adhoc_session_is_live(
               "wa-worker-adhoc-dupbeef", _adhoc_dup_sessions, T_az))
+
+    # -----------------------------------------------------------------------
+    # Section 6: ga-lrglm — list_gate_active_source_beads() sling
+    # back-reference resolution (SB-*). Stubs subprocess.run to serve canned
+    # `bd list --label type:quality-gate-marker ...` and `bd show <ids>`
+    # responses; no real bd/network calls.
+    # -----------------------------------------------------------------------
+
+    _orig_run_sb = subprocess.run
+
+    def _stub_bd(markers_by_gatelbl, titles_by_id, list_fails=False, show_fails=False):
+        """Build a subprocess.run stub for list_gate_active_source_beads().
+
+        markers_by_gatelbl: {gate_lbl: [[marker_labels...], ...]} — for each
+          gate-status label queried, the marker beads (each a list of its own
+          labels) to return.
+        titles_by_id: {bead_id: title} — canned `bd show` response titles.
+        """
+        class _R:
+            def __init__(self, rc, out):
+                self.returncode = rc
+                self.stdout = out
+                self.stderr = ""
+
+        def _run(cmd, **kw):
+            if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == "bd" and cmd[1] == "list":
+                if list_fails:
+                    # rc=0 + unparseable stdout — a bare non-zero exit is deliberately
+                    # NOT fail-safe here (existing contract: "no beads matching this
+                    # label combo is not an error" — see SB-7b). Only a genuine
+                    # exception (bad JSON) or a non-list payload trips the fail-safe.
+                    return _R(0, "{not valid json")
+                # cmd shape: ["bd","list","--label","type:quality-gate-marker","--label",gate_lbl,"--json"]
+                gate_lbl = cmd[5] if len(cmd) > 5 else ""
+                markers = markers_by_gatelbl.get(gate_lbl, [])
+                payload = [{"id": f"marker-{i}", "labels": lbls} for i, lbls in enumerate(markers)]
+                return _R(0, json.dumps(payload))
+            if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == "bd" and cmd[1] == "show":
+                if show_fails:
+                    return _R(1, "")
+                ids = [a for a in cmd[2:] if a != "--json"]
+                payload = [{"id": i, "title": titles_by_id.get(i, "")} for i in ids]
+                return _R(0, json.dumps(payload))
+            return _R(0, "")
+        return _run
+
+    try:
+        # --- SB-1: no active markers at all → empty set (and no back-ref lookup needed) ---
+        subprocess.run = _stub_bd({}, {})
+        _sb1 = list_gate_active_source_beads()
+        check("SB-1: no active markers → empty frozenset",
+              _sb1 == frozenset(), f"got={_sb1!r}")
+
+        # --- SB-2: direct source-bead whose title does NOT follow the sling
+        # convention (e.g. a rig-native bug bead) → only itself in the set ---
+        subprocess.run = _stub_bd(
+            {"gate-status:queued": [["source-bead:ga-native1", "type:quality-gate-marker"]]},
+            {"ga-native1": "some rig-native title with no sling convention"},
+        )
+        _sb2 = list_gate_active_source_beads()
+        check("SB-2: non-sling source-bead → set contains only itself (no spurious back-ref)",
+              _sb2 == frozenset({"ga-native1"}), f"got={_sb2!r}")
+
+        # --- SB-3: sling-dispatched fix ("fix bug X: ...") → set contains BOTH
+        # the sling bead AND the original bug it names ---
+        subprocess.run = _stub_bd(
+            {"gate-status:queued": [["source-bead:ga-djjeq", "type:quality-gate-marker"]]},
+            {"ga-djjeq": "fix bug ga-d2jil: Pilot NEVERSTARTED gate-marker guard checks..."},
+        )
+        _sb3 = list_gate_active_source_beads()
+        check("SB-3: sling 'fix bug' title → set contains sling id AND original bug id",
+              _sb3 == frozenset({"ga-djjeq", "ga-d2jil"}), f"got={_sb3!r}")
+
+        # --- SB-4: 'build story' convention (feature/story tier) also resolves ---
+        subprocess.run = _stub_bd(
+            {"gate-status:ready": [["source-bead:ga-slingA", "type:quality-gate-marker"]]},
+            {"ga-slingA": "build story ga-storyX: Add the frobnicator widget"},
+        )
+        _sb4 = list_gate_active_source_beads()
+        check("SB-4: sling 'build story' title → set contains sling id AND original story id",
+              _sb4 == frozenset({"ga-slingA", "ga-storyX"}), f"got={_sb4!r}")
+
+        # --- SB-5: multi-redispatch robustness (ga-d2jil's real 4-dispatch chain).
+        # Only the FIRST historical sling (ga-djjeq) still has an active marker;
+        # the bug's OWN pilot.sling_bead metadata would by now point at a LATER
+        # sling (ga-7q8x1) that has no marker at all. Resolution must succeed
+        # from ga-djjeq's title alone — it never reads pilot.sling_bead. ---
+        subprocess.run = _stub_bd(
+            {"gate-status:queued": [["source-bead:ga-djjeq", "type:quality-gate-marker"]]},
+            {"ga-djjeq": "fix bug ga-d2jil: Pilot NEVERSTARTED gate-marker guard..."},
+            # Deliberately no entry for ga-7q8x1 — proves resolution doesn't need it.
+        )
+        _sb5 = list_gate_active_source_beads()
+        check("SB-5: multi-redispatch — 1st-of-4 sling still resolves original bug (metadata-independent)",
+              "ga-d2jil" in _sb5 and "ga-djjeq" in _sb5, f"got={_sb5!r}")
+
+        # --- SB-6: bd-show (title-resolution) failure → fail-OPEN, keeps the
+        # directly-active set, does NOT collapse the whole cycle to None ---
+        subprocess.run = _stub_bd(
+            {"gate-status:queued": [["source-bead:ga-djjeq", "type:quality-gate-marker"]]},
+            {}, show_fails=True,
+        )
+        _sb6 = list_gate_active_source_beads()
+        check("SB-6: bd-show failure during back-ref resolution → fail-OPEN (direct set preserved, not None)",
+              _sb6 == frozenset({"ga-djjeq"}), f"got={_sb6!r}")
+
+        # --- SB-7: bd-list returning unparseable JSON → fail-SAFE, whole cycle → None
+        # (pre-existing contract; regression check — the back-ref addition must not
+        # weaken it) ---
+        subprocess.run = _stub_bd({}, {}, list_fails=True)
+        _sb7 = list_gate_active_source_beads()
+        check("SB-7: bd-list unparseable JSON → fail-SAFE None (pre-existing contract unchanged)",
+              _sb7 is None, f"got={_sb7!r}")
+
+        # --- SB-7b: bd-list non-zero exit (e.g. "no beads matched") is deliberately
+        # NOT a failure — pre-existing contract, regression check. active_source_beads
+        # stays empty in this case, so bd show is never invoked either. ---
+        def _stub_bd_nonzero(cmd, **kw):
+            class _RC:
+                returncode = 1
+                stdout = ""
+                stderr = ""
+            return _RC()
+        subprocess.run = _stub_bd_nonzero
+        _sb7b = list_gate_active_source_beads()
+        check("SB-7b: bd-list non-zero exit → treated as empty, NOT fail-safe (pre-existing contract)",
+              _sb7b == frozenset(), f"got={_sb7b!r}")
+
+        # --- SB-8: multiple active markers, only SOME are slings → mixed
+        # resolution (direct ids + resolved back-refs, no cross-contamination) ---
+        subprocess.run = _stub_bd(
+            {
+                "gate-status:queued": [
+                    ["source-bead:ga-djjeq", "type:quality-gate-marker"],
+                    ["source-bead:ga-native1", "type:quality-gate-marker"],
+                ],
+            },
+            {
+                "ga-djjeq": "fix bug ga-d2jil: ...",
+                "ga-native1": "a directly-dispatched bead, no sling wrapper",
+            },
+        )
+        _sb8 = list_gate_active_source_beads()
+        check("SB-8: mixed direct + sling markers → union is correct, no cross-contamination",
+              _sb8 == frozenset({"ga-djjeq", "ga-d2jil", "ga-native1"}), f"got={_sb8!r}")
+    finally:
+        subprocess.run = _orig_run_sb
+
+    # --- SB-9: _SLING_TITLE_RE pure-regex edge cases (no subprocess involved) ---
+    check("SB-9a: 'fix bug' matches and captures id up to colon",
+          bool(_SLING_TITLE_RE.match("fix bug ga-abc12: some title")) and
+          _SLING_TITLE_RE.match("fix bug ga-abc12: some title").group(1) == "ga-abc12")
+    check("SB-9b: 'build story' matches and captures id up to colon",
+          bool(_SLING_TITLE_RE.match("build story wa-xyz9: some title")) and
+          _SLING_TITLE_RE.match("build story wa-xyz9: some title").group(1) == "wa-xyz9")
+    check("SB-9c: unrelated title does not match",
+          _SLING_TITLE_RE.match("investigate: something weird happened") is None)
+    check("SB-9d: title missing the colon separator does not match",
+          _SLING_TITLE_RE.match("fix bug ga-abc12 no colon here") is None)
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0
