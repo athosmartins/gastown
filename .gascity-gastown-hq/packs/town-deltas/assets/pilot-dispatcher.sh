@@ -2404,7 +2404,10 @@ _ownership_guard_should_refuse() {
 # _neverstarted_recover_db <db_path> <now_epoch> — scan one DB for never-started
 # in-flight beads and release them. Decision rules (ALL must hold to release):
 #   - has story:in-flight AND pilot:dispatched (query selects both)
-#   - NO gate:* label (any gate marker = it reached the gate = it was built)
+#   - NO gate:* label on this bead OR its recorded pilot.sling_bead (any gate
+#       marker = the work reached the gate = it was built; ga-d2jil: Pilot's
+#       "fix bug"/"build story" sling-task dispatch writes gate:* onto the SLING
+#       bead, never mirrored back onto this one, so both must be checked)
 #   - pilot.dispatched_at present AND age > threshold (missing stamp → stamp NOW,
 #       never release on first sight — the ga-2azzj Defect-A discipline)
 #   - NO live worker: a recorded pilot.sling_bead whose assignee is a live session
@@ -2423,13 +2426,14 @@ _neverstarted_recover_db() {
   [ "${_count:-0}" -le "0" ] 2>/dev/null && return 0
 
   echo "$_json" | jq -c '.[]' | while IFS= read -r _bead; do
-    local _bid _labels _stamp _age _sling _asg _crew_owner
+    local _bid _labels _stamp _age _sling _sling_json _sling_labels _asg _crew_owner
     _bid=$(echo "$_bead" | jq -r '.id // ""' 2>/dev/null || echo "")
     [ -z "$_bid" ] && continue
     _labels=$(echo "$_bead" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
 
     # gate-marker guard — any gate:* label (comma-framed so "investigate:" can't
-    # false-match) means the bead was built and reached the gate. KEEP.
+    # false-match) means the bead was built and reached the gate. KEEP. (The
+    # sling/task bead's OWN labels are checked separately below — ga-d2jil.)
     case ",$_labels," in *,gate:*) continue ;; esac
 
     # stamp/age guard (Defect-A discipline) — never updated_at, never first-sight.
@@ -2445,11 +2449,18 @@ _neverstarted_recover_db() {
     fi
 
     # live-worker guard — a sling whose assignee is a live session = active build.
+    # ga-d2jil: ALSO check the sling/task bead's OWN labels for gate:* here. Pilot's
+    # "fix bug"/"build story" sling-task dispatch shape writes the gate:* progress
+    # label onto the SLING bead (e.g. ga-vi7z2), never mirrored back onto this
+    # story/bug bead — so the gate-marker guard above is structurally blind to it.
+    # Label reads are always trustworthy (unlike the session-roster liveness check
+    # below), so this fires regardless of _DEADWORKER_OK: an adhoc dog builder that
+    # FINISHED and drain-acked is CORRECTLY reported not-live by
+    # _session_is_live_builder (an adhoc worker never resumes), which would
+    # otherwise let a bead that already reached the gate fall through to release
+    # (root cause of the ga-tgo7q double-dispatch incident).
     _sling=$(echo "$_bead" | jq -r '.metadata["pilot.sling_bead"] // ""' 2>/dev/null || echo "")
     if [ -n "$_sling" ]; then
-      if [ "${_DEADWORKER_OK:-0}" != "1" ]; then
-        continue   # roster untrustworthy → cannot prove worker dead → KEEP.
-      fi
       # ga-mfeip cross-DB fix: a self-referential sling (pilot.sling_bead == bead id) is the
       # routed-pool pattern — the "sling" IS the rig-native bead, living in $_db (the rig DB),
       # NOT in HQ ($GC_CITY). Reading it from $GC_CITY returns a null assignee → false
@@ -2457,8 +2468,16 @@ _neverstarted_recover_db() {
       # branch yet (>thresh, no gate label). Read the sling from the bead's own DB.
       local _sling_db="$GC_CITY"
       [ "$_sling" = "$_bid" ] && _sling_db="$_db"
-      _asg=$(bd -C "$_sling_db" show "$_sling" --json 2>/dev/null \
-        | jq -r 'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null || echo "")
+      _sling_json=$(bd -C "$_sling_db" show "$_sling" --json 2>/dev/null \
+        | jq -c 'if type=="array" then .[0] else . end' 2>/dev/null || echo "null")
+
+      _sling_labels=$(echo "$_sling_json" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
+      case ",$_sling_labels," in *,gate:*) continue ;; esac
+
+      if [ "${_DEADWORKER_OK:-0}" != "1" ]; then
+        continue   # roster untrustworthy → cannot prove worker dead → KEEP.
+      fi
+      _asg=$(echo "$_sling_json" | jq -r '(.assignee // "")' 2>/dev/null || echo "")
       if [ -n "$_asg" ] && _session_is_live_builder "$_asg"; then
         continue   # worker actively building → not never-started (asleep adhoc = drained/dead).
       fi

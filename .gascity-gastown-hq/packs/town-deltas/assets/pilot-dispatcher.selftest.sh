@@ -179,6 +179,13 @@ case "$args" in
         if [ -n "${FAKE_SLING_ASSIGNEES:-}" ]; then
           asg=$(printf '%s' "$FAKE_SLING_ASSIGNEES" | jq -r --arg id "$id" '.[$id] // ""' 2>/dev/null || echo "")
         fi
+        # ga-d2jil: the sling gate-marker guard checks the sling/task bead's OWN
+        # labels for gate:*. FAKE_SLING_LABELS is a JSON map {"<slingid>":"<label>", …}
+        # (single extra label per id, folded into the same labels array as above).
+        if [ -n "${FAKE_SLING_LABELS:-}" ]; then
+          extra=$(printf '%s' "$FAKE_SLING_LABELS" | jq -r --arg id "$id" '.[$id] // ""' 2>/dev/null || echo "")
+          [ -n "$extra" ] && lbls="${lbls:+$lbls,}\"$extra\""
+        fi
         printf '{"id":"%s","status":"%s","assignee":"%s","labels":[%s]}' "$id" "$st" "$asg" "$lbls" ;;
     esac ;;
   *"-l ctx:ready"*)
@@ -385,6 +392,7 @@ run_step0() { # FAKE_STALE_JSON
 #   $5 = PILOT_TEST_CREW_PROGRESSED     (crews treated as "progressed" for owner-grace)
 #   $6 = PILOT_TEST_CREW_BRANCH_BEADS   (space-list of ids with a crew/<crew>/<id> branch — _beadid_has_crew_branch seam)
 #   $7 = PILOT_TEST_PHANTOM_STALE_BEADS (space-list of ids treated as stale >45min — phantom guard seam)
+#   $8 = FAKE_SLING_LABELS              (sling→extra-label map — ga-d2jil sling gate-marker guard seam)
 run_neverstarted() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   reset_state
@@ -401,6 +409,7 @@ run_neverstarted() {
     FAKE_SLING_ASSIGNEES="${4:-}" \
     PILOT_TEST_CREW_PROGRESSED="${5:-}" \
     PILOT_TEST_CREW_BRANCH_BEADS="${6:-}" \
+    FAKE_SLING_LABELS="${8:-}" \
     PILOT_TEST_PHANTOM_STALE_BEADS="${7:-}" \
     FAKE_BLOCKED_IDS="" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
@@ -3326,6 +3335,45 @@ echo "Scenario 16v: phantom-guard structural — knob and test seam wired"
 has "$DISPATCHER" 'PILOT_PHANTOM_STALE_SECS'             "phantom staleness knob defined (default 2700 = 45min)"
 has "$DISPATCHER" 'PILOT_TEST_PHANTOM_STALE_BEADS'       "phantom staleness test seam wired"
 has "$DISPATCHER" 'phantom: stale.*no branch'            "phantom-guard release path has identifying log/comment"
+
+# ── Scenario 16w–16y: sling gate-marker guard (ga-d2jil) ─────────────────────
+# The "fix bug"/"build story" sling-task dispatch shape writes progress labels
+# (gate:reviewing, gate:needs-fix, …) onto the SLING/TASK bead, never mirrored
+# back onto the story/bug bead evaluated here. A dog builder that FINISHED and
+# submitted to the gate then drain-acks — _session_is_live_builder CORRECTLY
+# reports it as not-live (an adhoc worker never resumes) — so absent this guard
+# the already-gated bead falls through 16f's dead-worker path and gets
+# released, triggering a fully redundant second dispatch (root cause of the
+# live ga-tgo7q double-dispatch incident, 2026-07-02).
+
+# 16w: sling assignee looks dead (same shape as 16f) BUT the sling carries a
+# gate:* label → KEEP. This is the exact incident shape: trustworthy roster,
+# provably-not-live builder, work already at the gate.
+echo "Scenario 16w: ga-d2jil — a sling carrying a gate:* label protects the bead even with a dead-looking builder session"
+NS_ATGATE='[{"id":"tt-ns-atgate","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-atgate"}}]'
+LOG16W="$(run_neverstarted "$NS_ATGATE" "" "$NS_SESS" '{"tt-sling-atgate":"ghost-wa"}' "" "" "" '{"tt-sling-atgate":"gate:reviewing"}')"
+if echo "$LOG16W" | grep -q "releasing never-started in-flight bead tt-ns-atgate"; then
+  bad "REGRESSION (ga-d2jil): released a bead whose SLING carries a gate:* label (already reached the gate — false double-dispatch)"
+else
+  ok "bead kept when its sling/task carries a gate:* label, even with a provably-dead builder session (ga-d2jil)"
+fi
+
+# 16x: control — identical dead-worker shape to 16f, but with NO sling label at
+# all → still RELEASE. Proves 16w's protection comes from the label, not merely
+# from fetching sling JSON, and that 16f's original behavior is unchanged.
+echo "Scenario 16x: ga-d2jil control — dead-worker sling with NO gate label still releases (16f unchanged)"
+NS_DEAD2='[{"id":"tt-ns-dead2","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-dead2"}}]'
+LOG16X="$(run_neverstarted "$NS_DEAD2" "" "$NS_SESS" '{"tt-sling-dead2":"ghost-wa"}')"
+if echo "$LOG16X" | grep -q "releasing never-started in-flight bead tt-ns-dead2"; then
+  ok "control: dead-worker sling with no gate label still releases (ga-d2jil did not weaken 16f)"
+else
+  bad "REGRESSION (ga-d2jil control): a dead-worker sling with NO gate label was kept (over-protection introduced)"
+fi
+
+# 16y: structural — the sling gate-marker guard is wired.
+echo "Scenario 16y: ga-d2jil structural — sling gate-marker guard wired"
+has "$DISPATCHER" 'case ",\$_sling_labels," in \*,gate:\*\) continue' \
+  "sling gate-marker guard checks the sling/task bead's own labels for gate:* (ga-d2jil)"
 
 # ── Scenario PS-WORKER: ps-worker ephemeral pool routing (ga-mfeip mirror) ───
 # A ps-* rig-native story:approved bead must route to ps-worker (NOT batista-ps).
