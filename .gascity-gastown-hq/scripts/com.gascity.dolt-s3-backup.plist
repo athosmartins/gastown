@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.dolt-s3-backup</string>
+
+  <!-- OFF-BOX (S3) backup of the city's Dolt bead stores — the data-safety gap gc doctor
+       flagged (no off-box backup of the sensitive debt/CPF beads). Backs up ALL databases
+       on the Dolt server (hq + every rig) via native DOLT_BACKUP -> local .dolt-backup
+       staging (incremental; also what gc doctor checks) -> aws s3 sync to the private,
+       versioned, encrypted bucket urblink-dolt-backups. READ + export only: never stops/
+       restarts Dolt, never touches a live .dolt. Daily at 04:00. Reads the Dolt port from
+       gc's dolt-config.yaml each run (never hardcoded). Silent on success; notifies via
+       `notify` only on failure. See scripts/dolt-s3-backup.sh for the verified restore
+       procedure. -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/dolt-s3-backup.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>4</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-s3-backup-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-s3-backup-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+  </dict>
+</dict>
+</plist>
