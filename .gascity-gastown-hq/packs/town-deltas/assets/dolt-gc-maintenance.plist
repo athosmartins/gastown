@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.dolt-gc-maintenance</string>
+
+  <!-- Keeps the hq beads Dolt store lean. THREE layers (see the script header):
+        1. ephemeral PURGE  (always)   — closed ephemeral beads, every cycle.
+        2. non-ephemeral PRUNE (opt-in: PRUNE_ENABLED=1) — closed non-ephemeral beads
+           older than PRUNE_KEEP_DAYS. Fixes the 2026-07-02 gate stall (hq.wisps bloated
+           to 37,810 rows → Dolt CPU ~194% → gate stalled 20+ min). DEFAULT OFF.
+        3. online GC (always, size-gated) + weekly FLATTEN (opt-in, DEFAULT OFF).
+       History-bloat left unchecked reaches 6.3G and destabilizes Dolt (the 2026-06-07
+       outage root cause). Runs every 2h; gc's only when hq >= 1GB (online, ~20s, safe;
+       2h/1GB tightened from 6h/2GB on 2026-06-11, ga-ftmci). Silent on success; notifies
+       only on failure. ENABLE prune/flatten via the LOCAL gitignored toggle
+       .gc/config/dolt-maintenance.env (PRUNE_ENABLED=1) — no reload; see script header. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/dolt-gc-maintenance.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <!-- 7200 = every 2h. Matches the deployed ~/Library/LaunchAgents copy; do NOT regress
+       to 21600 (6h) — the 2h cadence is the ga-ftmci fix (store crosses 1GB in 3-4h). -->
+  <key>StartInterval</key><integer>7200</integer>
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-gc-maintenance-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-gc-maintenance-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+  </dict>
+</dict>
+</plist>
