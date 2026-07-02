@@ -67,12 +67,13 @@ bd list --status open --updated-before "$(date -v-3d +%Y-%m-%d)" --limit 20
 ### 4. Tmux session hygiene
 
 ```bash
-tmux -L gt-fc02b7 list-sessions
+tmux_socket="${GT_TMUX_SOCKET:-$(basename "${TMUX%%,*}")}"
+tmux -L "$tmux_socket" list-sessions
 ```
 
 Para cada sessão suspeita (não-padrão como zzor-*, *-witness órfão sem rig correspondente):
 ```bash
-tmux -L gt-fc02b7 capture-pane -t <session> -p | tail -5
+tmux -L "$tmux_socket" capture-pane -t <session> -p | tail -5
 ```
 "Pane is dead" → kill.
 

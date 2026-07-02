@@ -54,7 +54,7 @@ Se `diff` é apenas submodule pointers e age > 1d → `git -C "$d" branch -D "$b
 #### 2c. Tarballs antigos /tmp
 
 ```bash
-find /tmp -name "*reset*.tar.gz" -o -name "*backup*.tar.gz" -o -name "*.patch" -mtime +3 2>/dev/null
+find /tmp \( -name "*reset*.tar.gz" -o -name "*backup*.tar.gz" -o -name "*.patch" \) -mtime +3 2>/dev/null
 ```
 
 Para cada um: verificar se algum bead aberto referencia o patch/backup. Se não → delete.
