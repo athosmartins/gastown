@@ -52,16 +52,33 @@
 set -uo pipefail
 
 # ── config ────────────────────────────────────────────────────────────────────
-# Timeout for `gc dolt health --json`. The task spec says "5s timeout — NOT a bd query".
-# In practice gc dolt health --json takes ~6s on a healthy Dolt (startup overhead), so
-# we default to 8s. A true hang returns exit 124 (treated as unhealthy). Override via
-# GC_DOLT_PROBE_TIMEOUT. The existing dolt-hang-watchdog.sh uses 12s; we use 8s as a
-# compromise between task spec (5s) and observed healthy latency (~6s).
-_GC_DOLT_PROBE_TIMEOUT="${GC_DOLT_PROBE_TIMEOUT:-8}"          # hard probe timeout (sec)
+# Timeout for `gc dolt health --json`. In practice the command takes ~4-6s on a healthy
+# Dolt (process startup overhead) and MORE under a CPU burst — measured ~10s during a
+# ~200% CPU spike. An 8s timeout made a slow-but-ALIVE Dolt miss the deadline → exit 124
+# → miscounted as "unhealthy" → false "Dolt UNREACHABLE" pages. We now default to 12s
+# (matches dolt-hang-watchdog.sh PROBE_TIMEOUT) so a saturated-but-serving Dolt still
+# answers within one probe. Override via GC_DOLT_PROBE_TIMEOUT.
+_GC_DOLT_PROBE_TIMEOUT="${GC_DOLT_PROBE_TIMEOUT:-12}"         # hard probe timeout (sec)
 _GC_DOLT_PROBE_GC="${GC_BIN:-gc}"
 _GC_DOLT_PROBE_CITY="${GC_CITY:-/Users/athos/gt/.gascity-gastown-hq}"
 # Sentinel: goroutine dump is idempotent within a launchd invocation (cleared by launchd on next run)
 _GC_DOLT_PROBE_DUMP_SENTINEL="${GC_DOLT_PROBE_DUMP_SENTINEL:-/tmp/gc-dolt-probe-goroutine-dumped}"
+
+# ── robust-probe config (transient-resistant reachability, gc-dolt-probe --robust) ──
+# The single-shot gc_dolt_probe conflates a CPU-burst timeout (slow-but-alive) with a
+# real outage. gc_dolt_probe_robust adds two guards so a transient burst never reads as
+# "unreachable" while a SUSTAINED outage still does:
+#   1. RETRY the health probe up to N times with a short backoff — a slow response that
+#      succeeds on a later attempt reads as UP (a burst is seconds; the retry outlasts it).
+#   2. SELECT-1 SERVE-CONFIRM fallback — if every health attempt fails, do a raw SELECT 1
+#      against the live Dolt port. If Dolt SERVES it (even slowly), the health-probe
+#      timeout was SATURATION, not an outage → still UP. Only health-fail + SELECT-1-refused
+#      is a genuine outage. (Same discriminator dolt-hang-watchdog.sh uses to avoid
+#      false-restarts on Dolt-CPU spikes.)
+_GC_DOLT_PROBE_RETRIES="${GC_DOLT_PROBE_RETRIES:-3}"          # health-probe attempts per sweep
+_GC_DOLT_PROBE_RETRY_SLEEP="${GC_DOLT_PROBE_RETRY_SLEEP:-2}"  # backoff between attempts (sec)
+_GC_DOLT_SERVE_CONFIRM_TIMEOUT="${GC_DOLT_SERVE_CONFIRM_TIMEOUT:-12}"  # SELECT 1 hard timeout (sec)
+_GC_DOLT_PORT="${BEADS_DOLT_PORT:-52756}"                     # live Dolt server port
 
 # ── internal helpers ──────────────────────────────────────────────────────────
 _gc_dolt_ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -111,6 +128,64 @@ gc_dolt_probe() {
   else
     return 1   # reachable=false → unhealthy
   fi
+}
+
+# ── serve-confirm: raw SELECT 1 (slow-vs-down discriminator) ──────────────────
+# The AUTHORITATIVE "is Dolt up?" check: open a raw MySQL connection to the live Dolt
+# port and run SELECT 1. If it answers — even slowly — Dolt is ALIVE and the health-probe
+# timeout was mere saturation, NOT an outage. Bounded by _GC_DOLT_SERVE_CONFIRM_TIMEOUT so
+# it can never itself hang. Read-only (SELECT 1); never calls bd/gc.
+# Returns: 0 = SERVED (Dolt UP) | 1 = refused / query hung (DOWN) | 2 = inconclusive
+#          (no MySQL client available → fail-open, do NOT treat as outage).
+_gc_dolt_serve_confirm() {
+  local rc
+  timeout "$_GC_DOLT_SERVE_CONFIRM_TIMEOUT" python3 - "$_GC_DOLT_PORT" <<'PY' 2>/dev/null
+import sys
+try:
+    import pymysql
+except Exception:
+    sys.exit(2)   # no client → inconclusive (fail-open, never a false outage)
+try:
+    c = pymysql.connect(host='127.0.0.1', port=int(sys.argv[1]), user='root', connect_timeout=8)
+    cur = c.cursor(); cur.execute('SELECT 1'); cur.fetchone()
+    c.close()
+    sys.exit(0)   # SELECT 1 served → Dolt is UP
+except Exception:
+    sys.exit(1)   # connection refused / query failed → DOWN
+PY
+  rc=$?
+  # timeout kill (rc=124): SELECT 1 could not return in time = unresponsive → DOWN candidate.
+  if [ "$rc" -eq 124 ]; then return 1; fi
+  return "$rc"
+}
+
+# ── public: gc_dolt_probe_robust ──────────────────────────────────────────────
+# Transient-resistant reachability verdict. Retries the health probe up to
+# _GC_DOLT_PROBE_RETRIES times with _GC_DOLT_PROBE_RETRY_SLEEP backoff, returning healthy
+# the instant ANY attempt succeeds (a burst-induced slow response that recovers on retry
+# reads as UP → never alarm). If every health attempt fails, falls back to the raw SELECT 1
+# serve-confirm: a served SELECT 1 means Dolt is UP (health probe was just saturated).
+# Only health-fail + SELECT-1-refused is a genuine outage.
+# Returns: 0 healthy | 1 unreachable (confirmed) | 2 unknown (fail-open).
+gc_dolt_probe_robust() {
+  local attempt rc=2
+  for attempt in $(seq 1 "$_GC_DOLT_PROBE_RETRIES"); do
+    gc_dolt_probe; rc=$?
+    if [ "$rc" -eq 0 ]; then
+      return 0   # healthy — Dolt answered (eventually-answers ⇒ UP)
+    fi
+    if [ "$attempt" -lt "$_GC_DOLT_PROBE_RETRIES" ]; then
+      sleep "$_GC_DOLT_PROBE_RETRY_SLEEP"
+    fi
+  done
+  # Every health attempt failed → authoritative slow-vs-down check via raw SELECT 1.
+  local serve_rc
+  _gc_dolt_serve_confirm; serve_rc=$?
+  case "$serve_rc" in
+    0) return 0 ;;   # SELECT 1 served → Dolt UP (health-probe timeout was saturation)
+    1) return 1 ;;   # SELECT 1 refused / hung → genuinely unreachable
+    *) return 2 ;;   # inconclusive (no client) → unknown, fail-open
+  esac
 }
 
 # ── public: gc_dolt_probe_json ────────────────────────────────────────────────
@@ -245,6 +320,15 @@ _gc_dolt_probe_main() {
       gc_dolt_probe_json
       return $?
       ;;
+    --robust)
+      gc_dolt_probe_robust
+      local rc=$?
+      case "$rc" in
+        0) echo "healthy"; exit 0 ;;
+        1) echo "unhealthy"; exit 1 ;;
+        2) echo "unknown"; exit 2 ;;
+      esac
+      ;;
     "")
       gc_dolt_probe
       local rc=$?
@@ -255,7 +339,7 @@ _gc_dolt_probe_main() {
       esac
       ;;
     *)
-      echo "Usage: gc-dolt-probe.sh [--json|--selftest]" >&2
+      echo "Usage: gc-dolt-probe.sh [--json|--robust|--selftest]" >&2
       exit 1
       ;;
   esac
@@ -437,6 +521,69 @@ GCEOF
       bad "T15-${stub_body:0:20}: probe_json emitted invalid JSON: $json_out"
     fi
   done
+
+  # ═══ ROBUST-PROBE TESTS (transient-resistance: retry + SELECT-1 serve-confirm) ═══
+  # These validate that a CPU-burst timeout NO LONGER reads as "unreachable" while a real
+  # outage still does. serve-confirm is stubbed per-case (bash function redefinition).
+  echo ""
+  echo "  -- robust-probe (retry + SELECT-1 serve-confirm) --"
+  _GC_DOLT_PROBE_RETRIES=3
+  _GC_DOLT_PROBE_RETRY_SLEEP=0     # no real backoff sleeps in tests
+  _GC_DOLT_PROBE_TIMEOUT=1         # short so the timeout case (R2) is quick
+
+  # --- R1: first health attempt healthy → robust rc=0 (serve-confirm NOT consulted) ---
+  cat > "$FAKE_GC" <<'GCEOF'
+#!/usr/bin/env bash
+echo '{"server":{"reachable":true,"latency_ms":40}}'
+exit 0
+GCEOF
+  _gc_dolt_serve_confirm() { return 1; }   # would say DOWN — must be ignored on the healthy path
+  gc_dolt_probe_robust; rc=$?
+  if [ "$rc" -eq 0 ]; then ok "R1: healthy first attempt → robust rc=0"; else bad "R1: expected rc=0, got $rc"; fi
+
+  # --- R2 (KEY): health TIMES OUT every attempt but SELECT 1 SERVES → robust rc=0 (UP) ---
+  # This is the exact CPU-burst false-alarm: gc dolt health exceeds the timeout, yet Dolt
+  # is alive and serves a raw SELECT 1. Old code counted this as "unhealthy"; robust = UP.
+  cat > "$FAKE_GC" <<'GCEOF'
+#!/usr/bin/env bash
+sleep 30
+GCEOF
+  _gc_dolt_serve_confirm() { return 0; }   # SELECT 1 served → Dolt UP
+  gc_dolt_probe_robust; rc=$?
+  if [ "$rc" -eq 0 ]; then ok "R2: health-timeout every attempt + SELECT-1 SERVES → robust rc=0 (saturation, NOT outage)"; else bad "R2: expected rc=0 (up via serve-confirm), got $rc"; fi
+
+  # --- R3: health fails every attempt AND SELECT 1 refused → robust rc=1 (real outage) ---
+  cat > "$FAKE_GC" <<'GCEOF'
+#!/usr/bin/env bash
+exit 1
+GCEOF
+  _gc_dolt_serve_confirm() { return 1; }   # SELECT 1 refused → DOWN
+  gc_dolt_probe_robust; rc=$?
+  if [ "$rc" -eq 1 ]; then ok "R3: health-fail + SELECT-1 refused → robust rc=1 (genuine outage)"; else bad "R3: expected rc=1, got $rc"; fi
+
+  # --- R4: health fails + serve-confirm inconclusive (no client) → robust rc=2 (fail-open) ---
+  _gc_dolt_serve_confirm() { return 2; }
+  gc_dolt_probe_robust; rc=$?
+  if [ "$rc" -eq 2 ]; then ok "R4: health-fail + serve-confirm inconclusive → robust rc=2 (fail-open)"; else bad "R4: expected rc=2, got $rc"; fi
+
+  # --- R5: unhealthy attempt 1, healthy attempt 2 → robust rc=0 via RETRY (serve-confirm skipped) ---
+  local R5_COUNTER R5_SERVE_MARKER
+  R5_COUNTER="$(mktemp)"; echo 0 > "$R5_COUNTER"
+  R5_SERVE_MARKER="$(mktemp -u)"
+  cat > "$FAKE_GC" <<GCEOF
+#!/usr/bin/env bash
+n=\$(( \$(cat "$R5_COUNTER") + 1 )); echo \$n > "$R5_COUNTER"
+if [ "\$n" -ge 2 ]; then echo '{"server":{"reachable":true,"latency_ms":40}}'; exit 0; fi
+exit 1
+GCEOF
+  eval "_gc_dolt_serve_confirm() { touch \"$R5_SERVE_MARKER\"; return 1; }"
+  gc_dolt_probe_robust; rc=$?
+  if [ "$rc" -eq 0 ] && [ ! -f "$R5_SERVE_MARKER" ]; then
+    ok "R5: unhealthy→healthy across retries → robust rc=0 via retry (serve-confirm skipped)"
+  else
+    bad "R5: expected rc=0 via retry + serve-confirm skipped; got rc=$rc serve_called=$([ -f "$R5_SERVE_MARKER" ] && echo yes || echo no)"
+  fi
+  rm -f "$R5_COUNTER" 2>/dev/null || true
 
   # Restore
   _GC_DOLT_PROBE_GC="$_saved_gc"

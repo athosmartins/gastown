@@ -93,6 +93,35 @@
     <!-- 6h cooldown: don't re-page while Mayor is already handling a prior alert -->
     <key>TSW_COOLDOWN_SEC</key>
     <string>21600</string>
+
+    <!-- ══ Dolt-health probe: transient-resistance (stop false "Dolt UNREACHABLE" pages) ══
+         The imp08 Dolt check calls `gc-dolt-probe.sh --robust`, which RETRIES the health
+         probe with backoff and, if all attempts fail, does a raw SELECT 1 serve-confirm.
+         A slow-but-alive Dolt (CPU burst) answers → reads healthy → never counts. Only a
+         SUSTAINED health-fail + SELECT-1-refused across TSW_DOLT_CONFIRM_SWEEPS consecutive
+         30-min sweeps (~90 min of continuous confirmed-down) pages. The dedicated
+         dolt-hang-watchdog.sh (every 60s) remains the FAST Dolt-outage detector. -->
+    <!-- Inner `gc dolt health --json` timeout (sec) — ~4-6s healthy, up to ~10s under CPU burst. -->
+    <key>GC_DOLT_PROBE_TIMEOUT</key>
+    <string>12</string>
+    <!-- Health-probe attempts per sweep before falling back to SELECT 1 serve-confirm. -->
+    <key>GC_DOLT_PROBE_RETRIES</key>
+    <string>3</string>
+    <!-- Backoff between health-probe attempts (sec). -->
+    <key>GC_DOLT_PROBE_RETRY_SLEEP</key>
+    <string>2</string>
+    <!-- Raw SELECT 1 serve-confirm hard timeout (sec). -->
+    <key>GC_DOLT_SERVE_CONFIRM_TIMEOUT</key>
+    <string>12</string>
+    <!-- OUTER subprocess bound for the whole robust probe (sec) — must exceed
+         RETRIES×GC_DOLT_PROBE_TIMEOUT + backoffs + serve-confirm (~52s worst case). -->
+    <key>TSW_DOLT_PROBE_TIMEOUT</key>
+    <string>90</string>
+    <!-- Consecutive fully-failed Dolt sweeps required before paging (raised 2→3 to kill
+         transient false alarms; a genuine outage still pages within ~90 min here). -->
+    <key>TSW_DOLT_CONFIRM_SWEEPS</key>
+    <string>3</string>
+
     <key>BD_ACTOR</key>
     <string>automation</string>
   </dict>

@@ -120,8 +120,21 @@ LOG_TAIL = int(os.environ.get("TSW_LOG_TAIL", "3000"))   # lines to tail from pi
 BLIND_SIGNAL_THRESHOLD = int(os.environ.get("TSW_BLIND_THRESHOLD", "2"))  # 2+ errors = blind
 BLIND_CONFIRM_SWEEPS = int(os.environ.get("TSW_BLIND_CONFIRM_SWEEPS", "2"))
 BLIND_COOLDOWN_SEC = int(os.environ.get("TSW_BLIND_COOLDOWN_SEC", "10800"))  # 3h cooldown
-DOLT_PROBE_TIMEOUT = int(os.environ.get("TSW_DOLT_PROBE_TIMEOUT", "10"))
-DOLT_CONFIRM_SWEEPS = int(os.environ.get("TSW_DOLT_CONFIRM_SWEEPS", "2"))
+# DOLT transient-resistance (fixes chronic false "Dolt UNREACHABLE" pages during CPU bursts):
+#   The Dolt reachability verdict now comes from `gc-dolt-probe.sh --robust`, which retries
+#   the health probe with backoff and, if every attempt fails, does a raw SELECT 1
+#   serve-confirm (see GC_DOLT_PROBE_RETRIES / GC_DOLT_PROBE_RETRY_SLEEP / GC_DOLT_PROBE_TIMEOUT
+#   / GC_DOLT_SERVE_CONFIRM_TIMEOUT in gc-dolt-probe.sh, set via the plist). A slow-but-alive
+#   Dolt therefore reads as rc=0 (healthy), never counting toward the escalation.
+#   • TSW_DOLT_PROBE_TIMEOUT: OUTER subprocess bound for the whole robust probe — must exceed
+#     RETRIES×probe-timeout + backoffs + serve-confirm (~52s worst case) so we never kill a
+#     legitimately-slow-but-answering probe. 90s. On a healthy Dolt it returns in ~4s.
+#   • TSW_DOLT_CONFIRM_SWEEPS: consecutive fully-failed sweeps required before paging. Raised
+#     2→3: at the 30-min sweep cadence a page now needs ~90 min of CONTINUOUS confirmed-down
+#     (every retry AND SELECT 1 failing). A burst lasts seconds and never sustains that; a
+#     genuine outage does. The dedicated dolt-hang-watchdog.sh (every 60s) is the FAST detector.
+DOLT_PROBE_TIMEOUT = int(os.environ.get("TSW_DOLT_PROBE_TIMEOUT", "90"))
+DOLT_CONFIRM_SWEEPS = int(os.environ.get("TSW_DOLT_CONFIRM_SWEEPS", "3"))
 DOLT_COOLDOWN_SEC = int(os.environ.get("TSW_DOLT_COOLDOWN_SEC", "10800"))   # 3h cooldown
 
 # ── imp23: delivery-stall knobs ───────────────────────────────────────────────
@@ -328,13 +341,18 @@ def _parse_bd_json(raw):
 
 # ── imp08: Dolt-health probe (Dolt-independent path) ─────────────────────────
 def _dolt_probe_rc():
-    """Probe Dolt via gc-dolt-probe.sh. Returns 0=healthy 1=unhealthy 2=unknown.
-    Test seam: if _do_dolt_probe is set, calls it instead of spawning bash."""
+    """Probe Dolt via `gc-dolt-probe.sh --robust`. Returns 0=healthy 1=unhealthy 2=unknown.
+
+    --robust retries the health probe with backoff and falls back to a raw SELECT 1
+    serve-confirm: a slow-but-alive Dolt (CPU burst) reads as 0 (healthy), so a transient
+    NEVER counts toward the "Dolt UNREACHABLE" escalation. Only a sustained health-fail +
+    SELECT-1-refused returns 1. Test seam: if _do_dolt_probe is set, its return value IS
+    the robust rc (bash is never spawned)."""
     if _do_dolt_probe is not None:
         return _do_dolt_probe()
-    r = _sh(["bash", DOLT_PROBE_SH], timeout=DOLT_PROBE_TIMEOUT)
+    r = _sh(["bash", DOLT_PROBE_SH, "--robust"], timeout=DOLT_PROBE_TIMEOUT)
     if r is None:
-        return 2  # spawn failed → unknown
+        return 2  # spawn failed / outer timeout → unknown (fail-open, never a false page)
     return r.returncode  # 0=healthy 1=unhealthy 2=unknown
 
 
@@ -445,11 +463,16 @@ def _tick_blind_and_dolt(signals_errored, now, state):
             _log("imp08 BLIND: cleared (signals readable again)")
         state["blind_pending"] = 0
 
-    # ── Dolt-health check (Dolt-independent probe) ───────────────────────────
+    # ── Dolt-health check (Dolt-independent robust probe) ────────────────────
+    # dolt_rc comes from `gc-dolt-probe.sh --robust`: rc=1 means EVERY health retry failed
+    # AND a raw SELECT 1 was refused this sweep (a burst that recovers on retry, or a Dolt
+    # that still serves SELECT 1, already returned rc=0 and never lands here). rc=2 (unknown/
+    # transient — e.g. no MySQL client) never counts. Escalation still needs DOLT_CONFIRM_SWEEPS
+    # such fully-failed sweeps in a row, so only a SUSTAINED outage pages.
     dolt_escalated = False
     dolt_rc = _dolt_probe_rc()
     if dolt_rc == 1:
-        # Confirmed unhealthy (rc=1). rc=2 (unknown/transient) never counts.
+        # Confirmed unreachable this sweep (all retries failed + SELECT 1 refused).
         state["dolt_pending"] += 1
         _tsw_ledger("flow-ledger", {
             "ts": _tsw_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1651,30 +1674,67 @@ def _selftest():
         _bad("J", "mails=%d notifies=%d blind_pending=%d" % (
              len(mail_calls), len(notify_calls), st.get("blind_pending", 0)))
 
-    # ── imp08-K: Dolt confirmed unreachable → dolt stall escalation ──────────────
-    print("\nimp08 Scenario K: Dolt unreachable (rc=1) → dolt escalation after %d sweeps" % DOLT_CONFIRM_SWEEPS)
-    _read_pilot_log_lines = lambda: _pilot_lines(1, 3)   # dispatch readable (flow present)
+    # ── imp08-K: Dolt confirmed unreachable (SUSTAINED) → dolt stall escalation ───
+    # The seam returns the ROBUST verdict per sweep (gc-dolt-probe.sh --robust already
+    # collapses transient bursts to rc=0; rc=1 here = a fully-failed sweep: every health
+    # retry failed AND SELECT 1 refused). Escalation requires DOLT_CONFIRM_SWEEPS such
+    # sweeps IN A ROW — this direction proves a genuine outage STILL pages.
+    print("\nimp08 Scenario K: Dolt unreachable rc=1 SUSTAINED → page on sweep %d (DOLT_CONFIRM_SWEEPS)" % DOLT_CONFIRM_SWEEPS)
+    _read_pilot_log_lines = lambda: _pilot_lines(1, 3)   # dispatch readable (flow present → no throughput stall)
     _read_gate_log_lines  = lambda: []
     _git_log_count        = lambda root, since: 0
     _bd_backlog           = lambda root: []
-    _do_dolt_probe        = lambda: 1   # CONFIRMED UNHEALTHY
+    _do_dolt_probe        = lambda: 1   # every sweep: robust probe says UNREACHABLE
     mail_calls.clear(); notify_calls.clear()
     st = _reset()
 
-    # sweep 1: Dolt unhealthy, but no stall (dispatch=1). dolt_pending=1, no escalation yet.
-    run_tick(NOW, st)
-    if st.get("dolt_pending", 0) >= 1 and not notify_calls:
-        _ok("K1: dolt_pending=1 after first unhealthy sweep, no notify yet")
+    # sweeps 1..K-1: dolt_pending climbs but NO page yet (sustained-failure requirement)
+    for i in range(DOLT_CONFIRM_SWEEPS - 1):
+        run_tick(NOW + i * 1800, st)
+    pre = [n for n in notify_calls if "DOLT" in n[0].upper() or "dolt" in n[0].lower()]
+    if st.get("dolt_pending", 0) == DOLT_CONFIRM_SWEEPS - 1 and not pre:
+        _ok("K1: %d unhealthy sweep(s) < K=%d → no Dolt page yet (dolt_pending=%d)" % (
+            DOLT_CONFIRM_SWEEPS - 1, DOLT_CONFIRM_SWEEPS, st.get("dolt_pending", 0)))
     else:
-        _bad("K1", "dolt_pending=%d notifies=%d" % (st.get("dolt_pending", 0), len(notify_calls)))
+        _bad("K1", "dolt_pending=%d notifies=%d (expected pending=%d, 0 notifies)" % (
+            st.get("dolt_pending", 0), len(pre), DOLT_CONFIRM_SWEEPS - 1))
 
-    # sweep 2: same Dolt unhealthy → dolt_pending=2 >= DOLT_CONFIRM_SWEEPS → escalate
-    run_tick(NOW + 1800, st)
+    # sweep K: dolt_pending == DOLT_CONFIRM_SWEEPS → escalate
+    run_tick(NOW + (DOLT_CONFIRM_SWEEPS - 1) * 1800, st)
     dolt_notifies = [n for n in notify_calls if "DOLT" in n[0].upper() or "dolt" in n[0].lower()]
     if dolt_notifies:
-        _ok("K2: dolt confirmed unhealthy → Dolt escalation notify fired")
+        _ok("K2: %d-th sustained unhealthy sweep → Dolt escalation notify fired (real outage still pages)" % DOLT_CONFIRM_SWEEPS)
     else:
-        _bad("K2", "expected Dolt notify, got: %r" % notify_calls)
+        _bad("K2", "expected Dolt notify on sweep %d, got: %r" % (DOLT_CONFIRM_SWEEPS, notify_calls))
+
+    # ── imp08-K3 (transient): unhealthy sweeps interrupted by a healthy one → NO page ──
+    # Models the CPU-burst false alarm: some sweeps read rc=1 but a healthy sweep (robust
+    # probe returned rc=0 — SELECT 1 served) resets dolt_pending before K accumulate in a
+    # row. This direction proves a transient NEVER pages.
+    print("\nimp08 Scenario K3: transient (rc=1..1,0 repeating) never reaches K consecutive → NO Dolt page")
+    _read_pilot_log_lines = lambda: _pilot_lines(1, 3)
+    _read_gate_log_lines  = lambda: []
+    _git_log_count        = lambda root, since: 0
+    _bd_backlog           = lambda root: []
+    _probe_seq = ([1] * (DOLT_CONFIRM_SWEEPS - 1) + [0]) * 3   # (K-1 bad, 1 healthy) × 3
+    _seq_idx = [0]
+    def _probe_transient():
+        v = _probe_seq[min(_seq_idx[0], len(_probe_seq) - 1)]
+        _seq_idx[0] += 1
+        return v
+    _do_dolt_probe = _probe_transient
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    for i in range(len(_probe_seq)):
+        run_tick(NOW + i * 1800, st)
+    dolt_notifies3 = [n for n in notify_calls if "DOLT" in n[0].upper() or "dolt" in n[0].lower()]
+    if not dolt_notifies3 and st.get("dolt_pending", 0) < DOLT_CONFIRM_SWEEPS:
+        _ok("K3: transient bursts (healthy sweep resets counter) → no false Dolt page (dolt_pending=%d < %d)" % (
+            st.get("dolt_pending", 0), DOLT_CONFIRM_SWEEPS))
+    else:
+        _bad("K3", "false Dolt page on transient: notifies=%d dolt_pending=%d" % (
+            len(dolt_notifies3), st.get("dolt_pending", 0)))
+    _do_dolt_probe = lambda: 0   # restore healthy for subsequent scenarios
 
     # ── imp23-L: delivery stall confirms after DELIVERY_CONFIRM_SWEEPS ──────────
     print("\nimp23 Scenario L: %d stalled in-flight beads → delivery stall after %d sweeps" % (
