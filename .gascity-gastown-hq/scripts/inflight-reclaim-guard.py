@@ -59,8 +59,10 @@ Safety invariants (CRITICAL — actuates on real work beads):
     Checks any remote branch whose final segment matches <bead-id> (incl.
     crew/<pool>/<bead-id>, feat/<id>*, fix/<id>*, feature/<id>*, polecat/<id>*)
     in both HQ and WA repos. Fails safe on git error (→ branch-might-exist).
-  - NEVER reclaims beads with a gate-status:dispatching|queued|claimed marker
-    (bead is actively being processed by the gate pipeline).
+  - NEVER reclaims beads with a gate-status:ready|dispatching|queued|claimed
+    marker (bead is actively being processed by the gate pipeline; "ready" is
+    the fresh-marker state /gate-done writes before a separate sweep promotes
+    it to queued, so it must count as active too — ga-cxzby).
   - ga-vw26y: the in_progress sweep is SCOPED to Pilot stories — a bead must
     carry a durable Pilot marker (pilot:dispatched or pilot:reclaim-count) and
     NO terminal/parked label (story:done, gate:passed, …) to qualify. Crew,
@@ -686,13 +688,18 @@ def list_suspended_agents():
 
 def list_gate_active_source_beads():
     """Return set of source-bead IDs that currently have an active gate marker
-    (gate-status:dispatching, queued, or claimed).
+    (gate-status:ready, dispatching, queued, or claimed).
+
+    "ready" is included because /gate-done writes a fresh marker in that state;
+    promotion to "queued" happens later via a separate sweep, so omitting
+    "ready" opens a race window where a just-submitted fix's marker is
+    invisible to this check (ga-cxzby).
 
     Returns a frozenset, or None on error (fail-safe: caller treats None as unknown
     and skips the cycle rather than risking a false reclaim).
     """
     active_source_beads = set()
-    for gate_lbl in ("gate-status:dispatching", "gate-status:queued", "gate-status:claimed"):
+    for gate_lbl in ("gate-status:ready", "gate-status:dispatching", "gate-status:queued", "gate-status:claimed"):
         try:
             result = subprocess.run(
                 ["bd", "list",

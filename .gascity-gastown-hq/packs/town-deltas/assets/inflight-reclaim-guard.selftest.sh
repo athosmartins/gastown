@@ -504,8 +504,8 @@ check_pattern "MAX_RECLAIMS constant present" "MAX_RECLAIMS\s*=\s*3"
 check_pattern "needs_human safety guard present" "has_needs_human"
 check_pattern "live session check covers session_name" "session_name"
 check_pattern "gate dispatching marker check present" "gate-status:dispatching"
-check_pattern "branch recency check for fix/ prefix" '"fix"'
-check_pattern "branch recency check for feature/ prefix" '"feature"'
+check_pattern "branch recency check for fix/ prefix" 'fix/<bead-id>\*'
+check_pattern "branch recency check for feature/ prefix" 'feature/<bead-id>\*'
 check_pattern "fail-safe: skip cycle on bd list failure" "bd list failed"
 check_pattern "fail-safe: skip cycle on session list failure" "session list failed"
 check_pattern "fail-safe: skip cycle on gate-marker failure" "gate-marker query failed"
