@@ -1,7 +1,9 @@
 #!/bin/bash
-# Block PRs by preventing pushes to arbitrary feature branches.
-# Gas Town agents push to main (crew) or polecat/* branches (polecats).
-# PRs are for external contributors only.
+# Block pushes to arbitrary/unexpected branches. Gas Town agents push to the
+# default branch (crew), polecat/* (polecats), integration/* (epics), or one
+# of the crew-commit skill's conventional work-branch prefixes (fix/, feat/,
+# refactor/, docs/, chore/, test/, crew/<name>/*) — the quality-gate-dispatcher
+# auto-rebases and pushes these continuously as its normal merge mechanism.
 #
 # Also enforces integration branch landing guardrails: pushes to the default
 # branch that introduce integration branch content are blocked unless
@@ -25,6 +27,10 @@ fi
 #   <default_branch>, beads-sync  - Direct work branches
 #   polecat/*                     - Polecat working branches (Refinery merges these)
 #   integration/*                 - Integration branches (created by gt mq integration)
+#   fix/*, feat/*, refactor/*,    - crew-commit skill's conventional work-branch
+#   docs/*, chore/*, test/*         prefixes; also what quality-gate-dispatcher
+#                                    auto-rebases and pushes as fix/* etc.
+#   crew/*                        - Named-crew branches (crew/<name>/<bead>)
 
 while read local_ref local_sha remote_ref remote_sha; do
   # Skip tags - they're allowed for releases
@@ -35,7 +41,7 @@ while read local_ref local_sha remote_ref remote_sha; do
   branch="${remote_ref#refs/heads/}"
 
   case "$branch" in
-    "${default_branch}"|beads-sync|polecat/*|integration/*)
+    "${default_branch}"|beads-sync|polecat/*|integration/*|fix/*|feat/*|refactor/*|docs/*|chore/*|test/*|crew/*)
       # Allowed branches
       ;;
     *)
@@ -49,11 +55,13 @@ while read local_ref local_sha remote_ref remote_sha; do
         echo ""
         echo "Allowed branches:"
         echo "  ${default_branch}        - Crew workers push here directly"
-        echo "  polecat/*   - Polecat working branches"
+        echo "  polecat/*     - Polecat working branches"
         echo "  integration/* - Integration branches"
-        echo "  beads-sync  - Beads synchronization"
+        echo "  beads-sync    - Beads synchronization"
+        echo "  fix/*, feat/*, refactor/*, docs/*, chore/*, test/* - crew-commit work branches"
+        echo "  crew/*        - Named-crew branches"
         echo ""
-        echo "Do NOT create PRs. Push to main or let Refinery merge polecat work."
+        echo "Do NOT create PRs. Push to main or let Refinery/gate-dispatcher merge work branches."
         exit 1
       fi
       ;;
