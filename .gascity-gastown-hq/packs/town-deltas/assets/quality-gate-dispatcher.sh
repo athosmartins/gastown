@@ -1522,18 +1522,44 @@ fi
 # merges until manual intervention.
 #
 # Fix: two-tier ordering. Markers with NO prior auto-rebase failure are drained
-# first (FIFO by created_at). Markers that already failed an auto-rebase (they
-# carry a gate:rebase-attempt:N label) sink to the BACK and are only re-attempted
-# when no healthy marker is queued. One broken branch can no longer travar a fila
+# first. Markers that already failed an auto-rebase (they carry a
+# gate:rebase-attempt:N label) sink to the BACK and are only re-attempted when
+# no healthy marker is queued. One broken branch can no longer travar a fila
 # regardless of who re-queues it — the queue drains the healthy markers while the
 # broken one is "tratado à parte" (escalated to needs-rebase by its own bounded
 # retry / gate-health-monitor). Star-guide: gate never idles >15min on 1 stale branch.
-MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq '
+#
+# ga-tgo7q STARVATION-BOUND AGING: the newest-first tiebreak above is Athos's
+# explicit, intended policy — but under continuous submission it can starve an
+# old HEALTHY marker indefinitely (live repro: ga-wisp-7yity6v queued 90+ min
+# while newer healthy markers kept jumping ahead), which also defeats
+# gt-mqkwj's orphan-marker re-queue (created_at is immutable, so a starved
+# marker's rank never improves on its own — see the note above re: the
+# label-cycle trick being a no-op). Fix: within the healthy tier only, split
+# further by age. A healthy marker that has waited longer than
+# GATE_MARKER_AGE_PROMOTE_SECONDS is force-promoted ahead of every not-yet-aged
+# healthy marker (FIFO among the aged set, so the longest-starved always goes
+# first once promoted). This gives every healthy marker a hard wait bound
+# while leaving the newest-first tiebreak untouched for markers still inside
+# the window. Aging does NOT reach into the rebase-fail tier — letting a
+# broken marker age its way back to the front would reintroduce the exact
+# ga-q3ig2 outage class this fix sits next to. GATE_MARKER_NOW_OVERRIDE_EPOCH
+# is a test-only seam (same convention as GATE_DOLT_LATENCY_OVERRIDE_MS) so
+# selftests can control "now" without depending on the wall clock.
+# SELFTEST-EXTRACT marker-select: BEGIN
+GATE_MARKER_AGE_PROMOTE_SECONDS="${GATE_MARKER_AGE_PROMOTE_SECONDS:-1800}"
+GATE_MARKER_NOW_EPOCH="${GATE_MARKER_NOW_OVERRIDE_EPOCH:-$(date -u +%s)}"
+MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
+  --argjson now "$GATE_MARKER_NOW_EPOCH" \
+  --argjson age_threshold "$GATE_MARKER_AGE_PROMOTE_SECONDS" '
   def has_rebase_fail: ((.labels // []) | map(select(test("^gate:rebase-attempt:[0-9]+$"))) | length) > 0;
-  sort_by(.created_at) | reverse
-  | (map(select(has_rebase_fail | not)) + map(select(has_rebase_fail)))
+  def is_aged: ($now - (.created_at | fromdateiso8601)) > $age_threshold;
+  (map(select((has_rebase_fail | not) and is_aged))           | sort_by(.created_at))
+  + (map(select((has_rebase_fail | not) and (is_aged | not))) | sort_by(.created_at) | reverse)
+  + (map(select(has_rebase_fail))                             | sort_by(.created_at) | reverse)
   | .[0]')
 MARKER_ID=$(printf '%s\n' "$MARKER" | jq -r '.id')
+# SELFTEST-EXTRACT marker-select: END
 DESC=$(printf '%s\n' "$MARKER" | jq -r '.description // ""')
 
 log "Attempting to claim marker $MARKER_ID ..."

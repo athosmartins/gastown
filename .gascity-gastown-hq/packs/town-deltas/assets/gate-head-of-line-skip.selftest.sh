@@ -15,9 +15,24 @@
 # IMMEDIATELY (no retry budget), while a transient plumbing failure still gets the
 # bounded retry.
 #
-# Strategy: extract the live selection jq expression VERBATIM from the dispatcher
-# and run it against synthetic marker fixtures (so the test cannot diverge from
-# the shipped code), then add source drift-guards for the CONFLICT_KIND branches.
+# Strategy: extract the live selection block VERBATIM from the dispatcher
+# (between sentinel comments) and execute it against synthetic marker fixtures
+# (so the test cannot diverge from the shipped code), then add source
+# drift-guards for the CONFLICT_KIND branches.
+#
+# POSTMORTEM (ga-tgo7q, 2026-07-02): this file used to hand-copy the jq filter
+# into select_marker() instead of genuinely extracting it. 4cae0a2c49
+# (2026-06-24) added a newest-first tiebreak (`| reverse`) to the shipped
+# selection, but the hand-copied test filter was never updated — so this file
+# kept asserting oldest-first ("ga-zf61i FIFO preserved") and PASSING for over
+# a week while production actually shipped newest-first. The "drift-guard"
+# section didn't catch it either: it only grep'd for the tier-split substring,
+# which is present in both the old and new code, so it never checked sort
+# direction. Fixed by switching to genuine sentinel-delimited extraction (same
+# mechanism as gate-marker-age-promote.selftest.sh) so this class of silent
+# drift can't recur. Aging (ga-tgo7q's own fix) is a SEPARATE concern with its
+# own dedicated coverage there — this file pins GATE_MARKER_AGE_PROMOTE_SECONDS
+# absurdly high so aging never interferes with what it's testing here.
 #
 # Exit 0 iff every assertion holds.
 set -uo pipefail
@@ -31,17 +46,18 @@ bad() { FAIL=$((FAIL+1)); echo "  ✗ $1"; }
 
 [ -f "$DISPATCHER" ] || { echo "FATAL: dispatcher not found at $DISPATCHER"; exit 1; }
 
-# ── The selection expression, kept in lock-step with the dispatcher. ──────────
-# We assert below (drift-guard) that the dispatcher still defines has_rebase_fail
-# and the two-tier (healthy-first) ordering, so this fixture logic cannot silently
-# diverge from production.
+# ── Genuine live extraction (not a hand-copied jq string — see postmortem above) ──
+SELECT_BLOCK="$(sed -n '/# SELFTEST-EXTRACT marker-select: BEGIN/,/# SELFTEST-EXTRACT marker-select: END/p' "$DISPATCHER")"
+[ -n "$SELECT_BLOCK" ] || { echo "FATAL: could not locate marker-select sentinel block in $DISPATCHER"; exit 1; }
+
 select_marker() {
-  # reads marker-array JSON on stdin, prints the selected marker id
-  jq -r '
-    def has_rebase_fail: ((.labels // []) | map(select(test("^gate:rebase-attempt:[0-9]+$"))) | length) > 0;
-    sort_by(.created_at)
-    | (map(select(has_rebase_fail | not)) + map(select(has_rebase_fail)))
-    | .[0].id'
+  # reads marker-array JSON on stdin, prints the selected marker id.
+  # Age threshold pinned huge: this file is scoped to the ga-q3ig2 two-tier +
+  # newest-first tiebreak, not aging (see gate-marker-age-promote.selftest.sh).
+  local markers_json; markers_json="$(cat)"
+  MARKERS_JSON="$markers_json" \
+  GATE_MARKER_AGE_PROMOTE_SECONDS=999999999 \
+  bash -c "$SELECT_BLOCK"$'\necho "$MARKER_ID"' 2>/dev/null
 }
 
 mk() { # id created_at [labels-csv]
@@ -51,32 +67,32 @@ mk() { # id created_at [labels-csv]
   printf '{"id":"%s","created_at":"%s","labels":%s}' "$id" "$ts" "$labarr"
 }
 
-echo "── (i) broken-oldest marker is SKIPPED for the oldest HEALTHY one ──"
+echo "── (i) broken-oldest marker is SKIPPED for the NEWEST healthy one ──"
 FIX=$(printf '[%s,%s,%s]' \
   "$(mk broken 2026-06-10T19:00:00Z 'gate-status:queued,gate:rebase-attempt:2')" \
   "$(mk healthyA 2026-06-10T20:00:00Z 'gate-status:queued')" \
   "$(mk healthyB 2026-06-10T21:00:00Z 'gate-status:queued')")
 SEL=$(printf '%s' "$FIX" | select_marker)
-[ "$SEL" = "healthyA" ] \
-  && ok "oldest-healthy (healthyA) selected, broken-but-older (broken) skipped — queue drains" \
-  || bad "expected healthyA, got '$SEL' (broken marker would head-of-line-block)"
+[ "$SEL" = "healthyB" ] \
+  && ok "newest-healthy (healthyB) selected, broken (older, rebase-fail) skipped — queue drains" \
+  || bad "expected healthyB, got '$SEL' (broken marker would head-of-line-block, or tiebreak regressed)"
 
-echo "── (ii) all-healthy queue keeps pure FIFO (oldest first) ──"
+echo "── (ii) all-healthy queue prefers newest (Athos's 6/24 tiebreak, 4cae0a2c49) ──"
 FIX=$(printf '[%s,%s,%s]' \
   "$(mk h3 2026-06-10T21:00:00Z 'gate-status:queued')" \
   "$(mk h1 2026-06-10T19:00:00Z 'gate-status:queued')" \
   "$(mk h2 2026-06-10T20:00:00Z 'gate-status:queued')")
 SEL=$(printf '%s' "$FIX" | select_marker)
-[ "$SEL" = "h1" ] && ok "no failures → oldest (h1) selected (ga-zf61i FIFO preserved)" \
-  || bad "expected h1, got '$SEL'"
+[ "$SEL" = "h3" ] && ok "no failures → newest (h3) selected (4cae0a2c49 tiebreak; ga-zf61i's oldest-first was deliberately superseded)" \
+  || bad "expected h3, got '$SEL'"
 
-echo "── (iii) all-broken queue still drains (oldest broken, never deadlocks) ──"
+echo "── (iii) all-broken queue still drains (newest broken retried, never deadlocks) ──"
 FIX=$(printf '[%s,%s]' \
   "$(mk b2 2026-06-10T20:00:00Z 'gate-status:queued,gate:rebase-attempt:1')" \
   "$(mk b1 2026-06-10T19:00:00Z 'gate-status:queued,gate:rebase-attempt:3')")
 SEL=$(printf '%s' "$FIX" | select_marker)
-[ "$SEL" = "b1" ] && ok "only-broken queue → oldest broken (b1) retried (no starvation/deadlock)" \
-  || bad "expected b1, got '$SEL'"
+[ "$SEL" = "b2" ] && ok "only-broken queue → newest broken (b2) retried (no starvation/deadlock)" \
+  || bad "expected b2, got '$SEL'"
 
 echo "── (iv) a lone broken marker is still selected (gets escalated, not ignored) ──"
 FIX="[$(mk lone 2026-06-10T19:00:00Z 'gate-status:queued,gate:rebase-attempt:2')]"
@@ -89,8 +105,11 @@ grep -q 'def has_rebase_fail' "$DISPATCHER" \
   && ok "dispatcher defines has_rebase_fail in selection" || bad "missing has_rebase_fail"
 grep -q 'gate:rebase-attempt:\[0-9\]+' "$DISPATCHER" \
   && ok "selection matches gate:rebase-attempt:N labels" || bad "selection regex missing"
-grep -q 'select(has_rebase_fail | not)) + map(select(has_rebase_fail))' "$DISPATCHER" \
-  && ok "two-tier order: healthy-first then failed-last" || bad "two-tier ordering not found"
+grep -q 'map(select(has_rebase_fail))' "$DISPATCHER" \
+  && ok "rebase-fail tier still isolated (sinks to the back)" || bad "rebase-fail tier not found — head-of-line fix may have regressed"
+grep -q '| reverse' "$DISPATCHER" \
+  && ok "newest-first tiebreak (4cae0a2c49) present — the exact thing that silently drifted from this test before" \
+  || bad "'| reverse' missing — either the 6/24 tiebreak policy was reverted, or this guard needs updating to match"
 grep -q 'CONFLICT_KIND="merge"' "$DISPATCHER" \
   && ok "genuine merge conflict classified CONFLICT_KIND=merge" || bad "no merge classification"
 grep -q 'CONFLICT_KIND="transient"' "$DISPATCHER" \
