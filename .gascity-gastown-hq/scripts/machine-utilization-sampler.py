@@ -126,12 +126,32 @@ def dolt_ok():
     return "1" in out
 
 
+def dolt_cpu_pct():
+    """Best-effort total %CPU of the dolt sql-server process(es) — summed across
+    matching procs (can exceed 100% = multi-core). FREE: reads `ps`, never queries
+    Dolt (so this health probe never adds to the load it measures). Returns a float
+    or None on failure (the panel shows '—' for None). This is what surfaces the
+    Dolt-heat KPI the Mayor tracks (the 280%→21% cooling)."""
+    # LC_ALL=C forces period decimals — this is a pt-BR box where ps prints "196,9",
+    # which float() can't parse (silently yielded None before this guard).
+    out = sh(["bash", "-c",
+              "LC_ALL=C ps aux | grep '[d]olt sql-server' | LC_ALL=C awk '{s+=$3} END{printf \"%.1f\", s}'"],
+             timeout=8)
+    try:
+        return round(float(out.strip()), 1)
+    except Exception:
+        return None
+
+
 def sample():
     if not dolt_ok():
-        # measurement gap — do NOT blame the machine for our own read failure.
+        # measurement gap — do NOT blame the machine for our own read failure. Still
+        # record dolt_cpu (ps is independent of Dolt reachability) so the heat KPI keeps
+        # ticking even while Dolt is too busy to serve queries (exactly when it matters).
         return {
             "ts": SAMPLE_EPOCH, "working": 0, "had_work": 0, "state": "unknown",
             "dolt_ok": False, "reviewing": 0, "building": 0, "refining": 0,
+            "dolt_cpu": dolt_cpu_pct(),
         }
     hq_markers = bd_list(HQ, "type:quality-gate-marker")
     def marker_status(b):
@@ -222,6 +242,7 @@ def sample():
         "working": working,
         "had_work": had_work,
         "dolt_ok": True,
+        "dolt_cpu": dolt_cpu_pct(),
         "state": (
             "productive" if (working and had_work)
             else "idle_stalled" if (had_work and not working)
