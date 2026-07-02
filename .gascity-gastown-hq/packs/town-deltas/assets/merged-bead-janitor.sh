@@ -22,15 +22,20 @@
 #
 # FIX — a periodic per-rig-store janitor. For every in_progress bead it asks
 # "is this bead's work in origin/main?" via THREE independent signals (OR):
-#   (A) COMMIT  — the bead id appears as the conventional-commit SCOPE in the
-#                 SUBJECT line of an origin/main commit in the bead's own rig
-#                 repo OR the HQ repo (mirror): `feat(<id>):` / `fix(<id>):` /
-#                 etc. Body-only mentions of an id in an unrelated commit are
-#                 REJECTED — they are incident reports, not deliveries. Uses
-#                 scan_commit_subject_for_bead (same strict fn as the story
-#                 sweep). False-negative (real merge missed this sweep) is far
-#                 safer than a false-positive (unbuilt work silently closed);
-#                 signal C (crew/*/<id> branch-ancestor) is the reliable catch-up.
+#   (A) COMMIT  — the bead id is the IMPLEMENTING conventional-commit SCOPE (the
+#                 header BEFORE the first colon) of an origin/main commit in the
+#                 bead's OWN rig repo: `feat(<id>):` / `fix(<id>):` / `Merge …/<id>:`.
+#                 Two things are REJECTED (ga-wisp-ld35wuw, 2026-07-01): (1) body-only
+#                 mentions AND trailing "(ga-x/<id>)" context parens — they are
+#                 motivation, not delivery; and (2) a commit in the HQ repo for a
+#                 RIG-NATIVE bead — a rig bead's completion commit lives in its own
+#                 rig repo, so an HQ framework commit that merely NAMES the rig id as
+#                 context (`fix(pilot): … (ga-4aree/wa-iy9s8)`) can never count. HQ is
+#                 consulted ONLY for a FOREIGN (non-rig-native) bead in a rig store.
+#                 Uses subject_impl_scopes_bead via scan_commit_subject_for_bead (shared
+#                 with the story sweep). False-negative (real merge missed this sweep) is
+#                 far safer than a false-positive (unbuilt work silently closed); signals
+#                 B/C (terminal marker, crew/*/<id> branch-ancestor) are the catch-up.
 #   (B) MARKER  — the bead has a CLOSED gate marker (source-bead:<id>) whose
 #                 terminal label is gate-status:passed or gate-status:superseded.
 #   (C) BRANCH  — the bead's branch (from a marker's branch:<…> label, or the
@@ -360,22 +365,54 @@ EOF
   return 1
 }
 
-# scan_commit_subject_for_bead <git_dir> <is_container> <ref> <bead_id>
-# STRICTER variant of scan_commit_for_bead used by the story:done reconciliation
-# sweep (ga-gosfs): rc0 + prints the first matching sha iff an ancestor commit of
-# <ref> references the bead id (token-bounded) in its SUBJECT line — the
-# conventional-commit scope an *implementing* commit carries (feat(<id>): /
-# fix(<id>): / "fix bug <id>:" / (<id>)). Body-only mentions are REJECTED.
+# subject_impl_scopes_bead <subject_line> <bead_id> — THE DISCRIMINATOR (ga-wisp-ld35wuw,
+# 2026-07-01). rc0 iff <bead_id> is the IMPLEMENTING conventional-commit SCOPE of <subject>;
+# rc1 if it is only a trailing context/motivation reference. This is the exact test that has
+# to separate a genuine delivery from a framework commit that merely NAMES the bead as context:
+#     MERGED     (rc0)  fix(wa-iy9s8): auto-deploy viewer/ to S3 on merge     ← id IS the scope
+#     NOT-MERGED (rc1)  fix(pilot): … rig re-fix bugs dispatch (ga-4aree/wa-iy9s8)
+#                       ← id is a TRAILING "(scope/…)" context paren; the real scope is `pilot`.
 #
-# WHY stricter than the in_progress sweep: a story:approved bead can sit OPEN for
-# days (engine-window / deferred work). Unrelated commits routinely name it in
-# their BODY as still-open or future work — "remains open in ga-r471 engine
-# window", "enforce … moves to wa-qggy (after tbbc)". The body-wide scan reads
-# those as "merged" and would falsely mark the story done. Marking a story done
-# is irreversible UX (it leaves the board) so zero false-positive is paramount
-# (AC3) — and a genuine story merge always puts the id in the SUBJECT (gate-done
-# commits as feat(<id>)/fix(<id>)). The unambiguous marker + branch signals still
-# cover the cross-store / superseded cases where no subject-scoped commit exists.
+# WHY token-bounding the WHOLE subject was not enough (the wa-iy9s8 false-close): a Pilot
+# framework commit's SUBJECT can carry the rig bead-id in a trailing "(ga-x/<id>)" motivation
+# parenthetical. token_bounded matched it anywhere in the subject → the old scan reported it
+# MERGED and the in_progress sweep auto-CLOSED the bead — hiding un-built work behind "done".
+#
+# RULE: a conventional-commit's type/scope lives in the HEADER `type(scope):` that PRECEDES the
+# FIRST colon. The bead id must be token-bounded WITHIN that header — as the whole scope
+# `fix(<id>)`, a path segment `feat(area/<id>)`, a genuine merge landing `Merge crew/x/<id>:`,
+# or a bare `<id>:` / `fix bug <id>:` lead. ANYTHING after the first colon — the description,
+# the "(ga-x/<id>)" motivation paren, "fixes dispatch for <id>", "refs <id>", "(interim until
+# <id> Phase-2)" — is CONTEXT, never delivery. FAIL-CLOSED: a subject with NO colon (no
+# locatable conventional scope) does NOT match; a Revert header (git's default `Revert "…"` or
+# a `revert: …` conventional) does NOT match — the change is being UNDONE, not delivered. Pure.
+# Verified 2026-07-01: rc1 on 286cb29c7-HQ (`fix(pilot): … (ga-4aree/wa-iy9s8)`), rc0 on
+# d0219063-WA (`fix(wa-iy9s8): …`).
+subject_impl_scopes_bead() {
+  local subj="$1" id="$2" header
+  case "$subj" in *:*) : ;; *) return 1 ;; esac    # no colon → no conventional scope → fail-closed
+  header="${subj%%:*}"                             # text before the FIRST colon = type(scope) / merge / bare-id lead
+  case "$header" in [Rr]evert*) return 1 ;; esac   # revert (undo, not delivery) → reject
+  token_bounded "$id" "$header"                    # id must be a whole token WITHIN the header/scope
+}
+
+# scan_commit_subject_for_bead <git_dir> <is_container> <ref> <bead_id>
+# STRICTER variant of scan_commit_for_bead used by BOTH the in_progress→close sweep and the
+# story:done reconciliation sweep (ga-gosfs): rc0 + prints the first matching sha iff an
+# ancestor commit of <ref> references the bead id as an IMPLEMENTING conventional-commit SCOPE
+# in its SUBJECT line (feat(<id>): / fix(<id>): / feat(area/<id>): / Merge …/<id>: / <id>: /
+# "fix bug <id>:"). The scope test is subject_impl_scopes_bead: the id must be token-bounded in
+# the header BEFORE the first colon, NOT anywhere in the subject. Body-only mentions AND trailing
+# "(context/<id>)" description parens are REJECTED (see subject_impl_scopes_bead for the why).
+#
+# WHY strict: closing a bead / marking a story done is irreversible UX (it leaves the board) so
+# zero false-positive is paramount (AC3). Unrelated commits routinely name a bead in their BODY
+# or as trailing context — "remains open in ga-r471 engine window", "rig re-fix bugs dispatch
+# (ga-4aree/wa-iy9s8)". A genuine delivery always puts the id in the SUBJECT SCOPE (gate-done
+# commits as feat(<id>)/fix(<id>)). The unambiguous marker + branch signals still cover the
+# cross-store / superseded cases where no subject-scoped commit exists. `-F --grep` pre-filters
+# to commits mentioning the id (subject OR body); subject_impl_scopes_bead then keeps only the
+# ones whose SUBJECT SCOPE is the id.
 scan_commit_subject_for_bead() {
   local gdir="$1" container="$2" ref="$3" id="$4"
   git_in "$gdir" "$container" rev-parse -q --verify "$ref" >/dev/null 2>&1 || return 1
@@ -385,7 +422,7 @@ scan_commit_subject_for_bead() {
   while IFS= read -r sha; do
     [ -z "$sha" ] && continue
     subj=$(git_in "$gdir" "$container" log -1 --format='%s' "$sha" 2>/dev/null || true)
-    if token_bounded "$id" "$subj"; then printf '%s' "$sha"; return 0; fi
+    if subject_impl_scopes_bead "$subj" "$id"; then printf '%s' "$sha"; return 0; fi
   done <<EOF
 $shas
 EOF
@@ -644,16 +681,27 @@ while IFS= read -r rig; do
     HAS_OPEN=0; has_open_marker "$MK" && HAS_OPEN=1
     SIG_MARKER=0; has_terminal_passed_marker "$MK" && SIG_MARKER=1
 
-    # Signal A — commit SUBJECT-scoped to this bead id in own-rig repo OR HQ repo (mirror).
-    # Uses the STRICT subject scanner (same as the story sweep): only a conventional-commit
-    # whose SCOPE is this bead id (feat(<id>)/fix(<id>)/etc.) counts as delivery evidence.
-    # Body-only mentions — incident descriptions, cross-references, "wa-oxkg dispatch
-    # surfaced mid-conversation" — are REJECTED. See scan_commit_subject_for_bead.
+    # Signal A — commit whose SUBJECT SCOPE is this bead id, in the bead's OWN rig repo.
+    # Uses the STRICT subject-scope scanner: only a conventional-commit whose SCOPE (the
+    # header before the first colon) is this bead id (feat(<id>)/fix(<id>)/Merge …/<id>:)
+    # counts as delivery evidence. Body-only mentions AND trailing "(ga-x/<id>)" context
+    # parens are REJECTED. See scan_commit_subject_for_bead / subject_impl_scopes_bead.
+    #
+    # REPO-SCOPING (ga-wisp-ld35wuw, 2026-07-01): a RIG-NATIVE bead (id prefix == this rig's
+    # prefix, e.g. wa-* in the WA rig) is matched ONLY against its OWN rig repo — NEVER HQ.
+    # A rig bead's completion commit lives in its own rig repo; an HQ framework commit that
+    # merely NAMES the rig bead-id as context (fix(pilot): … (ga-4aree/wa-iy9s8)) must never
+    # count as that rig bead's delivery (that false-closed the P1 bug wa-iy9s8 @ 286cb29c7-HQ).
+    # The HQ fallback is retained ONLY for a FOREIGN (non-rig-native) bead sitting in this
+    # rig's store — an HQ-home ga-*/dc-* bead — the legitimate cross-store case. (HQ-store
+    # beads are swept in the HQ rig iteration where RGITDIR==HQ_GITDIR, so they scan HQ as
+    # their own repo; this fallback covers a foreign bead that lives in a rig store.)
     SIG_COMMIT=0; COMMIT_EVID=""
     if [ "$IS_EPIC" = "0" ] && [ "$HAS_OPEN" = "0" ]; then
       if sha=$(scan_commit_subject_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$BID"); then
         SIG_COMMIT=1; COMMIT_EVID="$RNAME origin/$RDEFAULT@${sha:0:9}"
-      elif [ "$RGITDIR" != "$HQ_GITDIR" ] && sha=$(scan_commit_subject_for_bead "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$BID"); then
+      elif [ "${BID%%-*}" != "$RPREFIX" ] && [ "$RGITDIR" != "$HQ_GITDIR" ] \
+           && sha=$(scan_commit_subject_for_bead "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$BID"); then
         SIG_COMMIT=1; COMMIT_EVID="hq origin/$HQ_DEFAULT@${sha:0:9}"
       fi
     fi
@@ -759,12 +807,17 @@ EOF
     S_SIGCOMMIT=0; S_SIGBRANCH=0; S_COMMIT_EVID=""; S_BRANCH_EVID=""
     if [ "$S_EPIC" = "0" ] && [ "$S_DONE" = "0" ] && [ "$S_OPENMK" = "0" ] \
        && [ "$S_INFLIGHT" = "0" ] && [ "$S_BUILDER" = "0" ] && [ "$S_DELIV" = "0" ]; then
-      # Signal A — SUBJECT-scoped commit in own-rig repo OR HQ repo (cross-store /
-      # HQ-via-rig). Strict (subject only) to reject incidental body mentions of a
-      # still-open story — see scan_commit_subject_for_bead.
+      # Signal A — commit whose SUBJECT SCOPE is this story id, in the story's OWN rig repo.
+      # Strict subject-scope (header before the first colon) to reject incidental body
+      # mentions AND trailing "(context/<id>)" parens of a still-open story — see
+      # scan_commit_subject_for_bead / subject_impl_scopes_bead. REPO-SCOPING (ga-wisp-ld35wuw):
+      # a RIG-NATIVE story (id prefix == rig prefix) is matched ONLY against its own rig repo;
+      # the HQ fallback is kept ONLY for a FOREIGN (non-rig-native) story in this rig's store,
+      # so a rig story can never be marked done by an HQ framework commit that merely names it.
       if sha=$(scan_commit_subject_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$SID"); then
         S_SIGCOMMIT=1; S_COMMIT_EVID="$RNAME origin/$RDEFAULT@${sha:0:9}"
-      elif [ "$RGITDIR" != "$HQ_GITDIR" ] && sha=$(scan_commit_subject_for_bead "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$SID"); then
+      elif [ "${SID%%-*}" != "$RPREFIX" ] && [ "$RGITDIR" != "$HQ_GITDIR" ] \
+           && sha=$(scan_commit_subject_for_bead "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$SID"); then
         S_SIGCOMMIT=1; S_COMMIT_EVID="hq origin/$HQ_DEFAULT@${sha:0:9}"
       fi
       # Signal C — branch ancestor of origin/main (marker branch label, else crew/*/<id>).

@@ -27,7 +27,7 @@ rc1() { if "$@" >/dev/null 2>&1; then bad "expected non-zero: $*"; else ok "rc!=
 JANITOR_LIB_ONLY=1 source "$JANITOR" \
   || { echo "FATAL: could not source janitor in lib-only mode"; exit 1; }
 for fn in janitor_decide janitor_story_decide token_bounded scan_commit_for_bead \
-          scan_commit_subject_for_bead branch_merged content_in_main \
+          scan_commit_subject_for_bead subject_impl_scopes_bead branch_merged content_in_main \
           has_open_marker has_terminal_passed_marker branch_label_from_markers rig_gitdir \
           janitor_branch_decide normalize_bead_status branch_is_fresh \
           bead_lookup_one resolve_bead_state; do
@@ -150,6 +150,36 @@ rc0 token_bounded "wa-1or2" "Source bead: ga-piycl (mirror of wa-1or2)"
 rc1 token_bounded "wa-1"    "feat(wa-1or2): unrelated longer id"      # wa-1 must NOT match wa-1or2
 rc1 token_bounded "wa-1or2" "see commit wa-1or2x for details"          # trailing alnum breaks boundary
 rc1 token_bounded "wa-1or2" "totally unrelated message"
+
+# ── 2b. subject_impl_scopes_bead — THE DISCRIMINATOR (ga-wisp-ld35wuw) ───────
+# rc0 iff the bead id is the IMPLEMENTING conventional-commit SCOPE (header before the
+# first colon), rc1 if it is only a trailing context/motivation reference. This is the
+# exact test that separates a genuine delivery from a framework commit that merely names
+# the bead. The two load-bearing cases are the REAL commits from the wa-iy9s8 false-close.
+echo "── 2b. subject_impl_scopes_bead (impl-scope vs trailing context) ──"
+# THE REGRESSION (real subjects): 286cb29c7-HQ mentioned wa-iy9s8 in a TRAILING context
+# paren "(ga-4aree/wa-iy9s8)"; d0219063-WA is the genuine fix(wa-iy9s8): delivery. The OLD
+# scanner token-bounded the WHOLE subject and matched BOTH → false-closed the P1 bug.
+rc1 subject_impl_scopes_bead "fix(pilot): rig-native scan no longer excludes gate:needs-fix — rig re-fix bugs dispatch (ga-4aree/wa-iy9s8)" "wa-iy9s8"   # trailing context → NOT delivery
+rc0 subject_impl_scopes_bead "fix(wa-iy9s8): auto-deploy viewer/ to S3 on merge — done != deployed" "wa-iy9s8"                                          # scope → delivery
+# Implementing-scope forms all MATCH (rc0):
+rc0 subject_impl_scopes_bead "feat(wa-iy9s8): add thing" "wa-iy9s8"                       # feat(<id>):
+rc0 subject_impl_scopes_bead "feat(warming/wa-iy9s8): re-land squashed lane" "wa-iy9s8"   # path-segment scope
+rc0 subject_impl_scopes_bead "Merge crew/mila/wa-iy9s8: painel column-selector" "wa-iy9s8" # genuine merge landing
+rc0 subject_impl_scopes_bead "wa-iy9s8: fix the crash" "wa-iy9s8"                          # bare-id lead
+rc0 subject_impl_scopes_bead "fix bug wa-iy9s8: retry logic" "wa-iy9s8"                    # "fix bug <id>:" lead
+rc0 subject_impl_scopes_bead "merge(wa-86jr+wa-o3zs): Contagem cadastre bulk-load" "wa-o3zs" # multi-id scope (real wa-o3zs landing)
+# Trailing-context / body-ish / wrong-scope forms all REJECTED (rc1):
+rc1 subject_impl_scopes_bead "tune(gate): VERDICT_TIMEOUT 45→22min (interim until gt-x2xin Phase-2)" "gt-x2xin" # explicitly FUTURE work
+rc1 subject_impl_scopes_bead "fix(pilot): fixes dispatch for wa-iy9s8 stranded beads" "wa-iy9s8"               # id after colon = description
+rc1 subject_impl_scopes_bead "feat(wa-ab6z): São João Batista 5 donos (ITBI)" "wa-y2lk"                        # sibling under parent → per-bead unproven
+rc1 subject_impl_scopes_bead "docs(wa-e34v): doc-mestre de data-mastery de Contagem" "wa-qjym"                 # unrelated scope, no id
+rc1 subject_impl_scopes_bead "chore: see also refs wa-iy9s8" "wa-iy9s8"                                        # trailing reference
+# FAIL-CLOSED edges:
+rc1 subject_impl_scopes_bead "merge wa-iy9s8 into main" "wa-iy9s8"                         # NO colon → no locatable scope → reject
+rc1 subject_impl_scopes_bead 'Revert "fix(wa-iy9s8): add thing"' "wa-iy9s8"                # git default revert → undo, not delivery
+rc1 subject_impl_scopes_bead "revert: fix(wa-iy9s8): add thing" "wa-iy9s8"                 # conventional revert → reject
+rc1 subject_impl_scopes_bead "fix(wa-1or2): unrelated longer id" "wa-1"                    # token boundary: wa-1 ≠ wa-1or2
 
 # ── 3. merge-evidence helpers — real git, no network ────────────────────────
 echo "── 3. scan_commit_for_bead + branch_merged (real repo) ──"
@@ -316,6 +346,19 @@ grep -q 'scan_commit_subject_for_bead "$HQ_GITDIR"' "$JANITOR" && ok "cross-stor
 # qualifies as delivery evidence.
 grep -q 'scan_commit_subject_for_bead "\$RGITDIR" "\$RCONTAINER" "origin/\$RDEFAULT" "\$BID"' "$JANITOR" \
   && ok "in_progress sweep uses strict subject scan for BID" || bad "in_progress sweep not using strict scanner for BID"
+# ga-wisp-ld35wuw (2026-07-01): SCOPE discriminator + own-rig-repo scoping (the wa-iy9s8 fix).
+# The false-close was an HQ `fix(pilot): … (ga-4aree/wa-iy9s8)` commit whose SUBJECT carried the
+# rig id in a TRAILING context paren; the whole-subject scanner matched it and auto-closed the P1
+# bug. Signal A now (a) requires the id to be the SUBJECT SCOPE (header before the first colon)
+# via subject_impl_scopes_bead, and (b) matches a RIG-NATIVE bead ONLY against its own rig repo.
+grep -q 'subject_impl_scopes_bead()' "$JANITOR" \
+  && ok "defines subject_impl_scopes_bead (scope discriminator)" || bad "missing subject_impl_scopes_bead def"
+grep -qF 'if subject_impl_scopes_bead "$subj" "$id"' "$JANITOR" \
+  && ok "scan_commit_subject_for_bead gated on subject SCOPE (not whole-subject token)" || bad "scanner not using subject_impl_scopes_bead"
+grep -qF '[ "${BID%%-*}" != "$RPREFIX" ]' "$JANITOR" \
+  && ok "in_progress HQ fallback prefix-guarded (rig-native bead never matched vs HQ)" || bad "in_progress HQ fallback not prefix-guarded"
+grep -qF '[ "${SID%%-*}" != "$RPREFIX" ]' "$JANITOR" \
+  && ok "story HQ fallback prefix-guarded (rig-native story never matched vs HQ)" || bad "story HQ fallback not prefix-guarded"
 # set -e/pipefail safety: no `set -e` (sweep tolerates per-bead failures) but
 # the close path guards its mutation with `|| { err ...; continue; }`.
 grep -q 'close failed for' "$JANITOR" && ok "close failure is non-fatal (continue)" || bad "close failure not guarded"
@@ -413,6 +456,37 @@ rc1 scan_commit_subject_for_bead "$R7" 0 "main" "tt-other"   # body-only in chor
 git -C "$R7" checkout -q -b "crew/mila/tt-oxkg" HEAD~2   # points at base+incident (pre-delivery)
 git -C "$R7" checkout -q main
 rc0 branch_merged "$R7" 0 "crew/mila/tt-oxkg" "main"   # crew branch IS ancestor of main → signal C fires
+
+# ── 7b. wa-iy9s8 REGRESSION: trailing-context SUBJECT paren must NOT close (ga-wisp-ld35wuw) ──
+# The wa-iy9s8 false-close (2026-07-01) was NOT a body mention — the id was in the SUBJECT, but
+# as a TRAILING context paren "(ga-4aree/wa-iy9s8)" of a fix(pilot): framework commit in HQ. The
+# then-current scan_commit_subject_for_bead token-bounded the WHOLE subject → it matched and the
+# in_progress sweep auto-closed the P1 bug. The fix requires the id to be the SUBJECT SCOPE
+# (header before the first colon). This section builds the exact shape in a real repo.
+echo "── 7b. trailing-context subject paren (wa-iy9s8 shape) → KEEP; scoped → CLOSE ──"
+T7B="$(mktemp -d 2>/dev/null || mktemp -d -t janitor-t7b)"
+trap 'rm -rf "$T7B" 2>/dev/null || true; rm -rf "$T7" 2>/dev/null || true; rm -rf "$T" 2>/dev/null || true' EXIT
+R7B="$T7B/repo7b"
+git init -q -b main "$R7B"
+( cd "$R7B" && echo base > base.txt && git add base.txt && git commit -q -m "base commit" )
+# CONTEXT commit — models 286cb29c7-HQ: fix(pilot): … with the rig bead-id in a TRAILING paren.
+( cd "$R7B" && echo pilot > pilot.txt && git add pilot.txt && \
+  git commit -q -m "fix(pilot): rig-native scan no longer excludes gate:needs-fix — rig re-fix bugs dispatch (ga-4aree/tt-iy9s8)" )
+CTX_SHA=$(git -C "$R7B" rev-parse HEAD)
+# DELIVERY commit — models d0219063-WA: the genuine fix(tt-iy9s8): implementing commit.
+( cd "$R7B" && echo deliver > deliver.txt && git add deliver.txt && \
+  git commit -q -m "fix(tt-iy9s8): auto-deploy viewer/ to S3 on merge — done != deployed" )
+DLV_SHA=$(git -C "$R7B" rev-parse --short=9 HEAD)
+# STRICT scanner: the trailing-context paren commit must NOT be treated as delivery …
+rc1 scan_commit_subject_for_bead "$R7B" 0 "$CTX_SHA" "tt-iy9s8"   # trailing "(…/tt-iy9s8)" → KEEP (the bug)
+# … but the genuine fix(tt-iy9s8): scope commit MUST be, and returns ITS sha (not the context one).
+rc0 scan_commit_subject_for_bead "$R7B" 0 "main" "tt-iy9s8"
+GOTB=$(scan_commit_subject_for_bead "$R7B" 0 "main" "tt-iy9s8" 2>/dev/null || true)
+if [ "${GOTB:0:9}" = "$DLV_SHA" ]; then ok "strict scan returns DELIVERY sha (${GOTB:0:9}), not the context commit"; else bad "strict scan wrong sha: got [${GOTB:0:9}] want [$DLV_SHA]"; fi
+# The OLD loose behaviour (token-bounded WHOLE subject) WOULD have matched the context commit —
+# this asserts the test setup reproduces the real false-positive that the fix removes.
+ctx_subj=$(git -C "$R7B" log -1 --format='%s' "$CTX_SHA")
+rc0 token_bounded "tt-iy9s8" "$ctx_subj"                          # loose whole-subject match (why the fix was needed)
 
 
 # ── 8. story:done + close: subject-scoped commit in main → DONE verdict; body-only → KEEP ──
