@@ -19,10 +19,19 @@
 .DS_Store
 Thumbs.db
 
-# Claude Code local state (but track commands/skills)
+# Claude Code local state (but track commands/skills at the repo root only —
+# nested .claude/ dirs, e.g. internal/*/.claude/, stay fully ignored below).
+# NOTE: negating a path under an excluded parent dir doesn't work in gitignore
+# (git won't recurse into an excluded dir to check deeper patterns), so this
+# un-excludes the root .claude/ dir itself (root-anchored, leading /) before
+# re-excluding its direct children and re-including commands/ and skills/.
 .claude/
-!.claude/commands/
-!.claude/skills/
+!/.claude/
+/.claude/*
+!/.claude/commands/
+!/.claude/commands/**
+!/.claude/skills/
+!/.claude/skills/**
 
 # Test
 coverage.out
