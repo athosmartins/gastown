@@ -59,7 +59,7 @@ else
 fi
 
 # 2. Vector 1a kill: the detach clears the source bead's assignee.
-if grep -Eq 'bd -C "\$GC_CITY" assign "\$BEAD_ID" ""' "$GUARD"; then
+if grep -Eq 'bd -C "\$BEAD_CITY" assign "\$BEAD_ID" ""' "$GUARD"; then
   ok "clears source-bead assignee (Vector 1a) via bd assign \"\$BEAD_ID\" \"\""
 else
   bad "missing assignee clear on \$BEAD_ID (Vector 1a not killed)"
@@ -82,7 +82,7 @@ fi
 
 # 5. Guarded by a non-empty bead-id check (never detach with an empty id).
 #    The detach assign line must live inside an 'if [ -n "$BEAD_ID" ]' block.
-detach_line=$(grep -nE 'bd -C "\$GC_CITY" assign "\$BEAD_ID" ""' "$GUARD" | head -1 | cut -d: -f1)
+detach_line=$(grep -nE 'bd -C "\$BEAD_CITY" assign "\$BEAD_ID" ""' "$GUARD" | head -1 | cut -d: -f1)
 guard_line=$(awk '/if \[ -n "\$BEAD_ID" \]; then/ { print NR }' "$GUARD" | awk -v d="${detach_line:-0}" '$1 < d' | tail -1)
 if [ -n "${detach_line:-}" ] && [ -n "${guard_line:-}" ]; then
   ok "detach is guarded by 'if [ -n \"\$BEAD_ID\" ]'"
