@@ -89,24 +89,53 @@ MOCK_RUNS='[]'
 eq "(a) empty run list → no sibling" "$(live_sibling_run_for_branch 'crew/thies/wa-86jr-reland')" ""
 
 # (b) a young run for THIS branch → "LIVE <id>"
-MOCK_RUNS=$(printf '[{"id":"ga-run-live","description":"Autonomous gate run for crew/thies/wa-86jr-reland.\\nstarted_at: %s"}]' "$TS_5M_AGO")
+MOCK_RUNS=$(printf '[{"id":"ga-run-live","status":"open","description":"Autonomous gate run for crew/thies/wa-86jr-reland.\\nstarted_at: %s"}]' "$TS_5M_AGO")
 eq "(b) young same-branch run → LIVE" "$(live_sibling_run_for_branch 'crew/thies/wa-86jr-reland')" "LIVE ga-run-live"
 
 # (c) an OLD (>ceiling) run for THIS branch → "STALE <id>"
-MOCK_RUNS=$(printf '[{"id":"ga-run-stale","description":"Autonomous gate run for crew/thies/wa-86jr-reland.\\nstarted_at: %s"}]' "$TS_200M_AGO")
+MOCK_RUNS=$(printf '[{"id":"ga-run-stale","status":"open","description":"Autonomous gate run for crew/thies/wa-86jr-reland.\\nstarted_at: %s"}]' "$TS_200M_AGO")
 eq "(c) stale same-branch run → STALE" "$(live_sibling_run_for_branch 'crew/thies/wa-86jr-reland')" "STALE ga-run-stale"
 
 # (d) a young run for a DIFFERENT (prefix) branch → "" (must NOT match)
-MOCK_RUNS=$(printf '[{"id":"ga-run-other","description":"Autonomous gate run for crew/thies/wa-86jr.\\nstarted_at: %s"}]' "$TS_5M_AGO")
+MOCK_RUNS=$(printf '[{"id":"ga-run-other","status":"open","description":"Autonomous gate run for crew/thies/wa-86jr.\\nstarted_at: %s"}]' "$TS_5M_AGO")
 eq "(d) prefix-only branch (wa-86jr) does NOT match wa-86jr-reland" "$(live_sibling_run_for_branch 'crew/thies/wa-86jr-reland')" ""
 
 # (e) the longer branch IS matched when it is the one running
-MOCK_RUNS=$(printf '[{"id":"ga-run-base","description":"Autonomous gate run for crew/thies/wa-86jr.\\nstarted_at: %s"}]' "$TS_5M_AGO")
+MOCK_RUNS=$(printf '[{"id":"ga-run-base","status":"open","description":"Autonomous gate run for crew/thies/wa-86jr.\\nstarted_at: %s"}]' "$TS_5M_AGO")
 eq "(e) exact branch wa-86jr matches its own run" "$(live_sibling_run_for_branch 'crew/thies/wa-86jr')" "LIVE ga-run-base"
 
 # (f) missing started_at → conservative LIVE (never spawn a dup we can't age)
-MOCK_RUNS='[{"id":"ga-run-nots","description":"Autonomous gate run for crew/thies/wa-86jr-reland."}]'
+MOCK_RUNS='[{"id":"ga-run-nots","status":"open","description":"Autonomous gate run for crew/thies/wa-86jr-reland."}]'
 eq "(f) run with no started_at → conservative LIVE" "$(live_sibling_run_for_branch 'crew/thies/wa-86jr-reland')" "LIVE ga-run-nots"
+
+# ── ga-tgj23: closed/superseded sibling must NEVER be treated as live ─────────
+# Repro: ga-wisp-5yoelu5 carried label gate-status:superseded (correctly, a
+# single clean label) and status=closed, yet a stale/leaked gate-status:running
+# label on an EARLIER write (or an equivalent bd-list-layer inconsistency) could
+# still surface it as a YIELDING candidate — stranding the sibling marker
+# (ga-wisp-wkdz3xn, crew/mila/wa-ya17c) un-reviewed. These cases prove the fix:
+# status=open is REQUIRED regardless of how young/matching the candidate is.
+
+# (g) young, branch-matching, but status=closed → "" (NOT live — do not yield)
+MOCK_RUNS=$(printf '[{"id":"ga-run-dead","status":"closed","description":"Autonomous gate run for crew/mila/wa-ya17c.\\nstarted_at: %s"}]' "$TS_5M_AGO")
+eq "(g) closed sibling (young, branch-matching) → NOT live, no yield" "$(live_sibling_run_for_branch 'crew/mila/wa-ya17c')" ""
+
+# (h) status=closed with NO started_at (would hit the conservative-LIVE branch
+# in (f) if status were open) → still "" — the status gate short-circuits
+# BEFORE the missing-timestamp fallback ever runs.
+MOCK_RUNS='[{"id":"ga-run-dead-nots","status":"closed","description":"Autonomous gate run for crew/mila/wa-ya17c."}]'
+eq "(h) closed sibling with no started_at → NOT live (status gate wins)" "$(live_sibling_run_for_branch 'crew/mila/wa-ya17c')" ""
+
+# (i) missing status field entirely → treated as NOT confirmed open → NOT live.
+# Fail-safe direction: an uncertain sibling should not strand the marker forever;
+# a false-proceed is caught by the terminal-time supersede safety net instead.
+MOCK_RUNS=$(printf '[{"id":"ga-run-nostatus","description":"Autonomous gate run for crew/mila/wa-ya17c.\\nstarted_at: %s"}]' "$TS_5M_AGO")
+eq "(i) missing status field → NOT live (uncertain treated as not-open)" "$(live_sibling_run_for_branch 'crew/mila/wa-ya17c')" ""
+
+# (j) a genuinely live (status=open) sibling among a closed one still yields —
+# proves the fix filters PER-CANDIDATE, not the whole result set.
+MOCK_RUNS=$(printf '[{"id":"ga-run-dead2","status":"closed","description":"Autonomous gate run for crew/mila/wa-ya17c.\\nstarted_at: %s"},{"id":"ga-run-alive","status":"open","description":"Autonomous gate run for crew/mila/wa-ya17c.\\nstarted_at: %s"}]' "$TS_200M_AGO" "$TS_5M_AGO")
+eq "(j) closed + open siblings mixed → still yields to the OPEN one" "$(live_sibling_run_for_branch 'crew/mila/wa-ya17c')" "LIVE ga-run-alive"
 
 # ── 3. DRIFT GUARD: bug-1 live-sibling guard wired into the live dispatcher ───
 echo "── 3. drift guard: live-sibling run-creation guard present ──"
@@ -123,6 +152,7 @@ else
 fi
 has "$DISPATCHER" 'YIELDING \(one branch = one authoritative run\)' "LIVE sibling → yield (no duplicate run spawned)"
 has "$DISPATCHER" 'verdict=YIELDED'                                  "yield exits the sweep cleanly (no bead mutation)"
+has "$DISPATCHER" '\[ "\$status" = "open" \] \|\| continue'          "ga-tgj23: per-candidate status=open gate present (closed sibling never live)"
 has "$DISPATCHER" 'Superseding it and proceeding with a fresh run'  "STALE sibling → supersede + proceed"
 
 # ── 4. DRIFT GUARD: bug-2 task-delivery is timeout-bounded ───────────────────

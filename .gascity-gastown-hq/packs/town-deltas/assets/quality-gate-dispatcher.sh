@@ -536,15 +536,26 @@ classify_sibling_run() {
 }
 
 # live_sibling_run_for_branch <branch> — runtime resolver for the guard. Scans
-# OPEN gate-status:running gate-runs, matches one whose description names THIS
+# gate-status:running gate-runs, matches one whose description names THIS
 # branch (the trailing "." anchors the match so "wa-86jr" never matches
 # "wa-86jr-reland"), computes its age from started_at, and emits exactly one of:
 #   ""  (no live/stale sibling) | "LIVE <id>" | "STALE <id>"
+# ga-tgj23: every candidate ALSO requires status=open, checked explicitly here
+# rather than assumed from the label query alone. set_gate_status transitions a
+# bead's gate-status in TWO writes (remove old label, add new); a transient
+# bd/Dolt failure on the remove can leave a stale gate-status:running label on an
+# already-closed/superseded bead (the same leaked-label class documented at
+# set_gate_status, ga-jhyu). `.status` is the single authoritative bd-native
+# field for closed/open — checking it directly makes "closed is never live" true
+# independent of label consistency. A candidate we can't confirm status=open for
+# is treated as NOT live (skip): per the fail-safe below, a false-proceed here is
+# caught by the terminal-time supersede safety net (one branch, one authoritative
+# run), while a false-yield strands the marker for a full DISPATCHING_TTL cycle.
 # FAIL-OPEN: any bd/jq/date failure yields "" so a transient glitch can NEVER
 # block a legitimate run (identical to the pre-guard behavior). The decision it
 # defers to (classify_sibling_run) is the pure, unit-tested core.
 live_sibling_run_for_branch() {
-  local branch="$1" now_epoch run_json count i id desc started started_epoch age_min verdict
+  local branch="$1" now_epoch run_json count i id status desc started started_epoch age_min verdict
   [ -z "$branch" ] && return 0
   now_epoch=$(date +%s)
   run_json=$(bd -C "$GC_CITY" list --json \
@@ -556,8 +567,10 @@ live_sibling_run_for_branch() {
   [ "$count" = 0 ] && return 0
   for i in $(seq 0 $((count - 1))); do
     id=$(printf '%s\n' "$run_json" | jq -r ".[$i].id // empty" 2>/dev/null || echo "")
-    desc=$(printf '%s\n' "$run_json" | jq -r ".[$i].description // \"\"" 2>/dev/null || echo "")
     [ -z "$id" ] && continue
+    status=$(printf '%s\n' "$run_json" | jq -r ".[$i].status // \"\"" 2>/dev/null || echo "")
+    [ "$status" = "open" ] || continue   # closed/superseded/errored sibling is NEVER live
+    desc=$(printf '%s\n' "$run_json" | jq -r ".[$i].description // \"\"" 2>/dev/null || echo "")
     printf '%s\n' "$desc" | grep -qF "Autonomous gate run for ${branch}." || continue
     started=$(printf '%s\n' "$desc" | grep -E '^started_at:' | head -1 | sed 's/^started_at: *//' || true)
     if [ -z "$started" ]; then echo "LIVE $id"; return 0; fi   # no ts → conservative LIVE
