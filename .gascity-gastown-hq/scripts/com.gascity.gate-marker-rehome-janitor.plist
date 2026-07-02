@@ -30,7 +30,8 @@
 
        KILL-SWITCH: GATE_MARKER_REHOME_ENABLED=0 → no-op.
        DRY-RUN: GATE_MARKER_REHOME_DRY_RUN=1.
-       CADENCE: StartInterval=300 (5min, matches the gate sweep). No KeepAlive.
+       CADENCE: StartInterval=318 (~5min). Jittered off the 300s launchd tier to
+       decorrelate the simultaneous Dolt connect-storm (was 300). No KeepAlive.
        DPW_CRITICAL: registered in daemon-presence-watchdog.sh. -->
 
   <key>ProgramArguments</key>
@@ -42,7 +43,7 @@
   <key>WorkingDirectory</key>
   <string>/Users/athos/gt/.gascity-gastown-hq</string>
 
-  <key>StartInterval</key><integer>300</integer>
+  <key>StartInterval</key><integer>318</integer>
 
   <key>StandardOutPath</key>
   <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-marker-rehome-janitor.out</string>
