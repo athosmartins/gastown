@@ -31,7 +31,12 @@ DIFF=$(git diff; git diff --staged)
 DIFF=$(git diff --staged)
 
 # --branch: branch diff (detect base branch)
-BASE=$(git rev-parse --abbrev-ref HEAD@{upstream} 2>/dev/null | sed 's|origin/||' || git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo "main")
+# NOTE: check $BASE for emptiness directly rather than chaining with || —
+# in `cmd1 | sed ...`, the pipeline's exit status is sed's (always 0), so
+# a missing upstream/HEAD would silently swallow the fallback otherwise.
+BASE=$(git rev-parse --abbrev-ref HEAD@{upstream} 2>/dev/null | sed 's|origin/||')
+[ -z "$BASE" ] && BASE=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+BASE="${BASE:-main}"
 DIFF=$(git diff origin/$BASE...HEAD)
 
 # --pr <url>: PR diff
