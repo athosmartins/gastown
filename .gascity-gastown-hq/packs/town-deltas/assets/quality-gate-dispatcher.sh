@@ -3781,9 +3781,16 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             # Lines the branch added in this file (vs pre-merge main)
-            BRANCH_ADDITIONS=$(git_rig diff "$PRE_MERGE_MAIN" "origin/$BRANCH" -- "$f" 2>/dev/null | grep -c "^+" || echo "0")
+            # NOTE: `grep -c` ALREADY prints "0" on zero matches AND exits 1, so the old
+            # `|| echo "0"` appended a SECOND "0" → the var became "0\n0" (multiline) →
+            # the `[ "$X" -gt 0 ]` test below aborted the whole sweep under set -e
+            # ([: 0\n0: integer expression expected). `|| true` keeps grep's single "0"
+            # and neutralizes the exit code. Belt: strip to a bare integer.
+            BRANCH_ADDITIONS=$(git_rig diff "$PRE_MERGE_MAIN" "origin/$BRANCH" -- "$f" 2>/dev/null | grep -c "^+" || true)
+            BRANCH_ADDITIONS=$(printf '%s' "$BRANCH_ADDITIONS" | tr -dc '0-9'); BRANCH_ADDITIONS=${BRANCH_ADDITIONS:-0}
             # Lines that actually made it into merged main (vs pre-merge main)
-            MERGED_ADDITIONS=$(git_rig diff "$PRE_MERGE_MAIN" "$MERGED_HEAD" -- "$f" 2>/dev/null | grep -c "^+" || echo "0")
+            MERGED_ADDITIONS=$(git_rig diff "$PRE_MERGE_MAIN" "$MERGED_HEAD" -- "$f" 2>/dev/null | grep -c "^+" || true)
+            MERGED_ADDITIONS=$(printf '%s' "$MERGED_ADDITIONS" | tr -dc '0-9'); MERGED_ADDITIONS=${MERGED_ADDITIONS:-0}
 
             # If branch added lines to a file but the merged result has ZERO
             # additions relative to pre-merge main, the file was completely dropped.
