@@ -54,6 +54,15 @@ _should_skip_hot 200 150 && ok "hot: cpu 200 > 150 → skip prune" || bad "hot: 
 _should_skip_hot 40  150 && bad "cool: 40 should NOT skip" || ok "cool: cpu 40 < 150 → proceed"
 _should_skip_hot ""  150 && bad "unknown cpu should fail-open" || ok "unknown cpu → proceed (fail-open; probe is the harder gate)"
 
+# _dolt_cpu_pct must normalize a LOCALE decimal (comma OR dot) to a bare integer, so a
+# hot reading like "194,3%" actually trips skip-when-hot (regression: pt_BR comma).
+_gc_dolt_cpu_pct() { echo "194,3"; }   # stub the shared probe's ps reader (pt_BR format)
+n="$(_dolt_cpu_pct)"; [ "$n" = "194" ] && ok "cpu locale: '194,3' → 194 (comma stripped)" || bad "cpu locale got: '$n'"
+_should_skip_hot "$n" 150 && ok "cpu locale: normalized 194 > 150 → skip (hot-check fires)" || bad "cpu locale: 194 should skip"
+_gc_dolt_cpu_pct() { echo "62.4"; }    # dot-locale variant
+n="$(_dolt_cpu_pct)"; [ "$n" = "62" ] && ok "cpu locale: '62.4' → 62 (dot stripped)" || bad "cpu locale dot got: '$n'"
+unset -f _gc_dolt_cpu_pct
+
 # ── _backup_fresh: prune is gated on a recent backup ─────────────────────────────
 TMPB="$(mktemp -d)"; mkdir -p "$TMPB/hq"
 _backup_fresh "$TMPB" hq 26 && ok "backup: fresh staging dir within window → allow" || bad "backup: fresh dir should pass"

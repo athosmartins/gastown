@@ -112,7 +112,12 @@ _dolt_cpu_pct() {
     [ -z "$pid" ] && { echo ""; return; }
     c="$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ')"
   fi
-  case "$c" in ''|'?') echo "" ;; *) echo "${c%%.*}" ;; esac   # strip decimals
+  # strip the fractional part — ps renders it with a LOCALE decimal separator
+  # ('.' OR ',', e.g. "62,4" under pt_BR). Both must reduce to a bare integer, else
+  # the numeric guard in _should_skip_hot rejects "62,4" and fails open → the hot-check
+  # would never fire (it wouldn't skip even at 194%). Handle both separators.
+  case "$c" in ''|'?') echo ""; return ;; esac
+  c="${c%%.*}"; c="${c%%,*}"; echo "$c"
 }
 
 # _should_skip_hot <cpu_pct> <threshold> → 0 = skip (hot), 1 = proceed.
