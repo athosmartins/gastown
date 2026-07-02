@@ -452,7 +452,7 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
   NOW_EPOCH=$(date +%s)
 
   # One session snapshot for the whole sweep (reviewer-liveness lookups, ga-o57gn).
-  SESS_SNAP_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo '{}')
+  SESS_SNAP_JSON=$(bash "$GC_CITY/scripts/gc-session-list-cached.sh" 2>/dev/null || echo '{}')
 
   # ── First pass: build the dedup grouping key for every running gate-run. ────
   # ga-o57gn (c): enforce ≤1 running gate-run per marker. Key on marker_id
@@ -635,7 +635,7 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
 
       HAS_LIVE_ASSIGNEE=0
       if [ -n "$OI_ASSIGNEE" ] && [ "$OI_ASSIGNEE" != "null" ]; then
-        SESSION_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "{}")
+        SESSION_JSON=$(bash "$GC_CITY/scripts/gc-session-list-cached.sh" 2>/dev/null || echo "{}")
         SESSION_MATCH=$(echo "$SESSION_JSON" | jq -r --arg a "$OI_ASSIGNEE" '
           .sessions // [] |
           if any(.; .id == $a or .name == $a)
@@ -724,7 +724,7 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
 
     HAS_SC_ASSIGNEE=0
     if [ -n "$SC_ASSIGNEE" ] && [ "$SC_ASSIGNEE" != "null" ]; then
-      SC_SESSION_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "{}")
+      SC_SESSION_JSON=$(bash "$GC_CITY/scripts/gc-session-list-cached.sh" 2>/dev/null || echo "{}")
       SC_SESSION_MATCH=$(echo "$SC_SESSION_JSON" | jq -r --arg a "$SC_ASSIGNEE" '
         .sessions // [] |
         if any(.; .id == $a or .name == $a)
