@@ -22,14 +22,14 @@ Branch names MUST match `[a-z0-9/_-]+` only.
 
 | Variable | Source | Description |
 |----------|--------|-------------|
-| issue | caller | The STORY/bug bead you are fixing (e.g. `ga-xau4z`) — **NOT** your own ephemeral sling/task dispatch bead (e.g. `ga-e1yv1`, often available as `$GC_BEAD_ID`). Both are "assigned to this agent," but gate-done parses the bead id straight out of the branch name, so using the wrong one misdirects which bead the gate closes (see ga-pyxar). |
+| issue | caller | The STORY/bug bead you are fixing (e.g. `ga-xau4z`) — **NOT** your own ephemeral sling/task dispatch bead (e.g. `ga-e1yv1`, often available as `$GC_BEAD_ID`). Both are "assigned to this agent," but this formula's own step 5 writes `{{issue}}` directly into the gate marker's `bead_id`/`source-bead` fields when it creates the marker — a wrong `{{issue}}` corrupts those fields at that moment, independent of the branch name (see ga-pyxar). |
 """
 formula = "mol-do-work"
 version = 2
 
 [vars]
 [vars.issue]
-description = "The STORY/bug bead you are fixing (e.g. ga-xau4z) — NOT your own ephemeral sling/task dispatch bead (e.g. ga-e1yv1, often available as $GC_BEAD_ID). Both are technically \"assigned to this agent,\" but only the story bead belongs in the branch name and gate marker; using the sling bead misdirects gate-done's source-bead resolution (see ga-pyxar)."
+description = "The STORY/bug bead you are fixing (e.g. ga-xau4z) — NOT your own ephemeral sling/task dispatch bead (e.g. ga-e1yv1, often available as $GC_BEAD_ID). Both are technically \"assigned to this agent,\" but this formula's own step 5 writes {{issue}} directly into the gate marker's bead_id/source-bead fields when it creates the marker — a wrong {{issue}} corrupts those fields at that moment, independent of the branch name (see ga-pyxar)."
 required = true
 
 [[steps]]
@@ -56,9 +56,11 @@ Read the bead's title and description carefully. This is your task.
 titled "fix bug ga-xau4z: ..." means `{{issue}}` = `ga-xau4z`). It is NOT the
 ephemeral sling/task bead Pilot created to dispatch you — that one is usually
 your own `$GC_BEAD_ID` and gets closed separately in step 6, never branched on.
-Getting this backwards silently misdirects gate-done's source-bead resolution
-(ga-pyxar): the gate would try to close your already-closed sling bead and
-never close the real bug, so Pilot keeps re-dispatching it forever.
+Getting this backwards silently corrupts the gate marker that step 5 below
+creates — that step writes `{{issue}}` directly into the marker's
+`bead_id`/`source-bead` fields, independent of the branch name (ga-pyxar):
+the gate would try to close your already-closed sling bead and never close
+the real bug, so Pilot keeps re-dispatching it forever.
 
 Branch name MUST use only lowercase letters, digits, hyphens, underscores,
 and slashes — NO '+', uppercase, dots, or special characters.
