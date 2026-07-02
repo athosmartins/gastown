@@ -6,6 +6,13 @@
 # Also enforces integration branch landing guardrails: pushes to the default
 # branch that introduce integration branch content are blocked unless
 # GT_INTEGRATION_LAND=1 is set (only gt mq integration land sets this).
+#
+# The deployed copy at .git/hooks/pre-push has a "BEGIN/END BEADS
+# INTEGRATION" block appended after this section, managed independently by
+# `bd`. This tracked file covers only the custom section above that block —
+# and unlike post-checkout's tracked/deployed split, the deployed copy must
+# DROP this file's own trailing `exit 0` (see bottom) so control falls
+# through into the beads block instead of returning early. See ga-gdu3p.
 
 # Detect the rig's default branch dynamically.
 # Fallback chain matches Go implementation (git.RemoteDefaultBranch):
