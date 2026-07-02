@@ -76,13 +76,19 @@ exist, where does this symlink resolve, is this file tracked), cwd-relative
 indistinguishable from a real repo-root file also named `foo` unless you
 check which root you're measuring from.
 
-Before any such follow-up check:
+Before any such follow-up check, `cd` to the TRUE root — this is a required
+first step, not one of several options:
 ```bash
-git rev-parse --show-toplevel        # resolve the TRUE root — don't assume WorkDir is it
+cd "$(git rev-parse --show-toplevel)"   # don't assume WorkDir is the root
 ```
-Then verify root-relative — e.g. `git ls-files --full-name <path>` (not bare
-`git ls-files`), or `cd` to the resolved toplevel first. Do not treat
-cwd-relative output as root-relative. (ga-grxrh)
+Only then run `git ls-files --full-name <path>`, using `<path>` exactly as
+given in the pre-rendered diff (already root-relative). Do not treat
+cwd-relative output as root-relative — and do not skip the `cd`:
+`--full-name` only changes how *matched* paths are printed, it does not
+change how the `<path>` argument itself is resolved. Pathspec arguments are
+always resolved relative to cwd, so running `git ls-files --full-name
+<root-relative-path>` from WorkDir without `cd`-ing first silently matches
+nothing — a false negative, not an error. (ga-grxrh)
 
 ## Communication
 
