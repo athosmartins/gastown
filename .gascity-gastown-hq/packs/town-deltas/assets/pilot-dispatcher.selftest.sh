@@ -3341,12 +3341,21 @@ run_ps_worker_dispatch_own_guard() {
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
 
-echo "Scenario POOL-OWN-A (ga-sndpm): routed-pool dispatch REFUSED when candidate already has a crew branch (signal a)"
+echo "Scenario POOL-OWN-A (ga-sndpm): routed-pool dispatch REFUSED end-to-end when candidate already has a crew branch (signal a)"
 LOG_POA="$(run_ps_worker_dispatch_own_guard "[]" "$PS_WORKER_FX" "0" "ps-test1" "")"
-if echo "$LOG_POA" | grep -q "ga-sndpm: REFUSING routed-pool dispatch of ps-test1"; then
-  ok "pool-own(a): routed-pool dispatch refused when a crew branch already exists for the candidate"
+# NOTE: PILOT_TEST_CREW_BRANCH_BEADS is a static, whole-process test seam, so the
+# PRE-EXISTING ga-htjni guard (~L3392, earlier in the SAME dispatch_one() call)
+# sees the branch too and refuses first — this hermetic harness cannot make the
+# early check pass while the later ga-sndpm re-check fails, since both read the
+# identical seam. That's fine: the observable contract this scenario must prove
+# is the end-to-end one — a bead with an existing crew branch is NEVER routed to
+# the pool, by EITHER layer — so assert on the outcome (refused + no spawn), not
+# on which specific guard fired. Scenario POOL-OWN-B below proves the ga-sndpm
+# re-check code itself exists (structural), which the static-seam harness can't.
+if echo "$LOG_POA" | grep -q "REFUSING.*ps-test1\|REFUSING dispatch of ps-test1"; then
+  ok "pool-own(a): dispatch of a crew-branched candidate is refused (defense-in-depth: ga-htjni and/or ga-sndpm)"
 else
-  bad "pool-own(a): REGRESSION — no ga-sndpm refusal logged; a bead with an existing crew branch would still get gc.routed_to stamped (collision risk)"
+  bad "pool-own(a): REGRESSION — no refusal logged at all; a bead with an existing crew branch would get gc.routed_to stamped (collision risk)"
 fi
 if echo "$LOG_POA" | grep -q "session new ps-worker --no-attach"; then
   bad "pool-own(a): REGRESSION — pool worker spawn happened despite an existing crew branch for the candidate"
@@ -3354,12 +3363,13 @@ else
   ok "pool-own(a): pool worker spawn correctly skipped"
 fi
 
-echo "Scenario POOL-OWN-D (ga-sndpm): routed-pool dispatch REFUSED when candidate has an ACTIVE gate marker (signal d)"
+echo "Scenario POOL-OWN-D (ga-sndpm): routed-pool dispatch REFUSED end-to-end when candidate has an ACTIVE gate marker (signal d)"
 LOG_POD="$(run_ps_worker_dispatch_own_guard "[]" "$PS_WORKER_FX" "0" "" "ps-test1")"
-if echo "$LOG_POD" | grep -q "ga-sndpm: REFUSING routed-pool dispatch of ps-test1"; then
-  ok "pool-own(d): routed-pool dispatch refused when an active gate marker already exists for the candidate"
+# Same static-seam caveat as POOL-OWN-A above — asserting the end-to-end outcome.
+if echo "$LOG_POD" | grep -q "REFUSING.*ps-test1\|REFUSING dispatch of ps-test1"; then
+  ok "pool-own(d): dispatch of an actively-gated candidate is refused (defense-in-depth: ga-htjni and/or ga-sndpm)"
 else
-  bad "pool-own(d): REGRESSION — no ga-sndpm refusal logged; a bead being actively gated would still get gc.routed_to stamped (collision risk)"
+  bad "pool-own(d): REGRESSION — no refusal logged at all; a bead being actively gated would get gc.routed_to stamped (collision risk)"
 fi
 if echo "$LOG_POD" | grep -q "session new ps-worker --no-attach"; then
   bad "pool-own(d): REGRESSION — pool worker spawn happened despite an active gate marker for the candidate"
@@ -3369,7 +3379,7 @@ fi
 
 echo "Scenario POOL-OWN-CTL (ga-sndpm): control — routed-pool dispatch STILL proceeds when candidate is genuinely free"
 LOG_POCTL="$(run_ps_worker_dispatch_own_guard "[]" "$PS_WORKER_FX" "0" "" "")"
-if echo "$LOG_POCTL" | grep -q "ga-sndpm: REFUSING routed-pool dispatch"; then
+if echo "$LOG_POCTL" | grep -q "REFUSING"; then
   bad "pool-own(control): REGRESSION — a genuinely free candidate was refused (over-blocking)"
 else
   ok "pool-own(control): a genuinely free candidate is NOT refused (no over-blocking)"
@@ -3378,6 +3388,32 @@ if echo "$LOG_POCTL" | grep -q "session new ps-worker --no-attach"; then
   ok "pool-own(control): pool worker spawn still proceeds for a genuinely free candidate"
 else
   bad "pool-own(control): REGRESSION — pool worker spawn missing even with no competing ownership signal"
+fi
+
+echo "Scenario POOL-OWN-B (ga-sndpm): structural — routed-pool path re-verifies ownership guard before stamping gc.routed_to"
+# The behavioral scenarios above can't isolate the ga-sndpm re-check from the
+# pre-existing ga-htjni early guard (both read the same static test seam in this
+# hermetic harness — see the NOTE on POOL-OWN-A). These structural checks prove
+# the actual fix code exists in the right place, so a future edit that silently
+# drops the re-check (while leaving the early guard untouched) is caught even
+# though the two behave identically under the static-seam harness.
+has "$DISPATCHER" 'ga-sndpm: REFUSING routed-pool dispatch' \
+  "routed-pool path logs a distinct ga-sndpm refusal (re-check code present)"
+has "$DISPATCHER" 'pool_ownership_refuse' \
+  "routed-pool ownership refusal sets a distinct DISPATCH_RESULT"
+_OG_CALL_SITES=$(grep -c '_ownership_guard_should_refuse "\$STORY_ID" "\$STORY" "\$STORY_BEAD_CITY"' "$DISPATCHER")
+if [ "${_OG_CALL_SITES:-0}" -ge 2 ]; then
+  ok "_ownership_guard_should_refuse is invoked at 2+ sites (main guard + routed-pool re-check)"
+else
+  bad "REGRESSION — _ownership_guard_should_refuse invoked at only $_OG_CALL_SITES site(s); routed-pool re-check missing"
+fi
+# The re-check must sit BETWEEN the wa-worker*|ps-worker* case arm and the
+# pre-existing 'leave UNASSIGNED' no-op, i.e. BEFORE gc.routed_to is ever stamped.
+_POOL_ARM=$(awk '/wa-worker\*\|ps-worker\*\)/{f=1} f{print} f&&/pool: leave UNASSIGNED/{exit}' "$DISPATCHER")
+if printf '%s' "$_POOL_ARM" | grep -q '_ownership_guard_should_refuse'; then
+  ok "ownership re-check sits inside the wa-worker*/ps-worker* arm, before the unassigned no-op (correct placement)"
+else
+  bad "REGRESSION — ownership re-check not found between the pool case arm and the unassigned no-op (wrong placement or missing)"
 fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
