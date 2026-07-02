@@ -1327,33 +1327,87 @@ _filter_dispatch_gates() {
 # no git / no repo set / jq error → keep the candidate (never drop a real one on an
 # unresolved probe — the opposite of the reclaim-side fail-open).
 _filter_built() {
-  local repos arr id r built_ids=""
-  # Hermetic test seam: PILOT_TEST_BRANCH_BEADS lists ids treated as "built" (no git) —
-  # the same seam _beadid_has_branch uses.
-  if [ -n "${PILOT_TEST_BRANCH_BEADS+x}" ]; then
-    arr=$(cat)
-    printf '%s' "$arr" | jq --arg b "$PILOT_TEST_BRANCH_BEADS" \
-      '($b|split(" ")) as $bi | [ .[] | select(((.id as $i | $bi | index($i)) | not) or ((.labels // []) | index("gate:needs-fix"))) ]' \
-      2>/dev/null || printf '%s' "$arr"
-    return
-  fi
-  command -v git >/dev/null 2>&1 || { cat; return; }
-  repos="$(_ownership_guard_repos)"
-  [ -n "$repos" ] || { cat; return; }
+  local repos arr id r built_ids="" ingate_ids="" _bounced _glabel
   arr=$(cat)
-  while IFS= read -r id; do
+
+  # ── (wa-8y45 leak) GATE-MARKER + GATE-LABEL consultation ─────────────────────
+  # The branch probe below is BLIND to a bead whose crew branch was PRUNED while it
+  # sits in the quality gate: when the gate parks a marker at needs-rebase/error it
+  # prunes the crew branch, so the branch check reads "no branch → not built" and
+  # LEAKS the bead back as a FRESH candidate — even though it is already built and
+  # OWNED by the gate (the wa-8y45 leak: open marker ga-wisp-* @ needs-rebase,
+  # source-bead:wa-8y45, branch gone; the downstream imparavel-check was already
+  # hardened for this in c9a8413f1, now the Pilot must stop emitting it too).
+  #
+  # Mirrors imparavel-check.classify_bead + ownership-guard signal (d): a candidate
+  # is ALREADY-BUILT / IN-GATE (⇒ drop) when an OPEN type:quality-gate-marker names
+  # it (source-bead:<id>, ANY gate-status — needs-rebase/error are non-active but the
+  # bead is still in the pipeline) OR it carries a gate:* lifecycle label — EXCEPT
+  # gate:needs-fix, the gate-fix RE-DISPATCH loop, which stays a candidate UNLESS a
+  # marker is ACTIVELY re-gating it right now. That needs-fix carve-out reuses
+  # _beadid_has_active_gate_artifact (the exact signal-(d) semantics), so a needs-fix
+  # bead whose only marker is failed/error/needs-rebase still dispatches and we never
+  # reintroduce the rig-scan/held-until deadlock. Gate artifacts always live in the HQ
+  # store (GC_CITY) regardless of the bead's rig. FAIL-OPEN throughout: every gate
+  # read returns "not in gate" on any error, so an unreadable query NEVER drops a
+  # candidate (never wedge dispatch on a bad read).
+  while IFS=$'\t' read -r id _bounced _glabel; do
     [ -z "$id" ] && continue
-    while IFS= read -r r; do
-      [ -n "$r" ] && [ -d "$r" ] || continue
-      if git -C "$r" for-each-ref --format='%(refname)' \
-           "refs/remotes/origin/crew/*/$id" "refs/heads/crew/*/$id" 2>/dev/null | grep -q .; then
-        built_ids="${built_ids:+$built_ids }$id"; break
+    if [ "$_bounced" = "1" ]; then
+      # gate:needs-fix → re-dispatchable; drop ONLY if a marker is actively re-gating now.
+      if _beadid_has_active_gate_artifact "$id"; then
+        ingate_ids="${ingate_ids:+$ingate_ids }$id"
       fi
-    done <<< "$repos"
-  done < <(printf '%s' "$arr" | jq -r '.[]?.id // empty' 2>/dev/null)
-  [ -z "$built_ids" ] && { printf '%s' "$arr"; return; }
-  printf '%s' "$arr" | jq --arg b "$built_ids" \
-    '($b|split(" ")) as $bi | [ .[] | select(((.id as $i | $bi | index($i)) | not) or ((.labels // []) | index("gate:needs-fix"))) ]' \
+    elif [ "$_glabel" = "1" ] || _beadid_has_open_gate_marker "$id"; then
+      # a gate:* lifecycle label OR any OPEN quality-gate-marker → built / in the gate.
+      ingate_ids="${ingate_ids:+$ingate_ids }$id"
+    fi
+  done < <(printf '%s' "$arr" | jq -r '
+      .[]? | (.labels // []) as $L | (.id // "") as $id | select($id != "")
+      | [ $id,
+          (if ($L | index("gate:needs-fix")) then "1" else "0" end),
+          (if (($L | map(select(
+                (. == "gate" or startswith("gate:"))
+                and (. != "gate:needs-fix") and (startswith("gate:needs-fix:") | not)
+                and (. != "gate:needs-human") and (startswith("gate:needs-human") | not)
+              )) | length) > 0) then "1" else "0" end)
+        ] | @tsv' 2>/dev/null)
+
+  # ── Branch consultation (the original built-check) ───────────────────────────
+  # Hermetic test seam: PILOT_TEST_BRANCH_BEADS lists ids treated as "built" (no git) —
+  # the same seam _beadid_has_branch uses. No git / no repo set → no branch drops
+  # (fail-open to KEEP; the gate consultation above still applies independently).
+  if [ -n "${PILOT_TEST_BRANCH_BEADS+x}" ]; then
+    built_ids="$PILOT_TEST_BRANCH_BEADS"
+  elif command -v git >/dev/null 2>&1; then
+    repos="$(_ownership_guard_repos)"
+    if [ -n "$repos" ]; then
+      while IFS= read -r id; do
+        [ -z "$id" ] && continue
+        while IFS= read -r r; do
+          [ -n "$r" ] && [ -d "$r" ] || continue
+          if git -C "$r" for-each-ref --format='%(refname)' \
+               "refs/remotes/origin/crew/*/$id" "refs/heads/crew/*/$id" 2>/dev/null | grep -q .; then
+            built_ids="${built_ids:+$built_ids }$id"; break
+          fi
+        done <<< "$repos"
+      done < <(printf '%s' "$arr" | jq -r '.[]?.id // empty' 2>/dev/null)
+    fi
+  fi
+
+  # ── Combine: drop a candidate that is branch-built (except gate:needs-fix, whose
+  #    own fix-branch is expected) OR in-gate (ingate_ids already encodes the
+  #    needs-fix carve-out, so a needs-fix id is present here ONLY when actively
+  #    re-gated). FAIL-OPEN to the unfiltered array on any jq error.
+  if [ -z "$built_ids" ] && [ -z "$ingate_ids" ]; then
+    printf '%s' "$arr"; return
+  fi
+  printf '%s' "$arr" | jq --arg b "$built_ids" --arg g "$ingate_ids" '
+      ($b|split(" ")) as $bi | ($g|split(" ")) as $gi
+      | [ .[] | select(
+            ( ((.id as $i | $bi | index($i)) | not) or ((.labels // []) | index("gate:needs-fix")) )
+            and ((.id as $i | $gi | index($i)) | not)
+        ) ]' \
     2>/dev/null || printf '%s' "$arr"
 }
 
@@ -2165,6 +2219,40 @@ _beadid_has_active_gate_artifact() {
             ($l | index("gate-status:reviewing"))   or
             ($l | index("gate-status:running"))
           )
+      ] | length' 2>/dev/null || echo "0")
+  case "$_hit" in ''|0) return 1 ;; *) return 0 ;; esac
+}
+
+# _beadid_has_open_gate_marker <bead_id> — (wa-8y45) broader sibling of
+# _beadid_has_active_gate_artifact. Exit 0 iff an OPEN type:quality-gate-marker in the
+# HQ store (GC_CITY) names <bead_id> via source-bead:<id>, at ANY gate-status. Unlike
+# signal (d)'s ACTIVELY-processing filter, this ALSO counts parked/terminal marker
+# states (needs-rebase / error / passed / …): such a bead is ALREADY BUILT and sitting
+# in the gate pipeline — the crew branch is often PRUNED, so _filter_built's git probe
+# can't see it, yet the durable marker persists. Mirrors imparavel-check._gate_source_beads
+# (the downstream fix c9a8413f1). MARKER-only (runs are ephemeral); the exact
+# source-bead:<id> label (no id-prefix collision) in ONE read of the HQ store.
+# Test seam: PILOT_TEST_GATE_OPEN_BEADS (space-list), consulted when DEFINED, keeps the
+# selftest hermetic. FAIL-OPEN: no bd, any bd/jq error, or an empty read → return 1
+# (allow) — a bad gate-marker read must NEVER drop a candidate / wedge dispatch.
+_beadid_has_open_gate_marker() {
+  local _bid="${1:-}"
+  [ -n "$_bid" ] || return 1
+  if [ -n "${PILOT_TEST_GATE_OPEN_BEADS+x}" ]; then
+    case " $PILOT_TEST_GATE_OPEN_BEADS " in *" $_bid "*) return 0 ;; *) return 1 ;; esac
+  fi
+  command -v bd >/dev/null 2>&1 || return 1
+  local _arts _hit
+  _arts=$(bd -C "$GC_CITY" list -l "source-bead:$_bid" --json 2>/dev/null \
+    | jq -c 'if type=="array" then . else [.] end' 2>/dev/null || echo "")
+  [ -n "$_arts" ] || return 1
+  # Count OPEN quality-gate-markers for this source-bead, ANY gate-status. A closed
+  # or non-marker artifact contributes 0.
+  _hit=$(printf '%s' "$_arts" | jq -r '
+      [ .[]
+        | select(.status == "open")
+        | (.labels // []) as $l
+        | select( $l | index("type:quality-gate-marker") )
       ] | length' 2>/dev/null || echo "0")
   case "$_hit" in ''|0) return 1 ;; *) return 0 ;; esac
 }

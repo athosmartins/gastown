@@ -2562,14 +2562,17 @@ echo "Scenario 22g: HOL-block fix — built + gate-failed beads are excluded fro
 has "$DISPATCHER" 'exclude-label "gate:failed"'    "ctx:ready query excludes gate:failed (HOL-block layer 1)"
 has "$DISPATCHER" 'exclude-label "gate:needs-fix"' "ctx:ready query excludes gate:needs-fix (HOL-block layer 1)"
 # Layer 2 — _filter_built drops branched (built) candidates; behavioral unit + wiring.
-_FB_FN="$(awk '/^_filter_built\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
-FB_OUT="$(eval "$_FB_FN"; export PILOT_TEST_BRANCH_BEADS="wa-built"; printf '%s' '[{"id":"wa-built"},{"id":"wa-fresh"}]' | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
+# _filter_built now also consults the HQ gate markers (wa-8y45 leak), so extract its two
+# gate helpers alongside it. Gate seams are set EMPTY (defined→hermetic, no live Dolt) in
+# the branch-only cases so the gate consultation is a no-op there.
+_FB_FN="$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} /^_beadid_has_open_gate_marker\(\)/{f=1} /^_filter_built\(\)/{f=1} f{print} f&&/^}$/{f=0}' "$DISPATCHER")"
+FB_OUT="$(eval "$_FB_FN"; export PILOT_TEST_BRANCH_BEADS="wa-built" PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS=""; printf '%s' '[{"id":"wa-built"},{"id":"wa-fresh"}]' | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
 if [ "$FB_OUT" = '["wa-fresh"]' ]; then
   ok "_filter_built drops the built (branched) bead, keeps the fresh candidate"
 else
   bad "_filter_built logic wrong (got: '$FB_OUT')"
 fi
-FB_OPEN="$(eval "$_FB_FN"; printf '%s' '[{"id":"wa-built"},{"id":"wa-fresh"}]' | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
+FB_OPEN="$(eval "$_FB_FN"; export PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS=""; printf '%s' '[{"id":"wa-built"},{"id":"wa-fresh"}]' | _filter_built 2>/dev/null | jq -rc '[.[].id]' 2>/dev/null)"
 if [ "$FB_OPEN" = '["wa-built","wa-fresh"]' ]; then
   ok "_filter_built FAIL-OPEN keeps all candidates when branches are unprobeable (no false drop)"
 else
@@ -2579,7 +2582,7 @@ fi
 # MUST stay a candidate for re-dispatch (parity with the ownership-guard exemption 025b0cf58).
 # Dropping it would silently kill the gate-fix loop for self-repo rigs (local branch visible
 # to _filter_built), now that the HQ-empty fallback applies _filter_built (f7990dcf6).
-FB_NF="$(eval "$_FB_FN"; export PILOT_TEST_BRANCH_BEADS="wa-built wa-nf"
+FB_NF="$(eval "$_FB_FN"; export PILOT_TEST_BRANCH_BEADS="wa-built wa-nf" PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS=""
   printf '%s' '[{"id":"wa-built","labels":["story:approved"]},{"id":"wa-nf","labels":["story:approved","gate:needs-fix"]},{"id":"wa-fresh","labels":[]}]' \
     | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
 if [ "$FB_NF" = '["wa-nf","wa-fresh"]' ]; then
@@ -2587,7 +2590,63 @@ if [ "$FB_NF" = '["wa-nf","wa-fresh"]' ]; then
 else
   bad "_filter_built gate:needs-fix exemption broke (got: '$FB_NF')"
 fi
+
+# ── Scenario 22g-gate: _filter_built is GATE-MARKER-AWARE (wa-8y45 leak fix) ──────────
+# ROOT of the wa-8y45 leak: _filter_built decided "built?" ONLY by crew-branch existence.
+# When the gate parks a marker at needs-rebase/error it PRUNES the branch, so the git probe
+# read "no branch → not built" and LEAKED the in-gate bead back as a FRESH candidate (churn
+# + the class of confusion the downstream imparavel-check c9a8413f1 already patched). Now
+# _filter_built also drops a candidate that an OPEN quality-gate-marker names (source-bead)
+# OR that carries a gate:* lifecycle label — EXCEPT gate:needs-fix with no ACTIVE marker
+# (the re-fix loop). Seams: PILOT_TEST_GATE_OPEN_BEADS (any open marker) +
+# PILOT_TEST_GATE_ACTIVE_BEADS (actively-processing marker, reused signal-(d) helper).
+# Test BOTH directions: an in-gate bead must NOT leak; a fresh/re-fix bead must NOT be dropped.
+_fb() { # $1=OPEN-beads $2=ACTIVE-beads $3=input-json  → sorted id list; NO branch seam
+  ( eval "$_FB_FN"
+    export PILOT_TEST_GATE_OPEN_BEADS="$1" PILOT_TEST_GATE_ACTIVE_BEADS="$2"
+    printf '%s' "$3" | _filter_built 2>/dev/null | jq -rc '[.[].id]' 2>/dev/null )
+}
+# (i) open ACTIVE gate-marker (source-bead), NO branch → filtered as built/in-gate.
+FB_I="$(_fb "wa-ig" "wa-ig" '[{"id":"wa-ig","labels":["ctx:ready"]},{"id":"wa-fresh","labels":["ctx:ready"]}]')"
+[ "$FB_I" = '["wa-fresh"]' ] && ok "_filter_built(i): open ACTIVE marker + pruned branch → dropped (no leak)" \
+                             || bad "_filter_built(i): active-marker in-gate bead leaked (got: '$FB_I')"
+# (i-b) THE wa-8y45 REGRESSION: open NON-active marker (needs-rebase), NO branch, NO gate
+# label (it carried a stale ctx:ready at flag time) → still dropped via the open-marker signal.
+FB_R="$(_fb "wa-8y45" "" '[{"id":"wa-8y45","labels":["ctx:ready","exec:auto"]},{"id":"wa-fresh","labels":["ctx:ready"]}]')"
+[ "$FB_R" = '["wa-fresh"]' ] && ok "_filter_built(i-b): wa-8y45 open needs-rebase marker (non-active), pruned branch, stale ctx:ready → dropped (LEAK FIXED)" \
+                             || bad "_filter_built(i-b): wa-8y45 in-gate bead STILL LEAKS (got: '$FB_R')"
+# (ii) gate:needs-fix with ONLY a failed/error marker (non-active) → STILL dispatchable (re-fix).
+FB_NF2="$(_fb "wa-rf" "" '[{"id":"wa-rf","labels":["story:approved","gate:needs-fix"]},{"id":"wa-fresh","labels":["ctx:ready"]}]')"
+[ "$FB_NF2" = '["wa-rf","wa-fresh"]' ] && ok "_filter_built(ii): gate:needs-fix + only failed marker → kept (re-fix loop preserved; no deadlock)" \
+                                       || bad "_filter_built(ii): re-fix bead wrongly dropped — DEADLOCK regression (got: '$FB_NF2')"
+# (ii-b) carve-out BOUNDARY: gate:needs-fix WITH an active marker (re-queued) → dropped now.
+FB_NF3="$(_fb "wa-rq" "wa-rq" '[{"id":"wa-rq","labels":["story:approved","gate:needs-fix"]},{"id":"wa-fresh","labels":["ctx:ready"]}]')"
+[ "$FB_NF3" = '["wa-fresh"]' ] && ok "_filter_built(ii-b): gate:needs-fix + ACTIVE marker → dropped (actively re-gating, don't double-dispatch)" \
+                               || bad "_filter_built(ii-b): actively-regated needs-fix bead leaked (got: '$FB_NF3')"
+# (iii) normal fresh bead, no marker, no branch, no gate label → still a candidate.
+FB_F="$(_fb "" "" '[{"id":"wa-fresh","labels":["story:approved"]}]')"
+[ "$FB_F" = '["wa-fresh"]' ] && ok "_filter_built(iii): fresh bead (no marker/branch/gate-label) → kept as candidate" \
+                             || bad "_filter_built(iii): fresh candidate wrongly dropped (got: '$FB_F')"
+# (iv) live crew branch AND an in-gate bead compose: branch bead dropped, marker bead dropped, fresh kept.
+FB_IV="$(eval "$_FB_FN"; export PILOT_TEST_BRANCH_BEADS="wa-br" PILOT_TEST_GATE_OPEN_BEADS="wa-mk" PILOT_TEST_GATE_ACTIVE_BEADS=""
+  printf '%s' '[{"id":"wa-br","labels":[]},{"id":"wa-mk","labels":["ctx:ready"]},{"id":"wa-fresh","labels":[]}]' | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
+[ "$FB_IV" = '["wa-fresh"]' ] && ok "_filter_built(iv): branch bead + marker bead both dropped, fresh kept (branch behavior unchanged, composes with gate)" \
+                              || bad "_filter_built(iv): branch/gate composition wrong (got: '$FB_IV')"
+# (v) FAIL-OPEN: an unreadable gate-marker query must NOT drop a candidate. bd removed from
+# PATH + seams UNSET → both gate helpers fail-open (return "not in gate") → nothing dropped.
+FB_V="$(eval "$_FB_FN"; unset PILOT_TEST_GATE_OPEN_BEADS PILOT_TEST_GATE_ACTIVE_BEADS PILOT_TEST_BRANCH_BEADS
+  PATH="/usr/bin:/bin"; printf '%s' '[{"id":"wa-a","labels":["ctx:ready"]},{"id":"wa-b","labels":["ctx:ready"]}]' | _filter_built 2>/dev/null | jq -rc '[.[].id]' 2>/dev/null)"
+[ "$FB_V" = '["wa-a","wa-b"]' ] && ok "_filter_built(v): unreadable gate query (no bd) → FAIL-OPEN, no candidate dropped (dispatch never wedged)" \
+                               || bad "_filter_built(v): gate fail-open broke — would wedge dispatch (got: '$FB_V')"
+# (vi) gate:* lifecycle LABEL alone (marker pruned) → dropped via the label signal (imparavel-check parity).
+FB_VI="$(_fb "" "" '[{"id":"wa-rev","labels":["gate:reviewing"]},{"id":"wa-fresh","labels":["ctx:ready"]}]')"
+[ "$FB_VI" = '["wa-fresh"]' ] && ok "_filter_built(vi): gate:* lifecycle label (no marker) → dropped (label signal, imparavel-check parity)" \
+                             || bad "_filter_built(vi): gate:* label bead leaked (got: '$FB_VI')"
+
 has "$DISPATCHER" '_filter_built()'                        "_filter_built helper defined (HOL-block layer 2)"
+has "$DISPATCHER" '_beadid_has_open_gate_marker'           "_filter_built consults _beadid_has_open_gate_marker (any-open marker, wa-8y45 leak fix)"
+has "$DISPATCHER" '_beadid_has_active_gate_artifact "\$id"' "_filter_built reuses signal-(d) _beadid_has_active_gate_artifact for the needs-fix carve-out"
+has "$DISPATCHER" '_beadid_has_open_gate_marker()'         "_beadid_has_open_gate_marker helper defined"
 has "$DISPATCHER" '_filter_dispatch_gates | _filter_built' "_filter_built applied in the ctx:ready filter chain"
 # The HQ-empty rig FALLBACK scan (RIG_BUGS/RIG_DEBT/RIG_FEATURES) MUST apply the same
 # filter chain as WA_RIG_TIER2 — else built beads (wa-huo0d: branch + ready-for-gate, still
