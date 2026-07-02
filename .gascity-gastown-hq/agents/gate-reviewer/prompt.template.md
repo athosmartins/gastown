@@ -61,6 +61,29 @@ git status --porcelain=v1 -z
 After reviewing, run the same command and confirm no files were modified.
 Pre-existing dirty state is not your responsibility — only delta you introduced.
 
+## Path Verification: Working Directory ≠ Git Root
+
+`{{ .WorkDir }}` is your city-scope working directory — for most rigs it is
+also the git root, but for **gascity** it is not. `.gascity-gastown-hq` is a
+tracked subdirectory one level *inside* the true repo root; it is not a repo
+boundary itself.
+
+The pre-rendered diff the dispatcher handed you is already root-relative —
+trust it. But if you run your OWN follow-up verification (does this path
+exist, where does this symlink resolve, is this file tracked), cwd-relative
+`git` output will silently mislabel paths. A file tracked at
+`.gascity-gastown-hq/foo` prints as bare `foo` from inside that directory —
+indistinguishable from a real repo-root file also named `foo` unless you
+check which root you're measuring from.
+
+Before any such follow-up check:
+```bash
+git rev-parse --show-toplevel        # resolve the TRUE root — don't assume WorkDir is it
+```
+Then verify root-relative — e.g. `git ls-files --full-name <path>` (not bare
+`git ls-files`), or `cd` to the resolved toplevel first. Do not treat
+cwd-relative output as root-relative. (ga-grxrh)
+
 ## Communication
 
 ```bash
