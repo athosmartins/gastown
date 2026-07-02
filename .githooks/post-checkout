@@ -1,0 +1,47 @@
+#!/usr/bin/env sh
+# Gas Town branch protection
+# Auto-reverts to main if a non-main branch is checked out in the town root.
+# The town root must stay on main to avoid breaking gt commands.
+# NOTE: Git does NOT support pre-checkout hooks, so we auto-revert after.
+#
+# This hook lives in the COMMON .git dir, so it fires identically in every
+# linked worktree (all crew/dog worktrees under .gc-worktrees/), where
+# checking out a non-main branch is the correct, intended workflow. Only run
+# the auto-revert logic in the actual town-root worktree: --git-dir equals
+# --git-common-dir ONLY there; a linked worktree has its own private
+# git-dir under .git/worktrees/<name>. See ga-sm10n.
+#
+# The deployed copy at .git/hooks/post-checkout has a "BEGIN/END BEADS
+# INTEGRATION" block appended after this section, managed independently by
+# `bd`. This tracked file covers only the custom section above that block.
+if [ "$(git rev-parse --git-dir 2>/dev/null)" = "$(git rev-parse --git-common-dir 2>/dev/null)" ]; then
+    # Only check branch checkouts (not file checkouts)
+    # $3 is 1 for branch checkout, 0 for file checkout
+    if [ "$3" = "1" ]; then
+        # Get current branch after checkout
+        CURRENT_BRANCH=$(git branch --show-current 2>/dev/null)
+
+        # If on main or master, all good
+        if [ "$CURRENT_BRANCH" = "main" ] || [ "$CURRENT_BRANCH" = "master" ]; then
+            : # OK, continue with rest of hook
+        elif [ -n "$CURRENT_BRANCH" ]; then
+            # Non-main branch detected - auto-revert!
+            echo "" >&2
+            echo "⚠️  AUTO-REVERTING: Town root must stay on main branch" >&2
+            echo "" >&2
+            echo "   Detected checkout to '$CURRENT_BRANCH' in the Gas Town HQ directory." >&2
+            echo "   The town root should always be on main. Switching back..." >&2
+            echo "" >&2
+
+            # Revert to main
+            if git checkout main >/dev/null 2>&1; then
+                echo "   ✓ Reverted to main branch" >&2
+            elif git checkout master >/dev/null 2>&1; then
+                echo "   ✓ Reverted to master branch" >&2
+            else
+                echo "   ✗ Failed to revert - please run: git checkout main" >&2
+            fi
+            echo "" >&2
+        fi
+    fi
+fi
