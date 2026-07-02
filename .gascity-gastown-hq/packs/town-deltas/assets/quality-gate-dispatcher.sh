@@ -1958,6 +1958,35 @@ DEFAULT_BRANCH=$(echo "$RIG_LIST_JSON" \
 log "Fetching remote for rig $RIG ..."
 git_rig fetch origin 2>/dev/null || warn "git fetch failed (continuing with stale refs)"
 
+# ── ga-ymbv: shallow-clone preflight ──────────────────────────────────────────
+# A SHALLOW rig checkout can make every ancestry-walking command below
+# (merge-base, merge-base --is-ancestor, merge-tree) misreport two related
+# branches as having no common ancestor — not because the branches are
+# genuinely unrelated, but because their shared history sits past the shallow
+# fetch boundary. Verified empirically on this exact checkout (ga-ymbv): a
+# branch's root commit had a real parent per `git cat-file -p`, invisible to
+# `git log --parents` because of the shallow boundary; `git merge-base` came
+# back empty until `git fetch origin --unshallow` was run, after which it
+# resolved correctly for every branch against the current fetch boundary, not
+# just the one that surfaced the bug. Fixing it ONCE here, before any
+# downstream ancestry check runs, is cheaper and more robust than patching
+# each of the dozen+ merge-base/merge-tree call sites below individually.
+#
+# `rev-parse --is-shallow-repository` is O(1) (checks for a `.git/shallow`
+# marker file), so this is a cheap no-op on an already-full clone.
+# `fetch --unshallow` is local-only and non-destructive; a failure (e.g. a
+# transient network hiccup) is non-fatal — downstream ancestry checks simply
+# fall back to the pre-existing gate-status:error retry path, same as before
+# this fix.
+if [ "$(git_rig rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+  log "  Rig checkout ($GIT_DIR_PATH) is a shallow clone — running git fetch --unshallow so merge-base/merge-tree see full history (ga-ymbv)."
+  if git_rig fetch origin --unshallow >/dev/null 2>&1; then
+    log "  unshallow OK."
+  else
+    warn "  unshallow FAILED (non-fatal) — ancestry checks may still misreport merge-base=none for branches rooted past the fetch boundary."
+  fi
+fi
+
 # Verify branch exists on remote (ga-ljbx: hardened — a ref pointing at a missing
 # object yields EMPTY here, so we fail to gate-status:error, never proceed on garbage)
 BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH")
