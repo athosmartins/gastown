@@ -1205,6 +1205,22 @@ bd -C "$GC_CITY" update "$GATE_RUN_ID" \
   --notes "Guard claimed marker and created gate-run bead. Marker queued for autonomous dispatcher (G)." \
   2>/dev/null || true
 
+# ga-tkvsa (fixes ga-w5agg): persist the author THIS script just resolved
+# authoritatively (Step 5) onto the marker itself, via metadata (--set-metadata
+# is overwrite/last-write-wins, unlike label add — a worker cannot forge this by
+# pre-seeding a label at marker-creation time). The dispatcher re-derives author
+# independently at dispatch time (seconds to minutes later) from the SAME source
+# bead's assignee/created_by/owner — but Step 5 above (dog-pool detach, ga-e7zk7)
+# already cleared that bead's assignee in THIS SAME run, and created_by/owner are
+# never populated on programmatically-created sling beads either. Every
+# dog-submitted marker for a fix/* branch therefore hit the dispatcher's
+# author-unresolvable fail-safe and dead-ended at gate-status:deferred, which
+# nothing ever re-reads — not an edge case, the NORMAL dog lifecycle (submit,
+# close, exit before the dispatcher's next sweep). Recording the value here lets
+# the dispatcher trust it instead of re-deriving from a field this same guard run
+# is about to clear.
+bd -C "$GC_CITY" update "$MARKER_ID" --set-metadata "gate.submitted_by=$AUTHOR" -q 2>/dev/null || true
+
 # ── wa-qq33j: kanban sync — stamp source-bead + marker so the board shows in-review ──
 # (a) Add source-bead:$BEAD_ID and branch:$BRANCH labels to the marker so the
 #     painel's _parse_gate_marker can map marker → source-bead WITHOUT parsing

@@ -1620,17 +1620,40 @@ log "  branch=$BRANCH  bead_id=$BEAD_ID  rig=${RIG:-unknown}"
 # ── Step 3: Re-derive author authoritatively (never trust marker self-declaration)
 #
 # Resolution order (most-to-least authoritative):
+#   0. gate.submitted_by metadata already recorded on THIS marker by the guard
+#      at parking time (ga-tkvsa — see below).
 #   1. Look up the bead via "gc bd show" (cross-rig lookup — works for any rig DB).
 #   2. Try HQ DB directly as a fallback (in case gc bd fails).
 #   3. If assignee is a session-id (contains "adhoc"), map it back to the base
 #      crew role by stripping the adhoc suffix (e.g. "digo-wa-adhoc-e2510107f6" → "digo-wa").
 #
-# SECURITY: We do NOT trust the marker's self-declared author. The resolved value
-# is used solely for self-review exclusion. A partial/approximate match is safe
-# here: it only prevents a reviewer from reviewing their own work; it doesn't
-# grant access.
+# SECURITY: We do NOT trust the marker's self-declared author (the `author:`
+# line in its description). The resolved value is used solely for self-review
+# exclusion. A partial/approximate match is safe here: it only prevents a
+# reviewer from reviewing their own work; it doesn't grant access.
 
 AUTHOR=""
+
+# ga-tkvsa (fixes ga-w5agg): prefer the author the guard already resolved
+# authoritatively at submit time (quality-gate-guard.sh Step 7 records it as
+# gate.submitted_by metadata on the marker, via --set-metadata — overwrite
+# semantics, so a worker cannot forge this by pre-seeding it at marker-creation
+# time; the guard's write at parking time is always final). Re-deriving from the
+# source bead's assignee/created_by/owner below is a TOCTOU race: the guard's own
+# Step 5 (dog-pool detach, ga-e7zk7) clears the bead's assignee in the SAME run
+# that resolves AUTHOR, and created_by/owner are never populated on
+# programmatically-created sling beads either — so by the time this sweep runs
+# (seconds to minutes later, typically after the submitting dog has closed+exited
+# per dog doctrine), every dog-submitted marker for a fix/* branch hit the
+# fail-safe below and dead-ended at gate-status:deferred, which nothing ever
+# re-reads. $VERIFY_JSON was already fetched above (Step 1 claim-verification) —
+# reuse it rather than re-fetching.
+AUTHOR=$(printf '%s\n' "$VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .metadata["gate.submitted_by"] // empty' 2>/dev/null || true)
+if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
+  log "  Author recorded on marker by guard at submit time: $AUTHOR (trusted, ga-tkvsa; skipping bead re-derivation)"
+else
+  AUTHOR=""
+fi
 
 # bead_field_grep <raw_json_text> <field_name>
 # Extracts a simple string field from potentially-malformed JSON output.
@@ -1644,7 +1667,9 @@ bead_field_grep() {
     | head -1 || true
 }
 
-if [ -n "$BEAD_ID" ]; then
+# ga-tkvsa: only re-derive from the (possibly by-now-cleared) source bead when
+# the trusted marker-recorded value above didn't already resolve AUTHOR.
+if [ -z "$AUTHOR" ] && [ -n "$BEAD_ID" ]; then
   # 1. Cross-rig lookup via gc bd (authoritative — queries the owning rig's DB).
   #    This handles beads in rig DBs (e.g. wa-*, ps-*) that are NOT in the HQ DB.
   BEAD_RAW=$(gc --city "$GC_CITY" bd show "$BEAD_ID" --json 2>/dev/null || echo "")
