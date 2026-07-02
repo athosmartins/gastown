@@ -145,6 +145,18 @@ ERROR_REQUEUE_MAX_ATTEMPTS = int(os.environ.get("GRW_ERROR_REQUEUE_MAX_ATTEMPTS"
 GRW_REAP_FROZEN_ENABLED = os.environ.get("GRW_REAP_FROZEN_ENABLED", "1") != "0"
 FROZEN_KILL_SECS = int(os.environ.get("GRW_FROZEN_KILL_SECS", "900"))            # 15min of last_active silence on a STILL-active reviewer = definitively wedged (past the dispatcher's own detect+respawn cycle); SUSTAINED-confirmed on a resample before any kill
 FROZEN_KILL_MAX_PER_SWEEP = int(os.environ.get("GRW_FROZEN_KILL_MAX_PER_SWEEP", "2"))  # blast-radius cap: if MANY reviewers are silent at once (systemic Dolt/quota outage) killing them only churns — cap it and let the infra detectors + Mayor escalation handle a mass outage
+# FIX 4 — reap a QUEUED marker whose SOURCE is done, and clear a STALE gate:reviewing
+# label that STARVES a queued marker. Root (2026-07-02, a 9h head-of-line stall): a
+# reviewer that DRAINS during startup leaves `gate:reviewing` on its SOURCE bead with
+# NO terminal path to clear it → the dispatcher skips re-dispatch ("already in review")
+# → the marker starves forever (wa-ya17c queued 572min). Separately, several markers'
+# SOURCES had already CLOSED (work merged) but the queued markers were never reaped —
+# phantom queue depth that inflates the "oldest queued" alarm. FIX 1/2 don't cover a
+# gate-status:queued marker (they handle running-run reaps + gate-status:error). The
+# Mayor cleaned both by hand; this makes it durable.
+GRW_REAP_ORPHAN_ENABLED = os.environ.get("GRW_REAP_ORPHAN_ENABLED", "1") != "0"
+ORPHAN_MARKER_MIN_MINUTES = int(os.environ.get("GRW_ORPHAN_MARKER_MIN_MINUTES", "15"))  # a marker must be queued >this before FIX4 touches it — so a normal spin-up (source briefly gate:reviewing before the marker flips to dispatching) is never mistaken for a stale leak
+ORPHAN_MAX_PER_SWEEP = int(os.environ.get("GRW_ORPHAN_MAX_PER_SWEEP", "8"))
 RECOVERY_LOG = os.path.join(CITY, ".gc/logs/gate-recovery-actions.jsonl")        # durable jsonl audit of every direct reap/requeue (evidence)
 GRW_REQUEUE_LABEL_RE = re.compile(r"^grw-requeue:(\d+)$")                          # restart-safe per-marker requeue counter, stamped on the marker as a label
 # A repair dog's session title (set by the watchdog's --title-hint, and kept by the
@@ -1263,6 +1275,54 @@ def _source_bead_state(bead_id, rig_name=""):
     return (False, False, False)
 
 
+def _source_review_state(bead_id, rig_name=""):
+    """(resolved, closed, has_reviewing, store) for a marker's source bead — ONE read,
+    used by FIX 4 both to decide (close-source-done vs clear-stale-reviewing) and to know
+    WHICH store to clear the label in (the source lives in its RIG, not HQ). resolved=
+    False on any failure → FIX 4 fail-safe keeps the marker untouched."""
+    if not bead_id:
+        return (False, False, False, CITY)
+    rigp = _rig_paths().get(rig_name) if rig_name else None
+    tries = [CITY] + ([rigp] if (rigp and rigp != CITY) else [])
+    for st in tries:
+        r = sh(["bd", "-C", st, "show", bead_id, "--json"])
+        if not r or r.returncode != 0:
+            continue
+        try:
+            j = json.loads(r.stdout)
+            row = (j[0] if isinstance(j, list) and j else j) or {}
+        except Exception:
+            continue
+        if not row or not row.get("id"):
+            continue
+        labs = row.get("labels") or []
+        return (True, row.get("status") == "closed", "gate:reviewing" in labs, st)
+    return (False, False, False, CITY)
+
+
+def orphan_marker_verdict(age_sec, min_sec, resolved, source_closed, source_reviewing):
+    """PURE decision (no I/O, unit-tested) for FIX 4, on a gate-status:queued marker:
+      'close-source-done'     — source bead already CLOSED (work merged/done) → the marker
+                                is moot; close it (removes phantom queue depth).
+      'clear-stale-reviewing' — source still OPEN but carries gate:reviewing while the
+                                marker sits QUEUED (contradictory: queued≠in-review) → a
+                                leaked label from a reviewer that drained during startup;
+                                clear it so the dispatcher re-dispatches instead of
+                                skipping the marker as 'already in review'.
+      'wait'                  — younger than min_sec (a legit spin-up window).
+      'keep'                  — source unreadable (fail-safe) or nothing to do.
+    close-source-done takes precedence over clear (a closed source is done regardless)."""
+    if age_sec < min_sec:
+        return "wait"
+    if not resolved:
+        return "keep"
+    if source_closed:
+        return "close-source-done"
+    if source_reviewing:
+        return "clear-stale-reviewing"
+    return "keep"
+
+
 def _session_index(sessions):
     """{identifier: session-dict} across every name field a verdict-bead assignee
     could carry (session_name/name/alias/agent_name/id — verified equal live)."""
@@ -1590,6 +1650,65 @@ def reap_frozen_reviewers(sessions, now):
         print("[watchdog] frozen-reviewer sweep: %d killed%s" % (killed, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
 
 
+def reap_orphan_and_stale_markers(now):
+    """FIX 4: for each open gate-status:queued/ready/claimed marker older than
+    ORPHAN_MARKER_MIN_MINUTES, either close it (SOURCE already closed → orphaned/phantom
+    depth) or clear a leaked gate:reviewing on its OPEN source (the head-of-line
+    STARVATION root — a reviewer drained during startup and left the label, so the
+    dispatcher skips re-dispatch forever). FIX 1/2 don't cover this (they handle
+    running-run reaps + gate-status:error). Bounded, dry-run-aware, fully fail-safe:
+    an unreadable source → keep; a query failure → skip the whole sweep."""
+    if not GRW_ENABLED or not GRW_REAP_ORPHAN_ENABLED:
+        return
+    r = sh(["bd", "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",
+            "--status", "open", "--json"], timeout=25)
+    if not r or r.returncode != 0:
+        return  # query failure → fail-safe skip (no blind action)
+    try:
+        markers = json.loads(r.stdout) or []
+    except Exception:
+        return
+    acted = 0
+    for m in markers:
+        if acted >= ORPHAN_MAX_PER_SWEEP:
+            break
+        mid = m.get("id")
+        if not mid:
+            continue
+        if _label_value(m, "gate-status:") not in ("queued", "ready", "claimed"):
+            continue
+        age = int(now - (_iso_epoch(m.get("updated_at")) or now))
+        src = _label_value(m, "source-bead:")
+        rig = _label_value(m, "bead-rig:") or _label_value(m, "rig:")
+        resolved, closed, reviewing, store = _source_review_state(src, rig)
+        v = orphan_marker_verdict(age, ORPHAN_MARKER_MIN_MINUTES * 60, resolved, closed, reviewing)
+        if v in ("wait", "keep"):
+            continue
+        if GRW_DRY_RUN:
+            print("[watchdog] FIX4 DRY would %s marker=%s src=%s age=%dm" % (v, mid, src, age // 60), flush=True)
+            _recovery_ledger("would_" + v.replace("-", "_"),
+                             {"marker": mid, "source_bead": src, "age_min": age // 60, "dry_run": True})
+            acted += 1
+            continue
+        if v == "close-source-done":
+            set_gate_status_py(mid, "superseded")
+            sh(["bd", "-C", CITY, "close", mid, "-r",
+                "source bead %s already CLOSED (work merged/done) — orphaned queued marker reaped (grw FIX4 phantom-depth self-heal — the manual cleanup the Mayor did by hand)" % src], timeout=25)
+            _recovery_ledger("close_orphan_marker", {"marker": mid, "source_bead": src, "age_min": age // 60})
+            notify("Gate self-heal: marker órfão fechado (%s — fonte %s já concluída). Profundidade-fantasma da fila removida." % (mid, src), 3)
+            print("[watchdog] FIX4 CLOSED orphan marker=%s (source %s closed, %dm) — phantom queue depth removed" % (mid, src, age // 60), flush=True)
+        else:  # clear-stale-reviewing
+            sh(["bd", "-C", store, "label", "remove", src, "gate:reviewing", "-q"], timeout=20)
+            sh(["bd", "-C", store, "comment", src,
+                "grw FIX4: cleared STALE gate:reviewing (marker %s sat QUEUED %dm while source carried gate:reviewing — a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved)." % (mid, age // 60)], timeout=20)
+            _recovery_ledger("clear_stale_reviewing", {"marker": mid, "source_bead": src, "store": store, "age_min": age // 60})
+            notify("Gate self-heal: gate:reviewing fantasma limpo em %s (marker %s estava faminto %dmin). Volta a despachar." % (src, mid, age // 60), 3)
+            print("[watchdog] FIX4 CLEARED stale gate:reviewing on %s (marker %s starved %dm) — starvation self-heal" % (src, mid, age // 60), flush=True)
+        acted += 1
+    if acted:
+        print("[watchdog] FIX4 orphan/stale sweep: %d marker(s) actioned%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
+
+
 def _open_error_markers():
     """[marker dicts] type:quality-gate-marker + gate-status:error + open, in HQ (the
     dispatcher's domain — it only re-processes HQ queued markers). None on query
@@ -1728,9 +1847,11 @@ def main():
         % (MAX_ACTIVE_REPAIR_DOGS, MAX_SPAWNS_PER_CONDITION, GRW_ENABLED, GRW_DRY_RUN), flush=True)
   print("[watchdog] + DIRECT self-heal each sweep: reap HUNG reviewers (run>%dm, 0 verdicts, dead reviewer sustained; enabled=%s) "
         "AND kill FROZEN reviewers (active-but-last_active-silent>%ds, cap %d/sweep, sustained-confirmed; enabled=%s) "
+        "AND reap ORPHAN/STALE markers (queued>%dm w/ source closed→close, or leaked gate:reviewing→clear, cap %d/sweep; enabled=%s) "
         "AND auto-requeue STUCK gate-status:error markers (>%dm in error, cap %d/sweep, osc-escalate after %d; enabled=%s). "
         "All bounded + fail-safe + dry_run=%s."
         % (REVIEW_HANG_MINUTES, GRW_REAP_HUNG_ENABLED, FROZEN_KILL_SECS, FROZEN_KILL_MAX_PER_SWEEP, GRW_REAP_FROZEN_ENABLED,
+           ORPHAN_MARKER_MIN_MINUTES, ORPHAN_MAX_PER_SWEEP, GRW_REAP_ORPHAN_ENABLED,
            ERROR_REQUEUE_MINUTES, ERROR_REQUEUE_MAX_PER_SWEEP, ERROR_REQUEUE_MAX_ATTEMPTS, GRW_REQUEUE_ERROR_ENABLED, GRW_DRY_RUN), flush=True)
 
   while True:
@@ -1753,6 +1874,10 @@ def main():
             reap_frozen_reviewers(sessions, now)
         except Exception as e:
             print("[watchdog] reap_frozen_reviewers error (continuing): %r" % e, flush=True)
+        try:
+            reap_orphan_and_stale_markers(now)
+        except Exception as e:
+            print("[watchdog] reap_orphan_and_stale_markers error (continuing): %r" % e, flush=True)
         try:
             requeue_error_markers(now, rstate)
         except Exception as e:
@@ -1874,7 +1999,15 @@ def _selftest():
     # the two forms above name the SAME instant → equal epochs (offset math correct)
     a = _last_active_epoch("2026-07-02T16:06:29-03:00"); b = _last_active_epoch("2026-07-02T19:06:29Z")
     ok(a is not None and b is not None and abs(a - b) < 1, "-03:00 and its UTC-Z equivalent map to the same epoch")
-    print("gate-recovery-watchdog FIX3 selftest: PASS=%d FAIL=%d" % (p, f))
+    # FIX 4 — orphan_marker_verdict (queued-marker cleanup)
+    M = 15 * 60
+    ok(orphan_marker_verdict(9 * 60, M, True, True, True) == "wait", "young marker (9m<15m) → wait (spin-up race window)")
+    ok(orphan_marker_verdict(600 * 60, M, True, True, False) == "close-source-done", "old + source CLOSED → close orphan (the ga-sndpm case)")
+    ok(orphan_marker_verdict(600 * 60, M, True, True, True) == "close-source-done", "closed source WINS over reviewing (done regardless)")
+    ok(orphan_marker_verdict(572 * 60, M, True, False, True) == "clear-stale-reviewing", "old + source OPEN + gate:reviewing → clear stale (the wa-ya17c case)")
+    ok(orphan_marker_verdict(572 * 60, M, True, False, False) == "keep", "old + source open + no reviewing → keep (nothing stale)")
+    ok(orphan_marker_verdict(600 * 60, M, False, False, False) == "keep", "source UNREADABLE → keep (fail-safe, never blind-close)")
+    print("gate-recovery-watchdog FIX3+FIX4 selftest: PASS=%d FAIL=%d" % (p, f))
     return 0 if f == 0 else 1
 
 
