@@ -3343,10 +3343,21 @@ run_ps_worker_dispatch_own_guard() {
 
 echo "Scenario POOL-OWN-A (ga-sndpm): routed-pool dispatch REFUSED when candidate already has a crew branch (signal a)"
 LOG_POA="$(run_ps_worker_dispatch_own_guard "[]" "$PS_WORKER_FX" "0" "ps-test1" "")"
-if echo "$LOG_POA" | grep -q "ga-sndpm: REFUSING routed-pool dispatch of ps-test1"; then
+# ga-6hkzy: PILOT_TEST_CREW_BRANCH_BEADS is a STATIC seam, visible for the whole
+# dispatch_one() call — so the EARLY ga-htjni guard (~L3392, right after claim) sees
+# the signal and refuses BEFORE the LATE ga-sndpm re-verification (~L4005, right before
+# the pool write) is ever reached. Confirmed via the un-grepped dispatcher log: it shows
+# "ga-htjni: REFUSING dispatch of ps-test1 ... (branch:crew/*/ps-test1)", never the
+# ga-sndpm line. That's correct layering, not a regression — ga-sndpm exists to catch a
+# signal that FIRST appears in the wall-clock gap between the two checks (a real race a
+# static seam can't simulate, see the ga-sndpm block comment). Accept refusal from EITHER
+# guard as the pass condition (both give the identical collision-safe outcome); signal-(a)
+# logic itself already has isolated unit coverage under Scenario 22h (ga-htjni). The
+# ga-sndpm call site's continued existence is verified structurally below (POOL-OWN-STRUCT).
+if echo "$LOG_POA" | grep -Eq "ga-(htjni|sndpm): REFUSING (routed-pool )?dispatch of ps-test1"; then
   ok "pool-own(a): routed-pool dispatch refused when a crew branch already exists for the candidate"
 else
-  bad "pool-own(a): REGRESSION — no ga-sndpm refusal logged; a bead with an existing crew branch would still get gc.routed_to stamped (collision risk)"
+  bad "pool-own(a): REGRESSION — no ownership-guard refusal logged; a bead with an existing crew branch would still get gc.routed_to stamped (collision risk)"
 fi
 if echo "$LOG_POA" | grep -q "session new ps-worker --no-attach"; then
   bad "pool-own(a): REGRESSION — pool worker spawn happened despite an existing crew branch for the candidate"
@@ -3356,10 +3367,12 @@ fi
 
 echo "Scenario POOL-OWN-D (ga-sndpm): routed-pool dispatch REFUSED when candidate has an ACTIVE gate marker (signal d)"
 LOG_POD="$(run_ps_worker_dispatch_own_guard "[]" "$PS_WORKER_FX" "0" "" "ps-test1")"
-if echo "$LOG_POD" | grep -q "ga-sndpm: REFUSING routed-pool dispatch of ps-test1"; then
+# ga-6hkzy: same static-seam reasoning as POOL-OWN-A above — ga-htjni fires first with
+# "(gating:active)" and the dispatch never reaches the ga-sndpm re-verification call site.
+if echo "$LOG_POD" | grep -Eq "ga-(htjni|sndpm): REFUSING (routed-pool )?dispatch of ps-test1"; then
   ok "pool-own(d): routed-pool dispatch refused when an active gate marker already exists for the candidate"
 else
-  bad "pool-own(d): REGRESSION — no ga-sndpm refusal logged; a bead being actively gated would still get gc.routed_to stamped (collision risk)"
+  bad "pool-own(d): REGRESSION — no ownership-guard refusal logged; a bead being actively gated would still get gc.routed_to stamped (collision risk)"
 fi
 if echo "$LOG_POD" | grep -q "session new ps-worker --no-attach"; then
   bad "pool-own(d): REGRESSION — pool worker spawn happened despite an active gate marker for the candidate"
@@ -3379,6 +3392,18 @@ if echo "$LOG_POCTL" | grep -q "session new ps-worker --no-attach"; then
 else
   bad "pool-own(control): REGRESSION — pool worker spawn missing even with no competing ownership signal"
 fi
+
+echo "Scenario POOL-OWN-STRUCT (ga-sndpm): structural — ownership guard still re-verified at BOTH call sites"
+# POOL-OWN-A/D above can only observe whichever guard fires FIRST (ga-htjni, by code
+# order) when driven through a static test seam — they cannot behaviorally reach the LATE
+# ga-sndpm call site to prove it specifically still exists. Guard that gap structurally
+# instead (same idiom as the engaged-skip dual-loop check ~L937): count call sites of the
+# exact guard invocation. Expect >=2 (ga-htjni ~L3394 + ga-sndpm ~L4005) — if a future
+# refactor deletes the late re-verification, this count drops to 1 and catches the
+# regression even though POOL-OWN-A/D would stay green (masked by the early guard).
+[ "$(grep -cE '_ownership_guard_should_refuse "\$STORY_ID" "\$STORY" "\$STORY_BEAD_CITY"' "$DISPATCHER")" -ge 2 ] \
+  && ok "ga-sndpm: ownership guard re-verified at BOTH call sites (early ga-htjni + late pool-write re-check)" \
+  || bad "ga-sndpm: ownership guard call-site count regressed — late re-verification before the pool write may have been removed (claim-to-write race window reopened)"
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
