@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+# ── Runtime expectation (ga-iuzk1) ─────────────────────────────────────────
+# This is BY FAR the largest file in this directory: ~380 assertions driven
+# through ~94 real `pilot-dispatcher.sh` subprocess invocations (each spawns
+# a fresh bash interpreter for the ~4500-line dispatcher). Measured full-run
+# wall time: ~140s (2026-07-02, on the reference dev host) — vs. a sibling
+# median around 150-200 lines / well under 15s. If you're batch-verifying
+# every `*.selftest.sh` in this directory with a uniform short bound (a
+# `timeout 15` sweep is the go-to convention here), that bound WILL kill this
+# file mid-run with no PASS/FAIL summary. That is NOT a hang — every scenario
+# passes given enough time (383/383 as of this writing; see ga-iuzk1). Give
+# this file its own `timeout 180` (or no bound) rather than reusing the
+# per-file default that's sized for its much smaller siblings.
+#
 # pilot-dispatcher.selftest.sh — Regression harness for the Pilot dispatcher.
 #
 # Covers:
