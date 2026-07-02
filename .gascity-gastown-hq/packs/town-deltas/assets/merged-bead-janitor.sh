@@ -627,11 +627,13 @@ fetch_once "$HQ_GITDIR" "$HQ_CONTAINER"
 
 CLOSED_COUNT=0
 SIBLING_ADVISORIES=0
+INFLIGHT_CLOSED_COUNT=0 # ga-hcj4: stranded open+story:in-flight beads closed (Pilot sling-wrapper gap)
 DONE_COUNT=0   # ga-gosfs: stories reconciled story:approved → story:done
 CONVOY_COUNT=0 # convoy-reconciler: orphaned wrapper/coordination beads closed
 CONVOY_MAX_PER_SWEEP="${CONVOY_MAX_PER_SWEEP:-60}" # anti-Dolt-spike: cap REAL closes/sweep; the ~480 backlog drains over a few 15min sweeps instead of 480 commits at once
 BRANCH_PRUNE_COUNT=0 # ga-tijv5 extension: merged crew branches pruned this sweep
 declare -a CLOSED_SUMMARY=()
+declare -a INFLIGHT_CLOSED_SUMMARY=()
 declare -a DONE_SUMMARY=()
 declare -a CONVOY_SUMMARY=()
 declare -a BRANCH_PRUNE_SUMMARY=()
@@ -768,6 +770,100 @@ EOF
 $(printf '%s' "$INPROG" | jq -rc '.[]?')
 EOF
   fi  # end in_progress pass guard (N != 0)
+
+  # ── ga-hcj4: stranded open+story:in-flight sweep (Pilot sling-wrapper gap) ──
+  # WHY a bucket alongside in_progress/story:approved: Pilot's "fix bug X" / "fix
+  # story X" dispatch convention creates a ROTATING SLING-TASK WRAPPER bead per
+  # redispatch attempt (e.g. ga-a1tdi, ga-dp7s, ga-flwo). The wrapper cycles
+  # through open/in_progress/closed, but the underlying WORK bead (bug/task, or a
+  # story whose gate-PASS handoff never stripped the label) stays status=open with
+  # label story:in-flight the ENTIRE time — it is never itself in_progress and
+  # never carries story:approved, so it falls into NEITHER sweep, no matter how
+  # long its own "fix bug <id>:"/"fix(<id>):" scoped commit has sat merged in
+  # origin/main (ga-ap7od: commit merged 1h48m past a healthy 15min sweep cadence,
+  # invisible because the WRAPPER, not the bead, was the in_progress row each time).
+  #
+  # Reuses janitor_decide UNCHANGED — same triangulation as the in_progress sweep
+  # (commit-subject-scope / terminal marker / branch-ancestor, keyed on the bead's
+  # OWN id) — this bucket only widens which beads FEED that decision. Signal
+  # computation below mirrors the in_progress sweep line-for-line (F_-prefixed
+  # vars); see that sweep's comments above for the false-close history each guard
+  # defends against (repo-scoping, branch self-guard, strict subject-scope).
+  INFLIGHT=$(bd -C "$RPATH" list --status open --json -l story:in-flight 2>/dev/null || echo '[]')
+  [ -z "$INFLIGHT" ] && INFLIGHT='[]'
+  FN=$(printf '%s' "$INFLIGHT" | jq 'length' 2>/dev/null || echo 0)
+  [ "$FN" = "0" ] || log "rig $RNAME ($RPREFIX): $FN open story:in-flight bead(s) to check for stranded-wrapper reconciliation"
+
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    FID=$(printf '%s' "$f" | jq -r '.id' 2>/dev/null || true)
+    FTYPE=$(printf '%s' "$f" | jq -r '(.issue_type // .type // "")' 2>/dev/null || true)
+    FTITLE=$(printf '%s' "$f" | jq -r '(.title // "")[0:60]' 2>/dev/null || true)
+    [ -z "$FID" ] && continue
+
+    F_EPIC=0; [ "$FTYPE" = "epic" ] && F_EPIC=1
+
+    FMK=$(markers_for_bead "$FID")
+    F_HASOPEN=0; has_open_marker "$FMK" && F_HASOPEN=1
+    F_SIGMARKER=0; has_terminal_passed_marker "$FMK" && F_SIGMARKER=1
+
+    # Signal A — same strict subject-scope commit scan + rig/HQ repo-scoping as
+    # the in_progress sweep above.
+    F_SIGCOMMIT=0; F_COMMIT_EVID=""
+    if [ "$F_EPIC" = "0" ] && [ "$F_HASOPEN" = "0" ]; then
+      if sha=$(scan_commit_subject_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$FID"); then
+        F_SIGCOMMIT=1; F_COMMIT_EVID="$RNAME origin/$RDEFAULT@${sha:0:9}"
+      elif [ "${FID%%-*}" != "$RPREFIX" ] && [ "$RGITDIR" != "$HQ_GITDIR" ] \
+           && sha=$(scan_commit_subject_for_bead "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$FID"); then
+        F_SIGCOMMIT=1; F_COMMIT_EVID="hq origin/$HQ_DEFAULT@${sha:0:9}"
+      fi
+    fi
+
+    # Signal C — branch ancestor of origin/main, same final-path-segment self-guard
+    # (must equal this bead id) as the in_progress sweep above.
+    F_SIGBRANCH=0; F_BRANCH_EVID=""
+    if [ "$F_EPIC" = "0" ] && [ "$F_HASOPEN" = "0" ] && [ "$F_SIGCOMMIT" = "0" ] && [ "$F_SIGMARKER" = "0" ]; then
+      declare -a FCANDS=()
+      while IFS= read -r br; do [ -n "$br" ] && FCANDS+=("$br"); done <<EOF
+$(branch_label_from_markers "$FMK")
+EOF
+      while IFS= read -r br; do [ -n "$br" ] && FCANDS+=("$br"); done <<EOF
+$(git_in "$RGITDIR" "$RCONTAINER" for-each-ref --format='%(refname:short)' 'refs/remotes/origin/**' 2>/dev/null | sed 's#^origin/##' | awk -v id="$FID" -F/ '$NF==id' || true)
+EOF
+      for br in "${FCANDS[@]:-}"; do
+        [ -z "$br" ] && continue
+        case "$br" in */"$FID") : ;; *) continue ;; esac
+        if branch_merged "$RGITDIR" "$RCONTAINER" "origin/$br" "origin/$RDEFAULT"; then
+          F_SIGBRANCH=1; F_BRANCH_EVID="origin/$br ⊑ origin/$RDEFAULT"; break
+        fi
+      done
+    fi
+
+    F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH")
+    F_VERDICT="${F_VERDICT_LINE%%:*}"; F_REASON="${F_VERDICT_LINE#*:}"
+
+    if [ "$F_VERDICT" = "close" ]; then
+      F_EVID="$F_REASON"
+      [ -n "$F_COMMIT_EVID" ] && F_EVID="$F_EVID [$F_COMMIT_EVID]"
+      [ -n "$F_BRANCH_EVID" ] && F_EVID="$F_EVID [$F_BRANCH_EVID]"
+      [ "$F_SIGMARKER" = "1" ] && F_EVID="$F_EVID [terminal-marker]"
+      if [ "$DRY_RUN" = "1" ]; then
+        log "WOULD-CLOSE-INFLIGHT $FID ($RNAME) — $F_EVID — \"$FTITLE\""
+      else
+        F_REASON_MSG="merged-bead-janitor ($SOURCE_BEAD, ga-hcj4 stranded-wrapper reconciliation): work merged to origin/main — $F_EVID. Bead was stuck open+story:in-flight — the Pilot sling-wrapper dispatch convention never put the bead ITSELF in_progress, so the in_progress sweep never scanned it. Auto-closed."
+        bd -C "$RPATH" close "$FID" -r "$F_REASON_MSG" 2>/dev/null \
+          && log "CLOSED-INFLIGHT $FID ($RNAME) — $F_EVID" \
+          || { err "in-flight close failed for $FID ($RNAME)"; continue; }
+        bd -C "$RPATH" label remove "$FID" "story:in-flight" -q 2>/dev/null || true
+        INFLIGHT_CLOSED_COUNT=$((INFLIGHT_CLOSED_COUNT+1))
+        INFLIGHT_CLOSED_SUMMARY+=("$FID ($RNAME): $F_EVID")
+      fi
+    else
+      log "keep-inflight $FID ($RNAME) — $F_REASON"
+    fi
+  done <<EOF
+$(printf '%s' "$INFLIGHT" | jq -rc '.[]?')
+EOF
 
   # ── ga-gosfs: story:done reconciliation sweep ───────────────────────────────
   # OPEN story:approved beads (distinct from the in_progress sweep above). After a
@@ -1064,11 +1160,15 @@ done <<EOF
 $RIG_ROWS
 EOF
 
-log "=== merged-bead-janitor sweep complete — closed=$CLOSED_COUNT story_done=$DONE_COUNT convoy_reaped=$CONVOY_COUNT branches_pruned=$BRANCH_PRUNE_COUNT advisories=$SIBLING_ADVISORIES dry_run=$DRY_RUN ==="
+log "=== merged-bead-janitor sweep complete — closed=$CLOSED_COUNT inflight_closed=$INFLIGHT_CLOSED_COUNT story_done=$DONE_COUNT convoy_reaped=$CONVOY_COUNT branches_pruned=$BRANCH_PRUNE_COUNT advisories=$SIBLING_ADVISORIES dry_run=$DRY_RUN ==="
 if [ "$DRY_RUN" = "0" ]; then
   if [ "$CLOSED_COUNT" -gt 0 ]; then
     SUMMARY=$(printf '%s; ' "${CLOSED_SUMMARY[@]}")
     notify_athos -t "Kanban janitor" "Auto-closed $CLOSED_COUNT merged-but-stuck bead(s): $SUMMARY"
+  fi
+  if [ "$INFLIGHT_CLOSED_COUNT" -gt 0 ]; then
+    ISUMMARY=$(printf '%s; ' "${INFLIGHT_CLOSED_SUMMARY[@]}")
+    notify_athos -t "Kanban janitor" "Auto-closed $INFLIGHT_CLOSED_COUNT stranded open+story:in-flight bead(s) (ga-hcj4, Pilot sling-wrapper gap): $ISUMMARY"
   fi
   if [ "$DONE_COUNT" -gt 0 ]; then
     DSUMMARY=$(printf '%s; ' "${DONE_SUMMARY[@]}")

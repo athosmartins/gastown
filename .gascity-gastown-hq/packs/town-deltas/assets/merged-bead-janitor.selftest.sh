@@ -536,6 +536,40 @@ eq "in-flight active (not yet done): in-flight guard wins over commit signal" \
    "$(janitor_story_decide 0 0 0 1 0 0 1 0 0)" \
    "keep:story-in-flight-active-rework"
 
+# ── 9. Drift-guard: ga-hcj4 stranded open+story:in-flight sweep ─────────────
+# Pilot's "fix bug X" sling-wrapper convention leaves the underlying bug/task
+# bead (or a story whose gate-PASS handoff never stripped the label) stuck
+# status=open + story:in-flight FOREVER — it is never itself in_progress and
+# never carries story:approved, so it fell into NEITHER sweep above no matter
+# how long its own scoped commit sat merged in origin/main (ga-ap7od: confirmed
+# merged 1h48m past a healthy 15min sweep cadence, invisible because the
+# WRAPPER, not the bead, was the in_progress row). This bucket reuses
+# janitor_decide UNCHANGED (already exhaustively covered by §1 above) — these
+# assertions confirm the LIVE script wires a THIRD candidate query into that
+# same pure decision, with the same false-close defenses (strict subject-scope,
+# repo-scoping, branch self-guard) as the in_progress sweep, not a fresh or
+# looser decision path.
+echo "── 9. Drift-guard: ga-hcj4 stranded open+story:in-flight sweep ──"
+grep -qF 'list --status open --json -l story:in-flight' "$JANITOR" \
+  && ok "queries open+story:in-flight beads (third bucket)" || bad "open+story:in-flight query missing"
+grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH"' "$JANITOR" \
+  && ok "in-flight bucket reuses janitor_decide unchanged (no parallel decision fn)" || bad "in-flight bucket does not call janitor_decide"
+grep -qF 'scan_commit_subject_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$FID"' "$JANITOR" \
+  && ok "in-flight signal A uses the STRICT subject scanner (not the loose one)" || bad "in-flight bucket not using strict subject scanner"
+grep -qF 'sha=$(scan_commit_subject_for_bead "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$FID")' "$JANITOR" \
+  && ok "in-flight signal A falls back to HQ mirror scan" || bad "in-flight HQ mirror fallback missing"
+grep -qF '[ "${FID%%-*}" != "$RPREFIX" ]' "$JANITOR" \
+  && ok "in-flight commit signal is rig-scoped (HQ fallback only for foreign ids)" || bad "in-flight repo-scoping guard missing"
+grep -qF 'case "$br" in */"$FID") : ;; *) continue ;; esac' "$JANITOR" \
+  && ok "in-flight branch signal keeps the final-path-segment self-guard" || bad "in-flight branch self-guard missing"
+grep -qF 'CLOSED-INFLIGHT' "$JANITOR" && ok "in-flight close action logs CLOSED-INFLIGHT" || bad "in-flight close logging missing"
+grep -qF 'label remove "$FID" "story:in-flight"' "$JANITOR" \
+  && ok "in-flight close drops story:in-flight (mirrors in_progress sweep)" || bad "in-flight story:in-flight removal missing"
+grep -qF 'INFLIGHT_CLOSED_COUNT=$((INFLIGHT_CLOSED_COUNT+1))' "$JANITOR" \
+  && ok "in-flight closes counted" || bad "in-flight close counter missing"
+grep -qF 'INFLIGHT_CLOSED_COUNT" -gt 0' "$JANITOR" && ok "in-flight closes surfaced via notify_athos" || bad "in-flight notify wiring missing"
+grep -qF 'WOULD-CLOSE-INFLIGHT' "$JANITOR" && ok "in-flight bucket honors DRY_RUN" || bad "in-flight dry-run path missing"
+
 echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"
