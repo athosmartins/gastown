@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# inflight-reclaim-guard.selftest.sh — Regression harness for
+# list_gate_active_source_beads() fail-safe contract (ga-ap7od).
+#
+# Bug: on a per-label sub-query subprocess failure (non-zero returncode from
+# `bd list --label type:quality-gate-marker --label <gate_lbl>`), the loop did
+# `continue` — treating a QUERY FAILURE the same as "no beads matched" — instead
+# of returning None like the function's own docstring promises ("Returns...
+# None on error (fail-safe: caller treats None as unknown and skips the cycle
+# rather than risking a false reclaim)"). A transient failure on just the
+# gate-status:queued sub-query (e.g. brief Dolt contention) silently dropped
+# ALL currently-queued markers from the active set for that cycle without
+# tripping the fail-safe, risking a false reclaim of a bead with a live,
+# healthy gate review in flight.
+#
+# Scenarios:
+#   1. All sub-queries succeed, some return beads → correct frozenset of
+#      source-bead IDs (baseline, unaffected by the fix).
+#   2. All sub-queries succeed with zero matches → empty frozenset, not None
+#      ("no beads matching this label combo" remains a legitimate non-error).
+#   3. One sub-query returns non-zero (simulated transient failure) → None
+#      (THE regression test — was a partial frozenset pre-fix).
+#   4. A sub-query raises an exception (e.g. timeout) → None (already
+#      fail-safe pre-fix; verify the fix didn't disturb this path).
+#   5. A sub-query returns unparseable JSON → None (same, pre-existing path).
+#   6. A sub-query returns valid JSON that isn't a list → None (same,
+#      pre-existing path).
+#   7. Drift guard: source still returns None (not `continue`) on non-zero
+#      returncode, and the docstring's fail-safe contract line is intact.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WD="$SCRIPT_DIR/inflight-reclaim-guard.py"
+
+/usr/bin/python3 - "$WD" <<'PY'
+import sys, importlib.util, json
+
+wd_path = sys.argv[1]
+spec = importlib.util.spec_from_file_location("inflight_reclaim_guard", wd_path)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)  # top-level defines only; main loop is guarded by __name__
+
+PASS = 0
+FAIL = 0
+
+def ok(msg):
+    global PASS; PASS += 1; print("  ok: %s" % msg)
+
+def bad(msg):
+    global FAIL; FAIL += 1; print("  BAD: %s" % msg)
+
+GATE_LABELS = ("gate-status:ready", "gate-status:dispatching", "gate-status:queued", "gate-status:claimed")
+
+class FakeResult:
+    def __init__(self, returncode, stdout):
+        self.returncode = returncode
+        self.stdout = stdout
+
+def install_fake_run(fail_labels=None, raise_labels=None, label_beads=None, bad_json_labels=None, non_list_labels=None):
+    """Monkeypatch m.subprocess.run to simulate per-label bd-list outcomes.
+    cmd shape: ["bd","list","--label","type:quality-gate-marker","--label",gate_lbl,"--json"]
+    """
+    fail_labels = fail_labels or set()
+    raise_labels = raise_labels or set()
+    label_beads = label_beads or {}
+    bad_json_labels = bad_json_labels or set()
+    non_list_labels = non_list_labels or set()
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=20):
+        gate_lbl = cmd[5]
+        if gate_lbl in raise_labels:
+            raise RuntimeError("simulated subprocess crash for %s" % gate_lbl)
+        if gate_lbl in fail_labels:
+            return FakeResult(1, "")
+        if gate_lbl in bad_json_labels:
+            return FakeResult(0, "{not valid json")
+        if gate_lbl in non_list_labels:
+            return FakeResult(0, json.dumps({"unexpected": "shape"}))
+        beads = label_beads.get(gate_lbl, [])
+        markers = [{"labels": ["type:quality-gate-marker", gate_lbl, "source-bead:%s" % b]} for b in beads]
+        return FakeResult(0, json.dumps(markers))
+
+    orig = m.subprocess.run
+    m.subprocess.run = fake_run
+    return orig
+
+def restore_run(orig):
+    m.subprocess.run = orig
+
+# ── Scenario 1: all succeed, some beads → correct frozenset ─────────────────
+print("Scenario 1: all sub-queries succeed with matches → correct frozenset")
+orig = install_fake_run(label_beads={
+    "gate-status:queued": ["ga-aaaaa", "ga-bbbbb"],
+    "gate-status:claimed": ["ga-ccccc"],
+})
+try:
+    res = m.list_gate_active_source_beads()
+    if res == frozenset({"ga-aaaaa", "ga-bbbbb", "ga-ccccc"}):
+        ok("frozenset correctly aggregated across labels: %r" % sorted(res))
+    else:
+        bad("expected {ga-aaaaa,ga-bbbbb,ga-ccccc}, got %r" % res)
+finally:
+    restore_run(orig)
+
+# ── Scenario 2: all succeed, zero matches → empty frozenset, not None ───────
+print("Scenario 2: all sub-queries succeed with zero matches → empty frozenset (not None)")
+orig = install_fake_run()
+try:
+    res = m.list_gate_active_source_beads()
+    if res == frozenset():
+        ok("zero matches → empty frozenset (legitimate non-error)")
+    else:
+        bad("expected empty frozenset, got %r" % res)
+finally:
+    restore_run(orig)
+
+# ── Scenario 3: THE REGRESSION — one sub-query fails (non-zero) → None ──────
+print("Scenario 3: gate-status:queued sub-query fails (returncode=1) → None (fail-safe)")
+orig = install_fake_run(
+    fail_labels={"gate-status:queued"},
+    label_beads={"gate-status:claimed": ["ga-live-review"]},
+)
+try:
+    res = m.list_gate_active_source_beads()
+    if res is None:
+        ok("sub-query failure correctly fails safe → None (bug ga-ap7od FIXED)")
+    else:
+        bad("REGRESSION (ga-ap7od): sub-query failure silently dropped instead of "
+            "failing safe — got %r instead of None. A caller would treat this "
+            "partial/wrong result as ground truth and could falsely reclaim a bead "
+            "with a live, healthy gate review." % res)
+finally:
+    restore_run(orig)
+
+# ── Scenario 4: a sub-query raises → None (pre-existing fail-safe path) ─────
+print("Scenario 4: gate-status:dispatching sub-query raises → None (pre-existing path)")
+orig = install_fake_run(raise_labels={"gate-status:dispatching"})
+try:
+    res = m.list_gate_active_source_beads()
+    if res is None:
+        ok("exception during sub-query → None (unaffected by the fix)")
+    else:
+        bad("expected None on exception, got %r" % res)
+finally:
+    restore_run(orig)
+
+# ── Scenario 5: unparseable JSON → None (pre-existing path) ─────────────────
+print("Scenario 5: gate-status:ready sub-query returns unparseable JSON → None")
+orig = install_fake_run(bad_json_labels={"gate-status:ready"})
+try:
+    res = m.list_gate_active_source_beads()
+    if res is None:
+        ok("unparseable JSON → None (unaffected by the fix)")
+    else:
+        bad("expected None on JSON parse failure, got %r" % res)
+finally:
+    restore_run(orig)
+
+# ── Scenario 6: valid JSON, wrong shape (not a list) → None (pre-existing) ──
+print("Scenario 6: gate-status:claimed sub-query returns non-list JSON → None")
+orig = install_fake_run(non_list_labels={"gate-status:claimed"})
+try:
+    res = m.list_gate_active_source_beads()
+    if res is None:
+        ok("non-list JSON payload → None (unaffected by the fix)")
+    else:
+        bad("expected None on non-list payload, got %r" % res)
+finally:
+    restore_run(orig)
+
+# ── Scenario 7: drift guard — source still fails safe, docstring intact ─────
+print("Scenario 7: drift guard — fail-safe return + docstring contract present")
+src = open(wd_path).read()
+import re
+fn_match = re.search(r"def list_gate_active_source_beads\(\):.*?(?=\ndef |\Z)", src, re.S)
+if not fn_match:
+    bad("could not locate list_gate_active_source_beads() source for drift check")
+else:
+    fn_src = fn_match.group(0)
+    # Strip full-line comments so an interleaved `# ...` line between `if` and
+    # its body can't hide the real next statement from either regex below.
+    fn_src_nocomments = "\n".join(
+        line for line in fn_src.splitlines() if not line.strip().startswith("#")
+    )
+    if re.search(r"if result\.returncode != 0:\s*\n\s*return None", fn_src_nocomments):
+        ok("non-zero returncode path returns None (fail-safe, not silently continuing)")
+    else:
+        bad("MISSING: non-zero returncode path no longer returns None directly — "
+            "regression back to silent `continue` (or equivalent) is possible")
+    if re.search(r"returncode != 0:\s*\n\s*continue", fn_src_nocomments):
+        bad("REGRESSION: found `continue` directly on the returncode!=0 branch")
+    else:
+        ok("no bare `continue` on the returncode!=0 branch")
+    # Docstring wraps across lines with leading indentation; normalize
+    # whitespace runs to single spaces before matching so a reflow doesn't
+    # false-fail this check.
+    normalized = " ".join(src.split())
+    if "fail-safe: caller treats None as unknown and skips the cycle" in normalized:
+        ok("docstring fail-safe contract line intact")
+    else:
+        bad("MISSING: docstring fail-safe contract line changed/removed")
+
+print("")
+print("Results: %d passed, %d failed" % (PASS, FAIL))
+if FAIL == 0:
+    print("SELFTEST PASS"); sys.exit(0)
+print("SELFTEST FAIL"); sys.exit(1)
+PY

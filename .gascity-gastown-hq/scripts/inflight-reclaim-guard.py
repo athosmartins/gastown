@@ -739,8 +739,12 @@ def list_gate_active_source_beads():
                  "--json"],
                 capture_output=True, text=True, timeout=20)
             if result.returncode != 0:
-                # No beads matching this label combo is not an error
-                continue
+                # A sub-query FAILURE (e.g. transient Dolt contention) is not the
+                # same as "no beads matched" — conflating them silently drops that
+                # gate_lbl's markers from the active set without tripping the
+                # fail-safe (ga-ap7od). Match the documented contract: any error
+                # fails the whole function safe, not just this one label.
+                return None
             if not result.stdout.strip():
                 continue
             data = json.loads(result.stdout)
