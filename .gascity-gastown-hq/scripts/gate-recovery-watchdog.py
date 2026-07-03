@@ -1328,24 +1328,60 @@ def _source_review_state(bead_id, rig_name=""):
     return (False, False, False, CITY)
 
 
-def orphan_marker_verdict(age_sec, min_sec, resolved, source_closed, source_reviewing):
+def _branch_merged_state(branch, rig_name=""):
+    """Classify a marker's branch vs the rig's origin/main — the TRUTH about whether the
+    work landed (a source bead being closed does NOT prove it, ga-w5agg/ga-d2jil):
+      'merged'   — origin/<branch> is an ancestor of origin/main (landed).
+      'unmerged' — origin/<branch> exists but is NOT an ancestor (STRANDED — fix pending).
+      'missing'  — no such branch on origin (abandoned/renamed → marker is truly moot).
+      'unknown'  — rig unresolved / git error → caller MUST NOT treat as done (fail-safe).
+    Bounded git ops in the branch's rig repo (or HQ if rig unresolved)."""
+    if not branch:
+        return "unknown"
+    repo = (_rig_paths().get(rig_name) if rig_name else None) or CITY
+    sh(["git", "-C", repo, "fetch", "origin", "--quiet"], timeout=30)
+    ex = sh(["git", "-C", repo, "rev-parse", "--verify", "-q", "origin/%s^{commit}" % branch], timeout=15)
+    if not ex or ex.returncode != 0 or not (ex.stdout or "").strip():
+        return "missing"
+    anc = sh(["git", "-C", repo, "merge-base", "--is-ancestor",
+              "origin/%s" % branch, "origin/main"], timeout=15)
+    if anc is None:
+        return "unknown"
+    if anc.returncode == 0:
+        return "merged"
+    if anc.returncode == 1:
+        return "unmerged"
+    return "unknown"
+
+
+def orphan_marker_verdict(age_sec, min_sec, resolved, source_closed, source_reviewing,
+                          branch_state="unknown"):
     """PURE decision (no I/O, unit-tested) for FIX 4, on a gate-status:queued marker:
-      'close-source-done'     — source bead already CLOSED (work merged/done) → the marker
-                                is moot; close it (removes phantom queue depth).
-      'clear-stale-reviewing' — source still OPEN but carries gate:reviewing while the
-                                marker sits QUEUED (contradictory: queued≠in-review) → a
-                                leaked label from a reviewer that drained during startup;
-                                clear it so the dispatcher re-dispatches instead of
-                                skipping the marker as 'already in review'.
-      'wait'                  — younger than min_sec (a legit spin-up window).
-      'keep'                  — source unreadable (fail-safe) or nothing to do.
-    close-source-done takes precedence over clear (a closed source is done regardless)."""
+      'close-source-done'     — source CLOSED **and the branch actually merged** (or is
+                                gone) → the marker is moot; close it (phantom depth).
+      'recover-stranded'      — source CLOSED but the branch EXISTS and is NOT merged →
+                                a FALSE close (the sling-task-janitor closes fix-task
+                                beads as 'orphan' without the branch merging, which used
+                                to make FIX 4 false-close the marker as 'merged' and
+                                STRAND a complete fix — ga-w5agg/ga-d2jil 2026-07-02).
+                                Re-land it, NEVER close.
+      'clear-stale-reviewing' — source OPEN + carries gate:reviewing while the marker
+                                sits QUEUED (contradictory) → leaked label; clear it.
+      'wait'                  — younger than min_sec.
+      'keep'                  — source unreadable / branch state unknown (fail-safe) or
+                                nothing to do — NEVER close on a can't-verify.
+    branch_state ∈ {'merged','unmerged','missing','unknown'}: a source being closed does
+    NOT prove the work landed — the branch's ancestry vs origin/main is the truth."""
     if age_sec < min_sec:
         return "wait"
     if not resolved:
         return "keep"
     if source_closed:
-        return "close-source-done"
+        if branch_state in ("merged", "missing"):
+            return "close-source-done"   # truly landed, or abandoned (no branch) → close phantom
+        if branch_state == "unmerged":
+            return "recover-stranded"    # real branch, not merged → stranded fix, never false-close
+        return "keep"                    # unknown → fail-safe, NEVER false-close as 'merged'
     if source_reviewing:
         return "clear-stale-reviewing"
     return "keep"
@@ -1845,7 +1881,13 @@ def reap_orphan_and_stale_markers(now):
         src = _label_value(m, "source-bead:")
         rig = _label_value(m, "bead-rig:") or _label_value(m, "rig:")
         resolved, closed, reviewing, store = _source_review_state(src, rig)
-        v = orphan_marker_verdict(age, ORPHAN_MARKER_MIN_MINUTES * 60, resolved, closed, reviewing)
+        branch = _label_value(m, "branch:")
+        # Pay for the git-ancestry check ONLY when the source is CLOSED — the sole case
+        # where 'source closed' could be a FALSE 'merged' (the sling-task-janitor closes
+        # fix-task beads without the branch landing). Otherwise it's irrelevant.
+        branch_state = _branch_merged_state(branch, rig) if (resolved and closed) else "unknown"
+        v = orphan_marker_verdict(age, ORPHAN_MARKER_MIN_MINUTES * 60, resolved, closed,
+                                  reviewing, branch_state)
         if v in ("wait", "keep"):
             continue
         if GRW_DRY_RUN:
@@ -1854,13 +1896,27 @@ def reap_orphan_and_stale_markers(now):
                              {"marker": mid, "source_bead": src, "age_min": age // 60, "dry_run": True})
             acted += 1
             continue
-        if v == "close-source-done":
+        if v == "recover-stranded":
+            # Source CLOSED but branch NOT merged → a FALSE 'merged' close stranded a
+            # complete fix (ga-w5agg/ga-d2jil). Re-land it: reopen the source (so the
+            # janitor/dispatcher treat it as live) + re-queue the marker so a fresh sweep
+            # re-reviews and merges. NEVER close a marker whose fix hasn't landed.
+            if src:
+                sh(["bd", "-C", store, "update", src, "--status", "open"], timeout=20)
+            set_gate_status_py(mid, "queued")
+            sh(["bd", "-C", CITY, "comment", mid,
+                "gate-recovery-watchdog FIX4-recover: source %s is CLOSED but branch %s is NOT merged into origin/main — a false-'merged' close (the janitor orphaned the fix-task without it landing). Reopened the source + re-queued so the fix RE-LANDS instead of being stranded. (the ga-w5agg/ga-d2jil class)" % (src, branch or "?")], timeout=25)
+            _recovery_ledger("recover_stranded_marker", {"marker": mid, "source_bead": src,
+                             "branch": branch, "age_min": age // 60})
+            notify("Gate self-heal: fix ENCALHADO recuperado (marker %s — fonte %s fechada mas branch %s NÃO-mergeado) — reaberto + re-enfileirado. Você não precisa agir." % (mid, src, branch or "?"), 3)
+            print("[watchdog] FIX4-recover RE-LANDED stranded marker=%s (source %s closed but branch %s unmerged) — reopened+requeued" % (mid, src, branch), flush=True)
+        elif v == "close-source-done":
             set_gate_status_py(mid, "superseded")
             sh(["bd", "-C", CITY, "close", mid, "-r",
-                "source bead %s already CLOSED (work merged/done) — orphaned queued marker reaped (grw FIX4 phantom-depth self-heal — the manual cleanup the Mayor did by hand)" % src], timeout=25)
-            _recovery_ledger("close_orphan_marker", {"marker": mid, "source_bead": src, "age_min": age // 60})
-            notify("Gate self-heal: marker órfão fechado (%s — fonte %s já concluída). Profundidade-fantasma da fila removida." % (mid, src), 3)
-            print("[watchdog] FIX4 CLOSED orphan marker=%s (source %s closed, %dm) — phantom queue depth removed" % (mid, src, age // 60), flush=True)
+                "source bead %s CLOSED and branch %s VERIFIED merged/absent (grw FIX4 phantom-depth self-heal — merge confirmed via git ancestry, not assumed from a closed source)" % (src, branch or "?")], timeout=25)
+            _recovery_ledger("close_orphan_marker", {"marker": mid, "source_bead": src, "branch": branch, "branch_state": branch_state, "age_min": age // 60})
+            notify("Gate self-heal: marker órfão fechado (%s — fonte %s concluída, merge confirmado). Profundidade-fantasma removida." % (mid, src), 3)
+            print("[watchdog] FIX4 CLOSED orphan marker=%s (source %s closed, branch %s, %dm) — phantom depth removed" % (mid, src, branch_state, age // 60), flush=True)
         else:  # clear-stale-reviewing
             sh(["bd", "-C", store, "label", "remove", src, "gate:reviewing", "-q"], timeout=20)
             sh(["bd", "-C", store, "comment", src,
@@ -2169,11 +2225,15 @@ def _selftest():
     # the two forms above name the SAME instant → equal epochs (offset math correct)
     a = _last_active_epoch("2026-07-02T16:06:29-03:00"); b = _last_active_epoch("2026-07-02T19:06:29Z")
     ok(a is not None and b is not None and abs(a - b) < 1, "-03:00 and its UTC-Z equivalent map to the same epoch")
-    # FIX 4 — orphan_marker_verdict (queued-marker cleanup)
+    # FIX 4 — orphan_marker_verdict (queued-marker cleanup; now branch-merge-aware)
     M = 15 * 60
-    ok(orphan_marker_verdict(9 * 60, M, True, True, True) == "wait", "young marker (9m<15m) → wait (spin-up race window)")
-    ok(orphan_marker_verdict(600 * 60, M, True, True, False) == "close-source-done", "old + source CLOSED → close orphan (the ga-sndpm case)")
-    ok(orphan_marker_verdict(600 * 60, M, True, True, True) == "close-source-done", "closed source WINS over reviewing (done regardless)")
+    ok(orphan_marker_verdict(9 * 60, M, True, True, True, "merged") == "wait", "young marker (9m<15m) → wait (spin-up race window)")
+    ok(orphan_marker_verdict(600 * 60, M, True, True, False, "merged") == "close-source-done", "old + source CLOSED + branch MERGED → close orphan")
+    ok(orphan_marker_verdict(600 * 60, M, True, True, False, "missing") == "close-source-done", "old + source CLOSED + branch MISSING (abandoned) → close orphan")
+    ok(orphan_marker_verdict(600 * 60, M, True, True, True, "merged") == "close-source-done", "closed+merged WINS over reviewing (done regardless)")
+    # the ga-w5agg/ga-d2jil bug: source closed by janitor but branch NOT merged → NEVER false-close
+    ok(orphan_marker_verdict(600 * 60, M, True, True, False, "unmerged") == "recover-stranded", "old + source CLOSED but branch UNMERGED → recover, NEVER false-close (the ga-w5agg/ga-d2jil bug)")
+    ok(orphan_marker_verdict(600 * 60, M, True, True, False, "unknown") == "keep", "source closed but branch state UNKNOWN → keep (fail-safe, never blind-close as merged)")
     ok(orphan_marker_verdict(572 * 60, M, True, False, True) == "clear-stale-reviewing", "old + source OPEN + gate:reviewing → clear stale (the wa-ya17c case)")
     ok(orphan_marker_verdict(572 * 60, M, True, False, False) == "keep", "old + source open + no reviewing → keep (nothing stale)")
     ok(orphan_marker_verdict(600 * 60, M, False, False, False) == "keep", "source UNREADABLE → keep (fail-safe, never blind-close)")
