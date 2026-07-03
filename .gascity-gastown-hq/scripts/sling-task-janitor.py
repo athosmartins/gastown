@@ -47,6 +47,7 @@ _ACTIVE_LABELS = {"story:in-flight", "story:approved", "story:done", "story:need
 # ── test seams (monkeypatched in --selftest) ───────────────────────────────────
 _bd_list_open_fn = None   # (store) -> list[dict]
 _bd_close_fn = None       # (store, bead_id, reason) -> bool
+_gated_fn = None          # () -> set[str]  (bead-ids with an open gate marker)
 _sessions_fn = None       # () -> set[str] of live session identifiers
 _rigs_fn = None           # () -> list[str] store paths
 _do_notify_fn = None      # (msg, prio) -> None
@@ -118,6 +119,35 @@ def _list_open(store):
     return _parse_bd_json(r.stdout)
 
 
+_BEADID_RE = re.compile(r"\b([a-z]{2,3}-[a-z0-9]{4,})\b")
+
+
+def _gated_bead_ids():
+    """Set of bead-ids whose fix is IN FLIGHT at the gate — referenced by an OPEN
+    quality-gate-marker (its source-bead: label, or a bead-id embedded in its branch:).
+    A sling-task whose fix sits queued/reviewing at the gate is TRACKED work, NOT an
+    inert orphan: closing it made the orphaned-marker reaper false-close the marker as
+    'merged' and STRAND a complete fix (ga-w5agg/ga-d2jil, 2026-07-02). Markers live in
+    HQ (CITY). Empty set on query failure → the caller's other KEEP guards still apply."""
+    if _gated_fn is not None:
+        return _gated_fn()
+    ids = set()
+    r = _sh([BD_BIN, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",
+             "--status", "open", "--json", "-n", "0"], timeout=BD_TIMEOUT)
+    if not r or r.returncode != 0:
+        return ids
+    for m in (_parse_bd_json(r.stdout) or []):
+        if not isinstance(m, dict):
+            continue
+        for lb in (m.get("labels") or []):
+            s = str(lb)
+            if s.startswith("source-bead:"):
+                ids.add(s.split(":", 1)[1].strip())
+            elif s.startswith("branch:"):
+                ids.update(_BEADID_RE.findall(s))
+    return ids
+
+
 def _live_sessions():
     if _sessions_fn is not None:
         return _sessions_fn()
@@ -169,7 +199,7 @@ def _is_sling(bead):
     return m.group(1) if m else None
 
 
-def _should_close(bead, parent_inflight_ids, live, now):
+def _should_close(bead, parent_inflight_ids, live, now, gated=frozenset()):
     """Return (close: bool, reason_or_skip: str). Fail-toward-KEEP."""
     bid = bead.get("id", "?")
     parent = _is_sling(bead)
@@ -178,6 +208,11 @@ def _should_close(bead, parent_inflight_ids, live, now):
     labels = set(bead.get("labels") or [])
     if labels & _ACTIVE_LABELS:
         return False, "stub carries an active lifecycle label (tracked work)"
+    # A fix whose branch sits at the gate (open marker) is TRACKED work — closing it
+    # made the orphaned-marker reaper false-close the marker as 'merged' and STRAND a
+    # complete fix (ga-w5agg/ga-d2jil). Never orphan a bead with a live gate marker.
+    if bid in gated or parent in gated:
+        return False, "fix is IN FLIGHT at the gate (open marker refs %s) — tracked work" % (bid if bid in gated else parent)
     asg = bead.get("assignee") or ""
     if asg and asg in live:
         return False, "stub assignee '%s' is a LIVE session (active build)" % asg
@@ -193,6 +228,7 @@ def run_cycle(now):
     """One sweep across all stores. Returns count closed."""
     stores = _stores()
     live = _live_sessions()
+    gated = _gated_bead_ids()  # bead-ids whose fix is in flight at the gate — never orphan
     # Build the set of bead ids that are story:in-flight across ALL stores (parents).
     store_beads = {}
     inflight = set()
@@ -210,7 +246,7 @@ def run_cycle(now):
         for b in beads:
             if not isinstance(b, dict):
                 continue
-            do_close, why = _should_close(b, inflight, live, now)
+            do_close, why = _should_close(b, inflight, live, now, gated)
             bid = b.get("id", "?")
             if not do_close:
                 if _is_sling(b):
@@ -286,6 +322,12 @@ def _selftest():
     print("Scenario G: parent MISSING (closed/deferred → not in inflight set) → CLOSE")
     c, why = _should_close(mk("t7", "fix bug ga-gone"), set(), set(), NOW)
     _ok("G: closes a stub whose parent is gone/closed") if c else _bad("G: did not close", why)
+
+    print("Scenario G2: fix IN FLIGHT at the gate (open marker) → KEEP (the ga-w5agg/ga-d2jil bug)")
+    c, why = _should_close(mk("ga-tkvsa", "fix bug ga-w5agg"), set(), set(), NOW, gated={"ga-tkvsa"})
+    _bad("G2: false-closed a gated fix (would strand it)", why) if c else _ok("G2: keeps a sling-task whose OWN fix has an open gate marker")
+    c, why = _should_close(mk("t8", "fix bug ga-w5agg"), set(), set(), NOW, gated={"ga-w5agg"})
+    _bad("G2b: false-closed (parent gated)", why) if c else _ok("G2b: keeps when the PARENT bead has an open gate marker")
 
     print("Scenario H: run_cycle end-to-end via seams (MAX_PER_SWEEP honored)")
     MAX_PER_SWEEP = 2
