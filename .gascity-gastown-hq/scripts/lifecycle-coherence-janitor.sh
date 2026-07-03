@@ -94,10 +94,25 @@ run_sweep() {
 
     # R3: in_progress with NO assignee → no worker is building it → reset status=open. A bead
     # WITH a live assignee is left alone (genuine build OR Pilot owner-grace territory).
-    for id in $("$BD" -C "$store" list --status in_progress --json -n 0 2>/dev/null | jq -r '.[] | select((.assignee // "") == "") | .id' 2>/dev/null); do
+    # GUARD (routed-pool double-dispatch fix, 2026-07-03): R3 was the odd rule out — it had
+    # NO advisory-lock check and NO age-grace, unlike R4/R5/R6 (`_bead_locked && continue`).
+    # A live NAMED crew that self-selects work sets in_progress with an EMPTY assignee for a
+    # brief window before it claims/pushes; R3 flipped it back to `open` on the very next
+    # sweep → the routed-pool then legitimately dispatched a wa-worker onto the crew's active
+    # bead (mila-wa, 3x: wa-6j2b6/wa-ya17c/wa-4dcbg — R3 was the empirical enabler). Now: skip
+    # a still-fresh bead (updated within R3_GRACE_MIN) and honor the advisory lock, so R3 only
+    # resets a GENUINELY-abandoned in_progress bead (stale) and never races a live build.
+    R3_GRACE_MIN="${R3_GRACE_MIN:-30}"
+    _r3_cutoff=$(( $(date +%s) - R3_GRACE_MIN * 60 ))
+    for id in $("$BD" -C "$store" list --status in_progress --json -n 0 2>/dev/null \
+               | jq -r --argjson cut "$_r3_cutoff" '.[]
+                       | select((.assignee // "") == "")
+                       | select(((( .updated_at // .created_at // "") | fromdateiso8601?) // 9999999999) < $cut)
+                       | .id' 2>/dev/null); do
       [ -n "$id" ] || continue
+      _bead_locked "$id" && { log "R3 skip-locked: $id — advisory lock active (live build)"; continue; }
       _open "$store" "$id"; _strip "$store" "$id" pilot:dispatched
-      log "R3 in_progress-no-worker: $id ($(basename "$store")) — set status=open"; n=$((n+1))
+      log "R3 in_progress-no-worker (stale >${R3_GRACE_MIN}m): $id ($(basename "$store")) — set status=open"; n=$((n+1))
     done
 
     # R4: READY (story:approved OR ctx:ready), status=open, WITH an assignee but NOT being built
