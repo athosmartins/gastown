@@ -1106,6 +1106,23 @@ _filter_candidates() {
         and (.assignee == null or .assignee == "")
         and ((.issue_type // .type // "") != "epic")
         and (((.labels // []) | index("story:epic-split")) | not)
+        # ga-iu9m/ga-enfe: a bead belonging to a graph.v2 formula/workflow is a
+        # direct-execution runbook (run the listed commands, close the bead),
+        # not a code-build story — there is no repo to branch in, so the bug/
+        # feature "implement -> /gate-done" doctrine this filter feeds into can
+        # never be satisfied. Every dispatch times out, gets reclaimed, and
+        # re-dispatches (the ga-knfh 8x/5.25h thrash). Such beads are already
+        # serviced directly by whichever pool their gc.routed_to names (see
+        # .gc/system/packs/core/assets/prompts/graph-worker.md) — exclude both
+        # the steps (gc.root_bead_id set on every step) and the root itself
+        # (gc.formula_contract / gc.kind=workflow, no root_bead_id since it IS
+        # the root) at this one chokepoint so every tier/path (HQ bugs/debt/
+        # features, ctx:ready, rig DBs) is covered without touching each call site.
+        and ((.metadata["gc.root_bead_id"] // "") | test("\\S") | not)
+        and ((.metadata["gc.formula_contract"] // "") | test("\\S") | not)
+        and (((.metadata["gc.kind"] // "") as $k
+              | ["workflow","scope","ralph","retry","check","fanout","retry-eval","scope-check","workflow-finalize"]
+              | index($k)) == null)
         and (
           (((.labels // []) | index("pilot:held")) | not)
           or

@@ -752,6 +752,29 @@ case "$(_fc "$HELD_ACCUM_EXP")" in
   *) bad "ga-4aree: all-expired accumulated hold incorrectly skipped: $(_fc "$HELD_ACCUM_EXP")" ;;
 esac
 
+# ── Scenario 3e3 (ga-iu9m/ga-enfe): graph.v2 workflow steps excluded from candidates ──
+# ga-knfh ("Determine digest time range", a mol-digest-generate step) was dispatched as
+# a code-build story 8x over 5.25h before being reclaimed each time — there is no repo
+# to branch in, so the "implement -> /gate-done" doctrine this filter feeds into can
+# never be satisfied. Such beads carry gc.root_bead_id (every step) or
+# gc.formula_contract/gc.kind=workflow (the root itself, which has no root_bead_id since
+# it IS the root) and are already serviced directly by whichever pool gc.routed_to names
+# — Pilot must never treat them as buildable stories.
+echo "Scenario 3e3 (ga-iu9m/ga-enfe): graph.v2 workflow step/root beads excluded from candidates"
+STEP_BEAD='[{"id":"bd-step","assignee":null,"labels":[],"description":"x","metadata":{"gc.root_bead_id":"bd-root","gc.step_ref":"mol-x.step-y"}},{"id":"bd-normal","assignee":null,"labels":[],"description":"x","metadata":{}}]'
+[ "$(_fc "$STEP_BEAD")" = '["bd-normal"]' ] && ok "ga-iu9m/ga-enfe: gc.root_bead_id step bead excluded; normal bug kept" || bad "ga-iu9m/ga-enfe: step-bead exclusion failed (got: $(_fc "$STEP_BEAD"))"
+
+ROOT_BEAD='[{"id":"bd-root2","assignee":null,"labels":[],"description":"x","metadata":{"gc.formula_contract":"graph.v2","gc.kind":"workflow"}},{"id":"bd-normal2","assignee":null,"labels":[],"description":"x","metadata":{}}]'
+[ "$(_fc "$ROOT_BEAD")" = '["bd-normal2"]' ] && ok "ga-iu9m/ga-enfe: workflow root bead (formula_contract+kind) excluded; normal bug kept" || bad "ga-iu9m/ga-enfe: root-bead exclusion failed (got: $(_fc "$ROOT_BEAD"))"
+
+CONTROL_KIND_BEAD='[{"id":"bd-finalize","assignee":null,"labels":[],"description":"x","metadata":{"gc.kind":"workflow-finalize"}},{"id":"bd-normal3","assignee":null,"labels":[],"description":"x","metadata":{}}]'
+[ "$(_fc "$CONTROL_KIND_BEAD")" = '["bd-normal3"]' ] && ok "ga-iu9m/ga-enfe: control-kind bead (workflow-finalize) excluded; normal bug kept" || bad "ga-iu9m/ga-enfe: control-kind exclusion failed (got: $(_fc "$CONTROL_KIND_BEAD"))"
+
+UNRELATED_META='[{"id":"bd-has-meta","assignee":null,"labels":[],"description":"x","metadata":{"story.rig":"whatsapp_automation"}}]'
+[ "$(_fc "$UNRELATED_META")" = '["bd-has-meta"]' ] && ok "ga-iu9m/ga-enfe: bead with unrelated metadata still dispatchable (no false-positive)" || bad "ga-iu9m/ga-enfe: false-positive — unrelated-metadata bead wrongly excluded (got: $(_fc "$UNRELATED_META"))"
+
+echo "$_FC_FN" | grep -q 'gc.root_bead_id' && ok "_filter_candidates carries the gc.root_bead_id workflow-step exclusion clause" || bad "gc.root_bead_id exclusion clause missing from _filter_candidates"
+
 # ── Scenario OWN-GUARD (ga-htjni ext; wa-5wv49 / wa-xnuxd) ──────────────────────
 # The reported systemic double-dispatch: a crew/human creates a bead intending to
 # build it THEMSELVES and claims it (status=in_progress + assignee=<self>) — yet the
