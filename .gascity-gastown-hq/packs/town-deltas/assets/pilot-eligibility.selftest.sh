@@ -97,9 +97,9 @@ case "$args" in
     # All three candidate bugs. Filter by any --exclude-label present in args.
     CANDIDATES=$(cat <<'JSON'
 [
-  {"id":"tt-normal","title":"Normal eligible bug","priority":1,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
-  {"id":"tt-needs-human","title":"Gate-parked bug","priority":0,"issue_type":"bug","status":"open","labels":["gate:needs-human"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
-  {"id":"tt-dispatched","title":"Already-dispatched bug","priority":0,"issue_type":"bug","status":"open","labels":["pilot:dispatched"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
+  {"id":"tt-normal","title":"Normal eligible bug","priority":1,"issue_type":"bug","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{},"description":"Reproduces on current main; needs a fix dispatched to a builder."},
+  {"id":"tt-needs-human","title":"Gate-parked bug","priority":0,"issue_type":"bug","status":"open","labels":["gate:needs-human"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{},"description":"Requires human/device interaction; gate-parked pending a manual step."},
+  {"id":"tt-dispatched","title":"Already-dispatched bug","priority":0,"issue_type":"bug","status":"open","labels":["pilot:dispatched"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{},"description":"Already claimed by a previous sweep; awaiting builder completion."}
 ]
 JSON
 )
