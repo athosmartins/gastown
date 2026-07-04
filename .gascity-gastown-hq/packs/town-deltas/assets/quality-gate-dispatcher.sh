@@ -2930,6 +2930,19 @@ Review this diff adversarially using ONLY your assigned lens above.
 You must NOT know or consider what the other reviewers think (you are independent).
 This author ($AUTHOR) cannot be a reviewer of their own work.
 
+REFUTATION PASS — MANDATORY BEFORE ANY FAIL:
+For EVERY blocking issue you are about to raise, RE-READ the exact changed lines
+in the diff and actively try to REFUTE it: is the defect really present in THIS
+diff, at the lines you cite, given the surrounding context — or are you
+pattern-matching on superficially-similar code, or assuming context you did not
+actually verify in the diff? If you cannot ground a blocking issue in specific
+changed lines, DROP it. Only issues you can prove against the actual diff count
+as blocking. If nothing survives refutation, your verdict is PASS.
+WHY THIS MATTERS: this gate fails on ANY single reviewer FAIL, so a
+false-positive FAIL is expensive — it forces a full re-dispatch + re-work cycle
+on correct code. Be adversarial about the CODE, and equally adversarial about
+your own findings before you commit to FAIL.
+
 After completing your review, record your verdict with EXACTLY these bash commands:
 
 bd -C "$GC_CITY" label remove "$VERDICT_BEAD_ID" "verdict:pending"
