@@ -1093,6 +1093,11 @@ _pilot_gate_congested() {
 # still call _filter_candidates/_filter_unblocked/_filter_explicit_deps unchanged.
 
 _FILTER_PREAPPROVAL_LABELS='["story:unrefined","story:refinement-in-progress","story:triage","story:cancelled"]'
+# ga-am6h: mirrors MAX_RECLAIMS in scripts/inflight-reclaim-guard.py (line ~101) —
+# keep the two in sync by hand; there is no shared bash/python helper (see that
+# script's own reclaim_decision(), which is Python-private and not import-safe
+# from a bash filter).
+_FILTER_RECLAIM_CAP=3
 _filter_candidates() {
   # imp19: pilot:held is now a TIMED hold — pass a bead with pilot:held only if a
   # pilot:held-until:<epoch> label exists AND the epoch is in the past (expired hold).
@@ -1100,7 +1105,7 @@ _filter_candidates() {
   # Pilot bypass the hold without waiting for the janitor when the expiry is clear.
   local _now_ts; _now_ts=$(date +%s)
   jq --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
-     --argjson now_ts "$_now_ts" \
+     --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" \
     '[.[] | select(
         .id != $self
         and (.assignee == null or .assignee == "")
@@ -1135,6 +1140,21 @@ _filter_candidates() {
             if length > 0
             then (max < $now_ts)
             else false end)
+        )
+        and (
+          # ga-am6h: pilot:reclaim-count is STICKY, independent of pilot:held. Once
+          # reclaim_decision() in inflight-reclaim-guard.py sees reclaim_count >=
+          # MAX_RECLAIMS it stops reclaiming and escalates to gate:needs-human — but
+          # that escalation label can land arbitrarily late (observed ~1h41m gap in
+          # the ga-knfh incident, ga-iu9m), and the pilot:held cooldown on the same
+          # bead can expire first. Exclude on the count alone so a capped-out bead
+          # does not slip back into the candidate pool just because a timer ran out.
+          # Nothing decrements this label — only a human or mayor, or the escalation
+          # labels the guard sets on its own, re-admit the bead.
+          ((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | tonumber) |
+            if length > 0
+            then (max < $reclaim_cap)
+            else true end)
         )
         and (((.labels // []) - $preapproval) | length) == ((.labels // []) | length)
         and ((.labels // []) | map(select(

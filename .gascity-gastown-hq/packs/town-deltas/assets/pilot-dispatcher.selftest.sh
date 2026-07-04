@@ -700,7 +700,7 @@ fi
 # the candidate pool — else story:approved + empty assignee re-dispatches the held worker in
 # ~2min. One clause in _filter_candidates (the single chokepoint for every dispatch path).
 echo "Scenario 3e2: a pilot:held bead is excluded from the candidate pool (durable worker release)"
-_FC_FN="$(awk '/^_FILTER_PREAPPROVAL_LABELS=/{print} /^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_FC_FN="$(awk '/^_FILTER_PREAPPROVAL_LABELS=/{print} /^_FILTER_RECLAIM_CAP=/{print} /^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 _fc() { ( eval "$_FC_FN"; SELF_BEAD_ID=""; echo "$1" | _filter_candidates | jq -rc '[.[].id]' ); }
 HELD='[{"id":"bd-held","assignee":null,"labels":["story:approved","pilot:held"],"description":"x"},{"id":"bd-free","assignee":null,"labels":["story:approved"],"description":"x"}]'
 [ "$(_fc "$HELD")" = '["bd-free"]' ] && ok "pilot:held bead excluded; free story:approved kept (durable release holds)" || bad "pilot:held not excluded (got: $(_fc "$HELD"))"
@@ -774,6 +774,42 @@ UNRELATED_META='[{"id":"bd-has-meta","assignee":null,"labels":[],"description":"
 [ "$(_fc "$UNRELATED_META")" = '["bd-has-meta"]' ] && ok "ga-iu9m/ga-enfe: bead with unrelated metadata still dispatchable (no false-positive)" || bad "ga-iu9m/ga-enfe: false-positive — unrelated-metadata bead wrongly excluded (got: $(_fc "$UNRELATED_META"))"
 
 echo "$_FC_FN" | grep -q 'gc.root_bead_id' && ok "_filter_candidates carries the gc.root_bead_id workflow-step exclusion clause" || bad "gc.root_bead_id exclusion clause missing from _filter_candidates"
+
+# ── Scenario 3e2e-h (ga-am6h): pilot:reclaim-count cap is STICKY, independent of
+# pilot:held ─────────────────────────────────────────────────────────────────────
+# ga-knfh incident: inflight-reclaim-guard exhausted the reclaim cap (3/3) at
+# 18:10 but its gate:needs-human escalation did not land until 19:51 — a 1h41m
+# gap during which the ONLY thing keeping the bead out of Pilot's candidate pool
+# was the pilot:held 60min cooldown, which expired first and let Pilot
+# re-dispatch (19:17, 19:40) a bead that had already exhausted its cap.
+# _filter_candidates must exclude on pilot:reclaim-count alone, with no
+# dependency on pilot:held being present or unexpired (ga-52s2 fix).
+echo "Scenario 3e2e (ga-am6h): pilot:reclaim-count AT cap, no pilot:held label → must be SKIPPED (sticky, not cooldown-gated)"
+RECLAIM_CAPPED='[{"id":"bd-capped","assignee":null,"labels":["story:approved","pilot:reclaim-count:3"],"description":"x"},{"id":"bd-free5","assignee":null,"labels":["story:approved"],"description":"x"}]'
+[ "$(_fc "$RECLAIM_CAPPED")" = '["bd-free5"]' ] && ok "ga-am6h: reclaim-count at cap excluded even with no pilot:held (sticky)" || bad "ga-am6h: capped bead leaked into candidates: $(_fc "$RECLAIM_CAPPED")"
+
+echo "Scenario 3e2f (ga-am6h): pilot:reclaim-count ABOVE cap → must be SKIPPED (defensive, count can exceed cap)"
+RECLAIM_ABOVE='[{"id":"bd-above-cap","assignee":null,"labels":["story:approved","pilot:reclaim-count:5"],"description":"x"}]'
+case "$(_fc "$RECLAIM_ABOVE")" in
+  *bd-above-cap*) bad "ga-am6h: reclaim-count above cap (5) leaked into candidates: $(_fc "$RECLAIM_ABOVE")" ;;
+  *) ok "ga-am6h: reclaim-count above cap (5) excluded" ;;
+esac
+
+echo "Scenario 3e2g (ga-am6h): pilot:reclaim-count BELOW cap → still PASSED THROUGH (no regression for normal reclaim flow)"
+RECLAIM_BELOW='[{"id":"bd-below-cap","assignee":null,"labels":["story:approved","pilot:reclaim-count:2"],"description":"x"}]'
+case "$(_fc "$RECLAIM_BELOW")" in
+  *bd-below-cap*) ok "ga-am6h: reclaim-count below cap (2 < 3) passes through" ;;
+  *) bad "ga-am6h: below-cap bead incorrectly excluded: $(_fc "$RECLAIM_BELOW")" ;;
+esac
+
+echo "Scenario 3e2h (ga-am6h): no pilot:reclaim-count label at all → PASSED THROUGH (default/most-common case)"
+RECLAIM_NONE='[{"id":"bd-no-reclaim","assignee":null,"labels":["story:approved"],"description":"x"}]'
+case "$(_fc "$RECLAIM_NONE")" in
+  *bd-no-reclaim*) ok "ga-am6h: no reclaim-count label → unaffected, passes through" ;;
+  *) bad "ga-am6h: bead with no reclaim history incorrectly excluded: $(_fc "$RECLAIM_NONE")" ;;
+esac
+
+grep -qE 'pilot:reclaim-count:' "$DISPATCHER" && ok "_filter_candidates carries the pilot:reclaim-count clause"                      || bad "pilot:reclaim-count clause missing from _filter_candidates"
 
 # ── Scenario OWN-GUARD (ga-htjni ext; wa-5wv49 / wa-xnuxd) ──────────────────────
 # The reported systemic double-dispatch: a crew/human creates a bead intending to
