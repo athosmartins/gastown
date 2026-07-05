@@ -89,6 +89,7 @@ TIMEOUT_WINDOW_SEC = 1800      # 2+ timeouts within 30min = gate not producing v
 DISPATCH_STUCK_SEC = 720       # marker dispatching >12min w/ no active reviewers = spawn fail
 PILOT_JAM_WINDOW_SEC = 900     # 2+ sweep-aborts within 15min = Pilot jammed on a bad bead
 PILOT_STALL_SEC = 2400         # pilot log silent >40min = Pilot dead/not sweeping
+GRW_WAKE_GRACE = os.environ.get("GRW_WAKE_GRACE", "1") != "0"  # ga-m1o5: suppress a stall verdict a machine sleep can fully explain (mirrors daemon-presence-watchdog.sh's DPW_WAKE_GRACE)
 HEADOFLINE_MIN_SWEEPS = 2      # >=2 consecutive QUEUED-retry sweeps on the SAME branch = head-of-line block
 HEADOFLINE_LOG_FRESH_SEC = 600 # ignore if dispatcher log is staler than this (that's ENGINE-STALL's job)
 ORPHAN_LOG_FRESH_SEC = 600     # dispatcher log must be live (process still writing) — else ENGINE-STALL's job
@@ -235,6 +236,31 @@ def log_ts_epoch(line):
         return time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
     except Exception:
         return None
+
+
+_SYSCTL_SEC_RE = re.compile(r" sec = (\d+)")  # leading space anchors the `sec` field, not `usec`'s
+
+
+def secs_since_avail(now):
+    """Seconds the machine has been awake-and-up since it last became available,
+    i.e. now - max(boot_epoch, wake_epoch). Ports daemon-presence-watchdog.sh's
+    _secs_since_avail (ga-m1o5) so the Pilot-silence stall check gets the same
+    sleep/wake grace its heartbeat-WEDGE check already has: while asleep, launchd
+    suspends every StartInterval timer (Pilot's included), so a stale pilot log
+    proves nothing about Pilot's health until the machine has been up at least as
+    long as the stall threshold. Returns None if neither sysctl parses (caller
+    must fail OPEN — no grace, not a false 'never stalls' suppression)."""
+    latest = 0
+    for key in ("kern.boottime", "kern.waketime"):
+        r = sh(["sysctl", "-n", key], timeout=5)
+        if r is None or r.returncode != 0:
+            continue
+        m = _SYSCTL_SEC_RE.search(r.stdout or "")
+        if m:
+            v = int(m.group(1))
+            if v > latest:
+                latest = v
+    return (now - latest) if latest > 0 else None
 
 
 def recent_timeouts():
@@ -635,24 +661,43 @@ def mayor_session():
     return None
 
 
+def pilot_stall_verdict(silence_sec, avail_age_sec, threshold_sec, wake_grace=True):
+    """PURE decision (no I/O, unit-tested) for the pilot-log-silence half of
+    pilot_jammed(). True iff the pilot log has been silent >= threshold_sec AND
+    that silence is NOT fully explained by the machine having just woken/booted.
+    A wake/boot less than threshold_sec ago (avail_age_sec < threshold_sec) means
+    the log could not possibly have advanced yet regardless of Pilot's health —
+    suppress (False). avail_age_sec is None (neither sysctl parsed) fails OPEN:
+    no grace, judge on silence alone — same fail-safe direction as the other
+    *_verdict helpers in this file, just inverted (missing data must never mask
+    a real stall)."""
+    if silence_sec is None or silence_sec <= threshold_sec:
+        return False
+    if wake_grace and avail_age_sec is not None and avail_age_sec < threshold_sec:
+        return False
+    return True
+
+
 def pilot_jammed():
     """(jammed, reason). Detects the Pilot failing to dispatch — the gap that left a
     jam undetected for ~8h on 2026-06-08. Two modes:
       (a) sweep-abort: 2+ 'aborting dispatch' / 'gc sling failed' lines in the pilot log
           within PILOT_JAM_WINDOW (one bad bead — e.g. accented title — jams every sweep).
-      (b) stall: pilot log silent > PILOT_STALL_SEC (Pilot dead / not sweeping)."""
+      (b) stall: pilot log silent > PILOT_STALL_SEC (Pilot dead / not sweeping), unless
+          a machine sleep/wake fully explains the silence (ga-m1o5 — see
+          pilot_stall_verdict / secs_since_avail)."""
     try:
         mtime = os.path.getmtime(PILOT_LOG)
     except Exception:
         return (False, "")
-    if time.time() - mtime > PILOT_STALL_SEC:
+    now = time.time()
+    if pilot_stall_verdict(now - mtime, secs_since_avail(now), PILOT_STALL_SEC, GRW_WAKE_GRACE):
         return (True, "Pilot parou de varrer (log silencioso >%dmin) — pode estar morto" % (PILOT_STALL_SEC // 60))
     try:
         with open(PILOT_LOG) as f:
             lines = f.readlines()[-80:]
     except Exception:
         return (False, "")
-    now = time.time()
     aborts = 0
     for l in lines:
         if ("aborting dispatch" in l) or ("gc sling failed" in l):

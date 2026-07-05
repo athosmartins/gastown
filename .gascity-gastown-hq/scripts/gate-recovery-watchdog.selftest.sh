@@ -23,7 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WD="$SCRIPT_DIR/gate-recovery-watchdog.py"
 
 /usr/bin/python3 - "$WD" <<'PY'
-import sys, importlib.util, datetime
+import sys, importlib.util, datetime, time, tempfile, os
 
 wd_path = sys.argv[1]
 spec = importlib.util.spec_from_file_location("gate_recovery_watchdog", wd_path)
@@ -198,6 +198,12 @@ for needle, desc in [
     ("reap_hung_runs(sessions, now, rstate)", "main() reaps hung reviewers each loop"),
     ("requeue_error_markers(now, rstate)", "main() requeues stuck error markers each loop"),
     ("def set_gate_status_py(", "canonical gate-status transition helper is defined"),
+    # ga-m1o5: Pilot-silence sleep/wake grace (ports daemon-presence-watchdog.sh's DPW_WAKE_GRACE)
+    ("def secs_since_avail(", "secs_since_avail() boottime/waketime helper is defined"),
+    ("def pilot_stall_verdict(", "pure pilot_stall_verdict() decision is defined"),
+    ("GRW_WAKE_GRACE", "GRW_WAKE_GRACE opt-out constant is present"),
+    ("pilot_stall_verdict(now - mtime, secs_since_avail(now), PILOT_STALL_SEC, GRW_WAKE_GRACE)",
+     "pilot_jammed() actually wires the grace-aware verdict in (not just defined-but-unused)"),
 ]:
     if needle in src:
         ok(desc)
@@ -265,6 +271,120 @@ if m.error_requeue_verdict(ETH + 600, ETH, True, False, True, 0, KMAX) == "skip:
     ok("a ga-acb needs-human parked marker is left for the human, never requeued")
 else:
     bad("expected skip:parked-needs-human")
+
+# ═══ ga-m1o5: Pilot-silence sleep/wake grace ══════════════════════════════════
+# Incident ga-me4x: a machine sleep spanning the 40min PILOT_STALL_SEC threshold
+# made pilot-dispatcher.log look "silent >40min" and triggered an unnecessary
+# repair-dog dispatch, even though Pilot self-resumed and was never actually
+# dead. daemon-presence-watchdog.sh already suppresses this exact shape for its
+# heartbeat-WEDGE check (DPW_WAKE_GRACE / _secs_since_avail); these scenarios
+# pin the ported equivalent here.
+
+class _FakeResult:
+    def __init__(self, returncode, stdout):
+        self.returncode = returncode
+        self.stdout = stdout
+
+def _fake_sh(responses):
+    """Stand-in for m.sh() keyed on the last arg (the sysctl key). Missing
+    keys behave like a failed sysctl call (returncode=1), matching how
+    secs_since_avail() treats any sh() failure — `continue` past that key."""
+    def _inner(args, timeout=20, stdin=None):
+        key = args[-1] if args else None
+        if key in responses:
+            rc, out = responses[key]
+            return _FakeResult(rc, out)
+        return _FakeResult(1, "")
+    return _inner
+
+_real_sh = m.sh
+
+# ── Scenario 16: secs_since_avail() — sysctl 'sec' parsing (mirrors DPW bash Scenario 7e) ──
+print("Scenario 16: secs_since_avail() — boottime/waketime sysctl parsing")
+m.sh = _fake_sh({
+    "kern.boottime": (0, "{ sec = 1000000000, usec = 999999 } Fake Boot Date"),
+    "kern.waketime": (0, "{ sec = 0, usec = 0 } Thu Jan  1 00:00:00 1970"),
+})
+av = m.secs_since_avail(1000000500)
+if av == 500:
+    ok("parses the 'sec' field (not the usec collision) and ignores unpopulated waketime=0")
+else:
+    bad("mis-parsed boottime (got %r; expected 500 — usec-collision regex regression?)" % (av,))
+
+m.sh = _fake_sh({
+    "kern.boottime": (0, "{ sec = 1000000000, usec = 0 }"),
+    "kern.waketime": (0, "{ sec = 1000000400, usec = 0 }"),  # later epoch (Intel-style sleep)
+})
+av2 = m.secs_since_avail(1000000900)
+if av2 == 500:
+    ok("takes MAX(boottime, waketime) — the later (more-recently-available) epoch wins")
+else:
+    bad("expected 500 (now - max epoch), got %r" % (av2,))
+
+m.sh = _fake_sh({})  # both sysctls fail/unparseable
+av3 = m.secs_since_avail(1000000900)
+if av3 is None:
+    ok("returns None when neither sysctl parses (fail-OPEN contract for the caller)")
+else:
+    bad("expected None when both sysctls fail, got %r" % (av3,))
+m.sh = _real_sh
+
+# ── Scenario 17: pilot_stall_verdict() — pure grace decision ─────────────────
+print("Scenario 17: pilot_stall_verdict() — wake/boot grace suppresses ONLY a sleep-explained silence")
+TH = m.PILOT_STALL_SEC
+if m.pilot_stall_verdict(TH - 1, 50, TH, True) == False:
+    ok("silence under threshold → never a stall, regardless of avail_age")
+else:
+    bad("expected False for silence <= threshold")
+
+if m.pilot_stall_verdict(TH + 600, None, TH, True) == True:
+    ok("avail_age unknown (neither sysctl parsed) fails OPEN — judged on silence alone")
+else:
+    bad("expected True when avail_age_sec is None (fail-open)")
+
+if m.pilot_stall_verdict(TH + 600, 100, TH, True) == False:
+    ok("recent wake/boot (avail_age < threshold) fully explains the silence → suppressed (the ga-m1o5 fix)")
+else:
+    bad("REGRESSION ga-m1o5: recent-wake case not suppressed — false-positive dispatch would recur")
+
+if m.pilot_stall_verdict(TH + 600, TH + 1, TH, True) == True:
+    ok("machine long since up (avail_age >= threshold) → silence is a REAL stall, still fires")
+else:
+    bad("expected True when avail_age_sec >= threshold (genuine stall must still fire)")
+
+if m.pilot_stall_verdict(TH + 600, 100, TH, False) == True:
+    ok("GRW_WAKE_GRACE=0 (wake_grace=False) reverts to legacy behaviour — fires even right after wake")
+else:
+    bad("expected True with wake_grace=False (explicit opt-out)")
+
+# ── Scenario 18: pilot_jammed() end-to-end — replays the ga-me4x incident shape ──
+print("Scenario 18: pilot_jammed() end-to-end — recent wake fully explains a stale pilot log")
+_tmp_log = tempfile.NamedTemporaryFile(delete=False)
+_tmp_log.close()
+_stale_mtime = time.time() - (m.PILOT_STALL_SEC + 600)  # log silent > threshold
+os.utime(_tmp_log.name, (_stale_mtime, _stale_mtime))
+
+_real_pilot_log = m.PILOT_LOG
+m.PILOT_LOG = _tmp_log.name
+try:
+    m.sh = _fake_sh({"kern.boottime": (0, "{ sec = %d, usec = 0 }" % int(time.time() - 100))})  # woke 100s ago
+    jammed, reason = m.pilot_jammed()
+    if jammed == False:
+        ok("stale pilot log right after a machine wake is NOT reported jammed (ga-me4x false-positive fixed)")
+    else:
+        bad("REGRESSION ga-m1o5: pilot_jammed() fired on a sleep-explained stale log: %r" % (reason,))
+
+    # Same stale log, but the machine has been up far longer than the threshold → genuine stall.
+    m.sh = _fake_sh({"kern.boottime": (0, "{ sec = %d, usec = 0 }" % int(time.time() - (m.PILOT_STALL_SEC * 3)))})
+    jammed2, reason2 = m.pilot_jammed()
+    if jammed2 == True and "silencioso" in reason2:
+        ok("same stale log but machine long-since up → genuinely jammed, still detected")
+    else:
+        bad("expected a genuine stall to still fire when avail_age >= threshold, got jammed=%r reason=%r" % (jammed2, reason2))
+finally:
+    m.PILOT_LOG = _real_pilot_log
+    m.sh = _real_sh
+    os.unlink(_tmp_log.name)
 
 print("")
 print("Results: %d passed, %d failed" % (PASS, FAIL))
