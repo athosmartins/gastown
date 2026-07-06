@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -50,7 +51,7 @@ func (i *Info) IsStale() bool {
 		return true
 	}
 	// On Unix, FindProcess always succeeds; send signal 0 to test liveness.
-	return proc.Signal(nil) != nil
+	return proc.Signal(syscall.Signal(0)) != nil
 }
 
 // FilePath returns the full path to the freeze sentinel file.

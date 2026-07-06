@@ -111,3 +111,19 @@ func TestParseMalformedContent(t *testing.T) {
 		})
 	}
 }
+
+func TestInfoIsStale(t *testing.T) {
+	t.Run("current process is live", func(t *testing.T) {
+		info := &migration.Info{PID: os.Getpid()}
+		if info.IsStale() {
+			t.Fatal("current process should not be stale")
+		}
+	})
+
+	t.Run("missing process is stale", func(t *testing.T) {
+		info := &migration.Info{PID: 99999999}
+		if !info.IsStale() {
+			t.Fatal("non-existent process should be stale")
+		}
+	})
+}
