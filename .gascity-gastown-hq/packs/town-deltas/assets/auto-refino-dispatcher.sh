@@ -133,6 +133,16 @@ AUTO_REFINO_EXCLUDE_LABELS="${AUTO_REFINO_EXCLUDE_LABELS:-scraper build infra co
 # Set AUTO_REFINO_INGEST_RAW_TRIAGEM=0 to restore the EXACT prior behaviour
 # (labelled-input only — no raw ingestion).
 AUTO_REFINO_INGEST_RAW_TRIAGEM="${AUTO_REFINO_INGEST_RAW_TRIAGEM:-1}"
+# A no-label bead mutated more recently than this is disqualified from RAW
+# ingestion (ga-51ry, 3rd occurrence wa-soe8a): a manual or automated recovery
+# transition (e.g. the Mayor clearing gate:needs-human to retry) can clear the
+# LAST protective story:*/gate:* label moments before applying its replacement.
+# The periodic RAW sweep can land inside that gap (observed: 87s) and mistake
+# an already-triaged, already-approved/gated story for genuinely-untriaged raw
+# work. Sized above one launchd sweep interval (~5m, see FIX C below) so a
+# recovery in flight has a full cycle to land its replacement label; a
+# genuinely-fresh raw story is merely delayed one sweep, never starved.
+AUTO_REFINO_RAW_MIN_AGE_MINUTES="${AUTO_REFINO_RAW_MIN_AGE_MINUTES:-5}"
 
 # ── DELIVERED-DUPLICATE CHECK (wa-ca4jm) ──────────────────────────────────────
 # Before promoting a freshly-refined story to refino-gate, check whether a
@@ -304,7 +314,7 @@ auto_refino_has_lifecycle_label() {
   echo "no"
 }
 
-# auto_refino_is_ingestable_raw <id> <issue_type> <labels_csv> <ephemeral> <exclude_labels>
+# auto_refino_is_ingestable_raw <id> <issue_type> <labels_csv> <ephemeral> <exclude_labels> <age_minutes> <min_age_minutes>
 #   Emit "yes" iff this bead is a RAW Triagem story eligible for AUTO-INGESTION
 #   into the funnel — i.e. it qualifies the way the painel's _qualifies_for_triagem
 #   does, restricted to the funnel's product-story scope. ALL must hold:
@@ -314,11 +324,22 @@ auto_refino_has_lifecycle_label() {
 #     - NOT an automation/identity/ephemeral bead: ephemeral!=true, id not dc-*,
 #       id not *-wisp-*, no gt:agent / gt:rig label (mirror painel _is_automation_bead);
 #     - it is a product story (auto_refino_is_product_story — build/scraper/config
-#       excluded just like a labelled candidate would be).
+#       excluded just like a labelled candidate would be);
+#     - NOT too-freshly-mutated (ga-51ry): age_minutes (caller-computed minutes
+#       since updated_at) must be >= min_age_minutes. age_minutes/min_age_minutes
+#       are OPTIONAL (trailing, default ""/0) so every pre-existing call site
+#       keeps its exact prior behaviour unless it opts in by passing them.
 #   Status (open) is enforced at the query level (--status open), exactly as the
 #   labelled queries already are; this pure predicate covers the rest.
 auto_refino_is_ingestable_raw() {
   local id="$1" itype="$2" labels="$3" ephemeral="$4" ex="${5:-}"
+  local age_min="${6:-}" min_age="${7:-0}"
+  # Sanitize like auto_refino_next_attempt: garbage/empty age_min fails OPEN
+  # (treated as ancient, i.e. never age-excluded) so a missing/unparseable
+  # updated_at can never silently starve the RAW funnel. Garbage min_age
+  # disables the guard (0 minutes — nothing is ever "too fresh").
+  case "$age_min" in ''|*[!0-9]*) age_min=999999 ;; esac
+  case "$min_age" in ''|*[!0-9]*) min_age=0 ;; esac
   local csv=",$labels,"
   # type must be in the funnel (feature/story).
   [ "$(auto_refino_type_eligible "$itype")" = "yes" ] || { echo "no"; return; }
@@ -341,6 +362,12 @@ auto_refino_is_ingestable_raw() {
   # RAW and gets re-ingested every sweep. Any gate:* label disqualifies it (the RAW
   # jq query also drops it; classifier-side defense in depth). csv is comma-wrapped.
   case "$csv" in *,gate:*) echo "no"; return ;; esac
+  # too-freshly-mutated (ga-51ry): this bead was updated inside the last
+  # min_age minutes — likely mid a non-atomic recovery transition (a
+  # story:*/gate:* protective label was JUST cleared and the replacement has
+  # not landed yet). Wait it out rather than mistake it for genuinely-raw work
+  # (the RAW jq query mirrors this too; classifier-side defense in depth).
+  [ "$age_min" -lt "$min_age" ] && { echo "no"; return; }
   # build/scraper/non-product beads are excluded just like labelled candidates.
   [ "$(auto_refino_is_product_story "$labels" "$ex")" = "yes" ] || { echo "no"; return; }
   echo "yes"
@@ -770,7 +797,7 @@ if [ "$AUTO_REFINO_INGEST_RAW_TRIAGEM" = "1" ]; then
   # feature type (and `story` if the build models it as a distinct type).
   _RAW_FEATURE=$(bd_ list --type feature --status open --json 2>/dev/null || echo "[]")
   _RAW_STORY=$(bd_ list --type story --status open --json 2>/dev/null || echo "[]")
-  RAW_JSON=$(jq -s '
+  RAW_JSON=$(jq -s --argjson min_age_sec "$(( AUTO_REFINO_RAW_MIN_AGE_MINUTES * 60 ))" '
     (.[0] + .[1])
     | unique_by(.id)
     # RAW = carries NO story:* lifecycle label (the painel Triagem criterion).
@@ -792,6 +819,19 @@ if [ "$AUTO_REFINO_INGEST_RAW_TRIAGEM" = "1" ]; then
     # (ga-oonk3 re-ingested 3x). Any gate:* label means NOT a raw Triagem story.
     # Mirrors the auto-refino:escalated guard directly above.
     | map(select(((.labels // []) | any(type=="string" and startswith("gate:"))) | not))
+    # Drop beads mutated too recently (ga-51ry, 3rd occurrence wa-soe8a): a
+    # manual/automated recovery transition (e.g. the Mayor clearing
+    # gate:needs-human to retry) can clear the LAST protective story:*/gate:*
+    # label moments before applying its replacement — this sweep can land inside
+    # that gap (observed: 87s) and mistake an already-triaged story for genuinely
+    # untriaged raw work. Require updated_at at least min_age_sec old. A
+    # missing/unparseable updated_at ($upd == null) fails OPEN (kept) so a
+    # malformed timestamp can never silently starve the RAW funnel. Mirrors the
+    # classifier-side guard in auto_refino_is_ingestable_raw (defense in depth).
+    | map(select(
+        (((.updated_at // "") | try fromdateiso8601 catch null)) as $upd
+        | ($upd == null) or ((now - $upd) >= $min_age_sec)
+      ))
   ' <(echo "$_RAW_FEATURE") <(echo "$_RAW_STORY") 2>/dev/null || echo "[]")
   _RAWCOUNT=$(echo "$RAW_JSON" | jq 'length' 2>/dev/null || echo 0)
   log "Raw-Triagem ingestion ON: $_RAWCOUNT no-lifecycle-label feature/story bead(s) eligible (pre-classification)."
@@ -810,6 +850,7 @@ log "  $CCOUNT candidate story(ies) in Triagem (pre-classification)."
 
 # Classify with the pure core; keep only fresh/bounce candidates of an eligible
 # type. Oldest-first (FIFO) so the backlog drains in arrival order.
+NOW_EPOCH=$(date +%s)
 while IFS= read -r row; do
   [ -z "$row" ] && continue
   c_id=$(echo "$row" | jq -r '.id // empty')
@@ -818,6 +859,13 @@ while IFS= read -r row; do
   c_labels=$(_labels_csv "$row")
   c_assignee=$(echo "$row" | jq -r '.assignee // empty')
   c_ephemeral=$(echo "$row" | jq -r 'if (.ephemeral // false)==true then "true" else "false" end')
+  # Age since last update, in minutes (ga-51ry RAW min-age guard input). Same
+  # BSD/GNU date-parsing fallback as the TTL-recovery pass above; unparseable
+  # timestamp → epoch 0 → huge age → guard fails open (never age-excludes).
+  c_updated=$(echo "$row" | jq -r '.updated_at // empty')
+  c_upd_epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$c_updated" +%s 2>/dev/null \
+    || date -u -d "$c_updated" +%s 2>/dev/null || echo 0)
+  c_age_min=$(( (NOW_EPOCH - c_upd_epoch) / 60 ))
   [ "$(auto_refino_type_eligible "$c_type")" = "yes" ] || { log "  skip $c_id: type '$c_type' not in funnel (bug/chore/task bypass)"; continue; }
   [ "$(auto_refino_is_product_story "$c_labels" "$AUTO_REFINO_EXCLUDE_LABELS")" = "yes" ] || { log "  skip $c_id: carries build/non-product label (auto-refino excludes: $AUTO_REFINO_EXCLUDE_LABELS) — not a product story"; continue; }
   state=$(auto_refino_lifecycle_state "$c_labels" "$c_assignee" "$AUTO_REFINO_ACTOR")
@@ -830,7 +878,7 @@ while IFS= read -r row; do
       # flows through the identical "fresh" path. The labelled-input behaviour
       # above is untouched — this branch only ever fires for no-label beads.
       if [ "$AUTO_REFINO_INGEST_RAW_TRIAGEM" = "1" ] \
-         && [ "$(auto_refino_is_ingestable_raw "$c_id" "$c_type" "$c_labels" "$c_ephemeral" "$AUTO_REFINO_EXCLUDE_LABELS")" = "yes" ]; then
+         && [ "$(auto_refino_is_ingestable_raw "$c_id" "$c_type" "$c_labels" "$c_ephemeral" "$AUTO_REFINO_EXCLUDE_LABELS" "$c_age_min" "$AUTO_REFINO_RAW_MIN_AGE_MINUTES")" = "yes" ]; then
         STORY="$row"; RAW_INGEST=1
         log "  ingest $c_id: raw Triagem story (no story:* label) → applying story:unrefined entry label"
         break

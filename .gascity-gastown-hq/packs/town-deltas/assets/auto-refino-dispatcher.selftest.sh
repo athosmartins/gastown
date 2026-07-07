@@ -154,6 +154,40 @@ echo "Scenario 4c: RAW ingestion excludes escalated stories (bug ga-it11w)"
   && ok "genuine raw story (no story:*, no escalated) → yes (funnel not starved)" \
   || bad "genuine raw story → expected yes"
 
+# ── Scenario 4d: RAW min-age guard (bug ga-51ry, 3rd occurrence wa-soe8a) ──────
+# A manual/automated recovery transition (e.g. the Mayor clearing gate:needs-human
+# to retry) can clear the LAST protective story:*/gate:* label moments before
+# applying its replacement — the RAW sweep can land inside that gap (observed:
+# 87s) and mistake an already-triaged, already-approved/gated story for genuinely
+# untriaged raw work. age_minutes/min_age_minutes are the two new OPTIONAL
+# trailing params; every Scenario 4c call above omits them and must be unaffected
+# (proven by 4c still passing green).
+echo "Scenario 4d: RAW min-age guard — freshly-mutated no-label bead is NOT ingested (ga-51ry)"
+[ "$(auto_refino_is_ingestable_raw "wa-soe8a" "feature" "" "false" "$EX" "1" "5")" = "no" ] \
+  && ok "no-label bead updated 1m ago (<5m floor) → no (too fresh, likely mid-recovery)" \
+  || bad "freshly-mutated no-label bead → expected no"
+[ "$(auto_refino_is_ingestable_raw "wa-soe8a" "feature" "" "false" "$EX" "10" "5")" = "yes" ] \
+  && ok "same bead, now updated 10m ago (>=5m floor) → yes (quiet long enough to trust)" \
+  || bad "aged-past-floor bead → expected yes"
+[ "$(auto_refino_is_ingestable_raw "wa-soe8a" "feature" "" "false" "$EX" "5" "5")" = "yes" ] \
+  && ok "age_minutes == min_age_minutes (boundary) → yes (>= floor, not strictly less)" \
+  || bad "boundary age == floor → expected yes"
+[ "$(auto_refino_is_ingestable_raw "wa-soe8a" "feature" "" "false" "$EX" "" "5")" = "yes" ] \
+  && ok "missing age_minutes (unparseable updated_at upstream) → yes (fails OPEN, never starves funnel)" \
+  || bad "missing age_minutes → expected yes (fail-open)"
+[ "$(auto_refino_is_ingestable_raw "wa-soe8a" "feature" "" "false" "$EX" "garbage" "5")" = "yes" ] \
+  && ok "non-numeric age_minutes → yes (sanitized to fail-open, mirrors auto_refino_next_attempt idiom)" \
+  || bad "garbage age_minutes → expected yes (fail-open)"
+[ "$(auto_refino_is_ingestable_raw "wa-soe8a" "feature" "" "false" "$EX" "0" "")" = "yes" ] \
+  && ok "non-numeric min_age_minutes → yes (guard disabled, sanitized to 0-minute floor)" \
+  || bad "garbage min_age_minutes → expected yes (guard disabled)"
+# The age guard must not override the escalated/gate:* guards — a too-fresh
+# ESCALATED bead is still disqualified for being escalated, not merely re-admitted
+# because it also happens to fail the age check for a different reason.
+[ "$(auto_refino_is_ingestable_raw "ga-m9gt3" "feature" "auto-refino:escalated" "false" "$EX" "10" "5")" = "no" ] \
+  && ok "escalated bead that is ALSO old enough → still no (escalated guard independent of age)" \
+  || bad "escalated+aged → expected no"
+
 # ── Scenario 5: attempt cap terminates a daemon↔gate ping-pong ────────────────
 echo "Scenario 5: REFINED beyond the attempt budget → escalate (loop terminates)"
 D=$(auto_refino_handoff_decision "REFINED" 4 3)
