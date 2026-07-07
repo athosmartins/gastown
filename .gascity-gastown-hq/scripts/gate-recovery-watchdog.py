@@ -173,6 +173,27 @@ STRANDED_MAX_ATTEMPTS = int(os.environ.get("GRW_STRANDED_MAX_ATTEMPTS", "2"))   
 GRW_STRANDED_LABEL_RE = re.compile(r"^grw-stranded:(\d+)$")                        # restart-safe per-marker stranded-recovery counter
 RECOVERY_LOG = os.path.join(CITY, ".gc/logs/gate-recovery-actions.jsonl")        # durable jsonl audit of every direct reap/requeue (evidence)
 GRW_REQUEUE_LABEL_RE = re.compile(r"^grw-requeue:(\d+)$")                          # restart-safe per-marker requeue counter, stamped on the marker as a label
+# FIX 6 — requeue a STRANDED dispatching|reviewing MARKER whose reviewer DIED leaving
+# NO open running gate-run (wa-ppe5v, 3× in one session 2026-07-07: wa-b7z7c/wa-jpuu6/
+# wa-u3ay1). When a reviewer dies mid-review (drain / machine-sleep / quota / crash),
+# the dispatcher does not always leave a running gate-run for FIX 1/5 to reap — it died
+# DURING dispatch (marker gate-status:dispatching, run never created) OR the run was
+# already closed while the marker never advanced — so the marker sits dispatching|
+# reviewing FOREVER. FIX 1 only reaps running RUNS, FIX 4 only touches queued/ready/
+# claimed MARKERS, FIX 3 only kills active-but-silent reviewers, and stuck_dispatching()
+# only fires while the dispatcher is ACTIVELY polling a live run. Meanwhile the Pilot's
+# _beadid_has_active_gate_artifact counts dispatching|reviewing as ACTIVE → it DROPS the
+# gate:needs-fix source bead as 'already gating' → the bead is orphaned (never re-
+# dispatched NOR re-reviewed) until the Mayor re-slings by hand. Recovery = requeue the
+# marker (→ gate-status:queued: a fresh dispatcher sweep re-reviews the EXISTING branch,
+# no rebuild) + clear the source's leaked gate:reviewing. A live/hung RUN (has_open_run)
+# hands off to FIX 1/5 untouched; a per-marker attempt cap escalates to needs-human if
+# reviewers keep dying on the same branch. Sustained-confirmed on a resample; fail-safe.
+GRW_REAP_STALE_REVIEW_ENABLED = os.environ.get("GRW_REAP_STALE_REVIEW_ENABLED", "1") != "0"
+STALE_REVIEW_MARKER_MINUTES = int(os.environ.get("GRW_STALE_REVIEW_MARKER_MINUTES", "15"))  # a marker must sit dispatching|reviewing >this WITH NO open run before requeue — well past a normal spin-up (a run is created within seconds), so an in-flight dispatch is never mistaken for a dead one
+STALE_REVIEW_MAX_PER_SWEEP = int(os.environ.get("GRW_STALE_REVIEW_MAX_PER_SWEEP", "5"))
+STALE_REVIEW_MAX_ATTEMPTS = int(os.environ.get("GRW_STALE_REVIEW_MAX_ATTEMPTS", "3"))  # after K requeues of the SAME marker (reviewers keep dying on this branch), escalate to needs-human instead of an infinite re-review loop
+GRW_STALE_REVIEW_LABEL_RE = re.compile(r"^grw-stale-review:(\d+)$")                 # restart-safe per-marker stale-review requeue counter
 # A repair dog's session title (set by the watchdog's --title-hint, and kept by the
 # dog after it self-renames because the dog naturally echoes the branch/condition)
 # matched broadly so we also catch dogs spawned before this process started (restart
@@ -1974,6 +1995,168 @@ def reap_orphan_and_stale_markers(now):
         print("[watchdog] FIX4 orphan/stale sweep: %d marker(s) actioned%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
 
 
+def stale_review_marker_verdict(status, age_sec, min_sec, has_open_run):
+    """PURE decision (no I/O, unit-tested) for FIX 6, on an OPEN gate-marker whose
+    gate-status is dispatching|reviewing:
+      'requeue'                — sits dispatching|reviewing past min_sec with NO open
+                                 running run (reviewer dead, no hung RUN for FIX 1/5 to
+                                 own) → requeue so the dispatcher re-reviews the branch.
+      'wait'                   — younger than min_sec (normal dispatch→run-create spin-up).
+      'skip:not-review-status' — not a dispatching|reviewing marker (FIX 4 owns queued/
+                                 ready/claimed; every other state is terminal).
+      'skip:live-run'          — an open running run exists for it → FIX 1/5 own the reap;
+                                 FIX 6 never double-handles a live/hung review.
+      'skip:run-query-failed'  — has_open_run is None (the run query failed) → fail-safe,
+                                 NEVER requeue blind (a Dolt glitch must not duplicate a
+                                 live review by falsely concluding 'no run')."""
+    if status not in ("dispatching", "reviewing"):
+        return "skip:not-review-status"
+    if age_sec < min_sec:
+        return "wait"
+    if has_open_run is None:
+        return "skip:run-query-failed"
+    if has_open_run:
+        return "skip:live-run"
+    return "requeue"
+
+
+def _markers_with_open_run(runs):
+    """Set of marker_ids that currently have an OPEN gate-status:running gate-run
+    (parsed from each run's `marker_id:` description field). None if runs is None
+    (query failure) so the caller fail-safe treats liveness as UNKNOWN and skips."""
+    if runs is None:
+        return None
+    out = set()
+    for run in runs:
+        mid = _parse_run_field(run.get("description") or "", "marker_id")
+        if mid:
+            out.add(mid)
+    return out
+
+
+def reap_stale_review_markers(now, rstate):
+    """FIX 6: requeue a marker STRANDED at gate-status:dispatching|reviewing whose
+    reviewer DIED leaving NO open running run — the wa-ppe5v orphan (the Pilot counts
+    dispatching|reviewing as active and DROPS the gate:needs-fix source forever). Each
+    sweep, for an open dispatching|reviewing marker older than STALE_REVIEW_MARKER_MINUTES
+    with NO open running run (confirmed across a resample): requeue → gate-status:queued
+    (the dispatcher re-reviews the EXISTING branch, no rebuild) + clear the source's
+    leaked gate:reviewing. A per-marker attempt cap escalates to needs-human. Bounded,
+    dry-run-aware, fully fail-safe (unreadable → skip; a live/hung run → defer to FIX 1/5)."""
+    if not GRW_ENABLED or not GRW_REAP_STALE_REVIEW_ENABLED:
+        return
+    r = sh(["bd", "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",
+            "--status", "open", "--json"], timeout=25)
+    if not r or r.returncode != 0:
+        return  # query failure → fail-safe skip (no blind action)
+    try:
+        markers = json.loads(r.stdout) or []
+    except Exception:
+        return
+    open_run_markers = _markers_with_open_run(_open_running_runs())
+    acted = 0
+    for m in markers:
+        if acted >= STALE_REVIEW_MAX_PER_SWEEP:
+            break
+        mid = m.get("id")
+        if not mid:
+            continue
+        status = _label_value(m, "gate-status:")
+        if status not in ("dispatching", "reviewing"):
+            continue
+        age = int(now - (_iso_epoch(m.get("updated_at")) or now))
+        has_open_run = None if open_run_markers is None else (mid in open_run_markers)
+        v = stale_review_marker_verdict(status, age, STALE_REVIEW_MARKER_MINUTES * 60, has_open_run)
+        if v != "requeue":
+            if GRW_DRY_RUN and v != "skip:not-review-status":
+                print("[watchdog] FIX6 DRY skip marker=%s status=%s age=%dm (%s)"
+                      % (mid, status, age // 60, v), flush=True)
+            continue
+        # SUSTAINED-confirm: a dispatch CREATING its run right now (or a transient
+        # run-query blip) will show an open run — or the marker will have advanced —
+        # on a second sample after a short gap → abort. Never requeue a live review.
+        time.sleep(LIVENESS_RESAMPLE_SEC)
+        open_run_markers2 = _markers_with_open_run(_open_running_runs())
+        if open_run_markers2 is None or (mid in open_run_markers2):
+            print("[watchdog] FIX6 marker=%s NOT requeued after resample (run appeared / query failed) — fail-safe KEPT"
+                  % mid, flush=True)
+            continue
+        status2 = _label_value({"labels": _bead_labels(mid)}, "gate-status:")
+        if status2 not in ("dispatching", "reviewing"):
+            print("[watchdog] FIX6 marker=%s advanced to '%s' during resample — fail-safe KEPT"
+                  % (mid, status2 or "?"), flush=True)
+            continue
+        src = _label_value(m, "source-bead:")
+        rig = _label_value(m, "bead-rig:") or _label_value(m, "rig:")
+        branch = _label_value(m, "branch:")
+        attempts = 0
+        for lb in (m.get("labels") or []):
+            mm = GRW_STALE_REVIEW_LABEL_RE.match(str(lb))
+            if mm:
+                try:
+                    attempts = int(mm.group(1))
+                except Exception:
+                    attempts = 0
+        resolved, sclosed, reviewing, store = _source_review_state(src, rig)
+        if GRW_DRY_RUN:
+            print("[watchdog] FIX6 DRY would %s STALE %s marker=%s src=%s age=%dm attempts=%d"
+                  % ("ESCALATE" if attempts >= STALE_REVIEW_MAX_ATTEMPTS else "requeue",
+                     status, mid, src, age // 60, attempts), flush=True)
+            _recovery_ledger("would_requeue_stale_review_marker",
+                             {"marker": mid, "source_bead": src, "status": status,
+                              "age_min": age // 60, "attempts": attempts, "dry_run": True})
+            acted += 1
+            continue
+        if attempts >= STALE_REVIEW_MAX_ATTEMPTS:
+            # reviewers keep dying on this branch → stop re-reviewing, hand to a human.
+            set_gate_status_py(mid, "parked-needs-human")
+            sh(["bd", "-C", CITY, "comment", mid,
+                "gate-recovery-watchdog FIX6: marker re-stranded at %s %d× (reviewers keep dying mid-review, no run) on branch %s — escalating to parked-needs-human instead of another futile re-review. Cleared the phantom gate:reviewing so the Pilot stops seeing a live review. (grw stale-review cap)"
+                % (status, attempts, branch or "?")], timeout=25)
+            if resolved and reviewing:
+                sh(["bd", "-C", store, "label", "remove", src, "gate:reviewing", "-q"], timeout=20)
+            _recovery_ledger("escalate_stale_review_marker",
+                             {"marker": mid, "source_bead": src, "status": status,
+                              "attempts": attempts, "branch": branch})
+            if rstate.escalate_once("stale-review-osc:%s" % mid, now):
+                notify("🚨 Gate: marker %s encalhou em %s %d× (revisor morre repetido, sem run) — parkeado p/ needs-human. Precisa de você (branch %s)."
+                       % (mid, status, attempts, branch or "?"), 5)
+                _grw_ledger("human-touch", {"ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "source_daemon": "gate-recovery-watchdog", "stage": "revisa", "kind": "technical",
+                            "bead_id": src or "", "reason": "stale-review marker %s re-stranded %d× (reviewers keep dying, no run) — parked needs-human" % (mid, attempts)}, fail_open=True)
+            print("[watchdog] FIX6 ESCALATED marker=%s (re-stranded %d× at %s) → parked-needs-human"
+                  % (mid, attempts, status), flush=True)
+            acted += 1
+            continue
+        # 1) stamp the restart-safe counter FIRST (a crash mid-op must not lose the
+        #    oscillation history and loop forever), then requeue the marker → the
+        #    dispatcher re-reviews the EXISTING branch (no rebuild).
+        for lb in (m.get("labels") or []):
+            if GRW_STALE_REVIEW_LABEL_RE.match(str(lb)):
+                sh(["bd", "-C", CITY, "label", "remove", mid, str(lb), "-q"])
+        sh(["bd", "-C", CITY, "label", "add", mid, "grw-stale-review:%d" % (attempts + 1), "-q"])
+        set_gate_status_py(mid, "queued")
+        sh(["bd", "-C", CITY, "comment", mid,
+            "gate-recovery-watchdog FIX6: marker sat gate-status:%s %dm with NO open running run (reviewer died mid-review — drain/sleep/quota/crash — leaving no hung RUN for FIX 1/5). Re-queued so a fresh dispatcher sweep re-reviews branch %s (the existing fix, no rebuild). The Pilot was DROPPING the gate:needs-fix source %s as 'actively gating' on this dead marker (wa-ppe5v). attempt %d/%d."
+            % (status, age // 60, branch or "?", src or "?", attempts + 1, STALE_REVIEW_MAX_ATTEMPTS)], timeout=25)
+        # 2) clear the source's leaked gate:reviewing (the phantom 'em revisão').
+        cleared_reviewing = False
+        if resolved and reviewing:
+            sh(["bd", "-C", store, "label", "remove", src, "gate:reviewing", "-q"], timeout=20)
+            cleared_reviewing = True
+        _recovery_ledger("requeue_stale_review_marker",
+                         {"marker": mid, "source_bead": src, "status": status, "age_min": age // 60,
+                          "attempt": attempts + 1, "cleared_gate_reviewing": cleared_reviewing, "branch": branch})
+        notify("Gate self-heal: marker travado em %s reapado (%s, %dmin, revisor morto sem run) — re-enfileirado p/ re-revisão. Você não precisa agir."
+               % (status, mid, age // 60), 3)
+        print("[watchdog] FIX6 REQUEUED stale %s marker=%s src=%s age=%dm attempt=%d cleared_reviewing=%s"
+              % (status, mid, src, age // 60, attempts + 1, cleared_reviewing), flush=True)
+        acted += 1
+    if acted:
+        print("[watchdog] FIX6 stale-review sweep: %d marker(s) requeued/escalated%s"
+              % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
+
+
 def _open_error_markers():
     """[marker dicts] type:quality-gate-marker + gate-status:error + open, in HQ (the
     dispatcher's domain — it only re-processes HQ queued markers). None on query
@@ -2114,11 +2297,13 @@ def main():
         "AND recover STRANDED-VERDICT runs (run>%dm, all verdicts delivered but stuck running/unfinalized, cap %d attempts; enabled=%s) "
         "AND kill FROZEN reviewers (active-but-last_active-silent>%ds, cap %d/sweep, sustained-confirmed; enabled=%s) "
         "AND reap ORPHAN/STALE markers (queued>%dm w/ source closed→close, or leaked gate:reviewing→clear, cap %d/sweep; enabled=%s) "
+        "AND requeue STRANDED dispatching|reviewing markers w/ NO open run (dead reviewer, >%dm, cap %d/sweep, esc after %d; enabled=%s) "
         "AND auto-requeue STUCK gate-status:error markers (>%dm in error, cap %d/sweep, osc-escalate after %d; enabled=%s). "
         "All bounded + fail-safe + dry_run=%s."
         % (REVIEW_HANG_MINUTES, GRW_REAP_HUNG_ENABLED, STRANDED_RUN_MINUTES, STRANDED_MAX_ATTEMPTS, GRW_REAP_STRANDED_ENABLED,
            FROZEN_KILL_SECS, FROZEN_KILL_MAX_PER_SWEEP, GRW_REAP_FROZEN_ENABLED,
            ORPHAN_MARKER_MIN_MINUTES, ORPHAN_MAX_PER_SWEEP, GRW_REAP_ORPHAN_ENABLED,
+           STALE_REVIEW_MARKER_MINUTES, STALE_REVIEW_MAX_PER_SWEEP, STALE_REVIEW_MAX_ATTEMPTS, GRW_REAP_STALE_REVIEW_ENABLED,
            ERROR_REQUEUE_MINUTES, ERROR_REQUEUE_MAX_PER_SWEEP, ERROR_REQUEUE_MAX_ATTEMPTS, GRW_REQUEUE_ERROR_ENABLED, GRW_DRY_RUN), flush=True)
 
   while True:
@@ -2149,6 +2334,10 @@ def main():
             reap_orphan_and_stale_markers(now)
         except Exception as e:
             print("[watchdog] reap_orphan_and_stale_markers error (continuing): %r" % e, flush=True)
+        try:
+            reap_stale_review_markers(now, rstate)
+        except Exception as e:
+            print("[watchdog] reap_stale_review_markers error (continuing): %r" % e, flush=True)
         try:
             requeue_error_markers(now, rstate)
         except Exception as e:
@@ -2249,7 +2438,7 @@ def main():
 
 
 def _selftest():
-    """Pure-logic regression checks for FIX 3 (no I/O). Run: --selftest."""
+    """Pure-logic regression checks for FIX 3/4/5/6 (no I/O). Run: --selftest."""
     p = f = 0
     def ok(c, m):
         nonlocal p, f
@@ -2293,7 +2482,19 @@ def _selftest():
     ok(stranded_verdict_verdict(38 * 60, S, -1, -1) == "skip:query-failed", "unreadable verdict counts → skip (never act blind)")
     # boundary: FIX 1 (delivered==0) and FIX 5 (delivered==total) are mutually exclusive
     ok(stranded_verdict_verdict(38 * 60, S, 0, 2) != "recover", "delivered==0 is FIX 1's domain, NOT FIX 5 (no double-handling)")
-    print("gate-recovery-watchdog FIX3+FIX4+FIX5 selftest: PASS=%d FAIL=%d" % (p, f))
+    # FIX 6 — stale_review_marker_verdict (dispatching|reviewing marker, dead reviewer, NO run)
+    R = 15 * 60
+    ok(stale_review_marker_verdict("reviewing", 9 * 60, R, False) == "wait", "young reviewing marker (9m<15m) → wait (dispatch→run-create spin-up)")
+    ok(stale_review_marker_verdict("reviewing", 40 * 60, R, False) == "requeue", "old reviewing + NO open run → requeue (the wa-b7z7c dead-reviewer orphan)")
+    ok(stale_review_marker_verdict("dispatching", 40 * 60, R, False) == "requeue", "old dispatching + NO open run → requeue (reviewer never materialized)")
+    ok(stale_review_marker_verdict("reviewing", 40 * 60, R, True) == "skip:live-run", "reviewing + OPEN running run → skip (FIX 1/5 own it)")
+    ok(stale_review_marker_verdict("dispatching", 40 * 60, R, True) == "skip:live-run", "dispatching + open run → skip (a live review, not stale)")
+    ok(stale_review_marker_verdict("reviewing", 40 * 60, R, None) == "skip:run-query-failed", "run-query failed (None) → skip (never requeue blind on a Dolt glitch)")
+    ok(stale_review_marker_verdict("queued", 40 * 60, R, False) == "skip:not-review-status", "queued marker → not FIX 6's domain (FIX 4 owns queued/ready/claimed)")
+    ok(stale_review_marker_verdict("passed", 40 * 60, R, False) == "skip:not-review-status", "terminal (passed) marker → skip")
+    # boundary: FIX 6 (no run) and FIX 1/5 (open run) partition the dead-reviewer space
+    ok(stale_review_marker_verdict("reviewing", 40 * 60, R, True) != "requeue", "an OPEN run is FIX 1/5's domain, NOT FIX 6 (no double-handling)")
+    print("gate-recovery-watchdog FIX3+FIX4+FIX5+FIX6 selftest: PASS=%d FAIL=%d" % (p, f))
     return 0 if f == 0 else 1
 
 
