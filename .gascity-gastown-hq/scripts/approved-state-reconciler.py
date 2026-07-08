@@ -439,6 +439,16 @@ def _write_flow_authority(now, dimension):
 
 
 # ── pool capacity check ───────────────────────────────────────────────────────
+# rig_root basename -> (session template, max concurrent active/creating sessions).
+# Mirrors PILOT_WA_WORKER_MAX / PILOT_PS_WORKER_MAX in pilot-dispatcher.sh (packs/
+# town-deltas/assets/pilot-dispatcher.sh:104,109) and agents/{wa,ps}-worker/agent.toml
+# max_active_sessions. No single source of truth yet, so keep these in sync by hand.
+POOL_BY_RIG_BASENAME = {
+    "whatsapp_automation": ("wa-worker", 4),
+    "property_scrapers": ("ps-worker", 2),
+}
+
+
 def _pool_has_capacity(rig_root, now):
     """Check if the target builder pool for rig_root has at least one free slot.
 
@@ -449,10 +459,30 @@ def _pool_has_capacity(rig_root, now):
     Per spec §4: unknown capacity → alarm conservatively (True return), logging the gap.
     Silently swallowing a starve alarm is worse than a checkable false-positive alarm.
 
-    v1: capacity detection not yet implemented (requires pilot log slot parsing or a
-    pool-status API). Always returns (True, "unknown — conservative alarm").
+    Mirrors Pilot's own saturation check (pilot-dispatcher.sh ~4163-4171): count sessions
+    whose template matches the rig's builder pool and whose state is active or creating,
+    compare against that pool's configured max.
     """
-    return True, "capacity unknown — conservative alarm (pool slot detection not yet implemented)"
+    pool = POOL_BY_RIG_BASENAME.get(os.path.basename(rig_root.rstrip("/")))
+    if pool is None:
+        return True, "capacity unknown — no pool mapping for %s (conservative alarm)" % rig_root
+    template, max_active = pool
+
+    proc = _sh([GC_BIN, "session", "list", "--json"], timeout=15)
+    if proc is None or proc.returncode != 0 or not (proc.stdout or "").strip():
+        return True, "capacity unknown — gc session list failed (conservative alarm)"
+    try:
+        sessions = json.loads(proc.stdout).get("sessions") or []
+    except Exception:
+        return True, "capacity unknown — gc session list unparseable (conservative alarm)"
+
+    active = sum(
+        1 for s in sessions
+        if s.get("template") == template and s.get("state") in ("active", "creating")
+    )
+    if active >= max_active:
+        return False, "%s pool saturated (%d/%d active/creating)" % (template, active, max_active)
+    return True, "%s pool has capacity (%d/%d active/creating)" % (template, active, max_active)
 
 
 # ── route a bead out of story:approved ───────────────────────────────────────
