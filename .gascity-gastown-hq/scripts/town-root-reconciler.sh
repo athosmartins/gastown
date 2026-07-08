@@ -44,6 +44,29 @@
 # disk here; gascity v1.2.1 does NOT contain it — verified). ga-84rm stays OPEN;
 # this change does not close it and must not be called "durable".
 # ─────────────────────────────────────────────────────────────────────────────
+# ESCALATION LADDER (ga-k4uh — principle locked with Athos 2026-06-08): the
+# human is NOT the first line of defense for town-root infra problems. Every
+# maybe_ntfy() call site below (wrong branch, tracked/untracked FF conflict,
+# FF-pull failure, true CASE-C divergence) funnels through a 3-tier ladder
+# instead of paging Athos directly:
+#   1. Detect  (unchanged — the checks below).
+#   2. Escalate to infra (Mayor, via durable `gc mail send`) — give infra a
+#      chance to act (commit legit deltas / discard garbage / investigate).
+#   3. Promote to the human ONLY if still unresolved after
+#      ESCALATE_THRESHOLD_SECONDS (default 45min) — and even then capped at
+#      NTFY_THROTTLE_SECONDS (default 1/day, not hourly).
+# reconcile_once() clears the ladder's escalation state the moment things
+# resolve (already-in-sync, FF landed, or local-ahead-only) so a FRESH
+# divergence later restarts at tier 1. The daily human-page cap is NOT
+# cleared on resolve — a flap (resolve then re-diverge same day) must not
+# reset Athos's once-a-day budget.
+#
+# OUT OF SCOPE for this iteration (tracked as follow-up, not solved here):
+# WHICH files are safe to auto-commit during an infra-tier remediation. The
+# ladder changes WHO gets told WHEN; it does not add new auto-remediation —
+# the reconciler keeps its existing FF-only / never-clobber invariant. Mayor
+# still resolves a real divergence by hand after the tier-1 mail.
+# ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
 # Defaults are the live town root; all four are env-overridable so the selftest
@@ -68,16 +91,59 @@ log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [root-reconciler] $*" | tee -a "$L
 err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [root-reconciler] ERROR: $*" | tee -a "$LOG" 2>/dev/null; }
 warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [root-reconciler] WARN: $*"  | tee -a "$LOG" 2>/dev/null; }
 
-# Throttle ntfy so a persistent divergence pings at most once per hour.
+# Escalation ladder state (ga-k4uh). ESCALATE_STAMP tracks "already escalated
+# to infra at HH:MM, still open" per divergence episode; NTFY_STAMP (existing)
+# now throttles only the tier-3 HUMAN page, at a much wider default cadence
+# (1/day, not 1/hour) per the story's "1a do dia" cadence request.
+ESCALATE_STAMP="$LOG_DIR/.town-root-reconciler.escalated-at"
+ESCALATE_THRESHOLD_SECONDS="${RECONCILE_ESCALATE_THRESHOLD_SECONDS:-2700}"  # 45min (story's 30-60min range)
 NTFY_STAMP="$LOG_DIR/.town-root-reconciler.last-ntfy"
-NTFY_THROTTLE_SECONDS=3600
+NTFY_THROTTLE_SECONDS="${RECONCILE_NTFY_THROTTLE_SECONDS:-86400}"          # 1x/day (was 1/hour)
+
+# Called from reconcile_once()'s healthy exit points once the underlying
+# problem is gone. Deliberately does NOT touch NTFY_STAMP — the daily
+# human-page cap must survive a resolve/re-diverge flap within the same day.
+clear_escalation() {
+  [ -f "$ESCALATE_STAMP" ] && log "escalation ladder: divergence resolved — clearing infra-escalation state"
+  rm -f "$ESCALATE_STAMP" 2>/dev/null || true
+}
+
 maybe_ntfy() {
-  local msg="$1" now last
+  local msg="$1" now escalated_at elapsed last
   now=$(date +%s)
+  escalated_at=$(cat "$ESCALATE_STAMP" 2>/dev/null || echo 0)
+  [ -n "$escalated_at" ] || escalated_at=0
+
+  if [ "$escalated_at" -eq 0 ]; then
+    # Tier 1: first sight of this problem since it last cleared. Tell infra
+    # (Mayor) via DURABLE mail — survives Mayor's session dying before acting
+    # — and defer the human page until the threshold below.
+    echo "$now" > "$ESCALATE_STAMP" 2>/dev/null || true
+    if "$GC" mail send mayor -s "Gas City: town root diverged (auto-escalated)" -m "$msg
+
+Auto-escalated by town-root-reconciler (ga-k4uh ladder). Will page Athos only if still unresolved after ${ESCALATE_THRESHOLD_SECONDS}s." >/dev/null 2>&1; then
+      log "escalation ladder: tier 1 — mailed Mayor, human paging deferred up to ${ESCALATE_THRESHOLD_SECONDS}s"
+    else
+      warn "escalation ladder: tier 1 — gc mail send mayor FAILED; tier 3 (human, at threshold) remains the fallback"
+    fi
+    return 0
+  fi
+
+  elapsed=$((now - escalated_at))
+  if [ "$elapsed" -lt "$ESCALATE_THRESHOLD_SECONDS" ]; then
+    # Tier 2: within the grace window since infra was told — give Mayor time
+    # to act before bothering Athos. No-op.
+    return 0
+  fi
+
+  # Tier 3: unresolved past threshold since infra escalation — promote to the
+  # human, still capped at once per NTFY_THROTTLE_SECONDS.
   last=$(cat "$NTFY_STAMP" 2>/dev/null || echo 0)
+  [ -n "$last" ] || last=0
   if [ $((now - last)) -ge "$NTFY_THROTTLE_SECONDS" ]; then
-    notify -t "Gas City: town root diverged" -p 4 "$msg" 2>/dev/null || true
+    notify -t "Gas City: town root diverged" -p 4 "$msg (unresolved ${elapsed}s after infra escalation)" 2>/dev/null || true
     echo "$now" > "$NTFY_STAMP" 2>/dev/null || true
+    log "escalation ladder: tier 3 — paged human (unresolved ${elapsed}s after infra escalation)"
   fi
 }
 
@@ -272,6 +338,7 @@ reconcile_once() {
 
   # Already in sync → no-op (idempotent).
   if [ "$local_sha" = "$remote_sha" ]; then
+    clear_escalation
     return 0
   fi
 
@@ -317,6 +384,7 @@ reconcile_once() {
     fi
     if git -C "$ROOT" pull --ff-only "$REMOTE" "$BRANCH" >>"$LOG" 2>&1; then
       log "FF pull OK — now at $(git -C "$ROOT" rev-parse --short "$BRANCH"). Soft-reloading crew config (no drain)."
+      clear_escalation
       # ga-84rm INTERIM: SYNCHRONOUS soft reload (drop --async). Soft never drains
       # live sessions (config-drift-watcher doctrine); blocking until the reload is
       # applied means config drift is ACCEPTED before the session reconciler's
@@ -341,6 +409,7 @@ reconcile_once() {
     local ahead
     ahead=$(git -C "$ROOT" rev-list --count "$REMOTE/$BRANCH..$BRANCH" 2>/dev/null || echo "?")
     log "town root AHEAD of $REMOTE/$BRANCH by $ahead unpushed commit(s) — nothing to pull. (push is owned by the gate/delivery, not this reconciler.)"
+    clear_escalation
     return 0
   fi
 

@@ -143,6 +143,85 @@ grep -q "orthogonal edit" "$R/orth.sh" && ok "orthogonal edit survives FF"      
 [ "$(cat "$R/dup.sh")" = "B v2" ]      && ok "dup.sh at B v2"                          || bad "dup.sh wrong"
 [ "$(cat "$R/clean.sh")" = "C v2" ]    && ok "clean.sh at C v2"                        || bad "clean.sh wrong"
 
+# ── Escalation ladder scenarios (ga-k4uh) ─────────────────────────────────────
+# Humans are NOT the first line of defense for town-root infra problems: infra
+# (Mayor) is told first via durable mail; the human is only paged if the
+# problem stays unresolved past ESCALATE_THRESHOLD_SECONDS, and even then at
+# most once per NTFY_THROTTLE_SECONDS. Stub gc/notify as shell functions so
+# these scenarios never touch real Dolt/ntfy — bash resolves unqualified
+# command names against functions defined in the current shell before falling
+# back to $PATH, so these shadow the real binaries for the rest of this script.
+GC_MAIL_LOG="$TMP/gc-mail.log"
+NOTIFY_LOG="$TMP/notify.log"
+reset_stubs() { : > "$GC_MAIL_LOG"; : > "$NOTIFY_LOG"; }
+gc() {
+  # Args (the -m body) can contain embedded newlines; normalize to ONE log
+  # line per invocation so `wc -l` on the log counts calls, not text lines.
+  if [ "$1" = "mail" ] && [ "$2" = "send" ]; then
+    printf 'mail-sent: %s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$GC_MAIL_LOG"
+  fi
+  return 0
+}
+notify() { echo "notified: $*" >> "$NOTIFY_LOG"; return 0; }
+
+# ── Scenario 6: tier 1 — first sight mails Mayor, does NOT page human ────────
+echo "Scenario 6: escalation ladder tier 1 — first sight mails Mayor, does NOT page human"
+rm -f "$ESCALATE_STAMP" "$NTFY_STAMP"
+reset_stubs
+maybe_ntfy "test divergence msg"
+[ "$(wc -l < "$GC_MAIL_LOG" | tr -d ' ')" = "1" ] && ok "tier 1: Mayor mailed exactly once" || bad "tier 1: expected 1 Mayor mail, got $(wc -l < "$GC_MAIL_LOG")"
+[ ! -s "$NOTIFY_LOG" ]   && ok "tier 1: human NOT paged"          || bad "tier 1: human was paged on first sight (should defer)"
+[ -f "$ESCALATE_STAMP" ] && ok "tier 1: escalation stamp written" || bad "tier 1: no escalation stamp written"
+
+# ── Scenario 7: tier 2 — still within grace window, no repeat mail/page ──────
+echo "Scenario 7: escalation ladder tier 2 — within grace window, no repeat mail/page"
+reset_stubs
+maybe_ntfy "still diverged, second tick"
+[ ! -s "$GC_MAIL_LOG" ] && ok "tier 2: no repeat Mayor mail within grace window" || bad "tier 2: Mayor mailed again within grace window"
+[ ! -s "$NOTIFY_LOG" ]  && ok "tier 2: human still not paged"                    || bad "tier 2: human paged too early"
+
+# ── Scenario 8: tier 3 — unresolved past threshold pages the human ───────────
+echo "Scenario 8: escalation ladder tier 3 — unresolved past threshold pages human"
+reset_stubs
+echo "$(( $(date +%s) - ESCALATE_THRESHOLD_SECONDS - 5 ))" > "$ESCALATE_STAMP"
+rm -f "$NTFY_STAMP"
+maybe_ntfy "still diverged, past threshold"
+[ ! -s "$GC_MAIL_LOG" ]  && ok "tier 3: no re-mail to Mayor (already escalated)" || bad "tier 3: unexpectedly re-mailed Mayor"
+[ "$(wc -l < "$NOTIFY_LOG" | tr -d ' ')" = "1" ] && ok "tier 3: human paged exactly once" || bad "tier 3: expected 1 human page, got $(wc -l < "$NOTIFY_LOG")"
+[ -f "$NTFY_STAMP" ]     && ok "tier 3: NTFY_STAMP written" || bad "tier 3: NTFY_STAMP not written"
+
+# ── Scenario 9: daily human throttle — second tier-3 call same day no repeat ─
+echo "Scenario 9: daily human throttle — second tier-3-eligible call same day does not re-page"
+reset_stubs
+maybe_ntfy "still diverged, third tick same day"
+[ ! -s "$NOTIFY_LOG" ] && ok "daily throttle: human NOT paged again same day" || bad "daily throttle: human paged twice within throttle window"
+
+# ── Scenario 10: clear_escalation resets the ladder for a fresh episode ──────
+echo "Scenario 10: clear_escalation resets ladder — fresh divergence restarts at tier 1"
+clear_escalation
+[ ! -f "$ESCALATE_STAMP" ] && ok "clear_escalation removed the stamp" || bad "escalation stamp survived clear_escalation"
+reset_stubs
+maybe_ntfy "new divergence episode after resolve"
+[ "$(wc -l < "$GC_MAIL_LOG" | tr -d ' ')" = "1" ] && ok "tier 1 restarts: Mayor mailed again for the NEW episode" || bad "tier 1 restarts: Mayor not mailed for new episode"
+[ ! -s "$NOTIFY_LOG" ] && ok "tier 1 restarts: human not paged immediately on the fresh episode" || bad "tier 1 restarts: human paged immediately on fresh episode"
+
+# ── Scenario 11: reconcile_once wiring — already-in-sync clears escalation ───
+# Integration check that reconcile_once's healthy exit point actually CALLS
+# clear_escalation (scenarios 6-10 test maybe_ntfy/clear_escalation directly;
+# this pins the call site so a future edit can't silently drop the wiring).
+echo "Scenario 11: reconcile_once wiring — already-in-sync clears a stale escalation stamp"
+R="$TMP/s11"; mk_repo "$R"
+printf 'v1\n' > "$R/a.sh"; git -C "$R" add -A; git -C "$R" commit -q -m c0
+git -C "$R" remote add origin "$R"
+echo "999999999" > "$ESCALATE_STAMP"   # simulate a stale outstanding escalation
+_saved_ROOT="$ROOT"; _saved_REMOTE="$REMOTE"; _saved_BRANCH="$BRANCH"
+ROOT="$R"; REMOTE="origin"; BRANCH="main"
+reconcile_once >/dev/null 2>&1
+rc_fetch=$?
+ROOT="$_saved_ROOT"; REMOTE="$_saved_REMOTE"; BRANCH="$_saved_BRANCH"
+[ "$rc_fetch" -eq 0 ]     && ok "reconcile_once completed without error"          || bad "reconcile_once returned $rc_fetch"
+[ ! -f "$ESCALATE_STAMP" ] && ok "reconcile_once cleared escalation on already-in-sync" || bad "reconcile_once did NOT clear escalation on already-in-sync"
+
 echo ""
 echo "town-root-reconciler selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
