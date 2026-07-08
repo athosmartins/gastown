@@ -87,6 +87,13 @@ ENABLED = os.environ.get("APPROVED_RECONCILER_ENABLED", "1") == "1"
 DRY_RUN = os.environ.get("APPROVED_RECONCILER_DRY_RUN", "0") == "1"
 # STARVE_MIN: a buildable bead should dispatch within ~2 pilot sweeps (5min each) + margin.
 STARVE_MIN = int(os.environ.get("STARVE_MIN", "20"))
+# STARVE_MIN_PRI2/PRI3: lower-priority beads legitimately queue longer behind higher-
+# priority work under a fixed-size pool (e.g. a priority-3 "não-urgente" bead behind a
+# handful of priority-1/2 bugs) — that's fair-share ordering, not a dispatch failure.
+# Scale the grace window by priority so low-priority beads don't alarm on the same SLA
+# as urgent ones. Priority 0/1 keep the base STARVE_MIN (most conservative).
+STARVE_MIN_PRI2 = int(os.environ.get("STARVE_MIN_PRI2", str(STARVE_MIN * 2)))
+STARVE_MIN_PRI3 = int(os.environ.get("STARVE_MIN_PRI3", str(STARVE_MIN * 6)))
 # FLOW_GRACE_MIN: recently-dispatched beads are assumed to be flowing.
 FLOW_GRACE_MIN = int(os.environ.get("FLOW_GRACE_MIN", "10"))
 # Per-bead cooldowns to prevent churn/spam on repeated runs.
@@ -778,10 +785,18 @@ def _process_store(rig_root, now, state, pilot_alive):
             fsa[bead_id] = now
         starve_age_min = (now - fsa[bead_id]) / 60.0
 
-        # Grace window: too fresh (daemon-side) to alarm.
-        if starve_age_min < STARVE_MIN:
+        # Grace window: too fresh (daemon-side) to alarm. Priority-scaled: lower-priority
+        # beads get more slack (see STARVE_MIN_PRI2/PRI3 above).
+        priority = bead.get("priority")
+        effective_starve_min = (
+            STARVE_MIN_PRI3 if priority == 3 else
+            STARVE_MIN_PRI2 if priority == 2 else
+            STARVE_MIN
+        )
+        if starve_age_min < effective_starve_min:
             _log("  %s: no signal, not flowing, first-seen-approved=%.1fmin "
-                 "< STARVE_MIN=%d — grace" % (bead_id, starve_age_min, STARVE_MIN))
+                 "< STARVE_MIN=%d (priority=%s) — grace" % (
+                 bead_id, starve_age_min, effective_starve_min, priority))
             continue
 
         # pilot:held-until — pilot explicitly parked this bead.
