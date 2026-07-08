@@ -55,6 +55,11 @@ Safety invariants (CRITICAL — actuates on real work beads):
   - NEVER reclaims beads with a live owning session (assignee matches active session).
     Checks session.id, .name, .session_name, .alias, .agent_name because bd typically
     assigns session_name (e.g. 'dog-gawispy8c0mr') not session.name ('gastown.dog-3').
+    This also protects the ORIGINAL bug/story of a sling-dispatched fix whose live
+    builder session is assigned to the SLING bead, not the original's — the
+    original's own assignee is legitimately empty the whole time it's being built.
+    list_live_sling_source_beads() resolves that back-reference from the sling's
+    own title (ga-qfo3; same pattern as the gate-marker back-reference below).
   - NEVER reclaims beads with recent branch progress (commit within RECLAIM_TTL).
     Checks any remote branch whose final segment matches <bead-id> (incl.
     crew/<pool>/<bead-id>, feat/<id>*, fix/<id>*, feature/<id>*, polecat/<id>*)
@@ -1021,6 +1026,88 @@ def concrete_adhoc_session_is_live(assignee, sessions, now=None, bead_update_age
     return False
 
 
+def list_live_sling_source_beads(sessions, now):
+    """Return set of ORIGINAL bug/story bead IDs whose SLING/task bead is
+    in_progress and assigned to a live builder session (ga-qfo3).
+
+    Pilot's dispatch flow marks the ORIGINAL bug/story bead story:in-flight,
+    but assigns the actual build work — and thus the live builder's session —
+    to a separate SLING bead (title "fix bug <id>: ..." / "build story <id>:
+    ..."). The original bead's own `assignee` is therefore legitimately empty
+    while a live session is actively building it, so
+    session_is_live(original_bead_assignee, ...) checks the wrong bead's
+    field and can never see the real owner.
+
+    Root-caused from the ga-qfo3 incident's launchd log: the guard's own
+    "started stranded clock" line showed assignee='' for the ORIGINAL bug
+    (ga-z6uo) throughout, while its sling bead (ga-vw39) carried the live dog
+    session's assignee the whole time — ga-vw39 never even appeared in the
+    guard's query results. The bead was reclaimed at 31min idle with a fully
+    live, actively-committing builder.
+
+    Mirrors list_gate_active_source_beads()'s sling→original title
+    back-reference resolution (_SLING_TITLE_RE), but protects the
+    LIVE-SESSION rail instead of the gate-marker rail. Simpler than that
+    function: a sling bead's liveness is resolved directly off the same
+    in_progress query result (no separate marker-bead indirection to
+    bootstrap from), so multi-redispatch is handled for free — only a
+    CURRENTLY in_progress sling can ever contribute a protected id; closed/
+    superseded historical slings are absent from the query and contribute
+    nothing.
+
+    Fail-safe: returns None on HQ query error (caller skips the cycle,
+    matching the existing contract for the other list_* functions in this
+    file). Rig-store fan-out is fail-open per store (ga-mfeip pattern).
+    """
+    try:
+        result = subprocess.run(
+            ["bd", "list", "--status", "in_progress", "--json"],
+            capture_output=True, text=True, timeout=20)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        data = json.loads(result.stdout)
+        if not isinstance(data, list):
+            return None
+    except Exception:
+        return None
+
+    def _collect(candidate_beads, into):
+        for b in candidate_beads:
+            title = b.get("title") or ""
+            match = _SLING_TITLE_RE.match(title)
+            if not match:
+                continue
+            assignee = b.get("assignee") or ""
+            if not assignee:
+                continue
+            bead_update_epoch = parse_iso_epoch(b.get("updated_at", ""))
+            bead_update_age = (
+                (now - bead_update_epoch) if bead_update_epoch is not None else None
+            )
+            if session_is_live(assignee, sessions, now, bead_update_age):
+                into.add(match.group(1))
+
+    protected = set()
+    _collect(data, protected)
+
+    # Rig stores — fail-open per store (ga-mfeip cross-store consistency)
+    for _rig_name, rig_path in _list_rig_stores():
+        try:
+            r = subprocess.run(
+                ["bd", "-C", rig_path, "list", "--status", "in_progress", "--json"],
+                capture_output=True, text=True, timeout=20)
+            if r.returncode != 0 or not r.stdout.strip():
+                continue
+            rig_data = json.loads(r.stdout)
+            if not isinstance(rig_data, list):
+                continue
+            _collect(rig_data, protected)
+        except Exception:
+            continue  # fail-open: skip this rig
+
+    return frozenset(protected)
+
+
 def get_branch_recent(bead_id):
     """Return True if any remote branch whose final path segment equals <bead-id>
     (or starts with <bead-id> followed by '-'/'_'/'.') has a commit within
@@ -1364,6 +1451,13 @@ def run_cycle(state, escalated_alerted):
         print("[INFLIGHT-RECLAIM] gate-marker query failed — skipping cycle (safe)", flush=True)
         return len(beads), 0
 
+    # --- Query live sling-owner source beads (ga-qfo3, fail-safe: None → skip
+    #     cycle entirely — same contract as the gate-marker query above) ---
+    live_sling_owner_beads = list_live_sling_source_beads(sessions, now)
+    if live_sling_owner_beads is None:
+        print("[INFLIGHT-RECLAIM] sling-owner query failed — skipping cycle (safe)", flush=True)
+        return len(beads), 0
+
     stranded_count = 0
     active_bead_ids = set()
     # ga-dbibq: two-pass structure so pool-dead alert fires BEFORE per-bead actuation.
@@ -1418,6 +1512,15 @@ def run_cycle(state, escalated_alerted):
                 assignee, sessions, now, bead_update_age)
         else:
             has_live_session = session_is_live(assignee, sessions, now, bead_update_age)
+
+        # ga-qfo3: this bead's OWN assignee may be empty because Pilot assigned
+        # the live builder session to its SLING wrapper bead instead (see
+        # list_live_sling_source_beads' docstring). Treat it as owned when the
+        # sling bead's session is live — closes the false-reclaim gap that let
+        # ga-z6uo get reclaimed out from under a fully live, actively-building
+        # dog session.
+        if not has_live_session and bead_id in live_sling_owner_beads:
+            has_live_session = True
 
         # Branch check is potentially slow (git fetch); only run when needed
         has_recent_branch = False
@@ -2255,6 +2358,149 @@ def _selftest():
           _SLING_TITLE_RE.match("investigate: something weird happened") is None)
     check("SB-9d: title missing the colon separator does not match",
           _SLING_TITLE_RE.match("fix bug ga-abc12 no colon here") is None)
+
+    # -----------------------------------------------------------------------
+    # Section 7: ga-qfo3 — list_live_sling_source_beads() sling→original
+    # live-session resolution (SL-*). Stubs subprocess.run to serve canned
+    # `bd list --status in_progress --json` responses; no real bd calls.
+    #
+    # Root cause (confirmed from the ga-qfo3 incident's launchd log): Pilot's
+    # dispatch flow marks the ORIGINAL bug/story bead story:in-flight but
+    # assigns the live builder session to a separate SLING bead instead
+    # (title "fix bug <id>: ..." / "build story <id>: ..."). The guard's own
+    # "started stranded clock" log line showed assignee='' for the ORIGINAL
+    # bead (ga-z6uo) the whole time it was being live-built via its sling
+    # (ga-vw39) — session_is_live() was checking the wrong bead's assignee
+    # field, so a bead with a genuinely live builder got reclaimed at 31min
+    # idle ("no_live_session no_recent_branch").
+    # -----------------------------------------------------------------------
+
+    _orig_run_sl = subprocess.run
+
+    def _stub_inprogress(beads, list_fails=False, nonzero=False):
+        """Build a subprocess.run stub for list_live_sling_source_beads()'s
+        `bd list --status in_progress --json` query.
+
+        beads: list of bead dicts (id/title/assignee/updated_at) to return.
+        """
+        class _R:
+            def __init__(self, rc, out):
+                self.returncode = rc
+                self.stdout = out
+                self.stderr = ""
+
+        def _run(cmd, **kw):
+            if (isinstance(cmd, (list, tuple)) and len(cmd) >= 2
+                    and cmd[0] == "bd" and cmd[1] == "list"):
+                if nonzero:
+                    return _R(1, "")
+                if list_fails:
+                    return _R(0, "{not valid json")
+                return _R(0, json.dumps(beads))
+            return _R(0, "")
+        return _run
+
+    _sl_fresh_ts = _irg_datetime.datetime.fromtimestamp(
+        T_pz - 30, tz=_irg_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _sl_live_sessions = [
+        {"id": "sid-sl1", "name": "gastown.dog-2", "session_name": "dog-ga5e06",
+         "alias": "gastown.dog-2", "agent_name": "dog-ga5e06",
+         "state": "active", "last_active": _sl_fresh_ts},
+    ]
+
+    try:
+        # --- SL-1: sling bead in_progress + live-session assignee →
+        # original id resolved into the protected set ---
+        subprocess.run = _stub_inprogress([
+            {"id": "ga-vw39", "title": "fix bug ga-z6uo: chronic Dolt handle bug",
+             "assignee": "dog-ga5e06", "updated_at": ""},
+        ])
+        _sl1 = list_live_sling_source_beads(_sl_live_sessions, T_pz)
+        check("SL-1: live sling assignee → original bug id resolved into protected set",
+              _sl1 == frozenset({"ga-z6uo"}), f"got={_sl1!r}")
+
+        # --- SL-2: sling bead in_progress but assignee's session is DEAD →
+        # original NOT protected (correctly reclaimable) ---
+        subprocess.run = _stub_inprogress([
+            {"id": "ga-vw39", "title": "fix bug ga-z6uo: chronic Dolt handle bug",
+             "assignee": "dog-ga5e06", "updated_at": ""},
+        ])
+        _sl2 = list_live_sling_source_beads([], T_pz)  # no live sessions at all
+        check("SL-2: sling assignee's session is dead/gone → original NOT protected",
+              _sl2 == frozenset(), f"got={_sl2!r}")
+
+        # --- SL-3: in_progress bead whose title does NOT follow the sling
+        # convention (e.g. a plain crew/dog task) → no spurious protection ---
+        subprocess.run = _stub_inprogress([
+            {"id": "ga-plain1", "title": "run the weekly Dolt backup",
+             "assignee": "dog-ga5e06", "updated_at": ""},
+        ])
+        _sl3 = list_live_sling_source_beads(_sl_live_sessions, T_pz)
+        check("SL-3: non-sling title → empty set (no spurious protection)",
+              _sl3 == frozenset(), f"got={_sl3!r}")
+
+        # --- SL-4: sling bead in_progress but UNCLAIMED (empty assignee) →
+        # not protected (matches the pre-claim window; nothing to protect yet) ---
+        subprocess.run = _stub_inprogress([
+            {"id": "ga-vw39", "title": "fix bug ga-z6uo: chronic Dolt handle bug",
+             "assignee": "", "updated_at": ""},
+        ])
+        _sl4 = list_live_sling_source_beads(_sl_live_sessions, T_pz)
+        check("SL-4: unclaimed sling (empty assignee) → not protected",
+              _sl4 == frozenset(), f"got={_sl4!r}")
+
+        # --- SL-5: 'build story' convention also resolves (feature/story tier) ---
+        subprocess.run = _stub_inprogress([
+            {"id": "ga-slingB", "title": "build story ga-storyY: Add the frobnicator",
+             "assignee": "dog-ga5e06", "updated_at": ""},
+        ])
+        _sl5 = list_live_sling_source_beads(_sl_live_sessions, T_pz)
+        check("SL-5: sling 'build story' title → original story id resolved",
+              _sl5 == frozenset({"ga-storyY"}), f"got={_sl5!r}")
+
+        # --- SL-6: bd-list non-zero exit → fail-SAFE None (mirrors ga-ap7od) ---
+        subprocess.run = _stub_inprogress([], nonzero=True)
+        _sl6 = list_live_sling_source_beads(_sl_live_sessions, T_pz)
+        check("SL-6: bd-list non-zero exit → fail-SAFE None",
+              _sl6 is None, f"got={_sl6!r}")
+
+        # --- SL-7: bd-list unparseable JSON → fail-SAFE None ---
+        subprocess.run = _stub_inprogress([], list_fails=True)
+        _sl7 = list_live_sling_source_beads(_sl_live_sessions, T_pz)
+        check("SL-7: bd-list unparseable JSON → fail-SAFE None",
+              _sl7 is None, f"got={_sl7!r}")
+
+        # --- SL-8: END-TO-END regression for the actual ga-qfo3 incident shape.
+        # The ORIGINAL bug bead (ga-z6uo) carries story:in-flight with its OWN
+        # assignee empty (exactly as the launchd log showed); its live builder
+        # is only visible via the sling bead's assignee. Verify the full
+        # has_live_session computation — session_is_live() on the empty
+        # assignee alone (the pre-fix behavior) plus the sling-owner set OR'd
+        # in (the fix) — now correctly protects it, so reclaim_decision is
+        # "noop" instead of the "reclaim" the incident actually produced. ---
+        subprocess.run = _stub_inprogress([
+            {"id": "ga-vw39", "title": "fix bug ga-z6uo: chronic Dolt handle bug",
+             "assignee": "dog-ga5e06", "updated_at": ""},
+        ])
+        _sl8_live_sling_owners = list_live_sling_source_beads(_sl_live_sessions, T_pz)
+        _sl8_own_assignee_live = session_is_live("", _sl_live_sessions, T_pz)
+        check("SL-8a: pre-fix signal — original bead's OWN (empty) assignee never matches a live session",
+              _sl8_own_assignee_live is False, f"got={_sl8_own_assignee_live!r}")
+        _sl8_has_live_session = _sl8_own_assignee_live or ("ga-z6uo" in _sl8_live_sling_owners)
+        check("SL-8b: fix — OR'ing in the sling-owner set makes has_live_session True for ga-z6uo",
+              _sl8_has_live_session is True, f"got={_sl8_has_live_session!r}")
+        _sl8_decision = reclaim_decision(
+            has_live_session=_sl8_has_live_session,
+            has_recent_branch=False,  # ga-vw39 had no branch yet either, per the incident report
+            seconds_stranded=RECLAIM_TTL + 60,  # past the 25min TTL, like the real incident (31min)
+            reclaim_count=0,
+            has_needs_human=False,
+            has_dispatching_marker=False,
+        )
+        check("SL-8c: reclaim_decision — noop instead of the false 'reclaim' seen in the incident",
+              _sl8_decision == "noop", f"got={_sl8_decision!r}")
+    finally:
+        subprocess.run = _orig_run_sl
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0

@@ -93,6 +93,8 @@ mkdir -p "$SHIMBIN" "$FIXCITY/.gc/logs" "$STATE"
 #   FAKE_SUPPRESS_INFLIGHT =1 → `label add story:in-flight` is silently dropped
 #                          (simulates Dolt swallowing the write → never confirms)
 #   FAKE_SLING_STATUS      status returned for `show <…sling…>` (default open)
+#   FAKE_STORY_COMMENTS_JSON  JSON array returned for `comments <id> --json`
+#                          (ga-pd7j mayor-hold-grace seam; default [])
 cat > "$SHIMBIN/bd" <<'SHIM'
 #!/usr/bin/env bash
 args="$*"
@@ -138,7 +140,9 @@ case "$args" in
                   # NOTE: must match the 'label add/remove' SUBCOMMAND, not the
                   # '--exclude-label' flag that appears in the list queries below.
   *comments*)
-    printf '[]' ;;                # gate-feedback lookup
+    # gate-feedback lookup + ga-pd7j mayor-hold-grace check. Default [] keeps
+    # every existing scenario byte-identical to before this seam existed.
+    printf '%s' "${FAKE_STORY_COMMENTS_JSON:-[]}" ;;
   *show*)
     id="$(after show)"
     # Explicit-dep probe (ga-do8jj): _filter_explicit_deps calls `bd show <dep>
@@ -171,6 +175,10 @@ case "$args" in
           echo "$_sc" > "$_scf"
           [ "$_sc" -gt "$FAKE_ESCALATE_AFTER_SHOWS" ] && lbls="${lbls:+$lbls,}\"gate:needs-human\""
         fi
+        # ga-pd7j: mark the fixture as already in the gate-fix loop (stable label,
+        # present from the start — unlike the counter-based escalation above, this
+        # test isn't about racing the LABEL, it's about racing a MAYOR COMMENT).
+        [ "${FAKE_GATE_NEEDS_FIX:-0}" = "1" ] && lbls="${lbls:+$lbls,}\"gate:needs-fix\""
         st="open"
         case "$id" in *sling*) st="${FAKE_SLING_STATUS:-open}" ;; esac
         # ga-e5yw2: the dead-worker correction resolves a sling task's assignee.
@@ -458,6 +466,32 @@ run_real_dispatch_escalate() { # FAKE_ESCALATE_AFTER_SHOWS
     FAKE_SUPPRESS_INFLIGHT=0 \
     FAKE_ESCALATE_AFTER_SHOWS="${1:-}" \
     FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# Runs a REAL (non-dry) dispatch of a gate:needs-fix candidate, with comments
+# injected via FAKE_STORY_COMMENTS_JSON (ga-pd7j Mayor-hold grace window).
+# Arg 1: FAKE_STORY_COMMENTS_JSON (unset/empty = no comments, plain happy path).
+# Arg 2: PILOT_MAYOR_HOLD_GRACE_SECS override (default 300 if omitted).
+run_real_dispatch_mayorhold() { # FAKE_STORY_COMMENTS_JSON [PILOT_MAYOR_HOLD_GRACE_SECS]
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=0 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_INFLIGHT_RETRIES=3 \
+    PILOT_INFLIGHT_SLEEP=0 \
+    FAKE_BLOCKED_IDS="" \
+    FAKE_SUPPRESS_INFLIGHT=0 \
+    FAKE_GATE_NEEDS_FIX=1 \
+    FAKE_STORY_COMMENTS_JSON="${1:-}" \
+    PILOT_MAYOR_HOLD_GRACE_SECS="${2:-300}" \
+    FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["gate:needs-fix"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
@@ -1135,6 +1169,63 @@ if [ -f "$STATE/tt-flight.inflight" ]; then
   ok "story:in-flight still set normally when nothing escalated"
 else
   bad "REGRESSION: adding the re-check broke the ordinary happy-path dispatch"
+fi
+
+# ── Scenario 5e/5f/5g: Mayor out-of-band hold grace window (ga-pd7j) ─────────
+# The ga-z6uo/ga-06um incident: Pilot auto-redispatches a gate:needs-fix bead
+# once pilot:held/held-until is absent, but the Mayor's hold-disposition
+# comment can land in the SAME builder-target-resolution window this suite
+# already covers for label-based escalations (5c/5d above) — just via a
+# comment instead of a label. These scenarios prove the new grace-window
+# check defers dispatch on a fresh gastown__mayor comment, and stays silent
+# otherwise (no comments; an old Mayor comment; a fresh non-Mayor comment).
+echo "Scenario 5e: fresh gastown__mayor comment on a gate:needs-fix bead defers dispatch (ga-pd7j)"
+
+_MH_NOW=$(date +%s)
+_MH_RECENT=$(date -u -r $(( _MH_NOW - 30 )) +%Y-%m-%dT%H:%M:%SZ)
+_MH_OLD=$(date -u -r $(( _MH_NOW - 3600 )) +%Y-%m-%dT%H:%M:%SZ)
+
+LOG5E="$(run_real_dispatch_mayorhold "[{\"author\":\"gastown__mayor\",\"text\":\"HOLD: engine-window disposition\",\"created_at\":\"$_MH_RECENT\"}]" 300)"
+if echo "$LOG5E" | grep -q "ga-pd7j:.*tt-flight is gate:needs-fix with a gastown__mayor comment"; then
+  ok "pre-dispatch re-check detected the fresh Mayor comment and logged it"
+else
+  bad "REGRESSION: no ga-pd7j Mayor-hold check fired — a fresh out-of-band hold would be raced onto a builder"
+fi
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  bad "REGRESSION: story:in-flight was set despite the fresh Mayor comment — the builder dispatch was NOT stopped"
+else
+  ok "story:in-flight was never set — dispatch correctly deferred before finalization"
+fi
+if echo "$LOG5E" | grep -q "Dispatch complete:"; then
+  bad "REGRESSION: dispatch completed (builder notified) despite the fresh Mayor comment"
+else
+  ok "no builder was notified — deferred before the sling/nudge step"
+fi
+
+echo "Scenario 5f: control — no comments at all → new re-check never false-positives (ga-pd7j)"
+LOG5F="$(run_real_dispatch_mayorhold "" 300)"
+if echo "$LOG5F" | grep -q "ga-pd7j:"; then
+  bad "REGRESSION: Mayor-hold re-check fired with no comments injected (false positive)"
+else
+  ok "no false positive — re-check stayed silent with no comments present"
+fi
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  ok "story:in-flight still set normally when no Mayor comment is present"
+else
+  bad "REGRESSION: adding the Mayor-hold re-check broke the ordinary gate:needs-fix happy path"
+fi
+
+echo "Scenario 5g: control — old Mayor comment + fresh non-Mayor comment → still no false positive (ga-pd7j)"
+LOG5G="$(run_real_dispatch_mayorhold "[{\"author\":\"gastown__mayor\",\"text\":\"old disposition\",\"created_at\":\"$_MH_OLD\"},{\"author\":\"dog-abc123\",\"text\":\"status update\",\"created_at\":\"$_MH_RECENT\"}]" 300)"
+if echo "$LOG5G" | grep -q "ga-pd7j:"; then
+  bad "REGRESSION: Mayor-hold re-check fired on a stale Mayor comment / fresh non-Mayor comment (false positive)"
+else
+  ok "no false positive — re-check correctly ignores expired Mayor comments and non-Mayor authors"
+fi
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  ok "story:in-flight still set normally when no IN-WINDOW Mayor comment is present"
+else
+  bad "REGRESSION: old-Mayor/fresh-non-Mayor comments incorrectly blocked dispatch"
 fi
 
 # ── Scenario 6: source bead never carries dog routing (ga-ms1jm) ──────────────

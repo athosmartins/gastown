@@ -258,6 +258,17 @@ PILOT_NEVERSTARTED_OWNER_GRACE_HOURS="${PILOT_NEVERSTARTED_OWNER_GRACE_HOURS:-24
 # A branch OR a fresh updated_at (within this window) always overrides the threshold.
 PILOT_PHANTOM_STALE_SECS="${PILOT_PHANTOM_STALE_SECS:-2700}"
 
+# ── Mayor out-of-band hold grace window (ga-pd7j) ────────────────────────────
+# Pilot auto-redispatches any gate:needs-fix bead once no pilot:held/held-until
+# label is present. But the Mayor's hold-disposition comment can land moments
+# AFTER Pilot's candidate snapshot and BEFORE the pilot:held label is stamped
+# (ga-z6uo/ga-06um: dispatch fired 16:30:34Z, Mayor's comment landed 16:32:16Z,
+# no label yet — a diligent dog self-corrected that time, but Pilot itself raced
+# the hold). Default 300 = one sweep interval (Pilot runs every ~300s), matching
+# the bug's own "defer one cycle" fix direction: a gastown__mayor comment newer
+# than this is grounds to skip dispatch for THIS sweep only, not to hold forever.
+PILOT_MAYOR_HOLD_GRACE_SECS="${PILOT_MAYOR_HOLD_GRACE_SECS:-300}"
+
 # ── Reuse existing crew session, never spawn a 2nd one (gt-4st3n) ─────────────
 # A crew identity (e.g. digo-wa, batista-ps) is a single-identity config-agent
 # session. Dispatching to it via `gc sling <identity>` + an immediate
@@ -4016,6 +4027,31 @@ TASK
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
       return 1
+    fi
+
+    # ── ga-pd7j: Mayor out-of-band hold grace window ─────────────────────────
+    # Same TOCTOU class as the checks above, for a signal that ISN'T a label yet:
+    # the Mayor can post a hold-disposition comment on a gate:needs-fix bead in
+    # the same window this function is resolving the builder target (ga-z6uo/
+    # ga-06um: dispatch fired 16:30:34Z, Mayor's comment landed 16:32:16Z, still
+    # no pilot:held label). Only relevant for gate:needs-fix — that is the
+    # label Pilot auto-redispatches without waiting for a human/Mayor beat.
+    # Fail-open: an unreadable/empty comments fetch never blocks a real dispatch.
+    if echo "$_PREDISPATCH_LABELS" | grep -q "gate:needs-fix"; then
+      local _mayor_hold_active _predispatch_now
+      _predispatch_now=$(date +%s)
+      _mayor_hold_active=$(bd -C "$STORY_BEAD_CITY" comments "$STORY_ID" --json 2>/dev/null | jq -r \
+        --argjson now "$_predispatch_now" --argjson grace "${PILOT_MAYOR_HOLD_GRACE_SECS:-300}" \
+        'if type == "array" then . else [] end
+         | any(.[]; .author == "gastown__mayor"
+               and ((try (.created_at | fromdateiso8601) catch 0) > ($now - $grace)))' \
+        2>/dev/null || echo "false")
+      if [ "$_mayor_hold_active" = "true" ]; then
+        warn "ga-pd7j: $STORY_ID is gate:needs-fix with a gastown__mayor comment inside the ${PILOT_MAYOR_HOLD_GRACE_SECS:-300}s grace window — deferring this sweep so an out-of-band hold isn't raced onto a builder. Releasing claim and skipping."
+        bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+        bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+        return 1
+      fi
     fi
   fi
 
