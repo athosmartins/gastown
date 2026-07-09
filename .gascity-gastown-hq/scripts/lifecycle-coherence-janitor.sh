@@ -134,16 +134,19 @@ run_sweep() {
     # on a bead that then sits ready, not building). Clear it so the painel shows it unassigned and the
     # Pilot re-routes cleanly on real dispatch. EXCLUDE intentional assignments: exec:manual (held for
     # a human), gate:needs-human (braked for review), story:blocked (assignee may be unblocking).
-    # NOTE (wa-muesb): gate:needs-human is always colon-suffixed with a reason (e.g.
-    # gate:needs-human:review — same convention R7 matches below), never the bare label. An
-    # exact-match index() here never fires against that convention, silently clearing the assignee
-    # on a bead a human deliberately braked for review — matched by PREFIX instead.
+    # NOTE (wa-muesb, corrected after gate_run=ga-wisp-05leh8 FAIL): gate:needs-human is written
+    # BOTH bare (inflight-reclaim-guard.py, quorum-convergence-watchdog.py, gate-recovery-watchdog.py
+    # all add the plain label with no suffix) AND colon-suffixed with a reason (e.g.
+    # gate:needs-human:review). A first attempt here matched only the colon-suffixed form via
+    # test("^gate:needs-human:") — that traded the original exact-match gap for a new one, still
+    # missing the bare label actively written by production code. Matched by PREFIX with an
+    # optional colon-suffix instead, so both forms are covered.
     _r4_seen=" "
     for _rlbl in story:approved ctx:ready; do
       for id in $("$BD" -C "$store" list -l "$_rlbl" --status open --json -n 0 2>/dev/null \
                   | jq -r '.[] | select((.assignee // "") != "" and (.assignee // "") != "mayor")
                           | ([.labels[]?]) as $l
-                          | select(($l|index("story:in-flight"))==null and ($l|index("exec:manual"))==null and (($l|any(test("^gate:needs-human:")))|not) and ($l|index("story:blocked"))==null)
+                          | select(($l|index("story:in-flight"))==null and ($l|index("exec:manual"))==null and (($l|any(test("^gate:needs-human(:.*)?$")))|not) and ($l|index("story:blocked"))==null)
                           | .id' 2>/dev/null); do
         [ -n "$id" ] || continue
         case "$_r4_seen" in *" $id "*) continue ;; esac
@@ -204,7 +207,7 @@ run_sweep() {
     # metadata (open it back up if in_progress), and close the sling/molecule (and its steps).
     local non_imp_beads
     non_imp_beads=$("$BD" -C "$store" list --all --json 2>/dev/null \
-                    | jq -r '.[] | select([.labels[]?] | any(test("^story:epic$|^story:unrefined$|^story:needs-approval$|^story:refino-|^story:refinement-in-progress$|^refino:|^auto-refino:|^gate:needs-human:")) ) | .id' 2>/dev/null)
+                    | jq -r '.[] | select([.labels[]?] | any(test("^story:epic$|^story:unrefined$|^story:needs-approval$|^story:refino-|^story:refinement-in-progress$|^refino:|^auto-refino:|^gate:needs-human(:.*)?$")) ) | .id' 2>/dev/null)
     for id in $non_imp_beads; do
       [ -n "$id" ] || continue
       _bead_locked "$id" && { log "R7 skip-locked: $id — advisory lock active"; continue; }
@@ -254,14 +257,30 @@ run_sweep() {
       # 4. Find and close slings. $bid is regex-escaped (rxesc) before use in test() — bead ids
       # can contain literal dots (e.g. wa-8yw4i.1); unescaped, "." is regex any-char and would
       # false-positive match an unrelated sibling id differing by exactly one character.
+      # SAFETY (wa-muesb, corrected after gate_run=ga-wisp-05leh8 FAIL): a bare dependency-link
+      # check with no type/issue_type filter closes ANY open dependent of the target — including
+      # a real in-progress child story (parent-child) or a bug that merely tracks/relates to an
+      # unrefined story (discovered-from/related), not just disposable wrappers (confirmed live:
+      # wa-tpr3t depends on wa-ffg4c via discovered-from and is a real P0 bug, not a wrapper).
+      # `gc sling` (see --help) auto-creates a coordination wrapper unless --no-convoy/--owned is
+      # passed: issue_type=convoy, title "sling-<target-id>", linked via dependency type "tracks"
+      # (confirmed against live beads, e.g. wa-0w6ig/wa-zbnb5/wa-vmhza). This is the SAME wrapper
+      # signature quality-gate-dispatcher.sh's merge-boundary reaper (ga-dcclose) already uses to
+      # safely auto-close coordination beads — mirrored here rather than inventing a new rule.
+      # Gate the whole find (title OR dependency match) on that signature so a same-named or
+      # dependency-linked REAL story/bug is never touched. Also fixes a latent bug: dependency
+      # objects carry `depends_on_id` (confirmed via live data), never `.id` — the old
+      # `.dependencies[]?.id` reference was always null, so the dependency-match arm never fired.
       local sling_id
       for sling_id in $("$BD" -C "$store" list --status open,in_progress --json 2>/dev/null \
                        | jq -r --arg bid "$id" '
                            def rxesc: gsub("(?<c>[.^$*+?()\\[\\]{}|\\\\])"; "\\\(.c)");
                            ($bid | rxesc) as $ebid
-                           | .[] | select(.id != $bid) | select(
+                           | .[] | select(.id != $bid)
+                           | select(((.issue_type // .type // "") == "convoy") or (((.id // "") | startswith("dc-"))))
+                           | select(
                                (.title // "" | test("^sling-" + $ebid + "$|^(build story|fix bug|build|fix|implement)\\s+" + $ebid + "$"; "i")) or
-                               ([.dependencies[]?.id] | any(. == $bid))
+                               ([.dependencies[]? | select((.type // "") == "tracks") | .depends_on_id] | any(. == $bid))
                              ) | .id' 2>/dev/null); do
         [ -n "$sling_id" ] || continue
         _close_bead "$store" "$sling_id" "Closed by lifecycle-coherence-janitor: parent bead is non-implementable"
@@ -298,15 +317,31 @@ if [ "${1:-}" = "--selftest" ]; then
   ACT="$TMP/actions"; : > "$ACT"
   # r4-asg: open story:approved with stale assignee (no story:in-flight/exec:manual/gate:needs-human/story:blocked)
   # r4-human: same shape as r4-asg but ALSO carries gate:needs-human:foo — must be EXCLUDED (regression
-  #           for the colon-suffix bug: a bare index("gate:needs-human") never matches this convention)
+  #           for the original exact-match bug: index("gate:needs-human") never matches a colon-suffixed label)
+  # r4-human-bare: same shape but carries the BARE gate:needs-human label (no suffix) — must ALSO be
+  #           EXCLUDED (regression for gate_run=ga-wisp-05leh8: a colon-only test("^gate:needs-human:")
+  #           traded one gap for another, missing the bare form production code actually writes)
   # r5: closed ctx:ready without story:done (R5 target)
   # r5-locked: closed ctx:ready with an advisory lock (imp10 — must be SKIPPED by R5)
   # R7 fixtures (list --all): 3 historical recurrences (wa-o4kuh epic+molecule, wa-06yog
   # needs-approval+sling, wa-8yw4i.1 in-progress escalated-refino+molecule+step+sling — id has a
   # literal dot to regression-test regex-escaping) + one bead per remaining exclusion label
-  # (t-unrefined/t-refinement/t-refino/t-auto/t-human) + t-valid (a genuinely in-flight bead that
-  # R7 must NEVER touch). sling-8yw4iX1 is a DECOY sibling whose title differs from wa-8yw4i.1 by
-  # one character (X vs literal dot) — must NOT close (regression for the sling-regex-escape bug).
+  # (t-unrefined/t-refinement/t-refino/t-auto/t-human/t-human-bare) + t-valid (a genuinely
+  # in-flight bead that R7 must NEVER touch). sling-8yw4iX1 is a DECOY sibling whose title differs
+  # from wa-8yw4i.1 by one character (X vs literal dot) — must NOT close (regression for the
+  # sling-regex-escape bug). All three sling-* fixtures now carry issue_type:convoy, matching real
+  # `gc sling` wrapper beads (confirmed live: wa-0w6ig/wa-zbnb5/wa-vmhza) — regression fixtures for
+  # gate_run=ga-wisp-05leh8's second finding:
+  # dep-only-wrap: convoy, title does NOT match the sling-title pattern, found ONLY via a
+  #           dependency of type "tracks" pointing at wa-06yog — must close (also regression-tests
+  #           the .depends_on_id field-name fix; the old `.dependencies[]?.id` reference was
+  #           always null since dependency objects never carry a bare `.id` key).
+  # real-tracker-bug: issue_type:bug, linked via the SAME "tracks" dependency type to wa-06yog —
+  #           must survive (a bug that merely tracks a non-implementable bead is not a disposable
+  #           wrapper; the reviewer's exact cited hazard).
+  # real-title-collision: issue_type:bug, title literally "fix wa-06yog" (matches the title regex)
+  #           — must survive; the issue_type gate now applies to the title-match arm too, not just
+  #           the dependency arm.
   cat > "$TMP/bd" <<SHIM
 #!/usr/bin/env bash
 a="\$*"
@@ -315,7 +350,7 @@ case "\$a" in
   *"list -l story:approved --status closed"*)   echo '[{"id":"ca-1"},{"id":"ca-cancel","labels":["story:cancelled","story:approved"]}]' ;;
   *"list -l story:in-flight --status blocked"*) echo '[{"id":"bl-1"}]' ;;
   *"list --status in_progress"*)                echo '[{"id":"ip-noasg","assignee":"","updated_at":"2020-01-01T00:00:00Z"},{"id":"ip-fresh","assignee":"","updated_at":"'"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"'"},{"id":"ip-asg","assignee":"mila-wa"}]' ;;
-  *"list -l story:approved --status open"*)     echo '[{"id":"r4-asg","assignee":"mila-wa","labels":["story:approved"]},{"id":"r4-human","assignee":"mila-wa","labels":["story:approved","gate:needs-human:foo"]}]' ;;
+  *"list -l story:approved --status open"*)     echo '[{"id":"r4-asg","assignee":"mila-wa","labels":["story:approved"]},{"id":"r4-human","assignee":"mila-wa","labels":["story:approved","gate:needs-human:foo"]},{"id":"r4-human-bare","assignee":"mila-wa","labels":["story:approved","gate:needs-human"]}]' ;;
   *"list -l ctx:ready --status open"*)          echo '[]' ;;
   *"list -l ctx:ready --status closed"*)        echo '[{"id":"r5","labels":["ctx:ready"]},{"id":"r5-locked","labels":["ctx:ready"]},{"id":"r5-cancel","labels":["ctx:ready","story:cancelled"]}]' ;;
   *"show r5 "*|*"show r5-locked "*)             echo '[{"id":"r5","labels":["ctx:ready"]}]' ;;
@@ -324,7 +359,7 @@ case "\$a" in
   *"show r6-exp"*) echo '[{"id":"r6-exp","labels":["pilot:held","pilot:held-until:1000000"]}]' ;;
   *"show r6-noexp"*) echo '[{"id":"r6-noexp","labels":["pilot:held"]}]' ;;
   # R7 (wa-muesb): historical recurrences + one bead per exclusion label + a valid control
-  *"list --all"*)                               echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}},{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-8yw4i.1","status":"in_progress","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"list --all"*)                               echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}},{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-8yw4i.1","status":"in_progress","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human-bare","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show wa-o4kuh"*)                             echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}}]' ;;
   *"show wa-06yog"*)                             echo '[{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show wa-8yw4i.1"*)                           echo '[{"id":"wa-8yw4i.1","status":"in_progress","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}}]' ;;
@@ -332,13 +367,14 @@ case "\$a" in
   *"show t-refinement"*)                         echo '[{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-refino"*)                             echo '[{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-auto"*)                               echo '[{"id":"t-auto","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}}]' ;;
-  *"show t-human"*)                              echo '[{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"show t-human "*)                             echo '[{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"show t-human-bare"*)                         echo '[{"id":"t-human-bare","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-valid"*)                              echo '[{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show mol-o4kuh"*)                            echo '[{"id":"mol-o4kuh","status":"open"}]' ;;
   *"show mol-8yw4i"*)                            echo '[{"id":"mol-8yw4i","status":"open"}]' ;;
   *"list -t molecule --metadata-field gc.var.issue=wa-8yw4i.1"*) echo '[{"id":"mol-8yw4i","status":"open"}]' ;;
   *"list --parent mol-8yw4i"*)                   echo '[{"id":"step-8yw4i","status":"open"}]' ;;
-  *"list --status open,in_progress"*)            echo '[{"id":"sling-wa-06yog","title":"sling-wa-06yog","status":"open"},{"id":"sling-8yw4i","title":"fix wa-8yw4i.1","status":"open"},{"id":"sling-8yw4iX1","title":"fix wa-8yw4iX1","status":"open"}]' ;;
+  *"list --status open,in_progress"*)            echo '[{"id":"sling-wa-06yog","title":"sling-wa-06yog","status":"open","issue_type":"convoy"},{"id":"sling-8yw4i","title":"fix wa-8yw4i.1","status":"open","issue_type":"convoy"},{"id":"sling-8yw4iX1","title":"fix wa-8yw4iX1","status":"open","issue_type":"convoy"},{"id":"dep-only-wrap","title":"tracks wa-06yog work","status":"open","issue_type":"convoy","dependencies":[{"depends_on_id":"wa-06yog","type":"tracks"}]},{"id":"real-tracker-bug","title":"investigate related issue","status":"open","issue_type":"bug","dependencies":[{"depends_on_id":"wa-06yog","type":"tracks"}]},{"id":"real-title-collision","title":"fix wa-06yog","status":"open","issue_type":"bug"}]' ;;
   *"label remove"*|*"label add"*|*"update"*|*"dolt commit"*) echo "\$a" >> "$ACT" ;;
   *) echo '[]' ;;
 esac
@@ -363,6 +399,7 @@ SHIM
   grep -q 'ip-asg'                            "$ACT" && bad "TOUCHED an in_progress bead WITH an assignee (unsafe!)" || ok "left the assigned in_progress bead alone (safe)"
   grep -q 'update r4-asg --assignee'          "$ACT" && ok "R4: open story:approved with stale assignee → cleared (phantom worker)" || bad "R4 did not clear stale assignee"
   grep -q 'update r4-human --assignee'        "$ACT" && bad "R4: cleared assignee on a gate:needs-human:foo bead (must be excluded — human braked for review)" || ok "R4: left gate:needs-human:foo bead's assignee alone (colon-suffixed exclusion works)"
+  grep -q 'update r4-human-bare --assignee'   "$ACT" && bad "R4 bare-label bug (gate_run=ga-wisp-05leh8): cleared assignee on a BARE gate:needs-human bead (production code writes this form with no suffix)" || ok "R4: left bare gate:needs-human bead's assignee alone (bare-label exclusion works)"
   grep -q 'label remove r6-exp pilot:held'     "$ACT" && ok "R6 (imp19): expired pilot:held-until → stripped pilot:held" || bad "R6 did not strip expired pilot:held"
   grep -q 'label remove r6-exp pilot:held-until:1000000' "$ACT" && ok "R6 (imp19): stripped the expiry label" || bad "R6 did not strip expiry label"
   grep -q 'label add r6-noexp pilot:held-until:' "$ACT" && ok "R6 (imp19): pilot:held with no expiry → stamped default 24h expiry" || bad "R6 did not stamp default expiry"
@@ -382,11 +419,15 @@ SHIM
   grep -q 'update step-8yw4i --status closed' "$ACT" && ok "R7 (historical wa-8yw4i.1): closed molecule child step-8yw4i" || bad "R7 did not close step-8yw4i"
   grep -q 'update sling-8yw4i --status closed' "$ACT" && ok "R7 (historical wa-8yw4i.1): closed matching sling sling-8yw4i" || bad "R7 did not close sling-8yw4i"
   grep -q 'update sling-8yw4iX1 --status closed' "$ACT" && bad "R7 sling-regex bug: unescaped dot false-matched a DIFFERENT sibling id (wa-8yw4iX1 vs wa-8yw4i.1)" || ok "R7 sling-regex: correctly spared a differently-named sibling (bead id is regex-escaped)"
+  grep -q 'update dep-only-wrap --status closed' "$ACT" && ok "R7 (gate_run=ga-wisp-05leh8 fix): closed a convoy wrapper found ONLY via tracks-dependency (title didn't match; also proves the depends_on_id field-name fix)" || bad "R7 did not close dep-only-wrap (convoy, tracks-linked, non-matching title) — dependency-match arm still broken"
+  grep -q 'update real-tracker-bug --status closed' "$ACT" && bad "R7 over-broad fix (gate_run=ga-wisp-05leh8 hazard): closed a real bug that merely TRACKS a non-implementable bead — not a disposable wrapper" || ok "R7: left real-tracker-bug alone (tracks-dependency alone is not enough without issue_type:convoy)"
+  grep -q 'update real-title-collision --status closed' "$ACT" && bad "R7 over-broad fix (gate_run=ga-wisp-05leh8 hazard): closed a real bug whose title coincidentally matched the sling-title pattern" || ok "R7: left real-title-collision alone (title match alone is not enough without issue_type:convoy)"
   grep -q 'update t-unrefined --unset-metadata gc.routed_to' "$ACT" && ok "R7: unset gc.routed_to on story:unrefined" || bad "R7 did not unset gc.routed_to on t-unrefined"
   grep -q 'update t-refinement --unset-metadata gc.routed_to' "$ACT" && ok "R7: unset gc.routed_to on story:refinement-in-progress" || bad "R7 did not unset gc.routed_to on t-refinement"
   grep -q 'update t-refino --unset-metadata gc.routed_to' "$ACT" && ok "R7: unset gc.routed_to on refino:policy-gap" || bad "R7 did not unset gc.routed_to on t-refino"
   grep -q 'update t-auto --unset-metadata gc.routed_to' "$ACT" && ok "R7: unset gc.routed_to on auto-refino:foo" || bad "R7 did not unset gc.routed_to on t-auto"
   grep -q 'update t-human --unset-metadata gc.routed_to' "$ACT" && ok "R7: unset gc.routed_to on gate:needs-human:bar" || bad "R7 did not unset gc.routed_to on t-human"
+  grep -q 'update t-human-bare --unset-metadata gc.routed_to' "$ACT" && ok "R7 (gate_run=ga-wisp-05leh8 fix): unset gc.routed_to on BARE gate:needs-human" || bad "R7 did not unset gc.routed_to on t-human-bare (bare-label trigger still broken)"
   grep -q 't-valid' "$ACT" && bad "R7: modified a valid in-flight bead (t-valid)" || ok "R7 left valid bead t-valid alone"
 
   # DRY-RUN makes no changes
