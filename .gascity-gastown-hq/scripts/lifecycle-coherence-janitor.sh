@@ -222,6 +222,16 @@ run_sweep() {
         _unset_metadata "$store" "$id" "gc.routed_to" "gc.session_name" "gc.work_dir"
         if [ "$status" = "in_progress" ]; then
           _open "$store" "$id"
+          # Same intentional-hold convention R4 already uses (its != "mayor" exclusion above):
+          # don't strip an assignee that IS "mayor". Without this, reopening leaves
+          # status=open + assignee=<worker> — the exact incoherent "phantom card" state this
+          # whole janitor exists to prevent (see file header) — and R4 won't clean it up after
+          # the fact here, since these non-implementable beads (epic/unrefined/refino-escalated/
+          # gate:needs-human) typically carry neither story:approved nor ctx:ready, R4's own triggers.
+          local assignee; assignee=$(echo "$bead_json" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null)
+          if [ -n "$assignee" ] && [ "$assignee" != "mayor" ]; then
+            _unassign "$store" "$id"
+          fi
         fi
         mutated=1
       fi
@@ -359,10 +369,11 @@ case "\$a" in
   *"show r6-exp"*) echo '[{"id":"r6-exp","labels":["pilot:held","pilot:held-until:1000000"]}]' ;;
   *"show r6-noexp"*) echo '[{"id":"r6-noexp","labels":["pilot:held"]}]' ;;
   # R7 (wa-muesb): historical recurrences + one bead per exclusion label + a valid control
-  *"list --all"*)                               echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}},{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-8yw4i.1","status":"in_progress","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human-bare","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"list --all"*)                               echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}},{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human-bare","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show wa-o4kuh"*)                             echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}}]' ;;
   *"show wa-06yog"*)                             echo '[{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}}]' ;;
-  *"show wa-8yw4i.1"*)                           echo '[{"id":"wa-8yw4i.1","status":"in_progress","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"show wa-8yw4i.1"*)                           echo '[{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"show t-mayor-assigned"*)                     echo '[{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-unrefined"*)                          echo '[{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-refinement"*)                         echo '[{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-refino"*)                             echo '[{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}}]' ;;
@@ -415,6 +426,9 @@ SHIM
   grep -q 'update wa-06yog --unset-metadata gc.routed_to' "$ACT" && ok "R7 (historical wa-06yog): unset gc.routed_to on story:needs-approval" || bad "R7 did not unset gc.routed_to on wa-06yog"
   grep -q 'update sling-wa-06yog --status closed' "$ACT" && ok "R7 (historical wa-06yog): closed sling sling-wa-06yog" || bad "R7 did not close sling-wa-06yog"
   grep -q 'update wa-8yw4i.1 --status open' "$ACT" && ok "R7 (historical wa-8yw4i.1): reset in_progress bead to open" || bad "R7 did not reset wa-8yw4i.1 status"
+  grep -q 'update wa-8yw4i.1 --assignee' "$ACT" && ok "R7 (historical wa-8yw4i.1): cleared stale worker assignee on reopen" || bad "R7 reopened wa-8yw4i.1 but left its assignee set — recreates the open+assigned phantom-card state this janitor exists to prevent, and R4 won't catch it (no story:approved/ctx:ready on an escalated-refino bead)"
+  grep -q 'update t-mayor-assigned --status open' "$ACT" && ok "R7: reopened mayor-assigned in_progress bead" || bad "R7 did not reopen t-mayor-assigned"
+  grep -q 'update t-mayor-assigned --assignee' "$ACT" && bad "R7: cleared assignee=mayor on reopen (must be excluded — same intentional-hold convention R4 already uses)" || ok "R7: left assignee=mayor alone on reopen (matches R4's convention)"
   grep -q 'update mol-8yw4i --status closed' "$ACT" && ok "R7 (historical wa-8yw4i.1): closed molecule mol-8yw4i" || bad "R7 did not close molecule mol-8yw4i"
   grep -q 'update step-8yw4i --status closed' "$ACT" && ok "R7 (historical wa-8yw4i.1): closed molecule child step-8yw4i" || bad "R7 did not close step-8yw4i"
   grep -q 'update sling-8yw4i --status closed' "$ACT" && ok "R7 (historical wa-8yw4i.1): closed matching sling sling-8yw4i" || bad "R7 did not close sling-8yw4i"
