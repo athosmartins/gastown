@@ -3750,6 +3750,74 @@ echo "Scenario POOL-OWN-STRUCT (ga-sndpm): structural — ownership guard still 
   && ok "ga-sndpm: ownership guard re-verified at BOTH call sites (early ga-htjni + late pool-write re-check)" \
   || bad "ga-sndpm: ownership guard call-site count regressed — late re-verification before the pool write may have been removed (claim-to-write race window reopened)"
 
+# ── Scenario QM7U (ga-qm7u): live-verify-first section injected when a candidate
+# carries prior zero-progress reclaim history ─────────────────────────────────
+# ga-qm7u incident: a bead whose reported symptom was already fixed LIVE outside
+# the bd/gate flow was blind-redispatched 3x over ~2h, each builder finding
+# nothing to build and idling out the full 25min reclaim-guard TTL before being
+# caught. _filter_candidates already caps redispatch at pilot:reclaim-count>=3
+# (ga-am6h) — but that only stops it AFTER 3 blind cycles. This adds a builder-
+# facing nudge (mirrors the existing gate:fix-attempt / GATE_FIX_SECTION
+# pattern ~L3330): once a candidate carries ANY reclaim history
+# (pilot:reclaim-count>=1), tell the next builder to verify live BEFORE writing
+# code, so an already-fixed bead resolves in minutes (via the existing
+# no-changes close convention) instead of burning another full idle cycle.
+QM7U_BUG_RC1='[{"id":"ga-qm7ut1","title":"qm7u reclaim-count 1 fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["pilot:reclaim-count:1"],"assignee":null,"created_at":"2026-06-01T00:00:01Z","metadata":{}}]'
+QM7U_BUG_RC2='[{"id":"ga-qm7ut2","title":"qm7u reclaim-count 2 fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["pilot:reclaim-count:2"],"assignee":null,"created_at":"2026-06-01T00:00:02Z","metadata":{}}]'
+QM7U_BUG_NONE='[{"id":"ga-qm7ut0","title":"qm7u no reclaim-count fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:03Z","metadata":{}}]'
+
+echo "Scenario QM7U-a (ga-qm7u): pilot:reclaim-count:1 → live-verify-first section injected into dispatch prompt"
+LOG_QM7U_A="$(run_capacity_reuse 1 "$QM7U_BUG_RC1" "$GT4_SESS_NONE")"
+if echo "$LOG_QM7U_A" | grep -q "ga-qm7ut1 has pilot:reclaim-count:1 — injecting live-verify-first section"; then
+  ok "ga-qm7u: reclaim-count:1 candidate gets the live-verify-first section injected"
+else
+  bad "ga-qm7u: reclaim-count:1 candidate did NOT get the live-verify-first section injected (log: $LOG_QM7U_A)"
+fi
+
+echo "Scenario QM7U-b (ga-qm7u): pilot:reclaim-count:2 → live-verify-first section still injected"
+LOG_QM7U_B="$(run_capacity_reuse 1 "$QM7U_BUG_RC2" "$GT4_SESS_NONE")"
+if echo "$LOG_QM7U_B" | grep -q "ga-qm7ut2 has pilot:reclaim-count:2 — injecting live-verify-first section"; then
+  ok "ga-qm7u: reclaim-count:2 candidate gets the live-verify-first section injected"
+else
+  bad "ga-qm7u: reclaim-count:2 candidate did NOT get the live-verify-first section injected (log: $LOG_QM7U_B)"
+fi
+
+echo "Scenario QM7U-c (ga-qm7u): no pilot:reclaim-count label → section NOT injected (no regression on common case)"
+LOG_QM7U_C="$(run_capacity_reuse 1 "$QM7U_BUG_NONE" "$GT4_SESS_NONE")"
+if echo "$LOG_QM7U_C" | grep -q "injecting live-verify-first section"; then
+  bad "ga-qm7u: REGRESSION — live-verify-first section injected with no reclaim-count history (log: $LOG_QM7U_C)"
+else
+  ok "ga-qm7u: no reclaim-count label → section correctly NOT injected"
+fi
+
+# QM7U-a/b/c above all route through the BUG-tier DISPATCH_TASK heredoc (they use
+# issue_type:"bug", which _bead_tier() always maps to DISPATCH_TIER="bug"). The
+# feature/story-tier heredoc has its own separate $LIVE_VERIFY_SECTION injection
+# site — untested by QM7U-a/b/c — so a future edit could silently drop it there
+# while every other QM7U scenario (and the whole 400+ suite) stays green. Exercise
+# the HQ TIER2 (story:approved) path via run_hq_tier2 (Scenario 25's runner) so this
+# site is covered too.
+echo "Scenario QM7U-d (ga-qm7u): feature-tier (story:approved) candidate with pilot:reclaim-count:1 → live-verify-first section injected (covers the OTHER DISPATCH_TASK template)"
+QM7U_FEATURE_RC1='[{"id":"ga-qm7utf1","title":"qm7u feature-tier reclaim-count 1 fixture","priority":2,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["story:approved","pilot:reclaim-count:1"],"assignee":null,"created_at":"2026-06-01T00:00:04Z","metadata":{"story.criterios":"fixture acceptance criteria for veto test"}}]'
+LOG_QM7U_D="$(run_hq_tier2 "$QM7U_FEATURE_RC1")"
+if echo "$LOG_QM7U_D" | grep -q "ga-qm7utf1 has pilot:reclaim-count:1 — injecting live-verify-first section"; then
+  ok "ga-qm7u: feature-tier candidate with reclaim-count:1 gets the live-verify-first section injected (story/feature DISPATCH_TASK template covered)"
+else
+  bad "ga-qm7u: feature-tier candidate with reclaim-count:1 did NOT get the live-verify-first section injected (log: $LOG_QM7U_D)"
+fi
+
+grep -qE 'PRIOR ZERO-PROGRESS ATTEMPT' "$DISPATCHER" \
+  && ok "ga-qm7u: dispatch prompt template carries the live-verify-first section marker" \
+  || bad "ga-qm7u: live-verify-first section marker missing from dispatch prompt templates"
+
+# Structural: both DISPATCH_TASK heredocs (bug-tier and feature-tier) must inject
+# $LIVE_VERIFY_SECTION — a bare grep for the marker (above) is satisfied by the
+# variable's definition alone and would stay green even if a future edit dropped
+# one of the two injection sites. Count exact injection-line occurrences instead.
+[ "$(grep -cE '^\$LIVE_VERIFY_SECTION$' "$DISPATCHER")" -eq 2 ] \
+  && ok "ga-qm7u: \$LIVE_VERIFY_SECTION injected at both DISPATCH_TASK sites (bug-tier + feature-tier)" \
+  || bad "ga-qm7u: \$LIVE_VERIFY_SECTION injection-site count != 2 — one of the two dispatch templates lost its injection"
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

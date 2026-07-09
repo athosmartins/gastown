@@ -3377,6 +3377,43 @@ FIXSEC
     fi
   fi
 
+  # ── ga-qm7u: prior zero-progress attempt(s) — nudge builder to verify live first ──
+  # A bead carrying pilot:reclaim-count:N (N>=1, scripts/inflight-reclaim-guard.py)
+  # already burned at least one full dispatch+TTL cycle on a builder that made ZERO
+  # progress (no branch/commit) before the 25min inactivity reclaim-guard caught it.
+  # The single most common cause observed (ga-qm7u): the reported symptom was already
+  # fixed LIVE, outside the bd/gate flow, so the bead was never closed and kept
+  # re-dispatching blind — 3 full cycles (~2h) were burned before the existing
+  # _FILTER_RECLAIM_CAP=3 cap (ga-am6h) finally stopped it. Rather than let the next
+  # builder discover this the same slow way, tell it up front to verify the symptom
+  # still reproduces FIRST and close immediately via the existing "no-changes"
+  # convention (internal/templates/commands/bodies/done.md) if it doesn't — before
+  # spending any time on implementation. This does NOT change whether a bead
+  # redispatches (_FILTER_RECLAIM_CAP still governs that); it only makes the 2nd/3rd
+  # attempt fast instead of blind.
+  local STORY_RECLAIM_COUNT="" LIVE_VERIFY_SECTION=""
+  STORY_RECLAIM_COUNT=$(echo "$STORY_LABELS" | tr ',' '\n' \
+    | sed -n 's/^pilot:reclaim-count:\([0-9]\{1,\}\)$/\1/p' | sort -n | tail -1)
+  if [ -n "$STORY_RECLAIM_COUNT" ] && [ "$STORY_RECLAIM_COUNT" -ge 1 ]; then
+    log "  $STORY_ID has pilot:reclaim-count:$STORY_RECLAIM_COUNT — injecting live-verify-first section."
+    LIVE_VERIFY_SECTION=$(cat <<LIVESEC
+
+## ⚠️ PRIOR ZERO-PROGRESS ATTEMPT(S) — verify live BEFORE building (reclaim_count=$STORY_RECLAIM_COUNT)
+A prior builder was dispatched to this bead and made ZERO progress (no branch or
+commit) before the inactivity reclaim-guard reclaimed it ($STORY_RECLAIM_COUNT
+time(s) so far). The most common cause: the reported symptom was already fixed
+LIVE, outside the bd/gate flow, and this bead was simply never closed.
+
+BEFORE writing any code: quickly verify the reported symptom still reproduces
+against the current code/running system. If it does NOT reproduce (fix already
+present), close immediately with evidence — do not attempt to build:
+  bd -C "$STORY_BEAD_CITY" close "$STORY_ID" --reason="no-changes: verified live, symptom already fixed (cite commit/evidence)"
+Only proceed to implement once you have confirmed, with evidence, that the bug
+still reproduces.
+LIVESEC
+)
+  fi
+
   log "Selected $DISPATCH_TIER [$LANE] $STORY_ID (priority=$STORY_PRIORITY): $STORY_TITLE"
   log "  labels=$STORY_LABELS  lane=$LANE  tier=$DISPATCH_TIER"
 
@@ -3873,6 +3910,7 @@ Bead DB: $STORY_BEAD_CITY
 Fix this bug or tech-debt item completely. Do NOT wait for a human.
 "Só depois do sistema perfeito é que a gente faz novas features." — system quality first.
 $GATE_FIX_SECTION
+$LIVE_VERIFY_SECTION
 
 ## Description / Acceptance Criteria
 $STORY_CRITERIA
@@ -3920,6 +3958,7 @@ Bead DB: $STORY_BEAD_CITY
 ## Your job
 Build this story from acceptance criteria to /gate-done. Do NOT wait for a human.
 $GATE_FIX_SECTION
+$LIVE_VERIFY_SECTION
 
 ## Acceptance Criteria
 $STORY_CRITERIA
