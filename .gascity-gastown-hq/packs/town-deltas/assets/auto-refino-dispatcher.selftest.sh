@@ -27,6 +27,10 @@
 #        → drift-guard 6 (story.refino_mode=simplificado + the skip sentinel on F3/F4/F5).
 #   Loop safety (daemon↔gate ping-pong) → Scenario 5 (attempt cap → escalate).
 #   Timeout safety → Scenario 7 (TIMEOUT/unknown → requeue, never promote, no attempt burn).
+#   Drained-refiner safety (ga-bvbm: stale_async_start race orphans the spawned
+#   refiner before it ever consumes the task, task bead sits assignee=None for
+#   the full 25m timeout) → Scenario 10 (auto_refino_session_drained detector +
+#   SPAWN_DRAINED → requeue) + spawn-drained wiring drift-guards.
 #
 # Exit 0 iff every assertion holds.
 
@@ -685,6 +689,86 @@ if awk '/if \[ -n "\$_dup_twin" \]/{found=1} found && /No delivered twin/{nf=1} 
   ok "normal handoff bookkeeping is inside the no-dup branch"
 else
   bad "normal handoff bookkeeping may not be correctly gated by dup-check"
+fi
+
+# ── Scenario 10: SPAWN-DRAINED DETECTION (ga-bvbm) ────────────────────────────
+# The refiner is an ephemeral …-adhoc-… worker; it can hit the stale_async_start
+# race and drain during its OWN startup before ever consuming the queued refine
+# task. Step 6 previously had no way to tell that apart from "still working" —
+# it just burned the full AUTO_REFINO_TIMEOUT_MINUTES every time (25m default).
+# auto_refino_session_drained is the pure detector Step 6 now polls after a
+# grace period; prove it directly against gc-session-list-shaped fixtures.
+echo "Scenario 10: spawn-drained detection (ga-bvbm) — pure auto_refino_session_drained"
+
+SJ_DRAINED='{"sessions":[{"id":"ga-wisp-x1","session_name":"auto-refiner-adhoc-abc123","state":"asleep","closed":false}]}'
+[ "$(auto_refino_session_drained "$SJ_DRAINED" "ga-wisp-x1")" = "yes" ] \
+  && ok "adhoc worker asleep (drain-acked) → drained=yes" \
+  || bad "adhoc worker asleep → expected drained=yes"
+
+SJ_ACTIVE='{"sessions":[{"id":"ga-wisp-x1","session_name":"auto-refiner-adhoc-abc123","state":"active","closed":false}]}'
+[ "$(auto_refino_session_drained "$SJ_ACTIVE" "ga-wisp-x1")" = "no" ] \
+  && ok "adhoc worker still active → drained=no (genuinely working, not a false kill)" \
+  || bad "adhoc worker active → expected drained=no"
+
+SJ_CLOSED='{"sessions":[{"id":"ga-wisp-x1","session_name":"auto-refiner-adhoc-abc123","state":"active","closed":true}]}'
+[ "$(auto_refino_session_drained "$SJ_CLOSED" "ga-wisp-x1")" = "yes" ] \
+  && ok "closed session (any state) → drained=yes" \
+  || bad "closed session → expected drained=yes"
+
+SJ_NAMEDCREW='{"sessions":[{"id":"ga-wisp-x1","session_name":"thies-wa","state":"asleep","closed":false}]}'
+[ "$(auto_refino_session_drained "$SJ_NAMEDCREW" "ga-wisp-x1")" = "no" ] \
+  && ok "named (non-adhoc) session asleep → drained=no (an asleep crew is still its bead's owner, ga-mrfb)" \
+  || bad "named session asleep → expected drained=no (must not treat asleep crews as dead)"
+
+SJ_OTHERID='{"sessions":[{"id":"ga-wisp-OTHER","session_name":"auto-refiner-adhoc-abc123","state":"asleep","closed":false}]}'
+[ "$(auto_refino_session_drained "$SJ_OTHERID" "ga-wisp-x1")" = "no" ] \
+  && ok "session id not (yet) in the roster → drained=no (fail open, not a false kill)" \
+  || bad "id not in roster → expected drained=no (absence of evidence != evidence of death)"
+
+[ "$(auto_refino_session_drained '{}' 'ga-wisp-x1')" = "no" ] \
+  && ok "malformed/empty sessions payload → drained=no (fail open)" \
+  || bad "malformed payload → expected drained=no"
+
+[ "$(auto_refino_session_drained 'not json' 'ga-wisp-x1')" = "no" ] \
+  && ok "unparseable payload → drained=no (fail open)" \
+  || bad "unparseable payload → expected drained=no"
+
+# A new SPAWN_DRAINED outcome token must still land on requeue — proves the
+# decision core's existing `*) requeue` catch-all covers it with ZERO changes
+# to auto_refino_handoff_decision (ga-flxp6 AC: only handoff/escalate/requeue).
+D=$(auto_refino_handoff_decision "SPAWN_DRAINED" 1 3)
+[ "$D" = "requeue" ] && ok "SPAWN_DRAINED outcome → requeue (same safe path as TIMEOUT, no attempt burn)" || bad "SPAWN_DRAINED → expected requeue, got '$D'"
+
+# ── Drift guards: spawn-drained wiring (ga-bvbm) ──────────────────────────────
+echo "Drift guards: spawn-drained detection wiring"
+
+if grep -qF 'auto_refino_session_drained "$_SESSIONS_JSON" "$SESSION_ID"' "$DISPATCHER"; then
+  ok "Step 6 poll loop calls auto_refino_session_drained with the live session roster"
+else
+  bad "Step 6 does not call auto_refino_session_drained — drained-refiner detection not wired"
+fi
+
+if grep -q 'AUTO_REFINO_DRAINED_GRACE_SECONDS' "$DISPATCHER"; then
+  ok "grace-period tunable AUTO_REFINO_DRAINED_GRACE_SECONDS is defined"
+else
+  bad "AUTO_REFINO_DRAINED_GRACE_SECONDS not found — no boot grace period"
+fi
+
+# The grace-period comparison must sit just above the drained-check call — a
+# session-list lookup on every 30s poll tick (no gate) would be wasteful AND
+# risk a false-positive kill against a session still legitimately booting.
+_GATE_LN=$(grep -n -F -- '-ge "$AUTO_REFINO_DRAINED_GRACE_SECONDS" ]; then' "$DISPATCHER" | head -1 | cut -d: -f1)
+_CALL_LN=$(grep -n -F -- 'auto_refino_session_drained "$_SESSIONS_JSON" "$SESSION_ID"' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$_GATE_LN" ] && [ -n "$_CALL_LN" ] && [ "$_CALL_LN" -gt "$_GATE_LN" ] && [ "$_CALL_LN" -le "$((_GATE_LN + 5))" ]; then
+  ok "drained check is gated by the grace-period comparison (call sits inside the grace-period if-block)"
+else
+  bad "drained check does not appear gated by the grace period"
+fi
+
+if grep -qF 'session_name missing from' "$DISPATCHER"; then
+  ok "empty session_name is logged verbatim for forensics (ga-bvbm suggested next step)"
+else
+  bad "empty session_name path has no forensic logging"
 fi
 
 echo ""

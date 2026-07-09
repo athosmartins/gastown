@@ -99,6 +99,13 @@ if [ "$AUTO_REFINO_TIMEOUT_MINUTES" -lt 10 ] 2>/dev/null; then
 fi
 # Poll interval (seconds) while waiting for the refiner to reach a terminal state.
 AUTO_REFINO_POLL_INTERVAL="${AUTO_REFINO_POLL_INTERVAL:-30}"
+# Grace period (seconds) before Step 6 starts trusting a "drained" reading on the
+# refiner session (ga-bvbm). A fresh session can take real wall-clock time to
+# boot; a drained-adhoc reading during that window is more likely a not-yet-
+# indexed roster than a genuine stale_async_start death. After the grace period,
+# "asleep" for an adhoc worker is terminal (drain-acked, wake_mode=fresh never
+# resumes prior work — same rule as the sibling _session_is_live_builder check).
+AUTO_REFINO_DRAINED_GRACE_SECONDS="${AUTO_REFINO_DRAINED_GRACE_SECONDS:-120}"
 # Refiner session template (model = Sonnet; see agents/auto-refiner/agent.toml).
 AUTO_REFINO_REFINER_TEMPLATE="${AUTO_REFINO_REFINER_TEMPLATE:-auto-refiner}"
 # If a refine claim sits in auto-refino:refining longer than this, the dispatcher
@@ -371,6 +378,40 @@ auto_refino_is_ingestable_raw() {
   # build/scraper/non-product beads are excluded just like labelled candidates.
   [ "$(auto_refino_is_product_story "$labels" "$ex")" = "yes" ] || { echo "no"; return; }
   echo "yes"
+}
+
+# auto_refino_session_drained <sessions_json> <session_id>
+#   ga-bvbm: the refiner is spawned as an ephemeral …-adhoc-… worker, which can
+#   hit the stale_async_start race and drain during its OWN startup — before
+#   ever consuming the queued refine task. Step 6 previously had no way to tell
+#   that apart from "still working"; it just burned the full timeout every time.
+#
+#   Emits "yes" iff <session_id> names an entry in <sessions_json> ("gc session
+#   list --json" shape) that has PROVABLY drained and will NEVER resume:
+#     - closed == true, OR
+#     - state == "asleep" AND the entry is an …-adhoc-… worker (drain-acked;
+#       wake_mode=fresh means a later wake re-claims from the pool, it does NOT
+#       resume this build — same rule as the sibling _session_is_live_builder
+#       check / ga-mrfb).
+#   Emits "no" for a live session, for an id not (yet) present in the roster
+#   (absence of evidence is not evidence of death — a brand-new session may not
+#   be indexed instantly), and for empty/malformed input (fail open: the worst
+#   case is falling back to the pre-fix behaviour of waiting out the timeout,
+#   never a false kill of a healthy refine).
+auto_refino_session_drained() {
+  local sessions_json="${1:-}" sid="${2:-}"
+  [ -n "$sid" ] || { echo "no"; return; }
+  echo "$sessions_json" | jq -e '.sessions | type=="array"' >/dev/null 2>&1 || { echo "no"; return; }
+  echo "$sessions_json" | jq -r --arg id "$sid" '
+    ([.sessions[]? | select(.id == $id)] | .[0]) as $s
+    | if ($s == null) then "no"
+      elif ($s.closed == true) then "yes"
+      elif ($s.state == "asleep") and
+           ([$s.session_name, $s.name, $s.alias, $s.agent_name]
+             | map(select(. != null)) | any(test("-adhoc-"))) then "yes"
+      else "no"
+      end
+  ' 2>/dev/null || echo "no"
 }
 
 # If sourced by the selftest, stop here — expose the pure functions only.
@@ -1179,6 +1220,14 @@ SESSION_NAME=$(echo "$SESSION_JSON" | jq -r '.session_name // empty')
 if [ -n "$SESSION_NAME" ]; then
   bd_ update "$TASK_BEAD_ID" --assignee "$SESSION_NAME" --status in_progress -q 2>/dev/null || true
   bd_ comment "$TASK_BEAD_ID" "$REFINE_TASK" 2>/dev/null || true
+else
+  # ga-bvbm forensic: session_name is REQUIRED by `gc session new --json`'s own
+  # schema on success, so an empty read here means either a live contract
+  # violation or a malformed capture — either way the task bead's assignee (and
+  # so its durable pull-channel fallback) silently never gets set. Log the raw
+  # response verbatim so the next occurrence has real evidence instead of
+  # another "assignee=None, no clue why" report.
+  warn "  session_name missing from 'gc session new --json' for $SESSION_ID (ga-bvbm) — raw response: $SESSION_JSON"
 fi
 gc --city "$GC_CITY" session nudge "$SESSION_ID" "$REFINE_TASK" --delivery queue 2>/dev/null \
   || gc --city "$GC_CITY" session submit "$SESSION_ID" "$REFINE_TASK" 2>/dev/null \
@@ -1187,6 +1236,7 @@ log "  Simplificado task delivered to refiner for $STORY_ID."
 
 # ── Step 6: Poll the task bead until REFINED/ESCALATE or timeout ──────────────
 DEADLINE=$(( $(date +%s) + AUTO_REFINO_TIMEOUT_MINUTES * 60 ))
+_LAST_DRAINED_CHECK=$(date +%s)
 OUTCOME="TIMEOUT"
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   TB=$(bd_ show "$TASK_BEAD_ID" --json 2>/dev/null || echo "[]")
@@ -1197,6 +1247,27 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     OUTCOME="ESCALATE:info-gap"; break
   elif echo "$TB_LABELS" | grep -q "outcome:ESCALATE"; then
     OUTCOME="ESCALATE"; break
+  fi
+  # ga-bvbm: past the boot grace period, periodically check whether the refiner
+  # itself has already drained (stale_async_start race) — if so it will NEVER
+  # produce a terminal label, so waiting out the rest of the (25m default)
+  # timeout is pure waste. Detect it and requeue instead. Falls through
+  # auto_refino_handoff_decision's existing `*) requeue` catch-all — no
+  # decision-vocabulary change needed. Reuses the grace tunable as the RECHECK
+  # interval too (one knob): at most one extra `gc session list` call per grace
+  # window, not one per (30s default) bead-poll tick — Dolt has a documented
+  # history of poll-frequency-driven CPU/latency issues, so this stays a
+  # low-frequency check layered on the existing bead poll, not a second loop
+  # running at the same cadence.
+  _now=$(date +%s)
+  if [ $(( _now - _LAST_DRAINED_CHECK )) -ge "$AUTO_REFINO_DRAINED_GRACE_SECONDS" ]; then
+    _LAST_DRAINED_CHECK=$_now
+    _SESSIONS_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo '{}')
+    if [ "$(auto_refino_session_drained "$_SESSIONS_JSON" "$SESSION_ID")" = "yes" ]; then
+      OUTCOME="SPAWN_DRAINED"
+      warn "  Refiner session $SESSION_ID drained before delivering an outcome for $STORY_ID (stale_async_start race, ga-bvbm) — requeuing now instead of waiting out the full timeout."
+      break
+    fi
   fi
   sleep "$AUTO_REFINO_POLL_INTERVAL"
 done
