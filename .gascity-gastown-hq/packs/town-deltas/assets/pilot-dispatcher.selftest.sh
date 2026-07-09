@@ -401,6 +401,7 @@ run_step0() { # FAKE_STALE_JSON
 #   $6 = PILOT_TEST_CREW_BRANCH_BEADS   (space-list of ids with a crew/<crew>/<id> branch — _beadid_has_crew_branch seam)
 #   $7 = PILOT_TEST_PHANTOM_STALE_BEADS (space-list of ids treated as stale >45min — phantom guard seam)
 #   $8 = FAKE_SLING_LABELS              (sling→extra-label map — ga-d2jil sling gate-marker guard seam)
+#   $9 = PILOT_TEST_DEAD_SLINGS         (space-list of sling ids treated as STALE by _sling_is_live — ga-l7pp)
 run_neverstarted() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   reset_state
@@ -417,6 +418,7 @@ run_neverstarted() {
     FAKE_SLING_ASSIGNEES="${4:-}" \
     PILOT_TEST_CREW_PROGRESSED="${5:-}" \
     PILOT_TEST_CREW_BRANCH_BEADS="${6:-}" \
+    PILOT_TEST_DEAD_SLINGS="${9:-}" \
     FAKE_SLING_LABELS="${8:-}" \
     PILOT_TEST_PHANTOM_STALE_BEADS="${7:-}" \
     FAKE_BLOCKED_IDS="" \
@@ -1877,6 +1879,55 @@ echo "Scenario 16r: owner-grace knob + skip-proof helper are wired (ga-mfeip)"
 has "$DISPATCHER" 'PILOT_NEVERSTARTED_OWNER_GRACE_HOURS' "owner-grace window knob defined"
 has "$DISPATCHER" '_crew_progressed_since()' "_crew_progressed_since skip-proof helper defined"
 has "$DISPATCHER" 'owner-grace' "owner-grace release path wired into the never-started detector"
+
+# 16r1 (ga-l7pp, ga-kuuk double-dispatch): an UNCLAIMED sling (no assignee — it is
+# sitting QUEUED in its target pool, e.g. a backlogged gastown.dog) that is still
+# fresh/live must NOT be released. Before this fix, the only guard on a
+# sling-bearing bead was the live-SESSION check, which requires a non-empty
+# assignee — an unclaimed sling fell through untouched and got released, which
+# unsets pilot.sling_bead and ORPHANS the still-queued sling bead. The very next
+# sweep then dispatches a fresh SIBLING sling for the same story — this is
+# exactly what happened to ga-k4uh (5 sling beads in ~3h; two claimed by two
+# different dogs within 46s of each other).
+echo "Scenario 16r1 (ga-l7pp): an unclaimed-but-fresh sling is KEPT, not released"
+NS_QUEUED='[{"id":"tt-ns-queued","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-queued"}}]'
+LOG16R1="$(run_neverstarted "$NS_QUEUED" "" "$NS_SESS" "" "" "" "" "" "")"
+if echo "$LOG16R1" | grep -q "releasing never-started in-flight bead tt-ns-queued"; then
+  bad "REGRESSION (ga-l7pp): released a story whose sling is unclaimed but still queued/fresh — orphans the sling, mints a sibling (ga-kuuk double-dispatch mechanism)"
+else
+  ok "unclaimed-but-fresh sling is kept (pool hasn't served it yet, not abandoned)"
+fi
+
+# 16r2 (ga-l7pp): an UNCLAIMED sling that IS genuinely stale (idle past the SAME
+# STALE_SLING_SECONDS window the dispatch-time dedup guard uses, no branch) is a
+# real orphan — release the story, but ALSO close the orphaned sling bead itself
+# so it can never be independently claimed after the story starts over.
+echo "Scenario 16r2 (ga-l7pp): an unclaimed-and-stale sling releases the story AND closes the orphan"
+NS_QUEUED_STALE='[{"id":"tt-ns-queued-stale","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-queued-stale"}}]'
+LOG16R2="$(run_neverstarted "$NS_QUEUED_STALE" "" "$NS_SESS" "" "" "" "" "" "tt-sling-queued-stale")"
+if echo "$LOG16R2" | grep -q "releasing never-started in-flight bead tt-ns-queued-stale"; then
+  ok "unclaimed-and-stale sling is released (genuine orphan, pool never served it)"
+else
+  bad "REGRESSION (ga-l7pp): did NOT release a genuinely stale unclaimed-sling never-started bead"
+fi
+if echo "$LOG16R2" | grep -q "tt-sling-queued-stale is unclaimed AND stale"; then
+  ok "orphaned stale sling is closed before the story releases (no lingering claimable duplicate)"
+else
+  bad "REGRESSION (ga-l7pp): released the story but did NOT close the orphaned stale sling bead"
+fi
+
+# 16r3 (ga-l7pp): control — parity with pre-fix 16h. An unclaimed sling still KEEPS
+# when the session roster is untrustworthy, now via the staleness check rather
+# than the _DEADWORKER_OK gate (roster trust is irrelevant when there is no
+# assignee whose session liveness needs checking).
+echo "Scenario 16r3 (ga-l7pp): unclaimed sling still kept when roster is untrustworthy (parity with 16h)"
+NS_QUEUED_UNTRUST='[{"id":"tt-ns-queued-untrust","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-queued-untrust"}}]'
+LOG16R3="$(run_neverstarted "$NS_QUEUED_UNTRUST" "" "" "" "" "" "" "" "")"
+if echo "$LOG16R3" | grep -q "releasing never-started in-flight bead tt-ns-queued-untrust"; then
+  bad "REGRESSION (ga-l7pp): released an unclaimed-sling bead while the roster was untrustworthy"
+else
+  ok "unclaimed-but-fresh sling kept even when roster is untrustworthy (fail-open by default)"
+fi
 
 # 16i: PILOT_NEVERSTARTED_MINUTES=0 fully disables the detector.
 echo "Scenario 16i: PILOT_NEVERSTARTED_MINUTES=0 disables the detector"

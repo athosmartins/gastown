@@ -2522,11 +2522,33 @@ _neverstarted_recover_db() {
       _sling_labels=$(echo "$_sling_json" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
       case ",$_sling_labels," in *,gate:*) continue ;; esac
 
-      if [ "${_DEADWORKER_OK:-0}" != "1" ]; then
-        continue   # roster untrustworthy → cannot prove worker dead → KEEP.
-      fi
       _asg=$(echo "$_sling_json" | jq -r '(.assignee // "")' 2>/dev/null || echo "")
-      if [ -n "$_asg" ] && _session_is_live_builder "$_asg"; then
+      if [ -z "$_asg" ]; then
+        # ga-l7pp: an UNCLAIMED sling (no assignee yet) means the dispatch already
+        # materialized a task bead — it is QUEUED in its target pool, not "never
+        # started". The pool may simply be backlogged. Judge it the SAME way the
+        # dispatch-time dedup guard does (ga-cnvy1): still open/in_progress and not
+        # yet stale (_sling_is_live, same STALE_SLING_SECONDS window) → KEEP, the
+        # pool just hasn't served it. Only a PROVEN-stale unclaimed sling is a
+        # genuine orphan. Releasing here without this check unsets pilot.sling_bead
+        # (below) and leaves the queued sling bead ORPHANED — the very next sweep
+        # then mints a SIBLING sling for the same story, and both can be claimed
+        # independently (the ga-kuuk double-dispatch: ga-k4uh got 5 sling beads in
+        # ~3h, two of which were claimed by two different dogs within 46s).
+        local _sling_status
+        _sling_status=$(echo "$_sling_json" | jq -r '(.status // "")' 2>/dev/null || echo "")
+        case "$_sling_status" in
+          open|in_progress)
+            if _sling_is_live "$_sling" "$_sling_db" "$_bid"; then
+              continue   # still queued and not stale — pool hasn't served it yet.
+            fi
+            warn "NEVERSTARTED: $_bid's sling $_sling is unclaimed AND stale (idle >${STALE_SLING_SECONDS}s, no branch) — closing orphaned sling before release (ga-l7pp)."
+            bd -C "$_sling_db" close "$_sling" --reason "Stale unclaimed sling auto-closed by Pilot NEVERSTARTED release: story never started and sling sat open >${STALE_SLING_SECONDS}s with no crew branch — avoids orphaning it while the story re-dispatches (ga-l7pp)." -q 2>/dev/null || true
+            ;;
+        esac
+      elif [ "${_DEADWORKER_OK:-0}" != "1" ]; then
+        continue   # roster untrustworthy → cannot prove worker dead → KEEP.
+      elif _session_is_live_builder "$_asg"; then
         continue   # worker actively building → not never-started (asleep adhoc = drained/dead).
       fi
     fi
