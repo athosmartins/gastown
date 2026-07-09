@@ -140,8 +140,12 @@ def _stores():
 def _rig_name_map():
     """rig name -> store path. A molecule's metadata["gc.var.rig_name"] records which rig
     its gc.var.issue target actually lives in — not necessarily the molecule's own store
-    (an HQ-minted molecule can target a rig bead). Resolve via this map; callers fall back
-    to the molecule's own store when the name is absent or unrecognized."""
+    (an HQ-minted molecule can target a rig bead). Resolve via this map. Callers use the
+    molecule's own store ONLY when rig_name is ABSENT (an own-store target). When rig_name
+    is PRESENT but unresolved here (map miss / flaky `gc rig list`), callers MUST defer —
+    leave the target unresolved so it is KEPT — and never fall back to the own store: a
+    cross-store `bd show` miss is indistinguishable from a deleted bead and would
+    false-close live demand (ga-fckx gate-FAIL follow-up)."""
     if _rig_name_map_fn is not None:
         return _rig_name_map_fn()
     out = {}
@@ -397,7 +401,28 @@ def run_cycle(now):
         rig_map = _rig_name_map()
         targets_by_store = {}
         for store, target, rig_name in molecule_refs:
-            target_store = rig_map.get(rig_name, store) if rig_name else store
+            if rig_name:
+                target_store = rig_map.get(rig_name)
+                if target_store is None:
+                    # ga-fckx gate-FAIL follow-up: rig_name is PRESENT but UNRESOLVED in the
+                    # rig map — `gc rig list` was flaky/errored (empty/partial map) or the
+                    # rig_name is unknown/renamed. We do NOT know which store the target lives
+                    # in. Falling back to the molecule's OWN store (the old
+                    # `rig_map.get(rig_name, store)`) is UNSAFE: a per-store `bd show` there
+                    # answers 'no issue found' for a target whose id lives in ANOTHER store —
+                    # structurally indistinguishable from a genuinely-deleted bead — so it maps
+                    # to _TARGET_MISSING and the molecule gets false-closed as dead demand even
+                    # though its target may be wide open in its real rig (the exact INVERSE of
+                    # the bug this janitor exists to fix). Leave the target OUT of the lookup →
+                    # its status stays unresolved → _should_close_molecule KEEPs it (ambiguous
+                    # is never orphan-eligible). A later sweep, once the rig map resolves,
+                    # re-evaluates it correctly.
+                    _log("  KEEP (deferred): molecule target %s — rig_name=%r unresolved in rig "
+                         "map (gc rig list flaky or unknown rig); not risking a cross-store "
+                         "false-missing" % (target, rig_name))
+                    continue
+            else:
+                target_store = store  # no rig_name → target lives in the molecule's own store
             targets_by_store.setdefault(target_store, set()).add(target)
         target_statuses = _target_statuses(targets_by_store)
 
@@ -620,6 +645,34 @@ def _selftest():
         _ok("T: cap=1 stopped after the first close (sling stub) and deferred the molecule to next sweep")
     else:
         _bad("T: shared cap not honored", "n=%d closed=%s" % (n, closed_ids3))
+    _rig_name_map_fn = None
+    _target_status_fn = None
+
+    print("Scenario U: molecule rig_name PRESENT but UNRESOLVED in rig map (flaky gc rig list / unknown rig) → KEEP; MUST NOT look the target up against a fallback store (ga-fckx gate-FAIL follow-up: unsafe cross-store fallback false-closes live demand)")
+    MAX_PER_SWEEP = 10
+    mol_unresolved = mkmol("mu1", "wa-livetarget", rig_name="whatsapp_automation")
+    closed_idsU = []
+    capturedU = [None]
+    _rigs_fn = lambda: ["HQ"]
+    _bd_list_open_fn = lambda store: [mol_unresolved]
+    _sessions_fn = lambda: set()
+    _bd_close_fn = lambda store, bid, reason: (closed_idsU.append(bid) or True)
+    _do_notify_fn = lambda m, p: None
+    _rig_name_map_fn = lambda: {}   # rig_name unresolved: gc rig list flaky / rig unknown
+    def _fake_status_U(targets_by_store):
+        capturedU[0] = targets_by_store
+        # Simulate what a real bd would answer if the buggy fallback queried the target
+        # against the WRONG (molecule's own) store: 'no issue found' → _TARGET_MISSING.
+        # With the fix in place this fn should never even see wa-livetarget.
+        return {tid: _TARGET_MISSING for ids in targets_by_store.values() for tid in ids}
+    _target_status_fn = _fake_status_U
+    n = run_cycle(NOW)
+    _queriedU = [tid for ids in (capturedU[0] or {}).values() for tid in ids]
+    if closed_idsU == [] and "wa-livetarget" not in _queriedU:
+        _ok("U: kept the unresolved-rig molecule and never looked its target up against a fallback store")
+    else:
+        _bad("U: unsafe cross-store fallback still present (false-close risk)",
+             "closed=%s targets_by_store=%s" % (closed_idsU, capturedU[0]))
     _rig_name_map_fn = None
     _target_status_fn = None
 
