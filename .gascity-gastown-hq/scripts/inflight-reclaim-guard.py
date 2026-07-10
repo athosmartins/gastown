@@ -142,6 +142,14 @@ _POOL_DEAD_STATES = frozenset({
 STATE_FILE = ".gc/state/inflight-reclaim-guard.json"
 GC_CITY = "/Users/athos/gt/.gascity-gastown-hq"
 
+# ga-ufr7: ground-truth Claude quota check (ga-wjlv9) — reused here (not
+# reimplemented, per Gas Town's own "don't build what already exists" rule) to
+# distinguish a THROTTLED-but-alive builder from a genuinely DEAD one. The
+# original bug's root cause: reclaims fired for "no progress" during an
+# account-wide rate-limit — workers were alive but had zero API tokens to
+# commit with, and got reclaimed as if dead.
+QUOTA_CHECK = os.path.join(GC_CITY, "scripts/claude-quota-check.sh")
+
 
 def _list_rig_stores():
     """Return list of (name, path) for non-HQ rig stores. Fail-open: [] on error.
@@ -230,6 +238,34 @@ def emit(msg):
         pass
 
 
+def account_is_rate_limited():
+    """True only on a CONFIRMED active Claude session-limit (ga-ufr7).
+
+    Delegates to claude-quota-check.sh --quiet, the ground-truth check (ga-wjlv9)
+    that scans session transcripts for Anthropic's own exhaustion event rather
+    than guessing from wall-clock time. Contract: exit 2 = LIMITED (an active
+    session-scope exhaustion event whose reset time is still in the future);
+    exit 0 = not limited; anything else (weekly-only advisory, missing script,
+    timeout, non-zero-but-not-2) is treated as NOT confirmed limited.
+
+    Fail-open by design, matching the underlying tool's own philosophy ("absence
+    of the ground-truth signal = reliable NOT limited", see its header doc): this
+    check is an ADDITIONAL veto on top of the existing reclaim rails, so a flaky
+    or missing quota script must fall back to the pre-fix behavior (proceed with
+    the normal branch/session checks) rather than inventing a new way for the
+    whole reclaim mechanism to stall. The failure mode this guards against is
+    the opposite one — reclaiming a throttled-but-alive worker — which is only
+    prevented when the check POSITIVELY confirms a live limit.
+    """
+    try:
+        r = subprocess.run([QUOTA_CHECK, "--quiet"], capture_output=True, timeout=18)
+        return r.returncode == 2
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] quota check failed (treating as NOT limited): {exc}",
+              flush=True)
+        return False
+
+
 def _has_needs_human_label(labels):
     """True if labels contain gate:needs-human (exact) OR any gate:needs-human:* variant.
 
@@ -273,7 +309,7 @@ def _is_ephemeral_pool_assignee(assignee):
 
 def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
                      reclaim_count, has_needs_human, has_dispatching_marker,
-                     min_stranding_secs=None):
+                     min_stranding_secs=None, account_rate_limited=False):
     """Compute the reclaim action for one stranded in-flight bead.
 
     Args:
@@ -286,6 +322,12 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
         min_stranding_secs:      minimum continuous stranding before action; defaults to
                                  RECLAIM_TTL (25min). Pass POOL_ZOMBIE_TTL (2h) for
                                  bare-template pool-zombie beads (ga-hkpwv).
+        account_rate_limited:    True if account_is_rate_limited() confirmed an active
+                                 Claude session-limit THIS cycle (ga-ufr7). A throttled
+                                 builder produces no commits/output through no fault of
+                                 its own — reclaiming it as "dead" is the exact root
+                                 cause this param closes. Defaults False (pre-fix
+                                 behavior unchanged when the caller doesn't pass it).
 
     Returns:
         action in {"reclaim", "escalate", "noop"}
@@ -296,6 +338,11 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
     if has_needs_human:
         return "noop"
     if has_dispatching_marker:
+        return "noop"
+    # ga-ufr7: a confirmed account-wide rate-limit means NO builder anywhere can
+    # be making progress right now — "no progress" is not evidence of death.
+    # Defer the whole decision rather than reclaim; the next cycle re-evaluates.
+    if account_rate_limited:
         return "noop"
     if has_live_session:
         return "noop"
@@ -1108,6 +1155,131 @@ def list_live_sling_source_beads(sessions, now):
     return frozenset(protected)
 
 
+def _branch_segment_matches_bead(segment, bead_id):
+    """True if a ref's final path segment identifies bead_id: exact match, or
+    bead_id followed by a separator ('-', '_', '.'). Prefix-collision guard —
+    e.g. bead 'wa-oly' must NOT match segment 'wa-oly1'.
+
+    Shared by get_branch_recent() (origin refs) and preserve_unpushed_branch()
+    (local refs, ga-ufr7) so the two branch-identification rails can never
+    silently diverge.
+    """
+    return (segment == bead_id
+            or segment.startswith(bead_id + "-")
+            or segment.startswith(bead_id + "_")
+            or segment.startswith(bead_id + "."))
+
+
+def preserve_unpushed_branch(bead_id):
+    """Push-before-reclaim safety net (ga-ufr7).
+
+    A builder that goes quiet from THROTTLING (not death) can still have real
+    committed work sitting only in a LOCAL branch inside its worktree. Once
+    do_reclaim() clears the bead's ownership, the Pilot may re-dispatch it to a
+    new builder / new worktree — nothing in this guard (or its callers) guarantees
+    the old worktree survives that. Without a durable ref, that work is one
+    `git gc --prune` away from permanent loss — the wa-ffeje incident: 6 commits,
+    1064 insertions, survived only as un-GC'd dangling git objects.
+
+    For each LOCAL branch across REPOS whose final path segment identifies
+    bead_id (via the shared _branch_segment_matches_bead() predicate) and that
+    carries a commit not already reachable from any origin ref:
+      1. Try `git push origin <sha>:refs/heads/<branch>` — recoverable under its
+         own familiar name, immediately resumable by a human or the next builder.
+      2. If that is rejected (a same-named origin branch already diverged),
+         fall back to `git push origin <sha>:refs/reclaimed/<bead_id>/<sha>` — a
+         ref whose name embeds the sha, so it can never collide and the push
+         always succeeds if the remote is reachable at all.
+
+    Best-effort / never raises: any git error is logged and the scan continues
+    to the next repo/branch. This is a SAFETY NET, not a correctness gate —
+    do_reclaim() proceeds regardless of this function's outcome. A network blip
+    must not block reclaiming a genuinely dead bead forever (that would just
+    trade one stranding failure mode for another).
+
+    Returns a list of human-readable "what was preserved" strings (possibly
+    empty — most reclaims have no local unpushed branch at all, e.g. a builder
+    that never got as far as committing).
+    """
+    preserved = []
+    for repo in REPOS:
+        # Refresh remote-tracking refs so the "already on origin?" check below
+        # isn't working off a stale fetch. Fail-safe: a fetch error here just
+        # means the later --contains check may under-detect "already safe" and
+        # attempt a redundant (harmless) push — never a reason to skip the repo.
+        try:
+            subprocess.run(
+                ["git", "-C", repo, "fetch", "origin", "--prune", "--quiet"],
+                capture_output=True, timeout=30)
+        except Exception as exc:
+            print(f"[INFLIGHT-RECLAIM] preserve-branch: fetch failed for {repo}: {exc}",
+                  flush=True)
+
+        try:
+            r = subprocess.run(
+                ["git", "-C", repo, "for-each-ref",
+                 "--format=%(refname) %(objectname)", "refs/heads/"],
+                capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                continue
+        except Exception as exc:
+            print(f"[INFLIGHT-RECLAIM] preserve-branch: local ref-list failed for {repo}: {exc}",
+                  flush=True)
+            continue
+
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            refname, sha = parts
+            branch = refname[len("refs/heads/"):]
+            segment = branch.rsplit("/", 1)[-1]
+            if not _branch_segment_matches_bead(segment, bead_id):
+                continue
+
+            # Already reachable from some origin ref (pushed earlier, or merged)?
+            try:
+                chk = subprocess.run(
+                    ["git", "-C", repo, "branch", "-r", "--contains", sha],
+                    capture_output=True, text=True, timeout=30)
+                if chk.returncode == 0 and chk.stdout.strip():
+                    continue  # already safe on origin — nothing to preserve
+            except Exception:
+                pass  # can't confirm safety → fall through and attempt the push anyway
+
+            pushed = False
+            try:
+                p = subprocess.run(
+                    ["git", "-C", repo, "push", "origin", f"{sha}:refs/heads/{branch}"],
+                    capture_output=True, text=True, timeout=30)
+                if p.returncode == 0:
+                    pushed = True
+                    preserved.append(f"{branch}@{sha[:8]} pushed to origin/{branch}")
+            except Exception as exc:
+                print(f"[INFLIGHT-RECLAIM] preserve-branch: push {branch} failed: {exc}",
+                      flush=True)
+
+            if not pushed:
+                tag_ref = f"refs/reclaimed/{bead_id}/{sha}"
+                try:
+                    p2 = subprocess.run(
+                        ["git", "-C", repo, "push", "origin", f"{sha}:{tag_ref}"],
+                        capture_output=True, text=True, timeout=30)
+                    if p2.returncode == 0:
+                        preserved.append(f"{branch}@{sha[:8]} tagged {tag_ref}")
+                    else:
+                        print(f"[INFLIGHT-RECLAIM] preserve-branch: FAILED to preserve "
+                              f"{branch}@{sha[:8]} in {repo}: {p2.stderr.strip()[:300]}",
+                              flush=True)
+                except Exception as exc:
+                    print(f"[INFLIGHT-RECLAIM] preserve-branch: tag-push {branch} failed: {exc}",
+                          flush=True)
+    return preserved
+
+
 def get_branch_recent(bead_id):
     """Return True if any remote branch whose final path segment equals <bead-id>
     (or starts with <bead-id> followed by '-'/'_'/'.') has a commit within
@@ -1171,11 +1343,7 @@ def get_branch_recent(bead_id):
                 # Final path segment of the ref (e.g. 'wa-quoy' from
                 # refs/remotes/origin/crew/wa-worker/wa-quoy).
                 segment = refname.rsplit("/", 1)[-1]
-                # Match: exact OR bead_id + separator (prefix-collision guard).
-                if not (segment == bead_id
-                        or segment.startswith(bead_id + "-")
-                        or segment.startswith(bead_id + "_")
-                        or segment.startswith(bead_id + ".")):
+                if not _branch_segment_matches_bead(segment, bead_id):
                     continue
                 try:
                     ts = float(ts_str)
@@ -1238,6 +1406,16 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     """
     new_count = reclaim_count + 1
     ok = True
+
+    # 0. ga-ufr7: push-before-reclaim safety net. A builder that went quiet from
+    #    throttling (not death) may still have committed-but-unpushed work sitting
+    #    in a local worktree branch. Preserve it durably BEFORE clearing ownership
+    #    below — nothing past this point guarantees the local worktree survives.
+    #    Best-effort: never blocks the reclaim itself on a git/network failure.
+    _preserved = preserve_unpushed_branch(bead_id)
+    if _preserved:
+        print(f"[INFLIGHT-RECLAIM] preserve-branch: {bead_id} — " + "; ".join(_preserved),
+              flush=True)
 
     # Build the bd prefix: rig-native beads route to their own store.
     _bd = ["bd", "-C", rig_root] if rig_root else ["bd"]
@@ -1334,6 +1512,8 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
                          if l in labels) or "(no in-flight label)"
     _hold_note = (f" pilot:held stamped for {_reloop_hold//60}min cooldown to prevent re-loop (reclaim {new_count-1}+)."
                   if reclaim_count >= 1 and _reloop_hold > 0 else "")
+    _preserve_note = (" Preserved unpushed work (ga-ufr7): " + "; ".join(_preserved) + "."
+                       if _preserved else "")
     try:
         subprocess.run(
             _bd + ["comment", bead_id,
@@ -1341,7 +1521,8 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
              f"no recent branch progress for {idle_min:.0f}min "
              f"(> {RECLAIM_TTL//60}min TTL). {cleared} "
              f"cleared; assignee unset; status reset to open (ga-vw26y)."
-             f"{_hold_note} "
+             f"{_hold_note}"
+             f"{_preserve_note} "
              f"Pilot will re-dispatch. (reclaim {new_count}/{MAX_RECLAIMS})"],
             capture_output=True, text=True, timeout=15)
     except Exception:
@@ -1457,6 +1638,15 @@ def run_cycle(state, escalated_alerted):
     if live_sling_owner_beads is None:
         print("[INFLIGHT-RECLAIM] sling-owner query failed — skipping cycle (safe)", flush=True)
         return len(beads), 0
+
+    # ga-ufr7: one ground-truth quota check per cycle (not per-bead — it's an
+    # account-wide, not per-builder, signal). Computed after the fail-safe
+    # early-returns above so a cycle that's skipping anyway doesn't pay for it.
+    account_rate_limited = account_is_rate_limited()
+    if account_rate_limited:
+        print("[INFLIGHT-RECLAIM] account-wide Claude rate-limit confirmed active "
+              "(claude-quota-check.sh) — deferring all reclaims this cycle (ga-ufr7)",
+              flush=True)
 
     stranded_count = 0
     active_bead_ids = set()
@@ -1579,6 +1769,7 @@ def run_cycle(state, escalated_alerted):
             has_needs_human=has_needs_human,
             has_dispatching_marker=has_dispatching_marker,
             min_stranding_secs=min_stranding_secs,
+            account_rate_limited=account_rate_limited,
         )
 
         idle_min = seconds_stranded / 60.0
@@ -2501,6 +2692,147 @@ def _selftest():
               _sl8_decision == "noop", f"got={_sl8_decision!r}")
     finally:
         subprocess.run = _orig_run_sl
+
+    # -----------------------------------------------------------------------
+    # Section 8: ga-ufr7 — push-before-reclaim + throttled-vs-dead (RL-*, PB-*)
+    #
+    # RL-*: account_is_rate_limited() delegates to claude-quota-check.sh --quiet
+    # (exit 2 = LIMITED); reclaim_decision(account_rate_limited=...) must defer
+    # (noop) a confirmed-limited cycle even when every other rail says reclaim
+    # or escalate. PB-*: preserve_unpushed_branch() must push a local branch's
+    # unpushed commit to origin under its own name, fall back to a
+    # refs/reclaimed/<bead>/<sha> tag on rejection, and touch nothing when the
+    # commit is already reachable from origin or no branch matches. All stub
+    # subprocess.run — no real git/bd calls.
+    # -----------------------------------------------------------------------
+
+    class _FakeGitResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    # --- RL-1..3: account_is_rate_limited() exit-code contract ---
+    _orig_run_rl = subprocess.run
+
+    def _stub_quota(returncode=0, raise_exc=False):
+        def _run(cmd, **kw):
+            if raise_exc:
+                raise TimeoutError("simulated quota-check timeout")
+            assert cmd[0] == QUOTA_CHECK and "--quiet" in cmd, f"unexpected cmd: {cmd}"
+            return _FakeGitResult(returncode)
+        return _run
+
+    try:
+        subprocess.run = _stub_quota(returncode=2)
+        check("RL-1: account_is_rate_limited: exit 2 → True (confirmed limited)",
+              account_is_rate_limited() is True)
+
+        subprocess.run = _stub_quota(returncode=0)
+        check("RL-2: account_is_rate_limited: exit 0 → False (not limited)",
+              account_is_rate_limited() is False)
+
+        subprocess.run = _stub_quota(raise_exc=True)
+        check("RL-3: account_is_rate_limited: script raises → False (fail-open, not a new stall)",
+              account_is_rate_limited() is False)
+    finally:
+        subprocess.run = _orig_run_rl
+
+    # --- RL-4..6: reclaim_decision() gated on account_rate_limited ---
+    check("RL-4: reclaim_decision: rate-limited + otherwise-reclaimable → noop",
+          reclaim_decision(
+              has_live_session=False, has_recent_branch=False,
+              seconds_stranded=RECLAIM_TTL + 1, reclaim_count=0,
+              has_needs_human=False, has_dispatching_marker=False,
+              account_rate_limited=True,
+          ) == "noop")
+    check("RL-5: reclaim_decision: NOT rate-limited, same conditions → reclaim (default unchanged)",
+          reclaim_decision(
+              has_live_session=False, has_recent_branch=False,
+              seconds_stranded=RECLAIM_TTL + 1, reclaim_count=0,
+              has_needs_human=False, has_dispatching_marker=False,
+              account_rate_limited=False,
+          ) == "reclaim")
+    check("RL-6: reclaim_decision: rate-limited overrides escalate too (cap already hit)",
+          reclaim_decision(
+              has_live_session=False, has_recent_branch=False,
+              seconds_stranded=RECLAIM_TTL + 1, reclaim_count=MAX_RECLAIMS,
+              has_needs_human=False, has_dispatching_marker=False,
+              account_rate_limited=True,
+          ) == "noop")
+
+    # --- PB-*: preserve_unpushed_branch() ---
+    global REPOS
+    _orig_repos = REPOS
+    _orig_run_pb = subprocess.run
+    REPOS = ["/fake/repo"]
+    _FAKE_SHA = "aaaa1111bbbb2222cccc3333dddd4444eeee5555"
+
+    def _stub_preserve(branches, contains_origin=None, own_push_ok=True, tag_push_ok=True):
+        contains_origin = contains_origin or set()
+
+        def _run(cmd, **kw):
+            if "fetch" in cmd:
+                return _FakeGitResult(0)
+            if "for-each-ref" in cmd:
+                lines = "\n".join(f"refs/heads/{b} {s}" for b, s in branches)
+                return _FakeGitResult(0, stdout=lines)
+            if "branch" in cmd and "--contains" in cmd:
+                sha = cmd[-1]
+                return _FakeGitResult(0, stdout=("origin/x\n" if sha in contains_origin else ""))
+            if "push" in cmd:
+                refspec = cmd[-1]
+                target = refspec.split(":", 1)[1]
+                if target.startswith("refs/reclaimed/"):
+                    return _FakeGitResult(0 if tag_push_ok else 1, stderr="" if tag_push_ok else "tag rejected")
+                return _FakeGitResult(0 if own_push_ok else 1, stderr="" if own_push_ok else "! [rejected] non-fast-forward")
+            return _FakeGitResult(0)
+        return _run
+
+    try:
+        # PB-1: matching local branch, not on origin, own-name push succeeds.
+        subprocess.run = _stub_preserve(
+            branches=[("fix/ga-fakebead-my-fix", _FAKE_SHA)])
+        res = preserve_unpushed_branch("ga-fakebead")
+        check("PB-1: unpushed branch, own-name push succeeds → preserved via origin push",
+              len(res) == 1 and "pushed to origin/fix/ga-fakebead-my-fix" in res[0],
+              f"got={res!r}")
+
+        # PB-2: own-name push rejected (diverged same-named branch) → falls back to tag.
+        subprocess.run = _stub_preserve(
+            branches=[("fix/ga-fakebead-my-fix", _FAKE_SHA)], own_push_ok=False, tag_push_ok=True)
+        res = preserve_unpushed_branch("ga-fakebead")
+        check("PB-2: own-name push rejected → falls back to refs/reclaimed/<bead>/<sha> tag",
+              len(res) == 1 and f"tagged refs/reclaimed/ga-fakebead/{_FAKE_SHA}" in res[0],
+              f"got={res!r}")
+
+        # PB-3: commit already reachable from an origin ref → nothing to preserve.
+        subprocess.run = _stub_preserve(
+            branches=[("fix/ga-fakebead-my-fix", _FAKE_SHA)], contains_origin={_FAKE_SHA})
+        res = preserve_unpushed_branch("ga-fakebead")
+        check("PB-3: commit already on origin → preserved list empty (nothing to do)",
+              res == [], f"got={res!r}")
+
+        # PB-4: no local branch's segment matches this bead_id → nothing to preserve.
+        subprocess.run = _stub_preserve(
+            branches=[("fix/ga-someotherbead-fix", _FAKE_SHA)])
+        res = preserve_unpushed_branch("ga-fakebead")
+        check("PB-4: no matching branch segment → preserved list empty",
+              res == [], f"got={res!r}")
+
+        # PB-5: both own-name and tag push fail → best-effort, empty result, no raise.
+        subprocess.run = _stub_preserve(
+            branches=[("fix/ga-fakebead-my-fix", _FAKE_SHA)], own_push_ok=False, tag_push_ok=False)
+        try:
+            res = preserve_unpushed_branch("ga-fakebead")
+            check("PB-5: both pushes fail → best-effort empty result, does not raise",
+                  res == [], f"got={res!r}")
+        except Exception as exc:
+            check("PB-5: both pushes fail → best-effort empty result, does not raise",
+                  False, f"raised {exc!r} instead of returning []")
+    finally:
+        subprocess.run = _orig_run_pb
+        REPOS = _orig_repos
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0
