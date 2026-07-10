@@ -41,4 +41,22 @@ canônica do dado (DB/API) a varrer a árvore do Drive; (2) envolva SEMPRE em
 `timeout` (ex.: `timeout 15 ls ...`); (3) verifique antes que o mount responde.
 Rede de segurança: o `crew-hang-detector` detecta sessões de crew com heartbeat
 congelado e dispara o shutdown-dance (kill+restart com devido processo).
+
+**Formulas graph.v2 multi-step — feche E reclame CADA step, não só o
+primeiro (ga-z1k7).** A seção nativa "Following Your Formula" diz "Steps
+are NOT materialized as individual beads" — isso é FALSO para formulas com
+`contract = "graph.v2"` (ex.: mol-digest-generate, mol-idea-to-plan,
+mol-refinery-patrol): cada step materializa como bead PRÓPRIO, encadeado
+por dependências `blocks`. Se o bead tiver `molecule_id` no metadata, use
+SEMPRE o loop `bd mol current <molecule-id>` → para cada step `[ready]`:
+`bd show <step-id>` → execute → `bd close <step-id>` → repita a partir de
+`bd mol current`. NUNCA leia todos os steps de uma vez (ex.: via
+`gc bd formula show --json`) e execute o efeito real de todos inline
+fechando só o PRIMEIRO bead que você claimou — o engine libera o(s)
+próximo(s) step(s) como ready+unassigned assim que o anterior fecha, e eles
+ficam órfãos na pool; uma sessão FUTURA pode claimá-los como trabalho
+pronto e RE-EXECUTAR, duplicando side effects (mail, bead creation, sends).
+Se crashar/reiniciar no meio de um molecule, rode `bd mol current` antes de
+redigitar qualquer trabalho — o step pode já estar feito, faltando só
+fechar o bead.
 {{ end }}
