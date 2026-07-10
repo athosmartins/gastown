@@ -9,6 +9,15 @@
   <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
   <key>StartInterval</key><integer>300</integer>
   <key>RunAtLoad</key><true/>
+  <!-- ga-9wv5: unset ProcessType defaults to Standard (per launchd.plist(5), "equivalent
+       to no ProcessType being set" — light CPU/IO throttling), which macOS DAS can defer
+       indefinitely under load/thermal pressure ("pended nondemand spawn = interval").
+       This IS the watchdog that is supposed to catch every other daemon going silent —
+       if DAS can defer it too, nothing detects the town-wide stall (confirmed live:
+       2026-07-10, DPW itself went dark 2h24m, during which 4 daemons it monitors wedged
+       undetected). Interactive removes background resource limits entirely so DAS stops
+       treating this as deferrable background work. -->
+  <key>ProcessType</key><string>Interactive</string>
   <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/daemon-presence-watchdog-launchd.out</string>
   <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/daemon-presence-watchdog-launchd.err</string>
   <key>EnvironmentVariables</key><dict>

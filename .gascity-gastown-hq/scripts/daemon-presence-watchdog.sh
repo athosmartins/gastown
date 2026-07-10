@@ -41,17 +41,32 @@ HQ="${DPW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 
 # Heartbeat-WEDGE config — "label|heartbeat-logfile|max-stale-seconds". A LOADED daemon
 # whose heartbeat log has NOT advanced past max-stale is WEDGED: loaded + "running" but
-# its sweep/loop is stuck (e.g. hung on a Dolt query). launchd will NOT restart it (it is
-# alive) and the absent/crash-loop checks miss it (it IS loaded) — so it stalls delivery
-# silently. Only daemons that emit a per-cycle heartbeat line are listed; thresholds are
-# ≈5× the cycle so a merely slow cycle never trips. A wedge → launchctl kickstart -k
-# (un-stick) + alert. Override via DPW_HEARTBEAT; a daemon NOT listed is wedge-unchecked.
+# its sweep/loop is stuck (e.g. hung on a Dolt query) OR launchd/DAS never spawned the
+# next cycle at all (ga-9wv5: DAS "pended nondemand spawn" — see script header). Either
+# way launchd will NOT restart it on its own (it is either alive-but-stuck, or simply
+# loaded-and-quiet) and the absent/crash-loop checks miss it (it IS loaded) — so it
+# stalls delivery silently. Only daemons that emit a per-cycle heartbeat line are listed;
+# thresholds are ≈5× the cycle so a merely slow cycle never trips. A wedge → launchctl
+# kickstart -k (un-stick) + alert. Override via DPW_HEARTBEAT; a daemon NOT listed is
+# wedge-unchecked.
+#
+# The heartbeat file does NOT need to be a dedicated touch-file — a script's normal
+# launchd-captured stdout (StandardOutPath, "*.out") works too, PROVIDED the script logs
+# unconditionally as its first action in main(), before any early-exit (kill-switch,
+# lock-contention, no-work). The four *-janitor/*-reconciler entries below rely on this
+# (verified: each logs before its ENABLED check can return) rather than adding a new
+# heartbeat-touch line to each script — ga-9wv5 closes the coverage gap named in the bug
+# (approved-state-reconciler + "the janitors") with a config-only change.
 DPW_HEARTBEAT="${DPW_HEARTBEAT:-com.gascity.pilot|$HQ/.gc/logs/pilot-dispatcher.log|1500
 com.gascity.inflight-reclaim-guard|$HQ/.gc/logs/inflight-reclaim-guard-launchd.out|1500
 com.gascity.context-check-dispatcher|$HQ/.gc/logs/context-check-dispatcher.log|3000
 com.gascity.quality-gate-dispatcher|$HQ/.gc/logs/quality-gate-dispatcher.heartbeat|600
 com.gascity.auto-refino-dispatcher|$HQ/.gc/logs/auto-refino-dispatcher.log|1500
-com.gascity.story-delivery|$HQ/.gc/logs/story-delivery.log|1500}"
+com.gascity.story-delivery|$HQ/.gc/logs/story-delivery.log|1500
+com.gascity.approved-state-reconciler|$HQ/.gc/logs/approved-state-reconciler.out|3000
+com.gascity.auto-rehome-janitor|$HQ/.gc/logs/auto-rehome-janitor.out|3000
+com.gascity.sling-task-janitor|$HQ/.gc/logs/sling-task-janitor.out|4500
+com.gascity.gate-marker-rehome-janitor|$HQ/.gc/logs/gate-marker-rehome-janitor.out|1600}"
 
 # ── RECYCLER — memory-bounded restart of known-leaky Python dashboards ────────
 # Knobs (override via env or the launchd plist EnvironmentVariables):
@@ -480,6 +495,11 @@ run_sweep() {
 
 # ── selftest (hermetic; no launchctl/notify side effects) ─────────────────────
 if [ "${1:-}" = "--selftest" ] || [ "${DPW_SELFTEST:-0}" = "1" ]; then
+  # Capture the REAL default DPW_HEARTBEAT (set at module load, line ~49) before any
+  # scenario below overwrites it with hermetic test values — ga-9wv5's coverage-gap
+  # scenario asserts against this snapshot, not a scenario-local override.
+  _REAL_DEFAULT_HEARTBEAT="$DPW_HEARTBEAT"
+  _REAL_DEFAULT_CRITICAL="$DPW_CRITICAL"
   PASS=0; FAIL=0
   ok()  { PASS=$((PASS+1)); echo "  ✓ $1"; }
   bad() { FAIL=$((FAIL+1)); echo "  ✗ $1"; }
@@ -842,6 +862,28 @@ GCSTUB20
   # Restore gc stub
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/gc"; chmod +x "$TMP/gc"
   DPW_CHECK_GC_PROVENANCE=1; DPW_CHECK_GT_PROVENANCE=1
+
+  echo "Scenario 22 (ga-9wv5): real default DPW_HEARTBEAT covers approved-state-reconciler + the janitors"
+  # Static assertion against the REAL default (captured before scenario 1 ran), not a
+  # scenario-local override — proves the coverage gap named in ga-9wv5 stays closed even
+  # if a future edit reorders/retypes the DPW_HEARTBEAT default string. Each label must
+  # (a) appear in DPW_HEARTBEAT with a heartbeat file + numeric threshold, and (b) also be
+  # a member of DPW_CRITICAL — a heartbeat entry for a label the sweep never iterates over
+  # is silently dead code (see run_sweep's `for lbl in $DPW_CRITICAL`).
+  for _gap_lbl in com.gascity.approved-state-reconciler com.gascity.auto-rehome-janitor \
+                  com.gascity.sling-task-janitor com.gascity.gate-marker-rehome-janitor; do
+    _gap_line="$(printf '%s\n' "$_REAL_DEFAULT_HEARTBEAT" | awk -F'|' -v l="$_gap_lbl" '$1==l{print; exit}')"
+    if [ -n "$_gap_line" ]; then
+      ok "DPW_HEARTBEAT default covers $_gap_lbl ($_gap_line)"
+    else
+      bad "DPW_HEARTBEAT default MISSING an entry for $_gap_lbl"
+    fi
+    case " $_REAL_DEFAULT_CRITICAL " in
+      *" $_gap_lbl "*) ok "$_gap_lbl is also in DPW_CRITICAL (heartbeat entry is reachable)" ;;
+      *) bad "$_gap_lbl has a heartbeat entry but is NOT in DPW_CRITICAL (dead config)" ;;
+    esac
+  done
+  unset _gap_lbl _gap_line
 
   echo ""
   echo "daemon-presence-watchdog selftest: PASS=$PASS FAIL=$FAIL"
