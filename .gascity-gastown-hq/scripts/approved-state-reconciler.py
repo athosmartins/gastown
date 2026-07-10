@@ -94,6 +94,11 @@ STARVE_MIN = int(os.environ.get("STARVE_MIN", "20"))
 # as urgent ones. Priority 0/1 keep the base STARVE_MIN (most conservative).
 STARVE_MIN_PRI2 = int(os.environ.get("STARVE_MIN_PRI2", str(STARVE_MIN * 2)))
 STARVE_MIN_PRI3 = int(os.environ.get("STARVE_MIN_PRI3", str(STARVE_MIN * 6)))
+# RECLAIM_CAP: mirrors MAX_RECLAIMS in inflight-reclaim-guard.py (scripts/
+# inflight-reclaim-guard.py:106) and _FILTER_RECLAIM_CAP in pilot-dispatcher.sh:1111.
+# No single source of truth yet (same duplication pattern as POOL_BY_RIG_BASENAME
+# below) — keep in sync by hand.
+RECLAIM_CAP = int(os.environ.get("ARC_RECLAIM_CAP", "3"))
 # FLOW_GRACE_MIN: recently-dispatched beads are assumed to be flowing.
 FLOW_GRACE_MIN = int(os.environ.get("FLOW_GRACE_MIN", "10"))
 # Per-bead cooldowns to prevent churn/spam on repeated runs.
@@ -166,10 +171,12 @@ def _load_state():
                 d.setdefault("alarmed", {})
                 d.setdefault("first_seen_approved", {})
                 d.setdefault("flagged", {})
+                d.setdefault("reclaim_exhausted", {})
                 return d
     except Exception:
         pass
-    return {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    return {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {},
+            "reclaim_exhausted": {}}
 
 
 def _save_state(state):
@@ -188,7 +195,7 @@ def _prune_state(state, now):
     cooldown re-trigger — not a safety issue. Better than unbounded memory growth.
     """
     cutoff = now - 7 * 24 * 3600
-    for key in ("routed", "alarmed", "first_seen_approved", "flagged"):
+    for key in ("routed", "alarmed", "first_seen_approved", "flagged", "reclaim_exhausted"):
         bucket = state.get(key, {})
         stale = [bid for bid, ts in bucket.items() if ts < cutoff]
         for bid in stale:
@@ -237,6 +244,22 @@ def _has_prefix(labels, prefix):
         if lab == prefix or lab.startswith(prefix + ":"):
             return True
     return False
+
+
+def _parse_reclaim_count(labels):
+    """Extract pilot:reclaim-count:N from labels. Returns 0 if absent or invalid.
+
+    Mirrors parse_reclaim_count() in inflight-reclaim-guard.py (that daemon owns
+    stamping this label; no shared constants module exists between the two — see
+    RECLAIM_CAP comment above).
+    """
+    for lab in labels:
+        if lab.startswith("pilot:reclaim-count:"):
+            try:
+                return int(lab[len("pilot:reclaim-count:"):])
+            except ValueError:
+                pass
+    return 0
 
 
 def _bead_text(bead):
@@ -639,6 +662,62 @@ def _alarm_starving(rig_root, bead, age_min, now, state):
     state.setdefault("alarmed", {})[bead_id] = now
 
 
+# ── reclaim-exhausted note (ga-ag16) ──────────────────────────────────────────
+def _alarm_reclaim_exhausted(rig_root, bead, reclaim_count, now, state):
+    """Emit a ONE-TIME 'reclaim-exhausted' note for a bead at/above RECLAIM_CAP.
+
+    Distinct from _alarm_starving: this is explicitly NOT "dispatch path failing" —
+    the pilot correctly backed off after RECLAIM_CAP failed reclaim attempts.
+    inflight-reclaim-guard already escalates (gate:needs-human + a "[POOL-ZOMBIE-
+    ESCALATED]" mail) the moment reclaim-count crosses the cap — see do_escalate()
+    in inflight-reclaim-guard.py. This function does NOT re-mail; it leaves a
+    comment + ledger entry for reconciler-side audit trail, and — unlike
+    _alarm_starving's ALARM_COOLDOWN_SEC re-fire — never repeats for the same
+    bead_id (no cooldown expiry; only pruned after 7 days like other state).
+    """
+    bead_id = bead.get("id") or bead.get("issue_id") or ""
+    if not bead_id:
+        return
+
+    if bead_id in state.get("reclaim_exhausted", {}):
+        return  # already noted once — never repeat (this is not a recurring alarm)
+
+    title = (bead.get("title") or bead.get("name") or "?")[:80]
+    _log("RECLAIM-EXHAUSTED (not dispatch-failing): %s | reclaim=%d/%d | %s" % (
+         bead_id, reclaim_count, RECLAIM_CAP, title))
+
+    if DRY_RUN:
+        _log("DRY_RUN: would note reclaim-exhausted %s (reclaim=%d)" % (bead_id, reclaim_count))
+        return  # no state update, no mutations
+
+    note = (
+        "approved-state-reconciler: reclaim-exhausted (%d/%d) — the pilot correctly "
+        "backed off after repeated failed reclaims; this is NOT a dispatch failure. "
+        "inflight-reclaim-guard should already have escalated this bead "
+        "(gate:needs-human). Needs re-route/human triage, not a re-dispatch retry."
+    ) % (reclaim_count, RECLAIM_CAP)
+    _do_comment_add(rig_root, bead_id, note)
+
+    _arc_ledger("human-touch", {
+        "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source_daemon": "approved-state-reconciler",
+        "stage": "reclaim-exhausted",
+        "bead_id": bead_id,
+        "reclaim_count": reclaim_count,
+        "rig_root": rig_root,
+    }, fail_open=True)
+
+    notify_msg = ("RECLAIM-EXHAUSTED (not dispatch-failing): bead %s reclaimed %d/%d "
+                  "times, pilot backed off — needs re-route/human, not re-dispatch" % (
+                  bead_id, reclaim_count, RECLAIM_CAP))
+    if _do_notify is not None:
+        _do_notify(notify_msg, 2)
+    else:
+        _sh([NOTIFY_BIN, "-t", "Reclaim exhausted", "-p", "2", notify_msg], timeout=10)
+
+    state.setdefault("reclaim_exhausted", {})[bead_id] = now
+
+
 # ── built-bead index ──────────────────────────────────────────────────────────
 def _gate_marker_source_beads(rig_root):
     """Set of bead ids that an OPEN quality-gate-marker in this store points at (label
@@ -805,6 +884,24 @@ def _process_store(rig_root, now, state, pilot_alive):
                  bead_id, starve_age_min))
             continue
 
+        # pilot:reclaim-count:N (ga-ag16) — bead drained at least once (worker spawned but
+        # made no branch progress) and inflight-reclaim-guard reset it to open for re-dispatch.
+        # This is NOT a dispatch failure: the reclaim-guard loop owns re-dispatch retries, and
+        # its own cap (N >= RECLAIM_CAP → gate:needs-human, escalated by the guard itself) is
+        # the real backstop — same structure as the gate:needs-fix suppression below. Below cap
+        # the pilot is actively retrying (drain-cycling, not starving); at/above cap the guard
+        # has already escalated (or will next cycle), so emit our own ONE-TIME "reclaim-exhausted"
+        # note instead of repeating "dispatch failing" every ALARM_COOLDOWN_SEC.
+        reclaim_count = _parse_reclaim_count(labels)
+        if reclaim_count >= RECLAIM_CAP:
+            _alarm_reclaim_exhausted(rig_root, bead, reclaim_count, now, state)
+            continue
+        if reclaim_count >= 1:
+            _log("  %s: no signal, daemon-age=%.0fmin, pilot:reclaim-count:%d (reclaim-guard "
+                 "owns re-dispatch; cap→escalate is the backstop) — no alarm" % (
+                 bead_id, starve_age_min, reclaim_count))
+            continue
+
         # gate:needs-fix — bead is in the autonomous gate-fix loop, NOT starving.
         # When a build FAILs the gate, the gate clears story:in-flight + assignee and
         # labels the bead gate:needs-fix (+ gate:fix-attempt:N); the Pilot then re-dispatches
@@ -927,6 +1024,12 @@ def _selftest():
       (m)       per-store bd error → that store skipped, others processed, no crash
       (n)       add-before-remove: label add fails → story:approved NOT removed
       (o)       first_seen_approved: starve alarm fires despite fresh updated_at
+      (p)       gate:needs-fix bead in gate-fix loop → no starve alarm
+      (q)       BUILT bead (open gate marker) → no starve alarm
+      (r)       pilot:reclaim-count:1 (below RECLAIM_CAP) → no starve alarm (ga-ag16)
+      (s)       pilot:reclaim-count:RECLAIM_CAP → no starve alarm; ONE reclaim-exhausted
+                note (comment + ledger + low-prio notify), NOT a mayor mail (ga-ag16)
+      (t)       reclaim-exhausted note does not repeat across cycles (ga-ag16)
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers
@@ -1322,6 +1425,60 @@ def _selftest():
         _ok("(q): built bead (open gate marker) — no starve alarm (real issue is the gate, ga-pnugy)")
     else:
         _bad("(q): built bead FALSELY alarmed as starving/dispatch-failing", "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (r): pilot:reclaim-count:1 (below RECLAIM_CAP) → no starve alarm (ga-ag16)")
+    # A bead that drained once and was reclaimed by inflight-reclaim-guard sits
+    # story:approved + unassigned with pilot:reclaim-count:1 — no pilot:held is stamped
+    # until the 2nd+ reclaim (do_reclaim only holds on reclaim_count>=1 PRIOR to bump), so
+    # without this exclusion it would FALSELY alarm "dispatch failing" during that gap.
+    _bd_approved = lambda root: [_make_bead(
+        "hq-018", labels=["story:approved", "pilot:reclaim-count:1"], age_min=0.1)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_r = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {},
+            "reclaim_exhausted": {}}
+    st_r["first_seen_approved"]["hq-018"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_r)
+    alarmed_r = any("hq-018" in subj for subj, _ in mail_calls)
+    if not alarmed_r:
+        _ok("(r): pilot:reclaim-count:1 (below cap) — no starve alarm (reclaim-guard owns re-dispatch)")
+    else:
+        _bad("(r): drain-cycling bead FALSELY alarmed as dispatch-failing", "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (s): pilot:reclaim-count:RECLAIM_CAP → no dispatch-failing mail; "
+          "ONE reclaim-exhausted note instead (ga-ag16)")
+    # Reclaim cap exhausted: the pilot correctly backed off (inflight-reclaim-guard already
+    # escalated with its own mail — see do_escalate()). The reconciler must NOT send its own
+    # "dispatch path failing" mail; at most a distinct one-time comment/ledger/notify.
+    _bd_approved = lambda root: [_make_bead(
+        "hq-019", labels=["story:approved", "pilot:reclaim-count:%d" % RECLAIM_CAP], age_min=0.1)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_s = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {},
+            "reclaim_exhausted": {}}
+    st_s["first_seen_approved"]["hq-019"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_s)
+    starve_mailed_s = any("hq-019" in subj for subj, _ in mail_calls)
+    noted_s = any(bid == "hq-019" for bid, _ in comments)
+    notified_s = any("hq-019" in msg for msg, _ in notify_calls)
+    state_set_s = "hq-019" in st_s.get("reclaim_exhausted", {})
+    if not starve_mailed_s and noted_s and notified_s and state_set_s:
+        _ok("(s): reclaim-cap-exhausted bead — no dispatch-failing mail; one reclaim-exhausted "
+            "comment+notify fired instead")
+    else:
+        _bad("(s)", "starve_mailed=%s noted=%s notified=%s state_set=%s mail_calls=%s comments=%s" % (
+             starve_mailed_s, noted_s, notified_s, state_set_s, mail_calls, comments))
+
+    print("\nScenario (t): reclaim-exhausted note does not repeat across cycles (ga-ag16)")
+    # Re-run the same reclaim-capped bead against the SAME state dict (simulating the next
+    # launchd cycle, 10min later) — the one-time note must not fire again.
+    _reset_captures()
+    run_cycle(NOW, st_s)
+    if not comments and not notify_calls and not mail_calls:
+        _ok("(t): reclaim-exhausted note fired exactly once — no repeat on next cycle")
+    else:
+        _bad("(t): reclaim-exhausted note REPEATED on second cycle",
+             "comments=%s notify_calls=%s mail_calls=%s" % (comments, notify_calls, mail_calls))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
