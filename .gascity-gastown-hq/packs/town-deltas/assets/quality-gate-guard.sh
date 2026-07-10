@@ -247,6 +247,27 @@ warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-guard] WARN: $*"; }
 echo ""
 log "=== Guard sweep start ==="
 
+# ── ga-ny4y: surface silent pre-redirect parse failures ──────────────────────
+# A bash PARSE error happens before the `exec >> "$LOG" 2>&1` redirect above
+# takes effect, so it never reaches this timestamped log — it only lands in
+# launchd's untimestamped StandardErrorPath file, where it can sit unnoticed
+# for weeks (observed: a 2026-06-23 occurrence was still sitting there,
+# undetected, on 2026-07-10). Checkpoint that file's line count each sweep;
+# if it grew, a prior invocation wrote to it — warn here (timestamped, in the
+# log operators actually watch) instead of relying on someone remembering to
+# check a second, separate, untimestamped file.
+LAUNCHD_ERR="$GC_CITY/.gc/logs/quality-gate-guard-launchd.err"
+ERR_CHECKPOINT="$GC_CITY/.gc/logs/quality-gate-guard-launchd-err.checkpoint"
+if [ -f "$LAUNCHD_ERR" ]; then
+  CUR_ERR_LINES=$(wc -l < "$LAUNCHD_ERR" 2>/dev/null | tr -d ' ')
+  PREV_ERR_LINES=$(cat "$ERR_CHECKPOINT" 2>/dev/null || echo "")
+  if [ -n "$CUR_ERR_LINES" ] && [ -n "$PREV_ERR_LINES" ] && [ "$CUR_ERR_LINES" != "$PREV_ERR_LINES" ]; then
+    TAIL_SNIPPET=$(tail -n 5 "$LAUNCHD_ERR" 2>/dev/null | tr '\n' ' ' || true)
+    warn "launchd stderr capture ($LAUNCHD_ERR) changed since last sweep (was $PREV_ERR_LINES lines, now $CUR_ERR_LINES) — a prior invocation likely hit a pre-redirect parse failure (ga-ny4y). Tail: $TAIL_SNIPPET"
+  fi
+  [ -n "$CUR_ERR_LINES" ] && echo "$CUR_ERR_LINES" > "$ERR_CHECKPOINT" 2>/dev/null || true
+fi
+
 # ── Input validation helpers ──────────────────────────────────────────────────
 
 # Validate branch: lowercase alphanumeric, hyphens, underscores, slashes, dots.
