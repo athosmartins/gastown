@@ -45,6 +45,19 @@ GATE_VERDICT_TIMEOUT_MINUTES="${VERDICT_TIMEOUT_MINUTES:-45}"
 # (verdict-timeout + margin), so only genuinely abandoned runs are caught.
 GATE_DEAD_REVIEWER_MARGIN_MINUTES="${GATE_DEAD_REVIEWER_MARGIN_MINUTES:-10}"
 GATE_ZOMBIE_AGE_MINUTES=$(( GATE_VERDICT_TIMEOUT_MINUTES + GATE_DEAD_REVIEWER_MARGIN_MINUTES ))
+# ga-jfo7: a gate-run with ZERO verdict beads never had a dispatcher-spawned
+# reviewer attached to IT — verdict beads are keyed to the DISPATCHER's own
+# separately-created gate-run id (Step 6/7), never to the guard's claim-time
+# tracking bead. So this bead is either (a) the guard's own tracking bead with
+# its companion marker still healthily queued/claimed/dispatching, or (b) a
+# dispatcher run that died before ever reaching Step 7. In BOTH cases there is
+# NO real review in flight to wait on, so GATE_ZOMBIE_AGE_MINUTES (~55m,
+# calibrated for a genuine review that legitimately runs up to verdict-timeout)
+# is the wrong gate — it wastes ~55m before this bead is even looked at, then
+# closes it with a "no live reviewer — dispatcher abandoned it" message that is
+# actively misleading when nothing was ever dispatched (e.g. Dolt-hot headroom
+# defer, ga-cw4pm — the marker is correctly still queued the whole time).
+GATE_ZERO_VERDICT_GRACE_MINUTES="${GATE_ZERO_VERDICT_GRACE_MINUTES:-15}"
 
 # ── Pure decision functions (loaded in GATE_GUARD_LIB_ONLY=1 mode by tests/dispatcher) ──
 
@@ -136,6 +149,67 @@ reconcile_gaterun_action() {
   fi
   [ "$age_min" -le "$ttl_min" ] && { echo "skip"; return; }
   echo "abort:age"
+}
+
+# reconcile_zero_verdict_run_action <age_min> <grace_min> <marker_status>
+# Pure decision (ga-jfo7): what to do with a gate-status:running gate-run that
+# has ZERO verdict beads — it never had a dispatcher-spawned reviewer attached
+# to ITS id (see GATE_ZERO_VERDICT_GRACE_MINUTES above for why). Only called
+# when the companion marker is still active (queued/claimed/dispatching) — a
+# terminal/gone marker is already handled by reconcile_gaterun_action's
+# higher-priority supersede:marker rule.
+#
+# CONTRACT (gate-feedback, ga-jfo7 attempt 1): age_min MUST be the MARKER's own
+# time-in-current-state (its updated_at — mirrors Vector A's T_AGE for the same
+# claimed/dispatching states), NEVER the guard's claim-time gate-run tracking
+# bead's age. The tracking bead is stamped once at Step 7 (marker enters
+# gate-status:queued) and never touched again; markers routinely sit queued for
+# hours behind the backlog, so that age inherits the FULL backlog wait and
+# blows past grace_min before a live dispatcher has done anything — firing
+# supersede:requeue-marker against an actively-processing dispatch. Returns:
+#
+#   skip                       — younger than the grace window; a brand-new
+#                                 claim/dispatch handoff needs a moment to land
+#   supersede:still-queued     — marker is STILL gate-status:queued: nothing is
+#                                 stuck, the dispatcher simply hasn't reached it
+#                                 yet (backlog or Dolt-hot headroom defer,
+#                                 ga-cw4pm) — close this orphan bookkeeping bead
+#                                 quietly, the marker needs no correction
+#   supersede:requeue-marker   — marker is claimed/dispatching: something WAS
+#                                 actively working it and died before creating
+#                                 any verdict bead (dispatcher crashed between
+#                                 claiming the marker and its own Step 6/7).
+#                                 Genuinely stuck — close the run AND re-queue
+#                                 the marker so a fresh sweep retries it
+#   skip                       — unrecognized/empty marker_status: fail-safe,
+#                                 never guess
+reconcile_zero_verdict_run_action() {
+  local age_min="$1" grace_min="$2" marker_status="$3"
+  [ "$age_min" -le "$grace_min" ] && { echo "skip"; return; }
+  case "$marker_status" in
+    queued)              echo "supersede:still-queued" ;;
+    claimed|dispatching) echo "supersede:requeue-marker" ;;
+    *)                   echo "skip" ;;
+  esac
+}
+
+# verdict_count_from_query <rc> <stdout> — pure companion to
+# verdict_bead_count_for_run (ga-jfo7, gate-feedback attempt 2). Maps a `bd list`
+# OUTCOME to a verdict-bead count, or "unknown" when the count cannot be trusted.
+# THE POINT: a FAILED query (rc!=0 — Dolt timeout/contention) must NEVER be reported
+# as a confirmed 0. Zero verdict beads is the exact signature of a reviewer-AWOL run,
+# so a false 0 fires supersede:requeue-marker against a HEALTHY run — and Dolt-hot is
+# precisely when the query fails AND when real AWOLs happen, making the conflation
+# maximally dangerous. The prior `bd ... || echo "[]"` collapsed every nonzero exit to
+# an empty array => length 0. "unknown" is non-numeric on purpose: the caller's
+# ''|*[!0-9]* guard converts it to a fail-safe skip. Genuine confirmed-empty
+# (rc0 + "[]") still returns "0" so real AWOL recovery keeps working.
+verdict_count_from_query() {
+  local rc="$1" out="$2" n
+  [ "$rc" -ne 0 ] && { echo "unknown"; return; }          # query failed → never a confirmed 0
+  n=$(printf '%s\n' "$out" | jq 'length' 2>/dev/null)
+  case "$n" in ''|*[!0-9]*) echo "unknown"; return ;; esac # empty/unparseable body → unknown, not 0
+  echo "$n"
 }
 
 # dedup_gaterun_action <group_count> <is_newest: 0|1>
@@ -464,6 +538,28 @@ reviewers_alive_for_run() {
   echo 0
 }
 
+# verdict_bead_count_for_run <gate_run_id> — I/O helper (ga-jfo7).
+# Total (open+closed) verdict beads ever created for this gate-run id. 0 means
+# no dispatcher-spawned reviewer was ever attached to THIS bead's id (see
+# GATE_ZERO_VERDICT_GRACE_MINUTES above). Cheap: same query shape as
+# reviewers_alive_for_run, just a bare count — no session-snapshot lookup
+# needed to answer "did dispatch even begin for this run".
+verdict_bead_count_for_run() {
+  local gr_id="$1" vbs rc
+  [ -z "$gr_id" ] && { echo 0; return; }
+  # Capture bd's exit status WITHOUT masking it (the old `|| echo "[]"` conflated a
+  # failed query with 0 verdicts — ga-jfo7 attempt 2). The `if` keeps `set -euo
+  # pipefail` from aborting on a nonzero bd exit; verdict_count_from_query then maps
+  # rc!=0 to "unknown" so the caller fail-safes instead of superseding a healthy run.
+  if vbs=$(bd -C "$GC_CITY" list --json --all \
+      -l type:quality-gate-verdict -l "gate-run:$gr_id" 2>/dev/null); then
+    rc=0
+  else
+    rc=$?
+  fi
+  verdict_count_from_query "$rc" "$vbs"
+}
+
 # GATE_RUNS_JSON / GATE_RUN_COUNT: already fetched once in the shared prelude
 # above Step 0 (ga-cgynn) — reused here unchanged so Vector A's companion-
 # liveness check and Vector B see the identical snapshot instead of two
@@ -532,22 +628,70 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
     # parse_marker_id extracts the marker_id: field written by the guard at Step 6.
     COMPANION_MARKER_ID=$(parse_marker_id "$GR_DESC")
     MARKER_ACTIVE=0
+    MARKER_AGE="$GR_AGE"   # fallback only — overwritten below whenever the marker itself is readable
     if [ -n "$COMPANION_MARKER_ID" ]; then
       MARKER_JSON=$(bd -C "$GC_CITY" show "$COMPANION_MARKER_ID" --json 2>/dev/null || echo "")
       if [ -n "$MARKER_JSON" ]; then
         MARKER_LABELS=$(printf '%s\n' "$MARKER_JSON" \
           | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' \
           2>/dev/null || echo "")
+        # ga-jfo7 gate-feedback (attempt 1): GR_AGE is the GUARD's own claim-time
+        # tracking bead, stamped once at Step 7 the instant the marker first goes
+        # gate-status:queued — never touched again for the rest of this run's life.
+        # Markers routinely sit queued for hours behind the single-threaded backlog
+        # (Step 5b above), so by the time one is actually claimed/dispatched, GR_AGE
+        # has usually ALREADY blown past GATE_ZERO_VERDICT_GRACE_MINUTES from queue
+        # wait alone — with no dispatcher activity involved. The marker's OWN
+        # updated_at is refreshed at each real state transition (claimed at Step
+        # ~961, dispatching by the dispatcher) — the same T_AGE signal Vector A
+        # already uses for these exact states (Step 0 above) — so it measures time
+        # in the CURRENT state instead of time-since-queued.
+        MARKER_UPDATED=$(printf '%s\n' "$MARKER_JSON" \
+          | jq -r 'if type=="array" then .[0] else . end | .updated_at // .created_at // ""' \
+          2>/dev/null || echo "")
+        [ -n "$MARKER_UPDATED" ] && MARKER_AGE=$(age_minutes_of "$MARKER_UPDATED" "$NOW_EPOCH")
         printf '%s\n' "$MARKER_LABELS" | grep -qE "gate-status:(queued|claimed|dispatching)" \
           && MARKER_ACTIVE=1 || true
         printf '%s\n' "$MARKER_LABELS" | grep -qE "gate-status:" || MARKER_ACTIVE=1
       fi
     fi
 
+    # ── ga-jfo7: zero-verdict-bead early check ──────────────────────────────
+    # Reused below for logging even when this branch doesn't fire the action.
+    MARKER_STATUS=$(printf '%s\n' "$MARKER_LABELS" \
+      | grep -oE "gate-status:[a-z-]+" | head -1 | sed 's/^gate-status://' || true)
+    if [ "$MARKER_ACTIVE" = "1" ]; then
+      ZV_TOTAL=$(verdict_bead_count_for_run "$GR_ID")
+      case "$ZV_TOTAL" in ''|*[!0-9]*) ZV_TOTAL=1 ;; esac  # unreadable → fail-safe, defer to the existing path below
+      if [ "$ZV_TOTAL" = "0" ]; then
+        ZV_ACTION=$(reconcile_zero_verdict_run_action "$MARKER_AGE" "$GATE_ZERO_VERDICT_GRACE_MINUTES" "$MARKER_STATUS")
+        case "$ZV_ACTION" in
+          supersede:still-queued)
+            log "  Vector B (ga-jfo7): closing orphan gate-run $GR_ID (marker age=${MARKER_AGE}m, 0 verdict beads, marker $COMPANION_MARKER_ID still queued — healthy backlog/Dolt-hot defer, nothing stuck)."
+            set_gate_status "$GR_ID" "superseded"
+            bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-jfo7): orphan claim-time tracking bead closed — 0 verdict beads (no reviewer was ever attached to THIS bead's id) and companion marker $COMPANION_MARKER_ID is still healthily queued. Self-healed by guard." 2>/dev/null || true
+            bd -C "$GC_CITY" close "$GR_ID" -r "gate-run superseded (terminal) — 0-verdict orphan tracking bead, marker still queued. Closed by guard (ga-jfo7)." 2>/dev/null || true
+            continue
+            ;;
+          supersede:requeue-marker)
+            warn "Vector B (ga-jfo7): gate-run $GR_ID stuck (gate-run age=${GR_AGE}m, marker-state age=${MARKER_AGE}m, 0 verdict beads, marker $COMPANION_MARKER_ID stranded at gate-status:${MARKER_STATUS} — dispatcher died before ever creating its own run). Closing + re-queuing marker."
+            set_gate_status "$GR_ID" "superseded"
+            bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-jfo7): reviewer-AWOL — 0 verdict beads were ever created and marker was stranded at gate-status:${MARKER_STATUS} (dispatcher died before Step 6/7). Closing this run and re-queuing the marker for a fresh dispatcher attempt. Self-healed by guard." 2>/dev/null || true
+            bd -C "$GC_CITY" close "$GR_ID" -r "gate-run superseded (terminal) — reviewer-AWOL, 0 verdict beads, marker re-queued. Closed by guard (ga-jfo7)." 2>/dev/null || true
+            set_gate_status "$COMPANION_MARKER_ID" "queued"
+            bd -C "$GC_CITY" comment "$COMPANION_MARKER_ID" "Vector B (ga-jfo7): re-queued — the prior gate-run attempt died with 0 verdict beads ever created (reviewer-AWOL). A fresh dispatcher sweep will retry this branch." 2>/dev/null || true
+            continue
+            ;;
+        esac
+      fi
+    fi
+
     # ── Reviewer-liveness (ga-o57gn): computed ONLY when it can change the
     # outcome — the marker still looks active AND the run is already past
     # verdict-timeout. This bounds the extra bd/gc round-trip to genuine
-    # zombie candidates and never touches young/in-flight runs.
+    # zombie candidates and never touches young/in-flight runs. (Only reached
+    # here when the run has >=1 verdict bead — the ga-jfo7 block above already
+    # handled and `continue`d past the 0-verdict-bead case.)
     REVIEWERS_ALIVE=1
     if [ "$MARKER_ACTIVE" = "1" ] && [ "$GR_AGE" -gt "$GATE_ZOMBIE_AGE_MINUTES" ]; then
       REVIEWERS_ALIVE=$(reviewers_alive_for_run "$GR_ID")
