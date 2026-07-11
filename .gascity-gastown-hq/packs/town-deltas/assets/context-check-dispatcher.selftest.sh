@@ -539,6 +539,30 @@ else
   bad "ga-l5ud0: upgrade path broken — exec:auto→exec:manual upgrade is blocked (should only block downgrade)"
 fi
 
+# context_check_skip_reason (wa-9t2ty): dep-BLOCKED beads must be skipped from
+# ctx:ready (re)marking, so a refiner's manual block (remove ctx:ready + add a
+# blocked-by dep) is not undone every sweep. Also covers built + kill-switches.
+if [ "$(context_check_skip_reason wa-X '' wa-X 1 1)" = "blocked" ]; then
+  ok "skip_reason: dep-blocked bead → 'blocked' (no ctx:ready re-mark)"
+else
+  bad "skip_reason: dep-blocked bead not skipped (blocked bead would re-enter ctx:ready)"
+fi
+if [ "$(context_check_skip_reason wa-X wa-X '' 1 1)" = "built" ]; then
+  ok "skip_reason: built bead → 'built'"
+else
+  bad "skip_reason: built bead not skipped"
+fi
+if [ -z "$(context_check_skip_reason wa-X wa-Y wa-Z 1 1)" ]; then
+  ok "skip_reason: clean bead (in neither set) → no skip"
+else
+  bad "skip_reason: clean bead wrongly skipped"
+fi
+if [ -z "$(context_check_skip_reason wa-X '' wa-X 1 0)" ]; then
+  ok "skip_reason: EXCLUDE_BLOCKED=0 kill-switch → no skip"
+else
+  bad "skip_reason: blocked kill-switch ignored"
+fi
+
 echo ""
 echo "context-check-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

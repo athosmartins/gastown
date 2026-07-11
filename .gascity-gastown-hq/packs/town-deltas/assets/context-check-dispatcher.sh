@@ -229,6 +229,31 @@ context_check_is_candidate() {
   echo "yes"
 }
 
+# context_check_skip_reason <id> <built_ids> <blocked_ids> [ex_built=1] [ex_blocked=1]
+#   — emit "built" | "blocked" | "" (empty = do not skip). Pure (no I/O).
+#   Excludes a candidate from ctx:* (re)classification when it is:
+#     - BUILT: a crew branch already exists (built_ids) — coded is not ready-to-code.
+#     - BLOCKED: it has an active blocking dependency (blocked_ids) — a blocked
+#       bead is not ready to code, it waits on its blocker. Without this the
+#       classifier re-marks a manually-blocked bead ctx:ready EVERY sweep, so a
+#       refiner's block (remove ctx:ready + add a blocked-by dep) is undone within
+#       one cycle. Observed on wa-9t2ty: ctx:ready re-added 8min after digo removed
+#       it + added blocked-by wa-10srb (03:03Z -> 03:11Z). built_ids/blocked_ids
+#       are newline-separated id sets fetched once per store; each exclusion is
+#       env-gated (ex_built/ex_blocked=0 disables) and fail-open (empty set = no skip).
+context_check_skip_reason() {
+  local id="$1" built_ids="$2" blocked_ids="$3" ex_built="${4:-1}" ex_blocked="${5:-1}"
+  if [ "$ex_built" = "1" ] && [ -n "$built_ids" ] \
+     && printf '%s\n' "$built_ids" | grep -qx "$id" 2>/dev/null; then
+    echo "built"; return
+  fi
+  if [ "$ex_blocked" = "1" ] && [ -n "$blocked_ids" ] \
+     && printf '%s\n' "$blocked_ids" | grep -qx "$id" 2>/dev/null; then
+    echo "blocked"; return
+  fi
+  echo ""
+}
+
 # context_check_has_verifiable_signal <text> — emit "yes" iff the description
 #   carries a HOW-TO-VERIFY / concrete-artifact signal: an acceptance-criteria
 #   marker, a checklist, a named file/path/command, an expected/observable
@@ -581,6 +606,16 @@ for CC_STORE in $CONTEXT_CHECK_STORES; do
   # Test seam CONTEXT_CHECK_TEST_BUILT_IDS; kill-switch CONTEXT_CHECK_EXCLUDE_BUILT=0. (2026-06-22)
   CC_BUILT_IDS="${CONTEXT_CHECK_TEST_BUILT_IDS-$(git -C "$CC_STORE" for-each-ref --format='%(refname)' 2>/dev/null | grep -oE 'crew/[^/]+/[^/]+$' | sed -E 's@crew/[^/]+/@@' | sort -u)}"
 
+  # Dep-BLOCKED bead-ids in this store (wa-9t2ty fix): a bead with an active
+  # blocking dependency is NOT ready-to-code — it must not (re)enter ctx:ready.
+  # Without this, the classifier re-marks a manually-blocked bead ctx:ready every
+  # sweep, undoing a refiner's block within one cycle (digo removed ctx:ready +
+  # added blocked-by wa-10srb at 03:03Z; classifier re-added ctx:ready at 03:11Z).
+  # `bd_ blocked` honors $CC_STORE. One query per store; O(1) membership in the loop.
+  # Test seam CONTEXT_CHECK_TEST_BLOCKED_IDS; kill-switch CONTEXT_CHECK_EXCLUDE_BLOCKED=0.
+  # FAIL-OPEN (query fails → empty set → no exclusion). (2026-07-11)
+  CC_BLOCKED_IDS="${CONTEXT_CHECK_TEST_BLOCKED_IDS-$(bd_ blocked --json 2>/dev/null | jq -r '.[]?.id // empty' 2>/dev/null | sort -u)}"
+
 # Iterate oldest-first (FIFO) so the backlog drains in arrival order.
 while IFS= read -r row; do
   [ -z "$row" ] && continue
@@ -588,12 +623,17 @@ while IFS= read -r row; do
 
   c_id=$(echo "$row" | jq -r '.id // empty')
   [ -z "$c_id" ] && continue
-  # Skip beads already CODED (a crew branch exists) — coded ≠ ready-to-code. Without this, the
-  # classifier re-marks a built-but-still-open bead ctx:ready every sweep and it re-appears in
-  # the painel's Aprovadas. FAIL-OPEN, env-gated (CONTEXT_CHECK_EXCLUDE_BUILT=0 disables).
-  if [ "${CONTEXT_CHECK_EXCLUDE_BUILT:-1}" = "1" ] && [ -n "$CC_BUILT_IDS" ] \
-     && printf '%s\n' "$CC_BUILT_IDS" | grep -qx "$c_id" 2>/dev/null; then
+  # Skip beads already CODED (a crew branch exists) OR dep-BLOCKED (active blocking
+  # dependency) — neither is ready-to-code, and re-marking them ctx:ready re-inflates
+  # the painel's Aprovadas / undoes a refiner's manual block every sweep. Pure
+  # decision; FAIL-OPEN, env-gated (CONTEXT_CHECK_EXCLUDE_BUILT/BLOCKED=0 disables each).
+  c_skip=$(context_check_skip_reason "$c_id" "$CC_BUILT_IDS" "$CC_BLOCKED_IDS" \
+             "${CONTEXT_CHECK_EXCLUDE_BUILT:-1}" "${CONTEXT_CHECK_EXCLUDE_BLOCKED:-1}")
+  if [ "$c_skip" = "built" ]; then
     log "  $c_id: skip — already built (crew branch exists), not ready-to-code"
+    continue
+  elif [ "$c_skip" = "blocked" ]; then
+    log "  $c_id: skip — has an active blocking dependency, not ready-to-code (wa-9t2ty)"
     continue
   fi
   c_type=$(echo "$row" | jq -r '.issue_type // .type // "task"')
