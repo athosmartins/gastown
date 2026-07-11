@@ -17,6 +17,14 @@
 # a live assignee) is NEVER touched — that is the Pilot's owner-grace / never-started domain.
 # FAIL-OPEN: any bd/jq error skips that bead; the sweep never aborts. Idempotent. Knobs:
 # LCJ_STORES, LCJ_DRY_RUN=1 (report only), LCJ_ENABLED=0 (off). Test seam: LCJ_BD.
+#
+# ga-ibz0 (2026-07-11): R3/R7 additionally exclude any bead with an active/pending gate
+# marker (gate-status:ready|dispatching|queued|claimed) — see _gate_active_beads below.
+# quality-gate-guard.sh silently detaches a bead's assignee for the FULL gate duration
+# (no bd comment), and a marker can sit queued for a long time; without this exclusion R3
+# reopens such a bead the instant it crosses the 30min staleness threshold — a SILENT
+# status/assignee revert on a bead that is still actively/pending gated (confirmed live on
+# wa-bkjy7 2026-07-11, and via quality-gate-guard.log on ga-ibz0's original wa-ntakm/wa-2mxsb).
 set -uo pipefail
 
 LCJ_STORES="${LCJ_STORES:-/Users/athos/gt/.gascity-gastown-hq /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers}"
@@ -75,12 +83,80 @@ _ids() {    # store + list-args → bead ids (one per line), jq-filtered
   "$BD" -C "$1" "${@:2}" --json -n 0 2>/dev/null | jq -r "$JQ" 2>/dev/null
 }
 
+# ── Gate-active protection (ga-ibz0 / wa-bkjy7, 2026-07-11) ──────────────────
+# quality-gate-guard.sh detaches a bead's assignee the INSTANT /gate-done is
+# submitted (Step 5b, ga-e7zk7/gt-gwng6) — silently, no bd comment, status left
+# in_progress — on the reasoning that inflight-reclaim-guard.py already excludes
+# any gate-active bead from reclaim. True for THAT guard (it queries gate
+# markers directly), but R3/R7 below had no equivalent check: a marker can sit
+# QUEUED for a long time (quality-gate-guard.sh's own comment: "hours behind
+# the single-threaded backlog"), so R3's 30min in_progress-stale-no-assignee
+# sweep can fire on a bead that is still actively/pending gated — flipping
+# status=open with ZERO comment and ZERO reclaim-count interaction. Confirmed
+# LIVE on wa-bkjy7: R3 fired 18:42:28Z, four minutes before the dispatcher even
+# claimed the still-queued marker (gate passed clean nine minutes later
+# regardless — the danger is the open+unassigned WINDOW, not gate breakage: any
+# pool worker/dog querying for ready work during that window sees a false
+# vacancy — exactly ga-ibz0's "completed+gated bead → open/assignee:null"
+# report, confirmed separately via quality-gate-guard.log on both of its
+# original beads, wa-ntakm and wa-2mxsb).
+#
+# Mirrors inflight-reclaim-guard.py's list_gate_active_source_beads() (ga-cxzby
+# "ready" inclusion + ga-lrglm sling back-reference), ported to bash/jq. Gate
+# markers always live in the HQ store regardless of which store the source
+# bead is native to (mirrors quality-gate-guard.sh's own -C "$GC_CITY" writes).
+#
+# FAIL-SAFE (deliberately stricter than this file's own FAIL-OPEN mutation
+# contract, see file header): a query FAILURE is NOT the same as "zero active
+# markers" — conflating them would silently drop gate protection exactly when
+# Dolt is under the contention that makes false reclaims most likely (the same
+# guard-bug class already fixed twice elsewhere, ga-ap7od/ga-jfo7). On failure
+# this returns a sentinel and R3/R7 skip their mutations entirely for the
+# sweep rather than proceeding as if nothing were gated.
+LCJ_GATE_CITY="${LCJ_GATE_CITY:-/Users/athos/gt/.gascity-gastown-hq}"
+_GATE_UNKNOWN_SENTINEL="__GATE_ACTIVE_UNKNOWN__"
+_gate_active_beads() {
+  local lbl raw ids="" resolved
+  for lbl in gate-status:ready gate-status:dispatching gate-status:queued gate-status:claimed; do
+    raw=$("$BD" -C "$LCJ_GATE_CITY" list --label type:quality-gate-marker --label "$lbl" --json -n 0 2>/dev/null)
+    if [ $? -ne 0 ]; then
+      printf '%s' "$_GATE_UNKNOWN_SENTINEL"
+      return 0
+    fi
+    [ -z "$raw" ] && continue
+    ids="$ids
+$(printf '%s' "$raw" | jq -r '.[]?.labels[]? | select(startswith("source-bead:")) | ltrimstr("source-bead:")' 2>/dev/null)"
+  done
+  ids=$(printf '%s\n' "$ids" | awk 'NF && !seen[$0]++')
+  # ga-lrglm parity: a bug/story dispatched through the standard sling-task
+  # wrapper ("fix bug <ID>: ..." / "build story <ID>: ...") has its gate marker
+  # keyed on the SLING bead's id, not the original's — resolve the original
+  # too. Best-effort: a lookup failure here keeps the directly-active set as-is
+  # (never widens the fail-safe contract above — that only applies to the
+  # primary marker queries).
+  if [ -n "$ids" ]; then
+    resolved=$("$BD" -C "$LCJ_GATE_CITY" show $ids --json 2>/dev/null)
+    if [ $? -eq 0 ] && [ -n "$resolved" ]; then
+      ids="$ids
+$(printf '%s' "$resolved" | jq -r '
+          (if type=="array" then . else [.] end)[]
+          | (.title // "")
+          | capture("^(?:fix bug|build story)\\s+(?<sid>\\S+):")? | .sid' 2>/dev/null)"
+      ids=$(printf '%s\n' "$ids" | awk 'NF && !seen[$0]++')
+    fi
+  fi
+  printf ' %s ' "$(printf '%s' "$ids" | tr '\n' ' ')"
+}
+
 run_sweep() {
   if [ "$LCJ_ENABLED" != "1" ]; then log "disabled (LCJ_ENABLED!=1)"; return 0; fi
   # imp10: sweep-level mutual exclusion — only one janitor sweep at a time.
   mkdir -p "$LIFECYCLE_LOCK_DIR" 2>/dev/null || true
   exec 9>"$LIFECYCLE_SWEEP_LOCK" && flock -n 9 2>/dev/null || { log "sweep: concurrent sweep in progress (flock) — skipping"; return 0; }
   local store id n=0 lbl
+  # ga-ibz0: computed ONCE per sweep (same marker set regardless of which
+  # store's beads R3/R7 are currently walking) — see _gate_active_beads above.
+  local _gate_active; _gate_active=$(_gate_active_beads)
   for store in $LCJ_STORES; do
     [ -d "$store" ] || continue
 
@@ -123,6 +199,10 @@ run_sweep() {
                        | select(((( .updated_at // .created_at // "") | fromdateiso8601?) // 9999999999) < $cut)
                        | .id' 2>/dev/null); do
       [ -n "$id" ] || continue
+      case "$_gate_active" in
+        *"$_GATE_UNKNOWN_SENTINEL"*) log "R3 skip-gate-unknown: $id — gate-active query failed this sweep, treating as protected (fail-safe, ga-ibz0)"; continue ;;
+        *" $id "*) log "R3 skip-gate-active: $id ($(basename "$store")) — active/pending gate marker, protected (ga-ibz0)"; continue ;;
+      esac
       _bead_locked "$id" && { log "R3 skip-locked: $id — advisory lock active (live build)"; continue; }
       _open "$store" "$id"; _strip "$store" "$id" pilot:dispatched
       log "R3 in_progress-no-worker (stale >${R3_GRACE_MIN}m): $id ($(basename "$store")) — set status=open"; n=$((n+1))
@@ -210,6 +290,10 @@ run_sweep() {
                     | jq -r '.[] | select([.labels[]?] | any(test("^story:epic$|^story:unrefined$|^story:needs-approval$|^story:refino-|^story:refinement-in-progress$|^refino:|^auto-refino:|^gate:needs-human(:.*)?$")) ) | .id' 2>/dev/null)
     for id in $non_imp_beads; do
       [ -n "$id" ] || continue
+      case "$_gate_active" in
+        *"$_GATE_UNKNOWN_SENTINEL"*) log "R7 skip-gate-unknown: $id — gate-active query failed this sweep, treating as protected (fail-safe, ga-ibz0)"; continue ;;
+        *" $id "*) log "R7 skip-gate-active: $id ($(basename "$store")) — active/pending gate marker, protected (ga-ibz0)"; continue ;;
+      esac
       _bead_locked "$id" && { log "R7 skip-locked: $id — advisory lock active"; continue; }
 
       local bead_json; bead_json=$("$BD" -C "$store" show "$id" --json 2>/dev/null)
@@ -359,7 +443,7 @@ case "\$a" in
   *"list -l story:in-flight --status closed"*)  echo '[{"id":"cl-1"},{"id":"cl-2"}]' ;;
   *"list -l story:approved --status closed"*)   echo '[{"id":"ca-1"},{"id":"ca-cancel","labels":["story:cancelled","story:approved"]}]' ;;
   *"list -l story:in-flight --status blocked"*) echo '[{"id":"bl-1"}]' ;;
-  *"list --status in_progress"*)                echo '[{"id":"ip-noasg","assignee":"","updated_at":"2020-01-01T00:00:00Z"},{"id":"ip-fresh","assignee":"","updated_at":"'"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"'"},{"id":"ip-asg","assignee":"mila-wa"}]' ;;
+  *"list --status in_progress"*)                echo '[{"id":"ip-noasg","assignee":"","updated_at":"2020-01-01T00:00:00Z"},{"id":"ip-fresh","assignee":"","updated_at":"'"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"'"},{"id":"ip-asg","assignee":"mila-wa"},{"id":"ip-gate-active","assignee":"","updated_at":"2020-01-01T00:00:00Z"}]' ;;
   *"list -l story:approved --status open"*)     echo '[{"id":"r4-asg","assignee":"mila-wa","labels":["story:approved"]},{"id":"r4-human","assignee":"mila-wa","labels":["story:approved","gate:needs-human:foo"]},{"id":"r4-human-bare","assignee":"mila-wa","labels":["story:approved","gate:needs-human"]}]' ;;
   *"list -l ctx:ready --status open"*)          echo '[]' ;;
   *"list -l ctx:ready --status closed"*)        echo '[{"id":"r5","labels":["ctx:ready"]},{"id":"r5-locked","labels":["ctx:ready"]},{"id":"r5-cancel","labels":["ctx:ready","story:cancelled"]}]' ;;
@@ -369,7 +453,7 @@ case "\$a" in
   *"show r6-exp"*) echo '[{"id":"r6-exp","labels":["pilot:held","pilot:held-until:1000000"]}]' ;;
   *"show r6-noexp"*) echo '[{"id":"r6-noexp","labels":["pilot:held"]}]' ;;
   # R7 (wa-muesb): historical recurrences + one bead per exclusion label + a valid control
-  *"list --all"*)                               echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}},{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human-bare","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"list --all"*)                               echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}},{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human-bare","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-gate-protect","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"r7-original-target","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show wa-o4kuh"*)                             echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}}]' ;;
   *"show wa-06yog"*)                             echo '[{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show wa-8yw4i.1"*)                           echo '[{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}}]' ;;
@@ -386,6 +470,28 @@ case "\$a" in
   *"list -t molecule --metadata-field gc.var.issue=wa-8yw4i.1"*) echo '[{"id":"mol-8yw4i","status":"open"}]' ;;
   *"list --parent mol-8yw4i"*)                   echo '[{"id":"step-8yw4i","status":"open"}]' ;;
   *"list --status open,in_progress"*)            echo '[{"id":"sling-wa-06yog","title":"sling-wa-06yog","status":"open","issue_type":"convoy"},{"id":"sling-8yw4i","title":"fix wa-8yw4i.1","status":"open","issue_type":"convoy"},{"id":"sling-8yw4iX1","title":"fix wa-8yw4iX1","status":"open","issue_type":"convoy"},{"id":"dep-only-wrap","title":"tracks wa-06yog work","status":"open","issue_type":"convoy","dependencies":[{"depends_on_id":"wa-06yog","type":"tracks"}]},{"id":"real-tracker-bug","title":"investigate related issue","status":"open","issue_type":"bug","dependencies":[{"depends_on_id":"wa-06yog","type":"tracks"}]},{"id":"real-title-collision","title":"fix wa-06yog","status":"open","issue_type":"bug"}]' ;;
+  # Gate-active fixtures (ga-ibz0): gm-r3/gm-sling under gate-status:ready, gm-r7 under
+  # gate-status:queued. LCJ_TEST_GATE_FAIL toggles a simulated query failure (fail-safe test).
+  *"list --label type:quality-gate-marker --label gate-status:ready"*)
+    [ "\${LCJ_TEST_GATE_FAIL:-0}" = "1" ] && exit 1
+    echo '[{"id":"gm-r3","labels":["type:quality-gate-marker","gate-status:ready","source-bead:ip-gate-active"]},{"id":"gm-sling","labels":["type:quality-gate-marker","gate-status:ready","source-bead:sling-gate-src"]}]' ;;
+  *"list --label type:quality-gate-marker --label gate-status:dispatching"*)
+    [ "\${LCJ_TEST_GATE_FAIL:-0}" = "1" ] && exit 1
+    echo '[]' ;;
+  *"list --label type:quality-gate-marker --label gate-status:queued"*)
+    [ "\${LCJ_TEST_GATE_FAIL:-0}" = "1" ] && exit 1
+    echo '[{"id":"gm-r7","labels":["type:quality-gate-marker","gate-status:queued","source-bead:wa-gate-protect"]}]' ;;
+  *"list --label type:quality-gate-marker --label gate-status:claimed"*)
+    [ "\${LCJ_TEST_GATE_FAIL:-0}" = "1" ] && exit 1
+    echo '[]' ;;
+  # Multi-id resolve of the directly-active source beads (ga-lrglm sling→original parity):
+  # sling-gate-src's title resolves back to r7-original-target.
+  *"show ip-gate-active"*)
+    echo '[{"id":"ip-gate-active","title":"gate-active in_progress bead"},{"id":"sling-gate-src","title":"fix bug r7-original-target: gate parity test"},{"id":"wa-gate-protect","title":"gate-active non-implementable bead"}]' ;;
+  # Individual per-id shows R7 would issue ONLY if the gate-active skip regresses — real
+  # routed_to data here means a regression is caught (not masked by an empty-shim fallback).
+  *"show wa-gate-protect"*)     echo '[{"id":"wa-gate-protect","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"show r7-original-target"*)  echo '[{"id":"r7-original-target","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"label remove"*|*"label add"*|*"update"*|*"dolt commit"*) echo "\$a" >> "$ACT" ;;
   *) echo '[]' ;;
 esac
@@ -393,6 +499,7 @@ SHIM
   chmod +x "$TMP/bd"
   # Reassign script vars DIRECTLY (top-level reads happen at LOAD, before this block).
   BD="$TMP/bd"; LCJ_STORES="$TMP"; LOG="$TMP/log"; LCJ_DRY_RUN=0; LCJ_ENABLED=1
+  LCJ_GATE_CITY="$TMP"  # ga-ibz0: route _gate_active_beads() through the same shim
   LIFECYCLE_LOCK_DIR="$TMP/.lifecycle-lock"
   LIFECYCLE_SWEEP_LOCK="$LIFECYCLE_LOCK_DIR/.janitor-sweep.lock"
   # imp10: plant an advisory lock for r5-locked to verify the janitor skips it
@@ -443,6 +550,23 @@ SHIM
   grep -q 'update t-human --unset-metadata gc.routed_to' "$ACT" && ok "R7: unset gc.routed_to on gate:needs-human:bar" || bad "R7 did not unset gc.routed_to on t-human"
   grep -q 'update t-human-bare --unset-metadata gc.routed_to' "$ACT" && ok "R7 (gate_run=ga-wisp-05leh8 fix): unset gc.routed_to on BARE gate:needs-human" || bad "R7 did not unset gc.routed_to on t-human-bare (bare-label trigger still broken)"
   grep -q 't-valid' "$ACT" && bad "R7: modified a valid in-flight bead (t-valid)" || ok "R7 left valid bead t-valid alone"
+
+  # Gate-active protection (ga-ibz0/wa-bkjy7, 2026-07-11): quality-gate-guard.sh silently
+  # detaches a bead's assignee for the FULL gate duration (no bd comment); R3/R7 must never
+  # mutate a bead with an active/pending gate marker, mirroring inflight-reclaim-guard.py's
+  # list_gate_active_source_beads() (including its sling→original title back-reference).
+  grep -q 'update ip-gate-active --status open' "$ACT" && bad "R3 (ga-ibz0): reopened a bead with an ACTIVE gate marker — reproduces the exact silent revert this fix exists to prevent" || ok "R3 (ga-ibz0): left a gate-active in_progress-no-assignee bead alone (protected)"
+  grep -q 'wa-gate-protect' "$ACT" && bad "R7 (ga-ibz0): touched a bead directly referenced by an ACTIVE gate marker" || ok "R7 (ga-ibz0): left a directly gate-active non-implementable bead alone (protected)"
+  grep -q 'r7-original-target' "$ACT" && bad "R7 (ga-ibz0/ga-lrglm parity): touched the ORIGINAL bead behind a gate-active sling wrapper — sling-title back-reference not applied" || ok "R7 (ga-ibz0/ga-lrglm parity): left the original bead behind a gate-active sling wrapper alone (resolved via sling-gate-src's title)"
+
+  # FAIL-SAFE (ga-ibz0): a gate-active query FAILURE is NOT the same as "zero active
+  # markers" — conflating them would silently drop gate protection exactly when Dolt is
+  # under the contention that makes false reclaims most likely (same guard-bug class fixed
+  # twice elsewhere: ga-ap7od/ga-jfo7). On failure, R3/R7 must skip ALL mutations for the
+  # sweep rather than proceed as if nothing were gated.
+  : > "$ACT"; export LCJ_TEST_GATE_FAIL=1; run_sweep; export LCJ_TEST_GATE_FAIL=0
+  grep -q 'update ip-noasg --status open' "$ACT" && bad "R3 fail-safe (ga-ibz0): fired despite a gate-active query FAILURE (should treat as protected, not as zero-active)" || ok "R3 fail-safe (ga-ibz0): gate-query failure → skipped mutation entirely"
+  grep -q 'wa-o4kuh' "$ACT" && bad "R7 fail-safe (ga-ibz0): fired despite a gate-active query FAILURE (should treat as protected, not as zero-active)" || ok "R7 fail-safe (ga-ibz0): gate-query failure → skipped mutation entirely"
 
   # DRY-RUN makes no changes
   : > "$ACT"; LCJ_DRY_RUN=1; run_sweep
