@@ -259,7 +259,7 @@ log "=== Guard sweep start ==="
 LAUNCHD_ERR="$GC_CITY/.gc/logs/quality-gate-guard-launchd.err"
 ERR_CHECKPOINT="$GC_CITY/.gc/logs/quality-gate-guard-launchd-err.checkpoint"
 if [ -f "$LAUNCHD_ERR" ]; then
-  CUR_ERR_LINES=$(wc -l < "$LAUNCHD_ERR" 2>/dev/null | tr -d ' ')
+  CUR_ERR_LINES=$(wc -l < "$LAUNCHD_ERR" 2>/dev/null | tr -d ' ' || echo "")
   PREV_ERR_LINES=$(cat "$ERR_CHECKPOINT" 2>/dev/null || echo "")
   if [ -n "$CUR_ERR_LINES" ] && [ -n "$PREV_ERR_LINES" ] && [ "$CUR_ERR_LINES" != "$PREV_ERR_LINES" ]; then
     TAIL_SNIPPET=$(tail -n 5 "$LAUNCHD_ERR" 2>/dev/null | tr '\n' ' ' || true)
