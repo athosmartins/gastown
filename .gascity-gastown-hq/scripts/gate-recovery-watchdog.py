@@ -1316,7 +1316,7 @@ def _bead_labels(bead_id):
         return []
 
 
-_RIG_PATHS = {"ts": 0.0, "map": {}}
+_RIG_PATHS = {"ts": 0.0, "map": {}, "by_prefix": {}}
 
 
 def _rig_paths():
@@ -1326,29 +1326,61 @@ def _rig_paths():
     if time.time() - _RIG_PATHS["ts"] < 600 and _RIG_PATHS["map"]:
         return _RIG_PATHS["map"]
     r = sh(["gc", "--city", CITY, "rig", "list", "--json"])
-    m = {}
+    m, mp = {}, {}
     try:
         j = json.loads(r.stdout) if (r and r.returncode == 0) else {}
         for rg in (j.get("rigs", []) if isinstance(j, dict) else []):
-            nm, p = rg.get("name"), rg.get("path")
+            nm, p, pfx = rg.get("name"), rg.get("path"), rg.get("prefix")
             if nm and p:
                 m[nm] = p
+            if pfx and p:
+                mp[pfx] = p
     except Exception:
-        m = {}
+        m, mp = {}, {}
     if m:
         _RIG_PATHS["map"] = m
+        _RIG_PATHS["by_prefix"] = mp
         _RIG_PATHS["ts"] = time.time()
     return _RIG_PATHS["map"]
 
 
+def _bead_id_prefix(bead_id):
+    """Rig-prefix segment of a bead ID ('wa-10srb' -> 'wa', 'ga-wisp-me6y20' ->
+    'ga' — split on the FIRST hyphen only), or '' if bead_id is falsy or has no
+    hyphen. Pure (unit-tested); feeds _rig_path_by_prefix's ga-c1s8 fallback."""
+    if not bead_id or "-" not in bead_id:
+        return ""
+    return bead_id.split("-", 1)[0]
+
+
+def _rig_path_by_prefix(prefix):
+    """repo_path for a rig's bead-ID prefix (e.g. 'wa' -> whatsapp_automation's
+    path), from the same `gc rig list` fetch _rig_paths() caches. Fallback
+    source-bead-store resolution for markers with no bead-rig: label: markers
+    sourced from non-HQ rigs are NOT reliably labeled with their rig (ga-c1s8 —
+    marker ga-wisp-me6y20, source wa-10srb, had no bead-rig: label at all, so
+    _source_bead_state could only ever check the HQ store, always failed to
+    resolve the source bead, and silently bypassed the needs-human requeue
+    carve-out — the dispatcher's circuit-break and grw's requeue ping-ponged
+    until the oscillation cap tripped). None if prefix is empty/unknown."""
+    if not prefix:
+        return None
+    _rig_paths()  # ensure cache populated/fresh (same TTL, same fetch)
+    return _RIG_PATHS["by_prefix"].get(prefix)
+
+
 def _source_bead_state(bead_id, rig_name=""):
     """(resolved, closed, needs_human) for a marker's source bead. Tries HQ first,
-    then the bead's rig store. resolved=False on any failure → the caller treats the
-    source as UNKNOWN and proceeds to requeue (fail toward recovery; the dispatcher
-    re-validates the branch, and the oscillation cap bounds a bad requeue)."""
+    then the bead's rig store — from rig_name (the marker's bead-rig: label) if
+    given, else derived from the bead ID's own prefix (ga-c1s8 fallback: that
+    label is only ever set for HQ-native sources, so a non-HQ-rig-sourced marker
+    with no label would otherwise never resolve). resolved=False on any failure →
+    the caller treats the source as UNKNOWN and proceeds to requeue (fail toward
+    recovery; the dispatcher re-validates the branch, and the oscillation cap
+    bounds a bad requeue)."""
     if not bead_id:
         return (False, False, False)
-    rigp = _rig_paths().get(rig_name) if rig_name else None
+    rigp = (_rig_paths().get(rig_name) if rig_name else None) or _rig_path_by_prefix(_bead_id_prefix(bead_id))
     tries = [[CITY]]
     if rigp and rigp != CITY:
         tries.append([rigp])
@@ -2494,7 +2526,20 @@ def _selftest():
     ok(stale_review_marker_verdict("passed", 40 * 60, R, False) == "skip:not-review-status", "terminal (passed) marker → skip")
     # boundary: FIX 6 (no run) and FIX 1/5 (open run) partition the dead-reviewer space
     ok(stale_review_marker_verdict("reviewing", 40 * 60, R, True) != "requeue", "an OPEN run is FIX 1/5's domain, NOT FIX 6 (no double-handling)")
-    print("gate-recovery-watchdog FIX3+FIX4+FIX5+FIX6 selftest: PASS=%d FAIL=%d" % (p, f))
+    # FIX 2 — error_requeue_verdict (gate-status:error marker requeue decision)
+    E = 8 * 60
+    ok(error_requeue_verdict(300, E, True, True, False, 0, 3) == "close:source-done", "source resolved+CLOSED → close regardless of age (checked first)")
+    ok(error_requeue_verdict(60, E, True, False, False, 0, 3) == "skip:young", "in error < threshold → skip:young (let transient self-clear)")
+    ok(error_requeue_verdict(600, E, True, False, True, 0, 3) == "skip:parked-needs-human", "source resolved + needs-human → NEVER requeue (the ga-c1s8 circuit-break carve-out)")
+    ok(error_requeue_verdict(600, E, False, False, False, 0, 3) == "requeue", "source UNRESOLVABLE → fail-toward-recovery requeue (bounded by the oscillation cap below — the ga-c1s8 failure mode when rig resolution silently fails)")
+    ok(error_requeue_verdict(600, E, True, False, False, 3, 3) == "escalate:oscillating", "requeue_count hit max_attempts → escalate, stop looping")
+    ok(error_requeue_verdict(600, E, True, False, False, 2, 3) == "requeue", "requeue_count below max → requeue (one attempt left)")
+    # ga-c1s8 — _bead_id_prefix, the fallback rig-resolution key when bead-rig: is absent
+    ok(_bead_id_prefix("wa-10srb") == "wa", "wa-10srb -> wa (the ga-c1s8 marker's WA-rig source bead)")
+    ok(_bead_id_prefix("ga-wisp-me6y20") == "ga", "ga-wisp-me6y20 -> ga (split on the FIRST hyphen only)")
+    ok(_bead_id_prefix("") == "" and _bead_id_prefix(None) == "", "empty/None -> '' (fail-safe, never crashes)")
+    ok(_bead_id_prefix("noHyphenId") == "", "no hyphen -> '' (unknown prefix, fails safe to HQ-only lookup)")
+    print("gate-recovery-watchdog FIX2+FIX3+FIX4+FIX5+FIX6 selftest: PASS=%d FAIL=%d" % (p, f))
     return 0 if f == 0 else 1
 
 
