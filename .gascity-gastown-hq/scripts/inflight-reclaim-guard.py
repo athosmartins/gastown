@@ -357,6 +357,55 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
     return "reclaim"
 
 
+def update_strand_clock(bead_state, is_currently_stranded, assignee, now):
+    """Update a bead's per-cycle strand clock in bead_state; return
+    (seconds_stranded, event).  Mutates only the passed bead_state dict — no
+    I/O — so it is unit-testable.
+
+    wa-og36j (born-stale reclaim fix): RESET the strand clock whenever a FRESH
+    claim lands — i.e. the bead's assignee changed to a new non-empty value
+    since the last cycle. Previously the clock only reset when a LIVE builder
+    session or recent branch progress was observed (is_currently_stranded=False).
+    But a reclaimed->re-dispatched bead whose new builder is not YET visible as
+    live in this sweep (session-list race) OR NEVERSTARTS immediately stayed
+    is_currently_stranded=True and INHERITED the prior claim's first_seen_stranded
+    -> seconds_stranded was already past RECLAIM_TTL -> it was reclaimed within
+    minutes, cycle after cycle, so no builder could ever hold the claim long
+    enough to engage (structural churn; pilot.dispatched_at frozen across cycles).
+    Anchoring the reset on claim identity (assignee change) gives every fresh
+    claim a full window regardless of live-session detection timing.
+
+    events: "fresh_claim_reset" | "started" | "progress_reset" | None
+    """
+    prev_assignee = bead_state.get("last_assignee")
+    assignee = assignee or ""
+    # A fresh claim = assignee changed to a new non-empty value. prev_assignee
+    # is None on first-see: do NOT treat the original claim as "fresh" — the
+    # normal is_currently_stranded path below starts its clock.
+    fresh_claim = (
+        bool(assignee)
+        and prev_assignee is not None
+        and assignee != prev_assignee
+    )
+    bead_state["last_assignee"] = assignee
+    event = None
+    if fresh_claim and "first_seen_stranded" in bead_state:
+        bead_state.pop("first_seen_stranded", None)
+        event = "fresh_claim_reset"
+    if is_currently_stranded:
+        if "first_seen_stranded" not in bead_state:
+            bead_state["first_seen_stranded"] = now
+            if event is None:
+                event = "started"
+        return now - bead_state["first_seen_stranded"], event
+    # Live builder or recent progress -> reset stranded clock.
+    if "first_seen_stranded" in bead_state:
+        bead_state.pop("first_seen_stranded", None)
+        if event is None:
+            event = "progress_reset"
+    return 0.0, event
+
+
 # ---------------------------------------------------------------------------
 # State persistence
 # ---------------------------------------------------------------------------
@@ -1736,21 +1785,21 @@ def run_cycle(state, escalated_alerted):
         else:
             bead_state.pop("suspended_hold_logged", None)
 
+        seconds_stranded, _strand_event = update_strand_clock(
+            bead_state, is_currently_stranded, assignee, now)
+        if _strand_event == "started":
+            print(f"[INFLIGHT-RECLAIM] started stranded clock: bead={bead_id} "
+                  f"assignee={assignee!r}", flush=True)
+        elif _strand_event == "fresh_claim_reset":
+            print(f"[INFLIGHT-RECLAIM] reset stranded clock (fresh claim, wa-og36j): "
+                  f"bead={bead_id} assignee={assignee!r} — new claim gets a full "
+                  f"RECLAIM_TTL window (not born-stale)", flush=True)
+        elif _strand_event == "progress_reset":
+            print(f"[INFLIGHT-RECLAIM] reset stranded clock: bead={bead_id} "
+                  f"live_session={has_live_session} recent_branch={has_recent_branch}",
+                  flush=True)
         if is_currently_stranded:
-            if "first_seen_stranded" not in bead_state:
-                bead_state["first_seen_stranded"] = now
-                print(f"[INFLIGHT-RECLAIM] started stranded clock: bead={bead_id} "
-                      f"assignee={assignee!r}", flush=True)
-            seconds_stranded = now - bead_state["first_seen_stranded"]
             stranded_count += 1
-        else:
-            # Live builder or recent progress → reset stranded clock
-            if "first_seen_stranded" in bead_state:
-                bead_state.pop("first_seen_stranded", None)
-                print(f"[INFLIGHT-RECLAIM] reset stranded clock: bead={bead_id} "
-                      f"live_session={has_live_session} recent_branch={has_recent_branch}",
-                      flush=True)
-            seconds_stranded = 0.0
 
         reclaim_count = parse_reclaim_count(labels)
 

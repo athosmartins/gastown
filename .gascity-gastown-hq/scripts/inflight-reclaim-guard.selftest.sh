@@ -200,6 +200,38 @@ else:
     else:
         bad("MISSING: docstring fail-safe contract line changed/removed")
 
+# Scenario 8 (wa-og36j): update_strand_clock() must RESET the strand clock on a
+# FRESH claim (assignee changed to a new worker) so a reclaimed->re-dispatched
+# bead is not born-stale — inheriting the prior claim's stranding age and being
+# reclaimed within minutes before the new builder can engage (structural churn).
+print("Scenario 8: strand-clock fresh-claim reset (wa-og36j born-stale fix)")
+_TTL = m.RECLAIM_TTL
+_NOW = 1_000_000.0
+_st = {"first_seen_stranded": _NOW - 3000, "last_assignee": "wa-worker-adhoc-A"}
+_secs, _ = m.update_strand_clock(_st, True, "wa-worker-adhoc-B", _NOW)
+if _secs < _TTL:
+    ok("fresh claim (A->B) while still stranded resets clock (%.0fs < TTL)" % _secs)
+else:
+    bad("BORN-STALE: fresh claim kept old clock (%.0fs >= TTL) -> instant reclaim" % _secs)
+_st = {"first_seen_stranded": _NOW - 3000, "last_assignee": ""}
+_secs, _ = m.update_strand_clock(_st, True, "wa-worker-adhoc-B", _NOW)
+if _secs < _TTL:
+    ok("re-dispatch after reclaim ('' -> B) resets clock")
+else:
+    bad("BORN-STALE after reclaim gap (%.0fs)" % _secs)
+_st = {"first_seen_stranded": _NOW - 3000, "last_assignee": "wa-worker-adhoc-A"}
+_secs, _ = m.update_strand_clock(_st, True, "wa-worker-adhoc-A", _NOW)
+if _secs >= _TTL:
+    ok("same assignee keeps clock (genuine dead builder still reclaimable)")
+else:
+    bad("REGRESSION: same-assignee clock wrongly reset (%.0fs)" % _secs)
+_st = {"first_seen_stranded": _NOW - 3000, "last_assignee": "wa-worker-adhoc-A"}
+_secs, _ = m.update_strand_clock(_st, False, "wa-worker-adhoc-A", _NOW)
+if _secs == 0.0 and "first_seen_stranded" not in _st:
+    ok("live/branch (not stranded) resets clock to 0")
+else:
+    bad("not-stranded did not reset (%.0fs)" % _secs)
+
 print("")
 print("Results: %d passed, %d failed" % (PASS, FAIL))
 if FAIL == 0:
