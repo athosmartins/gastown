@@ -847,6 +847,20 @@ esac
 
 grep -qE 'pilot:reclaim-count:' "$DISPATCHER" && ok "_filter_candidates carries the pilot:reclaim-count clause"                      || bad "pilot:reclaim-count clause missing from _filter_candidates"
 
+# ── Scenario 3e2i (ga-2lqv): engine-window:pending excluded from candidates ────
+# ga-sm5p pattern: a builder finishes Phase-1 (code fix + green tests) and
+# deliberately leaves the bug open with engine-window:pending because Phase-2
+# (deploy) is batched with sibling bugs not yet ready. Pilot re-dispatched a
+# SECOND builder onto the same bug ~3 min after the first dispatch closed — a
+# pure no-op that burned a full dog-pool cycle re-verifying nothing had changed.
+# _filter_candidates must exclude engine-window:pending the same way it excludes
+# pilot:held, so the bead only re-enters the pool once whoever runs the batched
+# deploy removes the label.
+echo "Scenario 3e2i (ga-2lqv): engine-window:pending bead is excluded from the candidate pool (batched deploy hold)"
+ENGWIN_PENDING='[{"id":"bd-engwin-pending","assignee":null,"labels":["story:approved","engine-window:pending"],"description":"x"},{"id":"bd-free6","assignee":null,"labels":["story:approved"],"description":"x"}]'
+[ "$(_fc "$ENGWIN_PENDING")" = '["bd-free6"]' ] && ok "ga-2lqv: engine-window:pending bead excluded; free story:approved kept (batched-deploy hold honored)" || bad "ga-2lqv: engine-window:pending not excluded (got: $(_fc "$ENGWIN_PENDING"))"
+grep -qE '"engine-window:pending"' "$DISPATCHER" && ok "_filter_candidates carries the engine-window:pending clause" || bad "engine-window:pending clause missing from _filter_candidates"
+
 # ── Scenario OWN-GUARD (ga-htjni ext; wa-5wv49 / wa-xnuxd) ──────────────────────
 # The reported systemic double-dispatch: a crew/human creates a bead intending to
 # build it THEMSELVES and claims it (status=in_progress + assignee=<self>) — yet the

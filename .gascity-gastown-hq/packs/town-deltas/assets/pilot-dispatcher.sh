@@ -1174,6 +1174,19 @@ _filter_candidates() {
           or . == "story:needs-device"
           or . == "on-device"
           or . == "story:blocked"
+          # ga-2lqv: engine-window:pending means Phase-1 (code fix) is DONE and
+          # Phase-2 (deploy) is deliberately batched with sibling bugs (see
+          # docs/runbooks/ga-ftmci-dolt-cpu-engine-window.md) — it is NOT "not
+          # started". Before this clause the scan could not tell the two apart
+          # and re-dispatched a fresh builder onto the bead every sweep
+          # (observed on ga-sm5p: re-dispatched ~3 min after the prior
+          # dispatch closed, burning a full dog-pool cycle on a pure no-op
+          # re-verify). Whoever performs the batched deploy removes the
+          # label, so the bead re-enters the pool on the very next sweep —
+          # a plain static exclude needs no extra timer/expiry state here,
+          # mirroring how needs:engine-window is a static --exclude-label at
+          # the bd list call sites for the opposite side of the same window.
+          or . == "engine-window:pending"
         )) | length) == 0
         and ((.description // "") | test("\\S"))
      )]' \
