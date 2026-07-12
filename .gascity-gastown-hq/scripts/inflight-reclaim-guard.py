@@ -117,12 +117,20 @@ POOL_DEAD_COOLDOWN = int(os.environ.get("IRG_POOL_DEAD_COOLDOWN_SEC", "1800"))
 # 'wa-worker-adhoc-<hash>'). A bead in_progress with one of these assignees is
 # a Pilot pool dispatch that never engaged — no Pilot markers (pilot:dispatched /
 # story:in-flight) are required to qualify for the in_progress sweep.
-EPHEMERAL_POOL_ASSIGNEES = frozenset({"wa-worker"})
-# gastown.dog deliberately excluded: dogs are min_active pools assigned a
-# concrete session name at dispatch time (not a bare template name), so the
-# bare-template zombie detection path does not apply to them.  If future
-# dog-pool dispatch changes to use bare template assignees, add "gastown.dog"
-# here and verify that dog branches follow crew/gastown.dog/<id> convention.
+#
+# gt-fppb0: 'gastown.dog' IS a bare pool-template assignee. A dog claims work
+# through `gc hook` by setting assignee=$GC_ALIAS, and GC_ALIAS for the dog pool
+# is the BARE pool name 'gastown.dog' (stable across wake_mode=fresh respawns),
+# NOT a concrete session name. The earlier assumption (dogs get a concrete name)
+# was the NEVERSTART root: when a claimant dog died, the bead stayed
+# in_progress + assignee=gastown.dog, and the next fresh dog's Tier-1 work_query
+# (`bd list --status in_progress --assignee gastown.dog`) RE-ADOPTED the zombie,
+# burning pool workers in a respawn loop and polluting APROVADAS. Treating it as
+# a bare pool template routes it through pool_has_live_worker() (template match)
+# + the provably-dead fast-path (reclaim_decision) so a dead dog's claim is
+# reclaimed rather than re-offered. Dog branches follow the crew/gastown.dog/<id>
+# convention, already honored by get_branch_recent()'s segment matcher.
+EPHEMERAL_POOL_ASSIGNEES = frozenset({"wa-worker", "gastown.dog"})
 
 # ga-hkpwv: minimum stranding window for bare-template pool zombies.
 # Longer than RECLAIM_TTL (25min): no Pilot marker is a weaker signal, and a
@@ -148,7 +156,8 @@ GC_CITY = "/Users/athos/gt/.gascity-gastown-hq"
 # original bug's root cause: reclaims fired for "no progress" during an
 # account-wide rate-limit — workers were alive but had zero API tokens to
 # commit with, and got reclaimed as if dead.
-QUOTA_CHECK = os.path.join(GC_CITY, "scripts/claude-quota-check.sh")
+QUOTA_CHECK = os.environ.get(
+    "IRG_QUOTA_CHECK", os.path.join(GC_CITY, "scripts/claude-quota-check.sh"))
 
 
 def _list_rig_stores():
@@ -309,7 +318,8 @@ def _is_ephemeral_pool_assignee(assignee):
 
 def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
                      reclaim_count, has_needs_human, has_dispatching_marker,
-                     min_stranding_secs=None, account_rate_limited=False):
+                     min_stranding_secs=None, account_rate_limited=False,
+                     provably_dead=False):
     """Compute the reclaim action for one stranded in-flight bead.
 
     Args:
@@ -328,6 +338,19 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
                                  its own — reclaiming it as "dead" is the exact root
                                  cause this param closes. Defaults False (pre-fix
                                  behavior unchanged when the caller doesn't pass it).
+        provably_dead:           True if the claimant session is PROVABLY gone (gt-fppb0):
+                                 absent from `gc session list`, or the only matching
+                                 session(s) are in _POOL_DEAD_STATES. This is STRICTLY
+                                 STRONGER than `not has_live_session` — the latter is also
+                                 False for a merely-quiet / frozen-but-live-state session
+                                 (ga-64usm), which must KEEP the hysteresis. When True (and
+                                 every safety guard above is clear), the min_stranding_secs
+                                 hysteresis is bypassed and the bead is reclaimed at once —
+                                 a provably-dead claimant has no live builder to protect, so
+                                 the 25min/2h wait only lets a fresh pool worker re-adopt the
+                                 zombie and burn (the NEVERSTART respawn loop). Defaults
+                                 False: callers that don't pass it keep the pre-fix
+                                 hysteresis behavior exactly.
 
     Returns:
         action in {"reclaim", "escalate", "noop"}
@@ -348,10 +371,15 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
         return "noop"
     if has_recent_branch:
         return "noop"
-    # Bead is stranded — enforce hysteresis (wait for continuous stranding)
-    if seconds_stranded < min_stranding_secs:
+    # Bead is stranded — enforce hysteresis (wait for continuous stranding).
+    # gt-fppb0 fast-path: a PROVABLY-DEAD claimant (session absent / in a
+    # definitively-dead state) has no live builder the hysteresis could be
+    # protecting, so skip the wait and reclaim immediately (TTL ~ 0). A merely-
+    # quiet claimant (provably_dead=False) still serves the full window so a
+    # live-but-idle builder (ga-64usm) is never reclaimed out from under itself.
+    if not provably_dead and seconds_stranded < min_stranding_secs:
         return "noop"
-    # Stranded past TTL — check thrash cap
+    # Stranded past TTL (or provably dead) — check thrash cap
     if reclaim_count >= MAX_RECLAIMS:
         return "escalate"
     return "reclaim"
@@ -1122,6 +1150,61 @@ def concrete_adhoc_session_is_live(assignee, sessions, now=None, bead_update_age
     return False
 
 
+def claimant_provably_dead(assignee, sessions):
+    """True iff the bead's claimant session is PROVABLY gone (gt-fppb0).
+
+    "Provably gone" means: EVERY session matching `assignee` — by bare pool
+    template (session.template == assignee, e.g. 'gastown.dog'/'wa-worker') OR by
+    concrete identifier (assignee in {id,name,session_name,alias,agent_name}) — is
+    in a definitively-dead state (_POOL_DEAD_STATES), OR no session matches at all
+    (the claimant is absent from `gc session list`).
+
+    This is STRICTLY STRONGER than `not <live-rail>()`. The liveness rails
+    (session_is_live / pool_has_live_worker / concrete_adhoc_session_is_live)
+    already return "not live" for a session that is present in a LIVE state but
+    merely quiet/frozen (stale last_active — ga-64usm) OR in an UNKNOWN state.
+    Those cases are NOT provably dead: the builder might still be alive, so they
+    must keep the RECLAIM_TTL / POOL_ZOMBIE_TTL hysteresis. Only a claimant that
+    is *certainly* gone earns the reclaim_decision fast-path (immediate reclaim).
+
+    Conservative / fail-safe by construction:
+      - empty/unknown session list          → False (cannot prove death)
+      - empty/None or coordinator assignee   → False (parked / other rails own it)
+      - ANY matching session in a LIVE state → False (even if stale — merely quiet)
+      - ANY matching session in an UNKNOWN   → False (ambiguous → never fast-path)
+        (state ∉ LIVE_STATES ∪ _POOL_DEAD_STATES)
+
+    Reuses the exact primitives the other liveness helpers use (_POOL_DEAD_STATES,
+    the identifier set, is_coordinator) so the "dead" verdict can never silently
+    diverge from what session_is_live()/pool_has_live_worker() consider dead.
+    """
+    if not assignee or is_coordinator(assignee):
+        return False
+    if not sessions:
+        return False  # unknown / probe returned nothing → cannot PROVE death
+    for s in sessions:
+        identifiers = {
+            s.get("id", ""),
+            s.get("name", ""),
+            s.get("session_name", ""),
+            s.get("alias", ""),
+            s.get("agent_name", ""),
+        }
+        identifiers.discard("")
+        matches = (s.get("template", "") == assignee) or (assignee in identifiers)
+        if not matches:
+            continue
+        # A parked-under-coordinator match is not our rail (ga-7m191).
+        if any(is_coordinator(idv) for idv in identifiers):
+            return False
+        state = s.get("state", "").lower()
+        if state not in _POOL_DEAD_STATES:
+            # LIVE (even stale/frozen) or UNKNOWN state → not provably dead.
+            return False
+    # Matched only definitively-dead sessions, or matched nothing at all → gone.
+    return True
+
+
 def list_live_sling_source_beads(sessions, now):
     """Return set of ORIGINAL bug/story bead IDs whose SLING/task bead is
     in_progress and assigned to a live builder session (ga-qfo3).
@@ -1329,10 +1412,17 @@ def preserve_unpushed_branch(bead_id):
     return preserved
 
 
-def get_branch_recent(bead_id):
+def get_branch_recent(bead_id, fetch=True):
     """Return True if any remote branch whose final path segment equals <bead-id>
     (or starts with <bead-id> followed by '-'/'_'/'.') has a commit within
     RECLAIM_TTL seconds of now.
+
+    fetch=False skips the `git fetch` (gt-fppb0): the dog pre_start preflight must
+    be FAST and must never block a spawn on a slow network fetch, so it reads the
+    already-fetched remote-tracking refs (refreshed by run_cycle's 10-min sweep).
+    Slightly staler, but fails the SAME safe way — a recent local ref still blocks
+    the reclaim — and the authoritative run_cycle sweep (fetch=True) is the
+    backstop. run_cycle keeps fetch=True; all existing callers are unchanged.
 
     Matches ALL branch naming conventions regardless of prefix:
       crew/<pool>/<bead-id>     (dominant: 416 branches, e.g. crew/wa-worker/wa-quoy)
@@ -1354,16 +1444,17 @@ def get_branch_recent(bead_id):
     for repo in REPOS:
         # Fetch to update remote-tracking refs.
         # Fail-safe: fetch error → branch might exist → do NOT reclaim.
-        try:
-            subprocess.run(
-                ["git", "-C", repo, "fetch", "origin", "--prune", "--quiet"],
-                capture_output=True, timeout=30)
-        except Exception as _fe:
-            print(
-                f"[INFLIGHT-RECLAIM] branch-rail: fetch failed for {repo}: {_fe}"
-                " — treating as branch-might-exist (fail-safe)",
-                flush=True)
-            return True
+        if fetch:
+            try:
+                subprocess.run(
+                    ["git", "-C", repo, "fetch", "origin", "--prune", "--quiet"],
+                    capture_output=True, timeout=30)
+            except Exception as _fe:
+                print(
+                    f"[INFLIGHT-RECLAIM] branch-rail: fetch failed for {repo}: {_fe}"
+                    " — treating as branch-might-exist (fail-safe)",
+                    flush=True)
+                return True
 
         # List all remote refs with timestamps in a single pass.
         # Fail-safe: ref-list error → branch might exist → do NOT reclaim.
@@ -1634,6 +1725,161 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=N
 
 
 # ---------------------------------------------------------------------------
+# gt-fppb0: dog-pool pre_start preflight driver
+# ---------------------------------------------------------------------------
+
+# The exact pool alias a dog uses as GC_ALIAS when it claims work via `gc hook`
+# (bd list --status in_progress --assignee gastown.dog). A module constant so the
+# preflight query and the fresh dog's Tier-1 work_query can never drift apart.
+DOG_POOL_ALIAS = "gastown.dog"
+
+
+def reclaim_dead_dog_claims(exclude_session_ids=None, sessions=None,
+                            now=None, dry_run=False):
+    """Reclaim PROVABLY-DEAD dog-pool claims (gt-fppb0). Returns reclaimed ids.
+
+    Intended as the dog agent's pre_start preflight — run immediately before a
+    fresh dog executes `gc hook`, whose Tier-1 work_query is
+    `bd list --status in_progress --assignee gastown.dog`. If a previous claimant
+    dog died mid-claim, that query still returns the zombie bead and the fresh dog
+    RE-ADOPTS it, burning pool workers in a respawn loop (the NEVERSTART root that
+    pollutes APROVADAS). This driver reclaims the zombie FIRST — resetting it to
+    open + clearing the dog assignee — so the fresh dog's query no longer sees it
+    and the Pilot re-dispatches it cleanly, to ONE worker, not N.
+
+    Targets EXACTLY the set the fresh dog would re-adopt: in_progress beads whose
+    assignee is the bare pool alias 'gastown.dog'. Reuses run_cycle's liveness +
+    guard rails verbatim (zero divergence). A bead is reclaimed only when it is
+    provably-dead-owned AND every safety guard is clear:
+      - claimant provably gone (claimant_provably_dead) — NOT merely quiet;
+      - no live pool worker owns it (pool_has_live_worker) and it is not a live
+        sling source (list_live_sling_source_beads, ga-qfo3);
+      - no recent branch progress (get_branch_recent, fetch=False for speed);
+      - not gate:needs-human / :* (parked);
+      - no active quality-gate marker (list_gate_active_source_beads);
+      - owner not deliberately suspended (list_suspended_agents);
+      - account not rate-limited (account_is_rate_limited, ga-ufr7).
+
+    FAIL-OPEN, ALWAYS: any probe error / timeout / unexpected data → returns the
+    reclaims done so far (usually none) WITHOUT raising. A pre_start hook must
+    never block or delay a spawn. `sessions`/`now` may be injected (tests);
+    otherwise fetched. `exclude_session_ids` drops those identifiers from the
+    liveness view — belt-and-suspenders: pre_start runs BEFORE the fresh dog's own
+    session exists, but if that ever changes, excluding self keeps the preflight
+    from reading itself as the pool being alive.
+
+    Only ever fast-reclaims; escalation (reclaim cap exhausted) is left to
+    run_cycle — a capped bead needs the manual reset the gt-fppb0 note describes.
+    """
+    reclaimed = []
+    try:
+        if now is None:
+            now = time.time()
+
+        # Fast healthy path: exactly the fresh dog's Tier-1 query. No candidates
+        # → nothing to do; pay for nothing else. Dog hook-claims are HQ-native.
+        try:
+            r = subprocess.run(
+                ["bd", "list", "--status", "in_progress",
+                 "--assignee", DOG_POOL_ALIAS, "--json"],
+                capture_output=True, text=True, timeout=15)
+        except Exception:
+            return reclaimed  # fail-open
+        if r.returncode != 0 or not r.stdout.strip():
+            return reclaimed
+        try:
+            beads = json.loads(r.stdout)
+        except Exception:
+            return reclaimed
+        if not isinstance(beads, list) or not beads:
+            return reclaimed
+
+        # Sessions view (fetched unless injected). None → cannot assess → bail.
+        if sessions is None:
+            sessions = list_active_sessions()
+        if sessions is None:
+            return reclaimed
+        if exclude_session_ids:
+            drop = set(exclude_session_ids)
+            sessions = [
+                s for s in sessions
+                if not ({s.get("id", ""), s.get("name", ""),
+                         s.get("session_name", ""), s.get("alias", ""),
+                         s.get("agent_name", "")} & drop)
+            ]
+
+        # Guard rails, computed once. A fail-SAFE None (query error) → bail:
+        # without a trustworthy guard set we must NOT reclaim (the gate-guard
+        # failsafe class — a probe failure must never weaken a guard).
+        gate_active = list_gate_active_source_beads()
+        if gate_active is None:
+            return reclaimed
+        live_sling = list_live_sling_source_beads(sessions, now)
+        if live_sling is None:
+            return reclaimed
+        suspended = list_suspended_agents()        # fail-open: set() on error
+        rate_limited = account_is_rate_limited()   # fail-open: False on error
+
+        for b in beads:
+            bead_id = b.get("id", "")
+            if not bead_id:
+                continue
+            if (b.get("issue_type") or b.get("type") or "") == "epic":
+                continue
+            labels = b.get("labels", [])
+            assignee = b.get("assignee") or ""
+            # suspended-owner HOLD (mirrors run_cycle): never reclaim a parked crew.
+            if assignee and assignee in suspended:
+                continue
+
+            bead_update_epoch = parse_iso_epoch(b.get("updated_at", ""))
+            bead_update_age = (
+                (now - bead_update_epoch) if bead_update_epoch is not None else None)
+
+            # Liveness: pool-wide live worker OR live sling source (ga-qfo3).
+            has_live_session = (
+                pool_has_live_worker(assignee, sessions, now, bead_update_age)
+                or bead_id in live_sling
+            )
+            # Branch rail, fast (no fetch — reads run_cycle's already-fetched refs).
+            has_recent_branch = (
+                False if has_live_session
+                else get_branch_recent(bead_id, fetch=False))
+
+            provably_dead = claimant_provably_dead(assignee, sessions)
+            reclaim_count = parse_reclaim_count(labels)
+
+            action = reclaim_decision(
+                has_live_session=has_live_session,
+                has_recent_branch=has_recent_branch,
+                # preflight has no strand clock — the provably_dead fast-path is
+                # the ONLY path that can fire here (0 < any hysteresis window).
+                seconds_stranded=0.0,
+                reclaim_count=reclaim_count,
+                has_needs_human=_has_needs_human_label(labels),
+                has_dispatching_marker=(bead_id in gate_active),
+                min_stranding_secs=POOL_ZOMBIE_TTL,
+                account_rate_limited=rate_limited,
+                provably_dead=provably_dead,
+            )
+
+            if action == "reclaim":
+                if not dry_run:
+                    do_reclaim(bead_id, b.get("title", "")[:60], reclaim_count,
+                               0.0, labels, rig_root=b.get("rig_root"))
+                reclaimed.append(bead_id)
+                print(f"[DOG-PREFLIGHT] gt-fppb0: reclaimed provably-dead dog "
+                      f"claim bead={bead_id} assignee={assignee!r} "
+                      f"reclaim={reclaim_count + 1}/{MAX_RECLAIMS}"
+                      + (" (dry-run)" if dry_run else ""), flush=True)
+            # escalate / noop → left for run_cycle; the preflight only fast-reclaims.
+    except Exception as exc:
+        # Absolute fail-open contract: never propagate out of a pre_start hook.
+        print(f"[DOG-PREFLIGHT] fail-open (no spawn block): {exc}", flush=True)
+    return reclaimed
+
+
+# ---------------------------------------------------------------------------
 # Main poll cycle
 # ---------------------------------------------------------------------------
 
@@ -1809,6 +2055,23 @@ def run_cycle(state, escalated_alerted):
         # false reclaims on slow-starting builds.
         min_stranding_secs = POOL_ZOMBIE_TTL if is_pool_zombie_bead else RECLAIM_TTL
 
+        # gt-fppb0: grant the provably-dead fast-path (reclaim at TTL~0) ONLY to
+        # BARE pool-template zombies (assignee ∈ EPHEMERAL_POOL_ASSIGNEES, e.g.
+        # 'gastown.dog' / 'wa-worker'). Their assignee is a STABLE pool name that
+        # does not change on re-dispatch, so "claimant absent from gc session
+        # list" can never be the wa-og36j born-stale race (a fresh CONCRETE claim
+        # whose new session isn't visible yet) — that race only afflicts concrete
+        # per-dispatch assignees, which are excluded here and keep the full
+        # POOL_ZOMBIE_TTL wait. A deliberately-SUSPENDED owner is also excluded:
+        # its bead HOLDS for resume and must never be reclaimed even when its
+        # session is (expectedly) gone. All other reclaim guards live inside
+        # reclaim_decision and still veto the fast-path before it can fire.
+        provably_dead = (
+            is_bare_pool_zombie
+            and not has_suspended_owner
+            and claimant_provably_dead(assignee, sessions)
+        )
+
         # --- Pure decision ---
         action = reclaim_decision(
             has_live_session=has_live_session,
@@ -1819,6 +2082,7 @@ def run_cycle(state, escalated_alerted):
             has_dispatching_marker=has_dispatching_marker,
             min_stranding_secs=min_stranding_secs,
             account_rate_limited=account_rate_limited,
+            provably_dead=provably_dead,
         )
 
         idle_min = seconds_stranded / 60.0
@@ -2324,8 +2588,8 @@ def _selftest():
           _is_ephemeral_pool_assignee("wa-worker"))
     check("AZ-0b: _is_ephemeral_pool_assignee: wa-worker-adhoc-deadbeef → True",
           _is_ephemeral_pool_assignee("wa-worker-adhoc-deadbeef"))
-    check("AZ-0c: _is_ephemeral_pool_assignee: gastown.dog → False (not in scope)",
-          not _is_ephemeral_pool_assignee("gastown.dog"))
+    check("AZ-0c: _is_ephemeral_pool_assignee: gastown.dog → True (gt-fppb0: bare dog pool alias now in scope)",
+          _is_ephemeral_pool_assignee("gastown.dog"))
     check("AZ-0d: _is_ephemeral_pool_assignee: oracle-wa (crew) → False",
           not _is_ephemeral_pool_assignee("oracle-wa"))
 
@@ -2882,6 +3146,281 @@ def _selftest():
     finally:
         subprocess.run = _orig_run_pb
         REPOS = _orig_repos
+
+    # -----------------------------------------------------------------------
+    # Section 9: gt-fppb0 — provably-dead fast-path in reclaim_decision (FP-*).
+    # A PROVABLY-DEAD claimant reclaims at seconds_stranded=0 (bypasses the
+    # hysteresis); a merely-quiet one still serves the full window; every safety
+    # guard still vetoes before the fast-path fires; the thrash cap still holds.
+    # Pure function — no bd/gc/git. (min_stranding_secs=POOL_ZOMBIE_TTL: the dog
+    # pool's window, so seconds_stranded=0 is unambiguously "before hysteresis".)
+    # -----------------------------------------------------------------------
+    def _rd(**kw):
+        base = dict(has_live_session=False, has_recent_branch=False,
+                    seconds_stranded=0.0, reclaim_count=0,
+                    has_needs_human=False, has_dispatching_marker=False,
+                    min_stranding_secs=POOL_ZOMBIE_TTL)
+        base.update(kw)
+        return reclaim_decision(**base)
+
+    check("FP-1: provably_dead + stranded=0 + all clear → reclaim (fast-path; was noop pre-fix)",
+          _rd(provably_dead=True) == "reclaim")
+    check("FP-2: NOT provably_dead + stranded=0 → noop (merely-quiet keeps hysteresis)",
+          _rd(provably_dead=False) == "noop")
+    check("FP-3: provably_dead BUT has_needs_human → noop (park guard wins)",
+          _rd(provably_dead=True, has_needs_human=True) == "noop")
+    check("FP-4: provably_dead BUT has_dispatching_marker → noop (gate guard wins)",
+          _rd(provably_dead=True, has_dispatching_marker=True) == "noop")
+    check("FP-5: provably_dead BUT account_rate_limited → noop (ga-ufr7 guard wins)",
+          _rd(provably_dead=True, account_rate_limited=True) == "noop")
+    check("FP-6: provably_dead BUT has_live_session → noop (live builder guard wins)",
+          _rd(provably_dead=True, has_live_session=True) == "noop")
+    check("FP-7: provably_dead BUT has_recent_branch → noop (branch rail wins)",
+          _rd(provably_dead=True, has_recent_branch=True) == "noop")
+    check("FP-8: provably_dead + reclaim_count=MAX_RECLAIMS → escalate (cap still holds)",
+          _rd(provably_dead=True, reclaim_count=MAX_RECLAIMS) == "escalate")
+    check("FP-8b: provably_dead + reclaim_count=MAX-1 → reclaim (still below cap)",
+          _rd(provably_dead=True, reclaim_count=MAX_RECLAIMS - 1) == "reclaim")
+    check("FP-9: DEFAULT (provably_dead unset) + stranded=0 → noop (backward-compat unchanged)",
+          reclaim_decision(
+              has_live_session=False, has_recent_branch=False,
+              seconds_stranded=0.0, reclaim_count=0,
+              has_needs_human=False, has_dispatching_marker=False,
+              min_stranding_secs=POOL_ZOMBIE_TTL) == "noop")
+
+    # -----------------------------------------------------------------------
+    # Section 10: gt-fppb0 — claimant_provably_dead() classifier (CPD-*).
+    # STRICTLY STRONGER than "not live": provably dead only when the claimant is
+    # absent, or every match is in _POOL_DEAD_STATES. A live-but-quiet (stale)
+    # session, an unknown-state session, an empty session list, and a coordinator
+    # assignee are all NOT provably dead. Pure function — no bd/gc/git.
+    # -----------------------------------------------------------------------
+    T_cpd = 1_782_700_000.0
+    _cpd_fresh = _irg_datetime.datetime.fromtimestamp(
+        T_cpd - 60, tz=_irg_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _cpd_stale = _irg_datetime.datetime.fromtimestamp(
+        T_cpd - (STALE_ACTIVITY_TTL + 600), tz=_irg_datetime.timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _other_live = {"id": "ga-nav3", "name": "oracle-wa", "session_name": "oracle-wa-x",
+                   "alias": "oracle-wa", "agent_name": "oracle-wa",
+                   "template": "oracle-wa", "state": "active", "last_active": _cpd_fresh}
+    _dog_active = {"id": "d1", "name": "gastown.dog-2", "session_name": "dog-ga5e06",
+                   "alias": "gastown.dog-2", "agent_name": "dog-ga5e06",
+                   "template": "gastown.dog", "state": "active", "last_active": _cpd_fresh}
+    _dog_asleep = {"id": "d2", "name": "gastown.dog-3", "session_name": "dog-gaXXXX",
+                   "alias": "gastown.dog-3", "agent_name": "dog-gaXXXX",
+                   "template": "gastown.dog", "state": "asleep", "last_active": _cpd_stale}
+    _dog_unknown = dict(_dog_active); _dog_unknown["state"] = "booting"
+    _dog_frozen = dict(_dog_active); _dog_frozen["last_active"] = _cpd_stale  # active but stale
+
+    check("CPD-1: 'gastown.dog' absent from a non-empty session list → True (gone)",
+          claimant_provably_dead("gastown.dog", [_other_live]) is True)
+    check("CPD-2: live fresh dog present (template match) → False (not provably dead)",
+          claimant_provably_dead("gastown.dog", [_dog_active]) is False)
+    check("CPD-3: only dead-state dog (asleep, template match) → True (provably dead)",
+          claimant_provably_dead("gastown.dog", [_dog_asleep]) is True)
+    check("CPD-4: unknown-state dog (booting) → False (ambiguous, never fast-path)",
+          claimant_provably_dead("gastown.dog", [_dog_unknown]) is False)
+    check("CPD-5: active-but-STALE dog (frozen/quiet, ga-64usm) → False (keeps hysteresis)",
+          claimant_provably_dead("gastown.dog", [_dog_frozen]) is False)
+    check("CPD-6: empty session list → False (unknown, cannot prove death — fail-safe)",
+          claimant_provably_dead("gastown.dog", []) is False)
+    check("CPD-7: coordinator assignee (gastown.mayor) → False (parked, other rail)",
+          claimant_provably_dead("gastown.mayor", [_other_live]) is False)
+    check("CPD-8: concrete dead match (wa-worker-adhoc-x, closed) → True",
+          claimant_provably_dead("wa-worker-adhoc-x", [
+              {"id": "s", "name": "n", "session_name": "wa-worker-adhoc-x",
+               "alias": "", "agent_name": "wa-worker-adhoc-x", "template": "wa-worker",
+               "state": "closed", "last_active": _cpd_stale}]) is True)
+    check("CPD-9: empty assignee → False",
+          claimant_provably_dead("", [_other_live]) is False)
+    check("CPD-10: one live dog + one dead dog → False (any live match wins)",
+          claimant_provably_dead("gastown.dog", [_dog_asleep, _dog_active]) is False)
+
+    # -----------------------------------------------------------------------
+    # Section 11: gt-fppb0 — reclaim_dead_dog_claims() end-to-end (DD-*).
+    # The falsifiable "reclaimed within 1 hook cycle, not re-offered to N
+    # workers" test. Stubs subprocess.run to serve the full call graph
+    # (bd list/show, gc session/agent/rig list, git, quota-check) and CAPTURES
+    # bd mutations, so a real reclaim is provable by its bd assign/update calls.
+    # time.time is frozen so get_branch_recent + do_reclaim are deterministic.
+    # -----------------------------------------------------------------------
+    T_dd = 1_782_800_000.0
+    _dd_fresh = _irg_datetime.datetime.fromtimestamp(
+        T_dd - 60, tz=_irg_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _dd_other = {"id": "ga-nav3", "name": "oracle-wa", "session_name": "oracle-wa-x",
+                 "alias": "oracle-wa", "agent_name": "oracle-wa",
+                 "template": "oracle-wa", "state": "active", "last_active": _dd_fresh}
+    # A live dog whose identifier matches a sling assignee but NOT template — so
+    # only the sling rail (not pool_has_live_worker) can protect via it.
+    _dd_sling_dog = {"id": "d9", "name": "gastown.dog-2", "session_name": "dog-ga5e06",
+                     "alias": "gastown.dog-2", "agent_name": "dog-ga5e06",
+                     "template": "", "state": "active", "last_active": _dd_fresh}
+
+    def _make_dd_stub(dog_beads, sessions, inprogress=None, markers=None,
+                      titles=None, agents=None, refs=None, quota_rc=0,
+                      sessions_fail=False):
+        inprogress = inprogress if inprogress is not None else []
+        markers = markers or {}
+        titles = titles or {}
+        agents = agents or []
+        refs = refs or []
+        mutations = []
+        calls = []
+
+        class _R:
+            def __init__(self, rc=0, out=""):
+                self.returncode = rc
+                self.stdout = out
+                self.stderr = ""
+
+        def _run(cmd, **kw):
+            if not isinstance(cmd, (list, tuple)):
+                return _R(0, "")
+            calls.append(list(cmd))
+            if cmd and cmd[0] == QUOTA_CHECK:
+                return _R(quota_rc, "")
+            if cmd[0] == "gc":
+                if len(cmd) >= 3 and cmd[1] == "session" and cmd[2] == "list":
+                    if sessions_fail:
+                        return _R(1, "")
+                    return _R(0, json.dumps({"sessions": sessions}))
+                if len(cmd) >= 3 and cmd[1] == "agent" and cmd[2] == "list":
+                    return _R(0, json.dumps({"agents": agents}))
+                if len(cmd) >= 3 and cmd[1] == "rig" and cmd[2] == "list":
+                    return _R(0, json.dumps({"rigs": []}))
+                return _R(0, "")
+            if cmd[0] == "git":
+                if "for-each-ref" in cmd:
+                    return _R(0, ("\n".join(refs) + "\n") if refs else "")
+                return _R(0, "")
+            if cmd[0] == "bd":
+                args = list(cmd[1:])
+                if len(args) >= 2 and args[0] == "-C":
+                    args = args[2:]
+                sub = args[0] if args else ""
+                if sub == "list":
+                    if "--assignee" in args:                       # dog Tier-1 query
+                        return _R(0, json.dumps(dog_beads))
+                    if "type:quality-gate-marker" in args:         # gate-marker query
+                        labs = [args[i + 1] for i, a in enumerate(args)
+                                if a == "--label" and i + 1 < len(args)]
+                        gate_lbl = labs[1] if len(labs) > 1 else (labs[0] if labs else "")
+                        payload = [{"id": f"marker-{i}", "labels": lbls}
+                                   for i, lbls in enumerate(markers.get(gate_lbl, []))]
+                        return _R(0, json.dumps(payload))
+                    if "in_progress" in args:                      # sling in_progress query
+                        return _R(0, json.dumps(inprogress))
+                    return _R(0, "[]")
+                if sub == "show":
+                    ids = [a for a in args[1:] if a != "--json"]
+                    return _R(0, json.dumps([{"id": i, "title": titles.get(i, "")} for i in ids]))
+                if sub in ("label", "assign", "update", "comment"):
+                    mutations.append(list(cmd))
+                    return _R(0, "")
+                return _R(0, "")
+            return _R(0, "")
+        return _run, mutations, calls
+
+    def _mut_has(muts, *needle):
+        needle = list(needle)
+        return any(needle == [a for a in m if a not in ("-C",)][:len(needle)]
+                   or needle == m[-len(needle):] for m in muts)
+
+    _orig_run_dd = subprocess.run
+    _orig_time_dd = time.time
+    try:
+        time.time = lambda: T_dd
+
+        _X = {"id": "ga-zomb1", "title": "chronic Dolt handle refactor",
+              "assignee": "gastown.dog", "labels": ["story:in-flight"],
+              "updated_at": _dd_fresh}
+
+        # DD-1: DEAD claimant → reclaim within one preflight, mutations prove it.
+        subprocess.run, muts, calls = _make_dd_stub([_X], [_dd_other], inprogress=[_X])
+        _r1 = reclaim_dead_dog_claims(now=T_dd)
+        check("DD-1: provably-dead dog claim → reclaimed in ONE preflight (was re-offered pre-fix)",
+              _r1 == ["ga-zomb1"], f"got={_r1!r}")
+        check("DD-1b: reclaim cleared the dog assignee (bd assign ga-zomb1 '')",
+              any(m[:2] == ["bd", "assign"] and "ga-zomb1" in m for m in muts),
+              f"muts={muts!r}")
+        check("DD-1c: reclaim reset status to open (bd update ga-zomb1 --status open)",
+              any(m[:2] == ["bd", "update"] and "ga-zomb1" in m and "open" in m for m in muts),
+              f"muts={muts!r}")
+
+        # DD-2: live SLING owner → protected (noop), even though the classifier
+        # would call the bare 'gastown.dog' claimant absent (has_live_session wins).
+        _sling = {"id": "ga-sling1", "title": "fix bug ga-zomb1: chronic Dolt handle",
+                  "assignee": "dog-ga5e06", "labels": [], "updated_at": _dd_fresh}
+        subprocess.run, muts, calls = _make_dd_stub(
+            [_X], [_dd_sling_dog], inprogress=[_X, _sling])
+        _r2 = reclaim_dead_dog_claims(now=T_dd)
+        check("DD-2: live sling source (ga-qfo3) protects the original → noop",
+              _r2 == [] and muts == [], f"got={_r2!r} muts={muts!r}")
+
+        # DD-3: gate:needs-human → parked → noop even though provably dead.
+        _Xnh = dict(_X); _Xnh["labels"] = ["story:in-flight", "gate:needs-human"]
+        subprocess.run, muts, calls = _make_dd_stub([_Xnh], [_dd_other], inprogress=[_Xnh])
+        _r3 = reclaim_dead_dog_claims(now=T_dd)
+        check("DD-3: gate:needs-human guard → noop (provably dead but parked)",
+              _r3 == [] and muts == [], f"got={_r3!r} muts={muts!r}")
+
+        # DD-4: active quality-gate marker on the bead → noop.
+        subprocess.run, muts, calls = _make_dd_stub(
+            [_X], [_dd_other], inprogress=[_X],
+            markers={"gate-status:queued": [["source-bead:ga-zomb1", "type:quality-gate-marker"]]},
+            titles={"ga-zomb1": "chronic Dolt handle refactor"})
+        _r4 = reclaim_dead_dog_claims(now=T_dd)
+        check("DD-4: active gate marker guard → noop",
+              _r4 == [] and muts == [], f"got={_r4!r} muts={muts!r}")
+
+        # DD-5: account rate-limited (quota exit 2) → defer → noop.
+        subprocess.run, muts, calls = _make_dd_stub([_X], [_dd_other], inprogress=[_X], quota_rc=2)
+        _r5 = reclaim_dead_dog_claims(now=T_dd)
+        check("DD-5: account rate-limited (ga-ufr7) → noop (deferred)",
+              _r5 == [] and muts == [], f"got={_r5!r} muts={muts!r}")
+
+        # DD-6: deliberately-suspended owner HOLD → noop.
+        subprocess.run, muts, calls = _make_dd_stub(
+            [_X], [_dd_other], inprogress=[_X],
+            agents=[{"name": "gastown.dog", "suspended": True}])
+        _r6 = reclaim_dead_dog_claims(now=T_dd)
+        check("DD-6: suspended-owner HOLD → noop (waits for resume, never re-pooled)",
+              _r6 == [] and muts == [], f"got={_r6!r} muts={muts!r}")
+
+        # DD-7: session probe fails → fail-safe → noop (do nothing, never block).
+        subprocess.run, muts, calls = _make_dd_stub([_X], [], inprogress=[_X], sessions_fail=True)
+        _r7 = reclaim_dead_dog_claims(now=T_dd)
+        check("DD-7: gc session list fails → fail-safe noop (no reclaim on unknown liveness)",
+              _r7 == [] and muts == [], f"got={_r7!r} muts={muts!r}")
+
+        # DD-8: no candidate dog beads → fast healthy path, no session fetch at all.
+        subprocess.run, muts, calls = _make_dd_stub([], [_dd_other])
+        _r8 = reclaim_dead_dog_claims(now=T_dd)
+        _fetched_sessions = any(c[:3] == ["gc", "session", "list"] for c in calls)
+        check("DD-8: no dog candidates → noop AND no gc session list call (fast healthy path)",
+              _r8 == [] and muts == [] and not _fetched_sessions,
+              f"got={_r8!r} calls={calls!r}")
+
+        # DD-9: recent branch progress → noop (branch rail, fetch=False path).
+        subprocess.run, muts, calls = _make_dd_stub(
+            [_X], [_dd_other], inprogress=[_X],
+            refs=[f"refs/remotes/origin/crew/gastown.dog/ga-zomb1 {int(T_dd - 60)}"])
+        _r9 = reclaim_dead_dog_claims(now=T_dd)
+        check("DD-9: recent crew/gastown.dog/<id> branch → noop (branch rail holds)",
+              _r9 == [] and muts == [], f"got={_r9!r} muts={muts!r}")
+        _no_fetch = not any(c[:1] == ["git"] and "fetch" in c for c in calls)
+        check("DD-9b: preflight branch check did NOT run git fetch (fast, fetch=False)",
+              _no_fetch, f"calls={[c for c in calls if c[:1]==['git']]!r}")
+
+        # DD-10: dry_run → reports the reclaim but performs NO bd mutation.
+        subprocess.run, muts, calls = _make_dd_stub([_X], [_dd_other], inprogress=[_X])
+        _r10 = reclaim_dead_dog_claims(now=T_dd, dry_run=True)
+        check("DD-10: dry_run → identifies zombie but performs no bd mutation",
+              _r10 == ["ga-zomb1"] and muts == [], f"got={_r10!r} muts={muts!r}")
+    finally:
+        subprocess.run = _orig_run_dd
+        time.time = _orig_time_dd
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0

@@ -67,6 +67,12 @@ suspended = true
 dir = ""
 name = "gastown.dog"
 provider = "claude-headless"
+# gt-fppb0: reclaim PROVABLY-DEAD dog-pool claims before this fresh dog runs
+# `gc hook`, so its Tier-1 work_query (bd list --status in_progress --assignee
+# gastown.dog) can't re-adopt a dead claimant's zombie and burn in a respawn
+# loop. Fast + FAIL-OPEN (SIGALRM budget + catch-all → always exit 0); it never
+# blocks a spawn. inflight-reclaim-guard's poll is the authoritative backstop.
+pre_start = ["/Users/athos/gt/.gascity-gastown-hq/scripts/dog-pool-preflight-reclaim.py"]
 
 [daemon]
 formula_v2 = true
