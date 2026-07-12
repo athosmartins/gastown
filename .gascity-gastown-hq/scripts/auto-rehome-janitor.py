@@ -61,6 +61,12 @@ BD_TIMEOUT = int(os.environ.get("REHOME_BD_TIMEOUT", "30"))
 # SKIP_SUSPENDED: when True, skip rigs that are suspended (running=false).
 # Default False: re-home even to suspended rigs (bead will wait there for rig restart).
 SKIP_SUSPENDED = os.environ.get("REHOME_SKIP_SUSPENDED", "0") == "1"
+# MISSING_FILE_GUARD (ga-xzfl): before re-homing a bead to rig R, if the bead cites
+# concrete file paths and NONE exist in R's repo, R is the WRONG rig — keep the bead in
+# HQ (do NOT create+close). This mirrors the Pilot dispatcher's PILOT_MISSING_FILE_GUARD
+# and reads the SAME env var, so one kill-switch disables both sites. Default on.
+# FAIL-OPEN: no cited paths / unknown-or-off-disk rig root / probe error → re-home as today.
+MISSING_FILE_GUARD = os.environ.get("PILOT_MISSING_FILE_GUARD", "1") == "1"
 
 # ── test seams (monkeypatched in --selftest) ───────────────────────────────────
 _gc_rig_list_fn = None   # () -> list[dict]
@@ -72,6 +78,7 @@ _bd_comment_fn = None    # (rig_root, bead_id, text) -> bool
 _bd_close_fn = None      # (rig_root, bead_id, reason) -> bool
 _bd_label_list_fn = None # (rig_root) -> list[str]|None  (all labels in store)
 _do_notify_fn = None     # (msg, prio) -> None
+_file_exists_fn = None   # (rig_root, rel_path) -> bool  (ga-xzfl missing-file guard seam)
 
 
 # ── subprocess helper ─────────────────────────────────────────────────────────
@@ -356,6 +363,75 @@ def _bd_close_bead(rig_root, bead_id, reason):
     return bool(r and r.returncode == 0)
 
 
+# ── ga-xzfl: missing-file guard (mirror of the Pilot dispatcher's bead_cited_paths /
+#    _rig_has_any_path — a bead re-homed to a rig lacking its files NEVERSTARTS there) ─
+_PATH_TOKEN_RE = re.compile(r'\.?[A-Za-z0-9_-]+(?:/[A-Za-z0-9_.-]+)+')
+_PATH_EXT_RE = re.compile(
+    r'\.(?:py|sh|js|ts|tsx|jsx|toml|md|json|ya?ml|sql|txt|cfg|ini|go|rb|html|css|plist|conf)$',
+    re.IGNORECASE)
+_URL_STRIP_RE = re.compile(r'https?://\S+')
+
+
+def _paths_from_bead(bead):
+    """Extract concrete file paths a bead names — slash-joined tokens ending in a known
+    code/config extension — deduped, order-preserving. URLs are stripped first so a
+    hostname (painel.urblink.com.br/…) is never mistaken for a repo path. Scans
+    title + description + acceptance_criteria + every story.* metadata string."""
+    parts = [bead.get("title") or "", bead.get("description") or "",
+             bead.get("acceptance_criteria") or ""]
+    meta = bead.get("metadata") or {}
+    if isinstance(meta, dict):
+        for k, v in meta.items():
+            if isinstance(k, str) and k.startswith("story.") and isinstance(v, str):
+                parts.append(v)
+    hay = _URL_STRIP_RE.sub(" ", "  ".join(parts))
+    out, seen = [], set()
+    for tok in _PATH_TOKEN_RE.findall(hay):
+        if _PATH_EXT_RE.search(tok) and tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+    return out
+
+
+def _file_exists_in_rig(rig_path, rel):
+    """True iff <rel> is a tracked file in the rig's git repo OR exists on disk under
+    rig_path. Uses the _file_exists_fn seam when set (selftest).
+    FINDING 4: NEVER conflate a probe FAILURE with 'file absent'. git ls-files
+    --error-unmatch exits 0=tracked, 1=cleanly-not-tracked; a None result (timeout / spawn
+    error) or ANY other returncode (124 timeout, 128 not-a-repo, …) is a PROBE FAILURE ⇒
+    fail-OPEN (return True), so a probe hiccup under disk pressure never triggers a
+    destructive false refuse."""
+    if _file_exists_fn is not None:
+        return _file_exists_fn(rig_path, rel)
+    r = _sh(["git", "-C", rig_path, "ls-files", "--error-unmatch", "--", rel], timeout=5)
+    if r is None:
+        return True                       # probe failed (timeout / spawn error) → fail-open
+    if r.returncode == 0:
+        return True                       # tracked
+    if r.returncode == 1:                 # cleanly not tracked → the disk is the tie-breaker
+        try:
+            return os.path.exists(os.path.join(rig_path, rel))
+        except Exception:
+            return True
+    return True                           # any other rc (124/128/…) → probe failure → fail-open
+
+
+def _rig_has_any_cited_file(bead, rig_path):
+    """Return True when the bead cites NO concrete paths, when the rig root is
+    unknown/off-disk (and no test seam is active), or when at least ONE cited path exists
+    in rig_path. Return False ONLY when the bead cites paths AND none exist in a known
+    rig root — a confident 'this rig is missing every file the bead names'. FAIL-OPEN."""
+    paths = _paths_from_bead(bead)
+    if not paths:
+        return True
+    if _file_exists_fn is None and (not rig_path or not os.path.isdir(rig_path)):
+        return True  # unknown / off-disk rig root → cannot judge → fail-open
+    for p in paths:
+        if _file_exists_in_rig(rig_path, p):
+            return True
+    return False
+
+
 # ── re-home one bead ──────────────────────────────────────────────────────────
 def _rehome_bead(hq_bead, rig, state):
     """Re-home a single HQ bead to its target rig store.
@@ -389,6 +465,22 @@ def _rehome_bead(hq_bead, rig, state):
         prior = state["rehomed"][hq_id]
         _log("  SKIP %s: state records as already re-homed → %s in %s (at %s)" % (
              hq_id, prior.get("new_id"), prior.get("rig"), prior.get("ts")))
+        return False
+
+    # ── ga-xzfl: missing-file guard ────────────────────────────────────────────
+    # FINDING 2: only keep-in-HQ when the cited files are GENUINELY MISLOCATED — absent in
+    # the target rig but PRESENT IN HQ (so this bead is really HQ work mis-tagged for rehome).
+    # If HQ ALSO lacks them, it's a CREATE-FILE bead whose file doesn't exist anywhere yet;
+    # the target rig is the CORRECT place to create it, so proceed (refusing would strand it
+    # in HQ forever → NEVERSTART). Both probes are fail-open (see _file_exists_in_rig FINDING 4),
+    # so a probe hiccup never manufactures a destructive false refuse.
+    if (MISSING_FILE_GUARD
+            and not _rig_has_any_cited_file(hq_bead, rig_path)
+            and _rig_has_any_cited_file(hq_bead, CITY)):
+        _log("  SKIP %s: cites file path(s) %s present in HQ but absent in target rig %s (%s) — "
+             "MISLOCATED (not this rig's work); keeping HQ bead untouched (no create/close). "
+             "Disable with PILOT_MISSING_FILE_GUARD=0." % (
+                 hq_id, _paths_from_bead(hq_bead), rig_name, rig_path))
         return False
 
     # ── Step 1: Create in rig store ────────────────────────────────────────────
@@ -607,6 +699,11 @@ def _selftest():
       (h) MAX_PER_SWEEP=1, 3 candidates → only 1 re-homed
       (i) unknown label suffix → SKIP (no rig match), no crash
       (j) needs:rehome-property_scrapers (full name) → resolves to property_scrapers
+      (k) missing-file guard: cited file present in HQ, absent in target rig → refuse (mislocated)
+      (k2) control: cited path present in target rig → re-home proceeds (no over-fire)
+      (k3) PILOT_MISSING_FILE_GUARD=0 → re-home despite mislocation (kill-switch)
+      (k4) FINDING 2: create-file bead (cited file in NO rig incl HQ) → re-home, NOT refuse
+      (k5) FINDING 4: git-probe timeout/None → fail-open present (never conflate with absent)
     """
     global _gc_rig_list_fn, _bd_list_fn, _bd_show_fn, _bd_create_fn
     global _bd_update_fn, _bd_comment_fn, _bd_close_fn, _bd_label_list_fn
@@ -839,6 +936,92 @@ def _selftest():
         _ok("(j): full rig name resolves to property_scrapers")
     else:
         _bad("(j)", "created=%s" % created)
+
+    # ── (k) ga-xzfl missing-file guard: file MISLOCATED (present in HQ, absent in R) → refuse ─
+    # FINDING 2: only refuse when the cited file is GENUINELY MISLOCATED — present in HQ but
+    # absent in the target rig (this bead is really HQ work mis-tagged for rehome). Stub: file
+    # present in HQ (root==CITY), absent in property_scrapers (root=="/ps").
+    print("\nScenario (k): cited file present in HQ, absent in target rig → refuse (no create/close/mark)")
+    globals()["_file_exists_fn"] = lambda root, rel: (root == CITY)  # in HQ only, not in PS
+    _bd_list_fn = lambda path, label: (
+        [_make_hq_bead("ga-missing", meta={"story.o_que_e": "fix scripts/only_in_hq.py routing", "story.resumo": "r"})]
+        if label == "needs:rehome-property" else [])
+    _make_stubs()
+    st = {"rehomed": {}}
+    _reset()
+    run_sweep(0, st)
+    if not created and not closed and not updated:
+        _ok("(k): file present in HQ, absent in rig → mislocated → HQ bead untouched (no create/close/mark)")
+    else:
+        _bad("(k)", "created=%s closed=%s updated=%s" % (created, closed, updated))
+
+    # ── (k2) control: cited path PRESENT in target rig → re-home proceeds ────────
+    print("\nScenario (k2): cited path present in target rig → re-home proceeds (no false refuse)")
+    globals()["_file_exists_fn"] = lambda root, rel: True  # cited path "present" in rig
+    _bd_list_fn = lambda path, label: (
+        [_make_hq_bead("ga-present", meta={"story.o_que_e": "fix scrapers/rehome_thing.py", "story.resumo": "r"})]
+        if label == "needs:rehome-property" else [])
+    _make_stubs()
+    st = {"rehomed": {}}
+    _reset()
+    run_sweep(0, st)
+    if any(p == "/ps" for p, _ in created) and any(bid == "ga-present" for bid, _ in closed):
+        _ok("(k2): cited path present → re-homed normally (guard did not over-fire)")
+    else:
+        _bad("(k2)", "created=%s closed=%s" % (created, closed))
+
+    # ── (k3) knob: PILOT_MISSING_FILE_GUARD=0 → re-home despite mislocation ─────
+    print("\nScenario (k3): MISSING_FILE_GUARD off → re-home despite mislocation (kill-switch works)")
+    globals()["_file_exists_fn"] = lambda root, rel: (root == CITY)  # mislocated (guard ON would refuse)
+    globals()["MISSING_FILE_GUARD"] = False
+    _bd_list_fn = lambda path, label: (
+        [_make_hq_bead("ga-offguard", meta={"story.o_que_e": "fix scripts/only_in_hq.py", "story.resumo": "r"})]
+        if label == "needs:rehome-property" else [])
+    _make_stubs()
+    st = {"rehomed": {}}
+    _reset()
+    run_sweep(0, st)
+    if any(p == "/ps" for p, _ in created):
+        _ok("(k3): guard OFF → re-home proceeds despite mislocation (knob is a real kill-switch)")
+    else:
+        _bad("(k3)", "created=%s" % created)
+    globals()["MISSING_FILE_GUARD"] = True   # restore
+    globals()["_file_exists_fn"] = None      # restore
+
+    # ── (k4) FINDING 2: CREATE-FILE bead — cited file in NO rig (incl HQ) → re-home, NOT refuse ─
+    # The file doesn't exist anywhere yet; the target rig is the correct place to create it.
+    # Refusing would strand it in HQ forever (HQ can't build a PS scraper) → NEVERSTART.
+    print("\nScenario (k4): create-file bead (cited file in NO rig, incl HQ) → re-home proceeds")
+    globals()["_file_exists_fn"] = lambda root, rel: False  # absent EVERYWHERE (create-file)
+    _bd_list_fn = lambda path, label: (
+        [_make_hq_bead("ga-newfile", meta={"story.o_que_e": "create scrapers/foo_novo.py — brand new file", "story.resumo": "r"})]
+        if label == "needs:rehome-property" else [])
+    _make_stubs()
+    st = {"rehomed": {}}
+    _reset()
+    run_sweep(0, st)
+    if any(p == "/ps" for p, _ in created) and any(bid == "ga-newfile" for bid, _ in closed):
+        _ok("(k4): create-file bead re-homed to PS (correct rig to create it), NOT stranded in HQ")
+    else:
+        _bad("(k4)", "created=%s closed=%s (create-file bead was wrongly refused → NEVERSTART)" % (created, closed))
+
+    # ── (k5) FINDING 4: git-probe FAILURE must fail-open (present), never conflate with absent ──
+    print("\nScenario (k5): _file_exists_in_rig — git-probe timeout/None → fail-open present (not absent)")
+    globals()["_file_exists_fn"] = None
+    _sh_orig = globals()["_sh"]
+    class _RC124:
+        returncode = 124
+        stdout = ""
+        stderr = ""
+    globals()["_sh"] = lambda args, timeout=20: _RC124()       # git ls-files "times out" (rc=124)
+    r124 = _file_exists_in_rig(os.getcwd(), "does/not/exist_xyz.py")
+    globals()["_sh"] = lambda args, timeout=20: None            # subprocess raised (timeout) → None
+    rnone = _file_exists_in_rig(os.getcwd(), "does/not/exist_xyz.py")
+    globals()["_sh"] = _sh_orig                                 # restore
+    if r124 is True and rnone is True:
+        _ok("(k5): git-probe rc=124 AND _sh None → fail-open present (probe failure ≠ file absent)")
+    else:
+        _bad("(k5)", "rc124=%s none=%s (probe failure conflated with absent → destructive false refuse)" % (r124, rnone))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[rehome selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))

@@ -693,6 +693,140 @@ rig_domain_default_builder() {
   esac
 }
 
+# ── ga-xzfl: PATH-authoritative rig inference (the router-sabotages-itself bug) ─
+# ROOT: rig inference uses KEYWORDS (bead_content_rig/bead_domain), so a bead ABOUT
+# the routing machinery — cites packs/town-deltas/assets/pilot-dispatcher.sh +
+# scripts/auto-rehome-janitor.py, mentions "scraper"/"property_scrapers" in prose —
+# is keyword-classified property_scrapers and mis-dispatched to batista-ps, which
+# cannot build framework files → NEVERSTART. The file PATHS a bead names are far
+# more authoritative than the words it uses. These helpers extract those paths and
+# map them to the owning rig. Everything here is FAIL-OPEN, ADDITIVE and KNOB-GATED
+# (PILOT_PATH_RIG_GUARD / PILOT_MISSING_FILE_GUARD, default-on): no path signal ⇒ the
+# existing keyword/owner/explicit routing runs byte-for-byte unchanged.
+
+# _bead_path_haystack <bead_json> — the title+desc+criteria+story.*+labels blob used
+# for path extraction, with URLs stripped so a hostname (painel.urblink.com.br/…) is
+# never mistaken for a repo path. FAIL-OPEN: jq error → "".
+_bead_path_haystack() {
+  local bead="$1" hay
+  hay=$(echo "$bead" | jq -r '
+      [ (.title // ""), (.description // ""),
+        (.acceptance_criteria // .metadata["story.criterios"] // ""),
+        (.metadata["story.o_que_e"] // ""), (.metadata["story.resumo"] // ""),
+        (.metadata["story.dependencias"] // ""), (.metadata["story.notebook"] // ""),
+        ((.labels // []) | join(" ")) ] | join("  ")
+    ' 2>/dev/null || echo "")
+  [ -z "$hay" ] && { printf ''; return 0; }
+  printf '%s' "$hay" | sed -E 's#https?://[^[:space:]]*##g' 2>/dev/null || printf '%s' "$hay"
+}
+
+# bead_cited_paths <bead_json> — echo the concrete file paths a bead names, one per
+# line (deduped). A "concrete path" is a slash-joined token ending in a known code/
+# config extension (.py/.sh/.toml/…). Empty when none. Used by the missing-file guard
+# to probe whether a routed rig actually contains the files the bead is about.
+# FAIL-OPEN: any jq/grep error or no match → "".
+bead_cited_paths() {
+  local bead="$1" hay out
+  hay=$(_bead_path_haystack "$bead")
+  [ -z "$hay" ] && { printf ''; return 0; }
+  out=$(printf '%s' "$hay" \
+        | grep -oE '\.?[A-Za-z0-9_-]+(/[A-Za-z0-9_.-]+)+' 2>/dev/null \
+        | grep -iE '\.(py|sh|js|ts|tsx|jsx|toml|md|json|ya?ml|sql|txt|cfg|ini|go|rb|html|css|plist|conf)$' 2>/dev/null \
+        | sort -u 2>/dev/null || true)
+  printf '%s' "$out"
+}
+
+# bead_path_rig <bead_json> — infer the OWNING RIG from the FILE PATHS a bead names.
+# Prints one of:
+#   gascity              — an UNAMBIGUOUS HQ/framework path (packs//skills//agents//
+#                          .claude//city.toml/pack.toml/town-deltas), OR an ambiguous
+#                          scripts/ path when the bead carries NO product-content
+#                          keyword. Consumed by the framework-dog-exempt (below) which
+#                          clears the rig so the bead fails OPEN to the dog pool.
+#   whatsapp_automation  — a WA-owned path: crew/<*-wa>/, outreach/, painel/, shared/.
+#   property_scrapers    — a PS-owned path: crew/<*-ps>/, scrapers/.
+#   ""                   — no path signal → caller leaves routing UNCHANGED (fail-open).
+# scripts/ is INTENTIONALLY treated as ambiguous: it is a top-level dir in HQ *and*
+# property_scrapers *and* whatsapp_automation (verified via git ls-files), so a bare
+# scripts/ citation only implies gascity when no product keyword is present — otherwise
+# a product script (e.g. scripts/itbi_drive_bridge.py, a WA file — Scenario 18h) would
+# be wrongly force-routed to the dog. First match wins; framework paths win over
+# product paths (a bead touching packs/ IS framework even if it also names outreach/).
+bead_path_rig() {
+  local bead="$1" hay _crew
+  hay=$(_bead_path_haystack "$bead")
+  [ -z "$hay" ] && { echo ""; return 0; }
+  # (1) UNAMBIGUOUS HQ/framework paths (do NOT exist in any product rig).
+  if printf '%s' "$hay" | grep -qE '(^|[^[:alnum:]._/-])(packs|skills|agents)/|(^|[^[:alnum:]._/-])\.claude/|(city|pack)\.toml|town-deltas' 2>/dev/null; then
+    echo "gascity"; return 0
+  fi
+  # (2) crew/<name>/ → owning rig by crew-name suffix (mirror the *-wa/*-ps owner map).
+  _crew=$(printf '%s' "$hay" | grep -oE '(^|[^[:alnum:]._/-])crew/[A-Za-z0-9._-]+' 2>/dev/null | grep -oE 'crew/[A-Za-z0-9._-]+' 2>/dev/null | sed -E 's#^crew/##' 2>/dev/null | head -1 || true)
+  if [ -n "$_crew" ]; then
+    case "$_crew" in
+      *-wa|*-wa-*|whatsapp_automation*|wa-worker*) echo "whatsapp_automation"; return 0 ;;
+      *-ps|*-ps-*|property_scrapers*|ps-worker*)   echo "property_scrapers";   return 0 ;;
+    esac
+  fi
+  # (3) WA-domain product paths. outreach//painel/ are WA concepts absent from
+  #     property_scrapers. shared/ is DELIBERATELY EXCLUDED (ga-xzfl review FINDING 3):
+  #     it exists on disk in BOTH whatsapp_automation AND property_scrapers, so a shared/
+  #     citation is AMBIGUOUS and must fall through to owner/content, never force WA.
+  if printf '%s' "$hay" | grep -qE '(^|[^[:alnum:]._/-])(outreach|painel)/' 2>/dev/null; then
+    echo "whatsapp_automation"; return 0
+  fi
+  # (4) property_scrapers product path (scrapers/ is a PS-exclusive top-level dir).
+  if printf '%s' "$hay" | grep -qE '(^|[^[:alnum:]._/-])scrapers/' 2>/dev/null; then
+    echo "property_scrapers"; return 0
+  fi
+  # (5) DELIBERATELY NO bare-scripts/ rule (ga-xzfl review FINDING 1): scripts/ is a top-level
+  #     dir in HQ *and* property_scrapers *and* whatsapp_automation, so a bare scripts/ citation
+  #     is too ambiguous to name a rig. Forcing gascity here overrode the ga-nlh79 owner signal
+  #     — a *-wa/*-ps/-worker-owned scripts/ bead with no product keyword got dogged → NEVERSTART.
+  #     So we return "" and let the owner-authoritative/content inference below decide. (A
+  #     scripts/-only bead with no owner and no keyword still reaches the dog via bead_content_rig="".)
+  echo ""
+}
+
+# _rig_has_any_path <rig> <newline-or-space-separated-paths> — return 0 (true) when the
+# bead cites no paths, when the rig root is unknown/off-disk, or when at least ONE cited
+# path exists in the rig's repo. Return 1 (false) ONLY when the rig root is known AND
+# NONE of the cited paths exist there. So `! _rig_has_any_path …` fires only on a
+# confident "this rig is missing every file the bead names". Test seam:
+# PILOT_TEST_RIG_HAS_FILE ("1"=treat all present, "0"=treat all absent). FAIL-OPEN.
+_rig_has_any_path() {
+  local _rig="$1" _paths="$2" _root _p _rc
+  [ -z "$_paths" ] && return 0
+  # Test seam: PILOT_TEST_RIG_HAS_FILE, when non-empty, forces the verdict:
+  #   "1"            → every rig has the files;  "0" → NO rig has them (create-file);
+  #   "<rig> [rig…]" → only the listed rigs have them (per-rig, for mislocation tests).
+  # Empty/unset ⇒ seam inactive ⇒ real probe (a harness passing it through as "" never
+  # accidentally arms the guard).
+  if [ -n "${PILOT_TEST_RIG_HAS_FILE:-}" ]; then
+    case "$PILOT_TEST_RIG_HAS_FILE" in
+      1) return 0 ;;
+      0) return 1 ;;
+      *) case " $PILOT_TEST_RIG_HAS_FILE " in *" $_rig "*) return 0 ;; *) return 1 ;; esac ;;
+    esac
+  fi
+  _root=$(rig_root_path "$_rig" 2>/dev/null || echo "")
+  [ -z "$_root" ] && return 0
+  [ -d "$_root" ] || return 0
+  for _p in $_paths; do
+    [ -z "$_p" ] && continue
+    # FINDING 4: NEVER conflate a probe FAILURE with "file absent". git ls-files
+    # --error-unmatch exits 0=tracked, 1=cleanly-not-tracked; anything else (124 timeout,
+    # 128 not-a-repo, 127 no-git, spawn error) is a PROBE FAILURE ⇒ fail-OPEN (present).
+    _rc=0; timeout 5 git -C "$_root" ls-files --error-unmatch -- "$_p" >/dev/null 2>&1 || _rc=$?
+    case "$_rc" in
+      0) return 0 ;;                          # tracked → present
+      1) [ -e "$_root/$_p" ] && return 0 ;;   # cleanly not tracked → check disk
+      *) return 0 ;;                          # probe FAILED → fail-open (present, never refuse)
+    esac
+  done
+  return 1  # every cited path is CLEANLY absent (not tracked AND not on disk)
+}
+
 # ── ga-mfeip gate (e): suspended-crew exclusion ───────────────────────────────
 # A suspended crew (e.g. digo-wa) must NEVER receive a dispatch: the bead would sit
 # assigned-but-unbuilt forever (the wa-n0vv→digo phantom). The authoritative source
@@ -3682,7 +3816,7 @@ LIVESEC
   if [ "${PILOT_DOMAIN_ROUTE_GUARD:-1}" = "1" ]; then
     case "$BUILDER_TARGET" in
       gastown.dog|gastown.dog-*)
-        local _DOMAIN_RIG=""
+        local _DOMAIN_RIG="" _PATH_RIG=""
         # imp20: if story.rig is EXPLICITLY set in metadata (STORY_RIG_EXPLICIT=1), honor it
         # as authoritative over content-based inference. bead_content_rig uses keyword matching
         # which can false-positive on WA features that mention property/CNAE/ITBI nouns.
@@ -3690,6 +3824,24 @@ LIVESEC
           _DOMAIN_RIG="$STORY_RIG"
           log "imp20: $STORY_ID story.rig=$STORY_RIG is explicit — using authoritative rig over bead_content_rig inference"
         else
+          # ── FIX 1 (ga-xzfl): PATH-authoritative rig derivation, BEFORE owner/keyword ──
+          # The FILE PATHS a bead names beat the words it uses. A concrete PRODUCT path
+          # (crew/<*-wa|*-ps>/, outreach//painel//shared/ → WA; scrapers/ → PS) is used
+          # directly, overriding the owner/keyword inference below. A gascity/framework
+          # path (packs//scripts//…) is NOT resolved here — it is recorded in _PATH_RIG
+          # and handled by the framework-dog-exempt (FIX 2) so its "clear → fail-open to
+          # the dog" still logs and still honors PILOT_FRAMEWORK_DOG_EXEMPT (keeps the
+          # ga-tgo7q/ga-evjs2 exemption scenarios intact). This placement lets a concrete
+          # framework path WIN over a *-wa owner (the guard below never sets a product rig
+          # for it). Fail-open: PILOT_PATH_RIG_GUARD=0 or no path extracted ⇒ _PATH_RIG=""
+          # ⇒ the owner/keyword block runs byte-for-byte unchanged.
+          if [ "${PILOT_PATH_RIG_GUARD:-1}" = "1" ]; then
+            _PATH_RIG=$(bead_path_rig "$STORY" 2>/dev/null || echo "")
+          fi
+          if [ -n "$_PATH_RIG" ] && [ "$_PATH_RIG" != "gascity" ]; then
+            _DOMAIN_RIG="$_PATH_RIG"
+            log "ga-xzfl: $STORY_ID path-authoritative rig=$_PATH_RIG (from cited file paths) — overriding owner/keyword inference (a bead's file paths beat its words). Disable with PILOT_PATH_RIG_GUARD=0."
+          else
           # ga-nlh79: OWNER-AUTHORITATIVE rig precedence — a bead whose creator (created_by)
           # or assignee is a *-wa crew belongs to whatsapp_automation by definition, BEFORE
           # any content-keyword inference. bead_content_rig's keyword match fails when the
@@ -3730,6 +3882,7 @@ LIVESEC
           else
             _DOMAIN_RIG=$(bead_content_rig "$STORY" 2>/dev/null || echo "")
           fi
+          fi  # end FIX 1 (ga-xzfl) path-authoritative if/else — falls through to owner/keyword inference above
         fi
         # ── framework-dog-exempt (ga-tgo7q/ga-evjs2, 2026-07-02): gascity-framework
         # work is DOG-APPROPRIATE — must NOT be refused. ──────────────────────────
@@ -3761,10 +3914,53 @@ LIVESEC
         # held away from the dog (rule 3). Gated by PILOT_FRAMEWORK_DOG_EXEMPT (default 1);
         # fail-open: any bead_domain error → empty → no exemption → prior behaviour.
         if [ -n "$_DOMAIN_RIG" ] && [ "$_DOMAIN_RIG" != "gascity" ] && [ "${PILOT_FRAMEWORK_DOG_EXEMPT:-1}" = "1" ]; then
-          local _FW_DOMAIN=""
+          local _FW_DOMAIN="" _FW_EXEMPT=0 _FW_REASON=""
           _FW_DOMAIN=$(bead_domain "$STORY" 2>/dev/null || echo "")
-          if [ "$_FW_DOMAIN" = "infra" ]; then
-            log "framework-dog-exempt: $STORY_ID is gascity-framework work (bead_domain=infra) but bead_content_rig mis-inferred rig=$_DOMAIN_RIG from an incidental keyword — the dog pool ($BUILDER_TARGET) IS its correct builder (HQ checkout, git-diff, gate access). Clearing product-rig inference so the domain-route guard FAILS OPEN (dispatch, not REFUSE+1h-hold). Disable with PILOT_FRAMEWORK_DOG_EXEMPT=0."
+          # (a) coarse domain is infra — bead_domain checks the 4 PRODUCT domains FIRST,
+          #     so "infra" means NO product keyword matched (the original ga-tgo7q key).
+          if [ "$_FW_DOMAIN" = "infra" ]; then _FW_EXEMPT=1; _FW_REASON="bead_domain=infra"; fi
+          # (b) ga-xzfl: a concrete HQ/framework PATH is authoritative even when bead_domain
+          #     mis-classifies. bead_domain matches 'scraper' ⊂ 'property_scrapers' (a data
+          #     keyword) BEFORE it can reach "infra", so a bead ABOUT the router — cites
+          #     packs//scripts/ AND says "property_scrapers"/"scraper" in prose — is NEVER
+          #     infra and slipped this exemption (the ga-xzfl self-sabotage). _PATH_RIG==gascity
+          #     (bead_path_rig) is the path-level proof it is framework work for the dog.
+          #     (_PATH_RIG is only non-empty when PILOT_PATH_RIG_GUARD=1 — so this clause is
+          #     naturally gated by that knob too.)
+          if [ "$_FW_EXEMPT" = "0" ] && [ "$_PATH_RIG" = "gascity" ]; then _FW_EXEMPT=1; _FW_REASON="bead_path_rig=gascity"; fi
+          # (c) ga-xzfl: an explicit framework / pack:town-deltas / dog-pool LABEL is a direct
+          #     Mayor/refino signal that this is dog-pool framework work. jq -e any(); fail-open.
+          if [ "$_FW_EXEMPT" = "0" ] && echo "$STORY" | jq -e '(.labels // []) | any(. == "framework" or . == "pack:town-deltas" or . == "dog-pool")' >/dev/null 2>&1; then _FW_EXEMPT=1; _FW_REASON="framework-label"; fi
+          if [ "$_FW_EXEMPT" = "1" ]; then
+            log "framework-dog-exempt: $STORY_ID is gascity-framework work ($_FW_REASON) but bead_content_rig mis-inferred rig=$_DOMAIN_RIG from an incidental keyword — the dog pool ($BUILDER_TARGET) IS its correct builder (HQ checkout, git-diff, gate access). Clearing product-rig inference so the domain-route guard FAILS OPEN (dispatch, not REFUSE+1h-hold). Disable with PILOT_FRAMEWORK_DOG_EXEMPT=0."
+            _DOMAIN_RIG=""
+          fi
+        fi
+        # ── FIX 3 (ga-xzfl): missing-file guard ──────────────────────────────────────
+        # Before routing to a NON-DOG product rig, verify that rig actually contains the
+        # files the bead names. If the bead cites concrete file paths and NONE exist in
+        # $_DOMAIN_RIG's repo, that rig is WRONG for this bead — dispatching there
+        # NEVERSTARTS (the builder has no files to touch, circuit-breaks, and the bead
+        # re-queues forever: the ga-xzfl failure). Clear the inference so the bead falls
+        # OPEN to the dog instead. This one check guards BOTH reroute sites (rules 1 & 2
+        # below) since both build in $_DOMAIN_RIG. Gated by PILOT_MISSING_FILE_GUARD
+        # (default 1). FAIL-OPEN: no cited paths, an unknown/off-disk rig root, or any probe
+        # error ⇒ _rig_has_any_path succeeds ⇒ no refuse ⇒ routing proceeds exactly as
+        # today. Reuses the PILOT_RIG_PATHS_JSON cache (no fresh `gc rig list` per bead).
+        if [ -n "$_DOMAIN_RIG" ] && [ "$_DOMAIN_RIG" != "gascity" ] && [ "${PILOT_MISSING_FILE_GUARD:-1}" = "1" ]; then
+          local _CITED_PATHS=""
+          _CITED_PATHS=$(bead_cited_paths "$STORY" 2>/dev/null || echo "")
+          # FINDING 2: only DOG a missing-file bead when the cited files are GENUINELY
+          # MISLOCATED — absent in $_DOMAIN_RIG but PRESENT IN HQ (gascity), where the dog
+          # actually builds. If HQ ALSO lacks them, this is a CREATE-FILE bead (the file
+          # doesn't exist anywhere yet) and $_DOMAIN_RIG is the CORRECT rig to create it in —
+          # dogging it would NEVERSTART on the dog too (HQ has no such file). So require BOTH:
+          # R lacks every cited path AND HQ holds ≥1. Both probes are fail-open (see
+          # _rig_has_any_path FINDING 4), so a probe hiccup never manufactures a refuse.
+          if [ -n "$_CITED_PATHS" ] \
+             && ! _rig_has_any_path "$_DOMAIN_RIG" "$_CITED_PATHS" \
+             && _rig_has_any_path "gascity" "$_CITED_PATHS"; then
+            warn "ga-xzfl missing-file guard: $STORY_ID cites file path(s) present in HQ but in NONE of rig $_DOMAIN_RIG — MISLOCATED to the wrong rig (routing there NEVERSTARTS: no files to build). Clearing inference so the bead falls OPEN to the dog (which builds in HQ, where the files are). Cited: $(printf '%s' "$_CITED_PATHS" | tr '\n' ' '). Disable with PILOT_MISSING_FILE_GUARD=0."
             _DOMAIN_RIG=""
           fi
         fi

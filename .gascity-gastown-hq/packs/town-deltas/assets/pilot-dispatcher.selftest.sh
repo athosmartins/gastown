@@ -545,6 +545,9 @@ run_capacity() {
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
     PILOT_FRAMEWORK_DOG_EXEMPT="${PILOT_FRAMEWORK_DOG_EXEMPT:-}" \
+    PILOT_PATH_RIG_GUARD="${PILOT_PATH_RIG_GUARD:-}" \
+    PILOT_MISSING_FILE_GUARD="${PILOT_MISSING_FILE_GUARD:-}" \
+    PILOT_TEST_RIG_HAS_FILE="${PILOT_TEST_RIG_HAS_FILE:-}" \
     PILOT_DOLT_LATENCY_OVERRIDE_MS="$([ "${1:-10}" -gt 200 ] 2>/dev/null && echo 3000 || echo 100)" \
     PILOT_DOLT_CPU_OVERRIDE="${1:-10}" \
     FAKE_INFLIGHT_JSON="${2:-[]}" \
@@ -2541,6 +2544,188 @@ echo "$LOG18P" | grep -q "framework-dog-exempt" && bad "exemption fired on a no-
 echo "Scenario 18q: drift-guard — framework-dog-exempt is wired into the live dispatcher"
 has "$DISPATCHER" 'PILOT_FRAMEWORK_DOG_EXEMPT'   "framework-dog-exempt knob is wired"
 has "$DISPATCHER" 'framework-dog-exempt'         "framework-dog-exempt log/tag is wired"
+
+# ── Scenario 18r–18w2 (ga-xzfl): PATH-authoritative rig inference ──────────────
+# ROOT: rig inference used KEYWORDS (bead_content_rig/bead_domain) not code PATHS, so a
+# bead ABOUT the router (cites packs/…/pilot-dispatcher.sh + scripts/auto-rehome-janitor.py,
+# says "property_scrapers"/"scraper" in prose) was keyword-classified property_scrapers and
+# mis-dispatched to batista-ps, which cannot build framework files → NEVERSTART. The bead's
+# FILE PATHS are authoritative. FIX 1 bead_path_rig maps product paths → their rig (wins over
+# owner/keyword); FIX 2 folds bead_path_rig==gascity + a framework/pack:town-deltas/dog-pool
+# LABEL into the framework-dog-exempt (bead_domain matches 'scraper'⊂'property_scrapers' BEFORE
+# 'infra', so the infra-only exemption always missed the self-case); FIX 3 refuses to route to
+# a rig missing every file the bead names. All fail-open + knob-gated (PILOT_PATH_RIG_GUARD /
+# PILOT_MISSING_FILE_GUARD, default-on).
+echo "Scenario 18r (ga-xzfl): bead_path_rig UNIT — file PATHS drive the rig, not keywords"
+_HAY_FN="$(awk '/^_bead_path_haystack\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_BPR_FN="$(awk '/^bead_path_rig\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_BCR_FN_R="$(awk '/^bead_content_rig\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_bpr() { ( eval "$_HAY_FN"; eval "$_BCR_FN_R"; eval "$_BPR_FN"; bead_path_rig "$1" ); }
+R="$(_bpr '{"title":"x","description":"fix packs/town-deltas/assets/pilot-dispatcher.sh + scripts/auto-rehome-janitor.py; property_scrapers scraper inference wrong"}')"
+[ "$R" = gascity ] && ok "packs/ (framework) → gascity even amid property/scraper prose (the ga-xzfl self-sabotage)" || bad "packs/ path not gascity: '$R'"
+R="$(_bpr '{"title":"x","description":"branch crew/mila-wa/wa-9 broke"}')"
+[ "$R" = whatsapp_automation ] && ok "crew/mila-wa/ → whatsapp_automation (crew suffix)" || bad "crew/*-wa/ misrouted: '$R'"
+R="$(_bpr '{"title":"x","description":"crew/batista-ps/ps-1 needs rebase"}')"
+[ "$R" = property_scrapers ] && ok "crew/batista-ps/ → property_scrapers (crew suffix)" || bad "crew/*-ps/ misrouted: '$R'"
+R="$(_bpr '{"title":"x","description":"outreach/sender.py sends imovel ITBI proprietario deals"}')"
+[ "$R" = whatsapp_automation ] && ok "outreach/ + property nouns → whatsapp_automation (path beats keyword)" || bad "outreach/ misrouted: '$R'"
+R="$(_bpr '{"title":"x","description":"scrapers/rfb_death.py weekly job"}')"
+[ "$R" = property_scrapers ] && ok "scrapers/ → property_scrapers (PS product path)" || bad "scrapers/ misrouted: '$R'"
+R="$(_bpr '{"title":"ITBI bridge","description":"scripts/itbi_drive_bridge.py dispara itbi_combiner Hex whapi pipedrive"}')"
+[ -z "$R" ] && ok "scripts/ + WA content → empty (defers to keyword; protects Scenario 18h)" || bad "scripts/ wrongly forced a rig: '$R'"
+R="$(_bpr '{"title":"x","description":"tweak scripts/sweep_tool.py — no product keyword at all"}')"
+[ -z "$R" ] && ok "FINDING 1: bare scripts/ (no keyword) → empty (rule 5 dropped; owner/content decides, never forced gascity)" || bad "FINDING 1 regression: bare scripts/ still forces rig '$R' (would override the *-wa/*-ps owner)"
+R="$(_bpr '{"title":"x","description":"fix shared/whatsapp_sender.py retry logic"}')"
+[ -z "$R" ] && ok "FINDING 3: shared/ → empty (it exists in WA AND PS — ambiguous; defers to owner/content)" || bad "FINDING 3 regression: shared/ still force-mapped to '$R'"
+R="$(_bpr '{"title":"scraper RFB","description":"imovel ITBI cadastro — no file path cited"}')"
+[ -z "$R" ] && ok "no path → empty (fail-open to existing keyword/owner inference)" || bad "pathless bead inferred a rig: '$R'"
+R="$(_bpr '{"title":"x","description":"see the board at https://painel.urblink.com.br/kanban"}')"
+[ -z "$R" ] && ok "URL is not a path → empty (hostname never mistaken for a repo path)" || bad "URL mistaken for path: '$R'"
+has "$DISPATCHER" 'bead_path_rig()'           "bead_path_rig() is defined (drift-guard)"
+has "$DISPATCHER" 'PILOT_PATH_RIG_GUARD'      "path-rig guard knob is wired"
+has "$DISPATCHER" 'PILOT_MISSING_FILE_GUARD'  "missing-file guard knob is wired"
+
+echo "Scenario 18s (ga-xzfl SELF-CASE): a bead ABOUT the router (cites packs/…+scripts/…) → dog, NOT batista-ps"
+XZFL_SELF='[{"id":"ga-xzfltest","title":"Pilot/janitor mis-routes work to the WRONG rig — rig inference uses KEYWORDS not code PATHS","priority":1,"issue_type":"bug","description":"packs/town-deltas/assets/pilot-dispatcher.sh + scripts/auto-rehome-janitor.py: a bug ABOUT routing sabotages its own dispatch because bead_content_rig sees property_scrapers/scraper and mis-routes to batista-ps → NEVERSTART","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-11T00:00:01Z","metadata":{}}]'
+XZFL_OBJ="$(echo "$XZFL_SELF" | jq -c '.[0]')"
+[ "$(_bcr "$XZFL_OBJ")" = property_scrapers ] && ok "precondition: bead_content_rig STILL mis-infers property_scrapers (keyword 'scraper')" || bad "precondition changed: bead_content_rig='$(_bcr "$XZFL_OBJ")'"
+[ "$(_dom "$XZFL_OBJ")" != infra ] && ok "bead_domain is NOT infra for the self-case ('scraper'⊂data wins before infra — why the infra-only exemption missed it)" || bad "bead_domain unexpectedly infra"
+LOG18S="$(run_capacity 10 "[]" 1 "$XZFL_SELF")"
+B18S="$(dispatched_builder "$LOG18S")"
+if echo "$B18S" | grep -qE '^gastown\.dog'; then
+  ok "self-case DISPATCHED to the dog (framework work builds on the HQ checkout the dog has)"
+elif [ "$B18S" = batista-ps ]; then
+  bad "REGRESSION (ga-xzfl): the router-bug bead misrouted to batista-ps → NEVERSTART (the exact bug)"
+else
+  bad "self-case routed unexpectedly (got: '${B18S:-none}')"
+fi
+echo "$LOG18S" | grep -q "framework-dog-exempt: ga-xzfltest is gascity-framework work (bead_path_rig=gascity)" && ok "self-case exempted via bead_path_rig=gascity (the new path-authoritative condition)" || bad "self-case not exempted via bead_path_rig=gascity"
+
+echo "Scenario 18t (ga-xzfl): a framework/pack:town-deltas/dog-pool LABEL exempts a product-keyword bead → dog"
+LABEL_FW='[{"id":"ga-lbltest","title":"scraper cadastro ITBI de imoveis — property words but framework-labeled","priority":2,"issue_type":"bug","description":"property_scrapers scraper imovel ITBI, but this is dog-pool framework work","status":"open","labels":["lane:small","story:approved","framework"],"assignee":null,"created_at":"2026-07-11T00:00:02Z","metadata":{}}]'
+LOG18T="$(run_capacity 10 "[]" 1 "$LABEL_FW")"
+B18T="$(dispatched_builder "$LOG18T")"
+if echo "$B18T" | grep -qE '^gastown\.dog'; then
+  ok "framework-labeled bead → dog despite property keywords"
+elif [ "$B18T" = batista-ps ]; then
+  bad "framework-labeled bead misrouted to batista-ps (label exemption not honored)"
+else
+  bad "framework-labeled bead routed unexpectedly (got: '${B18T:-none}')"
+fi
+echo "$LOG18T" | grep -q "framework-dog-exempt: ga-lbltest is gascity-framework work (framework-label)" && ok "label-exemption logged (reason=framework-label)" || bad "label exemption not logged"
+
+echo "Scenario 18u (ga-xzfl Mode-A): WA bead citing outreach/ with property nouns → WA, NOT batista-ps"
+MODE_A='[{"id":"ga-modea","title":"outreach flow includes proprietario imovel ITBI data in the deal","priority":3,"issue_type":"feature","description":"outreach/deal_builder.py enriches the deal with imovel/ITBI/proprietario nouns","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-11T00:00:03Z","metadata":{}}]'
+LOG18U="$(run_capacity 10 "[]" 1 "$MODE_A")"
+B18U="$(dispatched_builder "$LOG18U")"
+if [ "$B18U" = batista-ps ]; then
+  bad "REGRESSION (Mode-A): WA outreach/shared bead misrouted to batista-ps on property nouns"
+elif echo "$B18U" | grep -qE '^gastown\.dog'; then
+  bad "Mode-A WA bead landed on the dog ($B18U) — should classify as whatsapp_automation"
+elif echo "$LOG18U" | grep -q "path-authoritative rig=whatsapp_automation"; then
+  ok "Mode-A: outreach//shared/ path → whatsapp_automation (path beats the property nouns), NOT batista-ps"
+else
+  bad "Mode-A routed unexpectedly (got: '${B18U:-none}')"
+fi
+
+echo "Scenario 18v (ga-xzfl Mode-B): framework bead (packs/) with product keywords → dog, NOT a product rig"
+MODE_B='[{"id":"ga-modeb","title":"packs/town-deltas/assets/quality-gate-dispatcher.sh — fix a whatsapp/painel/pipedrive wording in a log line","priority":2,"issue_type":"bug","description":"the dispatcher log line mentions whatsapp/painel/pipedrive; edit packs/town-deltas/assets/quality-gate-dispatcher.sh","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-11T00:00:04Z","metadata":{}}]'
+LOG18V="$(run_capacity 10 "[]" 1 "$MODE_B")"
+B18V="$(dispatched_builder "$LOG18V")"
+if echo "$B18V" | grep -qE '^gastown\.dog'; then
+  ok "Mode-B: framework-path bead → dog despite whatsapp/painel keywords (NOT WA-rehomed)"
+else
+  bad "Mode-B framework bead routed unexpectedly (got: '${B18V:-none}') — expected dog"
+fi
+echo "$LOG18V" | grep -q "framework-dog-exempt: ga-modeb is gascity-framework work (bead_path_rig=gascity)" && ok "Mode-B exempted via bead_path_rig=gascity" || bad "Mode-B not exempted via path"
+
+echo "Scenario 18w (ga-xzfl): missing-file guard — file present in HQ, absent in routed rig → REFUSE, fall open to dog"
+# GENUINE MISLOCATION (FINDING 2): the cited file exists in HQ (gascity) but NOT in the routed
+# product rig. Seam "gascity" = only HQ has the file. Path-rig guard OFF so content infers WA.
+MISSING_FIX='[{"id":"ga-missfile","title":"whatsapp painel kanban tweak that names packs/town-deltas/assets/pilot-dispatcher.sh","priority":2,"issue_type":"bug","description":"whatsapp painel kanban work — but the only file cited is packs/town-deltas/assets/pilot-dispatcher.sh, which lives in HQ, not in whatsapp_automation","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-11T00:00:05Z","metadata":{}}]'
+LOG18W="$(PILOT_PATH_RIG_GUARD=0 PILOT_MISSING_FILE_GUARD=1 PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$MISSING_FIX")"
+B18W="$(dispatched_builder "$LOG18W")"
+echo "$LOG18W" | grep -q "missing-file guard: ga-missfile" && ok "missing-file guard FIRED: cited file present in HQ, absent in whatsapp_automation → cleared the inference" || bad "missing-file guard did NOT fire (expected refuse+reroute)"
+if echo "$B18W" | grep -qE '^gastown\.dog'; then
+  ok "after the missing-file refuse the bead fell OPEN to the dog (which builds in HQ, where the file is)"
+elif [ "$B18W" = batista-ps ]; then
+  bad "missing-file bead misrouted to batista-ps"
+else
+  bad "missing-file bead routed unexpectedly (got: '${B18W:-none}')"
+fi
+echo "Scenario 18w2 (control): PILOT_MISSING_FILE_GUARD=0 → NO refuse (kill-switch works)"
+LOG18W0="$(PILOT_PATH_RIG_GUARD=0 PILOT_MISSING_FILE_GUARD=0 PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$MISSING_FIX")"
+echo "$LOG18W0" | grep -q "missing-file guard: ga-missfile" && bad "guard fired despite PILOT_MISSING_FILE_GUARD=0" || ok "guard silent when disabled (kill-switch honored)"
+
+# ── Scenario 18x (ga-xzfl review FINDING 2): CREATE-FILE bead — cited file exists in NO rig ──
+# "create scrapers/foo_novo.py": bead_path_rig maps scrapers/ → property_scrapers, but the file
+# doesn't exist yet (absent EVERYWHERE, incl HQ). The guard must NOT dog it (HQ can't build it
+# either) — PS is the correct rig to CREATE it in. Seam "0" = absent in every rig.
+echo "Scenario 18x (FINDING 2): create-file bead (cited file in NO rig) → property_scrapers, NOT dog"
+CREATE_FILE='[{"id":"ga-createf","title":"novo scraper: create scrapers/foo_novo.py for weekly RFB","priority":2,"issue_type":"feature","description":"create a brand-new file scrapers/foo_novo.py — it does not exist yet in any rig","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-11T00:00:06Z","metadata":{}}]'
+LOG18X="$(PILOT_MISSING_FILE_GUARD=1 PILOT_TEST_RIG_HAS_FILE=0 run_capacity 10 "[]" 1 "$CREATE_FILE")"
+B18X="$(dispatched_builder "$LOG18X")"
+if [ "$B18X" = batista-ps ]; then
+  ok "create-file bead → batista-ps (correct rig to create the new file), NOT dogged"
+elif echo "$B18X" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION (FINDING 2): create-file bead DOGGED → HQ lacks scrapers/ too → NEVERSTART"
+else
+  bad "create-file bead routed unexpectedly (got: '${B18X:-none}')"
+fi
+echo "$LOG18X" | grep -q "missing-file guard: ga-createf" && bad "FINDING 2: guard wrongly fired on a create-file bead (HQ also lacks the file)" || ok "missing-file guard stayed SILENT on the create-file bead (HQ also lacks it → not mislocated)"
+
+# ── Scenario 18y (ga-xzfl review FINDING 1): owner-authoritative scripts/ must beat gascity ──
+# A product-crew-OWNED bead citing a bare scripts/<file> with NO product keyword must route to
+# the OWNER's rig (ga-nlh79), NOT be forced to gascity→dog by the old rule-5.
+echo "Scenario 18y (FINDING 1): ps-worker-owned bare scripts/ bead (no keyword) → batista-ps, NOT dog"
+OWNED_PS='[{"id":"ga-ownps","title":"adjust the nightly sweep timing","priority":2,"issue_type":"bug","description":"tweak scripts/nightly_sweep.py interval — no product keyword whatsoever","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"ps-worker-1","created_at":"2026-07-11T00:00:07Z","metadata":{}}]'
+LOG18Y="$(run_capacity 10 "[]" 1 "$OWNED_PS")"
+B18Y="$(dispatched_builder "$LOG18Y")"
+if [ "$B18Y" = batista-ps ]; then
+  ok "ps-worker-owned scripts/ bead → batista-ps (owner-authoritative preserved)"
+elif echo "$B18Y" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION (FINDING 1): owned scripts/ bead FORCED to gascity→dog → HQ scripts/ shares no basenames → NEVERSTART"
+else
+  bad "owned scripts/ bead routed unexpectedly (got: '${B18Y:-none}')"
+fi
+echo "Scenario 18y2 (FINDING 1): *-wa-owned bare scripts/ bead (no keyword) → WA/held, NOT dog"
+OWNED_WA='[{"id":"ga-ownwa","title":"adjust the nightly sweep timing","priority":2,"issue_type":"bug","description":"tweak scripts/nightly_sweep.py interval — no product keyword whatsoever","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"mila-wa","created_at":"2026-07-11T00:00:08Z","metadata":{}}]'
+LOG18Y2="$(run_capacity 10 "[]" 1 "$OWNED_WA")"
+B18Y2="$(dispatched_builder "$LOG18Y2")"
+if echo "$B18Y2" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION (FINDING 1): *-wa-owned scripts/ bead FORCED to gascity→dog → NEVERSTART"
+elif [ "$B18Y2" = batista-ps ]; then
+  bad "*-wa-owned scripts/ bead misrouted to batista-ps"
+else
+  ok "*-wa-owned scripts/ bead → whatsapp_automation (deferred/held), NOT dog (owner preserved)"
+fi
+
+# ── Scenario 18z (ga-xzfl review FINDING 3): shared/ collision — PS-content bead → PS, not WA ──
+echo "Scenario 18z (FINDING 3): PS-content bead citing shared/<file> → batista-ps, NOT WA-held"
+SHARED_PS='[{"id":"ga-shrps","title":"consolidar cadastro ITBI de imoveis e lotes","priority":2,"issue_type":"bug","description":"shared/rfb_scraper.py consolida o cadastro ITBI/imovel/lote no MotherDuck (scraper de propriedade)","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-11T00:00:09Z","metadata":{}}]'
+LOG18Z="$(run_capacity 10 "[]" 1 "$SHARED_PS")"
+B18Z="$(dispatched_builder "$LOG18Z")"
+if [ "$B18Z" = batista-ps ]; then
+  ok "shared/ + PS content → batista-ps (shared/ no longer force-maps to WA)"
+elif echo "$LOG18Z" | grep -q "path-authoritative rig=whatsapp_automation"; then
+  bad "REGRESSION (FINDING 3): shared/ force-mapped to WA → PS scraper held on the wrong rig"
+else
+  bad "shared/ PS-content bead routed unexpectedly (got: '${B18Z:-none}')"
+fi
+
+# ── Scenario 18aa (ga-xzfl review FINDING 4): probe-failure must FAIL-OPEN, never refuse ──────
+echo "Scenario 18aa (FINDING 4): _rig_has_any_path — git-probe timeout (exit 124) → fail-open (present), NOT absent"
+_RHAP_FN="$(awk '/^_rig_has_any_path\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_RRP_FN="$(awk '/^rig_root_path\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+FAKEGIT="$WORK/fakegit"; mkdir -p "$FAKEGIT"
+printf '#!/usr/bin/env bash\nexit 124\n' > "$FAKEGIT/git"; chmod +x "$FAKEGIT/git"
+RIGROOT="$WORK/rigroot-ps"; mkdir -p "$RIGROOT"   # a REAL dir that does NOT contain the cited file
+_probe() { ( PATH="$FAKEGIT:$PATH"; unset PILOT_TEST_RIG_HAS_FILE; PILOT_RIG_PATHS_JSON='{"rigs":[{"name":"property_scrapers","path":"'"$RIGROOT"'"}]}'; eval "$_RRP_FN"; eval "$_RHAP_FN"; _rig_has_any_path property_scrapers "scripts/foo.py" && echo present || echo absent ); }
+if [ "$(_probe)" = present ]; then
+  ok "git-probe timeout (124) → fail-open (present) — probe failure NEVER conflated with file-absent"
+else
+  bad "REGRESSION (FINDING 4): git-probe timeout treated as file-absent → would REFUSE (destructive)"
+fi
 
 # ── Scenario 19 (wa-u5r1): dispatchable-queue emit for the painel ─────────────
 echo "Scenario 19a: emit writes valid JSON with the contract shape + count + items"
