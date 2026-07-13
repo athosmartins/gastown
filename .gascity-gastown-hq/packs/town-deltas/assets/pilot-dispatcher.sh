@@ -3448,7 +3448,7 @@ dispatch_one() {
   local STORY_ID STORY_TITLE STORY_PRIORITY STORY_LABELS STORY_RIG STORY_BEAD_CITY
   local STORY_ESTRELA STORY_CRITERIA STORY_EQUILIBRIOS STORY_RIG_EXPLICIT
   STORY_ID=$(echo "$STORY" | jq -r '.id')
-  STORY_TITLE=$(echo "$STORY" | jq -r '.title // .description // "untitled"' | head -c 100)
+  STORY_TITLE=$(echo "$STORY" | jq -r '(.title // .description // "untitled") | .[0:100]')
   STORY_PRIORITY=$(echo "$STORY" | jq -r '.priority // 99')
   STORY_LABELS=$(echo "$STORY" | jq -r '(.labels // []) | join(",")')
   STORY_RIG=$(echo "$STORY" | jq -r '.metadata["story.rig"] // ""')
@@ -3456,7 +3456,7 @@ dispatch_one() {
   # An explicit rig wins over bead_content_rig inference in the domain routing guard.
   STORY_RIG_EXPLICIT="0"
   [ -n "$STORY_RIG" ] && [ "$STORY_RIG" != "null" ] && STORY_RIG_EXPLICIT="1"
-  STORY_ESTRELA=$(echo "$STORY" | jq -r '.metadata["story.estrela_guia"] // ""' | head -c 200)
+  STORY_ESTRELA=$(echo "$STORY" | jq -r '(.metadata["story.estrela_guia"] // "") | .[0:200]')
   STORY_CRITERIA=$(echo "$STORY" | jq -r '.acceptance_criteria // .metadata["story.criterios"] // ""')
   STORY_EQUILIBRIOS=$(echo "$STORY" | jq -r '.metadata["story.equilibrios"] // ""')
 
