@@ -367,6 +367,7 @@ run_dispatch() { # $1=FAKE_BLOCKED_IDS  $2=FAKE_INCLUDE_ENGWIN(0|1)  $3=FAKE_DEP
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     FAKE_BLOCKED_IDS="$1" \
     FAKE_INCLUDE_ENGWIN="${2:-0}" \
     FAKE_DEP_BEAD="${3:-}" \
@@ -386,6 +387,7 @@ run_step0() { # FAKE_STALE_JSON
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     FAKE_STALE_JSON="$1" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
@@ -411,6 +413,7 @@ run_neverstarted() {
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     PILOT_NEVERSTARTED_MINUTES=15 \
     FAKE_NEVERSTARTED_JSON="${1:-[]}" \
     PILOT_TEST_BRANCH_BEADS="${2:-}" \
@@ -438,6 +441,7 @@ run_real_dispatch() { # FAKE_SUPPRESS_INFLIGHT
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     PILOT_INFLIGHT_RETRIES=3 \
     PILOT_INFLIGHT_SLEEP=0 \
     FAKE_BLOCKED_IDS="" \
@@ -462,6 +466,7 @@ run_real_dispatch_escalate() { # FAKE_ESCALATE_AFTER_SHOWS
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     PILOT_INFLIGHT_RETRIES=3 \
     PILOT_INFLIGHT_SLEEP=0 \
     FAKE_BLOCKED_IDS="" \
@@ -486,6 +491,7 @@ run_real_dispatch_mayorhold() { # FAKE_STORY_COMMENTS_JSON [PILOT_MAYOR_HOLD_GRA
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     PILOT_INFLIGHT_RETRIES=3 \
     PILOT_INFLIGHT_SLEEP=0 \
     FAKE_BLOCKED_IDS="" \
@@ -511,6 +517,7 @@ run_sling_retry() { # $1=FAKE_SLING_FAIL_TIMES  $2=FAKE_SLING_ALWAYS_FAIL(0|1)
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     PILOT_SLING_RETRIES=3 \
     PILOT_SLING_SLEEP=0 \
     PILOT_INFLIGHT_RETRIES=3 \
@@ -544,6 +551,7 @@ run_capacity() {
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     PILOT_FRAMEWORK_DOG_EXEMPT="${PILOT_FRAMEWORK_DOG_EXEMPT:-}" \
     PILOT_PATH_RIG_GUARD="${PILOT_PATH_RIG_GUARD:-}" \
     PILOT_MISSING_FILE_GUARD="${PILOT_MISSING_FILE_GUARD:-}" \
@@ -587,6 +595,7 @@ run_ctxready() {
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     PILOT_DOLT_LATENCY_OVERRIDE_MS="$([ "${5:-10}" -gt 200 ] 2>/dev/null && echo 3000 || echo 100)" \
     PILOT_DOLT_CPU_OVERRIDE="${5:-10}" \
     DISPATCH_TO_CAPACITY=1 \
@@ -1549,6 +1558,7 @@ run_quota() { # $1=PILOT_QUOTA_OVERRIDE  $2=PILOT_QUOTA_ETA_OVERRIDE
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
     PILOT_DOLT_CPU_OVERRIDE=10 \
     PILOT_QUOTA_OVERRIDE="$1" \
@@ -1951,6 +1961,7 @@ echo "Scenario 16i: PILOT_NEVERSTARTED_MINUTES=0 disables the detector"
 : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"; reset_state
 env -i PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" HOME="$HOME" DRY_RUN=1 \
   PILOT_CITY_OVERRIDE="$FIXCITY" PILOT_TEST_STATE="$STATE" \
+  PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
   PILOT_NEVERSTARTED_MINUTES=0 FAKE_NEVERSTARTED_JSON="$NS_REL" \
   PILOT_TEST_BRANCH_BEADS="" FAKE_BLOCKED_IDS="" \
   bash "$DISPATCHER" >/dev/null 2>&1 || true
@@ -2114,6 +2125,7 @@ run_capacity_reuse() { # $1=PILOT_REUSE_SESSION  $2=FAKE_BUGS_JSON  $3=FAKE_SESS
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
     PILOT_DOLT_CPU_OVERRIDE=10 \
     PILOT_REUSE_SESSION="${1:-1}" \
@@ -3363,6 +3375,7 @@ run_wa_rig_tier2() {
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
     PILOT_DOLT_CPU_OVERRIDE=10 \
     DISPATCH_TO_CAPACITY=1 \
@@ -3496,6 +3509,7 @@ run_hq_tier2() {
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
     PILOT_DOLT_CPU_OVERRIDE=10 \
     DISPATCH_TO_CAPACITY=1 \
@@ -3820,6 +3834,7 @@ run_ps_worker_dispatch() {
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
     PILOT_DOLT_CPU_OVERRIDE=10 \
     DISPATCH_TO_CAPACITY=1 \
@@ -3871,6 +3886,7 @@ run_ps_worker_dispatch_own_guard() {
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
     PILOT_DOLT_CPU_OVERRIDE=10 \
     DISPATCH_TO_CAPACITY=1 \
