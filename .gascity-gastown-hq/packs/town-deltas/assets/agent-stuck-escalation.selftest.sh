@@ -45,6 +45,8 @@ chmod +x "$SHIM/bd"
 
 # ── gc shim ───────────────────────────────────────────────────────────────────
 # gc session list --json → reads $WORK/sessions.json
+# gc session logs <name> --tail 1 --json → reads $LOGS_FIXTURE_DIR/<name>.json
+#   (absent fixture = simulates real `gc`'s "not found"/error response)
 # gc mail send <recipient> -s <subject> → records "mail:<recipient>|<subject>"
 cat > "$SHIM/gc" <<'SHIM'
 #!/usr/bin/env bash
@@ -52,6 +54,16 @@ case "$1 $2" in
   "session list")
     cat "${SESSIONS_FIXTURE:-/dev/null}"
     exit 0
+    ;;
+  "session logs")
+    _target="${3:-}"
+    _f="${LOGS_FIXTURE_DIR:-}/${_target}.json"
+    if [ -n "${LOGS_FIXTURE_DIR:-}" ] && [ -f "$_f" ]; then
+        cat "$_f"
+        exit 0
+    fi
+    echo '{"ok":false,"error":{"message":"session not found"}}'
+    exit 1
     ;;
   "mail send")
     # $3 = recipient; find subject after -s flag
@@ -88,9 +100,11 @@ run_script() {
     NOTIFY_BIN="$SHIM/notify" \
     BEADS_FIXTURE="${BEADS_FIXTURE:-}" \
     SESSIONS_FIXTURE="${SESSIONS_FIXTURE:-}" \
+    LOGS_FIXTURE_DIR="${LOGS_FIXTURE_DIR:-}" \
     ACTIONS_FILE="$ACTIONS" \
     STUCK_AGENT_SEC="${STUCK_AGENT_SEC:-1800}" \
     COOLDOWN_SEC="${COOLDOWN_SEC:-10800}" \
+    TRANSCRIPT_FRESH_SEC="${TRANSCRIPT_FRESH_SEC:-1800}" \
     ESCALATION_STORES="$WORK/city" \
     bash "$SCRIPT" 2>&1
 }
@@ -109,10 +123,24 @@ make_bead() {  # make_bead <id> <assignee> <age_secs> [type]
 
 BEADS_FIXTURE="$WORK/beads.json"
 SESSIONS_FIXTURE="$WORK/sessions.json"
-export BEADS_FIXTURE SESSIONS_FIXTURE
+LOGS_FIXTURE_DIR="$WORK/logsfx"
+mkdir -p "$LOGS_FIXTURE_DIR" "$WORK/transcripts"
+export BEADS_FIXTURE SESSIONS_FIXTURE LOGS_FIXTURE_DIR
 
 # Default: empty sessions
 echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+
+# make_transcript_fixture <session-name> <age-secs>
+# Registers a `gc session logs <session-name> --json` fixture pointing at a
+# real file whose mtime is <age-secs> old — lets tests simulate a transcript
+# that's fresh ("advancing") or stale ("frozen") without a real running agent.
+make_transcript_fixture() {
+    local name="$1" age="$2" tfile
+    tfile="$WORK/transcripts/$name.jsonl"
+    echo '{}' > "$tfile"
+    python3 -c "import os,time; t=time.time()-$age; os.utime('$tfile', (t, t))"
+    printf '{"ok":true,"transcript_path":"%s"}' "$tfile" > "$LOGS_FIXTURE_DIR/$name.json"
+}
 
 # ── T1: no beads → healthy, no escalation ────────────────────────────────────
 echo "T1: no in_progress beads → healthy"
@@ -190,6 +218,41 @@ rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test04"
 STUCK_AGENT_SEC=1800 out="$(run_script)"
 assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test04" "T9: escalation fired (session alive is OK — still stuck)"
 log_contains "T9" "ativa" "T9: session 'ativa' status logged"
+
+# ── T13: session alive + transcript ADVANCING → suppress escalation (ga-hehi) ─
+echo "T13: session alive, transcript advancing → escalation suppressed"
+echo '{"sessions":[{"name":"batista-ps","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture batista-ps 30   # written 30s ago — well under the 1800s threshold
+printf '[%s]' "$(make_bead ga-test05 batista-ps 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test05"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test05" "T13: no mail — transcript advancing"
+assert_absent "$ACTIONS" "notify" "T13: no notify — transcript advancing"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test05" ] && ok "T13: no escalation state written (suppression is log-only)" || bad "T13: unexpected state file written on suppression"
+log_contains "T13" "SUPRIMINDO" "T13: log notes suppression"
+rm -f "$LOGS_FIXTURE_DIR/batista-ps.json"
+
+# ── T14: session alive + transcript FROZEN → escalation still fires ──────────
+echo "T14: session alive, transcript frozen → escalation still fires"
+echo '{"sessions":[{"name":"oracle-wa","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture oracle-wa 3600   # written 1h ago — past the 1800s threshold
+printf '[%s]' "$(make_bead ga-test06 oracle-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test06"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test06" "T14: escalation fires — transcript frozen despite live session"
+log_contains "T14" "CONGELADO" "T14: log notes transcript frozen"
+rm -f "$LOGS_FIXTURE_DIR/oracle-wa.json"
+
+# ── T15: session absent/dead (no transcript fixture) → escalation unchanged ──
+echo "T15: session absent/dead → escalation still fires (no regression)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead ga-test07 thies-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test07"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test07" "T15: escalation fires — absent session, no regression"
 
 # ── T10–T12: Layer 1 routing integration (ga-qw3p.1) ────────────────────────
 # Deploy the real escalation-router.sh so the script can source it.

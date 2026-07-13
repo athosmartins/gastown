@@ -7,9 +7,14 @@
 #   Camada 3 (ga-qw3p.3): Mayor travado → quórum 2-de-3
 #   Camada 4 (ga-qw3p.4): quórum falhou → notify 🚨 humano
 #
-# SINAL DE "TRAVADO" (Athos aprovou via ga-qw3p.2):
+# SINAL DE "TRAVADO" (Athos aprovou o gate original via ga-qw3p.2; ga-hehi
+# corrigiu o item 2 — sessão viva nunca provou progresso, ver abaixo):
 #   1. updated_at do bead in_progress > STUCK_AGENT_SEC (padrão 1800s/30min)
-#   2. Sessão do assignee ausente/morta (diagnóstico extra, não bloqueia escalação)
+#   2. E transcript da sessão do assignee CONGELADO (sem escrita há
+#      TRANSCRIPT_FRESH_SEC, padrão = STUCK_AGENT_SEC) OU sessão ausente/morta.
+#      Transcript AVANÇANDO (escrita recente) SUPRIME a escalação — trabalho
+#      longo legítimo (tool calls, streaming) não gera falso-positivo.
+#      Ver transcript_is_advancing() abaixo.
 #
 # ANTI-SPAM: uma escalação por bead por janela COOLDOWN_SEC (padrão 3h).
 #   Per-bead state: .gc/state/agent-stuck-escalation/<bead-id>
@@ -33,6 +38,7 @@ ESCDIR="$STATE_DIR/agent-stuck-escalation"
 
 STUCK_AGENT_SEC="${STUCK_AGENT_SEC:-1800}"   # 30min sem update → travado
 COOLDOWN_SEC="${COOLDOWN_SEC:-10800}"        # 3h antes de re-escalar o mesmo bead
+TRANSCRIPT_FRESH_SEC="${TRANSCRIPT_FRESH_SEC:-$STUCK_AGENT_SEC}"  # ga-hehi: transcript escrito há menos disso = avançando
 MAYOR_ADDR="${MAYOR_ADDR:-mayor}"
 DRY_RUN="${DRY_RUN:-0}"
 # Bead stores to scan (space-separated paths; HQ must be .gascity-gastown-hq, NOT the gt root)
@@ -58,6 +64,36 @@ if [ "$DRY_RUN" != "1" ]; then
 fi
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [agent-stuck] $*"; }
+
+# transcript_is_advancing (ga-hehi): a live session is NOT proof of progress —
+# `gc session list` shows "active" whether the agent is busy or genuinely
+# wedged (same finding that shaped crew-hang-detector.sh — idle and hung
+# sessions are indistinguishable by session state alone). The real progress
+# signal is the session's transcript .jsonl file: it grows on every tool call
+# / message boundary while real work happens, and stays byte-still when the
+# agent is truly hung. Returns 0 ("advancing") only when that file was
+# written to within TRANSCRIPT_FRESH_SEC. Any lookup failure (gc error,
+# missing path, missing file) returns 1 ("not advancing") — fails CLOSED, so
+# an unknown state still escalates, same as today's absent-session path.
+transcript_is_advancing() {
+    local sess="$1" logs_json tpath mtime age
+    logs_json="$(timeout 15 "$GC" session logs "$sess" --tail 1 --json 2>/dev/null || true)"
+    [ -z "$logs_json" ] && return 1
+    tpath="$(printf '%s' "$logs_json" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(d.get("transcript_path") or "")
+except Exception:
+    print("")
+' 2>/dev/null)"
+    [ -z "$tpath" ] && return 1
+    [ -f "$tpath" ] || return 1
+    mtime="$(stat -f %m "$tpath" 2>/dev/null || stat -c %Y "$tpath" 2>/dev/null || echo "")"
+    [ -z "$mtime" ] && return 1
+    age=$(( now - mtime ))
+    [ "$age" -lt "$TRANSCRIPT_FRESH_SEC" ]
+}
 
 printf '%s %s\n' "$$" "$(date +%s)" > "$STATE_DIR/agent-stuck-escalation.startup"
 
@@ -244,19 +280,35 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
 
     # Session health check for assignee
     sess_status="ausente/desconhecida"
+    live_session_name=""
     if [ -n "$assignee" ]; then
         if printf '%s\n' "$ACTIVE_SESSIONS" | grep -qx "$assignee"; then
             sess_status="ativa (responde ao session list)"
+            live_session_name="$assignee"
         else
             # Also try prefix match (gawisp-form)
             base_tmpl="${assignee%%-gawisp*}"
-            if printf '%s\n' "$ACTIVE_SESSIONS" | grep -q "^${base_tmpl}"; then
-                sess_status="ativa (gawisp-form: $(printf '%s\n' "$ACTIVE_SESSIONS" | grep "^${base_tmpl}" | head -1))"
+            gawisp_match="$(printf '%s\n' "$ACTIVE_SESSIONS" | grep "^${base_tmpl}" | head -1)"
+            if [ -n "$gawisp_match" ]; then
+                sess_status="ativa (gawisp-form: $gawisp_match)"
+                live_session_name="$gawisp_match"
             else
                 sess_status="AUSENTE (nenhuma sessão ativa com nome '$assignee')"
             fi
         fi
     fi
+
+    # Transcript-progress gate (ga-hehi): a live session alone never proved
+    # progress. If the assignee has a live session AND its transcript was
+    # written to recently, this is legitimate long-running work — suppress
+    # escalation entirely (log-only; no state file write, so a real freeze on
+    # a later pass still escalates normally, undelayed by this suppression).
+    if [ -n "$live_session_name" ] && transcript_is_advancing "$live_session_name"; then
+        log "$bead_id: bead.updated_at parado ${age_min}min mas transcript de $live_session_name avançando (escrita <${TRANSCRIPT_FRESH_SEC}s) — SUPRIMINDO escalação (trabalho longo legítimo)"
+        continue
+    fi
+    transcript_note="n/d (sem sessão viva)"
+    [ -n "$live_session_name" ] && transcript_note="CONGELADO (sem escrita há >=${TRANSCRIPT_FRESH_SEC}s)"
 
     # Failure markers present?
     failure_markers=""
@@ -268,7 +320,7 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
     fi
     [ -z "$failure_markers" ] && failure_markers="nenhum"
 
-    log "$bead_id: STUCK ${age_min}min — assignee=$assignee sess=$sess_status labels=$labels"
+    log "$bead_id: STUCK ${age_min}min — assignee=$assignee sess=$sess_status transcript=$transcript_note labels=$labels"
 
     # Build diagnostic mail body
     body="$(cat <<BODY
@@ -278,6 +330,7 @@ Bead:      $bead_id — $title
 Assignee:  ${assignee:-'(não atribuído)'}
 Sem update há: ${age_min} minutos (limiar: $(( STUCK_AGENT_SEC / 60 )) min)
 Sessão:    $sess_status
+Transcript: $transcript_note
 Marcadores de falha: $failure_markers
 
 AÇÃO SUGERIDA:
