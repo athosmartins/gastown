@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.disk-ballast-guard</string>
+
+  <!-- Last-resort disk-ballast guard (ga-pzgr) — a guard that can ONLY help,
+       NEVER stop/kill anything. Follow-up to the 2026-07-14 full-disk Dolt-death
+       incident (ga-vs55) after gastown.dog-2 found the real gap in ga-gpzr's
+       floor guard: that guard only reclaims Dolt's OWN orphan DBs — it can't
+       help when the culprit is something else entirely (that day it was a
+       sandbox script, wa-9lwde, copying 19GB). Pre-allocates a ~2GB
+       non-sparse ballast file that does nothing but occupy real disk blocks;
+       when real avail free space drops at/below the floor, deletes it — 2GB
+       return INSTANTLY, buying ~20-30 min before actual ENOSPC. GRITA via
+       `notify` (ntfy, Dolt-independent — never `gc mail`/`bd`) with NO cooldown
+       at this tier; this is the final alarm. Only recreates once avail
+       recovers to a healthy level (hysteresis, no flapping mid-crisis). See
+       scripts/disk-ballast-guard.sh. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/disk-ballast-guard.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <!-- 120 = every 2 min. Tighter than ga-gpzr's 300s: this guard is the LAST
+       rung before real ENOSPC, with no cooldown once critical — speed of
+       detection matters most here, and a df read + optional rm/dd is cheap. -->
+  <key>StartInterval</key><integer>120</integer>
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/disk-ballast-guard-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/disk-ballast-guard-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+  </dict>
+</dict>
+</plist>
