@@ -1213,6 +1213,44 @@ author_is_alive() {
   fi
 }
 
+# resolve_recycled_author <author> <author_agent> <author_alive_0_1> — ga-pyzo.
+# author_is_alive() only matches AUTHOR's LITERAL recorded string (session_name
+# form, e.g. batista-wa-gawispc8tmbq) against CURRENTLY live sessions. When the
+# ONE session that submitted the marker recycles (restart/crash/reap), that
+# string can never match a live session again — even though the durable agent
+# (e.g. batista-wa) is up under a brand-new session id — so a live agent's work
+# reads as dead FOREVER and rots (evidence: 3 parked markers, 2026-07-14).
+#
+# If author_alive is already 1, or there is no distinct AUTHOR_AGENT to try
+# (empty, or identical to AUTHOR), echoes AUTHOR unchanged — pure no-op. Only
+# when AUTHOR's own session is dead AND a distinct durable agent alias was
+# recorded by the guard at submit time (gate.submitted_by_agent) does this
+# check THAT alias's liveness via the SAME canonical author_is_alive() — never
+# a regex derivation at dispatch time (fragile: session-suffix forms vary —
+# -ga2gnr, -gawispiwq9sj, -adhoc-e346188199 — no reliable single delimiter).
+#
+# Echoes the identity callers should treat as "the author" from here on: either
+# AUTHOR (unchanged/dead) or AUTHOR_AGENT (recycled session, live agent). The
+# caller is expected to reassign its own AUTHOR/*_ALIVE variables from this
+# result so every downstream nudge/mail/assign in that call site's block
+# targets the durable, reachable identity instead of the dead session string.
+# Single shared helper for BOTH dispatcher call sites (the ga-ipf6 lesson:
+# an un-factored predicate fixed on one call site and not the other stranded
+# a live author for hours — do not let this fallback re-diverge the same way).
+resolve_recycled_author() {
+  local author="${1:-}" agent="${2:-}" alive="${3:-0}"
+  case "$alive" in ''|*[!0-9]*) alive=0 ;; esac
+  if [ "$alive" = "1" ] || [ -z "$agent" ] || [ "$agent" = "$author" ]; then
+    printf '%s' "$author"
+    return 0
+  fi
+  if [ "$(author_is_alive "$agent")" = "1" ]; then
+    printf '%s' "$agent"
+  else
+    printf '%s' "$author"
+  fi
+}
+
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
 # above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
 # GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
@@ -1762,6 +1800,16 @@ if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
 else
   AUTHOR=""
 fi
+
+# ga-pyzo: also read the durable agent alias the guard recorded alongside
+# gate.submitted_by (best-effort; empty for markers submitted before this fix,
+# or when the guard's own live-session lookup at submit time missed). Used
+# ONLY as a liveness FALLBACK further below when AUTHOR's specifically
+# recorded session has since recycled — never overrides AUTHOR itself here at
+# derivation time (SECURITY: gate.submitted_by remains the sole trusted
+# self-review-exclusion identity — see the ga-tkvsa header above).
+AUTHOR_AGENT=$(printf '%s\n' "$VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .metadata["gate.submitted_by_agent"] // empty' 2>/dev/null || true)
+[ "$AUTHOR_AGENT" = "null" ] && AUTHOR_AGENT=""
 
 # bead_field_grep <raw_json_text> <field_name>
 # Extracts a simple string field from potentially-malformed JSON output.
@@ -2600,6 +2648,18 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # matched AUTHOR's actual session_name form, so every live author was
     # misread as dead on this path.
     AUTHOR_ALIVE=$(author_is_alive "$AUTHOR")
+
+    # ga-pyzo: recycled-session fallback, applied BEFORE the ga-acb circuit-break
+    # check below (which consumes AUTHOR_ALIVE) so a live agent whose specific
+    # submitting session recycled is never misread as dead-with-no-live-author
+    # and permanently circuit-broken. Reassigns AUTHOR itself so every
+    # downstream nudge/mail/assign in this block targets the reachable agent.
+    _RESOLVED_AUTHOR=$(resolve_recycled_author "$AUTHOR" "$AUTHOR_AGENT" "$AUTHOR_ALIVE")
+    if [ "$_RESOLVED_AUTHOR" != "$AUTHOR" ]; then
+      log "  ga-pyzo: author '$AUTHOR' session recycled but agent '$_RESOLVED_AUTHOR' has a live session — redirecting liveness/nudge/assign to the agent."
+      AUTHOR="$_RESOLVED_AUTHOR"
+      AUTHOR_ALIVE=1
+    fi
 
     # Read current rebase-attempt counter from the marker labels.
     REBASE_ATTEMPT=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null \
@@ -4537,6 +4597,19 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       # — this call site's predicate was already canonical; it is now the
       # single source of truth both paths share.
       FAIL_AUTHOR_ALIVE=$(author_is_alive "$AUTHOR")
+
+      # ga-pyzo: recycled-session fallback (same helper as the rebase-path call
+      # site above — single source of truth so the two paths cannot re-diverge,
+      # the exact ga-ipf6 lesson). Applied BEFORE gate_fail_assignee_action so a
+      # live agent whose specific FAILing session recycled gets "keep" (nudged
+      # to fix), not "clear" (silently handed to a stranger builder).
+      _RESOLVED_AUTHOR=$(resolve_recycled_author "$AUTHOR" "$AUTHOR_AGENT" "$FAIL_AUTHOR_ALIVE")
+      if [ "$_RESOLVED_AUTHOR" != "$AUTHOR" ]; then
+        log "  ga-pyzo: author '$AUTHOR' session recycled but agent '$_RESOLVED_AUTHOR' has a live session — redirecting liveness/nudge/assign to the agent."
+        AUTHOR="$_RESOLVED_AUTHOR"
+        FAIL_AUTHOR_ALIVE=1
+      fi
+
       GATE_FAIL_ASSIGNEE_ACTION=$(gate_fail_assignee_action "$AUTHOR" "$FAIL_AUTHOR_ALIVE")
 
       if [ "$GATE_FAIL_ASSIGNEE_ACTION" = "keep" ]; then

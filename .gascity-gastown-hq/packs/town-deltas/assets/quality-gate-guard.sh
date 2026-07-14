@@ -329,6 +329,47 @@ check_source_bead_park() {
   echo "ok"
 }
 
+# resolve_author_agent_alias <author> — ga-pyzo. Best-effort maps a
+# session_name-form AUTHOR (<agent>-<sessionid>, e.g. batista-wa-gawispiwq9sj)
+# to its durable agent alias (e.g. batista-wa) via a live `gc session list`
+# lookup, for markers whose specific submitting session may later recycle
+# (restart/crash/reap) — leaving AUTHOR permanently unmatchable even though
+# the durable agent is up under a NEW session id (author_is_alive() then reads
+# a live agent as dead FOREVER; evidence: 3 parked markers, 2026-07-14, see
+# bug). Echoes the alias if AUTHOR resolves to a live session AND the alias
+# differs from AUTHOR itself (no new info otherwise); echoes empty if
+# unresolvable or for pool/ephemeral builders (SCOPE GUARD below). Never
+# fatal — a lookup failure yields empty, same as "no fallback available".
+#
+# SCOPE GUARD: pool/ephemeral builders (dog-pool, wa-worker, ps-worker) churn
+# through a constant rotation of UNRELATED occupants under the SAME template
+# alias — "gastown.dog-3 is alive" seconds later is almost always a DIFFERENT
+# dog with zero context on this branch, not the same worker resuming. Unlike a
+# named crew alias (batista-wa, peter-wa — one durable identity, one owner,
+# indefinitely), resolving an alias fallback for these would let a later
+# liveness check misdirect a rebase-conflict bounce+nudge to a stranger dog
+# instead of correctly falling through to the existing dead-author
+# auto-retry/circuit-break path. Mirrors quality-gate-dispatcher.sh's
+# gate_fail_assignee_action deny-list (kept in sync by inspection — both
+# lists are short and rarely change).
+resolve_author_agent_alias() {
+  local author="${1:-}"
+  case "$author" in
+    ''|mayor|gastown.dog|gastown.dog-*|dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*)
+      return 0 ;;  # pool/ephemeral or empty — no agent fallback, echo nothing
+  esac
+  local agent
+  agent=$(gc --city "$GC_CITY" session list --json 2>/dev/null \
+    | jq -r --arg a "$author" \
+        '(if type=="array" then . else (.sessions // []) end)[]
+         | select(.closed != true)
+         | select((.session_name==$a) or (.id==$a) or (.name==$a) or (.alias==$a) or (.agent_name==$a))
+         | (.alias // .name // .agent_name // empty)' 2>/dev/null | head -1 || true)
+  [ "$agent" = "$author" ] && agent=""
+  [ "$agent" = "null" ] && agent=""
+  printf '%s' "$agent"
+}
+
 # ── Lib-only mode: source with GATE_GUARD_LIB_ONLY=1 to load pure functions ──
 # without running the live guard sweep. Used by tests and by the dispatcher.
 if [ -n "${GATE_GUARD_LIB_ONLY:-}" ]; then
@@ -1195,6 +1236,17 @@ if [ -n "$AUTHOR" ] && echo "$AUTHOR" | grep -qE "-adhoc-[0-9a-f]+" 2>/dev/null;
   AUTHOR="$AUTHOR_NORMALIZED"
 fi
 
+# ga-pyzo: best-effort resolve the DURABLE agent alias behind AUTHOR (see
+# resolve_author_agent_alias in the pure-decision-functions section above for
+# the full rationale + scope guard), while the submitting session is still
+# very likely alive — this guard runs synchronously, seconds after that same
+# session's own /gate-done call. Persisting the alias now (Step 7 below) lets
+# the dispatcher fall back to it later if AUTHOR's own session has since
+# recycled, instead of reading a live agent as dead forever (evidence: 3
+# parked markers, 2026-07-14, see bug).
+AUTHOR_AGENT=$(resolve_author_agent_alias "$AUTHOR")
+[ -n "$AUTHOR_AGENT" ] && log "  Durable agent alias for '$AUTHOR': '$AUTHOR_AGENT' (ga-pyzo, best-effort)."
+
 if [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; then
   warn "Cannot determine author authoritatively for bead $BEAD_ID — DEFERRING (fail-safe)."
   bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:claimed"  -q 2>/dev/null || true
@@ -1419,6 +1471,14 @@ bd -C "$GC_CITY" update "$GATE_RUN_ID" \
 # the dispatcher trust it instead of re-deriving from a field this same guard run
 # is about to clear.
 bd -C "$GC_CITY" update "$MARKER_ID" --set-metadata "gate.submitted_by=$AUTHOR" -q 2>/dev/null || true
+
+# ga-pyzo: persist the durable agent alias (resolved above, best-effort)
+# alongside gate.submitted_by. gate.submitted_by remains the sole trusted
+# self-review-exclusion identity (SECURITY, see Step 5 header) — this is a
+# secondary liveness FALLBACK the dispatcher consults only when AUTHOR's own
+# recorded session has since recycled. Omitted (no-op) when unresolved so old
+# and new markers coexist without a schema migration.
+[ -n "$AUTHOR_AGENT" ] && bd -C "$GC_CITY" update "$MARKER_ID" --set-metadata "gate.submitted_by_agent=$AUTHOR_AGENT" -q 2>/dev/null || true
 
 # ── wa-qq33j: kanban sync — stamp source-bead + marker so the board shows in-review ──
 # (a) Add source-bead:$BEAD_ID and branch:$BRANCH labels to the marker so the
