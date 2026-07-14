@@ -1763,6 +1763,44 @@ RIG=$(extract "rig")
 
 log "  branch=$BRANCH  bead_id=$BEAD_ID  rig=${RIG:-unknown}"
 
+# ── Step 2b: Schema-drift diagnostic for hand-created markers (ga-kefn) ──────
+# /gate-done's canonical writer (commands/gate-done.md Step 3) always emits
+# branch:/bead_id:/author:/base_commit:/rig:/bead_rig: — but a marker
+# hand-created OUTSIDE that flow (e.g. the Mayor re-submitting after a gate
+# infra failure) has zero schema enforcement. ga-wisp-5zki27 used `bead:`
+# instead of `bead_id:` and omitted `rig:`/`bead_rig:` entirely; BEAD_ID/RIG
+# above resolved empty with no signal why, and Step 4's eventual abort
+# ("Cannot resolve rig path for rig='' (bead=)") reads like a rig-registry
+# problem — nothing pointed at the real defect. Diagnosing it required
+# reading dispatcher source and cross-referencing raw log timestamps over
+# ~2 hours, while 3 separate dispatches landed on the already-complete fix
+# and could only stand down.
+#
+# Deliberately NOT alias-acceptance (ga-kefn's "(c) is lowest-leverage" —
+# silently accepting one typo just leaves the next hand-typed marker's novel
+# typo equally silent). This only names a REAL near-miss line for a field
+# that came back empty, so it never fires on crew markers that legitimately
+# omit `rig:` by design (ga-7zjs1 above) — only when a plausible-but-wrong
+# line is actually present in the description.
+# SELFTEST-EXTRACT near-miss-diagnostic: BEGIN
+warn_near_miss_field() {
+  # $1=canonical field  $2=already-resolved value  $3..=known near-miss aliases
+  local canonical="$1" resolved="$2"; shift 2
+  [ -n "$resolved" ] && return 0
+  local alias line
+  for alias in "$@"; do
+    line=$(printf '%s\n' "$DESC" | grep -E "^${alias}:" | head -1 || true)
+    if [ -n "$line" ]; then
+      log "  WARNING: '${canonical}:' is empty but description has near-miss line '${line}' — likely a hand-created marker (outside /gate-done) using a non-canonical field name. See ga-kefn."
+      return 0
+    fi
+  done
+  return 0
+}
+warn_near_miss_field "bead_id" "$BEAD_ID" bead beadid bead-id issue issue_id
+warn_near_miss_field "rig"     "$RIG"     bead_rig rig_name rigname target_rig
+# SELFTEST-EXTRACT near-miss-diagnostic: END
+
 # ── Step 3: Re-derive author authoritatively (never trust marker self-declaration)
 #
 # Resolution order (most-to-least authoritative):
