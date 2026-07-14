@@ -136,6 +136,24 @@ eq "_ts_to_epoch +00:00 form → 1577836800"                   "$(_ts_to_epoch '
 eq "_ts_to_epoch -03:00 form → 1577847600 (offset applied)"  "$(_ts_to_epoch '2020-01-01T00:00:00-03:00')" "1577847600"
 eq "_ts_to_epoch empty → empty (fail-open)"                  "$(_ts_to_epoch '')" ""
 
+# ── 2e. session_is_booting — ga-flfo boot-vs-dead discriminator ──────────────
+# A `gc session new --no-attach` deferred start can take ~210s under load
+# before the tmux runtime appears. During that window `gc session list`
+# reports state="creating" — the record exists, but nothing has booted. Every
+# OTHER deadness signal (session_is_dead's present+never-acked path via
+# slot_effectively_dead, the ga-h9o17 peek probe, the ga-q8tmn staleness
+# probe) reads this identically to a genuinely dead/drained session, so
+# without an explicit state check a slow boot alone got reviewers closed
+# mid-boot (observed live: w4x6vg reaped 32s after spawn, uraowb at 48s).
+# Signature: session_is_booting <state> → 1|0
+type session_is_booting >/dev/null 2>&1 || { echo "FATAL: session_is_booting not defined by dispatcher (ga-flfo)"; exit 1; }
+echo "── 2e. session_is_booting (state=creating = booting, never a death signal) ──"
+eq "state=creating → booting"           "$(session_is_booting creating)" "1"
+eq "state=active → not booting"         "$(session_is_booting active)"   "0"
+eq "state=asleep → not booting"         "$(session_is_booting asleep)"   "0"
+eq "empty state → not booting (fail safe to the OTHER existing probes)" "$(session_is_booting '')" "0"
+eq "unknown/garbage state → not booting" "$(session_is_booting weird)"  "0"
+
 # ── 3. respawn_reviewer_slot — real spawn/nudge wiring (mock gc) ──────────────
 # Proves the helper spawns a FRESH session, swaps SESSION_IDS[idx] in place,
 # re-delivers the SAME stored task, and REUSES the still-pending verdict bead
@@ -266,8 +284,10 @@ echo "── 4. bounded poll-loop simulation (scenarios a–e) ──"
 
 # Build the gc session-list JSON from the per-slot liveness model.
 # SLOT_LIVE[j]: "alive" (present,not-closed) | "absent" | "closed".
+# SLOT_STATE[j]: the listed state string, default "active" (ga-flfo: set to
+# "creating" to model a deferred-start session still booting).
 build_sess_json() {
-  local out="[" first=1 j sid
+  local out="[" first=1 j sid st
   for j in "${!SESSION_IDS[@]}"; do
     case "${SLOT_LIVE[$j]}" in
       alive)  sid="${SESSION_IDS[$j]}"; cl="false" ;;
@@ -275,8 +295,9 @@ build_sess_json() {
       absent) continue ;;  # not in the list at all
       *)      sid="${SESSION_IDS[$j]}"; cl="false" ;;
     esac
+    st="${SLOT_STATE[$j]:-active}"
     [ "$first" = "1" ] || out="$out,"
-    out="$out{\"id\":\"$sid\",\"state\":\"active\",\"closed\":$cl}"
+    out="$out{\"id\":\"$sid\",\"state\":\"$st\",\"closed\":$cl}"
     first=0
   done
   echo "$out]"
@@ -294,17 +315,21 @@ sim_poll() {
       FAIL) SIM_RECEIVED=$((SIM_RECEIVED+1)); SIM_ANYFAIL=1 ;;
       pending)
         # mirror the else-branch gating in the dispatcher
-        local sid present_n present_flag closed_flag dead spawn_age action k
+        local sid present_n present_flag closed_flag state_flag dead booting spawn_age action k
         sid="${SESSION_IDS[$j]}"
         spawn_age=$(( now - ${SLOT_SPAWN_EPOCH[$j]:-$now} ))
         present_n=$(echo "$MOCK_SESS_JSON" | jq -r --arg s "$sid" 'map(select(.id==$s)) | length')
         if [ "$present_n" -ge 1 ]; then
           present_flag=1
           closed_flag=$(echo "$MOCK_SESS_JSON" | jq -r --arg s "$sid" 'map(select(.id==$s)) | .[0].closed // false')
+          state_flag=$(echo "$MOCK_SESS_JSON" | jq -r --arg s "$sid" 'map(select(.id==$s)) | .[0].state // ""')
         else
-          present_flag=0; closed_flag=false
+          present_flag=0; closed_flag=false; state_flag=""
         fi
         dead=$(session_is_dead "$present_flag" "$closed_flag")
+        # ga-flfo: state=creating means the runtime has not appeared yet — NOT
+        # a signal of death. See session_is_booting() unit tests (2e) above.
+        booting=$(session_is_booting "$state_flag")
         # ga-h9o17: model the drained-but-listed peek probe through the REAL
         # helper. SLOT_PEEK[j]="gone" makes `gc session peek` report
         # session-not-found even though the list still shows the session present
@@ -312,7 +337,7 @@ sim_poll() {
         # peek succeeds. Probe only when the list says alive and past grace —
         # exactly the dispatcher's bounding.
         local peek_dead=0
-        if [ "$dead" = "0" ] && [ "$spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
+        if [ "$dead" = "0" ] && [ "$booting" != "1" ] && [ "$spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
           case "${SLOT_PEEK[$j]:-found}" in
             gone) peek_dead=$(session_peek_reports_dead "gc session peek: session not found: \"$sid\"") ;;
             *)    peek_dead=$(session_peek_reports_dead "live terminal scrollback for $sid") ;;
@@ -337,6 +362,10 @@ sim_poll() {
         local eff_dead="$dead"
         [ "$peek_dead" = "1" ] && eff_dead=1
         [ "$stale_dead" = "1" ] && eff_dead=1
+        # ga-flfo: catch-all — a booting slot is never effectively dead, no
+        # matter which signal above would otherwise have said so (mirrors the
+        # real dispatcher's final override; see quality-gate-dispatcher.sh).
+        [ "$booting" = "1" ] && eff_dead=0
         if [ "$eff_dead" = "1" ] && [ "$spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
           SLOT_DEAD_STREAK[$j]=$(( ${SLOT_DEAD_STREAK[$j]:-0} + 1 ))
         else
@@ -356,7 +385,7 @@ sim_poll() {
           # the drained-peek scenario converges instead of re-firing forever.
           # ga-q8tmn: a re-convened slot also gets a FRESH activity clock (new
           # session) so the staleness scenario converges instead of re-firing.
-          if [ -n "${REVIVE_ON_RESPAWN:-}" ]; then SLOT_LIVE[$j]="alive"; SLOT_PEEK[$j]="found"; SLOT_STALE[$j]="fresh"; SLOT_BEAD[$j]="$REVIVE_VERDICT"; fi
+          if [ -n "${REVIVE_ON_RESPAWN:-}" ]; then SLOT_LIVE[$j]="alive"; SLOT_PEEK[$j]="found"; SLOT_STALE[$j]="fresh"; SLOT_STATE[$j]="active"; SLOT_BEAD[$j]="$REVIVE_VERDICT"; fi
         fi
         ;;
     esac
@@ -390,7 +419,7 @@ run_sim() {
 }
 
 reset_slots() {
-  RESPAWN_BUDGET=(); SLOT_SPAWN_EPOCH=(); SLOT_DEAD_STREAK=(); SLOT_BEAD=(); SLOT_LIVE=(); SLOT_PEEK=(); SLOT_STALE=()
+  RESPAWN_BUDGET=(); SLOT_SPAWN_EPOCH=(); SLOT_DEAD_STREAK=(); SLOT_BEAD=(); SLOT_LIVE=(); SLOT_PEEK=(); SLOT_STALE=(); SLOT_STATE=()
   local j
   for j in 0 1 2; do
     RESPAWN_BUDGET[$j]="$MAX_RESPAWNS_PER_SLOT"
@@ -560,6 +589,50 @@ sim_poll 1500   # 500s after spawn, past grace, streak_min=1 → respawn
 eq "grace gate: dead past grace window → respawn"      "$SIM_RESPAWNS" "1"
 RECONVENE_GRACE_SECS=0; RECONVENE_DEAD_STREAK_MIN=2
 
+# (i) ga-flfo NB-VERIFY sense 1: slot 2 session PRESENT but state=creating (a
+# deferred-start reviewer still booting — record exists, runtime does not
+# yet). grace=0 + SLOT_SPAWN_EPOCH=0 means spawn_age already reads "past
+# grace" on the very first poll, and SLOT_PEEK=gone models physical reality:
+# a session with no runtime yet WOULD fail a peek if one were attempted. This
+# is EXACTLY the ga-mepb0 boot-wedge signature (present + never-acked) PLUS
+# the ga-h9o17 peek-gone signature at once — every pre-ga-flfo signal reads it
+# dead. streak_min=1 so a single poll would be enough to confirm-dead if the
+# bug existed. Must NEVER respawn while booting (observed live: w4x6vg reaped
+# 32s after spawn, uraowb at 48s — both well inside a real ~210s boot).
+VERDICT_BEAD_IDS=( vb0 ); SESSION_IDS=( s0 ); REVIEW_TASKS=( t0 )
+RESPAWN_BUDGET=( 2 ); SLOT_DEAD_STREAK=( 0 ); SLOT_SPAWN_EPOCH=( 0 )
+RECONVENE_GRACE_SECS=0; RECONVENE_DEAD_STREAK_MIN=1
+SLOT_BEAD=( pending ); SLOT_LIVE=( alive ); SLOT_STATE=( creating ); SLOT_PEEK=( gone )
+SIM_RESPAWNS=0
+sim_poll 1000
+eq "(i, ga-flfo NB-VERIFY sense 1) booting (state=creating) → 0 respawns even past grace + peek-gone + never-acked" "$SIM_RESPAWNS" "0"
+eq "(i) booting slot session id NOT swapped" "${SESSION_IDS[0]}" "s0"
+sim_poll 5000   # a second, much-later poll — still must not respawn while booting
+eq "(i) booting slot still not respawned on a LATER poll either" "$SIM_RESPAWNS" "0"
+
+echo "── (i-mutation) MUTATION TEST: the booting guard is load-bearing ──"
+# Reproduce the exact PRE-ga-flfo fold (no booting check anywhere) for the
+# IDENTICAL inputs scenario (i) just used: dead=0 (present+not-closed) and a
+# peek that reports gone. If this pre-fix formula does NOT diverge from the
+# fixed behavior above, scenario (i)'s assertion would pass vacuously (i.e.
+# even a reverted fix would pass it) — this proves it does not.
+_prefix_peek_dead=$(session_peek_reports_dead 'gc session peek: session not found: "s0"')
+_prefix_eff_dead=0
+[ "$_prefix_peek_dead" = "1" ] && _prefix_eff_dead=1
+eq "pre-ga-flfo fold (no booting guard) reads the SAME scenario-(i) inputs as dead" "$_prefix_eff_dead" "1"
+[ "$_prefix_eff_dead" = "1" ] && ok "pre-fix (dead=1, would respawn) vs post-fix (0 respawns above) diverge — the booting guard is what makes the difference" \
+                              || bad "pre-fix and post-fix formulas agree — mutation test failed to demonstrate the guard matters"
+
+# (i2) ga-flfo NB-VERIFY sense 2 / converse of (i): the SAME slot, no longer
+# creating (now "active" per the list) AND genuinely absent (not just slow) →
+# re-convene must STILL fire. Proves the creating-guard does not over-protect:
+# it shields only the specific booting state, nothing else — a genuinely dead
+# session past grace is unaffected by this fix.
+SLOT_STATE=( active ); SLOT_LIVE=( absent ); SLOT_DEAD_STREAK=( 0 ); SLOT_SPAWN_EPOCH=( 0 ); SIM_RESPAWNS=0
+sim_poll 1000
+eq "(i2, ga-flfo NB-VERIFY sense 2) no longer creating + absent → respawn fires (genuinely dead still reaped)" "$SIM_RESPAWNS" "1"
+RECONVENE_GRACE_SECS=0; RECONVENE_DEAD_STREAK_MIN=2
+
 # ── 5. Drift-guard: the live dispatcher wires the re-convene path in ──────────
 echo "── 5. drift-guard: dispatcher wires ga-4u16h re-convene ──"
 grep -q 'classify_slot_action()'   "$DISPATCHER" && ok "dispatcher defines classify_slot_action"   || bad "missing classify_slot_action def"
@@ -634,9 +707,10 @@ grep -q '\[ "\$_peek_dead" = "1" \] && _eff_dead=1' "$DISPATCHER" && ok "poll lo
 # The peek must capture STDERR ONLY (2>&1 >/dev/null) so a live reviewer's STDOUT
 # scrollback can never false-trigger the not-found match.
 grep -q 'session peek "\$_sid" --lines 5 2>&1 >/dev/null' "$DISPATCHER" && ok "drained probe captures peek STDERR only (stdout→/dev/null)" || bad "drained probe does not isolate stderr (live scrollback could false-match)"
-# The probe must be bounded to the suspicious window: list-alive (_dead=0) + past
-# grace — NOT run on a session the list already calls dead.
-grep -q '\[ "\$_dead" = "0" \] && \[ "\$_spawn_age" -ge "\$RECONVENE_GRACE_SECS" \]' "$DISPATCHER" && ok "drained probe bounded to list-alive + past-grace slots" || bad "drained probe not bounded (runs every poll / inside grace)"
+# The probe must be bounded to the suspicious window: list-alive (_dead=0) +
+# NOT booting (ga-flfo) + past grace — NOT run on a session the list already
+# calls dead, and NOT run on one that hasn't been born yet.
+grep -q '\[ "\$_dead" = "0" \] && \[ "\$_booting" != "1" \] && \[ "\$_spawn_age" -ge "\$RECONVENE_GRACE_SECS" \]' "$DISPATCHER" && ok "drained probe bounded to list-alive + not-booting + past-grace slots" || bad "drained probe not bounded (runs every poll / inside grace / while booting)"
 grep -q 'Drained reviewer detected (ga-h9o17)' "$DISPATCHER" && ok "poll loop logs the drained-reviewer detection" || bad "missing 'Drained reviewer detected' log"
 
 # ── 5d. drift-guard: the live dispatcher wires the ga-q8tmn frozen-reviewer fix ─
@@ -673,6 +747,20 @@ grep -q 'session pin "\$_new_sid"' "$DISPATCHER" && ok "re-convened respawn pins
 # abort the gate — it just leaves the session unprotected, with re-convene as backstop.
 grep -q 'session pin "\$SESSION_ID" 2>/dev/null || true' "$DISPATCHER" && ok "initial-spawn pin is non-fatal (|| true)" || bad "initial-spawn pin is not || true-guarded (could abort gate on pin failure)"
 grep -q 'session pin "\$_new_sid" 2>/dev/null || true' "$DISPATCHER" && ok "re-convene pin is non-fatal (|| true)" || bad "re-convene pin is not || true-guarded (could abort gate on pin failure)"
+
+# ── 5f. drift-guard: the live dispatcher wires the ga-flfo booting distinction ─
+# Fail LOUDLY if a future refactor drops the boot-vs-dead guard (the fix for a
+# deferred-start reviewer being indistinguishable, via EVERY prior signal, from
+# a genuinely dead one during its ~210s boot window).
+echo "── 5f. drift-guard: dispatcher wires ga-flfo booting-vs-dead distinction ──"
+grep -q 'session_is_booting()' "$DISPATCHER" && ok "dispatcher defines session_is_booting" || bad "missing session_is_booting def (ga-flfo fix dropped)"
+grep -q '_booting=$(session_is_booting' "$DISPATCHER" && ok "poll loop computes _booting from the session's listed state" || bad "poll loop does not compute _booting (ga-flfo)"
+grep -q '_state_flag=$(echo "$RECONVENE_SESS_JSON"' "$DISPATCHER" && ok "poll loop fetches session state (needed for the booting check)" || bad "poll loop does not fetch state (ga-flfo)"
+# (the peek-dead probe's booting gate is asserted in section 5c above, as part
+# of "drained probe bounded to list-alive + not-booting + past-grace slots" —
+# not repeated here to avoid a duplicate grep of the identical pattern.)
+grep -q '\[ "\$_booting" = "1" \] && _eff_dead=0' "$DISPATCHER" && ok "catch-all override forces _eff_dead=0 while booting (the load-bearing guard)" || bad "missing catch-all booting override (ga-flfo) — reviewers can be killed mid-boot again"
+grep -q 'RECONVENE_GRACE_SECS:-360' "$DISPATCHER" && ok "RECONVENE_GRACE_SECS default raised to 360s (>= observed ~210s worst-case boot)" || bad "RECONVENE_GRACE_SECS default not raised (ga-flfo) — regresses to the unsafe 60s if the live plist override is ever removed"
 
 # ── 6. dispatcher still parses + lib-only return is a no-op in normal flow ─────
 echo "── 6. syntax + lib-only safety ──"

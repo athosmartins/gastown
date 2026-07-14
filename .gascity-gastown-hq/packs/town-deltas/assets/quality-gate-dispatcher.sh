@@ -117,8 +117,18 @@ fi
 # Grace window (seconds) a freshly-(re)spawned reviewer gets before its session
 # may be judged DEAD — covers slow startup/waking so a live-but-slow reviewer is
 # NEVER re-convened. Floor-guarded.
-RECONVENE_GRACE_SECS="${RECONVENE_GRACE_SECS:-60}"
-case "$RECONVENE_GRACE_SECS" in ''|*[!0-9]*) RECONVENE_GRACE_SECS=60 ;; esac
+# ga-flfo: default was 60s, but a `gc session new --no-attach` deferred start
+# was observed taking ~210s under load/Dolt pressure — comfortably outside the
+# old default, which is how a reviewer got closed mid-boot before this default
+# was raised. 360s matches the value already proven safe live (Mayor's
+# EnvironmentVariables override on the launchd plist, applied as an interim
+# mitigation while this fix was in flight) so the code default no longer
+# silently regresses to the unsafe value if that override is ever removed.
+# The primary fix for the boot-vs-dead conflation is session_is_booting() (see
+# above) — it neutralizes deadness for state=creating regardless of this
+# value; this bump is defense in depth, not the load-bearing guard.
+RECONVENE_GRACE_SECS="${RECONVENE_GRACE_SECS:-360}"
+case "$RECONVENE_GRACE_SECS" in ''|*[!0-9]*) RECONVENE_GRACE_SECS=360 ;; esac
 [ "$RECONVENE_GRACE_SECS" -lt 20 ] 2>/dev/null && RECONVENE_GRACE_SECS=20
 
 # Consecutive polls a slot must read DEAD before re-convene fires (defends
@@ -133,8 +143,13 @@ case "$RECONVENE_DEAD_STREAK_MIN" in ''|*[!0-9]*) RECONVENE_DEAD_STREAK_MIN=2 ;;
 # DEAD and re-convened, instead of waiting the full 45m outer timeout. A frozen
 # Claude stops emitting tmux activity entirely, so its last_active stops
 # advancing; a genuinely-working reviewer refreshes it on every tool call.
-# Floored well above normal reviewer output gaps AND above RECONVENE_GRACE_SECS,
-# so it can never reap inside the grace window. Effective detection latency ≈
+# Floored well above normal reviewer output gaps. The probe that reads this
+# value cannot run before `_spawn_age >= RECONVENE_GRACE_SECS` (the caller's
+# own gate, not a static ordering of these two constants — ga-flfo raised
+# RECONVENE_GRACE_SECS to 360 without needing to raise this), and staleness is
+# measured from the session's own last_active clock, not from spawn time, so
+# it can never reap inside the grace window regardless of how the two values
+# compare numerically. Effective detection latency ≈
 # REVIEWER_STALE_SECS + (RECONVENE_DEAD_STREAK_MIN−1)·VERDICT_POLL_INTERVAL — at
 # the defaults ≈ 300 + 30 = 330s, comfortably under the 45m timeout and the
 # ga-q8tmn <8min guiding star. Set to 0 to DISABLE the staleness probe entirely.
@@ -316,6 +331,29 @@ slot_effectively_dead() {
 session_peek_reports_dead() {
   case "$1" in
     *"session not found"*) echo 1 ;;
+    *) echo 0 ;;
+  esac
+}
+
+# session_is_booting <state> → 1 (the session record exists but the runtime
+# has not started yet — NOT a signal of death) | 0. Pure; no I/O.
+# ga-flfo: a `gc session new --no-attach` deferred start can take ~210s under
+# load/Dolt pressure before the tmux runtime actually appears. During that
+# window `gc session list` reports state="creating" and `gc session peek`
+# answers "session not found" on stderr — the IDENTICAL signal
+# session_peek_reports_dead() uses to detect a DRAINED (already-ended)
+# reviewer, and a present-but-never-acked slot is exactly what
+# slot_effectively_dead() also treats as dead. Every existing deadness probe
+# therefore reads "hasn't been born yet" the same as "died", so a slow boot
+# alone got reviewers closed mid-boot (observed live: w4x6vg reaped 32s after
+# spawn, uraowb at 48s — both well inside a real ~210s boot). A session can
+# only report state="creating" while genuinely booting — never while
+# genuinely alive-and-working or genuinely dead — so gating on it directly
+# distinguishes NOT-BORN from DIED instead of conflating them via a timeout
+# race. RECONVENE_GRACE_SECS remains the backstop for every OTHER state.
+session_is_booting() {
+  case "$1" in
+    creating) echo 1 ;;
     *) echo 0 ;;
   esac
 }
@@ -3462,11 +3500,17 @@ while true; do
           _present_flag=1
           _closed_flag=$(echo "$RECONVENE_SESS_JSON" \
             | jq -r --arg s "$_sid" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | .[0].closed // false' 2>/dev/null || echo false)
+          # ga-flfo: fetch state too so the reconvene loop can tell a booting
+          # slot (state=creating) apart from a dead one — see session_is_booting().
+          _state_flag=$(echo "$RECONVENE_SESS_JSON" \
+            | jq -r --arg s "$_sid" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | .[0].state // ""' 2>/dev/null || echo "")
         else
           _present_flag=0
           _closed_flag=false
+          _state_flag=""
         fi
         _dead=$(session_is_dead "$_present_flag" "$_closed_flag")
+        _booting=$(session_is_booting "$_state_flag")
         # ── ga-mepb0: late-ACK re-check + boot-wedge deadness ───────────────────
         # A reviewer wedged at boot (gc prime hung on the Dolt circuit-breaker) is
         # present + asleep (session_is_dead=0) but never ACKs, so the session-only
@@ -3505,12 +3549,20 @@ while true; do
         # 2>&1 >/dev/null routes ONLY stderr into the capture (stdout → /dev/null),
         # so a live reviewer's scrollback can never false-trigger the not-found match.
         _peek_dead=0
-        if [ "$_dead" = "0" ] && [ "$_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
+        # ga-flfo: skip the probe entirely while booting — a session with no
+        # runtime yet will ALWAYS peek "session not found", so running it here
+        # would just log a misleading "Drained reviewer detected" for a slot
+        # that never lived in the first place. The _eff_dead override below is
+        # the actual guard; this is purely to keep the log honest and skip a
+        # wasted `gc session peek` call.
+        if [ "$_dead" = "0" ] && [ "$_booting" != "1" ] && [ "$_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
           _peek_stderr=$(gc --city "$GC_CITY" session peek "$_sid" --lines 5 2>&1 >/dev/null || true)
           _peek_dead=$(session_peek_reports_dead "$_peek_stderr")
           if [ "$_peek_dead" = "1" ]; then
             log "  Drained reviewer detected (ga-h9o17): slot $j session=${_sid} listed+not-closed but peek reports session-gone; treating as DEAD (verdict bead ${VERDICT_BEAD_IDS[$j]} still pending)."
           fi
+        elif [ "$_booting" = "1" ]; then
+          log "  Slot $j session=${_sid} still booting (state=creating, spawn_age=${_spawn_age}s) — not dead, skipping deadness probes (ga-flfo)."
         fi
         _eff_dead=$(slot_effectively_dead "$_dead" "${REVIEWER_ACKED[$j]:-0}")
         # ga-h9o17: fold the peek-confirmed drained signal into deadness. The grace
@@ -3552,6 +3604,14 @@ while true; do
         # like the ga-h9o17 peek signal — the grace + dead-streak guards below still
         # apply unchanged, so a single stale read cannot reap a live reviewer.
         [ "$_stale_dead" = "1" ] && _eff_dead=1
+        # ga-flfo: catch-all override — a booting slot (state=creating) is never
+        # effectively dead, no matter which probe above would otherwise have said
+        # so. The ACK-fold in slot_effectively_dead() alone already reads a
+        # booting session as dead (present + never-acked is indistinguishable
+        # from ga-mepb0's boot-wedge signature), so gating only the peek probe
+        # above is not sufficient — this final override is the actual fix. Placed
+        # last so it wins regardless of which upstream probe fired.
+        [ "$_booting" = "1" ] && _eff_dead=0
         # Grace gate: never call a freshly-(re)spawned reviewer dead too early.
         if [ "$_eff_dead" = "1" ] && [ "$_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
           SLOT_DEAD_STREAK[$j]=$(( ${SLOT_DEAD_STREAK[$j]:-0} + 1 ))
