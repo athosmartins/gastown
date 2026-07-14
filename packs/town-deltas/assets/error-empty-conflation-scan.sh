@@ -52,6 +52,13 @@
 #   - This tool does not cover the ga-p5q3 instance #1 shape (awk portability
 #     escapes) — that is a different bug family (portability, not error/empty
 #     conflation) and is intentionally out of this scan's 3-category scope.
+#   - C1 `except: pass` findings need case-by-case triage, not blanket
+#     fixing — not every swallow is load-bearing (ga-g2eg). Example benign:
+#     gate-recovery-watchdog.py:587 swallows a log-file f.seek() optimization
+#     failure — the fallback is just re-reading the whole file. Example real:
+#     gate-health-monitor.py:175 swallows the failure of the monitor's OWN
+#     notify call — the alarm silently stops ringing. This tool is REPORT-
+#     ONLY by design (see file header); the reader decides per finding.
 #
 # Usage:
 #   error-empty-conflation-scan.sh [--path DIR] [--quiet]
@@ -170,6 +177,21 @@ scan_py_bare_except() {
 
 # ── C3: launchd job with no failure-notification path ───────────────────────
 # Uses PlistBuddy (canonical macOS tool) rather than regexing XML by hand.
+#
+# ga-g2eg (instance #6 of the ga-p5q3 class, found INSIDE this lint itself):
+# the original match required `notify` followed by whitespace, which missed
+# the three real idioms this codebase actually uses — a NEGATIVE result meant
+# "my pattern didn't match this idiom," not "no notify exists," the exact
+# conflation this whole scanner exists to catch:
+#   NOTIFY="/path/to/notify"   # assigns the tool to a variable — ends in a
+#                               # quote, not whitespace
+#   "$NOTIFY" -t "..." "..."   # invokes via the variable, not the literal word
+#   notify_fail() { ... }      # a function NAMED notify_*, not `notify ` itself
+# Measured 4/11 (36%) false-positive rate in C3 before this fix. Case-
+# insensitive substring match (no trailing-space requirement) catches all
+# three without needing to resolve variables or parse function defs — see the
+# selftest's notify-via-variable/notify-via-function fixtures for the
+# falsification proof (ga-p5q3 defense (b)).
 scan_launchd_no_notify() {
   local plist="$1" args line script=""
   args="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments" "$plist" 2>/dev/null)" || return 0
@@ -187,7 +209,7 @@ scan_launchd_no_notify() {
   done <<<"$args"
   [ -z "$script" ] && return 0
   [ -r "$script" ] || return 0
-  grep -qE 'notify[[:space:]]|gc mail send|gc session nudge|ntfy\.sh' "$script" && return 0
+  grep -qiE 'notify|ntfy|gc mail send|gc session nudge' "$script" && return 0
   echo "${plist}:1:C3:launchd job (script: $script) has no failure-notification call (notify/gc mail send/gc session nudge/ntfy)"
 }
 

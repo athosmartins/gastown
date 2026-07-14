@@ -147,6 +147,33 @@ if ! do_thing; then
 fi
 EOF
 cp "$FIXDIR/mixed/good-daemon.sh" "$FIXDIR/clean/"
+
+# ── ga-g2eg falsification: the two real idioms the original C3 pattern
+# missed (variable indirection, function naming) — the exact shapes named in
+# ga-g2eg's dolt-s3-backup.sh / sling-task-janitor.py / gate-marker-rehome-
+# janitor.py / dolt-gc-maintenance.sh false positives ──────────────────────
+cat > "$FIXDIR/mixed/good-var-daemon.sh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+NOTIFY="/Users/athos/.local/bin/notify"
+if ! do_thing; then
+  "$NOTIFY" -t "job failed" -p 5 "the thing failed" 2>/dev/null || true
+fi
+EOF
+cp "$FIXDIR/mixed/good-var-daemon.sh" "$FIXDIR/clean/"
+
+cat > "$FIXDIR/mixed/good-func-daemon.sh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+notify_fail() {
+  echo "ALERT: $*" >&2
+}
+if ! do_thing; then
+  notify_fail "the thing failed"
+fi
+EOF
+cp "$FIXDIR/mixed/good-func-daemon.sh" "$FIXDIR/clean/"
+
 chmod +x "$FIXDIR/mixed"/*-daemon.sh "$FIXDIR/clean"/*-daemon.sh 2>/dev/null
 
 cat > "$FIXDIR/mixed/bad-daemon.plist" <<PLISTEOF
@@ -182,6 +209,42 @@ cat > "$FIXDIR/clean/good-daemon.plist" <<PLISTEOF
 PLISTEOF
 cp "$FIXDIR/clean/good-daemon.plist" "$FIXDIR/mixed/good-daemon.plist"
 sed -i '' "s#$FIXDIR/clean/good-daemon.sh#$FIXDIR/mixed/good-daemon.sh#" "$FIXDIR/mixed/good-daemon.plist"
+
+cat > "$FIXDIR/clean/good-var-daemon.plist" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.selftest.good-var-daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$FIXDIR/clean/good-var-daemon.sh</string>
+  </array>
+  <key>StartInterval</key><integer>300</integer>
+</dict>
+</plist>
+PLISTEOF
+cp "$FIXDIR/clean/good-var-daemon.plist" "$FIXDIR/mixed/good-var-daemon.plist"
+sed -i '' "s#$FIXDIR/clean/good-var-daemon.sh#$FIXDIR/mixed/good-var-daemon.sh#" "$FIXDIR/mixed/good-var-daemon.plist"
+
+cat > "$FIXDIR/clean/good-func-daemon.plist" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.selftest.good-func-daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$FIXDIR/clean/good-func-daemon.sh</string>
+  </array>
+  <key>StartInterval</key><integer>300</integer>
+</dict>
+</plist>
+PLISTEOF
+cp "$FIXDIR/clean/good-func-daemon.plist" "$FIXDIR/mixed/good-func-daemon.plist"
+sed -i '' "s#$FIXDIR/clean/good-func-daemon.sh#$FIXDIR/mixed/good-func-daemon.sh#" "$FIXDIR/mixed/good-func-daemon.plist"
 
 # ═════════════════════════════════════════════════════════════════════════
 # 1. Direct pure-function detection tests
@@ -224,6 +287,14 @@ case "$r" in *:C3:*) ok "launchd job with no notify call anywhere → flagged C3
 
 r="$(scan_launchd_no_notify "$FIXDIR/mixed/good-daemon.plist")"
 [ -z "$r" ] && ok "launchd job whose script calls notify → NOT flagged" || bad "REGRESSION: notifying launchd job flagged: '$r'"
+
+r="$(scan_launchd_no_notify "$FIXDIR/mixed/good-var-daemon.plist")"
+[ -z "$r" ] && ok "ga-g2eg: notify via NOTIFY=...; \"\$NOTIFY\" ... → NOT flagged (falsification)" \
+  || bad "ga-g2eg REGRESSION: notify-via-variable flagged: '$r'"
+
+r="$(scan_launchd_no_notify "$FIXDIR/mixed/good-func-daemon.plist")"
+[ -z "$r" ] && ok "ga-g2eg: notify via notify_fail() function → NOT flagged (falsification)" \
+  || bad "ga-g2eg REGRESSION: notify-via-function flagged: '$r'"
 
 # ═════════════════════════════════════════════════════════════════════════
 # 2. End-to-end driver: mixed dir finds a nonzero, expected-shape count
