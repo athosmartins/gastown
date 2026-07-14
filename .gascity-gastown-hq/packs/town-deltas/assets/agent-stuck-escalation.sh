@@ -250,24 +250,53 @@ if [ -z "$BEADS_RAW" ] || [ "$BEADS_RAW" = "[]" ]; then
 fi
 
 # ── Fetch active session names (for assignee health check) ────────────────────
-SESS_RAW="$(timeout 20 "$GC" session list --json 2>/dev/null || true)"
+# ga-2tpd fix (part 1): bead.assignee carries a session's `session_name`
+# (e.g. "dog-ga4zc3", "thies-wa-gam257"), NOT its `name`/alias (e.g.
+# "gastown.dog-2", "thies-wa") — those differ for every CREW/DOG session.
+# Adhoc sessions happen to have name==session_name, which is why matching on
+# `name` alone (the old code) passed every selftest fixture while silently
+# never matching a real crew/dog assignee — it made the tri-state transcript
+# check below (ga-hehi/ga-4tmc) unreachable for exactly the long-running
+# agents it exists to protect (confirmed live: this session's own
+# name='gastown.dog-2' vs session_name='dog-ga4zc3', the latter being what
+# bead assignees actually carry). Index every identifying field per active
+# session so the match below succeeds no matter which one the assignee is.
+SESS_RAW="$(timeout 20 "$GC" session list --json 2>/dev/null)"
+SESS_RC=$?
 TMP_SESS="$(mktemp)"
-printf '%s' "${SESS_RAW:-{\}}" > "$TMP_SESS"
-ACTIVE_SESSIONS="$(python3 - "$TMP_SESS" <<'PY' || true
+printf '%s' "$SESS_RAW" > "$TMP_SESS"
+ACTIVE_SESSIONS="$(python3 - "$TMP_SESS" <<'PY'
 import json, sys
 try:
     with open(sys.argv[1]) as fh:
-        data = json.load(fh)
+        raw = fh.read()
+    data = json.loads(raw)
     for s in (data.get("sessions") or []):
         if s.get("state") == "active":
-            n = s.get("name") or s.get("id") or ""
-            if n:
-                print(n)
+            for field in ("session_name", "name", "alias", "id"):
+                v = s.get(field) or ""
+                if v:
+                    print(v)
 except Exception:
-    pass
+    sys.exit(1)
 PY
 )"
+PY_RC=$?
 rm -f "$TMP_SESS"
+
+# ga-2tpd fix (part 2): a FAILED `session list` query (nonzero exit, empty
+# stdout, or unparseable JSON) must never collapse to the same value as a
+# query that SUCCEEDED with zero active sessions (ga-p5q3 root class again).
+# The old `${SESS_RAW:-{}}` default made a failed call look byte-identical
+# to `{"sessions":[]}`, so ACTIVE_SESSIONS went empty either way and every
+# assignee read AUSENTE — escalating stuck beads whose session state was
+# never actually confirmed. SESSIONS_QUERY_FAILED lets the per-bead loop
+# below suppress instead, the same fail-safe shape as transcript_state
+# UNKNOWN.
+SESSIONS_QUERY_FAILED=0
+if [ "$SESS_RC" -ne 0 ] || [ -z "$SESS_RAW" ] || [ "$PY_RC" -ne 0 ]; then
+    SESSIONS_QUERY_FAILED=1
+fi
 
 # ── Parse stuck beads ─────────────────────────────────────────────────────────
 # Output per line: id|assignee|title|age_secs|updated_at|labels
@@ -400,6 +429,16 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
     # stall and must still escalate.
     if gate_label_present "$labels" || bead_has_open_gate_marker "$bead_id"; then
         log "$bead_id: bead.updated_at parado ${age_min}min mas EM GATE (labels=$labels) — SUPRIMINDO escalação (sem builder por design, ga-n937)"
+        continue
+    fi
+
+    # ga-2tpd fix (part 2): the session-list query failed this whole pass —
+    # this assignee's session state was never actually checked. Suppress
+    # rather than fall through to "AUSENTE" (see SESSIONS_QUERY_FAILED note
+    # above). Unassigned beads have no session to fail to check, so they
+    # are unaffected and keep escalating on updated_at alone.
+    if [ "$SESSIONS_QUERY_FAILED" = "1" ] && [ -n "$assignee" ]; then
+        log "$bead_id: bead.updated_at parado ${age_min}min — 'gc session list' falhou/vazio nesta passada — estado de sessão de $assignee DESCONHECIDO (não confirmado ausente) — SUPRIMINDO escalação (fail-safe ga-2tpd)"
         continue
     fi
 

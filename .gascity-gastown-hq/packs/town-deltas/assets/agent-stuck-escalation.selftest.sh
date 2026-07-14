@@ -69,6 +69,11 @@ cat > "$SHIM/gc" <<'SHIM'
 #!/usr/bin/env bash
 case "$1 $2" in
   "session list")
+    if [ "${SESSIONS_QUERY_FAIL:-0}" = "1" ]; then
+        # Simulates a real `gc session list` failure: nonzero exit, no
+        # stdout — e.g. Dolt unreachable, gc binary crash, timeout.
+        exit 1
+    fi
     cat "${SESSIONS_FIXTURE:-/dev/null}"
     exit 0
     ;;
@@ -117,6 +122,7 @@ run_script() {
     NOTIFY_BIN="$SHIM/notify" \
     BEADS_FIXTURE="${BEADS_FIXTURE:-}" \
     SESSIONS_FIXTURE="${SESSIONS_FIXTURE:-}" \
+    SESSIONS_QUERY_FAIL="${SESSIONS_QUERY_FAIL:-0}" \
     LOGS_FIXTURE_DIR="${LOGS_FIXTURE_DIR:-}" \
     GATE_MARKERS_DIR="${GATE_MARKERS_DIR:-}" \
     ACTIONS_FILE="$ACTIONS" \
@@ -396,6 +402,57 @@ rm -f "$LOGS_FIXTURE_DIR/thies-wa.json"
 # cmd/gc/cmd_session_logs_test.go
 # Test{ResolveSessionLogPathResolvesCrewShapedWorkDirWithUnderscore,
 # ResolveStoredSessionLogSource_ResolvesCrewShapedWorkDirWithUnderscore}.
+
+# ── T23: assignee is a session_name distinct from the session's `name` ──────
+# (ga-2tpd part 1): this is the REAL shape of every CREW/DOG session —
+# bead.assignee carries session_name (e.g. "thies-wa-gam257"), never the
+# session's `name`/alias (e.g. "thies-wa"). Every fixture above (T9-T22) used
+# adhoc-shaped sessions where name==session_name, which is exactly why the
+# bug (ACTIVE_SESSIONS indexed only `name`) passed every prior test while
+# never matching a real crew/dog assignee in production. Before the fix, this
+# fixture's assignee could never match ACTIVE_SESSIONS, so sess_status stayed
+# AUSENTE, the tri-state transcript check never ran, and the bead escalated
+# against a session that was actually alive and advancing.
+echo "T23: assignee is a session_name distinct from name → session resolves, transcript-advancing suppresses (ga-2tpd)"
+echo '{"sessions":[{"name":"thies-wa","session_name":"thies-wa-gam257","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture thies-wa-gam257 30   # keyed by session_name, not name
+printf '[%s]' "$(make_bead ga-test09 thies-wa-gam257 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test09"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test09" "T23: no escalation — assignee (session_name) resolves against the live session"
+log_contains "T23" "ativa" "T23: session recognized as ativa via session_name match"
+log_contains "T23" "SUPRIMINDO" "T23: log notes transcript-advancing suppression"
+rm -f "$LOGS_FIXTURE_DIR/thies-wa-gam257.json"
+
+# ── T24: `gc session list` query fails entirely → session state UNKNOWN for ──
+# the whole pass, escalation suppressed (ga-2tpd part 2 — ga-p5q3 root class
+# again: a query FAILURE must never collapse to the same value as a query
+# that SUCCEEDED with an empty result). Before the fix, `${SESS_RAW:-{}}`
+# made a failed `gc session list` look byte-identical to `{"sessions":[]}`,
+# so every assignee read AUSENTE and every stuck bead with an assignee
+# escalated on a session state nobody actually confirmed.
+echo "T24: gc session list query fails entirely → session state unknown, escalation suppressed"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"   # ignored — shim fails before reading it
+printf '[%s]' "$(make_bead ga-test10 thies-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test10"
+: > "$ACTIONS"
+SESSIONS_QUERY_FAIL=1 STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test10" "T24: no mail — session-list query failed, not confirmed-absent"
+assert_absent "$ACTIONS" "notify" "T24: no notify — session-list query failure suppresses same as unknown transcript"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test10" ] && ok "T24: no escalation state written (suppression is log-only)" || bad "T24: unexpected state file written on suppression"
+log_contains "T24" "DESCONHECIDO" "T24: log distinguishes session-query-failed from confirmed-absent"
+
+# ── T25: session-list query fails + UNASSIGNED bead → escalation unaffected ──
+# (no regression): an unassigned bead has no session to fail to check, so
+# the new fail-safe must not touch it — it should still escalate on
+# bead.updated_at alone, exactly as before this fix.
+echo "T25: gc session list query fails + unassigned bead → escalation unaffected (no regression)"
+printf '[%s]' "$(make_bead ga-test11 "" 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test11"
+: > "$ACTIONS"
+SESSIONS_QUERY_FAIL=1 STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test11" "T25: unassigned bead still escalates despite session-query failure"
 
 # ── T10–T12: Layer 1 routing integration (ga-qw3p.1) ────────────────────────
 # Deploy the real escalation-router.sh so the script can source it.
