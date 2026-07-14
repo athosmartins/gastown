@@ -254,7 +254,29 @@ echo "── 24. ga-cru9: BEHAVIORAL proof — a Dolt-hot DEFER can never reach 
 # ever executing the `bd create -l type:quality-gate-run` call, mirroring how
 # assertion 3 in gate-dup-run-guard.selftest.sh proves its own guard-before-
 # create ordering.
-DEFER_EXIT_LN=$(awk '/Headroom DEFER/{f=1} f&&/exit 0/{print NR; exit}' "$DISPATCHER")
+#
+# ANCHOR (gate review on gate_run=ga-wisp-vek7zn caught a real hole here): a
+# first version scanned open-ended — `/Headroom DEFER/{f=1} f&&/exit 0/{print
+# NR; exit}` — which, once triggered, latches onto the FIRST `exit 0` ANYWHERE
+# later in the file, not necessarily the one in the DEFER if-block. Mutation-
+# tested: replacing L1534's `exit 0` with `true` (reproducing the exact bug
+# ga-cru9 describes — DEFER logs but falls through) made that scan skip past
+# the mutation and match an unrelated `exit 0` at L1630 (the Step 1 atomic-
+# claim race-check, nothing to do with headroom) — DEFER_EXIT_LN=1630 still
+# < RUN_CREATE_LN, so the assertion reported PASS on a regressed dispatcher.
+# Fixed by bounding the scan to the DEFER if-block itself: walk forward from
+# the log line and stop at the block's own closing `fi`; only report a line
+# if `exit 0` is found strictly before that boundary. Re-ran the same
+# mutation against the fixed scan: DEFER_EXIT_LN comes back empty (the block
+# closes via `fi` before any `exit 0` is seen) and the assertion correctly
+# fails.
+DEFER_EXIT_LN=$(awk '
+  in_block {
+    if ($0 ~ /^[[:space:]]*exit 0[[:space:]]*$/) { print NR; exit }
+    if ($0 ~ /^[[:space:]]*fi[[:space:]]*$/)      { exit }
+  }
+  /Headroom DEFER/ { in_block=1 }
+' "$DISPATCHER")
 RUN_CREATE_LN=$(grep -n 'GATE_RUN_ID=\$(bd -C "\$GC_CITY" create' "$DISPATCHER" | head -1 | cut -d: -f1)
 if [ -n "$DEFER_EXIT_LN" ] && [ -n "$RUN_CREATE_LN" ] && [ "$DEFER_EXIT_LN" -lt "$RUN_CREATE_LN" ]; then
   ok "DEFER's exit (L$DEFER_EXIT_LN) strictly precedes gate-run creation (L$RUN_CREATE_LN) — no run bead can be created that sweep"
