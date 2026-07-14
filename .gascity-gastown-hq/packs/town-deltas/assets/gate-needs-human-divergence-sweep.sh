@@ -181,6 +181,28 @@ files_diverged() {
   git_in "$gdir" "$container" log --oneline "${baseline}..${mref}" -- "${files[@]}" 2>/dev/null || true
 }
 
+# prune_decision <in_candidates: 0|1> <store_query_failed: 0|1> — pure
+# companion to the PASS 1 primary pruner (ga-u4yi gate-feedback attempt 1
+# blocking issue). Mirrors verdict_count_from_query in quality-gate-guard.sh
+# (ga-jfo7): a FAILED discovery query for a store must never be conflated
+# with a confirmed-empty candidate set, because the primary pruner treats
+# absence-from-candidates as proof a bead is resolved. Pruning on a
+# false-empty drops the ledger entry AND its alert-suppression stamp; the
+# NEXT sweep then rediscovers the bead (if still gate:needs-human) as
+# brand-new with a FRESH baseline_sha, permanently losing any commits that
+# collided between the TRUE original baseline and the rediscovery point —
+# reproducing the exact incident (20h silent rot, unmergeable branch) this
+# sweep exists to prevent, just via a different mechanism (baseline reset
+# instead of "nothing watching at all"). Fail OPEN (keep) whenever the
+# entry's store failed its discovery query this sweep, exactly like
+# entry_within_retention()'s unparseable-timestamp case.
+prune_decision() {
+  local in_candidates="$1" store_failed="$2"
+  [ "$store_failed" = "1" ] && { echo "keep"; return; }
+  [ "$in_candidates" = "1" ] && { echo "keep"; return; }
+  echo "prune"
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Guard: when sourced for tests, stop here (no live sweep).
 # ═════════════════════════════════════════════════════════════════════════════
@@ -214,9 +236,21 @@ done
 
 CANDIDATES_JSONL=""
 declare -a CANDIDATE_IDS=()
+declare -a FAILED_STORES=()
 for _store in "${CANDIDATE_STORES[@]}"; do
   [ -d "$_store" ] || continue
-  _found=$(bd -C "$_store" list --label "gate:needs-human" --status=open --json 2>/dev/null || echo "[]")
+  # Capture bd's exit status WITHOUT masking it (mirrors verdict_bead_count_for_run
+  # in quality-gate-guard.sh, ga-jfo7). The old `|| echo "[]"` collapsed a FAILED
+  # query (Dolt timeout/contention) into the same "[]" a confirmed-empty result
+  # produces — and the PASS 1 primary pruner below treats absence-from-candidates
+  # as proof of resolution. See prune_decision() above for why that conflation is
+  # dangerous. `if` (not `v=$(cmd); rc=$?`) keeps `set -uo pipefail` from
+  # aborting before rc is read.
+  if ! _found=$(bd -C "$_store" list --label "gate:needs-human" --status=open --json 2>/dev/null); then
+    warn "candidate query failed for store $_store — its ledger entries will NOT be pruned this sweep (unknown, not confirmed-empty)"
+    FAILED_STORES+=("$_store")
+    continue
+  fi
   if [ -z "$_found" ] || [ "$_found" = "null" ]; then _found="[]"; fi
   _tagged=$(printf '%s' "$_found" | jq -c --arg store "$_store" '.[] | . + {_bead_city: $store}' 2>/dev/null || true)
   [ -z "$_tagged" ] && continue
@@ -228,7 +262,7 @@ for _store in "${CANDIDATE_STORES[@]}"; do
 $(printf '%s' "$_tagged" | jq -r '.id' 2>/dev/null)
 EOF
 done
-log "candidates: ${#CANDIDATE_IDS[@]} bead(s) currently labeled gate:needs-human across ${#CANDIDATE_STORES[@]} store(s)"
+log "candidates: ${#CANDIDATE_IDS[@]} bead(s) currently labeled gate:needs-human across ${#CANDIDATE_STORES[@]} store(s) (${#FAILED_STORES[@]} store query failure(s))"
 
 declare -a KEEP_LINES=()
 declare -a SEEN_BEAD_IDS=()
@@ -304,13 +338,22 @@ if [ -s "$LEDGER" ]; then
     BEAD_ID=$(printf '%s' "$entry" | jq -r '.bead_id // ""' 2>/dev/null || true)
     [ -z "$BEAD_ID" ] && continue
     TS=$(printf '%s' "$entry" | jq -r '.ts_first_seen // ""' 2>/dev/null || true)
+    BEADCITY=$(printf '%s' "$entry" | jq -r '.bead_city // ""' 2>/dev/null || true)
+    [ -z "$BEADCITY" ] && BEADCITY="$GC_CITY"
 
     # Primary pruner: no longer a live gate:needs-human candidate → resolved.
-    if ! in_list "$BEAD_ID" "${CANDIDATE_IDS[@]:-}"; then
+    # prune_decision() fails OPEN (keeps) when this entry's store failed its
+    # discovery query this sweep — see prune_decision() above for why a
+    # failed query must never read as "confirmed resolved".
+    _store_failed=0; in_list "$BEADCITY" "${FAILED_STORES[@]:-}" && _store_failed=1
+    _in_cand=0; in_list "$BEAD_ID" "${CANDIDATE_IDS[@]:-}" && _in_cand=1
+    if [ "$(prune_decision "$_in_cand" "$_store_failed")" = "prune" ]; then
       PRUNED=$((PRUNED+1))
       log "prune $BEAD_ID — no longer gate:needs-human (resolved/closed)"
       rm -f "${ALERT_DIR:?}/$BEAD_ID" 2>/dev/null || true
       continue
+    elif [ "$_store_failed" = "1" ]; then
+      warn "keep $BEAD_ID — candidate query failed for its store ($BEADCITY) this sweep; cannot confirm resolved"
     fi
     # Backstop pruner: retention window (fail-open on unparseable ts).
     if ! entry_within_retention "$TS" "$NOW_EPOCH" "$LEDGER_RETENTION_DAYS"; then
@@ -328,8 +371,6 @@ if [ -s "$LEDGER" ]; then
     DEFAULT=$(printf '%s' "$entry" | jq -r '.default_branch // "main"' 2>/dev/null || true)
     BRANCH=$(printf '%s' "$entry" | jq -r '.branch // ""' 2>/dev/null || true)
     BASELINE=$(printf '%s' "$entry" | jq -r '.baseline_sha // ""' 2>/dev/null || true)
-    BEADCITY=$(printf '%s' "$entry" | jq -r '.bead_city // ""' 2>/dev/null || true)
-    [ -z "$BEADCITY" ] && BEADCITY="$GC_CITY"
 
     if [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; then
       warn "rig_path missing for $BEAD_ID: '$RIG_PATH' — cannot verify this sweep (keeping entry)"
@@ -397,7 +438,16 @@ while IFS= read -r cand; do
   # required or every real case is missed). Absence is EXPECTED and common —
   # inflight-reclaim-guard.py and auto-refino also apply gate:needs-human for
   # unrelated reasons with no marker at all; skip quietly, not a warning.
-  MARKERS=$(bd -C "$GC_CITY" list --label "source-bead:$BEAD_ID" --all --json 2>/dev/null || echo "[]")
+  # Capture bd's exit status WITHOUT masking it — same conflation risk as the
+  # candidate-discovery query above, though lower severity here: this path
+  # only seeds a BRAND NEW ledger entry, so a failed query just delays first-
+  # tracking by one sweep (retried next cycle, nothing to lose yet) rather
+  # than destroying an existing baseline. Still worth a truthful log line
+  # instead of the "no gate marker" message a genuine absence would produce.
+  if ! MARKERS=$(bd -C "$GC_CITY" list --label "source-bead:$BEAD_ID" --all --json 2>/dev/null); then
+    warn "skip $BEAD_ID ($RIG) — gate marker query failed this sweep (Dolt hiccup?); will retry next sweep"
+    continue
+  fi
   if [ -z "$MARKERS" ] || [ "$MARKERS" = "null" ]; then MARKERS="[]"; fi
   BRANCH=$(printf '%s' "$MARKERS" | jq -r '
     sort_by(.created_at // "") | last // empty

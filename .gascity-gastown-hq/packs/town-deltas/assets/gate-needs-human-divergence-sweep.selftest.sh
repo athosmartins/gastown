@@ -32,7 +32,7 @@ rc1() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then bad "$d — expected 
 # ── Load the REAL functions (lib-only = no live sweep) ──────────────────────
 DIVERGENCE_LIB_ONLY=1 source "$SWEEP" \
   || { echo "FATAL: could not source sweep in lib-only mode"; exit 1; }
-for fn in branch_touched_files files_diverged rig_gitdir git_in iso_to_epoch entry_within_retention in_list; do
+for fn in branch_touched_files files_diverged rig_gitdir git_in iso_to_epoch entry_within_retention in_list prune_decision; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by sweep"; exit 1; }
 done
 
@@ -89,6 +89,23 @@ eq "unresolvable baseline → empty (fails safe, not error)" \
 eq "unresolvable main_ref → empty (fails safe, not error)" \
    "$(files_diverged "$R" 0 "$BASELINE" "origin/does-not-exist" "c.txt")" ""
 
+# ── 2b. prune_decision — ga-u4yi gate-feedback attempt 1 blocking fix ───────
+# The reviewer's blocking issue: `bd list ... || echo "[]"` conflated a FAILED
+# discovery query with a confirmed-empty candidate set, so the PASS 1 primary
+# pruner treated "query errored" the same as "bead resolved" and silently
+# dropped still-live ledger entries (losing their baseline_sha on
+# rediscovery). This simulates the failing `bd list` call the reviewer flagged
+# as untested — not via a live Dolt/bd fake, but by directly driving the pure
+# decision function with the (in_candidates, store_failed) inputs a real
+# failure would produce, same style as verdict_count_from_query's selftest.
+echo "── 2b. prune_decision (query-failure vs confirmed-empty, ga-u4yi attempt 1) ──"
+eq "in candidates, store query ok → keep"                "$(prune_decision 1 0)" "keep"
+eq "NOT in candidates, store query ok → prune (genuine resolve)" \
+   "$(prune_decision 0 0)" "prune"
+eq "NOT in candidates, store query FAILED → keep (fail-open, not a false-empty)" \
+   "$(prune_decision 0 1)" "keep"
+eq "in candidates, store query FAILED → keep" "$(prune_decision 1 1)" "keep"
+
 # ── 3. age / retention + membership helpers ─────────────────────────────────
 echo "── 3. age / retention / in_list helpers ──"
 TS="2026-06-11T00:00:00Z"
@@ -129,6 +146,31 @@ grep -q 'date -u -j -f "%Y-%m-%dT%H:%M:%SZ"' "$SWEEP" && ok "iso_to_epoch uses -
 # that resolves in 10 minutes should stop being tracked in 10 minutes, not
 # linger for the full retention window.
 grep -q 'no longer gate:needs-human'         "$SWEEP" && ok "prunes on resolution (not just time)"      || bad "presence-based pruning missing"
+
+# ga-u4yi gate-feedback attempt 1: candidate-discovery and marker-lookup
+# queries must capture bd's exit status, not mask a FAILED query behind
+# `|| echo "[]"` (which the PASS 1 primary pruner would then read as
+# confirmed-resolved). Fixed-string greps against the exact live code so this
+# can never silently regress back to the naive idiom.
+grep -qF 'prune_decision()' "$SWEEP" \
+  && ok "defines prune_decision" || bad "missing prune_decision def"
+grep -qF 'prune_decision "$_in_cand" "$_store_failed"' "$SWEEP" \
+  && ok "PASS 1 primary pruner calls prune_decision (not raw in_list)" \
+  || bad "PASS 1 primary pruner does not call prune_decision — REGRESSION risk"
+grep -qF 'FAILED_STORES+=("$_store")' "$SWEEP" \
+  && ok "candidate-discovery tracks per-store query failures" \
+  || bad "FAILED_STORES tracking missing"
+grep -qF 'if ! _found=$(bd -C "$_store" list --label "gate:needs-human" --status=open --json 2>/dev/null); then' "$SWEEP" \
+  && ok "candidate query captures rc without masking (no naive || echo fallback)" \
+  || bad "candidate query regressed to masking rc — REGRESSION of ga-u4yi attempt 1 fix"
+if grep -qF '_found=$(bd -C "$_store" list --label "gate:needs-human" --status=open --json 2>/dev/null || echo "[]")' "$SWEEP"; then
+  bad "naive || echo \"[]\" candidate-query idiom is back — REGRESSION"
+else
+  ok "naive || echo \"[]\" candidate-query idiom removed"
+fi
+grep -qF 'if ! MARKERS=$(bd -C "$GC_CITY" list --label "source-bead:$BEAD_ID" --all --json 2>/dev/null); then' "$SWEEP" \
+  && ok "PASS 2 marker query captures rc without masking" \
+  || bad "PASS 2 marker query regressed to masking rc — REGRESSION of ga-u4yi attempt 1 fix"
 
 # ── 6. drift-guard: plist ────────────────────────────────────────────────────
 echo "── 6. drift-guard: plist ──"
