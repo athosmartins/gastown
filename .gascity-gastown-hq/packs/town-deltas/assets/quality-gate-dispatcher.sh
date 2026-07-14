@@ -1264,7 +1264,19 @@ resolve_recycled_author() {
 # no side effects) so running it unconditionally here is safe in both modes.
 # Also gives us parse_marker_id as the canonical single source of truth (DRY:
 # ga-b92q / ga-tmug).
-GATE_GUARD_LIB_ONLY=1 source "${GC_CITY}/packs/town-deltas/assets/quality-gate-guard.sh" 2>/dev/null || true
+#
+# ga-bnu1 (gate-fix-attempt:2): source the SIBLING guard.sh, not GC_CITY's.
+# GC_CITY (L32) is a hardcoded live-main-tree path, so a caller that sources
+# THIS file from anywhere else (a review worktree, a CI checkout) still
+# pulled guard.sh from main — silently loading a version that can lack
+# session_matches_author(), crashing author_is_alive() with "command not
+# found" instead of degrading gracefully. Resolve guard.sh relative to this
+# script's own real location instead, so the two files loaded together
+# always come from the same checkout/commit regardless of which tree
+# dispatcher.sh itself is running from.
+_GATE_DISPATCHER_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATE_GUARD_LIB_ONLY=1 source "${_GATE_DISPATCHER_SELF_DIR}/quality-gate-guard.sh" 2>/dev/null || true
+unset _GATE_DISPATCHER_SELF_DIR
 
 if [ -n "${GATE_DISPATCHER_LIB_ONLY:-}" ]; then
   return 0 2>/dev/null || exit 0
