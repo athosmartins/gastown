@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.dolt-disk-floor-guard</string>
+
+  <!-- Last-resort disk-floor guard for Dolt (ga-gpzr, follow-up to the 2026-07-14
+       full-disk Dolt-death incident, ga-vs55). Polls avail space on Dolt's data-dir
+       filesystem every StartInterval; at/below FLOOR_WARN_GB(8) attempts a safe
+       reclaim (`gc dolt cleanup --force` — orphan-DB SQL DROP, pre-sanctioned safe
+       while Dolt is up) + rate-limited notify; at/below FLOOR_CRITICAL_GB(3) always
+       notifies (cooldown bypassed) + mails the Mayor durably. Does NOT stop Dolt,
+       refuse writes, or touch its data dir/start wrapper — deliberately out of
+       scope; see the script header. See scripts/dolt-disk-floor-guard.sh. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/dolt-disk-floor-guard.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <!-- 300 = every 5 min. Tighter than disk-pressure-monitor's hourly cadence — this
+       is Dolt-specific last-resort protection, and ga-vs55 showed pressure can go
+       from "known and already being alerted on" to "Dolt dead" in well under an
+       hour; a runaway process could fill remaining disk far faster still. -->
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-disk-floor-guard-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-disk-floor-guard-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+  </dict>
+</dict>
+</plist>

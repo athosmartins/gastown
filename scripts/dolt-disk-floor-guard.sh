@@ -1,0 +1,257 @@
+#!/bin/bash
+# dolt-disk-floor-guard.sh (ga-gpzr) — last-resort disk-floor guard for Dolt.
+#
+# WHY: 2026-07-14 the HQ Dolt server (port 52756) died mid-journal-write when the
+# disk filled to 100% (ga-vs55). It came back up clean this time (data intact,
+# verified by the Mayor via positive control) but nothing actually PROTECTS Dolt
+# from ENOSPC — a future full-disk event (any source, not just the symlink-descent
+# vector already fixed) could hit Dolt mid-write again with no guarantee of a clean
+# recovery. ga-vs55's other two furos (rising-pressure notify, symlink guard) don't
+# cover this: they slow/warn about a fill that's already underway; neither reserves
+# Dolt any headroom of its own, and disk-pressure-monitor.sh polls hourly — a lot
+# can fill in an hour.
+#
+# WHAT: an EXTERNAL, non-invasive watchdog (same shape as dolt-hang-watchdog.sh /
+# dolt-gc-maintenance.sh — NOT a patch to Dolt's config or its gitignored,
+# framework-managed start wrapper under .gc/, which isn't a durable place to put a
+# fix). Polls avail space on Dolt's data-dir filesystem every StartInterval and:
+#
+#   WARN_GB (default 8)     — attempt the pre-sanctioned-safe reclaim
+#                             (`gc dolt cleanup --force` — orphan test-DB SQL DROP,
+#                             documented safe while Dolt is up) + rate-limited
+#                             notify. Cooldown is bypassed if avail is WORSENING
+#                             since the last notify (mirrors the exact fix ga-vs55
+#                             furo #2 added to disk-pressure-monitor.sh's
+#                             dpm_should_notify — a cooldown blind to trend is what
+#                             let the city monitor stay silent 28min before Dolt
+#                             died; must not regress that lesson onto this guard).
+#
+#   CRITICAL_GB (default 3) — same reclaim attempt + notify ALWAYS (cooldown
+#                             bypassed unconditionally — this is the last rung
+#                             before repeating ga-vs55) + a DURABLE mail to the
+#                             Mayor. A near-miss this close to repeating a
+#                             city-wide outage must survive a session restart, so
+#                             this is mail, not a nudge (see mail-lifecycle
+#                             doctrine: "if the recipient dies and restarts, do
+#                             they need this message? yes -> mail").
+#
+# Absolute-GB floors (not percent, unlike disk-pressure-monitor's WARN/EMERGENCY/
+# HALT_IMMINENT_PCT): a %-based floor can look "fine" on a large disk while the
+# absolute room left is thin, and vice versa on a small one. This guard is a
+# Dolt-specific backstop underneath the general city-wide monitor, not a
+# replacement for it.
+#
+# OUT OF SCOPE (deliberately — see ga-gpzr's own description: "needs design...
+# this is NOT a lane:small fix"): this guard does NOT stop Dolt, does NOT refuse
+# writes, and does NOT touch Dolt's data directory. An automated system unilaterally
+# halting the town's SOLE data plane is a materially bigger policy decision than
+# alerting + pre-sanctioned-safe cleanup, and deserves explicit Mayor/operator
+# sign-off rather than being silently bundled into a no-human-review small-lane
+# merge. Filed as a separate follow-up bead (see this commit's gate-done note).
+#
+# Kill switch: DOLT_DISK_FLOOR_GUARD_ENABLED=0 → skip the reclaim action only.
+# Notification is NEVER gated by this switch (imp07 CALL INVARIANT: alerting is the
+# lowest-blast-radius action here and the one furo #2 just fixed for being
+# wrongly suppressible — don't reintroduce that failure mode one guard over).
+#
+# TEST (no Dolt, no deletions, no real disk mutation, no mail/notify sent):
+#   bash scripts/dolt-disk-floor-guard.selftest.sh
+# Library mode: `DOLT_DISK_FLOOR_GUARD_LIB=1 source dolt-disk-floor-guard.sh` defines
+# the pure decision functions WITHOUT running the guard flow.
+set -uo pipefail
+
+CITY="/Users/athos/gt/.gascity-gastown-hq"
+DOLTDIR="$CITY/.beads/dolt"
+LOG="${DOLT_DISK_FLOOR_GUARD_LOG:-$CITY/.gc/logs/dolt-disk-floor-guard.log}"
+NOTIFY="/Users/athos/.local/bin/notify"
+GC="${GC_BIN:-gc}"
+ENABLED="${DOLT_DISK_FLOOR_GUARD_ENABLED:-1}"
+
+FLOOR_WARN_GB="${DOLT_DISK_FLOOR_WARN_GB:-8}"
+FLOOR_CRITICAL_GB="${DOLT_DISK_FLOOR_CRITICAL_GB:-3}"
+
+NOTIFY_COOLDOWN_SECS="${DOLT_DISK_FLOOR_NOTIFY_COOLDOWN_SECS:-3600}"   # 1h — tighter
+                        # than disk-pressure-monitor's 6h; this is Dolt-specific
+                        # last-resort protection, not general city monitoring.
+STATE_DIR="${DOLT_DISK_FLOOR_STATE_DIR:-$CITY/.gc/logs}"
+STATE_EPOCH_FILE="$STATE_DIR/.dolt-disk-floor-guard.last-notify"
+STATE_AVAIL_FILE="$STATE_DIR/.dolt-disk-floor-guard.last-notify-avail-gb"
+
+ts()  { date '+%Y-%m-%d %H:%M:%S'; }
+log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
+
+# optional shared Dolt-health probe (reuse gc-dolt-probe.sh; fail open if missing —
+# _safe_reclaim's own timeout still bounds the write it gates)
+_PROBE="$CITY/scripts/gc-dolt-probe.sh"
+# shellcheck disable=SC1090
+[ -f "$_PROBE" ] && . "$_PROBE" 2>/dev/null || true
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PURE DECISION FUNCTIONS — unit-tested by dolt-disk-floor-guard.selftest.sh.
+# No side effects (the df call is read-only); config is passed as explicit params
+# so the selftest can exercise arbitrary values without touching globals.
+# ════════════════════════════════════════════════════════════════════════════════
+
+# _avail_gb [path] → integer GB available on the filesystem hosting [path]
+# (default $CITY), or "" if df fails/parses oddly (e.g. nonexistent path). Uses
+# `df -k` + division rather than `df -g` (macOS/BSD df has no -g; -k is portable).
+_avail_gb() {
+  local path="${1:-$CITY}" kb
+  kb="$(df -k "$path" 2>/dev/null | awk 'NR==2 {print $4}')"
+  case "$kb" in ''|*[!0-9]*) echo ""; return ;; esac
+  echo $(( kb / 1024 / 1024 ))
+}
+
+# _floor_class <avail_gb> <warn_gb> <crit_gb> → NONE|WARN|CRITICAL|UNKNOWN.
+# UNKNOWN (empty/non-numeric avail_gb, e.g. df failed) is NEVER silently treated as
+# NONE — a failed read must fail LOUD, not collapse into "no problem" (ga-p5q3:
+# error and empty must not produce the same value when the emptiness is load-bearing).
+_floor_class() {
+  local avail="$1" warn="$2" crit="$3"
+  case "$avail" in ''|*[!0-9]*) echo "UNKNOWN"; return ;; esac
+  if [ "$avail" -le "$crit" ]; then echo "CRITICAL"; return; fi
+  if [ "$avail" -le "$warn" ]; then echo "WARN"; return; fi
+  echo "NONE"
+}
+
+# _worsening <current_avail_gb> <last_notified_avail_gb_or_empty> → 0 (true) only
+# when there IS a valid prior value AND current is strictly LOWER — avail-GB
+# FALLING is pressure worsening (the inverse framing of disk-pressure-monitor's
+# usage-% RISING; same idiom, same reason: dpm_pressure_rising in
+# disk-pressure-monitor.sh). No prior value → false (unknown trend is not on its
+# own a reason to bypass the cooldown — _cooldown_elapsed's fail-open already
+# covers "never notified").
+_worsening() {
+  local current="$1" last="$2"
+  case "$last" in ''|*[!0-9]*) return 1 ;; esac
+  case "$current" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$current" -lt "$last" ]
+}
+
+# _cooldown_elapsed <last_epoch_or_empty> <now_epoch> <cooldown_secs> → 0 (true)
+# when there's no/invalid prior timestamp (fail-open — a corrupt state file must
+# never silence a real emergency) or the cooldown window has passed.
+_cooldown_elapsed() {
+  local last="$1" now="$2" cd="$3"
+  case "$last" in ''|*[!0-9]*) return 0 ;; esac
+  [ $(( now - last )) -ge "$cd" ]
+}
+
+# _should_notify <last_epoch> <now_epoch> <cooldown> <current_avail> <last_avail>
+# → 0 (notify) when the cooldown elapsed OR pressure is worsening since the last
+# notify. This is the WARN-tier gate; CRITICAL always notifies unconditionally
+# (handled directly in main — the last rung before repeating ga-vs55 must never be
+# rate-limited).
+_should_notify() {
+  local last_epoch="$1" now="$2" cooldown="$3" current="$4" last_avail="$5"
+  _cooldown_elapsed "$last_epoch" "$now" "$cooldown" && return 0
+  _worsening "$current" "$last_avail"
+}
+
+# ════════════════════════════════════════════════════════════════════════════════
+# EXECUTION (side-effecting; NOT exercised by the selftest)
+# ════════════════════════════════════════════════════════════════════════════════
+
+_read_state() {
+  _LAST_EPOCH=""; _LAST_AVAIL=""
+  [ -f "$STATE_EPOCH_FILE" ] && _LAST_EPOCH="$(cat "$STATE_EPOCH_FILE" 2>/dev/null)"
+  [ -f "$STATE_AVAIL_FILE" ] && _LAST_AVAIL="$(cat "$STATE_AVAIL_FILE" 2>/dev/null)"
+}
+
+_write_state() {
+  local epoch="$1" avail="$2"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  echo "$epoch" > "$STATE_EPOCH_FILE" 2>/dev/null || true
+  echo "$avail" > "$STATE_AVAIL_FILE" 2>/dev/null || true
+}
+
+# _safe_reclaim <before_avail_gb> → best-effort `gc dolt cleanup --force` (orphan
+# test-DB SQL DROP — pre-sanctioned safe while Dolt is up; see gastown.dog
+# operational doctrine's dolt cleanup entry). Only runs when Dolt is confirmed
+# healthy (never pile a write onto an already-struggling server — same
+# skip-unless-healthy gate dolt-gc-maintenance.sh's _run_prune uses) and only when
+# the kill switch is on. Bounded by timeout so a wedged Dolt can't hang the guard.
+_safe_reclaim() {
+  local before="$1"
+  if [ "$ENABLED" != "1" ]; then
+    log "reclaim SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
+    return
+  fi
+  if declare -f gc_dolt_probe >/dev/null 2>&1; then
+    if ! gc_dolt_probe; then
+      log "reclaim SKIP — dolt not confirmed-healthy (cleanup is a write; retry next cycle)"
+      return
+    fi
+  fi
+  log "reclaim: avail=${before}GB at/below floor — running 'gc dolt cleanup --force' …"
+  if timeout 60 "$GC" dolt cleanup --force >> "$LOG" 2>&1; then
+    local after; after="$(_avail_gb "$DOLTDIR")"
+    log "reclaim OK — avail ${before}GB -> ${after:-?}GB"
+  else
+    log "reclaim FAILED (gc dolt cleanup --force nonzero exit)"
+  fi
+}
+
+main() {
+  local avail class now
+  avail="$(_avail_gb "$DOLTDIR")"
+  now=$(date +%s)
+  class="$(_floor_class "$avail" "$FLOOR_WARN_GB" "$FLOOR_CRITICAL_GB")"
+
+  if [ "$class" = "UNKNOWN" ]; then
+    log "WARN: could not read avail space for $DOLTDIR (df failed/unparseable) — cannot verify Dolt's disk floor this cycle"
+    "$NOTIFY" -t "Dolt disk-floor guard" -p 3 "⚠️ disk-floor guard couldn't read df for Dolt's data dir — check manually" 2>/dev/null || true
+    return 0
+  fi
+  if [ "$class" = "NONE" ]; then
+    log "avail=${avail}GB > floor(warn=${FLOOR_WARN_GB}GB) — OK"
+    return 0
+  fi
+
+  _read_state
+  _safe_reclaim "$avail"
+
+  # re-read avail — reclaim may have freed space; re-classify before deciding to notify
+  local avail_after; avail_after="$(_avail_gb "$DOLTDIR")"
+  [ -n "$avail_after" ] && avail="$avail_after"
+  class="$(_floor_class "$avail" "$FLOOR_WARN_GB" "$FLOOR_CRITICAL_GB")"
+
+  if [ "$class" = "NONE" ]; then
+    log "avail=${avail}GB back above floor after reclaim — no notify needed"
+    _write_state "$now" "$avail"
+    return 0
+  fi
+
+  local do_notify=1
+  if [ "$class" = "WARN" ] && ! _should_notify "$_LAST_EPOCH" "$now" "$NOTIFY_COOLDOWN_SECS" "$avail" "$_LAST_AVAIL"; then
+    do_notify=0
+    log "avail=${avail}GB <= warn floor(${FLOOR_WARN_GB}GB) but within cooldown + not worsening — suppressing (last notified avail=${_LAST_AVAIL:-none}GB)"
+  fi
+
+  if [ "$do_notify" = "1" ]; then
+    local prio=3
+    [ "$class" = "CRITICAL" ] && prio=5
+    log "${class}: avail=${avail}GB <= floor (warn=${FLOOR_WARN_GB}GB crit=${FLOOR_CRITICAL_GB}GB) — notifying"
+    "$NOTIFY" -t "Dolt disk-floor guard" -p "$prio" "🚨 [${class}] Dolt data-dir avail=${avail}GB — reclaim attempted, still at/below floor. See ga-gpzr." 2>/dev/null || true
+    if [ "$class" = "CRITICAL" ]; then
+      # NOTE: deliberately NOT a heredoc — bash 3.2 (macOS system /bin/bash, what
+      # launchd invokes per the plist) mis-parses a heredoc nested inside a $(...)
+      # command substitution when the body contains an apostrophe (confirmed by
+      # direct repro on this machine). A plain multi-line double-quoted assignment
+      # has no such bug and is otherwise equivalent.
+      local mail_body="dolt-disk-floor-guard: Dolt data-dir avail=${avail}GB <= critical floor (${FLOOR_CRITICAL_GB}GB).
+Safe reclaim (gc dolt cleanup --force) was already attempted this cycle - the reading above is
+AFTER that attempt. This is the same class of event that killed the HQ Dolt server on
+2026-07-14 (ga-vs55): a full disk hitting Dolt mid-journal-write. Recommend checking what is
+consuming space now (df -h, du -sh on shared/data and .gc/logs) before this reaches 0."
+      "$GC" mail send mayor -s "Dolt disk-floor CRITICAL: avail=${avail}GB" -m "$mail_body" 2>/dev/null || log "WARN: gc mail send mayor failed"
+    fi
+    _write_state "$now" "$avail"
+  fi
+}
+
+# ── run unless sourced as a library (selftest sources with DOLT_DISK_FLOOR_GUARD_LIB=1) ──
+if [ "${DOLT_DISK_FLOOR_GUARD_LIB:-0}" != "1" ]; then
+  main
+  exit 0
+fi
