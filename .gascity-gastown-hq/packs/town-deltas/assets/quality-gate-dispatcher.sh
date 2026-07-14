@@ -1105,6 +1105,49 @@ gate_circuit_break_check() {
   esac
 }
 
+# ── ga-jyox: FAIL-time assignee-clear decision (pure; selftest-sourceable) ──────
+# On a gate FAIL, the dispatcher used to unconditionally clear the bead's
+# assignee so the Pilot could re-dispatch a fixer. That is correct for an
+# ephemeral pool/adhoc builder (which exits after submitting) or a session that
+# has died — but WRONG for a live, long-lived named-crew author (e.g. thies-wa):
+# clearing story:in-flight + assignee made imparavel-check see "buildable but
+# stalled" and the Pilot dispatched a SECOND generic builder onto the SAME
+# in-flight branch, racing two agents on one branch (ga-1url/ga-u4yi: this
+# destroyed the same Fase 2 epic twice in one night).
+#
+# Args: <author> <author_alive_0_1>
+# Echoes "keep" (author is a live named crew — do not clear) or "clear"
+# (pool/adhoc builder, empty author, or dead session — today's behavior,
+# unchanged). FAIL-SAFE: any unrecognized/empty author, or a dead session,
+# resolves to "clear" — this can only ever restore today's re-dispatch path,
+# never newly strand a bead.
+gate_fail_assignee_action() {
+  local author="${1:-}" author_alive="${2:-0}"
+  case "$author_alive" in ''|*[!0-9]*) author_alive=0 ;; esac
+  # Pool/ephemeral builder naming convention (ga-nkkku; mirrors the identical
+  # deny-list used throughout pilot-dispatcher.sh, e.g. _beadid_live_crew_owner):
+  # anything matching these patterns is a disposable build slot, never a named
+  # crew PM/domain-owner, regardless of liveness.
+  #   - gastown.dog / gastown.dog-* : the dog-pool TEMPLATE/alias form.
+  #   - dog-*                       : the dog-pool session_name form actually
+  #     stored as bead assignee (dotted templates use the post-dot segment as
+  #     the session_name prefix, e.g. template "gastown.dog" → session_name
+  #     "dog-gabjtm" — confirmed live via `gc session list --json`).
+  #   - mayor                       : never a genuine gate-review author (Mayor
+  #     doesn't submit branches); it is a routing sentinel used elsewhere in
+  #     this file (wa-worker FAIL normalizer) to redirect an unrecoverable pool
+  #     author's nudge to a human — must still "clear", not "keep".
+  case "$author" in
+    ''|mayor|gastown.dog|gastown.dog-*|dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*)
+      printf 'clear'; return 0 ;;
+  esac
+  if [ "$author_alive" = "1" ]; then
+    printf 'keep'
+  else
+    printf 'clear'
+  fi
+}
+
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
 # above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
 # GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
@@ -4311,17 +4354,44 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       done
       bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:fix-attempt:${NEW_ATTEMPT}" -q 2>/dev/null || true
       bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-fix"                  -q 2>/dev/null || true
-      # Remove story:in-flight so the Pilot's feature-exclusion no longer hides it.
-      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"  -q 2>/dev/null || true
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"   -q 2>/dev/null || true  # wa-qq33j: clear in-review state (FAIL/needs-fix)
       # Clear stale Pilot claim labels left over from the failed dispatch.
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
-      # The Pilot's _filter_candidates drops ASSIGNED beads (both Tier-1 bugs and
-      # Tier-2 features), so a stale builder assignee makes a failed bead invisible.
-      # Clear it so the next sweep can re-pick this bead.
-      bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
-      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) and builder assignee cleared. The Pilot will re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
+
+      # ga-jyox: a live named-crew author (long-lived session, e.g. thies-wa) must
+      # KEEP ownership on FAIL instead of being cleared — see gate_fail_assignee_action
+      # above for the full rationale (ga-1url/ga-u4yi double-dispatch collision).
+      FAIL_AUTHOR_ALIVE=0
+      if [ -n "$AUTHOR" ]; then
+        if gc --city "$GC_CITY" session list --json 2>/dev/null \
+             | jq -e --arg a "$AUTHOR" \
+                 '[(if type=="array" then . else (.sessions // []) end)[]
+                   | select(.closed != true)
+                   | (.session_name, .name, .alias, .id, .agent_name)]
+                  | map(select(. != null and . != ""))
+                  | index($a) != null' >/dev/null 2>&1; then
+          FAIL_AUTHOR_ALIVE=1
+        fi
+      fi
+      GATE_FAIL_ASSIGNEE_ACTION=$(gate_fail_assignee_action "$AUTHOR" "$FAIL_AUTHOR_ALIVE")
+
+      if [ "$GATE_FAIL_ASSIGNEE_ACTION" = "keep" ]; then
+        log "Author $AUTHOR is a live named-crew session — keeping assignee + story:in-flight (ga-jyox); nudging feedback instead of letting the Pilot dispatch a stranger on top of in-flight work."
+        bd -C "$BEAD_CITY" assign "$BEAD_ID" "$AUTHOR" 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; gate:reviewing cleared (wa-qq33j). Author $AUTHOR is a LIVE crew session, so assignee + story:in-flight were KEPT (ga-jyox) — the Pilot will NOT dispatch a generic builder on top of your in-flight work. See GATE-FEEDBACK above; re-run /gate-done after fixing." 2>/dev/null || true
+        gc --city "$GC_CITY" session nudge "$AUTHOR" \
+          "Gate FAILED for $BEAD_ID (branch $BRANCH, attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — see GATE-FEEDBACK on the bead. Your assignee was kept (ga-jyox); fix and re-run /gate-done." \
+          --delivery wait-idle 2>/dev/null || warn "Could not nudge live-crew author $AUTHOR for gate FAIL feedback"
+      else
+        # Remove story:in-flight so the Pilot's feature-exclusion no longer hides it.
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"  -q 2>/dev/null || true
+        # The Pilot's _filter_candidates drops ASSIGNED beads (both Tier-1 bugs and
+        # Tier-2 features), so a stale builder assignee makes a failed bead invisible.
+        # Clear it so the next sweep can re-pick this bead.
+        bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) and builder assignee cleared. The Pilot will re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
+      fi
     fi
   fi
 
