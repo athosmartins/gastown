@@ -1766,6 +1766,23 @@ def stranded_verdict_verdict(age_sec, threshold_sec, delivered, total):
     return "recover"
 
 
+def stranded_escalation_needs_human_targets(marker_id, source_bead):
+    """PURE (ga-mwsg): which bead(s) must carry gate:needs-human when FIX 5's
+    stranded-cap escalates. FIX 2's error_requeue_verdict skip:parked-needs-human
+    carve-out reads ONLY the SOURCE bead's label (_source_bead_state), not the
+    marker's — labeling just the marker leaves FIX 2 free to requeue right back
+    over the escalation (observed live: marker ga-wisp-0uxxi5 escalated
+    08:51:59Z, requeued by FIX 2 08:52:03Z, 4s later — the circuit breaker never
+    actually broke the circuit). Marker is always labeled too (existing
+    behavior — the marker's own gate-status:error is what makes it visible as
+    parked); source_bead is appended only if resolvable (some marker rows lack
+    one: fail-safe no-op there, not a crash)."""
+    targets = [marker_id]
+    if source_bead:
+        targets.append(source_bead)
+    return targets
+
+
 def reap_stranded_verdict_runs(now):
     """FIX 5: recover a STRANDED-VERDICT run (all required verdicts delivered, still
     gate-status:running, managing sweep dead). See stranded_verdict_verdict. Supersede
@@ -1851,10 +1868,17 @@ def reap_stranded_verdict_runs(now):
                         n = max(n, int(m.group(1)))
                 if n + 1 >= STRANDED_MAX_ATTEMPTS:
                     set_gate_status_py(marker_id, "error")
+                    # ga-mwsg: also label the SOURCE bead — FIX 2's skip:parked-needs-human
+                    # carve-out (error_requeue_verdict) reads ONLY the source bead's label,
+                    # never the marker's; a marker-only label left FIX 2 free to requeue
+                    # right back over this escalation (see stranded_escalation_needs_human_targets).
+                    needs_human_targets = stranded_escalation_needs_human_targets(marker_id, source_bead if resolved else "")
                     sh(["bd", "-C", CITY, "label", "add", marker_id, "gate:needs-human", "-q"], timeout=20)
+                    if len(needs_human_targets) > 1:
+                        sh(["bd", "-C", store, "label", "add", source_bead, "gate:needs-human", "-q"], timeout=20)
                     sh(["bd", "-C", CITY, "comment", marker_id,
-                        "gate-recovery-watchdog FIX5: stranded-verdict recovery hit the cap (%d) — this marker's run keeps delivering verdicts then failing to finalize. Escalating to gate:needs-human; a human/Mayor must finalize by hand (the finalize path itself is likely broken)."
-                        % STRANDED_MAX_ATTEMPTS], timeout=25)
+                        "gate-recovery-watchdog FIX5: stranded-verdict recovery hit the cap (%d) — this marker's run keeps delivering verdicts then failing to finalize. Escalating to gate:needs-human (%s); a human/Mayor must finalize by hand (the finalize path itself is likely broken)."
+                        % (STRANDED_MAX_ATTEMPTS, "marker + source bead %s" % source_bead if len(needs_human_targets) > 1 else "marker")], timeout=25)
                     notify("Gate: marker %s estranha repetidamente (veredito entregue mas run não finaliza, %dx) — escalado p/ needs-human. Precisa de você." % (marker_id, STRANDED_MAX_ATTEMPTS), 4)
                     marker_action = "escalated:needs-human"
                 else:
@@ -2514,6 +2538,16 @@ def _selftest():
     ok(stranded_verdict_verdict(38 * 60, S, -1, -1) == "skip:query-failed", "unreadable verdict counts → skip (never act blind)")
     # boundary: FIX 1 (delivered==0) and FIX 5 (delivered==total) are mutually exclusive
     ok(stranded_verdict_verdict(38 * 60, S, 0, 2) != "recover", "delivered==0 is FIX 1's domain, NOT FIX 5 (no double-handling)")
+    # ga-mwsg: FIX 5's stranded-cap escalation must label the SOURCE bead too, not just
+    # the marker — FIX 2's skip:parked-needs-human carve-out (asserted above) reads ONLY
+    # the source bead's gate:needs-human label. A marker-only label leaves FIX 2 free to
+    # requeue right back over the escalation (observed live: marker ga-wisp-0uxxi5
+    # escalated 08:51:59Z, requeued by FIX 2 08:52:03Z, 4s later — the circuit breaker
+    # never actually broke the circuit).
+    ok(set(stranded_escalation_needs_human_targets("ga-wisp-mk1", "ga-4cb2")) == {"ga-wisp-mk1", "ga-4cb2"},
+       "stranded-cap escalation must label BOTH marker AND source bead (ga-mwsg)")
+    ok(stranded_escalation_needs_human_targets("ga-wisp-mk1", "") == ["ga-wisp-mk1"],
+       "no resolvable source bead → label marker only (fail-safe, never crash on empty source)")
     # FIX 6 — stale_review_marker_verdict (dispatching|reviewing marker, dead reviewer, NO run)
     R = 15 * 60
     ok(stale_review_marker_verdict("reviewing", 9 * 60, R, False) == "wait", "young reviewing marker (9m<15m) → wait (dispatch→run-create spin-up)")
