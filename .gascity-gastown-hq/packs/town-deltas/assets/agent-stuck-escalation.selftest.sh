@@ -376,6 +376,27 @@ assert_absent "$ACTIONS" "notify" "T22: no notify — unknown state suppresses s
 log_contains "T22" "DESCONHECIDO" "T22: log distinguishes UNKNOWN from confirmed CONGELADO"
 rm -f "$LOGS_FIXTURE_DIR/thies-wa.json"
 
+# NOTE (ga-l2d2, resolved): T9/T13/T14/T21/T22 above already exercise
+# crew-shaped names (batista-ps, oracle-wa, peter-wa, thies-wa) through
+# every tri-state branch — advancing, frozen, and unknown. That's real
+# coverage of THIS script's branching logic, which is name-agnostic (the
+# `gc` shim keys off whatever LOGS_FIXTURE_DIR/<name>.json fixture is
+# registered, never the real ~/.claude/projects/<slug> resolution). It
+# does NOT and structurally CANNOT prove `gc session logs` itself resolves
+# real crew transcripts — that bug (ProjectSlug preserving "_" so every
+# whatsapp_automation/property_scrapers crew session was permanently
+# unresolvable, while HQ-path Mayor/dog sessions worked by coincidence of
+# containing no "_") lived entirely inside `gc`, one layer below anything
+# this stub touches. Adding another stubbed crew-shaped case here would
+# re-test the same branching logic under a different fixture name, not
+# close that gap. The real-resolution proof (hermetic, fails pre-fix,
+# passes post-fix) lives in the gc engine repo instead, where the bug
+# actually was: internal/sessionlog/reader.go ProjectSlug +
+# internal/sessionlog/sessionlog_test.go TestProjectSlug +
+# cmd/gc/cmd_session_logs_test.go
+# Test{ResolveSessionLogPathResolvesCrewShapedWorkDirWithUnderscore,
+# ResolveStoredSessionLogSource_ResolvesCrewShapedWorkDirWithUnderscore}.
+
 # ── T10–T12: Layer 1 routing integration (ga-qw3p.1) ────────────────────────
 # Deploy the real escalation-router.sh so the script can source it.
 echo "T10-T12: Layer 1 routing via escalation-router.sh"
