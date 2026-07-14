@@ -3323,6 +3323,25 @@ ACK_MAX_RETRIES="${ACK_MAX_RETRIES:-4}"
 ACK_WAIT_SECS="${ACK_WAIT_SECS:-20}"
 for _ack_attempt in $(seq 1 "$ACK_MAX_RETRIES"); do
   _all_acked=1
+  # ga-xwdl: snapshot session state + "now" ONCE per attempt (not per-reviewer,
+  # same bounding idiom as ga-4u16h's RECONVENE_SESS_JSON below) so the
+  # ga-aknox skip further down can tell "still booting" apart from "genuinely
+  # drained" without an extra `gc session list` call per reviewer. Only
+  # fetched from attempt 2 on — the ga-aknox branch never runs on attempt 1.
+  # Fail-safe: if the list call fails or is unparseable, ACK_LIST_OK stays 0,
+  # every reviewer's state then reads "" (session_is_booting("")=0) — the
+  # spawn-age gate below still has to clear separately, so an inconclusive
+  # list read cannot by itself produce a skip.
+  ACK_LIST_OK=0
+  ACK_SESS_JSON=""
+  _ack_now=$(date +%s 2>/dev/null || echo 0)
+  if [ "$_ack_attempt" -gt 1 ]; then
+    ACK_SESS_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "")
+    if [ -n "$ACK_SESS_JSON" ] && echo "$ACK_SESS_JSON" \
+         | jq -e 'if type=="array" then true else has("sessions") end' >/dev/null 2>&1; then
+      ACK_LIST_OK=1
+    fi
+  fi
   for k in "${!VERDICT_BEAD_IDS[@]}"; do
     if [ "${REVIEWER_ACKED[$k]:-0}" = "1" ]; then continue; fi
     _vb="${VERDICT_BEAD_IDS[$k]}"
@@ -3347,18 +3366,43 @@ for _ack_attempt in $(seq 1 "$ACK_MAX_RETRIES"); do
     # chance); from attempt 2 on, re-queue the exact task into the idle session.
     _all_acked=0
     if [ "$_ack_attempt" -gt 1 ]; then
-      # ga-aknox: skip nudge (and its 45s GATE_NUDGE_TIMEOUT) when the session has
-      # already drained — peek reports "session not found" on STDERR for gone sessions.
-      # A reviewer that lost its start to a supervisor config-reload race (stale_async_start)
-      # drains without ACKing; re-queuing a dead session burns 45s×(N-1) ≈ 135s before the
-      # ACK loop gives up. Early-exit here saves that time; the verdict-poll re-convene
-      # (ga-4u16h) fires sooner and gets the branch reviewed. Guarded: non-not-found peek
-      # results (live sessions, Dolt glitches) still nudge as before.
+      # ga-aknox (ORIGINAL): skip nudge (and its 45s GATE_NUDGE_TIMEOUT) when the
+      # session has already drained — peek reports "session not found" on STDERR
+      # for gone sessions. Early-exit here saves ~45s×(N-1); the verdict-poll
+      # re-convene (ga-4u16h) fires sooner and gets the branch reviewed.
+      #
+      # ga-xwdl: that peek signal is the SAME "session not found" a reviewer
+      # still inside its ~210s deferred-start boot window produces (ga-flfo) —
+      # `gc session peek` cannot tell "not yet born" from "already dead". This
+      # loop's own attempts land at spawn_age ~20-60s, deep inside that window,
+      # so the ORIGINAL unconditional check misread a booting reviewer as
+      # drained, skipped its nudge, and — because the very next attempt's peek
+      # then succeeded (ACK) and stopped all further re-queuing — the task was
+      # NEVER delivered; the reviewer sat alive-but-untasked for the full 29m
+      # outer timeout. Gate the skip behind the SAME discriminator the
+      # reconvene loop already trusts a few hundred lines below
+      # (session_is_booting + RECONVENE_GRACE_SECS): only treat "peek says
+      # gone" as a confirmed drain once the session is not currently booting
+      # AND has been alive long enough that boot could not still explain a
+      # "not found" read. Any inconclusive read (list call failed, empty
+      # state, missing spawn epoch) biases toward "not past grace" and falls
+      # through to re-queue too — never skip on uncertain evidence.
+      _ack_state_flag=""
+      if [ "$ACK_LIST_OK" = "1" ]; then
+        _ack_state_flag=$(echo "$ACK_SESS_JSON" \
+          | jq -r --arg s "$_sid" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | .[0].state // ""' 2>/dev/null || echo "")
+      fi
+      _ack_booting=$(session_is_booting "$_ack_state_flag")
+      _ack_spawn_age=$(( _ack_now - ${SLOT_SPAWN_EPOCH[$k]:-$_ack_now} ))
       _ack_peek_stderr=$(gc --city "$GC_CITY" session peek "$_sid" --lines 5 2>&1 >/dev/null || true)
-      if [ "$(session_peek_reports_dead "$_ack_peek_stderr")" = "1" ]; then
+      if [ "$(session_peek_reports_dead "$_ack_peek_stderr")" = "1" ] && [ "$_ack_booting" != "1" ] && [ "$_ack_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
         warn "  ACK skip (ga-aknox): reviewer $((k+1)) session=$_sid drained during startup (stale_async_start race) — nudge skipped, re-convene will re-spawn"
       else
-        warn "  No ACK from reviewer $((k+1)) (attempt $_ack_attempt/$ACK_MAX_RETRIES) — re-queuing task session=$_sid"
+        if [ "$_ack_booting" = "1" ]; then
+          warn "  No ACK from reviewer $((k+1)) (attempt $_ack_attempt/$ACK_MAX_RETRIES) — session still booting (state=creating, spawn_age=${_ack_spawn_age}s, ga-xwdl) — re-queuing task session=$_sid"
+        else
+          warn "  No ACK from reviewer $((k+1)) (attempt $_ack_attempt/$ACK_MAX_RETRIES) — re-queuing task session=$_sid"
+        fi
         $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session nudge "$_sid" "${REVIEW_TASKS[$k]}" --delivery queue 2>/dev/null || true
       fi
     fi
