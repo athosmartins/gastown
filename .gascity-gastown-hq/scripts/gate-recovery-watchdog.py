@@ -194,6 +194,26 @@ STALE_REVIEW_MARKER_MINUTES = int(os.environ.get("GRW_STALE_REVIEW_MARKER_MINUTE
 STALE_REVIEW_MAX_PER_SWEEP = int(os.environ.get("GRW_STALE_REVIEW_MAX_PER_SWEEP", "5"))
 STALE_REVIEW_MAX_ATTEMPTS = int(os.environ.get("GRW_STALE_REVIEW_MAX_ATTEMPTS", "3"))  # after K requeues of the SAME marker (reviewers keep dying on this branch), escalate to needs-human instead of an infinite re-review loop
 GRW_STALE_REVIEW_LABEL_RE = re.compile(r"^grw-stale-review:(\d+)$")                 # restart-safe per-marker stale-review requeue counter
+# FIX 7 — recover a gate-status:deferred marker (ga-y1kk). quality-gate-dispatcher.sh's
+# Step 3 (and quality-gate-guard.sh's own Step 5 copy) fail-safes to gate-status:deferred
+# when AUTHOR cannot be derived (no gate.submitted_by metadata on the marker, no
+# assignee/created_by/owner on the source bead) — and NOTHING else ever re-reads
+# gate-status:deferred; only gate-status:queued is swept. Confirmed live: marker
+# ga-wisp-5zki27 sat deferred 77+ minutes until a human manually ran
+# `bd update --set-metadata gate.submitted_by=...` + relabeled it back to queued —
+# exactly the action this FIX now takes automatically. Unlike FIX 2's transient
+# gate-status:error, a blind requeue here is unlikely to help — the marker got stuck
+# BECAUSE no author field resolved, so a bare retry just dead-ends right back into
+# deferred — so this only requeues once the source bead (or the marker itself, via a
+# partial manual recovery) actually has a derivable author. If it never grows one
+# across DEFERRED_REQUEUE_MAX_ATTEMPTS sweeps, the marker is closed with an explicit
+# reason instead of rotting silently — but never on a single sweep's query blip;
+# unresolvability must be confirmed sustained across multiple polls first.
+GRW_REQUEUE_DEFERRED_ENABLED = os.environ.get("GRW_REQUEUE_DEFERRED_ENABLED", "1") != "0"
+DEFERRED_REQUEUE_MINUTES = int(os.environ.get("GRW_DEFERRED_REQUEUE_MINUTES", "8"))    # a marker must sit deferred >this before we even look — gives a human/automation time to write gate.submitted_by first
+DEFERRED_REQUEUE_MAX_PER_SWEEP = int(os.environ.get("GRW_DEFERRED_REQUEUE_MAX_PER_SWEEP", "5"))
+DEFERRED_REQUEUE_MAX_ATTEMPTS = int(os.environ.get("GRW_DEFERRED_REQUEUE_MAX_ATTEMPTS", "3"))  # after K sweeps with no derivable author found (or K re-defers despite one), stop: close if never resolvable, escalate if it keeps re-deferring anyway
+GRW_DEFER_REQUEUE_LABEL_RE = re.compile(r"^grw-defer-requeue:(\d+)$")               # restart-safe per-marker attempt counter — separate budget from FIX 2's grw-requeue: (a marker can pass through error AND deferred across its lifetime)
 # A repair dog's session title (set by the watchdog's --title-hint, and kept by the
 # dog after it self-renames because the dog naturally echoes the branch/condition)
 # matched broadly so we also catch dogs spawned before this process started (restart
@@ -1401,6 +1421,34 @@ def _source_bead_state(bead_id, rig_name=""):
     return (False, False, False)
 
 
+def _source_bead_has_author_fields(bead_id, rig_name=""):
+    """True if a marker's source bead has assignee, created_by, or owner set — the
+    same three fields quality-gate-dispatcher.sh Step 3 falls back to once a marker's
+    OWN gate.submitted_by metadata is absent (FIX 7, ga-y1kk). A lightweight 'is there
+    anything to work with' probe — NOT a re-implementation of the dispatcher's full
+    derivation (adhoc-suffix stripping, wa-worker routing, etc. stay the dispatcher's
+    sole authoritative job); this only decides whether a requeue is worth attempting.
+    False on any query failure (fail-safe: never treat an unreadable bead as
+    author-bearing, which would wrongly justify a requeue)."""
+    if not bead_id:
+        return False
+    rigp = (_rig_paths().get(rig_name) if rig_name else None) or _rig_path_by_prefix(_bead_id_prefix(bead_id))
+    tries = [CITY] + ([rigp] if (rigp and rigp != CITY) else [])
+    for st in tries:
+        r = sh(["bd", "-C", st, "show", bead_id, "--json"])
+        if not r or r.returncode != 0:
+            continue
+        try:
+            j = json.loads(r.stdout)
+            row = (j[0] if isinstance(j, list) and j else j) or {}
+        except Exception:
+            continue
+        if not row or not row.get("id"):
+            continue
+        return bool(row.get("assignee") or row.get("created_by") or row.get("owner"))
+    return False
+
+
 def _source_review_state(bead_id, rig_name=""):
     """(resolved, closed, has_reviewing, store) for a marker's source bead — ONE read,
     used by FIX 4 both to decide (close-source-done vs clear-stale-reviewing) and to know
@@ -1596,6 +1644,43 @@ def error_requeue_verdict(age_sec, threshold_sec, source_resolved, source_closed
     return "requeue"
 
 
+def deferred_requeue_verdict(age_sec, threshold_sec, source_resolved, source_closed,
+                             source_needs_human, has_derivable_author, attempts, max_attempts):
+    """PURE decision for a gate-status:deferred marker (FIX 7, ga-y1kk). A marker lands
+    here when the dispatcher's/guard's own AUTHOR-derivation fail-safe could not resolve
+    AUTHOR and nothing else ever re-reads gate-status:deferred. Unlike FIX 2's transient
+    gate-status:error, a blind requeue is unlikely to help — the marker got stuck
+    BECAUSE no author field resolved, so it only requeues once the source actually has
+    something to derive from. Returns:
+      close:source-done      — source CLOSED (work done/abandoned) → close, don't requeue
+      skip:young             — deferred < threshold; give gate.submitted_by (written by a
+                               human/automation doing a partial manual recovery) or the
+                               source bead's own fields time to land before we intervene
+      skip:parked-needs-human— source carries gate:needs-human → deliberately parked
+      requeue                — source resolved AND now has a derivable author field →
+                               worth another dispatcher pass (it re-derives AUTHOR itself)
+      escalate:oscillating   — attempts exhausted while author WAS derivable (the
+                               dispatcher keeps re-deferring for some other reason) →
+                               stop looping, page a human
+      close:unresolvable     — attempts exhausted while the source was NEVER resolvable
+                               or never grew a derivable author (ga-y1kk: "bead também
+                               sumiu") → genuinely terminal; close with an explicit
+                               reason instead of rotting silently
+      skip:unresolvable      — not yet at max_attempts; wait for another sweep before
+                               concluding it's genuinely gone (never close on one blip)
+    """
+    if source_resolved and source_closed:
+        return "close:source-done"
+    if age_sec <= threshold_sec:
+        return "skip:young"
+    if source_resolved and source_needs_human:
+        return "skip:parked-needs-human"
+    resolvable = source_resolved and has_derivable_author
+    if attempts >= max_attempts:
+        return "escalate:oscillating" if resolvable else "close:unresolvable"
+    return "requeue" if resolvable else "skip:unresolvable"
+
+
 class RecoveryState:
     """Tiny in-memory state for the two direct-action features: a per-marker requeue
     counter (backs the durable grw-requeue:N label so oscillation detection survives
@@ -1603,6 +1688,7 @@ class RecoveryState:
     at most once per back-off window."""
     def __init__(self):
         self.error_requeues = {}   # marker_id -> requeues this process has done
+        self.deferred_requeues = {}  # marker_id -> FIX 7 attempts this process has done (independent budget from error_requeues)
         self.escalated = {}        # key -> last-escalation epoch
 
     def escalate_once(self, key, now, window=None):
@@ -2331,6 +2417,158 @@ def requeue_error_markers(now, rstate):
         print("[watchdog] error-requeue sweep: %d marker(s) actioned%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
 
 
+def _open_deferred_markers():
+    """[marker dicts] type:quality-gate-marker + gate-status:deferred + open, in HQ.
+    None on query failure (fail-safe skip)."""
+    r = sh(["bd", "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",
+            "-l", "gate-status:deferred", "--status", "open", "--json"], timeout=25)
+    if not r or r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout) or []
+    except Exception:
+        return None
+
+
+def requeue_deferred_markers(now, rstate):
+    """FIX 7 (ga-y1kk): recover a gate-status:deferred marker — the dead-end nothing
+    else re-reads (quality-gate-dispatcher.sh Step 3's AUTHOR-derivation fail-safe, and
+    quality-gate-guard.sh Step 5's own copy, both dead-end here). A blind requeue rarely
+    helps (the marker got stuck precisely because AUTHOR couldn't be derived), so this
+    only requeues once the marker's own gate.submitted_by metadata (set by a partial
+    manual recovery) or the source bead's assignee/created_by/owner now resolves. If it
+    never does across DEFERRED_REQUEUE_MAX_ATTEMPTS sweeps, the marker is closed with an
+    explicit reason — but never on a single sweep's query blip. Bounded per sweep,
+    dry-run aware, fully fail-safe."""
+    if not GRW_ENABLED or not GRW_REQUEUE_DEFERRED_ENABLED:
+        return
+    markers = _open_deferred_markers()
+    if markers is None:
+        print("[watchdog] requeue: deferred-marker query unavailable — fail-safe skip", flush=True)
+        return
+    # oldest-deferred first (created_at asc) so the longest-stuck marker is served first
+    markers.sort(key=lambda m: _iso_epoch(m.get("created_at")) or 0.0)
+    acted = 0
+    for mk in markers:
+        if acted >= DEFERRED_REQUEUE_MAX_PER_SWEEP:
+            break
+        mid = mk.get("id")
+        if not mid:
+            continue
+        upd = _iso_epoch(mk.get("updated_at")) or _iso_epoch(mk.get("created_at"))
+        age = int(now - upd) if upd else 0
+        labels = mk.get("labels") or []
+        source_bead = _label_value(mk, "source-bead:")
+        rig_name = _label_value(mk, "bead-rig:")
+        branch = _label_value(mk, "branch:")
+        label_count = 0
+        for l in labels:
+            m = GRW_DEFER_REQUEUE_LABEL_RE.match(l)
+            if m:
+                try:
+                    label_count = int(m.group(1))
+                except Exception:
+                    label_count = 0
+        attempts = max(label_count, rstate.deferred_requeues.get(mid, 0))
+        marker_meta = mk.get("metadata") or {}
+        resolved, sclosed, needs_human = _source_bead_state(source_bead, rig_name)
+        has_author = bool(marker_meta.get("gate.submitted_by")) or (
+            resolved and _source_bead_has_author_fields(source_bead, rig_name))
+        verdict = deferred_requeue_verdict(age, DEFERRED_REQUEUE_MINUTES * 60, resolved,
+                                           sclosed, needs_human, has_author, attempts,
+                                           DEFERRED_REQUEUE_MAX_ATTEMPTS)
+
+        if verdict == "skip:young":
+            continue
+        if verdict == "skip:parked-needs-human":
+            if rstate.escalate_once("deferred-parked:%s" % mid, now):
+                print("[watchdog] deferred marker %s parked (source %s needs-human) — left for human (grw)"
+                      % (mid, source_bead), flush=True)
+            continue
+
+        if verdict == "close:source-done":
+            if GRW_DRY_RUN:
+                print("[watchdog] requeue DRY-RUN would CLOSE deferred marker %s (source bead %s closed — work done)"
+                      % (mid, source_bead), flush=True)
+                _recovery_ledger("would_close_done_deferred_marker", {"marker": mid, "source_bead": source_bead, "branch": branch, "dry_run": True})
+                acted += 1
+                continue
+            set_gate_status_py(mid, "superseded")
+            sh(["bd", "-C", CITY, "close", mid,
+                "-r", "source bead %s closed — gate work done/abandoned; deferred marker superseded (grw deferred-marker self-heal, ga-y1kk)" % source_bead], timeout=25)
+            _recovery_ledger("closed_done_deferred_marker", {"marker": mid, "source_bead": source_bead, "branch": branch})
+            print("[watchdog] CLOSED done deferred marker %s (source %s closed)" % (mid, source_bead), flush=True)
+            acted += 1
+            continue
+
+        if verdict == "skip:unresolvable":
+            if not GRW_DRY_RUN:
+                for l in labels:
+                    if GRW_DEFER_REQUEUE_LABEL_RE.match(l):
+                        sh(["bd", "-C", CITY, "label", "remove", mid, l, "-q"])
+                sh(["bd", "-C", CITY, "label", "add", mid, "grw-defer-requeue:%d" % (attempts + 1), "-q"])
+                rstate.deferred_requeues[mid] = attempts + 1
+            print("[watchdog] deferred marker %s source %s still unresolvable (attempt %d/%d)%s"
+                  % (mid, source_bead or "?", attempts + 1, DEFERRED_REQUEUE_MAX_ATTEMPTS,
+                     " (DRY_RUN, not persisted)" if GRW_DRY_RUN else ""), flush=True)
+            continue
+
+        if verdict == "close:unresolvable":
+            if GRW_DRY_RUN:
+                print("[watchdog] requeue DRY-RUN would CLOSE unresolvable deferred marker %s (source %s — no derivable author after %d attempts)"
+                      % (mid, source_bead or "?", attempts), flush=True)
+                _recovery_ledger("would_close_unresolvable_deferred_marker", {"marker": mid, "source_bead": source_bead, "branch": branch, "dry_run": True})
+                acted += 1
+                continue
+            set_gate_status_py(mid, "superseded")
+            sh(["bd", "-C", CITY, "close", mid,
+                "-r", "gate-recovery-watchdog: source bead %s unresolvable (no assignee/created_by/owner/gate.submitted_by) after %d attempts over %dm in gate-status:deferred — closing so it does not rot silently (ga-y1kk); re-submit /gate-done if branch %s still needs review"
+                % (source_bead or "?", attempts, age // 60, branch or "?")], timeout=25)
+            _recovery_ledger("closed_unresolvable_deferred_marker", {"marker": mid, "source_bead": source_bead, "branch": branch, "attempts": attempts})
+            notify("Gate: marker %s (branch %s) ficou %dmin em deferred sem author derivável (source %s) — fechei após %d tentativas pra não apodrecer em silêncio. Re-submeta /gate-done se o branch ainda precisa de review. (grw, ga-y1kk)"
+                   % (mid, branch or "?", age // 60, source_bead or "?", attempts), 4)
+            print("[watchdog] CLOSED unresolvable deferred marker %s (source %s, %d attempts)" % (mid, source_bead, attempts), flush=True)
+            acted += 1
+            continue
+
+        if verdict == "escalate:oscillating":
+            if rstate.escalate_once("deferred-osc:%s" % mid, now):
+                notify("🚨 Gate: marker %s (branch %s) volta pra deferred mesmo com author derivável em %s — já re-enfileirei %dx e continua falhando. Precisa de você. (grw)"
+                       % (mid, branch or "?", source_bead or "?", attempts), 5)
+                _grw_ledger("human-touch", {"ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "source_daemon": "gate-recovery-watchdog", "stage": "revisa", "kind": "technical",
+                            "bead_id": source_bead or "", "reason": "deferred marker %s oscillating (%d watchdog requeues, still re-defers despite derivable author) — needs human" % (mid, attempts)}, fail_open=True)
+                print("[watchdog] ESCALATED oscillating deferred marker %s (%d attempts, still re-defers) — NOT requeued again" % (mid, attempts), flush=True)
+            continue
+
+        # verdict == "requeue"
+        if GRW_DRY_RUN:
+            print("[watchdog] requeue DRY-RUN would re-queue deferred marker %s (branch %s, %dm deferred, attempt %d/%d) → gate-status:queued"
+                  % (mid, branch or "?", age // 60, attempts + 1, DEFERRED_REQUEUE_MAX_ATTEMPTS), flush=True)
+            _recovery_ledger("would_requeue_deferred", {"marker": mid, "branch": branch, "age_min": age // 60,
+                             "attempt": attempts + 1, "dry_run": True})
+            acted += 1
+            continue
+        for l in labels:
+            if GRW_DEFER_REQUEUE_LABEL_RE.match(l):
+                sh(["bd", "-C", CITY, "label", "remove", mid, l, "-q"])
+        sh(["bd", "-C", CITY, "label", "add", mid, "grw-defer-requeue:%d" % (attempts + 1), "-q"])
+        rstate.deferred_requeues[mid] = attempts + 1
+        set_gate_status_py(mid, "queued")
+        sh(["bd", "-C", CITY, "comment", mid,
+            "gate-recovery-watchdog: auto-requeued gate-status:deferred→queued after %dm stuck deferred (source %s now has a derivable author; attempt %d/%d). The dispatcher's own AUTHOR fail-safe dead-ends at deferred with nothing re-reading it (ga-y1kk) — this sweep is that re-read. (grw deferred-marker self-heal)"
+            % (age // 60, source_bead or "?", attempts + 1, DEFERRED_REQUEUE_MAX_ATTEMPTS)], timeout=25)
+        _recovery_ledger("requeue_deferred", {"marker": mid, "branch": branch, "source_bead": source_bead,
+                         "age_min": age // 60, "attempt": attempts + 1})
+        notify("Gate self-heal: marker %s re-enfileirado (deferred→queued, branch %s, %dmin travado, tentativa %d/%d). Você não precisa agir."
+               % (mid, branch or "?", age // 60, attempts + 1, DEFERRED_REQUEUE_MAX_ATTEMPTS), 3)
+        print("[watchdog] REQUEUED deferred marker %s (branch %s, %dm, attempt %d/%d)"
+              % (mid, branch or "?", age // 60, attempts + 1, DEFERRED_REQUEUE_MAX_ATTEMPTS), flush=True)
+        acted += 1
+    if acted:
+        print("[watchdog] deferred-requeue sweep: %d marker(s) actioned%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
+
+
 def main():
   # ---- state ----
   gov = Governor()       # dedup + concurrent cap + per-condition cooldown/back-off
@@ -2354,13 +2592,15 @@ def main():
         "AND kill FROZEN reviewers (active-but-last_active-silent>%ds, cap %d/sweep, sustained-confirmed; enabled=%s) "
         "AND reap ORPHAN/STALE markers (queued>%dm w/ source closed→close, or leaked gate:reviewing→clear, cap %d/sweep; enabled=%s) "
         "AND requeue STRANDED dispatching|reviewing markers w/ NO open run (dead reviewer, >%dm, cap %d/sweep, esc after %d; enabled=%s) "
-        "AND auto-requeue STUCK gate-status:error markers (>%dm in error, cap %d/sweep, osc-escalate after %d; enabled=%s). "
+        "AND auto-requeue STUCK gate-status:error markers (>%dm in error, cap %d/sweep, osc-escalate after %d; enabled=%s) "
+        "AND recover/close STUCK gate-status:deferred markers (>%dm deferred w/ derivable author→requeue, else close after %d attempts, ga-y1kk; cap %d/sweep, enabled=%s). "
         "All bounded + fail-safe + dry_run=%s."
         % (REVIEW_HANG_MINUTES, GRW_REAP_HUNG_ENABLED, STRANDED_RUN_MINUTES, STRANDED_MAX_ATTEMPTS, GRW_REAP_STRANDED_ENABLED,
            FROZEN_KILL_SECS, FROZEN_KILL_MAX_PER_SWEEP, GRW_REAP_FROZEN_ENABLED,
            ORPHAN_MARKER_MIN_MINUTES, ORPHAN_MAX_PER_SWEEP, GRW_REAP_ORPHAN_ENABLED,
            STALE_REVIEW_MARKER_MINUTES, STALE_REVIEW_MAX_PER_SWEEP, STALE_REVIEW_MAX_ATTEMPTS, GRW_REAP_STALE_REVIEW_ENABLED,
-           ERROR_REQUEUE_MINUTES, ERROR_REQUEUE_MAX_PER_SWEEP, ERROR_REQUEUE_MAX_ATTEMPTS, GRW_REQUEUE_ERROR_ENABLED, GRW_DRY_RUN), flush=True)
+           ERROR_REQUEUE_MINUTES, ERROR_REQUEUE_MAX_PER_SWEEP, ERROR_REQUEUE_MAX_ATTEMPTS, GRW_REQUEUE_ERROR_ENABLED,
+           DEFERRED_REQUEUE_MINUTES, DEFERRED_REQUEUE_MAX_ATTEMPTS, DEFERRED_REQUEUE_MAX_PER_SWEEP, GRW_REQUEUE_DEFERRED_ENABLED, GRW_DRY_RUN), flush=True)
 
   while True:
     try:
@@ -2398,6 +2638,10 @@ def main():
             requeue_error_markers(now, rstate)
         except Exception as e:
             print("[watchdog] requeue_error_markers error (continuing): %r" % e, flush=True)
+        try:
+            requeue_deferred_markers(now, rstate)
+        except Exception as e:
+            print("[watchdog] requeue_deferred_markers error (continuing): %r" % e, flush=True)
 
         # ga-htjni follow-up (dog investigation 2026-06-15): if the gate is
         # ALIVE-but-infra-throttled (Dolt-hot or quota DEFER), a repair dog cannot
@@ -2494,7 +2738,7 @@ def main():
 
 
 def _selftest():
-    """Pure-logic regression checks for FIX 3/4/5/6 (no I/O). Run: --selftest."""
+    """Pure-logic regression checks for FIX 2/3/4/5/6/7 (no I/O). Run: --selftest."""
     p = f = 0
     def ok(c, m):
         nonlocal p, f
@@ -2568,12 +2812,23 @@ def _selftest():
     ok(error_requeue_verdict(600, E, False, False, False, 0, 3) == "requeue", "source UNRESOLVABLE → fail-toward-recovery requeue (bounded by the oscillation cap below — the ga-c1s8 failure mode when rig resolution silently fails)")
     ok(error_requeue_verdict(600, E, True, False, False, 3, 3) == "escalate:oscillating", "requeue_count hit max_attempts → escalate, stop looping")
     ok(error_requeue_verdict(600, E, True, False, False, 2, 3) == "requeue", "requeue_count below max → requeue (one attempt left)")
+    # FIX 7 — deferred_requeue_verdict (gate-status:deferred marker recovery, ga-y1kk)
+    D = 8 * 60
+    ok(deferred_requeue_verdict(300, D, True, True, False, True, 0, 3) == "close:source-done", "source resolved+CLOSED → close regardless of age/author (checked first)")
+    ok(deferred_requeue_verdict(60, D, True, False, False, True, 0, 3) == "skip:young", "deferred < threshold → skip:young (give gate.submitted_by/a human time to land)")
+    ok(deferred_requeue_verdict(600, D, True, False, True, True, 0, 3) == "skip:parked-needs-human", "source needs-human → never requeue")
+    ok(deferred_requeue_verdict(600, D, True, False, False, True, 0, 3) == "requeue", "source resolved + derivable author now present → requeue (the ga-y1kk fix)")
+    ok(deferred_requeue_verdict(600, D, True, False, False, True, 3, 3) == "escalate:oscillating", "derivable author present but attempts exhausted → escalate, not another requeue")
+    ok(deferred_requeue_verdict(600, D, True, False, False, False, 0, 3) == "skip:unresolvable", "source resolved but STILL no derivable author, attempts remain → wait, don't requeue blind")
+    ok(deferred_requeue_verdict(600, D, False, False, False, False, 0, 3) == "skip:unresolvable", "source unresolved (bead lookup failed), attempts remain → wait, never close on one blip")
+    ok(deferred_requeue_verdict(600, D, False, False, False, False, 3, 3) == "close:unresolvable", "source unresolved across max_attempts sweeps → genuinely gone (ga-y1kk: 'bead também sumiu') → close with explicit reason")
+    ok(deferred_requeue_verdict(600, D, True, False, False, False, 3, 3) == "close:unresolvable", "source resolved but NEVER grew a derivable author across max_attempts → also terminal close (never oscillate — it never had one to lose)")
     # ga-c1s8 — _bead_id_prefix, the fallback rig-resolution key when bead-rig: is absent
     ok(_bead_id_prefix("wa-10srb") == "wa", "wa-10srb -> wa (the ga-c1s8 marker's WA-rig source bead)")
     ok(_bead_id_prefix("ga-wisp-me6y20") == "ga", "ga-wisp-me6y20 -> ga (split on the FIRST hyphen only)")
     ok(_bead_id_prefix("") == "" and _bead_id_prefix(None) == "", "empty/None -> '' (fail-safe, never crashes)")
     ok(_bead_id_prefix("noHyphenId") == "", "no hyphen -> '' (unknown prefix, fails safe to HQ-only lookup)")
-    print("gate-recovery-watchdog FIX2+FIX3+FIX4+FIX5+FIX6 selftest: PASS=%d FAIL=%d" % (p, f))
+    print("gate-recovery-watchdog FIX2+FIX3+FIX4+FIX5+FIX6+FIX7 selftest: PASS=%d FAIL=%d" % (p, f))
     return 0 if f == 0 else 1
 
 
