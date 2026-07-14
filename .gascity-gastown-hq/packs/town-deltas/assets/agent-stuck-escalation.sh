@@ -74,20 +74,47 @@ fi
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [agent-stuck] $*"; }
 
-# transcript_is_advancing (ga-hehi): a live session is NOT proof of progress —
-# `gc session list` shows "active" whether the agent is busy or genuinely
-# wedged (same finding that shaped crew-hang-detector.sh — idle and hung
-# sessions are indistinguishable by session state alone). The real progress
-# signal is the session's transcript .jsonl file: it grows on every tool call
-# / message boundary while real work happens, and stays byte-still when the
-# agent is truly hung. Returns 0 ("advancing") only when that file was
-# written to within TRANSCRIPT_FRESH_SEC. Any lookup failure (gc error,
-# missing path, missing file) returns 1 ("not advancing") — fails CLOSED, so
-# an unknown state still escalates, same as today's absent-session path.
+# transcript_is_advancing (ga-hehi; tri-state hardened by ga-4tmc): a live
+# session is NOT proof of progress — `gc session list` shows "active"
+# whether the agent is busy or genuinely wedged (same finding that shaped
+# crew-hang-detector.sh). The real progress signal is the session's
+# transcript .jsonl file: it grows on every tool call / message boundary
+# while real work happens, and stays byte-still when the agent is truly hung.
+#
+# TRI-STATE return — not a style choice, a fix. `gc session logs <sess>
+# --tail 1 --json` FAILS for crew/dog sessions ("no session file found")
+# while still printing a well-formed JSON error envelope ({"ok":false,...}).
+# The original boolean version of this function read
+# `d.get("transcript_path") or ""` the same way for THAT envelope as for a
+# genuine "no transcript" answer — collapsing "the query failed" and "the
+# query succeeded with an empty result" into one value (ga-p5q3 root class).
+# That turned a command FAILURE into a CONFIRMED-FROZEN verdict and
+# escalated kill recommendations against agents nobody actually checked
+# (ga-4tmc: thies-wa-gam257 + 3 dog beads, all alive and working).
+#
+#   0 = ADVANCING — envelope ok:true, transcript_path resolved, file fresh
+#   1 = FROZEN    — envelope ok:true, but no path / missing file / stale
+#                    mtime: the query SUCCEEDED and found no live progress
+#   2 = UNKNOWN   — envelope ok:false, unparseable, or no response at all:
+#                    the query itself failed, so nothing was proven either
+#                    way. Callers MUST treat this the same as ADVANCING for
+#                    escalation purposes (never escalate on an unproven
+#                    state) while logging it as distinct from a confirmed
+#                    freeze — UNKNOWN must skip, never silently act as if it
+#                    were empty.
 transcript_is_advancing() {
-    local sess="$1" logs_json tpath mtime age
+    local sess="$1" logs_json ok tpath mtime age
     logs_json="$(timeout 15 "$GC" session logs "$sess" --tail 1 --json 2>/dev/null || true)"
-    [ -z "$logs_json" ] && return 1
+    [ -z "$logs_json" ] && return 2
+    ok="$(printf '%s' "$logs_json" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print("true" if d.get("ok") else "false")
+except Exception:
+    print("false")
+' 2>/dev/null)"
+    [ "$ok" = "true" ] || return 2
     tpath="$(printf '%s' "$logs_json" | python3 -c '
 import json, sys
 try:
@@ -101,7 +128,8 @@ except Exception:
     mtime="$(stat -f %m "$tpath" 2>/dev/null || stat -c %Y "$tpath" 2>/dev/null || echo "")"
     [ -z "$mtime" ] && return 1
     age=$(( now - mtime ))
-    [ "$age" -lt "$TRANSCRIPT_FRESH_SEC" ]
+    [ "$age" -lt "$TRANSCRIPT_FRESH_SEC" ] && return 0
+    return 1
 }
 
 # gate_label_present (ga-n937): true iff the comma-joined label list $1
@@ -395,17 +423,36 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
         fi
     fi
 
-    # Transcript-progress gate (ga-hehi): a live session alone never proved
-    # progress. If the assignee has a live session AND its transcript was
-    # written to recently, this is legitimate long-running work — suppress
-    # escalation entirely (log-only; no state file write, so a real freeze on
-    # a later pass still escalates normally, undelayed by this suppression).
-    if [ -n "$live_session_name" ] && transcript_is_advancing "$live_session_name"; then
+    # Transcript-progress gate (ga-hehi; tri-state hardened by ga-4tmc): a
+    # live session alone never proved progress, and a FAILED progress query
+    # must never be read as a CONFIRMED freeze (ga-p5q3 root class — error
+    # and empty must not collapse to the same value). Only a transcript
+    # CONFIRMED frozen (rc=1: query succeeded, no live progress found) falls
+    # through to escalate below; both CONFIRMED advancing (rc=0) and UNKNOWN
+    # (rc=2: the query itself failed — e.g. crew/dog sessions where `gc
+    # session logs` returns an {"ok":false,...} envelope) suppress — log-only,
+    # no state file write, so a real freeze on a later pass still escalates
+    # normally, undelayed by this suppression.
+    transcript_state=""
+    if [ -n "$live_session_name" ]; then
+        transcript_is_advancing "$live_session_name"
+        case "$?" in
+            0) transcript_state="advancing" ;;
+            1) transcript_state="frozen" ;;
+            *) transcript_state="unknown" ;;
+        esac
+    fi
+
+    if [ "$transcript_state" = "advancing" ]; then
         log "$bead_id: bead.updated_at parado ${age_min}min mas transcript de $live_session_name avançando (escrita <${TRANSCRIPT_FRESH_SEC}s) — SUPRIMINDO escalação (trabalho longo legítimo)"
         continue
     fi
+    if [ "$transcript_state" = "unknown" ]; then
+        log "$bead_id: bead.updated_at parado ${age_min}min — 'gc session logs $live_session_name' falhou (ok:false/sem resposta) — transcript DESCONHECIDO (não confirmado congelado) — SUPRIMINDO escalação (fail-safe ga-4tmc: pergunta que falha nunca vira veredito de vazio)"
+        continue
+    fi
     transcript_note="n/d (sem sessão viva)"
-    [ -n "$live_session_name" ] && transcript_note="CONGELADO (sem escrita há >=${TRANSCRIPT_FRESH_SEC}s)"
+    [ "$transcript_state" = "frozen" ] && transcript_note="CONGELADO (sem escrita há >=${TRANSCRIPT_FRESH_SEC}s)"
 
     # Failure markers present?
     failure_markers=""

@@ -247,14 +247,20 @@ STUCK_AGENT_SEC=1800 run_script > /dev/null
 assert_absent "$ACTIONS" "mail:mayor" "T8: no mail with kill-switch"
 rm -f "$WORK/city/.gc/state/agent-stuck-escalation.disabled"
 
-# ── T9: assignee session alive → diagnostic notes it ─────────────────────────
-echo "T9: assignee session alive → logged as active"
+# ── T9: assignee session alive, transcript unresolvable → diagnostic notes ──
+# session as active, but does NOT escalate (ga-4tmc fail-safe). This fixture
+# shape (live session, no LOGS_FIXTURE_DIR entry registered) makes the gc
+# shim fall through to its default {"ok":false,...} envelope — historically
+# (pre-ga-4tmc) that got silently read as "confirmed empty transcript" and
+# escalated; that was exactly the bug (ga-4tmc: a query FAILURE is not the
+# same as a query that succeeded with an empty answer — ga-p5q3 root class).
+echo "T9: assignee session alive, transcript unresolvable → unknown, no escalation"
 echo '{"sessions":[{"name":"batista-ps","state":"active"}]}' > "$SESSIONS_FIXTURE"
 printf '[%s]' "$(make_bead ga-test04 batista-ps 2200)" > "$BEADS_FIXTURE"
 rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test04"
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 out="$(run_script)"
-assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test04" "T9: escalation fired (session alive is OK — still stuck)"
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test04" "T9: no escalation — transcript state unresolvable (ga-4tmc fail-safe)"
 log_contains "T9" "ativa" "T9: session 'ativa' status logged"
 
 # ── T13: session alive + transcript ADVANCING → suppress escalation (ga-hehi) ─
@@ -351,6 +357,24 @@ rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gate06"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
 assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-gate06" "T21: building bead with no gate signal still escalates (ga-hehi intact)"
 rm -f "$LOGS_FIXTURE_DIR/peter-wa.json"
+
+# ── T22: session alive but 'gc session logs' FAILS (ok:false) → UNKNOWN, ────
+# never read as CONGELADO — escalation suppressed (ga-4tmc fail-safe: a
+# failed query must never be treated as a confirmed-empty/frozen transcript)
+echo "T22: session alive, gc session logs returns ok:false → unknown, escalation suppressed"
+echo '{"sessions":[{"name":"thies-wa","state":"active"}]}' > "$SESSIONS_FIXTURE"
+# No LOGS_FIXTURE_DIR/thies-wa.json registered → the gc shim falls through to
+# its default: echo '{"ok":false,...}'; exit 1 — the exact envelope ga-4tmc
+# found `gc session logs thies-wa-gam257` returning for a live crew session.
+printf '[%s]' "$(make_bead ga-test08 thies-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test08"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test08" "T22: no mail — transcript query failed (ok:false), never treated as confirmed-frozen"
+assert_absent "$ACTIONS" "notify" "T22: no notify — unknown state suppresses same as advancing"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test08" ] && ok "T22: no escalation state written (suppression is log-only)" || bad "T22: unexpected state file written on suppression"
+log_contains "T22" "DESCONHECIDO" "T22: log distinguishes UNKNOWN from confirmed CONGELADO"
+rm -f "$LOGS_FIXTURE_DIR/thies-wa.json"
 
 # ── T10–T12: Layer 1 routing integration (ga-qw3p.1) ────────────────────────
 # Deploy the real escalation-router.sh so the script can source it.
