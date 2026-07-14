@@ -11,25 +11,40 @@
 #   this watchdog = throughput.
 #
 # LOGIC (runs every ~600s via launchd):
-#   1. Parse the gate dispatcher log (last GTSW_LOG_TAIL lines) for evidence of
-#      a non-empty queue: "Found N queued marker(s)" with N>0.
-#   2. Scan the same window for evidence of progress: "Gate PASSED:" within
-#      GTSW_STALL_MINUTES (default 165min; data: inter-merge p95=127min, p99=240min).
+#   1. Query LIVE gate-marker state directly via `bd` for evidence of a
+#      non-empty ACTIVE queue: count type:quality-gate-marker beads whose
+#      gate-status label is queued/dispatching/ready/claimed/running.
+#      EXCLUDES needs-rebase/parked-needs-human/deferred/error — those wait on
+#      a human/author, never on the gate, and must never read as "congested"
+#      (ga-4cb2: 7 needs-rebase markers were being counted as a non-empty
+#      queue, crying wolf on an idle gate).
+#   2. Scan the dispatcher log (last GTSW_LOG_TAIL lines) for evidence of
+#      progress: a "Gate PASSED" line within GTSW_STALL_MINUTES (default
+#      165min; data: inter-merge p95=127min, p99=240min). Matches the literal
+#      substring "Gate PASSED" (no fixed suffix) so it survives the dispatcher
+#      appending metadata before the colon — e.g. "Gate PASSED (origin=Pilot):"
+#      — as it started doing partway through 2026-07 (ga-4cb2: the old
+#      "Gate PASSED:" pattern silently stopped matching ANY current-format
+#      line, so the "last pass" calculation fell back to the last OLD-format
+#      line, hours stale, and reported a stall that wasn't one).
 #   3. FALSE-POSITIVE GUARDS (all must fail to declare a stall):
-#      a. Empty queue → NOT a stall (idle pipeline).
+#      a. No ACTIVE markers → NOT a stall (idle pipeline, possibly with
+#         parked/needs-human markers sitting untouched — that's expected).
 #      b. "cota=LIMITED" or "quota-limited" in any Headroom DEFER line in the
 #         tail → quota-limited, self-heals on window reset; suppress.
-#      c. A "Gate PASSED:" line within the window → progress; not a stall.
+#      c. A "Gate PASSED" line within the window → progress; not a stall.
 #      d. An active gate-reviewer session running (gc session list shows a live
 #         session named gate-reviewer*) → reviewer in-flight; not a stall.
-#   4. STALL = queue non-empty AND 0 Gate PASSED in window AND not quota-limited
-#      AND no active reviewer.
+#   4. STALL = active queue non-empty AND 0 Gate PASSED in window AND not
+#      quota-limited AND no active reviewer.
 #   5. On stall: notify -p 4 + gc mail send mayor.
 #      If GTSW_AUTORECOVER=1 (default): kickstart -k supervisor AND
 #      quality-gate-dispatcher to unstick the gate.
 #
-# FAIL-SAFE: any signal read error → treat as "flow present" (never false-alarm).
-# An idle gate (empty queue) NEVER fires.
+# FAIL-SAFE: any signal read/query error → UNKNOWN, never "flow present" nor
+# "stalled" — always fail toward "no stall verdict" (ga-p5q3 defense (a): a
+# failed query is not the same value as zero). An idle gate (no active
+# markers) NEVER fires.
 #
 # KILL-SWITCH: GTSW_ENABLED=0 → no-op.
 # DRY-RUN: GTSW_DRY_RUN=1 → log decisions but skip notify/mail/kickstart.
@@ -52,6 +67,7 @@ QUOTA_CHECK="${GTSW_QUOTA_CHECK:-$HQ/scripts/claude-quota-check.sh}"
 LOG="${GTSW_LOG:-$HQ/.gc/logs/gate-throughput-stall-watchdog.log}"
 NOTIFY_BIN="${GTSW_NOTIFY_BIN:-/Users/athos/.local/bin/notify}"
 GC_BIN="${GTSW_GC_BIN:-gc}"
+BD_BIN="${GTSW_BD_BIN:-bd}"
 UID_NUM="$(id -u)"
 
 GATE_STALL_COOLDOWN_S="${GATE_STALL_COOLDOWN_S:-7200}"    # 2h dedup window between Athos pages
@@ -80,6 +96,7 @@ log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] [gtsw] $
 
 # ── main sweep function (pure-ish; all I/O goes through overrideable vars) ───
 # Test seams: override these vars to inject fake data without touching disk/net.
+#   GTSW_TEST_ACTIVE_MARKERS_JSON — fake `bd list` JSON (replaces the live query)
 #   GTSW_TEST_LOG_LINES    — newline-separated fake log content (replaces tail)
 #   GTSW_TEST_QUOTA_RC     — fake exit code for quota-check (0=ok, 2=limited)
 #   GTSW_TEST_SESSIONS     — fake gc session list output
@@ -117,27 +134,46 @@ run_sweep() {
     return 0
   fi
 
-  # ── FALSE-POSITIVE GUARD A: empty queue ───────────────────────────────────
-  # Use the MOST RECENT "Found N queued marker(s)" line — that is the CURRENT
-  # queue state. The old code matched ANY N>0 anywhere in the tail and broke on
-  # the FIRST (oldest) hit, so a transient marker that already CLEARED left a stale
-  # "Found 1" line and the watchdog treated an idle gate as a non-empty queue →
-  # false STALL on an idle gate (observed 06-27: queued=0 now, but a brief marker
-  # earlier in the tail tripped it). Scan all lines, keep the LAST N, test that.
-  local queued_found=0 latest_found_n=""
-  while IFS= read -r line; do
-    if echo "$line" | grep -qE "Found [0-9]+ queued marker"; then
-      latest_found_n=$(echo "$line" | grep -oE "Found [0-9]+ queued marker" | grep -oE "[0-9]+" | head -1)
-    fi
-  done <<< "$log_lines"
-  [ -n "$latest_found_n" ] && [ "$latest_found_n" -gt 0 ] 2>/dev/null && queued_found=1
+  # ── FALSE-POSITIVE GUARD A: no ACTIVE markers ─────────────────────────────
+  # ga-4cb2: query LIVE gate-marker state directly via bd instead of parsing
+  # the dispatcher log's "Found N queued marker(s)" text. That text-parsing
+  # approach raced the independently-scheduled dispatcher sweep (this
+  # watchdog's tail can land a few seconds either side of the dispatcher's own
+  # write) and had no way to distinguish a genuinely active marker from one
+  # PARKED at needs-rebase/parked-needs-human/deferred/error — those wait on a
+  # human/author, never on the gate, and must never read as queue congestion.
+  # Count ONLY the states the gate itself owns: queued/dispatching/ready/
+  # claimed/running.
+  local markers_json=""
+  if [ -n "${GTSW_TEST_ACTIVE_MARKERS_JSON+x}" ]; then
+    markers_json="${GTSW_TEST_ACTIVE_MARKERS_JSON}"
+  elif command -v "$BD_BIN" >/dev/null 2>&1; then
+    markers_json="$("$BD_BIN" -C "$HQ" list --json -l type:quality-gate-marker --status open --limit 0 2>/dev/null)" || markers_json=""
+  else
+    log "WARN: bd not on PATH — cannot read gate-marker state — fail-open (no stall verdict)"
+    return 0
+  fi
 
-  if [ "$queued_found" -eq 0 ]; then
+  local active_count=""
+  if [ -n "$markers_json" ]; then
+    active_count="$(printf '%s' "$markers_json" | jq '[.[] | select(.labels[]? | test("^gate-status:(queued|dispatching|ready|claimed|running)$"))] | length' 2>/dev/null)"
+  fi
+  case "$active_count" in ''|*[!0-9]*) active_count="" ;; esac
+
+  if [ -z "$active_count" ]; then
+    # ga-p5q3 defense (a): a query/parse FAILURE is UNKNOWN, not zero — fail
+    # open rather than let "couldn't ask" masquerade as "nothing's queued" (or,
+    # worse, fall through and get misread as a stall).
+    log "WARN: could not read active gate-marker count (bd query or jq parse failed) — fail-open (no stall verdict)"
+    return 0
+  fi
+
+  if [ "$active_count" -eq 0 ]; then
     # COOLDOWN RESET: queue empty → stall cleared; disarm so next episode re-alerts immediately
     [ -f "${COOLDOWN_FILE}" ] && { rm -f "${COOLDOWN_FILE}" 2>/dev/null || true; log "COOLDOWN RESET: queue empty — cooldown disarmed"; }
     # ga-evjs2: also clear the recover-marker so a NEW episode starts recover-first (no stale escalation)
     [ -f "${RECOVER_MARKER_FILE}" ] && { rm -f "${RECOVER_MARKER_FILE}" 2>/dev/null || true; log "RECOVER-MARKER RESET: queue empty — next episode recovers before paging Athos"; }
-    log "OK: no queued markers found in tail — gate idle (not a stall)"
+    log "OK: 0 active gate markers (queued/dispatching/ready/claimed/running) — gate idle (not a stall)"
     return 0
   fi
 
@@ -179,11 +215,23 @@ run_sweep() {
   fi
 
   # ── FALSE-POSITIVE GUARD C: recent gate progress ──────────────────────────
-  # Scan the tail for "Gate PASSED:" lines. Parse the timestamp and check if
+  # Scan the tail for "Gate PASSED" lines. Parse the timestamp and check if
   # any falls within the stall window. A PASSED within GTSW_STALL_MINUTES → OK.
+  # ga-4cb2: match the substring "Gate PASSED" with NO fixed suffix — the
+  # dispatcher started emitting "Gate PASSED (origin=Pilot): branch=..." partway
+  # through 2026-07 (previously plain "Gate PASSED: branch=..."), and the old
+  # literal "Gate PASSED:" pattern silently stopped matching any current-format
+  # line. That left last_passed_epoch permanently pinned to the last OLD-format
+  # line still in the tail (hours stale) even while the gate was merging every
+  # few minutes, so a real recent pass never suppressed the alert. The
+  # timestamp extraction below is a separate regex on the leading `[...]`
+  # bracket, so broadening this match cannot pick up a wrong timestamp — it can
+  # only stop missing right ones. (The "Logged for digest ...: 🤖 Pilot Gate
+  # PASSED" summary line also contains this substring but carries no leading
+  # bracket, so ts_str comes back empty and it's skipped, same as always.)
   local last_passed_epoch=0
   while IFS= read -r line; do
-    if echo "$line" | grep -q "Gate PASSED:"; then
+    if echo "$line" | grep -q "Gate PASSED"; then
       # Timestamp format: [2026-06-23 17:33:31]
       local ts_str; ts_str="$(echo "$line" | grep -oE '\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\]' | tr -d '[]')"
       if [ -n "$ts_str" ]; then
@@ -412,23 +460,43 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   printf '#!/usr/bin/env bash\n[ "$1" = "mail" ] && echo "mail:$*" >> "$GTSW_TEST_MAILED" 2>/dev/null; [ "$1" = "session" ] && echo "${GTSW_TEST_SESSIONS:-}" ; exit 0\n' > "$TMP/gc"
   chmod +x "$TMP/notify" "$TMP/gc"
 
-  # Helper: generate realistic gate log lines with a given queue count and
-  # optionally a "Gate PASSED" line at a given age in seconds.
+  # Helper: generate realistic dispatcher log filler plus optionally a
+  # "Gate PASSED" line at a given age in seconds. ga-4cb2: Guard A no longer
+  # reads queue state from this text (see make_markers below) — this is now
+  # ONLY for guards B (quota) and C (recent progress). fmt=new reproduces the
+  # CURRENT dispatcher format "Gate PASSED (origin=Pilot): ..."; fmt=old
+  # reproduces the format every pre-2026-07 log line used, "Gate PASSED: ..."
+  # (no origin tag) — both must suppress via Guard C.
   make_log() {
-    local queue_n="$1" passed_age_sec="${2:-}"
+    local passed_age_sec="${1:-}" fmt="${2:-new}"
     local now; now="$(date +%s)"
-    # Queued-markers line (always present if queue_n > 0)
-    if [ "$queue_n" -gt 0 ]; then
-      local ts_q; ts_q="$(date -u -r $((now - 60)) '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u -d "@$((now - 60))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u '+%Y-%m-%d %H:%M:%S')"
-      echo "[${ts_q}] [quality-gate-dispatcher] Found ${queue_n} queued marker(s)"
-    fi
-    # Gate PASSED line (if requested)
+    local ts_now; ts_now="$(date -u '+%Y-%m-%d %H:%M:%S')"
+    echo "[${ts_now}] [quality-gate-dispatcher] === Dispatcher sweep start (DRY_RUN=0) ==="
     if [ -n "$passed_age_sec" ] && [ "$passed_age_sec" -gt 0 ]; then
       local ts_p; ts_p="$(date -u -r $((now - passed_age_sec)) '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u -d "@$((now - passed_age_sec))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
       if [ -n "$ts_p" ]; then
-        echo "[${ts_p}] [quality-gate-dispatcher] Gate PASSED: branch=crew/test/ga-test tier=CODE merge_sha=abc123 elapsed=300s"
+        if [ "$fmt" = "old" ]; then
+          echo "[${ts_p}] [quality-gate-dispatcher] Gate PASSED: branch=crew/test/ga-test tier=CODE merge_sha=abc123 elapsed=300s"
+        else
+          echo "[${ts_p}] [quality-gate-dispatcher] Gate PASSED (origin=Pilot): branch=fix/ga-test tier=CODE merge_sha=abc123 elapsed=300s"
+        fi
       fi
     fi
+  }
+
+  # Helper: build a fake `bd list --json` marker array — one bead per
+  # gate-status arg, e.g. `make_markers queued queued needs-rebase` → 2 active
+  # + 1 parked. No args → "[]" (empty queue). Feeds GTSW_TEST_ACTIVE_MARKERS_JSON,
+  # exercising the SAME jq filter the real bd-query path uses.
+  make_markers() {
+    local out="[" first=1 st i=0
+    for st in "$@"; do
+      if [ "$first" -eq 1 ]; then first=0; else out="${out},"; fi
+      i=$((i+1))
+      out="${out}{\"id\":\"m${i}\",\"status\":\"open\",\"labels\":[\"type:quality-gate-marker\",\"gate-status:${st}\"]}"
+    done
+    out="${out}]"
+    printf '%s' "$out"
   }
 
   # ── Scenario 1: STALL FIRST DETECTION → recover + mail Mayor, do NOT page Athos ──
@@ -440,7 +508,8 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   KICKS1="$TMP/kicks1"; : > "$KICKS1"
   NOTIF1="$TMP/notif1"; : > "$NOTIF1"
   MAIL1="$TMP/mail1";   : > "$MAIL1"
-  GTSW_TEST_LOG_LINES="$(make_log 5)"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued queued queued queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
   GTSW_TEST_QUOTA_RC=0
   GTSW_TEST_SESSIONS=""
   GTSW_TEST_KICKSTARTS="$KICKS1"
@@ -483,9 +552,10 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
 
   # ── Scenario 2: EMPTY QUEUE → no alert ───────────────────────────────────
-  echo "Scenario 2: empty queue (0 queued markers) → NOT a stall"
+  echo "Scenario 2: empty queue (0 active markers) → NOT a stall"
   NOTIF2="$TMP/notif2"; : > "$NOTIF2"
-  GTSW_TEST_LOG_LINES="$(make_log 0)"    # no queued-markers line at all
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers)"    # no markers at all
+  GTSW_TEST_LOG_LINES="$(make_log)"
   GTSW_TEST_QUOTA_RC=0
   GTSW_TEST_SESSIONS=""
   GTSW_TEST_NOTIFIED="$NOTIF2"
@@ -494,12 +564,48 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   run_sweep && ok "scenario 2: empty queue returns 0 (no alert)" || bad "scenario 2: empty queue falsely alerted"
   [ ! -s "$NOTIF2" ] && ok "scenario 2: no notify on empty queue" || bad "scenario 2: notify fired on empty queue (false positive)"
 
+  # ── Scenario 2b (ga-4cb2 regression): PARKED markers must NOT count ──────
+  # The exact reported incident: 7 markers sit at gate-status:needs-rebase
+  # (waiting on their AUTHORS to resolve a real conflict, never on the gate).
+  # A watchdog that counts them as "queue non-empty" cries wolf on an idle
+  # gate forever, since parked markers never clear themselves.
+  echo "Scenario 2b (ga-4cb2): 7 needs-rebase markers, 0 active → NOT a stall"
+  NOTIF2B="$TMP/notif2b"; : > "$NOTIF2B"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers needs-rebase needs-rebase needs-rebase needs-rebase needs-rebase needs-rebase needs-rebase)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_NOTIFIED="$NOTIF2B"
+  GTSW_TEST_MAILED="$TMP/mail2b"
+  unset GTSW_TEST_KICKSTARTS
+  run_sweep && ok "scenario 2b: 7 needs-rebase markers return 0 (no alert)" || bad "scenario 2b: parked markers falsely alerted (the exact ga-4cb2 bug)"
+  [ ! -s "$NOTIF2B" ] && ok "scenario 2b: no notify with only parked markers" || bad "scenario 2b: notify fired on parked-only queue (false positive)"
+
+  # ── Scenario 2c: parked markers coexist with ONE active marker → DOES count ──
+  # Proves the fix counts precisely, not just the empty-array trivial case:
+  # mixing 7 parked (ignored) with 1 genuinely active marker and no recent
+  # pass must still surface as a real stall.
+  echo "Scenario 2c: 7 needs-rebase + 1 queued (active) + no recent pass → STILL a stall"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true   # fresh episode
+  NOTIF2C="$TMP/notif2c"; : > "$NOTIF2C"
+  MAIL2C="$TMP/mail2c"; : > "$MAIL2C"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers needs-rebase needs-rebase needs-rebase needs-rebase needs-rebase needs-rebase needs-rebase queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_NOTIFIED="$NOTIF2C"
+  GTSW_TEST_MAILED="$MAIL2C"
+  unset GTSW_TEST_KICKSTARTS
+  run_sweep && bad "scenario 2c: 1 active marker among parked ones should still return 1" || ok "scenario 2c: 1 genuinely active marker still detected (return 1, under-reporting avoided)"
+  grep -q "mail:" "$MAIL2C" 2>/dev/null && ok "scenario 2c: Mayor mailed (real stall, not masked by parked markers)" || bad "scenario 2c: Mayor NOT mailed"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true   # clean slate for downstream scenarios
+
   # ── Scenario 3: QUOTA-LIMITED (B1: log pattern) → suppress ───────────────
   echo "Scenario 3: quota-limited via log pattern (B1) → suppressed"
   NOTIF3="$TMP/notif3"; : > "$NOTIF3"
   _sc3_now="$(date -u '+%Y-%m-%d %H:%M:%S')"
-  GTSW_TEST_LOG_LINES="[${_sc3_now}] [quality-gate-dispatcher] Found 8 queued marker(s)
-[${_sc3_now}] [quality-gate-dispatcher] Headroom DEFER: gate em 0 runs (Dolt cpu=200% lat=100ms / cota=LIMITED) — quota-limited; ceiling=0 reviewers, leaving 8 marker(s) queued (ga-cw4pm)."
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued queued queued queued queued queued queued)"
+  GTSW_TEST_LOG_LINES="[${_sc3_now}] [quality-gate-dispatcher] Headroom DEFER: gate em 0 runs (Dolt cpu=200% lat=100ms / cota=LIMITED) — quota-limited; ceiling=0 reviewers, leaving 8 marker(s) queued (ga-cw4pm)."
   GTSW_TEST_QUOTA_RC=0   # B2 says OK but B1 catches it
   GTSW_TEST_SESSIONS=""
   GTSW_TEST_NOTIFIED="$NOTIF3"
@@ -511,8 +617,8 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   # ── Scenario 4: QUOTA-LIMITED (B2: live check) → suppress ────────────────
   echo "Scenario 4: quota-limited via live quota-check (B2) → suppressed"
   NOTIF4="$TMP/notif4"; : > "$NOTIF4"
-  _sc4_now="$(date -u '+%Y-%m-%d %H:%M:%S')"
-  GTSW_TEST_LOG_LINES="[${_sc4_now}] [quality-gate-dispatcher] Found 5 queued marker(s)"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued queued queued queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
   GTSW_TEST_QUOTA_RC=2   # B2: quota check returns LIMITED
   GTSW_TEST_SESSIONS=""
   GTSW_TEST_NOTIFIED="$NOTIF4"
@@ -522,22 +628,43 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   [ ! -s "$NOTIF4" ] && ok "scenario 4: no notify when quota exit=2" || bad "scenario 4: notify fired despite quota exit=2 (false positive)"
 
   # ── Scenario 5: RECENT PROGRESS → no alert ───────────────────────────────
-  echo "Scenario 5: Gate PASSED within the stall window → NOT a stall"
+  # ga-4cb2: uses fmt=new — "Gate PASSED (origin=Pilot): ..." — the CURRENT
+  # dispatcher format. This is the exact reported bug: Guard C's old literal
+  # "Gate PASSED:" pattern did not match this format at all, so a real pass 30
+  # minutes ago would have been invisible and the stall would have fired anyway.
+  echo "Scenario 5: Gate PASSED (origin=Pilot) within the stall window → NOT a stall"
   NOTIF5="$TMP/notif5"; : > "$NOTIF5"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued queued)"
   # Gate PASSED 30 minutes ago (well within the 2h window)
-  GTSW_TEST_LOG_LINES="$(make_log 3 1800)"
+  GTSW_TEST_LOG_LINES="$(make_log 1800 new)"
   GTSW_TEST_QUOTA_RC=0
   GTSW_TEST_SESSIONS=""
   GTSW_TEST_NOTIFIED="$NOTIF5"
   GTSW_TEST_MAILED="$TMP/mail5"
   unset GTSW_TEST_KICKSTARTS
-  run_sweep && ok "scenario 5: recent Gate PASSED suppresses alert (return 0)" || bad "scenario 5: recent Gate PASSED did NOT suppress (false positive)"
+  run_sweep && ok "scenario 5: recent Gate PASSED (origin=Pilot) suppresses alert (return 0)" || bad "scenario 5: recent Gate PASSED (origin=Pilot) did NOT suppress (the exact ga-4cb2 bug)"
   [ ! -s "$NOTIF5" ] && ok "scenario 5: no notify when Gate PASSED recently" || bad "scenario 5: notify fired despite recent Gate PASSED (false positive)"
+
+  # ── Scenario 5b: RECENT PROGRESS, OLD log format → no alert (backward-compat) ──
+  # Historical log lines (pre-format-change, still in the tail on a live box)
+  # must keep suppressing too — the broadened match must not have narrowed.
+  echo "Scenario 5b: Gate PASSED (old format, no origin tag) within the stall window → NOT a stall"
+  NOTIF5B="$TMP/notif5b"; : > "$NOTIF5B"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued queued)"
+  GTSW_TEST_LOG_LINES="$(make_log 1800 old)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_NOTIFIED="$NOTIF5B"
+  GTSW_TEST_MAILED="$TMP/mail5b"
+  unset GTSW_TEST_KICKSTARTS
+  run_sweep && ok "scenario 5b: recent Gate PASSED (old format) suppresses alert (return 0)" || bad "scenario 5b: old-format Gate PASSED did NOT suppress (backward-compat regression)"
+  [ ! -s "$NOTIF5B" ] && ok "scenario 5b: no notify when old-format Gate PASSED recent" || bad "scenario 5b: notify fired despite recent old-format Gate PASSED (false positive)"
 
   # ── Scenario 6: ACTIVE REVIEWER → no alert ───────────────────────────────
   echo "Scenario 6: active gate-reviewer session → NOT a stall"
   NOTIF6="$TMP/notif6"; : > "$NOTIF6"
-  GTSW_TEST_LOG_LINES="$(make_log 4)"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued queued queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
   GTSW_TEST_QUOTA_RC=0
   GTSW_TEST_SESSIONS="gate-reviewer-adhoc-abc123 (running)"
   GTSW_TEST_NOTIFIED="$NOTIF6"
@@ -551,7 +678,8 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   KICKS7="$TMP/kicks7"; : > "$KICKS7"
   NOTIF7="$TMP/notif7"; : > "$NOTIF7"
   GTSW_AUTORECOVER=0
-  GTSW_TEST_LOG_LINES="$(make_log 6)"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued queued queued queued queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
   GTSW_TEST_QUOTA_RC=0
   GTSW_TEST_SESSIONS=""
   GTSW_TEST_KICKSTARTS="$KICKS7"
@@ -568,7 +696,8 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   echo "Scenario 8: GTSW_ENABLED=0 → no-op (return 0, no notify)"
   NOTIF8="$TMP/notif8"; : > "$NOTIF8"
   GTSW_ENABLED=0
-  GTSW_TEST_LOG_LINES="$(make_log 10)"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued queued queued queued queued queued queued queued queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
   GTSW_TEST_QUOTA_RC=0
   GTSW_TEST_SESSIONS=""
   GTSW_TEST_NOTIFIED="$NOTIF8"
@@ -584,7 +713,8 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   KICKS9="$TMP/kicks9"; : > "$KICKS9"
   NOTIF9="$TMP/notif9"; : > "$NOTIF9"
   GTSW_DRY_RUN=1
-  GTSW_TEST_LOG_LINES="$(make_log 3)"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
   GTSW_TEST_QUOTA_RC=0
   GTSW_TEST_SESSIONS=""
   GTSW_TEST_KICKSTARTS="$KICKS9"
@@ -611,7 +741,8 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   NOTIF11a="$TMP/notif11a"; : > "$NOTIF11a"
   MAIL11a="$TMP/mail11a";   : > "$MAIL11a"
   KICKS11a="$TMP/kicks11a"; : > "$KICKS11a"
-  GTSW_TEST_LOG_LINES="$(make_log 5)"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued queued queued queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
   GTSW_TEST_QUOTA_RC=0
   GTSW_TEST_SESSIONS=""
   GTSW_TEST_KICKSTARTS="$KICKS11a"
@@ -637,11 +768,9 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   echo "Scenario 12: stall-clear resets cooldown → next stall episode re-alerts immediately"
   # Pre-condition: cooldown file from 1 minute ago (within 2h window → would suppress)
   echo "$(( $(date +%s) - 60 ))" > "$TMP/cooldown"
-  # Stall CLEARS via empty queue (Guard A should delete the cooldown file).
-  # make_log 0 produces empty output which hits fail-open before Guard A; use a
-  # non-empty log line with 0 queued markers so Guard A path actually executes.
-  _sc12_now="$(date -u '+%Y-%m-%d %H:%M:%S')"
-  GTSW_TEST_LOG_LINES="[${_sc12_now}] [quality-gate-dispatcher] Found 0 queued marker(s) — gate idle"
+  # Stall CLEARS via 0 active markers (Guard A should delete the cooldown file).
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
   GTSW_TEST_QUOTA_RC=0
   GTSW_TEST_SESSIONS=""
   unset GTSW_TEST_KICKSTARTS
@@ -650,7 +779,8 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   # Fresh stall after clear — cooldown was reset, alert should fire again immediately
   NOTIF12b="$TMP/notif12b"; : > "$NOTIF12b"
   KICKS12b="$TMP/kicks12b"; : > "$KICKS12b"
-  GTSW_TEST_LOG_LINES="$(make_log 3)"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="$(make_markers queued queued queued)"
+  GTSW_TEST_LOG_LINES="$(make_log)"
   GTSW_TEST_QUOTA_RC=0
   GTSW_TEST_SESSIONS=""
   GTSW_TEST_KICKSTARTS="$KICKS12b"
@@ -663,9 +793,36 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   [ -f "$TMP/recover-marker" ] && ok "scenario 12b: recovery re-engaged after clear (marker re-stamped — not stale-suppressed)" || bad "scenario 12b: marker NOT re-stamped (clear-reset failed!)"
   [ ! -s "$NOTIF12b" ] && ok "scenario 12b: Athos NOT paged on the fresh episode's first detection (recover-first)" || bad "scenario 12b: Athos paged on first detection of fresh episode"
 
+  # ── Scenario 13 (ga-p5q3 defense (a)): bd/jq query FAILURE → fail-open ────
+  # A query failure must read as UNKNOWN, never as "0 active" nor "stalled".
+  # Both an empty bd response (query error swallowed by 2>/dev/null) and a
+  # malformed/non-JSON response (jq parse failure) must fail toward "no stall
+  # verdict" rather than either false-alarming or silently under-reporting.
+  echo "Scenario 13 (ga-p5q3): active-marker query failure → fail-open, no alert"
+  rm -f "$TMP/cooldown" "$TMP/recover-marker" 2>/dev/null || true
+  NOTIF13a="$TMP/notif13a"; : > "$NOTIF13a"
+  GTSW_TEST_ACTIVE_MARKERS_JSON=""    # simulates a failed/empty bd query response
+  GTSW_TEST_LOG_LINES="$(make_log)"
+  GTSW_TEST_QUOTA_RC=0
+  GTSW_TEST_SESSIONS=""
+  GTSW_TEST_NOTIFIED="$NOTIF13a"
+  GTSW_TEST_MAILED="$TMP/mail13a"
+  unset GTSW_TEST_KICKSTARTS
+  run_sweep && ok "scenario 13a: empty bd response fails open (return 0)" || bad "scenario 13a: empty bd response should fail open, not alert"
+  [ ! -s "$NOTIF13a" ] && ok "scenario 13a: no notify on query failure" || bad "scenario 13a: notify fired despite unreadable marker state"
+  grep -q "could not read active gate-marker count" "$LOG" 2>/dev/null && ok "scenario 13a: failure logged as WARN (distinguishable from a real empty queue)" || bad "scenario 13a: failure not logged"
+
+  echo "Scenario 13b (ga-p5q3): malformed bd JSON → fail-open, no alert"
+  NOTIF13b="$TMP/notif13b"; : > "$NOTIF13b"
+  GTSW_TEST_ACTIVE_MARKERS_JSON="not valid json{{{"    # simulates a jq parse failure
+  GTSW_TEST_NOTIFIED="$NOTIF13b"
+  GTSW_TEST_MAILED="$TMP/mail13b"
+  run_sweep && ok "scenario 13b: malformed JSON fails open (return 0)" || bad "scenario 13b: malformed JSON should fail open, not alert"
+  [ ! -s "$NOTIF13b" ] && ok "scenario 13b: no notify on malformed JSON" || bad "scenario 13b: notify fired despite malformed marker JSON"
+
   # ── CLEANUP / SUMMARY ─────────────────────────────────────────────────────
   # Unset test seams so no state leaks
-  unset GTSW_TEST_LOG_LINES GTSW_TEST_QUOTA_RC GTSW_TEST_SESSIONS
+  unset GTSW_TEST_ACTIVE_MARKERS_JSON GTSW_TEST_LOG_LINES GTSW_TEST_QUOTA_RC GTSW_TEST_SESSIONS
   unset GTSW_TEST_KICKSTARTS GTSW_TEST_NOTIFIED GTSW_TEST_MAILED
 
   echo ""
