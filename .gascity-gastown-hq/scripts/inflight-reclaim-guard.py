@@ -1632,6 +1632,78 @@ def _pool_of(assignee):
 # Actuation helpers (label + assignee ops on real beads — CONSERVATIVE)
 # ---------------------------------------------------------------------------
 
+def _promote_refusal_labels(bead_id, labels, refusal_count, rig_root=None):
+    """Consume fresh pool:refused[:reason] label(s), promote each into a
+    PERMANENT pilot:refused-reason:<slug> audit label, and bump
+    pilot:refusal-count:N. Shared by do_reclaim() and do_escalate() (ga-be4x
+    gate-fix-2) so this exact sequence runs regardless of which function
+    actuates a refusal-triggered bead.
+
+    Why do_escalate() needs this too, not just do_reclaim(): reclaim_decision()
+    jumps straight to "escalate" — bypassing do_reclaim() entirely — the
+    moment (refusal_count + 1) >= REFUSAL_ESCALATE_THRESHOLD. Before this
+    fix, ONLY do_reclaim() ran this promotion, so the 2nd (triggering)
+    worker's fresh pool:refused:<reason> label was never consumed, never
+    promoted, and never surfaced — do_escalate()'s reason-derivation read
+    only already-promoted pilot:refused-reason:<slug> labels, silently
+    dropping the exact reason that caused the escalation (and permanently
+    under-counting pilot:refusal-count by one, since its bump lived only in
+    this same do_reclaim()-only path).
+
+    Returns (new_refusal_count, fresh_slugs, all_slugs):
+      - new_refusal_count: refusal_count + 1.
+      - fresh_slugs:  reasons newly promoted THIS call (from pool:refused[:reason]
+                      labels present in `labels`).
+      - all_slugs:    fresh_slugs plus any pilot:refused-reason:<slug> already
+                      present in `labels`, deduplicated, first-seen order — the
+                      complete accumulated reason history a human/Mayor needs.
+    """
+    _bd = ["bd", "-C", rig_root] if rig_root else ["bd"]
+    fresh_slugs = _refusal_reason_slugs(labels)
+    for lbl in labels:
+        if lbl == "pool:refused" or lbl.startswith("pool:refused:"):
+            try:
+                subprocess.run(
+                    _bd + ["label", "remove", bead_id, lbl, "-q"],
+                    capture_output=True, text=True, timeout=15)
+            except Exception as exc:
+                print(f"[INFLIGHT-RECLAIM] warn: remove {lbl} from {bead_id}: {exc}",
+                      flush=True)
+    for slug in fresh_slugs:
+        try:
+            subprocess.run(
+                _bd + ["label", "add", bead_id, f"pilot:refused-reason:{slug}", "-q"],
+                capture_output=True, text=True, timeout=15)
+        except Exception as exc:
+            print(f"[INFLIGHT-RECLAIM] warn: add pilot:refused-reason:{slug} {bead_id}: {exc}",
+                  flush=True)
+
+    new_refusal_count = refusal_count + 1
+    if refusal_count > 0:
+        try:
+            subprocess.run(
+                _bd + ["label", "remove", bead_id, f"pilot:refusal-count:{refusal_count}", "-q"],
+                capture_output=True, text=True, timeout=15)
+        except Exception:
+            pass  # old label may already be missing; ignore
+    try:
+        subprocess.run(
+            _bd + ["label", "add", bead_id, f"pilot:refusal-count:{new_refusal_count}", "-q"],
+            capture_output=True, text=True, timeout=15)
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] warn: set refusal-count label {bead_id}: {exc}", flush=True)
+
+    existing_slugs = [
+        l[len("pilot:refused-reason:"):] for l in labels
+        if l.startswith("pilot:refused-reason:")
+    ]
+    all_slugs = list(existing_slugs)
+    for slug in fresh_slugs:
+        if slug not in all_slugs:
+            all_slugs.append(slug)
+    return new_refusal_count, fresh_slugs, all_slugs
+
+
 def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=None,
                 has_explicit_refusal=False, refusal_count=0):
     """Strip story:in-flight (+pilot:dispatched if present), clear assignee,
@@ -1655,7 +1727,6 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     Returns True if all bd ops succeeded, False if any failed (still best-effort).
     """
     new_count = reclaim_count + 1
-    new_refusal_count = refusal_count + 1 if has_explicit_refusal else refusal_count
     ok = True
 
     # 0. ga-ufr7: push-before-reclaim safety net. A builder that went quiet from
@@ -1690,33 +1761,19 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
             ok = False
 
     # 1b. ga-be4x: consume the ephemeral refusal marker(s) and fold each reason
-    #     into a PERMANENT audit label. Consuming (removing) pool:refused[:reason]
-    #     here is load-bearing: if left in place, a later UNRELATED drain (e.g. a
+    #     into a PERMANENT audit label, via the helper shared with do_escalate()
+    #     (ga-be4x gate-fix-2). Consuming (removing) pool:refused[:reason] here
+    #     is load-bearing: if left in place, a later UNRELATED drain (e.g. a
     #     genuine crash on the next dispatch) would be misread as a fresh
     #     refusal by _has_refusal_label() on the next cycle, double-counting it
     #     against REFUSAL_ESCALATE_THRESHOLD. pilot:refused-reason:<slug> is
     #     never removed — it accumulates so an eventual escalation can quote
     #     every reason a worker ever gave, verbatim, without re-investigation.
     refused_reason_slugs = []
+    new_refusal_count = refusal_count
     if has_explicit_refusal:
-        refused_reason_slugs = _refusal_reason_slugs(labels)
-        for lbl in labels:
-            if lbl == "pool:refused" or lbl.startswith("pool:refused:"):
-                try:
-                    subprocess.run(
-                        _bd + ["label", "remove", bead_id, lbl, "-q"],
-                        capture_output=True, text=True, timeout=15)
-                except Exception as exc:
-                    print(f"[INFLIGHT-RECLAIM] warn: remove {lbl} from {bead_id}: {exc}",
-                          flush=True)
-        for slug in refused_reason_slugs:
-            try:
-                subprocess.run(
-                    _bd + ["label", "add", bead_id, f"pilot:refused-reason:{slug}", "-q"],
-                    capture_output=True, text=True, timeout=15)
-            except Exception as exc:
-                print(f"[INFLIGHT-RECLAIM] warn: add pilot:refused-reason:{slug} {bead_id}: {exc}",
-                      flush=True)
+        new_refusal_count, refused_reason_slugs, _all_reason_slugs = _promote_refusal_labels(
+            bead_id, labels, refusal_count, rig_root=rig_root)
 
     # 2. Clear assignee so Pilot can claim it fresh
     try:
@@ -1756,22 +1813,10 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] warn: set reclaim-count label {bead_id}: {exc}", flush=True)
 
-    # 3a. ga-be4x: bump the refusal-specific counter in lockstep, same
-    #     remove-old/add-new pattern as pilot:reclaim-count above.
-    if has_explicit_refusal:
-        if refusal_count > 0:
-            try:
-                subprocess.run(
-                    _bd + ["label", "remove", bead_id, f"pilot:refusal-count:{refusal_count}", "-q"],
-                    capture_output=True, text=True, timeout=15)
-            except Exception:
-                pass  # old label may already be missing; ignore
-        try:
-            subprocess.run(
-                _bd + ["label", "add", bead_id, f"pilot:refusal-count:{new_refusal_count}", "-q"],
-                capture_output=True, text=True, timeout=15)
-        except Exception as exc:
-            print(f"[INFLIGHT-RECLAIM] warn: set refusal-count label {bead_id}: {exc}", flush=True)
+    # 3a. [ga-be4x gate-fix-2: refusal-count bump now happens inside
+    #      _promote_refusal_labels(), called at step 1b above — no separate
+    #      step needed here; kept as a numbered marker for continuity with the
+    #      audit comment below, which still references new_refusal_count.]
 
     # 3b. ga-l5ud0 FIX #2: re-loop cooldown — stamp pilot:held + pilot:held-until:<now+1h>
     #     on the 2nd+ reclaim (reclaim_count >= 1) to prevent the Pilot from immediately
@@ -1873,6 +1918,18 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=N
     comment additionally quotes every accumulated pilot:refused-reason:<slug>
     label verbatim so a Mayor can act without re-discovering the reason from
     scratch (ga-be4x fix item 3).
+
+    ga-be4x gate-fix-2: reclaim_decision() reaches "escalate" WITHOUT ever
+    calling do_reclaim() — the only function that used to promote a fresh
+    pool:refused:<reason> label into the permanent pilot:refused-reason:<slug>
+    form. That left the 2nd (triggering) worker's own reason un-promoted,
+    un-consumed, and absent from both this comment and the
+    [POOL-REFUSED-ESCALATED] Mayor-mail run_cycle() sends right after calling
+    this function. Fixed by calling the shared _promote_refusal_labels() helper
+    here FIRST, before deriving the reason text, so the triggering reason is
+    folded in exactly like any prior one. Returns the complete list of reason
+    slugs (empty list on the non-refusal path) so run_cycle() can reuse it
+    for its own mail body instead of re-deriving (and re-dropping) it.
     """
     # Build the bd prefix: rig-native beads route to their own store.
     _bd = ["bd", "-C", rig_root] if rig_root else ["bd"]
@@ -1906,24 +1963,31 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=N
                   flush=True)
 
     if has_explicit_refusal:
-        _reasons = [l[len("pilot:refused-reason:"):] for l in labels
-                    if l.startswith("pilot:refused-reason:")]
-        _reason_text = ", ".join(_reasons) if _reasons else "unspecified"
+        # ga-be4x gate-fix-2: promote THIS cycle's still-fresh
+        # pool:refused:<reason> label — the very one that crossed
+        # REFUSAL_ESCALATE_THRESHOLD and triggered this escalation — BEFORE
+        # reading reasons for the comment. reclaim_decision() short-circuits
+        # straight to "escalate" without ever calling do_reclaim(), so without
+        # this call the triggering reason was silently dropped (never
+        # promoted, never consumed, never read).
+        new_refusal_count, _fresh_reason_slugs, all_reason_slugs = _promote_refusal_labels(
+            bead_id, labels, refusal_count, rig_root=rig_root)
+        _reason_text = ", ".join(all_reason_slugs) if all_reason_slugs else "unspecified"
         try:
             subprocess.run(
                 _bd + ["comment", bead_id,
                  f"inflight-reclaim-guard (ga-be4x): ESCALATED — "
-                 f"{refusal_count + 1} independent workers EXPLICITLY REFUSED this "
+                 f"{new_refusal_count} independent workers EXPLICITLY REFUSED this "
                  f"bead (reason(s): {_reason_text}). This is not an unexplained "
                  f"death — re-dispatching again cannot succeed where "
-                 f"{refusal_count + 1} workers already reached the same reasoned "
+                 f"{new_refusal_count} workers already reached the same reasoned "
                  f"conclusion. Marked gate:needs-human:refused; story:in-flight "
                  f"RETAINED (not re-cleared) to avoid a dispatch↔reclaim loop. "
                  f"Human/Mayor must re-route or re-scope, then re-queue."],
                 capture_output=True, text=True, timeout=15)
         except Exception:
             pass
-        return
+        return all_reason_slugs
 
     try:
         subprocess.run(
@@ -1937,6 +2001,7 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=N
             capture_output=True, text=True, timeout=15)
     except Exception:
         pass
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -2367,8 +2432,9 @@ def run_cycle(state, escalated_alerted):
             # Rate-limit to avoid repeat ntfy on the same bead within REALERT_SEC
             last_alert = escalated_alerted.get(bead_id, 0)
             if now - last_alert > REALERT_SEC:
-                do_escalate(bead_id, title, reclaim_count, idle_min, labels, rig_root=rig_root,
-                            has_explicit_refusal=has_explicit_refusal, refusal_count=refusal_count)
+                _escalated_reason_slugs = do_escalate(
+                    bead_id, title, reclaim_count, idle_min, labels, rig_root=rig_root,
+                    has_explicit_refusal=has_explicit_refusal, refusal_count=refusal_count)
                 _escalate_reason = (
                     f"{refusal_count + 1} independent EXPLICIT REFUSALS"
                     if has_explicit_refusal else f"reclaimed {reclaim_count}x")
@@ -2383,8 +2449,15 @@ def run_cycle(state, escalated_alerted):
                 if _is_ephemeral_pool_assignee(assignee):
                     try:
                         if has_explicit_refusal:
-                            _reasons = [l[len("pilot:refused-reason:"):] for l in labels
-                                        if l.startswith("pilot:refused-reason:")]
+                            # ga-be4x gate-fix-2: reuse do_escalate's own
+                            # returned (complete, post-promotion) reason list
+                            # instead of re-deriving from the stale `labels`
+                            # local here — at this point `labels` still shows
+                            # this cycle's triggering reason as an un-promoted
+                            # pool:refused:<reason> label, so an independent
+                            # re-derivation from it would silently drop the
+                            # exact same reason do_escalate() itself used to.
+                            _reasons = _escalated_reason_slugs or []
                             subprocess.run(
                                 ["gc", "mail", "send", "mayor",
                                  "-s", f"[POOL-REFUSED-ESCALATED] {assignee}: bead {bead_id} refused {refusal_count + 1}x",
@@ -3581,14 +3654,28 @@ def _selftest():
     #     instead of) the existing gate:needs-human:technical — swapping it
     #     would silently drop the bead out of quorum-convergence-watchdog's
     #     exact `--label gate:needs-human:technical` fallback query — and
-    #     quotes every accumulated refusal reason verbatim. ---
+    #     quotes every accumulated refusal reason verbatim.
+    #
+    #     ga-be4x GATE-FEEDBACK FIX: the fixture below matches the REAL call
+    #     shape reclaim_decision()/run_cycle() produce on the triggering
+    #     escalation cycle — one reason ALREADY promoted from a prior reclaim
+    #     (pilot:refused-reason:cross-rig-framework) plus the CURRENT (2nd,
+    #     triggering) refusal still sitting as a fresh, un-promoted
+    #     pool:refused:<reason> label (pool:refused:hex-notebook-native) and
+    #     matching pilot:refusal-count:1. The PRIOR version of this test
+    #     hand-fabricated BOTH reasons as already-promoted
+    #     pilot:refused-reason:* labels — a shape that can never actually
+    #     occur on an escalating cycle — and so it passed even though
+    #     do_escalate() silently dropped the triggering reason from both its
+    #     own comment and run_cycle()'s [POOL-REFUSED-ESCALATED] Mayor mail
+    #     (found by gate review on fix-attempt 1). ---
     _rf_mutations.clear()
     subprocess.run = _stub_run_rf
     try:
-        do_escalate(
+        _rf13_result = do_escalate(
             "ga-refused1", "some bead", reclaim_count=1, idle_min=10.0,
             labels=["story:in-flight", "pilot:refused-reason:cross-rig-framework",
-                    "pilot:refused-reason:hex-notebook-native"],
+                    "pilot:refusal-count:1", "pool:refused:hex-notebook-native"],
             has_explicit_refusal=True, refusal_count=1,
         )
         check("RF-13a: do_escalate adds gate:needs-human:refused when refusal-triggered",
@@ -3601,11 +3688,34 @@ def _selftest():
         check("RF-13c: do_escalate emits exactly ONE comment (not both the generic and refusal-specific text)",
               len(_rf_comment_calls) == 1,
               f"comment_calls={_rf_comment_calls!r}")
-        check("RF-13d: do_escalate's comment quotes BOTH accumulated refusal reasons verbatim (Mayor needs no re-investigation)",
+        check("RF-13d (GATE-FEEDBACK regression anchor): do_escalate's comment quotes BOTH "
+              "the already-promoted reason AND the still-fresh triggering reason verbatim "
+              "(pre-fix, hex-notebook-native — the reason that CAUSED this escalation — was "
+              "silently absent here)",
               len(_rf_comment_calls) == 1
               and "cross-rig-framework" in _rf_comment_calls[0][-1]
               and "hex-notebook-native" in _rf_comment_calls[0][-1],
               f"comment_calls={_rf_comment_calls!r}")
+        check("RF-13e: do_escalate consumes the fresh pool:refused:<reason> marker (removed, not left stale)",
+              ["bd", "label", "remove", "ga-refused1", "pool:refused:hex-notebook-native", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+        check("RF-13f: do_escalate promotes the fresh marker into a PERMANENT pilot:refused-reason:<slug> label",
+              ["bd", "label", "add", "ga-refused1", "pilot:refused-reason:hex-notebook-native", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+        check("RF-13g (GATE-FEEDBACK regression anchor): do_escalate bumps pilot:refusal-count "
+              "1 → 2 on the triggering cycle (pre-fix this bump lived ONLY inside do_reclaim(), "
+              "which never runs on an escalating cycle — refusal-count stayed permanently "
+              "under-counted by one)",
+              ["bd", "label", "remove", "ga-refused1", "pilot:refusal-count:1", "-q"] in _rf_mutations
+              and ["bd", "label", "add", "ga-refused1", "pilot:refusal-count:2", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+        check("RF-13h: do_escalate returns the complete reason list (both reasons) so run_cycle's "
+              "[POOL-REFUSED-ESCALATED] Mayor mail can reuse it instead of re-deriving (and "
+              "re-dropping) it from the stale pre-promotion labels",
+              isinstance(_rf13_result, list)
+              and "cross-rig-framework" in _rf13_result
+              and "hex-notebook-native" in _rf13_result,
+              f"result={_rf13_result!r}")
     finally:
         subprocess.run = _orig_run_rf
 
@@ -3616,7 +3726,7 @@ def _selftest():
     _rf_mutations.clear()
     subprocess.run = _stub_run_rf
     try:
-        do_escalate(
+        _rf14_result = do_escalate(
             "ga-dead1", "some other bead", reclaim_count=MAX_RECLAIMS, idle_min=40.0,
             labels=["story:in-flight", "pilot:dispatched"],
         )
@@ -3631,6 +3741,8 @@ def _selftest():
               len(_rf_comment_calls2) == 1 and "ga-6ow4v" in _rf_comment_calls2[0][-1]
               and "reclaim cap" in _rf_comment_calls2[0][-1],
               f"comment_calls={_rf_comment_calls2!r}")
+        check("RF-14d: do_escalate (no refusal) returns an empty reason list (no promotion helper call)",
+              _rf14_result == [], f"result={_rf14_result!r}")
     finally:
         subprocess.run = _orig_run_rf
 
