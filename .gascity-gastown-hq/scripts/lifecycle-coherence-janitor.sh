@@ -33,6 +33,16 @@ LCJ_ENABLED="${LCJ_ENABLED:-1}"
 BD="${LCJ_BD:-bd}"
 LOG="${LCJ_LOG:-/Users/athos/gt/.gascity-gastown-hq/.gc/logs/lifecycle-coherence-janitor.log}"
 LCJ_NOTIFY="${LCJ_NOTIFY:-/Users/athos/.local/bin/notify}"
+# ga-hn34 (2026-07-14): cancellation/obsolescence keyword regex tested against a closed
+# bead's close_reason by R1/R5 below. Nothing enforces stamping story:cancelled AT
+# close-time — there is no dedicated cancel path anywhere; cancellation today is just a
+# plain `bd close -r "<prose reason>"`. Without this, a closed bead that still carries an
+# active lifecycle label falls through to R1/R5's default of story:done, silently
+# converting an intentional cancellation into a fake completion (confirmed live: wa-flba
+# + 4 siblings, data-fixed under ga-9pj4). Mirrors LCA_SUPPRESS_RE, added to
+# lifecycle-correctness-auditor.sh by that same bug — that fix suppresses a downstream
+# FALSE-CLOSE warning; this one fixes the mislabeling at its source instead.
+LCJ_CANCEL_RE="${LCJ_CANCEL_RE:-obsolet[oa]|obsolete|cancelad[oa]|cancell?ed|descomission|decommission|discontinu|deprecat}"
 # imp10: per-bead lifecycle advisory lock. Any process that will mutate lifecycle labels
 # on a specific bead should create $LIFECYCLE_LOCK_DIR/<bead-id> (containing "pid:epoch")
 # with a TTL of LIFECYCLE_LOCK_TTL seconds. The janitor skips any bead with a fresh lock,
@@ -171,11 +181,26 @@ run_sweep() {
     # "várias coisas em aprovados que já foram implementadas"). A bead explicitly marked
     # story:cancelled is left cancelled (never re-labelled done).
     for lbl in story:in-flight story:approved; do
-      for id in $("$BD" -C "$store" list -l "$lbl" --status closed --json -n 0 2>/dev/null \
-                  | jq -r '.[] | select(([.labels[]?]|index("story:cancelled"))|not) | .id' 2>/dev/null); do
+      local _r1_list; _r1_list=$("$BD" -C "$store" list -l "$lbl" --status closed --json -n 0 2>/dev/null)
+      for id in $(printf '%s' "$_r1_list" | jq -r --arg re "$LCJ_CANCEL_RE" \
+                  '.[] | select(([.labels[]?]|index("story:cancelled"))|not)
+                       | select(((.close_reason // "") | test($re; "i")) | not)
+                       | .id' 2>/dev/null); do
         [ -n "$id" ] || continue
         _strip "$store" "$id" "$lbl"; _strip "$store" "$id" pilot:dispatched; _add "$store" "$id" story:done
         log "R1 closed-vestigial: $id ($(basename "$store")) — stripped $lbl, set story:done"; n=$((n+1))
+      done
+      # ga-hn34: close_reason carries a cancellation/obsolescence keyword but the
+      # story:cancelled label was never applied (no dedicated cancel path stamps it
+      # atomically at close-time) — land on story:cancelled instead of the story:done
+      # default, so a label-less cancel is never silently converted into a fake completion.
+      for id in $(printf '%s' "$_r1_list" | jq -r --arg re "$LCJ_CANCEL_RE" \
+                  '.[] | select(([.labels[]?]|index("story:cancelled"))|not)
+                       | select((.close_reason // "") | test($re; "i"))
+                       | .id' 2>/dev/null); do
+        [ -n "$id" ] || continue
+        _strip "$store" "$id" "$lbl"; _strip "$store" "$id" pilot:dispatched; _add "$store" "$id" story:cancelled
+        log "R1 closed-vestigial-cancelled (ga-hn34): $id ($(basename "$store")) — stripped $lbl, close_reason matched cancellation keywords, set story:cancelled"; n=$((n+1))
       done
     done
 
@@ -270,8 +295,11 @@ run_sweep() {
     # ctx:ready was missing. A closed bead carrying ctx:ready shows up in the Aprovadas
     # column (which unions story:approved + ctx:ready) as a zombie card. Same exclusion as
     # R1: a story:cancelled bead stays cancelled, never re-labelled done.
-    for id in $("$BD" -C "$store" list -l ctx:ready --status closed --json -n 0 2>/dev/null \
-                | jq -r '.[] | select(([.labels[]?]|index("story:cancelled"))|not) | .id' 2>/dev/null); do
+    local _r5_list; _r5_list=$("$BD" -C "$store" list -l ctx:ready --status closed --json -n 0 2>/dev/null)
+    for id in $(printf '%s' "$_r5_list" | jq -r --arg re "$LCJ_CANCEL_RE" \
+                '.[] | select(([.labels[]?]|index("story:cancelled"))|not)
+                     | select(((.close_reason // "") | test($re; "i")) | not)
+                     | .id' 2>/dev/null); do
       [ -n "$id" ] || continue
       _bead_locked "$id" && { log "R5 skip-locked (imp10): $id — advisory lock active"; continue; }
       # Skip if already has story:done (idempotent safety)
@@ -280,6 +308,18 @@ run_sweep() {
           >/dev/null 2>&1; then continue; fi
       _strip "$store" "$id" ctx:ready; _strip "$store" "$id" pilot:dispatched; _add "$store" "$id" story:done
       log "R5 ctx-ready-vestigial: $id ($(basename "$store")) — stripped ctx:ready, set story:done"; n=$((n+1))
+    done
+    # ga-hn34: close_reason carries a cancellation/obsolescence keyword but the
+    # story:cancelled label was never applied — land on story:cancelled instead of the
+    # story:done default (mirrors the R1 cancel-keyword check above).
+    for id in $(printf '%s' "$_r5_list" | jq -r --arg re "$LCJ_CANCEL_RE" \
+                '.[] | select(([.labels[]?]|index("story:cancelled"))|not)
+                     | select((.close_reason // "") | test($re; "i"))
+                     | .id' 2>/dev/null); do
+      [ -n "$id" ] || continue
+      _bead_locked "$id" && { log "R5 skip-locked-cancelled (imp10): $id — advisory lock active"; continue; }
+      _strip "$store" "$id" ctx:ready; _strip "$store" "$id" pilot:dispatched; _add "$store" "$id" story:cancelled
+      log "R5 ctx-ready-vestigial-cancelled (ga-hn34): $id ($(basename "$store")) — stripped ctx:ready, close_reason matched cancellation keywords, set story:cancelled"; n=$((n+1))
     done
 
     # R7 (wa-muesb, 3rd recurrence of this leak class: wa-o4kuh, wa-06yog, wa-8yw4i.1): a
@@ -445,13 +485,13 @@ if [ "${1:-}" = "--selftest" ]; then
 #!/usr/bin/env bash
 a="\$*"
 case "\$a" in
-  *"list -l story:in-flight --status closed"*)  echo '[{"id":"cl-1"},{"id":"cl-2"}]' ;;
-  *"list -l story:approved --status closed"*)   echo '[{"id":"ca-1"},{"id":"ca-cancel","labels":["story:cancelled","story:approved"]}]' ;;
+  *"list -l story:in-flight --status closed"*)  echo '[{"id":"cl-1"},{"id":"cl-2"},{"id":"cl-byreason","close_reason":"Obsoleto pelo pivo on-device — descomissionamento do Whapi/proxy"}]' ;;
+  *"list -l story:approved --status closed"*)   echo '[{"id":"ca-1"},{"id":"ca-cancel","labels":["story:cancelled","story:approved"]},{"id":"ca-byreason","close_reason":"CANCELLED — requirements changed, replaced by ga-xyz"}]' ;;
   *"list -l story:in-flight --status blocked"*) echo '[{"id":"bl-1"}]' ;;
   *"list --status in_progress"*)                echo '[{"id":"ip-noasg","assignee":"","updated_at":"2020-01-01T00:00:00Z"},{"id":"ip-fresh","assignee":"","updated_at":"'"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"'"},{"id":"ip-asg","assignee":"mila-wa"},{"id":"ip-gate-active","assignee":"","updated_at":"2020-01-01T00:00:00Z"}]' ;;
   *"list -l story:approved --status open"*)     echo '[{"id":"r4-asg","assignee":"mila-wa","labels":["story:approved"]},{"id":"r4-human","assignee":"mila-wa","labels":["story:approved","gate:needs-human:foo"]},{"id":"r4-human-bare","assignee":"mila-wa","labels":["story:approved","gate:needs-human"]}]' ;;
   *"list -l ctx:ready --status open"*)          echo '[]' ;;
-  *"list -l ctx:ready --status closed"*)        echo '[{"id":"r5","labels":["ctx:ready"]},{"id":"r5-locked","labels":["ctx:ready"]},{"id":"r5-cancel","labels":["ctx:ready","story:cancelled"]}]' ;;
+  *"list -l ctx:ready --status closed"*)        echo '[{"id":"r5","labels":["ctx:ready"]},{"id":"r5-locked","labels":["ctx:ready"]},{"id":"r5-cancel","labels":["ctx:ready","story:cancelled"]},{"id":"r5-byreason","labels":["ctx:ready"],"close_reason":"discontinued: replaced by wa-xyz redesign"}]' ;;
   *"show r5 "*|*"show r5-locked "*)             echo '[{"id":"r5","labels":["ctx:ready"]}]' ;;
   # R6 (imp19): r6-exp has an expired held-until; r6-noexp has pilot:held but no expiry
   *"list -l pilot:held"*)                       echo '[{"id":"r6-exp","labels":["pilot:held","pilot:held-until:1000000"]},{"id":"r6-noexp","labels":["pilot:held"]}]' ;;
@@ -523,6 +563,11 @@ NOTIFYSHIM
   grep -q 'label add cl-1 story:done'         "$ACT" && ok "R1: closed bead transitioned to story:done"       || bad "R1 did not set story:done"
   grep -q 'label remove ca-1 story:approved'  "$ACT" && ok "R1: closed+story:approved → stripped (Aprovadas pollution fix)" || bad "R1 approved-vestigial not stripped"
   grep -q 'ca-cancel'                         "$ACT" && bad "TOUCHED a story:cancelled closed bead (must stay cancelled)" || ok "left the story:cancelled closed bead alone"
+  grep -q 'label remove cl-byreason story:in-flight' "$ACT" && ok "R1 (ga-hn34): closed+story:in-flight w/ cancellation close_reason → still stripped the active label" || bad "R1 (ga-hn34) did not strip story:in-flight on cl-byreason"
+  grep -q 'label add cl-byreason story:cancelled'    "$ACT" && ok "R1 (ga-hn34): close_reason matched a cancellation keyword → set story:cancelled instead of story:done" || bad "R1 (ga-hn34) did not set story:cancelled on cl-byreason"
+  grep -q 'label add cl-byreason story:done'         "$ACT" && bad "R1 (ga-hn34): mislabeled a cancelled-by-close_reason bead story:done — the exact silent mislabeling this fix exists to prevent" || ok "R1 (ga-hn34): did not mislabel cl-byreason story:done"
+  grep -q 'label add ca-byreason story:cancelled'    "$ACT" && ok "R1 (ga-hn34): keyword match is case-insensitive (CANCELLED, uppercase) and works on the story:approved path too" || bad "R1 (ga-hn34) did not set story:cancelled on ca-byreason (case-insensitivity or story:approved path broken)"
+  grep -q 'label add ca-byreason story:done'         "$ACT" && bad "R1 (ga-hn34): mislabeled ca-byreason story:done" || ok "R1 (ga-hn34): did not mislabel ca-byreason story:done"
   grep -q 'label remove bl-1 story:in-flight' "$ACT" && ok "R2: blocked+story:in-flight → stripped"           || bad "R2 not stripped"
   grep -q 'update ip-noasg --status open'     "$ACT" && ok "R3: STALE in_progress + no assignee → status=open" || bad "R3 not opened"
   grep -q 'ip-fresh'                          "$ACT" && bad "R3 flipped a FRESH in_progress bead (routed-pool race!)" || ok "R3: fresh in_progress + no assignee → LEFT ALONE (grace protects a live crew build)"
@@ -537,6 +582,9 @@ NOTIFYSHIM
   grep -q 'label add r5 story:done'           "$ACT" && ok "R5 (imp15): closed ctx:ready bead → set story:done" || bad "R5 did not set story:done"
   grep -q 'r5-locked'                         "$ACT" && bad "imp10: touched a lifecycle-locked bead (must be skipped)" || ok "imp10: skipped the advisory-locked bead (r5-locked)"
   grep -q 'r5-cancel'                         "$ACT" && bad "R5: TOUCHED a story:cancelled closed ctx:ready bead (must stay cancelled)" || ok "R5: left story:cancelled bead alone"
+  grep -q 'label remove r5-byreason ctx:ready'    "$ACT" && ok "R5 (ga-hn34): closed+ctx:ready w/ cancellation close_reason → still stripped ctx:ready" || bad "R5 (ga-hn34) did not strip ctx:ready on r5-byreason"
+  grep -q 'label add r5-byreason story:cancelled' "$ACT" && ok "R5 (ga-hn34): close_reason matched a cancellation keyword → set story:cancelled instead of story:done" || bad "R5 (ga-hn34) did not set story:cancelled on r5-byreason"
+  grep -q 'label add r5-byreason story:done'      "$ACT" && bad "R5 (ga-hn34): mislabeled a cancelled-by-close_reason bead story:done — the exact silent mislabeling this fix exists to prevent" || ok "R5 (ga-hn34): did not mislabel r5-byreason story:done"
   grep -q 'dolt commit'                       "$ACT" && ok "commits the Dolt working set (auto-commit off → else strips invisible to painel)" || bad "did NOT commit → normalization invisible to readers"
 
   # R7 (wa-muesb — historical recurrences, pattern coverage, and the two gate-flagged bugs)
