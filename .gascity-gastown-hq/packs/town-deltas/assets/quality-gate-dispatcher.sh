@@ -1148,6 +1148,33 @@ gate_fail_assignee_action() {
   fi
 }
 
+# author_is_alive <author> — canonical liveness check for a gate marker's
+# AUTHOR. Echoes 1 if AUTHOR matches session_name, name, alias, id, or
+# agent_name of a live (non-closed) `gc session list` entry; 0 otherwise
+# (including an empty AUTHOR). ga-ipf6: the rebase-path AUTHOR_ALIVE check
+# used a narrower ad-hoc predicate (alias/name/agent only — .agent isn't even
+# a real field on session-list entries, and no closed filter) than
+# FAIL_AUTHOR_ALIVE's canonical one. AUTHOR is recorded in session_name form
+# (<agent>-<sessionid>, e.g. peter-wa-ga2gnr), so the narrower predicate NEVER
+# matched — every live author hitting the rebase path read as dead (100%
+# false-dead; an earlier fix, ga-jyox, corrected only the FAIL call site).
+# Single source of truth now for BOTH call sites so they cannot diverge again.
+author_is_alive() {
+  local author="${1:-}"
+  [ -z "$author" ] && { echo 0; return 0; }
+  if gc --city "$GC_CITY" session list --json 2>/dev/null \
+       | jq -e --arg a "$author" \
+           '[(if type=="array" then . else (.sessions // []) end)[]
+             | select(.closed != true)
+             | (.session_name, .name, .alias, .id, .agent_name)]
+            | map(select(. != null and . != ""))
+            | index($a) != null' >/dev/null 2>&1; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
 # above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
 # GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
@@ -2487,14 +2514,11 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     #      a human-or-Mayor-driven resolution happens — but we NEVER silently strand.
     MAX_REBASE_ATTEMPTS=3
 
-    AUTHOR_ALIVE=0
-    if [ -n "$AUTHOR" ]; then
-      if gc --city "$GC_CITY" session list --json 2>/dev/null \
-           | jq -e --arg a "$AUTHOR" 'if type=="array" then . else (.sessions // []) end
-                 | map(select((.alias==$a) or (.name==$a) or (.agent==$a))) | length > 0' >/dev/null 2>&1; then
-        AUTHOR_ALIVE=1
-      fi
-    fi
+    # ga-ipf6: unified with FAIL_AUTHOR_ALIVE via author_is_alive() — the old
+    # inline predicate here (alias/name/agent only, no session_name) never
+    # matched AUTHOR's actual session_name form, so every live author was
+    # misread as dead on this path.
+    AUTHOR_ALIVE=$(author_is_alive "$AUTHOR")
 
     # Read current rebase-attempt counter from the marker labels.
     REBASE_ATTEMPT=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null \
@@ -4362,18 +4386,10 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       # ga-jyox: a live named-crew author (long-lived session, e.g. thies-wa) must
       # KEEP ownership on FAIL instead of being cleared — see gate_fail_assignee_action
       # above for the full rationale (ga-1url/ga-u4yi double-dispatch collision).
-      FAIL_AUTHOR_ALIVE=0
-      if [ -n "$AUTHOR" ]; then
-        if gc --city "$GC_CITY" session list --json 2>/dev/null \
-             | jq -e --arg a "$AUTHOR" \
-                 '[(if type=="array" then . else (.sessions // []) end)[]
-                   | select(.closed != true)
-                   | (.session_name, .name, .alias, .id, .agent_name)]
-                  | map(select(. != null and . != ""))
-                  | index($a) != null' >/dev/null 2>&1; then
-          FAIL_AUTHOR_ALIVE=1
-        fi
-      fi
+      # ga-ipf6: unified with the rebase-path AUTHOR_ALIVE via author_is_alive()
+      # — this call site's predicate was already canonical; it is now the
+      # single source of truth both paths share.
+      FAIL_AUTHOR_ALIVE=$(author_is_alive "$AUTHOR")
       GATE_FAIL_ASSIGNEE_ACTION=$(gate_fail_assignee_action "$AUTHOR" "$FAIL_AUTHOR_ALIVE")
 
       if [ "$GATE_FAIL_ASSIGNEE_ACTION" = "keep" ]; then
