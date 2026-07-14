@@ -1657,8 +1657,12 @@ def deferred_requeue_verdict(age_sec, threshold_sec, source_resolved, source_clo
                                human/automation doing a partial manual recovery) or the
                                source bead's own fields time to land before we intervene
       skip:parked-needs-human— source carries gate:needs-human → deliberately parked
-      requeue                — source resolved AND now has a derivable author field →
-                               worth another dispatcher pass (it re-derives AUTHOR itself)
+      requeue                — has_derivable_author is True (the marker's own
+                               gate.submitted_by, set by a partial manual recovery,
+                               counts on its own — it does NOT require source_resolved;
+                               that's exactly the ga-wisp-5zki27 scenario this fix exists
+                               for) → worth another dispatcher pass (it re-derives AUTHOR
+                               itself)
       escalate:oscillating   — attempts exhausted while author WAS derivable (the
                                dispatcher keeps re-deferring for some other reason) →
                                stop looping, page a human
@@ -1675,7 +1679,14 @@ def deferred_requeue_verdict(age_sec, threshold_sec, source_resolved, source_clo
         return "skip:young"
     if source_resolved and source_needs_human:
         return "skip:parked-needs-human"
-    resolvable = source_resolved and has_derivable_author
+    # has_derivable_author already folds source_resolved into its own OR (the caller
+    # sets it True from EITHER the marker's own gate.submitted_by OR a resolved source
+    # bead's author fields) — re-ANDing source_resolved here double-counts that check
+    # and wrongly denies resolvability when the source is unresolved but the marker
+    # already carries gate.submitted_by (GATE-FEEDBACK ga-wisp-d9fqvt, gate_run
+    # ga-y1kk attempt 1: verified false "skip:unresolvable"/"close:unresolvable" with
+    # a close reason that falsely claimed gate.submitted_by was absent).
+    resolvable = has_derivable_author
     if attempts >= max_attempts:
         return "escalate:oscillating" if resolvable else "close:unresolvable"
     return "requeue" if resolvable else "skip:unresolvable"
@@ -2823,6 +2834,8 @@ def _selftest():
     ok(deferred_requeue_verdict(600, D, False, False, False, False, 0, 3) == "skip:unresolvable", "source unresolved (bead lookup failed), attempts remain → wait, never close on one blip")
     ok(deferred_requeue_verdict(600, D, False, False, False, False, 3, 3) == "close:unresolvable", "source unresolved across max_attempts sweeps → genuinely gone (ga-y1kk: 'bead também sumiu') → close with explicit reason")
     ok(deferred_requeue_verdict(600, D, True, False, False, False, 3, 3) == "close:unresolvable", "source resolved but NEVER grew a derivable author across max_attempts → also terminal close (never oscillate — it never had one to lose)")
+    ok(deferred_requeue_verdict(600, D, False, False, False, True, 0, 3) == "requeue", "GATE-FEEDBACK gate_run=ga-wisp-d9fqvt attempt 1: source UNRESOLVED (transient query failure or genuinely gone) but marker already carries gate.submitted_by (has_derivable_author=True from the marker's OWN metadata, independent of source resolution — exactly ga-wisp-5zki27's manual-recovery scenario) → requeue, NOT skip:unresolvable")
+    ok(deferred_requeue_verdict(600, D, False, False, False, True, 3, 3) == "escalate:oscillating", "same source-unresolved+gate.submitted_by-present marker, attempts now exhausted → escalate (an author WAS derivable the whole time), never close:unresolvable with a reason that would falsely claim gate.submitted_by is absent")
     # ga-c1s8 — _bead_id_prefix, the fallback rig-resolution key when bead-rig: is absent
     ok(_bead_id_prefix("wa-10srb") == "wa", "wa-10srb -> wa (the ga-c1s8 marker's WA-rig source bead)")
     ok(_bead_id_prefix("ga-wisp-me6y20") == "ga", "ga-wisp-me6y20 -> ga (split on the FIRST hyphen only)")
