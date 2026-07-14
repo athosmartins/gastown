@@ -30,7 +30,9 @@ ENABLED="${GATEFIX_RECOVERY_ENABLED:-1}"
 DRY_RUN="${GATEFIX_RECOVERY_DRY_RUN:-0}"
 MAX_PER_SWEEP="${GATEFIX_RECOVERY_MAX_PER_SWEEP:-10}"
 case "$MAX_PER_SWEEP" in ''|*[!0-9]*) MAX_PER_SWEEP=10 ;; esac
+NOTIFY="${GATEFIX_RECOVERY_NOTIFY:-/Users/athos/.local/bin/notify}"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+notify_fail() { "$NOTIFY" -t "Gatefix Deadworker Recovery" -p 4 "🚨 $*" 2>/dev/null || true; }
 
 # ── PURE DECISION (selftest-sourceable) ───────────────────────────────────────
 # gatefix_recovery_decide <has_needs_fix 0|1> <in_flight 0|1> <session_name> <live_set>
@@ -49,8 +51,8 @@ gatefix_recovery_decide() {
 # Lib-only: stop before the live sweep so the selftest can source the pure function.
 [ "${GATEFIX_RECOVERY_LIB_ONLY:-0}" = "1" ] && return 0 2>/dev/null
 
-command -v gc >/dev/null 2>&1 || { printf '{"ts":"%s","event":"noop","reason":"no_gc"}\n' "$(ts)" >> "$LOG" 2>/dev/null; exit 0; }
-command -v bd >/dev/null 2>&1 || { printf '{"ts":"%s","event":"noop","reason":"no_bd"}\n' "$(ts)" >> "$LOG" 2>/dev/null; exit 0; }
+command -v gc >/dev/null 2>&1 || { printf '{"ts":"%s","event":"noop","reason":"no_gc"}\n' "$(ts)" >> "$LOG" 2>/dev/null; notify_fail "gatefix-deadworker-recovery: comando 'gc' nao encontrado no PATH — recuperacao de worker morto parada"; exit 0; }
+command -v bd >/dev/null 2>&1 || { printf '{"ts":"%s","event":"noop","reason":"no_bd"}\n' "$(ts)" >> "$LOG" 2>/dev/null; notify_fail "gatefix-deadworker-recovery: comando 'bd' nao encontrado no PATH — recuperacao de worker morto parada"; exit 0; }
 
 # ── live session identifiers (state NOT asleep/drained/dead/closed) ───────────
 LIVE_SESSIONS="$(gc session list --json 2>/dev/null | python3 -c '

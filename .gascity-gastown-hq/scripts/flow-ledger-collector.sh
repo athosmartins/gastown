@@ -43,6 +43,9 @@ PILOT_LOG="${CITY}/.gc/logs/pilot-dispatcher.log"
 GATE_LOG="${CITY}/.gc/logs/quality-gate-dispatcher.log"
 REFINO_LOG="${CITY}/.gc/logs/refino-gate-dispatcher.log"
 
+NOTIFY="${FLC_NOTIFY:-/Users/athos/.local/bin/notify}"
+notify_fail() { "$NOTIFY" -t "Flow Ledger Collector" -p 4 "🚨 $*" 2>/dev/null || true; }
+
 # ── source ledger helper ──────────────────────────────────────────────────────
 # shellcheck source=gc-ledger.sh
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,6 +54,7 @@ if [[ -f "${_SCRIPT_DIR}/gc-ledger.sh" ]]; then
   source "${_SCRIPT_DIR}/gc-ledger.sh"
 else
   echo "[flow-ledger-collector] FATAL: gc-ledger.sh not found in ${_SCRIPT_DIR}" >&2
+  notify_fail "flow-ledger-collector: gc-ledger.sh nao encontrado em ${_SCRIPT_DIR} — coletor nao pode iniciar"
   exit 1
 fi
 
@@ -131,6 +135,7 @@ write_snapshot() {
 
   gc_ledger_append "$LEDGER_NAME" "$json" || {
     echo "[flow-ledger-collector] WARN: ledger write failed (continuing)" >&2
+    notify_fail "flow-ledger-collector: falha ao escrever no ledger (snapshot perdido, coletor continua)"
   }
 }
 
@@ -168,6 +173,14 @@ _selftest() {
   export FLC_LOOP="0"
   export FLC_ENABLED="1"
   export WINDOW_SEC="3600"   # broad window for test log fixtures
+
+  NOTIFY_LOG="$TMP/notify.log"
+  cat > "$TMP/notify" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$NOTIFY_LOG"
+EOF
+  chmod +x "$TMP/notify"
+  export NOTIFY="$TMP/notify"
 
   echo "=== flow-ledger-collector.sh --selftest ==="
 
@@ -275,6 +288,30 @@ print('fields:', list(d.keys()))
     bad "T8: DRY_RUN=1 wrote unexpectedly ($before_size→$after_size lines)"
   fi
   export FLC_DRY_RUN="0"
+
+  # T9: ledger write failure → must notify (ga-4zpf), not silently swallow
+  : > "$NOTIFY_LOG"
+  gc_ledger_append() { return 1; }  # force a write failure
+  write_snapshot
+  if grep -qi 'flow-ledger-collector' "$NOTIFY_LOG" 2>/dev/null; then
+    ok "T9: ledger write failure → notified (ga-4zpf)"
+  else
+    bad "T9: ledger write failure did NOT notify — silent data loss (ga-4zpf regression)"
+  fi
+
+  # T10: gc-ledger.sh missing at startup → must notify (ga-4zpf). This FATAL check runs
+  # at top-level script load, before _selftest is reachable, so exercise it via a real
+  # subprocess in an isolated dir that lacks the sibling gc-ledger.sh.
+  : > "$NOTIFY_LOG"
+  local ISO_TMP; ISO_TMP="$(mktemp -d)"
+  cp "${BASH_SOURCE[0]}" "$ISO_TMP/flow-ledger-collector.sh"
+  FLC_NOTIFY="$TMP/notify" bash "$ISO_TMP/flow-ledger-collector.sh" --once >/dev/null 2>&1 || true
+  if grep -qi 'gc-ledger' "$NOTIFY_LOG" 2>/dev/null; then
+    ok "T10: gc-ledger.sh missing at startup → notified (ga-4zpf)"
+  else
+    bad "T10: gc-ledger.sh missing did NOT notify — silent startup failure (ga-4zpf regression)"
+  fi
+  rm -rf "$ISO_TMP"
 
   echo ""
   echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="

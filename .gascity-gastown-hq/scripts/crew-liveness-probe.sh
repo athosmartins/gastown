@@ -49,9 +49,11 @@ BD="${CLP_BD:-bd}"
 GC="${CLP_GC:-gc}"
 LOG="${CLP_LOG:-/Users/athos/gt/.gascity-gastown-hq/.gc/logs/crew-liveness-probe.log}"
 CLP_STATE_DIR="${CLP_STATE_DIR:-/Users/athos/gt/.gascity-gastown-hq/.gc/clp-state}"
+CLP_NOTIFY="${CLP_NOTIFY:-/Users/athos/.local/bin/notify}"
 
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
+notify_fail() { "$CLP_NOTIFY" -t "Crew Liveness Probe" -p 4 "🚨 $*" 2>/dev/null || true; }
 
 _nudge() {  # crew-id bead-id
   [ "$CLP_DRY_RUN" = "1" ] && { log "  DRY: would nudge $1 about bead $2"; return 0; }
@@ -93,7 +95,7 @@ _heal() {
   # the crew is wedged. The crew can be resumed manually via `gc agent resume <name>`.
   "$GC" -C /Users/athos/gt/.gascity-gastown-hq agent suspend "$crew" 2>/dev/null \
     && log "  HEAL: suspended crew agent $crew" \
-    || log "  HEAL WARN: failed to suspend crew agent $crew (may not be a city agent)"
+    || { log "  HEAL WARN: failed to suspend crew agent $crew (may not be a city agent)"; notify_fail "crew-liveness-probe: falha ao suspender crew $crew apos heal do bead $bead — crew wedged pode ser re-despachado"; }
 }
 
 _live_sessions() {
@@ -207,7 +209,14 @@ if [ "${1:-}" = "--selftest" ]; then
   NUDGE_LOG="$TMP/nudges"
   HEAL_LOG="$TMP/heals"
   SUSPEND_LOG="$TMP/suspends"
-  : > "$NUDGE_LOG"; : > "$HEAL_LOG"; : > "$SUSPEND_LOG"
+  NOTIFY_LOG="$TMP/notifies"
+  : > "$NUDGE_LOG"; : > "$HEAL_LOG"; : > "$SUSPEND_LOG"; : > "$NOTIFY_LOG"
+
+  cat > "$TMP/notify" <<NOTIFYSHIM
+#!/usr/bin/env bash
+echo "\$*" >> "${NOTIFY_LOG}"
+NOTIFYSHIM
+  chmod +x "$TMP/notify"
 
   # Stale bead (updated 20 min ago), live crew
   STALE_TS=$(date -u -r $(( NOW_ST - 1200 )) "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
@@ -233,7 +242,7 @@ BDSHIM
 case "\$*" in
   *"session list --json"*) echo '[{"name":"mila-wa"}]' ;;
   *"nudge"*) echo "\$*" >> "${NUDGE_LOG}" ;;
-  *"agent suspend"*) echo "\$*" >> "${SUSPEND_LOG}" ;;
+  *"agent suspend"*) [ -f "${TMP}/fail_suspend" ] && exit 1; echo "\$*" >> "${SUSPEND_LOG}" ;;
   *) true ;;
 esac
 GCSHIM
@@ -243,6 +252,7 @@ GCSHIM
   CLP_STORES="$TMP"
   LOG="$TMP/log"
   CLP_STATE_DIR="$TMP/state"
+  CLP_NOTIFY="$TMP/notify"
   CLP_ENABLED=1; CLP_PROBE_STALE_MIN=15; CLP_DRY_RUN=0
   CLP_HEAL_ENABLED=0; CLP_CONFIRM_MIN=8
 
@@ -315,6 +325,16 @@ GCSHIM
   [ -s "$HEAL_LOG" ] && bad "7: HEAL_ENABLED=0: heal actions ran" || ok "7: HEAL_ENABLED=0: no heal"
   [ -s "$SUSPEND_LOG" ] && bad "7: HEAL_ENABLED=0: suspend ran" || ok "7: HEAL_ENABLED=0: no suspend"
   grep -q 'wa-stale' "$NUDGE_LOG" && ok "7: HEAL_ENABLED=0: re-nudged confirmed-wedged crew" || bad "7: HEAL_ENABLED=0: expected re-nudge"
+
+  echo ""
+  echo "=== Scenario 8: HEAL suspend fails — must notify (silence-is-not-success, ga-4zpf) ==="
+  : > "$NUDGE_LOG"; : > "$HEAL_LOG"; : > "$SUSPEND_LOG"; : > "$NOTIFY_LOG"
+  touch "$TMP/fail_suspend"
+  CLP_ENABLED=1; CLP_HEAL_ENABLED=1; CLP_PROBE_STALE_MIN=15
+  echo $(( NOW_ST - (8 * 60 + 60) )) > "$TMP/state/wa-stale__mila-wa.nudged"
+  run_probe
+  grep -q 'crew-liveness-probe' "$NOTIFY_LOG" && ok "8: notify_fail fired when HEAL's suspend step failed (ga-4zpf)" || bad "8: HEAL suspend failure did NOT notify — silent failure (ga-4zpf regression)"
+  rm -f "$TMP/fail_suspend"
 
   echo ""
   echo "crew-liveness-probe selftest: PASS=$PASS FAIL=$FAIL"

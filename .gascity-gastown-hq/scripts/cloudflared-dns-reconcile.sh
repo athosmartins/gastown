@@ -42,6 +42,9 @@ CLOUDFLARED="${CLOUDFLARED:-/opt/homebrew/bin/cloudflared}"
 CONFIG="${CLOUDFLARED_CONFIG:-/Users/athos/.cloudflared/urblink-ops.yml}"
 CERT="${CLOUDFLARE_CERT:-/Users/athos/.cloudflared/cert.pem}"
 LOG_FILE="${LOG_FILE:-/tmp/cloudflared-dns-reconcile.log}"
+NOTIFY="${CLOUDFLARED_NOTIFY:-/Users/athos/.local/bin/notify}"
+
+notify_fail() { "$NOTIFY" -t "Cloudflared DNS Reconcile" -p 4 "🚨 $*" 2>/dev/null || true; }
 
 log() {
   local line
@@ -56,16 +59,19 @@ log() {
 # --- Preflight ---
 if [[ ! -x "$CLOUDFLARED" ]]; then
   log "ERROR: cloudflared not found/executable at $CLOUDFLARED"
+  notify_fail "cloudflared DNS reconcile: binario cloudflared nao encontrado em $CLOUDFLARED"
   exit 1
 fi
 
 if [[ ! -f "$CONFIG" ]]; then
   log "ERROR: config not found at $CONFIG"
+  notify_fail "cloudflared DNS reconcile: config nao encontrado em $CONFIG"
   exit 1
 fi
 
 if [[ ! -f "$CERT" ]]; then
   log "ERROR: cert not found at $CERT"
+  notify_fail "cloudflared DNS reconcile: cert nao encontrado em $CERT"
   exit 1
 fi
 
@@ -73,6 +79,7 @@ fi
 TUNNEL_ID="$(awk -F': *' '/^tunnel:/{print $2; exit}' "$CONFIG" | tr -d '[:space:]')"
 if [[ -z "$TUNNEL_ID" ]]; then
   log "ERROR: could not parse tunnel id from $CONFIG"
+  notify_fail "cloudflared DNS reconcile: nao foi possivel extrair tunnel id de $CONFIG"
   exit 1
 fi
 
@@ -114,6 +121,7 @@ _creds="$(python3 -c "$_py_extract_creds" 2>&1)"
 
 if printf '%s\n' "$_creds" | grep -q '^ERROR:'; then
   log "ERROR: failed to extract Cloudflare credentials: $_creds"
+  notify_fail "cloudflared DNS reconcile: falha ao extrair credenciais do Cloudflare"
   exit 1
 fi
 
@@ -148,6 +156,7 @@ _reconcile_fallback() {
     fi
   done <<< "$YAML_HOSTS"
   log "reconcile done (fallback): created=$created already_ok=$ok failed=$failed"
+  [[ $failed -gt 0 ]] && notify_fail "cloudflared DNS reconcile (fallback): $failed/$yaml_count host(s) falharam ao criar rota DNS"
   [[ $failed -eq 0 ]]
 }
 
@@ -219,6 +228,7 @@ done <<< "$MISSING_HOSTS"
 
 already_ok=$((yaml_count - missing_count))
 log "reconcile done: created=$created already_ok=$already_ok failed=$failed"
+[[ $failed -gt 0 ]] && notify_fail "cloudflared DNS reconcile: $failed/$missing_count host(s) faltantes falharam ao criar rota DNS"
 
 # Exit non-zero only if a route actually failed, so launchd/monitoring can flag it.
 [[ $failed -eq 0 ]]

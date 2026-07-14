@@ -21,10 +21,12 @@ STATE_DIR="$CITY/.gc/state"
 OUT="$STATE_DIR/skill-drift.json"
 LOG_DIR="$CITY/.gc/logs"
 LOG="$LOG_DIR/skill-audit.log"
+NOTIFY="${SKILL_AUDIT_NOTIFY:-/Users/athos/.local/bin/notify}"
 
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
+notify_fail() { "$NOTIFY" -t "Skill Audit Emit" -p 4 "🚨 $*" 2>/dev/null || true; }
 
 # Capture JSON (stdout) regardless of exit code; the auditor prints valid JSON
 # even when it finds drift/off-path.
@@ -33,6 +35,7 @@ rc=$?
 
 if [[ -z "$json" ]]; then
     echo "[$(ts)] [skill-audit-emit] ERROR: auditor produced no JSON (rc=$rc)" >> "$LOG"
+    notify_fail "skill-audit-emit: auditor nao produziu JSON (rc=$rc) — metrica de skill-drift parada"
     exit 2
 fi
 
@@ -41,6 +44,7 @@ tmp="$(mktemp "$STATE_DIR/.skill-drift.XXXXXX")"
 printf '%s\n' "$json" > "$tmp" && mv -f "$tmp" "$OUT" || {
     rm -f "$tmp" 2>/dev/null
     echo "[$(ts)] [skill-audit-emit] ERROR: failed to write $OUT" >> "$LOG"
+    notify_fail "skill-audit-emit: falha ao escrever $OUT — metrica de skill-drift parada"
     exit 2
 }
 

@@ -32,6 +32,7 @@ LCJ_DRY_RUN="${LCJ_DRY_RUN:-0}"
 LCJ_ENABLED="${LCJ_ENABLED:-1}"
 BD="${LCJ_BD:-bd}"
 LOG="${LCJ_LOG:-/Users/athos/gt/.gascity-gastown-hq/.gc/logs/lifecycle-coherence-janitor.log}"
+LCJ_NOTIFY="${LCJ_NOTIFY:-/Users/athos/.local/bin/notify}"
 # imp10: per-bead lifecycle advisory lock. Any process that will mutate lifecycle labels
 # on a specific bead should create $LIFECYCLE_LOCK_DIR/<bead-id> (containing "pid:epoch")
 # with a TTL of LIFECYCLE_LOCK_TTL seconds. The janitor skips any bead with a fresh lock,
@@ -49,6 +50,7 @@ _bead_locked() {  # bead-id → return 0 if locked (fresh advisory lock exists),
 }
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
+notify_fail() { "$LCJ_NOTIFY" -t "Lifecycle Coherence Janitor" -p 4 "🚨 $*" 2>/dev/null || true; }
 
 _strip() {  # store id label
   [ "$LCJ_DRY_RUN" = "1" ] && { log "  DRY: would strip $3 from $2"; return 0; }
@@ -157,6 +159,9 @@ run_sweep() {
   # ga-ibz0: computed ONCE per sweep (same marker set regardless of which
   # store's beads R3/R7 are currently walking) — see _gate_active_beads above.
   local _gate_active; _gate_active=$(_gate_active_beads)
+  case "$_gate_active" in
+    *"$_GATE_UNKNOWN_SENTINEL"*) notify_fail "lifecycle-coherence-janitor: consulta de gate-markers FALHOU nesta sweep — protecoes R3/R7 degradadas (fail-safe ativo, bd/Dolt pode estar instavel)" ;;
+  esac
   for store in $LCJ_STORES; do
     [ -d "$store" ] || continue
 
@@ -497,8 +502,15 @@ case "\$a" in
 esac
 SHIM
   chmod +x "$TMP/bd"
+  NOTIFY_LOG="$TMP/notify.log"
+  cat > "$TMP/notify" <<NOTIFYSHIM
+#!/usr/bin/env bash
+echo "\$*" >> "${TMP}/notify.log"
+NOTIFYSHIM
+  chmod +x "$TMP/notify"
   # Reassign script vars DIRECTLY (top-level reads happen at LOAD, before this block).
   BD="$TMP/bd"; LCJ_STORES="$TMP"; LOG="$TMP/log"; LCJ_DRY_RUN=0; LCJ_ENABLED=1
+  LCJ_NOTIFY="$TMP/notify"
   LCJ_GATE_CITY="$TMP"  # ga-ibz0: route _gate_active_beads() through the same shim
   LIFECYCLE_LOCK_DIR="$TMP/.lifecycle-lock"
   LIFECYCLE_SWEEP_LOCK="$LIFECYCLE_LOCK_DIR/.janitor-sweep.lock"
@@ -564,9 +576,10 @@ SHIM
   # under the contention that makes false reclaims most likely (same guard-bug class fixed
   # twice elsewhere: ga-ap7od/ga-jfo7). On failure, R3/R7 must skip ALL mutations for the
   # sweep rather than proceed as if nothing were gated.
-  : > "$ACT"; export LCJ_TEST_GATE_FAIL=1; run_sweep; export LCJ_TEST_GATE_FAIL=0
+  : > "$ACT"; : > "$NOTIFY_LOG"; export LCJ_TEST_GATE_FAIL=1; run_sweep; export LCJ_TEST_GATE_FAIL=0
   grep -q 'update ip-noasg --status open' "$ACT" && bad "R3 fail-safe (ga-ibz0): fired despite a gate-active query FAILURE (should treat as protected, not as zero-active)" || ok "R3 fail-safe (ga-ibz0): gate-query failure → skipped mutation entirely"
   grep -q 'wa-o4kuh' "$ACT" && bad "R7 fail-safe (ga-ibz0): fired despite a gate-active query FAILURE (should treat as protected, not as zero-active)" || ok "R7 fail-safe (ga-ibz0): gate-query failure → skipped mutation entirely"
+  grep -q 'lifecycle-coherence-janitor' "$NOTIFY_LOG" && ok "gate-query failure (ga-4zpf): notified — R3/R7 protection degradation is not silent" || bad "gate-query failure (ga-4zpf): did NOT notify — silent degradation of R3/R7 protection (ga-4zpf regression)"
 
   # DRY-RUN makes no changes
   : > "$ACT"; LCJ_DRY_RUN=1; run_sweep

@@ -31,5 +31,21 @@ grep -q 'worktree remove --force' "$J" && ok "reaps orphan worktree" || bad "no 
 grep -q 'rev-parse --short' "$J" && ok "logs branch SHA before delete (recoverable)" || bad "no SHA logging"
 
 echo ""
+echo "── live-path: missing dependency → must notify, not die silently (ga-4zpf) ──"
+LIVE_TMP="$(mktemp -d)"
+NOTIFY_LOG="$LIVE_TMP/notify.log"
+cat > "$LIVE_TMP/notify" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$NOTIFY_LOG"
+EOF
+chmod +x "$LIVE_TMP/notify"
+env -i PATH=/usr/bin:/bin HOME="$HOME" \
+    GATEFIX_RECOVERY_NOTIFY="$LIVE_TMP/notify" \
+    GATEFIX_RECOVERY_LOG="$LIVE_TMP/run.log" \
+    bash "$J" >/dev/null 2>&1
+grep -qi 'gc' "$NOTIFY_LOG" 2>/dev/null && ok "live-path: missing gc dependency → notified (ga-4zpf)" || bad "live-path: missing gc dependency did NOT notify — silent failure (ga-4zpf regression)"
+rm -rf "$LIVE_TMP"
+
+echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ] || exit 1

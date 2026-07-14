@@ -42,7 +42,8 @@ RIG_STORES = [
     "/Users/athos/gt/whatsapp_automation",
     "/Users/athos/gt/property_scrapers",
 ]
-OUT = os.path.join(HQ, ".gc", "machine-utilization.jsonl")
+OUT = os.environ.get("UTIL_OUT", os.path.join(HQ, ".gc", "machine-utilization.jsonl"))
+NOTIFY = os.environ.get("UTIL_NOTIFY", "/Users/athos/.local/bin/notify")
 BUILD_FRESH_SEC = int(os.environ.get("UTIL_BUILD_FRESH_SEC", "7200"))  # 2h: matches Pilot stale-in-flight
 # Gate-stall threshold: a marker queued longer than this means the gate is NOT keeping
 # up — counted as gate-stalled even if one reviewer is breathing on another branch.
@@ -269,13 +270,25 @@ def sample():
     }
 
 
+def notify_fail(msg):
+    try:
+        subprocess.run([NOTIFY, "-t", "Machine Utilization Sampler", "-p", "4", f"🚨 {msg}"],
+                        capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
 def main():
-    rec = sample()
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    with open(OUT, "a") as f:
-        f.write(json.dumps(rec) + "\n")
-    if "--print" in sys.argv:
-        print(json.dumps(rec, indent=2))
+    try:
+        rec = sample()
+        os.makedirs(os.path.dirname(OUT), exist_ok=True)
+        with open(OUT, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        if "--print" in sys.argv:
+            print(json.dumps(rec, indent=2))
+    except Exception as e:
+        notify_fail(f"machine-utilization-sampler: crash inesperado — {type(e).__name__}: {e}")
+        raise
 
 
 if __name__ == "__main__":
