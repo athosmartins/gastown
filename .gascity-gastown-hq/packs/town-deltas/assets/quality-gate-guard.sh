@@ -370,6 +370,45 @@ resolve_author_agent_alias() {
   printf '%s' "$agent"
 }
 
+# session_matches_author <author> <sessions_json>
+# Pure predicate — canonical liveness check shared by GAP-1, GAP-2, and (via a
+# thin wrapper) quality-gate-dispatcher.sh's author_is_alive(). Echoes 1 iff
+# <author> matches the session_name, name, alias, id, or agent_name of some
+# non-closed session in <sessions_json>; 0 otherwise (empty author, no match,
+# or unparseable JSON). <sessions_json> may be a bare array or the
+# {"sessions":[...]} shape (both `gc session list --json` and its cache shim
+# emit the latter).
+#
+# ga-bnu1: GAP-1/GAP-2 used to run their OWN inline predicate here — an
+# any(...) test comparing just two fields (id, name) against the array
+# itself rather than iterating each element — which is doubly broken: (1) a
+# generator of "." over an array binds "." in the condition to the ARRAY
+# itself (not each element — iterating needs ".[]" instead), so it throws
+# "Cannot index array with string" on every non-empty session list,
+# silently falling back to a 3-way "uncertain" string the caller treats as
+# alive; (2) even fixed to iterate, checking only .id/.name misses the form
+# bd's `assignee` field actually stores — .session_name (e.g. the named-crew
+# form `gastown__mayor`, or the pool form `<agent>-<sessionid>`) — the exact
+# class of bug ga-ipf6 already fixed once for author_is_alive()'s two
+# dispatcher.sh call sites. A live named-crew author whose .name
+# ("gastown.mayor") differs from .session_name ("gastown__mayor") reads as
+# dead under the old predicate. Single source of truth now for all three call
+# sites so they cannot diverge again.
+session_matches_author() {
+  local author="${1:-}" sessions_json="${2:-}"
+  [ -z "$author" ] && { echo 0; return 0; }
+  if printf '%s' "$sessions_json" | jq -e --arg a "$author" \
+       '[(if type=="array" then . else (.sessions // []) end)[]
+         | select(.closed != true)
+         | (.session_name, .name, .alias, .id, .agent_name)]
+        | map(select(. != null and . != ""))
+        | index($a) != null' >/dev/null 2>&1; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
 # ── Lib-only mode: source with GATE_GUARD_LIB_ONLY=1 to load pure functions ──
 # without running the live guard sweep. Used by tests and by the dispatcher.
 if [ -n "${GATE_GUARD_LIB_ONLY:-}" ]; then
@@ -866,12 +905,7 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
       HAS_LIVE_ASSIGNEE=0
       if [ -n "$OI_ASSIGNEE" ] && [ "$OI_ASSIGNEE" != "null" ]; then
         SESSION_JSON=$(bash "$GC_CITY/scripts/gc-session-list-cached.sh" 2>/dev/null || echo "{}")
-        SESSION_MATCH=$(echo "$SESSION_JSON" | jq -r --arg a "$OI_ASSIGNEE" '
-          .sessions // [] |
-          if any(.; .id == $a or .name == $a)
-          then "alive" else "dead" end
-        ' 2>/dev/null || echo "uncertain")
-        [ "$SESSION_MATCH" != "dead" ] && HAS_LIVE_ASSIGNEE=1
+        [ "$(session_matches_author "$OI_ASSIGNEE" "$SESSION_JSON")" = "1" ] && HAS_LIVE_ASSIGNEE=1
       fi
 
       ACTION=$(classify_inflight_gap1 "open" "0" "$HAS_LIVE_ASSIGNEE" "unknown")
@@ -965,12 +999,7 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
     HAS_SC_ASSIGNEE=0
     if [ -n "$SC_ASSIGNEE" ] && [ "$SC_ASSIGNEE" != "null" ]; then
       SC_SESSION_JSON=$(bash "$GC_CITY/scripts/gc-session-list-cached.sh" 2>/dev/null || echo "{}")
-      SC_SESSION_MATCH=$(echo "$SC_SESSION_JSON" | jq -r --arg a "$SC_ASSIGNEE" '
-        .sessions // [] |
-        if any(.; .id == $a or .name == $a)
-        then "alive" else "dead" end
-      ' 2>/dev/null || echo "uncertain")
-      [ "$SC_SESSION_MATCH" != "dead" ] && HAS_SC_ASSIGNEE=1
+      [ "$(session_matches_author "$SC_ASSIGNEE" "$SC_SESSION_JSON")" = "1" ] && HAS_SC_ASSIGNEE=1
     fi
 
     # Find sling bead ID from Pilot dispatch comment.

@@ -53,6 +53,7 @@ type age_minutes_of           >/dev/null 2>&1 || { echo "FATAL: age_minutes_of n
 type parse_marker_id          >/dev/null 2>&1 || { echo "FATAL: parse_marker_id not defined by guard"; exit 1; }
 type classify_inflight_gap1   >/dev/null 2>&1 || { echo "FATAL: classify_inflight_gap1 not defined by guard"; exit 1; }
 type classify_parent_gap2     >/dev/null 2>&1 || { echo "FATAL: classify_parent_gap2 not defined by guard"; exit 1; }
+type session_matches_author   >/dev/null 2>&1 || { echo "FATAL: session_matches_author not defined by guard (ga-bnu1)"; exit 1; }
 
 # ── 0. age_minutes_of must read the bead 'Z' timestamps as UTC (not local) ───
 # Regression lock for the TZ bug that made every age negative (off by the host's
@@ -261,6 +262,92 @@ grep -q 'merge-base --is-ancestor'  "$GUARD" && ok "guard uses merge-base for br
 ! grep -q '| contains(\.' "$GUARD" \
   && ok "live-builder checks use exact match (no substring contains)" \
   || bad "live-builder check still uses substring contains — must use exact match"
+
+echo ""
+# ── 7b. session_matches_author (ga-bnu1: GAP-1/GAP-2 false-dead liveness) ────
+# Bug ga-bnu1: GAP-1 and GAP-2 each ran their OWN inline session-liveness
+# predicate — `any(.; .id == $a or .name == $a)` — instead of the canonical
+# (session_name/name/alias/id/agent_name, closed-filtered) match. That inline
+# form is doubly broken: `any(.; C)` binds `.` in C to the whole ARRAY (not
+# each element — needs `.[]`), so it throws a jq runtime error on any non-
+# empty session list; the surrounding `2>/dev/null || echo "uncertain"`
+# swallows the crash into a 3rd string neither "alive" nor "dead", which the
+# caller's `[ "$MATCH" != "dead" ]` then treats as alive — accidentally
+# fail-open, not a real check. And even fixed to iterate, checking only
+# .id/.name misses .session_name — the form bd's assignee field actually
+# holds for a named-crew author (e.g. "gastown__mayor", whose .name is the
+# dotted "gastown.mayor") — the exact ga-ipf6 false-dead class, regressed
+# here in a third call site ga-ipf6's unification didn't reach. Real incident:
+# GAP-2 (or a sibling reconciler relying on the same empty-assignee/no-live-
+# owner signal) let the Pilot redispatch a generic builder onto ga-pyzo three
+# times while gastown__mayor's fix was live in the gate pipeline (ga-bnu1).
+echo "── 7b. session_matches_author (ga-bnu1: GAP-1/GAP-2 false-dead liveness) ──"
+
+# Fixture mirrors a REAL `gc session list --json` entry for a live named-crew
+# session (captured 2026-07-14): .session_name ("gastown__mayor") differs from
+# .name/.alias/.id ("gastown.mayor"/"gastown.mayor"/"gh-050"), and a second,
+# genuinely closed session to prove the closed-filter still holds.
+SESS_FIXTURE='{"sessions":[
+  {"session_name":"gastown__mayor","name":"gastown.mayor","alias":"gastown.mayor","agent_name":"gastown.mayor","id":"gh-050","closed":false},
+  {"session_name":"peter-wa-ga2gnr","name":"peter-wa","alias":"peter-wa","agent_name":null,"id":"ga2gnr","closed":false},
+  {"session_name":"dog-gadead1","name":"dog-gadead1","alias":"gastown.dog-9","agent_name":"gastown.dog","id":"gadead1","closed":true}
+]}'
+
+eq "session_name-only match (THE bug: gastown__mayor via .session_name)" \
+   "$(session_matches_author "gastown__mayor" "$SESS_FIXTURE")" "1"
+eq "name/alias form also matches (gastown.mayor)" \
+   "$(session_matches_author "gastown.mayor" "$SESS_FIXTURE")" "1"
+eq "id form also matches (gh-050)" \
+   "$(session_matches_author "gh-050" "$SESS_FIXTURE")" "1"
+eq "closed session does not count as alive" \
+   "$(session_matches_author "dog-gadead1" "$SESS_FIXTURE")" "0"
+eq "unknown author → dead" \
+   "$(session_matches_author "no-such-session" "$SESS_FIXTURE")" "0"
+eq "empty author → dead (fail-safe)" \
+   "$(session_matches_author "" "$SESS_FIXTURE")" "0"
+eq "bare-array session shape also accepted" \
+   "$(session_matches_author "gastown__mayor" '[{"session_name":"gastown__mayor","closed":false}]')" "1"
+
+# Mutation-lock: reverting session_matches_author to the old id/name-only jq
+# body must turn the FIRST assertion above red — proves this test exercises
+# the fixed predicate, not a tautology (mirrors gate-author-alive-predicate-
+# unify.selftest.sh's own mutation-testing note for the ga-ipf6 fix).
+OLD_BROKEN_MATCH=$(printf '%s' "$SESS_FIXTURE" | jq -r --arg a "gastown__mayor" '
+  .sessions // [] |
+  if any(.; .id == $a or .name == $a)
+  then "alive" else "dead" end
+' 2>/dev/null || echo "uncertain")
+eq "mutation-lock: the OLD id/name-only predicate does NOT catch the session_name form (uncertain==false-open, not a real match)" \
+   "$OLD_BROKEN_MATCH" "uncertain"
+
+# ── 7c. drift-guard: GAP-1/GAP-2 call the shared predicate, not a reinlined one ──
+echo "── 7c. drift-guard: GAP-1/GAP-2 use session_matches_author (ga-bnu1) ──"
+grep -q 'session_matches_author()' "$GUARD" && ok "guard defines session_matches_author" || bad "guard missing session_matches_author def"
+[ "$(grep -c 'session_matches_author "' "$GUARD")" -ge 2 ] \
+  && ok "GAP-1 and GAP-2 both call session_matches_author (>=2 call sites)" \
+  || bad "expected >=2 session_matches_author call sites (one per GAP), found fewer"
+! grep -q 'any(\.; \.id == \$a or \.name == \$a)' "$GUARD" \
+  && ok "the old broken any(.; ...) id/name-only predicate is gone from guard" \
+  || bad "guard still contains the old broken any(.; .id==\$a or .name==\$a) predicate"
+grep -q 'author_is_alive()' "$DISPATCHER" && ok "dispatcher still defines author_is_alive (public contract unchanged)" || bad "dispatcher missing author_is_alive def"
+grep -q 'session_matches_author "\$author" "\$sessions_json"' "$DISPATCHER" \
+  && ok "dispatcher's author_is_alive delegates to guard's session_matches_author (DRY, ga-bnu1)" \
+  || bad "dispatcher's author_is_alive does not delegate to session_matches_author — drift risk"
+# The guard-lib source must run BEFORE the LIB_ONLY early-return, or a
+# GATE_DISPATCHER_LIB_ONLY caller (this selftest's sibling,
+# gate-author-alive-predicate-unify.selftest.sh) never gets
+# session_matches_author defined and author_is_alive() dies at call time.
+# NOTE: match the early-return's exact `if [ -n "${GATE_DISPATCHER_LIB_ONLY:-}" ]; then`
+# form specifically — an unrelated, earlier compound check in this file
+# (`[ -n "${GATE_DISPATCHER_LIB_ONLY:-}" ] && [ -z "${GATE_NUDGE_TIMEOUT_FORCE:-}" ]`)
+# also references the same var and would otherwise be matched first.
+DISP_LIB_ONLY_LINE=$(grep -n 'if \[ -n "\${GATE_DISPATCHER_LIB_ONLY:-}" \]; then' "$DISPATCHER" | head -1 | cut -d: -f1)
+DISP_GUARD_SOURCE_LINE=$(grep -n 'GATE_GUARD_LIB_ONLY=1 source' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$DISP_LIB_ONLY_LINE" ] && [ -n "$DISP_GUARD_SOURCE_LINE" ] && [ "$DISP_GUARD_SOURCE_LINE" -lt "$DISP_LIB_ONLY_LINE" ]; then
+  ok "dispatcher sources guard lib BEFORE the GATE_DISPATCHER_LIB_ONLY early-return"
+else
+  bad "dispatcher sources guard lib AFTER (or missing relative to) the LIB_ONLY early-return — breaks author_is_alive() under GATE_DISPATCHER_LIB_ONLY"
+fi
 
 echo ""
 # ── 8. ga-jhyu: terminal gate beads are CLOSED (not just relabeled), and

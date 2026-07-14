@@ -1198,21 +1198,18 @@ gate_fail_assignee_action() {
 # (<agent>-<sessionid>, e.g. peter-wa-ga2gnr), so the narrower predicate NEVER
 # matched — every live author hitting the rebase path read as dead (100%
 # false-dead; an earlier fix, ga-jyox, corrected only the FAIL call site).
-# Single source of truth now for BOTH call sites so they cannot diverge again.
+# ga-bnu1: the matching predicate itself now lives in quality-gate-guard.sh as
+# session_matches_author() (guard's pure-function lib, sourced below) — GAP-1/
+# GAP-2 need the same 5-field match against a JSON blob they already hold
+# (the session-list CACHE shim's output), not a live `gc session list` call
+# per bead. This wrapper preserves author_is_alive()'s original live-fetch
+# contract for its own call sites unchanged. Single source of truth for the
+# match predicate across all three call sites so they cannot diverge again.
 author_is_alive() {
   local author="${1:-}"
-  [ -z "$author" ] && { echo 0; return 0; }
-  if gc --city "$GC_CITY" session list --json 2>/dev/null \
-       | jq -e --arg a "$author" \
-           '[(if type=="array" then . else (.sessions // []) end)[]
-             | select(.closed != true)
-             | (.session_name, .name, .alias, .id, .agent_name)]
-            | map(select(. != null and . != ""))
-            | index($a) != null' >/dev/null 2>&1; then
-    echo 1
-  else
-    echo 0
-  fi
+  local sessions_json
+  sessions_json=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "{}")
+  session_matches_author "$author" "$sessions_json"
 }
 
 # resolve_recycled_author <author> <author_agent> <author_alive_0_1> — ga-pyzo.
@@ -1257,16 +1254,24 @@ resolve_recycled_author() {
 # above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
 # GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
 # taken in normal `bash quality-gate-dispatcher.sh` execution.
+#
+# ga-bnu1: load guard's pure functions (lib-only: no live sweep) BEFORE the
+# GATE_DISPATCHER_LIB_ONLY early-return, not after. author_is_alive() now
+# delegates to guard's session_matches_author(), so a LIB_ONLY-mode caller
+# (e.g. gate-author-alive-predicate-unify.selftest.sh, which sources this
+# file with GATE_DISPATCHER_LIB_ONLY=1 and calls author_is_alive() directly)
+# needs it defined too — sourcing guard.sh is itself lib-only (no live sweep,
+# no side effects) so running it unconditionally here is safe in both modes.
+# Also gives us parse_marker_id as the canonical single source of truth (DRY:
+# ga-b92q / ga-tmug).
+GATE_GUARD_LIB_ONLY=1 source "${GC_CITY}/packs/town-deltas/assets/quality-gate-guard.sh" 2>/dev/null || true
+
 if [ -n "${GATE_DISPATCHER_LIB_ONLY:-}" ]; then
   return 0 2>/dev/null || exit 0
 fi
 
 mkdir -p "$LOG_DIR"
 exec >> "$LOG" 2>&1
-
-# Load guard pure functions (lib-only: no live sweep) — gives us parse_marker_id
-# as the canonical single source of truth (DRY: ga-b92q / ga-tmug).
-GATE_GUARD_LIB_ONLY=1 source "${GC_CITY}/packs/town-deltas/assets/quality-gate-guard.sh" 2>/dev/null || true
 
 log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] $*"; }
 err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] ERROR: $*"; }
