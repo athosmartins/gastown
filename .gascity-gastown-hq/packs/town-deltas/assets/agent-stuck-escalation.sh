@@ -15,6 +15,15 @@
 #      Transcript AVANÇANDO (escrita recente) SUPRIME a escalação — trabalho
 #      longo legítimo (tool calls, streaming) não gera falso-positivo.
 #      Ver transcript_is_advancing() abaixo.
+#   3. EXCETO se a bead está EM GATE (ga-n937, follow-up do ga-hehi): uma
+#      bead em gate:queued/reviewing/passed/merging (ou com um type:quality-
+#      gate-marker ABERTO referenciando-a via source-bead:<id>) não tem
+#      sessão de builder por design — o builder já terminou e saiu, então o
+#      sinal 2 acima cai sempre no ramo "sessão ausente" e escalaria toda
+#      vez que a fila do gate passar de STUCK_AGENT_SEC (rotineiro — o
+#      próprio gate só considera stall a partir de ~165min). Suprime SEMPRE,
+#      exceto gate:needs-fix (ali um fixer DEVE estar trabalhando; travado é
+#      stall de verdade). Ver gate_label_present()/bead_has_open_gate_marker().
 #
 # ANTI-SPAM: uma escalação por bead por janela COOLDOWN_SEC (padrão 3h).
 #   Per-bead state: .gc/state/agent-stuck-escalation/<bead-id>
@@ -93,6 +102,76 @@ except Exception:
     [ -z "$mtime" ] && return 1
     age=$(( now - mtime ))
     [ "$age" -lt "$TRANSCRIPT_FRESH_SEC" ]
+}
+
+# gate_label_present (ga-n937): true iff the comma-joined label list $1
+# carries a gate:* lifecycle label (queued/reviewing/passed/merging/…)
+# OTHER than gate:needs-fix or gate:needs-human — mirrors pilot-
+# dispatcher.sh's _filter_built "gate:* lifecycle label" predicate exactly,
+# including both exemptions: gate:needs-fix means a fixer SHOULD be
+# actively working there (a frozen fixer is a real stall — must still
+# escalate); gate:needs-human means the gate's own quorum already bounced
+# to a human (leave today's failure_markers escalation behavior alone —
+# don't newly suppress it).
+gate_label_present() {
+    local labels_csv="${1:-}" lbl
+    local -a lbls=()
+    IFS=',' read -ra lbls <<< "$labels_csv"
+    # "${lbls[@]:-}" (not "${lbls[@]}"): under `set -u`, expanding a
+    # zero-element array with the bare @ form is an unbound-variable error in
+    # this bash — the :- fallback keeps an empty/no-label bead from aborting
+    # the whole pass (discovered live: it silently killed T2/T9/T14/T15 etc.,
+    # every bead with no labels, until this guard was added).
+    for lbl in "${lbls[@]:-}"; do
+        [ -z "$lbl" ] && continue
+        case "$lbl" in
+            gate:needs-fix|gate:needs-fix:*|gate:needs-human|gate:needs-human:*)
+                ;;
+            gate|gate:*)
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+# bead_has_open_gate_marker (ga-n937): mirrors pilot-dispatcher.sh's
+# _beadid_has_open_gate_marker — the canonical "already-built / in-gate"
+# primitive (wa-8y45 leak), not reinvented here. True iff an OPEN
+# type:quality-gate-marker in the HQ store (CITY) names <bead_id> via
+# source-bead:<id>, at ANY gate-status — covers the case where the crew
+# branch was already pruned (needs-rebase/error) but the marker still owns
+# the bead. Gate artifacts always live in the HQ store regardless of which
+# rig the bead belongs to. FAIL-OPEN: no bd, any bd/python error, or an
+# empty read → return 1 (no marker) — an unreadable gate query must never
+# suppress a real stall.
+bead_has_open_gate_marker() {
+    local bid="${1:-}" arts hit
+    [ -n "$bid" ] || return 1
+    command -v "$BD" >/dev/null 2>&1 || return 1
+    arts="$(timeout 15 "$BD" -C "$CITY" list -l "source-bead:$bid" --json 2>/dev/null || true)"
+    [ -z "$arts" ] && return 1
+    hit="$(printf '%s' "$arts" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(0); sys.exit(0)
+if isinstance(d, dict):
+    d = [d]
+if not isinstance(d, list):
+    print(0); sys.exit(0)
+n = 0
+for b in d:
+    if not isinstance(b, dict):
+        continue
+    if b.get("status") != "open":
+        continue
+    if "type:quality-gate-marker" in (b.get("labels") or []):
+        n += 1
+print(n)
+' 2>/dev/null || echo 0)"
+    case "$hit" in ''|0) return 1 ;; *) return 0 ;; esac
 }
 
 printf '%s %s\n' "$$" "$(date +%s)" > "$STATE_DIR/agent-stuck-escalation.startup"
@@ -276,6 +355,24 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
             log "$bead_id: stuck ${age_min}min — already escalated ${since_esc}s ago (cooldown ${remaining}min remaining)"
             continue
         fi
+    fi
+
+    # In-gate skip (ga-n937 — follow-up to ga-hehi): a bead sitting in the
+    # quality gate has NO builder session by design (the builder already
+    # finished and exited), so signal 2 above never proves anything for it —
+    # it always falls into the "absent session" branch and would escalate
+    # every time the gate queue (routinely 29-38min; the gate's own stall
+    # threshold is ~165min) exceeds STUCK_AGENT_SEC. Suppress (log-only, no
+    # state file — a real stall on a later pass still escalates, undelayed)
+    # when: (a) the bead carries a gate:* label (queued/reviewing/passed/
+    # merging/…), OR (b) an OPEN type:quality-gate-marker in the HQ store
+    # names it via source-bead:<id> (covers the case where the crew branch
+    # was already pruned but the marker still owns the bead). EXCEPT
+    # gate:needs-fix — there a fixer SHOULD be working; frozen is a real
+    # stall and must still escalate.
+    if gate_label_present "$labels" || bead_has_open_gate_marker "$bead_id"; then
+        log "$bead_id: bead.updated_at parado ${age_min}min mas EM GATE (labels=$labels) — SUPRIMINDO escalação (sem builder por design, ga-n937)"
+        continue
     fi
 
     # Session health check for assignee

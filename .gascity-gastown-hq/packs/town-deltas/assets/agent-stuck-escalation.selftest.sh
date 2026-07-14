@@ -30,6 +30,9 @@ ACTIONS="$WORK/actions.log"
 
 # ── bd shim ───────────────────────────────────────────────────────────────────
 # bd [-C <store>] list --status in_progress --json → reads $WORK/beads.json
+# bd [-C <store>] list -l source-bead:<id> --json → reads
+#   $GATE_MARKERS_DIR/<id>.json (ga-n937 in-gate marker check; absent
+#   fixture = "[]", mirrors real bd's empty-result response)
 # Accepts the new multi-store -C <store> prefix transparently.
 cat > "$SHIM/bd" <<'SHIM'
 #!/usr/bin/env bash
@@ -38,6 +41,20 @@ if [ "$1" = "-C" ]; then shift 2; fi
 if [ "$1 $2" = "list --status" ] && [ "$3" = "in_progress" ]; then
     cat "${BEADS_FIXTURE:-/dev/null}"
     exit 0
+fi
+if [ "$1" = "list" ] && [ "$2" = "-l" ]; then
+    case "$3" in
+        source-bead:*)
+            _bid="${3#source-bead:}"
+            _f="${GATE_MARKERS_DIR:-}/${_bid}.json"
+            if [ -n "${GATE_MARKERS_DIR:-}" ] && [ -f "$_f" ]; then
+                cat "$_f"
+            else
+                echo "[]"
+            fi
+            exit 0
+            ;;
+    esac
 fi
 echo "[]"
 SHIM
@@ -101,6 +118,7 @@ run_script() {
     BEADS_FIXTURE="${BEADS_FIXTURE:-}" \
     SESSIONS_FIXTURE="${SESSIONS_FIXTURE:-}" \
     LOGS_FIXTURE_DIR="${LOGS_FIXTURE_DIR:-}" \
+    GATE_MARKERS_DIR="${GATE_MARKERS_DIR:-}" \
     ACTIONS_FILE="$ACTIONS" \
     STUCK_AGENT_SEC="${STUCK_AGENT_SEC:-1800}" \
     COOLDOWN_SEC="${COOLDOWN_SEC:-10800}" \
@@ -124,11 +142,31 @@ make_bead() {  # make_bead <id> <assignee> <age_secs> [type]
 BEADS_FIXTURE="$WORK/beads.json"
 SESSIONS_FIXTURE="$WORK/sessions.json"
 LOGS_FIXTURE_DIR="$WORK/logsfx"
-mkdir -p "$LOGS_FIXTURE_DIR" "$WORK/transcripts"
-export BEADS_FIXTURE SESSIONS_FIXTURE LOGS_FIXTURE_DIR
+GATE_MARKERS_DIR="$WORK/gatemarkers"
+mkdir -p "$LOGS_FIXTURE_DIR" "$WORK/transcripts" "$GATE_MARKERS_DIR"
+export BEADS_FIXTURE SESSIONS_FIXTURE LOGS_FIXTURE_DIR GATE_MARKERS_DIR
 
 # Default: empty sessions
 echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+
+# make_bead_json <id> <assignee> <age_secs> <labels_json_array> [type]
+# Like make_bead but with caller-controlled labels (ga-n937 gate tests).
+make_bead_json() {
+    local id="$1" assignee="$2" age="$3" labels="$4" itype="${5:-feature}"
+    local ts
+    ts="$(python3 -c "import time, datetime; e=time.time()-$age; print(datetime.datetime.utcfromtimestamp(e).strftime('%Y-%m-%dT%H:%M:%SZ'))")"
+    printf '{"id":"%s","title":"Test bead %s","assignee":"%s","status":"in_progress","issue_type":"%s","updated_at":"%s","labels":%s}' \
+        "$id" "$id" "$assignee" "$itype" "$ts" "$labels"
+}
+
+# make_gate_marker_fixture <bead-id> <gate-status>
+# Registers an OPEN type:quality-gate-marker naming <bead-id> via
+# source-bead, for the `bd -C <city> list -l source-bead:<id> --json` query.
+make_gate_marker_fixture() {
+    local bid="$1" status="${2:-queued}"
+    printf '[{"id":"ga-wisp-%s","status":"open","labels":["type:quality-gate-marker","source-bead:%s","gate-status:%s"]}]' \
+        "$bid" "$bid" "$status" > "$GATE_MARKERS_DIR/$bid.json"
+}
 
 # make_transcript_fixture <session-name> <age-secs>
 # Registers a `gc session logs <session-name> --json` fixture pointing at a
@@ -253,6 +291,66 @@ rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test07"
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
 assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test07" "T15: escalation fires — absent session, no regression"
+
+# ── T16: bead in gate:queued → suppressed (ga-n937) ──────────────────────────
+echo "T16: bead with gate:queued label → suppressed (in-gate, ga-n937)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead_json ga-gate01 thies-wa 2200 '["ctx:ready","gate:queued"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gate01"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-gate01" "T16: no mail — bead is in gate:queued"
+assert_absent "$ACTIONS" "notify" "T16: no notify — bead is in gate:queued"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gate01" ] && ok "T16: no escalation state written (suppression is log-only)" || bad "T16: unexpected state file written on suppression"
+log_contains "T16" "EM GATE" "T16: log notes in-gate suppression"
+
+# ── T17: bead in gate:reviewing → suppressed ──────────────────────────────────
+echo "T17: bead with gate:reviewing label → suppressed"
+printf '[%s]' "$(make_bead_json ga-gate02 mila-wa 3000 '["gate:reviewing"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gate02"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor" "T17: no mail — bead is in gate:reviewing"
+
+# ── T18: bead carries no gate:* label but an OPEN quality-gate-marker still ──
+# names it via source-bead (branch already pruned, wa-8y45-style) → suppressed
+echo "T18: bead has no gate:* label but an OPEN quality-gate-marker names it → suppressed"
+printf '[%s]' "$(make_bead_json ga-gate03 oracle-wa 2600 '["ctx:ready"]')" > "$BEADS_FIXTURE"
+make_gate_marker_fixture ga-gate03 needs-rebase
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gate03"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor" "T18: no mail — open gate marker owns the bead"
+log_contains "T18" "EM GATE" "T18: log notes in-gate suppression (marker-only signal)"
+rm -f "$GATE_MARKERS_DIR/ga-gate03.json"
+
+# ── T19: gate:needs-fix + dead session → STILL escalates (no regression) ─────
+echo "T19: bead with gate:needs-fix label + dead session → escalation still fires"
+printf '[%s]' "$(make_bead_json ga-gate04 thies-wa 2200 '["gate:needs-fix"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gate04"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-gate04" "T19: gate:needs-fix still escalates (fixer should be working)"
+
+# ── T20: gate:needs-human + dead session → STILL escalates (no regression) ───
+echo "T20: bead with gate:needs-human label + dead session → escalation still fires"
+printf '[%s]' "$(make_bead_json ga-gate05 mila-wa 2200 '["gate:needs-human"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gate05"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-gate05" "T20: gate:needs-human still escalates (unchanged failure_markers behavior)"
+
+# ── T21: building bead (no gate label/marker), transcript frozen → escalates ─
+# (ga-hehi intact — explicit ACEITE case 3, also covered implicitly by T14)
+echo "T21: building bead, no gate signal, transcript frozen → escalation still fires"
+echo '{"sessions":[{"name":"peter-wa","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture peter-wa 3600
+printf '[%s]' "$(make_bead_json ga-gate06 peter-wa 2200 '["ctx:ready"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gate06"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-gate06" "T21: building bead with no gate signal still escalates (ga-hehi intact)"
+rm -f "$LOGS_FIXTURE_DIR/peter-wa.json"
 
 # ── T10–T12: Layer 1 routing integration (ga-qw3p.1) ────────────────────────
 # Deploy the real escalation-router.sh so the script can source it.
