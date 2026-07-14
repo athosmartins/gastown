@@ -5,7 +5,6 @@ description: >
   história", "refinar esse item", "refine this story", "quero refinar",
   "vamos refinar juntos", or otherwise signals the start of a product
   refinement session on a feature story. Guides the agent through an
-<<<<<<< Updated upstream
   interactive Definition of Refined in two modes — completo (8 mandatory
   fields) or simplificado (5 essential fields: F1, F2, F6, F7, F8). With
   context loaded it proposes all 9 answers at once (one-shot, the default)
@@ -13,17 +12,11 @@ description: >
   field-by-field. No skipping within the chosen mode, Athos approval gate.
   Ends by writing/updating the story as a bead.
 version: "1.2.0"
-=======
-  interactive, rigid 9-field Definition of Refined — mandatory fields, no
-  skipping, Athos approval gate. Ends by writing/updating the story as a bead.
-version: "1.1.0"
->>>>>>> Stashed changes
 ---
 
 # Refino — Product Story Refinement Protocol
 
 Refino is a RIGID interactive protocol that a crew agent wears to refine a
-<<<<<<< Updated upstream
 feature story WITH Athos. It runs in one of two modes — **completo** (all 8
 fields) or **simplificado** (the 5 essential fields F1, F2, F6, F7, F8) — and
 in one of two forms of conduction: **one-shot** (the default when a story is
@@ -32,11 +25,6 @@ adjusts a field) or **campo-a-campo** (the fallback when context is too thin to
 draft). It does NOT end until every mandatory field *for the chosen mode* is
 filled AND Athos explicitly approves. No mandatory field may be skipped or left
 vague based on agent discretion.
-=======
-feature story WITH Athos. It does NOT end until all 9 mandatory fields are
-filled AND Athos explicitly approves. No field may be skipped or left vague
-based on agent discretion.
->>>>>>> Stashed changes
 
 Language: conduct the session in Portuguese unless Athos switches to English.
 Tone: collaborative product partner — not an engineer. Avoid technical jargon
@@ -51,11 +39,6 @@ immediately enters Refino mode and announces it:
 
 ```
 Entrando no modo Refino. Vamos refinar a história juntos.
-<<<<<<< Updated upstream
-=======
-Nenhum campo pode ser pulado — só finalizamos quando os 9 campos
-estiverem preenchidos E você aprovar explicitamente.
->>>>>>> Stashed changes
 ```
 
 If Athos provides a story title or bead ID at invocation, load it. Otherwise
@@ -63,11 +46,7 @@ open with: "Qual história vamos refinar hoje? (título ou ID do bead)"
 
 ---
 
-<<<<<<< Updated upstream
 ## Claim antes de refinar (anti-overlap — OBRIGATÓRIO)
-=======
-## The 9 Mandatory Fields (Definition of Refined)
->>>>>>> Stashed changes
 
 Workers/crews refinam o MESMO pool `story:unrefined` em paralelo. Os sinais de
 status/label LAGAM — uma história pode parecer livre e já estar sendo refinada
@@ -455,7 +434,6 @@ Only advance to the approval gate when Athos confirms.
 
 ## Approval Gate
 
-<<<<<<< Updated upstream
 Esta é a porta de aprovação do fluxo **campo-a-campo**. No **one-shot** a
 aprovação já acontece sobre a proposta única (ver "One-shot Proposal") — o bloco
 abaixo é o mesmo, e as regras de aprovação explícita e de ajuste pontual a seguir
@@ -464,9 +442,6 @@ valem identicamente para os dois caminhos.
 After all mandatory fields are filled, present the complete summary. In
 **simplificado**, lines 3–5 show the skip sentinel `— pulado no refino
 simplificado` instead of content:
-=======
-After all 9 fields are filled, present the complete summary:
->>>>>>> Stashed changes
 
 ```
 --- HISTÓRIA REFINADA ---
@@ -497,24 +472,6 @@ responde, o agente reescreve) antes que qualquer "sim" valha como aprovação.
 **If Athos says "ajustar campo X":** go back to that field, re-run it,
 re-present the full summary. Loop until explicit approval.
 
-<<<<<<< Updated upstream
-**After explicit approval, ask ONE priority question before writing the bead:**
-
-```
-Qual a prioridade — Normal / Alta / Baixa?
-```
-
-No **one-shot**, a prioridade já foi proposta como 9ª resposta no rascunho — se
-Athos aprovou a proposta inteira sem mexer nela, a prioridade proposta vale como
-respondida e essa pergunta não se repete; só pergunte de novo se ele a ajustou
-ou pediu para revê-la.
-
-Map the answer to `--priority` (Alta→1, Normal→2, Baixa→3). If unclear,
-default to Normal (P2). See `references/story-bead-convention.md` for the
-full priority table.
-
-=======
->>>>>>> Stashed changes
 ---
 
 ## Bead Write-back (on approval)
