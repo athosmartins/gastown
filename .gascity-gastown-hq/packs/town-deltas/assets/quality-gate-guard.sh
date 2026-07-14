@@ -266,6 +266,30 @@ classify_inflight_gap1() {
   esac
 }
 
+# guard_content_merged <main_ref> <branch_ref> — ga-0ndi: mirrors quality-gate-
+# dispatcher.sh's rig_content_merged() (ga-01yq) for GAP-1's orphan reconciler.
+# SHA-ancestry is FALSE BY CONSTRUCTION after a rebase-merge (the gate's own
+# auto-rebase, or any manual rebase, replays commits under NEW shas) — a
+# fully-merged branch never becomes an ancestor again, so the bare
+# `merge-base --is-ancestor` at the GAP-1 call site (below) would strand its
+# story:in-flight label FOREVER instead of stripping it, permanently leaking
+# the lane slot — the same class of bug ga-01yq fixed in the dispatcher's Step
+# 4b, just manifesting here as silent lane starvation instead of a
+# needs-rebase bounce.
+#
+# rc0 iff every commit reachable from <branch_ref> but not <main_ref> already
+# has its patch present on <main_ref> (git matches rebased/squashed/
+# re-committed content by patch-id, not sha) — i.e. the branch's content is
+# fully merged regardless of sha lineage.
+#
+# FAIL-CLOSED: any non-"0"/empty/error count → rc1 (treated as NOT merged), so
+# the caller keeps the existing safe skip:not-merged path on any doubt.
+guard_content_merged() {
+  local main_ref="$1" branch_ref="$2" n
+  n=$(git -C "$GC_CITY" rev-list --count --cherry-pick --right-only "${main_ref}...${branch_ref}" 2>/dev/null || echo ERR)
+  [ "$n" = "0" ]
+}
+
 # classify_parent_gap2 <has_pilot_dispatched> <has_live_assignee> <sling_found> <sling_needs_fix> <sling_closed>
 # Pure decision for ga-pa36 GAP-2: parent story/bug retains story:in-flight after
 # the gate ran on a sling/work bead (Pilot-dispatched path) and that bead is terminal.
@@ -839,15 +863,25 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
       fi
 
       BRANCH_MERGED=0
-      git -C "$GC_CITY" merge-base --is-ancestor "$OI_BRANCH_SHA" "$G1_MAIN_SHA" \
-        2>/dev/null && BRANCH_MERGED=1 || true
+      MERGED_BY_REBASE=0
+      if git -C "$GC_CITY" merge-base --is-ancestor "$OI_BRANCH_SHA" "$G1_MAIN_SHA" 2>/dev/null; then
+        BRANCH_MERGED=1
+      elif guard_content_merged "$G1_MAIN_SHA" "$OI_BRANCH_SHA"; then
+        BRANCH_MERGED=1
+        MERGED_BY_REBASE=1
+      fi
 
       ACTION=$(classify_inflight_gap1 "open" "0" "$HAS_LIVE_ASSIGNEE" "$BRANCH_MERGED")
       case "$ACTION" in
         strip:merged)
-          warn "GAP-1: $OI_ID branch tip $OI_BRANCH_SHA merged to origin/main, no gate:passed, no live builder — stripping story:in-flight"
+          if [ "$MERGED_BY_REBASE" = "1" ]; then
+            warn "GAP-1: $OI_ID branch tip $OI_BRANCH_SHA merged-by-rebase into origin/main (not a sha ancestor, but 0 unmerged patches by content), no gate:passed, no live builder — stripping story:in-flight (ga-0ndi)"
+            bd -C "$GC_CITY" comment "$OI_ID" "ga-pa36 GAP-1 reconciler: stripped orphaned story:in-flight — branch tip $OI_BRANCH_SHA is merged-by-rebase into origin/main (git rev-list --cherry-pick --right-only == 0; not a sha ancestor because a rebase/re-commit replays commits under new shas), no gate:passed label, no live builder. Lane slot freed. (ga-0ndi)" 2>/dev/null || true
+          else
+            warn "GAP-1: $OI_ID branch tip $OI_BRANCH_SHA merged to origin/main, no gate:passed, no live builder — stripping story:in-flight"
+            bd -C "$GC_CITY" comment "$OI_ID" "ga-pa36 GAP-1 reconciler: stripped orphaned story:in-flight — branch tip $OI_BRANCH_SHA already merged to origin/main, no gate:passed label, no live builder. Lane slot freed." 2>/dev/null || true
+          fi
           bd -C "$GC_CITY" label remove "$OI_ID" "story:in-flight" -q 2>/dev/null || true
-          bd -C "$GC_CITY" comment "$OI_ID" "ga-pa36 GAP-1 reconciler: stripped orphaned story:in-flight — branch tip $OI_BRANCH_SHA already merged to origin/main, no gate:passed label, no live builder. Lane slot freed." 2>/dev/null || true
           ;;
         skip:not-merged)
           log "GAP-1: $OI_ID branch tip $OI_BRANCH_SHA not yet merged — skip"
