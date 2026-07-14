@@ -1923,7 +1923,7 @@ fi
 log "Authoritative author: $AUTHOR"
 
 # ── Step 4: Determine rig path and git references ─────────────────────────────
-
+# SELFTEST-EXTRACT rig-path-resolve: BEGIN
 RIG_PATH=""
 RIG_LIST_JSON=$(gc --city "$GC_CITY" rig list --json 2>/dev/null || echo '{}')
 if [ -n "$RIG" ]; then
@@ -1948,12 +1948,23 @@ if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$RIG" ] && printf '%
   [ -n "$RIG_PATH" ] && log "  rig='$RIG' unresolved; derived from trailing segment '$_rig_tail' -> $RIG_PATH"
 fi
 
+# ga-dmox: a marker whose rig:/bead_id: fields don't resolve to any registered
+# rig is a MALFORMED-DATA problem local to this one marker, not a dispatcher
+# infrastructure failure. Mark it (label + comment, so a human/watchdog reading
+# the bead sees exactly what's missing) and exit 0 — matching Step 3's
+# established "cannot derive X -> mark terminal, exit 0" convention 30 lines
+# above. exit 1 here previously poisoned daemon-presence-watchdog's per-daemon
+# exit-code FAILING counter (scripts/daemon-presence-watchdog.sh) over a single
+# bad marker, making a one-item data problem look like a dispatcher outage.
 if [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; then
-  err "Cannot resolve rig path for rig='$RIG' (bead=$BEAD_ID). Aborting."
+  err "Cannot resolve rig path for rig='$RIG' (bead=$BEAD_ID). Marking gate-status:error, skipping (not aborting the daemon)."
   bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
-  exit 1
+  bd -C "$GC_CITY" comment "$MARKER_ID" "ga-dmox: rig path unresolved for rig='${RIG:-<empty>}' bead_id='${BEAD_ID:-<empty>}' — marker's branch:/bead_id:/rig: fields did not resolve to any registered rig via exact name, bead-id prefix, or trailing-segment match. Marker skipped (gate-status:error); other queued markers are unaffected. Resubmit via /gate-done with a corrected bead_id:/rig: field, or fix by hand and re-queue." 2>/dev/null || true
+  log "SUPPRESSED PUSH (ga-dmox non-terminal): rig path unresolvable for $MARKER_ID — gate-status:error (skipped, not a daemon failure)."
+  exit 0
 fi
+# SELFTEST-EXTRACT rig-path-resolve: END
 
 # ga-67hae: normalize $RIG to the canonical rig name (compound values break
 # downstream select(.name == $RIG) lookups like DEFAULT_BRANCH derivation).
@@ -2302,14 +2313,19 @@ if [ -z "$BRANCH_SHA" ]; then
         2>/dev/null || warn "Could not mail author $AUTHOR for circuit-break on $BRANCH"
     fi
     log "ga-acb circuit-break: branch $BRANCH absent from origin — marker $MARKER_ID parked, bead $BEAD_ID needs-human."
-    exit 1
+    # ga-dmox: marker is already fully parked (labels, comments, mail to Mayor +
+    # author all sent above) — exit 0, not 1. This case is a deliberately-handled
+    # terminal outcome for ONE marker, not a dispatcher process failure; exit 1
+    # here poisoned daemon-presence-watchdog's exit-code FAILING counter.
+    exit 0
   fi
   # GATE_AUTO_CIRCUIT_BREAK=0: fall through to legacy gate-status:error (retriable).
   bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
   # wa-uthi: non-terminal (marker error, fixable + resubmittable) — no push. Logged only.
   log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH not found on remote — gate-status:error."
-  exit 1
+  # ga-dmox: retriable per-marker state (comment above says so) must not exit 1.
+  exit 0
 fi
 
 log "  branch_sha=$BRANCH_SHA"
@@ -2435,7 +2451,8 @@ if [ -z "$MAIN_HEAD_SHA" ]; then
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
   bd -C "$GC_CITY" comment "$MARKER_ID" "Gate transient error: origin/$DEFAULT_BRANCH did not resolve to a present commit object (likely a racing fetch). NOT a conflict — will retry on next sweep." 2>/dev/null || true
   log "SUPPRESSED PUSH (wa-uthi non-terminal): origin/$DEFAULT_BRANCH unresolvable — gate-status:error (retriable)."
-  exit 1
+  # ga-dmox: retriable per-marker state (comment above says so) must not exit 1.
+  exit 0
 fi
 BRANCH_IS_CURRENT=0
 # main is an ancestor of branch iff the branch includes all of main
@@ -2485,7 +2502,8 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
     bd -C "$GC_CITY" comment "$MARKER_ID" "Gate transient error: merge-tree conflict pre-check for $BRANCH vs $DEFAULT_BRANCH was undeterminable (merge-base=${MERGE_BASE_SHA:-none}). NOT necessarily a conflict — will retry on next sweep." 2>/dev/null || true
     log "SUPPRESSED PUSH (wa-uthi non-terminal): merge-tree undeterminable for $BRANCH — gate-status:error (retriable)."
-    exit 1
+    # ga-dmox: retriable per-marker state (comment above says so) must not exit 1.
+    exit 0
   elif [ "$MT_VERDICT" = "1" ]; then
     HAS_CONFLICT=1
     CONFLICT_KIND="merge"   # ga-q3ig2: genuine, deterministic merge conflict.
@@ -2752,7 +2770,9 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
         '{ts: $ts, event: $event, branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author}' \
         >> "$QG_LOG" 2>/dev/null || true
       log "=== Dispatcher sweep complete: branch=$BRANCH verdict=$REBASE_VERDICT ==="
-      exit 1
+      # ga-dmox: marker already fully parked (labels, comments, mail sent above)
+      # — exit 0, not 1; this is a handled terminal outcome, not a daemon failure.
+      exit 0
     fi
 
     if [ "$AUTHOR_ALIVE" = "1" ] && [ "$CONFLICT_KIND" = "merge" ]; then

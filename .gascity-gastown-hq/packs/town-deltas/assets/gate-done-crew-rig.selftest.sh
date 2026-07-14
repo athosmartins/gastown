@@ -324,6 +324,143 @@ else
   bad "(G) gate-done.md not found at $GATE_DONE"
 fi
 
+# ── (I) ga-dmox: tree-wide unification — every REAL deployed gate-done.md is
+#    either the canonical file itself or a symlink resolving to it. Section (G)
+#    above only drift-guards ONE resolved path (via a 3-tier fallback); it has
+#    zero visibility into the other real copies crews actually execute. ga-dmox
+#    found 30 such copies (mayor/, gastown/*, lexbh/*, marketing/*,
+#    property_scrapers/*, whatsapp_automation/*) were stale, byte-identical
+#    157-line files with NO bead_rig logic at all — genuinely untracked by any
+#    git repo (gitignored in the main repo via .git/info/exclude, or inside a
+#    separate nested per-crew repo), so no git operation could ever have
+#    propagated the ga-owfll/ga-u4yi fixes into them. Fixed by symlinking each
+#    to the canonical file (same pattern as the existing root .claude/commands/
+#    symlink, ga-x8m6r). This section is the regression guard against that
+#    drift recurring — e.g. if a future crew-provisioning step ever recreates a
+#    real (non-symlink) file at one of these paths again.
+TOWN_ROOT="$(cd "$SELF_DIR/../../../.." && pwd)"
+CANONICAL_REAL="$TOWN_ROOT/.gascity-gastown-hq/commands/gate-done.md"
+
+# PROD_ROOT is deliberately the FIXED, real town-root path — NOT $TOWN_ROOT.
+# The 30 rig/crew/witness/refinery/mayor directories below are genuinely
+# untracked, singleton, machine-wide operational state (excluded via
+# .git/info/exclude, or living inside their own separate nested git repos —
+# see ga-dmox investigation) — `git worktree add` never materializes them, so
+# they exist ONLY at the one real production path, regardless of which
+# worktree/branch this selftest is invoked from. This section is therefore an
+# infrastructure-audit check against the live town, not a pure test of THIS
+# branch's tracked files (unlike the two $TOWN_ROOT-relative entries just
+# below, which correctly reflect whatever checkout is under test).
+PROD_ROOT="/Users/athos/gt"
+
+if [ ! -f "$CANONICAL_REAL" ]; then
+  bad "(I0) canonical gate-done.md not found at $CANONICAL_REAL — cannot run tree-wide check"
+else
+  # Every path a crew/witness/refinery/mayor session could actually execute.
+  # Kept as an explicit list (not a live `find`) so the test doesn't silently
+  # start (or stop) covering new directories without a deliberate edit here.
+  DEPLOYED_COPIES=(
+    "$TOWN_ROOT/.claude/commands/gate-done.md"
+    "$TOWN_ROOT/internal/templates/commands/bodies/gate-done.md"
+    "$PROD_ROOT/gastown/crew/batista/.claude/commands/gate-done.md"
+    "$PROD_ROOT/gastown/crew/deacon/.claude/commands/gate-done.md"
+    "$PROD_ROOT/gastown/crew/furiosa/.claude/commands/gate-done.md"
+    "$PROD_ROOT/gastown/crew/gastown/.claude/commands/gate-done.md"
+    "$PROD_ROOT/gastown/refinery/rig/.claude/commands/gate-done.md"
+    "$PROD_ROOT/gastown/witness/.claude/commands/gate-done.md"
+    "$PROD_ROOT/lexbh/crew/batista/.claude/commands/gate-done.md"
+    "$PROD_ROOT/lexbh/crew/digo/.claude/commands/gate-done.md"
+    "$PROD_ROOT/lexbh/crew/thies/.claude/commands/gate-done.md"
+    "$PROD_ROOT/lexbh/refinery/rig/.claude/commands/gate-done.md"
+    "$PROD_ROOT/lexbh/witness/.claude/commands/gate-done.md"
+    "$PROD_ROOT/marketing/crew/mila/.claude/commands/gate-done.md"
+    "$PROD_ROOT/marketing/refinery/rig/.claude/commands/gate-done.md"
+    "$PROD_ROOT/marketing/witness/.claude/commands/gate-done.md"
+    "$PROD_ROOT/mayor/.claude/commands/gate-done.md"
+    "$PROD_ROOT/property_scrapers/crew/batista/.claude/commands/gate-done.md"
+    "$PROD_ROOT/property_scrapers/crew/digo/.claude/commands/gate-done.md"
+    "$PROD_ROOT/property_scrapers/crew/thies/.claude/commands/gate-done.md"
+    "$PROD_ROOT/property_scrapers/refinery/rig/.claude/commands/gate-done.md"
+    "$PROD_ROOT/property_scrapers/witness/.claude/commands/gate-done.md"
+    "$PROD_ROOT/whatsapp_automation/crew/.claude/commands/gate-done.md"
+    "$PROD_ROOT/whatsapp_automation/crew/batista/.claude/commands/gate-done.md"
+    "$PROD_ROOT/whatsapp_automation/crew/digo/.claude/commands/gate-done.md"
+    "$PROD_ROOT/whatsapp_automation/crew/mila/.claude/commands/gate-done.md"
+    "$PROD_ROOT/whatsapp_automation/crew/oracle/.claude/commands/gate-done.md"
+    "$PROD_ROOT/whatsapp_automation/crew/peter/.claude/commands/gate-done.md"
+    "$PROD_ROOT/whatsapp_automation/crew/property_scrapers/.claude/commands/gate-done.md"
+    "$PROD_ROOT/whatsapp_automation/crew/thies/.claude/commands/gate-done.md"
+    "$PROD_ROOT/whatsapp_automation/refinery/rig/.claude/commands/gate-done.md"
+    "$PROD_ROOT/whatsapp_automation/witness/rig/.claude/commands/gate-done.md"
+  )
+
+  # deployed_copy_status <f> — pure predicate, no ok/bad side effects. Echoes a
+  # one-line reason and returns 0 (healthy) or 1 (broken). Kept separate from
+  # ok/bad so the mutation-check below can probe a DELIBERATELY-broken path
+  # without printing a confusing "✗" for an intentional, temporary break that
+  # doesn't count as a real failure.
+  deployed_copy_status() {
+    local f="$1"
+    if [ ! -e "$f" ]; then
+      echo "does not exist (was this crew/rig removed? update the list in this test)"
+      return 1
+    fi
+    if [ ! -L "$f" ]; then
+      echo "is a REGULAR file, not a symlink to canonical — drifts silently from ga-owfll/ga-u4yi/ga-dmox fixes"
+      return 1
+    fi
+    if ! grep -q 'bead_rig:' "$f" 2>/dev/null; then
+      echo "symlink does not resolve to bead_rig-carrying content (broken link or wrong target?)"
+      return 1
+    fi
+    echo "symlinked to canonical, resolves with bead_rig fix present"
+    return 0
+  }
+
+  for f in "${DEPLOYED_COPIES[@]}"; do
+    reason="$(deployed_copy_status "$f")"
+    if [ $? -eq 0 ]; then ok "(I) $f: $reason"; else bad "(I) $f: $reason"; fi
+  done
+
+  # Mutation check: this section must not be vacuous. Break ONE real symlink
+  # (point it at a scratch file with no bead_rig content), confirm the SAME
+  # predicate now reports it broken, then restore the original symlink
+  # exactly. Uses the whatsapp_automation/crew/oracle copy — arbitrary choice,
+  # any one of the 30 would do.
+  MUT_TARGET="$PROD_ROOT/whatsapp_automation/crew/oracle/.claude/commands/gate-done.md"
+  if [ -L "$MUT_TARGET" ]; then
+    ORIG_LINK="$(readlink "$MUT_TARGET")"
+    SCRATCH_STALE="$(mktemp)"
+    echo "not the real gate-done content" > "$SCRATCH_STALE"
+    # Belt-and-suspenders: guarantee restoration even on an unexpected
+    # interrupt/kill between the break and the (immediately-following) restore
+    # below — this mutates a LIVE crew directory and must never be left broken.
+    trap 'rm -f "'"$MUT_TARGET"'"; ln -s -- "'"$ORIG_LINK"'" "'"$MUT_TARGET"'"; rm -f "'"$SCRATCH_STALE"'"' EXIT INT TERM
+    rm -- "$MUT_TARGET"
+    ln -s -- "$SCRATCH_STALE" "$MUT_TARGET"
+    deployed_copy_status "$MUT_TARGET" >/dev/null 2>&1
+    MUT_RC=$?
+    # Restore immediately, before evaluating the result — a live crew directory
+    # must not be left mutated if anything below throws.
+    rm -- "$MUT_TARGET"
+    ln -s -- "$ORIG_LINK" "$MUT_TARGET"
+    rm -f "$SCRATCH_STALE"
+    trap - EXIT INT TERM
+    if [ "$MUT_RC" -ne 0 ]; then
+      ok "(I-mutation) breaking a real symlink is correctly caught by deployed_copy_status (test is not vacuous)"
+    else
+      bad "(I-mutation) breaking oracle's symlink did NOT get caught — this section may be vacuous"
+    fi
+    if [ "$(readlink "$MUT_TARGET")" = "$ORIG_LINK" ]; then
+      ok "(I-mutation) oracle's real symlink was restored exactly after the mutation check"
+    else
+      bad "(I-mutation) FAILED TO RESTORE oracle's symlink to '$ORIG_LINK' — got '$(readlink "$MUT_TARGET")' — fix by hand"
+    fi
+  else
+    bad "(I-mutation) $MUT_TARGET is not a symlink — cannot run the mutation check (has (I) already failed above?)"
+  fi
+fi
+
 echo
 echo "  PASS=$PASS  FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
