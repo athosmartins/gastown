@@ -1963,6 +1963,33 @@ rig_resolve_commit() {
   git_rig rev-parse --verify -q "$1^{commit}" 2>/dev/null || echo ""
 }
 
+# rig_content_merged <main_ref> <branch_ref> — ga-01yq: SHA-ancestry is FALSE BY
+# CONSTRUCTION after a rebase-merge (the gate's own auto-rebase, or any manual
+# rebase, replays commits under NEW shas) — a fully-merged branch never becomes
+# an ancestor again, so a naive `merge-base --is-ancestor` strands it on
+# needs-rebase FOREVER, and the suggested manual-rebase remediation can then
+# re-submit PRE-REBASE file versions on top of newer work already in main (a
+# real regression, not just noise — see ga-01yq / batista-wa's wa-jaxt8 catch
+# and the peter/ga-fr5d near-miss).
+#
+# rc0 iff EVERY commit reachable from <branch_ref> but not <main_ref> already
+# has its patch present on the <main_ref> side (git matches rebased/squashed/
+# re-committed changes by patch-id) — i.e. the branch's content is fully
+# merged regardless of SHA lineage. Mirrors merged-bead-janitor.sh's
+# content_in_main() (proven on ga-tijv5/wa-fvxj1); duplicated here rather than
+# sourced because each gate daemon is a self-contained script with its own
+# small git-check helpers (see git_rig/rig_resolve_commit above) — there is no
+# existing cross-script import convention for these.
+#
+# FAIL-CLOSED: any non-"0"/empty/error count → rc1 (treated as NOT merged), so
+# callers keep bouncing to the existing (safe) needs-rebase path on any doubt.
+rig_content_merged() {
+  local main_ref="$1" branch_ref="$2"
+  local n
+  n=$(git_rig rev-list --count --cherry-pick --right-only "${main_ref}...${branch_ref}" 2>/dev/null || echo ERR)
+  [ "$n" = "0" ]
+}
+
 # ── ga-78n2z: union-aware conflict pre-check ──────────────────────────────────
 # GATE_UNION_AWARE_PRECHECK=1 (default ON) makes the merge-tree pre-check honor
 # the `merge=union` gitattributes driver. =0 restores the EXACT legacy behavior
@@ -2207,16 +2234,32 @@ log "  branch_sha=$BRANCH_SHA"
 # sessions and produces duplicate gate-failed/passed noise.
 # DETECT: if merge-base --is-ancestor origin/$BRANCH origin/$DEFAULT_BRANCH → true
 # → mark marker gate-status:done/superseded and exit cleanly.
+#
+# ga-01yq: the is-ancestor check alone is FALSE BY CONSTRUCTION after a
+# rebase-merge (new shas on main) even when the branch's content is 100%
+# merged. Before concluding "not merged" (and falling into Step 4c below,
+# which can bounce to needs-rebase and invite a dangerous "merge main + push"
+# re-submission of pre-rebase files), fall back to the patch-id content check.
 
 ALREADY_MERGED=0
+MERGED_BY_REBASE=0
 if git_rig merge-base --is-ancestor "origin/$BRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null; then
   ALREADY_MERGED=1
+elif rig_content_merged "origin/$DEFAULT_BRANCH" "origin/$BRANCH"; then
+  ALREADY_MERGED=1
+  MERGED_BY_REBASE=1
 fi
 
 if [ "$ALREADY_MERGED" = "1" ]; then
-  log "Branch $BRANCH is already merged into $DEFAULT_BRANCH — superseding marker $MARKER_ID."
-  set_gate_status "$MARKER_ID" "superseded"
-  bd -C "$GC_CITY" comment "$MARKER_ID" "Branch $BRANCH is already merged into $DEFAULT_BRANCH (SHA $BRANCH_SHA is ancestor of main). Gate skipped — no reviewers needed." 2>/dev/null || true
+  if [ "$MERGED_BY_REBASE" = "1" ]; then
+    log "Branch $BRANCH is merged-by-rebase into $DEFAULT_BRANCH (not an ancestor by SHA, but 0 unmerged patches by content) — superseding marker $MARKER_ID (ga-01yq)."
+    set_gate_status "$MARKER_ID" "superseded"
+    bd -C "$GC_CITY" comment "$MARKER_ID" "Branch $BRANCH is merged-by-rebase into $DEFAULT_BRANCH: not a SHA ancestor (a rebase-merge replays commits under new shas) but every branch commit's patch is already present in main (git rev-list --cherry-pick --right-only == 0). Gate skipped — no reviewers needed, no rebase requested (ga-01yq)." 2>/dev/null || true
+  else
+    log "Branch $BRANCH is already merged into $DEFAULT_BRANCH — superseding marker $MARKER_ID."
+    set_gate_status "$MARKER_ID" "superseded"
+    bd -C "$GC_CITY" comment "$MARKER_ID" "Branch $BRANCH is already merged into $DEFAULT_BRANCH (SHA $BRANCH_SHA is ancestor of main). Gate skipped — no reviewers needed." 2>/dev/null || true
+  fi
   # ga-jhyu: CLOSE the marker at terminal (superseded) so it is reaped, not left OPEN.
   bd -C "$GC_CITY" close "$MARKER_ID" -r "Gate marker terminal: SUPERSEDED (branch $BRANCH already merged to $DEFAULT_BRANCH). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
 
