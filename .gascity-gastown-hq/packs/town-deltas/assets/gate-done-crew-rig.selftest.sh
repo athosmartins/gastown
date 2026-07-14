@@ -117,6 +117,37 @@ bead_rig() {
   printf 'unknown'
 }
 
+# ── Stub bead-existence probe (mirrors `bd -C <path> show <id>` exit code) ────
+# Reuses the HQ_BEADS/WA_BEADS membership lists above as the source of truth for
+# which ids "exist" in which store, for the ga-u4yi validation replica below.
+bead_exists_in_store() {
+  local path="$1" id="$2"
+  case "$path" in
+    */.gascity-gastown-hq)
+      case "$HQ_BEADS" in *" $id "*) return 0;; *) return 1;; esac ;;
+    */whatsapp_automation)
+      case "$WA_BEADS" in *" $id "*) return 0;; *) return 1;; esac ;;
+    *) return 1 ;;
+  esac
+}
+
+# validate_bead_id <bead_id> — replica of the ga-u4yi validation block: probe HQ,
+# then every registered rig store; empty result means "discard, does not resolve
+# anywhere" (the fix for the "demand-mobile" phantom bead_id bug).
+validate_bead_id() {
+  local bead_id="$1" rig_path
+  [ -z "$bead_id" ] && { printf ''; return; }
+  if bead_exists_in_store "/Users/athos/gt/.gascity-gastown-hq" "$bead_id"; then
+    printf '%s' "$bead_id"; return
+  fi
+  for rig_path in $(printf '%s' "$RIG_LIST_JSON" | jq -r '.rigs[].path // empty' 2>/dev/null); do
+    if bead_exists_in_store "$rig_path" "$bead_id"; then
+      printf '%s' "$bead_id"; return
+    fi
+  done
+  printf ''
+}
+
 echo "gate-done-crew-rig.selftest.sh (ga-owfll)"
 echo "  source: $GATE_DONE"
 echo
@@ -180,6 +211,38 @@ BR=$(bead_rig "wa-27jn"); [ "$BR" = "whatsapp_automation" ] \
   && ok "(F2) rig bead wa-27jn → bead_rig=whatsapp_automation (got: $BR)" \
   || bad "(F2) wa-27jn owning store → expected whatsapp_automation, got: $BR"
 
+# ── (H) ga-u4yi: bead_id VALIDATION discards non-existent regex matches ───────
+# Root bug (ga-u4yi, filed by thies-wa): the crew/*/* regex is syntactic, not
+# semantic — on a descriptive branch (crew/thies/demand-mobile-phase2) it happily
+# matches "demand-mobile", which is NOT a bead. Because that value is non-empty,
+# the SECONDARY fallback and FAIL-CLOSED guard (both gate on `-z "$BEAD_ID"`) were
+# skipped, and a marker shipped with a phantom source-bead no reviewer could find.
+B=$(extract_bead_from_branch "crew/thies/demand-mobile-phase2")
+[ "$B" = "demand-mobile" ] \
+  && ok "(H1) regex still extracts 'demand-mobile' from descriptive branch (pre-validation)" \
+  || bad "(H1) expected regex extraction 'demand-mobile', got: $B"
+V=$(validate_bead_id "$B")
+[ -z "$V" ] \
+  && ok "(H2) ga-u4yi repro: 'demand-mobile' does not resolve → validation discards it (got: '$V')" \
+  || bad "(H2) ga-u4yi repro: expected discard (empty), got: '$V' — REGRESSION of ga-u4yi"
+
+# real beads — in HQ and in a rig store — must SURVIVE validation (no false positives)
+B=$(extract_bead_from_branch "crew/batista/wa-27jn-desc"); V=$(validate_bead_id "$B")
+[ "$V" = "wa-27jn" ] \
+  && ok "(H3) real rig bead survives validation: wa-27jn (got: '$V')" \
+  || bad "(H3) expected wa-27jn to survive validation, got: '$V'"
+B=$(extract_bead_from_branch "crew/batista/ga-5uhbs"); V=$(validate_bead_id "$B")
+[ "$V" = "ga-5uhbs" ] \
+  && ok "(H4) real HQ bead survives validation: ga-5uhbs (got: '$V')" \
+  || bad "(H4) expected ga-5uhbs to survive validation, got: '$V'"
+
+# the generic (non-crew) branch case has the SAME class of bug — no trailing '-'
+# guarantees the match is a real bead either — validation must catch it too.
+B=$(extract_bead_from_branch "fix/totally-fake-desc"); V=$(validate_bead_id "$B")
+[ -z "$V" ] \
+  && ok "(H5) generic-path bogus match also discarded: 'totally-fake' (got: '$V')" \
+  || bad "(H5) expected discard for bogus generic match, got: '$V'"
+
 # ── (G) source drift-guards against deployed gate-done.md ─────────────────────
 if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
@@ -200,6 +263,9 @@ if [ -f "$GATE_DONE" ]; then
   else
     ok "(G4) gate-done.md no longer leaks the raw agent name into RIG (live code)"
   fi
+  printf '%s' "$src" | grep -q '_BEAD_ID_RESOLVED' \
+    && ok "(G5) gate-done.md validates bead_id existence before trusting the regex match (ga-u4yi)" \
+    || bad "(G5) gate-done.md missing ga-u4yi bead_id existence validation"
 else
   bad "(G) gate-done.md not found at $GATE_DONE"
 fi

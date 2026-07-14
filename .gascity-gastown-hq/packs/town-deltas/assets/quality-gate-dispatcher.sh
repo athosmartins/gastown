@@ -2071,6 +2071,15 @@ if [ -z "$BRANCH_SHA" ]; then
       -s "Gate circuit-break: $BRANCH absent from origin (${BEAD_ID:-unknown})" \
       -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) is ABSENT from origin — gate cannot review or merge it. Auto-circuit-broken (ga-acb): marker permanently parked at gate-status:error; source bead set gate:needs-human. Human or Mayor decision required: re-push the branch or close the bead." 2>/dev/null \
       || warn "Could not mail Mayor for circuit-break on $BRANCH"
+    # ga-u4yi: mail the AUTHOR too, not just the Mayor — a bd comment alone left
+    # thies-wa's branch rotting 20h in silence because nothing durable told her
+    # she was stuck. Mail (not nudge) survives a dead/restarted author session.
+    if [ -n "$AUTHOR" ]; then
+      gc --city "$GC_CITY" mail send "$AUTHOR" \
+        -s "Gate needs-human: your branch $BRANCH is gone from origin ($BEAD_ID)" \
+        -m "Your branch $BRANCH (bead $BEAD_ID) is ABSENT from origin — the gate cannot review or merge a branch that doesn't exist on the remote. Source bead $BEAD_ID is now labeled gate:needs-human: the Pilot will NOT re-dispatch it, and any further /gate-done resubmission for this bead will be silently parked until a human resolves this. Re-push the branch (or ask the Mayor to re-anchor the work) before resubmitting." \
+        2>/dev/null || warn "Could not mail author $AUTHOR for circuit-break on $BRANCH"
+    fi
     log "ga-acb circuit-break: branch $BRANCH absent from origin — marker $MARKER_ID parked, bead $BEAD_ID needs-human."
     exit 1
   fi
@@ -2474,6 +2483,13 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
         -s "Gate circuit-break: $BRANCH large divergence + dead author (${BEAD_ID:-unknown})" \
         -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) is ${REBASE_AHEAD:-?} commits ahead of main (> ${GATE_REBASE_AHEAD_MAX} max) with no live author session. Auto-circuit-broken (ga-acb): marker parked at gate-status:error; source bead set gate:needs-human. Human or Mayor must re-anchor the work or close the bead." 2>/dev/null \
         || warn "Could not mail Mayor for ahead_dead circuit-break on $BRANCH"
+      # ga-u4yi: durable mail to the AUTHOR too (see no_branch site above for why).
+      if [ -n "$AUTHOR" ]; then
+        gc --city "$GC_CITY" mail send "$AUTHOR" \
+          -s "Gate needs-human: $BRANCH diverged too far from main ($BEAD_ID)" \
+          -m "Your branch $BRANCH (bead $BEAD_ID) is ${REBASE_AHEAD:-?} commits ahead of main (> ${GATE_REBASE_AHEAD_MAX} max) and your session was not live to resolve the rebase. Source bead $BEAD_ID is now labeled gate:needs-human: the Pilot will NOT re-dispatch it, and any further /gate-done resubmission will be silently parked until a human resolves this. A human or the Mayor must re-anchor the work." \
+          2>/dev/null || warn "Could not mail author $AUTHOR for ahead_dead circuit-break on $BRANCH"
+      fi
       REBASE_EVENT="dispatcher_circuit_break_ahead_dead"
       REBASE_VERDICT="CIRCUIT-BREAK (ahead=${REBASE_AHEAD:-?} > max=${GATE_REBASE_AHEAD_MAX}, dead author)"
       log "ga-acb circuit-break: $BRANCH ahead_dead — marker $MARKER_ID parked, bead $BEAD_ID needs-human."
@@ -2614,6 +2630,13 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
             -s "Gate circuit-break: $BRANCH retries exhausted + dead author (${BEAD_ID:-unknown})" \
             -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) could not auto-rebase vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). ${CONFLICT_FILES:-unknown}. Auto-rebase failed $MAX_REBASE_ATTEMPTS times and the author session is gone. Auto-circuit-broken (ga-acb): marker parked at gate-status:error; source bead set gate:needs-human. Human or Mayor decision required." 2>/dev/null \
             || warn "Could not mail Mayor for retry_dead circuit-break on $BRANCH"
+          # ga-u4yi: durable mail to the AUTHOR too (see no_branch site above for why).
+          if [ -n "$AUTHOR" ]; then
+            gc --city "$GC_CITY" mail send "$AUTHOR" \
+              -s "Gate needs-human: $BRANCH could not auto-rebase ($BEAD_ID)" \
+              -m "Your branch $BRANCH (bead $BEAD_ID) could not be auto-rebased onto origin/$DEFAULT_BRANCH after $MAX_REBASE_ATTEMPTS attempts, and your session was not live to resolve conflicts. Source bead $BEAD_ID is now labeled gate:needs-human: the Pilot will NOT re-dispatch it, and any further /gate-done resubmission will be silently parked until a human resolves this. A human or the Mayor must re-anchor the work." \
+              2>/dev/null || warn "Could not mail author $AUTHOR for retry_dead circuit-break on $BRANCH"
+          fi
           REBASE_EVENT="dispatcher_circuit_break_retry_dead"
           REBASE_VERDICT="CIRCUIT-BREAK (retry_dead: ${MAX_REBASE_ATTEMPTS} attempts exhausted, dead author)"
         else
@@ -4251,6 +4274,17 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
             "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$BRANCH" "$RIG" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
           2>/dev/null || warn "Could not mail Mayor escalation for $BEAD_ID"
         notify -t "Gate needs-human" -p 4 "$BEAD_ID exhausted $GATE_FIX_CAP gate fix attempts — Mayor escalated" 2>/dev/null || true
+        # ga-u4yi: durable mail to the AUTHOR too — a bd comment alone left
+        # thies-wa's branch rotting 20h in silence because nothing durable told
+        # her she was stuck (only Mayor was mailed; mail, not nudge, survives a
+        # dead/restarted author session).
+        if [ -n "$AUTHOR" ]; then
+          gc --city "$GC_CITY" mail send "$AUTHOR" \
+            -s "Gate needs-human: your branch $BRANCH exhausted $GATE_FIX_CAP fix attempts" \
+            -m "$(printf 'Your branch %s (bead %s) failed the quality gate %s times. Auto-retry is now DISABLED (label gate:needs-human): the Pilot will NOT re-dispatch this bead, and any further /gate-done resubmission will be silently parked until a human resolves this.\n\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene before this can proceed.' \
+              "$BRANCH" "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
+            2>/dev/null || warn "Could not mail author $AUTHOR for gate-fix-cap escalation on $BEAD_ID"
+        fi
       fi
       # ga-5w0hr: a needs-human bead has NO active worker — the gate just gave up
       # auto-retry. Mirror the needs-fix-branch cleanup so the bead is honestly

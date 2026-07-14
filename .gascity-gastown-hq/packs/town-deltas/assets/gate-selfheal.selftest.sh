@@ -100,6 +100,25 @@ printf '%s\n' "$CAP_BLOCK" | grep -Eq 'assign "\$BEAD_ID" ""' \
   && ok "cap branch clears stale builder assignee" \
   || bad "cap branch leaves stale assignee (hides bead from Pilot _filter_candidates)"
 
+echo "── 8. drift-guard: ga-u4yi — AUTHOR (not just Mayor) is mailed at every gate:needs-human transition ──"
+# Bug ga-u4yi (thies-wa, P1): a branch parked at gate:needs-human rotted 20h in
+# total silence because only the Mayor was mailed — the AUTHOR had no durable
+# signal, only an ephemeral bd comment. Fix: mail "$AUTHOR" (survives a dead/
+# restarted session, unlike nudge) at EVERY site that applies gate:needs-human.
+# There are exactly 4 such sites: no_branch, ahead_dead, retry_dead, cap-exhaustion.
+eq "gate mails AUTHOR at all 4 gate:needs-human sites (ga-u4yi)" \
+   "$(grep -c 'mail send "\$AUTHOR"' "$GATE")" "4"
+grep -q 'mail send "\$AUTHOR"' "$GATE" \
+  && ok "gate escalates to the AUTHOR, not just Mayor" \
+  || bad "gate still only mails Mayor — author has no durable needs-human signal (ga-u4yi regression)"
+# The cap-exhaustion author-mail MUST live inside the SAME once-only idempotency
+# guard as the existing Mayor mail, or a bead already needs-human before this
+# code path re-triggers (defensively) would re-mail the author every time.
+CAP_MAIL_BLOCK="$(awk '/Escalate EXACTLY once/{f=1} f{print} f&&/^      fi[[:space:]]*$/{exit}' "$GATE")"
+printf '%s\n' "$CAP_MAIL_BLOCK" | grep -q 'mail send "\$AUTHOR"' \
+  && ok "cap-exhaustion author-mail is inside the escalate-exactly-once guard" \
+  || bad "cap-exhaustion author-mail is OUTSIDE the once-only guard — would spam on re-entry"
+
 echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"

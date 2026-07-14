@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# gate-needs-human-divergence-sweep.selftest.sh — prove the ga-u4yi divergence
+# watch in isolation, with NO live Dolt/gc/launchd and NO network.
+#
+# Sources the sweep in lib-only mode for the REAL functions (one source of
+# truth, no copy-drift), then:
+#   • unit-tests branch_touched_files and files_diverged (the two functions
+#     that implement ga-u4yi's suggested signal, `git log main -- <files>`)
+#     across every case: no divergence yet, a colliding commit, an unrelated
+#     commit that must NOT trigger, and unresolvable refs;
+#   • unit-tests the retention/age helpers and in_list membership check;
+#   • unit-tests the rig container/self git-dir resolution + git_in dispatch;
+#   • DRIFT-GUARDS the live wiring in the sweep and the plist, and the
+#     companion author-mail fix in quality-gate-dispatcher.sh.
+# Exit 0 iff every assertion holds.
+
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SWEEP="$SELF_DIR/gate-needs-human-divergence-sweep.sh"
+PLIST="$SELF_DIR/gate-needs-human-divergence-sweep.plist"
+DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
+
+PASS=0
+FAIL=0
+ok()  { echo "  ✓ $*"; PASS=$((PASS+1)); }
+bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
+eq()  { if [ "$2" = "$3" ]; then ok "$1 (=$2)"; else bad "$1: expected [$3], got [$2]"; fi; }
+rc0() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$d"; else bad "$d — expected rc0 from: $*"; fi; }
+rc1() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then bad "$d — expected non-zero from: $*"; else ok "$d"; fi; }
+
+# ── Load the REAL functions (lib-only = no live sweep) ──────────────────────
+DIVERGENCE_LIB_ONLY=1 source "$SWEEP" \
+  || { echo "FATAL: could not source sweep in lib-only mode"; exit 1; }
+for fn in branch_touched_files files_diverged rig_gitdir git_in iso_to_epoch entry_within_retention in_list; do
+  type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by sweep"; exit 1; }
+done
+
+# ── Real-git fixture (local only, no network) ───────────────────────────────
+T="$(mktemp -d 2>/dev/null || mktemp -d -t gau4yi)"
+trap 'rm -rf "$T" 2>/dev/null || true' EXIT
+R="$T/repo"
+git init -q -b main "$R"
+git -C "$R" config user.email t@example.com
+git -C "$R" config user.name  tester
+echo a > "$R/a.txt"; echo b > "$R/b.txt"; git -C "$R" add .; git -C "$R" commit -q -m "C1 (a,b)"
+
+# Feature branch off C1, touches ONLY c.txt (the file we'll watch).
+git -C "$R" checkout -q -b feature
+echo c > "$R/c.txt"; git -C "$R" add .; git -C "$R" commit -q -m "feature: add c"
+FEATURE=$(git -C "$R" rev-parse HEAD)
+git -C "$R" checkout -q main
+
+# Main advances touching a.txt (UNRELATED to feature's files) — must NOT count.
+echo a2 >> "$R/a.txt"; git -C "$R" add .; git -C "$R" commit -q -m "main: touch a (unrelated)"
+BASELINE=$(git -C "$R" rev-parse HEAD)
+
+git -C "$R" update-ref refs/remotes/origin/main "$BASELINE"
+git -C "$R" update-ref refs/remotes/origin/feature "$FEATURE"
+
+# ── 1. branch_touched_files — the "what to watch" seed ──────────────────────
+echo "── 1. branch_touched_files (triple-dot diff, same as dispatcher CHANGED_FILES) ──"
+eq "feature vs main → touches exactly c.txt" \
+   "$(branch_touched_files "$R" 0 "origin/main" "origin/feature")" "c.txt"
+
+# ── 2. files_diverged — ga-u4yi's core signal ────────────────────────────────
+echo "── 2. files_diverged (git log baseline..main -- files) ──"
+eq "no new commits on main yet → empty (not diverging)" \
+   "$(files_diverged "$R" 0 "$BASELINE" "origin/main" "c.txt")" ""
+
+echo c2 >> "$R/c.txt"; git -C "$R" add .; git -C "$R" commit -q -m "main: touch c (COLLIDES with feature)"
+COLLIDE_SHA=$(git -C "$R" rev-parse --short HEAD)
+git -C "$R" update-ref refs/remotes/origin/main HEAD
+
+case "$(files_diverged "$R" 0 "$BASELINE" "origin/main" "c.txt")" in
+  "$COLLIDE_SHA"*"COLLIDES"*) ok "colliding commit on watched file → detected ($COLLIDE_SHA)" ;;
+  *) bad "expected to detect colliding commit $COLLIDE_SHA, got: $(files_diverged "$R" 0 "$BASELINE" "origin/main" "c.txt")" ;;
+esac
+
+eq "unrelated file (never touched) → still empty" \
+   "$(files_diverged "$R" 0 "$BASELINE" "origin/main" "z.txt")" ""
+
+eq "no files given → empty (nothing to watch)" \
+   "$(files_diverged "$R" 0 "$BASELINE" "origin/main")" ""
+
+eq "unresolvable baseline → empty (fails safe, not error)" \
+   "$(files_diverged "$R" 0 "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" "origin/main" "c.txt")" ""
+
+eq "unresolvable main_ref → empty (fails safe, not error)" \
+   "$(files_diverged "$R" 0 "$BASELINE" "origin/does-not-exist" "c.txt")" ""
+
+# ── 3. age / retention + membership helpers ─────────────────────────────────
+echo "── 3. age / retention / in_list helpers ──"
+TS="2026-06-11T00:00:00Z"
+EXP=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$TS" +%s 2>/dev/null || echo X)
+eq "iso_to_epoch parses UTC ts" "$(iso_to_epoch "$TS")" "$EXP"
+NOW=$(date -u +%s)
+TS_RECENT=$(date -u -r $(( NOW - 86400 ))     +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+TS_OLD=$(date    -u -r $(( NOW - 45*86400 ))  +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+rc0 "1-day-old entry within 30d retention"    entry_within_retention "$TS_RECENT" "$NOW" 30
+rc1 "45-day-old entry outside 30d retention"  entry_within_retention "$TS_OLD" "$NOW" 30
+rc0 "unparseable ts FAILS OPEN (kept)"        entry_within_retention "garbage" "$NOW" 30
+rc0 "in_list finds a present element"         in_list "wa-jbrjj" "ga-abc" "wa-jbrjj" "wa-xyz"
+rc1 "in_list misses an absent element"        in_list "wa-nope" "ga-abc" "wa-jbrjj"
+
+# ── 4. rig_gitdir + git_in dispatch ──────────────────────────────────────────
+echo "── 4. rig container/self resolution ──"
+mkdir -p "$T/crig/.repo.git" "$T/srig"
+eq "container rig → .repo.git + flag 1" "$(rig_gitdir "$T/crig")" "$(printf '%s\t1' "$T/crig/.repo.git")"
+eq "self rig → path + flag 0"           "$(rig_gitdir "$T/srig")" "$(printf '%s\t0' "$T/srig")"
+eq "git_in self (container=0)"          "$(git_in "$R" 0 rev-parse --abbrev-ref HEAD)" "main"
+
+# ── 5. drift-guard: sweep wiring ─────────────────────────────────────────────
+echo "── 5. drift-guard: sweep wiring ──"
+grep -q 'DIVERGENCE_LIB_ONLY'                "$SWEEP" && ok "sweep sourceable in lib-only mode"       || bad "missing lib-only hook"
+grep -q 'files_diverged()'                   "$SWEEP" && ok "defines files_diverged"                  || bad "missing files_diverged def"
+grep -q 'branch_touched_files()'             "$SWEEP" && ok "defines branch_touched_files"             || bad "missing branch_touched_files def"
+grep -q 'escalate_diverging()'               "$SWEEP" && ok "defines escalate_diverging"               || bad "missing escalate_diverging def"
+grep -q 'gate:needs-human:diverging'         "$SWEEP" && ok "labels escalated bead diverging"          || bad "diverging label missing"
+grep -q 'mail send "\$author"'               "$SWEEP" && ok "escalates to the AUTHOR"                  || bad "author escalation missing"
+grep -q 'mail send mayor'                    "$SWEEP" && ok "escalates to the Mayor"                   || bad "Mayor escalation missing"
+grep -Eq 'label "gate:needs-human" --status=open' "$SWEEP" && ok "queries the live gate:needs-human candidate set" || bad "candidate query missing/changed"
+grep -q -- '--all'                           "$SWEEP" && ok "marker lookup includes CLOSED markers (--all)"  || bad "marker lookup missing --all (would miss every parked marker)"
+grep -q 'entry_within_retention'             "$SWEEP" && ok "retention backstop wired"                 || bad "retention backstop missing"
+grep -q 'should_alert'                       "$SWEEP" && ok "per-bead escalation rate-limit wired"     || bad "rate-limit missing"
+grep -q 'DIVERGENCE_DRY_RUN'                 "$SWEEP" && ok "dry-run supported"                        || bad "dry-run support missing"
+grep -q 'date -u -j -f "%Y-%m-%dT%H:%M:%SZ"' "$SWEEP" && ok "iso_to_epoch uses -u (UTC age, ga-35zp1)"  || bad "missing -u UTC guard"
+# The primary pruner MUST be presence-in-candidates, not just time — a bead
+# that resolves in 10 minutes should stop being tracked in 10 minutes, not
+# linger for the full retention window.
+grep -q 'no longer gate:needs-human'         "$SWEEP" && ok "prunes on resolution (not just time)"      || bad "presence-based pruning missing"
+
+# ── 6. drift-guard: plist ────────────────────────────────────────────────────
+echo "── 6. drift-guard: plist ──"
+if [ -f "$PLIST" ]; then
+  grep -q 'com.gascity.gate-needs-human-divergence-sweep' "$PLIST" && ok "plist Label correct"     || bad "plist Label wrong"
+  grep -q '<key>StartInterval</key>'                       "$PLIST" && ok "plist uses StartInterval" || bad "plist missing StartInterval"
+  grep -q '<key>RunAtLoad</key><true/>'                    "$PLIST" && ok "plist RunAtLoad=true"     || bad "plist missing RunAtLoad"
+  grep -q 'gate-needs-human-divergence-sweep.sh'           "$PLIST" && ok "plist points at the sweep script" || bad "plist ProgramArguments wrong"
+else
+  bad "plist not found at $PLIST"
+fi
+
+# ── 7. drift-guard: companion author-mail fix in the dispatcher (ga-u4yi) ───
+echo "── 7. drift-guard: companion fix — dispatcher mails AUTHOR at needs-human transitions ──"
+if [ -f "$DISPATCHER" ]; then
+  eq "dispatcher mails AUTHOR at all 4 gate:needs-human sites (ga-u4yi)" \
+     "$(grep -c 'mail send "\$AUTHOR"' "$DISPATCHER")" "4"
+else
+  bad "dispatcher not found at $DISPATCHER"
+fi
+
+echo ""
+echo "──────────────────────────────────────────"
+echo "  PASS=$PASS  FAIL=$FAIL"
+if [ "$FAIL" -gt 0 ]; then echo "  RESULT: FAIL"; exit 1; fi
+echo "  RESULT: PASS"; exit 0

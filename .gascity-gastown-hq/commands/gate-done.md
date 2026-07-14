@@ -111,6 +111,34 @@ case "$BRANCH" in
     ;;
 esac
 
+# ga-u4yi: VALIDATE the regex match before trusting it. The patterns above are
+# syntactic, not semantic — on a descriptively-named crew branch
+# (crew/thies/demand-mobile-phase2) the crew/*/* case happily matches
+# "demand-mobile", a token that is NOT a bead id. Because that value is
+# non-empty, both the SECONDARY fallback and the FAIL-CLOSED guard below (which
+# gate on `-z "$BEAD_ID"`) would be skipped, and a marker would ship with a
+# phantom source-bead no reviewer can ever find. Probe HQ, then every
+# registered rig's store (a bead can legitimately live in either); discard the
+# match if it resolves nowhere so the real checks below get a chance to run.
+RIG_LIST_JSON=$(gc --city "$GC_CITY_PATH" rig list --json 2>/dev/null || echo '{}')
+if [ -n "$BEAD_ID" ]; then
+  _BEAD_ID_RESOLVED=""
+  if bd -C "$GC_CITY_PATH" show "$BEAD_ID" >/dev/null 2>&1; then
+    _BEAD_ID_RESOLVED=1
+  else
+    for _RIG_PATH in $(printf '%s' "$RIG_LIST_JSON" | jq -r '.rigs[].path // empty' 2>/dev/null); do
+      if bd -C "$_RIG_PATH" show "$BEAD_ID" >/dev/null 2>&1; then
+        _BEAD_ID_RESOLVED=1
+        break
+      fi
+    done
+  fi
+  if [ -z "$_BEAD_ID_RESOLVED" ]; then
+    echo "Note: '$BEAD_ID' parsed from branch '$BRANCH' does not resolve to a real bead — discarding, will try fallback."
+    BEAD_ID=""
+  fi
+fi
+
 # SECONDARY: if branch doesn't embed a bead ID (uncommon), fall back to the
 # session's in_progress bead that carries story:in-flight — that label is ONLY on
 # story/bug beads, not on sling/task beads from the gate-dispatcher.
@@ -141,8 +169,7 @@ if [ -z "$BEAD_ID" ]; then
 fi
 AUTHOR="${GC_ALIAS:-${BEADS_ACTOR:-$(git config user.name)}}"
 BASE_COMMIT=$(git rev-parse origin/main 2>/dev/null || echo "unknown")
-# Derive rig from gc rig list (authoritative).
-RIG_LIST_JSON=$(gc --city "$GC_CITY_PATH" rig list --json 2>/dev/null || echo '{}')
+# Rig list (RIG_LIST_JSON) was already fetched above during bead_id validation.
 CWD_TOP=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 
 # ga-owfll PRIMARY: the rig whose registered path == cwd OR is an ANCESTOR of cwd.
