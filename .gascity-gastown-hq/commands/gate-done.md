@@ -176,8 +176,15 @@ CWD_TOP=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 # Crew members work in <rig>/crew/<name> — a SUBDIR of the registered rig path — so
 # the old EXACT match (.path == $cwd) never matched for them. Match by ancestry and
 # take the LONGEST (deepest) path to disambiguate any nested layout.
+# ga-8a9n: bind .path to $p BEFORE the pipe — `$cwd | startswith(.path + "/")`
+# rebinds `.` to the STRING $cwd for everything after the pipe, so the bare
+# `.path` inside startswith() tried to index a string and crashed. Since
+# `[.rigs[] | select(...)]` collects every output into one array, a SINGLE
+# crashing element (any rig that isn't an exact cwd match) poisoned the whole
+# result — so this crashed on nearly every invocation, silently falling
+# through to the bead-prefix/agent-suffix fallbacks below.
 RIG=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg cwd "$CWD_TOP" '
-    [ .rigs[] | select(($cwd == .path) or ($cwd | startswith(.path + "/"))) ]
+    [ .rigs[] | select(.path as $p | ($cwd == $p) or ($cwd | startswith($p + "/"))) ]
     | sort_by(.path | length) | last | .name // empty' 2>/dev/null || echo "")
 
 # ga-owfll FALLBACK 1: map the source bead's PREFIX to a rig (wa-27jn → wa →

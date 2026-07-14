@@ -28,6 +28,10 @@
 #   (G)  Source drift-guards: deployed gate-done.md uses ancestor matching, crew
 #        branch extraction, bead_rig recording, and does NOT contain the raw
 #        `${GC_AGENT%%/*}` → RIG leak.
+#   (I)  ga-8a9n: the ancestor-match OR crashes jq (`.` corrupted by a leading
+#        pipe) unless `.path` is bound to a local var before the pipe; a single
+#        crashing rig-list element poisons the whole `[...]` array construction,
+#        so this fired on nearly every invocation, masked by the fallbacks.
 #
 # Exit 0 iff every assertion holds.
 set -uo pipefail
@@ -68,8 +72,9 @@ RIG_LIST_JSON='{"rigs":[
 derive_rig() {
   local cwd="$1" bead_id="$2" gc_agent="$3" rig="" bpfx asfx
   # PRIMARY: rig whose path == cwd OR is an ANCESTOR of cwd (longest match).
+  # ga-8a9n: .path bound to $p BEFORE the pipe — see (I) below for why.
   rig=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg cwd "$cwd" '
-    [ .rigs[] | select(($cwd == .path) or ($cwd | startswith(.path + "/"))) ]
+    [ .rigs[] | select(.path as $p | ($cwd == $p) or ($cwd | startswith($p + "/"))) ]
     | sort_by(.path | length) | last | .name // empty' 2>/dev/null || echo "")
   # FALLBACK 1: source-bead prefix → rig.
   if [ -z "$rig" ] || [ "$rig" = "null" ]; then
@@ -243,12 +248,61 @@ B=$(extract_bead_from_branch "fix/totally-fake-desc"); V=$(validate_bead_id "$B"
   && ok "(H5) generic-path bogus match also discarded: 'totally-fake' (got: '$V')" \
   || bad "(H5) expected discard for bogus generic match, got: '$V'"
 
+# ── (I) ga-8a9n: jq `.` context-corruption crash in the ancestor-match OR ─────
+# `$cwd | startswith(.path + "/")` rebinds `.` to the STRING $cwd via the
+# leading pipe, so `.path` inside startswith() tries to index a string and jq
+# errors ("Cannot index string with string \"path\""). Because
+# `[.rigs[] | select(...)]` collects every output into ONE array, a single
+# crashing element poisons the whole array construction — so this fired on
+# nearly every invocation (any rig that wasn't an exact cwd match reached the
+# crashing branch), silently masked by the fallbacks below it.
+GA8A9N_ERR="$(mktemp)"
+
+# (I1) repro from the bug report: 2-entry array, cwd = the deeper entry. The
+# FIXED filter must resolve it with NO jq error.
+REPRO_JSON='[{"path":"/foo"},{"path":"/foo/bar"}]'
+: > "$GA8A9N_ERR"
+I1_OUT=$(printf '%s' "$REPRO_JSON" | jq -r --arg cwd "/foo/bar" '
+    [ .[] | select(.path as $p | ($cwd == $p) or ($cwd | startswith($p + "/"))) ]
+    | sort_by(.path | length) | last | .path // empty' 2>"$GA8A9N_ERR")
+I1_RC=$?
+[ "$I1_RC" -eq 0 ] && [ "$I1_OUT" = "/foo/bar" ] \
+  && ok "(I1) fixed jq resolves the repro with no error (got: '$I1_OUT')" \
+  || bad "(I1) fixed jq repro failed (out='$I1_OUT' rc=$I1_RC stderr='$(cat "$GA8A9N_ERR" 2>/dev/null)')"
+
+# (I2) mutation guard: the ORIGINAL buggy filter (before the `.path as $p`
+# binding) MUST still crash on this exact repro — proves (I1) would actually
+# catch a reversion of the fix, not just happen to pass either way.
+: > "$GA8A9N_ERR"
+printf '%s' "$REPRO_JSON" | jq -r --arg cwd "/foo/bar" '
+    [ .[] | select(($cwd == .path) or ($cwd | startswith(.path + "/"))) ]
+    | sort_by(.path | length) | last | .path // empty' >/dev/null 2>"$GA8A9N_ERR"
+I2_RC=$?
+[ "$I2_RC" -ne 0 ] && grep -q 'Cannot index string' "$GA8A9N_ERR" \
+  && ok "(I2) mutation check: reverting the fix reproduces the original jq crash (rc=$I2_RC)" \
+  || bad "(I2) mutation check: reverted (buggy) jq unexpectedly succeeded — (I1) would NOT catch this regression"
+
+# (I3) exact-match on a non-HQ rig, through derive_rig() with EMPTY bead_id and
+# gc_agent — neither fallback can fire, so a correct result can only come from
+# PRIMARY. This is the case ga-8a9n flagged as silently passing through
+# fallback before the fix, poisoned by the OTHER (non-matching) array elements
+# during array construction — exactly like the crew/HQ ancestor cases in (A)/(B).
+R=$(derive_rig "/Users/athos/gt/whatsapp_automation" "" "")
+[ "$R" = "whatsapp_automation" ] \
+  && ok "(I3) exact-path match via PRIMARY alone, no fallback available → whatsapp_automation (got: $R)" \
+  || bad "(I3) exact-path PRIMARY-only match → expected whatsapp_automation, got: $R"
+
+rm -f "$GA8A9N_ERR"
+
 # ── (G) source drift-guards against deployed gate-done.md ─────────────────────
 if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
-  printf '%s' "$src" | grep -q 'startswith(.path + "/")' \
-    && ok "(G1) gate-done.md uses ANCESTOR-path rig matching" \
-    || bad "(G1) gate-done.md missing ancestor-path rig matching (startswith(.path + \"/\"))"
+  printf '%s' "$src" | grep -qF '.path as $p' \
+    && ok "(G1) gate-done.md binds .path to a local var before the pipe (ga-8a9n jq-context fix)" \
+    || bad "(G1) gate-done.md missing '.path as \$p' binding — ga-8a9n jq-context-corruption regression"
+  printf '%s' "$src" | grep -qF 'startswith($p + "/")' \
+    && ok "(G1b) gate-done.md uses ANCESTOR-path rig matching via the bound var" \
+    || bad "(G1b) gate-done.md missing ancestor-path rig matching (startswith(\$p + \"/\"))"
   printf '%s' "$src" | grep -qE 'crew/\*/\*\)' \
     && ok "(G2) gate-done.md handles crew/<name>/<bead> branches" \
     || bad "(G2) gate-done.md missing crew/*/* branch handling"
