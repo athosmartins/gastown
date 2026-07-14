@@ -79,6 +79,37 @@ git push origin HEAD
 
 ---
 
+## Bead Is Not Buildable By You — Explicit Refusal (ga-be4x)
+
+If, after reading the bead (`bd show <id>`), you determine it is **not
+buildable by you** — wrong domain (cross-rig/framework work that belongs to
+the Mayor), no completion path in this repo (e.g. the fix is Hex-notebook-
+native and produces no git diff), or any other fundamental mismatch — do
+**NOT** just silently drain. An unexplained drain is indistinguishable from a
+crash and gets you re-dispatched to repeat the exact same analysis forever
+(ga-be4x — this already happened twice: wa-vvk58, wa-c6b3q). Instead, before
+draining:
+
+```bash
+# 1. Label the bead with your refusal + a short kebab-case reason slug
+bd label add <id> pool:refused:<reason-slug>   # e.g. cross-rig-framework, no-completion-path
+
+# 2. Leave a full human-readable explanation as a comment
+bd comment <id> "Refusing: <why this cannot be built here, what it actually needs>."
+
+# 3. Then drain normally — do NOT clear the bead's status/assignee yourself;
+#    the inflight-reclaim-guard owns that transition and needs the bead to
+#    still look in-flight to process your refusal.
+gc runtime drain-ack && exit
+```
+
+The guard treats this as a stated conclusion, not a guess: after **one more**
+independent worker reaches the same verdict, it stops re-dispatching and
+escalates straight to the Mayor with both reasons attached — no human has to
+rediscover why from scratch.
+
+---
+
 ## Mockups para Athos — S3 presigned URL (OBRIGATÓRIO)
 
 NUNCA entregue mockup como PNG, localhost ou tunnel (cloudflared já deu 404).

@@ -104,6 +104,15 @@ STALE_ACTIVITY_TTL = 1800  # 30min (ga-64usm): a matched live session whose
                          # on the bead within the same window — is a frozen /
                          # credit-limited zombie, NOT a live owner. alive != working.
 MAX_RECLAIMS = 3         # escalate instead of looping after this many reclaims
+
+# ga-be4x: a worker that EXPLICITLY refuses a bead (pool:refused[:reason] label,
+# set deliberately before draining) is a STATED conclusion, not an inferred one —
+# categorically different from an unexplained drain/crash, which MAX_RECLAIMS
+# above exists to handle. Two independent workers reaching the identical
+# stated conclusion is already sufficient signal; a 3rd re-dispatch cannot
+# out-argue an already-reasoned refusal, so this threshold is intentionally
+# lower than MAX_RECLAIMS. See reclaim_decision()'s has_explicit_refusal param.
+REFUSAL_ESCALATE_THRESHOLD = 2
 POLL_SEC = int(os.environ.get("RECLAIM_POLL_SEC", "600"))  # default 10min; was 5min
 REALERT_SEC = 900        # 15min re-alert cadence for escalated beads
 
@@ -289,6 +298,43 @@ def _has_needs_human_label(labels):
     )
 
 
+def _has_refusal_label(labels):
+    """True if labels carry an explicit worker refusal marker (ga-be4x).
+
+    pool:refused[:<reason-slug>] is a TERMINAL signal a worker sets on the bead
+    BEFORE draining, once it has determined — through actual analysis — that
+    the bead is not buildable by it (wrong domain, no completion path, etc.).
+
+    This is categorically different from reading session state (drained /
+    asleep / closed): a session-state read is an INFERENCE made after the
+    session is already gone and cannot distinguish "refused" from "crashed" —
+    that is the exact conflation ga-be4x reports. An explicit label can only
+    be set by a worker that reached a real conclusion, so it is never
+    ambiguous the way session state is.
+    """
+    return any(
+        lbl == "pool:refused" or lbl.startswith("pool:refused:")
+        for lbl in labels
+    )
+
+
+def _refusal_reason_slugs(labels):
+    """Extract reason slugs from pool:refused[:<slug>] labels, in label order.
+
+    A bare 'pool:refused' (no reason) contributes 'unspecified'. Used to seed
+    the persistent pilot:refused-reason:<slug> audit trail (ga-be4x) so a
+    Mayor reviewing an escalated bead sees WHY without re-investigating.
+    """
+    slugs = []
+    for lbl in labels:
+        if lbl == "pool:refused":
+            slugs.append("unspecified")
+        elif lbl.startswith("pool:refused:"):
+            slug = lbl[len("pool:refused:"):].strip()
+            slugs.append(slug if slug else "unspecified")
+    return slugs
+
+
 def _is_ephemeral_pool_assignee(assignee):
     """True if assignee is an ephemeral-pool bead assignee (bare template OR concrete adhoc form).
 
@@ -319,7 +365,8 @@ def _is_ephemeral_pool_assignee(assignee):
 def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
                      reclaim_count, has_needs_human, has_dispatching_marker,
                      min_stranding_secs=None, account_rate_limited=False,
-                     provably_dead=False):
+                     provably_dead=False, has_explicit_refusal=False,
+                     refusal_count=0):
     """Compute the reclaim action for one stranded in-flight bead.
 
     Args:
@@ -351,6 +398,29 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
                                  zombie and burn (the NEVERSTART respawn loop). Defaults
                                  False: callers that don't pass it keep the pre-fix
                                  hysteresis behavior exactly.
+        has_explicit_refusal:    True if the bead carries a pool:refused[:reason] label
+                                 (ga-be4x) — a worker's STATED conclusion that this bead
+                                 is not buildable by it, as opposed to an unexplained
+                                 drain/crash that provably_dead infers from session state.
+                                 A session-state read can NEVER distinguish "refused" from
+                                 "crashed" (both end up drained) — that conflation is the
+                                 root cause ga-be4x reports: a correctly-refusing worker
+                                 got re-dispatched forever because the guard could only see
+                                 "drained", identical to a real death. An explicit label
+                                 closes that gap because it can only be set by a worker
+                                 that reached an actual conclusion. Like provably_dead, it
+                                 bypasses the stranding hysteresis (the worker already told
+                                 us definitively; waiting teaches us nothing new). Unlike
+                                 provably_dead, once refusal_count crosses
+                                 REFUSAL_ESCALATE_THRESHOLD it short-circuits straight to
+                                 "escalate" ahead of the generic MAX_RECLAIMS thrash cap —
+                                 repeated re-dispatch cannot out-argue an already-reasoned,
+                                 already-corroborated refusal. Defaults False: callers that
+                                 don't pass it keep the pre-fix behavior exactly.
+        refusal_count:           current pilot:refusal-count:N from bead labels (int) — the
+                                 number of PRIOR explicit refusals already recorded for this
+                                 bead, NOT counting the one has_explicit_refusal signals for
+                                 the current cycle. Ignored unless has_explicit_refusal=True.
 
     Returns:
         action in {"reclaim", "escalate", "noop"}
@@ -371,15 +441,27 @@ def reclaim_decision(has_live_session, has_recent_branch, seconds_stranded,
         return "noop"
     if has_recent_branch:
         return "noop"
+
+    # ga-be4x: an explicit refusal is a STATED conclusion, not an inferred one.
+    # Once REFUSAL_ESCALATE_THRESHOLD independent workers reach the identical
+    # verdict, escalate immediately — checked ahead of the generic MAX_RECLAIMS
+    # thrash cap (which exists for *unexplained* death, a different failure
+    # class) so a bead never has to wait out a 3rd death-style reclaim when 2
+    # refusals already answered the question definitively.
+    if has_explicit_refusal and (refusal_count + 1) >= REFUSAL_ESCALATE_THRESHOLD:
+        return "escalate"
+
     # Bead is stranded — enforce hysteresis (wait for continuous stranding).
     # gt-fppb0 fast-path: a PROVABLY-DEAD claimant (session absent / in a
     # definitively-dead state) has no live builder the hysteresis could be
     # protecting, so skip the wait and reclaim immediately (TTL ~ 0). A merely-
     # quiet claimant (provably_dead=False) still serves the full window so a
     # live-but-idle builder (ga-64usm) is never reclaimed out from under itself.
-    if not provably_dead and seconds_stranded < min_stranding_secs:
+    # ga-be4x: an explicit refusal bypasses the same hysteresis for the same
+    # reason — the worker already told us it is done, waiting adds no signal.
+    if not provably_dead and not has_explicit_refusal and seconds_stranded < min_stranding_secs:
         return "noop"
-    # Stranded past TTL (or provably dead) — check thrash cap
+    # Stranded past TTL (or provably dead / explicitly refused) — thrash cap
     if reclaim_count >= MAX_RECLAIMS:
         return "escalate"
     return "reclaim"
@@ -1511,6 +1593,22 @@ def parse_reclaim_count(labels):
     return 0
 
 
+def parse_refusal_count(labels):
+    """Extract pilot:refusal-count:N from labels. Returns int (0 if absent or invalid).
+
+    ga-be4x: tracked SEPARATELY from pilot:reclaim-count — a bead may thrash
+    through unexplained deaths and explicit refusals in any mix, and only the
+    latter must trip the faster REFUSAL_ESCALATE_THRESHOLD circuit-breaker.
+    """
+    for lbl in labels:
+        if lbl.startswith("pilot:refusal-count:"):
+            try:
+                return int(lbl[len("pilot:refusal-count:"):])
+            except ValueError:
+                pass
+    return 0
+
+
 def _pool_of(assignee):
     """Normalize a bead assignee to its worker-pool name for pool-dead tracking (ga-dbibq).
 
@@ -1534,7 +1632,8 @@ def _pool_of(assignee):
 # Actuation helpers (label + assignee ops on real beads — CONSERVATIVE)
 # ---------------------------------------------------------------------------
 
-def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=None):
+def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=None,
+                has_explicit_refusal=False, refusal_count=0):
     """Strip story:in-flight (+pilot:dispatched if present), clear assignee,
     bump reclaim label.
 
@@ -1542,9 +1641,21 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     bead's own rig store (bd -C rig_root) instead of defaulting to HQ. HQ-native
     beads pass rig_root=None and use plain bd (existing behavior unchanged).
 
+    ga-be4x: when has_explicit_refusal is True, this reclaim was triggered by a
+    worker's STATED refusal (not an unexplained drain). In addition to the
+    normal reclaim mechanics, the ephemeral pool:refused[:reason] marker(s) are
+    consumed (removed — so a stale marker never gets mistaken for a FRESH
+    refusal by a later, unrelated drain) and folded into a permanent
+    pilot:refused-reason:<slug> audit label per reason, plus a bumped
+    pilot:refusal-count:N. Both counters advance together because a
+    refusal-triggered reclaim is still a reclaim (MAX_RECLAIMS stays a valid
+    backstop) — refusal_count just ALSO feeds the faster
+    REFUSAL_ESCALATE_THRESHOLD circuit-breaker in reclaim_decision.
+
     Returns True if all bd ops succeeded, False if any failed (still best-effort).
     """
     new_count = reclaim_count + 1
+    new_refusal_count = refusal_count + 1 if has_explicit_refusal else refusal_count
     ok = True
 
     # 0. ga-ufr7: push-before-reclaim safety net. A builder that went quiet from
@@ -1577,6 +1688,35 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
         except Exception as exc:
             print(f"[INFLIGHT-RECLAIM] warn: remove {lbl} from {bead_id}: {exc}", flush=True)
             ok = False
+
+    # 1b. ga-be4x: consume the ephemeral refusal marker(s) and fold each reason
+    #     into a PERMANENT audit label. Consuming (removing) pool:refused[:reason]
+    #     here is load-bearing: if left in place, a later UNRELATED drain (e.g. a
+    #     genuine crash on the next dispatch) would be misread as a fresh
+    #     refusal by _has_refusal_label() on the next cycle, double-counting it
+    #     against REFUSAL_ESCALATE_THRESHOLD. pilot:refused-reason:<slug> is
+    #     never removed — it accumulates so an eventual escalation can quote
+    #     every reason a worker ever gave, verbatim, without re-investigation.
+    refused_reason_slugs = []
+    if has_explicit_refusal:
+        refused_reason_slugs = _refusal_reason_slugs(labels)
+        for lbl in labels:
+            if lbl == "pool:refused" or lbl.startswith("pool:refused:"):
+                try:
+                    subprocess.run(
+                        _bd + ["label", "remove", bead_id, lbl, "-q"],
+                        capture_output=True, text=True, timeout=15)
+                except Exception as exc:
+                    print(f"[INFLIGHT-RECLAIM] warn: remove {lbl} from {bead_id}: {exc}",
+                          flush=True)
+        for slug in refused_reason_slugs:
+            try:
+                subprocess.run(
+                    _bd + ["label", "add", bead_id, f"pilot:refused-reason:{slug}", "-q"],
+                    capture_output=True, text=True, timeout=15)
+            except Exception as exc:
+                print(f"[INFLIGHT-RECLAIM] warn: add pilot:refused-reason:{slug} {bead_id}: {exc}",
+                      flush=True)
 
     # 2. Clear assignee so Pilot can claim it fresh
     try:
@@ -1616,6 +1756,23 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] warn: set reclaim-count label {bead_id}: {exc}", flush=True)
 
+    # 3a. ga-be4x: bump the refusal-specific counter in lockstep, same
+    #     remove-old/add-new pattern as pilot:reclaim-count above.
+    if has_explicit_refusal:
+        if refusal_count > 0:
+            try:
+                subprocess.run(
+                    _bd + ["label", "remove", bead_id, f"pilot:refusal-count:{refusal_count}", "-q"],
+                    capture_output=True, text=True, timeout=15)
+            except Exception:
+                pass  # old label may already be missing; ignore
+        try:
+            subprocess.run(
+                _bd + ["label", "add", bead_id, f"pilot:refusal-count:{new_refusal_count}", "-q"],
+                capture_output=True, text=True, timeout=15)
+        except Exception as exc:
+            print(f"[INFLIGHT-RECLAIM] warn: set refusal-count label {bead_id}: {exc}", flush=True)
+
     # 3b. ga-l5ud0 FIX #2: re-loop cooldown — stamp pilot:held + pilot:held-until:<now+1h>
     #     on the 2nd+ reclaim (reclaim_count >= 1) to prevent the Pilot from immediately
     #     re-dispatching to the same crew pool before the underlying routing issue is resolved.
@@ -1654,6 +1811,12 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
                   if reclaim_count >= 1 and _reloop_hold > 0 else "")
     _preserve_note = (" Preserved unpushed work (ga-ufr7): " + "; ".join(_preserved) + "."
                        if _preserved else "")
+    _refusal_note = (
+        f" ga-be4x: this reclaim was an EXPLICIT worker refusal (reason(s): "
+        f"{', '.join(refused_reason_slugs) or 'unspecified'}) — not an unexplained "
+        f"drain. refusal {new_refusal_count}/{REFUSAL_ESCALATE_THRESHOLD}; one more "
+        f"independent refusal escalates to gate:needs-human regardless of reclaim cap."
+        if has_explicit_refusal else "")
     try:
         subprocess.run(
             _bd + ["comment", bead_id,
@@ -1662,7 +1825,8 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
              f"(> {RECLAIM_TTL//60}min TTL). {cleared} "
              f"cleared; assignee unset; status reset to open (ga-vw26y)."
              f"{_hold_note}"
-             f"{_preserve_note} "
+             f"{_preserve_note}"
+             f"{_refusal_note} "
              f"Pilot will re-dispatch. (reclaim {new_count}/{MAX_RECLAIMS})"],
             capture_output=True, text=True, timeout=15)
     except Exception:
@@ -1671,7 +1835,8 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     return ok
 
 
-def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=None):
+def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=None,
+                 has_explicit_refusal=False, refusal_count=0):
     """Mark a permanently-failing bead gate:needs-human — do NOT re-clear it.
 
     ga-6ow4v: the reclaim cap is exhausted (MAX_RECLAIMS reclaims of the SAME
@@ -1690,6 +1855,24 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=N
 
     ga-mfeip (cross-store): rig_root routes bd mutations to the bead's own rig
     store when set. HQ-native beads pass rig_root=None (existing behavior).
+
+    ga-be4x: has_explicit_refusal=True means THIS escalation was triggered by
+    REFUSAL_ESCALATE_THRESHOLD independent workers explicitly refusing the
+    bead — a different circuit-breaker class than the generic MAX_RECLAIMS
+    thrash cap. It ADDS gate:needs-human:refused alongside (not instead of)
+    the existing gate:needs-human:technical: quorum-convergence-watchdog.py's
+    Fallback trigger B does an EXACT `--label gate:needs-human:technical`
+    query (not a prefix scan) to auto-convene a 3-crew quorum vote on any
+    bead an automation circuit-breaker parked and a human hasn't addressed
+    within MAYOR_STALE_SEC — swapping the sub-label instead of adding to it
+    would silently drop refusal-escalated beads out of that safety net
+    (worst case: a named-crew assignee, which gets no immediate Mayor mail
+    below, parked forever with nothing to re-evaluate it). :technical
+    remains an accurate description regardless — a refusal is still a
+    technical/scoping circuit-breaker park, not a product decision. The
+    comment additionally quotes every accumulated pilot:refused-reason:<slug>
+    label verbatim so a Mayor can act without re-discovering the reason from
+    scratch (ga-be4x fix item 3).
     """
     # Build the bd prefix: rig-native beads route to their own store.
     _bd = ["bd", "-C", rig_root] if rig_root else ["bd"]
@@ -1701,7 +1884,9 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=N
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] warn: add gate:needs-human {bead_id}: {exc}",
               flush=True)
-    # imp13: sub-label classifies this as a TECHNICAL circuit-breaker park (not a product decision).
+    # imp13: sub-label classifies this as a TECHNICAL circuit-breaker park (not
+    # a product decision). Always added — see ga-be4x note above re: the
+    # quorum-convergence-watchdog dependency on this exact label surviving.
     try:
         subprocess.run(
             _bd + ["label", "add", bead_id, "gate:needs-human:technical", "-q"],
@@ -1709,6 +1894,36 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=N
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] warn: add gate:needs-human:technical {bead_id}: {exc}",
               flush=True)
+    # ga-be4x: ADDITIONAL sub-label — never a replacement — naming the more
+    # specific circuit-breaker class so a human sees WHY at a glance.
+    if has_explicit_refusal:
+        try:
+            subprocess.run(
+                _bd + ["label", "add", bead_id, "gate:needs-human:refused", "-q"],
+                capture_output=True, text=True, timeout=15)
+        except Exception as exc:
+            print(f"[INFLIGHT-RECLAIM] warn: add gate:needs-human:refused {bead_id}: {exc}",
+                  flush=True)
+
+    if has_explicit_refusal:
+        _reasons = [l[len("pilot:refused-reason:"):] for l in labels
+                    if l.startswith("pilot:refused-reason:")]
+        _reason_text = ", ".join(_reasons) if _reasons else "unspecified"
+        try:
+            subprocess.run(
+                _bd + ["comment", bead_id,
+                 f"inflight-reclaim-guard (ga-be4x): ESCALATED — "
+                 f"{refusal_count + 1} independent workers EXPLICITLY REFUSED this "
+                 f"bead (reason(s): {_reason_text}). This is not an unexplained "
+                 f"death — re-dispatching again cannot succeed where "
+                 f"{refusal_count + 1} workers already reached the same reasoned "
+                 f"conclusion. Marked gate:needs-human:refused; story:in-flight "
+                 f"RETAINED (not re-cleared) to avoid a dispatch↔reclaim loop. "
+                 f"Human/Mayor must re-route or re-scope, then re-queue."],
+                capture_output=True, text=True, timeout=15)
+        except Exception:
+            pass
+        return
 
     try:
         subprocess.run(
@@ -1848,6 +2063,13 @@ def reclaim_dead_dog_claims(exclude_session_ids=None, sessions=None,
 
             provably_dead = claimant_provably_dead(assignee, sessions)
             reclaim_count = parse_reclaim_count(labels)
+            # ga-be4x: same explicit-refusal awareness as run_cycle — without
+            # this, a dog bead already at its 2nd independent refusal would get
+            # a 3rd fast RECLAIM here instead of the ESCALATE run_cycle owns,
+            # since this preflight only acts on action=="reclaim" (see docstring:
+            # "escalate / noop → left for run_cycle").
+            has_explicit_refusal = _has_refusal_label(labels)
+            refusal_count = parse_refusal_count(labels)
 
             action = reclaim_decision(
                 has_live_session=has_live_session,
@@ -1861,12 +2083,16 @@ def reclaim_dead_dog_claims(exclude_session_ids=None, sessions=None,
                 min_stranding_secs=POOL_ZOMBIE_TTL,
                 account_rate_limited=rate_limited,
                 provably_dead=provably_dead,
+                has_explicit_refusal=has_explicit_refusal,
+                refusal_count=refusal_count,
             )
 
             if action == "reclaim":
                 if not dry_run:
                     do_reclaim(bead_id, b.get("title", "")[:60], reclaim_count,
-                               0.0, labels, rig_root=b.get("rig_root"))
+                               0.0, labels, rig_root=b.get("rig_root"),
+                               has_explicit_refusal=has_explicit_refusal,
+                               refusal_count=refusal_count)
                 reclaimed.append(bead_id)
                 print(f"[DOG-PREFLIGHT] gt-fppb0: reclaimed provably-dead dog "
                       f"claim bead={bead_id} assignee={assignee!r} "
@@ -2049,6 +2275,14 @@ def run_cycle(state, escalated_alerted):
 
         reclaim_count = parse_reclaim_count(labels)
 
+        # ga-be4x: explicit refusal is a label read — pure, cheap, and, unlike
+        # provably_dead, not scoped to bare-pool-zombie assignees. A worker's
+        # STATED conclusion is unambiguous regardless of what kind of assignee
+        # held the bead, so any assignee shape (bare pool, concrete adhoc, or a
+        # named crew) can carry and benefit from this signal.
+        has_explicit_refusal = _has_refusal_label(labels)
+        refusal_count = parse_refusal_count(labels)
+
         # ga-hkpwv: pool-zombie beads (bare template AND concrete adhoc forms) use
         # POOL_ZOMBIE_TTL (2h) instead of the standard RECLAIM_TTL (25min) — a longer
         # window compensates for the weaker signal (no Pilot marker) and prevents
@@ -2083,6 +2317,8 @@ def run_cycle(state, escalated_alerted):
             min_stranding_secs=min_stranding_secs,
             account_rate_limited=account_rate_limited,
             provably_dead=provably_dead,
+            has_explicit_refusal=has_explicit_refusal,
+            refusal_count=refusal_count,
         )
 
         idle_min = seconds_stranded / 60.0
@@ -2107,13 +2343,22 @@ def run_cycle(state, escalated_alerted):
 
     # --- Pass 2: per-bead actuation (logic unchanged from prior single-pass) ---
     for bead_id, title, labels, assignee, action, idle_min, reclaim_count, rig_root in classified:
+        # ga-be4x: re-derive from labels (already in the tuple — no new fields
+        # needed) so actuation makes the SAME refusal-vs-death distinction
+        # Pass 1 used to classify the action in the first place.
+        has_explicit_refusal = _has_refusal_label(labels)
+        refusal_count = parse_refusal_count(labels)
+
         if action == "reclaim":
-            ok = do_reclaim(bead_id, title, reclaim_count, idle_min, labels, rig_root=rig_root)
+            ok = do_reclaim(bead_id, title, reclaim_count, idle_min, labels, rig_root=rig_root,
+                             has_explicit_refusal=has_explicit_refusal, refusal_count=refusal_count)
             status = "RECLAIMED" if ok else "RECLAIM-FAILED"
+            _refusal_tag = (f" refusal={refusal_count + 1}/{REFUSAL_ESCALATE_THRESHOLD}"
+                             if has_explicit_refusal else "")
             emit(
                 f"[INFLIGHT-RECLAIM] [{status}] bead={bead_id} "
                 f"idle={idle_min:.0f}min no_live_session no_recent_branch "
-                f"reclaim={reclaim_count + 1}/{MAX_RECLAIMS} title={title!r}"
+                f"reclaim={reclaim_count + 1}/{MAX_RECLAIMS}{_refusal_tag} title={title!r}"
             )
             # Reset state clock — bead left in-flight (or will be re-tracked if partially failed)
             state.pop(bead_id, None)
@@ -2122,25 +2367,44 @@ def run_cycle(state, escalated_alerted):
             # Rate-limit to avoid repeat ntfy on the same bead within REALERT_SEC
             last_alert = escalated_alerted.get(bead_id, 0)
             if now - last_alert > REALERT_SEC:
-                do_escalate(bead_id, title, reclaim_count, idle_min, labels, rig_root=rig_root)
+                do_escalate(bead_id, title, reclaim_count, idle_min, labels, rig_root=rig_root,
+                            has_explicit_refusal=has_explicit_refusal, refusal_count=refusal_count)
+                _escalate_reason = (
+                    f"{refusal_count + 1} independent EXPLICIT REFUSALS"
+                    if has_explicit_refusal else f"reclaimed {reclaim_count}x")
                 emit(
                     f"[INFLIGHT-RECLAIM] [ESCALATED] bead={bead_id} "
-                    f"reclaimed {reclaim_count}x idle={idle_min:.0f}min — "
+                    f"{_escalate_reason} idle={idle_min:.0f}min — "
                     f"needs human/Mayor intervention title={title!r}"
                 )
-                _irg_ledger("human-touch", {"ts": _irg_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "source_daemon": "inflight-reclaim-guard", "stage": "executa", "kind": "technical", "bead_id": bead_id, "reason": f"Reclaim cap exhausted ({reclaim_count}x) — needs human intervention"}, fail_open=True)
+                _irg_ledger("human-touch", {"ts": _irg_datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "source_daemon": "inflight-reclaim-guard", "stage": "executa", "kind": "technical", "bead_id": bead_id, "reason": f"{_escalate_reason} — needs human intervention"}, fail_open=True)
                 # ga-hkpwv: pool-zombie escalation also mails Mayor directly
                 # (POOL-DEAD handles pool-level alerts; this covers single-bead cap exhaustion)
                 if _is_ephemeral_pool_assignee(assignee):
                     try:
-                        subprocess.run(
-                            ["gc", "mail", "send", "mayor",
-                             "-s", f"[POOL-ZOMBIE-ESCALATED] {assignee}: bead {bead_id} reclaimed {reclaim_count}x",
-                             "-m", (f"Pool-zombie bead {bead_id!r} ({title!r}) exhausted reclaim cap "
-                                    f"({reclaim_count}/{MAX_RECLAIMS}) with assignee={assignee!r}, "
-                                    f"no branch, no active pool session. Marked gate:needs-human. "
-                                    f"Needs human investigation + re-queue.")],
-                            timeout=20, capture_output=True)
+                        if has_explicit_refusal:
+                            _reasons = [l[len("pilot:refused-reason:"):] for l in labels
+                                        if l.startswith("pilot:refused-reason:")]
+                            subprocess.run(
+                                ["gc", "mail", "send", "mayor",
+                                 "-s", f"[POOL-REFUSED-ESCALATED] {assignee}: bead {bead_id} refused {refusal_count + 1}x",
+                                 "-m", (f"Bead {bead_id!r} ({title!r}) was EXPLICITLY REFUSED by "
+                                        f"{refusal_count + 1} independent {assignee!r} workers — "
+                                        f"reason(s): {', '.join(_reasons) or 'unspecified'}. Not an "
+                                        f"unexplained death: re-dispatching again cannot succeed where "
+                                        f"{refusal_count + 1} workers already agreed it isn't buildable "
+                                        f"as specified. Marked gate:needs-human:refused. Needs human "
+                                        f"re-route/re-scope, then re-queue.")],
+                                timeout=20, capture_output=True)
+                        else:
+                            subprocess.run(
+                                ["gc", "mail", "send", "mayor",
+                                 "-s", f"[POOL-ZOMBIE-ESCALATED] {assignee}: bead {bead_id} reclaimed {reclaim_count}x",
+                                 "-m", (f"Pool-zombie bead {bead_id!r} ({title!r}) exhausted reclaim cap "
+                                        f"({reclaim_count}/{MAX_RECLAIMS}) with assignee={assignee!r}, "
+                                        f"no branch, no active pool session. Marked gate:needs-human. "
+                                        f"Needs human investigation + re-queue.")],
+                                timeout=20, capture_output=True)
                     except Exception as _exc:
                         print(f"[INFLIGHT-RECLAIM] warn: pool-zombie escalation mail ({bead_id}): {_exc}",
                               flush=True)
@@ -3187,6 +3451,188 @@ def _selftest():
               seconds_stranded=0.0, reclaim_count=0,
               has_needs_human=False, has_dispatching_marker=False,
               min_stranding_secs=POOL_ZOMBIE_TTL) == "noop")
+
+    # -----------------------------------------------------------------------
+    # Section 9b: ga-be4x — explicit refusal signal (RF-*).
+    # A worker's STATED refusal (pool:refused[:reason] label, set deliberately
+    # before draining) is a categorically different signal from an INFERRED
+    # drain/crash: reclaim_decision escalates after REFUSAL_ESCALATE_THRESHOLD
+    # independent refusals of the SAME bead — well before the generic
+    # MAX_RECLAIMS thrash cap would fire — while an unexplained death (no
+    # refusal label ever set) is completely unaffected (AC2). Pure-function
+    # checks first, then do_reclaim()/do_escalate() bookkeeping (consume
+    # marker → permanent audit label → counter bump → refusal-specific
+    # escalate message) verified via a minimal subprocess.run stub.
+    # -----------------------------------------------------------------------
+
+    # --- Pure helpers ---
+    check("RFH-1: _has_refusal_label: bare 'pool:refused' → True",
+          _has_refusal_label(["pool:refused"]) is True)
+    check("RFH-2: _has_refusal_label: 'pool:refused:<reason>' → True",
+          _has_refusal_label(["story:in-flight", "pool:refused:cross-rig-framework"]) is True)
+    check("RFH-3: _has_refusal_label: no marker present → False",
+          _has_refusal_label(["story:in-flight", "pilot:dispatched"]) is False)
+    check("RFH-4: _has_refusal_label: unrelated 'pool:' label does not false-positive",
+          _has_refusal_label(["pool:something-else"]) is False)
+    check("RFRS-1: _refusal_reason_slugs: extracts the reason",
+          _refusal_reason_slugs(["pool:refused:cross-rig-framework"]) == ["cross-rig-framework"])
+    check("RFRS-2: _refusal_reason_slugs: bare marker → 'unspecified'",
+          _refusal_reason_slugs(["pool:refused"]) == ["unspecified"])
+    check("RFRS-3: _refusal_reason_slugs: no marker → empty list",
+          _refusal_reason_slugs(["story:in-flight"]) == [])
+    check("PRC-1: parse_refusal_count: present → int",
+          parse_refusal_count(["pilot:refusal-count:2"]) == 2)
+    check("PRC-2: parse_refusal_count: absent → 0",
+          parse_refusal_count(["story:in-flight"]) == 0)
+    check("PRC-3: parse_refusal_count: malformed → 0 (fail-safe)",
+          parse_refusal_count(["pilot:refusal-count:nan"]) == 0)
+
+    # --- RF-1/2: the core AC1 behavior — escalate on the 2nd independent
+    #     refusal, faster than (and independent of) the generic thrash cap ---
+    check("RF-1: reclaim_decision: 1st explicit refusal (refusal_count=0) → reclaim, not escalate yet",
+          _rd(has_explicit_refusal=True, refusal_count=0) == "reclaim")
+    check("RF-2: reclaim_decision: 2nd independent refusal (refusal_count=1) → escalate "
+          "(reclaim_count=1 is nowhere near MAX_RECLAIMS=3 — proves this is FASTER than the generic cap)",
+          _rd(has_explicit_refusal=True, refusal_count=1, reclaim_count=1) == "escalate")
+    check("RF-3: refusal_count>=threshold but has_explicit_refusal=False THIS cycle → unaffected "
+          "(a stale/historical counter must not retroactively trigger anything without a fresh signal)",
+          _rd(has_explicit_refusal=False, refusal_count=5) == "noop")
+
+    # --- RF-4..8: every existing safety guard still outranks refusal-escalate ---
+    check("RF-4: 2nd refusal BUT has_live_session → noop (live builder guard wins)",
+          _rd(has_explicit_refusal=True, refusal_count=1, has_live_session=True) == "noop")
+    check("RF-5: 2nd refusal BUT has_needs_human → noop (park guard wins)",
+          _rd(has_explicit_refusal=True, refusal_count=1, has_needs_human=True) == "noop")
+    check("RF-6: 2nd refusal BUT has_dispatching_marker → noop (gate guard wins)",
+          _rd(has_explicit_refusal=True, refusal_count=1, has_dispatching_marker=True) == "noop")
+    check("RF-7: 2nd refusal BUT account_rate_limited → noop (ga-ufr7 guard wins)",
+          _rd(has_explicit_refusal=True, refusal_count=1, account_rate_limited=True) == "noop")
+    check("RF-8: 2nd refusal BUT has_recent_branch → noop (branch rail wins)",
+          _rd(has_explicit_refusal=True, refusal_count=1, has_recent_branch=True) == "noop")
+
+    # --- RF-9: generic MAX_RECLAIMS cap still holds as a backstop even on a
+    #     bead's FIRST refusal (defense-in-depth: refusal and unexplained-death
+    #     cycles can interleave on the same bead) ---
+    check("RF-9: 1st refusal BUT reclaim_count=MAX_RECLAIMS (interleaved deaths) → escalate (generic cap)",
+          _rd(has_explicit_refusal=True, refusal_count=0, reclaim_count=MAX_RECLAIMS) == "escalate")
+
+    # --- RF-10 (AC2 regression anchor): an UNEXPLAINED death — provably_dead
+    #     but no refusal label EVER set — is completely unaffected by this fix.
+    #     Still re-dispatches exactly as before, all the way to MAX_RECLAIMS. ---
+    check("RF-10 (AC2): provably_dead, no refusal label, reclaim_count=1 → still reclaim (no regression)",
+          _rd(provably_dead=True, has_explicit_refusal=False, reclaim_count=1) == "reclaim")
+    check("RF-10b (AC2): provably_dead, no refusal label, reclaim_count=MAX_RECLAIMS → still escalate via generic cap",
+          _rd(provably_dead=True, has_explicit_refusal=False, reclaim_count=MAX_RECLAIMS) == "escalate")
+
+    # --- RF-11 MUTATION TEST (AC3): "revert the distinction" = the caller
+    #     never passes has_explicit_refusal (its default, exactly what run_cycle
+    #     did pre-fix). Same inputs as RF-2 — including provably_dead=True,
+    #     because a bare-pool-zombie session that drained after refusing really
+    #     IS provably_dead under the pre-existing session-state machinery —
+    #     but with the discriminator withheld. Pre-fix, this bead's 2nd
+    #     independent refusal was indistinguishable from its 2nd unexplained
+    #     death: it just got reclaimed a 3rd time and re-dispatched — the exact
+    #     infinite loop ga-be4x reports. The outcome MUST differ from RF-2
+    #     (escalate) for RF-2 to mean anything.
+    check("RF-11 MUTATION: identical 2nd-refusal-and-provably-dead inputs but has_explicit_refusal "
+          "withheld (reverted) → reclaim, NOT escalate — proves the ga-be4x guard has teeth "
+          "(this bead would loop forever pre-fix)",
+          _rd(has_explicit_refusal=False, refusal_count=1, reclaim_count=1, provably_dead=True) == "reclaim")
+
+    # --- RF-12: do_reclaim() consumes the ephemeral pool:refused:<reason>
+    #     marker, promotes it to a PERMANENT pilot:refused-reason:<slug> audit
+    #     label, and bumps pilot:refusal-count — while still performing the
+    #     normal reclaim mechanics unchanged. ---
+    _rf_mutations = []
+
+    def _stub_run_rf(cmd, **kw):
+        if isinstance(cmd, (list, tuple)):
+            _rf_mutations.append(list(cmd))
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return _R()
+
+    _orig_run_rf = subprocess.run
+    subprocess.run = _stub_run_rf
+    try:
+        do_reclaim(
+            "ga-refused1", "some bead", reclaim_count=0, idle_min=5.0,
+            labels=["story:in-flight", "pilot:dispatched", "pool:refused:cross-rig-framework"],
+            has_explicit_refusal=True, refusal_count=0,
+        )
+        check("RF-12a: do_reclaim removes the ephemeral pool:refused:<reason> marker (consumed, not left stale)",
+              ["bd", "label", "remove", "ga-refused1", "pool:refused:cross-rig-framework", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+        check("RF-12b: do_reclaim adds a PERMANENT pilot:refused-reason:<slug> audit label",
+              ["bd", "label", "add", "ga-refused1", "pilot:refused-reason:cross-rig-framework", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+        check("RF-12c: do_reclaim bumps pilot:refusal-count 0 → 1",
+              ["bd", "label", "add", "ga-refused1", "pilot:refusal-count:1", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+        check("RF-12d: do_reclaim still performs the normal story:in-flight cleanup (base behavior unchanged)",
+              ["bd", "label", "remove", "ga-refused1", "story:in-flight", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+    finally:
+        subprocess.run = _orig_run_rf
+
+    # --- RF-13: do_escalate() ADDS gate:needs-human:refused ALONGSIDE (never
+    #     instead of) the existing gate:needs-human:technical — swapping it
+    #     would silently drop the bead out of quorum-convergence-watchdog's
+    #     exact `--label gate:needs-human:technical` fallback query — and
+    #     quotes every accumulated refusal reason verbatim. ---
+    _rf_mutations.clear()
+    subprocess.run = _stub_run_rf
+    try:
+        do_escalate(
+            "ga-refused1", "some bead", reclaim_count=1, idle_min=10.0,
+            labels=["story:in-flight", "pilot:refused-reason:cross-rig-framework",
+                    "pilot:refused-reason:hex-notebook-native"],
+            has_explicit_refusal=True, refusal_count=1,
+        )
+        check("RF-13a: do_escalate adds gate:needs-human:refused when refusal-triggered",
+              ["bd", "label", "add", "ga-refused1", "gate:needs-human:refused", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+        check("RF-13b: do_escalate STILL adds gate:needs-human:technical too (quorum-watchdog safety net preserved)",
+              ["bd", "label", "add", "ga-refused1", "gate:needs-human:technical", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+        _rf_comment_calls = [m for m in _rf_mutations if len(m) >= 2 and m[1] == "comment"]
+        check("RF-13c: do_escalate emits exactly ONE comment (not both the generic and refusal-specific text)",
+              len(_rf_comment_calls) == 1,
+              f"comment_calls={_rf_comment_calls!r}")
+        check("RF-13d: do_escalate's comment quotes BOTH accumulated refusal reasons verbatim (Mayor needs no re-investigation)",
+              len(_rf_comment_calls) == 1
+              and "cross-rig-framework" in _rf_comment_calls[0][-1]
+              and "hex-notebook-native" in _rf_comment_calls[0][-1],
+              f"comment_calls={_rf_comment_calls!r}")
+    finally:
+        subprocess.run = _orig_run_rf
+
+    # --- RF-14: do_escalate() on a NON-refusal (generic MAX_RECLAIMS) escalation
+    #     is completely unchanged — only gate:needs-human:technical, generic
+    #     comment text, no :refused label (AC2 regression anchor for do_escalate
+    #     specifically, mirroring RF-10/RF-10b at the reclaim_decision layer). ---
+    _rf_mutations.clear()
+    subprocess.run = _stub_run_rf
+    try:
+        do_escalate(
+            "ga-dead1", "some other bead", reclaim_count=MAX_RECLAIMS, idle_min=40.0,
+            labels=["story:in-flight", "pilot:dispatched"],
+        )
+        check("RF-14a: do_escalate (no refusal) does NOT add gate:needs-human:refused",
+              ["bd", "label", "add", "ga-dead1", "gate:needs-human:refused", "-q"] not in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+        check("RF-14b: do_escalate (no refusal) still adds gate:needs-human:technical (unchanged)",
+              ["bd", "label", "add", "ga-dead1", "gate:needs-human:technical", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+        _rf_comment_calls2 = [m for m in _rf_mutations if len(m) >= 2 and m[1] == "comment"]
+        check("RF-14c: do_escalate (no refusal) comment uses the ORIGINAL ga-6ow4v generic text, unchanged",
+              len(_rf_comment_calls2) == 1 and "ga-6ow4v" in _rf_comment_calls2[0][-1]
+              and "reclaim cap" in _rf_comment_calls2[0][-1],
+              f"comment_calls={_rf_comment_calls2!r}")
+    finally:
+        subprocess.run = _orig_run_rf
 
     # -----------------------------------------------------------------------
     # Section 10: gt-fppb0 — claimant_provably_dead() classifier (CPD-*).
