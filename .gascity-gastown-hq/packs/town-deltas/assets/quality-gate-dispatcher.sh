@@ -2936,7 +2936,19 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       fi
 
       # SELFTEST-EXTRACT phase-c-verdict-rehydrate: BEGIN
-      VB_JSON=$(bd -C "$GC_CITY" list --json -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID" 2>/dev/null || echo "[]")
+      # ga-* (2026-07-15): --all is LOAD-BEARING. `bd list` EXCLUDES closed beads by
+      # default (bd list --help: "--all  Show all issues including closed (overrides
+      # default filter)"). A DELIVERED verdict IS a CLOSED bead — the reviewer closes
+      # the verdict bead with a verdict:PASS/verdict:FAIL label as its final act. The
+      # ga-eqjo async split made Phase C RE-QUERY (rehydrate) the verdict beads from
+      # scratch each sweep instead of holding the in-process Step-7 array; without --all
+      # the query returns ZERO the instant any reviewer delivers, so Phase C mis-reads a
+      # COMPLETED run as "died before Step 7" (the emptiness path below), strands it, and
+      # NEVER finalizes → the whole gate stops merging (observed live: 5h / 0 merges,
+      # wa-k971r/ga-dlzl closed verdict:PASS at 10:38 yet counted 0/1). --all restores
+      # visibility of the pending (open) AND delivered (closed) verdict beads; the -l
+      # label filters still scope it to this run's verdict beads only.
+      VB_JSON=$(bd -C "$GC_CITY" list --json --all -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID" 2>/dev/null || echo "[]")
       VERDICT_BEAD_IDS=()
       while IFS= read -r PC_VBID; do
         [ -z "$PC_VBID" ] && continue
