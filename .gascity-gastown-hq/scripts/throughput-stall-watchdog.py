@@ -187,9 +187,28 @@ PILOT_COMPLETE_RE = re.compile(r"Pilot sweep complete: dispatched=(\d+)")
 # "Gate PASSED:" in gate dispatcher log
 GATE_PASS_RE = re.compile(r"Gate PASSED")
 # Exclude labels for the backlog query: a bead with ANY of these is not "ready to dispatch"
+# ga-* (2026-07-15): the set below was INCOMPLETE — it excluded gate:needs-human but NOT the
+# generic story:needs-human, and nothing for story:refinement-in-progress (a bead still IN
+# refino, not yet approved-ready). Result: a FALSE "THROUGHPUT STALL" fired against 6 "ready"
+# beads while the falsifiable imparavel-check reported 0 genuinely buildable. The 6 broke down
+# as: wa-x7ndm/wa-3sxpm (story:needs-human), wa-v89e3.4/wa-0nm4v (story:refinement-in-progress),
+# ga-3r41 (framework — no brake label, handled separately), + 1. False alarms erode the signal
+# (the Mayor learns to ignore the watchdog). The brake set now mirrors the painel's non-
+# dispatchable ("travada") taxonomy so backlog == what the Pilot can actually dispatch NOW.
 EXCLUDE_LABELS_BACKLOG = frozenset({
     "gate:needs-human", "exec:manual", "blocked", "story:blocked", "story:in-flight",
     "pilot:dispatched", "pilot:dispatching", "story:done",
+    # ── added 2026-07-15 (variant-aware via _bead_is_braked: matches exact OR "<label>:*") ──
+    "story:needs-human", "needs-human",          # generic human-punt (distinct from gate:needs-human)
+    "story:refinement-in-progress",              # still being refined — NOT approved-ready yet
+    "ctx:thin",                                  # under-specified — needs enrichment, Pilot won't build it
+    "story:cancelled",                           # cancelled ≠ dispatchable
+    "pilot:held",                                # Pilot deliberately not dispatching now (timed/route-refusal)
+    "pilot:reclaim-count:3",                     # circuit-broken (NEVERSTART cap) — proven un-dispatchable
+    "phone-proxy",                               # manual/proxy work, not pool-buildable
+    "gate:needs-fix", "gate:failed", "gate:needs-rebase",  # gate-parked, awaiting author fix/rebase
+    "gate:queued", "gate:reviewing",             # already IN the gate — not un-dispatched backlog
+    "blocked-on", "blocked-reason",              # dependency / external blocks (prefix-matched)
 })
 
 
@@ -1577,20 +1596,27 @@ def _selftest():
         _bad("F: should fail-open on unreadable pilot log")
 
     # ── G: braked beads excluded from backlog ─────────────────────────────────────
-    print("\nScenario G: braked beads (gate:needs-human / story:in-flight) → excluded, no alarm")
+    # 2026-07-15: extended to cover story:needs-human and story:refinement-in-progress —
+    # the two brake classes that leaked and caused the false THROUGHPUT STALL against a
+    # correctly-idle pipeline (wa-x7ndm/wa-3sxpm needs-human, wa-v89e3.4/wa-0nm4v in-refino).
+    print("\nScenario G: braked beads (gate/story:needs-human / in-flight / refino / manual) → excluded, no alarm")
     _read_pilot_log_lines = lambda: _pilot_lines(0, 3)
     _read_gate_log_lines  = lambda: []
     _git_log_count        = lambda root, since: 0
     _bd_backlog           = lambda root: [
-        {"id": "wa-0001", "title": "Braked",    "labels": ["story:approved", "gate:needs-human"]},
-        {"id": "wa-0002", "title": "In-flight", "labels": ["story:in-flight"]},
-        {"id": "wa-0003", "title": "Manual",    "labels": ["story:approved", "exec:manual"]},
+        {"id": "wa-0001", "title": "Braked",     "labels": ["story:approved", "gate:needs-human"]},
+        {"id": "wa-0002", "title": "In-flight",  "labels": ["story:in-flight"]},
+        {"id": "wa-0003", "title": "Manual",     "labels": ["story:approved", "exec:manual"]},
+        {"id": "wa-0004", "title": "NeedsHuman", "labels": ["story:approved", "ctx:ready", "story:needs-human"]},
+        {"id": "wa-0005", "title": "InRefino",   "labels": ["ctx:ready", "story:refinement-in-progress"]},
+        {"id": "wa-0006", "title": "DepBlock",   "labels": ["story:approved", "blocked-on:wa-9999"]},
+        {"id": "wa-0007", "title": "Thin",       "labels": ["ctx:ready", "ctx:thin"]},
     ]
     mail_calls.clear()
     st = _reset()
     run_tick(NOW, st); run_tick(NOW + 1800, st)
     if not st["escalations"] and not mail_calls:
-        _ok("G: all braked/in-flight/manual beads excluded → no false alarm")
+        _ok("G: all braked/needs-human/refino/dep-blocked/manual beads excluded → no false alarm")
     else:
         _bad("G", "escalations=%d mails=%d" % (st["escalations"], len(mail_calls)))
 
