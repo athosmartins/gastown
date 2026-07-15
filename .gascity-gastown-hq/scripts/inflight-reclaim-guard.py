@@ -38,6 +38,22 @@ reclaim rails (no recent branch + continuous stranding past RECLAIM_TTL). The
 check is conservative: a missing/unparseable last_active keeps the pre-fix
 "treat as live" behavior — we never reclaim on the strength of an absent field.
 
+ga-nlaa (paused-for-human != frozen): a builder that pauses mid-task on an
+interactive human prompt (AskUserQuestion) produces the exact SAME telemetry
+as a frozen/credit-limited zombie — no new terminal output, no bd update — so
+ga-64usm's own staleness check misclassified it as dead (2 false-reclaims in
+~5h on wa-y39v2, one mid-zoning-question). "Paused-waiting-for-human" and
+"session-dead" are the same signal wearing two different truths (ga-p5q3's
+root class). The fix: when both staleness signals are exhausted,
+session_awaiting_human_input() peeks the session's actual pane (`gc session
+peek`) — independent of commit cadence — before concluding zombie. A pane
+still showing an AskUserQuestion prompt keeps the session classified healthy.
+Peek only runs once the cheap activity/bd-update checks are already
+exhausted, so it stays off the hot path for the common fresh-activity case.
+Fails safe: any peek error/timeout/non-zero exit does NOT grant the
+exemption — it falls through to the pre-fix staleness rails, so a genuinely
+frozen zombie (ga-64usm) is still reclaimed on schedule.
+
 Poll loop (~5min). Silence = healthy. Emits on action only:
   [INFLIGHT-RECLAIM] [RECLAIMED]   cleared in-flight labels + reset <id> to open
   [INFLIGHT-RECLAIM] [RECLAIM-FAILED] label ops failed; bead may need manual cleanup
@@ -83,6 +99,11 @@ Safety invariants (CRITICAL — actuates on real work beads):
   - Fails safe on bad/empty/unparseable data — skips the entire cycle.
   - Only modifies pilot/lifecycle labels (+ gate:needs-human on escalation) and
     assignee. Never deletes beads, never touches gate markers or verdicts.
+  - ga-nlaa: a matched live session that is stale on both ga-64usm signals is
+    STILL not reclaimed if `gc session peek` shows it paused on an
+    AskUserQuestion prompt (session_awaiting_human_input()) — waiting on a
+    human decision is not death. Fails safe: a failed/ambiguous peek does NOT
+    grant the exemption, so a genuinely frozen zombie is still reclaimed.
 """
 import json
 import os
@@ -1037,7 +1058,8 @@ def session_activity_age(session, now):
     return max(0.0, now - age)
 
 
-def session_owner_is_healthy(matched_live, activity_age, bead_update_age):
+def session_owner_is_healthy(matched_live, activity_age, bead_update_age,
+                              awaiting_human_input=False):
     """Pure predicate (ga-64usm): given that the bead's assignee matched a
     live-state (active/awake) BUILDER session, decide whether that constitutes a
     HEALTHY live owner (block reclaim) or a frozen/credit-limited zombie
@@ -1047,6 +1069,12 @@ def session_owner_is_healthy(matched_live, activity_age, bead_update_age):
         matched_live:     True if assignee matched a session in LIVE_STATES
         activity_age:     seconds since session.last_active, or None if unknown
         bead_update_age:  seconds since the bead's own updated_at, or None if unknown
+        awaiting_human_input: True if session_awaiting_human_input() (ga-nlaa)
+                          confirmed the session's pane is paused on an
+                          interactive human prompt (e.g. AskUserQuestion).
+                          Callers should only pay for that check (a `gc
+                          session peek`) once the cheaper signals below are
+                          already exhausted — see session_is_live() etc.
 
     A matched live session is a healthy owner UNLESS it is *provably* frozen:
     its terminal activity is older than STALE_ACTIVITY_TTL AND the bead itself
@@ -1058,6 +1086,12 @@ def session_owner_is_healthy(matched_live, activity_age, bead_update_age):
     never reclaim on the strength of a missing field. The bug this fixes is
     UNDER-reclaiming (a frozen session was live forever); we must not over-
     correct into reclaiming a builder that is merely quiet.
+
+    ga-nlaa: stale-on-both is not automatically a zombie anymore — a session
+    legitimately paused on an interactive human prompt produces the identical
+    telemetry (no terminal output, no bd update) while being fully alive. If
+    the caller has independently confirmed that via session_awaiting_human_
+    input(), treat it as healthy too.
     """
     if not matched_live:
         return False
@@ -1071,8 +1105,54 @@ def session_owner_is_healthy(matched_live, activity_age, bead_update_age):
     # signal (workers should bd-update during long work — ga-64usm secondary).
     if bead_update_age is not None and bead_update_age <= STALE_ACTIVITY_TTL:
         return True
-    # Frozen: stale terminal activity AND no recent bead progress → zombie.
+    # ga-nlaa: stale on both signals — but a session paused waiting on a human
+    # decision is not dead. This is an independent-of-commit-cadence signal,
+    # confirmed by the caller via a pane peek before reaching this branch.
+    if awaiting_human_input:
+        return True
+    # Frozen: stale terminal activity, no recent bead progress, and not
+    # paused-for-human → zombie.
     return False
+
+
+def session_awaiting_human_input(session_ref, lines=40):
+    """True if `session_ref`'s pane is currently paused on an interactive
+    human prompt (ga-nlaa), via `gc session peek`.
+
+    A session blocked on AskUserQuestion produces no new terminal output
+    until a human answers — the exact same "stale last_active, no bd update"
+    signal a genuinely frozen/credit-limited zombie produces (ga-64usm).
+    Callers should invoke this ONLY once the cheap activity/bd-update checks
+    in session_owner_is_healthy() have already concluded "stale" — a peek
+    shells out to `gc`, which is comparatively expensive, so it must stay off
+    the hot path for the common fresh-activity case.
+
+    Because the prompt is blocking, its tool-call marker is still the most
+    recent thing rendered whenever the session is actually paused there, so
+    a bounded tail (`lines`) is enough — no need to capture the full pane.
+
+    Fails safe: any error/timeout/non-zero exit/missing marker → False. A
+    failed or inconclusive probe falls through to the pre-fix staleness
+    rails, which is still correct for the true-zombie case this guard exists
+    to catch — we only grant the exemption on a POSITIVE confirmation.
+    """
+    if not session_ref:
+        return False
+    try:
+        result = subprocess.run(
+            ["gc", "session", "peek", session_ref, "--json", "--lines", str(lines)],
+            capture_output=True, text=True, timeout=15)
+        if result.returncode != 0 or not result.stdout.strip():
+            return False
+        stdout = result.stdout.strip()
+        # gc can emit WARN lines before the JSON object — find the first '{'.
+        idx = stdout.find("{")
+        if idx < 0:
+            return False
+        data = json.loads(stdout[idx:])
+        return "AskUserQuestion" in data.get("output", "")
+    except Exception:
+        return False
 
 
 def session_is_live(assignee, sessions, now=None, bead_update_age=None):
@@ -1128,7 +1208,14 @@ def session_is_live(assignee, sessions, now=None, bead_update_age=None):
             # it isn't a frozen/credit-limited zombie. Gate on activity freshness
             # (+ recent bead progress as a secondary signal).
             activity_age = session_activity_age(s, now)
-            return session_owner_is_healthy(True, activity_age, bead_update_age)
+            if session_owner_is_healthy(True, activity_age, bead_update_age):
+                return True
+            # ga-nlaa: stale on both cheap signals — before writing this off as
+            # a frozen zombie, peek its pane for an independent-of-commit-
+            # cadence signal (paused on an interactive human prompt).
+            return session_owner_is_healthy(
+                True, activity_age, bead_update_age,
+                awaiting_human_input=session_awaiting_human_input(assignee))
     return False
 
 
@@ -1166,6 +1253,13 @@ def pool_has_live_worker(pool_template, sessions, now=None, bead_update_age=None
             # Active/awake — apply ga-64usm staleness check
             activity_age = session_activity_age(s, now)
             if session_owner_is_healthy(True, activity_age, bead_update_age):
+                return True
+            # ga-nlaa: stale on both cheap signals — peek this specific
+            # session's pane before writing it off as a frozen zombie.
+            _ref = s.get("session_name") or s.get("name") or s.get("id", "")
+            if session_owner_is_healthy(
+                    True, activity_age, bead_update_age,
+                    awaiting_human_input=session_awaiting_human_input(_ref)):
                 return True
             continue  # stale active (frozen zombie) — check remaining sessions
         # Unknown/unrecognized/missing state — conservative: treat pool as alive
@@ -1222,7 +1316,12 @@ def concrete_adhoc_session_is_live(assignee, sessions, now=None, bead_update_age
         if state in LIVE_STATES:
             # Apply ga-64usm staleness check: alive != working
             activity_age = session_activity_age(s, now)
-            return session_owner_is_healthy(True, activity_age, bead_update_age)
+            if session_owner_is_healthy(True, activity_age, bead_update_age):
+                return True
+            # ga-nlaa: stale on both cheap signals — peek before concluding zombie.
+            return session_owner_is_healthy(
+                True, activity_age, bead_update_age,
+                awaiting_human_input=session_awaiting_human_input(assignee))
         # Unknown/unrecognized state — conservative: treat as alive (NOOP).
         # NEVER reclaim on ambiguous session state.
         return True
@@ -3979,6 +4078,170 @@ def _selftest():
     finally:
         subprocess.run = _orig_run_dd
         time.time = _orig_time_dd
+
+    # -----------------------------------------------------------------------
+    # Section: ga-nlaa — session_awaiting_human_input() + the
+    # awaiting_human_input param on session_owner_is_healthy(). A session
+    # paused at an AskUserQuestion prompt produces the SAME telemetry (stale
+    # last_active, no bd update) as a frozen/credit-limited zombie (ga-64usm)
+    # — these checks give the guard an independent-of-commit-cadence signal
+    # to tell the two apart. No real bd/gc/git calls (subprocess.run stubbed).
+    # -----------------------------------------------------------------------
+
+    T_ah = 1_782_800_000.0  # fixed epoch for determinism
+    _ah_stale_ts = _irg_datetime.datetime.fromtimestamp(
+        T_ah - STALE_ACTIVITY_TTL - 600, tz=_irg_datetime.timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")  # 40min ago: stale on both ga-64usm signals
+    _ah_fresh_ts = _irg_datetime.datetime.fromtimestamp(
+        T_ah - 60, tz=_irg_datetime.timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # --- AH-1/1b: session_owner_is_healthy() — pure predicate contract ---
+    check("AH-1: session_owner_is_healthy: stale activity+bead, awaiting_human_input=True → healthy",
+          session_owner_is_healthy(True, STALE_ACTIVITY_TTL + 600, None,
+                                    awaiting_human_input=True) is True)
+    check("AH-1b: session_owner_is_healthy: identical staleness, awaiting_human_input omitted "
+          "(pre-fix default) → zombie — the contrast AH-7-MUT relies on below",
+          session_owner_is_healthy(True, STALE_ACTIVITY_TTL + 600, None) is False)
+
+    # --- AH-2..6: session_awaiting_human_input() — direct I/O-probe contract ---
+    _orig_run_ah = subprocess.run
+
+    def _stub_peek(output_text="", rc=0, raise_exc=False, expect_ref=None):
+        def _run(cmd, **kw):
+            if raise_exc:
+                raise TimeoutError("simulated peek timeout")
+            assert cmd[:3] == ["gc", "session", "peek"], f"unexpected cmd: {cmd}"
+            if expect_ref is not None:
+                assert cmd[3] == expect_ref, f"peeked wrong session: {cmd[3]!r} != {expect_ref!r}"
+            if rc != 0:
+                return _FakeGitResult(rc, "", "peek failed")
+            return _FakeGitResult(0, json.dumps({"ok": True, "output": output_text}))
+        return _run
+
+    try:
+        subprocess.run = _stub_peek(output_text="⏺ AskUserQuestion(Which zoning class applies?)\n❯ 1. ...")
+        check("AH-2: session_awaiting_human_input: peek shows AskUserQuestion → True",
+              session_awaiting_human_input("thies") is True)
+
+        subprocess.run = _stub_peek(output_text="⏺ Bash(pytest -q)\n  ⎿  3 passed\n❯ ")
+        check("AH-3: session_awaiting_human_input: peek shows ordinary output (no prompt) → False",
+              session_awaiting_human_input("thies") is False)
+
+        subprocess.run = _stub_peek(rc=1)
+        check("AH-4: session_awaiting_human_input: peek non-zero exit → False (fail-safe)",
+              session_awaiting_human_input("thies") is False)
+
+        subprocess.run = _stub_peek(raise_exc=True)
+        check("AH-5: session_awaiting_human_input: peek raises/times out → False (fail-safe)",
+              session_awaiting_human_input("thies") is False)
+
+        subprocess.run = _stub_peek(output_text="whatever")
+        check("AH-6: session_awaiting_human_input: empty ref → False (no call attempted)",
+              session_awaiting_human_input("") is False)
+    finally:
+        subprocess.run = _orig_run_ah
+
+    # --- AH-7/8: session_is_live() end-to-end — the actual wa-y39v2 shape ---
+    _ah_live_paused = [
+        {"id": "sid-thies", "name": "thies-wa", "session_name": "thies",
+         "alias": "thies", "agent_name": "thies-wa",
+         "state": "active", "last_active": _ah_stale_ts},
+    ]
+    try:
+        # AH-7: live session, stale on both signals, peek shows AskUserQuestion.
+        subprocess.run = _stub_peek(output_text="⏺ AskUserQuestion(zoning?)", expect_ref="thies")
+        check("AH-7: session_is_live: stale+paused-on-AskUserQuestion → True (ga-nlaa: NOT false-reclaimed)",
+              session_is_live("thies", _ah_live_paused, now=T_ah) is True)
+
+        # AH-7-MUT (mutation-test, ga-nlaa acceptance criterion 3): identical
+        # scenario to AH-7, but the peek probe now reports "nothing to see" —
+        # simulating the awaiting-human check being removed/disabled. AH-7
+        # must flip to False; if it doesn't, the fix isn't actually
+        # load-bearing for the wa-y39v2 scenario it was written to close.
+        subprocess.run = _stub_peek(output_text="", expect_ref="thies")
+        check("AH-7-MUT: same scenario with the peek check reporting nothing → reverts to False "
+              "(removing/disabling the check flips AH-7 red, as required)",
+              session_is_live("thies", _ah_live_paused, now=T_ah) is False)
+
+        # AH-8: stale on both signals, peek shows ordinary output → still a
+        # frozen/credit-limited zombie (ga-64usm) — NOT protected. No regression.
+        subprocess.run = _stub_peek(output_text="⏺ Bash(sleep 1)\n❯ ", expect_ref="thies")
+        check("AH-8: session_is_live: stale+genuinely-frozen (no AskUserQuestion) → False (ga-64usm preserved)",
+              session_is_live("thies", _ah_live_paused, now=T_ah) is False)
+    finally:
+        subprocess.run = _orig_run_ah
+
+    # AH-9: no matching session at all (tmux gone) → False, and peek is never
+    # attempted — ga-nlaa acceptance criterion 2: truly-dead claimants must
+    # still be reclaimable.
+    _ah_peek_calls = []
+
+    def _stub_peek_counting(cmd, **kw):
+        _ah_peek_calls.append(list(cmd))
+        return _FakeGitResult(0, json.dumps({"ok": True, "output": ""}))
+
+    subprocess.run = _stub_peek_counting
+    try:
+        check("AH-9: session_is_live: no matching session at all → False (still reclaimable; ga-nlaa AC2)",
+              session_is_live("thies", [], now=T_ah) is False)
+        check("AH-9b: ...and no peek call was made for a bead with no matching session",
+              _ah_peek_calls == [], f"calls={_ah_peek_calls!r}")
+    finally:
+        subprocess.run = _orig_run_ah
+
+    # AH-10: FRESH last_active never reaches the peek probe at all — the cheap
+    # activity check alone already proves health, so peek (comparatively
+    # expensive) must stay off the hot path.
+    _ah_live_fresh = [
+        {"id": "sid-thies2", "name": "thies-wa", "session_name": "thies",
+         "alias": "thies", "agent_name": "thies-wa",
+         "state": "active", "last_active": _ah_fresh_ts},
+    ]
+    _ah_peek_calls2 = []
+
+    def _stub_peek_counting2(cmd, **kw):
+        _ah_peek_calls2.append(list(cmd))
+        return _FakeGitResult(0, json.dumps({"ok": True, "output": ""}))
+
+    subprocess.run = _stub_peek_counting2
+    try:
+        check("AH-10: session_is_live: fresh activity → True via the cheap rail alone",
+              session_is_live("thies", _ah_live_fresh, now=T_ah) is True)
+        check("AH-10b: ...and peek was never called (stays off the hot path)",
+              _ah_peek_calls2 == [], f"calls={_ah_peek_calls2!r}")
+    finally:
+        subprocess.run = _orig_run_ah
+
+    # --- AH-11/12: pool_has_live_worker() / concrete_adhoc_session_is_live()
+    # wiring — the same false-reclaim can hit a bare pool-template dog or a
+    # concrete wa-worker-adhoc session mid-AskUserQuestion; both call sites
+    # share the session_owner_is_healthy() predicate and need the same fix. ---
+    _ah_pool_session = [
+        {"id": "sid-dog1", "name": "gastown.dog-9", "session_name": "dog-gaxyz",
+         "alias": "gastown.dog-9", "agent_name": "gastown.dog-9",
+         "template": "gastown.dog",
+         "state": "active", "last_active": _ah_stale_ts},
+    ]
+    subprocess.run = _stub_peek(output_text="⏺ AskUserQuestion(proceed?)")
+    try:
+        check("AH-11: pool_has_live_worker: stale+paused-on-AskUserQuestion dog → True (NOT reclaimed)",
+              pool_has_live_worker("gastown.dog", _ah_pool_session, now=T_ah) is True)
+    finally:
+        subprocess.run = _orig_run_ah
+
+    _ah_adhoc_session = [
+        {"id": "sid-wa1", "name": "wa-worker-adhoc-1", "session_name": "wa-worker-adhoc-deadbeef",
+         "alias": "", "agent_name": "wa-worker-adhoc-deadbeef",
+         "state": "active", "last_active": _ah_stale_ts},
+    ]
+    subprocess.run = _stub_peek(output_text="⏺ AskUserQuestion(proceed?)")
+    try:
+        check("AH-12: concrete_adhoc_session_is_live: stale+paused-on-AskUserQuestion → True (NOT reclaimed)",
+              concrete_adhoc_session_is_live(
+                  "wa-worker-adhoc-deadbeef", _ah_adhoc_session, now=T_ah) is True)
+    finally:
+        subprocess.run = _orig_run_ah
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0
