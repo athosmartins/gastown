@@ -175,7 +175,14 @@ echo "── 19. ga-x3nmz drift-guard: the re-queue path is wired into the live 
 has "$DISPATCHER" 'gate_quota_stop_verdict\(\)'                 "pure quota-stop decision is defined"
 has "$DISPATCHER" 'quota_reset_eta\(\)'                         "reset-ETA reader is defined"
 has "$DISPATCHER" 'QUOTA_REQUEUE=0'                             "QUOTA_REQUEUE state initialized"
-has "$DISPATCHER" 'gate_quota_stop_verdict "\$POLL_QUOTA_LIMITED"' "quota decision called from the poll loop"
+# ga-eqjo: the blocking poll loop this decision used to live inside (checking
+# "$POLL_QUOTA_LIMITED" once per 30s poll iteration) was replaced by a
+# non-blocking Step 8 + a later sweep's Phase C, which re-checks a run's own
+# persisted timeout instead of an in-process poll. The quota-stop decision
+# moved with it: Phase C now calls it as "$PC_QLIM" at TIMEOUT-detection time
+# (there is no other point at which a quota-stop is meaningful — Step 8's
+# fast path only fires once verdicts are ALREADY complete).
+has "$DISPATCHER" 'gate_quota_stop_verdict "\$PC_QLIM"' "quota decision called from Phase C's timeout check (ga-eqjo)"
 has "$DISPATCHER" 'verdict:REQUEUED'                            "pending verdicts parked as REQUEUED (not TIMEOUT)"
 has "$DISPATCHER" 'QUOTA-STOP re-queue'                         "marker re-queue comment present"
 has "$DISPATCHER" 'Gate pausado: cota 5h'                       "AC4 quota-pause notify present"
@@ -187,10 +194,18 @@ if awk '/QUOTA_REQUEUE:-0/{f=1} f&&/label add    "\$MARKER_ID" "gate-status:queu
 else
   bad "re-queue handler does not set gate-status:queued"
 fi
-if awk '/QUOTA_REQUEUE:-0/{f=1} f&&/exit 0/{print "ok"; exit} f&&/OVERALL_VERDICT" = "PASS"/{exit}' "$DISPATCHER" | grep -q ok; then
-  ok "re-queue handler exits 0 (skips both PASS and FAIL paths)"
+# ga-eqjo: this handler now lives inside gate_finalize_run() (called from
+# TWO places — the same-sweep fast path AND Phase C — not just the tail of a
+# single blocking invocation), so it must `return` to its caller rather than
+# `exit` the whole process: an `exit 0` here would abandon any OTHER run bead
+# Phase C still has queued to check this same sweep, and skip Step 0a onward
+# for the same-sweep fast-path caller. `return 0` is the function-context
+# equivalent of the old top-level `exit 0` — it still skips both the PASS and
+# FAIL branches below.
+if awk '/QUOTA_REQUEUE:-0/{f=1} f&&/return 0/{print "ok"; exit} f&&/OVERALL_VERDICT" = "PASS"/{exit}' "$DISPATCHER" | grep -q ok; then
+  ok "re-queue handler returns 0 (skips both PASS and FAIL paths, ga-eqjo function context)"
 else
-  bad "re-queue handler does not exit 0 before the verdict branches"
+  bad "re-queue handler does not return 0 before the verdict branches"
 fi
 
 echo "── 21. ORDERING guard: the re-queue handler precedes the merge/FAIL branches ──"

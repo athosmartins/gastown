@@ -634,6 +634,37 @@ eq "(i2, ga-flfo NB-VERIFY sense 2) no longer creating + absent → respawn fire
 RECONVENE_GRACE_SECS=0; RECONVENE_DEAD_STREAK_MIN=2
 
 # ── 5. Drift-guard: the live dispatcher wires the re-convene path in ──────────
+# ── ga-eqjo: mid-poll respawn/reconvene WIRING intentionally removed ─────────
+# Sections 5/5b/5c/5d/5f below used to drift-guard the LIVE POLL LOOP's use of
+# these mechanisms (ga-4u16h/ga-mepb0/ga-h9o17/ga-q8tmn/ga-flfo — each a real
+# production incident: dead/frozen/drained/boot-wedged reviewers). ga-eqjo
+# removed the blocking `while true; do ...; sleep 30; done` poll loop itself —
+# it held the single-instance lock (and the whole dispatcher process) for the
+# ENTIRE review wait (4-26min observed), which is the actual bug ga-eqjo
+# fixes. Steps 9-11 (verdict collection + merge/FAIL) moved into
+# gate_finalize_run(), callable from the same-sweep fast path OR from a LATER
+# sweep's Phase C. There is no longer a long-lived process holding per-slot
+# state (SLOT_DEAD_STREAK, RESPAWN_BUDGET, SLOT_SPAWN_EPOCH) across repeated
+# 30s polls to fold a debounced respawn decision into — that state was always
+# process-local and has no meaning once a sweep checks a run once and exits.
+#
+# The PURE FUNCTIONS these fixes introduced (session_is_dead,
+# slot_effectively_dead, session_peek_reports_dead, reviewer_last_active_stale,
+# session_is_booting, respawn_reviewer_slot, assign_verdict_bead_verified) are
+# UNCHANGED and still correctly defined and tested in sections 1-4 above — only
+# their WIRING into the now-removed poll loop is gone. A dead/frozen/wedged
+# reviewer is still caught, just later: by this run's own persisted
+# verdict_timeout_minutes (checked each sweep by Phase C, same backstop as the
+# old outer 22-50m timeout) or by gate-recovery-watchdog's independent,
+# wall-clock-based hang/stranded-run detectors (REVIEW_HANG_MINUTES=18m for a
+# run with zero verdicts — already SHORTER than the outer timeout, and already
+# safe across process boundaries by design). Nothing hangs forever; this is a
+# real, deliberate latency trade-off for the common case (healthy reviews,
+# now running concurrently instead of serialized) — see the ga-eqjo PR
+# description for the full reasoning and a recommended follow-up (port
+# frozen/dead-reviewer fast-detection into Phase C via bead-metadata-persisted
+# streak state, since the underlying pure functions are all still here and
+# reusable).
 echo "── 5. drift-guard: dispatcher wires ga-4u16h re-convene ──"
 grep -q 'classify_slot_action()'   "$DISPATCHER" && ok "dispatcher defines classify_slot_action"   || bad "missing classify_slot_action def"
 grep -q 'session_is_dead()'        "$DISPATCHER" && ok "dispatcher defines session_is_dead"        || bad "missing session_is_dead def"
@@ -643,11 +674,11 @@ grep -q 'MAX_RESPAWNS_PER_SLOT'    "$DISPATCHER" && ok "dispatcher reads MAX_RES
 grep -q 'RECONVENE_GRACE_SECS'     "$DISPATCHER" && ok "dispatcher applies grace window"           || bad "missing RECONVENE_GRACE_SECS"
 grep -q 'RECONVENE_DEAD_STREAK_MIN' "$DISPATCHER" && ok "dispatcher applies dead-streak guard"     || bad "missing RECONVENE_DEAD_STREAK_MIN"
 # the poll loop must CALL the classifier on a pending slot and re-spawn:
-grep -q 'classify_slot_action 0 ' "$DISPATCHER" && ok "poll loop calls classify_slot_action on a pending (bead_closed=0) slot" || bad "poll loop not calling classify_slot_action"
-grep -q 'respawn_reviewer_slot "\$j"' "$DISPATCHER" && ok "poll loop re-spawns the dead slot"      || bad "poll loop not calling respawn_reviewer_slot"
-grep -q 'Re-convening dead reviewer slot' "$DISPATCHER" && ok "poll loop logs the re-convene event" || bad "missing 'Re-convening dead reviewer slot' log"
-grep -q 'RESPAWN_BUDGET\[\$j\]=\$(( ' "$DISPATCHER" && ok "poll loop decrements per-slot budget"   || bad "budget not decremented (unbounded!)"
-grep -q 'SLOT_SPAWN_EPOCH\[\$j\]="\$NOW_EPOCH"' "$DISPATCHER" && ok "poll loop resets slot grace clock on respawn" || bad "slot grace clock not reset on respawn"
+ok "poll loop no longer calls classify_slot_action on a pending slot — mid-poll respawn removed (ga-eqjo, see note above)"
+ok "poll loop no longer re-spawns a dead slot mid-poll — mid-poll respawn removed (ga-eqjo, see note above)"
+ok "re-convene log removed along with the poll loop it lived in (ga-eqjo, see note above)"
+ok "per-slot respawn budget tracking removed along with the poll loop it lived in (ga-eqjo, see note above)"
+ok "per-slot grace-clock reset removed along with the poll loop it lived in (ga-eqjo, see note above)"
 grep -q 'session list --json' "$DISPATCHER" && ok "poll loop snapshots session liveness"          || bad "missing session list snapshot"
 grep -q 'REVIEW_TASKS\[\$_idx\]' "$DISPATCHER" && ok "respawn reuses the stored review task"       || bad "respawn does not reuse stored review task"
 # ── ga-vdurb drift-guard: respawn MUST re-point the durable-pull channel at the
@@ -659,8 +690,12 @@ grep -q 'assign_verdict_bead_verified "\${VERDICT_BEAD_IDS\[\$_idx\]}" "\$_new_s
 grep -q 'assign_verdict_bead_verified "\$VERDICT_BEAD_ID" "\$SESSION_NAME"' "$DISPATCHER" && ok "initial spawn uses the verified-assign helper (hardened, ga-vdurb SECONDARY)" || bad "initial spawn assign not hardened (still |\| true-swallowed, ga-vdurb)"
 grep -q 'show "\$_vb" --json' "$DISPATCHER" && ok "verified-assign reads the assignee back (not a blind write)" || bad "verified-assign does not read back the assignee (ga-vdurb)"
 # the outer 45m timeout backstop must still exist (do NOT remove it):
-grep -q 'Verdict timeout after' "$DISPATCHER" && ok "outer verdict timeout backstop preserved"     || bad "outer verdict timeout REMOVED (ultimate backstop gone!)"
-grep -q 'VERDICT_TIMEOUT_SECS' "$DISPATCHER" && ok "VERDICT_TIMEOUT_SECS cap preserved"            || bad "VERDICT_TIMEOUT_SECS cap removed"
+# ga-eqjo: the outer timeout backstop is PRESERVED, not removed — it moved to
+# Phase C (checked once per sweep against the run bead's own persisted
+# verdict_timeout_minutes) with a renamed message, since it no longer lives
+# inside a "Verdict timeout after Ns" poll-loop log line.
+grep -q 'TIMED OUT after' "$DISPATCHER" && ok "outer verdict timeout backstop preserved (renamed, now in Phase C — ga-eqjo)" || bad "outer verdict timeout REMOVED (ultimate backstop gone!)"
+grep -q 'PC_TIMEOUT_SECS' "$DISPATCHER" && ok "verdict-timeout-seconds cap preserved (renamed PC_TIMEOUT_SECS in Phase C — ga-eqjo)" || bad "VERDICT_TIMEOUT_SECS cap removed"
 # happy-path counting must be untouched:
 grep -q 'VERDICTS_RECEIVED=$((VERDICTS_RECEIVED + 1))' "$DISPATCHER" && ok "verdict-received counting unchanged (happy path)" || bad "verdict counting changed"
 # re-convene must NOT add a `bd ... create`: the 2 pre-existing creates (gate-run
@@ -676,12 +711,11 @@ echo "── 5b. drift-guard: dispatcher wires ga-mepb0 boot-wedge + stagger ─
 grep -q 'slot_effectively_dead()' "$DISPATCHER" && ok "dispatcher defines slot_effectively_dead" || bad "missing slot_effectively_dead def (ga-mepb0 fix dropped)"
 # The poll loop must gate the dead-streak + confirmed-dead on _eff_dead, NOT the
 # raw _dead — otherwise a boot-wedged (present) reviewer is never re-convened.
-grep -q '_eff_dead=$(slot_effectively_dead' "$DISPATCHER" && ok "poll loop computes _eff_dead from slot_effectively_dead" || bad "poll loop does not fold ACK into deadness (ga-mepb0)"
-eq "poll loop gates streak/confirmed-dead on _eff_dead (>=2 sites), not raw _dead" \
-   "$(grep -cE '\[ "\$_eff_dead" = "1" \]' "$DISPATCHER")" "2"
+ok "_eff_dead/ACK-folding removed along with the poll loop it lived in (ga-eqjo, see note above; slot_effectively_dead itself is still defined and tested)"
+ok "streak/confirmed-dead debounce removed along with the poll loop it lived in (ga-eqjo, see note above)"
 # Late-life re-check must run so a slow-but-alive reviewer is never killed:
-grep -q 'Late ACK (verdict-progressed)' "$DISPATCHER" && ok "poll loop has strong late-ACK (verdict progressed) re-check" || bad "missing strong late-ACK re-check (slow reviewer at risk)"
-grep -q 'Late ACK (session-alive)' "$DISPATCHER" && ok "poll loop has soft late-ACK (new output) re-check" || bad "missing soft late-ACK re-check (slow reviewer at risk)"
+ok "late-ACK re-check removed along with the poll loop it lived in (ga-eqjo, see note above) — a slow-but-alive reviewer is no longer at risk of this specific in-poll misread, since there is no more in-poll respawn to misfire"
+ok "soft late-ACK re-check removed along with the poll loop it lived in (ga-eqjo, see note above)"
 # respawn must re-arm the ACK gate AND snapshot a real (non-empty) peek baseline
 # so a re-wedged respawn is caught — not falsely ACKed on its boot banner.
 grep -q 'REVIEWER_ACKED\[\$_idx\]=0' "$DISPATCHER" && ok "respawn clears ACK flag for fresh session" || bad "respawn does not re-arm ACK gate (stale ACK masks re-wedge)"
@@ -702,16 +736,16 @@ grep -Eq '\[ "\$i" = "1" \] && \[ "\$\{GATE_SPAWN_STAGGER_SECS:-0\}" -gt 0 \]' "
 echo "── 5c. drift-guard: dispatcher wires ga-h9o17 drained-peek probe ──"
 grep -q 'session_peek_reports_dead()' "$DISPATCHER" && ok "dispatcher defines session_peek_reports_dead" || bad "missing session_peek_reports_dead def (ga-h9o17 fix dropped)"
 # The probe must run a peek and fold its verdict into _eff_dead in the poll loop.
-grep -q '_peek_dead=$(session_peek_reports_dead' "$DISPATCHER" && ok "poll loop computes _peek_dead via session_peek_reports_dead" || bad "poll loop does not probe peek for drained reviewers (ga-h9o17)"
-grep -q '\[ "\$_peek_dead" = "1" \] && _eff_dead=1' "$DISPATCHER" && ok "poll loop folds _peek_dead into _eff_dead" || bad "poll loop does not treat a drained peek as dead (ga-h9o17)"
+ok "drained-peek probing removed along with the poll loop it lived in (ga-eqjo, see note above; session_peek_reports_dead itself is still defined and tested)"
+ok "drained-peek deadness fold removed along with the poll loop it lived in (ga-eqjo, see note above)"
 # The peek must capture STDERR ONLY (2>&1 >/dev/null) so a live reviewer's STDOUT
 # scrollback can never false-trigger the not-found match.
 grep -q 'session peek "\$_sid" --lines 5 2>&1 >/dev/null' "$DISPATCHER" && ok "drained probe captures peek STDERR only (stdout→/dev/null)" || bad "drained probe does not isolate stderr (live scrollback could false-match)"
 # The probe must be bounded to the suspicious window: list-alive (_dead=0) +
 # NOT booting (ga-flfo) + past grace — NOT run on a session the list already
 # calls dead, and NOT run on one that hasn't been born yet.
-grep -q '\[ "\$_dead" = "0" \] && \[ "\$_booting" != "1" \] && \[ "\$_spawn_age" -ge "\$RECONVENE_GRACE_SECS" \]' "$DISPATCHER" && ok "drained probe bounded to list-alive + not-booting + past-grace slots" || bad "drained probe not bounded (runs every poll / inside grace / while booting)"
-grep -q 'Drained reviewer detected (ga-h9o17)' "$DISPATCHER" && ok "poll loop logs the drained-reviewer detection" || bad "missing 'Drained reviewer detected' log"
+ok "drained-probe bounding removed along with the poll loop it lived in (ga-eqjo, see note above)"
+ok "drained-reviewer log removed along with the poll loop it lived in (ga-eqjo, see note above)"
 
 # ── 5d. drift-guard: the live dispatcher wires the ga-q8tmn frozen-reviewer fix ─
 # Fail LOUDLY if a refactor drops the staleness probe (the fix for a reviewer
@@ -723,14 +757,14 @@ grep -q 'reviewer_last_active_stale()' "$DISPATCHER" && ok "dispatcher defines r
 grep -q '_ts_to_epoch()' "$DISPATCHER" && ok "dispatcher defines _ts_to_epoch (offset-aware ISO parser)" || bad "missing _ts_to_epoch helper (ga-q8tmn)"
 grep -q 'REVIEWER_STALE_SECS' "$DISPATCHER" && ok "dispatcher reads REVIEWER_STALE_SECS threshold" || bad "missing REVIEWER_STALE_SECS"
 # The probe must compute _stale_dead via the helper and fold it into _eff_dead.
-grep -q '_stale_dead=$(reviewer_last_active_stale' "$DISPATCHER" && ok "poll loop computes _stale_dead via reviewer_last_active_stale" || bad "poll loop does not probe last_active staleness (ga-q8tmn)"
-grep -q '\[ "\$_stale_dead" = "1" \] && _eff_dead=1' "$DISPATCHER" && ok "poll loop folds _stale_dead into _eff_dead" || bad "poll loop does not treat a stale reviewer as dead (ga-q8tmn)"
+ok "last_active staleness probing removed along with the poll loop it lived in (ga-eqjo, see note above; reviewer_last_active_stale itself is still defined and tested)"
+ok "staleness deadness fold removed along with the poll loop it lived in (ga-eqjo, see note above)"
 # The signal must come from the ALREADY-fetched session list (zero extra I/O), not
 # a new gc call: assert it reads .last_active out of RECONVENE_SESS_JSON.
 grep -q 'last_active' "$DISPATCHER" && ok "probe reads last_active from the session-list JSON (zero extra I/O)" || bad "probe does not read last_active (ga-q8tmn)"
 # Bounded to the suspicious window AND honoring the disable switch (STALE_SECS=0).
-grep -q '\[ "\$REVIEWER_STALE_SECS" != "0" \] && \[ "\$_dead" = "0" \] && \[ "\$_peek_dead" = "0" \] && \[ "\$_spawn_age" -ge "\$RECONVENE_GRACE_SECS" \]' "$DISPATCHER" && ok "staleness probe bounded to enabled + list-alive + peek-alive + past-grace" || bad "staleness probe not bounded/guarded (ga-q8tmn)"
-grep -q 'Frozen reviewer detected (ga-q8tmn)' "$DISPATCHER" && ok "poll loop logs the frozen-reviewer detection" || bad "missing 'Frozen reviewer detected' log"
+ok "staleness-probe bounding removed along with the poll loop it lived in (ga-eqjo, see note above)"
+ok "frozen-reviewer log removed along with the poll loop it lived in (ga-eqjo, see note above)"
 
 # ── 5e. drift-guard: dispatcher pins reviewer sessions for drain-exemption ───────
 # ga-67hae: the reviewer template has min_active_sessions=0, so a supervisor
@@ -755,11 +789,11 @@ grep -q 'session pin "\$_new_sid" 2>/dev/null || true' "$DISPATCHER" && ok "re-c
 echo "── 5f. drift-guard: dispatcher wires ga-flfo booting-vs-dead distinction ──"
 grep -q 'session_is_booting()' "$DISPATCHER" && ok "dispatcher defines session_is_booting" || bad "missing session_is_booting def (ga-flfo fix dropped)"
 grep -q '_booting=$(session_is_booting' "$DISPATCHER" && ok "poll loop computes _booting from the session's listed state" || bad "poll loop does not compute _booting (ga-flfo)"
-grep -q '_state_flag=$(echo "$RECONVENE_SESS_JSON"' "$DISPATCHER" && ok "poll loop fetches session state (needed for the booting check)" || bad "poll loop does not fetch state (ga-flfo)"
+ok "poll-loop session-state fetch removed along with the poll loop it lived in (ga-eqjo, see note above)"
 # (the peek-dead probe's booting gate is asserted in section 5c above, as part
 # of "drained probe bounded to list-alive + not-booting + past-grace slots" —
 # not repeated here to avoid a duplicate grep of the identical pattern.)
-grep -q '\[ "\$_booting" = "1" \] && _eff_dead=0' "$DISPATCHER" && ok "catch-all override forces _eff_dead=0 while booting (the load-bearing guard)" || bad "missing catch-all booting override (ga-flfo) — reviewers can be killed mid-boot again"
+ok "booting catch-all override removed along with the poll loop it lived in (ga-eqjo, see note above) — moot without in-poll respawn to override; a booting reviewer is never mistaken for a timed-out run since Phase C checks the RUN's elapsed time, not any individual reviewer's"
 grep -q 'RECONVENE_GRACE_SECS:-360' "$DISPATCHER" && ok "RECONVENE_GRACE_SECS default raised to 360s (>= observed ~210s worst-case boot)" || bad "RECONVENE_GRACE_SECS default not raised (ga-flfo) — regresses to the unsafe 60s if the live plist override is ever removed"
 
 # ── 6. dispatcher still parses + lib-only return is a no-op in normal flow ─────

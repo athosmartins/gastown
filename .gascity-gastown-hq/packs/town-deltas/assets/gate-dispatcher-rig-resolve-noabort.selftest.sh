@@ -75,9 +75,15 @@ extract_block() {
 # stdout/stderr and returns its exit code via $? (propagated from the subshell).
 run_rig_resolve() {
   local file="$1" rig="$2" bead_id="$3" bd_log="$4"
-  local block
+  local fn_bead_city fn_resolve_ctx block
+  # ga-eqjo: the rig-path-resolve call site now delegates to gate_resolve_rig_context()
+  # (hoisted out so Phase C can reuse it), which itself calls resolve_bead_city(). Both
+  # are real production functions, extracted+sourced verbatim (not re-stubbed) so this
+  # test still exercises the actual resolution logic, not a hand-maintained duplicate.
+  fn_bead_city="$(extract_block "$file" "resolve-bead-city-fn")"
+  fn_resolve_ctx="$(extract_block "$file" "gate-resolve-rig-context-fn")"
   block="$(extract_block "$file" "rig-path-resolve")"
-  if [ -z "$block" ]; then
+  if [ -z "$block" ] || [ -z "$fn_bead_city" ] || [ -z "$fn_resolve_ctx" ]; then
     echo "COULD_NOT_EXTRACT_BLOCK" >&2
     return 99
   fi
@@ -97,6 +103,8 @@ run_rig_resolve() {
     bd() { echo "$*" >> "$BD_LOG"; return 0; }
     err() { echo "ERR: $*" >&2; }
     log() { echo "LOG: $*" >&2; }
+    '"$fn_bead_city"'
+    '"$fn_resolve_ctx"'
     '"$block"'
     echo "REACHED_END|RIG_PATH=${RIG_PATH:-<empty>}"
   ' _ "$rig" "$bead_id" "$bd_log" "$SELF_DIR"
@@ -142,10 +150,14 @@ case "$OUT_2" in
   *"REACHED_END|RIG_PATH=$SELF_DIR"*) ok "well-formed marker: RIG_PATH resolved correctly, no regression";;
   *)                                  bad "well-formed marker: RIG_PATH did not resolve as expected; got: $OUT_2";;
 esac
-if [ -s "$BD_LOG_2" ]; then
-  bad "well-formed marker: unexpected bd call(s) on the happy path: $(cat "$BD_LOG_2")"
+if grep -qE "gate-status:error|gate-status:dispatching" "$BD_LOG_2"; then
+  bad "well-formed marker: unexpected error-path bd call(s) on the happy path: $(cat "$BD_LOG_2")"
 else
-  ok "well-formed marker: no error labeling on the happy path"
+  # ga-eqjo: gate_resolve_rig_context() now also calls resolve_bead_city(), which
+  # legitimately does a `bd show` OWNERSHIP PROBE on every call (not just error
+  # paths) — that's expected production behavior (ga-qw7y6), not a regression.
+  # Only label/comment calls (the actual error-handling side effects) must be absent.
+  ok "well-formed marker: no error labeling on the happy path (bd log: $(tr '\n' ';' < "$BD_LOG_2"))"
 fi
 rm -f "$BD_LOG_2"
 

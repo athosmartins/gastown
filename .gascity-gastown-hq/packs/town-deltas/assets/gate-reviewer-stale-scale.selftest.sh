@@ -107,11 +107,23 @@ if grep -q 'REVIEWER_STALE_SECS_SCALED=$(gate_scaled_reviewer_stale' "$DISPATCHE
 else
   bad "sweep does NOT wire gate_scaled_reviewer_stale — scaling is dead code"
 fi
-if grep -q '_stale_thresh=' "$DISPATCHER" && grep -q 'reviewer_last_active_stale "\$_last_active" "\$NOW_EPOCH" "\$_stale_thresh"' "$DISPATCHER"; then
-  ok "frozen-reviewer probe consumes the scaled threshold (_stale_thresh)"
-else
-  bad "frozen-reviewer probe still uses the FIXED window — scaling is not consumed"
-fi
+# ga-eqjo: the mid-poll frozen-reviewer probe this guard used to check for
+# (ga-q8tmn's in-loop respawn) no longer exists — Step 8's `while true; do
+# ...; sleep 30; done` poll it lived inside was replaced by a single
+# non-blocking check (the multi-minute blocking wait was the actual bug being
+# fixed). That probe's debounce state (SLOT_DEAD_STREAK) was process-local and
+# had no meaning once a sweep only checks a run once and exits; porting it
+# would mean persisting streak counters as bead metadata for what was always a
+# LATENCY optimization, not a correctness requirement (see gate_collect_verdicts'
+# header comment in quality-gate-dispatcher.sh). A frozen reviewer is still
+# caught by this run's own persisted verdict_timeout_minutes (Phase C) or by
+# gate-recovery-watchdog's independent wall-clock hang detectors — just later
+# (up to the full timeout) instead of via the faster in-poll reconvene. The
+# scaled threshold itself (gate_scaled_reviewer_stale, tested above) is
+# currently unconsumed dead code as a result; left in place (cheap, harmless,
+# and immediately reusable if frozen-reviewer respawn is ever ported into
+# Phase C) rather than deleted as part of an already-large change.
+ok "frozen-reviewer probe intentionally removed (ga-eqjo Step 8 non-blocking rewrite) — see comment above"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"

@@ -1351,6 +1351,1447 @@ supersede_sibling_runs() {
   done
 }
 
+# ── ga-eqjo: Steps 9-11 wrapped as a callable function ───────────────────────
+# No logic below changed from its historical inline form — pure relocation +
+# function-wrap so it is callable from TWO places: (a) the same-sweep fast
+# path, right after Phase A spawns reviewers, when verdicts already happen to
+# be in (near-instant reviews); (b) Phase C, a LATER sweep (possibly a
+# different process) that re-derives an in-flight run's context from its bead
+# state and finalizes it once complete or timed out. Defined this early
+# (before Phase C, before Step 0a) purely so bash has already executed this
+# definition by the time either caller runs — bash resolves a function call
+# against whatever has been DEFINED so far at that point in execution, not
+# by textual position, so callers earlier in the file can invoke a function
+# defined here as long as this definition itself runs first each sweep.
+gate_finalize_run() {
+# ── Step 9: Close reviewer sessions ──────────────────────────────────────────
+# Close promptly here (before the Step 10 merge) to free the gate-reviewer cap
+# slots ASAP. The EXIT trap (ga-zl277) is the safety net for every abort path
+# that never reaches this line; the shared idempotent helper makes the trap a
+# no-op once this has run.
+cleanup_reviewer_sessions
+
+# ── Step 10: Act on verdict ───────────────────────────────────────────────────
+
+GATE_END_EPOCH=$(date +%s)
+ELAPSED_S=$((GATE_END_EPOCH - GATE_START_EPOCH))
+
+# ── ga-x3nmz: QUOTA-STOP re-queue — never false-FAIL on an exhausted 5h window ─
+# A timeout or dead reviewer slot that coincided with an exhausted Claude 5h
+# quota is a quota-stop, not a logic failure. Re-queue the marker (back to
+# gate-status:queued) so the next sweep re-runs the gate; the ga-cw4pm headroom
+# gate holds it deferred until the window resets, giving automatic resume (AC3).
+# Park any still-pending verdict beads as REQUEUED (not TIMEOUT) so they neither
+# orphan nor read as a FAIL, and the re-run mints fresh ones. Clear notify + ETA
+# (AC4). This branch is mutually exclusive with the PASS/FAIL paths below.
+if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
+  if [ "${REQUEUE_REASON:-quota}" = "dead-reviewer" ]; then
+    # ga-eqjo (code-review fix): the old blocking Step 8 poll loop silently
+    # self-healed a reviewer session dying mid-review (Dolt hiccup, OOM,
+    # crash — the ga-4u16h/ga-h9o17 incident class) via mid-poll respawn.
+    # That respawn machinery was deliberately NOT ported to Phase C (its
+    # per-slot debounce state was process-local and meaningless once a
+    # sweep checks a run once and exits — see gate_collect_verdicts). But
+    # falling all the way through to a genuine TIMEOUT-FAIL below is WRONG
+    # for this specific case: the branch may be fine and other reviewers
+    # may have already passed it — blaming the AUTHOR's code for an infra
+    # death burns one of their 3 auto-fix attempts toward a false, permanent
+    # gate:needs-human park. Phase C confirmed EVERY still-pending
+    # reviewer's session is dead (not slow, not wedged — gone) before
+    # setting this flag, so re-queue for a fresh attempt with new reviewers
+    # instead, reusing the exact same proven re-queue MECHANISM as the
+    # ga-x3nmz quota-stop path immediately below (never FAIL, never burn a
+    # fix-attempt), with reason-appropriate messaging.
+    log "INFRA re-queue (ga-eqjo): marker $MARKER_ID re-queued — reviewer session(s) died mid-review (Dolt hiccup/crash class, not a code FAIL)."
+    for VB in "${VERDICT_BEAD_IDS[@]}"; do
+      VB_STATUS=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null \
+        | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
+      if [ "$VB_STATUS" != "closed" ]; then
+        bd -C "$GC_CITY" label remove "$VB" "verdict:pending" -q 2>/dev/null || true
+        bd -C "$GC_CITY" label add    "$VB" "verdict:REQUEUED" -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (ga-eqjo) — reviewer session died mid-review (infra failure, NOT a code FAIL). Marker re-queued for a fresh attempt." 2>/dev/null || true
+        bd -C "$GC_CITY" close "$VB" 2>/dev/null || true
+      fi
+    done
+    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
+    bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:queued"      -q 2>/dev/null || true
+    bd -C "$GC_CITY" comment "$MARKER_ID" "INFRA re-queue (ga-eqjo): reviewer session(s) died mid-review — an infra failure (Dolt hiccup/crash class, ga-4u16h/ga-h9o17), NOT a code FAIL. Marker re-queued; the ga-cw4pm headroom gate will admit a fresh attempt with new reviewers." 2>/dev/null || true
+    if [ "$GATE_RUN_ID" != "unknown" ]; then
+      bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run paused (infra re-queue, ga-eqjo): reviewer session(s) died mid-review; marker $MARKER_ID re-queued for a fresh attempt. No verdict recorded; this is NOT a FAIL." 2>/dev/null || true
+    fi
+    notify -t "⚠️ Gate re-enfileirado: reviewer morreu" -p 3 "Gate $BRANCH re-enfileirado — sessão de reviewer morreu em pleno review (falha de infra, não é FAIL) (ga-eqjo)." 2>/dev/null || true
+    return 0
+  fi
+  _eta=$(quota_reset_eta)
+  log "QUOTA-STOP (ga-x3nmz): marker $MARKER_ID re-queued — Claude 5h quota exhausted mid-review; gate re-runs automatically post-reset${_eta:+ ($_eta)}. This is NOT a FAIL."
+  # Park pending verdict beads as REQUEUED so they don't orphan or count as FAIL.
+  for VB in "${VERDICT_BEAD_IDS[@]}"; do
+    VB_STATUS=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
+    if [ "$VB_STATUS" != "closed" ]; then
+      bd -C "$GC_CITY" label remove "$VB" "verdict:pending" -q 2>/dev/null || true
+      bd -C "$GC_CITY" label add    "$VB" "verdict:REQUEUED" -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (ga-x3nmz) — reviewer session ended on an exhausted Claude 5h quota (quota-stop, NOT a code FAIL). Marker re-queued for re-run post-reset${_eta:+ ($_eta)}." 2>/dev/null || true
+      bd -C "$GC_CITY" close "$VB" 2>/dev/null || true
+    fi
+  done
+  # Re-queue the marker (reverse of the atomic claim): dispatching → queued.
+  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
+  bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:queued"      -q 2>/dev/null || true
+  bd -C "$GC_CITY" comment "$MARKER_ID" "QUOTA-STOP re-queue (ga-x3nmz): reviewer(s) stalled because Claude's 5h session quota is exhausted — a quota-stop, NOT a code FAIL. Marker re-queued; the ga-cw4pm headroom gate holds it deferred until the window resets${_eta:+ ($_eta)}, then the gate re-runs with fresh reviewers." 2>/dev/null || true
+  if [ "$GATE_RUN_ID" != "unknown" ]; then
+    bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run paused (quota-stop, ga-x3nmz): Claude 5h quota exhausted mid-review; marker $MARKER_ID re-queued for re-run post-reset${_eta:+ ($_eta)}. No verdict recorded; this is NOT a FAIL." 2>/dev/null || true
+  fi
+  notify -t "⏸️ Gate pausado: cota 5h" -p 3 "Gate $BRANCH re-enfileirado — cota 5h do Claude esgotada (quota-stop, não é FAIL); retoma quando resetar${_eta:+ ($_eta)} (ga-x3nmz)." 2>/dev/null || true
+  # ga-eqjo: return (not exit) — this now runs inside gate_finalize_run(), which
+  # Phase C calls once per in-flight run bead in a loop; exiting the whole
+  # process here would abandon any OTHER run bead still waiting to be checked
+  # this same sweep (and skip Step 0a onward for the same-sweep fast-path
+  # caller). Every other path through this function already falls off its end
+  # via Step 11, which is an ordinary return in function context.
+  return 0
+fi
+
+if [ "$OVERALL_VERDICT" = "PASS" ]; then
+  log "ALL PASS — proceeding to merge branch $BRANCH → $DEFAULT_BRANCH ..."
+
+  if [ "$DRY_RUN" = "1" ]; then
+    log "DRY_RUN=1 — WOULD MERGE: git_rig push origin <branch_sha>:refs/heads/$DEFAULT_BRANCH (FF merge of $BRANCH)"
+    log "DRY_RUN=1 — WOULD CLOSE source bead $BEAD_ID"
+    MERGE_SHA="DRY_RUN_NO_MERGE"
+    MERGE_RESULT="dry_run"
+  else
+    # ── Container-rig direct merge ──────────────────────────────────────────
+    # For container rigs (bare .repo.git):
+    #   1. Rebase the branch onto origin/main (ensures clean FF merge)
+    #   2. Fast-forward main to the branch tip
+    #   3. Push main to origin
+    #
+    # For self-repo rigs (normal .git directory):
+    #   Use standard git commands via -C <rig_path>
+    #
+    # SECURITY NOTE: We do NOT use `git push --force`. This is a FF merge only.
+    # If FF fails (diverged history), we abort and report failure.
+
+    MERGE_SHA=""
+    MERGE_RESULT="failed"
+
+    # ── ga-3b8: Merge-time rebase+retry (starvation fix) ──────────────────────
+    # The review→merge window is the starvation attack surface: another rig merge
+    # can land between "reviewers PASS" and "push main".  We handle this by
+    # re-fetching at merge time and, if main moved, auto-rebasing the branch
+    # (conflict-free only) before the FF push.  If the FF push races again, we
+    # retry the whole rebase→push sequence up to MAX_MERGE_RETRIES times.
+    # Each attempt is fast (seconds), so 3 retries closes the window even on a
+    # very busy rig.
+    MAX_MERGE_RETRIES=3
+    MERGE_ATTEMPT=0
+
+    do_merge_ff() {
+      # Arguments: IS_CONTAINER_RIG, BRANCH, DEFAULT_BRANCH — all from outer scope.
+      # Returns: sets MERGE_SHA and MERGE_RESULT in outer scope.
+      # Strategy per attempt:
+      #   1. git fetch (get current remote state)
+      #   2. If main moved (branch no longer FF-able): auto-rebase if clean
+      #   3. FF push branch SHA to main
+      #   4. Verify landing
+
+      git_rig fetch origin 2>/dev/null || warn "Pre-merge fetch failed (attempt $((MERGE_ATTEMPT+1)))"
+      # ga-ljbx: hardened — resolve to REAL commit objects so a dangling ref
+      # surfaces as failed_sha_resolution (retryable) rather than poisoning the
+      # downstream merge-base/merge-tree with a non-existent SHA.
+      local CUR_MAIN
+      CUR_MAIN=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
+      local CUR_BRANCH
+      CUR_BRANCH=$(rig_resolve_commit "origin/$BRANCH")
+
+      if [ -z "$CUR_MAIN" ] || [ -z "$CUR_BRANCH" ]; then
+        MERGE_RESULT="failed_sha_resolution"
+        return 1
+      fi
+
+      local IS_ANC
+      IS_ANC=$(git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null && echo "yes" || echo "no")
+
+      if [ "$IS_ANC" != "yes" ]; then
+        # Main moved during review — attempt inline rebase before push
+        log "  Merge-time rebase: main moved to $CUR_MAIN after review; rebasing $BRANCH ..."
+        local TMP_MR_WT="/tmp/gc-gate-mr-retry-$$-${MERGE_ATTEMPT}"
+        local MR_OK=0
+
+        # ga-ljbx: deterministic conflict pre-check (git 2.54) — see
+        # rig_merge_has_conflict. An "err" verdict is treated as a transient
+        # resolution failure (retryable) rather than a phantom conflict.
+        local MR_BASE
+        MR_BASE=$(git_rig merge-base "origin/$BRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+        local MR_CONFLICT=0
+        local MR_VERDICT
+        MR_VERDICT=$(rig_merge_has_conflict "origin/$DEFAULT_BRANCH" "origin/$BRANCH")
+        if [ "$MR_VERDICT" = "1" ]; then
+          MR_CONFLICT=1
+        elif [ "$MR_VERDICT" = "err" ]; then
+          err "  Merge-time conflict pre-check undeterminable (base=${MR_BASE:-none}) — treating as transient (attempt $((MERGE_ATTEMPT+1)))"
+          MERGE_RESULT="failed_sha_resolution"
+          return 1
+        fi
+
+        if [ "$MR_CONFLICT" = "1" ]; then
+          err "  Merge-time rebase: conflicts detected — cannot auto-rebase (attempt $((MERGE_ATTEMPT+1)))"
+          MERGE_RESULT="failed_merge_time_conflict"
+          return 1
+        fi
+
+        if [ "$IS_CONTAINER_RIG" = "1" ]; then
+          if git_rig worktree add "$TMP_MR_WT" "origin/$BRANCH" 2>/dev/null; then
+            git -C "$TMP_MR_WT" config user.email "gate-dispatcher@gascity.local" 2>/dev/null || true
+            git -C "$TMP_MR_WT" config user.name "Gate Dispatcher" 2>/dev/null || true
+            if git -C "$TMP_MR_WT" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+              local NEW_TIP_MR
+              NEW_TIP_MR=$(git -C "$TMP_MR_WT" rev-parse HEAD 2>/dev/null || echo "")
+              if [ -n "$NEW_TIP_MR" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
+                MR_OK=1
+                log "  Merge-time rebase: pushed $BRANCH → $NEW_TIP_MR"
+              else
+                git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
+              fi
+            else
+              git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
+            fi
+            git_rig worktree remove "$TMP_MR_WT" --force 2>/dev/null || true
+          fi
+        else
+          if git -C "$GIT_DIR_PATH" worktree add "$TMP_MR_WT" "origin/$BRANCH" 2>/dev/null; then
+            git -C "$TMP_MR_WT" config user.email "gate-dispatcher@gascity.local" 2>/dev/null || true
+            git -C "$TMP_MR_WT" config user.name "Gate Dispatcher" 2>/dev/null || true
+            if git -C "$TMP_MR_WT" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+              local NEW_TIP_MR_SR
+              NEW_TIP_MR_SR=$(git -C "$TMP_MR_WT" rev-parse HEAD 2>/dev/null || echo "")
+              if [ -n "$NEW_TIP_MR_SR" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
+                MR_OK=1
+                log "  Merge-time rebase (self-repo): pushed $BRANCH → $NEW_TIP_MR_SR"
+              else
+                git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
+              fi
+            else
+              git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
+            fi
+            git -C "$GIT_DIR_PATH" worktree remove "$TMP_MR_WT" --force 2>/dev/null || true
+          fi
+        fi
+
+        if [ "$MR_OK" != "1" ]; then
+          err "  Merge-time rebase: worktree/push failed (attempt $((MERGE_ATTEMPT+1)))"
+          MERGE_RESULT="failed_merge_time_rebase"
+          return 1
+        fi
+
+        # Re-fetch after rebase push (ga-ljbx: hardened resolution)
+        git_rig fetch origin 2>/dev/null || true
+        CUR_BRANCH=$(rig_resolve_commit "origin/$BRANCH")
+        CUR_MAIN=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
+        if [ -z "$CUR_BRANCH" ] || [ -z "$CUR_MAIN" ]; then
+          MERGE_RESULT="failed_sha_resolution"
+          return 1
+        fi
+        IS_ANC=$(git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null && echo "yes" || echo "no")
+
+        if [ "$IS_ANC" != "yes" ]; then
+          err "  Merge-time rebase: branch still not FF-able after rebase (main moved again?)"
+          MERGE_RESULT="failed_still_not_ff_after_rebase"
+          return 1
+        fi
+      fi
+
+      # ga-eqjo: refresh the outer MAIN_HEAD_SHA to THIS attempt's just-fetched
+      # CUR_MAIN before pushing. The post-merge integrity check below reads
+      # MAIN_HEAD_SHA as "main's state immediately before our merge" — if main
+      # moved since Step 4 claimed this marker (increasingly common now that
+      # runs can overlap, ga-eqjo) and this attempt rebased onto the new tip,
+      # the OLD claim-time MAIN_HEAD_SHA would be stale, making the integrity
+      # diff compare against the wrong baseline (and a revert would push back
+      # to a too-old sha, discarding any legitimate commits landed meanwhile).
+      # No-op when main did not move (CUR_MAIN == the claim-time value).
+      MAIN_HEAD_SHA="$CUR_MAIN"
+
+      # FF push
+      if git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH" 2>/dev/null; then
+        git_rig fetch origin 2>/dev/null || warn "Post-FF-push fetch failed"
+        local POST_MAIN
+        POST_MAIN=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
+        if [ -n "$POST_MAIN" ] && git_rig merge-base --is-ancestor "$CUR_BRANCH" "$POST_MAIN" 2>/dev/null; then
+          MERGE_SHA="$CUR_BRANCH"
+          MERGE_RESULT="direct_ff"
+          log "FF merge + landing verified (attempt $((MERGE_ATTEMPT+1))): $BRANCH → $DEFAULT_BRANCH (sha=$MERGE_SHA, main=$POST_MAIN)"
+
+          # ── ga-eptel: durable rig-canonical landing + survival audit ─────────
+          # The FF push above advances the REMOTE (origin/$DEFAULT_BRANCH on
+          # GitHub), but for a CONTAINER rig `git_rig` targets the bare
+          # .repo.git — whose OWN local refs/heads/$DEFAULT_BRANCH is NOT touched
+          # by a push. Crew worktrees clone from that bare repo, so a stale local
+          # main makes a gate-verified merge "disappear" from the rig's canonical
+          # main even though it lives on GitHub. This is the root cause of
+          # ga-eptel: ps-l72n (305dd697c) and ga-i5vt (d3cafb679) were reported
+          # "FF merge + landing verified" yet vanished from the rig's main —
+          # because the bare local main was never advanced (verified live: both
+          # SHAs present on origin/main, absent from the bare .repo.git main).
+          #
+          # Fix: advance the bare local main to the merge SHA (FF-only — never
+          # rewrite history), then AUDIT survival by confirming the merge is an
+          # ancestor of BOTH the rig-canonical local main AND origin/main after a
+          # fresh fetch. If it vanished (e.g. a racing town-main push clobbered a
+          # shared remote), do NOT report success: return 1 so the caller
+          # degrades to gate-status:error and the source bead is re-enqueued, not
+          # closed. Self-repo rigs (wa, gascity) are unaffected and untouched —
+          # their deploy reads GitHub directly and they survived the audit (4/4).
+          if [ "$IS_CONTAINER_RIG" = "1" ]; then
+            local RESOLVED_MERGE LOCAL_MAIN AUDIT_LOCAL AUDIT_ORIGIN
+            RESOLVED_MERGE=$(rig_resolve_commit "$CUR_BRANCH")
+            if [ -z "$RESOLVED_MERGE" ]; then
+              err "  Durable-landing: merge SHA unresolvable post-push ($CUR_BRANCH)"
+              MERGE_RESULT="failed_durable_resolution"
+              return 1
+            fi
+            # ga-rstw5: track origin/$DEFAULT_BRANCH (the canonical durable line the
+            # FF push above just advanced — $RESOLVED_MERGE is verified an ancestor
+            # of it), NOT merely the merge SHA. FF when the bare ref is behind; when
+            # it has FORKED off origin (orphan commits — e.g. a decommission
+            # 'preserve' commit) RECONCILE to origin instead of false-FAILing the
+            # all-PASS verdict. The old FF-only-or-fail guard's failed_durable_not_ff
+            # burned a 2nd gate cycle + mailed crew a spurious FAIL the instant the
+            # bare mirror diverged. The survival audit below STILL re-verifies the
+            # merge in BOTH the rig-canonical local main AND origin, so a genuine
+            # clobber/orphan is still caught and re-enqueued (not closed).
+            DURABLE_RECON_OUT=""
+            DURABLE_RECON_RC=0
+            DURABLE_RECON_OUT=$(reconcile_bare_main_to_origin "$GIT_DIR_PATH" "$DEFAULT_BRANCH") || DURABLE_RECON_RC=$?
+            if [ "$DURABLE_RECON_RC" != "0" ]; then
+              err "  Durable-landing: bare $DEFAULT_BRANCH reconcile to origin FAILED ($DURABLE_RECON_OUT)"
+              MERGE_RESULT="failed_durable_updateref"
+              return 1
+            fi
+            log "  Durable-landing: bare $DEFAULT_BRANCH reconciled to origin ($DURABLE_RECON_OUT)"
+            # Survival audit: fresh fetch, then confirm the merge survives in BOTH
+            # the rig-canonical local main AND origin/main. A failure here means
+            # the merge was orphaned (shared-remote clobber or lost push) — fail
+            # so the bead is re-enqueued, not closed (ga-eptel audit-guard ask).
+            git_rig fetch origin 2>/dev/null || warn "  Durable-landing: audit re-fetch failed (continuing with stale refs)"
+            AUDIT_LOCAL=$(rig_resolve_commit "refs/heads/$DEFAULT_BRANCH")
+            if [ -z "$AUDIT_LOCAL" ] || ! git_rig merge-base --is-ancestor "$RESOLVED_MERGE" "$AUDIT_LOCAL" 2>/dev/null; then
+              err "  Durable-landing AUDIT FAILED: merge $RESOLVED_MERGE not in rig-canonical $DEFAULT_BRANCH (${AUDIT_LOCAL:-<unresolved>})"
+              MERGE_RESULT="failed_durable_audit_local"
+              return 1
+            fi
+            AUDIT_ORIGIN=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
+            if [ -z "$AUDIT_ORIGIN" ] || ! git_rig merge-base --is-ancestor "$RESOLVED_MERGE" "$AUDIT_ORIGIN" 2>/dev/null; then
+              err "  Durable-landing AUDIT FAILED: merge $RESOLVED_MERGE not in origin/$DEFAULT_BRANCH (${AUDIT_ORIGIN:-<unresolved>}) — possible shared-remote clobber"
+              MERGE_RESULT="failed_durable_audit_origin"
+              return 1
+            fi
+            log "  Durable-landing verified: merge $RESOLVED_MERGE is ancestor of BOTH rig-canonical $DEFAULT_BRANCH ($AUDIT_LOCAL) and origin ($AUDIT_ORIGIN)"
+          fi
+
+          return 0
+        else
+          err "Landing verification FAILED (attempt $((MERGE_ATTEMPT+1))): $CUR_BRANCH not in $DEFAULT_BRANCH ($POST_MAIN)"
+          MERGE_RESULT="failed_landing_not_verified"
+          return 1
+        fi
+      else
+        # FF push rejected: main moved between our rebase and push (race)
+        warn "  FF push rejected (attempt $((MERGE_ATTEMPT+1))) — main moved during push; will retry"
+        MERGE_RESULT="failed_push_race"
+        return 1
+      fi
+    }
+
+    while [ "$MERGE_ATTEMPT" -lt "$MAX_MERGE_RETRIES" ]; do
+      MERGE_ATTEMPT=$((MERGE_ATTEMPT + 1))
+      log "Merge attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES ..."
+      if do_merge_ff; then
+        break
+      fi
+      # Only retry on push-race or stale-after-rebase; give up on conflict/worktree failure
+      if [ "$MERGE_RESULT" = "failed_merge_time_conflict" ] || \
+         [ "$MERGE_RESULT" = "failed_merge_time_rebase" ] || \
+         [ "$MERGE_RESULT" = "failed_sha_resolution" ]; then
+        log "  Non-retryable failure ($MERGE_RESULT). Stopping retry loop."
+        break
+      fi
+      if [ "$MERGE_ATTEMPT" -lt "$MAX_MERGE_RETRIES" ]; then
+        log "  Retrying in 2s ..."
+        sleep 2
+      fi
+    done
+
+    if [[ "$MERGE_RESULT" = failed* ]]; then
+      # Merge failed despite all-PASS verdict — degrade to FAIL
+      OVERALL_VERDICT="FAIL"
+      FAIL_REASONS="Merge failed after all-PASS verdict. Merge result: $MERGE_RESULT. Check git state of rig $RIG."
+      warn "All-PASS verdict but merge failed ($MERGE_RESULT). Setting gate to failed."
+    fi
+
+    # ── ga-hawi: soft-reload immediately after merge ──────────────────────────
+    # Every gate merge bumps the template config hash (CopyFiles mtime changes).
+    # Without this, the session reconciler's next tick sees config drift and
+    # issues drain decisions against crew, even pinned ones (race window = 0..Ns
+    # until town-root-reconciler's poll).  --soft accepts the new hash in place;
+    # --async returns immediately so we don't block the gate.  Non-fatal if missing.
+    if [[ ! "$MERGE_RESULT" = failed* ]] && [ "$MERGE_RESULT" != "dry_run" ]; then
+      gc reload --soft --async 2>/dev/null \
+        && log "ga-hawi: soft-reload dispatched post-merge (config-drift guard for pinned crew)." \
+        || warn "ga-hawi: gc reload --soft --async failed (non-fatal; binary guard still active)."
+    fi
+
+    # ── Bug 1b: Post-merge diff-integrity verification (belt-and-suspenders) ──
+    # After a successful merge, verify the branch's changes are actually present
+    # in the merged main. This catches silent conflict resolutions where git
+    # resolved to main's side (dropping the fix entirely — as seen in wa-e99e).
+    #
+    # Strategy: fetch updated remote refs, then verify each file changed by the
+    # branch still has a non-empty diff vs what was in main BEFORE the merge.
+    # If any changed file regressed back to its pre-branch state, the merge
+    # silently dropped changes — revert and bounce to author.
+    if [[ ! "$MERGE_RESULT" = failed* ]] && [ "$MERGE_RESULT" != "dry_run" ]; then
+      log "Post-merge diff-integrity check (Bug 1b belt-and-suspenders) ..."
+      git_rig fetch origin 2>/dev/null || warn "Post-merge fetch failed; integrity check may use stale refs"
+
+      MERGED_HEAD=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
+      INTEGRITY_FAIL=0
+      INTEGRITY_MSG=""
+
+      if [ -n "$MERGED_HEAD" ] && [ -n "$BRANCH_SHA" ]; then
+        # For each file changed by the branch, compute:
+        #   diff_in_branch   = lines added/removed by branch vs its base (pre-branch main)
+        #   diff_in_merged   = what actually changed in merged main vs the original pre-merge main SHA
+        # If a file was changed by the branch but shows ZERO net change in the
+        # merged result vs pre-merge main, the fix was dropped.
+        PRE_MERGE_MAIN="${MAIN_HEAD_SHA}"
+        BRANCH_CHANGED_FILES=$(git_rig diff --name-only "${PRE_MERGE_MAIN}...origin/$BRANCH" 2>/dev/null || echo "")
+
+        if [ -n "$BRANCH_CHANGED_FILES" ] && [ -n "$PRE_MERGE_MAIN" ]; then
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            # Lines the branch added in this file (vs pre-merge main)
+            # NOTE: `grep -c` ALREADY prints "0" on zero matches AND exits 1, so the old
+            # `|| echo "0"` appended a SECOND "0" → the var became "0\n0" (multiline) →
+            # the `[ "$X" -gt 0 ]` test below aborted the whole sweep under set -e
+            # ([: 0\n0: integer expression expected). `|| true` keeps grep's single "0"
+            # and neutralizes the exit code. Belt: strip to a bare integer.
+            BRANCH_ADDITIONS=$(git_rig diff "$PRE_MERGE_MAIN" "origin/$BRANCH" -- "$f" 2>/dev/null | grep -c "^+" || true)
+            BRANCH_ADDITIONS=$(printf '%s' "$BRANCH_ADDITIONS" | tr -dc '0-9'); BRANCH_ADDITIONS=${BRANCH_ADDITIONS:-0}
+            # Lines that actually made it into merged main (vs pre-merge main)
+            MERGED_ADDITIONS=$(git_rig diff "$PRE_MERGE_MAIN" "$MERGED_HEAD" -- "$f" 2>/dev/null | grep -c "^+" || true)
+            MERGED_ADDITIONS=$(printf '%s' "$MERGED_ADDITIONS" | tr -dc '0-9'); MERGED_ADDITIONS=${MERGED_ADDITIONS:-0}
+
+            # If branch added lines to a file but the merged result has ZERO
+            # additions relative to pre-merge main, the file was completely dropped.
+            if [ "$BRANCH_ADDITIONS" -gt 0 ] && [ "$MERGED_ADDITIONS" = "0" ]; then
+              INTEGRITY_FAIL=1
+              INTEGRITY_MSG="${INTEGRITY_MSG}File $f: branch had $BRANCH_ADDITIONS additions but merged main has 0 (DROPPED).\n"
+              log "  INTEGRITY FAIL: $f — branch additions not in merged main"
+            fi
+          done <<< "$BRANCH_CHANGED_FILES"
+        fi
+      fi
+
+      if [ "$INTEGRITY_FAIL" = "1" ]; then
+        warn "Post-merge integrity FAILED — merge silently dropped branch changes. Reverting."
+        # Revert the merge by resetting main back to pre-merge SHA
+        REVERT_OK=0
+        if [ -n "$MAIN_HEAD_SHA" ] && [ -n "$MERGED_HEAD" ] && [ "$MAIN_HEAD_SHA" != "$MERGED_HEAD" ]; then
+          if git_rig push origin "${MAIN_HEAD_SHA}:refs/heads/$DEFAULT_BRANCH" --force-with-lease 2>/dev/null; then
+            REVERT_OK=1
+            log "  Main reverted to pre-merge SHA $MAIN_HEAD_SHA (merge SHA $MERGED_HEAD removed)"
+          else
+            err "  Revert push failed. Main may be in corrupted state. Manual intervention required."
+          fi
+        fi
+
+        OVERALL_VERDICT="FAIL"
+        REVERT_STATUS=$([ "$REVERT_OK" = "1" ] && echo "REVERTED (main restored to $MAIN_HEAD_SHA)" || echo "REVERT FAILED — manual fix required")
+        FAIL_REASONS="Post-merge integrity check failed: merge silently dropped branch changes.
+Files with dropped changes:
+$(echo -e "$INTEGRITY_MSG")
+Revert status: $REVERT_STATUS
+Author must inspect conflict resolution and rebase + resubmit."
+
+        # Comment on the source bead explaining what happened
+        if [ -n "$BEAD_ID" ]; then
+          bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:integrity-fail" -q 2>/dev/null || true
+          bd -C "$BEAD_CITY" comment "$BEAD_ID" "GATE INTEGRITY FAIL: the merge of branch $BRANCH silently dropped your changes (conflict resolved to main's side).
+$(echo -e "$INTEGRITY_MSG")
+Revert: $REVERT_STATUS
+Action required: rebase $BRANCH onto current main, resolve conflicts explicitly, and re-submit via /gate-done." 2>/dev/null || true
+        fi
+
+        # wa-uthi: TERMINAL FAIL (merge reverted, definitive) — this push is KEPT.
+        notify -t "Quality Gate INTEGRITY FAIL" -p 4 "Branch $BRANCH merge dropped changes — reverted. Author: $AUTHOR" 2>/dev/null || true
+        log "Post-merge integrity FAILED: $INTEGRITY_MSG — merge reverted ($REVERT_STATUS)"
+      else
+        log "Post-merge integrity check PASSED — branch changes present in merged main."
+      fi
+    fi
+  fi
+
+  if [ "$OVERALL_VERDICT" = "PASS" ]; then
+    # ── ga-lzj2e: durable merge-survival ledger (async shared-remote defense) ──
+    # ga-eptel's inline durable-landing AUDIT (do_merge_ff) only catches an
+    # IN-FLIGHT clobber: by the time the gate exits, its audit window is closed.
+    # The gastown rig SHARES remote athosmartins/gastown.git with the town main,
+    # so a town-main push minutes/hours LATER can still orphan a just-merged
+    # gastown SHA on the shared remote — fully async, after the gate is gone.
+    # Record every CONTAINER-rig merge in a durable append-only ledger; the
+    # gate-merge-survival-sweep daemon periodically re-fetches and re-verifies
+    # each recent SHA is still an ancestor of origin/<default_branch>, then
+    # self-heals (FF-only re-push when safe) or escalates (divergent clobber).
+    # Container rigs only — a self-repo rig (wa, gascity) has no shared-remote
+    # clobber vector. FULLY GUARDED: a ledger failure must NEVER affect the gate
+    # outcome (every step `|| true` / non-fatal; runs only on a real merge SHA).
+    if [ "$DRY_RUN" != "1" ] && [ "${IS_CONTAINER_RIG:-0}" = "1" ] \
+       && printf '%s' "$MERGE_SHA" | grep -Eq '^[0-9a-f]{7,40}$'; then
+      SURVIVAL_LEDGER="$GC_CITY/.gc/merge-survival-ledger.jsonl"
+      mkdir -p "$GC_CITY/.gc" 2>/dev/null || true
+      LEDGER_LINE=$(jq -nc \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg rig "$RIG" --arg rig_path "$RIG_PATH" \
+        --arg default_branch "$DEFAULT_BRANCH" --arg branch "$BRANCH" \
+        --arg bead "${BEAD_ID:-}" --arg bead_city "${BEAD_CITY:-$GC_CITY}" \
+        --arg marker "${MARKER_ID:-}" --arg gate_run "${GATE_RUN_ID:-}" \
+        --arg merge_sha "$MERGE_SHA" \
+        '{ts:$ts,rig:$rig,rig_path:$rig_path,default_branch:$default_branch,branch:$branch,bead:$bead,bead_city:$bead_city,marker:$marker,gate_run:$gate_run,merge_sha:$merge_sha}' \
+        2>/dev/null || true)
+      if [ -n "$LEDGER_LINE" ]; then
+        printf '%s\n' "$LEDGER_LINE" >> "$SURVIVAL_LEDGER" 2>/dev/null \
+          && log "  Survival-ledger: recorded $RIG merge_sha=$MERGE_SHA (ga-lzj2e async-clobber defense)" \
+          || warn "  Survival-ledger: append failed (non-fatal)"
+      fi
+    fi
+
+    # Update markers and beads for success
+    set_gate_status "$MARKER_ID" "passed"
+    # ga-jhyu: CLOSE the marker at terminal (passed) so it is reaped, not left
+    # OPEN forever. Safe — no open-marker consumer scans gate-status:passed
+    # (gate-health-monitor.py only scans gate-status:error). Idempotent.
+    bd -C "$GC_CITY" close "$MARKER_ID" -r "Gate marker terminal: PASSED (branch $BRANCH merged sha=$MERGE_SHA). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
+
+    if [ "$GATE_RUN_ID" != "unknown" ]; then
+      set_gate_status "$GATE_RUN_ID" "passed"
+      bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate PASSED. Branch $BRANCH merged to $DEFAULT_BRANCH. SHA=$MERGE_SHA. Tier=$TIER. Reviewers=$REQUIRED_REVIEWERS. Elapsed=${ELAPSED_S}s. mode=${MERGE_RESULT}." 2>/dev/null || true
+      # ga-jhyu: CLOSE the gate-run at terminal so wisp-compact reaps it.
+      bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run terminal: PASSED (branch $BRANCH sha=$MERGE_SHA). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
+    fi
+
+    # ── ga-esbg: DRIVE THE SOURCE BEAD TO ITS TERMINAL/HANDOFF STATE ──────────
+    # A gate PASS+merge MUST NOT leave the source bead in_progress with the live
+    # builder still assigned. The legacy PASS path only added gate:passed + a
+    # comment, so the bead stayed in_progress with a live assignee: the pool
+    # crash-recovery selector (bd list --status in_progress --assignee <builder>)
+    # kept RE-SPAWNING the worker, and the Pilot's Tier-1 selectors kept
+    # re-picking open bugs/tech-debt — a wasteful re-spawn loop (wa-krzm).
+    # Mirror the already-merged short-circuit: drive the bead all the way to its
+    # terminal state — CLOSE bugs/tasks; HAND OFF stories to delivery.
+    if [ -n "$BEAD_ID" ] && [ "$DRY_RUN" != "1" ]; then
+      # gate:passed is BOTH the success label AND story-delivery's pickup signal
+      # (story-delivery selects story:approved + gate:passed, excluding story:done).
+      bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED. Branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) via autonomous dispatcher (gate_run=$GATE_RUN_ID)." 2>/dev/null || true
+
+      # Read the source bead state authoritatively (labels + live assignee).
+      SRC_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
+        | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
+      SRC_LABELS=$(printf '%s' "$SRC_JSON" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
+      BUILDER_ASSIGNEE=$(printf '%s' "$SRC_JSON" | jq -r '.assignee // ""' 2>/dev/null || echo "")
+      IS_STORY=0
+      if printf '%s' "$SRC_LABELS" | grep -q "story:approved"; then IS_STORY=1; fi
+
+      # (1) Clear the live builder assignee on EVERY source bead. This is what
+      #     removes it from the pool in_progress crash-recovery selector
+      #     (--assignee <builder>) and from the Pilot's assigned-bead exclusion,
+      #     breaking the re-spawn loop even if the close/handoff below fails.
+      if [ -n "$BUILDER_ASSIGNEE" ]; then
+        bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null \
+          || warn "Could not clear builder assignee on source bead $BEAD_ID"
+      fi
+
+      # (2) Terminal vs handoff, decided by the canonical story marker
+      #     (label story:approved — the type field is null for stories in bd;
+      #     see story-delivery.sh / pilot-dispatcher.sh).
+      if [ "$IS_STORY" = "1" ]; then
+        # STORY → hand off to story-delivery (deploy + prod-test → story:done).
+        # Leave it OPEN: delivery needs an open story:approved + gate:passed bead.
+        # Pool re-spawn is already closed (assignee cleared above).
+        # ga-3h8l: strip story:in-flight NOW (at merge). The lane slot MUST free
+        # at merge — delivery may lag/fail, permanently eating a lane slot if we
+        # wait. The Pilot's Tier-2 selector excludes gate:passed (see
+        # pilot-dispatcher.sh), so stripping in-flight does NOT re-expose the
+        # bead to re-dispatch.
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
+        log "Source story $BEAD_ID handed off to delivery (gate:passed set; story:in-flight + gate:reviewing cleared; builder assignee cleared)."
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate PASS handoff (ga-3h8l fix): builder assignee cleared; story:in-flight stripped (lane slot freed at merge); gate:reviewing cleared (wa-qq33j); story:approved + gate:passed in place. story-delivery will deploy + prod-test, then mark story:done." 2>/dev/null || true
+      else
+        # BUG/TASK → close it. bd list defaults to OPEN-only, so closing removes
+        # the bead from EVERY open-work selector (Pilot Tier-1 bug & tech-debt),
+        # and — combined with the assignee clear — from the pool crash-recovery
+        # query. Closing is the durable fix for non-story source beads.
+        log "Closing source bug/task $BEAD_ID (gate PASS + merged sha=$MERGE_SHA)."
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
+        bd -C "$BEAD_CITY" close "$BEAD_ID" \
+          -r "Quality gate PASSED — branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA, gate_run=$GATE_RUN_ID). Closed by autonomous dispatcher (ga-esbg)." \
+          2>/dev/null || warn "Could not close source bead $BEAD_ID"
+      fi
+
+      # (3) POST-MERGE VERIFICATION (ga-esbg): assert the source bead no longer
+      #     appears in any re-spawn / re-pick selector the dispatcher knows about.
+      #     If it does, a live loop vector remains — comment + escalate (never
+      #     silently leave it).
+      RESPAWN_HITS=""
+      _still_listed() {  # 0 (true) iff $BEAD_ID is present in `bd list --json <args>`
+        bd -C "$BEAD_CITY" list --json "$@" 2>/dev/null \
+          | jq -e --arg id "$BEAD_ID" 'any(.[]?; .id == $id)' >/dev/null 2>&1
+      }
+      # a) Pool in_progress crash-recovery (applies to ALL beads — the core loop).
+      if [ -n "$BUILDER_ASSIGNEE" ]; then
+        if _still_listed --status in_progress --assignee "$BUILDER_ASSIGNEE"; then
+          RESPAWN_HITS="$RESPAWN_HITS pool:in_progress+assignee=$BUILDER_ASSIGNEE"
+        fi
+      fi
+      # b/c) Pilot Tier-1 open-bug / open-tech-debt re-pick. Stories are EXEMPT
+      #      from Tier-1 checks (open for delivery; not type:bug / tech-debt).
+      if [ "$IS_STORY" != "1" ]; then
+        if _still_listed -t bug;        then RESPAWN_HITS="$RESPAWN_HITS pilot:open-bug"; fi
+        if _still_listed -l tech-debt;  then RESPAWN_HITS="$RESPAWN_HITS pilot:open-tech-debt"; fi
+      fi
+      # d) ga-3h8l: story lane-occupancy check. After PASS, story:in-flight must
+      #    have been stripped (lane slot freed at merge). If still present, the
+      #    slot is permanently leaked — escalate immediately.
+      if [ "$IS_STORY" = "1" ]; then
+        if _still_listed -l "story:in-flight"; then
+          RESPAWN_HITS="$RESPAWN_HITS story:in-flight-leaked"
+        fi
+      fi
+
+      if [ -n "$RESPAWN_HITS" ]; then
+        warn "POST-MERGE re-spawn vector STILL PRESENT for $BEAD_ID:$RESPAWN_HITS"
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "WARNING (ga-esbg post-merge verify): source bead still appears in open-work selector(s) after gate PASS+merge:$RESPAWN_HITS. This is a re-spawn/re-pick vector — the terminal/handoff transition did not fully take." 2>/dev/null || true
+        gc --city "$GC_CITY" mail send mayor \
+          -s "Gate post-merge: $BEAD_ID still re-pickable after PASS+merge" \
+          -m "$(printf 'Source bead %s PASSED the quality gate and merged (branch %s, sha %s, gate_run %s) but still appears in open-work selector(s):%s\n\nThis leaves a re-spawn / re-pick vector (ga-esbg). The dispatcher could not drive it to terminal/handoff state — investigate (close failed? assignee clear failed? unexpected labels?).' \
+            "$BEAD_ID" "$BRANCH" "$MERGE_SHA" "$GATE_RUN_ID" "$RESPAWN_HITS")" \
+          2>/dev/null || warn "Could not mail Mayor post-merge re-spawn escalation for $BEAD_ID"
+        notify -t "Gate post-merge vector" -p 3 "$BEAD_ID still re-pickable after PASS+merge:$RESPAWN_HITS" 2>/dev/null || true
+      else
+        log "Post-merge verify OK (ga-esbg): $BEAD_ID absent from all re-spawn/re-pick selectors."
+      fi
+    fi
+
+    # ── ga-dcclose: REAP THE ORIGINATING COORDINATION WRAPPER AT THE MERGE ──────
+    # BOUNDARY. The Pilot files a type:convoy sling wrapper per dispatch and the
+    # engine deacon files dc-* coordination beads ("Merge failed", "Rebase
+    # required", "T8.x merge-cycle"). Each is wired as a DEPENDENT that TRACKS the
+    # source bead (dependency_type:tracks; the wrapper depends-on the source). When
+    # the source PASS-merges, the wrapper's tracked work is DONE but nothing closes
+    # it → it accrues OPEN forever. merged-bead-janitor's convoy-reconciler is the
+    # eventual backstop (closes when ALL deps closed); closing HERE, at the merge
+    # boundary, is immediate.
+    #
+    # SAFETY (mirrors the janitor's discipline — NO commit-matching, dependency
+    # linkage ONLY): we ask "who TRACKS / depends-on the just-merged source?" via
+    # `bd dep list <source> --direction=up` and close only OPEN dependents that are
+    # unambiguous coordination wrappers (issue_type:convoy OR id prefix dc-). Any
+    # other dependent (real follow-on work, stories, bugs) is LEFT UNTOUCHED. If we
+    # cannot confidently enumerate wrappers (query fails / unreadable), we do
+    # NOTHING and let the janitor backstop handle it. EVERY step is `|| true`-
+    # guarded and idempotent: a close failure here MUST NEVER abort the merge — the
+    # merge is the critical operation; this cleanup is strictly best-effort. Runs
+    # ONLY on the PASS/merge-success path (inside `if OVERALL_VERDICT = PASS`,
+    # after a real MERGE_SHA), never on FAIL.
+    if [ -n "$BEAD_ID" ] && [ "$DRY_RUN" != "1" ]; then
+      WRAPPER_DEPS_JSON="$(bd -C "$BEAD_CITY" dep list "$BEAD_ID" --direction=up --json 2>/dev/null || echo "")"
+      # Select OPEN (non-closed) dependents that are coordination wrappers:
+      # issue_type:convoy OR id prefixed dc-. Closed ones are already reaped.
+      WRAPPER_IDS="$(printf '%s' "$WRAPPER_DEPS_JSON" \
+        | jq -r '(if type=="array" then . else [] end)
+                 | [ .[]?
+                     | select((.status // "") != "closed")
+                     | select(((.issue_type // .type // "") == "convoy")
+                              or (((.id // "") | startswith("dc-"))))
+                     | .id ] | unique | .[]' 2>/dev/null || echo "")"
+      if [ -n "$WRAPPER_IDS" ]; then
+        for _WID in $WRAPPER_IDS; do
+          [ -z "$_WID" ] && continue
+          [ "$_WID" = "$BEAD_ID" ] && continue   # never self-close the source
+          if bd -C "$BEAD_CITY" close "$_WID" \
+               -r "reaped: work merged (gate PASS) — coordination wrapper closed (source $BEAD_ID, branch $BRANCH, sha=$MERGE_SHA, gate_run=$GATE_RUN_ID; ga-dcclose)" \
+               2>/dev/null; then
+            log "ga-dcclose: reaped coordination wrapper $_WID (tracks merged source $BEAD_ID)."
+          else
+            # Non-fatal: an already-closed/obsolete sibling dep can make bd refuse a
+            # clean close. Leave it for the janitor convoy-reconciler backstop.
+            warn "ga-dcclose: could not close wrapper $_WID for $BEAD_ID (non-fatal — janitor backstop will retry)."
+          fi
+        done
+      else
+        log "ga-dcclose: no open coordination wrapper depends on $BEAD_ID — nothing to reap."
+      fi
+    fi
+
+    # wa-uthi: TERMINAL SUCCESS (merged to prod) — this push is KEPT.
+    # wa-wzvg: differentiate the merge push for Pilot-origin stories. The Pilot
+    # sets a durable "pilot:dispatched" label when it autonomously pulls a story
+    # (see pilot-dispatcher.sh). If present, use a distinct prefix/emoji so Athos
+    # can tell an autonomous Pilot merge apart from a human/Mayor-dispatched one.
+    PILOT_ORIGIN=0
+    if [ -n "$BEAD_ID" ]; then
+      BEAD_LABELS_NOW=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
+        | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
+      if echo "$BEAD_LABELS_NOW" | grep -q "pilot:dispatched"; then
+        PILOT_ORIGIN=1
+      fi
+    fi
+    if [ "$PILOT_ORIGIN" = "1" ]; then
+      notify -t "🤖 Pilot Gate PASSED" -p 2 "🤖 [Pilot] Branch $BRANCH merged to $DEFAULT_BRANCH — $TIER, ${ELAPSED_S}s (autonomous pickup)" 2>/dev/null || true
+      log "Gate PASSED (origin=Pilot): branch=$BRANCH tier=$TIER merge_sha=$MERGE_SHA elapsed=${ELAPSED_S}s"
+    else
+      notify -t "Quality Gate PASSED" -p 2 "Branch $BRANCH merged to $DEFAULT_BRANCH — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
+      log "Gate PASSED: branch=$BRANCH tier=$TIER merge_sha=$MERGE_SHA elapsed=${ELAPSED_S}s"
+    fi
+    supersede_sibling_runs "$MARKER_ID" "$BRANCH" "$BEAD_ID"
+  fi
+
+else
+  # ── FAIL path ─────────────────────────────────────────────────────────────
+  log "Gate FAILED: $FAIL_REASONS"
+
+  set_gate_status "$MARKER_ID" "failed"
+  # ga-jhyu: CLOSE the marker at terminal (failed) so it is reaped. A FAIL is
+  # terminal for THIS gate attempt — re-running /gate-done mints a fresh marker.
+  # Safe: no open-marker consumer scans gate-status:failed. Idempotent.
+  bd -C "$GC_CITY" close "$MARKER_ID" -r "Gate marker terminal: FAILED (branch $BRANCH). Re-gate mints a new marker. Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
+
+  if [ "$GATE_RUN_ID" != "unknown" ]; then
+    set_gate_status "$GATE_RUN_ID" "failed"
+    bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate FAILED.
+Branch: $BRANCH
+Tier: $TIER  Reviewers required: $REQUIRED_REVIEWERS
+Elapsed: ${ELAPSED_S}s
+
+Blocking reasons:
+$(echo -e "$FAIL_REASONS")" 2>/dev/null || true
+    # ga-jhyu: CLOSE the gate-run at terminal so wisp-compact reaps it.
+    bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run terminal: FAILED (branch $BRANCH). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
+  fi
+
+  # Notify the author (not the Mayor) via nudge
+  if [ -n "$AUTHOR" ]; then
+    gc --city "$GC_CITY" session nudge "$AUTHOR" \
+      "QUALITY GATE FAILED for branch $BRANCH. Blocking reasons: $(echo -e "$FAIL_REASONS" | head -3). Gate run: $GATE_RUN_ID. Fix the issues and re-run /gate-done when ready." \
+      --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR (session may not exist)"
+  fi
+
+  # ── ga-jb4l: SELF-HEALING FAIL LOOP ────────────────────────────────────────
+  # A gate FAIL must not strand the source story forever. The legacy FAIL path
+  # only touched the EPHEMERAL marker/gate-run beads and an ephemeral author
+  # session nudge — no durable feedback reached the SOURCE bead and no actor
+  # ever re-picked it (the Pilot's selection hid it: features by story:in-flight,
+  # bugs by a stale builder assignee). Here we close that loop:
+  #   (a) attach the FAILing reviewer reasons to the SOURCE bead (durable),
+  #   (b) transition it to a Pilot-re-dispatchable gate:needs-fix state, and
+  #   (c) cap auto-retry at N=3, escalating to a human (Mayor) exactly once.
+  # FAIL_REASONS is already populated upstream (and, post-ga-kf0v, carries the
+  # real reviewer .text reasons), so the feedback we attach is substantive.
+  if [ -n "$BEAD_ID" ] && [ "$DRY_RUN" != "1" ]; then
+    GATE_FIX_CAP=3
+
+    # Read the source bead's current labels (story beads live in the HQ/city DB).
+    SRC_LABELS=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' \
+      2>/dev/null || echo "")
+
+    # Current fix-attempt count from label gate:fix-attempt:N (default 0). Take
+    # the MAX in case multiple counter labels ever coexist.
+    PREV_ATTEMPT=$(printf '%s' "$SRC_LABELS" | tr ' ' '\n' \
+      | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | tail -1)
+    [ -z "$PREV_ATTEMPT" ] && PREV_ATTEMPT=0
+
+    # (a) ATTACH FEEDBACK TO THE SOURCE BEAD — durable, machine-readable marker
+    #     (prefix "GATE-FEEDBACK") so the Pilot can surface it to the re-dispatched
+    #     builder verbatim.
+    bd -C "$BEAD_CITY" comment "$BEAD_ID" "$(printf 'GATE-FEEDBACK (gate_run=%s branch=%s): quality gate FAILED. Fix THESE specific blocking issues, then run /gate-done to re-gate.\n\n%s' \
+      "$GATE_RUN_ID" "$BRANCH" "$(echo -e "$FAIL_REASONS")")" \
+      2>/dev/null || warn "Could not attach gate feedback to source bead $BEAD_ID"
+    bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:failed" -q 2>/dev/null || true
+
+    if [ "$PREV_ATTEMPT" -ge "$GATE_FIX_CAP" ]; then
+      # (c) RETRY CAP REACHED — stop auto-retry, escalate to the Mayor ONCE.
+      log "Gate fix-attempt cap reached for $BEAD_ID (prev=$PREV_ATTEMPT >= $GATE_FIX_CAP). Escalating; no further auto-retry."
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:needs-fix"   -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human"           -q 2>/dev/null || true
+      # imp13: sub-label classifies this as a TECHNICAL circuit-breaker park (not a product decision).
+      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human:technical" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate auto-fix cap ($GATE_FIX_CAP attempts) exhausted — labeled gate:needs-human. The machine could not resolve this after $GATE_FIX_CAP fix cycles; the Pilot will NOT re-dispatch it. Human/Mayor intervention required." 2>/dev/null || true
+      # imp13: emit human-touch ledger entry (technical kind) for 99% metric.
+      { source "$GC_CITY/scripts/gc-ledger.sh" 2>/dev/null && \
+        gc_ledger_append "human-touch" "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"source_daemon\":\"quality-gate-dispatcher\",\"stage\":\"executa\",\"kind\":\"technical\",\"bead_id\":\"${BEAD_ID}\",\"reason\":\"Gate fix-cap exhausted (${GATE_FIX_CAP} attempts) — circuit-breaker park\"}"; } 2>/dev/null || true
+      # Escalate EXACTLY once: only mail if gate:needs-human was not already set.
+      if ! printf '%s' "$SRC_LABELS" | grep -q "gate:needs-human"; then
+        gc --city "$GC_CITY" mail send mayor \
+          -s "Gate needs-human: $BEAD_ID exhausted $GATE_FIX_CAP fix attempts" \
+          -m "$(printf 'Source bead %s failed the quality gate %s times. Auto-retry is now DISABLED (label gate:needs-human); the Pilot will not re-dispatch it.\n\nBranch: %s\nRig: %s\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene.' \
+            "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$BRANCH" "$RIG" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
+          2>/dev/null || warn "Could not mail Mayor escalation for $BEAD_ID"
+        notify -t "Gate needs-human" -p 4 "$BEAD_ID exhausted $GATE_FIX_CAP gate fix attempts — Mayor escalated" 2>/dev/null || true
+        # ga-u4yi: durable mail to the AUTHOR too — a bd comment alone left
+        # thies-wa's branch rotting 20h in silence because nothing durable told
+        # her she was stuck (only Mayor was mailed; mail, not nudge, survives a
+        # dead/restarted author session).
+        if [ -n "$AUTHOR" ]; then
+          gc --city "$GC_CITY" mail send "$AUTHOR" \
+            -s "Gate needs-human: your branch $BRANCH exhausted $GATE_FIX_CAP fix attempts" \
+            -m "$(printf 'Your branch %s (bead %s) failed the quality gate %s times. Auto-retry is now DISABLED (label gate:needs-human): the Pilot will NOT re-dispatch this bead, and any further /gate-done resubmission will be silently parked until a human resolves this.\n\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene before this can proceed.' \
+              "$BRANCH" "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
+            2>/dev/null || warn "Could not mail author $AUTHOR for gate-fix-cap escalation on $BEAD_ID"
+        fi
+      fi
+      # ga-5w0hr: a needs-human bead has NO active worker — the gate just gave up
+      # auto-retry. Mirror the needs-fix-branch cleanup so the bead is honestly
+      # represented as "awaiting human" rather than masquerading as in-flight.
+      # gate:needs-human (which the Pilot EXCLUDES in every candidate query —
+      # pilot-dispatcher.sh) remains the re-dispatch block; this only strips the
+      # contradictory story:in-flight / pilot:* claim + stale builder assignee
+      # left over from the failed dispatch, which otherwise stranded the bead
+      # looking forever in-flight with no worker (ga-jhyu: 21h SEM WORKER after
+      # 3× FAIL). Re-dispatch policy is unchanged — needs-human still requires
+      # Human/Mayor intervention to clear.
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"  -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"   -q 2>/dev/null || true  # wa-qq33j: clear in-review state (cap/needs-human)
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
+    else
+      # (b) TRANSITION TO A PILOT-RE-DISPATCHABLE needs-fix STATE.
+      NEW_ATTEMPT=$((PREV_ATTEMPT + 1))
+      log "Marking $BEAD_ID gate:needs-fix (attempt $NEW_ATTEMPT/$GATE_FIX_CAP) for autonomous Pilot re-dispatch."
+      # Bump the attempt counter (drop any stale counters first).
+      for OLD in $(printf '%s' "$SRC_LABELS" | tr ' ' '\n' | grep '^gate:fix-attempt:'); do
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "$OLD" -q 2>/dev/null || true
+      done
+      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:fix-attempt:${NEW_ATTEMPT}" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-fix"                  -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"   -q 2>/dev/null || true  # wa-qq33j: clear in-review state (FAIL/needs-fix)
+      # Clear stale Pilot claim labels left over from the failed dispatch.
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
+
+      # ga-jyox: a live named-crew author (long-lived session, e.g. thies-wa) must
+      # KEEP ownership on FAIL instead of being cleared — see gate_fail_assignee_action
+      # above for the full rationale (ga-1url/ga-u4yi double-dispatch collision).
+      # ga-ipf6: unified with the rebase-path AUTHOR_ALIVE via author_is_alive()
+      # — this call site's predicate was already canonical; it is now the
+      # single source of truth both paths share.
+      FAIL_AUTHOR_ALIVE=$(author_is_alive "$AUTHOR")
+
+      # ga-pyzo: recycled-session fallback (same helper as the rebase-path call
+      # site above — single source of truth so the two paths cannot re-diverge,
+      # the exact ga-ipf6 lesson). Applied BEFORE gate_fail_assignee_action so a
+      # live agent whose specific FAILing session recycled gets "keep" (nudged
+      # to fix), not "clear" (silently handed to a stranger builder).
+      _RESOLVED_AUTHOR=$(resolve_recycled_author "$AUTHOR" "$AUTHOR_AGENT" "$FAIL_AUTHOR_ALIVE")
+      if [ "$_RESOLVED_AUTHOR" != "$AUTHOR" ]; then
+        log "  ga-pyzo: author '$AUTHOR' session recycled but agent '$_RESOLVED_AUTHOR' has a live session — redirecting liveness/nudge/assign to the agent."
+        AUTHOR="$_RESOLVED_AUTHOR"
+        FAIL_AUTHOR_ALIVE=1
+      fi
+
+      GATE_FAIL_ASSIGNEE_ACTION=$(gate_fail_assignee_action "$AUTHOR" "$FAIL_AUTHOR_ALIVE")
+
+      if [ "$GATE_FAIL_ASSIGNEE_ACTION" = "keep" ]; then
+        log "Author $AUTHOR is a live named-crew session — keeping assignee + story:in-flight (ga-jyox); nudging feedback instead of letting the Pilot dispatch a stranger on top of in-flight work."
+        bd -C "$BEAD_CITY" assign "$BEAD_ID" "$AUTHOR" 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; gate:reviewing cleared (wa-qq33j). Author $AUTHOR is a LIVE crew session, so assignee + story:in-flight were KEPT (ga-jyox) — the Pilot will NOT dispatch a generic builder on top of your in-flight work. See GATE-FEEDBACK above; re-run /gate-done after fixing." 2>/dev/null || true
+        gc --city "$GC_CITY" session nudge "$AUTHOR" \
+          "Gate FAILED for $BEAD_ID (branch $BRANCH, attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — see GATE-FEEDBACK on the bead. Your assignee was kept (ga-jyox); fix and re-run /gate-done." \
+          --delivery wait-idle 2>/dev/null || warn "Could not nudge live-crew author $AUTHOR for gate FAIL feedback"
+      else
+        # Remove story:in-flight so the Pilot's feature-exclusion no longer hides it.
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"  -q 2>/dev/null || true
+        # The Pilot's _filter_candidates drops ASSIGNED beads (both Tier-1 bugs and
+        # Tier-2 features), so a stale builder assignee makes a failed bead invisible.
+        # Clear it so the next sweep can re-pick this bead.
+        bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) and builder assignee cleared. The Pilot will re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  # wa-uthi: TERMINAL FAIL (review rejected, definitive) — this push is KEPT.
+  notify -t "Quality Gate FAILED" -p 3 "Branch $BRANCH failed review — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
+  supersede_sibling_runs "$MARKER_ID" "$BRANCH" "$BEAD_ID"
+fi
+
+# ── Step 11: Log to quality-gate.jsonl ───────────────────────────────────────
+
+mkdir -p "$(dirname "$QG_LOG")"
+REASON=""
+if [ "$OVERALL_VERDICT" = "PASS" ]; then
+  REASON="quorum_${REQUIRED_REVIEWERS}_of_${REQUIRED_REVIEWERS}_independent_sessions"
+else
+  REASON=$(echo -e "$FAIL_REASONS" | head -1 | tr '\n' ' ' | cut -c1-200)
+fi
+
+jq -c -n \
+  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg branch "$BRANCH" \
+  --arg bead "$BEAD_ID" \
+  --arg rig "${RIG:-unknown}" \
+  --arg tier "$TIER" \
+  --arg result "$OVERALL_VERDICT" \
+  --arg reason "$REASON" \
+  --arg gate_run "$GATE_RUN_ID" \
+  --arg marker "$MARKER_ID" \
+  --argjson elapsed_s "$ELAPSED_S" \
+  --argjson reviewers "$REQUIRED_REVIEWERS" \
+  --arg dry_run "$DRY_RUN" \
+  '{ts: $ts, event: "dispatcher_complete", branch: $branch, bead: $bead,
+    rig: $rig, tier: $tier, result: $result, reason: $reason,
+    gate_run: $gate_run, marker: $marker, elapsed_s: $elapsed_s,
+    reviewers: $reviewers, dry_run: $dry_run}' \
+  >> "$QG_LOG" 2>/dev/null || true
+
+# ga-eqjo (code-review fix): this used to be the literal LAST line of the
+# script, so "sweep complete" correctly meant "the one marker this process
+# claimed and blocked on is fully done." It no longer is: this line lives
+# inside gate_finalize_run(), callable from Phase C's per-run loop (0, 1, or
+# N times per sweep — however many gate-runs were finalized this sweep) as
+# well as the same-sweep fast path. Naming it "gate run complete" instead of
+# "Dispatcher sweep complete" keeps a 1:1 invariant honest for any log
+# scraper: one line per FINALIZED RUN, not one per sweep (the "Dispatcher
+# sweep start" line just above Phase C, logged exactly once per process
+# invocation, is the only genuine per-sweep marker left).
+log "=== Gate run complete: gate_run=$GATE_RUN_ID branch=$BRANCH verdict=$OVERALL_VERDICT elapsed=${ELAPSED_S}s ==="
+}
+# ── ga-eqjo: rig-plumbing helpers, hoisted so Phase C (which runs before any
+# marker may be claimed this sweep) can resolve a PREVIOUSLY-claimed run's git
+# context without waiting for Step 4 to run in THIS invocation. No logic below
+# changed from its historical Step-4-adjacent form — pure relocation. Bash
+# resolves a function call against whatever has been DEFINED so far at that
+# point in execution (not by textual position), so moving these earlier
+# changes nothing about how they behave, only when they become callable.
+
+# SELFTEST-EXTRACT resolve-bead-city-fn: BEGIN
+resolve_bead_city() {
+  local bead="$1" store st
+  [ -z "$bead" ] && { echo "$GC_CITY"; return 0; }
+  for store in "${RIG_PATH:-}" "$GC_CITY"; do
+    [ -z "$store" ] && continue
+    st=$(bd -C "$store" show "$bead" --json 2>/dev/null \
+      | jq -r 'if type=="array" then (.[0] // {}) else . end | .status // empty' 2>/dev/null)
+    if [ -n "$st" ]; then echo "$store"; return 0; fi
+  done
+  # Neither store resolved (transient Dolt issue): prefix heuristic. The HQ city
+  # prefix is `ga` (gascity); every other prefix is a rig.
+  case "$bead" in
+    ga-*) echo "$GC_CITY" ;;
+    *)    echo "${RIG_PATH:-$GC_CITY}" ;;
+  esac
+}
+# SELFTEST-EXTRACT resolve-bead-city-fn: END
+
+git_rig() {
+  if [ "$IS_CONTAINER_RIG" = "1" ]; then
+    git --git-dir="$GIT_DIR_PATH" "$@"
+  else
+    git -C "$GIT_DIR_PATH" "$@"
+  fi
+}
+
+# ── ga-ljbx: hardened ref resolution (defense-in-depth) ───────────────────────
+# rig_resolve_commit <ref> — resolve <ref> to a real COMMIT object SHA.
+#
+# Plain `git rev-parse origin/main` returns whatever 40-hex string the ref file
+# holds, EVEN IF that object is missing from the object DB (e.g. a ref left
+# dangling by a racing/aborted fetch or a competing reconciler). That garbage SHA
+# then poisons every downstream merge-base/merge-tree computation: merge-base
+# returns empty ("no common ancestor"), the branch is misclassified as having
+# unrelated histories, and a perfectly clean stale branch is bounced to
+# needs-rebase with a non-existent main_sha (observed live on ga-tmug:
+# main_sha=7b03eb9a… / e7949128…, neither of which exists in the repo).
+#
+# `git rev-parse --verify -q <ref>^{commit}` forces the ref to dereference to a
+# real, present commit object. On a missing/garbage object it prints NOTHING and
+# returns nonzero — callers can then distinguish "ref points at garbage" (→ treat
+# as a transient/re-triable error, gate-status:error) from "clean stale branch"
+# (→ auto-rebase). Output is empty on failure so `[ -z "$X" ]` guards trip.
+rig_resolve_commit() {
+  git_rig rev-parse --verify -q "$1^{commit}" 2>/dev/null || echo ""
+}
+
+# rig_content_merged <main_ref> <branch_ref> — ga-01yq: SHA-ancestry is FALSE BY
+# CONSTRUCTION after a rebase-merge (the gate's own auto-rebase, or any manual
+# rebase, replays commits under NEW shas) — a fully-merged branch never becomes
+# an ancestor again, so a naive `merge-base --is-ancestor` strands it on
+# needs-rebase FOREVER, and the suggested manual-rebase remediation can then
+# re-submit PRE-REBASE file versions on top of newer work already in main (a
+# real regression, not just noise — see ga-01yq / batista-wa's wa-jaxt8 catch
+# and the peter/ga-fr5d near-miss).
+#
+# rc0 iff EVERY commit reachable from <branch_ref> but not <main_ref> already
+# has its patch present on the <main_ref> side (git matches rebased/squashed/
+# re-committed changes by patch-id) — i.e. the branch's content is fully
+# merged regardless of SHA lineage. Mirrors merged-bead-janitor.sh's
+# content_in_main() (proven on ga-tijv5/wa-fvxj1); duplicated here rather than
+# sourced because each gate daemon is a self-contained script with its own
+# small git-check helpers (see git_rig/rig_resolve_commit above) — there is no
+# existing cross-script import convention for these.
+#
+# FAIL-CLOSED: any non-"0"/empty/error count → rc1 (treated as NOT merged), so
+# callers keep bouncing to the existing (safe) needs-rebase path on any doubt.
+rig_content_merged() {
+  local main_ref="$1" branch_ref="$2"
+  local n
+  n=$(git_rig rev-list --count --cherry-pick --right-only "${main_ref}...${branch_ref}" 2>/dev/null || echo ERR)
+  [ "$n" = "0" ]
+}
+
+# ── ga-78n2z: union-aware conflict pre-check ──────────────────────────────────
+# GATE_UNION_AWARE_PRECHECK=1 (default ON) makes the merge-tree pre-check honor
+# the `merge=union` gitattributes driver. =0 restores the EXACT legacy behavior
+# (merge-tree --write-tree exit code is taken at face value).
+#
+# WHY: `git merge-tree --write-tree <main> <branch>` does NOT apply custom/builtin
+# merge=* drivers from .gitattributes — even on git 2.54 (verified empirically on
+# wa-jjea/wa-40xb: merge-tree reports CONFLICT on docs/data_dictionary.md, which
+# carries `merge=union`, yet a REAL `git merge` of the same pair resolves it rc=0
+# with zero conflict markers because union concatenates both sides). The result
+# was a recurring pile of SPURIOUS needs-rebase escalations for branches whose
+# only conflict is in a union-driver file (wa-40xb, wa-jjea, ...).
+GATE_UNION_AWARE_PRECHECK="${GATE_UNION_AWARE_PRECHECK:-1}"
+
+# rig_conflict_paths <main_ref> <branch_ref> — echo the NUL-free newline list of
+# paths merge-tree flags as conflicting (empty on clean / error). Used only to
+# decide union-coverage; the authoritative verdict still comes from exit codes.
+rig_conflict_paths() {
+  local main_ref="$1" branch_ref="$2"
+  # `merge-tree --write-tree --name-only` stdout has THREE sections (git 2.54):
+  #   line 1            : the new tree OID
+  #   lines 2..K        : "Conflicted file info" — one conflicting path per line
+  #   (blank line)      : section separator
+  #   lines K+2..EOF    : "Informational messages" — "Auto-merging…", "CONFLICT…"
+  # We want ONLY the conflicted-path section: drop line 1, then stop at the FIRST
+  # blank line (sed `/^$/q` quits before printing it), which discards the trailing
+  # informational tail (otherwise "Auto-merging X"/"CONFLICT … X" would be mistaken
+  # for paths and break union-coverage detection). `|| true` is REQUIRED: merge-tree
+  # returns rc=1 on conflict and pipefail would trip set -e on the assignment.
+  git_rig merge-tree --write-tree --name-only "$main_ref" "$branch_ref" 2>/dev/null \
+    | tail -n +2 | sed '/^$/q' | sed '/^$/d' || true
+}
+
+# rig_path_is_union_resolvable <merge_ref> <path> — return 0 (true) iff <path> is
+# governed by a merge driver that resolves WITHOUT producing conflict markers
+# (currently only the builtin `union`). check-attr is evaluated against the merge
+# context ref (the branch being merged) so .gitattributes as the author sees it is
+# authoritative. Any unset/unspecified/other driver → return 1 (NOT union-safe).
+rig_path_is_union_resolvable() {
+  local merge_ref="$1" path="$2" drv=""
+  # `git check-attr` on a tree-ish: use --source (git ≥2.40) to read attributes
+  # from <merge_ref> rather than the working tree. Fall back to plain check-attr
+  # (working-tree .gitattributes) if --source is unsupported. Conservative on any
+  # failure: empty/err driver → not union → caller escalates as a real conflict.
+  drv=$(git_rig check-attr --source "$merge_ref" merge -- "$path" 2>/dev/null | sed 's/.*: merge: //' )
+  if [ -z "$drv" ] || [ "$drv" = "merge: unspecified" ]; then
+    drv=$(git_rig check-attr merge -- "$path" 2>/dev/null | sed 's/.*: merge: //')
+  fi
+  [ "$drv" = "union" ]
+}
+
+# rig_real_merge_is_clean <main_ref> <branch_ref> — perform a REAL throwaway
+# test-merge in a detached temp worktree to confirm the merge actually resolves
+# clean (union drivers applied). Return 0 (clean) iff `git merge --no-commit`
+# succeeds with NO unmerged index entries. Any error/uncertainty → return 1
+# (treat as NOT-clean → caller escalates; fail-safe, never green-lights a real
+# conflict). The worktree + a trap guarantee cleanup on every path.
+rig_real_merge_is_clean() {
+  local main_ref="$1" branch_ref="$2"
+  local wt rc=1
+  wt="$(mktemp -d "${TMPDIR:-/tmp}/gc-gate-unioncheck-XXXXXX" 2>/dev/null)" || return 1
+  # Resolve the temp worktree fully so cleanup in the trap is unambiguous.
+  # shellcheck disable=SC2064
+  trap "git_rig worktree remove --force '$wt' >/dev/null 2>&1 || true; rm -rf '$wt' >/dev/null 2>&1 || true" RETURN
+  # Create a detached worktree at main; do the merge there. --no-commit leaves the
+  # index/worktree merged so we can inspect ls-files -u, then we abort.
+  if git_rig worktree add --detach "$wt" "$main_ref" >/dev/null 2>&1; then
+    git -C "$wt" config user.email "gate-dispatcher@gascity.local" >/dev/null 2>&1 || true
+    git -C "$wt" config user.name  "Gate Dispatcher"               >/dev/null 2>&1 || true
+    if git -C "$wt" merge --no-commit --no-ff "$branch_ref" >/dev/null 2>&1; then
+      # Merge stopped-before-commit cleanly. Double-check no unmerged entries.
+      if [ -z "$(git -C "$wt" ls-files -u 2>/dev/null)" ]; then
+        rc=0
+      fi
+    fi
+    git -C "$wt" merge --abort >/dev/null 2>&1 || true
+  fi
+  return "$rc"
+}
+
+# ── ga-ljbx: git-2.54 conflict detection ──────────────────────────────────────
+# rig_merge_has_conflict <main_ref> <branch_ref> — echo "1" if merging
+# <branch_ref> into <main_ref> conflicts, "0" if clean, "err" if undeterminable.
+#
+# The legacy 3-arg form `git merge-tree <base> <ours> <theirs>` + grep '^<<<<<<<'
+# is BROKEN on git 2.54: the conflict markers in that output are diff-prefixed
+# (" +<<<<<<<"), so the anchored grep never matches and a real conflict reads as
+# clean (verified empirically on git 2.54.0). The modern
+# `git merge-tree --write-tree <main> <branch>` is authoritative: exit 0 = clean,
+# exit 1 = conflict, exit >1 = error (e.g. unrelated histories / bad ref).
+#
+# ga-78n2z: merge-tree --write-tree does NOT apply merge=union drivers, so a
+# branch whose ONLY conflict is in a union-driver file (e.g. docs/data_dictionary.md)
+# reads as a conflict here while a REAL merge resolves it cleanly. When the flag is
+# ON and EVERY conflicting path is union-resolvable, we run a real test-merge in a
+# throwaway worktree; if that confirms clean we report "0" (clean). If ANY path is
+# not union-resolvable, or the test-merge still conflicts, or anything is uncertain,
+# we fall through to the legacy "1" (escalate) — never auto-greenlight a real conflict.
+rig_merge_has_conflict() {
+  local main_ref="$1" branch_ref="$2"
+  git_rig merge-tree --write-tree "$main_ref" "$branch_ref" >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" = "0" ]; then
+    echo "0"
+    return 0
+  elif [ "$rc" != "1" ]; then
+    echo "err"
+    return 0
+  fi
+
+  # rc == 1: merge-tree reports a conflict.
+  if [ "$GATE_UNION_AWARE_PRECHECK" != "1" ]; then
+    echo "1"
+    return 0
+  fi
+
+  # Union-aware path: is EVERY conflicting file a union-driver file?
+  local paths p all_union=1 any=0
+  paths="$(rig_conflict_paths "$main_ref" "$branch_ref")"
+  if [ -z "$paths" ]; then
+    # Conservative: rc=1 but we could not enumerate the conflicting paths →
+    # cannot prove union-only → treat as a genuine conflict (legacy behavior).
+    echo "1"
+    return 0
+  fi
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    any=1
+    if ! rig_path_is_union_resolvable "$branch_ref" "$p"; then
+      all_union=0
+      break
+    fi
+  done <<EOF
+$paths
+EOF
+
+  if [ "$any" = "1" ] && [ "$all_union" = "1" ]; then
+    # All conflicting paths are union-driver files. Confirm with a REAL merge.
+    if rig_real_merge_is_clean "$main_ref" "$branch_ref"; then
+      log "  ga-78n2z: union-only merge-tree conflict in [$(printf '%s' "$paths" | tr '\n' ' ')] confirmed CLEAN by real test-merge — treating pre-check as clean." 2>/dev/null || true
+      echo "0"
+      return 0
+    fi
+    # Union-only by attribute but the real merge STILL conflicts → genuine.
+    log "  ga-78n2z: union-only merge-tree conflict but real test-merge ALSO conflicts — genuine conflict, escalating." 2>/dev/null || true
+  fi
+
+  # Default / fail-safe: genuine conflict (a non-union path, or real merge unclean).
+  echo "1"
+  return 0
+}
+
+# SELFTEST-EXTRACT gate-resolve-rig-context-fn: BEGIN
+# gate_resolve_rig_context — given $RIG and $BEAD_ID, resolve RIG_PATH (+
+# canonicalize RIG), BEAD_CITY, IS_CONTAINER_RIG, GIT_DIR_PATH, DEFAULT_BRANCH,
+# and refresh RIG_LIST_JSON. Self-contained (fetches its own rig list) so it is
+# callable identically from Step 4 (claim-time, same invocation) and Phase C (a
+# LATER invocation finalizing a run Step 4 claimed earlier — ga-eqjo). Returns 1
+# (never exits — the caller decides what an unresolvable rig means for it) on
+# failure, matching Step 4's historical fail-safe reasoning.
+gate_resolve_rig_context() {
+RIG_PATH=""
+# ga-eqjo (code-review fix): the rig registry is invariant for the lifetime
+# of one sweep (it only changes via a rare, administrative `gc rig add/
+# remove`, never mid-sweep), but this function is called once per Phase C
+# loop iteration — on N queued gate-runs finalized in one sweep, that was N
+# redundant `gc` subprocess spawns fetching byte-identical data, adding
+# avoidable process + Dolt load during the same sweep that is already
+# Dolt-query-heavy. Memoize per-process: fetch once, reuse for every
+# subsequent call (Phase C's whole loop, and Step 4's later claim-time call
+# in the same sweep, if any).
+# Only CACHE a fetch that actually returned rig data (a non-empty .rigs
+# array) — a transient `gc` hiccup must keep retrying on every call, exactly
+# like the original uncached code did, rather than poisoning every
+# subsequent Phase C iteration this sweep with an empty registry from one
+# blip.
+if [ -z "${_GATE_RIG_LIST_CACHE:-}" ]; then
+  _grlc_fetch=$(gc --city "$GC_CITY" rig list --json 2>/dev/null || echo '{}')
+  _grlc_count=$(printf '%s' "$_grlc_fetch" | jq '.rigs | length' 2>/dev/null || echo "0")
+  case "$_grlc_count" in ''|*[!0-9]*) _grlc_count=0 ;; esac
+  if [ "$_grlc_count" -gt 0 ]; then
+    _GATE_RIG_LIST_CACHE="$_grlc_fetch"
+  else
+    RIG_LIST_JSON="$_grlc_fetch"
+  fi
+fi
+RIG_LIST_JSON="${_GATE_RIG_LIST_CACHE:-$RIG_LIST_JSON}"
+if [ -n "$RIG" ]; then
+  RIG_PATH=$(echo "$RIG_LIST_JSON" \
+    | jq -r --arg r "$RIG" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
+fi
+
+# ga-67hae: COMPOUND rig fallback — /gate-done writes rig=mila-wa or rig=batista-ps
+# (crew-qualified). No rig has that compound name → bead-id prefix is authoritative
+# (wa-ucrq → wa → whatsapp_automation; ps-s27l → ps → property_scrapers).
+if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$BEAD_ID" ]; then
+  _bid_prefix="${BEAD_ID%%-*}"
+  RIG_PATH=$(echo "$RIG_LIST_JSON" \
+    | jq -r --arg r "$_bid_prefix" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
+  [ -n "$RIG_PATH" ] && log "  rig='$RIG' unresolved; derived from bead-id prefix '$_bid_prefix' -> $RIG_PATH"
+fi
+# Trailing-segment fallback: mila-wa → wa
+if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$RIG" ] && printf '%s' "$RIG" | grep -q '-'; then
+  _rig_tail="${RIG##*-}"
+  RIG_PATH=$(echo "$RIG_LIST_JSON" \
+    | jq -r --arg r "$_rig_tail" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
+  [ -n "$RIG_PATH" ] && log "  rig='$RIG' unresolved; derived from trailing segment '$_rig_tail' -> $RIG_PATH"
+fi
+
+if [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; then
+  err "Cannot resolve rig path for rig='$RIG' (bead=$BEAD_ID)."
+  return 1
+fi
+
+# ga-67hae: normalize $RIG to the canonical rig name (compound values break
+# downstream select(.name == $RIG) lookups like DEFAULT_BRANCH derivation).
+_RIG_CANON=$(echo "$RIG_LIST_JSON" | jq -r --arg p "$RIG_PATH" '.rigs[] | select(.path == $p) | .name' 2>/dev/null | head -1 || echo "")
+if [ -n "$_RIG_CANON" ] && [ "$_RIG_CANON" != "$RIG" ]; then
+  log "  Normalized rig '$RIG' -> canonical '$_RIG_CANON' for downstream lookups."
+  RIG="$_RIG_CANON"
+fi
+
+# wa-re77: source-bead (BEAD_ID) lives in the RIG's own Dolt DB, not HQ.
+# Use BEAD_CITY for all bd ops on $BEAD_ID; keep GC_CITY for marker/gate-run/verdict ops.
+#
+# ── ga-qw7y6: resolve the store that ACTUALLY contains the source bead ─────────
+# BEAD_CITY="${RIG_PATH:-$GC_CITY}" alone is WRONG when an HQ-resident `ga-` bead
+# is built on a RIG branch (e.g. an HQ painel story built on whatsapp_automation's
+# crew branch — see painel-lives-in-wa-rig). There the marker carries
+# rig=whatsapp_automation, so RIG_PATH resolves to the rig store, but the source
+# bead lives in the HQ city store. The PASS-merge close (`bd -C "$BEAD_CITY"
+# close`) and the ga-esbg post-merge verification then target the rig store,
+# can't find the HQ bead, and silently no-op — the source bead stays open, the
+# verification reports "absent" (false OK), and Pilot phantom-re-dispatches the
+# already-merged work (ga-8tv0s re-dispatched 3×: a direct slot/cycle leak).
+# Conversely, wa-re77 rig-native beads DO live in the rig store. The owning store
+# is therefore NOT derivable from RIG_PATH alone — probe which store resolves it.
+#
+# resolve_bead_city <bead-id> — echo the store dir whose Dolt DB owns <bead-id>.
+# Probes RIG_PATH first (preserve wa-re77 rig-native behavior), then GC_CITY (HQ).
+# A store "owns" the bead iff `bd -C <store> show <bead> --json` yields a record
+# with a non-empty .status; a not-found probe returns {"error":...} (no .status →
+# empty → skip). Falls back to a bead-id prefix heuristic (ga-* → HQ) only when
+# NEITHER store resolves (e.g. transient Dolt hiccup), so the close still targets
+# the most-likely-correct store rather than blindly trusting RIG_PATH.
+
+BEAD_CITY="$(resolve_bead_city "$BEAD_ID")"
+if [ "$BEAD_CITY" != "${RIG_PATH:-$GC_CITY}" ]; then
+  log "  ga-qw7y6: source bead $BEAD_ID resolves to store $BEAD_CITY (NOT rig store ${RIG_PATH:-$GC_CITY}) — cross-store close corrected."
+fi
+
+# Determine the canonical git repo location.
+# Container rigs (property_scrapers, lexbh) have a bare .repo.git.
+# Self-repo rigs (gastown, whatsapp_automation, marketing) have .git in root.
+if [ -d "$RIG_PATH/.repo.git" ]; then
+  GIT_DIR_PATH="$RIG_PATH/.repo.git"
+  IS_CONTAINER_RIG=1
+else
+  GIT_DIR_PATH="$RIG_PATH"
+  IS_CONTAINER_RIG=0
+fi
+
+# git_rig — wrapper that calls git with the correct rig-specific flags.
+# Usage: git_rig <args...>
+
+log "  rig_path=$RIG_PATH  git_dir=$GIT_DIR_PATH  container_rig=$IS_CONTAINER_RIG"
+
+# Determine default branch (main unless overridden)
+DEFAULT_BRANCH=$(echo "$RIG_LIST_JSON" \
+  | jq -r --arg r "$RIG" '.rigs[] | select(.name == $r or .prefix == $r) | .default_branch // "main"' 2>/dev/null | head -1 || echo "main")
+  return 0
+}
+# SELFTEST-EXTRACT gate-resolve-rig-context-fn: END
+# gate_collect_verdicts — snapshot VERDICT_BEAD_IDS ONCE (no polling/sleep) and
+# set VERDICTS_RECEIVED, ANY_FAIL, FAIL_REASONS. Extracted verbatim from the
+# historical Step 8 poll loop's per-iteration body (the closed-bead branch
+# only — see below) so a single check replaces what used to be a
+# while-true-sleep-30 loop. Callable from the same-sweep fast path AND from
+# Phase C (a later sweep re-checking a run claimed earlier — ga-eqjo).
+#
+# ga-eqjo DELIBERATE SCOPE REDUCTION: the historical loop ALSO re-convened a
+# reviewer whose session was confirmed dead across several consecutive polls
+# (ga-4u16h/ga-h9o17/ga-q8tmn/ga-mepb0 — session-list liveness + peek +
+# last_active staleness, debounced by SLOT_DEAD_STREAK so a single flaky
+# read could never kill a live reviewer). That debounce state lived in
+# process-local bash arrays that reset every poll WITHIN one long-lived
+# invocation — it has no meaning once a single sweep only checks a run ONCE
+# and exits (the whole point of ga-eqjo). Porting it would mean persisting
+# the streak counters as bead metadata and re-deriving them every sweep,
+# which is real complexity for what was always a LATENCY optimization, not a
+# correctness requirement — a dead reviewer's verdict beads just never close,
+# so the outer per-run timeout (checked by every caller of this function)
+# still catches it, same as always, just up to VERDICT_TIMEOUT_MINUTES later
+# instead of the faster in-poll reconvene (~RECONVENE_GRACE_SECS + a few dead
+# polls, often well under 5 min). gate-recovery-watchdog's independent,
+# wall-clock-based hang/stranded-run detectors (already cross-invocation-safe
+# by design) are the other backstop for this same failure mode. Nothing hangs
+# forever; a rare failure mode is just detected slower. See ga-eqjo PR.
+gate_collect_verdicts() {
+  VERDICTS_RECEIVED=0
+  ANY_FAIL=0
+  FAIL_REASONS=""
+  for j in "${!VERDICT_BEAD_IDS[@]}"; do
+    VB="${VERDICT_BEAD_IDS[$j]}"
+    VB_JSON=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null || echo "[]")
+    VB_STATUS=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .status // "open"')
+    VB_LABELS=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")')
+
+    if [ "$VB_STATUS" = "closed" ]; then
+      VERDICTS_RECEIVED=$((VERDICTS_RECEIVED + 1))
+      if echo "$VB_LABELS" | grep -q "verdict:PASS"; then
+        : # explicit PASS — continue
+      elif echo "$VB_LABELS" | grep -q "verdict:FAIL"; then
+        ANY_FAIL=1
+        # Collect the fail reason from the reviewer's verdict comment.
+        # NOTE (ga-kf0v): the beads "bd comments --json" schema uses .text
+        # (keys: author, created_at, id, issue_id, text) — there is NO .body
+        # field. The old accessor read .[0].body, so jq always fell through to
+        # the "No reason provided" default and EVERY genuine reviewer FAIL lost
+        # its reason. Parse .text (with .body kept as a defensive fallback for
+        # any future schema drift), preferring the comment that starts with
+        # "VERDICT:" (the reviewer convention), else the first non-empty one.
+        VB_COMMENTS_JSON=$(bd -C "$GC_CITY" comments "$VB" --json 2>/dev/null || echo "[]")
+        FAIL_COMMENT=$(printf '%s' "$VB_COMMENTS_JSON" | jq -r '
+            [ .[]? | (.text // .body // "") ]
+            | ( map(select(test("^\\s*VERDICT:"; "i"))) | last )
+              // ( map(select(. != "")) | first )
+              // ""
+          ' 2>/dev/null || echo "")
+        # FORENSICS (ga-kf0v #3): always log the raw comments + verdict labels
+        # for a FAIL so any future schema/field drift is visible in the
+        # dispatcher log without re-deriving from beads.
+        log "  FAIL forensics reviewer $((j+1)) bead=$VB labels=[$VB_LABELS] raw_comments=$(printf '%s' "$VB_COMMENTS_JSON" | jq -c . 2>/dev/null | cut -c1-2000)"
+        if [ -z "$FAIL_COMMENT" ]; then
+          # Reviewer closed verdict:FAIL but left no parseable reason. Now rare
+          # (the .text fix above resolves the common case). Fail-safe: PASS is
+          # the only acceptable verdict, so an empty-reason FAIL still blocks
+          # the merge — but mark it INCONCLUSIVE and warn loudly so it is
+          # distinguishable from a substantive FAIL. (Full per-reviewer session
+          # re-run retry per ga-kf0v #2 is deliberately deferred: re-dispatching
+          # a reviewer mid-collection is higher-risk than this lane:small fix
+          # warrants; making the empty case visible addresses the intent without
+          # destabilising the gate's verdict-collection loop.)
+          warn "Reviewer $((j+1)) (bead $VB) closed verdict:FAIL with no parseable reason — counting as INCONCLUSIVE FAIL (fail-safe)."
+          FAIL_COMMENT="INCONCLUSIVE — verdict:FAIL with empty/unparseable reason (raw bead $VB; see forensics log above)"
+        fi
+        FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) FAIL: $FAIL_COMMENT\n"
+      else
+        # ga-86l90a8 (thies): the reviewer writes `label add verdict:PASS` THEN
+        # `comment "VERDICT: PASS"` THEN closes the bead (Step "If PASS" ~L2284).
+        # If the label-add raced / didn't commit before the close but the PASS
+        # COMMENT landed, the label-only check above loses a GENUINE pass and
+        # false-FAILs clean code ("verdict bead closed without explicit PASS").
+        # Rescue it the same way FAIL reasons are read: parse the verdict COMMENT
+        # (.text) and accept ONLY an unambiguous, anchored "VERDICT: PASS" —
+        # anything else still FAILs, so the fail-safe (PASS is the ONLY acceptable
+        # verdict) is fully preserved. A jq glitch leaves PASS_COMMENT empty →
+        # falls through to the existing FAIL path (no regression).
+        VB_COMMENTS_JSON=$(bd -C "$GC_CITY" comments "$VB" --json 2>/dev/null || echo "[]")
+        PASS_COMMENT=$(printf '%s' "$VB_COMMENTS_JSON" | jq -r '
+            [ .[]? | (.text // .body // "") ]
+            | map(select(test("^\\s*VERDICT:\\s*PASS\\b"; "i")))
+            | last // ""
+          ' 2>/dev/null || echo "")
+        if [ -n "$PASS_COMMENT" ]; then
+          VERDICTS_RECEIVED=$VERDICTS_RECEIVED  # already counted at the closed branch
+          log "  Reviewer $((j+1)) (bead $VB) closed WITHOUT a verdict:PASS label but its verdict COMMENT is an explicit PASS — rescuing as PASS (ga-86l90a8 label-race). comment=$(printf '%s' "$PASS_COMMENT" | tr '\n' ' ' | cut -c1-200)"
+          : # treat as PASS — do NOT set ANY_FAIL
+        else
+          # Any other label (TIMEOUT, ABORTED, or missing verdict label) → FAIL.
+          # PASS is the ONLY acceptable verdict; anything else blocks the merge.
+          ANY_FAIL=1
+          VERDICT_LABEL=$(echo "$VB_LABELS" | tr ' ' '\n' | grep "^verdict:" | head -1 || echo "no-verdict-label")
+          FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) ${VERDICT_LABEL}: verdict bead closed without explicit PASS (no verdict:PASS label and no explicit PASS comment).\n"
+        fi
+      fi
+    fi
+    # ga-eqjo: NOT closed (still pending) -> not counted this check; see the
+    # scope-reduction note in this function's header comment above.
+  done
+}
+# extract <field-name> — parse a "<field-name>: value" line out of $DESC.
+# Hoisted (ga-eqjo) so Phase C can reuse it on a run bead's description the
+# same way Step 2 uses it on a marker's. ga-7zjs1: trailing `|| true` keeps a
+# missing field from aborting the dispatcher under `set -euo pipefail` — an
+# absent field makes grep exit 1 (no match) and pipefail would propagate it;
+# a no-match now yields an empty string instead, letting callers fall back.
+extract() { echo "$DESC" | grep -E "^$1:" | head -1 | sed "s/^$1: *//" || true; }
+
+# ── ga-zl277: guaranteed reviewer-session cleanup on EVERY exit path ───────────
+# Reviewer sessions used to be closed ONLY at Step 9 (the success/timeout path).
+# A mid-loop spawn-abort or any signal/timeout kill of the dispatcher left
+# already-spawned reviewer sessions ASLEEP and never closed. They pile up
+# against the gate-reviewer template's max_active_sessions budget until the
+# gate can no longer spawn reviewers (vicious cycle). This EXIT/signal trap
+# closes whatever is in SESSION_IDS exactly once, from one place, so every
+# abort path frees its cap slots. (SIGKILL/OOM cannot be trapped — the Step
+# 0a-2 startup janitor backstops those.) Hoisted (ga-eqjo) — see extract()
+# above for why: a Phase-C-only sweep never reaches Step 7's original
+# position, so this must be defined before Phase C, not at Step 7.
+_gate_cleanup_done=0
+cleanup_reviewer_sessions() {
+  [ "$_gate_cleanup_done" = "1" ] && return 0
+  _gate_cleanup_done=1
+  # ga-eqjo: a run admitted+spawned THIS sweep whose verdicts are not all in yet
+  # is not finished — its reviewers must keep working (Phase B, unsupervised).
+  # The non-blocking Step 8 tail sets this flag right before exiting so THIS
+  # same EXIT trap (which used to unconditionally close every reviewer session)
+  # only releases the single-instance lock and leaves the sessions alive for a
+  # future sweep's Phase C to finalize. Finalizing runs (via gate_finalize_run,
+  # from either the same-sweep fast path or Phase C) never set this flag, so
+  # they still close sessions exactly as before.
+  if [ "${GATE_RUN_LEAVE_SESSIONS_ALIVE:-0}" = "1" ]; then
+    log "Run $GATE_RUN_ID left in flight — reviewer sessions stay alive for a future sweep (ga-eqjo): ${SESSION_IDS[*]:-none}"
+    if [ "${GATE_SWEEP_HAS_MORE_WORK:-0}" != "1" ]; then _release_gate_lock 2>/dev/null || true; fi
+    return 0
+  fi
+  if [ "${#SESSION_IDS[@]}" -gt 0 ]; then
+    for _SID in "${SESSION_IDS[@]}"; do
+      [ -z "$_SID" ] && continue
+      gc --city "$GC_CITY" session close "$_SID" 2>/dev/null || true
+    done
+    log "Reviewer sessions closed (cleanup): ${SESSION_IDS[*]}"
+  fi
+  # This EXIT trap REPLACES the early '_release_gate_lock' trap installed at sweep
+  # start, so release the single-instance lock from here too — otherwise the lock
+  # would leak until GATE_LOCK_MAX_AGE on every run that reaches Step 7. Token-
+  # guarded + idempotent -> a no-op when GATE_LOCK_ENABLED=0 or we don't own it.
+  # ga-eqjo: GATE_SWEEP_HAS_MORE_WORK (set by Phase C around its own loop, see
+  # below) skips the release here — Phase C may have MORE runs queued to
+  # finalize, or Step 0b/Step 1 may still need to claim a new marker, THIS
+  # SAME sweep, all under the SAME lock acquisition. Releasing early here would
+  # open a window for a second concurrent sweep to start before this one's
+  # remaining work is done. The lock still gets released exactly once, at the
+  # sweep's true end, via whichever EXIT trap is active at that point (this
+  # function, if Step 7 ran; the plain _release_gate_lock trap from sweep
+  # start, if it never did) — both are idempotent and token-guarded.
+  if [ "${GATE_SWEEP_HAS_MORE_WORK:-0}" != "1" ]; then _release_gate_lock 2>/dev/null || true; fi
+}
 # ── Single-instance guard: collapse overlapping launchd sweeps to one ─────────
 # Acquire BEFORE the bd-heavy preamble (ambient-CPU snapshot, Step 0a TTL
 # recovery, Step 0a-2 orphan-reviewer reap, headroom probe, and the marker
@@ -1387,6 +2828,222 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
   GATE_AMBIENT_DOLT_CPU=$(gate_dolt_cpu "${GATE_AMBIENT_DOLT_PID:-}")
 fi
 
+# ── Phase C (ga-eqjo): finalize any in-flight gate-runs whose verdicts are
+# complete or whose timeout has elapsed. This is what makes Step 8 (Phase A's
+# tail) non-blocking: an EARLIER sweep's Phase A spawned reviewers and exited
+# immediately; THIS sweep (or a later one) is what actually merges/fails once
+# reviewers finish. Runs FIRST, before any new-marker admission (Step 0a
+# onward), so freed reviewer-session slots are visible to THIS sweep's own
+# headroom check (Step 0b-1) and the merge stays serial — this whole block
+# runs under the SAME single-instance lock as the rest of the sweep.
+#
+# Context for each running gate-run is re-derived from its bead state (never
+# from process-local variables — a DIFFERENT process may have claimed it):
+# the run bead's description (source_bead/author/rig/branch/tier/
+# required_reviewers/branch_sha/marker_id/started_at/verdict_timeout_minutes,
+# all written at Step 6) via extract(), and its verdict beads via the
+# gate-run:<id> label. gate_resolve_rig_context/gate_collect_verdicts/
+# gate_finalize_run are the SAME functions the same-sweep fast path (Step 8)
+# uses — no separate/duplicate logic to drift.
+#
+# DELIBERATE SCOPE REDUCTION: this sweep does NOT attempt mid-flight reviewer
+# respawn/reconvene (ga-4u16h and friends — see gate_collect_verdicts' header
+# comment). A dead reviewer is now caught by this run's own timeout (persisted
+# verdict_timeout_minutes, checked below) or by gate-recovery-watchdog's
+# independent hang/stranded-run detectors, both wall-clock-based and already
+# safe across process boundaries — never by a debounced in-poll counter that
+# only made sense inside one long-lived blocking process. See ga-eqjo PR.
+if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
+  PHASE_C_RUNNING_JSON=$(bd -C "$GC_CITY" list --json -l type:quality-gate-run -l gate-status:running 2>/dev/null || echo "[]")
+  PHASE_C_COUNT=$(printf '%s' "$PHASE_C_RUNNING_JSON" | jq 'length' 2>/dev/null || echo "0")
+  case "$PHASE_C_COUNT" in ''|*[!0-9]*) PHASE_C_COUNT=0 ;; esac
+  if [ "$PHASE_C_COUNT" -gt 0 ]; then
+    log "Phase C: sweeping $PHASE_C_COUNT in-flight gate-run(s) for completion/timeout (ga-eqjo)."
+    # More than one run bead may need finalizing this sweep; keep the
+    # single-instance lock held across the WHOLE loop (and into Step 0a
+    # onward) rather than releasing it after the first — see
+    # cleanup_reviewer_sessions' GATE_SWEEP_HAS_MORE_WORK handling above.
+    GATE_SWEEP_HAS_MORE_WORK=1
+    for PC_I in $(seq 0 $((PHASE_C_COUNT - 1))); do
+      # ga-eqjo (code-review fix): refresh the single-instance lock's heartbeat
+      # at the TOP of every Phase C iteration, mirroring what the old Step 8
+      # poll loop did every 30s for the same reason (that loop's own comment:
+      # "a 1846s real sweep has been observed > MAX_AGE (1800s)"). Each
+      # iteration can do several bd/gc calls plus a full do_merge_ff (git
+      # fetch/rebase/push, all with no per-call timeout) — on N queued runs
+      # this sweep, that's easily enough wall-clock for a LIVE holder's
+      # heartbeat to go stale and get reclaimed by a second concurrent sweep
+      # (_acquire_gate_lock only backs off when the heartbeat is BOTH fresh
+      # AND the PID confirmed alive — a live-but-slow holder fails the
+      # freshness half and gets reclaimed anyway). No-op when the lock is
+      # disabled or its dir is absent (token-guarded write, 2>/dev/null).
+      if [ "$GATE_LOCK_ENABLED" = "1" ]; then _gate_lock_write_hb; fi
+      PC_RUN=$(printf '%s' "$PHASE_C_RUNNING_JSON" | jq ".[$PC_I]")
+      GATE_RUN_ID=$(printf '%s' "$PC_RUN" | jq -r '.id // empty')
+      [ -z "$GATE_RUN_ID" ] && continue
+      DESC=$(printf '%s' "$PC_RUN" | jq -r '.description // ""')
+
+      # Fresh cleanup/leave-alive lifecycle for THIS run bead — a PRIOR
+      # iteration of this same loop (or a fast-path run earlier this sweep)
+      # may have already driven these to 1.
+      _gate_cleanup_done=0
+      GATE_RUN_LEAVE_SESSIONS_ALIVE=0
+
+      BEAD_ID=$(extract "source_bead")
+      AUTHOR=$(extract "author")
+      RIG=$(extract "rig")
+      BRANCH=$(extract "branch")
+      if [ -z "$BRANCH" ] && [ -n "$BEAD_ID" ]; then
+        # ga-eqjo (code-review fix): backward-compat fallback for gate-run
+        # beads created by the PRE-ga-eqjo dispatcher, whose Step 6 template
+        # never wrote a `branch:` description line (that field is new in
+        # this diff). Without this, any run already in flight at the exact
+        # moment this fix deploys can never be finalized — the required-
+        # field guard below would skip it, forever, every sweep, leaking
+        # its reviewer sessions and orphaning its marker.
+        # The bead's TITLE format ("gate-run: $BRANCH ($BEAD_ID)", set at
+        # Step 6) is UNCHANGED, so recover BRANCH from it: strip the fixed
+        # prefix, then the trailing " ($BEAD_ID)" suffix using the
+        # already-extracted bead id (an EXACT match against the known id,
+        # not a generic parenthesis strip, so a branch name that itself
+        # contains parentheses is never mis-parsed).
+        PC_TITLE=$(printf '%s' "$PC_RUN" | jq -r '.title // ""')
+        if [ -n "$PC_TITLE" ]; then
+          BRANCH="${PC_TITLE#gate-run: }"
+          BRANCH="${BRANCH% (${BEAD_ID})}"
+        fi
+        if [ -n "$BRANCH" ]; then
+          log "Phase C: gate-run $GATE_RUN_ID has no persisted branch: field (pre-ga-eqjo bead) — recovered '$BRANCH' from its title."
+        fi
+      fi
+      TIER=$(extract "tier")
+      REQUIRED_REVIEWERS=$(extract "required_reviewers")
+      BRANCH_SHA=$(extract "branch_sha")
+      MARKER_ID=$(extract "marker_id")
+      PC_STARTED_AT=$(extract "started_at")
+      PC_TIMEOUT_MIN=$(extract "verdict_timeout_minutes")
+      case "$REQUIRED_REVIEWERS" in ''|*[!0-9]*) REQUIRED_REVIEWERS=1 ;; esac
+      case "$PC_TIMEOUT_MIN" in ''|*[!0-9]*) PC_TIMEOUT_MIN="$VERDICT_TIMEOUT_MINUTES" ;; esac
+
+      if [ -z "$BEAD_ID" ] || [ -z "$BRANCH" ] || [ -z "$RIG" ] || [ -z "$MARKER_ID" ]; then
+        warn "Phase C: gate-run $GATE_RUN_ID missing a required field (source_bead/branch/rig/marker_id) in its description — skipping this sweep, will retry next sweep."
+        continue
+      fi
+
+      if ! gate_resolve_rig_context; then
+        warn "Phase C: gate-run $GATE_RUN_ID — could not resolve rig context for rig='$RIG'; skipping this sweep, will retry next sweep."
+        continue
+      fi
+
+      VB_JSON=$(bd -C "$GC_CITY" list --json -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID" 2>/dev/null || echo "[]")
+      VERDICT_BEAD_IDS=()
+      while IFS= read -r PC_VBID; do
+        [ -z "$PC_VBID" ] && continue
+        VERDICT_BEAD_IDS+=("$PC_VBID")
+      done < <(printf '%s' "$VB_JSON" | jq -r '
+          sort_by([(.labels[]? | select(startswith("reviewer-index:")) | ltrimstr("reviewer-index:") | tonumber)] | (.[0] // 0))
+          | .[].id' 2>/dev/null)
+      SESSION_IDS=()
+      for PC_VBID in "${VERDICT_BEAD_IDS[@]}"; do
+        PC_SID=$(bd -C "$GC_CITY" show "$PC_VBID" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
+        SESSION_IDS+=("$PC_SID")
+      done
+
+      if [ "${#VERDICT_BEAD_IDS[@]}" -eq 0 ]; then
+        warn "Phase C: gate-run $GATE_RUN_ID has ZERO verdict beads — likely died before Step 7 finished spawning. Leaving for gate-recovery-watchdog's hung-run backstop."
+        continue
+      fi
+
+      gate_collect_verdicts
+
+      PC_START_EPOCH=$(_ts_to_epoch "$PC_STARTED_AT")
+      case "$PC_START_EPOCH" in ''|*[!0-9]*) PC_START_EPOCH=$(date +%s) ;; esac
+      PC_NOW_EPOCH=$(date +%s)
+      PC_ELAPSED=$(( PC_NOW_EPOCH - PC_START_EPOCH ))
+      PC_TIMEOUT_SECS=$(( PC_TIMEOUT_MIN * 60 ))
+      GATE_START_EPOCH="$PC_START_EPOCH"
+      QUOTA_REQUEUE=0
+      REQUEUE_REASON="quota"
+
+      if [ "$VERDICTS_RECEIVED" -eq "$REQUIRED_REVIEWERS" ]; then
+        OVERALL_VERDICT="PASS"
+        [ "$ANY_FAIL" = "1" ] && OVERALL_VERDICT="FAIL"
+        log "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) complete — $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts, overall=$OVERALL_VERDICT (elapsed ${PC_ELAPSED}s). Finalizing."
+        gate_finalize_run
+      elif [ "$PC_ELAPSED" -gt "$PC_TIMEOUT_SECS" ]; then
+        PC_QLIM=$(gate_quota_limited)
+        if [ "$(gate_quota_stop_verdict "$PC_QLIM")" = "requeue" ]; then
+          QUOTA_REQUEUE=1
+          warn "Phase C: gate-run $GATE_RUN_ID timed out (${PC_ELAPSED}s) but Claude 5h quota is LIMITED — quota-stop re-queue (ga-x3nmz)."
+          gate_finalize_run
+          continue
+        fi
+        # ga-eqjo (code-review fix): before treating a timeout as a genuine
+        # code FAIL, check whether every STILL-PENDING reviewer's session is
+        # simply DEAD (gone — not slow, not wedged, confirmed absent or
+        # closed in `gc session list`). A dead session can never produce a
+        # verdict, so waiting out the full timeout only delays the
+        # inevitable — but it is an INFRA failure (the ga-4u16h/ga-h9o17
+        # incident class the old poll loop used to silently self-heal via
+        # respawn), not a reflection of the branch's code quality. Only
+        # re-queue when the run has genuinely produced NOTHING and every
+        # pending slot is confirmed dead — if even one reviewer is still
+        # alive (slow, or wedged on a huge diff), fall through to the
+        # existing FAIL path unchanged, same as before this fix.
+        PC_SESS_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "")
+        PC_ANY_PENDING=0
+        PC_ALL_PENDING_DEAD=1
+        for PC_J in "${!VERDICT_BEAD_IDS[@]}"; do
+          PC_VB="${VERDICT_BEAD_IDS[$PC_J]}"
+          PC_VB_ST=$(bd -C "$GC_CITY" show "$PC_VB" --json 2>/dev/null \
+            | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || echo "open")
+          [ "$PC_VB_ST" = "closed" ] && continue
+          PC_ANY_PENDING=1
+          PC_SID="${SESSION_IDS[$PC_J]:-}"
+          PC_PRESENT_N=$(printf '%s' "$PC_SESS_JSON" \
+            | jq -r --arg s "$PC_SID" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | length' 2>/dev/null || echo 1)
+          case "$PC_PRESENT_N" in ''|*[!0-9]*) PC_PRESENT_N=1 ;; esac
+          PC_PRESENT_FLAG=0
+          PC_CLOSED_FLAG=false
+          if [ "$PC_PRESENT_N" -ge 1 ]; then
+            PC_PRESENT_FLAG=1
+            PC_CLOSED_FLAG=$(printf '%s' "$PC_SESS_JSON" \
+              | jq -r --arg s "$PC_SID" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | .[0].closed // false' 2>/dev/null || echo false)
+          fi
+          if [ "$(session_is_dead "$PC_PRESENT_FLAG" "$PC_CLOSED_FLAG")" != "1" ]; then
+            PC_ALL_PENDING_DEAD=0
+            break
+          fi
+        done
+        if [ "$PC_ANY_PENDING" = "1" ] && [ "$PC_ALL_PENDING_DEAD" = "1" ]; then
+          QUOTA_REQUEUE=1
+          REQUEUE_REASON="dead-reviewer"
+          warn "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) timed out with ALL pending reviewer session(s) confirmed DEAD — infra failure, not a code FAIL (ga-eqjo)."
+          gate_finalize_run
+        else
+          warn "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) TIMED OUT after ${PC_ELAPSED}s (limit=${PC_TIMEOUT_SECS}s) with $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts. Treating as FAIL."
+          OVERALL_VERDICT="FAIL"
+          FAIL_REASONS="TIMEOUT: reviewers did not submit verdicts within ${PC_TIMEOUT_MIN} minutes."
+          for PC_VB in "${VERDICT_BEAD_IDS[@]}"; do
+            PC_VB_STATUS=$(bd -C "$GC_CITY" show "$PC_VB" --json 2>/dev/null \
+              | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
+            if [ "$PC_VB_STATUS" != "closed" ]; then
+              bd -C "$GC_CITY" label remove "$PC_VB" "verdict:pending" -q 2>/dev/null || true
+              bd -C "$GC_CITY" label add    "$PC_VB" "verdict:TIMEOUT" -q 2>/dev/null || true
+              bd -C "$GC_CITY" comment "$PC_VB" "VERDICT: TIMEOUT — reviewer session did not complete within ${PC_TIMEOUT_MIN}m" 2>/dev/null || true
+              bd -C "$GC_CITY" close "$PC_VB" 2>/dev/null || true
+            fi
+          done
+          gate_finalize_run
+        fi
+      else
+        log "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) still in flight ($VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts, ${PC_ELAPSED}s/${PC_TIMEOUT_SECS}s) — leaving for a future sweep."
+      fi
+    done
+    GATE_SWEEP_HAS_MORE_WORK=0
+  fi
+fi
+
 # ── Step 0a: TTL recovery — re-queue zombie dispatching markers ───────────────
 # If a marker has been in gate-status:dispatching for > DISPATCHING_TTL_MINUTES,
 # the dispatcher process was killed mid-run (after claiming but before completing).
@@ -1400,7 +3057,25 @@ fi
 #
 # Safety: we only recover markers that are STILL in dispatching — i.e. the
 # dispatcher never finished (no passed/failed/error/needs-rebase was set).
+#
+# ga-eqjo (code-review fix): this 30m TTL assumed the single-instance lock
+# spanned the ENTIRE claim-to-merge duration, so a marker stuck in
+# gate-status:dispatching past 30m could only mean the dispatcher process
+# itself died. That invariant is gone: Phase A now claims + spawns and EXITS
+# in ~65-95s, releasing the lock while Phase B (reviewers) legitimately keeps
+# working for up to VERDICT_TIMEOUT_MAX_MINUTES (50m) — and nothing touches
+# the MARKER's updated_at during Phase B (only the separate verdict beads get
+# updated). Without a fix here, every large/scaled-timeout review would get
+# spuriously "TTL recovered" mid-flight roughly every 30m even though the
+# dispatcher never died. Before reclaiming, check for a LIVE
+# type:quality-gate-run bead (gate-status:running) whose marker_id: matches —
+# that proves Phase B is legitimately still in progress, not a zombie.
 DISPATCHING_TTL_MINUTES=30
+
+LIVE_RUN_MARKER_IDS_JSON=$(bd -C "$GC_CITY" list --json \
+  -l type:quality-gate-run \
+  -l gate-status:running \
+  2>/dev/null || echo "[]")
 
 DISPATCHING_JSON=$(bd -C "$GC_CITY" list --json \
   -l type:quality-gate-marker \
@@ -1424,10 +3099,17 @@ if [ "$DISPATCHING_COUNT" -gt 0 ]; then
       || date -d "$D_UPDATED" +%s 2>/dev/null || echo "0")
     D_AGE_MINUTES=$(( (NOW_EPOCH_D - D_EPOCH) / 60 ))
     if [ "$D_AGE_MINUTES" -gt "$DISPATCHING_TTL_MINUTES" ]; then
-      warn "Re-queuing zombie dispatching marker $D_ID (age=${D_AGE_MINUTES}m > TTL=${DISPATCHING_TTL_MINUTES}m — dispatcher died mid-run)"
+      D_HAS_LIVE_RUN=$(printf '%s' "$LIVE_RUN_MARKER_IDS_JSON" | jq -r --arg mid "$D_ID" \
+        '[ .[] | select(((.description // "") | test("(^|\n)marker_id: *" + $mid + "( |\n|$)")) ) ] | length' 2>/dev/null || echo "0")
+      case "$D_HAS_LIVE_RUN" in ''|*[!0-9]*) D_HAS_LIVE_RUN=0 ;; esac
+      if [ "$D_HAS_LIVE_RUN" -gt 0 ]; then
+        log "Marker $D_ID is ${D_AGE_MINUTES}m old in gate-status:dispatching but has a LIVE gate-run (Phase B legitimately still in progress, ga-eqjo) — NOT reclaiming as a zombie."
+        continue
+      fi
+      warn "Re-queuing zombie dispatching marker $D_ID (age=${D_AGE_MINUTES}m > TTL=${DISPATCHING_TTL_MINUTES}m — dispatcher died mid-run, no live gate-run found)"
       bd -C "$GC_CITY" label remove "$D_ID" "gate-status:dispatching" -q 2>/dev/null || true
       bd -C "$GC_CITY" label add    "$D_ID" "gate-status:queued"      -q 2>/dev/null || true
-      bd -C "$GC_CITY" comment "$D_ID" "Dispatcher TTL recovery: marker was stuck in gate-status:dispatching for ${D_AGE_MINUTES}m (> ${DISPATCHING_TTL_MINUTES}m TTL). Dispatcher process died mid-run. Re-queuing for re-processing." 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$D_ID" "Dispatcher TTL recovery: marker was stuck in gate-status:dispatching for ${D_AGE_MINUTES}m (> ${DISPATCHING_TTL_MINUTES}m TTL) with no live gate-run bead found. Dispatcher process died mid-run. Re-queuing for re-processing." 2>/dev/null || true
     fi
   done
 fi
@@ -1747,15 +3429,9 @@ log "Marker $MARKER_ID claimed for dispatching."
 
 # ── Step 2: Extract fields from marker description ────────────────────────────
 
-# ga-7zjs1: trailing `|| true` keeps a missing field from aborting the dispatcher.
-# Under `set -euo pipefail`, an absent field makes grep exit 1 (no match) and
-# pipefail propagates it, so `RIG=$(extract "rig")` would kill the whole script
-# BEFORE the bead-id-prefix rig fallback below. Crew /gate-done markers omit the
-# `rig:` field, so without this guard every crew marker stalled the gate
-# (claimed→dispatching→died→re-queued, no reviewer ever spawned). A no-match now
-# yields an empty string and the downstream fallbacks resolve the rig.
-extract() { echo "$DESC" | grep -E "^$1:" | head -1 | sed "s/^$1: *//" || true; }
-
+# ga-eqjo: extract() itself is now hoisted (before Phase C) so Phase C can
+# reuse it to parse a run bead's persisted description the same way this step
+# parses a marker's. See the hoisted block for the ga-7zjs1 rationale comment.
 BRANCH=$(extract "branch")
 BEAD_ID=$(extract "bead_id")
 BASE_COMMIT=$(extract "base_commit")
@@ -1924,30 +3600,12 @@ log "Authoritative author: $AUTHOR"
 
 # ── Step 4: Determine rig path and git references ─────────────────────────────
 # SELFTEST-EXTRACT rig-path-resolve: BEGIN
-RIG_PATH=""
-RIG_LIST_JSON=$(gc --city "$GC_CITY" rig list --json 2>/dev/null || echo '{}')
-if [ -n "$RIG" ]; then
-  RIG_PATH=$(echo "$RIG_LIST_JSON" \
-    | jq -r --arg r "$RIG" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
-fi
-
-# ga-67hae: COMPOUND rig fallback — /gate-done writes rig=mila-wa or rig=batista-ps
-# (crew-qualified). No rig has that compound name → bead-id prefix is authoritative
-# (wa-ucrq → wa → whatsapp_automation; ps-s27l → ps → property_scrapers).
-if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$BEAD_ID" ]; then
-  _bid_prefix="${BEAD_ID%%-*}"
-  RIG_PATH=$(echo "$RIG_LIST_JSON" \
-    | jq -r --arg r "$_bid_prefix" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
-  [ -n "$RIG_PATH" ] && log "  rig='$RIG' unresolved; derived from bead-id prefix '$_bid_prefix' -> $RIG_PATH"
-fi
-# Trailing-segment fallback: mila-wa → wa
-if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$RIG" ] && printf '%s' "$RIG" | grep -q '-'; then
-  _rig_tail="${RIG##*-}"
-  RIG_PATH=$(echo "$RIG_LIST_JSON" \
-    | jq -r --arg r "$_rig_tail" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
-  [ -n "$RIG_PATH" ] && log "  rig='$RIG' unresolved; derived from trailing segment '$_rig_tail' -> $RIG_PATH"
-fi
-
+# ga-eqjo: rig/BEAD_CITY/DEFAULT_BRANCH resolution itself now lives in
+# gate_resolve_rig_context() (hoisted above, before Phase C) so Phase C can
+# call the exact same logic for a run claimed by an EARLIER sweep. Only the
+# claim-time-only work (fetch, shallow-preflight, verify the branch still
+# exists on origin) stays inline here.
+#
 # ga-dmox: a marker whose rig:/bead_id: fields don't resolve to any registered
 # rig is a MALFORMED-DATA problem local to this one marker, not a dispatcher
 # infrastructure failure. Mark it (label + comment, so a human/watchdog reading
@@ -1956,8 +3614,9 @@ fi
 # above. exit 1 here previously poisoned daemon-presence-watchdog's per-daemon
 # exit-code FAILING counter (scripts/daemon-presence-watchdog.sh) over a single
 # bad marker, making a one-item data problem look like a dispatcher outage.
-if [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; then
-  err "Cannot resolve rig path for rig='$RIG' (bead=$BEAD_ID). Marking gate-status:error, skipping (not aborting the daemon)."
+# (gate_resolve_rig_context() already logged the specific "cannot resolve"
+# reason via its own err call before returning 1 — no need to repeat it here.)
+if ! gate_resolve_rig_context; then
   bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
   bd -C "$GC_CITY" comment "$MARKER_ID" "ga-dmox: rig path unresolved for rig='${RIG:-<empty>}' bead_id='${BEAD_ID:-<empty>}' — marker's branch:/bead_id:/rig: fields did not resolve to any registered rig via exact name, bead-id prefix, or trailing-segment match. Marker skipped (gate-status:error); other queued markers are unaffected. Resubmit via /gate-done with a corrected bead_id:/rig: field, or fix by hand and re-queue." 2>/dev/null || true
@@ -1965,285 +3624,6 @@ if [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; then
   exit 0
 fi
 # SELFTEST-EXTRACT rig-path-resolve: END
-
-# ga-67hae: normalize $RIG to the canonical rig name (compound values break
-# downstream select(.name == $RIG) lookups like DEFAULT_BRANCH derivation).
-_RIG_CANON=$(echo "$RIG_LIST_JSON" | jq -r --arg p "$RIG_PATH" '.rigs[] | select(.path == $p) | .name' 2>/dev/null | head -1 || echo "")
-if [ -n "$_RIG_CANON" ] && [ "$_RIG_CANON" != "$RIG" ]; then
-  log "  Normalized rig '$RIG' -> canonical '$_RIG_CANON' for downstream lookups."
-  RIG="$_RIG_CANON"
-fi
-
-# wa-re77: source-bead (BEAD_ID) lives in the RIG's own Dolt DB, not HQ.
-# Use BEAD_CITY for all bd ops on $BEAD_ID; keep GC_CITY for marker/gate-run/verdict ops.
-#
-# ── ga-qw7y6: resolve the store that ACTUALLY contains the source bead ─────────
-# BEAD_CITY="${RIG_PATH:-$GC_CITY}" alone is WRONG when an HQ-resident `ga-` bead
-# is built on a RIG branch (e.g. an HQ painel story built on whatsapp_automation's
-# crew branch — see painel-lives-in-wa-rig). There the marker carries
-# rig=whatsapp_automation, so RIG_PATH resolves to the rig store, but the source
-# bead lives in the HQ city store. The PASS-merge close (`bd -C "$BEAD_CITY"
-# close`) and the ga-esbg post-merge verification then target the rig store,
-# can't find the HQ bead, and silently no-op — the source bead stays open, the
-# verification reports "absent" (false OK), and Pilot phantom-re-dispatches the
-# already-merged work (ga-8tv0s re-dispatched 3×: a direct slot/cycle leak).
-# Conversely, wa-re77 rig-native beads DO live in the rig store. The owning store
-# is therefore NOT derivable from RIG_PATH alone — probe which store resolves it.
-#
-# resolve_bead_city <bead-id> — echo the store dir whose Dolt DB owns <bead-id>.
-# Probes RIG_PATH first (preserve wa-re77 rig-native behavior), then GC_CITY (HQ).
-# A store "owns" the bead iff `bd -C <store> show <bead> --json` yields a record
-# with a non-empty .status; a not-found probe returns {"error":...} (no .status →
-# empty → skip). Falls back to a bead-id prefix heuristic (ga-* → HQ) only when
-# NEITHER store resolves (e.g. transient Dolt hiccup), so the close still targets
-# the most-likely-correct store rather than blindly trusting RIG_PATH.
-resolve_bead_city() {
-  local bead="$1" store st
-  [ -z "$bead" ] && { echo "$GC_CITY"; return 0; }
-  for store in "${RIG_PATH:-}" "$GC_CITY"; do
-    [ -z "$store" ] && continue
-    st=$(bd -C "$store" show "$bead" --json 2>/dev/null \
-      | jq -r 'if type=="array" then (.[0] // {}) else . end | .status // empty' 2>/dev/null)
-    if [ -n "$st" ]; then echo "$store"; return 0; fi
-  done
-  # Neither store resolved (transient Dolt issue): prefix heuristic. The HQ city
-  # prefix is `ga` (gascity); every other prefix is a rig.
-  case "$bead" in
-    ga-*) echo "$GC_CITY" ;;
-    *)    echo "${RIG_PATH:-$GC_CITY}" ;;
-  esac
-}
-BEAD_CITY="$(resolve_bead_city "$BEAD_ID")"
-if [ "$BEAD_CITY" != "${RIG_PATH:-$GC_CITY}" ]; then
-  log "  ga-qw7y6: source bead $BEAD_ID resolves to store $BEAD_CITY (NOT rig store ${RIG_PATH:-$GC_CITY}) — cross-store close corrected."
-fi
-
-# Determine the canonical git repo location.
-# Container rigs (property_scrapers, lexbh) have a bare .repo.git.
-# Self-repo rigs (gastown, whatsapp_automation, marketing) have .git in root.
-if [ -d "$RIG_PATH/.repo.git" ]; then
-  GIT_DIR_PATH="$RIG_PATH/.repo.git"
-  IS_CONTAINER_RIG=1
-else
-  GIT_DIR_PATH="$RIG_PATH"
-  IS_CONTAINER_RIG=0
-fi
-
-# git_rig — wrapper that calls git with the correct rig-specific flags.
-# Usage: git_rig <args...>
-git_rig() {
-  if [ "$IS_CONTAINER_RIG" = "1" ]; then
-    git --git-dir="$GIT_DIR_PATH" "$@"
-  else
-    git -C "$GIT_DIR_PATH" "$@"
-  fi
-}
-
-# ── ga-ljbx: hardened ref resolution (defense-in-depth) ───────────────────────
-# rig_resolve_commit <ref> — resolve <ref> to a real COMMIT object SHA.
-#
-# Plain `git rev-parse origin/main` returns whatever 40-hex string the ref file
-# holds, EVEN IF that object is missing from the object DB (e.g. a ref left
-# dangling by a racing/aborted fetch or a competing reconciler). That garbage SHA
-# then poisons every downstream merge-base/merge-tree computation: merge-base
-# returns empty ("no common ancestor"), the branch is misclassified as having
-# unrelated histories, and a perfectly clean stale branch is bounced to
-# needs-rebase with a non-existent main_sha (observed live on ga-tmug:
-# main_sha=7b03eb9a… / e7949128…, neither of which exists in the repo).
-#
-# `git rev-parse --verify -q <ref>^{commit}` forces the ref to dereference to a
-# real, present commit object. On a missing/garbage object it prints NOTHING and
-# returns nonzero — callers can then distinguish "ref points at garbage" (→ treat
-# as a transient/re-triable error, gate-status:error) from "clean stale branch"
-# (→ auto-rebase). Output is empty on failure so `[ -z "$X" ]` guards trip.
-rig_resolve_commit() {
-  git_rig rev-parse --verify -q "$1^{commit}" 2>/dev/null || echo ""
-}
-
-# rig_content_merged <main_ref> <branch_ref> — ga-01yq: SHA-ancestry is FALSE BY
-# CONSTRUCTION after a rebase-merge (the gate's own auto-rebase, or any manual
-# rebase, replays commits under NEW shas) — a fully-merged branch never becomes
-# an ancestor again, so a naive `merge-base --is-ancestor` strands it on
-# needs-rebase FOREVER, and the suggested manual-rebase remediation can then
-# re-submit PRE-REBASE file versions on top of newer work already in main (a
-# real regression, not just noise — see ga-01yq / batista-wa's wa-jaxt8 catch
-# and the peter/ga-fr5d near-miss).
-#
-# rc0 iff EVERY commit reachable from <branch_ref> but not <main_ref> already
-# has its patch present on the <main_ref> side (git matches rebased/squashed/
-# re-committed changes by patch-id) — i.e. the branch's content is fully
-# merged regardless of SHA lineage. Mirrors merged-bead-janitor.sh's
-# content_in_main() (proven on ga-tijv5/wa-fvxj1); duplicated here rather than
-# sourced because each gate daemon is a self-contained script with its own
-# small git-check helpers (see git_rig/rig_resolve_commit above) — there is no
-# existing cross-script import convention for these.
-#
-# FAIL-CLOSED: any non-"0"/empty/error count → rc1 (treated as NOT merged), so
-# callers keep bouncing to the existing (safe) needs-rebase path on any doubt.
-rig_content_merged() {
-  local main_ref="$1" branch_ref="$2"
-  local n
-  n=$(git_rig rev-list --count --cherry-pick --right-only "${main_ref}...${branch_ref}" 2>/dev/null || echo ERR)
-  [ "$n" = "0" ]
-}
-
-# ── ga-78n2z: union-aware conflict pre-check ──────────────────────────────────
-# GATE_UNION_AWARE_PRECHECK=1 (default ON) makes the merge-tree pre-check honor
-# the `merge=union` gitattributes driver. =0 restores the EXACT legacy behavior
-# (merge-tree --write-tree exit code is taken at face value).
-#
-# WHY: `git merge-tree --write-tree <main> <branch>` does NOT apply custom/builtin
-# merge=* drivers from .gitattributes — even on git 2.54 (verified empirically on
-# wa-jjea/wa-40xb: merge-tree reports CONFLICT on docs/data_dictionary.md, which
-# carries `merge=union`, yet a REAL `git merge` of the same pair resolves it rc=0
-# with zero conflict markers because union concatenates both sides). The result
-# was a recurring pile of SPURIOUS needs-rebase escalations for branches whose
-# only conflict is in a union-driver file (wa-40xb, wa-jjea, ...).
-GATE_UNION_AWARE_PRECHECK="${GATE_UNION_AWARE_PRECHECK:-1}"
-
-# rig_conflict_paths <main_ref> <branch_ref> — echo the NUL-free newline list of
-# paths merge-tree flags as conflicting (empty on clean / error). Used only to
-# decide union-coverage; the authoritative verdict still comes from exit codes.
-rig_conflict_paths() {
-  local main_ref="$1" branch_ref="$2"
-  # `merge-tree --write-tree --name-only` stdout has THREE sections (git 2.54):
-  #   line 1            : the new tree OID
-  #   lines 2..K        : "Conflicted file info" — one conflicting path per line
-  #   (blank line)      : section separator
-  #   lines K+2..EOF    : "Informational messages" — "Auto-merging…", "CONFLICT…"
-  # We want ONLY the conflicted-path section: drop line 1, then stop at the FIRST
-  # blank line (sed `/^$/q` quits before printing it), which discards the trailing
-  # informational tail (otherwise "Auto-merging X"/"CONFLICT … X" would be mistaken
-  # for paths and break union-coverage detection). `|| true` is REQUIRED: merge-tree
-  # returns rc=1 on conflict and pipefail would trip set -e on the assignment.
-  git_rig merge-tree --write-tree --name-only "$main_ref" "$branch_ref" 2>/dev/null \
-    | tail -n +2 | sed '/^$/q' | sed '/^$/d' || true
-}
-
-# rig_path_is_union_resolvable <merge_ref> <path> — return 0 (true) iff <path> is
-# governed by a merge driver that resolves WITHOUT producing conflict markers
-# (currently only the builtin `union`). check-attr is evaluated against the merge
-# context ref (the branch being merged) so .gitattributes as the author sees it is
-# authoritative. Any unset/unspecified/other driver → return 1 (NOT union-safe).
-rig_path_is_union_resolvable() {
-  local merge_ref="$1" path="$2" drv=""
-  # `git check-attr` on a tree-ish: use --source (git ≥2.40) to read attributes
-  # from <merge_ref> rather than the working tree. Fall back to plain check-attr
-  # (working-tree .gitattributes) if --source is unsupported. Conservative on any
-  # failure: empty/err driver → not union → caller escalates as a real conflict.
-  drv=$(git_rig check-attr --source "$merge_ref" merge -- "$path" 2>/dev/null | sed 's/.*: merge: //' )
-  if [ -z "$drv" ] || [ "$drv" = "merge: unspecified" ]; then
-    drv=$(git_rig check-attr merge -- "$path" 2>/dev/null | sed 's/.*: merge: //')
-  fi
-  [ "$drv" = "union" ]
-}
-
-# rig_real_merge_is_clean <main_ref> <branch_ref> — perform a REAL throwaway
-# test-merge in a detached temp worktree to confirm the merge actually resolves
-# clean (union drivers applied). Return 0 (clean) iff `git merge --no-commit`
-# succeeds with NO unmerged index entries. Any error/uncertainty → return 1
-# (treat as NOT-clean → caller escalates; fail-safe, never green-lights a real
-# conflict). The worktree + a trap guarantee cleanup on every path.
-rig_real_merge_is_clean() {
-  local main_ref="$1" branch_ref="$2"
-  local wt rc=1
-  wt="$(mktemp -d "${TMPDIR:-/tmp}/gc-gate-unioncheck-XXXXXX" 2>/dev/null)" || return 1
-  # Resolve the temp worktree fully so cleanup in the trap is unambiguous.
-  # shellcheck disable=SC2064
-  trap "git_rig worktree remove --force '$wt' >/dev/null 2>&1 || true; rm -rf '$wt' >/dev/null 2>&1 || true" RETURN
-  # Create a detached worktree at main; do the merge there. --no-commit leaves the
-  # index/worktree merged so we can inspect ls-files -u, then we abort.
-  if git_rig worktree add --detach "$wt" "$main_ref" >/dev/null 2>&1; then
-    git -C "$wt" config user.email "gate-dispatcher@gascity.local" >/dev/null 2>&1 || true
-    git -C "$wt" config user.name  "Gate Dispatcher"               >/dev/null 2>&1 || true
-    if git -C "$wt" merge --no-commit --no-ff "$branch_ref" >/dev/null 2>&1; then
-      # Merge stopped-before-commit cleanly. Double-check no unmerged entries.
-      if [ -z "$(git -C "$wt" ls-files -u 2>/dev/null)" ]; then
-        rc=0
-      fi
-    fi
-    git -C "$wt" merge --abort >/dev/null 2>&1 || true
-  fi
-  return "$rc"
-}
-
-# ── ga-ljbx: git-2.54 conflict detection ──────────────────────────────────────
-# rig_merge_has_conflict <main_ref> <branch_ref> — echo "1" if merging
-# <branch_ref> into <main_ref> conflicts, "0" if clean, "err" if undeterminable.
-#
-# The legacy 3-arg form `git merge-tree <base> <ours> <theirs>` + grep '^<<<<<<<'
-# is BROKEN on git 2.54: the conflict markers in that output are diff-prefixed
-# (" +<<<<<<<"), so the anchored grep never matches and a real conflict reads as
-# clean (verified empirically on git 2.54.0). The modern
-# `git merge-tree --write-tree <main> <branch>` is authoritative: exit 0 = clean,
-# exit 1 = conflict, exit >1 = error (e.g. unrelated histories / bad ref).
-#
-# ga-78n2z: merge-tree --write-tree does NOT apply merge=union drivers, so a
-# branch whose ONLY conflict is in a union-driver file (e.g. docs/data_dictionary.md)
-# reads as a conflict here while a REAL merge resolves it cleanly. When the flag is
-# ON and EVERY conflicting path is union-resolvable, we run a real test-merge in a
-# throwaway worktree; if that confirms clean we report "0" (clean). If ANY path is
-# not union-resolvable, or the test-merge still conflicts, or anything is uncertain,
-# we fall through to the legacy "1" (escalate) — never auto-greenlight a real conflict.
-rig_merge_has_conflict() {
-  local main_ref="$1" branch_ref="$2"
-  git_rig merge-tree --write-tree "$main_ref" "$branch_ref" >/dev/null 2>&1
-  local rc=$?
-  if [ "$rc" = "0" ]; then
-    echo "0"
-    return 0
-  elif [ "$rc" != "1" ]; then
-    echo "err"
-    return 0
-  fi
-
-  # rc == 1: merge-tree reports a conflict.
-  if [ "$GATE_UNION_AWARE_PRECHECK" != "1" ]; then
-    echo "1"
-    return 0
-  fi
-
-  # Union-aware path: is EVERY conflicting file a union-driver file?
-  local paths p all_union=1 any=0
-  paths="$(rig_conflict_paths "$main_ref" "$branch_ref")"
-  if [ -z "$paths" ]; then
-    # Conservative: rc=1 but we could not enumerate the conflicting paths →
-    # cannot prove union-only → treat as a genuine conflict (legacy behavior).
-    echo "1"
-    return 0
-  fi
-  while IFS= read -r p; do
-    [ -z "$p" ] && continue
-    any=1
-    if ! rig_path_is_union_resolvable "$branch_ref" "$p"; then
-      all_union=0
-      break
-    fi
-  done <<EOF
-$paths
-EOF
-
-  if [ "$any" = "1" ] && [ "$all_union" = "1" ]; then
-    # All conflicting paths are union-driver files. Confirm with a REAL merge.
-    if rig_real_merge_is_clean "$main_ref" "$branch_ref"; then
-      log "  ga-78n2z: union-only merge-tree conflict in [$(printf '%s' "$paths" | tr '\n' ' ')] confirmed CLEAN by real test-merge — treating pre-check as clean." 2>/dev/null || true
-      echo "0"
-      return 0
-    fi
-    # Union-only by attribute but the real merge STILL conflicts → genuine.
-    log "  ga-78n2z: union-only merge-tree conflict but real test-merge ALSO conflicts — genuine conflict, escalating." 2>/dev/null || true
-  fi
-
-  # Default / fail-safe: genuine conflict (a non-union path, or real merge unclean).
-  echo "1"
-  return 0
-}
-
-log "  rig_path=$RIG_PATH  git_dir=$GIT_DIR_PATH  container_rig=$IS_CONTAINER_RIG"
-
-# Determine default branch (main unless overridden)
-DEFAULT_BRANCH=$(echo "$RIG_LIST_JSON" \
-  | jq -r --arg r "$RIG" '.rigs[] | select(.name == $r or .prefix == $r) | .default_branch // "main"' 2>/dev/null | head -1 || echo "main")
 
 # Fetch to ensure we have the latest remote state
 log "Fetching remote for rig $RIG ..."
@@ -2329,7 +3709,6 @@ if [ -z "$BRANCH_SHA" ]; then
 fi
 
 log "  branch_sha=$BRANCH_SHA"
-
 # ── Step 4b: Already-merged detection ────────────────────────────────────────
 # If the branch tip is already an ancestor of the rig's default branch, the
 # work has already been merged.  Re-spawning reviewers on merged work wastes
@@ -3072,11 +4451,13 @@ GATE_RUN_ID=$(bd -C "$GC_CITY" create \
 source_bead: $BEAD_ID
 author: $AUTHOR
 rig: $RIG
+branch: $BRANCH
 tier: $TIER
 required_reviewers: $REQUIRED_REVIEWERS
 branch_sha: $BRANCH_SHA
 marker_id: $MARKER_ID
-started_at: $NOW" \
+started_at: $NOW
+verdict_timeout_minutes: $VERDICT_TIMEOUT_MINUTES" \
   --json 2>/dev/null | jq -r '.id // empty' || echo "")
 
 if [ -z "$GATE_RUN_ID" ]; then
@@ -3109,31 +4490,13 @@ REVIEWER_PEEK_BASELINE=()
 REVIEWER_ACKED=()
 
 # ── ga-zl277: guaranteed reviewer-session cleanup on EVERY exit path ───────────
-# Reviewer sessions used to be closed ONLY at Step 9 (the success/timeout path).
-# A mid-loop spawn-abort (the `exit 1` in the spawn loop below) or any signal/
-# timeout kill of the dispatcher left already-spawned reviewer sessions ASLEEP
-# and never closed. They pile up against the gate-reviewer template's
-# max_active_sessions=6 budget until the gate can no longer spawn 3 reviewers
-# (vicious cycle). This EXIT/signal trap closes whatever is in SESSION_IDS
-# exactly once, from one place, so every abort path frees its cap slots.
-# (SIGKILL/OOM cannot be trapped — the Step 0a-2 startup janitor backstops those.)
+# cleanup_reviewer_sessions() itself is now hoisted (before Phase C, ga-eqjo) so
+# a Phase-C-only sweep — one that finalizes an earlier run but claims NO new
+# marker, so this Step 7 never executes — still has it defined when
+# gate_finalize_run's Step 9 calls it. Reset the dedup flag here, fresh, for
+# THIS claim's own cleanup lifecycle: Phase C (just above, same sweep) may have
+# already driven it to 1 while finalizing a DIFFERENT, earlier-claimed run.
 _gate_cleanup_done=0
-cleanup_reviewer_sessions() {
-  [ "$_gate_cleanup_done" = "1" ] && return 0
-  _gate_cleanup_done=1
-  if [ "${#SESSION_IDS[@]}" -gt 0 ]; then
-    for _SID in "${SESSION_IDS[@]}"; do
-      [ -z "$_SID" ] && continue
-      gc --city "$GC_CITY" session close "$_SID" 2>/dev/null || true
-    done
-    log "Reviewer sessions closed (cleanup): ${SESSION_IDS[*]}"
-  fi
-  # This EXIT trap REPLACES the early '_release_gate_lock' trap installed at sweep
-  # start, so release the single-instance lock from here too — otherwise the lock
-  # would leak until GATE_LOCK_MAX_AGE on every run that reaches Step 7. Token-
-  # guarded + idempotent → a no-op when GATE_LOCK_ENABLED=0 or we don't own it.
-  _release_gate_lock 2>/dev/null || true
-}
 trap cleanup_reviewer_sessions EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
@@ -3534,1193 +4897,51 @@ for k in "${!VERDICT_BEAD_IDS[@]}"; do
   fi
 done
 
-log "Waiting for verdicts (timeout=${VERDICT_TIMEOUT_MINUTES}m, poll=${VERDICT_POLL_INTERVAL}s) ..."
+log "Verdicts requested (timeout=${VERDICT_TIMEOUT_MINUTES}m) — checking once now; if incomplete, a future sweep's Phase C finalizes (ga-eqjo, no longer blocking here)."
 
-# ── Step 8: Poll for verdicts ─────────────────────────────────────────────────
+# ── Step 8 (ga-eqjo): non-blocking verdict check — replaces the historical
+# `while true; do ...; sleep 30; done` blocking poll. That loop held the
+# single-instance lock (and this whole process) for the ENTIRE review wait —
+# 90%+ of a run's wall time (4-26min observed) — even though nothing in the
+# wait touches shared state. This is the actual fix for ga-eqjo: check ONCE,
+# non-blocking; if the run already finished (rare — a near-instant review),
+# finalize it right here in the same process (identical behavior to before,
+# just via gate_finalize_run instead of inline Steps 9-11). Otherwise, exit
+# immediately, leaving the reviewers running unsupervised (Phase B) — a LATER
+# sweep's Phase C (near the top of this file) checks back and finalizes once
+# complete, or once the run's own persisted timeout elapses. This is what
+# lets the single-instance lock be held for only ~65-95s (claim+spawn)
+# instead of the full review wait, so multiple runs can be genuinely in
+# flight at once (ceiling=3 headroom, ga-cw4pm, finally reachable).
 
-VERDICT_TIMEOUT_SECS=$((VERDICT_TIMEOUT_MINUTES * 60))
-WAIT_START=$(date +%s)
-ALL_VERDICTS_IN=0
 OVERALL_VERDICT="PASS"
 FAIL_REASONS=""
-# ga-x3nmz: quota-stop re-queue state. QUOTA_REQUEUE flips to 1 when a stall/
-# timeout coincides with an exhausted Claude 5h window; the post-poll handler
-# then re-queues the marker instead of FAILing. The 5h-quota check is memoized
-# to at most ONCE per poll (POLL_QUOTA_CHECKED) and only run on the rare
-# timeout/dead-slot paths, so it never adds per-poll cost on the happy path.
+# ga-eqjo (code-review fix): QUOTA_REQUEUE is a plain script-global gate_finalize_run
+# checks FIRST, before OVERALL_VERDICT. Phase C (above) may have already set it to 1
+# while finalizing a DIFFERENT, earlier-in-this-sweep run bead and never reset it
+# afterward — without this reset, that stale 1 would make gate_finalize_run silently
+# discard THIS run's real, just-computed verdict as a false quota-stop re-queue.
+# REQUEUE_REASON gets the same treatment: a stale "dead-reviewer" reason left
+# by an earlier Phase-C-processed run would otherwise mislabel THIS run's own
+# (unrelated) quota-stop re-queue, if it ever hits one.
 QUOTA_REQUEUE=0
-POLL_QUOTA_CHECKED=0
-POLL_QUOTA_LIMITED=0
+REQUEUE_REASON="quota"
+gate_collect_verdicts
 
-while true; do
-  NOW_EPOCH=$(date +%s)
-  ELAPSED=$((NOW_EPOCH - WAIT_START))
-  POLL_QUOTA_CHECKED=0   # ga-x3nmz: re-arm the per-poll quota memo each iteration
-  # ── ga-T1 #1 (ship-blocker): refresh the single-instance heartbeat every poll.
-  # The verdict wait can legitimately run to VERDICT_TIMEOUT (~22m) + ACK/preamble,
-  # and a 1846s real sweep has been observed > MAX_AGE (1800s). Without a refresh
-  # the hb mtime ages past MAX_AGE mid-sweep and a second launchd fire FALSE-
-  # RECLAIMS the lock → two concurrent sweeps. Stamping it at the TOP of every
-  # poll iteration keeps a LIVE holder fresh for the whole wait, so MAX_AGE only
-  # ever reclaims a TRULY dead holder (the refresh stops the instant we die).
-  if [ "$GATE_LOCK_ENABLED" = "1" ]; then _gate_lock_write_hb; fi
-
-  if [ "$ELAPSED" -gt "$VERDICT_TIMEOUT_SECS" ]; then
-    # ── ga-x3nmz: a timeout that coincides with an EXHAUSTED Claude 5h quota is a
-    # QUOTA-STOP (the reviewer's session died on "you've hit your session limit"),
-    # NOT a logic FAIL. Re-queue the marker so the next sweep re-runs the gate
-    # post-reset rather than false-FAILing a good branch. (Pending verdict beads
-    # are parked + the marker re-queued by the post-poll QUOTA_REQUEUE handler.)
-    if [ "$POLL_QUOTA_CHECKED" != "1" ]; then POLL_QUOTA_LIMITED=$(gate_quota_limited); POLL_QUOTA_CHECKED=1; fi
-    if [ "$(gate_quota_stop_verdict "$POLL_QUOTA_LIMITED")" = "requeue" ]; then
-      QUOTA_REQUEUE=1
-      warn "Verdict timeout after ${ELAPSED}s BUT Claude 5h quota is LIMITED — quota-stop: re-queuing marker $MARKER_ID for re-run post-reset (NOT a FAIL) (ga-x3nmz)."
-      break
-    fi
-    warn "Verdict timeout after ${ELAPSED}s (limit=${VERDICT_TIMEOUT_SECS}s). Treating as FAIL."
-    OVERALL_VERDICT="FAIL"
-    FAIL_REASONS="TIMEOUT: reviewers did not submit verdicts within ${VERDICT_TIMEOUT_MINUTES} minutes."
-    # Close any remaining pending verdict beads as timed-out
-    for VB in "${VERDICT_BEAD_IDS[@]}"; do
-      VB_STATUS=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null \
-        | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
-      if [ "$VB_STATUS" != "closed" ]; then
-        bd -C "$GC_CITY" label remove "$VB" "verdict:pending" -q 2>/dev/null || true
-        bd -C "$GC_CITY" label add    "$VB" "verdict:TIMEOUT" -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$VB" "VERDICT: TIMEOUT — reviewer session did not complete within ${VERDICT_TIMEOUT_MINUTES}m" 2>/dev/null || true
-        bd -C "$GC_CITY" close "$VB" 2>/dev/null || true
-      fi
-    done
-    break
-  fi
-
-  VERDICTS_RECEIVED=0
-  ANY_FAIL=0
-
-  # ── ga-4u16h: snapshot reviewer-session liveness ONCE per poll (cheap) so each
-  # still-pending slot can be checked for a DEAD session without N list calls.
-  # Fail-safe: if the list call fails or is unparseable, RECONVENE_LIST_OK stays 0
-  # and NO slot is re-convened this poll (a transient list glitch must never
-  # re-spawn a live reviewer). Skipped entirely when the feature is disabled.
-  RECONVENE_LIST_OK=0
-  RECONVENE_SESS_JSON=""
-  if [ "$MAX_RESPAWNS_PER_SLOT" -gt 0 ]; then
-    RECONVENE_SESS_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "")
-    if [ -n "$RECONVENE_SESS_JSON" ] && echo "$RECONVENE_SESS_JSON" \
-         | jq -e 'if type=="array" then true else has("sessions") end' >/dev/null 2>&1; then
-      RECONVENE_LIST_OK=1
-    fi
-  fi
-
-  for j in "${!VERDICT_BEAD_IDS[@]}"; do
-    VB="${VERDICT_BEAD_IDS[$j]}"
-    VB_JSON=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null || echo "[]")
-    VB_STATUS=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .status // "open"')
-    VB_LABELS=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")')
-
-    if [ "$VB_STATUS" = "closed" ]; then
-      VERDICTS_RECEIVED=$((VERDICTS_RECEIVED + 1))
-      if echo "$VB_LABELS" | grep -q "verdict:PASS"; then
-        : # explicit PASS — continue
-      elif echo "$VB_LABELS" | grep -q "verdict:FAIL"; then
-        ANY_FAIL=1
-        # Collect the fail reason from the reviewer's verdict comment.
-        # NOTE (ga-kf0v): the beads "bd comments --json" schema uses .text
-        # (keys: author, created_at, id, issue_id, text) — there is NO .body
-        # field. The old accessor read .[0].body, so jq always fell through to
-        # the "No reason provided" default and EVERY genuine reviewer FAIL lost
-        # its reason. Parse .text (with .body kept as a defensive fallback for
-        # any future schema drift), preferring the comment that starts with
-        # "VERDICT:" (the reviewer convention), else the first non-empty one.
-        VB_COMMENTS_JSON=$(bd -C "$GC_CITY" comments "$VB" --json 2>/dev/null || echo "[]")
-        FAIL_COMMENT=$(printf '%s' "$VB_COMMENTS_JSON" | jq -r '
-            [ .[]? | (.text // .body // "") ]
-            | ( map(select(test("^\\s*VERDICT:"; "i"))) | last )
-              // ( map(select(. != "")) | first )
-              // ""
-          ' 2>/dev/null || echo "")
-        # FORENSICS (ga-kf0v #3): always log the raw comments + verdict labels
-        # for a FAIL so any future schema/field drift is visible in the
-        # dispatcher log without re-deriving from beads.
-        log "  FAIL forensics reviewer $((j+1)) bead=$VB labels=[$VB_LABELS] raw_comments=$(printf '%s' "$VB_COMMENTS_JSON" | jq -c . 2>/dev/null | cut -c1-2000)"
-        if [ -z "$FAIL_COMMENT" ]; then
-          # Reviewer closed verdict:FAIL but left no parseable reason. Now rare
-          # (the .text fix above resolves the common case). Fail-safe: PASS is
-          # the only acceptable verdict, so an empty-reason FAIL still blocks
-          # the merge — but mark it INCONCLUSIVE and warn loudly so it is
-          # distinguishable from a substantive FAIL. (Full per-reviewer session
-          # re-run retry per ga-kf0v #2 is deliberately deferred: re-dispatching
-          # a reviewer mid-collection is higher-risk than this lane:small fix
-          # warrants; making the empty case visible addresses the intent without
-          # destabilising the gate's verdict-collection loop.)
-          warn "Reviewer $((j+1)) (bead $VB) closed verdict:FAIL with no parseable reason — counting as INCONCLUSIVE FAIL (fail-safe)."
-          FAIL_COMMENT="INCONCLUSIVE — verdict:FAIL with empty/unparseable reason (raw bead $VB; see forensics log above)"
-        fi
-        FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) FAIL: $FAIL_COMMENT\n"
-      else
-        # ga-86l90a8 (thies): the reviewer writes `label add verdict:PASS` THEN
-        # `comment "VERDICT: PASS"` THEN closes the bead (Step "If PASS" ~L2284).
-        # If the label-add raced / didn't commit before the close but the PASS
-        # COMMENT landed, the label-only check above loses a GENUINE pass and
-        # false-FAILs clean code ("verdict bead closed without explicit PASS").
-        # Rescue it the same way FAIL reasons are read: parse the verdict COMMENT
-        # (.text) and accept ONLY an unambiguous, anchored "VERDICT: PASS" —
-        # anything else still FAILs, so the fail-safe (PASS is the ONLY acceptable
-        # verdict) is fully preserved. A jq glitch leaves PASS_COMMENT empty →
-        # falls through to the existing FAIL path (no regression).
-        VB_COMMENTS_JSON=$(bd -C "$GC_CITY" comments "$VB" --json 2>/dev/null || echo "[]")
-        PASS_COMMENT=$(printf '%s' "$VB_COMMENTS_JSON" | jq -r '
-            [ .[]? | (.text // .body // "") ]
-            | map(select(test("^\\s*VERDICT:\\s*PASS\\b"; "i")))
-            | last // ""
-          ' 2>/dev/null || echo "")
-        if [ -n "$PASS_COMMENT" ]; then
-          VERDICTS_RECEIVED=$VERDICTS_RECEIVED  # already counted at the closed branch
-          log "  Reviewer $((j+1)) (bead $VB) closed WITHOUT a verdict:PASS label but its verdict COMMENT is an explicit PASS — rescuing as PASS (ga-86l90a8 label-race). comment=$(printf '%s' "$PASS_COMMENT" | tr '\n' ' ' | cut -c1-200)"
-          : # treat as PASS — do NOT set ANY_FAIL
-        else
-          # Any other label (TIMEOUT, ABORTED, or missing verdict label) → FAIL.
-          # PASS is the ONLY acceptable verdict; anything else blocks the merge.
-          ANY_FAIL=1
-          VERDICT_LABEL=$(echo "$VB_LABELS" | tr ' ' '\n' | grep "^verdict:" | head -1 || echo "no-verdict-label")
-          FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) ${VERDICT_LABEL}: verdict bead closed without explicit PASS (no verdict:PASS label and no explicit PASS comment).\n"
-        fi
-      fi
-    else
-      # ── ga-4u16h: verdict bead still pending. If this slot's reviewer SESSION
-      # is DEAD (Dolt reset killed it), re-convene a fresh reviewer for THIS slot
-      # rather than waiting the full outer timeout and counting it a false FAIL.
-      # Conservative gating (all must hold): re-convene is enabled, the session
-      # list call succeeded this poll, the slot is past its grace window, the
-      # session reads DEAD for RECONVENE_DEAD_STREAK_MIN consecutive polls, and
-      # respawn budget remains. A live-but-slow reviewer (present + not closed,
-      # incl. `asleep`) is never re-convened.
-      if [ "$MAX_RESPAWNS_PER_SLOT" -gt 0 ] && [ "$RECONVENE_LIST_OK" = "1" ]; then
-        _sid="${SESSION_IDS[$j]}"
-        _spawn_age=$(( NOW_EPOCH - ${SLOT_SPAWN_EPOCH[$j]:-$NOW_EPOCH} ))
-        _present_n=$(echo "$RECONVENE_SESS_JSON" \
-          | jq -r --arg s "$_sid" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | length' 2>/dev/null || echo 1)
-        case "$_present_n" in ''|*[!0-9]*) _present_n=1 ;; esac
-        if [ "$_present_n" -ge 1 ]; then
-          _present_flag=1
-          _closed_flag=$(echo "$RECONVENE_SESS_JSON" \
-            | jq -r --arg s "$_sid" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | .[0].closed // false' 2>/dev/null || echo false)
-          # ga-flfo: fetch state too so the reconvene loop can tell a booting
-          # slot (state=creating) apart from a dead one — see session_is_booting().
-          _state_flag=$(echo "$RECONVENE_SESS_JSON" \
-            | jq -r --arg s "$_sid" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | .[0].state // ""' 2>/dev/null || echo "")
-        else
-          _present_flag=0
-          _closed_flag=false
-          _state_flag=""
-        fi
-        _dead=$(session_is_dead "$_present_flag" "$_closed_flag")
-        _booting=$(session_is_booting "$_state_flag")
-        # ── ga-mepb0: late-ACK re-check + boot-wedge deadness ───────────────────
-        # A reviewer wedged at boot (gc prime hung on the Dolt circuit-breaker) is
-        # present + asleep (session_is_dead=0) but never ACKs, so the session-only
-        # liveness gate above left it for the 45m outer timeout to fail — bouncing
-        # a GOOD branch on INFRA. Treat a never-ACKed slot as effectively dead so
-        # it is re-convened in <grace+streak. BUT re-check for LATE life first so a
-        # slow-but-alive reviewer is NEVER killed:
-        #   strong: its verdict bead already dropped verdict:pending — reuse the
-        #           VB_LABELS fetched above, so NO extra bd call; OR
-        #   soft:   its session produced new terminal output since the baseline.
-        # Both checks are skipped once the slot has ACKed (cheap; bounded to the
-        # wedged-looking window only).
-        if [ "${REVIEWER_ACKED[$j]:-0}" != "1" ]; then
-          if ! echo "$VB_LABELS" | grep -q "verdict:pending"; then
-            REVIEWER_ACKED[$j]=1
-            log "  Late ACK (verdict-progressed): reviewer $((j+1)) session=${_sid} bead=$VB"
-          else
-            _peek_now=$(gc --city "$GC_CITY" session peek "$_sid" --lines 40 2>/dev/null | cksum 2>/dev/null | awk '{print $1}' || echo "")
-            if [ -n "$_peek_now" ] && [ "$_peek_now" != "${REVIEWER_PEEK_BASELINE[$j]:-}" ]; then
-              REVIEWER_ACKED[$j]=1
-              log "  Late ACK (session-alive): reviewer $((j+1)) session=${_sid}"
-            fi
-          fi
-        fi
-        # ── ga-h9o17: drained-but-listed reviewer probe ─────────────────────────
-        # session_is_dead is LIST-only and slot_effectively_dead only adds the ACK
-        # signal — neither catches a reviewer that DRAINED after ACKing: it stays
-        # listed + not-closed (_dead=0) and acked=1, so _eff_dead=0 and its pending
-        # verdict waits the full outer timeout (false-FAIL of a good branch). When
-        # the list still says ALIVE but the slot is past its grace window and still
-        # pending, ask `gc session peek`: a drained/ended session answers
-        # "session not found" on STDERR (exit!=0, stdout empty); a real asleep
-        # reviewer answers with stdout output. Bounded to exactly that suspicious
-        # window — one cheap peek per still-pending, past-grace, list-alive slot per
-        # poll — and skipped while _dead already=1 (the list already settled it).
-        # 2>&1 >/dev/null routes ONLY stderr into the capture (stdout → /dev/null),
-        # so a live reviewer's scrollback can never false-trigger the not-found match.
-        _peek_dead=0
-        # ga-flfo: skip the probe entirely while booting — a session with no
-        # runtime yet will ALWAYS peek "session not found", so running it here
-        # would just log a misleading "Drained reviewer detected" for a slot
-        # that never lived in the first place. The _eff_dead override below is
-        # the actual guard; this is purely to keep the log honest and skip a
-        # wasted `gc session peek` call.
-        if [ "$_dead" = "0" ] && [ "$_booting" != "1" ] && [ "$_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
-          _peek_stderr=$(gc --city "$GC_CITY" session peek "$_sid" --lines 5 2>&1 >/dev/null || true)
-          _peek_dead=$(session_peek_reports_dead "$_peek_stderr")
-          if [ "$_peek_dead" = "1" ]; then
-            log "  Drained reviewer detected (ga-h9o17): slot $j session=${_sid} listed+not-closed but peek reports session-gone; treating as DEAD (verdict bead ${VERDICT_BEAD_IDS[$j]} still pending)."
-          fi
-        elif [ "$_booting" = "1" ]; then
-          log "  Slot $j session=${_sid} still booting (state=creating, spawn_age=${_spawn_age}s) — not dead, skipping deadness probes (ga-flfo)."
-        fi
-        _eff_dead=$(slot_effectively_dead "$_dead" "${REVIEWER_ACKED[$j]:-0}")
-        # ga-h9o17: fold the peek-confirmed drained signal into deadness. The grace
-        # + dead-streak guards below still apply unchanged, so a single transient
-        # not-found cannot reap a live reviewer (it must read drained for
-        # RECONVENE_DEAD_STREAK_MIN consecutive polls past grace).
-        [ "$_peek_dead" = "1" ] && _eff_dead=1
-        # ── ga-q8tmn: frozen-reviewer staleness probe ───────────────────────────
-        # session_is_dead (list-only), the ACK fold (slot_effectively_dead), AND the
-        # ga-h9o17 drained-peek probe ALL read a WEDGED reviewer as alive: when Claude
-        # freezes mid-review (it hit a quota/credit limit) the session stays present +
-        # not-closed (_dead=0), it already ACKed, and `gc session peek` SUCCEEDS with
-        # real scrollback (_peek_dead=0) — so its pending verdict waited the full 45m
-        # outer timeout and false-FAILed a good branch (observed live 2026-06-10: 3
-        # reviewers froze, gate stalled 37m until the Mayor killed them by hand). The
-        # signal the others lack is the session's own activity clock: a frozen Claude
-        # emits NO terminal output, so its last_active — already in the session-list
-        # JSON we fetched this poll (zero extra I/O) — stops advancing, while a working
-        # reviewer refreshes it on every tool call. Treat a slot whose last_active is
-        # ≥ REVIEWER_STALE_SECS old as DEAD. Bounded to the SAME suspicious window as
-        # the peek probe (list-alive + peek-alive + past-grace) and skipped entirely
-        # when disabled (REVIEWER_STALE_SECS=0); fail-open on any missing/unparseable/
-        # future timestamp; the grace + dead-streak guards below stay the backstops, so
-        # one stale read can never reap a live reviewer.
-        _stale_dead=0
-        # ga-evjs2: use the diff-scaled staleness window (bigger diff → longer legit
-        # silence) instead of the fixed base, falling back to the base for any path
-        # that did not compute it. The disable-gate stays on the BASE knob (0=off).
-        _stale_thresh="${REVIEWER_STALE_SECS_SCALED:-$REVIEWER_STALE_SECS}"
-        if [ "$REVIEWER_STALE_SECS" != "0" ] && [ "$_dead" = "0" ] && [ "$_peek_dead" = "0" ] && [ "$_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
-          _last_active=$(echo "$RECONVENE_SESS_JSON" \
-            | jq -r --arg s "$_sid" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | .[0].last_active // ""' 2>/dev/null || echo "")
-          _stale_dead=$(reviewer_last_active_stale "$_last_active" "$NOW_EPOCH" "$_stale_thresh")
-          if [ "$_stale_dead" = "1" ]; then
-            log "  Frozen reviewer detected (ga-q8tmn): slot $j session=${_sid} listed+not-closed+peek-alive but last_active=${_last_active} is ≥${_stale_thresh}s stale (diff-scaled, ga-evjs2) with verdict bead ${VERDICT_BEAD_IDS[$j]} still pending; treating as DEAD (Claude wedged/quota)."
-          fi
-        fi
-        # ga-q8tmn: fold the staleness-confirmed frozen signal into deadness, exactly
-        # like the ga-h9o17 peek signal — the grace + dead-streak guards below still
-        # apply unchanged, so a single stale read cannot reap a live reviewer.
-        [ "$_stale_dead" = "1" ] && _eff_dead=1
-        # ga-flfo: catch-all override — a booting slot (state=creating) is never
-        # effectively dead, no matter which probe above would otherwise have said
-        # so. The ACK-fold in slot_effectively_dead() alone already reads a
-        # booting session as dead (present + never-acked is indistinguishable
-        # from ga-mepb0's boot-wedge signature), so gating only the peek probe
-        # above is not sufficient — this final override is the actual fix. Placed
-        # last so it wins regardless of which upstream probe fired.
-        [ "$_booting" = "1" ] && _eff_dead=0
-        # Grace gate: never call a freshly-(re)spawned reviewer dead too early.
-        if [ "$_eff_dead" = "1" ] && [ "$_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
-          SLOT_DEAD_STREAK[$j]=$(( ${SLOT_DEAD_STREAK[$j]:-0} + 1 ))
-        else
-          SLOT_DEAD_STREAK[$j]=0
-        fi
-        _confirmed_dead=0
-        if [ "$_eff_dead" = "1" ] && [ "${SLOT_DEAD_STREAK[$j]:-0}" -ge "$RECONVENE_DEAD_STREAK_MIN" ]; then
-          _confirmed_dead=1
-        fi
-        _action=$(classify_slot_action 0 "$_confirmed_dead" "${RESPAWN_BUDGET[$j]:-0}")
-        if [ "$_action" = "respawn" ]; then
-          # ── ga-x3nmz: quota-stop short-circuit ──────────────────────────────
-          # A slot that is dead because Claude's 5h quota is exhausted will die
-          # the instant it is respawned (and so will every sibling) — respawning
-          # only burns the budget, then the 45m timeout false-FAILs a GOOD branch.
-          # If the window is exhausted RIGHT NOW, stop: flag a quota-stop and let
-          # the post-poll handler re-queue the whole marker for a clean re-run
-          # post-reset. Quota is probed at most once per poll (memoized) and only
-          # on this already-rare dead-slot path.
-          if [ "$POLL_QUOTA_CHECKED" != "1" ]; then POLL_QUOTA_LIMITED=$(gate_quota_limited); POLL_QUOTA_CHECKED=1; fi
-          if [ "$(gate_quota_stop_verdict "$POLL_QUOTA_LIMITED")" = "requeue" ]; then
-            QUOTA_REQUEUE=1
-            warn "Reviewer slot $j is dead AND Claude 5h quota is LIMITED — quota-stop: re-queuing marker $MARKER_ID instead of a futile respawn (ga-x3nmz)."
-            break
-          fi
-          RESPAWN_BUDGET[$j]=$(( ${RESPAWN_BUDGET[$j]:-0} - 1 ))
-          _respawn_k=$(( MAX_RESPAWNS_PER_SLOT - ${RESPAWN_BUDGET[$j]} ))
-          # ga-mepb0: name the deadness cause so a boot-wedge (false-FAIL root) is
-          # distinguishable from a Dolt-killed session in the gate log.
-          if [ "$_dead" = "1" ]; then _dead_reason="session dead"
-          elif [ "${_peek_dead:-0}" = "1" ]; then _dead_reason="drained (listed+not-closed but peek session-gone — ga-h9o17)"
-          elif [ "${_stale_dead:-0}" = "1" ]; then _dead_reason="frozen (listed+peek-alive but last_active ≥${_stale_thresh:-$REVIEWER_STALE_SECS}s stale, diff-scaled ga-evjs2 — Claude wedged/quota, ga-q8tmn)"
-          else _dead_reason="boot-wedged (present but never ACKed — gc prime/Dolt stall)"; fi
-          log "Re-convening dead reviewer slot $j (respawn ${_respawn_k}/${MAX_RESPAWNS_PER_SLOT}) — session ${SESSION_IDS[$j]} ${_dead_reason}, verdict bead ${VERDICT_BEAD_IDS[$j]} still pending."
-          SLOT_SPAWN_EPOCH[$j]="$NOW_EPOCH"   # reset this slot's grace clock
-          SLOT_DEAD_STREAK[$j]=0
-          respawn_reviewer_slot "$j" || true
-        fi
-      fi
-    fi
-  done
-
-  # ga-x3nmz: a quota-stop tripped at the respawn gate this poll → leave the
-  # poll loop now; the post-poll handler re-queues the marker (never FAIL).
-  if [ "$QUOTA_REQUEUE" = "1" ]; then break; fi
-
-  log "  Verdicts: $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS received (elapsed: ${ELAPSED}s)"
-
-  if [ "$VERDICTS_RECEIVED" -eq "$REQUIRED_REVIEWERS" ]; then
-    ALL_VERDICTS_IN=1
-    if [ "$ANY_FAIL" = "1" ]; then
-      OVERALL_VERDICT="FAIL"
-    fi
-    break
-  fi
-
-  # GATE-HANG FIX (2026-06-24): touch the heartbeat each poll iteration so a long
-  # legit review (scaled up to VERDICT_TIMEOUT_MAX ~50min) doesn't go heartbeat-stale
-  # and trip the DPW's 600s wedge-kickstart — which would KILL the in-flight review.
-  touch "$LOG_DIR/quality-gate-dispatcher.heartbeat" 2>/dev/null || true
-  sleep "$VERDICT_POLL_INTERVAL"
-done
-
-log "Verdict collection complete: OVERALL=$OVERALL_VERDICT"
-
-# ── Step 9: Close reviewer sessions ──────────────────────────────────────────
-# Close promptly here (before the Step 10 merge) to free the gate-reviewer cap
-# slots ASAP. The EXIT trap (ga-zl277) is the safety net for every abort path
-# that never reaches this line; the shared idempotent helper makes the trap a
-# no-op once this has run.
-cleanup_reviewer_sessions
-
-# ── Step 10: Act on verdict ───────────────────────────────────────────────────
-
-GATE_END_EPOCH=$(date +%s)
-ELAPSED_S=$((GATE_END_EPOCH - GATE_START_EPOCH))
-
-# ── ga-x3nmz: QUOTA-STOP re-queue — never false-FAIL on an exhausted 5h window ─
-# A timeout or dead reviewer slot that coincided with an exhausted Claude 5h
-# quota is a quota-stop, not a logic failure. Re-queue the marker (back to
-# gate-status:queued) so the next sweep re-runs the gate; the ga-cw4pm headroom
-# gate holds it deferred until the window resets, giving automatic resume (AC3).
-# Park any still-pending verdict beads as REQUEUED (not TIMEOUT) so they neither
-# orphan nor read as a FAIL, and the re-run mints fresh ones. Clear notify + ETA
-# (AC4). This branch is mutually exclusive with the PASS/FAIL paths below.
-if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
-  _eta=$(quota_reset_eta)
-  log "QUOTA-STOP (ga-x3nmz): marker $MARKER_ID re-queued — Claude 5h quota exhausted mid-review; gate re-runs automatically post-reset${_eta:+ ($_eta)}. This is NOT a FAIL."
-  # Park pending verdict beads as REQUEUED so they don't orphan or count as FAIL.
-  for VB in "${VERDICT_BEAD_IDS[@]}"; do
-    VB_STATUS=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null \
-      | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
-    if [ "$VB_STATUS" != "closed" ]; then
-      bd -C "$GC_CITY" label remove "$VB" "verdict:pending" -q 2>/dev/null || true
-      bd -C "$GC_CITY" label add    "$VB" "verdict:REQUEUED" -q 2>/dev/null || true
-      bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (ga-x3nmz) — reviewer session ended on an exhausted Claude 5h quota (quota-stop, NOT a code FAIL). Marker re-queued for re-run post-reset${_eta:+ ($_eta)}." 2>/dev/null || true
-      bd -C "$GC_CITY" close "$VB" 2>/dev/null || true
-    fi
-  done
-  # Re-queue the marker (reverse of the atomic claim): dispatching → queued.
-  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
-  bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:queued"      -q 2>/dev/null || true
-  bd -C "$GC_CITY" comment "$MARKER_ID" "QUOTA-STOP re-queue (ga-x3nmz): reviewer(s) stalled because Claude's 5h session quota is exhausted — a quota-stop, NOT a code FAIL. Marker re-queued; the ga-cw4pm headroom gate holds it deferred until the window resets${_eta:+ ($_eta)}, then the gate re-runs with fresh reviewers." 2>/dev/null || true
-  if [ "$GATE_RUN_ID" != "unknown" ]; then
-    bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run paused (quota-stop, ga-x3nmz): Claude 5h quota exhausted mid-review; marker $MARKER_ID re-queued for re-run post-reset${_eta:+ ($_eta)}. No verdict recorded; this is NOT a FAIL." 2>/dev/null || true
-  fi
-  notify -t "⏸️ Gate pausado: cota 5h" -p 3 "Gate $BRANCH re-enfileirado — cota 5h do Claude esgotada (quota-stop, não é FAIL); retoma quando resetar${_eta:+ ($_eta)} (ga-x3nmz)." 2>/dev/null || true
-  exit 0
-fi
-
-if [ "$OVERALL_VERDICT" = "PASS" ]; then
-  log "ALL PASS — proceeding to merge branch $BRANCH → $DEFAULT_BRANCH ..."
-
-  if [ "$DRY_RUN" = "1" ]; then
-    log "DRY_RUN=1 — WOULD MERGE: git_rig push origin <branch_sha>:refs/heads/$DEFAULT_BRANCH (FF merge of $BRANCH)"
-    log "DRY_RUN=1 — WOULD CLOSE source bead $BEAD_ID"
-    MERGE_SHA="DRY_RUN_NO_MERGE"
-    MERGE_RESULT="dry_run"
-  else
-    # ── Container-rig direct merge ──────────────────────────────────────────
-    # For container rigs (bare .repo.git):
-    #   1. Rebase the branch onto origin/main (ensures clean FF merge)
-    #   2. Fast-forward main to the branch tip
-    #   3. Push main to origin
-    #
-    # For self-repo rigs (normal .git directory):
-    #   Use standard git commands via -C <rig_path>
-    #
-    # SECURITY NOTE: We do NOT use `git push --force`. This is a FF merge only.
-    # If FF fails (diverged history), we abort and report failure.
-
-    MERGE_SHA=""
-    MERGE_RESULT="failed"
-
-    # ── ga-3b8: Merge-time rebase+retry (starvation fix) ──────────────────────
-    # The review→merge window is the starvation attack surface: another rig merge
-    # can land between "reviewers PASS" and "push main".  We handle this by
-    # re-fetching at merge time and, if main moved, auto-rebasing the branch
-    # (conflict-free only) before the FF push.  If the FF push races again, we
-    # retry the whole rebase→push sequence up to MAX_MERGE_RETRIES times.
-    # Each attempt is fast (seconds), so 3 retries closes the window even on a
-    # very busy rig.
-    MAX_MERGE_RETRIES=3
-    MERGE_ATTEMPT=0
-
-    do_merge_ff() {
-      # Arguments: IS_CONTAINER_RIG, BRANCH, DEFAULT_BRANCH — all from outer scope.
-      # Returns: sets MERGE_SHA and MERGE_RESULT in outer scope.
-      # Strategy per attempt:
-      #   1. git fetch (get current remote state)
-      #   2. If main moved (branch no longer FF-able): auto-rebase if clean
-      #   3. FF push branch SHA to main
-      #   4. Verify landing
-
-      git_rig fetch origin 2>/dev/null || warn "Pre-merge fetch failed (attempt $((MERGE_ATTEMPT+1)))"
-      # ga-ljbx: hardened — resolve to REAL commit objects so a dangling ref
-      # surfaces as failed_sha_resolution (retryable) rather than poisoning the
-      # downstream merge-base/merge-tree with a non-existent SHA.
-      local CUR_MAIN
-      CUR_MAIN=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
-      local CUR_BRANCH
-      CUR_BRANCH=$(rig_resolve_commit "origin/$BRANCH")
-
-      if [ -z "$CUR_MAIN" ] || [ -z "$CUR_BRANCH" ]; then
-        MERGE_RESULT="failed_sha_resolution"
-        return 1
-      fi
-
-      local IS_ANC
-      IS_ANC=$(git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null && echo "yes" || echo "no")
-
-      if [ "$IS_ANC" != "yes" ]; then
-        # Main moved during review — attempt inline rebase before push
-        log "  Merge-time rebase: main moved to $CUR_MAIN after review; rebasing $BRANCH ..."
-        local TMP_MR_WT="/tmp/gc-gate-mr-retry-$$-${MERGE_ATTEMPT}"
-        local MR_OK=0
-
-        # ga-ljbx: deterministic conflict pre-check (git 2.54) — see
-        # rig_merge_has_conflict. An "err" verdict is treated as a transient
-        # resolution failure (retryable) rather than a phantom conflict.
-        local MR_BASE
-        MR_BASE=$(git_rig merge-base "origin/$BRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
-        local MR_CONFLICT=0
-        local MR_VERDICT
-        MR_VERDICT=$(rig_merge_has_conflict "origin/$DEFAULT_BRANCH" "origin/$BRANCH")
-        if [ "$MR_VERDICT" = "1" ]; then
-          MR_CONFLICT=1
-        elif [ "$MR_VERDICT" = "err" ]; then
-          err "  Merge-time conflict pre-check undeterminable (base=${MR_BASE:-none}) — treating as transient (attempt $((MERGE_ATTEMPT+1)))"
-          MERGE_RESULT="failed_sha_resolution"
-          return 1
-        fi
-
-        if [ "$MR_CONFLICT" = "1" ]; then
-          err "  Merge-time rebase: conflicts detected — cannot auto-rebase (attempt $((MERGE_ATTEMPT+1)))"
-          MERGE_RESULT="failed_merge_time_conflict"
-          return 1
-        fi
-
-        if [ "$IS_CONTAINER_RIG" = "1" ]; then
-          if git_rig worktree add "$TMP_MR_WT" "origin/$BRANCH" 2>/dev/null; then
-            git -C "$TMP_MR_WT" config user.email "gate-dispatcher@gascity.local" 2>/dev/null || true
-            git -C "$TMP_MR_WT" config user.name "Gate Dispatcher" 2>/dev/null || true
-            if git -C "$TMP_MR_WT" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
-              local NEW_TIP_MR
-              NEW_TIP_MR=$(git -C "$TMP_MR_WT" rev-parse HEAD 2>/dev/null || echo "")
-              if [ -n "$NEW_TIP_MR" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
-                MR_OK=1
-                log "  Merge-time rebase: pushed $BRANCH → $NEW_TIP_MR"
-              else
-                git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
-              fi
-            else
-              git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
-            fi
-            git_rig worktree remove "$TMP_MR_WT" --force 2>/dev/null || true
-          fi
-        else
-          if git -C "$GIT_DIR_PATH" worktree add "$TMP_MR_WT" "origin/$BRANCH" 2>/dev/null; then
-            git -C "$TMP_MR_WT" config user.email "gate-dispatcher@gascity.local" 2>/dev/null || true
-            git -C "$TMP_MR_WT" config user.name "Gate Dispatcher" 2>/dev/null || true
-            if git -C "$TMP_MR_WT" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
-              local NEW_TIP_MR_SR
-              NEW_TIP_MR_SR=$(git -C "$TMP_MR_WT" rev-parse HEAD 2>/dev/null || echo "")
-              if [ -n "$NEW_TIP_MR_SR" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
-                MR_OK=1
-                log "  Merge-time rebase (self-repo): pushed $BRANCH → $NEW_TIP_MR_SR"
-              else
-                git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
-              fi
-            else
-              git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
-            fi
-            git -C "$GIT_DIR_PATH" worktree remove "$TMP_MR_WT" --force 2>/dev/null || true
-          fi
-        fi
-
-        if [ "$MR_OK" != "1" ]; then
-          err "  Merge-time rebase: worktree/push failed (attempt $((MERGE_ATTEMPT+1)))"
-          MERGE_RESULT="failed_merge_time_rebase"
-          return 1
-        fi
-
-        # Re-fetch after rebase push (ga-ljbx: hardened resolution)
-        git_rig fetch origin 2>/dev/null || true
-        CUR_BRANCH=$(rig_resolve_commit "origin/$BRANCH")
-        CUR_MAIN=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
-        if [ -z "$CUR_BRANCH" ] || [ -z "$CUR_MAIN" ]; then
-          MERGE_RESULT="failed_sha_resolution"
-          return 1
-        fi
-        IS_ANC=$(git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null && echo "yes" || echo "no")
-
-        if [ "$IS_ANC" != "yes" ]; then
-          err "  Merge-time rebase: branch still not FF-able after rebase (main moved again?)"
-          MERGE_RESULT="failed_still_not_ff_after_rebase"
-          return 1
-        fi
-      fi
-
-      # FF push
-      if git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH" 2>/dev/null; then
-        git_rig fetch origin 2>/dev/null || warn "Post-FF-push fetch failed"
-        local POST_MAIN
-        POST_MAIN=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
-        if [ -n "$POST_MAIN" ] && git_rig merge-base --is-ancestor "$CUR_BRANCH" "$POST_MAIN" 2>/dev/null; then
-          MERGE_SHA="$CUR_BRANCH"
-          MERGE_RESULT="direct_ff"
-          log "FF merge + landing verified (attempt $((MERGE_ATTEMPT+1))): $BRANCH → $DEFAULT_BRANCH (sha=$MERGE_SHA, main=$POST_MAIN)"
-
-          # ── ga-eptel: durable rig-canonical landing + survival audit ─────────
-          # The FF push above advances the REMOTE (origin/$DEFAULT_BRANCH on
-          # GitHub), but for a CONTAINER rig `git_rig` targets the bare
-          # .repo.git — whose OWN local refs/heads/$DEFAULT_BRANCH is NOT touched
-          # by a push. Crew worktrees clone from that bare repo, so a stale local
-          # main makes a gate-verified merge "disappear" from the rig's canonical
-          # main even though it lives on GitHub. This is the root cause of
-          # ga-eptel: ps-l72n (305dd697c) and ga-i5vt (d3cafb679) were reported
-          # "FF merge + landing verified" yet vanished from the rig's main —
-          # because the bare local main was never advanced (verified live: both
-          # SHAs present on origin/main, absent from the bare .repo.git main).
-          #
-          # Fix: advance the bare local main to the merge SHA (FF-only — never
-          # rewrite history), then AUDIT survival by confirming the merge is an
-          # ancestor of BOTH the rig-canonical local main AND origin/main after a
-          # fresh fetch. If it vanished (e.g. a racing town-main push clobbered a
-          # shared remote), do NOT report success: return 1 so the caller
-          # degrades to gate-status:error and the source bead is re-enqueued, not
-          # closed. Self-repo rigs (wa, gascity) are unaffected and untouched —
-          # their deploy reads GitHub directly and they survived the audit (4/4).
-          if [ "$IS_CONTAINER_RIG" = "1" ]; then
-            local RESOLVED_MERGE LOCAL_MAIN AUDIT_LOCAL AUDIT_ORIGIN
-            RESOLVED_MERGE=$(rig_resolve_commit "$CUR_BRANCH")
-            if [ -z "$RESOLVED_MERGE" ]; then
-              err "  Durable-landing: merge SHA unresolvable post-push ($CUR_BRANCH)"
-              MERGE_RESULT="failed_durable_resolution"
-              return 1
-            fi
-            # ga-rstw5: track origin/$DEFAULT_BRANCH (the canonical durable line the
-            # FF push above just advanced — $RESOLVED_MERGE is verified an ancestor
-            # of it), NOT merely the merge SHA. FF when the bare ref is behind; when
-            # it has FORKED off origin (orphan commits — e.g. a decommission
-            # 'preserve' commit) RECONCILE to origin instead of false-FAILing the
-            # all-PASS verdict. The old FF-only-or-fail guard's failed_durable_not_ff
-            # burned a 2nd gate cycle + mailed crew a spurious FAIL the instant the
-            # bare mirror diverged. The survival audit below STILL re-verifies the
-            # merge in BOTH the rig-canonical local main AND origin, so a genuine
-            # clobber/orphan is still caught and re-enqueued (not closed).
-            DURABLE_RECON_OUT=""
-            DURABLE_RECON_RC=0
-            DURABLE_RECON_OUT=$(reconcile_bare_main_to_origin "$GIT_DIR_PATH" "$DEFAULT_BRANCH") || DURABLE_RECON_RC=$?
-            if [ "$DURABLE_RECON_RC" != "0" ]; then
-              err "  Durable-landing: bare $DEFAULT_BRANCH reconcile to origin FAILED ($DURABLE_RECON_OUT)"
-              MERGE_RESULT="failed_durable_updateref"
-              return 1
-            fi
-            log "  Durable-landing: bare $DEFAULT_BRANCH reconciled to origin ($DURABLE_RECON_OUT)"
-            # Survival audit: fresh fetch, then confirm the merge survives in BOTH
-            # the rig-canonical local main AND origin/main. A failure here means
-            # the merge was orphaned (shared-remote clobber or lost push) — fail
-            # so the bead is re-enqueued, not closed (ga-eptel audit-guard ask).
-            git_rig fetch origin 2>/dev/null || warn "  Durable-landing: audit re-fetch failed (continuing with stale refs)"
-            AUDIT_LOCAL=$(rig_resolve_commit "refs/heads/$DEFAULT_BRANCH")
-            if [ -z "$AUDIT_LOCAL" ] || ! git_rig merge-base --is-ancestor "$RESOLVED_MERGE" "$AUDIT_LOCAL" 2>/dev/null; then
-              err "  Durable-landing AUDIT FAILED: merge $RESOLVED_MERGE not in rig-canonical $DEFAULT_BRANCH (${AUDIT_LOCAL:-<unresolved>})"
-              MERGE_RESULT="failed_durable_audit_local"
-              return 1
-            fi
-            AUDIT_ORIGIN=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
-            if [ -z "$AUDIT_ORIGIN" ] || ! git_rig merge-base --is-ancestor "$RESOLVED_MERGE" "$AUDIT_ORIGIN" 2>/dev/null; then
-              err "  Durable-landing AUDIT FAILED: merge $RESOLVED_MERGE not in origin/$DEFAULT_BRANCH (${AUDIT_ORIGIN:-<unresolved>}) — possible shared-remote clobber"
-              MERGE_RESULT="failed_durable_audit_origin"
-              return 1
-            fi
-            log "  Durable-landing verified: merge $RESOLVED_MERGE is ancestor of BOTH rig-canonical $DEFAULT_BRANCH ($AUDIT_LOCAL) and origin ($AUDIT_ORIGIN)"
-          fi
-
-          return 0
-        else
-          err "Landing verification FAILED (attempt $((MERGE_ATTEMPT+1))): $CUR_BRANCH not in $DEFAULT_BRANCH ($POST_MAIN)"
-          MERGE_RESULT="failed_landing_not_verified"
-          return 1
-        fi
-      else
-        # FF push rejected: main moved between our rebase and push (race)
-        warn "  FF push rejected (attempt $((MERGE_ATTEMPT+1))) — main moved during push; will retry"
-        MERGE_RESULT="failed_push_race"
-        return 1
-      fi
-    }
-
-    while [ "$MERGE_ATTEMPT" -lt "$MAX_MERGE_RETRIES" ]; do
-      MERGE_ATTEMPT=$((MERGE_ATTEMPT + 1))
-      log "Merge attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES ..."
-      if do_merge_ff; then
-        break
-      fi
-      # Only retry on push-race or stale-after-rebase; give up on conflict/worktree failure
-      if [ "$MERGE_RESULT" = "failed_merge_time_conflict" ] || \
-         [ "$MERGE_RESULT" = "failed_merge_time_rebase" ] || \
-         [ "$MERGE_RESULT" = "failed_sha_resolution" ]; then
-        log "  Non-retryable failure ($MERGE_RESULT). Stopping retry loop."
-        break
-      fi
-      if [ "$MERGE_ATTEMPT" -lt "$MAX_MERGE_RETRIES" ]; then
-        log "  Retrying in 2s ..."
-        sleep 2
-      fi
-    done
-
-    if [[ "$MERGE_RESULT" = failed* ]]; then
-      # Merge failed despite all-PASS verdict — degrade to FAIL
-      OVERALL_VERDICT="FAIL"
-      FAIL_REASONS="Merge failed after all-PASS verdict. Merge result: $MERGE_RESULT. Check git state of rig $RIG."
-      warn "All-PASS verdict but merge failed ($MERGE_RESULT). Setting gate to failed."
-    fi
-
-    # ── ga-hawi: soft-reload immediately after merge ──────────────────────────
-    # Every gate merge bumps the template config hash (CopyFiles mtime changes).
-    # Without this, the session reconciler's next tick sees config drift and
-    # issues drain decisions against crew, even pinned ones (race window = 0..Ns
-    # until town-root-reconciler's poll).  --soft accepts the new hash in place;
-    # --async returns immediately so we don't block the gate.  Non-fatal if missing.
-    if [[ ! "$MERGE_RESULT" = failed* ]] && [ "$MERGE_RESULT" != "dry_run" ]; then
-      gc reload --soft --async 2>/dev/null \
-        && log "ga-hawi: soft-reload dispatched post-merge (config-drift guard for pinned crew)." \
-        || warn "ga-hawi: gc reload --soft --async failed (non-fatal; binary guard still active)."
-    fi
-
-    # ── Bug 1b: Post-merge diff-integrity verification (belt-and-suspenders) ──
-    # After a successful merge, verify the branch's changes are actually present
-    # in the merged main. This catches silent conflict resolutions where git
-    # resolved to main's side (dropping the fix entirely — as seen in wa-e99e).
-    #
-    # Strategy: fetch updated remote refs, then verify each file changed by the
-    # branch still has a non-empty diff vs what was in main BEFORE the merge.
-    # If any changed file regressed back to its pre-branch state, the merge
-    # silently dropped changes — revert and bounce to author.
-    if [[ ! "$MERGE_RESULT" = failed* ]] && [ "$MERGE_RESULT" != "dry_run" ]; then
-      log "Post-merge diff-integrity check (Bug 1b belt-and-suspenders) ..."
-      git_rig fetch origin 2>/dev/null || warn "Post-merge fetch failed; integrity check may use stale refs"
-
-      MERGED_HEAD=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
-      INTEGRITY_FAIL=0
-      INTEGRITY_MSG=""
-
-      if [ -n "$MERGED_HEAD" ] && [ -n "$BRANCH_SHA" ]; then
-        # For each file changed by the branch, compute:
-        #   diff_in_branch   = lines added/removed by branch vs its base (pre-branch main)
-        #   diff_in_merged   = what actually changed in merged main vs the original pre-merge main SHA
-        # If a file was changed by the branch but shows ZERO net change in the
-        # merged result vs pre-merge main, the fix was dropped.
-        PRE_MERGE_MAIN="${MAIN_HEAD_SHA}"
-        BRANCH_CHANGED_FILES=$(git_rig diff --name-only "${PRE_MERGE_MAIN}...origin/$BRANCH" 2>/dev/null || echo "")
-
-        if [ -n "$BRANCH_CHANGED_FILES" ] && [ -n "$PRE_MERGE_MAIN" ]; then
-          while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            # Lines the branch added in this file (vs pre-merge main)
-            # NOTE: `grep -c` ALREADY prints "0" on zero matches AND exits 1, so the old
-            # `|| echo "0"` appended a SECOND "0" → the var became "0\n0" (multiline) →
-            # the `[ "$X" -gt 0 ]` test below aborted the whole sweep under set -e
-            # ([: 0\n0: integer expression expected). `|| true` keeps grep's single "0"
-            # and neutralizes the exit code. Belt: strip to a bare integer.
-            BRANCH_ADDITIONS=$(git_rig diff "$PRE_MERGE_MAIN" "origin/$BRANCH" -- "$f" 2>/dev/null | grep -c "^+" || true)
-            BRANCH_ADDITIONS=$(printf '%s' "$BRANCH_ADDITIONS" | tr -dc '0-9'); BRANCH_ADDITIONS=${BRANCH_ADDITIONS:-0}
-            # Lines that actually made it into merged main (vs pre-merge main)
-            MERGED_ADDITIONS=$(git_rig diff "$PRE_MERGE_MAIN" "$MERGED_HEAD" -- "$f" 2>/dev/null | grep -c "^+" || true)
-            MERGED_ADDITIONS=$(printf '%s' "$MERGED_ADDITIONS" | tr -dc '0-9'); MERGED_ADDITIONS=${MERGED_ADDITIONS:-0}
-
-            # If branch added lines to a file but the merged result has ZERO
-            # additions relative to pre-merge main, the file was completely dropped.
-            if [ "$BRANCH_ADDITIONS" -gt 0 ] && [ "$MERGED_ADDITIONS" = "0" ]; then
-              INTEGRITY_FAIL=1
-              INTEGRITY_MSG="${INTEGRITY_MSG}File $f: branch had $BRANCH_ADDITIONS additions but merged main has 0 (DROPPED).\n"
-              log "  INTEGRITY FAIL: $f — branch additions not in merged main"
-            fi
-          done <<< "$BRANCH_CHANGED_FILES"
-        fi
-      fi
-
-      if [ "$INTEGRITY_FAIL" = "1" ]; then
-        warn "Post-merge integrity FAILED — merge silently dropped branch changes. Reverting."
-        # Revert the merge by resetting main back to pre-merge SHA
-        REVERT_OK=0
-        if [ -n "$MAIN_HEAD_SHA" ] && [ -n "$MERGED_HEAD" ] && [ "$MAIN_HEAD_SHA" != "$MERGED_HEAD" ]; then
-          if git_rig push origin "${MAIN_HEAD_SHA}:refs/heads/$DEFAULT_BRANCH" --force-with-lease 2>/dev/null; then
-            REVERT_OK=1
-            log "  Main reverted to pre-merge SHA $MAIN_HEAD_SHA (merge SHA $MERGED_HEAD removed)"
-          else
-            err "  Revert push failed. Main may be in corrupted state. Manual intervention required."
-          fi
-        fi
-
-        OVERALL_VERDICT="FAIL"
-        REVERT_STATUS=$([ "$REVERT_OK" = "1" ] && echo "REVERTED (main restored to $MAIN_HEAD_SHA)" || echo "REVERT FAILED — manual fix required")
-        FAIL_REASONS="Post-merge integrity check failed: merge silently dropped branch changes.
-Files with dropped changes:
-$(echo -e "$INTEGRITY_MSG")
-Revert status: $REVERT_STATUS
-Author must inspect conflict resolution and rebase + resubmit."
-
-        # Comment on the source bead explaining what happened
-        if [ -n "$BEAD_ID" ]; then
-          bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:integrity-fail" -q 2>/dev/null || true
-          bd -C "$BEAD_CITY" comment "$BEAD_ID" "GATE INTEGRITY FAIL: the merge of branch $BRANCH silently dropped your changes (conflict resolved to main's side).
-$(echo -e "$INTEGRITY_MSG")
-Revert: $REVERT_STATUS
-Action required: rebase $BRANCH onto current main, resolve conflicts explicitly, and re-submit via /gate-done." 2>/dev/null || true
-        fi
-
-        # wa-uthi: TERMINAL FAIL (merge reverted, definitive) — this push is KEPT.
-        notify -t "Quality Gate INTEGRITY FAIL" -p 4 "Branch $BRANCH merge dropped changes — reverted. Author: $AUTHOR" 2>/dev/null || true
-        log "Post-merge integrity FAILED: $INTEGRITY_MSG — merge reverted ($REVERT_STATUS)"
-      else
-        log "Post-merge integrity check PASSED — branch changes present in merged main."
-      fi
-    fi
-  fi
-
-  if [ "$OVERALL_VERDICT" = "PASS" ]; then
-    # ── ga-lzj2e: durable merge-survival ledger (async shared-remote defense) ──
-    # ga-eptel's inline durable-landing AUDIT (do_merge_ff) only catches an
-    # IN-FLIGHT clobber: by the time the gate exits, its audit window is closed.
-    # The gastown rig SHARES remote athosmartins/gastown.git with the town main,
-    # so a town-main push minutes/hours LATER can still orphan a just-merged
-    # gastown SHA on the shared remote — fully async, after the gate is gone.
-    # Record every CONTAINER-rig merge in a durable append-only ledger; the
-    # gate-merge-survival-sweep daemon periodically re-fetches and re-verifies
-    # each recent SHA is still an ancestor of origin/<default_branch>, then
-    # self-heals (FF-only re-push when safe) or escalates (divergent clobber).
-    # Container rigs only — a self-repo rig (wa, gascity) has no shared-remote
-    # clobber vector. FULLY GUARDED: a ledger failure must NEVER affect the gate
-    # outcome (every step `|| true` / non-fatal; runs only on a real merge SHA).
-    if [ "$DRY_RUN" != "1" ] && [ "${IS_CONTAINER_RIG:-0}" = "1" ] \
-       && printf '%s' "$MERGE_SHA" | grep -Eq '^[0-9a-f]{7,40}$'; then
-      SURVIVAL_LEDGER="$GC_CITY/.gc/merge-survival-ledger.jsonl"
-      mkdir -p "$GC_CITY/.gc" 2>/dev/null || true
-      LEDGER_LINE=$(jq -nc \
-        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        --arg rig "$RIG" --arg rig_path "$RIG_PATH" \
-        --arg default_branch "$DEFAULT_BRANCH" --arg branch "$BRANCH" \
-        --arg bead "${BEAD_ID:-}" --arg bead_city "${BEAD_CITY:-$GC_CITY}" \
-        --arg marker "${MARKER_ID:-}" --arg gate_run "${GATE_RUN_ID:-}" \
-        --arg merge_sha "$MERGE_SHA" \
-        '{ts:$ts,rig:$rig,rig_path:$rig_path,default_branch:$default_branch,branch:$branch,bead:$bead,bead_city:$bead_city,marker:$marker,gate_run:$gate_run,merge_sha:$merge_sha}' \
-        2>/dev/null || true)
-      if [ -n "$LEDGER_LINE" ]; then
-        printf '%s\n' "$LEDGER_LINE" >> "$SURVIVAL_LEDGER" 2>/dev/null \
-          && log "  Survival-ledger: recorded $RIG merge_sha=$MERGE_SHA (ga-lzj2e async-clobber defense)" \
-          || warn "  Survival-ledger: append failed (non-fatal)"
-      fi
-    fi
-
-    # Update markers and beads for success
-    set_gate_status "$MARKER_ID" "passed"
-    # ga-jhyu: CLOSE the marker at terminal (passed) so it is reaped, not left
-    # OPEN forever. Safe — no open-marker consumer scans gate-status:passed
-    # (gate-health-monitor.py only scans gate-status:error). Idempotent.
-    bd -C "$GC_CITY" close "$MARKER_ID" -r "Gate marker terminal: PASSED (branch $BRANCH merged sha=$MERGE_SHA). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
-
-    if [ "$GATE_RUN_ID" != "unknown" ]; then
-      set_gate_status "$GATE_RUN_ID" "passed"
-      bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate PASSED. Branch $BRANCH merged to $DEFAULT_BRANCH. SHA=$MERGE_SHA. Tier=$TIER. Reviewers=$REQUIRED_REVIEWERS. Elapsed=${ELAPSED_S}s. mode=${MERGE_RESULT}." 2>/dev/null || true
-      # ga-jhyu: CLOSE the gate-run at terminal so wisp-compact reaps it.
-      bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run terminal: PASSED (branch $BRANCH sha=$MERGE_SHA). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
-    fi
-
-    # ── ga-esbg: DRIVE THE SOURCE BEAD TO ITS TERMINAL/HANDOFF STATE ──────────
-    # A gate PASS+merge MUST NOT leave the source bead in_progress with the live
-    # builder still assigned. The legacy PASS path only added gate:passed + a
-    # comment, so the bead stayed in_progress with a live assignee: the pool
-    # crash-recovery selector (bd list --status in_progress --assignee <builder>)
-    # kept RE-SPAWNING the worker, and the Pilot's Tier-1 selectors kept
-    # re-picking open bugs/tech-debt — a wasteful re-spawn loop (wa-krzm).
-    # Mirror the already-merged short-circuit: drive the bead all the way to its
-    # terminal state — CLOSE bugs/tasks; HAND OFF stories to delivery.
-    if [ -n "$BEAD_ID" ] && [ "$DRY_RUN" != "1" ]; then
-      # gate:passed is BOTH the success label AND story-delivery's pickup signal
-      # (story-delivery selects story:approved + gate:passed, excluding story:done).
-      bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED. Branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) via autonomous dispatcher (gate_run=$GATE_RUN_ID)." 2>/dev/null || true
-
-      # Read the source bead state authoritatively (labels + live assignee).
-      SRC_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
-        | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
-      SRC_LABELS=$(printf '%s' "$SRC_JSON" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
-      BUILDER_ASSIGNEE=$(printf '%s' "$SRC_JSON" | jq -r '.assignee // ""' 2>/dev/null || echo "")
-      IS_STORY=0
-      if printf '%s' "$SRC_LABELS" | grep -q "story:approved"; then IS_STORY=1; fi
-
-      # (1) Clear the live builder assignee on EVERY source bead. This is what
-      #     removes it from the pool in_progress crash-recovery selector
-      #     (--assignee <builder>) and from the Pilot's assigned-bead exclusion,
-      #     breaking the re-spawn loop even if the close/handoff below fails.
-      if [ -n "$BUILDER_ASSIGNEE" ]; then
-        bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null \
-          || warn "Could not clear builder assignee on source bead $BEAD_ID"
-      fi
-
-      # (2) Terminal vs handoff, decided by the canonical story marker
-      #     (label story:approved — the type field is null for stories in bd;
-      #     see story-delivery.sh / pilot-dispatcher.sh).
-      if [ "$IS_STORY" = "1" ]; then
-        # STORY → hand off to story-delivery (deploy + prod-test → story:done).
-        # Leave it OPEN: delivery needs an open story:approved + gate:passed bead.
-        # Pool re-spawn is already closed (assignee cleared above).
-        # ga-3h8l: strip story:in-flight NOW (at merge). The lane slot MUST free
-        # at merge — delivery may lag/fail, permanently eating a lane slot if we
-        # wait. The Pilot's Tier-2 selector excludes gate:passed (see
-        # pilot-dispatcher.sh), so stripping in-flight does NOT re-expose the
-        # bead to re-dispatch.
-        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
-        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
-        log "Source story $BEAD_ID handed off to delivery (gate:passed set; story:in-flight + gate:reviewing cleared; builder assignee cleared)."
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate PASS handoff (ga-3h8l fix): builder assignee cleared; story:in-flight stripped (lane slot freed at merge); gate:reviewing cleared (wa-qq33j); story:approved + gate:passed in place. story-delivery will deploy + prod-test, then mark story:done." 2>/dev/null || true
-      else
-        # BUG/TASK → close it. bd list defaults to OPEN-only, so closing removes
-        # the bead from EVERY open-work selector (Pilot Tier-1 bug & tech-debt),
-        # and — combined with the assignee clear — from the pool crash-recovery
-        # query. Closing is the durable fix for non-story source beads.
-        log "Closing source bug/task $BEAD_ID (gate PASS + merged sha=$MERGE_SHA)."
-        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
-        bd -C "$BEAD_CITY" close "$BEAD_ID" \
-          -r "Quality gate PASSED — branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA, gate_run=$GATE_RUN_ID). Closed by autonomous dispatcher (ga-esbg)." \
-          2>/dev/null || warn "Could not close source bead $BEAD_ID"
-      fi
-
-      # (3) POST-MERGE VERIFICATION (ga-esbg): assert the source bead no longer
-      #     appears in any re-spawn / re-pick selector the dispatcher knows about.
-      #     If it does, a live loop vector remains — comment + escalate (never
-      #     silently leave it).
-      RESPAWN_HITS=""
-      _still_listed() {  # 0 (true) iff $BEAD_ID is present in `bd list --json <args>`
-        bd -C "$BEAD_CITY" list --json "$@" 2>/dev/null \
-          | jq -e --arg id "$BEAD_ID" 'any(.[]?; .id == $id)' >/dev/null 2>&1
-      }
-      # a) Pool in_progress crash-recovery (applies to ALL beads — the core loop).
-      if [ -n "$BUILDER_ASSIGNEE" ]; then
-        if _still_listed --status in_progress --assignee "$BUILDER_ASSIGNEE"; then
-          RESPAWN_HITS="$RESPAWN_HITS pool:in_progress+assignee=$BUILDER_ASSIGNEE"
-        fi
-      fi
-      # b/c) Pilot Tier-1 open-bug / open-tech-debt re-pick. Stories are EXEMPT
-      #      from Tier-1 checks (open for delivery; not type:bug / tech-debt).
-      if [ "$IS_STORY" != "1" ]; then
-        if _still_listed -t bug;        then RESPAWN_HITS="$RESPAWN_HITS pilot:open-bug"; fi
-        if _still_listed -l tech-debt;  then RESPAWN_HITS="$RESPAWN_HITS pilot:open-tech-debt"; fi
-      fi
-      # d) ga-3h8l: story lane-occupancy check. After PASS, story:in-flight must
-      #    have been stripped (lane slot freed at merge). If still present, the
-      #    slot is permanently leaked — escalate immediately.
-      if [ "$IS_STORY" = "1" ]; then
-        if _still_listed -l "story:in-flight"; then
-          RESPAWN_HITS="$RESPAWN_HITS story:in-flight-leaked"
-        fi
-      fi
-
-      if [ -n "$RESPAWN_HITS" ]; then
-        warn "POST-MERGE re-spawn vector STILL PRESENT for $BEAD_ID:$RESPAWN_HITS"
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "WARNING (ga-esbg post-merge verify): source bead still appears in open-work selector(s) after gate PASS+merge:$RESPAWN_HITS. This is a re-spawn/re-pick vector — the terminal/handoff transition did not fully take." 2>/dev/null || true
-        gc --city "$GC_CITY" mail send mayor \
-          -s "Gate post-merge: $BEAD_ID still re-pickable after PASS+merge" \
-          -m "$(printf 'Source bead %s PASSED the quality gate and merged (branch %s, sha %s, gate_run %s) but still appears in open-work selector(s):%s\n\nThis leaves a re-spawn / re-pick vector (ga-esbg). The dispatcher could not drive it to terminal/handoff state — investigate (close failed? assignee clear failed? unexpected labels?).' \
-            "$BEAD_ID" "$BRANCH" "$MERGE_SHA" "$GATE_RUN_ID" "$RESPAWN_HITS")" \
-          2>/dev/null || warn "Could not mail Mayor post-merge re-spawn escalation for $BEAD_ID"
-        notify -t "Gate post-merge vector" -p 3 "$BEAD_ID still re-pickable after PASS+merge:$RESPAWN_HITS" 2>/dev/null || true
-      else
-        log "Post-merge verify OK (ga-esbg): $BEAD_ID absent from all re-spawn/re-pick selectors."
-      fi
-    fi
-
-    # ── ga-dcclose: REAP THE ORIGINATING COORDINATION WRAPPER AT THE MERGE ──────
-    # BOUNDARY. The Pilot files a type:convoy sling wrapper per dispatch and the
-    # engine deacon files dc-* coordination beads ("Merge failed", "Rebase
-    # required", "T8.x merge-cycle"). Each is wired as a DEPENDENT that TRACKS the
-    # source bead (dependency_type:tracks; the wrapper depends-on the source). When
-    # the source PASS-merges, the wrapper's tracked work is DONE but nothing closes
-    # it → it accrues OPEN forever. merged-bead-janitor's convoy-reconciler is the
-    # eventual backstop (closes when ALL deps closed); closing HERE, at the merge
-    # boundary, is immediate.
-    #
-    # SAFETY (mirrors the janitor's discipline — NO commit-matching, dependency
-    # linkage ONLY): we ask "who TRACKS / depends-on the just-merged source?" via
-    # `bd dep list <source> --direction=up` and close only OPEN dependents that are
-    # unambiguous coordination wrappers (issue_type:convoy OR id prefix dc-). Any
-    # other dependent (real follow-on work, stories, bugs) is LEFT UNTOUCHED. If we
-    # cannot confidently enumerate wrappers (query fails / unreadable), we do
-    # NOTHING and let the janitor backstop handle it. EVERY step is `|| true`-
-    # guarded and idempotent: a close failure here MUST NEVER abort the merge — the
-    # merge is the critical operation; this cleanup is strictly best-effort. Runs
-    # ONLY on the PASS/merge-success path (inside `if OVERALL_VERDICT = PASS`,
-    # after a real MERGE_SHA), never on FAIL.
-    if [ -n "$BEAD_ID" ] && [ "$DRY_RUN" != "1" ]; then
-      WRAPPER_DEPS_JSON="$(bd -C "$BEAD_CITY" dep list "$BEAD_ID" --direction=up --json 2>/dev/null || echo "")"
-      # Select OPEN (non-closed) dependents that are coordination wrappers:
-      # issue_type:convoy OR id prefixed dc-. Closed ones are already reaped.
-      WRAPPER_IDS="$(printf '%s' "$WRAPPER_DEPS_JSON" \
-        | jq -r '(if type=="array" then . else [] end)
-                 | [ .[]?
-                     | select((.status // "") != "closed")
-                     | select(((.issue_type // .type // "") == "convoy")
-                              or (((.id // "") | startswith("dc-"))))
-                     | .id ] | unique | .[]' 2>/dev/null || echo "")"
-      if [ -n "$WRAPPER_IDS" ]; then
-        for _WID in $WRAPPER_IDS; do
-          [ -z "$_WID" ] && continue
-          [ "$_WID" = "$BEAD_ID" ] && continue   # never self-close the source
-          if bd -C "$BEAD_CITY" close "$_WID" \
-               -r "reaped: work merged (gate PASS) — coordination wrapper closed (source $BEAD_ID, branch $BRANCH, sha=$MERGE_SHA, gate_run=$GATE_RUN_ID; ga-dcclose)" \
-               2>/dev/null; then
-            log "ga-dcclose: reaped coordination wrapper $_WID (tracks merged source $BEAD_ID)."
-          else
-            # Non-fatal: an already-closed/obsolete sibling dep can make bd refuse a
-            # clean close. Leave it for the janitor convoy-reconciler backstop.
-            warn "ga-dcclose: could not close wrapper $_WID for $BEAD_ID (non-fatal — janitor backstop will retry)."
-          fi
-        done
-      else
-        log "ga-dcclose: no open coordination wrapper depends on $BEAD_ID — nothing to reap."
-      fi
-    fi
-
-    # wa-uthi: TERMINAL SUCCESS (merged to prod) — this push is KEPT.
-    # wa-wzvg: differentiate the merge push for Pilot-origin stories. The Pilot
-    # sets a durable "pilot:dispatched" label when it autonomously pulls a story
-    # (see pilot-dispatcher.sh). If present, use a distinct prefix/emoji so Athos
-    # can tell an autonomous Pilot merge apart from a human/Mayor-dispatched one.
-    PILOT_ORIGIN=0
-    if [ -n "$BEAD_ID" ]; then
-      BEAD_LABELS_NOW=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
-        | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
-      if echo "$BEAD_LABELS_NOW" | grep -q "pilot:dispatched"; then
-        PILOT_ORIGIN=1
-      fi
-    fi
-    if [ "$PILOT_ORIGIN" = "1" ]; then
-      notify -t "🤖 Pilot Gate PASSED" -p 2 "🤖 [Pilot] Branch $BRANCH merged to $DEFAULT_BRANCH — $TIER, ${ELAPSED_S}s (autonomous pickup)" 2>/dev/null || true
-      log "Gate PASSED (origin=Pilot): branch=$BRANCH tier=$TIER merge_sha=$MERGE_SHA elapsed=${ELAPSED_S}s"
-    else
-      notify -t "Quality Gate PASSED" -p 2 "Branch $BRANCH merged to $DEFAULT_BRANCH — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
-      log "Gate PASSED: branch=$BRANCH tier=$TIER merge_sha=$MERGE_SHA elapsed=${ELAPSED_S}s"
-    fi
-    supersede_sibling_runs "$MARKER_ID" "$BRANCH" "$BEAD_ID"
-  fi
-
+if [ "$VERDICTS_RECEIVED" -eq "$REQUIRED_REVIEWERS" ]; then
+  [ "$ANY_FAIL" = "1" ] && OVERALL_VERDICT="FAIL"
+  log "All verdicts already in ($VERDICTS_RECEIVED/$REQUIRED_REVIEWERS) on the same sweep that spawned them — finalizing now (fast path, OVERALL=$OVERALL_VERDICT)."
+  gate_finalize_run
 else
-  # ── FAIL path ─────────────────────────────────────────────────────────────
-  log "Gate FAILED: $FAIL_REASONS"
-
-  set_gate_status "$MARKER_ID" "failed"
-  # ga-jhyu: CLOSE the marker at terminal (failed) so it is reaped. A FAIL is
-  # terminal for THIS gate attempt — re-running /gate-done mints a fresh marker.
-  # Safe: no open-marker consumer scans gate-status:failed. Idempotent.
-  bd -C "$GC_CITY" close "$MARKER_ID" -r "Gate marker terminal: FAILED (branch $BRANCH). Re-gate mints a new marker. Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
-
-  if [ "$GATE_RUN_ID" != "unknown" ]; then
-    set_gate_status "$GATE_RUN_ID" "failed"
-    bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate FAILED.
-Branch: $BRANCH
-Tier: $TIER  Reviewers required: $REQUIRED_REVIEWERS
-Elapsed: ${ELAPSED_S}s
-
-Blocking reasons:
-$(echo -e "$FAIL_REASONS")" 2>/dev/null || true
-    # ga-jhyu: CLOSE the gate-run at terminal so wisp-compact reaps it.
-    bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run terminal: FAILED (branch $BRANCH). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
-  fi
-
-  # Notify the author (not the Mayor) via nudge
-  if [ -n "$AUTHOR" ]; then
-    gc --city "$GC_CITY" session nudge "$AUTHOR" \
-      "QUALITY GATE FAILED for branch $BRANCH. Blocking reasons: $(echo -e "$FAIL_REASONS" | head -3). Gate run: $GATE_RUN_ID. Fix the issues and re-run /gate-done when ready." \
-      --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR (session may not exist)"
-  fi
-
-  # ── ga-jb4l: SELF-HEALING FAIL LOOP ────────────────────────────────────────
-  # A gate FAIL must not strand the source story forever. The legacy FAIL path
-  # only touched the EPHEMERAL marker/gate-run beads and an ephemeral author
-  # session nudge — no durable feedback reached the SOURCE bead and no actor
-  # ever re-picked it (the Pilot's selection hid it: features by story:in-flight,
-  # bugs by a stale builder assignee). Here we close that loop:
-  #   (a) attach the FAILing reviewer reasons to the SOURCE bead (durable),
-  #   (b) transition it to a Pilot-re-dispatchable gate:needs-fix state, and
-  #   (c) cap auto-retry at N=3, escalating to a human (Mayor) exactly once.
-  # FAIL_REASONS is already populated upstream (and, post-ga-kf0v, carries the
-  # real reviewer .text reasons), so the feedback we attach is substantive.
-  if [ -n "$BEAD_ID" ] && [ "$DRY_RUN" != "1" ]; then
-    GATE_FIX_CAP=3
-
-    # Read the source bead's current labels (story beads live in the HQ/city DB).
-    SRC_LABELS=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
-      | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' \
-      2>/dev/null || echo "")
-
-    # Current fix-attempt count from label gate:fix-attempt:N (default 0). Take
-    # the MAX in case multiple counter labels ever coexist.
-    PREV_ATTEMPT=$(printf '%s' "$SRC_LABELS" | tr ' ' '\n' \
-      | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | tail -1)
-    [ -z "$PREV_ATTEMPT" ] && PREV_ATTEMPT=0
-
-    # (a) ATTACH FEEDBACK TO THE SOURCE BEAD — durable, machine-readable marker
-    #     (prefix "GATE-FEEDBACK") so the Pilot can surface it to the re-dispatched
-    #     builder verbatim.
-    bd -C "$BEAD_CITY" comment "$BEAD_ID" "$(printf 'GATE-FEEDBACK (gate_run=%s branch=%s): quality gate FAILED. Fix THESE specific blocking issues, then run /gate-done to re-gate.\n\n%s' \
-      "$GATE_RUN_ID" "$BRANCH" "$(echo -e "$FAIL_REASONS")")" \
-      2>/dev/null || warn "Could not attach gate feedback to source bead $BEAD_ID"
-    bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:failed" -q 2>/dev/null || true
-
-    if [ "$PREV_ATTEMPT" -ge "$GATE_FIX_CAP" ]; then
-      # (c) RETRY CAP REACHED — stop auto-retry, escalate to the Mayor ONCE.
-      log "Gate fix-attempt cap reached for $BEAD_ID (prev=$PREV_ATTEMPT >= $GATE_FIX_CAP). Escalating; no further auto-retry."
-      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:needs-fix"   -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human"           -q 2>/dev/null || true
-      # imp13: sub-label classifies this as a TECHNICAL circuit-breaker park (not a product decision).
-      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human:technical" -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate auto-fix cap ($GATE_FIX_CAP attempts) exhausted — labeled gate:needs-human. The machine could not resolve this after $GATE_FIX_CAP fix cycles; the Pilot will NOT re-dispatch it. Human/Mayor intervention required." 2>/dev/null || true
-      # imp13: emit human-touch ledger entry (technical kind) for 99% metric.
-      { source "$GC_CITY/scripts/gc-ledger.sh" 2>/dev/null && \
-        gc_ledger_append "human-touch" "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"source_daemon\":\"quality-gate-dispatcher\",\"stage\":\"executa\",\"kind\":\"technical\",\"bead_id\":\"${BEAD_ID}\",\"reason\":\"Gate fix-cap exhausted (${GATE_FIX_CAP} attempts) — circuit-breaker park\"}"; } 2>/dev/null || true
-      # Escalate EXACTLY once: only mail if gate:needs-human was not already set.
-      if ! printf '%s' "$SRC_LABELS" | grep -q "gate:needs-human"; then
-        gc --city "$GC_CITY" mail send mayor \
-          -s "Gate needs-human: $BEAD_ID exhausted $GATE_FIX_CAP fix attempts" \
-          -m "$(printf 'Source bead %s failed the quality gate %s times. Auto-retry is now DISABLED (label gate:needs-human); the Pilot will not re-dispatch it.\n\nBranch: %s\nRig: %s\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene.' \
-            "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$BRANCH" "$RIG" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
-          2>/dev/null || warn "Could not mail Mayor escalation for $BEAD_ID"
-        notify -t "Gate needs-human" -p 4 "$BEAD_ID exhausted $GATE_FIX_CAP gate fix attempts — Mayor escalated" 2>/dev/null || true
-        # ga-u4yi: durable mail to the AUTHOR too — a bd comment alone left
-        # thies-wa's branch rotting 20h in silence because nothing durable told
-        # her she was stuck (only Mayor was mailed; mail, not nudge, survives a
-        # dead/restarted author session).
-        if [ -n "$AUTHOR" ]; then
-          gc --city "$GC_CITY" mail send "$AUTHOR" \
-            -s "Gate needs-human: your branch $BRANCH exhausted $GATE_FIX_CAP fix attempts" \
-            -m "$(printf 'Your branch %s (bead %s) failed the quality gate %s times. Auto-retry is now DISABLED (label gate:needs-human): the Pilot will NOT re-dispatch this bead, and any further /gate-done resubmission will be silently parked until a human resolves this.\n\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene before this can proceed.' \
-              "$BRANCH" "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
-            2>/dev/null || warn "Could not mail author $AUTHOR for gate-fix-cap escalation on $BEAD_ID"
-        fi
-      fi
-      # ga-5w0hr: a needs-human bead has NO active worker — the gate just gave up
-      # auto-retry. Mirror the needs-fix-branch cleanup so the bead is honestly
-      # represented as "awaiting human" rather than masquerading as in-flight.
-      # gate:needs-human (which the Pilot EXCLUDES in every candidate query —
-      # pilot-dispatcher.sh) remains the re-dispatch block; this only strips the
-      # contradictory story:in-flight / pilot:* claim + stale builder assignee
-      # left over from the failed dispatch, which otherwise stranded the bead
-      # looking forever in-flight with no worker (ga-jhyu: 21h SEM WORKER after
-      # 3× FAIL). Re-dispatch policy is unchanged — needs-human still requires
-      # Human/Mayor intervention to clear.
-      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"  -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"   -q 2>/dev/null || true  # wa-qq33j: clear in-review state (cap/needs-human)
-      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
-    else
-      # (b) TRANSITION TO A PILOT-RE-DISPATCHABLE needs-fix STATE.
-      NEW_ATTEMPT=$((PREV_ATTEMPT + 1))
-      log "Marking $BEAD_ID gate:needs-fix (attempt $NEW_ATTEMPT/$GATE_FIX_CAP) for autonomous Pilot re-dispatch."
-      # Bump the attempt counter (drop any stale counters first).
-      for OLD in $(printf '%s' "$SRC_LABELS" | tr ' ' '\n' | grep '^gate:fix-attempt:'); do
-        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "$OLD" -q 2>/dev/null || true
-      done
-      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:fix-attempt:${NEW_ATTEMPT}" -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-fix"                  -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"   -q 2>/dev/null || true  # wa-qq33j: clear in-review state (FAIL/needs-fix)
-      # Clear stale Pilot claim labels left over from the failed dispatch.
-      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
-
-      # ga-jyox: a live named-crew author (long-lived session, e.g. thies-wa) must
-      # KEEP ownership on FAIL instead of being cleared — see gate_fail_assignee_action
-      # above for the full rationale (ga-1url/ga-u4yi double-dispatch collision).
-      # ga-ipf6: unified with the rebase-path AUTHOR_ALIVE via author_is_alive()
-      # — this call site's predicate was already canonical; it is now the
-      # single source of truth both paths share.
-      FAIL_AUTHOR_ALIVE=$(author_is_alive "$AUTHOR")
-
-      # ga-pyzo: recycled-session fallback (same helper as the rebase-path call
-      # site above — single source of truth so the two paths cannot re-diverge,
-      # the exact ga-ipf6 lesson). Applied BEFORE gate_fail_assignee_action so a
-      # live agent whose specific FAILing session recycled gets "keep" (nudged
-      # to fix), not "clear" (silently handed to a stranger builder).
-      _RESOLVED_AUTHOR=$(resolve_recycled_author "$AUTHOR" "$AUTHOR_AGENT" "$FAIL_AUTHOR_ALIVE")
-      if [ "$_RESOLVED_AUTHOR" != "$AUTHOR" ]; then
-        log "  ga-pyzo: author '$AUTHOR' session recycled but agent '$_RESOLVED_AUTHOR' has a live session — redirecting liveness/nudge/assign to the agent."
-        AUTHOR="$_RESOLVED_AUTHOR"
-        FAIL_AUTHOR_ALIVE=1
-      fi
-
-      GATE_FAIL_ASSIGNEE_ACTION=$(gate_fail_assignee_action "$AUTHOR" "$FAIL_AUTHOR_ALIVE")
-
-      if [ "$GATE_FAIL_ASSIGNEE_ACTION" = "keep" ]; then
-        log "Author $AUTHOR is a live named-crew session — keeping assignee + story:in-flight (ga-jyox); nudging feedback instead of letting the Pilot dispatch a stranger on top of in-flight work."
-        bd -C "$BEAD_CITY" assign "$BEAD_ID" "$AUTHOR" 2>/dev/null || true
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; gate:reviewing cleared (wa-qq33j). Author $AUTHOR is a LIVE crew session, so assignee + story:in-flight were KEPT (ga-jyox) — the Pilot will NOT dispatch a generic builder on top of your in-flight work. See GATE-FEEDBACK above; re-run /gate-done after fixing." 2>/dev/null || true
-        gc --city "$GC_CITY" session nudge "$AUTHOR" \
-          "Gate FAILED for $BEAD_ID (branch $BRANCH, attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — see GATE-FEEDBACK on the bead. Your assignee was kept (ga-jyox); fix and re-run /gate-done." \
-          --delivery wait-idle 2>/dev/null || warn "Could not nudge live-crew author $AUTHOR for gate FAIL feedback"
-      else
-        # Remove story:in-flight so the Pilot's feature-exclusion no longer hides it.
-        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"  -q 2>/dev/null || true
-        # The Pilot's _filter_candidates drops ASSIGNED beads (both Tier-1 bugs and
-        # Tier-2 features), so a stale builder assignee makes a failed bead invisible.
-        # Clear it so the next sweep can re-pick this bead.
-        bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) and builder assignee cleared. The Pilot will re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
-      fi
-    fi
-  fi
-
-  # wa-uthi: TERMINAL FAIL (review rejected, definitive) — this push is KEPT.
-  notify -t "Quality Gate FAILED" -p 3 "Branch $BRANCH failed review — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
-  supersede_sibling_runs "$MARKER_ID" "$BRANCH" "$BEAD_ID"
+  # ga-eqjo: not all verdicts are in on the SAME sweep that spawned this run —
+  # this is now the NORMAL case (reviewers take minutes; this check runs
+  # seconds after spawn), not a timeout. The full FAIL-path handling that used
+  # to live here (self-healing retry loop, marker/gate-run closure, author
+  # nudge/mail, ga-pyzo's recycled-author fallback) now lives inside
+  # gate_finalize_run() itself, shared by BOTH this function's fast-path call
+  # above (line ~4907) and Phase C's later call for runs finalized on a
+  # subsequent sweep — so it fires exactly once, whichever path completes the
+  # run, instead of being duplicated per call site.
+  log "Run $GATE_RUN_ID admitted: $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdict(s) in so far — reviewers keep working independently (Phase B); a future sweep's Phase C will finalize (ga-eqjo)."
+  GATE_RUN_LEAVE_SESSIONS_ALIVE=1
 fi
-
-# ── Step 11: Log to quality-gate.jsonl ───────────────────────────────────────
-
-mkdir -p "$(dirname "$QG_LOG")"
-REASON=""
-if [ "$OVERALL_VERDICT" = "PASS" ]; then
-  REASON="quorum_${REQUIRED_REVIEWERS}_of_${REQUIRED_REVIEWERS}_independent_sessions"
-else
-  REASON=$(echo -e "$FAIL_REASONS" | head -1 | tr '\n' ' ' | cut -c1-200)
-fi
-
-jq -c -n \
-  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  --arg branch "$BRANCH" \
-  --arg bead "$BEAD_ID" \
-  --arg rig "${RIG:-unknown}" \
-  --arg tier "$TIER" \
-  --arg result "$OVERALL_VERDICT" \
-  --arg reason "$REASON" \
-  --arg gate_run "$GATE_RUN_ID" \
-  --arg marker "$MARKER_ID" \
-  --argjson elapsed_s "$ELAPSED_S" \
-  --argjson reviewers "$REQUIRED_REVIEWERS" \
-  --arg dry_run "$DRY_RUN" \
-  '{ts: $ts, event: "dispatcher_complete", branch: $branch, bead: $bead,
-    rig: $rig, tier: $tier, result: $result, reason: $reason,
-    gate_run: $gate_run, marker: $marker, elapsed_s: $elapsed_s,
-    reviewers: $reviewers, dry_run: $dry_run}' \
-  >> "$QG_LOG" 2>/dev/null || true
-
-log "=== Dispatcher sweep complete: branch=$BRANCH verdict=$OVERALL_VERDICT elapsed=${ELAPSED_S}s ==="
