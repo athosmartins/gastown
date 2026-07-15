@@ -338,6 +338,13 @@ fi
 #    symlink, ga-x8m6r). This section is the regression guard against that
 #    drift recurring — e.g. if a future crew-provisioning step ever recreates a
 #    real (non-symlink) file at one of these paths again.
+#
+#    internal/templates/commands/bodies/gate-done.md is DELIBERATELY EXCLUDED
+#    from this list (ga-54iu): it is subject to a live `//go:embed bodies/*.md`
+#    in internal/templates/commands/provision.go, and Go's embed refuses to
+#    embed symlinks ("irregular files") at compile time — symlinking it here
+#    like the other 30 broke `go build ./...` entirely. See section (J) below
+#    for its (different) drift guard: real file, content-synced by copy.
 TOWN_ROOT="$(cd "$SELF_DIR/../../../.." && pwd)"
 CANONICAL_REAL="$TOWN_ROOT/.gascity-gastown-hq/commands/gate-done.md"
 
@@ -361,7 +368,6 @@ else
   # start (or stop) covering new directories without a deliberate edit here.
   DEPLOYED_COPIES=(
     "$TOWN_ROOT/.claude/commands/gate-done.md"
-    "$TOWN_ROOT/internal/templates/commands/bodies/gate-done.md"
     "$PROD_ROOT/gastown/crew/batista/.claude/commands/gate-done.md"
     "$PROD_ROOT/gastown/crew/deacon/.claude/commands/gate-done.md"
     "$PROD_ROOT/gastown/crew/furiosa/.claude/commands/gate-done.md"
@@ -459,6 +465,47 @@ else
   else
     bad "(I-mutation) $MUT_TARGET is not a symlink — cannot run the mutation check (has (I) already failed above?)"
   fi
+fi
+
+# ── (J) ga-54iu: internal/templates/commands/bodies/gate-done.md gets a
+#    DIFFERENT drift guard than section (I) above, not the same one. It is
+#    matched by a live `//go:embed bodies/*.md` in
+#    internal/templates/commands/provision.go, and Go's embed refuses to
+#    embed symlinks ("irregular files") at compile time — verified empirically
+#    by the quality-gate reviewer, who built the symlinked version and got
+#    `pattern bodies/*.md: cannot embed irregular file bodies/gate-done.md`
+#    (exit 1), then built the pre-ga-dmox parent commit cleanly (exit 0) with
+#    the identical command. So this copy must stay a REAL file, kept in sync
+#    with canonical by content copy — this section guards BOTH halves of that
+#    invariant (never re-symlinked, never silently drifted).
+EMBEDDED_COPY="$TOWN_ROOT/internal/templates/commands/bodies/gate-done.md"
+if [ ! -e "$EMBEDDED_COPY" ]; then
+  bad "(J0) $EMBEDDED_COPY not found — go:embed bodies/*.md would fail to compile"
+elif [ -L "$EMBEDDED_COPY" ]; then
+  bad "(J1) $EMBEDDED_COPY is a SYMLINK — go:embed cannot embed symlinks, this breaks 'go build ./...' (ga-54iu regression)"
+else
+  ok "(J1) $EMBEDDED_COPY is a regular file (go:embed-safe)"
+fi
+
+if [ -f "$EMBEDDED_COPY" ] && [ -f "$CANONICAL_REAL" ]; then
+  if cmp -s "$EMBEDDED_COPY" "$CANONICAL_REAL"; then
+    ok "(J2) $EMBEDDED_COPY content matches canonical byte-for-byte"
+  else
+    bad "(J2) $EMBEDDED_COPY has DRIFTED from canonical $CANONICAL_REAL — re-copy canonical's content"
+  fi
+
+  # Mutation check on a SCRATCH fixture, never on the real tracked file — unlike
+  # section (I)'s untracked crew copies, this file IS git-tracked source feeding
+  # a compiled binary; mutating it in place risks leaving the working tree (or a
+  # concurrent build) broken if this script is interrupted mid-check.
+  SCRATCH_DRIFT="$(mktemp)"
+  echo "drifted content, not synced with canonical" > "$SCRATCH_DRIFT"
+  if cmp -s "$SCRATCH_DRIFT" "$CANONICAL_REAL"; then
+    bad "(J-mutation) scratch fixture unexpectedly matches canonical — fixture itself is broken"
+  else
+    ok "(J-mutation) a deliberately-drifted copy is correctly caught as non-identical (test is not vacuous)"
+  fi
+  rm -f "$SCRATCH_DRIFT"
 fi
 
 echo
