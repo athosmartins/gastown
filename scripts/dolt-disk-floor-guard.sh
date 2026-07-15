@@ -208,42 +208,61 @@ main() {
     return 0
   fi
 
+  # Latch whether THIS reading (pre-reclaim) was CRITICAL. The CRITICAL-tier
+  # guarantee ("notify ALWAYS, cooldown bypassed, mail Mayor" — see header) must
+  # key off "was CRITICAL at any point this cycle", not solely the `class`
+  # recomputed below AFTER reclaim — otherwise a reclaim that recovers avail
+  # back into WARN/NONE silently swallows the exact breach this guard exists to
+  # report (gate-fix-1: GATE-FEEDBACK on gate_run=ga-wisp-9b4hnh — repro'd with
+  # shipped defaults WARN=8/CRIT=3/cooldown=3600: a CRITICAL 2GB reading
+  # reclaimed back to exactly 8GB was reclassified WARN and suppressed by
+  # ordinary WARN cooldown/worsening logic, skipping the CRITICAL-only
+  # mail-Mayor alert entirely).
+  local was_critical=0
+  [ "$class" = "CRITICAL" ] && was_critical=1
+
   _read_state
   _safe_reclaim "$avail"
 
-  # re-read avail — reclaim may have freed space; re-classify before deciding to notify
+  # re-read avail — reclaim may have freed space; `class` becomes the CURRENT
+  # (post-reclaim) reading, used for logging/messaging. was_critical also
+  # latches a post-reclaim CRITICAL reading (e.g. a concurrent fill worsens
+  # avail during the reclaim window) so the guarantee holds regardless of
+  # which direction avail moved this cycle.
   local avail_after; avail_after="$(_avail_gb "$DOLTDIR")"
   [ -n "$avail_after" ] && avail="$avail_after"
   class="$(_floor_class "$avail" "$FLOOR_WARN_GB" "$FLOOR_CRITICAL_GB")"
+  [ "$class" = "CRITICAL" ] && was_critical=1
 
-  if [ "$class" = "NONE" ]; then
+  if [ "$class" = "NONE" ] && [ "$was_critical" = "0" ]; then
     log "avail=${avail}GB back above floor after reclaim — no notify needed"
     _write_state "$now" "$avail"
     return 0
   fi
 
   local do_notify=1
-  if [ "$class" = "WARN" ] && ! _should_notify "$_LAST_EPOCH" "$now" "$NOTIFY_COOLDOWN_SECS" "$avail" "$_LAST_AVAIL"; then
+  if [ "$was_critical" = "0" ] && [ "$class" = "WARN" ] && ! _should_notify "$_LAST_EPOCH" "$now" "$NOTIFY_COOLDOWN_SECS" "$avail" "$_LAST_AVAIL"; then
     do_notify=0
     log "avail=${avail}GB <= warn floor(${FLOOR_WARN_GB}GB) but within cooldown + not worsening — suppressing (last notified avail=${_LAST_AVAIL:-none}GB)"
   fi
 
   if [ "$do_notify" = "1" ]; then
     local prio=3
-    [ "$class" = "CRITICAL" ] && prio=5
-    log "${class}: avail=${avail}GB <= floor (warn=${FLOOR_WARN_GB}GB crit=${FLOOR_CRITICAL_GB}GB) — notifying"
-    "$NOTIFY" -t "Dolt disk-floor guard" -p "$prio" "🚨 [${class}] Dolt data-dir avail=${avail}GB — reclaim attempted, still at/below floor. See ga-gpzr." 2>/dev/null || true
-    if [ "$class" = "CRITICAL" ]; then
+    [ "$was_critical" = "1" ] && prio=5
+    log "class=${class} was_critical=${was_critical}: avail=${avail}GB (warn=${FLOOR_WARN_GB}GB crit=${FLOOR_CRITICAL_GB}GB) — notifying"
+    "$NOTIFY" -t "Dolt disk-floor guard" -p "$prio" "🚨 [${class}] Dolt data-dir avail=${avail}GB — reclaim attempted. See ga-gpzr." 2>/dev/null || true
+    if [ "$was_critical" = "1" ]; then
       # NOTE: deliberately NOT a heredoc — bash 3.2 (macOS system /bin/bash, what
       # launchd invokes per the plist) mis-parses a heredoc nested inside a $(...)
       # command substitution when the body contains an apostrophe (confirmed by
       # direct repro on this machine). A plain multi-line double-quoted assignment
       # has no such bug and is otherwise equivalent.
-      local mail_body="dolt-disk-floor-guard: Dolt data-dir avail=${avail}GB <= critical floor (${FLOOR_CRITICAL_GB}GB).
-Safe reclaim (gc dolt cleanup --force) was already attempted this cycle - the reading above is
-AFTER that attempt. This is the same class of event that killed the HQ Dolt server on
+      local mail_body="dolt-disk-floor-guard: Dolt data-dir hit CRITICAL floor (<= ${FLOOR_CRITICAL_GB}GB) this cycle.
+Safe reclaim (gc dolt cleanup --force) was already attempted - avail is now ${avail}GB (post-reclaim,
+currently classified ${class}). This is the same class of event that killed the HQ Dolt server on
 2026-07-14 (ga-vs55): a full disk hitting Dolt mid-journal-write. Recommend checking what is
-consuming space now (df -h, du -sh on shared/data and .gc/logs) before this reaches 0."
+consuming space now (df -h, du -sh on shared/data and .gc/logs) even if the current reading looks
+recovered — CRITICAL was reached this cycle and could recur."
       "$GC" mail send mayor -s "Dolt disk-floor CRITICAL: avail=${avail}GB" -m "$mail_body" 2>/dev/null || log "WARN: gc mail send mayor failed"
     fi
     _write_state "$now" "$avail"

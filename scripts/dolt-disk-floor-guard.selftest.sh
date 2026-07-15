@@ -67,5 +67,130 @@ _should_notify 1000 1100 3600 8 5  && bad "should_notify: within cooldown, impro
 _should_notify 1000 4601 3600 8 8  && ok "should_notify: cooldown elapsed, stable avail → notify (repeat allowed)" || bad "should_notify: elapsed cooldown should notify regardless of trend"
 _should_notify "" 1100 3600 8 ""   && ok "should_notify: never notified before → notify (fail-open)"               || bad "should_notify: first-ever call should notify"
 
+echo ""
+echo "=== main(): CRITICAL-latch across reclaim reclassification (gate-fix-1: GATE-FEEDBACK gate_run=ga-wisp-9b4hnh) ==="
+# The pure-function tests above prove _should_notify is correct in ISOLATION.
+# They do NOT exercise main() itself, which is where the actual bug lived:
+# main() re-derives `class` from the POST-reclaim avail and (pre-fix) used
+# that alone to decide the CRITICAL-only "always notify, mail Mayor" path —
+# so a reclaim that recovered avail lost all memory that the cycle was ever
+# CRITICAL. These tests call main() directly (still library-sourced, so it
+# doesn't auto-run) with _avail_gb/_safe_reclaim/NOTIFY/GC stubbed — no real
+# df dependency, no real reclaim, no real notification or mail sent, and the
+# state files are redirected to a throwaway tmp dir (never touches the real
+# .gc/logs state).
+
+STATE_TMP="/tmp/dolt-disk-floor-guard-selftest-state-$$"
+mkdir -p "$STATE_TMP"
+# shellcheck disable=SC2034  # read by _write_state() in the sourced script
+STATE_DIR="$STATE_TMP"
+STATE_EPOCH_FILE="$STATE_TMP/.last-notify"
+STATE_AVAIL_FILE="$STATE_TMP/.last-notify-avail-gb"
+
+# Canned avail-GB readings: main() calls _avail_gb exactly twice per cycle
+# (pre-reclaim, then post-reclaim), both via `$(...)` command substitution —
+# which forks a SUBSHELL, so a shell-variable/array queue popped inside
+# _avail_gb would silently discard its own mutation on subshell exit (every
+# call would keep re-reading the same first element). A FILE-backed queue
+# survives across subshells since the pop is a real filesystem write, not
+# in-memory shell state. Exhausting the queue returns "" (UNKNOWN) rather
+# than erroring under `set -u`, so an unexpected extra call fails the
+# assertion instead of aborting the whole selftest.
+AVAIL_QUEUE_FILE="$STATE_TMP/.avail-queue"
+queue_avail() { printf '%s\n' "$@" > "$AVAIL_QUEUE_FILE"; }
+_avail_gb() {
+  [ -s "$AVAIL_QUEUE_FILE" ] || { echo ""; return; }
+  local v; v="$(head -n1 "$AVAIL_QUEUE_FILE")"
+  tail -n +2 "$AVAIL_QUEUE_FILE" > "$AVAIL_QUEUE_FILE.tmp" 2>/dev/null || true
+  mv "$AVAIL_QUEUE_FILE.tmp" "$AVAIL_QUEUE_FILE"
+  echo "$v"
+}
+# _safe_reclaim's own mechanics (gc dolt cleanup --force, health probe) are
+# EXECUTION code out of scope for this file (see section banner above) —
+# stubbed as a no-op here too, same as every other main()-only side effect.
+_safe_reclaim() { :; }
+
+NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""
+record_notify() {
+  NOTIFY_CALLS=$((NOTIFY_CALLS+1))
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -p) NOTIFY_LAST_PRIO="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+}
+# shellcheck disable=SC2034  # read by main() in the sourced script
+NOTIFY=record_notify
+
+GC_MAIL_CALLS=0
+record_gc() {
+  [ "$1" = "mail" ] && [ "$2" = "send" ] && GC_MAIL_CALLS=$((GC_MAIL_CALLS+1))
+}
+# shellcheck disable=SC2034  # read by main() in the sourced script
+GC=record_gc
+
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; GC_MAIL_CALLS=0; }
+seed_state() {
+  if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
+  if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
+}
+
+# Scenario A — repro path (a) from the GATE-FEEDBACK: CRITICAL (2GB) fully
+# recovers to NONE (20GB) after reclaim. Pre-fix, main() hit the early return
+# "back above floor after reclaim — no notify needed" and NEITHER notify nor
+# mail-Mayor ever fired for a reading that was CRITICAL moments earlier.
+reset_capture; seed_state "" ""
+queue_avail 2 20
+main
+if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CALLS" = "1" ]; then
+  ok "main(): CRITICAL avail fully recovered by reclaim still notifies (prio 5) + mails Mayor"
+else
+  bad "main(): CRITICAL->NONE recovery lost the notify/mail (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS)"
+fi
+
+# Scenario B — repro path (b), reviewer's exact numbers (WARN=8 CRIT=3
+# cooldown=3600): CRITICAL (2GB) reclaims back to EXACTLY the WARN floor
+# (8GB), within cooldown and not "worsening" vs. a last-notified avail of
+# 8GB. Pre-fix, class was reclassified WARN post-reclaim and ordinary WARN
+# cooldown/worsening suppression swallowed the CRITICAL-only mail-Mayor alert.
+reset_capture
+past_epoch=$(( $(date +%s) - 600 ))
+seed_state "$past_epoch" 8
+queue_avail 2 8
+main
+if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CALLS" = "1" ]; then
+  ok "main(): CRITICAL avail partially recovered into WARN tier still bypasses cooldown + mails Mayor"
+else
+  bad "main(): CRITICAL->WARN partial recovery lost the always-notify/mail-Mayor guarantee (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS)"
+fi
+
+# Scenario C — non-regression: a cycle that is NEVER critical (WARN both
+# before and after reclaim) still respects ordinary cooldown + not-worsening
+# suppression — proves the was_critical latch didn't make the guard noisier.
+reset_capture
+past_epoch=$(( $(date +%s) - 100 ))
+seed_state "$past_epoch" 6
+queue_avail 6 6
+main
+if [ "$NOTIFY_CALLS" = "0" ] && [ "$GC_MAIL_CALLS" = "0" ]; then
+  ok "main(): non-critical WARN cycle within cooldown + not worsening still suppresses (no regression)"
+else
+  bad "main(): non-critical WARN suppression regressed (notify_calls=$NOTIFY_CALLS mail_calls=$GC_MAIL_CALLS)"
+fi
+
+# Scenario D — non-regression: a non-critical WARN cycle fully resolved by
+# reclaim takes the early-return silent path, same as before the fix.
+reset_capture; seed_state "" ""
+queue_avail 6 20
+main
+if [ "$NOTIFY_CALLS" = "0" ] && [ "$GC_MAIL_CALLS" = "0" ]; then
+  ok "main(): non-critical WARN fully resolved by reclaim stays silent (no regression)"
+else
+  bad "main(): non-critical WARN->NONE early-return regressed (notify_calls=$NOTIFY_CALLS mail_calls=$GC_MAIL_CALLS)"
+fi
+
+rm -rf "$STATE_TMP"
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
