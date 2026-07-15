@@ -3402,20 +3402,24 @@ fi
 # SELFTEST-EXTRACT marker-select: BEGIN
 GATE_MARKER_AGE_PROMOTE_SECONDS="${GATE_MARKER_AGE_PROMOTE_SECONDS:-1800}"
 GATE_MARKER_NOW_EPOCH="${GATE_MARKER_NOW_OVERRIDE_EPOCH:-$(date -u +%s)}"
-# ga-* (2026-07-15, Athos): AUTHOR-PRIORITY tier. A space-separated allowlist of
-# marker authors (the `author:` field in the marker DESCRIPTION — always present,
-# unlike the branch: label which recipe-created markers omit) whose HEALTHY markers
-# drain BEFORE everyone else's, on top of the existing aged/newest tiebreaks. Set
-# to prioritize Oracle's gate throughput (his own crew/oracle/* builds AND the
-# sub-workers he spawns, whose work lands on his branches → author:oracle). The
-# `gate:priority` LABEL is an independent manual override (tags any single marker
-# regardless of author — e.g. a sub-worker Oracle slings onto a crew/wa-worker/*
-# branch). REVERSIBLE: set GATE_PRIORITY_AUTHORS="" in the plist to disable the
-# author tier (the label override still works); the ordering collapses to the exact
-# prior aged/newest behaviour. rebase-fail markers stay at the BACK even when their
-# author is prioritized — a broken branch must never jump the queue and re-break it
+# ga-* (2026-07-15, Athos): CREW-PRIORITY tier. A space-separated allowlist of
+# crew names (the `<crew>` segment of the marker's `branch: crew/<crew>/<bead>`
+# field in the DESCRIPTION) whose HEALTHY markers drain BEFORE everyone else's, on
+# top of the existing aged/newest tiebreaks. Keyed on the BRANCH crew segment, NOT
+# the `author:` field: /gate-done writes author as the agent alias "oracle-wa" while
+# the recipe writes bare "oracle" — the branch's crew dir is consistently "oracle"
+# across both, so it is the reliable signal. Set to prioritize Oracle's gate
+# throughput: his own crew/oracle/* builds AND the in-session sub-workers he spawns
+# (their commits land on his crew/oracle/* branch → same crew segment). The
+# `gate:priority` LABEL is an independent manual override for any single marker
+# regardless of branch (e.g. a sub-worker Oracle SLINGS onto a crew/wa-worker/*
+# branch — tag that marker's gate:priority off the source bead's created_by).
+# REVERSIBLE: set GATE_PRIORITY_AUTHORS="" in the plist to disable the crew tier
+# (the label override still works); the ordering collapses to the exact prior
+# aged/newest behaviour. rebase-fail markers stay at the BACK even when their crew
+# is prioritized — a broken branch must never jump the queue and re-break it
 # (ga-q3ig2 outage class); priority raises healthy work, it does not rescue a
-# conflicted one.
+# conflicted one. (Env var name kept as GATE_PRIORITY_AUTHORS for continuity.)
 GATE_PRIORITY_AUTHORS="${GATE_PRIORITY_AUTHORS-oracle}"
 # GATE-FEEDBACK (gate_run=ga-wisp-a7b4r5): every sibling GATE_* tunable (see
 # GATE_DOLT_CPU_HOT etc. above) gets a case-guard right after its ${VAR:-default}
@@ -3431,15 +3435,16 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   --arg priority_authors "$GATE_PRIORITY_AUTHORS" '
   def has_rebase_fail: ((.labels // []) | map(select(test("^gate:rebase-attempt:[0-9]+$"))) | length) > 0;
   def is_aged: try (($now - (.created_at | fromdateiso8601)) > $age_threshold) catch false;
-  # author: is parsed from the marker DESCRIPTION. MUST always yield exactly one
-  # value ("" when the field is absent) — `capture` yields EMPTY on no-match under
-  # jq, and `author_of as $au` over an empty stream runs zero times, silently
-  # DROPPING that marker from every tier → .[0] becomes null → the whole sweep
-  # selects nothing (verified: a description-less marker vanished). `[ scan(re) ]`
-  # collects matches into an array so .[0] // "" always produces one value.
-  def author_of: ([ (.description // "") | scan("(?:^|\n)author:[ ]*([^ \n]+)") ] | (.[0] // "") | if type == "array" then (.[0] // "") else . end);
+  # crew_of parses the <crew> segment of `branch: crew/<crew>/<bead>` from the
+  # marker DESCRIPTION. MUST always yield exactly one value ("" when absent) —
+  # `capture`/`scan` yield an EMPTY STREAM on no-match under jq, and `crew_of as
+  # $c` over an empty stream runs zero times, silently DROPPING that marker from
+  # every tier → .[0] becomes null → the whole sweep selects nothing (verified: a
+  # description-less marker vanished). `[ scan(re) ]` collects into an array so
+  # .[0] // "" always produces one value.
+  def crew_of: ([ (.description // "") | scan("(?:^|\n)branch:[ ]*crew/([^/ \n]+)/") ] | (.[0] // "") | if type == "array" then (.[0] // "") else . end);
   def prio_list: ($priority_authors | split(" ") | map(select(length>0)));
-  def is_priority: (author_of as $au | ($au != "" and ((prio_list | index($au)) != null))) or ((.labels // []) | any(. == "gate:priority"));
+  def is_priority: (crew_of as $c | ($c != "" and ((prio_list | index($c)) != null))) or ((.labels // []) | any(. == "gate:priority"));
   # Tier order: priority-healthy (aged→newest), then other-healthy (aged→newest),
   # then rebase-fail (all authors, back of queue). Mirrors the aged/newest logic
   # inside each priority class so no invariant (aging bound, newest tiebreak) is lost.
