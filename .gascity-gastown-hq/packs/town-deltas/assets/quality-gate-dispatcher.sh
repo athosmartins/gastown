@@ -2935,6 +2935,7 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
         continue
       fi
 
+      # SELFTEST-EXTRACT phase-c-verdict-rehydrate: BEGIN
       VB_JSON=$(bd -C "$GC_CITY" list --json -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID" 2>/dev/null || echo "[]")
       VERDICT_BEAD_IDS=()
       while IFS= read -r PC_VBID; do
@@ -2943,18 +2944,30 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       done < <(printf '%s' "$VB_JSON" | jq -r '
           sort_by([(.labels[]? | select(startswith("reviewer-index:")) | ltrimstr("reviewer-index:") | tonumber)] | (.[0] // 0))
           | .[].id' 2>/dev/null)
+
+      # ga-eqjo (gate-fix-3): this emptiness guard MUST run before any
+      # "${VERDICT_BEAD_IDS[@]}" expansion below. bash 3.2 (the only bash on
+      # this host — verified no newer bash exists anywhere in PATH) throws
+      # "unbound variable" under `set -euo pipefail` when "${ARR[@]}" expands
+      # a declared-but-empty array, killing the whole dispatcher process. A
+      # gate-run whose prior invocation died between Step 6 (run-bead
+      # creation) and Step 7 (verdict-bead spawning) rehydrates here with
+      # ZERO verdict beads — a real, reachable state (OOM/SIGKILL/launchd-
+      # timeout mid-run) — so this check cannot be deferred until after a
+      # loop that consumes the array.
+      if [ "${#VERDICT_BEAD_IDS[@]}" -eq 0 ]; then
+        warn "Phase C: gate-run $GATE_RUN_ID has ZERO verdict beads — likely died before Step 7 finished spawning. Leaving for gate-recovery-watchdog's hung-run backstop."
+        continue
+      fi
+
       SESSION_IDS=()
       for PC_VBID in "${VERDICT_BEAD_IDS[@]}"; do
         PC_SID=$(bd -C "$GC_CITY" show "$PC_VBID" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
         SESSION_IDS+=("$PC_SID")
       done
 
-      if [ "${#VERDICT_BEAD_IDS[@]}" -eq 0 ]; then
-        warn "Phase C: gate-run $GATE_RUN_ID has ZERO verdict beads — likely died before Step 7 finished spawning. Leaving for gate-recovery-watchdog's hung-run backstop."
-        continue
-      fi
-
       gate_collect_verdicts
+      # SELFTEST-EXTRACT phase-c-verdict-rehydrate: END
 
       PC_START_EPOCH=$(_ts_to_epoch "$PC_STARTED_AT")
       case "$PC_START_EPOCH" in ''|*[!0-9]*) PC_START_EPOCH=$(date +%s) ;; esac
