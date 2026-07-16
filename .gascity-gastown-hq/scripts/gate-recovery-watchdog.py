@@ -2483,6 +2483,50 @@ def _open_deferred_markers():
         return None
 
 
+def _mail_oscillating_deferred_marker(mid, branch, source_bead, rig_name, attempts,
+                                       max_attempts, age_sec):
+    """ga-76kc: durable, actionable escalation for a gate-status:deferred marker that
+    exhausted DEFERRED_REQUEUE_MAX_ATTEMPTS while its author WAS derivable —
+    deferred_requeue_verdict() only returns escalate:oscillating when
+    has_derivable_author is True (an unresolvable marker takes close:unresolvable
+    instead, a separate path), so there is no "unresolved" branch to describe here
+    the way _mail_oscillating_error_marker's clean_desc has. Mirrors that function
+    (added in the ga-rwzj fix) for the deferred path: notify() (the caller's other
+    escalation) is a transient push — if the Mayor is away when it fires, the
+    signal is gone with nothing left to act on. This mail is SECONDARY
+    (best-effort, never blocks the notify) but persists in the inbox with the
+    branch and the ready-to-run re-submit command already spelled out, so whoever
+    reads it hours later doesn't have to reconstruct context from scratch."""
+    author_desc = (
+        "author JÁ era derivável (gate.submitted_by do marker OU os campos do "
+        "source bead) quando o watchdog esgotou o cap de requeue — o requeue "
+        "automático não é o problema; o dispatcher/guard está re-deferindo por "
+        "outro motivo. Investigue esse motivo antes de reenfileirar de novo"
+    )
+    resubmit_cmd = (
+        "bd -C %s label remove %s gate-status:deferred -q && "
+        "bd -C %s label add %s gate-status:queued -q"
+    ) % (CITY, mid, CITY, mid)
+    subject = "Gate: marker %s preso oscilando em gate-status:deferred" % mid
+    body = (
+        "Marker %s esgotou o cap de auto-requeue (%d/%d tentativas) e continua "
+        "voltando pra gate-status:deferred. O watchdog PAROU — não é mais "
+        "transiente, precisa de você.\n\n"
+        "Branch: %s\n"
+        "Source bead: %s (%s)\n"
+        "Idade em gate-status:deferred: %dmin\n"
+        "Author-derivability-check: %s\n\n"
+        "Comando de re-submit pronto (rode DEPOIS de investigar por que ele re-defere):\n"
+        "  %s\n\n"
+        "(gate-recovery-watchdog FIX 7 — escalação de oscillating-deferred, ga-76kc)"
+    ) % (mid, attempts, max_attempts, branch or "?", source_bead or "?", rig_name or "?",
+         age_sec // 60, author_desc, resubmit_cmd)
+    r = sh(["gc", "mail", "send", "mayor", "-s", subject, "-m", body], timeout=45)
+    if not (r and r.returncode == 0):
+        print("[watchdog] WARN: gc mail send mayor FAILED for oscillating deferred marker %s — notify still sent (grw)"
+              % mid, flush=True)
+
+
 def requeue_deferred_markers(now, rstate):
     """FIX 7 (ga-y1kk): recover a gate-status:deferred marker — the dead-end nothing
     else re-reads (quality-gate-dispatcher.sh Step 3's AUTHOR-derivation fail-safe, and
@@ -2591,6 +2635,8 @@ def requeue_deferred_markers(now, rstate):
                 _grw_ledger("human-touch", {"ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                             "source_daemon": "gate-recovery-watchdog", "stage": "revisa", "kind": "technical",
                             "bead_id": source_bead or "", "reason": "deferred marker %s oscillating (%d watchdog requeues, still re-defers despite derivable author) — needs human" % (mid, attempts)}, fail_open=True)
+                _mail_oscillating_deferred_marker(mid, branch, source_bead, rig_name, attempts,
+                                                   DEFERRED_REQUEUE_MAX_ATTEMPTS, age)
                 print("[watchdog] ESCALATED oscillating deferred marker %s (%d attempts, still re-defers) — NOT requeued again" % (mid, attempts), flush=True)
             continue
 
