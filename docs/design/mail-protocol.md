@@ -429,6 +429,49 @@ the next session discovers state from beads, not from mail.
 NOT respond with mail. The Deacon tracks health via session status, not mail
 responses.
 
+## Mail Hygiene: Keep the Counter Honest
+
+The unread-mail counter (`gc mail count`, and the `gc mail check --inject`
+system-reminder agents see on wake) is the human's signal for whether mail is
+actually being read. It only stays honest if agents mark messages as they
+process them -- **surfacing a message is not the same as processing it.**
+
+### Root cause of a stuck counter
+
+`gc mail check --inject` only emits a `<system-reminder>` block into the
+agent's prompt; it marks nothing as read. `gc mail inbox` and `gc mail peek`
+both display full message content without changing read status either
+(`peek` is explicit about this: "does not change the message's read status").
+So an agent can genuinely read a message via inject, inbox, or peek, act on
+it, and never flip its status -- the message stays "unread" forever even
+though it was seen and handled. The counter then sticks at a high number and
+misleads the human into thinking mail is being ignored, when it was read and
+acted on, just never marked.
+
+### The norm
+
+**Mark mail as you process it -- read what you open, archive what you've
+handled:**
+
+- `gc mail read <id>` -- view a message and mark it read (stays in the store,
+  re-readable later)
+- `gc mail archive <id>` -- remove a message once handled; it no longer
+  appears in `gc mail check` or `gc mail inbox` results
+
+Don't leave a backlog of read-but-unarchived mail either -- once you've acted
+on a message (or it's a routine ack you don't need to revisit), archive it.
+
+### Why not auto-mark-read on `--inject`?
+
+Rejected. Injection means "surfaced in a prompt," not "processed." Marking
+read automatically on inject would make the counter lie in the opposite,
+more dangerous direction -- showing 0 unread while messages sit unprocessed.
+A stuck-but-honest counter is a better failure mode than a false all-clear.
+
+A "seen" state distinct from "read" (separating "surfaced in a prompt" from
+"actually processed") would be the structurally clean fix here, but it's real
+design surface -- deferred unless this norm proves insufficient in practice.
+
 ## Implementation
 
 ### Sending Mail
