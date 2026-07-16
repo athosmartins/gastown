@@ -486,10 +486,17 @@ def frozen_reviewer_verdict(state, silence_sec, threshold_sec):
 
 
 def _queued_markers():
-    """[(id, branch, created_epoch), ...] for every gate-status:queued marker.
-    Returns [] on any error (fail-safe: no markers → no orphan fire)."""
-    r = sh(["bd", "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",
-            "-l", "gate-status:queued", "--json"], timeout=25)
+    """[(id, branch, created_epoch), ...] for every OPEN gate-status:queued
+    marker. --all is required to surface the normally-hidden gate-marker type,
+    but it also lifts bd's default closed-issue hiding — so a marker closed via
+    the ad-hoc withdrawal path (e.g. "WITHDRAWN as duplicate") that kept its
+    gate-status:queued label would otherwise be indistinguishable from a
+    genuinely stuck open one. Filtered at both the query (--status) and parse
+    (status check) layers, since a future query refactor could silently drop
+    the CLI flag (ga-huke4). Returns [] on any error (fail-safe: no markers →
+    no orphan fire)."""
+    r = sh(["bd", "-C", CITY, "list", "--all", "--status", "open,in_progress",
+            "-l", "type:quality-gate-marker", "-l", "gate-status:queued", "--json"], timeout=25)
     if not r or r.returncode != 0:
         return []
     try:
@@ -498,6 +505,8 @@ def _queued_markers():
         return []
     out = []
     for row in rows or []:
+        if row.get("status") not in ("open", "in_progress"):
+            continue  # stale label on a closed/withdrawn marker (ga-huke4)
         branch = None
         for lb in (row.get("labels") or []):
             m = MARKER_BRANCH_RE.match(lb)

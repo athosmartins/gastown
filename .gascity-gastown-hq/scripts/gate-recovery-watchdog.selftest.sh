@@ -180,6 +180,36 @@ if res and res[0][0] == "ga-wisp-old":
 else:
     bad("expected oldest-first ['ga-wisp-old', ...], got %r" % ([r[0] for r in res],))
 
+# ── Scenario 9b: _queued_markers() excludes a closed marker with a stale label ──
+# (ga-huke4: a marker closed via the ad-hoc withdrawal path — e.g. "WITHDRAWN as
+# duplicate" — often keeps its gate-status:queued label; --all (needed to reveal
+# the gate-marker type at all) must not let that stale label make a dead marker
+# look like a live one to _detect_orphan_markers.)
+print("Scenario 9b: _queued_markers() filters out a closed marker with a stale gate-status:queued label")
+def _fake_sh_rows(rows):
+    class _R:
+        def __init__(self):
+            self.returncode = 0
+            self.stdout = m.json.dumps(rows)
+    def _inner(args, timeout=25, stdin=None):
+        return _R()
+    return _inner
+_real_sh_qm = m.sh
+m.sh = _fake_sh_rows([
+    {"id": "ga-wisp-open", "status": "open",
+     "labels": ["type:quality-gate-marker", "gate-status:queued", "branch:crew/wa/wa-open"],
+     "created_at": "2026-07-16T00:00:00Z"},
+    {"id": "ga-wisp-withdrawn", "status": "closed",
+     "labels": ["type:quality-gate-marker", "gate-status:queued", "branch:crew/wa/wa-withdrawn"],
+     "created_at": "2026-06-30T00:48:57Z"},
+])
+qm_ids = [q[0] for q in m._queued_markers()]
+m.sh = _real_sh_qm
+if qm_ids == ["ga-wisp-open"]:
+    ok("closed marker excluded even though it still carries the gate-status:queued label")
+else:
+    bad("expected only ['ga-wisp-open'], got %r — closed/withdrawn marker leaked through" % (qm_ids,))
+
 # ── Drift guard: the live script actually wires the detector in ──────────────
 print("Scenario 10: drift-guard — detector defined and wired into main()")
 src = open(wd_path).read()
