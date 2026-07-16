@@ -328,12 +328,14 @@ slot_effectively_dead() {
 # non-not-found result is treated as ALIVE, so a transient peek/Dolt glitch can
 # NEVER reap a live reviewer; the grace + dead-streak guards and the outer
 # timeout remain the backstops above this signal.
+# SELFTEST-EXTRACT session-peek-reports-dead-fn: BEGIN
 session_peek_reports_dead() {
   case "$1" in
     *"session not found"*) echo 1 ;;
     *) echo 0 ;;
   esac
 }
+# SELFTEST-EXTRACT session-peek-reports-dead-fn: END
 
 # session_is_booting <state> → 1 (the session record exists but the runtime
 # has not started yet — NOT a signal of death) | 0. Pure; no I/O.
@@ -2651,6 +2653,7 @@ DEFAULT_BRANCH=$(echo "$RIG_LIST_JSON" \
 # wall-clock-based hang/stranded-run detectors (already cross-invocation-safe
 # by design) are the other backstop for this same failure mode. Nothing hangs
 # forever; a rare failure mode is just detected slower. See ga-eqjo PR.
+# SELFTEST-EXTRACT gate-collect-verdicts-fn: BEGIN
 gate_collect_verdicts() {
   VERDICTS_RECEIVED=0
   ANY_FAIL=0
@@ -2660,6 +2663,35 @@ gate_collect_verdicts() {
     VB_JSON=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null || echo "[]")
     VB_STATUS=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .status // "open"')
     VB_LABELS=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")')
+
+    # ga-7lz1: a reviewer that WRITES its verdict (label + comment) but DRAINS
+    # before the final `bd close` leaves this bead OPEN forever — the
+    # closed-only check right below then re-reads a genuinely complete review
+    # as "still pending" every sweep, so the run sits until the full
+    # VERDICT_TIMEOUT_MINUTES elapses and the dead-reviewer requeue path
+    # (Phase C, below) discards the real verdict for a from-scratch
+    # re-review. Rescue it: an OPEN bead already carrying an explicit
+    # verdict:PASS/verdict:FAIL label is only ambiguous while its reviewer
+    # might still be mid-write (the label can land seconds before the close),
+    # so gate on CONFIRMED death, never on the label alone — fail-safe: any
+    # inconclusive or live peek leaves the bead pending, same as before this
+    # fix. `gc session list`/session_is_dead() is NOT the right death signal
+    # here: a drained (normally-ended) session STAYS listed with closed!=true
+    # (ga-h9o17/gt-bewtm), so it would read ALIVE. `gc session peek` is the
+    # proven discriminator (same check the gt-bewtm headroom janitor uses
+    # above in this file): a drained session answers "session not found" on
+    # stderr; a genuinely alive-but-slow one answers with real scrollback.
+    if [ "$VB_STATUS" != "closed" ] && echo "$VB_LABELS" | grep -qE "verdict:(PASS|FAIL)"; then
+      VB_ASSIGNEE=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""')
+      if [ -n "$VB_ASSIGNEE" ]; then
+        VB_PEEK_ERR=$(gc --city "$GC_CITY" session peek "$VB_ASSIGNEE" --lines 1 2>&1 >/dev/null || true)
+        if [ "$(session_peek_reports_dead "$VB_PEEK_ERR")" = "1" ]; then
+          log "  Verdict bead $VB has a verdict label but is still OPEN and its reviewer ($VB_ASSIGNEE) is confirmed drained — rescuing as delivered and closing it (ga-7lz1)."
+          bd -C "$GC_CITY" close "$VB" -r "auto-closed by dispatcher: verdict label delivered, reviewer session drained before its own close (ga-7lz1)" 2>/dev/null || true
+          VB_STATUS="closed"
+        fi
+      fi
+    fi
 
     if [ "$VB_STATUS" = "closed" ]; then
       VERDICTS_RECEIVED=$((VERDICTS_RECEIVED + 1))
@@ -2734,6 +2766,7 @@ gate_collect_verdicts() {
     # scope-reduction note in this function's header comment above.
   done
 }
+# SELFTEST-EXTRACT gate-collect-verdicts-fn: END
 # extract <field-name> — parse a "<field-name>: value" line out of $DESC.
 # Hoisted (ga-eqjo) so Phase C can reuse it on a run bead's description the
 # same way Step 2 uses it on a marker's. ga-7zjs1: trailing `|| true` keeps a
