@@ -432,6 +432,25 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
         continue
     fi
 
+    # Empty/absent assignee on an in_progress bead (ga-79vq): there's no name
+    # to check — not a confirmed-dead session, just an INDETERMINATE owner.
+    # Before this fix, the session-health block below (gated on `-n
+    # "$assignee"`) never ran, so live_session_name and transcript_state both
+    # stayed "" — matching neither "advancing" nor "unknown" further down,
+    # falling through both guards straight into escalation. Same error-vs-
+    # empty conflation this script has fixed before (ga-2tpd, ga-4tmc;
+    # ga-p5q3 root class): "don't know who owns this" and "owner confirmed
+    # dead" produced the same outcome. Concretely: a bead's assignee can be
+    # cleared mid-flight (inflight-reclaim-guard, a raw `bd update`, ...)
+    # while the real owner — findable only via crew:<name>/gc.routed_to,
+    # which this probe doesn't resolve — keeps working (wa-ka2lm escalated 3x
+    # against a live thies-wa-gam257). Suppress on unknown, like the other
+    # tri-state fail-safes below.
+    if [ -z "$assignee" ]; then
+        log "$bead_id: bead.updated_at parado ${age_min}min — assignee vazio/ausente — dono indeterminável (não confirmado morto) — SUPRIMINDO escalação (fail-safe ga-79vq)"
+        continue
+    fi
+
     # ga-2tpd fix (part 2): the session-list query failed this whole pass —
     # this assignee's session state was never actually checked. Suppress
     # rather than fall through to "AUSENTE" (see SESSIONS_QUERY_FAILED note

@@ -443,16 +443,71 @@ assert_absent "$ACTIONS" "notify" "T24: no notify — session-list query failure
 [ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test10" ] && ok "T24: no escalation state written (suppression is log-only)" || bad "T24: unexpected state file written on suppression"
 log_contains "T24" "DESCONHECIDO" "T24: log distinguishes session-query-failed from confirmed-absent"
 
-# ── T25: session-list query fails + UNASSIGNED bead → escalation unaffected ──
-# (no regression): an unassigned bead has no session to fail to check, so
-# the new fail-safe must not touch it — it should still escalate on
-# bead.updated_at alone, exactly as before this fix.
-echo "T25: gc session list query fails + unassigned bead → escalation unaffected (no regression)"
+# ── T25: session-list query fails + UNASSIGNED bead → still suppressed ───────
+# (ga-79vq revision): this test used to assert the OPPOSITE — that an
+# unassigned bead escalates "on age alone" regardless of session-query
+# state. That assumption WAS the bug (see T26 below): an in_progress bead's
+# assignee can be cleared out from under a live owner (inflight-reclaim-
+# guard, a raw `bd update`, ...), so empty-assignee is UNKNOWN ownership,
+# not proof nobody's home. Kept as its own case (rather than folded into
+# T26) to document that the empty-assignee fail-safe and the
+# session-query-failure fail-safe compose without conflict — either one
+# alone is enough to suppress.
+echo "T25: gc session list query fails + unassigned bead → still suppressed (ga-79vq)"
 printf '[%s]' "$(make_bead ga-test11 "" 2200)" > "$BEADS_FIXTURE"
 rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test11"
 : > "$ACTIONS"
 SESSIONS_QUERY_FAIL=1 STUCK_AGENT_SEC=1800 run_script > /dev/null
-assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test11" "T25: unassigned bead still escalates despite session-query failure"
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test11" "T25: unassigned bead suppressed even when session-query also fails"
+
+# ── T26: empty assignee, session-list query SUCCEEDS → still suppressed ──────
+# (ga-79vq core fix, acceptance case i). Distinct from T25 (which fails the
+# session query entirely): here `gc session list` works fine and even
+# reports an unrelated live session — but THIS bead's own assignee field is
+# empty, so there's no name to check it against. Empty assignee is UNKNOWN
+# ownership, not a dead assignee proven absent, and must suppress just like
+# T22/T24/T25 — same root class (ga-p5q3): error and empty must not
+# collapse to the same escalate-or-not answer. Real-world shape: wa-ka2lm
+# escalated 3x this way while thies-wa-gam257 was alive and building it.
+echo "T26: empty assignee, session-list query succeeds → suppressed (ga-79vq i)"
+echo '{"sessions":[{"name":"thies-wa","session_name":"thies-wa-gam257","state":"active"}]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead ga-test12 "" 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test12"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test12" "T26: empty assignee suppressed regardless of session-query outcome"
+assert_absent "$ACTIONS" "notify" "T26: no notify — unknown owner suppresses"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test12" ] && ok "T26: no escalation state written (suppression is log-only)" || bad "T26: unexpected state file written on suppression"
+log_contains "T26" "assignee vazio" "T26: log distinguishes empty-assignee unknown from confirmed-absent"
+
+# ── T27: assignee set, session genuinely absent → still escalates ────────────
+# (ga-79vq acceptance case ii, no regression). Confirms the new
+# empty-assignee fail-safe does NOT swallow the genuinely-dead-assignee
+# case — only a truly EMPTY assignee suppresses; a real name with no
+# matching active session is still a confirmed-absent verdict and escalates
+# exactly as before (same shape as T15; kept as its own explicitly-named
+# case for ga-79vq traceability).
+echo "T27: assignee genuinely dead (non-empty, no matching session) → still escalates (ga-79vq ii)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead ga-test13 wa-dead-assignee 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test13"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test13" "T27: genuinely dead assignee still escalates (no regression)"
+
+# ── T28: assignee alive, transcript advancing → suppressed ───────────────────
+# (ga-79vq acceptance case iii, no regression). Same shape as T13 (ga-hehi);
+# kept as its own explicitly-named case for ga-79vq traceability, using a
+# fresh bead id/session so it can't accidentally reuse T13's fixtures.
+echo "T28: assignee alive, transcript advancing → suppressed (ga-79vq iii)"
+echo '{"sessions":[{"name":"mila-wa","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture mila-wa 30
+printf '[%s]' "$(make_bead ga-test14 mila-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test14"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test14" "T28: no mail — transcript advancing (regression, ga-hehi intact)"
+rm -f "$LOGS_FIXTURE_DIR/mila-wa.json"
 
 # ── T10–T12: Layer 1 routing integration (ga-qw3p.1) ────────────────────────
 # Deploy the real escalation-router.sh so the script can source it.
