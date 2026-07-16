@@ -36,7 +36,13 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # NON-ephemeral origin, so that gated probe is silently SKIPPED and you would wrongly drain
 # while real pool work waits unclaimed. You ARE a dedicated ps-worker — ALWAYS run this
 # UN-GATED routed-pool probe directly:
-bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --json --sort oldest --limit=1
+# ga-y8qh: excludes pool:refused:*/story:needs-human/ctx:thin — nothing clears
+# gc.routed_to after a refusal, so without this filter every fresh worker
+# re-fetches and re-confirms the SAME already-parked bead, burning a full
+# startup per session. --exclude-label is exact-match only, so
+# pool:refused:<reason-slug> needs the jq startswith() pass; limit=20 (not 1)
+# so a filtered-out top candidate can't hide a valid one behind it.
+bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "ctx:thin" --json --sort oldest --limit=20 | jq '[.[] | select((.labels // []) | map(select(startswith("pool:refused"))) | length == 0)] | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.

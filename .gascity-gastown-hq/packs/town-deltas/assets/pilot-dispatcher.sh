@@ -1304,6 +1304,15 @@ _filter_candidates() {
         and (((.labels // []) - $preapproval) | length) == ((.labels // []) | length)
         and ((.labels // []) | map(select(
           startswith("gate:needs-human")
+          # ga-y8qh: pool:refused[:<reason-slug>] is the pool-worker-refusal
+          # counterpart to gate:needs-human — same prefix-sub-variant shape,
+          # same reason to catch it here (upstream, at selection time) rather
+          # than only downstream: a refused-and-parked bead keeps its
+          # gc.routed_to (nothing clears it), so without this it can be
+          # re-selected as a fresh dispatch candidate on a later sweep and
+          # re-routed into the same refusal loop the parking label was meant
+          # to end.
+          or startswith("pool:refused")
           or . == "story:needs-human"
           or . == "story:needs-device"
           or . == "on-device"
