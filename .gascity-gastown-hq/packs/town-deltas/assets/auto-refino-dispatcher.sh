@@ -1331,6 +1331,11 @@ case "$DECISION" in
     else
       # No delivered twin — complete the normal handoff.
       bd_ update "$STORY_ID" --set-metadata "story.auto_refino_attempts=$THIS_ATTEMPT" -q 2>/dev/null || true
+      # Normalize issue_type story→feature: gate + Pilot only ever query --type
+      # feature, so a story-typed bead would stay invisible forever after this
+      # handoff (ga-oe7e). Done here, not inside the refiner's heredoc, so it's
+      # guaranteed regardless of what the spawned session executes.
+      bd_ update "$STORY_ID" --type feature -q 2>/dev/null || true
       # Defensive: ensure the claim marker is gone even if the refiner forgot.
       bd_ label remove "$STORY_ID" "auto-refino:refining" -q 2>/dev/null || true
       # PHANTOM-ASSIGNEE FIX: the claim step set assignee=auto-refino so parallel
