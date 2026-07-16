@@ -13,9 +13,14 @@
 #   1. Computes the source files the deploy actually changed (git diff).
 #   2. Discovers the rig's long-lived launchd daemons from their plists
 #      (ProgramArguments → the .py entrypoint it runs, following wrapper .sh).
-#   3. Marks a daemon AFFECTED when its entrypoint changed, OR when a changed
+#   3. Marks a daemon AFFECTED when its entrypoint changed, when a changed
 #      shared module (routes/*.py, lib/*.py, …) is imported by its entrypoint
-#      (the exact ga-d81 dashboard-mounts-route scenario).
+#      (the exact ga-d81 dashboard-mounts-route scenario), OR when a changed
+#      Jinja template (*.html/*.htm/*.jinja/*.jinja2/*.j2) is rendered by its
+#      entrypoint via render_template(...) — templates are compiled and cached
+#      in-process (TEMPLATES_AUTO_RELOAD off in prod), so a disk-only template
+#      edit was otherwise invisible here (ga-jkj0: com.whatsapp.map-viewer
+#      served a stale layout twice despite "deployed + verified").
 #   4. SAFE daemons (read-only dashboards): kickstart -k, then VERIFY the new
 #      process actually started AFTER the deploy timestamp. A daemon that stays
 #      stale (restart did not take / crash-loop) FAILS verification.
@@ -106,11 +111,13 @@ fi
 # ── Step 1: changed files in this deploy ──────────────────────────────────────
 CHANGED="$(git -C "$RUNTIME_DIR" diff --name-only "$PRE_DEPLOY_SHA" "$POST_DEPLOY_SHA" 2>/dev/null || true)"
 CHANGED_PY="$(echo "$CHANGED" | grep -E '\.py$' || true)"
-if [ -z "$CHANGED_PY" ]; then
-  log "deploy changed no *.py files — no daemon code affected — OK."
-  emit OK "no python source changed"
+CHANGED_TEMPLATES="$(echo "$CHANGED" | grep -E '\.(html|htm|jinja2?|j2)$' || true)"
+if [ -z "$CHANGED_PY" ] && [ -z "$CHANGED_TEMPLATES" ]; then
+  log "deploy changed no *.py or template files — no daemon code affected — OK."
+  emit OK "no python source or template changed"
 fi
 log "changed python files:"; echo "$CHANGED_PY" | sed 's/^/[daemon-refresh]   /' >&2
+log "changed template files:"; echo "$CHANGED_TEMPLATES" | sed 's/^/[daemon-refresh]   /' >&2
 
 # helper: epoch of a pid's start time (parses `ps -o lstart=`)
 pid_start_epoch() {  # pid_start_epoch <pid>
@@ -201,6 +208,7 @@ fi
 # precompute changed basenames + stems for matching
 CHANGED_BASENAMES="$(echo "$CHANGED_PY" | while read -r f; do [ -n "$f" ] && basename "$f"; done)"
 CHANGED_STEMS="$(echo "$CHANGED_BASENAMES" | sed 's/\.py$//' | grep -v '^$' || true)"
+CHANGED_TEMPLATE_BASENAMES="$(echo "$CHANGED_TEMPLATES" | while read -r f; do [ -n "$f" ] && basename "$f"; done)"
 
 # is_sensitive <label>
 is_sensitive() {
@@ -210,6 +218,24 @@ is_sensitive() {
     case "$label" in *"$sub"*) return 0 ;; esac
   done
   return 1
+}
+
+# extract literal render_template("...") / render_template('...') first-arg
+# names referenced in a file — same single-hop precision as the import-level
+# .py match below (checks the daemon's own entrypoint, not its full transitive
+# closure).
+daemon_template_names() {  # daemon_template_names <file>
+  local f="$1"
+  [ -f "$f" ] || return 0
+  python3 - "$f" <<'PY' 2>/dev/null
+import re, sys
+try:
+    src = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+except Exception:
+    sys.exit(0)
+for m in re.findall(r'render_template\(\s*[\'"]([^\'"]+)[\'"]', src):
+    print(m)
+PY
 }
 
 # ── Step 3: resolve affected daemons ──────────────────────────────────────────
@@ -236,6 +262,23 @@ for label in $DAEMON_LABELS; do
           affected=1; break
         fi
       done
+      [ "$affected" -eq 1 ] && break
+    done
+  fi
+
+  # template: a changed template this daemon's own entrypoint renders via
+  # render_template(...) (ga-jkj0 — Jinja templates are cached in-process and
+  # a disk-only change is otherwise invisible to this script).
+  if [ "$affected" -eq 0 ] && [ -n "${CHANGED_TEMPLATE_BASENAMES// /}" ]; then
+    for e in $entries; do
+      [ -f "$RUNTIME_DIR/$e" ] || continue
+      while IFS= read -r tmpl; do
+        [ -n "$tmpl" ] || continue
+        tb="$(basename "$tmpl")"
+        if echo "$CHANGED_TEMPLATE_BASENAMES" | grep -qxF "$tb"; then
+          affected=1; break
+        fi
+      done < <(daemon_template_names "$RUNTIME_DIR/$e")
       [ "$affected" -eq 1 ] && break
     done
   fi

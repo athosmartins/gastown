@@ -12,6 +12,10 @@
 #      guarded restart → VERDICT=NEEDS_GUARDED_RESTART, non-zero exit.
 #   5. Resolves import-level changes: a changed routes/*.py module marks the
 #      dashboard that imports it as affected (the exact ga-d81 scenario).
+#   6. Resolves template-only changes: a changed *.html a dashboard renders via
+#      render_template(...) marks it affected even with zero *.py changes (the
+#      ga-jkj0 scenario — Jinja templates are cached in-process). An unrelated
+#      template change (not referenced by any daemon) stays OK, no restart.
 #
 # All external effects (launchctl, ps) are injected via LAUNCHCTL_BIN / PS_BIN
 # and a mock state dir, so the test touches NO real daemons. The plist scan and
@@ -251,6 +255,54 @@ V=$(field VERDICT "$OUT")
 [ "$RC" -eq 0 ] && ok "T6 exit 0" || nok "T6 exit" "rc=$RC"
 [ ! -f "$MOCK/kicks.log" ] && ok "T6 scheduled/down job NOT kickstarted" || nok "T6 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 echo "$(field RESTARTED "$OUT")" | grep -q "daily-scraper" && nok "T6 should not restart" "restarted=$(field RESTARTED "$OUT")" || ok "T6 not in RESTARTED"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T7: template-only change — a changed *.html a dashboard renders via
+#     render_template(...) marks it affected with ZERO *.py changes (ga-jkj0:
+#     com.whatsapp.map-viewer served a stale layout — Jinja compiles+caches
+#     templates in-process, so a disk-only edit was invisible pre-fix).
+# ════════════════════════════════════════════════════════════════════════════
+new_case t7
+cat > "$RUNTIME/daemons/map_viewer_dashboard.py" <<'PYEOF'
+from flask import render_template
+def index():
+    return render_template("map_viewer.html")
+PYEOF
+mkdir -p "$RUNTIME/templates"
+cat > "$RUNTIME/templates/map_viewer.html" <<<'<html>old</html>'
+make_plist "$AGENTS" com.test.map-viewer "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/map_viewer_dashboard.py"
+seed_running com.test.map-viewer 6001 "$STALE_LSTART"
+seed_restart com.test.map-viewer 6099 "$FRESH_LSTART"
+# deploy changed ONLY the template, not the .py entrypoint
+OUT=$(run_helper templates/map_viewer.html); RC=$?
+V=$(field VERDICT "$OUT")
+echo "$(field AFFECTED "$OUT")" | grep -q "com.test.map-viewer" && ok "T7 template-rendering dashboard marked affected" || nok "T7 affected" "$(field AFFECTED "$OUT")"
+[ "$V" = "OK" ] && ok "T7 verdict OK after fresh restart" || nok "T7 verdict" "got '$V' out=[$OUT]"
+grep -q "com.test.map-viewer" "$MOCK/kicks.log" 2>/dev/null && ok "T7 kickstart invoked" || nok "T7 kickstart" "log: $(cat "$MOCK/kicks.log" 2>/dev/null)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T8: unrelated template change — a changed *.html NOT referenced by any
+#     daemon's render_template(...) call must NOT trigger a restart (precision
+#     / no-cascade: template matching must not over-fire on every template
+#     edit in the runtime tree).
+# ════════════════════════════════════════════════════════════════════════════
+new_case t8
+cat > "$RUNTIME/daemons/map_viewer_dashboard.py" <<'PYEOF'
+from flask import render_template
+def index():
+    return render_template("map_viewer.html")
+PYEOF
+mkdir -p "$RUNTIME/templates"
+cat > "$RUNTIME/templates/map_viewer.html" <<<'<html>old</html>'
+cat > "$RUNTIME/templates/unrelated.html" <<<'<html>other</html>'
+make_plist "$AGENTS" com.test.map-viewer "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/map_viewer_dashboard.py"
+seed_running com.test.map-viewer 7001 "$STALE_LSTART"
+# deploy changes a template nobody renders
+OUT=$(run_helper templates/unrelated.html); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "OK" ] && ok "T8 verdict OK on unrelated template change" || nok "T8 verdict" "got '$V' out=[$OUT]"
+echo "$(field AFFECTED "$OUT")" | grep -q "com.test.map-viewer" && nok "T8 should not be affected" "$(field AFFECTED "$OUT")" || ok "T8 map-viewer not marked affected"
+[ ! -f "$MOCK/kicks.log" ] && ok "T8 no kickstart called (no cascade)" || nok "T8 kickstart" "called: $(cat "$MOCK/kicks.log" 2>/dev/null)"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
