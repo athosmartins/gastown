@@ -28,6 +28,22 @@ IDEMPOTENCY:
   • gc.rehomed_to metadata on HQ bead → skip (already re-homed).
   • State file check (secondary guard, survives process restarts).
 
+REVERSE DIRECTION (ga-0ou0, 2026-07-16): blocked:wrong-store-needs-rehome-hq previously had
+no consumer — a bead mis-routed HQ→rig, later flagged by a human/agent as actually HQ-owned,
+sat stuck forever (2 confirmed: wa-hshxt, wa-tj0vn, 7+ days each, only recovered by the Mayor
+re-homing them BY HAND). Each sweep ALSO scans every non-HQ rig for beads carrying this label
+and re-homes them BACK to HQ, using the same atomic create-verify-mark-close order (source and
+destination swapped). Shares the same MAX_PER_SWEEP budget as the forward direction.
+
+MISSING-FILE GUARD SCOPE (ga-0ou0 addendum to ga-xzfl): "does this cited path exist in HQ" now
+ALSO checks the git superproject root (CITY's parent) — HQ's own canonical shared assets (e.g.
+docs/design/*.md) can live one level above CITY (.gascity-gastown-hq/), which is a subtree of
+the same repo, not a separate checkout (confirmed: docs/design/mail-protocol.md — the wa-tj0vn
+case — lives at the superproject root and was invisible to a CITY-only existence check). A
+cited path is excluded from that superproject-root check if its leading segment names another
+known non-HQ rig, so a rig's own file is never mistaken for an HQ file just because both share
+the same git repo.
+
 CADENCE: MAX_PER_SWEEP=1 by default — one re-home per 10-min launchd cycle for safe pace.
 
 LAUNCHD: StartInterval=600, one-shot (no KeepAlive). See com.gascity.auto-rehome-janitor.plist.
@@ -121,6 +137,11 @@ def _save_state(state):
 _REHOME_RE = re.compile(r'^needs:rehome[-:](.+)$')
 _HELD_UNTIL_RE = re.compile(r'^pilot:held-until:')
 
+# ga-0ou0: label a human/agent applies when a bead landed in the wrong (non-HQ)
+# store and should come back to HQ. Previously had no consumer — see REVERSE
+# DIRECTION in the module docstring.
+WRONG_STORE_LABEL = "blocked:wrong-store-needs-rehome-hq"
+
 
 def _parse_rehome_label(label):
     """Extract rig suffix from needs:rehome-<suffix> or needs:rehome:<suffix>. Returns suffix or None."""
@@ -129,11 +150,13 @@ def _parse_rehome_label(label):
 
 
 def _filter_labels(labels):
-    """Labels to carry to rig bead: DROP needs:rehome-* and pilot:held-until:*.
+    """Labels to carry to the destination bead: DROP whatever this re-home (in
+    either direction) satisfies, plus HQ-scheduler cruft.
 
     DROP (satisfied / HQ-scheduler cruft):
-      needs:rehome-*     — satisfied by this re-home
-      pilot:held-until:* — HQ pilot scheduling artifact; irrelevant in rig store
+      needs:rehome-*                      — satisfied by a forward (HQ→rig) re-home
+      pilot:held-until:*                  — HQ pilot scheduling artifact; irrelevant elsewhere
+      blocked:wrong-store-needs-rehome-hq — satisfied by a reverse (rig→HQ) re-home (ga-0ou0)
 
     PRESERVE (all others):
       story:approved     — required for rig Pilot to dispatch
@@ -146,6 +169,8 @@ def _filter_labels(labels):
         if _REHOME_RE.match(label):
             continue
         if _HELD_UNTIL_RE.match(label):
+            continue
+        if label == WRONG_STORE_LABEL:
             continue
         kept.append(label)
     return kept
@@ -432,8 +457,32 @@ def _rig_has_any_cited_file(bead, rig_path):
     return False
 
 
+def _hq_has_any_cited_file(bead, non_hq_rig_names):
+    """ga-0ou0: like _rig_has_any_cited_file(bead, CITY), but ALSO checks the git
+    superproject root (CITY's parent) — HQ's own canonical shared assets (e.g.
+    docs/design/*.md) can live one level above CITY, in the same git repo, not a
+    separate checkout (docs/design/mail-protocol.md, the wa-tj0vn case, is exactly
+    this: invisible to a CITY-only existence check). A cited path whose leading
+    segment names another known non-HQ rig is excluded from the superroot check,
+    so a rig's own file is never mistaken for an HQ file just because both share
+    the same git repo. FAIL-OPEN throughout (mirrors _rig_has_any_cited_file)."""
+    if _rig_has_any_cited_file(bead, CITY):
+        return True
+    superroot = os.path.dirname(CITY.rstrip("/")) or CITY
+    if _file_exists_fn is None and not os.path.isdir(superroot):
+        return True  # unknown / off-disk superroot → cannot judge → fail-open
+    non_hq_rig_names = non_hq_rig_names or set()
+    for p in _paths_from_bead(bead):
+        first_seg = p.split("/", 1)[0]
+        if first_seg in non_hq_rig_names:
+            continue
+        if _file_exists_in_rig(superroot, p):
+            return True
+    return False
+
+
 # ── re-home one bead ──────────────────────────────────────────────────────────
-def _rehome_bead(hq_bead, rig, state):
+def _rehome_bead(hq_bead, rig, state, non_hq_rig_names=None):
     """Re-home a single HQ bead to its target rig store.
 
     Returns True if re-homed (or DRY_RUN intent logged), False on skip/failure.
@@ -476,7 +525,7 @@ def _rehome_bead(hq_bead, rig, state):
     # so a probe hiccup never manufactures a destructive false refuse.
     if (MISSING_FILE_GUARD
             and not _rig_has_any_cited_file(hq_bead, rig_path)
-            and _rig_has_any_cited_file(hq_bead, CITY)):
+            and _hq_has_any_cited_file(hq_bead, non_hq_rig_names)):
         _log("  SKIP %s: cites file path(s) %s present in HQ but absent in target rig %s (%s) — "
              "MISLOCATED (not this rig's work); keeping HQ bead untouched (no create/close). "
              "Disable with PILOT_MISSING_FILE_GUARD=0." % (
@@ -557,6 +606,135 @@ def _rehome_bead(hq_bead, rig, state):
     return True
 
 
+# ── re-home one bead BACK to HQ (ga-0ou0, reverse direction) ──────────────────
+def _rehome_bead_reverse(rig, rig_bead, state):
+    """Re-home a single rig bead BACK to HQ — the mirror image of _rehome_bead,
+    for beads labeled blocked:wrong-store-needs-rehome-hq (a human/agent decided
+    an earlier HQ→rig call, by this janitor or otherwise, was wrong). HQ is the
+    fixed destination; `rig` is the (variable) source store. Same atomic
+    create→verify→mark→close order and safety guarantees as the forward
+    direction; no missing-file guard here — unlike needs:rehome-<rig> (an
+    automatic Pilot heuristic that needs a safety net), this label is an
+    explicit human/agent judgment call, trusted as-is.
+
+    Returns True if re-homed (or DRY_RUN intent logged), False on skip/failure.
+    """
+    rig_id = rig_bead.get("id") or ""
+    rig_name = rig["name"]
+    rig_path = rig["path"]
+    title = (rig_bead.get("title") or "")[:80]
+
+    _log("REVERSE CANDIDATE %s (%s) → HQ | %s" % (rig_id, rig_name, title))
+
+    # ── Idempotency check ──────────────────────────────────────────────────────
+    existing_meta = rig_bead.get("metadata") or {}
+    if existing_meta.get("gc.rehomed_to"):
+        _log("  SKIP %s: already has gc.rehomed_to=%s" % (rig_id, existing_meta["gc.rehomed_to"]))
+        return False
+
+    state_key = "rev:%s" % rig_id
+    if state_key in state.get("rehomed", {}):
+        prior = state["rehomed"][state_key]
+        _log("  SKIP %s: state records as already re-homed → %s (at %s)" % (
+             rig_id, prior.get("new_id"), prior.get("ts")))
+        return False
+
+    # ── Step 1: Create in HQ ───────────────────────────────────────────────────
+    _log("  Step 1: creating bead in HQ ...")
+    new_id = _bd_create_in_rig(CITY, rig_bead)
+    if not new_id:
+        _log("  ABORT %s: create in HQ failed — %s bead untouched" % (rig_id, rig_name))
+        return False
+
+    if DRY_RUN:
+        _log("  DRY_RUN: would verify → comment → mark → close; skipping mutations")
+        return True  # counted as "would re-home"
+
+    # ── Step 2: Verify new id exists ───────────────────────────────────────────
+    _log("  Step 2: verifying %s in HQ ..." % new_id)
+    verified = _bd_show(CITY, new_id)
+    if not verified:
+        _log("  ABORT %s: new bead %s NOT found in HQ after create — "
+             "%s bead untouched (HQ store may have dropped it; investigate)" % (
+             rig_id, new_id, rig_name))
+        return False
+    _log("  VERIFIED: %s exists in HQ (title=%r)" % (new_id, (verified.get("title") or "")[:60]))
+
+    # ── Step 3: Mark rig bead as re-homed ──────────────────────────────────────
+    _log("  Step 3: marking %s gc.rehomed_to=%s ..." % (rig_id, new_id))
+    merged_meta = dict(existing_meta)
+    merged_meta["gc.rehomed_to"] = new_id
+    merged_meta["gc.rehomed_to_rig"] = "gascity"
+    mark_ok = _bd_update_metadata(rig_path, rig_id, merged_meta)
+    if not mark_ok:
+        _log("  WARN: failed to set gc.rehomed_to on %s — "
+             "continuing (new bead %s exists; HQ may need manual close)" % (rig_id, new_id))
+
+    # ── Step 4: Comment both beads ─────────────────────────────────────────────
+    _log("  Step 4: commenting both beads ...")
+    rig_comment = (
+        "auto-rehome-janitor: re-homed BACK to HQ as %s (honoring %s). "
+        "%s original closing." % (new_id, WRONG_STORE_LABEL, rig_name)
+    )
+    hq_comment = (
+        "auto-rehome-janitor: created from %s original %s (reverse re-home — wrong-store "
+        "correction). Ready for HQ dispatch." % (rig_name, rig_id)
+    )
+    _bd_add_comment(rig_path, rig_id, rig_comment)
+    _bd_add_comment(CITY, new_id, hq_comment)
+
+    # ── Step 5: Close rig original ─────────────────────────────────────────────
+    _log("  Step 5: closing %s %s ..." % (rig_name, rig_id))
+    close_reason = "re-homed back to HQ as %s by auto-rehome-janitor (wrong-store correction)" % new_id
+    close_ok = _bd_close_bead(rig_path, rig_id, close_reason)
+    if not close_ok:
+        _log("  WARN: close of %s %s failed — new bead %s exists in HQ. "
+             "%s bead is marked gc.rehomed_to; close manually: "
+             "bd -C %s close %s" % (rig_name, rig_id, new_id, rig_name, rig_path, rig_id))
+    else:
+        _log("  Step 5: %s %s closed OK" % (rig_name, rig_id))
+
+    # ── Record in state + notify ───────────────────────────────────────────────
+    state.setdefault("rehomed", {})[state_key] = {
+        "new_id": new_id,
+        "rig": "gascity",
+        "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "hq_closed": close_ok,
+    }
+
+    msg = "re-homed BACK to HQ: %s (%s) → %s | %s" % (rig_id, rig_name, new_id, title[:40])
+    if _do_notify_fn is not None:
+        _do_notify_fn(msg, 2)
+    else:
+        _sh([NOTIFY_BIN, "-t", "Auto-rehome", "-p", "2", msg], timeout=10)
+
+    _log("  DONE: %s (%s) → %s in HQ" % (rig_id, rig_name, new_id))
+    return True
+
+
+def _collect_reverse_candidates(non_hq_rigs):
+    """Scan every non-HQ rig for beads labeled blocked:wrong-store-needs-rehome-hq
+    (ga-0ou0 bug 2: this label previously had no consumer). Returns dict of
+    rig_bead_id -> (bead, rig), deduplicated by id. Deliberately scans ALL
+    non-HQ rigs regardless of SKIP_SUSPENDED — reading a rig's bd store and
+    creating in HQ don't require the rig's own workers to be running."""
+    candidates = {}
+    for rig in non_hq_rigs:
+        beads = _bd_list_with_label(rig["path"], WRONG_STORE_LABEL)
+        if beads is None:
+            _log("  WARN: bd list failed for %r in rig %r — skipping (fail-open)" % (
+                 WRONG_STORE_LABEL, rig["name"]))
+            continue
+        if not beads:
+            continue
+        _log("  rig %r: %d bead(s) labeled %s" % (rig["name"], len(beads), WRONG_STORE_LABEL))
+        for bead in beads:
+            bid = bead.get("id") or ""
+            if bid and bid not in candidates:
+                candidates[bid] = (bead, rig)
+    return candidates
+
+
 # ── discover all rehome labels present in HQ ──────────────────────────────────
 def _discover_rehome_labels(non_hq_rigs):
     """Build the set of needs:rehome-* labels to query for.
@@ -589,7 +767,9 @@ def _discover_rehome_labels(non_hq_rigs):
 
 # ── main sweep ────────────────────────────────────────────────────────────────
 def run_sweep(now, state):
-    """Scan HQ for needs:rehome-* beads and re-home up to MAX_PER_SWEEP per cycle.
+    """Scan HQ for needs:rehome-* beads (forward) and every non-HQ rig for
+    blocked:wrong-store-needs-rehome-hq beads (reverse, ga-0ou0), re-homing up
+    to MAX_PER_SWEEP total per cycle across both directions combined.
 
     Returns count of beads actually re-homed.
     """
@@ -603,16 +783,42 @@ def run_sweep(now, state):
         _log("WARN: no rigs found — nothing to do")
         return 0
 
-    non_hq_rigs = [r for r in all_rigs if not r.get("hq", False)]
-    _log("rigs: %s" % [r["name"] for r in non_hq_rigs])
+    non_hq_rigs_all = [r for r in all_rigs if not r.get("hq", False)]
+    _log("rigs: %s" % [r["name"] for r in non_hq_rigs_all])
 
+    non_hq_rigs = non_hq_rigs_all
     if SKIP_SUSPENDED:
         non_hq_rigs = [r for r in non_hq_rigs if not r.get("suspended", False)]
         _log("after SKIP_SUSPENDED filter: %s" % [r["name"] for r in non_hq_rigs])
 
+    non_hq_rig_names = {r["name"] for r in non_hq_rigs_all}
+    rehomed = 0
+
+    # ── Phase 1: reverse (rig → HQ) — honor blocked:wrong-store-needs-rehome-hq (ga-0ou0) ──
+    reverse_candidates = _collect_reverse_candidates(non_hq_rigs_all)
+    if reverse_candidates:
+        _log("%d reverse candidate(s) (%s): %s" % (
+             len(reverse_candidates), WRONG_STORE_LABEL, list(reverse_candidates.keys())))
+        reverse_items = list(reverse_candidates.items())
+        for i, (rig_id, (bead, rig)) in enumerate(reverse_items):
+            if rehomed >= MAX_PER_SWEEP:
+                remaining = [cid for cid, _ in reverse_items[i:]]
+                _log("MAX_PER_SWEEP=%d reached — %d reverse bead(s) deferred to next sweep: %s" % (
+                     MAX_PER_SWEEP, len(remaining), remaining))
+                break
+            try:
+                ok = _rehome_bead_reverse(rig, bead, state)
+                if ok:
+                    rehomed += 1
+            except Exception as e:
+                _log("ERROR: unexpected error reverse-rehoming %s: %r — bead left untouched" % (
+                     rig_id, e))
+
+    # ── Phase 2: forward (HQ → rig) — needs:rehome-<rig> ─────────────────────────────────
     if not non_hq_rigs:
-        _log("no eligible non-HQ rigs — nothing to do")
-        return 0
+        _log("no eligible non-HQ rigs for forward re-home this sweep")
+        _log("sweep done: %d re-homed (MAX_PER_SWEEP=%d)" % (rehomed, MAX_PER_SWEEP))
+        return rehomed
 
     rehome_labels = _discover_rehome_labels(non_hq_rigs)
     _log("rehome labels to scan: %s" % sorted(rehome_labels))
@@ -645,20 +851,21 @@ def run_sweep(now, state):
                 candidates[bid] = (bead, target_rig)
 
     if not candidates:
-        _log("no beads need re-homing this sweep")
-        return 0
+        _log("no beads need forward re-homing this sweep")
+        _log("sweep done: %d re-homed (MAX_PER_SWEEP=%d)" % (rehomed, MAX_PER_SWEEP))
+        return rehomed
 
-    _log("%d candidate bead(s): %s" % (len(candidates), list(candidates.keys())))
-    rehomed = 0
+    _log("%d forward candidate(s): %s" % (len(candidates), list(candidates.keys())))
 
-    for hq_id, (bead, rig) in candidates.items():
+    forward_items = list(candidates.items())
+    for i, (hq_id, (bead, rig)) in enumerate(forward_items):
         if rehomed >= MAX_PER_SWEEP:
-            remaining = list(candidates.keys())[rehomed:]
+            remaining = [cid for cid, _ in forward_items[i:]]
             _log("MAX_PER_SWEEP=%d reached — %d bead(s) deferred to next sweep: %s" % (
                  MAX_PER_SWEEP, len(remaining), remaining))
             break
         try:
-            ok = _rehome_bead(bead, rig, state)
+            ok = _rehome_bead(bead, rig, state, non_hq_rig_names=non_hq_rig_names)
             if ok:
                 rehomed += 1
         except Exception as e:
@@ -704,6 +911,16 @@ def _selftest():
       (k3) PILOT_MISSING_FILE_GUARD=0 → re-home despite mislocation (kill-switch)
       (k4) FINDING 2: create-file bead (cited file in NO rig incl HQ) → re-home, NOT refuse
       (k5) FINDING 4: git-probe timeout/None → fail-open present (never conflate with absent)
+      (l) ga-0ou0 reverse: blocked:wrong-store-needs-rehome-hq → creates in HQ, marks +
+          closes rig bead
+      (m) ga-0ou0 reverse: already gc.rehomed_to → skip (idempotent)
+      (n) ga-0ou0 reverse: already in state file (rev: key) → skip (idempotent)
+      (o) ga-0ou0 reverse + forward candidates in the same sweep → MAX_PER_SWEEP shared
+          budget respected
+      (p) ga-0ou0 missing-file guard gap: cited path absent in rig+CITY but present at the
+          git superproject root → refuse (was NOT caught before this fix)
+      (q) ga-0ou0 control: cited path prefixed with a sibling rig's name at the superroot →
+          excluded from the HQ match, no false refuse
     """
     global _gc_rig_list_fn, _bd_list_fn, _bd_show_fn, _bd_create_fn
     global _bd_update_fn, _bd_comment_fn, _bd_close_fn, _bd_label_list_fn
@@ -1022,6 +1239,103 @@ def _selftest():
         _ok("(k5): git-probe rc=124 AND _sh None → fail-open present (probe failure ≠ file absent)")
     else:
         _bad("(k5)", "rc124=%s none=%s (probe failure conflated with absent → destructive false refuse)" % (r124, rnone))
+
+    # ── (l) ga-0ou0 reverse: wrong-store label → creates in HQ, marks+closes rig bead ────
+    print("\nScenario (l): reverse re-home — rig bead labeled wrong-store → creates in HQ, marks+closes rig")
+    _bd_list_fn = lambda path, label: (
+        [_make_hq_bead("ps-wrong1", labels=[WRONG_STORE_LABEL, "story:done"])]
+        if (path == "/ps" and label == WRONG_STORE_LABEL) else [])
+    _make_stubs(create_returns="ga-new001")
+    st = {"rehomed": {}}
+    _reset()
+    run_sweep(0, st)
+    created_in_hq = any(p == "/hq" for p, _ in created)
+    rig_marked = any(bid == "ps-wrong1" and "gc.rehomed_to" in meta for bid, meta in updated)
+    rig_closed = any(bid == "ps-wrong1" for bid, _ in closed)
+    if created_in_hq and rig_marked and rig_closed:
+        _ok("(l): reverse re-home created in HQ, marked rig bead, closed rig bead")
+    else:
+        _bad("(l)", "created=%s updated=%s closed=%s" % (created, updated, closed))
+
+    # ── (m) ga-0ou0 reverse: gc.rehomed_to already set → skip (idempotent) ───────────────
+    print("\nScenario (m): reverse — gc.rehomed_to set on rig bead → skip (idempotent)")
+    _bd_list_fn = lambda path, label: ([
+        _make_hq_bead("ps-already", labels=[WRONG_STORE_LABEL],
+                       meta={"gc.rehomed_to": "ga-exists", "story.resumo": "r"})
+    ] if (path == "/ps" and label == WRONG_STORE_LABEL) else [])
+    _make_stubs()
+    st = {"rehomed": {}}
+    _reset()
+    run_sweep(0, st)
+    if not created and not closed:
+        _ok("(m): reverse gc.rehomed_to → skipped (no create, no close)")
+    else:
+        _bad("(m)", "created=%s closed=%s" % (created, closed))
+
+    # ── (n) ga-0ou0 reverse: already in state file (rev: key) → skip ────────────────────
+    print("\nScenario (n): reverse — bead in state file (rev: key) → skip")
+    _bd_list_fn = lambda path, label: (
+        [_make_hq_bead("ps-instate", labels=[WRONG_STORE_LABEL])]
+        if (path == "/ps" and label == WRONG_STORE_LABEL) else [])
+    _make_stubs()
+    st = {"rehomed": {"rev:ps-instate": {"new_id": "ga-xxx", "rig": "gascity", "ts": "t"}}}
+    _reset()
+    run_sweep(0, st)
+    if not created and not closed:
+        _ok("(n): reverse state file entry → skipped")
+    else:
+        _bad("(n)", "created=%s closed=%s" % (created, closed))
+
+    # ── (o) ga-0ou0 reverse + forward same sweep → shared MAX_PER_SWEEP budget ──────────
+    print("\nScenario (o): reverse + forward candidates same sweep → shared MAX_PER_SWEEP budget (reverse runs first)")
+    globals()["MAX_PER_SWEEP"] = 1
+    _bd_list_fn = lambda path, label: (
+        [_make_hq_bead("ps-rev-o", labels=[WRONG_STORE_LABEL])] if (path == "/ps" and label == WRONG_STORE_LABEL) else
+        [_make_hq_bead("ga-fwd-o")] if (path == "/hq" and label == "needs:rehome-property") else [])
+    _make_stubs()
+    st = {"rehomed": {}}
+    _reset()
+    count = run_sweep(0, st)
+    reverse_done = any(bid == "ps-rev-o" for bid, _ in closed)
+    forward_done = any(bid == "ga-fwd-o" for bid, _ in closed)
+    if count == 1 and reverse_done and not forward_done:
+        _ok("(o): shared MAX_PER_SWEEP budget → reverse candidate processed, forward deferred")
+    else:
+        _bad("(o)", "count=%s closed=%s" % (count, closed))
+    globals()["MAX_PER_SWEEP"] = 99
+
+    # ── (p) ga-0ou0 gap: cited path absent in rig+CITY, present at git superroot → refuse ─
+    print("\nScenario (p): ga-0ou0 gap — cited path absent in rig+CITY, present at git superroot → refuse")
+    globals()["_file_exists_fn"] = lambda root, rel: (root == "/")  # only "present" at superroot (parent of CITY="/hq")
+    _bd_list_fn = lambda path, label: (
+        [_make_hq_bead("ga-superroot",
+                        meta={"story.o_que_e": "add docs/design/mail-protocol.md section", "story.resumo": "r"})]
+        if (path == "/hq" and label == "needs:rehome-property") else [])
+    _make_stubs()
+    st = {"rehomed": {}}
+    _reset()
+    run_sweep(0, st)
+    if not created and not closed and not updated:
+        _ok("(p): cited path present only at gt-superroot (outside CITY) → HQ bead untouched (ga-0ou0 fix)")
+    else:
+        _bad("(p)", "created=%s closed=%s updated=%s" % (created, closed, updated))
+    globals()["_file_exists_fn"] = None
+
+    # ── (q) ga-0ou0 control: sibling-rig-prefixed path excluded from superroot match ─────
+    print("\nScenario (q): ga-0ou0 control — cited path prefixed with sibling rig name at superroot → excluded, no false refuse")
+    globals()["_file_exists_fn"] = lambda root, rel: (root == "/")  # "present" at superroot for ANY rel (stub)
+    _bd_list_fn = lambda path, label: (
+        [_make_hq_bead("ga-siblingpath", meta={"story.o_que_e": "fix marketing/lib/thing.py", "story.resumo": "r"})]
+        if (path == "/hq" and label == "needs:rehome-property") else [])
+    _make_stubs()
+    st = {"rehomed": {}}
+    _reset()
+    run_sweep(0, st)
+    if any(p == "/ps" for p, _ in created) and any(bid == "ga-siblingpath" for bid, _ in closed):
+        _ok("(q): sibling-rig-prefixed path excluded from HQ superroot match → re-home proceeds normally")
+    else:
+        _bad("(q)", "created=%s closed=%s" % (created, closed))
+    globals()["_file_exists_fn"] = None
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[rehome selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
