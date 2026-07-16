@@ -505,15 +505,15 @@ READY only if ALL three hold AND building it needs NO product decision a human
 must make. Otherwise THIN. When in doubt → THIN.
 
 RECORD YOUR VERDICT with EXACTLY these commands, then exit:
-bd -C "$GC_CITY" label remove "$_verdict_bead" "verdict:pending"
+bd -C "${CC_STORE:-$GC_CITY}" label remove "$_verdict_bead" "verdict:pending"
 # If complete enough for a generic agent:
-bd -C "$GC_CITY" label add "$_verdict_bead" "verdict:READY"
-bd -C "$GC_CITY" comment "$_verdict_bead" "VERDICT: READY — <1 frase do porquê>"
-bd -C "$GC_CITY" close "$_verdict_bead"
+bd -C "${CC_STORE:-$GC_CITY}" label add "$_verdict_bead" "verdict:READY"
+bd -C "${CC_STORE:-$GC_CITY}" comment "$_verdict_bead" "VERDICT: READY — <1 frase do porquê>"
+bd -C "${CC_STORE:-$GC_CITY}" close "$_verdict_bead"
 # If under-specified (default when unsure):
-# bd -C "$GC_CITY" label add "$_verdict_bead" "verdict:THIN"
-# bd -C "$GC_CITY" comment "$_verdict_bead" "VERDICT: THIN — <qual dimensão falta: QUÊ/COMO-VERIFICAR/ESCOPO>"
-# bd -C "$GC_CITY" close "$_verdict_bead"
+# bd -C "${CC_STORE:-$GC_CITY}" label add "$_verdict_bead" "verdict:THIN"
+# bd -C "${CC_STORE:-$GC_CITY}" comment "$_verdict_bead" "VERDICT: THIN — <qual dimensão falta: QUÊ/COMO-VERIFICAR/ESCOPO>"
+# bd -C "${CC_STORE:-$GC_CITY}" close "$_verdict_bead"
 Do not start other work. Record the verdict and exit.
 TASK
 )
