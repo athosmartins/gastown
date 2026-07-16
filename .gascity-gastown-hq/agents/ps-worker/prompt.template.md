@@ -42,12 +42,19 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # startup per session. --exclude-label is exact-match only, so
 # pool:refused:<reason-slug> needs the jq startswith() pass; limit=20 (not 1)
 # so a filtered-out top candidate can't hide a valid one behind it.
-# ga-en2s: also excludes beads carrying an UNEXPIRED pilot:held-until:<epoch> label —
-# Pilot's own dispatch-hold mechanism (see pilot-dispatcher.sh _filter_candidates).
-# This probe bypasses Pilot's dispatch path entirely, so it had no awareness of the
-# hold. held-until labels ACCUMULATE (never pruned on this path), so use MAX not
-# .[0] (ga-4aree) — a bead is still held iff its LATEST stamp is still in the future.
-bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "ctx:thin" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else true end)] | .[:1]'
+# ga-en2s: also excludes beads under Pilot's dispatch-hold (see pilot-dispatcher.sh
+# _filter_candidates). This probe bypasses Pilot's dispatch path entirely, so it had
+# no awareness of the hold. Replicate the CANONICAL rule EXACTLY (imp19/ga-4aree):
+#   a bead passes iff  (NOT pilot:held)  OR  (a pilot:held-until:<epoch> exists AND
+#   its LATEST/MAX stamp is already in the past).
+# Two subtleties the first cut got wrong (gate FAIL ga-wisp-2hcah2):
+#   • pilot:held with NO held-until yet is the "trap" state (imp19/imp20 hold-stamping
+#     is non-atomic; janitor R6 stamps a default expiry only on its NEXT sweep). The
+#     canonical filter treats it as skip-forever → the empty-held-until case must be
+#     `false` (still held), NOT `true`. A bare `pilot:held` alone must exclude.
+#   • held-until labels ACCUMULATE (never pruned here), so use MAX not .[0] (ga-4aree)
+#     — the bead is still held iff its LATEST stamp is in the future.
+bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "ctx:thin" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused"))) | length == 0) | select(((.labels // []) | index("pilot:held") | not) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end))] | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
