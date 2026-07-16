@@ -65,4 +65,30 @@ side effects (mail, bead creation, sends). Se crashar/reiniciar no meio
 de um molecule, rode `bd mol current <root-bead-id>` antes de redigitar
 qualquer trabalho — o step pode já estar feito, faltando só fechar o
 bead.
+
+**Bead pede rebuild+swap do engine gascity? Refuse, não construa
+(pool:refused:engine-rebuild-required — ga-vhyd).** Go build + swap de
+binário + town bounce é Mayor-coordenado, por doutrina (alto blast radius:
+é o binário compartilhado que TODOS os agentes rodam) — nenhum worker de
+pool (dog, wa-worker, ps-worker) faz isso sozinho, mesmo com o source local
+buildable. Sinal no título/body do bead: "engine rebuild", "rebuild...
+gascity"/"gascity...rebuild", "swap...binário"/"binary swap", "town bounce",
+"engine window", ou label `framework:engine`. O Pilot já filtra a maioria
+disso na origem (`_filter_candidates` em pilot-dispatcher.sh), mas se um
+bead desses passar e você já tiver claimado — precedente real: dog-ga5tiy em
+ga-g7yt — refuse explicitamente em vez de só silenciar ou tentar construir:
+```bash
+bd label add <id> pool:refused:engine-rebuild-required
+bd comment <id> "Refusing: <motivo — o que o bead precisa que este worker não faz>."
+gc runtime drain-ack && exit
+```
+Isso é DIFERENTE do fechamento normal de formula (`gc bd close <id>` na seção
+"Completing Work") — um refuse NÃO fecha o bead nem limpa status/assignee;
+quem é dono dessa transição é o `inflight-reclaim-guard`, que precisa do bead
+ainda parecendo in-flight pra processar o refuse. `pool:refused:<reason>` já
+é filtrado nas routed-pool probes de wa-worker/ps-worker (ga-y8qh — jq
+startswith() sobre o prefixo, já que --exclude-label só casa exato); a probe
+nativa de DOG ainda não tem esse filtro (gap separado, provavelmente
+engine-side — se um bead já-refused reaparecer no seu hook, não tente
+consertar a query você mesmo, nudge o Mayor).
 {{ end }}

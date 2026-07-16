@@ -283,6 +283,25 @@ JSON
 JSON
           ;;
       esac
+    elif [ "${FAKE_INCLUDE_ENGSIGNAL:-0}" = "1" ]; then
+      # ga-vhyd: tt-engsignal carries NO needs:engine-window label — only its
+      # own title+description text signals an engine rebuild. tt-frameworklabel
+      # carries the manual framework:engine marker (already in live use, e.g.
+      # ga-g7yt, but previously unwired into any exclusion). Unlike the
+      # FAKE_INCLUDE_ENGWIN fixture above, both leak in UNCONDITIONALLY (no
+      # --exclude-label branch to honor for either), so only the
+      # _filter_candidates body-text veto / framework:engine label clause can
+      # drop them. tt-benign is a P0 control that mentions "engine"/"rebuild"
+      # in an UNRELATED sense and must NOT be caught (regression guard against
+      # an over-broad regex).
+      cat <<'JSON'
+[
+  {"id":"tt-engsignal","title":"Pilot despacha engine bug pro pool","priority":0,"issue_type":"bug","description":"requires a full gascity engine rebuild + binary swap + town bounce before this can ship","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
+  {"id":"tt-frameworklabel","title":"Engine fix needed","priority":0,"issue_type":"bug","description":"see comments for details","status":"open","labels":["framework:engine"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
+  {"id":"tt-benign","title":"Fix the search engine ranking bug","priority":0,"issue_type":"bug","description":"the recommendation engine rebuild of the index is unrelated to gc binary","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}},
+  {"id":"tt-keep","title":"Normal bug fixture","priority":1,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}
+]
+JSON
     else
       # Two open, unassigned bug candidates. tt-blkd is HIGHER priority (P0).
       # When FAKE_DEP_BEAD is set, ALSO emit tt-depblk: P0 AND created earlier than
@@ -357,7 +376,7 @@ chmod +x "$SHIMBIN/notify"
 reset_state() { rm -rf "$STATE"; mkdir -p "$STATE"; }
 
 # Runs the real dispatcher in DRY_RUN with the shims on PATH, returns the log.
-run_dispatch() { # $1=FAKE_BLOCKED_IDS  $2=FAKE_INCLUDE_ENGWIN(0|1)  $3=FAKE_DEP_BEAD (optional)  $4=FAKE_INCLUDE_EPIC(0|1)  $5=FAKE_INCLUDE_PREAPPROVAL(0|1)
+run_dispatch() { # $1=FAKE_BLOCKED_IDS  $2=FAKE_INCLUDE_ENGWIN(0|1)  $3=FAKE_DEP_BEAD (optional)  $4=FAKE_INCLUDE_EPIC(0|1)  $5=FAKE_INCLUDE_PREAPPROVAL(0|1)  $6=FAKE_INCLUDE_ENGSIGNAL(0|1)
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
@@ -373,6 +392,7 @@ run_dispatch() { # $1=FAKE_BLOCKED_IDS  $2=FAKE_INCLUDE_ENGWIN(0|1)  $3=FAKE_DEP
     FAKE_DEP_BEAD="${3:-}" \
     FAKE_INCLUDE_EPIC="${4:-0}" \
     FAKE_INCLUDE_PREAPPROVAL="${5:-0}" \
+    FAKE_INCLUDE_ENGSIGNAL="${6:-0}" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
@@ -720,6 +740,35 @@ if [ "$GNH" -gt 0 ] && [ "$ENG" -eq "$GNH" ]; then
   ok "needs:engine-window present in all $GNH query block(s)"
 else
   bad "exclusion count mismatch: gate:needs-human=$GNH needs:engine-window=$ENG"
+fi
+
+# ── Scenario 3b: unlabeled engine-signal bugs excluded via body-text veto (ga-vhyd) ──
+# A freshly-filed bug has no needs:engine-window label yet (nothing auto-applies
+# it at creation time), so Scenario 3's query-level --exclude-label cannot help —
+# tt-engsignal here carries ZERO labels and leaks in UNCONDITIONALLY from the fake
+# bd (no --exclude-label branch to honor). Only the _filter_candidates body-text
+# veto can drop it. tt-benign is a same-priority (P0) control whose text mentions
+# "engine"/"rebuild" in an unrelated sense (search/recommendation engine) — it
+# MUST survive and win the pick, proving the regex isn't over-broad.
+echo "Scenario 3b: unlabeled engine-rebuild-signal bug excluded by body-text veto; benign P0 mention still dispatched"
+LOG3B="$(run_dispatch "" 0 "" 0 0 1)"
+
+if echo "$LOG3B" | grep -q "Lane picks — small: tt-engsignal"; then
+  bad "LEAK: dispatched the unlabeled engine-signal bug (tt-engsignal)"
+else
+  ok "did NOT dispatch the unlabeled engine-signal bug"
+fi
+
+if echo "$LOG3B" | grep -q "Lane picks — small: tt-frameworklabel"; then
+  bad "LEAK: dispatched the framework:engine-labeled bug (tt-frameworklabel)"
+else
+  ok "did NOT dispatch the framework:engine-labeled bug"
+fi
+
+if echo "$LOG3B" | grep -q "Lane picks — small: tt-benign"; then
+  ok "dispatched the benign same-priority control (tt-benign) — regex not over-broad"
+else
+  bad "did not dispatch the benign control (tt-benign) — regex may be over-broad, or veto broke the P0 pick"
 fi
 
 # ── Scenario 3e: split-epic shells are excluded from dispatch (gt-14nya) ───────

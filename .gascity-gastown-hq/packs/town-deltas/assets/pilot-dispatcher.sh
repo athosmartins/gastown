@@ -1330,8 +1330,32 @@ _filter_candidates() {
           # mirroring how needs:engine-window is a static --exclude-label at
           # the bd list call sites for the opposite side of the same window.
           or . == "engine-window:pending"
+          # ga-vhyd: framework:engine is the manual, human/dog-applied marker
+          # for "this needs a gascity engine rebuild" (already in live use —
+          # e.g. ga-g7yt — alongside pool:refused:engine-rebuild-required, but
+          # nothing previously excluded it from re-selection). Honor it the
+          # same static way as engine-window:pending/needs:engine-window.
+          or . == "framework:engine"
         )) | length) == 0
         and ((.description // "") | test("\\S"))
+        # ga-vhyd: needs:engine-window (excluded above via --exclude-label at
+        # every bd list call site) only protects a bead AFTER something labels
+        # it. Nothing does that at creation time, so a freshly-filed bug whose
+        # OWN body already says it needs a gascity (gc binary) rebuild + swap
+        # + town bounce can win a dispatch sweep before any human/system gets
+        # to label it (occurrences: ga-n9bw, ga-g7yt — both caught only by the
+        # dispatched dog/builder reading the body and standing down, burning a
+        # sling+session each time). Catch the same signal straight from the
+        # title/description text at selection time — the pre-label safety net
+        # for the identical case needs:engine-window covers once applied.
+        # Deliberately narrow/compound phrases requiring "gascity"/"binary"/
+        # "binário" to co-occur (not bare "engine" or "rebuild" alone, which
+        # false-positive on "search engine", "rebuild index", etc.) — checked
+        # both word orders, since real bug bodies say both "rebuild...gascity"
+        # and "gascity engine rebuild".
+        and (((.title // "") + " " + (.description // ""))
+             | test("gascity.*rebuild|rebuild.*gascity|swap.*bin[áa]rio|swap.*binary|binary swap|town bounce|engine[ -]window"; "i")
+             | not)
      )]' \
     2>/dev/null || echo "[]"
 }
