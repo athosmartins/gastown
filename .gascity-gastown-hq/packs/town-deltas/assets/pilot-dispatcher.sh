@@ -1106,6 +1106,11 @@ log "=== Pilot sweep start (DRY_RUN=${DRY_RUN}) ==="
 # wedged data plane is exactly the incident this constraint guards against.
 DOLT_PID=""
 DOLT_LATENCY_MS=""
+# ga-hzt7: set by _dolt_saturated on every call — "healthy"/"latency"/"cpu"/
+# "unreadable" — so callers can log a genuine-saturation message distinctly
+# from a probe-failure message. Purely diagnostic: the throttle DECISION stays
+# fail-safe (unreadable → treated as saturated) either way.
+DOLT_SAT_REASON=""
 
 # ── ga-x3nmz: Claude 5h-quota probe (mirrors gate's gate_quota_limited) ───────
 # _pilot_quota_limited → "1" iff the Claude 5h window is exhausted right now, else
@@ -1174,7 +1179,14 @@ _dolt_cpu() {
 }
 
 # _dolt_saturated — return 0 (saturated → back off) / 1 (healthy). FAIL-SAFE:
-# missing latency AND missing cpu (probe failed) → saturated.
+# missing latency AND missing cpu (probe failed) → saturated. Also sets
+# DOLT_SAT_REASON ("healthy"/"latency"/"cpu"/"unreadable") — ga-hzt7: a probe
+# failure and a genuine over-threshold reading used to log as the identical
+# "Dolt SATURATED ... latency=?ms" line, so an operator reading the log after
+# the fact couldn't tell "Dolt was actually hot" from "the health probe itself
+# broke". The DECISION stays fail-safe in both cases (see header comment above
+# this section) — only the reason exposed to callers changes, so they can log
+# accordingly.
 _dolt_saturated() {
   local _lat _cpu
   _lat="$DOLT_LATENCY_MS"
@@ -1187,14 +1199,19 @@ _dolt_saturated() {
   # whole pipeline stalled overnight. Same chronic-CPU-not-latency class as the gate's
   # GATE_DOLT_CPU_HOT recalibration.)
   if [ -n "$_lat" ] && [ "$_lat" -ge 0 ] 2>/dev/null; then
-    [ "$_lat" -gt "$PILOT_DOLT_LATENCY_MAX_MS" ] 2>/dev/null && return 0
-    return 1   # latency healthy → NOT saturated, regardless of CPU
+    if [ "$_lat" -gt "$PILOT_DOLT_LATENCY_MAX_MS" ] 2>/dev/null; then
+      DOLT_SAT_REASON="latency"; return 0
+    fi
+    DOLT_SAT_REASON="healthy"; return 1   # latency healthy → NOT saturated, regardless of CPU
   fi
   if [ -n "$_cpu" ] && [ "$_cpu" -ge 0 ] 2>/dev/null; then
-    [ "$_cpu" -gt "$PILOT_DOLT_CPU_MAX" ] 2>/dev/null && return 0
-    return 1
+    if [ "$_cpu" -gt "$PILOT_DOLT_CPU_MAX" ] 2>/dev/null; then
+      DOLT_SAT_REASON="cpu"; return 0
+    fi
+    DOLT_SAT_REASON="healthy"; return 1
   fi
   # No usable signal at all (both probes blind) → fail-safe to saturated.
+  DOLT_SAT_REASON="unreadable"
   return 0
 }
 
@@ -1792,7 +1809,11 @@ _pilot_emit_dispatchable() {
 _dolt_probe
 if _dolt_saturated; then
   PILOT_DOLT_SATURATED_AT_START=1
-  warn "Dolt SATURATED at sweep start (latency=${DOLT_LATENCY_MS:-?}ms pid=${DOLT_PID:-?} cpu=$(_dolt_cpu)% thresholds: lat>${PILOT_DOLT_LATENCY_MAX_MS} cpu>${PILOT_DOLT_CPU_MAX}). Throttling to 1 dispatch/lane this sweep (ga-rk5va backoff)."
+  if [ "$DOLT_SAT_REASON" = "unreadable" ]; then
+    warn "Dolt health UNREADABLE at sweep start (latency=${DOLT_LATENCY_MS:-?}ms pid=${DOLT_PID:-?} cpu=$(_dolt_cpu)% — probe returned no signal, NOT a measured value). Fail-safe: throttling to 1 dispatch/lane this sweep same as genuine saturation, since adding load to an unknown/possibly-wedged Dolt is the incident this guards against (ga-hzt7; ga-rk5va backoff)."
+  else
+    warn "Dolt SATURATED at sweep start (latency=${DOLT_LATENCY_MS:-?}ms pid=${DOLT_PID:-?} cpu=$(_dolt_cpu)% thresholds: lat>${PILOT_DOLT_LATENCY_MAX_MS} cpu>${PILOT_DOLT_CPU_MAX}). Throttling to 1 dispatch/lane this sweep (ga-rk5va backoff)."
+  fi
 else
   PILOT_DOLT_SATURATED_AT_START=0
   log "Dolt health OK (latency=${DOLT_LATENCY_MS:-?}ms cpu=$(_dolt_cpu)%) — dispatch-to-capacity armed."
@@ -5002,7 +5023,11 @@ dispatch_lane() {
       local _more
       _more=$(echo "$pool" | jq 'length' 2>/dev/null || echo "0")
       if [ "${_more:-0}" -gt 0 ] 2>/dev/null && _dolt_saturated; then
-        warn "Dolt saturated mid-sweep (cpu=$(_dolt_cpu)% lat=${DOLT_LATENCY_MS:-?}ms) — stopping $lane loop after ${filled} dispatch(es) (ga-rk5va backoff)."
+        if [ "$DOLT_SAT_REASON" = "unreadable" ]; then
+          warn "Dolt health UNREADABLE mid-sweep (cpu=$(_dolt_cpu)% lat=${DOLT_LATENCY_MS:-?}ms — probe returned no signal, NOT a measured value) — stopping $lane loop after ${filled} dispatch(es), same fail-safe as genuine saturation (ga-hzt7; ga-rk5va backoff)."
+        else
+          warn "Dolt saturated mid-sweep (cpu=$(_dolt_cpu)% lat=${DOLT_LATENCY_MS:-?}ms) — stopping $lane loop after ${filled} dispatch(es) (ga-rk5va backoff)."
+        fi
         break
       fi
     fi

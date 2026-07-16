@@ -1544,6 +1544,71 @@ _ds() { ( eval "$_DS_FN"; PILOT_DOLT_LATENCY_MAX_MS=2500; PILOT_DOLT_CPU_MAX=200
 [ "$(_ds '' 303)" = SAT ]  && ok "latency blind + cpu=303% → saturated (CPU fallback)"          || bad "CPU fallback broken"
 [ "$(_ds '' '')" = SAT ]   && ok "both probes blind → saturated (fail-safe)"                    || bad "fail-safe broken"
 
+# ga-hzt7: DOLT_SAT_REASON must distinguish "measured and over threshold" from
+# "probe returned nothing" — the decision above is unchanged (fail-safe stays
+# fail-safe), but callers use this reason to log the two cases distinctly so an
+# operator can tell "Dolt was actually hot" from "the health probe itself broke".
+_dsr() { ( eval "$_DS_FN"; PILOT_DOLT_LATENCY_MAX_MS=2500; PILOT_DOLT_CPU_MAX=200; \
+           DOLT_LATENCY_MS="$1" PILOT_DOLT_CPU_OVERRIDE="$2" _dolt_saturated >/dev/null 2>&1; \
+           printf '%s' "$DOLT_SAT_REASON" ); }
+[ "$(_dsr 62 303)" = healthy ]    && ok "reason=healthy for lat=62ms cpu=303%"        || bad "reason wrong for healthy case: $(_dsr 62 303)"
+[ "$(_dsr 3000 50)" = latency ]   && ok "reason=latency for real latency storm"       || bad "reason wrong for latency case: $(_dsr 3000 50)"
+[ "$(_dsr '' 303)" = cpu ]        && ok "reason=cpu for CPU-fallback saturation"      || bad "reason wrong for cpu case: $(_dsr '' 303)"
+[ "$(_dsr '' '')" = unreadable ]  && ok "reason=unreadable when both probes blind (ga-hzt7)" || bad "reason wrong for blind probes: $(_dsr '' '')"
+
+# Full-script proof: with BOTH override seams unset, _dolt_probe falls through to
+# the real `gc dolt health` call — the SHIMBIN gc shim has no "dolt health" case,
+# so it prints nothing and exits 0, reproducing the exact ga-hzt7 field symptom
+# (probe returns no signal) end-to-end. Must still throttle (fail-safe preserved)
+# but log the NEW distinct message, not the old "Dolt SATURATED ... latency=?ms"
+# text that conflated probe failure with genuine saturation.
+echo "Scenario 10c: blind Dolt probe (no override) → fail-safe throttle, DISTINCT log line"
+: > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+reset_state
+# Mirrors run_capacity's env block exactly, EXCEPT it omits
+# PILOT_DOLT_LATENCY_OVERRIDE_MS / PILOT_DOLT_CPU_OVERRIDE entirely — the script's
+# own top-level `"${VAR:-}"` defaults (pilot-dispatcher.sh, ga-rk5va section) make
+# that safe under `set -u`, and it's the only way to reach the REAL `_dolt_probe`
+# code path: with the overrides absent, `[ -n "$PILOT_DOLT_LATENCY_OVERRIDE_MS" ]`
+# is false, so it shells out to `gc dolt health` — the SHIMBIN gc shim has no
+# "dolt health" case (falls to its `*)` no-op), so it prints nothing and exits 0,
+# reproducing the exact ga-hzt7 field symptom (probe returns no signal) end-to-end.
+LOG10C="$(env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    PILOT_FRAMEWORK_DOG_EXEMPT="${PILOT_FRAMEWORK_DOG_EXEMPT:-}" \
+    PILOT_PATH_RIG_GUARD="${PILOT_PATH_RIG_GUARD:-}" \
+    PILOT_MISSING_FILE_GUARD="${PILOT_MISSING_FILE_GUARD:-}" \
+    PILOT_TEST_RIG_HAS_FILE="${PILOT_TEST_RIG_HAS_FILE:-}" \
+    FAKE_INFLIGHT_JSON="[]" \
+    DISPATCH_TO_CAPACITY=1 \
+    FAKE_BUGS_JSON="" \
+    FAKE_SESSIONS_JSON="" \
+    FAKE_SLING_ASSIGNEES="" \
+    FAKE_BLOCKED_IDS="" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log")"
+if echo "$LOG10C" | grep -q "Dolt health UNREADABLE at sweep start"; then
+  ok "blind probe logs the distinct UNREADABLE message"
+else
+  bad "blind probe did not log UNREADABLE (still conflating probe-failure with saturation?)"
+fi
+if echo "$LOG10C" | grep -q "Dolt SATURATED at sweep start"; then
+  bad "REGRESSION: blind probe logged the genuine-saturation message (ambiguous with a real Dolt storm)"
+else
+  ok "blind probe did NOT log the genuine-saturation message (no longer ambiguous)"
+fi
+if echo "$LOG10C" | grep -q "Lane small: dispatched 1 this sweep"; then
+  ok "blind probe still throttled to 1 dispatch/lane (fail-safe decision unchanged)"
+else
+  bad "blind probe did not throttle (fail-safe decision regressed — this would be dangerous)"
+fi
+
 # ── Scenario 10b: feature switch off → legacy single-pick even when healthy ────
 echo "Scenario 10b: DISPATCH_TO_CAPACITY=0 → single dispatch even on a healthy Dolt"
 LOG10B="$(run_capacity 10 "[]" 0)"
