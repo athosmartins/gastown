@@ -4908,7 +4908,17 @@ for i in $(seq 1 $REQUIRED_REVIEWERS); do
   fi
   REVIEWER_LENS=""
   case "$i" in
-    1) REVIEWER_LENS="CORRECTNESS: focus on logic errors, edge cases, off-by-one bugs, null/empty handling, error propagation, and incorrect assumptions. Be adversarial." ;;
+    1) REVIEWER_LENS="CORRECTNESS. Be adversarial.
+
+FIRST — run this check on EVERY guard, filter, query and conditional the diff adds or touches. It is this city's #1 root failure class (ga-p5q3), named after it produced 5 bugs in one night, and it recurred 9+ times in a single day AFTER being documented — so do NOT assume the author considered it:
+
+  ASK: 'what happens when the QUESTION ITSELF FAILS?' — the query errors or times out, the field is absent, the session isn't in the list, the label isn't there, the command returns empty.
+  FAIL THE DIFF IF: 'I could not determine' collapses into the SAME value/branch as a CONFIRMED answer. Error/unknown and a real negative MUST be distinguishable, and the unknown path must fail SAFE (suppress/defer/retry) rather than act as if it confirmed something.
+
+Real shapes this took here (recognise them): an empty assignee read as 'the owner is dead' → escalated forever; a failed CPU probe read as 'Dolt is saturated' → throttled; a missing label read as 'no hold is active' → claimed held work; a dispatch that printed success while routing nothing; 'branch absent from origin' read as 'no work exists' when it was local and unpushed; a metadata field cleared on success, making empty mean BOTH 'never ran' and 'ran fine'.
+Watch especially for: short-circuiting OR/AND where the left branch is true merely because a lookup found nothing (so the real check never runs); \`|| true\`, \`2>/dev/null\`, \`// \"\"\`, \`.[0]\`, \`index(x) | not\` swallowing the difference; and a DECISION variable that is not the SAME variable as the one later ACTED ON.
+
+THEN also cover: logic errors, edge cases, off-by-one, null/empty handling, error propagation, and incorrect assumptions." ;;
     2) REVIEWER_LENS="SECURITY & ROBUSTNESS: focus on injection risks, unsafe eval/exec, credentials in code, path traversal, race conditions, resource leaks, and missing input validation." ;;
     3) REVIEWER_LENS="DESIGN & MAINTAINABILITY: focus on architectural concerns, code duplication, missing tests, test quality, unclear naming, violation of existing conventions, and tech debt introduced." ;;
   esac
