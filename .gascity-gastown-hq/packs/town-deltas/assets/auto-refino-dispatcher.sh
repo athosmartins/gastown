@@ -1407,17 +1407,43 @@ case "$DECISION" in
     # attempt count back (a timeout must NOT burn an attempt).
     bd_ label remove "$STORY_ID" "auto-refino:refining" -q 2>/dev/null || true
     bd_ update "$STORY_ID" --set-metadata "story.auto_refino_attempts=$PRIOR_ATTEMPTS" -q 2>/dev/null || true
-    # Return to a fresh-eligible lifecycle so Step 1 re-picks it. If this was a
-    # gate bounce-back (assigned to us), keeping refinement-in-progress + our
-    # assignee is correct; if it was fresh, restore unrefined.
-    if [ "$STATE" = "bounce" ]; then
-      _set_lifecycle "$STORY_ID" "story:refinement-in-progress"
-      bd_ update "$STORY_ID" --assignee "$AUTO_REFINO_ACTOR" -q 2>/dev/null || true
+
+    # ga-1wc5: Step 6 only watches the TASK bead's own outcome:* labels, never
+    # the STORY's — so a refiner that finishes the handoff (or a gate that then
+    # advances the story) but is slow to close its own wisp bead produces a
+    # TIMEOUT here even though the story already moved past the daemon. $STATE
+    # was captured once at cycle-start (Step 1, well before this poll) and can be
+    # stale by now. Re-read the story's CURRENT labels/assignee and run them back
+    # through the SAME classifier the GUARANTEE above relies on — if it now says
+    # "skip" (refino-review/needs-approval/approved/in-flight/done/cancelled/
+    # escalated, a gate actively reviewing, or reassigned away from us while we
+    # waited), leave the lifecycle exactly as-is instead of resetting it; only
+    # the claim marker (already dropped above) was ever ours to release. A
+    # bd_ show read failure degrades to the SAME branch (empty labels are
+    # classified "skip" by the classifier's own catch-all) — deliberately
+    # fail-safe, never destructive on uncertainty, and harmless: Step 2's claim
+    # already left the story refinement-in-progress+us (bounce-shaped), so a
+    # skipped reset still leaves it re-pickable next sweep either way.
+    _RQ=$(bd_ show "$STORY_ID" --json 2>/dev/null || echo "[]")
+    _RQV() { echo "$_RQ" | jq -r "if type==\"array\" then .[0] else . end | $1"; }
+    _rq_labels=$(_RQV '(.labels // []) | join(",")')
+    _rq_assignee=$(_RQV '.assignee // empty')
+    if [ "$(auto_refino_lifecycle_state "$_rq_labels" "$_rq_assignee" "$AUTO_REFINO_ACTOR")" = "skip" ]; then
+      bd_ comment "$STORY_ID" "Auto-refino: o wisp do refiner só encerrou após o timeout (${AUTO_REFINO_TIMEOUT_MINUTES}m), mas a história já avançou pra um estado pós-daemon ($_rq_labels) enquanto o dispatcher esperava — lifecycle preservado, claim liberado." 2>/dev/null || true
+      log "  $STORY_ID → timeout, but already past-daemon ($_rq_labels) — lifecycle NOT reset (ga-1wc5)."
     else
-      _set_lifecycle "$STORY_ID" "story:unrefined"
+      # Return to a fresh-eligible lifecycle so Step 1 re-picks it. If this was a
+      # gate bounce-back (assigned to us), keeping refinement-in-progress + our
+      # assignee is correct; if it was fresh, restore unrefined.
+      if [ "$STATE" = "bounce" ]; then
+        _set_lifecycle "$STORY_ID" "story:refinement-in-progress"
+        bd_ update "$STORY_ID" --assignee "$AUTO_REFINO_ACTOR" -q 2>/dev/null || true
+      else
+        _set_lifecycle "$STORY_ID" "story:unrefined"
+      fi
+      bd_ comment "$STORY_ID" "Auto-refino: refino expirou (timeout ${AUTO_REFINO_TIMEOUT_MINUTES}m) sem desfecho. Re-enfileirada — não consumiu tentativa." 2>/dev/null || true
+      log "  $STORY_ID → re-queued (outcome $OUTCOME; attempt not consumed)."
     fi
-    bd_ comment "$STORY_ID" "Auto-refino: refino expirou (timeout ${AUTO_REFINO_TIMEOUT_MINUTES}m) sem desfecho. Re-enfileirada — não consumiu tentativa." 2>/dev/null || true
-    log "  $STORY_ID → re-queued (outcome $OUTCOME; attempt not consumed)."
     ;;
 esac
 

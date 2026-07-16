@@ -771,6 +771,42 @@ else
   bad "empty session_name path has no forensic logging"
 fi
 
+# ── Drift guards: requeue must not clobber a story that raced past the daemon
+#    while the dispatcher was polling (ga-1wc5) ────────────────────────────────
+echo "Drift guards: timeout/requeue re-checks CURRENT story state before lifecycle reset (ga-1wc5)"
+
+# The poll loop (Step 6) only watches the TASK bead's outcome:* labels — it never
+# re-reads the STORY. So the requeue branch (Step 7) is the last line of defense:
+# it must re-read the story and run it back through the SAME classifier the
+# GUARANTEE (Scenario 2c) relies on before ever touching lifecycle labels.
+if grep -qF 'auto_refino_lifecycle_state "$_rq_labels" "$_rq_assignee" "$AUTO_REFINO_ACTOR"' "$DISPATCHER"; then
+  ok "requeue path re-classifies the story's CURRENT labels via the GUARANTEE-backed classifier"
+else
+  bad "requeue path does not re-check current story state before resetting lifecycle — ga-1wc5 regression"
+fi
+
+# Ordering: the re-check must run BEFORE both lifecycle-mutating targets of the
+# requeue branch (bounce → refinement-in-progress, fresh → unrefined) — a check
+# performed after the reset would be a no-op.
+_RQ_CHECK_LN=$(grep -n -F 'auto_refino_lifecycle_state "$_rq_labels" "$_rq_assignee" "$AUTO_REFINO_ACTOR"' "$DISPATCHER" | head -1 | cut -d: -f1)
+_RQ_BOUNCE_RESET_LN=$(grep -n -F '_set_lifecycle "$STORY_ID" "story:refinement-in-progress"' "$DISPATCHER" | tail -1 | cut -d: -f1)
+_RQ_FRESH_RESET_LN=$(grep -n -F '_set_lifecycle "$STORY_ID" "story:unrefined"' "$DISPATCHER" | tail -1 | cut -d: -f1)
+if [ -n "$_RQ_CHECK_LN" ] && [ -n "$_RQ_BOUNCE_RESET_LN" ] && [ -n "$_RQ_FRESH_RESET_LN" ] \
+   && [ "$_RQ_CHECK_LN" -lt "$_RQ_BOUNCE_RESET_LN" ] && [ "$_RQ_CHECK_LN" -lt "$_RQ_FRESH_RESET_LN" ]; then
+  ok "the re-check precedes both requeue reset targets (bounce and fresh), not an after-the-fact no-op"
+else
+  bad "the re-check does not precede the requeue lifecycle resets"
+fi
+
+# The preserved-lifecycle path must leave an audit trail (comment + log), not
+# silently drop the timeout on the floor — same accountability bar as every
+# other terminal branch in the dispatcher.
+if grep -qF 'lifecycle NOT reset (ga-1wc5)' "$DISPATCHER"; then
+  ok "past-daemon requeue is audited (comment/log) instead of silently absorbed"
+else
+  bad "no audit trail for the preserved-lifecycle requeue branch"
+fi
+
 echo ""
 echo "auto-refino-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
