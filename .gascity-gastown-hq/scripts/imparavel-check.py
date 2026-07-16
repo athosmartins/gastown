@@ -14,7 +14,10 @@ e traz o veredito honesto. Este script NÃO dá opinião — mede a definição:
         JÁ CONSTRUÍDA / no pipeline do gate (bead com quality-gate-marker aberto
         apontando pra ela, ou label gate:* de ciclo-de-vida) — essa é responsabilidade
         do GATE (check 2), não uma falha silenciosa de dispatch do Pilot.
-        Uma construível sem story:in-flight, sem hold legítimo, com pilot vivo = FALHA.
+        Uma construível sem story:in-flight, sem hold legítimo, com pilot vivo = FALHA
+        — EXCEÇÃO (ga-wmrr): se o POOL está saturado (0 slots livres em TODAS as
+        lanes small/big, lido do log do Pilot), a fila normal atrás de capacidade
+        cheia NÃO é FALHA (só falta vaga, não houve skip de dispatch).
     (2) O gate não está travado em silêncio
         (se há marker queued/dispatching, tem que haver progresso: um merge
          recente OU um reviewer vivo. needs-rebase/error = PARKED, não é stall.)
@@ -437,6 +440,24 @@ def check_gate():
 
 
 # ── CHECK 3 & 4: pilot + dolt liveness ───────────────────────────────────────
+def _pilot_slots():
+    """Most recent 'Available slots: small=X  big=Y' line from the Pilot log —
+    the same line pilot-dispatcher.sh emits from MAX_lane - in_flight_lane.
+    Returns {'small': int, 'big': int}, or None if the log is missing/unreadable
+    or has no such line yet. Caller must treat None as 'unknown' and fall back
+    to the pre-ga-wmrr strict behavior — an unreadable signal must never
+    SUPPRESS a real stall; only a POSITIVELY-confirmed 0/0 may downgrade one."""
+    r = _sh(["tail", "-n", "500", PILOT_LOG])
+    if not (r and r.stdout):
+        return None
+    import re
+    for line in reversed(r.stdout.splitlines()):
+        mt = re.search(r"Available slots:\s*small=(\d+)\s+big=(\d+)", line)
+        if mt:
+            return {"small": int(mt.group(1)), "big": int(mt.group(2))}
+    return None
+
+
 def check_pilot():
     r = _sh(["tail", "-n", "60", PILOT_LOG])
     if not (r and r.stdout):
@@ -467,8 +488,9 @@ def main():
     g = check_gate()
     p = check_pilot()
     d = check_dolt()
+    slots = _pilot_slots()
 
-    fails, warns = [], []
+    fails, warns, notes = [], [], []
 
     # --- Buildable queue verdict ---
     for w in a.get("warns", []):
@@ -477,8 +499,21 @@ def main():
         warns.append("não consegui classificar %d bead(s) (bd show falhou): %s"
                      % (len(a["read_err"]), ", ".join(str(x) for x in a["read_err"][:8])))
 
+    # ga-wmrr: a construível queued behind a FULLY saturated pool (0 slots free
+    # in EVERY lane) has nowhere to go regardless of its own lane — that is
+    # healthy high-demand queueing (the reported HÍGIDO-e-CHEIO incident), not a
+    # silent stall. Only report a real ❌ when some lane still has room and the
+    # queue didn't use it (a genuine skip: empty routed_to, or a dispatch bug).
+    pool_saturated = bool(slots) and slots["small"] <= 0 and slots["big"] <= 0
+
     if a["stuck"] and (p.get("alive") is not False):
-        if a.get("from_dispatchable"):
+        if pool_saturated:
+            notes.append(
+                "pool saturado (slots small=%d big=%d) — %d construível(is) normalmente"
+                " na fila atrás de slots cheios, NÃO é falha: %s"
+                % (slots["small"], slots["big"], len(a["stuck"]),
+                   ", ".join("%s/%s" % (s["rig"], s["id"]) for s in a["stuck"][:6])))
+        elif a.get("from_dispatchable"):
             fails.append(
                 "%d bead(s) CONSTRUÍVEIS na fila do Pilot, 0 em build (pilot vivo): %s"
                 % (len(a["stuck"]),
@@ -528,6 +563,9 @@ def main():
         snap_note = ("snapshot %.0fmin atrás" % a["snap_age_min"]) if a.get("snap_age_min") is not None else ""
         print("FILA DO PILOT (dispatchable%s): %d total"
               % ((" — " + snap_note) if snap_note else "", a["total"]))
+        if slots:
+            print("  • slots do Pilot: small=%d livre(s)   big=%d livre(s)"
+                  % (slots["small"], slots["big"]))
         print("  • parked (needs-human/on-device/blocked/já-no-gate): %d (já-construídas-no-gate: %d)"
               "   • genuinamente construíveis: %d   • em build agora (in-flight): %d   • held: %d"
               % (a["parked_count"], a.get("in_gate_count", 0),
@@ -562,6 +600,8 @@ def main():
     if building_now:
         print("🔨 EM BUILD AGORA (real, todos os stores): %d — %s"
               % (building_now, ", ".join(building_ids[:8])))
+    for n in notes:
+        print("ℹ️  " + n)
     print("")
 
     if fails:
@@ -588,6 +628,9 @@ def main():
                   " → %s (%d parked)."
                   % ("ocioso correto" if not building_now else "fila dispatchable parqueada (mas há build ativo acima)",
                      a["parked_count"]))
+        elif notes:
+            print("  Pool saturado (slots cheios) — construíveis na fila normal atrás de capacidade"
+                  " (ver nota ℹ️ acima). Alta demanda saudável, não travamento.")
         else:
             print("  Nenhuma construível parada em silêncio; gate fluindo ou ocioso-com-fila-vazia;"
                   " pilot e Dolt vivos.")

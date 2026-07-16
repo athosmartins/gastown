@@ -90,6 +90,105 @@ eq("gate:needs-fix NOT in-flight (re-dispatchable)", m._label_is_gate_inflight("
 eq("gate:needs-human NOT in-flight (parked separately)", m._label_is_gate_inflight("gate:needs-human"), False)
 eq("ctx:ready NOT gate-inflight", m._label_is_gate_inflight("ctx:ready"), False)
 
+print("── _pilot_slots(): parses the Pilot's 'Available slots' log line ──")
+import types
+def _fake_sh_factory(stdout):
+    def _fake(args, timeout=20):
+        return types.SimpleNamespace(returncode=0, stdout=stdout)
+    return _fake
+
+m._sh = _fake_sh_factory(
+    "[2026-07-16 13:42:49] [pilot-dispatcher] In-flight: live=6 small=5/5  big=1/2\n"
+    "[2026-07-16 13:42:54] [pilot-dispatcher] Available slots: small=0  big=1\n"
+    "[2026-07-16 13:50:34] [pilot-dispatcher] In-flight: live=5 small=4/5  big=1/2\n"
+    "[2026-07-16 13:50:36] [pilot-dispatcher] Available slots: small=1  big=1\n")
+eq("picks the LAST (most recent) Available-slots line", m._pilot_slots(), {"small": 1, "big": 1})
+
+m._sh = _fake_sh_factory("[2026-07-16 13:42:49] [pilot-dispatcher] In-flight: live=6 small=5/5  big=1/2\n")
+eq("no Available-slots line yet → None", m._pilot_slots(), None)
+
+m._sh = _fake_sh_factory("")
+eq("empty log → None", m._pilot_slots(), None)
+
+m._sh = lambda args, timeout=20: None
+eq("_sh failure (command errored) → None", m._pilot_slots(), None)
+
+print("── ga-wmrr regression: saturated pool downgrades ❌ stuck → ℹ️  note, not fails ──")
+# Reproduces the reported incident: pilot-dispatchable.json has 1 genuinely
+# buildable, never-built bead; the Pilot log says BOTH lanes are fully saturated
+# (small=0 big=0). main()'s verdict must NOT treat this as a dispatch failure.
+import json, tempfile, os
+snap2 = {"generated_at": "2999-01-01T00:00:00Z", "ttl_seconds": 600, "count": 1,
+         "items": [{"id": "wa-QUEUED", "store": "whatsapp_automation", "title": "queued behind full pool"}]}
+_fd2, _p2 = tempfile.mkstemp(suffix=".json"); os.write(_fd2, json.dumps(snap2).encode()); os.close(_fd2)
+m.DISPATCHABLE_JSON = _p2
+m._gate_source_beads = lambda: set()
+m._bd_show_labels_text = lambda root, bid: ["ctx:ready", "exec:auto"]
+_a2 = m.check_approved()
+os.unlink(_p2)
+eq("fixture: exactly one genuinely-stuck bead pre-fix", [s["id"] for s in _a2["stuck"]], ["wa-QUEUED"])
+
+m._sh = _fake_sh_factory("[2026-07-16 14:00:00] [pilot-dispatcher] Available slots: small=0  big=0\n")
+_slots_sat = m._pilot_slots()
+eq("both lanes saturated parses as small=0 big=0", _slots_sat, {"small": 0, "big": 0})
+_pool_saturated = bool(_slots_sat) and _slots_sat["small"] <= 0 and _slots_sat["big"] <= 0
+eq("pool_saturated flag true when both lanes are 0", _pool_saturated, True)
+
+m._sh = _fake_sh_factory("[2026-07-16 14:00:00] [pilot-dispatcher] Available slots: small=0  big=2\n")
+_slots_room = m._pilot_slots()
+_pool_saturated2 = bool(_slots_room) and _slots_room["small"] <= 0 and _slots_room["big"] <= 0
+eq("pool_saturated flag false when a lane still has room (small=0 big=2)", _pool_saturated2, False)
+
+print("── main() end-to-end: saturated pool → verdict is ✅, not ❌ (ga-wmrr) ──")
+import io, contextlib
+_orig_check_approved, _orig_check_gate = m.check_approved, m.check_gate
+_orig_check_pilot, _orig_check_dolt = m.check_pilot, m.check_dolt
+_orig_pilot_slots, _orig_rigs = m._pilot_slots, m.RIGS
+
+m.check_approved = lambda: {
+    "total": 1, "parked_count": 0, "in_gate_count": 0, "buildable_count": 1,
+    "flowing_count": 0, "held_count": 0,
+    "stuck": [{"id": "wa-QUEUED", "rig": "WA", "title": "queued behind full pool"}],
+    "read_err": [], "warns": [], "from_dispatchable": True, "snap_age_min": 1.0,
+}
+m.check_gate = lambda: {"active": [], "parked": [], "last_pass_min": 1.0,
+                         "reviewer_alive": True, "oldest_active_min": None,
+                         "stalled": False, "stall_reason": ""}
+m.check_pilot = lambda: {"alive": True, "last_sweep_min": 0.5}
+m.check_dolt = lambda: {"responsive": True, "latency_ms": 10}
+m._pilot_slots = lambda: {"small": 0, "big": 0}
+m.RIGS = []   # skip the live `bd` subprocess calls in the building_now loop
+
+_buf = io.StringIO()
+_exit_code = None
+try:
+    with contextlib.redirect_stdout(_buf):
+        m.main()
+except SystemExit as e:
+    _exit_code = e.code
+_out = _buf.getvalue()
+eq("saturated pool (small=0 big=0): exit code 0 (✅, no ❌/⚠️)", _exit_code, 0)
+eq("saturated pool: report mentions 'pool saturado'", "pool saturado" in _out, True)
+eq("saturated pool: ✅ summary names the saturation, not silence", "Pool saturado (slots cheios)" in _out, True)
+eq("saturated pool: report does NOT say NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _out, False)
+
+print("── main() end-to-end: a lane still has room + stuck → STILL ❌ (real stall preserved) ──")
+m._pilot_slots = lambda: {"small": 1, "big": 0}   # small has a free slot, queue skipped it anyway
+_buf2 = io.StringIO()
+_exit_code2 = None
+try:
+    with contextlib.redirect_stdout(_buf2):
+        m.main()
+except SystemExit as e:
+    _exit_code2 = e.code
+_out2 = _buf2.getvalue()
+eq("free slot unused: exit code 1 (❌ failure preserved)", _exit_code2, 1)
+eq("free slot unused: report says NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _out2, True)
+
+m.check_approved, m.check_gate = _orig_check_approved, _orig_check_gate
+m.check_pilot, m.check_dolt = _orig_check_pilot, _orig_check_dolt
+m._pilot_slots, m.RIGS = _orig_pilot_slots, _orig_rigs
+
 print("── end-to-end: check_approved() over a fixture snapshot (bd/Dolt mocked) ──")
 # Snapshot mixes an already-built in-gate bead with a GENUINELY stuck one. The in-gate
 # bead must be parked (in_gate_count=1); ONLY the genuine bead may reach the stuck list.
