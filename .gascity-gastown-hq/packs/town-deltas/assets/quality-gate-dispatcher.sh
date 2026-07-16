@@ -4322,26 +4322,53 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
 
     # ga-6dp9 (bug 1 of 3): compute the branch-author candidate for THIS
     # liveness check specifically — see resolve_rebase_author() above. Does
-    # NOT touch $AUTHOR (self-review-exclusion / the nudge-mail target used
-    # elsewhere in this block stays exactly as before).
+    # NOT touch $AUTHOR itself — the notify target below keeps its original
+    # ga-pyzo/ga-ipf6 wiring unchanged (restored below, gate-fix-1: an
+    # earlier revision of this fix accidentally repurposed that wiring for
+    # the liveness decision instead of duplicating it — see the block below).
     REBASE_AUTHOR=$(resolve_rebase_author "$AUTHOR_TRUSTED_SUBMIT" "$BRANCH" "$MARKER_AUTHOR")
 
     # ga-ipf6: unified with FAIL_AUTHOR_ALIVE via author_is_alive() — the old
     # inline predicate here (alias/name/agent only, no session_name) never
     # matched AUTHOR's actual session_name form, so every live author was
-    # misread as dead on this path.
-    AUTHOR_ALIVE=$(author_is_alive "$REBASE_AUTHOR")
+    # misread as dead on this path. ga-6dp9 (gate-fix-1): named
+    # REBASE_AUTHOR_ALIVE (not AUTHOR_ALIVE) and keyed on REBASE_AUTHOR — the
+    # actual branch author, bug 1's fix — so it can drive every decision
+    # below without colliding with AUTHOR's own liveness/redirect, restored
+    # below for the notify target.
+    REBASE_AUTHOR_ALIVE=$(author_is_alive "$REBASE_AUTHOR")
 
-    # ga-pyzo: recycled-session fallback, applied BEFORE the ga-acb circuit-break
-    # check below (which consumes AUTHOR_ALIVE) so a live agent whose specific
+    # ga-pyzo: recycled-session fallback for the REBASE_AUTHOR liveness
+    # DECISION (bug 1), applied BEFORE the ga-acb circuit-break check below
+    # (which consumes REBASE_AUTHOR_ALIVE) so a live agent whose specific
     # submitting session recycled is never misread as dead-with-no-live-author
-    # and permanently circuit-broken. Reassigns REBASE_AUTHOR (not $AUTHOR —
-    # ga-6dp9 keeps the notification target and this liveness identity
-    # separate) so only the liveness decision targets the reachable agent.
-    _RESOLVED_AUTHOR=$(resolve_recycled_author "$REBASE_AUTHOR" "$AUTHOR_AGENT" "$AUTHOR_ALIVE")
-    if [ "$_RESOLVED_AUTHOR" != "$REBASE_AUTHOR" ]; then
-      log "  ga-pyzo: rebase-liveness author '$REBASE_AUTHOR' session recycled but agent '$_RESOLVED_AUTHOR' has a live session — redirecting liveness to the agent."
-      REBASE_AUTHOR="$_RESOLVED_AUTHOR"
+    # and permanently circuit-broken.
+    _RESOLVED_REBASE_AUTHOR=$(resolve_recycled_author "$REBASE_AUTHOR" "$AUTHOR_AGENT" "$REBASE_AUTHOR_ALIVE")
+    if [ "$_RESOLVED_REBASE_AUTHOR" != "$REBASE_AUTHOR" ]; then
+      log "  ga-pyzo: rebase-liveness author '$REBASE_AUTHOR' session recycled but agent '$_RESOLVED_REBASE_AUTHOR' has a live session — redirecting liveness to the agent."
+      REBASE_AUTHOR="$_RESOLVED_REBASE_AUTHOR"
+      REBASE_AUTHOR_ALIVE=1
+    fi
+
+    # ga-6dp9 (gate-fix-1): restore the ga-pyzo/ga-ipf6 wiring for $AUTHOR
+    # itself — the notify TARGET used by every nudge/mail call below (e.g.
+    # ~4443, 4479, 4510, 4522, 4602). Gate review on the first submission
+    # (gate_run=ga-wisp-wejpxu) caught that an earlier revision reassigned
+    # ONLY REBASE_AUTHOR above and never touched $AUTHOR again, so a worker
+    # submitting under an ephemeral adhoc session (e.g.
+    # gate.submitted_by="digo-wa-adhoc-abc123") whose durable role has since
+    # picked up a fresh live session would have its "author is live — bounce
+    # for manual rebase" nudge/mail silently sent to the confirmed-dead adhoc
+    # id — defeating the live-author escape hatch this whole block exists to
+    # provide. Independent of REBASE_AUTHOR_ALIVE (which drives the actual
+    # decision, bug 1) — same helper, same pattern as the FAIL-path call site
+    # above (ga-ipf6 lesson: don't let this fallback re-diverge across call
+    # sites again).
+    AUTHOR_ALIVE=$(author_is_alive "$AUTHOR")
+    _RESOLVED_AUTHOR=$(resolve_recycled_author "$AUTHOR" "$AUTHOR_AGENT" "$AUTHOR_ALIVE")
+    if [ "$_RESOLVED_AUTHOR" != "$AUTHOR" ]; then
+      log "  ga-pyzo: notify author '$AUTHOR' session recycled but agent '$_RESOLVED_AUTHOR' has a live session — redirecting nudge/mail target to the agent."
+      AUTHOR="$_RESOLVED_AUTHOR"
       AUTHOR_ALIVE=1
     fi
 
@@ -4354,7 +4381,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # rebase envelope allows AND no live author to re-anchor a large divergence.
     # Checked BEFORE the retry/bounce branching so the marker never enters the
     # bounded-retry churn cycle on a provably un-mergeable branch.
-    _ACB_AHEAD=$(gate_circuit_break_check "ahead_dead" "${REBASE_AHEAD:-}" "$AUTHOR_ALIVE" "$REBASE_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX")
+    _ACB_AHEAD=$(gate_circuit_break_check "ahead_dead" "${REBASE_AHEAD:-}" "$REBASE_AUTHOR_ALIVE" "$REBASE_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX")
     if [ "$_ACB_AHEAD" != "ok" ]; then
       err "  ga-acb: circuit-breaking marker $MARKER_ID (${_ACB_AHEAD}): ahead=${REBASE_AHEAD:-?} > GATE_REBASE_AHEAD_MAX=${GATE_REBASE_AHEAD_MAX} and author dead/empty."
       bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
@@ -4408,7 +4435,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # ahead_dead above (independent condition; both can be simultaneously
     # true — ahead_dead's own circuit-break, if it already fired, exited above
     # and this code is unreached).
-    _BEHIND_ACTION=$(gate_behind_envelope_action "$REBASE_BEHIND_EXCEEDED" "$AUTHOR_ALIVE")
+    _BEHIND_ACTION=$(gate_behind_envelope_action "$REBASE_BEHIND_EXCEEDED" "$REBASE_AUTHOR_ALIVE")
     if [ "$_BEHIND_ACTION" = "circuit_break" ]; then
       err "  ga-6dp9: circuit-breaking marker $MARKER_ID (behind_dead): behind=${REBASE_BEHIND:-?} > GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX} and author dead/empty."
       bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
@@ -4475,7 +4502,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       exit 0
     fi
 
-    if [ "$AUTHOR_ALIVE" = "1" ] && [ "$CONFLICT_KIND" = "merge" ]; then
+    if [ "$REBASE_AUTHOR_ALIVE" = "1" ] && [ "$CONFLICT_KIND" = "merge" ]; then
       # gt-4tk5m fix: only bounce to needs-rebase when the conflict is GENUINE
       # (deterministic merge conflict). A TRANSIENT failure (worktree/push plumbing
       # race — e.g. the author force-pushed a rebase while this marker was queued
@@ -4498,7 +4525,7 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
         --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR for rebase"
       REBASE_EVENT="dispatcher_needs_rebase"
       REBASE_VERDICT="NEEDS_REBASE (genuine merge conflict, author live, bounced)"
-    elif [ "$AUTHOR_ALIVE" = "1" ] && [ "$CONFLICT_KIND" = "transient" ]; then
+    elif [ "$REBASE_AUTHOR_ALIVE" = "1" ] && [ "$CONFLICT_KIND" = "transient" ]; then
       # gt-4tk5m fix: author is live but failure is TRANSIENT (worktree/push plumbing
       # race — e.g. author force-pushed a rebase while marker was queued and our
       # --force-with-lease was rejected). The branch may already be correctly rebased
@@ -4597,7 +4624,7 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
         # own reclaim path could re-ready it if the marker somehow regained claimed/
         # dispatching. Promote to gate:needs-human on the SOURCE BEAD so Pilot knows
         # not to re-dispatch, and park the marker permanently at gate-status:error.
-        _ACB_RETRY=$(gate_circuit_break_check "retry_dead" "" "$AUTHOR_ALIVE" "$NEXT_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX")
+        _ACB_RETRY=$(gate_circuit_break_check "retry_dead" "" "$REBASE_AUTHOR_ALIVE" "$NEXT_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX")
         if [ "$_ACB_RETRY" != "ok" ]; then
           err "Branch $BRANCH: retries exhausted ($NEXT_ATTEMPT >= $MAX_REBASE_ATTEMPTS) + dead author — ga-acb circuit-break (${_ACB_RETRY})."
           bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true

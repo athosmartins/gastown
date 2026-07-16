@@ -175,6 +175,68 @@ for _fn in resolve_rebase_author gate_behind_envelope_action gate_rebase_attempt
     || bad "$_fn MISSING from dispatcher lib-only export (drift!)"
 done
 
+# ── 7. gate-fix-1: AUTHOR (notify target) and REBASE_AUTHOR (liveness decision)
+#    each get their OWN independent resolve_recycled_author() redirect ────────
+# Gate review on the first ga-6dp9 submission (gate_run=ga-wisp-wejpxu) found
+# that an earlier revision reassigned ONLY REBASE_AUTHOR, leaving $AUTHOR — the
+# notify target used by every nudge/mail call in this block — pointed at a
+# confirmed-dead recycled session even when the liveness decision correctly
+# read "alive" via the redirect. Concretely: a worker submits under an
+# ephemeral adhoc session (gate.submitted_by="digo-wa-adhoc-abc123"); by
+# dispatch time that session exited but the durable role "digo-wa" has a fresh
+# live session. resolve_recycled_author redirected the DECISION correctly, but
+# the "author is live — bounce for manual rebase" nudge/mail was silently sent
+# to the dead adhoc id, defeating the live-author escape hatch this whole
+# block exists to provide. gate-recycled-session-author-fallback.selftest.sh
+# (ga-pyzo) already proves resolve_recycled_author()'s pure behavior
+# exhaustively (B1-B6) and its B7/B8 drift-guards independently caught this
+# exact regression by literal wiring pattern — this section closes the gap
+# the reviewer named specifically: this selftest never exercised the
+# AUTHOR-vs-REBASE_AUTHOR split at all.
+echo "── 7. gate-fix-1: AUTHOR notify-target redirect, independent of the REBASE_AUTHOR liveness decision ──"
+if grep -qF 'REBASE_AUTHOR_ALIVE=$(author_is_alive "$REBASE_AUTHOR")' "$DISPATCHER"; then
+  ok "rebase-path liveness DECISION keyed on REBASE_AUTHOR_ALIVE (bug 1 fix intact)"
+else
+  bad "REBASE_AUTHOR_ALIVE computation missing/renamed — bug 1 regressed?"
+fi
+if grep -qF '_RESOLVED_REBASE_AUTHOR=$(resolve_recycled_author "$REBASE_AUTHOR" "$AUTHOR_AGENT" "$REBASE_AUTHOR_ALIVE")' "$DISPATCHER"; then
+  ok "REBASE_AUTHOR gets its own recycled-session redirect for the liveness decision"
+else
+  bad "REBASE_AUTHOR recycled-session redirect missing/renamed"
+fi
+# grep -F substring match would false-positive here: 'AUTHOR_ALIVE=$(author_is_alive
+# "$AUTHOR")' is also a literal substring of the unrelated FAIL-path line
+# 'FAIL_AUTHOR_ALIVE=$(author_is_alive "$AUTHOR")' (drop the "FAIL_" prefix) — the
+# same collision that makes B8 in gate-recycled-session-author-fallback.selftest.sh
+# vacuous for this exact pattern. Anchor on the line's own leading whitespace so
+# only the bare (unprefixed) AUTHOR_ALIVE assignment counts.
+if grep -qE '^[[:space:]]+AUTHOR_ALIVE=\$\(author_is_alive "\$AUTHOR"\)$' "$DISPATCHER"; then
+  ok "AUTHOR's OWN liveness restored (ga-pyzo/ga-ipf6 original wiring, gate-fix-1)"
+else
+  bad 'AUTHOR_ALIVE=$(author_is_alive "$AUTHOR") missing — ga-pyzo/ga-ipf6 wiring not restored'
+fi
+if grep -qF '_RESOLVED_AUTHOR=$(resolve_recycled_author "$AUTHOR" "$AUTHOR_AGENT" "$AUTHOR_ALIVE")' "$DISPATCHER"; then
+  ok "AUTHOR notify-target gets its own independent recycled-session redirect (the reviewer's blocking issue)"
+else
+  bad "AUTHOR notify-target redirect missing — gate review blocking issue regressed"
+fi
+echo "── 7b. rebase-path decision call sites keyed on REBASE_AUTHOR_ALIVE, not bare AUTHOR_ALIVE ──"
+grep -qF 'gate_circuit_break_check "ahead_dead" "${REBASE_AHEAD:-}" "$REBASE_AUTHOR_ALIVE"' "$DISPATCHER" \
+  && ok "ga-acb ahead_dead circuit-break keyed on REBASE_AUTHOR_ALIVE" \
+  || bad "ga-acb ahead_dead circuit-break NOT keyed on REBASE_AUTHOR_ALIVE — regressed to notify-identity liveness?"
+grep -qF 'gate_behind_envelope_action "$REBASE_BEHIND_EXCEEDED" "$REBASE_AUTHOR_ALIVE"' "$DISPATCHER" \
+  && ok "ga-6dp9 behind-envelope action keyed on REBASE_AUTHOR_ALIVE" \
+  || bad "ga-6dp9 behind-envelope action NOT keyed on REBASE_AUTHOR_ALIVE — bug 1/bug 2 regressed?"
+grep -qF 'if [ "$REBASE_AUTHOR_ALIVE" = "1" ] && [ "$CONFLICT_KIND" = "merge" ]' "$DISPATCHER" \
+  && ok "genuine-merge-conflict bounce keyed on REBASE_AUTHOR_ALIVE" \
+  || bad "genuine-merge-conflict bounce NOT keyed on REBASE_AUTHOR_ALIVE — regressed to notify-identity liveness?"
+grep -qF 'elif [ "$REBASE_AUTHOR_ALIVE" = "1" ] && [ "$CONFLICT_KIND" = "transient" ]' "$DISPATCHER" \
+  && ok "transient-retry live-author branch keyed on REBASE_AUTHOR_ALIVE" \
+  || bad "transient-retry live-author branch NOT keyed on REBASE_AUTHOR_ALIVE — regressed to notify-identity liveness?"
+grep -qF 'gate_circuit_break_check "retry_dead" "" "$REBASE_AUTHOR_ALIVE"' "$DISPATCHER" \
+  && ok "retry_dead circuit-break keyed on REBASE_AUTHOR_ALIVE" \
+  || bad "retry_dead circuit-break NOT keyed on REBASE_AUTHOR_ALIVE — regressed to notify-identity liveness?"
+
 # ── Result ────────────────────────────────────────────────────────────────────
 echo ""
 if [ "$FAIL" = "0" ]; then
