@@ -2452,14 +2452,94 @@ _beadid_has_open_gate_marker() {
   case "$_hit" in ''|0) return 1 ;; *) return 0 ;; esac
 }
 
+# ── Attached-session live-mention (ga-48vb) ───────────────────────────────────
+# Pilot's approved-story auto-dispatch and a live ATTACHED framework session
+# (Mayor, or any other human-interactive session — NOT a pool worker/dog, which
+# is never attached) deciding in-conversation to hand-implement the SAME story
+# have no cross-visibility: the attached session's manual pickup never touches
+# the bd bead's assignee/status at all. Concrete instance (2026-07-16, ga-n9bw):
+# Mayor's attached session (gastown.mayor) delegated implementation to a
+# background subagent while Pilot independently dispatched a builder for the
+# same story — zero bd footprint on Mayor's side, so signals (a)-(d) (all keyed
+# off branch/assignee/status/gate-marker) were structurally blind to it. This is
+# a heuristic text match on recent transcript output, NOT an authoritative claim
+# signal like (a)-(d) — a session merely discussing a bead without building it
+# is a possible false-positive, but that only costs one deferred sweep, versus
+# the alternative of a silent double-write into a shared, non-worktree-isolated
+# source tree.
+#
+# _gc_session_peek_output <session_id> — thin wrapper around the bounded, real
+# `gc session peek` call so tests can stub this ONE function directly (a
+# `timeout <bin>` pipeline can't be intercepted by shadowing a shell function
+# named after the binary — `timeout` execs its argument directly, bypassing the
+# calling shell's function table). Echoes the peek's `.output` field, or "" on
+# any failure/timeout.
+_gc_session_peek_output() {
+  local _sess="${1:-}"
+  [ -n "$_sess" ] || return 1
+  timeout 8 gc --city "$GC_CITY" session peek "$_sess" --lines 80 --json 2>/dev/null \
+    | jq -r '.output // empty' 2>/dev/null || echo ""
+}
+
+# _attached_session_peek_cache — lazy, ONCE-per-sweep cache: recent output from
+# every currently ATTACHED, non-closed session (reusing the already-loaded
+# _SESSIONS_JSON roster — no extra `gc session list` call). Reused by every
+# _ownership_guard_should_refuse call this sweep so N candidates never multiply
+# into N × attached-count peek calls. Mirrors the _ownership_guard_repos
+# lazy-cache idiom above. FAIL-OPEN: no `gc`, zero attached sessions, or any
+# read error → empty cache (the caller's grep then naturally finds nothing).
+_attached_session_peek_cache() {
+  if [ -z "${_ATTACHED_PEEK_DONE:-}" ]; then
+    _ATTACHED_PEEK_CACHE=""
+    if command -v gc >/dev/null 2>&1; then
+      local _sess _out _attached_ids
+      _attached_ids=$(printf '%s' "$_SESSIONS_JSON" | jq -r '
+          [.sessions[]? | select(.closed != true) | select(.attached == true)
+           | (.alias // .name // .session_name // empty)]
+          | map(select(. != null and . != "")) | unique | .[]' 2>/dev/null || echo "")
+      while IFS= read -r _sess; do
+        [ -n "$_sess" ] || continue
+        _out=$(_gc_session_peek_output "$_sess")
+        [ -n "$_out" ] && _ATTACHED_PEEK_CACHE="${_ATTACHED_PEEK_CACHE}
+${_out}"
+      done <<< "$_attached_ids"
+    fi
+    _ATTACHED_PEEK_DONE=1
+  fi
+  printf '%s' "$_ATTACHED_PEEK_CACHE"
+}
+
+# _beadid_mentioned_in_attached_session <bead_id> — exit 0 iff a live ATTACHED
+# session's recent output mentions <bead_id> as a whole token (boundary-safe:
+# a longer id sharing the same prefix/suffix never false-matches).
+# Test seam: PILOT_TEST_ATTACHED_MENTION_BEADS (space-list), consulted when
+# DEFINED, keeps the selftest hermetic (no live gc / sessions). FAIL-OPEN: no
+# gc, no attached sessions, any read error, or no match → return 1 (allow) —
+# this signal must never wedge a genuinely-free dispatch.
+_beadid_mentioned_in_attached_session() {
+  local _bid="${1:-}"
+  [ -n "$_bid" ] || return 1
+  if [ -n "${PILOT_TEST_ATTACHED_MENTION_BEADS+x}" ]; then
+    case " $PILOT_TEST_ATTACHED_MENTION_BEADS " in *" $_bid "*) return 0 ;; *) return 1 ;; esac
+  fi
+  local _cache
+  _cache=$(_attached_session_peek_cache)
+  [ -n "$_cache" ] || return 1
+  printf '%s' "$_cache" | grep -qE "(^|[^A-Za-z0-9_-])${_bid}([^A-Za-z0-9_-]|\$)"
+}
+
 # _ownership_guard_should_refuse <bead_id> <bead_json> <bead_city> — emit a short
-# REASON to stdout and return 0 (REFUSE this dispatch) iff signal (a), (b), (c) or (d)
-# holds; return 1 (allow) otherwise. Pure read; the caller logs + releases the claim.
+# REASON to stdout and return 0 (REFUSE this dispatch) iff signal (a), (b), (c),
+# (d), or (e) holds; return 1 (allow) otherwise. Pure read; the caller logs +
+# releases the claim.
 #   (a) crew branch exists for <bead_id> (strongest)            → "branch:<...>"
 #   (d) a live gate marker/run is ACTIVELY gating its branch    → "gating:active"
 #   (c) fresh rig-DB re-read shows an EXTERNAL active claim      → "external-claim:<...>"
 #   (b) live assignee: a non-empty, NON-pilot crew assignee whose session is live
 #       in the once-per-sweep roster                            → "owner:<crew>"
+#   (e) a live ATTACHED session's recent output mentions <bead_id> (ga-48vb;
+#       heuristic, not authoritative — same needs-fix carve-out as (a))
+#                                                                 → "attached-session:mention"
 # Re-reads the bead's CURRENT assignee (race-safe: the candidate query required an
 # EMPTY assignee, but a competing claim could have set one between snapshot and
 # now — exactly the ga-htjni double-dispatch window). FAIL-OPEN: an unresolvable
@@ -2486,6 +2566,13 @@ _ownership_guard_should_refuse() {
       # (a) crew branch — strongest, evaluated first and standalone.
       if _beadid_has_crew_branch "$_bid"; then
         printf 'branch:crew/*/%s' "$_bid"
+        return 0
+      fi
+      # (e) attached-session live mention (ga-48vb) — see function doc above.
+      # Same needs-fix carve-out as (a): a soft heuristic signal must not
+      # reintroduce the ps-2w5d 40-minute re-fix stall (Scenario 22h).
+      if _beadid_mentioned_in_attached_session "$_bid"; then
+        printf 'attached-session:mention'
         return 0
       fi
       ;;

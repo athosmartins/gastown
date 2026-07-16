@@ -898,6 +898,7 @@ _og() { (
     bd() { case "$*" in *" show "*) printf '%s' "${OG_BEAD_JSON:-}" ;; *) : ;; esac; }
     _beadid_has_crew_branch() { return 1; }   # no crew branch → signal (a) does not fire
     _session_is_live()        { return 1; }   # never a live session → isolate (c) from (b)
+    _beadid_mentioned_in_attached_session() { return 1; }   # isolate from (e) — has its own dedicated scenario below
     _ownership_guard_should_refuse "$1" "$2" "ignored-db"
 ); }
 
@@ -1005,6 +1006,106 @@ _gate "wa-x" && bad "OWN-GUARD(d8): empty gate read wrongly refused — would we
 grep -qE 'gating:active' "$DISPATCHER" \
   && ok "OWN-GUARD: dispatcher carries the (d) gating:active clause" \
   || bad "OWN-GUARD: (d) gating:active clause missing from dispatcher"
+
+# ── Scenario OWN-GUARD (e): attached-session live-mention (ga-48vb) ────────────
+# Pilot's approved-story auto-dispatch and a live ATTACHED framework session
+# (Mayor, or any other human-interactive session — pool workers/dogs are NEVER
+# attached) deciding in-conversation to hand-implement the SAME story have no
+# cross-visibility: the attached session's manual pickup never touches the bd
+# bead's assignee/status at all. Concrete instance (2026-07-16, ga-n9bw): Mayor's
+# attached session delegated implementation to a background subagent while Pilot
+# independently dispatched a builder for the same story — zero bd footprint on
+# Mayor's side, so signals (a)-(d) (all keyed off branch/assignee/status/gate-
+# marker) were structurally blind to it. Signal (e) closes the gap with a
+# heuristic (not authoritative) check: does a live attached session's recent
+# output mention the candidate bead id?
+echo "Scenario OWN-GUARD (e): guard refuses when an attached session's transcript mentions the candidate; allows otherwise"
+_ATT_FN="$(awk '/^_beadid_mentioned_in_attached_session\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_og_e() { (
+    eval "$_OG_FN"; eval "$_ATT_FN"
+    SELF_BEAD_ID=""; _DEADWORKER_OK=1
+    bd() { case "$*" in *" show "*) printf '%s' "${OG_BEAD_JSON:-}" ;; *) : ;; esac; }
+    _beadid_has_crew_branch()          { return 1; }   # isolate (a)
+    _beadid_has_active_gate_artifact() { return 1; }   # isolate (d)
+    _session_is_live()                 { return 1; }   # isolate (b)/(c)
+    _ownership_guard_should_refuse "$1" "$2" "ignored-db"
+); }
+
+# (e1) attached-session seam reports a mention → REFUSE.
+OG_BEAD_JSON='[{"id":"wa-att","status":"open","assignee":"","labels":[],"metadata":{}}]'
+_OG_E1="$(PILOT_TEST_ATTACHED_MENTION_BEADS="wa-att" _og_e "wa-att" '{"id":"wa-att","assignee":"","status":"open","labels":[]}')"
+[ "$_OG_E1" = "attached-session:mention" ] && ok "OWN-GUARD(e1): attached-session mention REFUSED (reason: $_OG_E1)" \
+                                            || bad "OWN-GUARD(e1): attached-session mention NOT refused (got: '$_OG_E1') — Mayor/Pilot double-dispatch reopened"
+
+# (e2) seam defined but for a DIFFERENT bead → allow (normal dispatch preserved).
+_OG_E2="$(PILOT_TEST_ATTACHED_MENTION_BEADS="some-other-bead" _og_e "wa-att" '{"id":"wa-att","assignee":"","status":"open","labels":[]}')"
+[ -z "$_OG_E2" ] && ok "OWN-GUARD(e2): no attached-session mention allowed (normal dispatch preserved)" \
+                 || bad "OWN-GUARD(e2): unmentioned bead wrongly refused (got: '$_OG_E2')"
+
+# (e3) gate:needs-fix carve-out: same discipline as signal (a) (Scenario 22h /
+# the ps-2w5d 40-min stall) — a noisy heuristic signal must not deadlock the
+# autonomous gate-fix re-dispatch loop.
+_OG_E3="$(PILOT_TEST_ATTACHED_MENTION_BEADS="wa-fix" _og_e "wa-fix" '{"id":"wa-fix","assignee":"","status":"open","labels":["gate:needs-fix"]}')"
+[ -z "$_OG_E3" ] && ok "OWN-GUARD(e3): gate:needs-fix bead NOT refused despite attached-session mention (re-fix loop preserved)" \
+                 || bad "OWN-GUARD(e3): gate:needs-fix bead wrongly refused (got: '$_OG_E3') — would reintroduce the ps-2w5d stall"
+
+# (e4) control — same mention, WITHOUT gate:needs-fix → STILL refused (carve-out doesn't leak).
+_OG_E4="$(PILOT_TEST_ATTACHED_MENTION_BEADS="wa-fix2" _og_e "wa-fix2" '{"id":"wa-fix2","assignee":"","status":"open","labels":["story:approved"]}')"
+[ "$_OG_E4" = "attached-session:mention" ] && ok "OWN-GUARD(e4): non-needs-fix bead with a mention STILL refused (carve-out scoped correctly)" \
+                                            || bad "OWN-GUARD(e4): carve-out over-applied to a non-needs-fix bead (got: '$_OG_E4')"
+
+# Structural: signal (e) clause lives in the dispatcher source.
+grep -qE 'attached-session:mention' "$DISPATCHER" \
+  && ok "OWN-GUARD: dispatcher carries the (e) attached-session:mention clause" \
+  || bad "OWN-GUARD: (e) attached-session:mention clause missing from dispatcher"
+
+# ── Direct unit coverage: _beadid_mentioned_in_attached_session real matching ───
+# The scenarios above drive (e) through its test seam only (composition test).
+# These exercise the REAL cache + boundary-safe grep logic against fabricated
+# session/peek data — no live gc, no live sessions, fully hermetic. Note:
+# _gc_session_peek_output is stubbed directly (NOT the `gc` binary) because a
+# `timeout <bin>` pipeline execs its argument directly and can't be intercepted
+# by shadowing a shell function named after the binary.
+echo "Scenario OWN-GUARD (e) unit: _beadid_mentioned_in_attached_session real matching logic"
+_CACHE_FN="$(awk '/^_attached_session_peek_cache\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_ATT_FN2="$(awk '/^_beadid_mentioned_in_attached_session\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_attmention() { (
+    eval "$_CACHE_FN"; eval "$_ATT_FN2"
+    unset PILOT_TEST_ATTACHED_MENTION_BEADS
+    GC_CITY="ignored-city"
+    _SESSIONS_JSON="${ATT_SESSIONS_JSON:-{}}"
+    _gc_session_peek_output() { printf '%s' "${ATT_PEEK_OUTPUT:-}"; }
+    _beadid_mentioned_in_attached_session "$1"
+); }
+
+ATT_SESSIONS_JSON='{"sessions":[{"alias":"gastown.mayor","closed":false,"attached":true}]}'
+
+# (u1) real match: peek output mentions the bead id as a whole token.
+ATT_PEEK_OUTPUT="🔨 ga-n9bw (engine-window) — implementando agora."
+_attmention "ga-n9bw" && ok "OWN-GUARD(e-unit1): real cache/grep matches a mentioned bead id" \
+                      || bad "OWN-GUARD(e-unit1): real cache/grep missed a genuine mention — signal (e) is inert"
+
+# (u2) no mention → allow.
+ATT_PEEK_OUTPUT="nothing relevant here"
+_attmention "ga-n9bw" && bad "OWN-GUARD(e-unit2): false-positive match with no mention present" \
+                      || ok "OWN-GUARD(e-unit2): no mention → allowed (fail-open preserved)"
+
+# (u3) boundary safety: a LONGER id sharing the same prefix must not false-match.
+ATT_PEEK_OUTPUT="working on ga-n9bwx today"
+_attmention "ga-n9bw" && bad "OWN-GUARD(e-unit3): substring false-match on a longer id (ga-n9bwx matched query ga-n9bw)" \
+                      || ok "OWN-GUARD(e-unit3): longer id sharing a prefix does NOT false-match (boundary-safe)"
+
+# (u4) boundary safety: the id as a suffix of a longer token must not false-match.
+ATT_PEEK_OUTPUT="see xga-n9bw for context"
+_attmention "ga-n9bw" && bad "OWN-GUARD(e-unit4): substring false-match on a longer token (xga-n9bw matched query ga-n9bw)" \
+                      || ok "OWN-GUARD(e-unit4): id as a token suffix does NOT false-match (boundary-safe)"
+
+# (u5) no ATTACHED sessions at all (e.g. only pool workers live) → fail-open allow,
+# and the peek wrapper must never even be consulted.
+ATT_SESSIONS_JSON='{"sessions":[{"alias":"wa-worker-adhoc-1","closed":false,"attached":false}]}'
+ATT_PEEK_OUTPUT="ga-n9bw"
+_attmention "ga-n9bw" && bad "OWN-GUARD(e-unit5): fired with zero attached sessions — should never peek a non-attached worker" \
+                      || ok "OWN-GUARD(e-unit5): zero attached sessions → fail-open allow, no spurious peek"
 
 # ── Scenario 3f: pre-approval lifecycle stories are excluded (ga-w7wvm) ─────────
 # The Pilot dispatches ONLY story:approved features; pre-approval lifecycle states
