@@ -2324,6 +2324,46 @@ def _open_error_markers():
         return None
 
 
+def _mail_oscillating_error_marker(mid, branch, source_bead, rig_name, req_count,
+                                    max_attempts, age_sec, resolved):
+    """ga-rwzj: durable, actionable escalation for a gate-status:error marker that
+    exhausted its requeue cap. notify() (the caller's other escalation) is a
+    transient push — if the Mayor is away when it fires, the signal is gone with
+    nothing left to act on; that gap stranded 4 markers 9.9-11.6h until a human
+    counted them by hand. This mail is SECONDARY (best-effort, never blocks the
+    notify) but persists in the inbox with the branch, a source-clean check, and
+    the ready-to-run re-submit command already spelled out, so whoever reads it
+    hours later doesn't have to reconstruct context from scratch."""
+    clean_desc = (
+        "source bead NÃO resolvido (query falhou ou bead sumiu) — confirme o estado "
+        "do source ANTES de reenfileirar"
+    ) if not resolved else (
+        "source aberto e sem gate:needs-human — reenfileirar é seguro SE a causa raiz "
+        "(root) já foi corrigida; senão vai re-errorar de novo"
+    )
+    resubmit_cmd = (
+        "bd -C %s label remove %s gate-status:error -q && "
+        "bd -C %s label add %s gate-status:queued -q"
+    ) % (CITY, mid, CITY, mid)
+    subject = "Gate: marker %s preso oscilando em gate-status:error" % mid
+    body = (
+        "Marker %s esgotou o cap de auto-requeue (%d/%d tentativas) e continua "
+        "re-errorando. O watchdog PAROU — não é mais transiente, precisa de você.\n\n"
+        "Branch: %s\n"
+        "Source bead: %s (%s)\n"
+        "Idade em gate-status:error: %dmin\n"
+        "Source-clean-check: %s\n\n"
+        "Comando de re-submit pronto (rode DEPOIS de confirmar a causa raiz):\n"
+        "  %s\n\n"
+        "(gate-recovery-watchdog FIX 2 — escalação de oscillating-error, ga-rwzj)"
+    ) % (mid, req_count, max_attempts, branch or "?", source_bead or "?", rig_name or "?",
+         age_sec // 60, clean_desc, resubmit_cmd)
+    r = sh(["gc", "mail", "send", "mayor", "-s", subject, "-m", body], timeout=45)
+    if not (r and r.returncode == 0):
+        print("[watchdog] WARN: gc mail send mayor FAILED for oscillating marker %s — notify still sent (grw)"
+              % mid, flush=True)
+
+
 def requeue_error_markers(now, rstate):
     """FIX 2: auto-requeue a STUCK gate-status:error marker (error → queued) — the
     error→queued flip the Mayor did by hand ~6x today. Bounded per sweep, dry-run
@@ -2395,6 +2435,8 @@ def requeue_error_markers(now, rstate):
                 _grw_ledger("human-touch", {"ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                             "source_daemon": "gate-recovery-watchdog", "stage": "revisa", "kind": "technical",
                             "bead_id": source_bead or "", "reason": "error marker %s oscillating (%d watchdog requeues, still re-errors) — needs human" % (mid, req_count)}, fail_open=True)
+                _mail_oscillating_error_marker(mid, branch, source_bead, rig_name, req_count,
+                                                ERROR_REQUEUE_MAX_ATTEMPTS, age, resolved)
                 print("[watchdog] ESCALATED oscillating error marker %s (%d requeues, still re-errors) — NOT requeued again" % (mid, req_count), flush=True)
             continue
 
