@@ -31,6 +31,22 @@
 #   refiner before it ever consumes the task, task bead sits assignee=None for
 #   the full 25m timeout) → Scenario 10 (auto_refino_session_drained detector +
 #   SPAWN_DRAINED → requeue) + spawn-drained wiring drift-guards.
+#   Confidence-gate split (imp16: thin/duplicate/trivial input can't be paged to
+#   Athos) → Scenario 4a (ESCALATE:info-gap → escalate-info-gap, not in queue).
+#   Escalation visibility (ga-lfua3: escalations were rendering in TRIAGEM instead
+#   of the painel "Sua vez" human queue, and an escalated-only bead looked RAW and
+#   re-ingested forever) → Scenario 11 + drift-guard 4b (story:refino-escalado
+#   added in both escalate paths, survives _clear_lifecycle, RAW source excludes it).
+#   Multi-store funnel (WA/PS rig-store stories were starving in Triagem because
+#   the daemon only read/wrote HQ) → Scenario 12 (AUTO_REFINO_STORES iteration +
+#   per-store write-back to $AR_BEAD_STORE).
+#   Refiner-cap protection (FIX C: launchd's 5m interval << the 25m refiner
+#   timeout, so concurrent sweeps could blow past max_active_sessions) →
+#   Scenario 13 (single-instance mkdir-mutex lock: backs off / reclaims stale /
+#   kill-switch).
+#   Cross-stage anti-starvation (FIX B: refino is the lowest stage and must yield
+#   to a congested gate/Pilot under contention, but never serialize when resources
+#   are free) → Scenario 14 (yield gate + fail-open + kill-switch).
 #
 # Exit 0 iff every assertion holds.
 
@@ -120,6 +136,13 @@ D=$(auto_refino_handoff_decision "ESCALATE" 1 3)
 [ "$D" = "escalate" ] && ok "ESCALATE attempt 1 → escalate" || bad "ESCALATE → expected escalate, got '$D'"
 D=$(auto_refino_handoff_decision "ESCALATE" 9 3)
 [ "$D" = "escalate" ] && ok "ESCALATE at any attempt → escalate" || bad "ESCALATE → expected escalate, got '$D'"
+
+# ── Scenario 4a: imp16 ESCALATE:info-gap → escalate-info-gap (no human page) ──
+echo "Scenario 4a (imp16): ESCALATE:info-gap (thin/duplicate/trivial) → escalate-info-gap"
+D=$(auto_refino_handoff_decision "ESCALATE:info-gap" 1 3)
+[ "$D" = "escalate-info-gap" ] && ok "ESCALATE:info-gap → escalate-info-gap (not in Athos queue)" || bad "ESCALATE:info-gap → expected escalate-info-gap, got '$D'"
+D=$(auto_refino_handoff_decision "ESCALATE:info-gap" 9 3)
+[ "$D" = "escalate-info-gap" ] && ok "ESCALATE:info-gap at any attempt → escalate-info-gap" || bad "ESCALATE:info-gap high-attempt → expected escalate-info-gap, got '$D'"
 
 # ── Scenario 4b: escalated flag is durable → re-escalation loop cannot form ────
 # BUG 1: the escalate path persists auto-refino:escalated ADDITIVELY (no
@@ -357,6 +380,36 @@ else
   bad "escalate path missing the escalated flag, gaps metadata, or Mayor notify"
 fi
 
+# 4b. ga-lfua3 BUG 1: the escalate path must ALSO add story:refino-escalado (the
+#     painel _SUAVEZ_LABELS member) so escalations surface in the human "Sua vez"
+#     queue instead of rendering in TRIAGEM. It must appear in BOTH escalate paths:
+#     the inline daemon escalate (bd_ label add "$STORY_ID" ...) AND the spawned
+#     refiner's task heredoc (bd -C "$GC_CITY" label add "$STORY_ID" ...). Count
+#     both occurrences; require at least 2.
+_escalado_hits=$(grep -cF 'label add "$STORY_ID" "story:refino-escalado"' "$DISPATCHER")
+if [ "$_escalado_hits" -ge 2 ]; then
+  ok "escalate adds story:refino-escalado in BOTH paths ($_escalado_hits hits) → surfaces in 'Sua vez' (ga-lfua3 bug 1)"
+elif [ "$_escalado_hits" -eq 1 ]; then
+  bad "story:refino-escalado added in only ONE escalate path — the other path still hides the escalation"
+else
+  bad "escalate path does NOT add story:refino-escalado — escalations stay invisible in TRIAGEM (ga-lfua3 bug 1)"
+fi
+# story:refino-escalado must NOT be in AUTO_REFINO_LIFECYCLE_LABELS, otherwise
+# _clear_lifecycle would strip the label we just added to surface the escalation.
+if grep -q '^AUTO_REFINO_LIFECYCLE_LABELS=' "$DISPATCHER" \
+   && grep '^AUTO_REFINO_LIFECYCLE_LABELS=' "$DISPATCHER" | grep -q 'story:refino-escalado'; then
+  bad "story:refino-escalado is in AUTO_REFINO_LIFECYCLE_LABELS — _clear_lifecycle would strip the escalation label"
+else
+  ok "story:refino-escalado is NOT in AUTO_REFINO_LIFECYCLE_LABELS (survives _clear_lifecycle)"
+fi
+# Classifier skip-set honours story:refino-escalado as terminal (structural belt
+# independent of the auto-refino:escalated marker).
+if grep -qF '*,story:refino-escalado,*' "$DISPATCHER"; then
+  ok "classifier skip-set treats story:refino-escalado as terminal (structural belt)"
+else
+  bad "classifier skip-set does not list story:refino-escalado — could be re-picked if marker stripped"
+fi
+
 # 5. Candidate selection is restricted to feature/story (bug/chore/task bypass):
 #    every fresh source query carries --type feature, and the type classifier is
 #    asserted per candidate before claiming.
@@ -390,8 +443,10 @@ fi
 
 # 8. DRY_RUN must not transition labels or spawn (proof-mode safety). With no live
 #    bd the queue is empty → it exits 0 without spawning, logging the dry-run.
+#    AUTO_REFINO_STORES is pinned to the temp city so the test is HERMETIC (does
+#    not query the live WA/PS rig stores that the multi-store default points at).
 _drycity="$(mktemp -d)"
-AUTO_REFINO_CITY_OVERRIDE="$_drycity" DRY_RUN=1 \
+AUTO_REFINO_CITY_OVERRIDE="$_drycity" AUTO_REFINO_STORES="$_drycity" DRY_RUN=1 \
   PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
   bash "$DISPATCHER" >/dev/null 2>&1
 _dryrc=$?
@@ -806,6 +861,356 @@ if grep -qF 'lifecycle NOT reset (ga-1wc5)' "$DISPATCHER"; then
 else
   bad "no audit trail for the preserved-lifecycle requeue branch"
 fi
+
+# ── Scenario 11: ga-lfua3 — escalation reaches the human "Sua vez" queue + no loop
+# Two confirmed-live bugs:
+#  (a) escalate set only auto-refino:escalated, but the painel "Sua vez" column
+#      matches _SUAVEZ_LABELS={story:needs-approval, story:refino-escalado}. Without
+#      story:refino-escalado the story rendered in TRIAGEM (invisible to Athos).
+#      Fix: escalate ALSO adds story:refino-escalado (keeping auto-refino:escalated).
+#  (b) re-ingestion loop: an escalated bead carrying only auto-refino:escalated (no
+#      story:*) looked RAW and was re-ingested → re-refined → re-escalated. The RAW
+#      source must exclude auto-refino:escalated (defense in depth, holds even if the
+#      story:* escalation label is later stripped).
+echo "Scenario 11: ga-lfua3 — escalation surfaces in 'Sua vez', no re-ingestion loop"
+EX="scraper build infra config deploy migration pipeline"
+SUAVEZ="story:needs-approval story:refino-escalado"   # painel_visibilidade.py:135
+
+# 11(a). After Fix 1 an escalated story carries story:refino-escalado — which IS a
+#        _SUAVEZ_LABELS member, so the painel renders it in the human queue. Assert
+#        the post-escalate label set intersects _SUAVEZ_LABELS.
+_post_escalate_labels="auto-refino:escalated,story:refino-escalado"
+_in_suavez="no"
+for _l in $SUAVEZ; do case ",$_post_escalate_labels," in *",$_l,"*) _in_suavez="yes" ;; esac; done
+[ "$_in_suavez" = "yes" ] \
+  && ok "(a) post-escalate labels carry a _SUAVEZ_LABELS member (story:refino-escalado) → visible in 'Sua vez'" \
+  || bad "(a) post-escalate labels do NOT intersect _SUAVEZ_LABELS — escalation stays invisible in TRIAGEM"
+# story:refino-escalado must be terminal/skip in the classifier (never re-picked as
+# fresh/bounce) even though it is a story:* label.
+[ "$(auto_refino_lifecycle_state "auto-refino:escalated,story:refino-escalado" "$ACTOR" "$ACTOR")" = "skip" ] \
+  && ok "(a) escalated+story:refino-escalado → skip (terminal, not re-picked)" \
+  || bad "(a) escalated+story:refino-escalado → expected skip"
+# Belt independent of the daemon marker: even if auto-refino:escalated is stripped,
+# story:refino-escalado ALONE must still classify as skip (structural belt).
+[ "$(auto_refino_lifecycle_state "story:refino-escalado" "" "$ACTOR")" = "skip" ] \
+  && ok "(a) story:refino-escalado alone (escalated marker stripped) → skip (structural belt)" \
+  || bad "(a) story:refino-escalado alone → expected skip"
+
+# 11(b). A bead carrying auto-refino:escalated is NOT ingested by the RAW source
+#        (loop killed) — the exact ga-m9gt3 shape and the variant where story:* was
+#        stripped leaving only the daemon marker.
+[ "$(auto_refino_is_ingestable_raw "ga-m9gt3" "feature" "auto-refino:escalated" "false" "$EX")" = "no" ] \
+  && ok "(b) bead w/ auto-refino:escalated (no story:*) → NOT ingested (loop killed)" \
+  || bad "(b) escalated bead → expected NOT ingestable (re-ingestion loop ga-m9gt3 re-forms)"
+# After Fix 1 the escalated bead ALSO carries story:refino-escalado (a story:* label),
+# so it is doubly non-raw — assert both the has-lifecycle path AND the marker path drop it.
+[ "$(auto_refino_is_ingestable_raw "ga-m9gt3" "feature" "auto-refino:escalated,story:refino-escalado" "false" "$EX")" = "no" ] \
+  && ok "(b) escalated bead + story:refino-escalado → NOT ingested (story:* present AND marker excluded)" \
+  || bad "(b) escalated+refino-escalado → expected NOT ingestable"
+
+# 11(c). A genuinely-fresh raw story (no story:*, no escalated marker) IS still
+#        ingested — the fix must not over-reject and re-starve the funnel.
+[ "$(auto_refino_is_ingestable_raw "ga-fresh2" "feature" "frontend" "false" "$EX")" = "yes" ] \
+  && ok "(c) genuine fresh raw story (no story:*, no escalated) → still ingested (no regression)" \
+  || bad "(c) genuine raw story → expected ingestable (funnel re-starved)"
+[ "$(auto_refino_is_ingestable_raw "ga-fresh3" "story" "" "false" "$EX")" = "yes" ] \
+  && ok "(c) bare raw story type, no labels → still ingested" \
+  || bad "(c) bare raw story → expected ingestable"
+
+# 11(d). Flag-off path unchanged: AUTO_REFINO_INGEST_RAW_TRIAGEM=0 restores the EXACT
+#        prior labelled-input-only behaviour (no RAW source). Assert the dispatcher
+#        still gates the 4th source behind the flag and logs the OFF branch.
+if grep -qF 'if [ "$AUTO_REFINO_INGEST_RAW_TRIAGEM" = "1" ]; then' "$DISPATCHER" \
+   && grep -qF 'Raw-Triagem ingestion OFF' "$DISPATCHER"; then
+  ok "(d) RAW ingestion stays gated behind AUTO_REFINO_INGEST_RAW_TRIAGEM (flag-off path unchanged)"
+else
+  bad "(d) AUTO_REFINO_INGEST_RAW_TRIAGEM flag gate missing — flag-off behaviour changed"
+fi
+
+# ── Scenario 12: MULTI-STORE funnel (rig-store ingestion fix) ──────────────────
+# The daemon must query AND write back to all THREE bead stores (HQ + WA + PS),
+# not just HQ, so feature stories living in the whatsapp_automation / property_
+# scrapers rig stores are ingested into the refino funnel instead of starving in
+# the painel's "Triagem" column forever. Mirrors the proven multi-store shape of
+# context-check-dispatcher.sh. These are drift guards + a hermetic iteration proof.
+echo ""
+echo "── Scenario 12: multi-store funnel (HQ + WA + PS rig stores) ──"
+
+# 12a. AUTO_REFINO_STORES env exists and defaults to the 3 store paths.
+if grep -qE '^AUTO_REFINO_STORES="\$\{AUTO_REFINO_STORES:-\$GC_CITY .*whatsapp_automation .*property_scrapers\}"' "$DISPATCHER"; then
+  ok "AUTO_REFINO_STORES defaults to HQ + WA + PS store paths"
+else
+  bad "AUTO_REFINO_STORES env missing or does not default to the 3 store paths"
+fi
+
+# 12b. bd_() targets the per-iteration store ($AR_STORE), defaulting to $GC_CITY
+#      (so single-store callers / the lib-mode unit tests are unchanged).
+if grep -qE 'bd_\(\) \{ bd -C "\$\{AR_STORE:-\$GC_CITY\}" "\$@"; \}' "$DISPATCHER"; then
+  ok "bd_() targets \${AR_STORE:-\$GC_CITY} (per-store, HQ-default)"
+else
+  bad "bd_() does not target the per-iteration store with a GC_CITY fallback"
+fi
+
+# 12c. The candidate-gather loop iterates each store.
+if grep -qE 'for AR_STORE in \$AUTO_REFINO_STORES' "$DISPATCHER"; then
+  ok "candidate gather loops over AUTO_REFINO_STORES"
+else
+  bad "candidate gather does not iterate AUTO_REFINO_STORES"
+fi
+
+# 12d. CRITICAL CORRECTNESS: the refiner task heredoc writes back via $AR_BEAD_STORE
+#      (the selected bead's OWN store), NOT $GC_CITY — a WA story's labels/comments
+#      must land in the WA store. No bd -C "$GC_CITY" may survive in the heredoc.
+if grep -q 'bd -C "$AR_BEAD_STORE"' "$DISPATCHER" \
+   && ! grep -q 'bd -C "$GC_CITY"' "$DISPATCHER"; then
+  ok "refiner write-back targets the bead's own store (\$AR_BEAD_STORE), never HQ"
+else
+  bad "refiner heredoc still writes to \$GC_CITY (would land rig-store writes in HQ)"
+fi
+
+# 12e. The refiner SESSION spawn stays city-coupled on HQ (gc --city "$GC_CITY"):
+#      sessions live in the HQ city; only the bead writes are store-scoped. Mirrors
+#      context-check-dispatcher.sh.
+if grep -q 'gc --city "$GC_CITY" session new' "$DISPATCHER"; then
+  ok "refiner session spawn stays on the HQ city (gc --city \$GC_CITY)"
+else
+  bad "refiner session spawn no longer uses gc --city \$GC_CITY"
+fi
+
+# 12f. HERMETIC iteration proof: point AUTO_REFINO_STORES at TWO temp store dirs and
+#      confirm the DRY_RUN sweep visits BOTH (the log emits a per-store header for
+#      each). This proves the loop actually iterates every store — the regression
+#      that a WA/PS store is now reached, not just HQ. No live Dolt is touched
+#      (empty temp dirs → bd list returns [] → harmless DRY_RUN).
+_ms_a="$(mktemp -d)"; _ms_b="$(mktemp -d)"
+AUTO_REFINO_CITY_OVERRIDE="$_ms_a" AUTO_REFINO_STORES="$_ms_a $_ms_b" DRY_RUN=1 \
+  PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  bash "$DISPATCHER" >/dev/null 2>&1
+_msrc=$?
+_mslog=$(cat "$_ms_a/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
+if [ "$_msrc" -eq 0 ] \
+   && echo "$_mslog" | grep -q "candidate store: $_ms_a" \
+   && echo "$_mslog" | grep -q "candidate store: $_ms_b"; then
+  ok "DRY_RUN sweep iterates every store (both temp stores visited)"
+else
+  bad "DRY_RUN sweep did not visit all stores (rc=$_msrc; multi-store loop broken)"
+fi
+rm -rf "$_ms_a" "$_ms_b"
+
+# ── Scenario 13: FIX C — single-instance mkdir-mutex lock ─────────────────────
+# WHY: the refiner timeout (25m) >> the launchd interval (~5m), so without a lock
+# launchd stacks up to 5 concurrent sweeps, each spawning a Sonnet refiner, blowing
+# past the auto-refiner cap (max_active_sessions=3). The lock caps it at ONE live
+# sweep. These are drift guards + a live concurrency proof using the DRY_RUN harness.
+echo ""
+echo "── Scenario 13: FIX C — single-instance lock (refiner-cap protection) ──"
+
+# 13a. Drift guards: the lock primitives exist (mkdir mutex + heartbeat + trap +
+#      env kill-switch), mirroring the Pilot's proven shape.
+if grep -qF 'AUTO_REFINO_LOCK="${AUTO_REFINO_LOCK:-1}"' "$DISPATCHER"; then
+  ok "(C) AUTO_REFINO_LOCK env kill-switch present (defaults ON)"
+else
+  bad "(C) AUTO_REFINO_LOCK kill-switch missing"
+fi
+if grep -qF 'mkdir "$AUTO_REFINO_LOCK_DIR"' "$DISPATCHER" \
+   && grep -qF "trap '_release_ar_lock' EXIT" "$DISPATCHER"; then
+  ok "(C) atomic mkdir mutex + release-on-EXIT trap present (fd-less lock)"
+else
+  bad "(C) mkdir mutex or release trap missing"
+fi
+# The lock must live AFTER the lib-mode early-return so sourcing for unit tests
+# never acquires it (otherwise the harness above would have left a lock dir / hung).
+if awk '/AUTO_REFINO_LIB:-0/{libline=NR} /AUTO_REFINO_LOCK="\$\{AUTO_REFINO_LOCK/{lockline=NR} END{exit !(libline>0 && lockline>libline)}' "$DISPATCHER"; then
+  ok "(C) lock block sits AFTER the lib-mode guard (pure-fn sourcing never locks)"
+else
+  bad "(C) lock block is not strictly after the AUTO_REFINO_LIB early-return"
+fi
+
+# 13b. LIVE: a second concurrent sweep BACKS OFF while a fresh lock is held.
+#      Pre-create the lock dir with a FRESH heartbeat (age 0) in the temp city's
+#      TMPDIR, then run a DRY_RUN sweep — it must find the live holder and exit 0
+#      WITHOUT logging a sweep start (mutated nothing).
+_lkcity="$(mktemp -d)"; _lktmp="$(mktemp -d)"
+# Reconstruct the lock-dir path the dispatcher computes for this GC_CITY.
+_lk_san="$(printf '%s' "$_lkcity" | tr '/ ' '__')"
+_lk_dir="$_lktmp/auto-refino-dispatcher${_lk_san}.lock.d"
+mkdir -p "$_lk_dir"
+printf 'someoneelse:999\n' > "$_lk_dir/heartbeat"   # fresh mtime = live holder
+TMPDIR="$_lktmp" AUTO_REFINO_CITY_OVERRIDE="$_lkcity" AUTO_REFINO_STORES="$_lkcity" DRY_RUN=1 \
+  PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  bash "$DISPATCHER" >/dev/null 2>&1
+_lkrc=$?
+_lklog=$(cat "$_lkcity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
+if [ "$_lkrc" -eq 0 ] \
+   && echo "$_lklog" | grep -qiF 'backing off (single-instance guard' \
+   && ! echo "$_lklog" | grep -qiE 'Auto-refino sweep start'; then
+  ok "(C) second concurrent sweep BACKS OFF on a fresh lock (no second refiner; cap protected)"
+else
+  bad "(C) second sweep did not back off on a held lock (rc=$_lkrc) — 5-vs-3 stacking not prevented"
+fi
+# The live holder's lock dir must be untouched (the backing-off sweep owns nothing).
+[ -d "$_lk_dir" ] && ok "(C) live holder's lock dir left intact (back-off mutated nothing)" \
+                  || bad "(C) back-off clobbered the live holder's lock dir"
+rm -rf "$_lkcity" "$_lktmp"
+
+# 13c. LIVE: a STALE lock (heartbeat mtime older than MAX_AGE) is RECLAIMED — the
+#      sweep takes over and proceeds (so a crashed sweep can't wedge refino forever).
+_skcity="$(mktemp -d)"; _sktmp="$(mktemp -d)"
+_sk_san="$(printf '%s' "$_skcity" | tr '/ ' '__')"
+_sk_dir="$_sktmp/auto-refino-dispatcher${_sk_san}.lock.d"
+mkdir -p "$_sk_dir"
+printf 'deadholder:111\n' > "$_sk_dir/heartbeat"
+# Age the heartbeat far past any MAX_AGE (set a tiny MAX_AGE to make it stale).
+touch -t 200001010000 "$_sk_dir/heartbeat" 2>/dev/null || true
+TMPDIR="$_sktmp" AUTO_REFINO_CITY_OVERRIDE="$_skcity" AUTO_REFINO_STORES="$_skcity" \
+  AUTO_REFINO_LOCK_MAX_AGE=5 DRY_RUN=1 \
+  PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  bash "$DISPATCHER" >/dev/null 2>&1
+_skrc=$?
+_sklog=$(cat "$_skcity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
+if [ "$_skrc" -eq 0 ] \
+   && echo "$_sklog" | grep -qiF 'Recovered STALE auto-refino lock' \
+   && echo "$_sklog" | grep -qiE 'Auto-refino sweep start'; then
+  ok "(C) STALE lock RECLAIMED — sweep takes over and proceeds (crashed sweep can't wedge refino)"
+else
+  bad "(C) stale lock not reclaimed (rc=$_skrc) — a dead holder would wedge the funnel"
+fi
+rm -rf "$_skcity" "$_sktmp"
+
+# 13d. Kill-switch: AUTO_REFINO_LOCK=0 runs the sweep even with a fresh lock held
+#      (exact prior behaviour; the guard is fully bypassable).
+_kscity="$(mktemp -d)"; _kstmp="$(mktemp -d)"
+_ks_san="$(printf '%s' "$_kscity" | tr '/ ' '__')"
+_ks_dir="$_kstmp/auto-refino-dispatcher${_ks_san}.lock.d"
+mkdir -p "$_ks_dir"; printf 'held:1\n' > "$_ks_dir/heartbeat"
+TMPDIR="$_kstmp" AUTO_REFINO_CITY_OVERRIDE="$_kscity" AUTO_REFINO_STORES="$_kscity" \
+  AUTO_REFINO_LOCK=0 DRY_RUN=1 \
+  PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  bash "$DISPATCHER" >/dev/null 2>&1
+_kslog=$(cat "$_kscity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
+if echo "$_kslog" | grep -qiE 'Auto-refino sweep start' \
+   && ! echo "$_kslog" | grep -qiF 'backing off (single-instance guard'; then
+  ok "(C) AUTO_REFINO_LOCK=0 bypasses the guard (sweep runs despite a held lock — prior behaviour)"
+else
+  bad "(C) kill-switch did not bypass the lock"
+fi
+rm -rf "$_kscity" "$_kstmp"
+
+# ── Scenario 14: FIX B — cross-stage contention-yield ─────────────────────────
+# WHY: refino is the LOWEST stage and must yield to a congested gate / waiting Pilot
+# when resources are contended, but NEVER serialize pointlessly when resources are
+# free (anti-starvation). Drift guards + live behavioural proofs via the override
+# test seams (no live gate/Dolt/quota touched).
+echo ""
+echo "── Scenario 14: FIX B — cross-stage contention-yield (anti-starvation) ──"
+
+# 14a. Drift guards: the yield gate + its env kill-switch + the four probes exist,
+#      mirroring the Pilot's ga-d0hz3 shape.
+if grep -qF 'AUTO_REFINO_YIELD="${AUTO_REFINO_YIELD:-1}"' "$DISPATCHER"; then
+  ok "(B) AUTO_REFINO_YIELD env kill-switch present (defaults ON)"
+else
+  bad "(B) AUTO_REFINO_YIELD kill-switch missing"
+fi
+if grep -q '_ar_quota_limited()' "$DISPATCHER" && grep -q '_ar_dolt_hot()' "$DISPATCHER" \
+   && grep -q '_ar_gate_congested()' "$DISPATCHER" && grep -q '_ar_pilot_has_work()' "$DISPATCHER"; then
+  ok "(B) all four contention probes defined (quota / dolt / gate / pilot-work)"
+else
+  bad "(B) a contention probe is missing"
+fi
+# The yield must defer (exit) only under (higher-stage-work AND resource-tight).
+if grep -qF '_yield_resource_tight=1' "$DISPATCHER" \
+   && grep -qF 'DEFERRING refino this sweep' "$DISPATCHER"; then
+  ok "(B) defer is conditional on resource-tight AND higher-stage work (anti-starvation gate)"
+else
+  bad "(B) defer condition not wired as resource-tight AND higher-stage-work"
+fi
+
+# 14b. LIVE DEFER: gate congested + quota limited → the sweep DEFERS, mutating
+#      nothing (no claim, no spawn) and logging the yield. Driven purely by seams.
+_ydcity="$(mktemp -d)"
+AUTO_REFINO_CITY_OVERRIDE="$_ydcity" AUTO_REFINO_STORES="$_ydcity" DRY_RUN=1 \
+  AUTO_REFINO_QUOTA_OVERRIDE=2 AUTO_REFINO_GATE_CONGESTED_OVERRIDE=1 \
+  PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  bash "$DISPATCHER" >/dev/null 2>&1
+_ydrc=$?
+_ydlog=$(cat "$_ydcity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
+if [ "$_ydrc" -eq 0 ] \
+   && echo "$_ydlog" | grep -qiF 'sweep deferred (cross-stage yield' \
+   && ! echo "$_ydlog" | grep -qiF 'candidate store:'; then
+  ok "(B) DEFERS when gate-congested + quota-limited (no candidate gather, mutated nothing)"
+else
+  bad "(B) did not defer under gate-congested + quota-limited (rc=$_ydrc)"
+fi
+rm -rf "$_ydcity"
+
+# 14c. LIVE DEFER via the PILOT arm: pilot-has-work + Dolt hot → DEFERS (proves the
+#      'higher stage has work' disjunct covers the Pilot, not just the gate).
+_ypcity="$(mktemp -d)"
+AUTO_REFINO_CITY_OVERRIDE="$_ypcity" AUTO_REFINO_STORES="$_ypcity" DRY_RUN=1 \
+  AUTO_REFINO_DOLT_CPU_OVERRIDE=999 AUTO_REFINO_DOLT_LATENCY_OVERRIDE_MS=9999 \
+  AUTO_REFINO_GATE_CONGESTED_OVERRIDE=0 AUTO_REFINO_PILOT_WORK_OVERRIDE=1 \
+  PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  bash "$DISPATCHER" >/dev/null 2>&1
+_yplog=$(cat "$_ypcity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
+if echo "$_yplog" | grep -qiF 'sweep deferred (cross-stage yield'; then
+  ok "(B) DEFERS when Pilot has approved work + Dolt hot (pilot disjunct works)"
+else
+  bad "(B) did not defer under pilot-has-work + Dolt hot"
+fi
+rm -rf "$_ypcity"
+
+# 14d. ANTI-STARVATION (resources FREE): gate congested but quota OK + Dolt calm →
+#      MUST NOT defer. A calm, quota-OK moment always runs refino even with a busy
+#      gate. The sweep proceeds to the candidate gather (logs a candidate-store header).
+_yfcity="$(mktemp -d)"
+AUTO_REFINO_CITY_OVERRIDE="$_yfcity" AUTO_REFINO_STORES="$_yfcity" DRY_RUN=1 \
+  AUTO_REFINO_QUOTA_OVERRIDE=0 AUTO_REFINO_DOLT_CPU_OVERRIDE=5 AUTO_REFINO_DOLT_LATENCY_OVERRIDE_MS=10 \
+  AUTO_REFINO_GATE_CONGESTED_OVERRIDE=1 AUTO_REFINO_PILOT_WORK_OVERRIDE=1 \
+  PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  bash "$DISPATCHER" >/dev/null 2>&1
+_yfrc=$?
+_yflog=$(cat "$_yfcity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
+if [ "$_yfrc" -eq 0 ] \
+   && ! echo "$_yflog" | grep -qiF 'sweep deferred (cross-stage yield' \
+   && echo "$_yflog" | grep -qiF 'candidate store:'; then
+  ok "(B) ANTI-STARVATION: resources FREE (quota OK + Dolt calm) → does NOT defer, refines (even w/ busy gate)"
+else
+  bad "(B) deferred when resources were free — anti-starvation violated (rc=$_yfrc)"
+fi
+rm -rf "$_yfcity"
+
+# 14e. FAIL-OPEN: a blind Dolt probe (no signal) resolves to NOT-hot, and with quota
+#      OK the sweep proceeds (a daemon that can't read Dolt keeps refining, never
+#      wedges). Drive resource_tight off by leaving all seams unset but quota OK,
+#      gate congested — must NOT defer (resources not tight ⇒ skip higher-stage probe).
+_fecity="$(mktemp -d)"
+AUTO_REFINO_CITY_OVERRIDE="$_fecity" AUTO_REFINO_STORES="$_fecity" DRY_RUN=1 \
+  AUTO_REFINO_QUOTA_OVERRIDE=0 AUTO_REFINO_GATE_CONGESTED_OVERRIDE=1 \
+  PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  bash "$DISPATCHER" >/dev/null 2>&1
+_ferc=$?
+_felog=$(cat "$_fecity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
+if [ "$_ferc" -eq 0 ] && ! echo "$_felog" | grep -qiF 'sweep deferred (cross-stage yield'; then
+  ok "(B) FAIL-OPEN: blind Dolt probe → not-hot; quota OK ⇒ no defer (funnel never wedged)"
+else
+  bad "(B) blind probe wedged the sweep / deferred without contention (rc=$_ferc)"
+fi
+rm -rf "$_fecity"
+
+# 14f. Kill-switch: AUTO_REFINO_YIELD=0 disables the gate (no defer even when
+#      gate-congested + quota-limited — exact prior behaviour).
+_ykcity="$(mktemp -d)"
+AUTO_REFINO_CITY_OVERRIDE="$_ykcity" AUTO_REFINO_STORES="$_ykcity" DRY_RUN=1 \
+  AUTO_REFINO_YIELD=0 AUTO_REFINO_QUOTA_OVERRIDE=2 AUTO_REFINO_GATE_CONGESTED_OVERRIDE=1 \
+  PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  bash "$DISPATCHER" >/dev/null 2>&1
+_yklog=$(cat "$_ykcity/.gc/logs/auto-refino-dispatcher.log" 2>/dev/null || echo "")
+if ! echo "$_yklog" | grep -qiF 'sweep deferred (cross-stage yield'; then
+  ok "(B) AUTO_REFINO_YIELD=0 bypasses the yield gate (prior behaviour)"
+else
+  bad "(B) kill-switch did not bypass the yield gate"
+fi
+rm -rf "$_ykcity"
 
 echo ""
 echo "auto-refino-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
