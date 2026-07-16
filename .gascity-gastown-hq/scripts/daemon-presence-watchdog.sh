@@ -130,6 +130,16 @@ _loaded()    { launchctl list "$1" >/dev/null 2>&1; }
 _last_exit() { launchctl list 2>/dev/null | awk -v l="$1" '$3==l {print $2}'; }
 # Previous exit recorded for a label (from the state file); empty if none.
 _prev_exit() { awk -v l="$1" '$1==l {print $2}' "$STATE" 2>/dev/null; }
+# ga-g92h: classify a launchctl exit code. 137 is SIGKILL (128+9) -- the exact
+# code the kernel's OOM killer delivers, and on this host launchctl reports it
+# as a POSITIVE 137, not the negative/signal form the crash-loop comment below
+# assumes. A killed VICTIM (memory pressure -- needs capacity attention) and a
+# genuine code FAILURE (exit=1 -- needs a code fix) were landing in the
+# identical "exiting non-zero" bucket, indistinguishable to whoever reads the
+# alert. This does not change any threshold/kickstart-heal DECISION -- a
+# killed daemon needs restarting exactly like a crash-looping one -- it only
+# changes which message a caller emits.
+_exit_class() { [ "$1" = "137" ] && echo "oom-killed" || echo "failing"; }
 # Seconds since <file> was last modified ("$2"=now epoch); empty if missing / stat fails.
 _log_age()   { local f="$1" now="$2" m; [ -f "$f" ] || return 0; m=$(stat -f %m "$f" 2>/dev/null) && echo $(( now - m )); }
 
@@ -326,7 +336,7 @@ run_recycle_sweep() {
 }
 
 run_sweep() {
-  local absent="" reloaded="" crashloop="" failing="" wedged="" path_missing="" healthy=0 newstate="" lbl plist ex prev _hb _hblog _hbmax _age fc prog heal_n
+  local absent="" reloaded="" crashloop="" failing="" oom_killed="" wedged="" path_missing="" healthy=0 newstate="" lbl plist ex prev _hb _hblog _hbmax _age fc prog heal_n
   local NOW; NOW="$(date +%s)"
   # How long the machine has been awake-and-up (for WEDGE sleep/boot suppression).
   # DPW_TEST_AVAIL_AGE lets the selftest inject a value without calling sysctl.
@@ -385,8 +395,13 @@ run_sweep() {
         fc=$(( $(_fail_count_get "$lbl") + 1 ))
         _fail_count_set "$lbl" "$fc"
         if [ "$fc" -ge "${DPW_FAIL_THRESHOLD:-2}" ]; then
-          failing="$failing $lbl(exit=$ex,sweeps=$fc)"
-          log "FAILING: $lbl exiting non-zero (exit=$ex) for $fc consecutive sweeps"
+          if [ "$(_exit_class "$ex")" = "oom-killed" ]; then
+            oom_killed="$oom_killed $lbl(exit=$ex,sweeps=$fc)"
+            log "OOM-KILLED: $lbl killed by kernel (SIGKILL, exit=$ex) for $fc consecutive sweeps — memory pressure, not a code failure (ga-g92h)"
+          else
+            failing="$failing $lbl(exit=$ex,sweeps=$fc)"
+            log "FAILING: $lbl exiting non-zero (exit=$ex) for $fc consecutive sweeps"
+          fi
         fi
       else
         _fail_count_reset "$lbl"
@@ -476,11 +491,12 @@ run_sweep() {
     fi
   fi
 
-  if [ -n "$absent" ] || [ -n "$crashloop" ] || [ -n "$failing" ] || [ -n "$wedged" ] || [ -n "$path_missing" ]; then
+  if [ -n "$absent" ] || [ -n "$crashloop" ] || [ -n "$failing" ] || [ -n "$oom_killed" ] || [ -n "$wedged" ] || [ -n "$path_missing" ]; then
     local msg="Daemon-presence watchdog:"
     [ -n "$absent" ]      && msg="$msg ABSENT:${absent} (reloaded:${reloaded:- none})."
     [ -n "$crashloop" ]   && msg="$msg CRASH-LOOP:${crashloop} (auto-heal exhausted or disabled — needs Mayor/human)."
     [ -n "$failing" ]     && msg="$msg FAILING:${failing} (nonzero exit ≥${DPW_FAIL_THRESHOLD} consecutive sweeps — investigate)."
+    [ -n "$oom_killed" ]  && msg="$msg OOM-KILLED:${oom_killed} (SIGKILL by kernel under memory pressure, ≥${DPW_FAIL_THRESHOLD} consecutive sweeps — a capacity/RAM issue, not a code bug; ga-g92h)."
     [ -n "$wedged" ]      && msg="$msg WEDGED:${wedged} (loaded but heartbeat stale — kickstarted)."
     [ -n "$path_missing" ] && msg="$msg PATH-MISSING:${path_missing} (ProgramArguments script absent from disk — daemon will fail on restart)."
     log "ALERT $msg"
@@ -884,6 +900,32 @@ GCSTUB20
     esac
   done
   unset _gap_lbl _gap_line
+
+  echo "Scenario 23 (ga-g92h): _exit_class distinguishes OOM-killed (137) from a real failure"
+  # Provenance checks off (matches the imp17 block's own convention above) --
+  # scenario 16/17 permanently `unset -f _binary_has_marker` to undo their
+  # local override, which also erases the module's real definition for the
+  # rest of this process (pre-existing selftest quirk, unrelated to ga-g92h).
+  # Leaving provenance on here would call the now-missing function and print
+  # "command not found" noise with no effect on any assertion below.
+  DPW_CHECK_GC_PROVENANCE=0; DPW_CHECK_GT_PROVENANCE=0
+  [ "$(_exit_class 137)" = "oom-killed" ] && ok "_exit_class(137) = oom-killed (SIGKILL)"      || bad "_exit_class(137) should be oom-killed"
+  [ "$(_exit_class 1)" = "failing" ]      && ok "_exit_class(1) = failing (code error)"         || bad "_exit_class(1) should be failing"
+  [ "$(_exit_class 2)" = "failing" ]      && ok "_exit_class(2) = failing (any other nonzero)"  || bad "_exit_class(2) should be failing"
+
+  echo "Scenario 24 (ga-g92h): exit=137 crossing FAILING threshold alerts as OOM-KILLED, not FAILING"
+  rm -rf "${STATE}.fail-counts"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT="com.gascity.alpha:137"
+  : > "$STATE"; : > "$LOG"; run_sweep && ok "1st exit=137: no alert yet (threshold=2)" || bad "1st exit=137 falsely alerted"
+  : > "$STATE"; run_sweep && bad "2nd consecutive exit=137: should alert (return 1)" || ok "2nd consecutive exit=137 alerts (return 1, OOM-KILLED bucket)"
+  grep -q "OOM-KILLED: com.gascity.alpha" "$LOG" && ok "log contains OOM-KILLED for exit=137 (ga-g92h)" || bad "log missing OOM-KILLED line for exit=137"
+  grep -q "FAILING: com.gascity.alpha" "$LOG" && bad "log wrongly contains FAILING for exit=137 (should be OOM-KILLED only)" || ok "log does NOT say FAILING for exit=137"
+
+  echo "Scenario 25 (ga-g92h): exit=1 (plain code failure) still alerts as FAILING — regression guard"
+  rm -rf "${STATE}.fail-counts"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT="com.gascity.alpha:1"
+  : > "$STATE"; : > "$LOG"; run_sweep && ok "1st exit=1: no alert yet (threshold=2)" || bad "1st exit=1 falsely alerted"
+  : > "$STATE"; run_sweep && bad "2nd consecutive exit=1: should alert (return 1)" || ok "2nd consecutive exit=1 alerts (return 1, FAILING bucket unchanged)"
+  grep -q "FAILING: com.gascity.alpha" "$LOG" && ok "log contains FAILING for exit=1 (unchanged behavior)" || bad "log missing FAILING line for exit=1 regression"
+  grep -q "OOM-KILLED: com.gascity.alpha" "$LOG" && bad "log wrongly contains OOM-KILLED for exit=1" || ok "log does NOT say OOM-KILLED for exit=1"
 
   echo ""
   echo "daemon-presence-watchdog selftest: PASS=$PASS FAIL=$FAIL"
