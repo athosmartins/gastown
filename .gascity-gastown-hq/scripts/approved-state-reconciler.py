@@ -146,7 +146,7 @@ _bd_comment = None          # (rig_root, bead_id, text) -> bool
 _do_notify = None           # (msg, prio) -> None
 _do_mail_mayor = None       # (subject, body) -> bool
 _read_pilot_log_lines = None  # () -> list[str]
-_bd_gate_markers = None     # (rig_root) -> list[dict]|None; OPEN quality-gate-markers in the store
+_bd_gate_markers = None     # () -> list[dict]|None; OPEN quality-gate-markers in the HQ store
 
 
 # ── guarded subprocess ────────────────────────────────────────────────────────
@@ -402,7 +402,12 @@ def _is_flowing(bead):
     1. story:in-flight label — definitively being built.
     2. pilot:dispatched label — dispatched by the Pilot (assumed within FLOW_GRACE_MIN
        since the lifecycle-coherence-janitor clears stale pilot:dispatched labels via R4).
-    3. Non-empty assignee that is not 'mayor' — some builder holds it.
+    3. gate:reviewing / gate:queued label — the gate is actively working this bead (quality-
+       gate-guard.sh:1524-1526 stamps gate:reviewing on the SOURCE bead itself as belt-and-
+       suspenders, independent of the marker lookup in built_ids below). A bead in the gate
+       is flowing by definition — this reconciler's scope is DISPATCH failures, and a bead
+       already past dispatch and into review cannot also be a dispatch failure (ga-6927).
+    4. Non-empty assignee that is not 'mayor' — some builder holds it.
 
     Note: FLOW_GRACE_MIN (default 10min) is the env knob for operators to tune
     how long a dispatched bead is considered "freshly flowing" before alarming.
@@ -411,6 +416,8 @@ def _is_flowing(bead):
     if "story:in-flight" in labels:
         return True
     if "pilot:dispatched" in labels:
+        return True
+    if "gate:reviewing" in labels or "gate:queued" in labels:
         return True
     assignee = bead.get("assignee") or ""
     if assignee and assignee not in ("mayor", ""):
@@ -719,22 +726,39 @@ def _alarm_reclaim_exhausted(rig_root, bead, reclaim_count, now, state):
 
 
 # ── built-bead index ──────────────────────────────────────────────────────────
-def _gate_marker_source_beads(rig_root):
-    """Set of bead ids that an OPEN quality-gate-marker in this store points at (label
-    source-bead:<id>). Such a bead is BUILT and awaiting the gate — PAST the dispatch
-    stage — so the starve alarm must skip it: a built-but-still-story:approved bead is NOT
-    a dispatch failure. (A marker can even be orphaned by the HQ-only gate scan — ga-pnugy
-    — leaving the bead story:approved forever; that is a GATE bug, not a dispatch failure.)
-    FAIL-SAFE: any query/parse error → empty set (never SUPPRESS a real dispatch alarm on an
-    unreadable marker query — the same fail-toward-alarming bias as the rest of the daemon)."""
+def _gate_marker_source_beads():
+    """Set of bead ids that an OPEN quality-gate-marker points at (label source-bead:<id>).
+    Such a bead is BUILT and awaiting the gate — PAST the dispatch stage — so the starve
+    alarm must skip it: a built-but-still-story:approved bead is NOT a dispatch failure.
+    (A marker can even be orphaned by the HQ-only gate scan — ga-pnugy — leaving the bead
+    story:approved forever; that is a GATE bug, not a dispatch failure.)
+
+    Markers are ALWAYS created in the HQ store (CITY), never in a rig's own store —
+    quality-gate-guard.sh:1517 always runs `bd -C "$GC_CITY" label add "$MARKER_ID"
+    "source-bead:$BEAD_ID"` regardless of which rig the source bead lives in. Query CITY
+    once per cycle — NOT rig_root: the original implementation queried rig_root and so
+    could never find a marker for any non-HQ rig bead (a rig store never holds a
+    quality-gate-marker row), making built_ids silently always-empty for every
+    whatsapp_automation/property_scrapers bead since this check was introduced — its own
+    motivating example (wa-huo0d) would never have matched (ga-6927).
+
+    Returns None on query/parse error — the caller MUST treat None as "unknown, not
+    confirmed empty" and fail toward NOT alarming, mirroring the existing _bd_approved
+    convention (None = query error, distinct from a genuinely empty result) rather than
+    the old "empty set on error" behavior. Collapsing "query failed" into "empty set" is
+    exactly the error-vs-empty conflation this bug is about: an unreadable marker query
+    says nothing about whether a bead is built, so it must not silently license the starve
+    alarm (root-class:error-vs-empty)."""
     if _bd_gate_markers is not None:
-        rows = _bd_gate_markers(rig_root)          # test seam
+        rows = _bd_gate_markers()          # test seam
     else:
-        r = _sh([BD_BIN, "-C", rig_root, "list", "-l", "type:quality-gate-marker",
+        r = _sh([BD_BIN, "-C", CITY, "list", "-l", "type:quality-gate-marker",
                  "--json", "-n", "200"], timeout=BD_TIMEOUT)
         if r is None or r.returncode != 0:
-            return set()
+            return None
         rows = _parse_bd_json(r.stdout)
+    if rows is None:
+        return None
     out = set()
     for m in (rows or []):
         if not isinstance(m, dict):
@@ -748,13 +772,27 @@ def _gate_marker_source_beads(rig_root):
 
 
 # ── process one store ─────────────────────────────────────────────────────────
-def _process_store(rig_root, now, state, pilot_alive):
+def _process_store(rig_root, now, state, pilot_alive, built_ids):
     """Scan story:approved open beads in rig_root; classify and act on each one.
+
+    built_ids: set of bead ids with a live BUILT marker (from _gate_marker_source_beads(),
+    computed ONCE per cycle in run_cycle() — markers live only in HQ, not per-rig), or None
+    if that query failed (fail-safe: caller must not alarm when built-state is unknown).
 
     Returns (processed, routed, alarmed) int counts.
     On query error: logs + returns (0, 0, 0) — fail-open; other stores are unaffected.
     """
     # Query story:approved open beads.
+    #
+    # IMPORTANT: story:approved is NOT a pipeline stage — it is a durable ELIGIBILITY
+    # marker. It is set once (Mayor approval) and stays on the bead across build, gate
+    # review, and merge; the only removals in the whole framework are post-merge
+    # (story-delivery.sh, merged-bead-janitor.sh) or the post-build path in _route_bead()
+    # above. So this query's result set routinely contains beads that are already
+    # in-flight, in the gate, or fully built and awaiting the gate — membership here means
+    # "approved", not "waiting to be dispatched". Every consumer below (built_ids,
+    # _is_flowing, the label-based suppressions) exists BECAUSE reading this query alone as
+    # "not yet dispatched" is exactly the mistake that caused ga-6927.
     if _bd_approved is not None:
         # Test seam: stub provided.
         beads = _bd_approved(rig_root)
@@ -778,10 +816,6 @@ def _process_store(rig_root, now, state, pilot_alive):
 
     _log("  [%s] %d story:approved open bead(s) to evaluate" % (
          os.path.basename(rig_root), len(beads)))
-
-    # Beads an OPEN gate marker points at are BUILT + awaiting the gate (past dispatch) →
-    # the starve alarm skips them below (a built bead is not a dispatch failure).
-    built_ids = _gate_marker_source_beads(rig_root)
 
     processed = routed = alarmed = 0
 
@@ -950,6 +984,14 @@ def _process_store(rig_root, now, state, pilot_alive):
         # BUILT (open gate marker references it) → past dispatch, awaiting the gate. NOT a
         # dispatch failure — the reconciler's scope is dispatch. (If the gate never reviews it,
         # that's a GATE bug — ga-pnugy — surfaced elsewhere, not as a false "dispatch failing".)
+        # built_ids is None when the HQ marker query itself failed — treat that as UNKNOWN,
+        # never as "confirmed not built": firing a dispatch-failing alarm on unreadable data is
+        # the same error-vs-empty mistake that made this check a no-op for rig beads for weeks
+        # (ga-6927).
+        if built_ids is None:
+            _log("  %s: no signal, daemon-age=%.0fmin, gate-marker query failed (built-state "
+                 "unknown) — fail-safe, no alarm" % (bead_id, starve_age_min))
+            continue
         if bead_id in built_ids:
             _log("  %s: no signal, daemon-age=%.0fmin, BUILT (open gate marker) — awaiting "
                  "gate, not a dispatch failure — no alarm" % (bead_id, starve_age_min))
@@ -973,6 +1015,15 @@ def run_cycle(now, state):
     pilot_alive = _is_pilot_alive(now)
     _log("pilot alive: %s (window=%dmin)" % (pilot_alive, PILOT_ALIVE_WINDOW_MIN))
 
+    # Gate markers live ONLY in the HQ store, never per-rig — index once per cycle
+    # (ga-6927), not once per rig_root (the old per-store call was 3x redundant AND
+    # queried the wrong store for non-HQ rigs). None = query failed; _process_store
+    # treats that as fail-safe (unknown built-state → no alarm), not as "nothing built".
+    built_ids = _gate_marker_source_beads()
+    if built_ids is None:
+        _log("  gate-marker query FAILED — built-bead check degrades fail-safe "
+             "(no starve alarms this cycle on the BUILT check; see ga-6927)")
+
     total_p = total_r = total_a = 0
 
     for rig_root in RIG_ROOTS:
@@ -985,7 +1036,7 @@ def run_cycle(now, state):
             _log("  [%s] directory not found — skipping" % rig_root)
             continue
         try:
-            p, r, a = _process_store(rig_root, now, state, pilot_alive)
+            p, r, a = _process_store(rig_root, now, state, pilot_alive, built_ids)
             total_p += p
             total_r += r
             total_a += a
@@ -1045,6 +1096,14 @@ def _selftest():
       (u)       exec:manual bead → no starve alarm (awaiting human execution) (ga-u4sd)
       (v)       exec:auto bead (not exec:manual) → STILL alarms — regression guard, exact-
                 label match must not swallow other exec:* variants (ga-u4sd)
+      (w)       BUILT bead in a NON-HQ rig, no flowing label → no starve alarm — isolates
+                the built_ids store-scope fix (queries HQ, not rig_root) (ga-6927)
+      (x)       gate:reviewing label, no marker anywhere → no starve alarm — isolates the
+                _is_flowing fix (ga-6927)
+      (y)       no marker, no gate:*, not flowing → STILL alarms — regression guard, the
+                ga-6927 fix must not become over-permissive
+      (z)       HQ gate-marker query FAILS (built_ids=None) → no starve alarm — fail-safe,
+                error must not collapse into "nothing built" (ga-6927)
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers
@@ -1426,7 +1485,7 @@ def _selftest():
     # story:approved (e.g. wa-huo0d, whose marker the HQ-only gate scan never picks up — ga-pnugy)
     # yet is NOT a dispatch failure. The reconciler must not false-alarm "dispatch failing" on it.
     _bd_approved = lambda root: [_make_bead("hq-017", labels=["story:approved"], age_min=0.1)]
-    _bd_gate_markers = lambda root: [
+    _bd_gate_markers = lambda: [
         {"id": "wisp-q", "status": "open",
          "labels": ["type:quality-gate-marker", "source-bead:hq-017", "gate-status:ready"]}]
     _read_pilot_log_lines = lambda: _pilot_recent()
@@ -1532,6 +1591,95 @@ def _selftest():
     else:
         _bad("(v): exec:auto bead FAILED to alarm — exec:manual fix regressed exec:auto "
              "dispatch-failure detection", "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (w): BUILT bead (marker lives in HQ), NOT flowing → no starve alarm "
+          "— isolates the built_ids store-scope fix (ga-6927)")
+    # Reproduces the ORIGINAL bug precisely: the bead has NO story:in-flight/pilot:dispatched/
+    # gate:reviewing/gate:queued label and no assignee (_is_flowing is False — CAUSA 2 does
+    # NOT explain the suppression here), yet a live quality-gate-marker in the HQ store
+    # references it. Pre-fix, built_ids was computed via `bd -C rig_root list -l
+    # type:quality-gate-marker` — a rig store (whatsapp_automation, property_scrapers) NEVER
+    # holds a quality-gate-marker row (markers only ever live in HQ) — so built_ids was
+    # silently always-empty and this bead would have FALSELY alarmed.
+    _bd_approved = lambda root: [_make_bead("wa-025", labels=["story:approved"], age_min=0.1)]
+    _bd_gate_markers = lambda: [
+        {"id": "wisp-w", "status": "open",
+         "labels": ["type:quality-gate-marker", "source-bead:wa-025", "gate-status:reviewing"]}]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_w = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_w["first_seen_approved"]["wa-025"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_w)
+    _bd_gate_markers = None
+    alarmed_w = any("wa-025" in subj for subj, _ in mail_calls)
+    if not alarmed_w:
+        _ok("(w): BUILT bead, not flowing — no starve alarm (built_ids store-scope fix, ga-6927)")
+    else:
+        _bad("(w): FALSE ALARM on a built bead — built_ids store-scope fix regressed",
+             "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (x): gate:reviewing label, NO marker anywhere → no starve alarm — "
+          "isolates the _is_flowing fix (ga-6927)")
+    # built_ids has no entry at all here (marker orphaned/never created/already closed — e.g.
+    # the ga-pnugy HQ-only-scan gap) — CAUSA 1's fix does NOT explain the suppression. Only
+    # the gate:reviewing → _is_flowing addition can suppress this alarm.
+    _bd_approved = lambda root: [_make_bead(
+        "hq-026", labels=["story:approved", "gate:reviewing"], age_min=0.1)]
+    _bd_gate_markers = lambda: []   # query succeeds, genuinely no open markers
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_x = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_x["first_seen_approved"]["hq-026"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_x)
+    _bd_gate_markers = None
+    alarmed_x = any("hq-026" in subj for subj, _ in mail_calls)
+    if not alarmed_x:
+        _ok("(x): gate:reviewing, no marker — no starve alarm (_is_flowing fix, ga-6927)")
+    else:
+        _bad("(x): FALSE ALARM on a gate:reviewing bead — _is_flowing fix regressed",
+             "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (y): no marker, no gate:*, not flowing → STILL alarms (regression guard)")
+    # Guards against the ga-6927 fix becoming so permissive it swallows real dispatch
+    # failures — a genuinely stalled bead (no marker, no flowing/suppression label) must
+    # keep alarming exactly as before.
+    _bd_approved = lambda root: [_make_bead("hq-027", age_min=0.1)]
+    _bd_gate_markers = lambda: []   # query succeeds, genuinely no open markers
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_y = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_y["first_seen_approved"]["hq-027"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_y)
+    _bd_gate_markers = None
+    alarmed_y = any("hq-027" in subj for subj, _ in mail_calls)
+    if alarmed_y:
+        _ok("(y): genuinely stalled bead — still alarms (ga-6927 fix isn't over-permissive)")
+    else:
+        _bad("(y): genuinely stalled bead FAILED to alarm — ga-6927 fix became over-permissive",
+             "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (z): HQ gate-marker query FAILS (built_ids=None) → no starve alarm "
+          "— fail-safe, error != empty (ga-6927)")
+    # The core error-vs-empty fix: a failed marker query must not collapse into "nothing
+    # built" and license the starve alarm. built_ids=None (query error) must suppress the
+    # alarm — the SAME fail-toward-no-alarm direction as _is_pilot_alive's own fail-open,
+    # not the old "empty set on error, still evaluate the alarm" bias (that bias only made
+    # sense if the query normally worked, which — per scenario (w) — it never did for rig
+    # beads).
+    _bd_approved = lambda root: [_make_bead("hq-028", age_min=0.1)]
+    _bd_gate_markers = lambda: None   # simulated query error
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_z = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_z["first_seen_approved"]["hq-028"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_z)
+    _bd_gate_markers = None
+    alarmed_z = any("hq-028" in subj for subj, _ in mail_calls)
+    if not alarmed_z:
+        _ok("(z): HQ gate-marker query failure → fail-safe, no alarm (error-vs-empty fix)")
+    else:
+        _bad("(z): SAFETY VIOLATION — alarmed despite unreadable marker query "
+             "(error-vs-empty conflation)", "mail_calls=%s" % mail_calls)
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
