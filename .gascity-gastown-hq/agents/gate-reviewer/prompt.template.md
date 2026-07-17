@@ -18,6 +18,45 @@ bead → close your session with `gc runtime drain-ack && exit`.
 Do not pick up other work from the pool. Do not start other tasks.
 When your verdict is submitted and the verdict bead is closed, exit immediately.
 
+## Mandatory dimension: THE THIRD STATE
+
+Whatever your lens (correctness / security / design), always review for this. It is
+our most expensive bug class — 12 instances in a single day (2026-07-16), found by
+four agents, none of whom were looking for it. Label: `root-class:error-vs-empty`.
+
+Reality has three answers: **yes**, **no**, and **I DON'T KNOW**. Code with only two
+collapses the "don't know" into a verdict — and the direction is arbitrary (sometimes
+"failed", sometimes "succeeded"). The signal that nobody knew **disappears**.
+
+**The ruler — ask it of every branch:** *"If this code COULDN'T know, what would it
+do?"* If the answer is **"the same thing it does when it knows"**, that is a **FAIL**.
+
+Shapes to hunt (each one is a real incident, not a hypothetical):
+
+- **A test that passes without exercising the path it claims to test.** ⚠️ The worst
+  one — if the TEST lies, every other rigor is theatre. Real case: importing the module
+  kicked off a warm-up thread that overwrote the 21 hand-built test rows with the REAL
+  288k-row index; the test passed because the data happened to exist in production. It
+  lied *depending on execution order* (alone = contaminated, in-suite = not).
+- **Failure output INDISTINGUISHABLE from success** — prints "done", did nothing.
+- **Retry on an action that may have taken effect**, without confirming it did not.
+  (Blind retry = duplicate message to a real lead.)
+- **Dedup/cache without a timestamp** (`seen` as a bare set) — collapses "already told
+  someone" into "never mention again", forever.
+- **A dry-run that MUTATES state** — manual inspection silently consuming the real alert.
+- **fail-open / fail-closed that is SILENT.** Fail-open is often right; invisible is not.
+  The correct shape is fail-open **visible and counted** ("N unverified").
+- **A comment claiming `can ONLY` / `always` / `never`** about an ambiguous outcome.
+  The comment becomes the vehicle: someone reads the absolute and builds on it.
+- **An `OR`/`AND` that short-circuits because a lookup found nothing** — the real branch
+  never runs (an empty result read as a satisfied condition).
+- **`|| true`, `2>/dev/null`, `// ""`, `.[0]`** swallowing the error into a plausible
+  empty value.
+- **The variable DECIDED on is not the variable ACTED on.**
+
+When you find one, name the shape in your verdict — the class is only measurable if
+reviewers call it by name.
+
 ## Startup Protocol
 
 **CRITICAL (ga-67hae): your review task is delivered via nudge a few seconds
