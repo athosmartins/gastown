@@ -639,6 +639,15 @@ live_sibling_run_for_branch() {
   local branch="$1" now_epoch run_json count i id status desc started started_epoch age_min verdict
   [ -z "$branch" ] && return 0
   now_epoch=$(date +%s)
+  # ga-h199q: NOT routed through the read-cache shim (unlike the 3 siblings of
+  # this exact query below) — gate-dup-run-guard.selftest.sh mocks `bd` as an
+  # in-shell function; the shim's `bash bd-list-cached.sh` spawns a child
+  # process that cannot see that function (bash doesn't inherit unexported
+  # shell functions across a `bash script.sh` invocation), so caching this
+  # specific call site silently breaks that selftest's live-behavior coverage.
+  # Left live deliberately; see ga-h199q comment on the other 3 call sites for
+  # why THIS EXACT query is still cached elsewhere (verified byte-identical
+  # results; here it just could not be, given the test's mocking strategy).
   run_json=$(bd -C "$GC_CITY" list --json \
     -l type:quality-gate-run \
     -l gate-status:running \
@@ -1619,7 +1628,10 @@ supersede_sibling_runs() {
   [ -z "$this_marker" ] && return 0
 
   local running_json count
-  running_json=$(bd -C "$GC_CITY" list --json \
+  # ga-h199q: routed through the read-cache shim (see live_sibling_run_for_branch
+  # above — identical query, same-sweep dedup). Superseding is idempotent and a
+  # briefly-stale miss just delays cleanup to the next sweep, not a correctness issue.
+  running_json=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json \
     -l type:quality-gate-run \
     -l gate-status:running \
     2>/dev/null || echo "[]")
@@ -2210,7 +2222,13 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
       bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED. Branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) via autonomous dispatcher (gate_run=$GATE_RUN_ID)." 2>/dev/null || true
 
       # Read the source bead state authoritatively (labels + live assignee).
-      SRC_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
+      # ga-h199q: routed through the read-cache shim — the initial read of this
+      # PASS-terminal block, before any writes to this bead in this invocation;
+      # no concurrent legitimate writer at this lifecycle point (the builder
+      # session is already done). The actual post-write confirmation is the
+      # separate _still_listed() check below, which stays uncached (a real
+      # verify-my-own-write read, not an informational one).
+      SRC_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
         | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
       SRC_LABELS=$(printf '%s' "$SRC_JSON" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
       BUILDER_ASSIGNEE=$(printf '%s' "$SRC_JSON" | jq -r '.assignee // ""' 2>/dev/null || echo "")
@@ -2356,7 +2374,9 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
     # can tell an autonomous Pilot merge apart from a human/Mayor-dispatched one.
     PILOT_ORIGIN=0
     if [ -n "$BEAD_ID" ]; then
-      BEAD_LABELS_NOW=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
+      # ga-h199q: routed through the read-cache shim — cosmetic-only read (picks
+      # a notification emoji/prefix), no state transition depends on it.
+      BEAD_LABELS_NOW=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
         | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
       if echo "$BEAD_LABELS_NOW" | grep -q "pilot:dispatched"; then
         PILOT_ORIGIN=1
@@ -2417,7 +2437,12 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
     GATE_FIX_CAP=3
 
     # Read the source bead's current labels (story beads live in the HQ/city DB).
-    SRC_LABELS=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
+    # ga-h199q: routed through the read-cache shim — first read in the FAIL
+    # self-healing block (no prior write to THIS bead in this invocation to
+    # verify). The fix-attempt bump below removes every stale counter label by
+    # a loop, not a single value, so a few-seconds-old label snapshot cannot
+    # cause it to miss a label that didn't exist yet at read time.
+    SRC_LABELS=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' \
       2>/dev/null || echo "")
 
@@ -2630,7 +2655,10 @@ resolve_bead_city() {
   [ -z "$bead" ] && { echo "$GC_CITY"; return 0; }
   for store in "${RIG_PATH:-}" "$GC_CITY"; do
     [ -z "$store" ] && continue
-    st=$(bd -C "$store" show "$bead" --json 2>/dev/null \
+    # ga-h199q: routed through the read-cache shim — pure store-discovery probe
+    # (which DB has this bead), not a state decision; a bead's home store never
+    # changes within a gate run's lifetime.
+    st=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$store" show "$bead" --json 2>/dev/null \
       | jq -r 'if type=="array" then (.[0] // {}) else . end | .status // empty' 2>/dev/null)
     if [ -n "$st" ]; then echo "$store"; return 0; fi
   done
@@ -3011,6 +3039,11 @@ gate_collect_verdicts() {
     # this bead's status, so skip it this sweep rather than guess (it stays
     # in VERDICT_BEAD_IDS and is re-read next sweep; the outer VERDICT_TIMEOUT_MINUTES
     # backstop still applies either way).
+    # ga-h199q: NOT routed through the read-cache shim —
+    # gate-verdict-drained-reviewer-rescue.selftest.sh mocks `bd` in-shell and
+    # sources this file lib-only to test the ga-7lz1 rescue path; the shim's
+    # child-process bash invocation can't see that mock (verified: 6 assertion
+    # failures, including the mutation test going vacuous). Left live.
     if ! VB_JSON=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null); then
       log "  Verdict bead $VB status unreadable this sweep (bd show failed — transient Dolt hiccup?) — skipping, will retry next sweep (root-class:error-vs-empty, ga-art5)."
       continue
@@ -3241,7 +3274,9 @@ fi
 # safe across process boundaries — never by a debounced in-poll counter that
 # only made sense inside one long-lived blocking process. See ga-eqjo PR.
 if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
-  PHASE_C_RUNNING_JSON=$(bd -C "$GC_CITY" list --json -l type:quality-gate-run -l gate-status:running 2>/dev/null || echo "[]")
+  # ga-h199q: routed through the read-cache shim (see live_sibling_run_for_branch's
+  # header comment — identical query, same-sweep dedup across 4 call sites).
+  PHASE_C_RUNNING_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json -l type:quality-gate-run -l gate-status:running 2>/dev/null || echo "[]")
   PHASE_C_COUNT=$(printf '%s' "$PHASE_C_RUNNING_JSON" | jq 'length' 2>/dev/null || echo "0")
   case "$PHASE_C_COUNT" in ''|*[!0-9]*) PHASE_C_COUNT=0 ;; esac
   if [ "$PHASE_C_COUNT" -gt 0 ]; then
@@ -3335,6 +3370,15 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       # wa-k971r/ga-dlzl closed verdict:PASS at 10:38 yet counted 0/1). --all restores
       # visibility of the pending (open) AND delivered (closed) verdict beads; the -l
       # label filters still scope it to this run's verdict beads only.
+      # ga-h199q: NOT routed through the read-cache shim — two independent
+      # selftests break: gate-phase-c-empty-verdict-unbound.selftest.sh and
+      # gate-phase-c-rehydrate-includes-closed.selftest.sh both mock `bd` as an
+      # in-shell function and source this file lib-only; the shim's
+      # `bash bd-list-cached.sh` spawns a child process the mock can't reach
+      # (verified: rc=1, "gate_collect_verdicts NOT reached — the delivered
+      # verdict is invisible"). The rehydrate selftest's mutation test also
+      # anchors on this EXACT `--all` query string to construct its mutant —
+      # any text change here breaks that anchor match too. Left live.
       VB_JSON=$(bd -C "$GC_CITY" list --json --all -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID" 2>/dev/null || echo "[]")
       VERDICT_BEAD_IDS=()
       while IFS= read -r PC_VBID; do
@@ -3458,6 +3502,12 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
             # decision as a genuinely-still-open verdict bead. Mirrors the
             # already-fixed ga-eqjo/ga-x3nmz requeue loops above
             # (vb_status_action, defined near the top of this file).
+            # ga-h199q: NOT routed through the read-cache shim —
+            # gate-verdict-status-unreadable.selftest.sh's phase-c-timeout-close-fn
+            # section mocks `bd` in-shell and sources this file lib-only; the
+            # shim's child-process bash invocation can't see that mock (verified:
+            # "pc-open was NOT closed — happy path broken"), and its mutation
+            # test anchors on this exact call text. Left live.
             if PC_VB_JSON=$(bd -C "$GC_CITY" show "$PC_VB" --json 2>/dev/null); then
               PC_VB_STATUS=$(printf '%s' "$PC_VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
             else
@@ -3516,12 +3566,20 @@ fi
 # that proves Phase B is legitimately still in progress, not a zombie.
 DISPATCHING_TTL_MINUTES=30
 
-LIVE_RUN_MARKER_IDS_JSON=$(bd -C "$GC_CITY" list --json \
+# ga-h199q: routed through the read-cache shim (see live_sibling_run_for_branch's
+# header comment — identical query, same-sweep dedup across 4 call sites). A
+# ≤5s-stale miss here is inconsequential against the 30-minute reclaim threshold
+# this feeds (~360x the cache TTL) — a run that started in the last 5s is never
+# the same marker that's been dispatching for 30 minutes.
+LIVE_RUN_MARKER_IDS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json \
   -l type:quality-gate-run \
   -l gate-status:running \
   2>/dev/null || echo "[]")
 
-DISPATCHING_JSON=$(bd -C "$GC_CITY" list --json \
+# ga-h199q: routed through the read-cache shim — feeds the same 30-minute TTL
+# reclaim check as LIVE_RUN_MARKER_IDS_JSON just above; a ≤5s-stale read is
+# inconsequential against that threshold.
+DISPATCHING_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json \
   -l type:quality-gate-marker \
   -l gate-status:dispatching \
   2>/dev/null || echo "[]")
@@ -3702,7 +3760,11 @@ LIVE_REVIEWERS=$(headroom_live_reviewers "${REVIEWER_SESSION_COUNT:-0}" "${REAPE
 # gate-status:queued.  We only process queued markers — the guard already did
 # all the security work.
 
-MARKERS_JSON=$(bd -C "$GC_CITY" list --json \
+# ga-h199q: routed through the read-cache shim — worst-case a stale/empty read
+# here just defers newly-queued work to the next 180s sweep (this script has no
+# internal loop; launchd re-execs it), the same bounded delay the TTL-recovery
+# checks above already tolerate.
+MARKERS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json \
   -l type:quality-gate-marker \
   -l gate-status:queued \
   2>/dev/null || echo "[]")
@@ -4043,7 +4105,10 @@ if [ -z "$AUTHOR" ] && [ -n "$BEAD_ID" ]; then
   # If cross-rig lookup returned nothing, fall back to HQ DB
   if [ -z "$BEAD_RAW" ]; then
     log "  gc bd cross-rig lookup returned empty; trying HQ DB directly."
-    BEAD_RAW=$(bd -C "$GC_CITY" show "$BEAD_ID" --json 2>/dev/null || echo "")
+    # ga-h199q: routed through the read-cache shim (the bd-native fallback leg
+    # only — the cross-rig `gc bd show` leg above uses a different binary/argv
+    # shape the shim's `bd -C <verb>` contract doesn't cover, so it stays direct).
+    BEAD_RAW=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" show "$BEAD_ID" --json 2>/dev/null || echo "")
   fi
 
   # Extract fields using grep (robust to embedded-newline JSON from gc bd)
@@ -4333,7 +4398,9 @@ if [ "$ALREADY_MERGED" = "1" ]; then
 
   # Drive the source bead to its terminal/handoff state if open.
   if [ -n "$BEAD_ID" ]; then
-    BD_STATUS=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
+    # ga-h199q: routed through the read-cache shim — first read in the
+    # SUPERSEDED-terminal block, before any writes to this bead this invocation.
+    BD_STATUS=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
     if [ "$BD_STATUS" != "closed" ]; then
       # ga-i53ua: route a STORY already-merged through the SAME delivery completion
@@ -4343,7 +4410,9 @@ if [ "$ALREADY_MERGED" = "1" ]; then
       # the painel "Aprovadas" column forever, exactly the M1 mechanism this bead
       # tracks). Detect a story by its canonical label story:approved (type is null
       # for stories in bd; mirrors the PASS path's IS_STORY logic at ga-esbg).
-      SUPERSEDE_SRC_LABELS=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
+      # ga-h199q: routed through the read-cache shim — same bead as BD_STATUS
+      # just above, a few lines up; the shim collapses the pair into one live call.
+      SUPERSEDE_SRC_LABELS=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
         | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
       SUPERSEDE_IS_STORY=0
       if printf '%s' "$SUPERSEDE_SRC_LABELS" | grep -q "story:approved"; then SUPERSEDE_IS_STORY=1; fi
@@ -5635,7 +5704,10 @@ for _ack_attempt in $(seq 1 "$ACK_MAX_RETRIES"); do
     _vb="${VERDICT_BEAD_IDS[$k]}"
     _sid="${SESSION_IDS[$k]}"
     # Strong ACK: verdict bead progressed past verdict:pending (reviewer is acting).
-    _vb_labels=$(bd -C "$GC_CITY" show "$_vb" --json 2>/dev/null \
+    # ga-h199q: routed through the read-cache shim — this is an ACK poll, already
+    # designed to tolerate a missed/stale update (falls through to the Soft ACK
+    # session-peek check right below on any given poll iteration).
+    _vb_labels=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" show "$_vb" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "verdict:pending")
     if ! echo "$_vb_labels" | grep -q "verdict:pending"; then
       REVIEWER_ACKED[$k]=1

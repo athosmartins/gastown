@@ -83,6 +83,7 @@ SITE_TOML = os.path.join(CITY, ".gc/site.toml")
 NOTIFY = "/Users/athos/.local/bin/notify"
 DOG_TEMPLATE = "gastown.dog"   # utility pool the repair agent is spawned into (ga-afytf)
 QUOTA_CHECK = os.path.join(CITY, "scripts/claude-quota-check.sh")  # ground-truth quota verdict (ga-wjlv9)
+BD_LIST_CACHED = os.path.join(CITY, "scripts/bd-list-cached.sh")  # ga-h199q: read-cache shim (ga-48xcv) — drop-in ["bash", BD_LIST_CACHED] prefix replaces "bd" at read-only (list/show) call sites; only-list/show/query safety boundary lives in the shim itself, so a write accidentally routed through it still passes straight to the real bd, unaffected
 
 POLL_SEC = 120  # ga-8smq3: was 60; all thresholds below are 12-40min, so 120s loses no detection latency while halving this daemon's Dolt poll load
 TIMEOUT_WINDOW_SEC = 1800      # 2+ timeouts within 30min = gate not producing verdicts
@@ -495,7 +496,7 @@ def _queued_markers():
     (status check) layers, since a future query refactor could silently drop
     the CLI flag (ga-huke4). Returns [] on any error (fail-safe: no markers →
     no orphan fire)."""
-    r = sh(["bd", "-C", CITY, "list", "--all", "--status", "open,in_progress",
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "--status", "open,in_progress",  # ga-h199q
             "-l", "type:quality-gate-marker", "-l", "gate-status:queued", "--json"], timeout=25)
     if not r or r.returncode != 0:
         return []
@@ -1300,7 +1301,7 @@ def set_gate_status_py(bead_id, new_status):
     passed+superseded). Best-effort; never raises."""
     if not bead_id:
         return
-    r = sh(["bd", "-C", CITY, "show", bead_id, "--json"])
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "show", bead_id, "--json"])  # ga-h199q
     cur = []
     try:
         j = json.loads(r.stdout) if (r and r.returncode == 0) else None
@@ -1319,7 +1320,7 @@ def _bead_is_open(bead_id):
     """True/False if a bead is open; None on query failure (caller fail-safe)."""
     if not bead_id:
         return None
-    r = sh(["bd", "-C", CITY, "show", bead_id, "--json"])
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "show", bead_id, "--json"])  # ga-h199q
     if not r or r.returncode != 0:
         return None
     try:
@@ -1334,7 +1335,7 @@ def _bead_labels(bead_id):
     """A bead's label list ([] on failure) — used by FIX 5's per-marker stranded cap."""
     if not bead_id:
         return []
-    r = sh(["bd", "-C", CITY, "show", bead_id, "--json"])
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "show", bead_id, "--json"])  # ga-h199q
     if not r or r.returncode != 0:
         return []
     try:
@@ -1414,7 +1415,7 @@ def _source_bead_state(bead_id, rig_name=""):
     if rigp and rigp != CITY:
         tries.append([rigp])
     for st in tries:
-        r = sh(["bd", "-C", st[0], "show", bead_id, "--json"])
+        r = sh(["bash", BD_LIST_CACHED, "-C", st[0], "show", bead_id, "--json"])  # ga-h199q
         if not r or r.returncode != 0:
             continue
         try:
@@ -1444,7 +1445,7 @@ def _source_bead_has_author_fields(bead_id, rig_name=""):
     rigp = (_rig_paths().get(rig_name) if rig_name else None) or _rig_path_by_prefix(_bead_id_prefix(bead_id))
     tries = [CITY] + ([rigp] if (rigp and rigp != CITY) else [])
     for st in tries:
-        r = sh(["bd", "-C", st, "show", bead_id, "--json"])
+        r = sh(["bash", BD_LIST_CACHED, "-C", st, "show", bead_id, "--json"])  # ga-h199q
         if not r or r.returncode != 0:
             continue
         try:
@@ -1468,7 +1469,7 @@ def _source_review_state(bead_id, rig_name=""):
     rigp = _rig_paths().get(rig_name) if rig_name else None
     tries = [CITY] + ([rigp] if (rigp and rigp != CITY) else [])
     for st in tries:
-        r = sh(["bd", "-C", st, "show", bead_id, "--json"])
+        r = sh(["bash", BD_LIST_CACHED, "-C", st, "show", bead_id, "--json"])  # ga-h199q
         if not r or r.returncode != 0:
             continue
         try:
@@ -1582,7 +1583,7 @@ def _run_verdicts(run_id):
     FIX5's stranded-run check needs; ga-5t5w), or None if nothing has been
     delivered yet or no closed row parsed. Returns (set(), -1, -1, None) on query
     failure so the caller fail-safe skips."""
-    r = sh(["bd", "-C", CITY, "list", "--all", "-l", "gate-run:%s" % run_id, "--json"])
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "gate-run:%s" % run_id, "--json"])  # ga-h199q
     if not r or r.returncode != 0:
         return (set(), -1, -1, None)
     try:
@@ -1730,7 +1731,7 @@ class RecoveryState:
 def _open_running_runs():
     """[gate-run dicts] with type:quality-gate-run + gate-status:running + open.
     None on query failure (fail-safe: caller skips — never reap during a Dolt glitch)."""
-    r = sh(["bd", "-C", CITY, "list", "--all", "-l", "type:quality-gate-run",
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-run",  # ga-h199q
             "-l", "gate-status:running", "--status", "open", "--json"], timeout=25)
     if not r or r.returncode != 0:
         return None
@@ -2117,7 +2118,7 @@ def reap_orphan_and_stale_markers(now):
     an unreadable source → keep; a query failure → skip the whole sweep."""
     if not GRW_ENABLED or not GRW_REAP_ORPHAN_ENABLED:
         return
-    r = sh(["bd", "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",  # ga-h199q
             "--status", "open", "--json"], timeout=25)
     if not r or r.returncode != 0:
         return  # query failure → fail-safe skip (no blind action)
@@ -2236,7 +2237,7 @@ def reap_stale_review_markers(now, rstate, open_running_runs):
     dry-run-aware, fully fail-safe (unreadable → skip; a live/hung run → defer to FIX 1/5)."""
     if not GRW_ENABLED or not GRW_REAP_STALE_REVIEW_ENABLED:
         return
-    r = sh(["bd", "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",  # ga-h199q
             "--status", "open", "--json"], timeout=25)
     if not r or r.returncode != 0:
         return  # query failure → fail-safe skip (no blind action)
@@ -2352,7 +2353,7 @@ def _open_error_markers():
     """[marker dicts] type:quality-gate-marker + gate-status:error + open, in HQ (the
     dispatcher's domain — it only re-processes HQ queued markers). None on query
     failure (fail-safe skip)."""
-    r = sh(["bd", "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",  # ga-h199q
             "-l", "gate-status:error", "--status", "open", "--json"], timeout=25)
     if not r or r.returncode != 0:
         return None
@@ -2511,7 +2512,7 @@ def requeue_error_markers(now, rstate):
 def _open_deferred_markers():
     """[marker dicts] type:quality-gate-marker + gate-status:deferred + open, in HQ.
     None on query failure (fail-safe skip)."""
-    r = sh(["bd", "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",  # ga-h199q
             "-l", "gate-status:deferred", "--status", "open", "--json"], timeout=25)
     if not r or r.returncode != 0:
         return None
