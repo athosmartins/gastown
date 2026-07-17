@@ -2546,6 +2546,18 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         gc --city "$GC_CITY" session nudge "$AUTHOR" \
           "Gate FAILED for $BEAD_ID (branch $BRANCH, attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — see GATE-FEEDBACK on the bead. Your assignee was kept (ga-jyox); fix and re-run /gate-done." \
           --delivery wait-idle 2>/dev/null || warn "Could not nudge live-crew author $AUTHOR for gate FAIL feedback"
+        # ga-7rvyt: gc hook / routed-pool surfacing has no live-in-flight-owner
+        # guard (unlike Pilot's _filter_candidates), so a bead kept in-flight
+        # here for a live crew author was still re-offered to generic pool
+        # workers via its stale gc.routed_to whenever a later gate-review
+        # cycle's Step 5b (quality-gate-guard.sh) transiently blanks the
+        # assignee again. The marker was already closed terminal-FAILED above,
+        # so gate:queued has no live marker behind it either. Strip both —
+        # mirrors quality-gate-guard.sh Step 5b's exact unset-metadata pattern
+        # (ga-e7zk7/gt-gwng6). No-op when gc.routed_to lives on a sling bead
+        # instead of this source bead (current default dispatch model).
+        bd -C "$BEAD_CITY" update "$BEAD_ID" --unset-metadata gc.routed_to -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued" -q 2>/dev/null || true
       else
         # Remove story:in-flight so the Pilot's feature-exclusion no longer hides it.
         bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"  -q 2>/dev/null || true

@@ -158,6 +158,42 @@ else
   bad "needs-human branch (ga-5w0hr) marker missing — branch may have been altered unexpectedly"
 fi
 
+# ── 9. ga-7rvyt: 'keep' arm must ALSO strip gc.routed_to + the stale
+#    gate:queued label, not just re-assign. Without this, a bead kept
+#    in-flight for a live crew author on FAIL still matches routed-pool's
+#    `bd ready --metadata-field gc.routed_to=<pool> --unassigned` predicate
+#    whenever the NEXT gate-review cycle's Step 5b (quality-gate-guard.sh)
+#    transiently blanks the assignee again — gc hook/routed-pool has no
+#    live-in-flight-owner guard (unlike Pilot's _filter_candidates), so it
+#    re-offers the bead to generic pool workers every ~13min (observed:
+#    wa-4s5l9, 3 pool workers in 21min, all correctly stood down but wasted
+#    spawns + Dolt churn). The marker was ALREADY closed terminal-FAILED
+#    earlier in this same FAIL block, so gate:queued has no live marker
+#    behind it either way. Mirrors quality-gate-guard.sh Step 5b's exact
+#    `--unset-metadata gc.routed_to` pattern (ga-e7zk7/gt-gwng6).
+echo "── 9. ga-7rvyt: 'keep' arm strips gc.routed_to + stale gate:queued ──"
+if grep -qF 'bd -C "$BEAD_CITY" update "$BEAD_ID" --unset-metadata gc.routed_to -q 2>/dev/null || true' "$DISPATCHER"; then
+  ok "dispatcher strips gc.routed_to somewhere (ga-7rvyt or gt-gwng6 pattern present)"
+else
+  bad "dispatcher does NOT strip gc.routed_to anywhere — ga-7rvyt fix missing"
+fi
+# Scope check: the strip must be WIRED INTO the 'keep' arm specifically, not
+# merely present elsewhere (e.g. quality-gate-guard.sh's unrelated Step 5b
+# call lives in a different file and wouldn't satisfy this). Extract the
+# 'keep' arm's body (from its `if` to the matching `else`) and assert both
+# new lines appear inside THAT slice.
+KEEP_ARM=$(awk '/GATE_FAIL_ASSIGNEE_ACTION" = "keep"/{flag=1} flag{print} /^      else$/{if(flag) exit}' "$DISPATCHER")
+if printf '%s' "$KEEP_ARM" | grep -qF 'unset-metadata gc.routed_to'; then
+  ok "'keep' arm itself strips gc.routed_to (not just present elsewhere in the file)"
+else
+  bad "'keep' arm does NOT strip gc.routed_to — fix not wired into the FAIL-keep branch"
+fi
+if printf '%s' "$KEEP_ARM" | grep -qF 'label remove "$BEAD_ID" "gate:queued"'; then
+  ok "'keep' arm removes the stale gate:queued label"
+else
+  bad "'keep' arm does NOT remove gate:queued — marker was already closed terminal-FAILED above, label would stay stale"
+fi
+
 # ── Result ────────────────────────────────────────────────────────────────────
 echo ""
 if [ "$FAIL" = "0" ]; then
