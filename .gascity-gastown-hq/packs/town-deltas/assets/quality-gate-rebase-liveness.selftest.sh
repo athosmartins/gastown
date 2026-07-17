@@ -237,6 +237,41 @@ grep -qF 'gate_circuit_break_check "retry_dead" "" "$REBASE_AUTHOR_ALIVE"' "$DIS
   && ok "retry_dead circuit-break keyed on REBASE_AUTHOR_ALIVE" \
   || bad "retry_dead circuit-break NOT keyed on REBASE_AUTHOR_ALIVE — regressed to notify-identity liveness?"
 
+# ── 8. gate-fix-2: bounce/retry-live branches notify REBASE_AUTHOR, not the
+#    possibly-dead $AUTHOR ──────────────────────────────────────────────────
+# Gate review on gate-fix-1 (gate_run=ga-wisp-bkb9q6) found that the 4 branches
+# gated on REBASE_AUTHOR_ALIVE=1 (behind-envelope bounce, genuine-merge-conflict
+# bounce, transient-retry-live-author, and its exhausted-retries escalation)
+# decide "someone can fix this" via REBASE_AUTHOR_ALIVE but nudged the SEPARATE,
+# possibly-dead $AUTHOR — which, unlike REBASE_AUTHOR, CAN fall through to a
+# stale bead-assignee/owner (see resolve_rebase_author()'s docstring above).
+# Concrete repro from the review: a Mayor-rescue marker with no
+# gate.submitted_by; bead assignee 'peter-wa' has exited (AUTHOR='peter-wa',
+# dead) but the branch's own crew segment 'oracle-wa' is live
+# (REBASE_AUTHOR='oracle-wa', REBASE_AUTHOR_ALIVE=1) — a genuine conflict then
+# correctly decides to bounce, but the old code nudged dead peter-wa, never
+# telling live oracle-wa who could actually act.
+#
+# Extracts the rebase-handling block by its (verified unique) start/end anchor
+# strings and asserts, WITHIN just that block: every session-nudge call
+# targets $REBASE_AUTHOR, none target the bare $AUTHOR. A whole-file grep would
+# false-positive on 2 unrelated $AUTHOR nudge call sites elsewhere in this
+# dispatcher (Step 3 FAIL-path notify) that are out of scope for ga-6dp9.
+echo "── 8. gate-fix-2: REBASE_AUTHOR_ALIVE-gated branches nudge REBASE_AUTHOR, not \$AUTHOR ──"
+_REBASE_BLOCK=$(sed -n '/ga-ljbx: never-strand bounce/,/stale-base check passed/p' "$DISPATCHER")
+if [ -z "$_REBASE_BLOCK" ]; then
+  bad "could not extract the rebase-handling block — start/end anchor comments missing/renamed?"
+else
+  _NUDGE_AUTHOR_COUNT=$(printf '%s\n' "$_REBASE_BLOCK" | { grep -c 'session nudge "\$AUTHOR"' || true; })
+  _NUDGE_REBASE_AUTHOR_COUNT=$(printf '%s\n' "$_REBASE_BLOCK" | { grep -c 'session nudge "\$REBASE_AUTHOR"' || true; })
+  eq "no session-nudge call inside the rebase block targets the bare \$AUTHOR" \
+    "$_NUDGE_AUTHOR_COUNT" \
+    "0"
+  eq "all 4 REBASE_AUTHOR_ALIVE-gated branches (bounce x2, transient-retry-live x2) nudge \$REBASE_AUTHOR" \
+    "$_NUDGE_REBASE_AUTHOR_COUNT" \
+    "4"
+fi
+
 # ── Result ────────────────────────────────────────────────────────────────────
 echo ""
 if [ "$FAIL" = "0" ]; then
