@@ -4402,7 +4402,7 @@ LIVESEC
   # fact this is a straight copy-out, not a rewrite. IS_BEADS_REPO_FIX (set above,
   # right after STORY_RIG) overrides both variables afterward, only when
   # bead_targets_beads_repo fired. Fail-open: unset/empty ⇒ no behavior change.
-  local DOCTRINE_BLOCK DISPATCH_STEP5
+  local DOCTRINE_BLOCK DISPATCH_STEP5 YOUR_JOB_LINE
   if [ "$DISPATCH_TIER" = "bug" ]; then
     DOCTRINE_BLOCK="## DOCTRINE — read carefully
 - You are the BUILDER. Human never merges. Gate (G) and Delivery (①) are autonomous.
@@ -4410,6 +4410,8 @@ LIVESEC
 - DO NOT ask for approval. DO NOT send to Athos. Just fix, push, gate-done.
 - The autonomous loop: /gate-done → G reviews → merges → ① deploys → bead closed.
 - If /gate-done fails validation (no commits, no branch), fix the issue and retry."
+    YOUR_JOB_LINE='Fix this bug or tech-debt item completely. Do NOT wait for a human.
+"Só depois do sistema perfeito é que a gente faz novas features." — system quality first.'
   else
     DOCTRINE_BLOCK="## DOCTRINE — read carefully
 - You are the BUILDER. Human never merges. Gate (G) and Delivery (①) are autonomous.
@@ -4417,6 +4419,7 @@ LIVESEC
 - DO NOT ask for approval. DO NOT send to Athos. Just build, push, gate-done.
 - The autonomous loop: /gate-done → G reviews → merges → ① deploys → story:done.
 - If /gate-done fails validation (no commits, no branch), fix the issue and retry."
+    YOUR_JOB_LINE="Build this story from acceptance criteria to /gate-done. Do NOT wait for a human."
   fi
   DISPATCH_STEP5="5. Commit, push, then run /gate-done."
   if [ -n "$IS_BEADS_REPO_FIX" ]; then
@@ -4426,6 +4429,7 @@ LIVESEC
 - This DOES need human review: the PR awaits upstream-maintainer review/merge. It is NOT autonomous.
 - Leave $STORY_ID OPEN. Comment the PR URL on it once opened. Do NOT close the bead — it closes only after the PR merges."
     DISPATCH_STEP5="5. Commit, push to the fork remote, then gh pr create against upstream (see doctrine above for the exact remote command). Comment the PR URL on $STORY_ID. Do NOT run /gate-done. Do NOT close $STORY_ID — it closes only after the PR merges."
+    YOUR_JOB_LINE="Fix this completely. This work targets the beads CLI's own repo — see DOCTRINE below for the real path (upstream PR, human review required, NOT /gate-done)."
   fi
 
   # ── Build task prompt ────────────────────────────────────────────────────────
@@ -4444,8 +4448,7 @@ City: $GC_CITY
 Bead DB: $STORY_BEAD_CITY
 
 ## Your job
-Fix this bug or tech-debt item completely. Do NOT wait for a human.
-"Só depois do sistema perfeito é que a gente faz novas features." — system quality first.
+$YOUR_JOB_LINE
 $GATE_FIX_SECTION
 $LIVE_VERIFY_SECTION
 
@@ -4488,7 +4491,7 @@ City: $GC_CITY
 Bead DB: $STORY_BEAD_CITY
 
 ## Your job
-Build this story from acceptance criteria to /gate-done. Do NOT wait for a human.
+$YOUR_JOB_LINE
 $GATE_FIX_SECTION
 $LIVE_VERIFY_SECTION
 
