@@ -97,6 +97,28 @@ scan_shell_query_masking() {
       *'|| true'*)
         echo "${file}:${lineno}:C1:${line}"
         ;;
+      # ga-vkjs: o idioma que faltava, e é o MAIS COMUM na city — a query é
+      # canalizada pra um PARSER que fabrica um default, então não há `||` nenhum
+      # pros case-suffixes acima casarem. Perigoso porque o parser ZERA o rc do
+      # pipe (o rc de um pipeline é o do ÚLTIMO comando): erro-de-query e
+      # campo-genuinamente-ausente saem com o MESMO valor E o MESMO rc=0.
+      # PROVADO (não hipótese):
+      #   bd -C /nao/existe show x --json 2>/dev/null | jq -r '.a // ""'  ->  '' rc=0
+      #   echo '{}'                                   | jq -r '.a // ""'  ->  '' rc=0
+      # Instâncias reais: o gc sling (ga-66wc, "não roteado" era a query falhando)
+      # e a checagem do mila-wa que leu "o worker não despachou".
+      # ⚠️ A FONTE DO PIPE TEM QUE PODER FALHAR. `VAR=$(echo "$row" | jq -r '.a // ""')`
+      # NÃO é este bug: `echo` de uma variável não falha, então não existe o estado
+      # "a pergunta falhou" — só existe "o campo não está lá", que é um fato legítimo.
+      # Medido: sem esta exclusão, 48 dos 54 achados novos eram esse shape (89% ruído).
+      # Por isso o teste abaixo é sobre o INÍCIO da substituição (`=$(<query-tool>`),
+      # não sobre a linha conter um query-tool em qualquer posição.
+      *'=$(echo '* | *'=$(printf '* | *'=$(cat '* | *'=$( echo '*)
+        : ;;   # fonte inerte — não há erro pra confundir com vazio
+      *'2>/dev/null |'*' // '* | *'2>/dev/null |'*'2>/dev/null'* | \
+        *'| jq '*' // "'* | *"| jq "*" // '"*)
+        echo "${file}:${lineno}:C2:${line}"
+        ;;
     esac
   done < "$file"
 }
