@@ -105,9 +105,9 @@ echo "── 8. drift-guard: ga-u4yi — AUTHOR (not just Mayor) is mailed at ev
 # total silence because only the Mayor was mailed — the AUTHOR had no durable
 # signal, only an ephemeral bd comment. Fix: mail "$AUTHOR" (survives a dead/
 # restarted session, unlike nudge) at EVERY site that applies gate:needs-human.
-# There are exactly 4 such sites: no_branch, ahead_dead, retry_dead, cap-exhaustion.
-eq "gate mails AUTHOR at all 4 gate:needs-human sites (ga-u4yi)" \
-   "$(grep -c 'mail send "\$AUTHOR"' "$GATE")" "4"
+# There are exactly 5 such sites: no_branch, ahead_dead, behind_dead, retry_dead, cap-exhaustion.
+eq "gate mails AUTHOR at all 5 gate:needs-human sites (ga-u4yi)" \
+   "$(grep -c 'mail send "\$AUTHOR"' "$GATE")" "5"
 grep -q 'mail send "\$AUTHOR"' "$GATE" \
   && ok "gate escalates to the AUTHOR, not just Mayor" \
   || bad "gate still only mails Mayor — author has no durable needs-human signal (ga-u4yi regression)"
