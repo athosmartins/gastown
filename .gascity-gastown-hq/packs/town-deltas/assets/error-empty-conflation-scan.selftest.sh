@@ -65,6 +65,30 @@ cat > "$FIXDIR/mixed/planted_gh_query.sh" <<'EOF'
 LATEST=$(gh api repos/example/example/releases/latest --jq .tag_name 2>/dev/null || echo "")
 EOF
 
+# ── ga-vkjs: o idioma que a C2 NÃO via — `cmd 2>/dev/null | parser-com-default`.
+# Não tem `|| echo`/`|| true`, então os case-suffixes acima não casam. MAS é o mais
+# comum na city E o mais perigoso: PROVADO que erro-de-query e campo-ausente produzem
+# o MESMO valor **e o mesmo rc=0** (o jq `// ""` fabrica o default e zera o rc do pipe):
+#     bd -C /nao/existe show x --json 2>/dev/null | jq -r '.a // ""'  -> ''  rc=0
+#     echo '{}'                                   | jq -r '.a // ""'  -> ''  rc=0
+# Foi exatamente assim que o mila-wa leu "o worker não despachou" (era a query falhando)
+# e o gc sling (ga-66wc) leu "não roteado". Instâncias reais, não hipótese.
+cat > "$FIXDIR/mixed/bad_query_jq_default.sh" <<'EOF'
+routed=$(bd show "$BEAD" --json 2>/dev/null | jq -r '.metadata."gc.routed_to" // ""')
+EOF
+
+cat > "$FIXDIR/mixed/bad_query_py_default.sh" <<'EOF'
+n=$(bd -C "$S" list --label "$L" --json 2>/dev/null | python3 -c "import sys,json;print(len(json.load(sys.stdin)))" 2>/dev/null)
+EOF
+
+# ── GOOD (ga-vkjs, falsificação da minha própria regra): a fonte do pipe é um
+# `echo` de variável — NÃO pode falhar, logo não existe "a pergunta falhou" pra
+# confundir com "o campo não está lá". Sem esta exclusão a regra gerava 89% de
+# ruído (48 de 54 achados novos no HQ eram este shape) — medido, não estimado.
+cat > "$FIXDIR/mixed/good_echo_var_jq.sh" <<'EOF'
+c_type=$(echo "$row" | jq -r '.issue_type // ""')
+EOF
+
 # ── GOOD (must NOT be flagged): the established FIXED idiom — explicit rc
 # capture via `if ! VAR=$(cmd); then`, same shape as verdict_count_from_query
 # (ga-jfo7) / prune_decision (ga-u4yi attempt 1) ───────────────────────────
@@ -259,6 +283,16 @@ case "$r" in *:C1:*) ok "dolt query masked via || true → flagged C1" ;; *) bad
 r="$(scan_shell_query_masking "$FIXDIR/mixed/planted_gh_query.sh")"
 case "$r" in *:C2:*) ok "planted gh-query case (novel, not a memorized instance) → flagged C2" ;; *) bad "planted case NOT flagged: '$r'" ;; esac
 
+r="$(scan_shell_query_masking "$FIXDIR/mixed/bad_query_jq_default.sh")"
+case "$r" in *:C2:*) ok "ga-vkjs: jq // \"\" default após 2>/dev/null → flagged C2 (o idioma do ga-66wc)" ;; *) bad "ga-vkjs: parser-com-default NAO flagged (a C2 e cega ao idioma mais comum): '$r'" ;; esac
+
+r="$(scan_shell_query_masking "$FIXDIR/mixed/bad_query_py_default.sh")"
+case "$r" in *:C2:*) ok "ga-vkjs: parser com 2>/dev/null proprio → flagged C2" ;; *) bad "ga-vkjs: parser-2>/dev/null NAO flagged: '$r'" ;; esac
+
+r="$(scan_shell_query_masking "$FIXDIR/mixed/good_echo_var_jq.sh")"
+[ -z "$r" ] && ok "ga-vkjs: echo \$var | jq // \"\" → NAO flagged (fonte inerte; falsificação da propria regra)" \
+  || bad "ga-vkjs REGRESSION: echo-var-jq flagged (89% de ruido volta): '$r'"
+
 r="$(scan_shell_query_masking "$FIXDIR/mixed/good_rc_capture.sh")"
 [ -z "$r" ] && ok "fixed if-!-rc-capture idiom → NOT flagged (no false positive)" || bad "REGRESSION: fixed idiom flagged: '$r'"
 
@@ -304,8 +338,8 @@ MIXED_OUT="$(mktemp)"
 run_scan "$MIXED_OUT" "$FIXDIR/mixed"
 mixed_count=$(wc -l <"$MIXED_OUT" | tr -d '[:space:]')
 # 3 shell (C1x1 + C2x2) + 2 JS + 2 py + 1 plist = 8
-[ "$mixed_count" = "8" ] && ok "mixed fixture dir → 8 findings (matches every planted bad case, nothing missed or double-counted)" \
-  || bad "expected 8 findings in mixed dir, got $mixed_count"
+[ "$mixed_count" = "10" ] && ok "mixed fixture dir → 10 findings (matches every planted bad case, nothing missed or double-counted; +2 do ga-vkjs: parser-com-default)" \
+  || bad "expected 10 findings in mixed dir, got $mixed_count"
 rm -f "$MIXED_OUT"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -325,7 +359,7 @@ rm -f "$CLEAN_OUT"
 echo "── CLI wrapper ──"
 out="$(bash "$SCANNER" --path "$FIXDIR/mixed" --quiet)"; rc=$?
 [ "$rc" = "0" ] && ok "CLI exits 0 on a completed scan with findings" || bad "CLI exit code was $rc, expected 0"
-printf '%s\n' "$out" | grep -q '^error-empty-conflation-scan: 8 finding(s)$' \
+printf '%s\n' "$out" | grep -q '^error-empty-conflation-scan: 10 finding(s)$' \
   && ok "CLI summary line reports 8 finding(s)" || bad "CLI summary line unexpected: $(printf '%s\n' "$out" | head -1)"
 
 bash "$SCANNER" --path "$FIXDIR/does-not-exist" --quiet >/tmp/.conflation-selftest-missing-path.$$ 2>&1
