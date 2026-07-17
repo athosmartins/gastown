@@ -41,6 +41,21 @@ unset _GLH_SCRIPT
 # glh source clobbers LOG with its own jsonl path — restore ours (ga-l47b7 log-redirect fix)
 LOG="$LOG_DIR/quality-gate-dispatcher.log"
 
+# ── ga-eqjo hazard: AUTHOR/AUTHOR_AGENT must be BOUND for a Phase-C-only sweep ──
+# gate_finalize_run() (the Phase C finalize path) calls
+# resolve_recycled_author "$AUTHOR" "$AUTHOR_AGENT" ... — but both are only ASSIGNED
+# in the CLAIM path (~L3600+, after a marker is claimed). The ga-eqjo async split made
+# Phase C run STANDALONE: a sweep that only finalizes an in-flight run never reaches
+# that assignment, so under `set -u` the sweep DIES with "AUTHOR_AGENT: unbound
+# variable" — taking the whole gate with it. Observed 2026-07-16: 16 crashes, gate
+# stopped spawning reviewers with 11 markers queued.
+# Same shape as the extract()/cleanup_reviewer_sessions() hoists further down: Phase C
+# needs everything it touches to exist BEFORE it, not at the claim site. Defaulting
+# here (not `AUTHOR=""` at the claim site, which a Phase-C-only sweep skips) keeps the
+# claim path's own assignment authoritative — it simply overwrites these.
+AUTHOR="${AUTHOR:-}"
+AUTHOR_AGENT="${AUTHOR_AGENT:-}"
+
 # Maximum wall-clock minutes to wait for all reviewer verdicts before timing out.
 VERDICT_TIMEOUT_MINUTES="${VERDICT_TIMEOUT_MINUTES:-22}"
 
@@ -4629,7 +4644,17 @@ for i in $(seq 1 $REQUIRED_REVIEWERS); do
   fi
   REVIEWER_LENS=""
   case "$i" in
-    1) REVIEWER_LENS="CORRECTNESS: focus on logic errors, edge cases, off-by-one bugs, null/empty handling, error propagation, and incorrect assumptions. Be adversarial." ;;
+    1) REVIEWER_LENS="CORRECTNESS. Be adversarial.
+
+FIRST — run this check on EVERY guard, filter, query and conditional the diff adds or touches. It is this city's #1 root failure class (ga-p5q3), named after it produced 5 bugs in one night, and it recurred 9+ times in a single day AFTER being documented — so do NOT assume the author considered it:
+
+  ASK: 'what happens when the QUESTION ITSELF FAILS?' — the query errors or times out, the field is absent, the session isn't in the list, the label isn't there, the command returns empty.
+  FAIL THE DIFF IF: 'I could not determine' collapses into the SAME value/branch as a CONFIRMED answer. Error/unknown and a real negative MUST be distinguishable, and the unknown path must fail SAFE (suppress/defer/retry) rather than act as if it confirmed something.
+
+Real shapes this took here (recognise them): an empty assignee read as 'the owner is dead' → escalated forever; a failed CPU probe read as 'Dolt is saturated' → throttled; a missing label read as 'no hold is active' → claimed held work; a dispatch that printed success while routing nothing; 'branch absent from origin' read as 'no work exists' when it was local and unpushed; a metadata field cleared on success, making empty mean BOTH 'never ran' and 'ran fine'.
+Watch especially for: short-circuiting OR/AND where the left branch is true merely because a lookup found nothing (so the real check never runs); \`|| true\`, \`2>/dev/null\`, \`// \"\"\`, \`.[0]\`, \`index(x) | not\` swallowing the difference; and a DECISION variable that is not the SAME variable as the one later ACTED ON.
+
+THEN also cover: logic errors, edge cases, off-by-one, null/empty handling, error propagation, and incorrect assumptions." ;;
     2) REVIEWER_LENS="SECURITY & ROBUSTNESS: focus on injection risks, unsafe eval/exec, credentials in code, path traversal, race conditions, resource leaks, and missing input validation." ;;
     3) REVIEWER_LENS="DESIGN & MAINTAINABILITY: focus on architectural concerns, code duplication, missing tests, test quality, unclear naming, violation of existing conventions, and tech debt introduced." ;;
   esac
