@@ -1169,6 +1169,89 @@ gate_circuit_break_check() {
   esac
 }
 
+# ── ga-tgwq: no_branch local-rescue classification (pure; selftest-sourceable) ──
+# "Branch absent from origin" (the no_branch condition above) conflates two
+# states with OPPOSITE remedies. Real case (17/07): wa-4s5l9 had 2 commits /
+# 1148 insertions, clean worktree, answering a real gate-feedback round — the
+# owning session died between commit and push, and ga-acb permanently parked
+# it as gate:needs-human, when the actual fix was a 3-second `git push`.
+#
+# Given facts about the LOCAL git state (probed by the caller — this function
+# does no I/O itself, same separation-of-concerns as gate_circuit_break_check),
+# classify which of three outcomes applies:
+#
+#   park       → no local ref either: truly unmergeable, ga-acb's original
+#                behavior (unchanged).
+#   rescuable  → local ref exists, no uncommitted changes in a linked
+#                worktree: a session likely died between commit and push —
+#                the fix is `git push`, not a human re-anchor decision.
+#   escalate   → local ref exists AND a linked worktree has uncommitted
+#                changes: session died MID-EDIT — needs a human, never
+#                auto-push (could silently strand or overwrite the pending diff).
+#
+# Args: <local_ref_exists_0_1> <worktree_dirty_0_1>
+# Echoes: "park" | "rescuable" | "escalate".
+# FAIL-SAFE: any unexpected/non-0-1 input resolves to "park" — the pre-ga-tgwq
+# behavior, so a bug in this function can only ever restore the old (safe, if
+# overly aggressive) park path, never newly auto-push or silently drop work.
+gate_no_branch_local_classify() {
+  local ref_exists="${1:-0}" wt_dirty="${2:-0}"
+  case "$ref_exists" in
+    1) ;;
+    *) printf 'park'; return 0 ;;
+  esac
+  case "$wt_dirty" in
+    0) printf 'rescuable' ;;
+    1) printf 'escalate' ;;
+    *) printf 'park' ;;
+  esac
+}
+
+# _gate_tgwq_git <git-args...> — ga-tgwq: minimal is-container-aware git
+# dispatch, deliberately duplicating git_rig()'s --git-dir/-C branching
+# (git_rig itself is defined later in this file, among the Step-4
+# git-context helpers) rather than calling git_rig directly, because that
+# definition sits AFTER the GATE_DISPATCHER_LIB_ONLY early-return above —
+# so no lib-only source (every selftest, including this function's own)
+# ever has it defined. Confirmed the hard way: without this, the probe
+# below silently no-ops (rig_resolve_commit: command not found, masked by
+# its own 2>/dev/null) and every call reads "ref absent" — quality-gate-
+# circuit-break.selftest.sh's real-git-sandbox section (6c) catches this
+# exact failure mode if it regresses.
+_gate_tgwq_git() {
+  if [ "${IS_CONTAINER_RIG:-0}" = "1" ]; then
+    git --git-dir="${GIT_DIR_PATH:-}" "$@"
+  else
+    git -C "${GIT_DIR_PATH:-}" "$@"
+  fi
+}
+
+# gate_no_branch_probe_local <branch> — ga-tgwq. Does the actual git I/O for
+# the classification above: does $branch exist as a local ref in the rig's
+# git dir, and if so, does any LINKED WORKTREE currently checking it out have
+# uncommitted changes? Separated from the pure classifier so the decision
+# logic stays unit-testable without a live git checkout.
+#
+# Echoes two space-separated 0/1 flags: "<ref_exists> <wt_dirty>". A worktree
+# with `git worktree list --porcelain` output this function can't parse, or a
+# `git status` call that fails, reads as dirty=0 (fail toward "rescuable", the
+# more common case, over "escalate") since park-vs-rescuable already covers
+# the safety-critical never-park-real-work distinction — this second flag
+# only decides which SAFE-either-way message/label to attach.
+gate_no_branch_probe_local() {
+  local branch="$1" ref_exists=0 wt_dirty=0 wt_path=""
+  [ -n "$(_gate_tgwq_git rev-parse --verify -q "refs/heads/$branch^{commit}" 2>/dev/null)" ] && ref_exists=1
+  if [ "$ref_exists" = "1" ]; then
+    wt_path=$(_gate_tgwq_git worktree list --porcelain 2>/dev/null \
+      | awk -v b="refs/heads/$branch" '/^worktree /{wt=substr($0,10)} /^branch /{if (substr($0,8)==b) print wt}' \
+      | head -1)
+    if [ -n "$wt_path" ] && [ -d "$wt_path" ]; then
+      [ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ] && wt_dirty=1
+    fi
+  fi
+  printf '%s %s' "$ref_exists" "$wt_dirty"
+}
+
 # ── ga-jyox: FAIL-time assignee-clear decision (pure; selftest-sourceable) ──────
 # On a gate FAIL, the dispatcher used to unconditionally clear the bead's
 # assignee so the Pilot could re-dispatch a fixer. That is correct for an
@@ -4026,6 +4109,61 @@ fi
 BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH")
 if [ -z "$BRANCH_SHA" ]; then
   err "Branch '$BRANCH' not found on remote origin (or ref points at a missing object). Aborting."
+
+  # ga-tgwq: "absent from origin" conflates "doesn't exist anywhere" with
+  # "exists locally, session died before push" — two states with opposite
+  # remedies. Probe local git state BEFORE concluding the work is gone; see
+  # gate_no_branch_probe_local()/gate_no_branch_local_classify() above.
+  read -r _NB_REF_EXISTS _NB_WT_DIRTY <<<"$(gate_no_branch_probe_local "$BRANCH")"
+  _NB_CLASS=$(gate_no_branch_local_classify "$_NB_REF_EXISTS" "$_NB_WT_DIRTY")
+
+  if [ "$_NB_CLASS" = "rescuable" ]; then
+    _NB_LOCAL_SHA=$(rig_resolve_commit "refs/heads/$BRANCH")
+    err "  ga-tgwq: branch $BRANCH absent from origin but exists LOCALLY at $_NB_LOCAL_SHA with a clean worktree — looks like a session died between commit and push. NOT circuit-breaking; flagging as rescuable."
+    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
+    bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
+    bd -C "$GC_CITY" comment "$MARKER_ID" "ga-tgwq: branch '$BRANCH' is absent from origin, but a local ref exists at $_NB_LOCAL_SHA with a clean worktree — reads as a session that died between commit and push, not missing work. Rescue: \`git -C $GIT_DIR_PATH push -u origin $BRANCH\` (verify after with \`git ls-remote origin $BRANCH\`). Marker left at gate-status:error (retriable) — NOT circuit-broken: this is a push away, not a human re-anchor decision." 2>/dev/null || true
+    if [ -n "$BEAD_ID" ]; then
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-tgwq: gate found branch '$BRANCH' absent from origin but present locally (committed, clean) at $_NB_LOCAL_SHA — likely the session died between commit and push. Rescue: \`git -C $GIT_DIR_PATH push -u origin $BRANCH\`. Bead left as-is (no gate:needs-human, assignee untouched) — this is a 3-second push, not a re-anchor decision." 2>/dev/null || true
+    fi
+    gc --city "$GC_CITY" mail send mayor \
+      -s "Gate: $BRANCH absent from origin but rescuable (${BEAD_ID:-unknown})" \
+      -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) is absent from origin but exists locally at $_NB_LOCAL_SHA with a CLEAN worktree — looks like the owning session died between commit and push. Rescue command: git -C $GIT_DIR_PATH push -u origin $BRANCH. NOT circuit-broken (ga-tgwq): this is a push away, not a human re-anchor decision." 2>/dev/null \
+      || warn "Could not mail Mayor for rescuable branch $BRANCH"
+    log "ga-tgwq: branch $BRANCH absent from origin but locally rescuable at $_NB_LOCAL_SHA — marker $MARKER_ID left at gate-status:error (retriable), bead $BEAD_ID untouched."
+    exit 0
+  elif [ "$_NB_CLASS" = "escalate" ]; then
+    err "  ga-tgwq: branch $BRANCH absent from origin; local worktree has UNCOMMITTED changes — session likely died mid-edit. Escalating, not circuit-breaking or pushing."
+    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
+    bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
+    bd -C "$GC_CITY" comment "$MARKER_ID" "ga-tgwq: branch '$BRANCH' is absent from origin; a local ref exists but its worktree has UNCOMMITTED changes — the owning session likely died mid-edit. NOT circuit-broken, NOT auto-pushed (would silently strand the uncommitted diff). Human or Mayor must inspect the local worktree and decide: commit+push, or discard." 2>/dev/null || true
+    if [ -n "$BEAD_ID" ]; then
+      # ga-tgwq: same needs-human + Pilot-lane-free convention as the true
+      # park path below — safe to mirror here because gate:needs-human is
+      # what actually blocks Pilot re-dispatch of THIS bead (per the park
+      # path's own comment); clearing story:in-flight/pilot:dispatched/
+      # assignee is just stale-tracking hygiene once that label is set, not
+      # what does the blocking. Deliberately NOT done in the "rescuable"
+      # branch above, which has no gate:needs-human — clearing pilot:dispatched
+      # there would let Pilot re-dispatch a fresh builder while the
+      # almost-done branch just sits unpushed.
+      bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"  -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"   -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""                 -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-tgwq: gate found branch '$BRANCH' absent from origin with UNCOMMITTED changes in a local worktree — the session likely died mid-edit. Set gate:needs-human: a human or Mayor must inspect the pending diff before deciding whether to commit+push or discard. story:in-flight + pilot:dispatched stripped (Pilot lane slot freed)." 2>/dev/null || true
+    fi
+    gc --city "$GC_CITY" mail send mayor \
+      -s "Gate: $BRANCH absent from origin, uncommitted local work (${BEAD_ID:-unknown})" \
+      -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) is absent from origin; its local worktree has UNCOMMITTED changes — looks like the session died mid-edit. NOT auto-pushed (ga-tgwq): could silently strand the pending diff. Please inspect and decide: commit+push, or discard." 2>/dev/null \
+      || warn "Could not mail Mayor for dirty-local branch $BRANCH"
+    log "ga-tgwq: branch $BRANCH absent from origin with dirty local worktree — marker $MARKER_ID at gate-status:error, bead $BEAD_ID set needs-human, Mayor mailed."
+    exit 0
+  fi
+  # _NB_CLASS = "park": no local ref either — falls through to the original
+  # ga-acb circuit-break below, unchanged.
+
   # ga-acb: branch absent on origin is PROVABLY un-mergeable — circuit-break immediately.
   _ACB=$(gate_circuit_break_check "no_branch" "" "0" "0" "3" "10")
   if [ "$_ACB" != "ok" ]; then

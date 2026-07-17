@@ -132,11 +132,99 @@ eq "empty condition → ok" \
   "$(gate_circuit_break_check "" "" "0" "0" "3" "10")" \
   "ok"
 
-# ── 7. Drift guard: function must still be exported by the dispatcher ─────────
-echo "── 7. drift guard: gate_circuit_break_check exported by dispatcher ──"
+# ── 6b. ga-tgwq: gate_no_branch_local_classify — pure local-rescue classification
+# "Branch absent from origin" used to mean ONE thing (unmergeable, park). Real
+# case (17/07): wa-4s5l9 had 2 commits/1148 insertions, clean worktree, and
+# was permanently parked as gate:needs-human when the session had simply died
+# between commit and push — the fix was a 3-second `git push`, not a human
+# re-anchor decision.
+echo "── 6b. gate_no_branch_local_classify: park/rescuable/escalate ──"
+type gate_no_branch_local_classify >/dev/null 2>&1 \
+  || { echo "FATAL: gate_no_branch_local_classify not defined (ga-tgwq missing?)"; exit 1; }
+
+eq "ref absent → park (true park must remain possible — regression guard)" \
+  "$(gate_no_branch_local_classify "0" "0")" \
+  "park"
+eq "ref absent, dirty=1 (nonsensical combo) → still park (fail-safe)" \
+  "$(gate_no_branch_local_classify "0" "1")" \
+  "park"
+eq "ref exists, clean worktree → rescuable (the wa-4s5l9 case — must NOT park)" \
+  "$(gate_no_branch_local_classify "1" "0")" \
+  "rescuable"
+eq "ref exists, dirty worktree → escalate (mid-edit death, never auto-push)" \
+  "$(gate_no_branch_local_classify "1" "1")" \
+  "escalate"
+eq "ref_exists garbage → park (fail-safe)" \
+  "$(gate_no_branch_local_classify "xx" "0")" \
+  "park"
+eq "ref_exists empty (default arg) → park (fail-safe)" \
+  "$(gate_no_branch_local_classify "" "0")" \
+  "park"
+eq "ref exists, wt_dirty garbage → park (fail-safe)" \
+  "$(gate_no_branch_local_classify "1" "xx")" \
+  "park"
+
+# ── 6c. ga-tgwq: gate_no_branch_probe_local — real git I/O (throwaway sandbox)
+# 6b feeds 0/1 flags directly and can't catch a broken PROBE (the git
+# plumbing that produces those flags). This exercises the real probe against
+# a disposable git repo + linked worktrees so a broken `git worktree list
+# --porcelain` parse shows up RED here even with 6b green — the mutation
+# ga-tgwq's own acceptance criteria calls for ("neutralize the local-ref
+# probe => test goes RED").
+echo "── 6c. gate_no_branch_probe_local: real git I/O (throwaway sandbox) ──"
+type gate_no_branch_probe_local >/dev/null 2>&1 \
+  || { echo "FATAL: gate_no_branch_probe_local not defined (ga-tgwq missing?)"; exit 1; }
+
+_NB_SANDBOX=$(mktemp -d)
+cleanup_nb_sandbox() { [ -n "${_NB_SANDBOX:-}" ] && rm -rf "$_NB_SANDBOX"; }
+trap cleanup_nb_sandbox EXIT
+
+git init -q "$_NB_SANDBOX/rig"
+git -C "$_NB_SANDBOX/rig" config user.email test@test.local
+git -C "$_NB_SANDBOX/rig" config user.name Test
+git -C "$_NB_SANDBOX/rig" commit -q --allow-empty -m init
+_NB_BASE=$(git -C "$_NB_SANDBOX/rig" symbolic-ref --short HEAD)
+
+# Simulate the module-level state gate_no_branch_probe_local (via git_rig)
+# reads: a non-container rig, so git_rig uses `git -C $GIT_DIR_PATH`.
+GIT_DIR_PATH="$_NB_SANDBOX/rig"
+IS_CONTAINER_RIG=0
+
+eq "no ref anywhere → '0 0'" \
+  "$(gate_no_branch_probe_local "totally-absent-branch")" \
+  "0 0"
+
+git -C "$_NB_SANDBOX/rig" branch -q local-only-branch
+eq "local ref exists, no linked worktree (nothing to be dirty in) → '1 0'" \
+  "$(gate_no_branch_probe_local "local-only-branch")" \
+  "1 0"
+
+git -C "$_NB_SANDBOX/rig" worktree add -q -b clean-branch "$_NB_SANDBOX/wt-clean" "$_NB_BASE"
+eq "linked worktree, clean → '1 0' (the wa-4s5l9 case end-to-end)" \
+  "$(gate_no_branch_probe_local "clean-branch")" \
+  "1 0"
+
+git -C "$_NB_SANDBOX/rig" worktree add -q -b dirty-branch "$_NB_SANDBOX/wt-dirty" "$_NB_BASE"
+echo "uncommitted" > "$_NB_SANDBOX/wt-dirty/scratch.txt"
+eq "linked worktree, dirty (untracked file) → '1 1'" \
+  "$(gate_no_branch_probe_local "dirty-branch")" \
+  "1 1"
+
+cleanup_nb_sandbox
+trap - EXIT
+unset GIT_DIR_PATH IS_CONTAINER_RIG _NB_SANDBOX _NB_BASE
+
+# ── 7. Drift guard: functions must still be exported by the dispatcher ────────
+echo "── 7. drift guard: pure decision functions exported by dispatcher ──"
 type gate_circuit_break_check >/dev/null 2>&1 \
   && ok "gate_circuit_break_check present in lib-only mode" \
   || bad "gate_circuit_break_check MISSING from dispatcher lib-only export (drift!)"
+type gate_no_branch_local_classify >/dev/null 2>&1 \
+  && ok "gate_no_branch_local_classify present in lib-only mode" \
+  || bad "gate_no_branch_local_classify MISSING from dispatcher lib-only export (drift!)"
+type gate_no_branch_probe_local >/dev/null 2>&1 \
+  && ok "gate_no_branch_probe_local present in lib-only mode" \
+  || bad "gate_no_branch_probe_local MISSING from dispatcher lib-only export (drift!)"
 
 # ── Result ────────────────────────────────────────────────────────────────────
 echo ""
