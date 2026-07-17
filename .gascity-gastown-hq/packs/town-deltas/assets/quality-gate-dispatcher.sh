@@ -1403,6 +1403,16 @@ read_rebase_attempt() {
 _GATE_DISPATCHER_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE_GUARD_LIB_ONLY=1 source "${_GATE_DISPATCHER_SELF_DIR}/quality-gate-guard.sh" 2>/dev/null || true
 unset _GATE_DISPATCHER_SELF_DIR
+# guard.sh sets its OWN `LOG=$LOG_DIR/quality-gate-guard.log` (L25) at source time —
+# restore ours, exactly like the `glh` source is already undone at L41-42 (ga-l47b7).
+# Without this the `exec >> "$LOG"` below sends this dispatcher's ENTIRE output to
+# quality-gate-guard.log: the gate keeps working, but every observer looking at
+# quality-gate-dispatcher.log sees a file frozen at the moment this source was added,
+# and concludes the gate is DEAD. It cost hours tonight — the throughput watchdog fired
+# "165min with no Gate PASSED", digo reported the gate stalled, and I diagnosed a
+# 3-hour outage from a log that was simply being written somewhere else. The gate had
+# never stopped. Same root class (ga-p5q3): "I see nothing" read as "nothing happened".
+LOG="$LOG_DIR/quality-gate-dispatcher.log"
 
 if [ -n "${GATE_DISPATCHER_LIB_ONLY:-}" ]; then
   return 0 2>/dev/null || exit 0
