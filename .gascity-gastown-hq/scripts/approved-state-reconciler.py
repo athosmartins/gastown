@@ -205,8 +205,18 @@ def _prune_state(state, now):
 
 
 # ── bd JSON parse ─────────────────────────────────────────────────────────────
-def _parse_bd_json(raw):
-    """Parse bd --json output (array or {issues:[]} envelope). Returns [] on any failure."""
+def _parse_bd_json(raw, strict=False):
+    """Parse bd --json output (array or {issues:[]} envelope). Returns [] on any failure.
+
+    With strict=True, returns None instead of [] specifically when the payload could
+    not be parsed as JSON at all (both the initial parse and the truncate-and-retry
+    recovery failed) — callers that must not conflate "confirmed empty" with
+    "unreadable" (root-class:error-vs-empty) should pass strict=True and treat a None
+    return as unknown, not zero rows. strict=True does NOT change the empty-input or
+    wrong-shape cases: empty/whitespace stdout and syntactically-valid-but-unexpected
+    JSON (e.g. a bare number) both remain [] even in strict mode, since those ARE the
+    command legitimately saying "nothing here" rather than a parse failure.
+    """
     if not raw or not raw.strip():
         return []
     try:
@@ -217,9 +227,9 @@ def _parse_bd_json(raw):
         try:
             d = json.loads(raw[:e.pos])
         except Exception:
-            return []
+            return None if strict else []
     except Exception:
-        return []
+        return None if strict else []
     if isinstance(d, list):
         return d
     if isinstance(d, dict):
@@ -756,7 +766,7 @@ def _gate_marker_source_beads():
                  "--json", "-n", "200"], timeout=BD_TIMEOUT)
         if r is None or r.returncode != 0:
             return None
-        rows = _parse_bd_json(r.stdout)
+        rows = _parse_bd_json(r.stdout, strict=True)
     if rows is None:
         return None
     out = set()
@@ -1104,9 +1114,13 @@ def _selftest():
                 ga-6927 fix must not become over-permissive
       (z)       HQ gate-marker query FAILS (built_ids=None) → no starve alarm — fail-safe,
                 error must not collapse into "nothing built" (ga-6927)
+      (aa)      HQ gate-marker query returns UNPARSEABLE JSON (rc=0) via the REAL _sh +
+                _parse_bd_json path, not the _bd_gate_markers test seam — closes the gap
+                where gate attempt 1 left the actual parse-failure branch uncovered (z
+                only exercises the seam) (ga-6927 gate attempt 1 FAIL)
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
-    global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers
+    global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
     global DRY_RUN, STARVE_MIN, FLOW_GRACE_MIN, ROUTE_COOLDOWN_SEC, ALARM_COOLDOWN_SEC
 
     ok_count = [0]
@@ -1680,6 +1694,38 @@ def _selftest():
     else:
         _bad("(z): SAFETY VIOLATION — alarmed despite unreadable marker query "
              "(error-vs-empty conflation)", "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (aa): HQ gate-marker query returns UNPARSEABLE JSON (rc=0) via the "
+          "REAL _sh + _parse_bd_json path → no starve alarm — closes the gate-attempt-1 "
+          "coverage gap (ga-6927)")
+    # (z) stubs _bd_gate_markers directly, which short-circuits _gate_marker_source_beads()
+    # before it ever calls _sh()/_parse_bd_json() — the real production code path where the
+    # gate-attempt-1 bug lived (_parse_bd_json's truncate-and-retry ALSO failing) had zero
+    # coverage. Here we clear the _bd_gate_markers seam so the real branch runs, and stub
+    # _sh() itself to simulate `bd ... --json` exiting 0 with a body that is not valid JSON
+    # at all (not merely truncated-but-recoverable) — the exact shape _parse_bd_json's
+    # docstring says collapses to [] "on any failure". If _gate_marker_source_beads() calls
+    # _parse_bd_json without strict=True (or strict mode doesn't propagate None through the
+    # truncate-retry-also-fails path), this bead falsely alarms.
+    _bd_approved = lambda root: [_make_bead("hq-029", age_min=0.1)]
+    _bd_gate_markers = None   # force the real _sh + _parse_bd_json branch, not the seam
+    _real_sh = _sh
+    _sh = lambda *a, **kw: subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="not valid json at all {{{")
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_aa = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_aa["first_seen_approved"]["hq-029"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_aa)
+    _sh = _real_sh
+    alarmed_aa = any("hq-029" in subj for subj, _ in mail_calls)
+    if not alarmed_aa:
+        _ok("(aa): unparseable HQ gate-marker JSON via the real _sh/_parse_bd_json path — "
+            "fail-safe, no alarm")
+    else:
+        _bad("(aa): SAFETY VIOLATION — alarmed on unparseable gate-marker JSON via the real "
+             "_sh/_parse_bd_json path (error-vs-empty conflation the seam-only tests in "
+             "gate attempt 1 could not catch)", "mail_calls=%s" % mail_calls)
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
