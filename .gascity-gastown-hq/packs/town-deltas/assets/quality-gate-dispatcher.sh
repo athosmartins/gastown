@@ -4071,14 +4071,50 @@ if { [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; } && echo "$BRANCH" | grep -qE 
   AUTHOR="mayor"
 fi
 
+# SELFTEST-EXTRACT gate-author-final-fallback: BEGIN
+# ga-tmkjg: generic crew-branch fallback. gate.submitted_by can be blanked by a
+# raw `bd update` outside this dispatcher (bd-update-blanks-gc-metadata) and,
+# independently, a reclaim/janitor (lifecycle R4) can clear the source bead's
+# own assignee — so BOTH resolution paths above can legitimately go empty for
+# real, in-flight work, not only for the wa-worker case already handled.
+# Observed: 12 markers stuck ~2h with zero gate-runs (this bead). The branch
+# name is the one signal that cannot go missing: crew/<name>/<bead-id> is the
+# reason the marker exists at all, so <name> is always recoverable here even
+# when every bead-side field has been wiped. Mirrors resolve_rebase_author's
+# own crew-from-branch sed (this file) but stops there — unlike that function,
+# does NOT fall through to the marker's self-declared `author:` line, per the
+# SECURITY note at the top of this section (self-declared author must stay
+# untrusted for self-review-exclusion; resolve_rebase_author's marker_author
+# tier is safe only for its own lower-stakes liveness-check purpose).
+if [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; then
+  _CREW_FROM_BRANCH=$(printf '%s' "$BRANCH" | sed -n 's#^crew/\([^/]\{1,\}\)/.*#\1#p')
+  if [ -n "$_CREW_FROM_BRANCH" ]; then
+    log "  Author unresolved (gate.submitted_by and bead assignee/created_by/owner all empty) but branch '$BRANCH' names crew '$_CREW_FROM_BRANCH' — using branch fallback instead of aborting."
+    AUTHOR="$_CREW_FROM_BRANCH"
+  fi
+fi
+
 if [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; then
   err "Cannot derive author authoritatively for bead $BEAD_ID — aborting (fail-safe)."
   bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:deferred"    -q 2>/dev/null || true
   # wa-uthi: non-terminal (deferred) — no push to Athos. Logged only.
   log "SUPPRESSED PUSH (wa-uthi non-terminal): author unresolvable for $MARKER_ID — deferred."
+  # ga-tmkjg: a silently-deferred marker re-enters the SAME oldest-first queue
+  # position next sweep (gate-recovery-watchdog's grw-defer-requeue) and fails
+  # identically every time — an author-unresolvable marker cannot become
+  # resolvable between sweeps on its own — so it head-of-line-blocks every
+  # OTHER queued marker behind it, with zero gate-runs and no signal anything
+  # is wrong (this bead: 12 markers, ~2h, zero throughput, found only because
+  # Athos noticed the review queue looked empty). Mail Mayor so a human sees
+  # it THIS sweep, not N hours from now.
+  gc --city "$GC_CITY" mail send mayor \
+    -s "Gate: marker $MARKER_ID has no derivable author (bead ${BEAD_ID:-unknown})" \
+    -m "Marker $MARKER_ID (bead ${BEAD_ID:-unknown}, branch ${BRANCH:-unknown}, rig ${RIG:-unknown}) has no derivable author: gate.submitted_by is empty, the source bead's assignee/created_by/owner are all empty, and branch '${BRANCH:-unknown}' is not a crew/<name>/* branch so no name could be recovered from it either. Deferred (gate-status:deferred) rather than left dispatching, but it will fail identically on every future sweep and head-of-line-blocks the rest of the queue until someone intervenes (ga-tmkjg). Fix: set gate.submitted_by on the marker, or restore the source bead's assignee — either lets it re-dispatch on the next sweep." 2>/dev/null \
+    || warn "Could not mail Mayor for authorless marker $MARKER_ID"
   exit 0
 fi
+# SELFTEST-EXTRACT gate-author-final-fallback: END
 
 log "Authoritative author: $AUTHOR"
 
