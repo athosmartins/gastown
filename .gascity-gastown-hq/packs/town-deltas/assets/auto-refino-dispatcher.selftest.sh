@@ -47,6 +47,10 @@
 #   Cross-stage anti-starvation (FIX B: refino is the lowest stage and must yield
 #   to a congested gate/Pilot under contention, but never serialize when resources
 #   are free) → Scenario 14 (yield gate + fail-open + kill-switch).
+#   Hold-label guard (bug ga-268cr: RAW sweep re-ingested a story already governed
+#   by another authority — blocked:*, needs-human*, pilot:held*, blocked-on:*, and
+#   pool:refused:* were all unchecked by either layer) → Scenario 15 (classifier +
+#   RAW jq filter, defense in depth + drift-guard 15b).
 #
 # Exit 0 iff every assertion holds.
 
@@ -1211,6 +1215,74 @@ else
   bad "(B) kill-switch did not bypass the yield gate"
 fi
 rm -rf "$_ykcity"
+
+# ── Scenario 15: hold-label guard — RAW sweep must not override another ───────
+# authority's explicit hold (bug ga-268cr). 6 confirmed same-day occurrences
+# (2026-07-17, whatsapp_automation store) of the RAW Triagem source re-ingesting
+# a story an authority (Oracle/Mayor/a builder) had deliberately parked.
+# Occurrences 2 (wa-5b6yw) and 3 (wa-gunqu) carried blocked:needs-oracle-approval;
+# occurrence 5 (wa-ic45e, worst — a builder had REFUSED to implement on ban-risk
+# grounds and the Oracle formally deferred) carried blocked-on:wa-4e2m8,
+# blocked-on:wa-qfp58, blocked:needs-oracle-approval AND
+# pool:refused:deferred-by-plan-v6 simultaneously. Verified directly against the
+# live code (not from memory, 2026-07-17) that NEITHER layer (is_ingestable_raw
+# NOR the RAW_JSON jq filter) checked blocked:*, needs-human*, pilot:held*,
+# blocked-on:*, or pool:refused:* before this fix. blocked-on: is a DISTINCT
+# hyphenated prefix from blocked: (not a typo — a blocked:* guard alone does not
+# match it), and pilot:held can carry a -until:<epoch> suffix (mirrors the
+# dog-pool probe's own startswith("pilot:held") precedent) that a bare
+# exact-match would miss.
+EX="scraper build infra config deploy migration pipeline"
+echo "Scenario 15: hold-label guard — active hold from another authority blocks RAW ingestion (bug ga-268cr)"
+[ "$(auto_refino_is_ingestable_raw "wa-5b6yw" "feature" "blocked:needs-oracle-approval" "false" "$EX")" = "no" ] \
+  && ok "blocked:needs-oracle-approval (occurrence 2) → no (Mayor's hold respected)" \
+  || bad "blocked:* label → expected no"
+[ "$(auto_refino_is_ingestable_raw "wa-x1" "feature" "needs-human" "false" "$EX")" = "no" ] \
+  && ok "needs-human (bare) → no" \
+  || bad "needs-human bare → expected no"
+[ "$(auto_refino_is_ingestable_raw "wa-x2" "feature" "needs-human-priority" "false" "$EX")" = "no" ] \
+  && ok "needs-human-priority (prefixed variant) → no (prefix match, not exact-only)" \
+  || bad "needs-human-priority → expected no"
+[ "$(auto_refino_is_ingestable_raw "wa-x3" "feature" "pilot:held" "false" "$EX")" = "no" ] \
+  && ok "pilot:held (bare) → no" \
+  || bad "pilot:held bare → expected no"
+[ "$(auto_refino_is_ingestable_raw "wa-x4" "feature" "pilot:held-until:1784315109" "false" "$EX")" = "no" ] \
+  && ok "pilot:held-until:<epoch> (timed variant) → no (prefix match catches the suffix form too)" \
+  || bad "pilot:held-until:* → expected no"
+[ "$(auto_refino_is_ingestable_raw "wa-qfp58-blocker" "feature" "blocked-on:wa-qfp58" "false" "$EX")" = "no" ] \
+  && ok "blocked-on:wa-qfp58 (occurrence 5, hyphenated prefix) → no" \
+  || bad "blocked-on:* → expected no"
+[ "$(auto_refino_is_ingestable_raw "wa-x5" "feature" "pool:refused:deferred-by-plan-v6" "false" "$EX")" = "no" ] \
+  && ok "pool:refused:deferred-by-plan-v6 (occurrence 5) → no" \
+  || bad "pool:refused:* → expected no"
+# The exact wa-ic45e regression: all four hold labels the Oracle actually set,
+# simultaneously — the 5th and worst occurrence (a builder had already REFUSED
+# on ban-risk grounds; RAW ingested it anyway as attempt 2).
+[ "$(auto_refino_is_ingestable_raw "wa-ic45e" "feature" "blocked-on:wa-4e2m8,blocked-on:wa-qfp58,blocked:needs-oracle-approval,pool:refused:deferred-by-plan-v6" "false" "$EX")" = "no" ] \
+  && ok "wa-ic45e exact regression shape (4 hold labels at once) → no (5th occurrence cannot re-form)" \
+  || bad "wa-ic45e regression shape → expected no"
+# Anchoring: a label that merely CONTAINS "blocked" as a substring but is not
+# actually hold-prefixed (comma-bounded false-positive check) must NOT trip the
+# guard — the csv comma-wrap anchors prefix matches to real label boundaries.
+[ "$(auto_refino_is_ingestable_raw "wa-x6" "feature" "unblocked-reason,frontend" "false" "$EX")" = "yes" ] \
+  && ok "unblocked-reason (near-miss substring, not a real hold label) → yes (no false-positive over-reject)" \
+  || bad "near-miss substring label → expected yes (funnel over-rejected)"
+# Regression: a genuinely raw story with none of these labels is still ingested.
+[ "$(auto_refino_is_ingestable_raw "wa-fresh4" "feature" "frontend" "false" "$EX")" = "yes" ] \
+  && ok "genuine raw story (no hold label) → still yes (funnel not starved)" \
+  || bad "genuine raw story → expected yes"
+
+# 15b. Drift-guard: BOTH layers (RAW_JSON jq filter AND the is_ingestable_raw
+#      classifier) must carry the new hold-label guard — defense in depth,
+#      mirrors drift-guard 0d's structure for the escalated-story guard above.
+if grep -qF 'startswith("blocked-on:")' "$DISPATCHER" \
+   && grep -qF 'startswith("pool:refused:")' "$DISPATCHER" \
+   && grep -qF '*,blocked-on:*' "$DISPATCHER" \
+   && grep -qF '*,pool:refused:*' "$DISPATCHER"; then
+  ok "15b. hold-label guard present in BOTH the RAW jq filter and is_ingestable_raw classifier (bug ga-268cr)"
+else
+  bad "15b. hold-label guard missing from jq filter or classifier — occurrences 2/3/5 can re-form"
+fi
 
 echo ""
 echo "auto-refino-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"

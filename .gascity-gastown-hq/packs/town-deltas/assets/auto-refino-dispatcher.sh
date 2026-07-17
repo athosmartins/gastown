@@ -369,6 +369,14 @@ auto_refino_is_ingestable_raw() {
   # RAW and gets re-ingested every sweep. Any gate:* label disqualifies it (the RAW
   # jq query also drops it; classifier-side defense in depth). csv is comma-wrapped.
   case "$csv" in *,gate:*) echo "no"; return ;; esac
+  # under an active hold from another authority (bug ga-268cr, occurrences
+  # 2/3/5/6): blocked:*, needs-human*, pilot:held* (bare or -until:<epoch>),
+  # blocked-on:* (hyphenated — a DISTINCT prefix from blocked:*, not a typo),
+  # and pool:refused:* all mean Oracle/Mayor/a builder has deliberately parked
+  # this story — the RAW sweep must never override that hold (the RAW jq query
+  # also drops these; classifier-side defense in depth). csv is comma-wrapped
+  # so *,prefix* matches any label starting with prefix.
+  case "$csv" in *,blocked:*|*,needs-human*|*,pilot:held*|*,blocked-on:*|*,pool:refused:*) echo "no"; return ;; esac
   # too-freshly-mutated (ga-51ry): this bead was updated inside the last
   # min_age minutes — likely mid a non-atomic recovery transition (a
   # story:*/gate:* protective label was JUST cleared and the replacement has
@@ -860,6 +868,17 @@ if [ "$AUTO_REFINO_INGEST_RAW_TRIAGEM" = "1" ]; then
     # (ga-oonk3 re-ingested 3x). Any gate:* label means NOT a raw Triagem story.
     # Mirrors the auto-refino:escalated guard directly above.
     | map(select(((.labels // []) | any(type=="string" and startswith("gate:"))) | not))
+    # Drop beads under an active hold from another authority (bug ga-268cr,
+    # occurrences 2/3/5/6): blocked:*, needs-human*, pilot:held* (bare or
+    # -until:<epoch>), blocked-on:* (hyphenated — distinct prefix from
+    # blocked:*, not a typo), and pool:refused:* all signal a deliberate hold
+    # this sweep must not override. Mirrors the classifier-side guard in
+    # auto_refino_is_ingestable_raw (defense in depth).
+    | map(select(((.labels // []) | any(type=="string" and (
+        startswith("blocked:") or startswith("needs-human") or
+        startswith("pilot:held") or startswith("blocked-on:") or
+        startswith("pool:refused:")
+      ))) | not))
     # Drop beads mutated too recently (ga-51ry, 3rd occurrence wa-soe8a): a
     # manual/automated recovery transition (e.g. the Mayor clearing
     # gate:needs-human to retry) can clear the LAST protective story:*/gate:*
