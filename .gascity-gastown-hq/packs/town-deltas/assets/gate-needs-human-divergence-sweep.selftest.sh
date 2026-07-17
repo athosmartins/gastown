@@ -186,8 +186,8 @@ fi
 # ── 7. drift-guard: companion author-mail fix in the dispatcher (ga-u4yi) ───
 echo "── 7. drift-guard: companion fix — dispatcher mails AUTHOR at needs-human transitions ──"
 if [ -f "$DISPATCHER" ]; then
-  eq "dispatcher mails AUTHOR at all 4 gate:needs-human sites (ga-u4yi)" \
-     "$(grep -c 'mail send "\$AUTHOR"' "$DISPATCHER")" "4"
+  eq "dispatcher mails AUTHOR at all 5 gate:needs-human sites (ga-u4yi)" \
+     "$(grep -c 'mail send "\$AUTHOR"' "$DISPATCHER")" "5"
 else
   bad "dispatcher not found at $DISPATCHER"
 fi
