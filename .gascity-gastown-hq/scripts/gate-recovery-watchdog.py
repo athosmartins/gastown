@@ -168,7 +168,7 @@ ORPHAN_MAX_PER_SWEEP = int(os.environ.get("GRW_ORPHAN_MAX_PER_SWEEP", "8"))
 # needs-fix on FAIL — the watchdog never duplicates that crown-jewel logic). Per-marker
 # attempt cap → escalate to needs-human if a marker keeps stranding.
 GRW_REAP_STRANDED_ENABLED = os.environ.get("GRW_REAP_STRANDED_ENABLED", "1") != "0"
-STRANDED_RUN_MINUTES = int(os.environ.get("GRW_STRANDED_RUN_MINUTES", "15"))      # a healthy finalize is seconds after the last verdict; 15min (~5 dispatcher sweeps) past = the managing sweep is dead. SUSTAINED-confirmed on a resample first.
+STRANDED_RUN_MINUTES = int(os.environ.get("GRW_STRANDED_RUN_MINUTES", "5"))       # ga-5t5w: minutes since the LAST VERDICT was DELIVERED (not run creation — see stranded_verdict_verdict). A healthy finalize is seconds after the last verdict; 5min (~1-2 dispatcher Phase C sweeps) past = the managing sweep is dead. SUSTAINED-confirmed on a resample first.
 STRANDED_MAX_ATTEMPTS = int(os.environ.get("GRW_STRANDED_MAX_ATTEMPTS", "2"))     # after K recoveries of the SAME marker (finalize keeps dying), escalate to needs-human instead of another futile re-review
 GRW_STRANDED_LABEL_RE = re.compile(r"^grw-stranded:(\d+)$")                        # restart-safe per-marker stranded-recovery counter
 RECOVERY_LOG = os.path.join(CITY, ".gc/logs/gate-recovery-actions.jsonl")        # durable jsonl audit of every direct reap/requeue (evidence)
@@ -1574,25 +1574,33 @@ def _any_reviewer_active(sessions, names):
 
 
 def _run_verdicts(run_id):
-    """(reviewer_names:set, delivered:int, total:int) for a gate-run's verdict beads
-    (label gate-run:<id>). delivered = CLOSED verdict beads (a closed verdict bead =
-    a verdict was recorded; open/in_progress = pending). Returns (set(), -1, -1) on
-    query failure so the caller fail-safe skips."""
+    """(reviewer_names:set, delivered:int, total:int, last_delivered_epoch:float|None)
+    for a gate-run's verdict beads (label gate-run:<id>). delivered = CLOSED verdict
+    beads (a closed verdict bead = a verdict was recorded; open/in_progress =
+    pending). last_delivered_epoch = the newest `updated_at` among the CLOSED
+    verdict beads — a proxy for when the LAST verdict was delivered (the anchor
+    FIX5's stranded-run check needs; ga-5t5w), or None if nothing has been
+    delivered yet or no closed row parsed. Returns (set(), -1, -1, None) on query
+    failure so the caller fail-safe skips."""
     r = sh(["bd", "-C", CITY, "list", "--all", "-l", "gate-run:%s" % run_id, "--json"])
     if not r or r.returncode != 0:
-        return (set(), -1, -1)
+        return (set(), -1, -1, None)
     try:
         rows = json.loads(r.stdout) or []
     except Exception:
-        return (set(), -1, -1)
+        return (set(), -1, -1, None)
     names, delivered = set(), 0
+    last_delivered = None
     for row in rows:
         a = row.get("assignee")
         if a:
             names.add(a)
         if row.get("status") == "closed":
             delivered += 1
-    return (names, delivered, len(rows))
+            e = _iso_epoch(row.get("updated_at"))
+            if e is not None and (last_delivered is None or e > last_delivered):
+                last_delivered = e
+    return (names, delivered, len(rows), last_delivered)
 
 
 def hung_run_verdict(age_sec, hang_sec, n_verdict_beads, n_delivered,
@@ -1759,7 +1767,7 @@ def reap_hung_runs(sessions, now, rstate):
         age = int(now - se)
         if age <= REVIEW_HANG_MINUTES * 60:
             continue  # too young — a real review can take 9+ min; never reap early
-        names, delivered, total = _run_verdicts(rid)
+        names, delivered, total, _ldv = _run_verdicts(rid)
         active1 = _any_reviewer_active(sessions, names)
         v1 = hung_run_verdict(age, REVIEW_HANG_MINUTES * 60, total, delivered, active1, 0)
         if v1 != "reap":
@@ -1772,7 +1780,7 @@ def reap_hung_runs(sessions, now, rstate):
         # second sample, or will have LANDED a verdict — either aborts the reap.
         time.sleep(LIVENESS_RESAMPLE_SEC)
         sessions2 = _session_list_json()
-        names2, delivered2, total2 = _run_verdicts(rid)
+        names2, delivered2, total2, _ldv2 = _run_verdicts(rid)
         active2 = _any_reviewer_active(sessions2, names2)
         both_active = None if (active1 is None or active2 is None) else (active1 or active2)
         eff_total = total2 if total2 >= 0 else total
@@ -1854,21 +1862,34 @@ def stranded_verdict_verdict(age_sec, threshold_sec, delivered, total):
     RECOVERED as a STRANDED-VERDICT run — all required verdicts DELIVERED but the run
     never finalized (managing sweep died post-verdict; wa-99jug 2026-07-02)? Returns
     'recover' or 'skip:<reason>'. Fail-safe: any ambiguity → skip.
-      skip:young        younger than threshold (a healthy finalize is seconds after the
-                        last verdict — wait well past so a mid-finalize run is never touched)
-      skip:query-failed verdict counts unreadable (never act blind)
-      skip:not-a-run    0 verdict beads (a guard claim-tracking run, not a review)
-      skip:collecting   delivered < total (a REAL in-progress review still gathering verdicts)
-      recover           age>=threshold AND total>=1 AND delivered==total (all in, still running, stale)
+
+    ga-5t5w: age_sec is seconds since the LAST VERDICT was DELIVERED — never since
+    the run was created. A slow-but-healthy review and a genuinely wedged finalize
+    both keep a run open a long time; only recency of the last verdict tells them
+    apart. Measuring from run-creation made a review that simply took 16 minutes
+    indistinguishable from a dead finalizer, and this reaper discarded 11
+    COMPLETE, delivered verdicts in a single day (4 escalated to a human) as a
+    result. age_sec may be None when delivered==total but no delivery timestamp
+    parsed — never invent a recency signal.
+      skip:query-failed          verdict counts unreadable (never act blind)
+      skip:not-a-run             0 verdict beads (a guard claim-tracking run, not a review)
+      skip:collecting            delivered < total (a REAL in-progress review still gathering verdicts)
+      skip:verdict-time-unknown  all verdicts delivered but delivery time didn't parse
+      skip:young                 younger than threshold (a healthy finalize is seconds after the
+                                 last verdict — wait well past so a mid-finalize run is never touched)
+      recover                    total>=1 AND delivered==total AND age_sec>=threshold since the
+                                 LAST verdict landed (still running, stale)
     """
-    if age_sec < threshold_sec:
-        return "skip:young"
     if total < 0 or delivered < 0:
         return "skip:query-failed"
     if total == 0:
         return "skip:not-a-run"
     if delivered < total:
         return "skip:collecting"
+    if age_sec is None:
+        return "skip:verdict-time-unknown"
+    if age_sec < threshold_sec:
+        return "skip:young"
     return "recover"
 
 
@@ -1891,13 +1912,19 @@ def stranded_escalation_needs_human_targets(marker_id, source_bead):
 
 def reap_stranded_verdict_runs(now):
     """FIX 5: recover a STRANDED-VERDICT run (all required verdicts delivered, still
-    gate-status:running, managing sweep dead). See stranded_verdict_verdict. Supersede
-    the run + clear the source's stale gate:reviewing (the phantom 'em revisão') +
-    re-queue the marker so a fresh sweep re-reviews and finalizes cleanly. The watchdog
-    NEVER duplicates the dispatcher's merge/FAIL finalization — it hands the completed
-    branch back to the gate. Per-marker cap → escalate to needs-human on repeat. No
-    reviewer-liveness needed (the reviewers already delivered). Bounded, dry-run-aware,
-    fully fail-safe (query failure / run finalized between samples → skip)."""
+    gate-status:running, managing sweep dead). See stranded_verdict_verdict. Anchored
+    on time since the LAST VERDICT was DELIVERED (ga-5t5w) — NOT run creation time;
+    the run's own age conflates a slow-but-healthy review with a genuinely wedged
+    finalize, which is exactly why this reaper used to supersede runs whose reviewers
+    had JUST finished on time (11 delivered-and-discarded verdicts in a single day, 4
+    escalated to a human, before this fix). Supersede the run + clear the source's
+    stale gate:reviewing (the phantom 'em revisão') + re-queue the marker so a fresh
+    sweep re-reviews and finalizes cleanly. The watchdog NEVER duplicates the
+    dispatcher's merge/FAIL finalization — it hands the completed branch back to the
+    gate. Per-marker cap → escalate to needs-human on repeat. No reviewer-liveness
+    needed (the reviewers already delivered). Bounded, dry-run-aware, fully fail-safe
+    (query failure / run finalized between samples / unparseable verdict-delivery
+    time → skip)."""
     if not GRW_ENABLED or not GRW_REAP_STRANDED_ENABLED:
         return
     runs = _open_running_runs()
@@ -1911,11 +1938,8 @@ def reap_stranded_verdict_runs(now):
         if not rid:
             continue
         desc = run.get("description") or ""
-        se = _iso_epoch(_parse_run_field(desc, "started_at"))
-        if not se:
-            continue  # no parseable started_at → cannot age → skip
-        age = int(now - se)
-        _names, delivered, total = _run_verdicts(rid)
+        _names, delivered, total, last_delivered = _run_verdicts(rid)
+        age = int(now - last_delivered) if last_delivered is not None else None
         if stranded_verdict_verdict(age, STRANDED_RUN_MINUTES * 60, delivered, total) != "recover":
             continue
         # SUSTAINED confirm: re-read after a gap. If the run finalized (no longer open),
@@ -1924,12 +1948,17 @@ def reap_stranded_verdict_runs(now):
         if _bead_is_open(rid) is False:
             print("[watchdog] FIX5: run=%s finalized between samples — a live sweep handled it, no action" % rid, flush=True)
             continue
-        _n2, delivered2, total2 = _run_verdicts(rid)
-        if stranded_verdict_verdict(age, STRANDED_RUN_MINUTES * 60,
-                                    delivered2 if delivered2 >= 0 else delivered,
-                                    total2 if total2 >= 0 else total) != "recover":
+        _n2, delivered2, total2, last_delivered2 = _run_verdicts(rid)
+        eff_delivered = delivered2 if delivered2 >= 0 else delivered
+        eff_total = total2 if total2 >= 0 else total
+        eff_last_delivered = last_delivered2 if last_delivered2 is not None else last_delivered
+        age2 = int(now - eff_last_delivered) if eff_last_delivered is not None else None
+        if stranded_verdict_verdict(age2, STRANDED_RUN_MINUTES * 60, eff_delivered, eff_total) != "recover":
             print("[watchdog] FIX5: run=%s not stranded after resample — kept (fail-safe)" % rid, flush=True)
             continue
+        # recover is only reachable with a non-None age (stranded_verdict_verdict
+        # returns skip:verdict-time-unknown otherwise) — age2 is safe to use below.
+        age = age2
         marker_id = _parse_run_field(desc, "marker_id")
         source_bead = _parse_run_field(desc, "source_bead") or _label_value(run, "source-bead:")
         rig = _label_value(run, "bead-rig:")
@@ -2696,7 +2725,7 @@ def main():
         "on gate-down OR pilot-jam OR head-of-line block OR supervisor init-failure OR orphaned queued marker"
         % (MAX_ACTIVE_REPAIR_DOGS, MAX_SPAWNS_PER_CONDITION, GRW_ENABLED, GRW_DRY_RUN), flush=True)
   print("[watchdog] + DIRECT self-heal each sweep: reap HUNG reviewers (run>%dm, 0 verdicts, dead reviewer sustained; enabled=%s) "
-        "AND recover STRANDED-VERDICT runs (run>%dm, all verdicts delivered but stuck running/unfinalized, cap %d attempts; enabled=%s) "
+        "AND recover STRANDED-VERDICT runs (verdicts complete>%dm ago, all delivered but stuck running/unfinalized, cap %d attempts; enabled=%s) "
         "AND kill FROZEN reviewers (active-but-last_active-silent>%ds, cap %d/sweep, sustained-confirmed; enabled=%s) "
         "AND reap ORPHAN/STALE markers (queued>%dm w/ source closed→close, or leaked gate:reviewing→clear, cap %d/sweep; enabled=%s) "
         "AND requeue STRANDED dispatching|reviewing markers w/ NO open run (dead reviewer, >%dm, cap %d/sweep, esc after %d; enabled=%s) "

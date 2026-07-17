@@ -302,6 +302,122 @@ if m.error_requeue_verdict(ETH + 600, ETH, True, False, True, 0, KMAX) == "skip:
 else:
     bad("expected skip:parked-needs-human")
 
+# ═══ ga-5t5w: FIX5 stranded-verdict recovery anchored on LAST-VERDICT time ════
+# RAIZ: reap_stranded_verdict_runs anchored its age on the RUN's created_at instead
+# of the LAST VERDICT's delivered_at. A slow-but-healthy review and a genuinely
+# wedged finalize both keep a run open a long time; only recency of the last
+# verdict tells them apart. Measuring from run-creation made a 16-minute (healthy)
+# review indistinguishable from a dead finalizer and discarded 11 COMPLETE,
+# delivered verdicts in a single day (4 escalated to a human). These scenarios
+# pin the PURE stranded_verdict_verdict() contract, the _run_verdicts() data
+# plumbing that derives the new anchor from real bd rows, and a drift-guard that
+# the caller is actually wired to the new anchor (not silently reverted).
+SRM = m.STRANDED_RUN_MINUTES * 60
+
+# ── Scenario 15b (FIX5 i): all verdicts in, stale since last delivery → recover ──
+print("Scenario 15b (FIX5 i): verdicts complete, stale since LAST delivery → recover")
+if m.stranded_verdict_verdict(SRM + 300, SRM, 3, 3) == "recover":
+    ok("total>=1, delivered==total, age(since last verdict)>=threshold → recover")
+else:
+    bad("expected recover, got %r" % (m.stranded_verdict_verdict(SRM + 300, SRM, 3, 3),))
+
+# ── Scenario 15c (FIX5 ii): fail-safe skips ───────────────────────────────────
+print("Scenario 15c (FIX5 ii): every ambiguous/incomplete case is fail-safe SKIPPED")
+skip_cases = [
+    ("query-failed",        m.stranded_verdict_verdict(SRM + 300, SRM, -1, -1),   "skip:query-failed"),
+    ("not-a-run",           m.stranded_verdict_verdict(SRM + 300, SRM, 0, 0),     "skip:not-a-run"),
+    ("collecting",          m.stranded_verdict_verdict(SRM + 300, SRM, 1, 3),     "skip:collecting"),
+    ("verdict-time-unknown",m.stranded_verdict_verdict(None,     SRM, 3, 3),      "skip:verdict-time-unknown"),
+    ("young",               m.stranded_verdict_verdict(SRM - 60, SRM, 3, 3),      "skip:young"),
+]
+_all5c = True
+for name, got, want in skip_cases:
+    if got != want:
+        _all5c = False; bad("skip case %s: got %r want %r" % (name, got, want))
+if _all5c:
+    ok("query-failed, not-a-run, collecting, verdict-time-unknown, young all → skip (never act ambiguously)")
+
+# ── Scenario 15d (THE mutation, ga-5t5w core fix): old RUN, fresh VERDICT ─────
+# The exact incident shape: a review takes 20 minutes (run age = 20m) but the
+# reviewer finished ON TIME and the last verdict landed just 1 minute ago. Anchor
+# on the RUN's age (the bug) → wrongly "recover" (discards a live finalize-in-
+# progress). Anchor on the LAST VERDICT's age (the fix) → correctly "skip:young".
+print("Scenario 15d (THE mutation, ga-5t5w): run=20m old, last verdict delivered 1m ago")
+RUN_AGE_SEC = 20 * 60
+VERDICT_AGE_SEC = 60
+buggy_anchor_verdict = m.stranded_verdict_verdict(RUN_AGE_SEC, SRM, 3, 3)      # what the OLD code effectively asked
+fixed_anchor_verdict = m.stranded_verdict_verdict(VERDICT_AGE_SEC, SRM, 3, 3)  # what the NEW code asks
+if fixed_anchor_verdict == "skip:young":
+    ok("anchored on last-verdict-delivered (1m ago) → skip:young — the dispatcher still gets its chance to finalize")
+else:
+    bad("REGRESSION ga-5t5w: verdict-anchored age wrongly returned %r (want skip:young) — "
+        "a just-finished healthy review would be superseded again" % (fixed_anchor_verdict,))
+if buggy_anchor_verdict == "recover":
+    ok("(confirms the OLD run-creation anchor WOULD have wrongly fired 'recover' here — this is exactly the bug)")
+else:
+    bad("expected the OLD anchor to demonstrate 'recover' for contrast, got %r — mutation control invalid" % (buggy_anchor_verdict,))
+
+# ── Scenario 15e (regression guard): a GENUINELY stranded run is still recovered ──
+# Verdicts complete 10 minutes ago (well past the new 5min default) and the run
+# itself might be arbitrarily old or young — recovery must still fire; the fix
+# must never overcorrect into "nothing is ever recovered".
+print("Scenario 15e (regression): verdicts complete 10m ago, dispatcher dead → STILL recovered")
+if m.stranded_verdict_verdict(10 * 60, SRM, 2, 2) == "recover":
+    ok("a truly stale, fully-delivered run is still recovered under the new anchor (no false 'always skip')")
+else:
+    bad("REGRESSION: genuinely stranded run (10m since last verdict) not recovered, got %r"
+        % (m.stranded_verdict_verdict(10 * 60, SRM, 2, 2),))
+
+# ── Scenario 15f: _run_verdicts() derives last_delivered_epoch from CLOSED rows'
+#    updated_at (the MAX among them), never from an open/pending row ──────────
+print("Scenario 15f: _run_verdicts() last_delivered_epoch = newest updated_at among CLOSED verdict beads")
+def _fake_sh_verdicts(rows):
+    class _R:
+        def __init__(self):
+            self.returncode = 0
+            self.stdout = m.json.dumps(rows)
+    def _inner(args, timeout=25, stdin=None):
+        return _R()
+    return _inner
+_real_sh_rv = m.sh
+m.sh = _fake_sh_verdicts([
+    {"id": "v1", "assignee": "gate-reviewer-a", "status": "closed", "updated_at": "2026-07-17T09:00:00Z"},
+    {"id": "v2", "assignee": "gate-reviewer-b", "status": "closed", "updated_at": "2026-07-17T09:05:00Z"},
+    {"id": "v3", "assignee": "gate-reviewer-c", "status": "open",   "updated_at": "2026-07-17T09:59:59Z"},
+])
+names, delivered, total, last_delivered = m._run_verdicts("ga-wisp-fake")
+m.sh = _real_sh_rv
+want_epoch = m._iso_epoch("2026-07-17T09:05:00Z")
+if delivered == 2 and total == 3 and last_delivered == want_epoch:
+    ok("2/3 delivered; last_delivered_epoch is the newer CLOSED row's updated_at (09:05), ignoring the still-open row's later timestamp")
+else:
+    bad("expected (delivered=2, total=3, last_delivered=%r), got (delivered=%r, total=%r, last_delivered=%r)"
+        % (want_epoch, delivered, total, last_delivered))
+
+# ── Scenario 15g: drift-guard — the caller is actually wired to the new anchor ──
+print("Scenario 15g: drift-guard — reap_stranded_verdict_runs anchors on _run_verdicts' 4th value, not run started_at")
+src2 = open(wd_path).read()
+import re as _re_dg
+fn_match = _re_dg.search(r"def reap_stranded_verdict_runs\(now\):.*?(?=\ndef )", src2, _re_dg.S)
+if not fn_match:
+    bad("could not isolate reap_stranded_verdict_runs() body for drift-guard scan")
+else:
+    body = fn_match.group(0)
+    for needle, desc in [
+        ("_run_verdicts(rid)", "calls _run_verdicts for the primary sample"),
+        ("last_delivered", "binds the 4th (last-delivered-epoch) return value"),
+        ("stranded_verdict_verdict(age", "feeds the derived age into the pure decision function"),
+    ]:
+        if needle in body:
+            ok(desc)
+        else:
+            bad("MISSING in reap_stranded_verdict_runs(): %s (needle %r)" % (desc, needle))
+    if '_parse_run_field(desc, "started_at")' in body:
+        bad("REGRESSION ga-5t5w: reap_stranded_verdict_runs() reads started_at again — "
+            "the run-creation anchor is back, the original bug has returned")
+    else:
+        ok("no reference to started_at — the run-creation anchor was fully removed from FIX5's age computation")
+
 # ═══ ga-m1o5: Pilot-silence sleep/wake grace ══════════════════════════════════
 # Incident ga-me4x: a machine sleep spanning the 40min PILOT_STALL_SEC threshold
 # made pilot-dispatcher.log look "silent >40min" and triggered an unnecessary
