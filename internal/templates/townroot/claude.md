@@ -10,7 +10,21 @@ Your role is set by the GT_ROLE environment variable and injected by `{{cmd}} pr
 ## Dolt Server — Operational Awareness (All Agents)
 
 Dolt is the data plane for beads (issues, mail, identity, work history). It runs
-as a single server on port 3307 serving all databases. **It is fragile.**
+as a single server serving all databases. **It is fragile.**
+
+**Never hardcode or memorize Dolt's port or data_dir — derive them from the live
+server.** Both are **per-town**: they are materialized into a gitignored
+`.gc/runtime/packs/dolt/dolt-config.yaml`, so any number written into a doc is a
+guess that goes stale silently. This template used to say "port 3307"; on a real
+town it was **52756**, `~/gt/dolt-server.port` still said 3307, and 3307 simply
+refused connections — so tools pointed at it returned *empty*, which reads as
+"nothing is wrong" instead of "you asked the wrong server".
+
+```bash
+DOLT_PID=$(pgrep -f 'dolt sql-server' | head -1)
+ps -o command= -p "$DOLT_PID"                  # → --config <path>/dolt-config.yaml
+grep -E '^\s*(port|data_dir):' <that config>   # → the REAL port + data_dir
+```
 
 ### If you detect Dolt trouble
 
