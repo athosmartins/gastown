@@ -58,6 +58,7 @@ Poll loop (~5min). Silence = healthy. Emits on action only:
   [INFLIGHT-RECLAIM] [RECLAIMED]   cleared in-flight labels + reset <id> to open
   [INFLIGHT-RECLAIM] [RECLAIM-FAILED] label ops failed; bead may need manual cleanup
   [INFLIGHT-RECLAIM] [ESCALATED]   reclaim cap hit — needs human/Mayor review
+  [INFLIGHT-RECLAIM] [SELF-HEALED] restored a claim order:orphan-sweep wrongfully reset
   [INFLIGHT-RECLAIM] [STARTUP]     initial state snapshot
 
 Safety invariants (CRITICAL — actuates on real work beads):
@@ -104,6 +105,29 @@ Safety invariants (CRITICAL — actuates on real work beads):
     AskUserQuestion prompt (session_awaiting_human_input()) — waiting on a
     human decision is not death. Fails safe: a failed/ambiguous peek does NOT
     grant the exemption, so a genuinely frozen zombie is still reclaimed.
+
+ga-seuh4 / ga-a8t68 (self-heal a DIFFERENT component's false reset): a
+separate, non-Python mechanism — the `order:orphan-sweep` engine order
+(.gc/system/packs/maintenance/assets/scripts/orphan-sweep.sh, go:embed'd into
+the `gc` binary, NOT part of this file and not editable from this repo without
+a Mayor-coordinated engine rebuild+swap) independently resets in_progress
+dog/wa-worker-pool claims it judges orphaned. It already carries a
+CONFIRM_THRESHOLD=2-consecutive-sweep hysteresis (docs/runbooks/
+ga-u0vzx-orphan-sweep-hysteresis-engine-window.md), but that has proven
+insufficient: confirmed live re-occurrences (ga-adkny, ga-kq4jf x2, ga-0fw8g)
+show the underlying `gc session list --json` transient can persist across 2+
+consecutive ~5min sweeps for a freshly-spawned pool session, wrongfully
+resetting (status=open, assignee cleared) a claim whose session is still
+genuinely alive. Its reset never touches the bead's gc.* metadata
+(gc.session_name/gc.work_dir/gc.routed_to, written at claim time), so that
+metadata surviving alongside an empty assignee is a reliable tell.
+heal_orphan_sweep_false_resets() (called once per cycle, below) finds beads
+matching that tell and — ONLY if the stale gc.session_name still resolves to
+a live session — restores status=in_progress + assignee. This is a
+compensating heal, not a prevention: it cannot stop orphan-sweep's reset, but
+it closes the window before a competing worker races into the reopened bead,
+and it self-limits (a genuinely dead session is correctly left alone for
+normal re-dispatch).
 """
 import json
 import os
@@ -2104,6 +2128,174 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=N
 
 
 # ---------------------------------------------------------------------------
+# ga-seuh4 / ga-a8t68: self-heal order:orphan-sweep's false resets
+# ---------------------------------------------------------------------------
+
+def list_orphan_sweep_false_resets():
+    """List beads that look like a wrongful order:orphan-sweep reset:
+    status=open, no assignee, but gc.session_name/gc.routed_to metadata
+    (written at claim time) still intact — from HQ + all rig stores.
+
+    order:orphan-sweep resets a bead via `gc bd update <id> --status=open
+    --assignee=""` — it clears ONLY status+assignee, never the gc.* metadata
+    a dog/wa-worker-pool claim writes at claim time. A bead carrying that
+    metadata combination is therefore either (a) a claim orphan-sweep JUST
+    wrongfully reset while the session was still alive, or (b) a claim
+    orphan-sweep correctly reset because the session really did die. Both
+    look identical from this query alone — heal_orphan_sweep_false_resets()
+    disambiguates by checking live session state before acting on either.
+
+    Returns [] on query error (fail-safe: caller skips healing this cycle —
+    never worse than not healing at all, which was the pre-fix status quo).
+
+    NOTE: `bd list --has-metadata-key` is a single-value flag, not repeatable
+    — passing it twice silently keeps only the LAST occurrence (confirmed
+    live: `--has-metadata-key A --has-metadata-key B` returns exactly the
+    same set as `--has-metadata-key B` alone), it does NOT AND the two keys
+    together. So this only asks bd to filter on gc.session_name server-side;
+    the gc.routed_to requirement is enforced locally in the loop below.
+    """
+    def _has_both_keys(b):
+        meta = b.get("metadata") or {}
+        return bool(meta.get("gc.session_name")) and bool(meta.get("gc.routed_to"))
+
+    candidates = {}
+    try:
+        result = subprocess.run(
+            ["bd", "list", "--status", "open",
+             "--has-metadata-key", "gc.session_name",
+             "--no-assignee", "--json"],
+            capture_output=True, text=True, timeout=20)
+        if result.returncode == 0 and result.stdout.strip():
+            data = json.loads(result.stdout)
+            if isinstance(data, list):
+                for b in data:
+                    bid = b.get("id", "")
+                    if bid and _has_both_keys(b):
+                        b.setdefault("rig_root", None)
+                        candidates[bid] = b
+    except Exception:
+        pass  # HQ failure just yields fewer candidates; rig loop below is independent
+
+    for _rig_name, rig_path in _list_rig_stores():
+        try:
+            r = subprocess.run(
+                ["bd", "-C", rig_path, "list", "--status", "open",
+                 "--has-metadata-key", "gc.session_name",
+                 "--no-assignee", "--json"],
+                capture_output=True, text=True, timeout=20)
+            if r.returncode != 0 or not r.stdout.strip():
+                continue
+            rig_data = json.loads(r.stdout)
+            if not isinstance(rig_data, list):
+                continue
+            for b in rig_data:
+                bid = b.get("id", "")
+                if bid and bid not in candidates and _has_both_keys(b):
+                    b["rig_root"] = rig_path
+                    candidates[bid] = b
+        except Exception:
+            continue  # fail-open per rig store
+
+    return list(candidates.values())
+
+
+def heal_orphan_sweep_false_resets(sessions, now):
+    """Restore beads whose claim was wrongfully reset by order:orphan-sweep
+    (ga-seuh4/ga-a8t68) while the claiming session was still genuinely alive.
+
+    See the module docstring's "ga-seuh4 / ga-a8t68" section for the full
+    root-cause writeup. In short: orphan-sweep.sh is go:embed'd into the `gc`
+    binary and not editable from this repo (a hand-edit of the deployed copy
+    is auto-reverted by the engine's own reconcile within ~1-2min, per the
+    ga-u0vzx runbook's own empirical test) — a real fix needs a Mayor-
+    coordinated rebuild+swap. This is a compensating self-heal in the
+    meantime: it cannot stop orphan-sweep from resetting a bead, but it
+    detects the reset within one of THIS guard's own poll cycles (same ~5min
+    cadence as orphan-sweep's own sweep) and restores the claim before a
+    competing worker can race into the reopened bead — provided the original
+    session is still alive when this check runs.
+
+    Reuses concrete_adhoc_session_is_live() for the liveness check — the same
+    multi-field identifier matching + staleness/awaiting-human-input handling
+    already relied on elsewhere in this file, so a session that is
+    live-but-quiet (long extended-thinking turn, sub-agent tool call) is
+    correctly treated as alive, not left unhealed by this guard's own logic.
+
+    Fails safe in every direction: a candidate-query error yields []
+    (nothing healed, never worse than the pre-fix status quo); a bead already
+    re-claimed by someone else since the reset no longer matches the
+    --no-assignee query and is left alone; a session that is genuinely dead
+    (concrete_adhoc_session_is_live → False) is left open for normal
+    re-dispatch, exactly as orphan-sweep intended.
+
+    Returns count of beads healed this cycle.
+    """
+    candidates = list_orphan_sweep_false_resets()
+    if not candidates:
+        return 0
+    healed = 0
+    for b in candidates:
+        bead_id = b.get("id", "")
+        if not bead_id:
+            continue
+        meta = b.get("metadata") or {}
+        stale_assignee = meta.get("gc.session_name") or ""
+        if not stale_assignee:
+            continue
+        # Freshness guard: this metadata shape (open + unassigned + stale
+        # gc.session_name of a still-live session) is NOT unique to an
+        # orphan-sweep false-reset — a session that deliberately releases a
+        # duplicate claim (`bd update <id> -a "" -s open`, the standard
+        # stand-down move documented in dog-pool-slot-inherits-prior-
+        # incarnation-work precedent) leaves the identical shape behind,
+        # since a stand-down clears assignee/status but not gc.* metadata
+        # either. Healing THAT would silently undo a deliberate release.
+        # Bounding to beads updated within RECLAIM_TTL keeps this guard
+        # useful for its actual job (catching a reset within the next
+        # cycle or two after it happens) while limiting a wrong heal's
+        # blast radius: past this window, a stale claim is no longer a
+        # "just happened" event, and the normal stranding hysteresis below
+        # in run_cycle() already owns cleaning it up correctly either way.
+        bead_update_epoch = parse_iso_epoch(b.get("updated_at", ""))
+        if bead_update_epoch is None or (now - bead_update_epoch) > RECLAIM_TTL:
+            continue
+        if not concrete_adhoc_session_is_live(stale_assignee, sessions, now):
+            continue  # genuinely dead — leave for normal re-dispatch
+        rig_root = b.get("rig_root")
+        _bd = ["bd", "-C", rig_root] if rig_root else ["bd"]
+        try:
+            r = subprocess.run(
+                _bd + ["update", bead_id, "--status", "in_progress",
+                       "--assignee", stale_assignee],
+                capture_output=True, text=True, timeout=15)
+            if r.returncode != 0:
+                print(f"[INFLIGHT-RECLAIM] warn: self-heal update failed "
+                      f"bead={bead_id} rc={r.returncode}", flush=True)
+                continue
+        except Exception as exc:
+            print(f"[INFLIGHT-RECLAIM] warn: self-heal update exception "
+                  f"bead={bead_id}: {exc}", flush=True)
+            continue
+        healed += 1
+        try:
+            subprocess.run(
+                _bd + ["comment", bead_id,
+                       f"inflight-reclaim-guard self-heal (ga-seuh4/ga-a8t68): "
+                       f"restored to assignee={stale_assignee!r}, status=in_progress "
+                       f"after order:orphan-sweep wrongfully reset this claim while "
+                       f"the owning session was still live. Root cause: orphan-sweep.sh "
+                       f"is go:embed'd (can't be fixed from this repo without an engine "
+                       f"rebuild); this is a compensating heal, not a prevention."],
+                capture_output=True, text=True, timeout=15)
+        except Exception:
+            pass  # comment failure is non-fatal
+        emit(f"[INFLIGHT-RECLAIM] [SELF-HEALED] bead={bead_id} "
+             f"restored assignee={stale_assignee!r} (order:orphan-sweep false-reset)")
+    return healed
+
+
+# ---------------------------------------------------------------------------
 # gt-fppb0: dog-pool pre_start preflight driver
 # ---------------------------------------------------------------------------
 
@@ -2306,6 +2498,17 @@ def run_cycle(state, escalated_alerted):
     if sessions is None:
         print("[INFLIGHT-RECLAIM] session list failed — skipping cycle", flush=True)
         return len(beads), 0
+
+    # ga-seuh4/ga-a8t68: self-heal any bead order:orphan-sweep wrongfully
+    # reset while its session was still alive. Independent of the rest of
+    # this cycle's reclaim logic below (different candidate set: OPEN beads
+    # with a stale gc.session_name breadcrumb, not in-flight beads) — runs
+    # even if a later query in this cycle fails, since a stranded false-reset
+    # left unhealed only gets harder to recover the longer it waits.
+    try:
+        heal_orphan_sweep_false_resets(sessions, now)
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] warn: self-heal pass failed: {exc}", flush=True)
 
     # Deliberately-suspended crews: their in-flight beads HOLD (wait for resume), never
     # re-pool. Fail-open: empty set on probe error (current reclaim behavior preserved).
@@ -4242,6 +4445,189 @@ def _selftest():
                   "wa-worker-adhoc-deadbeef", _ah_adhoc_session, now=T_ah) is True)
     finally:
         subprocess.run = _orig_run_ah
+
+    # -----------------------------------------------------------------------
+    # Section SH: heal_orphan_sweep_false_resets() / list_orphan_sweep_false_resets()
+    # ga-seuh4/ga-a8t68: order:orphan-sweep (go:embed'd, not editable here)
+    # wrongfully resets live dog-pool claims; these two functions are a
+    # compensating self-heal added to this guard instead.
+    # -----------------------------------------------------------------------
+    global _list_rig_stores
+    _orig_list_rig_stores = _list_rig_stores
+    _list_rig_stores = lambda: []  # no rig stores in these hermetic tests
+    _orig_run_sh = subprocess.run
+
+    _sh_live_sessions = [
+        {"id": "sid-live1", "name": "gastown.dog-1", "session_name": "dog-galive1",
+         "alias": "gastown.dog-1", "agent_name": "gastown.dog-1", "state": "active"},
+    ]
+    T_sh = 2_000_000_000.0
+
+    def _sh_ts(seconds_ago):
+        return _irg_datetime.datetime.utcfromtimestamp(T_sh - seconds_ago).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _sh_bead(bead_id, stale_assignee, seconds_ago=60):
+        return {"id": bead_id, "status": "open", "assignee": "",
+                "updated_at": _sh_ts(seconds_ago),
+                "metadata": {"gc.routed_to": "gastown.dog",
+                             "gc.session_name": stale_assignee,
+                             "gc.work_dir": "/fake/work/dir"}}
+
+    # SH-1: candidate whose stale gc.session_name matches a LIVE session → healed.
+    _sh_update_calls = []
+
+    def _stub_sh_heal(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(0, json.dumps([_sh_bead("ga-shtest1", "dog-galive1")]))
+        if cmd[:2] == ["bd", "update"]:
+            _sh_update_calls.append(list(cmd))
+            return _FakeGitResult(0, "")
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh_heal
+    try:
+        _healed = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
+        check("SH-1: heals a candidate whose stale gc.session_name is still live",
+              _healed == 1, f"healed={_healed}")
+        check("SH-1b: issues bd update --status in_progress --assignee <stale-assignee>",
+              any(c[:2] == ["bd", "update"] and "in_progress" in c and "dog-galive1" in c
+                  for c in _sh_update_calls),
+              f"calls={_sh_update_calls!r}")
+    finally:
+        subprocess.run = _orig_run_sh
+
+    # SH-2: candidate whose stale gc.session_name matches no live session → left alone
+    # (genuinely dead — orphan-sweep's reset was correct, normal re-dispatch applies).
+    _sh_update_calls2 = []
+
+    def _stub_sh_dead(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(0, json.dumps([_sh_bead("ga-shtest2", "dog-galong-gone")]))
+        if cmd[:2] == ["bd", "update"]:
+            _sh_update_calls2.append(list(cmd))
+            return _FakeGitResult(0, "")
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh_dead
+    try:
+        _healed2 = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
+        check("SH-2: does NOT heal a candidate whose stale gc.session_name matches no live session",
+              _healed2 == 0 and _sh_update_calls2 == [],
+              f"healed={_healed2} calls={_sh_update_calls2!r}")
+    finally:
+        subprocess.run = _orig_run_sh
+
+    # SH-3: no candidates at all → 0 healed, zero bd update calls.
+    _sh_update_calls3 = []
+
+    def _stub_sh_empty(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(0, "[]")
+        if cmd[:2] == ["bd", "update"]:
+            _sh_update_calls3.append(list(cmd))
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh_empty
+    try:
+        _healed3 = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
+        check("SH-3: no candidates → 0 healed, no bd update calls",
+              _healed3 == 0 and _sh_update_calls3 == [])
+    finally:
+        subprocess.run = _orig_run_sh
+
+    # SH-4: candidate query itself fails (bd list errors) → fails safe, 0 healed.
+    def _stub_sh_query_fail(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(1, "")
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh_query_fail
+    try:
+        _healed4 = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
+        check("SH-4: candidate query failure fails safe (0 healed, no crash)",
+              _healed4 == 0)
+    finally:
+        subprocess.run = _orig_run_sh
+
+    # SH-5: bd update itself fails for a live-matched candidate → not counted
+    # healed, no crash (the next cycle will retry — session is still live).
+    def _stub_sh_update_fail(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(0, json.dumps([_sh_bead("ga-shtest5", "dog-galive1")]))
+        if cmd[:2] == ["bd", "update"]:
+            return _FakeGitResult(1, "")
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh_update_fail
+    try:
+        _healed5 = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
+        check("SH-5: bd update failure for a live candidate is not counted healed (no crash)",
+              _healed5 == 0)
+    finally:
+        subprocess.run = _orig_run_sh
+
+    # SH-6: candidate missing gc.session_name (defensive — the --has-metadata-key
+    # query should always populate it, but never act on an empty assignee).
+    def _stub_sh_no_meta(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(0, json.dumps(
+                [{"id": "ga-shtest6", "status": "open", "assignee": "", "metadata": {}}]))
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh_no_meta
+    try:
+        _healed6 = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
+        check("SH-6: candidate with no gc.session_name metadata is skipped, not crashed",
+              _healed6 == 0)
+    finally:
+        subprocess.run = _orig_run_sh
+
+    # SH-6b regression (real-data find): `bd list --has-metadata-key` is a
+    # single-value flag — passing it twice for two DIFFERENT keys silently
+    # keeps only the LAST one (confirmed against live data: a bead carrying
+    # ONLY gc.routed_to, e.g. a manually-routed non-pool task with no dog/
+    # wa-worker claim ever taken, matched a naive `--has-metadata-key
+    # gc.session_name --has-metadata-key gc.routed_to` query). Both keys
+    # must be required in Python, not left to the CLI flag alone.
+    def _stub_sh_routed_only(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(0, json.dumps(
+                [{"id": "ga-shtest6b", "status": "open", "assignee": "",
+                  "updated_at": _sh_ts(60),
+                  "metadata": {"gc.routed_to": "batista-lx"}}]))
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh_routed_only
+    try:
+        _healed6b = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
+        check("SH-6b: candidate with gc.routed_to but NO gc.session_name is skipped "
+              "(regression: --has-metadata-key does not AND across two keys)",
+              _healed6b == 0)
+    finally:
+        subprocess.run = _orig_run_sh
+
+    # SH-7: candidate whose updated_at is OLDER than RECLAIM_TTL is NOT healed,
+    # even though its stale gc.session_name still resolves to a live session —
+    # the freshness guard bounds this against silently undoing an old,
+    # deliberate stand-down release (same bd shape as an orphan-sweep false
+    # reset; see the guard's own comment in heal_orphan_sweep_false_resets).
+    def _stub_sh_stale_ts(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(0, json.dumps(
+                [_sh_bead("ga-shtest7", "dog-galive1", seconds_ago=RECLAIM_TTL + 60)]))
+        if cmd[:2] == ["bd", "update"]:
+            raise AssertionError("must not update a bead past the freshness window")
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh_stale_ts
+    try:
+        _healed7 = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
+        check("SH-7: candidate older than RECLAIM_TTL is NOT healed (freshness guard)",
+              _healed7 == 0)
+    finally:
+        subprocess.run = _orig_run_sh
+
+    _list_rig_stores = _orig_list_rig_stores
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0
