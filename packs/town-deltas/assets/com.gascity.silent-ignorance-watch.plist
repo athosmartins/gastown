@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.gascity.silent-ignorance-watch — o GATILHO do monitor da Ignorância Silenciosa.
+
+  ESTE ARQUIVO É O PONTO INTEIRO (ga-vkjs / wa-xvxs0). O scanner que acha a classe
+  existe desde 14/07 (ga-p5q3, thies) e ficou 2 DIAS em main sem ninguém agendar —
+  por isso a city "redescobriu" a classe do zero em 16/07, com ela já nomeada e com
+  detector pronto. Detector sem gatilho é igual a detector que não existe.
+  Se você for remover este plist, remova o scanner junto: manter um sem o outro é
+  manter a ilusão de cobertura, que é a própria classe.
+
+  Cadência: 1x/dia às 09:20. Por quê:
+   - o scan leva ~35s por root e varre todos os rigs — não é barato de repetir;
+   - o sinal é "alguém ESCREVEU o bug", que muda na escala de commits, não de minutos;
+   - 09:20 (e não madrugada) porque o alerta é pra ser LIDO: cai no começo do dia do
+     Athos, não às 4h junto do ruído dos jobs noturnos.
+  RunAtLoad=false de propósito: subir a máquina não é motivo pra alertar.
+
+  Alerta SÓ o que é NOVO desde o baseline (a dívida de ~291 achados é report-only e
+  não grita). E o watch FALHA ALTO (exit 3) se não conseguir varrer ou ler o baseline
+  — "não consegui olhar" nunca vira "não achei nada".
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gascity.silent-ignorance-watch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/silent-ignorance-watch.sh</string>
+        <string>--notify</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>9</integer>
+        <key>Minute</key><integer>20</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- PATH com ~/.local/bin PRIMEIRO: sem isso o `notify` não resolve sob launchd e
+         o alerta morre engolido — foi exatamente assim que 58 msgs sumiram caladas no
+         wa-mzfm0 (FileNotFoundError no notify, capturado e descartado). O watch já
+         resolve o notify por caminho absoluto E checa o rc, mas o PATH certo é a
+         segunda camada. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/athos/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/athos</string>
+        <key>GC_CITY_PATH</key>
+        <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/silent-ignorance-watch.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/silent-ignorance-watch.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
