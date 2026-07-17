@@ -622,7 +622,10 @@ log "Step 0b: Vector B reconcile — orphan gate-run:running beads (TTL=${GATE_R
 reviewers_alive_for_run() {
   local gr_id="$1" vbs assignees a present
   [ -z "$gr_id" ] && { echo 0; return; }
-  vbs=$(bd -C "$GC_CITY" list --json --all \
+  # ga-48xcv: routed through the read-cache shim — verdict_bead_count_for_run
+  # below issues this identical query for the same gr_id earlier in the same
+  # loop iteration; the shim collapses the pair into one live Dolt round-trip.
+  vbs=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --all \
     -l type:quality-gate-verdict -l "gate-run:$gr_id" 2>/dev/null || echo "[]")
   # Only OPEN verdict beads matter — a closed verdict means the reviewer finished.
   assignees=$(printf '%s\n' "$vbs" \
@@ -655,7 +658,8 @@ verdict_bead_count_for_run() {
   # failed query with 0 verdicts — ga-jfo7 attempt 2). The `if` keeps `set -euo
   # pipefail` from aborting on a nonzero bd exit; verdict_count_from_query then maps
   # rc!=0 to "unknown" so the caller fail-safes instead of superseding a healthy run.
-  if vbs=$(bd -C "$GC_CITY" list --json --all \
+  # ga-48xcv: routed through the read-cache shim (see reviewers_alive_for_run).
+  if vbs=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --all \
       -l type:quality-gate-verdict -l "gate-run:$gr_id" 2>/dev/null); then
     rc=0
   else
@@ -734,7 +738,12 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
     MARKER_ACTIVE=0
     MARKER_AGE="$GR_AGE"   # fallback only — overwritten below whenever the marker itself is readable
     if [ -n "$COMPANION_MARKER_ID" ]; then
-      MARKER_JSON=$(bd -C "$GC_CITY" show "$COMPANION_MARKER_ID" --json 2>/dev/null || echo "")
+      # ga-48xcv: routed through the read-cache shim — a status/liveness lookup
+      # whose worst-case staleness (default 5s TTL) is a briefly-delayed reap
+      # of an orphan gate-run tracking bead on the next ~2min sweep, not a
+      # correctness issue (the shim never caches writes; see its header note
+      # on call sites that gate close/requeue decisions).
+      MARKER_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" show "$COMPANION_MARKER_ID" --json 2>/dev/null || echo "")
       if [ -n "$MARKER_JSON" ]; then
         MARKER_LABELS=$(printf '%s\n' "$MARKER_JSON" \
           | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' \
