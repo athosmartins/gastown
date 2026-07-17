@@ -306,10 +306,22 @@ run_scan() {
   # Shared prune list — worktree copies, backups, and vendored deps would
   # otherwise multiply the same finding once per copy. Applied identically to
   # every find below so coverage doesn't quietly differ by file type.
+  # ga-ypl5l: o buraco era de ESCOPO (distinto do ga-50m2, que é de CLASSIFICAÇÃO). Medido:
+  # whatsapp_automation tinha 211.282 arquivos .sh/.py, ~1.369 canônicos — 154x de varredura
+  # à toa. A causa não é um dir, é uma CLASSE de dirs: cópias do repo (crew/<nome>, worktrees
+  # .wt-*, .viewer-deploy-clone, .gc-worktrees) e deps Python (venv/site-packages). Cada cópia
+  # multiplica o MESMO achado, e o volume afogava o --seed do monitor (>14min) — e um job
+  # agendado que estoura por volume é a própria classe (timeout lido como "nada novo").
+  # Excluo por CLASSE, não caçando nome a nome: qualquer dir-ponto (.wt-*, .viewer-*,
+  # .gc-*, .claude) + crew/ + as deps Python. NÃO exclua o root em si — só as cópias DENTRO.
   local -a EXCL=(
     -not -path '*/.gc-worktrees/*' -not -path '*/.gc-worktrees-adhoc/*'
     -not -path '*/.gc/*' -not -path '*/backup/*' -not -path '*/.dolt-backup/*'
     -not -path '*/.local-patches/*' -not -path '*/node_modules/*'
+    -not -path '*/crew/*'
+    -not -path '*/.wt-*' -not -path '*/.viewer-deploy-clone/*' -not -path '*/.claude/*'
+    -not -path '*/venv/*' -not -path '*/.venv/*'
+    -not -path '*/site-packages/*' -not -path '*/__pycache__/*'
   )
 
   local f
