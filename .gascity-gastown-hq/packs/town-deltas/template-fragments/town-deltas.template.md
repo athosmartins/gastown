@@ -91,4 +91,26 @@ startswith() sobre o prefixo, já que --exclude-label só casa exato); a probe
 nativa de DOG ainda não tem esse filtro (gap separado, provavelmente
 engine-side — se um bead já-refused reaparecer no seu hook, não tente
 consertar a query você mesmo, nudge o Mayor).
+
+**Editando `packs/town-deltas/assets/` (o arquivo mais disputado da cidade)?
+Worktree ANTES do primeiro Edit, não só na hora de shipar (ga-kgja).** A
+árvore `~/gt` é COMPARTILHADA entre Mayor, dogs e crews, sem isolamento por
+sessão — um `git add <arquivo>`/`git commit -a` de QUALQUER sessão stageia o
+ARQUIVO INTEIRO, incluindo edições não-commitadas de OUTRO agente no mesmo
+arquivo, e quem commita não percebe (reporta sucesso; o diff que foi não é o
+diff que ele pensa que fez). Já custou 2 incidentes no mesmo arquivo
+(`quality-gate-dispatcher.sh`): um commit do Mayor (055cc4f5) levou junto um
+fix de dog ainda não-commitado; antes, um dog varreu edições do Mayor num
+CLAUDE.md de rig. Fix: `git worktree add .gc-worktrees/<nome> -b
+fix/<bead>-<desc> HEAD` ANTES de tocar no arquivo — não no fim do trabalho.
+Só edite a raiz compartilhada direto pra investigação read-only (Read/grep/
+baseline), nunca pra fazer o fix em si.
+
+**Commitando na árvore compartilhada (qualquer arquivo)? Confira o staged
+antes — nunca `git add -A`/`git commit -a` às cegas (ga-kgja).** Norma geral,
+além do caso acima: `git add -p` (interativo) OU `git diff --cached` antes de
+qualquer commit em `~/gt` — garante que o que você stageou é só o que VOCÊ
+editou nesta sessão. `git add -A`/`git commit -a` sem conferir assume que o
+resto da árvore está limpo, e numa árvore com várias sessões concorrentes
+isso quase nunca é verdade.
 {{ end }}
