@@ -153,17 +153,35 @@ echo "── 8. drift-guard: ga-u4yi — AUTHOR (not just Mayor) is mailed at ev
 # total silence because only the Mayor was mailed — the AUTHOR had no durable
 # signal, only an ephemeral bd comment. Fix: mail "$AUTHOR" (survives a dead/
 # restarted session, unlike nudge) at EVERY site that applies gate:needs-human.
-# There are exactly 6 such sites: no_branch/rescuable-park (ga-acb), no_branch/
-# escalate-dirty-worktree (ga-tgwq — added after this guard was written, fixed
-# for the missing author-mail by ga-y43lq), ahead_dead, behind_dead, retry_dead,
-# cap-exhaustion.
-# (ga-5kx3 already bumped this 4→5 in main, in parallel with the ga-u4yi drive-by on this
-# branch — same count, kept the main version on cherry-pick. ga-y43lq bumped 5→6 for the
-# ga-tgwq escalate site this magic number silently missed (adding a site never changes an
-# existing count, so a stale N never goes RED on its own — see ga-huaxo, which replaces
-# this magic number with a bijection guard next so this class of gap can't recur).
-eq "gate mails AUTHOR at all 6 gate:needs-human sites (ga-u4yi)" \
-   "$(grep -c 'mail send "\$AUTHOR"' "$GATE")" "6"
+# ga-huaxo: BIJECTION, not a magic count. The old guard asserted `grep -c mail == N`
+# with N hardcoded — so every legitimate new needs-human site left the guard RED until a
+# human bumped N by hand (exactly what happened: a 5th site shipped WITH its mail, the
+# count stayed 4, the selftest went RED, nobody noticed). That is maintenance-by-
+# enumeration: a magic number lies by default, and a chronically-RED guard can no longer
+# distinguish "someone added a legit site" from "someone added a SILENT park" — the exact
+# thing this guard exists to catch. The structural invariant is: EVERY line that applies
+# gate:needs-human has a `mail send "$AUTHOR"` within the same escalation block (measured
+# window: the site→mail distance is 13–20 lines across all current sites, so 40 is safe).
+# A future Nth site WITH its mail passes untouched; a SILENT site fails, naming its line.
+# (This subsumes the old 4→5→6 hand-bumped count, incl. ga-y43lq's fix of the ga-tgwq
+# escalate-dirty-worktree site — the bijection scan finds that site's mail automatically,
+# no count to bump. It also self-updates for sites added by unrelated work, e.g. ga-lxz5w's
+# sibling-branch-race site — if such a site is itself missing its author-mail, this guard
+# names its line instead of staying silently green.)
+NEEDS_HUMAN_SITES=$(grep -nE 'label add[[:space:]]+"\$BEAD_ID"[[:space:]]+"gate:needs-human"' "$GATE" \
+  | grep -v 'gate:needs-human:' | cut -d: -f1)
+_bij_ok=1; _bij_bad_line=""
+for _site in $NEEDS_HUMAN_SITES; do
+  if ! sed -n "${_site},$((_site + 40))p" "$GATE" | grep -q 'mail send "\$AUTHOR"'; then
+    _bij_ok=0; _bij_bad_line="$_site"; break
+  fi
+done
+_n_sites=$(printf '%s\n' "$NEEDS_HUMAN_SITES" | grep -c .)
+if [ "$_bij_ok" = 1 ] && [ "$_n_sites" -ge 1 ]; then
+  ok "every gate:needs-human site ($_n_sites) has an adjacent AUTHOR mail (ga-huaxo bijection, no magic count)"
+else
+  bad "gate:needs-human site at line $_bij_bad_line has NO AUTHOR mail within 40 lines — a SILENT park (ga-u4yi/ga-huaxo)"
+fi
 grep -q 'mail send "\$AUTHOR"' "$GATE" \
   && ok "gate escalates to the AUTHOR, not just Mayor" \
   || bad "gate still only mails Mayor — author has no durable needs-human signal (ga-u4yi regression)"
