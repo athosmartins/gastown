@@ -2330,11 +2330,22 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
     # coexistence IS the manual clear's signature, and a reset always adds
     # a LOWER number than the stale one it's resetting — so MAX silently
     # discarded every manual clear (0 added alongside a stale N>0 always
-    # resolved to N). Take the MIN instead: the human's reset always wins
-    # over a stale automatic counter, and when only one counter exists
-    # (the normal case) MIN == MAX, so this is a no-op for the common path.
-    PREV_ATTEMPT=$(printf '%s' "$SRC_LABELS" | tr ' ' '\n' \
-      | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | head -1)
+    # resolved to N). Plain MIN over-corrects, though — the reviewer (ga-wisp-198xqe)
+    # showed coexistence is NOT manual-clear-only. The "Bump the attempt counter" loop
+    # below removes each stale label with `bd ... label remove ... || true`; a transient
+    # Dolt hiccup (routine here — hence the `|| true`) leaves the stale label behind, so
+    # the AUTOMATIC path alone can produce {1,2}. MIN reads that as 1 and the counter
+    # STALLS below the cap: silent, unbounded, machine-only retries — worse than the
+    # ignored-reset bug (which at least has a human in the loop). So: an explicit `:0`
+    # is the RESET SENTINEL and always wins (the human's clear); with no `:0`, take MAX
+    # so a {1,2} residue still advances toward GATE_FIX_CAP instead of stalling.
+    _ATTEMPTS=$(printf '%s' "$SRC_LABELS" | tr ' ' '\n' \
+      | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p')
+    if printf '%s\n' "$_ATTEMPTS" | grep -qx 0; then
+      PREV_ATTEMPT=0                                              # reset sentinel → reset wins
+    else
+      PREV_ATTEMPT=$(printf '%s\n' "$_ATTEMPTS" | sort -n | tail -1)   # else MAX (cap-safe)
+    fi
     [ -z "$PREV_ATTEMPT" ] && PREV_ATTEMPT=0
 
     # (a) ATTACH FEEDBACK TO THE SOURCE BEAD — durable, machine-readable marker

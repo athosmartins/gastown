@@ -29,19 +29,24 @@ eq()  { if [ "$2" = "$3" ]; then ok "$1 (=$2)"; else bad "$1: expected [$3], got
 
 # ── The exact parsers used by the dispatchers ────────────────────────────────
 # Attempt counter — gate side reads SPACE-separated labels; pilot side reads
-# COMMA-separated. Both take the MIN numeric suffix (default 0).
-# ga-26df: coexisting counters happen ONLY via a manual clear (a lower
-# number added alongside a stale higher one left by the last automatic
-# increment — the automatic path always removes stale counters before
-# adding its own, so it alone can never leave more than one behind). MAX
-# used to be taken here, which silently discarded every manual clear (0
-# alongside a stale N>0 always resolved to N, defeating the reset). MIN is
-# correct: the human's reset always wins, and when only one counter exists
-# (the normal case) MIN == MAX, so single-counter behavior is unchanged.
+# COMMA-separated. Semantics (ga-26df, refined after ga-wisp-198xqe):
+#   - an explicit `:0` is the RESET SENTINEL and always wins (a human's manual clear);
+#   - otherwise take MAX.
+# Why not plain MIN: coexistence is NOT manual-clear-only. The dispatcher's bump loop
+# removes stale labels with `bd ... label remove ... || true`; a transient Dolt hiccup
+# (routine here) leaves the old one behind, so the AUTOMATIC path alone can yield {1,2}.
+# MIN reads that as 1 → the counter STALLS below the cap (silent unbounded machine-only
+# retries). MAX reads 2 → keeps advancing to GATE_FIX_CAP. The `:0`-override recovers the
+# manual-clear case (a reset stamps :0, which wins) without the MIN stall.
+_attempt() {  # stdin: newline-separated numeric suffixes
+  local nums; nums=$(cat)
+  if printf '%s\n' "$nums" | grep -qx 0; then echo 0
+  else printf '%s\n' "$nums" | sort -n | tail -1; fi
+}
 attempt_from_space() { printf '%s' "$1" | tr ' ' '\n' \
-  | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | head -1; }
+  | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | _attempt; }
 attempt_from_comma() { printf '%s' "$1" | tr ',' '\n' \
-  | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | head -1; }
+  | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | _attempt; }
 # GATE-FEEDBACK selector — newest comment whose .text starts with GATE-FEEDBACK.
 feedback_select() { jq -r '[ .[]? | (.text // .body // "") | select(test("^GATE-FEEDBACK")) ] | last // ""'; }
 
@@ -49,15 +54,25 @@ echo "── 1. attempt-counter parser (gate: space-separated) ──"
 eq "no counter → 0 (empty after default)" "$(x=$(attempt_from_space 'lane:small story:approved'); echo "${x:-0}")" "0"
 eq "single counter :1"  "$(attempt_from_space 'gate:needs-fix gate:fix-attempt:1')" "1"
 eq "single counter :3"  "$(attempt_from_space 'tech-debt gate:fix-attempt:3 gate:failed')" "3"
-eq "min of duplicates (ga-26df: manual clear beats stale higher counter)" \
-   "$(attempt_from_space 'gate:fix-attempt:1 gate:fix-attempt:2')" "1"
+# ga-wisp-198xqe: a {1,2} residue is the AUTOMATIC path (a failed `|| true` removal),
+# NOT a manual clear. It must read as MAX (2) so the counter keeps advancing toward the
+# cap — plain MIN read it as 1 and STALLED the circuit-breaker (silent infinite retries).
+eq "automatic residue {1,2} → MAX 2 (keeps advancing to cap, no stall)" \
+   "$(attempt_from_space 'gate:fix-attempt:1 gate:fix-attempt:2')" "2"
+eq "automatic residue {2,3} → MAX 3 (reaches cap → escalates, not stalls)" \
+   "$(attempt_from_space 'gate:fix-attempt:2 gate:fix-attempt:3')" "3"
+# The reset sentinel :0 wins even against a stale cap-exhausted 3 — a human cleared it.
 eq "ga-26df acceptance: clear-to-0 alongside stale cap-exhausted 3 → resolves 0, not 3" \
    "$(attempt_from_space 'gate:needs-human gate:fix-attempt:3 gate:fix-attempt:0')" "0"
+eq ":0 beats a whole stale ladder {0,1,2,3} → 0 (reset wins over any residue)" \
+   "$(attempt_from_space 'gate:fix-attempt:3 gate:fix-attempt:2 gate:fix-attempt:1 gate:fix-attempt:0')" "0"
 
 echo "── 2. attempt-counter parser (pilot: comma-separated) ──"
 eq "comma single :2"    "$(attempt_from_comma 'lane:small,gate:needs-fix,gate:fix-attempt:2')" "2"
-eq "comma min of duplicates (ga-26df, pilot side)" \
+eq "comma :0 reset wins (ga-26df, pilot side)" \
    "$(attempt_from_comma 'gate:needs-fix,gate:fix-attempt:3,gate:fix-attempt:0')" "0"
+eq "comma automatic residue {1,2} → MAX 2 (pilot side, no stall)" \
+   "$(attempt_from_comma 'gate:needs-fix,gate:fix-attempt:1,gate:fix-attempt:2')" "2"
 eq "comma no counter→0" "$(x=$(attempt_from_comma 'story:approved,gate:needs-fix'); echo "${x:-0}")" "0"
 
 echo "── 3. cap decision (PREV >= CAP → escalate; else increment) ──"
@@ -82,16 +97,26 @@ echo "── 5. drift-guard: gate dispatcher still implements the loop ──"
 grep -q 'gate:needs-fix'                 "$GATE" && ok "gate sets gate:needs-fix"           || bad "gate missing gate:needs-fix"
 grep -q 'gate:needs-human'               "$GATE" && ok "gate sets gate:needs-human"         || bad "gate missing gate:needs-human"
 grep -q 'gate:fix-attempt:'              "$GATE" && ok "gate bumps fix-attempt counter"     || bad "gate missing fix-attempt counter"
-# ga-26df: pin MIN (head -1), not MAX (tail -1), on the fix-attempt parser in
-# BOTH dispatchers — a future edit reverting either back to tail -1 silently
-# re-defeats manual clears and this drift-guard is the only thing that would
-# notice (the unit tests above exercise a local mirror, not these files).
-grep -Fq "gate:fix-attempt:\\([0-9]\\{1,\\}\\)\$/\\1/p' | sort -n | head -1" "$GATE" \
-  && ok "gate fix-attempt parser takes MIN (head -1)" \
-  || bad "gate fix-attempt parser is not head -1 — MAX regression would re-defeat manual clears (ga-26df)"
-grep -Fq "gate:fix-attempt:\\([0-9]\\{1,\\}\\)\$/\\1/p' | sort -n | head -1" "$PILOT" \
-  && ok "pilot fix-attempt parser takes MIN (head -1)" \
-  || bad "pilot fix-attempt parser is not head -1 — MAX regression would re-defeat manual clears (ga-26df)"
+# ga-26df (refined, ga-wisp-198xqe): the parser in BOTH dispatchers must implement
+# `:0`-override-else-MAX, NOT plain MIN (head -1, which stalls on a {1,2} residue) and
+# NOT plain MAX (tail -1 alone, which discards manual clears). The signature of the right
+# shape is a `grep -qx 0` reset check paired with a `sort -n | tail -1` fallback. A future
+# edit collapsing either back to a single head -1 / tail -1 re-introduces one of the two
+# bugs, and this drift-guard is the only thing that would notice (the unit tests above
+# exercise a local mirror, not these files).
+for _f in "$GATE" "$PILOT"; do
+  _n=$(basename "$_f")
+  if grep -q 'grep -qx 0' "$_f" && grep -Fq "sed -n 's/^gate:fix-attempt:\\([0-9]\\{1,\\}\\)\$/\\1/p'" "$_f"; then
+    ok "$_n fix-attempt parser is :0-override-else-MAX (not plain MIN/MAX)"
+  else
+    bad "$_n fix-attempt parser lost the :0-override guard — MIN stall or MAX clear-discard regression (ga-26df)"
+  fi
+  if grep -Eq "gate:fix-attempt:.*sort -n \\| head -1" "$_f"; then
+    bad "$_n still has a plain 'sort -n | head -1' on fix-attempt — MIN stall regression (ga-wisp-198xqe)"
+  else
+    ok "$_n has no plain MIN (head -1) on fix-attempt"
+  fi
+done
 grep -q 'GATE-FEEDBACK'                  "$GATE" && ok "gate attaches GATE-FEEDBACK"         || bad "gate missing GATE-FEEDBACK"
 grep -q 'GATE_FIX_CAP=3'                 "$GATE" && ok "gate cap = 3"                        || bad "gate missing cap=3"
 grep -Eq 'assign "\$BEAD_ID" ""'         "$GATE" && ok "gate clears source assignee"        || bad "gate does not clear assignee"
@@ -128,9 +153,13 @@ echo "── 8. drift-guard: ga-u4yi — AUTHOR (not just Mayor) is mailed at ev
 # total silence because only the Mayor was mailed — the AUTHOR had no durable
 # signal, only an ephemeral bd comment. Fix: mail "$AUTHOR" (survives a dead/
 # restarted session, unlike nudge) at EVERY site that applies gate:needs-human.
-# There are exactly 4 such sites: no_branch, ahead_dead, retry_dead, cap-exhaustion.
-eq "gate mails AUTHOR at all 4 gate:needs-human sites (ga-u4yi)" \
-   "$(grep -c 'mail send "\$AUTHOR"' "$GATE")" "4"
+# ga-26df note: this was 4 and is now 5 — a fifth legitimate needs-human site (the
+# base-behind/diverged rebase path) was added without updating this guard, so it was
+# already RED on main before this branch touched anything. Verified all 5 are real
+# transitions (cap-exhausted, branch-gone, diverged, base-behind, rebase-failed — grep
+# the subject lines), so the right fix is to track the count, not to suppress it.
+eq "gate mails AUTHOR at all 5 gate:needs-human sites (ga-u4yi; was 4, +base-behind)" \
+   "$(grep -c 'mail send "\$AUTHOR"' "$GATE")" "5"
 grep -q 'mail send "\$AUTHOR"' "$GATE" \
   && ok "gate escalates to the AUTHOR, not just Mayor" \
   || bad "gate still only mails Mayor — author has no durable needs-human signal (ga-u4yi regression)"
