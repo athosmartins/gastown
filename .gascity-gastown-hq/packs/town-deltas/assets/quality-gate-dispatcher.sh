@@ -207,6 +207,13 @@ GATE_SPAWN_STAGGER_SECS="${GATE_SPAWN_STAGGER_SECS:-3}"
 case "$GATE_SPAWN_STAGGER_SECS" in ''|*[!0-9]*) GATE_SPAWN_STAGGER_SECS=3 ;; esac
 [ "$GATE_SPAWN_STAGGER_SECS" -gt 15 ] 2>/dev/null && GATE_SPAWN_STAGGER_SECS=15
 
+# ga-p4g6: raw-diff line budget embedded in the reviewer task text. Below this,
+# the full diff is shown verbatim and the header says so plainly. At/above it,
+# the diff is truncated on WHOLE-FILE boundaries (never mid-hunk) and the header
+# switches to PARTIAL with real counts + the omitted file list — see Step 7.
+GATE_DIFF_LINE_BUDGET="${GATE_DIFF_LINE_BUDGET:-2000}"
+case "$GATE_DIFF_LINE_BUDGET" in ''|*[!0-9]*) GATE_DIFF_LINE_BUDGET=2000 ;; esac
+
 # ── ga-dupnv (bug 2 root): bound reviewer task-delivery so a hung `gc session
 # nudge/submit` cannot blow the sweep's wall-clock budget. Observed live
 # (crew/thies/wa-86jr, run ga-wisp-o30v41): the `--delivery queue` nudge for
@@ -4993,9 +5000,66 @@ log "Gate-run bead: $GATE_RUN_ID"
 # The dispatcher polls these beads for closed status + verdict label.
 
 DIFF_SUMMARY=$(git_rig diff --stat "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null | tail -5 | tr '\n' ' ' | cut -c1-300 || true)
-# Note: "|| true" suppresses SIGPIPE (exit 141) from `head` truncating a large diff under pipefail.
-# Without it, the git diff process is killed by SIGPIPE when head exits, causing the script to abort.
-DIFF_FULL=$(git_rig diff "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null | head -2000 || true)
+
+# ga-p4g6: the old `head -2000` truncation sliced through diff hunks mid-file
+# AND the header unconditionally said "FULL DIFF (first 2000 lines)" — "full"
+# and "silently truncated at 45%" rendered as IDENTICAL text, so a reviewer
+# trusting the header had no way to know 9 of 20 changed files (including the
+# one with the real bug) were never shown. Measured impact: 14% of live
+# branches (3/21 sampled) truncate silently; the worst cases show reviewers as
+# little as 25-38% of the actual change.
+#
+# Fix: capture the full diff ONCE (avoid a 2nd/3rd `git diff` invocation), and
+# if it exceeds the budget, rebuild it by walking $CHANGED_FILES in order and
+# including each file's diff WHOLE — stopping before the file that would blow
+# the budget, never inside one. The header then states real numbers and names
+# every omitted file, so "I reviewed the change" and "I reviewed part of the
+# change" can no longer produce the same text.
+#
+# Note: "|| true" suppresses SIGPIPE (exit 141) if a downstream consumer of
+# this output truncates under pipefail — kept from the original for parity.
+DIFF_RAW=$(git_rig diff "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null || true)
+if [ -z "$DIFF_RAW" ]; then
+  DIFF_RAW_TOTAL_LINES=0
+else
+  DIFF_RAW_TOTAL_LINES=$(printf '%s\n' "$DIFF_RAW" | wc -l | tr -d ' ')
+fi
+
+if [ "$DIFF_RAW_TOTAL_LINES" -le "$GATE_DIFF_LINE_BUDGET" ]; then
+  DIFF_FULL="$DIFF_RAW"
+  DIFF_HEADER="FULL DIFF (complete — $DIFF_RAW_TOTAL_LINES lines across $DIFF_FILE_COUNT file(s), nothing omitted):"
+else
+  DIFF_FULL=""
+  _DIFF_SHOWN_LINES=0
+  _DIFF_SHOWN_FILES=0
+  DIFF_OMITTED_FILES=""
+  while IFS= read -r _df; do
+    [ -z "$_df" ] && continue
+    _FILE_DIFF=$(git_rig diff "origin/$DEFAULT_BRANCH...origin/$BRANCH" -- "$_df" 2>/dev/null || true)
+    _FILE_DIFF_LINES=$(printf '%s\n' "$_FILE_DIFF" | wc -l | tr -d ' ')
+    # Always take at least the first file whole (even if it alone exceeds the
+    # budget) — one complete file beats zero, and this still never cuts a hunk.
+    if [ $((_DIFF_SHOWN_LINES + _FILE_DIFF_LINES)) -le "$GATE_DIFF_LINE_BUDGET" ] || [ "$_DIFF_SHOWN_FILES" = "0" ]; then
+      DIFF_FULL="${DIFF_FULL}${_FILE_DIFF}
+"
+      _DIFF_SHOWN_LINES=$((_DIFF_SHOWN_LINES + _FILE_DIFF_LINES))
+      _DIFF_SHOWN_FILES=$((_DIFF_SHOWN_FILES + 1))
+    else
+      DIFF_OMITTED_FILES="${DIFF_OMITTED_FILES}  - ${_df}
+"
+    fi
+  done <<< "$CHANGED_FILES"
+
+  if [ "$IS_CONTAINER_RIG" = "1" ]; then
+    DIFF_ESCAPE_HATCH_CMD="git --git-dir=$GIT_DIR_PATH diff origin/$DEFAULT_BRANCH...origin/$BRANCH"
+  else
+    DIFF_ESCAPE_HATCH_CMD="cd $RIG_PATH && git diff origin/$DEFAULT_BRANCH...origin/$BRANCH"
+  fi
+
+  DIFF_HEADER="PARTIAL DIFF — showing $_DIFF_SHOWN_FILES of $DIFF_FILE_COUNT files ($_DIFF_SHOWN_LINES of $DIFF_RAW_TOTAL_LINES total diff lines). DO NOT treat the omitted files below as reviewed — you have not seen them:
+OMITTED FILES ($((DIFF_FILE_COUNT - _DIFF_SHOWN_FILES))):
+${DIFF_OMITTED_FILES}To review the FULL diff yourself: $DIFF_ESCAPE_HATCH_CMD"
+fi
 
 VERDICT_BEAD_IDS=()
 SESSION_IDS=()
@@ -5093,7 +5157,7 @@ $CHANGED_FILES
 DIFF SUMMARY:
 $DIFF_SUMMARY
 
-FULL DIFF (first 2000 lines):
+$DIFF_HEADER
 $DIFF_FULL
 
 --- YOUR TASK ---
