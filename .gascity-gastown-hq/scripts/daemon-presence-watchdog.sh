@@ -23,6 +23,20 @@
 # One-shots (suavez-first-watch self-unloads by design) and deprecated jobs are
 # deliberately ABSENT from this list — they are never auto-resurrected.
 # Override the set with DPW_CRITICAL (space-list of labels).
+#
+# ga-vkjs — por que com.gascity.silent-ignorance-watch entrou nesta lista (não remova sem ler):
+#   Ele é o monitor da Ignorância Silenciosa, e tem uma propriedade que o torna DEPENDENTE deste
+#   watchdog: ele só ALERTA quando acha algo NOVO. Num dia saudável ele sai calado (exit 0, zero
+#   ntfy) — de propósito, pra não virar ruído. Consequência: **o silêncio dele é ambíguo entre
+#   "vivo e sem novidade" e "morto"**. Ele não consegue detectar a própria ausência — que é
+#   exatamente a classe que ele existe pra caçar.
+#   Precedente que prova o risco: o scanner do ga-p5q3 (thies) ficou 2 dias em main SEM ser
+#   agendado e ninguém notou, porque "detector calado" parecia "sem bug". A city redescobriu a
+#   classe do zero por causa disso.
+#   ⇒ Este watchdog é o dono da liveness dele. Se o plist for descarregado, aqui dá ABSENT em
+#     <5min, recarrega e alerta. É a única coisa que impede o monitor de morrer em silêncio.
+#   Nota: é um job de CALENDÁRIO (09:20/dia), não StartInterval — o _loaded() usa
+#   `launchctl list <label>`, que vale igual pra os dois.
 set -uo pipefail
 
 LAUNCH_DIR="${DPW_LAUNCH_DIR:-$HOME/Library/LaunchAgents}"
@@ -35,7 +49,7 @@ DPW_RELOAD="${DPW_RELOAD:-1}"     # 1 = auto-reload absent critical daemons; 0 =
 # system sleep, NOT to a hung daemon); 0 = legacy behaviour (flag regardless).
 DPW_WAKE_GRACE="${DPW_WAKE_GRACE:-1}"
 
-DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector com.gascity.lifecycle-coherence-janitor com.gascity.crew-autopin-guard com.gascity.lifecycle-correctness-auditor com.gascity.throughput-stall-watchdog com.gascity.gate-throughput-stall-watchdog com.gascity.git-lock-hygiene com.gascity.crew-liveness-probe com.gascity.agent-stuck-escalation com.gascity.quorum-convergence-watchdog com.gascity.approved-state-reconciler com.gascity.auto-rehome-janitor com.gascity.sling-task-janitor com.gascity.gate-marker-rehome-janitor}"
+DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector com.gascity.lifecycle-coherence-janitor com.gascity.crew-autopin-guard com.gascity.lifecycle-correctness-auditor com.gascity.throughput-stall-watchdog com.gascity.gate-throughput-stall-watchdog com.gascity.git-lock-hygiene com.gascity.crew-liveness-probe com.gascity.agent-stuck-escalation com.gascity.quorum-convergence-watchdog com.gascity.approved-state-reconciler com.gascity.auto-rehome-janitor com.gascity.sling-task-janitor com.gascity.gate-marker-rehome-janitor com.gascity.silent-ignorance-watch}"
 
 HQ="${DPW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 
