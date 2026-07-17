@@ -956,6 +956,30 @@ GCSTUB20
   grep -q "FAILING: com.gascity.alpha" "$LOG" && ok "log contains FAILING for exit=1 (unchanged behavior)" || bad "log missing FAILING line for exit=1 regression"
   grep -q "OOM-KILLED: com.gascity.alpha" "$LOG" && bad "log wrongly contains OOM-KILLED for exit=1" || ok "log does NOT say OOM-KILLED for exit=1"
 
+  echo "Scenario 26 (ga-nvef × ga-g92h): OOM-killed exit crash-looping with in-budget autoheal → mail stays suppressed, not reclassified as OOM-KILLED"
+  # Neither original fix could test this interaction — ga-nvef's healing_inflight
+  # suppression and ga-g92h's OOM classification were written against different
+  # bases. This proves the merged ordering (suppression check wraps the
+  # classification) holds: an in-budget heal silences imp05's mail regardless of
+  # WHY the exit crossed threshold, exactly like a plain exit=1 in scenario 18.
+  : > "$STATE"; rm -rf "${STATE}.crashloop-heals" "${STATE}.fail-counts"
+  : > "$DPW_TEST_KICKSTARTS"
+  MAILSENT26="$TMP/mailsent26"; : > "$MAILSENT26"
+  cat > "$TMP/gc" <<GCSTUB26
+#!/usr/bin/env bash
+[ "\$1" = "mail" ] && echo "\$*" >> "$MAILSENT26"
+exit 0
+GCSTUB26
+  chmod +x "$TMP/gc"
+  DPW_CRASHLOOP_AUTOHEAL=1 DPW_CRASHLOOP_HEAL_MAX=2 DPW_TEST_LOADED="$ALL" DPW_TEST_EXIT="com.gascity.beta:137"
+  run_sweep >/dev/null 2>&1    # first sweep: prev empty, no crash-loop yet
+  : > "$LOG"
+  run_sweep && ok "OOM exit + in-budget heal: sweep returns 0 (healing in progress)" || bad "OOM exit + in-budget heal: unexpected non-zero return"
+  grep -q "com.gascity.beta" "$DPW_TEST_KICKSTARTS" && ok "OOM exit: kickstart -k issued for crash-looping daemon" || bad "OOM exit: kickstart NOT issued"
+  [ ! -s "$MAILSENT26" ] && ok "OOM exit + in-budget heal: no Mayor mail (imp05 suppressed same as a plain failure)" || bad "OOM exit + in-budget heal: Mayor mail sent prematurely"
+  grep -q "mail suppressed" "$LOG" && ok "log shows imp05 suppression message for the OOM-classified exit" || bad "log missing suppression message for OOM exit"
+  grep -q "OOM-KILLED: com.gascity.beta" "$LOG" && bad "log wrongly emitted OOM-KILLED while heal is in-budget (should stay suppressed)" || ok "log does NOT say OOM-KILLED while heal is in-budget"
+
   echo ""
   echo "daemon-presence-watchdog selftest: PASS=$PASS FAIL=$FAIL"
   [ "$FAIL" -eq 0 ] && exit 0 || exit 1
