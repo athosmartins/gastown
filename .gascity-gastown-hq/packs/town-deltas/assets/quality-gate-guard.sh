@@ -249,6 +249,26 @@ set_gate_status() {
   bd -C "$GC_CITY" label add "$_id" "gate-status:$_new" -q 2>/dev/null || true
 }
 
+# ── notify_park_author <author> <bead_id> <branch> <marker_id> <park_reason> ──
+# ga-oo66: Step 5a parks a marker (needs-approval / needs-human) by commenting
+# on the marker (closed right after — nobody re-opens it) and the source bead
+# (comments don't notify anyone). The author never actually heard about it,
+# even though /gate-done promises "you will be mailed when the gate passes or
+# fails" — a park is neither, so that promise silently went unkept. Mail (not
+# nudge): AUTHOR's session may be long dead by the time this guard sweep runs.
+# I/O helper (not pure) but defined here in the lib region so the selftest can
+# source + unit-test it with a mock gc/notify — same rationale as
+# set_gate_status above.
+notify_park_author() {
+  local _author="$1" _bead_id="$2" _branch="$3" _marker_id="$4" _park_reason="$5"
+  gc --city "$GC_CITY" mail send "$_author" \
+    -s "Gate marker parked — human action needed ($_bead_id)" \
+    -m "$(printf 'Your gate submission for %s (branch %s, marker %s) was PARKED, not reviewed: %s.\n\nNo reviewer was spawned, and none will be until this is resolved.\nTo unblock: resolve the blocking condition on %s (get it product-approved / clear gate:needs-human), then submit a fresh gate marker (/gate-done).' \
+      "$_bead_id" "$_branch" "$_marker_id" "$_park_reason" "$_bead_id")" \
+    2>/dev/null || warn "could not mail author $_author for parked marker $_marker_id"
+  notify -t "Gate needs-human" -p 4 "$_bead_id ($_branch) parked, not reviewed — $_park_reason. Author $_author mailed." 2>/dev/null || true
+}
+
 # classify_inflight_gap1 <status> <has_gate_passed> <has_live_assignee> <branch_merged>
 # Pure decision for ga-pa36 GAP-1: OPEN story:in-flight bead whose fix branch
 # was already merged to origin/main but has no gate:passed label.
@@ -1326,6 +1346,7 @@ To re-enter the gate: resolve the blocking condition on $BEAD_ID (get it approve
     bd -C "$GC_CITY" close "$MARKER_ID" \
       -r "Gate guard Step 5a: marker parked (terminal) — $PARK_REASON. No gate-run created." \
       2>/dev/null || true
+    notify_park_author "$AUTHOR" "$BEAD_ID" "$BRANCH" "$MARKER_ID" "$PARK_REASON"
     log "SUPPRESSED PUSH (wa-uthi non-terminal): marker $MARKER_ID parked (Step 5a: $PARK_ACTION)."
     exit 0
   fi
