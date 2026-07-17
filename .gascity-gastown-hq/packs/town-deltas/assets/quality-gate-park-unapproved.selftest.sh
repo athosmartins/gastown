@@ -164,6 +164,48 @@ grep -qE 'if \[ -n "\$BEAD_RAW" \]' "$GUARD" \
   && ok "park check is FAIL-OPEN (guarded by non-empty BEAD_RAW)" \
   || bad "park check is NOT fail-open (no BEAD_RAW guard — could block on lookup failure)"
 
+# ── 7. Drift-guards (ga-oo66): AUTHOR is mailed on Step 5a park ──────────────
+# Bug ga-oo66: a park (Step 5a) commented the marker + source bead but never
+# told the AUTHOR — from the submitter's side, "parked, nobody will ever look"
+# and "queued, reviewers incoming" emitted the identical signal (silence).
+# /gate-done promises "you will be mailed when the gate passes or fails"; this
+# park never fulfilled that promise. Fix: mail "$AUTHOR" (survives a dead/
+# restarted session, unlike a comment — same rationale as ga-u4yi's AUTHOR
+# mail at the dispatcher's gate:needs-human transition sites), scoped to the
+# Step 5a block specifically (isolate from Step 6+ / dispatcher content).
+echo "── 7. drift-guard: ga-oo66 — AUTHOR is mailed on Step 5a park (not just commented) ──"
+STEP5A_BLOCK=$(awk '/# ── Step 5a:/{f=1} f{print} f&&/# ── Resolve the store that OWNS the source bead/{exit}' "$GUARD")
+printf '%s\n' "$STEP5A_BLOCK" | grep -q 'mail send "\$AUTHOR"' \
+  && ok "Step 5a mails AUTHOR on park (ga-oo66)" \
+  || bad "Step 5a still only comments — author has no durable park signal (ga-oo66 regression)"
+# Both park reasons (needs-approval, needs-human) plus the fail-open default
+# each compute their own unblock hint — exactly 3 assignments, mirroring
+# ga-u4yi's "exactly N sites" counting style.
+eq "Step 5a covers all 3 park-action branches with a tailored unblock hint" \
+  "$(printf '%s\n' "$STEP5A_BLOCK" | grep -c 'UNBLOCK_HINT=')" \
+  "3"
+printf '%s\n' "$STEP5A_BLOCK" | grep -qi 'not queued' \
+  && ok "Step 5a mail explicitly distinguishes 'parked' from 'queued, reviewers incoming'" \
+  || bad "Step 5a mail does not distinguish park from queued — the ga-oo66 root-cause silence survives"
+printf '%s\n' "$STEP5A_BLOCK" | grep -q '|| warn "Could not mail author' \
+  && ok "Step 5a author mail is best-effort (mail failure does not abort the park)" \
+  || bad "Step 5a author mail is not best-effort-guarded"
+# Ordering: mail before close, mirroring the comment-then-mail-then-close
+# sequence used at the dispatcher's own ga-u4yi sites.
+# The `|| true` on each is required, not decorative: under set -euo pipefail,
+# a legitimate zero-match grep (exactly the pre-fix case this line exists to
+# catch) would otherwise abort the whole script instead of flowing into the
+# "missing" branch below — the same error/empty conflation this codebase's
+# own ga-p5q3 doctrine warns against, just inverted (empty caught as a hard
+# abort instead of a graceful signal).
+MAIL_LINE=$(printf '%s\n' "$STEP5A_BLOCK" | grep -n 'mail send "\$AUTHOR"' | head -1 | cut -d: -f1 || true)
+CLOSE_LINE=$(printf '%s\n' "$STEP5A_BLOCK" | grep -n 'close "\$MARKER_ID"' | head -1 | cut -d: -f1 || true)
+if [ -n "$MAIL_LINE" ] && [ -n "$CLOSE_LINE" ] && [ "$MAIL_LINE" -lt "$CLOSE_LINE" ]; then
+  ok "Step 5a author mail fires BEFORE the marker close"
+else
+  bad "Step 5a author mail ordering wrong (mail must precede close): mail=${MAIL_LINE:-missing} close=${CLOSE_LINE:-missing}"
+fi
+
 echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"

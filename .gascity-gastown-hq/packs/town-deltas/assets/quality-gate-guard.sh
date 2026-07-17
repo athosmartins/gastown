@@ -1323,6 +1323,26 @@ To re-enter the gate: resolve the blocking condition on $BEAD_ID (get it approve
       2>/dev/null || bd -C "$GC_CITY" comment "$BEAD_ID" \
       "Gate guard Step 5a: blocked gate submission — $PARK_REASON. Gate marker $MARKER_ID was parked (gate-status:parked-needs-human); no reviewer was spawned. Resolve the blocking condition, then re-submit a fresh gate marker." \
       2>/dev/null || true
+    # ga-oo66: durable mail to the AUTHOR — a marker/source-bead COMMENT alone
+    # is indistinguishable from "queued, reviewers incoming" (both look like
+    # silence to whoever submitted). /gate-done promises "you will be mailed
+    # when the gate passes or fails" and this park never fulfilled that
+    # promise. Mail (not nudge) survives a dead/restarted author session and
+    # reaches whoever resubmits later even from a DIFFERENT session
+    # (compaction, crash, different agent) — same rationale as ga-u4yi's
+    # AUTHOR mail at the dispatcher's gate:needs-human transition sites.
+    case "$PARK_ACTION" in
+      park:needs-approval) UNBLOCK_HINT="Get $BEAD_ID product-approved (clear story:needs-approval)" ;;
+      park:needs-human)    UNBLOCK_HINT="Get a human/Mayor to resolve the gate:needs-human circuit-break on $BEAD_ID" ;;
+      *)                   UNBLOCK_HINT="Resolve the blocking condition on $BEAD_ID" ;;
+    esac
+    if [ -n "$AUTHOR" ]; then
+      gc --city "$GC_CITY" mail send "$AUTHOR" \
+        -s "Gate marker parked (not queued): $BEAD_ID" \
+        -m "$(printf 'Your gate marker %s (bead %s, branch %s) was PARKED, not queued — %s.\n\nNo gate-run was created and no reviewer was spawned. This is different from "queued, reviewers incoming": nothing further will happen on this marker.\n\n%s, then submit a fresh gate marker. Until then, any further /gate-done resubmission for this bead will keep being silently parked — this mail is the one signal you get for THIS attempt.' \
+          "$MARKER_ID" "$BEAD_ID" "$BRANCH" "$PARK_REASON" "$UNBLOCK_HINT")" \
+        2>/dev/null || warn "Could not mail author $AUTHOR for Step 5a park on $BEAD_ID (marker $MARKER_ID)"
+    fi
     bd -C "$GC_CITY" close "$MARKER_ID" \
       -r "Gate guard Step 5a: marker parked (terminal) — $PARK_REASON. No gate-run created." \
       2>/dev/null || true
