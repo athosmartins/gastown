@@ -3658,8 +3658,18 @@ dispatch_one() {
   # tells the re-dispatched builder to fix THE SPECIFIC issues (not redo the work).
   local STORY_GATE_FEEDBACK="" STORY_FIX_ATTEMPT="" GATE_FIX_SECTION=""
   if echo "$STORY_LABELS" | grep -q "gate:needs-fix"; then
-    STORY_FIX_ATTEMPT=$(echo "$STORY_LABELS" | tr ',' '\n' \
-      | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | tail -1)
+    # ga-26df: `:0` reset sentinel wins, else MAX — mirrors the dispatcher-side reader.
+    # This label is READ here only (for the feedback banner), never written; but it must
+    # match the dispatcher's semantics or the banner would show a different attempt number
+    # than the cap logic acts on. Plain MIN stalls on a {1,2} automatic residue (a failed
+    # `|| true` label-removal in the bump loop); see the dispatcher comment (ga-wisp-198xqe).
+    _PA=$(echo "$STORY_LABELS" | tr ',' '\n' \
+      | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p')
+    if printf '%s\n' "$_PA" | grep -qx 0; then
+      STORY_FIX_ATTEMPT=0
+    else
+      STORY_FIX_ATTEMPT=$(printf '%s\n' "$_PA" | sort -n | tail -1)
+    fi
     STORY_GATE_FEEDBACK=$(bd -C "$STORY_BEAD_CITY" comments "$STORY_ID" --json 2>/dev/null \
       | jq -r '[ .[]? | (.text // .body // "") | select(test("^GATE-FEEDBACK")) ] | last // ""' \
       2>/dev/null || echo "")
