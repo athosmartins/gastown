@@ -29,11 +29,19 @@ eq()  { if [ "$2" = "$3" ]; then ok "$1 (=$2)"; else bad "$1: expected [$3], got
 
 # ── The exact parsers used by the dispatchers ────────────────────────────────
 # Attempt counter — gate side reads SPACE-separated labels; pilot side reads
-# COMMA-separated. Both take the MAX numeric suffix (default 0).
+# COMMA-separated. Both take the MIN numeric suffix (default 0).
+# ga-26df: coexisting counters happen ONLY via a manual clear (a lower
+# number added alongside a stale higher one left by the last automatic
+# increment — the automatic path always removes stale counters before
+# adding its own, so it alone can never leave more than one behind). MAX
+# used to be taken here, which silently discarded every manual clear (0
+# alongside a stale N>0 always resolved to N, defeating the reset). MIN is
+# correct: the human's reset always wins, and when only one counter exists
+# (the normal case) MIN == MAX, so single-counter behavior is unchanged.
 attempt_from_space() { printf '%s' "$1" | tr ' ' '\n' \
-  | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | tail -1; }
+  | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | head -1; }
 attempt_from_comma() { printf '%s' "$1" | tr ',' '\n' \
-  | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | tail -1; }
+  | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | head -1; }
 # GATE-FEEDBACK selector — newest comment whose .text starts with GATE-FEEDBACK.
 feedback_select() { jq -r '[ .[]? | (.text // .body // "") | select(test("^GATE-FEEDBACK")) ] | last // ""'; }
 
@@ -41,10 +49,15 @@ echo "── 1. attempt-counter parser (gate: space-separated) ──"
 eq "no counter → 0 (empty after default)" "$(x=$(attempt_from_space 'lane:small story:approved'); echo "${x:-0}")" "0"
 eq "single counter :1"  "$(attempt_from_space 'gate:needs-fix gate:fix-attempt:1')" "1"
 eq "single counter :3"  "$(attempt_from_space 'tech-debt gate:fix-attempt:3 gate:failed')" "3"
-eq "max of duplicates"  "$(attempt_from_space 'gate:fix-attempt:1 gate:fix-attempt:2')" "2"
+eq "min of duplicates (ga-26df: manual clear beats stale higher counter)" \
+   "$(attempt_from_space 'gate:fix-attempt:1 gate:fix-attempt:2')" "1"
+eq "ga-26df acceptance: clear-to-0 alongside stale cap-exhausted 3 → resolves 0, not 3" \
+   "$(attempt_from_space 'gate:needs-human gate:fix-attempt:3 gate:fix-attempt:0')" "0"
 
 echo "── 2. attempt-counter parser (pilot: comma-separated) ──"
 eq "comma single :2"    "$(attempt_from_comma 'lane:small,gate:needs-fix,gate:fix-attempt:2')" "2"
+eq "comma min of duplicates (ga-26df, pilot side)" \
+   "$(attempt_from_comma 'gate:needs-fix,gate:fix-attempt:3,gate:fix-attempt:0')" "0"
 eq "comma no counter→0" "$(x=$(attempt_from_comma 'story:approved,gate:needs-fix'); echo "${x:-0}")" "0"
 
 echo "── 3. cap decision (PREV >= CAP → escalate; else increment) ──"
@@ -69,6 +82,16 @@ echo "── 5. drift-guard: gate dispatcher still implements the loop ──"
 grep -q 'gate:needs-fix'                 "$GATE" && ok "gate sets gate:needs-fix"           || bad "gate missing gate:needs-fix"
 grep -q 'gate:needs-human'               "$GATE" && ok "gate sets gate:needs-human"         || bad "gate missing gate:needs-human"
 grep -q 'gate:fix-attempt:'              "$GATE" && ok "gate bumps fix-attempt counter"     || bad "gate missing fix-attempt counter"
+# ga-26df: pin MIN (head -1), not MAX (tail -1), on the fix-attempt parser in
+# BOTH dispatchers — a future edit reverting either back to tail -1 silently
+# re-defeats manual clears and this drift-guard is the only thing that would
+# notice (the unit tests above exercise a local mirror, not these files).
+grep -Fq "gate:fix-attempt:\\([0-9]\\{1,\\}\\)\$/\\1/p' | sort -n | head -1" "$GATE" \
+  && ok "gate fix-attempt parser takes MIN (head -1)" \
+  || bad "gate fix-attempt parser is not head -1 — MAX regression would re-defeat manual clears (ga-26df)"
+grep -Fq "gate:fix-attempt:\\([0-9]\\{1,\\}\\)\$/\\1/p' | sort -n | head -1" "$PILOT" \
+  && ok "pilot fix-attempt parser takes MIN (head -1)" \
+  || bad "pilot fix-attempt parser is not head -1 — MAX regression would re-defeat manual clears (ga-26df)"
 grep -q 'GATE-FEEDBACK'                  "$GATE" && ok "gate attaches GATE-FEEDBACK"         || bad "gate missing GATE-FEEDBACK"
 grep -q 'GATE_FIX_CAP=3'                 "$GATE" && ok "gate cap = 3"                        || bad "gate missing cap=3"
 grep -Eq 'assign "\$BEAD_ID" ""'         "$GATE" && ok "gate clears source assignee"        || bad "gate does not clear assignee"
