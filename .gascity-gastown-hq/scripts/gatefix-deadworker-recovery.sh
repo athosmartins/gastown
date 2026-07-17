@@ -3,24 +3,35 @@
 #
 # PROBLEM (ga-pdrij sub-scope C, observed 2026-06-30 on wa-85iv8 + wa-5otq4): a worker
 # dispatched for the autonomous gate-fix loop (gate:needs-fix) can DIE/drain mid-fix,
-# leaving an orphan crew/<owner>/<bead> branch + a per-bead worktree (crew/worker-<bead>
-# or /gt/worker-<bead>). The orphan branch/worktree then BLOCKS the Pilot from
-# re-dispatching the bead — it sits gate:needs-fix forever (the worktree-reaper only
-# reaps CLEAN worktrees >24h, so a dirty-from-dead one is skipped indefinitely). Manual
-# recovery (reap worktree + delete branch) reliably unblocks it (wa-85iv8 went on to
-# PASS + merge after recovery). This janitor automates that recovery within one sweep.
+# leaving an orphan per-bead worktree (crew/worker-<bead> or /gt/worker-<bead>) plus a
+# stale claim (gc.session_name/work_dir) on the bead. The orphan worktree + stale claim
+# then BLOCK the Pilot from re-dispatching the bead — it sits gate:needs-fix forever (the
+# worktree-reaper only reaps CLEAN worktrees >24h, so a dirty-from-dead one is skipped
+# indefinitely). This janitor automates that recovery within one sweep.
 #
 # WHAT IT DOES: for each gate:needs-fix bead that is NOT story:in-flight, whose recorded
 # worker session (gc.session_name) is DEAD (drained/asleep/absent in `gc session list`),
-# reap its orphan worktree (force) + delete its orphan crew/* branch (SHA logged for
-# recovery) so the next Pilot sweep re-dispatches it fresh. A bead whose worker is still
-# LIVE (or has no recorded session) is LEFT untouched (active rework — never reaped).
+# reap its orphan worktree (force, path-scoped — never touches any branch ref) + clear
+# its stale claim metadata so the next Pilot sweep re-dispatches it fresh. A bead whose
+# worker is still LIVE (or has no recorded session) is LEFT untouched (active rework —
+# never reaped).
 #
-# SAFETY: only acts on gate:needs-fix beads with a DEMONSTRABLY-DEAD worker. The branch
-# it deletes is FAILED gate work (the gate already rejected it) → a fresh rebuild is the
-# intended path; the SHA is logged so the commit is recoverable. DRY_RUN default-off but
-# easily toggled; kill-switch GATEFIX_RECOVERY_ENABLED=0; per-sweep cap. Lib-only seam
-# (GATEFIX_RECOVERY_LIB_ONLY=1) exposes the pure decision for the selftest.
+# NO BRANCH DELETION (ga-0re8j, 2026-07-17): this janitor used to also delete
+# crew/*/<bead> branches (local + remote) on the theory that a gate:needs-fix branch is
+# disposable "failed gate work". That premise was false, and the glob was worse than
+# imprecise: refs/heads/crew/*/<bead> requires exactly two path segments (git ref globs
+# never cross `/`), so it could ONLY match the crew's own crew/<owner>/<bead> PRIMARY
+# submission branch — the gatefix-worker worktree at crew/worker-<bead> checks out that
+# SAME ref, so there was never a distinct disposable branch to target. gate:needs-fix
+# means the crew will keep fixing THIS branch, not abandon it. Result: 73 remote branch
+# deletions over 17 days, 100% of them primary branches, zero permanent loss only by
+# luck (objects not yet git-gc'd). Recovery never needed the branch gone — clearing the
+# stale claim below is sufficient for the Pilot to re-dispatch. Do not re-add branch
+# deletion here.
+#
+# SAFETY: only acts on gate:needs-fix beads with a DEMONSTRABLY-DEAD worker. DRY_RUN
+# default-off but easily toggled; kill-switch GATEFIX_RECOVERY_ENABLED=0; per-sweep cap.
+# Lib-only seam (GATEFIX_RECOVERY_LIB_ONLY=1) exposes the pure decision for the selftest.
 set -uo pipefail
 
 GT="${GATEFIX_RECOVERY_GT:-/Users/athos/gt}"
@@ -71,7 +82,7 @@ print(" ".join(sorted(out)))
 # FAIL-SAFE: if we could not read the roster, do NOT reap anything (can't prove dead).
 [ -n "$LIVE_SESSIONS" ] || { printf '{"ts":"%s","event":"noop","reason":"empty_roster_failsafe"}\n' "$(ts)" >> "$LOG" 2>/dev/null; exit 0; }
 
-# ── rig repos (where the orphan worktrees/branches live) ──────────────────────
+# ── rig repos (where the orphan worktrees live) ───────────────────────────────
 RIGS="$(gc --city "$HQ" rig list --json 2>/dev/null | python3 -c '
 import sys,json
 try: d=json.load(sys.stdin)
@@ -85,30 +96,19 @@ $RIGS"
 
 recovered=0; skipped=0; cap_hit=0
 
-# reap_orphans <rig_repo> <bead_id> — remove the per-bead worktree + delete the crew/*
-# branch (local+remote), logging the SHA. Best-effort; never fatal.
+# reap_orphans <rig_repo> <bead_id> — remove the per-bead worktree. Best-effort; never
+# fatal. Does NOT touch any branch ref (see NO BRANCH DELETION in the file header).
 reap_orphans() {
-  local repo="$1" bid="$2" wt sha br
+  local repo="$1" bid="$2" wt
   command -v git >/dev/null 2>&1 || return 0
-  # candidate worktree paths
+  # candidate worktree paths — directory-scoped; removing a worktree never deletes the
+  # branch ref it had checked out
   for wt in "$repo/crew/worker-$bid" "$GT/worker-$bid"; do
     [ -d "$wt" ] || continue
     git -C "$repo" worktree remove --force "$wt" 2>/dev/null \
       && printf '{"ts":"%s","event":"worktree_reaped","repo":"%s","bead":"%s","wt":"%s"}\n' "$(ts)" "$(basename "$repo")" "$bid" "$wt" >> "$LOG" 2>/dev/null
   done
   git -C "$repo" worktree prune 2>/dev/null || true
-  # delete crew/*/<bead> branches (local + remote), logging the SHA first (recoverable)
-  for br in $(git -C "$repo" for-each-ref --format='%(refname:short)' "refs/heads/crew/*/$bid" 2>/dev/null); do
-    sha="$(git -C "$repo" rev-parse --short "$br" 2>/dev/null)"
-    git -C "$repo" branch -D "$br" 2>/dev/null \
-      && printf '{"ts":"%s","event":"branch_deleted","repo":"%s","bead":"%s","branch":"%s","sha":"%s"}\n' "$(ts)" "$(basename "$repo")" "$bid" "$br" "$sha" >> "$LOG" 2>/dev/null
-  done
-  for br in $(git -C "$repo" for-each-ref --format='%(refname:short)' "refs/remotes/origin/crew/*/$bid" 2>/dev/null); do
-    local rb="${br#origin/}"
-    sha="$(git -C "$repo" rev-parse --short "$br" 2>/dev/null)"
-    git -C "$repo" push origin --delete "$rb" 2>/dev/null \
-      && printf '{"ts":"%s","event":"remote_branch_deleted","repo":"%s","bead":"%s","branch":"%s","sha":"%s"}\n' "$(ts)" "$(basename "$repo")" "$bid" "$rb" "$sha" >> "$LOG" 2>/dev/null
-  done
 }
 
 while IFS= read -r store; do
@@ -136,7 +136,7 @@ for x in b:
       printf '{"ts":"%s","event":"would_recover","store":"%s","bead":"%s","dead_worker":"%s"}\n' "$(ts)" "$(basename "$store")" "$bid" "$sess" >> "$LOG" 2>/dev/null
       recovered=$((recovered+1)); continue
     fi
-    # reap orphans in EVERY rig repo (the worktree/branch could be in any)
+    # reap orphans in EVERY rig repo (the worktree could be in any)
     while IFS= read -r rig; do [ -n "$rig" ] && [ -d "$rig" ] && reap_orphans "$rig" "$bid"; done <<< "$RIGS"
     reap_orphans "$GT" "$bid"
     # clear the DEAD worker's stale claim so the bead is a clean re-dispatch candidate
