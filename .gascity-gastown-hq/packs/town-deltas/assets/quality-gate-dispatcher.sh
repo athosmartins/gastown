@@ -1265,6 +1265,117 @@ resolve_recycled_author() {
   fi
 }
 
+# resolve_rebase_author <trusted_submit_author> <branch> <marker_self_declared_author>
+# ga-6dp9 (bug 1 of 3): the rebase-path liveness check must be keyed on WHO
+# ACTUALLY WROTE the branch, not on the source bead's CURRENT assignee/owner —
+# that can be reassigned to an unrelated PM/babysitter long after the branch
+# was pushed (e.g. a Mayor-crafted marker rescuing an orphaned branch, where
+# the bead's owner never touched the code). Reproduced live: bead wa-aed6l's
+# owner was peter-wa, who never touched the branch; the real (already-dead)
+# author was an ephemeral wa-worker build. Treating peter-wa's liveness as
+# "the author is alive, wait" stalled the marker in an infinite retry.
+#
+# <trusted_submit_author> is AUTHOR as resolved from the marker's
+# gate.submitted_by METADATA (set by the guard at the ACTUAL /gate-done
+# submission time, ga-tkvsa) — reliable because it is tied to the
+# branch-submission EVENT, not the bead's current, driftable state. When
+# that's unavailable (marker created outside the normal guard flow), fall
+# through to signals ALSO tied to the branch/marker itself rather than the
+# bead: the branch's own `crew/<crew>/` segment (immutable once pushed), then
+# the marker's self-declared `author:` text line (untrusted for the
+# SECURITY/self-review-exclusion purpose in quality-gate-guard.sh Step 5 — but
+# fine here: the worst case of trusting a spoofed value for THIS check is one
+# extra escalation, never a security bypass). NEVER falls through to a
+# bead-assignee/owner value — that is precisely the wrong-agent vector this
+# bug fixes.
+#
+# Echoes "" (unresolvable) rather than guessing when none of these signals
+# are available; author_is_alive("") is 0 (dead) — the FAIL-SAFE direction
+# (bounded-retry-then-escalate, never wait-forever on a phantom "live" author).
+resolve_rebase_author() {
+  local trusted="${1:-}" branch="${2:-}" marker_author="${3:-}"
+  if [ -n "$trusted" ] && [ "$trusted" != "null" ]; then
+    printf '%s' "$trusted"
+    return 0
+  fi
+  local crew
+  crew=$(printf '%s' "$branch" | sed -n 's#^crew/\([^/]\{1,\}\)/.*#\1#p')
+  if [ -n "$crew" ]; then
+    printf '%s' "$crew"
+    return 0
+  fi
+  if [ -n "$marker_author" ] && [ "$marker_author" != "null" ]; then
+    printf '%s' "$marker_author"
+    return 0
+  fi
+  printf ''
+}
+
+# gate_behind_envelope_action <behind_exceeded_0_1> <author_alive_0_1>
+# ga-6dp9 (bug 2 of 3): decide what to do when main has moved further ahead of
+# the branch's base than GATE_REBASE_BEHIND_MAX allows. This is ALWAYS a
+# permanent condition — main only ever moves forward, it never self-heals by
+# waiting — so the only two valid outcomes are "circuit_break" (no live
+# author to fix it) or "bounce" (live author can manually rebase). NEVER
+# "retry": the old behavior funneled this into the generic transient-retry
+# bucket, re-queueing a permanent condition as if it might clear on its own —
+# an infinite "attempt 1/3" loop in production (the delta only ever grows,
+# never shrinks on its own). Echoes "not_applicable" when behind_exceeded=0
+# (this check does not apply; fall through to the existing generic dispatch
+# unchanged).
+gate_behind_envelope_action() {
+  local behind_exceeded="${1:-0}" author_alive="${2:-0}"
+  case "$behind_exceeded" in ''|*[!0-9]*) behind_exceeded=0 ;; esac
+  case "$author_alive"    in ''|*[!0-9]*) author_alive=0    ;; esac
+  if [ "$behind_exceeded" != "1" ]; then
+    printf 'not_applicable'; return 0
+  fi
+  if [ "$author_alive" = "1" ]; then
+    printf 'bounce'
+  else
+    printf 'circuit_break'
+  fi
+}
+
+# gate_rebase_attempt_advanced <intended_next_attempt> <actual_highest_after_write>
+# ga-6dp9 (bug 3 of 3): the gate:rebase-attempt:N label swap (remove old, add
+# new) is fire-and-forget (`|| true`, matching this script's fail-soft
+# convention for label writes) — a transient Dolt write failure on the ADD is
+# silently swallowed, leaving the counter at its OLD value. The dispatcher
+# would otherwise trust the unwritten counter and re-derive attempt=0 next
+# sweep, replaying "attempt 1/3" forever: an unverified write and a failed
+# write produce the SAME downstream behavior
+# ([[error-and-empty-must-not-produce-the-same-value]]). Falsify the write
+# instead of assuming it: re-read the label after writing and compare. Echoes
+# "advanced" iff the marker's highest recorded attempt now meets or exceeds
+# the intended value; "stuck" otherwise (write silently failed or lost a
+# race) — callers should treat "stuck" as retries-exhausted and escalate
+# immediately rather than looping on a counter that cannot move.
+gate_rebase_attempt_advanced() {
+  local intended="${1:-0}" actual="${2:-0}"
+  case "$intended" in ''|*[!0-9]*) intended=0 ;; esac
+  case "$actual"   in ''|*[!0-9]*) actual=0   ;; esac
+  if [ "$actual" -ge "$intended" ]; then
+    printf 'advanced'
+  else
+    printf 'stuck'
+  fi
+}
+
+# read_rebase_attempt <marker_id> — fetch the current highest
+# gate:rebase-attempt:N label value from the marker (0 if none present).
+# Single source of truth for both the per-sweep initial read and the ga-6dp9
+# post-write verification below, so they can never drift into two different
+# parsers of the same label convention.
+read_rebase_attempt() {
+  local marker_id="${1:-}" n
+  n=$(bd -C "$GC_CITY" show "$marker_id" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null \
+    | sed -n 's/^gate:rebase-attempt:\([0-9]\+\)$/\1/p' | sort -rn | head -1 || true)
+  [ -z "$n" ] && n=0
+  printf '%s' "$n"
+}
+
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
 # above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
 # GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
@@ -3561,6 +3672,11 @@ BRANCH=$(extract "branch")
 BEAD_ID=$(extract "bead_id")
 BASE_COMMIT=$(extract "base_commit")
 RIG=$(extract "rig")
+# ga-6dp9: self-declared author line, mirroring guard.sh's MARKER_AUTHOR. Used
+# ONLY as a last-mile candidate for the rebase-liveness check (resolve_rebase_author
+# below) — NEVER for self-review-exclusion (that AUTHOR derivation, below, keeps
+# its existing untrusted-marker-text posture unchanged).
+MARKER_AUTHOR=$(extract "author")
 
 log "  branch=$BRANCH  bead_id=$BEAD_ID  rig=${RIG:-unknown}"
 
@@ -3639,6 +3755,12 @@ if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
 else
   AUTHOR=""
 fi
+# ga-6dp9: snapshot the trusted-metadata result BEFORE the bead-derived
+# fallback below (over)writes AUTHOR. resolve_rebase_author() needs to know
+# whether AUTHOR came from the branch-submission event (trustworthy for
+# rebase-liveness) or is about to fall through to the bead's current
+# assignee/owner (NOT trustworthy for that purpose — see resolve_rebase_author).
+AUTHOR_TRUSTED_SUBMIT="$AUTHOR"
 
 # ga-pyzo: also read the durable agent alias the guard recorded alongside
 # gate.submitted_by (best-effort; empty for markers submitted before this fix,
@@ -4039,6 +4161,15 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
   GATE_REBASE_BEHIND_MAX="${GATE_REBASE_BEHIND_MAX:-50}"
   REBASE_IN_ENVELOPE=1
   REBASE_SKIP_REASON=""
+  # ga-6dp9 (bug 2 of 3): tracks specifically whether the BEHIND-envelope check
+  # (below) is what took us out of envelope, as distinct from the AHEAD check or
+  # the clean-tree guard. main only ever moves forward, so this specific cause is
+  # a PERMANENT condition (never self-heals by waiting) — see
+  # gate_behind_envelope_action() above. Initialized here (unconditionally,
+  # before the HAS_CONFLICT branch below) so it is always defined under this
+  # script's `set -u`, even when HAS_CONFLICT was already 1 and the envelope
+  # checks are skipped entirely.
+  REBASE_BEHIND_EXCEEDED=0
 
   if [ "$HAS_CONFLICT" = "0" ]; then
     REBASE_AHEAD=$(git_rig rev-list --count "origin/$DEFAULT_BRANCH..origin/$BRANCH" 2>/dev/null || echo "")
@@ -4050,6 +4181,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     fi
     if [ -n "$REBASE_BEHIND" ] && [ "$REBASE_BEHIND" -gt "$GATE_REBASE_BEHIND_MAX" ]; then
       REBASE_IN_ENVELOPE=0
+      REBASE_BEHIND_EXCEEDED=1
       REBASE_SKIP_REASON="${REBASE_SKIP_REASON:+${REBASE_SKIP_REASON}; }main moved $REBASE_BEHIND commits ahead of branch base (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}) — large main delta compounds conflict risk"
     fi
 
@@ -4203,29 +4335,70 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     #      a human-or-Mayor-driven resolution happens — but we NEVER silently strand.
     MAX_REBASE_ATTEMPTS=3
 
+    # ga-6dp9 (bug 1 of 3): compute the branch-author candidate for THIS
+    # liveness check specifically — see resolve_rebase_author() above. Does
+    # NOT touch $AUTHOR itself — the notify target below keeps its original
+    # ga-pyzo/ga-ipf6 wiring unchanged (restored below, gate-fix-1: an
+    # earlier revision of this fix accidentally repurposed that wiring for
+    # the liveness decision instead of duplicating it — see the block below).
+    REBASE_AUTHOR=$(resolve_rebase_author "$AUTHOR_TRUSTED_SUBMIT" "$BRANCH" "$MARKER_AUTHOR")
+
     # ga-ipf6: unified with FAIL_AUTHOR_ALIVE via author_is_alive() — the old
     # inline predicate here (alias/name/agent only, no session_name) never
     # matched AUTHOR's actual session_name form, so every live author was
-    # misread as dead on this path.
-    AUTHOR_ALIVE=$(author_is_alive "$AUTHOR")
+    # misread as dead on this path. ga-6dp9 (gate-fix-1): named
+    # REBASE_AUTHOR_ALIVE (not AUTHOR_ALIVE) and keyed on REBASE_AUTHOR — the
+    # actual branch author, bug 1's fix — so it can drive every decision
+    # below without colliding with AUTHOR's own liveness/redirect, restored
+    # below for the notify target.
+    REBASE_AUTHOR_ALIVE=$(author_is_alive "$REBASE_AUTHOR")
 
-    # ga-pyzo: recycled-session fallback, applied BEFORE the ga-acb circuit-break
-    # check below (which consumes AUTHOR_ALIVE) so a live agent whose specific
+    # ga-pyzo: recycled-session fallback for the REBASE_AUTHOR liveness
+    # DECISION (bug 1), applied BEFORE the ga-acb circuit-break check below
+    # (which consumes REBASE_AUTHOR_ALIVE) so a live agent whose specific
     # submitting session recycled is never misread as dead-with-no-live-author
-    # and permanently circuit-broken. Reassigns AUTHOR itself so every
-    # downstream nudge/mail/assign in this block targets the reachable agent.
+    # and permanently circuit-broken.
+    _RESOLVED_REBASE_AUTHOR=$(resolve_recycled_author "$REBASE_AUTHOR" "$AUTHOR_AGENT" "$REBASE_AUTHOR_ALIVE")
+    if [ "$_RESOLVED_REBASE_AUTHOR" != "$REBASE_AUTHOR" ]; then
+      log "  ga-pyzo: rebase-liveness author '$REBASE_AUTHOR' session recycled but agent '$_RESOLVED_REBASE_AUTHOR' has a live session — redirecting liveness to the agent."
+      REBASE_AUTHOR="$_RESOLVED_REBASE_AUTHOR"
+      REBASE_AUTHOR_ALIVE=1
+    fi
+
+    # ga-6dp9 (gate-fix-1): restore the ga-pyzo/ga-ipf6 wiring for $AUTHOR
+    # itself, independent of REBASE_AUTHOR_ALIVE (which drives the actual
+    # bounce/circuit-break decision, bug 1) — same helper, same pattern as the
+    # FAIL-path call site above (ga-ipf6 lesson: don't let this fallback
+    # re-diverge across call sites again). Gate review on the first submission
+    # (gate_run=ga-wisp-wejpxu) caught that an earlier revision reassigned
+    # ONLY REBASE_AUTHOR above and never touched $AUTHOR again, so a worker
+    # submitting under an ephemeral adhoc session (e.g.
+    # gate.submitted_by="digo-wa-adhoc-abc123") whose durable role has since
+    # picked up a fresh live session would have had ITS notify target silently
+    # left on the confirmed-dead adhoc id wherever $AUTHOR is still the notify
+    # variable (the circuit-break paths below, and the QG_LOG "author of
+    # record" field).
+    #
+    # ga-6dp9 (gate-fix-2): the bounce/retry branches below (behind-envelope
+    # bounce, genuine-merge-conflict bounce, transient-retry-live-author, and
+    # its exhausted-retries escalation) do NOT use $AUTHOR for their nudge
+    # target — they use $REBASE_AUTHOR instead. Gate review on gate-fix-1
+    # (gate_run=ga-wisp-bkb9q6) found that those branches decide "someone can
+    # fix this" via REBASE_AUTHOR_ALIVE (a check that, unlike $AUTHOR, never
+    # falls through to a stale bead-assignee/owner — see resolve_rebase_author()
+    # above) but were nudging the separate, possibly-dead $AUTHOR — leaving no
+    # one actually notified when the two identities diverge. Do not
+    # "fix" those call sites back to $AUTHOR.
+    AUTHOR_ALIVE=$(author_is_alive "$AUTHOR")
     _RESOLVED_AUTHOR=$(resolve_recycled_author "$AUTHOR" "$AUTHOR_AGENT" "$AUTHOR_ALIVE")
     if [ "$_RESOLVED_AUTHOR" != "$AUTHOR" ]; then
-      log "  ga-pyzo: author '$AUTHOR' session recycled but agent '$_RESOLVED_AUTHOR' has a live session — redirecting liveness/nudge/assign to the agent."
+      log "  ga-pyzo: notify author '$AUTHOR' session recycled but agent '$_RESOLVED_AUTHOR' has a live session — redirecting nudge/mail target to the agent."
       AUTHOR="$_RESOLVED_AUTHOR"
       AUTHOR_ALIVE=1
     fi
 
     # Read current rebase-attempt counter from the marker labels.
-    REBASE_ATTEMPT=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null \
-      | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null \
-      | sed -n 's/^gate:rebase-attempt:\([0-9]\+\)$/\1/p' | sort -rn | head -1 || true)
-    [ -z "$REBASE_ATTEMPT" ] && REBASE_ATTEMPT=0
+    REBASE_ATTEMPT=$(read_rebase_attempt "$MARKER_ID")
 
     bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
 
@@ -4233,7 +4406,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # rebase envelope allows AND no live author to re-anchor a large divergence.
     # Checked BEFORE the retry/bounce branching so the marker never enters the
     # bounded-retry churn cycle on a provably un-mergeable branch.
-    _ACB_AHEAD=$(gate_circuit_break_check "ahead_dead" "${REBASE_AHEAD:-}" "$AUTHOR_ALIVE" "$REBASE_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX")
+    _ACB_AHEAD=$(gate_circuit_break_check "ahead_dead" "${REBASE_AHEAD:-}" "$REBASE_AUTHOR_ALIVE" "$REBASE_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX")
     if [ "$_ACB_AHEAD" != "ok" ]; then
       err "  ga-acb: circuit-breaking marker $MARKER_ID (${_ACB_AHEAD}): ahead=${REBASE_AHEAD:-?} > GATE_REBASE_AHEAD_MAX=${GATE_REBASE_AHEAD_MAX} and author dead/empty."
       bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
@@ -4279,7 +4452,89 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       exit 0
     fi
 
-    if [ "$AUTHOR_ALIVE" = "1" ] && [ "$CONFLICT_KIND" = "merge" ]; then
+    # ga-6dp9 (bug 2 of 3): behind-envelope is ALWAYS a permanent condition —
+    # main only moves forward, so this can never clear by waiting. Decide and
+    # exit BEFORE the generic transient-retry dispatch below, which would
+    # otherwise re-queue it with a bounded counter as if it might self-heal
+    # (the exact infinite "attempt 1/3" loop this bead fixes). Checked after
+    # ahead_dead above (independent condition; both can be simultaneously
+    # true — ahead_dead's own circuit-break, if it already fired, exited above
+    # and this code is unreached).
+    _BEHIND_ACTION=$(gate_behind_envelope_action "$REBASE_BEHIND_EXCEEDED" "$REBASE_AUTHOR_ALIVE")
+    if [ "$_BEHIND_ACTION" = "circuit_break" ]; then
+      err "  ga-6dp9: circuit-breaking marker $MARKER_ID (behind_dead): behind=${REBASE_BEHIND:-?} > GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX} and author dead/empty."
+      bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$MARKER_ID" "ga-6dp9 AUTO-CIRCUIT-BREAK (behind_dead): branch $BRANCH's base is ${REBASE_BEHIND:-?} commits behind current main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}) with no live author session. main only moves forward, so this delta cannot shrink on its own, and a server-side rebase this large risks conflicts with no one to resolve them. Marker permanently parked at gate-status:error. Source bead $BEAD_ID set gate:needs-human." 2>/dev/null || true
+      if [ -n "$BEAD_ID" ]; then
+        bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human"           -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human:technical" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"            -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"             -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"           -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""                           -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-6dp9 AUTO-CIRCUIT-BREAK (behind_dead): branch $BRANCH base is ${REBASE_BEHIND:-?} commits behind main (> ${GATE_REBASE_BEHIND_MAX} max) with no live author (marker $MARKER_ID). Large main delta + dead author = un-mergeable without a human rebase. Set gate:needs-human; story:in-flight + gate:reviewing + pilot:dispatched stripped." 2>/dev/null || true
+      fi
+      gc --city "$GC_CITY" mail send mayor \
+        -s "Gate circuit-break: $BRANCH main diverged too far + dead author (${BEAD_ID:-unknown})" \
+        -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) base is ${REBASE_BEHIND:-?} commits behind current main (> ${GATE_REBASE_BEHIND_MAX} max) with no live author session. Auto-circuit-broken (ga-6dp9): marker parked at gate-status:error; source bead set gate:needs-human. Human or Mayor must re-anchor the work (assisted rebase) or close the bead." 2>/dev/null \
+        || warn "Could not mail Mayor for behind_dead circuit-break on $BRANCH"
+      if [ -n "$AUTHOR" ]; then
+        gc --city "$GC_CITY" mail send "$AUTHOR" \
+          -s "Gate needs-human: $BRANCH's base fell too far behind main ($BEAD_ID)" \
+          -m "Branch $BRANCH (bead $BEAD_ID) base is ${REBASE_BEHIND:-?} commits behind current main (> ${GATE_REBASE_BEHIND_MAX} max) and no live author session was found to resolve the rebase. Source bead $BEAD_ID is now labeled gate:needs-human: the Pilot will NOT re-dispatch it, and any further /gate-done resubmission will be silently parked until a human resolves this. A human or the Mayor must re-anchor the work." \
+          2>/dev/null || warn "Could not mail author $AUTHOR for behind_dead circuit-break on $BRANCH"
+      fi
+      REBASE_EVENT="dispatcher_circuit_break_behind_dead"
+      REBASE_VERDICT="CIRCUIT-BREAK (behind=${REBASE_BEHIND:-?} > max=${GATE_REBASE_BEHIND_MAX}, dead author)"
+      log "ga-6dp9 circuit-break: $BRANCH behind_dead — marker $MARKER_ID parked, bead $BEAD_ID needs-human."
+      log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
+      mkdir -p "$(dirname "$QG_LOG")"
+      jq -c -n \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg branch "$BRANCH" \
+        --arg bead "$BEAD_ID" \
+        --arg rig "${RIG:-unknown}" \
+        --arg marker "$MARKER_ID" \
+        --arg author "$AUTHOR" \
+        --arg event "$REBASE_EVENT" \
+        '{ts: $ts, event: $event, branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author}' \
+        >> "$QG_LOG" 2>/dev/null || true
+      log "=== Dispatcher sweep complete: branch=$BRANCH verdict=$REBASE_VERDICT ==="
+      exit 0
+    elif [ "$_BEHIND_ACTION" = "bounce" ]; then
+      warn "Branch $BRANCH: main is ${REBASE_BEHIND:-?} commits ahead of branch base (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}); author $REBASE_AUTHOR is live — bouncing for manual/assisted rebase instead of auto-retrying a permanent condition."
+      bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED (ga-6dp9): branch $BRANCH's base is ${REBASE_BEHIND:-?} commits behind current main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}). This is a permanent condition (main only moves forward) — auto-retry cannot help. Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH and re-run /gate-done." 2>/dev/null || true
+      if [ -n "$BEAD_ID" ]; then
+        bd -C "$BEAD_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate blocked (ga-6dp9): branch $BRANCH's base is ${REBASE_BEHIND:-?} commits behind main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}). Manual rebase required — re-run /gate-done after rebasing." 2>/dev/null || true
+      fi
+      # ga-6dp9 (gate-fix-2): notify the identity actually verified alive for
+      # THIS decision (REBASE_AUTHOR — resolve_rebase_author() never falls
+      # through to a bead-assignee/owner value, so it stays reliable here),
+      # not $AUTHOR, which can be a stale bead-owner. Gate review on gate-fix-1
+      # (gate_run=ga-wisp-bkb9q6) caught that this bounce decides "someone can
+      # fix this" via REBASE_AUTHOR_ALIVE but then nudged the separate,
+      # possibly-dead $AUTHOR — leaving no one actually notified.
+      gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
+        "GATE BLOCKED for branch $BRANCH: base is ${REBASE_BEHIND:-?} commits behind main (> ${GATE_REBASE_BEHIND_MAX} max) — this is permanent, not a transient race. Manually rebase onto origin/$DEFAULT_BRANCH and re-run /gate-done. Bead: $BEAD_ID" \
+        --delivery wait-idle 2>/dev/null || warn "Could not nudge author $REBASE_AUTHOR for rebase"
+      REBASE_EVENT="dispatcher_needs_rebase_behind_envelope"
+      REBASE_VERDICT="NEEDS_REBASE (main delta > envelope, author live, bounced)"
+      log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
+      mkdir -p "$(dirname "$QG_LOG")"
+      jq -c -n \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg branch "$BRANCH" --arg bead "$BEAD_ID" --arg rig "${RIG:-unknown}" \
+        --arg marker "$MARKER_ID" --arg author "$AUTHOR" --arg main_sha "$MAIN_HEAD_SHA" \
+        --arg conflicts "${CONFLICT_FILES:-unknown}" --arg event "$REBASE_EVENT" \
+        '{ts: $ts, event: $event, branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author, main_sha: $main_sha, conflicts: $conflicts}' \
+        >> "$QG_LOG" 2>/dev/null || true
+      log "=== Dispatcher sweep complete: branch=$BRANCH verdict=$REBASE_VERDICT ==="
+      exit 0
+    fi
+
+    if [ "$REBASE_AUTHOR_ALIVE" = "1" ] && [ "$CONFLICT_KIND" = "merge" ]; then
       # gt-4tk5m fix: only bounce to needs-rebase when the conflict is GENUINE
       # (deterministic merge conflict). A TRANSIENT failure (worktree/push plumbing
       # race — e.g. the author force-pushed a rebase while this marker was queued
@@ -4288,7 +4543,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       # already rebased and expects the gate to pick it up, but needs-rebase tells
       # them to rebase again). Re-queue instead (same logic as dead-author transient
       # path) so the next sweep re-reads the author's rebased tip and proceeds.
-      warn "Branch $BRANCH: genuine merge conflict (${CONFLICT_FILES:-conflicts}); author $AUTHOR is live — bouncing for manual rebase."
+      warn "Branch $BRANCH: genuine merge conflict (${CONFLICT_FILES:-conflicts}); author $REBASE_AUTHOR is live — bouncing for manual rebase."
       bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
       bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED: branch $BRANCH is stale and has a genuine merge conflict that auto-rebase cannot resolve.
 main HEAD is $MAIN_HEAD_SHA. Conflicting regions: ${CONFLICT_FILES:-unknown}.
@@ -4297,12 +4552,15 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
         bd -C "$BEAD_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
         bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate blocked: branch $BRANCH has a genuine merge conflict with current main ($MAIN_HEAD_SHA). Auto-rebase failed (${CONFLICT_FILES:-conflicts}). Manual rebase required — re-run /gate-done after resolving." 2>/dev/null || true
       fi
-      gc --city "$GC_CITY" session nudge "$AUTHOR" \
+      # ga-6dp9 (gate-fix-2): see the matching comment at the behind-envelope
+      # bounce above — notify REBASE_AUTHOR (verified alive by this branch's
+      # own gate), not the possibly-stale/dead $AUTHOR.
+      gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
         "GATE BLOCKED for branch $BRANCH: stale with merge conflicts — auto-rebase cannot resolve. Conflicts: ${CONFLICT_FILES:-unknown}. Manually rebase onto origin/$DEFAULT_BRANCH (main HEAD: $MAIN_HEAD_SHA), resolve conflicts, re-run /gate-done. Bead: $BEAD_ID" \
-        --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR for rebase"
+        --delivery wait-idle 2>/dev/null || warn "Could not nudge author $REBASE_AUTHOR for rebase"
       REBASE_EVENT="dispatcher_needs_rebase"
       REBASE_VERDICT="NEEDS_REBASE (genuine merge conflict, author live, bounced)"
-    elif [ "$AUTHOR_ALIVE" = "1" ] && [ "$CONFLICT_KIND" = "transient" ]; then
+    elif [ "$REBASE_AUTHOR_ALIVE" = "1" ] && [ "$CONFLICT_KIND" = "transient" ]; then
       # gt-4tk5m fix: author is live but failure is TRANSIENT (worktree/push plumbing
       # race — e.g. author force-pushed a rebase while marker was queued and our
       # --force-with-lease was rejected). The branch may already be correctly rebased
@@ -4314,28 +4572,41 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
       NEXT_ATTEMPT=$((REBASE_ATTEMPT + 1))
       bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:rebase-attempt:$REBASE_ATTEMPT" -q 2>/dev/null || true
       bd -C "$GC_CITY" label add    "$MARKER_ID" "gate:rebase-attempt:$NEXT_ATTEMPT"  -q 2>/dev/null || true
+      # ga-6dp9 (bug 3 of 3): the label add above is fire-and-forget — verify it
+      # actually stuck instead of trusting it. A write that silently failed would
+      # otherwise re-derive REBASE_ATTEMPT=0 next sweep and replay "attempt 1/3"
+      # forever. A stuck counter means the retry cannot make progress by
+      # construction, so treat it exactly like retries-exhausted: force the
+      # escalation branch below instead of re-queueing again.
+      if [ "$(gate_rebase_attempt_advanced "$NEXT_ATTEMPT" "$(read_rebase_attempt "$MARKER_ID")")" = "stuck" ]; then
+        warn "Branch $BRANCH: gate:rebase-attempt label write did not take effect (intended $NEXT_ATTEMPT) — forcing escalation to avoid an infinite attempt-1/3 loop."
+        NEXT_ATTEMPT="$MAX_REBASE_ATTEMPTS"
+      fi
       if [ "$NEXT_ATTEMPT" -lt "$MAX_REBASE_ATTEMPTS" ]; then
-        warn "Branch $BRANCH: transient auto-rebase-fail (author $AUTHOR live; likely rebase-while-queued race — attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — gate-status:queued for server-side retry."
+        warn "Branch $BRANCH: transient auto-rebase-fail (author $REBASE_AUTHOR live; likely rebase-while-queued race — attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — gate-status:queued for server-side retry."
         bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:queued" -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS (gt-4tk5m): branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) — likely a rebase-while-queued race (author $AUTHOR may have force-pushed while this marker was queued). Re-queued for next sweep; no /gate-done re-run needed. Carries gate:rebase-attempt:$NEXT_ATTEMPT so it sinks behind healthy markers (ga-q3ig2)." 2>/dev/null || true
-        gc --city "$GC_CITY" session nudge "$AUTHOR" \
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS (gt-4tk5m): branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) — likely a rebase-while-queued race (author $REBASE_AUTHOR may have force-pushed while this marker was queued). Re-queued for next sweep; no /gate-done re-run needed. Carries gate:rebase-attempt:$NEXT_ATTEMPT so it sinks behind healthy markers (ga-q3ig2)." 2>/dev/null || true
+        # ga-6dp9 (gate-fix-2): same notify-identity fix as the bounce branches
+        # above — REBASE_AUTHOR is this branch's own verified-alive identity.
+        gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
           "Gate auto-retry for branch $BRANCH (${BEAD_ID:-unknown}): transient rebase push race detected (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — re-queued for next sweep. No action needed unless this keeps retrying." \
           --delivery wait-idle 2>/dev/null || true
         REBASE_EVENT="dispatcher_autorebase_retry_alive"
-        REBASE_VERDICT="QUEUED (transient rebase race, author $AUTHOR live, retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS)"
+        REBASE_VERDICT="QUEUED (transient rebase race, author $REBASE_AUTHOR live, retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS)"
       else
-        err "Branch $BRANCH: transient auto-rebase failure persists after $MAX_REBASE_ATTEMPTS attempts even with live author $AUTHOR — escalating."
+        err "Branch $BRANCH: transient auto-rebase failure persists after $MAX_REBASE_ATTEMPTS attempts even with live author $REBASE_AUTHOR — escalating."
         bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED (gt-4tk5m): branch $BRANCH hit persistent transient auto-rebase failures ($MAX_REBASE_ATTEMPTS attempts) despite live author $AUTHOR. Possible stuck push race or corrupt ref. Parked at needs-rebase for human/Mayor resolution." 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED (gt-4tk5m): branch $BRANCH hit persistent transient auto-rebase failures ($MAX_REBASE_ATTEMPTS attempts) despite live author $REBASE_AUTHOR. Possible stuck push race or corrupt ref. Parked at needs-rebase for human/Mayor resolution." 2>/dev/null || true
         if [ -n "$BEAD_ID" ]; then
           bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
         fi
-        gc --city "$GC_CITY" session nudge "$AUTHOR" \
+        # ga-6dp9 (gate-fix-2): same notify-identity fix — REBASE_AUTHOR, not $AUTHOR.
+        gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
           "GATE ESCALATED for branch $BRANCH (${BEAD_ID:-unknown}): persistent transient auto-rebase failures after $MAX_REBASE_ATTEMPTS retries. Please check your branch and re-run /gate-done, or contact Mayor." \
           --delivery wait-idle 2>/dev/null || true
         gc --city "$GC_CITY" mail send mayor \
           -s "Gate escalation: $BRANCH transient rebase race (live author, $MAX_REBASE_ATTEMPTS attempts)" \
-          -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) hit persistent transient auto-rebase failures ($MAX_REBASE_ATTEMPTS attempts) even with live author $AUTHOR. ${CONFLICT_FILES:-unknown}. Possible stuck push race or corrupt ref. Parked at needs-rebase. (gt-4tk5m)" 2>/dev/null \
+          -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) hit persistent transient auto-rebase failures ($MAX_REBASE_ATTEMPTS attempts) even with live author $REBASE_AUTHOR. ${CONFLICT_FILES:-unknown}. Possible stuck push race or corrupt ref. Parked at needs-rebase. (gt-4tk5m)" 2>/dev/null \
           || warn "Could not mail Mayor for gate escalation on $BRANCH"
         REBASE_EVENT="dispatcher_needs_rebase_transient_escalated"
         REBASE_VERDICT="NEEDS_REBASE (persistent transient race, escalated after $MAX_REBASE_ATTEMPTS attempts)"
@@ -4369,6 +4640,14 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
       NEXT_ATTEMPT=$((REBASE_ATTEMPT + 1))
       bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:rebase-attempt:$REBASE_ATTEMPT" -q 2>/dev/null || true
       bd -C "$GC_CITY" label add    "$MARKER_ID" "gate:rebase-attempt:$NEXT_ATTEMPT"  -q 2>/dev/null || true
+      # ga-6dp9 (bug 3 of 3): verify the label write actually stuck (see the
+      # matching comment at the live-author call site above) — a stuck counter
+      # here would otherwise replay "attempt 1/3, dead author" forever instead
+      # of ever reaching the retry_dead circuit-break below.
+      if [ "$(gate_rebase_attempt_advanced "$NEXT_ATTEMPT" "$(read_rebase_attempt "$MARKER_ID")")" = "stuck" ]; then
+        warn "Branch $BRANCH: gate:rebase-attempt label write did not take effect (intended $NEXT_ATTEMPT) — forcing escalation to avoid an infinite attempt-1/3 loop."
+        NEXT_ATTEMPT="$MAX_REBASE_ATTEMPTS"
+      fi
       if [ "$NEXT_ATTEMPT" -lt "$MAX_REBASE_ATTEMPTS" ]; then
         warn "Branch $BRANCH: transient auto-rebase-fail, author dead/empty (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — gate-status:queued for server-side retry."
         bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:queued" -q 2>/dev/null || true
@@ -4383,7 +4662,7 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
         # own reclaim path could re-ready it if the marker somehow regained claimed/
         # dispatching. Promote to gate:needs-human on the SOURCE BEAD so Pilot knows
         # not to re-dispatch, and park the marker permanently at gate-status:error.
-        _ACB_RETRY=$(gate_circuit_break_check "retry_dead" "" "$AUTHOR_ALIVE" "$NEXT_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX")
+        _ACB_RETRY=$(gate_circuit_break_check "retry_dead" "" "$REBASE_AUTHOR_ALIVE" "$NEXT_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX")
         if [ "$_ACB_RETRY" != "ok" ]; then
           err "Branch $BRANCH: retries exhausted ($NEXT_ATTEMPT >= $MAX_REBASE_ATTEMPTS) + dead author — ga-acb circuit-break (${_ACB_RETRY})."
           bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true

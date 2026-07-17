@@ -336,7 +336,7 @@ run_recycle_sweep() {
 }
 
 run_sweep() {
-  local absent="" reloaded="" crashloop="" failing="" oom_killed="" wedged="" path_missing="" healthy=0 newstate="" lbl plist ex prev _hb _hblog _hbmax _age fc prog heal_n
+  local absent="" reloaded="" crashloop="" failing="" oom_killed="" wedged="" path_missing="" healthy=0 newstate="" lbl plist ex prev _hb _hblog _hbmax _age fc prog heal_n healing_inflight=""
   local NOW; NOW="$(date +%s)"
   # How long the machine has been awake-and-up (for WEDGE sleep/boot suppression).
   # DPW_TEST_AVAIL_AGE lets the selftest inject a value without calling sysctl.
@@ -369,6 +369,7 @@ run_sweep() {
             log "CRASH-LOOP-AUTOHEAL: $lbl (exit=$ex) attempt $heal_n/${DPW_CRASHLOOP_HEAL_MAX:-2} — kickstart -k"
             if launchctl kickstart -k "gui/$UID_NUM/$lbl" 2>/dev/null; then
               log "CRASH-LOOP-AUTOHEAL: kickstart -k succeeded for $lbl (attempt $heal_n)"
+              healing_inflight="$healing_inflight $lbl"
               command -v notify >/dev/null 2>&1 && notify -t "Daemon auto-heal" -p 3 \
                 "Crash-loop auto-healed: $lbl attempt $heal_n/${DPW_CRASHLOOP_HEAL_MAX:-2}" 2>/dev/null || true
             else
@@ -391,17 +392,33 @@ run_sweep() {
       # nonzero exits in per-label fail-count files. This lets us raise a FAILING alert
       # even when the prev/cur approach in crash-loop might miss it (e.g. state file
       # cleared between checks). DPW_FAIL_THRESHOLD consecutive sweeps with exit>0.
+      #
+      # ga-nvef: imp05 and imp17 both key off "2 consecutive nonzero exits" by default,
+      # so a daemon's first-ever crash-loop crosses BOTH thresholds on the same sweep.
+      # imp05 keeps counting/logging unconditionally — it exists specifically to catch
+      # failures imp17's prev/cur STATE mechanism might miss — but does NOT add the
+      # label to $failing (and so does not trigger this sweep's mail-to-Mayor) when
+      # THIS sweep's kickstart was a within-budget imp17 heal attempt for the SAME
+      # label: imp17's own design is to heal silently first and escalate only once its
+      # heal budget is exhausted (see heal-kickstart-failed / heals-exhausted below,
+      # which add to $crashloop directly and so are never affected by this).
       if [ "$ex" -gt 0 ] 2>/dev/null; then
         fc=$(( $(_fail_count_get "$lbl") + 1 ))
         _fail_count_set "$lbl" "$fc"
         if [ "$fc" -ge "${DPW_FAIL_THRESHOLD:-2}" ]; then
-          if [ "$(_exit_class "$ex")" = "oom-killed" ]; then
-            oom_killed="$oom_killed $lbl(exit=$ex,sweeps=$fc)"
-            log "OOM-KILLED: $lbl killed by kernel (SIGKILL, exit=$ex) for $fc consecutive sweeps — memory pressure, not a code failure (ga-g92h)"
-          else
-            failing="$failing $lbl(exit=$ex,sweeps=$fc)"
-            log "FAILING: $lbl exiting non-zero (exit=$ex) for $fc consecutive sweeps"
-          fi
+          case " $healing_inflight " in
+            *" $lbl "*)
+              log "FAILING: $lbl exiting non-zero (exit=$ex) for $fc consecutive sweeps (mail suppressed: imp17 auto-heal in-budget attempt $heal_n)" ;;
+            *)
+              if [ "$(_exit_class "$ex")" = "oom-killed" ]; then
+                oom_killed="$oom_killed $lbl(exit=$ex,sweeps=$fc)"
+                log "OOM-KILLED: $lbl killed by kernel (SIGKILL, exit=$ex) for $fc consecutive sweeps — memory pressure, not a code failure (ga-g92h)"
+              else
+                failing="$failing $lbl(exit=$ex,sweeps=$fc)"
+                log "FAILING: $lbl exiting non-zero (exit=$ex) for $fc consecutive sweeps"
+              fi
+              ;;
+          esac
         fi
       else
         _fail_count_reset "$lbl"
@@ -590,9 +607,15 @@ PLIST
   DPW_RELOAD=1
 
   echo "Scenario 4: crash-loop needs TWO consecutive nonzero exits"
+  # AUTOHEAL=0 isolates crash-loop DETECTION (this scenario's subject) from imp17's
+  # heal-vs-escalate POLICY (covered explicitly by scenarios 18-20) — with the default
+  # AUTOHEAL=1, a within-budget heal stays silent (ga-nvef) and this scenario's "alerts
+  # on 2nd exit" would pass only via imp05's independent counter, not crash-loop itself.
   : > "$STATE"; rm -rf "${STATE}.fail-counts"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT="com.gascity.beta:1"
+  DPW_CRASHLOOP_AUTOHEAL=0
   run_sweep && ok "single nonzero exit does NOT alert (transient)" || bad "transient nonzero exit falsely alerted"
   run_sweep && bad "2nd consecutive nonzero should alert (return 1)" || ok "persistent crash-loop alerts on 2nd consecutive nonzero exit"
+  DPW_CRASHLOOP_AUTOHEAL=1
 
   echo "Scenario 5: negative exit (signal restart) is NOT a crash-loop"
   : > "$STATE"; rm -rf "${STATE}.fail-counts"; DPW_TEST_LOADED="$ALL"; DPW_TEST_EXIT="com.gascity.beta:-15"
@@ -854,6 +877,11 @@ GCSTUB19
   # Pre-seed heal counter to HEAL_MAX (simulate prior attempts already consumed)
   mkdir -p "${STATE}.crashloop-heals"
   printf '2\n' > "${STATE}.crashloop-heals/com.gascity.beta"
+  # Pre-seed imp05's own counter too (ga-nvef): in real operation imp05 has been
+  # counting every sweep right alongside imp17's heal attempts, so by the time the
+  # heal budget is exhausted imp05 is already at/past its own threshold as well.
+  mkdir -p "${STATE}.fail-counts"
+  printf '1\n' > "${STATE}.fail-counts/com.gascity.beta"
   # STATE shows beta exited 1 previously (crash-loop condition requires prev>0)
   printf '%s\n' "com.gascity.alpha 0" "com.gascity.beta 1" "com.gascity.gamma 0" > "$STATE"
   MAILSENT20="$TMP/mailsent20"; : > "$MAILSENT20"
@@ -866,6 +894,7 @@ GCSTUB20
   DPW_CRASHLOOP_AUTOHEAL=1 DPW_CRASHLOOP_HEAL_MAX=2 DPW_TEST_LOADED="$ALL" DPW_TEST_EXIT="com.gascity.beta:1"
   run_sweep && bad "heal budget exhausted: should escalate (return 1)" || ok "heal budget exhausted (3rd attempt > max=2): escalates to human (return 1)"
   grep -q "heals-exhausted" "$LOG" 2>/dev/null && ok "heal budget exhausted: 'heals-exhausted' in log" || bad "heal budget exhausted: missing log entry"
+  grep -q "FAILING" "$MAILSENT20" 2>/dev/null && ok "heal budget exhausted (ga-nvef): FAILING still reaches Mayor once escalation is genuine (imp05 not permanently silenced)" || bad "heal budget exhausted: FAILING missing from mail — imp05 wrongly silenced permanently"
 
   echo "Scenario 21 (imp17): daemon recovers (clean exit) → heal counter reset"
   : > "$STATE"; rm -rf "${STATE}.crashloop-heals" "${STATE}.fail-counts"
@@ -926,6 +955,30 @@ GCSTUB20
   : > "$STATE"; run_sweep && bad "2nd consecutive exit=1: should alert (return 1)" || ok "2nd consecutive exit=1 alerts (return 1, FAILING bucket unchanged)"
   grep -q "FAILING: com.gascity.alpha" "$LOG" && ok "log contains FAILING for exit=1 (unchanged behavior)" || bad "log missing FAILING line for exit=1 regression"
   grep -q "OOM-KILLED: com.gascity.alpha" "$LOG" && bad "log wrongly contains OOM-KILLED for exit=1" || ok "log does NOT say OOM-KILLED for exit=1"
+
+  echo "Scenario 26 (ga-nvef × ga-g92h): OOM-killed exit crash-looping with in-budget autoheal → mail stays suppressed, not reclassified as OOM-KILLED"
+  # Neither original fix could test this interaction — ga-nvef's healing_inflight
+  # suppression and ga-g92h's OOM classification were written against different
+  # bases. This proves the merged ordering (suppression check wraps the
+  # classification) holds: an in-budget heal silences imp05's mail regardless of
+  # WHY the exit crossed threshold, exactly like a plain exit=1 in scenario 18.
+  : > "$STATE"; rm -rf "${STATE}.crashloop-heals" "${STATE}.fail-counts"
+  : > "$DPW_TEST_KICKSTARTS"
+  MAILSENT26="$TMP/mailsent26"; : > "$MAILSENT26"
+  cat > "$TMP/gc" <<GCSTUB26
+#!/usr/bin/env bash
+[ "\$1" = "mail" ] && echo "\$*" >> "$MAILSENT26"
+exit 0
+GCSTUB26
+  chmod +x "$TMP/gc"
+  DPW_CRASHLOOP_AUTOHEAL=1 DPW_CRASHLOOP_HEAL_MAX=2 DPW_TEST_LOADED="$ALL" DPW_TEST_EXIT="com.gascity.beta:137"
+  run_sweep >/dev/null 2>&1    # first sweep: prev empty, no crash-loop yet
+  : > "$LOG"
+  run_sweep && ok "OOM exit + in-budget heal: sweep returns 0 (healing in progress)" || bad "OOM exit + in-budget heal: unexpected non-zero return"
+  grep -q "com.gascity.beta" "$DPW_TEST_KICKSTARTS" && ok "OOM exit: kickstart -k issued for crash-looping daemon" || bad "OOM exit: kickstart NOT issued"
+  [ ! -s "$MAILSENT26" ] && ok "OOM exit + in-budget heal: no Mayor mail (imp05 suppressed same as a plain failure)" || bad "OOM exit + in-budget heal: Mayor mail sent prematurely"
+  grep -q "mail suppressed" "$LOG" && ok "log shows imp05 suppression message for the OOM-classified exit" || bad "log missing suppression message for OOM exit"
+  grep -q "OOM-KILLED: com.gascity.beta" "$LOG" && bad "log wrongly emitted OOM-KILLED while heal is in-budget (should stay suppressed)" || ok "log does NOT say OOM-KILLED while heal is in-budget"
 
   echo ""
   echo "daemon-presence-watchdog selftest: PASS=$PASS FAIL=$FAIL"

@@ -46,9 +46,17 @@ You are disposable. You do not carry state between runs. When your bead is done,
 #     is non-atomic; janitor R6 stamps a default expiry only on its NEXT sweep). The
 #     canonical filter treats it as skip-forever → the empty-held-until case must be
 #     `false` (still held), NOT `true`. A bare `pilot:held` alone must exclude.
+#   • ga-en2s-2: do NOT gate the left branch on a BARE `index("pilot:held")`. In the
+#     wild, beads carry `pilot:held-until:<epoch>` WITHOUT the bare `pilot:held`
+#     (stamping is non-atomic — held-until lands first). With `index("pilot:held")|not`
+#     the left branch is TRUE for those beads and the OR short-circuits, so an ACTIVE
+#     hold is never checked: live repro wa-qgdw1 (held-until ~4.7h in the future) came
+#     back as the probe's top-1 candidate. The left branch must mean "no hold label AT
+#     ALL" — `map(select(startswith("pilot:held"))) | length == 0` — which covers both
+#     `pilot:held` and `pilot:held-until:*`; only then is the expiry branch reachable.
 #   • held-until labels ACCUMULATE (never pruned here), so use MAX not .[0] (ga-4aree)
 #     — the bead is still held iff its LATEST stamp is in the future.
-bd ready --metadata-field "gc.routed_to=wa-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "ctx:thin" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused"))) | length == 0) | select(((.labels // []) | index("pilot:held") | not) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end))] | .[:1]'
+bd ready --metadata-field "gc.routed_to=wa-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "ctx:thin" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:held"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end))] | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
