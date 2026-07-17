@@ -111,16 +111,54 @@ scan_shell_query_masking() {
       # NÃO é este bug: `echo` de uma variável não falha, então não existe o estado
       # "a pergunta falhou" — só existe "o campo não está lá", que é um fato legítimo.
       # Medido: sem esta exclusão, 48 dos 54 achados novos eram esse shape (89% ruído).
-      # Por isso o teste abaixo é sobre o INÍCIO da substituição (`=$(<query-tool>`),
-      # não sobre a linha conter um query-tool em qualquer posição.
-      *'=$(echo '* | *'=$(printf '* | *'=$(cat '* | *'=$( echo '*)
-        : ;;   # fonte inerte — não há erro pra confundir com vazio
-      *'2>/dev/null |'*' // '* | *'2>/dev/null |'*'2>/dev/null'* | \
-        *'| jq '*' // "'* | *"| jq "*" // '"*)
-        echo "${file}:${lineno}:C2:${line}"
-        ;;
+      # ⚠️ O ESCOPO É A SUBSTITUIÇÃO, NÃO A LINHA — e é por isso que isto virou função.
+      # A v1 testava a linha INTEIRA num `case`, que casa o primeiro padrão e PARA. Numa
+      # linha com duas substituições —  `x=$(echo a); y=$(cmd 2>/dev/null | jq -r '.a // ""')` —
+      # a inerte casava primeiro e a ARRISCADA nunca era flagrada. Multi-statement na mesma
+      # linha é estilo corrente aqui (este diff mesmo: `notify_mode=0; seed_mode=0`), então
+      # não é canto raro. Achado pelo revisor do gate (run ga-wisp-3ip2my).
+      *) _c2_scan_substitutions "$file" "$lineno" "$line" ;;
     esac
   done < "$file"
+}
+
+# ── C2: classifica CADA `VAR=$(...)` da linha, isoladamente ─────────────────
+# Existe porque o `case` sobre a linha inteira casa o primeiro padrão e para: numa linha
+# com uma substituição inerte E uma arriscada, a inerte vencia e a arriscada sumia
+# (revisor do gate, run ga-wisp-3ip2my). Aqui cada substituição é julgada sozinha.
+#
+# ⚠️ O FIM DO FRAGMENTO É O PRÓXIMO `=$(`, NUNCA o primeiro ')'. Cortar no ')' parece
+# óbvio e está ERRADO: `n=$(bd ... 2>/dev/null | python3 -c "...print(len(json.load(
+# sys.stdin)))" 2>/dev/null)` tem ')' DENTRO das aspas, então o corte perde o segundo
+# `2>/dev/null` e a linha deixa de ser flagrada. Eu escrevi essa versão, chamei de
+# "limitação declarada aceitável", e ela QUEBROU uma fixture que já passava — o selftest
+# do scanner pegou (20/23). Delimitar pela próxima substituição sobre-aproxima (o
+# fragmento pode incluir texto após o ')' de fecho), mas sobre-aproximar erra pra FLAGRAR
+# a mais, e neste scanner — report-only — um achado a mais custa um humano olhar, um a
+# menos custa ninguém olhar. O teste de inerte só precisa do INÍCIO do fragmento, então a
+# sobra à direita não o afeta.
+_c2_scan_substitutions() {
+  _file="$1"; _lineno="$2"; _rest="$3"
+  while [ "${_rest#*=\$\(}" != "$_rest" ]; do
+    _rest="${_rest#*=\$\(}"
+    case "$_rest" in
+      *'=$('*) _frag="${_rest%%=\$\(*}" ;;   # até a PRÓXIMA substituição
+      *)       _frag="$_rest" ;;             # última: vai até o fim da linha
+    esac
+    case "$_frag" in
+      # FONTE INERTE: `echo`/`printf`/`cat` de uma variável não falha ⇒ não existe o
+      # estado "a pergunta falhou", só "o campo não está lá", que é fato legítimo.
+      # Medido: sem esta exclusão, 48 dos 54 achados eram este shape (89% de ruído).
+      'echo '* | 'printf '* | 'cat '* | ' echo '* | ' printf '* | ' cat '*) continue ;;
+    esac
+    case "$_frag" in
+      *'2>/dev/null |'*' // '* | *'2>/dev/null |'*'2>/dev/null'* | \
+        *'| jq '*' // "'* | *"| jq "*" // '"*)
+        echo "${_file}:${_lineno}:C2:${_frag}"
+        return 0 ;;   # 1 achado por linha basta: o objetivo é a linha ser OLHADA
+    esac
+  done
+  return 1
 }
 
 # ── C1: JS/TS empty catch block ─────────────────────────────────────────────
@@ -215,9 +253,28 @@ scan_py_bare_except() {
 # selftest's notify-via-variable/notify-via-function fixtures for the
 # falsification proof (ga-p5q3 defense (b)).
 scan_launchd_no_notify() {
-  local plist="$1" args line script=""
-  args="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments" "$plist" 2>/dev/null)" || return 0
-  [ -z "$args" ] && return 0
+  local plist="$1" args line script="" rc_pa rc_pg
+  # ⚠️ FAIL-OPEN SILENCIOSO ERA AQUI (revisor do gate, run ga-wisp-3f5t3y). A v1 fazia
+  #   args="$(PlistBuddy -c "Print :ProgramArguments" ... 2>/dev/null)" || return 0
+  # e `return 0` significa "nada a reportar" = "este job avisa, está tudo bem". Ou seja:
+  # NÃO CONSEGUI LER o plist saía igual a JÁ CHEQUEI E ESTÁ OK. Fail-open mudo dentro do
+  # exato tipo de ferramenta que este arquivo existe pra caçar — e, ao contrário das
+  # outras limitações, esta não estava declarada em "Known limitations".
+  # Gatilho concreto: o launchd aceita a chave `Program` (string única) como alternativa
+  # válida a `ProgramArguments` (array). Num plist assim, o Print :ProgramArguments FALHA
+  # e o job inteiro era dado como saudável sem ninguém olhar.
+  args="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments" "$plist" 2>/dev/null)"; rc_pa=$?
+  if [ "$rc_pa" -ne 0 ] || [ -z "$args" ]; then
+    # fallback: a outra chave válida do launchd.
+    args="$(/usr/libexec/PlistBuddy -c "Print :Program" "$plist" 2>/dev/null)"; rc_pg=$?
+    if [ "$rc_pg" -ne 0 ] || [ -z "$args" ]; then
+      # NENHUMA das duas chaves foi legível. Não sei se este job avisa — e "não sei" NÃO
+      # é "está ok". Reporto o desconhecido em vez de engolir (o scanner é report-only:
+      # o custo de um achado a mais é um humano olhar; o de um a menos é ninguém olhar).
+      echo "${plist}:1:C3:launchd plist ilegível (nem :ProgramArguments nem :Program) — NÃO consegui apurar se este job avisa em falha; isto é 'não sei', não 'está ok'"
+      return 0
+    fi
+  fi
   while IFS= read -r line; do
     line="$(printf '%s' "$line" | tr -d '[:space:]')"
     case "$line" in

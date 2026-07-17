@@ -231,6 +231,33 @@ cat > "$FIXDIR/clean/good-daemon.plist" <<PLISTEOF
 </dict>
 </plist>
 PLISTEOF
+
+# ── ga-vkjs (revisor do gate, run ga-wisp-3f5t3y): o launchd aceita a chave
+# `Program` (string única) como alternativa VÁLIDA a `ProgramArguments` (array).
+# A v1 fazia `PlistBuddy -c "Print :ProgramArguments" || return 0`, e `return 0`
+# significa "nada a reportar" = "este job avisa". Ou seja: NÃO CONSEGUI LER saía
+# igual a JÁ CHEQUEI E ESTÁ OK — fail-open mudo dentro da ferramenta que existe
+# pra caçar fail-open mudo. Estas 2 fixtures exercitam o que nenhuma exercitava.
+mkdir -p "$FIXDIR/progkey"
+cat > "$FIXDIR/progkey/prog-key-daemon.plist" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.test.progkey</string>
+    <key>Program</key><string>$FIXDIR/progkey/silent-prog.sh</string>
+</dict>
+</plist>
+PLISTEOF
+cat > "$FIXDIR/progkey/silent-prog.sh" <<'EOS'
+#!/bin/bash
+echo "faco trabalho e morro calado"
+EOS
+chmod +x "$FIXDIR/progkey/silent-prog.sh"
+
+cat > "$FIXDIR/progkey/ilegivel.plist" <<'PLISTEOF'
+isto nao e um plist valido de jeito nenhum
+PLISTEOF
 cp "$FIXDIR/clean/good-daemon.plist" "$FIXDIR/mixed/good-daemon.plist"
 sed -i '' "s#$FIXDIR/clean/good-daemon.sh#$FIXDIR/mixed/good-daemon.sh#" "$FIXDIR/mixed/good-daemon.plist"
 
@@ -333,6 +360,14 @@ r="$(scan_launchd_no_notify "$FIXDIR/mixed/good-func-daemon.plist")"
 # ═════════════════════════════════════════════════════════════════════════
 # 2. End-to-end driver: mixed dir finds a nonzero, expected-shape count
 # ═════════════════════════════════════════════════════════════════════════
+r="$(scan_launchd_no_notify "$FIXDIR/progkey/prog-key-daemon.plist")"
+case "$r" in *:C3:*) ok "ga-vkjs: plist com chave Program (nao ProgramArguments) -> job silencioso FLAGRADO (era fail-open mudo)" ;;
+  *) bad "ga-vkjs: plist com chave Program NAO flagrado — PlistBuddy falhou e virou 'esta ok': '$r'" ;; esac
+
+r="$(scan_launchd_no_notify "$FIXDIR/progkey/ilegivel.plist")"
+case "$r" in *:C3:*) ok "ga-vkjs: plist ilegivel -> reporta 'nao sei' em vez de engolir (nao-sei != esta-ok)" ;;
+  *) bad "ga-vkjs: plist ilegivel passou EM SILENCIO — o fail-open que este scanner existe pra caçar: '$r'" ;; esac
+
 echo "── run_scan end-to-end (mixed fixture dir) ──"
 MIXED_OUT="$(mktemp)"
 run_scan "$MIXED_OUT" "$FIXDIR/mixed"

@@ -97,6 +97,36 @@ run >/dev/null
   && ok "dry-run (sem --notify) deixou o baseline intacto" \
   || bad "dry-run mexeu no baseline — silenciaria o alerta real (wa-8fzuk/wa-4fmxd)"
 
+echo "── 7. rc=1 do scanner (o ERRO INTERNO documentado dele) tem que GRITAR ──"
+# O revisor do gate pegou: meus testes de exit-3 cobriam rc=127 (binário ausente) e
+# baseline ilegível — NUNCA o rc=1, que é o único erro que o scanner REALMENTE emite
+# ("0 on a completed scan; 1 only on an internal error"). O `-gt 1` deixava passar e o
+# erro virava "0 achados". O controle (rc=0) prova que não estou só gritando sempre.
+cat > "$TD/scan_rc1.sh" <<'EOS'
+#!/bin/bash
+exit 1
+EOS
+cat > "$TD/scan_rc0.sh" <<'EOS'
+#!/bin/bash
+exit 0
+EOS
+chmod +x "$TD/scan_rc1.sh" "$TD/scan_rc0.sh"
+printf 'x.sh\tC2\tc\t%s\n' "$NOW" > "$TD/base.tsv"
+rc=$(env SILENT_IGN_SCAN="$TD/scan_rc1.sh" SILENT_IGN_ROOTS=/tmp \
+     SILENT_IGN_BASELINE="$TD/base.tsv" timeout 60 bash "$WATCH" >/dev/null 2>&1; echo $?)
+[ "$rc" = "3" ] && ok "scanner rc=1 (erro interno) -> exit 3, não 'zero achados'" \
+                || bad "scanner rc=1 deu rc=$rc, esperado 3 — o erro virou silêncio"
+rc=$(env SILENT_IGN_SCAN="$TD/scan_rc0.sh" SILENT_IGN_ROOTS=/tmp \
+     SILENT_IGN_BASELINE="$TD/base.tsv" timeout 60 bash "$WATCH" >/dev/null 2>&1; echo $?)
+[ "$rc" = "0" ] && ok "CONTROLE: scanner rc=0 sem achados -> exit 0 (0 e 1 são distinguidos)" \
+                || bad "scanner rc=0 deu rc=$rc, esperado 0"
+
+echo "── 8. HQ inexistente (GC_CITY_PATH errado) grita em vez de varrer o vazio ──"
+rc=$(env GC_CITY_PATH=/hq/que/nao/existe SILENT_IGN_SCAN="$TD/scan_rc0.sh" \
+     SILENT_IGN_BASELINE="$TD/base.tsv" timeout 60 bash "$WATCH" >/dev/null 2>&1; echo $?)
+[ "$rc" = "3" ] && ok "HQ não-diretório -> exit 3 (a raiz principal não entra sem -d)" \
+                || bad "HQ inexistente deu rc=$rc, esperado 3"
+
 echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"

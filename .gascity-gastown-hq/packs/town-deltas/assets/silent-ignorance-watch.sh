@@ -57,6 +57,16 @@ done
 #  e marketing[5]. Rig novo = nunca varrido, e ninguém percebe.)
 if [ -z "$ROOTS" ]; then
   HQ="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
+  # ⚠️ O HQ entrava em ROOTS SEM checagem de -d, ao contrário dos rigs logo abaixo (que
+  # SÃO checados). GC_CITY_PATH errado ⇒ o scanner bate no próprio guard `[ ! -d ]`, sai 1
+  # com stdout vazio, e (antes do fix do rc abaixo) isso virava "varri, nada aqui".
+  # Achado do revisor do gate (run ga-wisp-3f5t3y). A assimetria era o bug: eu tinha
+  # escrito a checagem certa pros rigs e esquecido a raiz mais importante.
+  if [ ! -d "$HQ" ]; then
+    echo "silent-ignorance-watch: ERRO — HQ '$HQ' não é um diretório (GC_CITY_PATH errado?)." >&2
+    echo "  é a raiz principal da varredura: sem ela não afirmo nada. (Ignorância Silenciosa)" >&2
+    exit 3
+  fi
   ROOTS="$HQ"
   rigs_json=$(gc --city "$HQ" rig list --json 2>/dev/null)
   if [ -z "$rigs_json" ]; then
@@ -77,15 +87,25 @@ fi
 # com o scanner QUEBRADO. Peguei falsificando (scanner inexistente + baseline válido
 # -> exit=0, "0 achado(s)"). O monitor da Ignorância Silenciosa era, ele mesmo, uma
 # instância dela. Escrevendo direto no arquivo, o `exit` roda no shell principal.
-tmp_all=$(mktemp); tmp_raw=$(mktemp); tmp_new=$(mktemp)
-trap 'rm -f "$tmp_all" "$tmp_raw" "$tmp_new" "${tmp_all}.keys" 2>/dev/null' EXIT
+tmp_all=$(mktemp); tmp_raw=$(mktemp); tmp_new=$(mktemp); tmp_err=$(mktemp)
+trap 'rm -f "$tmp_all" "$tmp_raw" "$tmp_new" "$tmp_err" "${tmp_all}.keys" 2>/dev/null' EXIT
 : > "$tmp_raw"
 for r in $ROOTS; do
-  out=$(bash "$SCAN" --path "$r" --quiet 2>/dev/null); rc=$?
-  # rc 0/1 = varreu (com ou sem achados). Qualquer outra coisa = NÃO OLHEI.
-  if [ "$rc" -gt 1 ]; then
+  # ⚠️ QUALQUER rc != 0 é ERRO. A v2 fazia `[ "$rc" -gt 1 ]` com o comentário
+  # "rc 0/1 = varreu" — o contrato do scanner é o OPOSTO e está escrito nele
+  # (linhas 68-69): "0 on a completed scan; 1 only on an internal error (e.g. a
+  # requested --path does not exist)". Ou seja, rc=1 É o sinal de erro dele, e o
+  # `-gt 1` o deixava passar: stdout vazio + stderr engolido = "varri este root,
+  # nada aqui", indistinguível da verdade. Exatamente o que o comentário logo
+  # acima jura ser impossível. Achado pelo revisor do gate (run ga-wisp-3f5t3y) e
+  # FALSIFICADO antes de aceitar: `--path /nao/existe` -> rc=1; path real vazio ->
+  # rc=0. Quarta vez que este monitor foi instância da classe que ele caça.
+  out=$(bash "$SCAN" --path "$r" --quiet 2>"$tmp_err"); rc=$?
+  if [ "$rc" -ne 0 ]; then
     echo "silent-ignorance-watch: ERRO — scanner falhou em '$r' (rc=$rc). NÃO é 'zero achados'." >&2
     echo "  não consegui varrer -> não afirmo nada sobre este root. (Ignorância Silenciosa)" >&2
+    # o stderr do scanner ia pra /dev/null e a causa morria junto — agora ele fala.
+    [ -s "$tmp_err" ] && sed 's/^/    scanner: /' "$tmp_err" >&2
     exit 3
   fi
   printf '%s\n' "$out" | grep -E ':(C1|C2|C3):' >> "$tmp_raw" || true
