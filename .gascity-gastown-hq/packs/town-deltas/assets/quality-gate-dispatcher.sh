@@ -280,11 +280,13 @@ case "$GATE_REVIEWERS_PER_RUN"   in ''|*[!0-9]*) GATE_REVIEWERS_PER_RUN=3 ;; esa
 # OR explicitly closed. A present, non-closed session (active OR asleep) is ALIVE
 # — `asleep` is the normal state of a reviewer that finished or is between turns,
 # so it must NEVER be treated as dead. Pure; no I/O.
+# SELFTEST-EXTRACT session-is-dead-fn: BEGIN
 session_is_dead() {
   local present="$1" closed="$2"
   if [ "$present" = "0" ]; then echo 1; return 0; fi
   case "$closed" in true|TRUE|True|1) echo 1 ;; *) echo 0 ;; esac
 }
+# SELFTEST-EXTRACT session-is-dead-fn: END
 
 # classify_slot_action <bead_closed 0|1> <session_dead 0|1> <budget_remaining int>
 # The single decision for ONE reviewer slot in a poll iteration. Pure; no I/O.
@@ -1476,11 +1478,13 @@ spawn_abort_should_page() {
 #   unknown  — bd show failed; don't guess, skip this bead this sweep
 #   skip     — already closed; nothing to do
 #   requeue  — genuinely not closed; safe to park as REQUEUED
+# SELFTEST-EXTRACT vb-status-action-fn: BEGIN
 vb_status_action() {
   local status="$1"
   if [ "$status" = "__UNKNOWN__" ]; then echo "unknown"; return 0; fi
   if [ "$status" = "closed" ]; then echo "skip"; else echo "requeue"; fi
 }
+# SELFTEST-EXTRACT vb-status-action-fn: END
 
 # NOTE: set_gate_status() is provided by the guard lib sourced above (line ~58,
 # GATE_GUARD_LIB_ONLY=1) — same DRY pattern as parse_marker_id. Single source of
@@ -2850,9 +2854,19 @@ gate_collect_verdicts() {
   FAIL_REASONS=""
   for j in "${!VERDICT_BEAD_IDS[@]}"; do
     VB="${VERDICT_BEAD_IDS[$j]}"
-    VB_JSON=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null || echo "[]")
-    VB_STATUS=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .status // "open"')
-    VB_LABELS=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")')
+    # ga-art5: `|| echo "[]"` used to mask a failed `bd show` as an empty
+    # result, which `.status // "open"` then reads as a genuinely-open
+    # verdict — the exact error/empty conflation this bead exists to close.
+    # Capture the query's own rc explicitly instead: on failure we don't know
+    # this bead's status, so skip it this sweep rather than guess (it stays
+    # in VERDICT_BEAD_IDS and is re-read next sweep; the outer VERDICT_TIMEOUT_MINUTES
+    # backstop still applies either way).
+    if ! VB_JSON=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null); then
+      log "  Verdict bead $VB status unreadable this sweep (bd show failed — transient Dolt hiccup?) — skipping, will retry next sweep (root-class:error-vs-empty, ga-art5)."
+      continue
+    fi
+    VB_STATUS=$(printf '%s' "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
+    VB_LABELS=$(printf '%s' "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || true)
 
     # ga-7lz1: a reviewer that WRITES its verdict (label + comment) but DRAINS
     # before the final `bd close` leaves this bead OPEN forever — the
@@ -3241,10 +3255,23 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
         PC_SESS_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "")
         PC_ANY_PENDING=0
         PC_ALL_PENDING_DEAD=1
+        # SELFTEST-EXTRACT phase-c-dead-reviewer-classify-fn: BEGIN
         for PC_J in "${!VERDICT_BEAD_IDS[@]}"; do
           PC_VB="${VERDICT_BEAD_IDS[$PC_J]}"
-          PC_VB_ST=$(bd -C "$GC_CITY" show "$PC_VB" --json 2>/dev/null \
-            | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || echo "open")
+          # ga-art5: `|| echo "open"` used to mask a failed `bd show` as a
+          # genuinely-open verdict bead, feeding this classification loop
+          # false data. We can't confirm this VB's status -> we can't confirm
+          # "ALL pending are dead" either, so treat it the same as finding a
+          # confirmed-LIVE reviewer (existing style just below): stop
+          # classifying and fall through to the TIMEOUT path, which
+          # independently re-reads each bead's status (with its own
+          # unknown-safe handling) rather than guessing here.
+          if ! PC_VB_JSON=$(bd -C "$GC_CITY" show "$PC_VB" --json 2>/dev/null); then
+            warn "  Phase C: verdict bead $PC_VB status unreadable this sweep (bd show failed — transient Dolt hiccup?) — not confirming dead-reviewer classification; falling through to the TIMEOUT path instead of guessing (root-class:error-vs-empty, ga-art5)."
+            PC_ALL_PENDING_DEAD=0
+            break
+          fi
+          PC_VB_ST=$(printf '%s' "$PC_VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
           [ "$PC_VB_ST" = "closed" ] && continue
           PC_ANY_PENDING=1
           PC_SID="${SESSION_IDS[$PC_J]:-}"
@@ -3263,6 +3290,7 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
             break
           fi
         done
+        # SELFTEST-EXTRACT phase-c-dead-reviewer-classify-fn: END
         if [ "$PC_ANY_PENDING" = "1" ] && [ "$PC_ALL_PENDING_DEAD" = "1" ]; then
           QUOTA_REQUEUE=1
           REQUEUE_REASON="dead-reviewer"
@@ -3272,16 +3300,34 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
           warn "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) TIMED OUT after ${PC_ELAPSED}s (limit=${PC_TIMEOUT_SECS}s) with $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts. Treating as FAIL."
           OVERALL_VERDICT="FAIL"
           FAIL_REASONS="TIMEOUT: reviewers did not submit verdicts within ${PC_TIMEOUT_MIN} minutes."
+          # SELFTEST-EXTRACT phase-c-timeout-close-fn: BEGIN
           for PC_VB in "${VERDICT_BEAD_IDS[@]}"; do
-            PC_VB_STATUS=$(bd -C "$GC_CITY" show "$PC_VB" --json 2>/dev/null \
-              | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
-            if [ "$PC_VB_STATUS" != "closed" ]; then
-              bd -C "$GC_CITY" label remove "$PC_VB" "verdict:pending" -q 2>/dev/null || true
-              bd -C "$GC_CITY" label add    "$PC_VB" "verdict:TIMEOUT" -q 2>/dev/null || true
-              bd -C "$GC_CITY" comment "$PC_VB" "VERDICT: TIMEOUT — reviewer session did not complete within ${PC_TIMEOUT_MIN}m" 2>/dev/null || true
-              bd -C "$GC_CITY" close "$PC_VB" 2>/dev/null || true
+            # ga-art5: same conflation this whole bead exists to close, now
+            # at the site that does the HARD terminal action (label+comment+
+            # close) — a `bd show` failure must never produce the same
+            # decision as a genuinely-still-open verdict bead. Mirrors the
+            # already-fixed ga-eqjo/ga-x3nmz requeue loops above
+            # (vb_status_action, defined near the top of this file).
+            if PC_VB_JSON=$(bd -C "$GC_CITY" show "$PC_VB" --json 2>/dev/null); then
+              PC_VB_STATUS=$(printf '%s' "$PC_VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
+            else
+              PC_VB_STATUS="__UNKNOWN__"
             fi
+            case "$(vb_status_action "$PC_VB_STATUS")" in
+              unknown)
+                log "  Verdict bead $PC_VB status unreadable this sweep (bd show failed — transient Dolt hiccup?) — skipping, will retry next sweep (root-class:error-vs-empty, ga-art5)."
+                continue
+                ;;
+              skip) : ;;
+              requeue)
+                bd -C "$GC_CITY" label remove "$PC_VB" "verdict:pending" -q 2>/dev/null || true
+                bd -C "$GC_CITY" label add    "$PC_VB" "verdict:TIMEOUT" -q 2>/dev/null || true
+                bd -C "$GC_CITY" comment "$PC_VB" "VERDICT: TIMEOUT — reviewer session did not complete within ${PC_TIMEOUT_MIN}m" 2>/dev/null || true
+                bd -C "$GC_CITY" close "$PC_VB" 2>/dev/null || true
+                ;;
+            esac
           done
+          # SELFTEST-EXTRACT phase-c-timeout-close-fn: END
           gate_finalize_run
         fi
       else
