@@ -1740,7 +1740,7 @@ def _open_running_runs():
         return None
 
 
-def reap_hung_runs(sessions, now, rstate):
+def reap_hung_runs(sessions, now, rstate, open_running_runs):
     """FIX 1: reap a HUNG gate-reviewer. For every open gate-status:running gate-run
     past REVIEW_HANG_MINUTES with 0 verdicts delivered whose reviewer session is
     dead/idle SUSTAINED across two samples, do the FULL manual reap the Mayor did by
@@ -1748,7 +1748,7 @@ def reap_hung_runs(sessions, now, rstate):
     its marker so a fresh run reviews it. Bounded, dry-run-aware, fully fail-safe."""
     if not GRW_ENABLED or not GRW_REAP_HUNG_ENABLED:
         return
-    runs = _open_running_runs()
+    runs = open_running_runs
     if runs is None:
         print("[watchdog] reap: gate-run query unavailable — fail-safe skip (no blind reap)", flush=True)
         return
@@ -1910,7 +1910,7 @@ def stranded_escalation_needs_human_targets(marker_id, source_bead):
     return targets
 
 
-def reap_stranded_verdict_runs(now):
+def reap_stranded_verdict_runs(now, open_running_runs):
     """FIX 5: recover a STRANDED-VERDICT run (all required verdicts delivered, still
     gate-status:running, managing sweep dead). See stranded_verdict_verdict. Anchored
     on time since the LAST VERDICT was DELIVERED (ga-5t5w) — NOT run creation time;
@@ -1927,7 +1927,7 @@ def reap_stranded_verdict_runs(now):
     time → skip)."""
     if not GRW_ENABLED or not GRW_REAP_STRANDED_ENABLED:
         return
-    runs = _open_running_runs()
+    runs = open_running_runs
     if runs is None:
         return  # gate-run query unavailable → fail-safe skip
     acted = 0
@@ -2225,7 +2225,7 @@ def _markers_with_open_run(runs):
     return out
 
 
-def reap_stale_review_markers(now, rstate):
+def reap_stale_review_markers(now, rstate, open_running_runs):
     """FIX 6: requeue a marker STRANDED at gate-status:dispatching|reviewing whose
     reviewer DIED leaving NO open running run — the wa-ppe5v orphan (the Pilot counts
     dispatching|reviewing as active and DROPS the gate:needs-fix source forever). Each
@@ -2244,7 +2244,7 @@ def reap_stale_review_markers(now, rstate):
         markers = json.loads(r.stdout) or []
     except Exception:
         return
-    open_run_markers = _markers_with_open_run(_open_running_runs())
+    open_run_markers = _markers_with_open_run(open_running_runs)
     acted = 0
     for m in markers:
         if acted >= STALE_REVIEW_MAX_PER_SWEEP:
@@ -2745,6 +2745,13 @@ def main():
         # One session-list query per loop, shared by every detector's governor check
         # (replaces the per-block coarse cooldown; bounds this daemon's own gc load).
         sessions = _session_list_json()
+        # One gate-run query per loop, shared by FIX 1/5/6's first-look sample (ga-7e7a:
+        # each independently issued an identical `bd list --json` every cycle — same
+        # data, 3 fresh connections). FIX 6's SUSTAINED-confirm resample (after
+        # LIVENESS_RESAMPLE_SEC, inside reap_stale_review_markers) intentionally keeps
+        # its OWN fresh _open_running_runs() call — its whole purpose is detecting a run
+        # that appeared since this snapshot, so it must not reuse it.
+        open_running_runs = _open_running_runs()
         lp = last_pass_epoch()
 
         # ===== DIRECT SELF-HEAL (no dog, no Mayor) — runs EVERY sweep, independent
@@ -2752,11 +2759,11 @@ def main():
         # DIRECTLY heal the two toils the Mayor fixed by hand; a reap FREES load, and
         # if Dolt is wedged the queries fail → fail-safe skip). Each is fully guarded.
         try:
-            reap_hung_runs(sessions, now, rstate)
+            reap_hung_runs(sessions, now, rstate, open_running_runs)
         except Exception as e:
             print("[watchdog] reap_hung_runs error (continuing): %r" % e, flush=True)
         try:
-            reap_stranded_verdict_runs(now)
+            reap_stranded_verdict_runs(now, open_running_runs)
         except Exception as e:
             print("[watchdog] reap_stranded_verdict_runs error (continuing): %r" % e, flush=True)
         try:
@@ -2768,7 +2775,7 @@ def main():
         except Exception as e:
             print("[watchdog] reap_orphan_and_stale_markers error (continuing): %r" % e, flush=True)
         try:
-            reap_stale_review_markers(now, rstate)
+            reap_stale_review_markers(now, rstate, open_running_runs)
         except Exception as e:
             print("[watchdog] reap_stale_review_markers error (continuing): %r" % e, flush=True)
         try:
