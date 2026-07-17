@@ -69,7 +69,7 @@ mk() { # id created_at [labels-csv]
 
 echo "── (i) broken-oldest marker is SKIPPED for the NEWEST healthy one ──"
 FIX=$(printf '[%s,%s,%s]' \
-  "$(mk broken 2026-06-10T19:00:00Z 'gate-status:queued,gate:rebase-attempt:2')" \
+  "$(mk broken 2026-06-10T19:00:00Z 'gate-status:queued,gate:exiled-tier5:2')" \
   "$(mk healthyA 2026-06-10T20:00:00Z 'gate-status:queued')" \
   "$(mk healthyB 2026-06-10T21:00:00Z 'gate-status:queued')")
 SEL=$(printf '%s' "$FIX" | select_marker)
@@ -87,15 +87,18 @@ SEL=$(printf '%s' "$FIX" | select_marker)
   || bad "expected h3, got '$SEL'"
 
 echo "── (iii) all-broken queue still drains (newest broken retried, never deadlocks) ──"
+# ga-gpcx: b2 carries the current label name, b1 the legacy pre-2026-07-17 name
+# (gate:rebase-attempt:N) — proves both names sink to this tier AND interoperate
+# correctly under the newest-first tiebreak during a mixed-fleet rename rollout.
 FIX=$(printf '[%s,%s]' \
-  "$(mk b2 2026-06-10T20:00:00Z 'gate-status:queued,gate:rebase-attempt:1')" \
+  "$(mk b2 2026-06-10T20:00:00Z 'gate-status:queued,gate:exiled-tier5:1')" \
   "$(mk b1 2026-06-10T19:00:00Z 'gate-status:queued,gate:rebase-attempt:3')")
 SEL=$(printf '%s' "$FIX" | select_marker)
-[ "$SEL" = "b2" ] && ok "only-broken queue → newest broken (b2) retried (no starvation/deadlock)" \
+[ "$SEL" = "b2" ] && ok "only-broken queue (mixed current+legacy label names) → newest broken (b2) retried (no starvation/deadlock)" \
   || bad "expected b2, got '$SEL'"
 
 echo "── (iv) a lone broken marker is still selected (gets escalated, not ignored) ──"
-FIX="[$(mk lone 2026-06-10T19:00:00Z 'gate-status:queued,gate:rebase-attempt:2')]"
+FIX="[$(mk lone 2026-06-10T19:00:00Z 'gate-status:queued,gate:exiled-tier5:2')]"
 SEL=$(printf '%s' "$FIX" | select_marker)
 [ "$SEL" = "lone" ] && ok "single broken marker still picked (reaches immediate-skip/escalation)" \
   || bad "expected lone, got '$SEL'"
@@ -103,8 +106,8 @@ SEL=$(printf '%s' "$FIX" | select_marker)
 echo "── (v) source drift-guards: shipped dispatcher matches tested logic ──"
 grep -q 'def has_rebase_fail' "$DISPATCHER" \
   && ok "dispatcher defines has_rebase_fail in selection" || bad "missing has_rebase_fail"
-grep -q 'gate:rebase-attempt:\[0-9\]+' "$DISPATCHER" \
-  && ok "selection matches gate:rebase-attempt:N labels" || bad "selection regex missing"
+grep -q 'gate:(rebase-attempt|exiled-tier5):\[0-9\]+' "$DISPATCHER" \
+  && ok "selection matches gate:exiled-tier5:N labels (and the pre-ga-gpcx legacy name)" || bad "selection regex missing"
 grep -q 'map(select(has_rebase_fail))' "$DISPATCHER" \
   && ok "rebase-fail tier still isolated (sinks to the back)" || bad "rebase-fail tier not found — head-of-line fix may have regressed"
 grep -q '| reverse' "$DISPATCHER" \

@@ -108,7 +108,7 @@ SEL=$(select_marker "$FIX" "$NOW_EPOCH" "$THRESH")
 
 echo "── (4) aged rebase-fail marker must NOT jump ahead of a fresh healthy one (ga-q3ig2 guarantee) ──"
 FIX=$(printf '[%s,%s]' \
-  "$(mk broken "$(ago 7200)" 'gate-status:queued,gate:rebase-attempt:2')" \
+  "$(mk broken "$(ago 7200)" 'gate-status:queued,gate:exiled-tier5:2')" \
   "$(mk fresh "$(ago 60)" 'gate-status:queued')")
 SEL=$(select_marker "$FIX" "$NOW_EPOCH" "$THRESH")
 [ "$SEL" = "fresh" ] && ok "aged-but-broken marker still sinks behind a fresh healthy one — aging is healthy-tier-only" \
@@ -123,11 +123,14 @@ SEL=$(select_marker "$FIX" "$NOW_EPOCH" "$THRESH")
   || bad "expected newer, got '$SEL' (off-by-one on the aging boundary)"
 
 echo "── (6) all-rebase-fail queue: newest-broken still wins, aging irrelevant (unchanged behavior) ──"
+# ga-gpcx: b1 carries the legacy pre-2026-07-17 label name (gate:rebase-attempt:N),
+# b2 the current name — proves both still sink here and interoperate under the
+# newest-first tiebreak.
 FIX=$(printf '[%s,%s]' \
   "$(mk b1 "$(ago 10800)" 'gate-status:queued,gate:rebase-attempt:3')" \
-  "$(mk b2 "$(ago 7200)" 'gate-status:queued,gate:rebase-attempt:1')")
+  "$(mk b2 "$(ago 7200)" 'gate-status:queued,gate:exiled-tier5:1')")
 SEL=$(select_marker "$FIX" "$NOW_EPOCH" "$THRESH")
-[ "$SEL" = "b2" ] && ok "newest broken (b2) wins when only rebase-fail markers are queued (matches 4cae0a2c49, no aging applied even though both are 'aged')" \
+[ "$SEL" = "b2" ] && ok "newest broken (b2, current label name) wins over legacy-named b1 when only rebase-fail markers are queued (matches 4cae0a2c49, no aging applied even though both are 'aged')" \
   || bad "expected b2, got '$SEL'"
 
 echo "── (7) drift-guards: shipped dispatcher matches tested logic ──"

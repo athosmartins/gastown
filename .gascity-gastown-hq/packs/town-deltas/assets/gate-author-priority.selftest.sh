@@ -95,7 +95,7 @@ SEL=$(select_marker "$FIX" "$NOW_EPOCH" "$THRESH" "oracle")
 
 echo "── (4) oracle REBASE-FAIL marker must NOT jump a healthy non-oracle marker (ga-q3ig2) ──"
 FIX=$(printf '[%s,%s]' \
-  "$(mk orcbroken "$(ago 3600)" oracle "gate-status:queued,gate:rebase-attempt:2")" \
+  "$(mk orcbroken "$(ago 3600)" oracle "gate-status:queued,gate:exiled-tier5:2")" \
   "$(mk othok     "$(ago 60)"   mila)")
 SEL=$(select_marker "$FIX" "$NOW_EPOCH" "$THRESH" "oracle")
 [ "$SEL" = "othok" ] && ok "oracle's rebase-fail marker sinks to the back; healthy non-oracle wins (broken branch can't travar the queue)" \

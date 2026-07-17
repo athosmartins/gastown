@@ -123,7 +123,7 @@ else
   ok "dispatcher no longer uses the broken legacy grep conflict check"
 fi
 grep -q 'AUTHOR_ALIVE' "$DISPATCHER" && ok "dispatcher has never-strand dead-author branch (AUTHOR_ALIVE)" || bad "no dead-author handling"
-grep -q 'gate:rebase-attempt:' "$DISPATCHER" && ok "dispatcher tracks bounded gate:rebase-attempt:N" || bad "no bounded retry counter"
+grep -q 'gate:exiled-tier5:' "$DISPATCHER" && ok "dispatcher tracks bounded gate:exiled-tier5:N" || bad "no bounded retry counter"
 grep -q 'mail send mayor' "$DISPATCHER" && ok "dispatcher escalates to Mayor after max attempts" || bad "no Mayor escalation"
 
 echo "── (iv) gate-done.md fail-closed push verification + rig pin ──"

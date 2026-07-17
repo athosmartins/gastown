@@ -1117,7 +1117,7 @@ gate_circuit_break_check() {
   local condition="${1:-}"         # "no_branch" | "ahead_dead" | "retry_dead"
   local ahead="${2:-}"             # commit-count or empty
   local author_alive="${3:-0}"     # 0 = dead/empty, 1 = alive
-  local rebase_attempt="${4:-0}"   # current gate:rebase-attempt:N counter
+  local rebase_attempt="${4:-0}"   # current gate:exiled-tier5:N counter
   local rebase_max="${5:-3}"       # MAX_REBASE_ATTEMPTS
   local ahead_max="${6:-10}"       # GATE_REBASE_AHEAD_MAX
 
@@ -1338,7 +1338,7 @@ gate_behind_envelope_action() {
 }
 
 # gate_rebase_attempt_advanced <intended_next_attempt> <actual_highest_after_write>
-# ga-6dp9 (bug 3 of 3): the gate:rebase-attempt:N label swap (remove old, add
+# ga-6dp9 (bug 3 of 3): the gate:exiled-tier5:N label swap (remove old, add
 # new) is fire-and-forget (`|| true`, matching this script's fail-soft
 # convention for label writes) — a transient Dolt write failure on the ADD is
 # silently swallowed, leaving the counter at its OLD value. The dispatcher
@@ -1363,7 +1363,17 @@ gate_rebase_attempt_advanced() {
 }
 
 # read_rebase_attempt <marker_id> — fetch the current highest
-# gate:rebase-attempt:N label value from the marker (0 if none present).
+# gate:exiled-tier5:N label value from the marker (0 if none present).
+# ga-gpcx: this label was named gate:rebase-attempt:N until 2026-07-17. The old
+# name read as an innocuous retry counter — an author manually re-arming a
+# marker (flipping gate-status back to queued) saw it and reasonably assumed it
+# was decorative, not noticing it ALSO sinks the marker to the starved tier-5
+# rebase-fail bucket in the selection below (has_rebase_fail), independent of
+# gate-status. Renamed so the label itself names its own effect. Still matches
+# the legacy name on READ ONLY so any marker already exiled under the old name
+# at deploy time stays correctly recognized as exiled — silently releasing it
+# into the healthy tier would reintroduce the exact ga-q3ig2 outage class this
+# tier exists to prevent. All WRITES use the new name exclusively.
 # Single source of truth for both the per-sweep initial read and the ga-6dp9
 # post-write verification below, so they can never drift into two different
 # parsers of the same label convention.
@@ -1371,7 +1381,7 @@ read_rebase_attempt() {
   local marker_id="${1:-}" n
   n=$(bd -C "$GC_CITY" show "$marker_id" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null \
-    | sed -n 's/^gate:rebase-attempt:\([0-9]\+\)$/\1/p' | sort -rn | head -1 || true)
+    | sed -nE 's/^gate:(rebase-attempt|exiled-tier5):([0-9]+)$/\2/p' | sort -rn | head -1 || true)
   [ -z "$n" ] && n=0
   printf '%s' "$n"
 }
@@ -3590,7 +3600,8 @@ fi
 # ga-q3ig2 HEAD-OF-LINE FIX: a marker whose branch is stale-with-conflict and
 # whose author is dead/transient gets re-queued — here (dead-author bounded
 # retry re-adds gate-status:queued), by gate-health-monitor, or by a manual
-# re-anchor that resets the gate:rebase-attempt counter. Because the broken
+# re-anchor that resets the gate:exiled-tier5 counter (named gate:rebase-attempt
+# before ga-gpcx — see read_rebase_attempt above). Because the broken
 # marker keeps the OLDEST created_at, a pure FIFO sort re-selects it EVERY
 # sweep, fails the same rebase, and never reaches the N healthy markers behind
 # it ("o FIFO insiste nele"). Result: 2× outages 2026-06-10 (~16:30, ~18:03-18:52
@@ -3599,7 +3610,7 @@ fi
 #
 # Fix: two-tier ordering. Markers with NO prior auto-rebase failure are drained
 # first. Markers that already failed an auto-rebase (they carry a
-# gate:rebase-attempt:N label) sink to the BACK and are only re-attempted when
+# gate:exiled-tier5:N label) sink to the BACK and are only re-attempted when
 # no healthy marker is queued. One broken branch can no longer travar a fila
 # regardless of who re-queues it — the queue drains the healthy markers while the
 # broken one is "tratado à parte" (escalated to needs-rebase by its own bounded
@@ -3656,7 +3667,12 @@ MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
   --argjson now "$GATE_MARKER_NOW_EPOCH" \
   --argjson age_threshold "$GATE_MARKER_AGE_PROMOTE_SECONDS" \
   --arg priority_authors "$GATE_PRIORITY_AUTHORS" '
-  def has_rebase_fail: ((.labels // []) | map(select(test("^gate:rebase-attempt:[0-9]+$"))) | length) > 0;
+  # ga-gpcx: matches both the current name (gate:exiled-tier5:N) and the
+  # legacy name (gate:rebase-attempt:N, used before 2026-07-17) so a marker
+  # already exiled under the old name at deploy time stays correctly sunk to
+  # this tier instead of being silently released into the healthy tier (which
+  # would reintroduce the ga-q3ig2 outage class). See read_rebase_attempt().
+  def has_rebase_fail: ((.labels // []) | map(select(test("^gate:(rebase-attempt|exiled-tier5):[0-9]+$"))) | length) > 0;
   def is_aged: try (($now - (.created_at | fromdateiso8601)) > $age_threshold) catch false;
   # crew_of parses the <crew> segment of `branch: crew/<crew>/<bead>` from the
   # marker DESCRIPTION. MUST always yield exactly one value ("" when absent) —
@@ -4375,7 +4391,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # on every re-pick. We now:
     #   1. Decide if the author is reachable (non-empty AND a live session exists).
     #   2. If reachable: bounce + nudge as before (author can fix conflicts).
-    #   3. If NOT reachable: track a bounded gate:rebase-attempt:N counter on the
+    #   3. If NOT reachable: track a bounded gate:exiled-tier5:N counter on the
     #      marker. Below MAX → mark gate-status:error (the next sweep re-attempts
     #      the auto-rebase; main may have settled / a transient may clear). At/above
     #      MAX → escalate to the Mayor via mail (durable) and mark needs-rebase, so
@@ -4617,8 +4633,12 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
       # their branch is already fine, and silently drop it from the queue if they
       # don't (the catch-22 this bead fixes).
       NEXT_ATTEMPT=$((REBASE_ATTEMPT + 1))
+      # ga-gpcx: remove both the current (exiled-tier5) and legacy (rebase-attempt)
+      # names defensively — a marker exiled before the 2026-07-17 rename may still
+      # carry the old name — then write ONLY the new, self-describing name.
+      bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:exiled-tier5:$REBASE_ATTEMPT"  -q 2>/dev/null || true
       bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:rebase-attempt:$REBASE_ATTEMPT" -q 2>/dev/null || true
-      bd -C "$GC_CITY" label add    "$MARKER_ID" "gate:rebase-attempt:$NEXT_ATTEMPT"  -q 2>/dev/null || true
+      bd -C "$GC_CITY" label add    "$MARKER_ID" "gate:exiled-tier5:$NEXT_ATTEMPT"    -q 2>/dev/null || true
       # ga-6dp9 (bug 3 of 3): the label add above is fire-and-forget — verify it
       # actually stuck instead of trusting it. A write that silently failed would
       # otherwise re-derive REBASE_ATTEMPT=0 next sweep and replay "attempt 1/3"
@@ -4626,13 +4646,13 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
       # construction, so treat it exactly like retries-exhausted: force the
       # escalation branch below instead of re-queueing again.
       if [ "$(gate_rebase_attempt_advanced "$NEXT_ATTEMPT" "$(read_rebase_attempt "$MARKER_ID")")" = "stuck" ]; then
-        warn "Branch $BRANCH: gate:rebase-attempt label write did not take effect (intended $NEXT_ATTEMPT) — forcing escalation to avoid an infinite attempt-1/3 loop."
+        warn "Branch $BRANCH: gate:exiled-tier5 label write did not take effect (intended $NEXT_ATTEMPT) — forcing escalation to avoid an infinite attempt-1/3 loop."
         NEXT_ATTEMPT="$MAX_REBASE_ATTEMPTS"
       fi
       if [ "$NEXT_ATTEMPT" -lt "$MAX_REBASE_ATTEMPTS" ]; then
         warn "Branch $BRANCH: transient auto-rebase-fail (author $REBASE_AUTHOR live; likely rebase-while-queued race — attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — gate-status:queued for server-side retry."
         bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:queued" -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS (gt-4tk5m): branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) — likely a rebase-while-queued race (author $REBASE_AUTHOR may have force-pushed while this marker was queued). Re-queued for next sweep; no /gate-done re-run needed. Carries gate:rebase-attempt:$NEXT_ATTEMPT so it sinks behind healthy markers (ga-q3ig2)." 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS (gt-4tk5m): branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) — likely a rebase-while-queued race (author $REBASE_AUTHOR may have force-pushed while this marker was queued). Re-queued for next sweep; no /gate-done re-run needed. Carries gate:exiled-tier5:$NEXT_ATTEMPT so it sinks behind healthy markers (ga-q3ig2) — remove this label to re-anchor and rejoin the healthy queue." 2>/dev/null || true
         # ga-6dp9 (gate-fix-2): same notify-identity fix as the bounce branches
         # above — REBASE_AUTHOR is this branch's own verified-alive identity.
         gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
@@ -4685,20 +4705,22 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
       # it; then escalate. (Genuine merge conflicts take the immediate-skip branch
       # above — they never reach here.)
       NEXT_ATTEMPT=$((REBASE_ATTEMPT + 1))
+      # ga-gpcx: same defensive dual-name removal as the live-author branch above.
+      bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:exiled-tier5:$REBASE_ATTEMPT"  -q 2>/dev/null || true
       bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:rebase-attempt:$REBASE_ATTEMPT" -q 2>/dev/null || true
-      bd -C "$GC_CITY" label add    "$MARKER_ID" "gate:rebase-attempt:$NEXT_ATTEMPT"  -q 2>/dev/null || true
+      bd -C "$GC_CITY" label add    "$MARKER_ID" "gate:exiled-tier5:$NEXT_ATTEMPT"    -q 2>/dev/null || true
       # ga-6dp9 (bug 3 of 3): verify the label write actually stuck (see the
       # matching comment at the live-author call site above) — a stuck counter
       # here would otherwise replay "attempt 1/3, dead author" forever instead
       # of ever reaching the retry_dead circuit-break below.
       if [ "$(gate_rebase_attempt_advanced "$NEXT_ATTEMPT" "$(read_rebase_attempt "$MARKER_ID")")" = "stuck" ]; then
-        warn "Branch $BRANCH: gate:rebase-attempt label write did not take effect (intended $NEXT_ATTEMPT) — forcing escalation to avoid an infinite attempt-1/3 loop."
+        warn "Branch $BRANCH: gate:exiled-tier5 label write did not take effect (intended $NEXT_ATTEMPT) — forcing escalation to avoid an infinite attempt-1/3 loop."
         NEXT_ATTEMPT="$MAX_REBASE_ATTEMPTS"
       fi
       if [ "$NEXT_ATTEMPT" -lt "$MAX_REBASE_ATTEMPTS" ]; then
         warn "Branch $BRANCH: transient auto-rebase-fail, author dead/empty (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — gate-status:queued for server-side retry."
         bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:queued" -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS: branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) and the author session is gone. Queued for server-side retry on next sweep (NOT stranded on a dead author). Carries gate:rebase-attempt:$NEXT_ATTEMPT so it sinks behind healthy markers (ga-q3ig2)." 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS: branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) and the author session is gone. Queued for server-side retry on next sweep (NOT stranded on a dead author). Carries gate:exiled-tier5:$NEXT_ATTEMPT so it sinks behind healthy markers (ga-q3ig2) — remove this label to re-anchor and rejoin the healthy queue." 2>/dev/null || true
         REBASE_EVENT="dispatcher_autorebase_retry"
         REBASE_VERDICT="QUEUED (retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, dead author)"
       else
