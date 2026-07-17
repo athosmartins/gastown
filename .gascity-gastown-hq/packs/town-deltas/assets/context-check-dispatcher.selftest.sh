@@ -96,8 +96,23 @@ for L in story:in-flight story:done story:cancelled pilot:dispatched gate:needs-
 done
 [ "$(context_check_lifecycle_skip "tech-debt")" = "no" ] && ok "tech-debt (active work) → not skipped" || bad "tech-debt → expected not skipped"
 
+# ── Scenario 4a: park-exclusion (ga-ipm4) — never re-arm a deliberately parked bead
+echo "Scenario 4a: park-exclusion — needs-human/pool:refused:*/story:blocked never re-armed"
+[ "$(context_check_is_parked "needs-human")" = "yes" ] && ok "needs-human → parked" || bad "needs-human → expected parked"
+[ "$(context_check_is_parked "story:blocked")" = "yes" ] && ok "story:blocked → parked" || bad "story:blocked → expected parked"
+[ "$(context_check_is_parked "pool:refused:engine-rebuild-required")" = "yes" ] && ok "pool:refused:<reason> → parked" || bad "pool:refused:* → expected parked"
+[ "$(context_check_is_parked "pool:refused:anything-else")" = "yes" ] && ok "pool:refused:* prefix matches any reason suffix" || bad "pool:refused:<other> → expected parked"
+[ "$(context_check_is_parked "root-class:error-vs-empty,needs-human,lane:small")" = "yes" ] && ok "needs-human mixed with unrelated labels → parked" || bad "mixed labels → expected parked"
+[ "$(context_check_is_parked "tech-debt,lane:small")" = "no" ] && ok "no park label → not parked" || bad "clean labels → expected not parked"
+[ "$(context_check_is_parked "")" = "no" ] && ok "empty labels → not parked" || bad "empty → expected not parked"
+# ga-66wc repro: a park label surviving ALONE (ctx:ready/exec:auto already stripped
+# by a human/dog) must still read as parked — this is exactly the state that
+# tricked the pre-fix daemon into treating the bead as "fresh, never judged".
+[ "$(context_check_is_parked "needs-human,pool:refused:engine-rebuild-required,root-class:error-vs-empty")" = "yes" ] \
+  && ok "ga-66wc post-strip label set (no ctx:*, no exec:*) → still parked" || bad "ga-66wc post-strip set → expected parked"
+
 # ── Scenario 4b: master candidate gate composes all the above ─────────────────
-echo "Scenario 4b: context_check_is_candidate composes type+plumbing+ctx+lifecycle"
+echo "Scenario 4b: context_check_is_candidate composes type+plumbing+ctx+lifecycle+park"
 [ "$(context_check_is_candidate "ga-good" "task" "tech-debt" "false" "no")" = "yes" ] \
   && ok "real open task, no ctx, not plumbing/in-flight → candidate" || bad "real task → expected candidate"
 [ "$(context_check_is_candidate "ga-feat" "feature" "story:unrefined" "false" "yes")" = "no" ] \
@@ -106,6 +121,13 @@ echo "Scenario 4b: context_check_is_candidate composes type+plumbing+ctx+lifecyc
   && ok "feature WITHOUT story:* → candidate (raw actionable)" || bad "feature w/o story:* → expected candidate"
 [ "$(context_check_is_candidate "ga-junk" "epic" "" "false" "no")" = "no" ] \
   && ok "epic → NOT a candidate (type ineligible)" || bad "epic → expected not candidate"
+# ga-ipm4: the exact ga-66wc shape — bug, no ctx:* label (stripped), park labels
+# present, no lifecycle/lock label — must NOT re-enter candidacy.
+[ "$(context_check_is_candidate "ga-66wc" "bug" "needs-human,pool:refused:engine-rebuild-required,root-class:error-vs-empty" "false" "no")" = "no" ] \
+  && ok "ga-66wc-shaped bead (parked, ctx:* stripped) → NOT a candidate (no re-arm)" \
+  || bad "REGRESSION ga-ipm4: parked bead with ctx:* stripped would be re-judged and re-armed"
+[ "$(context_check_is_candidate "ga-blocked" "chore" "story:blocked,lane:small" "false" "no")" = "no" ] \
+  && ok "story:blocked bead → NOT a candidate" || bad "story:blocked → expected not candidate"
 
 # ── Scenario 5: verifiable-signal detection ───────────────────────────────────
 echo "Scenario 5: verifiable-signal detection (HOW-TO-VERIFY / concrete artifact)"

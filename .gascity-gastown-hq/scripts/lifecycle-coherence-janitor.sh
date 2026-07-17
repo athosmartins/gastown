@@ -431,6 +431,39 @@ run_sweep() {
         n=$((n+1))
       fi
     done
+
+    # R8 (ga-ipm4): PARK and ARM are orthogonal states that must never coexist. A bead
+    # carrying an arm label (exec:auto or ctx:ready) that is ALSO parked (needs-human,
+    # pool:refused:<any reason>, or story:blocked) must have the arm labels stripped —
+    # parking is a deliberate human/dog decision that must survive automated
+    # re-classification (same lesson as R4's bare+colon-suffixed gate:needs-human fix,
+    # here applied to a different label family). No status filter: the invariant is
+    # unconditional, not just for open beads. Confirmed live: ga-66wc carried
+    # needs-human + pool:refused:engine-rebuild-required alongside ctx:ready + exec:auto
+    # simultaneously; context-check-dispatcher.sh (separately fixed, ga-ipm4) re-added
+    # the arm labels on its next ~10min sweep the moment a human/dog stripped them,
+    # because a stripped bead has no ctx:* label left and looks unjudged again — 17+
+    # dog sessions re-claimed and re-confirmed the same refused verdict over 11 hours.
+    # Only the arm labels are stripped; the park labels are the correct, intended state
+    # and are left untouched. Strip-only footprint (no status/assignee mutation), so —
+    # like R1/R2/R5/R6 — this does NOT consult _gate_active_beads (that check is
+    # reserved for R3/R7's status-flip/close mutations); it DOES honor the advisory
+    # lock, matching R4-R7.
+    _r8_seen=" "
+    for _armlbl in exec:auto ctx:ready; do
+      for id in $("$BD" -C "$store" list -l "$_armlbl" --json -n 0 2>/dev/null \
+                  | jq -r '.[] | ([.labels[]?]) as $l
+                          | select($l | any(. == "needs-human" or . == "story:blocked" or test("^pool:refused:")))
+                          | .id' 2>/dev/null); do
+        [ -n "$id" ] || continue
+        case "$_r8_seen" in *" $id "*) continue ;; esac
+        _r8_seen="$_r8_seen$id "
+        _bead_locked "$id" && { log "R8 skip-locked: $id — advisory lock active"; continue; }
+        _strip "$store" "$id" exec:auto
+        _strip "$store" "$id" ctx:ready
+        log "R8 park-arm-invariant (ga-ipm4): $id ($(basename "$store")) — parked bead carried exec:auto/ctx:ready, stripped both"; n=$((n+1))
+      done
+    done
   done
   # CRITICAL: Dolt auto-commit is OFF (dolt.auto-commit=off). A `bd label remove`/`update` writes
   # to the WORKING SET but does NOT commit — so OTHER processes that read committed HEAD (the
@@ -462,6 +495,12 @@ if [ "${1:-}" = "--selftest" ]; then
   #           traded one gap for another, missing the bare form production code actually writes)
   # r5: closed ctx:ready without story:done (R5 target)
   # r5-locked: closed ctx:ready with an advisory lock (imp10 — must be SKIPPED by R5)
+  # R8 fixtures (ga-ipm4, park+arm invariant): r8-parked-auto (exec:auto+pool:refused:<reason>),
+  # r8-parked-auto2 (exec:auto+a DIFFERENT pool:refused:<reason> suffix — proves prefix
+  # genericity), r8-parked-ready (ctx:ready+needs-human), r8-parked-both (BOTH arm labels+
+  # story:blocked — dedup guard: must be processed exactly once, not once per arm-label pass),
+  # r8-locked (ctx:ready+needs-human, advisory-locked — must be SKIPPED like R4-R7),
+  # r8-clean-auto/r8-clean-ready (arm label, no park label — must be left alone).
   # R7 fixtures (list --all): 3 historical recurrences (wa-o4kuh epic+molecule, wa-06yog
   # needs-approval+sling, wa-8yw4i.1 in-progress escalated-refino+molecule+step+sling — id has a
   # literal dot to regression-test regex-escaping) + one bead per remaining exclusion label
@@ -537,6 +576,16 @@ case "\$a" in
   # routed_to data here means a regression is caught (not masked by an empty-shim fallback).
   *"show wa-gate-protect"*)     echo '[{"id":"wa-gate-protect","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show r7-original-target"*)  echo '[{"id":"r7-original-target","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  # R8 (ga-ipm4): park+arm invariant. r8-parked-auto (exec:auto + pool:refused:<reason>),
+  # r8-parked-auto2 (exec:auto + a DIFFERENT pool:refused:<reason> suffix, proves prefix
+  # genericity, not a single hardcoded reason string), r8-parked-ready (ctx:ready +
+  # needs-human), r8-parked-both (BOTH arm labels + story:blocked — one bead, one pass,
+  # dedup guard), r8-locked (ctx:ready + needs-human, advisory-locked — must be skipped),
+  # r8-clean-auto/r8-clean-ready (arm label, no park label — must be left alone).
+  *"list -l exec:auto --json"*)
+    echo '[{"id":"r8-parked-auto","labels":["exec:auto","pool:refused:engine-rebuild-required"]},{"id":"r8-parked-auto2","labels":["exec:auto","pool:refused:some-other-reason"]},{"id":"r8-parked-both","labels":["exec:auto","ctx:ready","story:blocked"]},{"id":"r8-clean-auto","labels":["exec:auto","lane:small"]}]' ;;
+  *"list -l ctx:ready --json"*)
+    echo '[{"id":"r8-parked-ready","labels":["ctx:ready","needs-human"]},{"id":"r8-parked-both","labels":["exec:auto","ctx:ready","story:blocked"]},{"id":"r8-locked","labels":["ctx:ready","needs-human"]},{"id":"r8-clean-ready","labels":["ctx:ready","lane:small"]}]' ;;
   *"label remove"*|*"label add"*|*"update"*|*"dolt commit"*) echo "\$a" >> "$ACT" ;;
   *) echo '[]' ;;
 esac
@@ -557,6 +606,8 @@ NOTIFYSHIM
   # imp10: plant an advisory lock for r5-locked to verify the janitor skips it
   mkdir -p "$LIFECYCLE_LOCK_DIR"
   echo "$$:$(date +%s)" > "$LIFECYCLE_LOCK_DIR/r5-locked"
+  # ga-ipm4: same, for r8-locked (R8 park+arm invariant must also honor the advisory lock)
+  echo "$$:$(date +%s)" > "$LIFECYCLE_LOCK_DIR/r8-locked"
   run_sweep
   echo "Scenario: janitor normalizes R1-R5 incoherences, respects locks (imp10), never touches coherent beads"
   grep -q 'label remove cl-1 story:in-flight' "$ACT" && ok "R1: closed+story:in-flight → stripped"            || bad "R1 not stripped"
@@ -610,6 +661,18 @@ NOTIFYSHIM
   grep -q 'update t-human --unset-metadata gc.routed_to' "$ACT" && ok "R7: unset gc.routed_to on gate:needs-human:bar" || bad "R7 did not unset gc.routed_to on t-human"
   grep -q 'update t-human-bare --unset-metadata gc.routed_to' "$ACT" && ok "R7 (gate_run=ga-wisp-05leh8 fix): unset gc.routed_to on BARE gate:needs-human" || bad "R7 did not unset gc.routed_to on t-human-bare (bare-label trigger still broken)"
   grep -q 't-valid' "$ACT" && bad "R7: modified a valid in-flight bead (t-valid)" || ok "R7 left valid bead t-valid alone"
+
+  # R8 (ga-ipm4): park+arm invariant — a parked bead (needs-human/pool:refused:*/
+  # story:blocked) must never keep exec:auto/ctx:ready. Reproduced live on ga-66wc.
+  grep -q 'label remove r8-parked-auto exec:auto' "$ACT" && ok "R8: exec:auto + pool:refused:<reason> → stripped exec:auto" || bad "R8 did not strip exec:auto on r8-parked-auto"
+  grep -q 'label remove r8-parked-auto2 exec:auto' "$ACT" && ok "R8: pool:refused:* prefix matches a DIFFERENT reason suffix, not one hardcoded string" || bad "R8 did not strip exec:auto on r8-parked-auto2 (pool:refused:* prefix match broken)"
+  grep -q 'label remove r8-parked-ready ctx:ready' "$ACT" && ok "R8: ctx:ready + needs-human → stripped ctx:ready" || bad "R8 did not strip ctx:ready on r8-parked-ready"
+  grep -q 'label remove r8-parked-both exec:auto' "$ACT" && ok "R8: bead with BOTH arm labels + story:blocked → stripped exec:auto" || bad "R8 did not strip exec:auto on r8-parked-both"
+  grep -q 'label remove r8-parked-both ctx:ready' "$ACT" && ok "R8: bead with BOTH arm labels + story:blocked → stripped ctx:ready" || bad "R8 did not strip ctx:ready on r8-parked-both"
+  [ "$(grep -c 'r8-parked-both' "$ACT")" = "2" ] && ok "R8: r8-parked-both processed exactly once despite matching both the exec:auto and ctx:ready queries (dedup guard)" || bad "R8 dedup guard broken: r8-parked-both processed more than once (found in both arm-label passes)"
+  grep -q 'r8-locked' "$ACT" && bad "R8: touched an advisory-locked parked+armed bead (must be skipped, matches R4-R7 convention)" || ok "R8: skipped the advisory-locked bead (r8-locked)"
+  grep -q 'r8-clean-auto' "$ACT" && bad "R8: touched an exec:auto bead with NO park label (false positive)" || ok "R8: left a clean exec:auto bead alone (no park label)"
+  grep -q 'r8-clean-ready' "$ACT" && bad "R8: touched a ctx:ready bead with NO park label (false positive)" || ok "R8: left a clean ctx:ready bead alone (no park label)"
 
   # Gate-active protection (ga-ibz0/wa-bkjy7, 2026-07-11): quality-gate-guard.sh silently
   # detaches a bead's assignee for the FULL gate duration (no bd comment); R3/R7 must never

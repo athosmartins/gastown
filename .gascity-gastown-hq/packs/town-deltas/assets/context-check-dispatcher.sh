@@ -37,7 +37,14 @@
 #     gap comment. (Drift-guarded.)
 #   - IDEMPOTENT. A bead that already carries ctx:ready or ctx:thin is excluded at
 #     the query AND re-asserted by the pure classifier — re-judged only if a human
-#     strips the label (re-judging a fresh bead is safe and cheap).
+#     strips the label. Re-judging a stripped bead is safe and cheap ONLY if it
+#     isn't ALSO parked (see PARK-EXCLUSION below) — ga-ipm4 found the naive
+#     version of this claim false: stripping ctx:ready to park ga-66wc made it
+#     look "fresh" again and this daemon re-armed it on the very next sweep.
+#   - PARK-EXCLUSION (ga-ipm4): a bead carrying needs-human, pool:refused:*, or
+#     story:blocked is NEVER a candidate, ctx:* label or not. Parking is a
+#     deliberate human/dog decision; this daemon must not silently overrule it
+#     by re-adding ctx:ready+exec:auto once the bead loses its ctx:* marker.
 #   - ga-it11w LESSON: a terminal ctx:thin bead must NOT loop. ctx:thin is itself
 #     the exclusion key (a thin bead already has a ctx:* label → never re-ingested),
 #     so there is no re-ingestion loop. ctx:thin is NOT stripped by this daemon.
@@ -209,12 +216,42 @@ context_check_lifecycle_skip() {
   echo "no"
 }
 
+# context_check_is_parked <labels_csv>
+#   emit "yes" iff the bead has been deliberately PARKED — needs-human,
+#   pool:refused:<any reason>, or story:blocked. A parked bead must NEVER be
+#   (re)armed with ctx:ready/exec:auto (ga-ipm4): parking and arming are
+#   orthogonal states that must never coexist, and today the ONLY way a parked
+#   bead loses ctx:ready is a human/dog explicitly stripping it — which this
+#   daemon would otherwise silently undo on its next ~10min sweep, because a
+#   stripped bead has no ctx:* label left and looks unjudged again. Reproduced
+#   live on ga-66wc: stripped ctx:ready+exec:auto at 11:01Z, this daemon
+#   re-added both at 11:14:58Z per context-check-dispatcher.log (mech=ready
+#   sig=yes) — the bead never lost needs-human/pool:refused:* in between.
+#   Mirrors the wa-9t2ty dep-blocked lesson (context_check_skip_reason below):
+#   a deliberate hold must survive a re-sweep. Split safely (see
+#   context_check_is_plumbing's IFS comment — a leaked IFS=, would break
+#   sibling space-separated word-splits). Pure.
+context_check_is_parked() {
+  local labels="$1" l
+  [ -z "$labels" ] && { echo "no"; return; }
+  local -a _lbls=()
+  IFS=',' read -ra _lbls <<< "$labels"
+  for l in "${_lbls[@]+"${_lbls[@]}"}"; do
+    case "$l" in
+      needs-human|story:blocked) echo "yes"; return ;;
+      pool:refused:*) echo "yes"; return ;;
+    esac
+  done
+  echo "no"
+}
+
 # context_check_is_candidate <id> <issue_type> <labels_csv> <ephemeral> <has_story_lifecycle yes|no>
 #   The master per-bead gate. emit "yes" iff this bead should be context-judged:
 #     - type-eligible (bug/chore/task/debt, OR feature WITHOUT a story:* label);
 #     - NOT plumbing;
 #     - NOT already carrying a ctx:* verdict (idempotence / anti-loop);
-#     - NOT in a lifecycle-skip state (in-flight/done/gate-stuck/dispatched).
+#     - NOT in a lifecycle-skip state (in-flight/done/gate-stuck/dispatched);
+#     - NOT parked (needs-human/pool:refused:*/story:blocked — ga-ipm4).
 #   <has_story_lifecycle> is the caller's precomputed answer to "does it carry any
 #   story:* label" (a feature WITH a story:* label is in the refino funnel — leave
 #   it; only feature WITHOUT story:* is a raw actionable item we judge).
@@ -226,6 +263,7 @@ context_check_is_candidate() {
   [ "$(context_check_is_plumbing "$id" "$labels" "$ephemeral")" = "no" ] || { echo "no"; return; }
   [ "$(context_check_has_ctx_label "$labels")" = "no" ] || { echo "no"; return; }
   [ "$(context_check_lifecycle_skip "$labels")" = "no" ] || { echo "no"; return; }
+  [ "$(context_check_is_parked "$labels")" = "no" ] || { echo "no"; return; }
   echo "yes"
 }
 
