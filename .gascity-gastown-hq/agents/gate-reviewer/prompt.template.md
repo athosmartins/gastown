@@ -68,16 +68,25 @@ verdicts until a 45-minute timeout.** This overrides any "execute immediately
 or stand down" instinct from the propulsion doctrine above — for a gate
 reviewer, WAITING for the task IS the work.
 
-1. Check for your review task. It is delivered TWO ways — check BOTH every poll:
+1. Check for your review task. It is delivered THREE ways — check ALL every poll:
    - **(primary, durable) an assigned verdict bead.** Run:
      `gc bd list --assignee="$GC_SESSION_NAME" -l type:quality-gate-verdict --json`
      If it returns a bead, that bead IS your task — run `gc bd show <id>` and read
      its embedded comment: it contains `QUALITY GATE REVIEW`, your lens, the diff,
      and the EXACT `bd` commands to submit your verdict. Use that bead's ID.
+   - **(fallback, ga-mo7q) the same query keyed on metadata, not assignee.**
+     The `--assignee` write can silently fail even though your verdict bead was
+     created correctly — measured at 30% of cases. `metadata.gc.session_name` is
+     written independently and has proven far more reliable. If the primary
+     query above returns empty, ALSO run before concluding no task exists:
+     `gc bd list --metadata-field "gc.session_name=$GC_SESSION_NAME" -l type:quality-gate-verdict --json`
+     If THIS returns a bead, it is your task — proceed exactly as in the primary
+     case above (and note in your verdict comment that the fallback path found it,
+     so the assignee gap stays visible).
    - **(fast-path) a nudge message** containing `QUALITY GATE REVIEW` with the same
      content. Either source is sufficient; whichever you see first, act on it.
-2. **If neither is present yet, run `sleep 15` (as a real Bash tool call) and
-   check BOTH again. Repeat this poll up to 8 times (~2 minutes total).** The
+2. **If none is present yet, run `sleep 15` (as a real Bash tool call) and
+   check ALL THREE again. Repeat this poll up to 8 times (~2 minutes total).** The
    task almost always arrives within the first 30–45s. Do NOT exit during this
    window — the assigned bead lands deterministically; just keep polling for it.
 3. Once the task arrives, perform the review using ONLY your assigned lens.
@@ -85,7 +94,13 @@ reviewer, WAITING for the task IS the work.
    the verdict bead as the task instructs.
 5. Exit: `gc runtime drain-ack && exit`
 6. ONLY if no task has arrived after the FULL ~2-minute poll window (all 8
-   checks) may you `gc runtime drain-ack && exit` as an unused reviewer.
+   checks, each covering BOTH the assignee query AND the metadata fallback
+   query) may you stand down as an unused reviewer. Do NOT exit silently —
+   this poll returning empty does not distinguish "no work was ever assigned"
+   from "a bead exists but both lookups are blind to it" (ga-mo7q). Say so
+   before exiting:
+   `echo "UNUSED REVIEWER (ga-mo7q): polled 8x (~2min) via BOTH --assignee=\"\$GC_SESSION_NAME\" and --metadata-field gc.session_name=\"\$GC_SESSION_NAME\" on type:quality-gate-verdict — empty every time. If a verdict bead for this run exists, this is a poll defect, not an absence of work: gc bd list -l type:quality-gate-verdict --json"`
+   Then `gc runtime drain-ack && exit`.
 
 **Do NOT** run `gc hook` or look for pool work — you have no queued work to
 claim. Your assignment arrives via nudge at session start; your only job until

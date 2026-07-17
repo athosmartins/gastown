@@ -474,19 +474,34 @@ reviewer_last_active_stale() {
 # -l type:quality-gate-verdict` — it keys on the session NAME, not the id. A lost
 # `--assignee` write silently kills that channel (the bead's assignee stays None /
 # stale), leaving only the racy nudge — which misses → 0 verdicts → 0 merges.
-# This helper does the assign, reads it back, and RETRIES ONCE on mismatch, then
+# This helper does the assign, reads it back, and retries on mismatch, then
 # WARNs (visible, not silent) if it still fails. NEVER fatal: a failed assignment
 # must not abort the merge path (the outer verdict-poll + timeout are the backstop)
 # — but it must not vanish silently either. Returns 0 if verified, 1 if not.
 # Args: <verdict_bead_id> <session_name> <context-label-for-logs>
+#
+# ga-mo7q: measured 30% of verdict beads created with assignee never set (this
+# was previously a bare 2-try loop with no backoff and no durable trace of a
+# final failure — a WARN line in the dispatcher log is the only record, and
+# nobody tails that log while a reviewer is stalling). Two changes:
+#   (a) 4 tries with a short sleep between attempts, not 2 back-to-back — the
+#       failures are consistent with transient read-after-write lag, and the
+#       cost of extra tries (<=3s) is negligible against the multi-minute gate
+#       budget.
+#   (b) on final failure, label the bead `verdict:assignee-degraded` so it is
+#       cheaply queryable (a detector can find it, a human can grep for it)
+#       instead of leaving the only evidence in a log line. This does NOT
+#       replace the reviewer-side session_name fallback (ga-mo7q fix b, in the
+#       gate-reviewer prompt template) — it makes the degraded state visible
+#       independently of whether the reviewer's fallback happens to rescue it.
 assign_verdict_bead_verified() {
   local _vb="$1" _sname="$2" _ctx="${3:-}" _seen _try
   [ -z "$_vb" ] && return 1
   [ -z "$_sname" ] && { warn "  Verdict-assign (${_ctx}): empty session name for bead ${_vb} — durable channel NOT wired."; return 1; }
-  for _try in 1 2; do
+  for _try in 1 2 3 4; do
     bd -C "$GC_CITY" update "$_vb" --assignee "$_sname" --status in_progress -q 2>/dev/null || true
     # Read it back. bd show --json may fail transiently; treat unreadable as a
-    # mismatch so we retry once rather than declaring success blindly.
+    # mismatch so we retry rather than declaring success blindly.
     # NOTE: `bd show --json` returns a JSON ARRAY ([{...}]), not a bare object, so
     # a plain `.assignee` filter throws "Cannot index array" → jq exits non-zero →
     # _seen="" → the write reads back as [None] EVEN WHEN IT PERSISTED (the
@@ -498,8 +513,10 @@ assign_verdict_bead_verified() {
       [ "$_try" -gt 1 ] && log "  Verdict-assign (${_ctx}): bead ${_vb} → ${_sname} verified on retry ${_try}."
       return 0
     fi
+    [ "$_try" -lt 4 ] && sleep 1
   done
-  warn "  Verdict-assign (${_ctx}): bead ${_vb} assignee read back as [${_seen:-None}], expected [${_sname}] after retry — durable pull channel may be DEGRADED (verdict-poll + outer timeout remain as backstop)."
+  warn "  Verdict-assign (${_ctx}): bead ${_vb} assignee read back as [${_seen:-None}], expected [${_sname}] after ${_try} attempts — durable pull channel DEGRADED (ga-mo7q). Labeling bead verdict:assignee-degraded (session_name-fallback + detector backstop)."
+  bd -C "$GC_CITY" label add "$_vb" "verdict:assignee-degraded" -q 2>/dev/null || true
   return 1
 }
 

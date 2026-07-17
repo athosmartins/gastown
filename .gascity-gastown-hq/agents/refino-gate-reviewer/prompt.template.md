@@ -32,7 +32,7 @@ task lands leaves the story stuck until a 20-minute timeout.** This overrides an
 "execute immediately or stand down" instinct from the propulsion doctrine above — for
 a refino gate reviewer, WAITING for the task IS the work.
 
-1. Check for your review task. It is delivered TWO ways — check BOTH every poll:
+1. Check for your review task. It is delivered THREE ways — check ALL every poll:
    - **(primary, durable) an assigned verdict bead.** Your verdict bead may live in the
      HQ store OR a rig store — `ps-*`/`wa-*` stories keep their verdict bead in their
      RIG DB, not HQ. So search ALL stores and remember WHICH store held it:
@@ -49,10 +49,27 @@ a refino gate reviewer, WAITING for the task IS the work.
      and read its embedded comment: it contains `REFINO QUALITY GATE`, the story's refined
      fields (the Definition of Refined rubric: F1–F8), and the EXACT `bd` commands to
      submit your verdict (those commands already target the correct store). Use that bead's ID.
+   - **(fallback, ga-mo7q) the same search, keyed on metadata, not assignee.**
+     The `--assignee` write can silently fail even though your verdict bead was
+     created correctly — measured at 30% of cases on the sibling code-gate
+     mechanism. `metadata.gc.session_name` is written independently and has
+     proven far more reliable. If the loop above found nothing in any store,
+     ALSO run before concluding no task exists:
+     ```bash
+     for _s in /Users/athos/gt/.gascity-gastown-hq \
+                /Users/athos/gt/whatsapp_automation \
+                /Users/athos/gt/property_scrapers; do
+       _r=$(bd -C "$_s" list --metadata-field "gc.session_name=$GC_SESSION_NAME" -l type:refino-gate-verdict --json 2>/dev/null)
+       if [ -n "$_r" ] && [ "$_r" != "[]" ]; then _FOUND_STORE="$_s"; echo "verdict bead (fallback) in $_s: $_r"; break; fi
+     done
+     ```
+     If THIS returns a bead, it is your task — proceed exactly as in the primary
+     case above (and note in your verdict comment that the fallback path found
+     it, so the assignee gap stays visible).
    - **(fast-path) a nudge message** containing `REFINO QUALITY GATE` with the same
      content. Either source is sufficient; whichever you see first, act on it.
-2. **If neither is present yet, run `sleep 15` (as a real Bash tool call) and
-   check BOTH again. Repeat this poll up to 8 times (~2 minutes total).** The
+2. **If none is present yet, run `sleep 15` (as a real Bash tool call) and
+   check ALL THREE again. Repeat this poll up to 8 times (~2 minutes total).** The
    task almost always arrives within the first 30–45s. Do NOT exit during this
    window — the assigned bead lands deterministically; just keep polling for it.
 3. Once the task arrives, perform the review: judge the refined fields against the
@@ -62,7 +79,13 @@ a refino gate reviewer, WAITING for the task IS the work.
    the verdict bead as the task instructs.
 5. Exit: `gc runtime drain-ack && exit`
 6. ONLY if no task has arrived after the FULL ~2-minute poll window (all 8
-   checks) may you `gc runtime drain-ack && exit` as an unused reviewer.
+   checks, each covering BOTH the assignee search AND the metadata fallback
+   search across all stores) may you stand down as an unused reviewer. Do NOT
+   exit silently — this poll returning empty does not distinguish "no work was
+   ever assigned" from "a bead exists but both lookups are blind to it"
+   (ga-mo7q). Say so before exiting:
+   `echo "UNUSED REVIEWER (ga-mo7q): polled 8x (~2min) via BOTH --assignee=\"\$GC_SESSION_NAME\" and --metadata-field gc.session_name=\"\$GC_SESSION_NAME\" on type:refino-gate-verdict across all stores — empty every time. If a verdict bead for this story exists, this is a poll defect, not an absence of work."`
+   Then `gc runtime drain-ack && exit`.
 
 **Do NOT** run `gc hook` or look for pool work — you have no queued work to
 claim. Your assignment arrives via the verdict bead at session start; your only job

@@ -460,6 +460,30 @@ TASK
 # A genuinely independent Claude session on the refino-gate-reviewer template
 # (model = Sonnet; provider = claude-headless so it never grabs Remote Control).
 #
+# ga-mo7q: sibling of quality-gate-dispatcher.sh's assign_verdict_bead_verified
+# (ga-vdurb) — this dispatcher had the SAME durable-pull assignment as a single
+# unverified `bd_ update --assignee ... || true` with no read-back and no retry
+# at all (strictly more fragile than the code-gate's already-hardened version).
+# Verify + retry + label-on-final-failure so a lost write is never silent.
+# Args: <verdict_bead_id> <session_name> <context-label-for-logs>
+refino_assign_verdict_bead_verified() {
+  local _vb="$1" _sname="$2" _ctx="${3:-}" _seen _try
+  [ -z "$_vb" ] && return 1
+  [ -z "$_sname" ] && { warn "  Verdict-assign (${_ctx}): empty session name for bead ${_vb} — durable channel NOT wired."; return 1; }
+  for _try in 1 2 3 4; do
+    bd_ update "$_vb" --assignee "$_sname" --status in_progress -q 2>/dev/null || true
+    _seen=$(bd_ show "$_vb" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .assignee // empty' 2>/dev/null || echo "")
+    if [ "$_seen" = "$_sname" ]; then
+      [ "$_try" -gt 1 ] && log "  Verdict-assign (${_ctx}): bead ${_vb} → ${_sname} verified on retry ${_try}."
+      return 0
+    fi
+    [ "$_try" -lt 4 ] && sleep 1
+  done
+  warn "  Verdict-assign (${_ctx}): bead ${_vb} assignee read back as [${_seen:-None}], expected [${_sname}] after ${_try} attempts — durable pull channel DEGRADED (ga-mo7q). Labeling bead verdict:assignee-degraded (session_name-fallback + detector backstop)."
+  bd_ label add "$_vb" "verdict:assignee-degraded" -q 2>/dev/null || true
+  return 1
+}
+#
 # refino_spawn_reviewer <reason-label> — spawn a reviewer for THIS story, wake it,
 # wire the ga-67hae DURABLE-PULL channel (assign the verdict bead to the new
 # session_name + embed the rubric as a comment), and nudge. Used by BOTH the
@@ -496,7 +520,7 @@ refino_spawn_reviewer() {
   # bead assignment is the reliable channel a fresh reviewer pulls from durably.
   SESSION_NAME=$(echo "$SESSION_JSON" | jq -r '.session_name // empty')
   if [ -n "$SESSION_NAME" ]; then
-    bd_ update "$VERDICT_BEAD_ID" --assignee "$SESSION_NAME" --status in_progress -q 2>/dev/null || true
+    refino_assign_verdict_bead_verified "$VERDICT_BEAD_ID" "$SESSION_NAME" "$_reason" || true
     bd_ comment "$VERDICT_BEAD_ID" "$REVIEW_TASK" 2>/dev/null || true
   fi
   gc --city "$GC_CITY" session nudge "$SESSION_ID" "$REVIEW_TASK" --delivery queue 2>/dev/null \

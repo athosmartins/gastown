@@ -8,6 +8,7 @@ Emits a line ONLY for actionable problems (silence = healthy):
   [DELIVERY-FAIL]       a delivery failed or HALTed
   [ASYNC-START-REGRESS] the stale_async_start race fix is MISSING from the live gc binary
   [ASYNC-START-RACE]    stale_async_start race rate spiked above threshold
+  [VERDICT-ASSIGNEE-GAP] a pending verdict bead has had no assignee for too long (ga-mo7q)
 
 Deliberately does NOT emit routine GATE PASS / PILOT dispatch / DELIVERY PASS —
 those are normal operation and were the source of the old monitor's noise.
@@ -26,6 +27,18 @@ the fix adds a 3rd config-drift-drain exemption for gate-reviewers in state=
 creating, identified by 'async-start (fresh creating)' in the binary. If the
 binary is rebuilt without the fix, reviewer-spawn flakiness resurges silently.
 Env: GATE_REVIEWER_RACE_CHECK=1 (default on), GATE_REVIEWER_RACE_MAX (default 8/h).
+
+[VERDICT-ASSIGNEE-GAP] (ga-mo7q) closes the blind spot measured at 30% of
+verdict beads: quality-gate-dispatcher.sh creates the verdict bead, then
+SEPARATELY assigns it to the reviewer's session name (assign_verdict_bead_verified,
+ga-vdurb) — that second write can fail silently, leaving a bead the reviewer's
+`--assignee` poll can never find. The reviewer now also falls back to
+`metadata.gc.session_name` (ga-mo7q fix b) so most cases self-heal, but this
+check gives an independent, bead-content-level signal for the residual cases —
+any open verdict:pending bead with no assignee past ASSIGNEE_GAP_STUCK_SEC
+(1min) is a defect worth surfacing, not routine churn (a fresh bead's assignee
+write is near-instant, so first-seen tracking exists only to skip the write's
+own brief in-flight window, not to absorb genuine multi-minute staleness).
 """
 import json, time, datetime, subprocess, os
 
@@ -39,6 +52,7 @@ ERROR_STUCK_SEC = 600   # 10min in gate-status:error = dispatch failure worth al
 VERDICT_STALL_SEC = 1500  # 25min of a gate-run's pending verdicts not changing = idle reviewer(s) (ga-noxbv)
 NOMERGE_STALL_SEC = 900   # 15min: queue has not ADVANCED + work queued + no review in flight = stuck (ga-hl0gq)
 RACE_WINDOW_SEC = 3600    # 1h rolling window for stale_async_start race-rate check
+ASSIGNEE_GAP_STUCK_SEC = 60  # ga-mo7q: >60s with no assignee on a pending verdict bead = defect, escalate
 # QG events that ADVANCE the queue (a marker reached a handled/terminal state).
 # autorebase_retry + guard_queued do NOT count — they are the non-advancing re-queue loop.
 PROGRESS_EVENTS = {"dispatcher_complete", "dispatcher_superseded", "dispatcher_needs_rebase"}
@@ -132,6 +146,22 @@ def pending_verdicts_by_run():
         return {r: sorted(ids) for r, ids in runs.items()}
     except Exception:
         return {}
+
+
+def verdict_beads_missing_assignee():
+    """Return open verdict beads (type:quality-gate-verdict, verdict:pending)
+    that have no assignee set (ga-mo7q). Returns a list of bead ids. Returns []
+    on any failure — fail-open, a query hiccup must never manufacture an alert."""
+    try:
+        result = subprocess.run(
+            ["gc", "bd", "list", "-l", "type:quality-gate-verdict",
+             "-l", "verdict:pending", "--no-assignee", "--json"],
+            capture_output=True, text=True, timeout=20)
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        return [b["id"] for b in json.loads(result.stdout)]
+    except Exception:
+        return []
 
 
 def dolt_responsive():
@@ -276,6 +306,8 @@ if __name__ == "__main__":
     nomerge_alerted = 0    # last-alerted ts for the GATE-NOMERGE throughput check (ga-hl0gq)
     binary_regress_alerted = 0  # last-alerted ts for ASYNC-START-REGRESS binary check
     race_spike_alerted = 0      # last-alerted ts for ASYNC-START-RACE spike check
+    assignee_gap_first_seen = {}  # bead_id -> first-seen timestamp (ga-mo7q assignee-gap tracking)
+    assignee_gap_alerted = {}     # bead_id -> last-alerted timestamp (ga-mo7q re-alert cadence)
 
     while True:
         # --- engine liveness: dispatcher log must keep sweeping ---
@@ -351,6 +383,39 @@ if __name__ == "__main__":
         for mid in gone:
             error_first_seen.pop(mid, None)
             error_alerted.pop(mid, None)
+
+        # --- VERDICT-ASSIGNEE-GAP: pending verdict bead created with no assignee (ga-mo7q) ---
+        # Measured 30% of verdict beads: the durable-pull assign write
+        # (assign_verdict_bead_verified, ga-vdurb) can fail silently after the bead
+        # itself was created fine, leaving the reviewer's --assignee poll blind to
+        # it. The reviewer now also falls back to metadata.gc.session_name (ga-mo7q
+        # fix b) so most cases self-heal without ever reaching this alert — this is
+        # the independent, bead-content-level backstop for the residual cases (and
+        # for the rarer case where the fallback also can't resolve it, e.g. spawn
+        # never delivered a session_name at all). Same first-seen + re-alert
+        # cadence as GATE-ERROR above, just a much shorter threshold since a
+        # healthy write completes in well under a second.
+        current_gap_ids = set()
+        for vid in verdict_beads_missing_assignee():
+            current_gap_ids.add(vid)
+            now = time.time()
+            if vid not in assignee_gap_first_seen:
+                assignee_gap_first_seen[vid] = now  # just appeared, start the clock
+            stuck_for = now - assignee_gap_first_seen[vid]
+            if stuck_for > ASSIGNEE_GAP_STUCK_SEC:
+                last_alert = assignee_gap_alerted.get(vid, 0)
+                if now - last_alert > REALERT_SEC:
+                    emit("[VERDICT-ASSIGNEE-GAP] verdict bead %s has no assignee %dmin after "
+                         "first seen (ga-mo7q) — reviewer's --assignee poll is blind to it; "
+                         "the metadata.gc.session_name fallback should rescue it, but "
+                         "verify verdicts are still landing: gc bd show %s" % (
+                             vid, int(stuck_for / 60), vid))
+                    assignee_gap_alerted[vid] = now
+        # Prune beads no longer missing an assignee (fixed/closed/resolved)
+        gone_gap = set(assignee_gap_first_seen.keys()) - current_gap_ids
+        for vid in gone_gap:
+            assignee_gap_first_seen.pop(vid, None)
+            assignee_gap_alerted.pop(vid, None)
 
         # --- IDLE-REVIEWER: a gate-run's verdicts not progressing (ga-noxbv) ---
         # Closes the 38min observability blind spot from today's hang: the marker was
