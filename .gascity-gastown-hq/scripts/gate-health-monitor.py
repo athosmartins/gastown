@@ -150,18 +150,24 @@ def pending_verdicts_by_run():
 
 def verdict_beads_missing_assignee():
     """Return open verdict beads (type:quality-gate-verdict, verdict:pending)
-    that have no assignee set (ga-mo7q). Returns a list of bead ids. Returns []
-    on any failure — fail-open, a query hiccup must never manufacture an alert."""
+    that have no assignee set (ga-mo7q). Returns a list of bead ids on success
+    (possibly empty — genuinely no gap), or None if the query itself failed
+    (non-zero exit, timeout, unparseable output). Callers MUST treat None as
+    "unknown" and skip both alerting and prune-tracking that cycle — conflating
+    query failure with genuine-empty here would corrupt first-seen tracking the
+    same way this detector exists to catch (gate feedback on ga-mo7q attempt 1)."""
     try:
         result = subprocess.run(
             ["gc", "bd", "list", "-l", "type:quality-gate-verdict",
              "-l", "verdict:pending", "--no-assignee", "--json"],
             capture_output=True, text=True, timeout=20)
-        if result.returncode != 0 or not result.stdout.strip():
+        if result.returncode != 0:
+            return None
+        if not result.stdout.strip():
             return []
         return [b["id"] for b in json.loads(result.stdout)]
     except Exception:
-        return []
+        return None
 
 
 def dolt_responsive():
@@ -395,27 +401,32 @@ if __name__ == "__main__":
         # never delivered a session_name at all). Same first-seen + re-alert
         # cadence as GATE-ERROR above, just a much shorter threshold since a
         # healthy write completes in well under a second.
-        current_gap_ids = set()
-        for vid in verdict_beads_missing_assignee():
-            current_gap_ids.add(vid)
-            now = time.time()
-            if vid not in assignee_gap_first_seen:
-                assignee_gap_first_seen[vid] = now  # just appeared, start the clock
-            stuck_for = now - assignee_gap_first_seen[vid]
-            if stuck_for > ASSIGNEE_GAP_STUCK_SEC:
-                last_alert = assignee_gap_alerted.get(vid, 0)
-                if now - last_alert > REALERT_SEC:
-                    emit("[VERDICT-ASSIGNEE-GAP] verdict bead %s has no assignee %dmin after "
-                         "first seen (ga-mo7q) — reviewer's --assignee poll is blind to it; "
-                         "the metadata.gc.session_name fallback should rescue it, but "
-                         "verify verdicts are still landing: gc bd show %s" % (
-                             vid, int(stuck_for / 60), vid))
-                    assignee_gap_alerted[vid] = now
-        # Prune beads no longer missing an assignee (fixed/closed/resolved)
-        gone_gap = set(assignee_gap_first_seen.keys()) - current_gap_ids
-        for vid in gone_gap:
-            assignee_gap_first_seen.pop(vid, None)
-            assignee_gap_alerted.pop(vid, None)
+        gap_ids = verdict_beads_missing_assignee()
+        # None means the query itself failed (Dolt hiccup/timeout) — skip alert-check
+        # AND prune this cycle; treating that like "no gap" would silently reset
+        # first-seen tracking and could mask a real stuck bead for the outage's duration.
+        if gap_ids is not None:
+            current_gap_ids = set()
+            for vid in gap_ids:
+                current_gap_ids.add(vid)
+                now = time.time()
+                if vid not in assignee_gap_first_seen:
+                    assignee_gap_first_seen[vid] = now  # just appeared, start the clock
+                stuck_for = now - assignee_gap_first_seen[vid]
+                if stuck_for > ASSIGNEE_GAP_STUCK_SEC:
+                    last_alert = assignee_gap_alerted.get(vid, 0)
+                    if now - last_alert > REALERT_SEC:
+                        emit("[VERDICT-ASSIGNEE-GAP] verdict bead %s has no assignee %dmin after "
+                             "first seen (ga-mo7q) — reviewer's --assignee poll is blind to it; "
+                             "the metadata.gc.session_name fallback should rescue it, but "
+                             "verify verdicts are still landing: gc bd show %s" % (
+                                 vid, int(stuck_for / 60), vid))
+                        assignee_gap_alerted[vid] = now
+            # Prune beads no longer missing an assignee (fixed/closed/resolved)
+            gone_gap = set(assignee_gap_first_seen.keys()) - current_gap_ids
+            for vid in gone_gap:
+                assignee_gap_first_seen.pop(vid, None)
+                assignee_gap_alerted.pop(vid, None)
 
         # --- IDLE-REVIEWER: a gate-run's verdicts not progressing (ga-noxbv) ---
         # Closes the 38min observability blind spot from today's hang: the marker was

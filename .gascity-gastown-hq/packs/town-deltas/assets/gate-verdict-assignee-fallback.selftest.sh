@@ -156,5 +156,79 @@ else
 fi
 
 echo
+echo "── 4. VERDICT-ASSIGNEE-GAP: query failure must not corrupt first-seen tracking (gate feedback, attempt 1) ──"
+# Gate feedback on attempt 1: verdict_beads_missing_assignee() returned []
+# both on a genuinely-resolved gap AND on a query failure (non-zero exit,
+# timeout, exception) — indistinguishable, same as the ga-mo7q bug itself.
+# The caller's prune step then read a failure as "this bead's gap resolved",
+# silently resetting first-seen and understating true staleness (a transient
+# hiccup) or suppressing the alert entirely (a sustained outage spanning the
+# bead's whole stuck lifetime). Fix: return None on failure, distinct from []
+# on genuine-empty; caller skips BOTH alert-check and prune when None —
+# mirrors this file's own dolt_responsive() guard pattern (used at the
+# IDLE-REVIEWER and GATE-NOMERGE checks) applied to this detector too.
+#
+# Pure mirror of ONE tracking cycle for a single bead's first-seen value
+# (plain scalars + echo, same technique as verdict_bead_lookup() above — no
+# bash4+ arrays/namerefs; this directory's selftests target bash 3.2).
+# $1 = current first_seen ("" = not yet tracked), $2 = this cycle's result
+# for the bead (FAIL | present | absent), $3 = now. Echoes the new first_seen.
+cycle_fixed() {
+  local fs="$1" result="$2" now="$3"
+  case "$result" in
+    FAIL)    echo "$fs" ;;                                  # the fix: untouched
+    present) if [ -z "$fs" ]; then echo "$now"; else echo "$fs"; fi ;;
+    absent)  echo "" ;;                                     # genuinely resolved
+  esac
+}
+# Mutation: the ORIGINAL bug — FAIL treated exactly like genuine-empty.
+cycle_buggy() {
+  local fs="$1" result="$2" now="$3"
+  case "$result" in
+    FAIL)    echo "" ;;                                     # bug: silently pruned
+    present) if [ -z "$fs" ]; then echo "$now"; else echo "$fs"; fi ;;
+    absent)  echo "" ;;
+  esac
+}
+
+# Scenario (matches the gate reviewer's "one isolated hiccup" trace): bead
+# first seen at t=0, query fails at t=60 (transient Dolt hiccup), bead still
+# genuinely missing its assignee and found again at t=120.
+fs=""
+fs="$(cycle_fixed "$fs" present 0)"
+fs="$(cycle_fixed "$fs" FAIL 60)"
+fs="$(cycle_fixed "$fs" present 120)"
+eq "fixed: first-seen survives a mid-sequence query failure" "$fs" "0"
+
+fs=""
+fs="$(cycle_buggy "$fs" present 0)"
+fs="$(cycle_buggy "$fs" FAIL 60)"
+fs="$(cycle_buggy "$fs" present 120)"
+if [ "$fs" = "120" ]; then
+  ok "mutation: neutralizing the None-check reproduces the bug (first-seen reset 0→120, understates true staleness by 120s) — proves the guard is what fixes it"
+else
+  bad "mutation: buggy variant did not reproduce the reset (got $fs) — mirror no longer matches the real bug"
+fi
+
+# Sustained outage: FAIL every cycle while the bead stays stuck. The fixed
+# variant must never manufacture a fresh first-seen from a failure — this is
+# the worst-case tail this detector exists to catch (a query blind for the
+# bead's entire stuck lifetime must still alert once it recovers, dating from
+# the true onset, not the recovery poll).
+fs=""
+fs="$(cycle_fixed "$fs" present 0)"
+fs="$(cycle_fixed "$fs" FAIL 60)"
+fs="$(cycle_fixed "$fs" FAIL 120)"
+fs="$(cycle_fixed "$fs" FAIL 180)"
+eq "fixed: first-seen survives a sustained multi-cycle outage" "$fs" "0"
+
+echo
+echo "── 5. DRIFT-GUARD: the None-vs-empty fix is actually wired into the real file ──"
+has "$HEALTH_MON" 'return None' \
+    "gate-health-monitor.py: verdict_beads_missing_assignee has a None (failure) return path"
+has "$HEALTH_MON" 'if gap_ids is not None' \
+    "gate-health-monitor.py: caller checks for the None sentinel before alert-check/prune"
+
+echo
 echo "── RESULT: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ]
