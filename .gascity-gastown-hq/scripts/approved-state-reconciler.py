@@ -918,6 +918,18 @@ def _process_store(rig_root, now, state, pilot_alive):
                  bead_id, starve_age_min))
             continue
 
+        # exec:manual — bead requires human/supervised execution; the headless pool never
+        # dispatches it by design (ga-u4sd: 3 beads Mayor approved stayed story:approved +
+        # exec:manual and alarmed "starving 90min" every cycle forever, since nothing else
+        # here suppresses them). Not a dispatch failure — it's a legitimate final state
+        # awaiting a human to run it. Same shape as gate:needs-fix above: suppress the alarm,
+        # do NOT reclassify (no target state exists; the bead correctly stays story:approved).
+        # Exact-match only (not a prefix check) — exec:auto must keep alarming if it starves.
+        if "exec:manual" in labels:
+            _log("  %s: no signal, daemon-age=%.0fmin, exec:manual (awaiting human execution, "
+                 "not a dispatch failure) — no alarm" % (bead_id, starve_age_min))
+            continue
+
         # Pilot dead → can't blame dispatch; don't alarm.
         if not pilot_alive:
             _log("  %s: no signal, daemon-age=%.0fmin, starving BUT pilot dead — no alarm" % (
@@ -1030,6 +1042,9 @@ def _selftest():
       (s)       pilot:reclaim-count:RECLAIM_CAP → no starve alarm; ONE reclaim-exhausted
                 note (comment + ledger + low-prio notify), NOT a mayor mail (ga-ag16)
       (t)       reclaim-exhausted note does not repeat across cycles (ga-ag16)
+      (u)       exec:manual bead → no starve alarm (awaiting human execution) (ga-u4sd)
+      (v)       exec:auto bead (not exec:manual) → STILL alarms — regression guard, exact-
+                label match must not swallow other exec:* variants (ga-u4sd)
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers
@@ -1479,6 +1494,44 @@ def _selftest():
     else:
         _bad("(t): reclaim-exhausted note REPEATED on second cycle",
              "comments=%s notify_calls=%s mail_calls=%s" % (comments, notify_calls, mail_calls))
+
+    print("\nScenario (u): exec:manual bead → no starve alarm (awaiting human execution)")
+    # A story:approved bead labeled exec:manual requires human/supervised execution — the
+    # headless pool never dispatches it by design. Without this exclusion an approved
+    # exec:manual bead alarms "starving" every cycle forever (ga-u4sd: 3 beads Mayor approved
+    # fired "buildable bead starving 90min — dispatch failing" repeatedly).
+    _bd_approved = lambda root: [_make_bead(
+        "hq-020", labels=["story:approved", "exec:manual"], age_min=0.1)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_u = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_u["first_seen_approved"]["hq-020"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_u)
+    alarmed_u = any("hq-020" in subj for subj, _ in mail_calls)
+    if not alarmed_u:
+        _ok("(u): exec:manual bead — no starve alarm (awaiting human execution, ga-u4sd)")
+    else:
+        _bad("(u): exec:manual bead FALSELY alarmed as starving (false dispatch-failure mail)",
+             "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (v): exec:auto bead (not exec:manual) → STILL alarms (regression)")
+    # Guard against a future refactor loosening the exec:manual check to a prefix/substring
+    # match — exec:auto means the pool SHOULD pick this up, so a starving exec:auto bead is a
+    # real dispatch failure and must keep alarming.
+    _bd_approved = lambda root: [_make_bead(
+        "hq-021", labels=["story:approved", "exec:auto"], age_min=0.1)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_v = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_v["first_seen_approved"]["hq-021"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_v)
+    alarmed_v = any("hq-021" in subj for subj, _ in mail_calls)
+    if alarmed_v:
+        _ok("(v): exec:auto bead — still alarms (exact-match guard, not swallowed by the "
+            "exec:manual fix)")
+    else:
+        _bad("(v): exec:auto bead FAILED to alarm — exec:manual fix regressed exec:auto "
+             "dispatch-failure detection", "mail_calls=%s" % mail_calls)
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
