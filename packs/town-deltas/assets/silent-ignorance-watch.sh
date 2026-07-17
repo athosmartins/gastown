@@ -99,8 +99,39 @@ now=$(date +%s)
 # edição acima desloca tudo e o monitor grita 291 falsos "novos" no dia seguinte).
 key_of() { awk -F: '{cat=""; for(i=1;i<=NF;i++) if($i=="C1"||$i=="C2"||$i=="C3"){cat=$i; ci=i; break} code=""; for(j=ci+1;j<=NF;j++) code=code (j>ci+1?":":"") $j; gsub(/^[[:space:]]+|[[:space:]]+$/,"",code); print $1 "\t" cat "\t" code}' "$1"; }
 
+# ── persist_baseline <keys> <delta|/dev/null> ────────────────────────────────
+# ⚠️ NUNCA reescreva o baseline carimbando $now em TUDO. O relógio é POR ACHADO.
+# A v1 fazia `key_of ... | awk -v t="$now" '{print $0 "\t" t}' > "$BASELINE"`: como a
+# regravação dispara quando aparece 1 NOVO em QUALQUER rig, o first-seen dos outros
+# ~290 era zerado junto. Nenhum achado jamais completaria ESCALATE_DAYS intactos ⇒ a
+# re-escalação NUNCA dispararia, e o monitor voltaria a "avisa 1x e cala pra sempre"
+# (wa-k288h) — o bug que este arquivo existe pra prevenir, reintroduzido pela própria
+# linha que declara preveni-lo, via reset de timestamp em vez de set sem timestamp.
+# Achado pelo revisor do gate (run ga-wisp-3ip2my) e REPRODUZIDO antes de aceitar:
+# achado com epoch de 10 dias virou "visto agora" porque um achado ALHEIO apareceu.
+# Regra: quem já está no baseline PRESERVA o first-seen; NOVO nasce agora; e quem
+# acabou de ser re-escalado reinicia o relógio (re-escala a cada ESCALATE_DAYS, não a
+# cada rodada).
+persist_baseline() {
+  local keys="$1" delta="$2" prev="$BASELINE"
+  [ -r "$prev" ]  || prev=/dev/null      # 1ª semeadura: não há epoch anterior
+  [ -r "$delta" ] || delta=/dev/null     # --seed: não há re-escalados
+  awk -F'\t' -v OFS='\t' -v t="$now" -v bf="$prev" -v df="$delta" '
+    FILENAME == bf { old[$1 FS $2 FS $3] = $4; next }
+    FILENAME == df { if ($1 == "ANTIGO") re[$2 FS $3 FS $4] = 1; next }
+    {
+      k = $1 FS $2 FS $3
+      if (k in re)        e = t          # re-escalado agora  -> reinicia o relógio
+      else if (k in old)  e = old[k]     # segue aberto       -> PRESERVA o first-seen
+      else                e = t          # NOVO               -> nasce agora
+      print $0, e
+    }
+  ' "$prev" "$delta" "$keys" > "${BASELINE}.tmp" && mv "${BASELINE}.tmp" "$BASELINE"
+}
+
 if [ "$seed_mode" = "1" ]; then
-  key_of "$tmp_all" | awk -v t="$now" '{print $0 "\t" t}' > "$BASELINE"
+  key_of "$tmp_all" > "${tmp_all}.keys"
+  persist_baseline "${tmp_all}.keys" /dev/null
   echo "silent-ignorance-watch: baseline semeado com $total achado(s) — nada alertado (é a dívida existente)."
   exit 0
 fi
@@ -157,6 +188,6 @@ if ! "$NOTIFY_BIN" -t "🔇 Ignorância Silenciosa" -p 4 "$msg" >/dev/null 2>&1;
   echo "silent-ignorance-watch: ERRO — notify falhou; baseline INTACTO, próxima rodada re-tenta." >&2
   exit 3
 fi
-key_of "$tmp_all" | awk -v t="$now" '{print $0 "\t" t}' > "$BASELINE"
-echo "alertado e baseline atualizado."
+persist_baseline "${tmp_all}.keys" "$tmp_new"
+echo "alertado e baseline atualizado (first-seen dos achados que continuam abertos PRESERVADO)."
 exit 0
