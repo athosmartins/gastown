@@ -305,9 +305,11 @@ PILOT_REUSE_SESSION="${PILOT_REUSE_SESSION:-1}"
 # This guard REFUSES a fresh dispatch — at the pre-sling chokepoint, AFTER the
 # atomic claim and AFTER all the existing lifecycle/race verify guards — when
 # EITHER signal says the work is already real and owned:
-#   (a) a branch `origin/crew/*/<bead-id>` ALREADY EXISTS in the bead's rig repo
-#       (the STRONGEST signal: code was pushed for this bead → a build happened /
-#       is happening → never start a second builder elsewhere), OR
+#   (a) a branch `origin/crew/*/<bead-id>` OR `origin/fix/<bead-id>-*` ALREADY
+#       EXISTS in the bead's rig repo (the STRONGEST signal: code was pushed for
+#       this bead → a build happened / is happening → never start a second
+#       builder elsewhere — ga-6jqr closed the fix/* blind spot: dog builders
+#       push fix/<bead>-<slug>, not crew/*/<bead>), OR
 #   (b) the bead's CURRENT assignee is a non-empty NAMED crew whose session is
 #       LIVE (it belongs to someone actively working it).
 # On a refusal the bead is SKIPPED (claim released, story untouched) so it stays
@@ -1563,9 +1565,12 @@ _filter_dispatch_gates() {
       and (((.labels // []) | map(select(test("^(waiting-on|next-action):"))) | length) == 0)
     )]' 2>/dev/null || cat
 }
-# _filter_built — drop ctx:ready candidates that ALREADY have a crew branch (built work
-# awaiting gate/delivery, NOT a fresh dispatch candidate). Such a bead — if it kept or
-# re-acquired ctx:ready (lost story:in-flight, or gate-failed) — is picked first by
+# _filter_built — drop ctx:ready candidates that ALREADY have a crew OR dog fix/ branch
+# (built work awaiting gate/delivery, NOT a fresh dispatch candidate; ga-6jqr: the branch
+# probe used to match ONLY crew/*/<id>, blind to the fix/<id>-* shape dog builders push —
+# so a bead a dog already branched still read "no branch" and got dispatched AGAIN).
+# Such a bead — if it kept or re-acquired ctx:ready (lost story:in-flight, or gate-failed)
+# — is picked first by
 # priority, REFUSED by the ownership guard (its branch exists), and HEAD-OF-LINE-BLOCKS
 # the lane every sweep (the wa-xrdv / wa-vn5o stall: dispatched=0 while fresh beads wait).
 # Self-sufficient repo list (does not need the never-started block). FAIL-OPEN to KEEP:
@@ -1632,7 +1637,8 @@ _filter_built() {
         while IFS= read -r r; do
           [ -n "$r" ] && [ -d "$r" ] || continue
           if git -C "$r" for-each-ref --format='%(refname)' \
-               "refs/remotes/origin/crew/*/$id" "refs/heads/crew/*/$id" 2>/dev/null | grep -q .; then
+               "refs/remotes/origin/crew/*/$id" "refs/heads/crew/*/$id" \
+               "refs/remotes/origin/fix/$id-*" "refs/heads/fix/$id-*" 2>/dev/null | grep -q .; then
             built_ids="${built_ids:+$built_ids }$id"; break
           fi
         done <<< "$repos"
@@ -2100,9 +2106,10 @@ _iso_to_epoch() {
     || date -u -d "$1" +%s 2>/dev/null || echo ""
 }
 
-# _target_has_real_branch <bead_id> — return 0 ONLY if a crew branch for the bead actually
-# exists. Self-contained repo list. Any uncertainty → return 1 (assert NO branch) so this
-# only ever ADDS a keep-signal, never forces a release.
+# _target_has_real_branch <bead_id> — return 0 ONLY if a crew or dog fix/ branch for the
+# bead actually exists (ga-6jqr: was crew/*/<id>-only, blind to the fix/<id>-* shape dog
+# builders push). Self-contained repo list. Any uncertainty → return 1 (assert NO branch)
+# so this only ever ADDS a keep-signal, never forces a release.
 _target_has_real_branch() {
   command -v git >/dev/null 2>&1 || return 1
   local _repos _r
@@ -2111,7 +2118,8 @@ _target_has_real_branch() {
   while IFS= read -r _r; do
     [ -n "$_r" ] && [ -d "$_r" ] || continue
     git -C "$_r" for-each-ref --format='%(refname)' \
-        "refs/remotes/origin/crew/*/$1" "refs/heads/crew/*/$1" 2>/dev/null | grep -q . && return 0
+        "refs/remotes/origin/crew/*/$1" "refs/heads/crew/*/$1" \
+        "refs/remotes/origin/fix/$1-*" "refs/heads/fix/$1-*" 2>/dev/null | grep -q . && return 0
   done <<< "$_repos"
   return 1
 }
@@ -2377,13 +2385,15 @@ while IFS= read -r _ttl_rig; do
 done <<< "$_ttl_rig_paths"
 
 # _beadid_has_crew_branch <bead_id> — exit 0 iff a branch named like
-# `crew/<owner>/<bead-id>` exists in ANY town/rig repo, local OR remote-tracking,
-# AND (best-effort) directly on the rig remote via a bounded `ls-remote`. This is
-# the ga-htjni signal-(a): a pushed crew branch means a build is real/in-flight.
-# It is STRICTER than _beadid_has_branch (which matches the id anywhere in any
-# ref) — here we require the `crew/.../<bead>` shape so a stray tag/note never
-# false-fires; the trailing `/<bead>` or exact `<bead>` end-anchor avoids matching
-# a longer id that merely contains this one as a prefix.
+# `crew/<owner>/<bead-id>` OR `fix/<bead-id>-<slug>` exists in ANY town/rig repo,
+# local OR remote-tracking, AND (best-effort) directly on the rig remote via a
+# bounded `ls-remote`. This is the ga-htjni signal-(a): a pushed crew/fix branch
+# means a build is real/in-flight. It is STRICTER than _beadid_has_branch (which
+# matches the id anywhere in any ref) — here we require one of the two KNOWN
+# builder-branch shapes so a stray tag/note never false-fires; the end-anchor
+# avoids matching a longer id that merely contains this one as a prefix.
+# ga-6jqr: originally crew/-only, blind to the fix/<id>-* shape dog builders
+# push — a dog-built bead read "no branch" here and got double-dispatched.
 #
 # Test seam: PILOT_TEST_CREW_BRANCH_BEADS (space-list), consulted when DEFINED,
 # keeps the selftest hermetic (no real git / network). When undefined we probe
@@ -2400,8 +2410,11 @@ _beadid_has_crew_branch() {
   local _repos _re
   _repos=$(_ownership_guard_repos)
   [ -n "$_repos" ] || return 1
-  # crew/<anything>/<bead> at a ref tail, OR a bare crew/<bead> (defensive).
-  _re="crew/([^/]+/)?${_bid}\$"
+  # crew/<anything>/<bead> at a ref tail, OR a bare crew/<bead> (defensive), OR
+  # a dog-built fix/<bead>-<slug> (ga-6jqr — the DOG builder branch shape; the
+  # trailing "-" requires a real slug so a longer id sharing this one as a
+  # prefix, e.g. "${_bid}2", never false-matches).
+  _re="(crew/([^/]+/)?${_bid}|fix/${_bid}-[^/]+)\$"
   while IFS= read -r _repo; do
     [ -n "$_repo" ] && [ -d "$_repo" ] || continue
     # 1. Already-fetched local + remote-tracking refs (cheap, offline).
@@ -2410,11 +2423,12 @@ _beadid_has_crew_branch() {
       return 0
     fi
     # 2. Best-effort authoritative remote probe (bounded; the live origin/crew/*
-    #    branch ga-htjni hit may not be fetched locally). A timeout / offline
-    #    remote is NOT evidence of a branch → fall through (fail-open), never block.
+    #    or origin/fix/* branch ga-htjni hit may not be fetched locally). A
+    #    timeout / offline remote is NOT evidence of a branch → fall through
+    #    (fail-open), never block.
     if git -C "$_repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 \
        || git -C "$_repo" remote 2>/dev/null | grep -q .; then
-      if timeout 8 git -C "$_repo" ls-remote --heads origin "crew/*/${_bid}" "crew/${_bid}" 2>/dev/null \
+      if timeout 8 git -C "$_repo" ls-remote --heads origin "crew/*/${_bid}" "crew/${_bid}" "fix/${_bid}-*" 2>/dev/null \
           | grep -qiE "refs/heads/${_re}"; then
         return 0
       fi

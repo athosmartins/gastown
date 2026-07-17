@@ -4248,6 +4248,108 @@ grep -qE 'PRIOR ZERO-PROGRESS ATTEMPT' "$DISPATCHER" \
   && ok "ga-qm7u: \$LIVE_VERIFY_SECTION injected at both DISPATCH_TASK sites (bug-tier + feature-tier)" \
   || bad "ga-qm7u: \$LIVE_VERIFY_SECTION injection-site count != 2 — one of the two dispatch templates lost its injection"
 
+# ── Scenario ga-6jqr: dedup blind to dog fix/<bead>-* branches ──────────────────
+# Bug ga-6jqr: the Pilot double-dispatched a builder to a bead a DOG had already
+# branched (fix/ga-oo66-gate-park-mail-author), burning a whole worker cycle,
+# because the 3 branch-existence probes (_filter_built L1635, _target_has_real_branch
+# L2114, _beadid_has_crew_branch's ls-remote L2417) matched ONLY crew/*/<bead> — the
+# NAMED-CREW convention — never fix/<bead>-<slug>, the convention DOG builders
+# actually push. This is a MUTATION test: PILOT_TEST_BRANCH_BEADS /
+# PILOT_TEST_CREW_BRANCH_BEADS are explicitly left UNSET so the REAL git ref-matching
+# code runs — every other scenario in this file drives those hermetic seams instead,
+# which bypass exactly the code this bug lives in, so a hermetic-only test could stay
+# green through a regression here.
+echo "Scenario ga-6jqr: Pilot branch-dedup recognizes dog fix/<bead>-* branches, not just crew/*/<bead>"
+
+GJ6_BARE="$WORK/ga6jqr-bare.git"
+GJ6_REPO="$WORK/ga6jqr-repo"
+GJ6_PUSHER="$WORK/ga6jqr-pusher"
+rm -rf "$GJ6_BARE" "$GJ6_REPO" "$GJ6_PUSHER"
+git init -q --bare "$GJ6_BARE"
+
+mkdir -p "$GJ6_REPO"
+git init -q "$GJ6_REPO"
+git -C "$GJ6_REPO" config user.email "selftest@example.com"
+git -C "$GJ6_REPO" config user.name "selftest"
+git -C "$GJ6_REPO" commit -q --allow-empty -m init
+git -C "$GJ6_REPO" remote add origin "$GJ6_BARE"
+git -C "$GJ6_REPO" push -q origin HEAD:refs/heads/main
+GJ6_SHA="$(git -C "$GJ6_REPO" rev-parse HEAD)"
+
+# crew/-shape fixtures (regression: MUST stay detected) — one local head, one
+# synthesized remote-tracking ref (no real fetch needed; for-each-ref reads local refs).
+git -C "$GJ6_REPO" branch "crew/mila/gj6-crew-l" "$GJ6_SHA"
+git -C "$GJ6_REPO" update-ref "refs/remotes/origin/crew/mila/gj6-crew-r" "$GJ6_SHA"
+
+# fix/<bead>-<slug>-shape fixtures (ga-6jqr: the NEW case) — same local + remote-tracking split.
+git -C "$GJ6_REPO" branch "fix/gj6-fix-l-some-slug" "$GJ6_SHA"
+git -C "$GJ6_REPO" update-ref "refs/remotes/origin/fix/gj6-fix-r-other-slug" "$GJ6_SHA"
+
+# gj6-none: no branch anywhere (negative control).
+
+# gj6-remoteonly: pushed straight to the bare "origin" from a THIRD, unrelated repo —
+# never fetched into $GJ6_REPO's local/remote-tracking refs — so the only way to
+# discover it is a LIVE ls-remote. This is the only fixture that actually exercises
+# _beadid_has_crew_branch's remote-probe fallback (site 3b, L2417); every other
+# fixture above short-circuits on the LOCAL for-each-ref check (site 3a).
+mkdir -p "$GJ6_PUSHER"
+git init -q "$GJ6_PUSHER"
+git -C "$GJ6_PUSHER" config user.email "selftest@example.com"
+git -C "$GJ6_PUSHER" config user.name "selftest"
+git -C "$GJ6_PUSHER" commit -q --allow-empty -m init
+git -C "$GJ6_PUSHER" remote add origin "$GJ6_BARE"
+git -C "$GJ6_PUSHER" push -q origin HEAD:refs/heads/fix/gj6-remoteonly-slug
+
+_GJ6_FILTER_BUILT_FN="$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} /^_beadid_has_open_gate_marker\(\)/{f=1} /^_filter_built\(\)/{f=1} f{print} f&&/^}$/{f=0}' "$DISPATCHER")"
+_GJ6_TARGET_HAS_REAL_BRANCH_FN="$(awk '/^_target_has_real_branch\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_GJ6_HAS_CREW_BRANCH_FN="$(awk '/^_beadid_has_crew_branch\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+
+[ -n "$_GJ6_FILTER_BUILT_FN" ] && [ -n "$_GJ6_TARGET_HAS_REAL_BRANCH_FN" ] && [ -n "$_GJ6_HAS_CREW_BRANCH_FN" ] \
+  || bad "ga-6jqr: failed to extract one of the 3 target functions from $DISPATCHER — awk markers drifted"
+
+# Site 1 — _filter_built: all 4 branched fixtures dropped, only gj6-none survives.
+GJ6_S1="$(
+  unset PILOT_TEST_BRANCH_BEADS
+  export PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS=""
+  _ownership_guard_repos() { printf '%s' "$GJ6_REPO"; }
+  eval "$_GJ6_FILTER_BUILT_FN"
+  printf '%s' '[{"id":"gj6-crew-l"},{"id":"gj6-crew-r"},{"id":"gj6-fix-l"},{"id":"gj6-fix-r"},{"id":"gj6-none"}]' \
+    | _filter_built | jq -rc '[.[].id]' 2>/dev/null
+)"
+[ "$GJ6_S1" = '["gj6-none"]' ] \
+  && ok "ga-6jqr site 1 (_filter_built, L1635): fix/<id>-* branches now recognized as built, crew/*/<id> regression-clean, no-branch bead kept" \
+  || bad "ga-6jqr site 1 (_filter_built, L1635): expected only gj6-none to survive, got '$GJ6_S1'"
+
+# Site 2 — _target_has_real_branch: exact per-id boolean check, all 4 shapes + negative control.
+GJ6_S2_RESULT=""
+for _id in gj6-crew-l gj6-crew-r gj6-fix-l gj6-fix-r gj6-none; do
+  if (
+    _ownership_guard_repos() { printf '%s' "$GJ6_REPO"; }
+    eval "$_GJ6_TARGET_HAS_REAL_BRANCH_FN"
+    _target_has_real_branch "$_id"
+  ); then GJ6_S2_RESULT="${GJ6_S2_RESULT}${_id}=1 "; else GJ6_S2_RESULT="${GJ6_S2_RESULT}${_id}=0 "; fi
+done
+[ "$GJ6_S2_RESULT" = "gj6-crew-l=1 gj6-crew-r=1 gj6-fix-l=1 gj6-fix-r=1 gj6-none=0 " ] \
+  && ok "ga-6jqr site 2 (_target_has_real_branch, L2114): fix/<id>-* detected (local+remote-tracking), crew/*/<id> regression-clean" \
+  || bad "ga-6jqr site 2 (_target_has_real_branch, L2114): wrong verdicts (got '$GJ6_S2_RESULT')"
+
+# Site 3 — _beadid_has_crew_branch: local-ref path (crew/fix, local+remote-tracking)
+# PLUS the remote-only fixture that can ONLY be found via the ls-remote fallback (L2417).
+GJ6_S3_RESULT=""
+for _id in gj6-crew-l gj6-crew-r gj6-fix-l gj6-fix-r gj6-remoteonly gj6-none; do
+  if (
+    unset PILOT_TEST_CREW_BRANCH_BEADS
+    _ownership_guard_repos() { printf '%s' "$GJ6_REPO"; }
+    eval "$_GJ6_HAS_CREW_BRANCH_FN"
+    _beadid_has_crew_branch "$_id"
+  ); then GJ6_S3_RESULT="${GJ6_S3_RESULT}${_id}=1 "; else GJ6_S3_RESULT="${GJ6_S3_RESULT}${_id}=0 "; fi
+done
+[ "$GJ6_S3_RESULT" = "gj6-crew-l=1 gj6-crew-r=1 gj6-fix-l=1 gj6-fix-r=1 gj6-remoteonly=1 gj6-none=0 " ] \
+  && ok "ga-6jqr site 3 (_beadid_has_crew_branch, L2417 ls-remote fallback): fix/<id>-* detected locally AND remote-only via live ls-remote, crew/*/<id> regression-clean" \
+  || bad "ga-6jqr site 3 (_beadid_has_crew_branch, L2417 ls-remote fallback): wrong verdicts (got '$GJ6_S3_RESULT')"
+
+rm -rf "$GJ6_BARE" "$GJ6_REPO" "$GJ6_PUSHER"
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
