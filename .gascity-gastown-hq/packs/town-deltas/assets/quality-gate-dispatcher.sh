@@ -1465,6 +1465,23 @@ spawn_abort_should_page() {
   if [ "$((now - last))" -ge "$realert" ]; then echo "page"; else echo "hold"; fi
 }
 
+# ── ga-art5: verdict-bead status must distinguish "couldn't read" from "open" ─
+# Pure decision (no IO, set -e safe) so the selftest can drift-guard it: a
+# failed `bd show` on a verdict bead is NOT the same fact as that bead's
+# verdict genuinely being open — conflating them made a transient Dolt hiccup
+# and a real open verdict trigger the identical REQUEUED action
+# (root-class:error-vs-empty). Callers pass the __UNKNOWN__ sentinel when
+# `bd show` itself failed (never a jq-parsed value in that case), and a real
+# status string otherwise.
+#   unknown  — bd show failed; don't guess, skip this bead this sweep
+#   skip     — already closed; nothing to do
+#   requeue  — genuinely not closed; safe to park as REQUEUED
+vb_status_action() {
+  local status="$1"
+  if [ "$status" = "__UNKNOWN__" ]; then echo "unknown"; return 0; fi
+  if [ "$status" = "closed" ]; then echo "skip"; else echo "requeue"; fi
+}
+
 # NOTE: set_gate_status() is provided by the guard lib sourced above (line ~58,
 # GATE_GUARD_LIB_ONLY=1) — same DRY pattern as parse_marker_id. Single source of
 # truth in quality-gate-guard.sh; no copy here to avoid drift (ga-jhyu).
@@ -1559,14 +1576,24 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
     # fix-attempt), with reason-appropriate messaging.
     log "INFRA re-queue (ga-eqjo): marker $MARKER_ID re-queued — reviewer session(s) died mid-review (Dolt hiccup/crash class, not a code FAIL)."
     for VB in "${VERDICT_BEAD_IDS[@]}"; do
-      VB_STATUS=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null \
-        | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
-      if [ "$VB_STATUS" != "closed" ]; then
-        bd -C "$GC_CITY" label remove "$VB" "verdict:pending" -q 2>/dev/null || true
-        bd -C "$GC_CITY" label add    "$VB" "verdict:REQUEUED" -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (ga-eqjo) — reviewer session died mid-review (infra failure, NOT a code FAIL). Marker re-queued for a fresh attempt." 2>/dev/null || true
-        bd -C "$GC_CITY" close "$VB" 2>/dev/null || true
+      if VB_JSON=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null); then
+        VB_STATUS=$(printf '%s' "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
+      else
+        VB_STATUS="__UNKNOWN__"
       fi
+      case "$(vb_status_action "$VB_STATUS")" in
+        unknown)
+          log "  Verdict bead $VB status unreadable this sweep (bd show failed — transient Dolt hiccup?) — skipping, will retry next sweep (root-class:error-vs-empty, ga-art5)."
+          continue
+          ;;
+        skip) : ;;
+        requeue)
+          bd -C "$GC_CITY" label remove "$VB" "verdict:pending" -q 2>/dev/null || true
+          bd -C "$GC_CITY" label add    "$VB" "verdict:REQUEUED" -q 2>/dev/null || true
+          bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (ga-eqjo) — reviewer session died mid-review (infra failure, NOT a code FAIL). Marker re-queued for a fresh attempt." 2>/dev/null || true
+          bd -C "$GC_CITY" close "$VB" 2>/dev/null || true
+          ;;
+      esac
     done
     bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
     bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:queued"      -q 2>/dev/null || true
@@ -1581,14 +1608,24 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
   log "QUOTA-STOP (ga-x3nmz): marker $MARKER_ID re-queued — Claude 5h quota exhausted mid-review; gate re-runs automatically post-reset${_eta:+ ($_eta)}. This is NOT a FAIL."
   # Park pending verdict beads as REQUEUED so they don't orphan or count as FAIL.
   for VB in "${VERDICT_BEAD_IDS[@]}"; do
-    VB_STATUS=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null \
-      | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
-    if [ "$VB_STATUS" != "closed" ]; then
-      bd -C "$GC_CITY" label remove "$VB" "verdict:pending" -q 2>/dev/null || true
-      bd -C "$GC_CITY" label add    "$VB" "verdict:REQUEUED" -q 2>/dev/null || true
-      bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (ga-x3nmz) — reviewer session ended on an exhausted Claude 5h quota (quota-stop, NOT a code FAIL). Marker re-queued for re-run post-reset${_eta:+ ($_eta)}." 2>/dev/null || true
-      bd -C "$GC_CITY" close "$VB" 2>/dev/null || true
+    if VB_JSON=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null); then
+      VB_STATUS=$(printf '%s' "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
+    else
+      VB_STATUS="__UNKNOWN__"
     fi
+    case "$(vb_status_action "$VB_STATUS")" in
+      unknown)
+        log "  Verdict bead $VB status unreadable this sweep (bd show failed — transient Dolt hiccup?) — skipping, will retry next sweep (root-class:error-vs-empty, ga-art5)."
+        continue
+        ;;
+      skip) : ;;
+      requeue)
+        bd -C "$GC_CITY" label remove "$VB" "verdict:pending" -q 2>/dev/null || true
+        bd -C "$GC_CITY" label add    "$VB" "verdict:REQUEUED" -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (ga-x3nmz) — reviewer session ended on an exhausted Claude 5h quota (quota-stop, NOT a code FAIL). Marker re-queued for re-run post-reset${_eta:+ ($_eta)}." 2>/dev/null || true
+        bd -C "$GC_CITY" close "$VB" 2>/dev/null || true
+        ;;
+    esac
   done
   # Re-queue the marker (reverse of the atomic claim): dispatching → queued.
   bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
@@ -4933,17 +4970,7 @@ for i in $(seq 1 $REQUIRED_REVIEWERS); do
   fi
   REVIEWER_LENS=""
   case "$i" in
-    1) REVIEWER_LENS="CORRECTNESS. Be adversarial.
-
-FIRST — run this check on EVERY guard, filter, query and conditional the diff adds or touches. It is this city's #1 root failure class (ga-p5q3), named after it produced 5 bugs in one night, and it recurred 9+ times in a single day AFTER being documented — so do NOT assume the author considered it:
-
-  ASK: 'what happens when the QUESTION ITSELF FAILS?' — the query errors or times out, the field is absent, the session isn't in the list, the label isn't there, the command returns empty.
-  FAIL THE DIFF IF: 'I could not determine' collapses into the SAME value/branch as a CONFIRMED answer. Error/unknown and a real negative MUST be distinguishable, and the unknown path must fail SAFE (suppress/defer/retry) rather than act as if it confirmed something.
-
-Real shapes this took here (recognise them): an empty assignee read as 'the owner is dead' → escalated forever; a failed CPU probe read as 'Dolt is saturated' → throttled; a missing label read as 'no hold is active' → claimed held work; a dispatch that printed success while routing nothing; 'branch absent from origin' read as 'no work exists' when it was local and unpushed; a metadata field cleared on success, making empty mean BOTH 'never ran' and 'ran fine'.
-Watch especially for: short-circuiting OR/AND where the left branch is true merely because a lookup found nothing (so the real check never runs); \`|| true\`, \`2>/dev/null\`, \`// \"\"\`, \`.[0]\`, \`index(x) | not\` swallowing the difference; and a DECISION variable that is not the SAME variable as the one later ACTED ON.
-
-THEN also cover: logic errors, edge cases, off-by-one, null/empty handling, error propagation, and incorrect assumptions." ;;
+    1) REVIEWER_LENS="CORRECTNESS: focus on logic errors, edge cases, off-by-one bugs, null/empty handling, error propagation, and incorrect assumptions. Be adversarial. (The ga-p5q3 third-state check now lives in the reviewer prompt template as a MANDATORY dimension for ALL lenses — ga-31ac, mila-wa. Do not duplicate it here: saying it twice dilutes both.)" ;;
     2) REVIEWER_LENS="SECURITY & ROBUSTNESS: focus on injection risks, unsafe eval/exec, credentials in code, path traversal, race conditions, resource leaks, and missing input validation." ;;
     3) REVIEWER_LENS="DESIGN & MAINTAINABILITY: focus on architectural concerns, code duplication, missing tests, test quality, unclear naming, violation of existing conventions, and tech debt introduced." ;;
   esac
