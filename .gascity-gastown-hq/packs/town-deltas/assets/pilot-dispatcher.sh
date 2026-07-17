@@ -3658,8 +3658,11 @@ dispatch_one() {
   # tells the re-dispatched builder to fix THE SPECIFIC issues (not redo the work).
   local STORY_GATE_FEEDBACK="" STORY_FIX_ATTEMPT="" GATE_FIX_SECTION=""
   if echo "$STORY_LABELS" | grep -q "gate:needs-fix"; then
+    # ga-26df: MIN not MAX — mirrors the dispatcher-side fix. Coexisting
+    # counters only happen via a manual clear (a lower number added
+    # alongside a stale higher one); MAX silently discarded the clear.
     STORY_FIX_ATTEMPT=$(echo "$STORY_LABELS" | tr ',' '\n' \
-      | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | tail -1)
+      | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | head -1)
     STORY_GATE_FEEDBACK=$(bd -C "$STORY_BEAD_CITY" comments "$STORY_ID" --json 2>/dev/null \
       | jq -r '[ .[]? | (.text // .body // "") | select(test("^GATE-FEEDBACK")) ] | last // ""' \
       2>/dev/null || echo "")

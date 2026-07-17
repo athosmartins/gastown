@@ -2321,10 +2321,20 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' \
       2>/dev/null || echo "")
 
-    # Current fix-attempt count from label gate:fix-attempt:N (default 0). Take
-    # the MAX in case multiple counter labels ever coexist.
+    # Current fix-attempt count from label gate:fix-attempt:N (default 0).
+    # ga-26df: coexisting counters happen ONLY via a manual clear — the
+    # automatic increment path below always removes every stale counter
+    # before adding the new one (see "Bump the attempt counter" below), so
+    # it alone can never leave more than one behind. Taking the MAX here
+    # "in case multiple counter labels ever coexist" was exactly backwards:
+    # coexistence IS the manual clear's signature, and a reset always adds
+    # a LOWER number than the stale one it's resetting — so MAX silently
+    # discarded every manual clear (0 added alongside a stale N>0 always
+    # resolved to N). Take the MIN instead: the human's reset always wins
+    # over a stale automatic counter, and when only one counter exists
+    # (the normal case) MIN == MAX, so this is a no-op for the common path.
     PREV_ATTEMPT=$(printf '%s' "$SRC_LABELS" | tr ' ' '\n' \
-      | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | tail -1)
+      | sed -n 's/^gate:fix-attempt:\([0-9]\{1,\}\)$/\1/p' | sort -n | head -1)
     [ -z "$PREV_ATTEMPT" ] && PREV_ATTEMPT=0
 
     # (a) ATTACH FEEDBACK TO THE SOURCE BEAD — durable, machine-readable marker
