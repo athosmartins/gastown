@@ -682,6 +682,39 @@ bead_content_rig() {
   echo ""
 }
 
+# ── ga-j0f6: beads-repo bug-fix doctrine gap ──────────────────────────────────
+# A bug/feature whose fix target is the beads CLI's own repo (/Users/athos/gt/beads,
+# fork athosmartins/beads, upstream gastownhall/beads) is NOT a registered gc rig
+# (`gc rig list` never returns "beads") and has no /gate-done path — a branch
+# pushed there is invisible to the gate (STORY_RIG defaults to "gascity" for any
+# unrecognized bead-ID prefix, and the gate only ever looks inside registered rig
+# roots). The REAL, already-established convention for this class of fix is:
+# commit in the beads checkout, push to the fork remote, gh pr create against
+# upstream — a PR that awaits HUMAN review/merge, not an autonomous gate. Without
+# this detector the normal "No human review required" doctrine text is dispatched
+# verbatim, which is actively false and risks a builder treating an open,
+# unreviewed upstream PR as done (concrete instance: ga-clgh/ga-svyw/PR #4865).
+#
+# bead_targets_beads_repo <bead_json> — "1" when the bead's own text names the
+# beads CLI repo as its fix target, else "" (fail-open: no signal → normal
+# doctrine, unchanged from pre-fix behaviour). Keyword-only (mirrors
+# bead_content_rig/bead_domain above) since "beads" has no registered rig root to
+# path-probe against. Deliberately narrow: explicit repo names/paths only, never
+# bare "bd"/"beads" — those appear constantly in unrelated bug text (bd commands,
+# bead terminology) and would false-positive on nearly every bug in this file.
+bead_targets_beads_repo() {
+  local bead="$1" hay
+  hay=$(echo "$bead" | jq -r '
+      [ (.title // ""), (.description // ""),
+        ((.labels // []) | join(" ")) ] | join("  ")
+    ' 2>/dev/null || echo "")
+  [ -z "$hay" ] && { echo ""; return 0; }
+  if printf '%s' "$hay" | grep -iqE 'steveyegge/beads|gastownhall/beads|athosmartins/beads|\bgt/beads\b|\bbeads repo\b|\bbeads-repo\b'; then
+    echo "1"; return 0
+  fi
+  echo ""
+}
+
 # rig_domain_default_builder <rig> — the PERSISTENT crew that owns a domain rig's
 # builds, or "" if the rig has no single persistent owner. Used by the domain-route
 # guard to pick the affirmative target when a domain build resolved to a dog and
@@ -3743,6 +3776,12 @@ dispatch_one() {
   fi
   log "  rig=$STORY_RIG  bead_city=$STORY_BEAD_CITY"
 
+  # ga-j0f6: detect a bug/feature whose fix target is the beads CLI's own repo —
+  # not a registered rig, no /gate-done path (see bead_targets_beads_repo above).
+  local IS_BEADS_REPO_FIX
+  IS_BEADS_REPO_FIX=$(bead_targets_beads_repo "$STORY")
+  [ -n "$IS_BEADS_REPO_FIX" ] && log "  ga-j0f6: $STORY_ID targets the beads repo — using upstream-PR doctrine, not gate-done."
+
   # ── ga-jb4l: gate re-dispatch — surface reviewer feedback for needs-fix beads ──
   # A bead labeled gate:needs-fix previously FAILED the quality gate. The gate
   # attached the FAILing reviewers' reasons to it as a "GATE-FEEDBACK" comment.
@@ -4357,6 +4396,38 @@ LIVESEC
   local WORKTREE_DIRECTIVE
   WORKTREE_DIRECTIVE=$(worktree_directive_for "$STORY_RIG" "$BUILDER_TARGET" 2>/dev/null || echo "")
 
+  # ── ga-j0f6: beads-repo fix ⇒ different DOCTRINE (upstream PR, not gate-done) ──
+  # Computed once, used by both heredocs below. Normal-path text (both branches
+  # below) is byte-identical to the pre-fix hardcoded doctrine — verified by the
+  # fact this is a straight copy-out, not a rewrite. IS_BEADS_REPO_FIX (set above,
+  # right after STORY_RIG) overrides both variables afterward, only when
+  # bead_targets_beads_repo fired. Fail-open: unset/empty ⇒ no behavior change.
+  local DOCTRINE_BLOCK DISPATCH_STEP5
+  if [ "$DISPATCH_TIER" = "bug" ]; then
+    DOCTRINE_BLOCK="## DOCTRINE — read carefully
+- You are the BUILDER. Human never merges. Gate (G) and Delivery (①) are autonomous.
+- When your fix is complete: run /gate-done — this feeds the autonomous gate.
+- DO NOT ask for approval. DO NOT send to Athos. Just fix, push, gate-done.
+- The autonomous loop: /gate-done → G reviews → merges → ① deploys → bead closed.
+- If /gate-done fails validation (no commits, no branch), fix the issue and retry."
+  else
+    DOCTRINE_BLOCK="## DOCTRINE — read carefully
+- You are the BUILDER. Human never merges. Gate (G) and Delivery (①) are autonomous.
+- When your implementation is complete: run /gate-done — this feeds the autonomous gate.
+- DO NOT ask for approval. DO NOT send to Athos. Just build, push, gate-done.
+- The autonomous loop: /gate-done → G reviews → merges → ① deploys → story:done.
+- If /gate-done fails validation (no commits, no branch), fix the issue and retry."
+  fi
+  DISPATCH_STEP5="5. Commit, push, then run /gate-done."
+  if [ -n "$IS_BEADS_REPO_FIX" ]; then
+    DOCTRINE_BLOCK="## DOCTRINE — read carefully (beads repo — different from normal doctrine)
+- This work lives in the beads CLI's own repo (/Users/athos/gt/beads) — NOT a registered gc rig. /gate-done CANNOT find or merge a branch there. Do not run it.
+- Real path: commit in /Users/athos/gt/beads, push to the fork remote, then gh pr create against upstream. Read the upstream org from: git -C /Users/athos/gt/beads remote get-url origin — do not hardcode an org name, it has been renamed before.
+- This DOES need human review: the PR awaits upstream-maintainer review/merge. It is NOT autonomous.
+- Leave $STORY_ID OPEN. Comment the PR URL on it once opened. Do NOT close the bead — it closes only after the PR merges."
+    DISPATCH_STEP5="5. Commit, push to the fork remote, then gh pr create against upstream (see doctrine above for the exact remote command). Comment the PR URL on $STORY_ID. Do NOT run /gate-done. Do NOT close $STORY_ID — it closes only after the PR merges."
+  fi
+
   # ── Build task prompt ────────────────────────────────────────────────────────
   local DISPATCH_TASK
   if [ "$DISPATCH_TIER" = "bug" ]; then
@@ -4387,19 +4458,14 @@ $STORY_ESTRELA
 ## Equilibrios (constraints to preserve)
 $STORY_EQUILIBRIOS
 
-## DOCTRINE — read carefully
-- You are the BUILDER. Human never merges. Gate (G) and Delivery (①) are autonomous.
-- When your fix is complete: run /gate-done — this feeds the autonomous gate.
-- DO NOT ask for approval. DO NOT send to Athos. Just fix, push, gate-done.
-- The autonomous loop: /gate-done → G reviews → merges → ① deploys → bead closed.
-- If /gate-done fails validation (no commits, no branch), fix the issue and retry.
+$DOCTRINE_BLOCK
 $WORKTREE_DIRECTIVE
 ## Steps
 1. Read the full bead: bd -C "$STORY_BEAD_CITY" show "$STORY_ID"
 2. Run gc prime to load your full context.
 3. Diagnose root cause, implement fix on a branch (name: fix/$STORY_ID).
 4. Add a regression test if applicable.
-5. Commit, push, then run /gate-done.
+$DISPATCH_STEP5
 
 ## Claim your work (do this first)
 bd -C "$STORY_BEAD_CITY" assign "$STORY_ID" "\$GC_ALIAS"
@@ -4435,19 +4501,14 @@ $STORY_ESTRELA
 ## Equilibrios (constraints to preserve)
 $STORY_EQUILIBRIOS
 
-## DOCTRINE — read carefully
-- You are the BUILDER. Human never merges. Gate (G) and Delivery (①) are autonomous.
-- When your implementation is complete: run /gate-done — this feeds the autonomous gate.
-- DO NOT ask for approval. DO NOT send to Athos. Just build, push, gate-done.
-- The autonomous loop: /gate-done → G reviews → merges → ① deploys → story:done.
-- If /gate-done fails validation (no commits, no branch), fix the issue and retry.
+$DOCTRINE_BLOCK
 $WORKTREE_DIRECTIVE
 ## Steps
 1. Read the full story bead: bd -C "$STORY_BEAD_CITY" show "$STORY_ID"
 2. Run gc prime to load your full context.
 3. Implement the story on a feature branch (name: feat/$STORY_ID or story/$STORY_ID).
 4. Add a story-specific prod test at the required path (see delivery-runbooks.toml).
-5. Commit, push, then run /gate-done.
+$DISPATCH_STEP5
 
 ## Claim your work (do this first)
 bd -C "$STORY_BEAD_CITY" assign "$STORY_ID" "\$GC_ALIAS"
@@ -5008,7 +5069,13 @@ TASK
     fi
 
     local DISPATCH_COMMENT
-    if [ "$DISPATCH_TIER" = "bug" ]; then
+    if [ -n "$IS_BEADS_REPO_FIX" ]; then
+      DISPATCH_COMMENT="Pilot dispatched builder '$BUILDER_TARGET' at $NOW (tier=$DISPATCH_TIER, lane=$LANE, rig=$STORY_RIG, target=beads-repo).
+Sling task bead: $SLING_BEAD_ID
+Builder doctrine: commit → push to fork → gh pr create against upstream beads repo.
+beads is NOT a registered gc rig — /gate-done cannot find this branch, do not run it.
+PR awaits HUMAN REVIEW (upstream maintainer). Bead stays OPEN until the PR merges."
+    elif [ "$DISPATCH_TIER" = "bug" ]; then
       DISPATCH_COMMENT="Pilot dispatched builder '$BUILDER_TARGET' at $NOW (tier=bug/tech-debt, lane=$LANE, rig=$STORY_RIG).
 Sling task bead: $SLING_BEAD_ID
 Builder doctrine: fix bug → /gate-done → autonomous gate+delivery → bead closed.
