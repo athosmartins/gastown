@@ -1,5 +1,6 @@
 #!/bin/bash
-# Test suite for the pre-push hook integration branch guardrails.
+# Test suite for the pre-push hook: branch allowlist, integration branch
+# guardrails, and the orphaned town-deltas tree guard.
 # Creates temporary git repos to simulate push scenarios.
 #
 # Usage: bash .githooks/pre-push_test.sh
@@ -311,6 +312,78 @@ git merge --ff-only integration/epic-4 >/dev/null 2>&1
 local_sha=$(get_sha HEAD)
 unset GT_INTEGRATION_LAND 2>/dev/null || true
 assert_block "FF integration merge blocked" run_hook "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+# Test 20: New branch adding a file under packs/town-deltas/ (orphan tree, repo
+# root) — blocked. Exercises the merge-base range path (remote_sha=zero).
+echo "Test 20: New branch adding a file under packs/town-deltas/ (orphan) — blocked"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b fix/ga-99999-orphan-add >/dev/null 2>&1
+mkdir -p packs/town-deltas/assets
+echo "orphan script" > packs/town-deltas/assets/new-script.sh
+git add packs/town-deltas/assets/new-script.sh && git commit -m "add orphan script" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+assert_block "New file under packs/town-deltas/ blocked" run_hook "refs/heads/fix/ga-99999-orphan-add" "$local_sha" "refs/heads/fix/ga-99999-orphan-add" "0000000000000000000000000000000000000000"
+cleanup
+
+# Test 21: Same shape, but under .gascity-gastown-hq/packs/town-deltas/ (the
+# CANONICAL tree) — allowed. Regression test for the anchor: a naive
+# unanchored match on "packs/town-deltas/" would false-positive here.
+echo "Test 21: New branch adding a file under .gascity-gastown-hq/packs/town-deltas/ (canonical) — allowed"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b fix/ga-99999-canonical-add >/dev/null 2>&1
+mkdir -p .gascity-gastown-hq/packs/town-deltas/assets
+echo "canonical script" > .gascity-gastown-hq/packs/town-deltas/assets/new-script.sh
+git add .gascity-gastown-hq/packs/town-deltas/assets/new-script.sh && git commit -m "add canonical script" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+assert_pass "New file under .gascity-gastown-hq/packs/town-deltas/ allowed" run_hook "refs/heads/fix/ga-99999-canonical-add" "$local_sha" "refs/heads/fix/ga-99999-canonical-add" "0000000000000000000000000000000000000000"
+cleanup
+
+# Test 22: Deleting a pre-existing file from packs/town-deltas/ (cleanup) —
+# allowed. Exercises the remote_sha..local_sha range path plus
+# --diff-filter=ACM excluding pure deletions.
+echo "Test 22: Deleting a file from packs/town-deltas/ (cleanup) — allowed"
+setup_repos
+cd "$TMPDIR/local"
+mkdir -p packs/town-deltas/assets
+echo "stale script" > packs/town-deltas/assets/stale.sh
+git add packs/town-deltas/assets/stale.sh && git commit -m "pre-existing orphan file" >/dev/null 2>&1
+# Bypass needed here: this is test SETUP (establishing pre-existing remote
+# state), not the behavior under test — the real installed hook would
+# otherwise correctly block this push too, since it's an ADD.
+GT_SKIP_ORPHAN_TREE_GUARD=1 git push origin "$DEFAULT_BRANCH" >/dev/null 2>&1
+remote_sha=$(get_sha HEAD)
+git rm packs/town-deltas/assets/stale.sh >/dev/null 2>&1
+git commit -m "cleanup: remove stale orphan file" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+assert_pass "Deleting orphan-tree file allowed" run_hook "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+# Test 23: GT_SKIP_ORPHAN_TREE_GUARD=1 bypasses the guard.
+echo "Test 23: GT_SKIP_ORPHAN_TREE_GUARD=1 bypasses the guard"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b fix/ga-99999-bypass >/dev/null 2>&1
+mkdir -p packs/town-deltas/assets
+echo "orphan script" > packs/town-deltas/assets/new-script.sh
+git add packs/town-deltas/assets/new-script.sh && git commit -m "add orphan script" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+GT_SKIP_ORPHAN_TREE_GUARD=1 assert_pass "Bypass env var allows orphan-tree push" run_hook "refs/heads/fix/ga-99999-bypass" "$local_sha" "refs/heads/fix/ga-99999-bypass" "0000000000000000000000000000000000000000"
+cleanup
+
+# Test 24: Default-branch push touching the orphan tree — still blocked. Proves
+# the content guard applies independent of the branch-name allowlist above it.
+echo "Test 24: Default-branch push touching packs/town-deltas/ (orphan) — blocked"
+setup_repos
+cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+mkdir -p packs/town-deltas/assets
+echo "orphan on main" > packs/town-deltas/assets/direct.sh
+git add packs/town-deltas/assets/direct.sh && git commit -m "oops direct to main" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+assert_block "Default-branch push touching orphan tree blocked" run_hook "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
 cleanup
 
 echo ""

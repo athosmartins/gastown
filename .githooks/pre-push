@@ -8,6 +8,12 @@
 # Also enforces integration branch landing guardrails: pushes to the default
 # branch that introduce integration branch content are blocked unless
 # GT_INTEGRATION_LAND=1 is set (only gt mq integration land sets this).
+#
+# Also blocks new/modified files under packs/town-deltas/ (repo root) on ANY
+# branch: that tree is an orphan no launchd plist executes (only
+# .gascity-gastown-hq/packs/town-deltas/ is live) — a commit there reviews
+# and merges identically to the canonical tree but nothing ever runs it.
+# See ga-47sl. Bypass: GT_SKIP_ORPHAN_TREE_GUARD=1.
 
 # Detect the rig's default branch dynamically.
 # Fallback chain matches Go implementation (git.RemoteDefaultBranch):
@@ -66,6 +72,45 @@ while read local_ref local_sha remote_ref remote_sha; do
       fi
       ;;
   esac
+
+  # Orphaned town-deltas tree guard: reject new/modified files under
+  # packs/town-deltas/ (repo root) on any branch. Deletions are allowed
+  # (cleanup out of the orphan tree is the eventual fix, not blocked).
+  # Anchored at the start so .gascity-gastown-hq/packs/town-deltas/ (the
+  # canonical tree, 12 plists point there) never matches.
+  if [[ "$local_sha" != "0000000000000000000000000000000000000000" ]] && \
+     [[ "$GT_SKIP_ORPHAN_TREE_GUARD" != "1" ]]; then
+    if [[ "$remote_sha" != "0000000000000000000000000000000000000000" ]]; then
+      orphan_range="$remote_sha..$local_sha"
+    else
+      orphan_range=""
+      merge_base=$(git merge-base "$local_sha" "refs/remotes/origin/$default_branch" 2>/dev/null) && \
+        orphan_range="$merge_base..$local_sha"
+    fi
+    if [[ -n "$orphan_range" ]]; then
+      # Fail OPEN if the diff itself errors (e.g. shallow clone, missing
+      # merge-base) -- this guard is new; a bug in it must not be able to
+      # block every push in the city. Only a POSITIVE, confirmed match
+      # blocks.
+      orphan_touch=$(git diff --name-only --diff-filter=ACM "$orphan_range" -- 'packs/town-deltas/' 2>/dev/null)
+      if [[ -n "$orphan_touch" ]]; then
+        echo "BLOCKED: push adds/modifies files under packs/town-deltas/ (repo root)."
+        echo ""
+        echo "This tree is ORPHANED -- no launchd plist executes it. The canonical"
+        echo "tree is .gascity-gastown-hq/packs/town-deltas/ (12 plists point there,"
+        echo "0 point at packs/town-deltas/). A commit here reviews and merges"
+        echo "identically to the canonical tree, but nothing ever runs it."
+        echo ""
+        echo "Move these files to .gascity-gastown-hq/packs/town-deltas/ instead:"
+        echo "$orphan_touch"
+        echo ""
+        echo "See ga-47sl for full context. Deleting files from this tree is fine"
+        echo "and not blocked -- only new adds/modifies are. One-off bypass:"
+        echo "GT_SKIP_ORPHAN_TREE_GUARD=1 git push ..."
+        exit 1
+      fi
+    fi
+  fi
 
   # Integration branch landing guardrail: when pushing to the default branch,
   # check if any integration branch tip is newly reachable from this push.
