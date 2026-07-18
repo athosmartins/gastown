@@ -102,8 +102,25 @@ echo "City DB path: $GC_CITY_PATH"
 case "$BRANCH" in
   crew/*/*)
     _CREW_SEG=${BRANCH#crew/*/}
+    # ga-pkvfc: capture an optional dotted sub-bead suffix (ps-8iuu.4) — the
+    # char class alone has no '.', so a dotted sub-bead id used to truncate at
+    # the dot (ps-8iuu.4 -> ps-8iuu, the PARENT epic).
     BEAD_ID=$(printf '%s\n' "$_CREW_SEG" \
-      | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,8}' | head -1 2>/dev/null || echo "")
+      | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?' | head -1 2>/dev/null || echo "")
+    # ga-pkvfc: existence-check below is not identity-check — a truncated
+    # match can coincidentally BE a real bead (a dotted sub-bead's truncated
+    # prefix is its parent epic, which really exists), so existence alone
+    # would accept the wrong id silently. Verify the match consumed the FULL
+    # leading token: the crew segment must equal BEAD_ID exactly, or BEAD_ID
+    # followed by a '-desc' separator — any other continuation (e.g. a '.'
+    # the regex didn't capture) proves truncation; discard here so the
+    # existence check below never gets a chance to accept it anyway.
+    if [ -n "$BEAD_ID" ]; then
+      case "$_CREW_SEG" in
+        "$BEAD_ID"|"$BEAD_ID"-*) : ;;
+        *) BEAD_ID="" ;;
+      esac
+    fi
     ;;
   *)
     BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \

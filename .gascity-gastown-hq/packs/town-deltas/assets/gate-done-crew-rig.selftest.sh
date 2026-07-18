@@ -102,7 +102,15 @@ extract_bead_from_branch() {
   case "$branch" in
     crew/*/*)
       seg=${branch#crew/*/}
-      bead=$(printf '%s\n' "$seg" | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,8}' | head -1 2>/dev/null || echo "")
+      # ga-pkvfc: optional dotted sub-bead suffix (ps-8iuu.4), plus an
+      # identity check — see the deployed source for the full rationale.
+      bead=$(printf '%s\n' "$seg" | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?' | head -1 2>/dev/null || echo "")
+      if [ -n "$bead" ]; then
+        case "$seg" in
+          "$bead"|"$bead"-*) : ;;
+          *) bead="" ;;
+        esac
+      fi
       ;;
     *)
       bead=$(echo "$branch" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}-' \
@@ -115,6 +123,7 @@ extract_bead_from_branch() {
 # bead_rig <bead_id>  — store probe replica (ga-* → HQ/gascity, others → owning rig)
 HQ_BEADS=" ga-owfll ga-u70a8 ga-5uhbs ga-dx5 "
 WA_BEADS=" wa-27jn wa-iv51 wa-lstd "
+PS_BEADS=" ps-8iuu "
 bead_rig() {
   local bead="$1"
   case "$HQ_BEADS" in *" $bead "*) printf 'gascity'; return;; esac
@@ -123,8 +132,11 @@ bead_rig() {
 }
 
 # ── Stub bead-existence probe (mirrors `bd -C <path> show <id>` exit code) ────
-# Reuses the HQ_BEADS/WA_BEADS membership lists above as the source of truth for
-# which ids "exist" in which store, for the ga-u4yi validation replica below.
+# Reuses the HQ_BEADS/WA_BEADS/PS_BEADS membership lists above as the source of
+# truth for which ids "exist" in which store, for the ga-u4yi validation
+# replica below. PS_BEADS carries ps-8iuu (a real EPIC bead) — needed for the
+# ga-pkvfc (K) section: the parent epic of a truncated dotted sub-bead id is
+# genuinely real, which is exactly why existence-check alone was fooled.
 bead_exists_in_store() {
   local path="$1" id="$2"
   case "$path" in
@@ -132,6 +144,8 @@ bead_exists_in_store() {
       case "$HQ_BEADS" in *" $id "*) return 0;; *) return 1;; esac ;;
     */whatsapp_automation)
       case "$WA_BEADS" in *" $id "*) return 0;; *) return 1;; esac ;;
+    */property_scrapers)
+      case "$PS_BEADS" in *" $id "*) return 0;; *) return 1;; esac ;;
     *) return 1 ;;
   esac
 }
@@ -506,6 +520,89 @@ if [ -f "$EMBEDDED_COPY" ] && [ -f "$CANONICAL_REAL" ]; then
     ok "(J-mutation) a deliberately-drifted copy is correctly caught as non-identical (test is not vacuous)"
   fi
   rm -f "$SCRATCH_DRIFT"
+fi
+
+# ── (K) ga-pkvfc: dotted sub-bead id (ps-8iuu.4) no longer truncates to its
+#    parent epic (ps-8iuu), and a truncation can no longer sail through on
+#    existence alone (existence-check is not identity-check).
+#
+# Root bug (filed by ps-worker submitting ps-8iuu.4): the crew/*/* char class
+# [a-z0-9]{2,8} has no '.', so a dotted sub-bead id truncates at the dot:
+# crew/ps-worker/ps-8iuu.4 -> _CREW_SEG=ps-8iuu.4 -> regex -> ps-8iuu (drops
+# .4). WORSE (ga-p5q3 class — existence-check without identity-check):
+# ps-8iuu IS a real bead (the parent epic), so the ga-u4yi existence-check
+# accepted the truncated, WRONG id silently — the marker shipped
+# source-bead:ps-8iuu instead of source-bead:ps-8iuu.4, reviewing/closing the
+# wrong bead.
+
+# (K1) primary repro, fixed regex + identity-check together.
+B=$(extract_bead_from_branch "crew/ps-worker/ps-8iuu.4")
+[ "$B" = "ps-8iuu.4" ] \
+  && ok "(K1) crew/ps-worker/ps-8iuu.4 -> ps-8iuu.4, not truncated (got: $B)" \
+  || bad "(K1) dotted sub-bead extraction -> expected ps-8iuu.4, got: $B"
+
+# (K2) mutation guard: the ORIGINAL buggy regex (no dotted-suffix capture)
+# MUST still truncate on this exact repro — proves (K1) would actually catch
+# a reversion of the regex fix, not just happen to pass either way.
+OLD_REGEX_MATCH=$(printf '%s\n' "ps-8iuu.4" | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,8}' | head -1)
+[ "$OLD_REGEX_MATCH" = "ps-8iuu" ] \
+  && ok "(K2) mutation check: pre-fix regex truncates ps-8iuu.4 -> ps-8iuu, reproducing the original bug" \
+  || bad "(K2) mutation check: pre-fix regex unexpectedly did not truncate (got '$OLD_REGEX_MATCH') — (K1) would not catch a regex reversion"
+
+# (K3a) ga-p5q3 class: prove the OLD buggy regex output ('ps-8iuu') resolves
+# via the EXISTENCE-only validator (it IS a real bead — the parent epic) —
+# this is exactly why an existence-check-only validation silently accepted
+# the truncated id.
+EXISTS_CHECK=$(validate_bead_id "$OLD_REGEX_MATCH")
+[ "$EXISTS_CHECK" = "ps-8iuu" ] \
+  && ok "(K3a) existence-only check WOULD accept truncated 'ps-8iuu' (it is a real epic bead) — proves existence-check alone is not enough" \
+  || bad "(K3a) expected existence-only check to accept 'ps-8iuu' for this demo to be meaningful, got '$EXISTS_CHECK'"
+
+# (K3b) the FULL extractor (regex + identity check together) never produces
+# the truncated id in the first place for this branch — the identity check
+# discards it before existence is ever consulted.
+B=$(extract_bead_from_branch "crew/ps-worker/ps-8iuu.4")
+[ "$B" != "ps-8iuu" ] \
+  && ok "(K3b) full extractor never yields the truncated 'ps-8iuu' for crew/ps-worker/ps-8iuu.4 (got: '$B')" \
+  || bad "(K3b) full extractor yielded truncated 'ps-8iuu' — the ga-p5q3-class silent-wrong-bead bug is back"
+
+# (K4) legitimate '-desc' suffix still survives the identity check (no
+# false-positive rejection of the documented crew/<name>/<STORY_ID>[-desc]
+# convention).
+B=$(extract_bead_from_branch "crew/mila/wa-6rdl-touchpoint-fix")
+[ "$B" = "wa-6rdl" ] \
+  && ok "(K4) crew branch with -desc suffix still resolves correctly: wa-6rdl (got: $B)" \
+  || bad "(K4) -desc suffix regression -> expected wa-6rdl, got: $B"
+
+# (K5) a double-digit sub-bead suffix does not truncate either — guards
+# against an off-by-bound regression in the digit class.
+B=$(extract_bead_from_branch "crew/thies/ps-8iuu.12")
+[ "$B" = "ps-8iuu.12" ] \
+  && ok "(K5) double-digit sub-bead suffix survives: ps-8iuu.12 (got: $B)" \
+  || bad "(K5) double-digit sub-bead suffix -> expected ps-8iuu.12, got: $B"
+
+# (K6) demand-mobile-phase2 (the ga-u4yi repro) must still be rejected by
+# existence, unchanged by the (K) identity check — a descriptive branch with
+# no real bead id embedded looks exactly like "BEAD_ID-desc" syntactically,
+# so identity alone cannot reject it; existence (H1/H2 above) must still
+# carry that case. Guards against the two checks silently swapping roles.
+B=$(extract_bead_from_branch "crew/thies/demand-mobile-phase2")
+[ "$B" = "demand-mobile" ] \
+  && ok "(K6) identity check still lets 'demand-mobile' through syntactically (existence check must catch it — see H2)" \
+  || bad "(K6) identity check unexpectedly rejected 'demand-mobile' — see if H1/H2 still pass unchanged"
+
+# ── (L) ga-pkvfc source drift-guard: deployed gate-done.md captures the
+#    dotted suffix and performs the identity check, not just existence.
+if [ -f "$GATE_DONE" ]; then
+  src=$(cat "$GATE_DONE")
+  printf '%s' "$src" | grep -qF '(\.[0-9]+)?' \
+    && ok "(L1) gate-done.md crew regex captures the optional dotted sub-bead suffix" \
+    || bad "(L1) gate-done.md missing the dotted sub-bead suffix capture group (ga-pkvfc regression)"
+  printf '%s' "$src" | grep -qF '"$BEAD_ID"|"$BEAD_ID"-*' \
+    && ok "(L2) gate-done.md performs the identity/boundary check (segment == BEAD_ID or BEAD_ID-desc)" \
+    || bad "(L2) gate-done.md missing the ga-pkvfc identity check (existence-check-only regression)"
+else
+  bad "(L) gate-done.md not found at $GATE_DONE"
 fi
 
 echo
