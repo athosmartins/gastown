@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# orphan-sweep.fake-gc — fake `gc` binary for orphan-sweep.selftest.sh.
+#
+# Reconstructed for ga-a8t68/ga-kq4jf: the builtin maintenance-pack copy of
+# this selftest (.gc/system/packs/maintenance/assets/scripts/tests/) never
+# shipped this sibling shim, so its own selftest can't run at all — a
+# separate, pre-existing gap this fix's selftest closes for the vendored
+# town-deltas copy.
+#
+# Dispatches on argv to the minimal set of `gc` subcommands orphan-sweep.sh
+# actually calls: rig list, session list, bd list, bd update, config explain.
+# Reads fixtures from env vars set by the selftest harness (FAKE_SESSION_JSON,
+# FAKE_INPROGRESS_JSON, FAKE_AGENTS) and records resets to $RESET_LOG.
+set -euo pipefail
+
+cmd="${1:-}"
+sub="${2:-}"
+
+case "$cmd $sub" in
+"rig list")
+    echo '{"rigs":[]}'
+    ;;
+"session list")
+    printf '%s' "${FAKE_SESSION_JSON:-}"
+    ;;
+"bd list")
+    printf '%s' "${FAKE_INPROGRESS_JSON:-[]}"
+    ;;
+"config explain")
+    for a in ${FAKE_AGENTS:-}; do
+        echo "Agent: $a"
+    done
+    ;;
+"bd update")
+    # orphan-sweep.sh calls: gc bd update "$bead_id" --status=open --assignee=""
+    bead_id="${3:-}"
+    printf '%s\n' "$bead_id" >> "${RESET_LOG:-/dev/null}"
+    ;;
+*)
+    echo "orphan-sweep.fake-gc: unhandled command: $*" >&2
+    exit 1
+    ;;
+esac

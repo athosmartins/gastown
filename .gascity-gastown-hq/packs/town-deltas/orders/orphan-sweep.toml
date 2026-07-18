@@ -1,0 +1,13 @@
+# town-deltas override: ga-a8t68/ga-seuh4/ga-kq4jf — add a bead_update_age
+# grace period so orphan-sweep never resets a claim the assignee touched
+# recently, closing a false-positive gap CONFIRM_THRESHOLD hysteresis alone
+# (ga-u0vzx) proved insufficient for (confirmed 2026-07-17: live claims
+# reset 6-12min after a fresh claim across 2+ consecutive sweeps while the
+# owning session was independently confirmed alive). Script vendored into
+# town-deltas/assets so $PACK_DIR resolves here (the embedded maintenance
+# copy is gitignored/ephemeral) — same recipe as gate-sweep's override.
+[order]
+description = "Reset beads assigned to dead agents back to the work pool"
+trigger = "cooldown"
+interval = "5m"
+exec = "$PACK_DIR/assets/scripts/orphan-sweep.sh"
