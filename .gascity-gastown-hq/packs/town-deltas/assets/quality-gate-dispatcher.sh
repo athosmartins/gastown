@@ -2583,7 +2583,33 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       if [ "$GATE_FAIL_ASSIGNEE_ACTION" = "keep" ]; then
         log "Author $AUTHOR is a live named-crew session — keeping assignee + story:in-flight (ga-jyox); nudging feedback instead of letting the Pilot dispatch a stranger on top of in-flight work."
         bd -C "$BEAD_CITY" assign "$BEAD_ID" "$AUTHOR" 2>/dev/null || true
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; gate:reviewing cleared (wa-qq33j). Author $AUTHOR is a LIVE crew session, so assignee + story:in-flight were KEPT (ga-jyox) — the Pilot will NOT dispatch a generic builder on top of your in-flight work. See GATE-FEEDBACK above; re-run /gate-done after fixing." 2>/dev/null || true
+        # ga-n7hu2: this arm used to leave story:in-flight untouched — relying on
+        # it never having been removed — while the comment below claimed
+        # UNCONDITIONALLY that both fields were kept. Measured in the field
+        # (wa-e7ey9, 18/07 15:53 via bd show --json raw): assignee was present
+        # but story:in-flight was ABSENT. Half the claim was false, and worse —
+        # a success report that isn't true is the reason nobody re-checks it
+        # (root-class:error-vs-empty). Fix: (1) actively (re)add the label here
+        # so "kept" holds regardless of what an earlier/concurrent step did to
+        # it, then (2) re-read the RAW post-write state (not cache, not intent)
+        # and let the comment say what was actually observed. The assignee path
+        # is left as-is (unconfirmed whether it was ever actually broken —
+        # AC4 of ga-n7hu2 — this only adds visibility, it does not presume a fix).
+        bd -C "$BEAD_CITY" label add "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
+        KEEP_VERIFY_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null)
+        KEEP_VERIFY_ASSIGNEE=$(printf '%s' "$KEEP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
+        KEEP_VERIFY_HAS_INFLIGHT=$(printf '%s' "$KEEP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | ((.labels // []) | index("story:in-flight")) != null' 2>/dev/null || echo "false")
+        if [ "$KEEP_VERIFY_ASSIGNEE" = "$AUTHOR" ]; then
+          KEEP_ASSIGNEE_OBS="assignee=$AUTHOR (kept)"
+        else
+          KEEP_ASSIGNEE_OBS="assignee='${KEEP_VERIFY_ASSIGNEE}' NOT $AUTHOR — keep action did not stick, needs investigation"
+        fi
+        if [ "$KEEP_VERIFY_HAS_INFLIGHT" = "true" ]; then
+          KEEP_INFLIGHT_OBS="story:in-flight=present"
+        else
+          KEEP_INFLIGHT_OBS="story:in-flight=MISSING even after re-add — needs investigation"
+        fi
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; gate:reviewing cleared (wa-qq33j). Author $AUTHOR is a LIVE crew session, so this dispatcher acted to KEEP assignee + story:in-flight (ga-jyox) instead of letting the Pilot dispatch a stranger — verified post-write on the raw bead, not display: $KEEP_ASSIGNEE_OBS; $KEEP_INFLIGHT_OBS. See GATE-FEEDBACK above; re-run /gate-done after fixing." 2>/dev/null || true
         gc --city "$GC_CITY" session nudge "$AUTHOR" \
           "Gate FAILED for $BEAD_ID (branch $BRANCH, attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — see GATE-FEEDBACK on the bead. Your assignee was kept (ga-jyox); fix and re-run /gate-done." \
           --delivery wait-idle 2>/dev/null || warn "Could not nudge live-crew author $AUTHOR for gate FAIL feedback"
