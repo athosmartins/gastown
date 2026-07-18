@@ -922,6 +922,20 @@ ENGWIN_PENDING='[{"id":"bd-engwin-pending","assignee":null,"labels":["story:appr
 [ "$(_fc "$ENGWIN_PENDING")" = '["bd-free6"]' ] && ok "ga-2lqv: engine-window:pending bead excluded; free story:approved kept (batched-deploy hold honored)" || bad "ga-2lqv: engine-window:pending not excluded (got: $(_fc "$ENGWIN_PENDING"))"
 grep -qE '"engine-window:pending"' "$DISPATCHER" && ok "_filter_candidates carries the engine-window:pending clause" || bad "engine-window:pending clause missing from _filter_candidates"
 
+# ── Scenario 3e2j (ga-spux4): story:awaiting-external-merge excluded from candidates ──
+# ga-hqchm pattern: a fix already exists as an open PR against an external (non-rig)
+# repo — fork -> PR -> upstream-review, no Gas Town gate watching it — but the signal
+# lived only in a bead comment, invisible to this scan, so Pilot re-dispatched a fresh
+# builder onto the SAME story 3x across ~4h even though the second dispatch had already
+# fixed it and posted the PR upstream. _filter_candidates must exclude
+# story:awaiting-external-merge the same static way it excludes engine-window:pending,
+# so the bead only re-enters the pool once a human/Mayor sweep removes the label (after
+# the external PR merges).
+echo "Scenario 3e2j (ga-spux4): story:awaiting-external-merge bead is excluded from the candidate pool (external PR awaiting upstream merge)"
+EXTPR_PENDING='[{"id":"bd-extpr-pending","assignee":null,"labels":["story:approved","story:awaiting-external-merge"],"description":"x"},{"id":"bd-free7","assignee":null,"labels":["story:approved"],"description":"x"}]'
+[ "$(_fc "$EXTPR_PENDING")" = '["bd-free7"]' ] && ok "ga-spux4: story:awaiting-external-merge bead excluded; free story:approved kept (external-PR hold honored)" || bad "ga-spux4: story:awaiting-external-merge not excluded (got: $(_fc "$EXTPR_PENDING"))"
+grep -qE '"story:awaiting-external-merge"' "$DISPATCHER" && ok "_filter_candidates carries the story:awaiting-external-merge clause" || bad "story:awaiting-external-merge clause missing from _filter_candidates"
+
 # ── Scenario OWN-GUARD (ga-htjni ext; wa-5wv49 / wa-xnuxd) ──────────────────────
 # The reported systemic double-dispatch: a crew/human creates a bead intending to
 # build it THEMSELVES and claims it (status=in_progress + assignee=<self>) — yet the

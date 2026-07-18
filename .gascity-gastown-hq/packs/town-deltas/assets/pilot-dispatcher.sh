@@ -1388,6 +1388,21 @@ _filter_candidates() {
           # nothing previously excluded it from re-selection). Honor it the
           # same static way as engine-window:pending/needs:engine-window.
           or . == "framework:engine"
+          # ga-spux4: story:awaiting-external-merge is the manual marker for
+          # "the fix already exists as an open PR against an external
+          # (non-rig) repo — e.g. a fork -> PR -> upstream-review flow with
+          # no Gas Town gate watching it — so this is NOT untouched, fresh
+          # work" (root-class:comment-only-signal-not-encoded: the signal
+          # previously lived only in a bead comment, invisible to this scan,
+          # so Pilot kept re-dispatching a fresh builder onto work that was
+          # already done and awaiting human/upstream merge — see ga-hqchm, 3
+          # dispatches across ~4h for one fix). Apply it (plus `external_ref`
+          # set to the PR URL) on the STORY bead whenever a dispatch closes
+          # its sling bead by pointing at an external, not-yet-merged PR
+          # instead of a rig gate. A human/Mayor sweep removes the label once
+          # the PR merges, same as engine-window:pending above — no daemon
+          # watches external PRs for merge yet, so removal is manual.
+          or . == "story:awaiting-external-merge"
         )) | length) == 0
         and ((.description // "") | test("\\S"))
         # ga-vhyd: needs:engine-window (excluded above via --exclude-label at
