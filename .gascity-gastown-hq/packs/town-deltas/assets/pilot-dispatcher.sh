@@ -1582,8 +1582,8 @@ _filter_exec_manual() {
   jq '[ .[] | select(((.labels // []) | index("exec:manual")) == null) ]' \
     2>/dev/null || cat
 }
-# _filter_dispatch_gates — ga-mfeip dispatch quality gates (a)+(b)+(c). Drop ctx:ready
-# candidates that are not safely auto-buildable by a crew:
+# _filter_dispatch_gates — ga-mfeip dispatch quality gates (a)+(b)+(c)+(d). Drop
+# ctx:ready candidates that are not safely auto-buildable by a crew:
 #   (a) BLOCKED / TERMINAL STATUS. A bead whose `status` FIELD is "blocked" (a crew or
 #       triage gated it — e.g. design-first awaiting Athos: wa-tozk F11, wa-1my1 F2) or
 #       "closed" must NEVER dispatch. `bd list -l ctx:ready` does NOT filter the status
@@ -1602,16 +1602,63 @@ _filter_exec_manual() {
 #   (c) AN UNSATISFIED PRECONDITION LABEL. A `blocked-on:*` or `depends-on:*` label is
 #       a free-text precondition the bd dep-graph can't see (e.g. blocked-on:ata-dedicada,
 #       depends-on:contact-sync). Such a bead is not ready regardless of ctx:ready.
-# Pure read, no side effects; fail-open → pass through unchanged on any jq error.
+#   (d) WAITING ON ANOTHER ACTOR — except refino's crew-routing convention (ga-f7bek).
+#       `waiting-on:*` always means "blocked on X" → always veto. But `next-action:*`
+#       is OVERLOADED with two opposite meanings: the original one (added 5de1ce1c7,
+#       2026-06-29) means "blocked on Athos/a dependency" (e.g. next-action:athos+oracle,
+#       bare next-action:mayor — no build verb, still vetoed below); refino's newer
+#       convention writes next-action:<crew>-constroi/-reconstroi/-corrige-gate to mean
+#       the OPPOSITE — "this is READY, <crew> is who builds it" — a ROUTING label, not
+#       a blocker. Before ga-f7bek this collision silently vetoed every refined WA story
+#       carrying a next-action, starving 10/15 approved beads up to 24h with zero
+#       per-bead signal (only the aggregate dispatchable count read "0"). Fix: only
+#       next-action forms WITHOUT a build-verb suffix still veto; next-action forms
+#       naming a human/decision/approval (next-action:athos-*, next-action:*-decide,
+#       next-action:*-aprova) are unaffected and keep blocking, same as before.
+# Pure read, no side effects on the default path; fail-open → pass through unchanged
+# on any jq error. Set PILOT_DISPATCH_GATES_DEBUG=1 to additionally `log` which bead
+# was vetoed by which clause (ga-f7bek AC5) — the aggregate count alone cost ~2h to
+# root-cause once, with no per-bead trail to shortcut the next investigation.
 _filter_dispatch_gates() {
-  jq --argjson floor "${PILOT_CTX_MIN_SPEC_CHARS:-20}" '[ .[] | select(
+  local floor="${PILOT_CTX_MIN_SPEC_CHARS:-20}"
+  local _gate_filter='[ .[] | select(
       (((.status) // "open") as $s | ($s != "blocked" and $s != "closed" and $s != "deferred"))
       and ( (((.metadata["story.criterios"]) // "") | test("\\S"))
         or (((.description) // "") | length) >= $floor )
       and (((.labels // []) | map(select(test("^(blocked-on|depends-on):"))) | length) == 0)
       and ((((.title) // "") + " " + ((.description) // "")) | ascii_downcase | test("design[ -]?first") | not)
-      and (((.labels // []) | map(select(test("^(waiting-on|next-action):"))) | length) == 0)
-    )]' 2>/dev/null || cat
+      and (((.labels // []) | map(select(
+            test("^waiting-on:")
+            or (test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))
+          )) | length) == 0)
+    )]'
+  if [ "${PILOT_DISPATCH_GATES_DEBUG:-0}" != "1" ]; then
+    jq --argjson floor "$floor" "$_gate_filter" 2>/dev/null || cat
+    return
+  fi
+  # Debug path: buffer stdin (consumed once, reused below) and additionally report
+  # per-bead veto reasons via `log` before producing the SAME output as the default
+  # path (via the shared $_gate_filter string — no separate copy to drift out of sync).
+  local _input
+  _input=$(cat)
+  printf '%s' "$_input" | jq --argjson floor "$floor" -r '
+      .[] | . as $b
+      | [
+          (if ((($b.status) // "open") as $s | ($s == "blocked" or $s == "closed" or $s == "deferred")) then "status:\($b.status // "open")" else empty end),
+          (if ( ((($b.metadata["story.criterios"]) // "") | test("\\S")) or ((($b.description) // "") | length) >= $floor ) then empty else "no-spec" end),
+          (if ((($b.labels) // []) | map(select(test("^(blocked-on|depends-on):"))) | length) == 0 then empty else "precondition-label" end),
+          (if (((($b.title) // "") + " " + (($b.description) // "")) | ascii_downcase | test("design[ -]?first")) then "design-first" else empty end),
+          (if ((($b.labels) // []) | map(select(
+                test("^waiting-on:")
+                or (test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))
+              )) | length) == 0 then empty else "waiting-or-next-action" end)
+        ] as $reasons
+      | select(($reasons | length) > 0)
+      | [$b.id, ($reasons | join(","))] | @tsv
+    ' 2>/dev/null | while IFS=$'\t' read -r _vid _vreasons; do
+        log "_filter_dispatch_gates veto id=$_vid reasons=$_vreasons" >&2
+      done || true
+  printf '%s' "$_input" | jq --argjson floor "$floor" "$_gate_filter" 2>/dev/null || printf '%s' "$_input"
 }
 # _filter_built — drop ctx:ready candidates that ALREADY have a crew OR dog fix/ branch
 # (built work awaiting gate/delivery, NOT a fresh dispatch candidate; ga-6jqr: the branch

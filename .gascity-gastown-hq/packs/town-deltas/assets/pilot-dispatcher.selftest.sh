@@ -3016,15 +3016,22 @@ echo "Scenario 19h: emit chain = real dispatch chain (ga-aprov: no blocked/manua
 # (a) structural drift-guard: the emit chain string carries the full filter set.
 has "$DISPATCHER" '_filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "\$_db" | _filter_explicit_deps "\$_db"' \
   "emit applies the FULL real-dispatch filter chain (exec_manual+dispatch_gates+built) — Aprovadas honest"
-# (b) behavioral: _filter_dispatch_gates drops waiting-on:* and next-action:* (were missing everywhere).
+# (b) behavioral: _filter_dispatch_gates drops waiting-on:* always, and next-action:*
+# UNLESS it names a refino crew-build-routing form (ga-f7bek: next-action:<crew>-constroi
+# means "ready, <crew> builds it" — the OPPOSITE of "blocked", so it must NOT be excluded;
+# see the dedicated "Scenario ga-f7bek" block below for full AC coverage).
 _FDG="$(awk '/^_filter_dispatch_gates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 FDG_OUT="$(eval "$_FDG"; printf '%s' '[
   {"id":"fdg-clean","status":"open","description":"a ready bead with a full description over the floor length","labels":["lane:small"]},
   {"id":"fdg-wait","status":"open","description":"a ready bead with a full description over the floor length","labels":["waiting-on:survival-wa-flba"]},
-  {"id":"fdg-next","status":"open","description":"a ready bead with a full description over the floor length","labels":["next-action:athos+oracle"]}
-]' | _filter_dispatch_gates | jq -rc '[.[].id]' 2>/dev/null)"
-if [ "$FDG_OUT" = '["fdg-clean"]' ]; then
-  ok "_filter_dispatch_gates excludes waiting-on:* and next-action:* (waiting work never dispatchable)"
+  {"id":"fdg-next","status":"open","description":"a ready bead with a full description over the floor length","labels":["next-action:athos+oracle"]},
+  {"id":"fdg-next-bare","status":"open","description":"a ready bead with a full description over the floor length","labels":["next-action:mayor"]},
+  {"id":"fdg-next-constroi","status":"open","description":"a ready bead with a full description over the floor length","labels":["next-action:oracle-constroi"]},
+  {"id":"fdg-next-reconstroi","status":"open","description":"a ready bead with a full description over the floor length","labels":["next-action:mayor-reconstroi"]},
+  {"id":"fdg-next-corrige-gate","status":"open","description":"a ready bead with a full description over the floor length","labels":["next-action:oracle-corrige-gate"]}
+]' | _filter_dispatch_gates | jq -rc '[.[].id] | sort' 2>/dev/null)"
+if [ "$FDG_OUT" = '["fdg-clean","fdg-next-constroi","fdg-next-corrige-gate","fdg-next-reconstroi"]' ]; then
+  ok "_filter_dispatch_gates excludes waiting-on:* and human/bare-actor next-action:* always; lets crew-build-routing next-action:<crew>-constroi/-reconstroi/-corrige-gate pass (ga-f7bek)"
 else
   bad "_filter_dispatch_gates waiting-on/next-action exclusion broke (got: '$FDG_OUT')"
 fi
@@ -4363,6 +4370,58 @@ done
   || bad "ga-6jqr site 3 (_beadid_has_crew_branch, L2417 ls-remote fallback): wrong verdicts (got '$GJ6_S3_RESULT')"
 
 rm -rf "$GJ6_BARE" "$GJ6_REPO" "$GJ6_PUSHER"
+
+echo "Scenario ga-f7bek: _filter_dispatch_gates next-action crew-routing vs waiting-on-actor collision"
+# Root cause: _filter_dispatch_gates vetoed EVERY next-action:* label as "blocked on
+# someone", but refino's next-action:<crew>-constroi/-reconstroi/-corrige-gate convention
+# means the OPPOSITE — "ready, <crew> builds it". This silently starved 10/15 approved
+# WA stories up to 24h, with only the aggregate dispatchable count reading "0" (no
+# per-bead signal to shortcut the ~2h it took to root-cause the first time).
+_FDG_F7BEK="$(awk '/^_filter_dispatch_gates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+
+# (a) AC2+AC3, real label shapes from ga-f7bek's own investigation (wa-pltmi/91agg/
+# q4os9/ys0cy) plus real WA rig data checked directly against this fix (wa-odbh9,
+# wa-4e2m8): every *-constroi/*-reconstroi/*-corrige-gate form must now survive;
+# blocked-on:/waiting-on:, bare-actor (next-action:mayor), and human-decision
+# (next-action:athos-decide) forms must still be vetoed exactly as before.
+F7BEK_FIXTURE='[
+  {"id":"wa-like-pltmi","status":"open","description":"a ready bead with a full description over the floor length","labels":["ctx:ready","gate:failed","next-action:oracle-constroi","story:approved"]},
+  {"id":"wa-like-91agg","status":"open","description":"a ready bead with a full description over the floor length","labels":["ctx:ready","next-action:batista-constroi","story:approved"]},
+  {"id":"wa-like-q4os9","status":"open","description":"a ready bead with a full description over the floor length","labels":["ctx:ready","next-action:mayor-reconstroi","story:approved"]},
+  {"id":"wa-like-ys0cy","status":"open","description":"a ready bead with a full description over the floor length","labels":["ctx:ready","next-action:oracle-corrige-gate","story:approved"]},
+  {"id":"wa-like-odbh9","status":"open","description":"a ready bead with a full description over the floor length","labels":["ctx:thin","next-action:mayor"]},
+  {"id":"wa-like-4e2m8","status":"open","description":"a ready bead with a full description over the floor length","labels":["blocked-on:wa-qfp58","ctx:ready","story:approved","waiting-on:wa-qfp58"]},
+  {"id":"wa-like-athos-decide","status":"open","description":"a ready bead with a full description over the floor length","labels":["ctx:ready","next-action:athos-decide","story:approved"]}
+]'
+F7BEK_OUT="$(eval "$_FDG_F7BEK"; printf '%s' "$F7BEK_FIXTURE" | _filter_dispatch_gates | jq -rc '[.[].id] | sort' 2>/dev/null)"
+F7BEK_EXPECT='["wa-like-91agg","wa-like-pltmi","wa-like-q4os9","wa-like-ys0cy"]'
+if [ "$F7BEK_OUT" = "$F7BEK_EXPECT" ]; then
+  ok "ga-f7bek AC2+AC3: crew-build next-action forms now dispatchable; blocked-on/waiting-on/bare-actor/decide forms still vetoed (got: $F7BEK_OUT)"
+else
+  bad "ga-f7bek AC2+AC3: expected $F7BEK_EXPECT, got '$F7BEK_OUT'"
+fi
+
+# (b) AC5: PILOT_DISPATCH_GATES_DEBUG=1 must log per-bead veto reasons to STDERR only —
+# stdout must stay pure JSON. (An earlier draft of this fix called the shared `log()`
+# helper, which writes to plain stdout by default, from inside this "pure" filter
+# function and silently corrupted every caller's JSON parse; caught only by testing
+# the debug path in isolation before shipping — worth guarding permanently.)
+log() { echo "[pilot-dispatcher] $*"; }
+eval "$_FDG_F7BEK"
+F7BEK_DEBUG_STDOUT="$(export PILOT_DISPATCH_GATES_DEBUG=1; printf '%s' "$F7BEK_FIXTURE" | _filter_dispatch_gates 2>/dev/null)"
+if printf '%s' "$F7BEK_DEBUG_STDOUT" | jq -e 'type == "array" and length == 4' >/dev/null 2>&1; then
+  ok "ga-f7bek AC5: PILOT_DISPATCH_GATES_DEBUG=1 still yields clean, unpolluted JSON on stdout"
+else
+  bad "ga-f7bek AC5: debug mode stdout is not the expected clean JSON (log-line leakage?): '$F7BEK_DEBUG_STDOUT'"
+fi
+F7BEK_DEBUG_STDERR="$(export PILOT_DISPATCH_GATES_DEBUG=1; printf '%s' "$F7BEK_FIXTURE" | _filter_dispatch_gates 2>&1 >/dev/null)"
+if printf '%s' "$F7BEK_DEBUG_STDERR" | grep -q "veto id=wa-like-4e2m8" && printf '%s' "$F7BEK_DEBUG_STDERR" | grep -q "veto id=wa-like-athos-decide"; then
+  ok "ga-f7bek AC5: debug mode attributes per-bead veto reasons to stderr (wa-like-4e2m8, wa-like-athos-decide)"
+else
+  bad "ga-f7bek AC5: debug mode did not log the expected per-bead vetoes (stderr: '$F7BEK_DEBUG_STDERR')"
+fi
+unset -f log
+unset PILOT_DISPATCH_GATES_DEBUG
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
