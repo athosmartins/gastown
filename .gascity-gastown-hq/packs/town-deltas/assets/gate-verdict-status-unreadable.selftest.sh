@@ -27,6 +27,17 @@
 #     This is the highest-severity site (a hard terminal action), so it
 #     gets a MUTATION TEST proving the suite isn't vacuous.
 #
+# Also covers the 2 lower-severity sites ga-s07s deliberately deferred
+# (filed as ga-i5s5, same root-class:error-vs-empty taxonomy):
+#   - already-merged-source-bead-cleanup-fn: an unreadable SOURCE bead
+#     status must not be read as "not closed" (which would re-run the
+#     idempotent supersede cascade on a bead that may already be terminal).
+#   - phase-c-verdict-rehydrate's SESSION_IDS capture: an unreadable
+#     assignee read must not surface as a blank session id, which
+#     phase-c-dead-reviewer-classify-fn would otherwise read as "session
+#     absent" -> confirmed DEAD — a false verdict manufactured from a query
+#     failure on a DIFFERENT read than the (successful) status check.
+#
 # Strategy: extract each block VERBATIM via SELFTEST-EXTRACT markers (real
 # production code, not a hand-maintained duplicate) and run under real
 # `set -euo pipefail`, stubbing only the I/O boundary (`bd`, `gc`, `log`,
@@ -317,6 +328,184 @@ $FN_CLOSE_MUT" "$BD_LOG5M" 2>&1)"
     rm -f "$BD_LOG5M"
   fi
   rm -f "$MUT5"
+fi
+
+# ── Part 6: already-merged-source-bead-cleanup-fn — an unreadable source ────
+# bead status must not be silently treated as "not closed" (which re-runs
+# the supersede cascade). Lower severity than Parts 3-5 (ga-i5s5): the
+# underlying "already merged" FACT is established independently by the
+# earlier git merge-base/patch-id check, so a false "not closed" here only
+# produces idempotent re-application (redundant label/comment/close — the
+# close call already has a non-fatal `|| warn` fallback) — but the read
+# failure must still be distinguishable from a genuine open status, not
+# silently masked as one.
+echo "── 6. already-merged-source-bead-cleanup-fn: unreadable source bead is skipped, not treated as open ──"
+FN_MERGE="$(extract_block "$DISPATCHER" "already-merged-source-bead-cleanup-fn")"
+FN_VSA3="$(extract_block "$DISPATCHER" "vb-status-action-fn")"
+if [ -z "$FN_MERGE" ] || [ -z "$FN_VSA3" ]; then
+  bad "could not extract already-merged-source-bead-cleanup-fn or vb-status-action-fn — aborting Part 6"
+else
+  run_merge_cleanup() {
+    local scenario="$1" bd_log="$2"
+    : > "$bd_log"
+    bash -c '
+      set -euo pipefail
+      BEAD_CITY="/fake/city"
+      BEAD_ID="src-bead"
+      BRANCH="fix/whatever"
+      DEFAULT_BRANCH="main"
+      MARKER_ID="marker-1"
+      RIG="gascity"
+      BD_LOG="$1"
+      SCENARIO="$2"
+      VB_OPEN='"'"'{"status":"open","labels":[]}'"'"'
+      VB_CLOSED='"'"'{"status":"closed","labels":[]}'"'"'
+      bd() {
+        case " $* " in
+          *" show src-bead "*)
+            case "$SCENARIO" in
+              unreadable) echo "transient Dolt hiccup" >&2; return 1 ;;
+              closed)     echo "$VB_CLOSED"; return 0 ;;
+              open)       echo "$VB_OPEN"; return 0 ;;
+            esac
+            ;;
+          *" label "*|*" comment "*|*" close "*|*" assign "*) echo "$*" >> "$BD_LOG"; return 0 ;;
+        esac
+        return 0
+      }
+      log()  { echo "LOG: $*" >&2; }
+      warn() { echo "WARN: $*" >&2; }
+      '"$FN_VSA3"'
+      '"$FN_MERGE"'
+    ' _ "$bd_log" "$scenario"
+    return $?
+  }
+
+  BD_LOG6="$(mktemp)"
+  OUT6U="$(run_merge_cleanup unreadable "$BD_LOG6" 2>&1)"; RC6U=$?
+  if [ "$RC6U" -eq 0 ]; then
+    ok "cleanup block runs to completion when the source bead is unreadable (rc=0)"
+  else
+    bad "cleanup block crashed on an unreadable source bead (rc=$RC6U): $OUT6U"
+  fi
+  if [ -s "$BD_LOG6" ]; then
+    bad "unreadable source bead: cascade fired anyway (label/comment/close/assign called) — the exact ga-i5s5 bug: bd-show failure treated as 'not closed'. bd_log: $(cat "$BD_LOG6")"
+  else
+    ok "unreadable source bead: no label/comment/close/assign fired — cascade correctly skipped, not run on unknown status"
+  fi
+  case "$OUT6U" in
+    *"unreadable"*) ok "unreadable status is named in the diagnostic log (distinguishable from genuinely-open)" ;;
+    *) bad "no diagnostic log line naming the source bead as unreadable" ;;
+  esac
+  rm -f "$BD_LOG6"
+
+  BD_LOG6C="$(mktemp)"
+  OUT6C="$(run_merge_cleanup closed "$BD_LOG6C" 2>&1)"; RC6C=$?
+  if [ "$RC6C" -eq 0 ] && [ ! -s "$BD_LOG6C" ]; then
+    ok "already-closed source bead: no redundant cascade — happy path (skip) unaffected by this fix"
+  else
+    bad "already-closed source bead: cascade unexpectedly fired (rc=$RC6C): $(cat "$BD_LOG6C") / $OUT6C"
+  fi
+  rm -f "$BD_LOG6C"
+
+  BD_LOG6O="$(mktemp)"
+  OUT6O="$(run_merge_cleanup open "$BD_LOG6O" 2>&1)"; RC6O=$?
+  if [ "$RC6O" -eq 0 ] && grep -q "close src-bead" "$BD_LOG6O"; then
+    ok "genuinely-open source bead: cascade runs and closes it — happy path (requeue) unaffected by this fix"
+  else
+    bad "genuinely-open source bead: cascade did not run as expected (rc=$RC6O): $(cat "$BD_LOG6O") / $OUT6O"
+  fi
+  rm -f "$BD_LOG6O"
+fi
+
+# ── Part 7: phase-c-verdict-rehydrate + phase-c-dead-reviewer-classify-fn ───
+# interaction — an unreadable assignee capture (SESSION_IDS[$PC_J] set to
+# __UNKNOWN__) must not be read as "session absent" by the classifier below
+# it, which would misclassify a live reviewer as dead purely because ONE
+# earlier query (the assignee read, not the reviewer's actual liveness)
+# failed. This is the real functional consequence of ga-i5s5's 2nd finding:
+# a false ALL-DEAD verdict wrongly re-queues a marker whose reviewer is
+# still alive, wasting that reviewer's in-progress work. Distinct from
+# Part 4: here the STATUS read succeeds (so the pre-existing ga-art5 guard
+# does NOT fire) and only the earlier ASSIGNEE read failed — isolating this
+# fix specifically.
+echo "── 7. phase-c-verdict-rehydrate capture + classify: unreadable assignee capture can't confirm dead ──"
+FN_REHYDRATE="$(extract_block "$DISPATCHER" "phase-c-verdict-rehydrate")"
+FN_CLASSIFY2="$(extract_block "$DISPATCHER" "phase-c-dead-reviewer-classify-fn")"
+FN_SID3="$(extract_block "$DISPATCHER" "session-is-dead-fn")"
+if [ -z "$FN_REHYDRATE" ] || [ -z "$FN_CLASSIFY2" ] || [ -z "$FN_SID3" ]; then
+  bad "could not extract phase-c-verdict-rehydrate, phase-c-dead-reviewer-classify-fn, or session-is-dead-fn — aborting Part 7"
+else
+  run_rehydrate_classify() {
+    local scenario="$1"  # "all_readable" or "assignee_unreadable"
+    bash -c '
+      set -euo pipefail
+      GC_CITY="/fake/city"
+      GATE_RUN_ID="run-1"
+      SCENARIO="$1"
+      VB1_JSON='"'"'{"status":"open","assignee":"sess-1"}'"'"'
+      VB2_JSON='"'"'{"status":"open","assignee":"sess-2"}'"'"'
+      VERDICT_LIST='"'"'[{"id":"pc-vb-1"},{"id":"pc-vb-2"}]'"'"'
+      # A call-COUNT variable does not work here: bd() is invoked via
+      # `$(...)` command substitution, which forks a subshell, so any
+      # variable mutation bd() makes is discarded when the subshell exits
+      # and never reaches this outer scope. Use a flag FILE instead —
+      # filesystem state persists across the subshell boundary, so only
+      # the first call to "show pc-vb-1" fails and every later call
+      # (including the classify loops own, separate status re-read)
+      # succeeds, matching the real "transient hiccup" scenario this test
+      # models.
+      PC_VB1_FLAG=$(mktemp)
+      rm -f "$PC_VB1_FLAG"
+      bd() {
+        case " $* " in
+          *" list "*"type:quality-gate-verdict"*) echo "$VERDICT_LIST"; return 0 ;;
+          *" show pc-vb-1 "*)
+            if [ "$SCENARIO" = "assignee_unreadable" ] && [ ! -f "$PC_VB1_FLAG" ]; then
+              : > "$PC_VB1_FLAG"
+              echo "transient Dolt hiccup (assignee read)" >&2
+              return 1
+            fi
+            echo "$VB1_JSON"; return 0 ;;
+          *" show pc-vb-2 "*) echo "$VB2_JSON"; return 0 ;;
+        esac
+        return 0
+      }
+      gate_collect_verdicts() { :; }
+      log()  { echo "LOG: $*" >&2; }
+      warn() { echo "WARN: $*" >&2; }
+      '"$FN_SID3"'
+      PC_SESS_JSON="[]"
+      PC_ANY_PENDING=0
+      PC_ALL_PENDING_DEAD=1
+      for _dummy_loop in 1; do
+        '"$FN_REHYDRATE"'
+      done
+      '"$FN_CLASSIFY2"'
+      rm -f "$PC_VB1_FLAG"
+      printf "RESULT|PC_ANY_PENDING=%s|PC_ALL_PENDING_DEAD=%s|SESSION_IDS=%s\n" "$PC_ANY_PENDING" "$PC_ALL_PENDING_DEAD" "${SESSION_IDS[*]}"
+    ' _ "$scenario"
+  }
+
+  OUT7_BASE="$(run_rehydrate_classify all_readable 2>&1)"; RC7_BASE=$?
+  RES7_BASE="$(printf '%s\n' "$OUT7_BASE" | grep '^RESULT|' || true)"
+  if [ "$RC7_BASE" -eq 0 ] && printf '%s' "$RES7_BASE" | grep -q "PC_ALL_PENDING_DEAD=1"; then
+    ok "baseline (both assignee reads succeed, no live sessions present): PC_ALL_PENDING_DEAD=1 — happy path unaffected by this fix"
+  else
+    bad "baseline rehydrate+classify broken (rc=$RC7_BASE): $OUT7_BASE"
+  fi
+
+  OUT7_FAIL="$(run_rehydrate_classify assignee_unreadable 2>&1)"; RC7_FAIL=$?
+  RES7_FAIL="$(printf '%s\n' "$OUT7_FAIL" | grep '^RESULT|' || true)"
+  if [ "$RC7_FAIL" -eq 0 ] && printf '%s' "$RES7_FAIL" | grep -q "PC_ALL_PENDING_DEAD=0"; then
+    ok "pc-vb-1 assignee capture unreadable (status read succeeds): PC_ALL_PENDING_DEAD=0 (falls through to TIMEOUT path instead of a false dead-reviewer verdict) — got: $RES7_FAIL"
+  else
+    bad "assignee-unreadable case did NOT force PC_ALL_PENDING_DEAD=0 — a transient hiccup on the assignee read alone could manufacture a false dead-reviewer verdict (rc=$RC7_FAIL): $OUT7_FAIL"
+  fi
+  case "$OUT7_FAIL" in
+    *"assignee capture was unreadable"*) ok "unreadable assignee capture is named in the diagnostic log" ;;
+    *) bad "no diagnostic log line distinguishing the unreadable assignee capture from a confirmed-absent session" ;;
+  esac
 fi
 
 echo ""

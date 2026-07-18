@@ -192,7 +192,21 @@ guard = '''      if [ "${#VERDICT_BEAD_IDS[@]}" -eq 0 ]; then
 '''
 loop = '''      SESSION_IDS=()
       for PC_VBID in "${VERDICT_BEAD_IDS[@]}"; do
-        PC_SID=$(bd -C "$GC_CITY" show "$PC_VBID" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
+        # ga-i5s5: `|| echo ""` used to mask a failed `bd show` (assignee
+        # read) as a blank session id. A blank PC_SID matches no live
+        # session below (root-class:error-vs-empty) -> the dead-reviewer
+        # classifier (phase-c-dead-reviewer-classify-fn) reads "not present"
+        # -> confirmed DEAD, so a transient Dolt hiccup on THIS read could
+        # manufacture a false dead-reviewer verdict for a reviewer that is
+        # actually still alive. Use the same __UNKNOWN__ sentinel
+        # vb_status_action already establishes for this file's status reads
+        # so the classifier can distinguish "confirmed absent" from
+        # "couldn't check" instead of conflating them.
+        if PC_SID_JSON=$(bd -C "$GC_CITY" show "$PC_VBID" --json 2>/dev/null); then
+          PC_SID=$(printf '%s' "$PC_SID_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || true)
+        else
+          PC_SID="__UNKNOWN__"
+        fi
         SESSION_IDS+=("$PC_SID")
       done
 

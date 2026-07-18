@@ -3541,7 +3541,21 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
 
       SESSION_IDS=()
       for PC_VBID in "${VERDICT_BEAD_IDS[@]}"; do
-        PC_SID=$(bd -C "$GC_CITY" show "$PC_VBID" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
+        # ga-i5s5: `|| echo ""` used to mask a failed `bd show` (assignee
+        # read) as a blank session id. A blank PC_SID matches no live
+        # session below (root-class:error-vs-empty) -> the dead-reviewer
+        # classifier (phase-c-dead-reviewer-classify-fn) reads "not present"
+        # -> confirmed DEAD, so a transient Dolt hiccup on THIS read could
+        # manufacture a false dead-reviewer verdict for a reviewer that is
+        # actually still alive. Use the same __UNKNOWN__ sentinel
+        # vb_status_action already establishes for this file's status reads
+        # so the classifier can distinguish "confirmed absent" from
+        # "couldn't check" instead of conflating them.
+        if PC_SID_JSON=$(bd -C "$GC_CITY" show "$PC_VBID" --json 2>/dev/null); then
+          PC_SID=$(printf '%s' "$PC_SID_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || true)
+        else
+          PC_SID="__UNKNOWN__"
+        fi
         SESSION_IDS+=("$PC_SID")
       done
 
@@ -3605,6 +3619,19 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
           [ "$PC_VB_ST" = "closed" ] && continue
           PC_ANY_PENDING=1
           PC_SID="${SESSION_IDS[$PC_J]:-}"
+          # ga-i5s5: an unreadable assignee capture (SESSION_IDS[$PC_J] set
+          # to __UNKNOWN__ above when its bd-show failed) must not fall
+          # through to the present-session lookup below — an unknown SID
+          # matches no session either, which is indistinguishable from a
+          # confirmed-absent one and would misclassify this reviewer DEAD.
+          # Mirror the bd-show-failure branch immediately above this loop
+          # (root-class:error-vs-empty): can't confirm dead, fall through to
+          # the TIMEOUT path instead of guessing.
+          if [ "$PC_SID" = "__UNKNOWN__" ]; then
+            warn "  Phase C: verdict bead $PC_VB assignee capture was unreadable earlier this sweep (bd show failed — transient Dolt hiccup?) — not confirming dead-reviewer classification; falling through to the TIMEOUT path instead of guessing (root-class:error-vs-empty, ga-i5s5)."
+            PC_ALL_PENDING_DEAD=0
+            break
+          fi
           PC_PRESENT_N=$(printf '%s' "$PC_SESS_JSON" \
             | jq -r --arg s "$PC_SID" 'if type=="array" then . else .sessions end | map(select(.id==$s or .session_id==$s)) | length' 2>/dev/null || echo 1)
           case "$PC_PRESENT_N" in ''|*[!0-9]*) PC_PRESENT_N=1 ;; esac
@@ -4589,51 +4616,77 @@ if [ "$ALREADY_MERGED" = "1" ]; then
 
   # Drive the source bead to its terminal/handoff state if open.
   if [ -n "$BEAD_ID" ]; then
-    # ga-h199q: routed through the read-cache shim — first read in the
-    # SUPERSEDED-terminal block, before any writes to this bead this invocation.
-    BD_STATUS=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
-      | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
-    if [ "$BD_STATUS" != "closed" ]; then
-      # ga-i53ua: route a STORY already-merged through the SAME delivery completion
-      # as the PASS path — do NOT just mark gate:superseded and leave it OPEN at
-      # story:approved (the old behavior delivered NOTHING: no story:done, no
-      # story:approved removal, no delivery-close → the executed story stranded in
-      # the painel "Aprovadas" column forever, exactly the M1 mechanism this bead
-      # tracks). Detect a story by its canonical label story:approved (type is null
-      # for stories in bd; mirrors the PASS path's IS_STORY logic at ga-esbg).
-      # ga-h199q: routed through the read-cache shim — same bead as BD_STATUS
-      # just above, a few lines up; the shim collapses the pair into one live call.
-      SUPERSEDE_SRC_LABELS=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
-        | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
-      SUPERSEDE_IS_STORY=0
-      if printf '%s' "$SUPERSEDE_SRC_LABELS" | grep -q "story:approved"; then SUPERSEDE_IS_STORY=1; fi
-
-      # ga-67hae PILOT-CASCADE FIX: branch already merged → strip story:in-flight so
-      # the Pilot lane slot frees. The PASS path strips it at merge (ga-3h8l) but this
-      # supersede path did not — phantom in-flight slots wedged the Pilot at capacity.
-      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" assign "$BEAD_ID" "" -q 2>/dev/null || true
-
-      if [ "$SUPERSEDE_IS_STORY" = "1" ]; then
-        # STORY → hand off to story-delivery exactly like the PASS path: set
-        # gate:passed (story-delivery's pickup signal), keep it OPEN with
-        # story:approved, and let delivery run deploy→prod-test→story:done+close
-        # (the durable terminal — story:approved removed + delivery close_reason →
-        # painel Done — lives in story-delivery, ga-i53ua Fix A). We do NOT mark
-        # gate:superseded on a story: that label is a non-delivery word the painel
-        # would mis-route, and superseded is not the story's outcome (it WAS merged).
-        bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate skipped (marker $MARKER_ID superseded), but this is a STORY: handed off to story-delivery (gate:passed set; story:approved kept; story:in-flight stripped; builder assignee cleared). Delivery will deploy + prod-test, then mark story:done and CLOSE with a delivery reason so it reaches painel Done (ga-i53ua)." 2>/dev/null || true
-        log "Already-merged STORY $BEAD_ID handed off to delivery (gate:passed set; story:approved kept for delivery pickup)."
-      else
-        # BUG/TASK → superseded close-direct (unchanged behavior). Non-story beads
-        # do NOT route through story-delivery; they close terminal here.
-        bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate superseded (marker $MARKER_ID). story:in-flight stripped (Pilot lane slot freed — ga-67hae pilot-cascade fix); work already merged." 2>/dev/null || true
-        bd -C "$BEAD_CITY" close "$BEAD_ID" -r "Branch $BRANCH already merged to $RIG/$DEFAULT_BRANCH — delivered via prior merge; gate superseded (marker $MARKER_ID). Closed by dispatcher (ga-i53ua: non-story already-merged terminal)." 2>/dev/null \
-          || warn "Could not close already-merged non-story source bead $BEAD_ID (non-fatal)."
-      fi
+    # SELFTEST-EXTRACT already-merged-source-bead-cleanup-fn: BEGIN
+    # ga-i5s5: `|| true` used to mask a failed `bd show` as BD_STATUS="",
+    # which `!= closed` then reads as "not yet closed" — the exact same
+    # error/empty conflation ga-s07s closed at the verdict-bead sites,
+    # applied here to the SOURCE bead. Consequence here is lower severity
+    # (the already-merged FACT is established independently by the earlier
+    # git merge-base/patch-id check, not by this read; a false "not closed"
+    # only re-runs the idempotent label/comment/close cascade below — the
+    # close call already has a `|| warn ... non-fatal` fallback), but an
+    # unreadable status must still not silently pass as "open". Reuse
+    # vb_status_action() (root-class:error-vs-empty) for the same
+    # unknown/skip/requeue split the verdict-bead sites use.
+    # NOTE deliberately NOT routed through bd-list-cached.sh (ga-h199q):
+    # this whole block is verbatim-extracted by SELFTEST-EXTRACT and run in
+    # a sandbox that stubs a `bd` shell function only — a shim call shells
+    # out to a separate script the stub cannot intercept, which silently
+    # made every scenario (including genuinely-open) read as unreadable.
+    # Also matches the shim's own documented caveat: not safe, without a
+    # confirming resample, for a call site that itself decides to close/
+    # supersede/requeue a bead from the result — exactly this site.
+    if BD_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null); then
+      BD_STATUS=$(printf '%s' "$BD_JSON" | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
+    else
+      BD_STATUS="__UNKNOWN__"
     fi
+    case "$(vb_status_action "$BD_STATUS")" in
+      unknown)
+        log "  Source bead $BEAD_ID status unreadable this sweep (bd show failed — transient Dolt hiccup?) — skipping already-merged cleanup this run rather than assuming open (root-class:error-vs-empty, ga-i5s5)."
+        ;;
+      skip) : ;;
+      requeue)
+        # ga-i53ua: route a STORY already-merged through the SAME delivery completion
+        # as the PASS path — do NOT just mark gate:superseded and leave it OPEN at
+        # story:approved (the old behavior delivered NOTHING: no story:done, no
+        # story:approved removal, no delivery-close → the executed story stranded in
+        # the painel "Aprovadas" column forever, exactly the M1 mechanism this bead
+        # tracks). Detect a story by its canonical label story:approved (type is null
+        # for stories in bd; mirrors the PASS path's IS_STORY logic at ga-esbg).
+        SUPERSEDE_SRC_LABELS=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
+          | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
+        SUPERSEDE_IS_STORY=0
+        if printf '%s' "$SUPERSEDE_SRC_LABELS" | grep -q "story:approved"; then SUPERSEDE_IS_STORY=1; fi
+
+        # ga-67hae PILOT-CASCADE FIX: branch already merged → strip story:in-flight so
+        # the Pilot lane slot frees. The PASS path strips it at merge (ga-3h8l) but this
+        # supersede path did not — phantom in-flight slots wedged the Pilot at capacity.
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" assign "$BEAD_ID" "" -q 2>/dev/null || true
+
+        if [ "$SUPERSEDE_IS_STORY" = "1" ]; then
+          # STORY → hand off to story-delivery exactly like the PASS path: set
+          # gate:passed (story-delivery's pickup signal), keep it OPEN with
+          # story:approved, and let delivery run deploy→prod-test→story:done+close
+          # (the durable terminal — story:approved removed + delivery close_reason →
+          # painel Done — lives in story-delivery, ga-i53ua Fix A). We do NOT mark
+          # gate:superseded on a story: that label is a non-delivery word the painel
+          # would mis-route, and superseded is not the story's outcome (it WAS merged).
+          bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
+          bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate skipped (marker $MARKER_ID superseded), but this is a STORY: handed off to story-delivery (gate:passed set; story:approved kept; story:in-flight stripped; builder assignee cleared). Delivery will deploy + prod-test, then mark story:done and CLOSE with a delivery reason so it reaches painel Done (ga-i53ua)." 2>/dev/null || true
+          log "Already-merged STORY $BEAD_ID handed off to delivery (gate:passed set; story:approved kept for delivery pickup)."
+        else
+          # BUG/TASK → superseded close-direct (unchanged behavior). Non-story beads
+          # do NOT route through story-delivery; they close terminal here.
+          bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
+          bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate superseded (marker $MARKER_ID). story:in-flight stripped (Pilot lane slot freed — ga-67hae pilot-cascade fix); work already merged." 2>/dev/null || true
+          bd -C "$BEAD_CITY" close "$BEAD_ID" -r "Branch $BRANCH already merged to $RIG/$DEFAULT_BRANCH — delivered via prior merge; gate superseded (marker $MARKER_ID). Closed by dispatcher (ga-i53ua: non-story already-merged terminal)." 2>/dev/null \
+            || warn "Could not close already-merged non-story source bead $BEAD_ID (non-fatal)."
+        fi
+        ;;
+    esac
+    # SELFTEST-EXTRACT already-merged-source-bead-cleanup-fn: END
   fi
 
   # Log and exit without error
