@@ -64,6 +64,7 @@ LCJ_DRY_RUN="${LCJ_DRY_RUN:-0}"
 LCJ_ENABLED="${LCJ_ENABLED:-1}"
 BD="${LCJ_BD:-bd}"
 GC="${LCJ_GC:-gc}"
+LCJ_GIT="${LCJ_GIT:-git}"
 LOG="${LCJ_LOG:-/Users/athos/gt/.gascity-gastown-hq/.gc/logs/lifecycle-coherence-janitor.log}"
 LCJ_NOTIFY="${LCJ_NOTIFY:-/Users/athos/.local/bin/notify}"
 # ga-hn34 (2026-07-14): cancellation/obsolescence keyword regex tested against a closed
@@ -253,6 +254,165 @@ sys.exit(0 if rl.claimant_provably_dead(assignee, sessions) else 1)
 ' "$assignee" 2>/dev/null
 }
 
+# ── AC3 (ga-to242): bead-id → branch(es) resolution + real git-ancestry merge
+# verification for R5. R4/R5 were re-enabled 2026-07-17 (ga-6plfv) with R5 only
+# partially fixed: it skipped beads still carrying gate:failed/needs-fix at sweep
+# time, but a bead closed+relabeled some other way was never checked against git
+# at all — "closed" does NOT prove "merged" (same lesson as gate-recovery-
+# watchdog.py's orphan_marker_verdict, ga-w5agg/ga-d2jil, and lifecycle-
+# correctness-auditor.sh's FALSE-CLOSE check, which independently confirmed the
+# identical failure shape live on wa-g1b58).
+#
+# R5 fires on the SOURCE bead directly — by the time it runs, any gate marker
+# that might have recorded a known branch name is long gone — so unlike
+# gate-recovery-watchdog.py's _branch_merged_state(branch, rig_name)
+# (scripts/gate-recovery-watchdog.py:1487-1510), which takes an already-known
+# branch name, R5 first has to DISCOVER candidate branch names from the bead id
+# itself. Any local or origin branch where the bead id appears as a /-or--
+# delimited path component is a candidate — this covers crew/<owner>/<bead>,
+# fix/<bead>-*, feat/<bead>-*, crew/worker-<bead>, and any other prefix
+# convention sharing that same delimiter shape. Deliberately NOT a hardcoded
+# enum of prefixes: chore/, feat/, and a handful of legacy bare-<bead>-<slug>
+# branches (no prefix at all) were all observed live in this repo's actual
+# branch history — a fixed 3-pattern whitelist would have missed them. Escapes
+# the bead id the same way R7 already does for sling-title matching (rxesc,
+# above) — ids contain literal dots (e.g. wa-8yw4i.1). KNOWN RESIDUAL RISK: if
+# one bead's full id happens to be an exact prefix of a second bead's full id
+# (e.g. "ga-ab" vs "ga-abcd"), a branch belonging to the second bead could
+# spuriously match the first — inherent to any delimiter-based heuristic
+# search with no registry of id→branch truth to check against; accepted as a
+# rare residual given the alternative (today's unconditional stamp, ga-to242's
+# whole reason for existing) is a confirmed-live, strictly worse failure mode.
+#
+# The merge-ancestry CHECK itself mirrors _branch_merged_state's semantics
+# exactly (rev-parse --verify, merge-base --is-ancestor against origin/main;
+# fetch is done ONCE per store by the caller, see R5 below, not per-call here
+# — a live backlog of ~148 closed+ctx:ready beads in a single store was
+# observed while verifying this fix, and fetching inside this function would
+# mean up to several hundred redundant `git fetch` calls in one sweep;
+# mirrors lifecycle-correctness-auditor.sh's fetch_rig(), called once per
+# store outside its own per-bead loop) — ported to bash rather than shelled
+# out to, matching this file's own precedent (_gate_active_beads above
+# already mirrors inflight-reclaim-guard.py's list_gate_active_source_beads()
+# the same way, "ported to bash/jq"). Deliberately the SIMPLER ancestor-only
+# signal, not lifecycle-correctness-auditor.sh's squash-aware 3-signal branch_merged_in_main
+# (ancestor OR patch-id content-equivalence OR scoped-commit-subject) — that
+# auditor is DETECTION-ONLY and free to spend extra git calls chasing every
+# signal; R5 is a live per-sweep mutation gate, and its OWN fail-safe below (no
+# positive merge evidence → skip, never stamp done) already makes a missed
+# squash-merge safe (a real done-via-squash bead just stays unlabelled-but-
+# visible instead of being silently mislabeled) rather than another false-close.
+_bead_id_regex() {  # bead-id → grep -E safe: escapes literal dots (e.g. wa-8yw4i.1) so
+                     # "." is matched literally, not as ERE any-char. Real bead ids are
+                     # lowercase alnum + hyphens + occasional dot (never the other ERE
+                     # metachars), so a dot-only escape is sufficient here — a broader
+                     # bracket-expression escape (mirroring R7's jq rxesc) was tried first
+                     # and PROVEN silently non-functional on this platform's sed (backslash
+                     # has no escaping meaning inside a POSIX bracket expression, so `\.`
+                     # inside `[...]` was passed through literally and matched nothing);
+                     # this narrower, verified-correct version replaces it.
+  printf '%s' "$1" | sed -e 's/\./\\./g'
+}
+_resolve_bead_branches() {  # store bead-id → candidate branch short-names (origin/ stripped, deduped, one per line)
+  local store="$1" bid="$2" bre
+  bre=$(_bead_id_regex "$bid")
+  "$LCJ_GIT" -C "$store" for-each-ref --format='%(refname:short)' refs/heads refs/remotes/origin 2>/dev/null \
+    | sed 's#^origin/##' \
+    | grep -E "(^|/|-)${bre}(-|/|\$)" 2>/dev/null \
+    | sort -u
+}
+_branch_merged_state() {  # store branch → merged|unmerged|missing|unknown (mirrors gate-recovery-watchdog.py:1487-1510)
+  # NOTE: does NOT fetch — caller (R5, once per store) is responsible. See comment above.
+  local store="$1" branch="$2" rc
+  [ -z "$branch" ] && { echo "unknown"; return; }
+  "$LCJ_GIT" -C "$store" rev-parse --verify -q "origin/${branch}^{commit}" >/dev/null 2>&1
+  if [ $? -ne 0 ]; then echo "missing"; return; fi
+  "$LCJ_GIT" -C "$store" merge-base --is-ancestor "origin/${branch}" origin/main 2>/dev/null
+  rc=$?
+  case "$rc" in
+    0) echo "merged" ;;
+    1) echo "unmerged" ;;
+    *) echo "unknown" ;;
+  esac
+}
+# _r5_merge_verdict store bead-id → merged|stranded|unresolved
+#   merged     — at least one candidate branch is a positive ancestor of origin/main:
+#                safe to stamp story:done.
+#   stranded   — EVERY candidate branch resolved definitively (none missing/unknown)
+#                and at least one is confirmed unmerged: the wa-g1b58 false-close
+#                shape. Never touch; rare + actionable, so escalate loudly (see
+#                _r5_stranded_notify_once below).
+#   unresolved — no candidate branch found at all, OR at least one candidate could
+#                not be resolved (missing/unknown) with no "merged" verdict found
+#                elsewhere: can't confirm either way. Never touch; log only.
+#
+# WHY a mixed missing+unmerged set is "unresolved", not "stranded" (found live
+# while verifying this fix, not a hypothetical): a bead can have MULTIPLE
+# candidate branches — an abandoned/superseded first attempt plus the branch
+# that actually shipped (see the r5mb selftest fixture, and real precedent:
+# ga-26df had 3 historical attempt branches). If the ACTUAL winning branch was
+# deleted after merging (confirmed live on wa-1t8x9/wa-tkvwb — both closed with
+# a close_reason citing a specific merged sha that `merge-base --is-ancestor`
+# confirms IS on origin/main, yet the branch recorded in bd metadata no longer
+# exists on origin) while an EARLIER, unrelated attempt branch still lingers
+# and resolves "unmerged", treating that alone as proof of a false-close would
+# itself be a false positive — the exact failure class this fix exists to
+# prevent, just relocated. Only trust "stranded" when every candidate could be
+# checked and NONE came back merged.
+_r5_merge_verdict() {
+  local store="$1" bid="$2" branches b state any_unmerged=0 any_inconclusive=0 verdict="unresolved"
+  branches=$(_resolve_bead_branches "$store" "$bid")
+  [ -z "$branches" ] && { echo "unresolved"; return; }
+  while IFS= read -r b; do
+    [ -z "$b" ] && continue
+    state=$(_branch_merged_state "$store" "$b")
+    case "$state" in
+      merged)   verdict="merged"; break ;;
+      unmerged) any_unmerged=1 ;;
+      *)        any_inconclusive=1 ;;  # missing or unknown — resolves nothing either way
+    esac
+  done <<< "$branches"
+  if [ "$verdict" != "merged" ]; then
+    if [ "$any_unmerged" -eq 1 ] && [ "$any_inconclusive" -eq 0 ]; then
+      verdict="stranded"
+    else
+      verdict="unresolved"
+    fi
+  fi
+  echo "$verdict"
+}
+# Cooldown for the R5 "stranded" push-notification specifically (NOT the log
+# line, which stays append-only every sweep) — R5's own sweep runs every 10min
+# (lifecycle-coherence-janitor.plist StartInterval=600); without a cooldown a
+# still-stranded bead would re-notify every single sweep until a human
+# intervenes. Separate namespace from $LIFECYCLE_LOCK_DIR's flat <bead-id>
+# advisory-lock files (_bead_locked) — writing flat files here would collide
+# with real locks and make R4-R8 wrongly treat a notified bead as locked.
+# Cooldown state is only touched/consulted in real (non-dry) runs — a DRY_RUN
+# preview always notifies, mirroring the gate-unknown-sentinel notify_fail
+# above which likewise never gates on LCJ_DRY_RUN (a detection signal, not a
+# bead mutation).
+R5_STRANDED_NOTIFY_COOLDOWN_SEC="${R5_STRANDED_NOTIFY_COOLDOWN_SEC:-21600}"
+_r5_stranded_notify_once() {  # bead-id message → notify_fail at most once per cooldown window
+  # $LIFECYCLE_LOCK_DIR resolved HERE, not cached at top-level load time — the
+  # selftest reassigns it to a sandboxed $TMP path AFTER this file is sourced,
+  # and a top-level ${LIFECYCLE_LOCK_DIR}/... assignment would have frozen in
+  # the pre-reassignment (real /tmp/gc-lifecycle-lock) default, leaking
+  # cooldown-marker writes outside the test sandbox.
+  local id="$1" msg="$2" notify_dir="${LIFECYCLE_LOCK_DIR}/.r5-stranded-notify" marker fts now
+  marker="$notify_dir/$id"
+  if [ "$LCJ_DRY_RUN" != "1" ]; then
+    mkdir -p "$notify_dir" 2>/dev/null || true
+    if [ -f "$marker" ]; then
+      fts=$(cat "$marker" 2>/dev/null) || fts=0
+      now=$(date +%s)
+      [ "$(( now - ${fts:-0} ))" -lt "$R5_STRANDED_NOTIFY_COOLDOWN_SEC" ] 2>/dev/null && return 0
+    fi
+    date +%s > "$marker" 2>/dev/null || true
+  fi
+  notify_fail "$msg"
+}
+
 run_sweep() {
   if [ "$LCJ_ENABLED" != "1" ]; then log "disabled (LCJ_ENABLED!=1)"; return 0; fi
   # imp10: sweep-level mutual exclusion — only one janitor sweep at a time.
@@ -392,7 +552,23 @@ run_sweep() {
     # ctx:ready was missing. A closed bead carrying ctx:ready shows up in the Aprovadas
     # column (which unions story:approved + ctx:ready) as a zombie card. Same exclusion as
     # R1: a story:cancelled bead stays cancelled, never re-labelled done.
+    # ga-to242 AC3: "closed" is NOT proof of "merged" — the ga-6plfv partial fix only
+    # caught beads still carrying gate:failed/needs-fix at sweep time. Require positive
+    # git-ancestry evidence (see _r5_merge_verdict above) before stamping story:done.
     local _r5_list; _r5_list=$("$BD" -C "$store" list -l ctx:ready --status closed --json -n 0 2>/dev/null)
+    # Fetch ONCE per store, only if there's at least one candidate — not once per bead/
+    # branch inside _branch_merged_state (see comment on that function for why: a live
+    # backlog of ~148 candidates in one store was observed while verifying this fix).
+    # --prune: without it, a branch deleted on origin after merging (confirmed live —
+    # not every rig keeps merged branches around the way gascity/HQ's fix/* convention
+    # does) leaves a STALE local refs/remotes/origin/* entry behind; rev-parse would
+    # then "successfully" resolve that stale tip and merge-base would ancestor-check
+    # against content that no longer represents anything real on the remote, instead of
+    # correctly reporting "missing" (which _r5_merge_verdict's mixed-signal handling
+    # above depends on to avoid a false "stranded").
+    if [ -n "$(printf '%s' "$_r5_list" | jq -r '.[0].id // empty' 2>/dev/null)" ]; then
+      "$LCJ_GIT" -C "$store" fetch origin --prune --quiet 2>/dev/null
+    fi
     for id in $(printf '%s' "$_r5_list" | jq -r --arg re "$LCJ_CANCEL_RE" \
                 '.[] | select(([.labels[]?]|index("story:cancelled"))|not)
                      | select(((.close_reason // "") | test($re; "i")) | not)
@@ -404,8 +580,19 @@ run_sweep() {
       if "$BD" -C "$store" show "$id" --json 2>/dev/null \
           | jq -e 'if type=="array" then .[0] else . end | (.labels // []) | any(. == "story:done")' \
           >/dev/null 2>&1; then continue; fi
-      _strip "$store" "$id" ctx:ready; _strip "$store" "$id" pilot:dispatched; _add "$store" "$id" story:done
-      log "R5 ctx-ready-vestigial: $id ($(basename "$store")) — stripped ctx:ready, set story:done"; n=$((n+1))
+      case "$(_r5_merge_verdict "$store" "$id")" in
+        merged)
+          _strip "$store" "$id" ctx:ready; _strip "$store" "$id" pilot:dispatched; _add "$store" "$id" story:done
+          log "R5 ctx-ready-vestigial: $id ($(basename "$store")) — verified merged, stripped ctx:ready, set story:done"; n=$((n+1))
+          ;;
+        stranded)
+          log "R5 skip-stranded (ga-to242 AC3): $id ($(basename "$store")) — closed+ctx:ready but its candidate branch exists on origin and is NOT merged into origin/main; NOT stamping story:done (wa-g1b58 false-close shape)"
+          _r5_stranded_notify_once "$id" "lifecycle-coherence-janitor: $id ($(basename "$store")) closed+ctx:ready but its branch is UNMERGED — possible false-close, needs manual recovery (ga-to242 AC3)"
+          ;;
+        unresolved)
+          log "R5 skip-unverified (ga-to242 AC3): $id ($(basename "$store")) — closed+ctx:ready but no branch found matching bead-id naming conventions; cannot confirm merge, NOT stamping story:done"
+          ;;
+      esac
     done
     # ga-6plfv (AC3, partial/zero-git-risk subset — full merge-ancestry
     # verification deferred, see file header): a closed+ctx:ready bead that
@@ -628,6 +815,21 @@ if [ "${1:-}" = "--selftest" ]; then
   # r5-gate-failed (ga-6plfv AC3, partial fix): closed+ctx:ready but STILL carries gate:failed +
   #          gate:needs-fix — must NOT get story:done stamped (wa-g1b58's exact live shape: parked/
   #          hard-stopped, not delivered). Log-only skip, no story:cancelled/story:done mutation.
+  # AC3 (ga-to242) fixtures — R5 must now verify git-ancestry before stamping story:done:
+  # r5m: candidate branch fix/r5m-some-fix IS an ancestor of origin/main → story:done (merged path)
+  # r5s: candidate branch fix/r5s-some-fix EXISTS on origin but is NOT an ancestor → left alone,
+  #      logged "skip-stranded", notified once (the wa-g1b58 false-close shape)
+  # r5u: NO branch matches any naming convention → left alone, logged "skip-unverified", no notify
+  # r9dot.1: dot-escaping regression (mirrors R7's wa-8yw4i.1/sling-8yw4iX1 pair) — its REAL
+  #      branch fix/r9dot.1-real is UNMERGED (stranded); a DECOY branch fix/r9dotX1-decoy
+  #      (literal X where r9dot.1 has a literal dot) IS merged. If the dot were treated as
+  #      ERE any-char instead of a literal, the decoy would wrongly match and r9dot.1 would
+  #      be misreported "merged" instead of "stranded". (Named r9, not r5-prefixed, so its
+  #      id does not itself collide with the bare "r5" fixture's own delimiter match — "r5"
+  #      is a literal prefix of "r5-dot...", which DOES spuriously match "fix/r5-dot...-*"
+  #      branches; verified empirically before picking this naming.)
+  # r5's own AC3 branch is fix/r5-legacy-fix (merged) — added so the pre-existing "r5 →
+  # story:done" assertion still holds under the new merge-gated R5.
   # R8 fixtures (ga-ipm4, park+arm invariant): r8-parked-auto (exec:auto+pool:refused:<reason>),
   # r8-parked-auto2 (exec:auto+a DIFFERENT pool:refused:<reason> suffix — proves prefix
   # genericity), r8-parked-ready (ctx:ready+needs-human), r8-parked-both (BOTH arm labels+
@@ -663,8 +865,14 @@ case "\$a" in
   *"list --status in_progress"*)                echo '[{"id":"ip-noasg","assignee":"","updated_at":"2020-01-01T00:00:00Z"},{"id":"ip-fresh","assignee":"","updated_at":"'"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"'"},{"id":"ip-asg","assignee":"mila-wa"},{"id":"ip-gate-active","assignee":"","updated_at":"2020-01-01T00:00:00Z"}]' ;;
   *"list -l story:approved --status open"*)     echo '[{"id":"r4-asg","assignee":"mila-wa","labels":["story:approved"]},{"id":"r4-human","assignee":"mila-wa","labels":["story:approved","gate:needs-human:foo"]},{"id":"r4-human-bare","assignee":"mila-wa","labels":["story:approved","gate:needs-human"]},{"id":"r4-live","assignee":"crew-live","labels":["story:approved"]},{"id":"r4-ambiguous","assignee":"crew-ambiguous","labels":["story:approved"]},{"id":"r4-deacon","assignee":"deacon","labels":["story:approved"]}]' ;;
   *"list -l ctx:ready --status open"*)          echo '[]' ;;
-  *"list -l ctx:ready --status closed"*)        echo '[{"id":"r5","labels":["ctx:ready"]},{"id":"r5-locked","labels":["ctx:ready"]},{"id":"r5-cancel","labels":["ctx:ready","story:cancelled"]},{"id":"r5-byreason","labels":["ctx:ready"],"close_reason":"discontinued: replaced by wa-xyz redesign"},{"id":"r5-gate-failed","labels":["ctx:ready","gate:failed","gate:needs-fix"]}]' ;;
+  *"list -l ctx:ready --status closed"*)        echo '[{"id":"r5","labels":["ctx:ready"]},{"id":"r5-locked","labels":["ctx:ready"]},{"id":"r5-cancel","labels":["ctx:ready","story:cancelled"]},{"id":"r5-byreason","labels":["ctx:ready"],"close_reason":"discontinued: replaced by wa-xyz redesign"},{"id":"r5-gate-failed","labels":["ctx:ready","gate:failed","gate:needs-fix"]},{"id":"r5m","labels":["ctx:ready"]},{"id":"r5s","labels":["ctx:ready"]},{"id":"r5u","labels":["ctx:ready"]},{"id":"r9dot.1","labels":["ctx:ready"]},{"id":"r5mb","labels":["ctx:ready"]},{"id":"r5mm","labels":["ctx:ready"]}]' ;;
   *"show r5 "*|*"show r5-locked "*)             echo '[{"id":"r5","labels":["ctx:ready"]}]' ;;
+  *"show r5m"*)                                 echo '[{"id":"r5m","labels":["ctx:ready"]}]' ;;
+  *"show r5s"*)                                 echo '[{"id":"r5s","labels":["ctx:ready"]}]' ;;
+  *"show r5mb"*)                                echo '[{"id":"r5mb","labels":["ctx:ready"]}]' ;;
+  *"show r5mm"*)                                echo '[{"id":"r5mm","labels":["ctx:ready"]}]' ;;
+  *"show r5u"*)                                 echo '[{"id":"r5u","labels":["ctx:ready"]}]' ;;
+  *"show r9dot.1"*)                             echo '[{"id":"r9dot.1","labels":["ctx:ready"]}]' ;;
   # R6 (imp19): r6-exp has an expired held-until; r6-noexp has pilot:held but no expiry
   *"list -l pilot:held"*)                       echo '[{"id":"r6-exp","labels":["pilot:held","pilot:held-until:1000000"]},{"id":"r6-noexp","labels":["pilot:held"]}]' ;;
   *"show r6-exp"*) echo '[{"id":"r6-exp","labels":["pilot:held","pilot:held-until:1000000"]}]' ;;
@@ -748,9 +956,57 @@ case "$*" in
 esac
 GCSHIM
   chmod +x "$TMP/gc"
+  # AC3 (ga-to242) git shim: for-each-ref always returns the full fixed branch set (real
+  # git for-each-ref takes no bead-id filter — _resolve_bead_branches does the grep
+  # filtering); rev-parse/merge-base respond per-branch so each fixture gets an
+  # independent merged/unmerged/missing verdict.
+  cat > "$TMP/git" <<GITSHIM
+#!/usr/bin/env bash
+a="\$*"
+case "\$a" in
+  *"for-each-ref"*)
+    echo "origin/fix/r5-legacy-fix"
+    echo "origin/fix/r5m-some-fix"
+    echo "origin/fix/r5s-some-fix"
+    echo "origin/fix/r9dot.1-real"
+    echo "origin/fix/r9dotX1-decoy"
+    echo "origin/fix/r5mb-attempt1"
+    echo "origin/fix/r5mb-attempt2"
+    echo "origin/fix/r5mm-attempt1"
+    echo "origin/fix/r5mm-attempt2"
+    ;;
+  *"fetch"*) exit 0 ;;
+  *"fix/r5-legacy-fix^{commit}"*) exit 0 ;;
+  *"fix/r5m-some-fix^{commit}"*)  exit 0 ;;
+  *"fix/r5s-some-fix^{commit}"*)  exit 0 ;;
+  *"fix/r9dot.1-real^{commit}"*)  exit 0 ;;
+  *"fix/r9dotX1-decoy^{commit}"*) exit 0 ;;
+  *"fix/r5mb-attempt1^{commit}"*) exit 0 ;;
+  *"fix/r5mb-attempt2^{commit}"*) exit 0 ;;
+  *"fix/r5mm-attempt2^{commit}"*) exit 0 ;;
+  # r5mm-attempt1 deliberately has NO rev-parse case here — falls through to the
+  # generic "^{commit}" miss below (exit 1 = missing), simulating a candidate
+  # branch name that was found by for-each-ref (e.g. a stale/local ref) but does
+  # not actually resolve on origin (the wa-1t8x9/wa-tkvwb real shape: the branch
+  # that actually merged was deleted afterward; a DIFFERENT, unrelated candidate
+  # for the same bead id lingers and resolves fine).
+  *"^{commit}"*) exit 1 ;;
+  *"is-ancestor origin/fix/r5-legacy-fix"*) exit 0 ;;  # merged
+  *"is-ancestor origin/fix/r5m-some-fix"*)  exit 0 ;;  # merged
+  *"is-ancestor origin/fix/r5s-some-fix"*)  exit 1 ;;  # unmerged (stranded)
+  *"is-ancestor origin/fix/r9dot.1-real"*)  exit 1 ;;  # unmerged (stranded — the REAL match)
+  *"is-ancestor origin/fix/r9dotX1-decoy"*) exit 0 ;;  # merged (decoy — must NOT be reached)
+  *"is-ancestor origin/fix/r5mb-attempt1"*) exit 1 ;;  # unmerged (an earlier abandoned attempt)
+  *"is-ancestor origin/fix/r5mb-attempt2"*) exit 0 ;;  # merged (the successful re-attempt)
+  *"is-ancestor origin/fix/r5mm-attempt2"*) exit 1 ;;  # unmerged — but attempt1 is MISSING, not confirmed unmerged: must be "unresolved", not "stranded"
+  *"is-ancestor"*) exit 1 ;;
+  *) exit 0 ;;
+esac
+GITSHIM
+  chmod +x "$TMP/git"
   # Reassign script vars DIRECTLY (top-level reads happen at LOAD, before this block).
   BD="$TMP/bd"; GC="$TMP/gc"; LCJ_STORES="$TMP"; LOG="$TMP/log"; LCJ_DRY_RUN=0; LCJ_ENABLED=1
-  LCJ_NOTIFY="$TMP/notify"
+  LCJ_NOTIFY="$TMP/notify"; LCJ_GIT="$TMP/git"
   LCJ_GATE_CITY="$TMP"  # ga-ibz0: route _gate_active_beads() through the same shim
   LIFECYCLE_LOCK_DIR="$TMP/.lifecycle-lock"
   LIFECYCLE_SWEEP_LOCK="$LIFECYCLE_LOCK_DIR/.janitor-sweep.lock"
@@ -786,6 +1042,22 @@ GCSHIM
   grep -q 'label add r6-noexp pilot:held-until:' "$ACT" && ok "R6 (imp19): pilot:held with no expiry → stamped default 24h expiry" || bad "R6 did not stamp default expiry"
   grep -q 'label remove r5 ctx:ready'         "$ACT" && ok "R5 (imp15): closed+ctx:ready → stripped (Aprovadas zombie fix)" || bad "R5 did not strip ctx:ready"
   grep -q 'label add r5 story:done'           "$ACT" && ok "R5 (imp15): closed ctx:ready bead → set story:done" || bad "R5 did not set story:done"
+
+  # R5 AC3 (ga-to242): closed is not proof of merged — require positive git-ancestry
+  # evidence before stamping story:done. (The "r5"/"r5 story:done" assertions just above
+  # already prove the merged path still works via r5's own dedicated fix/r5-legacy-fix
+  # branch; these add the stranded/unresolved fail-safe paths + the dot-escaping regression.)
+  grep -q 'label add r5m story:done'          "$ACT" && ok "R5 AC3: merged branch found (r5m) → story:done stamped" || bad "R5 AC3: r5m (merged branch) did NOT get story:done"
+  grep -q 'label remove r5m ctx:ready'        "$ACT" && ok "R5 AC3: r5m ctx:ready stripped on the merged path" || bad "R5 AC3: r5m ctx:ready not stripped"
+  grep -q 'r5s'                               "$ACT" && bad "R5 AC3: TOUCHED r5s (branch exists but UNMERGED — must never stamp story:done, wa-g1b58 false-close shape)" || ok "R5 AC3: left r5s alone (stranded — branch found but not merged)"
+  grep -q 'r5s' "$NOTIFY_LOG" 2>/dev/null     && ok "R5 AC3: stranded finding (r5s) was escalated via notify_fail" || bad "R5 AC3: stranded finding (r5s) was NOT notified — silent false-close risk"
+  grep -q 'r5u'                               "$ACT" && bad "R5 AC3: TOUCHED r5u (no branch found at all — must never stamp story:done)" || ok "R5 AC3: left r5u alone (unresolved — no branch found)"
+  grep -q 'r5u' "$NOTIFY_LOG" 2>/dev/null     && bad "R5 AC3: notified for r5u (unresolved/no-branch is the expected common case, not push-worthy — only 'stranded' should notify)" || ok "R5 AC3: did not notify for r5u (unresolved stays log-only, avoiding notification spam)"
+  grep -q 'r9dot.1'                           "$ACT" && bad "R5 AC3 dot-escaping regression: r9dot.1 got touched via its UNMERGED real branch leaking a match from the MERGED decoy (fix/r9dotX1-decoy) — dot was treated as ERE any-char instead of literal" || ok "R5 AC3: dot-escaping correct — r9dot.1 (unmerged real branch) did not pick up the merged decoy's verdict"
+  grep -q 'label add r5mb story:done'         "$ACT" && ok "R5 AC3 multi-branch (real shape: ga-26df had 3 attempt branches): an UNMERGED first candidate does not short-circuit — a LATER merged candidate still stamps story:done" || bad "R5 AC3 multi-branch: r5mb (2 candidates, 2nd merged) did NOT get story:done — early-unmerged wrongly won"
+  grep -q 'r5mm'                               "$ACT" && bad "R5 AC3 mixed-signal false-positive (real shape: wa-1t8x9/wa-tkvwb — the winning branch was deleted after merge, an unrelated abandoned attempt lingers): r5mm was TOUCHED — a missing+unmerged mix must never be confident enough for 'stranded'" || ok "R5 AC3 mixed-signal: r5mm (1 missing candidate + 1 unmerged candidate) left alone — correctly downgraded to unresolved, not falsely 'stranded'"
+  grep -q 'r5mm' "$NOTIFY_LOG" 2>/dev/null     && bad "R5 AC3 mixed-signal: notified for r5mm — 'unresolved' must stay log-only like r5u, not escalate on an inconclusive mix" || ok "R5 AC3 mixed-signal: did not notify for r5mm (correctly treated as unresolved, not stranded)"
+
   grep -q 'r5-locked'                         "$ACT" && bad "imp10: touched a lifecycle-locked bead (must be skipped)" || ok "imp10: skipped the advisory-locked bead (r5-locked)"
   grep -q 'r5-cancel'                         "$ACT" && bad "R5: TOUCHED a story:cancelled closed ctx:ready bead (must stay cancelled)" || ok "R5: left story:cancelled bead alone"
   grep -q 'label remove r5-byreason ctx:ready'    "$ACT" && ok "R5 (ga-hn34): closed+ctx:ready w/ cancellation close_reason → still stripped ctx:ready" || bad "R5 (ga-hn34) did not strip ctx:ready on r5-byreason"
