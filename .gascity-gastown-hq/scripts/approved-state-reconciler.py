@@ -109,6 +109,11 @@ BD_TIMEOUT = int(os.environ.get("ARC_BD_TIMEOUT", "25"))
 PILOT_ALIVE_WINDOW_MIN = int(os.environ.get("ARC_PILOT_ALIVE_WINDOW_MIN", "20"))
 LOG_TAIL = int(os.environ.get("ARC_LOG_TAIL", "2000"))
 FLOW_AUTHORITY_TTL_SEC = int(os.environ.get("ARC_FLOW_AUTHORITY_TTL_SEC", "3600"))
+# Marker label stamped on a bead after its first Step 1b keyword-flag comment. Idempotency
+# gate (ga-1iz2e/AC1): a bead that already carries this label is skipped — comment once,
+# then wait for a human/refino to add the real routing label. No reset path needed: once
+# the real label lands, _classify() routes the bead away before Step 1b is reached again.
+FLAG_REVIEW_LABEL = os.environ.get("ARC_FLAG_REVIEW_LABEL", "needs-label-review")
 
 # ── on-device detection patterns ──────────────────────────────────────────────
 # Each matches an EXPLICIT on-device signal in bead title/body/AC.
@@ -984,32 +989,35 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids):
         # §4 HARD RAIL: if _classify returned (None,None) but keywords match,
         # emit a low-priority flag so a human/refino can add the real label.
         # The bead STAYS story:approved. This is the wa-yez60 regression fix.
+        #
+        # Idempotency (ga-1iz2e/AC1): gate on FLAG_REVIEW_LABEL presence, not a time
+        # cooldown — the old ALARM_COOLDOWN_SEC gate re-fired forever (nothing in this
+        # loop ever applied the label it asked a human for), producing +60 identical
+        # comments in 4h across 5 beads before this fix.
         kw_flags = _keyword_flags(bead)
-        if kw_flags:
-            last_flagged = state.get("flagged", {}).get(bead_id, 0.0)
-            if now - last_flagged >= ALARM_COOLDOWN_SEC:
-                for cat, kw in kw_flags:
-                    _log("  %s: keyword flag [%s] %r — no routing label; "
-                         "bead stays approved, flag emitted for human review" % (
-                         bead_id, cat, kw))
-                if not DRY_RUN:
-                    flag_note = (
-                        "approved-state-reconciler: bead parece %s (keyword %r) mas sem "
-                        "label explícito. Um humano/refino deve confirmar e adicionar o label "
-                        "correto. Bead permanece story:approved." % (
-                        kw_flags[0][0], kw_flags[0][1]))
-                    _do_comment_add(rig_root, bead_id, flag_note)
-                    _arc_ledger("flow-ledger", {
-                        "ts": datetime.datetime.now(
-                            datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "source_daemon": "approved-state-reconciler",
-                        "stage": "keyword-flag",
-                        "bead_id": bead_id,
-                        "flags": [{"cat": c, "kw": k} for c, k in kw_flags],
-                        "note": "keyword match without routing label — flag emitted, "
-                                "bead stays approved",
-                    }, fail_open=True)
-                    state.setdefault("flagged", {})[bead_id] = now
+        if kw_flags and FLAG_REVIEW_LABEL not in labels:
+            for cat, kw in kw_flags:
+                _log("  %s: keyword flag [%s] %r — no routing label; "
+                     "bead stays approved, flag emitted for human review" % (
+                     bead_id, cat, kw))
+            if not DRY_RUN:
+                flag_note = (
+                    "approved-state-reconciler: bead parece %s (keyword %r) mas sem "
+                    "label explícito. Um humano/refino deve confirmar e adicionar o label "
+                    "correto. Bead permanece story:approved." % (
+                    kw_flags[0][0], kw_flags[0][1]))
+                _do_comment_add(rig_root, bead_id, flag_note)
+                _do_label_add(rig_root, bead_id, FLAG_REVIEW_LABEL)
+                _arc_ledger("flow-ledger", {
+                    "ts": datetime.datetime.now(
+                        datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "source_daemon": "approved-state-reconciler",
+                    "stage": "keyword-flag",
+                    "bead_id": bead_id,
+                    "flags": [{"cat": c, "kw": k} for c, k in kw_flags],
+                    "note": "keyword match without routing label — flag emitted, "
+                            "bead stays approved",
+                }, fail_open=True)
 
         # ── Step 2: no explicit signal → assumed buildable ─────────────────
         # Safety: we NEVER route here. Only flow-or-alarm.
@@ -1297,6 +1305,13 @@ def _selftest():
                 immediately even well inside the current backoff window
       (hh)      AC3 (ga-an81u): legacy float-only 'alarmed' state (pre-AC3 format)
                 migrates cleanly — treated as count=1, no crash in _prune_state
+      (ii)      AC1 (ga-1iz2e): keyword flag with no marker label yet → comments
+                ONCE and stamps FLAG_REVIEW_LABEL; bead still NOT routed, still
+                story:approved (Step 1b safety rail unchanged)
+      (jj)      AC1/AC3 (ga-1iz2e): keyword flag with FLAG_REVIEW_LABEL already
+                present (as bd would report it after (ii)'s label-add landed) →
+                ZERO additional comments — the old flat 30min cooldown would have
+                refired here; this is the +60-comments-in-4h regression guard
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
@@ -2124,6 +2139,54 @@ def _selftest():
     else:
         _bad("(hh)", "no_crash=%s suppressed_legacy=%s legacy_repeat_subj=%r" % (
              no_crash, suppressed_legacy, legacy_repeat_subj))
+
+    # ── (ii) AC1 (ga-1iz2e): keyword flag, no marker label yet → comment once, ──
+    #        stamp FLAG_REVIEW_LABEL; bead still not routed, still story:approved
+    print("\nScenario (ii): keyword flag, no marker label → comments once, stamps "
+          "FLAG_REVIEW_LABEL")
+    _bd_approved = lambda root: [
+        _make_bead("hq-041", title="feat: warming chip via UIAutomator")]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_ii = _reset()
+    run_cycle(NOW, st_ii)
+    # NOTE: the stub ignores `root`, so run_cycle's 3-rig loop sees the same fake bead
+    # 3x in one call — like every other first-occurrence scenario in this suite (e.g.
+    # (s)'s `noted_s = any(...)`), assert PRESENCE, not exact count.
+    commented_ii = any(bid == "hq-041" for bid, _ in comments)
+    labeled_ii = ("hq-041", FLAG_REVIEW_LABEL) in label_adds
+    not_removed_ii = ("hq-041", "story:approved") not in label_removes
+    if commented_ii and labeled_ii and not_removed_ii:
+        _ok("(ii): first sighting → flag comment emitted, FLAG_REVIEW_LABEL stamped, "
+            "story:approved kept")
+    else:
+        _bad("(ii)", "commented=%s labeled=%s not_removed=%s" % (
+             commented_ii, labeled_ii, not_removed_ii))
+
+    # ── (jj) AC1/AC3 (ga-1iz2e): marker label already present, PAST the old ──
+    #        30min cooldown window → zero repeat comments. The offset matters: at
+    #        only +60s even the OLD buggy cooldown-based gate would stay quiet, so
+    #        this must cross ALARM_COOLDOWN_SEC to actually distinguish old from
+    #        new behavior (verified: this scenario FAILS against the pre-fix
+    #        cooldown-based gate when run at this offset, passes at +60s either
+    #        way — the +60s case alone would be a vacuous regression guard).
+    #        story:in-flight neutralizes the unrelated Step 2 starve-alarm path
+    #        (crossing STARVE_MIN=20min too) so only Step 1b's behavior is under
+    #        test here.
+    print("\nScenario (jj): keyword flag, FLAG_REVIEW_LABEL already present, "
+          "past old 30min cooldown → zero repeat comments")
+    _bd_approved = lambda root: [
+        _make_bead("hq-041", title="feat: warming chip via UIAutomator",
+                   labels=["story:approved", "story:in-flight", FLAG_REVIEW_LABEL])]
+    _reset_captures()
+    run_cycle(NOW + ALARM_COOLDOWN_SEC + 100, st_ii)   # same state dict — next cycle
+    comments_jj = [text for bid, text in comments if bid == "hq-041"]
+    labeled_jj = ("hq-041", FLAG_REVIEW_LABEL) in label_adds
+    if len(comments_jj) == 0 and not labeled_jj:
+        _ok("(jj): marker label present → zero additional comments, zero "
+            "additional label-adds even past the old 30min cooldown (converges — "
+            "was: repeats every 30min forever)")
+    else:
+        _bad("(jj)", "comments=%s labeled=%s" % (comments_jj, labeled_jj))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
