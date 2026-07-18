@@ -25,12 +25,45 @@
 # reopens such a bead the instant it crosses the 30min staleness threshold — a SILENT
 # status/assignee revert on a bead that is still actively/pending gated (confirmed live on
 # wa-bkjy7 2026-07-11, and via quality-gate-guard.log on ga-ibz0's original wa-ntakm/wa-2mxsb).
+#
+# ga-6plfv/ga-u8e55 (2026-07-18): R4 and R5 were surgically disabled 2026-07-09
+# (MAYOR-DISABLED markers) after R4 cleared LIVE builders' assignees (duplicate
+# work) and R5 stamped story:done on active, not-actually-done beads. The stated
+# re-enable condition was DUAL: (a) wa-muesb merges, AND (b) R4/R5 gain a real
+# session-liveness/merge check. The script was reverted 2026-07-17 with (a) true
+# but (b) never implemented — R4 ran for a full day clearing live crews' assignees
+# every ~15min sweep (102 firings) before this fix landed. Lesson operationalized
+# here, not just noted: (b) is now actual code (_provably_dead(), R4's live-assignee
+# selftest fixtures below) rather than a bead comment a future re-enable could miss
+# — the check IS the precondition, it can't silently regress without failing
+# --selftest. R5 gained a narrower, zero-git-risk partial fix (AC3: skip beads
+# still carrying gate:failed/gate:needs-fix — the exact wa-g1b58 failure shape);
+# full git-ancestry merge verification was assessed and deferred (see follow-up
+# bead) because this codebase's rig-repo topology is genuinely inconsistent
+# across HQ/whatsapp_automation/property_scrapers (see rig-repo-topology in
+# project memory) and a rushed generic implementation risks a NEW false-verdict
+# class, not just leaving the known one unfixed.
+#
+# KNOWN GAP left open by ga-6plfv (AC2, documented per that bug's own "or
+# documented" clause rather than built): queued-but-not-yet-started work (the
+# 2nd/3rd/4th bead in a crew's queue) has no lifecycle state that survives BOTH
+# R4 and inflight-reclaim-guard.py. Without story:in-flight, R4 clears the
+# assignee in ~1 sweep (now gated on liveness, but a live crew's QUEUED-not-yet-
+# started bead has no in-flight signal to protect it either way). With
+# story:in-flight, inflight-reclaim-guard.py's RECLAIM_TTL takes the bead back
+# after ~25min of no branch progress. A crew can only "hold" the ONE bead it is
+# actively building right now — there is no representable "mine, next in queue"
+# state. Fixing this needs coordinated change across this janitor AND
+# inflight-reclaim-guard.py AND however Pilot enqueues multi-bead dispatches to
+# one crew — out of scope for a single dispatch; a design bead should own it if/
+# when queued-dispatch becomes load-bearing.
 set -uo pipefail
 
 LCJ_STORES="${LCJ_STORES:-/Users/athos/gt/.gascity-gastown-hq /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers}"
 LCJ_DRY_RUN="${LCJ_DRY_RUN:-0}"
 LCJ_ENABLED="${LCJ_ENABLED:-1}"
 BD="${LCJ_BD:-bd}"
+GC="${LCJ_GC:-gc}"
 LOG="${LCJ_LOG:-/Users/athos/gt/.gascity-gastown-hq/.gc/logs/lifecycle-coherence-janitor.log}"
 LCJ_NOTIFY="${LCJ_NOTIFY:-/Users/athos/.local/bin/notify}"
 # ga-hn34 (2026-07-14): cancellation/obsolescence keyword regex tested against a closed
@@ -160,6 +193,66 @@ $(printf '%s' "$resolved" | jq -r '
   printf ' %s ' "$(printf '%s' "$ids" | tr '\n' ' ')"
 }
 
+# ── Session-liveness for R4 (ga-6plfv/ga-u8e55, 2026-07-18) ──────────────────
+# R4 must only clear an assignee when the owning session is PROVABLY dead — not
+# merely "doesn't carry an in-flight label" (the bug: R4 was re-enabled
+# 2026-07-17 without ever gaining this check, so it ripped live crews'
+# assignees every ~15min sweep; see the file header note above and ga-6plfv for
+# the full incident). Reuses the canonical claimant_provably_dead() from
+# inflight-reclaim-guard.py, via its reclaim_liveness.py re-export (already the
+# pattern dog-pool-preflight-reclaim.py uses) — instead of writing a FIFTH
+# independent liveness check. This codebase already has four
+# (gate-recovery-watchdog.py, quorum-convergence-watchdog.py,
+# gatefix-deadworker-recovery.sh, and inflight-reclaim-guard.py's own rails),
+# each checking a different subset of identifier fields / dead-state lists and
+# silently disagreeing with each other — adding a bash-native fifth here would
+# make that worse, not better.
+#
+# "Provably dead" (not merely "not proven live") is deliberately the STRICTER
+# predicate — a session that's present but stale/frozen, or in an unrecognized
+# state, is NOT provably dead, so R4 leaves it alone (fail-safe). This matches
+# AC1's own wording ("sessao dona... comprovadamente MORTA") and R4's shape: it
+# has no hysteresis/TTL (fires every sweep, unlike inflight-reclaim-guard.py's
+# RECLAIM_TTL-gated reclaim), so only a CERTAIN verdict should act immediately.
+# Side benefit: claimant_provably_dead()'s is_coordinator() check also protects
+# "deacon" assignees, a gap R4's own jq prefilter never closed (it only ever
+# excluded the literal "mayor").
+#
+# Sessions are fetched ONCE per sweep (mirrors _gate_active_beads' "computed
+# once" pattern above) — one `gc session list` call regardless of how many
+# candidate beads R4 walks across all stores.
+LCJ_RECLAIM_LIB="${LCJ_RECLAIM_LIB:-/Users/athos/gt/.gascity-gastown-hq/scripts}"
+_SESSIONS_JSON=""
+_sessions_json() {
+  [ -n "$_SESSIONS_JSON" ] && { printf '%s' "$_SESSIONS_JSON"; return 0; }
+  _SESSIONS_JSON=$("$GC" session list --json 2>/dev/null)
+  [ -n "$_SESSIONS_JSON" ] || _SESSIONS_JSON="{}"
+  printf '%s' "$_SESSIONS_JSON"
+}
+# _provably_dead <assignee> → return 0 if PROVABLY dead, 1 otherwise. Fail-safe:
+# an empty assignee, an unreadable session roster, or a python/import failure
+# all resolve to "not provably dead" (1) — R4 leaves the bead alone rather than
+# risk clearing a live claim on a diagnostic hiccup.
+_provably_dead() {
+  local assignee="$1"
+  [ -n "$assignee" ] || return 1
+  _sessions_json | python3 -c '
+import sys, json
+sys.path.insert(0, "'"$LCJ_RECLAIM_LIB"'")
+try:
+    import reclaim_liveness as rl
+except Exception:
+    sys.exit(1)
+assignee = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sessions = d.get("sessions", []) if isinstance(d, dict) else (d or [])
+sys.exit(0 if rl.claimant_provably_dead(assignee, sessions) else 1)
+' "$assignee" 2>/dev/null
+}
+
 run_sweep() {
   if [ "$LCJ_ENABLED" != "1" ]; then log "disabled (LCJ_ENABLED!=1)"; return 0; fi
   # imp10: sweep-level mutual exclusion — only one janitor sweep at a time.
@@ -253,17 +346,21 @@ run_sweep() {
     # optional colon-suffix instead, so both forms are covered.
     _r4_seen=" "
     for _rlbl in story:approved ctx:ready; do
-      for id in $("$BD" -C "$store" list -l "$_rlbl" --status open --json -n 0 2>/dev/null \
+      for _pair in $("$BD" -C "$store" list -l "$_rlbl" --status open --json -n 0 2>/dev/null \
                   | jq -r '.[] | select((.assignee // "") != "" and (.assignee // "") != "mayor")
                           | ([.labels[]?]) as $l
                           | select(($l|index("story:in-flight"))==null and ($l|index("exec:manual"))==null and (($l|any(test("^gate:needs-human(:.*)?$")))|not) and ($l|index("story:blocked"))==null)
-                          | .id' 2>/dev/null); do
-        [ -n "$id" ] || continue
+                          | .id + "|" + .assignee' 2>/dev/null); do
+        [ -n "$_pair" ] || continue
+        id="${_pair%%|*}"; _r4_assignee="${_pair#*|}"
         case "$_r4_seen" in *" $id "*) continue ;; esac
         _r4_seen="$_r4_seen$id "
         _bead_locked "$id" && { log "R4 skip-locked (imp10): $id — advisory lock active"; continue; }
+        if ! _provably_dead "$_r4_assignee"; then
+          log "R4 skip-live-assignee (ga-6plfv): $id ($(basename "$store")) — assignee '$_r4_assignee' not provably dead, protected"; continue
+        fi
         _unassign "$store" "$id"; _strip "$store" "$id" pilot:dispatched
-        log "R4 ready-stale-assignee: $id ($(basename "$store")) — cleared phantom assignee"; n=$((n+1))
+        log "R4 ready-stale-assignee: $id ($(basename "$store")) — cleared assignee ($_r4_assignee, provably dead)"; n=$((n+1))
       done
     done
     # R6 (imp19 pilot:held expiry): pilot:held + pilot:held-until:<past-epoch> → strip both
@@ -299,6 +396,7 @@ run_sweep() {
     for id in $(printf '%s' "$_r5_list" | jq -r --arg re "$LCJ_CANCEL_RE" \
                 '.[] | select(([.labels[]?]|index("story:cancelled"))|not)
                      | select(((.close_reason // "") | test($re; "i")) | not)
+                     | select(([.labels[]?]|any(test("^gate:failed(:.*)?$|^gate:needs-fix(:.*)?$")))|not)
                      | .id' 2>/dev/null); do
       [ -n "$id" ] || continue
       _bead_locked "$id" && { log "R5 skip-locked (imp10): $id — advisory lock active"; continue; }
@@ -308,6 +406,23 @@ run_sweep() {
           >/dev/null 2>&1; then continue; fi
       _strip "$store" "$id" ctx:ready; _strip "$store" "$id" pilot:dispatched; _add "$store" "$id" story:done
       log "R5 ctx-ready-vestigial: $id ($(basename "$store")) — stripped ctx:ready, set story:done"; n=$((n+1))
+    done
+    # ga-6plfv (AC3, partial/zero-git-risk subset — full merge-ancestry
+    # verification deferred, see file header): a closed+ctx:ready bead that
+    # STILL carries gate:failed/gate:needs-fix is definitely not "done" — R5's
+    # default-to-story:done assumption is exactly wrong here (confirmed live:
+    # wa-g1b58, deliberately parked/hard-stopped with gate:failed+gate:needs-fix
+    # still attached, got story:done stamped anyway 2026-07-17). Log-only, no
+    # notify — this file's convention reserves notify for genuine anomalies, and
+    # a backlog of these would otherwise spam every sweep; left for human/Mayor
+    # triage (story:done vs story:cancelled) via the follow-up audit bead.
+    for id in $(printf '%s' "$_r5_list" | jq -r --arg re "$LCJ_CANCEL_RE" \
+                '.[] | select(([.labels[]?]|index("story:cancelled"))|not)
+                     | select(((.close_reason // "") | test($re; "i")) | not)
+                     | select([.labels[]?]|any(test("^gate:failed(:.*)?$|^gate:needs-fix(:.*)?$")))
+                     | .id' 2>/dev/null); do
+      [ -n "$id" ] || continue
+      log "R5 skip-gate-failed (ga-6plfv AC3): $id ($(basename "$store")) — closed+ctx:ready but still carries gate:failed/needs-fix; NOT stamping story:done (not proven delivered), needs human/Mayor triage"
     done
     # ga-hn34: close_reason carries a cancellation/obsolescence keyword but the
     # story:cancelled label was never applied — land on story:cancelled instead of the
@@ -493,8 +608,26 @@ if [ "${1:-}" = "--selftest" ]; then
   # r4-human-bare: same shape but carries the BARE gate:needs-human label (no suffix) — must ALSO be
   #           EXCLUDED (regression for gate_run=ga-wisp-05leh8: a colon-only test("^gate:needs-human:")
   #           traded one gap for another, missing the bare form production code actually writes)
+  # ga-6plfv/ga-u8e55 (2026-07-18) R4 liveness fixtures — regression coverage for the incident
+  # itself: R4 was re-enabled 2026-07-17 with NO session-liveness check and ripped live crews'
+  # assignees every sweep. Fake session roster (see the "gc" shim below) has exactly two entries:
+  # "crew-live" (state:active) and "crew-ambiguous" (an unrecognized state string). "mila-wa" (used
+  # by r4-asg/r4-human/r4-human-bare above) deliberately does NOT appear in that roster, so it stays
+  # provably-dead and those fixtures' existing cleared/excluded assertions are unchanged by this fix.
+  # r4-live: same shape as r4-asg but assignee="crew-live" (a LIVE session) — R4 must NOT clear it.
+  #          This is the direct regression test: this fixture would have caught ga-6plfv before it
+  #          shipped (assignee present, no protecting label, but liveness says "leave it alone").
+  # r4-ambiguous: assignee="crew-ambiguous" (a session that exists but whose state matches neither
+  #          the live nor the dead vocabulary) — R4 must NOT clear it either (fail-safe: unknown is
+  #          not proof of death, matches claimant_provably_dead()'s own documented contract).
+  # r4-deacon: assignee="deacon" — R4's own jq prefilter only ever excluded the literal "mayor", not
+  #          "deacon"; the liveness check's is_coordinator() closes that gap as a side effect — must
+  #          NOT be cleared regardless of what (if anything) "deacon" resolves to in the roster.
   # r5: closed ctx:ready without story:done (R5 target)
   # r5-locked: closed ctx:ready with an advisory lock (imp10 — must be SKIPPED by R5)
+  # r5-gate-failed (ga-6plfv AC3, partial fix): closed+ctx:ready but STILL carries gate:failed +
+  #          gate:needs-fix — must NOT get story:done stamped (wa-g1b58's exact live shape: parked/
+  #          hard-stopped, not delivered). Log-only skip, no story:cancelled/story:done mutation.
   # R8 fixtures (ga-ipm4, park+arm invariant): r8-parked-auto (exec:auto+pool:refused:<reason>),
   # r8-parked-auto2 (exec:auto+a DIFFERENT pool:refused:<reason> suffix — proves prefix
   # genericity), r8-parked-ready (ctx:ready+needs-human), r8-parked-both (BOTH arm labels+
@@ -528,9 +661,9 @@ case "\$a" in
   *"list -l story:approved --status closed"*)   echo '[{"id":"ca-1"},{"id":"ca-cancel","labels":["story:cancelled","story:approved"]},{"id":"ca-byreason","close_reason":"CANCELLED — requirements changed, replaced by ga-xyz"}]' ;;
   *"list -l story:in-flight --status blocked"*) echo '[{"id":"bl-1"}]' ;;
   *"list --status in_progress"*)                echo '[{"id":"ip-noasg","assignee":"","updated_at":"2020-01-01T00:00:00Z"},{"id":"ip-fresh","assignee":"","updated_at":"'"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"'"},{"id":"ip-asg","assignee":"mila-wa"},{"id":"ip-gate-active","assignee":"","updated_at":"2020-01-01T00:00:00Z"}]' ;;
-  *"list -l story:approved --status open"*)     echo '[{"id":"r4-asg","assignee":"mila-wa","labels":["story:approved"]},{"id":"r4-human","assignee":"mila-wa","labels":["story:approved","gate:needs-human:foo"]},{"id":"r4-human-bare","assignee":"mila-wa","labels":["story:approved","gate:needs-human"]}]' ;;
+  *"list -l story:approved --status open"*)     echo '[{"id":"r4-asg","assignee":"mila-wa","labels":["story:approved"]},{"id":"r4-human","assignee":"mila-wa","labels":["story:approved","gate:needs-human:foo"]},{"id":"r4-human-bare","assignee":"mila-wa","labels":["story:approved","gate:needs-human"]},{"id":"r4-live","assignee":"crew-live","labels":["story:approved"]},{"id":"r4-ambiguous","assignee":"crew-ambiguous","labels":["story:approved"]},{"id":"r4-deacon","assignee":"deacon","labels":["story:approved"]}]' ;;
   *"list -l ctx:ready --status open"*)          echo '[]' ;;
-  *"list -l ctx:ready --status closed"*)        echo '[{"id":"r5","labels":["ctx:ready"]},{"id":"r5-locked","labels":["ctx:ready"]},{"id":"r5-cancel","labels":["ctx:ready","story:cancelled"]},{"id":"r5-byreason","labels":["ctx:ready"],"close_reason":"discontinued: replaced by wa-xyz redesign"}]' ;;
+  *"list -l ctx:ready --status closed"*)        echo '[{"id":"r5","labels":["ctx:ready"]},{"id":"r5-locked","labels":["ctx:ready"]},{"id":"r5-cancel","labels":["ctx:ready","story:cancelled"]},{"id":"r5-byreason","labels":["ctx:ready"],"close_reason":"discontinued: replaced by wa-xyz redesign"},{"id":"r5-gate-failed","labels":["ctx:ready","gate:failed","gate:needs-fix"]}]' ;;
   *"show r5 "*|*"show r5-locked "*)             echo '[{"id":"r5","labels":["ctx:ready"]}]' ;;
   # R6 (imp19): r6-exp has an expired held-until; r6-noexp has pilot:held but no expiry
   *"list -l pilot:held"*)                       echo '[{"id":"r6-exp","labels":["pilot:held","pilot:held-until:1000000"]},{"id":"r6-noexp","labels":["pilot:held"]}]' ;;
@@ -597,8 +730,26 @@ SHIM
 echo "\$*" >> "${TMP}/notify.log"
 NOTIFYSHIM
   chmod +x "$TMP/notify"
+  # ga-6plfv: fake session roster for R4's liveness check. "crew-live" is active
+  # (must protect r4-live), "crew-ambiguous" carries a state in neither the live
+  # nor dead vocabulary (must ALSO protect r4-ambiguous — fail-safe). "mila-wa"
+  # and "deacon" deliberately do NOT appear here: mila-wa must still resolve
+  # provably-dead (absent from the roster, matching the pre-fix r4-asg/r4-human/
+  # r4-human-bare assertions below), and deacon must be protected regardless of
+  # roster contents (is_coordinator() short-circuits before any session lookup).
+  # _provably_dead() runs the REAL reclaim_liveness.py/claimant_provably_dead()
+  # against this fake roster — only `gc session list` itself is shimmed, so the
+  # selftest exercises the actual canonical liveness logic, not a re-mocked copy.
+  cat > "$TMP/gc" <<'GCSHIM'
+#!/usr/bin/env bash
+case "$*" in
+  *"session list --json"*) echo '{"sessions":[{"id":"sess-1","name":"crew-live","session_name":"crew-live","state":"active","closed":false},{"id":"sess-2","name":"crew-ambiguous","session_name":"crew-ambiguous","state":"paused-unknown-state","closed":false}]}' ;;
+  *) echo '{}' ;;
+esac
+GCSHIM
+  chmod +x "$TMP/gc"
   # Reassign script vars DIRECTLY (top-level reads happen at LOAD, before this block).
-  BD="$TMP/bd"; LCJ_STORES="$TMP"; LOG="$TMP/log"; LCJ_DRY_RUN=0; LCJ_ENABLED=1
+  BD="$TMP/bd"; GC="$TMP/gc"; LCJ_STORES="$TMP"; LOG="$TMP/log"; LCJ_DRY_RUN=0; LCJ_ENABLED=1
   LCJ_NOTIFY="$TMP/notify"
   LCJ_GATE_CITY="$TMP"  # ga-ibz0: route _gate_active_beads() through the same shim
   LIFECYCLE_LOCK_DIR="$TMP/.lifecycle-lock"
@@ -626,6 +777,10 @@ NOTIFYSHIM
   grep -q 'update r4-asg --assignee'          "$ACT" && ok "R4: open story:approved with stale assignee → cleared (phantom worker)" || bad "R4 did not clear stale assignee"
   grep -q 'update r4-human --assignee'        "$ACT" && bad "R4: cleared assignee on a gate:needs-human:foo bead (must be excluded — human braked for review)" || ok "R4: left gate:needs-human:foo bead's assignee alone (colon-suffixed exclusion works)"
   grep -q 'update r4-human-bare --assignee'   "$ACT" && bad "R4 bare-label bug (gate_run=ga-wisp-05leh8): cleared assignee on a BARE gate:needs-human bead (production code writes this form with no suffix)" || ok "R4: left bare gate:needs-human bead's assignee alone (bare-label exclusion works)"
+  grep -q 'update r4-live --assignee'         "$ACT" && bad "R4 REGRESSION (ga-6plfv): cleared the assignee of a PROVABLY-LIVE session — this is the exact incident that ran 102 times in production before this fix" || ok "R4 (ga-6plfv): left a live session's assignee alone (liveness check works)"
+  grep -q 'update r4-ambiguous --assignee'    "$ACT" && bad "R4 (ga-6plfv): cleared the assignee of a session in an UNRECOGNIZED state — unknown must fail safe as NOT provably dead" || ok "R4 (ga-6plfv): left an ambiguous-state session's assignee alone (fail-safe on unknown state)"
+  grep -q 'update r4-deacon --assignee'       "$ACT" && bad "R4 (ga-6plfv): cleared assignee=deacon — coordinator exclusion gap the liveness check was supposed to close" || ok "R4 (ga-6plfv): left assignee=deacon alone (is_coordinator() protects it, same convention as assignee=mayor)"
+  grep -q 'update r4-asg --assignee'          "$ACT" && ok "R4 (ga-6plfv): mila-wa is absent from the session roster → still provably dead → still cleared (pre-fix behavior preserved for genuine phantoms)" || bad "R4 (ga-6plfv): regressed the genuinely-phantom case — mila-wa should still be cleared"
   grep -q 'label remove r6-exp pilot:held'     "$ACT" && ok "R6 (imp19): expired pilot:held-until → stripped pilot:held" || bad "R6 did not strip expired pilot:held"
   grep -q 'label remove r6-exp pilot:held-until:1000000' "$ACT" && ok "R6 (imp19): stripped the expiry label" || bad "R6 did not strip expiry label"
   grep -q 'label add r6-noexp pilot:held-until:' "$ACT" && ok "R6 (imp19): pilot:held with no expiry → stamped default 24h expiry" || bad "R6 did not stamp default expiry"
@@ -636,6 +791,7 @@ NOTIFYSHIM
   grep -q 'label remove r5-byreason ctx:ready'    "$ACT" && ok "R5 (ga-hn34): closed+ctx:ready w/ cancellation close_reason → still stripped ctx:ready" || bad "R5 (ga-hn34) did not strip ctx:ready on r5-byreason"
   grep -q 'label add r5-byreason story:cancelled' "$ACT" && ok "R5 (ga-hn34): close_reason matched a cancellation keyword → set story:cancelled instead of story:done" || bad "R5 (ga-hn34) did not set story:cancelled on r5-byreason"
   grep -q 'label add r5-byreason story:done'      "$ACT" && bad "R5 (ga-hn34): mislabeled a cancelled-by-close_reason bead story:done — the exact silent mislabeling this fix exists to prevent" || ok "R5 (ga-hn34): did not mislabel r5-byreason story:done"
+  grep -q 'r5-gate-failed'                        "$ACT" && bad "R5 (ga-6plfv AC3): mutated a closed+ctx:ready bead that still carries gate:failed/gate:needs-fix — wa-g1b58's exact failure shape (parked/hard-stopped, not delivered)" || ok "R5 (ga-6plfv AC3): left a gate:failed/needs-fix bead alone (no story:done stamped on unproven work)"
   grep -q 'dolt commit'                       "$ACT" && ok "commits the Dolt working set (auto-commit off → else strips invisible to painel)" || bad "did NOT commit → normalization invisible to readers"
 
   # R7 (wa-muesb — historical recurrences, pattern coverage, and the two gate-flagged bugs)
