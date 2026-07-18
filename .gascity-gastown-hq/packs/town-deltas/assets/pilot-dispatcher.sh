@@ -2901,6 +2901,87 @@ _neverstarted_recover_db() {
   done
 }
 
+# _mayor_deferred_hold_db <db_path> <now_epoch> — scan one DB for stories whose
+# sling task was refused specifically because a coordinator (Mayor) explicitly
+# deferred the work in a comment, and stamp a timed pilot:held so
+# _filter_candidates (which already respects pilot:held/pilot:held-until — see
+# the ga-lfvs6/imp20 block below) stops re-dispatching it.
+#
+# ga-4zqwm: a coordinator's deferral is expressed only as prose in a bd
+# comment — no queryable label lands on the STORY itself. When Pilot
+# re-dispatches anyway, the refusing worker's pool:refused:mayor-deferred
+# label lands on the throwaway SLING bead (gc sling's wrapper: "fix bug
+# $STORY_ID: ..." / "build story $STORY_ID: ..."), never on the story —
+# so _filter_candidates's own pool:refused check (which reads only the
+# CANDIDATE's own labels, line ~1326) never sees it, and the story is
+# re-dispatched again on the very next sweep. Concretely: ga-dp15j (Mayor
+# deferred it 15:23) got dispatched at 23:32 anyway, sling ga-u5y7y was
+# refused with pool:refused:mayor-deferred, and ga-dp15j itself remained
+# completely unlabeled/re-dispatchable. Mirrors the sling→story label
+# resolution _neverstarted_recover_db already does for gate:* (ga-d2jil) —
+# same shape, different label, same reason (a signal that lives on the
+# sling wrapper is invisible to any check that only reads the story).
+#
+# Hold duration is deliberately long (24h default, vs. the 1h capacity-defer
+# default at ga-lfvs6 below) because this is an open-ended "not now" from the
+# story's own decision-maker ("Pego quando a poeira assentar" — no fixed
+# timeframe was given), not a transient capacity gap expected to clear
+# within the hour. 24h stops the re-dispatch thrash (which had been
+# recurring roughly every 8h) without holding silently for so long that a
+# genuinely-forgotten deferral never resurfaces.
+MAYOR_DEFERRED_HOLD_SECS="${MAYOR_DEFERRED_HOLD_SECS:-86400}"
+
+_mayor_deferred_hold_db() {
+  local _db="$1" _now="$2"
+  local _json _count
+  _json=$(bd -C "$_db" list --json \
+    -l "story:in-flight" \
+    -l "pilot:dispatched" \
+    2>/dev/null || echo "[]")
+  _count=$(echo "$_json" | jq 'length' 2>/dev/null || echo "0")
+  [ "${_count:-0}" -le "0" ] 2>/dev/null && return 0
+
+  echo "$_json" | jq -c '.[]' | while IFS= read -r _bead; do
+    local _bid _labels _sling _sling_json _sling_labels
+    _bid=$(echo "$_bead" | jq -r '.id // ""' 2>/dev/null || echo "")
+    [ -z "$_bid" ] && continue
+
+    # Already held (by this check or any other) — nothing to do.
+    _labels=$(echo "$_bead" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
+    case ",$_labels," in *,pilot:held,*) continue ;; esac
+
+    _sling=$(echo "$_bead" | jq -r '.metadata["pilot.sling_bead"] // ""' 2>/dev/null || echo "")
+    if [ -z "$_sling" ]; then
+      continue
+    fi
+    if [ "$_sling" = "$_bid" ]; then
+      continue   # self-referential sling = routed-pool pattern (rig-native bead), not a
+                 # "fix bug $STORY_ID" sling wrapper — nothing to cross-reference.
+    fi
+
+    # Slings are always HQ-native for this dispatch shape (gc sling creates the
+    # wrapper in $GC_CITY regardless of which DB the story itself lives in).
+    _sling_json=$(bd -C "$GC_CITY" show "$_sling" --json 2>/dev/null \
+      | jq -c 'if type=="array" then .[0] else . end' 2>/dev/null || echo "null")
+    _sling_labels=$(echo "$_sling_json" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
+    case ",$_sling_labels," in
+      *,pool:refused:mayor-deferred,*) : ;;
+      *) continue ;;
+    esac
+
+    local _hold_until; _hold_until=$(( _now + MAYOR_DEFERRED_HOLD_SECS ))
+    # imp19 atomicity convention (same as ga-lfvs6/imp20 below): held-until FIRST
+    # so a mid-crash never leaves the bead as pilot:held-without-until (which
+    # _filter_candidates treats as skip-forever).
+    bd -C "$_db" label add "$_bid" "pilot:held-until:${_hold_until}" -q 2>/dev/null || true
+    bd -C "$_db" label add "$_bid" "pilot:held" -q 2>/dev/null || true
+    for _stale in $(bd -C "$_db" show "$_bid" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[] | select(startswith("pilot:held-until:"))' 2>/dev/null); do
+      [ "$_stale" = "pilot:held-until:${_hold_until}" ] || bd -C "$_db" label remove "$_bid" "$_stale" -q 2>/dev/null || true
+    done
+    log "ga-4zqwm: $_bid stamped pilot:held-until:${_hold_until} then pilot:held (${MAYOR_DEFERRED_HOLD_SECS}s — sling $_sling carries pool:refused:mayor-deferred) — Pilot stops re-dispatching until the hold expires or a human clears it"
+  done
+}
+
 if [ "${PILOT_NEVERSTARTED_MINUTES:-15}" != "0" ]; then
   _NS_NOW_EPOCH=$(date +%s)
   # Repos a crew branch could live in: the shared town root (HQ ga-* branches) +
@@ -2918,6 +2999,17 @@ if [ "${PILOT_NEVERSTARTED_MINUTES:-15}" != "0" ]; then
     [ -z "$_ns_rig" ] || [ ! -d "$_ns_rig" ] && continue
     _neverstarted_recover_db "$_ns_rig" "$_NS_NOW_EPOCH"
   done <<< "$_ns_rig_paths"
+fi
+
+if [ "${PILOT_MAYOR_DEFERRED_HOLD:-1}" != "0" ]; then
+  _MDH_NOW_EPOCH=$(date +%s)
+  _mayor_deferred_hold_db "$GC_CITY" "$_MDH_NOW_EPOCH"
+  _mdh_rig_paths=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
+    | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
+  while IFS= read -r _mdh_rig; do
+    [ -z "$_mdh_rig" ] || [ ! -d "$_mdh_rig" ] && continue
+    _mayor_deferred_hold_db "$_mdh_rig" "$_MDH_NOW_EPOCH"
+  done <<< "$_mdh_rig_paths"
 fi
 
 _NOW_EPOCH=$(date +%s)
