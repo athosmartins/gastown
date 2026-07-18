@@ -72,9 +72,15 @@ fi
 # ── 4. Drift-guard: REBASE_ATTEMPT ───────────────────────────────────────────
 # The pipeline reads rebase-attempt counter from marker labels.
 # Empty REBASE_ATTEMPT is safe: the `[ -z ]` guard immediately below sets it to 0.
-RA_BLOCK="$(awk '/REBASE_ATTEMPT=\$\(bd.*show.*MARKER_ID/{c=1} c{printf "%s ", $0} /head -1/{if(c){print ""; c=0}}' "$GATE" 2>/dev/null || true)"
+# ga-46g1: the inline call site this awk pattern used to match was refactored
+# (ga-6dp9 era) into a read_rebase_attempt() helper — the call site is now the
+# plain function call `REBASE_ATTEMPT=$(read_rebase_attempt "$MARKER_ID")`,
+# which contains no bd-show|jq pipeline at all, so the old pattern matched
+# nothing and this guard was vacuously failing. The pipeline itself now lives
+# inside the helper's body, so the guard inspects that instead.
+RA_BLOCK="$(sed -n '/^read_rebase_attempt() {/,/^}/p' "$GATE" 2>/dev/null || true)"
 if printf '%s' "$RA_BLOCK" | grep -q 'head -1 || true)'; then
-  ok "REBASE_ATTEMPT pipeline is guarded with '|| true'"
+  ok "REBASE_ATTEMPT pipeline (read_rebase_attempt helper) is guarded with '|| true'"
 else
   bad "REBASE_ATTEMPT pipeline is NOT guarded with '|| true' (silent-crash risk — ga-8fx5e)"
 fi
