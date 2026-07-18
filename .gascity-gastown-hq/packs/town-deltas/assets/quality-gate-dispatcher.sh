@@ -3989,6 +3989,49 @@ RIG=$(extract "rig")
 # its existing untrusted-marker-text posture unchanged).
 MARKER_AUTHOR=$(extract "author")
 
+# ga-9oxah: format-tolerant fallback — a marker submitted OUTSIDE /gate-done's
+# canonical description-writer (e.g. oracle-wa's shape: routing in LABELS —
+# branch:<val>, source-bead:<val>, bead-rig:<val> — with a human-prose
+# description) has no description routing block at all, so the extract()
+# calls above resolve empty. Pre-fix this errored (unresolvable rig),
+# gate-recovery-watchdog re-queued it, and it churned indefinitely,
+# head-of-line-blocking the whole gate. extract() itself stays
+# description-only and untouched (it's hoisted and reused by Phase C above
+# to parse a persisted run-bead description that has no comparable label
+# convention) — this fallback lives here, at the call site, mirroring the
+# existing Phase C title-recovery fallback (ga-eqjo) elsewhere in this file.
+# Strictly additive: only fires per-field when that field's description-based
+# extract() found nothing, so a canonical marker (routing already in the
+# description) is completely unaffected.
+# SELFTEST-EXTRACT label-fallback: BEGIN
+if [ -z "$BRANCH" ] || [ -z "$BEAD_ID" ] || [ -z "$RIG" ]; then
+  MARKER_LABEL_LIST=$(printf '%s\n' "$MARKER" | jq -r '(.labels // [])[]' 2>/dev/null || true)
+  label_fallback() {
+    # $1=label prefix incl. trailing colon (e.g. "branch:") — first matching
+    # label, prefix stripped. Colon anchors the boundary so "source-bead:"
+    # never matches an unrelated "source-bead-type:" label. `|| true`
+    # mirrors extract()'s own terminator (ga-7zjs1): under this script's
+    # set -euo pipefail, a plain no-match grep exits 1 and pipefail
+    # propagates it, aborting the WHOLE dispatcher on the very first marker
+    # whose labels don't happen to carry this particular prefix — the same
+    # class of bug this fix exists to clean up, not reintroduce one field over.
+    printf '%s\n' "$MARKER_LABEL_LIST" | grep -E "^$1" | head -1 | sed "s/^$1//" || true
+  }
+  if [ -z "$BRANCH" ]; then
+    LBL_VAL=$(label_fallback "branch:")
+    if [ -n "$LBL_VAL" ]; then BRANCH="$LBL_VAL"; log "  branch: description had none — resolved from label 'branch:$LBL_VAL'."; fi
+  fi
+  if [ -z "$BEAD_ID" ]; then
+    LBL_VAL=$(label_fallback "source-bead:")
+    if [ -n "$LBL_VAL" ]; then BEAD_ID="$LBL_VAL"; log "  bead_id: description had none — resolved from label 'source-bead:$LBL_VAL'."; fi
+  fi
+  if [ -z "$RIG" ]; then
+    LBL_VAL=$(label_fallback "bead-rig:")
+    if [ -n "$LBL_VAL" ]; then RIG="$LBL_VAL"; log "  rig: description had none — resolved from label 'bead-rig:$LBL_VAL'."; fi
+  fi
+fi
+# SELFTEST-EXTRACT label-fallback: END
+
 log "  branch=$BRANCH  bead_id=$BEAD_ID  rig=${RIG:-unknown}"
 
 # ── Step 2b: Schema-drift diagnostic for hand-created markers (ga-kefn) ──────
