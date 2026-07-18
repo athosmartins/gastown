@@ -216,6 +216,33 @@ eq "dispatcher calls it on BOTH terminal paths (PASS+FAIL)" \
    "$(grep -c 'supersede_sibling_runs "' "$DISPATCHER")" "2"
 grep -q 'set_gate_status "$sibling_id" "superseded"' "$DISPATCHER" && ok "dispatcher supersedes (not deletes) siblings (via set_gate_status)" || bad "dispatcher missing set_gate_status sibling supersede"
 
+# ── 4b. drift-guard: dispatcher retires its OWN gate-run on requeue (ga-fi1dh) ─
+# Bug ga-fi1dh: the quota-stop (ga-x3nmz) and dead-reviewer (ga-eqjo) requeue
+# branches inside gate_finalize_run() re-queue the MARKER and park the verdict
+# bead(s) as REQUEUED, but left $GATE_RUN_ID itself at gate-status:running
+# forever. Phase C's `-l gate-status:running` selection query then re-picks the
+# SAME bead on its very next sweep, re-reads the now-closed verdict:REQUEUED
+# bead as a "received, non-PASS" verdict (gate_collect_verdicts has no case for
+# REQUEUED), and terminally FAILs a marker that was re-queued for a legitimate
+# retry — confirmed live on gate_run=ga-wisp-yf4wq0
+# (fix/ga-268cr-raw-ingestion-hold-labels, 2026-07-18: verdict bead ga-oe1ja
+# closed verdict:REQUEUED at 01:58:27Z; the SAME gate-run bead was re-selected
+# and FAILed at 02:02:12Z, ~4 minutes later, before the re-queued marker ever
+# got its retry). Fix mirrors the exact set_gate_status-supersede idiom
+# Section 3/4 above already drift-guard for the guard's Vector B and the
+# dispatcher's own sibling-supersede.
+echo "── 4b. drift-guard: dispatcher retires GATE_RUN_ID on quota-stop/dead-reviewer requeue (ga-fi1dh) ──"
+eq "dispatcher supersedes GATE_RUN_ID in BOTH requeue branches (quota-stop + dead-reviewer)" \
+   "$(grep -c 'set_gate_status "$GATE_RUN_ID" "superseded"' "$DISPATCHER")" "2"
+eq "dispatcher closes GATE_RUN_ID in BOTH requeue branches (ga-fi1dh)" \
+   "$(grep -c 'Closed by dispatcher (ga-fi1dh)' "$DISPATCHER")" "2"
+grep -q 'gate-run superseded (terminal) — infra re-queue (ga-eqjo)' "$DISPATCHER" \
+  && ok "dead-reviewer requeue branch retires its gate-run bead" \
+  || bad "dead-reviewer requeue branch missing gate-run retirement (ga-fi1dh)"
+grep -q 'gate-run superseded (terminal) — quota-stop re-queue (ga-x3nmz)' "$DISPATCHER" \
+  && ok "quota-stop requeue branch retires its gate-run bead" \
+  || bad "quota-stop requeue branch missing gate-run retirement (ga-fi1dh)"
+
 # ── 5. classify_inflight_gap1 (ga-pa36 GAP-1: merged-but-OPEN beads) ─────────
 # Signature: classify_inflight_gap1 <status> <has_gate_passed> <has_live_assignee> <branch_merged>
 echo "── 5. classify_inflight_gap1 (GAP-1: merged-but-OPEN) ──"

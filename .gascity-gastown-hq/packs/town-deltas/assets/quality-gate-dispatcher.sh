@@ -1733,6 +1733,16 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
     bd -C "$GC_CITY" comment "$MARKER_ID" "INFRA re-queue (ga-eqjo): reviewer session(s) died mid-review — an infra failure (Dolt hiccup/crash class, ga-4u16h/ga-h9o17), NOT a code FAIL. Marker re-queued; the ga-cw4pm headroom gate will admit a fresh attempt with new reviewers." 2>/dev/null || true
     if [ "$GATE_RUN_ID" != "unknown" ]; then
       bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run paused (infra re-queue, ga-eqjo): reviewer session(s) died mid-review; marker $MARKER_ID re-queued for a fresh attempt. No verdict recorded; this is NOT a FAIL." 2>/dev/null || true
+      # ga-fi1dh: retire THIS gate-run bead (superseded, NOT left at gate-status:
+      # running) — mirrors set_gate_status's other supersede call sites
+      # (quality-gate-guard.sh Vector B, supersede_sibling_runs above). Without
+      # this, Phase C's `-l gate-status:running` selection query (below) re-picks
+      # THIS SAME bead on its very next sweep, re-reads its own verdict bead
+      # (now closed verdict:REQUEUED) as a "received, non-PASS" verdict, and
+      # terminally FAILs the marker that was just re-queued for a fresh attempt
+      # — before that attempt ever runs.
+      set_gate_status "$GATE_RUN_ID" "superseded"
+      bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — infra re-queue (ga-eqjo), marker $MARKER_ID re-queued for a fresh attempt. Closed by dispatcher (ga-fi1dh)." 2>/dev/null || true
     fi
     notify -t "⚠️ Gate re-enfileirado: reviewer morreu" -p 3 "Gate $BRANCH re-enfileirado — sessão de reviewer morreu em pleno review (falha de infra, não é FAIL) (ga-eqjo)." 2>/dev/null || true
     return 0
@@ -1766,6 +1776,12 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
   bd -C "$GC_CITY" comment "$MARKER_ID" "QUOTA-STOP re-queue (ga-x3nmz): reviewer(s) stalled because Claude's 5h session quota is exhausted — a quota-stop, NOT a code FAIL. Marker re-queued; the ga-cw4pm headroom gate holds it deferred until the window resets${_eta:+ ($_eta)}, then the gate re-runs with fresh reviewers." 2>/dev/null || true
   if [ "$GATE_RUN_ID" != "unknown" ]; then
     bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run paused (quota-stop, ga-x3nmz): Claude 5h quota exhausted mid-review; marker $MARKER_ID re-queued for re-run post-reset${_eta:+ ($_eta)}. No verdict recorded; this is NOT a FAIL." 2>/dev/null || true
+    # ga-fi1dh: retire THIS gate-run bead (superseded, NOT left at gate-status:
+    # running) — see the identical comment in the dead-reviewer branch above for
+    # why (Phase C would otherwise re-select it next sweep and mis-finalize on
+    # the REQUEUED verdict bead as a FAIL).
+    set_gate_status "$GATE_RUN_ID" "superseded"
+    bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — quota-stop re-queue (ga-x3nmz), marker $MARKER_ID re-queued for re-run post-reset. Closed by dispatcher (ga-fi1dh)." 2>/dev/null || true
   fi
   notify -t "⏸️ Gate pausado: cota 5h" -p 3 "Gate $BRANCH re-enfileirado — cota 5h do Claude esgotada (quota-stop, não é FAIL); retoma quando resetar${_eta:+ ($_eta)} (ga-x3nmz)." 2>/dev/null || true
   # ga-eqjo: return (not exit) — this now runs inside gate_finalize_run(), which
