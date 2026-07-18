@@ -2596,18 +2596,37 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         # is left as-is (unconfirmed whether it was ever actually broken —
         # AC4 of ga-n7hu2 — this only adds visibility, it does not presume a fix).
         bd -C "$BEAD_CITY" label add "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
-        KEEP_VERIFY_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null)
-        KEEP_VERIFY_ASSIGNEE=$(printf '%s' "$KEEP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
-        KEEP_VERIFY_HAS_INFLIGHT=$(printf '%s' "$KEEP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | ((.labels // []) | index("story:in-flight")) != null' 2>/dev/null || echo "false")
-        if [ "$KEEP_VERIFY_ASSIGNEE" = "$AUTHOR" ]; then
-          KEEP_ASSIGNEE_OBS="assignee=$AUTHOR (kept)"
+        # The verify-read must NOT be a bare assignment: this script runs under
+        # `set -euo pipefail` (global), so a non-zero `bd show` — realistic given
+        # Dolt's documented fragility — would abort the WHOLE dispatcher, killing
+        # finalization of every other gate run pending in the same sweep, silently
+        # (gate_finalize_run is called as a bare statement from Phase C's loop).
+        # But guarding with a plain `|| echo ""` is NOT enough either: an empty
+        # result would then flow into the comparisons below and be reported as
+        # "keep action did not stick", i.e. a READ FAILURE would be published as a
+        # WRITE FAILURE — a false accusation, and the exact error-vs-empty class
+        # this bead exists to kill (ga-p5q3). So track the read outcome separately
+        # and let "could not verify" be its own visible, contained third state.
+        KEEP_VERIFY_JSON=""
+        KEEP_VERIFY_READ_OK=1
+        KEEP_VERIFY_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || KEEP_VERIFY_READ_OK=0
+        [ -n "$KEEP_VERIFY_JSON" ] || KEEP_VERIFY_READ_OK=0
+        if [ "$KEEP_VERIFY_READ_OK" = "0" ]; then
+          KEEP_ASSIGNEE_OBS="assignee=UNVERIFIED (post-write read failed — state unknown, NOT a claim that the keep failed)"
+          KEEP_INFLIGHT_OBS="story:in-flight=UNVERIFIED (post-write read failed)"
         else
-          KEEP_ASSIGNEE_OBS="assignee='${KEEP_VERIFY_ASSIGNEE}' NOT $AUTHOR — keep action did not stick, needs investigation"
-        fi
-        if [ "$KEEP_VERIFY_HAS_INFLIGHT" = "true" ]; then
-          KEEP_INFLIGHT_OBS="story:in-flight=present"
-        else
-          KEEP_INFLIGHT_OBS="story:in-flight=MISSING even after re-add — needs investigation"
+          KEEP_VERIFY_ASSIGNEE=$(printf '%s' "$KEEP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
+          KEEP_VERIFY_HAS_INFLIGHT=$(printf '%s' "$KEEP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | ((.labels // []) | index("story:in-flight")) != null' 2>/dev/null || echo "false")
+          if [ "$KEEP_VERIFY_ASSIGNEE" = "$AUTHOR" ]; then
+            KEEP_ASSIGNEE_OBS="assignee=$AUTHOR (kept)"
+          else
+            KEEP_ASSIGNEE_OBS="assignee='${KEEP_VERIFY_ASSIGNEE}' NOT $AUTHOR — keep action did not stick, needs investigation"
+          fi
+          if [ "$KEEP_VERIFY_HAS_INFLIGHT" = "true" ]; then
+            KEEP_INFLIGHT_OBS="story:in-flight=present"
+          else
+            KEEP_INFLIGHT_OBS="story:in-flight=MISSING even after re-add — needs investigation"
+          fi
         fi
         bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; gate:reviewing cleared (wa-qq33j). Author $AUTHOR is a LIVE crew session, so this dispatcher acted to KEEP assignee + story:in-flight (ga-jyox) instead of letting the Pilot dispatch a stranger — verified post-write on the raw bead, not display: $KEEP_ASSIGNEE_OBS; $KEEP_INFLIGHT_OBS. See GATE-FEEDBACK above; re-run /gate-done after fixing." 2>/dev/null || true
         gc --city "$GC_CITY" session nudge "$AUTHOR" \
