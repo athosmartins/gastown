@@ -193,11 +193,19 @@ def _prune_state(state, now):
 
     Pruning is conservative: a stale entry that survives at worst suppresses one
     cooldown re-trigger — not a safety issue. Better than unbounded memory growth.
+
+    NOTE: "alarmed" entries are either a bare epoch float (legacy, pre-AC3) or a
+    {"last": epoch, "count": N, "fp": ...} dict (AC3 escalating backoff) — pull
+    the timestamp out of either shape rather than assuming a bare number.
     """
     cutoff = now - 7 * 24 * 3600
     for key in ("routed", "alarmed", "first_seen_approved", "flagged", "reclaim_exhausted"):
         bucket = state.get(key, {})
-        stale = [bid for bid, ts in bucket.items() if ts < cutoff]
+        stale = []
+        for bid, v in bucket.items():
+            ts = v.get("last", 0.0) if isinstance(v, dict) else v
+            if ts < cutoff:
+                stale.append(bid)
         for bid in stale:
             del bucket[bid]
         if stale:
@@ -270,6 +278,42 @@ def _parse_reclaim_count(labels):
             except ValueError:
                 pass
     return 0
+
+
+# ── extra explicit non-buildable label prefixes (ga-an81u AC1) ───────────────
+# Beyond the routing labels in _classify() and the flowing/gate/pilot checks in
+# _process_store(), these prefixes are OTHER explicit non-buildable signals a
+# human or another daemon wrote onto the bead — dependency blocks, delegation
+# to a named crew, or a pool worker that already declined it. None of these
+# ROUTE the bead (the safe-default/never-route rule in _classify() still
+# holds) — they only suppress the STARVE ALARM, because they mean "the Pilot's
+# generic dispatch path isn't the mechanism in play right now," which is
+# exactly the condition the alarm exists to detect the absence of.
+#
+# Before this fix, NONE of these were recognized: a bead like wa-4e2m8 carrying
+# blocked-on:wa-qfp58 + waiting-on:wa-qfp58 (an explicit, human-written
+# dependency block) got mailed "This bead has NO explicit non-buildable
+# signal" — false, 44 times, ~every 30min, burying real alerts (disk-floor
+# CRITICAL) in the same inbox. next-action:<crew>-constroi means "ready, but
+# THIS named crew builds it, not the generic pool" (see memory
+# pilot-next-action-label-vetoes-own-dispatch) — the opposite of blocked, but
+# still not something the Pilot's dispatch path should be blamed for.
+_EXTRA_ALARM_SUPPRESS_PREFIXES = (
+    ("blocked-on", "blocked-on:* (dependency block)"),
+    ("waiting-on", "waiting-on:* (dependency block)"),
+    ("depends-on", "depends-on:* (dependency block)"),
+    ("next-action", "next-action:* (delegated to a named crew, not the generic pool)"),
+    ("pool:refused", "pool:refused:* (a pool worker already declined this)"),
+)
+
+
+def _extra_alarm_suppress_reason(labels):
+    """Return a human-readable reason if `labels` carries any of the explicit
+    non-buildable prefixes in _EXTRA_ALARM_SUPPRESS_PREFIXES, else None."""
+    for prefix, reason in _EXTRA_ALARM_SUPPRESS_PREFIXES:
+        if _has_prefix(labels, prefix):
+            return reason
+    return None
 
 
 def _bead_text(bead):
@@ -608,51 +652,139 @@ def _route_bead(rig_root, bead, route_to, signal, now, state):
 
 
 # ── starve alarm ──────────────────────────────────────────────────────────────
+# AC3 (ga-an81u): a flat ALARM_COOLDOWN_SEC (30min) re-fired the IDENTICAL
+# "dispatch failing" mail for as long as a bead sat starving — one bead
+# (wa-4e2m8) hit 44 repeats, burying unrelated real alerts (disk-floor
+# CRITICAL) in the same inbox. Escalate instead: the 1st repeat requires 1h
+# since the last alarm, the 2nd requires 4h, the 3rd+ requires 12h (a cap, not
+# a silence — a persistently-starving bead still gets a heartbeat, just never
+# more often than every 12h). A label-set change since the last alarm counts
+# as a new incident and resets the escalation immediately — see the AC3
+# acceptance text ("escalada exponencial ... ou mudança de estado").
+#
+# Tiers beyond the baseline are fixed; the baseline itself (count=0, i.e. the
+# very first alarm for an incident) deliberately reads the ALARM_COOLDOWN_SEC
+# *global* at call time rather than a value captured once at import — that
+# global is env-overridable in production and reassigned via globals() in
+# _selftest(), and a module-level list literal here would silently freeze the
+# import-time value, making a selftest override of ALARM_COOLDOWN_SEC a no-op.
+_ALARM_ESCALATION_TIERS_SEC = [3600, 14400, 43200]  # 1h, 4h, 12h(cap) — for count>=1
+
+
+def _alarm_backoff_sec(count):
+    """Required gap since the last alarm before firing the (count+1)th, given
+    `count` alarms already fired for the CURRENT incident (0 = never fired —
+    the caller's own now-last_alarmed check handles that case regardless of
+    what this returns, since last_alarmed=0.0 always exceeds any backoff)."""
+    if count <= 0:
+        return ALARM_COOLDOWN_SEC
+    idx = min(count - 1, len(_ALARM_ESCALATION_TIERS_SEC) - 1)
+    return _ALARM_ESCALATION_TIERS_SEC[idx]
+
+
+def _alarm_record(state, bead_id):
+    """Return (last_alarmed_epoch, count, labels_fp) for bead_id.
+
+    Transparently migrates the pre-AC3 state format, where state['alarmed'][id]
+    was a bare epoch float (implicitly: exactly one alarm already fired, unknown
+    label fingerprint). A None fingerprint is treated as NOT a state-change on
+    the next check (see _alarm_starving) so upgrading never causes a surprise
+    immediate re-fire for a bead already mid-cooldown at deploy time.
+    """
+    raw = state.get("alarmed", {}).get(bead_id)
+    if raw is None:
+        return 0.0, 0, None
+    if isinstance(raw, dict):
+        return float(raw.get("last", 0.0)), int(raw.get("count", 0)), raw.get("fp")
+    try:
+        return float(raw), 1, None   # legacy float-only format
+    except (TypeError, ValueError):
+        return 0.0, 0, None
+
+
 def _alarm_starving(rig_root, bead, age_min, now, state):
     """Fire a starve alarm for a buildable bead that has not been dispatched.
 
-    This is case 3 of the core guarantee: the bead has NO explicit non-buildable
-    signal, is not flowing, and has been approved longer than STARVE_MIN with the
-    Pilot alive — meaning the dispatch path is failing. The operator MUST investigate.
+    This is case 3 of the core guarantee: the bead matched NONE of this
+    reconciler's known non-buildable signals, is not flowing, and has been
+    approved longer than STARVE_MIN with the Pilot alive — meaning the dispatch
+    path is failing (or a signal this reconciler doesn't recognize yet — the
+    mail body says so explicitly, see AC2). The operator MUST investigate.
 
-    Never fires in DRY_RUN mode. Per-bead cooldown prevents spam.
+    Never fires in DRY_RUN mode. See _alarm_backoff_sec()/_ALARM_ESCALATION_TIERS_SEC
+    for the per-bead backoff/dedup policy (AC3) — this is no longer a flat cooldown.
     """
     bead_id = bead.get("id") or bead.get("issue_id") or ""
     if not bead_id:
         return
 
-    last_alarmed = state.get("alarmed", {}).get(bead_id, 0.0)
-    if now - last_alarmed < ALARM_COOLDOWN_SEC:
-        _log("  alarm cooldown active for %s (%.0fmin ago) — skipping" % (
-             bead_id, (now - last_alarmed) / 60.0))
+    labels_fp = ",".join(sorted(_get_labels(bead)))
+    last_alarmed, count, prev_fp = _alarm_record(state, bead_id)
+    state_changed = prev_fp is not None and prev_fp != labels_fp
+    if state_changed:
+        count = 0   # new incident — restart escalation
+
+    if not state_changed and (now - last_alarmed) < _alarm_backoff_sec(count):
+        _log("  alarm backoff active for %s (count=%d, last %.0fmin ago, "
+             "next in >=%.0fmin) — skipping" % (
+             bead_id, count, (now - last_alarmed) / 60.0,
+             (_alarm_backoff_sec(count) - (now - last_alarmed)) / 60.0))
         return
 
+    alarm_ordinal = count + 1   # 1 = first alarm for this incident, 2 = first repeat, ...
     title = (bead.get("title") or bead.get("name") or "?")[:80]
-    _log("ALARM starving: %s | age=%.0fmin | %s" % (bead_id, age_min, title))
+    _log("ALARM starving: %s | age=%.0fmin | ordinal=%d%s | %s" % (
+         bead_id, age_min, alarm_ordinal,
+         " (state changed → escalation reset)" if state_changed else "", title))
 
     if DRY_RUN:
-        _log("DRY_RUN: would alarm starving bead %s (age=%.0fmin)" % (bead_id, age_min))
+        _log("DRY_RUN: would alarm starving bead %s (age=%.0fmin, ordinal=%d)" % (
+             bead_id, age_min, alarm_ordinal))
         return  # no state update, no mutations
 
-    subject = ("Reconciler: buildable bead %s starving %dmin — dispatch failing"
-               % (bead_id, int(age_min)))
+    # AC4: repeats are a known-issue heartbeat, not a fresh incident — tag the
+    # subject distinctly (filterable/collapsible) and demote notify priority so
+    # they don't bury a genuinely different alert class (disk-floor, circuit-
+    # break, lca) landing in the same inbox window.
+    if alarm_ordinal == 1:
+        subject = ("Reconciler: buildable bead %s starving %dmin — dispatch failing"
+                   % (bead_id, int(age_min)))
+        notify_prio = 4
+    else:
+        subject = ("Reconciler: buildable bead %s STILL starving %dmin (repeat #%d) "
+                   "— dispatch failing" % (bead_id, int(age_min), alarm_ordinal))
+        notify_prio = 2
+
+    # AC2: the old body asserted "This bead has NO explicit non-buildable signal"
+    # as an absolute fact — false whenever the checked-signal list was
+    # incomplete (exactly this bug: blocked-on:/waiting-on:/etc. WERE explicit
+    # signals the reconciler simply didn't know). Say what was actually
+    # checked, and hedge honestly that the list can itself go stale again.
     body = (
         "APPROVED-STATE-RECONCILER: buildable bead starving — dispatch path failing\n\n"
         "Bead: %s — %s\n"
-        "Status: story:approved, age: %dmin, not dispatched, pilot alive\n\n"
-        "This bead has NO explicit non-buildable signal. It should have been dispatched\n"
-        "within %dmin. The dispatch path is failing.\n\n"
+        "Status: story:approved, age: %dmin, not dispatched, pilot alive, "
+        "alarm #%d for this incident\n\n"
+        "This bead matched NONE of this reconciler's known non-buildable signals\n"
+        "(blocked-on:*, waiting-on:*, depends-on:*, next-action:*, pool:refused:*,\n"
+        "gate:{needs-fix,failed,queued,reviewing,needs-human}, exec:manual,\n"
+        "pilot:held(-until:*), pilot:reclaim-count:N). It should have been\n"
+        "dispatched within %dmin.\n\n"
         "INVESTIGAR:\n"
         "1. tail -40 .gc/logs/pilot-dispatcher.log — o Pilot está varrendo?\n"
         "2. bd -C %s show %s — labels corretos?\n"
         "3. gc rig list — algum rig suspenso?\n"
         "4. Se o Pilot varre e ignora este bead → bug de query ou filtro no pilot-dispatcher.sh.\n"
-        "5. Verifique se o bead precisa de um label explícito (story:needs-device, etc.)\n"
-        "   antes de tentar re-despachar — NÃO adicione story:approved de volta sem investigar.\n"
-    ) % (bead_id, title, int(age_min), STARVE_MIN, rig_root, bead_id)
+        "5. Se o bead É legitimamente non-buildable, ele pode precisar de um sinal que\n"
+        "   este reconciler ainda não reconhece — ver _process_store()/\n"
+        "   _extra_alarm_suppress_reason() em scripts/approved-state-reconciler.py antes\n"
+        "   de re-despachar manualmente ou adicionar story:approved de volta.\n"
+    ) % (bead_id, title, int(age_min), alarm_ordinal, STARVE_MIN, rig_root, bead_id)
 
-    notify_msg = ("STARVE ALARM: bead %s story:approved há %dmin, pilot alive, "
-                  "não despachado — dispatch path failing" % (bead_id, int(age_min)))
+    notify_msg = ("STARVE ALARM%s: bead %s story:approved há %dmin, pilot alive, "
+                  "não despachado — dispatch path failing" % (
+                  "" if alarm_ordinal == 1 else " (repeat #%d)" % alarm_ordinal,
+                  bead_id, int(age_min)))
 
     _arc_ledger("human-touch", {
         "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -660,14 +792,15 @@ def _alarm_starving(rig_root, bead, age_min, now, state):
         "stage": "starve-alarm",
         "bead_id": bead_id,
         "age_min": int(age_min),
+        "alarm_ordinal": alarm_ordinal,
         "rig_root": rig_root,
     }, fail_open=True)
 
     # Dolt-independent: notify fires FIRST and unconditionally.
     if _do_notify is not None:
-        _do_notify(notify_msg, 4)
+        _do_notify(notify_msg, notify_prio)
     else:
-        _sh([NOTIFY_BIN, "-t", "Starve ALARM", "-p", "4", notify_msg], timeout=10)
+        _sh([NOTIFY_BIN, "-t", "Starve ALARM", "-p", str(notify_prio), notify_msg], timeout=10)
 
     if _do_mail_mayor is not None:
         _do_mail_mayor(subject, body)
@@ -676,7 +809,9 @@ def _alarm_starving(rig_root, bead, age_min, now, state):
             timeout=45)
 
     _write_flow_authority(now, "approved-starve:%s" % bead_id)
-    state.setdefault("alarmed", {})[bead_id] = now
+    state.setdefault("alarmed", {})[bead_id] = {
+        "last": now, "count": alarm_ordinal, "fp": labels_fp,
+    }
 
 
 # ── reclaim-exhausted note (ga-ag16) ──────────────────────────────────────────
@@ -928,6 +1063,22 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids):
                  bead_id, starve_age_min))
             continue
 
+        # pilot:held (bare, no -until suffix) — a DISTINCT label family from
+        # pilot:held-until:<epoch> above (no expiry to parse); pilot deliberately
+        # parked this bead (ga-an81u AC1).
+        if "pilot:held" in labels:
+            _log("  %s: no signal, daemon-age=%.0fmin, pilot:held — no alarm" % (
+                 bead_id, starve_age_min))
+            continue
+
+        # blocked-on:*/waiting-on:*/depends-on:*/next-action:*/pool:refused:* —
+        # see _EXTRA_ALARM_SUPPRESS_PREFIXES docstring above (ga-an81u AC1).
+        extra_reason = _extra_alarm_suppress_reason(labels)
+        if extra_reason is not None:
+            _log("  %s: no signal, daemon-age=%.0fmin, %s — no alarm" % (
+                 bead_id, starve_age_min, extra_reason))
+            continue
+
         # pilot:reclaim-count:N (ga-ag16) — bead drained at least once (worker spawned but
         # made no branch progress) and inflight-reclaim-guard reset it to open for re-dispatch.
         # This is NOT a dispatch failure: the reclaim-guard loop owns re-dispatch retries, and
@@ -960,6 +1111,17 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids):
             _log("  %s: no signal, daemon-age=%.0fmin, gate:needs-fix (gate-fix loop owns "
                  "re-dispatch; cap→needs-human is the backstop) — no alarm" % (
                  bead_id, starve_age_min))
+            continue
+
+        # gate:failed — same lifecycle moment as gate:needs-fix (a build just FAILed
+        # the gate); depending on exactly when this reconciler runs relative to the
+        # gate daemon, a bead can be observed carrying gate:failed before/without
+        # gate:needs-fix yet being stamped (ga-an81u AC1: wa-pltmi carried both
+        # gate:failed and gate:needs-fix while still getting falsely alarmed).
+        # Same suppression rationale as gate:needs-fix above.
+        if "gate:failed" in labels:
+            _log("  %s: no signal, daemon-age=%.0fmin, gate:failed (gate-fix loop owns "
+                 "re-dispatch) — no alarm" % (bead_id, starve_age_min))
             continue
 
         # exec:manual — bead requires human/supervised execution; the headless pool never
@@ -1118,6 +1280,23 @@ def _selftest():
                 _parse_bd_json path, not the _bd_gate_markers test seam — closes the gap
                 where gate attempt 1 left the actual parse-failure branch uncovered (z
                 only exercises the seam) (ga-6927 gate attempt 1 FAIL)
+      (bb)      AC1 (ga-an81u): each extra-suppress label (blocked-on:*, waiting-on:*,
+                depends-on:*, next-action:*, pool:refused:*, gate:failed, bare pilot:held)
+                individually blocks the starve alarm
+      (cc)      AC2 (ga-an81u): alarm body no longer asserts the false absolute claim
+                "NO explicit non-buildable signal" — says what was actually checked
+      (dd)      AC3 (ga-an81u): escalating backoff — +40min repeat suppressed (the OLD
+                flat 30min cooldown would have refired), +61min fires as repeat #2 with
+                notify priority demoted to 2 (AC4)
+      (ee)      AC3 (ga-an81u): escalation continues to the 4h tier — +3h after the 2nd
+                alarm suppressed, +4h1min fires as repeat #3
+      (ff)      AC3 (ga-an81u): escalation caps at 12h — +11h after the 3rd alarm
+                suppressed, +12h1min fires repeat #4, another +12h1min fires repeat #5
+                (cap holds, never grows further, never fully silences)
+      (gg)      AC3 (ga-an81u): a label-set change resets the escalation and fires
+                immediately even well inside the current backoff window
+      (hh)      AC3 (ga-an81u): legacy float-only 'alarmed' state (pre-AC3 format)
+                migrates cleanly — treated as count=1, no crash in _prune_state
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
@@ -1168,11 +1347,39 @@ def _selftest():
     def _stub_notify(msg, prio):
         notify_calls.append((msg, prio))
 
+    def _stub_sh_fast(args, timeout=20):
+        """Fast stand-in for the real _sh() — avoids real subprocess calls (e.g.
+        `gc session list --json`, invoked by _pool_has_capacity for every bead
+        that reaches the alarm path) so the selftest stays hermetic per its own
+        docstring, instead of ballooning in wall-clock as scenario count grows.
+
+        Returns a generic "successful, empty" response (rc=0, stdout="[]") rather
+        than a failure — the two real call sites this can reach when their own
+        seam is unstubbed (_pool_has_capacity's `gc session list`, and
+        _gate_marker_source_beads' `bd ... type:quality-gate-marker` fallback)
+        need DIFFERENT-looking failure handling: an rc!=0 here would make the
+        marker query return None (query error) instead of an empty set, which
+        flips built_ids-is-None → "unknown, fail-safe, no alarm" for every
+        scenario that doesn't explicitly stub _bd_gate_markers — silently
+        suppressing the very alarms scenarios (g)/(o)/(dd)/etc. exist to check
+        for. "[]" satisfies both: the marker query parses it as zero open
+        markers (correct, harmless); gc-session-list's dict .get() raises on a
+        bare list, caught by that call site's own try/except → "capacity
+        unknown, alarm conservatively" — the same fail-open outcome, just via
+        the exception path instead of the empty-stdout path. Every OTHER real
+        _sh call site (label add/remove/comment, notify, mail send, the main
+        story:approved query) is only reached when its own dedicated seam
+        (_bd_label_add etc.) is None, and every scenario in this suite always
+        stubs those directly — this generic fallback never reaches them.
+        """
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="[]", stderr="")
+
     _bd_label_add = _stub_label_add
     _bd_label_remove = _stub_label_remove
     _bd_comment = _stub_comment
     _do_mail_mayor = _stub_mail
     _do_notify = _stub_notify
+    _sh = _stub_sh_fast
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _make_bead(bid, labels=None, title="Test story", assignee="",
@@ -1202,6 +1409,15 @@ def _selftest():
         """Pilot sweep-complete line OUTSIDE the alive window."""
         e = NOW - (PILOT_ALIVE_WINDOW_MIN + 5) * 60
         ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(e))
+        return ["%s [pilot-dispatcher] === Pilot sweep complete: dispatched=0 ===" % ts]
+
+    def _pilot_recent_at(t):
+        """Pilot sweep-complete line within PILOT_ALIVE_WINDOW_MIN of `t` (NOT the
+        fixed module NOW). Multi-cycle scenarios that advance `now` by hours across
+        several run_cycle() calls must re-derive this per call — _pilot_recent()
+        freezes its line at NOW, so a cycle run hours later would see a stale line,
+        read the pilot as dead, and mask whatever the scenario is actually testing."""
+        ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(t))
         return ["%s [pilot-dispatcher] === Pilot sweep complete: dispatched=0 ===" % ts]
 
     def _reset():
@@ -1726,6 +1942,188 @@ def _selftest():
         _bad("(aa): SAFETY VIOLATION — alarmed on unparseable gate-marker JSON via the real "
              "_sh/_parse_bd_json path (error-vs-empty conflation the seam-only tests in "
              "gate attempt 1 could not catch)", "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (bb): AC1 — each extra-suppress label individually blocks the alarm")
+    # ga-an81u AC1: blocked-on:*, waiting-on:*, depends-on:*, next-action:*, pool:refused:*,
+    # bare pilot:held, and gate:failed are all explicit non-buildable signals this
+    # reconciler did NOT recognize before this fix — each, alone, must suppress the alarm.
+    bb_cases = [
+        ("hq-030", ["story:approved", "blocked-on:hq-999"], "blocked-on:*"),
+        ("hq-031", ["story:approved", "waiting-on:hq-999"], "waiting-on:*"),
+        ("hq-032", ["story:approved", "depends-on:hq-999"], "depends-on:*"),
+        ("hq-033", ["story:approved", "next-action:wa-worker-constroi"], "next-action:*"),
+        ("hq-034", ["story:approved", "pool:refused:engine-rebuild-required"], "pool:refused:*"),
+        ("hq-035", ["story:approved", "gate:failed"], "gate:failed"),
+        ("hq-036", ["story:approved", "pilot:held"], "bare pilot:held"),
+    ]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    bb_failures = []
+    for bid, labs, desc in bb_cases:
+        _bd_approved = lambda root, labs=labs, bid=bid: [_make_bead(bid, labels=labs, age_min=0.1)]
+        st_bb = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+        st_bb["first_seen_approved"][bid] = NOW - (_STARVE + 5) * 60
+        _reset_captures()
+        run_cycle(NOW, st_bb)
+        if any(bid in subj for subj, _ in mail_calls):
+            bb_failures.append("%s (%s) FALSELY alarmed" % (bid, desc))
+    if not bb_failures:
+        _ok("(bb): all 7 AC1 extra-suppress labels individually block the starve alarm")
+    else:
+        _bad("(bb)", "; ".join(bb_failures))
+
+    print("\nScenario (cc): AC2 — alarm body no longer asserts the false absolute claim")
+    _bd_approved = lambda root: [_make_bead("hq-037", age_min=0.1)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_cc = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_cc["first_seen_approved"]["hq-037"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_cc)
+    cc_body = next((b for s, b in mail_calls if "hq-037" in s), None)
+    old_false_claim = cc_body is not None and "NO explicit non-buildable signal" in cc_body
+    new_honest_claim = cc_body is not None and "matched NONE of this reconciler's known" in cc_body
+    if cc_body is not None and not old_false_claim and new_honest_claim:
+        _ok("(cc): alarm body says 'matched NONE of KNOWN signals' — no longer an absolute claim")
+    else:
+        _bad("(cc)", "body=%r" % (cc_body,))
+
+    print("\nScenario (dd): AC3 escalating backoff — +40min repeat suppressed (old flat "
+          "30min cooldown would have refired), +61min fires as repeat #2 with notify "
+          "priority demoted to 2 (AC4)")
+    T0 = NOW
+    _bd_approved = lambda root: [_make_bead("hq-038", age_min=0.1)]
+    _read_pilot_log_lines = lambda: _pilot_recent_at(T0)
+    st_dd = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_dd["first_seen_approved"]["hq-038"] = T0 - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(T0, st_dd)
+    first_subj = next((s for s, _ in mail_calls if "hq-038" in s), None)
+    first_prio = next((p for m, p in notify_calls if "hq-038" in m), None)
+
+    _reset_captures()
+    _read_pilot_log_lines = lambda: _pilot_recent_at(T0 + 40 * 60)
+    run_cycle(T0 + 40 * 60, st_dd)   # +40min — inside the 1h tier, must NOT refire
+    suppressed_40min = not any("hq-038" in s for s, _ in mail_calls)
+
+    _reset_captures()
+    _read_pilot_log_lines = lambda: _pilot_recent_at(T0 + 61 * 60)
+    run_cycle(T0 + 61 * 60, st_dd)   # +61min — past the 1h tier, must refire as repeat #2
+    second_subj = next((s for s, _ in mail_calls if "hq-038" in s), None)
+    second_prio = next((p for m, p in notify_calls if "hq-038" in m), None)
+
+    if (first_subj and "repeat" not in first_subj and first_prio == 4
+            and suppressed_40min
+            and second_subj and "repeat #2" in second_subj and second_prio == 2):
+        _ok("(dd): 1st alarm (prio 4) fires; +40min suppressed; +61min fires as "
+            "repeat #2 (prio 2 — AC4 demotion)")
+    else:
+        _bad("(dd)", "first_subj=%r first_prio=%s suppressed_40min=%s second_subj=%r "
+             "second_prio=%s" % (first_subj, first_prio, suppressed_40min,
+             second_subj, second_prio))
+
+    print("\nScenario (ee): AC3 escalation continues — 4h tier")
+    _reset_captures()
+    _read_pilot_log_lines = lambda: _pilot_recent_at(T0 + 61 * 60 + 3 * 3600)
+    run_cycle(T0 + 61 * 60 + 3 * 3600, st_dd)   # +3h after 2nd alarm — inside 4h tier
+    suppressed_3h = not any("hq-038" in s for s, _ in mail_calls)
+
+    _reset_captures()
+    _read_pilot_log_lines = lambda: _pilot_recent_at(T0 + 61 * 60 + 4 * 3600 + 60)
+    run_cycle(T0 + 61 * 60 + 4 * 3600 + 60, st_dd)   # +4h1min after 2nd — past 4h tier
+    third_subj = next((s for s, _ in mail_calls if "hq-038" in s), None)
+    if suppressed_3h and third_subj and "repeat #3" in third_subj:
+        _ok("(ee): +3h after 2nd alarm suppressed (4h tier); +4h1min fires as repeat #3")
+    else:
+        _bad("(ee)", "suppressed_3h=%s third_subj=%r" % (suppressed_3h, third_subj))
+
+    print("\nScenario (ff): AC3 escalation caps at 12h (holds, never grows further, "
+          "never fully silences)")
+    base = T0 + 61 * 60 + 4 * 3600 + 60   # timestamp of the 3rd alarm
+    _reset_captures()
+    _read_pilot_log_lines = lambda: _pilot_recent_at(base + 11 * 3600)
+    run_cycle(base + 11 * 3600, st_dd)   # +11h after 3rd alarm — inside the 12h cap tier
+    suppressed_11h = not any("hq-038" in s for s, _ in mail_calls)
+
+    _reset_captures()
+    _read_pilot_log_lines = lambda: _pilot_recent_at(base + 12 * 3600 + 60)
+    run_cycle(base + 12 * 3600 + 60, st_dd)   # +12h1min — past the cap, fires repeat #4
+    fourth_subj = next((s for s, _ in mail_calls if "hq-038" in s), None)
+
+    _reset_captures()
+    _read_pilot_log_lines = lambda: _pilot_recent_at(base + 12 * 3600 + 60 + 12 * 3600 + 60)
+    run_cycle(base + 12 * 3600 + 60 + 12 * 3600 + 60, st_dd)   # another +12h1min — fires #5
+    fifth_subj = next((s for s, _ in mail_calls if "hq-038" in s), None)
+
+    if (suppressed_11h and fourth_subj and "repeat #4" in fourth_subj
+            and fifth_subj and "repeat #5" in fifth_subj):
+        _ok("(ff): 12h cap holds — suppressed at +11h, fires #4 at +12h1min, "
+            "fires #5 another +12h1min later (cap doesn't keep growing)")
+    else:
+        _bad("(ff)", "suppressed_11h=%s fourth_subj=%r fifth_subj=%r" % (
+             suppressed_11h, fourth_subj, fifth_subj))
+
+    print("\nScenario (gg): AC3 — a label-set change resets escalation and fires "
+          "immediately despite being well inside the backoff window")
+    _bd_approved = lambda root: [_make_bead(
+        "hq-039", labels=["story:approved", "priority:x"], age_min=0.1)]
+    _read_pilot_log_lines = lambda: _pilot_recent_at(NOW)
+    st_gg = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_gg["first_seen_approved"]["hq-039"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_gg)   # 1st alarm — count 0→1, fp captured
+    first_gg = any("hq-039" in s for s, _ in mail_calls)
+
+    _reset_captures()
+    _read_pilot_log_lines = lambda: _pilot_recent_at(NOW + 10 * 60)
+    run_cycle(NOW + 10 * 60, st_gg)   # +10min, SAME labels — well inside 1h tier, suppressed
+    suppressed_unchanged = not any("hq-039" in s for s, _ in mail_calls)
+
+    _bd_approved = lambda root: [_make_bead(   # labels CHANGED (simulates real churn)
+        "hq-039", labels=["story:approved", "priority:x", "priority:y"], age_min=0.1)]
+    _reset_captures()
+    _read_pilot_log_lines = lambda: _pilot_recent_at(NOW + 20 * 60)
+    run_cycle(NOW + 20 * 60, st_gg)   # +20min total — still well inside 1h, but labels differ
+    changed_subj = next((s for s, _ in mail_calls if "hq-039" in s), None)
+    fired_on_change = changed_subj is not None and "repeat" not in changed_subj
+
+    if first_gg and suppressed_unchanged and fired_on_change:
+        _ok("(gg): unchanged labels stay suppressed inside the 1h tier; a label-set "
+            "change fires immediately (new incident) despite being well inside it")
+    else:
+        _bad("(gg)", "first=%s suppressed_unchanged=%s changed_subj=%r" % (
+             first_gg, suppressed_unchanged, changed_subj))
+
+    print("\nScenario (hh): legacy float-only 'alarmed' state (pre-AC3 format) "
+          "migrates cleanly, no crash in _prune_state")
+    LEGACY_TS = NOW - 100   # "already alarmed 100s ago" under the OLD pre-AC3 format
+    st_hh = {"routed": {}, "alarmed": {"hq-040": LEGACY_TS}, "first_seen_approved": {},
+             "flagged": {}}
+    st_hh["first_seen_approved"]["hq-040"] = NOW - (_STARVE + 5) * 60
+    _bd_approved = lambda root: [_make_bead("hq-040", age_min=0.1)]
+    _read_pilot_log_lines = lambda: _pilot_recent_at(NOW)
+
+    _reset_captures()
+    try:
+        run_cycle(NOW, st_hh)   # 100s after the legacy timestamp — well inside 1h, suppressed
+        no_crash = True
+    except Exception as exc:
+        no_crash = False
+        _bad("(hh): run_cycle raised on legacy float state", "%r" % exc)
+    suppressed_legacy = no_crash and not any("hq-040" in s for s, _ in mail_calls)
+
+    if no_crash:
+        _reset_captures()
+        _read_pilot_log_lines = lambda: _pilot_recent_at(NOW + 61 * 60)
+        run_cycle(NOW + 61 * 60, st_hh)   # +61min from LEGACY_TS — past 1h, fires repeat #2
+        legacy_repeat_subj = next((s for s, _ in mail_calls if "hq-040" in s), None)
+    else:
+        legacy_repeat_subj = None
+
+    if no_crash and suppressed_legacy and legacy_repeat_subj and "repeat #2" in legacy_repeat_subj:
+        _ok("(hh): legacy float 'alarmed' entry migrates cleanly — treated as count=1, "
+            "1h tier applies, no crash in _prune_state")
+    else:
+        _bad("(hh)", "no_crash=%s suppressed_legacy=%s legacy_repeat_subj=%r" % (
+             no_crash, suppressed_legacy, legacy_repeat_subj))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
