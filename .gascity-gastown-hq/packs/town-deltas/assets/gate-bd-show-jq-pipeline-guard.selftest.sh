@@ -62,7 +62,14 @@ fi
 # ── 3. Drift-guard: BD_STATUS (supersede path) ───────────────────────────────
 # The line reads the source bead status before deciding whether to deliver it.
 # Empty BD_STATUS is safe: `!= "closed"` triggers idempotent delivery ops.
-BD_BLOCK="$(awk '/BD_STATUS=\$\(bd.*show.*BEAD_ID.*--json/{c=1} c{printf "%s ", $0} /\.status .* "open"\)/{if(c){print ""; c=0}}' "$GATE" 2>/dev/null || true)"
+# ga-78lds: the ga-h199q shim (commit 6ad25a9c9) routed this call through
+# `bash ".../bd-list-cached.sh" -C ... show` instead of direct `bd -C ... show`.
+# The old anchor required the literal substring "BD_STATUS=$(bd" immediately
+# after the assignment, so it stopped matching this line even though the `||
+# true` guard itself was untouched (verified against both the current file and
+# the pre-shim baseline at 6ad25a9c9^) — a false negative, not a real
+# regression. Drop the "bd" literal so the anchor matches either call form.
+BD_BLOCK="$(awk '/BD_STATUS=\$\(.*show.*BEAD_ID.*--json/{c=1} c{printf "%s ", $0} /\.status .* "open"\)/{if(c){print ""; c=0}}' "$GATE" 2>/dev/null || true)"
 if printf '%s' "$BD_BLOCK" | grep -q "status .* \"open\"' 2>/dev/null || true)"; then
   ok "BD_STATUS pipeline is guarded with '|| true'"
 else
