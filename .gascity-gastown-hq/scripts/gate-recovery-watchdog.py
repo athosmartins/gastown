@@ -769,9 +769,13 @@ def snapshot(reason, dolt_hits):
             f.write("GATE WATCHDOG DIAGNOSTIC %s\nreason: %s\ndolt_instability_lines: %d\n\n"
                     % (ts, reason, dolt_hits))
             for title, args in [
-                ("queued markers", ["bd", "-C", CITY, "list", "--all", "-l",
+                # ga-xwza2: routed through the read-cache shim, same as the other 13
+                # call sites in this file (ga-h199q) — this is a diagnostic dump
+                # (triggered only on anomaly detection, not the routine poll path),
+                # not a read-after-write.
+                ("queued markers", ["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l",
                                     "type:quality-gate-marker", "-l", "gate-status:queued", "--json"]),
-                ("dispatching markers", ["bd", "-C", CITY, "list", "--all", "-l",
+                ("dispatching markers", ["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l",
                                          "type:quality-gate-marker", "-l", "gate-status:dispatching", "--json"]),
                 ("sessions", ["gc", "session", "list"]),
             ]:

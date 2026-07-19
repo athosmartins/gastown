@@ -63,6 +63,7 @@ PILOT_LOG = os.path.join(CITY, ".gc/logs/pilot-dispatcher.log")
 NOTIFY_BIN = os.environ.get("NOTIFY_BIN", "/Users/athos/.local/bin/notify")
 GC_BIN = os.environ.get("GC_BIN", "gc")
 BD_BIN = os.environ.get("BD_BIN", "bd")
+BD_LIST_CACHED = os.path.join(CITY, "scripts/bd-list-cached.sh")  # ga-xwza2: read-cache shim (ga-48xcv) — drop-in ["bash", BD_LIST_CACHED] prefix replaces BD_BIN at read-only (list/show/query) call sites; only-list/show/query safety boundary lives in the shim itself, so a write accidentally routed through it still passes straight to the real bd, unaffected
 FLOW_AUTHORITY_FILE = os.environ.get(
     "ARC_FLOW_AUTHORITY_FILE",
     os.path.join(CITY, ".gc/runtime/flow-authority.json"))
@@ -914,7 +915,10 @@ def _gate_marker_source_beads():
     if _bd_gate_markers is not None:
         rows = _bd_gate_markers()          # test seam
     else:
-        r = _sh([BD_BIN, "-C", CITY, "list", "-l", "type:quality-gate-marker",
+        # ga-xwza2: routed through the read-cache shim — informational membership
+        # check (which beads have a BUILT marker), computed once per 30min cycle;
+        # nothing in this cycle writes then re-reads this exact query.
+        r = _sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "-l", "type:quality-gate-marker",
                  "--json", "-n", "200"], timeout=BD_TIMEOUT)
         if r is None or r.returncode != 0:
             return None
@@ -1006,7 +1010,10 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
                  % os.path.basename(rig_root))
             return 0, 0, 0
     else:
-        r = _sh([BD_BIN, "-C", rig_root, "list", "-l", "story:approved",
+        # ga-xwza2: routed through the read-cache shim — this is the "reconciler"
+        # named in the bug (30min poll), a pure eligibility-membership scan, not a
+        # read-after-write (this cycle never writes story:approved then re-reads it).
+        r = _sh(["bash", BD_LIST_CACHED, "-C", rig_root, "list", "-l", "story:approved",
                  "--status", "open", "--json", "-n", "200"],
                 timeout=BD_TIMEOUT)
         if r is None or r.returncode != 0:

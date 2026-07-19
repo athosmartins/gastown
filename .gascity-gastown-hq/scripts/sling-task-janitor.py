@@ -50,6 +50,7 @@ CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
 NOTIFY_BIN = os.environ.get("NOTIFY_BIN", "/Users/athos/.local/bin/notify")
 GC_BIN = os.environ.get("GC_BIN", "gc")
 BD_BIN = os.environ.get("BD_BIN", "bd")
+BD_LIST_CACHED = os.path.join(CITY, "scripts/bd-list-cached.sh")  # ga-xwza2: read-cache shim (ga-48xcv)
 
 ENABLED = os.environ.get("SLING_JANITOR_ENABLED", "1") == "1"
 DRY_RUN = os.environ.get("SLING_JANITOR_DRY_RUN", "0") == "1"
@@ -176,7 +177,9 @@ def _target_statuses(targets_by_store):
         ids = sorted(ids)
         if not ids:
             continue
-        r = _sh([BD_BIN, "-C", store, "show"] + ids + ["--json"], timeout=BD_TIMEOUT)
+        # ga-xwza2: routed through the read-cache shim — batched existence/status
+        # probe of already-referenced target ids, informational only.
+        r = _sh(["bash", BD_LIST_CACHED, "-C", store, "show"] + ids + ["--json"], timeout=BD_TIMEOUT)
         if r is None:
             continue
         found = set()
@@ -203,7 +206,9 @@ def _target_statuses(targets_by_store):
 def _list_open(store):
     if _bd_list_open_fn is not None:
         return _bd_list_open_fn(store)
-    r = _sh([BD_BIN, "-C", store, "list", "--json", "--status", "open,in_progress", "-n", "0"],
+    # ga-xwza2: routed through the read-cache shim — informational open/in_progress
+    # membership scan, not a read-after-write.
+    r = _sh(["bash", BD_LIST_CACHED, "-C", store, "list", "--json", "--status", "open,in_progress", "-n", "0"],
             timeout=BD_TIMEOUT)
     if r is None or r.returncode != 0:
         _log("WARN: bd list failed in %s (rc=%s)" % (os.path.basename(store), r.returncode if r else "err"))
@@ -224,7 +229,9 @@ def _gated_bead_ids():
     if _gated_fn is not None:
         return _gated_fn()
     ids = set()
-    r = _sh([BD_BIN, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",
+    # ga-xwza2: routed through the read-cache shim — informational marker scan
+    # (which beads are tracked at the gate), not a read-after-write.
+    r = _sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",
              "--status", "open", "--json", "-n", "0"], timeout=BD_TIMEOUT)
     if not r or r.returncode != 0:
         return ids

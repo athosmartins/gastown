@@ -68,6 +68,7 @@ LOG="${GTSW_LOG:-$HQ/.gc/logs/gate-throughput-stall-watchdog.log}"
 NOTIFY_BIN="${GTSW_NOTIFY_BIN:-/Users/athos/.local/bin/notify}"
 GC_BIN="${GTSW_GC_BIN:-gc}"
 BD_BIN="${GTSW_BD_BIN:-bd}"
+BD_LIST_CACHED="${GTSW_BD_LIST_CACHED:-$HQ/scripts/bd-list-cached.sh}"  # ga-xwza2: read-cache shim (ga-48xcv)
 UID_NUM="$(id -u)"
 
 GATE_STALL_COOLDOWN_S="${GATE_STALL_COOLDOWN_S:-7200}"    # 2h dedup window between Athos pages
@@ -148,7 +149,9 @@ run_sweep() {
   if [ -n "${GTSW_TEST_ACTIVE_MARKERS_JSON+x}" ]; then
     markers_json="${GTSW_TEST_ACTIVE_MARKERS_JSON}"
   elif command -v "$BD_BIN" >/dev/null 2>&1; then
-    markers_json="$("$BD_BIN" -C "$HQ" list --json -l type:quality-gate-marker --status open --limit 0 2>/dev/null)" || markers_json=""
+    # ga-xwza2: routed through the read-cache shim — a count-only liveness check
+    # (active marker count for stall detection), not a read-after-write.
+    markers_json="$(bash "$BD_LIST_CACHED" -C "$HQ" list --json -l type:quality-gate-marker --status open --limit 0 2>/dev/null)" || markers_json=""
   else
     log "WARN: bd not on PATH — cannot read gate-marker state — fail-open (no stall verdict)"
     return 0

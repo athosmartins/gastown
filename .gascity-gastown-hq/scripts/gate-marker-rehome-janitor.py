@@ -36,6 +36,7 @@ CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
 NOTIFY_BIN = os.environ.get("NOTIFY_BIN", "/Users/athos/.local/bin/notify")
 GC_BIN = os.environ.get("GC_BIN", "gc")
 BD_BIN = os.environ.get("BD_BIN", "bd")
+BD_LIST_CACHED = os.path.join(CITY, "scripts/bd-list-cached.sh")  # ga-xwza2: read-cache shim (ga-48xcv)
 
 ENABLED = os.environ.get("GATE_MARKER_REHOME_ENABLED", "1") == "1"
 DRY_RUN = os.environ.get("GATE_MARKER_REHOME_DRY_RUN", "0") == "1"
@@ -114,7 +115,9 @@ def _rig_stores():
 def _list_orphan_markers(store):
     if _list_markers_fn is not None:
         return _list_markers_fn(store)
-    r = _sh([BD_BIN, "-C", store, "list", "--json", "-l", _MARKER_TYPE_LABEL,
+    # ga-xwza2: routed through the read-cache shim — informational orphan-marker
+    # scan, not a read-after-write.
+    r = _sh(["bash", BD_LIST_CACHED, "-C", store, "list", "--json", "-l", _MARKER_TYPE_LABEL,
              "--status", "open,in_progress", "-n", "0"], timeout=BD_TIMEOUT)
     if r is None or r.returncode != 0:
         return None
@@ -140,6 +143,10 @@ def _create_in_hq(title, desc, labels):
 def _verify_hq(new_id):
     if _verify_hq_fn is not None:
         return _verify_hq_fn(new_id)
+    # ga-xwza2: NOT routed through the read-cache shim — this is a read-after-write
+    # confirming a bead this same cycle just created via _create_in_hq(); staleness
+    # here would defeat the whole point of the check (same class as the 7
+    # read-after-write sites ga-h199q left uncached in quality-gate-dispatcher.sh).
     r = _sh([BD_BIN, "-C", CITY, "show", new_id, "--json"], timeout=BD_TIMEOUT)
     return bool(r and r.returncode == 0 and (new_id in (r.stdout or "")))
 

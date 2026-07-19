@@ -64,6 +64,7 @@ CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
 NOTIFY_BIN = os.environ.get("NOTIFY_BIN", "/Users/athos/.local/bin/notify")
 GC_BIN = os.environ.get("GC_BIN", "gc")
 BD_BIN = os.environ.get("BD_BIN", "bd")
+BD_LIST_CACHED = os.path.join(CITY, "scripts/bd-list-cached.sh")  # ga-xwza2: read-cache shim (ga-48xcv)
 STATE_FILE = os.environ.get(
     "REHOME_STATE_FILE",
     os.path.join(CITY, ".gc/auto-rehome-janitor-state.json"))
@@ -244,7 +245,8 @@ def _bd_list_with_label(hq_path, label):
     """Query HQ for beads with the given label (any status). Returns list[dict] or None on error."""
     if _bd_list_fn is not None:
         return _bd_list_fn(hq_path, label)
-    r = _sh([BD_BIN, "-C", hq_path, "list", "--json", "-l", label, "-n", "100"],
+    # ga-xwza2: routed through the read-cache shim — informational label scan.
+    r = _sh(["bash", BD_LIST_CACHED, "-C", hq_path, "list", "--json", "-l", label, "-n", "100"],
             timeout=BD_TIMEOUT)
     if r is None or r.returncode != 0:
         _log("WARN: bd list -l %r failed (rc=%s)" % (label, r.returncode if r else "err"))
@@ -256,7 +258,8 @@ def _bd_show(rig_root, bead_id):
     """Fetch a specific bead as dict. Returns dict or None."""
     if _bd_show_fn is not None:
         return _bd_show_fn(rig_root, bead_id)
-    r = _sh([BD_BIN, "-C", rig_root, "show", "--json", bead_id], timeout=BD_TIMEOUT)
+    # ga-xwza2: routed through the read-cache shim — single-bead informational fetch.
+    r = _sh(["bash", BD_LIST_CACHED, "-C", rig_root, "show", "--json", bead_id], timeout=BD_TIMEOUT)
     if r is None or r.returncode != 0:
         return None
     beads = _parse_bd_json(r.stdout)

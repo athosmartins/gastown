@@ -42,6 +42,10 @@ RIG_STORES = [
     "/Users/athos/gt/whatsapp_automation",
     "/Users/athos/gt/property_scrapers",
 ]
+# ga-xwza2: read-cache shim (ga-48xcv) — this sampler polls every 60s, the
+# tightest cadence found city-wide; bd_list() is a pure telemetry read (never
+# gates a decision that writes), so a short cache TTL is pure win here.
+BD_LIST_CACHED = os.path.join(HQ, "scripts/bd-list-cached.sh")
 OUT = os.environ.get("UTIL_OUT", os.path.join(HQ, ".gc", "machine-utilization.jsonl"))
 NOTIFY = os.environ.get("UTIL_NOTIFY", "/Users/athos/.local/bin/notify")
 BUILD_FRESH_SEC = int(os.environ.get("UTIL_BUILD_FRESH_SEC", "7200"))  # 2h: matches Pilot stale-in-flight
@@ -62,7 +66,7 @@ def sh(args, timeout=20):
 
 
 def bd_list(store, *labels, status="open"):
-    args = ["bd", "-C", store, "list", "--status", status, "--json"]
+    args = ["bash", BD_LIST_CACHED, "-C", store, "list", "--status", status, "--json"]
     for l in labels:
         args += ["-l", l]
     out = sh(args)
