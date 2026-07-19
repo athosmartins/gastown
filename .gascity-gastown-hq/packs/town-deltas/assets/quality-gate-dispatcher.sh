@@ -750,6 +750,60 @@ reconcile_bare_main_to_origin() {
       echo "reconcile:${lsha}->${osha}(backup:_backup-forked-${branch}-${lsha})"; return 0 ;;
   esac
 }
+
+# ── ga-nooaw: fail-closed-by-SHA helpers ──────────────────────────────────────
+# A gate FAIL must hold the commit: production observed a later, independent
+# gate-run PASS a commit SHA an earlier run had already rejected, and merge it
+# (wa-zmw4r / commit afb59120 — the bead ended up carrying gate:failed AND
+# gate:passed AND story:done at once, since the PASS/FAIL labels are purely
+# additive and neither write removes the other's). Fix: durably stamp the
+# rejected SHA onto the source bead when a run FAILs, and refuse to merge any
+# SHA that already carries that stamp, even when THIS run's own verdict is
+# PASS. Only a NEW commit (new BRANCH_SHA — an actual code change) is unstamped
+# and can re-gate normally. These three functions (a label-naming helper, a
+# pure decision, and its bd plumbing) are defined BEFORE the lib-only guard so
+# gate-sha-fail-lock.selftest.sh can exercise all three directly — single
+# source of truth, no copy-drift between the write site (FAIL path) and the
+# read site (pre-merge check).
+
+# gate_sha_fail_label <sha> — canonical label naming the "this SHA already
+# failed" stamp. Pure string formatting; the ONLY place this label's shape is
+# spelled out, so the write and read sites can never drift apart.
+gate_sha_fail_label() {
+  printf 'gate-sha-failed:%s' "$1"
+}
+
+# gate_labels_have_sha_fail <space_joined_labels> <sha> — pure (no IO, set -e
+# safe). Prints "yes" iff the label set already carries gate_sha_fail_label(sha).
+gate_labels_have_sha_fail() {
+  local hay=" $1 " needle
+  needle=" $(gate_sha_fail_label "$2") "
+  case "$hay" in
+    *"$needle"*) printf 'yes' ;;
+    *)           printf 'no' ;;
+  esac
+}
+
+# gate_bead_has_prior_sha_fail <bead_city> <bead_id> <sha> — bd-backed. Prints
+# "yes" iff $bead_id already has a gate-sha-failed stamp for this exact $sha,
+# i.e. an EARLIER, already-terminal gate-run rejected this commit. Deliberately
+# reads `bd show` directly rather than through bd-list-cached.sh: this gates a
+# hard-to-reverse merge decision and must see live state, not a stale cache
+# (same freshness reasoning as the other gate-critical reads left uncached
+# elsewhere in this file, e.g. ga-xwza2). FAIL-OPEN on any bd/jq error ("no")
+# so a transient Dolt hiccup can never permanently wedge a legitimately-fixed
+# branch — the worst case on a hiccup is identical to pre-fix behavior.
+gate_bead_has_prior_sha_fail() {
+  local city="$1" bead="$2" sha="$3" labels
+  if [ -z "$bead" ] || [ -z "$sha" ]; then
+    printf 'no'
+    return 0
+  fi
+  labels=$(bd -C "$city" show "$bead" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
+  gate_labels_have_sha_fail "$labels" "$sha"
+}
+
 # ── ga-cw4pm: dynamic-concurrency headroom helpers ────────────────────────────
 # Mirror the Pilot's Dolt-saturation probe (pilot-dispatcher.sh _dolt_cpu/
 # _dolt_saturated) so the GATE throttles its OWN reviewer spawns the same way the
@@ -1793,6 +1847,21 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
   return 0
 fi
 
+# ── ga-nooaw: FAIL-CLOSED BY SHA ─────────────────────────────────────────────
+# A prior, independent gate-run may already have rejected this EXACT commit
+# (gate_bead_has_prior_sha_fail, defined above the lib-only guard). If so,
+# downgrade THIS run's PASS to FAIL before the merge is even attempted —
+# unlike the post-hoc downgrades below (merge-failure, post-merge integrity),
+# this check runs BEFORE do_merge_ff(), so a rejected SHA can never reach
+# $DEFAULT_BRANCH in the first place. Falls through to the existing FAIL path
+# below, reusing its self-healing/notify/labeling machinery unchanged.
+if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH_SHA" ] \
+   && [ "$(gate_bead_has_prior_sha_fail "$BEAD_CITY" "$BEAD_ID" "$BRANCH_SHA")" = "yes" ]; then
+  OVERALL_VERDICT="FAIL"
+  FAIL_REASONS="Commit $BRANCH_SHA already carries a recorded FAIL verdict from an earlier, independent gate-run (fail-closed by SHA, ga-nooaw). A prior rejection of this exact commit cannot be flipped to PASS by re-review — push a new commit with an actual fix, then re-run /gate-done."
+  warn "Fail-closed by SHA (ga-nooaw): $BRANCH_SHA already has a gate-sha-failed label on $BEAD_ID — downgrading this run's PASS to FAIL."
+fi
+
 if [ "$OVERALL_VERDICT" = "PASS" ]; then
   log "ALL PASS — proceeding to merge branch $BRANCH → $DEFAULT_BRANCH ..."
 
@@ -2496,6 +2565,12 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       "$GATE_RUN_ID" "$BRANCH" "$(echo -e "$FAIL_REASONS")")" \
       2>/dev/null || warn "Could not attach gate feedback to source bead $BEAD_ID"
     bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:failed" -q 2>/dev/null || true
+    if [ -n "$BRANCH_SHA" ]; then
+      # ga-nooaw: stamp this exact commit as rejected — see
+      # gate_bead_has_prior_sha_fail, checked before the PASS/FAIL branch
+      # above, before ANY future run (same SHA) is allowed to merge it.
+      bd -C "$BEAD_CITY" label add "$BEAD_ID" "$(gate_sha_fail_label "$BRANCH_SHA")" -q 2>/dev/null || true
+    fi
 
     if [ "$PREV_ATTEMPT" -ge "$GATE_FIX_CAP" ]; then
       # (c) RETRY CAP REACHED — stop auto-retry, escalate to the Mayor ONCE.
