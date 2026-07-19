@@ -1284,6 +1284,78 @@ else
   bad "15b. hold-label guard missing from jq filter or classifier — occurrences 2/3/5 can re-form"
 fi
 
+# ── Scenario 16: already-claimed/already-split/already-escalated RAW beads are
+#    NOT swallowed as fresh ideas (bug ga-blron: 3+ occurrences in one day —
+#    wa-ngn08/wa-4uh2w lost their dispatch entirely; wa-ku5j1 was asked to
+#    approve a split that was already decided AND already delivered [all 4
+#    children closed], then RE-ingested a 4th time despite carrying escalation
+#    labels). is_ingestable_raw gained two new OPTIONAL trailing params
+#    (assignee, has_children) — every prior call site above (Scenarios
+#    4c/4d/11/15) omits them and must stay green (backward-compat proof).
+EX="scraper build infra config deploy migration pipeline"
+echo "Scenario 16: claimed/split/escalated RAW beads are excluded (bug ga-blron)"
+
+# (a) assignee non-empty → excluded (occurrences 1-3 shape: assignee still set
+#     at the moment of ingestion).
+[ "$(auto_refino_is_ingestable_raw "wa-ngn08" "feature" "frontend" "false" "$EX" "" "" "mila-wa")" = "no" ] \
+  && ok "(a) assignee filled (mila-wa) → no (already claimed, not an orphan idea)" \
+  || bad "(a) assignee filled → expected no"
+[ "$(auto_refino_is_ingestable_raw "ga-fresh5" "feature" "frontend" "false" "$EX")" = "yes" ] \
+  && ok "(a) assignee param omitted → yes (backward-compat default, funnel not starved)" \
+  || bad "(a) omitted assignee → expected yes"
+
+# (b) has_children="yes" → excluded. Mirrors the wa-ku5j1 3rd-occurrence shape
+#     where assignee was ALREADY CLEARED by the lifecycle-coherence-janitor R4
+#     rule before this sweep ran — assignee alone (a) is NOT enough here,
+#     has_children must independently exclude it.
+[ "$(auto_refino_is_ingestable_raw "wa-ku5j1" "feature" "frontend" "false" "$EX" "" "" "" "yes")" = "no" ] \
+  && ok "(b) has_children=yes, assignee EMPTY (wa-ku5j1 shape, janitor already cleared it) → no (already split)" \
+  || bad "(b) has_children=yes → expected no (wa-ku5j1 regression would re-form)"
+[ "$(auto_refino_is_ingestable_raw "wa-upd15" "feature" "frontend" "false" "$EX")" = "yes" ] \
+  && ok "(b) has_children param omitted (wa-upd15, 0 children) → yes (no false-positive over-reject)" \
+  || bad "(b) omitted has_children → expected yes"
+[ "$(auto_refino_is_ingestable_raw "wa-upd15" "feature" "frontend" "false" "$EX" "" "" "" "no")" = "yes" ] \
+  && ok "(b) has_children=no explicit (wa-upd15) → yes" \
+  || bad "(b) has_children=no explicit → expected yes"
+# has_children/assignee guards are independent of the age guard — a freshly
+# mutated (age=0 < floor=5) bead with children is still excluded for HAVING
+# children, not merely admitted because it also happens to pass the age check
+# (mirrors the escalated+aged independence check in Scenario 4d).
+[ "$(auto_refino_is_ingestable_raw "wa-ku5j1" "feature" "frontend" "false" "$EX" "0" "5" "" "yes")" = "no" ] \
+  && ok "(d) has_children=yes + freshly-mutated (age=0 < floor=5) → still no (children guard independent of age)" \
+  || bad "(d) has_children+fresh-age → expected no"
+
+# (c) refino:policy-gap label → excluded (occurrence 4: wa-ku5j1 was
+#     RE-ingested at 22:11:43Z despite already carrying this label — the
+#     cheapest, first-line-of-defense signal after live-measuring occurrence 4).
+[ "$(auto_refino_is_ingestable_raw "wa-ku5j1" "feature" "refino:policy-gap" "false" "$EX")" = "no" ] \
+  && ok "(c) refino:policy-gap label alone → no (already escalated by refino itself, re-ask loop killed)" \
+  || bad "(c) refino:policy-gap → expected no (4th occurrence would re-form)"
+[ "$(auto_refino_is_ingestable_raw "wa-ku5j1" "feature" "gate:needs-human:product,refino:policy-gap,auto-refino:escalated" "false" "$EX")" = "no" ] \
+  && ok "(c) full 4th-occurrence label shape (gate:*+refino:policy-gap+escalated) → no" \
+  || bad "(c) 4th-occurrence label shape → expected no"
+
+# Regression: a genuinely orphan, childless, unescalated raw story is STILL
+# ingested — the starvation the RAW-ingestion fix originally solved must not
+# return (falsification required in this direction too, per the story bead).
+[ "$(auto_refino_is_ingestable_raw "ga-fresh6" "feature" "frontend" "false" "$EX" "" "" "" "no")" = "yes" ] \
+  && ok "genuine orphan raw story (no assignee, no children, no escalation) → still yes (funnel not starved)" \
+  || bad "genuine orphan raw story → expected yes (starvation regression)"
+
+# 16b. Drift-guard: assignee + refino:policy-gap are mirrored in BOTH the RAW
+#      jq filter and the classifier (defense in depth, same structure as 15b).
+#      has_children is classifier-ONLY by design (jq cannot shell out to `bd
+#      children`) — assert the classification loop actually wires it through.
+if grep -qF 'map(select(((.assignee // "") | length) == 0))' "$DISPATCHER" \
+   && grep -qF 'any(. == "refino:policy-gap")) | not' "$DISPATCHER" \
+   && grep -qF '*,refino:policy-gap,*) echo "no"' "$DISPATCHER" \
+   && grep -qF 'bd_ children "$c_id" --json' "$DISPATCHER" \
+   && grep -qF '"$c_assignee" "$c_has_children")' "$DISPATCHER"; then
+  ok "16b. claimed/split/escalated guard present in jq filter (assignee+policy-gap) AND classifier (all 3 + has_children wiring) (bug ga-blron)"
+else
+  bad "16b. claimed/split/escalated guard missing from jq filter or classifier wiring — occurrences 1-4 can re-form"
+fi
+
 echo ""
 echo "auto-refino-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

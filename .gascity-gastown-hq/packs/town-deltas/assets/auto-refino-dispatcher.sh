@@ -321,7 +321,7 @@ auto_refino_has_lifecycle_label() {
   echo "no"
 }
 
-# auto_refino_is_ingestable_raw <id> <issue_type> <labels_csv> <ephemeral> <exclude_labels> <age_minutes> <min_age_minutes>
+# auto_refino_is_ingestable_raw <id> <issue_type> <labels_csv> <ephemeral> <exclude_labels> <age_minutes> <min_age_minutes> <assignee> <has_children>
 #   Emit "yes" iff this bead is a RAW Triagem story eligible for AUTO-INGESTION
 #   into the funnel — i.e. it qualifies the way the painel's _qualifies_for_triagem
 #   does, restricted to the funnel's product-story scope. ALL must hold:
@@ -336,11 +336,31 @@ auto_refino_has_lifecycle_label() {
 #       since updated_at) must be >= min_age_minutes. age_minutes/min_age_minutes
 #       are OPTIONAL (trailing, default ""/0) so every pre-existing call site
 #       keeps its exact prior behaviour unless it opts in by passing them.
+#     - NOT already claimed / already split / already escalated by refino's own
+#       policy-gap (bug ga-blron: auto-refino swallowed already-owned work as if
+#       it were a raw idea — lost dispatch, and re-asked Athos decisions already
+#       made or already executed, 3+ occurrences in one day). assignee/
+#       has_children are ALSO OPTIONAL trailing params (default ""/"no"), same
+#       backward-compat convention as age_minutes/min_age_minutes:
+#         - assignee non-empty → someone already owns this bead. Cheap, but NOT
+#           sufficient alone — the lifecycle-coherence-janitor's R4 rule clears
+#           assignee on ctx:ready/story:approved beads without checking
+#           liveness, so a genuinely-claimed bead can arrive here with an empty
+#           assignee (measured live on wa-ku5j1). has_children is the robust
+#           fallback for exactly that gap.
+#         - has_children="yes" (caller MUST compute via `bd children <id>
+#           --json`, length>0 — NOT dependent_count: measured live to disagree
+#           with itself between `bd list` and `bd show`, and it does not track
+#           PARENT relationships at all, only `dep add` edges) → already split
+#           into sub-work; refining/re-splitting the parent re-asks a decision
+#           already taken (wa-ku5j1's children were all closed — already
+#           delivered, not just decided).
 #   Status (open) is enforced at the query level (--status open), exactly as the
 #   labelled queries already are; this pure predicate covers the rest.
 auto_refino_is_ingestable_raw() {
   local id="$1" itype="$2" labels="$3" ephemeral="$4" ex="${5:-}"
   local age_min="${6:-}" min_age="${7:-0}"
+  local assignee="${8:-}" has_children="${9:-no}"
   # Sanitize like auto_refino_next_attempt: garbage/empty age_min fails OPEN
   # (treated as ancient, i.e. never age-excluded) so a missing/unparseable
   # updated_at can never silently starve the RAW funnel. Garbage min_age
@@ -369,6 +389,12 @@ auto_refino_is_ingestable_raw() {
   # RAW and gets re-ingested every sweep. Any gate:* label disqualifies it (the RAW
   # jq query also drops it; classifier-side defense in depth). csv is comma-wrapped.
   case "$csv" in *,gate:*) echo "no"; return ;; esac
+  # already flagged by refino's OWN policy-gap escalation (bug ga-blron, 4th
+  # occurrence, wa-ku5j1): a bead carrying refino:policy-gap already went
+  # through refino and is waiting on a human decision (e.g. "approve this
+  # split") — re-ingesting it loops the same already-answered/already-executed
+  # ask (the RAW jq query mirrors this too; classifier-side defense in depth).
+  case "$csv" in *,refino:policy-gap,*) echo "no"; return ;; esac
   # under an active hold from another authority (bug ga-268cr, occurrences
   # 2/3/5/6): blocked:*, needs-human*, pilot:held* (bare or -until:<epoch>),
   # blocked-on:* (hyphenated — a DISTINCT prefix from blocked:*, not a typo),
@@ -383,6 +409,16 @@ auto_refino_is_ingestable_raw() {
   # not landed yet). Wait it out rather than mistake it for genuinely-raw work
   # (the RAW jq query mirrors this too; classifier-side defense in depth).
   [ "$age_min" -lt "$min_age" ] && { echo "no"; return; }
+  # already-ASSIGNED (bug ga-blron, occurrences 1-3): someone already claimed
+  # this bead — not an orphan idea waiting for triage, it is dispatched work.
+  # The RAW jq query mirrors this too; classifier-side defense in depth. NOT
+  # sufficient alone (see has_children below and the param doc above).
+  [ -n "$assignee" ] && { echo "no"; return; }
+  # already SPLIT (bug ga-blron, occurrence 3, wa-ku5j1: 4 children, all
+  # closed). NOT mirrored in the RAW jq query — that layer is pure jq and
+  # cannot make the live `bd children` call this needs; this classifier call is
+  # the only enforcement point.
+  [ "$has_children" = "yes" ] && { echo "no"; return; }
   # build/scraper/non-product beads are excluded just like labelled candidates.
   [ "$(auto_refino_is_product_story "$labels" "$ex")" = "yes" ] || { echo "no"; return; }
   echo "yes"
@@ -868,6 +904,21 @@ if [ "$AUTO_REFINO_INGEST_RAW_TRIAGEM" = "1" ]; then
     # (ga-oonk3 re-ingested 3x). Any gate:* label means NOT a raw Triagem story.
     # Mirrors the auto-refino:escalated guard directly above.
     | map(select(((.labels // []) | any(type=="string" and startswith("gate:"))) | not))
+    # Drop beads already flagged by an existing refino policy-gap escalation
+    # (bug ga-blron, 4th occurrence, wa-ku5j1): refino:policy-gap means this
+    # bead already went through refino and is waiting on a human decision —
+    # re-ingesting loops the same already-answered/already-executed ask.
+    # Mirrors the classifier-side guard in auto_refino_is_ingestable_raw.
+    | map(select(((.labels // []) | any(. == "refino:policy-gap")) | not))
+    # Drop already-ASSIGNED beads (bug ga-blron, occurrences 1-3): someone
+    # already claimed this bead — it is dispatched work, not an orphan idea
+    # waiting for triage. Mirrors the classifier-side guard in
+    # auto_refino_is_ingestable_raw. NOT sufficient alone (a claimed bead can
+    # have its assignee cleared by the lifecycle-coherence-janitor R4 rule
+    # without checking liveness) — the classifier has_children check is the
+    # robust fallback for that gap; it needs a live `bd children` call this
+    # pure jq layer cannot make, so it is NOT mirrored here.
+    | map(select(((.assignee // "") | length) == 0))
     # Drop beads under an active hold from another authority (bug ga-268cr,
     # occurrences 2/3/5/6): blocked:*, needs-human*, pilot:held* (bare or
     # -until:<epoch>), blocked-on:* (hyphenated — distinct prefix from
@@ -937,11 +988,26 @@ while IFS= read -r row; do
       # it and flag it for story:unrefined pre-labelling (Step 1b), after which it
       # flows through the identical "fresh" path. The labelled-input behaviour
       # above is untouched — this branch only ever fires for no-label beads.
-      if [ "$AUTO_REFINO_INGEST_RAW_TRIAGEM" = "1" ] \
-         && [ "$(auto_refino_is_ingestable_raw "$c_id" "$c_type" "$c_labels" "$c_ephemeral" "$AUTO_REFINO_EXCLUDE_LABELS" "$c_age_min" "$AUTO_REFINO_RAW_MIN_AGE_MINUTES")" = "yes" ]; then
-        STORY="$row"; RAW_INGEST=1
-        log "  ingest $c_id: raw Triagem story (no story:* label) → applying story:unrefined entry label"
-        break
+      if [ "$AUTO_REFINO_INGEST_RAW_TRIAGEM" = "1" ]; then
+        # has_children (bug ga-blron, occurrence 3, wa-ku5j1): computed HERE,
+        # lazily, only for the specific candidate reaching this branch — never
+        # upfront for every RAW_JSON row — so a normal sweep costs at most one
+        # extra `bd children` call (the loop breaks on the first eligible
+        # candidate). Uses `bd children` (the PARENT relationship), NOT
+        # dependent_count, which measured live to disagree with itself between
+        # `bd list` and `bd show` and does not track PARENT edges at all (see
+        # the param doc on auto_refino_is_ingestable_raw). A failed/empty `bd
+        # children` call fails OPEN (c_has_children stays "no") — never a new
+        # starvation vector for a genuinely childless raw bead.
+        c_has_children="no"
+        if bd_ children "$c_id" --json 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1; then
+          c_has_children="yes"
+        fi
+        if [ "$(auto_refino_is_ingestable_raw "$c_id" "$c_type" "$c_labels" "$c_ephemeral" "$AUTO_REFINO_EXCLUDE_LABELS" "$c_age_min" "$AUTO_REFINO_RAW_MIN_AGE_MINUTES" "$c_assignee" "$c_has_children")" = "yes" ]; then
+          STORY="$row"; RAW_INGEST=1
+          log "  ingest $c_id: raw Triagem story (no story:* label) → applying story:unrefined entry label"
+          break
+        fi
       fi
       : ;;  # skip
   esac
