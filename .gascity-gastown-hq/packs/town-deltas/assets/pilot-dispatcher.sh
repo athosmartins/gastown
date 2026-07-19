@@ -1289,6 +1289,30 @@ _pilot_gate_congested() {
 # step. They have no side effects at definition time; the dispatch queries below
 # still call _filter_candidates/_filter_unblocked/_filter_explicit_deps unchanged.
 
+# ── ga-yolmi PASSO 1: per-bead exclusion trace helper ─────────────────────────
+# Every _filter_* stage in the dispatch chain (_filter_exec_manual, _filter_candidates,
+# _filter_dispatch_gates, _filter_built, _filter_unblocked, _filter_explicit_deps) now
+# logs ONE line per bead it drops, naming the bead id, the filter, and the specific
+# reason — the fix for the class of incident where an aggregate "dispatched=0" or a
+# missing bead from the candidate pool gave no trail (ga-f7bek: ~2h of manual jq replay
+# to find a single next-action: label veto; see docs on root-class:error-vs-empty).
+# DELTA-ONLY: each caller computes its real (unchanged) filtered output first, then
+# separately identifies which ids were dropped and why, and pipes "id<TAB>reason" rows
+# through this helper. In a healthy sweep (nothing excluded) no caller produces any
+# rows, so this is silent — AC2 (no log-volume explosion) holds by construction, not by
+# an env-gate. Writes to STDERR ONLY (routed to $LOG by the top-level `exec >> $LOG
+# 2>&1`, ga-1298) — a filter's STDOUT is a live JSON pipe consumed by the next filter
+# in the chain via command substitution; anything this helper wrote to stdout would
+# corrupt that JSON and silently change dispatch behavior. Never call it other than
+# piped/redirected so its own stdout stays empty.
+_log_exclusions() {
+  local _fname="$1" _id _reason
+  while IFS=$'\t' read -r _id _reason; do
+    [ -z "$_id" ] && continue
+    log "[pilot] EXCLUÍDO $_id por $_fname: $_reason" >&2
+  done
+}
+
 _FILTER_PREAPPROVAL_LABELS='["story:unrefined","story:refinement-in-progress","story:triage","story:cancelled"]'
 # ga-am6h: mirrors MAX_RECLAIMS in scripts/inflight-reclaim-guard.py (line ~101) —
 # keep the two in sync by hand; there is no shared bash/python helper (see that
@@ -1301,7 +1325,9 @@ _filter_candidates() {
   # The janitor R6 removes expired labels on its next sweep; this filter lets the
   # Pilot bypass the hold without waiting for the janitor when the expiry is clear.
   local _now_ts; _now_ts=$(date +%s)
-  jq --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
+  local _cf_in; _cf_in=$(cat)
+  local _cf_out _cf_kept
+  _cf_out=$(printf '%s' "$_cf_in" | jq --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
      --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" \
     '[.[] | select(
         .id != $self
@@ -1424,7 +1450,59 @@ _filter_candidates() {
              | test("gascity.*rebuild|rebuild.*gascity|swap.*bin[áa]rio|swap.*binary|binary swap|town bounce|engine[ -]window"; "i")
              | not)
      )]' \
-    2>/dev/null || echo "[]"
+    2>/dev/null)
+  [ -z "$_cf_out" ] && _cf_out="[]"
+
+  # ── ga-yolmi PASSO 1: per-bead exclusion trace (see _log_exclusions). This pass
+  # NEVER influences $_cf_out — it independently mirrors each clause above, read-only,
+  # restricted (via $kept) to ids already known to be dropped. A bug in this mirror
+  # can only under-report a reason, never change what actually gets dispatched.
+  _cf_kept=$(printf '%s' "$_cf_out" | jq -c '[.[].id]' 2>/dev/null); [ -z "$_cf_kept" ] && _cf_kept="[]"
+  printf '%s' "$_cf_in" | jq -r --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
+      --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" --argjson kept "$_cf_kept" '
+      .[] | . as $b | ($b.id // "") as $id | ($b.labels // []) as $L
+      | select($id != "" and (($kept | index($id)) | not))
+      | [
+          (if $id == $self then "self-bead" else empty end),
+          (if (($b.assignee // "") != "") then "assignee:\($b.assignee)" else empty end),
+          (if ((($b.issue_type // $b.type // "")) == "epic") then "issue_type:epic" else empty end),
+          (if ($L | index("story:epic-split")) then "label:story:epic-split" else empty end),
+          (if (($b.metadata["gc.root_bead_id"] // "") | test("\\S")) then "graph.v2-step:gc.root_bead_id" else empty end),
+          (if (($b.metadata["gc.formula_contract"] // "") | test("\\S")) then "graph.v2-root:gc.formula_contract" else empty end),
+          (if ((($b.metadata["gc.kind"] // "") as $k
+                | ["workflow","scope","ralph","retry","check","fanout","retry-eval","scope-check","workflow-finalize"]
+                | index($k)) != null) then "gc.kind:\($b.metadata["gc.kind"] // "")" else empty end),
+          (if ( ($L | index("pilot:held"))
+                and (($L | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber)) |
+                     if length > 0 then (max >= $now_ts) else true end) )
+           then "pilot:held(not-expired)" else empty end),
+          (if ( ($L | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | tonumber)) |
+                if length > 0 then (max >= $reclaim_cap) else false end )
+           then "pilot:reclaim-count>=cap(\($reclaim_cap))" else empty end),
+          ( ($L | map(select(. as $x | $preapproval | index($x)))) as $pa
+            | if ($pa | length) > 0 then "preapproval-label:\($pa | join(","))" else empty end ),
+          ( ($L | map(select(
+              startswith("gate:needs-human")
+              or startswith("pool:refused")
+              or . == "story:needs-human"
+              or . == "story:needs-device"
+              or . == "on-device"
+              or . == "story:blocked"
+              or . == "engine-window:pending"
+              or . == "framework:engine"
+              or . == "story:awaiting-external-merge"
+            ))) as $bl
+            | if ($bl | length) > 0 then "blocking-label:\($bl | join(","))" else empty end ),
+          (if ((($b.description // "") | test("\\S")) | not) then "empty-description" else empty end),
+          (if ( ((($b.title // "") + " " + ($b.description // ""))
+                 | test("gascity.*rebuild|rebuild.*gascity|swap.*bin[áa]rio|swap.*binary|binary swap|town bounce|engine[ -]window"; "i")) )
+           then "engine-rebuild-text-pattern" else empty end)
+        ] as $reasons
+      | select(($reasons | length) > 0)
+      | [$id, ($reasons | join(";"))] | @tsv
+    ' 2>/dev/null | _log_exclusions "_filter_candidates"
+
+  printf '%s' "$_cf_out"
 }
 # ── parking-label pre-filter (upstream of dispatch, additive to ga-zzrts) ─────
 # The bd list queries use exact --exclude-label matching. Labels like
@@ -1485,6 +1563,12 @@ _filter_unblocked() {
 
   if [ "$before" != "$after" ]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: excluded $((before - after)) blocked candidate(s) in $db_dir (unresolved deps — ga-5ew fix)" >&2
+    # ga-yolmi PASSO 1: name each dropped id (dropped == member of $blk, the
+    # exact predicate `filtered` above already applied — pure re-read, no
+    # influence on $filtered).
+    printf '%s' "$arr" | jq -r --argjson blk "$blocked_json" \
+      '.[] | select((.id as $i | $blk | index($i))) | [.id, "blocked by unresolved dependency (bd blocked — ga-5ew)"] | @tsv' \
+      2>/dev/null | _log_exclusions "_filter_unblocked"
   fi
   printf '%s' "$filtered"
 }
@@ -1552,6 +1636,9 @@ _filter_explicit_deps() {
       if [ -n "$dep_status" ] && [ "$dep_status" != "closed" ]; then
         held_ids="$held_ids $bid"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: holding $bid — explicit dep $dep is '$dep_status' (not closed) [story.depends_on_beads — ga-do8jj fix]" >&2
+        # ga-yolmi PASSO 1: standardized per-bead exclusion line (alongside the
+        # existing WARN above, unchanged for anything already parsing it).
+        log "[pilot] EXCLUÍDO $bid por _filter_explicit_deps: dep $dep status=$dep_status (story.depends_on_beads)" >&2
         break
       fi
     done
@@ -1579,8 +1666,20 @@ _filter_explicit_deps() {
 # (conservative default: absent exec: label → dispatch is fine, never suppress).
 # Pure read (no side effects); fail-open → pass through unchanged on jq error.
 _filter_exec_manual() {
-  jq '[ .[] | select(((.labels // []) | index("exec:manual")) == null) ]' \
-    2>/dev/null || cat
+  local _em_in _em_out
+  _em_in=$(cat)
+  _em_out=$(printf '%s' "$_em_in" | jq '[ .[] | select(((.labels // []) | index("exec:manual")) == null) ]' 2>/dev/null)
+  if [ -z "$_em_out" ]; then
+    printf '%s' "$_em_in"
+    return
+  fi
+  # ga-yolmi PASSO 1: single-clause filter, so every dropped id shares one reason.
+  printf '%s' "$_em_in" | jq -r --argjson kept "$(printf '%s' "$_em_out" | jq -c '[.[].id]' 2>/dev/null || echo '[]')" '
+      .[] | . as $b | ($b.id // "") as $id
+      | select($id != "" and (($kept | index($id)) | not))
+      | [$id, "label:exec:manual"] | @tsv
+    ' 2>/dev/null | _log_exclusions "_filter_exec_manual"
+  printf '%s' "$_em_out"
 }
 # _filter_dispatch_gates — ga-mfeip dispatch quality gates (a)+(b)+(c)+(d). Drop
 # ctx:ready candidates that are not safely auto-buildable by a crew:
@@ -1632,33 +1731,46 @@ _filter_dispatch_gates() {
             or (test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))
           )) | length) == 0)
     )]'
-  if [ "${PILOT_DISPATCH_GATES_DEBUG:-0}" != "1" ]; then
-    jq --argjson floor "$floor" "$_gate_filter" 2>/dev/null || cat
+  local _dg_input _dg_out _dg_reasons
+  _dg_input=$(cat)
+  _dg_out=$(printf '%s' "$_dg_input" | jq --argjson floor "$floor" "$_gate_filter" 2>/dev/null)
+  if [ -z "$_dg_out" ]; then
+    printf '%s' "$_dg_input"
     return
   fi
-  # Debug path: buffer stdin (consumed once, reused below) and additionally report
-  # per-bead veto reasons via `log` before producing the SAME output as the default
-  # path (via the shared $_gate_filter string — no separate copy to drift out of sync).
-  local _input
-  _input=$(cat)
-  printf '%s' "$_input" | jq --argjson floor "$floor" -r '
+
+  # ── ga-yolmi PASSO 1 (supersedes the old PILOT_DISPATCH_GATES_DEBUG-only trace,
+  # ga-f7bek): per-bead veto reasons, mirroring each clause of $_gate_filter
+  # individually. Read-only — never influences $_dg_out above. Always computed
+  # (not gated) so a delta produces a trace unconditionally; PILOT_DISPATCH_GATES_DEBUG=1
+  # additionally emits the older verbose single-line-per-bead form for anything
+  # already parsing that exact format.
+  _dg_reasons=$(printf '%s' "$_dg_input" | jq --argjson floor "$floor" -r '
       .[] | . as $b
       | [
           (if ((($b.status) // "open") as $s | ($s == "blocked" or $s == "closed" or $s == "deferred")) then "status:\($b.status // "open")" else empty end),
-          (if ( ((($b.metadata["story.criterios"]) // "") | test("\\S")) or ((($b.description) // "") | length) >= $floor ) then empty else "no-spec" end),
-          (if ((($b.labels) // []) | map(select(test("^(blocked-on|depends-on):"))) | length) == 0 then empty else "precondition-label" end),
+          (if ( ((($b.metadata["story.criterios"]) // "") | test("\\S")) or ((($b.description) // "") | length) >= $floor ) then empty else "no-spec(empty-criterios,desc<\($floor)chars)" end),
+          ( ((($b.labels) // []) | map(select(test("^(blocked-on|depends-on):")))) as $pl
+            | if ($pl | length) == 0 then empty else "precondition-label:\($pl | join(","))" end ),
           (if (((($b.title) // "") + " " + (($b.description) // "")) | ascii_downcase | test("design[ -]?first")) then "design-first" else empty end),
-          (if ((($b.labels) // []) | map(select(
+          ( ((($b.labels) // []) | map(select(
                 test("^waiting-on:")
                 or (test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))
-              )) | length) == 0 then empty else "waiting-or-next-action" end)
+              ))) as $wl
+            | if ($wl | length) == 0 then empty else "blocking-label:\($wl | join(","))" end )
         ] as $reasons
       | select(($reasons | length) > 0)
-      | [$b.id, ($reasons | join(","))] | @tsv
-    ' 2>/dev/null | while IFS=$'\t' read -r _vid _vreasons; do
-        log "_filter_dispatch_gates veto id=$_vid reasons=$_vreasons" >&2
-      done || true
-  printf '%s' "$_input" | jq --argjson floor "$floor" "$_gate_filter" 2>/dev/null || printf '%s' "$_input"
+      | [$b.id, ($reasons | join(";"))] | @tsv
+    ' 2>/dev/null)
+  printf '%s\n' "$_dg_reasons" | _log_exclusions "_filter_dispatch_gates"
+  if [ "${PILOT_DISPATCH_GATES_DEBUG:-0}" = "1" ]; then
+    printf '%s\n' "$_dg_reasons" | while IFS=$'\t' read -r _vid _vreasons; do
+      [ -z "$_vid" ] && continue
+      log "_filter_dispatch_gates veto id=$_vid reasons=$_vreasons" >&2
+    done
+  fi
+
+  printf '%s' "$_dg_out"
 }
 # _filter_built — drop ctx:ready candidates that ALREADY have a crew OR dog fix/ branch
 # (built work awaiting gate/delivery, NOT a fresh dispatch candidate; ga-6jqr: the branch
@@ -1673,6 +1785,7 @@ _filter_dispatch_gates() {
 # unresolved probe — the opposite of the reclaim-side fail-open).
 _filter_built() {
   local repos arr id r built_ids="" ingate_ids="" _bounced _glabel
+  local built_reasons="" ingate_reasons="" _matched_ref _out _kept_sp _bid _breason
   arr=$(cat)
 
   # ── (wa-8y45 leak) GATE-MARKER + GATE-LABEL consultation ─────────────────────
@@ -1702,10 +1815,16 @@ _filter_built() {
       # gate:needs-fix → re-dispatchable; drop ONLY if a marker is actively re-gating now.
       if _beadid_has_active_gate_artifact "$id"; then
         ingate_ids="${ingate_ids:+$ingate_ids }$id"
+        ingate_reasons="${ingate_reasons}${id}"$'\t'"gate:needs-fix + actively re-gating (open marker)"$'\n'
       fi
     elif [ "$_glabel" = "1" ] || _beadid_has_open_gate_marker "$id"; then
       # a gate:* lifecycle label OR any OPEN quality-gate-marker → built / in the gate.
       ingate_ids="${ingate_ids:+$ingate_ids }$id"
+      if [ "$_glabel" = "1" ]; then
+        ingate_reasons="${ingate_reasons}${id}"$'\t'"gate:* lifecycle label present"$'\n'
+      else
+        ingate_reasons="${ingate_reasons}${id}"$'\t'"open quality-gate-marker (source-bead)"$'\n'
+      fi
     fi
   done < <(printf '%s' "$arr" | jq -r '
       .[]? | (.labels // []) as $L | (.id // "") as $id | select($id != "")
@@ -1724,6 +1843,9 @@ _filter_built() {
   # (fail-open to KEEP; the gate consultation above still applies independently).
   if [ -n "${PILOT_TEST_BRANCH_BEADS+x}" ]; then
     built_ids="$PILOT_TEST_BRANCH_BEADS"
+    for id in $built_ids; do
+      built_reasons="${built_reasons}${id}"$'\t'"branch exists (PILOT_TEST_BRANCH_BEADS test seam)"$'\n'
+    done
   elif command -v git >/dev/null 2>&1; then
     repos="$(_ownership_guard_repos)"
     if [ -n "$repos" ]; then
@@ -1731,10 +1853,13 @@ _filter_built() {
         [ -z "$id" ] && continue
         while IFS= read -r r; do
           [ -n "$r" ] && [ -d "$r" ] || continue
-          if git -C "$r" for-each-ref --format='%(refname)' \
+          _matched_ref=$(git -C "$r" for-each-ref --format='%(refname)' \
                "refs/remotes/origin/crew/*/$id" "refs/heads/crew/*/$id" \
-               "refs/remotes/origin/fix/$id-*" "refs/heads/fix/$id-*" 2>/dev/null | grep -q .; then
-            built_ids="${built_ids:+$built_ids }$id"; break
+               "refs/remotes/origin/fix/$id-*" "refs/heads/fix/$id-*" 2>/dev/null | head -1)
+          if [ -n "$_matched_ref" ]; then
+            built_ids="${built_ids:+$built_ids }$id"
+            built_reasons="${built_reasons}${id}"$'\t'"branch $_matched_ref exists"$'\n'
+            break
           fi
         done <<< "$repos"
       done < <(printf '%s' "$arr" | jq -r '.[]?.id // empty' 2>/dev/null)
@@ -1748,13 +1873,29 @@ _filter_built() {
   if [ -z "$built_ids" ] && [ -z "$ingate_ids" ]; then
     printf '%s' "$arr"; return
   fi
-  printf '%s' "$arr" | jq --arg b "$built_ids" --arg g "$ingate_ids" '
+  _out=$(printf '%s' "$arr" | jq --arg b "$built_ids" --arg g "$ingate_ids" '
       ($b|split(" ")) as $bi | ($g|split(" ")) as $gi
       | [ .[] | select(
             ( ((.id as $i | $bi | index($i)) | not) or ((.labels // []) | index("gate:needs-fix")) )
             and ((.id as $i | $gi | index($i)) | not)
         ) ]' \
-    2>/dev/null || printf '%s' "$arr"
+    2>/dev/null || printf '%s' "$arr")
+
+  # ── ga-yolmi PASSO 1: per-bead exclusion trace. Read-only re-derivation of why
+  # an id present in $arr is absent from $_out, using the reason strings already
+  # collected above (built_reasons / ingate_reasons — including the gate:needs-fix
+  # carve-out, since a needs-fix id only ends up in ingate_reasons when actively
+  # re-gated). Never influences $_out.
+  _kept_sp=" $(printf '%s' "$_out" | jq -r '.[].id' 2>/dev/null | tr '\n' ' ')"
+  { printf '%s' "$built_reasons"; printf '%s' "$ingate_reasons"; } | while IFS=$'\t' read -r _bid _breason; do
+    [ -z "$_bid" ] && continue
+    case "$_kept_sp" in
+      *" $_bid "*) continue ;;
+    esac
+    log "[pilot] EXCLUÍDO $_bid por _filter_built: $_breason" >&2
+  done
+
+  printf '%s' "$_out"
 }
 
 # ── wa-u5r1: emit the Pilot's FULL dispatchable queue for the painel ──────────

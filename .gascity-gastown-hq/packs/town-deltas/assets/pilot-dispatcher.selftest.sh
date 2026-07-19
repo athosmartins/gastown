@@ -797,7 +797,9 @@ fi
 # the candidate pool — else story:approved + empty assignee re-dispatches the held worker in
 # ~2min. One clause in _filter_candidates (the single chokepoint for every dispatch path).
 echo "Scenario 3e2: a pilot:held bead is excluded from the candidate pool (durable worker release)"
-_FC_FN="$(awk '/^_FILTER_PREAPPROVAL_LABELS=/{print} /^_FILTER_RECLAIM_CAP=/{print} /^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_FC_FN="$(grep '^log()' "$DISPATCHER")
+$(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
+$(awk '/^_FILTER_PREAPPROVAL_LABELS=/{print} /^_FILTER_RECLAIM_CAP=/{print} /^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 _fc() { ( eval "$_FC_FN"; SELF_BEAD_ID=""; echo "$1" | _filter_candidates | jq -rc '[.[].id]' ); }
 HELD='[{"id":"bd-held","assignee":null,"labels":["story:approved","pilot:held"],"description":"x"},{"id":"bd-free","assignee":null,"labels":["story:approved"],"description":"x"}]'
 [ "$(_fc "$HELD")" = '["bd-free"]' ] && ok "pilot:held bead excluded; free story:approved kept (durable release holds)" || bad "pilot:held not excluded (got: $(_fc "$HELD"))"
@@ -3020,7 +3022,9 @@ has "$DISPATCHER" '_filter_exec_manual | _filter_candidates | _filter_dispatch_g
 # UNLESS it names a refino crew-build-routing form (ga-f7bek: next-action:<crew>-constroi
 # means "ready, <crew> builds it" — the OPPOSITE of "blocked", so it must NOT be excluded;
 # see the dedicated "Scenario ga-f7bek" block below for full AC coverage).
-_FDG="$(awk '/^_filter_dispatch_gates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_FDG="$(grep '^log()' "$DISPATCHER")
+$(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
+$(awk '/^_filter_dispatch_gates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 FDG_OUT="$(eval "$_FDG"; printf '%s' '[
   {"id":"fdg-clean","status":"open","description":"a ready bead with a full description over the floor length","labels":["lane:small"]},
   {"id":"fdg-wait","status":"open","description":"a ready bead with a full description over the floor length","labels":["waiting-on:survival-wa-flba"]},
@@ -3402,7 +3406,9 @@ has "$DISPATCHER" 'exclude-label "gate:needs-fix"' "ctx:ready query excludes gat
 # _filter_built now also consults the HQ gate markers (wa-8y45 leak), so extract its two
 # gate helpers alongside it. Gate seams are set EMPTY (defined→hermetic, no live Dolt) in
 # the branch-only cases so the gate consultation is a no-op there.
-_FB_FN="$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} /^_beadid_has_open_gate_marker\(\)/{f=1} /^_filter_built\(\)/{f=1} f{print} f&&/^}$/{f=0}' "$DISPATCHER")"
+_FB_FN="$(grep '^log()' "$DISPATCHER")
+$(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
+$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} /^_beadid_has_open_gate_marker\(\)/{f=1} /^_filter_built\(\)/{f=1} f{print} f&&/^}$/{f=0}' "$DISPATCHER")"
 FB_OUT="$(eval "$_FB_FN"; export PILOT_TEST_BRANCH_BEADS="wa-built" PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS=""; printf '%s' '[{"id":"wa-built"},{"id":"wa-fresh"}]' | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
 if [ "$FB_OUT" = '["wa-fresh"]' ]; then
   ok "_filter_built drops the built (branched) bead, keeps the fresh candidate"
@@ -4321,7 +4327,9 @@ git -C "$GJ6_PUSHER" commit -q --allow-empty -m init
 git -C "$GJ6_PUSHER" remote add origin "$GJ6_BARE"
 git -C "$GJ6_PUSHER" push -q origin HEAD:refs/heads/fix/gj6-remoteonly-slug
 
-_GJ6_FILTER_BUILT_FN="$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} /^_beadid_has_open_gate_marker\(\)/{f=1} /^_filter_built\(\)/{f=1} f{print} f&&/^}$/{f=0}' "$DISPATCHER")"
+_GJ6_FILTER_BUILT_FN="$(grep '^log()' "$DISPATCHER")
+$(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
+$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} /^_beadid_has_open_gate_marker\(\)/{f=1} /^_filter_built\(\)/{f=1} f{print} f&&/^}$/{f=0}' "$DISPATCHER")"
 _GJ6_TARGET_HAS_REAL_BRANCH_FN="$(awk '/^_target_has_real_branch\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 _GJ6_HAS_CREW_BRANCH_FN="$(awk '/^_beadid_has_crew_branch\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 
@@ -4377,7 +4385,9 @@ echo "Scenario ga-f7bek: _filter_dispatch_gates next-action crew-routing vs wait
 # means the OPPOSITE — "ready, <crew> builds it". This silently starved 10/15 approved
 # WA stories up to 24h, with only the aggregate dispatchable count reading "0" (no
 # per-bead signal to shortcut the ~2h it took to root-cause the first time).
-_FDG_F7BEK="$(awk '/^_filter_dispatch_gates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_FDG_F7BEK="$(grep '^log()' "$DISPATCHER")
+$(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
+$(awk '/^_filter_dispatch_gates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 
 # (a) AC2+AC3, real label shapes from ga-f7bek's own investigation (wa-pltmi/91agg/
 # q4os9/ys0cy) plus real WA rig data checked directly against this fix (wa-odbh9,
