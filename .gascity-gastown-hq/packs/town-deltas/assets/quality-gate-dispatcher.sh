@@ -4488,7 +4488,19 @@ if [ -z "$BRANCH_SHA" ]; then
       -s "Gate: $BRANCH absent from origin, uncommitted local work (${BEAD_ID:-unknown})" \
       -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) is absent from origin; its local worktree has UNCOMMITTED changes — looks like the session died mid-edit. NOT auto-pushed (ga-tgwq): could silently strand the pending diff. Please inspect and decide: commit+push, or discard." 2>/dev/null \
       || warn "Could not mail Mayor for dirty-local branch $BRANCH"
-    log "ga-tgwq: branch $BRANCH absent from origin with dirty local worktree — marker $MARKER_ID at gate-status:error, bead $BEAD_ID set needs-human, Mayor mailed."
+    # ga-y43lq/ga-u4yi: durable mail to the AUTHOR too, not just Mayor — this
+    # site sets gate:needs-human above (line ~4480) but, unlike every other
+    # gate:needs-human site in this file (the park/ga-acb path below, plus
+    # ahead_dead/behind_dead/retry_dead), it never told the author their own
+    # branch needed attention — they'd only find out from a Mayor-only mail
+    # or by noticing the bead went quiet. Same convention as those sites.
+    if [ -n "$AUTHOR" ]; then
+      gc --city "$GC_CITY" mail send "$AUTHOR" \
+        -s "Gate needs-human: $BRANCH has uncommitted local work ($BEAD_ID)" \
+        -m "Your branch $BRANCH (bead $BEAD_ID) is absent from origin, and its local worktree has UNCOMMITTED changes — looks like your session died mid-edit. Source bead $BEAD_ID is now labeled gate:needs-human: the Pilot will NOT re-dispatch it, and any further /gate-done resubmission for this bead will be silently parked until a human resolves this. Please inspect the local worktree and decide: commit+push, or discard, before resubmitting." \
+        2>/dev/null || warn "Could not mail author $AUTHOR for dirty-local branch $BRANCH"
+    fi
+    log "ga-tgwq: branch $BRANCH absent from origin with dirty local worktree — marker $MARKER_ID at gate-status:error, bead $BEAD_ID set needs-human, Mayor + author mailed."
     exit 0
   fi
   # _NB_CLASS = "park": no local ref either — falls through to the original

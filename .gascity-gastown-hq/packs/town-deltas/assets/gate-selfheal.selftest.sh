@@ -153,12 +153,17 @@ echo "── 8. drift-guard: ga-u4yi — AUTHOR (not just Mayor) is mailed at ev
 # total silence because only the Mayor was mailed — the AUTHOR had no durable
 # signal, only an ephemeral bd comment. Fix: mail "$AUTHOR" (survives a dead/
 # restarted session, unlike nudge) at EVERY site that applies gate:needs-human.
-# There are exactly 5 such sites: no_branch, ahead_dead, behind_dead, retry_dead, cap-exhaustion.
+# There are exactly 6 such sites: no_branch/rescuable-park (ga-acb), no_branch/
+# escalate-dirty-worktree (ga-tgwq — added after this guard was written, fixed
+# for the missing author-mail by ga-y43lq), ahead_dead, behind_dead, retry_dead,
+# cap-exhaustion.
 # (ga-5kx3 already bumped this 4→5 in main, in parallel with the ga-u4yi drive-by on this
-# branch — same count, kept the main version on cherry-pick. ga-huaxo replaces this magic
-# number with a bijection guard next.)
-eq "gate mails AUTHOR at all 5 gate:needs-human sites (ga-u4yi)" \
-   "$(grep -c 'mail send "\$AUTHOR"' "$GATE")" "5"
+# branch — same count, kept the main version on cherry-pick. ga-y43lq bumped 5→6 for the
+# ga-tgwq escalate site this magic number silently missed (adding a site never changes an
+# existing count, so a stale N never goes RED on its own — see ga-huaxo, which replaces
+# this magic number with a bijection guard next so this class of gap can't recur).
+eq "gate mails AUTHOR at all 6 gate:needs-human sites (ga-u4yi)" \
+   "$(grep -c 'mail send "\$AUTHOR"' "$GATE")" "6"
 grep -q 'mail send "\$AUTHOR"' "$GATE" \
   && ok "gate escalates to the AUTHOR, not just Mayor" \
   || bad "gate still only mails Mayor — author has no durable needs-human signal (ga-u4yi regression)"

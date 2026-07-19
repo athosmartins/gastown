@@ -186,8 +186,12 @@ fi
 # ── 7. drift-guard: companion author-mail fix in the dispatcher (ga-u4yi) ───
 echo "── 7. drift-guard: companion fix — dispatcher mails AUTHOR at needs-human transitions ──"
 if [ -f "$DISPATCHER" ]; then
-  eq "dispatcher mails AUTHOR at all 5 gate:needs-human sites (ga-u4yi)" \
-     "$(grep -c 'mail send "\$AUTHOR"' "$DISPATCHER")" "5"
+  # ga-y43lq: bumped 5→6 alongside gate-selfheal.selftest.sh's copy of this same
+  # count — the ga-tgwq no_branch/escalate site (dirty local worktree) was a
+  # silent 6th gate:needs-human site missing its author-mail (see that file's
+  # own comment for the full incident writeup; not duplicating it here).
+  eq "dispatcher mails AUTHOR at all 6 gate:needs-human sites (ga-u4yi)" \
+     "$(grep -c 'mail send "\$AUTHOR"' "$DISPATCHER")" "6"
 else
   bad "dispatcher not found at $DISPATCHER"
 fi
