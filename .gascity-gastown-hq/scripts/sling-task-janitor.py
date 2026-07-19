@@ -177,9 +177,17 @@ def _target_statuses(targets_by_store):
         ids = sorted(ids)
         if not ids:
             continue
-        # ga-xwza2: routed through the read-cache shim — batched existence/status
-        # probe of already-referenced target ids, informational only.
-        r = _sh(["bash", BD_LIST_CACHED, "-C", store, "show"] + ids + ["--json"], timeout=BD_TIMEOUT)
+        # ga-xwza2 gate feedback (attempt 1 FAIL): NOT routed through the read-cache
+        # shim. bd-list-cached.sh's _live() helper unconditionally does `2>/dev/null`
+        # on every code path (cache-miss live refresh AND the lock-contention live
+        # fallback), so the wrapped bd's stderr never survives — and this call's
+        # _TARGET_MISSING detection below depends entirely on stderr text ('no issue
+        # found matching'). A fixed _live() alone wouldn't be enough either: a cache
+        # HIT replays only the stored stdout JSON (the cache file format never
+        # captured stderr to begin with), so the signal would still be lost on any
+        # call served from cache. Same shape as gate-marker-rehome-janitor.py's
+        # _verify_hq() in this same rollout — skip the shim entirely for this site.
+        r = _sh([BD_BIN, "-C", store, "show"] + ids + ["--json"], timeout=BD_TIMEOUT)
         if r is None:
             continue
         found = set()
@@ -489,7 +497,7 @@ def main():
 # ── selftest ────────────────────────────────────────────────────────────────────
 def _selftest():
     global _bd_list_open_fn, _bd_close_fn, _sessions_fn, _rigs_fn, _do_notify_fn, MAX_PER_SWEEP
-    global _target_status_fn, _rig_name_map_fn
+    global _target_status_fn, _rig_name_map_fn, BD_BIN
     ok = [0]
     bad = [0]
     def _ok(m): ok[0] += 1; print("  ok  " + m)
@@ -682,6 +690,47 @@ def _selftest():
              "closed=%s targets_by_store=%s" % (closed_idsU, capturedU[0]))
     _rig_name_map_fn = None
     _target_status_fn = None
+
+    print("Scenario V: _target_statuses() REAL subprocess path parses stderr for confirmed-missing ids (ga-xwza2 gate-attempt-1 regression guard — Scenarios L/M only exercise _should_close_molecule() via the _target_status_fn seam, which bypasses this exact subprocess/stderr code; this is the scenario that would have caught bd-list-cached.sh swallowing stderr)")
+    import tempfile
+    stub_dir = tempfile.mkdtemp()
+    stub_bd = os.path.join(stub_dir, "fake-bd")
+    stub_src = r'''#!/usr/bin/env python3
+import sys, json
+args = sys.argv[1:]
+i = 0
+if args and args[i] == "-C":
+    i += 2
+assert args[i] == "show"
+i += 1
+ids = []
+while i < len(args) and args[i] != "--json":
+    ids.append(args[i])
+    i += 1
+found = []
+for id_ in ids:
+    if id_ == "ga-real1":
+        found.append({"id": id_, "status": "open"})
+    else:
+        sys.stderr.write('Error fetching %s: no issue found matching "%s"\n' % (id_, id_))
+print(json.dumps(found))
+'''
+    with open(stub_bd, "w") as f:
+        f.write(stub_src)
+    os.chmod(stub_bd, 0o755)
+    _target_status_fn = None
+    saved_bd_bin = BD_BIN
+    BD_BIN = stub_bd
+    try:
+        resultV = _target_statuses({"FAKESTORE": {"ga-real1", "ga-ghost1"}})
+    finally:
+        BD_BIN = saved_bd_bin
+        import shutil
+        shutil.rmtree(stub_dir, ignore_errors=True)
+    if resultV.get("ga-real1") == "open" and resultV.get("ga-ghost1") == _TARGET_MISSING:
+        _ok("V: real _target_statuses() resolves found status AND confirmed-missing via stderr, unshimmed")
+    else:
+        _bad("V: _target_statuses() real subprocess path broken", "result=%s" % resultV)
 
     print("\n[sling-janitor selftest] %d passed, %d failed" % (ok[0], bad[0]))
     sys.exit(1 if bad[0] else 0)
