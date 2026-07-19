@@ -154,6 +154,42 @@ if [ -n "$GIT_DIR_ABS" ] && [ "$GIT_DIR_ABS" = "$GIT_COMMON_DIR_ABS" ]; then
     exit 1
   fi
   echo "  Isolated worktree ready: $(pwd) (shared root untouched on $ROOT_BRANCH)"
+
+  # ga-ir033: if SHARED_ROOT was itself nested inside a larger repo (e.g. an
+  # HQ/gascity Dog whose CWD is `.gascity-gastown-hq`, a tracked SUBDIR of the
+  # true git toplevel `/Users/athos/gt`, not a repo boundary of its own), the
+  # worktree just created above is a FULL checkout of that same outer repo —
+  # so it ALSO contains that same nesting one level down, e.g.
+  # `$WT/.gascity-gastown-hq/`. Landing the shell at $WT (the worktree's own
+  # outer boundary) leaves "which directory is really city-root" to be
+  # re-derived by hand later — exactly the mistake that produced a
+  # double-prefixed ghost file the gate reviewed but never deployed (see
+  # git-worktree-nested-city-path-prefix-gotcha). Compute the SAME relative
+  # nesting SHARED_ROOT had under ITS true toplevel and re-apply it inside
+  # $WT now, once, mechanically. NEST_REL can legitimately point at a path
+  # that is NOT tracked in this repo at all (e.g. a Dog invoked from some
+  # untracked scratch subdir that isn't gascity-shaped) — that's not an
+  # error, there's simply nothing to mirror, so fall back to $WT rather than
+  # fail closed; only a `cd` that fails despite the directory existing is
+  # treated as fatal.
+  SHARED_ROOT_TOPLEVEL="$(git -C "$SHARED_ROOT" rev-parse --show-toplevel 2>/dev/null)"
+  SHARED_ROOT_PHYSICAL="$(cd "$SHARED_ROOT" 2>/dev/null && pwd -P)"
+  NEST_REL=""
+  if [ -n "$SHARED_ROOT_TOPLEVEL" ] && [ -n "$SHARED_ROOT_PHYSICAL" ]; then
+    case "$SHARED_ROOT_PHYSICAL" in
+      "$SHARED_ROOT_TOPLEVEL"/*)
+        NEST_REL="${SHARED_ROOT_PHYSICAL#"$SHARED_ROOT_TOPLEVEL"/}"
+        ;;
+    esac
+  fi
+  if [ -n "$NEST_REL" ]; then
+    if [ -d "$WT/$NEST_REL" ]; then
+      cd "$WT/$NEST_REL" || { echo "FATAL: isolation guard could not enter nested city root $WT/$NEST_REL" >&2; exit 1; }
+      echo "  NESTED-REPO GUARD: shared root was nested at '$NEST_REL' under its true toplevel — entered $(pwd), not the worktree's outer boundary $WT"
+    else
+      echo "  NESTED-REPO GUARD: shared root was nested at '$NEST_REL' under its true toplevel, but that path is not tracked in this repo — nothing to mirror, staying at $WT"
+    fi
+  fi
 fi
 # === MOL-DO-WORK ISOLATION GUARD END (ga-xau4z) ===
 

@@ -5349,6 +5349,66 @@ log "  Branch $BRANCH is current with $DEFAULT_BRANCH — stale-base check passe
 
 CHANGED_FILES=$(git_rig diff --name-only "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null || echo "")
 
+# ── ga-ir033: reject double-prefixed (mis-rooted-worktree) paths ──────────────
+# A build from a worktree created *inside* a nested city repo (e.g. gascity's
+# `.gascity-gastown-hq`, a tracked SUBDIR of the outer monorepo, not its own
+# git root) can silently write files under a path with a directory segment
+# repeated back-to-back (`.gascity-gastown-hq/.gascity-gastown-hq/...`) — see
+# git-worktree-nested-city-path-prefix-gotcha. Such a file is fully real to
+# git (stable line numbers, reviewable) but is NEVER read by any deploy/
+# launchd job — a green gate on it is a false-done: reviewed, merged, nothing
+# shipped. Reject before reviewers are ever dispatched, before any other
+# Step-5 work runs. Match is BRE (no -E): this grep is BSD/macOS grep, whose
+# -E does not support backreferences — verified empirically (ga-ir033).
+DOUBLE_PREFIXED_FILES=$(printf '%s\n' "$CHANGED_FILES" | grep '\(^\|/\)\([^/]*\)/\2\(/\|$\)' || echo "")
+if [ -n "$DOUBLE_PREFIXED_FILES" ]; then
+  err "Branch $BRANCH: double-prefixed (mis-rooted-worktree) path(s) detected — rejecting before dispatch:
+$DOUBLE_PREFIXED_FILES"
+  bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
+  bd -C "$GC_CITY" comment "$MARKER_ID" "ga-ir033 REJECTED before reviewer dispatch: branch $BRANCH contains file path(s) with a directory segment repeated back-to-back — the signature of a mis-rooted nested-worktree build (git-worktree-nested-city-path-prefix-gotcha):
+$DOUBLE_PREFIXED_FILES
+These are almost certainly ghost duplicates of a correctly-placed file one level up (e.g. .gascity-gastown-hq/.gascity-gastown-hq/foo instead of .gascity-gastown-hq/foo) and are never read by any deploy/launchd job. Verify 'git rev-parse --show-toplevel' resolves to the true repo root and target paths relative to THAT before building; remove the ghost path(s); re-run /gate-done." 2>/dev/null || true
+  if [ -n "$BEAD_ID" ]; then
+    bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human"           -q 2>/dev/null || true
+    bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human:technical" -q 2>/dev/null || true
+    bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"            -q 2>/dev/null || true
+    bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"             -q 2>/dev/null || true
+    bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"           -q 2>/dev/null || true
+    bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""                           -q 2>/dev/null || true
+    bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-ir033 AUTO-REJECT: branch $BRANCH (marker $MARKER_ID) has double-prefixed ghost path(s), a mis-rooted-worktree signature:
+$DOUBLE_PREFIXED_FILES
+Set gate:needs-human; story:in-flight + gate:reviewing + pilot:dispatched stripped (Pilot lane slot freed). Fix the build topology, remove the ghost path(s), resubmit." 2>/dev/null || true
+  fi
+  gc --city "$GC_CITY" mail send mayor \
+    -s "Gate reject: $BRANCH has mis-rooted-worktree ghost path(s) (${BEAD_ID:-unknown})" \
+    -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) was rejected before reviewer dispatch (ga-ir033): file path(s) with a directory segment repeated back-to-back were found — a mis-rooted nested-worktree build signature:
+$DOUBLE_PREFIXED_FILES
+Source bead set gate:needs-human. This class of bug lets a ghost file pass review while the real target file stays untouched (false-done)." 2>/dev/null \
+    || warn "Could not mail Mayor for ga-ir033 double-prefix rejection on $BRANCH"
+  if [ -n "$AUTHOR" ]; then
+    gc --city "$GC_CITY" mail send "$AUTHOR" \
+      -s "Gate needs-human: $BRANCH has mis-rooted-worktree ghost path(s)" \
+      -m "Your branch $BRANCH (bead ${BEAD_ID:-unknown}) was rejected before reviewer dispatch: file path(s) with a directory segment repeated back-to-back were found:
+$DOUBLE_PREFIXED_FILES
+This is the signature of a mis-rooted nested-worktree build (git-worktree-nested-city-path-prefix-gotcha) — the real target file was probably never touched. Source bead is now labeled gate:needs-human: Pilot will NOT re-dispatch it, and further /gate-done resubmission will be silently parked until this is resolved. Verify 'git rev-parse --show-toplevel', fix the ghost path(s), and resubmit." \
+      2>/dev/null || warn "Could not mail author $AUTHOR for ga-ir033 double-prefix rejection on $BRANCH"
+  fi
+  mkdir -p "$(dirname "$QG_LOG")"
+  jq -c -n \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg branch "$BRANCH" \
+    --arg bead "$BEAD_ID" \
+    --arg rig "${RIG:-unknown}" \
+    --arg marker "$MARKER_ID" \
+    --arg author "$AUTHOR" \
+    --arg event "dispatcher_reject_double_prefixed_path" \
+    --arg files "$DOUBLE_PREFIXED_FILES" \
+    '{ts: $ts, event: $event, branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author, files: $files}' \
+    >> "$QG_LOG" 2>/dev/null || true
+  log "=== Dispatcher sweep complete: branch=$BRANCH verdict=REJECTED (ga-ir033 double-prefixed path) ==="
+  exit 0
+fi
+
 # ── ga-ltr3c: scale this run's verdict timeout by its diff size ───────────────
 # CHANGED_FILES is already in hand; add the changed-line count (insertions +
 # deletions via --numstat, ignoring binary "-" rows) and scale VERDICT_TIMEOUT_

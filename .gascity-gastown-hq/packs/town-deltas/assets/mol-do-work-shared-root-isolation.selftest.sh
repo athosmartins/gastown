@@ -64,6 +64,14 @@
 #        topology: a Dog's CWD is .gascity-gastown-hq, a subdir of the git
 #        toplevel /Users/athos/gt) still isolates correctly, and nests the
 #        new worktree under that starting subdir — not git's toplevel
+#   (L)  ga-ir033: when that nested subdir is git-TRACKED (unlike (G)'s
+#        untracked mock — gascity's real .gascity-gastown-hq/ has real
+#        committed content), the new worktree ALSO contains that same
+#        nested directory fully checked out, and the guard lands the CWD
+#        INSIDE it — not at the worktree's own outer boundary. Getting this
+#        wrong is what let a Dog write a double-prefixed ghost file
+#        (.gascity-gastown-hq/.gascity-gastown-hq/...) that the gate
+#        reviewed but never deployed.
 #   (H)  Guard is a safe no-op when CWD is not inside a git repo at all
 #   (J)  A reused worktree that is BEHIND origin/main gets reset to the
 #        latest tip (gate blocking issue 2)
@@ -239,6 +247,37 @@ ROOT_BRANCH_G="$(git -C "$TMP/shared-root" branch --show-current)"
   && ok "(G2) shared root still on main after nested-subdir invocation" \
   || bad "(G2) shared root branch changed after nested-subdir invocation: $ROOT_BRANCH_G"
 
+# ── (L): guard run from a TRACKED nested subdir (ga-ir033 real HQ topology) ──
+# Unlike (G)'s UNTRACKED subdir-hq (nothing to mirror — guard correctly
+# stays at the worktree's outer boundary), gascity's real
+# `.gascity-gastown-hq/` is a git-TRACKED subdirectory with real committed
+# content — so a worktree of the same repo ALSO contains that same nested
+# directory, fully checked out. The guard must land the CWD INSIDE that
+# mirrored nested directory, not at the worktree's outer boundary — else a
+# dog operating on paths "relative to city root" is actually relative to
+# the OUTER repo's root, and prepending the city dirname again produces a
+# double-prefixed ghost path that the gate reviews but never deploys
+# (ga-ir033).
+mkdir -p "$TMP/shared-root/tracked-hq/scripts"
+echo "real tracked content" > "$TMP/shared-root/tracked-hq/scripts/marker.txt"
+git -C "$TMP/shared-root" add tracked-hq
+git -C "$TMP/shared-root" -c user.email=test@test -c user.name=test commit -q -m "add tracked nested city dir"
+git -C "$TMP/shared-root" push -q origin main
+
+OUTL=$(run_guard "$TMP/shared-root/tracked-hq" "tt-bead5" "tester5" 2>&1)
+NEWDIRL=$(printf '%s\n' "$OUTL" | grep '^PWD_AFTER=' | tail -1 | cut -d= -f2-)
+EXPECTED_L="$TMP/shared-root/tracked-hq/.gc-worktrees/tt-bead5-tester5/tracked-hq"
+[ "$NEWDIRL" = "$EXPECTED_L" ] \
+  && ok "(L) guard entered the mirrored TRACKED nested dir inside the new worktree ($NEWDIRL)" \
+  || bad "(L) expected guard to land inside the mirrored tracked nested dir $EXPECTED_L, got: $NEWDIRL"
+[ -f "$NEWDIRL/scripts/marker.txt" ] 2>/dev/null \
+  && ok "(L2) real tracked content is reachable from the landed CWD" \
+  || bad "(L2) tracked content not reachable from landed CWD — wrong directory or checkout incomplete"
+ROOT_BRANCH_L="$(git -C "$TMP/shared-root" branch --show-current)"
+[ "$ROOT_BRANCH_L" = "main" ] \
+  && ok "(L3) shared root still on main after tracked-nested-subdir invocation" \
+  || bad "(L3) shared root branch changed after tracked-nested-subdir invocation: $ROOT_BRANCH_L"
+
 # ── (H): guard is a safe no-op when CWD is not inside a git repo at all ──────
 mkdir -p "$TMP/not-a-repo"
 OUTH=$(run_guard "$TMP/not-a-repo" "tt-bead3" "tester3" 2>&1)
@@ -318,6 +357,12 @@ printf '%s' "$src" | grep -q 'worktree prune' \
 printf '%s' "$src" | grep -q 'checkout -B "$BRANCH" origin/main' \
   && ok "(F5) formula resets the branch to origin/main inside the isolated worktree (freshness fix)" \
   || bad "(F5) formula missing the post-isolation origin/main resync — staleness (J) may regress"
+printf '%s' "$src" | grep -q 'NESTED-REPO GUARD' \
+  && ok "(F6) formula contains the ga-ir033 nested-repo guard (double-prefixed ghost path prevention)" \
+  || bad "(F6) formula missing the ga-ir033 nested-repo guard — (L) may regress"
+printf '%s' "$src" | grep -q 'SHARED_ROOT_TOPLEVEL' \
+  && ok "(F7) formula computes the nested-repo guard via --show-toplevel, not a hardcoded dirname" \
+  || bad "(F7) formula missing --show-toplevel-based nesting detection"
 
 echo
 echo "  PASS=$PASS  FAIL=$FAIL"
