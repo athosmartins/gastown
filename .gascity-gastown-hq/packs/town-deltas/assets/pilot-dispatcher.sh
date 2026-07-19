@@ -1698,9 +1698,12 @@ _filter_exec_manual() {
 #       deliberately low: real WA tasks run 180–2200 chars, so only one-liner/stub
 #       beads are dropped; it never false-drops a genuine task. Raise it in the plist
 #       to enforce a stricter spec minimum.
-#   (c) AN UNSATISFIED PRECONDITION LABEL. A `blocked-on:*` or `depends-on:*` label is
-#       a free-text precondition the bd dep-graph can't see (e.g. blocked-on:ata-dedicada,
-#       depends-on:contact-sync). Such a bead is not ready regardless of ctx:ready.
+#   (c) AN UNSATISFIED PRECONDITION LABEL. A `blocked-on:*`, `blocked:*`, or `depends-on:*`
+#       label is a free-text precondition the bd dep-graph can't see (e.g.
+#       blocked-on:ata-dedicada, blocked:needs-pregao-deployed, depends-on:contact-sync).
+#       `blocked:*` (ga-yavyq) is the bare-prefix sibling of blocked-on: — used when
+#       there's a reason but no single blocking bead id to name. Such a bead is not
+#       ready regardless of ctx:ready.
 #   (d) WAITING ON ANOTHER ACTOR — except refino's crew-routing convention (ga-f7bek).
 #       `waiting-on:*` always means "blocked on X" → always veto. But `next-action:*`
 #       is OVERLOADED with two opposite meanings: the original one (added 5de1ce1c7,
@@ -1724,7 +1727,7 @@ _filter_dispatch_gates() {
       (((.status) // "open") as $s | ($s != "blocked" and $s != "closed" and $s != "deferred"))
       and ( (((.metadata["story.criterios"]) // "") | test("\\S"))
         or (((.description) // "") | length) >= $floor )
-      and (((.labels // []) | map(select(test("^(blocked-on|depends-on):"))) | length) == 0)
+      and (((.labels // []) | map(select(test("^(blocked-on|blocked|depends-on):"))) | length) == 0)
       and ((((.title) // "") + " " + ((.description) // "")) | ascii_downcase | test("design[ -]?first") | not)
       and (((.labels // []) | map(select(
             test("^waiting-on:")
@@ -1750,7 +1753,7 @@ _filter_dispatch_gates() {
       | [
           (if ((($b.status) // "open") as $s | ($s == "blocked" or $s == "closed" or $s == "deferred")) then "status:\($b.status // "open")" else empty end),
           (if ( ((($b.metadata["story.criterios"]) // "") | test("\\S")) or ((($b.description) // "") | length) >= $floor ) then empty else "no-spec(empty-criterios,desc<\($floor)chars)" end),
-          ( ((($b.labels) // []) | map(select(test("^(blocked-on|depends-on):")))) as $pl
+          ( ((($b.labels) // []) | map(select(test("^(blocked-on|blocked|depends-on):")))) as $pl
             | if ($pl | length) == 0 then empty else "precondition-label:\($pl | join(","))" end ),
           (if (((($b.title) // "") + " " + (($b.description) // "")) | ascii_downcase | test("design[ -]?first")) then "design-first" else empty end),
           ( ((($b.labels) // []) | map(select(

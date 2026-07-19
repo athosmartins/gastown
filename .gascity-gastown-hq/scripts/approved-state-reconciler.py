@@ -152,6 +152,7 @@ _do_notify = None           # (msg, prio) -> None
 _do_mail_mayor = None       # (subject, body) -> bool
 _read_pilot_log_lines = None  # () -> list[str]
 _bd_gate_markers = None     # () -> list[dict]|None; OPEN quality-gate-markers in the HQ store
+_bd_blocked = None          # (rig_root) -> list[dict]|None; None return = query error
 
 
 # ── guarded subprocess ────────────────────────────────────────────────────────
@@ -303,8 +304,19 @@ def _parse_reclaim_count(labels):
 # THIS named crew builds it, not the generic pool" (see memory
 # pilot-next-action-label-vetoes-own-dispatch) — the opposite of blocked, but
 # still not something the Pilot's dispatch path should be blamed for.
+#
+# "blocked" (ga-yavyq AC1): a bare-prefix sibling of blocked-on: — a human writes
+# blocked:<reason> (e.g. blocked:needs-pregao-deployed) to mean "explicitly
+# blocked, here's why" without naming a specific bead id (the blocked-on:<id>
+# shape doesn't fit when there's no single blocking bead). _has_prefix("blocked-on")
+# does NOT match "blocked:needs-pregao-deployed" — different prefix string — so it
+# fell through every check and alarmed falsely (wa-4uh2w, twice). Bare "blocked"/
+# "story:blocked" (no colon-suffix) are unaffected: _classify() already intercepts
+# those upstream as a ROUTE (story:approved -> story:blocked), so this prefix only
+# ever matches the colon-namespaced form in practice.
 _EXTRA_ALARM_SUPPRESS_PREFIXES = (
     ("blocked-on", "blocked-on:* (dependency block)"),
+    ("blocked", "blocked:* (explicit block, reason given, no single blocking bead)"),
     ("waiting-on", "waiting-on:* (dependency block)"),
     ("depends-on", "depends-on:* (dependency block)"),
     ("next-action", "next-action:* (delegated to a named crew, not the generic pool)"),
@@ -921,13 +933,56 @@ def _gate_marker_source_beads():
     return out
 
 
+def _blocked_bead_ids(rig_root):
+    """Set of bead ids in `rig_root` currently blocked by an open formal dependency
+    (ga-yavyq AC2), per bd's own blocker-aware `bd blocked` computation.
+
+    Unlike built_ids (HQ-only, computed once per cycle), dependencies are rig-scoped —
+    this must be called once PER rig_root, same as the story:approved query itself.
+
+    Why `bd blocked` and not the `dependencies` field already in the story:approved
+    list result: the list-mode `dependencies` entries only carry {depends_on_id, type}
+    — no status for the target bead — so "is this dep still open" cannot be answered
+    from that array without an extra per-bead lookup. `bd blocked` is a single call
+    that reuses bd's own already-correct, already-shipped blocker computation (the
+    same one pilot-dispatcher.sh's _filter_unblocked has gated dispatch on since
+    ga-5ew) instead of re-deriving dependency-closed-ness here.
+
+    Returns None on query/parse error — same fail-toward-NOT-alarming convention as
+    _gate_marker_source_beads()/built_ids: an unreadable blocked-set says nothing
+    about whether a bead is genuinely blocked, so it must not silently license the
+    starve alarm (root-class:error-vs-empty, ga-05604)."""
+    if _bd_blocked is not None:
+        rows = _bd_blocked(rig_root)       # test seam
+    else:
+        r = _sh([BD_BIN, "-C", rig_root, "blocked", "--json"], timeout=BD_TIMEOUT)
+        if r is None or r.returncode != 0:
+            return None
+        rows = _parse_bd_json(r.stdout, strict=True)
+    if rows is None:
+        return None
+    out = set()
+    for b in (rows or []):
+        if not isinstance(b, dict):
+            continue
+        bid = b.get("id") or b.get("issue_id") or ""
+        if bid:
+            out.add(bid)
+    return out
+
+
 # ── process one store ─────────────────────────────────────────────────────────
-def _process_store(rig_root, now, state, pilot_alive, built_ids):
+def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
     """Scan story:approved open beads in rig_root; classify and act on each one.
 
     built_ids: set of bead ids with a live BUILT marker (from _gate_marker_source_beads(),
     computed ONCE per cycle in run_cycle() — markers live only in HQ, not per-rig), or None
     if that query failed (fail-safe: caller must not alarm when built-state is unknown).
+
+    blocked_ids: set of bead ids in THIS rig_root blocked by an open formal dependency
+    (from _blocked_bead_ids(rig_root), computed once per rig_root — dependencies are
+    rig-scoped, unlike built_ids), or None if that query failed (same fail-safe: caller
+    must not alarm when dependency-block state is unknown, ga-yavyq AC2).
 
     Returns (processed, routed, alarmed) int counts.
     On query error: logs + returns (0, 0, 0) — fail-open; other stores are unaffected.
@@ -1177,6 +1232,21 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids):
                  "gate, not a dispatch failure — no alarm" % (bead_id, starve_age_min))
             continue
 
+        # BLOCKED by an open formal dependency (ga-yavyq AC2) — independent of any label.
+        # wa-4uh2w carried a real `blocks` dependency on wa-89enh (in_progress) and still
+        # alarmed, because until this fix nothing here ever consulted bd's own dependency
+        # graph — only labels. blocked_ids is None when the `bd blocked` query itself
+        # failed — same fail-safe direction as built_ids is None above: an unreadable
+        # dependency-block query must not license the alarm either.
+        if blocked_ids is None:
+            _log("  %s: no signal, daemon-age=%.0fmin, bd-blocked query failed (dependency-"
+                 "block state unknown) — fail-safe, no alarm" % (bead_id, starve_age_min))
+            continue
+        if bead_id in blocked_ids:
+            _log("  %s: no signal, daemon-age=%.0fmin, BLOCKED (open formal dependency, "
+                 "`bd blocked`) — no alarm" % (bead_id, starve_age_min))
+            continue
+
         # ALARM: buildable bead starving, pilot alive, pool has capacity, dispatch failing.
         _alarm_starving(rig_root, bead, starve_age_min, now, state)
         alarmed += 1
@@ -1215,8 +1285,15 @@ def run_cycle(now, state):
         if _bd_approved is None and not os.path.isdir(rig_root):
             _log("  [%s] directory not found — skipping" % rig_root)
             continue
+        # Dependencies are rig-scoped (unlike built_ids, HQ-global) — query per rig_root,
+        # same cadence as the story:approved query itself (ga-yavyq AC2).
+        blocked_ids = _blocked_bead_ids(rig_root)
+        if blocked_ids is None:
+            _log("  [%s] bd-blocked query FAILED — dependency-block check degrades "
+                 "fail-safe (no starve alarms this cycle for this rig on the BLOCKED "
+                 "check; see ga-yavyq)" % rig_root)
         try:
-            p, r, a = _process_store(rig_root, now, state, pilot_alive, built_ids)
+            p, r, a = _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids)
             total_p += p
             total_r += r
             total_a += a
@@ -1312,9 +1389,19 @@ def _selftest():
                 present (as bd would report it after (ii)'s label-add landed) →
                 ZERO additional comments — the old flat 30min cooldown would have
                 refired here; this is the +60-comments-in-4h regression guard
+      (kk)      AC1 (ga-yavyq): bare "blocked:<reason>" label suppresses the alarm
+                same as blocked-on:/waiting-on:/etc — namespace unification
+      (ll)      AC2 (ga-yavyq): bead with an OPEN formal 'blocks' dependency
+                (present in `bd blocked`) suppresses the alarm, independent of
+                any label
+      (mm)      AC3 (ga-yavyq) falsification: dep CLOSED (not in `bd blocked`)
+                + no blocking label → STILL alarms (AC2 fix isn't over-permissive)
+      (nn)      AC3 (ga-yavyq) fail-safe: `bd blocked` query FAILS (blocked_ids=
+                None) → no starve alarm, same direction as built_ids=None (z)
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
+    global _bd_blocked
     global DRY_RUN, STARVE_MIN, FLOW_GRACE_MIN, ROUTE_COOLDOWN_SEC, ALARM_COOLDOWN_SEC
 
     ok_count = [0]
@@ -2187,6 +2274,86 @@ def _selftest():
             "was: repeats every 30min forever)")
     else:
         _bad("(jj)", "comments=%s labeled=%s" % (comments_jj, labeled_jj))
+
+    print("\nScenario (kk): AC1 (ga-yavyq) — bare 'blocked:<reason>' label blocks the "
+          "alarm same as blocked-on:/waiting-on:/etc (namespace unification)")
+    # ga-yavyq: mila labeled wa-4uh2w 'blocked:needs-pregao-deployed' (colon-namespaced,
+    # like blocked-on:/pool:refused:) expecting it to read as an explicit block — but
+    # _has_prefix(labels, "blocked-on") does NOT match "blocked:needs-pregao-deployed"
+    # (different prefix string), so it fell through every suppression check and the
+    # bead alarmed "starving" twice despite being genuinely, explicitly blocked.
+    _bd_approved = lambda root: [
+        _make_bead("wa-042", labels=["story:approved", "blocked:needs-pregao-deployed"],
+                   age_min=0.1)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_kk = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_kk["first_seen_approved"]["wa-042"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_kk)
+    if not any("wa-042" in subj for subj, _ in mail_calls):
+        _ok("(kk): bare blocked:<reason> label suppresses the starve alarm (AC1)")
+    else:
+        _bad("(kk)", "FALSELY alarmed despite blocked:needs-pregao-deployed label; "
+             "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (ll): AC2 (ga-yavyq) — bead with an OPEN formal 'blocks' "
+          "dependency (present in `bd blocked`) suppresses the alarm, independent "
+          "of any label")
+    # ga-yavyq CAUSA (b): wa-4uh2w had a REAL, FORMAL bd dependency (blocks) on
+    # wa-89enh (in_progress, not closed) — and the reconciler alarmed anyway,
+    # because it only ever looked at LABELS, never at bd's own dependency graph.
+    # `bd blocked` is the authoritative, already-proven source (pilot-dispatcher.sh's
+    # _filter_unblocked, ga-5ew, has gated dispatch on it for a while) — port the
+    # same check into the reconciler's starve-alarm path instead of re-deriving
+    # dependency-closed-ness from the (differently-shaped, status-less) list-mode
+    # `dependencies` field.
+    _bd_approved = lambda root: [_make_bead("wa-043", age_min=0.1)]   # zero extra labels
+    _bd_blocked = lambda root: [{"id": "wa-043"}]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_ll = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_ll["first_seen_approved"]["wa-043"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_ll)
+    _bd_blocked = None
+    if not any("wa-043" in subj for subj, _ in mail_calls):
+        _ok("(ll): open formal 'blocks' dependency suppresses the alarm, no label needed (AC2)")
+    else:
+        _bad("(ll)", "FALSELY alarmed despite open formal dependency (bd blocked); "
+             "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (mm): AC3 falsification — dep CLOSED (bead not in `bd blocked`) "
+          "and no blocking label → STILL alarms (don't over-suppress)")
+    _bd_approved = lambda root: [_make_bead("wa-044", age_min=0.1)]
+    _bd_blocked = lambda root: []   # query succeeds, genuinely nothing blocked
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_mm = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_mm["first_seen_approved"]["wa-044"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_mm)
+    _bd_blocked = None
+    if any("wa-044" in subj for subj, _ in mail_calls):
+        _ok("(mm): no open dependency, no blocking label — still alarms "
+            "(AC2 fix isn't over-permissive)")
+    else:
+        _bad("(mm)", "FAILED to alarm on a genuinely buildable, starving bead — AC2 fix "
+             "became over-permissive; mail_calls=%s" % mail_calls)
+
+    print("\nScenario (nn): `bd blocked` query FAILS (blocked_ids=None) → no starve "
+          "alarm — fail-safe, error != empty (same direction as built_ids=None, "
+          "scenario z)")
+    _bd_approved = lambda root: [_make_bead("wa-045", age_min=0.1)]
+    _bd_blocked = lambda root: None   # simulates a query/parse error
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_nn = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_nn["first_seen_approved"]["wa-045"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_nn)
+    _bd_blocked = None
+    if not any("wa-045" in subj for subj, _ in mail_calls):
+        _ok("(nn): bd-blocked query failure fails SAFE — no alarm on unknown dep-state")
+    else:
+        _bad("(nn)", "FALSELY alarmed when bd-blocked query failed (dep-state unknown); "
+             "mail_calls=%s" % mail_calls)
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))

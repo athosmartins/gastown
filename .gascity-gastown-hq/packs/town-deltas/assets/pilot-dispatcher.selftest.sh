@@ -4433,6 +4433,29 @@ fi
 unset -f log
 unset PILOT_DISPATCH_GATES_DEBUG
 
+echo "Scenario ga-yavyq: _filter_dispatch_gates recognizes bare blocked:* precondition label"
+# Root cause: clause (c)'s regex only matched ^(blocked-on|depends-on): — a bare
+# "blocked:<reason>" label (e.g. blocked:needs-pregao-deployed — used when there's no
+# single blocking bead id to name, unlike blocked-on:<id>) fell through and the bead
+# dispatched anyway. Mirrors the same AC1 fix applied to approved-state-reconciler.py's
+# _EXTRA_ALARM_SUPPRESS_PREFIXES (same bug, same namespace gap, two daemons).
+_FDG_YAVYQ="$(grep '^log()' "$DISPATCHER")
+$(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
+$(awk '/^_filter_dispatch_gates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+
+YAVYQ_FIXTURE='[
+  {"id":"wa-like-needspregao","status":"open","description":"a ready bead with a full description over the floor length","labels":["ctx:ready","story:approved","blocked:needs-pregao-deployed"]},
+  {"id":"wa-like-blockedon","status":"open","description":"a ready bead with a full description over the floor length","labels":["ctx:ready","story:approved","blocked-on:some-other-bead"]},
+  {"id":"wa-like-clean","status":"open","description":"a ready bead with a full description over the floor length","labels":["ctx:ready","story:approved"]}
+]'
+YAVYQ_OUT="$(eval "$_FDG_YAVYQ"; printf '%s' "$YAVYQ_FIXTURE" | _filter_dispatch_gates | jq -rc '[.[].id] | sort' 2>/dev/null)"
+YAVYQ_EXPECT='["wa-like-clean"]'
+if [ "$YAVYQ_OUT" = "$YAVYQ_EXPECT" ]; then
+  ok "ga-yavyq AC1: bare blocked:* precondition label now vetoes dispatch same as blocked-on:; clean bead still dispatches (got: $YAVYQ_OUT)"
+else
+  bad "ga-yavyq AC1: expected $YAVYQ_EXPECT, got '$YAVYQ_OUT'"
+fi
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
