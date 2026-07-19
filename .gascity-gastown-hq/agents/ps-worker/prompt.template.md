@@ -47,6 +47,13 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # no awareness of the hold. Replicate the CANONICAL rule EXACTLY (imp19/ga-4aree):
 #   a bead passes iff  (NOT pilot:held)  OR  (a pilot:held-until:<epoch> exists AND
 #   its LATEST/MAX stamp is already in the past).
+# ga-uvfs6: also excludes pilot:refused-reason:* — inflight-reclaim-guard.py's
+# _promote_refusal_labels() CONSUMES the ephemeral pool:refused[:reason] label
+# above and promotes it to a permanent pilot:refused-reason:<slug> for audit,
+# so a once-refused bead that survived past its first reclaim cycle no longer
+# carries any pool:refused* label at all and this probe re-fetched/re-confirmed
+# it exactly like a fresh bead. Same prefix-startswith treatment as pool:refused,
+# just a different label namespace.
 # Two subtleties the first cut got wrong (gate FAIL ga-wisp-2hcah2):
 #   • pilot:held with NO held-until yet is the "trap" state (imp19/imp20 hold-stamping
 #     is non-atomic; janitor R6 stamps a default expiry only on its NEXT sweep). The
@@ -62,7 +69,7 @@ You are disposable. You do not carry state between runs. When your bead is done,
 #     `pilot:held` and `pilot:held-until:*`; only then is the expiry branch reachable.
 #   • held-until labels ACCUMULATE (never pruned here), so use MAX not .[0] (ga-4aree)
 #     — the bead is still held iff its LATEST stamp is in the future.
-bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "ctx:thin" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:held"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end))] | .[:1]'
+bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "ctx:thin" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:held"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end))] | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
@@ -114,6 +121,38 @@ git push origin HEAD
 gc runtime drain-ack
 exit
 ```
+
+---
+
+## Bead Is Not Buildable By You — Explicit Refusal (ga-be4x, ported ga-uvfs6)
+
+If, after reading the bead (`bd show <id>`), you determine it is **not
+buildable by you** — wrong domain (cross-rig/framework work that belongs to
+the Mayor), no completion path in this repo, or any other fundamental
+mismatch — do **NOT** just silently drain. An unexplained drain is
+indistinguishable from a crash and gets you re-dispatched to repeat the
+exact same analysis forever (the ga-be4x pattern — first caught on
+wa-worker: wa-vvk58, wa-c6b3q; ps-worker had no refusal protocol at all
+until ga-uvfs6, so a domain-mismatch here was previously 100% silent).
+Instead, before draining:
+
+```bash
+# 1. Label the bead with your refusal + a short kebab-case reason slug
+bd label add <id> pool:refused:<reason-slug>   # e.g. cross-rig-framework, no-completion-path
+
+# 2. Leave a full human-readable explanation as a comment
+bd comment <id> "Refusing: <why this cannot be built here, what it actually needs>."
+
+# 3. Then drain normally — do NOT clear the bead's status/assignee yourself;
+#    the inflight-reclaim-guard owns that transition and needs the bead to
+#    still look in-flight to process your refusal.
+gc runtime drain-ack && exit
+```
+
+The guard treats this as a stated conclusion, not a guess: after **one more**
+independent worker reaches the same verdict, it stops re-dispatching and
+escalates straight to the Mayor with both reasons attached — no human has to
+rediscover why from scratch.
 
 ---
 

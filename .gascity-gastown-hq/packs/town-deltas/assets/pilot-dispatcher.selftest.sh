@@ -2335,6 +2335,52 @@ NVNBEAD='{"title":"Contagem: enriquecer deals/imóveis fora de BH com geometria+
 [ "$(_dom "$WARM_BEAD")" = warming ]            && ok "chip/aquecimento → warming"                              || bad "warming misclassified: '$(_dom "$WARM_BEAD")'"
 [ "$(_own warming)" = oracle-wa ]               && ok "warming prefers oracle-wa"                               || bad "warming owner wrong: '$(_own warming)'"
 
+# ── Scenario 17g (ga-uvfs6): warming dispatches DIRECTLY to oracle-wa ─────────
+# Bug ga-uvfs6: rig_domain_owner has ALWAYS mapped warming→oracle-wa (Scenario
+# 17 above), but the pilot-rewire (2026-06-25) moved WA to virtual pool slots
+# (wa-worker-1..4) that pick_pool_builder's "prefer" step matches by EXACT
+# NAME — oracle-wa is not a slot name, so the preference silently became dead
+# code and Athos's 2026-07-17 decision that oracle-wa is the executor for
+# warming/on-device never took effect (wa-srgv/wa-ys0cy misrouted to the
+# generic wa-worker pool, refused there in a loop instead). Unlike Scenario
+# 17b (data→digo-wa, deliberately STILL pool-routed per pilot-rewire), warming
+# is structurally pool-INCOMPATIBLE — on-device chip work needs a live,
+# continuous session an ephemeral wa-worker cannot hold — so
+# rig_domain_requires_persistent_owner narrowly intercepts ONLY this domain
+# before pick_pool_builder ever runs, dispatching straight to oracle-wa.
+echo "Scenario 17g (ga-uvfs6): warming-domain WA bug dispatches DIRECTLY to oracle-wa, bypassing the wa-worker pool"
+WARM_BUG='[{"id":"tt-wawarm","title":"aquecimento de chip novo no grupo (on-device send)","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:03Z","metadata":{"story.rig":"whatsapp_automation"}}]'
+LOG17G="$(run_capacity 10 "[]" 1 "$WARM_BUG")"
+WARM_BUILDER="$(builder_for_domain "$LOG17G" warming)"
+if [ "$WARM_BUILDER" = "oracle-wa" ]; then
+  ok "warming bug dispatched DIRECTLY to oracle-wa (structural owner, ga-uvfs6 fix)"
+elif echo "$WARM_BUILDER" | grep -qE '^wa-worker-[0-9]+$'; then
+  bad "REGRESSION (ga-uvfs6): warming bug went to generic wa-worker pool ($WARM_BUILDER) instead of oracle-wa — the 2026-07-17 owner decision is not honored"
+else
+  bad "warming bug routed unexpectedly (got: '${WARM_BUILDER:-none}')"
+fi
+if echo "$LOG17G" | grep -q "gc.routed_to=wa-worker"; then
+  bad "REGRESSION (ga-uvfs6): warming bug still stamped gc.routed_to=wa-worker despite direct oracle-wa dispatch"
+else
+  ok "warming bug did NOT receive gc.routed_to=wa-worker stamp (named-crew path used instead)"
+fi
+
+echo "Scenario 17h (ga-uvfs6 control): rig_domain_requires_persistent_owner stays narrow — data/frontend/real-estate remain pool-routed"
+has "$DISPATCHER" 'rig_domain_requires_persistent_owner()' "rig_domain_requires_persistent_owner classifier is defined"
+if grep -qE 'whatsapp_automation/warming\|wa/warming\)[[:space:]]*return 0' "$DISPATCHER"; then
+  ok "rig_domain_requires_persistent_owner maps ONLY warming to a required persistent owner"
+else
+  bad "rig_domain_requires_persistent_owner does not map warming as expected"
+fi
+# Re-assert 17b's own data-domain expectation still holds with the new guard wired in
+# (belt-and-suspenders: 17b already covers this, but this ties the regression explicitly
+# to rig_domain_requires_persistent_owner rather than relying only on the shared fixture).
+if echo "$DATA_BUILDER" | grep -qE '^wa-worker-[0-9]+$'; then
+  ok "ga-uvfs6 control: data bug (digo-wa mapped but NOT structurally required) still pool-routed ($DATA_BUILDER)"
+else
+  bad "ga-uvfs6 control: data bug unexpectedly bypassed the pool (got: '${DATA_BUILDER:-none}') — rig_domain_requires_persistent_owner too broad"
+fi
+
 # ── Scenario 17: reuse existing crew session, never spawn a 2nd (gt-4st3n) ────
 # Bug gt-4st3n: the Pilot routed work to a crew identity via `gc sling <identity>`
 # + an immediate nudge. When that crew ALREADY had a session this spawned/resumed
@@ -4454,6 +4500,34 @@ if [ "$YAVYQ_OUT" = "$YAVYQ_EXPECT" ]; then
   ok "ga-yavyq AC1: bare blocked:* precondition label now vetoes dispatch same as blocked-on:; clean bead still dispatches (got: $YAVYQ_OUT)"
 else
   bad "ga-yavyq AC1: expected $YAVYQ_EXPECT, got '$YAVYQ_OUT'"
+fi
+
+echo "Scenario ga-uvfs6: _filter_candidates recognizes pilot:refused-reason:* same as pool:refused:*"
+# Bug ga-uvfs6: inflight-reclaim-guard.py's _promote_refusal_labels() CONSUMES the
+# ephemeral pool:refused[:reason] label (the one _filter_candidates already excluded,
+# ga-y8qh) and promotes it to a PERMANENT pilot:refused-reason:<slug> audit label —
+# a bead that survived past its first reclaim cycle carries ONLY the permanent label,
+# so without this clause it re-enters the candidate pool exactly like a never-refused
+# bead (wa-ys0cy: pilot:refused-reason:oracle-named-executor, no pool:refused,
+# reappeared and burned another dispatch). _filter_candidates needs its own two
+# globals (_FILTER_PREAPPROVAL_LABELS, _FILTER_RECLAIM_CAP) extracted alongside it.
+_FC_UVFS6="$(grep '^log()' "$DISPATCHER")
+$(grep '^_FILTER_PREAPPROVAL_LABELS=' "$DISPATCHER")
+$(grep '^_FILTER_RECLAIM_CAP=' "$DISPATCHER")
+$(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISPATCHER")
+$(awk '/^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+
+UVFS6_FIXTURE='[
+  {"id":"wa-like-poolrefused","status":"open","description":"a ready bead with a full description over the floor length","labels":["pool:refused:some-reason"]},
+  {"id":"wa-like-refusedreason","status":"open","description":"a ready bead with a full description over the floor length","labels":["pilot:refused-reason:oracle-named-executor"]},
+  {"id":"wa-like-clean","status":"open","description":"a ready bead with a full description over the floor length","labels":[]}
+]'
+UVFS6_OUT="$(eval "$_FC_UVFS6"; SELF_BEAD_ID=""; printf '%s' "$UVFS6_FIXTURE" | _filter_candidates 2>/dev/null | jq -rc '[.[].id] | sort' 2>/dev/null)"
+UVFS6_EXPECT='["wa-like-clean"]'
+if [ "$UVFS6_OUT" = "$UVFS6_EXPECT" ]; then
+  ok "ga-uvfs6 AC1: pilot:refused-reason:* excluded same as pool:refused:*; clean bead still dispatches (got: $UVFS6_OUT)"
+else
+  bad "ga-uvfs6 AC1: expected $UVFS6_EXPECT, got '$UVFS6_OUT'"
 fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────

@@ -41,6 +41,14 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # no awareness of the hold. Replicate the CANONICAL rule EXACTLY (imp19/ga-4aree):
 #   a bead passes iff  (NOT pilot:held)  OR  (a pilot:held-until:<epoch> exists AND
 #   its LATEST/MAX stamp is already in the past).
+# ga-uvfs6: also excludes pilot:refused-reason:* — inflight-reclaim-guard.py's
+# _promote_refusal_labels() CONSUMES the ephemeral pool:refused[:reason] label
+# above and promotes it to a permanent pilot:refused-reason:<slug> for audit,
+# so a once-refused bead that survived past its first reclaim cycle no longer
+# carries any pool:refused* label at all and this probe re-fetched/re-confirmed
+# it exactly like a fresh bead (wa-ys0cy: pilot:refused-reason:oracle-named-executor
+# with no pool:refused: reappeared and burned another startup). Same prefix-startswith
+# treatment as pool:refused, just a different label namespace.
 # Two subtleties the first cut got wrong (gate FAIL ga-wisp-2hcah2):
 #   • pilot:held with NO held-until yet is the "trap" state (imp19/imp20 hold-stamping
 #     is non-atomic; janitor R6 stamps a default expiry only on its NEXT sweep). The
@@ -56,7 +64,7 @@ You are disposable. You do not carry state between runs. When your bead is done,
 #     `pilot:held` and `pilot:held-until:*`; only then is the expiry branch reachable.
 #   • held-until labels ACCUMULATE (never pruned here), so use MAX not .[0] (ga-4aree)
 #     — the bead is still held iff its LATEST stamp is in the future.
-bd ready --metadata-field "gc.routed_to=wa-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "ctx:thin" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:held"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end))] | .[:1]'
+bd ready --metadata-field "gc.routed_to=wa-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "ctx:thin" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:held"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end))] | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.

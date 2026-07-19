@@ -609,6 +609,26 @@ rig_domain_exclude() {
   esac
 }
 
+# rig_domain_requires_persistent_owner <rig> <domain> — true (0) iff this
+# domain's work STRUCTURALLY cannot run on a disposable ephemeral pool worker
+# and must go to its rig_domain_owner crew directly instead. WA warming/
+# on-device chip management needs a live, continuous device/session that a
+# fresh headless wa-worker cannot hold — Athos's 2026-07-17 decision that
+# oracle-wa is the executor for this domain (ga-uvfs6: wa-srgv/wa-ys0cy were
+# misrouted to the generic wa-worker pool and refused there in a loop).
+# DELIBERATELY NARROW/allowlist-only: rig_domain_owner ALSO maps data→digo-wa
+# and real-estate→peter-wa, but per pilot-dispatcher.selftest.sh Scenario 17b
+# ("pilot-rewire: domain prefer for digo-wa is now a no-op") those are
+# intentionally pool-routed — ordinary code builds the wa-worker pool is
+# designed to absorb. Do not add a domain here without an explicit Athos/
+# Mayor decision that it is likewise structurally pool-incompatible.
+rig_domain_requires_persistent_owner() {
+  case "$1/$2" in
+    whatsapp_automation/warming|wa/warming) return 0 ;;
+    *)                                      return 1 ;;
+  esac
+}
+
 # ── Domain-build → owning-rig inference (ga-lfvs6/ga-wgcyk/ga-m3n1x misroute) ──
 # ROOT (5+ recurrences today: ga-lfvs6, ga-jazy9, ga-m3n1x, ga-wgcyk, ga-yx2d1's
 # property siblings): a DOMAIN build (a property_scrapers scraper, or a WA painel/
@@ -1391,6 +1411,15 @@ _filter_candidates() {
           # re-routed into the same refusal loop the parking label was meant
           # to end.
           or startswith("pool:refused")
+          # ga-uvfs6: pilot:refused-reason:<slug> is the PERMANENT audit label
+          # that inflight-reclaim-guard.py promotes pool:refused[:reason] INTO
+          # (consuming/removing the ephemeral one) via _promote_refusal_labels().
+          # A bead that survived past its first reclaim cycle carries this
+          # instead, and without this clause it re-enters open/unassigned
+          # candidacy exactly like a never-refused bead (wa-ys0cy:
+          # pilot:refused-reason:oracle-named-executor, no pool:refused,
+          # re-selected and burned another dispatch).
+          or startswith("pilot:refused-reason:")
           or . == "story:needs-human"
           or . == "story:needs-device"
           or . == "on-device"
@@ -1484,6 +1513,7 @@ _filter_candidates() {
           ( ($L | map(select(
               startswith("gate:needs-human")
               or startswith("pool:refused")
+              or startswith("pilot:refused-reason:")
               or . == "story:needs-human"
               or . == "story:needs-device"
               or . == "on-device"
@@ -4246,7 +4276,29 @@ LIVESEC
     _DOMAIN=$(bead_domain "$STORY")
     _PREFER=$(rig_domain_owner   "$STORY_RIG" "$_DOMAIN")
     _EXCLUDE=$(rig_domain_exclude "$STORY_RIG" "$_DOMAIN")
-    BUILDER_TARGET=$(pick_pool_builder "$STORY_RIG" "$_PREFER" "$_EXCLUDE" || echo "")
+    # ga-uvfs6: a domain whose owner is STRUCTURALLY REQUIRED (not just a rotation
+    # preference — see rig_domain_requires_persistent_owner) dispatches to that
+    # owner directly, bypassing the ephemeral pool-slot rotation entirely.
+    # BUILDER_TARGET becomes the named crew itself (never a wa-worker-N/
+    # ps-worker-N slot), so the bead never receives gc.routed_to=<pool> at all.
+    # If the owner is busy/suspended/at-cap/human-engaged, fall through to the
+    # normal pool rotation below UNCHANGED (same as any other domain) — this
+    # never blocks dispatch, it only redirects it when the owner is available.
+    if [ -n "$_PREFER" ] && rig_domain_requires_persistent_owner "$STORY_RIG" "$_DOMAIN"; then
+      local _OWNER_BUSY=0
+      _crew_session_human_engaged "$_PREFER" && _OWNER_BUSY=1
+      _crew_is_suspended "$_PREFER" && _OWNER_BUSY=1
+      _crew_at_inflight_cap "$_PREFER" && _OWNER_BUSY=1
+      case " $PILOT_BUSY_BUILDERS " in *" $_PREFER "*) _OWNER_BUSY=1 ;; esac
+      case " $PILOT_USED_BUILDERS " in *" $_PREFER "*) _OWNER_BUSY=1 ;; esac
+      if [ "$_OWNER_BUSY" = "0" ]; then
+        BUILDER_TARGET="$_PREFER"
+        log "ga-uvfs6: $STORY_ID domain=$_DOMAIN requires persistent owner $_PREFER — dispatching directly, bypassing wa-worker pool rotation."
+      fi
+    fi
+    if [ -z "${BUILDER_TARGET:-}" ]; then
+      BUILDER_TARGET=$(pick_pool_builder "$STORY_RIG" "$_PREFER" "$_EXCLUDE" || echo "")
+    fi
     if [ -z "$BUILDER_TARGET" ]; then
       log "POOL($STORY_RIG): all crew busy/used this sweep or domain-excluded (domain=${_DOMAIN:-none} prefer=${_PREFER:-none} exclude=${_EXCLUDE:-none} pool=[$_POOL] busy=[${PILOT_BUSY_BUILDERS:-none}] used=[${PILOT_USED_BUILDERS:-none}]) — deferring $STORY_ID to next sweep. Releasing claim."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
