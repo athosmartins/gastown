@@ -301,6 +301,80 @@ class TestUpdateIndexIfStaleThrottle(unittest.TestCase):
         self.assertIn("ga-1", ids)
         self.assertIn("ga-new0", ids)
 
+    def test_telemetry_only_round_advances_hwm(self):
+        """ga-wisp-uxqk2w gate finding: a poll round where every
+        new-since-last-check bead is telemetry (wisp/order/nudge — filtered
+        out of the corpus) must still advance hwm_closed_at. Before the fix,
+        the whole per-store update block (including the hwm bump) lived
+        behind `if not real: continue`, so a telemetry-only round left the
+        mark untouched and the tool re-polled the exact same window forever
+        (recall_lib.py:528-541)."""
+        idx = self._idx(last_build_at=0, last_check_at=0)
+        telemetry_only = [
+            {"id": "ga-wisp-a1", "title": "order: dispatch something", "issue_type": "task",
+             "closed_at": "2026-07-20T10:00:00Z"},
+            {"id": "ga-wisp-a2", "title": "nudge: fyi", "issue_type": "task",
+             "closed_at": "2026-07-20T11:00:00Z"},
+        ]
+
+        def fake_fetch_closed_meta(store_path, closed_after=None):
+            return telemetry_only if "gascity" in store_path else []
+
+        with mock.patch.object(rl, "fetch_closed_meta", side_effect=fake_fetch_closed_meta), \
+             mock.patch.object(rl, "fetch_full",
+                                side_effect=AssertionError("fetch_full must not run: nothing survived the telemetry filter")), \
+             mock.patch.object(rl, "save_index"):
+            new_idx, changed = rl.update_index_if_stale(idx, force=True)
+
+        self.assertTrue(changed)
+        # Nothing indexable -> corpus is unchanged...
+        self.assertEqual([b["id"] for b in new_idx.corpus], ["ga-1"])
+        # ...but the mark must move past the telemetry-only window, not freeze.
+        self.assertEqual(new_idx.meta["hwm_closed_at"]["HQ"], "2026-07-20T11:00:00Z")
+
+    def test_genuinely_empty_round_leaves_hwm_unchanged(self):
+        """The flip side of the telemetry-only case: when a store's poll
+        returns NOTHING at all since the last check (not even telemetry),
+        `dates` is empty and the mark must legitimately stay put — the fix
+        must not advance the hwm on every call regardless of content."""
+        idx = self._idx(last_build_at=0, last_check_at=0)
+        original_hwm = dict(idx.meta["hwm_closed_at"])
+
+        with mock.patch.object(rl, "fetch_closed_meta", return_value=[]), \
+             mock.patch.object(rl, "fetch_full",
+                                side_effect=AssertionError("fetch_full must not run: nothing fetched")), \
+             mock.patch.object(rl, "save_index"):
+            new_idx, changed = rl.update_index_if_stale(idx, force=True)
+
+        self.assertTrue(changed)
+        self.assertEqual(new_idx.meta["hwm_closed_at"], original_hwm)
+        self.assertEqual([b["id"] for b in new_idx.corpus], ["ga-1"])
+
+    def test_hwm_advances_independently_per_store(self):
+        """Reproduces the reviewer's exact framing ('freezes per-store'): one
+        store's telemetry-only round must advance while a sibling store's
+        genuinely-empty round in the SAME call leaves its own mark alone —
+        proves the two stores' marks aren't coupled to a single decision."""
+        idx = self._idx(last_build_at=0, last_check_at=0)
+        telemetry_only = [
+            {"id": "wa-wisp-b1", "title": "gate-run: reviewer prompt", "issue_type": "task",
+             "closed_at": "2026-07-20T09:30:00Z"},
+        ]
+
+        def fake_fetch_closed_meta(store_path, closed_after=None):
+            # HQ (gascity path) sees a telemetry-only round; WA sees nothing.
+            return [] if "gascity" in store_path else telemetry_only
+
+        with mock.patch.object(rl, "fetch_closed_meta", side_effect=fake_fetch_closed_meta), \
+             mock.patch.object(rl, "fetch_full",
+                                side_effect=AssertionError("fetch_full must not run: nothing survived the telemetry filter")), \
+             mock.patch.object(rl, "save_index"):
+            new_idx, changed = rl.update_index_if_stale(idx, force=True)
+
+        self.assertTrue(changed)
+        self.assertEqual(new_idx.meta["hwm_closed_at"]["HQ"], "2026-07-01T00:00:00Z")  # untouched: genuinely empty
+        self.assertEqual(new_idx.meta["hwm_closed_at"]["WA"], "2026-07-20T09:30:00Z")  # advanced: telemetry-only
+
 
 # ---------------------------------------------------------------------------
 # Hybrid retrieval quality regression (needs the real model — the ONE slow

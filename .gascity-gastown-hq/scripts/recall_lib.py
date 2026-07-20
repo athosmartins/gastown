@@ -527,14 +527,24 @@ def update_index_if_stale(idx: "RecallIndex", force: bool = False, progress=lamb
 
     new_beads = []
     for store_key, (fetched, real) in new_by_store.items():
-        if not real:
-            continue
-        ids = [b["id"] for b in real]
-        full = fetch_full(STORES[store_key], ids)
-        full_by_id = {b["id"]: b for b in full}
-        for b in real:
-            fb = full_by_id.get(b["id"], b)
-            new_beads.append(finalize_bead(fb, store_key))
+        if real:
+            ids = [b["id"] for b in real]
+            full = fetch_full(STORES[store_key], ids)
+            full_by_id = {b["id"]: b for b in full}
+            for b in real:
+                fb = full_by_id.get(b["id"], b)
+                new_beads.append(finalize_bead(fb, store_key))
+        # Advance the high-water-mark over every closed bead the poll SAW
+        # (`fetched`), not just the subset that survived the telemetry
+        # filter (`real`). A round where every new-since-last-check bead
+        # is telemetry (common — 97.8% of HQ closes) must still move the
+        # mark forward, or `after` (derived from the mark) never advances
+        # past that window and the same telemetry beads get re-fetched
+        # from bd on every subsequent call, forever — the index silently
+        # freezes for that store. This must NOT collapse into the
+        # genuinely-empty case: when `fetched` itself is empty (nothing
+        # closed at all since last check), `dates` is empty too and the
+        # `if dates:` guard below correctly leaves the mark untouched.
         dates = [b.get("closed_at") for b in fetched if b.get("closed_at")]
         if dates:
             meta.setdefault("hwm_closed_at", {})
