@@ -128,6 +128,14 @@ rc=$(env SILENT_IGN_SCAN="$TD/scan_rc1.sh" SILENT_IGN_ROOTS=/tmp \
      SILENT_IGN_BASELINE="$TD/base.tsv" timeout 60 bash "$WATCH" >/dev/null 2>&1; echo $?)
 [ "$rc" = "3" ] && ok "scanner rc=1 (erro interno) -> exit 3, não 'zero achados'" \
                 || bad "scanner rc=1 deu rc=$rc, esperado 3 — o erro virou silêncio"
+# ga-8yxwm (achado do gate, run ga-wisp-qgyum7): sem isto, base.tsv.scanner-fp ainda
+# carrega o hash do scan.sh da seção 5 (mk_scan não roda aqui — scan_rc0.sh é outro
+# arquivo). O CONTROLE abaixo bateria no ramo NOVO "instrumento mudou" (linha ~200 do
+# watch, ga-8yxwm) em vez do ramo "0 achados" que ele existe pra provar — os dois dão
+# exit 0, então `[ "$rc" = "0" ]` passava por acidente: false green, o controle não
+# testava mais o que seu próprio texto afirma ("0 e 1 são distinguidos"). Mesmo padrão
+# do mk_scan(): carimba a fingerprint do instrumento ATUAL antes de usá-lo.
+shasum -a 256 "$TD/scan_rc0.sh" | awk '{print $1}' > "$TD/base.tsv.scanner-fp"
 rc=$(env SILENT_IGN_SCAN="$TD/scan_rc0.sh" SILENT_IGN_ROOTS=/tmp \
      SILENT_IGN_BASELINE="$TD/base.tsv" timeout 60 bash "$WATCH" >/dev/null 2>&1; echo $?)
 [ "$rc" = "0" ] && ok "CONTROLE: scanner rc=0 sem achados -> exit 0 (0 e 1 são distinguidos)" \
