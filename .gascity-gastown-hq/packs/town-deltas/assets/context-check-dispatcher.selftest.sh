@@ -97,7 +97,7 @@ done
 [ "$(context_check_lifecycle_skip "tech-debt")" = "no" ] && ok "tech-debt (active work) → not skipped" || bad "tech-debt → expected not skipped"
 
 # ── Scenario 4a: park-exclusion (ga-ipm4) — never re-arm a deliberately parked bead
-echo "Scenario 4a: park-exclusion — needs-human/pool:refused:*/story:blocked never re-armed"
+echo "Scenario 4a: park-exclusion — needs-human/pool:refused:*/story:blocked/pilot:no-auto-dispatch never re-armed"
 [ "$(context_check_is_parked "needs-human")" = "yes" ] && ok "needs-human → parked" || bad "needs-human → expected parked"
 [ "$(context_check_is_parked "story:blocked")" = "yes" ] && ok "story:blocked → parked" || bad "story:blocked → expected parked"
 [ "$(context_check_is_parked "pool:refused:engine-rebuild-required")" = "yes" ] && ok "pool:refused:<reason> → parked" || bad "pool:refused:* → expected parked"
@@ -110,6 +110,19 @@ echo "Scenario 4a: park-exclusion — needs-human/pool:refused:*/story:blocked n
 # tricked the pre-fix daemon into treating the bead as "fresh, never judged".
 [ "$(context_check_is_parked "needs-human,pool:refused:engine-rebuild-required,root-class:error-vs-empty")" = "yes" ] \
   && ok "ga-66wc post-strip label set (no ctx:*, no exec:*) → still parked" || bad "ga-66wc post-strip set → expected parked"
+# ga-bzbig: pilot:no-auto-dispatch — the sticky opt-out for a disarm reason
+# outside the other three (e.g. an epic-child tracker/umbrella, not human-gated,
+# not refused, not dependency-blocked, just structurally not a single
+# dispatchable unit).
+[ "$(context_check_is_parked "pilot:no-auto-dispatch")" = "yes" ] && ok "pilot:no-auto-dispatch → parked" || bad "pilot:no-auto-dispatch → expected parked"
+[ "$(context_check_is_parked "area:infra,pilot:no-auto-dispatch,lane:small")" = "yes" ] && ok "pilot:no-auto-dispatch mixed with unrelated labels → parked" || bad "mixed labels → expected parked"
+# ga-0x4tv repro: pilot:no-auto-dispatch surviving ALONE (ctx:ready/exec:auto/
+# story:approved already stripped by Mayor) must still read as parked — this is
+# exactly the state that tricked the pre-fix daemon into re-arming ga-0x4tv
+# 42min after Mayor's manual disarm (context-check-dispatcher.log: "ga-0x4tv →
+# ctx:ready + exec:auto (mech=ready sig=yes dlen=962)").
+[ "$(context_check_is_parked "area:infra,pilot:no-auto-dispatch,epic:ga-05604")" = "yes" ] \
+  && ok "ga-0x4tv post-strip label set (no ctx:*, no exec:*, no story:approved) → still parked" || bad "ga-0x4tv post-strip set → expected parked"
 
 # ── Scenario 4b: master candidate gate composes all the above ─────────────────
 echo "Scenario 4b: context_check_is_candidate composes type+plumbing+ctx+lifecycle+park"
@@ -128,6 +141,13 @@ echo "Scenario 4b: context_check_is_candidate composes type+plumbing+ctx+lifecyc
   || bad "REGRESSION ga-ipm4: parked bead with ctx:* stripped would be re-judged and re-armed"
 [ "$(context_check_is_candidate "ga-blocked" "chore" "story:blocked,lane:small" "false" "no")" = "no" ] \
   && ok "story:blocked bead → NOT a candidate" || bad "story:blocked → expected not candidate"
+# ga-bzbig: the exact ga-0x4tv shape — chore, no ctx:* label (Mayor stripped it),
+# pilot:no-auto-dispatch present, no lifecycle/lock label — must NOT re-enter
+# candidacy (this is the regression: pre-fix, is_parked didn't recognize this
+# label so is_candidate returned "yes" and the daemon re-armed ctx:ready+exec:auto).
+[ "$(context_check_is_candidate "ga-0x4tv" "chore" "area:infra,pilot:no-auto-dispatch,epic:ga-05604" "false" "no")" = "no" ] \
+  && ok "ga-0x4tv-shaped bead (parked via pilot:no-auto-dispatch, ctx:* stripped) → NOT a candidate (no re-arm)" \
+  || bad "REGRESSION ga-bzbig: Mayor-disarmed tracker with ctx:* stripped would be re-judged and re-armed"
 
 # ── Scenario 5: verifiable-signal detection ───────────────────────────────────
 echo "Scenario 5: verifiable-signal detection (HOW-TO-VERIFY / concrete artifact)"

@@ -41,10 +41,11 @@
 #     isn't ALSO parked (see PARK-EXCLUSION below) — ga-ipm4 found the naive
 #     version of this claim false: stripping ctx:ready to park ga-66wc made it
 #     look "fresh" again and this daemon re-armed it on the very next sweep.
-#   - PARK-EXCLUSION (ga-ipm4): a bead carrying needs-human, pool:refused:*, or
-#     story:blocked is NEVER a candidate, ctx:* label or not. Parking is a
-#     deliberate human/dog decision; this daemon must not silently overrule it
-#     by re-adding ctx:ready+exec:auto once the bead loses its ctx:* marker.
+#   - PARK-EXCLUSION (ga-ipm4, extended ga-bzbig): a bead carrying needs-human,
+#     pool:refused:*, story:blocked, or pilot:no-auto-dispatch is NEVER a
+#     candidate, ctx:* label or not. Parking is a deliberate human/dog
+#     decision; this daemon must not silently overrule it by re-adding
+#     ctx:ready+exec:auto once the bead loses its ctx:* marker.
 #   - ga-it11w LESSON: a terminal ctx:thin bead must NOT loop. ctx:thin is itself
 #     the exclusion key (a thin bead already has a ctx:* label → never re-ingested),
 #     so there is no re-ingestion loop. ctx:thin is NOT stripped by this daemon.
@@ -218,15 +219,30 @@ context_check_lifecycle_skip() {
 
 # context_check_is_parked <labels_csv>
 #   emit "yes" iff the bead has been deliberately PARKED — needs-human,
-#   pool:refused:<any reason>, or story:blocked. A parked bead must NEVER be
-#   (re)armed with ctx:ready/exec:auto (ga-ipm4): parking and arming are
-#   orthogonal states that must never coexist, and today the ONLY way a parked
-#   bead loses ctx:ready is a human/dog explicitly stripping it — which this
-#   daemon would otherwise silently undo on its next ~10min sweep, because a
-#   stripped bead has no ctx:* label left and looks unjudged again. Reproduced
-#   live on ga-66wc: stripped ctx:ready+exec:auto at 11:01Z, this daemon
-#   re-added both at 11:14:58Z per context-check-dispatcher.log (mech=ready
-#   sig=yes) — the bead never lost needs-human/pool:refused:* in between.
+#   pool:refused:<any reason>, story:blocked, or pilot:no-auto-dispatch. A
+#   parked bead must NEVER be (re)armed with ctx:ready/exec:auto (ga-ipm4):
+#   parking and arming are orthogonal states that must never coexist, and
+#   today the ONLY way a parked bead loses ctx:ready is a human/dog explicitly
+#   stripping it — which this daemon would otherwise silently undo on its next
+#   ~10min sweep, because a stripped bead has no ctx:* label left and looks
+#   unjudged again. Reproduced live on ga-66wc: stripped ctx:ready+exec:auto at
+#   11:01Z, this daemon re-added both at 11:14:58Z per
+#   context-check-dispatcher.log (mech=ready sig=yes) — the bead never lost
+#   needs-human/pool:refused:* in between.
+#   pilot:no-auto-dispatch (ga-bzbig) covers a disarm reason the first three
+#   don't fit: a bead that is neither human-gated, refused, nor
+#   dependency-blocked, but structurally isn't a single dispatchable unit (e.g.
+#   an epic-child tracker/umbrella whose work happens organically across OTHER
+#   stories — ga-0x4tv). Reproduced live: Mayor manually stripped
+#   ctx:ready+story:approved at 00:53:53Z with none of the other three park
+#   labels added alongside, so is_parked returned "no", the bead looked
+#   "fresh", and this daemon re-armed ctx:ready+exec:auto 42min later
+#   (01:35:51Z, mech=ready sig=yes dlen=962) — causing a 2nd wasted Pilot
+#   dispatch. pilot:no-auto-dispatch is the general-purpose sticky opt-out for
+#   this shape: set once by whoever disarms for a reason outside the other
+#   three, cleared only by explicit human/Mayor action, never by a heuristic
+#   sweep — mirrors the pilot:* dispatch-metadata namespace already in use
+#   (pilot:dispatched, pilot:held-until:*, pilot:reclaim-count:*).
 #   Mirrors the wa-9t2ty dep-blocked lesson (context_check_skip_reason below):
 #   a deliberate hold must survive a re-sweep. Split safely (see
 #   context_check_is_plumbing's IFS comment — a leaked IFS=, would break
@@ -238,7 +254,7 @@ context_check_is_parked() {
   IFS=',' read -ra _lbls <<< "$labels"
   for l in "${_lbls[@]+"${_lbls[@]}"}"; do
     case "$l" in
-      needs-human|story:blocked) echo "yes"; return ;;
+      needs-human|story:blocked|pilot:no-auto-dispatch) echo "yes"; return ;;
       pool:refused:*) echo "yes"; return ;;
     esac
   done
