@@ -13,6 +13,11 @@
 #   VACUIDADE é load-bearing precisa ser FALSIFICADO. Por isso cada teste de "grita"
 #   vem com um CONTROLE que prova que ele NÃO grita quando não deve — senão "sempre
 #   grita" passaria por "detecta".
+#
+# SEÇÃO 9 (ga-8yxwm): prova a fingerprint do scanner — muda o hash do instrumento
+#   e o watcher tem que re-seedar em silêncio em vez de alertar "N novos" falsos
+#   (o incidente real: 21:35, 11770 "novos" bogus por o scanner ter mudado de
+#   escopo entre o baseline e o run).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,11 +30,18 @@ TD=$(mktemp -d); trap 'rm -rf "$TD"' EXIT
 NOW=$(date +%s); D10=$(( NOW - 10*86400 )); D3=$(( NOW - 3*86400 ))
 
 # scanner falso: 2 achados que já estão no baseline + 1 novo
+# Stampa a fingerprint (mesmo comando que o watch usa) JUNTO — todas as seções 1-8
+# testam o relógio/re-escalação/erro-vs-vazio, não o mecanismo de fingerprint do
+# ga-8yxwm; sem isto, CADA mk_scan (conteúdo novo -> hash novo) pareceria "o scanner
+# mudou" pro watch e disparava a re-seed silenciosa nova, mascarando o que essas
+# seções realmente querem provar. A seção 9 testa o fingerprint e cuida da sua
+# própria fingerprint explicitamente (não usa este auto-stamp).
 mk_scan() { cat > "$TD/scan.sh" <<EOF
 #!/bin/bash
 $(for f in "$@"; do echo "echo \"$f\""; done)
 EOF
-chmod +x "$TD/scan.sh"; }
+chmod +x "$TD/scan.sh"
+shasum -a 256 "$TD/scan.sh" | awk '{print $1}' > "$TD/base.tsv.scanner-fp"; }
 
 # roda o watch isolado; ecoa rc
 run() { local rc; env SILENT_IGN_SCAN="$TD/scan.sh" SILENT_IGN_ROOTS=/tmp \
@@ -126,6 +138,102 @@ rc=$(env GC_CITY_PATH=/hq/que/nao/existe SILENT_IGN_SCAN="$TD/scan_rc0.sh" \
      SILENT_IGN_BASELINE="$TD/base.tsv" timeout 60 bash "$WATCH" >/dev/null 2>&1; echo $?)
 [ "$rc" = "3" ] && ok "HQ não-diretório -> exit 3 (a raiz principal não entra sem -d)" \
                 || bad "HQ inexistente deu rc=$rc, esperado 3"
+
+echo "── 9. fingerprint do SCANNER muda -> re-seeda em silêncio, NÃO alerta 'N novos' falsos (ga-8yxwm) ──"
+# cenário real do bug: o scanner mudou de versão (ga-vkjs/ga-ypl5l) entre duas
+# rodadas agendadas. Baseline do scanner velho vs scan do scanner novo diverge em
+# quase tudo -> 100% artefato de FERRAMENTA, zero dívida nova de verdade.
+#
+# Mock dedicado: ao contrário de mk_scan (achados embutidos NO PRÓPRIO scanner),
+# aqui "o instrumento" (scan9.sh, versionado por write_scan9_version) e "o que ele
+# acha ao rodar" (scan9-data.txt, via mk_scan9) são arquivos SEPARADOS — como no
+# sistema real, onde error-empty-conflation-scan.sh não muda de hash só porque o
+# código-alvo que ele varre ganhou uma linha nova. É o que permite testar "mesmo
+# instrumento, achado novo" (9a/9d) sem também mexer na fingerprint.
+mk_scan9() { printf '%s\n' "$@" > "$TD/scan9-data.txt"; }
+write_scan9_version() { cat > "$TD/scan9.sh" <<EOS
+#!/bin/bash
+# versão: $1
+cat "$TD/scan9-data.txt"
+EOS
+chmod +x "$TD/scan9.sh"; }
+rm -f "$TD/notify_called"
+cat > "$TD/mock_notify.sh" <<EOS
+#!/bin/bash
+echo called >> "$TD/notify_called"
+exit 0
+EOS
+chmod +x "$TD/mock_notify.sh"
+run9() { env SILENT_IGN_SCAN="$TD/scan9.sh" SILENT_IGN_ROOTS=/tmp SILENT_IGN_BASELINE="$TD/base.tsv" \
+  SILENT_IGN_NOTIFY="$TD/mock_notify.sh" timeout 90 bash "$WATCH" "$@" >"$TD/out.txt" 2>&1; echo $?; }
+
+printf 'a.sh\tC2\tcod_a\t%s\nb.sh\tC2\tcod_b\t%s\n' "$D10" "$D3" > "$TD/base.tsv"
+write_scan9_version A
+shasum -a 256 "$TD/scan9.sh" | awk '{print $1}' > "$TD/base.tsv.scanner-fp"
+
+# 9a CONTROLE: MESMO scanner (versão A, fingerprint já combina), achado novo real
+# -> ALERTA de verdade. Prova que o mecanismo novo não deixa o watcher mudo em
+# geral — só quando o instrumento realmente muda.
+mk_scan9 "a.sh:1:C2:cod_a" "b.sh:2:C2:cod_b" "c.sh:3:C2:cod_c_real"
+rc=$(run9 --notify)
+[ "$rc" = "0" ] && [ -f "$TD/notify_called" ] \
+  && ok "CONTROLE: fingerprint IGUAL + achado novo real -> alerta dispara (mecanismo não fica mudo à toa)" \
+  || bad "CONTROLE falhou: rc=$rc notify_called=$([ -f "$TD/notify_called" ] && echo sim || echo não) — $(head -1 "$TD/out.txt")"
+
+# 9b: scanner MUDA pra versão B (hash diferente). Achados novos TODOS diferentes
+# dos do baseline — o "11770 novos" bogus do incidente real. Tem que re-seedar em
+# silêncio, NUNCA alertar.
+rm -f "$TD/notify_called"
+old_fp=$(cat "$TD/base.tsv.scanner-fp")
+mk_scan9 "x.sh:1:C2:cod_x" "y.sh:2:C2:cod_y" "z.sh:3:C2:cod_z"
+write_scan9_version B
+new_fp=$(shasum -a 256 "$TD/scan9.sh" | awk '{print $1}')
+[ "$old_fp" != "$new_fp" ] \
+  && ok "setup 9b são: versão B do scanner tem hash diferente da A (o teste prova algo)" \
+  || bad "setup do teste 9b quebrado: hash do scanner não mudou — o teste não provaria nada"
+rc=$(run9 --notify)
+[ "$rc" = "0" ] \
+  && ok "scanner mudou -> exit 0 (não é erro, é re-seed silenciosa)" \
+  || bad "scanner mudou deu rc=$rc, esperado 0"
+[ ! -f "$TD/notify_called" ] \
+  && ok "scanner mudou -> notify NUNCA chamado (o falso alarme de 'N novos' não dispara)" \
+  || bad "scanner mudou disparou notify — é o falso-alarme exato do ga-8yxwm (11770 'novos' bogus)"
+grep -qi "re-baseline" "$TD/out.txt" \
+  && ok "log explica a re-seed por mudança de scanner (auditável, não silêncio total)" \
+  || bad "nenhuma linha de log menciona a re-seed: $(cat "$TD/out.txt")"
+[ "$(epoch_of cod_x)" -ge "$NOW" ] 2>/dev/null \
+  && ok "achado do scanner novo entra no baseline (absorvido como dívida existente)" \
+  || bad "cod_x não foi absorvido no baseline após a re-seed: $(epoch_of cod_x)"
+[ "$(cat "$TD/base.tsv.scanner-fp")" = "$new_fp" ] \
+  && ok "fingerprint do baseline avançou pro novo instrumento" \
+  || bad "fingerprint não foi atualizada após a re-seed"
+
+# 9c CONTROLE: dry-run (sem --notify) com scanner mudado (versão C) NÃO pode mutar
+# nada — mesma regra que já vale pro resto do arquivo (wa-4fmxd/wa-8fzuk): um
+# smoke-test manual não pode consumir a re-seed que a rodada agendada real faria.
+rm -f "$TD/notify_called"
+mk_scan9 "p.sh:1:C2:cod_p" "q.sh:2:C2:cod_q"
+write_scan9_version C
+antes_base=$(cat "$TD/base.tsv"); antes_fp=$(cat "$TD/base.tsv.scanner-fp")
+rc=$(run9)
+[ "$rc" = "0" ] && [ ! -f "$TD/notify_called" ] \
+  && ok "dry-run com scanner mudado -> exit 0, sem alertar" \
+  || bad "dry-run com scanner mudado: rc=$rc notify=$([ -f "$TD/notify_called" ] && echo sim || echo não)"
+[ "$(cat "$TD/base.tsv")" = "$antes_base" ] && [ "$(cat "$TD/base.tsv.scanner-fp")" = "$antes_fp" ] \
+  && ok "dry-run com scanner mudado NÃO tocou baseline nem fingerprint (a rodada --notify real ainda vai re-seedar)" \
+  || bad "dry-run mutou estado durável — smoke-test manual consumiria a re-seed real (wa-4fmxd/wa-8fzuk de novo)"
+
+# 9d: volta pra versão B (a mesma já estampada em base.tsv.scanner-fp — a versão C
+# do 9c nunca foi persistida) + 1 achado genuinamente novo -> volta a alertar
+# normalmente. Prova que a re-seed absorve UMA diferença de instrumento e não
+# deixa o mecanismo mudo pra sempre.
+rm -f "$TD/notify_called"
+mk_scan9 "x.sh:1:C2:cod_x" "y.sh:2:C2:cod_y" "z.sh:3:C2:cod_z" "novo_de_verdade.sh:4:C2:cod_novo_de_verdade"
+write_scan9_version B
+rc=$(run9 --notify)
+[ -f "$TD/notify_called" ] \
+  && ok "instrumento estável de novo + achado real -> volta a alertar (não fica mudo depois da re-seed)" \
+  || bad "após estabilizar, achado novo de verdade NÃO alertou — mecanismo ficou mudo permanentemente: $(cat "$TD/out.txt")"
 
 echo ""
 echo "──────────────────────────────────────────"

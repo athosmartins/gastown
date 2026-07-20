@@ -20,7 +20,7 @@
 #   ACABOU DE ESCREVER O BUG — esse é o sinal. Isto também conserta a régua que estava
 #   quebrada: ela confundia "achado" com "criado". Baseline = achado. Delta = criado.
 #
-# AS 3 LIÇÕES DE 16/07 QUE ESTÃO CODIFICADAS AQUI (cada uma é um bug real de hoje):
+# AS 4 LIÇÕES QUE ESTÃO CODIFICADAS AQUI (cada uma é um bug real de hoje):
 #   1. wa-k288h — dedup sem timestamp avisa 1x e CALA PRA SEMPRE. Aqui: o seen guarda
 #      epoch por achado e RE-ESCALA depois de ESCALATE_DAYS.
 #   2. wa-4fmxd — persistir ANTES de o aviso sair faz um ntfy falho CONSUMIR o alerta.
@@ -29,6 +29,13 @@
 #      ser FALSIFICADO. Aqui: se o scanner não roda, ou o baseline não é legível, o
 #      monitor GRITA e sai != 0 — nunca reporta "0 novos" por não ter conseguido olhar.
 #      É a diferença entre "não achei" e "não consegui procurar".
+#   4. ga-8yxwm — comparar contra o baseline sem checar se o SCANNER é o MESMO
+#      instrumento vira apples-vs-oranges: 21:35, 11770 "novos" bogus porque o
+#      scanner tinha mudado de escopo (ga-ypl5l, 196k->2.9k arquivos) entre o
+#      baseline e o run. Aqui: fingerprint (hash) do scanner viaja ao lado do
+#      baseline; se ela muda, RE-SEED em silêncio — nunca "N novos" por artefato
+#      de ferramenta. Um --seed manual (2669 achados reais) foi o que descobriu o
+#      número verdadeiro depois do falso alarme de 11770.
 #
 # Uso:  silent-ignorance-watch.sh [--notify] [--seed] [--baseline PATH]
 #         (sem --notify = dry-run: NÃO toca no baseline — senão o smoke-test manual
@@ -51,6 +58,9 @@ while [ $# -gt 0 ]; do
     *) echo "silent-ignorance-watch: unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+# sidecar da fingerprint do scanner (ga-8yxwm) — deriva de BASELINE já resolvido
+# (pós --baseline), pra ficar sempre ao lado do baseline que ela guarda.
+FP_FILE="${BASELINE}.scanner-fp"
 
 # ── as raízes: derivadas do rig list, NUNCA hardcoded ────────────────────────
 # (ga-shqn: a lista hardcoded do root-class-count.sh já nascia sem gastown[50 beads]
@@ -118,6 +128,10 @@ now=$(date +%s)
 # chave estável: arquivo:categoria:código (SEM o número da linha — senão qualquer
 # edição acima desloca tudo e o monitor grita 291 falsos "novos" no dia seguinte).
 key_of() { awk -F: '{cat=""; for(i=1;i<=NF;i++) if($i=="C1"||$i=="C2"||$i=="C3"){cat=$i; ci=i; break} code=""; for(j=ci+1;j<=NF;j++) code=code (j>ci+1?":":"") $j; gsub(/^[[:space:]]+|[[:space:]]+$/,"",code); print $1 "\t" cat "\t" code}' "$1"; }
+# computado uma vez só; tanto o --seed quanto o fingerprint-check quanto o delta
+# normal (mais abaixo) leem o mesmo arquivo de keys — antes disto era chamado 2x
+# (uma vez em cada ramo), duplicação que sobrou ao intercalar o check novo entre eles.
+key_of "$tmp_all" > "${tmp_all}.keys"
 
 # ── persist_baseline <keys> <delta|/dev/null> ────────────────────────────────
 # ⚠️ NUNCA reescreva o baseline carimbando $now em TUDO. O relógio é POR ACHADO.
@@ -149,9 +163,23 @@ persist_baseline() {
   ' "$prev" "$delta" "$keys" > "${BASELINE}.tmp" && mv "${BASELINE}.tmp" "$BASELINE"
 }
 
+# ── fingerprint do scanner (ga-8yxwm): o baseline só é comparável contra um scan
+# feito pelo MESMO instrumento. Hash do arquivo inteiro do scanner — cobre tanto
+# mudança de LÓGICA (ga-vkjs: rc lido ao contrário) quanto de ESCOPO/exclusão
+# (ga-ypl5l: 196k->2.9k arquivos, 67x), porque a lista EXCL mora dentro do mesmo
+# error-empty-conflation-scan.sh — não existe hoje um 2º arquivo de escopo à parte.
+scanner_fp=$(shasum -a 256 "$SCAN" 2>/dev/null | awk '{print $1}')
+if [ -z "$scanner_fp" ]; then
+  # não deveria acontecer — "$SCAN" acabou de RODAR com sucesso lá em cima — mas se
+  # acontecer é "não sei que instrumento é este", que não pode virar "é o mesmo".
+  echo "silent-ignorance-watch: ERRO — não consegui calcular a fingerprint do scanner ('$SCAN')." >&2
+  echo "  sem saber o instrumento, não afirmo se o baseline é comparável. (Ignorância Silenciosa)" >&2
+  exit 3
+fi
+
 if [ "$seed_mode" = "1" ]; then
-  key_of "$tmp_all" > "${tmp_all}.keys"
   persist_baseline "${tmp_all}.keys" /dev/null
+  printf '%s\n' "$scanner_fp" > "$FP_FILE"
   echo "silent-ignorance-watch: baseline semeado com $total achado(s) — nada alertado (é a dívida existente)."
   exit 0
 fi
@@ -162,8 +190,28 @@ if [ ! -r "$BASELINE" ]; then
   exit 3
 fi
 
+# ── instrumento mudou desde o baseline? re-seed EM SILÊNCIO, nunca "N novos" ──
+# (ga-8yxwm: 21:35, 11770 "novos" bogus — o scanner tinha mudado de escopo entre o
+# baseline e o run, delta virou apples-vs-oranges. Fingerprint AUSENTE == não sei se
+# é o mesmo instrumento == trato como diferente — mesma regra de erro-não-é-vazio:
+# não afirmo "é o mesmo" sem prova.)
+prev_fp=""
+[ -r "$FP_FILE" ] && prev_fp="$(cat "$FP_FILE" 2>/dev/null)"
+if [ "$prev_fp" != "$scanner_fp" ]; then
+  # mesma regra do dry-run normal (lição wa-4fmxd/wa-8fzuk, cabeçalho deste arquivo):
+  # sem --notify não pode mutar estado durável, senão um smoke-test manual "consome"
+  # a re-seed e a rodada agendada real nunca vê o instrumento mudar.
+  if [ "$notify_mode" = "1" ]; then
+    persist_baseline "${tmp_all}.keys" /dev/null
+    printf '%s\n' "$scanner_fp" > "$FP_FILE"
+    echo "silent-ignorance-watch: scanner mudou (${prev_fp:-<sem fingerprint prévia>} -> $scanner_fp) — re-baselineando silenciosamente; $total achado(s) (dívida existente, NÃO alertado). (ga-8yxwm)"
+  else
+    echo "silent-ignorance-watch: scanner mudou (${prev_fp:-<sem fingerprint prévia>} -> $scanner_fp) — dry-run: baseline INTACTO; a próxima rodada com --notify re-seeda em silêncio."
+  fi
+  exit 0
+fi
+
 # ── delta: o que é NOVO + o que segue aberto há >= ESCALATE_DAYS ─────────────
-key_of "$tmp_all" > "${tmp_all}.keys"
 cutoff=$((now - ESCALATE_DAYS * 86400))
 awk -F'\t' -v OFS='\t' -v cutoff="$cutoff" '
   NR==FNR { seen[$1 FS $2 FS $3] = $4; next }
