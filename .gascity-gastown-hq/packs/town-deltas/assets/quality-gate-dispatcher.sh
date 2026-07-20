@@ -2045,6 +2045,22 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; the
       -m "$(printf 'Source bead %s has 2+ branches concurrently active in the quality gate.\n\nThis branch %s just PASSED review, but sibling branch %s is still %s — auto-merging either would silently discard the other. Labeled gate:needs-human on %s; the Pilot will not re-dispatch it.\n\nA human must reconcile: pick the correct/superset branch, then clear gate:needs-human.\n\nBead: %s   Rig: %s\nThis branch: %s (gate run %s)\nSibling branch: %s (gate-status:%s)' \
         "$BEAD_ID" "$BRANCH" "$GATE_LXZ5W_SIB_BRANCH" "$GATE_LXZ5W_SIB_STATUS" "$BEAD_ID" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID" "$GATE_LXZ5W_SIB_BRANCH" "$GATE_LXZ5W_SIB_STATUS")" \
       2>/dev/null || warn "Could not mail Mayor escalation for sibling-branch race on $BEAD_ID (ga-lxz5w)"
+    # ga-lxz5w/ga-huaxo: mail the AUTHOR too, not just the Mayor. This sibling-race
+    # site (ga-lxz5w) landed AFTER the ga-u4yi author-mail convention was established at
+    # the other gate:needs-human sites, so it silently missed its own author-mail — the
+    # ga-huaxo bijection guard (gate-selfheal.selftest.sh §8) caught it. The author's
+    # branch PASSED review but is held for human reconciliation; they need a DURABLE
+    # signal (mail survives a dead/restarted session, unlike an ephemeral bd comment).
+    # $AUTHOR is the global populated by `extract "author"` before gate_finalize_run is
+    # called (same as the working cap-exhaustion site below), so this reaches the real
+    # author — not a hollow guard-satisfier.
+    if [ -n "$AUTHOR" ]; then
+      gc --city "$GC_CITY" mail send "$AUTHOR" \
+        -s "Your gate PASS is held for reconciliation: 2 branches on $BEAD_ID (ga-lxz5w)" \
+        -m "$(printf 'Your branch %s PASSED gate review, but it was NOT merged.\n\nA sibling branch %s is concurrently active in the gate for the same source bead %s (gate-status:%s). Auto-merging either branch would silently discard the other, so %s was labeled gate:needs-human and the Pilot will not re-dispatch it.\n\nNothing to do from your side right now — a human must pick the correct/superset branch and clear gate:needs-human before either can proceed.\n\nBead: %s   Rig: %s\nYour branch: %s (gate run %s)\nSibling branch: %s (gate-status:%s)' \
+          "$BRANCH" "$GATE_LXZ5W_SIB_BRANCH" "$BEAD_ID" "$GATE_LXZ5W_SIB_STATUS" "$BRANCH" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID" "$GATE_LXZ5W_SIB_BRANCH" "$GATE_LXZ5W_SIB_STATUS")" \
+        2>/dev/null || warn "Could not mail author $AUTHOR for sibling-branch race on $BEAD_ID (ga-lxz5w)"
+    fi
     warn "ga-lxz5w: sibling branch $GATE_LXZ5W_SIB_BRANCH (gate-status:$GATE_LXZ5W_SIB_STATUS) active for bead $BEAD_ID — downgrading $BRANCH's PASS to FAIL, labeling gate:needs-human."
   fi
 fi
