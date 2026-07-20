@@ -804,6 +804,141 @@ gate_bead_has_prior_sha_fail() {
   gate_labels_have_sha_fail "$labels" "$sha"
 }
 
+# ── ga-lxz5w: SAME-BEAD SIBLING-BRANCH + LATE-HOLD pre-merge checks ───────────
+# Real incident: bead wa-fnibd had 2 builders. wa-worker's branch built an
+# INCOMPLETE fix; crew/oracle's branch (a different SHA, same bead) was the
+# COMPLETE superset. Oracle held the bead with gate:needs-human, but the
+# incomplete branch merged anyway — the gate never checked for (a) another
+# branch still active for the same source bead, or (b) a park-worthy label
+# applied to the bead AFTER this run's own review began. Both checks below
+# are inserted just before the ga-nooaw SHA-fail check's merge gate, downgrade
+# an in-flight PASS to FAIL, and fall through to the existing FAIL path
+# unchanged — identical shape to gate_bead_has_prior_sha_fail above.
+
+# gate_active_gate_statuses — space-joined gate-status values meaning "still
+# actively pursuing a merge" (not yet terminal). Single source of truth so the
+# pure/resolver pair below can't silently drift on what counts as "active".
+gate_active_gate_statuses() {
+  printf 'ready queued claimed dispatching running needs-rebase'
+}
+
+# gate_is_active_gate_status <status> — pure. "yes" iff $status is one of
+# gate_active_gate_statuses(); "no" for any terminal status (passed/failed/
+# superseded/error/aborted/deferred/parked-needs-human) or empty/unknown input.
+gate_is_active_gate_status() {
+  case " $(gate_active_gate_statuses) " in
+    *" $1 "*) printf 'yes' ;;
+    *)        printf 'no' ;;
+  esac
+}
+
+# gate_pick_active_sibling <branch_TAB_status_lines> <this_branch> — pure (no
+# IO, set -e safe). Each input line is "<branch><TAB><gate-status-value>" for
+# one marker/gate-run tied to the same source bead. Prints the FIRST line
+# whose branch differs from $this_branch AND whose status is active — i.e. a
+# genuinely CONCURRENT competitor. Same-branch rows are always this run's own
+# earlier state, never a sibling (a `-reland` resubmission always gets a NEW
+# branch name — see ga-dupnv's Step 5b comment for why branch, not bead, is
+# the right key: same-bead-different-branch-over-time is a legitimate,
+# non-conflicting, sequential case that must NOT be flagged here). Prints ""
+# if no active sibling is found.
+gate_pick_active_sibling() {
+  local lines="$1" this_branch="$2" branch status
+  while IFS=$'\t' read -r branch status; do
+    [ -z "$branch" ] && continue
+    [ "$branch" = "$this_branch" ] && continue
+    if [ "$(gate_is_active_gate_status "$status")" = "yes" ]; then
+      printf '%s\t%s' "$branch" "$status"
+      return 0
+    fi
+  done <<EOF
+$lines
+EOF
+  printf ''
+}
+
+# gate_bead_active_sibling_branch <gc_city> <bead_id> <this_branch> — bd-
+# backed. Prints "<branch><TAB><status>" of another branch's marker/gate-run
+# currently active for the SAME source bead, or "" if none. Queries the HQ
+# city (source-bead: labels are always written there by gate-done.md and
+# Step 6, regardless of which rig bead_id itself lives in) — pass gc_city,
+# never bead_city. A gate-run bead has no branch: LABEL (only a marker does —
+# gate-done.md Step 3); it carries the branch in its description instead
+# (Step 6, "branch: $BRANCH"), so the label is tried first, description second
+# — mirrors the established extract()-from-description convention (see
+# docs/gate-marker-recipe.md) rather than a single brittle inline jq regex.
+# Deliberately reads live (no bd-list-cached.sh) — same freshness reasoning as
+# gate_bead_has_prior_sha_fail above: this gates a hard-to-reverse merge
+# decision. FAIL-OPEN ("" / no sibling found) on any bd/jq error or missing
+# fields — identical rationale as the SHA-fail check: a transient hiccup must
+# never permanently wedge a legitimately-solo branch.
+gate_bead_active_sibling_branch() {
+  local gc_city="$1" bead_id="$2" this_branch="$3"
+  local siblings_json count i sib labels desc branch status lines
+  if [ -z "$bead_id" ] || [ -z "$this_branch" ]; then
+    printf ''
+    return 0
+  fi
+  siblings_json=$(bd -C "$gc_city" list --label "source-bead:$bead_id" --all --json 2>/dev/null || echo "[]")
+  if [ -z "$siblings_json" ] || [ "$siblings_json" = "null" ]; then siblings_json="[]"; fi
+  count=$(printf '%s' "$siblings_json" | jq 'length' 2>/dev/null || echo "0")
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  if [ "$count" = "0" ]; then
+    printf ''
+    return 0
+  fi
+  lines=""
+  for i in $(seq 0 $((count - 1))); do
+    sib=$(printf '%s' "$siblings_json" | jq ".[$i]" 2>/dev/null) || continue
+    labels=$(printf '%s' "$sib" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
+    branch=$(printf '%s\n' "$labels" | tr ' ' '\n' | sed -n 's/^branch:\(.*\)$/\1/p' | head -1)
+    if [ -z "$branch" ]; then
+      desc=$(printf '%s' "$sib" | jq -r '.description // ""' 2>/dev/null || echo "")
+      branch=$(printf '%s\n' "$desc" | sed -n 's/^branch:[ \t]*\(.*\)$/\1/p' | head -1)
+    fi
+    [ -z "$branch" ] && continue
+    status=$(printf '%s\n' "$labels" | tr ' ' '\n' | sed -n 's/^gate-status:\(.*\)$/\1/p' | head -1)
+    [ -z "$status" ] && continue
+    lines="${lines}${branch}	${status}
+"
+  done
+  gate_pick_active_sibling "$lines" "$this_branch"
+}
+
+# gate_bead_live_merge_block <bead_city> <bead_id> — bd-backed. Re-reads the
+# source bead's CURRENT status/labels, live, right before merge — the guard's
+# check_source_bead_park() (sourced from quality-gate-guard.sh above) only
+# ran ONCE, at marker-claim/submission time (Step 5a), long before this exact
+# moment. A park-worthy label applied AFTER claim (a human/crew holding it
+# mid-review), or the bead reaching `closed` entirely (already resolved by a
+# sibling branch's own finalize — the sequential variant of the same 2-branch
+# race), never re-blocked an already in-flight PASS. Reuses
+# check_source_bead_park so the two check sites can never drift on what
+# counts as a park-worthy label.
+# Returns: ok | closed | park:needs-approval | park:needs-human
+# FAIL-OPEN ("ok") on any bd/jq error or missing bead — identical rationale as
+# guard.sh's own Step 5a: a lookup failure must never permanently block a
+# legitimate PASS.
+gate_bead_live_merge_block() {
+  local bead_city="$1" bead_id="$2" raw status labels
+  if [ -z "$bead_id" ]; then
+    printf 'ok'
+    return 0
+  fi
+  raw=$(bd -C "$bead_city" show "$bead_id" --json 2>/dev/null || echo "")
+  if [ -z "$raw" ]; then
+    printf 'ok'
+    return 0
+  fi
+  status=$(printf '%s' "$raw" | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null || echo "")
+  if [ "$status" = "closed" ]; then
+    printf 'closed'
+    return 0
+  fi
+  labels=$(printf '%s' "$raw" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
+  check_source_bead_park "$labels"
+}
+
 # ── ga-cw4pm: dynamic-concurrency headroom helpers ────────────────────────────
 # Mirror the Pilot's Dolt-saturation probe (pilot-dispatcher.sh _dolt_cpu/
 # _dolt_saturated) so the GATE throttles its OWN reviewer spawns the same way the
@@ -1860,6 +1995,58 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH_SHA" ] 
   OVERALL_VERDICT="FAIL"
   FAIL_REASONS="Commit $BRANCH_SHA already carries a recorded FAIL verdict from an earlier, independent gate-run (fail-closed by SHA, ga-nooaw). A prior rejection of this exact commit cannot be flipped to PASS by re-review — push a new commit with an actual fix, then re-run /gate-done."
   warn "Fail-closed by SHA (ga-nooaw): $BRANCH_SHA already has a gate-sha-failed label on $BEAD_ID — downgrading this run's PASS to FAIL."
+fi
+
+# ── ga-lxz5w (b): LIVE re-check — a park-worthy label or bead closure that
+# arrived AFTER this gate-run began must still block an in-flight PASS. Runs
+# BEFORE the sibling-branch scan below: if this catches it, the bead already
+# carries the signal (closed, or an explicit hold) and there is nothing left
+# for the sibling check to usefully add.
+if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ]; then
+  GATE_LXZ5W_BLOCK="$(gate_bead_live_merge_block "$BEAD_CITY" "$BEAD_ID")"
+  case "$GATE_LXZ5W_BLOCK" in
+    closed)
+      OVERALL_VERDICT="FAIL"
+      FAIL_REASONS="Source bead $BEAD_ID is already closed — a different branch/process resolved it after this gate-run began (ga-lxz5w: 2-branch race, sequential variant). Not merging $BRANCH onto an already-terminal bead; a human should confirm whether these changes are still needed as a follow-up."
+      warn "ga-lxz5w: bead $BEAD_ID already closed (resolved elsewhere) — downgrading $BRANCH's in-flight PASS to FAIL before merge."
+      ;;
+    park:*)
+      OVERALL_VERDICT="FAIL"
+      FAIL_REASONS="Source bead $BEAD_ID now carries a park-worthy label ($GATE_LXZ5W_BLOCK) applied after this gate-run began — re-checked live immediately before merge (ga-lxz5w). Not merging $BRANCH; clear the hold, then re-submit."
+      warn "ga-lxz5w: live re-check — bead $BEAD_ID now parks ($GATE_LXZ5W_BLOCK) — downgrading $BRANCH's in-flight PASS to FAIL before merge."
+      ;;
+  esac
+fi
+
+# ── ga-lxz5w (a): SIBLING-BRANCH-FOR-SAME-BEAD — detect another branch still
+# actively in the gate for this SAME source bead before merging. Without this,
+# two branches racing to resolve one bead silently merge whichever passes
+# review first with no reconciliation, discarding the other (real incident:
+# wa-fnibd — an incomplete wa-worker fix merged while oracle's complete
+# superset fix, held gate:needs-human, was silently dropped). Escalates
+# (gate:needs-human) rather than attempting automated reconciliation: picking
+# the correct/superset branch needs semantic judgment this script cannot
+# safely automate. Mails the Mayor exactly once per incident: any OTHER
+# sibling branch that later reaches this same point will find gate:needs-human
+# already present and be caught by check (b) above instead, never re-entering
+# this block — no separate duplicate-mail guard needed.
+if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
+  GATE_LXZ5W_SIBLING="$(gate_bead_active_sibling_branch "$GC_CITY" "$BEAD_ID" "$BRANCH")"
+  if [ -n "$GATE_LXZ5W_SIBLING" ]; then
+    GATE_LXZ5W_SIB_BRANCH="${GATE_LXZ5W_SIBLING%%$'\t'*}"
+    GATE_LXZ5W_SIB_STATUS="${GATE_LXZ5W_SIBLING#*$'\t'}"
+    OVERALL_VERDICT="FAIL"
+    FAIL_REASONS="Another branch ($GATE_LXZ5W_SIB_BRANCH, gate-status:$GATE_LXZ5W_SIB_STATUS) is concurrently active in the gate for the same source bead $BEAD_ID (ga-lxz5w: 2 branches, same bead — auto-merging the first PASS without reconciling would silently discard whichever branch loses the race). Not merging $BRANCH; a human must reconcile (pick the correct/superset branch) and clear gate:needs-human before either can proceed."
+    bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-human"              -q 2>/dev/null || true
+    bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-human:sibling-race" -q 2>/dev/null || true
+    bd -C "$BEAD_CITY" comment "$BEAD_ID" "Dispatcher (ga-lxz5w): held $BRANCH — a sibling branch ($GATE_LXZ5W_SIB_BRANCH, gate-status:$GATE_LXZ5W_SIB_STATUS) is concurrently active in the gate for this same bead. Two branches racing to resolve the same bead cannot be auto-merged without reconciliation. A human must pick the correct branch (or merge the superset) and clear gate:needs-human before either can proceed." 2>/dev/null || true
+    gc --city "$GC_CITY" mail send mayor \
+      -s "Gate needs-human: 2 branches racing on $BEAD_ID (ga-lxz5w)" \
+      -m "$(printf 'Source bead %s has 2+ branches concurrently active in the quality gate.\n\nThis branch %s just PASSED review, but sibling branch %s is still %s — auto-merging either would silently discard the other. Labeled gate:needs-human on %s; the Pilot will not re-dispatch it.\n\nA human must reconcile: pick the correct/superset branch, then clear gate:needs-human.\n\nBead: %s   Rig: %s\nThis branch: %s (gate run %s)\nSibling branch: %s (gate-status:%s)' \
+        "$BEAD_ID" "$BRANCH" "$GATE_LXZ5W_SIB_BRANCH" "$GATE_LXZ5W_SIB_STATUS" "$BEAD_ID" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID" "$GATE_LXZ5W_SIB_BRANCH" "$GATE_LXZ5W_SIB_STATUS")" \
+      2>/dev/null || warn "Could not mail Mayor escalation for sibling-branch race on $BEAD_ID (ga-lxz5w)"
+    warn "ga-lxz5w: sibling branch $GATE_LXZ5W_SIB_BRANCH (gate-status:$GATE_LXZ5W_SIB_STATUS) active for bead $BEAD_ID — downgrading $BRANCH's PASS to FAIL, labeling gate:needs-human."
+  fi
 fi
 
 if [ "$OVERALL_VERDICT" = "PASS" ]; then
