@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.city-health-sentinel</string>
+
+  <!-- Judgment+action layer over the gate/pilot/dolt subsystems (ga-r5sn8). Cheap
+       deterministic collection every StartInterval; a fast-path exits at zero
+       Haiku cost when every signal is green (the common case); only an ambiguous
+       state invokes a one-shot headless Haiku judgment call (no tools, no
+       skills, no persisted session, JSON-schema-constrained decision). The shell
+       validates the returned action against a fixed allowlist and enforces a
+       hard guardrail: Dolt trouble is NEVER remediated by kickstart/restart,
+       only by a rate-limited nudge to the Mayor — see scripts/city-health-
+       sentinel.sh for the full design and scripts/gc-dolt-probe.sh for the
+       shared Dolt-health probe it reuses. Deliberately does NOT duplicate the
+       existing throughput/liveness watchdogs (gate-throughput-stall-
+       watchdog.sh, daemon-presence-watchdog.sh) — see that script's
+       NON-DUPLICATION section. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/city-health-sentinel.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <!-- 240 = every 4 min. RunAtLoad is deliberately false — installing (loading)
+       this plist is left to the Mayor, not this story. -->
+  <key>StartInterval</key><integer>240</integer>
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/city-health-sentinel.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/city-health-sentinel.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+  </dict>
+</dict>
+</plist>
