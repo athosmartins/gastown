@@ -34,6 +34,14 @@ mkdir -p "$CHS_STATE_DIR"
 # shellcheck disable=SC1090
 . "$SCRIPT"
 
+# Default stub for the reviewer-active guard's collector (ga-r5sn8 fix 2) so
+# every test below — including the ones that predate this fix and know
+# nothing about it — stays hermetic (never shells out to the real
+# gc-session-list-cached.sh) and keeps its original expected behavior: "no
+# gate-reviewer session at all" -> not active. Scenarios that specifically
+# exercise the guard override this again, locally, right before calling main.
+_collect_session_list_json() { echo '{"sessions":[]}'; }
+
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
@@ -96,6 +104,33 @@ _cooldown_elapsed "$TMP_ROOT/cd2" 180 "$NOW_T" && ok "cooldown: 200s ago, 180s w
 _cooldown_elapsed "$TMP_ROOT/cd-missing" 180 "$NOW_T" && ok "cooldown: no prior state file -> elapsed (fail-open)" || bad "missing state file should fail-open to elapsed"
 
 echo ""
+echo "-- pure functions: _reviewer_active_id (ga-r5sn8 fix 2 — reviewer-active guard) --"
+RID="$(_reviewer_active_id '{"sessions":[{"id":"rev-1","template":"gate-reviewer","state":"creating"}]}')"
+[ $? -eq 0 ] && [ "$RID" = "rev-1" ] && ok "gate-reviewer state=creating -> active, id=rev-1" || bad "expected active with id=rev-1, got rc=$? id=$RID"
+RID="$(_reviewer_active_id '{"sessions":[{"id":"rev-2","template":"gate-reviewer","state":"active"}]}')"
+[ $? -eq 0 ] && [ "$RID" = "rev-2" ] && ok "gate-reviewer state=active -> active, id=rev-2" || bad "expected active with id=rev-2"
+RID="$(_reviewer_active_id '{"sessions":[{"id":"rev-3","template":"refino-gate-reviewer","state":"active"}]}')"
+[ $? -eq 0 ] && [ "$RID" = "rev-3" ] && ok "refino-gate-reviewer template also counts (contains gate-reviewer)" || bad "expected refino-gate-reviewer to match"
+RID="$(_reviewer_active_id '{"sessions":[{"id":"rev-sp","template":"gate-reviewer","state":"start-pending","closed":false}]}')"
+[ $? -eq 0 ] && [ "$RID" = "rev-sp" ] && ok "gate-reviewer state=start-pending -> active (live-verified 2026-07-20 boot state; blocklist catches it, an allowlist of creating/active/booting alone would not)" || bad "expected start-pending to count as active (blocklist design)"
+_reviewer_active_id '{"sessions":[{"id":"rev-4","template":"gate-reviewer","state":"asleep"}]}' >/dev/null
+[ $? -ne 0 ] && ok "gate-reviewer state=asleep -> NOT active (known at-rest-between-turns state)" || bad "asleep should not count as active"
+_reviewer_active_id '{"sessions":[{"id":"rev-5","template":"gate-reviewer","state":"drained"}]}' >/dev/null
+[ $? -ne 0 ] && ok "gate-reviewer state=drained -> NOT active" || bad "drained should not count as active"
+_reviewer_active_id '{"sessions":[{"id":"rev-6","template":"gate-reviewer","state":"active","closed":true}]}' >/dev/null
+[ $? -ne 0 ] && ok "closed=true overrides a stale state=active -> NOT active" || bad "closed=true should never count as active regardless of the state string"
+RID="$(_reviewer_active_id '{"sessions":[{"id":"rev-7","template":"gate-reviewer","state":"some-future-state-nobody-documented-yet"}]}')"
+[ $? -eq 0 ] && [ "$RID" = "rev-7" ] && ok "unrecognized/future state name -> counts as active (blocklist fails closed on anything not explicitly known-safe)" || bad "expected an unknown state name to fail closed as active"
+_reviewer_active_id '{"sessions":[{"id":"ccr-1","template":"context-check-reviewer","state":"active"}]}' >/dev/null
+[ $? -ne 0 ] && ok "context-check-reviewer excluded even though it contains \"reviewer\"" || bad "context-check-reviewer must never count as a gate-reviewer"
+_reviewer_active_id '{"sessions":[]}' >/dev/null
+[ $? -ne 0 ] && ok "empty sessions list -> NOT active" || bad "empty sessions list should not count as active"
+RID="$(_reviewer_active_id '')"
+[ $? -eq 0 ] && [ -z "$RID" ] && ok "empty/unreadable JSON fails CLOSED (treated as active, id unknown) — never license to kickstart blind" || bad "expected fail-closed (rc=0, empty id) on empty input"
+RID="$(_reviewer_active_id 'not json at all')"
+[ $? -eq 0 ] && ok "unparseable JSON fails CLOSED (treated as active) rather than silently reading as inactive" || bad "expected fail-closed on unparseable JSON"
+
+echo ""
 echo "-- pure functions: _build_state_json null-encoding --"
 J="$(_build_state_json "" "5" "false" "-1" "unknown" "" "0")"
 echo "$J" | jq -e '.gate_sweep_gap_min == null' >/dev/null 2>&1 && ok "unknown gate_gap encodes as JSON null (not 0)" || bad "unknown gate_gap should encode as null"
@@ -110,6 +145,14 @@ PB="$(_haiku_playbook)"
 [ -n "$PB" ] && echo "$PB" | grep -q 'dolt_responds=false' && ok "playbook is non-empty and covers the dolt-down rule" || bad "playbook missing or doesn't mention dolt_responds=false"
 printf '%s' "$HAIKU_JSON_SCHEMA" | jq -e '.required == ["assessment","action","mayor_message"]' >/dev/null 2>&1 \
   && ok "HAIKU_JSON_SCHEMA is valid JSON with the 3 required fields" || bad "HAIKU_JSON_SCHEMA malformed or missing required fields"
+
+echo ""
+echo "-- static content sanity: _do_kickstart never SIGKILLs a running job (ga-r5sn8 fix 1) --"
+if grep -q -- 'kickstart -k "' "$SCRIPT"; then
+  bad "found the dangerous 'kickstart -k \"...' invocation in $SCRIPT — SIGKILL risk reintroduced (ga-r5sn8: -k kills an in-flight reviewer spawn mid-boot, producing a zero-verdict dead gate-run)"
+else
+  ok "no 'launchctl kickstart -k' invocation anywhere in $SCRIPT — kickstart is a safe no-op when the job is already running, never a force-kill"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # main() integration scenarios — collectors + Haiku + execute all mocked.
@@ -317,6 +360,68 @@ if [ "$DOLT_NUDGES" -eq 1 ] && [ "$DOLT_NUDGES_2" -eq 1 ] && [ "$DISK_NUDGES" -e
   ok "nudge rate-limit: dolt-topic suppressed its own repeat, but a distinct disk-topic nudge still fired"
 else
   bad "expected per-topic isolation (dolt_first=$DOLT_NUDGES dolt_second=$DOLT_NUDGES_2 disk=$DISK_NUDGES)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ga-r5sn8 fix 2: reviewer-active guard — main() integration scenarios.
+# These override _collect_session_list_json (mocking "gc session list"), so
+# they MUST run last: unlike the other _collect_* mocks, nothing later in this
+# file re-establishes the "no active reviewer" default once these override it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+echo ""
+echo "=== main(): gate genuinely stalled (backlog + extreme gap) BUT a gate-reviewer is actively booting -> SKIPPED, no kickstart ==="
+reset_capture
+_collect_gate_gap() { echo "30"; }
+_collect_pilot_gap() { echo "5"; }
+_collect_open_markers() { echo "5"; }
+_collect_disk_gb() { echo "100"; }
+_collect_dolt_json() { echo '{"reachable":true,"latency_ms":40,"state":"healthy"}'; }
+_invoke_haiku() { echo '{"assessment":"gate backlogged, dolt fine","action":"kickstart_gate","mayor_message":"restarting the gate"}'; return 0; }
+# state=start-pending is the REAL value observed live on 2026-07-20 for a
+# gate-reviewer moments into its boot (not "creating" — see _reviewer_active_id).
+_collect_session_list_json() { echo '{"sessions":[{"id":"rev-abc123","template":"gate-reviewer","state":"start-pending","closed":false}]}'; }
+main
+if [ "${#KICKSTART_CALLS[@]}" -eq 0 ] && [ "${#NUDGE_CALLS[@]}" -eq 0 ] && grep -q 'SKIPPED kickstart_gate' "$CHS_LOG" && grep -q 'rev-abc123' "$CHS_LOG"; then
+  ok "reviewer-active guard: an active/booting gate-reviewer (state=start-pending, the live-verified real value) blocked the kickstart, logged with its id"
+else
+  bad "expected kickstart_gate to be SKIPPED while a gate-reviewer is start-pending/booting (kickstarts=${#KICKSTART_CALLS[@]} nudges=${#NUDGE_CALLS[@]})"
+fi
+
+echo ""
+echo "=== main(): gate genuinely stalled, no reviewer active (context-check-reviewer + an asleep gate-reviewer don't count) -> kickstart proceeds ==="
+reset_capture
+_collect_gate_gap() { echo "30"; }
+_collect_pilot_gap() { echo "5"; }
+_collect_open_markers() { echo "5"; }
+_collect_disk_gb() { echo "100"; }
+_collect_dolt_json() { echo '{"reachable":true,"latency_ms":40,"state":"healthy"}'; }
+_invoke_haiku() { echo '{"assessment":"gate backlogged, dolt fine","action":"kickstart_gate","mayor_message":"restarting the gate"}'; return 0; }
+_collect_session_list_json() { echo '{"sessions":[{"id":"ccr-1","template":"context-check-reviewer","state":"active"},{"id":"rev-old","template":"gate-reviewer","state":"asleep"}]}'; }
+main
+if [ "${#KICKSTART_CALLS[@]}" -eq 2 ] && [ "${#NUDGE_CALLS[@]}" -eq 0 ] && grep -q 'EXECUTED kickstart_gate' "$CHS_LOG"; then
+  ok "reviewer-active guard: no genuinely active/booting gate-reviewer present -> kickstart proceeded normally"
+else
+  bad "expected kickstart_gate to proceed when no gate-reviewer is active/booting (kickstarts=${#KICKSTART_CALLS[@]})"
+fi
+
+echo ""
+echo "=== main(): Haiku fails + gate critical + reviewer active -> the DETERMINISTIC FALLBACK itself declines kickstart_gate ==="
+reset_capture
+_collect_gate_gap() { echo "20"; }   # > GATE_GAP_CRITICAL_MIN(12)
+_collect_pilot_gap() { echo "5"; }
+_collect_open_markers() { echo "1"; }
+_collect_disk_gb() { echo "100"; }
+_collect_dolt_json() { echo '{"reachable":true,"latency_ms":40,"state":"healthy"}'; }
+_invoke_haiku() { return 1; }   # force the deterministic fallback path
+_collect_session_list_json() { echo '{"sessions":[{"id":"rev-mid-boot","template":"refino-gate-reviewer","state":"active"}]}'; }
+main
+if [ "${#KICKSTART_CALLS[@]}" -eq 0 ] && [ "${#NUDGE_CALLS[@]}" -eq 0 ] \
+   && grep -q 'SKIPPED kickstart_gate (deterministic fallback)' "$CHS_LOG" && grep -q 'rev-mid-boot' "$CHS_LOG" \
+   && grep -q 'decision=none' "$CHS_LOG"; then
+  ok "fallback path: gate_gap>12 would normally fall back to kickstart_gate, but an active refino-gate-reviewer made the FALLBACK ITSELF choose none (not just the execute-layer guard)"
+else
+  bad "expected the deterministic fallback to decline kickstart_gate while a reviewer is active (kickstarts=${#KICKSTART_CALLS[@]})"
 fi
 
 rm -rf "$TMP_ROOT" 2>/dev/null || true

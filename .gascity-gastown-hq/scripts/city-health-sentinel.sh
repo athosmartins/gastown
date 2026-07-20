@@ -51,6 +51,29 @@
 #     in TWO places: the PLAYBOOK told to Haiku, AND a hard shell-side override
 #     that fires regardless of what Haiku returns (defense in depth — CLAUDE.md:
 #     Dolt is the town's sole data plane and fragile; see gc-dolt-probe.sh header).
+#   - NEVER kickstarts the gate launchd jobs while a gate-reviewer session is
+#     actively spawning/booting or working, on a "gate-reviewer"/
+#     "refino-gate-reviewer" template — never "context-check-reviewer", an
+#     unrelated job that also has "reviewer" in its name. Enforced in TWO
+#     places — _execute_action's kickstart_gate case AND the deterministic
+#     fallback — because launchctl kickstart's "no-op if already running"
+#     guarantee only protects a launchd job that is itself still running; the
+#     dispatcher process can already have exited after firing an async
+#     reviewer spawn, in which case a kickstart would happily start a
+#     brand-new sweep against a marker the still-booting reviewer hasn't
+#     updated yet. (ga-r5sn8, verified 2026-07-20: the Mayor's own manual
+#     `kickstart -k` was confirmed killing in-flight reviewer spawns —
+#     a kickstart timestamp and a zero-verdict dead gate-run landed the same
+#     second — producing the very stalls it was meant to fix.) "Actively
+#     spawning/booting or working" is judged by a BLOCKLIST of known-at-rest
+#     states (asleep/drained/draining/closed/dead/stopped/exited + closed=true)
+#     rather than an allowlist of "in-progress" names — live-verified the same
+#     day: a real reviewer was caught in a `state:"start-pending"` snapshot
+#     moments before settling into `state:"active"`, a value no allowlist of
+#     "creating/active/booting" alone would have caught. _gate_reviewer_active()
+#     ALSO fails CLOSED on any read/parse error (an unreadable session list is
+#     treated as "a reviewer might be active", never as license to kickstart
+#     into a live spawn).
 #   - Kickstart rate-limit: max 1 per job ("gate" or "pilot") per CHS_KICKSTART_COOLDOWN_S
 #     (default 180s / 3min).
 #   - Nudge rate-limit: max 1 per topic (dolt|disk|gate|pilot|general, derived
@@ -60,9 +83,9 @@
 #     structured JSON is the only channel back to this script; anything outside
 #     {kickstart_gate, kickstart_pilot, nudge_mayor, none} is discarded as "none".
 #   - Fail-safe on Haiku error/timeout: falls back to a minimal deterministic rule
-#     (dolt down -> nudge_mayor; else gate_gap>12 -> kickstart_gate; else none) and
-#     logs that Haiku was unavailable. Never hangs — every external call is
-#     `timeout`-bounded.
+#     (dolt down -> nudge_mayor; else gate_gap>12 AND no active/booting gate-
+#     reviewer -> kickstart_gate; else none) and logs that Haiku was
+#     unavailable. Never hangs — every external call is `timeout`-bounded.
 #   - Every decision is logged with timestamp + full collected state + action taken.
 #
 # CALIBRATION (why these numbers, not guesses):
@@ -168,16 +191,23 @@ _fastpath_ok() {
 # ONLY when the Haiku call itself fails/times out (never when Haiku answers, even
 # with an action outside the allowlist — that path is _valid_action, handled
 # separately in main). Order matters: Dolt trouble is checked FIRST and always
-# wins, matching the guardrail priority (dolt > gate).
+# wins, matching the guardrail priority (dolt > gate). The gate_gap>critical rule
+# additionally respects the reviewer-active guard (ga-r5sn8 fix 2) — the SAME
+# guard _execute_action's kickstart_gate case enforces, applied here too so this
+# function's own return value (and the "deterministic fallback chose 'X'"
+# message main() builds from it) is honest, not just the eventual side effect.
 _deterministic_fallback_action() {
-  local gate_gap="$1" dolt_responds="$2"
+  local gate_gap="$1" dolt_responds="$2" rid
   if [ "$dolt_responds" != "true" ]; then
     echo "nudge_mayor"
     return
   fi
   if _gt "$gate_gap" "$GATE_GAP_CRITICAL_MIN"; then
-    echo "kickstart_gate"
-    return
+    if ! rid="$(_gate_reviewer_active)"; then
+      echo "kickstart_gate"
+      return
+    fi
+    log "SKIPPED kickstart_gate (deterministic fallback) — reviewer ${rid:-<unknown>} is active/booting (would kill its spawn)"
   fi
   echo "none"
 }
@@ -219,6 +249,59 @@ _mark_now() {
   local f="$1" now="$2"
   mkdir -p "$(dirname "$f")" 2>/dev/null || true
   echo "$now" > "$f" 2>/dev/null || true
+}
+
+# _reviewer_active_id <sessions_json> (ga-r5sn8 fix 2) → prints the id of the
+# first session whose template contains "gate-reviewer" (covers both the
+# "gate-reviewer" and "refino-gate-reviewer" templates — but NEVER
+# "context-check-reviewer", an unrelated job that also has "reviewer" in its
+# name) AND whose state is NOT one of the known-at-rest-or-gone values
+# (asleep, drained, draining, closed, dead, stopped, exited) AND whose
+# `closed` field is not true. Prints "" (empty) when no such session exists.
+#
+# DELIBERATELY a BLOCKLIST, not an allowlist of "creating"/"active"/"booting"
+# (verified live 2026-07-20, ga-r5sn8): a real gate-reviewer session was
+# observed going through a `state:"start-pending"` snapshot before settling
+# into `state:"active"` a few seconds later — a real, in-progress-boot value
+# that isn't "creating", "active", or "booting" and that `gc session list
+# --help` does not document (it only documents the coarser --state FILTER
+# vocabulary: active/suspended/closed, not this per-session state field's
+# full range). An allowlist of specific "in-progress" names is only as good
+# as the last time someone enumerated them; a blocklist of specific
+# known-SAFE names fails CLOSED on every other value — including this one,
+# and any future state name introduced later — by construction, which is the
+# direction this guard must err on.
+#
+# Returns 0 (true) when a match was found, OR when <sessions_json> is
+# empty/unparseable — an unreadable session list must be treated as "a
+# reviewer might be active", never as license to kickstart into a live spawn
+# (same fail-closed-on-unknown principle as _is_int/_fastpath_ok above).
+# Returns 1 ONLY when the JSON parsed cleanly and genuinely contains no
+# matching session — the one case where a kickstart is actually safe.
+_reviewer_active_id() {
+  local json="$1" id
+  [ -z "$json" ] && { echo ""; return 0; }
+  id="$(printf '%s' "$json" | jq -r '
+    [ (.sessions // [])[]
+      | select(
+          (((.template // "") | ascii_downcase) as $t | ($t | contains("gate-reviewer")) and (($t | contains("context-check-reviewer")) | not))
+          and
+          ((.closed // false) | not)
+          and
+          (((.state // "") | ascii_downcase) as $s | ($s | IN("asleep","drained","draining","closed","dead","stopped","exited")) | not)
+        )
+      | (.id // .session_name // .name // "unknown")
+    ] | first // empty
+  ' 2>/dev/null)"
+  if [ $? -ne 0 ]; then
+    echo ""
+    return 0
+  fi
+  if [ -n "$id" ]; then
+    echo "$id"
+    return 0
+  fi
+  return 1
 }
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -292,6 +375,30 @@ _collect_dolt_json() {
   else
     printf '{"ts":"","reachable":null,"latency_ms":-1,"cpu":"?","state":"unknown","probe_rc":-1}\n'
   fi
+}
+
+# _collect_session_list_json (ga-r5sn8 fix 2) → raw `{"sessions":[...]}` JSON
+# via the shared, rate-limited gc-session-list-cached.sh shim (Option C —
+# reuse it rather than hand-rolling another direct `gc session list` poller,
+# same reasoning as _collect_dolt_json's use of gc-dolt-probe.sh: one hardened
+# module shared by every daemon instead of N slightly-different
+# reimplementations). Empty string on any failure — never fabricates a
+# fallback shape, so _reviewer_active_id can tell "read failed" apart from
+# "read succeeded, zero sessions".
+_SESSION_LIST_CACHED="$CITY/scripts/gc-session-list-cached.sh"
+_collect_session_list_json() {
+  timeout 15 bash "$_SESSION_LIST_CACHED" 2>/dev/null
+}
+
+# _gate_reviewer_active (ga-r5sn8 fix 2) → collect + decide in one call.
+# Prints the matching reviewer's id (or nothing) on stdout for the caller's
+# log line; returns 0 (true) iff a gate-reviewer is active/booting, or the
+# check itself could not be verified (fail-closed — see _reviewer_active_id).
+# A kickstart of the gate launchd jobs must never fire while this is true —
+# see the GUARDRAILS note at the top of this file for why the safe (no -k)
+# kickstart alone is not sufficient protection.
+_gate_reviewer_active() {
+  _reviewer_active_id "$(_collect_session_list_json)"
 }
 
 # _build_state_json — assemble the collected snapshot (+ the thresholds Haiku is
@@ -455,7 +562,15 @@ _do_kickstart() {
     log "  DRY_RUN: would kickstart $label (not executed)"
     return 0
   fi
-  if launchctl kickstart -k "gui/$UID_NUM/$label" 2>/dev/null; then
+  # No -k here — deliberately (ga-r5sn8, verified 2026-07-20). launchctl's -k
+  # flag forces a SIGKILL of the job's CURRENT running instance before it
+  # restarts it. If that instance is mid-way through spawning a gate-reviewer
+  # (~3min boot), -k kills the in-flight spawn, producing a zero-verdict dead
+  # run that STALLS the gate — a kickstart timestamp and a dead run were
+  # confirmed landing the same second. Plain `kickstart` (no -k) starts the
+  # job only if it is NOT already running, and is a no-op if it IS running —
+  # it can never kill a working instance. That is the only safe behavior.
+  if launchctl kickstart "gui/$UID_NUM/$label" 2>/dev/null; then
     log "  kickstart OK: $label"
   else
     log "  kickstart FAILED (may not be loaded): $label"
@@ -482,14 +597,19 @@ _execute_action() {
   local action="$1" mayor_message="$2" gate_gap="$3" pilot_gap="$4" dolt_responds="$5" disk_gb="$6" now="$7"
   case "$action" in
     kickstart_gate)
-      local f="$STATE_DIR/.city-health-sentinel.last-kickstart.gate"
-      if _cooldown_elapsed "$f" "$KICKSTART_COOLDOWN_S" "$now"; then
-        _do_kickstart "com.gascity.quality-gate-guard"
-        _do_kickstart "com.gascity.quality-gate-dispatcher"
-        _mark_now "$f" "$now"
-        log "EXECUTED kickstart_gate (quality-gate-guard + quality-gate-dispatcher)"
+      local rid
+      if rid="$(_gate_reviewer_active)"; then
+        log "SKIPPED kickstart_gate — reviewer ${rid:-<unknown>} is active/booting (would kill its spawn)"
       else
-        log "SUPPRESSED kickstart_gate — rate-limited (last kickstart <${KICKSTART_COOLDOWN_S}s ago)"
+        local f="$STATE_DIR/.city-health-sentinel.last-kickstart.gate"
+        if _cooldown_elapsed "$f" "$KICKSTART_COOLDOWN_S" "$now"; then
+          _do_kickstart "com.gascity.quality-gate-guard"
+          _do_kickstart "com.gascity.quality-gate-dispatcher"
+          _mark_now "$f" "$now"
+          log "EXECUTED kickstart_gate (quality-gate-guard + quality-gate-dispatcher)"
+        else
+          log "SUPPRESSED kickstart_gate — rate-limited (last kickstart <${KICKSTART_COOLDOWN_S}s ago)"
+        fi
       fi
       ;;
     kickstart_pilot)
