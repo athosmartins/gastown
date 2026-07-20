@@ -1,0 +1,22 @@
+[
+  {"id": 1, "target": "ga-lxz5w", "store": "HQ", "query": "Foi corrigido o bug do gate em que duas branches pro mesmo bead faziam a versao incompleta mergear antes do hold gate:needs-human chegar a tempo?"},
+  {"id": 2, "target": "ga-p4g6", "store": "HQ", "query": "Ja teve um bug em que o gate revisava so uma fracao do diff (truncado tipo head -2000) mas carimbava a revisao como 100% completa?"},
+  {"id": 3, "target": "ga-nooaw", "store": "HQ", "query": "Existe um bug conhecido em que um FAIL do gate nao travava o commit, e um run posterior acabava mergeando o mesmo commit reprovado?"},
+  {"id": 4, "target": "ga-fi1dh", "store": "HQ", "query": "What caused a re-queued gate marker after a quota-stop or dead-reviewer requeue to get false-FAILed on the next Phase C sweep?"},
+  {"id": 5, "target": "ga-pkvfc", "store": "HQ", "query": "Did we fix the gate-done branch regex that truncates dotted sub-bead IDs like ps-8iuu.4 down to ps-8iuu?"},
+  {"id": 6, "target": "ga-6jqr", "store": "HQ", "query": "Has the bug been fixed where Pilot dispatches two different workers to the same bead because dedup doesn't recognize fix/<bead>-* branch naming?"},
+  {"id": 7, "target": "ga-f7bek", "store": "HQ", "query": "What was wrong with Pilot's dispatch filter that made it treat next-action:<crew>-constroi labels as a blocker, starving approved WA stories?"},
+  {"id": 8, "target": "ga-268cr", "store": "HQ", "query": "Did we already fix auto-refino re-scanning stories that have an explicit hold from another authority, like blocked-on:* or pool:refused:* labels?"},
+  {"id": 9, "target": "ga-huaxo", "store": "HQ", "query": "What was the hardcoded magic-number bug in the gate-selfheal drift-guard selftest that went red every time a new needs-human site was added?"},
+  {"id": 10, "target": "ga-kgja", "store": "HQ", "query": "Was there an incident where git add on the shared HQ tree accidentally committed another agent's uncommitted work, bypassing the gate?"},
+  {"id": 11, "target": "wa-ey9fn", "store": "WA", "query": "Foi corrigido o bug do Pregao Triar em que a pill de nome do WhatsApp caia no fallback formal em vez de mostrar 'nao revelado' quando nao havia reveal?"},
+  {"id": 12, "target": "wa-j16zg", "store": "WA", "query": "What was the P0 bug where tick_unconfirmed collapsed two different send outcomes into one state, causing duplicate sends to the same lead on retry?"},
+  {"id": 13, "target": "wa-d5r3s", "store": "WA", "query": "Was there a bug where screen_ts_to_str fabricated the wrong date, turning yesterday's chat bubble into today's and starving the response cursor?"},
+  {"id": 14, "target": "wa-0iqe9", "store": "WA", "query": "Did we fix the duplicate-contacts bug in classifications where the same person is stored twice, once with and once without the leading 9 digit?"},
+  {"id": 15, "target": "wa-ue555", "store": "WA", "query": "What caused campaign_dashboard to leak file descriptors and fall back to _DEFAULTS with no production_send_backend, leaving the on-device roster empty?"},
+  {"id": 16, "target": "wa-a97o", "store": "WA", "query": "What broke the priority-pill drawer in version 2.8.8 so that clicking a card wouldn't open it anymore?"},
+  {"id": 17, "target": "wa-vdjtx", "store": "WA", "query": "Did we already fix the painel Aprovadas column showing beads that weren't actually dispatchable by the Pilot?"},
+  {"id": 18, "target": "wa-lve64", "store": "WA", "query": "Did we build a single unified phone-number resolver shared between inbound_capture and inbound_sweep instead of two separate ones?"},
+  {"id": 19, "target": "wa-49br3", "store": "WA", "query": "Was there a bug where the on-screen parser was blind to audio messages, undercounting audio replies compared to notification-based detection?"},
+  {"id": 20, "target": "wa-89enh", "store": "WA", "query": "Did we ship the Pregao TRIAR mode to production for both desktop and mobile?"}
+]

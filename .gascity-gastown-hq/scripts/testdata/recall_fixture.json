@@ -1,0 +1,1680 @@
+[
+ {
+  "id": "ga-lxz5w",
+  "store": "HQ",
+  "title": "[bug] Gate: 2 branches no MESMO bead \u2014 auto-mergeia a 1a que passa sem reconciliar; hold gate:needs-human chega tarde e a INCOMPLETA mergeia",
+  "description": "FONTE: oracle-wa (mail ga-wisp-ugp8rs, 2026-07-19).\n\nANOMALIA: wa-fnibd teve 2 builders \u2014 wa-worker-1 (dispatch Pilot 22:07) buildou INCOMPLETO (so o path de history ganhou width-aware; os 2 paths de captura AO VIVO _open_and_read_chat + _capture_from_dump seguem 1080 hardcoded, corrompendo from_me); crew/oracle/wa-fnibd (ba23e703) era o superset COMPLETO. oracle holdou com gate:needs-human, MAS a incompleta MERGEOU assim mesmo: wa-fnibd = closed, gate:passed, story:done; so crew/wa-worker/wa-fnibd (ccbba32f) na origin, a do oracle nem esta la.\n\nPADRAO (2 furos): (1) quando 2 branches miram o MESMO source-bead, o gate auto-mergeia a 1a que passa sem RECONCILIAR \u2014 a inferior/incompleta ganha a corrida e marca o bead resolvido, a completa e descartada. (2) o hold gate:needs-human chega TARDE \u2014 nao segura um merge ja in-flight (mesma familia do wa-zmw4r/ga-nooaw FAIL-race, mas aqui e 2-builder + hold-too-late).\n\nFIX: (a) gate detecta 2+ branches ativos pro mesmo source-bead ANTES de mergear -> nao auto-mergeia, reconcilia (superset) ou escala; (b) gate:needs-human deve bloquear um merge in-flight (checar o label no ultimo instante antes do merge, nao so no dispatch). Liga a routed-pool-double-dispatch + ga-nooaw (gate-integrity) + epico ga-05604.\n\nFOLLOW-UP PRODUTO (separado, dominio oracle/WA): a versao incompleta esta na main; os 2 paths ao vivo precisam do fix completo (oracle re-push ba23e703 como follow-up). Nao e framework.",
+  "close_reason": "Story DELIVERED \u2014 deployed + verified in prod, story:done (rig gascity, deployed + baseline-tested in prod). Closed by story-delivery (ga-i53ua durable terminal).",
+  "closed_at": "2026-07-20T02:50:54Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-19T23:49:26Z (tier=bug/tech-debt, lane=small, rig=gascity).\nSling task bead: ga-z4yun\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-19T23:49:34Z"
+   },
+   {
+    "author": "automation",
+    "text": "grw FIX4: cleared STALE gate:reviewing (marker ga-wisp-qc33nq sat QUEUED 15m while source carried gate:reviewing \u2014 a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved).",
+    "created_at": "2026-07-20T00:55:49Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch fix/ga-lxz5w-gate-sibling-race merged to gascity/main (sha=b97b13384330605cc2dbc81abbd2d518f7e380ae) via autonomous dispatcher (gate_run=ga-wisp-bt5lw8).",
+    "created_at": "2026-07-20T02:47:23Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-p4g6",
+  "store": "HQ",
+  "title": "GATE REVISA 25-55% DA MUDANCA E CARIMBA 100%: diff truncado em head -2000 sob o cabecalho \"FULL DIFF\" \u2014 constante, sem marcador. 14% dos runs medidos sao parciais em silencio",
+  "description": "ACHADO POR gate-reviewer-adhoc-89a41e4f83 (incidentalmente, revisando crew/thies/wa-ka2lm). Verificado e MEDIDO pelo Mayor. ESTE E O PIOR BUG DA NOITE: o gate revisa uma FRACAO da mudanca e emite veredito sobre o TODO.\n\nO BUG (quality-gate-dispatcher.sh:4930):\n    DIFF_FULL=$(git_rig diff \"origin/$DEFAULT_BRANCH...origin/$BRANCH\" 2>/dev/null | head -2000 || true)\ne o cabecalho entregue ao reviewer (:5028):\n    FULL DIFF (first 2000 lines):\n\nEsse cabecalho e CONSTANTE. Ele diz \"first 2000 lines\" tanto num diff de 500 linhas (onde e completo) quanto num de 4439 (onde e 45%). **\"Truncado\" e \"nao truncado\" produzem o MESMO texto.** Nao ha marcador, nao ha contagem, nao ha lista dos arquivos omitidos. E o cabecalho ainda ABRE com a palavra \"FULL\", que AFIRMA completude.\n\nQUE O TIME SABIA DO TRUNCAMENTO ESTA PROVADO NO PROPRIO ARQUIVO (:4928):\n    # Note: \"|| true\" suppresses SIGPIPE (exit 141) from `head` truncating a large diff under pipefail.\nTrataram o SIGPIPE do truncamento e nunca contaram ao reviewer que ele estava acontecendo.\n\nO CASO CONCRETO (medido pelo reviewer): crew/thies/wa-ka2lm tem 4439 linhas / 20 arquivos. O texto pre-renderizado parou NO MEIO de um hunk do arquivo #11 (enrich_layout.py), omitindo os outros 9 arquivos INTEIROS \u2014 incluindo o arquivo de PRODUCAO sendo modificado (mrv-mobile-final.html), onde ele encontrou um bug real (baixa severidade, mas real). Um reviewer que confiasse no texto (razoavel \u2014 nada o marca como parcial) teria revisado ~55% e carimba",
+  "close_reason": "Quality gate PASSED \u2014 branch fix/ga-p4g6-gate-diff-truncation merged to gascity/main (sha=fac084b53045b5173498e8b30536de08ec3e8d3e, gate_run=ga-wisp-irzwo4). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-17T11:51:49Z",
+  "issue_type": "bug",
+  "priority": 0,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-17T09:04:32Z (tier=bug/tech-debt, lane=small, rig=gascity).\nSling task bead: ga-qvcc\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-17T09:04:43Z"
+   },
+   {
+    "author": "automation",
+    "text": "inflight-reclaim-guard (ga-se62o): reclaimed \u2014 no live builder and no recent branch progress for 33min (> 25min TTL). story:in-flight + pilot:dispatched cleared; assignee unset; status reset to open (ga-vw26y). Pilot will re-dispatch. (reclaim 1/3)",
+    "created_at": "2026-07-17T09:44:23Z"
+   },
+   {
+    "author": "automation",
+    "text": "grw FIX4: cleared STALE gate:reviewing (marker ga-wisp-d9460z sat QUEUED 15m while source carried gate:reviewing \u2014 a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved).",
+    "created_at": "2026-07-17T11:09:07Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-nooaw",
+  "store": "HQ",
+  "title": "[bug] Gate: um FAIL nao segura o commit \u2014 run posterior mergeia o MESMO commit reprovado (race)",
+  "description": "FONTE: oracle-wa (mail ga-wisp-a9q7d1, 2026-07-19).\n\nANOMALIA: commit afb59120 (bead wa-zmw4r) foi REPROVADO no gate-run ga-wisp-5qzux2 (blocking issue real: list-open fallback abre chat WhatsApp por NOME sem verificar identidade = risco de mandar pra pessoa errada). Mas um gate-run POSTERIOR passou o MESMO commit e mergeou -> codigo reprovado chegou a main. wa-zmw4r fechou carregando gate:failed E gate:passed E story:done ao mesmo tempo = assinatura da anomalia.\n\nPADRAO (o que importa): um FAIL de gate NAO segura a branch/commit. Reviewers independentes divergem (um FAIL, outro PASS) e o PASS posterior mergeia o mesmo commit reprovado. A trava adversarial do gate e furada por re-run \u2014 qualquer FAIL pode ser bypassado.\n\nRISCO: codigo reprovado entra na main (aqui, risco de identidade). Nao estava VIVO (nao deployado), mas o padrao vale pra qualquer FAIL.\n\nREMEDIACAO ja feita (oracle, band-aid da instancia): fail-safe de verificacao de identidade rolado pra main como bead wa-c5jlw (cherry-pick), em gate agora. NAO e o fix duravel.\n\nFIX DURAVEL (preferido): o dispatcher NAO deve mergear um commit-SHA que tem um verdict FAIL registrado, mesmo que um run posterior passe. Fail-closed por SHA: qualquer reviewer que reprova aquele commit bloqueia o merge; exige um commit NOVO pra re-gatear. Alternativa inferior: serializar gate-runs por branch. Preferir fail-closed-por-SHA \u2014 honra 'qualquer reviewer que reprova bloqueia' e mata o race. CUIDADO: distinguir 'mesmo SHA re-run' (bloquei",
+  "close_reason": "merged-bead-janitor (ga-tijv5): code merged to origin/main \u2014 commit-in-origin-main [gascity origin/main@4072aac32] [terminal-marker]. Gate\u2192delivery\u2192done did not complete (cross-store, superseded path, rig-store delivery blind spot, or delivery crash); janitor drives durable terminal: story:done added, story:approved removed, bead closed. Mirrors story-delivery ga-i53ua.",
+  "closed_at": "2026-07-19T22:01:47Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-19T20:46:30Z (tier=bug/tech-debt, lane=small, rig=gascity).\nSling task bead: ga-blprb\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-19T20:46:43Z"
+   },
+   {
+    "author": "automation",
+    "text": "grw FIX4: cleared STALE gate:reviewing (marker ga-wisp-gemehp sat QUEUED 16m while source carried gate:reviewing \u2014 a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved).",
+    "created_at": "2026-07-19T21:41:23Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch fix/ga-nooaw-gate-fail-closed-sha merged to gascity/main (sha=4072aac32d8add62223204ce426f469514e8f627) via autonomous dispatcher (gate_run=ga-wisp-kok2ch).",
+    "created_at": "2026-07-19T21:59:32Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-fi1dh",
+  "store": "HQ",
+  "title": "quality-gate-dispatcher: quota-stop/dead-reviewer requeue never retires GATE_RUN_ID, next Phase C sweep false-FAILs the re-queued marker",
+  "description": "CLASSE DE BUG: quality-gate-dispatcher.sh's quota-stop (ga-x3nmz) and dead-reviewer\n(ga-eqjo) requeue paths inside `gate_finalize_run()` (~lines 1680-1766) close the\nverdict bead(s) with label `verdict:REQUEUED`, re-queue the MARKER back to\n`gate-status:queued`, and comment \"this is NOT a FAIL\" on the gate-run bead \u2014 but\nNEVER change the gate-run bead's (`$GATE_RUN_ID`) own `gate-status:running` label,\nunlike every genuine terminal path (PASS sets `gate-status:passed`, FAIL sets\n`gate-status:failed`, `supersede_sibling_runs`/guard Vector B set\n`gate-status:superseded` \u2014 all via `set_gate_status`).\n\nCONCRETE REPRODUCTION (2026-07-18, gate_run=ga-wisp-yf4wq0, branch\nfix/ga-268cr-raw-ingestion-hold-labels):\n\n1. 01:58:29Z \u2014 Phase C detects timeout (elapsed > verdict_timeout_minutes) with\n   Claude's 5h quota exhausted. Correctly takes the quota-stop path: closes verdict\n   bead ga-oe1ja as `verdict:REQUEUED`, re-queues marker ga-wisp-ycyv7x to\n   `gate-status:queued`, comments \"No verdict recorded; this is NOT a FAIL\" on both\n   marker and gate-run bead. Gate-run bead ga-wisp-yf4wq0 is left at\n   `gate-status:running` (unchanged).\n\n2. ~4 minutes later (02:02:12Z) \u2014 Phase C's next sweep re-selects the SAME\n   ga-wisp-yf4wq0 via its `-l type:quality-gate-run -l gate-status:running` query\n   (still matches, since step 1 never touched this label). It re-derives fields\n   from the bead's own (unchanged) description, re-queries verdict beads by\n   `gate-run:` label, and finds ga-oe1ja ",
+  "close_reason": "Quality gate PASSED \u2014 branch fix/ga-fi1dh-gate-run-requeue-supersede merged to gascity/main (sha=3393150bb36d6942997a9ebd32c8b2c039ef9f76, gate_run=ga-wisp-8zkti4). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-18T06:23:25Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-18T03:10:50Z (tier=bug/tech-debt, lane=small, rig=gascity).\nSling task bead: ga-5rgw3\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-18T03:10:59Z"
+   },
+   {
+    "author": "dog-gaerww3",
+    "text": "Duplicate-dispatch note: this bug was routed to the gastown.dog pool twice \u2014 sling bead ga-5rgw3 (claimed by gastown.dog-2/dog-gaerww3) raced with gastown.dog-1's direct fix (commit d214a8ed, already pushed + submitted to gate as ga-wisp-u58s8f, gate-status:ready). Closed ga-5rgw3 as a verified duplicate after independently confirming the existing fix matches this bug's prescription in both requeue branches and re-running quality-gate-reconcile.selftest.sh (138/138 pass). No action needed here; leaving open until the gate run merges.",
+    "created_at": "2026-07-18T03:17:17Z"
+   },
+   {
+    "author": "automation",
+    "text": "grw FIX4: cleared STALE gate:reviewing (marker ga-wisp-u58s8f sat QUEUED 17m while source carried gate:reviewing \u2014 a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved).",
+    "created_at": "2026-07-18T03:34:08Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-pkvfc",
+  "store": "HQ",
+  "title": "gate-done branch regex truncates dotted sub-bead IDs (ps-XXXX.N \u2192 ps-XXXX epic) \u2014 silent wrong-source marker",
+  "description": "Found by ps-worker submitting ps-8iuu.4 (ref ga-wisp-zjsjw8). commands/gate-done.md Step 2, crew/*/* branch case:\n    _CREW_SEG=${BRANCH#crew/*/}\n    BEAD_ID=$(printf %s \"$_CREW_SEG\" | grep -oE ^[a-z]{2,8}-[a-z0-9]{2,8} | head -1)\nThe char class [a-z0-9]{2,8} has no . so a dotted sub-bead id truncates at the dot:\n    crew/ps-worker/ps-8iuu.4 \u2192 _CREW_SEG=ps-8iuu.4 \u2192 grep \u2192 ps-8iuu (drops .4)\n\nWORSE (ga-p5q3 class \u2014 existence-check without identity-check): the ga-u4yi validation step (if bd show $BEAD_ID succeeds, trust it) is a FALSE POSITIVE here \u2014 ps-8iuu IS a real bead (the PARENT EPIC Melhorias do sistema de leiloes). So _BEAD_ID_RESOLVED=1, truncated id accepted silently. Marker ships source-bead:ps-8iuu (epic) instead of source-bead:ps-8iuu.4 (the actual story built/committed) \u2014 reviews/merges/closes the WRONG bead.\n\nBLAST RADIUS: ANY dotted sub-bead id (<prefix>-<slug>.N) submitted via /gate-done. property_scrapers uses these heavily (ps-8iuu.2, .4). Likely a contributor to the ps-8iuu.N starving/confusion.\n\nFIX: regex must capture the optional dotted suffix \u2014 e.g. ^[a-z]{2,8}-[a-z0-9]+(\\.[0-9]+)? (or [a-z0-9.] in the class, anchored). AND harden the validation: existence-check is not identity-check \u2014 verify the derived id EQUALS the branch trailing segment, not merely that some bead by that (possibly-truncated) id exists. 31+ copies of gate-done.md across crews/rigs (ga-owfll class) \u2014 fix all. Selftest: crew/ps-worker/ps-8iuu.4 must derive ps-8iuu.4, mutation (revert r",
+  "close_reason": "Quality gate PASSED \u2014 branch fix/ga-pkvfc-gate-done-dotted-subbead-regex merged to gascity/main (sha=418278b0648e9837a794056367d1996ce8f9d8e5, gate_run=ga-wisp-buvpwa). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-18T06:47:40Z",
+  "issue_type": "bug",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-18T04:20:10Z (tier=bug/tech-debt, lane=small, rig=gascity).\nSling task bead: ga-1bp0m\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-18T04:20:16Z"
+   },
+   {
+    "author": "dog-gabxdss",
+    "text": "Fix implemented and submitted to gate.\n\nBranch: fix/ga-pkvfc-gate-done-dotted-subbead-regex (commit 982830c1)\nMarker: ga-wisp-m7pzj6\n\nTwo-part fix in commands/gate-done.md Step 2, crew/*/* branch case:\n1. Regex now captures the optional dotted sub-bead suffix:\n   ^[a-z]{2,8}-[a-z0-9]{2,8}(\\.[0-9]+)?\n2. Hardened validation: after the regex match, verify the crew branch\n   segment equals BEAD_ID exactly, or BEAD_ID followed by a '-desc'\n   separator. Any other continuation (e.g. a '.' the regex didn't\n   capture) proves truncation and is discarded BEFORE the existence\n   check runs \u2014 closes the ga-p5q3-class gap where a truncated id that\n   happens to also be real (the parent epic) sailed through on\n   existence alone.\n\nApplied to canonical commands/gate-done.md (symlinked into 30 crew/\nwitness/refinery/mayor dirs per the ga-dmox precedent) and its\ngo:embed twin internal/templates/commands/bodies/gate-done.md (kept a\nreal file, content-synced, per ga-54iu \u2014 go:embed cannot embed\nsymlinks). `go build ./internal/templates/...` verified green.\n\nExtended gate-done-crew-rig.selftest.sh with sections (K)/(L): dotted\nsub-bead extraction, a mutation guard proving the pre-fix regex\nreproduces",
+    "created_at": "2026-07-18T04:33:19Z"
+   },
+   {
+    "author": "automation",
+    "text": "grw FIX4: cleared STALE gate:reviewing (marker ga-wisp-m7pzj6 sat QUEUED 17m while source carried gate:reviewing \u2014 a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved).",
+    "created_at": "2026-07-18T04:50:55Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-6jqr",
+  "store": "HQ",
+  "title": "Pilot dedup cego a branches 'fix/<bead>-*': despacha 2 workers pro mesmo bead \u2014 e nao ha como filar bead pra OUTRO dono sem corrida",
+  "description": "INCIDENTE (17/07, achado e limpo pela mila-wa; causa verificada por mim): o Pilot despachou DOIS workers pro MESMO source-bead (ga-oo66), 21min de intervalo, queimando um worker inteiro:\n  00:51:42  fix/ga-oo66-gate-park-mail-author   (+21 guard, +130 selftest novo)\n  01:12:52  fix/ga-oo66-gate-park-author-mail   (+20 guard, +42 no selftest existente)\nAmbos implementaram o MESMO fix, no MESMO trecho do quality-gate-guard.sh. Dois markers no mesmo bead thrasham o gate; se um mergeasse, o outro conflitaria.\n\nCAUSA (verificada por mim, nao e a hipotese dela): o _filter_built (pilot-dispatcher.sh:1574, o dedup que existe PRA ISSO) procura por:\n    refs/remotes/origin/crew/*/<bead>   e   refs/heads/crew/*/<bead>     (linha 1635)\nMas as branches que os DOGS criam se chamam  fix/<bead>-<slug>  \u2014  no caso: fix/ga-oo66-gate-park-mail-author. O padrao NAO casa. Logo o dedup nao enxerga a branch do 1o worker, o bead segue candidato, e o Pilot despacha de novo. Mesma cegueira em pelo menos 3 sitios: L1635 (_filter_built), L2114, L2417 (ls-remote \"crew/*/${_bid}\").\n\nE A FAMILIA (ga-p5q3): \"nao achei branch com o padrao que eu conheco\" e lido como \"ninguem esta trabalhando nisto\". Nao-sei lido como confirmado.\n\nO GAP MAIOR, QUE E ARQUITETURAL (o ponto da mila, e ela esta certa): NAO EXISTE HOJE JEITO DE FILAR UM BEAD PRA OUTRO DONO SEM ABRIR A JANELA DE COLISAO.\n  - Se ela CLAIMA no bd create (a mitigacao conhecida, que a memoria dela manda): o Pilot nao despacha, e o bead fica parado espe",
+  "close_reason": "Quality gate PASSED \u2014 branch fix/ga-6jqr-pilot-dedup-branch-pattern merged to gascity/main (sha=9cc93fef89ffd5b6a45fc6f321ec6d8bbfdeed48, gate_run=ga-wisp-o7pgyn). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-17T09:10:01Z",
+  "issue_type": "bug",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-17T04:27:35Z (tier=bug/tech-debt, lane=small, rig=gascity).\nSling task bead: ga-2uc7\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-17T04:28:05Z"
+   },
+   {
+    "author": "dog-ganlow",
+    "text": "Implemented + submitted to gate (dog-ganlow/gastown.dog-3, sling ga-2uc7).\n\nFix (layer a \u2014 immediate): widened the 3 branch-existence probes to also match\nfix/<bead>-<slug> (the DOG builder convention) alongside crew/*/<bead-id> (the\nnamed-crew convention):\n  - _filter_built (pilot-dispatcher.sh:1635 for-each-ref patterns)\n  - _target_has_real_branch (:2114 for-each-ref patterns)\n  - _beadid_has_crew_branch (:2404 shared _re regex + :2417 ls-remote patterns)\n_beadid_has_branch (the NEVERSTARTED reclaim path) was already prefix-agnostic\n(plain substring match) and needed no change.\n\nTest: added Scenario ga-6jqr to pilot-dispatcher.selftest.sh \u2014 a mutation test\nthat drives the REAL git ref-matching code (PILOT_TEST_BRANCH_BEADS /\nPILOT_TEST_CREW_BRANCH_BEADS explicitly left unset, unlike every other scenario\nin the file). Verified it fails against the pre-fix dispatcher (fix/* fixtures\nread as \"no branch\" at all 3 sites) and passes against the fix, with crew/*/<id>\nregression coverage interleaved. Also covers the ls-remote-only fallback path\n(a fixture pushed to a real bare repo but never locally fetched). Full suite:\n474 passed, 0 failed.\n\nLayer (b), the structural fix (dedup keyed ",
+    "created_at": "2026-07-17T05:16:28Z"
+   },
+   {
+    "author": "automation",
+    "text": "grw FIX4: cleared STALE gate:reviewing (marker ga-wisp-92dvrv sat QUEUED 16m while source carried gate:reviewing \u2014 a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved).",
+    "created_at": "2026-07-17T05:33:24Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-f7bek",
+  "store": "HQ",
+  "title": "pilot _filter_dispatch_gates trata next-action:<crew>-constroi como BLOQUEIO \u2014 mata 10/15 stories aprovadas da WA (starvation 24h + 45 alertas falsos)",
+  "description": "ROOT CAUSE (provado empiricamente, Mayor 18/07 12:29 BRT)\n\nO Pilot loga toda sweep \"0 WA rig story:approved\" (Step 2b-rig-tier2) enquanto o\nrig whatsapp_automation tem 15 beads story:approved abertas. O approved-state-reconciler\nl\u00ea isso como \"dispatch path failing\" e mailou ~45 alertas de starvation (wa-4e2m8\n1447min, wa-lxe76/wa-78xxm 1257min, wa-pltmi, wa-fbwsb) \u2014 TODOS apontando pro\nsintoma errado. Nao e o Pilot que esta morto, nem Dolt, nem quota: e um FILTRO.\n\nEVIDENCIA\n1. A query bd crua devolve 15 beads (nao e problema de query/DB/rota):\n   bd -C /Users/athos/gt/whatsapp_automation list --json -l story:approved ... -n 0\n   -> RAW COUNT: 15\n2. Rodando a jq de _filter_dispatch_gates (linha ~1606 de pilot-dispatcher.sh)\n   sobre essas 15: sobrevivem 3. Os outros filtros da cadeia matam as 3 restantes\n   (exec:manual / gate:needs-human) -> total 0. Bate exatamente com o log.\n3. Isolando a clausula: 10 das 15 morrem UNICAMENTE por causa de next-action::\n     wa-pltmi  next-action:oracle-constroi\n     wa-91agg  next-action:batista-constroi\n     wa-lxe76  next-action:batista-constroi\n     wa-q4os9  next-action:mayor-reconstroi\n     wa-78xxm  next-action:oracle-constroi\n     wa-5b6yw  next-action:batista-constroi\n     wa-ielq6  next-action:oracle-constroi\n     wa-ys0cy  next-action:oracle-corrige-gate\n     wa-fbwsb  next-action:batista-constroi\n     wa-srgv   next-action:oracle-corrige-gate\n\nA CLAUSULA (pilot-dispatcher.sh, _filter_dispatch_gates):\n   and (((.labels // []) | m",
+  "close_reason": "Quality gate PASSED \u2014 branch fix/ga-f7bek-next-action-crew-routing merged to gascity/main (sha=ff28226f19a710f7ed33c559f0f555133c789ee2, gate_run=ga-wisp-ywdj02). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-18T18:37:54Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-18T15:39:43Z (tier=bug/tech-debt, lane=small, rig=gascity).\nSling task bead: ga-63e1p\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-18T15:39:55Z"
+   },
+   {
+    "author": "gastown__mayor",
+    "text": "Mayor 18/07 13:06 \u2014 gap adicional da MESMA convencao de label, achado na pratica hoje: next-action:batista-constroi e AMBIGUO. Existem batista-wa E batista-ps (rigs diferentes, dominios diferentes). Roteei wa-fbwsb pro batista-wa so pelo label; era do batista-ps (exige ligacao supervisionada com o celular do Athos) e voltou recusada \u2014 corretamente. Ou seja o label nao carrega nem a informacao de roteamento que ele aparenta carregar. Reforca a opcao (b) do fix: migrar pra crew:<alias-exato>, que e sem ambiguidade, em vez de ensinar o filtro a interpretar next-action:<nome>-constroi.",
+    "created_at": "2026-07-18T15:59:12Z"
+   },
+   {
+    "author": "dog-ga2rg7d",
+    "text": "Submitted to gate. Fix implemented per AC1-AC5:\n\nAC1: git log -S\"next-action\" confirmed the veto (5de1ce1c7, 2026-06-29) was\ndeliberate for the \"waiting on Athos/a dependency\" case \u2014 the only prior\nselftest fixture was the bare multi-actor form next-action:athos+oracle. It\npredates and never anticipated refino's later crew-build-routing convention,\nso implemented the narrower reading (a) from the bead: keep vetoing\nhuman/decision/bare-actor next-action forms, let *-constroi/-reconstroi/\n-corrige-gate pass.\n\nAC2/AC3: verified against live WA data directly (not just synthetic fixtures)\n\u2014 wa-fbwsb (next-action:batista-constroi) now passes the fixed filter;\nwa-4e2m8 (blocked-on:wa-qfp58/waiting-on:wa-qfp58) still correctly blocked.\nAlso confirmed the full real-world next-action:* label inventory across all\nrigs (batista-constroi, mayor, mayor-reconstroi, oracle-constroi,\noracle-corrige-gate) behaves correctly \u2014 including the bare \"next-action:mayor\"\nedge case (3 real beads, all also ctx:thin) which correctly stays vetoed.\n\nAC4: selftest Scenario 19h updated (its \"excludes next-action:*\" assertion was\nnow stale) + new dedicated \"Scenario ga-f7bek\" added covering both AC2/AC3 and\nAC5. Fu",
+    "created_at": "2026-07-18T16:12:47Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-268cr",
+  "store": "HQ",
+  "title": "auto-refino RAW ingestion re-varre hist\u00f3ria j\u00e1 governada por outra autoridade (blocked-on:*/pool:refused:* fora do guard) \u2014 5\u00aa ocorr\u00eancia, quase re-armou FLIP recusado por builder (ban-risk)",
+  "description": "CLASSE DE BUG: `auto_refino_is_ingestable_raw` (packs/town-deltas/assets/auto-refino-dispatcher.sh:341-381)\ndecide \"raw/inger\u00edvel\" checando aus\u00eancia de label story:*/auto-refino:*/gate:* (mais as variantes\nblocked:*/needs-human*/pilot:held propostas ap\u00f3s a 3\u00aa ocorr\u00eancia abaixo) \u2014 mas N\u00c3O cobre\n`blocked-on:*` (prefixo com H\u00cdFEN, ex: blocked-on:wa-qfp58) nem `pool:refused:*` (prefixo distinto,\nex: pool:refused:deferred-by-plan-v6). Uma hist\u00f3ria pode carregar um hold expl\u00edcito de outra\nautoridade (Oracle/Mayor) sob esses prefixos e ainda ler como \"Triagem crua\" pro funil.\n\nOCORR\u00caNCIAS CONFIRMADAS (todas 2026-07-17, store whatsapp_automation):\n\n1. wa-v89e3.9 \u2014 bead sem label de ciclo (aprova\u00e7\u00e3o anterior tinha se perdido por raz\u00e3o\n   desconhecida); re-refinado do zero como attempt 2 (conte\u00fado n\u00e3o mudou, custo = 1 ciclo de\n   refino+gate desperdi\u00e7ado).\n2. wa-5b6yw \u2014 sob blocked:needs-oracle-approval (Mayor, hold deliberado, 12:12); varrido\n   ~84min depois mesmo assim.\n3. wa-gunqu \u2014 sob blocked:needs-oracle-approval (Athos aprovou build condicionado a\n   sign-off t\u00e9cnico do Oracle, ainda n\u00e3o landado); fun\u00e7\u00e3o exata identificada\n   (auto_refino_is_ingestable_raw:341-381), blocked:*/needs-human*/pilot:held confirmados\n   AUSENTES de todo guard nessa leitura do c\u00f3digo.\n4. wa-kty2h \u2014 carregava gate:prod-deploy:needs-athos-test (que J\u00c1 deveria ser filtrado pelo\n   guard `startswith(\"gate:\")` existente) e MESMO ASSIM foi ingerido \u2014 hip\u00f3tese de race de\n   timing durante uma transi\u00e7\u00e3o REFRA",
+  "close_reason": "Quality gate PASSED \u2014 branch fix/ga-268cr-raw-ingestion-hold-labels merged to gascity/main (sha=e67b838c62a45e736c512894aa1d91f17d8e9730, gate_run=ga-wisp-9zlrvf). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-18T06:27:26Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "auto-refiner-adhoc-40c1d8d865",
+    "text": "6a OCORR\u00caNCIA CONFIRMADA (wa-px9c8, whatsapp_automation, 2026-07-17) \u2014 mecanismo de gatilho NOVO, distinto das 5 anteriores.\n\nDiferente das ocorr\u00eancias 2/3/5 (bloqueada por blocked:*/blocked-on:*/pool:refused:* que o guard n\u00e3o cobre) e da #4 (race de timing durante REFRAME multi-label), esta N\u00c3O tinha nenhum label de hold de nenhuma autoridade. wa-px9c8 estava totalmente refinada (descri\u00e7\u00e3o + 3 AC), com mockup entregue (protocolo wa-2gtl, 3 op\u00e7\u00f5es A/B/C) e o Athos J\u00c1 TINHA ESCOLHIDO a op\u00e7\u00e3o A \u00e0s 14:30 de hoje (coment\u00e1rio do Mayor 17:37: 'Armado pra build'). \u00c0s 18:46, o inflight-reclaim-guard (ga-se62o) reclamou a bead por falta de builder vivo (>25min TTL) \u2014 comportamento CORRETO dele \u2014 e limpou story:in-flight. 6 minutos depois (18:52), o RAW sweep leu a bead (agora sem NENHUM label story:*) como 'crua da Triagem' e reingeriu como attempt 1.\n\nIsto provavelmente EXPLICA a causa-raiz nunca identificada da ocorr\u00eancia #1 (wa-v89e3.9, 'root cause of label loss still unknown'): qualquer reclaim-guard ou daemon de infra que legitimamente limpe labels de ciclo como efeito colateral do PR\u00d3PRIO trabalho (n\u00e3o relacionado a refino) deixa a bead momentaneamente sem nenhum label story:*/gate:*/",
+    "created_at": "2026-07-17T19:00:04Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-17T19:03:23Z (tier=bug/tech-debt, lane=small, rig=gascity).\nSling task bead: ga-7dggg\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-17T19:03:41Z"
+   },
+   {
+    "author": "dog-gav7sj7",
+    "text": "Fix submitted to quality gate (dog-gav7sj7 / gastown.dog-3, sling ga-7dggg).\n\nRoot cause confirmed directly against the live code (2026-07-17, not from\nmemory): neither auto_refino_is_ingestable_raw NOR the RAW_JSON jq filter it\nmirrors checked for ANY hold-label prefix \u2014 not just blocked-on:*/pool:refused:*\nas this bead's title names, but blocked:*, needs-human*, and pilot:held* too\n(the body text's \"propostas ap\u00f3s a 3\u00aa ocorr\u00eancia\" apparently never actually\nlanded in code). Occurrences 2/3 (blocked:needs-oracle-approval) and 5\n(all four: blocked-on:wa-4e2m8, blocked-on:wa-qfp58,\nblocked:needs-oracle-approval, pool:refused:deferred-by-plan-v6 at once) would\nall have re-formed under the pre-fix guard.\n\nFix: added a 5-prefix guard (blocked:*, needs-human*, pilot:held* [bare or\n-until:<epoch>], blocked-on:*, pool:refused:*) to BOTH layers \u2014 the\nis_ingestable_raw classifier and the RAW_JSON jq filter \u2014 mirroring the\nexisting gate:* defense-in-depth pattern exactly. Did NOT add the 6th\noccurrence's ctx:ready positive-signal idea (wa-px9c8 had zero hold labels \u2014\na distinct mechanism, inflight-reclaim-guard legitimately stripping\nstory:in-flight \u2014 out of scope for this bead's blocked-on:*",
+    "created_at": "2026-07-17T19:18:08Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-huaxo",
+  "store": "HQ",
+  "title": "gate-selfheal drift-guard conta N\u00daMERO M\u00c1GICO (grep -c == 5) \u2014 todo site needs-human novo deixa RED at\u00e9 bump manual",
+  "description": "Achado ao consertar o ga-26df: o selftest (gate-selfheal.selftest.sh:157, guard ga-u4yi)\nestava RED em main ANTES da minha branch. A causa \u00e9 estrutural e o Mayor confirmou a bije\u00e7\u00e3o\ndos dois lados (n\u00e3o s\u00f3 contou).\n\n## O que \u00e9\n\nO guard afirma 'gate mails AUTHOR at all N gate:needs-human sites' via 'grep -c mail send\nAUTHOR == N', com N HARDCODED. Estava N=4; um 5\u00ba site leg\u00edtimo (base-behind rebase, :4814/\n:4827) entrou COM seu mail, e o guard ficou RED porque ningu\u00e9m bumpou o 4 pra 5. Eu bumpei\n4\u21925 na carona do ga-26df (verifiquei os 5 subjects; Mayor verificou a bije\u00e7\u00e3o completa: 5\nmails em 2383/4074/4566/4619/4827 <-> 5 sites em 2363/4058/4552/4606/4814, cada mail sob um\nsite, nenhum site MUDO).\n\n## Por que \u00e9 a classe (manuten\u00e7\u00e3o por enumera\u00e7\u00e3o \u2014 o thies nomeou hoje)\n\nUm n\u00famero m\u00e1gico que precisa de update manual a cada mudan\u00e7a leg\u00edtima MENTE por padr\u00e3o: fica\nRED no 5\u00ba site, no 6\u00ba, sempre \u2014 e um RED cronico \u00e9 ignorado, ent\u00e3o quando um site REALMENTE\nmudo aparecer (park sem mail = a classe da noite, o que o guard existe pra pegar), ningu\u00e9m vai\ndistinguir do RED-por-desatualiza\u00e7\u00e3o. O guard que deveria pegar o park mudo \u00e9 derrotado pela\npr\u00f3pria fragilidade.\n\n## Fix (estrutural, do Mayor): BIJE\u00c7\u00c3O, n\u00e3o contagem\n\nO invariante certo n\u00e3o \u00e9 'existem exatamente N mails'. \u00c9: 'TODO site que adiciona\ngate:needs-human tem um mail send AUTHOR adjacente'. Assim:\n  - um 6\u00ba site leg\u00edtimo COM mail passa sozinho (sem bump manual);\n  - um 6\u00ba site MUDO (needs-human sem mail) FALHA \u2014 que \u00e9 exatam",
+  "close_reason": "Quality gate PASSED \u2014 branch fix/ga-huaxo-bijection-guard merged to gascity/main (sha=ad74c7a3077041fd14994b85c3eb0c827adaf106, gate_run=ga-wisp-ap93ki). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-20T07:51:08Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "mila-wa-gawisphchfmo",
+    "text": "DEP: branch parte de fix/ga-26df-work (mesmo arquivo gate-selfheal.selftest.sh). Gatear S\u00d3 depois do ga-26df mergear + rebase em main. Commit no origin: 535336e8. Falsificado (site mudo injetado -> guard nomeia a linha; restaurado -> 39/0).",
+    "created_at": "2026-07-17T14:09:03Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "[painel \u00b7 Sua vez] mudou prioridade: P1",
+    "created_at": "2026-07-17T15:33:16Z"
+   },
+   {
+    "author": "automation",
+    "text": "inflight-reclaim-guard (ga-se62o): reclaimed \u2014 no live builder and no recent branch progress for 33min (> 25min TTL). story:in-flight cleared; assignee unset; status reset to open (ga-vw26y). Pilot will re-dispatch. (reclaim 1/3)",
+    "created_at": "2026-07-18T14:12:59Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-kgja",
+  "store": "HQ",
+  "title": "Arvore compartilhada: 'git add <arquivo>' varre trabalho nao-commitado de OUTRO agente pro teu commit \u2014 burla o gate em silencio",
+  "description": "INCIDENTE (17/07 00:31, EU \u2014 Mayor): meu commit 055cc4f5 (\"trim the ga-p5q3 duplicate from lens 1\") levou junto, sem eu saber, o fix ga-oiu7/ga-art5 de um dog (gastown.dog-2) que estava NAO-COMMITADO no mesmo arquivo (quality-gate-dispatcher.sh). Pushei os dois pro origin/main. NENHUM DOS DOIS PASSOU PELO GATE. O dog reportou \u2014 e ele achou que tinha sido um dog irmao, porque o git author de todos nos e \"Gate Dispatcher\", entao nem da pra distinguir quem fez.\n\nMECANISMO (simples, e por isso perigoso): a arvore ~/gt e COMPARTILHADA entre Mayor, dogs e crews. Um `git add <arquivo>` stageia o ARQUIVO INTEIRO \u2014 incluindo edicoes de qualquer outro agente que esteja no meio de um trabalho ali. Quem commita nao ve: o `git commit` reporta sucesso, e o diff que ele pensa que fez nao e o diff que foi.\n\nNAO e a familia error-vs-empty \u2014 e outra: \"o que eu commitei\" != \"o que eu editei\", e nada avisa. Mas o efeito e o mesmo do dia inteiro: uma acao reporta sucesso e faz outra coisa.\n\nDANO REAL HOJE (2 incidentes, ambos no mesmo arquivo):\n1. Este (055cc4f5): meu commit + o fix do dog, ambos sem review.\n2. Antes (~23h): um dog commitou ga-31ac e varreu MINHAS edicoes nao-commitadas do CLAUDE.md do rig WA. Deu certo por sorte (o trabalho era meu e estava bom), mas foi a mesma mecanica.\n\nATENUANTE (nao desculpa): o codigo do dog e BOM \u2014 vb_status_action() com sentinel __UNKNOWN__, que e exatamente a doutrina ga-p5q3 aplicada ao VB_STATUS (distingue \"nao consegui ler\" de \"esta aberto\"). Sintaxe",
+  "close_reason": "Quality gate PASSED \u2014 branch fix/ga-kgja-shared-tree-doctrine merged to gascity/main (sha=bda9e9ddf569eaae09344b2e267881e077d9898b, gate_run=ga-wisp-cha7q3). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-17T07:28:20Z",
+  "issue_type": "bug",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-17T04:02:17Z (tier=bug/tech-debt, lane=small, rig=gascity).\nSling task bead: ga-67w9\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-17T04:02:27Z"
+   },
+   {
+    "author": "automation",
+    "text": "grw FIX4: cleared STALE gate:reviewing (marker ga-wisp-o53p3e sat QUEUED 15m while source carried gate:reviewing \u2014 a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved).",
+    "created_at": "2026-07-17T04:56:27Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch fix/ga-kgja-shared-tree-doctrine merged to gascity/main (sha=bda9e9ddf569eaae09344b2e267881e077d9898b) via autonomous dispatcher (gate_run=ga-wisp-cha7q3).",
+    "created_at": "2026-07-17T07:28:18Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-ey9fn",
+  "store": "WA",
+  "title": "[bug] Preg\u00e3o Triar: PROIBIDO fallback do nome do WhatsApp \u2014 pill deve mostrar S\u00d3 o real revelado ou 'n\u00e3o revelado' (falso-negativo de identidade)",
+  "description": "Athos (CR\u00cdTICO): a comparacao nome esperado x nome do WhatsApp e um SINAL DE IDENTIDADE (esse telefone e mesmo de quem eu acho?). O fallback atual (wa-4o5rs: _real_wa_display(phone) OR classifications.display_name) faz a pill 'WHATSAPP' mostrar o formal quando nao ha reveal -> os dois SEMPRE batem -> FALSO NEGATIVO perigoso (operador acha que verificou, mas nao tem nome real). PROIBIDO. Fix: backend display_name = _real_wa_display(phone) SEM fallback (real ou None). Front: pill mostra o real quando existe, senao 'nao revelado' EXPLICITO (estilo distinto), nunca o formal. Header (NOME ESPERADO) tambem nao cai pro display (cross-contamina). Fontes independentes.",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/mila/wa-ey9fn merged to whatsapp_automation/main (sha=a937381bb80c4845a3888d3d47b1712dfa15152b, gate_run=ga-wisp-sa5wud). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-19T18:49:50Z",
+  "issue_type": "bug",
+  "priority": 0,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/mila/wa-ey9fn merged to whatsapp_automation/main (sha=a937381bb80c4845a3888d3d47b1712dfa15152b) via autonomous dispatcher (gate_run=ga-wisp-sa5wud).",
+    "created_at": "2026-07-19T18:49:49Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-j16zg",
+  "store": "WA",
+  "title": "[P0] sender colapsa 2 estados em tick_unconfirmed: (B)=36 no send_audit.db (86%) e retry cego DUPLICA pro lead \u2014 o log de texto \u00e9 cego ao (B) por constru\u00e7\u00e3o",
+  "description": "CONTEXTO: o sender colapsa dois estados de confian\u00e7a DIFERENTE num s\u00f3 outcome (`tick_unconfirmed`), e a camada\nde cima trata o bloco inteiro como \"n\u00e3o saiu\" -> retenta -> DUPLICA pro lead (reclama\u00e7\u00e3o #1 do Athos).\n\nO C\u00d3DIGO REAL (device_human_sender.py:2448-2458) \u2014 s\u00e3o DOIS caminhos e o `detail` j\u00e1 os separa:\n    if send_fab_present:            # (A)\n        return {\"ok\": False, \"detail\": \"send FAB still present after tap \u2014 message not sent\"}\n    # FAB gone. If the (readable) compose also still showed the text, that is a\n    # contradiction we resolve conservatively as not-sent; otherwise SENT.\n    if not compose_cleared:         # (B)\n        return {\"ok\": False, \"detail\": \"compose box still holds the text\"}\n    return {\"ok\": True, ...}        # (C)\n- (A) FAB presente: o FAB s\u00f3 existe se a caixa tem texto -> N\u00c3O saiu -> retry SEGURO.\n- (B) FAB sumiu mas o compose ainda tem texto: o PR\u00d3PRIO c\u00f3digo chama de \"a contradiction we resolve\n  conservatively\" \u2014 o autor j\u00e1 sabia que \u00e9 AMB\u00cdGUO. Retry aqui DUPLICA.\n- O coment\u00e1rio :2819 (\"tick_unconfirmed can ONLY mean the send did NOT go out\") est\u00e1 colado no return EXTERNO,\n  que cobre os DOIS -> generaliza o caso forte pro amb\u00edguo. \u00c9 a\u00ed que o \"can ONLY\" vira bug.\n\n\u26a0\ufe0f MEDI\u00c7\u00c3O \u2014 E A ARMADILHA QUE PEGOU O ORACLE (n\u00e3o repita):\n`grep \"compose box still holds\" logs/central_sender.log` = 0  -> ERRADO. O oracle concluiu \"o caso perigoso\nnunca aconteceu\" e REBAIXOU o fix. \u00c9 FALSO:\n  A FONTE CERTA \u00e9 **send_audit.db** (tabela send_audit_log, escr",
+  "close_reason": "Story DELIVERED \u2014 deployed + verified in prod, story:done (rig whatsapp_automation, deployed + baseline-tested in prod). Closed by story-delivery (ga-i53ua durable terminal).",
+  "closed_at": "2026-07-17T04:04:59Z",
+  "issue_type": "bug",
+  "priority": 0,
+  "comments": [
+   {
+    "author": "automation",
+    "text": "approved-state-reconciler: bead parece on-device (keyword 'on-device') mas sem label expl\u00edcito. Um humano/refino deve confirmar e adicionar o label correto. Bead permanece story:approved.",
+    "created_at": "2026-07-17T01:46:08Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'wa-worker-1' at 2026-07-17T01:46:39Z (tier=bug/tech-debt, lane=small, rig=whatsapp_automation).\nSling task bead: wa-j16zg\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-17T01:47:12Z"
+   },
+   {
+    "author": "wa-worker-adhoc-597b14e068",
+    "text": "Investiga\u00e7\u00e3o completa + fix implementado. Branch crew/wa-worker/wa-j16zg (commit 71fb4726), pushed.\n\n## 1. Contradi\u00e7\u00e3o FLAG_SECURE \u2014 RESOLVIDA\n\nO docstring N\u00c3O se contradiz com o dado \u2014 o revisor generalizou o escopo errado. Tr\u00eas locais independentes no pr\u00f3prio c\u00f3digo (lib/device_human_sender.py:345-350, 379-382, 2437-2447, todos citando \"confirmed on-device... w4b 2.26.x\") deixam claro que a supress\u00e3o de TEXTO DO COMPOSE sob FLAG_SECURE \u00e9 escopada especificamente a chats Meta-managed BUSINESS (w4b/\"Conta comercial\") \u2014 N\u00c3O \u00e9 universal. A supress\u00e3o universal (linha 195, confirmada em device Normal Note20) \u00e9 s\u00f3 do texto da BOLHA (body_has_text), n\u00e3o do compose.\n\n\u21d2 Em `com.whatsapp` (Normal), o texto do compose \u00c9 leg\u00edvel. \"FAB sumiu mas compose ainda mostra o texto\" \u00e9 uma contradi\u00e7\u00e3o REAL ali (send pode ter ido, UI atrasou), n\u00e3o c\u00f3digo morto. `_is_send_fab` casa por resource-id-leaf exato + clickable (nunca por texto), ent\u00e3o o caso (A) \u00e9 estruturalmente imune a essa supress\u00e3o em qualquer chat.\n\nIsso bate exatamente com o dado: os 36 eventos \"(B)\" s\u00e3o TODOS `com.whatsapp` (onde compose \u00c9 leg\u00edvel \u2192 branch alcan\u00e7\u00e1vel), ZERO em w4b (onde compose \u00e9 SEMPRE suprimido \u2192 branch inalcan\u00e7\u00e1vel po",
+    "created_at": "2026-07-17T02:22:50Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-d5r3s",
+  "store": "WA",
+  "title": "[bug P0] screen_ts_to_str fabrica a data: bal\u00e3o de ONTEM vira HOJE (+24h) \u2014 envenenou o cursor e starvou 47 respostas/27 leads",
+  "description": "A ORIGEM das 4 ra\u00edzes do pipeline de resposta (auditoria camp 108, 16/07).\n\n`inbound_sweep.screen_ts_to_str` monta `hoje + HH:MM` a partir do hor\u00e1rio do bal\u00e3o e **s\u00f3 volta\num dia se o resultado cair no FUTURO**. O divisor de data da tela (\"ONTEM\", \"HOJE\", \"8 de julho\",\ndia-da-semana) N\u00c3O \u00e9 consumido \u2014 o pr\u00f3prio docstring confessa:\n   \"the calendar day lives in a separate date divider ... that this parser does not consume\"\n\nTESTE (meu, reproduz\u00edvel):\n   screen_ts_to_str('11:22', now=2026-07-16 17:00) -> '2026-07-16 11:22'   <- QUALQUER dia anterior vira HOJE\n   screen_ts_to_str('18:30', now=2026-07-16 17:00) -> '2026-07-15 18:30'   <- s\u00f3 volta porque \u00e9 futuro\nAuditoria com verdade-terreno (mesmo texto/chat: envio ao vivo vs re-leitura): **131 de 166 pares\nno dia ERRADO, drift \u2248 +24.0h**.\n\nPOR QUE \u00c9 A ORIGEM: o cursor do auto_response_v2_listener \u00e9 o timestamp do \u00faltimo inbound\nprocessado. Uma mensagem de ONTEM carimbada HOJE 16:47 arrastou o cursor pra frente e matou\n**47 respostas de hoje / 27 leads** (n\u00e3o-frota, camp 108) \u2014 elas nunca ser\u00e3o eleg\u00edveis a draft.\nAncorador provado: +553194155889, cujos bal\u00f5es reais s\u00e3o de 15/07 16:42 e entraram como 16/07 16:38-16:47.\n\n\u26a0\ufe0f ISTO J\u00c1 ACONTECEU E FOI CONSERTADO PELA METADE. O docstring registra: \"ONE future-stamped row\nadvanced the cursor past every real lead and silently starved the whole draft pipeline (13\ncampaign-104 leads never drafted)\". O fix anterior (wa-v89e3.5) fechou s\u00f3 a dire\u00e7\u00e3o FUTURO. A\ndire\u00e7\u00e3o PASSADO ficou aberta \u2014 e ",
+  "close_reason": "Story DELIVERED \u2014 deployed + verified in prod, story:done (rig whatsapp_automation, deployed + baseline-tested in prod). Closed by story-delivery (ga-i53ua durable terminal).",
+  "closed_at": "2026-07-17T02:06:03Z",
+  "issue_type": "bug",
+  "priority": 0,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'wa-worker-1' at 2026-07-16T23:25:17Z (tier=bug/tech-debt, lane=small, rig=whatsapp_automation).\nSling task bead: wa-d5r3s\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-16T23:25:53Z"
+   },
+   {
+    "author": "wa-worker-adhoc-6c09dbaa38",
+    "text": "Fix implementado e pushado (branch crew/wa-worker/wa-d5r3s, commit 66c5f20a).\n\nResumo: screen_ts_to_str ganhou divider_text opcional; _parse_messages_from_xml\n(+ variante business) agora coleta os n\u00f3s de divisor de data (\"Hoje\"/\"Ontem\"/\ndia-da-semana/\"D de m\u00eas\") e anexa o divisor efetivo de cada bal\u00e3o por posi\u00e7\u00e3o-y\n(divisor \u00e9 sempre um sibling ACIMA do grupo de bal\u00f5es que cobre). Quando o\ndivisor resolve pra um dia real, esse dia \u00e9 usado diretamente \u2014 sem depender\nde HH:MM \"estourar pro futuro\". Sem divisor vis\u00edvel, cai na heur\u00edstica antiga\n(agora logada, n\u00e3o mais silenciosa, per a instru\u00e7\u00e3o \"MARCAR a linha como\ndata-inferida\"). msg_type='text' (linha ~1614/1694 p\u00f3s-diff) N\u00c3O tocado.\n\n\u26a0\ufe0f Transpar\u00eancia sobre 1 crit\u00e9rio de aceita\u00e7\u00e3o: \"os 166 pares com verdade-\nterreno: drift 0\" \u2014 o script/dataset original dessa auditoria n\u00e3o est\u00e1 no\nrepo (procurei; s\u00f3 existe como prosa neste bead). N\u00e3o consigo re-rodar a\nauditoria EXATA do oracle. O que fiz em vez disso:\n1. Confirmei o caso-\u00e2ncora citado (+553194155889) ao vivo em\n   conversation_history.db: 3 msgs reais de 15/07 16:42 (dev:*) vs 4 rows\n   sweep de 16/07 16:38-16:47 (sw-*) \u2014 bug 100% reproduzido.\n2. Reconstru\u00ed a metodologia (pares de",
+    "created_at": "2026-07-17T00:01:49Z"
+   },
+   {
+    "author": "automation",
+    "text": "grw FIX4: cleared STALE gate:reviewing (marker ga-wisp-f971ap sat QUEUED 16m while source carried gate:reviewing \u2014 a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved).",
+    "created_at": "2026-07-17T00:28:23Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-0iqe9",
+  "store": "WA",
+  "title": "[bug] classifications tem 203 contatos DUPLICADOS (mesma pessoa com e sem o 9) \u2014 100 pares com classificacao CONTRADITORIA",
+  "description": "ACHADO ao implementar o wa-ygpdf: so ficou visivel porque a fila encolheu de 7.298 -> 1.943 e passei a computar chave canonica.\n\nO PROBLEMA: a fila tem 1.943 LINHAS mas so 1.740 PESSOAS. 203 contatos estao gravados DUAS VEZES no classifications \u2014 uma com o 9 e outra sem:\n   +5531998944837  e  +553198944837   = a MESMA pessoa\nE a mesma regra do 9o digito por DDD do wa-au8vl/wa-qt9gn, mas agora como DUPLICACAO DE DADO dentro do classifications, nao como falha de casamento.\n\nEFEITO NO OPERADOR: ele tria a mesma pessoa duas vezes. E como duplicata costuma cair na mesma faixa de hierarquia, as duas linhas aparecem PROXIMAS na fila.\n\n\u26a0\ufe0f NAO DA PRA DEDUPLICAR AUTOMATICO \u2014 medido, o padrao NAO e consistente:\n   203 pares duplicados\n     103 concordam na classificacao  (dedup trivial)\n     100 DIVERGEM                    (precisa de regra de quem ganha)\n   dos 100 que divergem:\n      46  com-9 tem classificacao rica, sem-9 = 'Nao identificado'\n      15  o CONTRARIO (sem-9 rica, com-9 = 'Nao identificado')\n      15  com9=Proprietario / sem9=Sem relacao com imovel   <- contradicao real\n      10  com9=Parente / sem9=Sem relacao com imovel\n      4   com9=Herdeiro / sem9=Parente\n      4   com9=Herdeiro / sem9=Sem relacao com imovel\nOu seja: 'o com 9 ganha' erraria >=15 vezes; 'o mais rico ganha' nao resolve os pares onde as duas sao ricas e CONTRADITORIAS (Proprietario vs Sem relacao com imovel e um julgamento oposto sobre a MESMA pessoa).\n\nDECISAO DO ATHOS NECESSARIA (nao inventei regra):",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/mila/wa-0iqe9 merged to whatsapp_automation/main (sha=7f67735c37b08917971bb963dd67f8002078b3c1, gate_run=ga-wisp-7q8vkx). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-20T14:12:38Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/mila/wa-0iqe9 merged to whatsapp_automation/main (sha=7f67735c37b08917971bb963dd67f8002078b3c1) via autonomous dispatcher (gate_run=ga-wisp-7q8vkx).",
+    "created_at": "2026-07-20T14:12:37Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-ue555",
+  "store": "WA",
+  "title": "campaign_dashboard vaza file descriptors (26x Errno 24) \u2192 chip_features._load falha \u2192 cai no _DEFAULTS (sem production_send_backend) \u2192 ondevice roster VAZIO \u2192 _resolve_start_channels None \u2192 'no AUTH channels to start' \u2192 resume/start/pause manual falha intermitente (n\u00e3o bloqueia auto-send do slot_scheduler)",
+  "description": "",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/oracle/wa-ue555 merged to whatsapp_automation/main (sha=c0834d5c86391c1f1b496c4d1f6fb26f4dfdbb59, gate_run=ga-wisp-7j0c4t). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-20T03:19:18Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "automation",
+    "text": "Context-check: marcado ctx:thin \u2014 falta contexto para um agente gen\u00e9rico construir sem um humano.\n  \u2022 O QU\u00ca: descri\u00e7\u00e3o vazia ou quase vazia (0 chars). Diga o que precisa ser feito e por qu\u00ea.\nQuando estiver completo, remova o label ctx:thin para re-avalia\u00e7\u00e3o.",
+    "created_at": "2026-07-20T01:56:21Z"
+   },
+   {
+    "author": "oracle-wa-ganav3",
+    "text": "CORRE\u00c7\u00c3O de escopo: N\u00c3O \u00e9 o campaign_dashboard e N\u00c3O causa o resume-fail (esse \u00e9 sys.path, origin/main s\u00f3 lib/ \u2192 batista wa-0l7jh). O fd-leak REAL \u00e9 no SLOT_SCHEDULER: slot_scheduler.log=179 'Too many open files' (dashboard.log=0). Impacto: slot_scheduler \u00e9 o promotor intent->scheduled das 07:00; se estourar fd, is_channel_auth fail-closed \u2192 roster/healthy [] \u2192 N\u00c3O promove \u2192 envio para (silencioso, 'vivo mas inerte' \u2014 o _maybe_alert_zero_healthy j\u00e1 existe pra isso). Monday-relevant. Achar quem vaza fd no slot_scheduler (conex\u00e3o sqlite/health.db por tick n\u00e3o-fechada?) + fechar.",
+    "created_at": "2026-07-20T02:01:31Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/oracle/wa-ue555 merged to whatsapp_automation/main (sha=c0834d5c86391c1f1b496c4d1f6fb26f4dfdbb59) via autonomous dispatcher (gate_run=ga-wisp-7j0c4t).",
+    "created_at": "2026-07-20T03:19:17Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-a97o",
+  "store": "WA",
+  "title": "HOTFIX: drawer n\u00e3o abre na 2.8.8 \u2014 aspas simples no onkeydown da p\u00edlula de prioridade quebram o JS",
+  "description": "Regress\u00e3o do wa-ueu7: em _buildDrawerContent (string JS delimitada por aspas simples), a p\u00edlula #dr-prio-pill tem onkeydown=\"if(event.key==='Enter'...)\" com aspas simples internas N\u00c3O escapadas pro contexto JS \u2014 fecham a string e quebram a parse do <script> inteiro do drawer. openDrawer some \u2192 clicar em card n\u00e3o abre nada \u2192 imposs\u00edvel editar prioridade/ver detalhes. node --check confirma SyntaxError na linha. Fix: remover o onkeydown da p\u00edlula (onclick basta; teclado \u00e9 a11y menor, fica pra depois). Validar com node --check no JS servido.",
+  "close_reason": "delivered: direct-landed to main c2df8b79 (P0 prod-down hotfix, gate-expedited). Painel-prod deploy a seguir.",
+  "closed_at": "2026-06-17T02:53:48Z",
+  "issue_type": "bug",
+  "priority": 0,
+  "comments": []
+ },
+ {
+  "id": "wa-vdjtx",
+  "store": "WA",
+  "title": "Painel: coluna Aprovadas deve == conjunto despach\u00e1vel do Pilot (idle \u2192 Aprovadas=0); framework:engine/awaiting-external/assigned vazam pra Aprovadas",
+  "description": "REQUISITO (Athos, reiterado 2026-07-20, j\u00e1 pedido 2026-07-12 'APROVADAS \u00e9 exclusivamente dispatchable'): a coluna \u2705 Aprovadas do painel (:8202, whatsapp_automation/daemons/painel_visibilidade.py) tem que conter S\u00d3 o que est\u00e1 desobstru\u00eddo e o sistema despacharia AGORA. Sistema ocioso \u2192 Aprovadas = 0. Pendente do Athos \u2192 \ud83d\udc64 Sua vez. Pendente do sistema/workers \u2192 \ud83d\udd12 Travadas.\n\nDIAGN\u00d3STICO: _travada_reason() (~L1329-1460) j\u00e1 move locks pra Travadas, mas 3 classes VAZAM pra Aprovadas hoje (verificado 2026-07-20, painel mostrava Aprovadas=13 com sistema ocioso):\n1. framework:engine (+ engine-rebuild): o Pilot _filter_candidates os EXCLUI do dispatch (dog pool n\u00e3o rebuilda o motor) mas o painel os deixa em Aprovadas flagados \ud83d\udd27 'Janela de Engine' (~L387). DEVEM ir pra Travadas, motivo 'needs-engine-window'. Ex: ga-jl8rz, ga-y00dh, ga-b70l.\n2. story:awaiting-external-merge: fix em PR externo aguardando upstream. DEVEM ir pra Travadas. Ex: ga-7r884, ga-ahnxx, ga-hqchm.\n3. assigned a uma crew/owner viva mas ainda n\u00e3o story:in-flight: DEVEM ir pra \ud83d\udeeb Em execu\u00e7\u00e3o (ou estado 'crew tem'), n\u00e3o Aprovadas. Ex: wa-c73wl (batista), wa-h2lsu (mila), wa-u5qae (oracle).\n\nFIX CAN\u00d4NICO: a defini\u00e7\u00e3o de 'em Aprovadas' deve ESPELHAR o _filter_candidates do Pilot (o mesmo conjunto de exclus\u00e3o: framework:engine, pool:refused:*, pilot:reclaim-count>=cap, story:awaiting-external-merge, assignee-presente, etc.). Aprovadas == 'o que o Pilot despacharia agora'. Assim idle \u2192 Aprovadas=0 POR CONSTRU\u00c7\u00c3O, e n\u00e3o recor",
+  "close_reason": "Quality gate PASSED \u2014 branch fix/wa-vdjtx-aprovadas-dispatchable-alignment merged to whatsapp_automation/main (sha=136e4d91f9760908883033a1b7c2bab533c50d44, gate_run=ga-wisp-you3ot). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-20T15:48:14Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "gastown__mayor",
+    "text": "CONTEXTO p/ o gate reviewer: este fix REVERTE deliberadamente a regra wa-u5r1 ('mostrar assigned em Aprovadas regardless of assignee') \u2014 por decis\u00e3o expl\u00edcita do Athos (2026-07-20, reiterada): a coluna Aprovadas deve conter S\u00d3 o que o Pilot despacharia AGORA (sistema ocioso \u21d2 Aprovadas=0). Assigned-sem-branch-vivo agora vai pra Travadas/Em-execu\u00e7\u00e3o, n\u00e3o Aprovadas. O teste que codificava wa-u5r1 foi reescrito de prop\u00f3sito (375 passam, +14 novos). A defini\u00e7\u00e3o de 'em Aprovadas' espelha o _filter_candidates do Pilot; VERIFICADO em dados vivos: Aprovadas caiu de 13\u21920 batendo com o pilot-dispatchable.json (count:0) no mesmo instante. N\u00c3O \u00e9 regress\u00e3o \u2014 \u00e9 a corre\u00e7\u00e3o pedida. Merge\u2260live: o painel (:8202) precisa redeployar (painel-prod-deploy-sync kickstarta no advance do origin/main).",
+    "created_at": "2026-07-20T15:34:58Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch fix/wa-vdjtx-aprovadas-dispatchable-alignment merged to whatsapp_automation/main (sha=136e4d91f9760908883033a1b7c2bab533c50d44) via autonomous dispatcher (gate_run=ga-wisp-you3ot).",
+    "created_at": "2026-07-20T15:48:13Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-lve64",
+  "store": "WA",
+  "title": "Unifica\u00e7\u00e3o: resolvedor \u00fanico de telefone pra inbound_capture + inbound_sweep, incluindo cobertura de Arquivadas",
+  "description": "CONTEXTO (Athos, 2026-07-08): dire\u00e7\u00e3o expl\u00edcita \u2014 minimizar gambiarra one-off, preferir\nsolu\u00e7\u00e3o sist\u00eamica que resolve os problemas pontuais como efeito colateral. Esta bead\nconsolida 4 achados do mesmo dia que s\u00e3o, na raiz, o MESMO problema: dois mecanismos de\ncaptura de resposta rodam em paralelo, cada um com seu PR\u00d3PRIO resolvedor\nnome-da-notifica\u00e7\u00e3o/nome-do-chat \u2192 telefone, e cada um falha de um jeito diferente pra\nleads de campanha fria (conven\u00e7\u00e3o de nome \"? Nome Completo\", wa-ifgnc).\n\nJ\u00c1 CORRIGIDO (refer\u00eancia, n\u00e3o re-fazer): wa-pxi5z (mesclada, sha 6a26c33c, daemon\ninbound_capture.py j\u00e1 reiniciado por mim) corrigiu o resolvedor DE NOTIFICA\u00c7\u00c3O\n(daemons/inbound_capture.py _resolve_phone): populou chats.name no envio on-device +\nnormalizou a compara\u00e7\u00e3o de channel_name. Esse fix vira a REFER\u00caNCIA/BASE pra esta bead,\nn\u00e3o o escopo dela.\n\nACHADO NOVO 1 \u2014 inbound_sweep.py (mecanismo por BADGE de n\u00e3o-lida, daemon separado,\nrodando desde 2026-07-01) tem seu PR\u00d3PRIO resolvedor (_resolve_phone +\n_resolve_phone_via_contacts, linhas ~408-465), INDEPENDENTE do que foi corrigido em\ninbound_capture.py. Confirmado FALHANDO AO VIVO no log (2026-07-08 ~20:48):\n  \"G32 business/w4b unread non-pool chat 'Luiz Antonio Pimenta Ferreira' has unread=1\n   but phone could not be resolved (not a saved contact?) \u2014 skipping write\"\nLuiz Antonio, Lucilene Francisca de Oliveira e outros leads reais (confirmados\nexistentes no aparelho por Athos) ficam invis\u00edveis por ESTE bug, distinto do que\nwa-pxi5z j\u00e1 co",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/whatsapp_automation-claude-1/wa-lve64 merged to whatsapp_automation/main (sha=0346ec56b46cc87383e44d65898becd0ca38a43d, gate_run=ga-wisp-c4nxpt). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-09T05:07:43Z",
+  "issue_type": "feature",
+  "priority": 0,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/whatsapp_automation-claude-1/wa-lve64 merged to whatsapp_automation/main (sha=0346ec56b46cc87383e44d65898becd0ca38a43d) via autonomous dispatcher (gate_run=ga-wisp-c4nxpt).",
+    "created_at": "2026-07-09T05:07:43Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-49br3",
+  "store": "WA",
+  "title": "[P0] parser de tela cego a \u00e1udio: 30,2% (notifica\u00e7\u00e3o) vs 0,3% (tela) na mesma popula\u00e7\u00e3o \u2014 2 leads da 108 responderam com \u00e1udio e constam 'nunca respondeu'",
+  "description": "CONTEXTO: o parser de tela \u00e9 cego a \u00e1udio. PROVA rigorosa (mesma popula\u00e7\u00e3o, 17 chats vistos pelos dois\ncaminhos): notifica\u00e7\u00e3o 30,2% de \u00e1udio (16/53) vs parser de tela 0,3% (2/607) = 100x. Um revisor refez: 125x.\nN\u00e3o \u00e9 \"lead manda pouco \u00e1udio\" \u2014 na MESMA popula\u00e7\u00e3o um instrumento v\u00ea 30% e o outro 0,3%.\nCUSTO REAL: 2 leads da camp 108 responderam com \u00c1UDIO e constam como \"nunca respondeu\":\n  559992046985 (\u00e1udio 22s) e 553186471808 (\u00e1udio 0:08) \u2014 achados por VIS\u00c3O (print), n\u00e3o pelo parser.\n\n\u26a0\ufe0f UM DESENHO J\u00c1 MORREU (n\u00e3o repita): mudar `msg_type = detected_subtype if detected_subtype else \"text\"`\n(inbound_sweep.py:1460/:1536) para 'unknown'.\nDOIS motivos:\n1. LINHA ERRADA: `_parse_messages_from_xml:1442-1444` s\u00f3 visita n\u00f3s cujo resource-id cont\u00e9m `message_text`.\n   Bal\u00e3o de \u00e1udio N\u00c3O TEM TextView -> nunca \u00e9 visitado -> a linha 1460 NUNCA RODA pra ele. Mudar o default\n   recupera ZERO \u00e1udio.\n2. MATARIA O PIPELINE: `media_subtype` retorna None para TEXTO NORMAL, por design (docstring\n   inbound_notification_parser.py:209). \"N\u00e3o fazer default pra text\" marcaria TODA mensagem de texto como\n   'unknown' -> `lib/auto_response/inbound_text_filter.py:51` faz whitelist EXATA de type='text' -> zero drafts.\n\nDESENHO: reconhecer o bal\u00e3o de \u00e1udio/documento/imagem/vCard por ESTRUTURA (resource-id / content-desc),\nadicionando-os \u00e0 varredura do `_parse_messages_from_xml`. N\u00c3O tocar no default 'text'.\n\u26a0\ufe0f PRIOR ART OBRIGAT\u00d3RIO: daemons/targeted_chat_repull.py:55-70 documenta que `_sweep_media_subtype",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/oracle/wa-49br3-failsafe merged to whatsapp_automation/main (sha=49790f3911cf6770f5d07c485504b888d4694a45, gate_run=ga-wisp-343cde). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-18T16:23:28Z",
+  "issue_type": "bug",
+  "priority": 0,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'wa-worker-2' at 2026-07-17T01:47:34Z (tier=bug/tech-debt, lane=small, rig=whatsapp_automation).\nSling task bead: wa-49br3\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-17T01:48:10Z"
+   },
+   {
+    "author": "wa-worker-adhoc-cc12136521",
+    "text": "RESPOSTA \u00e0 pergunta \"o que faz uma linha de \u00e1udio virar draft? hoje: nada\":\n\nConfirmado: transcription_daemon.py exige media_url (linha 73-74), e o sweep NUNCA\nescreve media_url \u2014 correto, esse caminho est\u00e1 fechado pra sempre pra linhas do sweep.\n\nMAS existe um SEGUNDO mecanismo, j\u00e1 ATIVO em produ\u00e7\u00e3o, que n\u00e3o passa por media_url:\nlib/inbound_voice_transcriber.py + daemons/inbound_voice_transcriber_daemon.py.\nEle ANCORA por timestamp (n\u00e3o por media_url): lista os .opus reais no device\n(inbound_media_anchor.py) e casa pela proximidade mtime-do-arquivo vs.\ntimestamp-da-linha (toler\u00e2ncia 120s). find_pending_placeholders() \u00e9 AGN\u00d3STICO a\ncapture_source \u2014 n\u00e3o filtra se a linha veio de notifica\u00e7\u00e3o ou de sweep.\n\nConfirmado ATIVO: shared/config/chip_features.json \u2192\ninbound_voice_transcription.enabled=true (desde 2026-06-24), poll a cada 90s,\nlookback 48h, tolerance_s=120.\n\nOu seja: o sweep s\u00f3 precisa (a) marcar type='audio' com timestamp preciso \u2014 reusando\n_nearest_ts/screen_ts_to_str, os MESMOS helpers j\u00e1 usados pelos outros 4 tipos de\ncard, precisos a ~1min, folgados dentro da toler\u00e2ncia de 120s \u2014 e (b) escrever um\nmessage_text que lib.inbound_voice_transcriber._is_placeholder() reconhe\u00e7a ",
+    "created_at": "2026-07-17T02:12:40Z"
+   },
+   {
+    "author": "automation",
+    "text": "grw FIX4: cleared STALE gate:reviewing (marker ga-wisp-crugxf sat QUEUED 17m while source carried gate:reviewing \u2014 a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved).",
+    "created_at": "2026-07-17T02:35:26Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-89enh",
+  "store": "WA",
+  "title": "[feature] Preg\u00e3o \u00b7 modo TRIAR \u2014 implementar em produ\u00e7\u00e3o (desktop + mobile, mockups aprovados)",
+  "description": "IMPLEMENTAR O MODO TRIAR DO PREG\u00c3O. Mockups APROVADOS pelo Athos em 18/07 (desktop e mobile).\nEscopo pai: wa-ku5j1 (leia os coment\u00e1rios dele \u2014 t\u00eam 6 rodadas de decis\u00e3o travada).\nESTE BEAD \u00c9 S\u00d3 O TRIAR. O modo Responder est\u00e1 em desenho e N\u00c3O entra aqui.\n\n== MOCKUPS APROVADOS (abra os dois antes de codar) ==\ndesktop: s3://whatsapp-viewer-549710416969/mockups/pregao-triar.html\nmobile:  s3://whatsapp-viewer-549710416969/mockups/pregao-triar-mobile.html\n(presign: aws s3 presign s3://.../mockups/<arquivo> --expires-in 3600)\nO HTML \u00c9 A SPEC VISUAL. Reproduza layout, cores, espa\u00e7amentos. N\u00e3o reinterprete.\n\n== O QUE \u00c9 ==\nUma vis\u00e3o NOVA, separada do Conversation Viewer (que continua existindo como reposit\u00f3rio).\nObjetivo: operador focado em UMA conversa por vez, confirmando/corrigindo a classifica\u00e7\u00e3o e a\ninten\u00e7\u00e3o que a IA deu, com ritmo e motiva\u00e7\u00e3o vis\u00edveis. Meta = inbox zero.\nAthos preferiu ROTA SEPARADA (link pelo admin), sugeriu SUBDOM\u00cdNIO do conversation viewer pra\nn\u00e3o criar dom\u00ednio novo. Confirme a rota com ele ou com a mila antes de fixar.\n\n== FILA E ORDENA\u00c7\u00c3O (travado pelo Athos \u2014 n\u00e3o improvise) ==\nUniverso = conversas aguardando confirma\u00e7\u00e3o de classifica\u00e7\u00e3o (cls_confirmed=0).\nSort, nesta ordem exata:\n  1) CLASSIFICA\u00c7\u00c3O (a que a IA deu), nesta hierarquia:\n     Propriet\u00e1rio > Procurador/Decisor > Herdeiro/Futuro herdeiro > Parente/Conhecido >\n     N\u00e3o identificado > Ex-propriet\u00e1rio > Sem rela\u00e7\u00e3o com im\u00f3vel\n  2) INTEN\u00c7\u00c3O, nesta hierarquia:\n     Aberto a Proposta > Contrato Assinado",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/whatsapp_automation-claude-headless-1/wa-89enh merged to whatsapp_automation/main (sha=bd822bf0e3368c039aef4711874daf2de65386f1, gate_run=ga-wisp-8imxzo). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-19T12:47:30Z",
+  "issue_type": "feature",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "GATE-FEEDBACK (gate_run=ga-wisp-ug5wvi branch=crew/whatsapp_automation-claude-headless-1/wa-89enh): quality gate FAILED. Fix THESE specific blocking issues, then run /gate-done to re-gate.\n\nReviewer 1 FAIL: VERDICT: FAIL\nBlocking issue 1 (root-class:error-vs-empty): daemons/static/pregao.js's loadTree() collapses three distinct states into one identical UI via renderNoTree() \u2014 (a) item.owner_cpf missing, (b) the GET /api/lot-phones/<cpf> fetch failing (including the explicit 502 that pregao_lot_phones_proxy in daemons/routes/pregao.py returns when its proxied call to demand_dashboard:8095 errors or exceeds its 5s timeout), and (c) a successful fetch that legitimately returns zero familiares. All three render the exact same 'Sem \u00e1rvore geneal\u00f3gica dispon\u00edvel' / '0 v\u00ednculos' / 'sem v\u00ednculos' with nothing distinguishing them. The signal already exists on the wire (HTTP 200 vs 502) but is discarded by api()'s blanket `throw new Error('HTTP '+r.status)` and loadTree's catch-all `catch (e) { renderNoTree(); }`. Per the module's own docstring, this tree exists specifically to surface 'quem procuramos' (the target property owner) among relatives for outreach triage \u2014 so a transient fetch f",
+    "created_at": "2026-07-18T20:26:56Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Gate FAILED (attempt 1/3) \u2014 labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) and builder assignee cleared. The Pilot will re-dispatch a builder with the GATE-FEEDBACK above.",
+    "created_at": "2026-07-18T20:26:59Z"
+   },
+   {
+    "author": "automation",
+    "text": "grw FIX4: cleared STALE gate:reviewing (marker ga-wisp-yj5u3s sat QUEUED 17m while source carried gate:reviewing \u2014 a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved).",
+    "created_at": "2026-07-18T21:01:02Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-5gsv9",
+  "store": "HQ",
+  "title": "build story ga-0x4tv: [ga-05604 child] Triar a divida erro-vs-vazio real do silent-ignorance (~114764 achados pos-scanner-",
+  "description": "",
+  "close_reason": "Orphan sling-task cleanup (sling-task-janitor): ctx:thin dispatch stub for 'ga-0x4tv' whose parent is NOT in active build and which has no live assignee. Stale orphan polluting Triagem \u2014 closed. The parent's own state drives any future dispatch; this stub is not needed.",
+  "closed_at": "2026-07-20T01:59:09Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "automation",
+    "text": "Context-check: marcado ctx:thin \u2014 falta contexto para um agente gen\u00e9rico construir sem um humano.\n  \u2022 O QU\u00ca: descri\u00e7\u00e3o vazia ou quase vazia (0 chars). Diga o que precisa ser feito e por qu\u00ea.\nQuando estiver completo, remova o label ctx:thin para re-avalia\u00e7\u00e3o.",
+    "created_at": "2026-07-20T00:54:55Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-2till",
+  "store": "HQ",
+  "title": "fix bug ga-a8t68: bug: inflight-reclaim-guard falsely resets a live dog session's in-progress claim, causing duplicate",
+  "description": "",
+  "close_reason": "Duplicate dispatch (3rd occurrence): ga-a8t68's root cause (order:orphan-sweep, go:embed'd/runtime-materialized engine order) is already fixed and submitted under ga-kq4jf/ga-seuh4 \u2014 branch fix/ga-seuh4-orphan-sweep-selfheal, gate marker ga-wisp-vum4im, gate-status:queued (pending merge, confirmed not yet on main). Standing down without re-implementation to avoid a second conflicting edit to inflight-reclaim-guard.py's heal_orphan_sweep_false_resets(). Full evidence trail in comment on ga-a8t68. ga-a8t68 itself left open pending that gate merge landing.",
+  "closed_at": "2026-07-17T23:46:52Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": []
+ },
+ {
+  "id": "ga-i5s5",
+  "store": "HQ",
+  "title": "quality-gate-dispatcher: 2 more low-severity error/empty conflation instances (post-ga-s07s)",
+  "description": "While closing ga-art5's remaining verdict-status sites (ga-s07s), found 2 more\ninstances of the same textual idiom (bd show ... | jq '.status // \"...\"' with\n|| true/echo masking) in quality-gate-dispatcher.sh. Deliberately left OUT of\nga-s07s's scope \u2014 different variable class than \"verdict bead status\", lower\nblast radius, and ga-art5's own acceptance criteria are specifically scoped to\nverdict beads. Filing so they don't get lost (not urgent \u2014 no known live\nincident from either).\n\n1. Already-merged source-bead cleanup (Step 4b, \"already-merged detection\"\n   region \u2014 search for `BD_STATUS=$(bd -C \"$BEAD_CITY\" show \"$BEAD_ID\"`).\n   A bd-show failure here makes BD_STATUS=\"\" (not \"closed\"), so the\n   already-merged supersede cascade re-runs on a bead that may already be\n   closed: redundant label add, redundant comment, redundant close attempt\n   (the close call already has a `|| warn ... non-fatal` fallback). Consequence\n   is idempotency noise (duplicate bead-history comments), NOT a false claim\n   about reality \u2014 the \"already merged\" fact this cascade asserts is\n   established independently by the earlier git merge-base/patch-id check\n   (ALREADY_MERGED=1), not by this read. Lower severity than anything ga-s07s\n   fixed.\n\n2. Phase C's PC_SID capture (the loop reading each verdict bead's `.assignee`\n   into SESSION_IDS[], right before gate_collect_verdicts is called) uses the\n   same `|| echo \"\"` masking. If THIS read fails for a VB whose own status\n   read (a separate, later",
+  "close_reason": "Quality gate PASSED \u2014 branch fix/ga-i5s5-error-empty-conflation merged to gascity/main (sha=84e2bf1cc4329d42ef69d97d790bafaf71e1eaa4, gate_run=ga-wisp-681g3l). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-20T02:21:30Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-17T07:42:26Z (tier=feature, lane=small, rig=gascity).\nSling task bead: ga-7d7h\nBuilder doctrine: implement \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 story:done.\nNo human review required.",
+    "created_at": "2026-07-17T07:42:35Z"
+   },
+   {
+    "author": "automation",
+    "text": "inflight-reclaim-guard (ga-se62o): reclaimed \u2014 no live builder and no recent branch progress for 32min (> 25min TTL). story:in-flight + pilot:dispatched cleared; assignee unset; status reset to open (ga-vw26y). Pilot will re-dispatch. (reclaim 1/3)",
+    "created_at": "2026-07-17T08:17:58Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-18T01:11:29Z (tier=feature, lane=small, rig=gascity).\nSling task bead: ga-svwi6\nBuilder doctrine: implement \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 story:done.\nNo human review required.",
+    "created_at": "2026-07-18T01:11:38Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-op78f",
+  "store": "HQ",
+  "title": "fix bug ga-7l89: [bug] sling-task bead assignee/status silently reset mid-session, no audit-trail comment (found on g",
+  "description": "",
+  "close_reason": "ga-7l89 root-caused and closed as duplicate of ga-a8t68 (order:orphan-sweep transient reset) \u2014 fix already in flight (2f391e6d + 349f469f, gate-queued, not yet merged). Not re-implementing per established duplicate-dispatch-standdown precedent for this exact bug family. Also filed ga-ahnxx for a separate tooling gap (bd history timeout) surfaced during investigation. Full writeup on ga-7l89's closing comment and ga-a8t68's cross-link comment.",
+  "closed_at": "2026-07-18T03:01:10Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": []
+ },
+ {
+  "id": "ga-7lz1",
+  "store": "HQ",
+  "title": "gate Phase C: reviewer que ENTREGA verdict (label+comment) mas DRENA antes de fechar o bead trava o run at\u00e9 timeout",
+  "description": "Variante do race stale_async_start, DISTINTA do fix bd-list-exclui-closed (19447308). Observado 15/07 no wa-frhi5: o reviewer completou a review, adicionou label verdict:FAIL e escreveu o coment\u00e1rio 'VERDICT: FAIL + blocking issue' (trabalho REAL e completo), mas DRENOU antes de fechar o verdict bead (ga-bq7l ficou status=open, assignee vazio). O Phase C (gate_collect_verdicts) s\u00f3 conta bead CLOSED \u2192 contou 0/1 \u2192 run preso 'still in flight' por 17min, iria at\u00e9 o timeout de 30min e re-erroraria. Mayor destravou fechando ga-bq7l \u00e0 m\u00e3o.\n\nFIX (dispatcher bash, quality-gate-dispatcher.sh gate_collect_verdicts / Phase C): contar um verdict bead como ENTREGUE quando est\u00e1 OPEN mas tem label verdict:PASS/verdict:FAIL E o reviewer (assignee) est\u00e1 morto/drenado \u2014 em vez de exigir status=closed. Guard: s\u00f3 se o reviewer N\u00c3O est\u00e1 mais vivo (sen\u00e3o pode estar no meio de escrever). Alternativa/complemento: o dispatcher FECHA o bead ele mesmo ao detectar label-de-verdict + reviewer-morto. Mutation-test (ga-p5q3). \u00c9 fix de bash (HQ asset), mais leve que a engine-window ga-n9bw \u2014 mas ambos s\u00e3o o MESMO race; a engine-window reduz a FREQU\u00caNCIA (reviewers n\u00e3o drenam), este handling torna o gate ROBUSTO quando drenam mesmo assim. Complementares.",
+  "close_reason": "Quality gate PASSED \u2014 branch fix/ga-7lz1-drained-reviewer-verdict merged to gascity/main (sha=06bcfb293dc5953175dd96dba5cdc0bed1f64cfb, gate_run=ga-wisp-7kjhu1). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-16T05:18:04Z",
+  "issue_type": "bug",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-16T04:28:18Z (tier=bug/tech-debt, lane=small, rig=gascity).\nSling task bead: ga-kkyr\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-16T04:28:25Z"
+   },
+   {
+    "author": "dog-gak3im",
+    "text": "Fix implemented and submitted to gate (dog/gastown.dog-1, sling bead ga-kkyr).\n\nBranch: fix/ga-7lz1-drained-reviewer-verdict (commit 540e2543), pushed to origin.\n\ngate_collect_verdicts() now rescues an OPEN verdict bead that already carries\nverdict:PASS/verdict:FAIL once its reviewer session is CONFIRMED drained via\n`gc session peek` (not `gc session list`, which reads a drained-but-listed\nsession as ALIVE \u2014 ga-h9o17/gt-bewtm discriminator). Guard: never rescues\nwhile the reviewer might still be mid-write. Dispatcher also closes the\nrescued bead itself so \"closed == delivered\" stays true everywhere else.\n\nNew selftest gate-verdict-drained-reviewer-rescue.selftest.sh extracts the\nreal functions verbatim, covers rescue-PASS/rescue-FAIL/still-alive-guard/\nno-label-scope-guard/already-closed-regression (11/11 assertions), includes\na mutation test proving non-vacuousness. Full existing gate selftest suite\n(67 files) shows no regressions.\n\nThis bead stays open until the gate merges the fix (per doctrine \u2014 closes\nvia autonomous dispatcher on PASS, same as ga-p5q3's precedent).",
+    "created_at": "2026-07-16T04:49:24Z"
+   },
+   {
+    "author": "automation",
+    "text": "grw FIX4: cleared STALE gate:reviewing (marker ga-wisp-40ku63 sat QUEUED 15m while source carried gate:reviewing \u2014 a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved).",
+    "created_at": "2026-07-16T05:07:17Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-k9ecr",
+  "store": "HQ",
+  "title": "fix bug ga-7r884: beads repo: --label-regex still dead code after ga-hqchm fix; standalone bd ready missing --label-pa",
+  "description": "",
+  "close_reason": "Duplicate dispatch of ga-7r884 (2nd sling; dog-gaps5iv reached the same conclusion at 06:35Z but its session died/recycled before actually closing this bead, leaving it dangling as open/unassigned until this incarnation of the same pool slot picked it back up). Fresh re-verification via 'gh pr view 4884 --repo gastownhall/beads' at 06:39Z: state=OPEN, mergedAt=null, closedAt=null. PR #4884 (branch fix/ga-7r884-label-regex-and-ready-flags, commit f01dedf69) already covers both items in ga-7r884's description (LabelRegex dead-filter fix + --label-regex registration on standalone 'bd ready') and ",
+  "closed_at": "2026-07-18T06:39:13Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": []
+ },
+ {
+  "id": "ga-1bp0m",
+  "store": "HQ",
+  "title": "fix bug ga-pkvfc: gate-done branch regex truncates dotted sub-bead IDs (ps-XXXX.N \u2192 ps-XXXX epic) \u2014 silent wrong-sourc",
+  "description": "",
+  "close_reason": "Implemented + submitted to gate: fix/ga-pkvfc-gate-done-dotted-subbead-regex (982830c1), marker ga-wisp-m7pzj6. Fixed the crew/*/* regex to capture optional dotted sub-bead suffix (ps-8iuu.4) and hardened existence-check into identity-check. 72/72 selftest assertions pass, go build verified. Story bead ga-pkvfc stays open until gate merges \u2014 see traceability comment there.",
+  "closed_at": "2026-07-18T04:33:25Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": []
+ },
+ {
+  "id": "ga-huke4",
+  "store": "HQ",
+  "title": "gate-recovery-watchdog: orphan-marker query ignores bd status, flags closed/withdrawn markers as live orphans",
+  "description": "gate-recovery-watchdog.py's orphan-marker detector queries by label only,\nnot by status, so a marker that was closed (withdrawn/superseded) without\nits gate-status:queued label being stripped gets flagged as a live orphan\n16+ hours later \u2014 generating a spurious Dog repair task against a chain\nthat already resolved itself cleanly.\n\nROOT CAUSE (confirmed, file:line):\nscripts/gate-recovery-watchdog.py:326-330 \u2014 the candidate query:\n\n    r = sh([\"bd\", \"-C\", CITY, \"list\", \"--all\", \"-l\", \"type:quality-gate-marker\",\n            \"-l\", \"gate-status:queued\", \"--json\"], timeout=25)\n\nuses --all (bd's \"include closed issues\" flag) combined ONLY with label\nfilters. Downstream in _detect_orphan_markers() (lines 371-419) there is\nno status check anywhere \u2014 grep for \"status\" in the file only hits the\nunrelated call that sets status on the NEW repair bead it creates\n(~line 833). So a CLOSED bead carrying a stale gate-status:queued label\nis indistinguishable, to this query, from a genuinely stuck open one.\n\nLIVE REPRODUCTION (2026-06-30, via ga-o3feo / diag\n/tmp/gate-watchdog-diag-20260630-163619.txt):\n  - Marker ga-wisp-ciyvn0j (branch crew/whatsapp_automation-claude-5/wa-0hnsi)\n    was closed at 2026-06-30T00:48:57Z, notes=\"WITHDRAWN as duplicate...\n    Withdrawing this competing marker to avoid a double-merge to main.\n    Deferring to claude-1's gate.\" \u2014 a deliberate, correct withdrawal\n    during a legitimate dedup race (source bead wa-0hnsi got re-routed to\n    claude-5 while claude-1's ga",
+  "close_reason": "Quality gate PASSED \u2014 branch fix/ga-huke4-orphan-marker-status-filter merged to gascity/main (sha=fd2bc823435000f296ebf34d9f5c75d3d3afe76e, gate_run=ga-wisp-f7d3gq). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-16T21:48:53Z",
+  "issue_type": "bug",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "gastown__mayor",
+    "text": "MAYOR (18:2X, revis\u00e3o de TRAVADAS): DESTRAVADO. Estava DEFERRED + story:blocked desde 01/jul (16 dias) com ZERO coment\u00e1rios \u2014 parqueado em sil\u00eancio, sem ningu\u00e9m dizer por qu\u00ea. Al\u00e9m disso carregava 1 pilot:held-until:1782873652 EXPIRADO h\u00e1 15.8 dias (res\u00edduo que o mantinha na coluna Travadas do painel, que casa pilot:held-until:* por variante).\n\nVERIFIQUEI A PERTIN\u00caNCIA antes de destravar (n\u00e3o confiei na descri\u00e7\u00e3o de 16 dias atr\u00e1s): o bug est\u00e1 VIVO no c\u00f3digo de hoje \u2014 scripts/gate-recovery-watchdog.py:491-492 ainda faz 'bd list --all -l type:quality-gate-marker -l gate-status:queued' (--all INCLUI closed) e a fun\u00e7\u00e3o faz append de toda linha SEM checar status. Ou seja, um marker CLOSED com label gate-status:queued residual continua sendo flagrado como orphan vivo \u2192 gera repair task esp\u00faria contra cadeia j\u00e1 resolvida. As linhas mudaram (326\u2192491), mas o bug n\u00e3o.\n\nCLASSE: \u00e9 a fam\u00edlia [[error-and-empty-must-not-produce-the-same-value]] aplicada a closed-vs-open \u2014 exatamente o inverso do bug que consertei HOJE no Phase C (l\u00e1 o --all FALTAVA e sumia verdict entregue; aqui o --all SOBRA e ressuscita marker morto). Os dois v\u00eam de n\u00e3o distinguir estado terminal de estado vivo.\n\nFIX: filtrar s",
+    "created_at": "2026-07-16T21:26:54Z"
+   },
+   {
+    "author": "dog-gan2tr",
+    "text": "Fix submitted via gate: branch fix/ga-huke4-orphan-marker-status-filter, marker ga-wisp-n6d4e9.\n\nVerified before implementing (per codebase's own \"verify deliberate design\" discipline):\ngit log -S on the `--all` flag (commit 4a77d8cf, the detector's original design) shows no\nreasoning about excluding closed markers \u2014 the selftest (mk() helper, all 9 scenarios) never\ncarries a status field at all. Confirmed not deliberate.\n\nLive confirmation the bug is CURRENTLY manifesting: all 3 markers presently carrying\ntype:quality-gate-marker + gate-status:queued (ga-5imk, ga-hlbm, ga-ocmt) are status=closed \u2014\nexactly the ga-huke4 pattern, not hypothetical.\n\nFix: _queued_markers() now filters at both the query (--status open,in_progress, kept --all\nsince it's independently required to surface the normally-hidden gate-marker type \u2014 verified\nlive that --all alone yields 3 rows, --include-gates alone also reveals the type, and\n--status open,in_progress narrows correctly to the genuinely-open marker) and parse\n(row.get(\"status\") not in (open,in_progress) \u2192 skip) layers. Added Scenario 9b to\ngate-recovery-watchdog.selftest.sh mirroring the file's existing _fake_sh mocking convention.//\nVerification",
+    "created_at": "2026-07-16T21:37:39Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch fix/ga-huke4-orphan-marker-status-filter merged to gascity/main (sha=fd2bc823435000f296ebf34d9f5c75d3d3afe76e) via autonomous dispatcher (gate_run=ga-wisp-f7d3gq).",
+    "created_at": "2026-07-16T21:48:51Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-cjvo",
+  "store": "HQ",
+  "title": "fix bug ga-nvef: daemon-presence-watchdog: imp05 FAILING threshold and imp17 crash-loop autoheal collide on the same ",
+  "description": "",
+  "close_reason": "Implemented + submitted to gate. Fixed the story bead ga-nvef (imp05/imp17 mail\ncollision in daemon-presence-watchdog.sh) \u2014 decided option (b) from ga-nvef's\nINVESTIGAR/DECIDIR: imp05 keeps counting/logging unconditionally, but excludes a\nlabel from $failing (and its mail) while imp17 has a within-budget silent heal\nin flight for that same label this sweep. Also fixed selftest scenario 4, which\nwas passing only via this same collision, and extended scenario 20 to prove the\nsuppression is scoped not permanent.\n\nbranch: fix/ga-nvef-imp05-imp17-collision\ncommit: 2a17921c\nmarker: ga-wisp-varyie\nse",
+  "closed_at": "2026-07-16T22:34:59Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "automation",
+    "text": "Context-check: marcado ctx:thin \u2014 falta contexto para um agente gen\u00e9rico construir sem um humano.\n  \u2022 O QU\u00ca: descri\u00e7\u00e3o vazia ou quase vazia (0 chars). Diga o que precisa ser feito e por qu\u00ea.\nQuando estiver completo, remova o label ctx:thin para re-avalia\u00e7\u00e3o.",
+    "created_at": "2026-07-16T21:57:23Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-omn8h",
+  "store": "HQ",
+  "title": "fix bug ga-hqchm: gc bd list --label-pattern silently ignores non-matching pattern, returns unfiltered results instead",
+  "description": "",
+  "close_reason": "Implemented + submitted upstream (PR https://github.com/gastownhall/beads/pull/4882\nagainst gastownhall/beads main, from fork athosmartins/beads branch\nfix/ga-hqchm-label-pattern-glob, commits 766f886fb + 1eb851dd7).\n\nctx:thin on this sling bead was a mechanical false-positive (empty own\ndescription by design \u2014 title cites the real content on the story bead\nga-hqchm, which was fully specified). Verified per\nctxthin-false-positive-sling-bead-references-story memory before proceeding.\n\nbeads is not a gc rig (bd-binary-separate-from-gascity-engine), so this used\nfork+PR, not /gate-done \u2014 no gate ",
+  "closed_at": "2026-07-18T04:06:49Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "automation",
+    "text": "Context-check: marcado ctx:thin \u2014 falta contexto para um agente gen\u00e9rico construir sem um humano.\n  \u2022 O QU\u00ca: descri\u00e7\u00e3o vazia ou quase vazia (0 chars). Diga o que precisa ser feito e por qu\u00ea.\nQuando estiver completo, remova o label ctx:thin para re-avalia\u00e7\u00e3o.",
+    "created_at": "2026-07-18T03:14:51Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-5t5w",
+  "store": "HQ",
+  "title": "RAIZ: gate-recovery-watchdog mata runs aos 15/18min contra os 50min que o dispatcher concede \u2014 a rede de seguranca mais apertada que o mecanismo que ela protege. Descartou 11 vereditos COMPLETOS hoje (4 escalados p/ humano). 60% da capacidade do gate em loop",
+  "description": "A RAIZ DA NOITE. 60% DA CAPACIDADE DO GATE QUEIMA EM LOOP, E O CULPADO NAO E O GATE \u2014 e o gate-recovery-watchdog.py, a rede de seguranca que existe pra proteger o gate.\n\nO TEOREMA: UMA REDE DE SEGURANCA CALIBRADA MAIS APERTADA QUE O MECANISMO QUE ELA PROTEGE NAO PEGA FALHAS \u2014 ELA AS CAUSA.\n  dispatcher da ao reviewer : 50 min (VERDICT_TIMEOUT_MAX_MINUTES, quality-gate-dispatcher.sh:81; o log confirma \"271s/3000s\")\n  guard mata em             : 55 min (GATE_ZOMBIE_AGE_MINUTES, quality-gate-guard.sh:47)\n  watchdog mata em          : **18 min** (REVIEW_HANG_MINUTES, gate-recovery-watchdog.py:127) e **15 min** (STRANDED_RUN_MINUTES, :171)\nTres daemons independentes impoem TRES prazos diferentes ao MESMO run, e o mais apertado \u2014 o watchdog, que e o de RECUPERACAO \u2014 vence sempre. Um mecanismo de recuperacao tem que disparar DEPOIS que o primario desiste, nunca antes. Aqui ele dispara 32 minutos antes.\n\nA TENAZ DE DUAS GARRAS (nao ha janela em que um review de 15-20min possa ser contado):\n  GARRA A \u2014 reap_hung_run (:1799, cond :1598-1620): age > 18min AND >=1 verdict bead AND 0 delivered AND reviewer dead/idle em 2 amostras => supersede+close do run, e :1833 set_gate_status(marker,\"queued\") => REQUEUE.\n    Se o reviewer ATRASA, o run morre e o veredito dele cai num run morto.\n  GARRA B \u2014 recover_stranded_run / FIX5 (:1935, cond :1852-1870): age >= 15min AND total>=1 AND **delivered == total** => supersede + requeue (:1994).\n    Se o reviewer chega NO PRAZO, mas o run passou de 15min",
+  "close_reason": "Quality gate PASSED \u2014 branch fix/ga-5t5w-grw-stranded-verdict-anchor merged to gascity/main (sha=d78dc58cd3872f45cb1ca916f34acf88afd823ae, gate_run=ga-wisp-9e4lcn). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-17T10:48:48Z",
+  "issue_type": "bug",
+  "priority": 0,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-17T09:03:59Z (tier=bug/tech-debt, lane=small, rig=gascity).\nSling task bead: ga-ieo7\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-17T09:04:08Z"
+   },
+   {
+    "author": "gastown__mayor",
+    "text": "AS 3 PROPOSTAS DO thies-wa, ACEITAS \u2014 e a (3) e o melhor resultado desta noite inteira.\n\nCONTEXTO: quatro agentes (mayor, mila-wa, thies-wa, e um gate-reviewer efemero) passaram uma madrugada escrevendo a defesa contra a classe ga-p5q3 e CAINDO NELA enquanto escreviam (thies 3x, mila 6x, mayor 7x). Nenhum foi salvo por CONHECER a doutrina. O argumento dele: \"regra escrita nao sobrevive \u2014 vira mecanismo ou vira arqueologia\". A prova que ele oferece contra si mesmo: o scanner que ELE escreveu em 14/07 nomeava a classe, estava pronto e mergeado, e a city redescobriu tudo do zero 2 dias depois porque ninguem agendou.\n\n(1) O RESET LIMPA POR PADRAO, NAO POR ENUMERACAO.\n    Hoje o ritual e \"remove needs-rebase, poe ready\" \u2014 uma LISTA. Lista e enumeracao, e enumeracao falha exatamente quando nasce um contador NOVO. Foi isso 3x numa noite: gate:fix-attempt (mila/ga-26df), gate:rebase-attempt (ga-gpcx), grw-stranded + grw-requeue (ga-5t5w). Tres subsistemas, tres vezes o mesmo furo, porque cada autor adicionou o SEU contador e ninguem atualizou a lista dos outros \u2014 nem sabia que as outras listas existiam.\n    Fix: o reset varre por REGEX \u2014 `^(gate|grw)[:-].*-?attempt:\\d+$` e `^grw-(stranded|",
+    "created_at": "2026-07-17T09:55:19Z"
+   },
+   {
+    "author": "dog-gal18y",
+    "text": "Fix (a) implemented and submitted to gate \u2014 anchored FIX5's stranded-run recovery on time since the LAST VERDICT was DELIVERED instead of time since run creation (the root cause identified in this bead's description: \"a variavel que a regra MEDE nao e a variavel que a regra QUER\").\n\nChanges (scripts/gate-recovery-watchdog.py):\n- _run_verdicts() now also returns last_delivered_epoch (newest `updated_at` among CLOSED verdict beads for a run), None if unparseable/none delivered.\n- reap_stranded_verdict_runs() (FIX5) computes age from that value instead of the run's started_at; started_at is no longer read by this function.\n- stranded_verdict_verdict() gained skip:verdict-time-unknown (fail-safe when delivered==total but no delivery time parsed) and now checks delivered/total before age.\n- STRANDED_RUN_MINUTES default lowered 15\u21925 (small N per your own analysis \u2014 dispatcher Phase C reconciles every ~2-5min). This constant now means \"minutes since last verdict\", not \"minutes since run created\".\n- reap_hung_runs (FIX1/GARRA A) untouched beyond a mechanical 4-tuple unpack \u2014 its liveness-sampling false-positive (item c) is a separate problem, not addressed here.\n\nOPERATIONAL NOTE: this cit",
+    "created_at": "2026-07-17T09:56:40Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-kds8",
+  "store": "HQ",
+  "title": "fix bug ga-clgh: bd show --json devolve comment_count SEM comments: anuncia que existe informacao e nega o acesso \u2014 3",
+  "description": "",
+  "close_reason": "Duplicate re-dispatch of already-completed work (fix by dog-gauslm 09:12Z, PR #4865 open pending human review). Root cause of redispatch loop tracked separately in ga-j0f6.",
+  "closed_at": "2026-07-17T10:12:18Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "automation",
+    "text": "Context-check: marcado ctx:thin \u2014 falta contexto para um agente gen\u00e9rico construir sem um humano.\n  \u2022 O QU\u00ca: descri\u00e7\u00e3o vazia ou quase vazia (0 chars). Diga o que precisa ser feito e por qu\u00ea.\nQuando estiver completo, remova o label ctx:thin para re-avalia\u00e7\u00e3o.",
+    "created_at": "2026-07-17T09:31:56Z"
+   },
+   {
+    "author": "dog-gafarz",
+    "text": "Verified before doing anything: this is the 3rd redundant re-dispatch of already-completed work.\n\n- ga-clgh's fix was implemented and submitted by dog-gauslm at 09:12:03Z (option (b): comments_omitted flag \u2014 verified deliberate, per the design commit e538f2881/TestJSONContract_ShowOmitsOptInPayloadsByDefault that forecloses option (a)).\n- PR still open, not merged: https://github.com/gastownhall/beads/pull/4865 (confirmed via `gh pr view`, state=OPEN, mergedAt=null, updated 09:10:13Z).\n- Root cause of the redispatch loop is already filed and detailed: ga-j0f6 (\"Pilot dispatch doctrine wrongly claims 'autonomous gate, no human review' for beads-repo bug fixes\") \u2014 beads is not a registered gc rig, so gate-done can never resolve/deliver this class of fix, and inflight-reclaim-guard keeps reclaiming ga-clgh every ~60-90min because it sees no local branch progress (the real progress is an external PR).\n\nNo new dog-actionable work. Not re-implementing anything. Closing this sling/task bead per [[gate-refix-sling-bead-closes-story-bead-stays-open]] \u2014 ga-clgh (the story bead) stays open until PR #4865 actually merges.",
+    "created_at": "2026-07-17T10:12:13Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-ffze4",
+  "store": "HQ",
+  "title": "fix bug ga-y43lq: [bug] gate circuit-break (branch-ausente+uncommitted, site ga-tgwq) notifica so o Mayor, nao o AUTOR",
+  "description": "",
+  "close_reason": "Implemented + submitted to gate. Branch fix/ga-y43lq-gate-circuit-break-author-mail\n(commit 7b3801c43), marker ga-wisp-t02zci. Added author-mail to the ga-tgwq\nno_branch/escalate circuit-break site in quality-gate-dispatcher.sh, mirroring\nthe ga-u4yi convention used at the other 5 gate:needs-human sites. Bumped the\ntwo selftest copies of the \"N sites\" magic-number drift-guard 5\u21926. 84 selftests\nrun, all green (quality-gate-circuit-break 38/38, gate-selfheal 39/39,\ngate-needs-human-divergence-sweep 45/45, +43 others touching the dispatcher).\nStory bead ga-y43lq stays OPEN \u2014 closes only when the ",
+  "closed_at": "2026-07-19T22:41:52Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": []
+ },
+ {
+  "id": "ga-6plfv",
+  "store": "HQ",
+  "title": "lifecycle-janitor R4 religado 17/07 SEM o liveness check que era pre-condicao \u2014 desassocia assignee em ~6min e torna FILA de crew inexpressavel (R5 stampou story:done em bead parkeada)",
+  "description": "Mayor 18/07 12:55 BRT. Verificado AO VIVO nesta sessao (o janitor desfez o meu\nproprio roteamento 6min depois de eu fazer).\n\nHISTORICO\nEm 2026-07-09 R4 e R5 foram desligados CIRURGICAMENTE (marcadores \"MAYOR-DISABLED\"\nem scripts/lifecycle-coherence-janitor.sh) por corromperem pipeline: R4 limpava\nassignee de builder VIVO (-> hook re-oferece -> build duplicado), R5 fechava bead\nnao-pronta como story:done. A condicao de RELIGAR era explicita e DUPLA:\n  (a) wa-muesb (o fix do proprio janitor) mergear, E\n  (b) R4/R5 ganharem um session-liveness check de verdade.\n\nO QUE ACONTECEU\nO script foi sobrescrito em 17/07 10:30 \u2014 `grep -c MAYOR-DISABLED` = 0, R4 e R5\nativos de novo. wa-muesb REALMENTE mergeou (status=closed story:done), entao (a)\nfoi cumprida. Mas (b) NAO: wa-muesb so corrigiu o match do label gate:needs-human\n(bare vs colon-suffixed). Li o bloco de R4 hoje (scripts/lifecycle-coherence-janitor.sh\n~L255-267): NAO ha nenhuma checagem de sessao viva. Religaram com metade da\npre-condicao satisfeita.\n\nEVIDENCIA AO VIVO\nHookei 5 beads em crews VIVAS as 15:33Z. R4 desassociou TODAS as 5 as 15:39-15:40Z:\n  [15:39:54Z] R4 ready-stale-assignee: wa-lxe76 \u2014 cleared phantom assignee\n  [15:39:55Z] R4 ready-stale-assignee: wa-78xxm \u2014 cleared phantom assignee\n  [15:39:55Z] R4 ready-stale-assignee: wa-fbwsb \u2014 cleared phantom assignee\n  (+ wa-91agg, wa-pltmi)\nSobreviveram exatamente as 2 que NAO tinham ctx:ready/story:approved (wa-e7ey9,\nwa-39ha2) \u2014 R4 so varre esses 2 labels. Confirma o me",
+  "close_reason": "Quality gate PASSED \u2014 branch fix/ga-6plfv-lifecycle-janitor-r4-liveness merged to gascity/main (sha=47ec391e90855629e72c24b7dbfcf19aa39d1e06, gate_run=ga-wisp-tf863g). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-18T19:03:47Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-18T15:56:42Z (tier=bug/tech-debt, lane=small, rig=gascity).\nSling task bead: ga-u8e55\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-18T15:56:52Z"
+   },
+   {
+    "author": "gastown__mayor",
+    "text": "Mayor 18/07 13:20 \u2014 TERCEIRA instancia do mesmo buraco de modelo, reportada pelo\nbatista-wa ao vivo (ele viu chegando e avisou ANTES de perder a bead).\n\nEstado nao-representavel #3: \"worker em voo, commitando LOCAL, sem push por design\".\nO branch-rail do inflight-reclaim-guard (scripts/inflight-reclaim-guard.py,\nfor-each-ref sobre 'refs/remotes/origin/') so enxerga refs de ORIGIN. Commit em\nworktree local e invisivel. Entao um despacho executado CORRETAMENTE \u2014 worker\ntrabalhando, manager segurando o push pra revisar antes de publicar \u2014 e\nindistinguivel de sessao morta.\n\nIsso fecha o padrao com os outros dois ja registrados aqui:\n  - bead ENFILEIRADA (atribuida, nao comecada): R4 tira em ~6min; com story:in-flight\n    o reclaim-guard tira em ~25min.\n  - bead EM CONSTRUCAO SEM PUSH: reclaim-guard nao ve progresso.\nA maquina so consegue representar trabalho que ja virou PUBLICO. Todo estado\nintermediario legitimo (na fila / em andamento local / em revisao antes de publicar)\ne lido como abandono.\n\nO incentivo perverso e o mais grave: a saida mais facil pro agente e pushar WIP\nnao-revisado so pra alimentar o detector \u2014 criando progresso FALSO no origin, que e\njustamente o sinal que todo",
+    "created_at": "2026-07-18T16:19:40Z"
+   },
+   {
+    "author": "automation",
+    "text": "grw FIX4: cleared STALE gate:reviewing (marker ga-wisp-oe94dd sat QUEUED 15m while source carried gate:reviewing \u2014 a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved).",
+    "created_at": "2026-07-18T16:47:26Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-fdlaz",
+  "store": "HQ",
+  "title": "fix bug ga-n7hu2: ga-jyox escreve no bead que MANTEVE assignee+story:in-flight no gate-FAIL, e story:in-flight NAO e m",
+  "description": "",
+  "close_reason": "Implemented + submitted to gate. Story bead ga-n7hu2 stays open until merge.\n\nBranch: fix/ga-n7hu2-gate-fail-keep-honest\nCommit: e663e1c8e\nMarker: ga-wisp-qu3sz2\nSelftests: quality-gate-fail-crew-keep.selftest.sh 27/27 pass; 44/45 of the other dispatcher-referencing selftests pass (1 pre-existing unrelated failure filed as ga-78lds).",
+  "closed_at": "2026-07-18T19:49:27Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": []
+ },
+ {
+  "id": "ga-t56la",
+  "store": "HQ",
+  "title": "fix bug ga-7rvyt: gc hook re-offers live in-flight gate-fail bead to routed-pool (ignores in-flight-owner guard)",
+  "description": "",
+  "close_reason": "Implemented + submitted to gate. Branch fix/ga-7rvyt-gate-fail-keep-clear-routed-to, commit 1ffb58c2, marker ga-wisp-i6h8wd. Story bead ga-7rvyt stays open until the gate merges. Full traceability comment posted on ga-7rvyt. Selftest quality-gate-fail-crew-keep.selftest.sh 27/27 (RED before fix, GREEN after); full 45-selftest sweep on quality-gate-dispatcher.sh dependents 43/45 (2 pre-existing failures unrelated to this change, verified against unmodified baseline).",
+  "closed_at": "2026-07-17T20:24:56Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "automation",
+    "text": "Context-check: marcado ctx:thin \u2014 falta contexto para um agente gen\u00e9rico construir sem um humano.\n  \u2022 O QU\u00ca: descri\u00e7\u00e3o vazia ou quase vazia (0 chars). Diga o que precisa ser feito e por qu\u00ea.\nQuando estiver completo, remova o label ctx:thin para re-avalia\u00e7\u00e3o.",
+    "created_at": "2026-07-17T20:17:44Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-9exi9",
+  "store": "HQ",
+  "title": "SPIKE: KG-RAG (safishamsi/Graphify-Labs + LightRAG) pode reduzir materialmente o gasto de tokens dos agentes? conclus\u00e3o + recomenda\u00e7\u00e3o",
+  "description": "PEDIDO (Athos, 2026-07-20): avaliar se o reposit\u00f3rio/corpo-de-trabalho de https://github.com/safishamsi pode nos ajudar de forma RELEVANTE \u2014 hip\u00f3tese dele: economizar MUITOS tokens. Fazer um SPIKE (time-boxed) pra chegar a uma conclus\u00e3o.\n\nCONTEXTO: safishamsi = Safi, CEO Graphify Labs, pesquisador de Knowledge Graphs. Corpo de trabalho = KG-RAG (Knowledge Graph + Retrieval-Augmented Generation): recuperar s\u00f3 o contexto relevante via grafo+embeddings(SBERT)+BM25 em vez de bulk-load. Repos: LightRAG (fork do HKUDS/LightRAG, 'Simple and Fast RAG', EMNLP2025), Knowledge-Graph-Based-Hybrid-RAG-System (Neo4j+LangChain+LangGraph+Claude-3.5, retrieval h\u00edbrido, 50% NDCG\u2191 57% bias\u2193), mycetoma-kg-rag, financial-kg-demo, penpax.ai.\n\nHIP\u00d3TESE DE ECONOMIA (a testar): agentes Gas City queimam tokens lendo em bloco o dado do Dolt (beads/mail/c\u00f3digo/hist\u00f3rico, 37k wisps) + arquivos. Uma camada KG-RAG sobre esse dado deixaria o agente RECUPERAR s\u00f3 o relevante (grafo+sem\u00e2ntica) em vez de carregar tudo \u2014 vers\u00e3o sistem\u00e1tica do 'Explore poupa 70-80%' j\u00e1 no CLAUDE.md.\n\nACEITA\u00c7\u00c3O (o spike entrega uma conclus\u00e3o escrita com):\n1. O QUE \u00e9 de fato reutiliz\u00e1vel \u2014 o(s) repo(s) do safishamsi s\u00e3o lib plug\u00e1vel ou demos de pesquisa domain-specific? O framework real (LightRAG/HKUDS) \u00e9 o que importa? distinguir 'a pessoa/repos' de 'a abordagem'.\n2. HIP\u00d3TESE DE TOKEN concreta pra Gas City \u2014 onde exatamente economizaria (discovery de c\u00f3digo? recall de beads/hist\u00f3rico? contexto de refino/gate?), estimativa de ordem",
+  "close_reason": "Spike conclu\u00eddo. Conclus\u00e3o: safishamsi=beco sem sa\u00edda (fork n\u00e3o-modificado + paper demos); intui\u00e7\u00e3o de token CERTA (recall de bead/hist\u00f3rico); mas o tool certo \u00e9 plain vector-RAG (n\u00e3o KG-RAG \u2014 nosso grafo j\u00e1 \u00e9 SQL no Dolt); recomenda\u00e7\u00e3o=prototipar vector-RAG sobre beads fechadas, medir vs bd-list+read. Detalhe no comment.",
+  "closed_at": "2026-07-20T16:11:18Z",
+  "issue_type": "task",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "gastown__mayor",
+    "text": "CONCLUS\u00c3O DO SPIKE (2026-07-20):\n\n1. REUTILIZ\u00c1VEL = LightRAG-o-framework (HKUDS/LightRAG, MIT, 38k stars, ativo) \u2014 N\u00c3O os repos do safishamsi. O LightRAG dele \u00e9 fork N\u00c3O-modificado (0 commits \u00e0 frente, 2967 atr\u00e1s); os outros s\u00e3o 'paper code' one-off (mycetoma/financial/kg-unlearning, v\u00e1rios pr\u00e9-publica\u00e7\u00e3o/under-review); penpax.ai \u00e9 scaffold vazio; Graphify Labs n\u00e3o \u00e9 produto consum\u00edvel. O \u00e2ngulo 'a pessoa/repos' \u00e9 beco sem sa\u00edda.\n\n2. INTUI\u00c7\u00c3O DE TOKEN = CERTA, mas o alvo \u00e9 recall de bead/mail/hist\u00f3rico (dedup 'j\u00e1 foi feito?', 'o que quebrou da \u00faltima vez?', montar contexto de refino) \u2014 onde o Explore N\u00c3O ajuda (ele cobre discovery de c\u00f3digo). Economia potencial da ordem do Explore (70-80% no retrieval).\n\n3. O PEGA (maior que 'indexar custa'): o GRAFO do Gas City (deps de bead, labels, routed_to, threads de mail) J\u00c1 \u00c9 dado estruturado no Dolt \u2014 FK/colunas, traversal perfeito de gra\u00e7a via SQL. O valor central do LightRAG (LLM inferir grafo de PROSA) resolve um problema que a gente N\u00c3O tem. O que falta \u00e9 busca SEM\u00c2NTICA sobre texto-livre (corpo/coment\u00e1rios de bead, mail) = plain vector-RAG, N\u00c3O graph-RAG. Embedding \u00e9 1-2 ordens de grandeza mais barato que extra\u00e7\u00e3o-por-LLM. E os 37k wi",
+    "created_at": "2026-07-20T16:11:17Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-26df",
+  "store": "HQ",
+  "title": "Gate: o MAX do fix-attempt derrota deterministicamente o clear manual \u2014 'reset' vira no-op silencioso",
+  "description": "IGNOR\u00c2NCIA SILENCIOSA na r\u00e9gua do breaker do gate. Achado ao vivo 17/07: o Mayor liberou o\nwa-rxi0q e o clear N\u00c3O PEGOU. Afirma\u00e7\u00e3o e contra-prova refinadas com ele (mails ga-wisp-v1t9wm ->\nresposta dele); o argumento forte abaixo \u00e9 dele, verificado por mim no c\u00f3digo.\n\n## O fato\n\nClear manual = 'bd label add <bead> gate:fix-attempt:0' sobre um bead que j\u00e1 tem\n'gate:fix-attempt:3'. As duas labels COEXISTEM. E o dispatcher (quality-gate-dispatcher.sh:2304-2306):\n\n    # the MAX in case multiple counter labels ever coexist.\n    PREV_ATTEMPT=$(printf '%s' \"$SRC_LABELS\" | tr ' ' '\\n' \\\n      | sed -n 's/^gate:fix-attempt:\\([0-9]\\{1,\\}\\)$/\\1/p' | sort -n | tail -1)\n\n'sort -n | tail -1' = MAX. Rodei o pipeline com as labels reais: resolve **3**. E\n'[ \"$PREV_ATTEMPT\" -ge \"$GATE_FIX_CAP\" ]' -> 3>=3 -> o pr\u00f3ximo FAIL re-escala pra needs-human\nNA HORA. O clear foi gasto \u00e0 toa.\n\n## O argumento que fecha (do Mayor, verificado por mim em :2367-2371)\n\nO caminho AUTOM\u00c1TICO **n\u00e3o empilha**: ao incrementar, o dispatcher REMOVE todos os contadores\nvelhos antes de adicionar o novo ('Bump the attempt counter (drop any stale counters first)').\n\n    for OLD in $(printf '%s' \"$SRC_LABELS\" | tr ' ' '\\n' | grep '^gate:fix-attempt:'); do\n      bd -C \"$BEAD_CITY\" label remove \"$BEAD_ID\" \"$OLD\" -q 2>/dev/null || true\n    done\n\n\u21d2 **O \u00daNICO produtor de contadores coexistindo \u00e9 o clear manual.** O coment\u00e1rio do MAX diz 'in\ncase multiple counter labels ever coexist', tratando a coexist\u00eancia como acidente benig",
+  "close_reason": "Quality gate PASSED \u2014 branch fix/ga-26df-v2 merged to gascity/main (sha=c3b98e57da68e723f4a9df7f7f607ef81e6fc9cc, gate_run=ga-wisp-cqka83). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-17T16:27:15Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-17T06:18:20Z (tier=bug/tech-debt, lane=small, rig=gascity).\nSling task bead: ga-j5m4\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-17T06:18:30Z"
+   },
+   {
+    "author": "automation",
+    "text": "inflight-reclaim-guard (ga-se62o): reclaimed \u2014 no live builder and no recent branch progress for 32min (> 25min TTL). story:in-flight + pilot:dispatched cleared; assignee unset; status reset to open (ga-vw26y). Pilot will re-dispatch. (reclaim 1/3)",
+    "created_at": "2026-07-17T06:51:14Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'gastown.dog' at 2026-07-17T07:40:50Z (tier=bug/tech-debt, lane=small, rig=gascity).\nSling task bead: ga-qluz\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-17T07:40:58Z"
+   }
+  ]
+ },
+ {
+  "id": "ga-rj1f",
+  "store": "HQ",
+  "title": "fix bug ga-6dp9: gate: auto-retry em LOOP INFINITO quando autor morreu + delta > GATE_REBASE_BEHIND_MAX (3 bugs compo",
+  "description": "",
+  "close_reason": "gate-fix-2 submitted for ga-6dp9: branch fix/ga-6dp9-gate-rebase-retry-loop commit 19832d74, marker ga-wisp-50gaar. Story bead ga-6dp9 stays open until gate merges.",
+  "closed_at": "2026-07-17T00:04:36Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": []
+ },
+ {
+  "id": "ga-g5khx",
+  "store": "HQ",
+  "title": "build story ga-6jfuo: [chore] silent-ignorance scan: excluir *.selftest.sh (fixtures C2 intencionais = falso-positivo)",
+  "description": "",
+  "close_reason": "Fix submitted via gate: branch fix/ga-6jfuo-selftest-exclude, marker ga-wisp-3goylg. Story bead ga-6jfuo stays open until merge.",
+  "closed_at": "2026-07-20T01:42:22Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "automation",
+    "text": "Context-check: marcado ctx:thin \u2014 falta contexto para um agente gen\u00e9rico construir sem um humano.\n  \u2022 O QU\u00ca: descri\u00e7\u00e3o vazia ou quase vazia (0 chars). Diga o que precisa ser feito e por qu\u00ea.\nQuando estiver completo, remova o label ctx:thin para re-avalia\u00e7\u00e3o.",
+    "created_at": "2026-07-20T00:54:56Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-4kx1a",
+  "store": "WA",
+  "title": "Redesign frota device card (Op\u00e7\u00e3o A): 2+ n\u00fameros/aparelho + estado on-device verificado (n\u00e3o inferido)",
+  "description": "Redesign the frota dashboard's DEVICE card (the main fleet view \u2014 daemons/frota_dashboard.py index/device list; port 8203, frota.urblink.com.br). VISUAL SPEC = Option A in the approved mockup: https://dnroc49bwlbis.cloudfront.net/mockups/frota-device-multinum.html (Athos chose A \u2014 \"slots empilhados\", 1 row per WhatsApp). Use design-system tokens (Geist + the palette in the mockup; lib/urblink_design_system.py).\n\nFIX 1 \u2014 MULTIPLE numbers per device. Today the card shows ONE number per device (the header). But a device has 2-3 WhatsApp accounts (Normal=com.whatsapp / Business=com.whatsapp.w4b / Dual), EACH with its own number + login state. Render: device header + ONE ROW PER APP SLOT (app label Normal/Business/Dual + number + WA version + login-state badge). Show every active slot (a 2-number device shows 2 rows). Data: /api/numbers per-device accounts (variant + numero + status + ondevice state).\n\nFIX 2 \u2014 TRUTHFUL connection state (the G32 lesson, 2026-06-30, HARD). The dashboard currently shows a chip's connect/logout state that can be STALE/INFERRED. PROOF: G32 (0079807463) showed BOTH apps \"Deslogado\", but an on-device read found com.whatsapp.w4b LOGGED IN (5531982256691, live recent chats). frota_dashboard.py:132 tags G32 \"adb-unverified (offline 2026-06-28)\" \u2014 the state was INFERRED while the device was off adb, never read. REQUIREMENT: per-slot login state must be EITHER (a) a real on-device read (reuse lib/whatsapp_device_rig.py: HomeActivity=logged-in vs RegisterPhone",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/whatsapp_automation-claude-1/wa-4kx1a merged to whatsapp_automation/main (sha=cb2f505f37ca8f24204c6e0343ad60e8a7c64f9e, gate_run=ga-wisp-62hz2dk). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-06-30T21:52:07Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/whatsapp_automation-claude-1/wa-4kx1a merged to whatsapp_automation/main (sha=cb2f505f37ca8f24204c6e0343ad60e8a7c64f9e) via autonomous dispatcher (gate_run=ga-wisp-62hz2dk).",
+    "created_at": "2026-06-30T21:52:07Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-r1se",
+  "store": "WA",
+  "title": "P1: persistir our_number (nosso n\u00ba WhatsApp) por mensagem \u2014 fonte /health, cache por canal, wire send+receive",
+  "description": "",
+  "close_reason": "",
+  "closed_at": "2026-06-09T02:19:46Z",
+  "issue_type": "feature",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "batista-wa-ga4fqc9",
+    "text": "DESIGN (p\u00f3s adversarial review \u2014 2 revisores, fatos verificados):\n\nPROBLEMA: messages guarda s\u00f3 channel_name. Canal whapi re-vincula a n\u00fameros diferentes ao longo do tempo (bans). Perdemos \"qual nosso n\u00famero falou com quem\" quando o canal troca de n\u00famero (bug Emir: DAREDL era 91000-4357 em 06/06, hoje \u00e9 98359-9699; o n\u00ba do Emir migrou pro HAWKEY).\n\nFONTE AUTORITATIVA = whapi /health (user.id) \u2014 J\u00c1 coletado por conversation_monitor.py:1846 (popula chats.my_number, 4609/4827 preenchidos, 20 distintos). N\u00c3O usar chip_pool no hot-path (cross-rig fr\u00e1gil; MANTIS sem linha; channel_id sempre None no config; chip_events \u00e9 prosa). config.json.phone \u00e9 STALE (2/3 errados).\n\nESCOPO P1 (going-forward; backfill \u00e9 bead separado):\n1. Migra\u00e7\u00e3o: ALTER TABLE messages ADD COLUMN our_number TEXT (nullable). Fix INSERT posicional db_sync_daemon.py:888 (VALUES sem colunas \u2192 quebra com nova coluna). busy_timeout+retry.\n2. Cache channel_number_state(channel_name PK, our_number, channel_id, updated_at) \u2014 escrito por conversation_monitor no poll /health existente. SoT leve \"n\u00famero atual no canal\".\n3. lib/channel_number.py: current_number_for_channel(name) l\u00ea o cache; best-effort, nunca raise.\n4. Wire outboun",
+    "created_at": "2026-06-08T18:39:08Z"
+   },
+   {
+    "author": "batista-wa-ga4fqc9",
+    "text": "IMPLEMENTADO + verificado (commit na branch crew/batista/wa-r1se). Tests 9 novos + 59 existentes verde; migra\u00e7\u00e3o validada vs c\u00f3pia prod (47.027 linhas ok). Wire completo: messages.our_number + channel_number_state cache (/health) + central_sender/webhook_receiver/conversation_monitor carimbam. Indo pro gate.",
+    "created_at": "2026-06-08T18:49:46Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-9ru16",
+  "store": "WA",
+  "title": "wa-b7o8c(D): banner de canal do viewer bate com o resolver (health.db AUTH)",
+  "description": "Sub-fix D da wa-b7o8c. /api/channels (daemons/routes/cls_media.py api_get_channels) retornava lista Whapi legada \u2192 todo canal on-device vivo era flagado 'defunct' \u2192 banner falso 'n\u00famero diferente'. Fix: endpoint agora l\u00ea channel_health (latest row, status_code=AUTH=4, phone!=null) = mesmo sinal do send-path. app.js intocado, channel_router s\u00f3 referenciado. Branch crew/oracle/wa-b7o8c-banner commit 04e79780. DEPLOY: restart classification_dashboard (:8086) p\u00f3s-merge. Parent: wa-b7o8c.",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/oracle/wa-b7o8c-banner merged to whatsapp_automation/main (sha=4f876f49443feba9050e66193f41c52744670561, gate_run=ga-wisp-romdiu). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-10T22:05:26Z",
+  "issue_type": "chore",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/oracle/wa-b7o8c-banner merged to whatsapp_automation/main (sha=4f876f49443feba9050e66193f41c52744670561) via autonomous dispatcher (gate_run=ga-wisp-romdiu).",
+    "created_at": "2026-07-10T22:05:25Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-1iyn",
+  "store": "WA",
+  "title": "fix(kanban): timeline do drawer pula 'em voo' + est\u00e1gio atual sem timestamp",
+  "description": "Na timeline (Jornada) do drawer do card, dois bugs (do wa-odea):\n\n1. PULA 'EM VOO': um bead no gate aparece como triagem\u2192gate, sem 'em voo'. Mas nenhum bead chega ao gate sem algu\u00e9m construir (passar por em voo). Causa: _buildTimeline s\u00f3 mostra 'em voo' se label story:in-flight ativa \u2014 que some quando vai pro gate. Fix: jornada \u00e9 LINEAR (triagem\u2192em voo\u2192gate\u2192done); se o est\u00e1gio atual \u00e9 gate/done, inferir que passou por em voo.\n\n2. EST\u00c1GIO ATUAL SEM TIMESTAMP: o est\u00e1gio corrente (ex gate 'na fila') n\u00e3o mostra quando entrou. Fix: usar updated_at como aproxima\u00e7\u00e3o do timestamp do est\u00e1gio atual (\u00e9 a \u00faltima transi\u00e7\u00e3o). Est\u00e1gios intermedi\u00e1rios inferidos sem timestamp exato ficam sem ts (honesto, n\u00e3o inventa).\n\nArquivo: _buildTimeline em painel_visibilidade.py. N\u00c3O toca VERSION.",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/mila/wa-1iyn merged to whatsapp_automation/main (sha=410d2fe8ac0b8a10b57ee4bbc93f95fe8b89c3f1, gate_run=ga-wisp-yaq7vw). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-06-11T01:22:12Z",
+  "issue_type": "bug",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/mila/wa-1iyn merged to whatsapp_automation/main (sha=410d2fe8ac0b8a10b57ee4bbc93f95fe8b89c3f1) via autonomous dispatcher (gate_run=ga-wisp-yaq7vw).",
+    "created_at": "2026-06-11T01:22:11Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-fs1g",
+  "store": "WA",
+  "title": "F4 follow-up: Navent inbound (Imovelweb + Casa Mineira) \u2014 novo filler direct_form_post + platform support",
+  "description": "Split de wa-oxkg (F4 maximizar inbound). wa-oxkg entregou ZAP (mesmo backend OLX da Vivareal, filler j\u00e1 existente) + auto-discovery multi-plataforma. Falta a parte 'pesada' do '~130k an\u00fancios BH': Imovelweb + Casa Mineira, que s\u00e3o plataforma Navent (mecanismo DIFERENTE: 'direct_form_post' com campos JS-rendered, POST pra pr\u00f3pria URL do an\u00fancio \u2014 N\u00c3O o XHR 'lead-message-form' OLX que o form_filler atual cobre).\n\nN\u00c3O foi inclu\u00eddo em wa-oxkg de prop\u00f3sito: sem um filler Navent funcional, s\u00f3 reconhecer a plataforma faria o daemon tentar+falhar e queimar slots do daily-cap dos chips em falhas garantidas.\n\nCHECKLIST:\n1. lib/inbound_generator/listing_parser.py: add imovelweb.com.br + casamineira.com.br ao _PLATFORM_MAP; validar extra\u00e7\u00e3o JSON-LD nessas p\u00e1ginas (Navent pode diferir).\n2. lib/inbound_generator/form_filler.py: NOVO caminho Navent (selectors reais descobertos AO VIVO numa p\u00e1gina renderizada \u2014 feasibility diz 'campos skeleton/JS, exatos desconhecidos'; SEM chute), submit via POST (n\u00e3o XHR-wait 'lead'). Rotear por detect_platform() em submit_form/process_one_url.\n3. scripts/discover_listings.py: j\u00e1 \u00e9 multi-plataforma; basta adicionar entradas Navent ao PLATFORMS (index URL + city_paths) DEPOIS que o filler funcione.\n4. Tests espelhando test_inbound_generator_form_filler.py + fixtures Navent.\n5. Valida\u00e7\u00e3o ao vivo (Firecrawl funciona nesses sites per feasibility) \u2014 submit end-to-end n\u00e3o test\u00e1vel em dev sem mandar lead real; documentar.\n\nRef: docs/inbound_generator/site_feasibi",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/whatsapp_automation-claude-1/wa-fs1g merged to whatsapp_automation/main (sha=4f0dc02d9a9626277ecce91c8c7b9cc3435f8721, gate_run=ga-wisp-969rpw). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-06-23T16:36:35Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'peter-wa' at 2026-06-22T21:44:56Z (tier=feature, lane=small, rig=whatsapp_automation).\nSling task bead: wa-fs1g\nBuilder doctrine: implement \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 story:done.\nNo human review required.",
+    "created_at": "2026-06-22T21:45:05Z"
+   },
+   {
+    "author": "peter-wa-gawispgckq7y",
+    "text": "PM peter SEGURANDO (n\u00e3o despacho). wa-fs1g \u00e9 premissado em 'wa-oxkg entregou ZAP+auto-discovery' \u2014 mas N\u00c3O existe commit wa-oxkg/ZAP/discovery em origin/main (re-verifiquei). wa-oxkg foi FALSO-fechado pelo janitor (commit cross-repo HQ). = o worker produziu CLAIM-FANTASMA + split premissado em base n\u00e3o-mergeada. N\u00e3o construo sobre fantasma. Escalado: ga-wisp-vgqkw1. inbound_generator base j\u00e1 live \u2014 sem urg\u00eancia.",
+    "created_at": "2026-06-22T21:48:16Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/whatsapp_automation-claude-1/wa-fs1g merged to whatsapp_automation/main (sha=4f0dc02d9a9626277ecce91c8c7b9cc3435f8721) via autonomous dispatcher (gate_run=ga-wisp-969rpw).",
+    "created_at": "2026-06-23T16:36:34Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-r31a",
+  "store": "WA",
+  "title": "Kanban: identificar visualmente beads 's\u00f3-Mayor' (badge \ud83c\udfa9 nos cards)",
+  "description": "Athos quer que fique CLARO no Kanban quais beads s\u00f3 o Mayor pode pegar (cross-rig/global/framework/engine), pra n\u00e3o tentar rotear/trabalhar algo que n\u00e3o \u00e9 acion\u00e1vel por crew.\n\nAN\u00c1LISE DOS DADOS (2026-06-08):\n- assignee=mayor: s\u00f3 1 bead (ga-m05wd) \u2014 n\u00e3o \u00e9 o sinal.\n- Sinal real existente: label 'needs:engine-window' (8 beads abertos) = trabalho engine-level, dom\u00ednio do Mayor. Mas INCONSISTENTE: needs:engine-window (8), engine-window (1), engine-level (1).\n- O board j\u00e1 mostra assignee (badge do agente); o GAP real s\u00e3o os s\u00f3-Mayor N\u00c3O-atribu\u00eddos (open, na Triagem) que parecem acion\u00e1veis mas n\u00e3o s\u00e3o.\n\nPARTE A \u2014 GARGALO, N\u00c3O \u00c9 UI (decis\u00e3o do Mayor, dom\u00ednio dele):\nCanonizar UM label pra 's\u00f3-Mayor' (padronizar needs:engine-window OU criar owner:mayor/scope:engine) + definir quem aplica e quando (refino/triagem? Mayor na entrada?). SEM isso, marca visual pode MENTIR (label errado = marca errada, pior que nada). Conversa com o Mayor pendente (entrega wait-idle).\n\nPARTE B \u2014 UI (trivial, ~1h, reusa infra da wa-8g3r):\nBadge \ud83c\udfa9 discreto nos cards que carregam o label can\u00f4nico (+ talvez faceta de filtro 'respons\u00e1vel: Mayor' na barra multi-select). Sem coluna nova. Vers\u00e3o M\u00cdNIMA recomendada (s\u00e3o ~8 beads, n\u00e3o justifica nada pesado).\n\nDEPEND\u00caNCIA: Parte B bloqueada pela Parte A (label can\u00f4nico definido pelo Mayor).",
+  "close_reason": "Superseded pela wa-0afx: o badge \ud83c\udfa9 's\u00f3-Mayor' foi absorvido pela regra unificada de avatares de respons\u00e1vel (\ud83c\udfa9 = \u00e9 do Mayor, por assignee ou needs:engine-window). Marker do gate j\u00e1 retirado.",
+  "closed_at": "2026-06-08T23:29:16Z",
+  "issue_type": "feature",
+  "priority": 2,
+  "comments": []
+ },
+ {
+  "id": "wa-0gs8",
+  "store": "WA",
+  "title": "F20: warming PRESEN\u00c7A on-device (typing 'digitando\u2026' + marcar-como-lido/read-receipts)",
+  "description": "lib/warming_presence.py :: show_typing (abrir chat + focar compose mostra 'digitando' aos contatos) + mark_read (abrir chat marca lido \u2192 ticks azuis no remetente). Sinais de presen\u00e7a humana. F15-E4 explorou typing-indicator. Build STANDALONE module on-device, reusa mec\u00e2nica provada (screencap FUNCIONA; verificar topResumedActivity antes de cada tap; ADBKeyboard; deep-link nav; menu long-press). Wire no dispatch J\u00c1 LIVE do warming_engine (F16, flag-gated). Branch off main, testes adb-MOCKED only, /gate-done. Ref: docs/superpowers/specs/2026-06-20-warming-rich-media-design.md + mem\u00f3ria reference-wa-onscreen-media-send-mechanics.",
+  "close_reason": "Closed",
+  "closed_at": "2026-06-24T13:10:10Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'mila-wa' at 2026-06-21T21:44:16Z (tier=feature, lane=small, rig=whatsapp_automation).\nSling task bead: wa-0gs8\nBuilder doctrine: implement \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 story:done.\nNo human review required.",
+    "created_at": "2026-06-21T21:44:24Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'oracle-wa' at 2026-06-22T20:34:22Z (tier=feature, lane=small, rig=whatsapp_automation).\nSling task bead: wa-0gs8\nBuilder doctrine: implement \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 story:done.\nNo human review required.",
+    "created_at": "2026-06-22T20:34:39Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'mila-wa' at 2026-06-23T01:38:13Z (tier=feature, lane=small, rig=whatsapp_automation).\nSling task bead: wa-0gs8\nBuilder doctrine: implement \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 story:done.\nNo human review required.",
+    "created_at": "2026-06-23T01:38:21Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-w24",
+  "store": "WA",
+  "title": "wa-6w6-E: migrate pbh_freshness scandir off mount",
+  "description": "attached_molecule: wa-wisp-30fi\nattached_formula: mol-polecat-work\nattached_at: 2026-05-27T23:43:07Z\ndispatched_by: mayor\nconvoy_id: hq-cv-wufq4\n\nMigrate pbh_freshness_daemon os.scandir() walks to gdrive_reader.list_folder(). BLOCKED until wa-6w6-A lands. P3 (daily 3am cron, lower exposure).",
+  "close_reason": "Closed",
+  "closed_at": "2026-05-27T23:47:10Z",
+  "issue_type": "task",
+  "priority": 3,
+  "comments": []
+ },
+ {
+  "id": "wa-laky",
+  "store": "WA",
+  "title": "cleanup:shiny - Zombie detected: session dead, uncommitted changes",
+  "description": "",
+  "close_reason": "Zombie shiny nuked \u2014 polecat removed, agent bead closed, mr_failed cleared",
+  "closed_at": "2026-06-06T15:03:00Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": []
+ },
+ {
+  "id": "wa-t0rte",
+  "store": "WA",
+  "title": "Mapa: toggle selecionado amarelo (DS) + p\u00edlula 'im\u00f3veis' + remove dica toque\u2192seleciona",
+  "description": "",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/peter/wa-t0rte merged to whatsapp_automation/main (sha=19804904813774dd4f3106b69ba79c2aa6e5cb26, gate_run=ga-wisp-w9ylsh). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-19T16:36:14Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "automation",
+    "text": "Context-check: marcado ctx:thin \u2014 falta contexto para um agente gen\u00e9rico construir sem um humano.\n  \u2022 O QU\u00ca: descri\u00e7\u00e3o vazia ou quase vazia (0 chars). Diga o que precisa ser feito e por qu\u00ea.\nQuando estiver completo, remova o label ctx:thin para re-avalia\u00e7\u00e3o.",
+    "created_at": "2026-07-19T16:19:39Z"
+   },
+   {
+    "author": "peter-wa-gawisp1qo0oy",
+    "text": "Deploy p\u00f3s-merge: reiniciar o daemon map_viewer_dashboard (:8099) a partir do worktree que serve mapa.urblink.com.br, pra o render vivo pegar o template + design system novos. N\u00c3O toca no pipeline de dados do mapa (mudan\u00e7a \u00e9 s\u00f3 front-end).",
+    "created_at": "2026-07-19T16:30:14Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/peter/wa-t0rte merged to whatsapp_automation/main (sha=19804904813774dd4f3106b69ba79c2aa6e5cb26) via autonomous dispatcher (gate_run=ga-wisp-w9ylsh).",
+    "created_at": "2026-07-19T16:36:14Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-aevgo",
+  "store": "WA",
+  "title": "Pilot/janitor mis-routes work to wrong rig \u2014 derive target rig from code path + guard (re-home of wa-f5qog)",
+  "description": "RE-HOME of wa-f5qog (fix is FRAMEWORK code in packs/town-deltas \u2192 belongs in HQ where the dog pool builds it; the bead is itself an instance of the mis-routing it fixes).\n\nPATTERN (2\u00d7+): work whose code lives in whatsapp_automation gets dispatched to property_scrapers (wrong repo) \u2192 reclaim-loops; AND framework beads land in the WA store \u2192 dispatch to wa-worker which can't build framework (wa-f5qog/wa-hshxt/wa-tj0vn all hit this).\n\nROOT: rig inference (auto-rehome-janitor + Pilot routing, packs/town-deltas/assets/pilot-dispatcher.sh) doesn't derive target rig from WHERE the code lives (crew/<x>\u2192owning rig; outreach/painel\u2192whatsapp_automation; packs/scripts\u2192HQ), falling back to a wrong default.\n\nFIX: derive target rig from code path/domain, never a blind default. Guard: if target rig lacks the file, refuse+reroute (not loop). ACCEPTANCE: bead dispatched to its code's rig (framework\u2192dog); missing-file target refused+rerouted; selftest covers ps-mrfb/ga-wuzeg/wa-f5qog-hshxt-tj0vn.",
+  "close_reason": "",
+  "closed_at": "2026-07-10T19:28:21Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "auto-rehome-janitor",
+    "text": "auto-rehome-janitor: created from HQ original ga-xzfl (re-home). Full refino lineage preserved. Ready for rig dispatch.",
+    "created_at": "2026-07-09T10:12:20Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'wa-worker-1' at 2026-07-10T10:22:27Z (tier=bug/tech-debt, lane=small, rig=whatsapp_automation).\nSling task bead: wa-aevgo\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-10T10:23:03Z"
+   },
+   {
+    "author": "automation",
+    "text": "inflight-reclaim-guard (ga-se62o): reclaimed \u2014 no live builder and no recent branch progress for 31min (> 25min TTL). story:in-flight + pilot:dispatched cleared; assignee unset; status reset to open (ga-vw26y). Pilot will re-dispatch. (reclaim 1/3)",
+    "created_at": "2026-07-10T11:03:42Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-whatsapp_automation-polecat-chrome",
+  "store": "WA",
+  "title": "wa-whatsapp_automation-polecat-chrome",
+  "description": "wa-whatsapp_automation-polecat-chrome\n\nrole_type: polecat\nrig: whatsapp_automation\nagent_state: nuked\nhook_bead: null\ncleanup_status: null\nactive_mr: null\nnotification_level: null",
+  "close_reason": "stale:auto-closed by reaper",
+  "closed_at": "2026-06-19T15:50:55Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": []
+ },
+ {
+  "id": "wa-0l7jh",
+  "store": "WA",
+  "title": "Pipeline de envio ON-DEVICE bloqueado nos daemons launchd (script ve 7 AUTH, daemon ve 0)",
+  "description": "Bloqueia TODAS as campanhas on-device (110/111 do Athos travadas 19/07). start_campaign/central_sender/scheduler (daemons launchd) resolvem _resolve_start_channels(None) => None ('no AUTH channels'); um script python fresco (mesmo venv, root cwd) => 7 canais AUTH. Verificado: health.db inode identico (root=shared=1358595), status_code=4 fresco (deep-check 30s), is_channel_auth SEM cache (so status_code==4), chip_features armado (7 canary, cache 10s), central_sender registra os 7 no channel_locks no init. Reiniciar o send-stack NAO resolveu => nao e processo velho, e DAEMON-launchd vs SHELL. Hipotese: env minimo do launchd vs env do shell em load_config/resolucao de path. Msgs das 110/111 forcadas via script (running) travam em 'intent'. Escalado ao Oracle (ga-wisp-yd8nhf). Dominio: on-device send infra (Oracle).",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/batista/wa-0l7jh merged to whatsapp_automation/main (sha=ed878d89234f1348733d5971ca6736f7723b01bb, gate_run=ga-wisp-ab1nnw). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-20T03:28:27Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "automation",
+    "text": "grw FIX4: cleared STALE gate:reviewing (marker ga-wisp-4mys1l sat QUEUED 16m while source carried gate:reviewing \u2014 a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved).",
+    "created_at": "2026-07-20T01:47:25Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/batista/wa-0l7jh merged to whatsapp_automation/main (sha=ed878d89234f1348733d5971ca6736f7723b01bb) via autonomous dispatcher (gate_run=ga-wisp-ab1nnw).",
+    "created_at": "2026-07-20T03:28:26Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-5at0",
+  "store": "WA",
+  "title": "device-human E1: integrar B1-B4 num harness de teste de sobreviv\u00eancia COLD (ex-HAWKEY)",
+  "description": "Integrar os 4 m\u00f3dulos J\u00c1 MERGEADOS num harness rod\u00e1vel de teste de sobreviv\u00eancia cold no ex-HAWKEY (Note20 RXCT1013CTH, WhatsApp Normal, n\u00famero 553183456103).\n\nM\u00f3dulos a integrar (j\u00e1 em main): B1 send-queue+cad\u00eancia+cold-cap+medi\u00e7\u00e3o (de wa-enlz), B2 chip_contact_sync (wa-xeoa), B3 device_human_sender (wa-9llk), B4 captura inbound por notifica\u00e7\u00e3o (wa-93rm). Reusar as libs mergeadas, n\u00e3o reescrever.\n\n## Protocolo E1\n- Slice pequeno de leads REAIS de cold (fonte configur\u00e1vel \u2014 leads escolhidos no run-time pelo oracle/Athos).\n- Salvar os contatos via B2 (content insert na conta roberto.souza.urblink, E.164 +55, paced add-before-message).\n- Envios cold digitados-humano via B3, pacing pelo B1 (warm-up RAMP 3->6->10/dia, hor\u00e1rio 7-20 dias \u00fateis, gaps humanos 20-90min, cold sub-cap, lock por-device \u2014 LER coord do dump ATUAL a cada passo, nunca hardcodar [li\u00e7\u00e3o validada]).\n- Capturar respostas via B4 (notification -> conversation_history).\n- Medir SOBREVIV\u00caNCIA: tempo-at\u00e9-ban (read_ban_state) + taxa de entrega, vs baseline companion (THOROD=15h; hist\u00f3rico 15h-24d).\n\n## Constraint dura\nConstruir o harness + validar em DRY-RUN (device mockado, ZERO envio real). O run AO VIVO (que queima o ex-HAWKEY em leads cold reais) \u00e9 GATEADO no OK expl\u00edcito do Athos e coordenado pelo oracle \u2014 N\u00c3O rode envios reais.\n\nPredecessoras: B1-B4 em main (feito). Ler docs/device_human_setup_plan.md. Branch crew/oracle/<bead>, /gate-done.",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/whatsapp_automation-claude-4/wa-5at0 merged to whatsapp_automation/main (sha=8c4e4d46841c76c962c1d43f8b8e78efa2c110ab, gate_run=ga-wisp-xhg5j43). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-06-13T10:20:00Z",
+  "issue_type": "feature",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "claude-awisphbaavfe",
+    "text": "Spurious re-claim by pool worker whatsapp_automation/claude-1 (claude-awisphbaavfe). NO new work performed.\n\nFinding: the deliverable is COMPLETE and ALREADY SUBMITTED to the quality gate. Prior session (claude-4) built + pushed the harness AND ran /gate-done.\n- Branch crew/whatsapp_automation-claude-4/wa-5at0 @ ed0cd3f9 (pushed; worktree /Users/athos/gt/wa-5at0-wt).\n- Files: daemons/chip_survival_harness.py (511L), docs/chip_survival/harness_README.md, harness_run.example.json, tests/test_chip_survival_harness.py (204L).\n- Verified by me: 12/12 tests pass; reuses merged B1 device_send_queue / B2 chip_contact_sync / B3 device_human_sender / B4 inbound_capture (not rewritten); cadence read from dump at runtime; hard live-gate CHIP_SURVIVAL_LIVE_OK=1 + --live; dry-run default, zero real sends. Matches E1 spec.\n- Gate marker ga-wisp-ovpbja (city HQ DB) exists, label gate-status:queued (guard already parked it). Awaiting autonomous dispatcher (G), currently backed up on gate-run ga-h9o17.\n\nAction: NOT redoing, NOT resubmitting (would duplicate marker), NOT closing (gate closes source-bead on PASS). Deferring this bead to stop the pool reclaim loop; gate will close it on merge.",
+    "created_at": "2026-06-12T23:28:20Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "GATE-FEEDBACK (gate_run=ga-wisp-p6rg8bv branch=crew/whatsapp_automation-claude-4/wa-5at0): quality gate FAILED. Fix THESE specific blocking issues, then run /gate-done to re-gate.\n\nTIMEOUT: reviewers did not submit verdicts within 45 minutes.",
+    "created_at": "2026-06-13T02:32:01Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Gate FAILED (attempt 1/3) \u2014 labeled gate:needs-fix; story:in-flight and builder assignee cleared. The Pilot will re-dispatch a builder with the GATE-FEEDBACK above.",
+    "created_at": "2026-06-13T02:32:02Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-5y9",
+  "store": "WA",
+  "title": "[TEST] dc-test-ui: tweak demand_dashboard chip color (synthetic UI scope test for wa-4vd acceptance)",
+  "description": "## TEST BEAD \u2014 N\u00c3O IMPLEMENTAR\n\nThis is a **synthetic acceptance test** for wa-4vd (deacon REDESIGN).\n\nSlung to deacon to verify REJECT list works:\n- UI/Frontend \u2192 should suggest mila\n- Expected behavior: deacon refuses with comment 'Out of scope. Sugiro reassign mila' AND does NOT begin work\n\n## Pseudo-task description (NOT to be executed)\n\nMock task: 'tweak demand_dashboard chip color from blue to green'.\n\nIf deacon STARTS implementing \u2192 wa-4vd FAILED (REJECT list not effective).\nIf deacon refuses + comments + leaves unclaimed \u2192 wa-4vd PASSED.\n\n## Mayor instructions for deacon\n\nRead this bead description carefully BEFORE acting. This is a TEST. Per AGENTS.md REJECT rules just loaded via gt prime, this UI work is NOT yours.\n\nExpected response: comment 'Out of scope (UI/frontend \u2192 mila)' + do NOT hook + do NOT start work.\n\nAfter your response, mayor will close this bead manually with test result.",
+  "close_reason": "",
+  "closed_at": "2026-05-16T10:43:53Z",
+  "issue_type": "task",
+  "priority": 3,
+  "comments": []
+ },
+ {
+  "id": "wa-ozyjo",
+  "store": "WA",
+  "title": "Nightly integrity guard: detect media-drops/dups/placeholder-names/mis-relacao/phone-collisions across all WA conversations + ntfy summary",
+  "description": "Productionize scratchpad audit.py into scripts/nightly_integrity_guard.py \u2014 read-only nightly launchd job that scans conversation_history.db/classifications.db/campaigns.db for 5 defect classes and ntfy's a summary so Athos never hand-checks. Corrections from 07-15 session: Defect4 (mis-relacao) responders-ONLY (non-responder socio='N\u00e3o identificado' is CORRECT per Athos, not a defect); Defect2 dups = broader sweep-re-ingest-of-any-real-send pattern; Defect1 media flags on-device(recoverable via wa-6b584 re-sweep) vs Whapi(lost). Alert only when actionable count>0.",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/oracle/wa-ozyjo merged to whatsapp_automation/main (sha=522b75b60a2fb73e6801d08d56d160adfa0e2cef, gate_run=ga-wisp-uyi20o). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-16T03:44:06Z",
+  "issue_type": "feature",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "automation",
+    "text": "grw FIX4: cleared STALE gate:reviewing (marker ga-wisp-tafekc sat QUEUED 21m while source carried gate:reviewing \u2014 a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved).",
+    "created_at": "2026-07-16T03:25:44Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/oracle/wa-ozyjo merged to whatsapp_automation/main (sha=522b75b60a2fb73e6801d08d56d160adfa0e2cef) via autonomous dispatcher (gate_run=ga-wisp-uyi20o).",
+    "created_at": "2026-07-16T03:44:05Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-4edk",
+  "store": "WA",
+  "title": "Recuperar quarteirao+lotes do Verbo Divino (Contagem) dos IPTUs travados no FUSE",
+  "description": "Parte do epic wa-ab6z. No dashboard, o terreno Santa Terezinha/Verbo Divino (Contagem, camp 82) esta com quarteirao '(em levant.)' porque os 8 IPTUs em Drive '00 Real Estate/Terrenos/Contagem/Santa Terezinha/Rua do Verbo Divino/Proprietarios/IPTUs/' falharam ao abrir (FUSE 'Resource deadlock avoided').\n\nESCOPO:\n1. Forcar download offline dos 8 PDFs (Drive 'disponivel offline') OU via cache ~/.cache/gdrive_reader; usar leitura FUSE-safe (lib/drive_safe_write nao aplica a leitura \u2014 usar copia local).\n2. OCR cada PDF -> extrair: quarteirao/quadra, lote interno, indice cadastral, nome do proprietario por inscricao. As 8 inscricoes ja sao conhecidas: 1000095050991001, ...992000, ...993000, ...994000, ...995001, ...996001, ...997001, 1000119041325007.\n3. Report markdown mapeando inscricao->quarteirao/lote/owner; atualizar mockups/dashboard_clientes/RESEARCH_terrenos.md e o seed daemons/clientes_seed.py (VERBO_DETAIL + quarteirao da demanda mrv_santa_terezinha).\nNAO tocar a branch crew/thies/wa-ab6z. Branch propria -> /gate-done.",
+  "close_reason": "Quarteir\u00e3o Verbo Divino recuperado (Z9\u00b7Qd0073, lotes 0008-0011) + propriet\u00e1rios/CPF dos IPTUs. Patch revisado e aplicado na branch crew/thies/wa-ab6z (commit aa5a8932). Corroborado com camp 82.",
+  "closed_at": "2026-06-11T02:44:08Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": []
+ },
+ {
+  "id": "wa-jboxh",
+  "store": "WA",
+  "title": "slot_scheduler: resume em dia n\u00e3o-\u00fatil deixa intents em limbo \u2014 pr\u00e9-agendar pra pr\u00f3xima janela na hora",
+  "description": "Requisito do Athos (19/07): ao dar resume numa campanha FORA da janela de envio, ele quer que as mensagens fiquem 'scheduled' pra pr\u00f3xima janela IMEDIATAMENTE (vis\u00edveis em 'Na fila'), n\u00e3o em 'intent' at\u00e9 o pr\u00f3ximo tick de dia-\u00fatil. Sen\u00e3o: (a) some da fila (parece que n\u00e3o vai enviar), (b) come\u00e7a atrasado (agenda s\u00f3 \u00e0s 07:00 e envia depois). Causa: daemons/slot_scheduler.py:620 _assign_slots_for_channel retorna 0 em dia n\u00e3o-\u00fatil ANTES do branch de pr\u00e9-agendamento (645+), que j\u00e1 usa _next_window_start (pr\u00f3ximo dia \u00fatil). Fix: dia n\u00e3o-\u00fatil n\u00e3o curto-circuita \u2014 cai no pr\u00e9-agendamento (n\u00e3o envia hoje, mas agenda pra pr\u00f3xima janela). Fim de semana era o \u00fanico caso descoberto (dia-\u00fatil fora do hor\u00e1rio j\u00e1 pr\u00e9-agenda).",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/batista/wa-jboxh merged to whatsapp_automation/main (sha=bb0d50cc49675b0e15ebbe917291f2c3fa7fe64f, gate_run=ga-wisp-7qaxwn). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-20T04:04:38Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "automation",
+    "text": "grw FIX4: cleared STALE gate:reviewing (marker ga-wisp-n06pzb sat QUEUED 15m while source carried gate:reviewing \u2014 a reviewer drained during startup and left the label, no terminal path cleared it). The dispatcher can re-dispatch this branch now (was head-of-line starved).",
+    "created_at": "2026-07-20T02:23:34Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/batista/wa-jboxh merged to whatsapp_automation/main (sha=bb0d50cc49675b0e15ebbe917291f2c3fa7fe64f) via autonomous dispatcher (gate_run=ga-wisp-7qaxwn).",
+    "created_at": "2026-07-20T04:04:38Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-9lwde",
+  "store": "WA",
+  "title": "[bug] Sandbox de daemon: copytree(shared/config, symlinks=False) segue o symlink config/data -> shared/data e copia 595 GB \u2014 encheu o disco e MATOU o Dolt da cidade (14/07)",
+  "description": "INCIDENTE (2026-07-14 ~13:10): o Dolt do HQ (:52756) morreu com\n\n    fatal error: write .../hq/.dolt/noms/...: no space left on device\n                 error writing to database journal file\n\nBeads, mail, quality gate e sessions da cidade inteira ficaram fora ate o Mayor reiniciar (13:20, pid 66826, dados intactos).\n\nCAUSA RAIZ: um script de sandbox meu (mila) montava um ambiente isolado pra testar o painel sem tocar em producao, e copiava a config assim:\n\n    shutil.copytree('/Users/athos/shared/config', dst, symlinks=False)\n\nO flag symlinks=False NAO quer dizer 'ignore symlinks' \u2014 quer dizer 'NAO preserve o link, copie o ALVO'. E existe:\n\n    /Users/athos/shared/config/data -> /Users/athos/gt/whatsapp_automation/shared/data\n\nOu seja: o copytree desceu no symlink e comecou a replicar a arvore de dados de producao. Dry-run medido depois: o plano ANTIGO copiaria 595,91 GB num disco de 228 GB. So parou nos 19 GB porque o disco encheu antes \u2014 era ilimitado.\n\nFIX (no script): copiar SO arquivos regulares do topo; symlink e diretorio sao pulados POR CONSTRUCAO.\n  ANTES: shutil.copytree(REAL.parent / 'config', cfg_dst, symlinks=False)\n  DEPOIS: for entry in sorted(cfg_src.iterdir()):\n              if entry.is_symlink(): continue      # config/data -> shared/data\n              if entry.is_dir():     continue\n              shutil.copy2(entry, cfg_dst / entry.name)\n\nNota: symlinks=True NAO serve como conserto \u2014 ele RECRIA o link apontando pra producao, e ai o daemon da sandbox escreve",
+  "close_reason": "CONSERTADO NA CAUSA, com prova.\n\nA LINHA:\n  ANTES:  shutil.copytree(REAL.parent / 'config', cfg_dst, symlinks=False)\n  DEPOIS: for entry in sorted(cfg_src.iterdir()):\n              if entry.is_symlink(): continue   # config/data -> shared/data\n              if entry.is_dir():     continue\n              shutil.copy2(entry, cfg_dst / entry.name)\n\nSymlink e diretorio sao pulados POR CONSTRUCAO \u2014 nao existe caminho pra descer em shared/data. Nao depende de o proximo dev lembrar da regra.\n\nDRY-RUN (comentario acima, re-executavel):\n  antigo: 595,91 GB, 1 caminho descendo em shared/data\n  novo  : 48",
+  "closed_at": "2026-07-14T16:50:55Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'wa-worker-2' at 2026-07-14T16:39:10Z (tier=bug/tech-debt, lane=small, rig=whatsapp_automation).\nSling task bead: wa-9lwde\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-14T16:39:36Z"
+   },
+   {
+    "author": "mila-wa-gawispwlsyxb",
+    "text": "DRY-RUN \u2014 a prova que o Mayor pediu (rodado 2026-07-14, sem copiar nada):\n\n========================================================================\nCOMPORTAMENTO ANTIGO \u2014 copytree(config, dst, symlinks=False)\n========================================================================\n  copiaria: 595.97 GB\n  \u274c DESCE EM DADOS: data     -> /Users/athos/gt/whatsapp_automation/shared/data  (595.97 GB)\n\n========================================================================\nCOMPORTAMENTO NOVO \u2014 so arquivos regulares do topo\n========================================================================\n  copiaria: 48 arquivos, 0.6 MB\n  pulados : data (symlink), pbh_freshness (dir)\n\n========================================================================\nVEREDITO\n========================================================================\n  antigo: 595.97 GB, 1 caminho(s) descendo em shared/data\n  novo  : 0.6 MB, 0 caminho(s) descendo em shared/data\n\n  \u2705 PROVADO: o plano novo NAO desce em shared/data e cabe em <50 MB.\n     Reducao: 595.97 GB -> 0.6 MB\n\nScript do dry-run (re-executavel): scratchpad/dryrun_sandbox_copy.py \u2014 enumera o plano de copia dos DOIS comportamentos, resolve cada caminho e ASSERTA",
+    "created_at": "2026-07-14T16:50:19Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-7rkb",
+  "store": "WA",
+  "title": "feat(campaign_api): POST /campaigns/<id>/contacts \u2014 adicionar contatos a campanha existente",
+  "description": "NECESSIDADE: daemons/campaign_api.py (porta 8082) so tem POST /campaigns (criar). Nao ha como adicionar contatos a uma campanha JA existente. Precisamos disso pra incrementar campanhas rolling (caso concreto: adicionar os 2 numeros WhatsApp novos da herdeira Samira a campanha 84 'MRV - MCMV [Qualquer lugar de BH]' sem criar campanha paralela/duplicada \u2014 o numero do lote 007 ja esta na 84).\n\nIMPLEMENTAR: rota POST /campaigns/<int:campaign_id>/contacts em campaign_api.py. Auth Bearer (mesma key config.json -> campaign_api.api_key). Body: {\"contacts\":[{\"phone\",\"messages\":[...],\"metadata\":{...}}]}.\n\nCOMPORTAMENTO:\n- validar campanha existe (senao 404).\n- inserir em campaign_contacts ESPELHANDO a logica de create_campaign (~linhas 123-250): mesmo status inicial ('waiting'/'pending'), mesma montagem de messages/metadata.\n- DEDUP contra contatos JA existentes NA MESMA campanha: nao inserir phone repetido (normalizar com lib.phone_normalizer.normalize_brazilian_phone antes de comparar).\n- RESPEITAR estado paused/draft: NUNCA enviar \u2014 so adicionar como pending. Nao chamar start. Se a campanha estiver running, os novos contatos entram no fluxo normal do CampaignManager, mas a rota NAO forca start.\n- retornar {added, skipped_dup}.\n\nTESTE (tests/): add a campanha existente (conta sobe); dedup (phone ja existente nao duplica); campanha inexistente -> 404; paused permanece sem envio.\n\nRESTRICAO: nao quebrar POST /campaigns nem o CampaignManager. Apos merge, o daemon precisa de restart pra ",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/whatsapp_automation-claude-6/wa-7rkb merged to whatsapp_automation/main (sha=8fa5385fc4f05081faea79a0775f07822ac6b896, gate_run=ga-wisp-kjz57j). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-06-11T01:52:47Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/whatsapp_automation-claude-6/wa-7rkb merged to whatsapp_automation/main (sha=8fa5385fc4f05081faea79a0775f07822ac6b896) via autonomous dispatcher (gate_run=ga-wisp-kjz57j).",
+    "created_at": "2026-06-11T01:52:46Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-bu15",
+  "store": "WA",
+  "title": "Remodelagem construtoras.db + consumidor p\u00f3s-reuni\u00e3o (perfil graduado + papel_estrategico derivado por terreno)",
+  "description": "",
+  "close_reason": "Merged in dc-wisp-azy1",
+  "closed_at": "2026-06-02T23:18:17Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "whatsapp_automation/crew/peter",
+    "text": "SPEC (piloto fechado com Emccamp 02/jun).\n\nCADASTRO: processo_lookup/data/construtoras/construtoras.db (tabela construtora_perfil, 317 linhas). Documentar em docs/data_dictionary.md + ponteiro no CLAUDE.md do rig (hoje \u00e9 invis\u00edvel).\n\nNOVOS/ALTERADOS campos em construtora_perfil:\n- pracas_json: lista {praca, nivel_interesse(alta/media/baixa NOMINAL), ticket_max, obs} \u2014 substitui regiao_interesse\n- vgv_minimo + vgv_empolga (2 limiares)\n- pagamento_json: atratividade por forma {permuta_loja, permuta_apto, permuta_financeira, dinheiro} em escala nominal (excelente/muito bom/bom/medio/ruim) + antecipacao (regras Barro Preto/Lei Nova melhor, padrao 10%, extremo 12%)\n- produto_json: POR LINHA. ex MCMV {tipologias, pavimentos_max{BH:35,RMBH:25}, vagas pilotis 5-10%, filosofia adensar} ; Medio padrao {exemplo Brizze Estoril, tipologias com m2+vagas}\n- land_bank (NOVO, texto)\n- momento_empresa (NOVO, texto)\n- observacoes (renomeia pontos_atencao)\n- contatos_json: [{nome, papel, telefone}]\n- comissao (campo proprio)\n- REMOVIDO: campo antecipacao-OUS (vai em pagamento_json)\n- NOVA TABELA propostas_passadas (renomeia construtora_proposta_ouvida): propostas reais ouvidas (1:N)\n- terreno_que_ganh",
+    "created_at": "2026-06-02T16:50:14Z"
+   },
+   {
+    "author": "whatsapp_automation/crew/peter",
+    "text": "PILOTO DE REFER\u00caNCIA \u2014 Emccamp p\u00f3s-reuni\u00e3o 02/jun (como o cadastro deve ficar):\n- category/necessidade: Hot / Alta (urg\u00eancia + IPO)\n- pracas: BH=alta (ticket<=800k) | Contagem=media (dificil) | Betim=media (dificil) | Vespasiano=baixa (landbank grande)\n- vgv_minimo=80M ; vgv_empolga=100M+\n- pagamento: permuta_loja=excelente, permuta_apto=muito_bom, permuta_financeira=bom, dinheiro=medio/ruim; antecipa 10-20%; Barro Preto/Lei Nova paga melhor; padrao 10%; extremo 12% (Marcelo Diamantina)\n- produto LINHA MCMV: studio 24 / 2q 33-35 / 2q+suite 40m2; pav BH35 RMBH25; vaga pilotis 5-10%; filosofia adensar>padrao\n- produto LINHA MEDIO (Brizze Estoril): 2q ~54m2 (1 vaga) / 3q ~59m2 (1-2 vagas); suite+varanda; VGV ~106M; entregue dez/25\n- land_bank: 2o Brizze (3 torres, acima do Estoril); fechando na Operacao Nova; Vespasiano passarela p/ shopping + algo na Op Nova; Betim/Contagem s/ info\n- momento_empresa: busca IPO (1bi->2,5bi); caixa farto; nao alavancada; arquiteta nova entrando\n- velocidade_decisao: <=1 semana\n- contatos: Joao (coord novos negocios) ; Bernardo (linha de frente) \u2014 TELEFONES pendentes (Athos vai passar)\n- comissao: 4% permuta (tentando 5%)\n- observacoes: vaga em BH e inc",
+    "created_at": "2026-06-02T17:38:18Z"
+   },
+   {
+    "author": "whatsapp_automation/crew/digo",
+    "text": "MR created: dc-wisp-azy1",
+    "created_at": "2026-06-02T23:16:57Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-xw8mv",
+  "store": "WA",
+  "title": "demandas mobile \u2014 telefones do neg\u00f3cio n\u00e3o aparecem: collectPhones ignora other_phones (PIX/MDS/WA-check) e bot\u00e3o 'Ver telefones' fica escondido quando phone_count=0 com etapa de busca pendente",
+  "description": "",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/batista/wa-xw8mv merged to whatsapp_automation/main (sha=b860f655e081a2ad149ac68782852844a92f924d, gate_run=ga-wisp-8ak1uj). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-13T12:37:01Z",
+  "issue_type": "bug",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "GATE-FEEDBACK (gate_run=ga-wisp-riklih branch=crew/batista/wa-xw8mv): quality gate FAILED. Fix THESE specific blocking issues, then run /gate-done to re-gate.\n\nReviewer 1 FAIL: VERDICT: FAIL\nBlocking issue 1: demand_mobile.js:616 \u2014 `anyCpf && plan.act !== 'manual_cpf'` still gates the ghost 'Ver telefones' button on plan.act, which nextActionPlan() derives from a single primary owner (.find(o=>o.has_cpf), no digit validation) rather than the any-owner scan anyCpf performs. Server-side has_cpf is just bool(raw_cpf) (outreach_queue.py:3401) \u2014 not digit-validated. For a multi-owner lot where the FIRST has_cpf-flagged owner has empty/malformed CPF digits while a LATER owner has a valid 11-digit CPF, anyCpf=true but plan.act='manual_cpf', so the button stays hidden even though showPhones() (same any-owner filter, line 779) would successfully fetch that owner's phones. Reintroduces the exact 'phones reachable but no way to reveal them' bug this patch is meant to fix, for multi-owner lots.\nBlocking issue 2: demand_mobile.js:795-797 \u2014 dedup key drops the DDD. Comment says 'dedupe by a DDD+last-8 fingerprint' and claims parity with 'the WA badge', matching the established pattern used elsew",
+    "created_at": "2026-07-13T12:19:31Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Gate FAILED (attempt 1/3) \u2014 labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) and builder assignee cleared. The Pilot will re-dispatch a builder with the GATE-FEEDBACK above.",
+    "created_at": "2026-07-13T12:19:33Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/batista/wa-xw8mv merged to whatsapp_automation/main (sha=b860f655e081a2ad149ac68782852844a92f924d) via autonomous dispatcher (gate_run=ga-wisp-8ak1uj).",
+    "created_at": "2026-07-13T12:37:00Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-5qwle",
+  "store": "WA",
+  "title": "title-verify: tolerate trailing punctuation/whitespace (razao social 'Ltda.' vs WA-stripped 'Ltda' -> chat_title_mismatch loop)",
+  "description": "Surfaced live during wa-f7vjo verification (campaign 107 re-run). A company-name contact saved as 'Belo Horizonte Paracatu 40 Participacoes Ltda.' (trailing period) fails _verify_chat_title because WhatsApp renders the chat title WITHOUT the trailing period ('...Ltda'), so the exact-match title guard reports chat_title_mismatch: 'X' != 'X.'. With wa-f7vjo this now loops as contact_unsynced->reschedule until the cap, then fails. Fix: normalize TRAILING punctuation+whitespace on BOTH the WA title and the expected contact_name before comparing (does NOT weaken the wrong-chat guard \u2014 the substantive name must still match; only cosmetic trailing chars are tolerated). Affects only razao-social contacts (person names have no trailing period). Separate from wa-f7vjo (which is correct + merged).",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/oracle/wa-5qwle merged to whatsapp_automation/main (sha=ea7478957e7d2686e803596a14db0cbca3cd22e8, gate_run=ga-wisp-1lajz6). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-13T19:22:58Z",
+  "issue_type": "bug",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'wa-worker-1' at 2026-07-13T19:02:57Z (tier=bug/tech-debt, lane=small, rig=whatsapp_automation).\nSling task bead: wa-5qwle\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-13T19:03:26Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/oracle/wa-5qwle merged to whatsapp_automation/main (sha=ea7478957e7d2686e803596a14db0cbca3cd22e8) via autonomous dispatcher (gate_run=ga-wisp-1lajz6).",
+    "created_at": "2026-07-13T19:22:57Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-og36j",
+  "store": "WA",
+  "title": "inflight-reclaim-guard: pilot.dispatched_at never resets on re-claim \u2192 reclaimed beads born-stale, structurally un-buildable",
+  "description": "BUG (critical guard \u2014 inflight-reclaim-guard.py): a reclaimed in-flight bead is \"born stale\" \u2014 its strand/staleness anchor is NOT reset when a fresh claim lands (new assignee + live session), so every claim after the first reclaim is immediately past the 25min RECLAIM_TTL hysteresis \u2192 reclaimed again within ~10min \u2192 no builder (pilot pool OR adhoc) can ever hold the claim long enough to make branch progress \u2192 the bead churns to reclaim-count 3/3 \u2192 circuit-breaks to needs-human. Structurally un-buildable once reclaimed once.\n\nIMPACT (observed 2026-07-10): ~9 genuinely-buildable WA beads parked needs-human this evening from this churn (wa-fow42, wa-xh20z, wa-rxi0q, wa-px9c8, wa-5gh4c, wa-kv6hj, wa-f5ugx\u2026). NOT 100% pool block (pool still builds beads that never got reclaimed), but a real throughput drain + it masquerades as a spawn/NEVERSTARTED problem (ga-3r41).\n\nSEVERE VARIANT (19:23Z repro): wa-ntakm was IMPLEMENTED, tested, and gated (branch crew/wa-worker/wa-ntakm commit 0111661b, marker ga-wisp-6u7295 gate-status:ready) \u2014 yet the bead reverted to status:open/assignee:null. NOTABLY: no inflight-reclaim-guard comment and no reclaim-count bump on that reversion \u2014 so either the gate-status:ready exclusion (guard lines 67/199-218) has a hole on the completed+gated path, OR the reversion is a DIFFERENT mechanism than this guard (must be determined). Risk: re-offering completed work to the pool for duplicate re-implementation before the gate closes the source bead.\n\nROOT (hypoth",
+  "close_reason": "FIXED + live (commit e3986c2e, pushed origin main). Root: strand clock inherited across re-claims \u2192 born-stale \u2192 NEVERSTARTED churn. Fix: update_strand_clock() resets the clock on a fresh claim (assignee change), giving every re-dispatch a full RECLAIM_TTL window; genuine dead builders (same assignee) still reclaimed. TDD RED\u2192GREEN, selftest 13/13, smoke-tested live (inflight=0 sweep clean). Daemon runs the working tree \u2192 already live.",
+  "closed_at": "2026-07-11T12:03:17Z",
+  "issue_type": "bug",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "gastown__mayor",
+    "text": "Reported via session note on wa-xh20z (full detail in its bd comment). Symptom: a self/adhoc claim on wa-xh20z was reverted ~10min after claim \u2014 well before the DOCUMENTED 25min RECLAIM_TTL/hysteresis (inflight-reclaim-guard.py:101) \u2014 with no new reclaim comment. EVIDENCE: pilot.dispatched_at is FROZEN at 1783605032 (10:50, original dispatch) and never refreshed across 3 reclaim cycles NOR the adhoc claim (verified: still 1783605032 at 00:22Z, ~10.5h later). Reclaim-count hit 3/3. HYPOTHESIS (worker + Mayor): the guard's staleness/hysteresis is measured against a timestamp that is NOT reset per-claim (dispatched_at, or a stranded-since not reset on new claim), so once a bead is reclaimed even once, every subsequent claim is BORN past the TTL \u2192 reclaimed within minutes \u2192 NO builder (pilot or adhoc) can ever hold the claim long enough to make branch progress \u2192 bead structurally stuck. This plausibly explains the reclaim-3/3 churn seen today on wa-5gh4c, wa-kv6hj, wa-xh20z. NEEDS: code verification of the RECLAIM_TTL/hysteresis anchor (should reset per-claim, or measure branch-progress-age not dispatch-age); then fix so a fresh claim gets a fresh window. Framework/critical-guard chang",
+    "created_at": "2026-07-10T00:26:22Z"
+   },
+   {
+    "author": "automation",
+    "text": "Context-check: marcado ctx:thin \u2014 falta contexto para um agente gen\u00e9rico construir sem um humano.\n  \u2022 O QU\u00ca: descri\u00e7\u00e3o vazia ou quase vazia (0 chars). Diga o que precisa ser feito e por qu\u00ea.\nQuando estiver completo, remova o label ctx:thin para re-avalia\u00e7\u00e3o.",
+    "created_at": "2026-07-10T00:26:49Z"
+   },
+   {
+    "author": "wa-worker-adhoc-109ff00a5e",
+    "text": "Novo repro, mais severo que o j\u00e1 registrado: wa-ntakm (wa-worker-adhoc-be3b5813b5) IMPLEMENTOU, testou e enviou ao gate (branch crew/wa-worker/wa-ntakm commit 0111661b, marker ga-wisp-6u7295 gate-status:ready, criado 19:05:51Z) \u2014 e mesmo assim o bead reverteu sozinho pra status:open/assignee:null (o pr\u00f3prio builder j\u00e1 tinha notado uma revers\u00e3o silenciosa antes do claim final e reclamou defensivamente antes de submeter ao gate; reverteu de novo depois mesmo assim, sem comment do inflight-reclaim-guard nem bump de reclaim-count). Ou seja, o bug n\u00e3o \u00e9 s\u00f3 'claim n\u00e3o segura tempo suficiente pra COME\u00c7AR a trabalhar' \u2014 ele tamb\u00e9m atinge bead J\u00c1 CONCLU\u00cdDO E GATEADO, arriscando reoferecer trabalho pronto pro pool pra reimplementa\u00e7\u00e3o duplicada antes do gate fechar o source-bead. Verifiquei independentemente: branch+commit existem em origin, marker existe na city db (checado via bd -C $GC_CITY). N\u00e3o \u00e9 claim falso do builder. (wa-worker-adhoc-109ff00a5e, 2026-07-10 ~19:20Z)",
+    "created_at": "2026-07-10T19:23:20Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-pnr3",
+  "store": "WA",
+  "title": "Feature-gate: desligar StarkBank/PIX DICT de todo o fluxo (sem remover c\u00f3digo)",
+  "description": "Motivo: 08/jun/2026 o StarkBank bloqueou a consulta de chave PIX (DICT) no N\u00cdVEL DA ORGANIZA\u00c7\u00c3O \u2014 erro keyLookupBlocked \"suspected data scraping\". Afeta toda consulta DICT. Continuar chamando s\u00f3 refor\u00e7a a flag anti-scraping deles e queima erro. Ver mem\u00f3ria project_starkbank_pix_blocked.\n\nObjetivo: adicionar um FEATURE GATE (flag de config, default DESLIGADO at\u00e9 StarkBank liberar) que desativa TODAS as chamadas StarkBank/PIX DICT do fluxo. N\u00c3O remover c\u00f3digo \u2014 s\u00f3 gatear.\n\nPontos a gatear (todos checam a flag e viram no-op/skip gracioso quando OFF):\n- lib/starkbank_client.py \u2014 StarkBankClient.lookup() retorna early (found=False, error=\"pix_lookup_disabled\") sem chamar a API.\n- lib/pix_confirm.py \u2014 lookup_and_match() respeita a flag (skip_reason=\"pix_disabled_feature_gate\").\n- daemons/pix_lookup_api.py \u2014 endpoint responde 503/desabilitado quando OFF.\n- demand_dashboard / outreach_worker \u2014 n\u00e3o enfileirar a\u00e7\u00f5es de PIX confirm quando OFF; esconder/desabilitar bot\u00f5es PIX na UI.\n\nFlag sugerida: shared/config/config.json -> {\"features\": {\"pix_lookup_enabled\": false}} (ou auto_response_config.yaml), lida por um helper \u00fanico (ex. lib/feature_flags.py) pra um s\u00f3 ponto de verdade. Default OFF agora; ligar de volta s\u00f3 ap\u00f3s StarkBank desbloquear.\n\nCrit\u00e9rio de pronto: com a flag OFF, nenhuma chamada DICT sai (verific\u00e1vel: rodar o fluxo PIX e confirmar 0 requests ao StarkBank + skip auditado); com ON, comportamento atual restaurado. Sem deletar c\u00f3digo.",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/batista/wa-pnr3 merged to whatsapp_automation/main (sha=073831e421a7a42c3225ab3e01b92e10fdf08644, gate_run=ga-wisp-wwtuw3). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-06-09T11:10:22Z",
+  "issue_type": "task",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/batista/wa-pnr3 merged to whatsapp_automation/main (sha=073831e421a7a42c3225ab3e01b92e10fdf08644) via autonomous dispatcher (gate_run=ga-wisp-wwtuw3).",
+    "created_at": "2026-06-09T11:10:22Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-g3k0q",
+  "store": "WA",
+  "title": "Telefonia: media-path do S2S sobre brdid d\u00e1 0 frames (carrier 183-no-ring) \u2014 JOINT",
+  "description": "A liga\u00e7\u00e3o boa de 28/jun (1882 frames, originate-into-Stasis voicebot-s2s) REGREDIU: o carrier agora responde 183-sem-tocar em TODAS as 7 variantes de origina\u00e7\u00e3o sobre brdid \u2192 0 frames/remote_hangup (commits 82eedebe/df734229), enquanto um Dial() manual toca+atende. O modelo originate-into-Stasis+ExternalMedia bridge do runner conflita com o answer-path via Dial() do trunk (o leg Local ;1 conflita com o external-media bridge). Reconciliar. JOINT batista-ps (telefonia) + batista-wa (runner). P1 \u2014 bloqueia qualquer teste ao vivo.",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/wa-worker/wa-g3k0q merged to whatsapp_automation/main (sha=18e30dcb18757872591cfbb690c566728ce89eeb, gate_run=ga-wisp-u0s841). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-07T18:10:40Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'wa-worker-1' at 2026-07-07T16:45:02Z (tier=bug/tech-debt, lane=small, rig=whatsapp_automation).\nSling task bead: wa-g3k0q\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-07T16:45:35Z"
+   },
+   {
+    "author": "wa-worker-adhoc-d956b798bb",
+    "text": "Root cause found + fix pushed (branch crew/wa-worker/wa-g3k0q, commit 99ff5727).\n\nThe dialplan already had a fix scaffold \u2014 [voicebot-s2s] in\nlib/predictive_dialer/asterisk/extensions.conf \u2014 that waits for a real 200 OK\nbefore running Stasis() (avoids both the 183-no-ring carrier behavior AND the\nLocal-leg/bridge conflict from the 06-30 Local->Dial attempt). But neither\nrunner_s2s_gemini.py nor runner_s2s_openai.py ever passed context=/extension=\nto ari.originate() \u2014 both still used direct-Stasis-app mode. Wired both to\ncontext=\"voicebot-s2s\", extension=\"s\", mirroring the pattern already proven\nlive by providers/asterisk_ari.py's pix-amd flow. Added a unit test locking\nthe REST params. Full voicebot suite: 365 passed, 6 failed + 2 errors (all\npre-existing ModuleNotFoundError: audioop, unrelated, reproduces on main).\n\nIMPORTANT \u2014 could not verify against the real carrier: no live-call test\nharness exists in this repo, and I did not place a live PSTN test call myself\n(real cost + rings a real phone \u2014 not mine to decide solo as a pool worker).\nConfirmed via SSH (jambonz-dialer VM) that Asterisk is up and brdid's\ndirect_media=false (compatible with the ExternalMedia bridge). Recommend\n",
+    "created_at": "2026-07-07T17:08:13Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/wa-worker/wa-g3k0q merged to whatsapp_automation/main (sha=18e30dcb18757872591cfbb690c566728ce89eeb) via autonomous dispatcher (gate_run=ga-wisp-u0s841).",
+    "created_at": "2026-07-07T18:10:39Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-lvqh",
+  "store": "WA",
+  "title": "fix(proxy): admin API/cadastro mostra proxy real do Whapi (n\u00e3o proxy_ref desacoplado) + drift guard",
+  "description": "",
+  "close_reason": "stale:auto-closed by reaper",
+  "closed_at": "2026-06-19T15:50:55Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Context-check: marcado ctx:thin \u2014 falta contexto para um agente gen\u00e9rico construir sem um humano.\n  \u2022 O QU\u00ca: descri\u00e7\u00e3o vazia ou quase vazia (0 chars). Diga o que precisa ser feito e por qu\u00ea.\nQuando estiver completo, remova o label ctx:thin para re-avalia\u00e7\u00e3o.",
+    "created_at": "2026-06-17T19:23:23Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-2v57",
+  "store": "WA",
+  "title": "contatos_master source DB (contatos_mds.db) is 0 bytes \u2014 rebuild upstream; MotherDuck sync fails 'no such table: data'",
+  "description": "",
+  "close_reason": "Merged in dc-wisp-jnl2",
+  "closed_at": "2026-06-03T01:46:27Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "whatsapp_automation/crew/oracle",
+    "text": "Builder = Hex 'Consolidate Telephones v2 (Contatos - Master Data Set)' id=01965389-3ff5-7ee4-8691-07254cf60f2b, agendado DAILY 01:20 BRT (enabled). Ultimo run via API: COMPLETED hoje 14:45 BRT (APP_REFRESH, 65s). POREM contatos_mds.db no Drive segue 0 bytes / parado em 2026-05-30 01:26 e sync MotherDuck falha 'no such table: data'. Hipoteses (API nao expoe codigo das celulas): (1) export do .db gated atras de um INPUT/toggle que default off em runs agendados \u2014 celula 98 e INPUT; (2) auth Google/Drive do export quebrou ~30/mai (coincide com a quebra google_auth_oauthlib do motherduck-sync no MESMO dia 30/mai); (3) query fonte retornando 0 linhas. Acao: abrir o Hex e checar a celula que grava contatos_mds.db (toggle de publish + auth Drive).",
+    "created_at": "2026-06-03T01:17:29Z"
+   },
+   {
+    "author": "whatsapp_automation/crew/oracle",
+    "text": "MR created: dc-wisp-jnl2",
+    "created_at": "2026-06-03T01:36:53Z"
+   },
+   {
+    "author": "whatsapp_automation/crew/oracle",
+    "text": "RESOLVIDO (nao era dado upstream). Root cause: pasta Drive tinha 3 arquivos com mesmo nome contatos_mds.db (1 vivo 11.4MB do Hex 'Consolidate Telephones v2' + 2 stale 0-byte); gdrive_reader.resolve_drive_path pegava files[0] arbitrario (0-byte) e cacheava no path_map. Fix wa-2v57 (orderBy modifiedTime desc + drop folders no ultimo segmento) merged 91a02dde. Deploy: clear path_map cache + restart motherduck-sync + --sync-one contatos_master. Verificado: pessoas_empresas.contatos_master = 13469 linhas (13468 CPFs). MotherDuck dashboard 0 erros. Hex estava 100% correto. Cleanup opcional das 2 duplicatas 0-byte deixado pro dono.",
+    "created_at": "2026-06-03T01:46:27Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-ob8zd",
+  "store": "WA",
+  "title": "Design/spec: ordem de prioridade on-device + arquitetura de visita-fundida-por-contexto (scheduler da frota)",
+  "description": "Quando o sistema envia uma mensagem a um lead, o chat daquele lead j\u00e1 est\u00e1 aberto no aparelho \u2014 hoje essa abertura serve s\u00f3 para enviar, e o mesmo chat precisa ser reaberto depois (varredura de leitura geral, ~30min mais tarde, e de novo se houver m\u00eddia) s\u00f3 para ler o que j\u00e1 podia ter sido visto na hora. Esta hist\u00f3ria funde essas aberturas por CHAT \u2014 n\u00e3o por aparelho (decis\u00e3o de Athos, 2026-07-16): logo ap\u00f3s o envio ser confirmado, e com o chat certo j\u00e1 aberto e verificado, o sistema aproveita a mesma visita para tamb\u00e9m capturar o que j\u00e1 estiver vis\u00edvel na tela (respostas de texto, documento, contato, chamada, v\u00eddeo), sem estender essa visita com rolagem de hist\u00f3rico. \u00c9 uma camada nova, aditiva: a varredura de leitura geral continua rodando normalmente para os chats que n\u00e3o recebem envio nesse per\u00edodo.\n\nImporta porque cada reabertura programada do mesmo chat \u00e9 um padr\u00e3o repetitivo que aumenta o risco de o n\u00famero parecer automatizado (fingerprint de banimento) \u2014 e adiar a captura de m\u00eddia para uma varredura futura j\u00e1 causou perda real de informa\u00e7\u00e3o (caso Jacqueline: m\u00eddia capturada 12h depois, e essa captura atrasada ainda esbarrou num bug de rolagem e se perdeu). Capturar na pr\u00f3pria visita do envio elimina essa reabertura redundante, evita perder m\u00eddia importante, e d\u00e1 mais contexto para o pr\u00f3prio envio \u2014 o sistema j\u00e1 enxerga se o lead respondeu antes de continuar. Alinhado com o objetivo de parecer humano.\n\n---\n\nDesign t\u00e9cnico original (Athos, 2026-07-16) \u2014 preservado na \u00ednt",
+  "close_reason": "Story DELIVERED \u2014 deployed + verified in prod, story:done (rig whatsapp_automation, deployed + baseline-tested in prod). Closed by story-delivery (ga-i53ua durable terminal).",
+  "closed_at": "2026-07-16T16:20:07Z",
+  "issue_type": "feature",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "automation",
+    "text": "Context-check: marcado ctx:thin \u2014 falta contexto para um agente gen\u00e9rico construir sem um humano.\n  \u2022 O QU\u00ca: descri\u00e7\u00e3o vazia ou quase vazia (0 chars). Diga o que precisa ser feito e por qu\u00ea.\nQuando estiver completo, remova o label ctx:thin para re-avalia\u00e7\u00e3o.",
+    "created_at": "2026-07-15T14:05:33Z"
+   },
+   {
+    "author": "automation",
+    "text": "Auto-refino: hist\u00f3ria crua da Triagem (sem label de ciclo) ingerida no funil \u2014 story:unrefined aplicado. Vai passar pelo refino simplificado \u2192 gate \u2192 aprova\u00e7\u00e3o.",
+    "created_at": "2026-07-15T14:06:46Z"
+   },
+   {
+    "author": "auto-refiner-adhoc-09932dbfeb",
+    "text": "Auto-refino INFO-GAP: historia sem contexto suficiente (attempt 1). Lacuna tecnica - nao e decisao de produto. Aguardando mais contexto.",
+    "created_at": "2026-07-15T14:20:09Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-litw",
+  "store": "WA",
+  "title": "fix(viewer)+feat(demand): distress score honesto (tira /3 enganoso) + d\u00edvida ativa na aba Contatos",
+  "description": "",
+  "close_reason": "Mergeado em origin/main como e3563d84 (08/06 00:02). Rebase sobre wa-8g3r resolvido no caminho.",
+  "closed_at": "2026-06-08T12:57:10Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": []
+ },
+ {
+  "id": "wa-ucmb",
+  "store": "WA",
+  "title": "Produ\u00e7\u00e3o can\u00f4nica (peter): repointar com.whatsapp.peter-predeploy-check pra root worktree",
+  "description": "Auditoria 2026-06-14 (Athos): launchd com.whatsapp.peter-predeploy-check roda de crew/peter/scripts/peter/predeploy_check.sh. O c\u00f3digo EST\u00c1 em main (drift trivial). A\u00c7\u00c3O: repointar o plist pra scripts/peter/predeploy_check.sh do ROOT worktree + reload. ACEITE: o job roda do checkout can\u00f4nico, n\u00e3o de crew/peter.",
+  "close_reason": "Re-filed no city DB como ga-h55xa (hooks leem city:gascity; rig bead n\u00e3o roteia)",
+  "closed_at": "2026-06-14T19:22:11Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": []
+ },
+ {
+  "id": "wa-089wh",
+  "store": "WA",
+  "title": "[bug] Audit: mesmo padrao de fd-leak (with sqlite3.connect) em ~40 sites / 7 daemons \u2014 triar hot-paths (canary=19, admin_dashboard=5 Flask)",
+  "description": "AUDIT read-only pedido pelo oracle-wa no sign-off do wa-0o0a4 (ga-wisp-ds5sbz, item 3): \"fa\u00e7a s\u00f3 um audit READ-ONLY dos `with sqlite3.connect` e, se achar leak em hot-path, abre bead SEPARADO\". Este \u00e9 o bead.\n\n## O padr\u00e3o\n\n`with sqlite3.connect(...) as conn:` \u2014 o context manager do sqlite3 faz commit/rollback e **N\u00c3O fecha** a conex\u00e3o. Em loop longo, vaza fd por chamada at\u00e9 estourar o limite do processo.\n\nPROVADO (wa-0o0a4, medido, n\u00e3o te\u00f3rico): no slot_scheduler vazava ~1-2 fds por chamada; chegou a **279 fds (252 em campaigns.db)** e derrubou o envio em sil\u00eancio por 2h30. Teste que mede: tests/test_slot_scheduler_fd_leak.py (chama N vezes e compara len(os.listdir('/dev/fd'))). Contra o c\u00f3digo pr\u00e9-fix: +60 fds em 60 chamadas. Com try/finally + conn.close(): delta 0.\n\n## O que o audit encontrou (~40 ocorr\u00eancias, 7 daemons)\n\n    auto_response_canary_daemon.py : 19   <-- maior concentra\u00e7\u00e3o\n    daemon_health_monitor.py       :  6\n    admin_dashboard.py             :  5\n    pipedrive_sync.py              :  4\n    campaign_state_watcher.py      :  3\n    auto_response_v2_listener.py   :  2\n    central_sender.py              :  1\n\n## HONESTIDADE SOBRE O ESCOPO (ler antes de sair consertando)\n\nEu **provei** o vazamento S\u00d3 no slot_scheduler. Os outros s\u00e3o o MESMO PADR\u00c3O, mas **n\u00e3o medidos** \u2014 n\u00e3o afirme que vazam sem medir. Antes de mexer em cada um, triar por:\n\n1. **\u00c9 hot-path?** O leak s\u00f3 importa em processo LONGO que chama repetidamente. Script one-shot que termina devolve tudo no ",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/wa-worker/wa-089wh merged to whatsapp_automation/main (sha=282886b2befda3f5a638255164b0ce83bb19c858, gate_run=ga-wisp-vifq9k). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-16T04:56:39Z",
+  "issue_type": "bug",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'wa-worker-2' at 2026-07-16T02:24:33Z (tier=bug/tech-debt, lane=small, rig=whatsapp_automation).\nSling task bead: wa-089wh\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-16T02:25:50Z"
+   },
+   {
+    "author": "automation",
+    "text": "inflight-reclaim-guard (ga-se62o): reclaimed \u2014 no live builder and no recent branch progress for 33min (> 25min TTL). story:in-flight + pilot:dispatched cleared; assignee unset; status reset to open (ga-vw26y). Pilot will re-dispatch. (reclaim 1/3)",
+    "created_at": "2026-07-16T03:18:41Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'wa-worker-1' at 2026-07-16T03:22:28Z (tier=bug/tech-debt, lane=small, rig=whatsapp_automation).\nSling task bead: wa-089wh\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-16T03:22:57Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-2nxf",
+  "store": "WA",
+  "title": "Investigar: quais tipos/prefixos de bead n\u00e3o aparecem no Kanban",
+  "description": "Athos observou que o bead ga-xt7bp (prefixo HQ) n\u00e3o aparecia no Kanban de hist\u00f3rias.\n\nINVESTIGAR:\n1. Quais prefixos de bead s\u00e3o exclu\u00eddos do Kanban atual (ga- vs wa- vs outros)?\n2. O filtro \u00e9 por banco/rig, por tipo, por status, ou por label?\n3. Se houver beads que deveriam aparecer mas n\u00e3o aparecem \u2014 qual a regra atual e qual deveria ser?\n\nENTREGA: Relat\u00f3rio com as regras atuais + op\u00e7\u00f5es (ex: mostrar todos, mostrar s\u00f3 wa-, filtrar por tipo) para Athos decidir a dire\u00e7\u00e3o.\n\nN\u00c3O implementar nada sem aprova\u00e7\u00e3o do Athos \u2014 apenas investigar e reportar.",
+  "close_reason": "Investiga\u00e7\u00e3o conclu\u00edda por mila \u2014 ver findings abaixo",
+  "closed_at": "2026-06-06T17:56:46Z",
+  "issue_type": "task",
+  "priority": 1,
+  "comments": []
+ },
+ {
+  "id": "wa-a0y",
+  "store": "WA",
+  "title": "migrate pbh_freshness_daemon to lib/gdrive_reader (wa-6w6 follow-up \u2014 fixes wa-5iy dashboard errors)",
+  "description": "attached_molecule: wa-wisp-7tpw\nattached_formula: mol-polecat-work\nattached_at: 2026-05-28T19:16:51Z\ndispatched_by: mayor\nconvoy_id: hq-cv-px6bw",
+  "close_reason": "Merged in wa-wisp-lkl",
+  "closed_at": "2026-05-28T19:24:48Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "whatsapp_automation/polecats/atom",
+    "text": "MR created: wa-wisp-lkl",
+    "created_at": "2026-05-28T19:24:20Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-998of",
+  "store": "WA",
+  "title": "reveal higiene: drain-time fleet-skip + STATUS_SKIPPED (n\u00e3o churnar chips nossos j\u00e1 na fila)",
+  "description": "wa-nn37s higiene (Athos: 'higiene primeiro'). O sweep j\u00e1 exclui frota/Athos via _is_fleet (wa-v89e3.6), mas o DRAIN (consumer) n\u00e3o re-checa \u2192 chips nossos que j\u00e1 entraram na fila (pr\u00e9-fix ou via inbound_capture) ainda s\u00e3o drenados: abre o contato + delete\u2192re-save no NOSSO chip = device churn puro, queima o device-lock que leads reais esperam. Fix: run_drain pula _is_fleet ANTES de pegar o device-lock, marcando STATUS_SKIPPED (novo status terminal, mant\u00e9m 'done'=reveals reais). Defense-in-depth ao sweep. Evid\u00eancia: fila tinha ...83456103=Note20, ...82765266=G22, ...88598058=Athos pending.",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/oracle/wa-998of merged to whatsapp_automation/main (sha=b100620f9ca7fcd07792c49c1d216351b5b3ec1c, gate_run=ga-wisp-0d2jal). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-11T12:40:16Z",
+  "issue_type": "bug",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'wa-worker-1' at 2026-07-11T12:14:48Z (tier=bug/tech-debt, lane=small, rig=whatsapp_automation).\nSling task bead: wa-998of\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-11T12:15:20Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Quality gate PASSED. Branch crew/oracle/wa-998of merged to whatsapp_automation/main (sha=b100620f9ca7fcd07792c49c1d216351b5b3ec1c) via autonomous dispatcher (gate_run=ga-wisp-0d2jal).",
+    "created_at": "2026-07-11T12:40:16Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-jou",
+  "store": "WA",
+  "title": "hotfix(worker): _get_bridge passes conexoes_folder_path (CRITICAL \u2014 regua hook was persisting nowhere)",
+  "description": "",
+  "close_reason": "Merged in wa-wisp-a2k",
+  "closed_at": "2026-05-26T10:07:23Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "whatsapp_automation/crew/batista",
+    "text": "MR created: wa-wisp-faq",
+    "created_at": "2026-05-26T10:05:54Z"
+   },
+   {
+    "author": "whatsapp_automation/crew/batista",
+    "text": "MR created: wa-wisp-a2k",
+    "created_at": "2026-05-26T10:06:14Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-tjd4a",
+  "store": "WA",
+  "title": "GATE OUTAGE: gate-reviewer sessions never receive op=start \u2014 supervisor emits ZERO gate-reviewer lines",
+  "description": "Desde ~13:22 de 2026-07-09 o quality gate nao produz veredito nenhum.\n\nSINTOMA: quality-gate-dispatcher cria a sessao do reviewer (gc session new gate-reviewer --no-attach), o bead de sessao fica em state=start-pending com pending_create_claim=true, e o supervisor NUNCA emite 'session lifecycle op=start' pra ela (0 linhas com 'gate-reviewer' no supervisor.log desde 14:27). O reviewer nunca nasce -> verdict bead fica verdict:pending -> 'Verdicts: 0/1' ate o timeout.\n\nCONTRASTE: o mesmo supervisor starta normalmente pool/persona (whatsapp_automation/claude, oracle-wa, peter-wa, digo-wa, thies-wa) via poolDesired. 'poolDesired: gate-reviewer' aparece pela ultima vez as 13:22:12 e nunca mais.\n\nINTERMITENTE: as 15:33 uma sonda manual 'gc session new gate-reviewer --no-attach' chegou a ACTIVE em 40s. As 15:45+ a mesma sonda (com e sem wake/pin) ficou presa em start-pending por 100s+. Ou seja, o start de sessao EXPLICITA funciona as vezes.\n\nDESCARTADO com evidencia: (a) binario novo gc-patched-asyncstart5m (A/B com gc-patched-u0vzx: mesmo comportamento); (b) cota Claude (claude-quota-check: NOT limited); (c) lifecycle-coherence-janitor (R4/R5 seguem desligados); (d) inflight-reclaim-guard (so tocou beads wa-*); (e) hooks bd rogue (nenhum); (f) bd context do property_scrapers (warning CRONICO desde 06-06, benigno \u2014 ver memoria); (g) wake-antes-de-criar (experimento controle/tratamento: ambos travaram); (h) claim de create preso bloqueando o template (fechei todos os start-pending e a",
+  "close_reason": "",
+  "closed_at": "2026-07-10T19:29:05Z",
+  "issue_type": "bug",
+  "priority": 0,
+  "comments": [
+   {
+    "author": "auto-rehome-janitor",
+    "text": "auto-rehome-janitor: created from HQ original ga-i6el (re-home). Full refino lineage preserved. Ready for rig dispatch.",
+    "created_at": "2026-07-09T19:03:14Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'wa-worker-1' at 2026-07-10T19:16:14Z (tier=bug/tech-debt, lane=small, rig=whatsapp_automation).\nSling task bead: wa-tjd4a\nBuilder doctrine: fix bug \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 bead closed.\nNo human review required. SYSTEM QUALITY FIRST.",
+    "created_at": "2026-07-10T19:16:36Z"
+   },
+   {
+    "author": "gastown__mayor",
+    "text": "Closed by Mayor 2026-07-10: reverse-rehomed to HQ ga-i6el. This is an ENGINE (gc binary / supervisor start-wave) fix \u2014 a wa-worker in the WA rig cannot build it (was draining, held). Batched into the deliberate engine-window with ga-z6uo + ga-sm5p. Acute outage is over (gate healthy post supervisor-kick).",
+    "created_at": "2026-07-10T19:29:05Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-i02u",
+  "store": "WA",
+  "title": "Contagem: pedido e-SIC/LAI da Planta Gen\u00e9rica de Valores (Tabela ZH\u2192R$/m\u00b2, Anexo VI Lei 1.611/1983)",
+  "description": "Origem: an\u00e1lise de incorpora\u00e7\u00e3o (Athos autorizou abrir). O valor venal de terreno por m\u00b2 de Contagem (4\u00ba crit\u00e9rio de ranking) est\u00e1 na PGV = Tabelas de Valores 1 e 2 do Anexo VI do CTMC (Lei 1.611/1983, Art.64 \u00a74\u00ba), MAS o Anexo VI N\u00c3O est\u00e1 no PDF p\u00fablico (confirmado: PDF do CTMC tem anexos II-A/I/IV/V/\u00danico, sem o VI) e a ferramenta per-im\u00f3vel foi desativada. Pedir via LAI a tabela em formato aberto.\n\nTEXTO DO PEDIDO (rascunho): 'Com base na Lei de Acesso \u00e0 Informa\u00e7\u00e3o (Lei 12.527/2011), solicito c\u00f3pia em formato aberto e leg\u00edvel por m\u00e1quina (CSV/XLSX) das Tabelas de Valores 1 e 2 do Anexo VI do C\u00f3digo Tribut\u00e1rio do Munic\u00edpio de Contagem (Lei n\u00ba 1.611/1983 e altera\u00e7\u00f5es) \u2014 a Planta Gen\u00e9rica de Valores (PGV), especificamente o valor unit\u00e1rio de m\u00b2 de terreno por Zona Homog\u00eanea (ZH), conforme Art. 64 \u00a74\u00ba do CTMC. Se poss\u00edvel, incluir a tabela de valores de constru\u00e7\u00e3o e os fatores de corre\u00e7\u00e3o, com a chave da Zona Homog\u00eanea.'\n\nPORTAL: Fala.BR (falabr.cgu.gov.br) \u00e9 o canal padr\u00e3o; alt = ouvidoria de Contagem (portal.contagem.mg.gov.br). SUBMISS\u00c3O exige identidade do Athos (CPF/login) \u2014 via skill federated-site-login (browser autenticado dele) OU Athos submete. Prazo LAI: 20 dias (+10). Quando responder: a tabela ZH\u2192R$/m\u00b2 \u00e9 drop-in (--pgv-csv) no script contagem_valor_m2_enrichment.py (a georrefer\u00eancia ZH j\u00e1 est\u00e1 cravada nos 384k). Acompanhar protocolo.",
+  "close_reason": "A\u00e7\u00e3o do bead (protocolar pedido e-SIC/LAI da PGV de Contagem) est\u00e1 FEITA: enviado 2026-06-15 por thies via gmail CLI (id 19ecbb79357d19b3) p/ ouvidoria.cidadao@contagem.mg.gov.br; em correspond\u00eancia viva (CPF fornecido 06-16, Ouvidoria respondeu 06-17). Comments recentes de 'precisa identidade do Athos / n\u00e3o-aut\u00f4nomo' s\u00e3o STALE (identidade j\u00e1 dada 06-16). Ingest\u00e3o da tabela PGV (ZH\u2192R$/m\u00b2) quando Contagem entregar = tarefa downstream separada, n\u00e3o este bead de protocolo. Fechado na revis\u00e3o da coluna Aprovadas (Athos, 2026-06-23).",
+  "closed_at": "2026-06-23T15:11:26Z",
+  "issue_type": "task",
+  "priority": 2,
+  "comments": [
+   {
+    "author": "thies-wa-gawisp6m07lv",
+    "text": "ENVIADO 2026-06-15 via gmail CLI (athosmartins@gmail.com \u2192 ouvidoria.cidadao@contagem.mg.gov.br), gmail_id 19ecbb79357d19b3. Await registrado (resposta roteia de volta + reabre este bead). Prazo LAI 20(+10) dias. Quando a tabela ZH\u2192R$/m\u00b2 chegar: drop-in --pgv-csv no contagem_valor_m2_enrichment.py.",
+    "created_at": "2026-06-15T14:38:24Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'mila-wa' at 2026-06-21T02:45:17Z (tier=feature, lane=small, rig=whatsapp_automation).\nSling task bead: wa-i02u\nBuilder doctrine: implement \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 story:done.\nNo human review required.",
+    "created_at": "2026-06-21T02:45:28Z"
+   },
+   {
+    "author": "mila-wa-awispuke85cy",
+    "text": "DEFERRED \u2014 parte do STORM do Pilot de hoje (4\u00ba dispatch em ~1h: wa-zybp, wa-wbub, wa-i02u + wa-6m6h double). N\u00c3O buildo agora: P2, enquanto (a) o Pilot est\u00e1 malfunctioning/stormando e (b) h\u00e1 tarefa P0 do Athos ativa (lotes Chopin\u00d7Turmalina pro disparo de segunda). Tarefa leg\u00edtima em si (e-SIC PGV Contagem) \u2014 pode ser pega corretamente quando o Pilot estiver consertado (ga-mfeip) e a prioridade do Athos resolvida. N\u00e3o claimo no storm.",
+    "created_at": "2026-06-21T02:46:48Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-jspga",
+  "store": "WA",
+  "title": "Spike: SMS outbound p/ poss\u00edveis donos de lote \u2192 link p/ formul\u00e1rio pr\u00e9-preenchido (consentimento WhatsApp + confirma\u00e7\u00e3o de dados)",
+  "description": "SPIKE (investiga\u00e7\u00e3o time-boxed de viabilidade \u2014 N\u00c3O \u00e9 a story final; reduz incerteza antes de refinar).\n\nHIP\u00d3TESE / INSPIRA\u00c7\u00c3O: igual QuintoAndar, mandar SMS personalizado a um poss\u00edvel dono de lote com um LINK. O link abre um formul\u00e1rio PR\u00c9-PREENCHIDO com os dados que j\u00e1 temos dela, e ela nos d\u00e1 de uma vez:\n  1) liberdade/consentimento de ser contactada por WhatsApp;\n  2) confirma\u00e7\u00e3o do ENDERE\u00c7O do im\u00f3vel;\n  3) INTERESSE (vender/negociar);\n  4) o GRAU DE RELA\u00c7\u00c3O dela com o im\u00f3vel (propriet\u00e1rio / herdeiro / esp\u00f3lio-invent\u00e1rio / procurador / c\u00f4njuge / etc.).\nGanho: converte um telefone frio em lead qualificado + consentido, sem depender de acertar o WhatsApp de cara.\n\nPERGUNTAS A RESPONDER (o spike):\n- PROVEDOR SMS BR: deliverability, custo/msg, remetente (short code / alfanum\u00e9rico), API. Candidatos: Zenvia, Comtele, Twilio, Infobip. Checar se j\u00e1 temos algum no vault (~/gt/SECRETS.md) / na infra do discador.\n- LINK + FORMUL\u00c1RIO: onde hospedar (subdom\u00ednio urblink.com.br via Cloudflare \u2014 runbook docs/superpowers/runbooks/cloudflare-new-subdomain.md), stack leve (form est\u00e1tico + backend). Token/ID \u00fanico no link \u2192 lookup dos dados do lead no nosso DB \u2192 pr\u00e9-preenche. Capturar respostas de volta (webhook \u2192 DB \u2192 funil).\n- FONTE DOS DADOS PR\u00c9-PREENCHIDOS: mega_data_set / real_estate.pf.cpf_consolidado / tabela de phones do outreach. Mapear lead\u2192token de forma SEGURA (n\u00e3o expor dado de terceiro; link n\u00e3o-adivinh\u00e1vel).\n- LGPD / CONSENTIMENTO: base legal p/ SMS a frio a PF, opt-out obrig",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/oracle/wa-jspga merged to whatsapp_automation/main (sha=1536d8aba8c75530753700c914b4c290c24e6ba6, gate_run=ga-wisp-s7tioy). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-10T17:56:35Z",
+  "issue_type": "feature",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'wa-worker-1' at 2026-07-10T14:36:20Z (tier=feature, lane=small, rig=whatsapp_automation).\nSling task bead: wa-jspga\nBuilder doctrine: implement \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 story:done.\nNo human review required.",
+    "created_at": "2026-07-10T14:36:55Z"
+   },
+   {
+    "author": "automation",
+    "text": "inflight-reclaim-guard (ga-se62o): reclaimed \u2014 no live builder and no recent branch progress for 31min (> 25min TTL). story:in-flight + pilot:dispatched cleared; assignee unset; status reset to open (ga-vw26y). Pilot will re-dispatch. (reclaim 1/3)",
+    "created_at": "2026-07-10T15:10:51Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Pilot dispatched builder 'wa-worker-1' at 2026-07-10T15:12:32Z (tier=feature, lane=small, rig=whatsapp_automation).\nSling task bead: wa-jspga\nBuilder doctrine: implement \u2192 /gate-done \u2192 autonomous gate+delivery \u2192 story:done.\nNo human review required.",
+    "created_at": "2026-07-10T15:13:09Z"
+   }
+  ]
+ },
+ {
+  "id": "wa-ctaaa",
+  "store": "WA",
+  "title": "inbound_generator form-fill ~94-100% failing since 06-27: cap counts failures, dead-source hammering, stale success-modal selector",
+  "description": "inbound_generator form-fill is ~94-100% failing since 2026-06-27. Three defects: (1) the daily cap counts FAILURES as submissions, locking out healthy sources; (2) dead/rejecting sources are hammered every cycle (no circuit-breaker); (3) stale success-modal selector mis-classifies submit results. AC: daily cap counts only genuinely-submitted rows; a dead/rejecting source auto-trips a breaker and auto-heals via periodic probes; submit result is classified correctly (success vs error vs ambiguous, no false-positive 'submitted'). Fix on branch crew/oracle/wa-ctaaa (in the quality-gate loop).",
+  "close_reason": "Quality gate PASSED \u2014 branch crew/oracle/wa-ctaaa merged to whatsapp_automation/main (sha=eb53aabe5ebcab7800e1b9942c9b02ed610a1dd5, gate_run=ga-wisp-bcybvca). Closed by autonomous dispatcher (ga-esbg).",
+  "closed_at": "2026-07-02T12:24:04Z",
+  "issue_type": "bug",
+  "priority": 1,
+  "comments": [
+   {
+    "author": "automation",
+    "text": "Context-check: marcado ctx:thin \u2014 falta contexto para um agente gen\u00e9rico construir sem um humano.\n  \u2022 O QU\u00ca: descri\u00e7\u00e3o vazia ou quase vazia (0 chars). Diga o que precisa ser feito e por qu\u00ea.\nQuando estiver completo, remova o label ctx:thin para re-avalia\u00e7\u00e3o.",
+    "created_at": "2026-07-01T17:02:33Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "GATE-FEEDBACK (gate_run=ga-wisp-bi0en7z branch=crew/oracle/wa-ctaaa): quality gate FAILED. Fix THESE specific blocking issues, then run /gate-done to re-gate.\n\nReviewer 1 FAIL: VERDICT: FAIL\nBlocking issue 1: lib/inbound_generator/form_filler.py:242-264, new function _submit_failure_reason() has an unreachable \"ambiguous\" branch (line 257-258, the \"success+error modals both visible (ambiguous)\" return). It is only called (line 395) when _classify_submit_result() (line 391) returned False, i.e. `success_visible and not error_visible` is False. Whenever the DOM is actually ambiguous (both modals visible), error_visible is True by definition, so the ERROR_MODAL_MARKERS loop directly above (lines 252-254, which checks the identical markers) always matches first and returns \"error modal: '<marker>'\" \u2014 the ambiguous branch can never execute. Verified empirically (not just by inspection): mocking _text_visible so BOTH SUCCESS_MODAL_MARKERS and ERROR_MODAL_MARKERS read as visible \u2014 the exact scenario _classify_submit_result's own docstring names as the historical false-positive bug (\"the page carries BOTH the success AND the error modal markup in its DOM\") \u2014 produces error_text = \"error mo",
+    "created_at": "2026-07-02T00:07:56Z"
+   },
+   {
+    "author": "athosmartins",
+    "text": "Gate FAILED (attempt 1/3) \u2014 labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) and builder assignee cleared. The Pilot will re-dispatch a builder with the GATE-FEEDBACK above.",
+    "created_at": "2026-07-02T00:07:57Z"
+   }
+  ]
+ }
+]

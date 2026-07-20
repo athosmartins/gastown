@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# recall -- thin wrapper (ga-ps28g): activates the recall-venv and execs
+# recall.py. Put this on PATH, e.g.:
+#   ln -sf "$GC_CITY_PATH/scripts/recall" ~/.local/bin/recall
+#
+# Runtime state (index, venv, usage log) lives under $GC_CITY_PATH/.gc/ —
+# see recall_lib.py — so this works from any cwd/worktree, not just HQ's
+# own checkout.
+set -euo pipefail
+
+CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
+VENV_PY="$CITY/.gc/recall-venv/bin/python3"
+RECALL_PY="$CITY/scripts/recall.py"
+
+if [ ! -x "$VENV_PY" ]; then
+  echo "recall: venv not found at $VENV_PY" >&2
+  echo "        one-time setup: python3.11 -m venv \"$CITY/.gc/recall-venv\" && \\" >&2
+  echo "          \"$CITY/.gc/recall-venv/bin/pip\" install -r \"$CITY/scripts/recall-requirements.txt\"" >&2
+  exit 1
+fi
+
+if [ ! -f "$RECALL_PY" ]; then
+  echo "recall: $RECALL_PY not found (GC_CITY_PATH=$CITY)" >&2
+  exit 1
+fi
+
+exec "$VENV_PY" "$RECALL_PY" "$@"
