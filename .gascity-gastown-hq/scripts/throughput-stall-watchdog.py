@@ -68,6 +68,7 @@ import sys as _sys
 _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 from gc_ledger import gc_ledger_append as _tsw_ledger
 import datetime as _tsw_datetime
+import park_labels
 
 # ── paths ────────────────────────────────────────────────────────────────────
 CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
@@ -195,36 +196,40 @@ GATE_PASS_RE = re.compile(r"Gate PASSED")
 # ga-3r41 (framework — no brake label, handled separately), + 1. False alarms erode the signal
 # (the Mayor learns to ignore the watchdog). The brake set now mirrors the painel's non-
 # dispatchable ("travada") taxonomy so backlog == what the Pilot can actually dispatch NOW.
-EXCLUDE_LABELS_BACKLOG = frozenset({
-    "gate:needs-human", "exec:manual", "blocked", "story:blocked", "story:in-flight",
-    "pilot:dispatched", "pilot:dispatching", "story:done",
-    # ── added 2026-07-15 (variant-aware via _bead_is_braked: matches exact OR "<label>:*") ──
-    "story:needs-human", "needs-human",          # generic human-punt (distinct from gate:needs-human)
-    "story:refinement-in-progress",              # still being refined — NOT approved-ready yet
-    "ctx:thin",                                  # under-specified — needs enrichment, Pilot won't build it
-    "story:cancelled",                           # cancelled ≠ dispatchable
-    "pilot:held",                                # Pilot deliberately not dispatching now (timed/route-refusal)
-    "pilot:reclaim-count:3",                     # circuit-broken (NEVERSTART cap) — proven un-dispatchable
-    "phone-proxy",                               # manual/proxy work, not pool-buildable
-    "gate:needs-fix", "gate:failed", "gate:needs-rebase",  # gate-parked, awaiting author fix/rebase
-    "gate:queued", "gate:reviewing",             # already IN the gate — not un-dispatched backlog
-    "blocked-on", "blocked-reason",              # dependency / external blocks (prefix-matched)
-})
+# ga-hzt8s (2026-07-20): sourced from the canonical park_labels.py vocabulary
+# (shared with approved-state-reconciler.py + imparavel-check.py) instead of a
+# fourth hand-maintained copy that had drifted from the other three — see
+# park_labels.py for what's in each group. This ADDS labels this file was
+# missing: needs-label-review, waiting-on (standalone — previously only the
+# blocked-on:*/blocked-reason:* prefixes were covered), framework:engine,
+# story:awaiting-external-merge, pilot:no-auto-dispatch, on-device, and
+# (via the wider ":"-or-"-" matcher below) pilot:held-until:* — pilot:held was
+# already listed but the OLD colon-only matcher never matched its real dash-
+# suffixed form. "pilot:reclaim-count:3" is NOT a member here anymore — it
+# only ever matched the exact string "3", so a bumped cap would have silently
+# stopped excluding; _bead_is_braked() now checks reclaim-exhaustion
+# numerically via park_labels.is_reclaim_exhausted() instead (deliverable 2).
+EXCLUDE_LABELS_BACKLOG = (
+    park_labels.PARK_LABELS | park_labels.GATE_PARK_LABELS
+    | park_labels.FLOWING_OR_DONE_LABELS
+)
 
 
 def _bead_is_braked(labels):
     """True iff any bead label marks it not-ready-to-dispatch. Matches an exclude
-    label EXACTLY or as a colon-suffixed VARIANT (e.g. EXCLUDE 'gate:needs-human'
-    also matches the real labels 'gate:needs-human:product' / ':technical'). The
-    old exact set-intersection MISSED these suffixed variants → product/technical-
+    label EXACTLY or as a ":"- or "-"-suffixed VARIANT (e.g. EXCLUDE
+    'gate:needs-human' also matches the real labels 'gate:needs-human:product' /
+    ':technical'; EXCLUDE 'pilot:held' also matches 'pilot:held-until:<epoch>' —
+    ga-hzt8s widened this from colon-only to park_labels.label_matches's rule,
+    since several real label shapes use a dash suffix, e.g. needs:rehome-property).
+    The old exact set-intersection MISSED suffixed variants → product/technical-
     braked + story:blocked beads were counted as dispatchable backlog → false STALL
     (observed 2026-06-27: wa-43k needs-human:product, wa-el8t/n0vv story:blocked,
-    wa-f5q4 story:done all miscounted). Same session-suffix matcher class."""
-    for lab in labels:
-        for ex in EXCLUDE_LABELS_BACKLOG:
-            if lab == ex or lab.startswith(ex + ":"):
-                return True
-    return False
+    wa-f5q4 story:done all miscounted). Also excludes reclaim-exhausted beads
+    (pilot:reclaim-count:N >= cap) via a numeric check, not a label-string match."""
+    if park_labels.any_labeled(labels, EXCLUDE_LABELS_BACKLOG):
+        return True
+    return park_labels.is_reclaim_exhausted(labels)
 
 # ── test seams (monkeypatched in --selftest) ──────────────────────────────────
 # These are module-level callables so tests can substitute them without patching subprocess.
@@ -2089,6 +2094,45 @@ def _selftest():
     else:
         _bad("PR5", "HQ root=%r  CITY=%r — HQ root does NOT equal bead store (bd -C will fail)" % (
              _hq_roots_pr5[0] if _hq_roots_pr5 else None, CITY))
+
+    print("\nScenario ga-hzt8s-1: _bead_is_braked — newly-added park labels (deliverable 2, "
+          "sourced from the canonical park_labels.py) now excluded from backlog")
+    _ghz_cases = [
+        (["story:approved", "needs-label-review"], True, "needs-label-review"),
+        (["ctx:ready", "waiting-on:wa-9999"], True, "waiting-on:* (standalone, previously "
+         "only blocked-on:*/blocked-reason:* were covered)"),
+        (["story:approved", "framework:engine"], True, "framework:engine"),
+        (["story:approved", "story:awaiting-external-merge"], True, "story:awaiting-external-merge"),
+        (["ctx:ready", "pilot:no-auto-dispatch"], True, "pilot:no-auto-dispatch"),
+        (["ctx:ready", "on-device"], True, "on-device"),
+        (["story:approved", "pilot:held-until:9999999999"], True,
+         "pilot:held-until:* (dash-suffix of pilot:held — the OLD colon-only "
+         "matcher never matched this despite listing bare pilot:held)"),
+        (["story:approved", "ctx:ready"], False, "no park label — genuinely backlog"),
+    ]
+    for _ghz_labs, _ghz_expect, _ghz_desc in _ghz_cases:
+        _ghz_got = _bead_is_braked(set(_ghz_labs))
+        if _ghz_got == _ghz_expect:
+            _ok("ga-hzt8s-1: %s → braked=%s" % (_ghz_desc, _ghz_expect))
+        else:
+            _bad("ga-hzt8s-1", "%s: expected braked=%s got %s" % (_ghz_desc, _ghz_expect, _ghz_got))
+
+    print("\nScenario ga-hzt8s-2: _bead_is_braked — reclaim-count is now a NUMERIC >= cap "
+          "check (park_labels.is_reclaim_exhausted), not the old hardcoded exact-string "
+          "'pilot:reclaim-count:3' — a bumped/higher count is still correctly excluded")
+    _ghz_over_cap = _bead_is_braked({"story:approved", "pilot:reclaim-count:4"})
+    _ghz_under_cap = _bead_is_braked({"story:approved", "pilot:reclaim-count:2"})
+    if _ghz_over_cap is True:
+        _ok("ga-hzt8s-2: pilot:reclaim-count:4 (>= DEFAULT_RECLAIM_CAP=3) → braked "
+            "(old exact-string match for '3' would have MISSED this)")
+    else:
+        _bad("ga-hzt8s-2", "pilot:reclaim-count:4 should be braked (numeric >=), got %s"
+             % _ghz_over_cap)
+    if _ghz_under_cap is False:
+        _ok("ga-hzt8s-2: pilot:reclaim-count:2 (< cap) → NOT braked (still genuinely retrying)")
+    else:
+        _bad("ga-hzt8s-2", "pilot:reclaim-count:2 should NOT be braked yet, got %s"
+             % _ghz_under_cap)
 
     # ── cleanup ───────────────────────────────────────────────────────────────────
     _read_pilot_log_lines = None

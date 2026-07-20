@@ -32,6 +32,9 @@ e traz o veredito honesto. Este script NÃO dá opinião — mede a definição:
 """
 import json, os, subprocess, sys, time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import park_labels
+
 CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
 RIGS = [("HQ", CITY),
         ("WA", "/Users/athos/gt/whatsapp_automation"),
@@ -51,15 +54,13 @@ MAX_CLASSIFY = int(os.environ.get("IMP_MAX_CLASSIFY", "40"))  # cap to avoid han
 # Labels that mark a bead as NOT auto-dispatchable right now (not a silent stall).
 # A bead carrying ANY of these is parked for a real reason — the Pilot correctly
 # won't auto-dispatch it, so it is NOT a "buildable bead silently stuck".
-PARKING_LABELS = ("gate:needs-human", "story:needs-human", "on-device",
-                  "story:needs-device", "blocked", "story:blocked",
-                  # found 2026-06-28 peeling layers: these ALSO mean "not auto-dispatchable":
-                  "exec:manual",        # manual execution — Pilot doesn't auto-dispatch
-                  "waiting-on",         # waiting-on:<dep> — blocked on a dependency/bead
-                  "next-action",        # next-action:<human> — needs a human action
-                  "needs:rehome",       # needs:rehome-property — needs re-homing to a store
-                  "pilot:held",         # the Pilot itself is holding it (held / held-loop)
-                  "status")             # synthetic status:deferred / status:blocked (see _bd_show_labels_text)
+#
+# ga-hzt8s: sourced from the canonical park_labels.py vocabulary (shared with
+# approved-state-reconciler.py + throughput-stall-watchdog.py) so this list
+# can't drift out of sync with the other two the way it did before. "status"
+# is imparavel-specific (a synthetic label _bd_show_labels_text() derives from
+# the bead's STATUS header, not a real bead label) and stays local.
+PARKING_LABELS = tuple(park_labels.PARK_LABELS) + ("status",)
 
 NOW = time.time()
 
@@ -145,8 +146,10 @@ def _bd_show_labels_text(root, bead_id):
 
 def _label_matches(label, base):
     """A label matches a base if it is the base exactly, or a colon-suffixed
-    (gate:needs-human:on-device) or dash-suffixed (needs:rehome-property) variant."""
-    return label == base or label.startswith(base + ":") or label.startswith(base + "-")
+    (gate:needs-human:on-device) or dash-suffixed (needs:rehome-property) variant.
+    Delegates to the canonical matcher (ga-hzt8s) — kept as a local name since
+    every call site in this file already uses it."""
+    return park_labels.label_matches(label, base)
 
 
 def _label_is_parking(label):

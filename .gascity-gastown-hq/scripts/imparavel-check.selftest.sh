@@ -45,6 +45,23 @@ eq("pilot:held-until:<future> (dash variant of pilot:held)",
 eq("pilot:held-until repeated 7x (held-loop) still parks", C("b", ["ctx:ready"]
    + ["pilot:held-until:%d" % i for i in range(7)], NONE)[0], "parked")
 
+print("── ga-hzt8s: PARKING_LABELS now sourced from canonical park_labels.py — "
+      "labels this file didn't previously recognize also park ──")
+eq("needs-label-review", C("b", ["needs-label-review"], NONE)[0], "parked")
+eq("phone-proxy", C("b", ["ctx:ready", "phone-proxy"], NONE)[0], "parked")
+eq("story:refinement-in-progress", C("b", ["ctx:ready", "story:refinement-in-progress"], NONE)[0], "parked")
+eq("ctx:thin", C("b", ["ctx:ready", "ctx:thin"], NONE)[0], "parked")
+eq("story:cancelled", C("b", ["story:cancelled"], NONE)[0], "parked")
+eq("framework:engine", C("b", ["framework:engine"], NONE)[0], "parked")
+eq("story:awaiting-external-merge", C("b", ["story:awaiting-external-merge"], NONE)[0], "parked")
+eq("pilot:no-auto-dispatch", C("b", ["ctx:ready", "pilot:no-auto-dispatch"], NONE)[0], "parked")
+eq("pool:refused:engine-rebuild-required", C("b", ["pool:refused:engine-rebuild-required"], NONE)[0], "parked")
+eq("blocked-on:<id> (via 'blocked' base + dash-suffix match)",
+   C("b", ["ctx:ready", "blocked-on:wa-9999"], NONE)[0], "parked")
+# regression guard: a genuinely buildable bead must still classify as stuck, unaffected
+# by the wider PARKING_LABELS import.
+eq("still stuck: ctx:ready+exec:auto, none of the new labels", C("fresh", ["ctx:ready", "exec:auto"], NONE)[0], "stuck")
+
 print("── (b) REGRESSION: already-built / in-gate → parked, NOT stuck ──")
 # wa-8y45 at symptom time: STALE ctx:ready+exec:auto (the context-check-dispatcher had
 # not yet flipped exec:auto→exec:manual), but a DURABLE open gate marker named it.

@@ -56,6 +56,7 @@ try:
 except ImportError:
     def _arc_ledger(name, data, *, fail_open=False):  # type: ignore
         pass
+import park_labels
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
@@ -371,26 +372,32 @@ def _classify(bead):
     """
     labels = _get_labels(bead)
 
+    # ga-hzt8s: label spellings below are sourced from park_labels.py (shared
+    # with imparavel-check.py + throughput-stall-watchdog.py) so this routing
+    # table can't drift from the other two park-label consumers. The BUCKET
+    # SHAPE (routing to a target state) stays local — painel's _travada_reason
+    # and imparavel's classify_bead each have their own, not unified here.
+
     # 1. post-build: gate:passed — the bead already built; delivery owns next state.
-    if _has_prefix(labels, "gate:passed"):
+    if _has_prefix(labels, park_labels.GATE_PASSED_LABEL):
         for lab in labels:
-            if lab == "gate:passed" or lab.startswith("gate:passed:"):
+            if lab == park_labels.GATE_PASSED_LABEL or lab.startswith(park_labels.GATE_PASSED_LABEL + ":"):
                 return "post-build", "label %s" % lab
         return "post-build", "gate:passed label present"
 
     # 2. needs-device: LABEL ONLY.
-    if "story:needs-device" in labels:
-        return "needs-device", "label story:needs-device"
+    if park_labels.NEEDS_DEVICE_LABEL in labels:
+        return "needs-device", "label %s" % park_labels.NEEDS_DEVICE_LABEL
 
     # 3. needs-human: gate:needs-human* (prefix) OR story:needs-human LABEL ONLY.
-    if "story:needs-human" in labels:
-        return "needs-human", "label story:needs-human"
+    if park_labels.NEEDS_HUMAN_LABEL in labels:
+        return "needs-human", "label %s" % park_labels.NEEDS_HUMAN_LABEL
     for lab in labels:
-        if lab.startswith("gate:needs-human"):
+        if lab.startswith(park_labels.GATE_NEEDS_HUMAN_PREFIX):
             return "needs-human", "label %s" % lab
 
     # 4. blocked: LABEL ONLY (blocked or story:blocked).
-    for lab in ("blocked", "story:blocked"):
+    for lab in park_labels.BLOCKED_LABELS:
         if lab in labels:
             return "blocked", "label %s" % lab
 
@@ -1013,8 +1020,17 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
         # ga-xwza2: routed through the read-cache shim — this is the "reconciler"
         # named in the bug (30min poll), a pure eligibility-membership scan, not a
         # read-after-write (this cycle never writes story:approved then re-reads it).
+        #
+        # ga-hzt8s (2026-07-20, deliverable 1): widened from "open" only to also
+        # include in_progress/deferred (mirrors painel_visibilidade.py's kanban
+        # query, ~line 2154) — a bead that flipped to in_progress/deferred (e.g.
+        # gate-failed, still carrying story:approved) was previously INVISIBLE to
+        # this reconciler entirely, so it could never be seen, classified, flowing-
+        # checked, or alarmed on. _classify() and _is_flowing() below (unchanged
+        # order — see the comment at the _is_flowing() call site) are what keep
+        # this widening safe now that non-open statuses are in scope.
         r = _sh(["bash", BD_LIST_CACHED, "-C", rig_root, "list", "-l", "story:approved",
-                 "--status", "open", "--json", "-n", "200"],
+                 "--status", "open,in_progress,deferred", "--json", "-n", "200"],
                 timeout=BD_TIMEOUT)
         if r is None or r.returncode != 0:
             _log("  [%s] bd list story:approved failed (rc=%s) — skipping store (fail-open)"
@@ -1023,10 +1039,10 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
         beads = _parse_bd_json(r.stdout)
 
     if not beads:
-        _log("  [%s] 0 story:approved open beads" % os.path.basename(rig_root))
+        _log("  [%s] 0 story:approved bead(s) (open/in_progress/deferred)" % os.path.basename(rig_root))
         return 0, 0, 0
 
-    _log("  [%s] %d story:approved open bead(s) to evaluate" % (
+    _log("  [%s] %d story:approved bead(s) to evaluate (open/in_progress/deferred)" % (
          os.path.basename(rig_root), len(beads)))
 
     processed = routed = alarmed = 0
@@ -1099,6 +1115,20 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
             continue
 
         # If the bead is in-flight or dispatched → already flowing, no action.
+        #
+        # ga-hzt8s (2026-07-20): deliberately NOT checked before Step 1's _classify()
+        # call — an earlier draft of this fix moved it there, reasoning that routing
+        # strips story:approved just as destructively as a false starve-alarm. Live
+        # data proved that wrong: wa-srgv and wa-6cx36 (both in_progress, both newly
+        # in scope via the widened --status filter above) carry a STALE flowing
+        # signal (pilot:dispatched left over from a prior dispatch/escalation cycle)
+        # ALONGSIDE an accurate, current gate:needs-human* label — gating classify()
+        # on _is_flowing() would have left story:approved stuck on them forever,
+        # reproducing the exact bug this fix targets. _classify()'s routing labels
+        # (gate:passed/needs-device/needs-human/blocked) already take precedence over
+        # flowing/assignee signals for OPEN beads in the pre-existing code — that
+        # precedence is unchanged here, just now also reached by in_progress/deferred
+        # beads. See selftest scenario (pp) for the regression guard.
         if _is_flowing(bead):
             _log("  %s: flowing (story:in-flight / pilot:dispatched / assignee) — OK" % bead_id)
             continue
@@ -1128,7 +1158,7 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
             continue
 
         # pilot:held-until — pilot explicitly parked this bead.
-        if _has_prefix(labels, "pilot:held-until"):
+        if _has_prefix(labels, park_labels.PILOT_HELD_LABEL + "-until"):
             _log("  %s: no signal, daemon-age=%.0fmin, pilot:held-until — no alarm" % (
                  bead_id, starve_age_min))
             continue
@@ -1136,7 +1166,7 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
         # pilot:held (bare, no -until suffix) — a DISTINCT label family from
         # pilot:held-until:<epoch> above (no expiry to parse); pilot deliberately
         # parked this bead (ga-an81u AC1).
-        if "pilot:held" in labels:
+        if park_labels.PILOT_HELD_LABEL in labels:
             _log("  %s: no signal, daemon-age=%.0fmin, pilot:held — no alarm" % (
                  bead_id, starve_age_min))
             continue
@@ -1177,7 +1207,7 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
         # failure: the gate-fix loop owns re-dispatch, and its own fix-cap (gate:fix-attempt:N →
         # gate:needs-human at cap, escalated by the gate itself) is the real backstop — and
         # gate:needs-human is already excluded as a non-buildable signal above. Suppress here.
-        if "gate:needs-fix" in labels:
+        if park_labels.GATE_NEEDS_FIX_LABEL in labels:
             _log("  %s: no signal, daemon-age=%.0fmin, gate:needs-fix (gate-fix loop owns "
                  "re-dispatch; cap→needs-human is the backstop) — no alarm" % (
                  bead_id, starve_age_min))
@@ -1189,7 +1219,7 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
         # gate:needs-fix yet being stamped (ga-an81u AC1: wa-pltmi carried both
         # gate:failed and gate:needs-fix while still getting falsely alarmed).
         # Same suppression rationale as gate:needs-fix above.
-        if "gate:failed" in labels:
+        if park_labels.GATE_FAILED_LABEL in labels:
             _log("  %s: no signal, daemon-age=%.0fmin, gate:failed (gate-fix loop owns "
                  "re-dispatch) — no alarm" % (bead_id, starve_age_min))
             continue
@@ -1201,7 +1231,7 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
         # awaiting a human to run it. Same shape as gate:needs-fix above: suppress the alarm,
         # do NOT reclassify (no target state exists; the bead correctly stays story:approved).
         # Exact-match only (not a prefix check) — exec:auto must keep alarming if it starves.
-        if "exec:manual" in labels:
+        if park_labels.EXEC_MANUAL_LABEL in labels:
             _log("  %s: no signal, daemon-age=%.0fmin, exec:manual (awaiting human execution, "
                  "not a dispatch failure) — no alarm" % (bead_id, starve_age_min))
             continue
@@ -1405,6 +1435,13 @@ def _selftest():
                 + no blocking label → STILL alarms (AC2 fix isn't over-permissive)
       (nn)      AC3 (ga-yavyq) fail-safe: `bd blocked` query FAILS (blocked_ids=
                 None) → no starve alarm, same direction as built_ids=None (z)
+      (oo)      ga-hzt8s deliverable 1: the real bd-list query's --status arg is
+                'open,in_progress,deferred', not just 'open'
+      (pp)      ga-hzt8s regression guard: a bead with a stale flowing signal
+                (pilot:dispatched) PLUS an explicit routing label (gate:needs-
+                human) still gets routed — classify() takes precedence over a
+                stale flowing/assignee signal, matching pre-existing open-bead
+                behavior (live repro: wa-srgv, wa-6cx36)
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
@@ -2361,6 +2398,54 @@ def _selftest():
     else:
         _bad("(nn)", "FALSELY alarmed when bd-blocked query failed (dep-state unknown); "
              "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (oo): ga-hzt8s deliverable 1 — the real bd-list query's --status "
+          "arg is widened to 'open,in_progress,deferred' (not just 'open')")
+    _captured_argv_oo = []
+
+    def _fake_sh_capture_oo(args, timeout=20):
+        _captured_argv_oo.append(args)
+        class _R:
+            returncode = 0
+            stdout = "[]"
+        return _R()
+
+    _bd_approved = None                # force the REAL query-building code path
+    _sh = _fake_sh_capture_oo
+    _process_store(RIG_ROOTS[0], NOW, {"first_seen_approved": {}}, True, set(), set())
+    _sh = _stub_sh_fast
+    _status_arg_oo = None
+    for _argv in _captured_argv_oo:
+        if "story:approved" in _argv and "--status" in _argv:
+            _status_arg_oo = _argv[_argv.index("--status") + 1]
+            break
+    if _status_arg_oo == "open,in_progress,deferred":
+        _ok("(oo): story:approved query --status widened to 'open,in_progress,deferred'")
+    else:
+        _bad("(oo)", "expected --status 'open,in_progress,deferred', got %r (captured=%r)" % (
+             _status_arg_oo, _captured_argv_oo))
+
+    print("\nScenario (pp): ga-hzt8s regression guard — a bead carrying BOTH a stale "
+          "flowing signal (pilot:dispatched) AND an explicit routing label "
+          "(gate:needs-human) IS ROUTED (classify wins over flowing/assignee, matching "
+          "pre-existing behavior for open beads). Live repro: wa-srgv and wa-6cx36 "
+          "(whatsapp_automation) are in_progress with a stale pilot:dispatched left over "
+          "from a prior dispatch/escalation cycle, plus a current gate:needs-human* label "
+          "— an earlier draft of this fix checked _is_flowing() before _classify() and "
+          "left story:approved stuck on both forever; this guards against reintroducing "
+          "that regression.")
+    _bd_approved = lambda root: [_make_bead(
+        "wa-046", labels=["story:approved", "pilot:dispatched", "gate:needs-human"])]
+    st_pp = _reset()
+    run_cycle(NOW, st_pp)
+    routed_pp = ("wa-046", "story:approved") in label_removes and \
+                ("wa-046", "story:needs-human") in label_adds
+    if routed_pp:
+        _ok("(pp): stale-flowing + gate:needs-human → routed to story:needs-human "
+            "(story:approved finally stripped, matching the wa-srgv/wa-6cx36 fix)")
+    else:
+        _bad("(pp)", "expected routing to story:needs-human despite pilot:dispatched — "
+             "removes=%s adds=%s" % (label_removes, label_adds))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
