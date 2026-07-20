@@ -108,6 +108,17 @@ notify -t "job failed" -p 5 "the thing failed" 2>/dev/null || true
 EOF
 cp "$FIXDIR/mixed/good_cleanup_true.sh" "$FIXDIR/clean/"
 
+# ── ga-6jfuo: a *.selftest.sh file containing a C2-shaped pattern ON PURPOSE
+# — mirrors exactly what tripped the false positive (this scanner's OWN
+# fixture heredocs above are C1/C2-shaped by construction, e.g.
+# bad_query_mask_echo.sh's content). Proves FIND-level exclusion, not
+# detection-level: scan_shell_query_masking still flags this content when
+# called directly (asserted in the scan_shell_query_masking section below) —
+# only run_scan's file-discovery `find` must skip *.selftest.sh files ───────
+cat > "$FIXDIR/mixed/fixture_shape.selftest.sh" <<'EOF'
+_found=$(bd -C "$_store" list --label "gate:needs-human" --status=open --json 2>/dev/null || echo "[]")
+EOF
+
 # ── C1: JS empty catch — mirrors the real collectPhones()/cwEnsurePhones
 # incident shape (single-line), plus the common multi-line shape ──────────
 cat > "$FIXDIR/mixed/bad_catch.js" <<'EOF'
@@ -326,6 +337,9 @@ r="$(scan_shell_query_masking "$FIXDIR/mixed/good_rc_capture.sh")"
 r="$(scan_shell_query_masking "$FIXDIR/mixed/good_cleanup_true.sh")"
 [ -z "$r" ] && ok "non-query cleanup '|| true' and notify call → NOT flagged" || bad "REGRESSION: innocent || true flagged: '$r'"
 
+r="$(scan_shell_query_masking "$FIXDIR/mixed/fixture_shape.selftest.sh")"
+case "$r" in *:C2:*) ok "ga-6jfuo: detection still fires on *.selftest.sh CONTENT when scanned directly (exclusion is find-level, not detection-level)" ;; *) bad "ga-6jfuo: detection regressed on *.selftest.sh content: '$r'" ;; esac
+
 echo "── scan_js_empty_catch ──"
 r="$(scan_js_empty_catch "$FIXDIR/mixed/bad_catch.js")"
 n=$(printf '%s\n' "$r" | grep -c ':C1:')
@@ -372,9 +386,16 @@ echo "── run_scan end-to-end (mixed fixture dir) ──"
 MIXED_OUT="$(mktemp)"
 run_scan "$MIXED_OUT" "$FIXDIR/mixed"
 mixed_count=$(wc -l <"$MIXED_OUT" | tr -d '[:space:]')
-# 3 shell (C1x1 + C2x2) + 2 JS + 2 py + 1 plist = 8
-[ "$mixed_count" = "10" ] && ok "mixed fixture dir → 10 findings (matches every planted bad case, nothing missed or double-counted; +2 do ga-vkjs: parser-com-default)" \
+# 3 shell (C1x1 + C2x2) + 2 JS + 2 py + 1 plist = 8, +2 do ga-vkjs (parser-
+# com-default) = 10. fixture_shape.selftest.sh is an 11th C2-shaped file
+# planted on purpose — it must stay find-excluded, so the total stays 10.
+[ "$mixed_count" = "10" ] && ok "mixed fixture dir → 10 findings (matches every planted bad case, nothing missed or double-counted; ga-6jfuo's *.selftest.sh fixture correctly NOT counted)" \
   || bad "expected 10 findings in mixed dir, got $mixed_count"
+
+case "$(cat "$MIXED_OUT")" in
+  *fixture_shape.selftest.sh*) bad "ga-6jfuo REGRESSION: *.selftest.sh file was scanned by run_scan (should be find-excluded): $(grep 'fixture_shape.selftest.sh' "$MIXED_OUT")" ;;
+  *) ok "ga-6jfuo: *.selftest.sh fixture excluded from run_scan's find (fixtures are intentional test patterns, not real findings)" ;;
+esac
 rm -f "$MIXED_OUT"
 
 # ═════════════════════════════════════════════════════════════════════════

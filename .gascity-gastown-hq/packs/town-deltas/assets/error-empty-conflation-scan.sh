@@ -322,6 +322,10 @@ run_scan() {
     -not -path '*/.wt-*' -not -path '*/.viewer-deploy-clone/*' -not -path '*/.claude/*'
     -not -path '*/venv/*' -not -path '*/.venv/*'
     -not -path '*/site-packages/*' -not -path '*/__pycache__/*'
+    # ga-6jfuo: *.selftest.sh contem padroes C1/C2 DE PROPOSITO (fixtures pra
+    # testar o proprio detector) -> falso-positivo na varredura de producao.
+    # Nao afeta o selftest do scanner em si, que chama scan_* diretamente.
+    -not -name '*.selftest.sh'
   )
 
   local f
