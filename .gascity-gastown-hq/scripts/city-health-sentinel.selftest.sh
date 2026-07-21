@@ -260,15 +260,16 @@ sleep 30
 GCEOF
 chmod +x "$CDJ_FAKE_GC"
 
-# Case 1: probe times out, SELECT-1 serve-confirm says Dolt IS up (saturation, not
-# an outage) -> _collect_dolt_json re-probes (2 total gc invocations).
+# Case 1: probe times out, SELECT-1 serve-confirm says Dolt IS up (it served a raw
+# SELECT 1) -> saturation, not an outage -> reachable:true, taking the serve-confirm
+# as authoritative (NO re-probe, which would just reproduce the timeout ambiguity).
 cdj_reset
 _gc_dolt_serve_confirm() { return 0; }   # SELECT 1 served -> Dolt UP
 CDJ_OUT="$(_collect_dolt_json)"
-if [ "$(cdj_calls)" = "2" ] && echo "$CDJ_OUT" | jq -e '.probe_rc == 124' >/dev/null 2>&1; then
-  ok "timeout + serve-confirm UP -> re-probed once (saturation, not a confirmed outage)"
+if [ "$(cdj_calls)" = "1" ] && echo "$CDJ_OUT" | jq -e '.reachable == true' >/dev/null 2>&1; then
+  ok "timeout + serve-confirm UP -> reachable:true (saturation; serve-confirm authoritative, no wasteful re-probe)"
 else
-  bad "timeout + serve-confirm UP -> expected exactly 2 gc invocations (retry), got $(cdj_calls): $CDJ_OUT"
+  bad "timeout + serve-confirm UP -> expected 1 gc invocation + reachable:true, got $(cdj_calls): $CDJ_OUT"
 fi
 
 # Case 2: probe times out AND SELECT-1 serve-confirm says Dolt is genuinely DOWN ->
@@ -282,16 +283,18 @@ else
   bad "timeout + serve-confirm DOWN -> expected exactly 1 gc invocation (no retry) and an unhealthy/124 reading, got $(cdj_calls): $CDJ_OUT"
 fi
 
-# Case 3: SELECT-1 serve-confirm itself is inconclusive (e.g. no mysql client in
-# this env) -> still worth ONE re-probe; gc-dolt-probe.sh's own contract says an
-# inconclusive check must never assert an outage, so this path must not either.
+# Case 3 (ga-eldeu gap-2, the review finding): SELECT-1 serve-confirm is inconclusive
+# (no mysql client, or SELECT-1 also unresolved) -> the timeout CANNOT be disambiguated,
+# so it maps to reachable:null (UNKNOWN), never to a confirmed outage. The old code
+# re-probed and, if that also timed out, returned reachable:false verbatim — asserting
+# an outage the evidence didn't support. No re-probe now; unknown stands.
 cdj_reset
 _gc_dolt_serve_confirm() { return 2; }   # inconclusive (no client available)
 CDJ_OUT="$(_collect_dolt_json)"
-if [ "$(cdj_calls)" = "2" ]; then
-  ok "timeout + serve-confirm INCONCLUSIVE -> still re-probed (an unconfirmable check does not skip the extra chance)"
+if [ "$(cdj_calls)" = "1" ] && echo "$CDJ_OUT" | jq -e '.reachable == null' >/dev/null 2>&1; then
+  ok "timeout + serve-confirm INCONCLUSIVE -> reachable:null (unknown), NEVER a confirmed outage (unresolved timeout != down)"
 else
-  bad "timeout + serve-confirm inconclusive -> expected exactly 2 gc invocations (retry), got $(cdj_calls)"
+  bad "timeout + serve-confirm inconclusive -> expected 1 gc invocation + reachable:null, got $(cdj_calls): $CDJ_OUT"
 fi
 
 # Case 4: probe succeeds on the FIRST attempt -> serve-confirm must never be

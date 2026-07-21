@@ -403,18 +403,22 @@ _collect_dolt_json() {
   json="$(gc_dolt_probe_json 2>/dev/null)"
   rc="$(printf '%s' "$json" | jq -r '.probe_rc // empty' 2>/dev/null)"
   if [ "$rc" = "124" ] && declare -f _gc_dolt_serve_confirm >/dev/null 2>&1; then
-    serve_rc=2
+    # The health probe timed out (rc=124) — ambiguous on its own. Disambiguate
+    # with the direct SELECT-1 serve-confirm and let THAT be authoritative; do
+    # NOT re-probe. A second health probe would just reproduce the same timeout
+    # ambiguity, and taking its reachable:false as the answer asserts a CONFIRMED
+    # outage the serve-confirm evidence contradicts (ga-eldeu gap-2 review): an
+    # unresolved timeout must map to UNKNOWN, never to a confirmed outage — main()'s
+    # three-state dolt_responds then reports "could not confirm", not "Dolt is down".
+    #   serve_rc=0  SELECT 1 SERVED             -> Dolt UP (saturation) -> reachable:true
+    #   serve_rc=1  refused / SELECT-1 timed out -> real outage          -> reachable:false
+    #   serve_rc=2  no client / inconclusive     -> cannot confirm        -> reachable:null (unknown)
     _gc_dolt_serve_confirm 2>/dev/null; serve_rc=$?
-    # serve_rc=1 (SELECT 1 refused/hung) is the ONLY case that CONFIRMS the
-    # outage this timeout already suggested — skip the extra round-trip and
-    # keep this reading. serve_rc=0 (served -> saturation, not an outage) AND
-    # serve_rc=2 (no mysql client -> inconclusive, never asserts an outage per
-    # gc-dolt-probe.sh's own fail-open contract) both get ONE re-probe: a
-    # single ambiguous timeout must not be the last word when Dolt might
-    # answer normally a moment later.
-    if [ "$serve_rc" != "1" ]; then
-      json="$(gc_dolt_probe_json 2>/dev/null)"
-    fi
+    case "$serve_rc" in
+      0) json="$(printf '%s' "$json" | jq -c '.reachable=true  | .state="saturated"' 2>/dev/null || printf '%s' "$json")" ;;
+      1) json="$(printf '%s' "$json" | jq -c '.reachable=false | .state="unhealthy"' 2>/dev/null || printf '%s' "$json")" ;;
+      *) json="$(printf '%s' "$json" | jq -c '.reachable=null  | .state="unknown"'   2>/dev/null || printf '%s' "$json")" ;;
+    esac
   fi
   printf '%s\n' "$json"
 }
