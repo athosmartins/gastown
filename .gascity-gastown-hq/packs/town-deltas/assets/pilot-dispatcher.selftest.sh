@@ -1143,7 +1143,11 @@ _attmention() { (
     _beadid_mentioned_in_attached_session "$1"
 ); }
 
-ATT_SESSIONS_JSON='{"sessions":[{"alias":"gastown.mayor","closed":false,"attached":true}]}'
+# NOTE: deliberately a non-Mayor alias — ga-lluq1 exempts the Mayor's own
+# session from this cache (dedicated coverage in (u6)-(u8) below), so this
+# generic matching-logic fixture uses a real crew/builder identity instead,
+# to avoid being confounded by that exemption.
+ATT_SESSIONS_JSON='{"sessions":[{"alias":"wa-worker-attached-1","closed":false,"attached":true}]}'
 
 # (u1) real match: peek output mentions the bead id as a whole token.
 ATT_PEEK_OUTPUT="🔨 ga-n9bw (engine-window) — implementando agora."
@@ -1171,6 +1175,40 @@ ATT_SESSIONS_JSON='{"sessions":[{"alias":"wa-worker-adhoc-1","closed":false,"att
 ATT_PEEK_OUTPUT="ga-n9bw"
 _attmention "ga-n9bw" && bad "OWN-GUARD(e-unit5): fired with zero attached sessions — should never peek a non-attached worker" \
                       || ok "OWN-GUARD(e-unit5): zero attached sessions → fail-open allow, no spurious peek"
+
+# ── ga-lluq1: Mayor session exemption from the attached-mention scan ───────────
+# ROOT (found 2026-07-21, ga-t1ub9 starving ~30h + 3 reconciler alarms): the
+# Mayor coordinates approved work in-conversation (triages/holds/comments) but
+# by doctrine never hand-builds ('Mayor delega toda impl') — so its own
+# transcript mentioning a bead must not be read as "an attached session owns
+# this." Without the exemption, EVERY bead the Mayor merely discusses gets
+# refused on every dispatch sweep for as long as the mention stays in its
+# recent transcript window.
+
+# (u6) a mention that appears ONLY in the MAYOR's attached session must NOT
+# fire the signal.
+ATT_SESSIONS_JSON='{"sessions":[{"alias":"gastown.mayor","closed":false,"attached":true}]}'
+ATT_PEEK_OUTPUT="Mayor discussing ga-t1ub9 — holding for capacity, not building."
+_attmention "ga-t1ub9" && bad "OWN-GUARD(e-unit6): Mayor-only mention wrongly fired signal (e) — ga-lluq1 regression, would starve approved beads the Mayor merely discusses" \
+                       || ok "OWN-GUARD(e-unit6): Mayor-only mention does NOT fire signal (e) (ga-lluq1 fix)"
+
+# (u7) control — the same bead ALSO mentioned via a live CREW/builder attached
+# session present in the SAME roster as the Mayor must STILL fire the signal:
+# the exemption excludes only the Mayor's own session from the peek roster,
+# it is not a global cache bypass.
+ATT_SESSIONS_JSON='{"sessions":[{"alias":"gastown.mayor","closed":false,"attached":true},{"alias":"wa-worker-1","closed":false,"attached":true}]}'
+ATT_PEEK_OUTPUT="🔨 ga-t1ub9 — implementando agora."
+_attmention "ga-t1ub9" && ok "OWN-GUARD(e-unit7): live crew mention STILL fires signal (e) even when the Mayor is also attached (exemption scoped correctly, not a global cache bypass)" \
+                       || bad "OWN-GUARD(e-unit7): crew mention wrongly suppressed when the Mayor is also attached — real owner protection lost"
+
+# (u8) belt-and-suspenders: the Mayor identified ONLY by the double-underscore
+# session_name form ("gastown__mayor", no alias/name populated) must ALSO be
+# exempt — the exact alias-vs-session_name mismatch class already fixed once
+# in quality-gate-guard.sh's session_matches_author (ga-ipf6).
+ATT_SESSIONS_JSON='{"sessions":[{"session_name":"gastown__mayor","closed":false,"attached":true}]}'
+ATT_PEEK_OUTPUT="ga-t1ub9 mentioned via session_name-only Mayor record"
+_attmention "ga-t1ub9" && bad "OWN-GUARD(e-unit8): Mayor identified only by session_name still wrongly fired signal (e)" \
+                       || ok "OWN-GUARD(e-unit8): Mayor identified only by session_name is ALSO exempt (ga-ipf6-class form covered)"
 
 # ── Scenario 3f: pre-approval lifecycle stories are excluded (ga-w7wvm) ─────────
 # The Pilot dispatches ONLY story:approved features; pre-approval lifecycle states

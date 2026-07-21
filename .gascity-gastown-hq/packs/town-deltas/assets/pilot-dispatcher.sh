@@ -2805,6 +2805,19 @@ _beadid_has_open_gate_marker() {
 # the alternative of a silent double-write into a shared, non-worktree-isolated
 # source tree.
 #
+# ga-lluq1 (2026-07-21): the Mayor session itself is EXEMPT from this scan. By
+# doctrine the Mayor never hand-builds — it only triages/holds/comments/
+# escalates ('Mayor delega toda impl') — so a mention in the Mayor's own
+# transcript is coordination chatter, never "an attached session is actively
+# building this", and must not be read as an owner to leave the bead for.
+# Without the exemption, every approved bead the Mayor merely discusses gets
+# refused on every sweep for as long as the mention stays in its recent
+# transcript window (observed: ga-t1ub9 starved ~30h). A live CREW/builder
+# attached session mentioning the bead is unaffected — that is a real
+# candidate owner and must still refuse. The exemption is applied once, at
+# the shared cache in _attached_session_peek_cache below, so it covers every
+# caller of this heuristic without needing to be repeated per call site.
+#
 # _gc_session_peek_output <session_id> — thin wrapper around the bounded, real
 # `gc session peek` call so tests can stub this ONE function directly (a
 # `timeout <bin>` pipeline can't be intercepted by shadowing a shell function
@@ -2820,9 +2833,17 @@ _gc_session_peek_output() {
 
 # _attached_session_peek_cache — lazy, ONCE-per-sweep cache: recent output from
 # every currently ATTACHED, non-closed session (reusing the already-loaded
-# _SESSIONS_JSON roster — no extra `gc session list` call). Reused by every
-# _ownership_guard_should_refuse call this sweep so N candidates never multiply
-# into N × attached-count peek calls. Mirrors the _ownership_guard_repos
+# _SESSIONS_JSON roster — no extra `gc session list` call), EXCLUDING the
+# Mayor session (ga-lluq1 — the Mayor only coordinates, never builds, so its
+# own mentions must never be read as "an attached session owns this"; see the
+# doc comment above). Both known resolved-identity forms are excluded:
+# "gastown.mayor" (alias/name/agent_name — what the id-resolution below
+# actually yields today) and "gastown__mayor" (the double-underscore
+# session_name form used elsewhere in this codebase, e.g. quality-gate-guard.sh's
+# session_matches_author) — belt-and-suspenders against the exact
+# alias-vs-session_name mismatch class already fixed there (ga-ipf6). Reused by
+# every _ownership_guard_should_refuse call this sweep so N candidates never
+# multiply into N × attached-count peek calls. Mirrors the _ownership_guard_repos
 # lazy-cache idiom above. FAIL-OPEN: no `gc`, zero attached sessions, or any
 # read error → empty cache (the caller's grep then naturally finds nothing).
 _attached_session_peek_cache() {
@@ -2833,7 +2854,8 @@ _attached_session_peek_cache() {
       _attached_ids=$(printf '%s' "$_SESSIONS_JSON" | jq -r '
           [.sessions[]? | select(.closed != true) | select(.attached == true)
            | (.alias // .name // .session_name // empty)]
-          | map(select(. != null and . != "")) | unique | .[]' 2>/dev/null || echo "")
+          | map(select(. != null and . != "" and . != "gastown.mayor" and . != "gastown__mayor"))
+          | unique | .[]' 2>/dev/null || echo "")
       while IFS= read -r _sess; do
         [ -n "$_sess" ] || continue
         _out=$(_gc_session_peek_output "$_sess")
@@ -2848,7 +2870,11 @@ ${_out}"
 
 # _beadid_mentioned_in_attached_session <bead_id> — exit 0 iff a live ATTACHED
 # session's recent output mentions <bead_id> as a whole token (boundary-safe:
-# a longer id sharing the same prefix/suffix never false-matches).
+# a longer id sharing the same prefix/suffix never false-matches). The Mayor's
+# own session is excluded from the scan (ga-lluq1 — see
+# _attached_session_peek_cache above): a mention that appears ONLY in the
+# Mayor's transcript never fires this signal, while a mention in any other
+# live attached (crew/builder) session still does.
 # Test seam: PILOT_TEST_ATTACHED_MENTION_BEADS (space-list), consulted when
 # DEFINED, keeps the selftest hermetic (no live gc / sessions). FAIL-OPEN: no
 # gc, no attached sessions, any read error, or no match → return 1 (allow) —
@@ -2875,7 +2901,8 @@ _beadid_mentioned_in_attached_session() {
 #   (b) live assignee: a non-empty, NON-pilot crew assignee whose session is live
 #       in the once-per-sweep roster                            → "owner:<crew>"
 #   (e) a live ATTACHED session's recent output mentions <bead_id> (ga-48vb;
-#       heuristic, not authoritative — same needs-fix carve-out as (a))
+#       heuristic, not authoritative — same needs-fix carve-out as (a); the
+#       Mayor's own session is exempt from this scan per ga-lluq1)
 #                                                                 → "attached-session:mention"
 # Re-reads the bead's CURRENT assignee (race-safe: the candidate query required an
 # EMPTY assignee, but a competing claim could have set one between snapshot and
