@@ -104,6 +104,19 @@ _cooldown_elapsed "$TMP_ROOT/cd2" 180 "$NOW_T" && ok "cooldown: 200s ago, 180s w
 _cooldown_elapsed "$TMP_ROOT/cd-missing" 180 "$NOW_T" && ok "cooldown: no prior state file -> elapsed (fail-open)" || bad "missing state file should fail-open to elapsed"
 
 echo ""
+echo "-- pure functions: _mark_now honors DRY_RUN (ga-r5sn8 fix 3 — dry-run must NOT arm the real cooldown) --"
+# A dry-run performs no real action, so it must not write the cooldown marker; else
+# a manual diagnostic dry-run silently suppresses a genuine launchd remediation.
+DRY_RUN_SAVE="$DRY_RUN"
+MARKF="$TMP_ROOT/mark-dryrun"
+rm -f "$MARKF"
+DRY_RUN=1; _mark_now "$MARKF" "$NOW_T"
+[ ! -f "$MARKF" ] && ok "DRY_RUN=1: _mark_now writes NO cooldown marker (a diagnostic dry-run never suppresses a real remediation)" || bad "DRY_RUN=1 must not arm the real cooldown, but the marker was written"
+DRY_RUN=0; _mark_now "$MARKF" "$NOW_T"
+[ -f "$MARKF" ] && ok "DRY_RUN=0: _mark_now writes the cooldown marker (a real action arms the rate-limit)" || bad "DRY_RUN=0 should write the marker"
+rm -f "$MARKF"; DRY_RUN="$DRY_RUN_SAVE"
+
+echo ""
 echo "-- pure functions: _reviewer_active_id (ga-r5sn8 fix 2 — reviewer-active guard) --"
 RID="$(_reviewer_active_id '{"sessions":[{"id":"rev-1","template":"gate-reviewer","state":"creating"}]}')"
 [ $? -eq 0 ] && [ "$RID" = "rev-1" ] && ok "gate-reviewer state=creating -> active, id=rev-1" || bad "expected active with id=rev-1, got rc=$? id=$RID"

@@ -138,10 +138,13 @@ KICKSTART_COOLDOWN_S="${CHS_KICKSTART_COOLDOWN_S:-180}"   # 3min per job
 NUDGE_COOLDOWN_S="${CHS_NUDGE_COOLDOWN_S:-1800}"           # 30min per topic
 
 # CHS_DRY_RUN=1 → collect + decide + log exactly as normal, but _do_kickstart /
-# _do_nudge become log-only no-ops (no real launchctl/gc call). Rate-limit state
-# files are still written on a "would-execute" decision so a dry-run cycle can be
-# safely repeated without a following real cycle immediately re-firing on a stale
-# window. Operator/manual-verification switch — launchd never sets this.
+# _do_nudge become log-only no-ops (no real launchctl/gc call) AND the per-action
+# rate-limit markers are NOT written (see _mark_now): a dry-run performed no real
+# action, so it must never arm the real cooldown and silently suppress a following
+# genuine launchd remediation. Repeated dry-runs each just re-log "would execute",
+# which is the correct diagnostic behavior. Operator/manual-verification switch —
+# launchd never sets this. (ga-r5sn8: earlier this armed the real cooldown, which
+# let a manual diagnostic suppress genuine automated remediation.)
 DRY_RUN="${CHS_DRY_RUN:-0}"
 
 # ── haiku call config ──────────────────────────────────────────────────────
@@ -250,6 +253,12 @@ _cooldown_elapsed() {
 
 _mark_now() {
   local f="$1" now="$2"
+  # A cooldown marker records that we ACTUALLY performed an action at $now. Under
+  # DRY_RUN the action was a logged no-op — nothing happened — so writing the marker
+  # would let a manual diagnostic dry-run silently arm the REAL rate-limit and
+  # suppress a genuine launchd remediation within the cooldown window. Record real
+  # actions only; a real cycle firing after a dry-run is correct, not a double-fire. (ga-r5sn8.)
+  [ "$DRY_RUN" = "1" ] && return 0
   mkdir -p "$(dirname "$f")" 2>/dev/null || true
   echo "$now" > "$f" 2>/dev/null || true
 }
