@@ -699,9 +699,13 @@ main() {
   if [ "$dolt_responds" != "true" ] && [ "$action" != "nudge_mayor" ] && [ "$action" != "none" ]; then
     log "GUARDRAIL OVERRIDE: dolt_responds=false but action was '$action' — forcing nudge_mayor (this sentinel never restarts/touches Dolt)"
     action="nudge_mayor"
-    if [ -z "$mayor_message" ]; then
-      mayor_message="city-health-sentinel: Dolt is unreachable (dolt_responds=false). Needs human attention — this sentinel never restarts or touches Dolt."
-    fi
+    # Rewrite the message UNCONDITIONALLY (not only when empty). Haiku's original
+    # mayor_message, if any, was written to justify the action we just discarded
+    # (e.g. "restarting" for a kickstart_gate that the guardrail blocked). Sending
+    # it verbatim would tell the Mayor something happened that did not — the
+    # variable ACTED on must match the variable DECIDED on, especially in a Dolt
+    # outage, the highest-severity case this file exists to handle. (ga-r5sn8.)
+    mayor_message="city-health-sentinel: Dolt is unreachable (dolt_responds=false). Needs human attention — this sentinel never restarts or touches Dolt."
   fi
 
   _execute_action "$action" "$mayor_message" "$gate_gap" "$pilot_gap" "$dolt_responds" "$disk_gb" "$now"

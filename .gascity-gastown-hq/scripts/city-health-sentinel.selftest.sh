@@ -247,10 +247,16 @@ _collect_dolt_json() { echo '{"reachable":false,"latency_ms":-1,"state":"unhealt
 # whole file, since it proves the safety net does not depend on Haiku behaving.
 _invoke_haiku() { echo "called" >> "$HAIKU_CALL_LOG"; echo '{"assessment":"gate looks slow too","action":"kickstart_gate","mayor_message":"restarting"}'; return 0; }
 main
-if [ "${#KICKSTART_CALLS[@]}" -eq 0 ] && [ "${#NUDGE_CALLS[@]}" -eq 1 ] && grep -q 'GUARDRAIL OVERRIDE' "$CHS_LOG"; then
-  ok "dolt-hung: guardrail overrode Haiku's kickstart_gate -> nudge_mayor only, zero kickstarts, zero Dolt restarts"
+# ga-r5sn8 gate fix: assert the nudge CONTENT, not just the call counts. The
+# guardrail forced nudge_mayor and discarded Haiku's kickstart_gate — so the
+# message the Mayor receives must describe the ACTUAL outcome (Dolt unreachable),
+# NOT Haiku's now-discarded "restarting" text. Counts alone passed while the
+# stale message leaked (the variable DECIDED on != the variable ACTED on).
+if [ "${#KICKSTART_CALLS[@]}" -eq 0 ] && [ "${#NUDGE_CALLS[@]}" -eq 1 ] && grep -q 'GUARDRAIL OVERRIDE' "$CHS_LOG" \
+   && [[ "${NUDGE_CALLS[0]}" != *restarting* ]] && [[ "${NUDGE_CALLS[0]}" == *"Dolt is unreachable"* ]]; then
+  ok "dolt-hung: guardrail overrode Haiku's kickstart_gate -> nudge_mayor only, zero kickstarts, and the nudge TEXT matches the actual action (no stale 'restarting')"
 else
-  bad "dolt-hung: expected the guardrail to force nudge_mayor and block all kickstarts (kickstarts=${#KICKSTART_CALLS[@]} nudges=${#NUDGE_CALLS[@]})"
+  bad "dolt-hung: expected guardrail to force nudge_mayor, block kickstarts, AND send a message matching what actually happened — not Haiku's discarded action (kickstarts=${#KICKSTART_CALLS[@]} nudges=${#NUDGE_CALLS[@]} msg='${NUDGE_CALLS[0]:-<none>}')"
 fi
 
 echo ""
