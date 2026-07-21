@@ -100,7 +100,7 @@
 #   - dolt_ms(3000) / disk_gb(5): as specified for this sentinel.
 #
 # Kill switch: CHS_DRY_RUN=1 → collect + decide + log exactly as normal, but
-# skip the real launchctl kickstart / gc session nudge call (log-only). Useful
+# skip the real launchctl kickstart / gc mail send call (log-only). Useful
 # for a manual live-data smoke test before trusting a config change. launchd
 # never sets this — it is an operator/manual switch only.
 #
@@ -381,12 +381,42 @@ _collect_disk_gb() {
 # the module wasn't sourced (missing file) — NEVER hand-roll a bd/dolt timeout
 # check here (imp07: that module exists specifically so every daemon shares one
 # hardened, already-tested probe instead of N slightly-different reimplementations).
+#
+# A single-shot probe_rc=124 (the FULL `gc dolt health --json` call blew past its
+# own 12s budget) is ambiguous, not a confirmed outage: that command runs several
+# sub-checks beyond the reachability ping (per-database commit/open-bead counts,
+# an orphan scan bounded internally at 5s but measured taking 8-17s under Dolt
+# load — CLAUDE.md, ga-eu2x), so a real but brief Dolt-load burst can push the
+# WHOLE command over budget even though Dolt itself is answering fine. Live
+# evidence (ga-eldeu gap 2, 2026-07-21): 3 consecutive daemon-context reads at
+# 07:22-07:26 came back probe_rc=124/unhealthy while direct gc_dolt_probe_json
+# calls around the same window were healthy at 43-69ms. gc-dolt-probe.sh's own
+# _gc_dolt_serve_confirm (raw SELECT 1) is the module's authoritative
+# saturation-vs-outage discriminator (see gc_dolt_probe_robust) — consult it
+# before a single ambiguous timeout becomes a Mayor page.
 _collect_dolt_json() {
-  if declare -f gc_dolt_probe_json >/dev/null 2>&1; then
-    gc_dolt_probe_json 2>/dev/null
-  else
+  if ! declare -f gc_dolt_probe_json >/dev/null 2>&1; then
     printf '{"ts":"","reachable":null,"latency_ms":-1,"cpu":"?","state":"unknown","probe_rc":-1}\n'
+    return
   fi
+  local json rc serve_rc
+  json="$(gc_dolt_probe_json 2>/dev/null)"
+  rc="$(printf '%s' "$json" | jq -r '.probe_rc // empty' 2>/dev/null)"
+  if [ "$rc" = "124" ] && declare -f _gc_dolt_serve_confirm >/dev/null 2>&1; then
+    serve_rc=2
+    _gc_dolt_serve_confirm 2>/dev/null; serve_rc=$?
+    # serve_rc=1 (SELECT 1 refused/hung) is the ONLY case that CONFIRMS the
+    # outage this timeout already suggested — skip the extra round-trip and
+    # keep this reading. serve_rc=0 (served -> saturation, not an outage) AND
+    # serve_rc=2 (no mysql client -> inconclusive, never asserts an outage per
+    # gc-dolt-probe.sh's own fail-open contract) both get ONE re-probe: a
+    # single ambiguous timeout must not be the last word when Dolt might
+    # answer normally a moment later.
+    if [ "$serve_rc" != "1" ]; then
+      json="$(gc_dolt_probe_json 2>/dev/null)"
+    fi
+  fi
+  printf '%s\n' "$json"
 }
 
 # _collect_session_list_json (ga-r5sn8 fix 2) → raw `{"sessions":[...]}` JSON
@@ -605,13 +635,21 @@ _do_kickstart() {
 _do_nudge() {
   local msg="$1"
   if [ "$DRY_RUN" = "1" ]; then
-    log "  DRY_RUN: would nudge mayor: $msg (not executed)"
+    log "  DRY_RUN: would mail mayor: $msg (not executed)"
     return 0
   fi
-  if timeout 15 "$GC" --city "$CITY" session nudge mayor "$msg" 2>/dev/null; then
-    log "  nudge OK: mayor"
+  # `gc session nudge mayor` HANGS (exit 124, not a fast failure) whenever the
+  # Mayor's session is tmux-ATTACHED — which is most of the time — so every
+  # alert this sentinel tried to send was silently dropped (ga-eldeu gap 1,
+  # live-verified 2026-07-21: nudge oracle-wa/unattached=exit0, nudge
+  # mayor/attached=exit124). `gc mail send` is durable (a bead, survives the
+  # recipient's session state entirely) and does not depend on tmux attachment
+  # — the exact "must survive recipient" mail-vs-nudge case. Still
+  # timeout-wrapped per this file's own "never hangs" invariant (see header).
+  if timeout 15 "$GC" --city "$CITY" mail send mayor -s "[city-health-sentinel] alert" -m "$msg" 2>/dev/null; then
+    log "  mail OK: mayor"
   else
-    log "  nudge FAILED (or timed out): mayor"
+    log "  mail FAILED (or timed out): mayor"
   fi
 }
 

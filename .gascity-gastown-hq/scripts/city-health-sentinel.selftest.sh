@@ -7,9 +7,18 @@
 # same technique as dolt-disk-floor-guard.selftest.sh and
 # gate-throughput-stall-watchdog.sh's GTSW_TEST_KICKSTARTS/GTSW_TEST_MAILED
 # redirection). Hermetic: NEVER calls the real `claude` CLI (no network, no
-# cost), `launchctl kickstart`, `gc session nudge`, or `gc dolt health` — every
+# cost), `launchctl kickstart`, `gc mail send`, or `gc dolt health` — every
 # side-effecting call is replaced with a recording stub. Nothing on this machine
-# is restarted, nudged, or queried.
+# is restarted, mailed, or queried.
+#
+# ga-eldeu (2 runtime gaps that shipped live undetected): the main()-integration
+# scenarios below override _do_nudge/_collect_dolt_json WHOLESALE by name, which
+# means a bug INSIDE those two functions' own real implementation is invisible to
+# every scenario in this file — exactly how both gaps reached production. The
+# "real (unmocked) implementations" block exercises the ACTUAL _do_nudge /
+# _collect_dolt_json bodies instead, faking out only the one level further down
+# (the `gc` binary itself, and gc-dolt-probe.sh's _gc_dolt_serve_confirm) so it
+# stays just as hermetic while actually covering this seam.
 #
 # IMPORTANT (lesson carried over from dolt-disk-floor-guard.selftest.sh): several
 # of main()'s calls into the mocked functions go through `$(...)` command
@@ -170,6 +179,162 @@ if grep -q -- 'kickstart -k "' "$SCRIPT"; then
 else
   ok "no 'launchctl kickstart -k' invocation anywhere in $SCRIPT — kickstart is a safe no-op when the job is already running, never a force-kill"
 fi
+
+echo ""
+echo "-- static content sanity: _do_nudge no longer calls 'session nudge' (ga-eldeu gap 1) --"
+# Excludes comment-only lines: _do_nudge's own doc-comment quotes the old broken
+# invocation verbatim for explanatory purposes, which isn't a reintroduction.
+if grep -v '^[[:space:]]*#' "$SCRIPT" | grep -q -- 'session nudge mayor'; then
+  bad "found a LIVE 'session nudge mayor' invocation (outside comments) in $SCRIPT — the hang-on-attached-Mayor bug (ga-eldeu) risks reintroduction; the Mayor alert path must mail, not session-nudge"
+else
+  ok "no LIVE 'session nudge mayor' invocation anywhere in $SCRIPT — the Mayor alert path mails (durable), never session-nudges (hangs when the Mayor's tmux session is attached)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Real (unmocked) implementations of _do_nudge / _collect_dolt_json (ga-eldeu).
+#
+# Everything below faces a bug that shipped live and went undetected: the
+# main()-integration scenarios further down override BOTH of these functions
+# WHOLESALE by name, so a bug inside their own real bodies is invisible to
+# every one of those scenarios (this is literally what happened — "the gate's
+# mocked selftest could not catch both", per the bug report). These blocks run
+# the REAL _do_nudge / _collect_dolt_json, faking only one level further down
+# (the `gc` binary via $GC / $_GC_DOLT_PROBE_GC, and gc-dolt-probe.sh's
+# _gc_dolt_serve_confirm) — hermetic in the same sense as the rest of this
+# file, but covering the actual seam. MUST run before the main()-integration
+# section below permanently overrides _do_nudge/_collect_dolt_json.
+# ─────────────────────────────────────────────────────────────────────────────
+
+echo ""
+echo "-- _do_nudge (real impl): mails the Mayor, not session-nudge (ga-eldeu gap 1) --"
+DN_FAKE_GC="$(mktemp)"
+DN_CALL_LOG="$(mktemp)"
+cat > "$DN_FAKE_GC" <<GCEOF
+#!/usr/bin/env bash
+echo "\$@" >> "$DN_CALL_LOG"
+exit 0
+GCEOF
+chmod +x "$DN_FAKE_GC"
+GC_SAVE="$GC"
+GC="$DN_FAKE_GC"
+
+_do_nudge "test alert body"
+if grep -q -- "mail send mayor" "$DN_CALL_LOG" && ! grep -q -- "session nudge" "$DN_CALL_LOG"; then
+  ok "_do_nudge invokes 'gc mail send mayor', not 'gc session nudge mayor'"
+else
+  bad "_do_nudge should call 'mail send mayor', got argv: $(cat "$DN_CALL_LOG" 2>/dev/null)"
+fi
+grep -q -- "test alert body" "$DN_CALL_LOG" && ok "_do_nudge passes the alert message through to the mail call" \
+  || bad "_do_nudge did not pass the message through, got argv: $(cat "$DN_CALL_LOG" 2>/dev/null)"
+
+: > "$DN_CALL_LOG"
+DRY_RUN_SAVE2="$DRY_RUN"
+DRY_RUN=1
+_do_nudge "should not send"
+[ ! -s "$DN_CALL_LOG" ] && ok "_do_nudge DRY_RUN=1 makes no real mail call" \
+  || bad "_do_nudge DRY_RUN=1 should not invoke gc at all, got: $(cat "$DN_CALL_LOG")"
+DRY_RUN="$DRY_RUN_SAVE2"
+
+GC="$GC_SAVE"
+rm -f "$DN_FAKE_GC" "$DN_CALL_LOG" 2>/dev/null || true
+
+echo ""
+echo "-- _collect_dolt_json (real impl): a single 12s timeout is not a confirmed outage (ga-eldeu gap 2) --"
+CDJ_FAKE_GC="$(mktemp)"
+CDJ_CALL_COUNT="$(mktemp)"
+CDJ_SAVED_GC="$_GC_DOLT_PROBE_GC"
+CDJ_SAVED_CITY="$_GC_DOLT_PROBE_CITY"
+CDJ_SAVED_TIMEOUT="$_GC_DOLT_PROBE_TIMEOUT"
+_GC_DOLT_PROBE_GC="$CDJ_FAKE_GC"
+_GC_DOLT_PROBE_CITY="/tmp"
+_GC_DOLT_PROBE_TIMEOUT=1   # short so the timeout cases below don't slow the suite
+
+cdj_reset() { echo 0 > "$CDJ_CALL_COUNT"; }
+cdj_calls() { cat "$CDJ_CALL_COUNT" 2>/dev/null || echo 0; }
+
+# Always exceeds the 1s test timeout — used for the "single-shot timeout" cases.
+cat > "$CDJ_FAKE_GC" <<GCEOF
+#!/usr/bin/env bash
+n=\$(( \$(cat "$CDJ_CALL_COUNT" 2>/dev/null || echo 0) + 1 )); echo \$n > "$CDJ_CALL_COUNT"
+sleep 30
+GCEOF
+chmod +x "$CDJ_FAKE_GC"
+
+# Case 1: probe times out, SELECT-1 serve-confirm says Dolt IS up (saturation, not
+# an outage) -> _collect_dolt_json re-probes (2 total gc invocations).
+cdj_reset
+_gc_dolt_serve_confirm() { return 0; }   # SELECT 1 served -> Dolt UP
+CDJ_OUT="$(_collect_dolt_json)"
+if [ "$(cdj_calls)" = "2" ] && echo "$CDJ_OUT" | jq -e '.probe_rc == 124' >/dev/null 2>&1; then
+  ok "timeout + serve-confirm UP -> re-probed once (saturation, not a confirmed outage)"
+else
+  bad "timeout + serve-confirm UP -> expected exactly 2 gc invocations (retry), got $(cdj_calls): $CDJ_OUT"
+fi
+
+# Case 2: probe times out AND SELECT-1 serve-confirm says Dolt is genuinely DOWN ->
+# _collect_dolt_json does NOT waste a second timeout confirming the obvious (1 call).
+cdj_reset
+_gc_dolt_serve_confirm() { return 1; }   # SELECT 1 refused -> Dolt DOWN
+CDJ_OUT="$(_collect_dolt_json)"
+if [ "$(cdj_calls)" = "1" ] && echo "$CDJ_OUT" | jq -e '.reachable == false and .probe_rc == 124' >/dev/null 2>&1; then
+  ok "timeout + serve-confirm DOWN -> confirmed outage reported without a pointless second timeout"
+else
+  bad "timeout + serve-confirm DOWN -> expected exactly 1 gc invocation (no retry) and an unhealthy/124 reading, got $(cdj_calls): $CDJ_OUT"
+fi
+
+# Case 3: SELECT-1 serve-confirm itself is inconclusive (e.g. no mysql client in
+# this env) -> still worth ONE re-probe; gc-dolt-probe.sh's own contract says an
+# inconclusive check must never assert an outage, so this path must not either.
+cdj_reset
+_gc_dolt_serve_confirm() { return 2; }   # inconclusive (no client available)
+CDJ_OUT="$(_collect_dolt_json)"
+if [ "$(cdj_calls)" = "2" ]; then
+  ok "timeout + serve-confirm INCONCLUSIVE -> still re-probed (an unconfirmable check does not skip the extra chance)"
+else
+  bad "timeout + serve-confirm inconclusive -> expected exactly 2 gc invocations (retry), got $(cdj_calls)"
+fi
+
+# Case 4: probe succeeds on the FIRST attempt -> serve-confirm must never be
+# consulted at all (only a single-shot TIMEOUT is the ambiguity this fix targets).
+cat > "$CDJ_FAKE_GC" <<GCEOF
+#!/usr/bin/env bash
+n=\$(( \$(cat "$CDJ_CALL_COUNT" 2>/dev/null || echo 0) + 1 )); echo \$n > "$CDJ_CALL_COUNT"
+echo '{"server":{"reachable":true,"latency_ms":55}}'
+exit 0
+GCEOF
+cdj_reset
+_gc_dolt_serve_confirm() { echo "SHOULD NOT BE CALLED" > "$TMP_ROOT/serve-confirm-unexpected"; return 1; }
+CDJ_OUT="$(_collect_dolt_json)"
+if [ "$(cdj_calls)" = "1" ] && [ ! -f "$TMP_ROOT/serve-confirm-unexpected" ] && echo "$CDJ_OUT" | jq -e '.reachable == true' >/dev/null 2>&1; then
+  ok "clean first-attempt success -> serve-confirm never consulted, single gc invocation"
+else
+  bad "clean first-attempt success should skip serve-confirm entirely, got $(cdj_calls) calls: $CDJ_OUT"
+fi
+
+# Case 5: gc dolt health --json ITSELF answers reachable=false (a real, non-timeout
+# response, probe_rc=0) -> trust it immediately. A genuine answer is not the
+# saturation ambiguity this fix targets, so serve-confirm must not override it.
+cat > "$CDJ_FAKE_GC" <<GCEOF
+#!/usr/bin/env bash
+n=\$(( \$(cat "$CDJ_CALL_COUNT" 2>/dev/null || echo 0) + 1 )); echo \$n > "$CDJ_CALL_COUNT"
+echo '{"server":{"reachable":false,"latency_ms":0}}'
+exit 0
+GCEOF
+cdj_reset
+_gc_dolt_serve_confirm() { echo "SHOULD NOT BE CALLED" > "$TMP_ROOT/serve-confirm-unexpected-2"; return 0; }
+CDJ_OUT="$(_collect_dolt_json)"
+if [ "$(cdj_calls)" = "1" ] && [ ! -f "$TMP_ROOT/serve-confirm-unexpected-2" ] && echo "$CDJ_OUT" | jq -e '.reachable == false and .probe_rc == 0' >/dev/null 2>&1; then
+  ok "genuine (non-timeout) reachable=false answer -> trusted as-is, serve-confirm not consulted"
+else
+  bad "a real probe_rc=0 reachable=false answer should be trusted without serve-confirm, got $(cdj_calls) calls: $CDJ_OUT"
+fi
+
+_GC_DOLT_PROBE_GC="$CDJ_SAVED_GC"
+_GC_DOLT_PROBE_CITY="$CDJ_SAVED_CITY"
+_GC_DOLT_PROBE_TIMEOUT="$CDJ_SAVED_TIMEOUT"
+# shellcheck disable=SC1090
+. "$_PROBE" 2>/dev/null || true   # restore the real _gc_dolt_serve_confirm (undo the name-override above)
+rm -f "$CDJ_FAKE_GC" "$CDJ_CALL_COUNT" "$TMP_ROOT/serve-confirm-unexpected" "$TMP_ROOT/serve-confirm-unexpected-2" 2>/dev/null || true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # main() integration scenarios — collectors + Haiku + execute all mocked.
