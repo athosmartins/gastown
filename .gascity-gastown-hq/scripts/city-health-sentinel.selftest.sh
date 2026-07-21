@@ -136,6 +136,10 @@ J="$(_build_state_json "" "5" "false" "-1" "unknown" "" "0")"
 echo "$J" | jq -e '.gate_sweep_gap_min == null' >/dev/null 2>&1 && ok "unknown gate_gap encodes as JSON null (not 0)" || bad "unknown gate_gap should encode as null"
 echo "$J" | jq -e '.disk_gb == null' >/dev/null 2>&1 && ok "unknown disk_gb encodes as JSON null" || bad "unknown disk_gb should encode as null"
 echo "$J" | jq -e '.dolt_responds == false' >/dev/null 2>&1 && ok "dolt_responds encodes as JSON boolean false" || bad "dolt_responds should be JSON false"
+# ga-r5sn8 (error-vs-empty): an INCONCLUSIVE probe must reach Haiku as null, never
+# collapsed into false — false is a CONFIRMED outage, null is "could not confirm".
+J_UNK="$(_build_state_json "" "5" "unknown" "-1" "unknown" "" "0")"
+echo "$J_UNK" | jq -e '.dolt_responds == null' >/dev/null 2>&1 && ok "dolt_responds=unknown encodes as JSON null (inconclusive != confirmed false)" || bad "dolt_responds=unknown should encode as JSON null, got: $(echo "$J_UNK" | jq -c .dolt_responds 2>/dev/null)"
 J2="$(_build_state_json "3" "5" "true" "42" "healthy" "100" "2")"
 echo "$J2" | jq -e '.open_markers_count == 2' >/dev/null 2>&1 && ok "open_markers_count encodes as a number" || bad "open_markers_count should be 2"
 
@@ -257,6 +261,35 @@ if [ "${#KICKSTART_CALLS[@]}" -eq 0 ] && [ "${#NUDGE_CALLS[@]}" -eq 1 ] && grep 
   ok "dolt-hung: guardrail overrode Haiku's kickstart_gate -> nudge_mayor only, zero kickstarts, and the nudge TEXT matches the actual action (no stale 'restarting')"
 else
   bad "dolt-hung: expected guardrail to force nudge_mayor, block kickstarts, AND send a message matching what actually happened — not Haiku's discarded action (kickstarts=${#KICKSTART_CALLS[@]} nudges=${#NUDGE_CALLS[@]} msg='${NUDGE_CALLS[0]:-<none>}')"
+fi
+
+echo ""
+echo "=== main(): dolt INCONCLUSIVE (reachable=null) -> 'could not confirm', NOT a confirmed outage; Haiku fed null not false (ga-r5sn8 error-vs-empty) ==="
+reset_capture
+_collect_gate_gap() { echo "3"; }
+_collect_pilot_gap() { echo "5"; }
+_collect_open_markers() { echo "0"; }
+_collect_disk_gb() { echo "100"; }
+# The probe's real third state: gc_dolt_probe_json returns reachable=null/state=unknown
+# on a transient hiccup, a below-rc=124 timeout, or unparseable output. It is NOT an outage.
+_collect_dolt_json() { echo '{"reachable":null,"latency_ms":-1,"state":"unknown"}'; }
+# Adversarial: Haiku, if it had been fed a collapsed dolt_responds=false, would claim a
+# hard outage and pick a Dolt-touching action. The guardrail must block the kickstart AND
+# the rewritten nudge must NOT assert an outage the probe never confirmed — and Haiku must
+# have been fed dolt_responds=null, not false, so its own judgment isn't built on a lie.
+_invoke_haiku() {
+  echo "$1" >> "$HAIKU_CALL_LOG"
+  echo '{"assessment":"dolt down","action":"kickstart_gate","mayor_message":"restarting the gate"}'
+  return 0
+}
+main
+if [ "${#KICKSTART_CALLS[@]}" -eq 0 ] && [ "${#NUDGE_CALLS[@]}" -eq 1 ] \
+   && [[ "${NUDGE_CALLS[0]}" == *"could NOT be confirmed"* ]] \
+   && [[ "${NUDGE_CALLS[0]}" != *unreachable* ]] \
+   && [ -f "$HAIKU_CALL_LOG" ] && jq -e '.dolt_responds == null' "$HAIKU_CALL_LOG" >/dev/null 2>&1; then
+  ok "dolt-inconclusive: guardrail blocked the kickstart, the nudge says 'could not be confirmed' (no false outage), and Haiku was fed dolt_responds=null (not false)"
+else
+  bad "dolt-inconclusive: expected a non-asserting nudge + null fed to Haiku (kickstarts=${#KICKSTART_CALLS[@]} nudges=${#NUDGE_CALLS[@]} msg='${NUDGE_CALLS[0]:-<none>}' haiku_dolt=$(jq -c '.dolt_responds' "$HAIKU_CALL_LOG" 2>/dev/null))"
 fi
 
 echo ""

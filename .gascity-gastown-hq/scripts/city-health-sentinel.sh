@@ -217,7 +217,10 @@ _deterministic_fallback_action() {
 # wording run to run and defeat rate-limiting by never matching a prior topic).
 _compute_topic() {
   local gate_gap="$1" pilot_gap="$2" dolt_responds="$3" disk_gb="$4"
-  if [ "$dolt_responds" != "true" ]; then echo "dolt"; return; fi
+  # Separate cooldown buckets for confirmed-down vs inconclusive, so a real
+  # outage nudge is never suppressed by an earlier "couldn't confirm" one (ga-r5sn8).
+  if [ "$dolt_responds" = "false" ]; then echo "dolt"; return; fi
+  if [ "$dolt_responds" = "unknown" ]; then echo "dolt-inconclusive"; return; fi
   if _is_int "$disk_gb" && _lt "$disk_gb" "$DISK_GB_WARN"; then echo "disk"; return; fi
   if _is_int "$gate_gap" && _ge "$gate_gap" "$GATE_GAP_FASTPATH_MIN"; then echo "gate"; return; fi
   if _is_int "$pilot_gap" && _ge "$pilot_gap" "$PILOT_GAP_FASTPATH_MIN"; then echo "pilot"; return; fi
@@ -407,10 +410,16 @@ _gate_reviewer_active() {
 # signal is visibly distinct from a confirmed-zero one on the Haiku side too.
 _build_state_json() {
   local gate_gap="$1" pilot_gap="$2" dolt_responds="$3" dolt_latency="$4" dolt_state="$5" disk_gb="$6" open_markers="$7"
+  # Encode dolt_responds as a JSON literal that preserves the third state: true/false
+  # are confirmed, null = INCONCLUSIVE (reachable was null — see main()'s derivation),
+  # matching this blob's null-for-absent convention for the numeric fields below. (ga-r5sn8.)
+  local dolt_responds_json="null"
+  [ "$dolt_responds" = "true" ] && dolt_responds_json="true"
+  [ "$dolt_responds" = "false" ] && dolt_responds_json="false"
   jq -n \
     --arg gate_gap "$gate_gap" \
     --arg pilot_gap "$pilot_gap" \
-    --argjson dolt_responds "$([ "$dolt_responds" = "true" ] && echo true || echo false)" \
+    --argjson dolt_responds "$dolt_responds_json" \
     --arg dolt_latency "$dolt_latency" \
     --arg dolt_state "$dolt_state" \
     --arg disk_gb "$disk_gb" \
@@ -475,6 +484,13 @@ REAL PROBLEMS — act on these:
   choose kickstart_gate or kickstart_pilot when dolt_responds=false: restarting
   those jobs cannot fix Dolt, and adds load to an already-unreachable dependency.
   This is a hard rule with no exception.
+- dolt_responds=null (probe INCONCLUSIVE — Dolt health could NOT be confirmed this
+  cycle: a transient gc hiccup, a Dolt-load blip, or a timeout, NOT a confirmed
+  outage): do NOT treat this as an outage and do NOT assert one to the Mayor. NEVER
+  kickstart anything on it (Dolt's state is unclear, so restarting/adding load is
+  unsafe). Prefer action="none" unless a DIFFERENT signal (very low disk, a clearly
+  extreme gate/pilot gap with real backlog) independently warrants action on its own
+  merits — and if you do nudge, say Dolt was UNCONFIRMED, never that it is down.
 - disk_gb is very low (under ~3): likely the ROOT CAUSE of any other symptoms
   (daemons failing to write logs/state; Dolt itself is at risk of a full-disk
   crash). -> action="nudge_mayor", name disk space as the likely root cause in
@@ -657,7 +673,18 @@ main() {
 
   dolt_json="$(_collect_dolt_json)"
   dolt_responds_raw="$(printf '%s' "$dolt_json" | jq -r '.reachable' 2>/dev/null)"
-  if [ "$dolt_responds_raw" = "true" ]; then dolt_responds="true"; else dolt_responds="false"; fi
+  # Three-state, honoring gc-dolt-probe.sh's real signal (reachable: true|false|null)
+  # and this file's own "absent != confirmed" convention (see _build_state_json).
+  # `jq -r` prints JSON null as the literal string "null"; collapsing that (or any
+  # unparseable value) into "false" would make an INCONCLUSIVE probe (a transient
+  # gc hiccup / Dolt-load blip / timeout below the rc=124 branch) indistinguishable
+  # from a CONFIRMED outage — the exact error-vs-empty trap this signal exists to
+  # avoid, and the one that made the guardrail assert an outage it hadn't seen. (ga-r5sn8.)
+  case "$dolt_responds_raw" in
+    true)  dolt_responds="true" ;;
+    false) dolt_responds="false" ;;
+    *)     dolt_responds="unknown" ;;
+  esac
   dolt_latency="$(printf '%s' "$dolt_json" | jq -r '.latency_ms' 2>/dev/null)"
   _is_int "$dolt_latency" || dolt_latency="-1"
   dolt_state="$(printf '%s' "$dolt_json" | jq -r '.state // "unknown"' 2>/dev/null)"
@@ -697,15 +724,20 @@ main() {
   # while it is unreachable. This check re-derives the decision from the
   # deterministically-collected dolt_responds, never from Haiku's text.
   if [ "$dolt_responds" != "true" ] && [ "$action" != "nudge_mayor" ] && [ "$action" != "none" ]; then
-    log "GUARDRAIL OVERRIDE: dolt_responds=false but action was '$action' — forcing nudge_mayor (this sentinel never restarts/touches Dolt)"
+    log "GUARDRAIL OVERRIDE: dolt_responds=$dolt_responds but action was '$action' — forcing nudge_mayor (this sentinel never restarts/touches Dolt)"
     action="nudge_mayor"
-    # Rewrite the message UNCONDITIONALLY (not only when empty). Haiku's original
-    # mayor_message, if any, was written to justify the action we just discarded
-    # (e.g. "restarting" for a kickstart_gate that the guardrail blocked). Sending
-    # it verbatim would tell the Mayor something happened that did not — the
-    # variable ACTED on must match the variable DECIDED on, especially in a Dolt
-    # outage, the highest-severity case this file exists to handle. (ga-r5sn8.)
-    mayor_message="city-health-sentinel: Dolt is unreachable (dolt_responds=false). Needs human attention — this sentinel never restarts or touches Dolt."
+    # Rewrite the message UNCONDITIONALLY (not only when empty): Haiku's original
+    # mayor_message, if any, justified the action we just discarded (e.g. "restarting"
+    # for a kickstart_gate the guardrail blocked) — the variable ACTED on must match
+    # the variable DECIDED on. AND distinguish a CONFIRMED outage (dolt_responds=false)
+    # from a merely-INCONCLUSIVE probe (dolt_responds=unknown, reachable=null): blocking
+    # the Dolt-touching action is correct in BOTH cases (fail-safe), but we must not
+    # assert an outage the probe never confirmed. (ga-r5sn8: decided-vs-acted + error-vs-empty.)
+    if [ "$dolt_responds" = "false" ]; then
+      mayor_message="city-health-sentinel: Dolt is unreachable (dolt_responds=false, confirmed). Needs human attention — this sentinel never restarts or touches Dolt."
+    else
+      mayor_message="city-health-sentinel: Dolt health could NOT be confirmed this cycle (probe inconclusive — dolt_responds=unknown; likely a transient gc/Dolt-load blip or timeout, NOT a confirmed outage). Blocked a Dolt-touching action as a precaution; nothing was restarted. No action needed unless this persists across cycles."
+    fi
   fi
 
   _execute_action "$action" "$mayor_message" "$gate_gap" "$pilot_gap" "$dolt_responds" "$disk_gb" "$now"
