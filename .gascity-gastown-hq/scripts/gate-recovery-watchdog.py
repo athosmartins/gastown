@@ -147,6 +147,7 @@ ERROR_REQUEUE_MAX_ATTEMPTS = int(os.environ.get("GRW_ERROR_REQUEUE_MAX_ATTEMPTS"
 GRW_REAP_FROZEN_ENABLED = os.environ.get("GRW_REAP_FROZEN_ENABLED", "1") != "0"
 FROZEN_KILL_SECS = int(os.environ.get("GRW_FROZEN_KILL_SECS", "900"))            # 15min of last_active silence on a STILL-active reviewer = definitively wedged (past the dispatcher's own detect+respawn cycle); SUSTAINED-confirmed on a resample before any kill
 FROZEN_KILL_MAX_PER_SWEEP = int(os.environ.get("GRW_FROZEN_KILL_MAX_PER_SWEEP", "2"))  # blast-radius cap: if MANY reviewers are silent at once (systemic Dolt/quota outage) killing them only churns — cap it and let the infra detectors + Mayor escalation handle a mass outage
+GRW_FROZEN_REQUEUE_ENABLED = os.environ.get("GRW_FROZEN_REQUEUE_ENABLED", "1") != "0"  # ga-pp5vh: after FIX 3 kills a confirmed-frozen reviewer, ALSO supersede+requeue its now-orphaned run if that reviewer was the run's sole pending one — closing the ~15min(kill)->~29min(dispatcher Phase C timeout) gap that zeroed gate throughput 2026-07-22. Independent toggle from GRW_REAP_FROZEN_ENABLED so the requeue extension can be killed without disabling the frozen-reviewer kill itself.
 # FIX 4 — reap a QUEUED marker whose SOURCE is done, and clear a STALE gate:reviewing
 # label that STARVES a queued marker. Root (2026-07-02, a 9h head-of-line stall): a
 # reviewer that DRAINS during startup leaves `gate:reviewing` on its SOURCE bead with
@@ -484,6 +485,31 @@ def frozen_reviewer_verdict(state, silence_sec, threshold_sec):
     if silence_sec is None or silence_sec < 0:
         return "keep"
     return "kill" if silence_sec >= threshold_sec else "keep"
+
+
+def frozen_reviewer_run_verdict(pending_names, killed_identities):
+    """PURE decision (no I/O, unit-tested) for FIX 3's post-kill run/marker recovery
+    (ga-pp5vh): given a gate-run's set of PENDING (not-yet-delivered) reviewer names
+    and the just-killed session's set of identifier strings (session_name/name/alias/
+    agent_name/id — the same key set _session_index uses), decide whether this run
+    should be superseded + its marker requeued right now, or left for FIX 1/timeout.
+      'supersede'          — the killed session was pending AND the ONLY pending
+                             reviewer on this run — nobody else can ever land a
+                             verdict, so the run is provably stuck.
+      'skip:not-pending'   — the killed session had already delivered its verdict (or
+                             was never assigned to this run) — nothing to recover here.
+      'skip:other-pending' — another reviewer is still pending on this run → it may
+                             still finish; killing ONE dead reviewer must never
+                             terminate a run others are still actively working.
+      'skip:query-failed'  — pending_names is None (the verdict query failed) →
+                             fail-safe, never supersede blind."""
+    if pending_names is None:
+        return "skip:query-failed"
+    if not (pending_names & killed_identities):
+        return "skip:not-pending"
+    if len(pending_names) > 1:
+        return "skip:other-pending"
+    return "supersede"
 
 
 def _queued_markers():
@@ -1350,6 +1376,23 @@ def _bead_labels(bead_id):
         return []
 
 
+def _bead_row(bead_id):
+    """A bead's full JSON row ({} on failure/missing) — used by FIX 3's post-kill
+    recovery (ga-pp5vh) to fetch a single marker for _requeue_or_escalate_review_marker
+    outside a list query (FIX 6 gets its `m` from a list row already; FIX 3 only has a
+    marker_id parsed out of the gate-run's description, so it needs its own fetch)."""
+    if not bead_id:
+        return {}
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "show", bead_id, "--json"])  # ga-h199q
+    if not r or r.returncode != 0:
+        return {}
+    try:
+        j = json.loads(r.stdout)
+        return (j[0] if isinstance(j, list) and j else j) or {}
+    except Exception:
+        return {}
+
+
 _RIG_PATHS = {"ts": 0.0, "map": {}, "by_prefix": {}}
 
 
@@ -1606,6 +1649,28 @@ def _run_verdicts(run_id):
             if e is not None and (last_delivered is None or e > last_delivered):
                 last_delivered = e
     return (names, delivered, len(rows), last_delivered)
+
+
+def _run_pending_reviewers(run_id):
+    """Set of reviewer names with a NOT-yet-closed (pending) verdict bead on a
+    gate-run (label gate-run:<id>) — the subset of _run_verdicts' names that have NOT
+    delivered yet. Used by FIX 3's post-kill recovery (ga-pp5vh) to tell whether a
+    just-killed reviewer was the run's SOLE pending one. None on query failure
+    (fail-safe: caller never supersedes on unreadable state)."""
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "gate-run:%s" % run_id, "--json"])  # ga-h199q
+    if not r or r.returncode != 0:
+        return None
+    try:
+        rows = json.loads(r.stdout) or []
+    except Exception:
+        return None
+    pending = set()
+    for row in rows:
+        if row.get("status") != "closed":
+            a = row.get("assignee")
+            if a:
+                pending.add(a)
+    return pending
 
 
 def hung_run_verdict(age_sec, hang_sec, n_verdict_beads, n_delivered,
@@ -2043,7 +2108,7 @@ def reap_stranded_verdict_runs(now, open_running_runs):
         print("[watchdog] FIX5 stranded-verdict sweep: %d run(s) recovered%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
 
 
-def reap_frozen_reviewers(sessions, now):
+def reap_frozen_reviewers(sessions, now, rstate, open_running_runs):
     """FIX 3: kill a FROZEN gate-reviewer — state=active but last_active silent past
     FROZEN_KILL_SECS. This is the gap reap_hung_runs (FIX 1) can't see: a frozen
     reviewer reads active, so hung_run_verdict returns skip:reviewer-active and the
@@ -2053,7 +2118,13 @@ def reap_frozen_reviewers(sessions, now):
     kill` makes the reconciler revive the reviewer in place. SUSTAINED-confirmed (a
     reviewer mid-think that resumes between samples is never killed) + bounded +
     dry-run-aware + fully fail-safe (unparseable/future/fresh last_active → never
-    killed; a gc/Dolt outage returns sessions=None → skip)."""
+    killed; a gc/Dolt outage returns sessions=None → skip).
+
+    ga-pp5vh: after a confirmed kill, also hands the (session, run-set) to
+    _requeue_run_after_frozen_kill — killing the session alone left its gate-run
+    orphaned at gate-status:running for up to the dispatcher's own ~29min Phase C
+    timeout, zeroing throughput on a single-item queue. rstate/open_running_runs are
+    threaded through only for that extension (mirrors reap_hung_runs' signature)."""
     if not GRW_ENABLED or not GRW_REAP_FROZEN_ENABLED:
         return
     if sessions is None:
@@ -2068,7 +2139,11 @@ def reap_frozen_reviewers(sessions, now):
             continue
         silence = int(now - la)
         if frozen_reviewer_verdict(s.get("state"), silence, FROZEN_KILL_SECS) == "kill":
-            cand.append((s.get("id"), s.get("last_active"), silence))
+            # ga-pp5vh: keep the FULL session dict (was: id/last_active/silence scalars
+            # only) — the post-kill run/marker recovery needs every identity field a
+            # verdict-bead assignee could carry (session_name/alias/agent_name), not
+            # just id, to correlate the killed session against a run's pending reviewers.
+            cand.append((s, silence))
     if not cand:
         return
     # SUSTAINED confirm: re-sample after a gap. A reviewer whose last_active ADVANCED
@@ -2077,11 +2152,14 @@ def reap_frozen_reviewers(sessions, now):
     s2 = _session_list_json()
     idx2 = {str(s.get("id")): s for s in s2} if s2 else None
     killed = 0
-    for sid, la_iso, silence in cand:
+    for s0, silence in cand:
         if killed >= FROZEN_KILL_MAX_PER_SWEEP:
             break
+        sid = s0.get("id")
+        la_iso = s0.get("last_active")
         if not sid:
             continue
+        s_fresh = s0
         if idx2 is not None:
             s = idx2.get(str(sid))
             if s is None:
@@ -2093,23 +2171,114 @@ def reap_frozen_reviewers(sessions, now):
                                        FROZEN_KILL_SECS) != "kill":
                 print("[watchdog] frozen-reviewer %s RESUMED/changed on resample — NOT killing (fail-safe)" % sid, flush=True)
                 continue
+            s_fresh = s
         if GRW_DRY_RUN:
             print("[watchdog] FROZEN DRY-RUN would kill reviewer %s (last_active=%s, silent %dm) → reconciler revives fresh"
                   % (sid, la_iso, silence // 60), flush=True)
             _recovery_ledger("would_kill_frozen_reviewer",
                              {"session": sid, "last_active": la_iso, "silent_min": silence // 60, "dry_run": True})
-            killed += 1
-            continue
-        sh(["gc", "session", "kill", sid], timeout=20)
-        _recovery_ledger("kill_frozen_reviewer",
-                         {"session": sid, "last_active": la_iso, "silent_min": silence // 60})
-        notify("Gate self-heal: revisor CONGELADO morto (%s, %dmin sem atividade, active-mas-mudo) — reconciler sobe fresco. Você não precisa agir."
-               % (sid, silence // 60), 3)
-        print("[watchdog] KILLED frozen reviewer %s (last_active=%s, silent %dm) — reconciler revives fresh (grw FIX3 frozen-reviewer self-heal)"
-              % (sid, la_iso, silence // 60), flush=True)
+        else:
+            sh(["gc", "session", "kill", sid], timeout=20)
+            _recovery_ledger("kill_frozen_reviewer",
+                             {"session": sid, "last_active": la_iso, "silent_min": silence // 60})
+            notify("Gate self-heal: revisor CONGELADO morto (%s, %dmin sem atividade, active-mas-mudo) — reconciler sobe fresco. Você não precisa agir."
+                   % (sid, silence // 60), 3)
+            print("[watchdog] KILLED frozen reviewer %s (last_active=%s, silent %dm) — reconciler revives fresh (grw FIX3 frozen-reviewer self-heal)"
+                  % (sid, la_iso, silence // 60), flush=True)
         killed += 1
+        # ga-pp5vh: run in BOTH branches — GRW_DRY_RUN is a global flag, so a dry-run
+        # sweep hits this function's OWN internal dry-run guard (read-only preview,
+        # never mutates) instead of skipping the extension outright. Without this a
+        # dry run would never preview the cascading supersede+requeue effect.
+        try:
+            _requeue_run_after_frozen_kill(s_fresh, sid, now, rstate, open_running_runs)
+        except Exception as e:
+            print("[watchdog] FIX3-requeue error for killed reviewer %s (continuing): %r" % (sid, e), flush=True)
     if killed:
         print("[watchdog] frozen-reviewer sweep: %d killed%s" % (killed, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
+
+
+def _requeue_run_after_frozen_kill(killed_session, sid, now, rstate, open_running_runs):
+    """FIX 3 extension (ga-pp5vh): after reap_frozen_reviewers kills a confirmed-frozen
+    reviewer, close the gap between that kill (~FROZEN_KILL_SECS) and the dispatcher's
+    own Phase C run-timeout (~29min) that used to be the only thing re-queuing the
+    orphaned run — on a single-item queue that gap zeroed gate throughput for the full
+    interval (the 2026-07-22 incident this bug fixes). If the killed session was the
+    run's ONLY pending reviewer, the run is now provably stuck (nobody left who could
+    ever deliver a verdict): supersede it and hand its marker to the SAME requeue-or-
+    escalate path FIX 6 uses for a dead reviewer with no run — same underlying symptom
+    (this branch keeps drawing a dead reviewer), same shared grw-stale-review:<n>
+    counter. A run where another reviewer is still pending is left untouched for FIX
+    1/timeout — one dead reviewer must never terminate a run others are still working.
+    Boot-grace is inherited for free: this only ever runs on a session
+    reap_frozen_reviewers already SUSTAINED-confirmed frozen (state=active, silent
+    >=FROZEN_KILL_SECS), which a booting reviewer (state=creating) can never be.
+    Best-effort; never raises on its own (the caller also wraps it, since a bug here
+    must not turn a successful kill into an unhandled sweep exception)."""
+    if not GRW_ENABLED or not GRW_FROZEN_REQUEUE_ENABLED:
+        return
+    if open_running_runs is None:
+        return  # run query unavailable this sweep → fail-safe skip (no blind supersede)
+    identities = set(_session_index([killed_session]).keys()) if killed_session else {str(sid)}
+    if not identities:
+        return
+    for run in open_running_runs:
+        rid = run.get("id")
+        if not rid:
+            continue
+        pending = _run_pending_reviewers(rid)
+        if frozen_reviewer_run_verdict(pending, identities) != "supersede":
+            continue
+        # SUSTAINED-confirm: re-read after a gap — a verdict landing or another
+        # reviewer joining between the kill and here must abort (never race a live run).
+        time.sleep(LIVENESS_RESAMPLE_SEC)
+        if _bead_is_open(rid) is False:
+            print("[watchdog] FIX3-requeue: run=%s finalized/closed between samples — no action" % rid, flush=True)
+            continue
+        pending2 = _run_pending_reviewers(rid)
+        if frozen_reviewer_run_verdict(pending2, identities) != "supersede":
+            print("[watchdog] FIX3-requeue: run=%s no longer solely-pending-on-killed-session after resample — fail-safe KEPT" % rid, flush=True)
+            continue
+        desc = run.get("description") or ""
+        marker_id = _parse_run_field(desc, "marker_id")
+        if GRW_DRY_RUN:
+            print("[watchdog] FIX3-requeue DRY would supersede run=%s (sole pending reviewer %s just killed) → requeue marker=%s"
+                  % (rid, sid, marker_id), flush=True)
+            _recovery_ledger("would_requeue_run_after_frozen_kill",
+                             {"run": rid, "session": sid, "marker": marker_id, "dry_run": True})
+            return
+        # 1) supersede + close the now-provably-stuck run.
+        set_gate_status_py(rid, "superseded")
+        sh(["bd", "-C", CITY, "comment", rid,
+            "gate-recovery-watchdog FIX3: sole pending reviewer session %s was just killed as FROZEN (active but silent — see kill_frozen_reviewer above). No other reviewer can land a verdict on this run. Superseding + handing marker %s to the FIX6 requeue path instead of waiting for the dispatcher's ~29min Phase C timeout. (ga-pp5vh)"
+            % (sid, marker_id or "unknown")], timeout=25)
+        sh(["bd", "-C", CITY, "close", rid,
+            "-r", "gate-run superseded: sole pending reviewer frozen+killed (grw FIX3 requeue, ga-pp5vh)"], timeout=25)
+        # 2) hand the marker to the shared FIX6 requeue-or-escalate mechanism.
+        marker_action = "no-marker"
+        if marker_id:
+            m_open = _bead_is_open(marker_id)
+            if m_open is False:
+                marker_action = "marker-already-closed"
+            elif m_open is None:
+                marker_action = "marker-state-unknown-skip"
+            else:
+                m = _bead_row(marker_id)
+                status = _label_value(m, "gate-status:") or "reviewing"
+                action, attempts_shown, cleared_reviewing = _requeue_or_escalate_review_marker(
+                    marker_id, m, status,
+                    "its sole pending reviewer session %s froze (active but last_active silent >=%dm) and was killed by FIX 3; the run was superseded since no one else could ever deliver a verdict"
+                    % (sid, FROZEN_KILL_SECS // 60),
+                    now, rstate, "FIX3")
+                marker_action = action
+                if action == "requeued":
+                    notify("Gate self-heal: run com único revisor CONGELADO morto foi encerrado — marker %s re-enfileirado p/ re-revisão. Você não precisa agir."
+                           % marker_id, 3)
+                print("[watchdog] FIX3-requeue: run=%s superseded (sole pending reviewer %s killed) marker=%s action=%s cleared_reviewing=%s"
+                      % (rid, sid, marker_id, action, cleared_reviewing), flush=True)
+        _recovery_ledger("requeue_run_after_frozen_kill",
+                         {"run": rid, "session": sid, "marker": marker_id, "marker_action": marker_action})
+        return  # a session reviews at most one run at a time — done
 
 
 def reap_orphan_and_stale_markers(now):
@@ -2230,6 +2399,75 @@ def _markers_with_open_run(runs):
     return out
 
 
+def _requeue_or_escalate_review_marker(mid, m, status, reason, now, rstate, context):
+    """Shared dead-reviewer recovery for a review marker: either requeue it back to
+    gate-status:queued (clearing its source's leaked gate:reviewing) so a fresh
+    dispatcher sweep re-reviews the EXISTING branch — or, once
+    STALE_REVIEW_MAX_ATTEMPTS reviewers have died on the SAME marker, escalate to
+    parked-needs-human instead of an infinite re-review loop. Shared by FIX 6 (a dead
+    reviewer left no open run to reap) and FIX 3 (ga-pp5vh: a frozen reviewer WAS just
+    killed and its now-orphaned run superseded) — both are the same underlying symptom
+    (this branch keeps drawing a dead reviewer), so they share ONE
+    grw-stale-review:<n> counter: a reviewer dying via one path counts toward the
+    other's cap too. `reason` is the caller-specific why-clause folded into the bd
+    comment/escalation message; `context` is a short provenance tag ('FIX6'/'FIX3')
+    for logs/ledger. `m` must carry at least id/labels/updated_at (a list row or a
+    _bead_row() fetch both qualify). Returns (action, attempts_shown,
+    cleared_reviewing) — action is 'requeued'|'escalated'."""
+    src = _label_value(m, "source-bead:")
+    rig = _label_value(m, "bead-rig:") or _label_value(m, "rig:")
+    branch = _label_value(m, "branch:")
+    age = int(now - (_iso_epoch(m.get("updated_at")) or now))
+    attempts = 0
+    for lb in (m.get("labels") or []):
+        mm = GRW_STALE_REVIEW_LABEL_RE.match(str(lb))
+        if mm:
+            try:
+                attempts = int(mm.group(1))
+            except Exception:
+                attempts = 0
+    resolved, sclosed, reviewing, store = _source_review_state(src, rig)
+    if attempts >= STALE_REVIEW_MAX_ATTEMPTS:
+        # reviewers keep dying on this branch → stop re-reviewing, hand to a human.
+        set_gate_status_py(mid, "parked-needs-human")
+        sh(["bd", "-C", CITY, "comment", mid,
+            "gate-recovery-watchdog %s: marker re-stranded %d× (reviewers keep dying mid-review — %s) — escalating to parked-needs-human instead of another futile re-review. Cleared the phantom gate:reviewing so the Pilot stops seeing a live review. (grw stale-review cap, shared FIX3+FIX6)"
+            % (context, attempts, reason)], timeout=25)
+        if resolved and reviewing:
+            sh(["bd", "-C", store, "label", "remove", src, "gate:reviewing", "-q"], timeout=20)
+        _recovery_ledger("escalate_stale_review_marker",
+                         {"marker": mid, "source_bead": src, "status": status, "age_min": age // 60,
+                          "attempts": attempts, "branch": branch, "context": context})
+        if rstate.escalate_once("stale-review-osc:%s" % mid, now):
+            notify("🚨 Gate: marker %s encalhou %d× (revisor morre repetido) — parkeado p/ needs-human. Precisa de você (branch %s)."
+                   % (mid, attempts, branch or "?"), 5)
+            _grw_ledger("human-touch", {"ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "source_daemon": "gate-recovery-watchdog", "stage": "revisa", "kind": "technical",
+                        "bead_id": src or "", "reason": "stale-review marker %s re-stranded %d× — parked needs-human" % (mid, attempts)}, fail_open=True)
+        return ("escalated", attempts, False)
+    # 1) stamp the restart-safe counter FIRST (a crash mid-op must not lose the
+    #    oscillation history and loop forever), then requeue the marker → the
+    #    dispatcher re-reviews the EXISTING branch (no rebuild).
+    for lb in (m.get("labels") or []):
+        if GRW_STALE_REVIEW_LABEL_RE.match(str(lb)):
+            sh(["bd", "-C", CITY, "label", "remove", mid, str(lb), "-q"])
+    sh(["bd", "-C", CITY, "label", "add", mid, "grw-stale-review:%d" % (attempts + 1), "-q"])
+    set_gate_status_py(mid, "queued")
+    sh(["bd", "-C", CITY, "comment", mid,
+        "gate-recovery-watchdog %s: %s. Re-queued (→gate-status:queued) so a fresh dispatcher sweep re-reviews branch %s (the existing fix, no rebuild). attempt %d/%d."
+        % (context, reason, branch or "?", attempts + 1, STALE_REVIEW_MAX_ATTEMPTS)], timeout=25)
+    # 2) clear the source's leaked gate:reviewing (the phantom 'em revisão').
+    cleared_reviewing = False
+    if resolved and reviewing:
+        sh(["bd", "-C", store, "label", "remove", src, "gate:reviewing", "-q"], timeout=20)
+        cleared_reviewing = True
+    _recovery_ledger("requeue_stale_review_marker",
+                     {"marker": mid, "source_bead": src, "status": status, "age_min": age // 60,
+                      "attempt": attempts + 1, "cleared_gate_reviewing": cleared_reviewing,
+                      "branch": branch, "context": context})
+    return ("requeued", attempts + 1, cleared_reviewing)
+
+
 def reap_stale_review_markers(now, rstate, open_running_runs):
     """FIX 6: requeue a marker STRANDED at gate-status:dispatching|reviewing whose
     reviewer DIED leaving NO open running run — the wa-ppe5v orphan (the Pilot counts
@@ -2283,18 +2521,15 @@ def reap_stale_review_markers(now, rstate, open_running_runs):
                   % (mid, status2 or "?"), flush=True)
             continue
         src = _label_value(m, "source-bead:")
-        rig = _label_value(m, "bead-rig:") or _label_value(m, "rig:")
-        branch = _label_value(m, "branch:")
-        attempts = 0
-        for lb in (m.get("labels") or []):
-            mm = GRW_STALE_REVIEW_LABEL_RE.match(str(lb))
-            if mm:
-                try:
-                    attempts = int(mm.group(1))
-                except Exception:
-                    attempts = 0
-        resolved, sclosed, reviewing, store = _source_review_state(src, rig)
         if GRW_DRY_RUN:
+            attempts = 0
+            for lb in (m.get("labels") or []):
+                mm = GRW_STALE_REVIEW_LABEL_RE.match(str(lb))
+                if mm:
+                    try:
+                        attempts = int(mm.group(1))
+                    except Exception:
+                        attempts = 0
             print("[watchdog] FIX6 DRY would %s STALE %s marker=%s src=%s age=%dm attempts=%d"
                   % ("ESCALATE" if attempts >= STALE_REVIEW_MAX_ATTEMPTS else "requeue",
                      status, mid, src, age // 60, attempts), flush=True)
@@ -2303,50 +2538,19 @@ def reap_stale_review_markers(now, rstate, open_running_runs):
                               "age_min": age // 60, "attempts": attempts, "dry_run": True})
             acted += 1
             continue
-        if attempts >= STALE_REVIEW_MAX_ATTEMPTS:
-            # reviewers keep dying on this branch → stop re-reviewing, hand to a human.
-            set_gate_status_py(mid, "parked-needs-human")
-            sh(["bd", "-C", CITY, "comment", mid,
-                "gate-recovery-watchdog FIX6: marker re-stranded at %s %d× (reviewers keep dying mid-review, no run) on branch %s — escalating to parked-needs-human instead of another futile re-review. Cleared the phantom gate:reviewing so the Pilot stops seeing a live review. (grw stale-review cap)"
-                % (status, attempts, branch or "?")], timeout=25)
-            if resolved and reviewing:
-                sh(["bd", "-C", store, "label", "remove", src, "gate:reviewing", "-q"], timeout=20)
-            _recovery_ledger("escalate_stale_review_marker",
-                             {"marker": mid, "source_bead": src, "status": status,
-                              "attempts": attempts, "branch": branch})
-            if rstate.escalate_once("stale-review-osc:%s" % mid, now):
-                notify("🚨 Gate: marker %s encalhou em %s %d× (revisor morre repetido, sem run) — parkeado p/ needs-human. Precisa de você (branch %s)."
-                       % (mid, status, attempts, branch or "?"), 5)
-                _grw_ledger("human-touch", {"ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                            "source_daemon": "gate-recovery-watchdog", "stage": "revisa", "kind": "technical",
-                            "bead_id": src or "", "reason": "stale-review marker %s re-stranded %d× (reviewers keep dying, no run) — parked needs-human" % (mid, attempts)}, fail_open=True)
+        action, attempts_shown, cleared_reviewing = _requeue_or_escalate_review_marker(
+            mid, m, status,
+            "reviewer died mid-review (drain/sleep/quota/crash) leaving no hung RUN for FIX 1/5 to own; sat gate-status:%s %dm. The Pilot was DROPPING the gate:needs-fix source %s as 'actively gating' on this dead marker (wa-ppe5v)"
+            % (status, age // 60, src or "?"),
+            now, rstate, "FIX6")
+        if action == "escalated":
             print("[watchdog] FIX6 ESCALATED marker=%s (re-stranded %d× at %s) → parked-needs-human"
-                  % (mid, attempts, status), flush=True)
-            acted += 1
-            continue
-        # 1) stamp the restart-safe counter FIRST (a crash mid-op must not lose the
-        #    oscillation history and loop forever), then requeue the marker → the
-        #    dispatcher re-reviews the EXISTING branch (no rebuild).
-        for lb in (m.get("labels") or []):
-            if GRW_STALE_REVIEW_LABEL_RE.match(str(lb)):
-                sh(["bd", "-C", CITY, "label", "remove", mid, str(lb), "-q"])
-        sh(["bd", "-C", CITY, "label", "add", mid, "grw-stale-review:%d" % (attempts + 1), "-q"])
-        set_gate_status_py(mid, "queued")
-        sh(["bd", "-C", CITY, "comment", mid,
-            "gate-recovery-watchdog FIX6: marker sat gate-status:%s %dm with NO open running run (reviewer died mid-review — drain/sleep/quota/crash — leaving no hung RUN for FIX 1/5). Re-queued so a fresh dispatcher sweep re-reviews branch %s (the existing fix, no rebuild). The Pilot was DROPPING the gate:needs-fix source %s as 'actively gating' on this dead marker (wa-ppe5v). attempt %d/%d."
-            % (status, age // 60, branch or "?", src or "?", attempts + 1, STALE_REVIEW_MAX_ATTEMPTS)], timeout=25)
-        # 2) clear the source's leaked gate:reviewing (the phantom 'em revisão').
-        cleared_reviewing = False
-        if resolved and reviewing:
-            sh(["bd", "-C", store, "label", "remove", src, "gate:reviewing", "-q"], timeout=20)
-            cleared_reviewing = True
-        _recovery_ledger("requeue_stale_review_marker",
-                         {"marker": mid, "source_bead": src, "status": status, "age_min": age // 60,
-                          "attempt": attempts + 1, "cleared_gate_reviewing": cleared_reviewing, "branch": branch})
-        notify("Gate self-heal: marker travado em %s reapado (%s, %dmin, revisor morto sem run) — re-enfileirado p/ re-revisão. Você não precisa agir."
-               % (status, mid, age // 60), 3)
-        print("[watchdog] FIX6 REQUEUED stale %s marker=%s src=%s age=%dm attempt=%d cleared_reviewing=%s"
-              % (status, mid, src, age // 60, attempts + 1, cleared_reviewing), flush=True)
+                  % (mid, attempts_shown, status), flush=True)
+        else:
+            notify("Gate self-heal: marker travado em %s reapado (%s, %dmin, revisor morto sem run) — re-enfileirado p/ re-revisão. Você não precisa agir."
+                   % (status, mid, age // 60), 3)
+            print("[watchdog] FIX6 REQUEUED stale %s marker=%s src=%s age=%dm attempt=%d cleared_reviewing=%s"
+                  % (status, mid, src, age // 60, attempts_shown, cleared_reviewing), flush=True)
         acted += 1
     if acted:
         print("[watchdog] FIX6 stale-review sweep: %d marker(s) requeued/escalated%s"
@@ -2731,14 +2935,14 @@ def main():
         % (MAX_ACTIVE_REPAIR_DOGS, MAX_SPAWNS_PER_CONDITION, GRW_ENABLED, GRW_DRY_RUN), flush=True)
   print("[watchdog] + DIRECT self-heal each sweep: reap HUNG reviewers (run>%dm, 0 verdicts, dead reviewer sustained; enabled=%s) "
         "AND recover STRANDED-VERDICT runs (verdicts complete>%dm ago, all delivered but stuck running/unfinalized, cap %d attempts; enabled=%s) "
-        "AND kill FROZEN reviewers (active-but-last_active-silent>%ds, cap %d/sweep, sustained-confirmed; enabled=%s) "
+        "AND kill FROZEN reviewers (active-but-last_active-silent>%ds, cap %d/sweep, sustained-confirmed; enabled=%s), THEN supersede+requeue its run if that reviewer was the sole pending one (ga-pp5vh; enabled=%s) "
         "AND reap ORPHAN/STALE markers (queued>%dm w/ source closed→close, or leaked gate:reviewing→clear, cap %d/sweep; enabled=%s) "
         "AND requeue STRANDED dispatching|reviewing markers w/ NO open run (dead reviewer, >%dm, cap %d/sweep, esc after %d; enabled=%s) "
         "AND auto-requeue STUCK gate-status:error markers (>%dm in error, cap %d/sweep, osc-escalate after %d; enabled=%s) "
         "AND recover/close STUCK gate-status:deferred markers (>%dm deferred w/ derivable author→requeue, else close after %d attempts, ga-y1kk; cap %d/sweep, enabled=%s). "
         "All bounded + fail-safe + dry_run=%s."
         % (REVIEW_HANG_MINUTES, GRW_REAP_HUNG_ENABLED, STRANDED_RUN_MINUTES, STRANDED_MAX_ATTEMPTS, GRW_REAP_STRANDED_ENABLED,
-           FROZEN_KILL_SECS, FROZEN_KILL_MAX_PER_SWEEP, GRW_REAP_FROZEN_ENABLED,
+           FROZEN_KILL_SECS, FROZEN_KILL_MAX_PER_SWEEP, GRW_REAP_FROZEN_ENABLED, GRW_FROZEN_REQUEUE_ENABLED,
            ORPHAN_MARKER_MIN_MINUTES, ORPHAN_MAX_PER_SWEEP, GRW_REAP_ORPHAN_ENABLED,
            STALE_REVIEW_MARKER_MINUTES, STALE_REVIEW_MAX_PER_SWEEP, STALE_REVIEW_MAX_ATTEMPTS, GRW_REAP_STALE_REVIEW_ENABLED,
            ERROR_REQUEUE_MINUTES, ERROR_REQUEUE_MAX_PER_SWEEP, ERROR_REQUEUE_MAX_ATTEMPTS, GRW_REQUEUE_ERROR_ENABLED,
@@ -2772,7 +2976,7 @@ def main():
         except Exception as e:
             print("[watchdog] reap_stranded_verdict_runs error (continuing): %r" % e, flush=True)
         try:
-            reap_frozen_reviewers(sessions, now)
+            reap_frozen_reviewers(sessions, now, rstate, open_running_runs)
         except Exception as e:
             print("[watchdog] reap_frozen_reviewers error (continuing): %r" % e, flush=True)
         try:
@@ -2953,6 +3157,24 @@ def _selftest():
     ok(stale_review_marker_verdict("passed", 40 * 60, R, False) == "skip:not-review-status", "terminal (passed) marker → skip")
     # boundary: FIX 6 (no run) and FIX 1/5 (open run) partition the dead-reviewer space
     ok(stale_review_marker_verdict("reviewing", 40 * 60, R, True) != "requeue", "an OPEN run is FIX 1/5's domain, NOT FIX 6 (no double-handling)")
+    # FIX 3 extension (ga-pp5vh) — frozen_reviewer_run_verdict: post-kill run/marker recovery
+    ok(frozen_reviewer_run_verdict({"sess-A"}, {"sess-A", "alias-A"}) == "supersede",
+       "killed session is the SOLE pending reviewer (matched via any identity field) → supersede + requeue (ga-pp5vh)")
+    ok(frozen_reviewer_run_verdict({"sess-A", "sess-B"}, {"sess-A"}) == "skip:other-pending",
+       "another reviewer still pending on the run → skip, leave to FIX 1/timeout (never end a run others are still working)")
+    ok(frozen_reviewer_run_verdict({"sess-B"}, {"sess-A"}) == "skip:not-pending",
+       "killed session isn't in the run's pending set (never assigned, or already delivered) → skip")
+    ok(frozen_reviewer_run_verdict(set(), {"sess-A"}) == "skip:not-pending",
+       "no pending reviewers at all (verdicts already fully delivered) → skip, nothing to recover")
+    ok(frozen_reviewer_run_verdict(None, {"sess-A"}) == "skip:query-failed",
+       "pending-reviewer query failed (None) → fail-safe skip, never supersede blind")
+    # AC3 guard-rail: a BOOTING reviewer (state=creating, per quality-gate-dispatcher.sh's
+    # session_is_booting) must never be killed nor have its run superseded/marker
+    # re-queued. frozen_reviewer_verdict's state!="active" fail-safe already covers this
+    # (a booting session is never "active"), so FIX 3's extension inherits the guard for
+    # free — this pins that inheritance explicitly rather than relying on the general
+    # non-active-state case above.
+    ok(frozen_reviewer_verdict("creating", 5000, 900) == "keep", "booting session (state=creating) → keep, NEVER killed (boot-grace inherited for free, AC3 ga-pp5vh)")
     # FIX 2 — error_requeue_verdict (gate-status:error marker requeue decision)
     E = 8 * 60
     ok(error_requeue_verdict(300, E, True, True, False, 0, 3) == "close:source-done", "source resolved+CLOSED → close regardless of age (checked first)")
