@@ -200,6 +200,24 @@ def deploy_block(now=None):
             continue
         # Refresh origin/<branch> (best-effort; a transient fetch failure is NOT a stall).
         sh(["git", "-C", root, "fetch", "--quiet", REMOTE, BRANCH], timeout=GIT_FETCH_TIMEOUT)
+        # ga-1tj73: a SHALLOW checkout (e.g. a sibling worktree of this root's
+        # common-dir did a --depth fetch, which marks $GIT_COMMON_DIR/shallow for
+        # every worktree sharing it, this root included) makes the rev-list counts
+        # below meaningless — ancestry past the shallow boundary reads as "no
+        # common history", which rev-list --left-right reports as bogus large
+        # ahead/behind numbers (seen in production: ahead=4869 behind=6). Detect
+        # it FIRST and report the real condition instead of a fake "DIVERGIDO —
+        # precisa rebase deliberado" that would send whoever acts on it toward a
+        # dangerous manual rebase for something `git fetch --unshallow` fixes
+        # safely. This watchdog only detects/reports (see module docstring); the
+        # actual cure now runs automatically in deploy_daemons.sh /
+        # viewer-deploy-sync.sh (ga-1tj73 part A).
+        shallow = sh(["git", "-C", root, "rev-parse", "--is-shallow-repository"])
+        if shallow and shallow.returncode == 0 and "true" in (shallow.stdout or ""):
+            blocked.append("%s SHALLOW (git worktree common-dir marcado shallow por um checkout "
+                           "irmão) — rode 'git -C %s fetch %s --unshallow'; NÃO é divergência "
+                           "real, não precisa de rebase (ga-1tj73)" % (root, root, REMOTE))
+            continue
         # ahead\tbehind relative to the remote tracking ref.
         lr = sh(["git", "-C", root, "rev-list", "--left-right", "--count",
                  "%s/%s...HEAD" % (REMOTE, BRANCH)])
@@ -319,6 +337,9 @@ MAYOR_HEADER = (
 REMEDY = {
     "deploy-block": (
         "REMÉDIO (deploy-block — a causa do stall de 2h em 2026-06-18):\n"
+        "0. Se o motivo acima diz SHALLOW: rode o 'git fetch --unshallow' indicado "
+        "e confirme 'git -C <root> rev-parse --is-shallow-repository' -> false. "
+        "NÃO é divergência real — não faça rebase/stash por isso (ga-1tj73).\n"
         "1. Para cada root listado: cd <root> && git -C <root> status; rev-list "
         "--left-right --count origin/main...HEAD.\n"
         "2. AHEAD (commits não-pushados): se forem commits legítimos, push deles "
