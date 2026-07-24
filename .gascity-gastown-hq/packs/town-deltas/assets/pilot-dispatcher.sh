@@ -4455,8 +4455,50 @@ LIVESEC
               case "$_BEAD_CREATED_BY" in ps-worker*) _OWNER_RIG_SIGNAL="property_scrapers" ;; esac
             fi
             if [ -n "$_OWNER_RIG_SIGNAL" ]; then
-              _DOMAIN_RIG="$_OWNER_RIG_SIGNAL"
-              log "ga-nlh79: $STORY_ID owner-authoritative rig (created_by='$_BEAD_CREATED_BY' assignee='$_BEAD_ASSIGNEE_RAW') → $_DOMAIN_RIG (BEFORE content-keyword inference, preventing misroute to property_scrapers)"
+              # ── ga-zzqza (Mayor ruling, 2026-07-24, AC4 follow-up to ga-uvfs6): HQ-EXCLUSIVE
+              # path EXISTENCE outranks the owner-authoritative signal just computed above.
+              # bead_path_rig (FIX 1) is PATTERN-matching (dir-name prefixes) and deliberately
+              # returns "" for a bare scripts/ citation because that directory name exists in HQ
+              # *and* both product rigs — but a bead can cite a SPECIFIC file (e.g.
+              # scripts/root-class-count.sh) that genuinely exists ONLY in HQ, even though
+              # "scripts/" as a bare prefix is ambiguous. Prior to this fix, such a bead
+              # (created_by=*-wa/ps-worker, zero product keyword — ga-shqn/ga-9oyvj, Mayor sweep
+              # 2026-07-19) hit _OWNER_RIG_SIGNAL above and was permanently misrouted to a product
+              # rig, looping refuse→hold forever (the ga-zzqza conflict: an earlier attempt to
+              # gate bead_content_rig on a product keyword FIXED this but broke Scenarios
+              # 18k2/18y/18y2, so it was reverted rather than shipped blind — see ga-zzqza).
+              # MAYOR RULING: created_by-based inference YIELDS to file existence — a path that
+              # resolves to a REAL file under HQ and under NO product rig is unambiguous framework
+              # work, dog-routed regardless of who created it. created_by remains the tie-breaker
+              # ONLY when cited paths are ABSENT everywhere or AMBIGUOUS (present in HQ AND a
+              # product rig, or the probe can't tell) — so this check is scoped to ONLY the
+              # owner-authoritative branch, deliberately NOT the plain bead_content_rig fallback
+              # below (an ownerless keyword-guessed misroute is already a separate, already-solved
+              # problem: the FIX 3 missing-file guard further down catches it post-hoc; touching
+              # that path here would be an unrelated behavior change beyond this ruling's scope).
+              # Reuses the ga-xzfl missing-file guard's own _rig_has_any_path (identical fail-open
+              # semantics: an unresolvable rig root or a probe error reads as "present", never
+              # manufacturing a false HQ-only verdict). Gated by PILOT_HQ_PATH_EXISTS_GUARD
+              # (default 1). Fail-open: no cited path, or _rig_has_any_path unable to confirm
+              # absence from EVERY product rig ⇒ _HQ_ONLY_PATH stays 0 ⇒ the owner signal commits
+              # exactly as before.
+              local _HQ_ONLY_PATH=0 _EXIST_CITED_PATHS=""
+              if [ "${PILOT_HQ_PATH_EXISTS_GUARD:-1}" = "1" ]; then
+                _EXIST_CITED_PATHS=$(bead_cited_paths "$STORY" 2>/dev/null || echo "")
+                if [ -n "$_EXIST_CITED_PATHS" ] \
+                   && _rig_has_any_path "gascity" "$_EXIST_CITED_PATHS" \
+                   && ! _rig_has_any_path "whatsapp_automation" "$_EXIST_CITED_PATHS" \
+                   && ! _rig_has_any_path "property_scrapers" "$_EXIST_CITED_PATHS"; then
+                  _HQ_ONLY_PATH=1
+                fi
+              fi
+              if [ "$_HQ_ONLY_PATH" = "1" ]; then
+                _DOMAIN_RIG=""
+                log "ga-zzqza: $STORY_ID cites path(s) present in HQ (gascity) and absent from every known product rig ($(printf '%s' "$_EXIST_CITED_PATHS" | tr '\n' ' ')) — unambiguous framework work per Mayor ruling; overriding owner-authoritative (created_by='$_BEAD_CREATED_BY' assignee='$_BEAD_ASSIGNEE_RAW' would have routed $_OWNER_RIG_SIGNAL). Disable with PILOT_HQ_PATH_EXISTS_GUARD=0."
+              else
+                _DOMAIN_RIG="$_OWNER_RIG_SIGNAL"
+                log "ga-nlh79: $STORY_ID owner-authoritative rig (created_by='$_BEAD_CREATED_BY' assignee='$_BEAD_ASSIGNEE_RAW') → $_DOMAIN_RIG (BEFORE content-keyword inference, preventing misroute to property_scrapers)"
+              fi
             else
               _DOMAIN_RIG=$(bead_content_rig "$STORY" 2>/dev/null || echo "")
             fi

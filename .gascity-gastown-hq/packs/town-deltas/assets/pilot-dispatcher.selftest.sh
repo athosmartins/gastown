@@ -575,6 +575,7 @@ run_capacity() {
     PILOT_FRAMEWORK_DOG_EXEMPT="${PILOT_FRAMEWORK_DOG_EXEMPT:-}" \
     PILOT_PATH_RIG_GUARD="${PILOT_PATH_RIG_GUARD:-}" \
     PILOT_MISSING_FILE_GUARD="${PILOT_MISSING_FILE_GUARD:-}" \
+    PILOT_HQ_PATH_EXISTS_GUARD="${PILOT_HQ_PATH_EXISTS_GUARD:-}" \
     PILOT_TEST_RIG_HAS_FILE="${PILOT_TEST_RIG_HAS_FILE:-}" \
     PILOT_DOLT_LATENCY_OVERRIDE_MS="$([ "${1:-10}" -gt 200 ] 2>/dev/null && echo 3000 || echo 100)" \
     PILOT_DOLT_CPU_OVERRIDE="${1:-10}" \
@@ -4567,6 +4568,61 @@ if [ "$UVFS6_OUT" = "$UVFS6_EXPECT" ]; then
 else
   bad "ga-uvfs6 AC1: expected $UVFS6_EXPECT, got '$UVFS6_OUT'"
 fi
+
+# ── Scenario ga-zzqza (Mayor ruling 2026-07-24, AC4 follow-up to ga-uvfs6): ────
+# HQ-EXCLUSIVE path existence outranks owner-authoritative (ga-nlh79) inference.
+# A bead citing a path that resolves to a REAL file under HQ and under NO product
+# rig is unambiguous framework work — dog-routed regardless of who created it.
+# created_by remains the tie-breaker ONLY when the cited path is absent everywhere
+# or ambiguous (present in HQ AND a product rig). Motivating example from the
+# ruling: scripts/root-class-count.sh, created_by=mila-wa, zero product keyword
+# (ga-shqn/ga-9oyvj, manually held by the Mayor 2026-07-19 pending this fix).
+echo "Scenario ga-zzqza-a: HQ-only path (created_by=*-wa) → dog, owner-authoritative does NOT fire"
+HQPATH_WA='[{"id":"ga-hqpathwa","title":"tidy up scripts/root-class-count.sh output formatting","priority":2,"issue_type":"bug","description":"cosmetic fix to scripts/root-class-count.sh — no product keyword whatsoever","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"mila-wa","created_at":"2026-07-24T00:00:01Z","metadata":{}}]'
+LOG_ZZQZA_A="$(PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$HQPATH_WA")"
+B_ZZQZA_A="$(dispatched_builder "$LOG_ZZQZA_A")"
+if echo "$B_ZZQZA_A" | grep -qE '^gastown\.dog'; then
+  ok "HQ-only path (*-wa owner) → dog, per Mayor ruling (owner-authoritative preempted)"
+elif [ -z "$B_ZZQZA_A" ]; then
+  bad "REGRESSION (ga-zzqza): HQ-only path bead DEFERRED/held instead of dispatched to dog — new guard did not fire"
+else
+  bad "ga-zzqza-a routed unexpectedly (got: '${B_ZZQZA_A:-none}')"
+fi
+echo "$LOG_ZZQZA_A" | grep -q "ga-zzqza: ga-hqpathwa cites path(s) present in HQ" && ok "ga-zzqza guard logged the HQ-only verdict" || bad "ga-zzqza guard did not log (expected fire)"
+echo "$LOG_ZZQZA_A" | grep -q "ga-nlh79.*owner-authoritative" && bad "REGRESSION: owner-authoritative (ga-nlh79) STILL fired despite HQ-only path — should have been preempted" || ok "owner-authoritative correctly did NOT fire (preempted by HQ-only path)"
+
+echo "Scenario ga-zzqza-b: HQ-only path (created_by=ps-worker) → dog too (guard is owner-agnostic, not WA-only)"
+HQPATH_PS='[{"id":"ga-hqpathps","title":"tidy up scripts/root-class-count.sh output formatting","priority":2,"issue_type":"bug","description":"cosmetic fix to scripts/root-class-count.sh — no product keyword whatsoever","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"ps-worker-1","created_at":"2026-07-24T00:00:02Z","metadata":{}}]'
+LOG_ZZQZA_B="$(PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$HQPATH_PS")"
+B_ZZQZA_B="$(dispatched_builder "$LOG_ZZQZA_B")"
+if echo "$B_ZZQZA_B" | grep -qE '^gastown\.dog'; then
+  ok "HQ-only path (ps-worker owner) → dog too (guard is symmetric across WA/PS owners)"
+elif [ "$B_ZZQZA_B" = batista-ps ]; then
+  bad "REGRESSION (ga-zzqza): HQ-only path bead misrouted to batista-ps — owner-authoritative not preempted for PS owner"
+else
+  bad "ga-zzqza-b routed unexpectedly (got: '${B_ZZQZA_B:-none}')"
+fi
+
+echo "Scenario ga-zzqza-c (AMBIGUOUS control): path present in HQ AND owner's rig → owner-authoritative fallback still wins"
+LOG_ZZQZA_C="$(PILOT_TEST_RIG_HAS_FILE="gascity whatsapp_automation" run_capacity 10 "[]" 1 "$HQPATH_WA")"
+B_ZZQZA_C="$(dispatched_builder "$LOG_ZZQZA_C")"
+if [ "$B_ZZQZA_C" = batista-ps ]; then
+  bad "REGRESSION: ambiguous-path bead misrouted to batista-ps"
+elif echo "$B_ZZQZA_C" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION (ga-zzqza AMBIGUOUS case): path present in BOTH HQ and WA still forced to dog — should defer to owner-authoritative tie-break per Mayor ruling"
+else
+  ok "ambiguous path (present in HQ AND WA) → owner-authoritative fallback wins (WA/held), NOT forced to dog"
+fi
+echo "$LOG_ZZQZA_C" | grep -q "ga-zzqza: ga-hqpathwa cites path" && bad "ga-zzqza guard wrongly fired on an AMBIGUOUS path (present in >1 rig)" || ok "ga-zzqza guard correctly stayed silent on the ambiguous case (tie-break defers to owner)"
+
+echo "Scenario ga-zzqza-d (kill-switch control): PILOT_HQ_PATH_EXISTS_GUARD=0 → NO preemption (guard disabled)"
+LOG_ZZQZA_D="$(PILOT_HQ_PATH_EXISTS_GUARD=0 PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$HQPATH_WA")"
+echo "$LOG_ZZQZA_D" | grep -q "ga-zzqza: ga-hqpathwa cites path" && bad "guard fired despite PILOT_HQ_PATH_EXISTS_GUARD=0" || ok "guard silent when disabled (kill-switch honored) — falls back to owner-authoritative"
+
+echo "Scenario ga-zzqza: drift-guard — HQ-path-existence guard is wired"
+has "$DISPATCHER" 'ga-zzqza'                       "ga-zzqza HQ-path-existence guard is wired"
+has "$DISPATCHER" 'PILOT_HQ_PATH_EXISTS_GUARD'     "PILOT_HQ_PATH_EXISTS_GUARD env-gate is wired"
+has "$DISPATCHER" '_HQ_ONLY_PATH'                  "_HQ_ONLY_PATH signal variable is wired"
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
