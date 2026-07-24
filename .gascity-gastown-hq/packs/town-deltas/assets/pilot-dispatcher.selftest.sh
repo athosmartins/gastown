@@ -875,6 +875,38 @@ UNRELATED_META='[{"id":"bd-has-meta","assignee":null,"labels":[],"description":"
 
 echo "$_FC_FN" | grep -q 'gc.root_bead_id' && ok "_filter_candidates carries the gc.root_bead_id workflow-step exclusion clause" || bad "gc.root_bead_id exclusion clause missing from _filter_candidates"
 
+# ── Scenario ga-nf4x5 (SECURITY): story:needs-approval is the Athos
+# MERIT/legal sign-off gate — distinct from story:needs-human (an INFO-GAP:
+# the bead itself is unbuildable) but must be excluded from auto-dispatch the
+# same way. Near-miss: wa-6xn82 (a real LAI legal filing under Athos's CPF)
+# carried story:needs-approval + an owner comment demanding human sign-off on
+# legal merit, yet Pilot dispatched it (15:52) to the generic wa-worker pool
+# with "No human review required" — only a worker manually reading the
+# comment and refusing by hand stopped it from being filed. AC2 (ga-nf4x5):
+# prove a bead with story:needs-approval + ctx:ready + exec:auto never
+# appears as a dispatch candidate — neither via Pilot nor via the routed-pool
+# probes that bypass Pilot entirely (ga-en2s).
+echo "Scenario ga-nf4x5: story:needs-approval bead is excluded from the candidate pool (human merit/legal gate)"
+NEEDS_APPROVAL='[{"id":"bd-needs-approval","assignee":null,"labels":["story:needs-approval","ctx:ready","exec:auto"],"description":"x"},{"id":"bd-approval-free","assignee":null,"labels":["ctx:ready","exec:auto"],"description":"x"}]'
+[ "$(_fc "$NEEDS_APPROVAL")" = '["bd-approval-free"]' ] && ok "ga-nf4x5: story:needs-approval+ctx:ready+exec:auto bead excluded; clean sibling kept" || bad "ga-nf4x5: story:needs-approval bead leaked into candidates (SECURITY REGRESSION): $(_fc "$NEEDS_APPROVAL")"
+echo "$_FC_FN" | grep -q '"story:needs-approval"' && ok "_filter_candidates carries the story:needs-approval clause" || bad "story:needs-approval clause missing from _filter_candidates"
+
+# AC1(b)/AC2 cross-check: the routed-pool probes (wa-worker/ps-worker) must
+# carry the SAME exclusion independently of _filter_candidates — they bypass
+# Pilot's dispatch path entirely, so a fix in _filter_candidates alone would
+# NOT have closed the wa-6xn82 near-miss (that bead was routed straight to
+# the wa-worker pool, never touching _filter_candidates at all).
+for _NF4X5_TMPL in wa-worker ps-worker; do
+  _NF4X5_TMPL_PATH="$SELF_DIR/../../../agents/$_NF4X5_TMPL/prompt.template.md"
+  if [ -f "$_NF4X5_TMPL_PATH" ]; then
+    grep -q -- '--exclude-label "story:needs-approval"' "$_NF4X5_TMPL_PATH" \
+      && ok "ga-nf4x5: $_NF4X5_TMPL routed-pool probe excludes story:needs-approval" \
+      || bad "ga-nf4x5: $_NF4X5_TMPL routed-pool probe MISSING story:needs-approval exclusion (SECURITY REGRESSION)"
+  else
+    bad "ga-nf4x5: could not locate $_NF4X5_TMPL prompt.template.md to verify story:needs-approval exclusion (path: $_NF4X5_TMPL_PATH)"
+  fi
+done
+
 # ── Scenario 3e2e-h (ga-am6h): pilot:reclaim-count cap is STICKY, independent of
 # pilot:held ─────────────────────────────────────────────────────────────────────
 # ga-knfh incident: inflight-reclaim-guard exhausted the reclaim cap (3/3) at

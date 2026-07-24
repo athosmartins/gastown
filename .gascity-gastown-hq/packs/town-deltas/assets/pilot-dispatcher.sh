@@ -1421,6 +1421,16 @@ _filter_candidates() {
           # re-selected and burned another dispatch).
           or startswith("pilot:refused-reason:")
           or . == "story:needs-human"
+          # ga-nf4x5: story:needs-approval is the Athos MERIT/legal sign-off gate
+          # (refino-gate-dispatcher.sh applies it once code-gate passed but a human
+          # decision on merit/risk is still pending — e.g. wa-6xn82, a real LAI legal
+          # filing dispatched to the generic wa-worker pool with "No human review
+          # required" before a worker happened to read the comment and refuse by
+          # hand). It is semantically distinct from story:needs-human (an INFO-GAP:
+          # the bead is unbuildable/underspecified) but must be excluded the same
+          # way: this is a human decision gate, not a code-quality gate that
+          # gate-done/autonomous review can ever clear.
+          or . == "story:needs-approval"
           or . == "story:needs-device"
           or . == "on-device"
           or . == "story:blocked"
@@ -1515,6 +1525,7 @@ _filter_candidates() {
               or startswith("pool:refused")
               or startswith("pilot:refused-reason:")
               or . == "story:needs-human"
+              or . == "story:needs-approval"
               or . == "story:needs-device"
               or . == "on-device"
               or . == "story:blocked"
