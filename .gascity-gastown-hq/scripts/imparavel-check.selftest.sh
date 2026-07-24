@@ -216,6 +216,7 @@ snap = {"generated_at": "2999-01-01T00:00:00Z", "ttl_seconds": 600, "count": 2,
             {"id": "wa-STUCK",  "store": "whatsapp_automation", "title": "buildable, never built"}]}
 _fd, _p = tempfile.mkstemp(suffix=".json"); os.write(_fd, json.dumps(snap).encode()); os.close(_fd)
 m.DISPATCHABLE_JSON = _p
+_orig_age_min = m._age_min
 m._age_min = lambda iso: 1.0                       # treat snapshot as 1 min old (live)
 m._gate_source_beads = lambda: {"wa-INGATE"}       # only the in-gate bead has an open marker
 _LIVE = {"wa-INGATE": ["ctx:ready", "exec:auto", "gate:reviewing"],
@@ -223,10 +224,103 @@ _LIVE = {"wa-INGATE": ["ctx:ready", "exec:auto", "gate:reviewing"],
 m._bd_show_labels_text = lambda root, bid: _LIVE.get(bid)
 _a = m.check_approved()
 os.unlink(_p)
+m._age_min = _orig_age_min   # ga-26us5: must not leak into later tests (age must be real there)
 eq("in_gate_count == 1", _a["in_gate_count"], 1)
 eq("stuck list == [wa-STUCK] (in-gate NOT flagged, genuine IS)",
    [s["id"] for s in _a["stuck"]], ["wa-STUCK"])
 eq("from_dispatchable path used (not fallback)", _a["from_dispatchable"], True)
+
+print("── ga-26us5: classify_in_flight pure classifier (delivery-stall exclusion) ──")
+eq("fresh (60min < 180min stall) → building", m.classify_in_flight(60.0, 180.0), "building")
+eq("exactly at threshold (180min == 180min stall) → building (inclusive, mirrors watchdog's strict->stalled)",
+   m.classify_in_flight(180.0, 180.0), "building")
+eq("just past threshold (180.1min > 180min stall) → delivery-stalled",
+   m.classify_in_flight(180.1, 180.0), "delivery-stalled")
+eq("stale (240min=4h > 180min=3h stall) → delivery-stalled", m.classify_in_flight(240.0, 180.0), "delivery-stalled")
+eq("unknown age (None) → delivery-stalled (never a free pass to building)",
+   m.classify_in_flight(None, 180.0), "delivery-stalled")
+
+print("── ga-26us5: DELIVERY_STALL_HOURS imported from throughput-stall-watchdog.py (single source, AC2) ──")
+eq("DELIVERY_STALL_HOURS is a positive float", isinstance(m.DELIVERY_STALL_HOURS, float) and m.DELIVERY_STALL_HOURS > 0, True)
+
+print("── ga-26us5: main() end-to-end — a single 4h-stale story:in-flight bead must NOT "
+      "count as 'building now' and must be named as delivery-stalled (AC1/AC3/AC4) ──")
+import time as _time
+_orig_bd_json = m._bd_json
+m.check_approved = lambda: {
+    "total": 0, "parked_count": 0, "in_gate_count": 0, "buildable_count": 0,
+    "flowing_count": 0, "held_count": 0, "stuck": [], "read_err": [], "warns": [],
+    "from_dispatchable": True, "snap_age_min": 1.0,
+}
+m.check_gate = lambda: {"active": [], "parked": [], "last_pass_min": 1.0,
+                         "reviewer_alive": True, "oldest_active_min": None,
+                         "stalled": False, "stall_reason": ""}
+m.check_pilot = lambda: {"alive": True, "last_sweep_min": 0.5}
+m.check_dolt = lambda: {"responsive": True, "latency_ms": 10}
+m._pilot_slots = lambda: None
+m.RIGS = [("WA", "/fake/wa/root")]
+_stale_iso = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(m.NOW - 4 * 3600))  # 4h ago > 3h default stall
+
+
+def _fake_bd_json_stale(root, label, status="open"):
+    if label == "story:in-flight":
+        return [{"id": "wa-v66xt", "title": "worker terminated, device flaky", "updated_at": _stale_iso}], True
+    return [], True
+
+
+m._bd_json = _fake_bd_json_stale
+
+_buf3 = io.StringIO()
+_exit_code3 = None
+try:
+    with contextlib.redirect_stdout(_buf3):
+        m.main()
+except SystemExit as e:
+    _exit_code3 = e.code
+_out3 = _buf3.getvalue()
+eq("4h-stale in-flight bead: exit code 0 (other 3 checks are legitimately healthy)", _exit_code3, 0)
+eq("4h-stale in-flight bead: 'EM BUILD AGORA' line does NOT print (building_now excludes it)",
+   "EM BUILD AGORA" in _out3, False)
+eq("4h-stale in-flight bead: ✅ 'Construindo' reassurance does NOT fire off this bead",
+   "Construindo" in _out3, False)
+eq("4h-stale in-flight bead: the stalled bead IS named explicitly in the report (AC4)",
+   "wa-v66xt" in _out3, True)
+eq("4h-stale in-flight bead: report says 'não building' (rebaixado, not silently dropped)",
+   "não building" in _out3, True)
+eq("4h-stale in-flight bead: report says 'aguardando humano' (AC1 downgrade target)",
+   "aguardando humano" in _out3, True)
+eq("4h-stale in-flight bead: verdict is still ✅ (this bead's miscount is fixed — not a new gating condition)",
+   "VEREDITO: ✅" in _out3, True)
+
+print("── ga-26us5: regression guard — a genuinely FRESH in-flight bead still counts as building ──")
+_fresh_iso = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(m.NOW - 5 * 60))  # 5min ago, well under 3h
+
+
+def _fake_bd_json_fresh(root, label, status="open"):
+    if label == "story:in-flight":
+        return [{"id": "wa-desi9", "title": "actively building", "updated_at": _fresh_iso}], True
+    return [], True
+
+
+m._bd_json = _fake_bd_json_fresh
+_buf4 = io.StringIO()
+_exit_code4 = None
+try:
+    with contextlib.redirect_stdout(_buf4):
+        m.main()
+except SystemExit as e:
+    _exit_code4 = e.code
+_out4 = _buf4.getvalue()
+eq("fresh in-flight bead: 'EM BUILD AGORA' line DOES print", "EM BUILD AGORA" in _out4, True)
+eq("fresh in-flight bead: named in the building line", "wa-desi9" in _out4, True)
+eq("fresh in-flight bead: does NOT appear in a 'não building' line (never downgraded)",
+   "não building" in _out4, False)
+eq("fresh in-flight bead: ✅ 'Construindo 1 agora' reassurance fires", "Construindo 1 agora" in _out4, True)
+
+m._bd_json = _orig_bd_json
+m.check_approved, m.check_gate = _orig_check_approved, _orig_check_gate
+m.check_pilot, m.check_dolt = _orig_check_pilot, _orig_check_dolt
+m._pilot_slots, m.RIGS = _orig_pilot_slots, _orig_rigs
 
 print()
 print("RESULT: %d passed, %d failed" % (PASS, FAIL))
