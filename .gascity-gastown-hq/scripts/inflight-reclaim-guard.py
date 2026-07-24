@@ -363,6 +363,23 @@ def _has_refusal_label(labels):
     )
 
 
+def _refusal_slug_of_label(lbl):
+    """Return the reason slug a single label contributes, or None if it isn't
+    a pool:refused[:<slug>] marker. Bare 'pool:refused' -> 'unspecified'.
+
+    Single-label primitive factored out of _refusal_reason_slugs() (ga-9d80l
+    gate-fix-2) so _promote_refusal_labels() can match a label being removed
+    from the ORIGINAL bead back to the bridge-source entry that produced it,
+    without duplicating the slug-extraction rule in two places.
+    """
+    if lbl == "pool:refused":
+        return "unspecified"
+    if lbl.startswith("pool:refused:"):
+        slug = lbl[len("pool:refused:"):].strip()
+        return slug if slug else "unspecified"
+    return None
+
+
 def _refusal_reason_slugs(labels):
     """Extract reason slugs from pool:refused[:<slug>] labels, in label order.
 
@@ -372,11 +389,9 @@ def _refusal_reason_slugs(labels):
     """
     slugs = []
     for lbl in labels:
-        if lbl == "pool:refused":
-            slugs.append("unspecified")
-        elif lbl.startswith("pool:refused:"):
-            slug = lbl[len("pool:refused:"):].strip()
-            slugs.append(slug if slug else "unspecified")
+        slug = _refusal_slug_of_label(lbl)
+        if slug is not None:
+            slugs.append(slug)
     return slugs
 
 
@@ -1493,9 +1508,10 @@ def list_live_sling_source_beads(sessions, now):
 
 
 def list_refused_sling_source_beads():
-    """Return {original_bead_id: [reason_slug, ...]} bridging an explicit
-    pool:refused[:reason] label stamped on a SLING/task bead back onto the
-    ORIGINAL bug/story bead it was dispatched to fix (ga-9d80l).
+    """Return {original_bead_id: [(reason_slug, sling_id, sling_rig_root), ...]}
+    bridging an explicit pool:refused[:reason] label stamped on a SLING/task
+    bead back onto the ORIGINAL bug/story bead it was dispatched to fix
+    (ga-9d80l).
 
     ga-be4x's explicit-refusal awareness (_has_refusal_label(),
     REFUSAL_ESCALATE_THRESHOLD, the pilot:refused-reason:* audit trail) only
@@ -1524,6 +1540,21 @@ def list_refused_sling_source_beads():
     pool:refused[:reason], resolves the original bead id from the title
     capture group.
 
+    ga-9d80l GATE-FEEDBACK FIX: fix-attempt 1 returned bare reason slugs and
+    discarded the sling's own bead id, so the only thing downstream could do
+    with a bridged reason was synthesize it into the ORIGINAL's in-memory
+    effective_labels — nothing ever consumed the REAL pool:refused[:reason]
+    label at its actual source (the sling). That let a single stale sling
+    refusal re-bridge and re-promote on every subsequent cycle forever,
+    including against later, unrelated, healthy re-dispatches of the same
+    original (a false escalate). Each entry now also carries the sling's own
+    id and rig_root (None=HQ store, else the rig path it was queried from) so
+    a caller that actually PROMOTES a bridged reason (_promote_refusal_labels,
+    called only when do_reclaim()/do_escalate() actuate this cycle) can also
+    clear pool:refused[:reason] at the sling — consumed exactly once, exactly
+    when applied, same contract as a native (non-bridged) refusal label
+    already had.
+
     Fail-OPEN: returns {} (never None) on any query error — unlike
     list_live_sling_source_beads()/list_gate_active_source_beads()'s
     fail-CLOSED (None -> skip the whole cycle) contract. This signal only
@@ -1536,7 +1567,7 @@ def list_refused_sling_source_beads():
     """
     bridged = {}
 
-    def _collect(candidate_beads):
+    def _collect(candidate_beads, rig_root):
         for b in candidate_beads:
             title = b.get("title") or ""
             match = _SLING_TITLE_RE.match(title)
@@ -1545,14 +1576,18 @@ def list_refused_sling_source_beads():
             sling_labels = b.get("labels", [])
             if not _has_refusal_label(sling_labels):
                 continue
+            sling_id = b.get("id") or ""
+            if not sling_id:
+                continue
             original_id = match.group(1)
             slugs = _refusal_reason_slugs(sling_labels)
             if not slugs:
                 continue
             existing = bridged.setdefault(original_id, [])
             for slug in slugs:
-                if slug not in existing:
-                    existing.append(slug)
+                entry = (slug, sling_id, rig_root)
+                if entry not in existing:
+                    existing.append(entry)
 
     for status in ("open", "in_progress"):
         try:
@@ -1564,7 +1599,7 @@ def list_refused_sling_source_beads():
             data = json.loads(result.stdout)
             if not isinstance(data, list):
                 continue
-            _collect(data)
+            _collect(data, None)
         except Exception:
             continue  # fail-open per query
 
@@ -1579,7 +1614,7 @@ def list_refused_sling_source_beads():
                 rig_data = json.loads(r.stdout)
                 if not isinstance(rig_data, list):
                     continue
-                _collect(rig_data)
+                _collect(rig_data, rig_path)
             except Exception:
                 continue  # fail-open per rig/status
 
@@ -1849,7 +1884,7 @@ def _pool_of(assignee):
 # Actuation helpers (label + assignee ops on real beads — CONSERVATIVE)
 # ---------------------------------------------------------------------------
 
-def _promote_refusal_labels(bead_id, labels, refusal_count, rig_root=None):
+def _promote_refusal_labels(bead_id, labels, refusal_count, rig_root=None, bridge_sources=None):
     """Consume fresh pool:refused[:reason] label(s), promote each into a
     PERMANENT pilot:refused-reason:<slug> audit label, and bump
     pilot:refusal-count:N. Shared by do_reclaim() and do_escalate() (ga-be4x
@@ -1867,6 +1902,23 @@ def _promote_refusal_labels(bead_id, labels, refusal_count, rig_root=None):
     under-counting pilot:refusal-count by one, since its bump lived only in
     this same do_reclaim()-only path).
 
+    ga-9d80l gate-fix-2: bridge_sources, when provided, is the
+    (slug, sling_id, sling_rig_root) list run_cycle's Pass 1 attached to
+    this bead (from list_refused_sling_source_beads(), via the classified
+    tuple). For every pool:refused[:reason] label consumed below that
+    matches a bridged slug, the REAL label is ALSO removed at its actual
+    source — the sling bead, via bd -C sling_rig_root — not just from
+    `bead_id` (the ORIGINAL). Removing it only from `bead_id` was a no-op
+    on a bridged reason: the original never carried it natively in bd,
+    only in this call's in-memory `labels` (synthesized by Pass 1). Left
+    uncleared, the sling's label survives forever and
+    list_refused_sling_source_beads() re-bridges the SAME stale refusal on
+    every later cycle — including against a later, unrelated, healthy
+    re-dispatch of the same original (a false escalate: fix-attempt-1's
+    gate-review finding). Consuming at the source makes a bridged refusal
+    behave exactly like a native one: read once, promoted once, never
+    re-applied.
+
     Returns (new_refusal_count, fresh_slugs, all_slugs):
       - new_refusal_count: refusal_count + 1.
       - fresh_slugs:  reasons newly promoted THIS call (from pool:refused[:reason]
@@ -1877,6 +1929,13 @@ def _promote_refusal_labels(bead_id, labels, refusal_count, rig_root=None):
     """
     _bd = ["bd", "-C", rig_root] if rig_root else ["bd"]
     fresh_slugs = _refusal_reason_slugs(labels)
+
+    # ga-9d80l gate-fix-2: index bridge sources by slug so a label removed
+    # from `bead_id` below can find every sling that actually carries it.
+    _sources_by_slug = {}
+    for _slug, _sling_id, _sling_rig_root in (bridge_sources or []):
+        _sources_by_slug.setdefault(_slug, []).append((_sling_id, _sling_rig_root))
+
     for lbl in labels:
         if lbl == "pool:refused" or lbl.startswith("pool:refused:"):
             try:
@@ -1886,6 +1945,20 @@ def _promote_refusal_labels(bead_id, labels, refusal_count, rig_root=None):
             except Exception as exc:
                 print(f"[INFLIGHT-RECLAIM] warn: remove {lbl} from {bead_id}: {exc}",
                       flush=True)
+            # ga-9d80l gate-fix-2: also consume the label AT ITS SOURCE when
+            # it was bridged from a sling — otherwise the sling keeps
+            # carrying it forever and a later cycle re-bridges the same
+            # stale refusal (see docstring above).
+            _slug = _refusal_slug_of_label(lbl)
+            for _sling_id, _sling_rig_root in _sources_by_slug.get(_slug, []):
+                _sling_bd = ["bd", "-C", _sling_rig_root] if _sling_rig_root else ["bd"]
+                try:
+                    subprocess.run(
+                        _sling_bd + ["label", "remove", _sling_id, lbl, "-q"],
+                        capture_output=True, text=True, timeout=15)
+                except Exception as exc:
+                    print(f"[INFLIGHT-RECLAIM] warn: remove {lbl} from bridge "
+                          f"source {_sling_id}: {exc}", flush=True)
     for slug in fresh_slugs:
         try:
             subprocess.run(
@@ -1922,7 +1995,7 @@ def _promote_refusal_labels(bead_id, labels, refusal_count, rig_root=None):
 
 
 def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=None,
-                has_explicit_refusal=False, refusal_count=0):
+                has_explicit_refusal=False, refusal_count=0, bridge_sources=None):
     """Strip story:in-flight (+pilot:dispatched if present), clear assignee,
     bump reclaim label.
 
@@ -1990,7 +2063,7 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     new_refusal_count = refusal_count
     if has_explicit_refusal:
         new_refusal_count, refused_reason_slugs, _all_reason_slugs = _promote_refusal_labels(
-            bead_id, labels, refusal_count, rig_root=rig_root)
+            bead_id, labels, refusal_count, rig_root=rig_root, bridge_sources=bridge_sources)
 
     # 2. Clear assignee so Pilot can claim it fresh
     try:
@@ -2098,7 +2171,7 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
 
 
 def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=None,
-                 has_explicit_refusal=False, refusal_count=0):
+                 has_explicit_refusal=False, refusal_count=0, bridge_sources=None):
     """Mark a permanently-failing bead gate:needs-human — do NOT re-clear it.
 
     ga-6ow4v: the reclaim cap is exhausted (MAX_RECLAIMS reclaims of the SAME
@@ -2188,7 +2261,7 @@ def do_escalate(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=N
         # this call the triggering reason was silently dropped (never
         # promoted, never consumed, never read).
         new_refusal_count, _fresh_reason_slugs, all_reason_slugs = _promote_refusal_labels(
-            bead_id, labels, refusal_count, rig_root=rig_root)
+            bead_id, labels, refusal_count, rig_root=rig_root, bridge_sources=bridge_sources)
         _reason_text = ", ".join(all_reason_slugs) if all_reason_slugs else "unspecified"
         try:
             subprocess.run(
@@ -2639,7 +2712,7 @@ def run_cycle(state, escalated_alerted):
     stranded_count = 0
     active_bead_ids = set()
     # ga-dbibq: two-pass structure so pool-dead alert fires BEFORE per-bead actuation.
-    classified = []    # (bead_id, title, labels, action, idle_min, reclaim_count, assignee)
+    classified = []    # (bead_id, title, labels, assignee, action, idle_min, reclaim_count, rig_root, bridge_sources)
     pool_zombies = {}  # pool -> [bead_id] for beads classified zombie this cycle
 
     # --- Pass 1: classify all beads (no actuation yet) ---
@@ -2660,10 +2733,24 @@ def run_cycle(state, escalated_alerted):
         # existing label-membership check below and downstream (do_reclaim /
         # do_escalate / _promote_refusal_labels) stays correct unchanged —
         # see list_refused_sling_source_beads()'s docstring for the incident
-        # this closes.
+        # this closes. bridge_sources (the full (slug, sling_id, rig_root)
+        # entries, empty when nothing was bridged) rides along in the
+        # classified tuple so Pass 2 can pass it to do_reclaim/do_escalate,
+        # which consume pool:refused[:reason] AT THE SLING once a bridged
+        # reason is actually promoted onto this bead this cycle — never
+        # here at discovery time, since bridging alone doesn't guarantee
+        # this bead gets actuated this cycle (ga-9d80l GATE-FEEDBACK: an
+        # un-actuated bead — e.g. gate:needs-human or a live dispatch marker
+        # wins this cycle — must still see the same bridged reason next
+        # cycle, not have it silently consumed and lost).
+        bridge_sources = []
         if not _has_refusal_label(labels):
-            _bridged_slugs = refused_sling_source_beads.get(bead_id, [])
-            if _bridged_slugs:
+            bridge_sources = refused_sling_source_beads.get(bead_id, [])
+            if bridge_sources:
+                _bridged_slugs = []
+                for _slug, _sling_id, _sling_rig_root in bridge_sources:
+                    if _slug not in _bridged_slugs:
+                        _bridged_slugs.append(_slug)
                 labels = labels + [f"pool:refused:{_slug}" for _slug in _bridged_slugs]
         assignee = bead.get("assignee") or ""
         title = bead.get("title", "")[:60]
@@ -2812,8 +2899,11 @@ def run_cycle(state, escalated_alerted):
             if pool:
                 pool_zombies.setdefault(pool, []).append(bead_id)
 
-        # Include assignee + rig_root in classified tuple for Pass 2 (ga-hkpwv, ga-mfeip)
-        classified.append((bead_id, title, labels, assignee, action, idle_min, reclaim_count, rig_root))
+        # Include assignee + rig_root in classified tuple for Pass 2 (ga-hkpwv, ga-mfeip).
+        # bridge_sources (ga-9d80l gate-fix-2) lets Pass 2 consume a bridged
+        # refusal at its sling source when it actually promotes it.
+        classified.append((bead_id, title, labels, assignee, action, idle_min, reclaim_count,
+                            rig_root, bridge_sources))
 
     # --- Pool-dead alert (BEFORE per-bead actuation, ga-dbibq) ---
     # Emits [POOL-DEAD] Mayor mail when >= POOL_DEAD_MIN beads from the same pool
@@ -2821,7 +2911,8 @@ def run_cycle(state, escalated_alerted):
     _check_pool_dead(pool_zombies, now)
 
     # --- Pass 2: per-bead actuation (logic unchanged from prior single-pass) ---
-    for bead_id, title, labels, assignee, action, idle_min, reclaim_count, rig_root in classified:
+    for (bead_id, title, labels, assignee, action, idle_min, reclaim_count,
+         rig_root, bridge_sources) in classified:
         # ga-be4x: re-derive from labels (already in the tuple — no new fields
         # needed) so actuation makes the SAME refusal-vs-death distinction
         # Pass 1 used to classify the action in the first place.
@@ -2830,7 +2921,8 @@ def run_cycle(state, escalated_alerted):
 
         if action == "reclaim":
             ok = do_reclaim(bead_id, title, reclaim_count, idle_min, labels, rig_root=rig_root,
-                             has_explicit_refusal=has_explicit_refusal, refusal_count=refusal_count)
+                             has_explicit_refusal=has_explicit_refusal, refusal_count=refusal_count,
+                             bridge_sources=bridge_sources)
             status = "RECLAIMED" if ok else "RECLAIM-FAILED"
             _refusal_tag = (f" refusal={refusal_count + 1}/{REFUSAL_ESCALATE_THRESHOLD}"
                              if has_explicit_refusal else "")
@@ -2848,7 +2940,8 @@ def run_cycle(state, escalated_alerted):
             if now - last_alert > REALERT_SEC:
                 _escalated_reason_slugs = do_escalate(
                     bead_id, title, reclaim_count, idle_min, labels, rig_root=rig_root,
-                    has_explicit_refusal=has_explicit_refusal, refusal_count=refusal_count)
+                    has_explicit_refusal=has_explicit_refusal, refusal_count=refusal_count,
+                    bridge_sources=bridge_sources)
                 _escalate_reason = (
                     f"{refusal_count + 1} independent EXPLICIT REFUSALS"
                     if has_explicit_refusal else f"reclaimed {reclaim_count}x")
@@ -4176,6 +4269,22 @@ def _selftest():
     # Section 7's SL-1..7); RS-8 reproduces the actual ga-dp15j/ga-u5y7y
     # incident end-to-end, including the FALSIFY criterion from ga-9d80l's
     # own bug report.
+    #
+    # ga-9d80l GATE-FEEDBACK FIX (fix-attempt 2): fix-attempt 1's gate review
+    # found that the bridge synthesized pool:refused:<slug> into the
+    # ORIGINAL's in-memory effective_labels but never consumed the REAL
+    # label at its source (the sling) — do_reclaim()/do_escalate() only ever
+    # removed it from the original, a no-op since the original never
+    # natively carried it in bd. A single stale sling's refusal therefore
+    # re-bridged forever, including against a later, unrelated, healthy
+    # re-dispatch (a false escalate). list_refused_sling_source_beads() now
+    # returns {original_id: [(slug, sling_id, sling_rig_root), ...]} instead
+    # of bare slugs, threaded through run_cycle's classified tuple into
+    # do_reclaim/do_escalate/_promote_refusal_labels as `bridge_sources`, so
+    # a bridged reason can be cleared at its actual source exactly when (and
+    # only when) it is promoted. RS-1..8 below are updated for the new tuple
+    # shape (same scenarios, same intent); RS-9..12 are new and cover the
+    # gate-feedback fix specifically.
     # -----------------------------------------------------------------------
 
     _orig_run_rs = subprocess.run
@@ -4209,9 +4318,21 @@ def _selftest():
             return _R(0, "")  # e.g. 'gc rig list' → empty stdout → no rigs
         return _run
 
+    def _bridged_slugs_of(entries):
+        """Dedup (slug, sling_id, rig_root) entries down to unique slugs, in
+        first-seen order — exactly what run_cycle's Pass 1 does to build
+        effective_labels from a bridge lookup. Shared here so RS-8's manual
+        reproduction can't silently drift from the production dedup logic.
+        """
+        slugs = []
+        for _slug, _sling_id, _sling_rig_root in entries:
+            if _slug not in slugs:
+                slugs.append(_slug)
+        return slugs
+
     try:
         # --- RS-1: refused sling ('fix bug') resolves to its original id,
-        # with the reason slug extracted ---
+        # with the reason slug + sling id + rig_root (None=HQ) extracted ---
         subprocess.run = _stub_bd_refused({
             "in_progress": [
                 {"id": "ga-u5y7y", "title": "fix bug ga-dp15j: Pilot dispatch ignores Mayor's deferral",
@@ -4219,8 +4340,9 @@ def _selftest():
             ],
         })
         _rs1 = list_refused_sling_source_beads()
-        check("RS-1: refused sling ('fix bug') resolves to its original id with reason slug",
-              _rs1 == {"ga-dp15j": ["mayor-deferred"]}, f"got={_rs1!r}")
+        check("RS-1: refused sling ('fix bug') resolves to its original id with "
+              "reason slug + sling id + rig_root",
+              _rs1 == {"ga-dp15j": [("mayor-deferred", "ga-u5y7y", None)]}, f"got={_rs1!r}")
 
         # --- RS-2: non-refused sling → contributes nothing ---
         subprocess.run = _stub_bd_refused({
@@ -4253,7 +4375,7 @@ def _selftest():
         })
         _rs4 = list_refused_sling_source_beads()
         check("RS-4: sling 'build story' title → original story id resolved",
-              _rs4 == {"ga-storyZ": ["cross-rig-framework"]}, f"got={_rs4!r}")
+              _rs4 == {"ga-storyZ": [("cross-rig-framework", "ga-slingC", None)]}, f"got={_rs4!r}")
 
         # --- RS-5 (ga-vw26y): status=open ALSO bridges, not just in_progress —
         # a refused sling's status varies by how/when it was refused ---
@@ -4266,7 +4388,7 @@ def _selftest():
         })
         _rs5 = list_refused_sling_source_beads()
         check("RS-5 (ga-vw26y): status=open sling also bridges (not just in_progress)",
-              _rs5 == {"ga-bugD": ["unspecified"]}, f"got={_rs5!r}")
+              _rs5 == {"ga-bugD": [("unspecified", "ga-slingD", None)]}, f"got={_rs5!r}")
 
         # --- RS-6a: bd-list non-zero exit → fail-OPEN {} (never None — unlike
         # the sibling functions' fail-CLOSED/None contract) ---
@@ -4290,7 +4412,7 @@ def _selftest():
         })
         _rs7 = list_refused_sling_source_beads()
         check("RS-7: bare 'pool:refused' (no reason) → 'unspecified' slug",
-              _rs7 == {"ga-bugE": ["unspecified"]}, f"got={_rs7!r}")
+              _rs7 == {"ga-bugE": [("unspecified", "ga-slingE", None)]}, f"got={_rs7!r}")
 
         # --- RS-8: END-TO-END regression for the actual ga-dp15j/ga-u5y7y
         # incident shape (the FALSIFY criterion from ga-9d80l's own bug
@@ -4306,7 +4428,8 @@ def _selftest():
         })
         _rs8_bridge = list_refused_sling_source_beads()
         check("RS-8a: bridge resolves the incident's sling refusal onto the original id",
-              _rs8_bridge == {"ga-dp15j": ["cross-rig-framework"]}, f"got={_rs8_bridge!r}")
+              _rs8_bridge == {"ga-dp15j": [("cross-rig-framework", "ga-u5y7y", None)]},
+              f"got={_rs8_bridge!r}")
 
         # ga-dp15j's OWN labels — confirmed live incident state: no refusal
         # marker of any kind, despite its sling having been explicitly refused.
@@ -4327,9 +4450,11 @@ def _selftest():
               _rs8_pre_fix_decision == "reclaim", f"got={_rs8_pre_fix_decision!r}")
 
         # Fix — bridge the sling's refusal onto ga-dp15j's effective_labels,
-        # exactly as run_cycle's Pass 1 now does.
+        # exactly as run_cycle's Pass 1 now does (dedup entries down to
+        # unique slugs via the shared _bridged_slugs_of helper above).
+        _rs8_bridge_entries = _rs8_bridge.get("ga-dp15j", [])
         _rs8_effective_labels = _rs8_own_labels + [
-            f"pool:refused:{slug}" for slug in _rs8_bridge.get("ga-dp15j", [])
+            f"pool:refused:{slug}" for slug in _bridged_slugs_of(_rs8_bridge_entries)
         ]
         _rs8_has_refusal = _has_refusal_label(_rs8_effective_labels)
         _rs8_refusal_count = parse_refusal_count(_rs8_effective_labels)
@@ -4357,8 +4482,9 @@ def _selftest():
         _rs8_bridge2 = list_refused_sling_source_beads()
         _rs8_own_labels2 = ["story:in-flight", "pilot:dispatched", "pilot:refusal-count:1",
                              "pilot:refused-reason:cross-rig-framework"]
+        _rs8_bridge2_entries = _rs8_bridge2.get("ga-dp15j", [])
         _rs8_effective_labels2 = _rs8_own_labels2 + [
-            f"pool:refused:{slug}" for slug in _rs8_bridge2.get("ga-dp15j", [])
+            f"pool:refused:{slug}" for slug in _bridged_slugs_of(_rs8_bridge2_entries)
         ]
         _rs8_has_refusal2 = _has_refusal_label(_rs8_effective_labels2)
         _rs8_refusal_count2 = parse_refusal_count(_rs8_effective_labels2)
@@ -4372,6 +4498,157 @@ def _selftest():
               _rs8_second_decision == "escalate", f"got={_rs8_second_decision!r}")
     finally:
         subprocess.run = _orig_run_rs
+
+    # -----------------------------------------------------------------------
+    # RS-9..12 (ga-9d80l gate-fix-2): the sling-side consumption the fix-
+    # attempt-1 gate review found missing. RS-9/10 exercise
+    # _promote_refusal_labels()'s bridge_sources parameter directly (mutation
+    # tracking, mirrors Section 9b's RF-12/13/14 style); RS-11 is the
+    # regression guard proving a NATIVE (non-bridged) refusal never touches
+    # any bead other than itself; RS-12 is the end-to-end FALSIFY for THIS
+    # fix — reproduces the reviewer's exact false-escalate scenario and
+    # proves it no longer happens once the source label is consumed.
+    # -----------------------------------------------------------------------
+    _rf_mutations.clear()
+    subprocess.run = _stub_run_rf
+    try:
+        _promote_refusal_labels(
+            "ga-dp15j", ["pool:refused:cross-rig-framework"], 0,
+            bridge_sources=[("cross-rig-framework", "ga-u5y7y", None)],
+        )
+        check("RS-9a: _promote_refusal_labels still (no-op) attempts removal on the "
+              "ORIGINAL bead (unchanged base behavior)",
+              ["bd", "label", "remove", "ga-dp15j", "pool:refused:cross-rig-framework", "-q"]
+              in _rf_mutations, f"mutations={_rf_mutations!r}")
+        check("RS-9b (GATE-FEEDBACK FIX): _promote_refusal_labels ALSO clears the label "
+              "AT ITS SOURCE — the sling bead ga-u5y7y — so it can never be re-bridged "
+              "on a later cycle (fix-attempt-1's gate review finding)",
+              ["bd", "label", "remove", "ga-u5y7y", "pool:refused:cross-rig-framework", "-q"]
+              in _rf_mutations, f"mutations={_rf_mutations!r}")
+        check("RS-9c: _promote_refusal_labels still promotes the permanent audit label "
+              "on the original (unchanged base behavior)",
+              ["bd", "label", "add", "ga-dp15j", "pilot:refused-reason:cross-rig-framework", "-q"]
+              in _rf_mutations, f"mutations={_rf_mutations!r}")
+    finally:
+        subprocess.run = _orig_run_rs
+
+    # --- RS-10: rig-store sling — the source removal must route through the
+    # SLING's own rig_root (bd -C <rig_path>), independent of whatever store
+    # the ORIGINAL bead itself lives in (here: HQ, rig_root=None for
+    # bead_id's own removal at RS-10a) ---
+    _rf_mutations.clear()
+    subprocess.run = _stub_run_rf
+    try:
+        _promote_refusal_labels(
+            "ga-dp15j", ["pool:refused:mayor-deferred"], 0,
+            bridge_sources=[("mayor-deferred", "wa-slingR", "/rigs/whatsapp_automation")],
+        )
+        check("RS-10a: original-bead removal still uses the ORIGINAL's own rig_root (HQ, plain bd)",
+              ["bd", "label", "remove", "ga-dp15j", "pool:refused:mayor-deferred", "-q"]
+              in _rf_mutations, f"mutations={_rf_mutations!r}")
+        check("RS-10b: source removal routes through the SLING's own rig_root "
+              "(bd -C /rigs/whatsapp_automation), not the original's store",
+              ["bd", "-C", "/rigs/whatsapp_automation", "label", "remove", "wa-slingR",
+               "pool:refused:mayor-deferred", "-q"] in _rf_mutations,
+              f"mutations={_rf_mutations!r}")
+    finally:
+        subprocess.run = _orig_run_rs
+
+    # --- RS-11 (regression guard): a NATIVE (non-bridged) refusal —
+    # bridge_sources=None, the default every pre-existing caller (RF-12/13/14)
+    # already uses — must NEVER attempt a removal against any bead other than
+    # bead_id itself. Guards against the bridge machinery over-firing on a
+    # refusal that was never bridged in the first place. ---
+    _rf_mutations.clear()
+    subprocess.run = _stub_run_rf
+    try:
+        _promote_refusal_labels(
+            "ga-solo1", ["pool:refused:out-of-scope"], 0,
+        )
+        _rs11_other_bead_removals = [
+            m for m in _rf_mutations
+            if len(m) >= 4 and m[0] == "bd" and m[1] == "label" and m[2] == "remove"
+            and m[3] != "ga-solo1"
+        ]
+        check("RS-11: native (non-bridged) refusal touches ONLY bead_id — no "
+              "cross-bead removal attempted without an explicit bridge_sources entry",
+              _rs11_other_bead_removals == [], f"got={_rs11_other_bead_removals!r}")
+    finally:
+        subprocess.run = _orig_run_rs
+
+    # --- RS-12 (FALSIFY, gate-fix-2): end-to-end reproduction of the exact
+    # false-escalate the gate review described — proven FIXED. Cycle N: the
+    # stale sling ga-u5y7y is bridged and do_reclaim() promotes+consumes it.
+    # Cycle N+1: a FRESH, otherwise-healthy re-dispatch's session isn't
+    # visible yet (the wa-og36j race — has_live_session=False, seconds_
+    # stranded still small). Pre-fix, ga-u5y7y's label was never cleared, so
+    # it re-bridges every cycle forever and the fresh dispatch is escalated
+    # within seconds despite being perfectly healthy. Post-fix, the source
+    # was already consumed at cycle N, so cycle N+1's bridge query finds
+    # nothing for ga-dp15j and the fresh dispatch is correctly left alone. ---
+    _rf_mutations.clear()
+    subprocess.run = _stub_run_rf
+    try:
+        do_reclaim(
+            "ga-dp15j", "Pilot dispatch ignores Mayor's deferral", reclaim_count=0, idle_min=26.0,
+            # effective_labels as run_cycle's Pass 1 would actually build it: own
+            # labels + the synthetic pool:refused:<slug> bridged in from ga-u5y7y.
+            labels=["story:in-flight", "pilot:dispatched", "pool:refused:cross-rig-framework"],
+            has_explicit_refusal=True, refusal_count=0,
+            bridge_sources=[("cross-rig-framework", "ga-u5y7y", None)],
+        )
+        check("RS-12a: cycle N — do_reclaim (threaded bridge_sources end-to-end, not just "
+              "the internal helper) clears the source label on the sling",
+              ["bd", "label", "remove", "ga-u5y7y", "pool:refused:cross-rig-framework", "-q"]
+              in _rf_mutations, f"mutations={_rf_mutations!r}")
+    finally:
+        subprocess.run = _orig_run_rs
+
+    # Cycle N+1: ga-u5y7y's label is now cleared (proven above) — simulate
+    # that live state (no pool:refused* on ga-u5y7y at all) plus a brand new,
+    # healthy, unrefused sling for the fresh re-dispatch.
+    subprocess.run = _stub_bd_refused({
+        "in_progress": [
+            {"id": "ga-u5y7y", "title": "fix bug ga-dp15j: Pilot dispatch ignores Mayor's deferral",
+             "labels": ["story:in-flight"]},  # cleared: no refusal label survives
+            {"id": "ga-freshdispatch", "title": "fix bug ga-dp15j: Pilot dispatch ignores Mayor's deferral",
+             "labels": ["story:in-flight", "pilot:dispatched"]},  # fresh, healthy, NOT refused
+        ],
+    })
+    try:
+        _rs12_bridge_n1 = list_refused_sling_source_beads()
+    finally:
+        subprocess.run = _orig_run_rs
+    check("RS-12b (FALSIFY): cycle N+1 — with the source consumed, the bridge query "
+          "finds NOTHING for ga-dp15j (the cleared sling no longer qualifies, the "
+          "fresh sling was never refused)",
+          _rs12_bridge_n1.get("ga-dp15j", []) == [], f"got={_rs12_bridge_n1!r}")
+
+    # ga-dp15j's own labels after cycle N's promotion: native audit trail
+    # present, but no pool:refused* of its own (never had one natively).
+    _rs12_own_labels = ["story:in-flight", "pilot:dispatched", "pilot:refusal-count:1",
+                         "pilot:refused-reason:cross-rig-framework"]
+    _rs12_bridge_entries_n1 = _rs12_bridge_n1.get("ga-dp15j", [])
+    _rs12_effective_labels = _rs12_own_labels + [
+        f"pool:refused:{slug}" for slug in _bridged_slugs_of(_rs12_bridge_entries_n1)
+    ]
+    _rs12_has_refusal = _has_refusal_label(_rs12_effective_labels)
+    check("RS-12c (FALSIFY): cycle N+1 — effective_labels carries NO fresh refusal "
+          "signal (the stale sling can no longer contribute one)",
+          _rs12_has_refusal is False, f"got={_rs12_has_refusal!r}")
+    _rs12_refusal_count = parse_refusal_count(_rs12_effective_labels)
+    _rs12_decision = _rd(
+        has_explicit_refusal=_rs12_has_refusal, refusal_count=_rs12_refusal_count,
+        has_live_session=False,  # wa-og36j race: fresh dispatch's session not visible yet
+        seconds_stranded=60.0,   # barely stranded — nowhere near any hysteresis window
+        min_stranding_secs=RECLAIM_TTL, reclaim_count=0,
+    )
+    check("RS-12d (FALSIFY, GATE-FEEDBACK regression anchor): the fresh, healthy "
+          "re-dispatch is left alone (noop) — NOT escalated. Pre-fix, ga-u5y7y's "
+          "uncleared label would have re-bridged here (has_explicit_refusal=True, "
+          "refusal_count=1 >= REFUSAL_ESCALATE_THRESHOLD-1) and escalated a dispatch "
+          "barely 60s old, before its builder's session was even visible",
+          _rs12_decision == "noop", f"got={_rs12_decision!r}")
 
     # -----------------------------------------------------------------------
     # Section 10: gt-fppb0 — claimant_provably_dead() classifier (CPD-*).
