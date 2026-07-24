@@ -24,6 +24,17 @@
 #      próprio gate só considera stall a partir de ~165min). Suprime SEMPRE,
 #      exceto gate:needs-fix (ali um fixer DEVE estar trabalhando; travado é
 #      stall de verdade). Ver gate_label_present()/bead_has_open_gate_marker().
+#   4. EXCETO se o transcript CONGELADO é porque o último turno do assignee
+#      terminou AGUARDANDO HUMANO, não travado (wa-y0620): transcript parado
+#      é o MESMO sinal que um agente saudável produz depois de perguntar algo
+#      e ceder o turno por design — Mayor confirmou 2 falsos-positivos reais
+#      assim no mesmo dia (2026-07-20: oracle-wa parado em "Sigo parado
+#      aguardando o mockup.", texto puro sem tool call; batista-wa parado
+#      numa pergunta aberta). Ação destrutiva (kill/shutdown-dance) nesse
+#      caso é dano puro numa sessão sã. Generaliza para o caso de texto puro
+#      o sinal que inflight-reclaim-guard.py's session_awaiting_human_input()
+#      (ga-nlaa) já usa só para AskUserQuestion. Ver
+#      session_awaiting_human_input() abaixo.
 #
 # ANTI-SPAM: uma escalação por bead por janela COOLDOWN_SEC (padrão 3h).
 #   Per-bead state: .gc/state/agent-stuck-escalation/<bead-id>
@@ -129,6 +140,85 @@ except Exception:
     [ -z "$mtime" ] && return 1
     age=$(( now - mtime ))
     [ "$age" -lt "$TRANSCRIPT_FRESH_SEC" ] && return 0
+    return 1
+}
+
+# session_awaiting_human_input (wa-y0620): distinguishes case (a) WEDGED
+# real (transcript frozen, agent mid-tool-call or genuinely dead) from case
+# (b) AGUARDANDO-HUMANO (transcript frozen because the agent correctly
+# ceded its turn and is waiting for the next human/orchestrator message).
+# Both produce an IDENTICAL frozen-transcript signal — Mayor confirmed 2
+# real false positives the same day were exactly this (2026-07-20:
+# oracle-wa's last line was literally "Sigo parado aguardando o mockup." —
+# plain text, no tool call; batista-wa's was an open question). Destructive
+# action (kill/shutdown-dance) is only correct for (a); killing a healthy
+# session mid-wait is pure damage.
+#
+# Generalizes the sibling primitive of the same name in
+# inflight-reclaim-guard.py (ga-nlaa), which detects ONLY the sub-case where
+# the agent explicitly invoked the blocking AskUserQuestion tool (via `gc
+# session peek` + substring match on rendered pane output). That alone does
+# not cover this bug's own primary example — a plain-text status update with
+# no tool call at all. (A naive ends-in-"?" check, the bug's own suggested
+# fallback, would ALSO miss it: "Sigo parado..." is a declarative sentence,
+# not a question.) The structurally correct signal for "turn ended cleanly,
+# nothing owed" is the Claude message `stop_reason`, already available from
+# the SAME `gc session logs --json` call transcript_is_advancing() above
+# makes — no second shell-out needed:
+#
+#   end_turn, no trailing tool_use  → turn ended on final text BY DESIGN;
+#                                      nothing pending, waits for next input.
+#   tool_use, trailing block IS the
+#   AskUserQuestion tool             → same ga-nlaa signal, read structurally
+#                                      instead of via rendered-text substring
+#                                      match (more precise: can't false-match
+#                                      on the string "AskUserQuestion"
+#                                      appearing in unrelated prose, can't
+#                                      false-miss on terminal rendering).
+#   tool_use, any OTHER tool         → mid-flight, environment owes it a
+#                                      tool_result that never arrived — this
+#                                      IS the real hang transcript_is_
+#                                      advancing already flags; unchanged.
+#
+# FAIL-OPEN toward escalating (return 1/not-awaiting), same direction as
+# bead_has_open_gate_marker: this check only carves out a suppression
+# exception, so any read/parse failure must fall through to the existing
+# frozen-transcript escalation rather than silently grow into a new blanket
+# suppression whenever `gc session logs` flakes.
+#
+#   0 = AWAITING-HUMAN — confirmed via one of the two signals above.
+#   1 = NOT CONFIRMED  — mid-tool-call (other tool), last entry is a
+#       user/tool_result, unparseable, or the query failed outright.
+session_awaiting_human_input() {
+    local sess="$1" logs_json verdict
+    logs_json="$(timeout 15 "$GC" session logs "$sess" --tail 5 --json 2>/dev/null || true)"
+    [ -z "$logs_json" ] && return 1
+    verdict="$(printf '%s' "$logs_json" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    if not d.get("ok"):
+        print("no"); sys.exit(0)
+    entries = [e for e in (d.get("entries") or []) if e.get("type") in ("assistant", "user")]
+    if not entries:
+        print("no"); sys.exit(0)
+    last = entries[-1]
+    if last.get("type") != "assistant":
+        print("no"); sys.exit(0)
+    stop_reason = (last.get("message") or {}).get("stop_reason")
+    blocks = last.get("blocks") or []
+    lb = blocks[-1] if blocks else {}
+    lb_type = lb.get("type")
+    if stop_reason == "end_turn" and lb_type != "tool_use":
+        print("yes")
+    elif stop_reason == "tool_use" and lb_type == "tool_use" and lb.get("name") == "AskUserQuestion":
+        print("yes")
+    else:
+        print("no")
+except Exception:
+    print("no")
+' 2>/dev/null)"
+    [ "$verdict" = "yes" ] && return 0
     return 1
 }
 
@@ -509,6 +599,17 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
         log "$bead_id: bead.updated_at parado ${age_min}min — 'gc session logs $live_session_name' falhou (ok:false/sem resposta) — transcript DESCONHECIDO (não confirmado congelado) — SUPRIMINDO escalação (fail-safe ga-4tmc: pergunta que falha nunca vira veredito de vazio)"
         continue
     fi
+
+    # wa-y0620: transcript CONFIRMED frozen + session alive is still not
+    # proof of a hang — it is the SAME signal a correctly-blocked agent
+    # produces after asking something and ceding the turn by design. See
+    # session_awaiting_human_input() above for the full rationale (Mayor
+    # confirmed 2 real false positives from exactly this the same day).
+    if [ "$transcript_state" = "frozen" ] && session_awaiting_human_input "$live_session_name"; then
+        log "$bead_id: bead.updated_at parado ${age_min}min — transcript de $live_session_name CONGELADO mas último turno terminou AGUARDANDO HUMANO (end_turn sem tool_use pendente, ou AskUserQuestion) — SUPRIMINDO escalação (fail-safe wa-y0620: aguardando-humano ≠ travado)"
+        continue
+    fi
+
     transcript_note="n/d (sem sessão viva)"
     [ "$transcript_state" = "frozen" ] && transcript_note="CONGELADO (sem escrita há >=${TRANSCRIPT_FRESH_SEC}s)"
 

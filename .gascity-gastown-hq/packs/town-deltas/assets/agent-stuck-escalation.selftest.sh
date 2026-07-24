@@ -174,16 +174,19 @@ make_gate_marker_fixture() {
         "$bid" "$bid" "$status" > "$GATE_MARKERS_DIR/$bid.json"
 }
 
-# make_transcript_fixture <session-name> <age-secs>
+# make_transcript_fixture <session-name> <age-secs> [entries_json]
 # Registers a `gc session logs <session-name> --json` fixture pointing at a
 # real file whose mtime is <age-secs> old — lets tests simulate a transcript
 # that's fresh ("advancing") or stale ("frozen") without a real running agent.
+# [entries_json] (wa-y0620): optional JSON array string for the "entries"
+# field session_awaiting_human_input() reads; defaults to "[]" so existing
+# 2-arg callers are unaffected (empty entries → not-awaiting, same as today).
 make_transcript_fixture() {
-    local name="$1" age="$2" tfile
+    local name="$1" age="$2" entries="${3:-[]}" tfile
     tfile="$WORK/transcripts/$name.jsonl"
     echo '{}' > "$tfile"
     python3 -c "import os,time; t=time.time()-$age; os.utime('$tfile', (t, t))"
-    printf '{"ok":true,"transcript_path":"%s"}' "$tfile" > "$LOGS_FIXTURE_DIR/$name.json"
+    printf '{"ok":true,"transcript_path":"%s","entries":%s}' "$tfile" "$entries" > "$LOGS_FIXTURE_DIR/$name.json"
 }
 
 # ── T1: no beads → healthy, no escalation ────────────────────────────────────
@@ -508,6 +511,67 @@ rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test14"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
 assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test14" "T28: no mail — transcript advancing (regression, ga-hehi intact)"
 rm -f "$LOGS_FIXTURE_DIR/mila-wa.json"
+
+# ── T29: session alive, transcript frozen, last turn ended cleanly on text ───
+# (plain end_turn, no tool call) → suppressed (wa-y0620 core fix). Mirrors
+# the bug's own primary example verbatim: oracle-wa's last line was "Sigo
+# parado aguardando o mockup." — a declarative sentence, NOT a question, so
+# this also proves the fix does NOT rely on question-mark/keyword matching.
+echo "T29: session alive, transcript frozen, last turn end_turn/no-tool → suppressed (wa-y0620)"
+echo '{"sessions":[{"name":"oracle-wa","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture oracle-wa 3600 '[{"type":"assistant","message":{"stop_reason":"end_turn"},"blocks":[{"type":"text","text":"Sigo parado aguardando o mockup."}]}]'
+printf '[%s]' "$(make_bead ga-test15 oracle-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test15"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test15" "T29: no mail — last turn ended cleanly awaiting human (wa-y0620)"
+assert_absent "$ACTIONS" "notify" "T29: no notify — awaiting-human suppresses"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test15" ] && ok "T29: no escalation state written (suppression is log-only)" || bad "T29: unexpected state file written on suppression"
+log_contains "T29" "AGUARDANDO HUMANO" "T29: log notes awaiting-human suppression"
+rm -f "$LOGS_FIXTURE_DIR/oracle-wa.json"
+
+# ── T30: session alive, transcript frozen, last turn mid OTHER tool_use ──────
+# (e.g. a Bash call with no result yet) → escalation STILL fires (no
+# regression). This is the genuine hang case Mayor's case (a) describes: the
+# environment owes this call a tool_result that never arrived.
+echo "T30: session alive, transcript frozen, last turn mid Bash tool_use → escalation still fires"
+echo '{"sessions":[{"name":"batista-wa","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture batista-wa 3600 '[{"type":"assistant","message":{"stop_reason":"tool_use"},"blocks":[{"type":"tool_use","name":"Bash"}]}]'
+printf '[%s]' "$(make_bead ga-test16 batista-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test16"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test16" "T30: escalation fires — mid-tool-call is a real hang, not awaiting-human"
+rm -f "$LOGS_FIXTURE_DIR/batista-wa.json"
+
+# ── T31: session alive, transcript frozen, last turn IS the AskUserQuestion ──
+# tool → suppressed. Structural equivalent of inflight-reclaim-guard.py's
+# session_awaiting_human_input() (ga-nlaa), which detects the same case via
+# a pane-text substring match instead.
+echo "T31: session alive, transcript frozen, last turn is AskUserQuestion tool_use → suppressed"
+echo '{"sessions":[{"name":"mila-wa","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture mila-wa 3600 '[{"type":"assistant","message":{"stop_reason":"tool_use"},"blocks":[{"type":"tool_use","name":"AskUserQuestion"}]}]'
+printf '[%s]' "$(make_bead ga-test17 mila-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test17"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test17" "T31: no mail — AskUserQuestion tool call is awaiting-human (ga-nlaa equivalent)"
+log_contains "T31" "AGUARDANDO HUMANO" "T31: log notes awaiting-human suppression"
+rm -f "$LOGS_FIXTURE_DIR/mila-wa.json"
+
+# ── T32: session alive, transcript frozen, last entry is a tool_result ───────
+# (assistant hasn't responded yet) → escalation still fires. Not the
+# awaiting-human shape — this is "the environment already replied and the
+# agent itself never picked it back up", the opposite of ceding control.
+echo "T32: session alive, transcript frozen, last entry is tool_result (not assistant) → escalation still fires"
+echo '{"sessions":[{"name":"thies-wa","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture thies-wa 3600 '[{"type":"assistant","message":{"stop_reason":"tool_use"},"blocks":[{"type":"tool_use","name":"Bash"}]},{"type":"user","blocks":[{"type":"tool_result"}]}]'
+printf '[%s]' "$(make_bead ga-test18 thies-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test18"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test18" "T32: escalation fires — last entry is tool_result, not an assistant awaiting-human shape"
+rm -f "$LOGS_FIXTURE_DIR/thies-wa.json"
 
 # ── T10–T12: Layer 1 routing integration (ga-qw3p.1) ────────────────────────
 # Deploy the real escalation-router.sh so the script can source it.
