@@ -1072,8 +1072,19 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
         # cooldown — the old ALARM_COOLDOWN_SEC gate re-fired forever (nothing in this
         # loop ever applied the label it asked a human for), producing +60 identical
         # comments in 4h across 5 beads before this fix.
+        #
+        # ga-zcb20: the bd label-add below can itself fail (timeout, Dolt pressure,
+        # etc.) without raising — when it does, FLAG_REVIEW_LABEL never actually lands
+        # in `labels`, so the check above stays true forever and this branch re-fires
+        # every cycle. Live repro: wa-ielq6 got 50+ byte-identical flag comments over
+        # ~2 days at ~30min cadence. `flagged_ids` is a local, durable backstop
+        # (persisted in STATE_FILE like routed/alarmed/reclaim_exhausted) that records
+        # the flag the moment it's emitted, independent of whether the bd write itself
+        # succeeded — the bd label stays the human-visible signal, this is what
+        # actually guarantees "comment once."
         kw_flags = _keyword_flags(bead)
-        if kw_flags and FLAG_REVIEW_LABEL not in labels:
+        flagged_ids = state.setdefault("flagged", {})
+        if kw_flags and FLAG_REVIEW_LABEL not in labels and bead_id not in flagged_ids:
             for cat, kw in kw_flags:
                 _log("  %s: keyword flag [%s] %r — no routing label; "
                      "bead stays approved, flag emitted for human review" % (
@@ -1086,6 +1097,7 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
                     kw_flags[0][0], kw_flags[0][1]))
                 _do_comment_add(rig_root, bead_id, flag_note)
                 _do_label_add(rig_root, bead_id, FLAG_REVIEW_LABEL)
+                flagged_ids[bead_id] = now
                 _arc_ledger("flow-ledger", {
                     "ts": datetime.datetime.now(
                         datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -2446,6 +2458,42 @@ def _selftest():
     else:
         _bad("(pp)", "expected routing to story:needs-human despite pilot:dispatched — "
              "removes=%s adds=%s" % (label_removes, label_adds))
+
+    # ── (qq) ga-zcb20: FLAG_REVIEW_LABEL bd write fails every cycle → local ──
+    #        `flagged` state still suppresses every repeat after the first. Live
+    #        repro: wa-ielq6 got 50+ byte-identical flag comments over ~2 days
+    #        (07-16→18) at ~30min cadence — the bd label add was never
+    #        succeeding, and the old gate (FLAG_REVIEW_LABEL not in labels) had
+    #        no fallback, so it re-matched forever.
+    print("\nScenario (qq): ga-zcb20 — FLAG_REVIEW_LABEL bd write fails every cycle → "
+          "local state backstop still stops the repeat (was: reposted forever)")
+
+    def _stub_label_add_always_fails(root, bid, label):
+        return False  # simulate the bd write never landing, every single cycle
+
+    _bd_label_add = _stub_label_add_always_fails
+    _bd_approved = lambda root: [
+        _make_bead("wa-ielq6", title="feat: warming chip via UIAutomator",
+                   labels=["story:approved"])]
+    st_qq = _reset()
+    _read_pilot_log_lines = lambda: _pilot_recent_at(NOW)
+    run_cycle(NOW, st_qq)
+    first_count_qq = len([b for b, _ in comments if b == "wa-ielq6"])
+    _reset_captures()
+    # Same state dict across 3 more cycles spanning +90min; the bead's bd labels
+    # never change (the label-add never actually took) — exactly the live
+    # failure mode, not a one-off repeat.
+    for _dt_min in (30, 60, 90):
+        _read_pilot_log_lines = lambda dt=_dt_min: _pilot_recent_at(NOW + dt * 60)
+        run_cycle(NOW + _dt_min * 60, st_qq)
+    repeat_comments_qq = [b for b, _ in comments if b == "wa-ielq6"]
+    _bd_label_add = _stub_label_add  # restore
+    if first_count_qq >= 1 and len(repeat_comments_qq) == 0:
+        _ok("(qq): label-add failure doesn't reopen the repost loop — local "
+            "'flagged' state holds even with the bd label permanently missing")
+    else:
+        _bad("(qq)", "first_count=%d repeat_comments=%s" % (
+             first_count_qq, repeat_comments_qq))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
