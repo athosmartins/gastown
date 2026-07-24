@@ -1492,6 +1492,100 @@ def list_live_sling_source_beads(sessions, now):
     return frozenset(protected)
 
 
+def list_refused_sling_source_beads():
+    """Return {original_bead_id: [reason_slug, ...]} bridging an explicit
+    pool:refused[:reason] label stamped on a SLING/task bead back onto the
+    ORIGINAL bug/story bead it was dispatched to fix (ga-9d80l).
+
+    ga-be4x's explicit-refusal awareness (_has_refusal_label(),
+    REFUSAL_ESCALATE_THRESHOLD, the pilot:refused-reason:* audit trail) only
+    ever reads a bead's OWN labels. For Pilot's standard HQ dispatch shape,
+    `gc sling` creates a SEPARATE wrapper task bead ("fix bug <id>: ..." /
+    "build story <id>: ...") distinct from the original bug/story, and a
+    refusing worker stamps pool:refused[:reason] on THAT WRAPPER, never on
+    the original — so the refusal signal never reached the original's
+    reclaim_decision() at all. The original bead instead fell through to the
+    generic no-live-session/no-recent-branch hysteresis path and got
+    blind-reclaimed (re-dispatchable) up to MAX_RECLAIMS times, each one
+    requiring a fresh worker to re-derive the identical refusal conclusion
+    from scratch, before the GENERIC (reason-less) escalate finally parked
+    it. Concrete incident: ga-dp15j / its sling ga-u5y7y — ga-u5y7y was
+    correctly refused (pool:refused:mayor-deferred) but ga-dp15j's own
+    labels never carried any pool:refused*/pilot:refused-reason:*/
+    pilot:refusal-count:* marker, and it was reclaimed via the generic path
+    well before the refusal-aware REFUSAL_ESCALATE_THRESHOLD fast path could
+    ever fire.
+
+    Mirrors list_live_sling_source_beads() almost exactly: queries BOTH
+    status=open AND status=in_progress (ga-vw26y: a refused sling's status
+    varies by how/when it was refused — neither alone is safe to assume)
+    across the HQ store and every rig store, filters by _SLING_TITLE_RE
+    match on title, and for any match whose OWN labels carry
+    pool:refused[:reason], resolves the original bead id from the title
+    capture group.
+
+    Fail-OPEN: returns {} (never None) on any query error — unlike
+    list_live_sling_source_beads()/list_gate_active_source_beads()'s
+    fail-CLOSED (None -> skip the whole cycle) contract. This signal only
+    ever makes reclaim_decision MORE conservative (it can only ADD a
+    refusal a caller would otherwise miss, never remove a real guard), so
+    degrading gracefully to "no bridge found" on a transient fetch failure
+    is the safer choice — a whole-cycle skip would needlessly also drop the
+    unrelated, otherwise-healthy reclaims/escalates this cycle would
+    correctly make.
+    """
+    bridged = {}
+
+    def _collect(candidate_beads):
+        for b in candidate_beads:
+            title = b.get("title") or ""
+            match = _SLING_TITLE_RE.match(title)
+            if not match:
+                continue
+            sling_labels = b.get("labels", [])
+            if not _has_refusal_label(sling_labels):
+                continue
+            original_id = match.group(1)
+            slugs = _refusal_reason_slugs(sling_labels)
+            if not slugs:
+                continue
+            existing = bridged.setdefault(original_id, [])
+            for slug in slugs:
+                if slug not in existing:
+                    existing.append(slug)
+
+    for status in ("open", "in_progress"):
+        try:
+            result = subprocess.run(
+                ["bd", "list", "--status", status, "--json"],
+                capture_output=True, text=True, timeout=20)
+            if result.returncode != 0 or not result.stdout.strip():
+                continue
+            data = json.loads(result.stdout)
+            if not isinstance(data, list):
+                continue
+            _collect(data)
+        except Exception:
+            continue  # fail-open per query
+
+    for _rig_name, rig_path in _list_rig_stores():
+        for status in ("open", "in_progress"):
+            try:
+                r = subprocess.run(
+                    ["bd", "-C", rig_path, "list", "--status", status, "--json"],
+                    capture_output=True, text=True, timeout=20)
+                if r.returncode != 0 or not r.stdout.strip():
+                    continue
+                rig_data = json.loads(r.stdout)
+                if not isinstance(rig_data, list):
+                    continue
+                _collect(rig_data)
+            except Exception:
+                continue  # fail-open per rig/status
+
+    return bridged
+
+
 def _branch_segment_matches_bead(segment, bead_id):
     """True if a ref's final path segment identifies bead_id: exact match, or
     bead_id followed by a separator ('-', '_', '.'). Prefix-collision guard —
@@ -2527,6 +2621,12 @@ def run_cycle(state, escalated_alerted):
         print("[INFLIGHT-RECLAIM] sling-owner query failed — skipping cycle (safe)", flush=True)
         return len(beads), 0
 
+    # --- Query refused sling-source beads (ga-9d80l). Fail-OPEN contract —
+    #     unlike the two queries above, a lookup error here degrades to {}
+    #     rather than skipping the cycle (see list_refused_sling_source_beads'
+    #     docstring for why that's the safer choice for this signal). ---
+    refused_sling_source_beads = list_refused_sling_source_beads()
+
     # ga-ufr7: one ground-truth quota check per cycle (not per-bead — it's an
     # account-wide, not per-builder, signal). Computed after the fail-safe
     # early-returns above so a cycle that's skipping anyway doesn't pay for it.
@@ -2553,6 +2653,18 @@ def run_cycle(state, escalated_alerted):
         active_bead_ids.add(bead_id)
 
         labels = bead.get("labels", [])
+        # ga-9d80l: bridge a refusal stamped on this bead's SLING wrapper onto
+        # this bead's OWN view of its labels, when its own labels don't
+        # already carry one. effective_labels is a pure superset of labels
+        # (only ever adds synthetic pool:refused:<slug> entries), so every
+        # existing label-membership check below and downstream (do_reclaim /
+        # do_escalate / _promote_refusal_labels) stays correct unchanged —
+        # see list_refused_sling_source_beads()'s docstring for the incident
+        # this closes.
+        if not _has_refusal_label(labels):
+            _bridged_slugs = refused_sling_source_beads.get(bead_id, [])
+            if _bridged_slugs:
+                labels = labels + [f"pool:refused:{_slug}" for _slug in _bridged_slugs]
         assignee = bead.get("assignee") or ""
         title = bead.get("title", "")[:60]
         rig_root = bead.get("rig_root")  # ga-mfeip: None=HQ-native, path=rig store
@@ -4047,6 +4159,219 @@ def _selftest():
               _rf14_result == [], f"result={_rf14_result!r}")
     finally:
         subprocess.run = _orig_run_rf
+
+    # -----------------------------------------------------------------------
+    # Section 9c: ga-9d80l — refused-sling bridge (RS-*).
+    #
+    # ga-be4x's explicit-refusal awareness (Section 9b, above) only ever reads
+    # a bead's OWN labels. For Pilot's standard HQ dispatch shape, the sling
+    # wrapper bead ("fix bug <id>: ..." / "build story <id>: ...") is what a
+    # refusing worker actually stamps pool:refused[:reason] on — never the
+    # original bug/story. list_refused_sling_source_beads() bridges that
+    # signal back onto the original so run_cycle's Pass 1 can build
+    # effective_labels (labels + synthesized pool:refused:<slug> entries) and
+    # feed it wherever plain labels used to flow. Stubs subprocess.run to
+    # serve canned `bd list --status open/in_progress --json` responses; no
+    # real bd calls. RS-1..7 test the bridge function in isolation (mirrors
+    # Section 7's SL-1..7); RS-8 reproduces the actual ga-dp15j/ga-u5y7y
+    # incident end-to-end, including the FALSIFY criterion from ga-9d80l's
+    # own bug report.
+    # -----------------------------------------------------------------------
+
+    _orig_run_rs = subprocess.run
+
+    def _stub_bd_refused(beads_by_status, list_fails=False, nonzero=False):
+        """Build a subprocess.run stub for list_refused_sling_source_beads()'s
+        `bd list --status open|in_progress --json` queries. The unmatched
+        fallback (rc=0, empty stdout) also satisfies _list_rig_stores()'s own
+        `gc rig list --json` probe — empty stdout reads as "no rigs", so the
+        rig fan-out loop contributes nothing and every case below exercises
+        the HQ-store query path only.
+
+        beads_by_status: {"open": [...], "in_progress": [...]} — bead dicts
+          (id/title/labels) to return for each status query.
+        """
+        class _R:
+            def __init__(self, rc, out):
+                self.returncode = rc
+                self.stdout = out
+                self.stderr = ""
+
+        def _run(cmd, **kw):
+            if (isinstance(cmd, (list, tuple)) and len(cmd) >= 4
+                    and cmd[0] == "bd" and cmd[1] == "list" and cmd[2] == "--status"):
+                if nonzero:
+                    return _R(1, "")
+                if list_fails:
+                    return _R(0, "{not valid json")
+                status = cmd[3]
+                return _R(0, json.dumps(beads_by_status.get(status, [])))
+            return _R(0, "")  # e.g. 'gc rig list' → empty stdout → no rigs
+        return _run
+
+    try:
+        # --- RS-1: refused sling ('fix bug') resolves to its original id,
+        # with the reason slug extracted ---
+        subprocess.run = _stub_bd_refused({
+            "in_progress": [
+                {"id": "ga-u5y7y", "title": "fix bug ga-dp15j: Pilot dispatch ignores Mayor's deferral",
+                 "labels": ["pool:refused:mayor-deferred"]},
+            ],
+        })
+        _rs1 = list_refused_sling_source_beads()
+        check("RS-1: refused sling ('fix bug') resolves to its original id with reason slug",
+              _rs1 == {"ga-dp15j": ["mayor-deferred"]}, f"got={_rs1!r}")
+
+        # --- RS-2: non-refused sling → contributes nothing ---
+        subprocess.run = _stub_bd_refused({
+            "in_progress": [
+                {"id": "ga-u5y7y", "title": "fix bug ga-dp15j: Pilot dispatch ignores Mayor's deferral",
+                 "labels": ["story:in-flight"]},
+            ],
+        })
+        _rs2 = list_refused_sling_source_beads()
+        check("RS-2: non-refused sling → contributes nothing",
+              _rs2 == {}, f"got={_rs2!r}")
+
+        # --- RS-3: non-sling title never spuriously matches, even if refused ---
+        subprocess.run = _stub_bd_refused({
+            "in_progress": [
+                {"id": "ga-plain1", "title": "run the weekly Dolt backup",
+                 "labels": ["pool:refused:out-of-scope"]},
+            ],
+        })
+        _rs3 = list_refused_sling_source_beads()
+        check("RS-3: non-sling title (even if refused) → never spuriously matches",
+              _rs3 == {}, f"got={_rs3!r}")
+
+        # --- RS-4: 'build story' convention also resolves ---
+        subprocess.run = _stub_bd_refused({
+            "open": [
+                {"id": "ga-slingC", "title": "build story ga-storyZ: Add the frobnicator widget",
+                 "labels": ["pool:refused:cross-rig-framework"]},
+            ],
+        })
+        _rs4 = list_refused_sling_source_beads()
+        check("RS-4: sling 'build story' title → original story id resolved",
+              _rs4 == {"ga-storyZ": ["cross-rig-framework"]}, f"got={_rs4!r}")
+
+        # --- RS-5 (ga-vw26y): status=open ALSO bridges, not just in_progress —
+        # a refused sling's status varies by how/when it was refused ---
+        subprocess.run = _stub_bd_refused({
+            "open": [
+                {"id": "ga-slingD", "title": "fix bug ga-bugD: some other bug",
+                 "labels": ["pool:refused"]},
+            ],
+            "in_progress": [],
+        })
+        _rs5 = list_refused_sling_source_beads()
+        check("RS-5 (ga-vw26y): status=open sling also bridges (not just in_progress)",
+              _rs5 == {"ga-bugD": ["unspecified"]}, f"got={_rs5!r}")
+
+        # --- RS-6a: bd-list non-zero exit → fail-OPEN {} (never None — unlike
+        # the sibling functions' fail-CLOSED/None contract) ---
+        subprocess.run = _stub_bd_refused({}, nonzero=True)
+        _rs6a = list_refused_sling_source_beads()
+        check("RS-6a: bd-list non-zero exit → fail-OPEN {} (never None)",
+              _rs6a == {}, f"got={_rs6a!r}")
+
+        # --- RS-6b: bd-list unparseable JSON → fail-OPEN {} (never None) ---
+        subprocess.run = _stub_bd_refused({}, list_fails=True)
+        _rs6b = list_refused_sling_source_beads()
+        check("RS-6b: bd-list unparseable JSON → fail-OPEN {} (never None)",
+              _rs6b == {}, f"got={_rs6b!r}")
+
+        # --- RS-7: bare 'pool:refused' (no reason) → 'unspecified' slug ---
+        subprocess.run = _stub_bd_refused({
+            "in_progress": [
+                {"id": "ga-slingE", "title": "fix bug ga-bugE: some bug",
+                 "labels": ["pool:refused"]},
+            ],
+        })
+        _rs7 = list_refused_sling_source_beads()
+        check("RS-7: bare 'pool:refused' (no reason) → 'unspecified' slug",
+              _rs7 == {"ga-bugE": ["unspecified"]}, f"got={_rs7!r}")
+
+        # --- RS-8: END-TO-END regression for the actual ga-dp15j/ga-u5y7y
+        # incident shape (the FALSIFY criterion from ga-9d80l's own bug
+        # report). ga-u5y7y (the sling) carries pool:refused:cross-rig-
+        # framework; ga-dp15j (the original) carries NONE of pool:refused*/
+        # pilot:refused-reason:*/pilot:refusal-count:* — exactly the
+        # incident's confirmed live state. ---
+        subprocess.run = _stub_bd_refused({
+            "in_progress": [
+                {"id": "ga-u5y7y", "title": "fix bug ga-dp15j: Pilot dispatch ignores Mayor's deferral",
+                 "labels": ["pool:refused:cross-rig-framework"]},
+            ],
+        })
+        _rs8_bridge = list_refused_sling_source_beads()
+        check("RS-8a: bridge resolves the incident's sling refusal onto the original id",
+              _rs8_bridge == {"ga-dp15j": ["cross-rig-framework"]}, f"got={_rs8_bridge!r}")
+
+        # ga-dp15j's OWN labels — confirmed live incident state: no refusal
+        # marker of any kind, despite its sling having been explicitly refused.
+        _rs8_own_labels = ["story:in-flight", "pilot:dispatched"]
+        _rs8_pre_fix_has_refusal = _has_refusal_label(_rs8_own_labels)
+        check("RS-8b: pre-fix signal — original bead's OWN labels never show the "
+              "refusal (confirmed live: ga-dp15j never carried "
+              "pool:refused*/pilot:refused-reason:*)",
+              _rs8_pre_fix_has_refusal is False, f"got={_rs8_pre_fix_has_refusal!r}")
+        _rs8_pre_fix_decision = _rd(
+            has_explicit_refusal=_rs8_pre_fix_has_refusal, refusal_count=0,
+            seconds_stranded=RECLAIM_TTL + 60, min_stranding_secs=RECLAIM_TTL,
+            reclaim_count=1,
+        )
+        check("RS-8c: pre-fix — falls through to the GENERIC hysteresis path and "
+              "reclaims blindly (no refusal awareness at all) — the exact loop "
+              "ga-9d80l reports: up to MAX_RECLAIMS blind re-dispatches",
+              _rs8_pre_fix_decision == "reclaim", f"got={_rs8_pre_fix_decision!r}")
+
+        # Fix — bridge the sling's refusal onto ga-dp15j's effective_labels,
+        # exactly as run_cycle's Pass 1 now does.
+        _rs8_effective_labels = _rs8_own_labels + [
+            f"pool:refused:{slug}" for slug in _rs8_bridge.get("ga-dp15j", [])
+        ]
+        _rs8_has_refusal = _has_refusal_label(_rs8_effective_labels)
+        _rs8_refusal_count = parse_refusal_count(_rs8_effective_labels)
+        check("RS-8d: fix — effective_labels now carries the bridged refusal",
+              _rs8_has_refusal is True, f"got={_rs8_has_refusal!r}")
+        _rs8_first_decision = _rd(
+            has_explicit_refusal=_rs8_has_refusal, refusal_count=_rs8_refusal_count,
+            reclaim_count=1,
+        )
+        check("RS-8e: fix — 1st bridged refusal → reclaim (refusal-aware, not yet "
+              "at REFUSAL_ESCALATE_THRESHOLD) — do_reclaim's has_explicit_refusal=True "
+              "path now promotes the audit trail that pre-fix was silently dropped",
+              _rs8_first_decision == "reclaim", f"got={_rs8_first_decision!r}")
+
+        # Simulate the 2ND independent refusal: a fresh re-dispatch's sling
+        # (ga-newsl) is ALSO refused, and ga-dp15j's own labels now natively
+        # carry pilot:refusal-count:1 (promoted by the 1st bridged reclaim's
+        # do_reclaim, via the existing _promote_refusal_labels machinery).
+        subprocess.run = _stub_bd_refused({
+            "in_progress": [
+                {"id": "ga-newsl", "title": "fix bug ga-dp15j: Pilot dispatch ignores Mayor's deferral",
+                 "labels": ["pool:refused:cross-rig-framework"]},
+            ],
+        })
+        _rs8_bridge2 = list_refused_sling_source_beads()
+        _rs8_own_labels2 = ["story:in-flight", "pilot:dispatched", "pilot:refusal-count:1",
+                             "pilot:refused-reason:cross-rig-framework"]
+        _rs8_effective_labels2 = _rs8_own_labels2 + [
+            f"pool:refused:{slug}" for slug in _rs8_bridge2.get("ga-dp15j", [])
+        ]
+        _rs8_has_refusal2 = _has_refusal_label(_rs8_effective_labels2)
+        _rs8_refusal_count2 = parse_refusal_count(_rs8_effective_labels2)
+        _rs8_second_decision = _rd(
+            has_explicit_refusal=_rs8_has_refusal2, refusal_count=_rs8_refusal_count2,
+            reclaim_count=1,
+        )
+        check("RS-8f (FALSIFY): fix — 2nd independent bridged refusal escalates "
+              "(REFUSAL_ESCALATE_THRESHOLD=2) instead of blind-reclaiming a 3rd "
+              "time — the exact criterion ga-9d80l's own bug report asks to confirm",
+              _rs8_second_decision == "escalate", f"got={_rs8_second_decision!r}")
+    finally:
+        subprocess.run = _orig_run_rs
 
     # -----------------------------------------------------------------------
     # Section 10: gt-fppb0 — claimant_provably_dead() classifier (CPD-*).
