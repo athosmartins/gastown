@@ -1076,18 +1076,26 @@ def _fetch_bd_show_full(rig_root, bead_id):
 
 def _dispatched_and_built_reason(rig_root, bead_id):
     """Suppress reason if the Pilot already dispatched this bead
-    (pilot.dispatched_at metadata set) AND it shows a built signal — a
-    matching crew/fix branch exists, OR its pilot.sling_bead task bead is
-    closed — else None.
+    (pilot.dispatched_at metadata set) AND a matching crew/fix branch
+    exists, else None.
 
     Mirrors pilot-dispatcher.sh's _filter_built (ga-tkcam): the Pilot's own
-    dispatch filter already treats such a bead as built / not a fresh
-    candidate, but the reconciler had no equivalent, so a bead stuck awaiting
-    merge (e.g. behind the gate GAP-1 stall, ga-625z4) read as a fresh
-    'dispatch failing' starve case — live repro ga-eiv38: dispatched + built +
-    PR #65 open, alarmed 90min anyway. Fail-open: unreadable/missing data
-    returns None (no suppression invented), same direction as every other
-    fail-safe check in this function.
+    dispatch filter already treats a branch-built bead as built / not a
+    fresh candidate, but the reconciler had no equivalent, so a bead stuck
+    awaiting merge (e.g. behind the gate GAP-1 stall, ga-625z4) read as a
+    fresh 'dispatch failing' starve case — live repro ga-eiv38: dispatched +
+    built + PR #65 open, alarmed 90min anyway. Fail-open: unreadable/missing
+    data returns None (no suppression invented), same direction as every
+    other fail-safe check in this function.
+
+    Deliberately does NOT treat a closed pilot.sling_bead as a built signal
+    (gate ga-wisp-cxtyh16 FAIL, 2026-07-25, RE-FIX GUIDANCE from mayor): a
+    closed sling is a THIRD STATE, not proof of success —
+    _neverstarted_recover_db (pilot-dispatcher.sh ~3149-3156) auto-closes an
+    unclaimed/stale sling as part of RELEASING the story for re-dispatch
+    (ga-l7pp) — the opposite conclusion from "built". _filter_built itself
+    never references pilot.sling_bead or pilot.dispatched_at at all — only
+    the branch-exists path below is a real mirror of it.
     """
     row = _fetch_bd_show_full(rig_root, bead_id)
     if row is None:
@@ -1101,13 +1109,6 @@ def _dispatched_and_built_reason(rig_root, bead_id):
     if _has_built_branch(bead_id):
         return ("pilot.dispatched_at set + built branch exists "
                 "(mirrors pilot-dispatcher _filter_built)")
-
-    sling_id = meta.get("pilot.sling_bead")
-    if sling_id:
-        sling_row = _fetch_bd_show_full(rig_root, sling_id)
-        if isinstance(sling_row, dict) and sling_row.get("status") == "closed":
-            return ("pilot.dispatched_at set + pilot.sling_bead %s closed "
-                     "(mirrors pilot-dispatcher _filter_built)" % sling_id)
     return None
 
 
@@ -1426,12 +1427,11 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
             continue
 
         # DISPATCHED-AND-BUILT (ga-tkcam): mirrors pilot-dispatcher.sh's
-        # _filter_built — Pilot already dispatched this bead and it shows a
-        # built signal (branch exists / sling task closed), so it is past
-        # dispatch and awaiting merge/gate, not starving. Checked LAST: needs
-        # a per-bead bd show (metadata isn't in the bulk list payload above)
-        # plus a git branch probe, so it only runs for a bead that survived
-        # every cheaper suppression above.
+        # _filter_built — Pilot already dispatched this bead and a built
+        # branch exists, so it is past dispatch and awaiting merge/gate, not
+        # starving. Checked LAST: needs a per-bead bd show (metadata isn't in
+        # the bulk list payload above) plus a git branch probe, so it only
+        # runs for a bead that survived every cheaper suppression above.
         dab_reason = _dispatched_and_built_reason(rig_root, bead_id)
         if dab_reason is not None:
             _log("  %s: no signal, daemon-age=%.0fmin, %s — no alarm" % (
@@ -1598,9 +1598,11 @@ def _selftest():
                 behavior (live repro: wa-srgv, wa-6cx36)
       (rr)      ga-tkcam: pilot.dispatched_at set + built branch exists → no
                 starve alarm (mirrors pilot-dispatcher _filter_built)
-      (ss)      ga-tkcam: pilot.dispatched_at set + no branch + pilot.sling_bead
-                CLOSED → no starve alarm (live repro shape: ga-eiv38 — dispatched
-                + built + PR open, alarmed 90min under the old code)
+      (ss)      ga-tkcam RE-FIX (gate ga-wisp-cxtyh16 FAIL): pilot.dispatched_at
+                set + no branch + pilot.sling_bead CLOSED as stale/abandoned
+                (_neverstarted_recover_db ga-l7pp shape) → STILL alarms — a
+                closed sling is not proof of a build, so bare closed-status
+                must not suppress
       (tt)      ga-tkcam falsification: pilot.dispatched_at set but NO branch and
                 sling_bead still OPEN → STILL alarms (fix isn't over-permissive)
     """
@@ -2664,14 +2666,21 @@ def _selftest():
     else:
         _bad("(rr)", "FALSELY alarmed on a dispatched+built bead; mail_calls=%s" % mail_calls)
 
-    print("\nScenario (ss): ga-tkcam — pilot.dispatched_at set + NO branch + "
-          "pilot.sling_bead CLOSED → no starve alarm (live repro shape: ga-eiv38)")
+    print("\nScenario (ss): ga-tkcam RE-FIX — pilot.dispatched_at set + NO branch "
+          "+ pilot.sling_bead CLOSED as stale/abandoned (_neverstarted_recover_db "
+          "ga-l7pp shape) → STILL alarms (closed status alone is not proof of a "
+          "build; gate ga-wisp-cxtyh16 FAILED the prior version of this fix for "
+          "conflating the two)")
     _bd_approved = lambda root: [_make_bead("ga-ss1", age_min=0.1)]
     _bd_show_full = lambda root, bid: (
         {"id": "ga-ss1", "status": "open",
          "metadata": {"pilot.dispatched_at": NOW - 3600, "pilot.sling_bead": "ga-ss1-sling"}}
         if bid == "ga-ss1" else
-        {"id": "ga-ss1-sling", "status": "closed"} if bid == "ga-ss1-sling" else None)
+        {"id": "ga-ss1-sling", "status": "closed",
+         "close_reason": "Stale unclaimed sling auto-closed by Pilot NEVERSTARTED "
+                          "release: story never started and sling sat open "
+                          ">STALE_SLING_SECONDS with no crew branch (ga-l7pp)"}
+        if bid == "ga-ss1-sling" else None)
     _bd_has_built_branch = lambda bid: False
     _read_pilot_log_lines = lambda: _pilot_recent()
     st_ss = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
@@ -2680,10 +2689,13 @@ def _selftest():
     run_cycle(NOW, st_ss)
     _bd_show_full = None
     _bd_has_built_branch = None
-    if not any("ga-ss1" in subj for subj, _ in mail_calls):
-        _ok("(ss): dispatched + no branch + sling closed → no alarm (ga-eiv38 shape)")
+    if any("ga-ss1" in subj for subj, _ in mail_calls):
+        _ok("(ss): dispatched + no branch + closed-but-stale sling → still alarms "
+            "(closed status alone is not treated as built)")
     else:
-        _bad("(ss)", "FALSELY alarmed on dispatched+sling-closed bead; mail_calls=%s" % mail_calls)
+        _bad("(ss)", "FAILED to alarm on an abandoned dispatch whose sling was "
+             "auto-reaped as stale — closed-sling suppression regressed; "
+             "mail_calls=%s" % mail_calls)
 
     print("\nScenario (tt): ga-tkcam falsification — pilot.dispatched_at set but "
           "NO branch and sling_bead still OPEN → STILL alarms (fix isn't "
