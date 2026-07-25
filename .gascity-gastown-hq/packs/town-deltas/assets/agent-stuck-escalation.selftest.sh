@@ -573,6 +573,23 @@ STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
 assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test18" "T32: escalation fires — last entry is tool_result, not an assistant awaiting-human shape"
 rm -f "$LOGS_FIXTURE_DIR/thies-wa.json"
 
+# ── T33: assignee is a human identity (email), no session → suppressed ──────
+# (ga-tiwmm). Mirrors T27 exactly (non-empty assignee, no matching active
+# session) EXCEPT the assignee is a human email instead of an agent session
+# name — proves the new is_human_assignee() guard fires before the
+# genuinely-dead-assignee escalation path, without weakening T27 itself
+# (T27's assignee "wa-dead-assignee" has no "@" and must still escalate).
+echo "T33: assignee is human identity (email), no session → suppressed (ga-tiwmm)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead ga-test19 athosmartins@gmail.com 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test19"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test19" "T33: no mail — human assignee, absent session is normal"
+assert_absent "$ACTIONS" "notify" "T33: no notify — human-assignee suppresses"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test19" ] && ok "T33: no escalation state written (suppression is log-only)" || bad "T33: unexpected state file written on suppression"
+log_contains "T33" "identidade humana" "T33: log notes human-assignee suppression"
+
 # ── T10–T12: Layer 1 routing integration (ga-qw3p.1) ────────────────────────
 # Deploy the real escalation-router.sh so the script can source it.
 echo "T10-T12: Layer 1 routing via escalation-router.sh"

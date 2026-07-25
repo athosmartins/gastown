@@ -35,6 +35,15 @@
 #      o sinal que inflight-reclaim-guard.py's session_awaiting_human_input()
 #      (ga-nlaa) já usa só para AskUserQuestion. Ver
 #      session_awaiting_human_input() abaixo.
+#   5. EXCETO se o assignee é uma identidade HUMANA, não um agente (ga-tiwmm):
+#      "sessão ausente" é o estado PERMANENTE e ESPERADO pra um humano
+#      trabalhando manualmente (e.g. athosmartins@gmail.com) — não é sinal de
+#      agente travado. Sem essa exceção, o assignee humano nunca seta
+#      live_session_name, então os itens 2-4 acima (todos guardados em `-n
+#      "$live_session_name"`) nunca rodam e a execução cai direto na
+#      escalação. Concreto: 2026-07-25, três beads de anúncios (wa-6dd0l,
+#      wa-utjmz, wa-yevxq) escalaram ao Mayor no limiar de 30min enquanto
+#      Athos codava manualmente o dashboard. Ver is_human_assignee() abaixo.
 #
 # ANTI-SPAM: uma escalação por bead por janela COOLDOWN_SEC (padrão 3h).
 #   Per-bead state: .gc/state/agent-stuck-escalation/<bead-id>
@@ -292,6 +301,31 @@ print(n)
     case "$hit" in ''|0) return 1 ;; *) return 0 ;; esac
 }
 
+# is_human_assignee (ga-tiwmm): an in_progress bead assigned to a HUMAN
+# identity (e.g. "athosmartins@gmail.com") has no Gas Town agent
+# session-template by construction — "sessão ausente" is not a stall signal
+# for a human, it's the PERMANENT expected state while they hand-code a task.
+# Before this fix, a human assignee fell straight through every tri-state
+# transcript guard below (all gated on `-n "$live_session_name"`, which a
+# human assignee never sets — there's no session to find) into escalation,
+# paging the Mayor at the STUCK_AGENT_SEC threshold. Concrete: 2026-07-25,
+# three anuncios beads (wa-6dd0l, wa-utjmz, wa-yevxq) each escalated at
+# 30min while Athos manually built the anuncios dashboard.
+#
+# Heuristic: Gas Town session names/aliases (dog-ga4zc3, thies-wa-gam257,
+# gastown.mayor, batista-ps-xxxxx, ...) are alphanumeric+hyphen+dot and never
+# contain "@" (confirmed against the full `gc agent list` template roster);
+# a human identity used as a bd assignee is an email address. This only
+# suppresses on a CONFIRMED human marker — an assignee without "@" still
+# falls through to the existing agent-liveness checks unchanged (T27: a
+# genuinely dead non-email assignee still escalates, no regression).
+is_human_assignee() {
+    case "$1" in
+        *@*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 printf '%s %s\n' "$$" "$(date +%s)" > "$STATE_DIR/agent-stuck-escalation.startup"
 
 log "=== pass start (PID $$, STUCK=${STUCK_AGENT_SEC}s, COOLDOWN=${COOLDOWN_SEC}s, DRY_RUN=$DRY_RUN) ==="
@@ -538,6 +572,17 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
     # tri-state fail-safes below.
     if [ -z "$assignee" ]; then
         log "$bead_id: bead.updated_at parado ${age_min}min — assignee vazio/ausente — dono indeterminável (não confirmado morto) — SUPRIMINDO escalação (fail-safe ga-79vq)"
+        continue
+    fi
+
+    # Human-assigned bead (ga-tiwmm): "sessão ausente" é o estado normal e
+    # permanente pra um assignee que nunca ia ter sessão de agente. Precisa
+    # rodar ANTES dos guards de SESSIONS_QUERY_FAILED/session-health/
+    # transcript abaixo — todos só disparam quando live_session_name está
+    # setado, o que um assignee humano nunca faz, então sem este guard a
+    # execução cai direto na escalação (era exatamente o bug).
+    if is_human_assignee "$assignee"; then
+        log "$bead_id: bead.updated_at parado ${age_min}min — assignee=$assignee é identidade humana (sem agent session-template) — SUPRIMINDO escalação (fail-safe ga-tiwmm: trabalho manual humano, não agente travado)"
         continue
     fi
 
