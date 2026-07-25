@@ -374,10 +374,10 @@ resolve_author_agent_alias() {
 # Pure predicate — canonical liveness check shared by GAP-1, GAP-2, and (via a
 # thin wrapper) quality-gate-dispatcher.sh's author_is_alive(). Echoes 1 iff
 # <author> matches the session_name, name, alias, id, or agent_name of some
-# non-closed session in <sessions_json>; 0 otherwise (empty author, no match,
-# or unparseable JSON). <sessions_json> may be a bare array or the
-# {"sessions":[...]} shape (both `gc session list --json` and its cache shim
-# emit the latter).
+# non-closed, non-dead-state session in <sessions_json>; 0 otherwise (empty
+# author, no match, or unparseable JSON). <sessions_json> may be a bare array
+# or the {"sessions":[...]} shape (both `gc session list --json` and its
+# cache shim emit the latter).
 #
 # ga-bnu1: GAP-1/GAP-2 used to run their OWN inline predicate here — an
 # any(...) test comparing just two fields (id, name) against the array
@@ -394,12 +394,28 @@ resolve_author_agent_alias() {
 # ("gastown.mayor") differs from .session_name ("gastown__mayor") reads as
 # dead under the old predicate. Single source of truth now for all three call
 # sites so they cannot diverge again.
+#
+# ga-625z4: `.closed != true` alone is not sufficient — a session row can sit
+# closed:false in a non-working `state` (asleep/drained/etc) indefinitely.
+# GAP-1 safe-skipped forever on exactly this shape: an HQ story bead's
+# assignee is the always-live orchestrating owner (e.g. gastown__mayor), so
+# `.closed` never flips even after the actual builder/sling session that did
+# the work went dormant and the fix had already landed (ga-eiv38 stuck 13h
+# this way — gate-done marker present, sling bead closed, PR unmerged).
+# Mirrors _POOL_DEAD_STATES in scripts/inflight-reclaim-guard.py: excluding
+# dead states is a strict superset of the old behavior (it only REMOVES
+# matches already provably dead by state), so rows carrying no `state` key
+# at all — including every row in the existing selftest fixture — still
+# match exactly as before. Conservative by construction: unknown or missing
+# state keeps reading as alive, never a new way to fail-closed.
 session_matches_author() {
   local author="${1:-}" sessions_json="${2:-}"
   [ -z "$author" ] && { echo 0; return 0; }
   if printf '%s' "$sessions_json" | jq -e --arg a "$author" \
-       '[(if type=="array" then . else (.sessions // []) end)[]
+       'def dead_states: ["asleep","drained","closed","archived","quarantined","failed-create"];
+        [(if type=="array" then . else (.sessions // []) end)[]
          | select(.closed != true)
+         | select((.state // "") as $s | ($s == "" or (dead_states | index($s)) == null))
          | (.session_name, .name, .alias, .id, .agent_name)]
         | map(select(. != null and . != ""))
         | index($a) != null' >/dev/null 2>&1; then

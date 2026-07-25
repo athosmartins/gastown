@@ -347,6 +347,40 @@ OLD_BROKEN_MATCH=$(printf '%s' "$SESS_FIXTURE" | jq -r --arg a "gastown__mayor" 
 eq "mutation-lock: the OLD id/name-only predicate does NOT catch the session_name form (uncertain==false-open, not a real match)" \
    "$OLD_BROKEN_MATCH" "uncertain"
 
+# ── 7b-ii. session_matches_author dead-state exclusion (ga-625z4) ───────────
+# Bug ga-625z4: `.closed != true` alone is not sufficient — a session can sit
+# closed:false in a non-working `state` (asleep/drained/etc) indefinitely.
+# GAP-1 safe-skipped forever on exactly this shape: an HQ story bead's
+# assignee is the always-live orchestrating owner (gastown__mayor), so
+# `.closed` never flips even after the real builder/sling session that did
+# the work went dormant and the fix had already landed (ga-eiv38 stuck 13h:
+# gate-done marker present, sling bead closed, PR unmerged — GAP-1 kept
+# safe-skipping on the Mayor's always-closed:false row).
+echo "── 7b-ii. session_matches_author dead-state exclusion (ga-625z4) ──"
+
+eq "closed:false + state:asleep → dead (0), not alive" \
+   "$(session_matches_author "gastown__mayor" '{"sessions":[{"session_name":"gastown__mayor","closed":false,"state":"asleep"}]}')" "0"
+eq "closed:false + state:drained → dead (0), not alive" \
+   "$(session_matches_author "gastown__mayor" '{"sessions":[{"session_name":"gastown__mayor","closed":false,"state":"drained"}]}')" "0"
+eq "closed:false + state:active → still alive (1)" \
+   "$(session_matches_author "gastown__mayor" '{"sessions":[{"session_name":"gastown__mayor","closed":false,"state":"active"}]}')" "1"
+eq "closed:false + state:awake → still alive (1)" \
+   "$(session_matches_author "gastown__mayor" '{"sessions":[{"session_name":"gastown__mayor","closed":false,"state":"awake"}]}')" "1"
+eq "no state key at all (existing fixture shape) → still alive (1), no regression" \
+   "$(session_matches_author "gastown__mayor" "$SESS_FIXTURE")" "1"
+
+# Mutation-lock: reverting to the pre-ga-625z4 body (closed-filter only, no
+# state check) must turn the asleep-row assertion above green->wrongly-alive —
+# proves this test exercises the state-exclusion, not a tautology.
+OLD_STATE_BLIND_MATCH=$(printf '%s' '{"sessions":[{"session_name":"gastown__mayor","closed":false,"state":"asleep"}]}' | jq -e --arg a "gastown__mayor" \
+  '[(if type=="array" then . else (.sessions // []) end)[]
+     | select(.closed != true)
+     | (.session_name, .name, .alias, .id, .agent_name)]
+    | map(select(. != null and . != ""))
+    | index($a) != null' >/dev/null 2>&1 && echo 1 || echo 0)
+eq "mutation-lock: the pre-fix closed-only predicate WOULD wrongly call the asleep row alive" \
+   "$OLD_STATE_BLIND_MATCH" "1"
+
 # ── 7c. drift-guard: GAP-1/GAP-2 call the shared predicate, not a reinlined one ──
 echo "── 7c. drift-guard: GAP-1/GAP-2 use session_matches_author (ga-bnu1) ──"
 grep -q 'session_matches_author()' "$GUARD" && ok "guard defines session_matches_author" || bad "guard missing session_matches_author def"
@@ -356,6 +390,12 @@ grep -q 'session_matches_author()' "$GUARD" && ok "guard defines session_matches
 ! grep -q 'any(\.; \.id == \$a or \.name == \$a)' "$GUARD" \
   && ok "the old broken any(.; ...) id/name-only predicate is gone from guard" \
   || bad "guard still contains the old broken any(.; .id==\$a or .name==\$a) predicate"
+grep -q 'def dead_states:' "$GUARD" \
+  && ok "guard defines a dead_states exclusion list (ga-625z4)" \
+  || bad "guard is missing the ga-625z4 dead_states exclusion — GAP-1 will safe-skip forever on asleep/drained assignees again"
+grep -q 'dead_states | index(\$s)) == null' "$GUARD" \
+  && ok "session_matches_author wires dead_states into its select() (ga-625z4)" \
+  || bad "session_matches_author does not filter on dead_states — regression of ga-625z4"
 grep -q 'author_is_alive()' "$DISPATCHER" && ok "dispatcher still defines author_is_alive (public contract unchanged)" || bad "dispatcher missing author_is_alive def"
 grep -q 'session_matches_author "\$author" "\$sessions_json"' "$DISPATCHER" \
   && ok "dispatcher's author_is_alive delegates to guard's session_matches_author (DRY, ga-bnu1)" \
