@@ -110,6 +110,13 @@ BD_TIMEOUT = int(os.environ.get("ARC_BD_TIMEOUT", "25"))
 # Pilot alive window: if no Pilot sweep-complete within this many minutes → pilot dead.
 PILOT_ALIVE_WINDOW_MIN = int(os.environ.get("ARC_PILOT_ALIVE_WINDOW_MIN", "20"))
 LOG_TAIL = int(os.environ.get("ARC_LOG_TAIL", "2000"))
+# ga-6om6a: how far back to trust the Pilot's own log for "did it recently decline
+# this exact bead". Must comfortably span the longest known Pilot-side hold/cycle
+# (currently 1h: ga-lfvs6 domain-routing hold, MAYOR_DEFERRED_HOLD_SECS) plus
+# sweep-interval slack, so the brief gap between a hold's expiry and the next
+# claim+re-hold never reads as a fresh incident. Bounded (not infinite) so a bead
+# refused long ago but genuinely stuck for a NEW reason still alarms.
+PILOT_REFUSAL_WINDOW_MIN = int(os.environ.get("ARC_PILOT_REFUSAL_WINDOW_MIN", "90"))
 FLOW_AUTHORITY_TTL_SEC = int(os.environ.get("ARC_FLOW_AUTHORITY_TTL_SEC", "3600"))
 # Marker label stamped on a bead after its first Step 1b keyword-flag comment. Idempotency
 # gate (ga-1iz2e/AC1): a bead that already carries this label is skipped — comment once,
@@ -475,6 +482,63 @@ def _is_pilot_alive(now):
             if epoch is not None and (now - epoch) <= window_sec:
                 return True
     return False
+
+
+# Matches both per-bead exclusion trails the Pilot emits: the upstream jq-filter
+# rejections (_log_exclusions: "[pilot] EXCLUÍDO <id> por <filter>: <reason>",
+# pilot-dispatcher.sh:1332) and every downstream post-claim refusal/skip (ownership
+# ga-htjni, dedup ga-cnvy1, domain-routing ga-lfvs6, lane:big ga-jazy9, race guards
+# ga-88g2/ga-zzrts(b)/ga-pd7j, routed-pool ga-sndpm, ...). The downstream paths all
+# log via warn() (pilot-dispatcher.sh:1063), which stamps a consistent "WARN:"
+# marker regardless of each call site's specific wording — so a refusal reason
+# added later is matched automatically, no reconciler update needed.
+_PILOT_REFUSAL_LINE_RE = re.compile(
+    r"\[pilot-dispatcher\]\s+(?:WARN:|\[pilot\]\s+EXCLU[IÍ]DO\b)")
+
+
+def _pilot_recently_refused_reason(pilot_log_lines, bead_id, now):
+    """Suppress reason if the Pilot's OWN log shows it recently declined to
+    dispatch this exact bead, else None.
+
+    ga-6om6a ROOT CAUSE: this reconciler re-derives "is this buildable" from
+    its own hand-maintained label list (pilot:held, pilot:reclaim-count, ...),
+    which DRIFTS from what the Pilot actually decided — two separate
+    implementations of the same judgment. Live repro: ga-t1ub9 is a
+    whatsapp_automation domain bug the dog pool structurally cannot build
+    (ga-lfvs6 domain-routing guard). Every Pilot cycle: claim -> refuse ->
+    stamp pilot:held(-until) for 1h -> hold expires -> reclaim -> repeat,
+    forever. _filter_candidates correctly excludes it ~59 of every 60 minutes
+    (pilot:held not-expired) — but this reconciler's own sweep occasionally
+    landed in the brief unheld gap between one hold's expiry and the next
+    cycle's re-hold, read the label snapshot at that instant as "no known
+    non-buildable signal", and paged the Mayor: 8 alarms over 5.3 days on a
+    bead the Pilot was correctly and continuously declining to build the
+    entire time (confirmed via .gc/approved-state-reconciler-state.json:
+    every alarm's label fingerprint was the un-held snapshot).
+
+    Rather than add yet another hand-maintained label signal (the pattern
+    that already needed 2 rounds for ga-tkcam), read the Pilot's own emitted
+    decision straight from its log — the actual single source of truth for
+    what it did, immune to which instant a label snapshot happened to be
+    read. See _PILOT_REFUSAL_LINE_RE for exactly what this covers.
+
+    Bounded to PILOT_REFUSAL_WINDOW_MIN minutes so a bead refused long ago
+    but genuinely stuck for a NEW reason now still alarms. Fail-open: no log
+    lines, no matching line, or an unparseable/stale timestamp on the most
+    recent match -> None (no suppression invented) — same direction as every
+    other check here.
+    """
+    if not pilot_log_lines or not bead_id:
+        return None
+    id_re = re.compile(r"\b" + re.escape(bead_id) + r"\b")
+    for line in reversed(pilot_log_lines):
+        if not id_re.search(line) or not _PILOT_REFUSAL_LINE_RE.search(line):
+            continue
+        epoch = _ts_epoch(line)
+        if epoch is not None and (now - epoch) <= PILOT_REFUSAL_WINDOW_MIN * 60:
+            return "pilot log shows recent decline: %s" % line.strip()[:200]
+        return None   # most recent match is stale/unparseable — older ones only more so
+    return None
 
 
 # ── flowing check ─────────────────────────────────────────────────────────────
@@ -1113,7 +1177,8 @@ def _dispatched_and_built_reason(rig_root, bead_id):
 
 
 # ── process one store ─────────────────────────────────────────────────────────
-def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
+def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
+                    pilot_log_lines):
     """Scan story:approved open beads in rig_root; classify and act on each one.
 
     built_ids: set of bead ids with a live BUILT marker (from _gate_marker_source_beads(),
@@ -1124,6 +1189,10 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
     (from _blocked_bead_ids(rig_root), computed once per rig_root — dependencies are
     rig-scoped, unlike built_ids), or None if that query failed (same fail-safe: caller
     must not alarm when dependency-block state is unknown, ga-yavyq AC2).
+
+    pilot_log_lines: tailed PILOT_LOG lines (ga-6om6a), computed ONCE per cycle in
+    run_cycle() — the log is a single HQ-global file regardless of rig_root, same
+    once-per-cycle shape as built_ids. Passed to _pilot_recently_refused_reason().
 
     Returns (processed, routed, alarmed) int counts.
     On query error: logs + returns (0, 0, 0) — fail-open; other stores are unaffected.
@@ -1313,6 +1382,20 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
                  bead_id, starve_age_min))
             continue
 
+        # Pilot's OWN log recently declined this bead (ga-6om6a) — catches every
+        # _filter_candidates/_filter_built/etc. exclusion AND every downstream
+        # post-claim refusal (domain-routing, ownership, dedup, race guards, ...),
+        # including the brief gap where a cyclical 1h hold (e.g. ga-lfvs6 domain
+        # refusal) has expired but not yet been re-stamped, which the two label
+        # checks above miss. See _pilot_recently_refused_reason() for the full
+        # ga-t1ub9 incident writeup.
+        pilot_refusal_reason = _pilot_recently_refused_reason(
+            pilot_log_lines, bead_id, now)
+        if pilot_refusal_reason is not None:
+            _log("  %s: no signal, daemon-age=%.0fmin, %s — no alarm" % (
+                 bead_id, starve_age_min, pilot_refusal_reason))
+            continue
+
         # blocked-on:*/waiting-on:*/depends-on:*/next-action:*/pool:refused:* —
         # see _EXTRA_ALARM_SUPPRESS_PREFIXES docstring above (ga-an81u AC1).
         extra_reason = _extra_alarm_suppress_reason(labels)
@@ -1456,6 +1539,15 @@ def run_cycle(now, state):
     pilot_alive = _is_pilot_alive(now)
     _log("pilot alive: %s (window=%dmin)" % (pilot_alive, PILOT_ALIVE_WINDOW_MIN))
 
+    # ga-6om6a: the Pilot's log is a single HQ-global file regardless of rig_root —
+    # tail it ONCE per cycle here (same shape as built_ids below), not once per bead
+    # inside _process_store's loop, which would re-read a multi-MB file for every
+    # candidate that survives the cheaper label checks. Test seam: _read_pilot_log_lines.
+    if _read_pilot_log_lines is not None:
+        pilot_log_lines = _read_pilot_log_lines()
+    else:
+        pilot_log_lines = _tail(PILOT_LOG, LOG_TAIL)
+
     # Gate markers live ONLY in the HQ store, never per-rig — index once per cycle
     # (ga-6927), not once per rig_root (the old per-store call was 3x redundant AND
     # queried the wrong store for non-HQ rigs). None = query failed; _process_store
@@ -1484,7 +1576,8 @@ def run_cycle(now, state):
                  "fail-safe (no starve alarms this cycle for this rig on the BLOCKED "
                  "check; see ga-yavyq)" % rig_root)
         try:
-            p, r, a = _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids)
+            p, r, a = _process_store(rig_root, now, state, pilot_alive, built_ids,
+                                      blocked_ids, pilot_log_lines)
             total_p += p
             total_r += r
             total_a += a
@@ -1605,6 +1698,17 @@ def _selftest():
                 must not suppress
       (tt)      ga-tkcam falsification: pilot.dispatched_at set but NO branch and
                 sling_bead still OPEN → STILL alarms (fix isn't over-permissive)
+      (uu)      ga-6om6a: no pilot:held label, but the Pilot's own log shows a
+                RECENT per-bead refusal (WARN: domain-routing decline, ga-lfvs6
+                shape) for this exact bead → no starve alarm — the ga-t1ub9
+                incident (caught in the brief gap between one hold's expiry and
+                the next cycle's re-hold)
+      (vv)      ga-6om6a falsification: the Pilot's log shows a refusal for this
+                bead, but OUTSIDE PILOT_REFUSAL_WINDOW_MIN → STILL alarms (stale
+                history isn't treated as an ongoing decline)
+      (ww)      ga-6om6a falsification: the Pilot's log has recent activity but
+                NEVER mentions this bead → STILL alarms (no signal isn't invented
+                from unrelated log lines)
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
@@ -2575,7 +2679,7 @@ def _selftest():
 
     _bd_approved = None                # force the REAL query-building code path
     _sh = _fake_sh_capture_oo
-    _process_store(RIG_ROOTS[0], NOW, {"first_seen_approved": {}}, True, set(), set())
+    _process_store(RIG_ROOTS[0], NOW, {"first_seen_approved": {}}, True, set(), set(), [])
     _sh = _stub_sh_fast
     _status_arg_oo = None
     for _argv in _captured_argv_oo:
@@ -2720,6 +2824,71 @@ def _selftest():
     else:
         _bad("(tt)", "FAILED to alarm on a genuinely starving dispatched-but-not-built "
              "bead — fix became over-permissive; mail_calls=%s" % mail_calls)
+
+    print("\nScenario (uu): ga-6om6a — no pilot:held label, but the Pilot's own "
+          "log shows a RECENT per-bead refusal (WARN: domain-routing decline, "
+          "ga-lfvs6 shape) for this exact bead → no starve alarm (the ga-t1ub9 "
+          "incident: caught in the brief gap between one hold's expiry and the "
+          "next cycle's re-hold)")
+    _bd_approved = lambda root: [_make_bead("ga-uu1", age_min=0.1)]
+    _read_pilot_log_lines = lambda: [
+        "%s [pilot-dispatcher] WARN: ga-lfvs6: REFUSING to dispatch "
+        "whatsapp_automation domain build ga-uu1 to the ephemeral dog pool "
+        "(gastown.dog) — a dog cannot build a real domain task. Stamping timed "
+        "pilot:held (1h); releasing claim." % (
+            time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(NOW - 5 * 60))),
+        "%s [pilot-dispatcher] === Pilot sweep complete: dispatched=0 ===" % (
+            time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(NOW - 60))),
+    ]
+    st_uu = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_uu["first_seen_approved"]["ga-uu1"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_uu)
+    if not any("ga-uu1" in subj for subj, _ in mail_calls):
+        _ok("(uu): recent Pilot-log refusal (no current pilot:held label) → no alarm")
+    else:
+        _bad("(uu)", "FALSELY alarmed despite a recent Pilot-log refusal; "
+             "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (vv): ga-6om6a falsification — the Pilot's log shows a "
+          "refusal for this bead, but OUTSIDE PILOT_REFUSAL_WINDOW_MIN → STILL "
+          "alarms (stale history isn't treated as an ongoing decline)")
+    _bd_approved = lambda root: [_make_bead("ga-vv1", age_min=0.1)]
+    _read_pilot_log_lines = lambda: [
+        "%s [pilot-dispatcher] WARN: ga-lfvs6: REFUSING to dispatch "
+        "whatsapp_automation domain build ga-vv1 to the ephemeral dog pool "
+        "(gastown.dog) — a dog cannot build a real domain task." % (
+            time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(
+                NOW - (PILOT_REFUSAL_WINDOW_MIN + 5) * 60))),
+        "%s [pilot-dispatcher] === Pilot sweep complete: dispatched=0 ===" % (
+            time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(NOW - 60))),
+    ]
+    st_vv = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_vv["first_seen_approved"]["ga-vv1"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_vv)
+    if any("ga-vv1" in subj for subj, _ in mail_calls):
+        _ok("(vv): Pilot-log refusal OUTSIDE the window → still alarms "
+            "(fix isn't over-permissive)")
+    else:
+        _bad("(vv)", "FAILED to alarm despite the only Pilot-log mention being "
+             "stale; mail_calls=%s" % mail_calls)
+
+    print("\nScenario (ww): ga-6om6a falsification — the Pilot's log has recent "
+          "activity but NEVER mentions this bead → STILL alarms (no signal isn't "
+          "invented from unrelated log lines)")
+    _bd_approved = lambda root: [_make_bead("ga-ww1", age_min=0.1)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_ww = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_ww["first_seen_approved"]["ga-ww1"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_ww)
+    if any("ga-ww1" in subj for subj, _ in mail_calls):
+        _ok("(ww): no Pilot-log mention of this bead → still alarms (fix isn't "
+            "over-permissive)")
+    else:
+        _bad("(ww)", "FAILED to alarm on a genuinely starving bead absent from "
+             "the Pilot log; mail_calls=%s" % mail_calls)
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
