@@ -155,6 +155,10 @@ _do_mail_mayor = None       # (subject, body) -> bool
 _read_pilot_log_lines = None  # () -> list[str]
 _bd_gate_markers = None     # () -> list[dict]|None; OPEN quality-gate-markers in the HQ store
 _bd_blocked = None          # (rig_root) -> list[dict]|None; None return = query error
+_bd_show_full = None        # (rig_root, bead_id) -> dict|None; full `bd show --json` row
+                             # (metadata included); None = query/parse error or not found
+_bd_has_built_branch = None  # (bead_id) -> bool; True iff a crew/*/<id> or fix/<id>-*
+                              # branch exists (local or origin remote-tracking) anywhere
 
 
 # ── guarded subprocess ────────────────────────────────────────────────────────
@@ -982,6 +986,131 @@ def _blocked_bead_ids(rig_root):
     return out
 
 
+# ── dispatched-and-built check (ga-tkcam) ─────────────────────────────────────
+# pilot.dispatched_at / pilot.sling_bead are METADATA, not labels — and `bd list
+# --json` (the bulk story:approved query above) never hydrates metadata, only
+# `bd show <id> --json` does. So unlike built_ids/blocked_ids this can't be
+# precomputed once per cycle from a bulk query; _dispatched_and_built_reason()
+# is called per-bead from _process_store(), and only for a bead that has
+# already survived every cheaper suppression this cycle (see call site) — the
+# rare near-alarm case, not the whole story:approved scan.
+_OWNERSHIP_REPOS = None  # memoized for this process (script runs one-shot per launchd tick)
+
+
+def _ownership_guard_repos():
+    """Every repo a crew/fix branch could live in: the monorepo town root
+    (dirname(CITY)) plus each registered rig's own path, de-duped. Mirrors
+    pilot-dispatcher.sh's _ownership_guard_repos() (packs/town-deltas/assets/
+    pilot-dispatcher.sh:2638). Fail-open: a `gc rig list` error yields just the
+    town root — the branch probe below then simply finds no branch, never a
+    false suppression."""
+    global _OWNERSHIP_REPOS
+    if _OWNERSHIP_REPOS is not None:
+        return _OWNERSHIP_REPOS
+    repos = [os.path.dirname(CITY.rstrip("/"))]
+    r = _sh([GC_BIN, "--city", CITY, "rig", "list", "--json"], timeout=20)
+    if r is not None and r.returncode == 0 and (r.stdout or "").strip():
+        try:
+            for rig in (json.loads(r.stdout).get("rigs") or []):
+                p = rig.get("path")
+                if p:
+                    repos.append(p)
+        except Exception:
+            pass
+    seen = set()
+    out = []
+    for p in repos:
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    _OWNERSHIP_REPOS = out
+    return out
+
+
+def _real_has_built_branch(bead_id):
+    """True iff a crew/<owner>/<id> or fix/<id>-<slug> branch (local or origin
+    remote-tracking) exists in any known repo. Mirrors the branch consultation
+    in pilot-dispatcher.sh's _filter_built (packs/town-deltas/assets/
+    pilot-dispatcher.sh:1900-1902) — same ref patterns, same fail-open-to-False
+    direction (no git / no repos / probe error → NOT built; never invent a
+    false suppression signal)."""
+    if not bead_id:
+        return False
+    for repo in _ownership_guard_repos():
+        if not repo or not os.path.isdir(repo):
+            continue
+        r = _sh(["git", "-C", repo, "for-each-ref", "--format=%(refname)",
+                  "refs/remotes/origin/crew/*/%s" % bead_id,
+                  "refs/heads/crew/*/%s" % bead_id,
+                  "refs/remotes/origin/fix/%s-*" % bead_id,
+                  "refs/heads/fix/%s-*" % bead_id],
+                 timeout=10)
+        if r is not None and r.returncode == 0 and (r.stdout or "").strip():
+            return True
+    return False
+
+
+def _has_built_branch(bead_id):
+    if _bd_has_built_branch is not None:
+        return _bd_has_built_branch(bead_id)
+    return _real_has_built_branch(bead_id)
+
+
+def _fetch_bd_show_full(rig_root, bead_id):
+    """Full `bd show <id> --json` row (metadata included), or None on any
+    query/parse error or unresolved id — same None-means-unknown convention as
+    _gate_marker_source_beads()/_blocked_bead_ids() above."""
+    if _bd_show_full is not None:
+        return _bd_show_full(rig_root, bead_id)
+    if not bead_id:
+        return None
+    r = _sh([BD_BIN, "-C", rig_root, "show", bead_id, "--json"], timeout=BD_TIMEOUT)
+    if r is None or r.returncode != 0:
+        return None
+    rows = _parse_bd_json(r.stdout, strict=True)
+    if not rows:
+        return None
+    row = rows[0] if isinstance(rows, list) else rows
+    return row if isinstance(row, dict) else None
+
+
+def _dispatched_and_built_reason(rig_root, bead_id):
+    """Suppress reason if the Pilot already dispatched this bead
+    (pilot.dispatched_at metadata set) AND it shows a built signal — a
+    matching crew/fix branch exists, OR its pilot.sling_bead task bead is
+    closed — else None.
+
+    Mirrors pilot-dispatcher.sh's _filter_built (ga-tkcam): the Pilot's own
+    dispatch filter already treats such a bead as built / not a fresh
+    candidate, but the reconciler had no equivalent, so a bead stuck awaiting
+    merge (e.g. behind the gate GAP-1 stall, ga-625z4) read as a fresh
+    'dispatch failing' starve case — live repro ga-eiv38: dispatched + built +
+    PR #65 open, alarmed 90min anyway. Fail-open: unreadable/missing data
+    returns None (no suppression invented), same direction as every other
+    fail-safe check in this function.
+    """
+    row = _fetch_bd_show_full(rig_root, bead_id)
+    if row is None:
+        return None
+    meta = row.get("metadata")
+    if not isinstance(meta, dict):
+        return None
+    if not meta.get("pilot.dispatched_at"):
+        return None
+
+    if _has_built_branch(bead_id):
+        return ("pilot.dispatched_at set + built branch exists "
+                "(mirrors pilot-dispatcher _filter_built)")
+
+    sling_id = meta.get("pilot.sling_bead")
+    if sling_id:
+        sling_row = _fetch_bd_show_full(rig_root, sling_id)
+        if isinstance(sling_row, dict) and sling_row.get("status") == "closed":
+            return ("pilot.dispatched_at set + pilot.sling_bead %s closed "
+                     "(mirrors pilot-dispatcher _filter_built)" % sling_id)
+    return None
+
+
 # ── process one store ─────────────────────────────────────────────────────────
 def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
     """Scan story:approved open beads in rig_root; classify and act on each one.
@@ -1296,6 +1425,19 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
                  "`bd blocked`) — no alarm" % (bead_id, starve_age_min))
             continue
 
+        # DISPATCHED-AND-BUILT (ga-tkcam): mirrors pilot-dispatcher.sh's
+        # _filter_built — Pilot already dispatched this bead and it shows a
+        # built signal (branch exists / sling task closed), so it is past
+        # dispatch and awaiting merge/gate, not starving. Checked LAST: needs
+        # a per-bead bd show (metadata isn't in the bulk list payload above)
+        # plus a git branch probe, so it only runs for a bead that survived
+        # every cheaper suppression above.
+        dab_reason = _dispatched_and_built_reason(rig_root, bead_id)
+        if dab_reason is not None:
+            _log("  %s: no signal, daemon-age=%.0fmin, %s — no alarm" % (
+                 bead_id, starve_age_min, dab_reason))
+            continue
+
         # ALARM: buildable bead starving, pilot alive, pool has capacity, dispatch failing.
         _alarm_starving(rig_root, bead, starve_age_min, now, state)
         alarmed += 1
@@ -1454,10 +1596,17 @@ def _selftest():
                 human) still gets routed — classify() takes precedence over a
                 stale flowing/assignee signal, matching pre-existing open-bead
                 behavior (live repro: wa-srgv, wa-6cx36)
+      (rr)      ga-tkcam: pilot.dispatched_at set + built branch exists → no
+                starve alarm (mirrors pilot-dispatcher _filter_built)
+      (ss)      ga-tkcam: pilot.dispatched_at set + no branch + pilot.sling_bead
+                CLOSED → no starve alarm (live repro shape: ga-eiv38 — dispatched
+                + built + PR open, alarmed 90min under the old code)
+      (tt)      ga-tkcam falsification: pilot.dispatched_at set but NO branch and
+                sling_bead still OPEN → STILL alarms (fix isn't over-permissive)
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
-    global _bd_blocked
+    global _bd_blocked, _bd_show_full, _bd_has_built_branch
     global DRY_RUN, STARVE_MIN, FLOW_GRACE_MIN, ROUTE_COOLDOWN_SEC, ALARM_COOLDOWN_SEC
 
     ok_count = [0]
@@ -2494,6 +2643,71 @@ def _selftest():
     else:
         _bad("(qq)", "first_count=%d repeat_comments=%s" % (
              first_count_qq, repeat_comments_qq))
+
+    print("\nScenario (rr): ga-tkcam — pilot.dispatched_at set + built branch "
+          "exists → no starve alarm (mirrors pilot-dispatcher _filter_built)")
+    _bd_approved = lambda root: [_make_bead("ga-rr1", age_min=0.1)]
+    _bd_show_full = lambda root, bid: (
+        {"id": "ga-rr1", "status": "open",
+         "metadata": {"pilot.dispatched_at": NOW - 3600, "pilot.sling_bead": "ga-rr1-sling"}}
+        if bid == "ga-rr1" else None)
+    _bd_has_built_branch = lambda bid: bid == "ga-rr1"
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_rr = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_rr["first_seen_approved"]["ga-rr1"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_rr)
+    _bd_show_full = None
+    _bd_has_built_branch = None
+    if not any("ga-rr1" in subj for subj, _ in mail_calls):
+        _ok("(rr): dispatched + built branch → no alarm")
+    else:
+        _bad("(rr)", "FALSELY alarmed on a dispatched+built bead; mail_calls=%s" % mail_calls)
+
+    print("\nScenario (ss): ga-tkcam — pilot.dispatched_at set + NO branch + "
+          "pilot.sling_bead CLOSED → no starve alarm (live repro shape: ga-eiv38)")
+    _bd_approved = lambda root: [_make_bead("ga-ss1", age_min=0.1)]
+    _bd_show_full = lambda root, bid: (
+        {"id": "ga-ss1", "status": "open",
+         "metadata": {"pilot.dispatched_at": NOW - 3600, "pilot.sling_bead": "ga-ss1-sling"}}
+        if bid == "ga-ss1" else
+        {"id": "ga-ss1-sling", "status": "closed"} if bid == "ga-ss1-sling" else None)
+    _bd_has_built_branch = lambda bid: False
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_ss = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_ss["first_seen_approved"]["ga-ss1"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_ss)
+    _bd_show_full = None
+    _bd_has_built_branch = None
+    if not any("ga-ss1" in subj for subj, _ in mail_calls):
+        _ok("(ss): dispatched + no branch + sling closed → no alarm (ga-eiv38 shape)")
+    else:
+        _bad("(ss)", "FALSELY alarmed on dispatched+sling-closed bead; mail_calls=%s" % mail_calls)
+
+    print("\nScenario (tt): ga-tkcam falsification — pilot.dispatched_at set but "
+          "NO branch and sling_bead still OPEN → STILL alarms (fix isn't "
+          "over-permissive)")
+    _bd_approved = lambda root: [_make_bead("ga-tt1", age_min=0.1)]
+    _bd_show_full = lambda root, bid: (
+        {"id": "ga-tt1", "status": "open",
+         "metadata": {"pilot.dispatched_at": NOW - 3600, "pilot.sling_bead": "ga-tt1-sling"}}
+        if bid == "ga-tt1" else
+        {"id": "ga-tt1-sling", "status": "open"} if bid == "ga-tt1-sling" else None)
+    _bd_has_built_branch = lambda bid: False
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_tt = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_tt["first_seen_approved"]["ga-tt1"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_tt)
+    _bd_show_full = None
+    _bd_has_built_branch = None
+    if any("ga-tt1" in subj for subj, _ in mail_calls):
+        _ok("(tt): dispatched but neither branch nor closed sling → still alarms "
+            "(fix isn't over-permissive)")
+    else:
+        _bad("(tt)", "FAILED to alarm on a genuinely starving dispatched-but-not-built "
+             "bead — fix became over-permissive; mail_calls=%s" % mail_calls)
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
