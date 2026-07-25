@@ -99,6 +99,26 @@ eq "mayor, dead → clear" \
   "$(gate_fail_assignee_action "mayor" "0")" \
   "clear"
 
+# ── 4b. ga-mgrma: Mayor identity → always clear, even though the Mayor's own
+#    session is always live. Before this fix, neither "gastown.mayor" nor
+#    "gastown__mayor" matched the bare "mayor" sentinel pattern in section 4,
+#    so a Mayor-authored gate-fail fell through to the author_alive=1 branch
+#    and got "keep" — stranding the bead forever (Mayor delegates all
+#    implementation, so it never author-codes the re-fix; the Pilot won't
+#    re-dispatch an author-kept bead; the dog pool won't claim a bead assigned
+#    to live-mayor). Concrete: ga-tkcam sat kept-assigned to gastown__mayor for
+#    110s+ until manually cleared.
+echo "── 4b. ga-mgrma: Mayor identity (both resolved forms) → always clear ──"
+eq "gastown__mayor (session_name form — what bd's assignee field actually stores), alive → clear" \
+  "$(gate_fail_assignee_action "gastown__mayor" "1")" \
+  "clear"
+eq "gastown.mayor (alias/name form), alive → clear" \
+  "$(gate_fail_assignee_action "gastown.mayor" "1")" \
+  "clear"
+eq "gastown__mayor, dead → clear (unchanged either way)" \
+  "$(gate_fail_assignee_action "gastown__mayor" "0")" \
+  "clear"
+
 # ── 5. Fail-safe: empty/unresolvable author → clear (today's behavior) ───────
 echo "── 5. empty author → clear (fail-safe, matches today's dead-end path) ──"
 eq "empty author, alive=1 (shouldn't happen, but fail-safe) → clear" \

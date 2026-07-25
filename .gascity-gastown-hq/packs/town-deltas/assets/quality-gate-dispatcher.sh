@@ -1499,8 +1499,25 @@ gate_fail_assignee_action() {
   #     doesn't submit branches); it is a routing sentinel used elsewhere in
   #     this file (wa-worker FAIL normalizer) to redirect an unrecoverable pool
   #     author's nudge to a human — must still "clear", not "keep".
+  #   - gastown.mayor / gastown__mayor : ga-mgrma. The Mayor DELEGATES all
+  #     implementation and never author-codes a fix, but the Mayor's session is
+  #     always live, so before this exclusion a Mayor-authored gate-fail hit
+  #     the author_alive=1 branch below and got "keep" — stranding the bead
+  #     forever (the Mayor won't code it, the Pilot won't re-dispatch an
+  #     author-kept bead, and the dog pool won't claim a bead assigned to
+  #     live-mayor). Concrete: ga-tkcam gate-failed and sat kept-assigned to
+  #     gastown__mayor for 110s+ until manually cleared. Both resolved-identity
+  #     forms are excluded, same belt-and-suspenders pairing already used for
+  #     the Mayor elsewhere in this codebase (pilot-dispatcher.sh's
+  #     _attached_session_peek_cache, ga-lluq1): "gastown__mayor" is what bd's
+  #     assignee field actually stores (session_name form — confirmed via the
+  #     ga-tkcam incident and quality-gate-guard.sh's AUTHOR derivation, which
+  #     reads the bead's raw assignee verbatim), "gastown.mayor" is the
+  #     alias/name form, kept for parity in case a future call site ever feeds
+  #     that form in instead. Same "gate/dispatch mis-handles the Mayor
+  #     identity" class as GAP-1 (ga-625z4).
   case "$author" in
-    ''|mayor|gastown.dog|gastown.dog-*|dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*)
+    ''|mayor|gastown.mayor|gastown__mayor|gastown.dog|gastown.dog-*|dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*)
       printf 'clear'; return 0 ;;
   esac
   if [ "$author_alive" = "1" ]; then
