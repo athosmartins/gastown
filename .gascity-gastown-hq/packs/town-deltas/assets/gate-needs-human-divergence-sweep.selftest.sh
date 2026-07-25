@@ -186,12 +186,22 @@ fi
 # ── 7. drift-guard: companion author-mail fix in the dispatcher (ga-u4yi) ───
 echo "── 7. drift-guard: companion fix — dispatcher mails AUTHOR at needs-human transitions ──"
 if [ -f "$DISPATCHER" ]; then
-  # ga-y43lq: bumped 5→6 alongside gate-selfheal.selftest.sh's copy of this same
-  # count — the ga-tgwq no_branch/escalate site (dirty local worktree) was a
-  # silent 6th gate:needs-human site missing its author-mail (see that file's
-  # own comment for the full incident writeup; not duplicating it here).
-  eq "dispatcher mails AUTHOR at all 6 gate:needs-human sites (ga-u4yi)" \
-     "$(grep -c 'mail send "\$AUTHOR"' "$DISPATCHER")" "6"
+  # ga-4op40 (3rd occurrence of this exact drift: 4→5→6, now 8): a hardcoded
+  # magic-number count needs a human to hand-bump it every time the dispatcher
+  # legitimately grows a new gate:needs-human site — the DURABLE fix already
+  # adopted by gate-selfheal.selftest.sh's own copy of this check (ga-huaxo,
+  # a full bijection scan) is to stop comparing against a literal number at
+  # all. Here: compare the AUTHOR-mail count against an INDEPENDENT count of
+  # the same pattern class it is meant to track — the base gate:needs-human
+  # label-add sites in this same file (the trailing quote in the pattern
+  # already excludes gate:needs-human:<subkind> variants, verified: 8 base
+  # sites, 0 accidental subkind matches). A legitimate new site adds one of
+  # each in lockstep so this never drifts again; a SILENT site (label added,
+  # no mail) breaks the count match and fails loudly instead of staying red
+  # forever waiting for a human to notice and re-bump a number.
+  NEEDS_HUMAN_SITE_COUNT=$(grep -cE 'label add[[:space:]]+"\$BEAD_ID"[[:space:]]+"gate:needs-human"' "$DISPATCHER")
+  eq "dispatcher mails AUTHOR at every gate:needs-human site ($NEEDS_HUMAN_SITE_COUNT, ga-u4yi/ga-huaxo self-consistent count)" \
+     "$(grep -c 'mail send "\$AUTHOR"' "$DISPATCHER")" "$NEEDS_HUMAN_SITE_COUNT"
 else
   bad "dispatcher not found at $DISPATCHER"
 fi

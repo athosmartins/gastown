@@ -14,8 +14,9 @@
 #   VB_STATUS×2  — verdict-bead cleanup in timeout and quota-requeue paths
 #
 # Fix: append `|| true` to each pipeline (matches every other guarded cmdsub
-# in the dispatcher). Downstream code already handles the empty-string case:
-#   BD_STATUS=""    → [ "$BD_STATUS" != "closed" ] = true → idempotent ops
+# in the dispatcher). Downstream code already handles the empty/unknown case:
+#   BD_STATUS="__UNKNOWN__" (ga-i5s5: explicit if/else, not `|| true`-masked
+#                    — see section 3 below) → vb_status_action() → skip, not open
 #   REBASE_ATTEMPT="" → `[ -z ]` guard → default 0   → safe
 #   VB_STATUS=""    → [ "$VB_STATUS" != "closed" ] = true → idempotent close
 #
@@ -61,19 +62,27 @@ fi
 
 # ── 3. Drift-guard: BD_STATUS (supersede path) ───────────────────────────────
 # The line reads the source bead status before deciding whether to deliver it.
-# Empty BD_STATUS is safe: `!= "closed"` triggers idempotent delivery ops.
-# ga-78lds: the ga-h199q shim (commit 6ad25a9c9) routed this call through
-# `bash ".../bd-list-cached.sh" -C ... show` instead of direct `bd -C ... show`.
-# The old anchor required the literal substring "BD_STATUS=$(bd" immediately
-# after the assignment, so it stopped matching this line even though the `||
-# true` guard itself was untouched (verified against both the current file and
-# the pre-shim baseline at 6ad25a9c9^) — a false negative, not a real
-# regression. Drop the "bd" literal so the anchor matches either call form.
-BD_BLOCK="$(awk '/BD_STATUS=\$\(.*show.*BEAD_ID.*--json/{c=1} c{printf "%s ", $0} /\.status .* "open"\)/{if(c){print ""; c=0}}' "$GATE" 2>/dev/null || true)"
-if printf '%s' "$BD_BLOCK" | grep -q "status .* \"open\"' 2>/dev/null || true)"; then
-  ok "BD_STATUS pipeline is guarded with '|| true'"
+# Empty/unknown BD_STATUS is safe: `!= "closed"` triggers idempotent delivery ops.
+# ga-i5s5 (root-class:error-vs-empty) superseded the plain `|| true`-masked
+# single pipeline this guard originally checked for with a STRONGER pattern:
+# `bd show` now runs ALONE as an `if` condition (its own exit status gates the
+# branch directly — safe under `set -e`, no pipe for `pipefail` to propagate
+# through), and only a successfully-read result is piped into jq; a failed
+# read sets BD_STATUS="__UNKNOWN__" instead of masking to empty/open. This
+# block deliberately does NOT route through the bd-list-cached.sh shim (see
+# its own comment in $GATE) — so ga-78lds's later anchor tweak (matching the
+# shim's call form) was ALSO stale against this shape, same as the literal-
+# text anchor it replaced (ga-4op40: this selftest going red against a moving
+# target for the 2nd time). Assert the CURRENT invariant directly via the
+# dispatcher's own SELFTEST-EXTRACT marker for this block (the same
+# extraction point gate-verdict-status-unreadable.selftest.sh Part 6 already
+# uses to behaviorally test it) instead of a call-prefix text anchor.
+BD_MERGE_BLOCK="$(sed -n '/# SELFTEST-EXTRACT already-merged-source-bead-cleanup-fn: BEGIN/,/# SELFTEST-EXTRACT already-merged-source-bead-cleanup-fn: END/p' "$GATE" 2>/dev/null || true)"
+if printf '%s' "$BD_MERGE_BLOCK" | grep -q 'if BD_JSON=\$(bd .* show .*--json' \
+   && printf '%s' "$BD_MERGE_BLOCK" | grep -q 'BD_STATUS="__UNKNOWN__"'; then
+  ok "BD_STATUS pipeline: bd-show exit status captured via if/else, not piped raw into jq (ga-8fx5e/ga-i5s5)"
 else
-  bad "BD_STATUS pipeline is NOT guarded with '|| true' (silent-crash risk — ga-8fx5e)"
+  bad "BD_STATUS pipeline is NOT guarded against bd-show failure (silent-crash or error/empty-conflation risk — ga-8fx5e/ga-i5s5)"
 fi
 
 # ── 4. Drift-guard: REBASE_ATTEMPT ───────────────────────────────────────────
