@@ -308,6 +308,66 @@ PLISTEOF
 cp "$FIXDIR/clean/good-func-daemon.plist" "$FIXDIR/mixed/good-func-daemon.plist"
 sed -i '' "s#$FIXDIR/clean/good-func-daemon.sh#$FIXDIR/mixed/good-func-daemon.sh#" "$FIXDIR/mixed/good-func-daemon.plist"
 
+# ── ga-9krhl: worktree/rig-copy + backup-dir classes added to EXCL ─────────
+# Measured against the live silent-ignorance-watch baseline: whatsapp_automation's
+# own mayor/rig/ + refinery/rig/ copies alone accounted for 1054 of 2279 C1
+# findings (3x duplication of canonical source — e.g. demand_dashboard.js:
+# 103 canonical + 97 + 78 from the two rig copies = 278 "findings" that were
+# really 1 file counted 3x). polecats/ (Gas Town's own term for transient
+# worktrees) and .worktrees/ (property_scrapers' convention) are the same
+# class under different names. Each planted pair below proves the SAME
+# content is excluded under the copy path but still flagged at a canonical
+# path — differential proof, not just "the excluded one produced nothing"
+# (ga-p5q3 defense (b): a check that always says nothing is as useless as
+# one that always says something).
+mkdir -p "$FIXDIR/mixed/somerig/mayor/rig" "$FIXDIR/mixed/somerig/refinery/rig" \
+  "$FIXDIR/mixed/somerig/polecats/furiosa" "$FIXDIR/mixed/somerig/.worktrees/wt1" \
+  "$FIXDIR/mixed/scripts.bak-20260101-000000"
+
+cat > "$FIXDIR/mixed/somerig/mayor/rig/dupe_except.py" <<'EOF'
+try:
+    do_thing()
+except:
+    pass
+EOF
+# canonical counterpart: identical content, NOT under an excluded path —
+# must still be flagged (proves exclusion is path-specific, not content-based)
+cat > "$FIXDIR/mixed/canonical_control_except.py" <<'EOF'
+try:
+    do_thing()
+except:
+    pass
+EOF
+
+cat > "$FIXDIR/mixed/somerig/mayor/rig/dupe_catch.js" <<'EOF'
+function f(x) {
+  try { g(x); } catch (e) {}
+  return x;
+}
+EOF
+
+cat > "$FIXDIR/mixed/somerig/refinery/rig/dupe_shell.sh" <<'EOF'
+X=$(dolt sql -q "select 1" 2>/dev/null) || true
+EOF
+
+cat > "$FIXDIR/mixed/somerig/polecats/furiosa/dupe_polecat.sh" <<'EOF'
+Y=$(bd list --json 2>/dev/null) || true
+EOF
+
+cat > "$FIXDIR/mixed/somerig/.worktrees/wt1/dupe_worktree.py" <<'EOF'
+try:
+    do_other()
+except:
+    pass
+EOF
+
+cat > "$FIXDIR/mixed/scripts.bak-20260101-000000/dupe_backup.py" <<'EOF'
+try:
+    do_third()
+except:
+    pass
+EOF
+
 # ═════════════════════════════════════════════════════════════════════════
 # 1. Direct pure-function detection tests
 # ═════════════════════════════════════════════════════════════════════════
@@ -389,12 +449,38 @@ mixed_count=$(wc -l <"$MIXED_OUT" | tr -d '[:space:]')
 # 3 shell (C1x1 + C2x2) + 2 JS + 2 py + 1 plist = 8, +2 do ga-vkjs (parser-
 # com-default) = 10. fixture_shape.selftest.sh is an 11th C2-shaped file
 # planted on purpose — it must stay find-excluded, so the total stays 10.
-[ "$mixed_count" = "10" ] && ok "mixed fixture dir → 10 findings (matches every planted bad case, nothing missed or double-counted; ga-6jfuo's *.selftest.sh fixture correctly NOT counted)" \
-  || bad "expected 10 findings in mixed dir, got $mixed_count"
+# ga-9krhl: +1 for canonical_control_except.py (must still be counted — it is
+# NOT under any excluded path). The 6 dupe_*/mayor/rig,refinery/rig,polecats,
+# .worktrees,bak-dir fixtures must all stay find-excluded (net +0), so the
+# total becomes 11, not 17.
+[ "$mixed_count" = "11" ] && ok "mixed fixture dir → 11 findings (10 pre-existing + 1 canonical control; the 6 ga-9krhl copy/backup dupes correctly excluded, nothing missed or double-counted)" \
+  || bad "expected 11 findings in mixed dir, got $mixed_count"
 
 case "$(cat "$MIXED_OUT")" in
   *fixture_shape.selftest.sh*) bad "ga-6jfuo REGRESSION: *.selftest.sh file was scanned by run_scan (should be find-excluded): $(grep 'fixture_shape.selftest.sh' "$MIXED_OUT")" ;;
   *) ok "ga-6jfuo: *.selftest.sh fixture excluded from run_scan's find (fixtures are intentional test patterns, not real findings)" ;;
+esac
+
+# ga-9krhl: each new exclusion class checked individually — an aggregate count
+# match alone wouldn't say WHICH exclusion broke if one did.
+for dupe in \
+  "somerig/mayor/rig/dupe_except.py:mayor/rig worktree-copy (.py)" \
+  "somerig/mayor/rig/dupe_catch.js:mayor/rig worktree-copy (.js)" \
+  "somerig/refinery/rig/dupe_shell.sh:refinery/rig worktree-copy (.sh)" \
+  "somerig/polecats/furiosa/dupe_polecat.sh:polecats transient worktree" \
+  "somerig/.worktrees/wt1/dupe_worktree.py:.worktrees convention (property_scrapers)" \
+  "scripts.bak-20260101-000000/dupe_backup.py:*.bak-* backup dir"
+do
+  relpath="${dupe%%:*}"; label="${dupe#*:}"
+  case "$(cat "$MIXED_OUT")" in
+    *"$relpath"*) bad "ga-9krhl REGRESSION: $label NOT excluded — found in output: $(grep "$relpath" "$MIXED_OUT")" ;;
+    *) ok "ga-9krhl: $label correctly excluded from run_scan" ;;
+  esac
+done
+
+case "$(cat "$MIXED_OUT")" in
+  *canonical_control_except.py*:C1:*) ok "ga-9krhl: canonical (non-copy) duplicate of the SAME content still flagged — exclusion is path-specific, not content-based" ;;
+  *) bad "ga-9krhl REGRESSION: canonical_control_except.py NOT flagged — exclusion is over-broad (content-based, not path-specific): $(cat "$MIXED_OUT")" ;;
 esac
 rm -f "$MIXED_OUT"
 
@@ -415,8 +501,8 @@ rm -f "$CLEAN_OUT"
 echo "── CLI wrapper ──"
 out="$(bash "$SCANNER" --path "$FIXDIR/mixed" --quiet)"; rc=$?
 [ "$rc" = "0" ] && ok "CLI exits 0 on a completed scan with findings" || bad "CLI exit code was $rc, expected 0"
-printf '%s\n' "$out" | grep -q '^error-empty-conflation-scan: 10 finding(s)$' \
-  && ok "CLI summary line reports 8 finding(s)" || bad "CLI summary line unexpected: $(printf '%s\n' "$out" | head -1)"
+printf '%s\n' "$out" | grep -q '^error-empty-conflation-scan: 11 finding(s)$' \
+  && ok "CLI summary line reports 11 finding(s)" || bad "CLI summary line unexpected: $(printf '%s\n' "$out" | head -1)"
 
 bash "$SCANNER" --path "$FIXDIR/does-not-exist" --quiet >/tmp/.conflation-selftest-missing-path.$$ 2>&1
 rc=$?

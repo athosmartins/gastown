@@ -314,6 +314,32 @@ run_scan() {
   # agendado que estoura por volume é a própria classe (timeout lido como "nada novo").
   # Excluo por CLASSE, não caçando nome a nome: qualquer dir-ponto (.wt-*, .viewer-*,
   # .gc-*, .claude) + crew/ + as deps Python. NÃO exclua o root em si — só as cópias DENTRO.
+  #
+  # ga-9krhl: MAIS 2 classes da MESMA família (crew/* já cobria as cópias DENTRO de
+  # crew/<nome>, mas não o rig do PRÓPRIO mayor/refinery na raiz do rig, nem os
+  # worktrees "polecat"/".worktrees" que usam nomes diferentes de .gc-worktrees):
+  #   1. <rig>/mayor/rig/ e <rig>/refinery/rig/ — cada rig (whatsapp_automation,
+  #      gastown, etc.) tem sua PRÓPRIA cópia de trabalho pro mayor e pro refinery,
+  #      irmã da canônica na raiz do rig — não nomeada "crew" nem ".gc-worktrees",
+  #      então nenhuma exclusão existente pegava. Medido: whatsapp_automation/mayor/rig/
+  #      e /refinery/rig/ sozinhos respondiam por 1054 dos 2279 C1 do baseline da
+  #      silent-ignorance-watch (3x duplicação da fonte canônica; demand_dashboard.js
+  #      sozinho: 103 canônico + 97 + 78 das 2 cópias = 278 "achados" que eram na
+  #      verdade 1 arquivo contado 3x).
+  #   2. /polecats/ (worktrees transientes, nome da doutrina Gas Town) e /.worktrees/
+  #      (convenção usada por property_scrapers) — mesma classe de ".wt-*"/
+  #      ".gc-worktrees", nome diferente por rig.
+  # NÃO restrinjo a varredura a .py: falsifiquei antes de aceitar (ga-p5q3 defesa b) —
+  # depois de só este dedup, o total .py caiu pra 830 achados em 327 arquivos, batendo
+  # quase exato com o "~848 em ~330 arquivos" que motivou este bug, SEM precisar excluir
+  # .js/.sh. E excluir .js/.sh estragaria sinal real: merged-bead-janitor.sh sozinho tem
+  # 21 achados C1 (`|| true` masking), todos na cópia canônica única, zero duplicação —
+  # sinal genuíno num script de infra da própria cidade, não ruído. "achado em .js/.sh
+  # não é 'except:pass'" é
+  # verdade mas irrelevante — cada C1 tem o idioma de fix certo pra sua própria
+  # linguagem (catch(e){} para JS, `|| true` pra shell); a varredura multi-linguagem é
+  # a missão documentada deste monitor desde o cabeçalho de silent-ignorance-watch.sh,
+  # não um acidente de escopo.
   local -a EXCL=(
     -not -path '*/.gc-worktrees/*' -not -path '*/.gc-worktrees-adhoc/*'
     -not -path '*/.gc/*' -not -path '*/backup/*' -not -path '*/.dolt-backup/*'
@@ -322,6 +348,9 @@ run_scan() {
     -not -path '*/.wt-*' -not -path '*/.viewer-deploy-clone/*' -not -path '*/.claude/*'
     -not -path '*/venv/*' -not -path '*/.venv/*'
     -not -path '*/site-packages/*' -not -path '*/__pycache__/*'
+    -not -path '*/mayor/rig/*' -not -path '*/refinery/rig/*'
+    -not -path '*/polecats/*' -not -path '*/.worktrees/*'
+    -not -path '*.bak-*/*'
     # ga-6jfuo: *.selftest.sh contem padroes C1/C2 DE PROPOSITO (fixtures pra
     # testar o proprio detector) -> falso-positivo na varredura de producao.
     # Nao afeta o selftest do scanner em si, que chama scan_* diretamente.
