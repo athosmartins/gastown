@@ -396,11 +396,19 @@ def _refusal_reason_slugs(labels):
 
 
 def _is_ephemeral_pool_assignee(assignee):
-    """True if assignee is an ephemeral-pool bead assignee (bare template OR concrete adhoc form).
+    """True if assignee is an ephemeral-pool bead assignee (bare template,
+    concrete adhoc form, or dog-pool concrete session form).
 
     Covers:
-    - Bare template in EPHEMERAL_POOL_ASSIGNEES (e.g. 'wa-worker')
+    - Bare template in EPHEMERAL_POOL_ASSIGNEES (e.g. 'wa-worker', 'gastown.dog')
     - Concrete adhoc form: '<template>-adhoc-<hex>' (e.g. 'wa-worker-adhoc-faac43db2d')
+    - ga-9vi19: dog-pool concrete session form 'dog-<suffix>' (e.g. 'dog-ga2rkia') —
+      the assignee shape `gc bd update --claim` sets for a dog pool slot, distinct
+      from both forms above. Mirrors _pool_of()'s existing 'al.startswith("dog-")'
+      rule (ga-dbibq) so the two classification paths agree on what belongs to the
+      gastown.dog pool, instead of _pool_of() alone recognizing it. Deliberately
+      NOT folded into the generic '-adhoc-' loop above: the dog pool's concrete
+      form is 'dog-<suffix>', not 'gastown.dog-adhoc-<hex>'.
 
     ga-hkpwv gap fix: the Pilot pool dispatcher assigns concrete adhoc session names
     like 'wa-worker-adhoc-<hash>' to beads rather than the bare template 'wa-worker'.
@@ -415,6 +423,8 @@ def _is_ephemeral_pool_assignee(assignee):
     for template in EPHEMERAL_POOL_ASSIGNEES:
         if al.startswith(template + "-adhoc-"):
             return True
+    if al.startswith("dog-"):
+        return True
     return False
 
 
@@ -3543,11 +3553,59 @@ def _selftest():
     check("AZ-7: concrete_adhoc_session_is_live: session gone (empty list) → False (eligible)",
           not concrete_adhoc_session_is_live("wa-worker-adhoc-deadbeef", [], T_az))
 
-    # --- AZ-8: non-wa-worker assignees NOT swept (scope stays wa-worker family) ---
-    check("AZ-8: _is_ephemeral_pool_assignee: dog-gawispy8c0mr → False (not in scope)",
-          not _is_ephemeral_pool_assignee("dog-gawispy8c0mr"))
-    check("AZ-8b: is_reclaimable_inprogress_story: dog-gawispy8c0mr without markers → False",
-          not is_reclaimable_inprogress_story([], assignee="dog-gawispy8c0mr"))
+    # --- AZ-8: dog-pool concrete session form IS swept (ga-9vi19) ---
+    # Was "→ False (not in scope)" until ga-9vi19: dog-<suffix> is the assignee
+    # shape `gc bd update --claim` actually sets for a dog pool slot (confirmed
+    # directly — a live session's own assignee took this exact form), and
+    # _pool_of() already normalized it to "gastown.dog" for POOL-DEAD bucketing
+    # (ga-dbibq) — only this reclaim-classification path had failed to agree.
+    # Flipped alongside the code fix, not left stale (verify-fix-against-
+    # deliberate-design: the old assertion's own rationale, "scope stays
+    # wa-worker family", was superseded the moment gt-fppb0 put 'gastown.dog'
+    # itself in EPHEMERAL_POOL_ASSIGNEES; no comment anywhere justified
+    # excluding this sibling concrete form specifically).
+    check("AZ-8: _is_ephemeral_pool_assignee: dog-gawispy8c0mr → True (ga-9vi19: dog-pool concrete form in scope)",
+          _is_ephemeral_pool_assignee("dog-gawispy8c0mr"))
+    check("AZ-8b: is_reclaimable_inprogress_story: dog-gawispy8c0mr without markers → True (ga-9vi19)",
+          is_reclaimable_inprogress_story([], assignee="dog-gawispy8c0mr"))
+    check("AZ-8c: _pool_of/_is_ephemeral_pool_assignee now agree on dog-gawispy8c0mr (ga-9vi19)",
+          _pool_of("dog-gawispy8c0mr") == "gastown.dog" and
+          _is_ephemeral_pool_assignee("dog-gawispy8c0mr"))
+    check("AZ-8d: _is_ephemeral_pool_assignee: dog-gawispy8c0mr is adhoc-only, not bare (is_bare_pool_zombie stays False)",
+          "dog-gawispy8c0mr" not in EPHEMERAL_POOL_ASSIGNEES and
+          _is_ephemeral_pool_assignee("dog-gawispy8c0mr"))
+    check("AZ-8e: _is_ephemeral_pool_assignee: dogwatcher-wa (no hyphen after 'dog') stays False (prefix precision)",
+          not _is_ephemeral_pool_assignee("dogwatcher-wa"))
+
+    # --- AZ-9c: full pipeline — dog-pool concrete session, dead, stranded 2h+ → reclaim (ga-9vi19) ---
+    # Mirrors AZ-3 (wa-worker-adhoc) for the dog-pool concrete form: proves the
+    # classification fix changes an end-to-end outcome, not just an isolated predicate.
+    check("AZ-9c: reclaim_decision: dog-<suffix>+dead session, no branch, stranded>POOL_ZOMBIE_TTL → reclaim (ga-9vi19)",
+          reclaim_decision(
+              has_live_session=concrete_adhoc_session_is_live(
+                  "dog-ga2rkia", [], T_az),
+              has_recent_branch=False,
+              seconds_stranded=POOL_ZOMBIE_TTL + 1,
+              reclaim_count=0,
+              has_needs_human=False,
+              has_dispatching_marker=False,
+              min_stranding_secs=POOL_ZOMBIE_TTL,
+          ) == "reclaim")
+
+    # --- AZ-9d: dog-<suffix> now needs the LONGER POOL_ZOMBIE_TTL wait, not RECLAIM_TTL ---
+    # ga-9vi19 behavior change: pre-fix this assignee fell to the generic `else`
+    # branch and only needed RECLAIM_TTL (25min); post-fix is_pool_zombie_bead=True
+    # grants (and requires) the same 2h patience wa-worker-adhoc-<hex> already gets.
+    check("AZ-9d: reclaim_decision: dog-<suffix> stranded 30min (<POOL_ZOMBIE_TTL) → noop (ga-9vi19: needs full 2h now)",
+          reclaim_decision(
+              has_live_session=False,
+              has_recent_branch=False,
+              seconds_stranded=1800,  # 30min: > RECLAIM_TTL (25min), < POOL_ZOMBIE_TTL (2h)
+              reclaim_count=0,
+              has_needs_human=False,
+              has_dispatching_marker=False,
+              min_stranding_secs=POOL_ZOMBIE_TTL,
+          ) == "noop")
 
     # --- AZ-9: bare wa-worker regression — existing pool-wide behavior unchanged ---
     check("AZ-9: _is_ephemeral_pool_assignee: bare wa-worker still detected (regression check)",
