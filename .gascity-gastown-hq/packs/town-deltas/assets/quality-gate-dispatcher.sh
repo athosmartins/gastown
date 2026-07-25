@@ -1936,6 +1936,16 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
     done
     bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
     bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:queued"      -q 2>/dev/null || true
+    # ga-n2cpe: every OTHER terminal path in this function clears gate:reviewing
+    # on the source bead (wa-qq33j) — this one didn't. A reviewer that died
+    # before ever ACKing (stale_async_start drain during startup, ga-flfo/
+    # ga-xwdl) lands here with gate:reviewing still set and no verdict to
+    # trigger a PASS/FAIL clear elsewhere, so the label stuck forever with no
+    # terminal path to clear it — head-of-line-blocking the whole gate queue
+    # until the grw FIX4 watchdog swept it up, 15-39m later (observed live on
+    # wa-c3qsr, 2026-07-25, three times in one day). Clear it here too, on the
+    # same sweep this dead-reviewer condition is confirmed.
+    bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (infra re-queue, ga-n2cpe)
     bd -C "$GC_CITY" comment "$MARKER_ID" "INFRA re-queue (ga-eqjo): reviewer session(s) died mid-review — an infra failure (Dolt hiccup/crash class, ga-4u16h/ga-h9o17), NOT a code FAIL. Marker re-queued; the ga-cw4pm headroom gate will admit a fresh attempt with new reviewers." 2>/dev/null || true
     if [ "$GATE_RUN_ID" != "unknown" ]; then
       bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run paused (infra re-queue, ga-eqjo): reviewer session(s) died mid-review; marker $MARKER_ID re-queued for a fresh attempt. No verdict recorded; this is NOT a FAIL." 2>/dev/null || true
@@ -1979,6 +1989,12 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
   # Re-queue the marker (reverse of the atomic claim): dispatching → queued.
   bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:queued"      -q 2>/dev/null || true
+  # ga-n2cpe: same gap as the dead-reviewer branch above (sibling requeue
+  # path, identical shape, identical missing clear) — a quota-stop can strand
+  # gate:reviewing on the source bead just as permanently as a dead reviewer
+  # can, with the same head-of-line fallout. See the dead-reviewer branch's
+  # comment for the full incident context.
+  bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (quota-stop re-queue, ga-n2cpe)
   bd -C "$GC_CITY" comment "$MARKER_ID" "QUOTA-STOP re-queue (ga-x3nmz): reviewer(s) stalled because Claude's 5h session quota is exhausted — a quota-stop, NOT a code FAIL. Marker re-queued; the ga-cw4pm headroom gate holds it deferred until the window resets${_eta:+ ($_eta)}, then the gate re-runs with fresh reviewers." 2>/dev/null || true
   if [ "$GATE_RUN_ID" != "unknown" ]; then
     bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run paused (quota-stop, ga-x3nmz): Claude 5h quota exhausted mid-review; marker $MARKER_ID re-queued for re-run post-reset${_eta:+ ($_eta)}. No verdict recorded; this is NOT a FAIL." 2>/dev/null || true
