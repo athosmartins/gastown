@@ -907,6 +907,48 @@ for _NF4X5_TMPL in wa-worker ps-worker; do
   fi
 done
 
+# ── Scenario ga-3lsy1 (SAFETY): bare needs-human is the bug/tech-debt/task
+# human-gate label — distinct from story:needs-human/story:needs-approval, which
+# only apply to beads that went through the refino story:* lifecycle. Bugs never
+# get that labeling, so their gate is the BARE `needs-human` (or its
+# `needs-human-decision` sub-variant). Confirmed reproducible gap: ga-jwnye
+# (issue_type=bug) carried `needs-human` from creation, with an explicit
+# "Nao auto-despachar" body instruction, yet Pilot's BUGS_JSON -> _filter_candidates
+# path dispatched it 4x anyway (02:40Z, 03:55Z, 05:40Z, and again at 08:45Z — the
+# last dispatch AFTER a dog had already re-affirmed needs-human on the bead
+# following a full investigation). _filter_candidates previously checked only
+# story:needs-human/story:needs-approval, never the bare label — so every path
+# that flows through it (BUGS_JSON, DEBT_JSON, TIER2_JSON, CTXREADY_JSON, and
+# every per-rig RIG_BUGS/RIG_DEBT/RIG_FEATURES query) let a needs-human bug through.
+echo "Scenario ga-3lsy1: bare needs-human bead is excluded from the candidate pool (bug/tech-debt human gate)"
+NEEDS_HUMAN_BARE='[{"id":"bd-needs-human","assignee":null,"labels":["needs-human"],"description":"x"},{"id":"bd-human-free","assignee":null,"labels":[],"description":"x"}]'
+[ "$(_fc "$NEEDS_HUMAN_BARE")" = '["bd-human-free"]' ] && ok "ga-3lsy1: bare needs-human bug excluded; clean sibling kept" || bad "ga-3lsy1: bare needs-human bead leaked into candidates (SAFETY REGRESSION): $(_fc "$NEEDS_HUMAN_BARE")"
+
+echo "Scenario ga-3lsy1b: needs-human-decision sub-variant is also excluded (startswith, mirrors gate:needs-human treatment)"
+NEEDS_HUMAN_DECISION='[{"id":"bd-needs-human-decision","assignee":null,"labels":["needs-human-decision"],"description":"x"},{"id":"bd-human-free2","assignee":null,"labels":[],"description":"x"}]'
+[ "$(_fc "$NEEDS_HUMAN_DECISION")" = '["bd-human-free2"]' ] && ok "ga-3lsy1: needs-human-decision bug excluded; clean sibling kept" || bad "ga-3lsy1: needs-human-decision bead leaked into candidates (SAFETY REGRESSION): $(_fc "$NEEDS_HUMAN_DECISION")"
+
+echo "$_FC_FN" | grep -q 'startswith("needs-human")' && ok "_filter_candidates carries the bare needs-human clause" || bad "bare needs-human clause missing from _filter_candidates"
+
+# AC1(b)/AC2 cross-check (mirrors ga-nf4x5): the routed-pool probes (wa-worker/
+# ps-worker) must carry the SAME bare-needs-human exclusion independently of
+# _filter_candidates — they bypass Pilot's dispatch path entirely, so a fix in
+# _filter_candidates alone would not stop a needs-human bug from being picked up
+# by an idle wa-worker/ps-worker's own routed-pool probe.
+for _GA3LSY1_TMPL in wa-worker ps-worker; do
+  _GA3LSY1_TMPL_PATH="$SELF_DIR/../../../agents/$_GA3LSY1_TMPL/prompt.template.md"
+  if [ -f "$_GA3LSY1_TMPL_PATH" ]; then
+    grep -q -- '--exclude-label "needs-human"' "$_GA3LSY1_TMPL_PATH" \
+      && ok "ga-3lsy1: $_GA3LSY1_TMPL routed-pool probe excludes bare needs-human" \
+      || bad "ga-3lsy1: $_GA3LSY1_TMPL routed-pool probe MISSING bare needs-human exclusion (SAFETY REGRESSION)"
+    grep -q -- '--exclude-label "needs-human-decision"' "$_GA3LSY1_TMPL_PATH" \
+      && ok "ga-3lsy1: $_GA3LSY1_TMPL routed-pool probe excludes needs-human-decision" \
+      || bad "ga-3lsy1: $_GA3LSY1_TMPL routed-pool probe MISSING needs-human-decision exclusion (SAFETY REGRESSION)"
+  else
+    bad "ga-3lsy1: could not locate $_GA3LSY1_TMPL prompt.template.md to verify needs-human exclusion (path: $_GA3LSY1_TMPL_PATH)"
+  fi
+done
+
 # ── Scenario 3e2e-h (ga-am6h): pilot:reclaim-count cap is STICKY, independent of
 # pilot:held ─────────────────────────────────────────────────────────────────────
 # ga-knfh incident: inflight-reclaim-guard exhausted the reclaim cap (3/3) at

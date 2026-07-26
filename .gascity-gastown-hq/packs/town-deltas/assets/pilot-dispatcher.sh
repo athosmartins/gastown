@@ -1402,6 +1402,20 @@ _filter_candidates() {
         and (((.labels // []) - $preapproval) | length) == ((.labels // []) | length)
         and ((.labels // []) | map(select(
           startswith("gate:needs-human")
+          # ga-3lsy1: bugs/tech-debt (issue_type=bug, -l tech-debt) never carry the
+          # story:* refino labeling convention, so their human-gate signal is the BARE
+          # needs-human label instead of story:needs-human — which this filter did not
+          # check at all, so a bug carrying needs-human sailed through untouched
+          # (ga-jwnye: dispatched 4x via BUGS_JSON/_filter_candidates despite carrying
+          # needs-human from creation, incl. once AFTER a dog had re-affirmed the label
+          # following investigation). startswith (not exact match, mirroring
+          # gate:needs-human above) also catches the needs-human-decision sub-variant,
+          # already treated as an equivalent human-gate signal elsewhere in this file
+          # (WA gate1 check, ~line 283) and already excluded at CTXREADY_JSONs own
+          # query site — this brings BUGS_JSON/DEBT_JSON/TIER2_JSON and every RIG_*
+          # variant (all of which rely on this shared chokepoint, not a per-query
+          # --exclude-label) up to the same standard.
+          or startswith("needs-human")
           # ga-y8qh: pool:refused[:<reason-slug>] is the pool-worker-refusal
           # counterpart to gate:needs-human — same prefix-sub-variant shape,
           # same reason to catch it here (upstream, at selection time) rather
@@ -1522,6 +1536,7 @@ _filter_candidates() {
             | if ($pa | length) > 0 then "preapproval-label:\($pa | join(","))" else empty end ),
           ( ($L | map(select(
               startswith("gate:needs-human")
+              or startswith("needs-human")
               or startswith("pool:refused")
               or startswith("pilot:refused-reason:")
               or . == "story:needs-human"
