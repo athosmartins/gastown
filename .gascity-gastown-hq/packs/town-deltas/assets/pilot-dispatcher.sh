@@ -696,7 +696,13 @@ bead_content_rig() {
     echo "property_scrapers"; return 0
   fi
   # whatsapp_automation domain features authored as HQ (ga-) beads.
-  if printf '%s' "$hay" | grep -iqE '\bpainel\b|whatsapp|\bwhapi\b|pipedrive|urblink_design_system|design[ -]system|painel-hist|kanban hist|\bfrota\b|\bcanais\b|\bcanal\b de alerta|disparo|envio de mensagem'; then
+  # ga-r4jnu/ga-zfe51: word-boundary "disparo(s)" — bare substring matching also hit
+  # "disparou"/"disparar"/"disparando" (ordinary Portuguese verb forms meaning "fired/
+  # triggered", ubiquitous in ops prose: "o watchdog disparou", "dispara em description
+  # vazia"). Audited: EVERY historical match of dispar* across this HQ's bead corpus
+  # (open + closed) was this false cognate, never the genuine WA noun ("disparo de
+  # mensagem"). \b on both sides keeps the real signal, drops the verb collision.
+  if printf '%s' "$hay" | grep -iqE '\bpainel\b|whatsapp|\bwhapi\b|pipedrive|urblink_design_system|design[ -]system|painel-hist|kanban hist|\bfrota\b|\bcanais\b|\bcanal\b de alerta|\bdisparos?\b|envio de mensagem'; then
     echo "whatsapp_automation"; return 0
   fi
   echo ""
@@ -4580,6 +4586,19 @@ LIVESEC
           # (c) ga-xzfl: an explicit framework / pack:town-deltas / dog-pool LABEL is a direct
           #     Mayor/refino signal that this is dog-pool framework work. jq -e any(); fail-open.
           if [ "$_FW_EXEMPT" = "0" ] && echo "$STORY" | jq -e '(.labels // []) | any(. == "framework" or . == "pack:town-deltas" or . == "dog-pool")' >/dev/null 2>&1; then _FW_EXEMPT=1; _FW_REASON="framework-label"; fi
+          # (d) ga-r4jnu/ga-zfe51: an explicit area:infra LABEL is a direct Mayor/refino
+          #     signal that a human already classified this bead as infrastructure —
+          #     covers the case bead_domain's own infra keywords (a) miss. bead_domain's
+          #     "infra" branch is a narrow, curated allowlist (dolt/gate dispatcher/
+          #     reviewer/dispatcher/framework/headroom/refinery); an infra bead written in
+          #     different ops vocabulary (disk-floor-guard/reaper/scratch/transcript) isn't
+          #     "infra" by (a), has no cited path for (b), and isn't literally labeled
+          #     framework/pack:town-deltas/dog-pool for (c) — yet still needs the exemption
+          #     when bead_content_rig trips on an incidental keyword (e.g. "disparou" ⊃
+          #     "disparo" before the ga-r4jnu word-boundary fix; the next unforeseen false
+          #     cognate after it). area:infra is an established label (5 live HQ beads at
+          #     time of fix) already meaning exactly this. jq -e any(); fail-open.
+          if [ "$_FW_EXEMPT" = "0" ] && echo "$STORY" | jq -e '(.labels // []) | any(. == "area:infra")' >/dev/null 2>&1; then _FW_EXEMPT=1; _FW_REASON="area-infra-label"; fi
           if [ "$_FW_EXEMPT" = "1" ]; then
             log "framework-dog-exempt: $STORY_ID is gascity-framework work ($_FW_REASON) but bead_content_rig mis-inferred rig=$_DOMAIN_RIG from an incidental keyword — the dog pool ($BUILDER_TARGET) IS its correct builder (HQ checkout, git-diff, gate access). Clearing product-rig inference so the domain-route guard FAILS OPEN (dispatch, not REFUSE+1h-hold). Disable with PILOT_FRAMEWORK_DOG_EXEMPT=0."
             _DOMAIN_RIG=""

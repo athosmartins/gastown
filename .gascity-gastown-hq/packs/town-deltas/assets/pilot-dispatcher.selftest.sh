@@ -2907,8 +2907,13 @@ fi
 echo "Scenario 18n (ga-evjs2): infra bead saying 'Disparou' (⊃ disparo) → dog dispatch, NOT refused"
 INFRA_REVIEWER='[{"id":"ga-evtest","title":"Gate reviewer death-spiral on LARGE diffs: REVIEWER_STALE_SECS=300 fixed freeze-kill doesnt scale with diff size","priority":1,"issue_type":"bug","description":"big-diff reviewers false-reaped at 5min. Disparou throughput-stall watchdog + agent respawns; Dolt+quota burn. Scale the reviewer stale timeout with diff size.","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-01T00:00:02Z","metadata":{}}]'
 INFRA_REV_OBJ="$(echo "$INFRA_REVIEWER" | jq -c '.[0]')"
-[ "$(_bcr "$INFRA_REV_OBJ")" = whatsapp_automation ] && ok "precondition: bead_content_rig still mis-infers whatsapp_automation (incidental 'disparo' token)" || bad "precondition changed: bead_content_rig='$(_bcr "$INFRA_REV_OBJ")'"
-[ "$(_dom "$INFRA_REV_OBJ")" = infra ] && ok "bead_domain classifies ga-evjs2 shape as infra (framework)" || bad "bead_domain not infra: '$(_dom "$INFRA_REV_OBJ")'"
+# ga-r4jnu (2026-07-26): bead_content_rig now word-boundaries "disparo" (\bdisparos?\b),
+# so "Disparou" no longer mis-infers whatsapp_automation AT SOURCE — one layer earlier
+# than this scenario originally exercised. The framework-dog-exempt safety net below is
+# consequently NOT needed for this exact fixture anymore (nothing left to exempt); the
+# outcome that actually matters — dispatch to the dog, never refused — is unchanged.
+[ -z "$(_bcr "$INFRA_REV_OBJ")" ] && ok "ga-r4jnu: bead_content_rig no longer mis-infers whatsapp_automation from 'Disparou' (fixed one layer earlier than the exemption)" || bad "bead_content_rig still mis-infers: '$(_bcr "$INFRA_REV_OBJ")' (ga-r4jnu word-boundary fix not wired?)"
+[ "$(_dom "$INFRA_REV_OBJ")" = infra ] && ok "bead_domain classifies ga-evjs2 shape as infra (framework) — unaffected by the ga-r4jnu fix" || bad "bead_domain not infra: '$(_dom "$INFRA_REV_OBJ")'"
 LOG18N="$(run_capacity 10 "[]" 1 "$INFRA_REVIEWER")"
 B18N="$(dispatched_builder "$LOG18N")"
 if echo "$B18N" | grep -qE '^gastown\.dog'; then
@@ -2918,7 +2923,7 @@ elif [ -z "$B18N" ] && echo "$LOG18N" | grep -q "REFUSING"; then
 else
   bad "gate-reviewer infra bead routed unexpectedly (got: '${B18N:-none}')"
 fi
-echo "$LOG18N" | grep -q "framework-dog-exempt: ga-evtest" && ok "exemption logged for ga-evjs2 shape" || bad "framework-dog-exempt not logged for ga-evjs2 shape"
+echo "$LOG18N" | grep -q "framework-dog-exempt: ga-evtest" && bad "exemption fired for ga-evjs2 shape but bead_content_rig should already be empty post-ga-r4jnu (redundant firing suggests the word-boundary fix regressed)" || ok "framework-dog-exempt correctly silent for ga-evjs2 shape (ga-r4jnu: nothing to exempt — bead_content_rig already returns empty)"
 
 echo "Scenario 18o (no regression): genuine PRODUCT-domain beads are NEVER infra-exempted → still steered to crew"
 # The exemption keys on bead_domain=infra; a real product build classifies as its PRODUCT
@@ -4697,6 +4702,84 @@ echo "Scenario ga-zzqza: drift-guard — HQ-path-existence guard is wired"
 has "$DISPATCHER" 'ga-zzqza'                       "ga-zzqza HQ-path-existence guard is wired"
 has "$DISPATCHER" 'PILOT_HQ_PATH_EXISTS_GUARD'     "PILOT_HQ_PATH_EXISTS_GUARD env-gate is wired"
 has "$DISPATCHER" '_HQ_ONLY_PATH'                  "_HQ_ONLY_PATH signal variable is wired"
+
+# ── Scenario ga-r4jnu/ga-zfe51 (2026-07-26): domain-route guard false-refuse on an
+# infra bead whose ops prose incidentally trips a WA keyword, immediately AFTER a
+# genuine domain bead in the same dispatch pass ──────────────────────────────────
+# LIVE INCIDENT (pilot-dispatcher.log, 2026-07-26 14:01): ga-lt2dz (genuine WA bead,
+# owner-authoritative) was claimed, classified whatsapp_automation, refused+held.
+# 18s later ga-t1ub9 (P1, disk-floor-guard transcript-reaper fix — no WA content
+# whatsoever) was claimed NEXT and got the IDENTICAL "REFUSING... whatsapp_automation
+# domain build... Owning crew none is unmapped" verdict — starving it for days.
+#
+# Originally filed as a suspected stale-variable LEAK of _DOMAIN_RIG across
+# dispatch_one() calls. VERIFIED FALSE: dispatch_one() is called via a fresh
+# function invocation per candidate (dispatch_lane's while loop), and _DOMAIN_RIG/
+# _PATH_RIG/_DOM_CREW_OWNER/_DOM_DEFAULT are all `local` and reset at their point of
+# declaration — bash cannot leak them across separate calls. The dispatcher log
+# itself proves it: no second "ga-nlh79: ga-t1ub9 owner-authoritative..." line ever
+# fired — ga-t1ub9's verdict came from the SILENT bead_content_rig() fallback,
+# computed fresh from ITS OWN text, independent of ga-lt2dz.
+#
+# ACTUAL root cause (confirmed by extracting bead_content_rig/bead_domain and
+# running them against ga-t1ub9's live JSON in total isolation): its description
+# contains "...FUNCIONA (disparou 01:27, recuperou)" — "disparou" (ordinary
+# Portuguese verb, "it triggered") CONTAINS the bare substring "disparo", the
+# WA-domain keyword. bead_domain (the framework-dog-exempt safety net) does NOT
+# classify this bead "infra" — its allowlist (dolt/gate dispatcher/reviewer/
+# dispatcher/framework/headroom/refinery) doesn't cover "disk-floor-guard/reaper/
+# scratch/transcript" prose — and the label-based exemption only recognised
+# framework/pack:town-deltas/dog-pool, not this bead's own (already-present)
+# area:infra label. Two fixes:
+#   1. bead_content_rig: \bdisparos?\b (word boundary) — audited every dispar*
+#      hit across this HQ's whole bead corpus (open+closed): 100% false cognates,
+#      zero genuine "disparo de mensagem" WA signals.
+#   2. framework-dog-exempt: an explicit area:infra LABEL is now its own
+#      exemption reason (d), independent of bead_domain's keyword coverage — the
+#      general safety net for the NEXT unforeseen false-cognate collision.
+echo "Scenario ga-r4jnu-a: word-boundary fix — bead_content_rig no longer mis-infers on 'disparou'"
+DISKLEAK_BEAD='{"id":"ga-r4diskleak","title":"[bug] disk leak: transcripts de sessao MORTA acumulam (~/.claude/projects) sem reaper — scratch-reaper so pega scratch","priority":1,"issue_type":"bug","description":"disco caindo. O reaper (disk-floor-guard _reap_dead_scratch) limpa scratch morto e FUNCIONA (disparou 01:27, recuperou). MAS nao toca em TRANSCRIPTS — transcript de sessao morta (crews/dogs/reviewers de incarnacoes antigas) acumula, vazando o disco.","status":"open","labels":["area:infra","lane:small","story:approved"],"assignee":null,"created_at":"2026-07-20T05:14:59Z","metadata":{}}'
+[ -z "$(_bcr "$DISKLEAK_BEAD")" ] && ok "ga-r4jnu: bead_content_rig no longer mis-infers whatsapp_automation from 'disparou' (was: false match on bare 'disparo')" || bad "REGRESSION (ga-r4jnu): bead_content_rig still returns '$(_bcr "$DISKLEAK_BEAD")' for 'disparou' text"
+
+echo "Scenario ga-r4jnu-b: end-to-end — the EXACT live adjacency (domain bead, then ga-t1ub9-shaped generic bead) in ONE pass"
+DOMTEST_BEAD='{"id":"ga-r4domtest","title":"code-mode MCP servers configuration for context injection","priority":1,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"mila-wa","created_at":"2026-07-26T00:00:01Z","metadata":{}}'
+R4JNU_SEQ="[${DOMTEST_BEAD},${DISKLEAK_BEAD}]"
+LOG_R4JNU="$(run_capacity 10 "[]" 1 "$R4JNU_SEQ")"
+echo "$LOG_R4JNU" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-r4domtest" \
+  && ok "sequence setup faithful: the genuine WA domain bead (first claim) is still refused+held, exactly like ga-lt2dz" \
+  || bad "sequence setup broken: the domain bead was NOT refused — test no longer reproduces the real adjacency"
+if echo "$LOG_R4JNU" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-r4diskleak"; then
+  bad "REGRESSION (ga-r4jnu): the generic disk-leak bead (second claim, right after a domain bead) was STILL falsely refused+held"
+else
+  ok "ga-r4jnu FIXED: the generic disk-leak bead is NOT refused, despite following a genuine domain bead in the same pass"
+fi
+B_R4JNU="$(dispatched_builder "$LOG_R4JNU")"
+echo "$B_R4JNU" | grep -qE '^gastown\.dog' && ok "disk-leak bead dispatched to the dog pool ($B_R4JNU) — the P1 that starved for days now flows" || bad "disk-leak bead routed unexpectedly (got: '${B_R4JNU:-none}')"
+
+echo "Scenario ga-r4jnu-c: framework-dog-exempt reason (d) — area:infra label exempts even when bead_domain misses it AND the keyword isn't 'disparo'"
+# Decoupled from fix 1: this bead trips bead_content_rig via 'painel' (a DIFFERENT,
+# still-live keyword — internal ops dashboards get called 'painel' in Portuguese
+# infra prose too), so this proves exemption reason (d) on its own merit, not
+# riding on the word-boundary fix above.
+PAINEL_INFRA_BEAD='{"id":"ga-r4painel","title":"expose disk-floor-guard reap counters on the internal ops painel","priority":2,"issue_type":"task","description":"surface bytes-freed and files-removed counters on the internal status painel so the mayor can see reap velocity over time.","status":"open","labels":["area:infra","lane:small","story:approved"],"assignee":null,"created_at":"2026-07-26T00:00:02Z","metadata":{}}'
+[ "$(_bcr "$PAINEL_INFRA_BEAD")" = whatsapp_automation ] && ok "precondition: bead_content_rig still mis-infers whatsapp_automation from incidental 'painel' (untouched by the disparo fix)" || bad "precondition changed: bead_content_rig='$(_bcr "$PAINEL_INFRA_BEAD")'"
+[ "$(_dom "$PAINEL_INFRA_BEAD")" != infra ] && ok "precondition: bead_domain does NOT classify this infra bead as infra (its allowlist misses disk-floor-guard/reap vocabulary)" || bad "precondition changed: bead_domain='$(_dom "$PAINEL_INFRA_BEAD")' — exemption (a) would already cover this"
+LOG_R4PAINEL="$(run_capacity 10 "[]" 1 "[$PAINEL_INFRA_BEAD]")"
+B_R4PAINEL="$(dispatched_builder "$LOG_R4PAINEL")"
+echo "$B_R4PAINEL" | grep -qE '^gastown\.dog' && ok "area:infra-labeled bead dispatched to the dog pool (exemption (d) fired)" || bad "REGRESSION: area:infra bead not dispatched (got: '${B_R4PAINEL:-none}')"
+echo "$LOG_R4PAINEL" | grep -q "framework-dog-exempt: ga-r4painel is gascity-framework work (area-infra-label)" && ok "exemption reason 'area-infra-label' logged" || bad "area-infra-label exemption not logged"
+
+echo "Scenario ga-r4jnu-d (control): SAME painel bead WITHOUT area:infra → still refused+held (proves the label, not something else, is what saves it)"
+PAINEL_NOLABEL='{"id":"ga-r4painelctl","title":"expose disk-floor-guard reap counters on the internal ops painel","priority":2,"issue_type":"task","description":"surface bytes-freed and files-removed counters on the internal status painel so the mayor can see reap velocity over time.","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-26T00:00:03Z","metadata":{}}'
+LOG_R4CTL="$(run_capacity 10 "[]" 1 "[$PAINEL_NOLABEL]")"
+echo "$LOG_R4CTL" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-r4painelctl" \
+  && ok "control: without area:infra the same bead IS refused+held (proves exemption (d) — not some other accident — is what flips scenario ga-r4jnu-c)" \
+  || bad "control failed: bead without area:infra was NOT refused (got builder='$(dispatched_builder "$LOG_R4CTL")') — cannot attribute ga-r4jnu-c's pass to the label"
+
+echo "Scenario ga-r4jnu: drift-guard — both fixes are wired into the live dispatcher"
+has "$DISPATCHER" 'ga-r4jnu'              "ga-r4jnu fix comment is wired"
+has "$DISPATCHER" 'disparos?'             "disparo keyword now requires a word boundary"
+has "$DISPATCHER" 'area-infra-label'      "area-infra-label exemption reason is wired"
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
