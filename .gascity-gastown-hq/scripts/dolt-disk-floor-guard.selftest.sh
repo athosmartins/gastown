@@ -5,8 +5,9 @@
 #
 # Hermetic: sources the script as a LIBRARY (DOLT_DISK_FLOOR_GUARD_LIB=1) so main()
 # never runs, points the log at a throwaway path. Never calls `gc dolt-cleanup`,
-# `gc mail send`, `notify`, or the real scratchpad-reaper.sh; nothing is deleted,
-# nothing is sent, nothing in Dolt's data dir or /private/tmp is touched.
+# `gc mail send`, `notify`, the real scratchpad-reaper.sh, or the real
+# orphan-session-dir-reaper.sh; nothing is deleted, nothing is sent, nothing in
+# Dolt's data dir, /private/tmp, or ~/.claude/projects is touched.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -118,6 +119,15 @@ _safe_reclaim() { :; }
 REAP_CALLS=0
 _reap_dead_scratch() { REAP_CALLS=$((REAP_CALLS+1)); }
 
+# _reap_orphan_session_dirs is new (ga-kqbca): same stubbing rationale as
+# _reap_dead_scratch above — EXECUTION code (shells out to
+# orphan-session-dir-reaper.sh, which has its own independent selftest).
+# ORPHAN_REAP_CALLS proves main() invokes it alongside the other reclaim
+# levers, without ever running the real reaper (no `gc session list`, no
+# `rm -rf`, hermetic — never touches ~/.claude/projects).
+ORPHAN_REAP_CALLS=0
+_reap_orphan_session_dirs() { ORPHAN_REAP_CALLS=$((ORPHAN_REAP_CALLS+1)); }
+
 NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""
 record_notify() {
   NOTIFY_CALLS=$((NOTIFY_CALLS+1))
@@ -138,7 +148,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; GC_MAIL_CALLS=0; REAP_CALLS=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; GC_MAIL_CALLS=0; REAP_CALLS=0; ORPHAN_REAP_CALLS=0; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -218,6 +228,23 @@ reset_capture; seed_state "" ""
 queue_avail 20
 main
 [ "$REAP_CALLS" = "0" ] && ok "main(): avail above floor on first read never invokes _reap_dead_scratch" || bad "main(): expected zero reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS"
+
+echo ""
+echo "=== main(): orphan-session-dir-reap integration (ga-kqbca) ==="
+# Scenario G — mirrors Scenario E for the third reclaim lever: must be wired
+# into main()'s reclaim step alongside _safe_reclaim and _reap_dead_scratch on
+# every cycle that reaches the reclaim step at all.
+reset_capture; seed_state "" ""
+queue_avail 2 20
+main
+[ "$ORPHAN_REAP_CALLS" = "1" ] && ok "main(): _reap_orphan_session_dirs invoked exactly once alongside the other reclaim levers" || bad "main(): expected _reap_orphan_session_dirs called once, got ORPHAN_REAP_CALLS=$ORPHAN_REAP_CALLS"
+
+# Scenario H — mirrors Scenario F: a cycle that never reaches the floor must
+# never touch the new lever either.
+reset_capture; seed_state "" ""
+queue_avail 20
+main
+[ "$ORPHAN_REAP_CALLS" = "0" ] && ok "main(): avail above floor on first read never invokes _reap_orphan_session_dirs" || bad "main(): expected zero orphan-reap calls when floor never breached, got ORPHAN_REAP_CALLS=$ORPHAN_REAP_CALLS"
 
 rm -rf "$STATE_TMP"
 

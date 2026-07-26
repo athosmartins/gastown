@@ -24,7 +24,11 @@
 #                             ga-02pnu: a single dead session's 1GB scratchpad
 #                             caused a CRITICAL incident that this follow-up
 #                             fixes — dolt-cleanup alone never touched that class
-#                             of file) — then rate-limited notify. Cooldown is
+#                             of file), PLUS a third lever — reaping orphan
+#                             ~/.claude/projects/<project>/<session-id>/
+#                             directories whose .jsonl transcript is already
+#                             gone (see _reap_orphan_session_dirs, ga-kqbca) —
+#                             then rate-limited notify. Cooldown is
 #                             bypassed if avail is WORSENING since the last notify
 #                             (mirrors the exact fix ga-vs55 furo #2 added to
 #                             disk-pressure-monitor.sh's dpm_should_notify — a
@@ -55,9 +59,10 @@
 # sign-off rather than being silently bundled into a no-human-review small-lane
 # merge. Filed as a separate follow-up bead (see this commit's gate-done note).
 #
-# Kill switch: DOLT_DISK_FLOOR_GUARD_ENABLED=0 → skip BOTH reclaim actions
-# (dolt-cleanup AND the scratchpad reaper) only. Notification is NEVER gated by
-# this switch (imp07 CALL INVARIANT: alerting is the lowest-blast-radius action
+# Kill switch: DOLT_DISK_FLOOR_GUARD_ENABLED=0 → skip ALL THREE reclaim actions
+# (dolt-cleanup, the scratchpad reaper, AND the orphan session-dir reaper) only.
+# Notification is NEVER gated by this switch (imp07 CALL INVARIANT: alerting is
+# the lowest-blast-radius action
 # here and the one furo #2 just fixed for being wrongly suppressible — don't
 # reintroduce that failure mode one guard over).
 #
@@ -235,6 +240,35 @@ _reap_dead_scratch() {
   fi
 }
 
+# _reap_orphan_session_dirs — third reclaim lever, alongside _safe_reclaim and
+# _reap_dead_scratch (ga-kqbca, discovered during ga-t1ub9's implementation):
+# ~/.claude/projects/<project>/<session-id>/ directories (tool-results/ etc.)
+# survive independently of their .jsonl transcript and accumulate with nothing
+# to reap them — a single project dir had 107 such orphans at time of writing.
+# Delegates to the standalone, independently-selftested orphan-session-dir-
+# reaper.sh so its liveness/staleness safety logic is unit-tested in isolation
+# rather than inlined here (same shape as _reap_dead_scratch). Bounded by
+# timeout so a wedged `gc session list` can't hang this guard; best-effort — a
+# failure here must never block the other reclaim levers or the notify
+# decision that follows.
+_reap_orphan_session_dirs() {
+  if [ "$ENABLED" != "1" ]; then
+    log "orphan-dir-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
+    return
+  fi
+  local reaper="$CITY/scripts/orphan-session-dir-reaper.sh"
+  if [ ! -f "$reaper" ]; then
+    log "orphan-dir-reap SKIP — $reaper not found"
+    return
+  fi
+  log "orphan-dir-reap: running orphan session-dir cleanup …"
+  if timeout 60 bash "$reaper" >> "$LOG" 2>&1; then
+    log "orphan-dir-reap OK"
+  else
+    log "orphan-dir-reap FAILED or aborted (nonzero exit) — see log lines above"
+  fi
+}
+
 main() {
   local avail class now
   avail="$(_avail_gb "$DOLTDIR")"
@@ -267,6 +301,7 @@ main() {
   _read_state
   _safe_reclaim "$avail"
   _reap_dead_scratch
+  _reap_orphan_session_dirs
 
   # re-read avail — reclaim may have freed space; `class` becomes the CURRENT
   # (post-reclaim) reading, used for logging/messaging. was_critical also
