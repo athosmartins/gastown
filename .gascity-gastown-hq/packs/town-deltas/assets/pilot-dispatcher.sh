@@ -5707,7 +5707,10 @@ No human review required."
       "Would dispatch $STORY_ID [$TIER_LABEL/$LANE] (P${STORY_PRIORITY}) → $BUILDER_TARGET [DRY_RUN]" \
       2>/dev/null || true
   else
-    notify -t "✨ Pilot pegou uma história" -p 3 \
+    # ga-opyus: force digest/infra — orchestration is the Mayor's radar, not Athos's.
+    # Plain allowlist routing isn't enough: $STORY_TITLE is free text the Pilot doesn't
+    # control, and can accidentally match a push-trigger keyword (e.g. "needs-human").
+    NOTIFY_FORCE_DIGEST=1 notify -t "✨ Pilot pegou uma história" -p 3 \
       "✨ $STORY_TITLE ($STORY_ID, P${STORY_PRIORITY}, lane=$LANE → $BUILDER_TARGET)" \
       2>/dev/null || true
   fi

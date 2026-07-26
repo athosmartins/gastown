@@ -2695,7 +2695,10 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
       fi
     fi
 
-    # wa-uthi: TERMINAL SUCCESS (merged to prod) — this push is KEPT.
+    # wa-uthi: TERMINAL SUCCESS (merged to prod).
+    # ga-opyus: force digest/infra, not signal — orchestration is the Mayor's radar.
+    # $BRANCH is free text (from the bead title) and can accidentally match a
+    # push-trigger keyword (e.g. "needs-human"), so plain allowlist routing isn't enough.
     # wa-wzvg: differentiate the merge push for Pilot-origin stories. The Pilot
     # sets a durable "pilot:dispatched" label when it autonomously pulls a story
     # (see pilot-dispatcher.sh). If present, use a distinct prefix/emoji so Athos
@@ -2711,10 +2714,10 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
       fi
     fi
     if [ "$PILOT_ORIGIN" = "1" ]; then
-      notify -t "🤖 Pilot Gate PASSED" -p 2 "🤖 [Pilot] Branch $BRANCH merged to $DEFAULT_BRANCH — $TIER, ${ELAPSED_S}s (autonomous pickup)" 2>/dev/null || true
+      NOTIFY_FORCE_DIGEST=1 notify -k gate-pass -t "🤖 Pilot Gate PASSED" -p 2 "🤖 [Pilot] Branch $BRANCH merged to $DEFAULT_BRANCH — $TIER, ${ELAPSED_S}s (autonomous pickup)" 2>/dev/null || true
       log "Gate PASSED (origin=Pilot): branch=$BRANCH tier=$TIER merge_sha=$MERGE_SHA elapsed=${ELAPSED_S}s"
     else
-      notify -t "Quality Gate PASSED" -p 2 "Branch $BRANCH merged to $DEFAULT_BRANCH — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
+      NOTIFY_FORCE_DIGEST=1 notify -k gate-pass -t "Quality Gate PASSED" -p 2 "Branch $BRANCH merged to $DEFAULT_BRANCH — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
       log "Gate PASSED: branch=$BRANCH tier=$TIER merge_sha=$MERGE_SHA elapsed=${ELAPSED_S}s"
     fi
     supersede_sibling_runs "$MARKER_ID" "$BRANCH" "$BEAD_ID"
