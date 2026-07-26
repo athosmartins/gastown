@@ -31,7 +31,8 @@ for fn in janitor_decide janitor_story_decide token_bounded scan_commit_for_bead
           has_open_marker has_terminal_passed_marker branch_label_from_markers rig_gitdir \
           janitor_branch_decide normalize_bead_status branch_is_fresh \
           bead_lookup_one resolve_bead_state \
-          commit_epoch commit_evidence_stale comments_for_bead; do
+          commit_epoch commit_evidence_stale comments_for_bead \
+          sling_beads_from_show sling_signals_for_id; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by janitor"; exit 1; }
 done
 
@@ -682,6 +683,131 @@ grep -qF 'if [ "$S_SIGCOMMIT_TRUSTED" = "0" ] && [ "$S_SIGMK" = "0" ]' "$JANITOR
 grep -qF 'comments_for_bead "$RPATH" "$BID"' "$JANITOR" && ok "in_progress sweep fetches bead comments" || bad "in_progress sweep missing comments_for_bead call"
 grep -qF 'comments_for_bead "$RPATH" "$FID"' "$JANITOR" && ok "ga-hcj4 sweep fetches bead comments" || bad "ga-hcj4 sweep missing comments_for_bead call"
 grep -qF 'comments_for_bead "$RPATH" "$SID"' "$JANITOR" && ok "story sweep fetches bead comments" || bad "story sweep missing comments_for_bead call"
+# ── 11. ga-vokwv: sling-bead-name fallback (sling_beads_from_show / sling_signals_for_id) ──
+# The ga-hcj4 sweep's three signals key strictly off the stranded bead's OWN id.
+# Pilot's "fix bug X" dispatch convention creates a ROTATING sling-task WRAPPER
+# bead per (re)dispatch attempt; if a fix branch/commit is named after the
+# WRAPPER instead of the PARENT bug (the ga-0jcit incident this bead fixes),
+# the sweep never finds it — confirmed live: 5+ post-merge sweeps all logged
+# "no-merge-evidence" for a bead whose fix had already landed. This bucket
+# hardens the sweep: when FID's own id carries no evidence, it re-probes every
+# sling-task wrapper id ever dispatched for FID (via metadata + comment
+# history) with the SAME three signals before giving up.
+echo "── 11. ga-vokwv: sling-bead-name fallback ──"
+
+echo "  -- 11a. sling_beads_from_show (pure JSON, no live Dolt) --"
+# Real shape captured live off ga-vokwv itself (2026-07-26): TWO dispatch
+# attempts, each leaving a "Sling task bead: <id>" comment; metadata carries
+# only the MOST RECENT wrapper. Both must surface, deduplicated — an earlier
+# wrapper can be the one that actually shipped (ga-0jcit's real fix landed
+# under its FIRST wrapper ga-w4ah2, while later re-dispatches carried nothing).
+SHOW_MULTI='{
+  "metadata": {"pilot.dispatched_at": 1785070184, "pilot.sling_bead": "ga-803hq"},
+  "comments": [
+    {"text": "Pilot dispatched builder gastown.dog at 2026-07-26T11:42:20Z.\nSling task bead: ga-2rp0x\nBuilder doctrine: fix bug -> gate-done -> autonomous gate+delivery.", "created_at": "2026-07-26T11:42:28Z"},
+    {"text": "inflight-reclaim-guard: reclaimed - no live builder and no recent branch progress for 32min.", "created_at": "2026-07-26T12:23:47Z"},
+    {"text": "Pilot dispatched builder gastown.dog at 2026-07-26T12:49:37Z.\nSling task bead: ga-803hq\nBuilder doctrine: fix bug -> gate-done -> autonomous gate+delivery.", "created_at": "2026-07-26T12:49:47Z"}
+  ]
+}'
+GOT_SLING=$(sling_beads_from_show "$SHOW_MULTI" | sort | tr '\n' ',')
+eq "extracts both wrapper ids across dispatch history, deduplicated" "$GOT_SLING" "ga-2rp0x,ga-803hq,"
+
+# `bd show` sometimes wraps the object in a single-element array — must normalize identically.
+SHOW_MULTI_ARR="[$SHOW_MULTI]"
+GOT_SLING_ARR=$(sling_beads_from_show "$SHOW_MULTI_ARR" | sort | tr '\n' ',')
+eq "array-wrapped bd show output normalizes the same as bare object" "$GOT_SLING_ARR" "$GOT_SLING"
+
+# No metadata, no matching comments → nothing found (a never-redispatched bead).
+SHOW_NONE='{"metadata": {}, "comments": [{"text": "just a status update, no sling reference here", "created_at": "2026-07-26T00:00:00Z"}]}'
+eq "no metadata + no matching comments → empty" "$(sling_beads_from_show "$SHOW_NONE")" ""
+
+# Missing comments field entirely (bd show WITHOUT --include-comments) → metadata-only, no crash.
+SHOW_META_ONLY='{"metadata": {"pilot.sling_bead": "ga-onlyone"}}'
+eq "metadata-only (no comments key) → the one wrapper id" "$(sling_beads_from_show "$SHOW_META_ONLY")" "ga-onlyone"
+
+# Malformed comment (id char class doesn't match, e.g. non-lowercase) must NOT
+# crash the extraction of its siblings — jq's capture() no-ops on a non-match,
+# it does not raise (unlike the (?P<id>...) syntax error this regex avoids).
+SHOW_MIXED='{"metadata": {}, "comments": [{"text": "Sling task bead: NOTLOWER", "created_at": "x"}, {"text": "Sling task bead: ga-good1", "created_at": "y"}]}'
+eq "malformed sibling comment does not block a valid match" "$(sling_beads_from_show "$SHOW_MIXED")" "ga-good1"
+
+echo "  -- 11b. sling_signals_for_id (real git + synthetic marker JSON) --"
+T10="$(mktemp -d 2>/dev/null || mktemp -d -t janitor-t10)"
+trap 'rm -rf "$T10" 2>/dev/null || true; rm -rf "$T7B" 2>/dev/null || true; rm -rf "$T7" 2>/dev/null || true; rm -rf "$T" 2>/dev/null || true' EXIT
+R10="$T10/repo10"
+git init -q -b main "$R10"
+( cd "$R10" && echo base > base.txt && git add base.txt && git commit -q -m "base commit" )
+# The genuine fix, subject-scoped to the SLING WRAPPER id (the ga-0jcit shape:
+# the branch/commit names the wrapper, not the parent).
+( cd "$R10" && echo fix > fix.txt && git add fix.txt && git commit -q -m "fix(tt-wrap1): the real fix, named after the wrapper" )
+SLING_FIX_SHA=$(git -C "$R10" rev-parse --short=9 HEAD)
+# sling_signals_for_id operates on FETCHED origin/* refs (the live sweep never
+# reads local branches) — stand up remote-tracking refs without a real remote.
+git -C "$R10" update-ref refs/remotes/origin/main refs/heads/main
+
+M_OPEN_MK='[{"status":"open","labels":["gate-status:queued"]}]'
+M_PASSED_MK='[{"status":"closed","labels":["gate-status:passed"]}]'
+
+# Commit signal: the wrapper id IS the subject scope of a commit in main.
+eq "subject-scoped commit → sig_commit=1 with sha evidence" \
+   "$(sling_signals_for_id "$R10" 0 "main" "zz" "$R10" 0 "main" "tt-wrap1" "$M_EMPTY")" \
+   "1 0 0 ${SLING_FIX_SHA} -"
+
+# No evidence at all for an unrelated id.
+eq "no evidence → all-zero, no evidence strings" \
+   "$(sling_signals_for_id "$R10" 0 "main" "zz" "$R10" 0 "main" "tt-nothing" "$M_EMPTY")" \
+   "0 0 0 - -"
+
+# OPEN marker suppresses ALL signals, even though commit evidence exists for
+# this SAME id — still-active work on a candidate must never read as evidence
+# either way (mirrors has_open_marker's role in the direct FID path).
+eq "open marker on the CANDIDATE suppresses its own commit evidence" \
+   "$(sling_signals_for_id "$R10" 0 "main" "zz" "$R10" 0 "main" "tt-wrap1" "$M_OPEN_MK")" \
+   "0 0 0 - -"
+
+# Terminal passed marker alone is sufficient — no git evidence required.
+eq "terminal passed marker → sig_marker=1, no git lookup needed" \
+   "$(sling_signals_for_id "$R10" 0 "main" "zz" "$R10" 0 "main" "tt-passed-only" "$M_PASSED_MK")" \
+   "0 1 0 - -"
+
+# Branch-ancestor signal via the crew/*/<id> convention fallback, same
+# final-path-segment self-guard as the in_progress/ga-hcj4 sweeps.
+git -C "$R10" branch crew/x/tt-branchy main
+git -C "$R10" update-ref refs/remotes/origin/crew/x/tt-branchy refs/heads/crew/x/tt-branchy
+eq "branch-ancestor signal fires via crew/*/<id> convention" \
+   "$(sling_signals_for_id "$R10" 0 "main" "zz" "$R10" 0 "main" "tt-branchy" "$M_EMPTY")" \
+   "0 0 1 - crew/x/tt-branchy"
+
+# Self-guard: a branch whose FINAL segment != the candidate id must never
+# match (mirrors the in_progress/ga-hcj4 sweeps' */"$FID" guard — a
+# differently-named branch that merely CONTAINS the id string must not count).
+git -C "$R10" branch "crew/x/tt-branchy-longer" main
+git -C "$R10" update-ref refs/remotes/origin/crew/x/tt-branchy-longer refs/heads/crew/x/tt-branchy-longer
+eq "branch self-guard rejects a final-segment mismatch" \
+   "$(sling_signals_for_id "$R10" 0 "main" "zz" "$R10" 0 "main" "tt-branchy-lon" "$M_EMPTY")" \
+   "0 0 0 - -"
+
+echo "  -- 11c. drift-guard: live wiring in the ga-hcj4 sweep --"
+grep -q 'sling_beads_from_show()' "$JANITOR"  && ok "defines sling_beads_from_show"  || bad "missing sling_beads_from_show def"
+grep -q 'sling_signals_for_id()' "$JANITOR"   && ok "defines sling_signals_for_id"   || bad "missing sling_signals_for_id def"
+grep -qF 'capture("Sling task bead: (?<id>[a-z][a-z0-9-]+)")' "$JANITOR" \
+  && ok "uses the WORKING jq named-group syntax (?<id>...), not the P-form quality-gate-guard.sh uses" \
+  || bad "sling id capture regex missing or reverted to the broken (?P<id>...) form"
+grep -qF 'if [ "$F_VERDICT" = "keep" ] && [ "$F_REASON" = "no-merge-evidence" ]; then' "$JANITOR" \
+  && ok "fallback strictly gated on keep:no-merge-evidence (never overrides epic/open-marker keeps)" \
+  || bad "fallback gating condition missing or loosened"
+grep -qF '[ "$F_SLING_ID" = "$FID" ] && continue' "$JANITOR" \
+  && ok "skips self-referential sling id (rig-native beads already scanned as FID itself)" \
+  || bad "sling self-reference skip missing"
+grep -qF 'bd -C "$RPATH" show "$FID" --json --include-comments' "$JANITOR" \
+  && ok "fetches comment history (not just metadata) to resolve sling wrapper ids" \
+  || bad "--include-comments show call missing"
+grep -qF 'F_VERDICT="close"' "$JANITOR" && grep -qF 'F_REASON="sling-bead-evidence"' "$JANITOR" \
+  && ok "sling evidence flips the verdict to close with a distinguishable reason" \
+  || bad "sling-bead-evidence verdict flip missing"
+grep -qF '[ -n "$F_SLING_EVID" ] && F_EVID="$F_EVID $F_SLING_EVID"' "$JANITOR" \
+  && ok "sling evidence is surfaced in the close comment/log line" \
+  || bad "sling evidence not appended to F_EVID"
 
 echo ""
 echo "──────────────────────────────────────────"

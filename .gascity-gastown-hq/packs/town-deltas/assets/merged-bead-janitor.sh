@@ -586,6 +586,98 @@ branch_label_from_markers() {
     | awk 'NF && !seen[$0]++' || true
 }
 
+# ═════════════════════════════════════════════════════════════════════════════
+# ga-vokwv: sling-bead-name fallback for the ga-hcj4 sweep. See that sweep's
+# own header comment for the WHY; these two helpers do the WHAT.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# sling_beads_from_show <show_json> — echoes (one per line, de-duplicated) every
+# sling-task WRAPPER bead id ever dispatched for a bead: its own
+# metadata["pilot.sling_bead"] (most recent dispatch) plus every "Sling task
+# bead: <id>" comment Pilot leaves per dispatch attempt (pilot-dispatcher.sh's
+# dispatch-notice convention; same comment convention quality-gate-guard.sh's
+# GAP-2 parent-stranding sweep also reads — one convention, two consumers).
+# <show_json> is the raw output of `bd show <id> --json --include-comments`
+# (object OR single-element array; normalized internally).
+#
+# NOTE: the named capture group below uses jq/oniguruma's native
+# `(?<id>...)` syntax, NOT the `(?P<id>...)` Python-style form
+# quality-gate-guard.sh's own GAP-2 extractor uses — on this deployment's jq
+# (1.8.1) the P-form throws "Regex failure: undefined group option", silently
+# swallowed there by `2>/dev/null`, so that sweep's sling-id lookup likely
+# never actually matches. Confirmed live 2026-07-26; filed as a separate bug
+# rather than fixed here (out of scope for the ga-hcj4 sweep this bead covers).
+#
+# ALL wrapper ids are returned, not just the latest — a fix branch/commit is
+# sometimes named after an EARLIER wrapper than the one currently on record:
+# ga-0jcit's real fix landed under its FIRST wrapper (ga-w4ah2) while two later
+# re-dispatches (chasing the same already-fixed bug) carried no code at all, so
+# only trying the newest metadata value would have missed the actual evidence.
+sling_beads_from_show() {
+  printf '%s' "$1" | jq -r '
+    (if type=="array" then .[0] else . end) as $b
+    | ([$b.metadata["pilot.sling_bead"]? // empty] | map(select(. != null and . != "")))
+      + ([($b.comments // [])[] | .text // "" | select(test("Sling task bead:")) |
+          capture("Sling task bead: (?<id>[a-z][a-z0-9-]+)") | .id])
+    | unique[]
+  ' 2>/dev/null || true
+}
+
+# sling_signals_for_id <gdir> <container> <rdefault> <rprefix> <hq_gdir>
+#                       <hq_container> <hq_default> <id> <markers_json>
+# Recomputes the SAME three merge-evidence signals as the in_progress/ga-hcj4
+# sweeps (strict commit-subject-scope with HQ fallback / terminal gate-marker /
+# branch-ancestor with the final-path-segment self-guard) for an ARBITRARY bead
+# id — used to re-probe each historical sling-task wrapper id when the
+# stranded bead's OWN id carried no evidence. An id with any OPEN gate marker
+# contributes NO signal (still-active work must never be read as evidence
+# either way — has_open_marker's guard, applied per-candidate here instead of
+# gating the whole bucket).
+#
+# <markers_json> is the caller's already-fetched `markers_for_bead <id>`
+# result — this function does NOT call bd itself, so its only live dependency
+# is git, letting it be exercised against a real throwaway repo exactly like
+# scan_commit_subject_for_bead / branch_merged already are, with has_open_marker
+# / has_terminal_passed_marker's own pure-JSON tests covering the marker logic
+# it delegates to.
+# Echoes "<sig_commit> <sig_marker> <sig_branch> <commit_evid> <branch_evid>"
+# (evidence fields are '-' when absent; the sha9/branch forms used here never
+# contain whitespace, so a plain word-split `read` on the result is safe).
+sling_signals_for_id() {
+  local gdir="$1" container="$2" rdefault="$3" rprefix="$4" \
+        hq_gdir="$5" hq_container="$6" hq_default="$7" id="$8" mk="$9"
+  local s_marker=0 s_commit=0 s_branch=0 c_evid="-" b_evid="-" sha br
+  if has_open_marker "$mk"; then
+    printf '0 0 0 - -\n'; return 0
+  fi
+  has_terminal_passed_marker "$mk" && s_marker=1
+  if [ "$s_marker" = "0" ]; then
+    if sha=$(scan_commit_subject_for_bead "$gdir" "$container" "origin/$rdefault" "$id"); then
+      s_commit=1; c_evid="${sha:0:9}"
+    elif [ "${id%%-*}" != "$rprefix" ] && [ "$gdir" != "$hq_gdir" ] \
+         && sha=$(scan_commit_subject_for_bead "$hq_gdir" "$hq_container" "origin/$hq_default" "$id"); then
+      s_commit=1; c_evid="hq:${sha:0:9}"
+    fi
+  fi
+  if [ "$s_commit" = "0" ] && [ "$s_marker" = "0" ]; then
+    local -a cands=()
+    while IFS= read -r br; do [ -n "$br" ] && cands+=("$br"); done <<EOF
+$(branch_label_from_markers "$mk")
+EOF
+    while IFS= read -r br; do [ -n "$br" ] && cands+=("$br"); done <<EOF
+$(git_in "$gdir" "$container" for-each-ref --format='%(refname:short)' 'refs/remotes/origin/**' 2>/dev/null | sed 's#^origin/##' | awk -v bid="$id" -F/ '$NF==bid' || true)
+EOF
+    for br in "${cands[@]:-}"; do
+      [ -z "$br" ] && continue
+      case "$br" in */"$id") : ;; *) continue ;; esac
+      if branch_merged "$gdir" "$container" "origin/$br" "origin/$rdefault"; then
+        s_branch=1; b_evid="$br"; break
+      fi
+    done
+  fi
+  printf '%s %s %s %s %s\n' "$s_commit" "$s_marker" "$s_branch" "$c_evid" "$b_evid"
+}
+
 # convoy_dep_counts <show_json> — parse a `bd show <id> --json` blob and echo a
 # single line "<dep_count> <open_dep_count> <deps_readable>" for the convoy
 # reconciler (PURE: jq-only, no live store, so the selftest can exercise it on
@@ -950,11 +1042,48 @@ EOF
     F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE")
     F_VERDICT="${F_VERDICT_LINE%%:*}"; F_REASON="${F_VERDICT_LINE#*:}"
 
+    # ga-vokwv: sling-bead-name fallback. FID's OWN id carried no merge
+    # evidence — before keeping, check whether the fix instead named one of
+    # FID's historical sling-task WRAPPER beads (Pilot's rotating per-dispatch
+    # id; a naming slip here permanently blinded this exact sweep for
+    # ga-0jcit — see the ga-hcj4 header comment above). Gated strictly on
+    # keep:no-merge-evidence: an epic or an actively-gated FID (has_open=1)
+    # must never be overridden by this fallback, only the clean "nothing
+    # found yet" case gets a second look.
+    F_SLING_EVID=""
+    if [ "$F_VERDICT" = "keep" ] && [ "$F_REASON" = "no-merge-evidence" ]; then
+      F_SHOW=$(bd -C "$RPATH" show "$FID" --json --include-comments 2>/dev/null || echo '')
+      if [ -n "$F_SHOW" ]; then
+        while IFS= read -r F_SLING_ID; do
+          [ -z "$F_SLING_ID" ] && continue
+          [ "$F_SLING_ID" = "$FID" ] && continue   # rig-native self-reference — already scanned above
+          SL_MK=$(markers_for_bead "$F_SLING_ID")
+          SL_LINE=$(sling_signals_for_id "$RGITDIR" "$RCONTAINER" "$RDEFAULT" "$RPREFIX" \
+                                          "$HQ_GITDIR" "$HQ_CONTAINER" "$HQ_DEFAULT" "$F_SLING_ID" "$SL_MK")
+          read -r SL_COMMIT SL_MARKER SL_BRANCH SL_CEVID SL_BEVID <<EOF
+$SL_LINE
+EOF
+          if [ "$SL_COMMIT" = "1" ] || [ "$SL_MARKER" = "1" ] || [ "$SL_BRANCH" = "1" ]; then
+            F_VERDICT="close"
+            F_REASON="sling-bead-evidence"
+            F_SLING_EVID="via sling-task bead $F_SLING_ID"
+            [ "$SL_COMMIT" = "1" ] && F_SLING_EVID="$F_SLING_EVID [commit $SL_CEVID]"
+            [ "$SL_MARKER" = "1" ] && F_SLING_EVID="$F_SLING_EVID [terminal-marker]"
+            [ "$SL_BRANCH" = "1" ] && F_SLING_EVID="$F_SLING_EVID [branch origin/$SL_BEVID ⊑ origin/$RDEFAULT]"
+            break
+          fi
+        done <<EOF
+$(sling_beads_from_show "$F_SHOW")
+EOF
+      fi
+    fi
+
     if [ "$F_VERDICT" = "close" ]; then
       F_EVID="$F_REASON"
       [ -n "$F_COMMIT_EVID" ] && F_EVID="$F_EVID [$F_COMMIT_EVID]"
       [ -n "$F_BRANCH_EVID" ] && F_EVID="$F_EVID [$F_BRANCH_EVID]"
       [ "$F_SIGMARKER" = "1" ] && F_EVID="$F_EVID [terminal-marker]"
+      [ -n "$F_SLING_EVID" ] && F_EVID="$F_EVID $F_SLING_EVID"
       if [ "$DRY_RUN" = "1" ]; then
         log "WOULD-CLOSE-INFLIGHT $FID ($RNAME) — $F_EVID — \"$FTITLE\""
       else
