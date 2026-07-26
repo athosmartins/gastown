@@ -128,16 +128,34 @@ notify_athos() {
 # ═════════════════════════════════════════════════════════════════════════════
 # PURE DECISION FUNCTION — the heart of the janitor; fully unit-testable.
 # janitor_decide <is_epic> <has_open_marker> <sig_commit> <sig_marker> <sig_branch_merged>
-# Each arg is 0|1. Echoes "<verdict>:<reason>" where verdict ∈ {keep,close}.
-# Guards are evaluated FIRST (an open marker or epic always wins over signals).
+#                <sig_commit_stale>
+# Each arg is 0|1 (sig_commit_stale defaults to 0 when omitted — backward-compatible
+# with every pre-ga-2zp4h caller/test). Echoes "<verdict>:<reason>" where verdict ∈
+# {keep,close}. Guards are evaluated FIRST (an open marker or epic always wins over
+# signals).
+#
+# sig_commit_stale (ga-2zp4h, 2026-07-26): Signal A alone only proves "a conventional
+# commit scoped to this bead id landed in origin/main" — not that THIS bead's own
+# remaining work is done. wa-d3136 was a JOINT bead split into two owners' halves;
+# mila's half was delivered and gated under her OWN sibling bead (wa-eda28), but her
+# commit's subject still scoped `chore(wa-d3136): …` (the shared parent id) — so
+# Signal A matched and the janitor closed wa-d3136 while thies's half was still
+# undone. sig_commit_stale=1 means a bead comment postdates the matched commit (see
+# commit_evidence_stale) — a cheap proxy for "this bead's story continued after that
+# commit; the commit alone may not mean THIS bead is finished." It suppresses ONLY
+# signal A's ability to close ALONE — signals B (marker) and C (branch) are
+# bead-specific and authoritative, so they are UNAFFECTED and still close normally.
 # ═════════════════════════════════════════════════════════════════════════════
 janitor_decide() {
-  local is_epic="$1" has_open_marker="$2" sig_commit="$3" sig_marker="$4" sig_branch="$5"
+  local is_epic="$1" has_open_marker="$2" sig_commit="$3" sig_marker="$4" sig_branch="$5" \
+        sig_commit_stale="${6:-0}"
   if [ "$is_epic" = "1" ]; then            echo "keep:epic-parent-never-autoclosed"; return 0; fi
   if [ "$has_open_marker" = "1" ]; then    echo "keep:active-open-gate-marker"; return 0; fi
-  if [ "$sig_commit" = "1" ]; then         echo "close:commit-in-origin-main"; return 0; fi
+  if [ "$sig_commit" = "1" ] && [ "$sig_commit_stale" != "1" ]; then
+                                            echo "close:commit-in-origin-main"; return 0; fi
   if [ "$sig_marker" = "1" ]; then         echo "close:terminal-gate-marker-passed-or-superseded"; return 0; fi
   if [ "$sig_branch" = "1" ]; then         echo "close:branch-ancestor-of-origin-main"; return 0; fi
+  if [ "$sig_commit" = "1" ]; then         echo "keep:commit-evidence-superseded-by-newer-comment"; return 0; fi
   echo "keep:no-merge-evidence"
 }
 
@@ -173,15 +191,19 @@ janitor_decide() {
 #
 # janitor_story_decide <is_epic> <has_open_marker> <already_done> <in_flight>
 #                      <has_builder> <delivery_active>
-#                      <sig_commit> <sig_marker> <sig_branch>
-# Each arg is 0|1. Echoes "<verdict>:<reason>", verdict ∈ {done,keep}.
-# Guards are evaluated FIRST and in a fixed precedence — ANY active-rework or
-# not-a-merged-story condition wins over the merge signals (zero false-positive
-# is paramount: a genuinely-pending approved story must NEVER be force-done).
+#                      <sig_commit> <sig_marker> <sig_branch> <sig_commit_stale>
+# Each arg is 0|1 (sig_commit_stale defaults to 0 when omitted — backward-compatible).
+# Echoes "<verdict>:<reason>", verdict ∈ {done,keep}. Guards are evaluated FIRST and in
+# a fixed precedence — ANY active-rework or not-a-merged-story condition wins over the
+# merge signals (zero false-positive is paramount: a genuinely-pending approved story
+# must NEVER be force-done). sig_commit_stale (ga-2zp4h): same suppression as
+# janitor_decide — a bead comment postdating Signal A's matched commit means that
+# commit alone should not force story:done; signals B/C are unaffected.
 # ═════════════════════════════════════════════════════════════════════════════
 janitor_story_decide() {
   local is_epic="$1" has_open_marker="$2" already_done="$3" in_flight="$4" \
-        has_builder="$5" delivery_active="$6" sig_commit="$7" sig_marker="$8" sig_branch="$9"
+        has_builder="$5" delivery_active="$6" sig_commit="$7" sig_marker="$8" sig_branch="$9" \
+        sig_commit_stale="${10:-0}"
   # — Guards (keep) — first match wins (each returns) —
   # SECURITY (sibling-path parity, ga-v3o6i sweep): ACTIVE-WORK guards MUST precede
   # already_done. A bead can carry a stale story:done label AND be re-opened (open
@@ -195,9 +217,11 @@ janitor_story_decide() {
   if [ "$delivery_active" = "1" ]; then echo "keep:delivery-owns-it"; return 0; fi
   if [ "$already_done" = "1" ];    then echo "keep:already-story-done"; return 0; fi
   # — Merge evidence (done) — same triangulation as janitor_decide —
-  if [ "$sig_commit" = "1" ];      then echo "done:commit-in-origin-main"; return 0; fi
+  if [ "$sig_commit" = "1" ] && [ "$sig_commit_stale" != "1" ]; then
+                                   echo "done:commit-in-origin-main"; return 0; fi
   if [ "$sig_marker" = "1" ];      then echo "done:terminal-gate-marker-passed-or-superseded"; return 0; fi
   if [ "$sig_branch" = "1" ];      then echo "done:branch-ancestor-of-origin-main"; return 0; fi
+  if [ "$sig_commit" = "1" ];      then echo "keep:commit-evidence-superseded-by-newer-comment"; return 0; fi
   echo "keep:no-merge-evidence"
 }
 
@@ -429,6 +453,46 @@ EOF
   return 1
 }
 
+# commit_epoch <git_dir> <is_container> <sha> — echoes <sha>'s committer-date epoch
+# seconds (git %ct), rc1 + prints nothing if <sha> is empty/unresolvable. Live-git
+# helper; pairs with commit_evidence_stale (ga-2zp4h) to test whether a bead's own
+# activity postdates the commit Signal A matched.
+commit_epoch() {
+  local gdir="$1" container="$2" sha="$3"
+  [ -z "$sha" ] && return 1
+  git_in "$gdir" "$container" log -1 --format='%ct' "$sha" 2>/dev/null
+}
+
+# commit_evidence_stale <comments_json> <commit_epoch> — rc0 iff any comment's
+# created_at (ISO-8601 UTC, the `bd comments <id> --json` shape) is STRICTLY newer
+# than <commit_epoch>.
+#
+# WHY (ga-2zp4h, 2026-07-26): Signal A (scan_commit_subject_for_bead) only proves a
+# conventional commit SCOPED to this bead id exists in origin/main — it says nothing
+# about whether THIS bead's own remaining work is done. wa-d3136 was a JOINT bead:
+# mila's half was delivered and gated under her OWN sibling bead (wa-eda28), but her
+# commit's subject still read `chore(wa-d3136): …` (the shared PARENT id) — a
+# legitimate subject-scope match, yet the bead was reassigned to a second owner
+# (thies) via a comment a full DAY after that commit landed, and his half was never
+# built. The janitor closed it anyway. A comment newer than the matched commit is a
+# cheap, general proxy for "this bead's story continued after that commit" — it does
+# not prove the bead is unfinished, it just means Signal A's single commit should not
+# be trusted ALONE (see janitor_decide's sig_commit_stale gate).
+#
+# FAIL-OPEN (rc1, "not stale") on an empty/non-numeric commit_epoch or on any
+# comment whose created_at cannot be parsed — preserves today's Signal-A behaviour
+# rather than introducing a new way for the janitor to go silent on a genuine merge
+# because a comment read/parse hiccuped. This mirrors the file's existing best-effort
+# idiom (markers_for_bead, convoy_dep_counts, etc. all default to the pre-existing,
+# already-shipped behaviour on read failure).
+commit_evidence_stale() {
+  local comments_json="$1" commit_epoch="$2"
+  case "$commit_epoch" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$comments_json" | jq -e --argjson ts "$commit_epoch" '
+    any(.[]?; (try (.created_at // "" | fromdateiso8601) catch -1) > $ts)
+  ' >/dev/null 2>&1
+}
+
 # branch_merged <git_dir> <is_container> <branch_ref> <main_ref>
 # rc0 iff branch_ref resolves and is an ancestor of main_ref.
 branch_merged() {
@@ -486,6 +550,17 @@ markers_for_bead() {
   local id="$1" out
   out=$(bd -C "$GC_CITY" list --all --json -l type:quality-gate-marker -l "source-bead:$id" 2>/dev/null || echo '[]')
   [ -z "$out" ] && out='[]'
+  printf '%s' "$out"
+}
+
+# comments_for_bead <store_path> <bead_id> — echoes the bead's comments as a JSON
+# array (`bd comments <id> --json` shape: each entry has .created_at), or '[]' on
+# any failure. Feeds commit_evidence_stale ONLY — never itself a decision signal,
+# same live-fetch-then-pure-decide split as markers_for_bead/has_open_marker.
+comments_for_bead() {
+  local store="$1" id="$2" out
+  out=$(bd -C "$store" comments "$id" --json 2>/dev/null) || out=""
+  case "$out" in ''|null) out='[]' ;; esac
   printf '%s' "$out"
 }
 
@@ -698,20 +773,36 @@ while IFS= read -r rig; do
     # rig's store — an HQ-home ga-*/dc-* bead — the legitimate cross-store case. (HQ-store
     # beads are swept in the HQ rig iteration where RGITDIR==HQ_GITDIR, so they scan HQ as
     # their own repo; this fallback covers a foreign bead that lives in a rig store.)
-    SIG_COMMIT=0; COMMIT_EVID=""
+    SIG_COMMIT=0; COMMIT_EVID=""; SIG_COMMIT_STALE=0
     if [ "$IS_EPIC" = "0" ] && [ "$HAS_OPEN" = "0" ]; then
+      MATCH_GITDIR=""; MATCH_CONTAINER=""
       if sha=$(scan_commit_subject_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$BID"); then
         SIG_COMMIT=1; COMMIT_EVID="$RNAME origin/$RDEFAULT@${sha:0:9}"
+        MATCH_GITDIR="$RGITDIR"; MATCH_CONTAINER="$RCONTAINER"
       elif [ "${BID%%-*}" != "$RPREFIX" ] && [ "$RGITDIR" != "$HQ_GITDIR" ] \
            && sha=$(scan_commit_subject_for_bead "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$BID"); then
         SIG_COMMIT=1; COMMIT_EVID="hq origin/$HQ_DEFAULT@${sha:0:9}"
+        MATCH_GITDIR="$HQ_GITDIR"; MATCH_CONTAINER="$HQ_CONTAINER"
+      fi
+      # ga-2zp4h: a bead comment newer than the matched commit suppresses signal A
+      # ALONE (signals B/C below are unaffected) — see commit_evidence_stale /
+      # janitor_decide's sig_commit_stale gate (joint/split-bead false-close guard).
+      if [ "$SIG_COMMIT" = "1" ]; then
+        CEPOCH=$(commit_epoch "$MATCH_GITDIR" "$MATCH_CONTAINER" "$sha")
+        BCOMMENTS=$(comments_for_bead "$RPATH" "$BID")
+        commit_evidence_stale "$BCOMMENTS" "$CEPOCH" && SIG_COMMIT_STALE=1
       fi
     fi
+    # SIG_COMMIT_TRUSTED — signal A only when NOT stale (see above). Signal C below
+    # gates on this, not on raw SIG_COMMIT, so a stale signal A never blinds the
+    # sweep to an independent, genuinely-merged crew branch for this same bead.
+    SIG_COMMIT_TRUSTED=0
+    [ "$SIG_COMMIT" = "1" ] && [ "$SIG_COMMIT_STALE" != "1" ] && SIG_COMMIT_TRUSTED=1
 
     # Signal C — branch ancestor of origin/main. Branch from marker labels, else
     # the crew/*/<id> convention discovered on the remote.
     SIG_BRANCH=0; BRANCH_EVID=""
-    if [ "$IS_EPIC" = "0" ] && [ "$HAS_OPEN" = "0" ] && [ "$SIG_COMMIT" = "0" ] && [ "$SIG_MARKER" = "0" ]; then
+    if [ "$IS_EPIC" = "0" ] && [ "$HAS_OPEN" = "0" ] && [ "$SIG_COMMIT_TRUSTED" = "0" ] && [ "$SIG_MARKER" = "0" ]; then
       declare -a CANDS=()
       while IFS= read -r br; do [ -n "$br" ] && CANDS+=("$br"); done <<EOF
 $(branch_label_from_markers "$MK")
@@ -736,7 +827,7 @@ EOF
       done
     fi
 
-    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH")
+    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE")
     VERDICT="${VERDICT_LINE%%:*}"; REASON="${VERDICT_LINE#*:}"
 
     if [ "$VERDICT" = "close" ]; then
@@ -758,7 +849,12 @@ EOF
     else
       # Keep — but if kept only for "no-merge-evidence" and a SIBLING heuristic
       # suggests it rode a merged parent branch, emit an advisory (never close).
-      log "keep $BID ($RNAME) — $REASON"
+      # ga-2zp4h: when kept via the stale-comment suppression, surface the
+      # suppressed commit evidence so the log line stays auditable (which commit
+      # matched but was not trusted alone) instead of a bare reason with no evidence.
+      KEEP_MSG="keep $BID ($RNAME) — $REASON"
+      [ -n "$COMMIT_EVID" ] && KEEP_MSG="$KEEP_MSG [$COMMIT_EVID]"
+      log "$KEEP_MSG"
       if [ "$REASON" = "no-merge-evidence" ] && [ "$IS_EPIC" = "0" ]; then
         # Advisory sibling detection: a crew/*/<parent> branch that is merged and
         # whose parent != this bead, but this bead shares the rig & is open.
@@ -809,20 +905,32 @@ EOF
 
     # Signal A — same strict subject-scope commit scan + rig/HQ repo-scoping as
     # the in_progress sweep above.
-    F_SIGCOMMIT=0; F_COMMIT_EVID=""
+    F_SIGCOMMIT=0; F_COMMIT_EVID=""; F_SIGCOMMIT_STALE=0
     if [ "$F_EPIC" = "0" ] && [ "$F_HASOPEN" = "0" ]; then
+      F_MATCH_GITDIR=""; F_MATCH_CONTAINER=""
       if sha=$(scan_commit_subject_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$FID"); then
         F_SIGCOMMIT=1; F_COMMIT_EVID="$RNAME origin/$RDEFAULT@${sha:0:9}"
+        F_MATCH_GITDIR="$RGITDIR"; F_MATCH_CONTAINER="$RCONTAINER"
       elif [ "${FID%%-*}" != "$RPREFIX" ] && [ "$RGITDIR" != "$HQ_GITDIR" ] \
            && sha=$(scan_commit_subject_for_bead "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$FID"); then
         F_SIGCOMMIT=1; F_COMMIT_EVID="hq origin/$HQ_DEFAULT@${sha:0:9}"
+        F_MATCH_GITDIR="$HQ_GITDIR"; F_MATCH_CONTAINER="$HQ_CONTAINER"
+      fi
+      # ga-2zp4h: same stale-comment suppression as the in_progress sweep above
+      # (joint/split-bead false-close guard) — signal A alone, not B/C.
+      if [ "$F_SIGCOMMIT" = "1" ]; then
+        F_CEPOCH=$(commit_epoch "$F_MATCH_GITDIR" "$F_MATCH_CONTAINER" "$sha")
+        F_BCOMMENTS=$(comments_for_bead "$RPATH" "$FID")
+        commit_evidence_stale "$F_BCOMMENTS" "$F_CEPOCH" && F_SIGCOMMIT_STALE=1
       fi
     fi
+    F_SIGCOMMIT_TRUSTED=0
+    [ "$F_SIGCOMMIT" = "1" ] && [ "$F_SIGCOMMIT_STALE" != "1" ] && F_SIGCOMMIT_TRUSTED=1
 
     # Signal C — branch ancestor of origin/main, same final-path-segment self-guard
     # (must equal this bead id) as the in_progress sweep above.
     F_SIGBRANCH=0; F_BRANCH_EVID=""
-    if [ "$F_EPIC" = "0" ] && [ "$F_HASOPEN" = "0" ] && [ "$F_SIGCOMMIT" = "0" ] && [ "$F_SIGMARKER" = "0" ]; then
+    if [ "$F_EPIC" = "0" ] && [ "$F_HASOPEN" = "0" ] && [ "$F_SIGCOMMIT_TRUSTED" = "0" ] && [ "$F_SIGMARKER" = "0" ]; then
       declare -a FCANDS=()
       while IFS= read -r br; do [ -n "$br" ] && FCANDS+=("$br"); done <<EOF
 $(branch_label_from_markers "$FMK")
@@ -839,7 +947,7 @@ EOF
       done
     fi
 
-    F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH")
+    F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE")
     F_VERDICT="${F_VERDICT_LINE%%:*}"; F_REASON="${F_VERDICT_LINE#*:}"
 
     if [ "$F_VERDICT" = "close" ]; then
@@ -859,7 +967,9 @@ EOF
         INFLIGHT_CLOSED_SUMMARY+=("$FID ($RNAME): $F_EVID")
       fi
     else
-      log "keep-inflight $FID ($RNAME) — $F_REASON"
+      F_KEEP_MSG="keep-inflight $FID ($RNAME) — $F_REASON"
+      [ -n "$F_COMMIT_EVID" ] && F_KEEP_MSG="$F_KEEP_MSG [$F_COMMIT_EVID]"
+      log "$F_KEEP_MSG"
     fi
   done <<EOF
 $(printf '%s' "$INFLIGHT" | jq -rc '.[]?')
@@ -900,7 +1010,7 @@ EOF
     S_SIGMK=0;   has_terminal_passed_marker "$SMK" && S_SIGMK=1
 
     # Only pay for the git scans when no cheap guard already forces keep.
-    S_SIGCOMMIT=0; S_SIGBRANCH=0; S_COMMIT_EVID=""; S_BRANCH_EVID=""
+    S_SIGCOMMIT=0; S_SIGBRANCH=0; S_COMMIT_EVID=""; S_BRANCH_EVID=""; S_SIGCOMMIT_STALE=0
     if [ "$S_EPIC" = "0" ] && [ "$S_DONE" = "0" ] && [ "$S_OPENMK" = "0" ] \
        && [ "$S_INFLIGHT" = "0" ] && [ "$S_BUILDER" = "0" ] && [ "$S_DELIV" = "0" ]; then
       # Signal A — commit whose SUBJECT SCOPE is this story id, in the story's OWN rig repo.
@@ -910,14 +1020,26 @@ EOF
       # a RIG-NATIVE story (id prefix == rig prefix) is matched ONLY against its own rig repo;
       # the HQ fallback is kept ONLY for a FOREIGN (non-rig-native) story in this rig's store,
       # so a rig story can never be marked done by an HQ framework commit that merely names it.
+      S_MATCH_GITDIR=""; S_MATCH_CONTAINER=""
       if sha=$(scan_commit_subject_for_bead "$RGITDIR" "$RCONTAINER" "origin/$RDEFAULT" "$SID"); then
         S_SIGCOMMIT=1; S_COMMIT_EVID="$RNAME origin/$RDEFAULT@${sha:0:9}"
+        S_MATCH_GITDIR="$RGITDIR"; S_MATCH_CONTAINER="$RCONTAINER"
       elif [ "${SID%%-*}" != "$RPREFIX" ] && [ "$RGITDIR" != "$HQ_GITDIR" ] \
            && sha=$(scan_commit_subject_for_bead "$HQ_GITDIR" "$HQ_CONTAINER" "origin/$HQ_DEFAULT" "$SID"); then
         S_SIGCOMMIT=1; S_COMMIT_EVID="hq origin/$HQ_DEFAULT@${sha:0:9}"
+        S_MATCH_GITDIR="$HQ_GITDIR"; S_MATCH_CONTAINER="$HQ_CONTAINER"
       fi
+      # ga-2zp4h: same stale-comment suppression as the in_progress sweep — a story
+      # can be a joint/split bead too. Suppresses signal A alone, not B/C.
+      if [ "$S_SIGCOMMIT" = "1" ]; then
+        S_CEPOCH=$(commit_epoch "$S_MATCH_GITDIR" "$S_MATCH_CONTAINER" "$sha")
+        S_BCOMMENTS=$(comments_for_bead "$RPATH" "$SID")
+        commit_evidence_stale "$S_BCOMMENTS" "$S_CEPOCH" && S_SIGCOMMIT_STALE=1
+      fi
+      S_SIGCOMMIT_TRUSTED=0
+      [ "$S_SIGCOMMIT" = "1" ] && [ "$S_SIGCOMMIT_STALE" != "1" ] && S_SIGCOMMIT_TRUSTED=1
       # Signal C — branch ancestor of origin/main (marker branch label, else crew/*/<id>).
-      if [ "$S_SIGCOMMIT" = "0" ] && [ "$S_SIGMK" = "0" ]; then
+      if [ "$S_SIGCOMMIT_TRUSTED" = "0" ] && [ "$S_SIGMK" = "0" ]; then
         declare -a SCANDS=()
         while IFS= read -r br; do [ -n "$br" ] && SCANDS+=("$br"); done <<EOF
 $(branch_label_from_markers "$SMK")
@@ -935,7 +1057,7 @@ EOF
     fi
 
     S_VERDICT_LINE=$(janitor_story_decide "$S_EPIC" "$S_OPENMK" "$S_DONE" "$S_INFLIGHT" \
-                       "$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH")
+                       "$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE")
     S_VERDICT="${S_VERDICT_LINE%%:*}"; S_REASON="${S_VERDICT_LINE#*:}"
 
     if [ "$S_VERDICT" = "done" ]; then
@@ -972,7 +1094,9 @@ EOF
         fi
       fi
     else
-      log "keep-story $SID ($RNAME) — $S_REASON"
+      S_KEEP_MSG="keep-story $SID ($RNAME) — $S_REASON"
+      [ -n "$S_COMMIT_EVID" ] && S_KEEP_MSG="$S_KEEP_MSG [$S_COMMIT_EVID]"
+      log "$S_KEEP_MSG"
       # Orphan-close backstop: a bead that already has story:done (from a prior
       # janitor pass) but was never closed — the close step was missing until this
       # fix. The bead keeps appearing in Aprovadas because:

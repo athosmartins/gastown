@@ -62,6 +62,23 @@ parent-child cascade guessing. Until the convention is universal, the janitor
 falls back to signals (B)/(C) and, for pure no-signal siblings, **keeps** the
 bead (advisory only) rather than risk a false close.
 
+## Joint/split beads — the stale-comment guard (ga-2zp4h)
+
+Signal (A) only proves *a commit scoped to this bead id landed in `origin/main`* —
+not that *this bead's own remaining work is done*. A bead split into two owners'
+halves can still have the sibling's delivery commit scoped to the shared
+**parent** id (`wa-d3136`: mila's half was delivered and gated under her own
+split-off sibling bead `wa-eda28`, but her commit's subject still read
+`chore(wa-d3136): …`) — signal (A) fires "correctly" on the parent, yet the
+parent's own remaining half (thies's) was never built.
+
+Fix: if any bead **comment postdates** the commit signal (A) matched, signal (A)
+is suppressed **for that bead alone** — the janitor defers to signals (B)/(C),
+which are bead-specific and unaffected. This doesn't prove the bead is
+unfinished; it means a single old commit shouldn't be trusted alone once the
+bead's own story has visibly continued since (reassignment, scope narrowing, a
+follow-up comment).
+
 ## Operating
 
 ```bash

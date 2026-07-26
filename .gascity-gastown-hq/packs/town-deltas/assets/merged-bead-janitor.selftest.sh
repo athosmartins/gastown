@@ -30,7 +30,8 @@ for fn in janitor_decide janitor_story_decide token_bounded scan_commit_for_bead
           scan_commit_subject_for_bead subject_impl_scopes_bead branch_merged content_in_main \
           has_open_marker has_terminal_passed_marker branch_label_from_markers rig_gitdir \
           janitor_branch_decide normalize_bead_status branch_is_fresh \
-          bead_lookup_one resolve_bead_state; do
+          bead_lookup_one resolve_bead_state \
+          commit_epoch commit_evidence_stale comments_for_bead; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by janitor"; exit 1; }
 done
 
@@ -53,6 +54,34 @@ eq "open-marker beats branch → keep"    "$(janitor_decide 0 1 0 0 1 | cut -d: 
 eq "open-marker reason"                 "$(janitor_decide 0 1 0 0 0)" "keep:active-open-gate-marker"
 # Epic precedence over open-marker (both 'keep' but epic wins the label).
 eq "epic+open → epic reason"            "$(janitor_decide 1 1 0 0 0)" "keep:epic-parent-never-autoclosed"
+
+# ── 1a2. janitor_decide sig_commit_stale — joint/split-bead false-close guard (ga-2zp4h) ──
+# wa-d3136 shape: mila's half was delivered+gated under her OWN sibling bead (wa-eda28),
+# but her commit's subject still scoped the shared PARENT id (`chore(wa-d3136): …`) — a
+# legitimate Signal-A match, yet the bead was reassigned to a second owner the day AFTER
+# that commit landed, and his half was never built. sig_commit_stale=1 means a bead
+# comment postdates the matched commit — it suppresses signal A ALONE; signals B/C are
+# bead-specific and authoritative, so they still close normally even when stale=1.
+echo "── 1a2. janitor_decide sig_commit_stale (joint/split-bead guard, ga-2zp4h) ──"
+eq "backward-compat: 5 args, no 6th → commit still closes" \
+   "$(janitor_decide 0 0 1 0 0)" "close:commit-in-origin-main"
+eq "6th arg omitted defaults to 0 (not stale) → commit still closes" \
+   "$(janitor_decide 0 0 1 0 0 | cut -d: -f1)" "close"
+eq "stale commit alone → KEEP (the wa-d3136 false-close this fix prevents)" \
+   "$(janitor_decide 0 0 1 0 0 1)" "keep:commit-evidence-superseded-by-newer-comment"
+eq "stale commit + marker also fires → marker still closes (signal B unaffected)" \
+   "$(janitor_decide 0 0 1 1 0 1)" "close:terminal-gate-marker-passed-or-superseded"
+eq "stale commit + branch also fires → branch still closes (signal C unaffected)" \
+   "$(janitor_decide 0 0 1 0 1 1)" "close:branch-ancestor-of-origin-main"
+eq "stale=1 but no commit signal at all → falls through to no-merge-evidence" \
+   "$(janitor_decide 0 0 0 0 0 1)" "keep:no-merge-evidence"
+eq "stale=0 explicit (not just omitted) → commit still closes" \
+   "$(janitor_decide 0 0 1 0 0 0)" "close:commit-in-origin-main"
+# Guard precedence unchanged: epic/open-marker still beat a stale-flagged commit too.
+eq "epic beats stale commit → keep (epic reason, not stale reason)" \
+   "$(janitor_decide 1 0 1 0 0 1)" "keep:epic-parent-never-autoclosed"
+eq "open-marker beats stale commit → keep (open-marker reason)" \
+   "$(janitor_decide 0 1 1 0 0 1)" "keep:active-open-gate-marker"
 
 # ── 1b. janitor_story_decide — merged story:approved → story:done (ga-gosfs) ──
 # Args: <is_epic> <has_open_marker> <already_done> <in_flight> <has_builder>
@@ -89,6 +118,20 @@ eq "builder > delivery"                 "$(janitor_story_decide 0 0 0 0 1 1 0 0 
 # Signal precedence among the three (commit > marker > branch), cosmetic only.
 eq "commit beats marker+branch"         "$(janitor_story_decide 0 0 0 0 0 0 1 1 1)" "done:commit-in-origin-main"
 eq "marker beats branch"                "$(janitor_story_decide 0 0 0 0 0 0 0 1 1)" "done:terminal-gate-marker-passed-or-superseded"
+
+# ── 1b2. janitor_story_decide sig_commit_stale — same joint/split-bead guard (ga-2zp4h) ──
+# A story can be a joint/split bead too; the suppression mirrors janitor_decide exactly.
+echo "── 1b2. janitor_story_decide sig_commit_stale (joint/split-bead guard, ga-2zp4h) ──"
+eq "backward-compat: 9 args, no 10th → commit still done" \
+   "$(janitor_story_decide 0 0 0 0 0 0 1 0 0)" "done:commit-in-origin-main"
+eq "stale commit alone → KEEP (not forced to story:done)" \
+   "$(janitor_story_decide 0 0 0 0 0 0 1 0 0 1)" "keep:commit-evidence-superseded-by-newer-comment"
+eq "stale commit + marker also fires → marker still drives done (signal B unaffected)" \
+   "$(janitor_story_decide 0 0 0 0 0 0 1 1 0 1)" "done:terminal-gate-marker-passed-or-superseded"
+eq "stale commit + branch also fires → branch still drives done (signal C unaffected)" \
+   "$(janitor_story_decide 0 0 0 0 0 0 1 0 1 1)" "done:branch-ancestor-of-origin-main"
+eq "in-flight guard still beats a stale-flagged commit" \
+   "$(janitor_story_decide 0 0 0 1 0 0 1 0 0 1)" "keep:story-in-flight-active-rework"
 
 # ── 1c. janitor_branch_decide — crew-branch prune (ga-tijv5 extension) ──────
 # Args: <ahead> <content_in_main> <bead_state> <live_worktree> <is_fresh>. A branch
@@ -280,6 +323,16 @@ rc1 content_in_main "$R" 0 "main" "main"                # self-check (bref==mref
 rc1 content_in_main "$R" 0 ""     "main"                # empty bref
 rc1 content_in_main "$R" 0 "no-such-branch" "main"      # unresolvable ref
 
+# ── 3d. commit_epoch — live-git committer-date lookup (ga-2zp4h) ───────────
+# Feeds commit_evidence_stale: the sha Signal A matched must resolve to ITS OWN
+# committer-date epoch so the janitor can compare it against the bead's comments.
+echo "── 3d. commit_epoch (real git, feeds commit_evidence_stale) ──"
+WANT_EPOCH=$(git -C "$R" log -1 --format='%ct' "$MIRROR_SHA")
+eq "commit_epoch matches raw git %ct for a real sha" \
+   "$(commit_epoch "$R" 0 "$MIRROR_SHA")" "$WANT_EPOCH"
+rc1 commit_epoch "$R" 0 "0000000000000000000000000000000000000000"   # unresolvable sha
+rc1 commit_epoch "$R" 0 ""                                            # empty sha
+
 # ── 4. marker JSON helpers — synthetic fixtures ─────────────────────────────
 echo "── 4. marker helpers ──"
 M_OPEN='[{"status":"open","labels":["gate-status:queued","source-bead:wa-lstd","branch:crew/mila/wa-lstd"]}]'
@@ -299,6 +352,27 @@ rc1 has_terminal_passed_marker "$M_OPEN"
 rc1 has_terminal_passed_marker "$M_EMPTY"
 eq "branch label extracted" "$(branch_label_from_markers "$M_OPEN")" "crew/mila/wa-lstd"
 eq "no branch label → empty" "$(branch_label_from_markers "$M_PASSED")" ""
+
+# ── 4b. commit_evidence_stale — synthetic comment fixtures (ga-2zp4h) ───────
+# The real wa-d3136 shape: the false-closing commit landed 2026-07-24T22:29:53-03:00
+# (epoch 1784942993); mila's reassignment comment landed 2026-07-26T03:13:51Z (epoch
+# 1785035631) — a full day later. These are the ACTUAL production timestamps that
+# reproduced the false-close (verified live against wa-d3136 + commit cd4c6f058).
+echo "── 4b. commit_evidence_stale (comment-postdates-commit guard) ──"
+CWA='[{"created_at":"2026-07-26T03:13:51Z"}]'
+rc0 commit_evidence_stale "$CWA" 1784942993          # real wa-d3136 timestamps → STALE
+rc1 commit_evidence_stale "$CWA" 1785200000          # comment BEFORE commit epoch → not stale
+# Multiple comments: ANY one newer than the commit epoch is enough to flag stale.
+CMULTI='[{"created_at":"2026-07-20T00:00:00Z"},{"created_at":"2026-07-27T00:00:00Z"}]'
+rc0 commit_evidence_stale "$CMULTI" 1785000000
+# No comments at all (the comment_count=0 shape: `bd comments <id> --json` → []).
+rc1 commit_evidence_stale "[]" 1784942993
+# FAIL-OPEN directions (ga-2zp4h design: never invent a false "stale" from bad input —
+# preserves today's Signal-A behaviour rather than a new way to go silent on a merge).
+rc1 commit_evidence_stale "$CWA" ""                                    # empty commit_epoch
+rc1 commit_evidence_stale "$CWA" "not-a-number"                        # non-numeric commit_epoch
+rc1 commit_evidence_stale "not json" 1784942993                        # unparseable comments blob
+rc1 commit_evidence_stale '[{"created_at":"not-a-date"}]' 1784942993   # unparseable created_at
 
 # ── 5. rig_gitdir — container (.repo.git) vs self-repo selection ────────────
 echo "── 5. rig_gitdir ──"
@@ -569,6 +643,45 @@ grep -qF 'INFLIGHT_CLOSED_COUNT=$((INFLIGHT_CLOSED_COUNT+1))' "$JANITOR" \
   && ok "in-flight closes counted" || bad "in-flight close counter missing"
 grep -qF 'INFLIGHT_CLOSED_COUNT" -gt 0' "$JANITOR" && ok "in-flight closes surfaced via notify_athos" || bad "in-flight notify wiring missing"
 grep -qF 'WOULD-CLOSE-INFLIGHT' "$JANITOR" && ok "in-flight bucket honors DRY_RUN" || bad "in-flight dry-run path missing"
+
+# ── 10. Drift-guard: ga-2zp4h joint/split-bead stale-comment guard ──────────
+# wa-d3136 false-close: Signal A matched a LEGITIMATE subject-scoped commit that was
+# actually the delivery of a DIFFERENT (split-off sibling) bead (wa-eda28) — the bead
+# was reassigned to a second owner via a comment a full day AFTER that commit landed,
+# and his half was never built, yet the janitor closed the shared parent anyway. The
+# guard: a bead comment postdating the matched commit suppresses signal A ALONE. It
+# must be wired into ALL THREE call sites that use janitor_decide/janitor_story_decide
+# (in_progress, ga-hcj4 stranded-wrapper, story:approved) — missing even one leaves
+# that bucket vulnerable to the exact same false-close.
+echo "── 10. Drift-guard: ga-2zp4h joint/split-bead stale-comment guard ──"
+grep -q 'commit_epoch()' "$JANITOR" && ok "defines commit_epoch" || bad "missing commit_epoch def"
+grep -q 'commit_evidence_stale()' "$JANITOR" && ok "defines commit_evidence_stale" || bad "missing commit_evidence_stale def"
+grep -q 'comments_for_bead()' "$JANITOR" && ok "defines comments_for_bead" || bad "missing comments_for_bead def"
+grep -qF 'sig_commit_stale="${6:-0}"' "$JANITOR" \
+  && ok "janitor_decide accepts optional sig_commit_stale (backward-compatible default)" || bad "janitor_decide missing sig_commit_stale param"
+grep -qF 'sig_commit_stale="${10:-0}"' "$JANITOR" \
+  && ok "janitor_story_decide accepts optional sig_commit_stale (backward-compatible default)" || bad "janitor_story_decide missing sig_commit_stale param"
+grep -qF 'commit-evidence-superseded-by-newer-comment' "$JANITOR" \
+  && ok "stale-suppression keep reason present" || bad "stale-suppression keep reason missing"
+# All THREE call sites must thread SIG_COMMIT_STALE into janitor_decide/janitor_story_decide.
+grep -qF 'janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE"' "$JANITOR" \
+  && ok "in_progress sweep threads sig_commit_stale into janitor_decide" || bad "in_progress sweep not threading sig_commit_stale"
+grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE"' "$JANITOR" \
+  && ok "ga-hcj4 stranded-wrapper sweep threads sig_commit_stale into janitor_decide" || bad "ga-hcj4 sweep not threading sig_commit_stale"
+grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE"' "$JANITOR" \
+  && ok "story sweep threads sig_commit_stale into janitor_story_decide" || bad "story sweep not threading sig_commit_stale"
+# Signal C must gate on a TRUSTED flag (not raw SIG_COMMIT) at all three call sites, so a
+# stale signal A never blinds the sweep to an independent, genuinely-merged crew branch.
+grep -qF '[ "$SIG_COMMIT_TRUSTED" = "0" ] && [ "$SIG_MARKER" = "0" ]' "$JANITOR" \
+  && ok "in_progress signal C gates on SIG_COMMIT_TRUSTED (not raw SIG_COMMIT)" || bad "in_progress signal C not using TRUSTED gate"
+grep -qF '[ "$F_SIGCOMMIT_TRUSTED" = "0" ] && [ "$F_SIGMARKER" = "0" ]' "$JANITOR" \
+  && ok "ga-hcj4 signal C gates on F_SIGCOMMIT_TRUSTED (not raw F_SIGCOMMIT)" || bad "ga-hcj4 signal C not using TRUSTED gate"
+grep -qF 'if [ "$S_SIGCOMMIT_TRUSTED" = "0" ] && [ "$S_SIGMK" = "0" ]' "$JANITOR" \
+  && ok "story signal C gates on S_SIGCOMMIT_TRUSTED (not raw S_SIGCOMMIT)" || bad "story signal C not using TRUSTED gate"
+# comments_for_bead must be fetched at all three call sites (once per BID/FID/SID).
+grep -qF 'comments_for_bead "$RPATH" "$BID"' "$JANITOR" && ok "in_progress sweep fetches bead comments" || bad "in_progress sweep missing comments_for_bead call"
+grep -qF 'comments_for_bead "$RPATH" "$FID"' "$JANITOR" && ok "ga-hcj4 sweep fetches bead comments" || bad "ga-hcj4 sweep missing comments_for_bead call"
+grep -qF 'comments_for_bead "$RPATH" "$SID"' "$JANITOR" && ok "story sweep fetches bead comments" || bad "story sweep missing comments_for_bead call"
 
 echo ""
 echo "──────────────────────────────────────────"
