@@ -252,10 +252,18 @@ def _gc_binary_path():
 def _binary_has_async_start_fix(path):
     """Check if the gc binary at `path` contains the async-start race fix string.
 
-    The fix (4f57fbac4) added the config-drift-drain exemption message:
-      'Skipping config-drift drain for ...: gate-reviewer in async-start (fresh creating)'
-    We probe for the distinctive substring 'async-start (fresh creating)' via
-    `strings` so the check works on a compiled binary.
+    The fix (4f57fbac4, generalized by ee6999666) emits a config-drift-drain
+    exemption message containing the substring 'async-start (fresh creating'
+    for any fresh-wake ephemeral worker, e.g.:
+      "Skipping config-drift drain for '%s': ephemeral worker in async-start
+      (fresh creating, wake_mode=fresh)"
+    We deliberately do NOT include the closing paren in the probe: ee6999666
+    inserted ", wake_mode=fresh)" between "fresh creating" and the paren, so
+    the original probe (which matched through the closing paren) went stale
+    the moment that wording changed, firing ~275 false [ASYNC-START-REGRESS]
+    alerts (ga-4bai6) even though the fix was intact. Truncating before the
+    paren keeps the match anchored to the stable prefix both the old and
+    current message share.
 
     Returns:
       True  — fix is present (binary is patched)
@@ -268,7 +276,7 @@ def _binary_has_async_start_fix(path):
         r = subprocess.run(["strings", path], capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
             return None
-        return "async-start (fresh creating)" in r.stdout
+        return "async-start (fresh creating" in r.stdout
     except Exception:
         return None
 

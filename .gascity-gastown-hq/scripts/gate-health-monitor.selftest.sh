@@ -8,7 +8,8 @@
 #   _disp_log_ts(line) — timestamp parser used by CHECK B
 #
 # Scenarios:
-#   1. Binary contains fix string → _binary_has_async_start_fix → True (no alert)
+#   1. Binary contains fix string (original wording) → _binary_has_async_start_fix → True
+#  1b. Binary contains fix string (current post-ee6999666 wording, ga-4bai6) → True
 #   2. Binary lacks fix string   → _binary_has_async_start_fix → False (alert)
 #   3. Binary path is None       → _binary_has_async_start_fix → None (fail-open, no alert)
 #   4. Binary path doesn't exist → _binary_has_async_start_fix → None (fail-open, no alert)
@@ -45,6 +46,17 @@ def bad(msg):
 
 FIX_STRING = "async-start (fresh creating)"
 
+# ga-4bai6: ee6999666 generalized the config-drift-drain exemption from
+# gate-reviewer-only to all wake_mode=fresh ephemeral workers, inserting
+# ", wake_mode=fresh)" between "fresh creating" and the closing paren. The
+# probe used to match through the closing paren, so it broke the moment this
+# landed (~275 false [ASYNC-START-REGRESS] alerts before it was noticed).
+# This is the exact current-production wording — kept alongside FIX_STRING
+# (the original wording) so both shapes are covered deterministically,
+# without depending on Scenario 5's live-binary check (which no-ops if `gc`
+# isn't on PATH).
+CURRENT_FIX_STRING = "ephemeral worker in async-start (fresh creating, wake_mode=fresh)"
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def tmp_file(content):
@@ -76,6 +88,18 @@ try:
         ok("binary with fix string → True")
     else:
         bad("expected True, got %r" % res)
+finally:
+    os.unlink(p)
+
+# ── Scenario 1b: binary WITH CURRENT (post-ee6999666) fix string → True ──────
+print("Scenario 1b: binary containing CURRENT wording (ga-4bai6) → True (fix present)")
+p = tmp_file("some text\n%s\nmore text\n" % CURRENT_FIX_STRING)
+try:
+    res = m._binary_has_async_start_fix(p)
+    if res is True:
+        ok("binary with current (wake_mode=fresh) wording → True")
+    else:
+        bad("REGRESSION (ga-4bai6): expected True for current wording, got %r" % res)
 finally:
     os.unlink(p)
 
