@@ -217,6 +217,14 @@ _safe_reclaim() {
 # inlined here. Bounded by timeout so a wedged `gc session list` can't hang this
 # guard; best-effort — a failure here must never block the dolt-cleanup lever or
 # the notify decision that follows it.
+#
+# SCRATCHPAD_REAPER_PROD=1 (ga-h565g): this function IS the real, launchd-driven
+# caller scratchpad-reaper.sh's own production-sentinel guard is designed to
+# trust — the ONLY place that should ever set this opt-in. It authorizes
+# scratchpad-reaper.sh to actually delete when its resolved root equals its
+# real default; without it, a harness bug that leaves that root at the default
+# (exactly what caused the sibling transcript-reaper.sh incident) forces a
+# dry-run instead of deleting real data.
 _reap_dead_scratch() {
   if [ "$ENABLED" != "1" ]; then
     log "scratch-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
@@ -228,7 +236,7 @@ _reap_dead_scratch() {
     return
   fi
   log "scratch-reap: running dead-session scratchpad cleanup …"
-  if timeout 60 bash "$reaper" >> "$LOG" 2>&1; then
+  if SCRATCHPAD_REAPER_PROD=1 timeout 60 bash "$reaper" >> "$LOG" 2>&1; then
     log "scratch-reap OK"
   else
     log "scratch-reap FAILED or aborted (nonzero exit) — see log lines above"

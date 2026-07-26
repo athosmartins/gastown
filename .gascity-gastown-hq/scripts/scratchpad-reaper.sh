@@ -48,6 +48,16 @@
 # Kill switch: SCRATCHPAD_REAPER_ENABLED=0 -> dry-run regardless of
 # SCRATCHPAD_REAPER_DRY_RUN (logs candidates, deletes nothing).
 #
+# PRODUCTION SENTINEL (ga-h565g, follow-up to a 2026-07-26 incident where this
+# script's sibling, transcript-reaper.sh, deleted 185 real transcripts because
+# its selftest's harness bug left the resolved root at its REAL default
+# instead of a tmp fixture): whenever the resolved root exactly equals the
+# hardcoded real default AND SCRATCHPAD_REAPER_PROD!=1, main() forces a
+# dry-run regardless of SCRATCHPAD_REAPER_DRY_RUN — the same harness mistake
+# (forgetting to override the root) can never delete real data again unless
+# the caller ALSO explicitly opts in. Set ONLY by the real caller
+# (dolt-disk-floor-guard.sh's _reap_dead_scratch) — never by a test.
+#
 # TEST (no real /private/tmp data touched, no deletions, hermetic fixtures):
 #   bash scripts/scratchpad-reaper.selftest.sh
 # Library mode: `SCRATCHPAD_REAPER_LIB=1 source scratchpad-reaper.sh` defines
@@ -55,13 +65,15 @@
 set -uo pipefail
 
 CITY="/Users/athos/gt/.gascity-gastown-hq"
-SCRATCH_ROOT="${SCRATCHPAD_REAPER_ROOT:-/private/tmp/claude-$(id -u)}"
+SCRATCH_REAL_DEFAULT_ROOT="/private/tmp/claude-$(id -u)"
+SCRATCH_ROOT="${SCRATCHPAD_REAPER_ROOT:-$SCRATCH_REAL_DEFAULT_ROOT}"
 LOG="${SCRATCHPAD_REAPER_LOG:-$CITY/.gc/logs/scratchpad-reaper.log}"
 GC="${GC_BIN:-gc}"
 ENABLED="${SCRATCHPAD_REAPER_ENABLED:-1}"
 DRY_RUN="${SCRATCHPAD_REAPER_DRY_RUN:-0}"
 MIN_AGE_HOURS="${SCRATCHPAD_REAPER_MIN_AGE_HOURS:-24}"
 SELF_SESSION_ID="${CLAUDE_CODE_SESSION_ID:-}"
+PROD="${SCRATCHPAD_REAPER_PROD:-0}"
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
@@ -107,6 +119,17 @@ _should_reap() {
   _is_stale "$mtime" "$now" "$min_hours"
 }
 
+# _prod_sentinel_active <resolved_root> <real_default_root> <prod_flag> → 0
+# (true) iff resolved_root exactly equals real_default_root AND prod_flag is
+# not "1". This is the ga-h565g guard: a caller (test or otherwise) that
+# fails to override the root — leaving it at its real-default value — must
+# never be able to trigger deletion just because it ALSO forgot to opt in;
+# both conditions are required to authorize touching the real default root.
+_prod_sentinel_active() {
+  local root="$1" real_default="$2" prod="$3"
+  [ "$root" = "$real_default" ] && [ "$prod" != "1" ]
+}
+
 # ════════════════════════════════════════════════════════════════════════════
 # EXECUTION (side-effecting; NOT exercised by the selftest)
 # ════════════════════════════════════════════════════════════════════════════
@@ -138,6 +161,11 @@ main() {
   if [ ! -d "$SCRATCH_ROOT" ]; then
     log "SCRATCH_ROOT $SCRATCH_ROOT does not exist — nothing to do"
     return 0
+  fi
+
+  if _prod_sentinel_active "$SCRATCH_ROOT" "$SCRATCH_REAL_DEFAULT_ROOT" "$PROD"; then
+    log "SENTINEL: resolved root ($SCRATCH_ROOT) equals the real default and no production opt-in is set (SCRATCHPAD_REAPER_PROD=1) — forcing dry-run this cycle (ga-h565g production sentinel)"
+    DRY_RUN=1
   fi
 
   local keyfile now reaped=0 freed_kb=0 candidates=0

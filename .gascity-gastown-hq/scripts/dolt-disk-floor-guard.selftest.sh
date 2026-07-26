@@ -68,6 +68,37 @@ _should_notify 1000 4601 3600 8 8  && ok "should_notify: cooldown elapsed, stabl
 _should_notify "" 1100 3600 8 ""   && ok "should_notify: never notified before → notify (fail-open)"               || bad "should_notify: first-ever call should notify"
 
 echo ""
+echo "=== _reap_dead_scratch: production sentinel wiring (ga-h565g) ==="
+# _reap_dead_scratch is the REAL caller scratchpad-reaper.sh's own header
+# names as the one allowed to set SCRATCHPAD_REAPER_PROD=1 (ga-h565g) — this
+# proves it actually does, BEFORE _reap_dead_scratch gets stubbed out below
+# for the main() scenarios. Hermetic: CITY is a plain global (not readonly),
+# reassigned here to a disposable tmp dir containing a FAKE
+# scratchpad-reaper.sh that only records what env it received — never touches
+# the real scratchpad-reaper.sh, no real `gc session list`, no real deletion.
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/scratchpad-reaper.sh" <<EOF
+#!/bin/bash
+echo "PROD=\${SCRATCHPAD_REAPER_PROD:-unset}" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/scratchpad-reaper.sh"
+
+REAL_CITY="$CITY"
+CITY="$FAKE_CITY"
+_reap_dead_scratch
+CITY="$REAL_CITY"
+
+if [ -f "$CAPTURE_FILE" ] && grep -qx "PROD=1" "$CAPTURE_FILE"; then
+  ok "_reap_dead_scratch: sets SCRATCHPAD_REAPER_PROD=1 when invoking the real reaper (production opt-in wired)"
+else
+  bad "_reap_dead_scratch: did NOT set SCRATCHPAD_REAPER_PROD=1 — real launchd path would silently dry-run forever (got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing'))"
+fi
+rm -rf "$FAKE_CITY"
+
+echo ""
 echo "=== main(): CRITICAL-latch across reclaim reclassification (gate-fix-1: GATE-FEEDBACK gate_run=ga-wisp-9b4hnh) ==="
 # The pure-function tests above prove _should_notify is correct in ISOLATION.
 # They do NOT exercise main() itself, which is where the actual bug lived:
