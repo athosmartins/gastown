@@ -874,7 +874,7 @@ EOF
 # never permanently wedge a legitimately-solo branch.
 gate_bead_active_sibling_branch() {
   local gc_city="$1" bead_id="$2" this_branch="$3"
-  local siblings_json count i sib labels desc branch status lines
+  local siblings_json count i sib marker_status labels desc branch status lines
   if [ -z "$bead_id" ] || [ -z "$this_branch" ]; then
     printf ''
     return 0
@@ -890,6 +890,13 @@ gate_bead_active_sibling_branch() {
   lines=""
   for i in $(seq 0 $((count - 1))); do
     sib=$(printf '%s' "$siblings_json" | jq ".[$i]" 2>/dev/null) || continue
+    # A closed marker keeps its residual gate-status:* label forever (nothing
+    # strips it on close) — that label alone would misread a discarded/
+    # superseded submission as a live concurrent one (ga-4wncs). Skip on
+    # lifecycle .status, not the label. Fail-open on jq error (marker_status
+    # empty, not "closed") so a transient hiccup never hides a real sibling.
+    marker_status=$(printf '%s' "$sib" | jq -r '.status // ""' 2>/dev/null || echo "")
+    [ "$marker_status" = "closed" ] && continue
     labels=$(printf '%s' "$sib" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
     branch=$(printf '%s\n' "$labels" | tr ' ' '\n' | sed -n 's/^branch:\(.*\)$/\1/p' | head -1)
     if [ -z "$branch" ]; then

@@ -132,6 +132,21 @@ MOCK_LIST_JSON='[{"id":"m1","labels":["gate-status:superseded","source-bead:wa-f
 eq "(g) sibling exists but terminal (superseded) → '' (sequential reland is legitimate)" \
   "$(gate_bead_active_sibling_branch city 'wa-fnibd' 'crew/wa-worker/wa-fnibd-reland')" ""
 
+# ga-4wncs: a CLOSED marker whose gate-status LABEL was never stripped and
+# still reads "queued" (active-looking) — nothing rewrites the label on
+# close, so this residual state is routine, not exotic. A closed marker is
+# never a live concurrent submission, no matter what its label says.
+MOCK_LIST_JSON='[{"id":"m1","status":"closed","labels":["gate-status:queued","source-bead:wa-fnibd","branch:crew/oracle/wa-fnibd"],"description":""}]'
+eq "(g2) ga-4wncs: closed marker with residual ACTIVE gate-status label → '' (not a live sibling)" \
+  "$(gate_bead_active_sibling_branch city 'wa-fnibd' 'crew/wa-worker/wa-fnibd')" ""
+
+# Same active-looking label, but the marker is genuinely still open — the
+# ga-lxz5w protection must survive: a real concurrent sibling is still flagged.
+MOCK_LIST_JSON='[{"id":"m1","status":"open","labels":["gate-status:queued","source-bead:wa-fnibd","branch:crew/oracle/wa-fnibd"],"description":""}]'
+eq "(g3) ga-4wncs: OPEN marker with active gate-status label → still flagged (ga-lxz5w protection intact)" \
+  "$(gate_bead_active_sibling_branch city 'wa-fnibd' 'crew/wa-worker/wa-fnibd')" \
+  "$(printf 'crew/oracle/wa-fnibd\tqueued')"
+
 MOCK_LIST_JSON='[]'
 MOCK_LIST_FAIL=1
 eq "(h) bd list fails (transient) → '' (fail-open)" \
