@@ -1031,7 +1031,7 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
     SLING_ID=$(echo "$SC_SHOW" | jq -r '
       .comments // [] | sort_by(.created_at) | reverse |
       .[] | .text // "" | select(test("Sling task bead:")) |
-      capture("Sling task bead: (?P<id>[a-z][a-z0-9-]+)") | .id
+      capture("Sling task bead: (?<id>[a-z][a-z0-9-]+)") | .id
     ' 2>/dev/null | head -1 || echo "")
 
     SLING_FOUND=0
