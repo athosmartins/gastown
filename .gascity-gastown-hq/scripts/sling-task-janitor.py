@@ -62,6 +62,11 @@ MIN_AGE_MIN = int(os.environ.get("SLING_MIN_AGE_MIN", "60"))
 SLING_RE = re.compile(r"\b(?:build story|fix bug|build|fix|implement)\s+([a-z]{2,3}-[a-z0-9]+)", re.I)
 # A bead carrying any of these is TRACKED work, not an inert orphan stub — never touch.
 _ACTIVE_LABELS = {"story:in-flight", "story:approved", "story:done", "story:needs-approval"}
+# ga-0jcit: a stub the assignee explicitly refused (`pool:refused:<reason>`, per the dog
+# refuse protocol) is a terminal decision, not active work — even though dog-pool sessions
+# are long-lived and stay "live" indefinitely after refusing. Prefix match (labels carry a
+# reason suffix, e.g. pool:refused:needs-human-investigation).
+_POOL_REFUSED_PREFIX = "pool:refused:"
 
 # Molecule target-status orphan detection. Sentinel for "bd confirmed no such bead exists"
 # (distinct from None/absent, which means the lookup was inconclusive — always KEEP on that).
@@ -306,6 +311,12 @@ def _is_sling(bead):
     return m.group(1) if m else None
 
 
+def _is_refused(labels):
+    """True if any label on the stub itself carries the pool:refused: prefix — an explicit,
+    terminal refuse by its assignee (see _POOL_REFUSED_PREFIX)."""
+    return any(str(l).startswith(_POOL_REFUSED_PREFIX) for l in labels)
+
+
 def _is_orphan_molecule(bead):
     """Return the gc.var.issue target id if this is a target-tracking molecule (e.g.
     mol-do-work), else None. Molecules without this metadata key (e.g. wisp-tracking
@@ -332,13 +343,18 @@ def _should_close(bead, parent_inflight_ids, live, now, gated=frozenset()):
     if bid in gated or parent in gated:
         return False, "fix is IN FLIGHT at the gate (open marker refs %s) — tracked work" % (bid if bid in gated else parent)
     asg = bead.get("assignee") or ""
-    if asg and asg in live:
+    refused = _is_refused(labels)
+    if asg and asg in live and not refused:
         return False, "stub assignee '%s' is a LIVE session (active build)" % asg
     if parent in parent_inflight_ids:
         return False, "parent %s is story:in-flight (active build)" % parent
     age = _age_min(bead, now)
     if age < MIN_AGE_MIN:
         return False, "too fresh (age=%.0fmin < %d) — never race a just-minted dispatch" % (age, MIN_AGE_MIN)
+    if refused and asg and asg in live:
+        return True, ("orphan: stub explicitly refused (pool:refused:*) — assignee '%s' is still "
+                       "live, but dog-pool sessions are long-lived and the refuse is a terminal "
+                       "decision, age=%.0fmin" % (asg, age))
     return True, ("orphan: parent %s NOT in active build, no live assignee, age=%.0fmin" % (parent, age))
 
 
@@ -454,10 +470,17 @@ def run_cycle(now):
                 if not do_close:
                     _log("  KEEP %s/%s: %s" % (os.path.basename(store), bid, why))
                     continue
-                reason = ("Orphan sling-task cleanup (sling-task-janitor): ctx:thin dispatch stub for "
-                          "'%s' whose parent is NOT in active build and which has no live assignee. "
-                          "Stale orphan polluting Triagem — closed. The parent's own state drives any "
-                          "future dispatch; this stub is not needed." % parent)
+                if _is_refused(set(b.get("labels") or [])):
+                    reason = ("Orphan sling-task cleanup (sling-task-janitor, ga-0jcit): stub for "
+                              "'%s' carries an explicit pool:refused:* label — a terminal decision "
+                              "by its assignee. Dog-pool sessions are long-lived, so the assignee "
+                              "remaining live is not evidence this stub is still active work. "
+                              "Closed; the parent's own state drives any future dispatch." % parent)
+                else:
+                    reason = ("Orphan sling-task cleanup (sling-task-janitor): ctx:thin dispatch stub for "
+                              "'%s' whose parent is NOT in active build and which has no live assignee. "
+                              "Stale orphan polluting Triagem — closed. The parent's own state drives any "
+                              "future dispatch; this stub is not needed." % parent)
                 closed, hit_cap = _try_close(store, bid, why, reason, closed)
                 if hit_cap:
                     return closed
@@ -527,6 +550,25 @@ def _selftest():
     print("Scenario C: stub has a LIVE assignee → KEEP")
     c, why = _should_close(mk("t3", "build story ga-x", assignee="wa-worker-adhoc-LIVE"), set(), {"wa-worker-adhoc-LIVE"}, NOW)
     _bad("C: wrongly closed a live-assignee stub", why) if c else _ok("C: keeps live-assignee stub")
+
+    print("Scenario C2: pool:refused:* stub with a LIVE assignee → CLOSE (ga-0jcit: refuse is a "
+          "terminal decision; dog-pool sessions are long-lived, so liveness alone must not override "
+          "an explicit refuse)")
+    c, why = _should_close(mk("t3b", "fix bug ga-y", labels=["pool:refused:needs-human-investigation"],
+                              assignee="dog-galnfou"), set(), {"dog-galnfou"}, NOW)
+    _ok("C2: closes a refused stub even though its assignee is still live") if c else _bad("C2: did not close refused stub", why)
+
+    print("Scenario C3: pool:refused:* stub but parent IS story:in-flight → still KEEP (refuse "
+          "does not override an active parent build)")
+    c, why = _should_close(mk("t3c", "fix bug ga-z", labels=["pool:refused:needs-human-investigation"],
+                              assignee="dog-galnfou"), {"ga-z"}, {"dog-galnfou"}, NOW)
+    _bad("C3: wrongly closed while parent is in-flight", why) if c else _ok("C3: keeps refused stub whose parent is actively being built elsewhere")
+
+    print("Scenario C4: pool:refused:* stub but too fresh → still KEEP (refuse does not override "
+          "the anti-race age guard)")
+    c, why = _should_close(mk("t3d", "fix bug ga-w", labels=["pool:refused:needs-human-investigation"],
+                              assignee="dog-galnfou", updated=FRESH), set(), {"dog-galnfou"}, NOW)
+    _bad("C4: wrongly closed a fresh refused stub", why) if c else _ok("C4: keeps fresh refused stub (age guard still applies)")
 
     print("Scenario D: too-fresh stub → KEEP (never race a just-minted dispatch)")
     c, why = _should_close(mk("t4", "build story ga-fresh", updated=FRESH), set(), set(), NOW)
