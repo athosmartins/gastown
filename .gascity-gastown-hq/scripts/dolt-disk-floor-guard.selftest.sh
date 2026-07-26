@@ -118,6 +118,13 @@ _safe_reclaim() { :; }
 REAP_CALLS=0
 _reap_dead_scratch() { REAP_CALLS=$((REAP_CALLS+1)); }
 
+# _reap_dead_transcripts is new (ga-t1ub9), same reasoning: EXECUTION code
+# (shells out to transcript-reaper.sh, which has its own independent unit +
+# integration selftest) stubbed as a no-op here so main()'s WIRING is what
+# gets proven, not the real reaper's file-deletion logic.
+REAP_TRANSCRIPT_CALLS=0
+_reap_dead_transcripts() { REAP_TRANSCRIPT_CALLS=$((REAP_TRANSCRIPT_CALLS+1)); }
+
 NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""
 record_notify() {
   NOTIFY_CALLS=$((NOTIFY_CALLS+1))
@@ -138,7 +145,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; GC_MAIL_CALLS=0; REAP_CALLS=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; GC_MAIL_CALLS=0; REAP_CALLS=0; REAP_TRANSCRIPT_CALLS=0; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -199,8 +206,8 @@ else
 fi
 
 echo ""
-echo "=== main(): scratchpad-reap integration (ga-02pnu) ==="
-# Scenario E — the new reclaim lever must actually be wired into main()'s
+echo "=== main(): scratchpad + transcript reap integration (ga-02pnu, ga-t1ub9) ==="
+# Scenario E — BOTH new reclaim levers must actually be wired into main()'s
 # reclaim step (called alongside _safe_reclaim, before the post-reclaim avail
 # re-read) on EVERY cycle that reaches the reclaim step at all — regardless of
 # whether the outcome ends up CRITICAL, WARN-notify, or WARN-suppressed. Reuses
@@ -208,16 +215,24 @@ echo "=== main(): scratchpad-reap integration (ga-02pnu) ==="
 reset_capture; seed_state "" ""
 queue_avail 2 20
 main
-[ "$REAP_CALLS" = "1" ] && ok "main(): _reap_dead_scratch invoked exactly once alongside _safe_reclaim" || bad "main(): expected _reap_dead_scratch called once, got REAP_CALLS=$REAP_CALLS"
+if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ]; then
+  ok "main(): _reap_dead_scratch AND _reap_dead_transcripts each invoked exactly once alongside _safe_reclaim"
+else
+  bad "main(): expected both reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS"
+fi
 
 # Scenario F — a cycle that never reaches the floor at all (avail comfortably
 # above warn on the FIRST read) must take the top early-return and never touch
-# either reclaim lever — proves the reap call didn't get hoisted above the
-# floor check.
+# ANY reclaim lever — proves neither reap call got hoisted above the floor
+# check.
 reset_capture; seed_state "" ""
 queue_avail 20
 main
-[ "$REAP_CALLS" = "0" ] && ok "main(): avail above floor on first read never invokes _reap_dead_scratch" || bad "main(): expected zero reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS"
+if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ]; then
+  ok "main(): avail above floor on first read never invokes either dead-session reaper"
+else
+  bad "main(): expected zero reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS"
+fi
 
 rm -rf "$STATE_TMP"
 
