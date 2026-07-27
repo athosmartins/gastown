@@ -50,6 +50,21 @@ r=$(reconcile_zero_verdict_run_action 30 15 claimed);     [ "$r" = "supersede:re
 r=$(reconcile_zero_verdict_run_action 30 15 '');          [ "$r" = "skip" ] && ok "aged+empty-status → skip (fail-safe, never guess)" || bad "empty status got '$r'"
 r=$(reconcile_zero_verdict_run_action 30 15 reviewing);   [ "$r" = "skip" ] && ok "aged+unrecognized-status → skip (fail-safe)" || bad "unrecognized status got '$r'"
 
+# ── classify_parent_gap2 <dispatched> <live_assignee> <sling_found> <sling_needs_fix> <sling_closed> ─
+echo "classify_parent_gap2: dispatch/assignee/sling routing"
+r=$(classify_parent_gap2 1 0 1 1 0); [ "$r" = "free:fail-stranded" ] && ok "sling gate-failed → free:fail-stranded" || bad "sling-failed got '$r'"
+r=$(classify_parent_gap2 1 0 1 0 1); [ "$r" = "free:pass-stranded" ] && ok "sling gate-passed+closed → free:pass-stranded" || bad "sling-passed got '$r'"
+r=$(classify_parent_gap2 0 0 1 0 1); [ "$r" = "skip:not-dispatched" ] && ok "not pilot:dispatched → skip:not-dispatched" || bad "not-dispatched got '$r'"
+r=$(classify_parent_gap2 1 1 1 0 1); [ "$r" = "skip:live-assignee" ] && ok "live assignee → skip:live-assignee (never race a live builder)" || bad "live-assignee got '$r'"
+r=$(classify_parent_gap2 1 0 0 0 0); [ "$r" = "skip:no-sling" ] && ok "no 'Sling task bead' comment found → skip:no-sling" || bad "no-sling got '$r'"
+r=$(classify_parent_gap2 1 0 1 0 0); [ "$r" = "skip:active-sling" ] && ok "sling still open/active → skip:active-sling" || bad "active-sling got '$r'"
+
+# ── classify_gap2_bugtask_verdict <merge_verified> — ga-6ync4: sling-passed ≠ parent-fix-merged ─
+echo "classify_gap2_bugtask_verdict: a passed+closed sling must NOT alone close the parent"
+r=$(classify_gap2_bugtask_verdict 1); [ "$r" = "close:merge-verified" ] && ok "merged (branch/content evidence found) → close:merge-verified" || bad "merged got '$r'"
+r=$(classify_gap2_bugtask_verdict 0); [ "$r" = "keep:merge-not-verified" ] && ok "NOT merged (sling passed but parent's own fix absent from origin/main) → keep:merge-not-verified (regression guard for ga-h565g-class false-close)" || bad "not-merged got '$r'"
+r=$(classify_gap2_bugtask_verdict ''); [ "$r" = "keep:merge-not-verified" ] && ok "empty/anomalous input → keep:merge-not-verified (fail-safe, never guess merged)" || bad "empty input got '$r'"
+
 echo ""
 echo "Results: $P passed, $F failed"
 [ "$F" -eq 0 ] && { echo "SELFTEST PASS"; exit 0; } || { echo "SELFTEST FAIL"; exit 1; }
