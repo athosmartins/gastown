@@ -40,6 +40,97 @@ RUNBOOK_FILE="$GC_CITY/packs/town-deltas/assets/delivery-runbooks.toml"
 DRY_RUN="${DRY_RUN:-0}"
 FORCE_STORY_ID="${STORY_ID:-}"  # If set, process only this story
 
+# ═════════════════════════════════════════════════════════════════════════════
+# ga-266z8: merge-verification helpers for the Step 1b task/bug reconciler below.
+# NEVER trust a gate:passed LABEL alone before closing a bead — see Step 1b for
+# the full rationale (confirmed false-closes: ga-opyus, ga-t1ub9). These mirror
+# merged-bead-janitor.sh's already-audited git helpers verbatim (one proven
+# implementation of "verify by content, not label", not a second one to drift).
+# ═════════════════════════════════════════════════════════════════════════════
+
+# rig_gitdir <rig_path> — echoes "<git_dir_path>\t<is_container 0|1>".
+# Container rigs keep a bare .repo.git (preferred when present); self-repo rigs
+# use their working tree .git.
+rig_gitdir() {
+  local rig_path="$1"
+  if [ -d "$rig_path/.repo.git" ]; then
+    printf '%s\t1\n' "$rig_path/.repo.git"
+  else
+    printf '%s\t0\n' "$rig_path"
+  fi
+}
+
+# git_in <git_dir> <is_container> <git-args...> — run git against a rig repo.
+git_in() {
+  local gdir="$1" container="$2"; shift 2
+  if [ "$container" = "1" ]; then
+    git --git-dir="$gdir" "$@"
+  else
+    git -C "$gdir" "$@"
+  fi
+}
+
+# token_bounded <bead_id> <text> — rc0 iff text contains bead_id as a whole
+# token (not a substring of a longer id).
+token_bounded() {
+  printf '%s' "$2" | grep -Eq "(^|[^[:alnum:]-])$1([^[:alnum:]-]|\$)"
+}
+
+# subject_impl_scopes_bead <subject_line> <bead_id> — rc0 iff <bead_id> is the
+# IMPLEMENTING conventional-commit SCOPE of <subject> (fix(<id>):, feat(area/<id>):,
+# a bare "<id>:" lead, etc.) rather than a trailing "(context/<id>)" mention.
+subject_impl_scopes_bead() {
+  local subj="$1" id="$2" header
+  case "$subj" in *:*) : ;; *) return 1 ;; esac
+  header="${subj%%:*}"
+  case "$header" in [Rr]evert*) return 1 ;; esac
+  token_bounded "$id" "$header"
+}
+
+# scan_commit_subject_for_bead <git_dir> <is_container> <ref> <bead_id>
+# rc0 + prints the first matching sha iff an ancestor commit of <ref> references
+# the bead id as an implementing conventional-commit scope in its SUBJECT line —
+# i.e. this bead's fix genuinely landed in <ref>'s history. Content check, not a
+# branch-name guess (the reconciler has no branch name for a task bead to test).
+scan_commit_subject_for_bead() {
+  local gdir="$1" container="$2" ref="$3" id="$4"
+  git_in "$gdir" "$container" rev-parse -q --verify "$ref" >/dev/null 2>&1 || return 1
+  local shas sha subj
+  shas=$(git_in "$gdir" "$container" log "$ref" -F --grep="$id" --format='%H' 2>/dev/null || true)
+  [ -z "$shas" ] && return 1
+  while IFS= read -r sha; do
+    [ -z "$sha" ] && continue
+    subj=$(git_in "$gdir" "$container" log -1 --format='%s' "$sha" 2>/dev/null || true)
+    if subject_impl_scopes_bead "$subj" "$id"; then printf '%s' "$sha"; return 0; fi
+  done <<EOF
+$shas
+EOF
+  return 1
+}
+
+# task_reconciler_verdict <is_contradicted> <is_merge_verified> — pure decision:
+# echoes "close:<reason>" iff gate:passed may be trusted, "keep:<reason>"
+# otherwise. A contradicting gate:failed/gate:needs-fix label always wins
+# (gate:passed is then stale/propagated, not evidence); absent that, the bead
+# must show independent content proof before the sweep may close it.
+task_reconciler_verdict() {
+  local is_contradicted="$1" is_merge_verified="$2"
+  if [ "$is_contradicted" = "1" ]; then
+    echo "keep:contradicted-by-gate-failed-or-needs-fix"
+    return 0
+  fi
+  if [ "$is_merge_verified" = "1" ]; then
+    echo "close:commit-in-origin-main"
+    return 0
+  fi
+  echo "keep:merge-not-verified"
+}
+
+# Lib-only mode: `STORY_DELIVERY_LIB_ONLY=1 source story-delivery.sh` defines the
+# helpers above without running the live sweep, so the selftest exercises the
+# real functions (one source of truth, no copy-drift). Mirrors merged-bead-janitor.sh.
+[ "${STORY_DELIVERY_LIB_ONLY:-0}" = "1" ] && return 0 2>/dev/null
+
 mkdir -p "$LOG_DIR"
 exec >> "$LOG" 2>&1
 
@@ -176,8 +267,12 @@ reconcile_untracked_for_ffpull() {
 # dc-/gastown rigs are found by the delivery scan — not just HQ (gascity store).
 # Fail-open: if gc rig list fails, fall back to HQ only so HQ stories are never
 # blocked by a failing rig-list call.
-ALL_STORES=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
-  | jq -r '.rigs[].path' 2>/dev/null || echo "")
+# ga-266z8: cache the full rig-list JSON (not just paths) — the task reconciler
+# below needs each rig's default_branch to verify merges by content, and a
+# second live `gc rig list` call per candidate would be wasteful and hit Dolt
+# again for no reason.
+RIG_LIST_JSON=$(gc --city "$GC_CITY" rig list --json 2>/dev/null || echo "")
+ALL_STORES=$(echo "$RIG_LIST_JSON" | jq -r '.rigs[].path' 2>/dev/null || echo "")
 [ -z "$ALL_STORES" ] && ALL_STORES="$GC_CITY"
 log "Stores to scan: $(echo "$ALL_STORES" | tr '\n' ' ')"
 
@@ -254,51 +349,112 @@ if [ -z "$FORCE_STORY_ID" ]; then
   TASK_COUNT=$(echo "$TASK_BEADS_JSON" | jq 'length' 2>/dev/null || echo "0")
 
   if [ "$TASK_COUNT" -gt 0 ]; then
-    TASK_BEAD=$(echo "$TASK_BEADS_JSON" | jq '.[0]')
-    TASK_BEAD_ID=$(echo "$TASK_BEAD" | jq -r '.id')
-    TASK_BEAD_TITLE=$(echo "$TASK_BEAD" | jq -r '.title // "untitled"' | head -c 80)
-    TASK_STORE=$(echo "$TASK_BEAD" | jq -r '._store // ""')
-    [ -z "$TASK_STORE" ] && TASK_STORE="$GC_CITY"
-    # ga-iwv0 (done==deployed, not merged): a gate:passed bead that ALSO carries
-    # delivery:deploy-pending went THROUGH delivery and the DEPLOY did not complete (a hot-path
-    # daemon needs a guarded restart / did not come up fresh → merged code is NOT live). It is a
-    # deploy-PENDING story, NOT a no-deploy artifact task — closing it here would mark "done"
-    # while the code is dormant in prod (the exact gap that closed wa-t4olb before its daemon was
-    # restarted). Do NOT close: re-arm story:approved so Step 1 re-picks it and runs delivery to
-    # REAL completion (story:done only after daemon-refresh verifies live). NOTE: we key on the
-    # specific delivery:deploy-pending label, NOT generic delivery:failed — a prod-test
-    # delivery:failed must NOT auto-retry here (a flaky test would loop forever); that path stays
-    # author-driven.
-    TASK_DEPLOY_PENDING=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | contains(["delivery:deploy-pending"])) then "1" else "0" end' 2>/dev/null || echo "0")
-    if [ "$TASK_DEPLOY_PENDING" = "1" ]; then
-      log "Task reconciler: $TASK_BEAD_ID has delivery:deploy-pending (deploy NOT live) — NOT closing; re-arming story:approved for delivery retry (ga-iwv0: done must mean deployed, not merged)."
-      if [ "$DRY_RUN" = "1" ]; then
-        log "DRY_RUN=1 — WOULD: bd -C $TASK_STORE label add $TASK_BEAD_ID story:approved (re-arm delivery retry; do NOT close)"
-      else
-        bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "story:approved" -q 2>/dev/null || true
-        bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-iwv0): NOT closed — this bead carries delivery:deploy-pending, i.e. delivery ran and the deploy did NOT go live (a hot-path daemon needs a guarded restart). Closing here would mark done while the merged code is dormant in prod. Re-armed story:approved so the delivery sweep retries to completion; story:done is set only after the deploy (daemon-refresh) verifies the daemon is live on the new code." 2>/dev/null || true
+    # ga-266z8: iterate candidates (not just .[0]) so a bead that fails the new
+    # verification guards below doesn't head-of-line-block every other
+    # candidate forever — but still act on (close, or re-arm) AT MOST ONE per
+    # sweep, same "one per run" discipline as before.
+    TASK_ACTED=0
+    TASK_FETCHED_STORES=""
+    _task_idx=0
+    while [ "$TASK_ACTED" = "0" ] && [ "$_task_idx" -lt "$TASK_COUNT" ]; do
+      TASK_BEAD=$(echo "$TASK_BEADS_JSON" | jq ".[$_task_idx]")
+      _task_idx=$((_task_idx + 1))
+      TASK_BEAD_ID=$(echo "$TASK_BEAD" | jq -r '.id')
+      TASK_BEAD_TITLE=$(echo "$TASK_BEAD" | jq -r '.title // "untitled"' | head -c 80)
+      TASK_STORE=$(echo "$TASK_BEAD" | jq -r '._store // ""')
+      [ -z "$TASK_STORE" ] && TASK_STORE="$GC_CITY"
+      # ga-iwv0 (done==deployed, not merged): a gate:passed bead that ALSO carries
+      # delivery:deploy-pending went THROUGH delivery and the DEPLOY did not complete (a hot-path
+      # daemon needs a guarded restart / did not come up fresh → merged code is NOT live). It is a
+      # deploy-PENDING story, NOT a no-deploy artifact task — closing it here would mark "done"
+      # while the code is dormant in prod (the exact gap that closed wa-t4olb before its daemon was
+      # restarted). Do NOT close: re-arm story:approved so Step 1 re-picks it and runs delivery to
+      # REAL completion (story:done only after daemon-refresh verifies live). NOTE: we key on the
+      # specific delivery:deploy-pending label, NOT generic delivery:failed — a prod-test
+      # delivery:failed must NOT auto-retry here (a flaky test would loop forever); that path stays
+      # author-driven.
+      TASK_DEPLOY_PENDING=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | contains(["delivery:deploy-pending"])) then "1" else "0" end' 2>/dev/null || echo "0")
+      if [ "$TASK_DEPLOY_PENDING" = "1" ]; then
+        log "Task reconciler: $TASK_BEAD_ID has delivery:deploy-pending (deploy NOT live) — NOT closing; re-arming story:approved for delivery retry (ga-iwv0: done must mean deployed, not merged)."
+        if [ "$DRY_RUN" = "1" ]; then
+          log "DRY_RUN=1 — WOULD: bd -C $TASK_STORE label add $TASK_BEAD_ID story:approved (re-arm delivery retry; do NOT close)"
+        else
+          bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "story:approved" -q 2>/dev/null || true
+          bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-iwv0): NOT closed — this bead carries delivery:deploy-pending, i.e. delivery ran and the deploy did NOT go live (a hot-path daemon needs a guarded restart). Closing here would mark done while the merged code is dormant in prod. Re-armed story:approved so the delivery sweep retries to completion; story:done is set only after the deploy (daemon-refresh) verifies the daemon is live on the new code." 2>/dev/null || true
+        fi
+        TASK_ACTED=1
+        continue
       fi
-    else
-      log "Task reconciler: gate:passed non-story bead $TASK_BEAD_ID ($TASK_BEAD_TITLE) in store $TASK_STORE — closing (no deploy/prod-test; merge verified by gate)"
-      if [ "$DRY_RUN" = "1" ]; then
-        log "DRY_RUN=1 — WOULD: bd -C $TASK_STORE close $TASK_BEAD_ID (gate:passed task reconciler, ga-tjqe)"
-      else
-        bd -C "$TASK_STORE" close "$TASK_BEAD_ID" \
-          -r "Delivery task reconciler (ga-tjqe): gate:passed non-story bead closed — merge verified by gate. Gate dispatcher's direct-close (ga-esbg) was the primary path; this sweep catches beads the dispatcher did not close (e.g., crash between gate:passed + bd close)." \
-          2>/dev/null || warn "Task reconciler: could not close $TASK_BEAD_ID (non-fatal; will retry next sweep)"
-        bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-tjqe): gate:passed is set and this bead is not a story (no story:approved). Closed by delivery sweep — terminal for artifact tasks (no deploy/prod-test needed; merge already verified by gate)." 2>/dev/null || true
-        log "Task reconciler: closed $TASK_BEAD_ID"
-        mkdir -p "$(dirname "$DELIVERY_LOG")"
-        jq -c -n \
-          --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-          --arg task_id "$TASK_BEAD_ID" \
-          --arg task_title "$TASK_BEAD_TITLE" \
-          --arg result "task_closed" \
-          --arg dry_run "$DRY_RUN" \
-          '{ts: $ts, event: "task_reconcile", task_id: $task_id, task_title: $task_title, result: $result, dry_run: $dry_run}' \
-          >> "$DELIVERY_LOG" 2>/dev/null || true
+
+      # ga-266z8: NEVER trust the gate:passed label alone before closing — it can
+      # be PROPAGATED from a sling/earlier run while the parent's own latest gate
+      # run FAILED (confirmed false-closes: ga-opyus, ga-t1ub9, both manually
+      # re-opened). Two guards, mirroring the already-fixed sibling ga-v8ui5
+      # (verify by content, never by label alone):
+      #   (1) a contradicting gate:failed/gate:needs-fix label means gate:passed
+      #       is stale/propagated, not evidence — the gate has not resolved.
+      #   (2) absent that, require independent proof the fix landed in
+      #       origin/<default_branch>: scan for a commit whose conventional-commit
+      #       SCOPE is this bead id (same discriminator merged-bead-janitor.sh
+      #       uses) — a content check, since the reconciler has no branch name
+      #       for a task bead to run merge-base --is-ancestor against.
+      TASK_CONTRADICTED=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | any(. == "gate:failed" or . == "gate:needs-fix")) then "1" else "0" end' 2>/dev/null || echo "0")
+
+      TASK_MERGE_VERIFIED=0
+      TASK_DEFAULT_BRANCH="main"
+      if [ "$TASK_CONTRADICTED" != "1" ]; then
+        TASK_DEFAULT_BRANCH=$(echo "$RIG_LIST_JSON" | jq -r --arg p "$TASK_STORE" '(.rigs[] | select(.path==$p) | .default_branch) // "main"' 2>/dev/null || echo "main")
+        [ -z "$TASK_DEFAULT_BRANCH" ] && TASK_DEFAULT_BRANCH="main"
+        TASK_GITDIR_PAIR=$(rig_gitdir "$TASK_STORE")
+        TASK_GDIR="${TASK_GITDIR_PAIR%$'\t'*}"
+        TASK_CONTAINER="${TASK_GITDIR_PAIR#*$'\t'}"
+        case " $TASK_FETCHED_STORES " in
+          *" $TASK_STORE "*) : ;;
+          *)
+            timeout 30 sh -c '
+              if [ "$3" = "1" ]; then git --git-dir="$1" fetch origin "$2" --quiet; else git -C "$1" fetch origin "$2" --quiet; fi
+            ' _ "$TASK_GDIR" "$TASK_DEFAULT_BRANCH" "$TASK_CONTAINER" 2>/dev/null \
+              || warn "Task reconciler: fetch origin/$TASK_DEFAULT_BRANCH failed/timed out for $TASK_STORE (non-fatal — verifying against last-known ref)."
+            TASK_FETCHED_STORES="$TASK_FETCHED_STORES $TASK_STORE"
+            ;;
+        esac
+        if scan_commit_subject_for_bead "$TASK_GDIR" "$TASK_CONTAINER" "origin/$TASK_DEFAULT_BRANCH" "$TASK_BEAD_ID" >/dev/null 2>&1; then
+          TASK_MERGE_VERIFIED=1
+        fi
       fi
-    fi
+
+      TASK_VERDICT=$(task_reconciler_verdict "$TASK_CONTRADICTED" "$TASK_MERGE_VERIFIED")
+      case "$TASK_VERDICT" in
+        close:*)
+          log "Task reconciler: gate:passed non-story bead $TASK_BEAD_ID ($TASK_BEAD_TITLE) in store $TASK_STORE — verified merged ($TASK_VERDICT) — closing (no deploy/prod-test)."
+          if [ "$DRY_RUN" = "1" ]; then
+            log "DRY_RUN=1 — WOULD: bd -C $TASK_STORE close $TASK_BEAD_ID (gate:passed task reconciler, ga-tjqe; ancestry-verified ga-266z8)"
+          else
+            bd -C "$TASK_STORE" close "$TASK_BEAD_ID" \
+              -r "Delivery task reconciler (ga-tjqe): gate:passed non-story bead closed — merge verified by content-in-origin-$TASK_DEFAULT_BRANCH check (ga-266z8), not the label alone. Gate dispatcher's direct-close (ga-esbg) was the primary path; this sweep catches beads the dispatcher did not close (e.g., crash between gate:passed + bd close)." \
+              2>/dev/null || warn "Task reconciler: could not close $TASK_BEAD_ID (non-fatal; will retry next sweep)"
+            bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-tjqe): gate:passed is set and this bead is not a story (no story:approved). Verified merged by scanning origin/$TASK_DEFAULT_BRANCH for a commit scoped to this bead id (ga-266z8 — the label alone is never trusted). Closed by delivery sweep — terminal for artifact tasks." 2>/dev/null || true
+            log "Task reconciler: closed $TASK_BEAD_ID"
+            mkdir -p "$(dirname "$DELIVERY_LOG")"
+            jq -c -n \
+              --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --arg task_id "$TASK_BEAD_ID" \
+              --arg task_title "$TASK_BEAD_TITLE" \
+              --arg result "task_closed" \
+              --arg dry_run "$DRY_RUN" \
+              '{ts: $ts, event: "task_reconcile", task_id: $task_id, task_title: $task_title, result: $result, dry_run: $dry_run}' \
+              >> "$DELIVERY_LOG" 2>/dev/null || true
+          fi
+          TASK_ACTED=1
+          ;;
+        keep:contradicted-by-gate-failed-or-needs-fix)
+          log "Task reconciler: $TASK_BEAD_ID carries gate:passed but ALSO gate:failed/gate:needs-fix (ga-266z8 contradiction guard) — NOT closing; checking next candidate this sweep."
+          ;;
+        *)
+          log "Task reconciler: $TASK_BEAD_ID has gate:passed but no commit scoped to it was found in origin/$TASK_DEFAULT_BRANCH (ga-266z8 — never trust the label alone) — NOT closing this sweep; checking next candidate."
+          ;;
+      esac
+    done
   fi
 fi
 # ── End Step 1b ──────────────────────────────────────────────────────────────
