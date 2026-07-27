@@ -306,6 +306,19 @@ classify_parent_gap2() {
   echo "skip:active-sling"
 }
 
+# classify_gap2_bugtask_verdict <merge_verified> — ga-6ync4: a bug/task parent's
+# sling passed+closed is a done-SIGNAL, not proof — the sling can gate-pass on a
+# review of code that never actually landed on the parent's own fix. Mirrors
+# story-delivery.sh's task_reconciler_verdict (ga-266z8, same root flaw, different
+# code path): require independent content/ancestry evidence before trusting a
+# passed+closed sling enough to close the parent.
+# Returns: close:merge-verified | keep:merge-not-verified
+classify_gap2_bugtask_verdict() {
+  local merge_verified="$1"
+  [ "$merge_verified" = "1" ] && { echo "close:merge-verified"; return; }
+  echo "keep:merge-not-verified"
+}
+
 # check_source_bead_park <space_sep_labels>
 # Pure decision: should the gate park a marker because the source-bead is in a
 # state that must not enter the review cycle?
@@ -1084,10 +1097,58 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
           bd -C "$GC_CITY" label add "$SC_ID" "gate:passed" -q 2>/dev/null || true
           bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: parent stranded after sling bead $SLING_ID gate-passed+closed. story:in-flight + pilot:dispatched cleared; gate:passed set — story-delivery will deploy and mark story:done." 2>/dev/null || true
         else
-          # Bug/task parent: close it (work was merged via sling bead).
-          bd -C "$GC_CITY" close "$SC_ID" \
-            -r "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed and closed — work is done; closing parent." \
-            2>/dev/null || warn "Could not close parent $SC_ID after pass-stranded detection"
+          # Bug/task parent: sling-passed+closed is a done-SIGNAL, not proof the
+          # PARENT's own fix landed (ga-6ync4 — same root flaw as ga-266z8's
+          # story-delivery.sh task reconciler, different code path: trusting a
+          # done-signal instead of an ancestry/content merge check). Verify via
+          # the same branch-lookup + guard_content_merged check GAP-1 already
+          # uses just above (this file) before closing — try the parent's own
+          # id first, then the sling wrapper's id (a fix branch is occasionally
+          # named after the sling task instead of the parent; ga-vokwv precedent
+          # in merged-bead-janitor.sh's sibling sweep).
+          GAP2_MAIN_SHA=""
+          git -C "$GC_CITY" fetch origin main --quiet 2>/dev/null || true
+          GAP2_MAIN_SHA=$(git -C "$GC_CITY" rev-parse "origin/main" 2>/dev/null || echo "")
+
+          GAP2_MERGE_VERIFIED=0
+          if [ -n "$GAP2_MAIN_SHA" ]; then
+            for GAP2_TRY_ID in "$SC_ID" "$SLING_ID"; do
+              [ -n "$GAP2_TRY_ID" ] || continue
+              GAP2_BRANCH_SHA=""
+              for GAP2_PAT in "refs/heads/fix/${GAP2_TRY_ID}" "refs/heads/fix/${GAP2_TRY_ID}-*" \
+                         "refs/heads/feature/${GAP2_TRY_ID}" "refs/heads/feature/${GAP2_TRY_ID}-*"; do
+                GAP2_SHA=$(git -C "$GC_CITY" ls-remote origin "$GAP2_PAT" 2>/dev/null | head -1 | awk '{print $1}')
+                if [ -z "$GAP2_SHA" ]; then
+                  GAP2_RREF="${GAP2_PAT/refs\/heads\//refs\/remotes\/origin\/}"
+                  GAP2_SHA=$(git -C "$GC_CITY" for-each-ref --format='%(objectname)' "$GAP2_RREF" 2>/dev/null | head -1)
+                fi
+                [ -n "$GAP2_SHA" ] && { GAP2_BRANCH_SHA="$GAP2_SHA"; break; }
+              done
+              [ -z "$GAP2_BRANCH_SHA" ] && continue
+
+              if git -C "$GC_CITY" merge-base --is-ancestor "$GAP2_BRANCH_SHA" "$GAP2_MAIN_SHA" 2>/dev/null; then
+                GAP2_MERGE_VERIFIED=1; break
+              elif guard_content_merged "$GAP2_MAIN_SHA" "$GAP2_BRANCH_SHA"; then
+                GAP2_MERGE_VERIFIED=1; break
+              fi
+            done
+          else
+            warn "GAP-2: $SC_ID — origin/main SHA unreachable — cannot verify merge; treating as NOT verified (fail-safe)"
+          fi
+
+          GAP2_VERDICT=$(classify_gap2_bugtask_verdict "$GAP2_MERGE_VERIFIED")
+          case "$GAP2_VERDICT" in
+            close:*)
+              bd -C "$GC_CITY" close "$SC_ID" \
+                -r "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed and closed, and parent's own fix verified merged into origin/main (ga-6ync4) — work is done; closing parent." \
+                2>/dev/null || warn "Could not close parent $SC_ID after pass-stranded detection"
+              ;;
+            *)
+              warn "GAP-2: $SC_ID sling $SLING_ID gate-passed+closed but parent's own fix NOT verified in origin/main (ga-6ync4 — sling-passed is a signal, not proof) — NOT closing; re-arming gate:needs-fix"
+              bd -C "$GC_CITY" label add "$SC_ID" "gate:needs-fix" -q 2>/dev/null || true
+              bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed+closed, but no independent evidence the parent's own fix ($SC_ID) is merged into origin/main was found (checked branches fix/$SC_ID*, feature/$SC_ID*, and sling fix/$SLING_ID*, feature/$SLING_ID*). ga-6ync4 fix: never trust sling-passed alone. story:in-flight + pilot:dispatched cleared; gate:needs-fix set so Pilot re-dispatches / this can re-merge." 2>/dev/null || true
+              ;;
+          esac
         fi
         ;;
       skip:live-assignee)

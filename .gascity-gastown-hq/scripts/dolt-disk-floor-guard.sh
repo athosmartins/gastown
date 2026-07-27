@@ -18,13 +18,17 @@
 #
 #   WARN_GB (default 8)     — attempt the pre-sanctioned-safe reclaim
 #                             (`gc dolt-cleanup --force` — orphan test-DB SQL DROP,
-#                             documented safe while Dolt is up), PLUS a second
-#                             lever — reaping dead-session scratchpads under
+#                             documented safe while Dolt is up), PLUS two more
+#                             levers — reaping dead-session scratchpads under
 #                             /private/tmp (see _reap_dead_scratch, ga-hjcxy/
 #                             ga-02pnu: a single dead session's 1GB scratchpad
 #                             caused a CRITICAL incident that this follow-up
 #                             fixes — dolt-cleanup alone never touched that class
-#                             of file) — then rate-limited notify. Cooldown is
+#                             of file) and dead-session transcripts under
+#                             ~/.claude/projects (see _reap_dead_transcripts,
+#                             ga-t1ub9: 1.4GB/1232 files accumulated with no
+#                             reaper at all — a disjoint leak class from
+#                             scratch) — then rate-limited notify. Cooldown is
 #                             bypassed if avail is WORSENING since the last notify
 #                             (mirrors the exact fix ga-vs55 furo #2 added to
 #                             disk-pressure-monitor.sh's dpm_should_notify — a
@@ -55,11 +59,12 @@
 # sign-off rather than being silently bundled into a no-human-review small-lane
 # merge. Filed as a separate follow-up bead (see this commit's gate-done note).
 #
-# Kill switch: DOLT_DISK_FLOOR_GUARD_ENABLED=0 → skip BOTH reclaim actions
-# (dolt-cleanup AND the scratchpad reaper) only. Notification is NEVER gated by
-# this switch (imp07 CALL INVARIANT: alerting is the lowest-blast-radius action
-# here and the one furo #2 just fixed for being wrongly suppressible — don't
-# reintroduce that failure mode one guard over).
+# Kill switch: DOLT_DISK_FLOOR_GUARD_ENABLED=0 → skip ALL THREE reclaim actions
+# (dolt-cleanup, the scratchpad reaper, AND the transcript reaper) only.
+# Notification is NEVER gated by this switch (imp07 CALL INVARIANT: alerting
+# is the lowest-blast-radius action here and the one furo #2 just fixed for
+# being wrongly suppressible — don't reintroduce that failure mode one guard
+# over).
 #
 # TEST (no Dolt, no deletions, no real disk mutation, no mail/notify sent):
 #   bash scripts/dolt-disk-floor-guard.selftest.sh
@@ -243,6 +248,35 @@ _reap_dead_scratch() {
   fi
 }
 
+# _reap_dead_transcripts — third reclaim lever, alongside _safe_reclaim and
+# _reap_dead_scratch (ga-t1ub9, same family as ga-02pnu): Claude Code session
+# transcripts under ~/.claude/projects/<project>/<session-id>.jsonl accumulate
+# forever with nothing to reap them — 1.4GB across 1232 files by 2026-07-26,
+# contributing to two Dolt ENOSPC hits that day. Delegates to the standalone,
+# independently-selftested transcript-reaper.sh so its liveness/staleness
+# safety logic (NEVER reap a live or suspended session's transcript — losing
+# one is unrecoverable, unlike scratch) is unit- AND integration-tested in
+# isolation rather than inlined here. Bounded by timeout so a wedged `gc
+# session list` can't hang this guard; best-effort — a failure here must never
+# block the other two reclaim levers or the notify decision that follows.
+_reap_dead_transcripts() {
+  if [ "$ENABLED" != "1" ]; then
+    log "transcript-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
+    return
+  fi
+  local reaper="$CITY/scripts/transcript-reaper.sh"
+  if [ ! -f "$reaper" ]; then
+    log "transcript-reap SKIP — $reaper not found"
+    return
+  fi
+  log "transcript-reap: running dead-session transcript cleanup …"
+  if timeout 60 bash "$reaper" >> "$LOG" 2>&1; then
+    log "transcript-reap OK"
+  else
+    log "transcript-reap FAILED or aborted (nonzero exit) — see log lines above"
+  fi
+}
+
 main() {
   local avail class now
   avail="$(_avail_gb "$DOLTDIR")"
@@ -275,6 +309,7 @@ main() {
   _read_state
   _safe_reclaim "$avail"
   _reap_dead_scratch
+  _reap_dead_transcripts
 
   # re-read avail — reclaim may have freed space; `class` becomes the CURRENT
   # (post-reclaim) reading, used for logging/messaging. was_critical also
