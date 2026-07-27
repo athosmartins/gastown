@@ -152,9 +152,16 @@ _shield_unresolved_session() {
 # _fetch_live_keys <out_file> → writes one session_key per line to out_file,
 # PLUS shielded ids for sessions we can't positively name (see below).
 # Returns nonzero on ANY failure to positively confirm liveness data (nonzero
-# exit, empty stdout, or JSON with no `.sessions` key) — a failure here must
-# abort the whole cycle upstream, never be read as "nobody's alive, reap
-# everything" (ga-p5q3 class). Deliberately no --state flag: the default
+# exit, empty stdout, or `.sessions` missing/null/non-array) — a failure here
+# must abort the whole cycle upstream, never be read as "nobody's alive, reap
+# everything" (ga-p5q3 class). NOTE: `has("sessions")` alone is NOT this check
+# — has() returns true for `{"sessions": null}` too (key presence, not value
+# shape), which is precisely the gate:fix-attempt:2 finding: null collapsed to
+# the same outcome as `[]`, jq's `.sessions[]` then errored (exit 5) on the
+# null, got swallowed by `2>/dev/null`, and _fetch_live_keys returned 0 with an
+# empty keyfile — every session read as dead. `(.sessions | type) == "array"`
+# rejects null/missing/non-array roots alike (verified empirically) and
+# subsumes the old has() check. Deliberately no --state flag: the default
 # listing (active + suspended/asleep + anything not closed) is exactly
 # ga-t1ub9's stated dead-session criterion.
 #
@@ -179,8 +186,8 @@ _fetch_live_keys() {
     log "ABORT: 'gc session list --json' failed (rc=$rc) or returned empty — cannot verify liveness"
     return 1
   fi
-  if ! printf '%s' "$raw" | jq -e 'has("sessions")' >/dev/null 2>&1; then
-    log "ABORT: 'gc session list --json' output has no .sessions key — cannot verify liveness"
+  if ! printf '%s' "$raw" | jq -e '(.sessions | type) == "array"' >/dev/null 2>&1; then
+    log "ABORT: 'gc session list --json' .sessions is missing, null, or non-array — cannot verify liveness"
     return 1
   fi
 

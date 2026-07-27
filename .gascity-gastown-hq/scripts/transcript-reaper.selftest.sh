@@ -140,6 +140,85 @@ rm -rf "$FLK_ROOT" "$FAKE_GC_DIR"
 rm -f "$FLK_OUT"
 
 echo ""
+echo "=== _fetch_live_keys: '.sessions' null/missing must ABORT, not collapse to empty ==="
+# GATE-FLAGGED BUG (ga-t1ub9, fix-attempt 2 FAIL, gate_run=ga-wisp-kq50t3g):
+# has("sessions") returns true even when the value is null — {"sessions": null}
+# passed the old guard, then '.sessions[]' errored (jq exit 5) iterating over
+# null, got swallowed by 2>/dev/null, and _fetch_live_keys returned 0 with an
+# EMPTY keyfile: every session would read as dead. Fixed via
+# '(.sessions | type) == "array"', which rejects null and non-array alike.
+NULLSESS_GC_DIR="$(mktemp -d /tmp/transcript-reaper-selftest-nullgc.XXXXXX)"
+cat > "$NULLSESS_GC_DIR/fake-gc" <<'FAKEGC'
+#!/bin/bash
+echo '{"sessions": null}'
+FAKEGC
+chmod +x "$NULLSESS_GC_DIR/fake-gc"
+
+NULLSESS_OUT="$(mktemp /tmp/transcript-reaper-selftest-nullout.XXXXXX)"
+GC="$NULLSESS_GC_DIR/fake-gc"
+: > "$TRANSCRIPT_REAPER_LOG"
+
+_fetch_live_keys "$NULLSESS_OUT"
+NULLSESS_RC=$?
+
+[ "$NULLSESS_RC" -ne 0 ] && ok "fetch_live_keys: '.sessions: null' → nonzero rc (abort, not silent-empty) — THE GATE-FLAGGED BUG" || bad "fetch_live_keys: '.sessions: null' returned rc=0 — would silently reap every session"
+grep -q "ABORT" "$TRANSCRIPT_REAPER_LOG" && ok "fetch_live_keys: '.sessions: null' logs an ABORT" || bad "fetch_live_keys: '.sessions: null' abort not logged"
+
+rm -rf "$NULLSESS_GC_DIR"
+rm -f "$NULLSESS_OUT"
+
+echo ""
+echo "=== _fetch_live_keys: '.sessions' key entirely absent must also ABORT ==="
+NOSESS_GC_DIR="$(mktemp -d /tmp/transcript-reaper-selftest-nogc.XXXXXX)"
+cat > "$NOSESS_GC_DIR/fake-gc" <<'FAKEGC'
+#!/bin/bash
+echo '{}'
+FAKEGC
+chmod +x "$NOSESS_GC_DIR/fake-gc"
+
+NOSESS_OUT="$(mktemp /tmp/transcript-reaper-selftest-noout.XXXXXX)"
+GC="$NOSESS_GC_DIR/fake-gc"
+: > "$TRANSCRIPT_REAPER_LOG"
+
+_fetch_live_keys "$NOSESS_OUT"
+NOSESS_RC=$?
+
+[ "$NOSESS_RC" -ne 0 ] && ok "fetch_live_keys: missing '.sessions' key → nonzero rc (abort)" || bad "fetch_live_keys: missing '.sessions' key returned rc=0"
+
+rm -rf "$NOSESS_GC_DIR"
+rm -f "$NOSESS_OUT"
+
+echo ""
+echo "=== main(): _fetch_live_keys failure must abort the WHOLE cycle — zero deletions ==="
+# Structural regression guard for the same gate finding, at main()'s level:
+# even if a future change alters how _fetch_live_keys decides to fail, main()
+# must still refuse to reap ANYTHING when it can't establish a trustworthy
+# live-session set — never fall back to "treat unknown as dead".
+ABORT_ROOT="$(mktemp -d /tmp/transcript-reaper-selftest-abortroot.XXXXXX)"
+mkdir -p "$ABORT_ROOT/proj"
+: > "$ABORT_ROOT/proj/clearly-dead-and-stale.jsonl"
+OLD_TS_ABORT="$(date -v-10d +%Y%m%d%H%M.%S)"
+touch -t "$OLD_TS_ABORT" "$ABORT_ROOT/proj/clearly-dead-and-stale.jsonl"
+
+_fetch_live_keys() { return 1; }
+
+TRANSCRIPT_ROOT="$ABORT_ROOT"
+ENABLED=1
+DRY_RUN=0
+MIN_AGE_HOURS=72
+SELF_SESSION_ID=""
+
+main
+MAIN_ABORT_RC=$?
+
+[ "$MAIN_ABORT_RC" -ne 0 ] && ok "main(): propagates _fetch_live_keys failure as nonzero rc" || bad "main(): swallowed _fetch_live_keys failure, returned 0"
+[ -f "$ABORT_ROOT/proj/clearly-dead-and-stale.jsonl" ] \
+  && ok "main(): liveness-fetch failure reaps NOTHING, even an obviously dead+stale file" \
+  || bad "main(): reaped a file despite being unable to establish liveness — THE EXACT GATE-FLAGGED RISK"
+
+rm -rf "$ABORT_ROOT"
+
+echo ""
 echo "=== main(): end-to-end integration against a disposable tmp root ==="
 # Fixture layout under a throwaway TRANSCRIPT_ROOT (never real ~/.claude/projects):
 #   proj/live-sess.jsonl        — LIVE session, OLD mtime  → must survive (liveness beats age)
