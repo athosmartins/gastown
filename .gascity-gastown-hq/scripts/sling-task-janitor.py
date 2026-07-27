@@ -328,7 +328,7 @@ def _is_orphan_molecule(bead):
     return target or None
 
 
-def _should_close(bead, parent_inflight_ids, live, now, gated=frozenset()):
+def _should_close(bead, parent_inflight_ids, live, now, gated=frozenset(), parent_status_by_id=None):
     """Return (close: bool, reason_or_skip: str). Fail-toward-KEEP."""
     bid = bead.get("id", "?")
     parent = _is_sling(bead)
@@ -344,7 +344,13 @@ def _should_close(bead, parent_inflight_ids, live, now, gated=frozenset()):
         return False, "fix is IN FLIGHT at the gate (open marker refs %s) — tracked work" % (bid if bid in gated else parent)
     asg = bead.get("assignee") or ""
     refused = _is_refused(labels)
-    if asg and asg in live and not refused:
+    # ga-mf0gb: symmetric to the refused override — a dog-pool session staying live after
+    # the PARENT bug already closed (verified merge, one way or another) is equally terminal
+    # as an explicit refuse. Only an exact resolved "closed" status counts; None (unresolved
+    # lookup) or any other status (open/deferred/blocked/missing/...) must NOT trigger this —
+    # fail-toward-KEEP.
+    parent_closed = (parent_status_by_id or {}).get(parent) == "closed"
+    if asg and asg in live and not refused and not parent_closed:
         return False, "stub assignee '%s' is a LIVE session (active build)" % asg
     if parent in parent_inflight_ids:
         return False, "parent %s is story:in-flight (active build)" % parent
@@ -355,6 +361,10 @@ def _should_close(bead, parent_inflight_ids, live, now, gated=frozenset()):
         return True, ("orphan: stub explicitly refused (pool:refused:*) — assignee '%s' is still "
                        "live, but dog-pool sessions are long-lived and the refuse is a terminal "
                        "decision, age=%.0fmin" % (asg, age))
+    if parent_closed and asg and asg in live:
+        return True, ("orphan: parent %s is CONFIRMED CLOSED — assignee '%s' is still live, but a "
+                       "dog-pool session remaining live after finishing this task is not evidence "
+                       "the stub itself is still active work, age=%.0fmin" % (parent, asg, age))
     return True, ("orphan: parent %s NOT in active build, no live assignee, age=%.0fmin" % (parent, age))
 
 
@@ -414,6 +424,28 @@ def run_cycle(now):
             if isinstance(b, dict) and "story:in-flight" in set(b.get("labels") or []):
                 inflight.add(b.get("id"))
 
+    # Collect sling-stub parent references (pure, no I/O) so their statuses can be
+    # resolved in one batched call per store, mirroring the molecule-target resolution
+    # below. ga-mf0gb: a stub's parent is assumed to live in the SAME store as the stub
+    # itself — sling stubs carry no rig_name-equivalent metadata, so there's no cross-store
+    # signal to resolve against (unlike molecules' gc.var.rig_name); skip the round trip
+    # entirely when this sweep has no sling stubs at all.
+    sling_parent_refs = []  # (store, parent_id)
+    for store, beads in store_beads.items():
+        for b in beads:
+            if not isinstance(b, dict):
+                continue
+            parent = _is_sling(b)
+            if parent:
+                sling_parent_refs.append((store, parent))
+
+    parent_statuses = {}
+    if sling_parent_refs:
+        parent_targets_by_store = {}
+        for store, parent in sling_parent_refs:
+            parent_targets_by_store.setdefault(store, set()).add(parent)
+        parent_statuses = _target_statuses(parent_targets_by_store)
+
     # Collect molecule targets (pure, no I/O) so their statuses can be resolved in one
     # batched call per store — skip the rig-name-map/bd-show round trips entirely when
     # this sweep has no target-tracking molecules at all.
@@ -466,16 +498,24 @@ def run_cycle(now):
 
             parent = _is_sling(b)
             if parent:
-                do_close, why = _should_close(b, inflight, live, now, gated)
+                do_close, why = _should_close(b, inflight, live, now, gated, parent_statuses)
                 if not do_close:
                     _log("  KEEP %s/%s: %s" % (os.path.basename(store), bid, why))
                     continue
-                if _is_refused(set(b.get("labels") or [])):
+                labels_b = set(b.get("labels") or [])
+                asg_b = b.get("assignee") or ""
+                if _is_refused(labels_b):
                     reason = ("Orphan sling-task cleanup (sling-task-janitor, ga-0jcit): stub for "
                               "'%s' carries an explicit pool:refused:* label — a terminal decision "
                               "by its assignee. Dog-pool sessions are long-lived, so the assignee "
                               "remaining live is not evidence this stub is still active work. "
                               "Closed; the parent's own state drives any future dispatch." % parent)
+                elif parent_statuses.get(parent) == "closed" and asg_b and asg_b in live:
+                    reason = ("Orphan sling-task cleanup (sling-task-janitor, ga-mf0gb): stub for "
+                              "'%s' is CONFIRMED CLOSED at the parent — assignee '%s' is still live, "
+                              "but a dog-pool session remaining live after finishing this task is not "
+                              "evidence the stub itself is still active work. Closed; the parent's own "
+                              "state drives any future dispatch." % (parent, asg_b))
                 else:
                     reason = ("Orphan sling-task cleanup (sling-task-janitor): ctx:thin dispatch stub for "
                               "'%s' whose parent is NOT in active build and which has no live assignee. "
@@ -773,6 +813,48 @@ print(json.dumps(found))
         _ok("V: real _target_statuses() resolves found status AND confirmed-missing via stderr, unshimmed")
     else:
         _bad("V: _target_statuses() real subprocess path broken", "result=%s" % resultV)
+
+    print("Scenario W: parent CONFIRMED CLOSED, non-refused stub with a LIVE assignee → CLOSE "
+          "(ga-mf0gb: parent-closed is equally terminal as an explicit refuse — a dog-pool "
+          "session remaining live after finishing this task is not evidence the stub itself "
+          "is still active work)")
+    c, why = _should_close(mk("t3e", "fix bug ga-done", assignee="dog-galnfou"), set(), {"dog-galnfou"}, NOW,
+                            parent_status_by_id={"ga-done": "closed"})
+    _ok("W: closes a non-refused, live-assignee stub once its parent is confirmed closed") if c else _bad("W: did not close parent-closed stub", why)
+
+    print("Scenario X: parent status resolved but explicitly OPEN, live assignee → KEEP "
+          "(unchanged — an explicit non-closed status, not just absence of info, must not "
+          "trigger the override)")
+    c, why = _should_close(mk("t3f", "fix bug ga-active", assignee="dog-galnfou"), set(), {"dog-galnfou"}, NOW,
+                            parent_status_by_id={"ga-active": "open"})
+    _bad("X: wrongly closed while parent is confirmed open", why) if c else _ok("X: keeps live-assignee stub whose parent is confirmed open")
+
+    print("Scenario Y: parent status UNRESOLVED (lookup failed/ambiguous, absent from the "
+          "resolved map), live assignee → KEEP (fail-toward-KEEP: absence of a resolved "
+          "status is not proof of closure)")
+    c, why = _should_close(mk("t3g", "fix bug ga-unknown", assignee="dog-galnfou"), set(), {"dog-galnfou"}, NOW,
+                            parent_status_by_id={})
+    _bad("Y: wrongly closed on an unresolved parent status", why) if c else _ok("Y: keeps live-assignee stub whose parent status could not be resolved")
+
+    print("Scenario Z: run_cycle end-to-end closes a live-assignee sling stub once its parent "
+          "resolves as CONFIRMED CLOSED (ga-mf0gb: the actual reported shape — a dog-pool "
+          "session stays live after finishing the parent bug, e.g. ga-mx837/dog-gaagsrv/"
+          "ga-lfj05 — the stub must still self-close)")
+    MAX_PER_SWEEP = 10
+    live_stub = mk("mx1", "fix bug ga-parentdone", assignee="dog-poolworker-LIVE")
+    closed_idsZ = []
+    _rigs_fn = lambda: ["HQ"]
+    _bd_list_open_fn = lambda store: [live_stub]   # closed parent is NOT part of the open listing
+    _sessions_fn = lambda: {"dog-poolworker-LIVE"}
+    _bd_close_fn = lambda store, bid, reason: (closed_idsZ.append(bid) or True)
+    _do_notify_fn = lambda m, p: None
+    _target_status_fn = lambda targets_by_store: {"ga-parentdone": "closed"}
+    n = run_cycle(NOW)
+    if closed_idsZ == ["mx1"]:
+        _ok("Z: closed the live-assignee stub end-to-end once its parent resolved as confirmed-closed")
+    else:
+        _bad("Z: run_cycle did not close the parent-closed live-assignee stub", "closed=%s" % closed_idsZ)
+    _target_status_fn = None
 
     print("\n[sling-janitor selftest] %d passed, %d failed" % (ok[0], bad[0]))
     sys.exit(1 if bad[0] else 0)
