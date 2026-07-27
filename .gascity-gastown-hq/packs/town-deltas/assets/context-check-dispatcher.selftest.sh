@@ -50,7 +50,7 @@ fi
 
 # Pin the exclude sets the pure plumbing classifier reads (the dispatcher sets
 # defaults; we re-assert them so the selftest is hermetic).
-CONTEXT_CHECK_EXCLUDE_LABELS="gt:agent gt:rig gt:convoy gc:nudge"
+CONTEXT_CHECK_EXCLUDE_LABELS="gt:agent gt:rig gt:convoy gc:nudge digest"
 CONTEXT_CHECK_EXCLUDE_PREFIXES="type:quality-gate gate-status: nudge: reviewer-index: verdict: refino-gate: auto-refino: gate-reclaim-count: order-run: ctx:"
 # Pin heuristic thresholds so length-based assertions are deterministic.
 CONTEXT_CHECK_THIN_MAXLEN=40
@@ -76,6 +76,9 @@ echo "Scenario 2: plumbing exclusion — engine-internal coordination is NOT hum
 [ "$(context_check_is_plumbing "ga-x" "" "true")" = "yes" ]                           && ok "ephemeral → plumbing"    || bad "ephemeral → expected plumbing"
 [ "$(context_check_is_plumbing "ga-real" "tech-debt" "false")" = "no" ]               && ok "real bead (tech-debt) → NOT plumbing" || bad "real bead → expected not plumbing"
 [ "$(context_check_is_plumbing "ga-real" "" "false")" = "no" ]                        && ok "real bead (no labels) → NOT plumbing" || bad "real bead → expected not plumbing"
+# ga-aq5cw: mol-digest-generate's archive-as-bead step tags type=task beads
+# label=digest,{{period}} with no park label — a pure log record, no code to build.
+[ "$(context_check_is_plumbing "ga-x" "digest,daily" "false")" = "yes" ]              && ok "digest label → plumbing (ga-aq5cw)" || bad "digest → expected plumbing"
 
 # ── Scenario 3: idempotence — an already-judged bead is never re-judged ───────
 echo "Scenario 3: idempotence / anti-loop (ga-it11w lesson) — ctx:* already present"
@@ -148,6 +151,13 @@ echo "Scenario 4b: context_check_is_candidate composes type+plumbing+ctx+lifecyc
 [ "$(context_check_is_candidate "ga-0x4tv" "chore" "area:infra,pilot:no-auto-dispatch,epic:ga-05604" "false" "no")" = "no" ] \
   && ok "ga-0x4tv-shaped bead (parked via pilot:no-auto-dispatch, ctx:* stripped) → NOT a candidate (no re-arm)" \
   || bad "REGRESSION ga-bzbig: Mayor-disarmed tracker with ctx:* stripped would be re-judged and re-armed"
+# ga-aq5cw: the exact ga-sh5zv/ga-mun9x shape — a freshly-created digest-archive
+# bead (type=task, label=digest,{{period}}, no ctx:* yet, no park label at all)
+# — must never be granted candidacy in the first place (there is no park label
+# to strip; the fix is at the type/plumbing gate, not the park gate).
+[ "$(context_check_is_candidate "ga-sh5zv" "task" "digest,daily" "false" "no")" = "no" ] \
+  && ok "digest-archive bead (task, label=digest) → NOT a candidate (ga-aq5cw)" \
+  || bad "REGRESSION ga-aq5cw: digest-archive bead would be armed ctx:ready+exec:auto with nothing to build"
 
 # ── Scenario 5: verifiable-signal detection ───────────────────────────────────
 echo "Scenario 5: verifiable-signal detection (HOW-TO-VERIFY / concrete artifact)"

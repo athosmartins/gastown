@@ -117,7 +117,14 @@ CONTEXT_CHECK_EXEC_CLASS="${CONTEXT_CHECK_EXEC_CLASS:-1}"
 # if its type is bug/chore/task. Mirrors the painel's _is_automation_bead set plus
 # the quality-gate marker/run/verdict family that pollutes the open chore/task
 # population. Env-overridable so the Mayor can tune without a code edit.
-CONTEXT_CHECK_EXCLUDE_LABELS="${CONTEXT_CHECK_EXCLUDE_LABELS:-gt:agent gt:rig gt:convoy gc:nudge}"
+# `digest` (ga-aq5cw): mol-digest-generate's "Archive as bead" step creates a
+# type=task bead with label=digest,{{period}} purely as a log record — the
+# digest's real payload (mail to the mayor) is already sent before this bead
+# exists, so there is never any code to build. Without this exclusion, task is
+# type-eligible and the bead carries no park label, so it got armed with
+# ctx:ready+exec:auto on its first sweep pass → Pilot dispatched a "build
+# story" task with nothing to build (ga-sh5zv, ga-mun9x).
+CONTEXT_CHECK_EXCLUDE_LABELS="${CONTEXT_CHECK_EXCLUDE_LABELS:-gt:agent gt:rig gt:convoy gc:nudge digest}"
 # Label PREFIXES that mark plumbing (matched as startswith). Covers the gate
 # marker/run/verdict family, gate-status:*, nudge:*, reviewer-index:*, source:*,
 # and the ctx:* family itself (idempotence).
