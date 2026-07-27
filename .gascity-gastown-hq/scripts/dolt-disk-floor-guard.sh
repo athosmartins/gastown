@@ -259,6 +259,15 @@ _reap_dead_scratch() {
 # isolation rather than inlined here. Bounded by timeout so a wedged `gc
 # session list` can't hang this guard; best-effort — a failure here must never
 # block the other two reclaim levers or the notify decision that follows.
+#
+# TRANSCRIPT_REAPER_PROD=1 (ga-lfj05, completing ga-h565g for this file): this
+# function IS the real, launchd-driven caller transcript-reaper.sh's own
+# production-sentinel guard is designed to trust — the ONLY place that should
+# ever set this opt-in. It authorizes transcript-reaper.sh to actually delete
+# when its resolved root equals its real default; without it, a harness bug
+# that leaves that root at the default (exactly what caused this script's own
+# 2026-07-26 185-transcript incident) forces a dry-run instead of deleting
+# real data.
 _reap_dead_transcripts() {
   if [ "$ENABLED" != "1" ]; then
     log "transcript-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
@@ -270,7 +279,7 @@ _reap_dead_transcripts() {
     return
   fi
   log "transcript-reap: running dead-session transcript cleanup …"
-  if timeout 60 bash "$reaper" >> "$LOG" 2>&1; then
+  if TRANSCRIPT_REAPER_PROD=1 timeout 60 bash "$reaper" >> "$LOG" 2>&1; then
     log "transcript-reap OK"
   else
     log "transcript-reap FAILED or aborted (nonzero exit) — see log lines above"

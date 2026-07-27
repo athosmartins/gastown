@@ -99,6 +99,37 @@ fi
 rm -rf "$FAKE_CITY"
 
 echo ""
+echo "=== _reap_dead_transcripts: production sentinel wiring (ga-lfj05) ==="
+# Same proof as _reap_dead_scratch above, for the sibling lever: transcript-
+# reaper.sh's own header names _reap_dead_transcripts as the ONLY allowed
+# setter of TRANSCRIPT_REAPER_PROD=1. Hermetic: CITY is a plain global (not
+# readonly), reassigned here to a disposable tmp dir containing a FAKE
+# transcript-reaper.sh that only records what env it received — never
+# touches the real transcript-reaper.sh, no real `gc session list`, no real
+# deletion.
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city2.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/transcript-reaper.sh" <<EOF
+#!/bin/bash
+echo "PROD=\${TRANSCRIPT_REAPER_PROD:-unset}" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/transcript-reaper.sh"
+
+REAL_CITY="$CITY"
+CITY="$FAKE_CITY"
+_reap_dead_transcripts
+CITY="$REAL_CITY"
+
+if [ -f "$CAPTURE_FILE" ] && grep -qx "PROD=1" "$CAPTURE_FILE"; then
+  ok "_reap_dead_transcripts: sets TRANSCRIPT_REAPER_PROD=1 when invoking the real reaper (production opt-in wired)"
+else
+  bad "_reap_dead_transcripts: did NOT set TRANSCRIPT_REAPER_PROD=1 — real launchd path would silently dry-run forever (got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing'))"
+fi
+rm -rf "$FAKE_CITY"
+
+echo ""
 echo "=== main(): CRITICAL-latch across reclaim reclassification (gate-fix-1: GATE-FEEDBACK gate_run=ga-wisp-9b4hnh) ==="
 # The pure-function tests above prove _should_notify is correct in ISOLATION.
 # They do NOT exercise main() itself, which is where the actual bug lived:

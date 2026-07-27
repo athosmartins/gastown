@@ -55,6 +55,16 @@
 # Kill switch: TRANSCRIPT_REAPER_ENABLED=0 -> dry-run regardless of
 # TRANSCRIPT_REAPER_DRY_RUN (logs candidates, deletes nothing).
 #
+# PRODUCTION SENTINEL (ga-lfj05, completing ga-h565g's ask for this file — the
+# 2026-07-26 incident where THIS script deleted 185 real transcripts because
+# its selftest's harness bug left the resolved root at its REAL default
+# instead of a tmp fixture): whenever the resolved root exactly equals the
+# hardcoded real default AND TRANSCRIPT_REAPER_PROD!=1, main() forces a
+# dry-run regardless of TRANSCRIPT_REAPER_DRY_RUN — the same harness mistake
+# (forgetting to override the root) can never delete real data again unless
+# the caller ALSO explicitly opts in. Set ONLY by the real caller
+# (dolt-disk-floor-guard.sh's _reap_dead_transcripts) — never by a test.
+#
 # TEST (no real ~/.claude/projects data touched, no real deletions against live
 # data — the integration test uses a disposable tmp root):
 #   bash scripts/transcript-reaper.selftest.sh
@@ -63,13 +73,15 @@
 set -uo pipefail
 
 CITY="/Users/athos/gt/.gascity-gastown-hq"
-TRANSCRIPT_ROOT="${TRANSCRIPT_REAPER_ROOT:-/Users/athos/.claude/projects}"
+TRANSCRIPT_REAL_DEFAULT_ROOT="/Users/athos/.claude/projects"
+TRANSCRIPT_ROOT="${TRANSCRIPT_REAPER_ROOT:-$TRANSCRIPT_REAL_DEFAULT_ROOT}"
 LOG="${TRANSCRIPT_REAPER_LOG:-$CITY/.gc/logs/transcript-reaper.log}"
 GC="${GC_BIN:-gc}"
 ENABLED="${TRANSCRIPT_REAPER_ENABLED:-1}"
 DRY_RUN="${TRANSCRIPT_REAPER_DRY_RUN:-0}"
 MIN_AGE_HOURS="${TRANSCRIPT_REAPER_MIN_AGE_HOURS:-72}"
 SELF_SESSION_ID="${CLAUDE_CODE_SESSION_ID:-}"
+PROD="${TRANSCRIPT_REAPER_PROD:-0}"
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
@@ -119,6 +131,19 @@ _should_reap() {
 # /Users/athos/gt/.gascity-gastown-hq -> -Users-athos-gt--gascity-gastown-hq.
 _workdir_to_project_slug() {
   printf '%s' "$1" | tr '/.' '-'
+}
+
+# _prod_sentinel_active <resolved_root> <real_default_root> <prod_flag> → 0
+# (true) iff resolved_root exactly equals real_default_root AND prod_flag is
+# not "1". This is the ga-h565g guard (completed for this file by ga-lfj05): a
+# caller (test or otherwise) that fails to override the root — leaving it at
+# its real-default value — must never be able to trigger deletion just
+# because it ALSO forgot to opt in; both conditions are required to authorize
+# touching the real default root. Identical to scratchpad-reaper.sh's
+# function of the same name.
+_prod_sentinel_active() {
+  local root="$1" real_default="$2" prod="$3"
+  [ "$root" = "$real_default" ] && [ "$prod" != "1" ]
 }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -218,6 +243,11 @@ main() {
   if [ ! -d "$TRANSCRIPT_ROOT" ]; then
     log "TRANSCRIPT_ROOT $TRANSCRIPT_ROOT does not exist — nothing to do"
     return 0
+  fi
+
+  if _prod_sentinel_active "$TRANSCRIPT_ROOT" "$TRANSCRIPT_REAL_DEFAULT_ROOT" "$PROD"; then
+    log "SENTINEL: resolved root ($TRANSCRIPT_ROOT) equals the real default and no production opt-in is set (TRANSCRIPT_REAPER_PROD=1) — forcing dry-run this cycle (ga-h565g production sentinel)"
+    DRY_RUN=1
   fi
 
   local keyfile now reaped=0 freed_kb=0 candidates=0
