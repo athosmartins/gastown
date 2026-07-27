@@ -55,6 +55,91 @@ _should_reap "dead-session-9"  "$KEYFILE" "$OLD"    "$NOW" 72 "dead-session-9" &
 _should_reap "alive-session-1" "$KEYFILE" "$OLD"    "$NOW" 72 "dead-session-9" && bad "should_reap: unrelated self id must not change a live session's outcome" || ok "should_reap: self set but different id → still protected by liveness"
 
 echo ""
+echo "=== _workdir_to_project_slug: Claude Code's '/' and '.' -> '-' convention ==="
+[ "$(_workdir_to_project_slug "/Users/athos/gt/.gascity-gastown-hq")" = "-Users-athos-gt--gascity-gastown-hq" ] \
+  && ok "workdir_to_project_slug: matches this machine's live ~/.claude/projects/ naming" \
+  || bad "workdir_to_project_slug: slug mismatch vs. verified live directory name"
+[ "$(_workdir_to_project_slug "/a/b")" = "-a-b" ] \
+  && ok "workdir_to_project_slug: simple path, no dots" \
+  || bad "workdir_to_project_slug: simple path mismatch"
+
+echo ""
+echo "=== _shield_unresolved_session: null-session_key protection by work_dir ==="
+SHIELD_ROOT="$(mktemp -d /tmp/transcript-reaper-selftest-shield.XXXXXX)"
+mkdir -p "$SHIELD_ROOT/-work-dir-slug"
+: > "$SHIELD_ROOT/-work-dir-slug/some-session-a.jsonl"
+: > "$SHIELD_ROOT/-work-dir-slug/some-session-b.jsonl"
+SHIELD_OUT="$(mktemp /tmp/transcript-reaper-selftest-shieldout.XXXXXX)"
+
+_shield_unresolved_session "$SHIELD_OUT" "/work/dir/slug" "$SHIELD_ROOT"
+grep -qxF "some-session-a" "$SHIELD_OUT" && grep -qxF "some-session-b" "$SHIELD_OUT" \
+  && ok "shield_unresolved_session: every .jsonl under the mapped project dir is shielded" \
+  || bad "shield_unresolved_session: shielded ids missing from out file"
+
+: > "$SHIELD_OUT"
+_shield_unresolved_session "$SHIELD_OUT" "" "$SHIELD_ROOT"
+[ ! -s "$SHIELD_OUT" ] && ok "shield_unresolved_session: empty work_dir → no-op (nothing to shield)" || bad "shield_unresolved_session: empty work_dir should no-op"
+
+: > "$SHIELD_OUT"
+_shield_unresolved_session "$SHIELD_OUT" "/no/such/mapped/dir" "$SHIELD_ROOT"
+[ ! -s "$SHIELD_OUT" ] && ok "shield_unresolved_session: project dir doesn't exist → no-op" || bad "shield_unresolved_session: nonexistent project dir should no-op"
+
+rm -rf "$SHIELD_ROOT"
+rm -f "$SHIELD_OUT"
+
+echo ""
+echo "=== _fetch_live_keys: real jq pipeline against a stubbed 'gc session list --json' ==="
+# GATE-FLAGGED BUG (ga-t1ub9, fix-attempt 1 FAIL): the original _fetch_live_keys
+# used `.session_key // empty`, silently dropping any session with a null/absent
+# session_key from the live set — giving it ZERO reap protection. This section
+# exercises the REAL _fetch_live_keys (not stubbed, unlike the main() test
+# below) against a fake `gc` binary, so the actual jq parsing this bug lived in
+# is under test, not just the pure helper functions.
+FLK_ROOT="$(mktemp -d /tmp/transcript-reaper-selftest-flk.XXXXXX)"
+mkdir -p "$FLK_ROOT/-null-with-dir"
+: > "$FLK_ROOT/-null-with-dir/shielded-1.jsonl"
+: > "$FLK_ROOT/-null-with-dir/shielded-2.jsonl"
+
+FAKE_GC_DIR="$(mktemp -d /tmp/transcript-reaper-selftest-gcbin.XXXXXX)"
+cat > "$FAKE_GC_DIR/fake-gc" <<'FAKEGC'
+#!/bin/bash
+cat <<JSON
+{"sessions":[
+  {"id":"ga-live1","session_name":"live-one","state":"active","session_key":"real-uuid-live-one","work_dir":"/irrelevant"},
+  {"id":"ga-nullwd","session_name":"null-with-dir","state":"asleep","session_key":null,"work_dir":"/null/with/dir"},
+  {"id":"ga-nullnodir","session_name":"null-no-workdir","state":"active","session_key":""}
+]}
+JSON
+FAKEGC
+chmod +x "$FAKE_GC_DIR/fake-gc"
+
+FLK_OUT="$(mktemp /tmp/transcript-reaper-selftest-flkout.XXXXXX)"
+# Internal var names, not their TRANSCRIPT_REAPER_*/GC_BIN env counterparts —
+# same footgun as TRANSCRIPT_ROOT/ENABLED/DRY_RUN below (env vars resolve once
+# at source time; reassigning the env name here would silently no-op).
+TRANSCRIPT_ROOT="$FLK_ROOT"
+GC="$FAKE_GC_DIR/fake-gc"
+: > "$TRANSCRIPT_REAPER_LOG"
+
+_fetch_live_keys "$FLK_OUT"
+FLK_RC=$?
+
+[ "$FLK_RC" -eq 0 ] && ok "fetch_live_keys: well-formed sessions payload → success (rc=0)" || bad "fetch_live_keys: unexpected nonzero rc=$FLK_RC"
+grep -qxF "real-uuid-live-one" "$FLK_OUT" && ok "fetch_live_keys: real session_key passes through unchanged" || bad "fetch_live_keys: real session_key missing from out file"
+grep -qxF "shielded-1" "$FLK_OUT" && grep -qxF "shielded-2" "$FLK_OUT" \
+  && ok "fetch_live_keys: null-session_key entry's work_dir shields its project dir's transcripts" \
+  || bad "fetch_live_keys: null-key work_dir shielding did not protect its project dir's files — THE GATE-FLAGGED BUG"
+grep -q "null-with-dir" "$TRANSCRIPT_REAPER_LOG" && grep -q "shielding its project dir" "$TRANSCRIPT_REAPER_LOG" \
+  && ok "fetch_live_keys: null-session_key gap is logged (never silently dropped)" \
+  || bad "fetch_live_keys: null-session_key gap must be logged, not silently dropped"
+grep -q "null-no-workdir" "$TRANSCRIPT_REAPER_LOG" && grep -q "cannot shield" "$TRANSCRIPT_REAPER_LOG" \
+  && ok "fetch_live_keys: null-session_key WITHOUT work_dir logs an explicit cannot-shield warning" \
+  || bad "fetch_live_keys: missing cannot-shield warning when work_dir is also absent"
+
+rm -rf "$FLK_ROOT" "$FAKE_GC_DIR"
+rm -f "$FLK_OUT"
+
+echo ""
 echo "=== main(): end-to-end integration against a disposable tmp root ==="
 # Fixture layout under a throwaway TRANSCRIPT_ROOT (never real ~/.claude/projects):
 #   proj/live-sess.jsonl        — LIVE session, OLD mtime  → must survive (liveness beats age)

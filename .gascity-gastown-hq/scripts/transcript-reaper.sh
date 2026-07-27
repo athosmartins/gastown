@@ -39,6 +39,12 @@
 #     `gc session list` yet.
 #   - Only the exact `<session-id>.jsonl` file (+ its same-named sibling dir,
 #     when present) is removed — never a differently-named file.
+#   - A session list entry with a null/absent `session_key` (observed for a
+#     registered-but-never-started slot, and for a non-Claude managed process
+#     sharing the same session list) is NOT treated as dead — its work_dir's
+#     entire project directory is shielded from reaping instead, since its
+#     transcript filename (if any) can't be named directly. See
+#     _fetch_live_keys/_shield_unresolved_session (gate:fix-attempt:1 finding).
 #
 # OUT OF SCOPE: directories under ~/.claude/projects with NO matching `.jsonl`
 # (observed to exist on this machine — a distinct leak, not what ga-t1ub9's fix
@@ -107,6 +113,14 @@ _should_reap() {
   _is_stale "$mtime" "$now" "$min_hours"
 }
 
+# _workdir_to_project_slug <work_dir> → the Claude Code project-directory
+# name derived from a working directory: every '/' and '.' becomes '-'.
+# Verified against this machine's live ~/.claude/projects/ entries, e.g.
+# /Users/athos/gt/.gascity-gastown-hq -> -Users-athos-gt--gascity-gastown-hq.
+_workdir_to_project_slug() {
+  printf '%s' "$1" | tr '/.' '-'
+}
+
 # ════════════════════════════════════════════════════════════════════════════
 # EXECUTION (side-effecting). transcript-reaper.selftest.sh unit-tests the
 # pure functions above AND integration-tests main() end-to-end against a
@@ -115,13 +129,48 @@ _should_reap() {
 # irreplaceable data, not regeneratable scratch).
 # ════════════════════════════════════════════════════════════════════════════
 
-# _fetch_live_keys <out_file> → writes one session_key per line to out_file.
+# _shield_unresolved_session <out_file> <work_dir> <transcript_root> —
+# appends every session-id found under <work_dir>'s project directory to
+# <out_file> (the same live-keys file _session_is_live reads). Used for a
+# `gc session list` entry that has NO session_key: we can't name its
+# transcript file directly (no UUID on record), but any .jsonl already
+# sitting in its project directory could be it, so all of them get the same
+# protection a genuinely-live session_key would grant. No-op when work_dir
+# is empty or its project directory doesn't exist — nothing to shield.
+_shield_unresolved_session() {
+  local out="$1" work_dir="$2" root="$3" dir f sid
+  [ -n "$work_dir" ] || return 0
+  dir="$root/$(_workdir_to_project_slug "$work_dir")"
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/*.jsonl; do
+    [ -f "$f" ] || continue
+    sid="$(basename "$f" .jsonl)"
+    printf '%s\n' "$sid" >> "$out"
+  done
+}
+
+# _fetch_live_keys <out_file> → writes one session_key per line to out_file,
+# PLUS shielded ids for sessions we can't positively name (see below).
 # Returns nonzero on ANY failure to positively confirm liveness data (nonzero
 # exit, empty stdout, or JSON with no `.sessions` key) — a failure here must
 # abort the whole cycle upstream, never be read as "nobody's alive, reap
 # everything" (ga-p5q3 class). Deliberately no --state flag: the default
 # listing (active + suspended/asleep + anything not closed) is exactly
 # ga-t1ub9's stated dead-session criterion.
+#
+# session_key can be null/absent on a live entry — observed on this system
+# for a registered-but-never-started session slot (last_active is the zero
+# value) and for a non-Claude managed process tracked by the same session
+# list. The original implementation dropped these via `// empty`, giving
+# them ZERO reap protection: _session_is_live can only match an id it was
+# told about, so if such an entry ever turns out to own a real .jsonl,
+# nothing would stop it being reaped once stale — the exact third-state
+# collapse (unknown treated as the wrong-direction default) this reaper's
+# own safety contract forbids. We can't name their transcript file (no
+# session_key), so instead of excluding them we shield by work_dir: every
+# .jsonl already in that project directory is added to the SAME live-keys
+# file real session_keys go into. Over-protecting a directory is the safe
+# direction for an irreversible delete; under-protecting one is not.
 _fetch_live_keys() {
   local out="$1" raw rc
   raw="$("$GC" session list --json 2>/dev/null)"
@@ -134,7 +183,28 @@ _fetch_live_keys() {
     log "ABORT: 'gc session list --json' output has no .sessions key — cannot verify liveness"
     return 1
   fi
-  printf '%s' "$raw" | jq -r '.sessions[]?.session_key // empty' > "$out" 2>/dev/null
+
+  : > "$out"
+  printf '%s' "$raw" | jq -r '.sessions[] | select((.session_key // "") != "") | .session_key' >> "$out" 2>/dev/null
+
+  local unresolved entry name id state wd
+  unresolved="$(printf '%s' "$raw" | jq -c '.sessions[] | select((.session_key // "") == "")' 2>/dev/null)"
+  if [ -n "$unresolved" ]; then
+    while IFS= read -r entry; do
+      [ -n "$entry" ] || continue
+      name="$(printf '%s' "$entry" | jq -r '.session_name // .name // "?"' 2>/dev/null)"
+      id="$(printf '%s' "$entry" | jq -r '.id // "?"' 2>/dev/null)"
+      state="$(printf '%s' "$entry" | jq -r '.state // "?"' 2>/dev/null)"
+      wd="$(printf '%s' "$entry" | jq -r '.work_dir // empty' 2>/dev/null)"
+      if [ -n "$wd" ]; then
+        log "session $name ($id, state=$state) has no session_key — shielding its project dir ($wd) instead of treating it as dead"
+        _shield_unresolved_session "$out" "$wd" "$TRANSCRIPT_ROOT"
+      else
+        log "WARNING: session $name ($id, state=$state) has no session_key AND no work_dir — cannot shield; a transcript of its would have no reap protection"
+      fi
+    done <<< "$unresolved"
+  fi
+  return 0
 }
 
 main() {
