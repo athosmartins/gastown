@@ -170,6 +170,75 @@ for pid in "${DECOY_PIDS[@]}"; do kill "$pid" >/dev/null 2>&1 || true; done
 DECOY_PIDS=()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Gate-review regression (fix-attempt 2): pkill/killall glued flush against a
+# preceding shell separator with no whitespace must still be caught -- plain
+# shlex.split only splits on whitespace, so e.g. "hi;pkill" was one token that
+# never matched the "pkill" basename check, silently hiding the invocation
+# from the guard entirely (confirmed allow-by-default before this fix).
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- gate-review regression: separator-glued pkill/killall is still caught --"
+
+run_guard 'echo hi;pkill -f "anuncios_dashboard.py" -U $(id -u)'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "';pkill' glued with no space still denied" \
+  || bad "';pkill' glued with no space should be denied, got rc=$RC out=$OUT"
+
+run_guard 'cd /tmp&&pkill -f "anuncios_dashboard.py" -U $(id -u)'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "'&&pkill' glued with no space still denied" \
+  || bad "'&&pkill' glued with no space should be denied, got rc=$RC out=$OUT"
+
+run_guard 'true||pkill -f "anuncios_dashboard.py" -U $(id -u)'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "'||pkill' glued with no space still denied" \
+  || bad "'||pkill' glued with no space should be denied, got rc=$RC out=$OUT"
+
+run_guard 'true|pkill -f "anuncios_dashboard.py" -U $(id -u)'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "'|pkill' (single pipe) glued with no space still denied" \
+  || bad "'|pkill' glued with no space should be denied, got rc=$RC out=$OUT"
+
+# Quoting must still protect a pattern that legitimately contains a separator
+# character -- this must NOT be misread as a second glued invocation.
+run_guard "pkill -f 'foo;bar;baz'"
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" != "deny" ] \
+  && ok "semicolon INSIDE a quoted pattern is not mistaken for a separator" \
+  || bad "quoted-semicolon pattern should be allowed, got rc=$RC out=$OUT"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gate-review regression (fix-attempt 2): a pattern built from an unexpanded
+# shell variable/substitution must never be silently confirmed "safe" just
+# because pgrep finds zero matches for the LITERAL variable-reference text --
+# that zero-matches read says nothing about what the pattern actually expands
+# to once the shell resolves it at runtime (confirmed allow-by-default, on a
+# machine with a real live claude session pgrep would have matched, before
+# this fix).
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- gate-review regression: unexpanded-variable pattern is refused, not silently allowed --"
+
+run_guard 'TARGET=claude ; pkill -f "$TARGET"'
+if [ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ]; then
+  ok "pkill -f \"\$TARGET\" (unexpanded) denied instead of silently confirmed safe"
+else
+  bad "unexpanded-variable pattern should be denied, got rc=$RC out=$OUT"
+fi
+echo "$OUT" | jq -e '.hookSpecificOutput.permissionDecisionReason | contains("unexpanded")' >/dev/null 2>&1 \
+  && ok "unexpanded-variable deny reason explains why" \
+  || bad "deny reason should explain the unexpanded-variable refusal, got: $(echo "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason // "MISSING"')"
+
+run_guard 'pkill -f "${TARGET}"'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "pkill -f \"\${TARGET}\" (braced variable) denied" \
+  || bad "braced-variable pattern should be denied, got rc=$RC out=$OUT"
+
+run_guard 'pkill -f "$(hostname)"'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "pkill -f \"\$(hostname)\" (command substitution) denied" \
+  || bad "command-substitution pattern should be denied, got rc=$RC out=$OUT"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Activation script: idempotent compose-not-replace merge into a SCRATCH
 # settings.json (never the live file).
 # ─────────────────────────────────────────────────────────────────────────────

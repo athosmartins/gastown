@@ -10,13 +10,21 @@ production anuncios-dashboard daemon in the same second. See bead ga-jo3xl.
 
 WHAT: reads a single Claude Code PreToolUse hook payload from stdin. When
 tool_name is "Bash" and tool_input.command contains a pkill/killall
-invocation, denies when:
+invocation -- including one glued flush against a preceding ;/&&/||/|/&
+with no whitespace, e.g. "echo hi;pkill ..." -- denies when:
   (a) the pattern is not the last argument (a flag or its value follows it)
       -- the exact defect above, checked by pure argv inspection;
-  (b) the pattern currently matches any process whose command line contains
+  (b) the pattern contains unexpanded shell variable/substitution syntax
+      ($VAR, ${VAR}, $(...), a backtick) -- checking the literal text
+      against the process table would prove nothing about what the pattern
+      actually expands to at runtime, so this is refused rather than
+      silently read as "confirmed safe";
+  (c) the pattern currently matches any process whose command line contains
       "claude" (checked read-only via `pgrep -fl`);
-  (c) the pattern currently matches more than N processes (default 5,
-      override via PKILL_GUARD_MAX_MATCHES).
+  (d) the pattern currently matches more than N processes (default 5,
+      override via PKILL_GUARD_MAX_MATCHES);
+  (e) pgrep itself fails or times out while checking (c)/(d) -- a genuine
+      "cannot verify" is never treated the same as a confirmed-safe read.
 Every other command -- including plain `kill $PID` -- is allowed untouched.
 Only pkill/killall invocations are ever inspected; the candidate command
 itself is never executed by this guard.
@@ -42,18 +50,41 @@ OVERALL_BUDGET_SECS = 0.9  # stays under the <1s budget (AC4) with margin
 # BSD pkill/killall flags that consume the NEXT token as a value (space-
 # separated, e.g. `-U 501`, never glued). Every other `-x`-shaped token is
 # treated as a standalone boolean flag (-f, -v, -x, -9, -e, -i, ...).
-ARG_TAKING_FLAGS = {"-t", "-u", "-U", "-g", "-G", "-P", "-d", "-s"}
+# -F (pidfile) and -j (jail, FreeBSD-only but harmless to include) also take
+# a value; missing them let `pkill -F file.pid -f X` misfire rule (a), since
+# the pidfile path would be mistaken for the pattern.
+ARG_TAKING_FLAGS = {"-t", "-u", "-U", "-g", "-G", "-P", "-d", "-s", "-F", "-j"}
 
 CMD_RE = re.compile(r"\b(pkill|killall)\b")
-SEPARATORS = (";", "&&", "||", "|")
+# Includes bare "&" (backgrounding) alongside the compound/pipe operators --
+# same class of shell control token as ";"/"&&"/"||"/"|", and a pkill/killall
+# glued flush against any of these with no whitespace must still be split
+# into its own invocation (see _tokenize below), not swallowed into the
+# neighboring command's argument list.
+SEPARATORS = (";", "&&", "||", "|", "&")
+
+
+def _tokenize(command):
+    """Tokenize like shlex.split, but also split shell control operators
+    (;, &&, ||, |, &) into their own tokens even when glued flush against a
+    neighboring word with no whitespace (e.g. "echo hi;pkill ..."). Plain
+    shlex.split only splits on whitespace, so a glued separator leaves the
+    next command's name fused onto it as one token (e.g. "hi;pkill") that
+    never matches the "pkill"/"killall" basename check in find_invocations
+    -- silently hiding that entire invocation from the guard. Quoting still
+    protects separator characters that are genuinely part of a pattern
+    (e.g. 'foo;bar' stays one token); this only affects unquoted operators."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    return list(lexer)
 
 
 def find_invocations(command):
     """Yield the argv list following each pkill/killall command-word
     occurrence in `command`, each cut off at the next shell separator token
-    (;, &&, ||, |) or end of string. Raises on unparseable input (unbalanced
-    quotes) -- caller is responsible for failing open."""
-    tokens = shlex.split(command, posix=True)
+    (;, &&, ||, |, &) or end of string. Raises on unparseable input
+    (unbalanced quotes) -- caller is responsible for failing open."""
+    tokens = _tokenize(command)
     n = len(tokens)
     i = 0
     while i < n:
@@ -93,6 +124,22 @@ def pattern_not_last(args):
 def extract_pattern(args):
     idx = first_operand_index(args)
     return args[idx] if idx is not None else None
+
+
+UNVERIFIABLE_PATTERN_RE = re.compile(r"\$\{|\$\(|\$[A-Za-z_]|`")
+
+
+def pattern_unverifiable(pattern):
+    """True if `pattern` contains unexpanded shell variable/substitution
+    syntax ($VAR, ${VAR}, $(...), or a backtick command substitution).
+    pgrep would match this LITERALLY against the current process table --
+    e.g. checking the literal text "$TARGET" finds ~zero matches on any
+    real machine, which looks like "confirmed safe" but says nothing about
+    what killing "$TARGET" will actually match once the shell expands it at
+    runtime. Collapsing that unknown into a confirmed-safe read is the same
+    error-vs-empty bug class as the pgrep_matches None/[] distinction below
+    -- this function exists so decide() can tell the two apart too."""
+    return bool(UNVERIFIABLE_PATTERN_RE.search(pattern))
 
 
 def pgrep_matches(pattern):
@@ -139,9 +186,36 @@ def decide(command, max_matches):
         if not pattern:
             continue
 
+        if pattern_unverifiable(pattern):
+            return "deny", (
+                "pkill/killall pattern %r contains unexpanded shell "
+                "variable/substitution syntax ($VAR, ${VAR}, $(...), or a "
+                "backtick) -- this guard can only check the LITERAL text "
+                "against the current process table, not whatever the shell "
+                "actually expands it to when the command runs, so a clean "
+                "read here proves nothing about what will really get "
+                "killed. Refusing rather than silently treating 'could not "
+                "verify' as 'verified safe'. Expand the variable yourself "
+                "and re-run `pgrep -lf <expanded-pattern>` to confirm what "
+                "it actually matches, or use a literal pattern instead."
+                % pattern
+            )
+
         matches = pgrep_matches(pattern)
         if matches is None:
-            continue  # could not confirm -> do not block on an unconfirmed read
+            # pgrep itself failed/timed out -- a legitimate "cannot verify"
+            # result (AC4's fail-open covers this SCRIPT erroring, not an
+            # external check coming back inconclusive), so this must not
+            # silently fall through to the same "allow" a confirmed-zero-
+            # matches read would produce.
+            return "deny", (
+                "pkill/killall pattern %r could not be verified -- pgrep "
+                "itself failed or timed out, so this guard cannot confirm "
+                "whether it's safe. Refusing rather than treating 'could "
+                "not check' as 'verified safe'. Validate manually with "
+                "`pgrep -lf %r` before retrying."
+                % (pattern, pattern)
+            )
 
         if any("claude" in line.lower() for line in matches):
             return "deny", (
