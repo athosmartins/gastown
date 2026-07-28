@@ -44,6 +44,26 @@ ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
 notify_fail() { "$NOTIFY" -t "Dolt S3 backup" -p 4 "🚨 $*" 2>/dev/null || true; }
 
+# ── PURE detection logic — unit-tested by dolt-s3-backup.selftest.sh ────────────
+# ga-b5h83: Dolt's background archive/GC can conjoin a raw table file into a .darc
+# archive on disk WITHOUT updating a stale LOCAL file:// backup manifest that still
+# references the pre-archive raw filename. DOLT_BACKUP('sync', ...) reads that
+# destination manifest for incremental diffing and chokes on the missing raw file.
+# This is STRUCTURAL, not transient — retrying the identical sync always fails the
+# same way; only a fresh full sync from a clean staging dir recovers.
+is_stale_manifest_error() {
+  case "$1" in
+    *"table file not found"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Library mode: `DOLT_S3_BACKUP_LIB=1 source dolt-s3-backup.sh` defines the pure
+# function above without running the live backup flow (lock/PORT/DOLT_BACKUP/S3).
+if [ "${DOLT_S3_BACKUP_LIB:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 mkdir -p "$CITY/.gc/logs" "$BACKUP_ROOT" 2>/dev/null || true
 
 # --- single-instance lock (portable; no flock dependency) with staleness reclaim ---
@@ -56,8 +76,8 @@ if ! mkdir "$LOCKDIR" 2>/dev/null; then
     exit 0
   fi
 fi
-META="$(mktemp)"; RAW="$(mktemp)"
-cleanup() { rmdir "$LOCKDIR" 2>/dev/null || true; rm -f "$META" "$RAW" 2>/dev/null || true; }
+META="$(mktemp)"; RAW="$(mktemp)"; SYNC_OUT="$(mktemp)"
+cleanup() { rmdir "$LOCKDIR" 2>/dev/null || true; rm -f "$META" "$RAW" "$SYNC_OUT" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
 # --- read the Dolt port from the authoritative config each run (NEVER hardcode) ---
@@ -101,8 +121,25 @@ for db in $DBS; do
   head="$(dsql -q "SELECT commit_hash FROM \`$db\`.dolt_log ORDER BY date DESC LIMIT 1" --result-format csv 2>/dev/null | tail -1)"
   # 1) native consistent backup -> local staging (incremental)
   if ! DOLT_CLI_PASSWORD='' timeout "$SYNC_TIMEOUT" "$DOLT" --host "$HOST" --port "$PORT" \
-        --user root --no-tls sql -q "USE \`$db\`; CALL DOLT_BACKUP('sync', '${db}-backup');" >> "$LOG" 2>&1; then
-    log "$db: DOLT_BACKUP sync FAILED"; failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
+        --user root --no-tls sql -q "USE \`$db\`; CALL DOLT_BACKUP('sync', '${db}-backup');" > "$SYNC_OUT" 2>&1; then
+    cat "$SYNC_OUT" >> "$LOG"
+    if is_stale_manifest_error "$(cat "$SYNC_OUT")"; then
+      # Structural staging corruption (see is_stale_manifest_error above). The
+      # local staging is regenerable — never touches live .beads/dolt or S3 — so
+      # wipe just this db's dest and retry ONCE with a fresh full sync.
+      log "$db: stale-manifest staging detected — auto-reinit ${dest} and retry once"
+      case "$dest" in
+        "$BACKUP_ROOT"/*) rm -rf "${dest:?}" ;;
+        *) log "$db: REFUSING auto-reinit — dest '$dest' outside BACKUP_ROOT (safety guard)" ;;
+      esac
+      if ! DOLT_CLI_PASSWORD='' timeout "$SYNC_TIMEOUT" "$DOLT" --host "$HOST" --port "$PORT" \
+            --user root --no-tls sql -q "USE \`$db\`; CALL DOLT_BACKUP('sync', '${db}-backup');" >> "$LOG" 2>&1; then
+        log "$db: DOLT_BACKUP sync FAILED (after auto-recover retry)"; failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
+      fi
+      log "$db: auto-recover OK after staging reinit"
+    else
+      log "$db: DOLT_BACKUP sync FAILED"; failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"; continue
+    fi
   fi
   # 2) off-box mirror -> S3 (incremental; prune orphans; versioning retains history)
   if ! timeout "$S3_TIMEOUT" "$AWS" s3 sync "$dest/" "$S3/$db/" --delete --only-show-errors >> "$LOG" 2>&1; then
