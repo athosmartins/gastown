@@ -5006,6 +5006,64 @@ has "$DISPATCHER" 'ga-r4jnu'              "ga-r4jnu fix comment is wired"
 has "$DISPATCHER" 'disparos?'             "disparo keyword now requires a word boundary"
 has "$DISPATCHER" 'area-infra-label'      "area-infra-label exemption reason is wired"
 
+# ── Scenario ga-2n7xw (refusal-successor invariant): the shared hold/escalate
+# counter reaches the cap and ESCALATES (never holds forever) at the two
+# call sites this file already has rich end-to-end fixtures for. Unit
+# coverage of the shared _pilot_hold_or_escalate mechanism itself (all 3
+# sites, including ga-4zqwm which has no end-to-end harness here, plus
+# mutation-content and drift-guard checks) lives in the sibling file
+# pilot-hold-escalate.selftest.sh — kept separate so this already-huge file
+# (~140s) doesn't grow a second, slower way to test the same function.
+echo "Scenario ga-2n7xw-a: ga-lfvs6 domain-build hold #1 (busy crew, fresh bead) → held, NOT escalated"
+LOG_2N7XW_A="$(run_capacity 10 "$INFLIGHT18E" 1 "$PS_DOMAIN_SMALL" "$SESSIONS18E" "$SLINGMAP18E")"
+if echo "$LOG_2N7XW_A" | grep -qF "WOULD stamp pilot:held-count:ga-lfvs6:1 on ga-wgtest (hold 1/3)"; then
+  ok "ga-lfvs6 1st hold stamps the counter at 1/3"
+else
+  bad "ga-lfvs6 1st hold did not stamp the counter as expected"
+fi
+if echo "$LOG_2N7XW_A" | grep -qF "WOULD ESCALATE"; then
+  bad "REGRESSION: ga-lfvs6 escalated on the very first hold (cap=3)"
+else
+  ok "ga-lfvs6 1st hold correctly did NOT escalate"
+fi
+
+echo "Scenario ga-2n7xw-b: ga-lfvs6 domain-build hold #3 (prior count=2 already on the bead) → ESCALATES, not another hold"
+PS_DOMAIN_SMALL_HELD2='[{"id":"ga-wgtest","title":"Mapeamento automatico de falecimento de proprietarios idosos (scraper RFB semanal)","priority":3,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["lane:small","story:approved","pilot:held-count:ga-lfvs6:2"],"assignee":null,"created_at":"2026-06-12T00:00:01Z","metadata":{"story.o_que_e":"scraper semanal que verifica na Receita Federal o CPF dos proprietarios dos imoveis de interesse"}}]'
+LOG_2N7XW_B="$(run_capacity 10 "$INFLIGHT18E" 1 "$PS_DOMAIN_SMALL_HELD2" "$SESSIONS18E" "$SLINGMAP18E")"
+if echo "$LOG_2N7XW_B" | grep -qF "WOULD ESCALATE ga-wgtest (ga-lfvs6, hold 3/3) to Mayor"; then
+  ok "ga-lfvs6 3rd consecutive hold ESCALATES (by the ga-lfvs6-slug counter, not a generic side effect)"
+else
+  bad "ga-lfvs6 3rd hold did not escalate as expected (log: $LOG_2N7XW_B)"
+fi
+if echo "$LOG_2N7XW_B" | grep -qF "WOULD stamp pilot:held-count:ga-lfvs6:3"; then
+  bad "REGRESSION: ga-lfvs6 3rd hold stamped ANOTHER hold instead of escalating"
+else
+  ok "ga-lfvs6 3rd hold did not fall back to a plain hold"
+fi
+
+echo "Scenario ga-2n7xw-c: ga-jazy9 lane:big hold #1 (generic, no domain match, no live owner) → held, leaves a trace (was: NONE at all pre-fix)"
+GENERIC_BIG_NOOWNER='[{"id":"ga-jazytest","title":"generic subsystem refactor","priority":2,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["lane:big"],"assignee":null,"created_at":"2026-07-01T00:00:01Z","metadata":{}}]'
+LOG_2N7XW_C="$(run_capacity 10 "[]" 1 "$GENERIC_BIG_NOOWNER")"
+if echo "$LOG_2N7XW_C" | grep -qF "ga-jazy9: REFUSING to dispatch lane:big ga-jazytest"; then
+  ok "precondition: generic lane:big bead with no live owner hits the ga-jazy9 refusal (unchanged by this fix)"
+else
+  bad "precondition failed: ga-jazy9 refusal did not fire for the generic lane:big fixture (got builder: $(dispatched_builder "$LOG_2N7XW_C"))"
+fi
+if echo "$LOG_2N7XW_C" | grep -qF "WOULD stamp pilot:held-count:ga-jazy9:1 on ga-jazytest (hold 1/3)"; then
+  ok "AC3: ga-jazy9 (the worst-of-3 site) now leaves a trace on the FIRST hold — previously left none at all"
+else
+  bad "AC3 regression: ga-jazy9 did not stamp a counter on its first hold"
+fi
+
+echo "Scenario ga-2n7xw-d: ga-jazy9 lane:big hold #3 (prior count=2) → ESCALATES"
+GENERIC_BIG_HELD2='[{"id":"ga-jazytest","title":"generic subsystem refactor","priority":2,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["lane:big","pilot:held-count:ga-jazy9:2"],"assignee":null,"created_at":"2026-07-01T00:00:01Z","metadata":{}}]'
+LOG_2N7XW_D="$(run_capacity 10 "[]" 1 "$GENERIC_BIG_HELD2")"
+if echo "$LOG_2N7XW_D" | grep -qF "WOULD ESCALATE ga-jazytest (ga-jazy9, hold 3/3) to Mayor"; then
+  ok "ga-jazy9 3rd consecutive hold ESCALATES via the ga-jazy9-slug counter"
+else
+  bad "ga-jazy9 3rd hold did not escalate as expected (log: $LOG_2N7XW_D)"
+fi
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

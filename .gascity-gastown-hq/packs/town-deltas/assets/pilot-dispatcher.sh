@@ -1365,6 +1365,103 @@ _FILTER_PREAPPROVAL_LABELS='["story:unrefined","story:refinement-in-progress","s
 # script's own reclaim_decision(), which is Python-private and not import-safe
 # from a bash filter).
 _FILTER_RECLAIM_CAP=3
+
+# ── ga-2n7xw: refusal-successor invariant — shared hold/escalate counter ──────
+# Every Pilot refusal must ROUTE, ESCALATE, or TERMINATE — never silently
+# "defer and retry the same" forever (the pattern behind 3 real incidents:
+# ga-8jxe1 branch-veto deadlock, ga-q640n permission-dialog stall, ga-7ti1t
+# unmapped-crew hold renewed forever). This is the shared cap+escalate
+# mechanic for the 3 pre-dispatch refusal sites in this file: ga-lfvs6
+# (domain build, no idle crew), ga-jazy9 (lane:big, no dog pool), ga-4zqwm
+# (Mayor-deferred hold).
+#
+# DELIBERATELY separate from pilot:reclaim-count (ga-am6h, owned by
+# inflight-reclaim-guard.py): that counter tracks POST-dispatch stranding of
+# an assigned/in-flight bead, recovered by a different daemon on a different
+# lifecycle. This one tracks PRE-dispatch holds on a bead that was never
+# assigned at all — same sticky-label shape (survives hold expiry), its own
+# namespace, its own cap.
+PILOT_HOLD_ESCALATE_CAP="${PILOT_HOLD_ESCALATE_CAP:-3}"
+
+# _pilot_hold_or_escalate <db> <bead_id> <slug> <reason> <unblock_hint> <labels_json> [<cap>]
+#   db          bd -C target for THIS bead (its own rig store or $GC_CITY)
+#   bead_id     the held/refused bead
+#   slug        short stable site tag — keeps each site's counter independent
+#               and makes the escalation trail attributable to the specific
+#               refusal that caused it (ga-lfvs6 / ga-jazy9 / ga-4zqwm)
+#   reason      literal, human-readable reason for THIS hold (AC2)
+#   unblock_hint human-readable "what would unblock this" (AC2)
+#   labels_json JSON array of the bead's CURRENT labels — the caller already
+#               has this in memory ($STORY / $_bead from its own candidate
+#               query), so no extra bd round-trip happens here
+#   cap         optional override of PILOT_HOLD_ESCALATE_CAP for this call
+#               (ga-4zqwm passes 1 — AC4: a hold that depends on a human must
+#               escalate on the FIRST occurrence, not the 3rd)
+#
+# Side effects only — no stdout contract; callers must not command-substitute
+# this. Always stamps the bumped sticky pilot:held-count:<slug>:<n> label
+# (same imp19 atomicity convention as pilot:held-until elsewhere in this
+# file: add the new stamp FIRST, then purge older stamps of the same slug, so
+# a mid-crash never loses the count). The purge reads the SAME in-memory
+# labels_json passed in rather than issuing a fresh `bd show` — a stale purge
+# can at worst leave one extra inert label behind (harmless: readers always
+# take the MAX of the prefix, never an exact match) — an acceptable tradeoff
+# for not adding a bd round-trip to every dispatch-refusal sweep.
+#
+# At/above cap: comments the bead, adds gate:needs-human + gate:needs-human:
+# technical (a Pilot-dispatch refusal is a technical/scoping circuit-breaker
+# park, not a product decision — mirrors do_escalate()'s rationale in
+# inflight-reclaim-guard.py; reusing the SAME sub-label means the existing
+# quorum-convergence-watchdog safety net also picks this up if the Mayor
+# doesn't respond), mails the Mayor once (via $GC_CITY — mail always routes
+# through the HQ regardless of which store `db` is, matching every other
+# `mail send mayor` call site in this pack), and logs ESCALATED. Respects
+# DRY_RUN (logs WOULD-* only, no mutation) exactly like every other mutation
+# in this file.
+_pilot_hold_or_escalate() {
+  local _phe_db="$1" _phe_id="$2" _phe_slug="$3" _phe_reason="$4" _phe_unblock="$5"
+  local _phe_labels="${6:-[]}" _phe_cap="${7:-$PILOT_HOLD_ESCALATE_CAP}"
+  local _phe_prefix="pilot:held-count:${_phe_slug}:"
+  local _phe_cur _phe_new
+  _phe_cur=$(printf '%s' "$_phe_labels" | jq -r --arg p "$_phe_prefix" \
+    '(. // []) | map(select(startswith($p)) | ltrimstr($p) | tonumber) | if length > 0 then max else 0 end' \
+    2>/dev/null)
+  case "$_phe_cur" in ''|*[!0-9]*) _phe_cur=0 ;; esac
+  _phe_new=$((_phe_cur + 1))
+
+  if [ "$DRY_RUN" = "1" ]; then
+    if [ "$_phe_new" -ge "$_phe_cap" ]; then
+      log "[pilot-hold] WOULD ESCALATE $_phe_id ($_phe_slug, hold $_phe_new/$_phe_cap) to Mayor: $_phe_reason"
+    else
+      log "[pilot-hold] WOULD stamp ${_phe_prefix}${_phe_new} on $_phe_id (hold $_phe_new/$_phe_cap)"
+    fi
+    return 0
+  fi
+
+  bd -C "$_phe_db" label add "$_phe_id" "${_phe_prefix}${_phe_new}" -q 2>/dev/null || true
+  local _phe_stale
+  for _phe_stale in $(printf '%s' "$_phe_labels" | jq -r --arg p "$_phe_prefix" '(. // [])[] | select(startswith($p))' 2>/dev/null); do
+    [ "$_phe_stale" = "${_phe_prefix}${_phe_new}" ] || bd -C "$_phe_db" label remove "$_phe_id" "$_phe_stale" -q 2>/dev/null || true
+  done
+
+  if [ "$_phe_new" -lt "$_phe_cap" ]; then
+    log "[pilot-hold] $_phe_slug: $_phe_id held ($_phe_new/$_phe_cap) — $_phe_reason"
+    return 0
+  fi
+
+  bd -C "$_phe_db" label add "$_phe_id" "gate:needs-human" -q 2>/dev/null || true
+  bd -C "$_phe_db" label add "$_phe_id" "gate:needs-human:technical" -q 2>/dev/null || true
+  bd -C "$_phe_db" comment "$_phe_id" \
+    "pilot-dispatcher ($_phe_slug / ga-2n7xw): ESCALATED after $_phe_new consecutive holds for the same reason (cap=$_phe_cap). Reason: $_phe_reason. What would unblock: $_phe_unblock. Not auto-closing — routing to the Mayor for a decision." \
+    2>/dev/null || true
+  gc --city "$GC_CITY" mail send mayor \
+    -s "Pilot hold escalation ($_phe_slug): $_phe_id" \
+    -m "$(printf 'Bead %s has been held/deferred %s time(s) for the same reason with no successor (ga-2n7xw invariant: every refusal must route, escalate, or terminate).\n\n  site:      %s\n  reason:    %s\n  unblock:   %s\n\nNot auto-closed. gate:needs-human(:technical) added; please route, unblock, or terminally close.' \
+      "$_phe_id" "$_phe_new" "$_phe_slug" "$_phe_reason" "$_phe_unblock")" \
+    2>/dev/null || true
+  log "[pilot-hold] $_phe_slug: $_phe_id ESCALATED to Mayor after $_phe_new holds (cap=$_phe_cap)"
+}
+
 _filter_candidates() {
   # imp19: pilot:held is now a TIMED hold — pass a bead with pilot:held only if a
   # pilot:held-until:<epoch> label exists AND the epoch is in the past (expired hold).
@@ -3508,6 +3605,14 @@ _mayor_deferred_hold_db() {
       [ "$_stale" = "pilot:held-until:${_hold_until}" ] || bd -C "$_db" label remove "$_bid" "$_stale" -q 2>/dev/null || true
     done
     log "ga-4zqwm: $_bid stamped pilot:held-until:${_hold_until} then pilot:held (${MAYOR_DEFERRED_HOLD_SECS}s — sling $_sling carries pool:refused:mayor-deferred) — Pilot stops re-dispatching until the hold expires or a human clears it"
+    # ga-2n7xw AC4: this hold's OWN log line says "until the hold expires OR A
+    # HUMAN CLEARS IT" — but nothing ever told the human. cap=1 so it escalates
+    # on the FIRST hold, not the 3rd: passive 24h waiting is not escalation.
+    _pilot_hold_or_escalate "$_db" "$_bid" "ga-4zqwm" \
+      "Mayor-deferred hold (sling $_sling carries pool:refused:mayor-deferred) — this hold is designed to require a human to clear it" \
+      "have the Mayor/a human review $_bid and either clear the hold, route it, or close it" \
+      "$(echo "$_bead" | jq -c '.labels // []' 2>/dev/null || echo '[]')" \
+      1
   done
 }
 
@@ -4922,6 +5027,13 @@ LIVESEC
                 done
                 log "ga-lfvs6/imp20: $STORY_ID stamped pilot:held-until:${_hold_until} then pilot:held (1h timed hold; prior held-until stamps purged — ga-4aree)"
               fi
+              # ga-2n7xw: count this hold toward the shared refusal-successor
+              # escalation cap — a domain build stuck with no idle crew must
+              # eventually reach the Mayor, not hold-and-retry forever.
+              _pilot_hold_or_escalate "$STORY_BEAD_CITY" "$STORY_ID" "ga-lfvs6" \
+                "$_DOMAIN_RIG domain build with no idle persistent-crew owner (owning crew: ${_DOM_DEFAULT:-unmapped})" \
+                "map/free a persistent crew for $_DOMAIN_RIG, or set a live explicit assignee on $STORY_ID" \
+                "$(echo "$STORY" | jq -c '.labels // []' 2>/dev/null || echo '[]')"
               return 1
             fi
           fi
@@ -4962,6 +5074,14 @@ LIVESEC
             bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
             bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
           fi
+          # ga-2n7xw: this was the WORST of the 3 refusal sites — it used to
+          # defer with NO label at all, no trace, no counter. At minimum,
+          # stamp the shared counter so a bead stuck here forever eventually
+          # escalates to the Mayor instead of vanishing silently.
+          _pilot_hold_or_escalate "$STORY_BEAD_CITY" "$STORY_ID" "ga-jazy9" \
+            "lane:big story with no live persistent-crew owner — dogs (~25-min TTL) cannot build a big subsystem" \
+            "assign a live persistent crew to $STORY_ID, or route it off lane:big" \
+            "$(echo "$STORY" | jq -c '.labels // []' 2>/dev/null || echo '[]')"
           return 1
         fi
         ;;
