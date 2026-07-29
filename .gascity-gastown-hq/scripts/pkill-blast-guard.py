@@ -122,7 +122,13 @@ import time
 
 MAX_MATCHES_DEFAULT = 5
 PGREP_TIMEOUT_SECS = 0.5
-OVERALL_BUDGET_SECS = 0.9  # stays under the <1s budget (AC4) with margin
+# Must stay comfortably under BOTH the <1s budget (AC4) AND the 5s timeout
+# pkill-blast-guard-activate.sh registers for this hook -- a hook that
+# exceeds ITS timeout does not fail closed (Claude Code treats a timed-out
+# hook as though it never ran), so decide() must actually enforce this
+# deadline everywhere it makes a pgrep call, not just once per invocation;
+# see the per-operand deadline check in decide() for the gap this closed.
+OVERALL_BUDGET_SECS = 0.9
 
 # BSD pkill/killall flags that consume the NEXT token as a value (space-
 # separated, e.g. `-U 501`, never glued). Every other `-x`-shaped token is
@@ -472,6 +478,19 @@ def check_pattern(pattern, max_matches):
     return None
 
 
+def _budget_exceeded_reason():
+    # Shared by both the per-invocation and per-operand deadline checks in
+    # decide() -- see the comment at the per-operand check site for why a
+    # single deadline needs to gate both loops, not just the outer one.
+    return (
+        "pkill/killall: this command has multiple invocations or targets "
+        "to verify and ran out of the guard's analysis time budget before "
+        "finishing -- refusing rather than allowing the unchecked "
+        "remainder through. Split this into separate commands, or "
+        "validate manually with `pgrep -lf`."
+    )
+
+
 def decide(command, max_matches):
     if not CMD_RE.search(command):
         return "allow", None
@@ -514,13 +533,7 @@ def decide(command, max_matches):
             # un-checked pkill/killall is exactly the "unknown result"
             # case, so this denies rather than silently stopping early and
             # allowing the unchecked remainder through.
-            return "deny", (
-                "pkill/killall: this command has multiple invocations to "
-                "verify and ran out of the guard's analysis time budget "
-                "before finishing -- refusing rather than allowing the "
-                "unchecked remainder through. Split this into separate "
-                "commands, or validate manually with `pgrep -lf`."
-            )
+            return "deny", _budget_exceeded_reason()
 
         operands, flag_after_operand = split_operands_and_flags(args)
 
@@ -557,6 +570,27 @@ def decide(command, max_matches):
             )
 
         for pattern in operands:
+            # Gate-review finding (post-fix-attempt-4): this deadline check
+            # was previously only at the top of the OUTER loop above, once
+            # per pkill/killall invocation -- but a single invocation can
+            # carry many operands (killall's documented `killall [procname
+            # ...]` form), and each one costs a real pgrep subprocess via
+            # check_pattern(). Measured live: ~17.6ms/operand, so a killall
+            # with ~300+ plain space-separated targets -- not a contrived
+            # shape, a plausible bulk-cleanup command -- blew past both
+            # OVERALL_BUDGET_SECS and the 5s timeout
+            # pkill-blast-guard-activate.sh registers for this hook. A
+            # PreToolUse hook that exceeds its own registered timeout does
+            # NOT fail closed (Claude Code treats a timed-out hook as if it
+            # never ran, so the tool call proceeds unguarded) -- silently
+            # defeating the entire guard, including the "matches a claude
+            # process" check that is this fix's whole purpose. Checking the
+            # deadline here too, before every individual pgrep call rather
+            # than only before every invocation, caps the guard's own
+            # worst-case wall time regardless of operand count.
+            if time.monotonic() > deadline:
+                return "deny", _budget_exceeded_reason()
+
             reason = check_pattern(pattern, max_matches)
             if reason:
                 return "deny", reason

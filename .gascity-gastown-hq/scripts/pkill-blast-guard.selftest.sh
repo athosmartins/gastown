@@ -543,6 +543,48 @@ run_guard 'pkill -f "$1"'
   || bad "bare \$1 pattern should be denied, got rc=$RC out=$OUT"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Gate-review regression (post-fix-attempt-4): the analysis-time budget was
+# previously checked only once per pkill/killall INVOCATION, never once per
+# OPERAND within a single invocation -- so a single multi-target killall
+# (killall's own documented `killall [procname ...]` form) could blow past
+# OVERALL_BUDGET_SECS with zero safety net, and past that, past the 5s
+# timeout pkill-blast-guard-activate.sh registers for this hook. A
+# PreToolUse hook that exceeds ITS OWN timeout does not fail closed (Claude
+# Code treats a timed-out hook as though it never ran -- normal unguarded
+# flow applies), so this used to be a complete, silent bypass of the whole
+# guard given enough targets. Reviewer measured ~17.6ms/operand live;
+# 150 synthetic (guaranteed non-matching) targets is comfortably past the
+# ~51 needed to exceed the 0.9s budget, while staying well under both the
+# 5s hook timeout and this selftest's own patience.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- gate-review regression: many-target killall denies via budget, not timeout bypass --"
+
+MANY_TARGETS=""
+for n in $(seq 1 150); do
+  MANY_TARGETS="$MANY_TARGETS pkill-guard-selftest-budget-decoy-$$-$n"
+done
+
+START_NS=$(date +%s%N)
+run_guard "killall$MANY_TARGETS"
+END_NS=$(date +%s%N)
+ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))
+
+if [ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ]; then
+  ok "killall with 150 targets denied (was an unguarded timeout-bypass pre-fix)"
+else
+  bad "killall with 150 targets should be denied, got rc=$RC out=$OUT"
+fi
+echo "$OUT" | jq -e '.hookSpecificOutput.permissionDecisionReason | contains("analysis time budget")' >/dev/null 2>&1 \
+  && ok "150-target denial reason is the budget check (proves the per-operand gate fired, not a per-pattern one)" \
+  || bad "150-target deny reason should cite the analysis time budget, got: $(echo "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason // "MISSING"')"
+if [ "$ELAPSED_MS" -lt 4500 ]; then
+  ok "guard returned in ${ELAPSED_MS}ms, comfortably under the hook's 5s registered timeout"
+else
+  bad "guard took ${ELAPSED_MS}ms -- too close to (or past) the hook's 5s timeout, budget enforcement may not be working"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Activation script: idempotent compose-not-replace merge into a SCRATCH
 # settings.json (never the live file).
 # ─────────────────────────────────────────────────────────────────────────────
