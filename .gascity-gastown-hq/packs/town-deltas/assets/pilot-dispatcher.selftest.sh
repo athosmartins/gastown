@@ -1037,6 +1037,7 @@ _og() { (
     SELF_BEAD_ID=""; _DEADWORKER_OK=1
     bd() { case "$*" in *" show "*) printf '%s' "${OG_BEAD_JSON:-}" ;; *) : ;; esac; }
     _beadid_has_crew_branch() { return 1; }   # no crew branch → signal (a) does not fire
+    _beadid_branch_signal()   { return 1; }   # ga-8jxe1: signal (a)'s real entry point now — see below
     _session_is_live()        { return 1; }   # never a live session → isolate (c) from (b)
     _beadid_mentioned_in_attached_session() { return 1; }   # isolate from (e) — has its own dedicated scenario below
     _ownership_guard_should_refuse "$1" "$2" "ignored-db"
@@ -3677,8 +3678,19 @@ has "$DISPATCHER" 'assign "\$_bid" ""' \
 # live owner — signal (a) must be skipped for gate:needs-fix; signal (b) still guards a
 # live crew owner. This is HOL-block layer 2b (guard-level), complementing layer 1/2.
 echo "Scenario 22h: ownership guard exempts gate:needs-fix from the branch-exists refusal"
+# ga-8jxe1: signal (a) now routes through _beadid_branch_signal (which itself calls
+# _beadid_matched_crew_branch_ref, and — on an orphan verdict — _ownership_guard_
+# flag_orphan_branch) instead of calling _beadid_has_crew_branch directly — extract
+# all of them so this eval'd subshell has the REAL functions _ownership_guard_
+# should_refuse now depends on (an undefined function here would silently no-op as
+# "command not found" → empty capture → indistinguishable from "signal (a) allows",
+# which is exactly how this regressed the first time this fix landed).
 _OG_FNS="$(awk '/^_beadid_has_crew_branch\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")
+$(awk '/^_beadid_matched_crew_branch_ref\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")
+$(awk '/^_beadid_branch_signal\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")
+$(awk '/^_ownership_guard_flag_orphan_branch\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")
 $(awk '/^_ownership_guard_should_refuse\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+[ -n "$_OG_FNS" ] || bad "Scenario 22h: failed to extract one of the 5 target functions from $DISPATCHER — awk markers drifted"
 # (1) gate:needs-fix bead WITH a branch → signal (a) suppressed → NOT refused on branch.
 OG_FIX="$( bd() { echo ""; }; eval "$_OG_FNS"
   export PILOT_TEST_CREW_BRANCH_BEADS="ps-2w5d" _DEADWORKER_OK=0
@@ -3690,14 +3702,212 @@ case "$OG_FIX" in
   *)         bad "unexpected ownership-guard result for gate:needs-fix (got: '$OG_FIX')" ;;
 esac
 # (2) control — a non-gate:needs-fix bead WITH a branch → signal (a) STILL refuses (ga-htjni intact).
+# ga-8jxe1 AC2: the refusal reason now carries the REAL matched ref (here the test seam's
+# default "fix/<bead>-test") instead of a hardcoded "crew/*/<bead>" guess — this assertion
+# was updated FOR that fix, not despite it (the old literal string was the AC2 bug itself).
+# PILOT_TEST_BRANCH_MERGED_BEADS/PILOT_TEST_ORPHAN_BRANCH_BEADS are defined-but-empty so
+# _beadid_branch_signal's merged/orphan checks resolve via their OWN hermetic seams
+# (neither lists "wa-built" → falls through to "block") instead of touching real git.
 OG_CTL="$( bd() { echo ""; }; eval "$_OG_FNS"
-  export PILOT_TEST_CREW_BRANCH_BEADS="wa-built" _DEADWORKER_OK=0
+  export PILOT_TEST_CREW_BRANCH_BEADS="wa-built" _DEADWORKER_OK=0 \
+         PILOT_TEST_BRANCH_MERGED_BEADS="" PILOT_TEST_ORPHAN_BRANCH_BEADS=""
   _ownership_guard_should_refuse "wa-built" '{"labels":["story:approved"]}' "/nonexistent" 2>/dev/null
   printf 'rc=%s' "$?" )"
 case "$OG_CTL" in
-  *branch:crew/*/wa-built*) ok "ownership guard STILL refuses a plain branched bead (ga-htjni double-dispatch guard intact)" ;;
+  *branch:fix/wa-built-test*) ok "ownership guard STILL refuses a plain branched bead, now with the REAL matched ref (ga-htjni double-dispatch guard intact; ga-8jxe1 AC2 evidence not hardcoded) (got: '$OG_CTL')" ;;
   *) bad "ownership guard no longer refuses a plain branched bead — ga-htjni regression (got: '$OG_CTL')" ;;
 esac
+
+# ── Scenario ga-8jxe1: branch-exists ≠ in-flight (AC1/AC3) ──────────────────────
+# Bug ga-8jxe1: signal (a) treated ANY matched crew/fix branch as a permanent
+# in-flight signal. Two real cases (fix/ga-opyus-…, fix/ga-50m2-…) were ABANDONED
+# builds — unmerged, 3 and 12 days idle, bead unassigned, no live session — yet
+# vetoed every sweep forever (branch exists → veto → nobody works it → branch
+# still exists → veto…), because the reclaim paths the old code comment pointed
+# to only examine story:in-flight beads, and a ready/unassigned candidate with a
+# stray old branch is outside their domain. _beadid_branch_signal now classifies
+# a matched branch as merged / orphan / block instead of an unconditional "block".
+echo "Scenario ga-8jxe1-a: ownership guard classifies merged/orphan/recent branches instead of blanket-refusing (hermetic seams)"
+_ownership_guard_repos() { :; }   # unused in this block — every case short-circuits via test seams before reaching it
+
+# (a1) MERGED branch → AC1a: build already shipped, NOT an in-flight signal → allow.
+OG_MERGED="$( bd() { echo ""; }; eval "$_OG_FNS"
+  export PILOT_TEST_CREW_BRANCH_BEADS="gj8-merged" _DEADWORKER_OK=0 \
+         PILOT_TEST_BRANCH_MERGED_BEADS="gj8-merged"
+  _ownership_guard_should_refuse "gj8-merged" '{"labels":["story:approved"]}' "/nonexistent" 2>/dev/null
+  printf 'rc=%s' "$?" )"
+case "$OG_MERGED" in
+  rc=1) ok "ga-8jxe1(a1) AC1a: an already-MERGED branch does NOT block dispatch (got: '$OG_MERGED')" ;;
+  *)    bad "ga-8jxe1(a1) AC1a: merged branch wrongly still refused (got: '$OG_MERGED') — merge-base check not wired" ;;
+esac
+
+# (a2) ORPHAN branch (unmerged, stale, unassigned) → AC1b: not refused, AND AC3:
+# flagged (pilot:orphan-branch label + explanatory comment) for a separate triage
+# pass — never silent, never auto-resolved, never touches the branch itself.
+OG_ORPHAN_BD_LOG="$WORK/ga8jxe1-orphan-bd-calls.log"
+: > "$OG_ORPHAN_BD_LOG"
+OG_ORPHAN="$( eval "$_OG_FNS"
+  bd() { printf '%s\n' "$*" >> "$OG_ORPHAN_BD_LOG"; [[ "$*" == *" show "* ]] && echo '{"labels":[]}'; :; }
+  export PILOT_TEST_CREW_BRANCH_BEADS="gj8-orphan" _DEADWORKER_OK=0 \
+         PILOT_TEST_BRANCH_MERGED_BEADS="" PILOT_TEST_ORPHAN_BRANCH_BEADS="gj8-orphan"
+  _ownership_guard_should_refuse "gj8-orphan" '{"labels":["story:approved"]}' "/nonexistent" 2>/dev/null
+  printf 'rc=%s' "$?" )"
+case "$OG_ORPHAN" in
+  rc=1) ok "ga-8jxe1(a2) AC1b: a stale+unassigned orphan branch does NOT block dispatch forever (got: '$OG_ORPHAN')" ;;
+  *)    bad "ga-8jxe1(a2) AC1b: orphan branch still unconditionally refused (got: '$OG_ORPHAN') — the exact ga-opyus/ga-50m2 deadlock is back" ;;
+esac
+if grep -q "label add gj8-orphan pilot:orphan-branch" "$OG_ORPHAN_BD_LOG"; then
+  ok "ga-8jxe1(a2) AC3: orphan branch labeled pilot:orphan-branch (queryable triage path exists)"
+else
+  bad "ga-8jxe1(a2) AC3: orphan branch NOT labeled — lifting the veto with no durable trace would just be a QUIETER silent deadlock"
+fi
+if grep -q "comment gj8-orphan" "$OG_ORPHAN_BD_LOG"; then
+  ok "ga-8jxe1(a2) AC3: orphan branch got an explanatory comment (evidence + next-step for the triage pass)"
+else
+  bad "ga-8jxe1(a2) AC3: orphan branch flagged but no comment — no evidence trail for whoever triages it"
+fi
+if grep -qE "label (remove|delete)|branch -[dD]|push .*(:|--delete)" "$OG_ORPHAN_BD_LOG"; then
+  bad "ga-8jxe1(a2) AC3: flagging touched/deleted something beyond the label+comment — the bug explicitly forbids ever deleting the branch"
+else
+  ok "ga-8jxe1(a2) AC3: flagging is purely additive — branch and other labels left untouched"
+fi
+
+# (a2-idempotent) A SECOND detection of the SAME already-flagged orphan must NOT
+# re-comment (idempotent — a sweep runs every few minutes; without this a
+# perpetual orphan would spam comments forever).
+OG_ORPHAN_BD_LOG2="$WORK/ga8jxe1-orphan-bd-calls-2.log"
+: > "$OG_ORPHAN_BD_LOG2"
+OG_ORPHAN2="$( eval "$_OG_FNS"
+  bd() { printf '%s\n' "$*" >> "$OG_ORPHAN_BD_LOG2"; [[ "$*" == *" show "* ]] && echo '{"labels":["pilot:orphan-branch"]}'; :; }
+  export PILOT_TEST_CREW_BRANCH_BEADS="gj8-orphan2" _DEADWORKER_OK=0 \
+         PILOT_TEST_BRANCH_MERGED_BEADS="" PILOT_TEST_ORPHAN_BRANCH_BEADS="gj8-orphan2"
+  _ownership_guard_should_refuse "gj8-orphan2" '{"labels":["story:approved"]}' "/nonexistent" 2>/dev/null
+  printf 'rc=%s' "$?" )"
+[ "$OG_ORPHAN2" = "rc=1" ] || bad "ga-8jxe1(a2-idempotent): re-detecting an already-flagged orphan changed the refuse verdict (got: '$OG_ORPHAN2')"
+if grep -q "comment gj8-orphan2" "$OG_ORPHAN_BD_LOG2"; then
+  bad "ga-8jxe1(a2-idempotent): AC3 flagging re-commented on an ALREADY-flagged orphan — would spam the bead every sweep"
+else
+  ok "ga-8jxe1(a2-idempotent): AC3 flagging is idempotent — an already-labeled orphan is not re-commented"
+fi
+
+# (a3) RECENT unmerged branch, NO assignee → preserves "branch recente… continua
+# vetando": staleness (not just liveness) gates the orphan exemption, so a build
+# that pushed moments ago and hasn't updated the bead's assignee YET still blocks
+# a competing dispatch (the exact lag ga-6jqr/ga-htjni protect against).
+OG_RECENT="$( bd() { echo ""; }; eval "$_OG_FNS"
+  export PILOT_TEST_CREW_BRANCH_BEADS="gj8-recent" _DEADWORKER_OK=0 \
+         PILOT_TEST_BRANCH_MERGED_BEADS="" PILOT_TEST_ORPHAN_BRANCH_BEADS=""
+  _ownership_guard_should_refuse "gj8-recent" '{"labels":["story:approved"]}' "/nonexistent" 2>/dev/null
+  printf 'rc=%s' "$?" )"
+case "$OG_RECENT" in
+  *branch:fix/gj8-recent-test*) ok "ga-8jxe1(a3): a RECENT unmerged branch (not stale) STILL refuses despite no live owner yet — ga-6jqr/ga-htjni push-then-metadata-lag protection intact (got: '$OG_RECENT')" ;;
+  *) bad "ga-8jxe1(a3): recent unmerged branch no longer refused (got: '$OG_RECENT') — would allow a double-dispatch race right after a legitimate push" ;;
+esac
+
+# (a4) UNMERGED branch WITH a snapshot assignee → the orphan exemption's defensive
+# assignee re-check must short-circuit to "block" even if the staleness seam alone
+# would have said orphan (defense in depth — the candidate query already
+# guarantees empty assignee, but this proves the guard doesn't blindly trust that).
+OG_ASSIGNED="$( bd() { echo ""; }; eval "$_OG_FNS"
+  export PILOT_TEST_CREW_BRANCH_BEADS="gj8-assigned" _DEADWORKER_OK=0 \
+         PILOT_TEST_BRANCH_MERGED_BEADS="" PILOT_TEST_ORPHAN_BRANCH_BEADS="gj8-assigned"
+  _ownership_guard_should_refuse "gj8-assigned" '{"labels":["story:approved"],"assignee":"someone"}' "/nonexistent" 2>/dev/null
+  printf 'rc=%s' "$?" )"
+case "$OG_ASSIGNED" in
+  *branch:fix/gj8-assigned-test*) ok "ga-8jxe1(a4): an unmerged branch on a bead with a snapshot assignee STILL refuses even though the orphan-staleness seam says stale (got: '$OG_ASSIGNED')" ;;
+  *) bad "ga-8jxe1(a4): assigned bead's branch wrongly treated as orphan (got: '$OG_ASSIGNED') — defensive assignee check not wired" ;;
+esac
+
+unset -f _ownership_guard_repos 2>/dev/null || true
+
+# ── Scenario ga-8jxe1-b: REAL git merge-base + staleness math (not just seams) ──
+# Mirrors ga-6jqr site 3's rigor: PILOT_TEST_* seams are explicitly left UNSET so
+# the ACTUAL `git merge-base --is-ancestor` / `git log --format=%ct` calls run —
+# every scenario above bypasses exactly the git-plumbing code this bug's staleness
+# math lives in, so a hermetic-only suite could stay green through a regression
+# in the real predicate (e.g. an inverted --is-ancestor, or %ct vs %at drift).
+echo "Scenario ga-8jxe1-b: REAL git merge-base + staleness math against real commits/timestamps"
+GJ8_BARE="$WORK/gj8-bare.git"
+GJ8_REPO="$WORK/gj8-repo"
+rm -rf "$GJ8_BARE" "$GJ8_REPO"
+git init -q --bare "$GJ8_BARE"
+mkdir -p "$GJ8_REPO"
+git init -q "$GJ8_REPO"
+git -C "$GJ8_REPO" config user.email "selftest@example.com"
+git -C "$GJ8_REPO" config user.name "selftest"
+git -C "$GJ8_REPO" commit -q --allow-empty -m init
+git -C "$GJ8_REPO" remote add origin "$GJ8_BARE"
+git -C "$GJ8_REPO" push -q origin HEAD:refs/heads/main
+git -C "$GJ8_REPO" fetch -q origin   # populate refs/remotes/origin/main for merge-base
+
+# Fixture 1: MERGED — branched at the current main tip, never diverged.
+git -C "$GJ8_REPO" branch "fix/gj8-merged-slug" HEAD
+
+# Fixture 2: OLD unmerged — 1 new commit, timestamp backdated 10 days (the field
+# _beadid_branch_signal actually reads, via `git log --format=%ct`, not the
+# branch ref's own mtime on disk).
+git -C "$GJ8_REPO" checkout -q -b "fix/gj8-old-slug"
+echo "old work" > "$GJ8_REPO/old.txt"
+git -C "$GJ8_REPO" add old.txt
+GJ8_OLD_DATE="$(( $(date +%s) - (10*86400) ))"
+GIT_AUTHOR_DATE="@$GJ8_OLD_DATE" GIT_COMMITTER_DATE="@$GJ8_OLD_DATE" \
+  git -C "$GJ8_REPO" commit -q -m "old unmerged work"
+git -C "$GJ8_REPO" checkout -q main
+
+# Fixture 3: RECENT unmerged — 1 new commit, current timestamp.
+git -C "$GJ8_REPO" checkout -q -b "fix/gj8-new-slug"
+echo "new work" > "$GJ8_REPO/new.txt"
+git -C "$GJ8_REPO" add new.txt
+git -C "$GJ8_REPO" commit -q -m "recent unmerged work"
+git -C "$GJ8_REPO" checkout -q main
+
+_GJ8_MATCHED_FN="$(awk '/^_beadid_matched_crew_branch_ref\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_GJ8_SIGNAL_FN="$(awk '/^_beadid_branch_signal\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+[ -n "$_GJ8_MATCHED_FN" ] && [ -n "$_GJ8_SIGNAL_FN" ] \
+  || bad "ga-8jxe1-b: failed to extract _beadid_matched_crew_branch_ref/_beadid_branch_signal from $DISPATCHER — awk markers drifted"
+
+GJ8_R_MERGED="$(
+  unset PILOT_TEST_CREW_BRANCH_BEADS PILOT_TEST_BRANCH_MERGED_BEADS PILOT_TEST_ORPHAN_BRANCH_BEADS
+  _ownership_guard_repos() { printf '%s' "$GJ8_REPO"; }
+  eval "$_GJ8_MATCHED_FN"; eval "$_GJ8_SIGNAL_FN"
+  _beadid_branch_signal "gj8-merged" '{}'
+)"
+case "$GJ8_R_MERGED" in
+  merged*) ok "ga-8jxe1-b: REAL merge-base correctly classifies an already-merged branch as 'merged' (got: '$GJ8_R_MERGED')" ;;
+  *) bad "ga-8jxe1-b: REAL merge-base check failed to classify a merged branch (got: '$GJ8_R_MERGED') — AC1a git predicate broken" ;;
+esac
+
+GJ8_R_OLD="$(
+  unset PILOT_TEST_CREW_BRANCH_BEADS PILOT_TEST_BRANCH_MERGED_BEADS PILOT_TEST_ORPHAN_BRANCH_BEADS
+  _ownership_guard_repos() { printf '%s' "$GJ8_REPO"; }
+  eval "$_GJ8_MATCHED_FN"; eval "$_GJ8_SIGNAL_FN"
+  PILOT_ORPHAN_BRANCH_STALE_HOURS=48 _beadid_branch_signal "gj8-old" '{}'
+)"
+case "$GJ8_R_OLD" in
+  orphan*) ok "ga-8jxe1-b: REAL staleness math (10-day-old commit vs. a 48h threshold) correctly classifies as 'orphan' (got: '$GJ8_R_OLD')" ;;
+  *) bad "ga-8jxe1-b: a 10-day-old unmerged branch NOT classified as orphan (got: '$GJ8_R_OLD') — AC1b staleness math broken (this is the exact ga-opyus/ga-50m2 shape: 3 and 12 days idle)" ;;
+esac
+
+GJ8_R_NEW="$(
+  unset PILOT_TEST_CREW_BRANCH_BEADS PILOT_TEST_BRANCH_MERGED_BEADS PILOT_TEST_ORPHAN_BRANCH_BEADS
+  _ownership_guard_repos() { printf '%s' "$GJ8_REPO"; }
+  eval "$_GJ8_MATCHED_FN"; eval "$_GJ8_SIGNAL_FN"
+  PILOT_ORPHAN_BRANCH_STALE_HOURS=48 _beadid_branch_signal "gj8-new" '{}'
+)"
+case "$GJ8_R_NEW" in
+  block*) ok "ga-8jxe1-b: REAL staleness math correctly PRESERVES the veto for a just-pushed unmerged branch (got: '$GJ8_R_NEW')" ;;
+  *) bad "ga-8jxe1-b: a fresh unmerged branch was NOT preserved as 'block' (got: '$GJ8_R_NEW') — would regress the ga-6jqr/ga-htjni double-dispatch protection" ;;
+esac
+
+rm -rf "$GJ8_BARE" "$GJ8_REPO"
+
+# ── Scenario ga-8jxe1: drift-guard — AC1-AC4 landmarks wired into live dispatcher ─
+has "$DISPATCHER" 'PILOT_ORPHAN_BRANCH_STALE_HOURS'      "ga-8jxe1 AC1b: staleness threshold knob wired"
+has "$DISPATCHER" '_beadid_branch_signal'                "ga-8jxe1: branch-signal classifier wired into signal (a)"
+has "$DISPATCHER" 'merge-base --is-ancestor'             "ga-8jxe1 AC1a: merge-base ancestry check present"
+has "$DISPATCHER" '_ownership_guard_flag_orphan_branch'  "ga-8jxe1 AC3: orphan-flagging reclaim path wired"
+has "$DISPATCHER" 'pilot:orphan-branch'                  "ga-8jxe1 AC3: durable triage label wired"
+has "$DISPATCHER" 'OWNERSHIP_GUARD_VETO_COUNT'           "ga-8jxe1 AC4: sweep-wide veto counter wired"
 
 # ── Scenario 22e: gate (e) — suspended crews are excluded (unit + structural) ───
 echo "Scenario 22e: gate (e) — _crew_is_suspended excludes a suspended crew, keeps an active one"
@@ -4330,6 +4540,14 @@ if echo "$LOG_POA" | grep -q "session new ps-worker --no-attach"; then
 else
   ok "pool-own(a): pool worker spawn correctly skipped"
 fi
+# ga-8jxe1 AC4: this real end-to-end sweep (1 candidate, 1 ownership-guard refusal)
+# is exactly the shape that made the original bug hard to diagnose — the log used
+# to say only "dispatched=0" with no hint the guard was the cause.
+if echo "$LOG_POA" | grep -q "ga-8jxe1: ownership-guard vetoed 1 candidate(s) this sweep."; then
+  ok "ga-8jxe1 AC4: sweep summary reports the ownership-guard veto count for a real refusal (was invisible before)"
+else
+  bad "ga-8jxe1 AC4: REGRESSION — veto count missing from the sweep summary despite a real ownership-guard refusal"
+fi
 
 echo "Scenario POOL-OWN-D (ga-sndpm): routed-pool dispatch REFUSED when candidate has an ACTIVE gate marker (signal d)"
 LOG_POD="$(run_ps_worker_dispatch_own_guard "[]" "$PS_WORKER_FX" "0" "" "ps-test1")"
@@ -4357,6 +4575,13 @@ if echo "$LOG_POCTL" | grep -q "session new ps-worker --no-attach"; then
   ok "pool-own(control): pool worker spawn still proceeds for a genuinely free candidate"
 else
   bad "pool-own(control): REGRESSION — pool worker spawn missing even with no competing ownership signal"
+fi
+# ga-8jxe1 AC4 control: zero refusals this sweep → the summary line must stay
+# absent entirely, not print "vetoed 0 candidate(s)" noise every sweep.
+if echo "$LOG_POCTL" | grep -q "ownership-guard vetoed"; then
+  bad "ga-8jxe1 AC4: veto-count line appeared despite ZERO refusals this sweep (should stay silent when nothing was vetoed)"
+else
+  ok "ga-8jxe1 AC4: veto-count line correctly absent when nothing was vetoed this sweep"
 fi
 
 echo "Scenario POOL-OWN-STRUCT (ga-sndpm): structural — ownership guard still re-verified at BOTH call sites"

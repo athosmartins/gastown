@@ -332,6 +332,26 @@ PILOT_REUSE_SESSION="${PILOT_REUSE_SESSION:-1}"
 # Set PILOT_OWNERSHIP_GUARD=0 to disable (legacy flat-pool behaviour, no redeploy).
 PILOT_OWNERSHIP_GUARD="${PILOT_OWNERSHIP_GUARD:-1}"
 
+# ── ga-8jxe1: branch-exists ≠ in-flight (ownership guard signal (a) refinement) ─
+# Bug ga-8jxe1: signal (a) above treated "a crew/fix branch exists" as an
+# unconditional, permanent in-flight signal. Two real cases (fix/ga-opyus-...,
+# fix/ga-50m2-...) proved that assumption false: both branches were ABANDONED —
+# 1 real commit each, last touched 3 and 12 days ago, bead unassigned, no live
+# session — yet the guard vetoed every sweep forever (branch existed → veto →
+# nobody works it → branch still exists → veto...). The code comment that
+# introduced (a) explicitly delegated recovery to "the distinct dead-worker/
+# never-started reclaim paths" — those paths only examine story:in-flight
+# beads, and a ready/unassigned candidate with a stray old branch is outside
+# their domain, so nothing ever actually recovered it.
+# How long an UNMERGED matched branch may sit with no new commits before its
+# bead (candidate query already guarantees it's unassigned) is treated as
+# ABANDONED rather than "in-flight, just hasn't pushed lately." The two real
+# cases sat 3 and 12 days; 48h is comfortably inside that margin while safely
+# outside any normal single build — and "branch recente... continua vetando"
+# (a RECENT unmerged branch, regardless of assignee) is preserved exactly:
+# only a branch OLDER than this threshold is even eligible to be an orphan.
+PILOT_ORPHAN_BRANCH_STALE_HOURS="${PILOT_ORPHAN_BRANCH_STALE_HOURS:-48}"
+
 # ── ctx:ready auto-dispatch — chore/task/debt with a trusted context check ─────
 # Final phase of the auto-dispatch architecture. A LIVE, LABEL-ONLY context-check
 # daemon now annotates bug/chore/task/debt beads with ctx:ready (context-complete,
@@ -2738,6 +2758,169 @@ _beadid_has_crew_branch() {
   return 1
 }
 
+# _beadid_matched_crew_branch_ref <bead_id> — ga-8jxe1 AC2 companion to
+# _beadid_has_crew_branch above. Deliberately a SEPARATE function (not a
+# refactor of it) — this file's established pattern for branch-existence
+# checks is several independently-testable functions with overlapping probe
+# logic (_filter_built / _target_has_real_branch / _beadid_has_crew_branch
+# itself; ga-6jqr), so a 4th here follows the grain rather than risking the
+# existing selftest coverage of _beadid_has_crew_branch's exact source shape.
+# Prints "<repo>\t<ref>" on a match (ref is EMPTY when the match came only from
+# the ls-remote fallback — no local ref object exists to inspect further, e.g.
+# for merge/staleness below); exit 0/1 exactly like _beadid_has_crew_branch.
+# Lets a caller report the REAL matched ref (e.g. "fix/ga-8jxe1-slug") instead
+# of a hardcoded "crew/*/<bead>" guess — the old WARN message lied about the
+# evidence whenever a dog's fix/* branch, not a crew/* branch, was what
+# actually matched (cost real diagnosis time on ga-8jxe1 itself).
+_beadid_matched_crew_branch_ref() {
+  local _bid="${1:-}" _repo
+  [ -n "$_bid" ] || return 1
+  if [ -n "${PILOT_TEST_CREW_BRANCH_BEADS+x}" ]; then
+    case " $PILOT_TEST_CREW_BRANCH_BEADS " in
+      *" $_bid "*) printf '%s\t%s' "${PILOT_TEST_CREW_BRANCH_REPO:-.}" "${PILOT_TEST_CREW_BRANCH_REF:-fix/${_bid}-test}"; return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  command -v git >/dev/null 2>&1 || return 1
+  local _repos _re _match
+  _repos=$(_ownership_guard_repos)
+  [ -n "$_repos" ] || return 1
+  _re="(crew/([^/]+/)?${_bid}|fix/${_bid}-[^/]+)\$"
+  while IFS= read -r _repo; do
+    [ -n "$_repo" ] && [ -d "$_repo" ] || continue
+    _match=$(git -C "$_repo" for-each-ref --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null \
+        | grep -iE "$_re" | head -1)
+    if [ -n "$_match" ]; then
+      printf '%s\t%s' "$_repo" "$_match"
+      return 0
+    fi
+    if git -C "$_repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 \
+       || git -C "$_repo" remote 2>/dev/null | grep -q .; then
+      if timeout 8 git -C "$_repo" ls-remote --heads origin "crew/*/${_bid}" "crew/${_bid}" "fix/${_bid}-*" 2>/dev/null \
+          | grep -qiE "refs/heads/${_re}"; then
+        printf '%s\t' "$_repo"   # repo known, ref unresolved locally (ls-remote-only)
+        return 0
+      fi
+    fi
+  done <<< "$_repos"
+  return 1
+}
+
+# _beadid_branch_signal <bead_id> <bead_json> — ga-8jxe1: classifies a matched
+# crew/fix branch instead of treating "branch exists" as an unconditional
+# in-flight signal. FAIL-OPEN toward the PRE-FIX behaviour, never toward a NEW
+# failure mode: any unresolvable merge-base/log probe classifies "block" with
+# the matched ref — exactly what the old boolean-only signal (a) would have
+# done. Silent by design (matches every other signal-helper in this file —
+# ONLY the top-level dispatch_one() logs); MUST NOT write to stdout/stderr
+# beyond its own final printf, because both call sites capture this chain via
+# `_OWN_REASON=$(_ownership_guard_should_refuse ...)` — a stray log line here
+# would corrupt that captured string (the exact hazard the dispatch_one()
+# DISPATCHED-mutation comment above warns about, for the same $(...) reason).
+#
+# Prints "<class>\t<detail>" to stdout, exit 0 iff a branch matched at all
+# (exit 1 = no branch — identical to _beadid_has_crew_branch's original
+# "no signal" case):
+#   block  \t <real ref>                 — unmerged and NOT stale (or matched
+#                                           only via ls-remote, no local ref to
+#                                           inspect) → preserve the EXACT
+#                                           pre-fix behaviour: refuse.
+#   merged \t <ref>                      — AC1a: `git merge-base --is-ancestor
+#                                           <ref> origin/main` succeeds → the
+#                                           build already shipped, this is NOT
+#                                           an in-flight signal.
+#   orphan \t <repo>\t<ref>\t<age_days>   — AC1b: unmerged, last commit older
+#                                           than PILOT_ORPHAN_BRANCH_STALE_HOURS,
+#                                           AND the bead's OWN snapshot assignee
+#                                           ($_json — the candidate query
+#                                           already required it empty) is empty
+#                                           → abandoned, not active.
+# Test seams (space-lists of bead ids, hermetic — consulted only when the
+# underlying branch match already succeeded via PILOT_TEST_CREW_BRANCH_BEADS):
+#   PILOT_TEST_BRANCH_MERGED_BEADS  — force the "merged" classification.
+#   PILOT_TEST_ORPHAN_BRANCH_BEADS  — force "orphan" (else falls to "block").
+_beadid_branch_signal() {
+  local _bid="${1:-}" _json="${2:-}" _repo _ref _rt
+  [ -n "$_bid" ] || return 1
+  _rt="$(_beadid_matched_crew_branch_ref "$_bid")" || return 1
+  _repo="${_rt%%$'\t'*}"
+  _ref="${_rt#*$'\t'}"
+  if [ -z "$_ref" ]; then
+    printf 'block\tcrew/*/%s' "$_bid"
+    return 0
+  fi
+  if [ -n "${PILOT_TEST_BRANCH_MERGED_BEADS+x}" ]; then
+    case " $PILOT_TEST_BRANCH_MERGED_BEADS " in
+      *" $_bid "*) printf 'merged\t%s' "$_ref"; return 0 ;;
+    esac
+  elif command -v git >/dev/null 2>&1 \
+     && git -C "$_repo" merge-base --is-ancestor "$_ref" origin/main 2>/dev/null; then
+    printf 'merged\t%s' "$_ref"
+    return 0
+  fi
+  # Unmerged. Snapshot assignee is a defensive re-check, not the primary
+  # discriminator — the candidate query already guarantees it empty for
+  # virtually every caller; kept for the (theoretical) path that doesn't.
+  local _asg_snapshot
+  _asg_snapshot=$(printf '%s' "$_json" | jq -r '(.assignee // "")' 2>/dev/null || echo "")
+  if [ -n "$_asg_snapshot" ] && [ "$_asg_snapshot" != "null" ]; then
+    printf 'block\t%s' "$_ref"
+    return 0
+  fi
+  if [ -n "${PILOT_TEST_ORPHAN_BRANCH_BEADS+x}" ]; then
+    case " $PILOT_TEST_ORPHAN_BRANCH_BEADS " in
+      *" $_bid "*) printf 'orphan\t%s\t%s\ttest' "$_repo" "$_ref"; return 0 ;;
+      *) printf 'block\t%s' "$_ref"; return 0 ;;
+    esac
+  fi
+  local _age_secs _commit_epoch _now
+  _commit_epoch=$(git -C "$_repo" log -1 --format=%ct "$_ref" 2>/dev/null || echo "")
+  if [ -z "$_commit_epoch" ]; then
+    printf 'block\t%s' "$_ref"   # unresolvable → fail toward pre-fix behaviour
+    return 0
+  fi
+  _now=$(date +%s)
+  _age_secs=$(( _now - _commit_epoch ))
+  if [ "$_age_secs" -gt "$(( PILOT_ORPHAN_BRANCH_STALE_HOURS * 3600 ))" ]; then
+    printf 'orphan\t%s\t%s\t%s' "$_repo" "$_ref" "$(( _age_secs / 86400 ))"
+  else
+    printf 'block\t%s' "$_ref"
+  fi
+  return 0
+}
+
+# _ownership_guard_flag_orphan_branch <bead_id> <bead_city> <detail> — ga-8jxe1
+# AC3: give an ownership-guard ORPHAN verdict (_beadid_branch_signal's "orphan"
+# class) a path to resolution instead of a silent forever-veto. <detail> is
+# "<repo>\t<ref>\t<age_days>" from _beadid_branch_signal. Idempotent (gated on
+# the pilot:orphan-branch label itself — a later sweep finding the SAME orphan
+# is a no-op, not a repeat comment) and NON-DESTRUCTIVE (never touches the
+# branch — see the bug's own warning: deleting it would lose the unmerged
+# work). Does NOT decide merge-worthy vs. dead — that judgment call is
+# explicitly out of scope here (see the bug's "Triagem paralela" note) and
+# belongs to a human/dog triage pass querying `bd list -l pilot:orphan-branch`.
+# Best-effort: any bd failure here must never block the caller's dispatch
+# decision. Every command output is suppressed (stdout AND stderr) — this runs
+# inside the same $(...)-captured chain as _beadid_branch_signal above and
+# must not leak a byte into _OWN_REASON/_RP_OWN_REASON.
+# Test seam: PILOT_TEST_NOOP_ORPHAN_FLAG=1 skips all bd I/O (selftest hermeticity).
+_ownership_guard_flag_orphan_branch() {
+  local _bid="${1:-}" _city="${2:-$GC_CITY}" _detail="${3:-}" _repo _ref _age _cur_labels
+  [ -n "$_bid" ] || return 0
+  [ "${PILOT_TEST_NOOP_ORPHAN_FLAG:-0}" = "1" ] && return 0
+  command -v bd >/dev/null 2>&1 || return 0
+  _repo="${_detail%%$'\t'*}"; _detail="${_detail#*$'\t'}"
+  _ref="${_detail%%$'\t'*}"; _age="${_detail#*$'\t'}"
+  _cur_labels=$(bd -C "$_city" show "$_bid" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
+  case ",$_cur_labels," in
+    *,pilot:orphan-branch,*) return 0 ;;   # already flagged — idempotent, no repeat comment
+  esac
+  bd -C "$_city" label add "$_bid" "pilot:orphan-branch" -q >/dev/null 2>&1 || true
+  bd -C "$_city" comment "$_bid" "ga-8jxe1: ownership-guard found an unmerged branch ('$_ref', repo $(basename "$_repo" 2>/dev/null || printf '%s' "$_repo")) idle ~${_age}d with no live owner — treating as an abandoned build, no longer auto-vetoing dispatch on it. Branch left untouched (never auto-deleted). Needs a triage judgment call: re-arm the gate off this branch if the work looks complete, or delete the branch and remove this label to free the bead for a fresh build. Queryable via: bd list -l pilot:orphan-branch" >/dev/null 2>&1 || true
+  return 0
+}
+
 # _beadid_has_active_gate_artifact <bead_id> — ga-wisp gate-handoff signal (d).
 # Exit 0 iff an OPEN quality-gate artifact in the HQ store (GC_CITY) references
 # <bead_id> as its source-bead AND is ACTIVELY processing its branch right now.
@@ -2943,6 +3126,7 @@ _beadid_mentioned_in_attached_session() {
 # any jq error → no (b) block. (a) is independent and self-fail-open.
 _ownership_guard_should_refuse() {
   local _bid="${1:-}" _json="${2:-}" _city="${3:-$GC_CITY}"
+  local _bs _bs_class _bs_detail
   [ -n "$_bid" ] || return 1
 
   # gate:needs-fix exemption (ga-htjni × autonomous gate-fix loop). A bead the gate
@@ -2959,10 +3143,27 @@ _ownership_guard_should_refuse() {
     *,gate:needs-fix,*)
       : ;;   # in the gate-fix loop → its own branch is not a competing owner
     *)
-      # (a) crew branch — strongest, evaluated first and standalone.
-      if _beadid_has_crew_branch "$_bid"; then
-        printf 'branch:crew/*/%s' "$_bid"
-        return 0
+      # (a) crew branch — strongest, evaluated first and standalone. ga-8jxe1:
+      # "branch exists" alone is no longer treated as an unconditional
+      # in-flight signal — classify it first (see _beadid_branch_signal doc).
+      _bs="$(_beadid_branch_signal "$_bid" "$_json")"
+      if [ -n "$_bs" ]; then
+        _bs_class="${_bs%%$'\t'*}"
+        _bs_detail="${_bs#*$'\t'}"
+        case "$_bs_class" in
+          block)
+            printf 'branch:%s' "$_bs_detail"
+            return 0
+            ;;
+          merged)
+            : # AC1a — build already shipped, not an in-flight signal; keep checking.
+            ;;
+          orphan)
+            # AC1b/AC3 — unmerged but abandoned (stale + unassigned): surface
+            # for triage instead of vetoing forever; never touches the branch.
+            _ownership_guard_flag_orphan_branch "$_bid" "$_city" "$_bs_detail"
+            ;;
+        esac
       fi
       # (e) attached-session live mention (ga-48vb) — see function doc above.
       # Same needs-fix carve-out as (a): a soft heuristic signal must not
@@ -4257,6 +4458,11 @@ LIVESEC
     local _OWN_REASON
     _OWN_REASON=$(_ownership_guard_should_refuse "$STORY_ID" "$STORY" "$STORY_BEAD_CITY" || echo "")
     if [ -n "$_OWN_REASON" ]; then
+      # ga-8jxe1 AC4: sweep-wide counter (mutated directly, NOT via $(...) — same
+      # non-subshell requirement as the DISPATCHED global below) so a "dispatched=0"
+      # sweep summary can report HOW MANY candidates the guard vetoed, instead of
+      # requiring a code read to even suspect this guard was the cause.
+      OWNERSHIP_GUARD_VETO_COUNT=$((OWNERSHIP_GUARD_VETO_COUNT + 1))
       warn "ga-htjni: REFUSING dispatch of $STORY_ID — already owned/in-flight ($_OWN_REASON). Leaving it for its rightful owner; releasing claim (set PILOT_OWNERSHIP_GUARD=0 to disable)."
       if [ "$DRY_RUN" != "1" ]; then
         bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
@@ -5112,6 +5318,7 @@ TASK
           local _RP_OWN_REASON
           _RP_OWN_REASON=$(_ownership_guard_should_refuse "$STORY_ID" "$STORY" "$STORY_BEAD_CITY" || echo "")
           if [ -n "$_RP_OWN_REASON" ]; then
+            OWNERSHIP_GUARD_VETO_COUNT=$((OWNERSHIP_GUARD_VETO_COUNT + 1))   # ga-8jxe1 AC4
             warn "ga-sndpm: REFUSING routed-pool dispatch of $STORY_ID to $_SLING_TARGET — already owned/in-flight ($_RP_OWN_REASON). NOT stamping gc.routed_to (would let the pool self-claim collide with active crew work). Releasing claim (set PILOT_OWNERSHIP_GUARD=0 to disable)."
             bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
             bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
@@ -5520,6 +5727,7 @@ No human review required."
 # can never WIDEN a wedged pipe (the fd-leak/CPU-incident class this guards).
 
 DISPATCHED=0
+OWNERSHIP_GUARD_VETO_COUNT=0   # ga-8jxe1 AC4 — see the two increment sites in dispatch_one()
 
 # dispatch_lane <lane> <candidates_json> <free_slots>
 # Loops pick→dispatch→remove until the lane is full or candidates are exhausted.
@@ -5602,6 +5810,14 @@ fi
 
 if [ "$BIG_SLOTS" -gt "0" ] && [ "$BIG_COUNT" -gt "0" ]; then
   dispatch_lane "big" "$BIG_CANDIDATES" "$BIG_SLOTS"
+fi
+
+if [ "$OWNERSHIP_GUARD_VETO_COUNT" -gt "0" ] 2>/dev/null; then
+  # ga-8jxe1 AC4 — the log excerpt that made this bug hard to diagnose was
+  # exactly "Lane small: dispatched 0 this sweep (cap=5, slots_left=5)" with NO
+  # indication the ownership guard vetoed every candidate. This line answers
+  # "how many" in one grep instead of a code read.
+  log "ga-8jxe1: ownership-guard vetoed ${OWNERSHIP_GUARD_VETO_COUNT} candidate(s) this sweep."
 fi
 
 if [ "$DISPATCHED" -eq "0" ]; then
