@@ -44,6 +44,17 @@
 #      escalação. Concreto: 2026-07-25, três beads de anúncios (wa-6dd0l,
 #      wa-utjmz, wa-yevxq) escalaram ao Mayor no limiar de 30min enquanto
 #      Athos codava manualmente o dashboard. Ver is_human_assignee() abaixo.
+#   6. QUANDO NENHUM dos itens 1-5 suprimiu (a escalação vai disparar do
+#      mesmo jeito) MAS o pane confirma um diálogo de permissão aberto
+#      (ga-iog1v, AC1+AC2 de ga-q640n): NÃO é uma condição de supressão nova
+#      — é a MESMA escalação, só que a mensagem muda de "sem progresso"
+#      genérico para BLOQUEADO-EM-PROMPT + comando exato + pane. Motivo:
+#      "sem progresso" e "esperando 1 tecla de humano" têm remédios opostos
+#      (kill/reclaim vs. responder o prompt), e um pool worker rodou 7h
+#      travado num `rm -rf` porque uma regra "ask" sobrepôs o bypass de
+#      permissões e as 3 escalações que dispararam nesse intervalo diziam
+#      só "sem progresso" — ninguém soube que bastava 1 tecla. Ver
+#      pane_shows_permission_prompt() abaixo.
 #
 # ANTI-SPAM: uma escalação por bead por janela COOLDOWN_SEC (padrão 3h).
 #   Per-bead state: .gc/state/agent-stuck-escalation/<bead-id>
@@ -229,6 +240,74 @@ except Exception:
 ' 2>/dev/null)"
     [ "$verdict" = "yes" ] && return 0
     return 1
+}
+
+# pane_shows_permission_prompt (ga-iog1v / AC1 de ga-q640n): a MESMA situação
+# de transcript CONGELADO cobre dois casos que session_awaiting_human_input()
+# acima não distingue: (a) turno terminou LIMPO (end_turn sem tool pendente,
+# ou AskUserQuestion) — já suprimido acima — versus (b) turno terminou num
+# tool_use PENDENTE (Bash, Write, etc.) que nunca recebeu tool_result porque
+# a CLI está bloqueada num diálogo de confirmação de permissão. (b) hoje cai
+# em "NOT CONFIRMED" em session_awaiting_human_input() e escala pelo caminho
+# genérico abaixo — o que já FUNCIONA (ga-q640n escalou 3x) mas com uma
+# mensagem que não diz a causa, então ninguém agiu por 7 horas.
+#
+# Lê o PANE RENDERIZADO (não o transcript JSONL — o prompt é chrome de UI da
+# CLI, nunca escrito na conversa) via `gc session peek`, procurando a
+# assinatura textual estável do diálogo real: "Do you want to proceed?" /
+# "requires confirmation". Restringe o grep às ÚLTIMAS linhas do peek (não
+# o bloco todo) porque um diálogo REALMENTE aberto e bloqueando é sempre a
+# última coisa renderizada (é onde o cursor espera) — texto antigo no
+# scrollback que por acaso cite essas frases (ex.: um agente discutindo
+# este próprio bug) não fica preso perto do fim quando o transcript está
+# congelado há >=TRANSCRIPT_FRESH_SEC.
+#
+# FAIL-CLOSED de propósito (direção oposta aos outros checks deste arquivo):
+# peek ausente/ilegível NUNCA vira "prompt confirmado" — na pior hipótese só
+# perde a mensagem diferenciada e cai no caminho genérico que já escalava
+# antes desta mudança (nunca suprime, nunca inventa uma escalação nova).
+#
+#   0 = CONFIRMADO — diálogo de permissão aberto (match estável no final do pane)
+#   1 = não confirmado (peek falhou, vazio, ou sem match)
+pane_shows_permission_prompt() {
+    local sess="$1" peek_out tail_out
+    peek_out="$(timeout 15 "$GC" session peek "$sess" --lines 40 2>/dev/null || true)"
+    [ -z "$peek_out" ] && return 1
+    tail_out="$(printf '%s\n' "$peek_out" | tail -12)"
+    printf '%s' "$tail_out" | grep -qE 'Do you want to proceed\?|requires confirmation'
+}
+
+# permission_prompt_blocked_command (ga-iog1v / AC2 de ga-q640n): quando
+# pane_shows_permission_prompt() confirma o diálogo, busca no MESMO envelope
+# que transcript_is_advancing() já consulta (`gc session logs --tail 1
+# --json`) o nome da tool + comando do tool_use pendente, pra a mensagem de
+# escalação citar o comando EXATO em vez de só dizer "travado". Saída vazia
+# em qualquer falha de parse — fail-open pra uma mensagem menos informativa,
+# nunca pra um comando fabricado.
+permission_prompt_blocked_command() {
+    local sess="$1" logs_json
+    logs_json="$(timeout 15 "$GC" session logs "$sess" --tail 1 --json 2>/dev/null || true)"
+    [ -z "$logs_json" ] && return 1
+    printf '%s' "$logs_json" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    if not d.get("ok"):
+        sys.exit(1)
+    entries = [e for e in (d.get("entries") or []) if e.get("type") == "assistant"]
+    if not entries:
+        sys.exit(1)
+    blocks = entries[-1].get("blocks") or []
+    lb = blocks[-1] if blocks else {}
+    if lb.get("type") != "tool_use":
+        sys.exit(1)
+    name = lb.get("name") or "?"
+    inp = lb.get("input") or {}
+    cmd = inp.get("command") or inp.get("cmd") or json.dumps(inp)[:200]
+    print("%s: %s" % (name, cmd))
+except Exception:
+    sys.exit(1)
+' 2>/dev/null
 }
 
 # gate_label_present (ga-n937): true iff the comma-joined label list $1
@@ -655,6 +734,21 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
         continue
     fi
 
+    # pane_shows_permission_prompt (ga-iog1v / AC1+AC2 de ga-q640n): diferente
+    # do check acima (que SUPRIME quando o turno terminou limpo), aqui o
+    # turno ainda tem um tool_use PENDENTE — a escalação abaixo vai disparar
+    # de qualquer forma (nenhum "continue" aqui). O que muda é SÓ a
+    # mensagem: se o pane confirma um diálogo de permissão aberto, a
+    # mensagem genérica "sem progresso" vira BLOQUEADO-EM-PROMPT + comando
+    # exato + pane — porque aqui basta 1 tecla, não um kill/reclaim.
+    permission_prompt_detected=0
+    blocked_cmd=""
+    if [ "$transcript_state" = "frozen" ] && [ -n "$live_session_name" ] && pane_shows_permission_prompt "$live_session_name"; then
+        permission_prompt_detected=1
+        blocked_cmd="$(permission_prompt_blocked_command "$live_session_name" 2>/dev/null || true)"
+        [ -z "$blocked_cmd" ] && blocked_cmd="(comando não determinado — veja gc session peek $live_session_name --lines 40)"
+    fi
+
     transcript_note="n/d (sem sessão viva)"
     [ "$transcript_state" = "frozen" ] && transcript_note="CONGELADO (sem escrita há >=${TRANSCRIPT_FRESH_SEC}s)"
 
@@ -668,10 +762,53 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
     fi
     [ -z "$failure_markers" ] && failure_markers="nenhum"
 
-    log "$bead_id: STUCK ${age_min}min — assignee=$assignee sess=$sess_status transcript=$transcript_note labels=$labels"
+    if [ "$permission_prompt_detected" = "1" ]; then
+        log "$bead_id: BLOQUEADO-EM-PROMPT ${age_min}min — assignee=$assignee sess=$sess_status comando=[$blocked_cmd] labels=$labels"
+    else
+        log "$bead_id: STUCK ${age_min}min — assignee=$assignee sess=$sess_status transcript=$transcript_note labels=$labels"
+    fi
 
-    # Build diagnostic mail body
-    body="$(cat <<BODY
+    # Build diagnostic mail body — differenciada (ga-iog1v/AC2) quando um
+    # diálogo de confirmação de permissão foi confirmado aberto no pane:
+    # NÃO é um stall genérico, precisa de um remédio específico, barato e
+    # não-destrutivo (responder o prompt), não o menu de kill/reclaim abaixo.
+    mail_subject_prefix="Agente travado"
+    if [ "$permission_prompt_detected" = "1" ]; then
+        mail_subject_prefix="Agente BLOQUEADO EM PROMPT (1 tecla resolve)"
+        body="$(cat <<BODY
+CAMADA 2 — ESCALAÇÃO AUTOMÁTICA: agente BLOQUEADO EM PROMPT DE PERMISSÃO
+(NÃO é um stall genérico — o pane confirma um diálogo interativo aberto).
+
+Bead:      $bead_id — $title
+Assignee:  ${assignee:-'(não atribuído)'}
+Sessão:    $live_session_name
+Comando bloqueado: $blocked_cmd
+Sem update há: ${age_min} minutos (limiar: $(( STUCK_AGENT_SEC / 60 )) min)
+Marcadores de falha: $failure_markers
+
+O QUE ACONTECEU: mesmo com bypass de permissões ativo, uma regra "ask"
+explícita ainda exigiu confirmação e a sessão está parada num diálogo como:
+  "Do you want to proceed?  1. Yes  2. Yes, and don't ask again  3. No"
+\`gc session nudge\` NÃO resolve isso — a mensagem fica em fila e só é
+processada DEPOIS do diálogo (verificado: 105s+ sem efeito). Não tente
+nudge aqui.
+
+AÇÃO SUGERIDA (confirmação antes de agir, resolve em segundos, não é kill):
+1. gc session peek $live_session_name --lines 40 — confirme o texto exato do prompt
+2. Responda a tecla certa DIRETAMENTE no pane (exceção documentada da
+   doutrina de pool — nudge não serve pra isto): tmux send-keys -t <pane>
+   '1' Enter (ou a tecla da opção CORRETA — leia o prompt antes, não assuma
+   sempre '1')
+3. Depois de destravar: se esta regra de permissão alcança sessões de pool
+   não-supervisionadas, considere virar "deny"/"allow" — nunca "ask"
+   (ga-q640n/AC3).
+
+Limiar configurável via STUCK_AGENT_SEC (atual: ${STUCK_AGENT_SEC}s).
+(Daemon: agent-stuck-escalation · ga-qw3p.2 · permission-prompt: ga-iog1v/ga-q640n)
+BODY
+)"
+    else
+        body="$(cat <<BODY
 CAMADA 2 — ESCALAÇÃO AUTOMÁTICA: bead in_progress sem progresso detectado.
 
 Bead:      $bead_id — $title
@@ -692,6 +829,7 @@ Limiar configurável via STUCK_AGENT_SEC (atual: ${STUCK_AGENT_SEC}s).
 (Daemon: agent-stuck-escalation · ga-qw3p.2)
 BODY
 )"
+    fi
 
     # Layer 1 routing (ga-qw3p.1): classify bead title+labels to find domain owner.
     # Falls back to Mayor when router unavailable or topic unrecognised.
@@ -707,20 +845,26 @@ BODY
 
     if [ "$DRY_RUN" = "1" ]; then
         log "  [DRY_RUN] would send mail to $_esc_target for $bead_id"
-        log "  [DRY_RUN] subject: Agente travado: $bead_id (${age_min}min sem progresso)"
+        log "  [DRY_RUN] subject: ${mail_subject_prefix}: $bead_id (${age_min}min sem progresso)"
         printf '%s' "$now" > "$sf"
         continue
     fi
 
     # imp07 invariant: notify FIRST (Dolt-independent), mail SECONDARY (best-effort)
     if command -v "$NOTIFY" >/dev/null 2>&1; then
-        "$NOTIFY" -t "Agente travado" -p 4 \
-            "$bead_id (${assignee:-?}) sem progresso há ${age_min}min — escalando → ${_esc_target}" \
-            >/dev/null 2>&1 || true
+        if [ "$permission_prompt_detected" = "1" ]; then
+            "$NOTIFY" -t "Agente bloqueado em prompt" -p 5 \
+                "$bead_id (${assignee:-?}) BLOQUEADO em prompt de permissão — 1 tecla resolve → ${_esc_target}" \
+                >/dev/null 2>&1 || true
+        else
+            "$NOTIFY" -t "Agente travado" -p 4 \
+                "$bead_id (${assignee:-?}) sem progresso há ${age_min}min — escalando → ${_esc_target}" \
+                >/dev/null 2>&1 || true
+        fi
     fi
 
     if timeout 45 "$GC" mail send "$_esc_target" \
-            -s "Agente travado: $bead_id — ${age_min}min sem progresso (assignee=${assignee:-?})" \
+            -s "${mail_subject_prefix}: $bead_id — ${age_min}min sem progresso (assignee=${assignee:-?})" \
             -m "$body" \
             >/dev/null 2>&1; then
         log "  mail enviado a $_esc_target (topic=${_esc_topic:-none}) para $bead_id"

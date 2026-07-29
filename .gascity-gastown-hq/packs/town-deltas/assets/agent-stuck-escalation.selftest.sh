@@ -87,6 +87,14 @@ case "$1 $2" in
     echo '{"ok":false,"error":{"message":"session not found"}}'
     exit 1
     ;;
+  "session peek")
+    _target="${3:-}"
+    _f="${PEEK_FIXTURE_DIR:-}/${_target}.txt"
+    if [ -n "${PEEK_FIXTURE_DIR:-}" ] && [ -f "$_f" ]; then
+        cat "$_f"
+    fi
+    exit 0
+    ;;
   "mail send")
     # $3 = recipient; find subject after -s flag
     _recipient="${3:-mayor}"
@@ -124,6 +132,7 @@ run_script() {
     SESSIONS_FIXTURE="${SESSIONS_FIXTURE:-}" \
     SESSIONS_QUERY_FAIL="${SESSIONS_QUERY_FAIL:-0}" \
     LOGS_FIXTURE_DIR="${LOGS_FIXTURE_DIR:-}" \
+    PEEK_FIXTURE_DIR="${PEEK_FIXTURE_DIR:-}" \
     GATE_MARKERS_DIR="${GATE_MARKERS_DIR:-}" \
     ACTIONS_FILE="$ACTIONS" \
     STUCK_AGENT_SEC="${STUCK_AGENT_SEC:-1800}" \
@@ -148,9 +157,10 @@ make_bead() {  # make_bead <id> <assignee> <age_secs> [type]
 BEADS_FIXTURE="$WORK/beads.json"
 SESSIONS_FIXTURE="$WORK/sessions.json"
 LOGS_FIXTURE_DIR="$WORK/logsfx"
+PEEK_FIXTURE_DIR="$WORK/peekfx"
 GATE_MARKERS_DIR="$WORK/gatemarkers"
-mkdir -p "$LOGS_FIXTURE_DIR" "$WORK/transcripts" "$GATE_MARKERS_DIR"
-export BEADS_FIXTURE SESSIONS_FIXTURE LOGS_FIXTURE_DIR GATE_MARKERS_DIR
+mkdir -p "$LOGS_FIXTURE_DIR" "$WORK/transcripts" "$GATE_MARKERS_DIR" "$PEEK_FIXTURE_DIR"
+export BEADS_FIXTURE SESSIONS_FIXTURE LOGS_FIXTURE_DIR PEEK_FIXTURE_DIR GATE_MARKERS_DIR
 
 # Default: empty sessions
 echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
@@ -589,6 +599,80 @@ assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test19" "T33: no mail �
 assert_absent "$ACTIONS" "notify" "T33: no notify — human-assignee suppresses"
 [ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test19" ] && ok "T33: no escalation state written (suppression is log-only)" || bad "T33: unexpected state file written on suppression"
 log_contains "T33" "identidade humana" "T33: log notes human-assignee suppression"
+
+# ── T34-T39: pane_shows_permission_prompt / permission_prompt_blocked_command ─
+# (ga-iog1v, AC1+AC2 of ga-q640n). T30 above (transcript frozen, pending Bash
+# tool_use, NO peek fixture registered — the shim then returns empty stdout)
+# already proves the fail-closed default: no PEEK_FIXTURE_DIR entry → generic
+# "Agente travado" escalation, unchanged. These tests cover the new signal.
+
+echo "T34: transcript frozen, pending Bash tool_use, pane confirms permission dialog → BLOQUEADO-EM-PROMPT escalation"
+echo '{"sessions":[{"name":"dog-test1","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-test1 3600 '[{"type":"assistant","message":{"stop_reason":"tool_use"},"blocks":[{"type":"tool_use","name":"Bash","input":{"command":"rm -rf scripts/__pycache__"}}]}]'
+{
+    echo "Permission rule Bash(rm -rf:*) requires confirmation for this command."
+    echo "Do you want to proceed?  1. Yes  2. Yes, and don't ask again  3. No"
+} > "$PEEK_FIXTURE_DIR/dog-test1.txt"
+printf '[%s]' "$(make_bead ga-test20 dog-test1 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test20"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente BLOQUEADO EM PROMPT (1 tecla resolve): ga-test20" "T34: differentiated escalation subject fires"
+log_contains "T34" "ga-test20: BLOQUEADO-EM-PROMPT" "T34: log notes permission-prompt detection for this bead"
+log_contains "T34" "rm -rf scripts/__pycache__" "T34: log includes the exact blocked command"
+rm -f "$LOGS_FIXTURE_DIR/dog-test1.json" "$PEEK_FIXTURE_DIR/dog-test1.txt"
+
+echo "T35: transcript frozen, pending Bash tool_use, pane has UNRELATED content → generic escalation (no false positive)"
+echo '{"sessions":[{"name":"dog-test2","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-test2 3600 '[{"type":"assistant","message":{"stop_reason":"tool_use"},"blocks":[{"type":"tool_use","name":"Bash","input":{"command":"npm test"}}]}]'
+{
+    echo "Running tests..."
+    echo "12 passed, 0 failed"
+} > "$PEEK_FIXTURE_DIR/dog-test2.txt"
+printf '[%s]' "$(make_bead ga-test21 dog-test2 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test21"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test21" "T35: generic escalation — pane content doesn't match the permission-prompt signature"
+log_contains "T35" "ga-test21: STUCK" "T35: log uses the generic STUCK marker, not BLOQUEADO-EM-PROMPT"
+rm -f "$LOGS_FIXTURE_DIR/dog-test2.json" "$PEEK_FIXTURE_DIR/dog-test2.txt"
+
+echo "T37: permission-prompt text present only in OLD scrollback (outside last 12 lines) → generic escalation (tail-anchoring holds)"
+echo '{"sessions":[{"name":"dog-test3","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-test3 3600 '[{"type":"assistant","message":{"stop_reason":"tool_use"},"blocks":[{"type":"tool_use","name":"Bash","input":{"command":"npm run build"}}]}]'
+{
+    echo "Do you want to proceed?  1. Yes  2. Yes, and don't ask again  3. No"
+    for i in $(seq 1 20); do echo "unrelated old scrollback line $i"; done
+} > "$PEEK_FIXTURE_DIR/dog-test3.txt"
+printf '[%s]' "$(make_bead ga-test22 dog-test3 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test22"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test22" "T37: generic escalation — prompt text is stale scrollback, not the pane's current tail"
+rm -f "$LOGS_FIXTURE_DIR/dog-test3.json" "$PEEK_FIXTURE_DIR/dog-test3.txt"
+
+echo "T38: pane shows 'requires confirmation' phrasing alone (no 'Do you want to proceed?' line) → still detected"
+echo '{"sessions":[{"name":"dog-test4","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-test4 3600 '[{"type":"assistant","message":{"stop_reason":"tool_use"},"blocks":[{"type":"tool_use","name":"Bash","input":{"command":"sudo apt-get update"}}]}]'
+echo "Permission rule Bash(sudo:*) requires confirmation for this command." > "$PEEK_FIXTURE_DIR/dog-test4.txt"
+printf '[%s]' "$(make_bead ga-test23 dog-test4 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test23"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente BLOQUEADO EM PROMPT (1 tecla resolve): ga-test23" "T38: 'requires confirmation' phrasing alone is also detected"
+rm -f "$LOGS_FIXTURE_DIR/dog-test4.json" "$PEEK_FIXTURE_DIR/dog-test4.txt"
+
+echo "T39: permission prompt confirmed but pending tool has no 'command' input field → falls back gracefully, doesn't break"
+echo '{"sessions":[{"name":"dog-test5","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-test5 3600 '[{"type":"assistant","message":{"stop_reason":"tool_use"},"blocks":[{"type":"tool_use","name":"Write","input":{"file_path":"/etc/hosts","content":"x"}}]}]'
+echo "Do you want to proceed?  1. Yes  2. No" > "$PEEK_FIXTURE_DIR/dog-test5.txt"
+printf '[%s]' "$(make_bead ga-test24 dog-test5 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test24"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente BLOQUEADO EM PROMPT (1 tecla resolve): ga-test24" "T39: detection still fires for a non-Bash tool (Write) pending approval"
+log_contains "T39" "ga-test24: BLOQUEADO-EM-PROMPT" "T39: log line present even without a 'command' field"
+rm -f "$LOGS_FIXTURE_DIR/dog-test5.json" "$PEEK_FIXTURE_DIR/dog-test5.txt"
 
 # ── T10–T12: Layer 1 routing integration (ga-qw3p.1) ────────────────────────
 # Deploy the real escalation-router.sh so the script can source it.

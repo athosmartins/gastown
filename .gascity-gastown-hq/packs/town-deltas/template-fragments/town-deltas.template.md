@@ -113,4 +113,29 @@ qualquer commit em `~/gt` — garante que o que você stageou é só o que VOCÊ
 editou nesta sessão. `git add -A`/`git commit -a` sem conferir assume que o
 resto da árvore está limpo, e numa árvore com várias sessões concorrentes
 isso quase nunca é verdade.
+
+**`gc session nudge` NÃO destrava um diálogo de permissão aberto — exige
+keystroke direto no pane (ga-q640n/ga-iog1v).** A doutrina nativa "sempre
+nudge, nunca tmux send-keys" tem uma exceção real e já confirmada num
+incidente ao vivo. Se o pane mostra um diálogo de confirmação interativo tipo
+`"Permission rule Bash(rm -rf:*) requires confirmation for this command. Do
+you want to proceed? 1. Yes 2. Yes, and don't ask again 3. No"`, o nudge
+entra numa fila que só é processada DEPOIS que o diálogo resolver — ou seja,
+nunca, se ninguém responder primeiro. Causa raiz: uma sessão de pool
+(dog/wa-worker/ps-worker) roda com bypass de permissões, mas uma regra
+"ask" explícita no `~/.claude/settings.json` (ex.: `Bash(rm -rf:*)`,
+`Bash(sudo:*)`) SOBREPÕE esse bypass — comportamento documentado e
+intencional do próprio Claude Code, não um bug do Gas Town. Verificado ao
+vivo: nudge "1" ficou 105s+ sem efeito num dog que rodou um `rm -rf` legítimo
+(limpeza de `__pycache__`) e travou 7h. O que destravou foi `tmux send-keys`
+direto no pane (tecla + Enter em comandos separados). Exceção ESCOPADA à
+doutrina nativa: só recorra a send-keys depois de CONFIRMAR o diálogo via
+`gc session peek <target> --lines 40` (leia as opções exatas antes de
+responder — não assuma sempre "1"), nunca como primeiro recurso e nunca sem
+essa confirmação. O daemon `agent-stuck-escalation.sh` agora detecta esse
+estado automaticamente (assinatura estável no pane, ver
+`pane_shows_permission_prompt()`) e manda mail com assunto "Agente BLOQUEADO
+EM PROMPT (1 tecla resolve)" em vez do genérico "Agente travado" — se você
+receber essa mensagem específica, o pane já está confirmado, pule direto
+para o passo de send-keys em vez de tentar nudge.
 {{ end }}
