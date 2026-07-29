@@ -2201,6 +2201,27 @@ echo "Scenario 16d6: ga-pb8z5 drift-guard — the stale-gate-history fix is wire
 has "$DISPATCHER" 'ga-pb8z5' "ga-pb8z5 fix comment is wired"
 has "$DISPATCHER" '_ns_label_blocks_release' "_ns_label_blocks_release helper is wired into the never-started detector"
 
+# 16d7 (ga-pb8z5 gate-review regression): TWO coexisting gate:fix-attempt:N
+# labels — the attempt-bump loop's `bd label remove ... || true` occasionally
+# leaves a stale counter behind a transient Dolt hiccup (documented, routine
+# residue — quality-gate-dispatcher.sh takes MAX over surviving values for the
+# same reason, ga-wisp-198xqe). A prior version of _ns_label_blocks_release
+# stripped history labels via comma-paired sed substitution
+# (`sed 's/,gate:needs-fix,/,/g; s/,gate:fix-attempt:[0-9]\{1,\},/,/g'`), which
+# breaks on two adjacent fix-attempt labels: the first match's trailing comma
+# is the same comma the second match needs as its leading delimiter, so
+# non-overlapping `/g` semantics consume it once and leave one counter
+# unstripped — falsely matching `*,gate:*)` and returning KEEP forever. This
+# was caught in gate review (gate_run=ga-wisp-4jpnm6y) before merge, with zero
+# test coverage for the exact shape that broke it. Must RELEASE, same as 16d2.
+NS_GATE_HIST2='[{"id":"tt-ns-gate-hist2","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-fix","gate:fix-attempt:1","gate:fix-attempt:2"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+LOG16D7="$(run_neverstarted "$NS_GATE_HIST2" "" "" "")"
+if echo "$LOG16D7" | grep -q "releasing never-started in-flight bead tt-ns-gate-hist2"; then
+  ok "ga-pb8z5: two coexisting gate:fix-attempt:N labels (residue race) no longer blocks release"
+else
+  bad "ga-pb8z5 REGRESSION: two coexisting gate:fix-attempt:N labels still block release forever (the gate-review-caught bug)"
+fi
+
 # 16e: a sling whose assignee is a LIVE session → KEEP (build in flight).
 NS_LIVE='[{"id":"tt-ns-live","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-live"}}]'
 LOG16E="$(run_neverstarted "$NS_LIVE" "" "$NS_SESS" '{"tt-sling-live":"digo-wa"}')"

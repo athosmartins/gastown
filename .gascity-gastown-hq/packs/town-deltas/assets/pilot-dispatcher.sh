@@ -3449,11 +3449,33 @@ _ownership_guard_should_refuse() {
 # active or needs a human" and keeps blocking — matching this function's
 # fail-safe-to-KEEP default. Split out of _neverstarted_recover_db so this
 # predicate is independently testable (see pilot-dispatcher.selftest.sh
-# Scenario 16d/16d2-16d5).
+# Scenario 16d/16d2-16d7).
+#
+# Checks each label as its own token (one per line via `tr ','  '\n'`), not via
+# comma-paired sed substitution — a prior version stripped history labels with
+# `sed 's/,gate:needs-fix,/,/g; s/,gate:fix-attempt:[0-9]\{1,\},/,/g'`, which
+# breaks when TWO gate:fix-attempt:N labels coexist (a documented, routine
+# residue — see quality-gate-dispatcher.sh's own MAX-over-surviving-values
+# handling of the same `{1,2}` race, ga-wisp-198xqe): the first match's
+# trailing comma is the second match's leading delimiter, so non-overlapping
+# `/g` semantics consume it once and leave one counter unstripped, which then
+# falsely matches the `*,gate:*)` KEEP case — silently reproducing the exact
+# stuck-forever bug this function exists to fix. Per-token matching has no
+# shared delimiters to consume, so it is immune regardless of how many
+# gate:fix-attempt:N labels are present at once.
 _ns_label_blocks_release() {
-  local _stripped
-  _stripped=$(printf ',%s,' "$1" | sed 's/,gate:needs-fix,/,/g; s/,gate:fix-attempt:[0-9]\{1,\},/,/g')
-  case "$_stripped" in *,gate:*) return 0 ;; esac
+  local _label
+  while IFS= read -r _label; do
+    case "$_label" in
+      ""|gate:needs-fix) continue ;;
+    esac
+    printf '%s\n' "$_label" | grep -q '^gate:fix-attempt:[0-9]\{1,\}$' && continue
+    case "$_label" in
+      gate:*) return 0 ;;
+    esac
+  done <<EOF
+$(printf '%s' "$1" | tr ',' '\n')
+EOF
   return 1
 }
 
