@@ -29,7 +29,16 @@
 #   • Only launchd-OWNED live processes (ppid==1) are inspected, so a developer's
 #     transient build subprocess (a child of an agent shell) is never mistaken
 #     for a production job.
-#   • Does not cover config/secret drift — only the CODE PATH of production jobs.
+#   • Also covers EnvironmentVariables drift specifically, for
+#     packs/town-deltas/assets/*.plist vs its deployed ~/Library/LaunchAgents/
+#     counterpart (ga-cv0dv): a path-only check would have missed the incident
+#     that prompted this — ProgramArguments matched, only an env var was stale
+#     because the deployed copy was never resynced. Matches pairs by Label,
+#     not filename (most asset files are bare-named but deploy under a
+#     com.gascity.*-prefixed Label). A repo plist with NO deployed counterpart
+#     at all is a related but distinct gap — out of scope here, not flagged.
+#   • Does not cover config/secret drift beyond that one EnvironmentVariables
+#     check — only the CODE PATH of production jobs, plus that.
 #
 # ALERTING:
 #   • Clean → SILENT exit 0 (acceptance: no noise / no false-positive when there
@@ -67,12 +76,14 @@ STATE_DIR="${STATE_DIR:-$CITY/.gc/state}"
 REMOTE="${DRIFT_REMOTE:-origin}"
 MAIN_BRANCH="${DRIFT_MAIN_BRANCH:-main}"
 LAUNCH_AGENTS_DIR="${LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
+ASSETS_DIR="${DRIFT_ASSETS_DIR:-$CITY/packs/town-deltas/assets}"
 SCAN_INTERVAL="${DRIFT_SCAN_INTERVAL:-900}"          # 15 min between sweeps (daemon mode)
 ENABLED="${DRIFT_GUARD_ENABLED:-1}"
 EXIT_ON_DRIFT="${DRIFT_GUARD_EXIT_ON_DRIFT:-0}"      # pre-push/CI: exit nonzero on drift
 SCAN_LAUNCHD="${DRIFT_SCAN_LAUNCHD:-1}"
 SCAN_CRON="${DRIFT_SCAN_CRON:-1}"
 SCAN_PROCS="${DRIFT_SCAN_PROCS:-1}"
+SCAN_PLIST_ENV="${DRIFT_SCAN_PLIST_ENV:-1}"          # ga-cv0dv: assets/*.plist env-var drift
 NTFY_THROTTLE_SECONDS="${DRIFT_NTFY_THROTTLE:-3600}"
 # Allowlist of SANCTIONED exceptions (e.g. deliberate on-disk-only stopgap
 # daemons). One glob per line, matched against either the code path or the job
@@ -220,6 +231,14 @@ dg_label_from_plist() {
   plutil -convert json -o - "$1" 2>/dev/null | jq -r '.Label // empty' 2>/dev/null
 }
 
+# dg_env_from_plist <plist> → sorted "KEY=VALUE" lines of EnvironmentVariables
+# (empty output for a plist with no such key, or an empty dict).
+dg_env_from_plist() {
+  plutil -convert json -o - "$1" 2>/dev/null | jq -r '
+    (.EnvironmentVariables // {}) | to_entries | sort_by(.key)[] | "\(.key)=\(.value)"
+  ' 2>/dev/null
+}
+
 # dg_is_allowlisted <path> <label> → 0 if a sanctioned exception, else 1.
 dg_is_allowlisted() {
   local path="$1" label="$2" pat file
@@ -249,6 +268,27 @@ dg_emit_if_drift() {
   owner=$(dg_owner_for_path "$path" "$kind")
   DRIFT_FOUND=$((DRIFT_FOUND + 1))
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$source" "$job" "$path" "$kind" "$detail" "$owner"
+}
+
+# dg_emit_if_env_drift <label> <repo_plist> <deployed_plist>
+# Compare EnvironmentVariables dicts between a repo asset plist and its
+# deployed LaunchAgents counterpart; if they differ, print one drift record.
+# Unlike dg_emit_if_drift (code-path classification via git), this is a pure
+# value diff with no git involved, so it stays a sibling function rather than
+# reusing dg_classify_path.
+dg_emit_if_env_drift() {
+  local label="$1" repo_plist="$2" deployed_plist="$3" repo_env deployed_env detail
+  repo_env=$(dg_env_from_plist "$repo_plist")
+  deployed_env=$(dg_env_from_plist "$deployed_plist")
+  [ "$repo_env" = "$deployed_env" ] && return 0
+  dg_is_allowlisted "$repo_plist" "$label" && return 0
+  # Guard each side: `printf '%s\n' ""` emits one blank line even for a truly
+  # empty dict, which `diff` would report as a spurious "< " removal.
+  detail=$(diff <([ -n "$repo_env" ] && printf '%s\n' "$repo_env") \
+                <([ -n "$deployed_env" ] && printf '%s\n' "$deployed_env") 2>/dev/null \
+    | grep '^[<>]' | tr '\n' ';' | sed 's/;$//')
+  DRIFT_FOUND=$((DRIFT_FOUND + 1))
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "plist-env" "$label" "$repo_plist" "env-drift" "$detail" "deployed=$deployed_plist"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,6 +338,30 @@ scan_procs() {
   done < <(ps -axo pid=,ppid=,command= 2>/dev/null)
 }
 
+# scan_plist_env — repo packs/town-deltas/assets/*.plist vs deployed
+# ~/Library/LaunchAgents/ counterpart, EnvironmentVariables only (ga-cv0dv).
+# Matches by Label (NOT filename) — most asset files are bare-named
+# (crew-hang-detector.plist) but deploy under a com.gascity.*-prefixed
+# Label, so a filename-based matcher would silently skip most pairs.
+# A repo plist with no deployed counterpart is skipped, not flagged — "never
+# deployed at all" is a related but distinct gap from "deployed but stale".
+scan_plist_env() {
+  [ "$SCAN_PLIST_ENV" = "1" ] || return 0
+  # log() tees to stdout as well as $LOG, and this scanner's stdout is captured
+  # as structured findings by run_scan — redirect these guard diagnostics to
+  # stderr so a missing dir degrades to silent-skip, not a phantom finding.
+  [ -d "$ASSETS_DIR" ] || { log "plist-env: $ASSETS_DIR absent — skip" >&2; return 0; }
+  [ -d "$LAUNCH_AGENTS_DIR" ] || { log "plist-env: $LAUNCH_AGENTS_DIR absent — skip" >&2; return 0; }
+  local repo_plist label deployed_plist
+  for repo_plist in "$ASSETS_DIR"/*.plist; do
+    [ -e "$repo_plist" ] || continue
+    label=$(dg_label_from_plist "$repo_plist"); [ -n "$label" ] || label=$(basename "$repo_plist" .plist)
+    deployed_plist="$LAUNCH_AGENTS_DIR/$label.plist"
+    [ -e "$deployed_plist" ] || continue
+    dg_emit_if_env_drift "$label" "$repo_plist" "$deployed_plist"
+  done
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ORCHESTRATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -309,7 +373,7 @@ run_scan() {
   # dg_emit_if_drift increments to DRIFT_FOUND do NOT reach this scope. Derive
   # DRIFT_FOUND authoritatively from the finding count below so run_one's
   # EXIT_ON_DRIFT (pre-push/CI gate) sees the real result.
-  findings=$( { scan_launchd; scan_cron; scan_procs; } | sort -u )
+  findings=$( { scan_launchd; scan_cron; scan_procs; scan_plist_env; } | sort -u )
 
   if [ -z "$findings" ]; then
     # Silent on clean (acceptance: no noise). Refresh the state file for observability.

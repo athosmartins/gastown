@@ -13,6 +13,9 @@
 #     zero-false-positive guarantee (Scenarios 1,7,8 + the silent-clean scan 14).
 #   • findings are actionable: job + path + kind + owner (Scenarios 11,12,13).
 #   • launchd plist parsing + end-to-end launchd scan (Scenarios 10,13).
+#   • ga-cv0dv: assets/*.plist EnvironmentVariables vs deployed counterpart,
+#     matched by Label not filename, undeployed plists silent, allowlist
+#     reused (Scenarios 16-21).
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -173,7 +176,10 @@ echo "Scenario 13: all-clean scan is silent and writes last_clean state"
 LA2="$TMP/LaunchAgentsClean"; mkdir -p "$LA2"
 cp "$LA/com.test.clean.plist" "$LA2/"
 # Drive run_scan directly in-process (lib already sourced) with only the clean dir.
-LAUNCH_AGENTS_DIR="$LA2" SCAN_CRON=0 SCAN_PROCS=0 run_scan
+# SCAN_PLIST_ENV=0: isolate to scan_launchd, same as SCAN_CRON/SCAN_PROCS below —
+# ASSETS_DIR is still the unset-in-this-tree default, and scan_plist_env's own
+# absent-dir log() would otherwise leak a line into run_scan's findings capture.
+LAUNCH_AGENTS_DIR="$LA2" SCAN_CRON=0 SCAN_PROCS=0 SCAN_PLIST_ENV=0 run_scan
 rc=$?
 [ "$rc" -eq 0 ] && ok "run_scan returns 0 on clean host" || bad "run_scan rc=$rc on clean host"
 [ "$DRIFT_FOUND" -eq 0 ] && ok "DRIFT_FOUND=0 (silent)" || bad "DRIFT_FOUND=$DRIFT_FOUND on clean host"
@@ -181,7 +187,7 @@ grep -q "^last_clean " "$STATE_DIR/production-drift-guard.last" 2>/dev/null && o
 
 # ── Scenario 14: run_scan on a drifted host sets DRIFT_FOUND + writes last_drift ──
 echo "Scenario 14: drifted scan records findings + state"
-LAUNCH_AGENTS_DIR="$LA" SCAN_CRON=0 SCAN_PROCS=0 run_scan
+LAUNCH_AGENTS_DIR="$LA" SCAN_CRON=0 SCAN_PROCS=0 SCAN_PLIST_ENV=0 run_scan
 [ "$DRIFT_FOUND" -ge 1 ] && ok "DRIFT_FOUND>=1 ($DRIFT_FOUND)" || bad "DRIFT_FOUND=$DRIFT_FOUND, expected >=1"
 grep -q "^last_drift " "$STATE_DIR/production-drift-guard.last" 2>/dev/null && ok "last_drift state written" || bad "last_drift state missing"
 
@@ -195,6 +201,93 @@ got=$(DRIFT_ALLOWLIST_FILE="$ALLOW" LAUNCH_AGENTS_DIR="$LA" scan_launchd)
 printf 'com.test.something-else\n' > "$ALLOW"
 got=$(DRIFT_ALLOWLIST_FILE="$ALLOW" LAUNCH_AGENTS_DIR="$LA" scan_launchd)
 printf '%s\n' "$got" | grep -q "com.test.drift" && ok "non-matching allowlist does not suppress real drift" || bad "drift wrongly suppressed by non-matching allowlist"
+
+# mk_plist_env <path> <label> <key=val> [<key=val> ...] — write a minimal
+# LaunchAgent plist with the given Label + EnvironmentVariables dict.
+mk_plist_env() {
+  local path="$1" label="$2"; shift 2
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<plist version="1.0"><dict>'
+    echo "  <key>Label</key><string>$label</string>"
+    echo '  <key>EnvironmentVariables</key><dict>'
+    local kv k v
+    for kv in "$@"; do
+      k="${kv%%=*}"; v="${kv#*=}"
+      echo "    <key>$k</key><string>$v</string>"
+    done
+    echo '  </dict>'
+    echo '</dict></plist>'
+  } > "$path"
+}
+
+# ── Scenario 16: dg_env_from_plist extracts sorted KEY=VALUE lines ──
+echo "Scenario 16: dg_env_from_plist extraction"
+EP="$TMP/env-extract-test.plist"
+mk_plist_env "$EP" "com.test.envextract" "ZVAR=z" "AVAR=a"
+got=$(dg_env_from_plist "$EP")
+expected=$'AVAR=a\nZVAR=z'
+[ "$got" = "$expected" ] && ok "extracts + sorts by key" || bad "expected '$expected', got '$got'"
+NOENV="$TMP/no-env.plist"
+cat > "$NOENV" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>com.test.noenv</string></dict></plist>
+EOF
+[ -z "$(dg_env_from_plist "$NOENV")" ] && ok "absent EnvironmentVariables key → empty" || bad "expected empty for absent key"
+
+# ── Scenario 17: scan_plist_env — matching env → no finding ──
+echo "Scenario 17: scan_plist_env silent when repo matches deployed"
+ASSETS="$TMP/assets"; LA3="$TMP/LaunchAgents3"; mkdir -p "$ASSETS" "$LA3"
+mk_plist_env "$ASSETS/same-job.plist"          "com.gascity.same-job" "FOO=bar"
+mk_plist_env "$LA3/com.gascity.same-job.plist" "com.gascity.same-job" "FOO=bar"
+got=$(ASSETS_DIR="$ASSETS" LAUNCH_AGENTS_DIR="$LA3" scan_plist_env)
+[ -z "$got" ] && ok "matching env produces no finding" || bad "expected silent, got '$got'"
+
+# ── Scenario 18: scan_plist_env — differing env → exactly one env-drift finding ──
+echo "Scenario 18: scan_plist_env flags a real env difference"
+mk_plist_env "$ASSETS/drift-job.plist"          "com.gascity.drift-job" "FOO=bar"
+mk_plist_env "$LA3/com.gascity.drift-job.plist" "com.gascity.drift-job" "FOO=bar" "BD_ACTOR=automation"
+findings=$(ASSETS_DIR="$ASSETS" LAUNCH_AGENTS_DIR="$LA3" scan_plist_env)
+n=$(printf '%s\n' "$findings" | grep -c .)
+[ "$n" -eq 1 ] && ok "exactly 1 env-drift finding (same-job still silent)" || bad "expected 1 finding, got $n: '$findings'"
+echo "$findings" | grep -q "com.gascity.drift-job" && ok "drifted job named" || bad "drifted job not named"
+echo "$findings" | grep -q "env-drift" && ok "kind=env-drift reported" || bad "kind not reported"
+echo "$findings" | grep -q "BD_ACTOR" && ok "diff detail names the differing key" || bad "diff detail missing differing key"
+
+# ── Scenario 19: matches by Label, not filename (most assets are bare-named) ──
+echo "Scenario 19: matches by Label even when repo filename has no com.gascity prefix"
+mk_plist_env "$ASSETS/bare-named-file.plist"        "com.gascity.actual-label" "X=1"
+mk_plist_env "$LA3/com.gascity.actual-label.plist"  "com.gascity.actual-label" "X=2"
+findings=$(ASSETS_DIR="$ASSETS" LAUNCH_AGENTS_DIR="$LA3" scan_plist_env)
+echo "$findings" | grep -q "com.gascity.actual-label" && ok "bare-named repo file matched via Label" || bad "Label-based match failed: '$findings'"
+
+# ── Scenario 20: repo plist with no deployed counterpart is skipped, not flagged ──
+echo "Scenario 20: undeployed repo plist is silent (distinct gap, out of scope)"
+mk_plist_env "$ASSETS/never-deployed.plist" "com.gascity.never-deployed" "X=1"
+findings=$(ASSETS_DIR="$ASSETS" LAUNCH_AGENTS_DIR="$LA3" scan_plist_env)
+echo "$findings" | grep -q "never-deployed" && bad "undeployed plist wrongly flagged" || ok "undeployed plist silent (out of scope by design)"
+
+# ── Scenario 21: allowlist suppresses env-drift too (same mechanism as path-drift) ──
+echo "Scenario 21: allowlist suppresses a sanctioned env-drift exception"
+ALLOW2="$TMP/allow2.txt"
+printf 'com.gascity.drift-job\n' > "$ALLOW2"
+got=$(DRIFT_ALLOWLIST_FILE="$ALLOW2" ASSETS_DIR="$ASSETS" LAUNCH_AGENTS_DIR="$LA3" scan_plist_env)
+echo "$got" | grep -q "com.gascity.drift-job" && bad "allowlist did not suppress env-drift" || ok "allowlisted env-drift suppressed"
+echo "$got" | grep -q "com.gascity.actual-label" && ok "non-matching job still flagged through allowlist" || bad "allowlist over-suppressed unrelated job"
+
+# ── Scenario 22: repo side with zero env vars produces no spurious blank-line diff ──
+echo "Scenario 22: empty-side diff has no phantom blank-line entry"
+NOENVDIR="$TMP/no-env-repo.plist"
+cat > "$NOENVDIR" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>com.gascity.no-env-repo</string></dict></plist>
+EOF
+mk_plist_env "$LA3/com.gascity.no-env-repo.plist" "com.gascity.no-env-repo" "BD_ACTOR=automation"
+cp "$NOENVDIR" "$ASSETS/no-env-repo.plist"
+findings=$(ASSETS_DIR="$ASSETS" LAUNCH_AGENTS_DIR="$LA3" scan_plist_env)
+line=$(printf '%s\n' "$findings" | grep "com.gascity.no-env-repo")
+echo "$line" | grep -q "BD_ACTOR=automation" && ok "real addition still reported" || bad "missing real diff content: '$line'"
+echo "$line" | awk -F'\t' '{print $5}' | grep -qE '^< ' && bad "phantom blank-line '<' entry present: '$line'" || ok "no phantom blank-line entry on the empty side"
 
 echo ""
 echo "──────────────────────────────────────────"
