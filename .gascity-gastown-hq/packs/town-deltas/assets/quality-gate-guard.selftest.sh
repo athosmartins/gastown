@@ -50,6 +50,21 @@ r=$(reconcile_zero_verdict_run_action 30 15 claimed);     [ "$r" = "supersede:re
 r=$(reconcile_zero_verdict_run_action 30 15 '');          [ "$r" = "skip" ] && ok "aged+empty-status → skip (fail-safe, never guess)" || bad "empty status got '$r'"
 r=$(reconcile_zero_verdict_run_action 30 15 reviewing);   [ "$r" = "skip" ] && ok "aged+unrecognized-status → skip (fail-safe)" || bad "unrecognized status got '$r'"
 
+# ── dedup_gaterun_action <group_count> <is_newest> — ga-f1ngu ────────────────
+# This is what retires the guard's own claim-receipt bead (gate-status:claimed
+# as of ga-f1ngu) the sweep after a real gate-run bead (gate-status:running)
+# lands for the same marker_id — group_count=2, the claim receipt is always
+# older so is_newest=0 → supersede:duplicate; the real run is is_newest=1 → keep.
+echo "dedup_gaterun_action: keep-newest across a shared marker_id group"
+r=$(dedup_gaterun_action 1 1); [ "$r" = "keep" ] && ok "lone run (group_count=1) → keep, nothing to dedup" || bad "lone run got '$r'"
+r=$(dedup_gaterun_action 0 1); [ "$r" = "keep" ] && ok "group_count=0 (no key / unmatched) → keep" || bad "group_count=0 got '$r'"
+r=$(dedup_gaterun_action 2 1); [ "$r" = "keep" ] && ok "2-member group, this IS newest (the real dispatcher run) → keep" || bad "newest-of-2 got '$r'"
+r=$(dedup_gaterun_action 2 0); [ "$r" = "supersede:duplicate" ] && ok "2-member group, NOT newest (the guard's stale claim receipt) → supersede:duplicate" || bad "oldest-of-2 got '$r'"
+r=$(dedup_gaterun_action 3 0); [ "$r" = "supersede:duplicate" ] && ok "3-member group (re-queued marker spawned another retry), not newest → supersede:duplicate" || bad "oldest-of-3 got '$r'"
+r=$(dedup_gaterun_action 3 1); [ "$r" = "keep" ] && ok "3-member group, this IS newest → keep" || bad "newest-of-3 got '$r'"
+r=$(dedup_gaterun_action abc 0); [ "$r" = "keep" ] && ok "non-numeric group_count → keep (fail-safe, never guess)" || bad "non-numeric group_count got '$r'"
+r=$(dedup_gaterun_action '' 0);  [ "$r" = "keep" ] && ok "empty group_count → keep (fail-safe)" || bad "empty group_count got '$r'"
+
 # ── classify_parent_gap2 <dispatched> <live_assignee> <sling_found> <sling_needs_fix> <sling_closed> ─
 echo "classify_parent_gap2: dispatch/assignee/sling routing"
 r=$(classify_parent_gap2 1 0 1 1 0); [ "$r" = "free:fail-stranded" ] && ok "sling gate-failed → free:fail-stranded" || bad "sling-failed got '$r'"

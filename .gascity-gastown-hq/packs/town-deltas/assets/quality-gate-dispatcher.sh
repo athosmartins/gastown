@@ -635,6 +635,20 @@ classify_sibling_run() {
 # FAIL-OPEN: any bd/jq/date failure yields "" so a transient glitch can NEVER
 # block a legitimate run (identical to the pre-guard behavior). The decision it
 # defers to (classify_sibling_run) is the pure, unit-tested core.
+#
+# ga-f1ngu: the description match below ("Autonomous gate run for X.") is this
+# dispatcher's OWN Step 6 template text — it never matches the guard's
+# claim-receipt bead (quality-gate-guard.sh Step 6, description "Quality gate
+# run for branch X."). That text mismatch is exactly why this guard used to be
+# blind to the guard's claim receipt, letting a second (real) run get created
+# right on top of it (the "same marker generates 2 runs" bug). The actual fix
+# was NOT to make the text match here — that would make the dispatcher yield
+# to the claim receipt as a perpetually-"live" sibling forever, since nothing
+# in this run's own lifecycle ever ages it out, permanently stalling dispatch
+# for every marker. The real fix was to stop the claim receipt from claiming
+# gate-status:running at all (it is now gate-status:claimed), so it is
+# correctly excluded up front by THIS function's own bd query, for the right
+# reason instead of an accidental one.
 live_sibling_run_for_branch() {
   local branch="$1" now_epoch run_json count i id status desc started started_epoch age_min verdict
   [ -z "$branch" ] && return 0
@@ -1829,11 +1843,18 @@ vb_status_action() {
 # GATE_GUARD_LIB_ONLY=1) — same DRY pattern as parse_marker_id. Single source of
 # truth in quality-gate-guard.sh; no copy here to avoid drift (ga-jhyu).
 
-# ── supersede_sibling_runs — proactively close guard's companion gate-run bead ─
-# The guard creates a quality-gate: sibling bead at claim time. The dispatcher
-# drives ITS OWN gate-run: bead but never drives the sibling to terminal (ga-tmug
-# Vector B). Calling this on BOTH PASS and FAIL terminal paths supersedes any
-# still-running sibling immediately, without waiting for the guard's 90m TTL fallback.
+# ── supersede_sibling_runs — proactively close a duplicate gate-status:running run ─
+# Originally written (ga-tmug) because the guard's claim-time quality-gate:
+# sibling bead was never driven to terminal by anyone but the guard's own 90m
+# TTL fallback (Vector B). As of ga-f1ngu the guard's claim receipt is labeled
+# gate-status:claimed, not :running (see quality-gate-guard.sh Step 6), so this
+# function's query below no longer sees it at all — that case is now retired by
+# the guard's OWN Vector B dedup, typically within one ~2min sweep of this
+# dispatcher creating its real run, well before any terminal verdict. This
+# function remains live for its OTHER original purpose: a re-queued marker
+# (dead-dispatcher recovery, ga-dupnv/ga-o57gn) can still spawn a second REAL
+# dispatcher-created run sharing this marker_id — calling this on BOTH PASS and
+# FAIL terminal paths supersedes any such still-running duplicate immediately.
 #
 # Usage: supersede_sibling_runs <marker_id> <branch> <bead_id>
 supersede_sibling_runs() {
@@ -3711,6 +3732,17 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
         # already-extracted bead id (an EXACT match against the known id,
         # not a generic parenthesis strip, so a branch name that itself
         # contains parentheses is never mis-parsed).
+        #
+        # ga-f1ngu note: before that fix, the guard's "quality-gate: ..."
+        # claim-receipt bead could ALSO reach this loop (it was mislabeled
+        # gate-status:running) and, since its title prefix is "quality-gate:
+        # " not "gate-run: ", the strip below was a no-op and BRANCH ended up
+        # as the garbled full title minus only the trailing "($BEAD_ID)" —
+        # exactly the corrupted value this log line reported live (ga-jo3xl,
+        # 2026-07-29). Now that the guard's claim-receipt is gate-status:
+        # claimed, the PHASE_C_RUNNING_JSON query above never returns it, so
+        # this fallback only ever sees genuine pre-ga-eqjo dispatcher beads
+        # again, as originally intended.
         PC_TITLE=$(printf '%s' "$PC_RUN" | jq -r '.title // ""')
         if [ -n "$PC_TITLE" ]; then
           BRANCH="${PC_TITLE#gate-run: }"

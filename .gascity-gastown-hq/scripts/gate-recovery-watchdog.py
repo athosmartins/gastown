@@ -1681,8 +1681,15 @@ def hung_run_verdict(age_sec, hang_sec, n_verdict_beads, n_delivered,
 
       skip:young            — younger than REVIEW_HANG_MINUTES (a real review takes 9+m)
       skip:verdict-query-failed — could not read verdict beads (never reap blind)
-      skip:not-a-review-run — 0 verdict beads = a guard CLAIM-time tracking run, not a
-                              dispatcher review run; leave it to the guard's own reconcile
+      skip:not-a-review-run — 0 verdict beads on an open gate-status:running run. Before
+                              ga-f1ngu this was usually the guard's CLAIM-time tracking
+                              bead (mislabeled gate-status:running); that bead is now
+                              gate-status:claimed and _open_running_runs() never returns
+                              it at all. This branch now means the DISPATCHER's own real
+                              run bead was created but died before Step 7 ever spawned a
+                              reviewer — leave it to the guard's Vector B reconcile
+                              (reconcile_zero_verdict_run_action), which handles this
+                              case identically regardless of which side created the bead
       skip:producing        — >=1 verdict already delivered → reviewers ARE working
       skip:liveness-unknown — session list unavailable → never reap blind
       skip:reviewer-active  — a reviewer session is state=active → working, not hung

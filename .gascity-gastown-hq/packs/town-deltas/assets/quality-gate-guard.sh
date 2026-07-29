@@ -214,11 +214,15 @@ verdict_count_from_query() {
 
 # dedup_gaterun_action <group_count> <is_newest: 0|1>
 # Pure decision: enforce ≤1 running gate-run per source-bead/marker (ga-o57gn (c)).
-# The guard creates a tracking gate-run at claim time and the dispatcher creates
-# its OWN at dispatch time; a re-queued marker (dead-dispatcher recovery) then
-# spawns yet another. Multiple gate-runs sharing a marker_id are thus normal
-# transiently — but only the NEWEST is the live run; older ones are stale and
-# inflate the "GATES RODANDO" count. Keep the newest, supersede the rest.
+# The guard creates a tracking gate-run at claim time (gate-status:claimed as of
+# ga-f1ngu) and the dispatcher creates its OWN at dispatch time (gate-status:
+# running); a re-queued marker (dead-dispatcher recovery) then spawns yet
+# another real run. Multiple gate-runs sharing a marker_id are thus normal
+# transiently — but only the NEWEST is the live one; older ones are stale and
+# (pre-ga-f1ngu) used to inflate the "GATES RODANDO" count by masquerading as
+# :running. Keep the newest, supersede the rest — this is also what retires the
+# guard's own claim receipt the sweep after a real gate-run bead lands for the
+# same marker_id.
 # A lone run (group_count<=1) is always kept. Returns: keep | supersede:duplicate
 dedup_gaterun_action() {
   local group_count="$1" is_newest="$2"
@@ -522,9 +526,20 @@ validate_rig() {
 # second, separate bd round-trip in Step 0b) AND by Vector A's companion-
 # liveness check right below. Both vectors must see the identical snapshot;
 # two separate fetches could observe different states across the gap.
+#
+# ga-f1ngu: includes gate-status:claimed alongside :running — a claim receipt
+# (Step 6 below) is a real, live companion of its marker even though it is not
+# itself a review run. Narrowing this to :running only would (a) make Vector
+# A's has_live_companion_run go false the instant a marker is merely claimed
+# but not yet dispatched, re-exposing it to false reclaim/error, and (b) leave
+# claim receipts with no companion query to ever dedup/close them once a real
+# gate-run bead supersedes them — they'd accumulate as permanently-open beads
+# forever (nothing else queries gate-status:claimed gate-runs). --label-any is
+# OR (verified empirically: passed OR failed counts summed to the union count).
 GATE_RUNS_JSON=$(bd -C "$GC_CITY" list --json --all \
   -l type:quality-gate-run \
-  -l gate-status:running \
+  --label-any gate-status:running \
+  --label-any gate-status:claimed \
   2>/dev/null || echo "[]")
 GATE_RUN_COUNT=$(printf '%s\n' "$GATE_RUNS_JSON" | jq 'length' 2>/dev/null || echo "0")
 case "$GATE_RUN_COUNT" in ''|*[!0-9]*) GATE_RUN_COUNT=0 ;; esac
@@ -625,11 +640,14 @@ if [ "$TRANSIENT_COUNT" -gt 0 ]; then
   done
 fi
 
-# ── Step 0b: Vector B — reconcile orphan gate-run:running beads ───────────────
-# The guard creates a quality-gate: bead (type:quality-gate-run, gate-status:running)
-# at claim time. The dispatcher drives ITS OWN gate-run: bead but NEVER drives the
-# guard's bead to terminal — leaving orphans pinned in running after their run
-# completed (ga-tmug Vector B, 9 such beads observed).
+# ── Step 0b: Vector B — reconcile orphan gate-run beads ───────────────────────
+# The guard creates a quality-gate: claim-receipt bead (type:quality-gate-run,
+# gate-status:claimed — NOT :running as of ga-f1ngu, see Step 6's header) at
+# claim time. The dispatcher drives ITS OWN gate-run: bead (gate-status:running)
+# but never drives the guard's claim-receipt to terminal — leaving orphans
+# pinned open after their real run completed (ga-tmug Vector B, 9 such beads
+# observed originally in gate-status:running; the SAME orphaning happens today
+# in gate-status:claimed, just no longer masquerading as a live review).
 #
 # Fix: use reconcile_gaterun_action keyed on the companion marker's state
 # (extracted via parse_marker_id from the gate-run description):
@@ -639,8 +657,15 @@ fi
 #
 # Keying on marker_id (not just source-bead) prevents false-positives on
 # re-dispatched live runs that share a source bead with an older failed attempt.
+#
+# This vector, plus the dedup pass below, is what ultimately closes out every
+# claim receipt — either via keep-newest dedup the sweep after a real gate-run
+# bead appears for the same marker_id, or (if dispatch never happens) via the
+# zero-verdict grace-window check once the marker itself goes stale. Nothing
+# else queries gate-status:claimed gate-run beads, so this loop is their only
+# path to ever closing (ga-f1ngu) — see the shared-prelude query above.
 
-log "Step 0b: Vector B reconcile — orphan gate-run:running beads (TTL=${GATE_RUN_TTL_MINUTES}m, zombie-age=${GATE_ZOMBIE_AGE_MINUTES}m=verdict-timeout+margin)..."
+log "Step 0b: Vector B reconcile — orphan gate-run beads, running+claimed (TTL=${GATE_RUN_TTL_MINUTES}m, zombie-age=${GATE_ZOMBIE_AGE_MINUTES}m=verdict-timeout+margin)..."
 
 # reviewers_alive_for_run <gate_run_id> — I/O helper (ga-o57gn).
 # Echo 1 iff at least one of this gate-run's still-OPEN verdict beads is assigned
@@ -1545,15 +1570,38 @@ if [ -n "$BEAD_ID" ]; then
   bd -C "$BEAD_CITY" update "$BEAD_ID" --unset-metadata gc.routed_to -q 2>/dev/null || true
 fi
 
-# ── Step 6: Create gate-run tracking bead ─────────────────────────────────────
-
+# ── Step 6: Create gate-run CLAIM RECEIPT (ga-f1ngu) ──────────────────────────
+# This bead is NOT a review run — no reviewer is ever spawned against it, the
+# dispatcher creates its OWN, separate type:quality-gate-run bead (title
+# "gate-run: ...", gate-status:running) once it actually begins reviewing. This
+# one exists only so the claim is durably recorded before the marker is parked
+# gate-status:queued below.
+#
+# gate-status:claimed (NOT :running) is deliberate — ga-f1ngu (2026-07-29):
+# labeling this :running made it indistinguishable from a REAL run to every
+# consumer that scans `type:quality-gate-run + gate-status:running` as "a
+# review is in flight": Phase C's health sweep (quality-gate-dispatcher.sh),
+# gate-recovery-watchdog.py's hung_run_verdict, AND the gate-congestion
+# throttle checks in pilot-dispatcher.sh / auto-refino-dispatcher.sh (all
+# inflated by every claim receipt sitting in queue). Worse, it let the
+# dispatcher's OWN pre-creation duplicate-run guard (live_sibling_run_for_branch,
+# ga-dupnv) miss this bead as a sibling — that guard matches candidates by the
+# exact description substring "Autonomous gate run for X." which only the
+# dispatcher's own template writes, so it never recognized this bead as
+# competition and happily created a second, real run on top of it. (Making the
+# text match instead would be WORSE, not better: the dispatcher would then
+# yield to this receipt as a perpetually-"live" sibling forever, since nothing
+# in the dispatcher's own lifecycle ever ages it out — the gate would never
+# actually dispatch anything.) Do NOT relabel this back to :running without
+# also either (a) giving it real verdict beads, or (b) re-auditing every one of
+# those consumers.
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 GATE_RUN_ID=$(bd -C "$GC_CITY" create \
   "quality-gate: $BRANCH ($BEAD_ID)" \
   -t chore --ephemeral \
   -l type:quality-gate-run \
-  -l gate-status:running \
+  -l gate-status:claimed \
   -l "source-bead:$BEAD_ID" \
   -d "Quality gate run for branch $BRANCH.
 source_bead: $BEAD_ID
