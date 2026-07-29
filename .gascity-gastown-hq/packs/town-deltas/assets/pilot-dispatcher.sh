@@ -940,6 +940,59 @@ _crew_is_suspended() {
   case " $susp " in *" $crew "*) return 0 ;; *) return 1 ;; esac
 }
 
+# ── ga-7ti1t (Mayor re-scope, 2026-07-29 16:06): owner-inferred crew fallback ──
+# A DOMAIN build with no rig-wide persistent-crew default (rig_domain_default_builder
+# returns "" — e.g. whatsapp_automation, which deliberately has none: several crews
+# share the domain) was refused to the dog pool and stamped pilot:held for 1h, forever,
+# with no successor (ga-2n7xw invariant violation) — the bead never reached a crew
+# that could actually build it. created_by already carries the session-origin form
+# <crew-alias>-<session-suffix> (oracle-wa-ganav3, mila-wa-gawisphchfmo); the prefix
+# before the suffix IS the crew that filed the bead — a reasonable fallback owner,
+# exactly how ga-h7qje (oracle-wa-ganav3 → oracle-wa) and ga-50m2
+# (mila-wa-gawisphchfmo → mila-wa) were routed by hand during the investigation.
+# This is the happy-path shortcut ONLY: _pilot_infer_crew_from_owner never holds,
+# escalates, or mutates a bead — on no confident match it echoes "" and the caller
+# (ga-lfvs6, below) falls through to the UNCHANGED _pilot_hold_or_escalate (ga-2n7xw)
+# safety net.
+
+# _pilot_crew_aliases — the live <name>-<code> crew-alias roster (gc agent list),
+# cached once per process, same pattern as _pilot_suspended_crews above. Test seam:
+# PILOT_CREW_ALIASES_OVERRIDE (space-separated), mirroring
+# PILOT_SUSPENDED_CREWS_OVERRIDE. FAIL-OPEN: any error → "" → no inference.
+_PILOT_CREW_ALIASES=""
+_PILOT_CREW_ALIASES_LOADED=0
+_pilot_crew_aliases() {
+  if [ "$_PILOT_CREW_ALIASES_LOADED" != "1" ]; then
+    if [ -n "${PILOT_CREW_ALIASES_OVERRIDE+x}" ]; then
+      _PILOT_CREW_ALIASES="$PILOT_CREW_ALIASES_OVERRIDE"
+    else
+      _PILOT_CREW_ALIASES=$(gc agent list 2>/dev/null \
+        | awk '{print $1}' | grep -E '^[a-z0-9]+-(wa|ps|lx|ma)$' | tr '\n' ' ' 2>/dev/null || echo "")
+    fi
+    _PILOT_CREW_ALIASES_LOADED=1
+  fi
+  printf '%s' "$_PILOT_CREW_ALIASES"
+}
+
+# _pilot_infer_crew_from_owner <owner> — echo the crew alias that is the LONGEST
+# live-roster prefix of $owner (so "oracle-wa-ganav3" only ever resolves to a crew
+# that actually exists, never a coincidental guess), or "" on no confident match.
+# Excludes suspended crews (routing there would just leave the bead assigned-but-
+# unbuilt) and pool/ephemeral identities, which are never persistent owners.
+_pilot_infer_crew_from_owner() {
+  local _owner="$1" _roster _c _best=""
+  [ -z "$_owner" ] && { printf ''; return 0; }
+  case "$_owner" in gastown.dog|gastown.dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*) printf ''; return 0 ;; esac
+  _roster=$(_pilot_crew_aliases)
+  for _c in $_roster; do
+    case "$_owner" in
+      "$_c"|"$_c"-*) [ "${#_c}" -gt "${#_best}" ] && _best="$_c" ;;
+    esac
+  done
+  [ -n "$_best" ] && _crew_is_suspended "$_best" && _best=""
+  printf '%s' "$_best"
+}
+
 # ── per-crew in-flight CAP (over-assignment / load-balance) ───────────────────
 # The Pilot picks an idle-THIS-SWEEP crew without seeing the crew's ACCUMULATED
 # in-flight backlog, so over many sweeps one crew piles up beads it builds
@@ -5007,6 +5060,14 @@ LIVESEC
             # (2) route to the domain's persistent crew if mapped AND idle.
             local _DOM_DEFAULT=""
             _DOM_DEFAULT=$(rig_domain_default_builder "$_DOMAIN_RIG" 2>/dev/null || echo "")
+            # ga-7ti1t (Mayor re-scope): no rig-wide default — infer one from the
+            # bead's creator before falling to hold/escalate. Filling _DOM_DEFAULT
+            # (rather than a parallel variable) means the idle/busy check and the
+            # routing/hold logic below apply UNCHANGED to an inferred owner too.
+            if [ -z "$_DOM_DEFAULT" ] && [ "${PILOT_OWNER_INFER_GUARD:-1}" = "1" ]; then
+              _DOM_DEFAULT=$(_pilot_infer_crew_from_owner "$(echo "$STORY" | jq -r '(.created_by // "")' 2>/dev/null || echo "")")
+              [ -n "$_DOM_DEFAULT" ] && log "ga-7ti1t: $STORY_ID has no rig-default crew for $_DOMAIN_RIG — inferred owner $_DOM_DEFAULT from creator (created_by). Disable with PILOT_OWNER_INFER_GUARD=0."
+            fi
             local _DOM_BUSY=0
             if [ -n "$_DOM_DEFAULT" ]; then
               case " $PILOT_BUSY_BUILDERS " in *" $_DOM_DEFAULT "*) _DOM_BUSY=1 ;; esac

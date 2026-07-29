@@ -359,6 +359,13 @@ case "$*" in
   *"session list"*)  # ga-e5yw2 roster seam. Brace-in-default `${x:-{...}}` mis-parses
                      # (the inner } closes the expansion early) → use an explicit if.
                      if [ -n "${FAKE_SESSIONS_JSON:-}" ]; then printf '%s' "$FAKE_SESSIONS_JSON"; else printf '{"sessions":[]}'; fi ;;
+  *"agent list"*)    # ga-7ti1t: crew-alias roster seam for _pilot_crew_aliases /
+                     # _pilot_suspended_crews (both parse `<name> <status>` columns,
+                     # same as the real `gc agent list`). Default: the real live
+                     # <name>-<code> crews, all active (nobody suspended — matches the
+                     # PRIOR unmatched-case behavior of "" for _pilot_suspended_crews,
+                     # which no existing scenario depends on being non-empty).
+                     if [ -n "${FAKE_AGENT_LIST_OUTPUT:-}" ]; then printf '%s' "$FAKE_AGENT_LIST_OUTPUT"; else printf 'batista-lx active\nbatista-ps active\nbatista-wa active\ndigo-wa active\nmila-wa active\noracle-wa active\npeter-wa active\nthies-ps active\nthies-wa active\n'; fi ;;
   *"session nudge"*) : ;;
   *) : ;;
 esac
@@ -3135,6 +3142,86 @@ else
   bad "REGRESSION (FINDING 4): git-probe timeout treated as file-absent → would REFUSE (destructive)"
 fi
 
+# ── Scenario 18ab (ga-7ti1t, Mayor re-scope 2026-07-29 16:06): owner-inferred
+# crew fallback for a domain build with no rig-wide persistent-crew default (e.g.
+# whatsapp_automation, which deliberately has none — rig_domain_default_builder
+# returns "" per Scenario NEW-C above). ROOT: such a build was refused to the dog
+# pool and stamped pilot:held(1h) forever with no successor (ga-h7qje, ga-50m2 —
+# both hand-routed during the investigation since nothing did it automatically).
+# FIX: infer the crew from the bead's creator (created_by carries the session-
+# origin form <crew-alias>-<session-suffix>) and route there, falling through to
+# the UNCHANGED _pilot_hold_or_escalate (ga-2n7xw) safety net on no confident match.
+echo "Scenario 18ab-unit (ga-7ti1t): _pilot_infer_crew_from_owner — suffix-stripping, roster-matching, exclusions"
+_INFER_FNS="$(awk '/^_PILOT_SUSPENDED_CREWS=""/{p=1} p{print} /^_pilot_infer_crew_from_owner\(\)/{c=1} c&&/^}$/{exit}' "$DISPATCHER")"
+INFER_RESULT="$(
+  eval "$_INFER_FNS"
+  export PILOT_CREW_ALIASES_OVERRIDE="oracle-wa mila-wa batista-ps"
+  export PILOT_SUSPENDED_CREWS_OVERRIDE="batista-ps"
+  printf 'a=%s ' "$(_pilot_infer_crew_from_owner "oracle-wa-ganav3")"
+  printf 'b=%s ' "$(_pilot_infer_crew_from_owner "mila-wa-gawisphchfmo")"
+  printf 'c=%s ' "$(_pilot_infer_crew_from_owner "gastown__mayor")"
+  printf 'd=%s ' "$(_pilot_infer_crew_from_owner "")"
+  printf 'e=%s ' "$(_pilot_infer_crew_from_owner "batista-ps-gasomesuffix")"
+  printf 'f=%s'  "$(_pilot_infer_crew_from_owner "gastown.dog-3")"
+)"
+EXPECT_INFER="a=oracle-wa b=mila-wa c= d= e= f="
+if [ "$INFER_RESULT" = "$EXPECT_INFER" ]; then
+  ok "ga-7ti1t: crew inference — real hand-routed examples match (oracle-wa-ganav3→oracle-wa, mila-wa-gawisphchfmo→mila-wa); no-match/empty/suspended/pool-identity all → '' (safety net, never a guess)"
+else
+  bad "ga-7ti1t: crew inference logic wrong (got: '$INFER_RESULT', expected: '$EXPECT_INFER')"
+fi
+
+echo "Scenario 18ac (ga-7ti1t): WA domain build with no rig-default crew, owner=oracle-wa-ganav3 → dispatched to oracle-wa, NOT held/dogged"
+WA_OWNER_INFER='[{"id":"ga-h7test","title":"Revisar rotina de acompanhamento pos-onboarding","priority":2,"issue_type":"bug","description":"fixture body — context for veto test, deliberately no WA/PS keywords","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"oracle-wa-ganav3","created_at":"2026-07-29T00:00:01Z","metadata":{}}]'
+LOG18AC="$(run_capacity 10 "[]" 1 "$WA_OWNER_INFER")"
+B18AC="$(dispatched_builder "$LOG18AC")"
+if [ "$B18AC" = "oracle-wa" ]; then
+  ok "ga-7ti1t: WA domain build with no rig-default crew routed to inferred owner oracle-wa (not held)"
+elif echo "$B18AC" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION (ga-7ti1t): domain build with an inferrable owner still landed on the dog pool"
+elif [ -z "$B18AC" ]; then
+  bad "REGRESSION (ga-7ti1t): domain build with an inferrable owner (oracle-wa-ganav3) still held/deferred — inference did not fire"
+else
+  bad "ga-7ti1t: domain build routed unexpectedly (got: '${B18AC:-none}')"
+fi
+echo "$LOG18AC" | grep -q "ga-7ti1t: ga-h7test has no rig-default crew for whatsapp_automation — inferred owner oracle-wa from creator" \
+  && ok "ga-7ti1t: inference logged with the correct reason" \
+  || bad "ga-7ti1t: inference log line missing or malformed"
+
+echo "Scenario 18ad (ga-7ti1t): inferred owner BUSY this sweep → DEFERRED, not double-dispatched"
+NOW_ISO18AD="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+INFLIGHT18AD="[{\"id\":\"if-oracle\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO18AD\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-oracle\"}}]"
+SESSIONS18AD='{"sessions":[{"session_name":"oracle-wa","closed":false}]}'
+SLINGMAP18AD='{"tt-sling-oracle":"oracle-wa"}'
+LOG18AD="$(run_capacity 10 "$INFLIGHT18AD" 1 "$WA_OWNER_INFER" "$SESSIONS18AD" "$SLINGMAP18AD")"
+B18AD="$(dispatched_builder "$LOG18AD")"
+if [ "$B18AD" = "oracle-wa" ]; then
+  bad "ga-7ti1t: inferred owner oracle-wa double-dispatched despite being busy this sweep (mutex bypass)"
+elif echo "$B18AD" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION (ga-7ti1t): domain build fell back to a dog while the inferred owner was busy"
+else
+  ok "ga-7ti1t: domain build with a BUSY inferred owner correctly DEFERRED (no double-dispatch — reuses the existing busy-check)"
+fi
+
+echo "Scenario 18ae (ga-7ti1t regression): WA domain build with NO crew-shaped owner → still DEFERRED (ga-2n7xw hold/escalate unchanged)"
+LOG18AE="$(run_capacity 10 "[]" 1 "$WA_PIPEDRIVE")"
+B18AE="$(dispatched_builder "$LOG18AE")"
+if echo "$B18AE" | grep -qE '^gastown\.dog'; then
+  bad "REGRESSION: WA domain build with no owner-match landed on the dog pool"
+elif [ "$B18AE" = "batista-ps" ]; then
+  bad "REGRESSION: WA domain build with no owner-match misrouted to batista-ps"
+elif [ -z "$B18AE" ]; then
+  ok "ga-7ti1t: WA domain build with no crew-shaped owner still DEFERRED (inference is a shortcut only — ga-2n7xw hold/escalate untouched)"
+else
+  bad "WA domain build with no owner-match routed unexpectedly (got: '${B18AE:-none}')"
+fi
+
+echo "Scenario 18af: drift-guard — owner-inferred crew fallback is wired into the live dispatcher"
+has "$DISPATCHER" '_pilot_infer_crew_from_owner\(\)'         "ga-7ti1t: owner-inference helper is defined"
+has "$DISPATCHER" '_pilot_crew_aliases\(\)'                  "ga-7ti1t: crew-alias roster helper is defined"
+has "$DISPATCHER" 'PILOT_OWNER_INFER_GUARD'                  "ga-7ti1t: owner-inference knob is wired"
+has "$DISPATCHER" '_DOM_DEFAULT=\$\(_pilot_infer_crew_from_owner' "ga-7ti1t: owner-inference wired into the ga-lfvs6 guard (fills _DOM_DEFAULT, reusing the existing busy-check/hold fallback)"
+
 # ── Scenario 19 (wa-u5r1): dispatchable-queue emit for the painel ─────────────
 echo "Scenario 19a: emit writes valid JSON with the contract shape + count + items"
 F19="$(run_emit)"
@@ -4970,15 +5057,32 @@ echo "Scenario ga-r4jnu-b: end-to-end — the EXACT live adjacency (domain bead,
 DOMTEST_BEAD='{"id":"ga-r4domtest","title":"code-mode MCP servers configuration for context injection","priority":1,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"mila-wa","created_at":"2026-07-26T00:00:01Z","metadata":{}}'
 R4JNU_SEQ="[${DOMTEST_BEAD},${DISKLEAK_BEAD}]"
 LOG_R4JNU="$(run_capacity 10 "[]" 1 "$R4JNU_SEQ")"
-echo "$LOG_R4JNU" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-r4domtest" \
-  && ok "sequence setup faithful: the genuine WA domain bead (first claim) is still refused+held, exactly like ga-lt2dz" \
-  || bad "sequence setup broken: the domain bead was NOT refused — test no longer reproduces the real adjacency"
+echo "$LOG_R4JNU" | grep -q "ga-nlh79: ga-r4domtest owner-authoritative rig.*whatsapp_automation" \
+  && ok "sequence setup faithful: the genuine WA domain bead (first claim) still classifies whatsapp_automation via owner-authoritative inference, exactly like ga-lt2dz" \
+  || bad "sequence setup broken: the domain bead no longer classifies whatsapp_automation — test no longer reproduces the real adjacency"
+# ga-7ti1t (Mayor re-scope, landed AFTER this scenario was written): created_by=mila-wa
+# is now a live crew-alias-roster match, so this exact domain bead no longer falls all
+# the way to REFUSING+hold — it is inferred+dispatched to mila-wa directly (a STRICTLY
+# BETTER outcome: this adjacency case is itself now fixed by ga-7ti1t). The refuse+hold
+# branch this scenario originally exercised is still live and still covered elsewhere
+# (Scenario 18ae, WA_PIPEDRIVE — no crew-shaped owner to infer from).
+if echo "$LOG_R4JNU" | grep -q "ga-7ti1t: ga-r4domtest has no rig-default crew for whatsapp_automation — inferred owner mila-wa"; then
+  ok "ga-7ti1t: the domain bead (mila-wa owner) is now inferred+dispatched instead of refused+held (this adjacency case is itself fixed)"
+elif echo "$LOG_R4JNU" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-r4domtest"; then
+  bad "REGRESSION (ga-7ti1t): mila-wa-owned domain bead fell back to REFUSING+hold — owner inference did not fire"
+else
+  bad "domain bead (first claim) routed unexpectedly — neither inferred+dispatched nor refused"
+fi
 if echo "$LOG_R4JNU" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-r4diskleak"; then
   bad "REGRESSION (ga-r4jnu): the generic disk-leak bead (second claim, right after a domain bead) was STILL falsely refused+held"
 else
   ok "ga-r4jnu FIXED: the generic disk-leak bead is NOT refused, despite following a genuine domain bead in the same pass"
 fi
-B_R4JNU="$(dispatched_builder "$LOG_R4JNU")"
+# ga-7ti1t: the domain bead now ALSO dispatches (to mila-wa) instead of holding, so the
+# log carries TWO "→ story:in-flight" lines this sweep — extract ga-r4diskleak's OWN
+# outcome by bead ID instead of the shared dispatched_builder() helper's blind head -1
+# (which would now grab the FIRST dispatch, ga-r4domtest/mila-wa, not this bead's).
+B_R4JNU="$(echo "$LOG_R4JNU" | grep -oE 'ga-r4diskleak → story:in-flight \(builder=[^ )]+' | sed -E 's/.*builder=//' | head -1)"
 echo "$B_R4JNU" | grep -qE '^gastown\.dog' && ok "disk-leak bead dispatched to the dog pool ($B_R4JNU) — the P1 that starved for days now flows" || bad "disk-leak bead routed unexpectedly (got: '${B_R4JNU:-none}')"
 
 echo "Scenario ga-r4jnu-c: framework-dog-exempt reason (d) — area:infra label exempts even when bead_domain misses it AND the keyword isn't 'disparo'"
