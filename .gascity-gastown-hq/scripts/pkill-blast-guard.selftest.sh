@@ -113,11 +113,20 @@ OUT="$(printf 'not json at all' | python3 "$GUARD" 2>/dev/null)"; RC=$?
   && ok "malformed stdin JSON fails OPEN (rc=0, no deny)" \
   || bad "malformed stdin should fail open, got rc=$RC out=$OUT"
 
-# Unbalanced quotes (unparseable shell string) must fail open too.
-run_guard 'pkill -f "unterminated'
+# A command with NO pkill/killall mention at all must still fail open on a
+# forced internal error -- distinct from the unbalanced-quote case below,
+# which DOES mention pkill/killall and is a deliberate deny (fix-attempt 3).
+run_guard 'echo hello world' PKILL_GUARD_SELFTEST_FORCE_ERROR=1
 [ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" != "deny" ] \
-  && ok "unbalanced quotes in command string fails OPEN" \
-  || bad "unbalanced-quote command should fail open, got rc=$RC out=$OUT"
+  && ok "forced error on a command with no pkill/killall mention still fails OPEN" \
+  || bad "forced error on unrelated command should fail open, got rc=$RC out=$OUT"
+
+# A bad PKILL_GUARD_MAX_MATCHES env value is a guard MISCONFIGURATION, not a
+# property of the command -- stays fail-open per AC4.
+run_guard 'pkill -f "anuncios_dashboard.py" -U $(id -u)' PKILL_GUARD_MAX_MATCHES=not-a-number
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" != "deny" ] \
+  && ok "malformed PKILL_GUARD_MAX_MATCHES env value fails OPEN" \
+  || bad "bad env value should fail open, got rc=$RC out=$OUT"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AC2(c): pattern matching more than N processes is blocked (using disposable
@@ -237,6 +246,161 @@ run_guard 'pkill -f "$(hostname)"'
 [ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
   && ok "pkill -f \"\$(hostname)\" (command substitution) denied" \
   || bad "command-substitution pattern should be denied, got rc=$RC out=$OUT"
+
+run_guard 'pkill -f `hostname`'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "pkill -f \`hostname\` (backtick substitution) denied" \
+  || bad "backtick-substitution pattern should be denied, got rc=$RC out=$OUT"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gate-review regression (fix-attempt 3), structural: THREE rounds of gate
+# review each found a DIFFERENT way for decide() to fall through to its old
+# default "allow" instead of denying an unverified result. Mayor's directive
+# after round 3: stop patching individual cases, invert the default -- once a
+# command is confirmed to contain pkill/killall, every path is
+# deny-unless-verified-safe. The cases below are that inversion's regression
+# coverage, one per path that used to silently fall through to allow.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- gate-review regression (fix-attempt 3): criteria-only invocation (no pattern operand) is denied --"
+echo "   (bypass found live: pkill -U \$(id -u) / pkill -u root reach the SAME blast radius as the"
+echo "    original misordered-flag incident, just by omitting -f entirely -- 8 shapes below)"
+
+for cmd in \
+  "pkill -u root" \
+  "pkill -U 501" \
+  "killall -u root" \
+  "pkill -G staff" \
+  "pkill -P 1" \
+  "pkill -t tty01" \
+  "pkill -9 -U 501" \
+  "pkill -U 501 -G staff" \
+; do
+  run_guard "$cmd"
+  [ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+    && ok "criteria-only '$cmd' denied (no pattern operand)" \
+    || bad "criteria-only '$cmd' should be denied, got rc=$RC out=$OUT"
+done
+echo "$OUT" | jq -e '.hookSpecificOutput.permissionDecisionReason | contains("WIDEST possible match")' >/dev/null 2>&1 \
+  && ok "criteria-only deny reason explains the BSD 'absent pattern = widest match' semantics" \
+  || bad "criteria-only deny reason should explain widest-match semantics, got: $(echo "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason // "MISSING"')"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gate-review regression (fix-attempt 3): killall's own documented multi-
+# target form (`killall [procname ...]`) was a FALSE POSITIVE under the old
+# single-operand assumption -- the second plain target got misread as "a
+# flag placed after the pattern" (rule a) and denied. A flag genuinely
+# appearing after the first target must still deny.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- gate-review regression (fix-attempt 3): killall multi-target is not a false positive --"
+
+MARK_A="pkill-guard-selftest-decoy-multitarget-a-$$"
+MARK_B="pkill-guard-selftest-decoy-multitarget-b-$$"
+
+run_guard "killall $MARK_A $MARK_B"
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" != "deny" ] \
+  && ok "killall with two plain targets allowed (documented killall usage)" \
+  || bad "killall with two plain targets should be allowed, got rc=$RC out=$OUT"
+
+run_guard "killall -9 $MARK_A $MARK_B"
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" != "deny" ] \
+  && ok "killall with a leading flag then two targets allowed" \
+  || bad "killall -9 <a> <b> should be allowed, got rc=$RC out=$OUT"
+
+run_guard "killall $MARK_A -9 $MARK_B"
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "killall with a flag AFTER the first target still denied (rule a still fires)" \
+  || bad "killall <a> -9 <b> should still be denied, got rc=$RC out=$OUT"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gate-review regression (fix-attempt 3): a $(...) command substitution used
+# as a CRITERIA FLAG's value (not the pattern) must survive as one opaque
+# token, not get shattered by the punctuation-aware tokenizer into stray
+# operands/flags. Without this fix, the guard's OWN suggested "correct form"
+# in its rule-(a) deny message -- `pkill -f -U $(id -u) 'PATTERN'` -- was
+# itself silently denied, which nobody would have discovered by reading the
+# message, only by trying it.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- gate-review regression (fix-attempt 3): \$(...) as a flag's value is not shattered --"
+
+MARK_CORRECT="pkill-guard-selftest-decoy-correctform-$$"
+run_guard "pkill -f -U \$(id -u) '$MARK_CORRECT'"
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" != "deny" ] \
+  && ok "the guard's own suggested correct form (with a real \$(id -u)) is actually allowed" \
+  || bad "own suggested correct form should be allowed, got rc=$RC out=$OUT"
+
+# An unbalanced $(...) is a genuine parse failure -- see the tokenizer-
+# failure section below, not this one.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gate-review regression (fix-attempt 3), tokenizer FAILURE on a command
+# already confirmed (by the coarse pre-filter) to mention pkill/killall: per
+# Mayor's clarification, "cannot verify" is a RESULT that denies, distinct
+# from AC4's fail-open (which is for THIS SCRIPT breaking on input unrelated
+# to any specific dangerous shape). This deliberately CHANGES prior behavior
+# for the unbalanced-quote case (was allow in fix-attempt 2's selftest).
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- gate-review regression (fix-attempt 3): unparseable pkill/killall command denies, not fail-open --"
+
+run_guard 'pkill -f "unterminated'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "unbalanced quote in a pkill command now DENIES (was fail-open through fix-attempt 2)" \
+  || bad "unbalanced-quote pkill command should now deny, got rc=$RC out=$OUT"
+echo "$OUT" | jq -e '.hookSpecificOutput.permissionDecisionReason | contains("could not be parsed")' >/dev/null 2>&1 \
+  && ok "unparseable-command deny reason explains why" \
+  || bad "deny reason should explain the parse failure, got: $(echo "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason // "MISSING"')"
+
+run_guard 'pkill -f "x" -U $(id -u'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "unbalanced \$(...) (missing close paren) in a pkill command denied" \
+  || bad "unbalanced-\$(...) pkill command should be denied, got rc=$RC out=$OUT"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Engineering judgment call (fix-attempt 3) -- documented explicitly because
+# it is a DELIBERATE, NARROWER reading of one line of Mayor's review rather
+# than a literal implementation of it. Mayor's review listed "the coarse
+# regex matched pkill/killall but no invocation was extracted" as a case
+# that must deny. Taken completely literally, that would deny ANY command
+# whose raw text merely CONTAINS the word "pkill"/"killall" without a real
+# invocation being present -- which includes this guard's own filename
+# (scripts/pkill-blast-guard.py), its own branch name
+# (fix/ga-jo3xl-pkill-blast-guard), and any commit message or comment that
+# mentions "pkill" -- extremely common in exactly the files this bug's own
+# fix touches. Verified live before choosing this: with a literal
+# CMD_RE-matched-but-zero-invocations-denies rule, `cat
+# scripts/pkill-blast-guard.py` and `git commit -m "fix pkill guard"` would
+# both be denied. Instead, this fix closes the NARROWER, actually-dangerous
+# version of the same concern above (the tokenizer FAILING to parse a
+# pkill/killall-mentioning command denies) and leaves a clean "found nothing"
+# read as allow, because find_invocations already matches by exact token
+# basename regardless of position (catches `sudo pkill`, `nohup pkill`,
+# glued separators, etc.) -- a clean zero-invocations read is trustworthy,
+# not a detector gap. If a reviewer disagrees with this call, it is a one-
+# line change (drop the `if not invocations: return "allow", None` early
+# return in decide()) -- flagged for visibility, not hidden in the diff.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- engineering judgment call (fix-attempt 3): mentioning pkill/killall in a filename or"
+echo "   commit message, with no real invocation, is NOT denied (see selftest.sh comment + commit"
+echo "   message for the full reasoning + the literal-reading false-positive this avoids) --"
+
+run_guard 'cat scripts/pkill-blast-guard.py'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" != "deny" ] \
+  && ok "cat on this guard's own filename is allowed (no real invocation present)" \
+  || bad "cat on the guard's own filename should be allowed, got rc=$RC out=$OUT"
+
+run_guard 'git commit -m "fix pkill guard bypass"'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" != "deny" ] \
+  && ok "a commit message mentioning pkill is allowed (no real invocation present)" \
+  || bad "commit message mentioning pkill should be allowed, got rc=$RC out=$OUT"
+
+run_guard 'ls .gc-worktrees/fix-ga-jo3xl-pkill-blast-guard'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" != "deny" ] \
+  && ok "a path shaped like this bug's own branch name is allowed" \
+  || bad "branch-name-shaped path should be allowed, got rc=$RC out=$OUT"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Activation script: idempotent compose-not-replace merge into a SCRATCH
