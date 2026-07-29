@@ -403,6 +403,146 @@ run_guard 'ls .gc-worktrees/fix-ga-jo3xl-pkill-blast-guard'
   || bad "branch-name-shaped path should be allowed, got rc=$RC out=$OUT"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Gate-review regression (fix-attempt 4), false positive: find_invocations()
+# previously matched ANY token whose basename equals "pkill"/"killall"
+# regardless of position, so pkill/killall used as a plain STRING ARGUMENT to
+# an unrelated command (never actually invoked) was misread as a real
+# invocation with zero args -- which then tripped the "no pattern/target
+# operand" rule and denied a command that never runs pkill/killall at all.
+# Confirmed live pre-fix: `man pkill`, `which pkill`, `echo pkill`, `type
+# pkill`, `apropos killall` were ALL denied with the criteria-only message.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- gate-review regression (fix-attempt 4): pkill/killall as a plain argument to"
+echo "   another command (not actually invoked) is allowed, not denied --"
+
+for cmd in "man pkill" "which pkill" "echo pkill" "type pkill" "apropos killall"; do
+  run_guard "$cmd"
+  [ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" != "deny" ] \
+    && ok "'$cmd' allowed (pkill/killall is an argument, not an invocation)" \
+    || bad "'$cmd' should be allowed, got rc=$RC out=$OUT"
+done
+
+# A longer sentence where pkill/killall is a trailing word with no operands
+# of its own -- same class as the examples above, not just single-word cases.
+run_guard 'echo "run pkill to kill it"'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" != "deny" ] \
+  && ok "pkill mentioned inside a quoted sentence argument is allowed" \
+  || bad "pkill inside a quoted sentence should be allowed, got rc=$RC out=$OUT"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gate-review regression (fix-attempt 4), non-regression: the position check
+# added above must NOT stop recognizing pkill/killall invoked through a
+# transparent wrapper -- sudo/doas/nohup/env, that wrapper's OWN flags (e.g.
+# `sudo -u root pkill ...`), or a leading inline VAR=VALUE assignment (e.g.
+# `PKILL_GUARD_MAX_MATCHES=50 pkill ...`, the same idiom this very selftest
+# uses to drive the guard). None of these were previously covered by an
+# explicit test -- only asserted in the module docstring -- so a naive
+# "pkill must be the first word" position check would have silently
+# regressed all of them from denied to allowed. Using the criteria-only
+# (no-pattern) shape throughout: cheap to assert on and, per fix-attempt 3,
+# denied on its own merits regardless of the wrapper prefix.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- gate-review regression (fix-attempt 4): wrapper-prefixed pkill/killall is still"
+echo "   fully inspected (sudo, doas, nohup, env, inline VAR=VALUE, and combinations) --"
+
+for cmd in \
+  "sudo pkill -U 501" \
+  "sudo -u root pkill -U 501" \
+  "doas pkill -U 501" \
+  "nohup pkill -U 501" \
+  "env pkill -U 501" \
+  "env FOO=bar pkill -U 501" \
+  "FOO=bar pkill -U 501" \
+  "sudo nohup pkill -U 501" \
+; do
+  run_guard "$cmd"
+  [ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+    && ok "'$cmd' still denied (wrapper does not hide the invocation)" \
+    || bad "'$cmd' should still be denied, got rc=$RC out=$OUT"
+done
+
+# Glued-separator + wrapper together must still be caught too (fix-attempt 2
+# regression combined with the fix-attempt 4 position check).
+run_guard 'true;sudo pkill -U 501'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "wrapper glued flush against a separator ('sudo' right after ';') still denied" \
+  || bad "separator-glued wrapper form should still be denied, got rc=$RC out=$OUT"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Self-found regression, fixed before submission: an EARLIER version of this
+# same fix-attempt-4 diff used a wrapper-command WHITELIST only (no
+# non-empty-args fallback) to decide command position. Checked live against
+# real invented inputs before ever writing this test: that version silently
+# ALLOWED `exec pkill -U 501`, `time pkill -U 501`, `command pkill -U 501`,
+# `! pkill -U 501`, and `... | xargs pkill -U 501` -- none of those
+# wrapper/builtin names happened to be enumerated in WRAPPER_PREFIXES, so a
+# criteria-only pkill behind any of them went through unexamined. This is the
+# SAME root-class defect (a detector gap silently reading as "safe") the
+# prior three fix-attempts each hit in a different spot -- catching it here,
+# ourselves, before the gate, rather than shipping a fourth bypass.
+# Fix: a pkill/killall token with any trailing argv of its own is now ALWAYS
+# a real invocation regardless of what precedes it (see
+# _is_command_position's non-empty-`args` clause) -- no wrapper enumeration
+# needed for this to hold.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- self-found regression (fixed pre-submission): pkill/killall behind an"
+echo "   UNENUMERATED wrapper/builtin is still denied when it has its own args --"
+
+for cmd in \
+  "exec pkill -U 501" \
+  "time pkill -U 501" \
+  "command pkill -U 501" \
+  "! pkill -U 501" \
+; do
+  run_guard "$cmd"
+  [ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+    && ok "'$cmd' denied (non-empty args catch it even with no wrapper enumerated)" \
+    || bad "'$cmd' should be denied, got rc=$RC out=$OUT"
+done
+
+run_guard 'echo x | xargs pkill -U 501'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "'... | xargs pkill -U 501' denied (unenumerated wrapper, non-empty args)" \
+  || bad "xargs-piped pkill should be denied, got rc=$RC out=$OUT"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gate-review regression (fix-attempt 4): UNVERIFIABLE_PATTERN_RE previously
+# matched only named variables ($VAR, ${VAR}), $(...), and backticks -- it
+# missed shell SPECIAL/POSITIONAL parameters ($1-$9, $@, $*, $#, $?, $!, $$,
+# $0, $-). Confirmed live pre-fix: $1/$$/$@/$0/$#/$!/$- were silently
+# ALLOWED (pgrep checked the literal unexpanded text, found ~0 matches, read
+# as "confirmed safe"); $*/$? happened to DENY already, but only because
+# pgrep's own regex engine errored on those two characters -- an accident of
+# pgrep's parser, not this guard's own detection, and the message it produced
+# ("pgrep itself failed or timed out") doesn't teach the real reason (AC5).
+# This guard must refuse ALL of them as unverifiable, and for the correct,
+# explained reason.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- gate-review regression (fix-attempt 4): special/positional shell parameters"
+echo "   are refused as unverifiable, not silently allowed --"
+
+for varref in '$1' '$9' '$0' '$@' '$*' '$#' '$?' '$!' '$$' '$-'; do
+  run_guard "pkill -f \"myscript-${varref}\""
+  [ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+    && ok "pattern containing ${varref} denied as unverifiable" \
+    || bad "pattern containing ${varref} should be denied, got rc=$RC out=$OUT"
+  echo "$OUT" | jq -e '.hookSpecificOutput.permissionDecisionReason | contains("unexpanded")' >/dev/null 2>&1 \
+    && ok "${varref} deny reason names it as unexpanded/unverifiable (not a pgrep failure)" \
+    || bad "${varref} deny reason should explain the unexpanded-parameter refusal, got: $(echo "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason // "MISSING"')"
+done
+
+# Bare (non-braced, non-prefixed) special parameter as the WHOLE pattern,
+# not just embedded in a larger string.
+run_guard 'pkill -f "$1"'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "bare \$1 as the entire pattern denied" \
+  || bad "bare \$1 pattern should be denied, got rc=$RC out=$OUT"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Activation script: idempotent compose-not-replace merge into a SCRATCH
 # settings.json (never the live file).
 # ─────────────────────────────────────────────────────────────────────────────
