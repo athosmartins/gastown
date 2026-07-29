@@ -3430,13 +3430,43 @@ _ownership_guard_should_refuse() {
   return 1
 }
 
+# _ns_label_blocks_release <labels_csv> — exit 0 (BLOCK release / KEEP) iff any
+# gate:* label OTHER than the story-level history markers gate:needs-fix /
+# gate:fix-attempt:N is present in the comma-joined label list. gate:needs-fix
+# and gate:fix-attempt:N persist across a bead's ENTIRE redispatch cycle by
+# design (Pilot deliberately redispatches any gate:needs-fix bead — see the
+# PILOT_MAYOR_HOLD_GRACE_SECS doc above — and does not clear them until the fix
+# PASSES or the next FAIL bumps the attempt count), so their mere presence proves
+# only that SOME prior attempt once reached the gate — not that THIS dispatch
+# attempt did. Treating them as an unconditional "reached the gate, KEEP" signal
+# made a bead invisible to recovery FOREVER after its first gate FAIL: a
+# brand-new dispatch attempt whose builder died before reaching the gate again
+# read identically to "still building," and no other path caught it either
+# (ga-e5yw2's dead-worker correction deliberately never mutates labels — see its
+# doc above). Real incident: ga-tje7u sat stuck 2h+, invisible to the Pilot,
+# until a human noticed and manually re-slung it (ga-pb8z5). Every OTHER gate:*
+# label (queued, reviewing, passed, failed, needs-human) still means "definitely
+# active or needs a human" and keeps blocking — matching this function's
+# fail-safe-to-KEEP default. Split out of _neverstarted_recover_db so this
+# predicate is independently testable (see pilot-dispatcher.selftest.sh
+# Scenario 16d/16d2-16d5).
+_ns_label_blocks_release() {
+  local _stripped
+  _stripped=$(printf ',%s,' "$1" | sed 's/,gate:needs-fix,/,/g; s/,gate:fix-attempt:[0-9]\{1,\},/,/g')
+  case "$_stripped" in *,gate:*) return 0 ;; esac
+  return 1
+}
+
 # _neverstarted_recover_db <db_path> <now_epoch> — scan one DB for never-started
 # in-flight beads and release them. Decision rules (ALL must hold to release):
 #   - has story:in-flight AND pilot:dispatched (query selects both)
-#   - NO gate:* label on this bead OR its recorded pilot.sling_bead (any gate
-#       marker = the work reached the gate = it was built; ga-d2jil: Pilot's
-#       "fix bug"/"build story" sling-task dispatch writes gate:* onto the SLING
-#       bead, never mirrored back onto this one, so both must be checked)
+#   - NO active gate:* marker on this bead OR its recorded pilot.sling_bead (a
+#       marker such as gate:reviewing/queued/passed/failed/needs-human = an
+#       attempt actually reached the gate or needs a human = KEEP; ga-d2jil:
+#       Pilot's "fix bug"/"build story" sling-task dispatch writes gate:* onto
+#       the SLING bead, never mirrored back onto this one, so both must be
+#       checked). gate:needs-fix / gate:fix-attempt:N ALONE do NOT block — see
+#       _ns_label_blocks_release above (ga-pb8z5).
 #   - pilot.dispatched_at present AND age > threshold (missing stamp → stamp NOW,
 #       never release on first sight — the ga-2azzj Defect-A discipline)
 #   - NO live worker: a recorded pilot.sling_bead whose assignee is a live session
@@ -3460,10 +3490,12 @@ _neverstarted_recover_db() {
     [ -z "$_bid" ] && continue
     _labels=$(echo "$_bead" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
 
-    # gate-marker guard — any gate:* label (comma-framed so "investigate:" can't
-    # false-match) means the bead was built and reached the gate. KEEP. (The
-    # sling/task bead's OWN labels are checked separately below — ga-d2jil.)
-    case ",$_labels," in *,gate:*) continue ;; esac
+    # gate-marker guard — any ACTIVE gate:* label means an attempt reached the
+    # gate or needs a human. KEEP. gate:needs-fix/gate:fix-attempt:N are STORY-
+    # LEVEL HISTORY, not proof THIS attempt got there — see _ns_label_blocks_release
+    # above (ga-pb8z5). (The sling/task bead's OWN labels are checked separately
+    # below — ga-d2jil.)
+    _ns_label_blocks_release "$_labels" && continue
 
     # stamp/age guard (Defect-A discipline) — never updated_at, never first-sight.
     _stamp=$(echo "$_bead" | jq -r '.metadata["pilot.dispatched_at"] // ""' 2>/dev/null || echo "")

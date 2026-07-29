@@ -2122,14 +2122,84 @@ else
   ok "bead with a surviving crew branch kept"
 fi
 
-# 16d: a gate:* label → KEEP (it reached the gate, so it was built).
-NS_GATE='[{"id":"tt-ns-gate","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-fix"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+# 16d: an ACTIVE gate-review marker (gate:reviewing) → KEEP (an attempt is under
+# review RIGHT NOW). NOTE (ga-pb8z5): this fixture used to carry only
+# gate:needs-fix — a STORY-LEVEL HISTORY label that Pilot deliberately leaves on
+# a bead through its ENTIRE redispatch cycle (it's the marker that makes the bead
+# a candidate for re-fix dispatch in the first place — see the
+# PILOT_MAYOR_HOLD_GRACE_SECS doc above — and it is not cleared until the fix
+# PASSES or the next FAIL bumps the attempt count). Treating that history label
+# alone as "reached the gate, was built, KEEP" made a bead invisible to recovery
+# FOREVER after its first gate FAIL: a brand new dispatch attempt whose builder
+# died before reaching the gate again read identically to "still building," and
+# no other recovery path caught it either (ga-e5yw2's dead-worker correction
+# deliberately never mutates labels). Real incident: ga-tje7u sat stuck 2h+,
+# invisible to the Pilot, until a human manually re-slung it (ga-pb8z5). See
+# 16d2/16d3 below for the fixed behavior; gate:reviewing/gate:queued remain the
+# markers that mean "an attempt is under review right now" and still block.
+NS_GATE='[{"id":"tt-ns-gate","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:reviewing"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
 LOG16D="$(run_neverstarted "$NS_GATE" "" "" "")"
 if echo "$LOG16D" | grep -q "releasing never-started in-flight bead tt-ns-gate"; then
-  bad "REGRESSION: released a bead carrying a gate marker (gate:needs-fix)"
+  bad "REGRESSION: released a bead under ACTIVE gate review (gate:reviewing)"
 else
-  ok "bead with a gate marker kept"
+  ok "bead under active gate review (gate:reviewing) kept"
 fi
+
+# 16d2 (ga-pb8z5): gate:needs-fix ALONE — no active review marker, no sling, no
+# branch — is STORY-LEVEL HISTORY from a prior failed attempt, not evidence this
+# NEW dispatch attempt reached the gate. Aged past threshold with zero other
+# activity signal → RELEASE, same as any other never-started bead.
+NS_GATE_HIST='[{"id":"tt-ns-gate-hist","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-fix","gate:fix-attempt:1"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+LOG16D2="$(run_neverstarted "$NS_GATE_HIST" "" "" "")"
+if echo "$LOG16D2" | grep -q "releasing never-started in-flight bead tt-ns-gate-hist"; then
+  ok "ga-pb8z5: stale gate:needs-fix/fix-attempt history alone no longer blocks release"
+else
+  bad "ga-pb8z5 REGRESSION: bare gate:needs-fix/fix-attempt history still blocks release forever"
+fi
+
+# 16d3 (ga-pb8z5 — reproduces the real incident): gate:needs-fix history label
+# PLUS a sling whose recorded builder session is PROVABLY DEAD (roster
+# trustworthy, assignee not in it). This is ga-tje7u's exact shape: attempt 1
+# failed the gate (gate:needs-fix + gate:fix-attempt:1 persisted), Pilot
+# redispatched for the fix, and attempt 2's builder died before reaching the
+# gate again. Must RELEASE so the very next sweep redispatches it — not sit
+# invisible for 2h+ waiting on a human to notice and manually re-sling it.
+NS_GATE_DEAD='[{"id":"tt-ns-gate-dead","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-fix","gate:fix-attempt:1"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-gate-dead"}}]'
+LOG16D3="$(run_neverstarted "$NS_GATE_DEAD" "" "$NS_SESS" '{"tt-sling-gate-dead":"ghost-wa"}')"
+if echo "$LOG16D3" | grep -q "releasing never-started in-flight bead tt-ns-gate-dead"; then
+  ok "ga-pb8z5: bead stuck on gate:needs-fix with a confirmed-dead builder is released (real-incident shape)"
+else
+  bad "ga-pb8z5 REGRESSION: bead with dead builder + stale gate:needs-fix stayed invisible forever (the exact incident)"
+fi
+
+# 16d4 (ga-pb8z5 control): gate:needs-fix history PLUS an ACTIVE gate:reviewing
+# marker → still KEEP. Proves the narrowed guard only ignores the STALE history
+# labels, not real active-review protection — this attempt DID reach the gate
+# again and is currently being reviewed.
+NS_GATE_ACTIVE2='[{"id":"tt-ns-gate-active2","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-fix","gate:fix-attempt:1","gate:reviewing"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'"}}]'
+LOG16D4="$(run_neverstarted "$NS_GATE_ACTIVE2" "" "" "")"
+if echo "$LOG16D4" | grep -q "releasing never-started in-flight bead tt-ns-gate-active2"; then
+  bad "REGRESSION: released a bead under active gate:reviewing despite stale gate:needs-fix also present"
+else
+  ok "control: gate:needs-fix history + ACTIVE gate:reviewing still kept (only stale labels are ignored)"
+fi
+
+# 16d5 (ga-pb8z5 control): gate:needs-human must NEVER be auto-released — it
+# requires a human, and must remain an unconditional block regardless of
+# age/sling/branch state (this is a DIFFERENT label from needs-fix and must not
+# be swept up by the narrower strip).
+NS_GATE_HUMAN='[{"id":"tt-ns-gate-human","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-human"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-gate-human"}}]'
+LOG16D5="$(run_neverstarted "$NS_GATE_HUMAN" "" "$NS_SESS" '{"tt-sling-gate-human":"ghost-wa"}')"
+if echo "$LOG16D5" | grep -q "releasing never-started in-flight bead tt-ns-gate-human"; then
+  bad "REGRESSION: released a gate:needs-human bead — must always stay human-gated"
+else
+  ok "gate:needs-human always blocks release regardless of age (human-gate invariant preserved)"
+fi
+
+# 16d6: structural drift-guard — the ga-pb8z5 fix stays wired into the live dispatcher.
+echo "Scenario 16d6: ga-pb8z5 drift-guard — the stale-gate-history fix is wired"
+has "$DISPATCHER" 'ga-pb8z5' "ga-pb8z5 fix comment is wired"
+has "$DISPATCHER" '_ns_label_blocks_release' "_ns_label_blocks_release helper is wired into the never-started detector"
 
 # 16e: a sling whose assignee is a LIVE session → KEEP (build in flight).
 NS_LIVE='[{"id":"tt-ns-live","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-live"}}]'
