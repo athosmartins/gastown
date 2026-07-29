@@ -18,10 +18,15 @@ pgrep would say. No pattern parsing, no subprocess calls, no "safe form"
 this guard recognizes.
 
 THREAT MODEL: accident, not adversary (the ga-jo3xl author didn't evade
-anything -- it was a genuine mistake). This guard makes no attempt to
-resist deliberate evasion -- `pgrep | xargs kill` walks straight past it,
-same as wrapping the call in `bash -c '...'` or a command substitution --
-and that is an accepted, documented gap, not an oversight.
+anything -- it was a genuine mistake). This guard's own first gate review
+(ga-tje7u gate FAIL + Mayor sweep, 2026-07-29) reinforced this: every one
+of the holes found -- a comment above the real command, `if`/`while`/
+`for`/`case` block keywords, `$(...)` hiding a `;`-joined command -- is
+ordinary shell an agent writes with zero intent to evade anything. This
+guard still makes no attempt to resist DELIBERATE evasion -- `pgrep |
+xargs kill` walks straight past it, same as an `eval`/`bash -c` string
+argument -- and that remains an accepted, documented gap, not an
+oversight.
 
 SCOPE: intercepts only the Bash tool calls of Claude Code AGENTS running
 under this hook. Daemons, launchd jobs, and .sh scripts invoked outside an
@@ -32,9 +37,13 @@ COMMAND POSITION: pkill/killall counts as a real invocation -- not a plain
 argument to some other command (`man pkill`, `echo pkill`) -- when EITHER:
   (a) it's the first word of a simple command: start of the whole string,
       or immediately after a separator (; && || | &), an opening `(` or
-      `{`, or a newline (converted to `;` before tokenizing -- shell
-      treats an unquoted newline as an ordinary statement separator, but
-      shlex just swallows it as whitespace and leaves no token behind);
+      `{`, a closing `)` (a case-statement pattern like `a) pkill ..;;`
+      opens its command list on `)` exactly like `{`/`(` open one --
+      ga-tje7u Mayor sweep, 2026-07-29), one of the block keywords that
+      always introduces a new command list (then, do, else, elif), or a
+      newline (converted to `;` before tokenizing -- see COMMENTS below
+      for why that conversion must happen AFTER comment-stripping, not
+      before);
   (b) every token between the start of its simple command and it is
       consistent with a chain of known wrapper commands (sudo, doas,
       nohup, env, time, xargs, exec, command, !) and/or inline VAR=value
@@ -53,6 +62,59 @@ shape as the evasion gap above: an invocation behind an unenumerated
 wrapper this list doesn't name slips through unflagged. Extend
 WRAPPER_PREFIXES if a real gap is found -- do not go back to a blanket
 "has trailing args" rule, it was tried and reverted for the reason above.
+
+Deliberately NOT extended to `if`/`while`/`until`/`for`/`case` themselves,
+only to the keywords that follow their condition/list (then, do, else,
+elif) plus the case-pattern `)`: a real pkill/killall call in ordinary
+agent-written shell sits directly after THOSE, not after `if`/`while`
+itself. `for` in particular is always followed by a variable name, never
+a command, so adding it would add surface for zero benefit.
+
+COMMENTS (`#`): a `#` at the start of a word (start of string, or right
+after whitespace/a separator/an opening paren-or-brace) starts a comment
+that runs to the end of its OWN physical line -- exactly like real bash,
+and unlike a `#` embedded mid-word (`http://x/#y`) or inside quotes
+(`"a#b"`), both of which stay literal. This has to be resolved BEFORE the
+newline-to-";" conversion below, not by shlex's own built-in comment
+handling: shlex's comment-skip reads to the next raw "\n" in the
+INSTREAM it's given, but this guard already replaces every real "\n"
+with ";" so the tokenizer can see statement boundaries -- so by the time
+shlex ran its own comment logic, there was no "\n" left to stop at, and a
+`#` silently swallowed EVERYTHING after it, including a real pkill call
+on the next line (ga-tje7u gate FAIL, 2026-07-29: `# note\npkill -f x`
+tokenized to nothing and allowed). Fix: strip comments ourselves first,
+character by character with quote-tracking, leaving the terminating
+newline in place for the ";" conversion to see -- then disable shlex's
+own `commenters` so it never independently re-applies a second, possibly
+divergent comment pass on top of ours.
+
+COMMAND SUBSTITUTION (`$(...)`, `` `...` ``): the shell always executes a
+substitution's content for its side effects, no matter what the outer
+command does with the captured stdout -- `echo $(pkill -f x)` really
+invokes pkill even though nothing ever prints it. This guard protects
+each balanced `$(...)`/backtick span with an opaque placeholder before
+tokenizing the OUTER command (so e.g. a wrapper's "-U $(id -u)" flag
+value survives as one token instead of being shattered by the inner
+parens), then separately re-applies this SAME rule -- recursively -- to
+each span's own captured inner text. A bare pkill wrapped as the ENTIRE
+command (`$(pkill -9 -f pattern)`) and a pkill hidden as one statement in
+a `;`-joined list inside a substitution used for something else (`echo
+$(echo a; pkill -f a)`) are the same threat by this logic and both deny
+now (ga-tje7u Mayor sweep, 2026-07-29 -- the first submission treated
+only the latter shape as a gap and the former as equivalent to the
+accepted `bash -c` gap below; empirically they're identical, so both are
+covered). Still NOT covered, deliberately: a pkill hidden in a string
+handed to `eval` or `bash -c`/`sh -c` -- those re-interpret a plain
+argument STRING as new shell text via their OWN semantics, which no
+amount of shell-syntax scanning reveals; catching that means knowing what
+`eval`/`bash -c` specifically DO with their argument, which is exactly
+the kind of per-command special-casing this design tries to avoid.
+`eval "pkill -f a"` and backslash-mangled forms designed purely to dodge
+literal text-matching (of which `eval` is the flagship example) remain
+open (ga-tje7u Mayor sweep, 2026-07-29: flagged as "fix if it's free,
+don't build machinery to chase it" -- eval wasn't free, so it's still
+open; the backslash-in-the-token-itself case, `pk\\ill -f a`, WAS free --
+see find_invocation's docstring -- and is fixed).
 
 REDIRECTS (`>`, `<`, `>>`, `2>&1`, ...): no dedicated handling exists, and
 none is needed. Because command position only ever looks BACKWARD from a
@@ -76,9 +138,14 @@ import sys
 
 CMD_RE = re.compile(r"\b(pkill|killall)\b")
 SEPARATORS = (";", "&&", "||", "|", "&")
-COMMAND_START_TOKENS = SEPARATORS + ("(", "{")
+BLOCK_KEYWORDS = ("then", "do", "else", "elif")
+COMMAND_START_TOKENS = SEPARATORS + ("(", ")", "{") + BLOCK_KEYWORDS
 WRAPPER_PREFIXES = {"sudo", "doas", "nohup", "env", "time", "xargs", "exec", "command", "!"}
 ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# A '#' only starts a comment when it's the first character of a NEW word --
+# i.e. right after one of these, or at the very start of the command.
+_WORD_BREAK_CHARS = frozenset(" \t\n;&|(){}")
 
 # Opaque, NUL-delimited placeholder for a protected $(...)/`...` span -- NUL
 # can't appear in a real shell command string, so this can never collide.
@@ -142,6 +209,60 @@ def _restore(token, placeholders):
     return token
 
 
+def _strip_comments(command):
+    """Delete bash-style comments -- an unquoted `#` at the start of a
+    word, through the end of its own physical line -- while leaving the
+    terminating newline itself in place for the caller's later
+    newline-to-";" conversion to see. Quote-aware (a `#` inside '...' or
+    "..." is literal) and word-start-aware (a `#` glued mid-word, like
+    `http://x/#y`, is literal too -- a bash comment must BEGIN a word).
+    See the module docstring's COMMENTS section for why this has to run
+    before that conversion instead of relying on shlex's own comment
+    handling."""
+    out = []
+    quote = None  # None, "'", or '"'
+    at_word_start = True
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if quote == "'":
+            out.append(ch)
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(command[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(ch)
+            out.append(command[i + 1])
+            i += 2
+            at_word_start = False
+            continue
+        if ch in ("'", '"'):
+            out.append(ch)
+            quote = ch
+            at_word_start = False
+            i += 1
+            continue
+        if ch == "#" and at_word_start:
+            while i < n and command[i] != "\n":
+                i += 1
+            continue
+        at_word_start = ch in _WORD_BREAK_CHARS
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _split_operator_run(tok):
     """shlex's punctuation_chars mode fuses adjacent operator characters
     into one token even when they're two DISTINCT operators with no space
@@ -165,19 +286,27 @@ def _split_operator_run(tok):
 def _tokenize(command):
     """Shell-aware tokenizer: splits on whitespace and on shell
     control/redirect operators, even glued flush against a neighboring
-    word (e.g. "echo hi;pkill ..."). An unquoted newline is a statement
-    separator in real bash exactly like ";" -- shlex treats it as plain
-    whitespace and drops it, so it's converted to ";" first to keep that
-    meaning visible. Quoting still protects any operator character that's
-    genuinely part of a pattern (e.g. 'foo;bar' stays one token)."""
+    word (e.g. "echo hi;pkill ..."). Returns (tokens, placeholders) --
+    the placeholders map lets find_invocation() recurse into each
+    protected $(...)/`...` span's own captured text. An unquoted newline
+    is a statement separator in real bash exactly like ";" -- shlex
+    treats it as plain whitespace and drops it, so it's converted to ";"
+    (AFTER comment-stripping, which needs the real newline as the
+    comment terminator -- see COMMENTS in the module docstring) to keep
+    that separator meaning visible. Quoting still protects any operator
+    character that's genuinely part of a pattern (e.g. 'foo;bar' stays
+    one token)."""
     protected, placeholders = _protect_command_substitutions(command)
-    protected = protected.replace("\r\n", ";").replace("\n", ";")
+    protected = protected.replace("\r\n", "\n")
+    protected = _strip_comments(protected)
+    protected = protected.replace("\n", ";")
     lexer = shlex.shlex(protected, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
+    lexer.commenters = ""  # comments already stripped above -- see COMMENTS in module docstring
     tokens = []
     for tok in lexer:
         tokens.extend(_split_operator_run(_restore(tok, placeholders)))
-    return tokens
+    return tokens, placeholders
 
 
 def _wrapper_chain(tokens, i):
@@ -222,12 +351,25 @@ def _is_command_position(tokens, i):
     return _wrapper_chain(tokens, i)
 
 
-def find_invocation(tokens):
-    """True if any pkill/killall token in `tokens` is in real command
-    position. The single rule only needs a yes/no -- never which one, or
-    what its arguments are -- so this short-circuits on the first hit."""
+def find_invocation(command):
+    """True if `command` contains a pkill/killall token in real command
+    position, anywhere -- including inside a $(...)/`...` command
+    substitution's own captured text, checked recursively (see COMMAND
+    SUBSTITUTION in the module docstring). Operates on the raw command
+    STRING rather than pre-split tokens so that a token-level obfuscation
+    like `pk\\ill -f a` (an unquoted backslash-escape that shlex still
+    joins into the single token "pkill", but which a raw substring check
+    for the literal text "pkill" would miss) is only ever inspected after
+    tokenization, never before it. The single rule only needs a yes/no --
+    never which one, or what its arguments are -- so the top-level scan
+    short-circuits on the first hit."""
+    tokens, placeholders = _tokenize(command)
     for i, tok in enumerate(tokens):
         if os.path.basename(tok) in ("pkill", "killall") and _is_command_position(tokens, i):
+            return True
+    for raw in placeholders.values():
+        inner = raw[2:-1] if raw.startswith("$(") else raw[1:-1]
+        if find_invocation(inner):
             return True
     return False
 
@@ -248,20 +390,20 @@ DENY_REASON = (
 
 
 def decide(command):
-    if not CMD_RE.search(command):
-        return "allow", None
     try:
-        tokens = _tokenize(command)
+        invoked = find_invocation(command)
     except Exception as exc:
-        return "deny", (
-            "This command mentions pkill/killall, but its shell syntax could not "
-            "be parsed to verify what it would actually do (%s: %s) -- refusing "
-            "rather than assuming an unparseable command is safe. Simplify the "
-            "quoting, or validate by hand with the read-only `pgrep -lf <same "
-            "args>` first. (See ga-jo3xl for why pkill/killall gets this "
-            "scrutiny.)" % (type(exc).__name__, exc)
-        )
-    if find_invocation(tokens):
+        if CMD_RE.search(command):
+            return "deny", (
+                "This command mentions pkill/killall, but its shell syntax could not "
+                "be parsed to verify what it would actually do (%s: %s) -- refusing "
+                "rather than assuming an unparseable command is safe. Simplify the "
+                "quoting, or validate by hand with the read-only `pgrep -lf <same "
+                "args>` first. (See ga-jo3xl for why pkill/killall gets this "
+                "scrutiny.)" % (type(exc).__name__, exc)
+            )
+        return "allow", None
+    if invoked:
         return "deny", DENY_REASON
     return "allow", None
 

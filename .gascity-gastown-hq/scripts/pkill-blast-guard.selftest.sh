@@ -156,6 +156,95 @@ assert_allow "echo pkill > /tmp/x"    'echo pkill > /tmp/x'
 assert_allow "man pkill 2>/dev/null"  'man pkill 2>/dev/null'
 
 # ─────────────────────────────────────────────────────────────────────────
+# AC9/AC12 (2026-07-29 gate FAIL + Mayor 9-hole sweep, fix-attempt 1): the
+# first gate run found the guard's own `_tokenize()` let shlex's default
+# '#' comment handling swallow a REAL pkill call on the line after a
+# comment, because the newline that should have ended the comment had
+# already been rewritten to ';' before shlex ever saw the string. The
+# Mayor then swept the whole class ("does this construct make the guard
+# IGNORE or REWRITE text?") and found 8 more of the same shape: shell
+# block keywords (if/then, while/do, for/do, case/)), and a pkill hidden
+# inside a $(...) used for something else. Per the Mayor's AC12 mandate,
+# every such construct gets TWO cases: (a) alone, it must still ALLOW
+# (proves the fix didn't just start over-denying everything with a "#",
+# "if", etc. in it) and (b) with a real pkill hidden inside/after it, it
+# must DENY (proves the hole is actually closed, not just the exact
+# string from the report).
+# ─────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- AC12: comments (word-initial '#', quote- and mid-word-aware) --"
+assert_allow "comment only, nothing after (AC3, pre-existing)" \
+  '# this mentions pkill, not a real call'
+assert_allow "comment after a real command, nothing dangerous follows" \
+  'echo hi
+# just a note, nothing dangerous here'
+assert_allow "mid-word # is not a comment (URL fragment)" \
+  'curl http://example.com/#frag'
+assert_allow "quoted # is not a comment" \
+  'echo "a # b" pkill'
+assert_deny "gate-FAIL case: comment then real pkill on the next line" \
+  '# note
+pkill -f a'
+assert_deny "gate's own verbatim reviewed example" \
+  '# Clean up stale processes
+pkill -f "anuncios_dashboard.py" -U $(id -u)'
+assert_deny "trailing comment on the SAME line as other text, pkill on the next" \
+  'echo a # nota
+pkill -f a'
+
+echo ""
+echo "-- AC12: shell block keywords (then/do/else/elif) + case-pattern ')' --"
+assert_allow "if/then, no pkill"     'if true; then echo ok; fi'
+assert_deny  "if/then hides pkill"   'if true; then pkill -f a; fi'
+assert_allow "while/do, no pkill"    'while read l; do echo "$l"; done'
+assert_deny  "while/do hides pkill"  'while read l; do pkill -f a; done'
+assert_allow "for/do, no pkill"      'for i in 1 2; do echo "$i"; done'
+assert_deny  "for/do hides pkill"    'for i in 1 2; do pkill -f a; done'
+assert_allow "case, no pkill"        'case $x in a) echo ok;; esac'
+assert_deny  "case hides pkill"      'case $x in a) pkill -f a;; esac'
+assert_allow "if/else, no pkill"     'if false; then echo x; else echo y; fi'
+assert_deny  "if/else hides pkill"   'if false; then echo x; else pkill -f a; fi'
+assert_deny  "if/elif hides pkill"   'if false; then echo x; elif true; then pkill -f a; fi'
+
+echo ""
+echo "-- AC12: \$(...) / \`...\` command substitution, scanned recursively --"
+assert_allow "cmdsub, no pkill anywhere"        'echo $(echo a)'
+assert_allow "backtick cmdsub, no pkill"        'echo `echo a`'
+assert_deny  "cmdsub hides pkill in a ;-list"   'echo $(echo a; pkill -f a)'
+assert_deny  "bare cmdsub wraps the whole call" '$(pkill -9 -f pattern)'
+assert_deny  "cmdsub result assigned to a var"  'x=$(sudo pkill -f a)'
+assert_deny  "backtick form hides a real pkill" 'echo `pkill -f a`'
+
+echo ""
+echo "-- AC12: backslash-escape inside the pkill/killall token itself --"
+assert_allow "unrelated backslash-escaped command still allows" 'ec\ho hello'
+assert_deny  'backslash-escape hides the literal substring, not the token (pk\ill)' 'pk\ill -f a'
+
+echo ""
+echo "-- known, accepted gap (do NOT flip to deny without new machinery) --"
+echo "   eval's string argument is re-interpreted as shell BY eval itself,"
+echo "   which no shell-syntax scan can see -- ga-tje7u Mayor sweep, "
+echo "   2026-07-29, explicitly declined ('fix if free, don't build"
+echo "   machinery to chase it'). This assert_allow documents the gap as"
+echo "   INTENTIONAL so a future reviewer doesn't mistake it for a miss."
+assert_allow "eval hides a real pkill (accepted, documented gap)" 'eval "pkill -f a"'
+
+echo ""
+echo "-- regression guard: line continuation and heredocs (Mayor sweep named" \
+     "these 'already correct' but neither was actually pinned as a test) --"
+assert_deny "backslash-newline continuation, pkill's OWN args span lines" \
+  'pkill \
+-f a'
+assert_allow "backslash-newline continuation joins into echo's args -- never really invokes pkill" \
+  'echo hi \
+pkill -U 501'
+assert_deny "heredoc body precedes a real pkill call on a later line" \
+  'cat <<EOF
+some text
+EOF
+pkill -f a'
+
+# ─────────────────────────────────────────────────────────────────────────
 # AC4: unparseable shell syntax that still mentions pkill/killall denies
 # (fail CLOSED on this narrow edge — it wouldn't run in real bash either).
 # ─────────────────────────────────────────────────────────────────────────
