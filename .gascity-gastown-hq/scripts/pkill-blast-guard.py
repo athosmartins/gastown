@@ -66,6 +66,40 @@ error-vs-empty shape as before:
     2 closed for named variables, just left open for this other class of
     unexpanded reference. Fixed by widening the regex.
 
+FIX-ATTEMPT (2026-07-29, post budget-fix): closed a further gap in the same
+error-vs-empty family, this time a tokenizer/operand-classification bug
+rather than a pattern-verification one. shlex's punctuation_chars mode
+glues ANY run of adjacent characters from its fixed set "();<>|&" into one
+token with no regard for shell semantics, which produced two distinct
+bypasses, both confirmed live against the committed guard before this fix:
+  - a redirection operator (`>`, `<`, `>>`, `<<`, `>&`, `&>`, `<&`, `<>`),
+    including fd-dup forms that tokenize with a leading bare digit (e.g.
+    `2>/dev/null` -> "2", ">", "/dev/null"), was read as an ordinary
+    pattern/target operand. `pkill -U 501 2>/dev/null` and `pkill -U $(id
+    -u) >/tmp/x` produced non-empty "operands" out of the stray
+    "2"/">"/"/dev/null"/"/tmp/x" text, so rule (b)'s "no pattern operand"
+    never fired -- whether the command was denied at all then depended on
+    the unrelated accident of whether that punctuation/path text happened
+    to also match a live process on the machine running the check. The
+    real ga-jo3xl incident line itself contained "2>/dev/null" on both its
+    pkill calls; every selftest through this fix, including AC6(i), had
+    only ever exercised a sanitized version without it.
+  - two distinct real shell operators glued with no separating whitespace
+    (e.g. "&;" -- backgrounding immediately followed by a statement
+    separator) merge into ONE token matching neither a known SEPARATOR nor
+    a known redirect operator, so find_invocations's "stop at the next
+    separator" cutoff never fires and everything after it -- not just
+    redirection syntax -- is silently absorbed into the PRECEDING
+    command's own argv instead of ending it there.
+Fixed at the root: _split_operator_run re-tokenizes any pure-punctuation
+run shlex hands back into the real operators it represents (longest match
+first, e.g. "&&"/">>"/">&"/"&>" before the single-character forms), so
+every later stage always sees canonical, individually-recognized tokens --
+never a fused hybrid -- and split_operands_and_flags treats a recognized
+redirect operator (never a statement separator, which is already handled)
+as the end of the operand list, popping a bare fd-number token immediately
+in front of it back off since it was never a real operand.
+
 WHAT: reads a single Claude Code PreToolUse hook payload from stdin. When
 tool_name is "Bash" and tool_input.command contains a pkill/killall
 invocation in command position -- including one glued flush against a
@@ -229,24 +263,84 @@ def _restore(token, placeholders):
     return token
 
 
+# shlex's punctuation_chars mode returns any RUN of adjacent characters from
+# its fixed set "();<>|&" as a single token, with no regard for where one
+# real shell operator ends and the next begins -- e.g. "&;" (backgrounding
+# glued flush against a following separator) comes back as ONE token that
+# doesn't equal any string in SEPARATORS. Longest-match-first vocabulary of
+# every operator shlex's punctuation_chars can ever produce a run of; 2-char
+# forms MUST precede their 1-char prefixes (e.g. "&&" before "&") so the
+# greedy match in _split_operator_run below picks the real operator, not an
+# arbitrary prefix of it.
+_KNOWN_OPERATORS = (
+    "&&", "||", ">>", "<<", ">&", "&>", "<&", "<>",
+    ";", "&", "|", "<", ">", "(", ")",
+)
+_PUNCTUATION_RUN_RE = re.compile(r"^[();<>|&]+$")
+
+# Redirection operators specifically -- as opposed to the statement
+# separators in SEPARATORS, which end an INVOCATION -- are never a
+# pkill/killall pattern/target operand; see split_operands_and_flags.
+REDIRECT_OPERATORS = {">>", "<<", ">&", "&>", "<&", "<>", "<", ">"}
+
+
+def _split_operator_run(tok):
+    """If `tok` is composed entirely of shlex punctuation_chars, re-split it
+    into the real shell operators it represents, longest match first (e.g.
+    "&;" -> ["&", ";"], "&&" stays ["&&"], ">&" stays [">&"]). Without this,
+    two DISTINCT operators glued with no whitespace between them (only
+    possible when both are punctuation characters -- a digit or letter in
+    between already breaks shlex's own run) come back as one token that
+    downstream code (SEPARATORS / REDIRECT_OPERATORS membership checks) does
+    not recognize as anything, silently absorbing whatever follows into the
+    wrong invocation's argv. Returns [tok] unchanged for the overwhelmingly
+    common case of an ordinary word/flag/pattern, which this never touches."""
+    if not _PUNCTUATION_RUN_RE.match(tok):
+        return [tok]
+    out = []
+    i, n = 0, len(tok)
+    while i < n:
+        for op in _KNOWN_OPERATORS:
+            if tok.startswith(op, i):
+                out.append(op)
+                i += len(op)
+                break
+        else:
+            # Unreachable while _KNOWN_OPERATORS covers every character in
+            # _PUNCTUATION_RUN_RE's class as a 1-char operator on its own --
+            # kept as a safe fallback rather than raising, consistent with
+            # this function's job being pure re-tokenization, not detection.
+            out.append(tok[i])
+            i += 1
+    return out
+
+
 def _tokenize(command):
-    """Tokenize like shlex.split, but also split shell control operators
-    (;, &&, ||, |, &) into their own tokens even when glued flush against a
-    neighboring word with no whitespace (e.g. "echo hi;pkill ..."). Plain
-    shlex.split only splits on whitespace, so a glued separator leaves the
-    next command's name fused onto it as one token (e.g. "hi;pkill") that
-    never matches the "pkill"/"killall" basename check in find_invocations
-    -- silently hiding that entire invocation from the guard. Quoting still
-    protects separator characters that are genuinely part of a pattern
-    (e.g. 'foo;bar' stays one token); this only affects unquoted operators.
-    $(...)/`...` spans are protected first (see
+    """Tokenize like shlex.split, but also split shell control/redirection
+    operators (;, &&, ||, |, &, >, <, >>, <<, >&, &>, <&, <>) into their own
+    tokens even when glued flush against a neighboring word or against EACH
+    OTHER with no whitespace (e.g. "echo hi;pkill ...", "pkill ... &;ls").
+    Plain shlex.split only splits on whitespace, so a glued separator leaves
+    the next command's name fused onto it as one token (e.g. "hi;pkill")
+    that never matches the "pkill"/"killall" basename check in
+    find_invocations -- silently hiding that entire invocation from the
+    guard. Quoting still protects operator characters that are genuinely
+    part of a pattern (e.g. 'foo;bar' stays one token); this only affects
+    unquoted operators. $(...)/`...` spans are protected first (see
     _protect_command_substitutions) and restored per-token after shlex has
     decided token boundaries, so a command-substitution value survives as
-    one token instead of being shattered by the same punctuation splitting."""
+    one token instead of being shattered by the same punctuation splitting;
+    _split_operator_run then further divides any token that -- even after
+    restoration -- is still composed entirely of punctuation characters,
+    since shlex's own run-merging can fuse two distinct real operators
+    together (see that function's docstring)."""
     protected, placeholders = _protect_command_substitutions(command)
     lexer = shlex.shlex(protected, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
-    return [_restore(tok, placeholders) for tok in lexer]
+    tokens = []
+    for tok in lexer:
+        tokens.extend(_split_operator_run(_restore(tok, placeholders)))
+    return tokens
 
 
 def _simple_command_span(tokens, i):
@@ -370,12 +464,40 @@ def split_operands_and_flags(args):
     many operands came before it (a second plain operand, e.g. killall's
     "slack" after "firefox", is NOT a flag and must not trip this). A token
     in ARG_TAKING_FLAGS consumes the next token as its value (never counted
-    as an operand itself, e.g. `-U 501` contributes zero operands)."""
+    as an operand itself, e.g. `-U 501` contributes zero operands).
+
+    A REDIRECT_OPERATORS token (>, <, >>, <<, >&, &>, <&, <>) is never a
+    pkill/killall operand -- shell redirection, wherever it appears in a
+    simple command, is stripped by the shell before argv ever reaches the
+    invoked program. Per gate review (the ga-jo3xl 2026-07-29 GATE-FEEDBACK),
+    this is the exact reason `pkill -U 501 2>/dev/null` and `pkill -U $(id
+    -u) >/tmp/x` were both previously misread as HAVING an operand (the
+    stray "2"/">"/"/dev/null"/"/tmp/x" text) when they actually supply none
+    -- silently skipping rule (b) for the identical criteria-only blast
+    radius as ga-jo3xl's original misordered-flag incident. On hitting a
+    redirect operator this stops collecting entirely (conservative: real
+    commands never need a "real" operand to follow a redirect in practice,
+    and treating everything from here on as non-operand can only make this
+    guard MORE likely to deny, never less). A bare fd-number token
+    immediately in front of the operator (e.g. "2" in "2>/dev/null") was
+    already appended as an operand one iteration earlier -- shlex can never
+    glue a digit to adjacent punctuation, so it always arrives as its own
+    token -- and is popped back off now that the redirect confirms it was
+    an fd prefix, not a real operand."""
     operands = []
     flag_after_operand = False
     i, n = 0, len(args)
     while i < n:
         tok = args[i]
+        if tok in REDIRECT_OPERATORS:
+            if (
+                operands
+                and i > 0
+                and args[i - 1] == operands[-1]
+                and re.match(r"^\d+$", operands[-1])
+            ):
+                operands.pop()
+            break
         if tok.startswith("-") and tok != "-":
             if operands:
                 flag_after_operand = True

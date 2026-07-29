@@ -585,6 +585,154 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Gate-review regression (2026-07-29 GATE-FEEDBACK on ga-jo3xl): a redirection
+# operator (>, <, >>, <<, >&, &>, <&, <>), including fd-dup forms that
+# tokenize with a leading bare digit (e.g. "2>/dev/null" -> "2", ">",
+# "/dev/null"), was previously read as an ordinary pattern/target operand --
+# so a criteria-only invocation with a trailing redirect silently skipped
+# rule (b) ("no pattern operand"), reaching the exact ga-jo3xl blast radius.
+# Whether it denied at all then depended on the unrelated accident of
+# whether the stray punctuation/path text happened to also match a live
+# process. Confirmed live pre-fix on THIS machine: both of the two cases
+# below already denied, but for the WRONG rule ("matches a claude process"
+# on the literal text '2' / '>') -- an accident of this machine's process
+# table, not a real check of anything the user supplied. Asserting on the
+# SPECIFIC rule (b) reason, not just "denied", is the point: a decision that
+# happens to be deny for the wrong reason is exactly what let this gap pass
+# an earlier review round.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- gate-review regression: redirection operators are never a pattern operand --"
+
+run_guard 'pkill -U 501 2>/dev/null'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "'pkill -U 501 2>/dev/null' denied" \
+  || bad "'pkill -U 501 2>/dev/null' should be denied, got rc=$RC out=$OUT"
+echo "$OUT" | jq -e '.hookSpecificOutput.permissionDecisionReason | contains("NO pattern/target operand")' >/dev/null 2>&1 \
+  && ok "...via rule (b) 'no operand', NOT an accidental claude-match on the fd number '2'" \
+  || bad "should deny via rule (b), got: $(echo "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason // "MISSING"')"
+
+run_guard 'pkill -U $(id -u) >/tmp/x'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "'pkill -U \$(id -u) >/tmp/x' denied" \
+  || bad "'pkill -U \$(id -u) >/tmp/x' should be denied, got rc=$RC out=$OUT"
+echo "$OUT" | jq -e '.hookSpecificOutput.permissionDecisionReason | contains("NO pattern/target operand")' >/dev/null 2>&1 \
+  && ok "...via rule (b), NOT an accidental claude-match on the bare '>' token" \
+  || bad "should deny via rule (b), got: $(echo "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason // "MISSING"')"
+
+run_guard 'killall -u root 2>/dev/null'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "'killall -u root 2>/dev/null' denied" \
+  || bad "'killall -u root 2>/dev/null' should be denied, got rc=$RC out=$OUT"
+echo "$OUT" | jq -e '.hookSpecificOutput.permissionDecisionReason | contains("NO pattern/target operand")' >/dev/null 2>&1 \
+  && ok "...via rule (b)" \
+  || bad "should deny via rule (b), got: $(echo "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason // "MISSING"')"
+
+# Every other redirection form shlex's punctuation_chars mode can produce --
+# all criteria-only, all must deny via rule (b), none by accident.
+for cmd in \
+  "pkill -U 501 >/tmp/x" \
+  "pkill -U 501 >>/tmp/x" \
+  "pkill -U 501 </dev/null" \
+  "pkill -U 501 <<EOF" \
+  "pkill -U 501 &>/dev/null" \
+  "pkill -U 501 1>&2" \
+  "pkill -U 501 <&3" \
+  "pkill -U 501 <>/tmp/x" \
+; do
+  run_guard "$cmd"
+  [ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+    && ok "'$cmd' denied" \
+    || bad "'$cmd' should be denied, got rc=$RC out=$OUT"
+  echo "$OUT" | jq -e '.hookSpecificOutput.permissionDecisionReason | contains("NO pattern/target operand")' >/dev/null 2>&1 \
+    && ok "...'$cmd' denied via rule (b), not an accidental pattern match" \
+    || bad "'$cmd' should deny via rule (b), got: $(echo "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason // "MISSING"')"
+done
+
+# The REAL ga-jo3xl incident line, with its ACTUAL trailing "2>/dev/null" on
+# BOTH calls -- AC6(i) above has, through every prior fix-attempt, only ever
+# exercised a sanitized version without them. Still denies via rule (a)
+# (flag_after_operand fires on the second call's "-U" appearing after its
+# pattern, independent of the redirect), but this proves the real, complete
+# incident text -- not a cleaned-up stand-in -- is what gets exercised.
+run_guard 'pkill -f "ANUNCIOS_PORT=8214" 2>/dev/null; pkill -f "anuncios_dashboard.py" -U $(id -u) 2>/dev/null | true'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "the REAL incident line (with its actual 2>/dev/null redirects) is denied" \
+  || bad "the real incident line should be denied, got rc=$RC out=$OUT"
+echo "$OUT" | jq -e '.hookSpecificOutput.permissionDecisionReason | contains("PATTERN must be the LAST argument")' >/dev/null 2>&1 \
+  && ok "...via rule (a), same reason as the sanitized AC6(i) case" \
+  || bad "real incident line should deny via rule (a), got: $(echo "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason // "MISSING"')"
+
+# Non-regression: a REAL pattern followed by a trailing redirect must still
+# be checked on its own merits -- the redirect must strip only its OWN
+# operator+target, never a genuine operand that precedes it.
+SAFE_MARK="pkill-guard-selftest-redirect-safe-$$"
+run_guard "pkill -f '$SAFE_MARK' 2>/dev/null"
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" != "deny" ] \
+  && ok "real pattern + trailing 2>/dev/null still allowed on its own merits (pattern matches nothing)" \
+  || bad "real pattern + trailing redirect should be allowed, got rc=$RC out=$OUT"
+
+run_guard "pkill -f '$SAFE_MARK' >/tmp/log 2>&1"
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" != "deny" ] \
+  && ok "real pattern + compound '>/tmp/log 2>&1' redirect still allowed" \
+  || bad "real pattern + compound redirect should be allowed, got rc=$RC out=$OUT"
+
+# Non-regression: killall's documented multi-target form with a trailing
+# redirect must keep BOTH real targets -- only the redirect stripped.
+MARK_RA="pkill-guard-selftest-redirtarget-a-$$"
+MARK_RB="pkill-guard-selftest-redirtarget-b-$$"
+run_guard "killall $MARK_RA $MARK_RB 2>/dev/null"
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" != "deny" ] \
+  && ok "killall with two real targets + trailing redirect still allowed" \
+  || bad "killall multi-target + redirect should be allowed, got rc=$RC out=$OUT"
+
+# Non-regression: a token that merely CONTAINS a redirect character amid
+# other characters (not composed ENTIRELY of them) must never be mistaken
+# for a redirect operator -- only an exact, pure-punctuation token qualifies.
+run_guard 'pkill -f "a>b" -U 501'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "pattern 'a>b' (contains '>' but is not purely a redirect operator) still triggers rule (a), not treated as a redirect" \
+  || bad "'a>b' pattern should still trigger flag-after-operand (rule a), got rc=$RC out=$OUT"
+
+# A pattern that is legitimately quoted but happens to consist SOLELY of
+# redirect-shaped characters (e.g. a literal ">") is indistinguishable, once
+# shlex's posix quote-removal has already run, from a bare unquoted redirect
+# operator -- this guard cannot tell "the user quoted a literal >" from "the
+# user wrote an actual redirect" from tokens alone. Deliberately resolved
+# toward deny (same "ambiguous verification denies" principle as an
+# unexpanded $VAR, fix-attempt 2): a real pkill pattern that is a single
+# bare punctuation character is not a realistic use case, and erring toward
+# refusing a same-shaped real redirect is the safe direction. Documented
+# here explicitly so a future reviewer sees this is a deliberate tradeoff,
+# not a miss -- same convention as fix-attempt 3's "engineering judgment
+# call" section above.
+run_guard 'pkill -f ">" -U 501'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "a quoted single-'>' pattern denies (indistinguishable from a bare redirect post-quote-removal -- documented tradeoff)" \
+  || bad "quoted-'>' pattern should deny (ambiguous -> deny), got rc=$RC out=$OUT"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gate-review regression (found during this same fix, same root cause): TWO
+# distinct real shell operators glued with no whitespace between them (only
+# possible when both are punctuation characters -- a digit or word char in
+# between already breaks shlex's own run) merge into ONE token matching
+# neither a known SEPARATOR nor a known redirect operator. Confirmed live
+# pre-fix: "pkill -U 501&;ls" silently absorbed "ls" into pkill's OWN argv
+# (as a bogus extra operand) instead of ending the invocation at "&",
+# because the fused token "&;" is not equal to any string in SEPARATORS.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- gate-review regression: two glued operators (e.g. '&;') are still split correctly --"
+
+run_guard 'pkill -U 501&;ls'
+[ "$RC" -eq 0 ] && [ "$(decision_of "$OUT")" = "deny" ] \
+  && ok "'pkill -U 501&;ls' denied" \
+  || bad "'pkill -U 501&;ls' should be denied, got rc=$RC out=$OUT"
+echo "$OUT" | jq -e '.hookSpecificOutput.permissionDecisionReason | contains("NO pattern/target operand")' >/dev/null 2>&1 \
+  && ok "...via rule (b), proving 'ls' was NOT absorbed as pkill's pattern operand" \
+  || bad "should deny via rule (b) (a different reason would imply 'ls' leaked into pkill's argv), got: $(echo "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason // "MISSING"')"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Activation script: idempotent compose-not-replace merge into a SCRATCH
 # settings.json (never the live file).
 # ─────────────────────────────────────────────────────────────────────────────
