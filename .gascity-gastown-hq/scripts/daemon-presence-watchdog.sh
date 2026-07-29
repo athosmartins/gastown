@@ -17,12 +17,40 @@
 #   ABSENT critical daemon         → bootstrap (reload) it + ntfy + mail Mayor (self-heal).
 #   CRASH-LOOP (loaded, nonzero exit on 2 consecutive checks) → ntfy + mail Mayor; do NOT
 #       reload (it is loaded and failing — reloading would just re-loop; needs a human/Mayor).
+#   PRESENCE-DRIFT (plist authored in scripts/ or packs/town-deltas/assets/, not loaded,
+#       and not even in DPW_CRITICAL) → ntfy + mail Mayor ONLY — deliberately does NOT
+#       auto-bootstrap (ga-u04vp: an un-curated daemon may need real per-daemon
+#       evaluation before going live — e.g. config-drift-watcher had been disabled
+#       after a prior incident; blindly reviving an unevaluated daemon is its own risk).
 #   ALL HEALTHY                    → a single heartbeat line to the log (no noise).
 #
 # The CRITICAL set is the must-always-run pipeline + the watchdogs that protect it.
 # One-shots (suavez-first-watch self-unloads by design) and deprecated jobs are
 # deliberately ABSENT from this list — they are never auto-resurrected.
 # Override the set with DPW_CRITICAL (space-list of labels).
+#
+# ga-u04vp — why PRESENCE-DRIFT exists (read before removing or "simplifying" it):
+#   7 daemons had a reviewed, selftested plist sitting in scripts/ or
+#   packs/town-deltas/assets/ for up to 6 weeks with ZERO launchd coverage, because
+#   the fix for each one was "add it to DPW_CRITICAL" — a list that, by definition,
+#   only contains what a human already remembered to add. That is precisely the
+#   failure mode this class of bug needs closed: the gap is the thing NOT on
+#   anyone's list. PRESENCE-DRIFT needs no curation — it scans the same source
+#   directories a new daemon's plist would be authored into, and alerts on any
+#   com.gascity.*/com.gastown.* Label found there that isn't currently loaded,
+#   whether it was never bootstrapped (AC1 case) or silently fell off launchd
+#   after being disabled/unloaded (AC2 case — see merged-bead-janitor, which
+#   turned out to be `launchctl disable`d, a persistent bit that survives
+#   bootout/bootstrap and isn't visible via `launchctl list`/`print`).
+#   DOCTRINE (ga-u04vp AC4): a commit that claims "runs automatically via
+#   com.gascity.X" is not a deploy — it is a claim. This sweep is what makes the
+#   claim provable forever: an author no longer needs to remember to wire in
+#   monitoring, because monitoring already scans where they authored the plist.
+#   If a daemon is deliberately retired/disabled going forward, remove or rename
+#   its SOURCE plist too (not just the deployed copy under ~/Library/LaunchAgents)
+#   — otherwise this check will keep flagging it. That repeat false-flag is the
+#   intended, cheaper failure mode; the alternative (silently trusting an
+#   undocumented disable) is exactly what produced this bug.
 #
 # ga-vkjs — por que com.gascity.silent-ignorance-watch entrou nesta lista (não remova sem ler):
 #   Ele é o monitor da Ignorância Silenciosa, e tem uma propriedade que o torna DEPENDENTE deste
@@ -347,6 +375,58 @@ run_recycle_sweep() {
     } || log "RECYCLE unexpected error for $lbl — skipped (fail-safe)"
   done
   return 0   # recycler never fails the watchdog
+}
+
+# ── ga-u04vp: PRESENCE-DRIFT — catches "plist authored, never deployed" ──────
+# See the header comment (top of file) for the full rationale. This needs no
+# curated list: it scans the canonical "meant to be deployed" source locations
+# (non-recursive — deliberately skips .gc-worktrees/ and .gc/agents/*/, which are
+# per-session working copies, not deployment intent) for any com.gascity.*/
+# com.gastown.* plist Label, and flags one that is not currently loaded. A label
+# already in DPW_CRITICAL is skipped here — the main loop above already alerts on
+# that one (and, unlike this sweep, will also attempt an auto-bootstrap).
+DPW_PRESENCE_DRIFT_ENABLED="${DPW_PRESENCE_DRIFT_ENABLED:-1}"
+DPW_PRESENCE_DIRS="${DPW_PRESENCE_DIRS:-$HQ/packs/town-deltas/assets $HQ/scripts}"
+
+# Extract a plist's <key>Label</key> string value. Handles both the compact
+# same-line style (<key>Label</key><string>X</string>, used by most repo-authored
+# plists) and the expanded multi-line style a canonicalized (plutil/launchctl-
+# rewritten) plist uses — `want` persists across lines so either shape resolves.
+_plist_label() {
+  awk '
+    /<key>Label<\/key>/ { want=1 }
+    want && /<string>/ {
+      line=$0
+      sub(/.*<string>/, "", line); sub(/<\/string>.*/, "", line)
+      if (line != "") { print line; exit }
+    }
+  ' "$1" 2>/dev/null
+}
+
+run_presence_drift_sweep() {
+  [ "${DPW_PRESENCE_DRIFT_ENABLED:-1}" = "1" ] || return 0
+  local dir f label undeployed=""
+  for dir in $DPW_PRESENCE_DIRS; do
+    [ -d "$dir" ] || continue
+    for f in "$dir"/*.plist; do
+      [ -f "$f" ] || continue
+      label="$(_plist_label "$f")"
+      case "$label" in
+        com.gascity.*|com.gastown.*) ;;
+        *) continue ;;
+      esac
+      case " $DPW_CRITICAL " in *" $label "*) continue ;; esac
+      _loaded "$label" || undeployed="$undeployed $label"
+    done
+  done
+  if [ -n "$undeployed" ]; then
+    local msg="Daemon-presence watchdog: PRESENCE-DRIFT —${undeployed} (plist exists in \$DPW_PRESENCE_DIRS but is NOT loaded in launchd: never bootstrapped, or fell out silently — ga-u04vp)."
+    log "ALERT $msg"
+    _alert "presence-drift (undeployed plist)" "$msg"
+    return 1
+  fi
+  log "OK: presence-drift sweep — every com.gascity.*/com.gastown.* plist in \$DPW_PRESENCE_DIRS is loaded"
+  return 0
 }
 
 run_sweep() {
@@ -994,6 +1074,42 @@ GCSTUB26
   grep -q "mail suppressed" "$LOG" && ok "log shows imp05 suppression message for the OOM-classified exit" || bad "log missing suppression message for OOM exit"
   grep -q "OOM-KILLED: com.gascity.beta" "$LOG" && bad "log wrongly emitted OOM-KILLED while heal is in-budget (should stay suppressed)" || ok "log does NOT say OOM-KILLED while heal is in-budget"
 
+  echo "Scenario 27 (ga-u04vp): presence-drift — plist LOADED (both compact + expanded plist styles) → no alert"
+  PDIR="$TMP/presence-src"; mkdir -p "$PDIR"
+  cat > "$PDIR/delta.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gascity.delta</string>
+</dict></plist>
+PLIST
+  cat > "$PDIR/epsilon.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.gascity.epsilon</string>
+</dict>
+</plist>
+PLIST
+  DPW_PRESENCE_DIRS="$PDIR"; DPW_TEST_LOADED="com.gascity.delta com.gascity.epsilon"
+  run_presence_drift_sweep && ok "both compact + expanded plist styles resolve + loaded → no alert" || bad "loaded presence-dir plists falsely alerted"
+
+  echo "Scenario 28 (ga-u04vp): presence-drift — one plist NOT loaded → alert names exactly that label"
+  : > "$LOG"; DPW_TEST_LOADED="com.gascity.epsilon"
+  run_presence_drift_sweep && bad "undeployed presence-dir plist should alert (return 1)" || ok "undeployed presence-dir plist alerts (return 1)"
+  grep -q "com.gascity.delta" "$LOG" && ok "alert names the undeployed label (delta)" || bad "alert missing the undeployed label"
+  grep -q "com.gascity.epsilon" "$LOG" && bad "alert wrongly mentions the still-loaded label (epsilon)" || ok "loaded label (epsilon) correctly absent from alert"
+
+  echo "Scenario 29 (ga-u04vp): presence-drift skips a label already in DPW_CRITICAL (no double-alert)"
+  : > "$LOG"; DPW_CRITICAL="com.gascity.delta"; DPW_TEST_LOADED="com.gascity.epsilon"
+  run_presence_drift_sweep && ok "DPW_CRITICAL label deferred to main loop, not double-alerted here (return 0)" || bad "presence-drift double-alerted a DPW_CRITICAL label"
+  DPW_CRITICAL="$ALL"
+
+  echo "Scenario 30 (ga-u04vp): DPW_PRESENCE_DRIFT_ENABLED=0 → sweep no-ops even with an undeployed plist"
+  : > "$LOG"; DPW_PRESENCE_DRIFT_ENABLED=0; DPW_TEST_LOADED="com.gascity.epsilon"
+  run_presence_drift_sweep && ok "disabled presence-drift sweep returns 0 even with undeployed plist (delta)" || bad "disabled presence-drift sweep should not alert"
+  DPW_PRESENCE_DRIFT_ENABLED=1
+
   echo ""
   echo "daemon-presence-watchdog selftest: PASS=$PASS FAIL=$FAIL"
   [ "$FAIL" -eq 0 ] && exit 0 || exit 1
@@ -1001,3 +1117,4 @@ fi
 
 run_sweep
 run_recycle_sweep
+run_presence_drift_sweep
