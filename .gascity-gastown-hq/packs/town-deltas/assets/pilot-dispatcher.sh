@@ -4910,6 +4910,24 @@ LIVESEC
           #     cognate after it). area:infra is an established label (5 live HQ beads at
           #     time of fix) already meaning exactly this. jq -e any(); fail-open.
           if [ "$_FW_EXEMPT" = "0" ] && echo "$STORY" | jq -e '(.labels // []) | any(. == "area:infra")' >/dev/null 2>&1; then _FW_EXEMPT=1; _FW_REASON="area-infra-label"; fi
+          # (e) ga-mhbyc: an explicit "digest" LABEL is a direct signal that this bead is
+          #     an archived activity report (mol-digest-generate's generate-and-send step
+          #     stamps every digest bead --label=digest,{{period}}), not a domain build.
+          #     A digest's own auto-generated "By Rig" table NAMES every product rig
+          #     (property_scrapers, whatsapp_automation) to report its filed/closed counts
+          #     — an INCIDENTAL mention, not the bead's subject. This defeats (a) twice
+          #     over: bead_content_rig's WA-INTEGRATION PRECEDENCE matches bare "whatsapp"
+          #     before bead_domain is ever consulted, AND bead_domain itself never reaches
+          #     its "infra" branch (checked LAST) because "scraper" ⊂ "property_scrapers"
+          #     is also an (earlier-checked) data-domain keyword — so a digest classifies
+          #     "data", never "infra". No cited file path (b) and no framework/area:infra
+          #     label (c/d) apply to a plain digest bead either (ga-j54v3: labels were only
+          #     ["daily","digest"]) — the ga-tgo7q/ga-evjs2 stall recurring in a 5th shape
+          #     (REFUSE+1h-hold, every sweep, on the ONLY buildable bead in queue). Unlike
+          #     area:infra, "digest" is not a discretionary human label — it is stamped by
+          #     the formula on every digest bead, daily and weekly, by construction. jq -e
+          #     any(); fail-open.
+          if [ "$_FW_EXEMPT" = "0" ] && echo "$STORY" | jq -e '(.labels // []) | any(. == "digest")' >/dev/null 2>&1; then _FW_EXEMPT=1; _FW_REASON="digest-label"; fi
           if [ "$_FW_EXEMPT" = "1" ]; then
             log "framework-dog-exempt: $STORY_ID is gascity-framework work ($_FW_REASON) but bead_content_rig mis-inferred rig=$_DOMAIN_RIG from an incidental keyword — the dog pool ($BUILDER_TARGET) IS its correct builder (HQ checkout, git-diff, gate access). Clearing product-rig inference so the domain-route guard FAILS OPEN (dispatch, not REFUSE+1h-hold). Disable with PILOT_FRAMEWORK_DOG_EXEMPT=0."
             _DOMAIN_RIG=""

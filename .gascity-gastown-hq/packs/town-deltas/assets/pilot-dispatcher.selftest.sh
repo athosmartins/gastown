@@ -5064,6 +5064,43 @@ else
   bad "ga-jazy9 3rd hold did not escalate as expected (log: $LOG_2N7XW_D)"
 fi
 
+# ── Scenario ga-mhbyc (2026-07-29): framework-dog-exempt reason (e) — digest label ─
+# ROOT (found investigating ga-7ti1t AC5, same live bead ga-j54v3): a digest bead's
+# OWN auto-generated "By Rig" table names EVERY rig (including property_scrapers/
+# whatsapp_automation) to report its filed/closed counts — an incidental mention,
+# not the bead's subject. This defeats bead_content_rig (bare "whatsapp" wins via
+# the WA-INTEGRATION PRECEDENCE check, before property_scrapers is ever checked)
+# AND independently defeats bead_domain's own "infra" allowlist: "scraper" ⊂
+# "property_scrapers" is ALSO a data-domain keyword, checked BEFORE infra, so a
+# digest naming property_scrapers classifies "data", never "infra" — reason (a)
+# never fires. No cited file path (b), no framework/area:infra label (c/d) either
+# (ga-j54v3's real labels were only ["daily","digest"]). Result: REFUSED to the
+# dog pool + stamped pilot:held EVERY sweep — the ga-tgo7q/ga-evjs2 stall
+# recurring in a 5th shape, on the digest itself (often the only queued bead).
+# Unlike area:infra, "digest" is not a discretionary human label — mol-digest-
+# generate's generate-and-send step stamps it on every digest bead by
+# construction (`gc bd create --label=digest,{{period}}`), daily and weekly.
+echo "Scenario ga-mhbyc-a: precondition — digest's own 'By Rig' table trips bead_content_rig (whatsapp) and bead_domain (data, not infra)"
+DIGEST_BEAD='{"id":"ga-digesttest","title":"Digest: 2026-07-27","priority":2,"issue_type":"task","description":"# Gas Town Daily Digest: 2026-07-27\n\n## By Rig\n| Rig | Filed | Closed | Merges | Notes |\n|-----|-------|--------|--------|-------|\n| gascity (HQ) | 163 | 5172 | 2 | HQ + framework |\n| property_scrapers | 0 | 0 | 0 | independent repo, quiet day |\n| whatsapp_automation | 4 | 22 | 0 | independent repo |\n","status":"open","labels":["daily","digest"],"assignee":null,"created_at":"2026-07-28T14:59:04Z","metadata":{}}'
+[ "$(_bcr "$DIGEST_BEAD")" = whatsapp_automation ] && ok "precondition: bead_content_rig mis-infers whatsapp_automation from the digest's own By-Rig table (incidental 'whatsapp' mention)" || bad "precondition changed: bead_content_rig='$(_bcr "$DIGEST_BEAD")'"
+[ "$(_dom "$DIGEST_BEAD")" != infra ] && ok "precondition: bead_domain does NOT classify the digest as infra (scraper⊂property_scrapers hits the EARLIER-checked data branch)" || bad "precondition changed: bead_domain='$(_dom "$DIGEST_BEAD")' — exemption (a) would already cover this"
+
+echo "Scenario ga-mhbyc-b: framework-dog-exempt reason (e) — digest label exempts, dispatches to dog pool"
+LOG_DIGEST="$(run_capacity 10 "[]" 1 "[$DIGEST_BEAD]")"
+B_DIGEST="$(dispatched_builder "$LOG_DIGEST")"
+echo "$B_DIGEST" | grep -qE '^gastown\.dog' && ok "digest-labeled bead dispatched to the dog pool (exemption (e) fired)" || bad "REGRESSION (ga-mhbyc): digest bead not dispatched (got: '${B_DIGEST:-none}')"
+echo "$LOG_DIGEST" | grep -q "framework-dog-exempt: ga-digesttest is gascity-framework work (digest-label)" && ok "exemption reason 'digest-label' logged" || bad "digest-label exemption not logged"
+
+echo "Scenario ga-mhbyc-c (control): SAME digest body WITHOUT the digest label → still refused+held (proves the label, not something else, is what saves it)"
+DIGEST_NOLABEL='{"id":"ga-digestctl","title":"Digest: 2026-07-27","priority":2,"issue_type":"task","description":"# Gas Town Daily Digest: 2026-07-27\n\n## By Rig\n| Rig | Filed | Closed | Merges | Notes |\n|-----|-------|--------|--------|-------|\n| gascity (HQ) | 163 | 5172 | 2 | HQ + framework |\n| property_scrapers | 0 | 0 | 0 | independent repo, quiet day |\n| whatsapp_automation | 4 | 22 | 0 | independent repo |\n","status":"open","labels":["daily"],"assignee":null,"created_at":"2026-07-28T14:59:05Z","metadata":{}}'
+LOG_DIGESTCTL="$(run_capacity 10 "[]" 1 "[$DIGEST_NOLABEL]")"
+echo "$LOG_DIGESTCTL" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-digestctl" \
+  && ok "control: without the digest label the same bead IS refused+held (proves exemption (e) — not some other accident — is what flips scenario ga-mhbyc-b)" \
+  || bad "control failed: bead without digest label was NOT refused (got builder='$(dispatched_builder "$LOG_DIGESTCTL")') — cannot attribute ga-mhbyc-b's pass to the label"
+
+echo "Scenario ga-mhbyc-d: drift-guard — digest-label exemption is wired into the live dispatcher"
+has "$DISPATCHER" 'digest-label'          "digest-label exemption reason is wired"
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
