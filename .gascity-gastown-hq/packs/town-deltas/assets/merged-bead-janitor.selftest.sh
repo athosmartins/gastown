@@ -28,7 +28,8 @@ JANITOR_LIB_ONLY=1 source "$JANITOR" \
   || { echo "FATAL: could not source janitor in lib-only mode"; exit 1; }
 for fn in janitor_decide janitor_story_decide token_bounded scan_commit_for_bead \
           scan_commit_subject_for_bead subject_impl_scopes_bead branch_merged content_in_main \
-          has_open_marker has_terminal_passed_marker branch_label_from_markers rig_gitdir \
+          has_open_marker has_terminal_passed_marker has_terminal_superseded_marker \
+          branch_label_from_markers rig_gitdir \
           janitor_branch_decide normalize_bead_status branch_is_fresh \
           bead_lookup_one resolve_bead_state \
           commit_epoch commit_evidence_stale comments_for_bead \
@@ -44,7 +45,7 @@ eq "commit signal → close"              "$(janitor_decide 0 0 1 0 0 | cut -d: 
 eq "marker signal → close"              "$(janitor_decide 0 0 0 1 0 | cut -d: -f1)" "close"
 eq "branch signal → close"              "$(janitor_decide 0 0 0 0 1 | cut -d: -f1)" "close"
 eq "commit reason"                      "$(janitor_decide 0 0 1 0 0)" "close:commit-in-origin-main"
-eq "marker reason"                      "$(janitor_decide 0 0 0 1 0)" "close:terminal-gate-marker-passed-or-superseded"
+eq "marker reason"                      "$(janitor_decide 0 0 0 1 0)" "close:terminal-gate-marker-passed"
 eq "branch reason"                      "$(janitor_decide 0 0 0 0 1)" "close:branch-ancestor-of-origin-main"
 # Guard precedence: epic ALWAYS keep, even with every signal set.
 eq "epic beats all signals → keep"      "$(janitor_decide 1 0 1 1 1 | cut -d: -f1)" "keep"
@@ -71,7 +72,7 @@ eq "6th arg omitted defaults to 0 (not stale) → commit still closes" \
 eq "stale commit alone → KEEP (the wa-d3136 false-close this fix prevents)" \
    "$(janitor_decide 0 0 1 0 0 1)" "keep:commit-evidence-superseded-by-newer-comment"
 eq "stale commit + marker also fires → marker still closes (signal B unaffected)" \
-   "$(janitor_decide 0 0 1 1 0 1)" "close:terminal-gate-marker-passed-or-superseded"
+   "$(janitor_decide 0 0 1 1 0 1)" "close:terminal-gate-marker-passed"
 eq "stale commit + branch also fires → branch still closes (signal C unaffected)" \
    "$(janitor_decide 0 0 1 0 1 1)" "close:branch-ancestor-of-origin-main"
 eq "stale=1 but no commit signal at all → falls through to no-merge-evidence" \
@@ -83,6 +84,29 @@ eq "epic beats stale commit → keep (epic reason, not stale reason)" \
    "$(janitor_decide 1 0 1 0 0 1)" "keep:epic-parent-never-autoclosed"
 eq "open-marker beats stale commit → keep (open-marker reason)" \
    "$(janitor_decide 0 1 1 0 0 1)" "keep:active-open-gate-marker"
+
+# ── 1a3. janitor_decide sig_marker_superseded — superseded ≠ merged (ga-v8ui5) ──
+# gate-status:superseded means the branch was REPLACED (rebase/recreate — the
+# documented procedure when the gate rejects a stale base) — the OPPOSITE of
+# passed. It must NEVER assert delivery by itself; only real merge evidence
+# (signal A commit-in-main, or signal C branch-ancestor — e.g. a REPLACEMENT
+# branch that genuinely merged) may close a bead with a superseded marker.
+echo "── 1a3. janitor_decide sig_marker_superseded (superseded ≠ merged, ga-v8ui5) ──"
+eq "backward-compat: 6 args, no 7th → unaffected (defaults to 0)" \
+   "$(janitor_decide 0 0 0 0 0 0)" "keep:no-merge-evidence"
+eq "superseded alone → KEEP with a distinguishable reason (the wa-c3qsr false-close this fix prevents)" \
+   "$(janitor_decide 0 0 0 0 0 0 1)" "keep:superseded-marker-needs-merge-evidence"
+eq "superseded + commit signal → commit still closes (replacement branch merged, verified by content)" \
+   "$(janitor_decide 0 0 1 0 0 0 1)" "close:commit-in-origin-main"
+eq "superseded + branch signal → branch still closes (replacement branch is an origin/main ancestor)" \
+   "$(janitor_decide 0 0 0 0 1 0 1)" "close:branch-ancestor-of-origin-main"
+eq "superseded + passed marker also present → passed still wins (signal B, distinct marker)" \
+   "$(janitor_decide 0 0 0 1 0 0 1)" "close:terminal-gate-marker-passed"
+# Guard precedence unchanged: epic/open-marker still beat a superseded-only marker too.
+eq "epic beats superseded-only → keep (epic reason, not superseded reason)" \
+   "$(janitor_decide 1 0 0 0 0 0 1)" "keep:epic-parent-never-autoclosed"
+eq "open-marker beats superseded-only → keep (open-marker reason)" \
+   "$(janitor_decide 0 1 0 0 0 0 1)" "keep:active-open-gate-marker"
 
 # ── 1b. janitor_story_decide — merged story:approved → story:done (ga-gosfs) ──
 # Args: <is_epic> <has_open_marker> <already_done> <in_flight> <has_builder>
@@ -96,7 +120,7 @@ eq "open-marker beats stale commit → keep (open-marker reason)" \
 echo "── 1b. janitor_story_decide (merged story → story:done) ──"
 # Happy paths: a merge signal + no active rework + not already done → done.
 eq "commit signal → done"               "$(janitor_story_decide 0 0 0 0 0 0 1 0 0)" "done:commit-in-origin-main"
-eq "marker signal → done"               "$(janitor_story_decide 0 0 0 0 0 0 0 1 0)" "done:terminal-gate-marker-passed-or-superseded"
+eq "marker signal → done"               "$(janitor_story_decide 0 0 0 0 0 0 0 1 0)" "done:terminal-gate-marker-passed"
 eq "branch signal → done"               "$(janitor_story_decide 0 0 0 0 0 0 0 0 1)" "done:branch-ancestor-of-origin-main"
 eq "any-signal verb is done"            "$(janitor_story_decide 0 0 0 0 0 0 1 0 0 | cut -d: -f1)" "done"
 # No merge evidence → keep (a genuinely-pending approved story is NOT touched: AC2).
@@ -118,7 +142,7 @@ eq "in-flight > builder"                "$(janitor_story_decide 0 0 0 1 1 0 0 0 
 eq "builder > delivery"                 "$(janitor_story_decide 0 0 0 0 1 1 0 0 0)" "keep:live-builder-assignee"
 # Signal precedence among the three (commit > marker > branch), cosmetic only.
 eq "commit beats marker+branch"         "$(janitor_story_decide 0 0 0 0 0 0 1 1 1)" "done:commit-in-origin-main"
-eq "marker beats branch"                "$(janitor_story_decide 0 0 0 0 0 0 0 1 1)" "done:terminal-gate-marker-passed-or-superseded"
+eq "marker beats branch"                "$(janitor_story_decide 0 0 0 0 0 0 0 1 1)" "done:terminal-gate-marker-passed"
 
 # ── 1b2. janitor_story_decide sig_commit_stale — same joint/split-bead guard (ga-2zp4h) ──
 # A story can be a joint/split bead too; the suppression mirrors janitor_decide exactly.
@@ -128,11 +152,31 @@ eq "backward-compat: 9 args, no 10th → commit still done" \
 eq "stale commit alone → KEEP (not forced to story:done)" \
    "$(janitor_story_decide 0 0 0 0 0 0 1 0 0 1)" "keep:commit-evidence-superseded-by-newer-comment"
 eq "stale commit + marker also fires → marker still drives done (signal B unaffected)" \
-   "$(janitor_story_decide 0 0 0 0 0 0 1 1 0 1)" "done:terminal-gate-marker-passed-or-superseded"
+   "$(janitor_story_decide 0 0 0 0 0 0 1 1 0 1)" "done:terminal-gate-marker-passed"
 eq "stale commit + branch also fires → branch still drives done (signal C unaffected)" \
    "$(janitor_story_decide 0 0 0 0 0 0 1 0 1 1)" "done:branch-ancestor-of-origin-main"
 eq "in-flight guard still beats a stale-flagged commit" \
    "$(janitor_story_decide 0 0 0 1 0 0 1 0 0 1)" "keep:story-in-flight-active-rework"
+
+# ── 1b3. janitor_story_decide sig_marker_superseded — superseded ≠ merged (ga-v8ui5) ──
+# Same parity as janitor_decide §1a3: a superseded marker alone must never drive
+# a story to story:done — only real merge evidence (commit or branch-ancestor,
+# e.g. a genuinely-merged REPLACEMENT branch) may.
+echo "── 1b3. janitor_story_decide sig_marker_superseded (superseded ≠ merged, ga-v8ui5) ──"
+eq "backward-compat: 9 args, no 10th/11th → unaffected" \
+   "$(janitor_story_decide 0 0 0 0 0 0 0 0 0)" "keep:no-merge-evidence"
+eq "superseded alone → KEEP with a distinguishable reason (not forced to story:done)" \
+   "$(janitor_story_decide 0 0 0 0 0 0 0 0 0 0 1)" "keep:superseded-marker-needs-merge-evidence"
+eq "superseded + commit signal → commit still drives done (replacement branch merged)" \
+   "$(janitor_story_decide 0 0 0 0 0 0 1 0 0 0 1)" "done:commit-in-origin-main"
+eq "superseded + branch signal → branch still drives done (replacement branch ancestor)" \
+   "$(janitor_story_decide 0 0 0 0 0 0 0 0 1 0 1)" "done:branch-ancestor-of-origin-main"
+eq "epic beats superseded-only → keep (epic reason)" \
+   "$(janitor_story_decide 1 0 0 0 0 0 0 0 0 0 1)" "keep:epic-parent-never-autoclosed"
+eq "already-done beats superseded-only → keep (idempotent, not re-driven by a stale marker)" \
+   "$(janitor_story_decide 0 0 1 0 0 0 0 0 0 0 1)" "keep:already-story-done"
+eq "in-flight beats superseded-only → keep (active rework not masked as done)" \
+   "$(janitor_story_decide 0 0 0 1 0 0 0 0 0 0 1)" "keep:story-in-flight-active-rework"
 
 # ── 1c. janitor_branch_decide — crew-branch prune (ga-tijv5 extension) ──────
 # Args: <ahead> <content_in_main> <bead_state> <live_worktree> <is_fresh>. A branch
@@ -347,10 +391,16 @@ rc1 has_open_marker "$M_PASSED"
 rc1 has_open_marker "$M_EMPTY"
 rc0 has_open_marker "$M_MIXED"                       # wa-ab6z shape: open ready + closed superseded → kept
 rc0 has_terminal_passed_marker "$M_PASSED"
-rc0 has_terminal_passed_marker "$M_SUPER"
+rc1 has_terminal_passed_marker "$M_SUPER"            # ga-v8ui5: superseded is NOT passed — the opposite (branch discarded)
 rc1 has_terminal_passed_marker "$M_FAILED"           # closed-FAILED is NOT merged → no close signal
 rc1 has_terminal_passed_marker "$M_OPEN"
 rc1 has_terminal_passed_marker "$M_EMPTY"
+# has_terminal_superseded_marker (ga-v8ui5) — distinguishable, NON-closing signal.
+rc0 has_terminal_superseded_marker "$M_SUPER"
+rc1 has_terminal_superseded_marker "$M_PASSED"
+rc1 has_terminal_superseded_marker "$M_FAILED"
+rc1 has_terminal_superseded_marker "$M_OPEN"
+rc1 has_terminal_superseded_marker "$M_EMPTY"
 eq "branch label extracted" "$(branch_label_from_markers "$M_OPEN")" "crew/mila/wa-lstd"
 eq "no branch label → empty" "$(branch_label_from_markers "$M_PASSED")" ""
 
@@ -391,8 +441,12 @@ grep -q 'epic-parent-never-autoclosed' "$JANITOR" && ok "epic guard present"    
 grep -q 'active-open-gate-marker' "$JANITOR"     && ok "open-marker guard present"               || bad "open-marker guard missing"
 grep -q 'label remove "$BID" "story:in-flight"' "$JANITOR" && ok "drops story:in-flight on close" || bad "story:in-flight removal missing"
 grep -q 'JANITOR_DRY_RUN' "$JANITOR"             && ok "dry-run supported"                       || bad "dry-run support missing"
-grep -q 'gate-status:passed' "$JANITOR" && grep -q 'gate-status:superseded' "$JANITOR" \
-  && ok "terminal signal checks passed+superseded" || bad "terminal marker labels missing"
+grep -q 'gate-status:passed' "$JANITOR"          && ok "terminal signal checks passed"           || bad "passed marker label missing"
+# ga-v8ui5: superseded must NOT be OR'd into has_terminal_passed_marker — it is the
+# opposite of passed (a discarded/replaced branch), not a merge signal. Assert the negative.
+grep -qF 'or . == "gate-status:superseded"' "$JANITOR" \
+  && bad "has_terminal_passed_marker still ORs in gate-status:superseded (ga-v8ui5 regression)" \
+  || ok "has_terminal_passed_marker no longer treats superseded as passed"
 # Branch-prune extension (ga-tijv5, 2026-07-01) — wired, conservative, and STAGED (off by default).
 grep -q 'janitor_branch_decide()' "$JANITOR"     && ok "defines janitor_branch_decide"           || bad "missing janitor_branch_decide def"
 grep -q 'PRUNE_BRANCHES="${JANITOR_PRUNE_BRANCHES:-0}"' "$JANITOR" && ok "branch-prune is OPT-IN, default OFF (staged)" || bad "branch-prune not default-off"
@@ -808,6 +862,48 @@ grep -qF 'F_VERDICT="close"' "$JANITOR" && grep -qF 'F_REASON="sling-bead-eviden
 grep -qF '[ -n "$F_SLING_EVID" ] && F_EVID="$F_EVID $F_SLING_EVID"' "$JANITOR" \
   && ok "sling evidence is surfaced in the close comment/log line" \
   || bad "sling evidence not appended to F_EVID"
+
+# ── 12. Drift-guard: ga-v8ui5 superseded is NOT a merge signal ──────────────
+# gate-status:superseded means the branch was REPLACED (rebase/recreate — the
+# documented procedure when the gate rejects a stale base) — the OPPOSITE of
+# passed. Treating it as terminal-delivered on the marker signal ALONE let the
+# janitor assert delivery for discarded work (wa-c3qsr: closed "work merged to
+# origin/main" while the code was NOT in origin/main — 0 content hits, branch
+# not an ancestor, the page still 404). Must be wired into ALL THREE call
+# sites, exactly like the ga-2zp4h stale-comment guard above — missing even
+# one leaves that bucket vulnerable to the same false-close.
+echo "── 12. Drift-guard: ga-v8ui5 superseded-not-merged ──"
+grep -q 'has_terminal_superseded_marker()' "$JANITOR" \
+  && ok "defines has_terminal_superseded_marker (distinguishable, non-closing signal)" \
+  || bad "missing has_terminal_superseded_marker def"
+grep -qF 'sig_marker_superseded="${7:-0}"' "$JANITOR" \
+  && ok "janitor_decide accepts optional sig_marker_superseded (backward-compatible default)" \
+  || bad "janitor_decide missing sig_marker_superseded param"
+grep -qF 'sig_marker_superseded="${11:-0}"' "$JANITOR" \
+  && ok "janitor_story_decide accepts optional sig_marker_superseded (backward-compatible default)" \
+  || bad "janitor_story_decide missing sig_marker_superseded param"
+grep -qF 'keep:superseded-marker-needs-merge-evidence' "$JANITOR" \
+  && ok "superseded-only keep reason is distinguishable from generic no-merge-evidence" \
+  || bad "superseded-marker-needs-merge-evidence reason missing"
+# All THREE call sites must compute the signal AND thread it into the decision fns.
+grep -qF 'SIG_MK_SUPER=0; has_terminal_superseded_marker "$MK" && SIG_MK_SUPER=1' "$JANITOR" \
+  && ok "in_progress sweep computes SIG_MK_SUPER from has_terminal_superseded_marker" \
+  || bad "in_progress sweep not computing SIG_MK_SUPER"
+grep -qF 'F_SIGMK_SUPER=0; has_terminal_superseded_marker "$FMK" && F_SIGMK_SUPER=1' "$JANITOR" \
+  && ok "ga-hcj4 stranded-wrapper sweep computes F_SIGMK_SUPER" \
+  || bad "ga-hcj4 sweep not computing F_SIGMK_SUPER"
+grep -qF 'S_SIGMK_SUPER=0; has_terminal_superseded_marker "$SMK" && S_SIGMK_SUPER=1' "$JANITOR" \
+  && ok "story sweep computes S_SIGMK_SUPER" \
+  || bad "story sweep not computing S_SIGMK_SUPER"
+grep -qF 'janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE" "$SIG_MK_SUPER"' "$JANITOR" \
+  && ok "in_progress sweep threads sig_marker_superseded into janitor_decide" \
+  || bad "in_progress sweep not threading sig_marker_superseded"
+grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER"' "$JANITOR" \
+  && ok "ga-hcj4 stranded-wrapper sweep threads sig_marker_superseded into janitor_decide" \
+  || bad "ga-hcj4 sweep not threading sig_marker_superseded"
+grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER"' "$JANITOR" \
+  && ok "story sweep threads sig_marker_superseded into janitor_story_decide" \
+  || bad "story sweep not threading sig_marker_superseded"
 
 echo ""
 echo "──────────────────────────────────────────"

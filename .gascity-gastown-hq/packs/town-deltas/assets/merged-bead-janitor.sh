@@ -148,14 +148,18 @@ notify_athos() {
 # ═════════════════════════════════════════════════════════════════════════════
 janitor_decide() {
   local is_epic="$1" has_open_marker="$2" sig_commit="$3" sig_marker="$4" sig_branch="$5" \
-        sig_commit_stale="${6:-0}"
+        sig_commit_stale="${6:-0}" sig_marker_superseded="${7:-0}"
   if [ "$is_epic" = "1" ]; then            echo "keep:epic-parent-never-autoclosed"; return 0; fi
   if [ "$has_open_marker" = "1" ]; then    echo "keep:active-open-gate-marker"; return 0; fi
   if [ "$sig_commit" = "1" ] && [ "$sig_commit_stale" != "1" ]; then
                                             echo "close:commit-in-origin-main"; return 0; fi
-  if [ "$sig_marker" = "1" ]; then         echo "close:terminal-gate-marker-passed-or-superseded"; return 0; fi
+  if [ "$sig_marker" = "1" ]; then         echo "close:terminal-gate-marker-passed"; return 0; fi
   if [ "$sig_branch" = "1" ]; then         echo "close:branch-ancestor-of-origin-main"; return 0; fi
   if [ "$sig_commit" = "1" ]; then         echo "keep:commit-evidence-superseded-by-newer-comment"; return 0; fi
+  # ga-v8ui5: superseded reaches here ONLY after every real merge signal missed — say so
+  # out loud instead of collapsing into the generic "no-merge-evidence".
+  if [ "$sig_marker_superseded" = "1" ]; then
+                                            echo "keep:superseded-marker-needs-merge-evidence"; return 0; fi
   echo "keep:no-merge-evidence"
 }
 
@@ -203,7 +207,7 @@ janitor_decide() {
 janitor_story_decide() {
   local is_epic="$1" has_open_marker="$2" already_done="$3" in_flight="$4" \
         has_builder="$5" delivery_active="$6" sig_commit="$7" sig_marker="$8" sig_branch="$9" \
-        sig_commit_stale="${10:-0}"
+        sig_commit_stale="${10:-0}" sig_marker_superseded="${11:-0}"
   # — Guards (keep) — first match wins (each returns) —
   # SECURITY (sibling-path parity, ga-v3o6i sweep): ACTIVE-WORK guards MUST precede
   # already_done. A bead can carry a stale story:done label AND be re-opened (open
@@ -219,9 +223,12 @@ janitor_story_decide() {
   # — Merge evidence (done) — same triangulation as janitor_decide —
   if [ "$sig_commit" = "1" ] && [ "$sig_commit_stale" != "1" ]; then
                                    echo "done:commit-in-origin-main"; return 0; fi
-  if [ "$sig_marker" = "1" ];      then echo "done:terminal-gate-marker-passed-or-superseded"; return 0; fi
+  if [ "$sig_marker" = "1" ];      then echo "done:terminal-gate-marker-passed"; return 0; fi
   if [ "$sig_branch" = "1" ];      then echo "done:branch-ancestor-of-origin-main"; return 0; fi
   if [ "$sig_commit" = "1" ];      then echo "keep:commit-evidence-superseded-by-newer-comment"; return 0; fi
+  # ga-v8ui5 — same parity as janitor_decide: a superseded marker never marks a story done.
+  if [ "$sig_marker_superseded" = "1" ]; then
+                                   echo "keep:superseded-marker-needs-merge-evidence"; return 0; fi
   echo "keep:no-merge-evidence"
 }
 
@@ -570,12 +577,41 @@ has_open_marker() {
 }
 
 # has_terminal_passed_marker <markers_json> — rc0 iff any CLOSED marker carries
-# a gate-status:passed or gate-status:superseded label.
+# a gate-status:passed label.
+#
+# ga-v8ui5 (2026-07-27): `gate-status:superseded` USED to count here, as if it were a
+# synonym of passed. It is the OPPOSITE. `superseded` means the branch was REPLACED
+# (rebased/recreated — the DOCUMENTED procedure when the gate rejects a stale base), so
+# it is precisely the marker that will NEVER merge. Lumping them made the janitor assert
+# delivery for discarded work: wa-c3qsr was closed with "work merged to origin/main" while
+# its code was NOT in origin/main (0 hits by content, branch not an ancestor, the page
+# still 404). Worse, the chain compounds — the next gate-run then correctly refuses to
+# merge "onto an already-terminal bead", so reviewed+approved work is orphaned behind a
+# trail that says it shipped.
+#
+# A superseded marker is now handled by has_terminal_superseded_marker, which closes
+# NOTHING on its own: the work only counts as delivered through real merge evidence
+# (signal A commit-in-origin-main, or signal C branch-ancestor-of-origin-main). That
+# preserves the legitimate healing path — a replacement branch that genuinely merged
+# still trips A or C — while removing the label's power to assert a merge by itself.
 has_terminal_passed_marker() {
   printf '%s' "$1" | jq -e '
     any(.[];
       (.status // "") == "closed"
-      and ((.labels // []) | any(. == "gate-status:passed" or . == "gate-status:superseded")))' \
+      and ((.labels // []) | any(. == "gate-status:passed")))' \
+    >/dev/null 2>&1
+}
+
+# has_terminal_superseded_marker <markers_json> — rc0 iff any CLOSED marker carries a
+# gate-status:superseded label. NOT a merge signal (see above) — it exists so the sweeps
+# can emit a DISTINGUISHABLE keep-reason instead of silently falling through to
+# "no-merge-evidence". The whole ga-v8ui5 incident was invisible; this makes the case
+# observable in the log without giving it any closing power.
+has_terminal_superseded_marker() {
+  printf '%s' "$1" | jq -e '
+    any(.[];
+      (.status // "") == "closed"
+      and ((.labels // []) | any(. == "gate-status:superseded")))' \
     >/dev/null 2>&1
 }
 
@@ -849,6 +885,7 @@ while IFS= read -r rig; do
     MK=$(markers_for_bead "$BID")
     HAS_OPEN=0; has_open_marker "$MK" && HAS_OPEN=1
     SIG_MARKER=0; has_terminal_passed_marker "$MK" && SIG_MARKER=1
+    SIG_MK_SUPER=0; has_terminal_superseded_marker "$MK" && SIG_MK_SUPER=1   # ga-v8ui5: NOT a merge signal
 
     # Signal A — commit whose SUBJECT SCOPE is this bead id, in the bead's OWN rig repo.
     # Uses the STRICT subject-scope scanner: only a conventional-commit whose SCOPE (the
@@ -919,7 +956,7 @@ EOF
       done
     fi
 
-    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE")
+    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE" "$SIG_MK_SUPER")
     VERDICT="${VERDICT_LINE%%:*}"; REASON="${VERDICT_LINE#*:}"
 
     if [ "$VERDICT" = "close" ]; then
@@ -994,6 +1031,7 @@ EOF
     FMK=$(markers_for_bead "$FID")
     F_HASOPEN=0; has_open_marker "$FMK" && F_HASOPEN=1
     F_SIGMARKER=0; has_terminal_passed_marker "$FMK" && F_SIGMARKER=1
+    F_SIGMK_SUPER=0; has_terminal_superseded_marker "$FMK" && F_SIGMK_SUPER=1   # ga-v8ui5
 
     # Signal A — same strict subject-scope commit scan + rig/HQ repo-scoping as
     # the in_progress sweep above.
@@ -1039,7 +1077,7 @@ EOF
       done
     fi
 
-    F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE")
+    F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER")
     F_VERDICT="${F_VERDICT_LINE%%:*}"; F_REASON="${F_VERDICT_LINE#*:}"
 
     # ga-vokwv: sling-bead-name fallback. FID's OWN id carried no merge
@@ -1137,6 +1175,7 @@ EOF
     SMK=$(markers_for_bead "$SID")
     S_OPENMK=0;  has_open_marker "$SMK"           && S_OPENMK=1
     S_SIGMK=0;   has_terminal_passed_marker "$SMK" && S_SIGMK=1
+    S_SIGMK_SUPER=0; has_terminal_superseded_marker "$SMK" && S_SIGMK_SUPER=1   # ga-v8ui5
 
     # Only pay for the git scans when no cheap guard already forces keep.
     S_SIGCOMMIT=0; S_SIGBRANCH=0; S_COMMIT_EVID=""; S_BRANCH_EVID=""; S_SIGCOMMIT_STALE=0
@@ -1186,7 +1225,7 @@ EOF
     fi
 
     S_VERDICT_LINE=$(janitor_story_decide "$S_EPIC" "$S_OPENMK" "$S_DONE" "$S_INFLIGHT" \
-                       "$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE")
+                       "$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER")
     S_VERDICT="${S_VERDICT_LINE%%:*}"; S_REASON="${S_VERDICT_LINE#*:}"
 
     if [ "$S_VERDICT" = "done" ]; then
