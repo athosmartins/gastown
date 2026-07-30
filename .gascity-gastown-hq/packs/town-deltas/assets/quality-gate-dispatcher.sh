@@ -1707,8 +1707,28 @@ gate_rebase_attempt_advanced() {
   fi
 }
 
-# read_rebase_attempt <marker_id> — fetch the current highest
-# gate:exiled-tier5:N label value from the marker (0 if none present).
+# gate_should_exile_tier5 <next_attempt> <exile_after_n> — pure (no I/O).
+# ga-g0v96 (AC4): stamping gate:exiled-tier5 on the VERY FIRST transient
+# rebase failure sank the marker behind the ENTIRE healthy queue before its
+# own just-promised "retry 1/3" had a chance to run on a busy gate — the
+# exile and the retry budget it accompanies directly contradicted each other
+# (observed: 4h44m between attempt 1 and attempt 2, wa-b6uy3 — the exile, not
+# headroom, was the binding constraint). Forgive a single blip: only a
+# REPEATED failure (this attempt >= exile_after_n) is treated as strong
+# enough evidence to deprioritize the marker behind healthy ones.
+gate_should_exile_tier5() {
+  local next_attempt="${1:-1}" exile_after_n="${2:-2}"
+  case "$next_attempt"  in ''|*[!0-9]*) next_attempt=1 ;; esac
+  case "$exile_after_n" in ''|*[!0-9]*) exile_after_n=2 ;; esac
+  if [ "$next_attempt" -ge "$exile_after_n" ]; then
+    printf '1'
+  else
+    printf '0'
+  fi
+}
+
+# read_rebase_attempt <marker_id> — fetch the current highest attempt-counter
+# value recorded on the marker (0 if none present).
 # ga-gpcx: this label was named gate:rebase-attempt:N until 2026-07-17. The old
 # name read as an innocuous retry counter — an author manually re-arming a
 # marker (flipping gate-status back to queued) saw it and reasonably assumed it
@@ -1719,6 +1739,11 @@ gate_rebase_attempt_advanced() {
 # at deploy time stays correctly recognized as exiled — silently releasing it
 # into the healthy tier would reintroduce the exact ga-q3ig2 outage class this
 # tier exists to prevent. All WRITES use the new name exclusively.
+# ga-g0v96 (AC4): also matches gate:rebase-fail-count:N — the counter written
+# on EVERY transient failure regardless of whether it also exiles to tier5
+# (see gate_should_exile_tier5 above). Without this, an attempt-1 failure
+# (which no longer writes gate:exiled-tier5 by itself) would read back as
+# attempt=0 forever and the counter could never advance past "1/3".
 # Single source of truth for both the per-sweep initial read and the ga-6dp9
 # post-write verification below, so they can never drift into two different
 # parsers of the same label convention.
@@ -1726,7 +1751,7 @@ read_rebase_attempt() {
   local marker_id="${1:-}" n
   n=$(bd -C "$GC_CITY" show "$marker_id" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null \
-    | sed -nE 's/^gate:(rebase-attempt|exiled-tier5):([0-9]+)$/\2/p' | sort -rn | head -1 || true)
+    | sed -nE 's/^gate:(rebase-attempt|exiled-tier5|rebase-fail-count):([0-9]+)$/\2/p' | sort -rn | head -1 || true)
   [ -z "$n" ] && n=0
   printf '%s' "$n"
 }
@@ -5154,6 +5179,11 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     log "  Auto-rebase: no conflicts detected (ahead=${REBASE_AHEAD:-?} behind=${REBASE_BEHIND:-?}) — rebasing $BRANCH onto $MAIN_HEAD_SHA ..."
     AUTO_REBASE_OK=0
     TMP_REBASE_WT="/tmp/gc-gate-autorebase-$$"
+    # ga-g0v96 (AC3): captured push stderr/exit-code, if the push below fails.
+    # Empty means "no push was attempted or none failed" — never confuse with a
+    # captured-but-empty stderr (AUTO_REBASE_PUSH_RC is the actual failure signal).
+    AUTO_REBASE_PUSH_ERR=""
+    AUTO_REBASE_PUSH_RC=""
 
     # imp18: Acquire per-repo mutation mutex before any git worktree/rebase/push ops.
     # If a live holder exists, treat as transient (next sweep retries; mutex + janitor
@@ -5179,22 +5209,34 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
         git -C "$TMP_REBASE_WT" config user.name "Gate Dispatcher" 2>/dev/null || true
         if git -C "$TMP_REBASE_WT" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
           NEW_TIP=$(git -C "$TMP_REBASE_WT" rev-parse HEAD 2>/dev/null || echo "")
-          if [ -n "$NEW_TIP" ] && git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
-            AUTO_REBASE_OK=1
-            BRANCH_SHA="$NEW_TIP"
-            log "  Auto-rebase success: $BRANCH pushed to $NEW_TIP (rebased onto $MAIN_HEAD_SHA)"
-            bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher auto-rebased $BRANCH onto main ($MAIN_HEAD_SHA). New tip: $NEW_TIP. Proceeding with review." 2>/dev/null || true
-            # Re-verify stale check passes now
-            git_rig fetch origin 2>/dev/null || true
-            BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH"); [ -z "$BRANCH_SHA" ] && BRANCH_SHA="$NEW_TIP"
-            if git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null; then
-              BRANCH_IS_CURRENT=1
-            else
-              warn "  Post-auto-rebase stale check still fails — falling through to bounce."
-              AUTO_REBASE_OK=0
-            fi
+          if [ -z "$NEW_TIP" ]; then
+            warn "  Auto-rebase: rev-parse HEAD after rebase returned empty for $BRANCH — treating as push failure"
+            AUTO_REBASE_PUSH_ERR="rev-parse HEAD after rebase returned empty (rebase produced no commit?)"
           else
-            warn "  Auto-rebase push failed for $BRANCH"
+            # ga-g0v96 (AC3): capture stderr + exit code instead of discarding both —
+            # "Auto-rebase push failed" with zero diagnostics was the exact
+            # error==empty defect this bead exists to fix.
+            _PUSH_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-push.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-push.$$")
+            if git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>"$_PUSH_ERR_FILE"; then
+              AUTO_REBASE_OK=1
+              BRANCH_SHA="$NEW_TIP"
+              log "  Auto-rebase success: $BRANCH pushed to $NEW_TIP (rebased onto $MAIN_HEAD_SHA)"
+              bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher auto-rebased $BRANCH onto main ($MAIN_HEAD_SHA). New tip: $NEW_TIP. Proceeding with review." 2>/dev/null || true
+              # Re-verify stale check passes now
+              git_rig fetch origin 2>/dev/null || true
+              BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH"); [ -z "$BRANCH_SHA" ] && BRANCH_SHA="$NEW_TIP"
+              if git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null; then
+                BRANCH_IS_CURRENT=1
+              else
+                warn "  Post-auto-rebase stale check still fails — falling through to bounce."
+                AUTO_REBASE_OK=0
+              fi
+            else
+              AUTO_REBASE_PUSH_RC=$?
+              AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+              warn "  Auto-rebase push failed for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
+            fi
+            rm -f "$_PUSH_ERR_FILE" 2>/dev/null || true
           fi
         else
           warn "  Auto-rebase git rebase command failed (unexpected — merge-tree reported no conflicts)"
@@ -5211,21 +5253,31 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
         git -C "$TMP_REBASE_WT" config user.name "Gate Dispatcher" 2>/dev/null || true
         if git -C "$TMP_REBASE_WT" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
           NEW_TIP=$(git -C "$TMP_REBASE_WT" rev-parse HEAD 2>/dev/null || echo "")
-          if [ -n "$NEW_TIP" ] && git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
-            AUTO_REBASE_OK=1
-            BRANCH_SHA="$NEW_TIP"
-            log "  Auto-rebase success (self-repo): $BRANCH pushed to $NEW_TIP"
-            bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher auto-rebased $BRANCH onto main ($MAIN_HEAD_SHA). New tip: $NEW_TIP. Proceeding with review." 2>/dev/null || true
-            git_rig fetch origin 2>/dev/null || true
-            BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH"); [ -z "$BRANCH_SHA" ] && BRANCH_SHA="$NEW_TIP"
-            if git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null; then
-              BRANCH_IS_CURRENT=1
-            else
-              warn "  Post-auto-rebase stale check still fails — falling through to bounce."
-              AUTO_REBASE_OK=0
-            fi
+          if [ -z "$NEW_TIP" ]; then
+            warn "  Auto-rebase (self-repo): rev-parse HEAD after rebase returned empty for $BRANCH — treating as push failure"
+            AUTO_REBASE_PUSH_ERR="rev-parse HEAD after rebase returned empty (rebase produced no commit?)"
           else
-            warn "  Auto-rebase push failed (self-repo) for $BRANCH"
+            # ga-g0v96 (AC3): capture stderr + exit code instead of discarding both.
+            _PUSH_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gc-gate-autorebase-push.XXXXXX" 2>/dev/null || echo "/tmp/gc-gate-autorebase-push.$$")
+            if git -C "$TMP_REBASE_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>"$_PUSH_ERR_FILE"; then
+              AUTO_REBASE_OK=1
+              BRANCH_SHA="$NEW_TIP"
+              log "  Auto-rebase success (self-repo): $BRANCH pushed to $NEW_TIP"
+              bd -C "$GC_CITY" comment "$MARKER_ID" "Gate dispatcher auto-rebased $BRANCH onto main ($MAIN_HEAD_SHA). New tip: $NEW_TIP. Proceeding with review." 2>/dev/null || true
+              git_rig fetch origin 2>/dev/null || true
+              BRANCH_SHA=$(rig_resolve_commit "origin/$BRANCH"); [ -z "$BRANCH_SHA" ] && BRANCH_SHA="$NEW_TIP"
+              if git_rig merge-base --is-ancestor "origin/$DEFAULT_BRANCH" "origin/$BRANCH" 2>/dev/null; then
+                BRANCH_IS_CURRENT=1
+              else
+                warn "  Post-auto-rebase stale check still fails — falling through to bounce."
+                AUTO_REBASE_OK=0
+              fi
+            else
+              AUTO_REBASE_PUSH_RC=$?
+              AUTO_REBASE_PUSH_ERR=$(tr '\n' ' ' < "$_PUSH_ERR_FILE" 2>/dev/null | cut -c1-500)
+              warn "  Auto-rebase push failed (self-repo) for $BRANCH (exit=$AUTO_REBASE_PUSH_RC): ${AUTO_REBASE_PUSH_ERR:-<no stderr captured>}"
+            fi
+            rm -f "$_PUSH_ERR_FILE" 2>/dev/null || true
           fi
         else
           warn "  Auto-rebase git rebase failed (self-repo)"
@@ -5241,12 +5293,25 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
 
     if [ "$AUTO_REBASE_OK" = "1" ] && [ "$BRANCH_IS_CURRENT" = "1" ]; then
       log "  Auto-rebase complete — branch is now current. Continuing with review."
+      # ga-g0v96 (AC5): any retry saga for this marker is over now — clear the
+      # informational retry label from the SOURCE bead so it doesn't linger
+      # once the branch recovers on a later sweep.
+      _PRIOR_ATTEMPT=$(read_rebase_attempt "$MARKER_ID")
+      if [ -n "$BEAD_ID" ] && [ "$_PRIOR_ATTEMPT" != "0" ]; then
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:rebase-retry:$_PRIOR_ATTEMPT" -q 2>/dev/null || true
+      fi
       # Fall through to Step 5 with updated BRANCH_SHA
     else
-      # Auto-rebase failed despite no conflicts (worktree/push failure)
+      # Auto-rebase failed despite no conflicts (worktree/push failure).
+      # ga-g0v96 (AC3): surface the CAPTURED diagnostic when we have one, instead
+      # of the old zero-information "worktree/push error" string.
       HAS_CONFLICT=1
       CONFLICT_KIND="transient"   # ga-q3ig2: plumbing failure, not a real conflict — retry is worthwhile.
-      CONFLICT_FILES="auto-rebase failed (worktree/push error)"
+      if [ -n "$AUTO_REBASE_PUSH_ERR" ]; then
+        CONFLICT_FILES="auto-rebase push failed (exit=${AUTO_REBASE_PUSH_RC:-?}): $AUTO_REBASE_PUSH_ERR"
+      else
+        CONFLICT_FILES="auto-rebase failed (worktree/push error) — no stderr captured"
+      fi
     fi
   fi
 
@@ -5265,6 +5330,14 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     #      MAX → escalate to the Mayor via mail (durable) and mark needs-rebase, so
     #      a human-or-Mayor-driven resolution happens — but we NEVER silently strand.
     MAX_REBASE_ATTEMPTS=3
+    # ga-g0v96 (AC4): a marker used to sink to tier5 (behind EVERY healthy queued
+    # marker) on the VERY FIRST transient rebase failure — the same step that
+    # stamped "retry 1/3" also stamped the exile, so on a busy gate the marker's
+    # own retry budget starved behind the healthy queue for hours (observed: 4h44m
+    # between attempt 1 and attempt 2, wa-b6uy3). Forgive a single blip: only a
+    # REPEATED transient failure (this attempt >= threshold) sinks the marker.
+    # GATE_EXILE_AFTER_ATTEMPTS=1 restores the old always-exile behavior.
+    GATE_EXILE_AFTER_ATTEMPTS="${GATE_EXILE_AFTER_ATTEMPTS:-2}"
 
     # ga-6dp9 (bug 1 of 3): compute the branch-author candidate for THIS
     # liveness check specifically — see resolve_rebase_author() above. Does
@@ -5501,12 +5574,27 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
       # their branch is already fine, and silently drop it from the queue if they
       # don't (the catch-22 this bead fixes).
       NEXT_ATTEMPT=$((REBASE_ATTEMPT + 1))
-      # ga-gpcx: remove both the current (exiled-tier5) and legacy (rebase-attempt)
-      # names defensively — a marker exiled before the 2026-07-17 rename may still
-      # carry the old name — then write ONLY the new, self-describing name.
-      bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:exiled-tier5:$REBASE_ATTEMPT"  -q 2>/dev/null || true
-      bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:rebase-attempt:$REBASE_ATTEMPT" -q 2>/dev/null || true
-      bd -C "$GC_CITY" label add    "$MARKER_ID" "gate:exiled-tier5:$NEXT_ATTEMPT"    -q 2>/dev/null || true
+      # ga-g0v96 (AC4): the attempt COUNTER now lives in gate:rebase-fail-count,
+      # written on every transient failure; gate:exiled-tier5 (the tier-sinking
+      # label) is only added once gate_should_exile_tier5 says the failure has
+      # REPEATED — a single blip no longer costs queue position. ga-gpcx: still
+      # remove the legacy/current tier5 names defensively (a marker exiled before
+      # the 2026-07-17 rename may still carry the old one).
+      bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:exiled-tier5:$REBASE_ATTEMPT"     -q 2>/dev/null || true
+      bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:rebase-attempt:$REBASE_ATTEMPT"    -q 2>/dev/null || true
+      bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:rebase-fail-count:$REBASE_ATTEMPT" -q 2>/dev/null || true
+      bd -C "$GC_CITY" label add    "$MARKER_ID" "gate:rebase-fail-count:$NEXT_ATTEMPT"   -q 2>/dev/null || true
+      _EXILE_THIS_ATTEMPT=$(gate_should_exile_tier5 "$NEXT_ATTEMPT" "$GATE_EXILE_AFTER_ATTEMPTS")
+      if [ "$_EXILE_THIS_ATTEMPT" = "1" ]; then
+        bd -C "$GC_CITY" label add "$MARKER_ID" "gate:exiled-tier5:$NEXT_ATTEMPT" -q 2>/dev/null || true
+      fi
+      # ga-g0v96 (AC5): mirror the retry state onto the SOURCE bead too — this
+      # state used to live ONLY as a label on the marker, and neither the
+      # reporter nor the author ever saw it there.
+      if [ -n "$BEAD_ID" ]; then
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:rebase-retry:$REBASE_ATTEMPT" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:rebase-retry:$NEXT_ATTEMPT"   -q 2>/dev/null || true
+      fi
       # ga-6dp9 (bug 3 of 3): the label add above is fire-and-forget — verify it
       # actually stuck instead of trusting it. A write that silently failed would
       # otherwise re-derive REBASE_ATTEMPT=0 next sweep and replay "attempt 1/3"
@@ -5514,13 +5602,30 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
       # construction, so treat it exactly like retries-exhausted: force the
       # escalation branch below instead of re-queueing again.
       if [ "$(gate_rebase_attempt_advanced "$NEXT_ATTEMPT" "$(read_rebase_attempt "$MARKER_ID")")" = "stuck" ]; then
-        warn "Branch $BRANCH: gate:exiled-tier5 label write did not take effect (intended $NEXT_ATTEMPT) — forcing escalation to avoid an infinite attempt-1/3 loop."
+        warn "Branch $BRANCH: gate:rebase-fail-count label write did not take effect (intended $NEXT_ATTEMPT) — forcing escalation to avoid an infinite attempt-1/3 loop."
         NEXT_ATTEMPT="$MAX_REBASE_ATTEMPTS"
       fi
+      # ga-g0v96 (AC3): present the CAPTURED push diagnostic, and mark the
+      # mechanism as a HYPOTHESIS rather than an established cause — mila-wa
+      # proved the old "likely rebase-while-queued race, author may have
+      # force-pushed" text asserted a mechanism that was chronologically
+      # IMPOSSIBLE in the real incident this bead reports (push failed 2h before
+      # the cited force-push could have happened).
+      if [ -n "$AUTO_REBASE_PUSH_ERR" ]; then
+        _PUSH_DIAG="push failed (exit=${AUTO_REBASE_PUSH_RC:-?}): $AUTO_REBASE_PUSH_ERR — cause not otherwise confirmed"
+      else
+        _PUSH_DIAG="push failed; cause not captured"
+      fi
       if [ "$NEXT_ATTEMPT" -lt "$MAX_REBASE_ATTEMPTS" ]; then
-        warn "Branch $BRANCH: transient auto-rebase-fail (author $REBASE_AUTHOR live; likely rebase-while-queued race — attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — gate-status:queued for server-side retry."
+        if [ "$_EXILE_THIS_ATTEMPT" = "1" ]; then
+          warn "Branch $BRANCH: transient auto-rebase-fail (author $REBASE_AUTHOR live; attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, exiled to tier5) — gate-status:queued for server-side retry."
+          _TIER5_NOTE=" Carries gate:exiled-tier5:$NEXT_ATTEMPT so it sinks behind healthy markers (ga-q3ig2) — remove this label to re-anchor and rejoin the healthy queue."
+        else
+          warn "Branch $BRANCH: transient auto-rebase-fail (author $REBASE_AUTHOR live; attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, still in the healthy queue) — gate-status:queued for server-side retry."
+          _TIER5_NOTE=""
+        fi
         bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:queued" -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS (gt-4tk5m): branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) — likely a rebase-while-queued race (author $REBASE_AUTHOR may have force-pushed while this marker was queued). Re-queued for next sweep; no /gate-done re-run needed. Carries gate:exiled-tier5:$NEXT_ATTEMPT so it sinks behind healthy markers (ga-q3ig2) — remove this label to re-anchor and rejoin the healthy queue." 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS (gt-4tk5m): branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) — $_PUSH_DIAG. Re-queued for next sweep; no /gate-done re-run needed.${_TIER5_NOTE}" 2>/dev/null || true
         # ga-6dp9 (gate-fix-2): same notify-identity fix as the bounce branches
         # above — REBASE_AUTHOR is this branch's own verified-alive identity.
         gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
@@ -5531,7 +5636,10 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
       else
         err "Branch $BRANCH: transient auto-rebase failure persists after $MAX_REBASE_ATTEMPTS attempts even with live author $REBASE_AUTHOR — escalating."
         bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED (gt-4tk5m): branch $BRANCH hit persistent transient auto-rebase failures ($MAX_REBASE_ATTEMPTS attempts) despite live author $REBASE_AUTHOR. Possible stuck push race or corrupt ref. Parked at needs-rebase for human/Mayor resolution." 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED (gt-4tk5m): branch $BRANCH hit persistent transient auto-rebase failures ($MAX_REBASE_ATTEMPTS attempts) despite live author $REBASE_AUTHOR. Last attempt: $_PUSH_DIAG. Parked at needs-rebase for human/Mayor resolution." 2>/dev/null || true
+        # ga-g0v96 (AC5): the retry saga is now terminal (bounced) — drop the
+        # informational label from the source bead so it doesn't linger.
+        [ -n "$BEAD_ID" ] && bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:rebase-retry:$NEXT_ATTEMPT" -q 2>/dev/null || true
         if [ -n "$BEAD_ID" ]; then
           bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
         fi
@@ -5573,22 +5681,41 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
       # it; then escalate. (Genuine merge conflicts take the immediate-skip branch
       # above — they never reach here.)
       NEXT_ATTEMPT=$((REBASE_ATTEMPT + 1))
-      # ga-gpcx: same defensive dual-name removal as the live-author branch above.
-      bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:exiled-tier5:$REBASE_ATTEMPT"  -q 2>/dev/null || true
-      bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:rebase-attempt:$REBASE_ATTEMPT" -q 2>/dev/null || true
-      bd -C "$GC_CITY" label add    "$MARKER_ID" "gate:exiled-tier5:$NEXT_ATTEMPT"    -q 2>/dev/null || true
+      # ga-g0v96 (AC4): same decoupled counter/exile scheme as the live-author
+      # branch above — gate:rebase-fail-count is the counter, gate:exiled-tier5
+      # only applies once gate_should_exile_tier5 confirms the failure repeated.
+      bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:exiled-tier5:$REBASE_ATTEMPT"     -q 2>/dev/null || true
+      bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:rebase-attempt:$REBASE_ATTEMPT"    -q 2>/dev/null || true
+      bd -C "$GC_CITY" label remove "$MARKER_ID" "gate:rebase-fail-count:$REBASE_ATTEMPT" -q 2>/dev/null || true
+      bd -C "$GC_CITY" label add    "$MARKER_ID" "gate:rebase-fail-count:$NEXT_ATTEMPT"   -q 2>/dev/null || true
+      _EXILE_THIS_ATTEMPT=$(gate_should_exile_tier5 "$NEXT_ATTEMPT" "$GATE_EXILE_AFTER_ATTEMPTS")
+      if [ "$_EXILE_THIS_ATTEMPT" = "1" ]; then
+        bd -C "$GC_CITY" label add "$MARKER_ID" "gate:exiled-tier5:$NEXT_ATTEMPT" -q 2>/dev/null || true
+      fi
+      # ga-g0v96 (AC5): mirror the retry state onto the SOURCE bead (see the
+      # matching comment at the live-author call site above).
+      if [ -n "$BEAD_ID" ]; then
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:rebase-retry:$REBASE_ATTEMPT" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:rebase-retry:$NEXT_ATTEMPT"   -q 2>/dev/null || true
+      fi
       # ga-6dp9 (bug 3 of 3): verify the label write actually stuck (see the
       # matching comment at the live-author call site above) — a stuck counter
       # here would otherwise replay "attempt 1/3, dead author" forever instead
       # of ever reaching the retry_dead circuit-break below.
       if [ "$(gate_rebase_attempt_advanced "$NEXT_ATTEMPT" "$(read_rebase_attempt "$MARKER_ID")")" = "stuck" ]; then
-        warn "Branch $BRANCH: gate:exiled-tier5 label write did not take effect (intended $NEXT_ATTEMPT) — forcing escalation to avoid an infinite attempt-1/3 loop."
+        warn "Branch $BRANCH: gate:rebase-fail-count label write did not take effect (intended $NEXT_ATTEMPT) — forcing escalation to avoid an infinite attempt-1/3 loop."
         NEXT_ATTEMPT="$MAX_REBASE_ATTEMPTS"
       fi
       if [ "$NEXT_ATTEMPT" -lt "$MAX_REBASE_ATTEMPTS" ]; then
-        warn "Branch $BRANCH: transient auto-rebase-fail, author dead/empty (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — gate-status:queued for server-side retry."
+        if [ "$_EXILE_THIS_ATTEMPT" = "1" ]; then
+          warn "Branch $BRANCH: transient auto-rebase-fail, author dead/empty (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, exiled to tier5) — gate-status:queued for server-side retry."
+          _TIER5_NOTE=" Carries gate:exiled-tier5:$NEXT_ATTEMPT so it sinks behind healthy markers (ga-q3ig2) — remove this label to re-anchor and rejoin the healthy queue."
+        else
+          warn "Branch $BRANCH: transient auto-rebase-fail, author dead/empty (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, still in the healthy queue) — gate-status:queued for server-side retry."
+          _TIER5_NOTE=""
+        fi
         bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:queued" -q 2>/dev/null || true
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS: branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) and the author session is gone. Queued for server-side retry on next sweep (NOT stranded on a dead author). Carries gate:exiled-tier5:$NEXT_ATTEMPT so it sinks behind healthy markers (ga-q3ig2) — remove this label to re-anchor and rejoin the healthy queue." 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS: branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) and the author session is gone. Queued for server-side retry on next sweep (NOT stranded on a dead author).${_TIER5_NOTE}" 2>/dev/null || true
         REBASE_EVENT="dispatcher_autorebase_retry"
         REBASE_VERDICT="QUEUED (retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, dead author)"
       else
@@ -5609,6 +5736,9 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
             bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human:technical" -q 2>/dev/null || true
             bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"            -q 2>/dev/null || true
             bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"           -q 2>/dev/null || true
+            # ga-g0v96 (AC5): retry saga is now terminal (circuit-broken) — drop
+            # the informational label so it doesn't linger under gate:needs-human.
+            bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:rebase-retry:$NEXT_ATTEMPT" -q 2>/dev/null || true
             bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""                           -q 2>/dev/null || true
             bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-acb AUTO-CIRCUIT-BREAK (${_ACB_RETRY}): branch $BRANCH failed auto-rebase $MAX_REBASE_ATTEMPTS times with no live author (marker $MARKER_ID). Set gate:needs-human; story:in-flight + pilot:dispatched stripped (Pilot lane slot freed). Human or Mayor must re-anchor or close." 2>/dev/null || true
           fi

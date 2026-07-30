@@ -238,6 +238,8 @@ _read_gate_log_lines = None    # () -> [str]; None = read from disk
 _git_log_count = None          # (root, since_iso) -> int; None = run git
 _bd_backlog = None             # (rig_root) -> list[dict]; None = run bd
 _bd_delivery = None            # (rig_root) -> list[dict]; None = run bd (imp23 delivery)
+_bd_marker_for_bead = None     # (root, bead_id) -> ("found"|"absent"|"error", marker_dict|None); None = run bd (ga-g0v96)
+_do_dolt_cpu = None            # () -> float pct or None; None = run ps (ga-g0v96 headroom annotation)
 _do_notify = None              # (msg, prio) -> None; None = run notify binary
 _do_mail_mayor = None          # (subject, body) -> bool; None = run gc mail
 
@@ -361,6 +363,28 @@ def _parse_bd_json(raw):
     if isinstance(d, dict):
         return d.get("issues") or d.get("beads") or d.get("items") or []
     return []
+
+
+# ── ga-g0v96: Dolt CPU% reading (headroom annotation, distinct from health probe) ──
+def _dolt_cpu_pct():
+    """Best-effort total %CPU of the dolt sql-server process(es), or None on failure.
+
+    Reads `ps` only — never queries Dolt (same technique as
+    machine-utilization-sampler.py's dolt_cpu_pct()). Used only to annotate a
+    delivery-stall bead that turns out to be explained by a healthy queued gate
+    marker (AC1: "aguardando headroom há Nh (Dolt cpu=X%)") — not a health
+    verdict, so no retry/median-of-N sampling is needed here. Test seam: _do_dolt_cpu."""
+    if _do_dolt_cpu is not None:
+        return _do_dolt_cpu()
+    r = _sh(["bash", "-c",
+             "LC_ALL=C ps aux | grep '[d]olt sql-server' | LC_ALL=C awk '{s+=$3} END{printf \"%.1f\", s}'"],
+            timeout=8)
+    if r is None or r.returncode != 0:
+        return None
+    try:
+        return round(float(r.stdout.strip()), 1)
+    except Exception:
+        return None
 
 
 # ── imp08: Dolt-health probe (Dolt-independent path) ─────────────────────────
@@ -752,18 +776,61 @@ def backlog_signal():
     return len(unique), sample
 
 
+# ── ga-g0v96: healthy-queued-marker check (AC1/AC2) ──────────────────────────
+def _queued_marker_state(root, bead_id):
+    """Tri-state: is there a HEALTHY (gate-status:queued) type:quality-gate-marker
+    bead with label source-bead:<bead_id> in root's bd store?
+
+    Returns ("found", {"id": marker_id}) | ("absent", None) | ("error", None).
+
+    ga-g0v96 (AC1): a bead legitimately queued behind gate headroom (Dolt CPU
+    saturation) is NOT a delivery anomaly — it is the gate working as designed
+    under load. Distinguishing this from a genuinely-abandoned bead requires a
+    direct point-query for the marker, never a paginated/windowed bd list scan
+    (ga-g0v96's own reporter fell into exactly that trap once: "not in my
+    150-row query" was misread as "does not exist").
+
+    error vs absent stay distinguishable here (never collapse — see
+    [[error-and-empty-must-not-produce-the-same-value]]) even though the
+    caller currently treats both the same way (fall back to unexplained): a
+    query failure must never be misread as "confirmed no marker exists".
+    Test seam: _bd_marker_for_bead."""
+    if _bd_marker_for_bead is not None:
+        return _bd_marker_for_bead(root, bead_id)
+    r = _sh([BD_BIN, "-C", root, "list",
+             "-l", "type:quality-gate-marker",
+             "-l", "source-bead:%s" % bead_id,
+             "-l", "gate-status:queued",
+             "--status", "open", "--json", "-n", "5"],
+            timeout=BD_TIMEOUT)
+    if r is None or r.returncode != 0:
+        return ("error", None)
+    markers = _parse_bd_json(r.stdout)
+    if not markers:
+        return ("absent", None)
+    m = markers[0] if isinstance(markers[0], dict) else {}
+    return ("found", {"id": m.get("id") or m.get("issue_id") or "?"})
+
+
 # ── imp23: delivery-stall signal ─────────────────────────────────────────────
 def delivery_signal(now):
-    """Returns (count, sample_beads) of story:in-flight beads stalled past DELIVERY_STALL_HOURS.
+    """Returns (count, sample_beads, explained) of story:in-flight beads stalled
+    past DELIVERY_STALL_HOURS.
 
     A bead is delivery-stalled when it carries story:in-flight AND its updated_at is older
     than DELIVERY_STALL_HOURS — the delivery daemon (or the gate itself) has not closed it
     despite the branch presumably being merged (or the crew having abandoned work).
 
-    On any error returns (None, []) — fail-open (no false alert).
+    ga-g0v96 (AC1/AC2): stalled beads explained by a healthy queued gate marker
+    (see _queued_marker_state) are split into `explained` and EXCLUDED from
+    count/sample — they are not an anomaly, so they must never drive escalation
+    or get lumped in with genuinely-abandoned beads.
+
+    On any error returns (None, [], []) — fail-open (no false alert).
     Test seam: _bd_delivery(rig_root) -> list[dict]; None = run bd."""
     stall_sec = DELIVERY_STALL_HOURS * 3600
     stalled = {}
+    stall_root = {}   # bid -> root that produced it (needed for the marker point-query)
     at_least_one_success = False
 
     for root in RIG_ROOTS:
@@ -808,19 +875,47 @@ def delivery_signal(now):
                 continue
             if now - updated_epoch > stall_sec:
                 stalled[bid] = b
+                stall_root[bid] = root
+                b["_tsw_stall_hours"] = (now - updated_epoch) / 3600.0
 
     if not at_least_one_success:
         _log("delivery_signal: all bd queries failed — ERROR (fail-open)")
-        return None, []
+        return None, [], []
 
-    unique = list(stalled.values())
+    # ga-g0v96 (AC1/AC2): split out beads explained by a healthy queued marker —
+    # they are not an anomaly and must never count toward the escalation threshold.
+    unexplained = {}
+    explained = []
+    for bid, b in stalled.items():
+        marker_verdict, marker = _queued_marker_state(stall_root[bid], bid)
+        if marker_verdict == "found":
+            explained.append({
+                "id": bid,
+                "title": (b.get("title") or b.get("name") or "?")[:80],
+                "stall_hours": b.get("_tsw_stall_hours", 0.0),
+                "marker_id": marker["id"],
+            })
+        else:
+            # "absent" (checked, no marker) and "error" (couldn't check) both fall
+            # back to pre-fix behavior (unexplained) — an error must never SUPPRESS
+            # a real anomaly just because this diagnostic probe itself failed.
+            if marker_verdict == "error":
+                _log("delivery_signal: marker check for %s errored — treating as unexplained" % bid)
+            unexplained[bid] = b
+
+    unique = list(unexplained.values())
     sample = [{"id": b.get("id", "?"), "title": (b.get("title") or b.get("name") or "?")[:80]}
               for b in unique[:5]]
-    return len(unique), sample
+    return len(unique), sample, explained
 
 
-def _escalate_delivery(count, sample, now):
-    """Notify + mail Mayor on a confirmed delivery stall (imp23)."""
+def _escalate_delivery(count, sample, explained, now):
+    """Notify + mail Mayor on a confirmed delivery stall (imp23).
+
+    ga-g0v96 (AC1/AC2): `explained` lists beads that ARE stalled but carry a
+    healthy gate-status:queued marker — appended as its own annotated section,
+    never merged into the anomaly "amostra"/"POSSÍVEIS CAUSAS" framing, and
+    with an explicit "don't touch gate:queued" warning (AC2)."""
     notify_msg = ("DELIVERY STALL: %d bead(s) story:in-flight > %.0fh sem atualização — "
                   "possível merged-but-undeployed. Mayor notificado." % (count, DELIVERY_STALL_HOURS))
     subject = ("Watchdog: DELIVERY STALL — %d bead(s) in-flight > %.0fh sem atualização"
@@ -845,6 +940,17 @@ def _escalate_delivery(count, sample, now):
         "  Se merged+não-fechado: gc bd close <id> --reason 'entrega manual (delivery stall)'",
         "  Se fora do git: adicione gate:needs-human para freiar o Pilot (imp13 :technical)",
     ]
+    if explained:
+        cpu = _dolt_cpu_pct()
+        cpu_str = ("%.0f%%" % cpu) if cpu is not None else "?%"
+        lines += [
+            "",
+            "OUTROS %d bead(s) com marker gate-status:queued SAUDÁVEL — NÃO é anomalia, NÃO remova "
+            "gate:queued nestes (auto-refino re-ingere o bead como história crua se você remover):" % len(explained),
+        ]
+        for e in explained:
+            lines.append("  • %s — %s (aguardando headroom há %.0fh; Dolt cpu=%s; marker %s)" % (
+                e["id"], e["title"], e["stall_hours"], cpu_str, e["marker_id"]))
     body = "\n".join(lines)
 
     _tsw_ledger("human-touch", {
@@ -882,11 +988,15 @@ def _tick_delivery(now, state):
     state.setdefault("delivery_pending", 0)
     state.setdefault("delivery_last_escalate", 0.0)
 
-    count, sample = delivery_signal(now)
+    count, sample, explained = delivery_signal(now)
     if count is None:
         _log("delivery_signal ERROR → fail-open (no delivery verdict)")
         state["delivery_pending"] = 0
         return False
+
+    if explained:
+        _log("delivery: %d bead(s) explained by a healthy queued gate marker (ga-g0v96: "
+             "not an anomaly, excluded from count)" % len(explained))
 
     if count < DELIVERY_STALL_MIN_BEADS:
         if state["delivery_pending"] > 0:
@@ -910,7 +1020,7 @@ def _tick_delivery(now, state):
     # imp24: attempt auto-heal before escalating; success = stall-cleared next tick
     if _attempt_heal(now, state):
         return False
-    _escalate_delivery(count, sample, now)
+    _escalate_delivery(count, sample, explained, now)
     state["delivery_last_escalate"] = now
     return True
 
@@ -1402,7 +1512,7 @@ def _selftest():
     # Use `global` to inject into the correct namespace.
     global _read_pilot_log_lines, _read_gate_log_lines, _git_log_count
     global _bd_backlog, _bd_delivery, _do_mail_mayor, _do_notify, _do_dolt_probe
-    global _suspended_rigs
+    global _suspended_rigs, _bd_marker_for_bead, _do_dolt_cpu
 
     ok_count = [0]
     fail_count = [0]
@@ -1466,6 +1576,10 @@ def _selftest():
     # imp23: stub delivery signal as no stalled beads by default so existing scenarios
     # are not affected.
     _bd_delivery = lambda root: []   # no stalled beads — overridden in L/M/N scenarios
+    # ga-g0v96: stub the marker check as "absent" by default (pre-fix behavior:
+    # every stalled bead is unexplained) — overridden in the ga-g0v96 scenarios below.
+    _bd_marker_for_bead = lambda root, bead_id: ("absent", None)
+    _do_dolt_cpu = lambda: 42.0
     # imp24: heal disabled by default so existing scenarios are not affected.
     _do_heal_throughput = None   # overridden in P/Q scenarios
     # imp12: quota check stubbed as available by default
@@ -1855,6 +1969,82 @@ def _selftest():
         _ok("N: delivery signal error (empty RIG_ROOTS) → fail-open, no delivery alert")
     else:
         _bad("N", "should not fire delivery alert on signal error, got: %r" % notify_calls)
+
+    # ── ga-g0v96 Scenario O1: bead explained by a healthy queued marker never
+    # escalates, no matter how many sweeps (AC1: not an anomaly) ────────────────
+    print("\nga-g0v96 Scenario O1: explained-by-marker bead never escalates")
+    _read_pilot_log_lines = lambda: _pilot_lines(0, 3)
+    _read_gate_log_lines  = lambda: []
+    _git_log_count        = lambda root, since: 0
+    _bd_backlog           = lambda root: []
+    _bd_delivery = lambda root: [_stale_bead("wa-o001", DELIVERY_STALL_HOURS + 1)]
+    _bd_marker_for_bead = lambda root, bead_id: ("found", {"id": "ga-wisp-o001"})
+    _do_dolt_probe = lambda: 0
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    for i in range(5):
+        run_tick(NOW + i * 1800, st)
+    delivery_notifies_o1 = [n for n in notify_calls if "DELIVERY" in n[0].upper()]
+    if not delivery_notifies_o1 and st.get("delivery_pending", 0) == 0:
+        _ok("O1: bead with a healthy queued marker never triggers delivery-stall escalation (ga-g0v96 AC1)")
+    else:
+        _bad("O1", "delivery_pending=%d notifies=%d" % (st.get("delivery_pending", 0), len(delivery_notifies_o1)))
+
+    # ── ga-g0v96 Scenario O2: mixed explained+unexplained — escalates for the
+    # real anomaly only; explained bead is annotated (not hidden, not conflated) ─
+    print("\nga-g0v96 Scenario O2: mixed explained+unexplained — escalates, annotates correctly")
+    _bd_delivery = lambda root: [_stale_bead("wa-o002-explained", DELIVERY_STALL_HOURS + 2),
+                                 _stale_bead("wa-o003-real", DELIVERY_STALL_HOURS + 3)]
+
+    def _marker_o2(root, bead_id):
+        if bead_id == "wa-o002-explained":
+            return ("found", {"id": "ga-wisp-o002"})
+        return ("absent", None)
+    _bd_marker_for_bead = _marker_o2
+    _do_dolt_cpu = lambda: 210.0
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)
+    delivery_mails_o2 = [m for m in mail_calls if "DELIVERY" in m[0]]
+    if delivery_mails_o2:
+        o2_body = delivery_mails_o2[0][1]
+        amostra_section = o2_body.split("POSSÍVEIS CAUSAS")[0]
+        annotated = ("aguardando headroom" in o2_body and "ga-wisp-o002" in o2_body and "210" in o2_body
+                     and "wa-o002-explained" in o2_body)
+        not_in_amostra = "wa-o002-explained" not in amostra_section
+        real_anomaly_present = "wa-o003-real" in amostra_section
+        if annotated and not_in_amostra and real_anomaly_present:
+            _ok("O2: escalates for the real anomaly only; explained bead annotated separately "
+                "with headroom hours + Dolt cpu% (ga-g0v96 AC1)")
+        else:
+            _bad("O2", "annotated=%s not_in_amostra=%s real_anomaly_present=%s body=%r" % (
+                 annotated, not_in_amostra, real_anomaly_present, o2_body))
+        if "NÃO remova" in o2_body:
+            _ok("O2b: mail explicitly warns not to remove gate:queued from explained beads (ga-g0v96 AC2)")
+        else:
+            _bad("O2b", "expected an explicit 'do not remove gate:queued' warning in the mail body")
+    else:
+        _bad("O2", "expected a delivery mail for the unexplained bead, got: %r" % mail_calls)
+
+    # ── ga-g0v96 Scenario O3: the marker-check itself ERRORS → fail-open to the
+    # OLD behavior (treated as unexplained) — an error must never SUPPRESS a
+    # genuine stall just because this diagnostic probe failed ──────────────────
+    print("\nga-g0v96 Scenario O3: marker-check error falls back to unexplained (fail-open)")
+    _bd_delivery = lambda root: [_stale_bead("wa-o004-errcheck", DELIVERY_STALL_HOURS + 1)]
+    _bd_marker_for_bead = lambda root, bead_id: ("error", None)
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)
+    delivery_notifies_o3 = [n for n in notify_calls if "DELIVERY" in n[0].upper()]
+    if delivery_notifies_o3:
+        _ok("O3: marker-check ERROR does not suppress a genuine stall — still escalates (fail-open, ga-g0v96)")
+    else:
+        _bad("O3", "marker-check error incorrectly suppressed escalation: %r" % notify_calls)
+
+    _bd_marker_for_bead = lambda root, bead_id: ("absent", None)   # restore default
+    _do_dolt_cpu = lambda: 42.0
 
     # ── imp24-P: heal-action branch wiring ───────────────────────────────────────
     print("\nimp24 Scenario P1: HEAL_ENABLED=0 → heal not attempted, stall escalates normally")

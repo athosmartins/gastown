@@ -272,6 +272,100 @@ else
     "4"
 fi
 
+# ── 9. ga-g0v96: exile-after-N-attempts decouples the retry counter from the
+#    tier-sinking label, captured push diagnostics replace fabricated causes,
+#    and the retry state is mirrored onto the source bead ───────────────────
+# BUG (ga-g0v96): stamping gate:exiled-tier5 on the VERY FIRST transient
+# rebase failure sank the marker behind the ENTIRE healthy queue before its
+# own "retry 1/3" had a chance to run — a busy gate could starve attempt 2
+# for hours (observed: 4h44m, wa-b6uy3). Separately, "Auto-rebase push
+# failed" discarded stderr+exit code entirely, and the retry-queue comment
+# asserted a specific guessed mechanism ("likely a rebase-while-queued race,
+# author may have force-pushed") as fact — proven chronologically IMPOSSIBLE
+# in the real incident (push failed 2h before the cited force-push).
+echo "── 9. ga-g0v96: exile-after-N-attempts, captured push diagnostics, bead-visible retry state ──"
+
+echo "── 9a. gate_should_exile_tier5: pure decision, forgives ONE blip ──"
+eq "attempt 1 < default threshold 2 → do not exile yet (forgive the first blip)" \
+  "$(gate_should_exile_tier5 "1" "2")" \
+  "0"
+eq "attempt 2 == default threshold 2 → exile (repeated failure)" \
+  "$(gate_should_exile_tier5 "2" "2")" \
+  "1"
+eq "attempt 3 > default threshold 2 → exile" \
+  "$(gate_should_exile_tier5 "3" "2")" \
+  "1"
+eq "threshold=1 (GATE_EXILE_AFTER_ATTEMPTS=1) restores the OLD always-exile-on-attempt-1 behavior" \
+  "$(gate_should_exile_tier5 "1" "1")" \
+  "1"
+eq "garbage attempt/threshold sanitize to defaults (1 < 2) → do not exile (fail toward the forgiving default, not a false exile)" \
+  "$(gate_should_exile_tier5 "xx" "yy")" \
+  "0"
+
+echo "── 9b. read_rebase_attempt: widened regex recognizes the new counter label end-to-end (mocked bd) ──"
+bd() {
+  case " $* " in
+    *" show "*) printf '%s' "$_RA_MOCK_JSON" ;;
+    *) : ;;
+  esac
+  return 0
+}
+_RA_MOCK_JSON='[{"id":"ga-wisp-mock","labels":["gate-status:queued","gate:rebase-fail-count:1"]}]'
+eq "attempt-1 failure (no tier5 label yet) still reads back as 1 via gate:rebase-fail-count" \
+  "$(read_rebase_attempt "ga-wisp-mock")" \
+  "1"
+_RA_MOCK_JSON='[{"id":"ga-wisp-mock","labels":["gate-status:queued","gate:rebase-fail-count:2","gate:exiled-tier5:2"]}]'
+eq "attempt-2 (exiled) reads back as 2 (both labels present, MAX taken, no double-count)" \
+  "$(read_rebase_attempt "ga-wisp-mock")" \
+  "2"
+_RA_MOCK_JSON='[{"id":"ga-wisp-mock","labels":["gate-status:queued","gate:rebase-attempt:3"]}]'
+eq "pre-ga-gpcx legacy label name (gate:rebase-attempt:N) still recognized" \
+  "$(read_rebase_attempt "ga-wisp-mock")" \
+  "3"
+_RA_MOCK_JSON='[{"id":"ga-wisp-mock","labels":["gate-status:queued"]}]'
+eq "no counter label present → 0" \
+  "$(read_rebase_attempt "ga-wisp-mock")" \
+  "0"
+unset -f bd
+
+echo "── 9c. drift-guard: AC3 — push stderr/exit-code captured, fabricated-cause phrase gone ──"
+grep -qF 'AUTO_REBASE_PUSH_RC=$?' "$DISPATCHER" \
+  && ok "push exit code is captured into AUTO_REBASE_PUSH_RC" \
+  || bad "AUTO_REBASE_PUSH_RC capture missing — AC3 regressed?"
+grep -qF '_PUSH_ERR_FILE' "$DISPATCHER" \
+  && ok "push stderr is captured to a file instead of being discarded to /dev/null" \
+  || bad "_PUSH_ERR_FILE capture missing — AC3 regressed?"
+if grep -qE 'likely a rebase-while-queued race \(author \$REBASE_AUTHOR may have force-pushed' "$DISPATCHER"; then
+  bad "the fabricated-mechanism phrase ('likely a rebase-while-queued race...') is STILL present — mila-wa proved this exact phrase chronologically impossible in the real incident (ga-g0v96)"
+else
+  ok "fabricated-mechanism phrase ('likely a rebase-while-queued race...') is gone"
+fi
+grep -qF 'cause not captured' "$DISPATCHER" \
+  && ok "an uncaptured push failure is now labeled 'cause not captured' (hypothesis, not asserted fact)" \
+  || bad "'cause not captured' fallback text missing"
+
+echo "── 9d. drift-guard: AC4 — gate_should_exile_tier5 actually gates the write sites (not just defined) ──"
+_EXILE_CALL_COUNT=$(grep -c 'gate_should_exile_tier5 "\$NEXT_ATTEMPT" "\$GATE_EXILE_AFTER_ATTEMPTS"' "$DISPATCHER" || true)
+if [ "${_EXILE_CALL_COUNT:-0}" -ge 2 ]; then
+  ok "gate_should_exile_tier5 is called at both retry sites (live-author + dead-author), count=$_EXILE_CALL_COUNT"
+else
+  bad "gate_should_exile_tier5 called fewer than 2 times (count=${_EXILE_CALL_COUNT:-0}) — a write site may still unconditionally exile"
+fi
+grep -qF 'GATE_EXILE_AFTER_ATTEMPTS="${GATE_EXILE_AFTER_ATTEMPTS:-2}"' "$DISPATCHER" \
+  && ok "GATE_EXILE_AFTER_ATTEMPTS knob present, env-overridable, defaults to 2" \
+  || bad "GATE_EXILE_AFTER_ATTEMPTS knob missing/renamed"
+
+echo "── 9e. drift-guard: AC5 — retry state mirrored onto the SOURCE bead, not just the marker ──"
+_BEAD_RETRY_LABEL_COUNT=$(grep -c 'gate:rebase-retry:' "$DISPATCHER" || true)
+if [ "${_BEAD_RETRY_LABEL_COUNT:-0}" -ge 4 ]; then
+  ok "gate:rebase-retry label referenced at add/remove sites for both retry paths (count=$_BEAD_RETRY_LABEL_COUNT)"
+else
+  bad "gate:rebase-retry label references fewer than expected (count=${_BEAD_RETRY_LABEL_COUNT:-0}) — AC5 bead-visibility may have regressed"
+fi
+grep -qF 'bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:rebase-retry:$NEXT_ATTEMPT"' "$DISPATCHER" \
+  && ok "retry state is written to \$BEAD_CITY/\$BEAD_ID (visible on the source bead), not only \$GC_CITY/\$MARKER_ID" \
+  || bad "gate:rebase-retry is not written to the source bead — AC5 (visibility outside the marker) regressed"
+
 # ── Result ────────────────────────────────────────────────────────────────────
 echo ""
 if [ "$FAIL" = "0" ]; then
