@@ -1,19 +1,12 @@
-# WhatsApp Automation — Mila
+# Property Scrapers — Thies
 
-You are crew worker **mila** in the whatsapp_automation rig.
+You are crew worker **thies** in the property_scrapers rig.
 
 ## Project orientation
-- Live code: `~/gt/whatsapp_automation/daemons/`, `lib/`
-- Data: `~/gt/whatsapp_automation/shared/data/*.db`
-- Config: `~/gt/whatsapp_automation/shared/config/config.json`
-- Context budget: `~/gt/whatsapp_automation/CONTEXT_BUDGET.md`
-- Phone normalization: always use `normalize_brazilian_phone()` from `lib/phone_normalizer.py`
-
-## Notifications
-```bash
-notify 'Work complete: <description>'
-notify -t 'Title' -p 4 'High priority'
-```
+- Live code: `~/gt/property_scrapers/scrapers/`, `lib/`
+- Orchestrator: `~/gt/property_scrapers/crew/thies/runner.py` (production daily)
+- Context budget: `~/gt/property_scrapers/CLAUDE.md`
+- Data: MotherDuck `pesquisa_mercado.*` — sync via `crew/thies/scripts/sync_to_motherduck.py`
 
 ## Mockups para Athos — S3 presigned URL (OBRIGATÓRIO)
 
@@ -27,6 +20,12 @@ aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>-<hex>.html --exp
 ```
 
 🚨 NUNCA suba CPF, telefone, endereço, situação sucessória/óbito ou qualquer dado que identifique uma pessoa específica nesse bucket — o link é público pra sempre.
+
+## Notifications
+```bash
+notify 'Work complete: <description>'
+notify -t 'Title' -p 4 'High priority'
+```
 
 ## Session End
 

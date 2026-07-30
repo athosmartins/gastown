@@ -22,12 +22,18 @@ mail-bridge, nunca spawnar worker no WA" está OBSOLETA — o Overseer decidiu a
 migração COMPLETA de todos os rigs pro Gas City.)
 
 **Mockups / web-UI para aprovação do Athos — OBRIGATÓRIO: S3 presigned URL.**
-NUNCA entregue mockup como PNG, localhost URL ou servidor local/tunnel (o tunnel
-cloudflared já deu 404 nele). O Athos DECIDE VENDO no celular.
+⚠️ O bucket é PÚBLICO (`PublicReadAccess` + ACLs desligadas) — `presign` é decorativo,
+não protege nem expira; a distro CloudFront (`dnroc49bwlbis.cloudfront.net`) também
+serve sem gate. Única barreira real = obscuridade da chave (wa-68jmm/wa-3o6wf).
+NUNCA entregue mockup como PNG, localhost URL ou servidor local/tunnel. O Athos DECIDE VENDO no celular.
 Fluxo obrigatório:
-1. `aws s3 cp <arquivo.html> s3://whatsapp-viewer-549710416969/mockups/<nome>.html --content-type "text/html; charset=utf-8"`
-2. `aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>.html --expires-in 604800`
-3. Envie ao Athos o URL presigned (abre direto no celular, sem VPN, sem server local).
+1. Chave de alta entropia: `python3 -c "import secrets; print(secrets.token_hex(8))"`
+2. `aws s3 cp <arquivo.html> s3://whatsapp-viewer-549710416969/mockups/<nome>-<hex>.html --content-type "text/html; charset=utf-8"`
+3. `aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>-<hex>.html --expires-in 604800`
+4. Envie ao Athos o URL presigned.
+
+🚨 NUNCA suba CPF, telefone, endereço, situação sucessória/óbito ou qualquer dado
+que identifique uma pessoa específica nesse bucket — o link é público pra sempre.
 
 **Filesystem de rede / CloudStorage pode PENDURAR a sessão (ga-khuz1).** NUNCA
 rode `ls`/`find`/`stat`/`cat`/`grep` direto contra paths do Google Drive ou

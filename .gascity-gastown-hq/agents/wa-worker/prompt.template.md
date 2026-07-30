@@ -158,12 +158,16 @@ rediscover why from scratch.
 
 ## Mockups para Athos — S3 presigned URL (OBRIGATÓRIO)
 
+⚠️ O bucket é PÚBLICO (`PublicReadAccess` + ACLs desligadas) — `presign` é decorativo, não protege nem expira; a distro CloudFront (`dnroc49bwlbis.cloudfront.net`) também serve sem gate. Única barreira real = obscuridade da chave (wa-68jmm/wa-3o6wf).
 NUNCA entregue mockup como PNG, localhost ou tunnel (cloudflared já deu 404).
 
 ```bash
-aws s3 cp <arquivo.html> s3://whatsapp-viewer-549710416969/mockups/<nome>.html --content-type "text/html; charset=utf-8"
-aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>.html --expires-in 604800
+python3 -c "import secrets; print(secrets.token_hex(8))"  # chave de alta entropia
+aws s3 cp <arquivo.html> s3://whatsapp-viewer-549710416969/mockups/<nome>-<hex>.html --content-type "text/html; charset=utf-8"
+aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>-<hex>.html --expires-in 604800
 ```
+
+🚨 NUNCA suba CPF, telefone, endereço, situação sucessória/óbito ou qualquer dado que identifique uma pessoa específica nesse bucket — o link é público pra sempre.
 
 ---
 
