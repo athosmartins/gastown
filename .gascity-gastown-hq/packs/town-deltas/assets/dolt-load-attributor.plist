@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- ga-c30ak: atribuição contínua da carga do Dolt por dono.
+     Amostra 40 ciclos de 1s a cada 10min e grava JSONL. Custo próprio baixo:
+     lsof + um ps por ciclo, nenhuma query ao Dolt (não se mede um sistema
+     adicionando carga a ele). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.dolt-load-attributor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/dolt-load-attributor.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DOLT_ATTR_CYCLES</key><string>40</string>
+    <key>DOLT_ATTR_GAP</key><string>1.0</string>
+  </dict>
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-load-attributor.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-load-attributor.err</string>
+</dict>
+</plist>
