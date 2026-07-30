@@ -33,7 +33,7 @@ for fn in janitor_decide janitor_story_decide token_bounded scan_commit_for_bead
           janitor_branch_decide normalize_bead_status branch_is_fresh \
           bead_lookup_one resolve_bead_state \
           commit_epoch commit_evidence_stale comments_for_bead \
-          sling_beads_from_show sling_signals_for_id; do
+          sling_beads_from_show sling_signals_for_id sling_fallback_eligible_reason; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by janitor"; exit 1; }
 done
 
@@ -841,15 +841,45 @@ eq "branch self-guard rejects a final-segment mismatch" \
    "$(sling_signals_for_id "$R10" 0 "main" "zz" "$R10" 0 "main" "tt-branchy-lon" "$M_EMPTY")" \
    "0 0 0 - -"
 
+echo "  -- 11b2. sling_fallback_eligible_reason (ga-v8ui5 gate-feedback follow-up) --"
+# GATE-FEEDBACK (2026-07-30, gate_run=ga-wisp-617q8ra): janitor_decide's new
+# keep:superseded-marker-needs-merge-evidence reason (§12 below) is a SECOND
+# "FID's own signals came up empty" bucket, distinct from the original
+# no-merge-evidence string. Before this predicate existed, the fallback gate
+# matched no-merge-evidence ONLY — so a bead superseded under its current
+# wrapper, whose real merge lived under a sibling wrapper id, silently never
+# got the cross-check attempted (verdict stayed "keep", indistinguishable in
+# the log from "checked and found nothing"). This exercises the actual
+# predicate the sweep calls, not just a grep for its source text — the gap
+# the gate feedback called out was exactly that no test exercised the
+# end-to-end F_REASON branch.
+eq "no-merge-evidence is fallback-eligible" \
+   "$(sling_fallback_eligible_reason "no-merge-evidence")" "1"
+eq "superseded-marker-needs-merge-evidence is fallback-eligible (the fix)" \
+   "$(sling_fallback_eligible_reason "superseded-marker-needs-merge-evidence")" "1"
+# Every guard/suppression reason a "keep" verdict can carry must stay
+# ineligible — the fallback may NEVER second-guess an epic, an actively-gated
+# bead, or a deliberately-suppressed stale-comment commit signal.
+for guard_reason in epic-parent-never-autoclosed active-open-gate-marker \
+                    commit-evidence-superseded-by-newer-comment \
+                    story-in-flight-active-rework live-builder-assignee \
+                    delivery-owns-it already-story-done; do
+  eq "guard reason '$guard_reason' stays fallback-ineligible" \
+     "$(sling_fallback_eligible_reason "$guard_reason")" "0"
+done
+
 echo "  -- 11c. drift-guard: live wiring in the ga-hcj4 sweep --"
 grep -q 'sling_beads_from_show()' "$JANITOR"  && ok "defines sling_beads_from_show"  || bad "missing sling_beads_from_show def"
 grep -q 'sling_signals_for_id()' "$JANITOR"   && ok "defines sling_signals_for_id"   || bad "missing sling_signals_for_id def"
 grep -qF 'capture("Sling task bead: (?<id>[a-z][a-z0-9-]+)")' "$JANITOR" \
   && ok "uses the WORKING jq named-group syntax (?<id>...), not the P-form quality-gate-guard.sh uses" \
   || bad "sling id capture regex missing or reverted to the broken (?P<id>...) form"
-grep -qF 'if [ "$F_VERDICT" = "keep" ] && [ "$F_REASON" = "no-merge-evidence" ]; then' "$JANITOR" \
-  && ok "fallback strictly gated on keep:no-merge-evidence (never overrides epic/open-marker keeps)" \
-  || bad "fallback gating condition missing or loosened"
+grep -qF 'if [ "$F_VERDICT" = "keep" ] && [ "$(sling_fallback_eligible_reason "$F_REASON")" = "1" ]; then' "$JANITOR" \
+  && ok "fallback gated via sling_fallback_eligible_reason (never overrides epic/open-marker keeps)" \
+  || bad "fallback gating condition missing, loosened, or reverted to the single-string no-merge-evidence check"
+grep -qF 'sling_fallback_eligible_reason()' "$JANITOR" \
+  && ok "defines sling_fallback_eligible_reason" \
+  || bad "missing sling_fallback_eligible_reason def"
 grep -qF '[ "$F_SLING_ID" = "$FID" ] && continue' "$JANITOR" \
   && ok "skips self-referential sling id (rig-native beads already scanned as FID itself)" \
   || bad "sling self-reference skip missing"

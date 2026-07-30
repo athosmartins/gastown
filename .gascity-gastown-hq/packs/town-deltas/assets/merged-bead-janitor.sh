@@ -232,6 +232,22 @@ janitor_story_decide() {
   echo "keep:no-merge-evidence"
 }
 
+# ga-v8ui5 (gate-feedback follow-up): is a janitor_decide/janitor_story_decide
+# "keep" reason one of the "FID's own signals came up completely empty"
+# buckets — the only case the ga-vokwv sling-bead-name fallback (below) may
+# override? no-merge-evidence is the original empty-handed case;
+# superseded-marker-needs-merge-evidence is the SAME empty-handed case, just
+# named explicitly instead of collapsing into the generic string. Every guard
+# reason (epic, open-marker, stale-comment-suppressed-commit) must stay
+# ineligible — fail-closed via the unmatched `*)` branch, not an allowlist
+# the fallback caller has to keep in sync by hand.
+sling_fallback_eligible_reason() {
+  case "$1" in
+    no-merge-evidence|superseded-marker-needs-merge-evidence) echo 1 ;;
+    *)                                                        echo 0 ;;
+  esac
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # PURE DECISION FUNCTION #3 — convoy/coordination wrapper reconciliation.
 #
@@ -1084,12 +1100,19 @@ EOF
     # evidence — before keeping, check whether the fix instead named one of
     # FID's historical sling-task WRAPPER beads (Pilot's rotating per-dispatch
     # id; a naming slip here permanently blinded this exact sweep for
-    # ga-0jcit — see the ga-hcj4 header comment above). Gated strictly on
-    # keep:no-merge-evidence: an epic or an actively-gated FID (has_open=1)
-    # must never be overridden by this fallback, only the clean "nothing
-    # found yet" case gets a second look.
+    # ga-0jcit — see the ga-hcj4 header comment above). Gated on the two
+    # "nothing found on FID's own signals yet" reasons — no-merge-evidence,
+    # and (ga-v8ui5) superseded-marker-needs-merge-evidence, which is the
+    # SAME empty-handed case, just named explicitly by janitor_decide instead
+    # of collapsing into no-merge-evidence. Without this second branch, a
+    # bead superseded under its current wrapper whose real merge landed under
+    # a sibling wrapper id would be kept with the cross-check silently never
+    # attempted — the exact gap this fallback exists to close. An epic or an
+    # actively-gated FID (has_open=1), or the stale-comment-suppressed commit
+    # case, must never be overridden by this fallback — only these two
+    # "nothing found yet" reasons get a second look.
     F_SLING_EVID=""
-    if [ "$F_VERDICT" = "keep" ] && [ "$F_REASON" = "no-merge-evidence" ]; then
+    if [ "$F_VERDICT" = "keep" ] && [ "$(sling_fallback_eligible_reason "$F_REASON")" = "1" ]; then
       F_SHOW=$(bd -C "$RPATH" show "$FID" --json --include-comments 2>/dev/null || echo '')
       if [ -n "$F_SHOW" ]; then
         while IFS= read -r F_SLING_ID; do
