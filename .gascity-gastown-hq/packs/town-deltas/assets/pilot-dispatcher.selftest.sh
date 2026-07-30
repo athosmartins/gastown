@@ -937,6 +937,23 @@ NEEDS_HUMAN_DECISION='[{"id":"bd-needs-human-decision","assignee":null,"labels":
 
 echo "$_FC_FN" | grep -q 'startswith("needs-human")' && ok "_filter_candidates carries the bare needs-human clause" || bad "bare needs-human clause missing from _filter_candidates"
 
+# ── Scenario ga-1mqdz AC1: pilot:no-auto-dispatch must exclude candidacy STANDALONE ──
+# Bug ga-1mqdz: pilot:no-auto-dispatch is the direct Mayor/human "stop dispatching
+# this" opt-out (used to park a bead without a full story:* refino lifecycle — see
+# context-check-dispatcher.sh's context_check_is_parked, its own canonical consumer)
+# but _filter_candidates — the single chokepoint every candidate source funnels
+# through — never checked it. Confirmed live via dolt_diff on the real incident
+# beads (ga-t8274, ga-i0n83): pilot:no-auto-dispatch was added 5 DAYS before either
+# was first selected as a dispatch candidate; only the ga-2n7xw hold/escalate cap's
+# OWN 3rd-strike side effect (stamping gate:needs-human) finally stopped the loop —
+# not the no-auto-dispatch label itself. The fixture deliberately ALSO carries
+# ctx:ready+exec:auto (the previously-documented workaround) to prove the label now
+# holds on its own, independent of that indirect mechanism.
+echo "Scenario ga-1mqdz: pilot:no-auto-dispatch bead is excluded from the candidate pool standalone"
+NO_AUTO_DISPATCH='[{"id":"bd-no-auto","assignee":null,"labels":["pilot:no-auto-dispatch","ctx:ready","exec:auto"],"description":"x"},{"id":"bd-auto-free","assignee":null,"labels":["ctx:ready","exec:auto"],"description":"x"}]'
+[ "$(_fc "$NO_AUTO_DISPATCH")" = '["bd-auto-free"]' ] && ok "ga-1mqdz: pilot:no-auto-dispatch bead excluded even with ctx:ready+exec:auto present; clean sibling kept" || bad "ga-1mqdz: pilot:no-auto-dispatch bead leaked into candidates: $(_fc "$NO_AUTO_DISPATCH")"
+echo "$_FC_FN" | grep -q '"pilot:no-auto-dispatch"' && ok "_filter_candidates carries the pilot:no-auto-dispatch clause" || bad "pilot:no-auto-dispatch clause missing from _filter_candidates"
+
 # AC1(b)/AC2 cross-check (mirrors ga-nf4x5): the routed-pool probes (wa-worker/
 # ps-worker) must carry the SAME bare-needs-human exclusion independently of
 # _filter_candidates — they bypass Pilot's dispatch path entirely, so a fix in
@@ -3105,6 +3122,53 @@ echo "Scenario 18q: drift-guard — framework-dog-exempt is wired into the live 
 has "$DISPATCHER" 'PILOT_FRAMEWORK_DOG_EXEMPT'   "framework-dog-exempt knob is wired"
 has "$DISPATCHER" 'framework-dog-exempt'         "framework-dog-exempt log/tag is wired"
 
+# ── Scenario 18q2 (ga-1mqdz AC2): infra signal SHADOWED by an earlier-precedence
+# product-domain keyword must still exempt — condition (a) alone misses this ──
+# Bug ga-1mqdz: bead_domain checks frontend/real-estate/warming/data BEFORE infra
+# (by design — its OTHER caller, rig_domain_owner/exclude crew-picking, wants
+# "most-specific product domain wins"), so a bead that matches BOTH an infra
+# keyword (dispatcher/gate/dolt/framework/…) AND an earlier-checked product
+# keyword (e.g. \bkanban\b/\bpainel\b, frontend's regex) classifies as the
+# EARLIER domain, never reaching "infra" — hiding a genuine infra signal from
+# exemption (a). Real incident (dolt_diff-confirmed): ga-t8274/ga-i0n83, two
+# Pilot/gate-dispatcher framework bugs that ALSO describe a SYMPTOM ("o painel
+# mostra N beads presos", tripping kanban/painel) — REFUSED+held 3x over
+# ~2h40m although unmistakably dog-appropriate. Fixture below mirrors that
+# exact shape: cites "pilot-dispatcher.sh"/"dispatcher" (infra) AND
+# "kanban-contract"/"do painel" (frontend, checked first by bead_domain).
+echo "Scenario 18q2 (ga-1mqdz): infra bead whose ALSO-present product keyword is checked FIRST by bead_domain → still dog-dispatched, not refused/held"
+INFRA_SHADOWED='[{"id":"ga-ac2test","title":"Pilot dispatch-reliability rot: approved work silently not executing","priority":1,"issue_type":"bug","description":"A query de candidatos no pilot-dispatcher.sh exclui pilot:dispatching stale, entao o bead some dos candidatos para sempre. DISPLAY-TRUTH: a coluna Aprovadas do painel MOSTRA beads presos que o kanban-contract do batista ja contava como prontos, mascarando o problema real no dispatcher.","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-18T00:00:01Z","metadata":{}}]'
+INFRA_SHADOWED_OBJ="$(echo "$INFRA_SHADOWED" | jq -c '.[0]')"
+# Preconditions: reproduce the EXACT shadowing — bead_content_rig still mis-infers
+# WA (kanban/painel), and bead_domain returns "frontend" (NOT infra) because its
+# precedence checks frontend before infra, even though an infra keyword ALSO matches.
+[ "$(_bcr "$INFRA_SHADOWED_OBJ")" = whatsapp_automation ] && ok "precondition: bead_content_rig mis-infers whatsapp_automation (kanban/painel mention)" || bad "precondition changed: bead_content_rig='$(_bcr "$INFRA_SHADOWED_OBJ")'"
+[ "$(_dom "$INFRA_SHADOWED_OBJ")" = frontend ] && ok "precondition: bead_domain returns frontend (NOT infra) — kanban shadows the ALSO-present infra keyword, exemption (a) alone would miss this" || bad "precondition changed: bead_domain='$(_dom "$INFRA_SHADOWED_OBJ")' (expected frontend)"
+LOG18Q2="$(run_capacity 10 "[]" 1 "$INFRA_SHADOWED")"
+B18Q2="$(dispatched_builder "$LOG18Q2")"
+if echo "$B18Q2" | grep -qE '^gastown\.dog'; then
+  ok "shadowed-infra bead DISPATCHED to the dog pool ($B18Q2) — condition (f) catches what (a) missed"
+elif [ -z "$B18Q2" ] && echo "$LOG18Q2" | grep -q "REFUSING"; then
+  bad "REGRESSION: shadowed-infra bead REFUSED to the dog pool + held (ga-1mqdz AC2 reproduced)"
+else
+  bad "shadowed-infra bead routed unexpectedly (got: '${B18Q2:-none}')"
+fi
+echo "$LOG18Q2" | grep -q "framework-dog-exempt: ga-ac2test" && ok "exemption logged for the shadowed-infra shape" || bad "framework-dog-exempt not logged for the shadowed-infra shape"
+echo "$LOG18Q2" | grep -q "infra-keyword-shadowed" && ok "exemption reason correctly attributes condition (f), not (a)" || bad "exemption did not log the expected condition-(f) reason (infra-keyword-shadowed)"
+echo "$LOG18Q2" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-ac2test" && bad "shadowed-infra shape still refused (ga-1mqdz AC2 not fixed)" || ok "shadowed-infra shape NOT refused (no pilot:held loop)"
+
+echo "Scenario 18q2b (ga-1mqdz, guard OFF): PILOT_FRAMEWORK_DOG_EXEMPT=0 reproduces the REFUSE+hold bug"
+LOG18Q2B="$(PILOT_FRAMEWORK_DOG_EXEMPT=0 run_capacity 10 "[]" 1 "$INFRA_SHADOWED")"
+B18Q2B="$(dispatched_builder "$LOG18Q2B")"
+if [ -z "$B18Q2B" ] && echo "$LOG18Q2B" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-ac2test"; then
+  ok "with exemption OFF the shadowed-infra bead is REFUSED+held (proves condition (f) is exactly what flips the behaviour)"
+else
+  bad "toggle-off did not reproduce the refuse (knob not wired to condition (f)?) got builder='${B18Q2B:-none}'"
+fi
+
+echo "Scenario 18q2c: drift-guard — condition (f) is wired into framework-dog-exempt"
+has "$DISPATCHER" 'infra-keyword-shadowed' "condition (f) (infra-keyword-shadowed) is wired"
+
 # ── Scenario 18r–18w2 (ga-xzfl): PATH-authoritative rig inference ──────────────
 # ROOT: rig inference used KEYWORDS (bead_content_rig/bead_domain) not code PATHS, so a
 # bead ABOUT the router (cites packs/…/pilot-dispatcher.sh + scripts/auto-rehome-janitor.py,
@@ -3202,7 +3266,7 @@ echo "$LOG18V" | grep -q "framework-dog-exempt: ga-modeb is gascity-framework wo
 echo "Scenario 18w (ga-xzfl): missing-file guard — file present in HQ, absent in routed rig → REFUSE, fall open to dog"
 # GENUINE MISLOCATION (FINDING 2): the cited file exists in HQ (gascity) but NOT in the routed
 # product rig. Seam "gascity" = only HQ has the file. Path-rig guard OFF so content infers WA.
-MISSING_FIX='[{"id":"ga-missfile","title":"whatsapp painel kanban tweak that names packs/town-deltas/assets/pilot-dispatcher.sh","priority":2,"issue_type":"bug","description":"whatsapp painel kanban work — but the only file cited is packs/town-deltas/assets/pilot-dispatcher.sh, which lives in HQ, not in whatsapp_automation","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-11T00:00:05Z","metadata":{}}]'
+MISSING_FIX='[{"id":"ga-missfile","title":"whatsapp painel kanban tweak that names packs/town-deltas/assets/gate-marker-rehome-janitor.sh","priority":2,"issue_type":"bug","description":"whatsapp painel kanban work — but the only file cited is packs/town-deltas/assets/gate-marker-rehome-janitor.sh, which lives in HQ, not in whatsapp_automation","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-07-11T00:00:05Z","metadata":{}}]'
 LOG18W="$(PILOT_PATH_RIG_GUARD=0 PILOT_MISSING_FILE_GUARD=1 PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$MISSING_FIX")"
 B18W="$(dispatched_builder "$LOG18W")"
 echo "$LOG18W" | grep -q "missing-file guard: ga-missfile" && ok "missing-file guard FIRED: cited file present in HQ, absent in whatsapp_automation → cleared the inference" || bad "missing-file guard did NOT fire (expected refuse+reroute)"
@@ -5336,7 +5400,7 @@ fi
 # generate's generate-and-send step stamps it on every digest bead by
 # construction (`gc bd create --label=digest,{{period}}`), daily and weekly.
 echo "Scenario ga-mhbyc-a: precondition — digest's own 'By Rig' table trips bead_content_rig (whatsapp) and bead_domain (data, not infra)"
-DIGEST_BEAD='{"id":"ga-digesttest","title":"Digest: 2026-07-27","priority":2,"issue_type":"task","description":"# Gas Town Daily Digest: 2026-07-27\n\n## By Rig\n| Rig | Filed | Closed | Merges | Notes |\n|-----|-------|--------|--------|-------|\n| gascity (HQ) | 163 | 5172 | 2 | HQ + framework |\n| property_scrapers | 0 | 0 | 0 | independent repo, quiet day |\n| whatsapp_automation | 4 | 22 | 0 | independent repo |\n","status":"open","labels":["daily","digest"],"assignee":null,"created_at":"2026-07-28T14:59:04Z","metadata":{}}'
+DIGEST_BEAD='{"id":"ga-digesttest","title":"Digest: 2026-07-27","priority":2,"issue_type":"task","description":"# Gas Town Daily Digest: 2026-07-27\n\n## By Rig\n| Rig | Filed | Closed | Merges | Notes |\n|-----|-------|--------|--------|-------|\n| gascity (HQ) | 163 | 5172 | 2 | HQ + core |\n| property_scrapers | 0 | 0 | 0 | independent repo, quiet day |\n| whatsapp_automation | 4 | 22 | 0 | independent repo |\n","status":"open","labels":["daily","digest"],"assignee":null,"created_at":"2026-07-28T14:59:04Z","metadata":{}}'
 [ "$(_bcr "$DIGEST_BEAD")" = whatsapp_automation ] && ok "precondition: bead_content_rig mis-infers whatsapp_automation from the digest's own By-Rig table (incidental 'whatsapp' mention)" || bad "precondition changed: bead_content_rig='$(_bcr "$DIGEST_BEAD")'"
 [ "$(_dom "$DIGEST_BEAD")" != infra ] && ok "precondition: bead_domain does NOT classify the digest as infra (scraper⊂property_scrapers hits the EARLIER-checked data branch)" || bad "precondition changed: bead_domain='$(_dom "$DIGEST_BEAD")' — exemption (a) would already cover this"
 
@@ -5347,7 +5411,7 @@ echo "$B_DIGEST" | grep -qE '^gastown\.dog' && ok "digest-labeled bead dispatche
 echo "$LOG_DIGEST" | grep -q "framework-dog-exempt: ga-digesttest is gascity-framework work (digest-label)" && ok "exemption reason 'digest-label' logged" || bad "digest-label exemption not logged"
 
 echo "Scenario ga-mhbyc-c (control): SAME digest body WITHOUT the digest label → still refused+held (proves the label, not something else, is what saves it)"
-DIGEST_NOLABEL='{"id":"ga-digestctl","title":"Digest: 2026-07-27","priority":2,"issue_type":"task","description":"# Gas Town Daily Digest: 2026-07-27\n\n## By Rig\n| Rig | Filed | Closed | Merges | Notes |\n|-----|-------|--------|--------|-------|\n| gascity (HQ) | 163 | 5172 | 2 | HQ + framework |\n| property_scrapers | 0 | 0 | 0 | independent repo, quiet day |\n| whatsapp_automation | 4 | 22 | 0 | independent repo |\n","status":"open","labels":["daily"],"assignee":null,"created_at":"2026-07-28T14:59:05Z","metadata":{}}'
+DIGEST_NOLABEL='{"id":"ga-digestctl","title":"Digest: 2026-07-27","priority":2,"issue_type":"task","description":"# Gas Town Daily Digest: 2026-07-27\n\n## By Rig\n| Rig | Filed | Closed | Merges | Notes |\n|-----|-------|--------|--------|-------|\n| gascity (HQ) | 163 | 5172 | 2 | HQ + core |\n| property_scrapers | 0 | 0 | 0 | independent repo, quiet day |\n| whatsapp_automation | 4 | 22 | 0 | independent repo |\n","status":"open","labels":["daily"],"assignee":null,"created_at":"2026-07-28T14:59:05Z","metadata":{}}'
 LOG_DIGESTCTL="$(run_capacity 10 "[]" 1 "[$DIGEST_NOLABEL]")"
 echo "$LOG_DIGESTCTL" | grep -q "REFUSING to dispatch whatsapp_automation domain build ga-digestctl" \
   && ok "control: without the digest label the same bead IS refused+held (proves exemption (e) — not some other accident — is what flips scenario ga-mhbyc-b)" \

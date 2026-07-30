@@ -275,6 +275,62 @@ else
   fi
 fi
 
+# ── Scenario I (ga-1mqdz AC3): explicitly-parked beads skip hold/escalation ──
+# Bug ga-1mqdz: a bead already parked by an EXPLICIT human/Mayor decision
+# (pilot:no-auto-dispatch, or any needs-human/needs-approval gate label) must
+# not have its hold counted or escalated — that counter exists for beads that
+# SHOULD be flowing and genuinely aren't (e.g. "no idle crew"), not for beads
+# a human already told the Pilot to leave alone. Real incident (dolt_diff-
+# confirmed on ga-t8274/ga-i0n83): pilot:no-auto-dispatch predated the first
+# hold by 5 days, yet 3 holds were counted and escalated anyway before AC1
+# (the candidacy fix, tested separately) closes the primary gap — this is the
+# defense-in-depth layer for any OTHER path that might still reach this
+# function on an explicitly-parked bead.
+echo "Scenario I: pilot:no-auto-dispatch bead skips hold/escalation entirely — no stamp, no mail, no comment"
+run_hold "db1" "bd-parked" "ga-lfvs6" "no idle crew" "map a crew" '["pilot:no-auto-dispatch"]' 3 0
+if has_call "already parked by explicit decision"; then
+  ok "logs the skip reason (no-auto-dispatch/needs-human)"
+else
+  bad "did not log the expected skip reason (dump: $(cat "$CALLS" | tr '\n' '|'))"
+fi
+if grep -qE '^(bd|gc)	' "$CALLS"; then
+  bad "REGRESSION: pilot:no-auto-dispatch bead triggered a real bd/gc mutation (dump: $(cat "$CALLS" | tr '\n' '|'))"
+else
+  ok "no bd/gc mutation at all for a no-auto-dispatch bead (no stamp, no escalation labels, no mail)"
+fi
+
+echo "Scenario I2: gate:needs-human bead ALSO skips hold/escalation (same explicit-decision family)"
+run_hold "db1" "bd-parked2" "ga-jazy9" "no dog pool" "wait for a persistent crew" '["gate:needs-human"]' 3 0
+if has_call "already parked by explicit decision"; then
+  ok "gate:needs-human bead also logs the skip reason"
+else
+  bad "gate:needs-human bead did not skip (dump: $(cat "$CALLS" | tr '\n' '|'))"
+fi
+if grep -qE '^(bd|gc)	' "$CALLS"; then
+  bad "REGRESSION: gate:needs-human bead triggered a real bd/gc mutation (dump: $(cat "$CALLS" | tr '\n' '|'))"
+else
+  ok "gate:needs-human bead: no bd/gc mutation, no hold-count stamp, no escalation"
+fi
+
+echo "Scenario I3 (AT cap — must NOT re-escalate): a bead already at cap AND explicitly parked stays skipped"
+run_hold "db1" "bd-parked3" "ga-lfvs6" "no idle crew" "map a crew" '["pilot:no-auto-dispatch","pilot:held-count:ga-lfvs6:3"]' 3 0
+if has_call "mail send mayor"; then
+  bad "REGRESSION: an explicitly-parked bead at cap was RE-escalated (should stay silent — already the Mayor's to unpark)"
+else
+  ok "explicitly-parked bead at cap does not re-escalate"
+fi
+
+echo "Scenario I4 (no false-positive): a normal bead with NO explicit-decision label still holds/escalates exactly as before"
+run_hold "db1" "bd-normal" "ga-lfvs6" "no idle crew" "map a crew" '["lane:small"]' 3 1
+if has_call "log	[pilot-hold] WOULD stamp pilot:held-count:ga-lfvs6:1 on bd-normal (hold 1/3)"; then
+  ok "a normal (unparked) bead is unaffected by the AC3 skip — holds exactly as before"
+else
+  bad "REGRESSION: AC3 skip over-fired on a bead with no explicit-decision label (dump: $(cat "$CALLS" | tr '\n' '|'))"
+fi
+
+echo "Scenario I5: drift-guard — the AC3 skip is wired into _pilot_hold_or_escalate"
+echo "$HOLD_FN" | grep -q 'pilot:no-auto-dispatch' && ok "_pilot_hold_or_escalate carries the pilot:no-auto-dispatch skip clause" || bad "pilot:no-auto-dispatch skip clause missing from _pilot_hold_or_escalate"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "pilot-hold-escalate.selftest: $PASS passed, $FAIL failed"

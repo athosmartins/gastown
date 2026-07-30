@@ -1474,6 +1474,35 @@ PILOT_HOLD_ESCALATE_CAP="${PILOT_HOLD_ESCALATE_CAP:-3}"
 _pilot_hold_or_escalate() {
   local _phe_db="$1" _phe_id="$2" _phe_slug="$3" _phe_reason="$4" _phe_unblock="$5"
   local _phe_labels="${6:-[]}" _phe_cap="${7:-$PILOT_HOLD_ESCALATE_CAP}"
+
+  # ga-1mqdz AC3: a bead already parked by an EXPLICIT human/Mayor decision
+  # (pilot:no-auto-dispatch, or any needs-human/needs-approval human-gate
+  # label) is out of flow ON PURPOSE — this counter's 3-strikes-then-escalate
+  # treatment exists for beads that SHOULD be flowing and genuinely aren't
+  # (e.g. "no idle crew this sweep"), not for beads a human already told the
+  # Pilot to leave alone. Confirmed live (dolt_diff, ga-t8274/ga-i0n83): both
+  # carried pilot:no-auto-dispatch for 5 days before EVER reaching this
+  # function, then were held/escalated 3 times over ~2h40m — pure noise, since
+  # AC1 (this same fix) means such a bead should never be a candidate in the
+  # first place. This is the defense-in-depth layer: even if some OTHER,
+  # not-yet-found candidacy gap lets an explicitly-parked bead through, it
+  # still must not burn the hold-count/escalate cycle. Skip silently — no
+  # stamp, no mail, no comment; the bead is already the Mayor's to unpark.
+  # Checked against the SAME in-memory labels_json callers already pass in (no
+  # extra bd round-trip), mirroring _filter_candidates' equivalent clauses.
+  if printf '%s' "$_phe_labels" | jq -e '
+      (. // []) | any(
+        . == "pilot:no-auto-dispatch"
+        or startswith("gate:needs-human")
+        or startswith("needs-human")
+        or . == "story:needs-human"
+        or . == "story:needs-approval"
+      )
+    ' >/dev/null 2>&1; then
+    log "[pilot-hold] $_phe_slug: $_phe_id already parked by explicit decision (no-auto-dispatch/needs-human) — skipping hold-count/escalation (ga-1mqdz AC3)"
+    return 0
+  fi
+
   local _phe_prefix="pilot:held-count:${_phe_slug}:"
   local _phe_cur _phe_new
   _phe_cur=$(printf '%s' "$_phe_labels" | jq -r --arg p "$_phe_prefix" \
@@ -1621,6 +1650,21 @@ _filter_candidates() {
           # way: this is a human decision gate, not a code-quality gate that
           # gate-done/autonomous review can ever clear.
           or . == "story:needs-approval"
+          # ga-1mqdz AC1: pilot:no-auto-dispatch is a direct Mayor/human "stop
+          # dispatching this" signal (used to defer/park a bead without a
+          # full story:* refino lifecycle) but this filter — the single
+          # chokepoint every candidate source funnels through — never
+          # checked it, so only the pilot:held-until 1h backoff between
+          # attempts kept re-selecting it. Confirmed live (dolt_diff on
+          # ga-t8274/ga-i0n83): pilot:no-auto-dispatch was added 5 DAYS
+          # before either bead was first selected as a dispatch candidate,
+          # attempted, refused, and held — 3 times over ~2h40m — before the
+          # hold-cap escalation itself (a SEPARATE mechanism) finally added
+          # gate:needs-human and stopped it. The label alone must hold, per
+          # the memory this fixes (pilot-no-auto-dispatch-not-respected-by-
+          # pilot-dispatcher / wa-0sk7n): "strip ctx:ready+exec:auto" was
+          # never meant to be the ONLY way to pause a bead.
+          or . == "pilot:no-auto-dispatch"
           or . == "story:needs-device"
           or . == "on-device"
           or . == "story:blocked"
@@ -5039,6 +5083,36 @@ LIVESEC
           #     the formula on every digest bead, daily and weekly, by construction. jq -e
           #     any(); fail-open.
           if [ "$_FW_EXEMPT" = "0" ] && echo "$STORY" | jq -e '(.labels // []) | any(. == "digest")' >/dev/null 2>&1; then _FW_EXEMPT=1; _FW_REASON="digest-label"; fi
+          # (f) ga-1mqdz (AC2): the bead's text ALSO matches bead_domain's infra
+          #     keyword set, even though bead_domain returned an EARLIER-checked
+          #     PRODUCT domain instead. bead_domain checks frontend/real-estate/
+          #     warming/data BEFORE infra (by design, for its OTHER caller —
+          #     rig_domain_owner/exclude crew-picking — where "most-specific
+          #     product domain wins" is correct), so any earlier match SHADOWS an
+          #     infra signal that is also genuinely present, hiding it from
+          #     exemption (a). Concrete case: ga-t8274/ga-i0n83, two genuine Pilot/
+          #     gate-dispatcher framework bugs (cite "gate dispatcher"/"dispatcher"
+          #     in prose) that ALSO describe a SYMPTOM — "o painel mostra N beads
+          #     presos" — tripping \bkanban\b/\bpainel\b, bead_domain's FRONTEND
+          #     check (checked first). bead_domain returns "frontend", never
+          #     reaches "infra", and the bead is REFUSED+held every sweep for 3
+          #     cycles although it is unmistakably dog-appropriate framework work
+          #     (confirmed live via dolt_diff: pilot:no-auto-dispatch predates the
+          #     first hold by 5 days — see AC1 above — so this is a genuinely
+          #     stuck framework bug, not a misfiled product build). Re-checks
+          #     bead_domain's OWN infra regex directly (duplicated here — keep in
+          #     sync with the "infra" branch inside bead_domain() above) rather
+          #     than reordering bead_domain's precedence globally, which would
+          #     change rig_domain_owner/exclude's crew-pick behaviour for every
+          #     OTHER caller, an unrelated blast radius this fix does not need.
+          #     jq -e any(); fail-open.
+          if [ "$_FW_EXEMPT" = "0" ] && echo "$STORY" | jq -r '
+              [ (.title // ""), (.description // ""),
+                (.acceptance_criteria // .metadata["story.criterios"] // ""),
+                ((.labels // []) | join(" ")) ] | join("  ")
+            ' 2>/dev/null | grep -iqE '\bdolt\b|gate dispatcher|\breviewer\b|\bdispatcher\b|\bframework\b|headroom|\brefinery\b'; then
+            _FW_EXEMPT=1; _FW_REASON="infra-keyword-shadowed(bead_domain=$_FW_DOMAIN)"
+          fi
           if [ "$_FW_EXEMPT" = "1" ]; then
             log "framework-dog-exempt: $STORY_ID is gascity-framework work ($_FW_REASON) but bead_content_rig mis-inferred rig=$_DOMAIN_RIG from an incidental keyword — the dog pool ($BUILDER_TARGET) IS its correct builder (HQ checkout, git-diff, gate access). Clearing product-rig inference so the domain-route guard FAILS OPEN (dispatch, not REFUSE+1h-hold). Disable with PILOT_FRAMEWORK_DOG_EXEMPT=0."
             _DOMAIN_RIG=""
