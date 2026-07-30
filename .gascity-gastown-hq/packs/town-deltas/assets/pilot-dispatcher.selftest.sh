@@ -1037,6 +1037,38 @@ EXTPR_PENDING='[{"id":"bd-extpr-pending","assignee":null,"labels":["story:approv
 [ "$(_fc "$EXTPR_PENDING")" = '["bd-free7"]' ] && ok "ga-spux4: story:awaiting-external-merge bead excluded; free story:approved kept (external-PR hold honored)" || bad "ga-spux4: story:awaiting-external-merge not excluded (got: $(_fc "$EXTPR_PENDING"))"
 grep -qE '"story:awaiting-external-merge"' "$DISPATCHER" && ok "_filter_candidates carries the story:awaiting-external-merge clause" || bad "story:awaiting-external-merge clause missing from _filter_candidates"
 
+# ── Scenario 3e2k (ga-xdukc/ga-hd87d): DECISAO-titled / Athos-decide-phrased beads
+# excluded via body-text veto, independent of labels ────────────────────────────
+# wa-5ch02 ("DECISAO (Athos): classificacao deve pagar conexoes (R$0,32/CPF) ou
+# basta o fetch lazy do outreach?", body: "So o Athos decide isso - e dinheiro por
+# volume, nao escolha tecnica.") carried refino:policy-gap + story:refino-escalado
+# but NEITHER story:needs-human NOR any gate:needs-human* label reached the bead —
+# Pilot dispatched it with "No human review required" and only a workers manual
+# refusal stopped an agent from deciding a real spend policy alone. The origin fix
+# (auto-refino-dispatcher.sh escalate case now stamps story:needs-human
+# deterministically) closes the gap at its source; this is the independent,
+# label-blind safety net: a bead whose TITLE BEGINS WITH DECISAO/DECISION, or
+# whose title+description says "so o Athos decide" (accent-insensitive), must
+# never be dispatched, even with zero human-gate labels present.
+echo "Scenario 3e2k (ga-xdukc): DECISAO-titled bead excluded even though its only label is refino:policy-gap; a sibling policy-gap bead with an ordinary title is still dispatchable"
+DECISAO_TITLED='[{"id":"bd-decisao","assignee":null,"labels":["refino:policy-gap","story:refino-escalado"],"title":"DECISÃO (Athos): classificação deve pagar conexões (R$0,32/CPF) ou basta o fetch lazy do outreach?","description":"Só o Athos decide isso — é dinheiro por volume, não escolha técnica."},{"id":"bd-policygap-normal","assignee":null,"labels":["refino:policy-gap","story:refino-escalado"],"title":"Sub-decisão de escopo do split de epic","description":"fixture body — refino escalated for an unrelated scope question"}]'
+[ "$(_fc "$DECISAO_TITLED")" = '["bd-policygap-normal"]' ] && ok "ga-xdukc: DECISAO-titled bead excluded by text alone; ordinary-titled refino:policy-gap sibling still dispatchable (the other 15 beads AC1 protects)" || bad "ga-xdukc: DECISAO-title veto failed (got: $(_fc "$DECISAO_TITLED"))"
+
+echo "Scenario 3e2k-en (ga-xdukc): English DECISION-titled bead excluded, carries NO labels at all (pure text signal)"
+DECISION_EN='[{"id":"bd-decision-en","assignee":null,"labels":[],"title":"DECISION: which vendor for the SMS gateway?","description":"fixture body"},{"id":"bd-keep-en","assignee":null,"labels":[],"title":"Fix pagination bug in the outreach dashboard","description":"fixture body"}]'
+[ "$(_fc "$DECISION_EN")" = '["bd-keep-en"]' ] && ok "ga-xdukc: unlabeled DECISION-titled bead excluded by title text alone; unrelated bug kept" || bad "ga-xdukc: DECISION(en)-title veto failed (got: $(_fc "$DECISION_EN"))"
+
+echo "Scenario 3e2k-body (ga-xdukc): body-only Athos-decide phrase excluded even with an unrelated title"
+BODY_PHRASE='[{"id":"bd-body-phrase","assignee":null,"labels":[],"title":"Classificacao deve pagar conexoes por CPF","description":"So o Athos decide isso, nao e escolha tecnica."},{"id":"bd-keep-body","assignee":null,"labels":[],"title":"Fix pagination bug","description":"fixture body"}]'
+[ "$(_fc "$BODY_PHRASE")" = '["bd-keep-body"]' ] && ok "ga-xdukc: body-only Athos-decide phrase excluded; unrelated bug kept" || bad "ga-xdukc: body-phrase veto failed (got: $(_fc "$BODY_PHRASE"))"
+
+echo "Scenario 3e2k-benign (ga-xdukc): 'decision' as an ordinary mid-title word must NOT false-positive (regex anchored to title start, regression guard)"
+BENIGN_DECISION_WORD='[{"id":"bd-benign-decision","assignee":null,"labels":[],"title":"Refactor the decision tree module in the pricing engine","description":"unrelated to any Athos approval, just an engineering refactor"}]'
+[ "$(_fc "$BENIGN_DECISION_WORD")" = '["bd-benign-decision"]' ] && ok "ga-xdukc: mid-title 'decision' word NOT caught by the anchored veto (no over-broad regex)" || bad "ga-xdukc: REGRESSION — benign mid-title 'decision' word wrongly excluded (got: $(_fc "$BENIGN_DECISION_WORD"))"
+
+echo "$_FC_FN" | grep -qE 'DECIS\[' && ok "_filter_candidates carries the DECISAO/DECISION title-anchor clause" || bad "DECISAO/DECISION title-anchor clause missing from _filter_candidates"
+echo "$_FC_FN" | grep -qE 'athos decide' && ok "_filter_candidates carries the so-o-Athos-decide body-phrase clause" || bad "so-o-Athos-decide body-phrase clause missing from _filter_candidates"
+
 # ── Scenario OWN-GUARD (ga-htjni ext; wa-5wv49 / wa-xnuxd) ──────────────────────
 # The reported systemic double-dispatch: a crew/human creates a bead intending to
 # build it THEMSELVES and claims it (status=in_progress + assignee=<self>) — yet the

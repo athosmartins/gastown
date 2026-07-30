@@ -1722,6 +1722,29 @@ _filter_candidates() {
         and (((.title // "") + " " + (.description // ""))
              | test("gascity.*rebuild|rebuild.*gascity|swap.*bin[áa]rio|swap.*binary|binary swap|town bounce|engine[ -]window"; "i")
              | not)
+        # ga-xdukc/ga-hd87d: independent safety net (defense-in-depth), same
+        # shape as the engine-rebuild veto directly above. A bead whose TITLE
+        # BEGINS WITH DECISAO/DECISION, or whose title+description contains
+        # "so o Athos decide", is a human-decision-only bead by its own text —
+        # regardless of whether refinos escalation labels (story:needs-human,
+        # gate:needs-human:*) actually landed on it. wa-5ch02 (a real
+        # Athos-money decision: DECISAO (Athos): classificacao deve pagar
+        # conexoes...) proved neither label reached the bead before Pilot
+        # dispatched it with No human review required — manual refusal by a
+        # dispatched worker was the only thing that stopped an agent from
+        # deciding a spend policy alone. The escalate-path fix
+        # (auto-refino-dispatcher.sh, story:needs-human) closes the gap at its
+        # source; this is the belt to that suspenders — cheap to keep (worst
+        # case: one extra bead waits for a human that did not strictly need to).
+        # NOTE: no literal apostrophes anywhere in this comment block — this
+        # whole clause lives inside ONE bash single-quoted jq argument, so a
+        # stray apostrophe (even inside a # comment) prematurely closes the
+        # bash string and desyncs everything after it (caught live while
+        # writing this fix — do not reintroduce one here).
+        and (((.title // "") | test("^\\s*(DECIS[ÃA]O|DECISION)\\b"; "i")) | not)
+        and (((.title // "") + " " + (.description // ""))
+             | test("s[óo] o athos decide"; "i")
+             | not)
      )]' \
     2>/dev/null)
   [ -z "$_cf_out" ] && _cf_out="[]"
@@ -1772,7 +1795,13 @@ _filter_candidates() {
           (if ((($b.description // "") | test("\\S")) | not) then "empty-description" else empty end),
           (if ( ((($b.title // "") + " " + ($b.description // ""))
                  | test("gascity.*rebuild|rebuild.*gascity|swap.*bin[áa]rio|swap.*binary|binary swap|town bounce|engine[ -]window"; "i")) )
-           then "engine-rebuild-text-pattern" else empty end)
+           then "engine-rebuild-text-pattern" else empty end),
+          (if (($b.title // "") | test("^\\s*(DECIS[ÃA]O|DECISION)\\b"; "i"))
+           then "decisao-title-text-pattern"
+           elif ( ((($b.title // "") + " " + ($b.description // ""))
+                   | test("s[óo] o athos decide"; "i")) )
+           then "athos-decide-phrase-text-pattern"
+           else empty end)
         ] as $reasons
       | select(($reasons | length) > 0)
       | [$id, ($reasons | join(";"))] | @tsv

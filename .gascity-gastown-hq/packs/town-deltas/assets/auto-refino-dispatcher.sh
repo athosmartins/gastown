@@ -1481,6 +1481,25 @@ case "$DECISION" in
     # as skip (not fresh/bounce), so it is NOT re-picked. Keep auto-refino:escalated
     # (the daemon's durable skip/attempt-tracking marker) alongside it.
     bd_ label add "$STORY_ID" "story:refino-escalado" -q 2>/dev/null || true
+    # ga-xdukc/ga-hd87d: a POLICY-GAP escalation is a human-decision gate, same
+    # class as story:needs-approval — but until now nothing in this DETERMINISTIC
+    # bash path stamped a label Pilot's _filter_candidates actually excludes on.
+    # The spawned refiner's own PATH B heredoc instructs it to add
+    # gate:needs-human:product (also excluded, via startswith), but that's an LLM
+    # agentic tool call — best-effort, not guaranteed to run every time. wa-5ch02
+    # (a real Athos-money DECISÃO bead) proved the gap: it carried refino:policy-gap
+    # + story:refino-escalado but reached Pilot with NEITHER story:needs-human NOR
+    # gate:needs-human:product, and was dispatched with "No human review required"
+    # — only a worker's manual refusal caught it. Stamp story:needs-human HERE,
+    # in code that runs unconditionally on every escalate (policy-gap AND
+    # budget-exhaustion — both already mean "stop auto-dispatching, wait for
+    # Athos" per the surrounding comments), so the guarantee no longer depends on
+    # the refiner sub-agent's prompt-following. Pilot's own candidate filter
+    # (_filter_candidates) already excludes this exact label — no Pilot-side
+    # change is needed to close this gap, only this stamp.
+    # Not in AUTO_REFINO_LIFECYCLE_LABELS (same reasoning as story:refino-escalado
+    # above), so _clear_lifecycle never strips it.
+    bd_ label add "$STORY_ID" "story:needs-human" -q 2>/dev/null || true
     if [ "$OUTCOME" != "ESCALATE" ]; then
       # Budget-exhaustion escalation (the refiner kept producing REFINED but the
       # gate kept bouncing). Record why.

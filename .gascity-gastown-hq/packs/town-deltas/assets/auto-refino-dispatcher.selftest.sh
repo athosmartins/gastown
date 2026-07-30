@@ -37,6 +37,12 @@
 #   of the painel "Sua vez" human queue, and an escalated-only bead looked RAW and
 #   re-ingested forever) → Scenario 11 + drift-guard 4b (story:refino-escalado
 #   added in both escalate paths, survives _clear_lifecycle, RAW source excludes it).
+#   Policy-gap dispatch gap (ga-xdukc/ga-hd87d: an escalated bead reached Pilot
+#   with refino:policy-gap + story:refino-escalado but NEITHER story:needs-human
+#   NOR gate:needs-human:* — Pilot dispatched it with "No human review required")
+#   → drift-guard 4c (the deterministic escalate case stamps story:needs-human,
+#   the label pilot-dispatcher.sh _filter_candidates already excludes on exactly;
+#   survives _clear_lifecycle the same way story:refino-escalado does).
 #   Multi-store funnel (WA/PS rig-store stories were starving in Triagem because
 #   the daemon only read/wrote HQ) → Scenario 12 (AUTO_REFINO_STORES iteration +
 #   per-store write-back to $AR_BEAD_STORE).
@@ -412,6 +418,49 @@ if grep -qF '*,story:refino-escalado,*' "$DISPATCHER"; then
   ok "classifier skip-set treats story:refino-escalado as terminal (structural belt)"
 else
   bad "classifier skip-set does not list story:refino-escalado — could be re-picked if marker stripped"
+fi
+
+# 4c. ga-xdukc/ga-hd87d BUG: the escalate path must ALSO add story:needs-human —
+#     the exact label pilot-dispatcher.sh _filter_candidates already excludes on
+#     (. == "story:needs-human"), so no Pilot change is required once this daemon
+#     stamps it reliably. Before this fix, the deterministic bash escalate case
+#     added ONLY auto-refino:escalated + story:refino-escalado; the spawned
+#     refiners own PATH B heredoc separately instructs it to add
+#     gate:needs-human:product, but that is an LLM agentic tool call — best
+#     effort, not guaranteed on every run. wa-5ch02 proved the gap live: escalated
+#     with refino:policy-gap + story:refino-escalado, reached Pilot with NEITHER
+#     needs-human label, dispatched with "No human review required." This check
+#     is scoped to the DETERMINISTIC bash path only (must appear at least once,
+#     unlike the story:refino-escalado check above which requires 2 hits across
+#     both the bash path and the heredoc — story:needs-human is a NEW label this
+#     fix introduces only in the bash path, not in the heredocs gate:needs-human:
+#     product convention).
+if grep -qF 'label add "$STORY_ID" "story:needs-human"' "$DISPATCHER"; then
+  ok "escalate path (deterministic bash) adds story:needs-human — Pilot _filter_candidates already excludes this exact label (ga-xdukc/ga-hd87d)"
+else
+  bad "escalate path does NOT add story:needs-human — a policy-gap escalation can still reach Pilot with no label it excludes on (ga-xdukc/ga-hd87d REGRESSION)"
+fi
+# story:needs-human must NOT be in AUTO_REFINO_LIFECYCLE_LABELS, otherwise
+# _clear_lifecycle (called earlier in the same escalate case) would strip it
+# right back off before it ever reached Dolt.
+if grep -q '^AUTO_REFINO_LIFECYCLE_LABELS=' "$DISPATCHER" \
+   && grep '^AUTO_REFINO_LIFECYCLE_LABELS=' "$DISPATCHER" | grep -q 'story:needs-human'; then
+  bad "story:needs-human is in AUTO_REFINO_LIFECYCLE_LABELS — _clear_lifecycle would strip the label this fix just added"
+else
+  ok "story:needs-human is NOT in AUTO_REFINO_LIFECYCLE_LABELS (survives _clear_lifecycle)"
+fi
+# Ordering: the label add must appear AFTER _clear_lifecycle in the escalate
+# case, not before (else the strip could race/overwrite an in-flight add on a
+# re-escalation). Both this label and story:refino-escalado follow the same
+# convention; assert story:needs-human is not accidentally placed upstream of
+# the _clear_lifecycle call within the same case block.
+_esc_block=$(awk '/^  escalate\)$/{f=1} f{print} f&&/^    ;;$/{exit}' "$DISPATCHER")
+_clear_line=$(printf '%s\n' "$_esc_block" | grep -n '_clear_lifecycle "\$STORY_ID"' | head -1 | cut -d: -f1)
+_needshuman_line=$(printf '%s\n' "$_esc_block" | grep -n 'label add "\$STORY_ID" "story:needs-human"' | head -1 | cut -d: -f1)
+if [ -n "$_clear_line" ] && [ -n "$_needshuman_line" ] && [ "$_needshuman_line" -gt "$_clear_line" ]; then
+  ok "story:needs-human is added AFTER _clear_lifecycle within the escalate case (correct ordering)"
+else
+  bad "story:needs-human ordering relative to _clear_lifecycle is wrong or indeterminate (clear_line=$_clear_line needshuman_line=$_needshuman_line) — could be stripped by the same case that adds it"
 fi
 
 # 5. Candidate selection is restricted to feature/story (bug/chore/task bypass):
