@@ -67,6 +67,18 @@ _should_notify 1000 1100 3600 8 5  && bad "should_notify: within cooldown, impro
 _should_notify 1000 4601 3600 8 8  && ok "should_notify: cooldown elapsed, stable avail → notify (repeat allowed)" || bad "should_notify: elapsed cooldown should notify regardless of trend"
 _should_notify "" 1100 3600 8 ""   && ok "should_notify: never notified before → notify (fail-open)"               || bad "should_notify: first-ever call should notify"
 
+# ── _sustain_confirmed: CRITICAL-mail debounce gate (ga-q4cqr) — the
+#    boundary is >= (inclusive), and a corrupt/non-numeric pending count
+#    fails CLOSED (never confirmed), the opposite direction from
+#    _cooldown_elapsed's fail-open — see the function's own comment for why.
+_sustain_confirmed 2 2   && ok "sustain_confirmed: pending==threshold → confirmed (boundary inclusive)" || bad "sustain_confirmed: 2>=2 should confirm"
+_sustain_confirmed 3 2   && ok "sustain_confirmed: pending>threshold → confirmed"                        || bad "sustain_confirmed: 3>=2 should confirm"
+_sustain_confirmed 1 2   && bad "sustain_confirmed: pending<threshold should NOT confirm"                || ok "sustain_confirmed: 1<2 → not yet confirmed"
+_sustain_confirmed 0 2   && bad "sustain_confirmed: pending=0 should NOT confirm"                        || ok "sustain_confirmed: 0<2 → not yet confirmed"
+_sustain_confirmed "" 2  && bad "sustain_confirmed: empty pending should fail CLOSED, not confirm"       || ok "sustain_confirmed: empty pending → fails closed (never confirmed)"
+_sustain_confirmed abc 2 && bad "sustain_confirmed: non-numeric pending should fail CLOSED"              || ok "sustain_confirmed: non-numeric pending → fails closed"
+_sustain_confirmed 1 1   && ok "sustain_confirmed: threshold=1 (sustain disabled/immediate) → confirmed on 1st sample" || bad "sustain_confirmed: 1>=1 should confirm"
+
 echo ""
 echo "=== _reap_dead_scratch: production sentinel wiring (ga-h565g) ==="
 # _reap_dead_scratch is the REAL caller scratchpad-reaper.sh's own header
@@ -148,6 +160,15 @@ mkdir -p "$STATE_TMP"
 STATE_DIR="$STATE_TMP"
 STATE_EPOCH_FILE="$STATE_TMP/.last-notify"
 STATE_AVAIL_FILE="$STATE_TMP/.last-notify-avail-gb"
+# ga-q4cqr: MUST be redirected exactly like the two state files above — it was
+# evaluated at SOURCE time against the real $CITY/.gc/logs (before this
+# override runs), and _read_critical_sustain/_write_critical_sustain reference
+# the variable by name at call time, so without this line every scenario below
+# would read/write the REAL production sustain-count file instead of this
+# disposable one (caught live: a first draft of this suite leaked a stray
+# `.dolt-disk-floor-guard.critical-sustain-count` file into the real
+# $CITY/.gc/logs before this redirect was added).
+STATE_CRITICAL_SUSTAIN_FILE="$STATE_TMP/.critical-sustain-count"
 
 # Canned avail-GB readings: main() calls _avail_gb exactly twice per cycle
 # (pre-reclaim, then post-reclaim), both via `$(...)` command substitution —
@@ -212,18 +233,63 @@ seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
 }
+# ga-q4cqr: seed/read the CRITICAL-mail sustain counter directly, so scenarios
+# can set up "already N cycles into a streak" without needing N real main()
+# calls, and can verify main() left the expected count behind afterward.
+seed_critical_sustain() {
+  if [ -n "$1" ]; then echo "$1" > "$STATE_CRITICAL_SUSTAIN_FILE"; else rm -f "$STATE_CRITICAL_SUSTAIN_FILE"; fi
+}
+read_critical_sustain_state() { [ -f "$STATE_CRITICAL_SUSTAIN_FILE" ] && cat "$STATE_CRITICAL_SUSTAIN_FILE" || echo ""; }
 
 # Scenario A — repro path (a) from the GATE-FEEDBACK: CRITICAL (2GB) fully
 # recovers to NONE (20GB) after reclaim. Pre-fix, main() hit the early return
 # "back above floor after reclaim — no notify needed" and NEITHER notify nor
 # mail-Mayor ever fired for a reading that was CRITICAL moments earlier.
-reset_capture; seed_state "" ""
+# ga-q4cqr: mail is now sustain-gated (default threshold 2) — a single
+# CRITICAL cycle notifies immediately (prio 5, unconditional per imp07) but
+# must NOT yet mail; it should leave a pending count of 1 behind for the next
+# cycle to potentially confirm. See Scenario A2 for the 2nd-cycle confirm.
+reset_capture; seed_state "" ""; seed_critical_sustain ""
 queue_avail 2 20
 main
-if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CALLS" = "1" ]; then
-  ok "main(): CRITICAL avail fully recovered by reclaim still notifies (prio 5) + mails Mayor"
+if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CALLS" = "0" ] && [ "$(read_critical_sustain_state)" = "1" ]; then
+  ok "main(): CRITICAL avail fully recovered by reclaim still notifies (prio 5); mail debounced (pending 1/2)"
 else
-  bad "main(): CRITICAL->NONE recovery lost the notify/mail (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS)"
+  bad "main(): CRITICAL->NONE recovery — notify/debounce wrong (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS pending=$(read_critical_sustain_state))"
+fi
+
+# Scenario A2 — ga-q4cqr sustain confirm: a SECOND consecutive CRITICAL cycle
+# (pending already 1 from a prior cycle) must confirm the streak and mail the
+# Mayor this time, while notify keeps firing unconditionally every cycle
+# regardless (same as before this bead — only mail is new/gated).
+reset_capture; seed_state "" ""; seed_critical_sustain 1
+queue_avail 2 20
+main
+if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CALLS" = "1" ] && [ "$(read_critical_sustain_state)" = "2" ]; then
+  ok "main(): 2nd consecutive CRITICAL cycle confirms sustain (2/2) — mails Mayor"
+else
+  bad "main(): 2nd consecutive CRITICAL cycle should confirm + mail (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS pending=$(read_critical_sustain_state))"
+fi
+
+# Scenario A3 — ga-q4cqr streak reset: a non-critical cycle between two
+# CRITICAL cycles must reset the sustain counter, so the second CRITICAL
+# cycle (pending resets to 1, not 3) does NOT prematurely mail. Reuses
+# Scenario D's readings (6 -> 20, fully resolved, non-critical) to perform
+# the reset, then a fresh CRITICAL cycle.
+reset_capture; seed_state "" ""; seed_critical_sustain 1
+queue_avail 6 20
+main
+if [ "$(read_critical_sustain_state)" != "0" ]; then
+  bad "main(): non-critical cycle should reset sustain count to 0, got '$(read_critical_sustain_state)'"
+else
+  reset_capture
+  queue_avail 2 20
+  main
+  if [ "$GC_MAIL_CALLS" = "0" ] && [ "$(read_critical_sustain_state)" = "1" ]; then
+    ok "main(): sustain streak correctly reset by an intervening non-critical cycle (next CRITICAL starts back at 1/2, does not prematurely mail)"
+  else
+    bad "main(): streak reset didn't take — next CRITICAL cycle should start at 1/2 (mail_calls=$GC_MAIL_CALLS pending=$(read_critical_sustain_state))"
+  fi
 fi
 
 # Scenario B — repro path (b), reviewer's exact numbers (WARN=8 CRIT=3
@@ -231,13 +297,19 @@ fi
 # (8GB), within cooldown and not "worsening" vs. a last-notified avail of
 # 8GB. Pre-fix, class was reclassified WARN post-reclaim and ordinary WARN
 # cooldown/worsening suppression swallowed the CRITICAL-only mail-Mayor alert.
+# ga-q4cqr: seeds sustain=1 explicitly (this cycle is the CONFIRMING 2nd) so
+# this scenario stays self-contained/order-independent and keeps proving its
+# original point — cooldown/worsening suppression must never swallow an
+# already-sustain-confirmed CRITICAL mail — rather than accidentally passing
+# on leftover state from whichever scenario happened to run before it.
 reset_capture
 past_epoch=$(( $(date +%s) - 600 ))
 seed_state "$past_epoch" 8
+seed_critical_sustain 1
 queue_avail 2 8
 main
 if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CALLS" = "1" ]; then
-  ok "main(): CRITICAL avail partially recovered into WARN tier still bypasses cooldown + mails Mayor"
+  ok "main(): CRITICAL avail partially recovered into WARN tier still bypasses cooldown + mails Mayor (sustain already confirmed)"
 else
   bad "main(): CRITICAL->WARN partial recovery lost the always-notify/mail-Mayor guarantee (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS)"
 fi

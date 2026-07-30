@@ -39,7 +39,13 @@
 #   CRITICAL_GB (default 3) — same reclaim attempts + notify ALWAYS (cooldown
 #                             bypassed unconditionally — this is the last rung
 #                             before repeating ga-vs55) + a DURABLE mail to the
-#                             Mayor. A near-miss this close to repeating a
+#                             Mayor once CRITICAL_MAIL_SUSTAIN (default 2)
+#                             consecutive cycles confirm it (ga-q4cqr —
+#                             debounces a single self-recovering compaction
+#                             spike; see the Mayor's own 2026-07-27 comment on
+#                             that bead: one such spike fired 4 pages in one
+#                             incident). NOTIFY is never debounced, only the
+#                             mail. A near-miss this close to repeating a
 #                             city-wide outage must survive a session restart, so
 #                             this is mail, not a nudge (see mail-lifecycle
 #                             doctrine: "if the recipient dies and restarts, do
@@ -88,6 +94,19 @@ NOTIFY_COOLDOWN_SECS="${DOLT_DISK_FLOOR_NOTIFY_COOLDOWN_SECS:-3600}"   # 1h — 
 STATE_DIR="${DOLT_DISK_FLOOR_STATE_DIR:-$CITY/.gc/logs}"
 STATE_EPOCH_FILE="$STATE_DIR/.dolt-disk-floor-guard.last-notify"
 STATE_AVAIL_FILE="$STATE_DIR/.dolt-disk-floor-guard.last-notify-avail-gb"
+
+# ga-q4cqr: consecutive CRITICAL cycles required before mailing the Mayor.
+# Mayor's own comment on ga-q4cqr (2026-07-27 incident): a single transient
+# compaction spike (avail dipped to 2GB then self-recovered within one cycle)
+# fired 4 separate pages across the city's guards — "must debounce so a
+# self-recovering condition does not storm the inbox." NOTIFY itself stays
+# UNCONDITIONAL on every CRITICAL cycle (imp07 CALL INVARIANT, unchanged —
+# alerting is the lowest-blast-radius action and must never be suppressed);
+# only the DURABLE mail-Mayor escalation is debounced. Poll cadence is 5min
+# (StartInterval), so the default of 2 consecutive cycles is a ~5-10min
+# confirmation window — mirrors ram-pressure-monitor.sh's RPM_EMERGENCY_SUSTAIN.
+CRITICAL_MAIL_SUSTAIN="${DOLT_DISK_FLOOR_CRITICAL_MAIL_SUSTAIN:-2}"
+STATE_CRITICAL_SUSTAIN_FILE="$STATE_DIR/.dolt-disk-floor-guard.critical-sustain-count"
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
@@ -160,6 +179,24 @@ _should_notify() {
   _worsening "$current" "$last_avail"
 }
 
+# _sustain_confirmed <pending_count> <threshold> → 0 (true) once pending_count
+# has reached threshold. Trivial arithmetic, but kept as a named, unit-tested
+# function — matching this file's own "decisions are pure + tested" convention
+# — so the boundary (>= not >) is explicit and covered, same as _floor_class's
+# inclusive boundaries above. A non-numeric pending_count (corrupt state file)
+# fails CLOSED here (never confirmed) — the OPPOSITE fail-direction from
+# _cooldown_elapsed's fail-open, deliberately: a corrupt cooldown timestamp
+# must never SILENCE a real emergency (imp07), but a corrupt sustain COUNTER
+# must never PREMATURELY confirm one on garbage data — _write_critical_sustain
+# always writes a clean integer, so corruption here would mean external
+# interference, not a normal empty-state case (contrast STATE_EPOCH_FILE/
+# STATE_AVAIL_FILE, which are legitimately empty on a fresh install).
+_sustain_confirmed() {
+  local pending="$1" threshold="$2"
+  case "$pending" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$pending" -ge "$threshold" ]
+}
+
 # ════════════════════════════════════════════════════════════════════════════════
 # EXECUTION (side-effecting; NOT exercised by the selftest)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -175,6 +212,22 @@ _write_state() {
   mkdir -p "$STATE_DIR" 2>/dev/null || true
   echo "$epoch" > "$STATE_EPOCH_FILE" 2>/dev/null || true
   echo "$avail" > "$STATE_AVAIL_FILE" 2>/dev/null || true
+}
+
+# _read_critical_sustain / _write_critical_sustain — persist the consecutive-
+# CRITICAL-cycle counter the mail-Mayor sustain-guard reads. Missing/corrupt
+# state reads as 0 (fresh install / no prior streak — NOT "sustain already
+# confirmed"; see _sustain_confirmed's fail-CLOSED note above for why that
+# asymmetry with the notify-cooldown state files is intentional).
+_read_critical_sustain() {
+  local f="$STATE_CRITICAL_SUSTAIN_FILE" v
+  v="$([ -f "$f" ] && cat "$f" 2>/dev/null)"
+  case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac
+}
+
+_write_critical_sustain() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  echo "$1" > "$STATE_CRITICAL_SUSTAIN_FILE" 2>/dev/null || true
 }
 
 # _safe_reclaim <before_avail_gb> → best-effort `gc dolt-cleanup --force` (orphan
@@ -299,6 +352,7 @@ main() {
   fi
   if [ "$class" = "NONE" ]; then
     log "avail=${avail}GB > floor(warn=${FLOOR_WARN_GB}GB) — OK"
+    _write_critical_sustain 0
     return 0
   fi
 
@@ -330,6 +384,15 @@ main() {
   class="$(_floor_class "$avail" "$FLOOR_WARN_GB" "$FLOOR_CRITICAL_GB")"
   [ "$class" = "CRITICAL" ] && was_critical=1
 
+  # ga-q4cqr: any cycle that is NOT critical (post-reclaim) breaks a
+  # CRITICAL-mail sustain streak, regardless of which of the three
+  # non-critical exits below this cycle takes — mirrors
+  # ram-pressure-monitor.sh resetting its own EMERGENCY sustain count on
+  # every OK *and* every WARN-but-not-EMERGENCY sample. Placed once here
+  # (rather than in each of the three exits) so it can't be missed if a
+  # future edit adds a fourth.
+  [ "$was_critical" = "0" ] && _write_critical_sustain 0
+
   if [ "$class" = "NONE" ] && [ "$was_critical" = "0" ]; then
     log "avail=${avail}GB back above floor after reclaim — no notify needed"
     _write_state "$now" "$avail"
@@ -348,19 +411,31 @@ main() {
     log "class=${class} was_critical=${was_critical}: avail=${avail}GB (warn=${FLOOR_WARN_GB}GB crit=${FLOOR_CRITICAL_GB}GB) — notifying"
     "$NOTIFY" -t "Dolt disk-floor guard" -p "$prio" "🚨 [${class}] Dolt data-dir avail=${avail}GB — reclaim attempted. See ga-gpzr." 2>/dev/null || true
     if [ "$was_critical" = "1" ]; then
-      # NOTE: deliberately NOT a heredoc — bash 3.2 (macOS system /bin/bash, what
-      # launchd invokes per the plist) mis-parses a heredoc nested inside a $(...)
-      # command substitution when the body contains an apostrophe (confirmed by
-      # direct repro on this machine). A plain multi-line double-quoted assignment
-      # has no such bug and is otherwise equivalent.
-      local mail_body="dolt-disk-floor-guard: Dolt data-dir hit CRITICAL floor (<= ${FLOOR_CRITICAL_GB}GB) this cycle.
+      # ga-q4cqr sustain-guard: require CRITICAL_MAIL_SUSTAIN consecutive
+      # CRITICAL cycles before mailing the Mayor — debounces a single
+      # transient dip (self-recovering compaction spike). NOTIFY above is
+      # UNCONDITIONAL regardless (imp07 invariant, unchanged) — only this
+      # durable escalation is gated.
+      local pending; pending=$(( $(_read_critical_sustain) + 1 ))
+      _write_critical_sustain "$pending"
+      if _sustain_confirmed "$pending" "$CRITICAL_MAIL_SUSTAIN"; then
+        log "CRITICAL sustain confirmed (${pending}/${CRITICAL_MAIL_SUSTAIN} consecutive cycles) — mailing Mayor"
+        # NOTE: deliberately NOT a heredoc — bash 3.2 (macOS system /bin/bash, what
+        # launchd invokes per the plist) mis-parses a heredoc nested inside a $(...)
+        # command substitution when the body contains an apostrophe (confirmed by
+        # direct repro on this machine). A plain multi-line double-quoted assignment
+        # has no such bug and is otherwise equivalent.
+        local mail_body="dolt-disk-floor-guard: Dolt data-dir hit CRITICAL floor (<= ${FLOOR_CRITICAL_GB}GB) for ${pending} consecutive cycles.
 Safe reclaim (gc dolt-cleanup --force) and dead-session scratchpad cleanup were already attempted -
 avail is now ${avail}GB (post-reclaim, currently classified ${class}). This is the same class of
 event that killed the HQ Dolt server on 2026-07-14 (ga-vs55): a full disk hitting Dolt
 mid-journal-write. Recommend checking what is consuming space now (df -h, du -sh on shared/data
-and .gc/logs) even if the current reading looks recovered — CRITICAL was reached this cycle and
-could recur."
-      "$GC" mail send mayor -s "Dolt disk-floor CRITICAL: avail=${avail}GB" -m "$mail_body" 2>/dev/null || log "WARN: gc mail send mayor failed"
+and .gc/logs) even if the current reading looks recovered — CRITICAL persisted across multiple
+cycles and could recur."
+        "$GC" mail send mayor -s "Dolt disk-floor CRITICAL: avail=${avail}GB" -m "$mail_body" 2>/dev/null || log "WARN: gc mail send mayor failed"
+      else
+        log "CRITICAL sample ${pending}/${CRITICAL_MAIL_SUSTAIN} — PENDING, not yet mailing Mayor (single-cycle dip may self-recover; notify above already fired unconditionally)"
+      fi
     fi
     _write_state "$now" "$avail"
   fi
