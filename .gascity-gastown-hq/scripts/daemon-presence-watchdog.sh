@@ -403,9 +403,25 @@ _plist_label() {
   ' "$1" 2>/dev/null
 }
 
+# ── ga-4l2sn: PRESENCE-DRIFT cooldown/dedup ──────────────────────────────────
+# Without this, every 5-min sweep re-alerted the SAME undeployed label with no
+# memory of the last one — ga-4l2sn measured 10+ identical Mayor mails for one
+# daemon in a single morning. Mirrors the agent-stuck-escalation.sh cooldown:
+# one state file per label under ${STATE}.presence-drift/<label>, content = the
+# epoch of the last alert; a label still undeployed inside the window is logged
+# but not re-mailed. State clears the moment a label loads again, so a LATER
+# drift on the same label alerts fresh instead of inheriting a stale cooldown
+# from an unrelated earlier incident.
+DPW_PRESENCE_DRIFT_COOLDOWN_SEC="${DPW_PRESENCE_DRIFT_COOLDOWN_SEC:-10800}"
+_pd_state_file() { echo "${STATE}.presence-drift/$1"; }
+_pd_last_get()   { local f; f="$(_pd_state_file "$1")"; [ -f "$f" ] && cat "$f" 2>/dev/null || echo 0; }
+_pd_last_set()   { local f; f="$(_pd_state_file "$1")"; mkdir -p "$(dirname "$f")" 2>/dev/null || true; printf '%s\n' "$2" > "$f" 2>/dev/null || true; }
+_pd_last_clear() { rm -f "$(_pd_state_file "$1")" 2>/dev/null || true; }
+
 run_presence_drift_sweep() {
   [ "${DPW_PRESENCE_DRIFT_ENABLED:-1}" = "1" ] || return 0
-  local dir f label undeployed=""
+  local dir f label undeployed="" alerted="" now last since remaining
+  now="${DPW_TEST_NOW:-$(date +%s)}"
   for dir in $DPW_PRESENCE_DIRS; do
     [ -d "$dir" ] || continue
     for f in "$dir"/*.plist; do
@@ -416,16 +432,31 @@ run_presence_drift_sweep() {
         *) continue ;;
       esac
       case " $DPW_CRITICAL " in *" $label "*) continue ;; esac
-      _loaded "$label" || undeployed="$undeployed $label"
+      if _loaded "$label"; then
+        _pd_last_clear "$label"
+        continue
+      fi
+      undeployed="$undeployed $label"
+      last="$(_pd_last_get "$label")"
+      since=$(( now - last ))
+      if [ "$since" -lt "$DPW_PRESENCE_DRIFT_COOLDOWN_SEC" ] 2>/dev/null; then
+        remaining=$(( (DPW_PRESENCE_DRIFT_COOLDOWN_SEC - since) / 60 ))
+        log "PRESENCE-DRIFT $label: already alerted ${since}s ago (cooldown ${remaining}min remaining, src=$dir)"
+      else
+        alerted="$alerted $label(src:$dir)"
+        _pd_last_set "$label" "$now"
+      fi
     done
   done
-  if [ -n "$undeployed" ]; then
-    local msg="Daemon-presence watchdog: PRESENCE-DRIFT —${undeployed} (plist exists in \$DPW_PRESENCE_DIRS but is NOT loaded in launchd: never bootstrapped, or fell out silently — ga-u04vp)."
+  if [ -n "$alerted" ]; then
+    local msg="Daemon-presence watchdog: PRESENCE-DRIFT —${alerted} (each shown with its SOURCE directory — versioned source under scripts/ or packs/town-deltas/assets/, NOT the deployed ~/Library/LaunchAgents copy — found there but NOT loaded in launchd: never bootstrapped, or fell out silently — ga-u04vp)."
     log "ALERT $msg"
     _alert "presence-drift (undeployed plist)" "$msg"
+  fi
+  if [ -n "$undeployed" ]; then
     return 1
   fi
-  log "OK: presence-drift sweep — every com.gascity.*/com.gastown.* plist in \$DPW_PRESENCE_DIRS is loaded"
+  log "OK: presence-drift sweep — every com.gascity.*/com.gastown.* plist in $DPW_PRESENCE_DIRS is loaded"
   return 0
 }
 
@@ -1109,6 +1140,43 @@ PLIST
   : > "$LOG"; DPW_PRESENCE_DRIFT_ENABLED=0; DPW_TEST_LOADED="com.gascity.epsilon"
   run_presence_drift_sweep && ok "disabled presence-drift sweep returns 0 even with undeployed plist (delta)" || bad "disabled presence-drift sweep should not alert"
   DPW_PRESENCE_DRIFT_ENABLED=1
+
+  echo "Scenario 31 (ga-4l2sn): presence-drift — first alert names source dir + disambiguates from ~/Library/LaunchAgents, dedup suppresses repeat"
+  : > "$LOG"; rm -rf "${STATE}.presence-drift"; DPW_CRITICAL="$ALL"; DPW_PRESENCE_DIRS="$PDIR"; DPW_TEST_LOADED="com.gascity.epsilon"
+  MAILSENT31="$TMP/mailsent31"; : > "$MAILSENT31"
+  cat > "$TMP/gc" <<GCSTUB31
+#!/usr/bin/env bash
+[ "\$1" = "mail" ] && echo "\$*" >> "$MAILSENT31"
+exit 0
+GCSTUB31
+  chmod +x "$TMP/gc"
+  DPW_TEST_NOW=1000000000
+  run_presence_drift_sweep >/dev/null 2>&1
+  [ -s "$MAILSENT31" ] && ok "first drift on delta: mail sent" || bad "first drift on delta: expected mail, none sent"
+  grep -q "src:$PDIR" "$LOG" && ok "alert names the source directory ($PDIR)" || bad "alert missing the source-directory annotation"
+  grep -q "LaunchAgents" "$LOG" && ok "alert disambiguates source dir from ~/Library/LaunchAgents" || bad "alert missing the LaunchAgents disambiguation"
+  : > "$MAILSENT31"; : > "$LOG"
+  DPW_TEST_NOW=1000000100   # 100s later — well inside the 10800s default cooldown
+  run_presence_drift_sweep; rc31=$?
+  [ "$rc31" -eq 1 ] && ok "repeat sweep within cooldown: still returns 1 (drift persists)" || bad "repeat sweep within cooldown: expected return 1"
+  [ ! -s "$MAILSENT31" ] && ok "repeat sweep within cooldown: mail suppressed (dedup)" || bad "repeat sweep within cooldown: mail wrongly re-sent"
+  grep -q "already alerted" "$LOG" && ok "repeat sweep within cooldown: suppression logged" || bad "repeat sweep within cooldown: missing suppression log line"
+
+  echo "Scenario 32 (ga-4l2sn): presence-drift — cooldown EXPIRES → re-alerts"
+  : > "$MAILSENT31"; : > "$LOG"
+  DPW_TEST_NOW=$(( 1000000000 + DPW_PRESENCE_DRIFT_COOLDOWN_SEC + 1 ))
+  run_presence_drift_sweep >/dev/null 2>&1
+  [ -s "$MAILSENT31" ] && ok "sweep after cooldown expiry: re-alerts (mail sent)" || bad "sweep after cooldown expiry: expected fresh mail"
+
+  echo "Scenario 33 (ga-4l2sn): presence-drift — label recovers (loaded) then drifts again → alerts fresh, no stale cooldown carried over"
+  : > "$MAILSENT31"; : > "$LOG"
+  DPW_TEST_LOADED="com.gascity.delta com.gascity.epsilon"
+  run_presence_drift_sweep >/dev/null 2>&1
+  [ ! -f "$(_pd_state_file com.gascity.delta)" ] && ok "recovered label: cooldown state file cleared" || bad "recovered label: stale cooldown state NOT cleared"
+  DPW_TEST_LOADED="com.gascity.epsilon"
+  run_presence_drift_sweep >/dev/null 2>&1
+  [ -s "$MAILSENT31" ] && ok "same label drifts again post-recovery: alerts fresh (no inherited cooldown)" || bad "same label post-recovery: unexpectedly suppressed"
+  unset DPW_TEST_NOW
 
   echo ""
   echo "daemon-presence-watchdog selftest: PASS=$PASS FAIL=$FAIL"
