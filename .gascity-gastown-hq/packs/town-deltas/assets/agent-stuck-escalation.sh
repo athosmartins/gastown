@@ -713,10 +713,54 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
             1) transcript_state="frozen" ;;
             *) transcript_state="unknown" ;;
         esac
+    else
+        # ga-v6ols: the batch `gc session list` scan above and this
+        # per-session `gc session logs` probe are two INDEPENDENT queries —
+        # live evidence showed a session confirmed active by hand (`gc
+        # session list`) and a transcript written 6s earlier, yet THIS
+        # script's own batch scan the SAME pass logged "sess=AUSENTE" for
+        # it. ga-2tpd's SESSIONS_QUERY_FAILED (above) only catches the
+        # batch call FAILING outright (nonzero exit/empty/unparseable) —
+        # it does not catch the batch call SUCCEEDING with a stale or
+        # incomplete list, which is what the evidence points at. Before
+        # this fix, "not found in the batch scan" skipped this probe
+        # entirely (transcript_state stayed "" here and fell straight
+        # through to escalation below).
+        #
+        # AC1 of ga-v6ols keeps "não-encontrada" (batch-confirmed-absent) a
+        # valid, non-suppressing state on its own — only
+        # "não-consegui-consultar" (SESSIONS_QUERY_FAILED, above) suppresses
+        # by itself; a genuinely-dead assignee with an unreadable transcript
+        # must still escalate (AC4 — T15/T27 below lock this in). So this
+        # probe only ACTS when it affirmatively CONTRADICTS the batch
+        # "not found" verdict: proof of a live/advancing transcript (or,
+        # weaker, a resolvable-but-stale one) is new information the batch
+        # scan alone didn't have. An inconclusive probe (ok:false — the
+        # same "no session file found" shape ga-4tmc found for otherwise-
+        # live crew/dog sessions) adds nothing, so it does not override an
+        # already-correct default — per AC2 the two signals are still
+        # consulted independently either way, this just doesn't let an
+        # unproven result overturn a state that was already settled.
+        transcript_is_advancing "$assignee"
+        case "$?" in
+            0)
+                transcript_state="advancing"
+                live_session_name="$assignee"
+                sess_status="$sess_status — checagem direta (gc session logs $assignee) contradiz: transcript ADVANCING (ga-v6ols)"
+                ;;
+            1)
+                transcript_state="frozen"
+                live_session_name="$assignee"
+                sess_status="$sess_status — checagem direta (gc session logs $assignee): transcript CONGELADO (ga-v6ols)"
+                ;;
+            *)
+                : # inconclusive — no new evidence; "não-encontrada" stands, escalation path below unchanged (AC1/AC4)
+                ;;
+        esac
     fi
 
     if [ "$transcript_state" = "advancing" ]; then
-        log "$bead_id: bead.updated_at parado ${age_min}min mas transcript de $live_session_name avançando (escrita <${TRANSCRIPT_FRESH_SEC}s) — SUPRIMINDO escalação (trabalho longo legítimo)"
+        log "$bead_id: bead.updated_at parado ${age_min}min mas transcript de $live_session_name avançando (escrita <${TRANSCRIPT_FRESH_SEC}s) — sess=$sess_status — SUPRIMINDO escalação (trabalho longo legítimo)"
         continue
     fi
     if [ "$transcript_state" = "unknown" ]; then

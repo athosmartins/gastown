@@ -674,6 +674,55 @@ assert_contains "$ACTIONS" "mail:mayor|Agente BLOQUEADO EM PROMPT (1 tecla resol
 log_contains "T39" "ga-test24: BLOQUEADO-EM-PROMPT" "T39: log line present even without a 'command' field"
 rm -f "$LOGS_FIXTURE_DIR/dog-test5.json" "$PEEK_FIXTURE_DIR/dog-test5.txt"
 
+# ── T40: assignee not found in the batch session-list scan, but a DIRECT ────
+# transcript probe on the raw assignee confirms ADVANCING → suppressed
+# (ga-v6ols core fix). This is the actual reported incident: `gc session
+# list` (batch) failed to list a session that was, in fact, active — its
+# transcript had been written 6 seconds before the false escalation. Before
+# this fix, "not found in the batch scan" (live_session_name empty) skipped
+# the transcript probe entirely and escalated unconditionally.
+echo "T40: assignee not found in batch session-list, direct transcript probe confirms ADVANCING → suppressed (ga-v6ols)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"   # batch scan does NOT list this assignee at all
+make_transcript_fixture dog-gav6ols-a 30       # yet its own transcript was written 30s ago
+printf '[%s]' "$(make_bead ga-test25 dog-gav6ols-a 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test25"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test25" "T40: no mail — direct transcript probe overrides a stale/incomplete batch-absent verdict"
+assert_absent "$ACTIONS" "notify" "T40: no notify — advancing suppresses"
+log_contains "T40" "ga-v6ols" "T40: log shows the direct-probe contradiction note"
+rm -f "$LOGS_FIXTURE_DIR/dog-gav6ols-a.json"
+
+# ── T41: assignee not found in the batch scan, direct transcript probe ──────
+# confirms FROZEN (resolvable transcript, stale mtime) → STILL escalates
+# (ga-v6ols AC4: a batch "not found" verdict must not become a blanket
+# suppression — only an AFFIRMATIVE contradiction changes the outcome).
+# Also proves the improved diagnostic: the log now says CONGELADO via the
+# direct probe instead of the old bare "n/d" default.
+echo "T41: assignee not found in batch session-list, direct transcript probe confirms FROZEN → escalation still fires (ga-v6ols AC4)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-gav6ols-b 3600      # resolvable transcript, 1h stale
+printf '[%s]' "$(make_bead ga-test26 dog-gav6ols-b 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test26"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test26" "T41: escalation still fires — batch-absent + confirmed-frozen (no false-negative regression)"
+log_contains "T41" "CONGELADO" "T41: log shows CONGELADO via the direct probe (ga-v6ols), not the old bare n/d"
+rm -f "$LOGS_FIXTURE_DIR/dog-gav6ols-b.json"
+
+# ── T42: assignee not found in the batch scan, direct probe ALSO ────────────
+# inconclusive (no transcript fixture at all) → escalation still fires
+# unchanged (ga-v6ols non-regression — mirrors T15/T27 under this fix's own
+# name for traceability: an unproven fallback probe must not silently start
+# suppressing the daemon's core "genuinely absent" signal).
+echo "T42: assignee not found in batch session-list, direct probe also inconclusive → escalation still fires (ga-v6ols non-regression)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead ga-test27 dog-gav6ols-c 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test27"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test27" "T42: escalation still fires — batch-absent + inconclusive probe, same as before this fix (AC1: não-encontrada alone still escalates)"
+
 # ── T10–T12: Layer 1 routing integration (ga-qw3p.1) ────────────────────────
 # Deploy the real escalation-router.sh so the script can source it.
 echo "T10-T12: Layer 1 routing via escalation-router.sh"
