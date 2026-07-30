@@ -2157,13 +2157,21 @@ else
   bad "ga-pb8z5 REGRESSION: bare gate:needs-fix/fix-attempt history still blocks release forever"
 fi
 
-# 16d3 (ga-pb8z5 — reproduces the real incident): gate:needs-fix history label
-# PLUS a sling whose recorded builder session is PROVABLY DEAD (roster
-# trustworthy, assignee not in it). This is ga-tje7u's exact shape: attempt 1
-# failed the gate (gate:needs-fix + gate:fix-attempt:1 persisted), Pilot
-# redispatched for the fix, and attempt 2's builder died before reaching the
-# gate again. Must RELEASE so the very next sweep redispatches it — not sit
-# invisible for 2h+ waiting on a human to notice and manually re-sling it.
+# 16d3 (ga-pb8z5): gate:needs-fix history label on the PARENT bead PLUS a
+# DISTINCT sling whose recorded builder session is PROVABLY DEAD (roster
+# trustworthy, assignee not in it) and whose OWN labels carry NO gate:*
+# marker. This exercises Guard 1 ($_labels) release plus the dead-worker
+# fall-through — it does NOT exercise Guard 2's sling-label predicate (the
+# sling fixture here has no gate:* label for it to check). Must RELEASE:
+# attempt 1 failed the gate (gate:needs-fix + gate:fix-attempt:1 persisted),
+# Pilot redispatched, and attempt 2's builder died before reaching the gate
+# again — this is ga-tje7u's shape for the PARENT-label path. CORRECTION
+# (gate_run=ga-wisp-1c548x8): an earlier version of this comment claimed this
+# scenario "reproduces the real incident" — it does not cover the
+# self-referential/sling-owned-label shape that actually broke in gate review.
+# See 16d8/16d9 below for the sling-side predicate (the shape that matters for
+# ga-mfeip routed-pool self-referential slings and for distinct sling beads
+# that carry their own gate:* history).
 NS_GATE_DEAD='[{"id":"tt-ns-gate-dead","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-fix","gate:fix-attempt:1"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-gate-dead"}}]'
 LOG16D3="$(run_neverstarted "$NS_GATE_DEAD" "" "$NS_SESS" '{"tt-sling-gate-dead":"ghost-wa"}')"
 if echo "$LOG16D3" | grep -q "releasing never-started in-flight bead tt-ns-gate-dead"; then
@@ -2200,6 +2208,7 @@ fi
 echo "Scenario 16d6: ga-pb8z5 drift-guard — the stale-gate-history fix is wired"
 has "$DISPATCHER" 'ga-pb8z5' "ga-pb8z5 fix comment is wired"
 has "$DISPATCHER" '_ns_label_blocks_release' "_ns_label_blocks_release helper is wired into the never-started detector"
+has "$DISPATCHER" '_ns_label_blocks_release "\$_sling_labels" && continue' "ga-pb8z5 attempt 2: Guard 2 (sling labels) also calls _ns_label_blocks_release, not just Guard 1"
 
 # 16d7 (ga-pb8z5 gate-review regression): TWO coexisting gate:fix-attempt:N
 # labels — the attempt-bump loop's `bd label remove ... || true` occasionally
@@ -2220,6 +2229,51 @@ if echo "$LOG16D7" | grep -q "releasing never-started in-flight bead tt-ns-gate-
   ok "ga-pb8z5: two coexisting gate:fix-attempt:N labels (residue race) no longer blocks release"
 else
   bad "ga-pb8z5 REGRESSION: two coexisting gate:fix-attempt:N labels still block release forever (the gate-review-caught bug)"
+fi
+
+# 16d8 (ga-pb8z5 attempt 2 — the actual gate-review-caught regression): a
+# SELF-REFERENTIAL sling (pilot.sling_bead == the bead's own id — the ga-mfeip
+# routed-pool pattern, L3552-3553) means Guard 2 re-reads the SAME bead's
+# labels Guard 1 just evaluated. Attempt 1's fix (gate_run=ga-wisp-1c548x8)
+# only applied _ns_label_blocks_release to Guard 1 ($_labels, L3520); Guard 2
+# ($_sling_labels, L3558) kept the old unconditional "any gate:* blocks
+# forever" case, so it immediately re-blocked on the identical bare
+# gate:needs-fix Guard 1 had just released — net effect zero, the ga-tje7u-
+# class incident fully reproduced despite the "fix". Must RELEASE now that
+# both guards share the same predicate.
+NS_SELFREF='[{"id":"tt-ns-selfref","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched","gate:needs-fix","gate:fix-attempt:1"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-ns-selfref"}}]'
+LOG16D8="$(run_neverstarted "$NS_SELFREF" "" "$NS_SESS" '{"tt-ns-selfref":"ghost-wa"}' "" "" "" '{"tt-ns-selfref":"gate:needs-fix"}')"
+if echo "$LOG16D8" | grep -q "releasing never-started in-flight bead tt-ns-selfref"; then
+  ok "ga-pb8z5 attempt 2: self-referential sling (routed-pool shape) with bare gate:needs-fix no longer re-blocks via Guard 2"
+else
+  bad "ga-pb8z5 attempt 2 REGRESSION: self-referential sling still re-blocks on Guard 2 despite Guard 1 releasing the same label (net-zero fix)"
+fi
+
+# 16d9 (ga-pb8z5 attempt 2): a DISTINCT sling/task bead (not the parent) whose
+# OWN labels carry a bare gate:needs-fix, with the PARENT bead carrying no
+# gate:* label at all (ga-d2jil shape: "fix bug"/"build story" dispatch writes
+# gate:* progress onto the SLING bead, never mirrored back). Isolates Guard 2
+# from Guard 1 entirely — Guard 1 never fires here since $_labels has no
+# gate:* — proving the predicate applies correctly on its own, not only when
+# piggybacking on Guard 1 already having released.
+NS_SLING_GATEHIST='[{"id":"tt-ns-sling-gatehist","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-gatehist-distinct"}}]'
+LOG16D9="$(run_neverstarted "$NS_SLING_GATEHIST" "" "$NS_SESS" '{"tt-sling-gatehist-distinct":"ghost-wa"}' "" "" "" '{"tt-sling-gatehist-distinct":"gate:needs-fix"}')"
+if echo "$LOG16D9" | grep -q "releasing never-started in-flight bead tt-ns-sling-gatehist"; then
+  ok "ga-pb8z5 attempt 2: distinct sling bead's own bare gate:needs-fix no longer blocks release (Guard 2 isolated from Guard 1)"
+else
+  bad "ga-pb8z5 attempt 2 REGRESSION: distinct sling bead's own stale gate:needs-fix still blocks release forever"
+fi
+
+# 16d10 (ga-pb8z5 attempt 2 control): a distinct sling bead carrying an ACTIVE
+# gate:reviewing marker (not story-level history) must still KEEP — proves
+# Guard 2's narrowed predicate only ignores the STALE history labels on the
+# sling side too, same fail-safe-to-KEEP default as Guard 1's 16d4 control.
+NS_SLING_ACTIVE='[{"id":"tt-ns-sling-active","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_OLD"'","pilot.sling_bead":"tt-sling-active-distinct"}}]'
+LOG16D10="$(run_neverstarted "$NS_SLING_ACTIVE" "" "$NS_SESS" '{"tt-sling-active-distinct":"ghost-wa"}' "" "" "" '{"tt-sling-active-distinct":"gate:reviewing"}')"
+if echo "$LOG16D10" | grep -q "releasing never-started in-flight bead tt-ns-sling-active"; then
+  bad "REGRESSION: released despite the sling bead carrying an ACTIVE gate:reviewing marker"
+else
+  ok "control: sling-side ACTIVE gate:reviewing still blocks release (Guard 2 fail-safe preserved)"
 fi
 
 # 16e: a sling whose assignee is a LIVE session → KEEP (build in flight).
@@ -4578,10 +4632,16 @@ else
   bad "REGRESSION (ga-d2jil control): a dead-worker sling with NO gate label was kept (over-protection introduced)"
 fi
 
-# 16y: structural — the sling gate-marker guard is wired.
+# 16y: structural — the sling gate-marker guard is wired. Pattern updated for
+# ga-pb8z5 attempt 2: the guard used to be an inline unconditional
+# `case ",$_sling_labels," in *,gate:*) continue` (any gate:* label blocks
+# forever, including stale story-level history); it now delegates to the same
+# _ns_label_blocks_release predicate Guard 1 uses, so gate:needs-fix/
+# gate:fix-attempt:N history alone no longer re-blocks a self-referential
+# sling (see 16d8/16d9/16d10 above for the behavioral coverage).
 echo "Scenario 16y: ga-d2jil structural — sling gate-marker guard wired"
-has "$DISPATCHER" 'case ",\$_sling_labels," in \*,gate:\*\) continue' \
-  "sling gate-marker guard checks the sling/task bead's own labels for gate:* (ga-d2jil)"
+has "$DISPATCHER" '_ns_label_blocks_release "\$_sling_labels" && continue' \
+  "sling gate-marker guard checks the sling/task bead's own labels for gate:* via the shared _ns_label_blocks_release predicate (ga-d2jil + ga-pb8z5 attempt 2)"
 
 # ── Scenario PS-WORKER: ps-worker ephemeral pool routing (ga-mfeip mirror) ───
 # A ps-* rig-native story:approved bead must route to ps-worker (NOT batista-ps).

@@ -3555,7 +3555,11 @@ _neverstarted_recover_db() {
         | jq -c 'if type=="array" then .[0] else . end' 2>/dev/null || echo "null")
 
       _sling_labels=$(echo "$_sling_json" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
-      case ",$_sling_labels," in *,gate:*) continue ;; esac
+      # ga-pb8z5 attempt 2: the self-referential routed-pool pattern above (_sling ==
+      # $_bid) re-reads THIS SAME bead's labels here, so an unconditional "any gate:*
+      # blocks" re-KEEPs on the exact gate:needs-fix/gate:fix-attempt:N history Guard 1
+      # (L3520) just released — net effect zero. Same predicate, same fail-safe default.
+      _ns_label_blocks_release "$_sling_labels" && continue
 
       _asg=$(echo "$_sling_json" | jq -r '(.assignee // "")' 2>/dev/null || echo "")
       if [ -z "$_asg" ]; then
