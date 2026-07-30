@@ -9,8 +9,9 @@
   <key>Label</key><string>com.gascity.dolt-load-attributor</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
-    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/dolt-load-attributor.py</string>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>/usr/bin/python3 /Users/athos/gt/.gascity-gastown-hq/scripts/dolt-load-attributor.py &amp;&amp; DOLT_PAGE_S3="s3://whatsapp-viewer-549710416969/ops/dolt-load-4bd108313b86.html" /usr/bin/python3 /Users/athos/gt/.gascity-gastown-hq/scripts/dolt-load-page.py</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
