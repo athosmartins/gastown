@@ -88,6 +88,16 @@ newline in place for the ";" conversion to see -- then disable shlex's
 own `commenters` so it never independently re-applies a second, possibly
 divergent comment pass on top of ours.
 
+Both gate FAILs on this file were the same shape -- TWO passes with
+DIFFERENT ideas of which text is live, over one string. Attempt 1: shlex's
+comment pass vs the newline-to-";" conversion. Attempt 2: substitution-
+protection (raw substring scan, quote-blind) vs comment-stripping
+(carefully quote-aware) -- see COMMAND SUBSTITUTION. So comment-stripping
+and substitution-protection are now ONE traversal sharing ONE quote and
+word-start state (_protect_and_strip), which is why neither can disagree
+with the other again. Add a third opinion about what is live only with
+that history in mind.
+
 COMMAND SUBSTITUTION (`$(...)`, `` `...` ``): the shell always executes a
 substitution's content for its side effects, no matter what the outer
 command does with the captured stdout -- `echo $(pkill -f x)` really
@@ -96,7 +106,18 @@ each balanced `$(...)`/backtick span with an opaque placeholder before
 tokenizing the OUTER command (so e.g. a wrapper's "-U $(id -u)" flag
 value survives as one token instead of being shattered by the inner
 parens), then separately re-applies this SAME rule -- recursively -- to
-each span's own captured inner text. A bare pkill wrapped as the ENTIRE
+each span's own captured inner text.
+
+Only spans bash would actually EXECUTE are captured: unquoted, or inside
+DOUBLE quotes (which expand them). A span inside SINGLE quotes is inert
+text and one inside a comment is never parsed at all, so neither is
+captured, and find_invocation() therefore can't recurse into something
+unreachable and deny on it. Capturing them is exactly what made `echo hi
+# $(pkill -f a)` and `echo '$(pkill -f a)'` deny commands that run no
+pkill (ga-tje7u gate FAIL attempt 2/3, 2026-07-29). The contrast is
+load-bearing in both directions and pinned as paired tests: `echo
+"$(pkill -f a)"` still denies, and neither inert form can be used to hide
+a real call that follows it. A bare pkill wrapped as the ENTIRE
 command (`$(pkill -9 -f pattern)`) and a pkill hidden as one statement in
 a `;`-joined list inside a substitution used for something else (`echo
 $(echo a; pkill -f a)`) are the same threat by this logic and both deny
@@ -161,17 +182,64 @@ _KNOWN_OPERATORS = (
 _PUNCTUATION_RUN_RE = re.compile(r"^[();<>|&]+$")
 
 
-def _protect_command_substitutions(command):
-    """Replace each balanced $(...)/`...` span with an opaque placeholder
-    before tokenizing, so e.g. a wrapper's "-U $(id -u)" flag value
-    survives as one token instead of being shattered -- an internal "("
-    from a shattered substitution would otherwise be misread as a command
-    start token. Raises ValueError on an unbalanced span; the caller
-    treats that as a parse failure (deny, not fail-open -- see decide())."""
+def _protect_and_strip(command):
+    """ONE left-to-right pass doing BOTH jobs the tokenizer needs done
+    before shlex sees the text, off a SINGLE shared quote/word-start state:
+
+      * delete bash comments -- an unquoted `#` at the start of a word,
+        through the end of its own physical line -- leaving the
+        terminating newline in place for the caller's newline-to-";"
+        conversion to see. A `#` inside quotes (`"a#b"`) or glued mid-word
+        (`http://x/#y`) stays literal, exactly like real bash;
+      * replace each LIVE balanced `$(...)`/backtick span with an opaque
+        placeholder, so a wrapper's "-U $(id -u)" flag value survives as
+        ONE token instead of being shattered -- a stray "(" from a
+        shattered substitution would otherwise read as a command-start
+        token. The captured raw text is what find_invocation() recurses
+        into.
+
+    LIVE is the whole point, and the reason this is one pass instead of
+    two. A substitution inside SINGLE quotes is inert text (bash performs
+    no expansion there) and one inside a comment is never parsed at all;
+    capturing either put an unreachable span into `placeholders`, which
+    find_invocation() then recursed into and denied on. That is what made
+    `echo hi # $(pkill -f a)` and `echo '$(pkill -f a)'` deny (ga-tje7u
+    gate FAIL attempt 2/3, 2026-07-29) even though bash runs no pkill in
+    either. Inside DOUBLE quotes a substitution IS live -- bash expands it
+    -- so it is still captured, and `echo "$(pkill -f a)"` still denies.
+
+    Splitting this across two passes is what made that bug possible:
+    substitution-protection ran first over the RAW string with no
+    quote/comment awareness, while comment-stripping, forty lines away,
+    tracked quotes carefully -- one string, two disagreeing opinions about
+    which spans are live, and the careless one ran first. Both gate FAILs
+    on this file were that same shape (attempt 1: shlex's comment pass
+    disagreeing with the newline conversion). Merging them makes the
+    disagreement UNREPRESENTABLE rather than merely fixed: there is now a
+    single traversal and a single answer to "is this text live?".
+
+    Raises ValueError on an unbalanced span; decide() turns a parse
+    failure into an explicit deny, never a fail-open allow."""
     out, placeholders = [], {}
+    quote = None  # None, "'", or '"'
+    at_word_start = True
     i, n, counter = 0, len(command), 0
     while i < n:
         ch = command[i]
+
+        # Single quotes suppress EVERYTHING: no substitution, no comment.
+        if quote == "'":
+            out.append(ch)
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+
+        # Live substitution: unquoted, or inside double quotes (which do
+        # expand it). Checked before the double-quote passthrough below so
+        # the span is captured rather than copied through verbatim; a
+        # backslash-escaped `\$(` never reaches here, because the escape
+        # branches consume both characters first.
         if ch == "$" and i + 1 < n and command[i + 1] == "(":
             depth, j = 1, i + 2
             while j < n and depth > 0:
@@ -187,7 +255,9 @@ def _protect_command_substitutions(command):
             out.append(key)
             counter += 1
             i = j
-        elif ch == "`":
+            at_word_start = False
+            continue
+        if ch == "`":
             j = command.find("`", i + 1)
             if j == -1:
                 raise ValueError("unbalanced ` in command")
@@ -196,41 +266,9 @@ def _protect_command_substitutions(command):
             out.append(key)
             counter += 1
             i = j + 1
-        else:
-            out.append(ch)
-            i += 1
-    return "".join(out), placeholders
-
-
-def _restore(token, placeholders):
-    if placeholders and _CMDSUB_PLACEHOLDER_RE.search(token):
-        for key, raw in placeholders.items():
-            token = token.replace(key, raw)
-    return token
-
-
-def _strip_comments(command):
-    """Delete bash-style comments -- an unquoted `#` at the start of a
-    word, through the end of its own physical line -- while leaving the
-    terminating newline itself in place for the caller's later
-    newline-to-";" conversion to see. Quote-aware (a `#` inside '...' or
-    "..." is literal) and word-start-aware (a `#` glued mid-word, like
-    `http://x/#y`, is literal too -- a bash comment must BEGIN a word).
-    See the module docstring's COMMENTS section for why this has to run
-    before that conversion instead of relying on shlex's own comment
-    handling."""
-    out = []
-    quote = None  # None, "'", or '"'
-    at_word_start = True
-    i, n = 0, len(command)
-    while i < n:
-        ch = command[i]
-        if quote == "'":
-            out.append(ch)
-            if ch == "'":
-                quote = None
-            i += 1
+            at_word_start = False
             continue
+
         if quote == '"':
             out.append(ch)
             if ch == "\\" and i + 1 < n:
@@ -241,26 +279,37 @@ def _strip_comments(command):
                 quote = None
             i += 1
             continue
+
         if ch == "\\" and i + 1 < n:
             out.append(ch)
             out.append(command[i + 1])
             i += 2
             at_word_start = False
             continue
+
         if ch in ("'", '"'):
             out.append(ch)
             quote = ch
             at_word_start = False
             i += 1
             continue
+
         if ch == "#" and at_word_start:
             while i < n and command[i] != "\n":
                 i += 1
             continue
+
         at_word_start = ch in _WORD_BREAK_CHARS
         out.append(ch)
         i += 1
-    return "".join(out)
+    return "".join(out), placeholders
+
+
+def _restore(token, placeholders):
+    if placeholders and _CMDSUB_PLACEHOLDER_RE.search(token):
+        for key, raw in placeholders.items():
+            token = token.replace(key, raw)
+    return token
 
 
 def _split_operator_run(tok):
@@ -296,9 +345,7 @@ def _tokenize(command):
     that separator meaning visible. Quoting still protects any operator
     character that's genuinely part of a pattern (e.g. 'foo;bar' stays
     one token)."""
-    protected, placeholders = _protect_command_substitutions(command)
-    protected = protected.replace("\r\n", "\n")
-    protected = _strip_comments(protected)
+    protected, placeholders = _protect_and_strip(command.replace("\r\n", "\n"))
     protected = protected.replace("\n", ";")
     lexer = shlex.shlex(protected, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True

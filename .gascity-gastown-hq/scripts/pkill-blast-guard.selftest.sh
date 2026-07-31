@@ -216,6 +216,32 @@ assert_deny  "cmdsub result assigned to a var"  'x=$(sudo pkill -f a)'
 assert_deny  "backtick form hides a real pkill" 'echo `pkill -f a`'
 
 echo ""
+echo "-- AC12: INERT vs LIVE substitution (gate FAIL attempt 2/3, 2026-07-29) --"
+echo "   The guard used to capture every \$(...) found by a raw substring scan"
+echo "   and recurse into it, with no idea whether that span was reachable --"
+echo "   so a substitution sitting in a COMMENT or in SINGLE quotes (bash runs"
+echo "   neither) was denied anyway. These pin both directions: inert spans"
+echo "   allow, live ones still deny, and each inert form gets the AC12 pair"
+echo "   (b) proving it can't be used to HIDE a real call either."
+# inert: comment (bash never parses it)
+assert_allow "cmdsub inside a comment is inert"        'echo hi # $(pkill -f a)'
+assert_deny  "...but a comment cannot HIDE a real pkill on the next line" \
+             'echo hi # $(pkill -f a)
+pkill -f b'
+# inert: single quotes (bash performs NO expansion inside them)
+assert_allow "cmdsub in single quotes is inert"        "echo '\$(pkill -f a)'"
+assert_deny  "...but single quotes cannot HIDE a following real pkill" \
+             "echo '\$(pkill -f a)'; pkill -f b"
+assert_allow "backtick cmdsub in single quotes is inert" "echo '\`pkill -f a\`'"
+assert_allow "backslash-escaped \$( in double quotes is inert" 'echo "\$(pkill -f a)"'
+# live: the contrast that proves the fix did not over-correct into fail-open
+assert_deny  "cmdsub in DOUBLE quotes is live -- bash expands it" 'echo "$(pkill -f a)"'
+# an unbalanced "\$(" inside single quotes is literal text, not a parse failure:
+# real bash runs this fine, so AC4's fail-closed deny must not fire here
+assert_allow "unbalanced \$( inside single quotes is literal, not a parse error" \
+             "echo '\$(' ; echo hi"
+
+echo ""
 echo "-- AC12: backslash-escape inside the pkill/killall token itself --"
 assert_allow "unrelated backslash-escaped command still allows" 'ec\ho hello'
 assert_deny  'backslash-escape hides the literal substring, not the token (pk\ill)' 'pk\ill -f a'
