@@ -1,0 +1,16 @@
+# town-deltas override (ga-gquc1): script vendored into town-deltas/assets so $PACK_DIR
+# resolves here (the embedded maintenance copy is gitignored/ephemeral) — same recipe as
+# gate-sweep's override. The vendored script distinguishes a per-db sync timeout
+# (run_bounded exit 124) from a genuine sync failure instead of collapsing both into the
+# same "sync failed" string, and sizes the per-db bound to the db (120s small / 600s for
+# hq-sized and larger — see dolt-s3-backup.sh's SYNC_TIMEOUT=600 precedent for the same
+# operation against the same hq db). timeout raised 1800s→3600s: worst case is now 2 large
+# dbs (hq ~6.7G, whatsapp_automation ~1.5G, measured 2026-07-31) at 600s each + up to 8
+# small dbs at 120s each + 30s preflight + 300s offsite ≈ 2490s — needs headroom over the
+# old 1800s ceiling. Runs every 6h; the extra worst-case runtime is free.
+[order]
+description = "Sync Dolt backups to configured remotes"
+exec = "$PACK_DIR/assets/scripts/mol-dog-backup.sh"
+trigger = "cooldown"
+interval = "6h"
+timeout = "3600s"
