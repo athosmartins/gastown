@@ -5452,6 +5452,193 @@ echo "$LOG_DIGESTCTL" | grep -q "REFUSING to dispatch whatsapp_automation domain
 echo "Scenario ga-mhbyc-d: drift-guard — digest-label exemption is wired into the live dispatcher"
 has "$DISPATCHER" 'digest-label'          "digest-label exemption reason is wired"
 
+# ── Scenario ga-y1m40 (2026-07-31): Step 2c fallback gated on POOL-EMPTY, not
+# on DISPATCH-SUCCESS. An HQ pool with exactly 1 permanently-undispatchable
+# candidate (e.g. every candidate vetoed by the ownership guard) left
+# ALL_CANDIDATES_TIER non-empty, so the old Step 2c NEVER ran, and the entire
+# rig backlog (wa-*, ps-*) was invisible for the whole sweep even with free
+# slots — measured live: ~4h stall, 2026-07-31 03:50-07:50 (human-noticed, no
+# alarm fired). Fix: scan rigs again, post-lane, whenever DISPATCHED==0 and
+# Step 2c itself did not already run this sweep (STEP2C_RAN unset).
+
+# run_y1m40: real end-to-end DRY_RUN sweep for the ga-y1m40 fix.
+#   $1 = FAKE_BUGS_JSON               (HQ Tier1 bug/debt fixture; "[]" = HQ empty)
+#   $2 = PILOT_TEST_CREW_BRANCH_BEADS (space-list — forces ownership-guard veto)
+#   $3 = PILOT_RIG_FALLBACK_OVERRIDE  (rig Tier1/Tier2 fixture JSON — hermetic
+#        seam added by this fix; bypasses the real gc/bd rig-scan loop, mirrors
+#        PILOT_WA_RIG_TIER2_OVERRIDE)
+run_y1m40() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE=10 \
+    DISPATCH_TO_CAPACITY=1 \
+    FAKE_BUGS_JSON="${1:-[]}" \
+    FAKE_BLOCKED_IDS="" \
+    PILOT_TEST_CREW_BRANCH_BEADS="${2:-}" \
+    PILOT_RIG_FALLBACK_OVERRIDE="${3:-[]}" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# run_y1m40_stall: same shape as run_y1m40 but DRY_RUN=0 — Step 5's stall
+# counter only persists state when DRY_RUN!=1 (mirrors every other mutation
+# in this file). Reuses the SAME FIXCITY/state-file across calls on purpose:
+# the streak must survive across separate process invocations, exactly like
+# launchd actually runs this script (a fresh process every 300s, no in-memory
+# state carries over).
+run_y1m40_stall() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=0 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE=10 \
+    DISPATCH_TO_CAPACITY=1 \
+    FAKE_BUGS_JSON="${1:-[]}" \
+    FAKE_BLOCKED_IDS="" \
+    PILOT_TEST_CREW_BRANCH_BEADS="${2:-}" \
+    PILOT_RIG_FALLBACK_OVERRIDE="${3:-[]}" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+Y1M40_HQ_VETOED='[{"id":"tt-y1m40-hq","title":"HQ bug fixture, permanently vetoed","priority":0,"issue_type":"bug","description":"fixture body — HQ candidate with an existing crew branch (ownership-guard veto), 80+ chars to clear the spec floor","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]'
+Y1M40_HQ_FREE='[{"id":"tt-y1m40-hqfree","title":"HQ bug fixture, genuinely dispatchable","priority":0,"issue_type":"bug","description":"fixture body — HQ candidate with no competing ownership signal, 80+ chars to clear the spec floor","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]'
+Y1M40_RIG_BUG='[{"id":"wa-y1m40rig","title":"rig bug fixture, buildable","priority":1,"issue_type":"bug","description":"fixture body — rig-native bug, no competing ownership signal, 80+ chars to clear the spec floor","status":"open","labels":[],"assignee":null,"created_at":"2026-06-02T00:00:00Z","metadata":{}}]'
+
+echo "Scenario ga-y1m40-a (AC1): HQ candidate vetoed (dispatched=0) + rig has buildable work + free slots -> rig candidate IS dispatched"
+LOG_Y1M40A="$(run_y1m40 "$Y1M40_HQ_VETOED" "tt-y1m40-hq" "$Y1M40_RIG_BUG")"
+if echo "$LOG_Y1M40A" | grep -q "Task title:.*wa-y1m40rig"; then
+  ok "ga-y1m40 AC1: rig candidate (wa-y1m40rig) IS picked/dispatched after the sole HQ candidate was vetoed"
+else
+  bad "ga-y1m40 AC1 REGRESSION: rig candidate NOT dispatched even though HQ's only candidate was vetoed and slots were free — the exact 4h-stall bug"
+fi
+if echo "$LOG_Y1M40A" | grep -q "ga-y1m40: HQ pool had candidate(s) but dispatched=0"; then
+  ok "ga-y1m40 AC1: the new post-lane fallback log line fired"
+else
+  bad "ga-y1m40 AC1: post-lane fallback did not announce itself in the log"
+fi
+if echo "$LOG_Y1M40A" | grep -qE "dispatched=1 "; then
+  ok "ga-y1m40 AC1: sweep summary reports dispatched=1 (rescued by the rig fallback, not stuck at 0)"
+else
+  bad "ga-y1m40 AC1: sweep summary did not report a successful dispatch"
+fi
+if echo "$LOG_Y1M40A" | grep -q "ga-htjni: REFUSING dispatch of tt-y1m40-hq"; then
+  ok "ga-y1m40 AC1: precondition confirmed — the HQ candidate was actually refused by the ownership guard (not some other reason)"
+else
+  bad "ga-y1m40 AC1: precondition failed — ownership guard did not refuse tt-y1m40-hq as expected"
+fi
+if echo "$LOG_Y1M40A" | grep -q "Task title:.*tt-y1m40-hq"; then
+  bad "ga-y1m40 AC1: the permanently-vetoed HQ bead (tt-y1m40-hq) was dispatched — ownership guard was bypassed, not respected"
+else
+  ok "ga-y1m40 AC1: the permanently-vetoed HQ bead (tt-y1m40-hq) correctly never dispatches"
+fi
+
+echo "Scenario ga-y1m40-b (AC2 non-regression): HQ candidate IS dispatchable -> HQ wins, rig fallback NEVER triggers (no inverted priority, no wasted scan)"
+LOG_Y1M40B="$(run_y1m40 "$Y1M40_HQ_FREE" "" "$Y1M40_RIG_BUG")"
+if echo "$LOG_Y1M40B" | grep -q "Task title:.*tt-y1m40-hqfree"; then
+  ok "ga-y1m40 AC2: a genuinely dispatchable HQ candidate still dispatches (HQ precedence intact)"
+else
+  bad "ga-y1m40 AC2 REGRESSION: dispatchable HQ candidate did NOT dispatch"
+fi
+if echo "$LOG_Y1M40B" | grep -q "Task title:.*wa-y1m40rig"; then
+  bad "ga-y1m40 AC2 REGRESSION: rig candidate dispatched even though the HQ candidate was itself dispatchable — HQ->rig priority inverted"
+else
+  ok "ga-y1m40 AC2: rig candidate never considered when HQ already had a dispatchable candidate"
+fi
+if echo "$LOG_Y1M40B" | grep -q "ga-y1m40: HQ pool had candidate(s) but dispatched=0"; then
+  bad "ga-y1m40 AC2 REGRESSION: post-lane rig fallback fired even though HQ successfully dispatched (dispatched!=0) — wasted scan"
+else
+  ok "ga-y1m40 AC2: post-lane rig fallback correctly did NOT fire when HQ already dispatched"
+fi
+
+echo "Scenario ga-y1m40-c (AC3 non-regression): HQ pool genuinely EMPTY -> old Step 2c path still fires exactly as before, and the NEW fallback does not double-scan"
+LOG_Y1M40C="$(run_y1m40 "[]" "" "$Y1M40_RIG_BUG")"
+if echo "$LOG_Y1M40C" | grep -q "HQ returned no candidates (bugs/debt + stories) — scanning rig DBs as fallback"; then
+  ok "ga-y1m40 AC3: original Step 2c empty-pool log line still fires unchanged"
+else
+  bad "ga-y1m40 AC3 REGRESSION: Step 2c empty-pool fallback log line missing"
+fi
+if echo "$LOG_Y1M40C" | grep -q "Task title:.*wa-y1m40rig"; then
+  ok "ga-y1m40 AC3: rig candidate still dispatches via the original empty-pool path"
+else
+  bad "ga-y1m40 AC3 REGRESSION: rig candidate not dispatched when HQ pool is genuinely empty"
+fi
+if echo "$LOG_Y1M40C" | grep -q "ga-y1m40: HQ pool had candidate(s) but dispatched=0"; then
+  bad "ga-y1m40 AC3: the NEW post-lane fallback fired on top of the OLD Step 2c path (STEP2C_RAN guard not respected — double-scan)"
+else
+  ok "ga-y1m40 AC3: STEP2C_RAN guard correctly suppresses the new post-lane fallback when Step 2c itself already ran"
+fi
+
+echo "Scenario ga-y1m40-d (control): HQ vetoed AND rig fallback finds nothing -> dispatched=0, no crash, clean log"
+LOG_Y1M40D="$(run_y1m40 "$Y1M40_HQ_VETOED" "tt-y1m40-hq" "[]")"
+if echo "$LOG_Y1M40D" | grep -qE "dispatched=0 "; then
+  ok "ga-y1m40 control: dispatched=0 when neither HQ nor rig has anything dispatchable (no false dispatch, no crash)"
+else
+  bad "ga-y1m40 control: unexpected dispatch outcome when nothing should be dispatchable"
+fi
+if echo "$LOG_Y1M40D" | grep -q "ga-y1m40: rig DB fallback scan found no additional candidates"; then
+  ok "ga-y1m40 control: empty rig fallback scan is logged explicitly (not silent)"
+else
+  bad "ga-y1m40 control: empty rig fallback scan outcome not logged"
+fi
+
+echo "Scenario ga-y1m40-e: structural — fix wiring verified in dispatcher source"
+has "$DISPATCHER" '_scan_rig_fallback_pool'        "ga-y1m40: rig-scan extracted into a reusable function"
+has "$DISPATCHER" '_split_candidates_by_lane'      "ga-y1m40: lane-split extracted into a reusable function"
+has "$DISPATCHER" 'STEP2C_RAN'                     "ga-y1m40: STEP2C_RAN flag distinguishes empty-pool vs post-lane fallback"
+has "$DISPATCHER" 'PILOT_RIG_FALLBACK_OVERRIDE'    "ga-y1m40: hermetic test seam for the rig-scan function defined"
+has "$DISPATCHER" 'Step 4b'                        "ga-y1m40: Step 4b (post-lane fallback) block comment present"
+has "$DISPATCHER" 'PILOT_STALL_STATE'              "ga-y1m40: stall-streak state file path defined (observability)"
+has "$DISPATCHER" 'PILOT_STALL_ALERT_CAP'          "ga-y1m40: stall-alert cooldown cap knob defined (observability)"
+
+echo "Scenario ga-y1m40-f (observability): consecutive dispatched=0-with-free-slots sweeps increment a persisted stall counter across separate process invocations"
+# Earlier DRY_RUN=0 scenarios in this file (run_real_dispatch etc.) share this
+# same $FIXCITY and may have left a stall-count file behind — clear it so this
+# scenario starts from a known zero state. Only done ONCE, before the first of
+# the 3 sequential calls below: run_y1m40_stall itself must NOT clear it (the
+# whole point is proving the counter persists ACROSS separate invocations).
+rm -f "$FIXCITY/.gc/pilot-dispatcher-stall.count"
+Y1M40_STALL_LOG1="$(run_y1m40_stall "$Y1M40_HQ_VETOED" "tt-y1m40-hq" "[]")"
+Y1M40_STALL_LOG2="$(run_y1m40_stall "$Y1M40_HQ_VETOED" "tt-y1m40-hq" "[]")"
+Y1M40_STALL_LOG3="$(run_y1m40_stall "$Y1M40_HQ_VETOED" "tt-y1m40-hq" "[]")"
+if echo "$Y1M40_STALL_LOG1" | grep -q "1 consecutive sweep(s)" \
+   && echo "$Y1M40_STALL_LOG2" | grep -q "2 consecutive sweep(s)" \
+   && echo "$Y1M40_STALL_LOG3" | grep -q "3 consecutive sweep(s)"; then
+  ok "ga-y1m40 observability: stall streak persists cross-process and increments 1->2->3 (pilot-dispatcher.sh is not long-lived — file-backed, not in-memory)"
+else
+  bad "ga-y1m40 observability REGRESSION: stall streak did not increment correctly across invocations"
+fi
+
+echo "Scenario ga-y1m40-g (observability control): a dispatching sweep resets the stall streak"
+Y1M40_STALL_LOG4="$(run_y1m40_stall "$Y1M40_HQ_FREE" "" "[]")"
+if echo "$Y1M40_STALL_LOG4" | grep -q "consecutive sweep(s)"; then
+  bad "ga-y1m40 observability REGRESSION: stall WARN fired even though this sweep dispatched successfully"
+else
+  ok "ga-y1m40 observability: no stall WARN on a sweep that actually dispatched"
+fi
+Y1M40_STALL_LOG5="$(run_y1m40_stall "$Y1M40_HQ_VETOED" "tt-y1m40-hq" "[]")"
+if echo "$Y1M40_STALL_LOG5" | grep -q "1 consecutive sweep(s)"; then
+  ok "ga-y1m40 observability: streak correctly restarts at 1 after a prior success reset the counter"
+else
+  bad "ga-y1m40 observability REGRESSION: streak did not reset after a successful dispatch broke it"
+fi
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

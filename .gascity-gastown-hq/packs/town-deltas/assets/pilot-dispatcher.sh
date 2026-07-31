@@ -4324,10 +4324,40 @@ fi
 
 # ── Step 2c: Fallback — scan rig DBs if HQ returned nothing ──────────────────
 # Per convention all story beads live in HQ, but check rig DBs as a fallback.
-# Only reached when the merged HQ pool is empty.
+# Reached in TWO cases (ga-y1m40): (1) the merged HQ pool is empty (original
+# behavior, unchanged below); or (2) Step 4b, near the end of the sweep, finds
+# HQ was non-empty but dispatched NOTHING (e.g. every HQ candidate was vetoed
+# by the ownership guard). Case (2) used to be invisible: a non-empty pool
+# meant this block never ran at all, so the rig backlog (wa-*, ps-*) stayed
+# unscanned for the ENTIRE sweep even with free slots (measured live: ~4h
+# stall, 2026-07-31 03:50-07:50 — a human noticed, no alarm fired).
+#
+# _scan_rig_fallback_pool: scan every non-HQ rig DB for Tier1 (bug/tech-debt)
+# + Tier2 (story:approved feature) candidates, same filter chain as the HQ
+# queries. Sets RIG_MERGED_JSON / RIG_MERGED_COUNT / RIG_TIER1_COUNT /
+# RIG_TIER2_COUNT as globals (direct mutation, not via $(...) — same
+# convention as dispatch_lane's DISPATCHED: the script's top-level
+# `exec >> LOG 2>&1` means command-substituting this function would swallow
+# its own log lines). Called from Step 2c below AND from Step 4b (ga-y1m40).
+# Test seam: PILOT_RIG_FALLBACK_OVERRIDE — when set, bypass the gc/bd loop and
+# use this JSON array directly (hermetic selftest; no real gc/bd needed).
+# Mirrors PILOT_WA_RIG_TIER2_OVERRIDE (Step 2b-rig-tier2).
+_scan_rig_fallback_pool() {
+  if [ -n "${PILOT_RIG_FALLBACK_OVERRIDE+x}" ]; then
+    local _rfp_filtered
+    _rfp_filtered=$(echo "$PILOT_RIG_FALLBACK_OVERRIDE" \
+      | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built \
+      | _filter_unblocked "${GC_CITY}" | _filter_explicit_deps "${GC_CITY}")
+    RIG_TIER1_COUNT=$(echo "$_rfp_filtered" | jq '[ .[] | select(
+        (((.issue_type // .type // "") | ascii_downcase) == "bug")
+        or (((.labels // []) | index("tech-debt")) != null)
+      ) ] | length' 2>/dev/null || echo "0")
+    RIG_MERGED_JSON="$_rfp_filtered"
+    RIG_MERGED_COUNT=$(echo "$RIG_MERGED_JSON" | jq 'length' 2>/dev/null || echo "0")
+    RIG_TIER2_COUNT=$((RIG_MERGED_COUNT - RIG_TIER1_COUNT))
+    return 0
+  fi
 
-if [ -z "$ALL_CANDIDATES_TIER" ]; then
-  log "HQ returned no candidates (bugs/debt + stories) — scanning rig DBs as fallback ..."
   RIG_PATHS=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
     | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
 
@@ -4387,6 +4417,16 @@ if [ -z "$ALL_CANDIDATES_TIER" ]; then
   RIG_MERGED_JSON=$(echo "$ALL_RIG_TIER1 $ALL_RIG_TIER2" \
     | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
   RIG_MERGED_COUNT=$(echo "$RIG_MERGED_JSON" | jq 'length' 2>/dev/null || echo "0")
+}
+
+# STEP2C_RAN (ga-y1m40): set when the block below actually scans rigs, so
+# Step 4b (much later) can tell "already tried this sweep, don't repeat" apart
+# from "never got the chance" — a non-empty pool that dispatched nothing.
+STEP2C_RAN=""
+if [ -z "$ALL_CANDIDATES_TIER" ]; then
+  log "HQ returned no candidates (bugs/debt + stories) — scanning rig DBs as fallback ..."
+  STEP2C_RAN=1
+  _scan_rig_fallback_pool
   if [ "$RIG_MERGED_COUNT" -gt "0" ]; then
     ALL_CANDIDATES_JSON="$RIG_MERGED_JSON"
     if [ "$RIG_TIER1_COUNT" -gt "0" ] && [ "$RIG_TIER2_COUNT" -gt "0" ]; then
@@ -4414,20 +4454,28 @@ log "Dispatch tier: $ALL_CANDIDATES_TIER (${ALL_CANDIDATES_COUNT} candidate(s))"
 # Pick highest priority (P0>P1>P2..., tie-break oldest) from each.
 # Only dispatch into a lane if it has a free slot.
 
-SMALL_CANDIDATES="[]"
-BIG_CANDIDATES="[]"
+# _split_candidates_by_lane <json>: classify each candidate into SMALL/BIG
+# lanes via classify_lane. Sets SMALL_CANDIDATES/BIG_CANDIDATES/SMALL_COUNT/
+# BIG_COUNT globals (same direct-mutation convention as _scan_rig_fallback_pool
+# above). Factored into a function (ga-y1m40) because Step 4b re-splits a
+# fresh rig-only pool after the primary lanes already ran once this sweep.
+_split_candidates_by_lane() {
+  local _scbl_json="$1" _scbl_bead _scbl_lane
+  SMALL_CANDIDATES="[]"
+  BIG_CANDIDATES="[]"
+  while IFS= read -r _scbl_bead; do
+    _scbl_lane=$(classify_lane "$_scbl_bead")
+    if [ "$_scbl_lane" = "big" ]; then
+      BIG_CANDIDATES=$(echo "$BIG_CANDIDATES" | jq --argjson b "$_scbl_bead" '. + [$b]' 2>/dev/null || echo "$BIG_CANDIDATES")
+    else
+      SMALL_CANDIDATES=$(echo "$SMALL_CANDIDATES" | jq --argjson b "$_scbl_bead" '. + [$b]' 2>/dev/null || echo "$SMALL_CANDIDATES")
+    fi
+  done < <(echo "$_scbl_json" | jq -c '.[]')
+  SMALL_COUNT=$(echo "$SMALL_CANDIDATES" | jq 'length' 2>/dev/null || echo "0")
+  BIG_COUNT=$(echo "$BIG_CANDIDATES" | jq 'length' 2>/dev/null || echo "0")
+}
 
-while IFS= read -r bead; do
-  lane=$(classify_lane "$bead")
-  if [ "$lane" = "big" ]; then
-    BIG_CANDIDATES=$(echo "$BIG_CANDIDATES" | jq --argjson b "$bead" '. + [$b]' 2>/dev/null || echo "$BIG_CANDIDATES")
-  else
-    SMALL_CANDIDATES=$(echo "$SMALL_CANDIDATES" | jq --argjson b "$bead" '. + [$b]' 2>/dev/null || echo "$SMALL_CANDIDATES")
-  fi
-done < <(echo "$ALL_CANDIDATES_JSON" | jq -c '.[]')
-
-SMALL_COUNT=$(echo "$SMALL_CANDIDATES" | jq 'length' 2>/dev/null || echo "0")
-BIG_COUNT=$(echo "$BIG_CANDIDATES" | jq 'length' 2>/dev/null || echo "0")
+_split_candidates_by_lane "$ALL_CANDIDATES_JSON"
 log "Candidates split: small=${SMALL_COUNT}  big=${BIG_COUNT}"
 
 # wa-tm2a: ordering key shared by _top_candidate and _queue_preview.
@@ -6175,6 +6223,36 @@ if [ "$BIG_SLOTS" -gt "0" ] && [ "$BIG_COUNT" -gt "0" ]; then
   dispatch_lane "big" "$BIG_CANDIDATES" "$BIG_SLOTS"
 fi
 
+# ── Step 4b: Fallback — scan rigs if HQ pool was non-empty but dispatched=0
+# this sweep (ga-y1m40) ───────────────────────────────────────────────────────
+# Step 2c (above) only fires when the merged pool was EMPTY. A non-empty pool
+# that is 100% undispatchable this sweep (e.g. every candidate vetoed by the
+# ownership guard) still leaves Step 2c permanently skipped — DISPATCHED==0
+# here means BOTH lane loops exhausted their ENTIRE original pool without one
+# success, so retrying the SAME HQ candidates would fail identically; only a
+# rig scan can find NEW work. Skip when Step 2c already ran this sweep (same
+# rigs, already tried and found equally undispatchable — re-scanning would
+# just repeat the same failed picks, not fix anything) or when DISPATCHED!=0
+# (HQ got at least one success this sweep — HQ keeps precedence, no rig scan).
+# Because DISPATCHED==0 implies neither lane consumed a slot, SMALL_SLOTS/
+# BIG_SLOTS (computed once in Step 1) are still the FULL free capacity here.
+if [ "$DISPATCHED" -eq "0" ] && [ -z "$STEP2C_RAN" ] && { [ "$SMALL_SLOTS" -gt "0" ] || [ "$BIG_SLOTS" -gt "0" ]; }; then
+  log "ga-y1m40: HQ pool had candidate(s) but dispatched=0 this sweep (all vetoed/skipped?) — scanning rig DBs as fallback ..."
+  _scan_rig_fallback_pool
+  if [ "$RIG_MERGED_COUNT" -gt "0" ]; then
+    log "ga-y1m40: Rig DBs: $RIG_MERGED_COUNT merged candidate(s) (bug/debt=$RIG_TIER1_COUNT, feature=$RIG_TIER2_COUNT) — retrying lanes with rig pool."
+    _split_candidates_by_lane "$RIG_MERGED_JSON"
+    if [ "$SMALL_SLOTS" -gt "0" ] && [ "$SMALL_COUNT" -gt "0" ]; then
+      dispatch_lane "small" "$SMALL_CANDIDATES" "$SMALL_SLOTS"
+    fi
+    if [ "$BIG_SLOTS" -gt "0" ] && [ "$BIG_COUNT" -gt "0" ]; then
+      dispatch_lane "big" "$BIG_CANDIDATES" "$BIG_SLOTS"
+    fi
+  else
+    log "ga-y1m40: rig DB fallback scan found no additional candidates."
+  fi
+fi
+
 if [ "$OWNERSHIP_GUARD_VETO_COUNT" -gt "0" ] 2>/dev/null; then
   # ga-8jxe1 AC4 — the log excerpt that made this bug hard to diagnose was
   # exactly "Lane small: dispatched 0 this sweep (cap=5, slots_left=5)" with NO
@@ -6185,6 +6263,34 @@ fi
 
 if [ "$DISPATCHED" -eq "0" ]; then
   log "No dispatches this sweep (lane slots may have been won by a concurrent process, or all picks skipped)."
+fi
+
+# ── Step 5: Stall observability (ga-y1m40) ────────────────────────────────────
+# No alarm existed for "lane(s) had free slots and nothing dispatched, sweep
+# after sweep" — the exact shape of the 4h-invisible outage this bug fixes
+# (measured 2026-07-31 03:50-07:50; a human noticed, not an alarm). A single
+# sweep with dispatched=0 is routine (genuinely no work this sweep); only a
+# STREAK across consecutive sweeps is the signal. pilot-dispatcher.sh is not a
+# long-lived daemon — launchd spawns a fresh process every 300s (its plist) —
+# so the streak must be file-persisted, not an in-process variable. State
+# lives under $GC_CITY/.gc/ so PILOT_CITY_OVERRIDE redirects it into the
+# selftest fixture exactly like LOG/PILOT_LOG already do (hermetic, no new
+# test seam needed). Gated on DRY_RUN (mirrors every other mutation in this
+# file — "makes zero state changes").
+PILOT_STALL_STATE="$GC_CITY/.gc/pilot-dispatcher-stall.count"
+PILOT_STALL_ALERT_CAP="${PILOT_STALL_ALERT_CAP:-3}"
+if [ "$DRY_RUN" != "1" ] && [ "$DISPATCHED" -eq "0" ] && { [ "$SMALL_SLOTS" -gt "0" ] || [ "$BIG_SLOTS" -gt "0" ]; }; then
+  _stall_count=0
+  [ -f "$PILOT_STALL_STATE" ] && _stall_count=$(cat "$PILOT_STALL_STATE" 2>/dev/null || echo "0")
+  case "$_stall_count" in ''|*[!0-9]*) _stall_count=0 ;; esac
+  _stall_count=$((_stall_count + 1))
+  echo "$_stall_count" > "$PILOT_STALL_STATE" 2>/dev/null || true
+  warn "ga-y1m40: dispatched=0 with free slots (small=$SMALL_SLOTS big=$BIG_SLOTS) — ${_stall_count} consecutive sweep(s)."
+  if [ $((_stall_count % PILOT_STALL_ALERT_CAP)) -eq 0 ]; then
+    notify -t "⚠️ Pilot estagnado" -p 4 "Pilot: ${_stall_count} varreduras consecutivas com vaga livre e 0 despachos (ga-y1m40). Ver pilot-dispatcher.log." || true
+  fi
+elif [ "$DRY_RUN" != "1" ] && [ -f "$PILOT_STALL_STATE" ]; then
+  rm -f "$PILOT_STALL_STATE" 2>/dev/null || true
 fi
 
 log "=== Pilot sweep complete: dispatched=$DISPATCHED (small_slots=$SMALL_SLOTS big_slots=$BIG_SLOTS dolt_saturated_at_start=${PILOT_DOLT_SATURATED_AT_START:-0}) ==="
