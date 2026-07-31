@@ -5,6 +5,70 @@ Estes são acréscimos específicos desta town. A doutrina base (3307 sagrado,
 protocolo Dolt-frágil, nudge-first, mail lifecycle, não-adotar-identidade) já
 vem do fragment NATIVO `operational-awareness` — NÃO duplicar aqui.
 
+🚨 **REGRA Nº 1 — TODA pergunta ao Athos é MÚLTIPLA ESCOLHA. Pergunta aberta é
+PROIBIDA.** (Mandato do Athos 2026-07-24, RE-COBRADO em 2026-07-31 porque
+continuava sendo violado: a regra existia em UM arquivo só e não chegava ao
+prompt de ninguém. Agora chega — não há mais desculpa de "não sabia".)
+
+Vale para TODOS os agentes desta town (crews, workers, dogs, reviewers, Mayor),
+em QUALQUER canal (AskUserQuestion, mail, nudge, Slack, WhatsApp, terminal).
+
+Formato OBRIGATÓRIO, sem exceção:
+1. **Contexto primeiro, em BULLET POINTS curtos** — o problema e por que a
+   decisão importa. Não escreva parágrafo corrido.
+2. **Opções concretas e mutuamente exclusivas**, cada uma com o **TRADEOFF
+   explícito** (o que ele ganha e o que ele perde escolhendo aquilo).
+3. **A 1ª opção é SEMPRE a SUA recomendação.** Você é quem estudou o problema —
+   tome posição. "Não sei, você decide" não é resposta de especialista.
+4. **Texto livre só como UMA das opções**, nunca como a pergunta inteira.
+5. Em sessão Claude Code: use a ferramenta **AskUserQuestion** (o campo "Other"
+   já satisfaz o item 4 por construção). Fora dela (mail/nudge/WhatsApp):
+   escreva as opções numeradas 1/2/3 no corpo da mensagem, mesma estrutura.
+
+❌ PROIBIDO: "O que você acha?", "Como prefere que eu siga?", "Pode confirmar?",
+"Alguma preferência?" — qualquer coisa que obrigue o Athos a redigir a resposta
+do zero. Se você se pegar escrevendo uma dessas, PARE e converta em opções.
+
+⚖️ **Antes de perguntar, cheque se precisa perguntar.** Se existe default óbvio,
+se é do SEU domínio técnico, ou se a resposta dele não muda o que você vai
+fazer → **NÃO pergunte: decida e reporte.** O Athos fala PRODUTO e decide rápido
+em escolha guiada; pergunta aberta é fricção e trava a decisão. Sobre-perguntar
+viola a regra tanto quanto perguntar errado. (Exceção: dog headless
+não-supervisionado age sozinho e não pergunta.)
+
+🚨 **REGRA Nº 2 — só pergunte PRODUTO/NEGÓCIO. Decisão TÉCNICA nunca vai pro
+Athos.** (Mandato do Athos, 2026-07-31.) Ele NÃO deve precisar de conhecimento
+de programação ou de engenharia de software para responder você. Se responder
+exige ler código, escolher entre implementações, opinar sobre arquitetura,
+timeout, schema, biblioteca ou refactor → **a decisão é SUA, não dele.**
+
+❌ NÃO PERGUNTE (técnico — resolva você):
+  • "Uso skip-and-continue ou refatoro o laço?"
+  • "O timeout deve ser 120s ou 600s?"
+  • "Vendorizo o runtime.sh ou aponto pro path real?"
+  • "Qual índice/schema/biblioteca devo usar?"
+  • "Faço rebase ou merge nessa branch?"
+
+✅ PERGUNTE ASSIM (produto/negócio — ele decide de verdade):
+  • "O filtro X some do painel por ~2 dias enquanto eu conserto, ou seguro a
+    correção e mantenho como está hoje?" (impacto pro usuário)
+  • "Priorizo restaurar o funil de leads (0% hoje) ou o canal de alertas?"
+    (prioridade de negócio)
+  • "Essa mudança começa a enviar mensagem automática pro corretor sem revisão
+    humana. Libero, libero só com canário, ou mantenho desligado?" (risco de
+    negócio / exposição ao cliente)
+
+**Como converter:** pergunte-se "qual é o impacto disso pro usuário, pro cliente,
+pro faturamento, pro risco ou pra prioridade?" — pergunte ISSO. Se você NÃO
+consegue traduzir a decisão em impacto de produto/negócio, então ela é puramente
+técnica e **não é dele: decida você.**
+
+**Travou numa decisão técnica difícil?** O caminho NÃO é o Athos. É: (a) decidir
+com o tradeoff explícito e registrar no bead; (b) chamar o especialista do
+domínio (oracle/peter/mila/thies/batista conforme o rig); ou (c) mandar pro gate
+/ revisão adversarial, que existe exatamente pra isso. O Athos não é revisor
+técnico nem desempatador de engenharia.
+
 **Secrets — Bitwarden é source of truth.** Tokens (MOTHERDUCK_TOKEN, whapi,
 pipedrive, hex, etc.) vêm do vault via `secret <item-name>` (~/.local/bin/secret).
 Nunca hardcode. Falha: `~/.gastown/scripts/secrets-bootstrap.sh --ensure`.

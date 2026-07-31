@@ -4,6 +4,69 @@ See **CLAUDE.md** for complete agent context and instructions.
 
 This file exists for compatibility with tools that look for AGENTS.md.
 
+---
+
+## 🚨 REGRA Nº 1 — TODA pergunta ao Athos é MÚLTIPLA ESCOLHA
+
+**Pergunta aberta é PROIBIDA.** Duplicada aqui DE PROPÓSITO (não é redundância
+preguiçosa): agentes não-Claude (Codex, Gemini) leem este arquivo e NÃO leem o
+CLAUDE.md, então um ponteiro "veja o CLAUDE.md" deixaria justamente eles sem a
+regra. Se você é um agente lendo AGENTS.md, esta regra vale para você.
+
+Formato OBRIGATÓRIO, em qualquer canal (terminal, mail, nudge, WhatsApp, Slack):
+
+1. **Contexto primeiro, em BULLET POINTS curtos** — o problema e por que a
+   decisão importa. Nada de parágrafo corrido.
+2. **Opções concretas e mutuamente exclusivas**, cada uma com o **TRADEOFF
+   explícito** (o que ele ganha e o que perde).
+3. **A 1ª opção é SEMPRE a SUA recomendação** — você estudou o problema, tome
+   posição.
+4. **Texto livre só como UMA das opções**, nunca como a pergunta inteira.
+5. Sem a ferramenta AskUserQuestion disponível? Escreva as opções **numeradas
+   1/2/3** no corpo da mensagem, com a mesma estrutura.
+
+❌ PROIBIDO: "O que você acha?", "Como prefere?", "Pode confirmar?", "Alguma
+preferência?" — qualquer coisa que obrigue o Athos a redigir a resposta do zero.
+
+⚖️ **Antes de perguntar, cheque se precisa perguntar.** Default óbvio, ou é do
+SEU domínio técnico, ou a resposta não muda o que você fará → **decida e
+reporte**, não pergunte. Sobre-perguntar viola a regra tanto quanto perguntar
+errado.
+
+---
+
+## 🚨 REGRA Nº 2 — só pergunte PRODUTO/NEGÓCIO. Técnico nunca vai pro Athos
+
+Mandato do Athos (2026-07-31). Ele **não deve precisar de conhecimento de
+programação ou engenharia de software** para responder você. Se responder exige
+ler código, escolher entre implementações, ou opinar sobre arquitetura, timeout,
+schema, biblioteca ou refactor → **a decisão é SUA, não dele.**
+
+❌ **NÃO PERGUNTE** (técnico — resolva você):
+- "Uso skip-and-continue ou refatoro o laço?"
+- "O timeout deve ser 120s ou 600s?"
+- "Qual índice/schema/biblioteca devo usar?"
+- "Faço rebase ou merge nessa branch?"
+
+✅ **PERGUNTE ASSIM** (produto/negócio — ele decide de verdade):
+- "O filtro X some do painel por ~2 dias enquanto conserto, ou seguro a correção
+  e mantenho como está?" (impacto pro usuário)
+- "Priorizo restaurar o funil de leads (0% hoje) ou o canal de alertas?"
+  (prioridade de negócio)
+- "Isso passa a enviar mensagem automática pro corretor sem revisão humana.
+  Libero, libero só com canário, ou mantenho desligado?" (risco de negócio)
+
+**Como converter:** pergunte-se *"qual o impacto disso pro usuário, pro cliente,
+pro faturamento, pro risco ou pra prioridade?"* — pergunte ISSO. Se você não
+consegue traduzir em impacto de produto/negócio, a decisão é puramente técnica e
+**não é dele: decida você.**
+
+**Travou numa decisão técnica difícil?** O caminho não é o Athos: (a) decida com
+o tradeoff explícito e registre no bead; (b) chame o especialista do domínio
+(oracle/peter/mila/thies/batista conforme o rig); ou (c) mande pro gate /
+revisão adversarial, que existe exatamente pra isso. O Athos não é revisor
+técnico nem desempatador de engenharia.
+
 > **Recovery**: Run `gt prime` after compaction, clear, or new session
 
 Full context is injected by `gt prime` at session start.
