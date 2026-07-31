@@ -207,6 +207,25 @@ assert_deny  "if/else hides pkill"   'if false; then echo x; else pkill -f a; fi
 assert_deny  "if/elif hides pkill"   'if false; then echo x; elif true; then pkill -f a; fi'
 
 echo ""
+echo "-- AC12b: pkill as the CONDITION of if/while/until (gate FAIL 4/4) --"
+# Every case in AC12 above puts pkill in the block BODY (after then/do/else).
+# NONE put it in the CONDITION slot -- and that slot was ALLOWED (false
+# negative) until "if"/"while"/"until" joined COMMAND_START_TOKENS. These are
+# ordinary "kill if running" / "kill in a loop" idioms, no obfuscation needed,
+# so the body-only coverage above was the reason this shipped unguarded twice.
+assert_deny  "pkill as if-condition"      'if pkill -f a; then echo killed; fi'
+assert_deny  "pkill as while-condition"   'while pkill -f a; do sleep 1; done'
+assert_deny  "pkill as until-condition"   'until pkill -f a; do sleep 1; done'
+assert_deny  "killall as if-condition"    'if killall Dolt; then echo ok; fi'
+assert_deny  "if ! pkill (negated cond)"  'if ! pkill -f a; then echo none; fi'
+# Non-regression: the keywords themselves must not become a blanket denial --
+# a command that merely CONTAINS these words, or runs something else in the
+# condition, still has to be allowed.
+assert_allow "if-condition, no pkill"     'if grep -q pkill f.log; then echo found; fi'
+assert_allow "while-condition, no pkill"  'while read -r l; do echo "$l"; done < f'
+assert_allow "until-condition, no pkill"  'until test -f /tmp/x; do sleep 1; done'
+
+echo ""
 echo "-- AC12: \$(...) / \`...\` command substitution, scanned recursively --"
 assert_allow "cmdsub, no pkill anywhere"        'echo $(echo a)'
 assert_allow "backtick cmdsub, no pkill"        'echo `echo a`'

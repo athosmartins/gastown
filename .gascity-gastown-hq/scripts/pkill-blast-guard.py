@@ -159,7 +159,20 @@ import sys
 
 CMD_RE = re.compile(r"\b(pkill|killall)\b")
 SEPARATORS = (";", "&&", "||", "|", "&")
-BLOCK_KEYWORDS = ("then", "do", "else", "elif")
+# Keywords after which the NEXT word is a genuine command.
+#   then/do/else/elif -> the command sits in the BODY of the block.
+#   if/while/until    -> the command IS the block's CONDITION (gate FAIL 4/4).
+# An earlier revision listed only the body keywords, reasoning that "a real
+# pkill call sits directly after then/do, not after if/while itself". That is
+# factually wrong for the condition slot: in `if pkill -f a; then ...; fi` the
+# pkill IS the condition expression, executed exactly like any other command.
+# With "if" in neither this set nor WRAPPER_PREFIXES, _is_command_position()
+# fell through to _wrapper_chain(), which returned False on the first span
+# token -- so the call was ALLOWED. That is a FALSE NEGATIVE, the catastrophic
+# direction for this guard, and it needs ZERO obfuscation to hit: `if pkill -f
+# x; then` and `while pkill -f x; do` are the ordinary "kill if running" /
+# "kill in a loop" idioms this guard's own docstring puts in scope.
+BLOCK_KEYWORDS = ("then", "do", "else", "elif", "if", "while", "until")
 COMMAND_START_TOKENS = SEPARATORS + ("(", ")", "{") + BLOCK_KEYWORDS
 WRAPPER_PREFIXES = {"sudo", "doas", "nohup", "env", "time", "xargs", "exec", "command", "!"}
 ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
