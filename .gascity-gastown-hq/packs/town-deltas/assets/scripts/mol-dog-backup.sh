@@ -14,8 +14,12 @@
 # more than 120s for a cold/full resync of their local file:// backup target;
 # see dolt-s3-backup.sh's SYNC_TIMEOUT=600 for the same kind of operation
 # against the same hq db — 600s is proven sufficient there. Script vendored
-# into town-deltas/assets so $PACK_DIR resolves here (the embedded maintenance
-# copy is gitignored/ephemeral) — same recipe as gate-sweep's override.
+# into town-deltas/assets for this override (same recipe as gate-sweep's).
+# runtime.sh itself is NOT vendored here — it further sources port_resolve.sh
+# and is a ~200-line dependency not worth duplicating/drifting — it's sourced
+# live from the dolt pack's engine-materialized copy via GC_CITY_PATH instead
+# (gate fix-attempt 2: a self-relative $PACK_DIR here resolves under
+# town-deltas once vendored, and no runtime.sh was ever copied there).
 set -euo pipefail
 
 SMALL_DB_BOUND_SECS=120
@@ -63,8 +67,8 @@ if [ "${MOL_DOG_BACKUP_LIB:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
 
-PACK_DIR="${GC_PACK_DIR:-$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-. "$PACK_DIR/assets/scripts/runtime.sh"
+: "${GC_CITY_PATH:?GC_CITY_PATH must be set}"
+. "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/runtime.sh"
 
 PORT="$GC_DOLT_PORT"
 HOST="${GC_DOLT_HOST:-127.0.0.1}"

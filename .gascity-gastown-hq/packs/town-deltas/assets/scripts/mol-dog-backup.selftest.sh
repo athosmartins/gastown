@@ -131,5 +131,20 @@ else
   ok "no hardcoded 'run_bounded 120 dolt backup sync' remains"
 fi
 
+# ── drift-guard: runtime.sh sourced from its real (dolt pack) location, not ──
+# ── the self-relative $PACK_DIR that broke gate attempt 1 (crashed before ────
+# ── Step 1 ever ran because vendoring this script under town-deltas made ─────
+# ── $PACK_DIR resolve to town-deltas, which never had its own runtime.sh) ────
+if grep -qE '^\s*PACK_DIR=.*BASH_SOURCE' "$SCRIPT"; then
+  bad "self-relative \$PACK_DIR computation is back — this resolves to town-deltas post-vendoring, not the dolt pack, and has no runtime.sh there (the exact gate attempt-1 bootstrap crash)"
+else
+  ok "no self-relative \$PACK_DIR computation for locating runtime.sh"
+fi
+if grep -qF '.gc/system/packs' "$SCRIPT" && grep -qE '\.\s+"\$\{GC_SYSTEM_PACKS_DIR:-\$GC_CITY_PATH' "$SCRIPT"; then
+  ok "runtime.sh is sourced from the dolt pack's GC_CITY_PATH-anchored live location"
+else
+  bad "runtime.sh sourcing no longer anchors to GC_CITY_PATH/.gc/system/packs/dolt — verify it still resolves to a real, always-materialized file"
+fi
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
