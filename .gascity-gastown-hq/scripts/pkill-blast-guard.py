@@ -182,6 +182,93 @@ _KNOWN_OPERATORS = (
 _PUNCTUATION_RUN_RE = re.compile(r"^[();<>|&]+$")
 
 
+def _scan_cmdsub_end(command, start):
+    """Index just past the `)` that closes a `$(` opened before `start`, or
+    None if it never closes.
+
+    Parens are counted ONLY outside quotes. A `)` inside a quoted string is
+    literal text to the shell, not a closer -- `$(grep -c ")" f.txt)` is one
+    complete substitution, not one that ends at the quoted paren.
+
+    Counting parens raw, without this quote state, was the gate FAIL 3/3
+    (2026-07-31): the span closed early at the quoted `)`, the leftover `"`
+    leaked into the OUTER scan and desynced ITS quote state, shlex then threw
+    "No closing quotation", and decide()'s parse-failure path -- which cannot
+    tell "genuinely unparseable command" from "my own scanner desynced" --
+    fell back to a raw text search and DENIED commands that invoke no
+    pkill/killall at all (any command that merely mentions the word while
+    containing this ordinary paren-in-a-string idiom). One-directional: false
+    DENY, never false ALLOW. The irony worth remembering: the docstring above
+    claims one traversal with one shared quote state precisely so nothing can
+    disagree -- and this scanner, nested inside it, was keeping its own
+    quote-blind opinion.
+    """
+    depth, i, n = 1, start, len(command)
+    quote = None  # None, "'", or '"'
+    while i < n:
+        ch = command[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:  # escape (inert in single quotes, handled above)
+            i += 2
+            continue
+        if quote == '"':
+            if ch == '"':
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _scan_backtick_end(command, start):
+    """Index of the backtick closing one opened before `start`, or None.
+
+    Same quote-awareness as _scan_cmdsub_end, for the same reason: a backtick
+    inside a quoted string is literal. Flagged by the same gate review as a
+    secondary instance of the identical root cause (`command.find` was equally
+    quote-blind), so it is fixed the same way rather than left to resurface.
+    """
+    i, n = start, len(command)
+    quote = None
+    while i < n:
+        ch = command[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if quote == '"':
+            if ch == '"':
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "`":
+            return i
+        i += 1
+    return None
+
+
 def _protect_and_strip(command):
     """ONE left-to-right pass doing BOTH jobs the tokenizer needs done
     before shlex sees the text, off a SINGLE shared quote/word-start state:
@@ -241,14 +328,8 @@ def _protect_and_strip(command):
         # backslash-escaped `\$(` never reaches here, because the escape
         # branches consume both characters first.
         if ch == "$" and i + 1 < n and command[i + 1] == "(":
-            depth, j = 1, i + 2
-            while j < n and depth > 0:
-                if command[j] == "(":
-                    depth += 1
-                elif command[j] == ")":
-                    depth -= 1
-                j += 1
-            if depth != 0:
+            j = _scan_cmdsub_end(command, i + 2)
+            if j is None:
                 raise ValueError("unbalanced $(...) in command")
             key = _CMDSUB_PLACEHOLDER % counter
             placeholders[key] = command[i:j]
@@ -258,8 +339,8 @@ def _protect_and_strip(command):
             at_word_start = False
             continue
         if ch == "`":
-            j = command.find("`", i + 1)
-            if j == -1:
+            j = _scan_backtick_end(command, i + 1)
+            if j is None:
                 raise ValueError("unbalanced ` in command")
             key = _CMDSUB_PLACEHOLDER % counter
             placeholders[key] = command[i:j + 1]

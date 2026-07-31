@@ -242,6 +242,32 @@ assert_allow "unbalanced \$( inside single quotes is literal, not a parse error"
              "echo '\$(' ; echo hi"
 
 echo ""
+echo "-- AC12: quoted paren/backtick INSIDE \$(...) (gate FAIL 3/3, 2026-07-31) --"
+echo "   The \$(...) span scanner counted parens without tracking quotes, so a"
+echo "   ')' inside a quoted string closed the span early, leaked a quote into"
+echo "   the outer scan, and the resulting parse failure denied commands that"
+echo "   invoke no pkill at all. Every repro the reviewer reported is pinned"
+echo "   verbatim, each with the AC12 pair (b): the same idiom must still not"
+echo "   be able to HIDE a real call."
+# reviewer's reported false positives -- all invoke nothing, must ALLOW
+assert_allow "quoted ')' in \$( ) + the word pkill as inert text" \
+             'echo "note: pkill guard test, count=$(grep -c ")" file.txt)"'
+assert_allow "quoted ')' in \$( ) + --grep=pkill argument" \
+             'git log --oneline --grep=pkill | head -n $(echo ")" | wc -c)'
+assert_allow "quoted ')' in \$( ) then an unrelated pkill mention" \
+             'x=$(grep -c ")" f.txt); echo "unrelated pkill mention in this comment"'
+assert_allow "bare quoted ')' inside \$( )"            'x=$(echo ")")'
+assert_allow "quoted ')' in \$( ), no pkill text"      'count=$(grep -c ")" file.txt)'
+assert_allow "quoted '(' inside \$( )"                 'x=$(echo "(")'
+# secondary instance the reviewer flagged: the backtick finder was equally blind
+assert_allow "escaped backtick inside a backtick span" 'x=`echo "\`"`'
+# (b) the same idiom must NOT become a hiding place for a real invocation
+assert_deny  "quoted ')' in \$( ) cannot hide a real pkill after it" \
+             'x=$(grep -c ")" f.txt); pkill -f a'
+assert_deny  "quoted ')' inside a \$( ) that ALSO invokes pkill" \
+             'x=$(grep -c ")" f.txt; pkill -f a)'
+
+echo ""
 echo "-- AC12: backslash-escape inside the pkill/killall token itself --"
 assert_allow "unrelated backslash-escaped command still allows" 'ec\ho hello'
 assert_deny  'backslash-escape hides the literal substring, not the token (pk\ill)' 'pk\ill -f a'
