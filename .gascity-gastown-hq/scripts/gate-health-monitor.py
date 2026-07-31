@@ -40,7 +40,7 @@ any open verdict:pending bead with no assignee past ASSIGNEE_GAP_STUCK_SEC
 write is near-instant, so first-seen tracking exists only to skip the write's
 own brief in-flight window, not to absorb genuine multi-minute staleness).
 """
-import json, time, datetime, subprocess, os
+import json, time, datetime, subprocess, os, re
 
 QG = ".gc/quality-gate.jsonl"
 SD = ".gc/story-delivery.jsonl"
@@ -201,9 +201,51 @@ def queued_marker_ids():
         return []
 
 
+# ── ga-kpv48: per-alert cooldown on the notify path ──────────────────────────
+# emit() had NO dedup: a condition that stays true re-fired every loop (120s)
+# forever. The first-seen trackers upstream gate only the START of an alert,
+# never its repetition. Measured 2026-07-30: ~5-8k notifies/day, ~96k since
+# 06-06, from ~7 persistent conditions x 720 cycles/day. Two consequences:
+#   1. it rate-limited the city's ENTIRE ntfy channel (429s) — alerting went
+#      100% blind from 04:03, and this monitor was the top talker;
+#   2. notify blocks when transport is dead (measured: 76s/call), so at ~360
+#      emits/h the monitor spent ~100% of its wall-clock inside notify. It was
+#      queueing on curl, not watching the gate — the alert loop starved the
+#      very check it exists to run.
+# Fix: suppress a REPEAT of the same alert inside EMIT_COOLDOWN_SEC. The key
+# normalizes digits away, so a drifting counter ("stuck 140min" -> "142min")
+# does not defeat dedup while distinct entities stay distinct. stdout is ALWAYS
+# printed — the local log keeps full fidelity and the digest still sees every
+# cycle; only the outbound notify is gated. Cooldown is the mechanism the
+# module docstring already implied ("silence = healthy") but never had.
+EMIT_COOLDOWN_SEC = int(os.environ.get("GATE_HEALTH_EMIT_COOLDOWN_SEC", "3600"))
+_emit_last_notified = {}
+
+
+def emit_key(msg):
+    """Identity of an alert, ignoring volatile counters. PURE (no I/O)."""
+    return re.sub(r"\d+", "#", msg)
+
+
+def emit_should_notify(msg, now, last_notified, cooldown=None):
+    """True iff this alert may reach notify now. PURE (no I/O, no clock, no
+    mutation) — `now` and the state dict are injected so this is testable."""
+    cd = EMIT_COOLDOWN_SEC if cooldown is None else cooldown
+    prev = last_notified.get(emit_key(msg))
+    return prev is None or (now - prev) >= cd
+
+
 def emit(msg):
-    """Print alert line and fire notify CLI (best-effort, never crash on failure)."""
+    """Print alert line and fire notify CLI (best-effort, never crash on failure).
+
+    The print is unconditional; the notify is rate-limited per distinct alert
+    (ga-kpv48) so a persistent condition alerts hourly instead of every 120s.
+    """
     print(msg, flush=True)
+    now = time.time()
+    if not emit_should_notify(msg, now, _emit_last_notified):
+        return
+    _emit_last_notified[emit_key(msg)] = now
     try:
         subprocess.run(
             ["/Users/athos/.local/bin/notify", "-t", "Gate health", "-p", "4", msg],

@@ -254,6 +254,114 @@ for needle, desc in checks:
     else:
         bad("MISSING: %s (needle %r not found in source)" % (desc, needle))
 
+# ── Scenarios 14-19: ga-kpv48 emit() cooldown ─────────────────────────────────
+# emit() had no dedup: a condition that stays true re-fired every loop (120s)
+# forever, because the upstream first-seen trackers gate only the START of an
+# alert. Measured 2026-07-30: ~5-8k notifies/day (~96k since 06-06) from ~7
+# persistent conditions x 720 cycles/day. That rate-limited the city's ENTIRE
+# ntfy channel into 429s (alerting 100% blind from 04:03), and — since notify
+# BLOCKS when transport is dead (measured 76s/call) — it also ate ~100% of this
+# monitor's wall-clock: it queued on curl instead of watching the gate.
+# Scenarios 13's binary_regress_alerted / race_spike_alerted are the same idea
+# applied ad-hoc to 2 of the 10 emit sites; this generalizes it to all of them
+# at the single choke point.
+JAM = "[REAL-JAM] gate marker ga-wisp-abc stuck 140min (queued, no completion)"
+CD = 3600
+
+print("Scenario 14: a first-seen alert notifies")
+if m.emit_should_notify(JAM, 1000.0, {}, CD) is True:
+    ok("empty state -> notify")
+else:
+    bad("first-seen alert was suppressed")
+
+print("Scenario 15: an immediate repeat is suppressed")
+state = {m.emit_key(JAM): 1000.0}
+for label, now in (("+0s", 1000.0), ("+120s (one loop)", 1120.0)):
+    if m.emit_should_notify(JAM, now, state, CD) is False:
+        ok("same alert %s -> suppress" % label)
+    else:
+        bad("same alert %s was NOT suppressed" % label)
+
+print("Scenario 16: a drifting counter does not defeat dedup")
+# This is the scenario that decides whether the fix bites in production: every
+# real alert embeds a minute count that increments each cycle, so exact-string
+# dedup would never match and the flood would continue unchanged.
+for newv in ("142min", "9999min"):
+    drifted = JAM.replace("140min", newv)
+    if m.emit_should_notify(drifted, 1120.0, state, CD) is False:
+        ok("counter drifted 140min -> %s still suppressed" % newv)
+    else:
+        bad("counter drift to %s defeated dedup (flood would continue)" % newv)
+
+print("Scenario 17: suppression is per-alert, never global")
+cases = [
+    ("[GATE FAIL] ga-wisp-abc crew/x/y - tests failed", "different alert TAG"),
+    # Same tag, DIFFERENT marker: the digit-normalizing key must not collapse
+    # distinct entities, or a second stuck marker would go unreported.
+    ("[REAL-JAM] gate marker ga-wisp-zzz stuck 140min (queued, no completion)",
+     "same tag, different entity"),
+]
+for msg, desc in cases:
+    if m.emit_should_notify(msg, 1000.0, state, CD) is True:
+        ok("%s -> notify" % desc)
+    else:
+        bad("%s was wrongly suppressed by an unrelated alert" % desc)
+
+print("Scenario 18: the alert returns once the cooldown elapses")
+for delta, want, label in ((3599, False, "just inside"), (3600, True, "exactly at"),
+                           (7200, True, "well past")):
+    got = m.emit_should_notify(JAM, 1000.0 + delta, state, CD)
+    if got is want:
+        ok("+%ds (%s) -> %s" % (delta, label, "notify" if want else "suppress"))
+    else:
+        bad("+%ds (%s): expected %r, got %r" % (delta, label, want, got))
+
+print("Scenario 19: stdout stays unconditional (suppression costs no log line)")
+# Drive the REAL emit() twice with notify stubbed: both must PRINT (the local
+# log and the digest keep full fidelity) while only the first reaches notify.
+import io, contextlib
+_calls = []
+_real_subprocess = m.subprocess
+m.subprocess = type("S", (), {"run": staticmethod(lambda *a, **k: _calls.append(a))})()
+m._emit_last_notified.clear()
+_buf = io.StringIO()
+try:
+    with contextlib.redirect_stdout(_buf):
+        m.emit(JAM)
+        m.emit(JAM.replace("140min", "142min"))
+finally:
+    m.subprocess = _real_subprocess
+    m._emit_last_notified.clear()
+_lines = [l for l in _buf.getvalue().splitlines() if l.strip()]
+if len(_lines) == 2:
+    ok("both cycles printed to stdout (2 lines)")
+else:
+    bad("expected 2 stdout lines, got %d — suppression ate a log line" % len(_lines))
+if len(_calls) == 1:
+    ok("only the first cycle reached notify (1 call)")
+else:
+    bad("expected 1 notify call, got %d" % len(_calls))
+
+print("Scenario 20: drift guard — cooldown is defined and wired into emit()")
+for needle, desc in [
+    ("def emit_key(", "emit_key() normalizer is defined"),
+    ("def emit_should_notify(", "emit_should_notify() pure decision is defined"),
+    ("EMIT_COOLDOWN_SEC", "EMIT_COOLDOWN_SEC constant is defined"),
+    ("GATE_HEALTH_EMIT_COOLDOWN_SEC", "env override knob is present"),
+    ("_emit_last_notified", "per-alert cooldown state is present"),
+]:
+    ok(desc) if needle in src else bad("MISSING: %s (needle %r)" % (desc, needle))
+_emit_src = src[src.index("def emit(msg):"):]
+_emit_src = _emit_src[:_emit_src.index("\ndef ", 1)]
+if "emit_should_notify" in _emit_src:
+    ok("emit() consults the cooldown before notifying")
+else:
+    bad("emit() does NOT call emit_should_notify — the flood would return")
+if "print(msg" in _emit_src:
+    ok("emit() still prints unconditionally")
+else:
+    bad("emit() no longer prints unconditionally — log fidelity lost")
+
 print("")
 print("Results: %d passed, %d failed" % (PASS, FAIL))
 if FAIL == 0:
