@@ -333,6 +333,20 @@ _EXTRA_ALARM_SUPPRESS_PREFIXES = (
     # (ga-uvfs6), consuming the ephemeral pool:refused one. Without this clause such a
     # bead re-enters candidacy here exactly like a never-refused bead.
     ("pilot:refused-reason", "pilot:refused-reason:* (permanent refusal audit label, ga-uvfs6)"),
+    # ga-eu2x (2026-07-30): an ENGINE-WINDOW bead is buildable in principle but by
+    # DOCTRINE no pool worker may build it — the fix is a go:embed'd source edit +
+    # `go build` + swap of the shared /opt/homebrew/bin/gc binary + town bounce,
+    # which is Mayor/operator-coordinated (see the pool:refused:engine-rebuild-required
+    # convention in the town-deltas doctrine fragment). The Mayor parks such a bead by
+    # adding needs:engine-window + no-auto-dispatch and stripping ctx:ready/exec:auto.
+    # Neither park label was in this table, so the parked bead kept matching "NONE of
+    # this reconciler's known non-buildable signals" and alarmed as "dispatch path
+    # failing" — blaming the Pilot for correctly declining to dispatch it. Same class
+    # as the blocked:* miss above: a deliberate park read as a broken dispatch path.
+    # This affects the whole engine-window class (ga-yxuab, ga-s2eri, ga-hssb1, …),
+    # not just the bead that surfaced it, and would repeat every STARVE_MIN forever.
+    ("needs:engine-window", "needs:engine-window (Mayor/operator-coordinated gc engine rebuild — no pool worker may build it)"),
+    ("no-auto-dispatch", "no-auto-dispatch (explicitly parked out of automatic dispatch)"),
 )
 
 
