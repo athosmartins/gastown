@@ -70,7 +70,7 @@ fire ntfy 🚨 -p 5 to Athos — autonomous recovery couldn't fix it, a human is
 Recovers silently: when a Gate PASSED appears after a dispatch, reset state (solved).
 Never crashes (every external call guarded); silence = healthy.
 """
-import json, time, datetime, subprocess, os, re
+import json, time, datetime, subprocess, os, re, inspect
 import sys as _sys
 _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 from gc_ledger import gc_ledger_append as _grw_ledger
@@ -216,6 +216,19 @@ DEFERRED_REQUEUE_MINUTES = int(os.environ.get("GRW_DEFERRED_REQUEUE_MINUTES", "8
 DEFERRED_REQUEUE_MAX_PER_SWEEP = int(os.environ.get("GRW_DEFERRED_REQUEUE_MAX_PER_SWEEP", "5"))
 DEFERRED_REQUEUE_MAX_ATTEMPTS = int(os.environ.get("GRW_DEFERRED_REQUEUE_MAX_ATTEMPTS", "3"))  # after K sweeps with no derivable author found (or K re-defers despite one), stop: close if never resolvable, escalate if it keeps re-deferring anyway
 GRW_DEFER_REQUEUE_LABEL_RE = re.compile(r"^grw-defer-requeue:(\d+)$")               # restart-safe per-marker attempt counter — separate budget from FIX 2's grw-requeue: (a marker can pass through error AND deferred across its lifetime)
+# FIX 8 — clear a PHANTOM gate:queued/gate:reviewing label on a SOURCE bead: no open
+# type:quality-gate-marker references it AT ALL (ga-yzw06). Stronger than FIX 4's
+# clear-stale-reviewing, which requires a real QUEUED marker to exist (just contradicted
+# by the source's own gate:reviewing). Here there is no marker whatsoever — the label is
+# pure phantom, and it strands the bead on BOTH sides: Pilot's ingate filter skips any
+# bead carrying a gate:* label (assumes it's already in the gate), and the gate
+# dispatcher only drains from markers, sees none, and does nothing. Measured live
+# (ga-tje7u): 2 days silent, discovered only because a human happened to ask for a
+# status readout. Deliberately label-only — see reap_orphan_gate_labels()'s docstring
+# for why story:*/status/assignee are never touched.
+GRW_REAP_ORPHAN_GATE_LABEL_ENABLED = os.environ.get("GRW_REAP_ORPHAN_GATE_LABEL_ENABLED", "1") != "0"
+ORPHAN_GATE_LABEL_CONFIRM_THRESHOLD = int(os.environ.get("GRW_ORPHAN_GATE_LABEL_CONFIRM_THRESHOLD", "3"))  # consecutive sweeps (>=this many POLL_SEC apart) a (bead,label) pair must be seen unreferenced before FIX 8 clears it — mirrors orphan-sweep.sh's CONFIRM_THRESHOLD hysteresis; a marker gate-done.md JUST created may not yet be visible to this sweep's query (replication lag), so a single miss must never be enough to act. orphan-sweep.sh found its own CONFIRM_THRESHOLD=2 insufficient (ga-kq4jf) and had to add a second signal — FIX 8 has no equivalent second signal available, so it starts one step more conservative at 3.
+ORPHAN_GATE_LABEL_MAX_PER_SWEEP = int(os.environ.get("GRW_ORPHAN_GATE_LABEL_MAX_PER_SWEEP", "5"))
 # A repair dog's session title (set by the watchdog's --title-hint, and kept by the
 # dog after it self-renames because the dog naturally echoes the branch/condition)
 # matched broadly so we also catch dogs spawned before this process started (restart
@@ -1795,6 +1808,7 @@ class RecoveryState:
         self.error_requeues = {}   # marker_id -> requeues this process has done
         self.deferred_requeues = {}  # marker_id -> FIX 7 attempts this process has done (independent budget from error_requeues)
         self.escalated = {}        # key -> last-escalation epoch
+        self.orphan_gate_label_hits = {}  # (bead_id, label) -> FIX 8 consecutive-sweep count seen unreferenced
 
     def escalate_once(self, key, now, window=None):
         w = WAKE_BACKOFF_MAX_SEC if window is None else window
@@ -2922,6 +2936,149 @@ def requeue_deferred_markers(now, rstate):
         print("[watchdog] deferred-requeue sweep: %d marker(s) actioned%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
 
 
+def _open_quality_gate_marker_sources():
+    """set() of every source-bead: value referenced by an OPEN type:quality-gate-marker,
+    ANY gate-status (queued/ready/claimed/dispatching/running/error/deferred all count —
+    FIX 8 only needs to know SOMETHING still tracks the bead, not which phase). None on
+    query failure (fail-safe: caller aborts the whole sweep rather than risk treating a
+    bead as unreferenced because we simply failed to see its marker)."""
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",  # ga-h199q
+            "--status", "open", "--json"], timeout=25)
+    if not r or r.returncode != 0:
+        return None
+    try:
+        rows = json.loads(r.stdout) or []
+    except Exception:
+        return None
+    out = set()
+    for row in rows:
+        src = _label_value(row, "source-bead:")
+        if src:
+            out.add(src)
+    return out
+
+
+def _beads_with_gate_label(label):
+    """[(bead_id, store), ...] for every open/in_progress bead across HQ + every known
+    rig carrying `label` (gate:queued or gate:reviewing) — a marker's source bead can
+    live in any rig, not just HQ (mirrors FIX 4's _source_review_state rig resolution).
+    None on ANY store query failure (fail-safe: FIX 8 aborts the whole sweep rather than
+    scan a partial rig population and risk false-clearing based on incomplete data)."""
+    stores = [CITY] + [p for p in _rig_paths().values() if p and p != CITY]
+    out = []
+    for store in stores:
+        r = sh(["bash", BD_LIST_CACHED, "-C", store, "list", "-l", label,  # ga-h199q
+                "--status", "open,in_progress", "--json"], timeout=25)
+        if not r or r.returncode != 0:
+            return None
+        try:
+            rows = json.loads(r.stdout) or []
+        except Exception:
+            return None
+        for row in rows:
+            if label in (row.get("labels") or []):
+                out.append((row.get("id"), store))
+    return out
+
+
+def orphan_gate_label_verdict(confirm_hits, confirm_threshold):
+    """PURE decision (no I/O, unit-tested) for FIX 8: has a (bead, gate:queued-or-
+    -reviewing label) pair now been seen unreferenced by any open marker across enough
+    CONSECUTIVE sweeps to act?
+      'clear' — confirm_hits >= confirm_threshold: safe to strip the phantom label.
+      'wait'  — not yet confirmed; could still be a marker-visibility race."""
+    return "clear" if confirm_hits >= confirm_threshold else "wait"
+
+
+def _update_orphan_gate_label_hits(hits_state, candidate_keys):
+    """PURE (no I/O, unit-tested): the CONSECUTIVE-sweep counting rule in one place.
+    hits_state is the current {(bead_id, label): consecutive_count}; candidate_keys is
+    the SET of (bead_id, label) pairs detected as orphan-candidates THIS sweep (label
+    present, no open marker references it). Returns the NEXT hits_state: every
+    candidate's count +1, and — critically — every key NOT in candidate_keys this sweep
+    is DROPPED, not merely frozen. A pair that was a candidate for 2 sweeps and then
+    isn't (a marker appeared, or the label was cleared some other way) starts over from
+    0 if it ever reappears, rather than resuming from 2. That drop-not-freeze rule is
+    what makes ORPHAN_GATE_LABEL_CONFIRM_THRESHOLD a CONSECUTIVE-sweep guard against the
+    marker-visibility race (a marker gate-done.md just created may not be queryable yet)
+    rather than a cumulative "seen enough times ever" counter, which a single missed
+    sweep would already have satisfied via unrelated intermittent hits."""
+    return {key: hits_state.get(key, 0) + 1 for key in candidate_keys}
+
+
+def reap_orphan_gate_labels(now, rstate):
+    """FIX 8 (ga-yzw06): clear a SOURCE bead's gate:queued/gate:reviewing label when NO
+    open quality-gate-marker references it at all — see the FIX 8 constants-block
+    docstring above for the full incident/rationale. This function owns HOW (candidate
+    gather, hysteresis bookkeeping, apply); the constants block owns WHY.
+
+    Scope is deliberately label-only: never touches story:*/status/assignee. Verified
+    against the live board's own source (whatsapp_automation/daemons/painel_visibilidade.py,
+    function _load_kanban and its helpers _qualifies_for_triagem/_is_auto_dispatch_card/
+    _is_automation_bead) — grepped for "gate:queued": ZERO hits. Column placement keys
+    on story:*/status/assignee/live-session only; gate:* labels are never read for it, and
+    the dedicated Gate column is populated from live MARKERS (_place_gate_cards), not from
+    the source's label either. gate-done.md only ADDS gate:queued on marker creation; it
+    never removes story:*. So story:*/status/assignee are already intact on every orphan
+    this function will ever see, and clearing the phantom gate:* label cannot drop a bead
+    off the board — there is nothing to "restore". A stale ASSIGNEE (dead builder session)
+    is a separate, already-solved problem: packs/town-deltas/assets/scripts/orphan-sweep.sh
+    resets in-progress beads assigned to dead agents on its own 5min-cooldown sweep,
+    independent of gate:* labels — this function does not duplicate that.
+
+    Hysteresis via rstate.orphan_gate_label_hits (see orphan_gate_label_verdict): a
+    (bead_id, label) pair must be re-detected as a candidate on ORPHAN_GATE_LABEL_
+    CONFIRM_THRESHOLD consecutive sweeps before it is cleared. Any pair NOT re-detected
+    this sweep (label gone, or a marker now references it) is pruned from the ledger —
+    that pruning is what makes the count consecutive rather than "seen N times ever"
+    (same shape as packs/town-deltas orphan-sweep.sh's CONFIRM_THRESHOLD ledger).
+
+    Bounded, dry-run-aware, fully fail-safe: any store query failure this sweep (HQ or
+    any rig, for either the marker-source set or a labeled-bead scan) aborts the WHOLE
+    sweep — never act on a partial population."""
+    if not GRW_ENABLED or not GRW_REAP_ORPHAN_GATE_LABEL_ENABLED:
+        return
+    referenced = _open_quality_gate_marker_sources()
+    if referenced is None:
+        return  # query failure → fail-safe skip (no blind action)
+    candidates = {}  # (bead_id, label) -> store, for every unreferenced sighting this sweep
+    for label in ("gate:queued", "gate:reviewing"):
+        beads = _beads_with_gate_label(label)
+        if beads is None:
+            return  # a store failed to answer → abort the WHOLE sweep, never act on a partial scan
+        for bid, store in beads:
+            if not bid or bid in referenced:
+                continue
+            candidates[(bid, label)] = store
+    rstate.orphan_gate_label_hits = _update_orphan_gate_label_hits(rstate.orphan_gate_label_hits, set(candidates))
+    to_clear = [(bid, candidates[(bid, label)], label, hits)
+                for (bid, label), hits in rstate.orphan_gate_label_hits.items()
+                if orphan_gate_label_verdict(hits, ORPHAN_GATE_LABEL_CONFIRM_THRESHOLD) == "clear"]
+    acted = 0
+    for bid, store, label, hits in to_clear:
+        if acted >= ORPHAN_GATE_LABEL_MAX_PER_SWEEP:
+            break
+        if GRW_DRY_RUN:
+            print("[watchdog] FIX8 DRY would clear orphan %s on %s (confirmed %d/%d sweeps, no open marker)"
+                  % (label, bid, hits, ORPHAN_GATE_LABEL_CONFIRM_THRESHOLD), flush=True)
+            _recovery_ledger("would_clear_orphan_gate_label",
+                             {"bead": bid, "label": label, "store": store, "hits": hits, "dry_run": True})
+            acted += 1
+            continue
+        sh(["bd", "-C", store, "label", "remove", bid, label, "-q"], timeout=20)
+        sh(["bd", "-C", store, "comment", bid,
+            "grw FIX8: cleared PHANTOM %s (no open quality-gate-marker referenced this bead across %d consecutive sweeps — Pilot's ingate filter was skipping it and the gate dispatcher had nothing to drain; the ga-yzw06 class). Bead is a dispatch candidate again. If it is still assigned to a dead session, orphan-sweep.sh resets that separately on its own sweep."
+            % (label, hits)], timeout=20)
+        _recovery_ledger("clear_orphan_gate_label", {"bead": bid, "label": label, "store": store, "confirm_hits": hits})
+        notify("Gate self-heal: label fantasma %s limpo em %s (sem marker há %d sweeps seguidos — ga-yzw06). Virou candidato de novo pro Pilot." % (label, bid, hits), 3)
+        print("[watchdog] FIX8 CLEARED orphan %s on %s (no marker across %d consecutive sweeps) — Pilot/gate candidacy restored"
+              % (label, bid, hits), flush=True)
+        del rstate.orphan_gate_label_hits[(bid, label)]
+        acted += 1
+    if acted:
+        print("[watchdog] FIX8 orphan gate-label sweep: %d bead(s) actioned%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
+
+
 def main():
   # ---- state ----
   gov = Governor()       # dedup + concurrent cap + per-condition cooldown/back-off
@@ -2946,14 +3103,16 @@ def main():
         "AND reap ORPHAN/STALE markers (queued>%dm w/ source closed→close, or leaked gate:reviewing→clear, cap %d/sweep; enabled=%s) "
         "AND requeue STRANDED dispatching|reviewing markers w/ NO open run (dead reviewer, >%dm, cap %d/sweep, esc after %d; enabled=%s) "
         "AND auto-requeue STUCK gate-status:error markers (>%dm in error, cap %d/sweep, osc-escalate after %d; enabled=%s) "
-        "AND recover/close STUCK gate-status:deferred markers (>%dm deferred w/ derivable author→requeue, else close after %d attempts, ga-y1kk; cap %d/sweep, enabled=%s). "
+        "AND recover/close STUCK gate-status:deferred markers (>%dm deferred w/ derivable author→requeue, else close after %d attempts, ga-y1kk; cap %d/sweep, enabled=%s) "
+        "AND clear PHANTOM gate:queued/gate:reviewing source labels w/ NO open marker at all (confirmed %dx consecutive sweeps, cap %d/sweep, ga-yzw06; enabled=%s). "
         "All bounded + fail-safe + dry_run=%s."
         % (REVIEW_HANG_MINUTES, GRW_REAP_HUNG_ENABLED, STRANDED_RUN_MINUTES, STRANDED_MAX_ATTEMPTS, GRW_REAP_STRANDED_ENABLED,
            FROZEN_KILL_SECS, FROZEN_KILL_MAX_PER_SWEEP, GRW_REAP_FROZEN_ENABLED, GRW_FROZEN_REQUEUE_ENABLED,
            ORPHAN_MARKER_MIN_MINUTES, ORPHAN_MAX_PER_SWEEP, GRW_REAP_ORPHAN_ENABLED,
            STALE_REVIEW_MARKER_MINUTES, STALE_REVIEW_MAX_PER_SWEEP, STALE_REVIEW_MAX_ATTEMPTS, GRW_REAP_STALE_REVIEW_ENABLED,
            ERROR_REQUEUE_MINUTES, ERROR_REQUEUE_MAX_PER_SWEEP, ERROR_REQUEUE_MAX_ATTEMPTS, GRW_REQUEUE_ERROR_ENABLED,
-           DEFERRED_REQUEUE_MINUTES, DEFERRED_REQUEUE_MAX_ATTEMPTS, DEFERRED_REQUEUE_MAX_PER_SWEEP, GRW_REQUEUE_DEFERRED_ENABLED, GRW_DRY_RUN), flush=True)
+           DEFERRED_REQUEUE_MINUTES, DEFERRED_REQUEUE_MAX_ATTEMPTS, DEFERRED_REQUEUE_MAX_PER_SWEEP, GRW_REQUEUE_DEFERRED_ENABLED,
+           ORPHAN_GATE_LABEL_CONFIRM_THRESHOLD, ORPHAN_GATE_LABEL_MAX_PER_SWEEP, GRW_REAP_ORPHAN_GATE_LABEL_ENABLED, GRW_DRY_RUN), flush=True)
 
   while True:
     try:
@@ -2990,6 +3149,10 @@ def main():
             reap_orphan_and_stale_markers(now)
         except Exception as e:
             print("[watchdog] reap_orphan_and_stale_markers error (continuing): %r" % e, flush=True)
+        try:
+            reap_orphan_gate_labels(now, rstate)
+        except Exception as e:
+            print("[watchdog] reap_orphan_gate_labels error (continuing): %r" % e, flush=True)
         try:
             reap_stale_review_markers(now, rstate, open_running_runs)
         except Exception as e:
@@ -3208,7 +3371,46 @@ def _selftest():
     ok(_bead_id_prefix("ga-wisp-me6y20") == "ga", "ga-wisp-me6y20 -> ga (split on the FIRST hyphen only)")
     ok(_bead_id_prefix("") == "" and _bead_id_prefix(None) == "", "empty/None -> '' (fail-safe, never crashes)")
     ok(_bead_id_prefix("noHyphenId") == "", "no hyphen -> '' (unknown prefix, fails safe to HQ-only lookup)")
-    print("gate-recovery-watchdog FIX2+FIX3+FIX4+FIX5+FIX6+FIX7 selftest: PASS=%d FAIL=%d" % (p, f))
+    # FIX 8 — orphan_gate_label_verdict (phantom gate:queued/gate:reviewing, NO marker at all)
+    T = ORPHAN_GATE_LABEL_CONFIRM_THRESHOLD
+    ok(orphan_gate_label_verdict(T - 1, T) == "wait", "one sweep short of threshold -> wait")
+    ok(orphan_gate_label_verdict(T, T) == "clear", "exactly at threshold -> clear")
+    ok(orphan_gate_label_verdict(T + 5, T) == "clear", "past threshold -> still clear")
+    ok(orphan_gate_label_verdict(0, T) == "wait", "never seen (0 hits) -> wait")
+    ok(orphan_gate_label_verdict(1, 1) == "clear", "sanity: WITHOUT any hysteresis (threshold=1) a single sighting fires immediately — proving ORPHAN_GATE_LABEL_CONFIRM_THRESHOLD=%d is the ONLY thing standing between a marker-visibility race (sweep 1 misses a just-created marker) and a false clear" % T)
+    # FIX 8 — _update_orphan_gate_label_hits (the CONSECUTIVE-sweep counting rule)
+    ok(_update_orphan_gate_label_hits({}, {("ga-x", "gate:queued")}) == {("ga-x", "gate:queued"): 1},
+       "first sighting of a candidate -> hits=1")
+    ok(_update_orphan_gate_label_hits({("ga-x", "gate:queued"): 1}, {("ga-x", "gate:queued")}) == {("ga-x", "gate:queued"): 2},
+       "re-detected next sweep -> hits increments (consecutive)")
+    ok(_update_orphan_gate_label_hits({("ga-x", "gate:queued"): 2}, set()) == {},
+       "the ga-yzw06 race guard: NOT re-detected this sweep (a marker appeared, or the label's gone) -> DROPPED entirely, not merely frozen at 2")
+    ok(_update_orphan_gate_label_hits({("ga-x", "gate:queued"): 2, ("ga-y", "gate:reviewing"): 5},
+                                       {("ga-x", "gate:queued")}) == {("ga-x", "gate:queued"): 3},
+       "unrelated pair (ga-y) drops out independently when not re-detected; the still-candidate pair (ga-x) keeps accumulating")
+    ok(_update_orphan_gate_label_hits({("ga-x", "gate:queued"): 9}, {("ga-x", "gate:queued")}) != {("ga-x", "gate:queued"): 9},
+       "re-detection always increments — a candidate never plateaus (guards against an off-by-one that silently stops counting)")
+    # FIX 8 scenario: the exact marker-visibility race the bug (ga-yzw06) asks for —
+    # sweep 1 sees a bead as unreferenced (marker just created by gate-done.md, not yet
+    # queryable), sweep 2 sees the SAME marker now visible -> must NOT have fired.
+    race = _update_orphan_gate_label_hits({}, {("ga-race", "gate:queued")})
+    ok(orphan_gate_label_verdict(race[("ga-race", "gate:queued")], T) == "wait",
+       "sweep 1 of a fresh candidate -> wait, never clear on a single sighting")
+    race = _update_orphan_gate_label_hits(race, set())  # sweep 2: marker now visible, not a candidate
+    ok(("ga-race", "gate:queued") not in race,
+       "sweep 2 (marker now visible) resets the streak to gone — confirms hysteresis actually prevented the false clear, not just delayed it")
+    # FIX 8 scope guard: reap_orphan_gate_labels must NEVER touch story:*/assignee — the
+    # ga-yzw06 trap this bug explicitly warns against (an over-eager fix that repositions
+    # lifecycle state instead of just clearing the phantom label). Static source-inspection
+    # mutation guard: if this invariant is ever violated by a future edit, this goes RED.
+    _fix8_src = inspect.getsource(reap_orphan_gate_labels)
+    ok('"story:' not in _fix8_src and "'story:" not in _fix8_src,
+       "FIX 8 source never references a story:* label literal (label-only fix; painel's column derivation never reads gate:* labels, so there is nothing to 'restore')")
+    ok("--assignee" not in _fix8_src and '"update"' not in _fix8_src,
+       "FIX 8 source never reassigns/updates the bead (dead-assignee reset is orphan-sweep.sh's job, not this fix's — no double-handling)")
+    ok('"label", "remove"' in _fix8_src,
+       "sanity: the guard above isn't vacuous — FIX 8 does perform its OWN real mutation (label remove)")
+    print("gate-recovery-watchdog FIX2+FIX3+FIX4+FIX5+FIX6+FIX7+FIX8 selftest: PASS=%d FAIL=%d" % (p, f))
     return 0 if f == 0 else 1
 
 
