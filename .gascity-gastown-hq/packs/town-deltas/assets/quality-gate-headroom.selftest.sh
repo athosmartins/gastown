@@ -69,10 +69,23 @@ eq "calm + 0 in-flight   → admit run 1"        "$(HD 50 120 0 0)" "admit 6 dol
 eq "calm + 1 run (3)     → admit run 2"        "$(HD 50 120 0 3)" "admit 6 dolt-calm"
 eq "calm + 2 runs (6)    → defer (cap=6)"      "$(HD 50 120 0 6)" "defer 6 dolt-calm-cap-reached"
 
-echo "── 2. AC1+AC3: Dolt HOT opens NO run, regardless of in-flight ──"
-eq "hot (cpu>180) + idle → defer"              "$(HD 220 120 0 0)" "defer 0 dolt-hot"
+echo "── 2. AC1+AC3: Dolt HOT adds no run to a plane the gate is ALREADY loading ──"
+# ga-q4gqq: the hot rule is "don't ADD to a hot plane", not "never start". It
+# only bites while the gate HAS runs in flight — those are load the gate owns
+# and can shed by waiting. With in-flight == 0 the gate owns NO load, so
+# deferring sheds nothing and the ceiling=0 becomes a self-deadlock (see § 2b).
 eq "hot + 1 run          → defer"              "$(HD 220 120 0 3)" "defer 0 dolt-hot"
-eq "latency hot (>2500)  → defer"              "$(HD 50 9000 0 0)" "defer 0 dolt-hot"
+eq "hot + 2 runs         → defer"              "$(HD 220 120 0 6)" "defer 0 dolt-hot"
+
+echo "── 2b. ga-q4gqq: HOT + in-flight==0 → floor of ONE run (stall → slow) ──"
+# Measured 2026-07-30: 37 sweeps deferred at ceiling=0 with in-flight=0 while an
+# UNRELATED load source (the per-session `gc nudge` 2s poll, ~47% of Dolt load)
+# held ambient cpu over the hot threshold. The gate starved on load it does not
+# produce and cannot reduce. A floor of exactly one run converts an unbounded
+# stall into bounded slowness, and never exceeds ONE run while hot (§ 2 above).
+eq "hot (cpu>180) + idle → admit ONE run"      "$(HD 220 120 0 0)" "admit 3 dolt-hot-floor"
+eq "latency hot (>2500) + idle → admit ONE"    "$(HD 50 9000 0 0)" "admit 3 dolt-hot-floor"
+eq "very hot + idle → still exactly ONE"       "$(HD 900 120 0 0)" "admit 3 dolt-hot-floor"
 
 echo "── 3. AC3: Dolt WARM allows exactly ONE run (serializes; no herd) ──"
 eq "warm (100<cpu≤180) idle → admit one run"   "$(HD 140 120 0 0)" "admit 3 dolt-warm"
@@ -80,6 +93,12 @@ eq "warm + 1 run already     → defer 2nd"      "$(HD 140 120 0 3)" "defer 3 do
 
 echo "── 4. quota limit is an independent hard-stop (even on a calm Dolt) ──"
 eq "calm Dolt but quota LIMITED → defer"       "$(HD 50 120 1 0)" "defer 0 quota-limited"
+# ga-q4gqq: the in-flight==0 floor must NOT leak into the quota stop. Dolt-hot
+# is a soft signal the gate can trade against; an exhausted 5h window is a HARD
+# limit — admitting there burns the run into a quota-stop and re-queues it, so
+# "idle" is never a reason to start. These two idle cases must diverge.
+eq "quota LIMITED + idle → STILL defer"        "$(HD 50 120 1 0)" "defer 0 quota-limited"
+eq "quota LIMITED + hot + idle → defer"        "$(HD 220 120 1 0)" "defer 0 quota-limited"
 
 echo "── 5. boundaries are strict (> not ≥): exactly-at threshold is the cooler tier ──"
 eq "cpu == warm(100) → calm, not warm"         "$(HD 100 120 0 0)" "admit 6 dolt-calm"
@@ -90,8 +109,10 @@ echo "── 6. no-signal fail-OPEN (default) vs fail-CLOSED (opt-in) ──"
 # A wedged probe must NEVER deadlock the critical-path gate → default proceeds.
 eq "no cpu/lat + failopen=1 → admit (max)"     "$(HD '' '' 0 0 1)" "admit 6 no-signal-failopen"
 eq "no cpu/lat + failopen=0 → defer"           "$(HD '' '' 0 0 0)" "defer 0 no-signal-failclosed"
-# A positively-measured hot reading still defers even under fail-open.
-eq "failopen but measured hot → still defer"   "$(HD 220 '' 0 0 1)" "defer 0 dolt-hot"
+# A positively-measured hot reading still caps at ONE run under fail-open
+# (ga-q4gqq floor: idle → one run; with a run already in flight → defer).
+eq "failopen + measured hot + idle → ONE run"  "$(HD 220 '' 0 0 1)" "admit 3 dolt-hot-floor"
+eq "failopen + measured hot + 1 run → defer"   "$(HD 220 '' 0 3 1)" "defer 0 dolt-hot"
 
 echo "── 7. junk inputs degrade safely (no crash; sane default tier) ──"
 eq "non-numeric cpu (lat ok, calm) → admit"    "$(HD NaN 120 0 0)" "admit 6 dolt-calm"
@@ -232,11 +253,19 @@ eq "both absent      → empty (→ fail-open)"       "$(gate_effective_headroom
 eq "now absent       → ambient still used"        "$(gate_effective_headroom_cpu 90 '')"  "90"
 # End-to-end VALUE proof: the SAME plane that DEFERs on the post-janitor reading
 # ADMITs one run on the ambient reading — exactly the deadlock this fixes.
-eq "post-janitor reading (200) alone → DEFER"    "$(HD 200 120 0 0)" "defer 0 dolt-hot"
-eq "ambient reading (155) → ADMIT one run"       "$(HD 155 120 0 0)" "admit 3 dolt-warm"
-eq "selector picks ambient → flips DEFER→ADMIT"  "$(HD "$(gate_effective_headroom_cpu 155 200)" 120 0 0)" "admit 3 dolt-warm"
-# A genuinely hot ambient still DEFERs (the fix must not blind the gate).
-eq "ambient genuinely HOT (220) → still DEFER"   "$(HD "$(gate_effective_headroom_cpu 220 240)" 120 0 0)" "defer 0 dolt-hot"
+# ga-q4gqq: probed with a run ALREADY in flight, because that is now the regime
+# where hot still DEFERs. At in-flight==0 both readings admit (the § 2b floor),
+# which would make this comparison pass for the wrong reason — it must keep
+# discriminating hot from warm, so it is asserted where the two verdicts differ.
+eq "post-janitor reading (200) alone → DEFER"    "$(HD 200 120 0 3)" "defer 0 dolt-hot"
+eq "ambient reading (155) → ADMIT (warm, 1 run)" "$(HD 155 120 0 0)" "admit 3 dolt-warm"
+eq "selector picks ambient → flips DEFER→ADMIT"  "$(HD "$(gate_effective_headroom_cpu 155 200)" 120 0 3)" "defer 3 dolt-warm-cap-reached"
+# A genuinely hot ambient still DEFERs while a run is in flight (the fix must
+# not blind the gate)...
+eq "ambient genuinely HOT (220) + 1 run → DEFER" "$(HD "$(gate_effective_headroom_cpu 220 240)" 120 0 3)" "defer 0 dolt-hot"
+# ...and even when idle (floor) it is still CLASSIFIED hot — never silently
+# demoted to warm/calm. The reason string is the proof the threshold still bites.
+eq "ambient genuinely HOT (220) + idle → hot-floor" "$(HD "$(gate_effective_headroom_cpu 220 240)" 120 0 0)" "admit 3 dolt-hot-floor"
 
 echo "── 23. ga-bgvc0: live wiring drift guards ──"
 has "$DISPATCHER" 'gate_effective_headroom_cpu\(\)'                   "selector helper defined"
@@ -305,8 +334,20 @@ echo "── 25. ga-cru9: incident replay — production threshold (cpu_hot=250)
 # script's own coded default is 180 — com.gascity.quality-gate-dispatcher.plist
 # raises it). Prove the pure decision defers at the real deployed threshold, not
 # just the test harness's hardcoded-180 HD() helper used above.
-eq "production threshold (250): reported cpu=275 lat=48 → defer" \
-  "$(gate_headroom_decision 275 48 0 0 250 130 2500 6 3 1)" "defer 0 dolt-hot"
+# ga-q4gqq: the claim under test is "the DEPLOYED threshold (250) is honored,
+# not the harness's 180" — i.e. cpu=275 must classify as HOT. That is asserted
+# two ways so the § 2b floor cannot mask a threshold regression:
+#   (a) with a run in flight → the hot rule still DEFERs outright;
+#   (b) idle → admits at most ONE run and is still REASONED as hot-floor
+#       (a broken threshold would surface here as dolt-warm/dolt-calm).
+eq "production threshold (250): cpu=275 + 1 run → defer" \
+  "$(gate_headroom_decision 275 48 0 3 250 130 2500 6 3 1)" "defer 0 dolt-hot"
+eq "production threshold (250): cpu=275 + idle → hot-floor (ONE run)" \
+  "$(gate_headroom_decision 275 48 0 0 250 130 2500 6 3 1)" "admit 3 dolt-hot-floor"
+# Control: just BELOW the deployed hot threshold is warm, not hot — proves the
+# 250 boundary is the thing being read (and that 'hot-floor' is not a catch-all).
+eq "production threshold (250): cpu=249 + idle → warm" \
+  "$(gate_headroom_decision 249 48 0 0 250 130 2500 6 3 1)" "admit 3 dolt-warm"
 
 echo ""
 echo "──────────────────────────────────────────────"

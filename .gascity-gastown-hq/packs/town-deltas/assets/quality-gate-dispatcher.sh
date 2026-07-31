@@ -1106,7 +1106,23 @@ gate_headroom_decision() {
     if [ "$failopen" = "1" ]; then ceiling="$maxr"; reason="no-signal-failopen"
     else echo "defer 0 no-signal-failclosed"; return 0; fi
   elif [ "$hot" = "1" ]; then
-    echo "defer 0 dolt-hot"; return 0
+    # ga-q4gqq: "hot → open no run" presumes the gate is PART of the load it is
+    # waiting out. That holds only while it has runs in flight. With in-flight
+    # == 0 the gate owns none of the load, so deferring sheds nothing — the
+    # ceiling=0 becomes a self-deadlock that clears only if some UNRELATED
+    # process happens to go quiet. Measured 2026-07-30: 37 sweeps deferred at
+    # ceiling=0 with in-flight=0, while the per-session `gc nudge` 2s poll
+    # (~47% of Dolt load, ga-yxuab) held ambient CPU over the hot threshold.
+    # Floor of exactly ONE run: turns an unbounded stall into bounded slowness
+    # without ever exceeding one run while hot (in-flight>0 still defers below).
+    # NOTE: deliberately NOT applied to quota-limited above — an exhausted 5h
+    # window is a hard limit, and admitting there burns the run into a
+    # quota-stop re-queue (ga-x3nmz). Dolt-hot is a soft signal; quota is not.
+    if [ "$inflight" -eq 0 ] 2>/dev/null; then
+      ceiling="$perrun"; reason="dolt-hot-floor"
+    else
+      echo "defer 0 dolt-hot"; return 0
+    fi
   elif [ "$warm" = "1" ]; then
     ceiling="$perrun"; reason="dolt-warm"
   else
