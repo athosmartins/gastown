@@ -74,11 +74,16 @@ r=$(classify_parent_gap2 1 1 1 0 1); [ "$r" = "skip:live-assignee" ] && ok "live
 r=$(classify_parent_gap2 1 0 0 0 0); [ "$r" = "skip:no-sling" ] && ok "no 'Sling task bead' comment found → skip:no-sling" || bad "no-sling got '$r'"
 r=$(classify_parent_gap2 1 0 1 0 0); [ "$r" = "skip:active-sling" ] && ok "sling still open/active → skip:active-sling" || bad "active-sling got '$r'"
 
-# ── classify_gap2_bugtask_verdict <merge_verified> — ga-6ync4: sling-passed ≠ parent-fix-merged ─
+# ── classify_gap2_bugtask_verdict <merge_verified> <has_untracked_marker> — ga-6ync4: sling-passed ≠ parent-fix-merged ─
 echo "classify_gap2_bugtask_verdict: a passed+closed sling must NOT alone close the parent"
 r=$(classify_gap2_bugtask_verdict 1); [ "$r" = "close:merge-verified" ] && ok "merged (branch/content evidence found) → close:merge-verified" || bad "merged got '$r'"
 r=$(classify_gap2_bugtask_verdict 0); [ "$r" = "keep:merge-not-verified" ] && ok "NOT merged (sling passed but parent's own fix absent from origin/main) → keep:merge-not-verified (regression guard for ga-h565g-class false-close)" || bad "not-merged got '$r'"
 r=$(classify_gap2_bugtask_verdict ''); [ "$r" = "keep:merge-not-verified" ] && ok "empty/anomalous input → keep:merge-not-verified (fail-safe, never guess merged)" || bad "empty input got '$r'"
+# ga-x2x63: delivery:untracked marker must short-circuit to close, WITHOUT needing a branch
+r=$(classify_gap2_bugtask_verdict 0 1); [ "$r" = "close:untracked-delivery" ] && ok "not merged but delivery:untracked marker present → close:untracked-delivery (ga-x2x63 false-positive fix)" || bad "untracked-marker got '$r'"
+r=$(classify_gap2_bugtask_verdict '' 1); [ "$r" = "close:untracked-delivery" ] && ok "empty merge_verified + untracked marker → close:untracked-delivery" || bad "empty+untracked-marker got '$r'"
+r=$(classify_gap2_bugtask_verdict 0 0); [ "$r" = "keep:merge-not-verified" ] && ok "not merged, no untracked marker → keep:merge-not-verified (unchanged legitimate-failure path)" || bad "not-merged-no-marker got '$r'"
+r=$(classify_gap2_bugtask_verdict 1 1); [ "$r" = "close:merge-verified" ] && ok "merge_verified=1 wins over untracked marker (evidence beats trust)" || bad "verified-and-marker got '$r'"
 
 echo ""
 echo "Results: $P passed, $F failed"
