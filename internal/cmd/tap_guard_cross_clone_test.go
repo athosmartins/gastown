@@ -64,6 +64,63 @@ func TestResolveCrewClone_RequiresGitMarker(t *testing.T) {
 	}
 }
 
+// TestResolveCrewClone_BareCrewContainerIsProtected covers the false-negative
+// measured live against whatsapp_automation/crew (ga-mctun furo 2): a '-C'
+// target pointed at the bare '<rig>/crew' container (no member name) has no
+// .git of its own, so without this case git would silently walk up to
+// whatever ancestor repo it finds and operate there, unprotected.
+func TestResolveCrewClone_BareCrewContainerIsProtected(t *testing.T) {
+	root := t.TempDir()
+	// A rig whose crew/ container holds named clones, mirroring the
+	// real-world whatsapp_automation/crew/{batista,digo,...} layout.
+	_ = makeFakeCrewClone(t, root, "wa_rig", "batista")
+	crewContainer, err := filepath.EvalSymlinks(filepath.Join(root, "wa_rig", "crew"))
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+
+	// Bare container path itself — the exact shape that was measured ALLOW
+	// (wrong) before this fix.
+	got := resolveCrewClone(crewContainer)
+	if got != crewContainer {
+		t.Errorf("bare crew container: got %q, want %q (itself)", got, crewContainer)
+	}
+
+	// The bare-container exception is narrow: it applies only to the
+	// literal input path. A non-clone entry one level further down (e.g. a
+	// shared .claude/ dir, or a typo'd/not-yet-created member name) is NOT
+	// swept in as crew territory — same as TestResolveCrewClone_
+	// RequiresGitMarker's pre-existing "no .git, out of scope" contract.
+	// Widening that would be scope creep beyond the reported furo.
+	nonCloneEntry := filepath.Join(crewContainer, ".claude")
+	if err := os.MkdirAll(nonCloneEntry, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	got = resolveCrewClone(nonCloneEntry)
+	if got != "" {
+		t.Errorf("non-clone entry inside crew/: got %q, want empty (out of scope, unchanged)", got)
+	}
+
+	// Sanity: a named member clone below the container still resolves to
+	// itself (existing behavior), not to the container.
+	named := filepath.Join(crewContainer, "batista")
+	resolvedNamed, err := filepath.EvalSymlinks(named)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	got = resolveCrewClone(named)
+	if got != resolvedNamed {
+		t.Errorf("named clone: got %q, want %q (itself, not container)", got, resolvedNamed)
+	}
+
+	// Sanity: a rig root with no crew/ segment at all is still out of
+	// scope — this fix must not make every path "crew territory".
+	rigRoot := filepath.Join(root, "wa_rig")
+	if got := resolveCrewClone(rigRoot); got != "" {
+		t.Errorf("rig root (no crew/ segment): got %q, want empty", got)
+	}
+}
+
 func TestFirstSubcommand_HandlesFlagsBeforeSubcommand(t *testing.T) {
 	tests := []struct {
 		name string
@@ -114,6 +171,15 @@ func TestIsWriteClass(t *testing.T) {
 		{"tag -d", "tag", " tag -d v1", true},
 		{"tag --delete", "tag", " tag --delete v1", true},
 		{"tag list", "tag", " tag", false},
+		{"stash bare (implicit push)", "stash", " stash", true},
+		{"stash push", "stash", " stash push", true},
+		{"stash pop", "stash", " stash pop", true},
+		{"stash apply", "stash", " stash apply", true},
+		{"stash drop", "stash", " stash drop", true},
+		{"stash clear", "stash", " stash clear", true},
+		{"stash list (read-only)", "stash", " stash list", false},
+		{"stash show (read-only)", "stash", " stash show", false},
+		{"stash show with ref (read-only)", "stash", " stash show -p stash@{0}", false},
 		{"log (read-only)", "log", " log --oneline", false},
 		{"status (read-only)", "status", " status --short", false},
 		{"diff (read-only)", "diff", " diff HEAD", false},

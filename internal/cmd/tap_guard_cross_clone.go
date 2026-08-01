@@ -30,7 +30,8 @@ target, and blocks if both:
      process's own crew clone (or the calling process is not in any crew
      clone), AND
   2. The git subcommand is write-class (commit, push, merge, rebase,
-     cherry-pick, reset, stash, clean, branch -D, tag -d, apply, am).
+     cherry-pick, reset, stash except list/show, clean, branch -D, tag -d,
+     apply, am).
 
 Read-only ops (log, status, diff, show, rev-parse, etc) are explicitly
 allowed — diagnostic visibility into other clones is useful and not a breach.
@@ -152,9 +153,18 @@ func currentCrewClone() string {
 }
 
 // resolveCrewClone walks up from the given path looking for the first
-// '<...>/crew/<name>/' segment that itself is a git clone (has .git). Returns
-// the absolute crew-clone root, or "" if no crew clone is found in the
-// ancestor chain.
+// '<...>/crew/<name>/' segment that itself is a git clone (has .git).
+// Returns the absolute crew-clone root, or "" if no crew clone is found in
+// the ancestor chain.
+//
+// One exception: if the ORIGINAL target path itself is exactly a bare
+// '<...>/crew' container (no member name), it is treated as its own
+// identity even though it has no .git — see the check below for why. This
+// exception applies only to the literal input path, not to ancestors
+// reached while walking up from a deeper, non-matching path: a path shaped
+// like '<...>/crew/ghost' with no .git anywhere is still out of scope, same
+// as before (see TestResolveCrewClone_RequiresGitMarker) — a typo'd or
+// not-yet-created member name shouldn't suddenly widen into "all of crew/".
 //
 // Paths are canonicalized via filepath.EvalSymlinks so that platforms with
 // /var → /private/var (macOS) compare equal to themselves regardless of
@@ -166,6 +176,16 @@ func resolveCrewClone(path string) string {
 	}
 	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
 		abs = resolved
+	}
+	// Bare crew container, e.g. 'git -C <rig>/crew ...' with no member
+	// name. It isn't any specific member's clone, but it's unambiguously
+	// crew territory: a bare '-C' target with no .git of its own would
+	// otherwise let git silently walk up to whatever ancestor repo it
+	// finds (e.g. the rig's own top-level clone) and operate there,
+	// falling through this guard unprotected. Treat the container itself
+	// as the clone identity so that case is still caught.
+	if filepath.Base(abs) == "crew" {
+		return abs
 	}
 	cur := abs
 	for {
@@ -245,6 +265,7 @@ func firstSubcommand(trailing string) string {
 // Special-cases:
 //   - 'branch' is write-class only with -D, --delete, -d, --delete (not list/show)
 //   - 'tag' is write-class only with -d, --delete (not list/show)
+//   - 'stash' is write-class except for 'list'/'show' (not push/pop/apply/drop/clear)
 //   - 'remote' has its own subcommand surface — not handled here (out of scope)
 func isWriteClass(subcommand, trailing string) bool {
 	if !crossCloneWriteOps[subcommand] {
@@ -261,6 +282,11 @@ func isWriteClass(subcommand, trailing string) bool {
 		// Plain 'tag' lists tags — read-only. Block only on delete forms.
 		return strings.Contains(trailing, " -d") ||
 			strings.Contains(trailing, " --delete")
+	case "stash":
+		// 'stash list'/'stash show' are read-only. Bare 'stash' (implicit
+		// push) and push/pop/apply/drop/clear are write-class.
+		return !strings.Contains(trailing, "stash list") &&
+			!strings.Contains(trailing, "stash show")
 	}
 	return true
 }
