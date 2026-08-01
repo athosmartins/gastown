@@ -174,6 +174,20 @@ assert_allow "redirect na frente de 'man pkill'"       '>/tmp/out man pkill'
 assert_allow "redirect na frente de 'grep pkill'"      '</dev/null grep pkill file.sh'
 assert_allow "redirect na frente de ls"                '2>/dev/null ls -la'
 
+echo ""
+echo "-- AC10-c: _KNOWN_OPERATORS e _REDIR_OPS sao um PACTO (regressao do Mayor, 01/08) --"
+echo "   Enquanto o AC10-b era escrito, uma edicao paralela acrescentou '<<<' e '&>>' so ao"
+echo "   _KNOWN_OPERATORS. Efeito: o tokenizador passou a entregar cada um como UM token, o"
+echo "   _REDIR_OPS (que nao os conhecia) nao os removeu do span, e o pkill logo depois"
+echo "   deixou de ser a primeira palavra -> ALLOW. A correcao do AC10-b, ja commitada e"
+echo "   passando, foi REABERTA por dois operadores novos — falso-NEGATIVO de novo."
+echo "   Estes 4 casos travam os dois conjuntos juntos: mexer em um sem o outro quebra aqui."
+assert_deny  "herestring antes do comando"          '<<<x pkill -f y'
+assert_deny  "append-both (&>>) antes do comando"   '&>>/tmp/o pkill -f x'
+# inverso: os mesmos operadores NAO podem virar negacao cega
+assert_allow "herestring com pkill como DADO"       'echo hi <<<pkill'
+assert_allow "append-both na frente de comando inocente" '&>>/tmp/o echo hi'
+
 # ─────────────────────────────────────────────────────────────────────────
 # AC9/AC12 (2026-07-29 gate FAIL + Mayor 9-hole sweep, fix-attempt 1): the
 # first gate run found the guard's own `_tokenize()` let shlex's default

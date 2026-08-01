@@ -194,14 +194,6 @@ _KNOWN_OPERATORS = (
 )
 _PUNCTUATION_RUN_RE = re.compile(r"^[();<>|&]+$")
 
-# The operators that introduce a REDIRECTION rather than a new command.
-# Bash lets a redirection appear anywhere in a simple command, including
-# BEFORE the command name -- see REDIRECTS in the module docstring.
-REDIRECT_OPS = frozenset(("<<<", "&>>", ">>", "<<", ">&", "&>", "<&", "<>", "<", ">"))
-# A redirection may be prefixed by an fd number, glued to the operator in
-# the source text ("2>/dev/null") but split off as its own token here.
-_FD_RE = re.compile(r"^\d+$")
-
 
 def _scan_cmdsub_end(command, start):
     """Index just past the `)` that closes a `$(` opened before `start`, or
@@ -458,7 +450,14 @@ def _tokenize(command):
     return tokens, placeholders
 
 
-_REDIR_OPS = (">>", "<<", ">&", "&>", "<&", "<>", ">", "<")
+# Precisa casar EXATAMENTE o conjunto que `_KNOWN_OPERATORS` sabe fundir num token só.
+# Um operador que o tokenizador entrega inteiro mas que NÃO esteja aqui vira uma "palavra"
+# qualquer no span, `_drop_redirects` não o remove, e o `pkill` depois dele deixa de ser
+# lido como primeira palavra -> ALLOW. Foi exatamente o que aconteceu com `<<<` e `&>>`
+# (01/08): acrescentá-los só ao `_KNOWN_OPERATORS` fundiu os tokens e ABRIU dois bypasses
+# (`<<<x pkill -f y`, `&>>/tmp/o pkill -f x`) — os dois bash válido, os dois falso-NEGATIVO.
+# Ao mexer num dos dois conjuntos, mexa no outro: eles são um pacto, não duas listas.
+_REDIR_OPS = ("<<<", "&>>", ">>", "<<", ">&", "&>", "<&", "<>", ">", "<")
 
 
 def _drop_redirects(span):
