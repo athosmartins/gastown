@@ -857,7 +857,12 @@ def _sling_bead_state(sling_id, now):
         return ("absent", None)
     updated_epoch = _parse_ts_epoch(s.get("updated_at") or s.get("updated") or "")
     if updated_epoch is None:
-        return ("live", 0.0)   # unparseable → cannot prove stale → LIVE (fail conservative)
+        # missing/unparseable timestamp is NOT proof of liveness — collapsing it to
+        # ("live", 0.0) would silently and permanently exclude this story from
+        # delivery-stall detection (GATE-FEEDBACK ga-9ni9w attempt 1). Reuse the
+        # existing "error" path two lines above; the caller already falls through
+        # to the marker check without suppressing on "error".
+        return ("error", None)
     stall_hours = (now - updated_epoch) / 3600.0
     return ("stale", stall_hours) if stall_hours > DELIVERY_STALL_HOURS else ("live", stall_hours)
 
@@ -2178,6 +2183,43 @@ def _selftest():
         _bad("Q3", "expected the no-sling-metadata case to still alert: %r" % notify_calls)
 
     _bd_sling_state = lambda sling_id: ("absent", None)   # restore default (no live sling)
+
+    # ── ga-9ni9w GATE-FEEDBACK (attempt 1 FAIL): Q1/Q2/Q3 above all mock
+    # _bd_sling_state directly, bypassing _parse_ts_epoch entirely — zero coverage
+    # for _sling_bead_state's own handling of a missing/unparseable sling
+    # updated_at. Pre-fix that branch silently returned ("live", 0.0), bit-for-bit
+    # identical to a sling verified updated 5 minutes ago, which permanently and
+    # silently excludes the story from delivery-stall detection with no log trace.
+    # Exercise the REAL _sh-backed path (not the test seam) to prove the fix ─────
+    print("\nga-9ni9w Scenario Q4: _sling_bead_state — missing/unparseable sling "
+          "updated_at must return ('error', None), never silently collapse to LIVE")
+    import types as _types_q4
+    _saved_bd_sling_state_q4 = _bd_sling_state
+    _bd_sling_state = None   # force the real _sh-backed implementation, not the seam
+    _saved_sh_q4 = globals().get("_sh")
+
+    globals()["_sh"] = lambda *a, **kw: _types_q4.SimpleNamespace(
+        returncode=0, stdout='[{"id":"ga-q004-sling","status":"open"}]')   # no updated_at/updated at all
+    _q4_verdict_missing, _q4_hours_missing = _sling_bead_state("ga-q004-sling", NOW)
+
+    globals()["_sh"] = lambda *a, **kw: _types_q4.SimpleNamespace(
+        returncode=0, stdout='[{"id":"ga-q004-sling","status":"open","updated_at":"not-a-timestamp"}]')
+    _q4_verdict_garbled, _q4_hours_garbled = _sling_bead_state("ga-q004-sling", NOW)
+
+    globals()["_sh"] = _saved_sh_q4
+    _bd_sling_state = _saved_bd_sling_state_q4
+
+    if _q4_verdict_missing == "error" and _q4_hours_missing is None and \
+       _q4_verdict_garbled == "error" and _q4_hours_garbled is None:
+        _ok("Q4: missing and unparseable sling updated_at both return ('error', None) — "
+            "delivery_signal's existing 'error' handling falls through to the marker "
+            "check instead of silently suppressing the story (gate-blocking fix, ga-9ni9w)")
+    else:
+        _bad("Q4", "missing-field verdict=%r  garbled-value verdict=%r — expected "
+                    "('error', None) for both; a ('live', ...) verdict here means the "
+                    "silent-collapse regressed" % (
+                        (_q4_verdict_missing, _q4_hours_missing),
+                        (_q4_verdict_garbled, _q4_hours_garbled)))
 
     # ── imp24-P: heal-action branch wiring ───────────────────────────────────────
     print("\nimp24 Scenario P1: HEAL_ENABLED=0 → heal not attempted, stall escalates normally")
