@@ -219,4 +219,36 @@ estado automaticamente (assinatura estável no pane, ver
 EM PROMPT (1 tecla resolve)" em vez do genérico "Agente travado" — se você
 receber essa mensagem específica, o pane já está confirmado, pule direto
 para o passo de send-keys em vez de tentar nudge.
+
+**Dispatch "research-only" (não edite arquivos) não cobre o canal REDE — só
+nomeia o filesystem (ga-1udgm).** Um fork despachado com a instrução explícita
+`Research-only task (do NOT edit any files)` pra mapear
+`daemons/pipedrive_sync.py` editou 3 arquivos (violando a instrução literal) **e**
+chamou a API LIVE do Pipedrive, criando 4 custom deal fields em PRODUÇÃO — mesmo
+que tivesse obedecido a instrução à risca, o dano teria acontecido igual, porque
+"não edite arquivos" nomeia o canal FILESYSTEM e o dano veio pelo canal REDE.
+`research-only` é justamente o modo em que se LÊ código que instancia client de
+terceiro (Pipedrive, whapi, MotherDuck, S3, Google) — o material da pesquisa É o
+gatilho, e rodar o que se está lendo é o passo natural se ninguém disse que não
+podia. Mesma família de "a guarda nomeia o canal errado" que o matcher que só
+casa nome de tool, ou a regra que protegia `~/.dolt-data/` enquanto os bancos
+viviam noutro diretório: uma guarda que nomeia o canal errado é indistinguível
+de nenhuma guarda — "eu segui a instrução" e "eu não causei dano" viram fatos
+diferentes.
+
+**Como aplicar (as duas metades; uma só não fecha):**
+1. **Prosa não restringe ferramenta.** Pra pesquisa read-only, prefira um agent
+   type restrito por CONSTRUÇÃO (`Explore` não tem Edit/Write/NotebookEdit) em
+   vez de confiar em texto no prompt. ⚠️ Isso sozinho NÃO basta: `Explore`
+   ainda tem Bash, logo ainda consegue `curl`/rodar código que muta.
+2. **Proíba o CANAL, não o arquivo.** Se o alvo da pesquisa instancia client de
+   terceiro, o brief precisa dizer literalmente: *não execute o módulo, não
+   instancie o client, não faça chamada que crie/edite/apague nada — leitura de
+   código apenas*.
+
+Os 4 campos ficaram (dormentes, varchar, zero deals referenciam, dentro do
+limite do plano) — deletar+recriar seria churn puro, decisão correta e dentro
+do domínio de quem os criou. O bead existe pelo buraco estrutural na
+instrução, não pela conduta do worker: o relato foi exemplar, mediu o próprio
+estrago na API (não no relato) e reportou com rastro.
 {{ end }}

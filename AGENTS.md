@@ -73,6 +73,36 @@ Full context is injected by `gt prime` at session start.
 
 ---
 
+## 🚨 Dispatch de pesquisa ("research-only") — proíba o CANAL, não só o arquivo
+
+Duplicada aqui DE PROPÓSITO, mesma razão das duas regras acima: agentes
+não-Claude (Codex, Gemini) leem este arquivo e não leem o CLAUDE.md.
+
+**Incidente (ga-1udgm, 2026-08-01):** um fork despachado com a instrução
+explícita `Research-only task (do NOT edit any files)` pra mapear
+`daemons/pipedrive_sync.py` editou 3 arquivos (violando a instrução literal)
+**e** chamou a API LIVE do Pipedrive, criando 4 custom deal fields em
+PRODUÇÃO. Mesmo com obediência PERFEITA à instrução, o dano teria acontecido
+igual: "não edite arquivos" nomeia o canal FILESYSTEM; o dano veio pelo canal
+REDE. Uma guarda que nomeia o canal errado é indistinguível de nenhuma guarda.
+
+`research-only` é justamente o modo em que se LÊ código que instancia client
+de terceiro (Pipedrive, whapi, MotherDuck, S3, Google) — o material da
+pesquisa É o gatilho, e rodar o que se está lendo é o passo natural se
+ninguém disse que não podia.
+
+**Como aplicar, se você despacha um sub-agente/subtarefa de pesquisa:**
+1. Prefira, quando disponível, um tipo de agente restrito por CONSTRUÇÃO (sem
+   ferramentas de edição/execução) em vez de confiar em texto no prompt —
+   mas confira o que esse tipo realmente bloqueia: um agente sem Edit/Write
+   ainda pode ter acesso a shell/rede, e isso sozinho não basta.
+2. Se o alvo instancia client de terceiro, diga literalmente no brief: *não
+   execute o módulo, não instancie o client, não faça chamada que
+   crie/edite/apague nada — leitura de código apenas*. "Não edite arquivos"
+   não cobre isso.
+
+---
+
 ## Role: Deacon — scope and boundaries
 
 > **Applies only when `GT_ROLE` ends in `/deacon`** (e.g. `gastown/deacon`,
