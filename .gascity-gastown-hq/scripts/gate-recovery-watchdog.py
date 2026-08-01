@@ -3128,29 +3128,38 @@ def needs_rebase_verdict(age_sec, threshold_sec, source_resolved, source_closed,
     transient gate-status:error, needs-rebase means the gate already confirmed a
     deterministic conflict, so blindly flipping it back to queued would reproduce
     that conflict identically.
-      close:source-done   — source CLOSED → marker is a leftover; close, no alert.
       close:branch-landed — branch_state in (merged, missing) → the work either
                             already shipped some other way or the branch is
-                            gone/abandoned; the marker is moot regardless of
-                            source status. Checked BEFORE the age gate, same as
-                            close:source-done — a moot marker never waits.
+                            gone/abandoned; the marker is moot. This is the ONLY
+                            closing path, checked before source status and the
+                            age gate — a moot marker never waits. `source_closed`
+                            is deliberately NEVER used to decide closing on its
+                            own: a source bead being closed does not prove the
+                            work landed (ga-w5agg/ga-d2jil — the same stranding
+                            bug class FIX 4's orphan_marker_verdict already
+                            guards against via this identical branch_state gate).
+                            A closed source with a real unmerged branch is a
+                            STRANDED fix, not a leftover — it falls through to
+                            'escalate' below, exactly like an open source would.
       skip:young          — parked <= threshold; a human may already be mid-fix.
       skip:parked-needs-human — source already carries gate:needs-human; a
                             different mechanism (gate-needs-human-divergence-
                             sweep) owns escalation for that bead.
-      escalate             — genuinely stuck: source open (or unresolvable),
-                            branch neither landed nor gone, past the age
-                            threshold → mail+notify with age. ga-7b19e's
-                            acceptance OR-clause (dispatchable-again OR an
-                            alert) is satisfied via this branch — dispatch is
-                            deliberately NOT force-resumed, since that would
-                            just re-hit the identical conflict.
+      escalate             — genuinely stuck: branch neither landed nor gone
+                            (unmerged = real branch pending a human rebase/
+                            rebuild decision; unknown = can't verify, fail-safe
+                            toward visibility), past the age threshold →
+                            mail+notify with age. Fires regardless of source
+                            status (open, closed, or unresolvable) — only the
+                            branch's own ancestry vs origin/main ever justifies a
+                            close. ga-7b19e's acceptance OR-clause (dispatchable-
+                            again OR an alert) is satisfied via this branch —
+                            dispatch is deliberately NOT force-resumed, since
+                            that would just re-hit the identical conflict.
     branch_state ∈ {'merged','unmerged','missing','unknown'} (_branch_merged_state).
     An unresolvable source (source_resolved=False) still reaches 'escalate' once
     old enough — fail TOWARD visibility, never toward silence (the bug this fix
     exists to close)."""
-    if source_resolved and source_closed:
-        return "close:source-done"
     if branch_state in ("merged", "missing"):
         return "close:branch-landed"
     if age_sec <= threshold_sec:
@@ -3229,10 +3238,8 @@ def recover_needs_rebase_markers(now, rstate):
         if verdict == "skip:parked-needs-human":
             continue
 
-        if verdict in ("close:source-done", "close:branch-landed"):
-            reason = ("source bead %s closed — needs-rebase marker is a leftover" % source_bead
-                       if verdict == "close:source-done" else
-                       "branch %s state=%s (already landed or gone) — needs-rebase marker is moot"
+        if verdict == "close:branch-landed":
+            reason = ("branch %s state=%s (already landed or gone) — needs-rebase marker is moot"
                        % (branch or "?", branch_state))
             if GRW_DRY_RUN:
                 print("[watchdog] needs-rebase DRY-RUN would CLOSE marker %s (%s)" % (mid, reason), flush=True)
@@ -3304,7 +3311,7 @@ def main():
         "AND auto-requeue STUCK gate-status:error markers (>%dm in error, cap %d/sweep, osc-escalate after %d; enabled=%s) "
         "AND recover/close STUCK gate-status:deferred markers (>%dm deferred w/ derivable author→requeue, else close after %d attempts, ga-y1kk; cap %d/sweep, enabled=%s) "
         "AND clear PHANTOM gate:queued/gate:reviewing source labels w/ NO open marker at all (confirmed %dx consecutive sweeps, cap %d/sweep, ga-yzw06; enabled=%s) "
-        "AND close/escalate permanently-parked gate-status:needs-rebase markers (>%dm parked, close if source-done/branch-landed else escalate w/ age every %dm cooldown, cap %d/sweep, NEVER requeue, ga-7b19e; enabled=%s). "
+        "AND close/escalate permanently-parked gate-status:needs-rebase markers (>%dm parked, close only if branch landed/gone else escalate w/ age every %dm cooldown, cap %d/sweep, NEVER requeue, ga-7b19e; enabled=%s). "
         "All bounded + fail-safe + dry_run=%s."
         % (REVIEW_HANG_MINUTES, GRW_REAP_HUNG_ENABLED, STRANDED_RUN_MINUTES, STRANDED_MAX_ATTEMPTS, GRW_REAP_STRANDED_ENABLED,
            FROZEN_KILL_SECS, FROZEN_KILL_MAX_PER_SWEEP, GRW_REAP_FROZEN_ENABLED, GRW_FROZEN_REQUEUE_ENABLED,
@@ -3622,8 +3629,10 @@ def _selftest():
     # (dead author, or MAX_REBASE_ATTEMPTS exhausted), so a blind requeue would just
     # reproduce the identical conflict for nothing.
     NR = 15 * 60
-    ok(needs_rebase_verdict(300, NR, True, True, False, "unmerged") == "close:source-done",
-       "source resolved+CLOSED → close regardless of age/branch (checked first)")
+    ok(needs_rebase_verdict(300, NR, True, True, False, "merged") == "close:branch-landed",
+       "source resolved+CLOSED AND branch actually MERGED → still closes (moot), even young — branch_state alone gates closing, checked before the age gate")
+    ok(needs_rebase_verdict(600 * 60, NR, True, True, False, "unmerged") == "escalate",
+       "GATE-FEEDBACK regression (ga-7b19e attempt 1 FAIL): source resolved+CLOSED but branch UNMERGED (stranded fix) must NEVER close — a closed source does not prove the work landed (mirrors FIX 4's orphan_marker_verdict recover-stranded guard, ga-w5agg/ga-d2jil class). The original FIX 9 draft closed here unconditionally; this is the falsifying case for that exact bug.")
     ok(needs_rebase_verdict(600 * 60, NR, True, False, False, "merged") == "close:branch-landed",
        "source OPEN but branch MERGED → close (work landed some other way)")
     ok(needs_rebase_verdict(600 * 60, NR, True, False, False, "missing") == "close:branch-landed",
