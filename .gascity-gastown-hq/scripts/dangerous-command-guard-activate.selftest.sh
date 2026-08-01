@@ -168,6 +168,70 @@ RC5=$?
   && ok "missing file: non-zero exit with FATAL message" \
   || bad "missing file: expected non-zero exit + FATAL, got rc=$RC5 out=$(cat /tmp/dcg-selftest-5.$$)"
 
+# ─────────────────────────────────────────────────────────────────────────
+# Case 6 (gate-fix-2): a target with invalid/unparseable JSON must not
+# take down the whole batch under set -e -- targets listed AFTER it in
+# the same invocation must still get processed. Reproduces the exact
+# scenario gate review verified by hand against fix-attempt 1 (3 targets,
+# middle one unparseable; target 3 was silently never touched).
+# ─────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- case 6: invalid JSON on one target does not skip later targets --"
+F6A="$SCRATCH/batch-a.json"
+F6B="$SCRATCH/batch-b-invalid.json"
+F6C="$SCRATCH/batch-c.json"
+echo '{}' > "$F6A"
+echo '{ this is not valid json' > "$F6B"
+echo '{}' > "$F6C"
+B6B_BEFORE="$(cat "$F6B")"
+
+bash "$ACTIVATE" "$F6A" "$F6B" "$F6C" >/tmp/dcg-selftest-6.$$ 2>&1
+RC6=$?
+HOOKS_6A="$(jq '[.hooks.PreToolUse[]? | select(.matcher == "Bash") | .hooks[]] | length' "$F6A" 2>/dev/null)"
+HOOKS_6C="$(jq '[.hooks.PreToolUse[]? | select(.matcher == "Bash") | .hooks[]] | length' "$F6C" 2>/dev/null)"
+B6B_AFTER="$(cat "$F6B")"
+if [ "$RC6" -ne 0 ] && [ "$HOOKS_6A" = "6" ] && [ "$HOOKS_6C" = "6" ] \
+   && grep -q "FATAL" /tmp/dcg-selftest-6.$$ && grep -q "batch-b-invalid.json" /tmp/dcg-selftest-6.$$ \
+   && [ "$B6B_AFTER" = "$B6B_BEFORE" ]; then
+  ok "batch: valid targets before AND after the bad one both got their 6 hooks, bad target named in FATAL output and left untouched, overall exit non-zero"
+else
+  bad "batch: expected rc!=0, a=6 c=6, FATAL naming batch-b-invalid.json, b untouched -- got rc=$RC6 a=$HOOKS_6A c=$HOOKS_6C b_changed=$([ "$B6B_AFTER" = "$B6B_BEFORE" ] && echo no || echo yes) out=$(cat /tmp/dcg-selftest-6.$$)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────
+# Case 7 (gate-fix-2): a target with TWO pre-existing bare-Bash entries
+# (malformed but syntactically legal JSON) must get the 6 new hooks in
+# only ONE of them, not duplicated into both.
+# ─────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- case 7: two pre-existing bare-Bash entries -- no duplication --"
+F7="$SCRATCH/two-bare-bash.json"
+cat > "$F7" <<'JSONEOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "echo first-entry", "if": "Bash(first-thing*)" } ] },
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "echo second-entry", "if": "Bash(second-thing*)" } ] }
+    ]
+  }
+}
+JSONEOF
+
+bash "$ACTIVATE" "$F7" >/tmp/dcg-selftest-7.$$ 2>&1
+TOTAL_DC_HOOKS_7="$(jq '[.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[] | select(.command | contains("dangerous-command"))] | length' "$F7" 2>/dev/null)"
+FIRST_ENTRY_HOOKS_7="$(jq '.hooks.PreToolUse[0].hooks | length' "$F7" 2>/dev/null)"
+SECOND_ENTRY_HOOKS_7="$(jq '.hooks.PreToolUse[1].hooks | length' "$F7" 2>/dev/null)"
+if [ "$TOTAL_DC_HOOKS_7" = "6" ] && [ "$FIRST_ENTRY_HOOKS_7" = "7" ] && [ "$SECOND_ENTRY_HOOKS_7" = "1" ]; then
+  ok "two-bare-bash: 6 dangerous-command hooks total (not 12), all landed in the first entry (7 hooks), second entry untouched (1 hook)"
+else
+  bad "two-bare-bash: expected 6 total / first=7 / second=1, got total=$TOTAL_DC_HOOKS_7 first=$FIRST_ENTRY_HOOKS_7 second=$SECOND_ENTRY_HOOKS_7 file=$(cat "$F7")"
+fi
+
+bash "$ACTIVATE" "$F7" >/tmp/dcg-selftest-7b.$$ 2>&1
+TOTAL_DC_HOOKS_7B="$(jq '[.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[] | select(.command | contains("dangerous-command"))] | length' "$F7" 2>/dev/null)"
+[ "$TOTAL_DC_HOOKS_7B" = "6" ] && ok "two-bare-bash: re-run is idempotent (still 6 dangerous-command hooks total, no re-duplication)" \
+  || bad "two-bare-bash: expected 6 after re-run, got $TOTAL_DC_HOOKS_7B"
+
 rm -f /tmp/dcg-selftest-*.$$ 2>/dev/null || true
 
 echo ""
