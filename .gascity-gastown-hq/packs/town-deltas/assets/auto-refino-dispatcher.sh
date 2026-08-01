@@ -355,6 +355,18 @@ auto_refino_has_lifecycle_label() {
 #           into sub-work; refining/re-splitting the parent re-asks a decision
 #           already taken (wa-ku5j1's children were all closed — already
 #           delivered, not just decided).
+#           CAVEAT (bug ga-8bjhl, wa-pxvox): both this check AND the story:*
+#           label check above are defeated if a split is executed WITHOUT the
+#           Epic Split Convention (skills/refino/references/story-bead-
+#           convention.md: --type epic --set-labels story:epic-split on the
+#           umbrella, --parent on each child) — e.g. a split recorded only via
+#           free-text comment + sibling `blocks` deps between the children
+#           leaves `bd children` empty AND no story:* label, so the umbrella
+#           looks untouched again. Not fixable from inside this pure
+#           classifier (it has no way to know a split happened with zero
+#           structural trace). The actual fix is upstream, at the point a
+#           POLICY-GAP escalation gets resolved: see the escalate-time
+#           reminder next to the `story:needs-human` stamp below.
 #   Status (open) is enforced at the query level (--status open), exactly as the
 #   labelled queries already are; this pure predicate covers the rest.
 auto_refino_is_ingestable_raw() {
@@ -1500,6 +1512,25 @@ case "$DECISION" in
     # Not in AUTO_REFINO_LIFECYCLE_LABELS (same reasoning as story:refino-escalado
     # above), so _clear_lifecycle never strips it.
     bd_ label add "$STORY_ID" "story:needs-human" -q 2>/dev/null || true
+    # bug ga-8bjhl: a POLICY-GAP resolved by SPLITTING the story into
+    # sub-stories only leaves a durable trace if whoever executes the split
+    # applies the EXISTING Epic Split Convention (skills/refino/references/
+    # story-bead-convention.md: --type epic --set-labels story:epic-split on
+    # the umbrella, --parent on each child). Reproduced live (wa-pxvox): a
+    # split recorded only via free-text comment + sibling `blocks` deps
+    # between the children (no --parent to the umbrella) is invisible to
+    # BOTH defenses auto_refino_is_ingestable_raw has (no story:* label AND
+    # `bd children` returns empty) — the umbrella looks untouched and gets
+    # re-ingested as fresh raw work. Same fragility class as the
+    # story:needs-human stamp above (ga-xdukc/ga-hd87d): relying on the
+    # refiner's own LLM-composed comment to remember this is best-effort,
+    # not guaranteed. Stamp the reminder HERE instead, in code that runs
+    # unconditionally on every escalate, independent of the refiner's
+    # prompt-following AND of whoever ends up resolving the gap (Mayor or
+    # Athos) already knowing the convention exists.
+    bd_ comment "$STORY_ID" "Lembrete (bug ga-8bjhl): se a resolução desta escalação envolver DIVIDIR esta história em sub-histórias, aplique o Epic Split Convention NA PRÓPRIA história — não só em comentário — skills/refino/references/story-bead-convention.md: a história-mãe fica com type=epic e o label de lifecycle TROCADO para story:epic-split, e cada filha nasce com --parent apontando pra ela, ex.:
+  bd -C \"$AR_BEAD_STORE\" create \"<sub-história>\" --type feature --parent $STORY_ID --label story:unrefined --no-inherit-labels
+Sem o --parent + o label story:epic-split na história-mãe, o guard de RAW-ingestion não enxerga o split (bd children continua vazio, sem label story:*) e esta história volta a ser ingerida como ideia crua." 2>/dev/null || true
     if [ "$OUTCOME" != "ESCALATE" ]; then
       # Budget-exhaustion escalation (the refiner kept producing REFINED but the
       # gate kept bouncing). Record why.

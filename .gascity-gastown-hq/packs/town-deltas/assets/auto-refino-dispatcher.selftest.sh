@@ -1405,6 +1405,38 @@ else
   bad "16b. claimed/split/escalated guard missing from jq filter or classifier wiring — occurrences 1-4 can re-form"
 fi
 
+# ── Scenario 17: POLICY-GAP escalations stamp an Epic Split Convention
+#    reminder, so a split executed comment-only (bug ga-8bjhl, wa-pxvox: 3
+#    children created via free-text comment + sibling `blocks` deps, no
+#    --parent, no story:epic-split) doesn't defeat BOTH of
+#    is_ingestable_raw's existing defenses (story:* label check +
+#    has_children — see Scenario 16b). The reminder is stamped in
+#    DETERMINISTIC bash on every escalate — same fix shape as the
+#    story:needs-human stamp (ga-xdukc/ga-hd87d) — not left to the refiner's
+#    own best-effort LLM comment.
+echo "Scenario 17: escalate stamps the Epic Split Convention reminder (bug ga-8bjhl)"
+
+if grep -qF 'Lembrete (bug ga-8bjhl)' "$DISPATCHER" \
+   && grep -qF 'story:epic-split' "$DISPATCHER" \
+   && grep -qF -- '--parent $STORY_ID --label story:unrefined --no-inherit-labels' "$DISPATCHER"; then
+  ok "17. escalate path stamps the Epic Split Convention reminder (story:epic-split + --parent) (bug ga-8bjhl)"
+else
+  bad "17. escalate path missing the ga-8bjhl split-convention reminder"
+fi
+
+# 17b. Drift-guard: the reminder must run UNCONDITIONALLY, at the same
+#      line-position class as the story:needs-human stamp right above it —
+#      NOT nested inside the OUTCOME!=ESCALATE budget-exhaustion branch,
+#      which would mean POLICY-GAP escalations (OUTCOME=ESCALATE, the one
+#      case this bug actually needs it for) never see it.
+_reminder_line=$(grep -nF 'Lembrete (bug ga-8bjhl)' "$DISPATCHER" | head -1 | cut -d: -f1)
+_outcome_if_line=$(grep -nF 'if [ "$OUTCOME" != "ESCALATE" ]; then' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$_reminder_line" ] && [ -n "$_outcome_if_line" ] && [ "$_reminder_line" -lt "$_outcome_if_line" ]; then
+  ok "17b. reminder fires BEFORE the OUTCOME!=ESCALATE branch — reaches POLICY-GAP escalations, not just budget-exhaustion"
+else
+  bad "17b. reminder is gated behind OUTCOME!=ESCALATE (or missing) — POLICY-GAP escalations would never see it"
+fi
+
 echo ""
 echo "auto-refino-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
