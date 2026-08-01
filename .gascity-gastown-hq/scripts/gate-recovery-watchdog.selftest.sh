@@ -234,6 +234,10 @@ for needle, desc in [
     ("GRW_WAKE_GRACE", "GRW_WAKE_GRACE opt-out constant is present"),
     ("pilot_stall_verdict(now - mtime, secs_since_avail(now), PILOT_STALL_SEC, GRW_WAKE_GRACE)",
      "pilot_jammed() actually wires the grace-aware verdict in (not just defined-but-unused)"),
+    # FIX9 (ga-7b19e): needs-rebase silent-park recovery — defined + wired into main()
+    ("def needs_rebase_verdict(", "FIX9 pure needs-rebase decision is defined"),
+    ("def recover_needs_rebase_markers(", "FIX9 recover_needs_rebase_markers() driver is defined"),
+    ("recover_needs_rebase_markers(now, rstate)", "main() recovers/escalates needs-rebase markers each loop"),
 ]:
     if needle in src:
         ok(desc)

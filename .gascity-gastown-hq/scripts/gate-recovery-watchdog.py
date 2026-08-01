@@ -229,6 +229,33 @@ GRW_DEFER_REQUEUE_LABEL_RE = re.compile(r"^grw-defer-requeue:(\d+)$")           
 GRW_REAP_ORPHAN_GATE_LABEL_ENABLED = os.environ.get("GRW_REAP_ORPHAN_GATE_LABEL_ENABLED", "1") != "0"
 ORPHAN_GATE_LABEL_CONFIRM_THRESHOLD = int(os.environ.get("GRW_ORPHAN_GATE_LABEL_CONFIRM_THRESHOLD", "3"))  # consecutive sweeps (>=this many POLL_SEC apart) a (bead,label) pair must be seen unreferenced before FIX 8 clears it — mirrors orphan-sweep.sh's CONFIRM_THRESHOLD hysteresis; a marker gate-done.md JUST created may not yet be visible to this sweep's query (replication lag), so a single miss must never be enough to act. orphan-sweep.sh found its own CONFIRM_THRESHOLD=2 insufficient (ga-kq4jf) and had to add a second signal — FIX 8 has no equivalent second signal available, so it starts one step more conservative at 3.
 ORPHAN_GATE_LABEL_MAX_PER_SWEEP = int(os.environ.get("GRW_ORPHAN_GATE_LABEL_MAX_PER_SWEEP", "5"))
+# FIX 9 — recover/escalate a permanently-parked gate-status:needs-rebase marker
+# (ga-7b19e). Unlike FIX 2's transient gate-status:error, needs-rebase is reached
+# ONLY after the gate itself already confirmed a deterministic conflict (dead
+# author, or MAX_REBASE_ATTEMPTS exhausted — quality-gate-dispatcher.sh's own
+# needs-rebase bounce sites document "a rebase retry fails identically"). A blind
+# requeue would therefore just reproduce the IDENTICAL conflict for nothing — so
+# this fix NEVER requeues (contrast FIX 2/FIX 7, both safe retries of a plausibly-
+# transient state). It only auto-closes the marker when independently proven moot
+# (source bead already closed, or the branch already landed/vanished per
+# _branch_merged_state), and otherwise ESCALATES once per cooldown window with the
+# marker's age — a permanent SILENT park was the actual bug: measured live in the
+# gastown rig, 9 markers piled up at needs-rebase, the oldest 10 days, one
+# (wa-juety) holding a real Athos-approved bead hostage 5 days with zero signal
+# anywhere (not even gate-throughput-stall-watchdog.sh, which deliberately excludes
+# needs-rebase from its "active" count by design). pilot-dispatcher.sh's
+# _filter_built excludes a needs-rebase-parked bead via TWO INDEPENDENT paths — the
+# open marker itself (_beadid_has_open_gate_marker), AND, if mirrored, the source
+# bead's own gate:needs-rebase label — so closing the marker alone is not always
+# enough; the close path below also best-effort strips that label from the source
+# bead (label-only, same FIX 8 scope discipline: never touches story:*/status/
+# assignee). Branch deletion/rebuild/re-anchor stays a human/Mayor decision, same
+# as the existing dead-author re-anchor doctrine — this fix never pushes/deletes a
+# branch; see the FIX 9 selftest's static source guard.
+GRW_RECOVER_NEEDS_REBASE_ENABLED = os.environ.get("GRW_RECOVER_NEEDS_REBASE_ENABLED", "1") != "0"
+NEEDS_REBASE_AGE_MINUTES = int(os.environ.get("GRW_NEEDS_REBASE_AGE_MINUTES", "15"))    # a marker must sit needs-rebase >this before the FIRST escalation — mirrors FIX2/FIX7's young-skip window (gives an already-in-progress manual fix time to land first). Deliberately short: the measured failure mode is SILENCE OVER DAYS, not noise over minutes — see NEEDS_REBASE_ALERT_COOLDOWN_SEC for the much longer re-escalation spacing.
+NEEDS_REBASE_MAX_PER_SWEEP = int(os.environ.get("GRW_NEEDS_REBASE_MAX_PER_SWEEP", "5"))
+NEEDS_REBASE_ALERT_COOLDOWN_SEC = int(os.environ.get("GRW_NEEDS_REBASE_ALERT_COOLDOWN_SEC", "21600"))  # 6h — mirrors gate-merge-survival-sweep.sh's ALERT_COOLDOWN for the same "keep reminding about a stuck condition that needs a human DECISION, not a fix-attempt" shape; a 2h default (WAKE_BACKOFF_MAX_SEC) would re-page too often for a marker whose own text says "Needs re-anchor/rebuild or a Mayor decision" — this is not urgent-minute-by-minute, it is P3-with-a-known-workaround (the Mayor's own framing on wa-juety)
 # A repair dog's session title (set by the watchdog's --title-hint, and kept by the
 # dog after it self-renames because the dog naturally echoes the branch/condition)
 # matched broadly so we also catch dogs spawned before this process started (restart
@@ -3079,6 +3106,178 @@ def reap_orphan_gate_labels(now, rstate):
         print("[watchdog] FIX8 orphan gate-label sweep: %d bead(s) actioned%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
 
 
+def _open_needs_rebase_markers():
+    """[marker dicts] type:quality-gate-marker + gate-status:needs-rebase + open, in
+    HQ (the dispatcher's domain — mirrors _open_error_markers/_open_deferred_markers).
+    None on query failure (fail-safe skip)."""
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",  # ga-h199q
+            "-l", "gate-status:needs-rebase", "--status", "open", "--json"], timeout=25)
+    if not r or r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout) or []
+    except Exception:
+        return None
+
+
+def needs_rebase_verdict(age_sec, threshold_sec, source_resolved, source_closed,
+                          source_needs_human, branch_state):
+    """PURE decision (no I/O, unit-tested) for a gate-status:needs-rebase marker
+    (FIX 9, ga-7b19e). See the FIX 9 constants-block docstring for the full
+    rationale; in short, this never re-queues the marker — unlike FIX 2's
+    transient gate-status:error, needs-rebase means the gate already confirmed a
+    deterministic conflict, so blindly flipping it back to queued would reproduce
+    that conflict identically.
+      close:source-done   — source CLOSED → marker is a leftover; close, no alert.
+      close:branch-landed — branch_state in (merged, missing) → the work either
+                            already shipped some other way or the branch is
+                            gone/abandoned; the marker is moot regardless of
+                            source status. Checked BEFORE the age gate, same as
+                            close:source-done — a moot marker never waits.
+      skip:young          — parked <= threshold; a human may already be mid-fix.
+      skip:parked-needs-human — source already carries gate:needs-human; a
+                            different mechanism (gate-needs-human-divergence-
+                            sweep) owns escalation for that bead.
+      escalate             — genuinely stuck: source open (or unresolvable),
+                            branch neither landed nor gone, past the age
+                            threshold → mail+notify with age. ga-7b19e's
+                            acceptance OR-clause (dispatchable-again OR an
+                            alert) is satisfied via this branch — dispatch is
+                            deliberately NOT force-resumed, since that would
+                            just re-hit the identical conflict.
+    branch_state ∈ {'merged','unmerged','missing','unknown'} (_branch_merged_state).
+    An unresolvable source (source_resolved=False) still reaches 'escalate' once
+    old enough — fail TOWARD visibility, never toward silence (the bug this fix
+    exists to close)."""
+    if source_resolved and source_closed:
+        return "close:source-done"
+    if branch_state in ("merged", "missing"):
+        return "close:branch-landed"
+    if age_sec <= threshold_sec:
+        return "skip:young"
+    if source_resolved and source_needs_human:
+        return "skip:parked-needs-human"
+    return "escalate"
+
+
+def _mail_stuck_needs_rebase_marker(mid, branch, source_bead, rig_name, age_sec, resolved):
+    """ga-7b19e: durable, actionable escalation for a gate-status:needs-rebase
+    marker that has been silently parked past the age threshold. Unlike FIX 2's
+    oscillating-error mail, there is no safe one-line resubmit command here —
+    needs-rebase means the gate already confirmed a deterministic conflict, so
+    the fix requires a human DECISION (re-anchor vs fresh rebuild vs abandon),
+    the same doctrine as the dead-author re-anchor case. This mail exists so
+    that decision point is never silent again (measured: 9 markers piled up in
+    the gastown rig, the oldest 10 days, before a human happened to look)."""
+    subject = "Gate: marker %s preso em needs-rebase (%dmin, ninguém foi avisado)" % (mid, age_sec // 60)
+    body = (
+        "Marker %s está parkeado em gate-status:needs-rebase há %dmin e ninguém "
+        "tinha sido avisado até agora — o watchdog detectou e está avisando "
+        "(grw FIX9, ga-7b19e).\n\n"
+        "Branch: %s\n"
+        "Source bead: %s (%s)\n"
+        "Source resolvido: %s\n\n"
+        "O gate já confirmou um conflito determinístico (autor morto, ou tentativas "
+        "de rebase esgotadas) — um requeue automático reproduziria o MESMO conflito, "
+        "então o watchdog NÃO tenta. Precisa de uma decisão sua: re-anchor (se ainda "
+        "fizer sentido) ou rebuild (RESET pro origin/main atual e reaplicar o fix). "
+        "Se o branch já não presta, apague-o (arquive antes com uma tag) e o marker "
+        "será fechado automaticamente num sweep futuro (source-done ou branch-landed) "
+        "— o watchdog nunca apaga/força-push um branch sozinho.\n\n"
+        "(gate-recovery-watchdog FIX 9 — needs-rebase silent-park escalation, ga-7b19e)"
+    ) % (mid, age_sec // 60, branch or "?", source_bead or "?", rig_name or "?",
+         "sim" if resolved else "não (query falhou ou bead sumiu)")
+    r = sh(["gc", "mail", "send", "mayor", "-s", subject, "-m", body], timeout=45)
+    if not (r and r.returncode == 0):
+        print("[watchdog] WARN: gc mail send mayor FAILED for stuck needs-rebase marker %s — notify still sent (grw)"
+              % mid, flush=True)
+
+
+def recover_needs_rebase_markers(now, rstate):
+    """FIX 9 (ga-7b19e): close a gate-status:needs-rebase marker when proven moot
+    (source closed, or branch landed/gone), else escalate once per cooldown with
+    age — NEVER requeue (see needs_rebase_verdict / constants-block docstring for
+    why a blind requeue is unsafe here, unlike FIX 2/FIX 7). Bounded per sweep,
+    dry-run aware, fully fail-safe."""
+    if not GRW_ENABLED or not GRW_RECOVER_NEEDS_REBASE_ENABLED:
+        return
+    markers = _open_needs_rebase_markers()
+    if markers is None:
+        print("[watchdog] needs-rebase: marker query unavailable — fail-safe skip", flush=True)
+        return
+    # oldest-parked first so the longest-silent marker is served first
+    markers.sort(key=lambda m: _iso_epoch(m.get("created_at")) or 0.0)
+    acted = 0
+    for mk in markers:
+        if acted >= NEEDS_REBASE_MAX_PER_SWEEP:
+            break
+        mid = mk.get("id")
+        if not mid:
+            continue
+        upd = _iso_epoch(mk.get("updated_at")) or _iso_epoch(mk.get("created_at"))
+        age = int(now - upd) if upd else 0
+        source_bead = _label_value(mk, "source-bead:")
+        rig_name = _label_value(mk, "bead-rig:")
+        branch = _label_value(mk, "branch:")
+        resolved, sclosed, needs_human = _source_bead_state(source_bead, rig_name)
+        branch_state = _branch_merged_state(branch, rig_name)
+        verdict = needs_rebase_verdict(age, NEEDS_REBASE_AGE_MINUTES * 60, resolved,
+                                        sclosed, needs_human, branch_state)
+
+        if verdict == "skip:young":
+            continue
+        if verdict == "skip:parked-needs-human":
+            continue
+
+        if verdict in ("close:source-done", "close:branch-landed"):
+            reason = ("source bead %s closed — needs-rebase marker is a leftover" % source_bead
+                       if verdict == "close:source-done" else
+                       "branch %s state=%s (already landed or gone) — needs-rebase marker is moot"
+                       % (branch or "?", branch_state))
+            if GRW_DRY_RUN:
+                print("[watchdog] needs-rebase DRY-RUN would CLOSE marker %s (%s)" % (mid, reason), flush=True)
+                _recovery_ledger("would_close_needs_rebase",
+                                 {"marker": mid, "source_bead": source_bead, "branch": branch,
+                                  "verdict": verdict, "dry_run": True})
+                acted += 1
+                continue
+            set_gate_status_py(mid, "superseded")
+            sh(["bd", "-C", CITY, "close", mid, "-r",
+                "grw FIX9: %s (ga-7b19e). Closed by watchdog self-heal." % reason], timeout=25)
+            # Best-effort: also strip a mirrored gate:needs-rebase label off the SOURCE
+            # bead, if it's still open — closing the marker alone leaves _filter_built's
+            # OTHER independent exclusion path (the bead's own gate:* label) in place.
+            # Label-only, same FIX 8 scope discipline (never touches story:*/status/assignee).
+            if source_bead and resolved and not sclosed:
+                store = ((_rig_paths().get(rig_name) if rig_name else None)
+                         or _rig_path_by_prefix(_bead_id_prefix(source_bead)) or CITY)
+                sh(["bd", "-C", store, "label", "remove", source_bead, "gate:needs-rebase", "-q"], timeout=20)
+            _recovery_ledger("closed_needs_rebase_marker",
+                             {"marker": mid, "source_bead": source_bead, "branch": branch, "verdict": verdict})
+            notify("Gate self-heal: marker %s (needs-rebase) fechado — %s. (grw FIX9)" % (mid, reason), 3)
+            print("[watchdog] CLOSED needs-rebase marker %s (%s)" % (mid, verdict), flush=True)
+            acted += 1
+            continue
+
+        # verdict == "escalate"
+        if rstate.escalate_once("needs-rebase:%s" % mid, now, window=NEEDS_REBASE_ALERT_COOLDOWN_SEC):
+            notify("🚨 Gate: marker %s (branch %s) preso em needs-rebase há %dmin, ninguém tinha sido avisado. Precisa de uma decisão (re-anchor/rebuild). (grw FIX9)"
+                   % (mid, branch or "?", age // 60), 4)
+            _grw_ledger("human-touch",
+                        {"ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                         "source_daemon": "gate-recovery-watchdog", "stage": "revisa", "kind": "technical",
+                         "bead_id": source_bead or "",
+                         "reason": "needs-rebase marker %s silently parked %dmin — needs a Mayor decision (ga-7b19e)"
+                                   % (mid, age // 60)}, fail_open=True)
+            _mail_stuck_needs_rebase_marker(mid, branch, source_bead, rig_name, age, resolved)
+            _recovery_ledger("escalated_needs_rebase",
+                             {"marker": mid, "source_bead": source_bead, "branch": branch, "age_min": age // 60})
+            print("[watchdog] ESCALATED stuck needs-rebase marker %s (%dm, branch %s)"
+                  % (mid, age // 60, branch or "?"), flush=True)
+    if acted:
+        print("[watchdog] needs-rebase sweep: %d marker(s) actioned%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
+
+
 def main():
   # ---- state ----
   gov = Governor()       # dedup + concurrent cap + per-condition cooldown/back-off
@@ -3104,7 +3303,8 @@ def main():
         "AND requeue STRANDED dispatching|reviewing markers w/ NO open run (dead reviewer, >%dm, cap %d/sweep, esc after %d; enabled=%s) "
         "AND auto-requeue STUCK gate-status:error markers (>%dm in error, cap %d/sweep, osc-escalate after %d; enabled=%s) "
         "AND recover/close STUCK gate-status:deferred markers (>%dm deferred w/ derivable author→requeue, else close after %d attempts, ga-y1kk; cap %d/sweep, enabled=%s) "
-        "AND clear PHANTOM gate:queued/gate:reviewing source labels w/ NO open marker at all (confirmed %dx consecutive sweeps, cap %d/sweep, ga-yzw06; enabled=%s). "
+        "AND clear PHANTOM gate:queued/gate:reviewing source labels w/ NO open marker at all (confirmed %dx consecutive sweeps, cap %d/sweep, ga-yzw06; enabled=%s) "
+        "AND close/escalate permanently-parked gate-status:needs-rebase markers (>%dm parked, close if source-done/branch-landed else escalate w/ age every %dm cooldown, cap %d/sweep, NEVER requeue, ga-7b19e; enabled=%s). "
         "All bounded + fail-safe + dry_run=%s."
         % (REVIEW_HANG_MINUTES, GRW_REAP_HUNG_ENABLED, STRANDED_RUN_MINUTES, STRANDED_MAX_ATTEMPTS, GRW_REAP_STRANDED_ENABLED,
            FROZEN_KILL_SECS, FROZEN_KILL_MAX_PER_SWEEP, GRW_REAP_FROZEN_ENABLED, GRW_FROZEN_REQUEUE_ENABLED,
@@ -3112,7 +3312,9 @@ def main():
            STALE_REVIEW_MARKER_MINUTES, STALE_REVIEW_MAX_PER_SWEEP, STALE_REVIEW_MAX_ATTEMPTS, GRW_REAP_STALE_REVIEW_ENABLED,
            ERROR_REQUEUE_MINUTES, ERROR_REQUEUE_MAX_PER_SWEEP, ERROR_REQUEUE_MAX_ATTEMPTS, GRW_REQUEUE_ERROR_ENABLED,
            DEFERRED_REQUEUE_MINUTES, DEFERRED_REQUEUE_MAX_ATTEMPTS, DEFERRED_REQUEUE_MAX_PER_SWEEP, GRW_REQUEUE_DEFERRED_ENABLED,
-           ORPHAN_GATE_LABEL_CONFIRM_THRESHOLD, ORPHAN_GATE_LABEL_MAX_PER_SWEEP, GRW_REAP_ORPHAN_GATE_LABEL_ENABLED, GRW_DRY_RUN), flush=True)
+           ORPHAN_GATE_LABEL_CONFIRM_THRESHOLD, ORPHAN_GATE_LABEL_MAX_PER_SWEEP, GRW_REAP_ORPHAN_GATE_LABEL_ENABLED,
+           NEEDS_REBASE_AGE_MINUTES, NEEDS_REBASE_ALERT_COOLDOWN_SEC // 60, NEEDS_REBASE_MAX_PER_SWEEP, GRW_RECOVER_NEEDS_REBASE_ENABLED,
+           GRW_DRY_RUN), flush=True)
 
   while True:
     try:
@@ -3165,6 +3367,10 @@ def main():
             requeue_deferred_markers(now, rstate)
         except Exception as e:
             print("[watchdog] requeue_deferred_markers error (continuing): %r" % e, flush=True)
+        try:
+            recover_needs_rebase_markers(now, rstate)
+        except Exception as e:
+            print("[watchdog] recover_needs_rebase_markers error (continuing): %r" % e, flush=True)
 
         # ga-htjni follow-up (dog investigation 2026-06-15): if the gate is
         # ALIVE-but-infra-throttled (Dolt-hot or quota DEFER), a repair dog cannot
@@ -3410,7 +3616,48 @@ def _selftest():
        "FIX 8 source never reassigns/updates the bead (dead-assignee reset is orphan-sweep.sh's job, not this fix's — no double-handling)")
     ok('"label", "remove"' in _fix8_src,
        "sanity: the guard above isn't vacuous — FIX 8 does perform its OWN real mutation (label remove)")
-    print("gate-recovery-watchdog FIX2+FIX3+FIX4+FIX5+FIX6+FIX7+FIX8 selftest: PASS=%d FAIL=%d" % (p, f))
+    # FIX 9 — needs_rebase_verdict (permanent gate-status:needs-rebase park recovery,
+    # ga-7b19e). Unlike FIX2/FIX7, this verdict NEVER returns "requeue" — needs-rebase
+    # is reached only after the gate itself already confirmed a deterministic conflict
+    # (dead author, or MAX_REBASE_ATTEMPTS exhausted), so a blind requeue would just
+    # reproduce the identical conflict for nothing.
+    NR = 15 * 60
+    ok(needs_rebase_verdict(300, NR, True, True, False, "unmerged") == "close:source-done",
+       "source resolved+CLOSED → close regardless of age/branch (checked first)")
+    ok(needs_rebase_verdict(600 * 60, NR, True, False, False, "merged") == "close:branch-landed",
+       "source OPEN but branch MERGED → close (work landed some other way)")
+    ok(needs_rebase_verdict(600 * 60, NR, True, False, False, "missing") == "close:branch-landed",
+       "branch MISSING (abandoned) → close (moot regardless of source)")
+    ok(needs_rebase_verdict(60, NR, True, False, False, "unmerged") == "skip:young",
+       "parked < threshold → skip:young (give a human time to react organically first)")
+    ok(needs_rebase_verdict(600 * 60, NR, True, False, True, "unmerged") == "skip:parked-needs-human",
+       "source needs-human → a different mechanism (needs-human-divergence-sweep) owns escalation")
+    ok(needs_rebase_verdict(600 * 60, NR, True, False, False, "unmerged") == "escalate",
+       "the wa-juety case: old + source open + branch real & unmerged → escalate, NEVER requeue (would reproduce the identical gate-confirmed conflict)")
+    ok(needs_rebase_verdict(600 * 60, NR, True, False, False, "unknown") == "escalate",
+       "branch state unknown (git/rig error) → escalate (the safe direction), NEVER auto-close blind")
+    ok(needs_rebase_verdict(600 * 60, NR, False, False, False, "unmerged") == "escalate",
+       "source unresolvable (query failed) but old → escalate rather than silently do nothing (fail toward visibility, not silence)")
+    # ga-7b19e FALSIFYING TEST — the exact wa-juety scenario from the bug's acceptance
+    # criteria: marker at gate-status:needs-rebase (open), branch on origin (real work,
+    # unmerged), source bead ctx:ready/exec:auto/story:approved (open, no needs-human).
+    # Before this fix NOTHING ever revisited this marker — it aged silently (measured:
+    # wa-juety sat 5 days, the oldest of 9 sibling markers sat 10, before a human
+    # happened to look). The bead must exit limbo via one of ga-7b19e's two sanctioned
+    # outcomes — dispatchable again (deliberately NOT attempted, see FIX 9's constants
+    # docstring for why that's unsafe) OR a visible alert carrying its age. This asserts
+    # the escalate path fires for that exact shape — proving silence is no longer the
+    # outcome. Without this fix, the deadlock stays intact — exactly what happened for
+    # 5 real days.
+    ok(needs_rebase_verdict(7 * 24 * 3600, NR, True, False, False, "unmerged") == "escalate",
+       "ga-7b19e falsifying test: wa-juety-shaped scenario (5d parked, source open+approved, real unmerged branch on origin) → escalate, the bead exits limbo instead of staying silent")
+    _nr_src = inspect.getsource(needs_rebase_verdict)
+    ok('"requeue"' not in _nr_src,
+       "needs_rebase_verdict source never returns 'requeue' — the entire point of FIX 9 (a blind requeue would reproduce a gate-confirmed deterministic conflict, unlike FIX2's transient error)")
+    _nr_action_src = inspect.getsource(recover_needs_rebase_markers)
+    ok("push" not in _nr_action_src and "--force" not in _nr_action_src,
+       "FIX 9 action never pushes/force-pushes the branch — branch deletion/rebuild stays a human/Mayor decision (never autonomous), matching the dead-author re-anchor doctrine")
+    print("gate-recovery-watchdog FIX2+FIX3+FIX4+FIX5+FIX6+FIX7+FIX8+FIX9 selftest: PASS=%d FAIL=%d" % (p, f))
     return 0 if f == 0 else 1
 
 
