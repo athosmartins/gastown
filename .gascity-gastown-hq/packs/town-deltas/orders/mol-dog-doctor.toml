@@ -1,0 +1,13 @@
+# town-deltas override (ga-3wdlv/ga-v6y3p): script vendored into town-deltas/assets so
+# $PACK_DIR resolves here (the embedded maintenance copy is gitignored/ephemeral) — same
+# recipe as gate-sweep's and mol-dog-backup's (ga-gquc1) overrides. The vendored script
+# raises BACKUP_STALE_S from the embedded 43200s (12h, tuned for a 6h backup cadence) to
+# 108000s (30h), matching this city's actual once-daily 04:00 backup job — the old
+# threshold tripped every afternoon on all 10 DBs simultaneously, paging the Mayor with
+# an identical false-positive "Dolt health advisory [MEDIUM]" for most of every day. See
+# mol-dog-doctor.sh's own header comment for the full rationale.
+[order]
+description = "Probe Dolt server health and report status"
+exec = "$PACK_DIR/assets/scripts/mol-dog-doctor.sh"
+trigger = "cooldown"
+interval = "5m"
