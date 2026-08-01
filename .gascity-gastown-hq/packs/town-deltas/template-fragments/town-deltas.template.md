@@ -236,7 +236,17 @@ viviam noutro diretório: uma guarda que nomeia o canal errado é indistinguíve
 de nenhuma guarda — "eu segui a instrução" e "eu não causei dano" viram fatos
 diferentes.
 
-**Como aplicar (as duas metades; uma só não fecha):**
+Um terceiro canal apareceu depois — e é o pior dos três (comentário do Mayor,
+2026-08-01): **identidade/comunicação.** Um subagent herda a identidade do pai
+em TODO canal de comunicação (mail, nudge, comentário/fechamento de bead) —
+nada no envelope distingue "o agente escreveu" de "um subagent dele escreveu".
+Um subagent confuso que reporta sob o nome do pai é pior que silêncio: é lido
+como medição verificada, não como palpite. Foi o que aconteceu aqui — um mail
+chegou como se fosse do worker, carregava uma alegação factual falsa (atribuiu
+ao fork 2 arquivos que já existiam antes dele) e uma causa-raiz inventada, e
+consumiu investigação real do Mayor antes de alguém checar o artefato.
+
+**Como aplicar (as três frentes; uma só não fecha):**
 1. **Prosa não restringe ferramenta.** Pra pesquisa read-only, prefira um agent
    type restrito por CONSTRUÇÃO (`Explore` não tem Edit/Write/NotebookEdit) em
    vez de confiar em texto no prompt. ⚠️ Isso sozinho NÃO basta: `Explore`
@@ -245,6 +255,17 @@ diferentes.
    terceiro, o brief precisa dizer literalmente: *não execute o módulo, não
    instancie o client, não faça chamada que crie/edite/apague nada — leitura de
    código apenas*.
+3. **Proíba o canal de IDENTIDADE também.** No brief: *não mande mail, não
+   faça nudge, não comente nem feche bead — devolva tudo no relatório final;
+   quem decide o que comunicar é quem despachou*. Sem isso, um subagent pode
+   agir e falar sob a identidade do pai sem que ninguém a jusante consiga
+   distinguir um do outro.
+
+**Corolário pra quem recebe (vale pro Mayor e pra qualquer agente): relato de
+agente não é medição.** Quando uma mensagem trouxer uma alegação factual que
+vai virar decisão, confirme no artefato antes de repassar — `git log`, consulta
+à API, o dado bruto — não a narrativa. Repassar sem checar propaga o erro como
+se fosse fato verificado.
 
 Os 4 campos ficaram (dormentes, varchar, zero deals referenciam, dentro do
 limite do plano) — deletar+recriar seria churn puro, decisão correta e dentro

@@ -91,7 +91,18 @@ de terceiro (Pipedrive, whapi, MotherDuck, S3, Google) — o material da
 pesquisa É o gatilho, e rodar o que se está lendo é o passo natural se
 ninguém disse que não podia.
 
-**Como aplicar, se você despacha um sub-agente/subtarefa de pesquisa:**
+Um terceiro canal apareceu depois — e é o pior dos três (comentário do Mayor,
+2026-08-01): **identidade/comunicação.** Um subagent herda a identidade do pai
+em TODO canal de comunicação (mail, nudge, comentário/fechamento de bead) —
+nada no envelope distingue "o agente escreveu" de "um subagent dele escreveu".
+Um subagent confuso que reporta sob o nome do pai é pior que silêncio: é lido
+como medição verificada, não como palpite. Foi o que aconteceu aqui — um mail
+chegou como se fosse do worker, carregava uma alegação factual falsa (atribuiu
+ao fork 2 arquivos que já existiam antes dele) e uma causa-raiz inventada, e
+consumiu investigação real do Mayor antes de alguém checar o artefato.
+
+**Como aplicar, se você despacha um sub-agente/subtarefa de pesquisa (as três
+frentes; uma só não fecha):**
 1. Prefira, quando disponível, um tipo de agente restrito por CONSTRUÇÃO (sem
    ferramentas de edição/execução) em vez de confiar em texto no prompt —
    mas confira o que esse tipo realmente bloqueia: um agente sem Edit/Write
@@ -100,6 +111,17 @@ ninguém disse que não podia.
    execute o módulo, não instancie o client, não faça chamada que
    crie/edite/apague nada — leitura de código apenas*. "Não edite arquivos"
    não cobre isso.
+3. Proíba o canal de IDENTIDADE também: *não mande mail, não faça nudge, não
+   comente nem feche bead — devolva tudo no relatório final; quem decide o
+   que comunicar é quem despachou*. Sem isso, um subagent pode agir e falar
+   sob a identidade do pai sem que ninguém a jusante consiga distinguir um do
+   outro.
+
+**Corolário pra quem recebe (vale pra qualquer agente): relato de agente não
+é medição.** Quando uma mensagem trouxer uma alegação factual que vai virar
+decisão, confirme no artefato antes de repassar — `git log`, consulta à API,
+o dado bruto — não a narrativa. Repassar sem checar propaga o erro como se
+fosse fato verificado.
 
 ---
 
