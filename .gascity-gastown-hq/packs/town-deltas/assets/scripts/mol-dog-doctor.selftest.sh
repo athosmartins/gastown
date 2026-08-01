@@ -124,5 +124,37 @@ else
   bad "town-deltas order override missing or does not match expected [order] shape: $ORDER_TOML"
 fi
 
+# ── real-bootstrap check (ga-v75ka): the "resolved runtime.sh path exists" ────
+# ── check above proves runtime.sh ITSELF is reachable — it does NOT prove ─────
+# ── port_resolve.sh (sourced from WITHIN runtime.sh) resolves when GC_PACK_DIR
+# ── is set to the WRONG pack, exactly as the engine sets it for a ─────────────
+# ── town-deltas-owned order (GC_PACK_DIR=.../packs/town-deltas). That one ─────
+# ── extra level of sourcing is exactly what a static existence check never ────
+# ── executes (see memory: hermetic-selftest-cannot-test-the-bootstrap-it-stubs
+# ── — 26h dead in prod with this exact class of check green). This extracts ───
+# ── the REAL bootstrap lines (not a stub) from the shipped script and runs ────
+# ── them for real against the live Dolt server — doctor's body is read-only ───
+# ── but we still stop right after the source line to avoid a real ─────────────
+# ── send_mayor_mail call if this city currently has orphan DBs (see header).
+echo "── real-bootstrap check: engine GC_PACK_DIR does not break port_resolve.sh ──"
+BOOT_LINE=$(grep -n 'assets/scripts/runtime\.sh"' "$SCRIPT" | head -1 | cut -d: -f1)
+if [ -z "$BOOT_LINE" ]; then
+  bad "could not locate the runtime.sh source line in $SCRIPT to build a bootstrap snippet"
+else
+  BOOT_SNIPPET="$(mktemp)"
+  head -n "$BOOT_LINE" "$SCRIPT" > "$BOOT_SNIPPET"
+  echo 'echo "BOOTSTRAP_OK GC_DOLT_PORT=$GC_DOLT_PORT"' >> "$BOOT_SNIPPET"
+  BOOT_OUTPUT=$(GC_CITY_PATH="$GC_CITY_PATH" GC_PACK_DIR="$GC_CITY_PATH/packs/town-deltas" bash "$BOOT_SNIPPET" 2>&1)
+  BOOT_RC=$?
+  rm -f "$BOOT_SNIPPET"
+  if [ "$BOOT_RC" -eq 0 ] && printf '%s' "$BOOT_OUTPUT" | grep -q '^BOOTSTRAP_OK GC_DOLT_PORT='; then
+    ok "real bootstrap survives engine GC_PACK_DIR=.../packs/town-deltas (resolved a live port)"
+  elif printf '%s' "$BOOT_OUTPUT" | grep -q 'port_resolve.sh: No such file'; then
+    bad "THE ORIGINAL BUG IS BACK: port_resolve.sh not found when GC_PACK_DIR=town-deltas (ga-v75ka) — output: $BOOT_OUTPUT"
+  else
+    bad "real-bootstrap check inconclusive (rc=$BOOT_RC, not the ga-v75ka 'No such file' signature — verify live Dolt is reachable and rerun): $BOOT_OUTPUT"
+  fi
+fi
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

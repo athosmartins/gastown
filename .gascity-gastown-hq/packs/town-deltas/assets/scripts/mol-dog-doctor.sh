@@ -27,7 +27,11 @@
 set -euo pipefail
 
 : "${GC_CITY_PATH:?GC_CITY_PATH must be set}"
-. "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/runtime.sh"
+# ga-v75ka: engine exports GC_PACK_DIR=town-deltas (the pack owning this order),
+# but runtime.sh:209 trusts GC_PACK_DIR to find its sibling port_resolve.sh —
+# override it to dolt's own pack dir for this source, or the dog dies on boot.
+GC_PACK_DIR="${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt" \
+    . "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/runtime.sh"
 
 PORT="$GC_DOLT_PORT"
 HOST="${GC_DOLT_HOST:-127.0.0.1}"

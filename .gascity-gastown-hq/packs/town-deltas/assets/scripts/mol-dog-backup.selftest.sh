@@ -146,5 +146,37 @@ else
   bad "runtime.sh sourcing no longer anchors to GC_CITY_PATH/.gc/system/packs/dolt — verify it still resolves to a real, always-materialized file"
 fi
 
+# ── real-bootstrap check (ga-v75ka): the drift-guard above proves the SOURCE ──
+# ── LINE PATTERN is safe; it does NOT prove port_resolve.sh actually resolves ─
+# ── when GC_PACK_DIR is set to the WRONG pack — exactly as the engine sets it ─
+# ── for a town-deltas-owned order (GC_PACK_DIR=.../packs/town-deltas). That ───
+# ── one extra level of sourcing (runtime.sh sourcing ITS OWN port_resolve.sh) ─
+# ── is exactly what lib-mode/early-return checks never execute (see memory:
+# ── hermetic-selftest-cannot-test-the-bootstrap-it-stubs — 26h dead in prod ───
+# ── with this exact class of check green). This extracts the REAL bootstrap ───
+# ── lines (not a stub) from the shipped script and runs them for real against ─
+# ── the live Dolt server, stopping right after the runtime.sh source line so ──
+# ── no real backup sync is triggered.
+echo "── real-bootstrap check: engine GC_PACK_DIR does not break port_resolve.sh ──"
+: "${GC_CITY_PATH:=/Users/athos/gt/.gascity-gastown-hq}"
+BOOT_LINE=$(grep -n 'assets/scripts/runtime\.sh"' "$SCRIPT" | head -1 | cut -d: -f1)
+if [ -z "$BOOT_LINE" ]; then
+  bad "could not locate the runtime.sh source line in $SCRIPT to build a bootstrap snippet"
+else
+  BOOT_SNIPPET="$(mktemp)"
+  head -n "$BOOT_LINE" "$SCRIPT" > "$BOOT_SNIPPET"
+  echo 'echo "BOOTSTRAP_OK GC_DOLT_PORT=$GC_DOLT_PORT"' >> "$BOOT_SNIPPET"
+  BOOT_OUTPUT=$(GC_CITY_PATH="$GC_CITY_PATH" GC_PACK_DIR="$GC_CITY_PATH/packs/town-deltas" bash "$BOOT_SNIPPET" 2>&1)
+  BOOT_RC=$?
+  rm -f "$BOOT_SNIPPET"
+  if [ "$BOOT_RC" -eq 0 ] && printf '%s' "$BOOT_OUTPUT" | grep -q '^BOOTSTRAP_OK GC_DOLT_PORT='; then
+    ok "real bootstrap survives engine GC_PACK_DIR=.../packs/town-deltas (resolved a live port)"
+  elif printf '%s' "$BOOT_OUTPUT" | grep -q 'port_resolve.sh: No such file'; then
+    bad "THE ORIGINAL BUG IS BACK: port_resolve.sh not found when GC_PACK_DIR=town-deltas (ga-v75ka) — output: $BOOT_OUTPUT"
+  else
+    bad "real-bootstrap check inconclusive (rc=$BOOT_RC, not the ga-v75ka 'No such file' signature — verify live Dolt is reachable and rerun): $BOOT_OUTPUT"
+  fi
+fi
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
