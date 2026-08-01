@@ -3834,7 +3834,24 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       # verdict is invisible"). The rehydrate selftest's mutation test also
       # anchors on this EXACT `--all` query string to construct its mutant —
       # any text change here breaks that anchor match too. Left live.
-      VB_JSON=$(bd -C "$GC_CITY" list --json --all -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID" 2>/dev/null || echo "[]")
+      # root-class:error-vs-empty — a FAILED query must not read as "no verdict
+      # beads exist". The old `|| echo "[]"` collapsed both into an empty array,
+      # and the emptiness guard below then declared "likely died before Step 7".
+      # MEASURED 2026-07-31 (ga-wisp-jm34iny): the SAME run logged 0/1 verdicts
+      # at 23:19, "ZERO verdict beads" at 23:24, then 0/1 again at 23:29 — the
+      # verdict bead (ga-45m6o) existed the whole time and the run finalized
+      # correctly as FAILED. The bead never vanished; one sweep's query did.
+      # That intermittent failure is what fed the "gate outage" narrative: the
+      # WARN is the string three separate agents counted to size ga-jwnye at
+      # 147/426 runs "dead", when the per-bead count for the same day was 13.
+      # Mirrors the sibling `vb_status_action` unknown-branch (ga-art5), which
+      # already skips-and-retries on an unreadable `bd show` instead of guessing.
+      VB_SENTINEL="__VB_QUERY_FAILED__"
+      VB_JSON=$(bd -C "$GC_CITY" list --json --all -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID" 2>/dev/null || echo "$VB_SENTINEL")
+      if [ "$VB_JSON" = "$VB_SENTINEL" ]; then
+        log "  Phase C: verdict-bead query for gate-run $GATE_RUN_ID failed this sweep (transient Dolt hiccup?) — skipping, will retry next sweep (root-class:error-vs-empty). NOT treating as died-before-Step-7."
+        continue
+      fi
       VERDICT_BEAD_IDS=()
       while IFS= read -r PC_VBID; do
         [ -z "$PC_VBID" ] && continue
