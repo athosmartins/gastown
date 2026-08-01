@@ -239,6 +239,7 @@ _git_log_count = None          # (root, since_iso) -> int; None = run git
 _bd_backlog = None             # (rig_root) -> list[dict]; None = run bd
 _bd_delivery = None            # (rig_root) -> list[dict]; None = run bd (imp23 delivery)
 _bd_marker_for_bead = None     # (root, bead_id) -> ("found"|"absent"|"error", marker_dict|None); None = run bd (ga-g0v96)
+_bd_sling_state = None         # (sling_id) -> ("live"|"stale"|"absent"|"error", stall_hours|None); None = run bd (ga-ebm7c)
 _do_dolt_cpu = None            # () -> float pct or None; None = run ps (ga-g0v96 headroom annotation)
 _do_notify = None              # (msg, prio) -> None; None = run notify binary
 _do_mail_mayor = None          # (subject, body) -> bool; None = run gc mail
@@ -812,6 +813,55 @@ def _queued_marker_state(root, bead_id):
     return ("found", {"id": m.get("id") or m.get("issue_id") or "?"})
 
 
+def _parse_ts_epoch(raw):
+    """Parse a bd timestamp ('%Y-%m-%dT%H:%M:%S' or '%Y-%m-%d %H:%M:%S') to epoch, or None."""
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return time.mktime(time.strptime(raw[:19], fmt))
+        except Exception:
+            pass
+    return None
+
+
+# ── ga-9ni9w/ga-ebm7c: pilot.sling_bead liveness check ───────────────────────
+def _sling_bead_state(sling_id, now):
+    """Tri-state: is a story's recorded pilot.sling_bead still open, and is it
+    itself within the delivery-stall window?
+
+    Returns ("live", stall_hours) | ("stale", stall_hours) | ("absent", None) | ("error", None).
+
+    ga-9ni9w: a story's own updated_at freezes BY CONSTRUCTION once the Pilot
+    dispatches it — the actual work happens on the sling/wrapper task bead
+    (pilot.sling_bead), whose updated_at moves as the builder progresses. The
+    pre-fix delivery_signal() only ever looked at the story, so every story
+    with a fix in flight >3h read as "stalled" even mid-build. This mirrors
+    the canonical read of pilot.sling_bead already used by pilot-dispatcher.sh's
+    ga-cnvy1 dedup guard: the sling bead always lives in GC_CITY (gc sling
+    creates it in HQ) — the caller never reaches this function for the
+    rig-native self-reference case (pilot.sling_bead == the story's own id,
+    i.e. no separate wrapper bead to look up).
+    Test seam: _bd_sling_state(sling_id) -> tri-state tuple; None = run bd."""
+    if _bd_sling_state is not None:
+        return _bd_sling_state(sling_id)
+    r = _sh([BD_BIN, "-C", CITY, "show", sling_id, "--json"], timeout=BD_TIMEOUT)
+    if r is None or r.returncode != 0:
+        return ("error", None)
+    beads = _parse_bd_json(r.stdout)
+    if not beads or not isinstance(beads[0], dict):
+        return ("error", None)
+    s = beads[0]
+    status = s.get("status") or ""
+    if status in ("closed", "done"):
+        return ("absent", None)
+    updated_epoch = _parse_ts_epoch(s.get("updated_at") or s.get("updated") or "")
+    if updated_epoch is None:
+        return ("live", 0.0)   # unparseable → cannot prove stale → LIVE (fail conservative)
+    stall_hours = (now - updated_epoch) / 3600.0
+    return ("stale", stall_hours) if stall_hours > DELIVERY_STALL_HOURS else ("live", stall_hours)
+
+
 # ── imp23: delivery-stall signal ─────────────────────────────────────────────
 def delivery_signal(now):
     """Returns (count, sample_beads, explained) of story:in-flight beads stalled
@@ -864,13 +914,7 @@ def delivery_signal(now):
                            b.get("created_at") or b.get("created") or "")
             if not updated_raw:
                 continue
-            updated_epoch = None
-            for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-                try:
-                    updated_epoch = time.mktime(time.strptime(updated_raw[:19], fmt))
-                    break
-                except Exception:
-                    pass
+            updated_epoch = _parse_ts_epoch(updated_raw)
             if updated_epoch is None:
                 continue
             if now - updated_epoch > stall_sec:
@@ -887,7 +931,29 @@ def delivery_signal(now):
     unexplained = {}
     explained = []
     for bid, b in stalled.items():
-        marker_verdict, marker = _queued_marker_state(stall_root[bid], bid)
+        root = stall_root[bid]
+
+        # ga-9ni9w: the story's own updated_at freezes by construction once a
+        # sling/wrapper task is dispatched for it — check pilot.sling_bead
+        # BEFORE trusting the story's staleness. A live (open + recent) sling
+        # means real work is in flight; silence entirely (no mail, no count).
+        # A stale sling means the story really is stuck — fall through so the
+        # existing marker check still gets a chance, but stamp the sling id so
+        # the eventual alert names it. No sling_bead, a closed sling, or a
+        # failed sling lookup all fall through UNCHANGED — that is exactly
+        # today's (accidentally correct) behavior for those cases.
+        sling_id = ((b.get("metadata") or {}).get("pilot.sling_bead") or "").strip()
+        if sling_id and sling_id != bid:
+            sling_verdict, sling_hours = _sling_bead_state(sling_id, now)
+            if sling_verdict == "live":
+                continue
+            if sling_verdict == "stale":
+                b["_tsw_sling_id"] = sling_id
+            elif sling_verdict == "error":
+                _log("delivery_signal: sling check for %s (%s) errored — "
+                     "falling through to marker check" % (bid, sling_id))
+
+        marker_verdict, marker = _queued_marker_state(root, bid)
         if marker_verdict == "found":
             explained.append({
                 "id": bid,
@@ -904,7 +970,8 @@ def delivery_signal(now):
             unexplained[bid] = b
 
     unique = list(unexplained.values())
-    sample = [{"id": b.get("id", "?"), "title": (b.get("title") or b.get("name") or "?")[:80]}
+    sample = [{"id": b.get("id", "?"), "title": (b.get("title") or b.get("name") or "?")[:80],
+               "sling_id": b.get("_tsw_sling_id")}
               for b in unique[:5]]
     return len(unique), sample, explained
 
@@ -926,7 +993,10 @@ def _escalate_delivery(count, sample, explained, now):
         "Beads com story:in-flight não atualizados há > %.0fh (amostra):" % DELIVERY_STALL_HOURS,
     ]
     for b in sample:
-        lines.append("  • %s — %s" % (b["id"], b["title"]))
+        if b.get("sling_id"):
+            lines.append("  • %s — %s (sling parado: %s)" % (b["id"], b["title"], b["sling_id"]))
+        else:
+            lines.append("  • %s — %s" % (b["id"], b["title"]))
     lines += [
         "",
         "POSSÍVEIS CAUSAS:",
@@ -1512,7 +1582,7 @@ def _selftest():
     # Use `global` to inject into the correct namespace.
     global _read_pilot_log_lines, _read_gate_log_lines, _git_log_count
     global _bd_backlog, _bd_delivery, _do_mail_mayor, _do_notify, _do_dolt_probe
-    global _suspended_rigs, _bd_marker_for_bead, _do_dolt_cpu
+    global _suspended_rigs, _bd_marker_for_bead, _do_dolt_cpu, _bd_sling_state
 
     ok_count = [0]
     fail_count = [0]
@@ -1892,6 +1962,12 @@ def _selftest():
                 "labels": ["story:in-flight", "pilot:dispatched"],
                 "updated_at": ts}
 
+    def _stale_bead_with_sling(bid, hours_ago, sling_id):
+        """Same as _stale_bead but carrying pilot.sling_bead metadata (ga-ebm7c)."""
+        b = _stale_bead(bid, hours_ago)
+        b["metadata"] = {"pilot.sling_bead": sling_id}
+        return b
+
     _read_pilot_log_lines = lambda: _pilot_lines(0, 3)   # no dispatch
     _read_gate_log_lines  = lambda: []
     _git_log_count        = lambda root, since: 0
@@ -2045,6 +2121,63 @@ def _selftest():
 
     _bd_marker_for_bead = lambda root, bead_id: ("absent", None)   # restore default
     _do_dolt_cpu = lambda: 42.0
+
+    # ── ga-9ni9w/ga-ebm7c: sling-aware delivery stall. FALSIFYING TEST (per the
+    # bug's own Aceite): pair a story stale well past the window with a FRESH
+    # open sling → must be SILENT (this is exactly the gap the pre-fix watchdog
+    # had: it looked only at the story). Then age the SAME sling past the
+    # window too → must ALERT, and the alert must name the sling, not just the
+    # story, else an investigator starts at the wrong bead ─────────────────────
+    print("\nga-ebm7c Scenario Q1: story stale but its pilot.sling_bead is open+recent → SILENCE")
+    _read_pilot_log_lines = lambda: _pilot_lines(0, 3)
+    _read_gate_log_lines  = lambda: []
+    _git_log_count        = lambda root, since: 0
+    _bd_backlog           = lambda root: []
+    _bd_delivery = lambda root: [_stale_bead_with_sling("ga-q001", DELIVERY_STALL_HOURS + 3, "ga-q001-sling")]
+    _bd_marker_for_bead = lambda root, bead_id: ("absent", None)
+    _bd_sling_state = lambda sling_id: ("live", 10 / 60.0)   # sling updated 10min ago
+    _do_dolt_probe = lambda: 0
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    for i in range(5):
+        run_tick(NOW + i * 1800, st)
+    delivery_notifies_q1 = [n for n in notify_calls if "DELIVERY" in n[0].upper()]
+    if not delivery_notifies_q1 and st.get("delivery_pending", 0) == 0:
+        _ok("Q1: story stalled but its pilot.sling_bead is open+recent → no delivery-stall "
+            "alert, no matter how many sweeps (ga-9ni9w)")
+    else:
+        _bad("Q1", "delivery_pending=%d notifies=%d — the story-only staleness check regressed "
+                    "(this is today's bug)" % (st.get("delivery_pending", 0), len(delivery_notifies_q1)))
+
+    print("\nga-ebm7c Scenario Q2: same story, sling ALSO stale → ALERT, names the sling")
+    _bd_sling_state = lambda sling_id: ("stale", DELIVERY_STALL_HOURS + 1)   # sling itself now stale
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)
+    delivery_notifies_q2 = [n for n in notify_calls if "DELIVERY" in n[0].upper()]
+    delivery_mails_q2 = [m for m in mail_calls if "DELIVERY" in m[0]]
+    if delivery_notifies_q2 and delivery_mails_q2 and "ga-q001-sling" in delivery_mails_q2[0][1]:
+        _ok("Q2: story + its sling both stale → delivery-stall alert fires and NAMES the sling "
+            "bead (ga-9ni9w Aceite)")
+    else:
+        _bad("Q2", "notifies=%d mails=%d body=%r" % (
+             len(delivery_notifies_q2), len(delivery_mails_q2),
+             delivery_mails_q2[0][1] if delivery_mails_q2 else None))
+
+    print("\nga-ebm7c Scenario Q3: no pilot.sling_bead at all → unchanged (real stall, as before)")
+    _bd_delivery = lambda root: [_stale_bead("ga-q003", DELIVERY_STALL_HOURS + 1)]   # no metadata
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)
+    delivery_notifies_q3 = [n for n in notify_calls if "DELIVERY" in n[0].upper()]
+    if delivery_notifies_q3:
+        _ok("Q3: story with no pilot.sling_bead at all still alerts exactly as before (no regression)")
+    else:
+        _bad("Q3", "expected the no-sling-metadata case to still alert: %r" % notify_calls)
+
+    _bd_sling_state = lambda sling_id: ("absent", None)   # restore default (no live sling)
 
     # ── imp24-P: heal-action branch wiring ───────────────────────────────────────
     print("\nimp24 Scenario P1: HEAL_ENABLED=0 → heal not attempted, stall escalates normally")
