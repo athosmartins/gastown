@@ -189,10 +189,18 @@ _CMDSUB_PLACEHOLDER_RE = re.compile(r"\x00CMDSUB\d+\x00")
 # Every operator shlex's punctuation_chars="();<>|&" mode can hand back as
 # one fused token. Longest match first so e.g. "&&" isn't split into "&","&".
 _KNOWN_OPERATORS = (
-    "&&", "||", ">>", "<<", ">&", "&>", "<&", "<>",
+    "<<<", "&>>", "&&", "||", ">>", "<<", ">&", "&>", "<&", "<>",
     ";", "&", "|", "<", ">", "(", ")",
 )
 _PUNCTUATION_RUN_RE = re.compile(r"^[();<>|&]+$")
+
+# The operators that introduce a REDIRECTION rather than a new command.
+# Bash lets a redirection appear anywhere in a simple command, including
+# BEFORE the command name -- see REDIRECTS in the module docstring.
+REDIRECT_OPS = frozenset(("<<<", "&>>", ">>", "<<", ">&", "&>", "<&", "<>", "<", ">"))
+# A redirection may be prefixed by an fd number, glued to the operator in
+# the source text ("2>/dev/null") but split off as its own token here.
+_FD_RE = re.compile(r"^\d+$")
 
 
 def _scan_cmdsub_end(command, start):
@@ -450,6 +458,51 @@ def _tokenize(command):
     return tokens, placeholders
 
 
+_REDIR_OPS = (">>", "<<", ">&", "&>", "<&", "<>", ">", "<")
+
+
+def _drop_redirects(span):
+    """Remove os REDIRECTS de um span de tokens — eles nao dizem NADA sobre posicao de comando.
+
+    Em bash, redirect pode vir ANTES do comando: `2>/dev/null pkill -f x` invoca pkill
+    exatamente como `pkill -f x 2>/dev/null`. Sintaxe valida (bash -n) e idioma comum.
+
+    Isto foi o gate FAIL 5/5 (01/08). O guard negava a forma com redirect no FIM e LIBERAVA
+    a mesma linha com o redirect no COMECO — inclusive a linha verbatim do incidente de
+    28/07 do proprio selftest (AC11), so com o `2>/dev/null` movido pra frente. Sem nenhuma
+    ofuscacao: falso-NEGATIVO, a direcao catastrofica.
+
+    RAIZ: `_wrapper_chain` olhava pra tras e via os tokens ['2','>','/dev/null']. O alvo
+    (`/dev/null`) nao e wrapper nem `VAR=`, `seen_wrapper` ainda era False -> retornava
+    "nao e cadeia de wrapper" -> nao e posicao de comando -> allow.
+    A docstring de REDIRECTS afirmava "nenhum tratamento dedicado e necessario", mas o
+    argumento que a sustentava so cobria redirect no FIM (que de fato nao importa, porque a
+    posicao de comando so olha pra TRAS). Redirect ANTES estava fora do argumento inteiro.
+
+    Consertar a CLASSE em vez do caso: o redirect (com fd opcional colado, `2>`) e o alvo
+    dele viram transparentes ao olhar pra tras — em qualquer posicao, quantos quiserem. Isso
+    tambem cobre `>out 2>&1 pkill`, `sudo 2>/dev/null pkill` e formas de fd-dup, que nunca
+    foram testadas.
+    """
+    out, k, n = [], 0, len(span)
+    while k < n:
+        tok = span[k]
+        # fd numerico colado no operador: ['2','>'] — o '2' sozinho nao e palavra de comando
+        if tok.isdigit() and k + 1 < n and span[k + 1] in _REDIR_OPS:
+            k += 2                      # pula fd + operador
+            if k < n and span[k] not in _REDIR_OPS:
+                k += 1                  # pula o ALVO do redirect
+            continue
+        if tok in _REDIR_OPS:
+            k += 1
+            if k < n and span[k] not in _REDIR_OPS:
+                k += 1                  # pula o ALVO
+            continue
+        out.append(tok)
+        k += 1
+    return out
+
+
 def _wrapper_chain(tokens, i):
     """True if every token between the start of tokens[i]'s simple command
     and tokens[i] is consistent with a chain of WRAPPER_PREFIXES commands
@@ -472,7 +525,14 @@ def _wrapper_chain(tokens, i):
         if tokens[k] in COMMAND_START_TOKENS:
             start = k + 1
             break
-    span = tokens[start:i]
+    span = _drop_redirects(tokens[start:i])
+    # Span VAZIO depois de remover redirects => nao havia NADA de verdade entre o inicio do
+    # comando simples e o pkill: ele E a primeira palavra. `2>/dev/null pkill -f x` cai
+    # exatamente aqui. Sem esta linha o laco abaixo nem roda e a funcao devolve
+    # `seen_wrapper=False` -> "nao e posicao de comando" -> ALLOW, que era metade do
+    # gate FAIL 5/5 (a outra metade, com `sudo` no meio, ja passava pela cadeia de wrapper).
+    if not span:
+        return True
     seen_wrapper = False
     for idx, tok in enumerate(span):
         if os.path.basename(tok) in WRAPPER_PREFIXES or ASSIGNMENT_RE.match(tok):

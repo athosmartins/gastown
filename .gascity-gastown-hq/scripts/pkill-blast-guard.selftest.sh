@@ -155,6 +155,25 @@ echo "-- AC10: redirects around a NON-invocation (argument use) still allow --"
 assert_allow "echo pkill > /tmp/x"    'echo pkill > /tmp/x'
 assert_allow "man pkill 2>/dev/null"  'man pkill 2>/dev/null'
 
+echo ""
+echo "-- AC10-b: redirect ANTES do comando (gate FAIL 5/5, 01/08) --"
+echo "   Em bash o redirect pode preceder o comando: '2>/dev/null pkill -f x' invoca"
+echo "   pkill igual a 'pkill -f x 2>/dev/null'. O guard negava a 2a forma e LIBERAVA a"
+echo "   1a — falso-NEGATIVO, sem nenhuma ofuscacao. Os 4 casos AC10 acima so exercitavam"
+echo "   redirect no FIM, entao o buraco tinha zero cobertura em 4 rodadas de gate."
+# a linha VERBATIM do incidente de 28/07, so com o redirect movido pra frente
+assert_deny "AC11 invertida: redirect na FRENTE da linha do incidente" \
+            '2>/dev/null pkill -f "anuncios_dashboard.py" -U $(id -u)'
+assert_deny "redirect de saida antes do comando"   '>/tmp/out pkill -f x'
+assert_deny "redirect de entrada antes do comando" '</dev/null killall -u root'
+assert_deny "redirect entre wrapper e comando"     'sudo 2>/dev/null pkill -f x'
+assert_deny "dois redirects + fd-dup na frente"    '>out 2>&1 pkill -f x'
+# inverso obrigatorio: redirect na frente NAO pode virar negacao cega
+assert_allow "redirect na frente de comando inocente"  '2>/dev/null echo hi'
+assert_allow "redirect na frente de 'man pkill'"       '>/tmp/out man pkill'
+assert_allow "redirect na frente de 'grep pkill'"      '</dev/null grep pkill file.sh'
+assert_allow "redirect na frente de ls"                '2>/dev/null ls -la'
+
 # ─────────────────────────────────────────────────────────────────────────
 # AC9/AC12 (2026-07-29 gate FAIL + Mayor 9-hole sweep, fix-attempt 1): the
 # first gate run found the guard's own `_tokenize()` let shlex's default
