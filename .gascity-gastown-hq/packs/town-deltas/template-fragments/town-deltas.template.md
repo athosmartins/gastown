@@ -177,12 +177,23 @@ Só edite a raiz compartilhada direto pra investigação read-only (Read/grep/
 baseline), nunca pra fazer o fix em si.
 
 **Commitando na árvore compartilhada (qualquer arquivo)? Confira o staged
-antes — nunca `git add -A`/`git commit -a` às cegas (ga-kgja).** Norma geral,
-além do caso acima: `git add -p` (interativo) OU `git diff --cached` antes de
-qualquer commit em `~/gt` — garante que o que você stageou é só o que VOCÊ
-editou nesta sessão. `git add -A`/`git commit -a` sem conferir assume que o
-resto da árvore está limpo, e numa árvore com várias sessões concorrentes
-isso quase nunca é verdade.
+antes — nunca `git add -A`/`git commit -a` às cegas, e nomear o arquivo +
+`git diff --cached --stat` NÃO bastam (ga-kgja, ga-0s4at).** Norma geral,
+além do caso acima: `git add -p` (interativo) OU `git diff --cached`
+**sem `--stat`** antes de qualquer commit em `~/gt` — garante que o que você
+stageou é só o que VOCÊ editou nesta sessão. Dois furos que uma versão
+anterior desta regra não cobria, e que já custaram um commit real levando
+código alheio pra dentro de um guard de segurança:
+  1. `git add <arquivo>` stageia o ARQUIVO INTEIRO, mesmo nomeado (nunca
+     `-A`) — inclui edição não-commitada de OUTRO agente dentro do mesmo
+     arquivo. Nomear protege contra levar arquivos alheios, não contra levar
+     LINHAS alheias no teu próprio arquivo.
+  2. `--stat` mostra só nome e contagem de linha ("2 arquivos, +81/-2") —
+     exatamente o que o teu próprio trabalho pareceria. O diff alheio se
+     esconde dentro do número; só ler o CONTEÚDO expõe.
+`git add -A`/`git commit -a` sem conferir assume que o resto da árvore está
+limpo, e numa árvore com várias sessões concorrentes isso quase nunca é
+verdade.
 
 **`gc session nudge` NÃO destrava um diálogo de permissão aberto — exige
 keystroke direto no pane (ga-q640n/ga-iog1v).** A doutrina nativa "sempre
