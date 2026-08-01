@@ -2091,9 +2091,16 @@ _filter_dispatch_gates() {
 # Self-sufficient repo list (does not need the never-started block). FAIL-OPEN to KEEP:
 # no git / no repo set / jq error → keep the candidate (never drop a real one on an
 # unresolved probe — the opposite of the reclaim-side fail-open).
+# ga-rcees: "branch exists" alone is no longer an unconditional veto here either — a
+# matched ref is classified via _beadid_branch_signal, and an "orphan" (unmerged,
+# stale, unassigned) is kept as a candidate instead of vetoed forever. Without this,
+# ga-8jxe1's own orphan classifier could never fire for its primary case: this filter
+# runs UPSTREAM of dispatch_one() and dropped the bead before the classifier ever saw
+# it. See _beadid_branch_signal's doc for the classification detail.
 _filter_built() {
   local repos arr id r built_ids="" ingate_ids="" _bounced _glabel
   local built_reasons="" ingate_reasons="" _matched_ref _out _kept_sp _bid _breason
+  local _bf_json _bf_signal
   arr=$(cat)
 
   # ── (wa-8y45 leak) GATE-MARKER + GATE-LABEL consultation ─────────────────────
@@ -2165,8 +2172,25 @@ _filter_built() {
                "refs/remotes/origin/crew/*/$id" "refs/heads/crew/*/$id" \
                "refs/remotes/origin/fix/$id-*" "refs/heads/fix/$id-*" 2>/dev/null | head -1)
           if [ -n "$_matched_ref" ]; then
-            built_ids="${built_ids:+$built_ids }$id"
-            built_reasons="${built_reasons}${id}"$'\t'"branch $_matched_ref exists"$'\n'
+            # ga-rcees: a matched ref is no longer an UNCONDITIONAL veto. Classify
+            # it via _beadid_branch_signal (ga-8jxe1) and let "orphan" (unmerged +
+            # stale + unassigned) fall through instead of vetoing forever — the same
+            # carve-out _ownership_guard_should_refuse already applies inside
+            # dispatch_one(), just too late: a bead with an orphan branch never
+            # survives THIS filter to reach that check. Deliberately narrow: only
+            # "orphan" changes behavior here. "block"/"merged"/unclassifiable all
+            # preserve the EXACT pre-fix veto, so a classification miss (no git, no
+            # match via the independent _beadid_matched_crew_branch_ref lookup, etc.)
+            # fails toward the old behavior, never toward a new one.
+            _bf_json=$(printf '%s' "$arr" | jq -c --arg i "$id" '.[] | select(.id == $i)' 2>/dev/null | head -1)
+            _bf_signal="$(_beadid_branch_signal "$id" "$_bf_json")"
+            if [ "${_bf_signal%%$'\t'*}" = "orphan" ]; then
+              _ownership_guard_flag_orphan_branch "$id" "$GC_CITY" "${_bf_signal#*$'\t'}"
+              built_reasons="${built_reasons}${id}"$'\t'"branch $_matched_ref orphaned (unmerged+stale+unassigned) — not vetoing, flagged pilot:orphan-branch"$'\n'
+            else
+              built_ids="${built_ids:+$built_ids }$id"
+              built_reasons="${built_reasons}${id}"$'\t'"branch $_matched_ref exists"$'\n'
+            fi
             break
           fi
         done <<< "$repos"

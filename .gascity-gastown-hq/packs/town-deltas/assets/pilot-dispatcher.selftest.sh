@@ -4227,6 +4227,51 @@ case "$GJ8_R_NEW" in
   *) bad "ga-8jxe1-b: a fresh unmerged branch was NOT preserved as 'block' (got: '$GJ8_R_NEW') — would regress the ga-6jqr/ga-htjni double-dispatch protection" ;;
 esac
 
+# ── Scenario ga-rcees: _filter_built consults _beadid_branch_signal, orphan survives ──
+# ga-rcees: _filter_built's OWN branch-consultation used to treat "ref matched" as an
+# unconditional veto, so a bead with an orphan branch never survived to reach
+# _ownership_guard_should_refuse — the ONLY place ga-8jxe1's classifier was wired in.
+# ga-8jxe1's classifier could never fire for its primary case (wa-juety: 6 days idle,
+# never got pilot:orphan-branch). Reuses the GJ8_REPO fixture above (still live, cleanup
+# is after this block): gj8-merged/gj8-old/gj8-new already have real branches with real
+# merge-base/timestamp shapes; gj8-fresh has none.
+echo "Scenario ga-rcees: _filter_built no longer vetoes forever on an orphan branch"
+_FBO_FN="$(awk '
+    /^_beadid_has_active_gate_artifact\(\)/{f=1}
+    /^_beadid_has_open_gate_marker\(\)/{f=1}
+    /^_beadid_matched_crew_branch_ref\(\)/{f=1}
+    /^_beadid_branch_signal\(\)/{f=1}
+    /^_ownership_guard_flag_orphan_branch\(\)/{f=1}
+    /^_filter_built\(\)/{f=1}
+    f{print}
+    f&&/^}$/{f=0}
+  ' "$DISPATCHER")"
+[ -n "$_FBO_FN" ] || bad "ga-rcees: failed to extract _filter_built + branch-signal chain from $DISPATCHER — awk markers drifted"
+
+FBO_OUT="$(
+  unset PILOT_TEST_BRANCH_BEADS PILOT_TEST_CREW_BRANCH_BEADS PILOT_TEST_BRANCH_MERGED_BEADS PILOT_TEST_ORPHAN_BRANCH_BEADS
+  export PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS="" PILOT_TEST_NOOP_ORPHAN_FLAG=1 PILOT_ORPHAN_BRANCH_STALE_HOURS=48
+  _ownership_guard_repos() { printf '%s' "$GJ8_REPO"; }
+  eval "$_FBO_FN"
+  printf '%s' '[{"id":"gj8-old"},{"id":"gj8-new"},{"id":"gj8-merged"},{"id":"gj8-fresh"}]' \
+    | _filter_built 2>/dev/null | jq -rc '[.[].id]' 2>/dev/null
+)"
+[ "$FBO_OUT" = '["gj8-old","gj8-fresh"]' ] \
+  && ok "ga-rcees: orphan branch (gj8-old, real 10-day-stale unmerged commit) SURVIVES _filter_built; fresh candidate unaffected (got: '$FBO_OUT')" \
+  || bad "ga-rcees: _filter_built orphan carve-out broken — expected '[\"gj8-old\",\"gj8-fresh\"]', got '$FBO_OUT'"
+
+case ",$FBO_OUT," in
+  *gj8-new*) bad "ga-rcees: _filter_built REGRESSION — a recent/non-stale unmerged branch (gj8-new) must still be vetoed (got: '$FBO_OUT')" ;;
+  *) ok "ga-rcees: recent unmerged branch (gj8-new) still vetoed — ga-6jqr/ga-htjni double-dispatch protection preserved" ;;
+esac
+case ",$FBO_OUT," in
+  *gj8-merged*) bad "ga-rcees: _filter_built out-of-scope regression — a MERGED branch (gj8-merged) must still be vetoed by this deliberately narrow fix (got: '$FBO_OUT')" ;;
+  *) ok "ga-rcees: merged branch (gj8-merged) still vetoed — fix is deliberately scoped to 'orphan' only" ;;
+esac
+
+has "$DISPATCHER" '_beadid_branch_signal "\$id" "\$_bf_json"' \
+  "ga-rcees: _filter_built's branch-consultation wired to _beadid_branch_signal (drift-guard)"
+
 rm -rf "$GJ8_BARE" "$GJ8_REPO"
 
 # ── Scenario ga-8jxe1: drift-guard — AC1-AC4 landmarks wired into live dispatcher ─
