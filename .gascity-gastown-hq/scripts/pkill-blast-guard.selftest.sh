@@ -188,6 +188,28 @@ assert_deny  "append-both (&>>) antes do comando"   '&>>/tmp/o pkill -f x'
 assert_allow "herestring com pkill como DADO"       'echo hi <<<pkill'
 assert_allow "append-both na frente de comando inocente" '&>>/tmp/o echo hi'
 
+echo ""
+echo "-- AC13: verbo via ATRIBUICAO de variavel (gate FAIL 6, 01/08) --"
+echo "   O gate mostrou que a alegacao do DESIGN ('sempre, independente de...') era FALSA:"
+echo "   o teste so comparava texto pos-tokenizacao, entao 'CMD=pkill; \$CMD -f x' passava."
+echo "   Cobrimos a forma de ACIDENTE (verbo escrito no MESMO comando). A forma sem o verbo"
+echo "   no texto (\$CMD exportado noutro lugar) e estaticamente desconhecivel e segue"
+echo "   documentada como lacuna aceita — por isso ela e testada como ALLOW aqui embaixo,"
+echo "   pra ninguem 'consertar' isso sem perceber que virou adivinhacao."
+assert_deny  "atribuicao simples do verbo"       'CMD=pkill; $CMD -f x'
+assert_deny  "atribuicao de killall"             'K=killall; $K -u root'
+assert_deny  "atribuicao com caminho absoluto"   'CMD=/usr/bin/pkill; $CMD -f x'
+assert_deny  "atribuicao atras de wrapper"       'sudo CMD=killall true'
+# inversos — a regra nao pode virar negacao cega de qualquer 'VAR='
+assert_allow "VAR= com valor inocente"           'PY=python3; $PY script.py'
+assert_allow "VAR= com pgrep (read-only)"        'CMD=pgrep; $CMD -lf x'
+# posicao importa: em `echo CMD=pkill` o bash NAO atribui nada, so imprime texto
+assert_allow "VAR=pkill como ARGUMENTO do echo"  'echo CMD=pkill'
+# lacuna aceita e DOCUMENTADA: sem o verbo no texto, nao da pra saber
+assert_allow "expansao pura, verbo ausente"      '$CMD -f x'
+# o guard nao pode bloquear o proprio ferramental (arquivos chamados pkill-*)
+assert_allow "rodar o proprio selftest"          'bash pkill-blast-guard.selftest.sh'
+
 # ─────────────────────────────────────────────────────────────────────────
 # AC9/AC12 (2026-07-29 gate FAIL + Mayor 9-hole sweep, fix-attempt 1): the
 # first gate run found the guard's own `_tokenize()` let shlex's default

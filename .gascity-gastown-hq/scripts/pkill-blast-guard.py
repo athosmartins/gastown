@@ -12,10 +12,18 @@ pkill" false positives, a machine-dependent pgrep-match accident, redirect
 operators misread as pattern operands) -- the analysis itself was the risk
 surface, wide open to whatever subtlety nobody had thought of yet.
 
-DESIGN: ONE rule. If pkill or killall appears in COMMAND POSITION in a
-Bash tool call, deny -- always, regardless of pattern, flags, or what
-pgrep would say. No pattern parsing, no subprocess calls, no "safe form"
-this guard recognizes.
+DESIGN: ONE rule. If the LITERAL TOKEN pkill or killall appears in COMMAND
+POSITION in a Bash tool call, deny -- always, regardless of pattern, flags,
+or what pgrep would say. No pattern parsing, no subprocess calls, no "safe
+form" this guard recognizes.
+
+The words "LITERAL TOKEN" are load-bearing and were added after a gate FAIL
+(2026-08-01, attempt 6) that correctly called the earlier absolute phrasing
+FALSE: it promised "always, regardless of..." while the check only ever
+compared post-tokenization text, so `CMD=pkill; $CMD -f x` walked past. The
+claim was the defect -- a guard that overstates its own reach is the same
+class of harm as this city's doctrine promising protections the wiring never
+delivered. See "$VAR INDIRECTION" below for what is and isn't covered now.
 
 THREAT MODEL: accident, not adversary (the ga-jo3xl author didn't evade
 anything -- it was a genuine mistake). This guard's own first gate review
@@ -27,6 +35,34 @@ guard still makes no attempt to resist DELIBERATE evasion -- `pgrep |
 xargs kill` walks straight past it, same as an `eval`/`bash -c` string
 argument -- and that remains an accepted, documented gap, not an
 oversight.
+
+$VAR INDIRECTION (`CMD=pkill; $CMD -f x`): the command NAME can arrive via
+parameter expansion, and then no amount of shell-syntax scanning reveals it
+-- `$CMD` is just a word until the shell expands it, and the value may come
+from the environment, a sourced file, or an earlier session entirely. That
+is not a hole to be plugged; it is the static/runtime boundary, the same one
+`eval` and `bash -c` sit on. So it stays an ACCEPTED, DOCUMENTED gap, and
+the DESIGN claim above is scoped ("LITERAL TOKEN") to stop pretending
+otherwise.
+
+What IS covered, because it costs nothing: the ACCIDENT shape carries the
+verb in the SAME command text (`CMD=pkill`), where the assignment token sits
+right there post-tokenization. `_assigns_the_verb()` denies on it -- one
+closed test on one token, no variable tracking, no matching `$CMD` back to
+its assignment, no guess about whether the expansion ever runs. What remains
+open is the case where the verb is never written in the command at all
+(`$CMD -f x` with CMD exported elsewhere), which is precisely the
+statically-unknowable half.
+
+Rejected here, deliberately: "deny if the text mentions pkill/killall at
+all", which was this bead's own written escalation trigger for a 6th failure.
+It disqualifies itself in THIS repo -- the guard's files are NAMED
+pkill-blast-guard.py / .selftest.sh, so `bash pkill-blast-guard.selftest.sh`
+would be blocked by the guard it tests, along with every `cat`/`git add` of
+its own source. It also would not close the gap it was meant to close: an
+exported CMD never puts the word in the command text either. A trigger
+written before knowing that is a trigger worth overriding in the open --
+which is what this comment is doing.
 
 SCOPE: intercepts only the Bash tool calls of Claude Code AGENTS running
 under this hook. Daemons, launchd jobs, and .sh scripts invoked outside an
@@ -551,6 +587,38 @@ def _is_command_position(tokens, i):
     return _wrapper_chain(tokens, i)
 
 
+def _assigns_the_verb(tok):
+    """True for a `VAR=pkill` / `VAR=/usr/bin/killall` assignment token.
+
+    Um nome de comando que so existe em TEMPO DE EXECUCAO (`$CMD -f x`) nao e
+    conhecivel estaticamente -- ver "$VAR INDIRECTION" no docstring do modulo. Mas a forma
+    de ACIDENTE realista traz o verbo escrito no MESMO comando (`CMD=pkill; $CMD -f x`), e
+    ai o token do assignment esta ali, na nossa frente, ja tokenizado. Isto e um teste
+    FECHADO sobre um token -- nao abre superficie de analise nova: nao rastreia variavel,
+    nao casa `$CMD` com a atribuicao, nao tenta saber se a expansao chega a rodar.
+    Deliberadamente conservador: `CMD=pkill` numa chamada Bash de agente praticamente nunca
+    e inocente, entao nega mesmo que a variavel nunca seja expandida.
+
+    O chamador exige POSICAO DE COMANDO (mesma funcao usada pro verbo), porque essa e a
+    regra do proprio bash: `VAR=valor` so cria variavel no PREFIXO de um comando simples.
+    Em `echo CMD=pkill` o token e ARGUMENTO do echo -- o shell nao atribui nada, so imprime
+    texto -- e sem essa checagem o guard negava esse echo inocente (falso-positivo pego
+    pelo teste inverso desta mesma rodada, nao em producao). `sudo CMD=killall true` segue
+    negando, porque a cadeia de wrapper mantem o token no prefixo.
+
+    Cobre tambem `CMD=/usr/bin/pkill`, que ANTES negava por ACIDENTE: o token inteiro caia
+    em `os.path.basename("CMD=/usr/bin/pkill")` -> "pkill". Resposta certa pelo motivo
+    errado -- e a prova disso e que a forma sem caminho (`CMD=pkill`, mesma intencao) era
+    LIBERADA. Mesma familia do `rm --recursive --force /` que eu achei no gt tap guard hoje:
+    quando a regra acerta por artefato, o irmao mais simples passa."""
+    if not ASSIGNMENT_RE.match(tok):
+        return False
+    return os.path.basename(tok.split("=", 1)[1]) in ("pkill", "killall")
+
+
+_ASSIGN_DANGEROUS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=(?:.*/)?(pkill|killall)$")
+
+
 def find_invocation(command):
     """True if `command` contains a pkill/killall token in real command
     position, anywhere -- including inside a $(...)/`...` command
@@ -565,6 +633,8 @@ def find_invocation(command):
     short-circuits on the first hit."""
     tokens, placeholders = _tokenize(command)
     for i, tok in enumerate(tokens):
+        if _assigns_the_verb(tok) and _is_command_position(tokens, i):
+            return True
         if os.path.basename(tok) in ("pkill", "killall") and _is_command_position(tokens, i):
             return True
     for raw in placeholders.values():
