@@ -1332,8 +1332,11 @@ def _real_branch_stranded_reason(bead_id):
     repo, ref = matched
 
     r = _sh(["git", "-C", repo, "merge-base", "--is-ancestor", ref, "origin/main"], timeout=10)
-    if r is not None and r.returncode == 0:
+    if r is None or r.returncode not in (0, 1):
+        return None  # no git / unresolvable merge-base (e.g. origin/main missing, timeout) — fail open
+    if r.returncode == 0:
         return None  # merged — landed, not stranded (a DIFFERENT bug: bead should have closed)
+    # r.returncode == 1 here: confirmed NOT an ancestor of origin/main — proceed to staleness check
 
     r2 = _sh(["git", "-C", repo, "log", "-1", "--format=%ct", ref], timeout=10)
     if r2 is None or r2.returncode != 0:
@@ -1919,11 +1922,22 @@ def _selftest():
       (ga-32u6s-d) branch-stranded alert does not repeat across cycles for
                 the same bead — local state backstop, mirrors
                 _alarm_reclaim_exhausted's one-time-only shape (scenario (t))
+      (ga-32u6s-e) gate-fix-1 regression guard: _real_branch_stranded_reason's
+                merge-base ancestry check must fail OPEN (None) when
+                `git merge-base --is-ancestor` is unresolvable — both
+                r is None (subprocess exception/timeout) and a non-{0,1}
+                returncode (e.g. 128, no origin/main ref) — instead of
+                silently falling through toward "confirmed unmerged", which
+                would misreport an unrelated git failure as a stranded
+                branch. Exercises the REAL function (not the
+                _bd_branch_stranded stub scenarios a-d use), matching how
+                the gate reviewer who caught this actually reproduced it.
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
     global _bd_blocked, _bd_show_full, _bd_has_built_branch, _bd_branch_stranded
     global DRY_RUN, STARVE_MIN, FLOW_GRACE_MIN, ROUTE_COOLDOWN_SEC, ALARM_COOLDOWN_SEC
+    global _OWNERSHIP_REPOS
 
     ok_count = [0]
     fail_count = [0]
@@ -3204,6 +3218,59 @@ def _selftest():
     else:
         _bad("(ga-32u6s-d)", "first_cycle_count=%d second_cycle_count=%d" % (
              first_cycle_count, second_cycle_count))
+
+    print("\nScenario (ga-32u6s-e) gate-fix-1 regression guard: unresolvable "
+          "`git merge-base --is-ancestor` (r is None, or returncode not in (0,1) e.g. "
+          "128 for a missing origin/main ref) must fail OPEN — calls the REAL "
+          "_real_branch_stranded_reason() directly (bypassing the _bd_branch_stranded "
+          "stub scenarios a-d rely on), the exact path the gate reviewer's own repro "
+          "exercised")
+    _real_sh = _sh
+    _real_ownership_repos = _OWNERSHIP_REPOS
+    _OWNERSHIP_REPOS = ["/tmp"]  # any real dir — _sh is faked below, no real git runs
+    OLD_EPOCH_E = int(NOW) - 30 * 86400  # 30d old — well past BRANCH_STRANDED_STALE_HOURS,
+                                          # so a code path that WRONGLY proceeds past the
+                                          # merge-base check reaches a "stranded" verdict
+                                          # instead of silently no-oping into the same None
+
+    def _fake_sh_e_none(args, timeout=20):
+        if "for-each-ref" in args:
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout="refs/heads/fix/ga-eee1-slug\n")
+        if "merge-base" in args:
+            return None  # _sh's own except-Exception shape (subprocess timeout/error)
+        if "log" in args:
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout="%d\n" % OLD_EPOCH_E)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="")
+
+    _sh = _fake_sh_e_none
+    res_e_none = _real_branch_stranded_reason("ga-eee1")
+
+    def _fake_sh_e_128(args, timeout=20):
+        if "for-each-ref" in args:
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout="refs/heads/fix/ga-eee2-slug\n")
+        if "merge-base" in args:
+            return subprocess.CompletedProcess(
+                args=args, returncode=128, stdout="", stderr="fatal: no such ref 'origin/main'")
+        if "log" in args:
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout="%d\n" % OLD_EPOCH_E)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="")
+
+    _sh = _fake_sh_e_128
+    res_e_128 = _real_branch_stranded_reason("ga-eee2")
+
+    _sh = _real_sh
+    _OWNERSHIP_REPOS = _real_ownership_repos
+    if res_e_none is None and res_e_128 is None:
+        _ok("(ga-32u6s-e): unresolvable merge-base (r=None / returncode=128) fails "
+            "OPEN — returns None instead of misreporting stranded")
+    else:
+        _bad("(ga-32u6s-e)", "SAFETY VIOLATION — unresolvable merge-base treated as "
+             "confirmed-unmerged, would fire a FALSE stranded-branch alert to the "
+             "Mayor; res_e_none=%r res_e_128=%r" % (res_e_none, res_e_128))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
