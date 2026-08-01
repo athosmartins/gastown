@@ -616,9 +616,6 @@ def _assigns_the_verb(tok):
     return os.path.basename(tok.split("=", 1)[1]) in ("pkill", "killall")
 
 
-_ASSIGN_DANGEROUS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=(?:.*/)?(pkill|killall)$")
-
-
 def find_invocation(command):
     """True if `command` contains a pkill/killall token in real command
     position, anywhere -- including inside a $(...)/`...` command
