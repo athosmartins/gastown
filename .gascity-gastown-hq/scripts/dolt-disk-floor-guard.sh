@@ -332,10 +332,41 @@ _reap_dead_transcripts() {
     return
   fi
   log "transcript-reap: running dead-session transcript cleanup …"
-  if TRANSCRIPT_REAPER_PROD=1 timeout 60 bash "$reaper" >> "$LOG" 2>&1; then
-    log "transcript-reap OK"
+  # Bound sized to the MEASURED cost of the work, not to a round number.
+  # MEASURED 2026-08-01: a full pass takes ~39s on this host (1854 transcripts
+  # across 122 project dirs; the reaper `du -sk`s each candidate AND its sibling
+  # dir, and calls `gc session list --json` first to verify liveness before any
+  # irreversible delete). 39s against a 60s bound is a ~35% margin — and the
+  # liveness call alone stretches from ~1.3s to 10-20s whenever Dolt is warm,
+  # which is precisely WHEN this path runs (disk pressure and Dolt pressure
+  # arrive together). Live evidence in this very log: 5 runs, 5 timeouts, ZERO
+  # successes, each lasting exactly ~60s (23:36:56->23:37:57, 23:43:21->23:44:21).
+  # An emergency disk-reclaim that never completes is worse than none, because
+  # the "FAILED" line reads as "tried and could not free space" when the truth
+  # is "was killed before it could try". Same class as ga-gquc1 (backup dog:
+  # 120s bound vs a 6.3G database) and ga-q4cqr's ladder.
+  # 300s is deliberately generous: this runs only at/below the disk floor, at
+  # most once per guard cycle, and finishing LATE is strictly better than not
+  # finishing. The reaper is itself fail-safe — it ABORTS rather than delete
+  # when it cannot verify session liveness (ga-lfj05, after the 2026-07-26
+  # incident that deleted 185 live transcripts), so a longer bound cannot make
+  # it delete anything it would not have deleted at 60s.
+  local _reap_bound="${TRANSCRIPT_REAP_TIMEOUT_SECS:-300}"
+  local _reap_start _reap_elapsed
+  _reap_start=$(date +%s)
+  if TRANSCRIPT_REAPER_PROD=1 timeout "$_reap_bound" bash "$reaper" >> "$LOG" 2>&1; then
+    _reap_elapsed=$(( $(date +%s) - _reap_start ))
+    log "transcript-reap OK (${_reap_elapsed}s, bound=${_reap_bound}s)"
   else
-    log "transcript-reap FAILED or aborted (nonzero exit) — see log lines above"
+    _reap_elapsed=$(( $(date +%s) - _reap_start ))
+    # Distinguish "ran out of time" from "ran and failed" — they need different
+    # responses, and collapsing them is what hid 5 consecutive timeouts as a
+    # generic FAILED (root-class:error-vs-empty).
+    if [ "$_reap_elapsed" -ge "$_reap_bound" ]; then
+      log "transcript-reap TIMED OUT after ${_reap_elapsed}s (bound=${_reap_bound}s) — reclaim did NOT run to completion; raise TRANSCRIPT_REAP_TIMEOUT_SECS if this repeats"
+    else
+      log "transcript-reap FAILED after ${_reap_elapsed}s (nonzero exit, not a timeout) — see log lines above"
+    fi
   fi
 }
 

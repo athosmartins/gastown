@@ -142,6 +142,70 @@ fi
 rm -rf "$FAKE_CITY"
 
 echo ""
+echo "=== _reap_dead_transcripts: TIMEOUT and FAILURE must not log the same thing ==="
+# WHY: measured 2026-08-01 in the live guard log — 5 runs, 5 timeouts, ZERO
+# successes, each lasting exactly ~60s against the old `timeout 60`. Every one
+# logged the generic "transcript-reap FAILED or aborted (nonzero exit)", which
+# reads as "tried and could not free space" when the truth was "was killed
+# before it could try". A full pass measures ~39s on this host, and the
+# liveness call it makes first stretches 1.3s -> 10-20s exactly when Dolt is
+# warm — i.e. exactly when disk pressure triggers this path. Collapsing the two
+# outcomes hid a completely broken emergency disk-reclaim (root-class:error-vs-empty).
+FAKE_CITY_T="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city3.XXXXXX)"
+mkdir -p "$FAKE_CITY_T/scripts"
+REAL_CITY="$CITY"; REAL_LOG="$LOG"
+
+# (a) reaper that OUTLIVES the bound -> must say TIMED OUT, not FAILED
+cat > "$FAKE_CITY_T/scripts/transcript-reaper.sh" <<'EOF'
+#!/bin/bash
+sleep 5
+exit 0
+EOF
+chmod +x "$FAKE_CITY_T/scripts/transcript-reaper.sh"
+LOG="$FAKE_CITY_T/timeout.log"; : > "$LOG"
+CITY="$FAKE_CITY_T"; TRANSCRIPT_REAP_TIMEOUT_SECS=1 _reap_dead_transcripts; CITY="$REAL_CITY"
+if grep -q "TIMED OUT" "$LOG" 2>/dev/null; then
+  ok "_reap_dead_transcripts: a run killed by the bound logs TIMED OUT (reclaim did not complete)"
+else
+  bad "_reap_dead_transcripts: bound-kill did NOT log TIMED OUT — got: $(tr '\n' ';' < "$LOG" | cut -c1-140)"
+fi
+if grep -qE "FAILED after" "$LOG" 2>/dev/null; then
+  bad "_reap_dead_transcripts: a TIMEOUT was also reported as FAILED — the two are still conflated"
+else
+  ok "_reap_dead_transcripts: a TIMEOUT is not also reported as a genuine failure"
+fi
+
+# (b) reaper that exits nonzero QUICKLY -> must say FAILED, not TIMED OUT
+cat > "$FAKE_CITY_T/scripts/transcript-reaper.sh" <<'EOF'
+#!/bin/bash
+exit 3
+EOF
+chmod +x "$FAKE_CITY_T/scripts/transcript-reaper.sh"
+LOG="$FAKE_CITY_T/failed.log"; : > "$LOG"
+CITY="$FAKE_CITY_T"; TRANSCRIPT_REAP_TIMEOUT_SECS=30 _reap_dead_transcripts; CITY="$REAL_CITY"
+if grep -qE "FAILED after" "$LOG" 2>/dev/null && ! grep -q "TIMED OUT" "$LOG" 2>/dev/null; then
+  ok "_reap_dead_transcripts: a genuine nonzero exit logs FAILED (not TIMED OUT) — no blind spot introduced"
+else
+  bad "_reap_dead_transcripts: genuine failure misreported — got: $(tr '\n' ';' < "$LOG" | cut -c1-140)"
+fi
+
+# (c) the real default bound must cover the measured ~39s pass with margin
+LOG="$FAKE_CITY_T/default.log"; : > "$LOG"
+cat > "$FAKE_CITY_T/scripts/transcript-reaper.sh" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+chmod +x "$FAKE_CITY_T/scripts/transcript-reaper.sh"
+CITY="$FAKE_CITY_T"; unset TRANSCRIPT_REAP_TIMEOUT_SECS; _reap_dead_transcripts; CITY="$REAL_CITY"
+if grep -q "bound=300s" "$LOG" 2>/dev/null; then
+  ok "_reap_dead_transcripts: default bound is 300s — covers the measured ~39s pass even when Dolt is warm"
+else
+  bad "_reap_dead_transcripts: default bound is not 300s — got: $(tr '\n' ';' < "$LOG" | cut -c1-140)"
+fi
+LOG="$REAL_LOG"
+rm -rf "$FAKE_CITY_T"
+
+echo ""
 echo "=== main(): CRITICAL-latch across reclaim reclassification (gate-fix-1: GATE-FEEDBACK gate_run=ga-wisp-9b4hnh) ==="
 # The pure-function tests above prove _should_notify is correct in ISOLATION.
 # They do NOT exercise main() itself, which is where the actual bug lived:
