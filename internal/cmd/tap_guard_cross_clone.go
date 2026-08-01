@@ -231,24 +231,23 @@ func expandTilde(path string) string {
 	return path
 }
 
-// firstSubcommand returns the first non-flag token from the trailing portion
-// of a 'git -C <path> ...' invocation. Handles the cases where additional
-// flags appear before the subcommand (e.g. '-c user.email=foo commit').
-//
-// Recognizes the small set of git top-level flags that take a value as a
-// separate argument so we don't mistake the value for the subcommand.
-func firstSubcommand(trailing string) string {
-	flagsWithSeparateValue := map[string]bool{
-		"-c": true, "--config-env": true,
-	}
-	fields := strings.Fields(trailing)
+// gitFlagsWithSeparateValue is the small set of git top-level flags that
+// take a value as a separate argument, so token scanners don't mistake the
+// value for a subcommand (e.g. '-c user.email=foo commit').
+var gitFlagsWithSeparateValue = map[string]bool{
+	"-c": true, "--config-env": true,
+}
+
+// firstNonFlagToken returns the first token in fields that isn't a flag (and
+// isn't consumed as a flagsWithSeparateValue flag's value), or "" if none.
+func firstNonFlagToken(fields []string) string {
 	skipNext := false
 	for _, f := range fields {
 		if skipNext {
 			skipNext = false
 			continue
 		}
-		if flagsWithSeparateValue[f] {
+		if gitFlagsWithSeparateValue[f] {
 			skipNext = true
 			continue
 		}
@@ -256,6 +255,31 @@ func firstSubcommand(trailing string) string {
 			continue
 		}
 		return f
+	}
+	return ""
+}
+
+// firstSubcommand returns the first non-flag token from the trailing portion
+// of a 'git -C <path> ...' invocation. Handles the cases where additional
+// flags appear before the subcommand (e.g. '-c user.email=foo commit').
+func firstSubcommand(trailing string) string {
+	return firstNonFlagToken(strings.Fields(trailing))
+}
+
+// stashSubop returns the first non-flag token immediately following the
+// "stash" token in trailing — e.g. "push" in ' stash push -m "..."', "list"
+// in ' stash list', or "" for a bare ' stash' (implicit push has no sub-op
+// token) or if "stash" isn't present. Operates on tokenized fields, not the
+// raw string, so free-text arguments (e.g. a commit/stash message) can never
+// be mistaken for the sub-op — see ga-mctun furo 1, where substring matching
+// on the raw trailing text let 'stash push -m "stash list"' masquerade as
+// the read-only 'stash list' op.
+func stashSubop(trailing string) string {
+	fields := strings.Fields(trailing)
+	for i, f := range fields {
+		if f == "stash" {
+			return firstNonFlagToken(fields[i+1:])
+		}
 	}
 	return ""
 }
@@ -283,10 +307,20 @@ func isWriteClass(subcommand, trailing string) bool {
 		return strings.Contains(trailing, " -d") ||
 			strings.Contains(trailing, " --delete")
 	case "stash":
-		// 'stash list'/'stash show' are read-only. Bare 'stash' (implicit
-		// push) and push/pop/apply/drop/clear are write-class.
-		return !strings.Contains(trailing, "stash list") &&
-			!strings.Contains(trailing, "stash show")
+		// 'stash list'/'stash show' are read-only. Everything else —
+		// push/pop/apply/drop/clear/save, and bare 'stash' (implicit
+		// push, no sub-op token) — is write-class. Classify on the actual
+		// sub-op token (via stashSubop), never on substring containment
+		// over the raw trailing text: a write-class 'stash push -m "stash
+		// list"' has "stash list" sitting right there in its free-text
+		// message, and Contains-over-the-whole-string can't tell a
+		// sub-op token from a word inside someone's commit message.
+		switch stashSubop(trailing) {
+		case "list", "show":
+			return false
+		default:
+			return true
+		}
 	}
 	return true
 }

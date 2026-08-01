@@ -142,6 +142,38 @@ func TestFirstSubcommand_HandlesFlagsBeforeSubcommand(t *testing.T) {
 	}
 }
 
+// TestStashSubop_TokenizesRatherThanSubstringMatches covers ga-mctun furo 1
+// (gate attempt 1 regression): the sub-op must come from the actual token
+// after "stash", never from a substring search over the whole trailing text
+// — otherwise a write-class 'stash push -m "stash list"' is misclassified
+// as the read-only 'stash list' because its free-text message happens to
+// contain those words.
+func TestStashSubop_TokenizesRatherThanSubstringMatches(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"push", " stash push", "push"},
+		{"list", " stash list", "list"},
+		{"show", " stash show", "show"},
+		{"bare (implicit push, no token)", " stash", ""},
+		{"push with 'stash list' in message", ` stash push -m "stash list"`, "push"},
+		{"push with 'stash show' in message", ` stash push -m "stash show"`, "push"},
+		{"save with message", ` stash save "wip before lunch"`, "save"},
+		{"show with ref and flag", " stash show -p stash@{0}", "show"},
+		{"no stash token present", " commit -m foo", ""},
+		{"leading global flag before stash", " -c user.email=x stash pop", "pop"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := stashSubop(tt.in); got != tt.want {
+				t.Errorf("stashSubop(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsWriteClass(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -180,6 +212,14 @@ func TestIsWriteClass(t *testing.T) {
 		{"stash list (read-only)", "stash", " stash list", false},
 		{"stash show (read-only)", "stash", " stash show", false},
 		{"stash show with ref (read-only)", "stash", " stash show -p stash@{0}", false},
+		{"stash save", "stash", ` stash save "wip"`, true},
+		// Regression, ga-mctun furo 1 (gate attempt 1): a real write op
+		// whose free-text message happens to contain the words "stash
+		// list"/"stash show" must still classify as write-class. The
+		// previous fix attempt used strings.Contains(trailing, "stash
+		// list") and was fooled by exactly this shape.
+		{"stash push with 'stash list' in message (regression)", "stash", ` stash push -m "stash list"`, true},
+		{"stash push with 'stash show' in message (regression)", "stash", ` stash push -m "stash show of pending changes"`, true},
 		{"log (read-only)", "log", " log --oneline", false},
 		{"status (read-only)", "status", " status --short", false},
 		{"diff (read-only)", "diff", " diff HEAD", false},
