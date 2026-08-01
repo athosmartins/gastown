@@ -100,7 +100,7 @@ for SETTINGS in "${TARGETS[@]}"; do
 
   TMP="$(mktemp)"
 
-  jq \
+  if ! jq \
     --arg cmd "$GUARD_CMD" \
     --arg marker "$MARKER" \
     --argjson patterns "$PATTERNS_JSON" \
@@ -113,10 +113,17 @@ for SETTINGS in "${TARGETS[@]}"; do
     ) as $already_guarded |
     ($patterns - $already_guarded) as $missing |
     ($missing | map({type: "command", command: $cmd, "if": .})) as $new_hooks |
+    (
+      # Target only the FIRST matcher=="Bash" entry, by index. A plain
+      # map(if .matcher == "Bash" then ...) would touch EVERY such entry,
+      # duplicating $new_hooks into each one if a target ever has more
+      # than one bare-Bash entry (malformed but syntactically legal JSON).
+      [.hooks.PreToolUse | to_entries[] | select(.value.matcher == "Bash") | .key][0]
+    ) as $bash_idx |
     (if ($new_hooks | length) == 0 then
       .
-    elif (.hooks.PreToolUse | any(.matcher == "Bash")) then
-      .hooks.PreToolUse |= map(if .matcher == "Bash" then .hooks = ((.hooks // []) + $new_hooks) else . end)
+    elif ($bash_idx != null) then
+      .hooks.PreToolUse[$bash_idx].hooks = ((.hooks.PreToolUse[$bash_idx].hooks // []) + $new_hooks)
     else
       .hooks.PreToolUse += [{matcher: "Bash", hooks: $new_hooks}]
     end) |
@@ -135,11 +142,26 @@ for SETTINGS in "${TARGETS[@]}"; do
       or ((.hooks // []) | any(((.command // "") | contains($marker)) | not))
     ))
     ' \
-    "$SETTINGS" > "$TMP"
+    "$SETTINGS" > "$TMP"; then
+    # A single bad target (unparseable JSON, or any other jq error) must
+    # not take down the whole batch -- this `if` keeps `set -e` from
+    # aborting the script here, so targets listed after this one in the
+    # same invocation still get processed.
+    echo "FATAL: jq failed processing $SETTINGS (invalid/unparseable JSON or jq error) -- skipped, other targets unaffected" >&2
+    rm -f "$TMP"
+    STATUS=1
+    continue
+  fi
 
   # Validate before overwriting the real file -- never leave settings.json
-  # truncated/corrupt if jq produced something unexpected.
-  jq empty "$TMP"
+  # truncated/corrupt if jq produced something unexpected. Same isolation
+  # as above: one target failing this check must not kill the batch.
+  if ! jq empty "$TMP"; then
+    echo "FATAL: jq produced invalid JSON for $SETTINGS -- skipped, not overwriting" >&2
+    rm -f "$TMP"
+    STATUS=1
+    continue
+  fi
 
   if cmp -s "$SETTINGS" "$TMP"; then
     echo "Already fully guarded: $SETTINGS"
