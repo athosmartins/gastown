@@ -1576,15 +1576,31 @@ def _branch_merged_state(branch, rig_name=""):
     work landed (a source bead being closed does NOT prove it, ga-w5agg/ga-d2jil):
       'merged'   — origin/<branch> is an ancestor of origin/main (landed).
       'unmerged' — origin/<branch> exists but is NOT an ancestor (STRANDED — fix pending).
-      'missing'  — no such branch on origin (abandoned/renamed → marker is truly moot).
-      'unknown'  — rig unresolved / git error → caller MUST NOT treat as done (fail-safe).
+      'missing'  — git ACTUALLY RAN and confirmed no such branch exists on origin
+                   (abandoned/renamed → marker is truly moot).
+      'unknown'  — fetch failed, or a git subprocess couldn't be confirmed to have run
+                   (sh() returned None on exception/timeout), or rig unresolved → caller
+                   MUST NOT treat as done (fail-safe).
+    GATE-FEEDBACK (ga-7b19e attempt 2 FAIL): sh() returning None (subprocess exception/
+    timeout) on the rev-parse call used to fall into the SAME branch as a confirmed-
+    absent ref (returncode != 0) — inconsistent with the merge-base check 4 lines below,
+    which already treated its own sh()-returns-None case as 'unknown'. Under this city's
+    documented load (Dolt-hot, 100+ concurrent worktrees sharing git state) a transient
+    subprocess failure is not hypothetical. Every sh() result is now checked for None
+    before its returncode is read, and a failed/timed-out `fetch` short-circuits to
+    'unknown' before rev-parse even runs — a stale local view must never stand in for a
+    freshly confirmed one.
     Bounded git ops in the branch's rig repo (or HQ if rig unresolved)."""
     if not branch:
         return "unknown"
     repo = (_rig_paths().get(rig_name) if rig_name else None) or CITY
-    sh(["git", "-C", repo, "fetch", "origin", "--quiet"], timeout=30)
+    fetch = sh(["git", "-C", repo, "fetch", "origin", "--quiet"], timeout=30)
+    if fetch is None or fetch.returncode != 0:
+        return "unknown"
     ex = sh(["git", "-C", repo, "rev-parse", "--verify", "-q", "origin/%s^{commit}" % branch], timeout=15)
-    if not ex or ex.returncode != 0 or not (ex.stdout or "").strip():
+    if ex is None:
+        return "unknown"
+    if ex.returncode != 0 or not (ex.stdout or "").strip():
         return "missing"
     anc = sh(["git", "-C", repo, "merge-base", "--is-ancestor",
               "origin/%s" % branch, "origin/main"], timeout=15)
@@ -3128,42 +3144,52 @@ def needs_rebase_verdict(age_sec, threshold_sec, source_resolved, source_closed,
     transient gate-status:error, needs-rebase means the gate already confirmed a
     deterministic conflict, so blindly flipping it back to queued would reproduce
     that conflict identically.
-      close:branch-landed — branch_state in (merged, missing) → the work either
-                            already shipped some other way or the branch is
-                            gone/abandoned; the marker is moot. This is the ONLY
-                            closing path, checked before source status and the
-                            age gate — a moot marker never waits. `source_closed`
-                            is deliberately NEVER used to decide closing on its
-                            own: a source bead being closed does not prove the
-                            work landed (ga-w5agg/ga-d2jil — the same stranding
-                            bug class FIX 4's orphan_marker_verdict already
-                            guards against via this identical branch_state gate).
-                            A closed source with a real unmerged branch is a
-                            STRANDED fix, not a leftover — it falls through to
-                            'escalate' below, exactly like an open source would.
-      skip:young          — parked <= threshold; a human may already be mid-fix.
+      skip:young          — parked <= threshold. Checked FIRST, before branch_state
+                            is ever consulted (GATE-FEEDBACK attempt 2 FAIL: a
+                            marker created moments ago can't yet be trusted to act
+                            on — mirrors FIX 4's identical young-marker guard,
+                            which also runs before anything else).
+      close:branch-landed — branch_state == 'merged' (positive proof of ancestry —
+                            closes ALONE, no corroboration needed) OR branch_state
+                            == 'missing' AND source_closed (absence of evidence
+                            needs corroboration: GATE-FEEDBACK attempt 2 FAIL —
+                            'missing' alone was closing markers on a single
+                            sweep's git result, the same single-signal shape this
+                            bug's own history already rejected once for
+                            source_closed; requiring source_closed alongside
+                            'missing' mirrors FIX 4's orphan_marker_verdict
+                            exactly). `source_closed` ALONE — with branch_state
+                            'unmerged' or 'unknown' — is still NEVER enough to
+                            close: a source bead being closed does not prove the
+                            work landed (ga-w5agg/ga-d2jil). A closed source with
+                            a real unmerged branch is a STRANDED fix, not a
+                            leftover — it falls through to 'escalate' below,
+                            exactly like an open source would.
       skip:parked-needs-human — source already carries gate:needs-human; a
                             different mechanism (gate-needs-human-divergence-
                             sweep) owns escalation for that bead.
-      escalate             — genuinely stuck: branch neither landed nor gone
-                            (unmerged = real branch pending a human rebase/
-                            rebuild decision; unknown = can't verify, fail-safe
-                            toward visibility), past the age threshold →
-                            mail+notify with age. Fires regardless of source
-                            status (open, closed, or unresolvable) — only the
-                            branch's own ancestry vs origin/main ever justifies a
-                            close. ga-7b19e's acceptance OR-clause (dispatchable-
-                            again OR an alert) is satisfied via this branch —
-                            dispatch is deliberately NOT force-resumed, since
-                            that would just re-hit the identical conflict.
+      escalate             — genuinely stuck: branch neither landed nor
+                            corroborated-gone (unmerged = real branch pending a
+                            human rebase/rebuild decision; unknown = can't
+                            verify; missing-without-source_closed = uncorroborated)
+                            — fail-safe toward visibility, past the age threshold
+                            → mail+notify with age. Fires regardless of source
+                            status (open, closed, or unresolvable) whenever the
+                            branch signal alone isn't conclusive enough to close.
+                            ga-7b19e's acceptance OR-clause (dispatchable-again OR
+                            an alert) is satisfied via this branch — dispatch is
+                            deliberately NOT force-resumed, since that would just
+                            re-hit the identical conflict.
     branch_state ∈ {'merged','unmerged','missing','unknown'} (_branch_merged_state).
     An unresolvable source (source_resolved=False) still reaches 'escalate' once
     old enough — fail TOWARD visibility, never toward silence (the bug this fix
     exists to close)."""
-    if branch_state in ("merged", "missing"):
-        return "close:branch-landed"
     if age_sec <= threshold_sec:
         return "skip:young"
+    if branch_state == "merged":
+        return "close:branch-landed"
+    if branch_state == "missing" and source_closed:
+        return "close:branch-landed"
     if source_resolved and source_needs_human:
         return "skip:parked-needs-human"
     return "escalate"
@@ -3507,6 +3533,61 @@ def _selftest():
     ok(orphan_marker_verdict(572 * 60, M, True, False, True) == "clear-stale-reviewing", "old + source OPEN + gate:reviewing → clear stale (the wa-ya17c case)")
     ok(orphan_marker_verdict(572 * 60, M, True, False, False) == "keep", "old + source open + no reviewing → keep (nothing stale)")
     ok(orphan_marker_verdict(600 * 60, M, False, False, False) == "keep", "source UNREADABLE → keep (fail-safe, never blind-close)")
+    # _branch_merged_state (shared by FIX 4 + FIX 9) — ga-7b19e attempt 3 root-cause fix.
+    # GATE-FEEDBACK (attempt 2 FAIL): sh() returning None (subprocess exception/timeout)
+    # on the rev-parse call fell into the SAME branch as a confirmed-absent ref, so a
+    # transient git failure under this city's documented load (Dolt-hot, 100+ concurrent
+    # worktrees) was silently reported as "missing" instead of "unknown" — letting FIX 4
+    # or FIX 9 auto-close a marker (and strip a source bead's label) for a branch that
+    # was actually still real and unmerged. These monkeypatch sh() itself since
+    # _branch_merged_state's whole job is interpreting subprocess results.
+    _CP = subprocess.CompletedProcess
+    _bms_calls = []
+    def _fake_sh_bms(fetch_is_none=False, fetch_rc=0, rev_is_none=False, rev_rc=0,
+                      rev_stdout="abc123\n", merge_rc=0):
+        def _f(args, timeout=20, stdin=None):
+            _bms_calls.append(list(args))
+            if "fetch" in args:
+                return None if fetch_is_none else _CP(args=args, returncode=fetch_rc, stdout="")
+            if "rev-parse" in args:
+                return None if rev_is_none else _CP(args=args, returncode=rev_rc, stdout=rev_stdout)
+            if "merge-base" in args:
+                return _CP(args=args, returncode=merge_rc, stdout="")
+            return None
+        return _f
+    _real_sh = globals()["sh"]
+    try:
+        globals()["sh"] = _fake_sh_bms(rev_is_none=True)
+        ok(_branch_merged_state("br") == "unknown",
+           "GATE-FEEDBACK regression (ga-7b19e attempt 2 FAIL): sh() returns None on rev-parse (timeout/exception) → unknown, NOT missing — mirrors the anc-is-None handling a few lines below in the same function")
+
+        _bms_calls.clear()
+        globals()["sh"] = _fake_sh_bms(fetch_is_none=True)
+        ok(_branch_merged_state("br") == "unknown",
+           "sh() returns None on fetch (timeout/exception) → unknown; a wedged fetch must never let a stale local view masquerade as ground truth")
+        ok(not any("rev-parse" in c for c in _bms_calls),
+           "a failed fetch short-circuits BEFORE rev-parse runs — never trust local refs when fetch itself couldn't confirm them fresh")
+
+        _bms_calls.clear()
+        globals()["sh"] = _fake_sh_bms(fetch_rc=1)
+        ok(_branch_merged_state("br") == "unknown",
+           "fetch runs but returns nonzero (network hiccup etc.) → unknown, same as sh()-returns-None — a failed fetch is a failed fetch regardless of failure mode")
+        ok(not any("rev-parse" in c for c in _bms_calls),
+           "nonzero-returncode fetch also short-circuits before rev-parse")
+
+        globals()["sh"] = _fake_sh_bms(rev_rc=1, rev_stdout="")
+        ok(_branch_merged_state("br") == "missing",
+           "fetch OK + rev-parse ACTUALLY RAN and confirmed the ref doesn't resolve (returncode!=0, empty stdout) → missing is still reachable — the fix narrows what counts as missing, it doesn't remove the state")
+
+        globals()["sh"] = _fake_sh_bms(merge_rc=0)
+        ok(_branch_merged_state("br") == "merged", "fetch OK + rev-parse OK + merge-base ancestor(rc=0) → merged (unchanged happy path)")
+
+        globals()["sh"] = _fake_sh_bms(merge_rc=1)
+        ok(_branch_merged_state("br") == "unmerged", "fetch OK + rev-parse OK + merge-base not-ancestor(rc=1) → unmerged (unchanged happy path)")
+
+        ok(_branch_merged_state("") == "unknown", "empty branch name → unknown (unchanged guard, no sh() call at all)")
+    finally:
+        globals()["sh"] = _real_sh
     # FIX 5 — stranded_verdict_verdict (delivered==total stuck run recovery)
     S = 15 * 60
     ok(stranded_verdict_verdict(9 * 60, S, 1, 1) == "skip:young", "young run (9m<15m) → skip (a finalize is seconds after last verdict)")
@@ -3629,14 +3710,16 @@ def _selftest():
     # (dead author, or MAX_REBASE_ATTEMPTS exhausted), so a blind requeue would just
     # reproduce the identical conflict for nothing.
     NR = 15 * 60
-    ok(needs_rebase_verdict(300, NR, True, True, False, "merged") == "close:branch-landed",
-       "source resolved+CLOSED AND branch actually MERGED → still closes (moot), even young — branch_state alone gates closing, checked before the age gate")
+    ok(needs_rebase_verdict(300, NR, True, True, False, "merged") == "skip:young",
+       "GATE-FEEDBACK regression (ga-7b19e attempt 2 FAIL): a brand-new marker (age < threshold) never closes on sweep 1 even when branch_state is already MERGED — the age gate now runs before branch_state is ever consulted, mirroring FIX 4's own young-marker guard instead of letting a single sweep act on a signal that may not have replicated yet")
     ok(needs_rebase_verdict(600 * 60, NR, True, True, False, "unmerged") == "escalate",
        "GATE-FEEDBACK regression (ga-7b19e attempt 1 FAIL): source resolved+CLOSED but branch UNMERGED (stranded fix) must NEVER close — a closed source does not prove the work landed (mirrors FIX 4's orphan_marker_verdict recover-stranded guard, ga-w5agg/ga-d2jil class). The original FIX 9 draft closed here unconditionally; this is the falsifying case for that exact bug.")
     ok(needs_rebase_verdict(600 * 60, NR, True, False, False, "merged") == "close:branch-landed",
        "source OPEN but branch MERGED → close (work landed some other way)")
-    ok(needs_rebase_verdict(600 * 60, NR, True, False, False, "missing") == "close:branch-landed",
-       "branch MISSING (abandoned) → close (moot regardless of source)")
+    ok(needs_rebase_verdict(600 * 60, NR, True, True, False, "missing") == "close:branch-landed",
+       "branch MISSING (abandoned) + source CLOSED → close (moot, corroborated) — mirrors FIX 4's orphan_marker_verdict: missing needs source_closed alongside it, merged doesn't")
+    ok(needs_rebase_verdict(600 * 60, NR, True, False, False, "missing") == "escalate",
+       "GATE-FEEDBACK regression (ga-7b19e attempt 2 FAIL): branch MISSING but source still OPEN → does NOT close, falls through to escalate. 'missing' is absence of evidence — closing on it ALONE would reproduce the exact silent-stranding class (ga-w5agg/ga-d2jil) this fix exists to prevent; only 'merged' is positive-enough proof to close unaccompanied")
     ok(needs_rebase_verdict(60, NR, True, False, False, "unmerged") == "skip:young",
        "parked < threshold → skip:young (give a human time to react organically first)")
     ok(needs_rebase_verdict(600 * 60, NR, True, False, True, "unmerged") == "skip:parked-needs-human",
