@@ -101,6 +101,14 @@ STARVE_MIN_PRI3 = int(os.environ.get("STARVE_MIN_PRI3", str(STARVE_MIN * 6)))
 # No single source of truth yet (same duplication pattern as POOL_BY_RIG_BASENAME
 # below) — keep in sync by hand.
 RECLAIM_CAP = int(os.environ.get("ARC_RECLAIM_CAP", "3"))
+# BRANCH_STRANDED_STALE_HOURS (ga-32u6s): a crew/fix branch's last commit older than
+# this, still unmerged into origin/main, with the bead itself unassigned (guaranteed
+# by the time _branch_stranded_reason() is consulted — see its call site) is treated
+# as an abandoned build rather than active work. Same default/semantics as
+# PILOT_ORPHAN_BRANCH_STALE_HOURS in pilot-dispatcher.sh's ga-8jxe1 classifier
+# (packs/town-deltas/assets/pilot-dispatcher.sh:353) — reusing an already-vetted
+# number instead of inventing a new one, independently override-able via its own env var.
+BRANCH_STRANDED_STALE_HOURS = int(os.environ.get("ARC_BRANCH_STRANDED_STALE_HOURS", "48"))
 # FLOW_GRACE_MIN: recently-dispatched beads are assumed to be flowing.
 FLOW_GRACE_MIN = int(os.environ.get("FLOW_GRACE_MIN", "10"))
 # Per-bead cooldowns to prevent churn/spam on repeated runs.
@@ -159,6 +167,7 @@ _bd_show_full = None        # (rig_root, bead_id) -> dict|None; full `bd show --
                              # (metadata included); None = query/parse error or not found
 _bd_has_built_branch = None  # (bead_id) -> bool; True iff a crew/*/<id> or fix/<id>-*
                               # branch exists (local or origin remote-tracking) anywhere
+_bd_branch_stranded = None  # (bead_id) -> (repo, ref, age_days)|None; ga-32u6s orphan-branch probe
 
 
 # ── guarded subprocess ────────────────────────────────────────────────────────
@@ -184,11 +193,12 @@ def _load_state():
                 d.setdefault("first_seen_approved", {})
                 d.setdefault("flagged", {})
                 d.setdefault("reclaim_exhausted", {})
+                d.setdefault("branch_stranded", {})
                 return d
     except Exception:
         pass
     return {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {},
-            "reclaim_exhausted": {}}
+            "reclaim_exhausted": {}, "branch_stranded": {}}
 
 
 def _save_state(state):
@@ -211,7 +221,8 @@ def _prune_state(state, now):
     the timestamp out of either shape rather than assuming a bare number.
     """
     cutoff = now - 7 * 24 * 3600
-    for key in ("routed", "alarmed", "first_seen_approved", "flagged", "reclaim_exhausted"):
+    for key in ("routed", "alarmed", "first_seen_approved", "flagged", "reclaim_exhausted",
+                "branch_stranded"):
         bucket = state.get(key, {})
         stale = []
         for bid, v in bucket.items():
@@ -968,6 +979,106 @@ def _alarm_reclaim_exhausted(rig_root, bead, reclaim_count, now, state):
     state.setdefault("reclaim_exhausted", {})[bead_id] = now
 
 
+# ── branch-stranded alert (ga-32u6s) ────────────────────────────────────────────
+def _alarm_branch_stranded(rig_root, bead, repo, ref, age_days, now, state):
+    """ONE-TIME mail + pilot:orphan-branch label for a bead whose crew/fix branch
+    is a stranded orphan: built, unmerged into origin/main, idle past
+    BRANCH_STRANDED_STALE_HOURS, unassigned.
+
+    WHY THIS EXISTS (ga-32u6s / wa-juety: 6 days, 83h starving): _filter_built
+    (packs/town-deltas/assets/pilot-dispatcher.sh:2148-2175) drops a candidate
+    from the dispatch pool FOREVER the moment a matching crew/fix branch merely
+    EXISTS — no merge check, no age check, no live-owner check. Pilot's own
+    smarter classifier for exactly this situation (_beadid_branch_signal's
+    'orphan' verdict, ga-8jxe1, pilot-dispatcher.sh:3065) only ever runs inside
+    dispatch_one(), on a candidate that already SURVIVED _filter_built — so for
+    the precise case ga-8jxe1 was built to fix, its own classifier is
+    unreachable, and the bead never gets pilot:orphan-branch or any other
+    signal. This reconciler-side check is an independent backstop that does
+    not depend on ever reaching dispatch_one: it reuses the SAME branch-probe
+    shape (_real_has_built_branch/_ownership_guard_repos, ga-tkcam) already
+    proven correct here, adds the merge-ancestry + age checks ga-8jxe1 already
+    validated as the right judgment call, and — critically — actually fires an
+    alert instead of silently relying on a label nobody applied.
+
+    Distinct from _alarm_starving: NOT "dispatch path failing". The branch is
+    real, finished (or at least real) work sitting unmerged; the correct next
+    step is a human triage call (re-anchor vs rebuild vs abandon per the bead's
+    own text), not a re-dispatch retry. Like _alarm_reclaim_exhausted, this
+    mails/labels ONCE per bead rather than repeating on ALARM_COOLDOWN_SEC —
+    the diagnosis doesn't change cycle to cycle until a human acts on it, and
+    pilot:orphan-branch (shared vocabulary with ga-8jxe1's own labeling) keeps
+    the state durably queryable (`bd list -l pilot:orphan-branch`) without a
+    repeat alarm. Never touches the branch itself — deleting it would destroy
+    real unmerged work; that decision is explicitly out of scope here.
+    """
+    bead_id = bead.get("id") or bead.get("issue_id") or ""
+    if not bead_id:
+        return
+    if bead_id in state.get("branch_stranded", {}):
+        return  # already alerted once — never repeat
+
+    title = (bead.get("title") or bead.get("name") or "?")[:80]
+    repo_name = os.path.basename(repo.rstrip("/")) or repo
+    _log("BRANCH-STRANDED (not dispatch-failing): %s | ref=%s | repo=%s | age=%.1fd | %s" % (
+         bead_id, ref, repo_name, age_days, title))
+
+    if DRY_RUN:
+        _log("DRY_RUN: would alert branch-stranded %s (ref=%s, age=%.1fd)" % (
+             bead_id, ref, age_days))
+        return  # no state update, no mutations
+
+    subject = ("Reconciler: bead %s has an UNMERGED BUILD BRANCH stranded %dd "
+               "— needs re-anchor decision" % (bead_id, int(age_days)))
+    body = (
+        "APPROVED-STATE-RECONCILER: branch stranded, not a dispatch failure\n\n"
+        "Bead: %s — %s\n"
+        "Branch: %s (repo %s), last commit ~%.1f days ago, NOT merged into origin/main\n"
+        "Bead is unassigned, not flowing, no open gate marker, no formal block "
+        "(see approved-state-reconciler's earlier checks this cycle).\n\n"
+        "DIAGNOSTICO: trabalho pronto e nao mergeado em %s; decida re-anchor vs "
+        "rebuild vs abandon.\n\n"
+        "Este NAO e um caso de \"dispatch path failing\": _filter_built "
+        "(pilot-dispatcher.sh) veta a candidatura deste bead permanentemente so por "
+        "a branch existir, sem checar merge/idade/dono — entao o classificador "
+        "inteligente que o Pilot ja tem para essa situacao (ga-8jxe1, "
+        "_beadid_branch_signal em dispatch_one()) nunca chega a rodar nele.\n\n"
+        "Nao feche nem apague a branch automaticamente — ela pode conter o "
+        "entregavel inteiro. Rotulo pilot:orphan-branch aplicado neste bead; "
+        "consultavel via `bd list -l pilot:orphan-branch`.\n"
+    ) % (bead_id, title, ref, repo_name, age_days, ref)
+
+    notify_msg = ("BRANCH STRANDED: bead %s tem branch %s pronta, nao mergeada ha "
+                  "~%.0fd, sem dono — decisao de re-anchor/rebuild/abandon precisa "
+                  "de humano" % (bead_id, ref, age_days))
+
+    _arc_ledger("human-touch", {
+        "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source_daemon": "approved-state-reconciler",
+        "stage": "branch-stranded",
+        "bead_id": bead_id,
+        "branch": ref,
+        "repo": repo_name,
+        "age_days": round(age_days, 1),
+        "rig_root": rig_root,
+    }, fail_open=True)
+
+    if _do_notify is not None:
+        _do_notify(notify_msg, 3)
+    else:
+        _sh([NOTIFY_BIN, "-t", "Branch stranded", "-p", "3", notify_msg], timeout=10)
+
+    if _do_mail_mayor is not None:
+        _do_mail_mayor(subject, body)
+    else:
+        _sh([GC_BIN, "mail", "send", MAYOR_ADDR, "-s", subject, "-m", body, "--notify"],
+            timeout=45)
+
+    _do_label_add(rig_root, bead_id, "pilot:orphan-branch")
+
+    state.setdefault("branch_stranded", {})[bead_id] = now
+
+
 # ── built-bead index ──────────────────────────────────────────────────────────
 def _gate_marker_source_beads():
     """Set of bead ids that an OPEN quality-gate-marker points at (label source-bead:<id>).
@@ -1179,6 +1290,87 @@ def _dispatched_and_built_reason(rig_root, bead_id):
         return ("pilot.dispatched_at set + built branch exists "
                 "(mirrors pilot-dispatcher _filter_built)")
     return None
+
+
+def _matched_built_branch_ref(bead_id):
+    """Like _real_has_built_branch but also returns WHICH (repo, ref) matched —
+    needed to name the specific stranded branch in an alert. Same ref shapes,
+    same repos, same fail-open (no match) direction; deliberately a separate
+    probe rather than a refactor of _real_has_built_branch, matching this
+    file's established pattern of several independently-testable branch-probe
+    functions (mirrors pilot-dispatcher.sh's _beadid_has_crew_branch vs.
+    _beadid_matched_crew_branch_ref split, ga-8jxe1 AC2)."""
+    if not bead_id:
+        return None
+    for repo in _ownership_guard_repos():
+        if not repo or not os.path.isdir(repo):
+            continue
+        r = _sh(["git", "-C", repo, "for-each-ref", "--format=%(refname)",
+                  "refs/remotes/origin/crew/*/%s" % bead_id,
+                  "refs/heads/crew/*/%s" % bead_id,
+                  "refs/remotes/origin/fix/%s-*" % bead_id,
+                  "refs/heads/fix/%s-*" % bead_id],
+                 timeout=10)
+        if r is not None and r.returncode == 0 and (r.stdout or "").strip():
+            ref = (r.stdout or "").strip().splitlines()[0].strip()
+            if ref:
+                return (repo, ref)
+    return None
+
+
+def _real_branch_stranded_reason(bead_id):
+    """Real-git implementation behind _branch_stranded_reason() — see that
+    function's docstring for the full judgment call. FAIL-OPEN throughout:
+    no branch / no git / unresolvable merge-base / unresolvable commit date
+    all return None (never invent a stranded-branch alert on unprobable
+    data — the opposite direction from _filter_built's own fail-open, which
+    is deliberate: a missed alert just means silence continues one more
+    cycle, but a FALSE alert wastes a human triage cycle on nothing)."""
+    matched = _matched_built_branch_ref(bead_id)
+    if matched is None:
+        return None
+    repo, ref = matched
+
+    r = _sh(["git", "-C", repo, "merge-base", "--is-ancestor", ref, "origin/main"], timeout=10)
+    if r is not None and r.returncode == 0:
+        return None  # merged — landed, not stranded (a DIFFERENT bug: bead should have closed)
+
+    r2 = _sh(["git", "-C", repo, "log", "-1", "--format=%ct", ref], timeout=10)
+    if r2 is None or r2.returncode != 0:
+        return None
+    raw = (r2.stdout or "").strip()
+    if not raw:
+        return None
+    try:
+        commit_epoch = int(raw.splitlines()[0].strip())
+    except (ValueError, IndexError):
+        return None
+
+    age_sec = time.time() - commit_epoch
+    if age_sec <= BRANCH_STRANDED_STALE_HOURS * 3600:
+        return None  # fresh — could be legitimately in-progress work, not abandoned
+
+    return (repo, ref, age_sec / 86400.0)
+
+
+def _branch_stranded_reason(bead_id):
+    """Returns (repo, ref, age_days) iff bead_id has a matched crew/fix branch
+    that is unmerged into origin/main and idle past BRANCH_STRANDED_STALE_HOURS.
+    None if no branch, branch is merged, or branch is fresh.
+
+    Caller (_process_store) reaches this check only after the bead has already
+    passed every earlier suppression in the gauntlet — in particular
+    _is_flowing() already guarantees the bead is unassigned (or assignee ==
+    'mayor', itself continue'd earlier) and not gate:reviewing/queued, and the
+    built_ids/blocked_ids/_dispatched_and_built_reason checks above already
+    guarantee no open gate marker and no formal dependency block — so unlike
+    pilot-dispatcher.sh's ga-8jxe1 _beadid_branch_signal (which re-checks the
+    bead's own assignee snapshot itself, since dispatch_one() has no equivalent
+    upstream gauntlet), this function only needs to answer the branch-state
+    question: does a stale, unmerged, matching branch exist."""
+    if _bd_branch_stranded is not None:
+        return _bd_branch_stranded(bead_id)
+    return _real_branch_stranded_reason(bead_id)
 
 
 # ── process one store ─────────────────────────────────────────────────────────
@@ -1505,6 +1697,28 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
                  bead_id, starve_age_min, dab_reason))
             continue
 
+        # BRANCH STRANDED (ga-32u6s): already flagged by this check (a prior cycle)
+        # OR by pilot-dispatcher.sh's own ga-8jxe1 classifier (shared label
+        # vocabulary) → already surfaced to a human, don't re-alert. Checked before
+        # the git probe below so an already-labeled bead skips it entirely.
+        if "pilot:orphan-branch" in labels:
+            _log("  %s: no signal, daemon-age=%.0fmin, pilot:orphan-branch already "
+                 "flagged — no alarm" % (bead_id, starve_age_min))
+            continue
+
+        # BRANCH STRANDED (ga-32u6s): a matching crew/fix branch exists, is unmerged,
+        # and has sat idle past BRANCH_STRANDED_STALE_HOURS — built work abandoned
+        # mid-flight, not a dispatch failure. See _alarm_branch_stranded()'s docstring
+        # for why this is checked here rather than relying on pilot-dispatcher.sh's own
+        # ga-8jxe1 classifier (unreachable for exactly this case — _filter_built drops
+        # the candidate before dispatch_one ever sees it).
+        stranded = _branch_stranded_reason(bead_id)
+        if stranded is not None:
+            s_repo, s_ref, s_age_days = stranded
+            _alarm_branch_stranded(rig_root, bead, s_repo, s_ref, s_age_days, now, state)
+            alarmed += 1
+            continue
+
         # ALARM: buildable bead starving, pilot alive, pool has capacity, dispatch failing.
         _alarm_starving(rig_root, bead, starve_age_min, now, state)
         alarmed += 1
@@ -1688,10 +1902,27 @@ def _selftest():
       (xx)      ga-6om6a RE-FIX: pilot:refused-reason:<slug> label (the
                 PERMANENT audit label inflight-reclaim-guard.py promotes
                 pool:refused[:reason] into, ga-uvfs6) → no alarm
+      (ga-32u6s-a) stranded unmerged crew/fix branch, idle past
+                BRANCH_STRANDED_STALE_HOURS, unassigned → branch-stranded
+                alert fires (NOT the generic "dispatch failing" alarm) —
+                wa-juety repro (6 days / 83min-scale starvation with the
+                wrong diagnosis, root cause: _filter_built vetoes dispatch
+                candidacy on branch-existence alone, so ga-8jxe1's own
+                smarter classifier — which lives inside dispatch_one() —
+                never gets a chance to run on this exact case)
+      (ga-32u6s-b) falsification: no branch signal at all → STILL alarms via
+                the generic starve path (fix isn't over-permissive)
+      (ga-32u6s-c) bead already carries pilot:orphan-branch (this check's own
+                prior cycle, OR pilot-dispatcher.sh's ga-8jxe1 classifier —
+                shared label vocabulary) → skip re-alert entirely, even
+                though the branch probe would still report stranded
+      (ga-32u6s-d) branch-stranded alert does not repeat across cycles for
+                the same bead — local state backstop, mirrors
+                _alarm_reclaim_exhausted's one-time-only shape (scenario (t))
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
-    global _bd_blocked, _bd_show_full, _bd_has_built_branch
+    global _bd_blocked, _bd_show_full, _bd_has_built_branch, _bd_branch_stranded
     global DRY_RUN, STARVE_MIN, FLOW_GRACE_MIN, ROUTE_COOLDOWN_SEC, ALARM_COOLDOWN_SEC
 
     ok_count = [0]
@@ -2877,6 +3108,102 @@ def _selftest():
     else:
         _bad("(xx)", "FALSELY alarmed despite pilot:refused-reason:*; "
              "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (ga-32u6s-a): stranded unmerged crew/fix branch, idle past "
+          "BRANCH_STRANDED_STALE_HOURS, unassigned → branch-stranded alert fires "
+          "(NOT the generic 'dispatch failing' alarm) — wa-juety repro")
+    _bd_approved = lambda root: [_make_bead("ga-bsa1", age_min=0.1)]
+    _bd_branch_stranded = lambda bid: (
+        ("/Users/athos/gt/whatsapp_automation", "refs/remotes/origin/crew/wa-worker/ga-bsa1", 6.2)
+        if bid == "ga-bsa1" else None)
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_bsa = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_bsa["first_seen_approved"]["ga-bsa1"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_bsa)
+    _bd_branch_stranded = None
+    bsa_mail = [(subj, body) for subj, body in mail_calls if "ga-bsa1" in subj]
+    bsa_stranded_subject = any("UNMERGED BUILD BRANCH" in subj for subj, _ in bsa_mail)
+    bsa_generic_subject = any("dispatch failing" in subj for subj, _ in bsa_mail)
+    bsa_labeled = ("ga-bsa1", "pilot:orphan-branch") in label_adds
+    bsa_state_recorded = "ga-bsa1" in st_bsa.get("branch_stranded", {})
+    if bsa_stranded_subject and not bsa_generic_subject and bsa_labeled and bsa_state_recorded:
+        _ok("(ga-32u6s-a): stranded branch → branch-stranded alert (not generic starve), "
+            "pilot:orphan-branch labeled, state recorded")
+    else:
+        _bad("(ga-32u6s-a)", "stranded_subject=%s generic_subject=%s labeled=%s "
+             "state_recorded=%s mail_calls=%s label_adds=%s" % (
+             bsa_stranded_subject, bsa_generic_subject, bsa_labeled, bsa_state_recorded,
+             bsa_mail, label_adds))
+
+    print("\nScenario (ga-32u6s-b) falsification: no branch signal at all "
+          "(_branch_stranded_reason → None) → STILL alarms via the generic starve "
+          "path — the new check must not swallow a genuine dispatch-failing case")
+    _bd_approved = lambda root: [_make_bead("ga-bsb1", age_min=0.1)]
+    _bd_branch_stranded = lambda bid: None
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_bsb = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_bsb["first_seen_approved"]["ga-bsb1"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_bsb)
+    _bd_branch_stranded = None
+    if any("ga-bsb1" in subj and "dispatch failing" in subj for subj, _ in mail_calls):
+        _ok("(ga-32u6s-b): no branch signal → still alarms via the generic path "
+            "(fix isn't over-permissive)")
+    else:
+        _bad("(ga-32u6s-b)", "FAILED to alarm a genuinely starving bead with no branch "
+             "signal; mail_calls=%s" % mail_calls)
+
+    print("\nScenario (ga-32u6s-c): bead ALREADY carries pilot:orphan-branch (applied "
+          "by this check on a prior cycle, OR by pilot-dispatcher.sh's own ga-8jxe1 "
+          "classifier — shared label vocabulary) → skip re-alert entirely, even "
+          "though the branch probe would still report stranded if consulted")
+    _bd_approved = lambda root: [_make_bead(
+        "ga-bsc1", age_min=0.1, labels=["story:approved", "pilot:orphan-branch"])]
+    _bd_branch_stranded = lambda bid: (
+        ("/Users/athos/gt/whatsapp_automation", "refs/heads/fix/ga-bsc1-slug", 10.0)
+        if bid == "ga-bsc1" else None)
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_bsc = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_bsc["first_seen_approved"]["ga-bsc1"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_bsc)
+    _bd_branch_stranded = None
+    if not any("ga-bsc1" in subj for subj, _ in mail_calls):
+        _ok("(ga-32u6s-c): pilot:orphan-branch already present → no re-alert "
+            "(idempotent vs. ga-8jxe1's shared label vocabulary)")
+    else:
+        _bad("(ga-32u6s-c)", "FALSELY re-alerted on an already-flagged bead; "
+             "mail_calls=%s" % mail_calls)
+
+    print("\nScenario (ga-32u6s-d): branch-stranded alert does not repeat across "
+          "cycles for the same bead — local state backstop, mirrors "
+          "_alarm_reclaim_exhausted's one-time-only shape (scenario (t))")
+    _bd_approved = lambda root: [_make_bead("ga-bsd1", age_min=0.1)]
+    _bd_branch_stranded = lambda bid: (
+        ("/Users/athos/gt/whatsapp_automation", "refs/remotes/origin/crew/wa-worker/ga-bsd1", 6.2)
+        if bid == "ga-bsd1" else None)
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_bsd = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_bsd["first_seen_approved"]["ga-bsd1"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_bsd)
+    first_cycle_count = len([s for s, _ in mail_calls if "ga-bsd1" in s])
+    _reset_captures()
+    # +1h, same state dict, branch still stranded. Re-derive the pilot-alive log line
+    # at the NEW now (_pilot_recent_at, not _pilot_recent) — see that helper's docstring:
+    # a frozen-at-NOW line would read as pilot-dead an hour later and suppress the alarm
+    # for the WRONG reason, making this assertion pass even with a broken idempotency guard.
+    _read_pilot_log_lines = lambda: _pilot_recent_at(NOW + 3600)
+    run_cycle(NOW + 3600, st_bsd)
+    _bd_branch_stranded = None
+    second_cycle_count = len([s for s, _ in mail_calls if "ga-bsd1" in s])
+    if first_cycle_count == 1 and second_cycle_count == 0:
+        _ok("(ga-32u6s-d): branch-stranded alert fires once, never repeats for the "
+            "same bead across later cycles")
+    else:
+        _bad("(ga-32u6s-d)", "first_cycle_count=%d second_cycle_count=%d" % (
+             first_cycle_count, second_cycle_count))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
