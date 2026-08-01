@@ -2258,9 +2258,11 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
 
         if [ "$IS_CONTAINER_RIG" = "1" ]; then
           if git_rig worktree add "$TMP_MR_WT" "origin/$BRANCH" 2>/dev/null; then
-            git -C "$TMP_MR_WT" config user.email "gate-dispatcher@gascity.local" 2>/dev/null || true
-            git -C "$TMP_MR_WT" config user.name "Gate Dispatcher" 2>/dev/null || true
-            if git -C "$TMP_MR_WT" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+            # ga-euopg: identity scoped via -c to this invocation only — a prior
+            # `git config` here wrote to the SHARED repo config (no --worktree
+            # flag), silently re-stamping "Gate Dispatcher" onto every worktree's
+            # default author/committer identity, repo-wide, every ~2min cycle.
+            if git -C "$TMP_MR_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
               local NEW_TIP_MR
               NEW_TIP_MR=$(git -C "$TMP_MR_WT" rev-parse HEAD 2>/dev/null || echo "")
               if [ -n "$NEW_TIP_MR" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
@@ -2276,9 +2278,8 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
           fi
         else
           if git -C "$GIT_DIR_PATH" worktree add "$TMP_MR_WT" "origin/$BRANCH" 2>/dev/null; then
-            git -C "$TMP_MR_WT" config user.email "gate-dispatcher@gascity.local" 2>/dev/null || true
-            git -C "$TMP_MR_WT" config user.name "Gate Dispatcher" 2>/dev/null || true
-            if git -C "$TMP_MR_WT" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+            # ga-euopg: see identity-scoping note above (container-rig branch).
+            if git -C "$TMP_MR_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
               local NEW_TIP_MR_SR
               NEW_TIP_MR_SR=$(git -C "$TMP_MR_WT" rev-parse HEAD 2>/dev/null || echo "")
               if [ -n "$NEW_TIP_MR_SR" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
@@ -3238,8 +3239,10 @@ rig_real_merge_is_clean() {
   # Create a detached worktree at main; do the merge there. --no-commit leaves the
   # index/worktree merged so we can inspect ls-files -u, then we abort.
   if git_rig worktree add --detach "$wt" "$main_ref" >/dev/null 2>&1; then
-    git -C "$wt" config user.email "gate-dispatcher@gascity.local" >/dev/null 2>&1 || true
-    git -C "$wt" config user.name  "Gate Dispatcher"               >/dev/null 2>&1 || true
+    # ga-euopg: no identity needed — --no-commit never creates a commit, and
+    # this merge is always aborted below. The prior `git config` calls here
+    # served no purpose except writing "Gate Dispatcher" into the SHARED repo
+    # config (no --worktree flag), repo-wide, on every union-check probe.
     if git -C "$wt" merge --no-commit --no-ff "$branch_ref" >/dev/null 2>&1; then
       # Merge stopped-before-commit cleanly. Double-check no unmerged entries.
       if [ -z "$(git -C "$wt" ls-files -u 2>/dev/null)" ]; then
@@ -5237,10 +5240,10 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     if [ "$IS_CONTAINER_RIG" = "1" ] && [ "$HAS_CONFLICT" = "0" ]; then
       # Container rig (bare repo): worktree uses the bare .repo.git
       if git_rig worktree add "$TMP_REBASE_WT" "origin/$BRANCH" 2>/dev/null; then
-        # Configure git user inside worktree for the rebase commit
-        git -C "$TMP_REBASE_WT" config user.email "gate-dispatcher@gascity.local" 2>/dev/null || true
-        git -C "$TMP_REBASE_WT" config user.name "Gate Dispatcher" 2>/dev/null || true
-        if git -C "$TMP_REBASE_WT" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+        # ga-euopg: identity scoped via -c to this invocation only — see note
+        # at the merge-time-rebase call site above for why (was leaking into
+        # shared repo config, repo-wide, every auto-rebase cycle).
+        if git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
           NEW_TIP=$(git -C "$TMP_REBASE_WT" rev-parse HEAD 2>/dev/null || echo "")
           if [ -z "$NEW_TIP" ]; then
             warn "  Auto-rebase: rev-parse HEAD after rebase returned empty for $BRANCH — treating as push failure"
@@ -5282,9 +5285,8 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     elif [ "$HAS_CONFLICT" = "0" ]; then
       # Self-repo rig
       if git -C "$GIT_DIR_PATH" worktree add "$TMP_REBASE_WT" "origin/$BRANCH" 2>/dev/null; then
-        git -C "$TMP_REBASE_WT" config user.email "gate-dispatcher@gascity.local" 2>/dev/null || true
-        git -C "$TMP_REBASE_WT" config user.name "Gate Dispatcher" 2>/dev/null || true
-        if git -C "$TMP_REBASE_WT" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+        # ga-euopg: see identity-scoping note above (container-rig branch).
+        if git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
           NEW_TIP=$(git -C "$TMP_REBASE_WT" rev-parse HEAD 2>/dev/null || echo "")
           if [ -z "$NEW_TIP" ]; then
             warn "  Auto-rebase (self-repo): rev-parse HEAD after rebase returned empty for $BRANCH — treating as push failure"
