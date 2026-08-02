@@ -430,7 +430,8 @@ def check_gate():
     reviewer_alive = bool(rv and rv.stdout and
                           any("gate-reviewer" in ln and ("active" in ln or "awake" in ln)
                               for ln in rv.stdout.splitlines()))
-    stalled_by_age = (oldest_active_min is not None and oldest_active_min > GATE_STALL_MIN)
+    stalled_by_age = (oldest_active_min is not None and oldest_active_min > GATE_STALL_MIN
+                      and not reviewer_alive)
     stalled_by_silence = (len(active) > 0
                           and (last_pass_min is None or last_pass_min > GATE_STALL_MIN)
                           and not reviewer_alive)

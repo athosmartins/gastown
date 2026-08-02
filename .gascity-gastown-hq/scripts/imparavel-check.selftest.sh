@@ -228,6 +228,35 @@ eq("stuck list == [wa-STUCK] (in-gate NOT flagged, genuine IS)",
    [s["id"] for s in _a["stuck"]], ["wa-STUCK"])
 eq("from_dispatchable path used (not fallback)", _a["from_dispatchable"], True)
 
+print("── ga-lwi4b regression: check_gate()'s stalled_by_age must respect reviewer_alive ──")
+# batista's measured incident (04:17): a queued marker sat 475min (> GATE_STALL_MIN=165)
+# purely from queue congestion (24 in the fila) while gate-reviewer was ACTIVE and
+# reviewing it that instant. stalled_by_age used to ignore reviewer_alive (only
+# stalled_by_silence consulted it), so age alone declared a false GATE travado.
+_orig_bd_json, _orig_age_min, _orig_sh_gate = m._bd_json, m._age_min, m._sh
+m._bd_json = lambda root, label, status="open": (
+    [{"id": "mk-OLD", "updated_at": "2020-01-01T00:00:00Z", "labels": ["gate-status:dispatching"]}],
+    True)
+m._age_min = lambda iso: 475.0
+
+def _fake_sh_reviewer_alive(args, timeout=20):
+    if args and "session" in args:
+        return types.SimpleNamespace(returncode=0, stdout="gastown.gate-reviewer  active  0s\n")
+    return types.SimpleNamespace(returncode=0, stdout="")   # DISPATCH_LOG tail: no "Gate PASSED:" lines
+m._sh = _fake_sh_reviewer_alive
+_g_alive = m.check_gate()
+eq("reviewer alive + 475min-old marker: reviewer_alive detected True", _g_alive["reviewer_alive"], True)
+eq("reviewer alive + 475min-old marker: stalled must be False (the ga-lwi4b bug)", _g_alive["stalled"], False)
+
+def _fake_sh_reviewer_dead(args, timeout=20):
+    return types.SimpleNamespace(returncode=0, stdout="")   # no gate-reviewer active/awake, no Gate PASSED
+m._sh = _fake_sh_reviewer_dead
+_g_dead = m.check_gate()
+eq("reviewer dead + 475min-old marker: reviewer_alive detected False", _g_dead["reviewer_alive"], False)
+eq("reviewer dead + 475min-old marker: stalled must STILL be True (real stall preserved)", _g_dead["stalled"], True)
+
+m._bd_json, m._age_min, m._sh = _orig_bd_json, _orig_age_min, _orig_sh_gate
+
 print()
 print("RESULT: %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
