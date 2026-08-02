@@ -888,7 +888,7 @@ EOF
 # never permanently wedge a legitimately-solo branch.
 gate_bead_active_sibling_branch() {
   local gc_city="$1" bead_id="$2" this_branch="$3"
-  local siblings_json count i sib marker_status labels desc branch status lines
+  local siblings_json count i sib marker_status labels desc branch status lines sib_id
   if [ -z "$bead_id" ] || [ -z "$this_branch" ]; then
     printf ''
     return 0
@@ -919,7 +919,21 @@ gate_bead_active_sibling_branch() {
     fi
     [ -z "$branch" ] && continue
     status=$(printf '%s\n' "$labels" | tr ' ' '\n' | sed -n 's/^gate-status:\(.*\)$/\1/p' | head -1)
-    [ -z "$status" ] && continue
+    if [ -z "$status" ]; then
+      # ga-kgtiw: an OPEN marker/gate-run with a real branch but NO gate-status
+      # label is the exact invisible-forever signature (every dispatcher sweep
+      # selects its work via `-l gate-status:<value>`, so this sibling matches
+      # none of them, ever). This scan is the one place in the dispatcher that
+      # walks every marker for a bead regardless of its gate-status, so it is
+      # the one place that can actually SEE the gap — surface it instead of
+      # silently continuing past it like before. Written straight to stderr
+      # (not via warn/log, which echo to stdout): this function's own return
+      # value is captured via "$(...)" by every caller, and a stdout write
+      # here would corrupt that captured string.
+      printf '[%s] [quality-gate-dispatcher] ALERT: sibling marker %s (bead %s, branch %s) is OPEN with NO gate-status label — ga-kgtiw invisible-marker signature. Excluded from sibling-race detection; needs manual gate-status repair.\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "${sib_id:-$(printf '%s' "$sib" | jq -r '.id // "unknown"' 2>/dev/null || echo unknown)}" "$bead_id" "$branch" >&2
+      continue
+    fi
     lines="${lines}${branch}	${status}
 "
   done
@@ -1721,6 +1735,66 @@ gate_rebase_attempt_advanced() {
   else
     printf 'stuck'
   fi
+}
+
+# gate_labels_have_status <labels> — pure (no I/O). "1" iff the space-joined
+# label string carries at least one gate-status:* entry, "0" otherwise. Same
+# tokenization as the sibling-branch extractor above (tr ' ' '\n', anchored
+# ^gate-status: match) so the two can never drift on what counts as "has a
+# status". Isolated from gate_marker_status_ensure's live I/O below so the
+# actual predicate is unit-testable the same way gate_rebase_attempt_advanced
+# is (ga-kgtiw).
+gate_labels_have_status() {
+  local labels="${1:-}"
+  if printf '%s\n' "$labels" | tr ' ' '\n' | grep -q '^gate-status:'; then
+    printf '1'
+  else
+    printf '0'
+  fi
+}
+
+# gate_marker_status_ensure <marker_id> <context> — bd-backed self-heal.
+# ga-kgtiw: every exit point in the rebase-fail path (Step 4c below) removes
+# gate-status:dispatching up front, then — depending which branch it takes —
+# adds exactly one new terminal/requeue gate-status via a SEPARATE, unverified
+# `bd label add ... || true` call. That is the same shape ga-6dp9 already fixed
+# for the gate:rebase-fail-count counter (see gate_rebase_attempt_advanced
+# above): a transient Dolt write failure on the add is silently swallowed by
+# `|| true`, and a silently-failed write is then indistinguishable from "no
+# write was ever needed" — [[error-and-empty-must-not-produce-the-same-value]].
+# Unlike the counter, the status label never got the same falsify-the-write
+# treatment. The cost is not cosmetic: EVERY phase of this dispatcher selects
+# its work via `bd ... -l gate-status:<value>` label queries, so a marker that
+# ends up with ZERO gate-status labels matches no query, ever again — it is
+# not "parked", it is invisible. Measured live (ga-kgtiw): 3/3 markers with
+# gate:rebase-fail-count:1 had no gate-status label at all, one stranded 3
+# days with 14 commits behind it.
+#
+# Call this immediately before every `exit 0` in the rebase-fail path (Step
+# 4c) — after whatever branch-specific gate-status write it took. Re-reads the
+# marker's labels live and, if truly empty, force-writes gate-status:error (a
+# safe, already-retriable terminal state every other part of this system
+# already knows how to handle) so the marker can never exit this script
+# invisible. Logs loudly and mails the Mayor when it actually has to repair
+# something — the common case (a status IS present) returns immediately and
+# touches nothing.
+gate_marker_status_ensure() {
+  local marker_id="${1:-}" context="${2:-the rebase-fail path}"
+  local raw labels
+  [ -z "$marker_id" ] && return 0
+  raw=$(bd -C "$GC_CITY" show "$marker_id" --json 2>/dev/null || echo "")
+  labels=$(printf '%s' "$raw" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
+  if [ "$(gate_labels_have_status "$labels")" = "1" ]; then
+    return 0
+  fi
+  err "ga-kgtiw SELF-HEAL: marker $marker_id exited $context with NO gate-status label (an earlier label write silently failed) — it would otherwise be invisible to every dispatcher sweep forever. Forcing gate-status:error (safe, retriable)."
+  bd -C "$GC_CITY" label add "$marker_id" "gate-status:error" -q 2>/dev/null || true
+  bd -C "$GC_CITY" comment "$marker_id" "ga-kgtiw AUTO-REPAIR: this marker left $context with no gate-status label — a prior label write silently failed. The dispatcher's own safety net (ga-kgtiw) detected the gap and forced gate-status:error so this marker is never permanently invisible; it will be retried like any other error marker." 2>/dev/null || true
+  gc --city "$GC_CITY" mail send mayor \
+    -s "Gate ALERT: marker $marker_id lost its gate-status label (ga-kgtiw self-heal fired)" \
+    -m "Marker $marker_id exited $context with no gate-status label — an earlier label write silently failed (transient Dolt hiccup or similar). The ga-kgtiw self-heal forced gate-status:error so the marker stays visible/retriable instead of vanishing forever. This should be RARE; if it keeps firing, the underlying write-reliability issue (not just this safety net) needs investigation." 2>/dev/null \
+    || warn "Could not mail Mayor for ga-kgtiw status self-heal on $marker_id"
+  return 1
 }
 
 # gate_should_exile_tier5 <next_attempt> <exile_after_n> — pure (no I/O).
@@ -5069,6 +5143,7 @@ if [ -z "$MAIN_HEAD_SHA" ]; then
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
   bd -C "$GC_CITY" comment "$MARKER_ID" "Gate transient error: origin/$DEFAULT_BRANCH did not resolve to a present commit object (likely a racing fetch). NOT a conflict — will retry on next sweep." 2>/dev/null || true
   log "SUPPRESSED PUSH (wa-uthi non-terminal): origin/$DEFAULT_BRANCH unresolvable — gate-status:error (retriable)."
+  gate_marker_status_ensure "$MARKER_ID" "the main-ref-unresolvable guard"
   # ga-dmox: retriable per-marker state (comment above says so) must not exit 1.
   exit 0
 fi
@@ -5120,6 +5195,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
     bd -C "$GC_CITY" comment "$MARKER_ID" "Gate transient error: merge-tree conflict pre-check for $BRANCH vs $DEFAULT_BRANCH was undeterminable (merge-base=${MERGE_BASE_SHA:-none}). NOT necessarily a conflict — will retry on next sweep." 2>/dev/null || true
     log "SUPPRESSED PUSH (wa-uthi non-terminal): merge-tree undeterminable for $BRANCH — gate-status:error (retriable)."
+    gate_marker_status_ensure "$MARKER_ID" "the merge-tree-undeterminable guard"
     # ga-dmox: retriable per-marker state (comment above says so) must not exit 1.
     exit 0
   elif [ "$MT_VERDICT" = "1" ]; then
@@ -5473,6 +5549,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       REBASE_EVENT="dispatcher_circuit_break_ahead_dead"
       REBASE_VERDICT="CIRCUIT-BREAK (ahead=${REBASE_AHEAD:-?} > max=${GATE_REBASE_AHEAD_MAX}, dead author)"
       log "ga-acb circuit-break: $BRANCH ahead_dead — marker $MARKER_ID parked, bead $BEAD_ID needs-human."
+      gate_marker_status_ensure "$MARKER_ID" "the ahead_dead circuit-break"
       log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
       mkdir -p "$(dirname "$QG_LOG")"
       jq -c -n \
@@ -5526,6 +5603,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       REBASE_EVENT="dispatcher_circuit_break_behind_dead"
       REBASE_VERDICT="CIRCUIT-BREAK (behind=${REBASE_BEHIND:-?} > max=${GATE_REBASE_BEHIND_MAX}, dead author)"
       log "ga-6dp9 circuit-break: $BRANCH behind_dead — marker $MARKER_ID parked, bead $BEAD_ID needs-human."
+      gate_marker_status_ensure "$MARKER_ID" "the behind_dead circuit-break"
       log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
       mkdir -p "$(dirname "$QG_LOG")"
       jq -c -n \
@@ -5560,6 +5638,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
         --delivery wait-idle 2>/dev/null || warn "Could not nudge author $REBASE_AUTHOR for rebase"
       REBASE_EVENT="dispatcher_needs_rebase_behind_envelope"
       REBASE_VERDICT="NEEDS_REBASE (main delta > envelope, author live, bounced)"
+      gate_marker_status_ensure "$MARKER_ID" "the behind-envelope bounce"
       log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
       mkdir -p "$(dirname "$QG_LOG")"
       jq -c -n \
@@ -5825,6 +5904,7 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
       '{ts: $ts, event: $event, branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author, main_sha: $main_sha, conflicts: $conflicts}' \
       >> "$QG_LOG" 2>/dev/null || true
 
+    gate_marker_status_ensure "$MARKER_ID" "the auto-rebase decision (merge-conflict/transient-retry/circuit-break)"
     log "=== Dispatcher sweep complete: branch=$BRANCH verdict=$REBASE_VERDICT ==="
     exit 0
   fi
