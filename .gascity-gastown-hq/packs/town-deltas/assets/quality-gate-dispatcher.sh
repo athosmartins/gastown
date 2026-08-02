@@ -1778,13 +1778,43 @@ gate_labels_have_status() {
 # invisible. Logs loudly and mails the Mayor when it actually has to repair
 # something — the common case (a status IS present) returns immediately and
 # touches nothing.
+#
+# gate-fix-2 (reviewer FAIL on gate_run=ga-wisp-0yhttsl): NEVER returns
+# non-zero. Attempt 1 called this bare (no if/&&/||/!) at all 6 sites below,
+# under this script's own `set -euo pipefail` (line 30) — a real non-zero
+# return from the repair path aborted the ENTIRE dispatcher sweep right there,
+# skipping the intended `exit 0`, trading "one invisible marker" for "the
+# whole sweep dies mid-repair", in exactly the situation (a marker already
+# under repair) most likely to already be under human scrutiny. Outcome is
+# now signaled via stdout instead, mirroring gate_rebase_attempt_advanced()
+# above: "ok" (a status was already present, nothing touched), "repaired"
+# (status was genuinely missing, self-heal fired), or "unknown" (this
+# function's OWN verification read/parse failed — state undetermined, so it
+# does NOT guess: forcing gate-status:error here would risk stacking a
+# self-contradictory label onto a marker whose earlier write may have
+# actually succeeded, pointing any human investigation at the wrong root
+# cause). A caller MAY consume the signal via
+# `if [ "$(gate_marker_status_ensure ...)" = "repaired" ]`, exactly like the
+# sibling function, but does not have to — a bare call is safe by
+# construction now, so a future 7th call site can't reintroduce this bug by
+# forgetting a guard the way the first 6 did.
 gate_marker_status_ensure() {
   local marker_id="${1:-}" context="${2:-the rebase-fail path}"
   local raw labels
-  [ -z "$marker_id" ] && return 0
+  [ -z "$marker_id" ] && { printf 'ok'; return 0; }
   raw=$(bd -C "$GC_CITY" show "$marker_id" --json 2>/dev/null || echo "")
-  labels=$(printf '%s' "$raw" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
+  if [ -z "$raw" ]; then
+    warn "ga-kgtiw SELF-HEAL: could not read marker $marker_id after $context (bd show failed) — skipping repair, real label state unknown, not risking a contradictory status label."
+    printf 'unknown'
+    return 0
+  fi
+  if ! labels=$(printf '%s' "$raw" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null); then
+    warn "ga-kgtiw SELF-HEAL: could not parse marker $marker_id's labels after $context (jq failed on bd show output) — skipping repair, real label state unknown, not risking a contradictory status label."
+    printf 'unknown'
+    return 0
+  fi
   if [ "$(gate_labels_have_status "$labels")" = "1" ]; then
+    printf 'ok'
     return 0
   fi
   err "ga-kgtiw SELF-HEAL: marker $marker_id exited $context with NO gate-status label (an earlier label write silently failed) — it would otherwise be invisible to every dispatcher sweep forever. Forcing gate-status:error (safe, retriable)."
@@ -1794,7 +1824,8 @@ gate_marker_status_ensure() {
     -s "Gate ALERT: marker $marker_id lost its gate-status label (ga-kgtiw self-heal fired)" \
     -m "Marker $marker_id exited $context with no gate-status label — an earlier label write silently failed (transient Dolt hiccup or similar). The ga-kgtiw self-heal forced gate-status:error so the marker stays visible/retriable instead of vanishing forever. This should be RARE; if it keeps firing, the underlying write-reliability issue (not just this safety net) needs investigation." 2>/dev/null \
     || warn "Could not mail Mayor for ga-kgtiw status self-heal on $marker_id"
-  return 1
+  printf 'repaired'
+  return 0
 }
 
 # gate_should_exile_tier5 <next_attempt> <exile_after_n> — pure (no I/O).
@@ -5143,7 +5174,9 @@ if [ -z "$MAIN_HEAD_SHA" ]; then
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
   bd -C "$GC_CITY" comment "$MARKER_ID" "Gate transient error: origin/$DEFAULT_BRANCH did not resolve to a present commit object (likely a racing fetch). NOT a conflict — will retry on next sweep." 2>/dev/null || true
   log "SUPPRESSED PUSH (wa-uthi non-terminal): origin/$DEFAULT_BRANCH unresolvable — gate-status:error (retriable)."
-  gate_marker_status_ensure "$MARKER_ID" "the main-ref-unresolvable guard"
+  if [ "$(gate_marker_status_ensure "$MARKER_ID" "the main-ref-unresolvable guard")" = "repaired" ]; then
+    : # already logged, commented, and mailed inside gate_marker_status_ensure
+  fi
   # ga-dmox: retriable per-marker state (comment above says so) must not exit 1.
   exit 0
 fi
@@ -5195,7 +5228,9 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
     bd -C "$GC_CITY" comment "$MARKER_ID" "Gate transient error: merge-tree conflict pre-check for $BRANCH vs $DEFAULT_BRANCH was undeterminable (merge-base=${MERGE_BASE_SHA:-none}). NOT necessarily a conflict — will retry on next sweep." 2>/dev/null || true
     log "SUPPRESSED PUSH (wa-uthi non-terminal): merge-tree undeterminable for $BRANCH — gate-status:error (retriable)."
-    gate_marker_status_ensure "$MARKER_ID" "the merge-tree-undeterminable guard"
+    if [ "$(gate_marker_status_ensure "$MARKER_ID" "the merge-tree-undeterminable guard")" = "repaired" ]; then
+      : # already logged, commented, and mailed inside gate_marker_status_ensure
+    fi
     # ga-dmox: retriable per-marker state (comment above says so) must not exit 1.
     exit 0
   elif [ "$MT_VERDICT" = "1" ]; then
@@ -5549,7 +5584,9 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       REBASE_EVENT="dispatcher_circuit_break_ahead_dead"
       REBASE_VERDICT="CIRCUIT-BREAK (ahead=${REBASE_AHEAD:-?} > max=${GATE_REBASE_AHEAD_MAX}, dead author)"
       log "ga-acb circuit-break: $BRANCH ahead_dead — marker $MARKER_ID parked, bead $BEAD_ID needs-human."
-      gate_marker_status_ensure "$MARKER_ID" "the ahead_dead circuit-break"
+      if [ "$(gate_marker_status_ensure "$MARKER_ID" "the ahead_dead circuit-break")" = "repaired" ]; then
+        : # already logged, commented, and mailed inside gate_marker_status_ensure
+      fi
       log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
       mkdir -p "$(dirname "$QG_LOG")"
       jq -c -n \
@@ -5603,7 +5640,9 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       REBASE_EVENT="dispatcher_circuit_break_behind_dead"
       REBASE_VERDICT="CIRCUIT-BREAK (behind=${REBASE_BEHIND:-?} > max=${GATE_REBASE_BEHIND_MAX}, dead author)"
       log "ga-6dp9 circuit-break: $BRANCH behind_dead — marker $MARKER_ID parked, bead $BEAD_ID needs-human."
-      gate_marker_status_ensure "$MARKER_ID" "the behind_dead circuit-break"
+      if [ "$(gate_marker_status_ensure "$MARKER_ID" "the behind_dead circuit-break")" = "repaired" ]; then
+        : # already logged, commented, and mailed inside gate_marker_status_ensure
+      fi
       log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
       mkdir -p "$(dirname "$QG_LOG")"
       jq -c -n \
@@ -5638,7 +5677,9 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
         --delivery wait-idle 2>/dev/null || warn "Could not nudge author $REBASE_AUTHOR for rebase"
       REBASE_EVENT="dispatcher_needs_rebase_behind_envelope"
       REBASE_VERDICT="NEEDS_REBASE (main delta > envelope, author live, bounced)"
-      gate_marker_status_ensure "$MARKER_ID" "the behind-envelope bounce"
+      if [ "$(gate_marker_status_ensure "$MARKER_ID" "the behind-envelope bounce")" = "repaired" ]; then
+        : # already logged, commented, and mailed inside gate_marker_status_ensure
+      fi
       log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
       mkdir -p "$(dirname "$QG_LOG")"
       jq -c -n \
@@ -5904,7 +5945,9 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
       '{ts: $ts, event: $event, branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author, main_sha: $main_sha, conflicts: $conflicts}' \
       >> "$QG_LOG" 2>/dev/null || true
 
-    gate_marker_status_ensure "$MARKER_ID" "the auto-rebase decision (merge-conflict/transient-retry/circuit-break)"
+    if [ "$(gate_marker_status_ensure "$MARKER_ID" "the auto-rebase decision (merge-conflict/transient-retry/circuit-break)")" = "repaired" ]; then
+      : # already logged, commented, and mailed inside gate_marker_status_ensure
+    fi
     log "=== Dispatcher sweep complete: branch=$BRANCH verdict=$REBASE_VERDICT ==="
     exit 0
   fi

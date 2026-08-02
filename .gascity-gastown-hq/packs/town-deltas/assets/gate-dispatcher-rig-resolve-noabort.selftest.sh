@@ -199,16 +199,21 @@ assert_exit0_after \
 assert_exit0_after \
   'log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH not found on remote — gate-status:error."' \
   "no_branch legacy retriable fallback"
+# ga-kgtiw (gate-fix-2): windows widened from the 3/20 default — each of
+# these 3 sites now has an `if [ "$(gate_marker_status_ensure ...)" = ... ];
+# then ... fi` block between the anchor and its exit 0.
 assert_exit0_after \
   'log "SUPPRESSED PUSH (wa-uthi non-terminal): origin/$DEFAULT_BRANCH unresolvable — gate-status:error (retriable)."' \
-  "main-ref unresolvable (racing fetch)"
+  "main-ref unresolvable (racing fetch)" \
+  6
 assert_exit0_after \
   'log "SUPPRESSED PUSH (wa-uthi non-terminal): merge-tree undeterminable for $BRANCH — gate-status:error (retriable)."' \
-  "merge-tree conflict pre-check undeterminable"
+  "merge-tree conflict pre-check undeterminable" \
+  6
 assert_exit0_after \
   'REBASE_EVENT="dispatcher_circuit_break_ahead_dead"' \
   "ahead_dead circuit-break (ga-acb)" \
-  20
+  24
 
 # ── Test 8: MUTATION-TEST — this test must not be vacuous. Revert the Step 4
 #    fix in a scratch copy (exit 0 -> exit 1) and confirm assertion 1 goes RED

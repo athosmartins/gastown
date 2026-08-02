@@ -29,6 +29,30 @@
 #       net independent of fix (1), catching any marker that reaches this
 #       broken state through a path this dispatcher version didn't anticipate.
 #
+# GATE-FIX-2 (gate_run=ga-wisp-0yhttsl FAILED, attempt 1/3): reviewer found
+# gate_marker_status_ensure()'s repair path ended in `return 1`, called BARE
+# (no if/&&/||/!) at all 6 call sites under this script's own
+# `set -euo pipefail` — every time the self-heal actually fired, it aborted
+# the ENTIRE dispatcher sweep right there, trading "one invisible marker" for
+# "the whole sweep dies mid-repair". Also: the function's OWN verification
+# read failing (bd show) was treated identically to "labels genuinely empty",
+# risking a self-heal firing on an unverified marker and stacking a
+# self-contradictory gate-status label onto one that may already be correct.
+# Mayor's explicit guidance (not just the reviewer's): don't guard the 6 call
+# sites (a 7th added later would forget the guard, replanting the bug
+# identically) — make the FUNCTION always return 0 and signal via stdout
+# ("ok" / "repaired" / "unknown"), mirroring gate_rebase_attempt_advanced(),
+# so safety is a property of the function, not caller discipline. Also fixed:
+# a read/parse failure now returns "unknown" and does NOT repair anything
+# (previously conflated with "confirmed empty" via the same `|| echo ""`
+# fallback). Mayor's additional AC: this selftest must call the function
+# EXACTLY as the real call sites do — the OLD version of this file wrapped
+# every call in `&& _RC=0 || _RC=$?` specifically to survive its own
+# set -euo pipefail, a wrapper the 6 real call sites never carried; that
+# divergence is why the test suite passed while the production wiring was
+# broken. This version calls it the same way production does (stdout capture
+# consumed via `[ "$(...)" = "token" ]`).
+#
 # This harness SOURCES the dispatcher in lib-only mode (GATE_DISPATCHER_LIB_ONLY)
 # to unit-test gate_labels_have_status (pure) and gate_marker_status_ensure
 # (bd/gc-backed, driven by in-shell mocks — NO live Dolt/gc/launchd), then
@@ -113,27 +137,55 @@ gc() {
   return 0
 }
 
-# (a) empty marker_id → no-op, never touches bd/gc.
+# Calling convention below matches the 6 real call sites exactly (gate-fix-2
+# AC): stdout is consumed the same way production consumes it — via a
+# command-substitution capture of the token — never via a defensive &&/||
+# exit-code wrapper the production code doesn't also use. Safe under this
+# test's own `set -euo pipefail` purely because the function itself never
+# returns non-zero anymore — the same property the production call sites now
+# lean on.
+#
+# gate-fix-2 subtlety: `$(gate_marker_status_ensure ...)` forks a SUBSHELL in
+# bash, so any MOCK_* counter increment made by the mocked bd()/gc() during
+# that call is invisible once the subshell exits — the exact kind of
+# error/empty-conflation this whole bug is about, just one layer up in the
+# test harness itself. _capture_out below redirects stdout to a file INSTEAD
+# of substituting it, so the mocked call runs in THIS shell and counter
+# side effects survive; it still can't fail the script under set -e (the
+# `&&`/`||` pair is in the exempt list-position, same reasoning as production).
+_capture_out() {
+  local __tmp
+  __tmp=$(mktemp)
+  "$@" >"$__tmp" && CAPTURED_RC=0 || CAPTURED_RC=$?
+  CAPTURED=$(cat "$__tmp")
+  rm -f "$__tmp"
+}
+
+# (a) empty marker_id → no-op "ok", never touches bd/gc.
 MOCK_LABEL_ADD_COUNT=0; MOCK_COMMENT_COUNT=0; MOCK_MAIL_COUNT=0
-gate_marker_status_ensure '' 'test context' && _RC=0 || _RC=$?
-eq "(a) empty marker_id → return 0" "$_RC" "0"
+_capture_out gate_marker_status_ensure '' 'test context'
+eq "(a) empty marker_id → return 0" "$CAPTURED_RC" "0"
+eq "(a) empty marker_id → stdout 'ok'" "$CAPTURED" "ok"
 eq "(a) empty marker_id → bd label add never called" "$MOCK_LABEL_ADD_COUNT" "0"
 eq "(a) empty marker_id → gc mail send never called" "$MOCK_MAIL_COUNT" "0"
 
-# (b) marker already carries a gate-status → fast path, no repair, no mail.
+# (b) marker already carries a gate-status → fast path "ok", no repair, no mail.
 MOCK_SHOW_JSON='[{"id":"m1","labels":["gate-status:queued","source-bead:wa-x"]}]'
 MOCK_LABEL_ADD_COUNT=0; MOCK_COMMENT_COUNT=0; MOCK_MAIL_COUNT=0
-gate_marker_status_ensure 'm1' 'test context' && _RC=0 || _RC=$?
-eq "(b) status present → return 0 (healthy, no repair)" "$_RC" "0"
+_capture_out gate_marker_status_ensure 'm1' 'test context'
+eq "(b) status present → return 0" "$CAPTURED_RC" "0"
+eq "(b) status present → stdout 'ok' (healthy, no repair)" "$CAPTURED" "ok"
 eq "(b) status present → bd label add NOT called" "$MOCK_LABEL_ADD_COUNT" "0"
 eq "(b) status present → bd comment NOT called" "$MOCK_COMMENT_COUNT" "0"
 eq "(b) status present → gc mail send NOT called (no spam on the healthy path)" "$MOCK_MAIL_COUNT" "0"
 
-# (c) THE BUG: marker has labels but NO gate-status → self-heal fires.
+# (c) THE BUG: marker has labels but NO gate-status → self-heal fires, and
+# the function still returns 0 (gate-fix-2: never abort the sweep).
 MOCK_SHOW_JSON='[{"id":"m2","labels":["source-bead:wa-x","branch:crew/me/wa-x"]}]'
 MOCK_LABEL_ADD_COUNT=0; MOCK_COMMENT_COUNT=0; MOCK_MAIL_COUNT=0
-gate_marker_status_ensure 'm2' 'the transient-retry queue write' && _RC=0 || _RC=$?
-eq "(c) status missing → return 1 (repair happened, caller can tell)" "$_RC" "1"
+_capture_out gate_marker_status_ensure 'm2' 'the transient-retry queue write'
+eq "(c) status missing → return 0 even though it repaired (gate-fix-2)" "$CAPTURED_RC" "0"
+eq "(c) status missing → stdout 'repaired' (caller tells via stdout, not exit code)" "$CAPTURED" "repaired"
 eq "(c) status missing → bd label add called exactly once" "$MOCK_LABEL_ADD_COUNT" "1"
 case "$MOCK_LABEL_ADD_LAST" in
   *"m2"*"gate-status:error"*) ok "(c) repair wrote gate-status:error onto the right marker" ;;
@@ -146,17 +198,32 @@ case "$MOCK_MAIL_LAST" in
   *) bad "(c) expected mail to mayor naming m2, got: $MOCK_MAIL_LAST" ;;
 esac
 
+# (c2) gate-fix-2 regression guard, empirically reproducing the reviewer's own
+# repro shape: call the function completely BARE (no if/$()/&&) exactly like
+# all 6 real call sites used to, immediately followed by another statement.
+# Under set -euo pipefail, attempt-1's `return 1` on this exact path aborted
+# the whole script here — this line never running would mean the FAIL (the
+# script would die above without ever reaching the PASS/FAIL tally at the end).
+MOCK_LABEL_ADD_COUNT=0; MOCK_COMMENT_COUNT=0; MOCK_MAIL_COUNT=0
+gate_marker_status_ensure 'm2b' 'bare-call regression guard' >/dev/null
+ok "(c2) bare (unguarded) call on the repair path did NOT abort the script under set -euo pipefail"
+
 # (d) marker JSON returned as a bare object (not array) — same shape gate_bead_live_merge_block tolerates.
 MOCK_SHOW_JSON='{"id":"m3","labels":["gate-status:running"]}'
 MOCK_LABEL_ADD_COUNT=0; MOCK_MAIL_COUNT=0
-gate_marker_status_ensure 'm3' 'test context' && _RC=0 || _RC=$?
-eq "(d) bare-object show JSON, status present → return 0, no repair" "$_RC" "0"
+_capture_out gate_marker_status_ensure 'm3' 'test context'
+eq "(d) bare-object show JSON, status present → return 0" "$CAPTURED_RC" "0"
+eq "(d) bare-object show JSON, status present → stdout 'ok', no repair" "$CAPTURED" "ok"
 eq "(d) bare-object show JSON, status present → no label add" "$MOCK_LABEL_ADD_COUNT" "0"
 
-# (e) bd show fails entirely (transient) → labels read as empty → treated as
-# missing → self-heals rather than trusting an unreadable marker as "fine".
-# This is the deliberately conservative side of the fail path: an unverifiable
-# marker gets the same safe gate-status:error treatment as a proven-empty one.
+# (e) bd show fails entirely (transient) → gate-fix-2: this is now "unknown",
+# NOT treated as confirmed-empty. Blocking issue 2 from gate_run=ga-wisp-0yhttsl:
+# conflating this function's OWN read failure with "labels are genuinely
+# empty" could stack a self-contradictory gate-status:error onto a marker
+# whose earlier branch-specific write may have actually succeeded — and mail
+# the Mayor a misleading "lost its status" alert pointing at the wrong root
+# cause. An unverifiable marker must NOT be repaired; it stays untouched and
+# gets picked up again whenever a future read succeeds.
 MOCK_SHOW_JSON=''
 bd() {
   case " $* " in
@@ -168,9 +235,31 @@ bd() {
   return 0
 }
 MOCK_LABEL_ADD_COUNT=0; MOCK_COMMENT_COUNT=0; MOCK_MAIL_COUNT=0
-gate_marker_status_ensure 'm4' 'test context' && _RC=0 || _RC=$?
-eq "(e) bd show fails → return 1 (repaired defensively)" "$_RC" "1"
-eq "(e) bd show fails → still force-writes gate-status:error" "$MOCK_LABEL_ADD_COUNT" "1"
+_capture_out gate_marker_status_ensure 'm4' 'test context'
+eq "(e) bd show fails → return 0 (never aborts the sweep)" "$CAPTURED_RC" "0"
+eq "(e) bd show fails → stdout 'unknown' (state undetermined, not guessed)" "$CAPTURED" "unknown"
+eq "(e) bd show fails → does NOT force-write gate-status:error (blocking issue 2 fix)" "$MOCK_LABEL_ADD_COUNT" "0"
+eq "(e) bd show fails → does NOT comment on the marker" "$MOCK_COMMENT_COUNT" "0"
+eq "(e) bd show fails → does NOT mail the Mayor (no misleading alert)" "$MOCK_MAIL_COUNT" "0"
+
+# (f) bd show succeeds but returns unparseable JSON → same "unknown" treatment
+# as a read failure (blocking issue 2 applies equally to a parse failure).
+MOCK_SHOW_JSON='not valid json{{{'
+bd() {
+  case " $* " in
+    *" show "*) printf '%s\n' "$MOCK_SHOW_JSON" ;;
+    *" label add "*) MOCK_LABEL_ADD_COUNT=$((MOCK_LABEL_ADD_COUNT + 1)) ;;
+    *" comment "*) MOCK_COMMENT_COUNT=$((MOCK_COMMENT_COUNT + 1)) ;;
+    *) : ;;
+  esac
+  return 0
+}
+MOCK_LABEL_ADD_COUNT=0; MOCK_COMMENT_COUNT=0; MOCK_MAIL_COUNT=0
+_capture_out gate_marker_status_ensure 'm5' 'test context'
+eq "(f) unparseable show JSON → return 0 (never aborts the sweep)" "$CAPTURED_RC" "0"
+eq "(f) unparseable show JSON → stdout 'unknown'" "$CAPTURED" "unknown"
+eq "(f) unparseable show JSON → does NOT force-write gate-status:error" "$MOCK_LABEL_ADD_COUNT" "0"
+eq "(f) unparseable show JSON → does NOT mail the Mayor" "$MOCK_MAIL_COUNT" "0"
 
 # ── 3. gate_bead_active_sibling_branch — orphaned sibling now ALERTS, never silently vanishes ──
 echo "── 3. gate_bead_active_sibling_branch: no-status sibling logs to stderr, genuine sibling still found ──"
@@ -238,6 +327,32 @@ for context in \
   has "$DISPATCHER" "gate_marker_status_ensure \"\\\$MARKER_ID\" \"${context}\"" \
     "self-heal wired at: ${context}"
 done
+
+# ── 4b. gate-fix-2 regression guard: no call site may be bare, and the
+# function must never return non-zero on its repair path ─────────────────────
+echo "── 4b. gate-fix-2: call sites consume via if/\$(), function never return-1s ──"
+# NOTE (self-referential lesson): `grep -c` prints "0" but still EXITS 1 when
+# it legitimately finds zero matches — the exact expected outcome for both
+# checks below. A bare `VAR=$(grep -c ...)` assignment under this script's own
+# set -e would abort right here on the PASSING case, the same error/empty
+# conflation this whole bug is about, one layer up in the harness. `|| true`
+# on the grep, not on the assignment, so a real grep ERROR (exit 2) still
+# leaves CAPTURED empty and the eq below correctly reports FAIL, not a
+# silent pass.
+BARE_CALL_COUNT=$(grep -cE '^\s*gate_marker_status_ensure "\$MARKER_ID"' "$DISPATCHER" || true)
+eq "zero call sites invoke gate_marker_status_ensure as a bare statement" "$BARE_CALL_COUNT" "0"
+
+WRAPPED_CALL_COUNT=$(grep -cE 'if \[ "\$\(gate_marker_status_ensure "\$MARKER_ID"' "$DISPATCHER" || true)
+eq "all 6 call sites consume via if [ \"\$(gate_marker_status_ensure ...)\" = ... ]" "$WRAPPED_CALL_COUNT" "6"
+
+FN_BODY_START=$(grep -n '^gate_marker_status_ensure() {' "$DISPATCHER" | head -1 | cut -d: -f1)
+FN_BODY_END=$(awk -v start="$FN_BODY_START" 'NR>start && /^}/ {print NR; exit}' "$DISPATCHER")
+if [ -n "$FN_BODY_START" ] && [ -n "$FN_BODY_END" ]; then
+  RETURN1_COUNT=$(sed -n "${FN_BODY_START},${FN_BODY_END}p" "$DISPATCHER" | grep -cE 'return 1\b' || true)
+  eq "gate_marker_status_ensure body contains zero 'return 1' (always returns 0)" "$RETURN1_COUNT" "0"
+else
+  bad "could not locate gate_marker_status_ensure function body bounds (start=$FN_BODY_START end=$FN_BODY_END)"
+fi
 
 CUTOFF_LN=$(grep -n 'if \[ -n "\${GATE_DISPATCHER_LIB_ONLY:-}" \]; then' "$DISPATCHER" | head -1 | cut -d: -f1)
 for fn in gate_labels_have_status gate_marker_status_ensure; do
