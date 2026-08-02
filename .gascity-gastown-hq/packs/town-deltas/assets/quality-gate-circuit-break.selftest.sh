@@ -76,6 +76,31 @@ eq "ahead garbage, dead author → ok (fail-open)" \
   "$(gate_circuit_break_check "ahead_dead" "xx" "0" "0" "3" "10")" \
   "ok"
 
+# ── 2c. ga-agtqm: merge_clean (7th arg) bypass for ahead_dead ────────────────
+# wa-vcd01 (2026-08-02): 15 commits ahead, `git merge-tree --write-tree` proved
+# ZERO conflicts, dead author — yet the pre-fix ahead_dead circuit-broke it
+# anyway, because it never checked whether there was anything to actually
+# resolve. merge_clean="1" means the caller already ran that check.
+echo "── 2c. ga-agtqm: merge_clean=1 bypasses ahead_dead regardless of commit count ──"
+eq "ahead=68, dead author, merge_clean=1 → ok (wa-vcd01 shape: clean merge wins)" \
+  "$(gate_circuit_break_check "ahead_dead" "68" "0" "0" "3" "10" "1")" \
+  "ok"
+eq "ahead=15, dead author, merge_clean=1 → ok (the actual measured wa-vcd01 count)" \
+  "$(gate_circuit_break_check "ahead_dead" "15" "0" "0" "3" "10" "1")" \
+  "ok"
+eq "ahead=68, dead author, merge_clean=0 (explicit) → circuit-break (unchanged)" \
+  "$(gate_circuit_break_check "ahead_dead" "68" "0" "0" "3" "10" "0")" \
+  "circuit-break:ahead_dead"
+eq "ahead=68, dead author, merge_clean omitted (6-arg call) → circuit-break (backward compat)" \
+  "$(gate_circuit_break_check "ahead_dead" "68" "0" "0" "3" "10")" \
+  "circuit-break:ahead_dead"
+eq "ahead=68, dead author, merge_clean garbage → circuit-break (fail-safe: only literal 1 bypasses)" \
+  "$(gate_circuit_break_check "ahead_dead" "68" "0" "0" "3" "10" "yes")" \
+  "circuit-break:ahead_dead"
+eq "ahead=68, LIVE author, merge_clean=1 → ok (both reasons agree)" \
+  "$(gate_circuit_break_check "ahead_dead" "68" "1" "0" "3" "10" "1")" \
+  "ok"
+
 # ── 3. Condition: retry_dead ──────────────────────────────────────────────────
 # Circuit-break when attempts >= max AND author is dead.
 echo "── 3. retry_dead → circuit-break only when attempts >= max AND dead author ──"
@@ -94,6 +119,26 @@ eq "attempt=3, max=3, LIVE author → ok (live author: escalate, not circuit-bre
 eq "attempt=0, max=3, dead → ok (first attempt)" \
   "$(gate_circuit_break_check "retry_dead" "" "0" "0" "3" "10")" \
   "ok"
+
+# ── 3b. ga-agtqm: merge_clean (7th arg) bypass for retry_dead ────────────────
+# The bounded-retry path re-derives the identical "ahead>max, merge-tree
+# clean" verdict every sweep for a dead author (nothing about the branch
+# changes without human action), so retries exhaust and retry_dead would
+# otherwise circuit-break on the SAME underlying non-problem, just 3 sweeps
+# later than ahead_dead would have. merge_clean="1" must block that too.
+echo "── 3b. ga-agtqm: merge_clean=1 bypasses retry_dead regardless of attempt count ──"
+eq "attempt=3, max=3, dead, merge_clean=1 → ok (clean merge wins even at cap)" \
+  "$(gate_circuit_break_check "retry_dead" "" "0" "3" "3" "10" "1")" \
+  "ok"
+eq "attempt=4, max=3, dead, merge_clean=1 → ok (above cap, still exempt)" \
+  "$(gate_circuit_break_check "retry_dead" "" "0" "4" "3" "10" "1")" \
+  "ok"
+eq "attempt=3, max=3, dead, merge_clean=0 (explicit) → circuit-break (unchanged)" \
+  "$(gate_circuit_break_check "retry_dead" "" "0" "3" "3" "10" "0")" \
+  "circuit-break:retry_dead"
+eq "attempt=3, max=3, dead, merge_clean omitted (6-arg call) → circuit-break (backward compat)" \
+  "$(gate_circuit_break_check "retry_dead" "" "0" "3" "3" "10")" \
+  "circuit-break:retry_dead"
 
 # ── 4. GOOD marker (ahead=1, behind=1, live author) → never circuit-broken ───
 # This is the critical safety case: a healthy marker MUST NOT be circuit-broken.

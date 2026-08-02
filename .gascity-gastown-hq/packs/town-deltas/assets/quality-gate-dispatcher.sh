@@ -1384,10 +1384,24 @@ gate_scaled_reviewer_stale() {
 #   retry_dead  → rebase-attempt counter ≥ MAX AND author is dead/empty
 #                 (replaces the existing "escalate to needs-rebase" path)
 #
-# Arguments: <condition> <ahead_count_or_blank> <author_alive_0_1> <rebase_attempt> <rebase_attempt_max> <ahead_max>
+# Arguments: <condition> <ahead_count_or_blank> <author_alive_0_1> <rebase_attempt> <rebase_attempt_max> <ahead_max> <merge_clean_0_1>
 # Echoes: "circuit-break:<reason>" when the marker should be circuit-broken,
 #         "ok" otherwise. FAIL-OPEN: any unexpected input yields "ok".
 # Env: GATE_AUTO_CIRCUIT_BREAK (default 1; set to 0 to disable).
+#
+# ga-agtqm: <merge_clean_0_1> (7th arg, default "0" — old 6-arg callers keep the
+# PRE-existing, stricter behavior; nothing becomes silently more lenient just
+# by being recompiled). Pass "1" only when the caller already proved, via a
+# real `git merge-tree --write-tree`, that this branch merges into main with
+# ZERO conflicts. ahead_dead's own premise is "no live author to resolve a
+# rebase"; retry_dead's is "retries exhausted, will never self-heal" — both
+# are false by construction when there is nothing to resolve in the first
+# place. Measured case (wa-vcd01, 2026-08-02): 15 commits ahead, `git
+# merge-tree --write-tree origin/main origin/crew/peter/wa-vcd01` reported
+# ZERO conflicts, yet ahead_dead circuit-broke it anyway — commit count was
+# used as a proxy for "would conflict" and never actually checked. no_branch
+# is unaffected by this parameter: a branch absent from origin cannot be
+# merge-tree'd clean in the first place.
 gate_circuit_break_check() {
   local condition="${1:-}"         # "no_branch" | "ahead_dead" | "retry_dead"
   local ahead="${2:-}"             # commit-count or empty
@@ -1395,12 +1409,14 @@ gate_circuit_break_check() {
   local rebase_attempt="${4:-0}"   # current gate:exiled-tier5:N counter
   local rebase_max="${5:-3}"       # MAX_REBASE_ATTEMPTS
   local ahead_max="${6:-10}"       # GATE_REBASE_AHEAD_MAX
+  local merge_clean="${7:-0}"      # ga-agtqm: 1 = merge-tree already proved clean
 
   # Sanitise numeric inputs
   case "$author_alive"   in ''|*[!0-9]*) author_alive=0 ;; esac
   case "$rebase_attempt" in ''|*[!0-9]*) rebase_attempt=0 ;; esac
   case "$rebase_max"     in ''|*[!0-9]*|0) rebase_max=3 ;; esac
   case "$ahead_max"      in ''|*[!0-9]*|0) ahead_max=10 ;; esac
+  case "$merge_clean"    in 1) merge_clean=1 ;; *) merge_clean=0 ;; esac
 
   # Feature gate — default ON; set GATE_AUTO_CIRCUIT_BREAK=0 to disable
   if [ "${GATE_AUTO_CIRCUIT_BREAK:-1}" = "0" ]; then
@@ -1413,6 +1429,11 @@ gate_circuit_break_check() {
       printf 'circuit-break:no_branch'
       ;;
     ahead_dead)
+      # ga-agtqm: a proven-clean merge means there is nothing for anyone —
+      # alive or dead — to resolve. Never circuit-break on commit count alone.
+      if [ "$merge_clean" = "1" ]; then
+        printf 'ok'; return 0
+      fi
       # Branch is over the rebase envelope AND no live author to re-anchor.
       case "$ahead" in ''|*[!0-9]*) printf 'ok'; return 0 ;; esac
       if [ "$ahead" -gt "$ahead_max" ] && [ "$author_alive" = "0" ]; then
@@ -1422,6 +1443,13 @@ gate_circuit_break_check() {
       fi
       ;;
     retry_dead)
+      # ga-agtqm: same clean-merge exemption as ahead_dead — retries exhausted
+      # against a provably clean branch is not evidence of unmergeability,
+      # only of the size-caution loop this bead fixes never resolving on its
+      # own (it re-derives the identical "too wide" verdict every sweep).
+      if [ "$merge_clean" = "1" ]; then
+        printf 'ok'; return 0
+      fi
       # Rebase retries exhausted AND no live author — will never self-heal.
       if [ "$rebase_attempt" -ge "$rebase_max" ] && [ "$author_alive" = "0" ]; then
         printf 'circuit-break:retry_dead'
@@ -5355,18 +5383,52 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
   # script's `set -u`, even when HAS_CONFLICT was already 1 and the envelope
   # checks are skipped entirely.
   REBASE_BEHIND_EXCEEDED=0
+  # ga-agtqm: true iff the ahead-commit-count cap below is the SOLE reason
+  # this branch is out of envelope — i.e. the real merge-tree check that
+  # gates entry to this whole block (HAS_CONFLICT=0 test just below) already
+  # proved the branch merges CLEAN, and we are only distrusting it here for
+  # being textually-clean-but-large. Fed into gate_circuit_break_check()'s
+  # ahead_dead/retry_dead conditions downstream so a provably clean-merging
+  # branch is never circuit-broken purely because of its commit count.
+  # Reset to 0 if the behind-cap or clean-tree guard below ALSO fire —
+  # those are independent, already-correctly-severe conditions (ga-6dp9)
+  # this bead does not touch.
+  REBASE_AHEAD_CAP_ONLY=0
 
   if [ "$HAS_CONFLICT" = "0" ]; then
     REBASE_AHEAD=$(git_rig rev-list --count "origin/$DEFAULT_BRANCH..origin/$BRANCH" 2>/dev/null || echo "")
     REBASE_BEHIND=$(git_rig rev-list --count "origin/$BRANCH..origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
 
-    if [ -n "$REBASE_AHEAD" ] && [ "$REBASE_AHEAD" -gt "$GATE_REBASE_AHEAD_MAX" ]; then
+    # ga-agtqm: an explicit human/Mayor release decision — label
+    # gate:allow-large-divergence on the SOURCE BEAD — bypasses the ahead-cap
+    # below entirely, letting a provably-clean branch (HAS_CONFLICT=0 above)
+    # proceed straight to auto-rebase regardless of size. Re-read FRESH every
+    # sweep (never cached across sweeps, no persistent state file) so the
+    # decision survives every future scan: the bug this replaces had a human
+    # revert gate-status by hand, only for the NEXT sweep to re-derive the
+    # identical ahead>max condition and re-park it — nothing ever checked for
+    # a durable release signal, only a transient one that kept getting
+    # overwritten.
+    GATE_ALLOW_LARGE_DIVERGENCE=0
+    if [ -n "$BEAD_ID" ]; then
+      _ALD_LABELS=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null \
+        | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
+      case " $_ALD_LABELS " in
+        *" gate:allow-large-divergence "*) GATE_ALLOW_LARGE_DIVERGENCE=1 ;;
+      esac
+    fi
+
+    if [ -n "$REBASE_AHEAD" ] && [ "$REBASE_AHEAD" -gt "$GATE_REBASE_AHEAD_MAX" ] && [ "$GATE_ALLOW_LARGE_DIVERGENCE" != "1" ]; then
       REBASE_IN_ENVELOPE=0
+      REBASE_AHEAD_CAP_ONLY=1
       REBASE_SKIP_REASON="branch has $REBASE_AHEAD own commits not on main (> GATE_REBASE_AHEAD_MAX=${GATE_REBASE_AHEAD_MAX}) — large divergence risks logical conflicts"
+    elif [ -n "$REBASE_AHEAD" ] && [ "$REBASE_AHEAD" -gt "$GATE_REBASE_AHEAD_MAX" ]; then
+      log "  ga-agtqm: branch $BRANCH is $REBASE_AHEAD commits ahead (> $GATE_REBASE_AHEAD_MAX) but bead $BEAD_ID carries gate:allow-large-divergence — proceeding despite the envelope (explicit release)."
     fi
     if [ -n "$REBASE_BEHIND" ] && [ "$REBASE_BEHIND" -gt "$GATE_REBASE_BEHIND_MAX" ]; then
       REBASE_IN_ENVELOPE=0
       REBASE_BEHIND_EXCEEDED=1
+      REBASE_AHEAD_CAP_ONLY=0
       REBASE_SKIP_REASON="${REBASE_SKIP_REASON:+${REBASE_SKIP_REASON}; }main moved $REBASE_BEHIND commits ahead of branch base (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}) — large main delta compounds conflict risk"
     fi
 
@@ -5384,6 +5446,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       # in-progress markers count (rebase dirs / MERGE_HEAD / CHERRY_PICK_HEAD / index.lock).
       if [ -d "$_RIG_GIT_DIR/rebase-merge" ] || [ -d "$_RIG_GIT_DIR/rebase-apply" ] || [ -f "$_RIG_GIT_DIR/MERGE_HEAD" ] || [ -f "$_RIG_GIT_DIR/CHERRY_PICK_HEAD" ] || [ -f "$_RIG_GIT_DIR/index.lock" ]; then
         REBASE_IN_ENVELOPE=0
+        REBASE_AHEAD_CAP_ONLY=0
         _LOCK_FILES=""
         [ -d "$_RIG_GIT_DIR/rebase-merge"     ] && _LOCK_FILES="${_LOCK_FILES}rebase-merge "
         [ -d "$_RIG_GIT_DIR/rebase-apply"     ] && _LOCK_FILES="${_LOCK_FILES}rebase-apply "
@@ -5638,7 +5701,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # rebase envelope allows AND no live author to re-anchor a large divergence.
     # Checked BEFORE the retry/bounce branching so the marker never enters the
     # bounded-retry churn cycle on a provably un-mergeable branch.
-    _ACB_AHEAD=$(gate_circuit_break_check "ahead_dead" "${REBASE_AHEAD:-}" "$REBASE_AUTHOR_ALIVE" "$REBASE_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX")
+    _ACB_AHEAD=$(gate_circuit_break_check "ahead_dead" "${REBASE_AHEAD:-}" "$REBASE_AUTHOR_ALIVE" "$REBASE_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX" "$REBASE_AHEAD_CAP_ONLY")
     if [ "$_ACB_AHEAD" != "ok" ]; then
       err "  ga-acb: circuit-breaking marker $MARKER_ID (${_ACB_AHEAD}): ahead=${REBASE_AHEAD:-?} > GATE_REBASE_AHEAD_MAX=${GATE_REBASE_AHEAD_MAX} and author dead/empty."
       bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
@@ -5963,7 +6026,7 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
         # own reclaim path could re-ready it if the marker somehow regained claimed/
         # dispatching. Promote to gate:needs-human on the SOURCE BEAD so Pilot knows
         # not to re-dispatch, and park the marker permanently at gate-status:error.
-        _ACB_RETRY=$(gate_circuit_break_check "retry_dead" "" "$REBASE_AUTHOR_ALIVE" "$NEXT_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX")
+        _ACB_RETRY=$(gate_circuit_break_check "retry_dead" "" "$REBASE_AUTHOR_ALIVE" "$NEXT_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX" "$REBASE_AHEAD_CAP_ONLY")
         if [ "$_ACB_RETRY" != "ok" ]; then
           err "Branch $BRANCH: retries exhausted ($NEXT_ATTEMPT >= $MAX_REBASE_ATTEMPTS) + dead author — ga-acb circuit-break (${_ACB_RETRY})."
           bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
