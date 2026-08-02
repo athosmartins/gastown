@@ -1798,13 +1798,37 @@ gate_labels_have_status() {
 # sibling function, but does not have to — a bare call is safe by
 # construction now, so a future 7th call site can't reintroduce this bug by
 # forgetting a guard the way the first 6 did.
+#
+# gate-fix-3 (reviewer FAIL on gate_run=ga-wisp-ub0uybc): the "unknown" net
+# above had its own gap. It inferred a failed `bd show` from EMPTY stdout
+# (`raw=$(bd ... || echo "")`; `[ -z "$raw" ]`) — but the real `bd` binary
+# does not fail empty: `bd show <id-it-cannot-find> --json` exits 1 while
+# still printing a non-empty, syntactically valid JSON object to STDOUT
+# (`{"error": "...", "schema_version": 1}` — the human-readable message goes
+# to stderr only). So `raw` was non-empty, the "unknown" branch never fired,
+# jq's null-safe `.labels // []` turned the absent key into `[]`, and a
+# genuine READ FAILURE was indistinguishable from "confirmed empty labels" —
+# the exact [[error-and-empty-must-not-produce-the-same-value]] class this
+# function exists to close off, reopened one layer down in its own read.
+# Fix: check bd's ACTUAL exit status from the command substitution directly
+# (`if ! raw=$(bd ... 2>/dev/null); then ... unknown ...`) instead of
+# inferring it from stdout shape — same exemption from `set -e` as the jq
+# parse guard immediately below, since the assignment sits in `if` position.
+# The old selftest case for this path mocked the failure as a bare `return 1`
+# with NO stdout at all — a shape the real binary never produces — so the
+# suite was green while this path was live; the mock now matches bd's actual
+# on-error stdout.
 gate_marker_status_ensure() {
   local marker_id="${1:-}" context="${2:-the rebase-fail path}"
   local raw labels
   [ -z "$marker_id" ] && { printf 'ok'; return 0; }
-  raw=$(bd -C "$GC_CITY" show "$marker_id" --json 2>/dev/null || echo "")
+  if ! raw=$(bd -C "$GC_CITY" show "$marker_id" --json 2>/dev/null); then
+    warn "ga-kgtiw SELF-HEAL: could not read marker $marker_id after $context (bd show exited non-zero — bd's own not-found/error object still prints non-empty JSON to stdout, so stdout emptiness alone can't detect this) — skipping repair, real label state unknown, not risking a contradictory status label."
+    printf 'unknown'
+    return 0
+  fi
   if [ -z "$raw" ]; then
-    warn "ga-kgtiw SELF-HEAL: could not read marker $marker_id after $context (bd show failed) — skipping repair, real label state unknown, not risking a contradictory status label."
+    warn "ga-kgtiw SELF-HEAL: could not read marker $marker_id after $context (bd show returned empty output) — skipping repair, real label state unknown, not risking a contradictory status label."
     printf 'unknown'
     return 0
   fi

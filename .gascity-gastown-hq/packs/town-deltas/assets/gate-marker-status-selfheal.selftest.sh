@@ -53,6 +53,22 @@
 # broken. This version calls it the same way production does (stdout capture
 # consumed via `[ "$(...)" = "token" ]`).
 #
+# GATE-FIX-3 (gate_run=ga-wisp-ub0uybc FAILED, attempt 2/3): reviewer found the
+# "unknown" net itself had a gap — it inferred a failed `bd show` from EMPTY
+# stdout, but the real `bd` binary exits 1 while still printing a non-empty
+# JSON error object to stdout (`{"error": "...", "schema_version": 1}` — the
+# human-readable message goes to stderr only). So a genuine read failure
+# looked like a successful read of a marker with zero labels, and the
+# function force-wrote gate-status:error plus a misleading "lost its status"
+# Mayor alert onto a marker it never actually managed to read. Reviewer also
+# flagged that case (e) below mocked the failure as a bare `return 1` with NO
+# stdout — a shape the real binary never produces — so this very suite was
+# green while the false-alert path was live. Fix: check bd's actual exit
+# status from the command substitution directly instead of inferring it from
+# stdout emptiness. Case (e)'s mock now matches bd's real on-error stdout;
+# case (e2) covers the (unlikely but still handled) truly-empty-stdout shape
+# the emptiness check still guards.
+#
 # This harness SOURCES the dispatcher in lib-only mode (GATE_DISPATCHER_LIB_ONLY)
 # to unit-test gate_labels_have_status (pure) and gate_marker_status_ensure
 # (bd/gc-backed, driven by in-shell mocks — NO live Dolt/gc/launchd), then
@@ -216,18 +232,21 @@ eq "(d) bare-object show JSON, status present → return 0" "$CAPTURED_RC" "0"
 eq "(d) bare-object show JSON, status present → stdout 'ok', no repair" "$CAPTURED" "ok"
 eq "(d) bare-object show JSON, status present → no label add" "$MOCK_LABEL_ADD_COUNT" "0"
 
-# (e) bd show fails entirely (transient) → gate-fix-2: this is now "unknown",
-# NOT treated as confirmed-empty. Blocking issue 2 from gate_run=ga-wisp-0yhttsl:
-# conflating this function's OWN read failure with "labels are genuinely
-# empty" could stack a self-contradictory gate-status:error onto a marker
-# whose earlier branch-specific write may have actually succeeded — and mail
-# the Mayor a misleading "lost its status" alert pointing at the wrong root
-# cause. An unverifiable marker must NOT be repaired; it stays untouched and
-# gets picked up again whenever a future read succeeds.
-MOCK_SHOW_JSON=''
+# (e) bd show fails exactly as the REAL bd binary does it (gate-fix-3 repro,
+# gate_run=ga-wisp-ub0uybc): exits 1 but still writes a non-empty, valid JSON
+# error object to STDOUT (`{"error": ..., "schema_version": 1}` — the human-
+# readable message goes to stderr only). Must still be "unknown", NOT treated
+# as confirmed-empty. Blocking issue 2 from gate_run=ga-wisp-0yhttsl, reopened
+# by ga-wisp-ub0uybc via this exact non-empty-stdout shape: conflating this
+# function's OWN read failure with "labels are genuinely empty" could stack a
+# self-contradictory gate-status:error onto a marker whose earlier branch-
+# specific write may have actually succeeded — and mail the Mayor a
+# misleading "lost its status" alert pointing at the wrong root cause. An
+# unverifiable marker must NOT be repaired; it stays untouched and gets
+# picked up again whenever a future read succeeds.
 bd() {
   case " $* " in
-    *" show "*) return 1 ;;
+    *" show "*) printf '%s\n' '{"error": "no issues found matching the provided IDs", "schema_version": 1}'; return 1 ;;
     *" label add "*) MOCK_LABEL_ADD_COUNT=$((MOCK_LABEL_ADD_COUNT + 1)) ;;
     *" comment "*) MOCK_COMMENT_COUNT=$((MOCK_COMMENT_COUNT + 1)) ;;
     *) : ;;
@@ -236,11 +255,31 @@ bd() {
 }
 MOCK_LABEL_ADD_COUNT=0; MOCK_COMMENT_COUNT=0; MOCK_MAIL_COUNT=0
 _capture_out gate_marker_status_ensure 'm4' 'test context'
-eq "(e) bd show fails → return 0 (never aborts the sweep)" "$CAPTURED_RC" "0"
-eq "(e) bd show fails → stdout 'unknown' (state undetermined, not guessed)" "$CAPTURED" "unknown"
-eq "(e) bd show fails → does NOT force-write gate-status:error (blocking issue 2 fix)" "$MOCK_LABEL_ADD_COUNT" "0"
-eq "(e) bd show fails → does NOT comment on the marker" "$MOCK_COMMENT_COUNT" "0"
-eq "(e) bd show fails → does NOT mail the Mayor (no misleading alert)" "$MOCK_MAIL_COUNT" "0"
+eq "(e) bd show exits 1 with non-empty stdout → return 0 (never aborts the sweep)" "$CAPTURED_RC" "0"
+eq "(e) bd show exits 1 with non-empty stdout → stdout 'unknown', not misread as confirmed-empty (gate-fix-3)" "$CAPTURED" "unknown"
+eq "(e) bd show exits 1 with non-empty stdout → does NOT force-write gate-status:error" "$MOCK_LABEL_ADD_COUNT" "0"
+eq "(e) bd show exits 1 with non-empty stdout → does NOT comment on the marker" "$MOCK_COMMENT_COUNT" "0"
+eq "(e) bd show exits 1 with non-empty stdout → does NOT mail the Mayor (no misleading alert)" "$MOCK_MAIL_COUNT" "0"
+
+# (e2) degenerate case the belt-and-suspenders emptiness check still guards:
+# bd show exits 0 but stdout is truly empty. Distinct from (e), which tests
+# exit-status detection alone with realistic non-empty error stdout; this
+# confirms the `[ -z "$raw" ]` check after it still catches a genuinely empty
+# "successful" read instead of letting it fall through to jq.
+bd() {
+  case " $* " in
+    *" show "*) printf '' ;;
+    *" label add "*) MOCK_LABEL_ADD_COUNT=$((MOCK_LABEL_ADD_COUNT + 1)) ;;
+    *" comment "*) MOCK_COMMENT_COUNT=$((MOCK_COMMENT_COUNT + 1)) ;;
+    *) : ;;
+  esac
+  return 0
+}
+MOCK_LABEL_ADD_COUNT=0; MOCK_COMMENT_COUNT=0; MOCK_MAIL_COUNT=0
+_capture_out gate_marker_status_ensure 'm4b' 'test context'
+eq "(e2) bd show exits 0 with truly empty stdout → return 0" "$CAPTURED_RC" "0"
+eq "(e2) bd show exits 0 with truly empty stdout → stdout 'unknown'" "$CAPTURED" "unknown"
+eq "(e2) bd show exits 0 with truly empty stdout → does NOT force-write gate-status:error" "$MOCK_LABEL_ADD_COUNT" "0"
 
 # (f) bd show succeeds but returns unparseable JSON → same "unknown" treatment
 # as a read failure (blocking issue 2 applies equally to a parse failure).
