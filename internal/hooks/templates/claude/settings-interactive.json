@@ -13,38 +13,42 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash(gh pr create*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard pr-workflow"
+            "command": "{{GT_BIN}} tap guard pr-workflow",
+            "if": "Bash(gh pr create*)"
           }
         ]
       },
       {
-        "matcher": "Bash(git checkout -b*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard pr-workflow"
+            "command": "{{GT_BIN}} tap guard pr-workflow",
+            "if": "Bash(git checkout -b*)"
           }
         ]
       },
       {
-        "matcher": "Bash(git switch -c*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard pr-workflow"
+            "command": "{{GT_BIN}} tap guard pr-workflow",
+            "if": "Bash(git switch -c*)"
           }
         ]
       },
       {
-        "matcher": "Bash(git*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard cross-clone-block"
+            "command": "{{GT_BIN}} tap guard cross-clone-block",
+            "if": "Bash(git*)"
           }
         ]
       }

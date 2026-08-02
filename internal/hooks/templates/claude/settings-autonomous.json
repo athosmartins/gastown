@@ -15,101 +15,112 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash(gh pr create*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard pr-workflow"
+            "command": "{{GT_BIN}} tap guard pr-workflow",
+            "if": "Bash(gh pr create*)"
           }
         ]
       },
       {
-        "matcher": "Bash(git checkout -b*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard pr-workflow"
+            "command": "{{GT_BIN}} tap guard pr-workflow",
+            "if": "Bash(git checkout -b*)"
           }
         ]
       },
       {
-        "matcher": "Bash(git switch -c*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard pr-workflow"
+            "command": "{{GT_BIN}} tap guard pr-workflow",
+            "if": "Bash(git switch -c*)"
           }
         ]
       },
       {
-        "matcher": "Bash(git*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard cross-clone-block"
+            "command": "{{GT_BIN}} tap guard cross-clone-block",
+            "if": "Bash(git*)"
           }
         ]
       },
       {
-        "matcher": "Bash(sudo *)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard dangerous-command"
+            "command": "{{GT_BIN}} tap guard dangerous-command",
+            "if": "Bash(sudo *)"
           }
         ]
       },
       {
-        "matcher": "Bash(apt install*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard dangerous-command"
+            "command": "{{GT_BIN}} tap guard dangerous-command",
+            "if": "Bash(apt install*)"
           }
         ]
       },
       {
-        "matcher": "Bash(apt-get install*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard dangerous-command"
+            "command": "{{GT_BIN}} tap guard dangerous-command",
+            "if": "Bash(apt-get install*)"
           }
         ]
       },
       {
-        "matcher": "Bash(dnf install*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard dangerous-command"
+            "command": "{{GT_BIN}} tap guard dangerous-command",
+            "if": "Bash(dnf install*)"
           }
         ]
       },
       {
-        "matcher": "Bash(yum install*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard dangerous-command"
+            "command": "{{GT_BIN}} tap guard dangerous-command",
+            "if": "Bash(yum install*)"
           }
         ]
       },
       {
-        "matcher": "Bash(pacman -S*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard dangerous-command"
+            "command": "{{GT_BIN}} tap guard dangerous-command",
+            "if": "Bash(pacman -S*)"
           }
         ]
       },
       {
-        "matcher": "Bash(brew install*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard dangerous-command"
+            "command": "{{GT_BIN}} tap guard dangerous-command",
+            "if": "Bash(brew install*)"
           }
         ]
       }
