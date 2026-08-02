@@ -1753,6 +1753,31 @@ gate_labels_have_status() {
   fi
 }
 
+# gate_marker_label_snapshot <marker_id> — read a marker's current labels
+# live. Prints the space-joined label string (possibly empty) and returns 0 on
+# a successful read; returns 1 (prints nothing) if the read itself could not
+# be trusted — `bd show` exited non-zero, produced truly empty stdout, or its
+# JSON could not be parsed. Callers MUST branch on the exit status directly
+# (`if labels=$(gate_marker_label_snapshot ...); then ...`), never infer
+# failure from stdout shape — that inference is exactly the gap gate-fix-3
+# closed below (bd's own not-found/error object still prints non-empty JSON
+# to stdout, so stdout emptiness alone can't detect a failed read). Factored
+# out of gate_marker_status_ensure (gate-fix-4) so its pre-write read and its
+# post-write verification read share one implementation and can never drift
+# into two different error-detection rules.
+gate_marker_label_snapshot() {
+  local marker_id="${1:-}" raw labels
+  if ! raw=$(bd -C "$GC_CITY" show "$marker_id" --json 2>/dev/null); then
+    return 1
+  fi
+  [ -z "$raw" ] && return 1
+  if ! labels=$(printf '%s' "$raw" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null); then
+    return 1
+  fi
+  printf '%s' "$labels"
+  return 0
+}
+
 # gate_marker_status_ensure <marker_id> <context> — bd-backed self-heal.
 # ga-kgtiw: every exit point in the rebase-fail path (Step 4c below) removes
 # gate-status:dispatching up front, then — depending which branch it takes —
@@ -1775,9 +1800,8 @@ gate_labels_have_status() {
 # marker's labels live and, if truly empty, force-writes gate-status:error (a
 # safe, already-retriable terminal state every other part of this system
 # already knows how to handle) so the marker can never exit this script
-# invisible. Logs loudly and mails the Mayor when it actually has to repair
-# something — the common case (a status IS present) returns immediately and
-# touches nothing.
+# invisible. Signals outcome via stdout (see gate-fix-2/3/4 below) — the
+# common case (a status IS present) returns immediately and touches nothing.
 #
 # gate-fix-2 (reviewer FAIL on gate_run=ga-wisp-0yhttsl): NEVER returns
 # non-zero. Attempt 1 called this bare (no if/&&/||/!) at all 6 sites below,
@@ -1788,12 +1812,10 @@ gate_labels_have_status() {
 # under repair) most likely to already be under human scrutiny. Outcome is
 # now signaled via stdout instead, mirroring gate_rebase_attempt_advanced()
 # above: "ok" (a status was already present, nothing touched), "repaired"
-# (status was genuinely missing, self-heal fired), or "unknown" (this
-# function's OWN verification read/parse failed — state undetermined, so it
-# does NOT guess: forcing gate-status:error here would risk stacking a
-# self-contradictory label onto a marker whose earlier write may have
-# actually succeeded, pointing any human investigation at the wrong root
-# cause). A caller MAY consume the signal via
+# (status was genuinely missing, self-heal fired and VERIFIED — see gate-fix-4
+# below), or "unknown" (state undetermined — this function does NOT guess: an
+# unverified state must never be reported as a verified one, in either
+# direction). A caller MAY consume the signal via
 # `if [ "$(gate_marker_status_ensure ...)" = "repaired" ]`, exactly like the
 # sibling function, but does not have to — a bare call is safe by
 # construction now, so a future 7th call site can't reintroduce this bug by
@@ -1811,29 +1833,53 @@ gate_labels_have_status() {
 # the exact [[error-and-empty-must-not-produce-the-same-value]] class this
 # function exists to close off, reopened one layer down in its own read.
 # Fix: check bd's ACTUAL exit status from the command substitution directly
-# (`if ! raw=$(bd ... 2>/dev/null); then ... unknown ...`) instead of
-# inferring it from stdout shape — same exemption from `set -e` as the jq
-# parse guard immediately below, since the assignment sits in `if` position.
-# The old selftest case for this path mocked the failure as a bare `return 1`
-# with NO stdout at all — a shape the real binary never produces — so the
-# suite was green while this path was live; the mock now matches bd's actual
-# on-error stdout.
+# instead of inferring it from stdout shape (now lives in
+# gate_marker_label_snapshot above, gate-fix-4 factored it out).
+#
+# gate-fix-4 (reviewer FAIL on gate_run=ga-wisp-twg3gh8, attempt 3/3, plus the
+# Mayor's 2026-08-02 15:29 follow-up correcting the Mayor's OWN prior
+# guidance): two independent blocking issues.
+#
+# Blocking issue 1 (primary): gate-fix-2's "signal via stdout, mirroring
+# gate_rebase_attempt_advanced()" guidance was INCOMPLETE — it never stated
+# the precondition that makes the precedent safe. gate_rebase_attempt_advanced
+# has ZERO log/warn/err calls in its body; it is mute by construction. This
+# function's warn()/err() calls used this script's own log()/warn()/err()
+# helpers (defined below), which are plain `echo` — NOT `>&2` — so they wrote
+# straight into the SAME stdout stream all 6 call sites capture via `$(...)`.
+# On every path that mattered (the old "unknown" branches, the "repaired"
+# self-heal branch) the captured value came out polluted, e.g. "[timestamp]
+# ... ERROR: ga-kgtiw SELF-HEAL: ...\nrepaired" instead of the bare token
+# "repaired" — so `= "repaired"` was FALSE even when a repair genuinely fired.
+# Fix: this function is now MUTE — no log/warn/err calls anywhere in its body,
+# and every `bd`/`gc` call's own stdout is explicitly redirected to /dev/null
+# too (defense in depth against either binary someday printing a success
+# message on stdout despite a quiet flag). Per the Mayor's explicit direction,
+# the CALLER now logs after reading the returned signal — see the 6 call
+# sites below, which warn() on "repaired" (mirroring how
+# gate_rebase_attempt_advanced's own callers warn() on "stuck").
+#
+# Blocking issue 2 (secondary): the repair branch's `bd label add ... ||
+# true` — the write that performs the actual fix — was never verified; a
+# silent write failure left the marker exactly as broken as before while this
+# function still printed 'repaired' and mailed the Mayor a false "fixed it".
+# Same shape as ga-6dp9 (gate_rebase_attempt_advanced above), applied one
+# layer down: FALSIFY THE WRITE. 'repaired' is now printed ONLY when a
+# post-write re-read (via gate_marker_label_snapshot, the same helper used for
+# the initial read — so both can never drift into different error-detection
+# rules) CONFIRMS the label landed. A re-read that fails, OR one that
+# succeeds but still shows no gate-status label, both fall back to 'unknown'
+# — the Mayor's contract names exactly THREE tokens (ok/repaired/unknown), so
+# an unconfirmed repair does not get a token of its own; it still mails the
+# Mayor, now with honest "could not confirm" wording instead of a false
+# "fixed it" (mail is a separate path from bd, so it remains the
+# human-in-the-loop fallback either way).
 gate_marker_status_ensure() {
   local marker_id="${1:-}" context="${2:-the rebase-fail path}"
-  local raw labels
+  local labels
   [ -z "$marker_id" ] && { printf 'ok'; return 0; }
-  if ! raw=$(bd -C "$GC_CITY" show "$marker_id" --json 2>/dev/null); then
-    warn "ga-kgtiw SELF-HEAL: could not read marker $marker_id after $context (bd show exited non-zero — bd's own not-found/error object still prints non-empty JSON to stdout, so stdout emptiness alone can't detect this) — skipping repair, real label state unknown, not risking a contradictory status label."
-    printf 'unknown'
-    return 0
-  fi
-  if [ -z "$raw" ]; then
-    warn "ga-kgtiw SELF-HEAL: could not read marker $marker_id after $context (bd show returned empty output) — skipping repair, real label state unknown, not risking a contradictory status label."
-    printf 'unknown'
-    return 0
-  fi
-  if ! labels=$(printf '%s' "$raw" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null); then
-    warn "ga-kgtiw SELF-HEAL: could not parse marker $marker_id's labels after $context (jq failed on bd show output) — skipping repair, real label state unknown, not risking a contradictory status label."
+
+  if ! labels=$(gate_marker_label_snapshot "$marker_id"); then
     printf 'unknown'
     return 0
   fi
@@ -1841,14 +1887,26 @@ gate_marker_status_ensure() {
     printf 'ok'
     return 0
   fi
-  err "ga-kgtiw SELF-HEAL: marker $marker_id exited $context with NO gate-status label (an earlier label write silently failed) — it would otherwise be invisible to every dispatcher sweep forever. Forcing gate-status:error (safe, retriable)."
-  bd -C "$GC_CITY" label add "$marker_id" "gate-status:error" -q 2>/dev/null || true
-  bd -C "$GC_CITY" comment "$marker_id" "ga-kgtiw AUTO-REPAIR: this marker left $context with no gate-status label — a prior label write silently failed. The dispatcher's own safety net (ga-kgtiw) detected the gap and forced gate-status:error so this marker is never permanently invisible; it will be retried like any other error marker." 2>/dev/null || true
+
+  # Confirmed empty — attempt repair, then FALSIFY THE WRITE (gate-fix-4)
+  # instead of trusting `|| true`: only a verified post-write read may claim
+  # 'repaired'.
+  bd -C "$GC_CITY" label add "$marker_id" "gate-status:error" -q >/dev/null 2>&1 || true
+
+  if labels=$(gate_marker_label_snapshot "$marker_id") && [ "$(gate_labels_have_status "$labels")" = "1" ]; then
+    bd -C "$GC_CITY" comment "$marker_id" "ga-kgtiw AUTO-REPAIR: this marker left $context with no gate-status label — a prior label write silently failed. The dispatcher's own safety net (ga-kgtiw) detected the gap, forced gate-status:error, and VERIFIED by re-read that the write landed — this marker is never permanently invisible; it will be retried like any other error marker." >/dev/null 2>&1 || true
+    gc --city "$GC_CITY" mail send mayor \
+      -s "Gate ALERT: marker $marker_id lost its gate-status label (ga-kgtiw self-heal fired)" \
+      -m "Marker $marker_id exited $context with no gate-status label — an earlier label write silently failed (transient Dolt hiccup or similar). The ga-kgtiw self-heal forced gate-status:error and VERIFIED by re-read that the write landed, so the marker stays visible/retriable instead of vanishing forever. This should be RARE; if it keeps firing, the underlying write-reliability issue (not just this safety net) needs investigation." >/dev/null 2>&1 || true
+    printf 'repaired'
+    return 0
+  fi
+
+  bd -C "$GC_CITY" comment "$marker_id" "ga-kgtiw AUTO-REPAIR UNCONFIRMED: this marker left $context with no gate-status label. The dispatcher's self-heal (ga-kgtiw) attempted to force gate-status:error but could NOT verify by re-read that the write took effect — it may still have no gate-status label. Needs manual check/repair; do not assume this marker is safely retriable yet." >/dev/null 2>&1 || true
   gc --city "$GC_CITY" mail send mayor \
-    -s "Gate ALERT: marker $marker_id lost its gate-status label (ga-kgtiw self-heal fired)" \
-    -m "Marker $marker_id exited $context with no gate-status label — an earlier label write silently failed (transient Dolt hiccup or similar). The ga-kgtiw self-heal forced gate-status:error so the marker stays visible/retriable instead of vanishing forever. This should be RARE; if it keeps firing, the underlying write-reliability issue (not just this safety net) needs investigation." 2>/dev/null \
-    || warn "Could not mail Mayor for ga-kgtiw status self-heal on $marker_id"
-  printf 'repaired'
+    -s "Gate ALERT: self-heal could NOT confirm repair of marker $marker_id (ga-kgtiw)" \
+    -m "Marker $marker_id exited $context with no gate-status label. The ga-kgtiw self-heal attempted to force gate-status:error but could NOT verify (by re-read) that the write took effect — it may still be invisible to every dispatcher sweep. Needs manual bd label add / investigation; do not assume this is already fixed." >/dev/null 2>&1 || true
+  printf 'unknown'
   return 0
 }
 
@@ -5199,7 +5257,7 @@ if [ -z "$MAIN_HEAD_SHA" ]; then
   bd -C "$GC_CITY" comment "$MARKER_ID" "Gate transient error: origin/$DEFAULT_BRANCH did not resolve to a present commit object (likely a racing fetch). NOT a conflict — will retry on next sweep." 2>/dev/null || true
   log "SUPPRESSED PUSH (wa-uthi non-terminal): origin/$DEFAULT_BRANCH unresolvable — gate-status:error (retriable)."
   if [ "$(gate_marker_status_ensure "$MARKER_ID" "the main-ref-unresolvable guard")" = "repaired" ]; then
-    : # already logged, commented, and mailed inside gate_marker_status_ensure
+    warn "ga-kgtiw SELF-HEAL: marker $MARKER_ID had no gate-status label after the main-ref-unresolvable guard — self-heal force-wrote and verified gate-status:error (see marker comment + Mayor mail for detail)."
   fi
   # ga-dmox: retriable per-marker state (comment above says so) must not exit 1.
   exit 0
@@ -5253,7 +5311,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     bd -C "$GC_CITY" comment "$MARKER_ID" "Gate transient error: merge-tree conflict pre-check for $BRANCH vs $DEFAULT_BRANCH was undeterminable (merge-base=${MERGE_BASE_SHA:-none}). NOT necessarily a conflict — will retry on next sweep." 2>/dev/null || true
     log "SUPPRESSED PUSH (wa-uthi non-terminal): merge-tree undeterminable for $BRANCH — gate-status:error (retriable)."
     if [ "$(gate_marker_status_ensure "$MARKER_ID" "the merge-tree-undeterminable guard")" = "repaired" ]; then
-      : # already logged, commented, and mailed inside gate_marker_status_ensure
+      warn "ga-kgtiw SELF-HEAL: marker $MARKER_ID had no gate-status label after the merge-tree-undeterminable guard — self-heal force-wrote and verified gate-status:error (see marker comment + Mayor mail for detail)."
     fi
     # ga-dmox: retriable per-marker state (comment above says so) must not exit 1.
     exit 0
@@ -5609,7 +5667,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       REBASE_VERDICT="CIRCUIT-BREAK (ahead=${REBASE_AHEAD:-?} > max=${GATE_REBASE_AHEAD_MAX}, dead author)"
       log "ga-acb circuit-break: $BRANCH ahead_dead — marker $MARKER_ID parked, bead $BEAD_ID needs-human."
       if [ "$(gate_marker_status_ensure "$MARKER_ID" "the ahead_dead circuit-break")" = "repaired" ]; then
-        : # already logged, commented, and mailed inside gate_marker_status_ensure
+        warn "ga-kgtiw SELF-HEAL: marker $MARKER_ID had no gate-status label after the ahead_dead circuit-break — self-heal force-wrote and verified gate-status:error (see marker comment + Mayor mail for detail)."
       fi
       log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
       mkdir -p "$(dirname "$QG_LOG")"
@@ -5665,7 +5723,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       REBASE_VERDICT="CIRCUIT-BREAK (behind=${REBASE_BEHIND:-?} > max=${GATE_REBASE_BEHIND_MAX}, dead author)"
       log "ga-6dp9 circuit-break: $BRANCH behind_dead — marker $MARKER_ID parked, bead $BEAD_ID needs-human."
       if [ "$(gate_marker_status_ensure "$MARKER_ID" "the behind_dead circuit-break")" = "repaired" ]; then
-        : # already logged, commented, and mailed inside gate_marker_status_ensure
+        warn "ga-kgtiw SELF-HEAL: marker $MARKER_ID had no gate-status label after the behind_dead circuit-break — self-heal force-wrote and verified gate-status:error (see marker comment + Mayor mail for detail)."
       fi
       log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
       mkdir -p "$(dirname "$QG_LOG")"
@@ -5702,7 +5760,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       REBASE_EVENT="dispatcher_needs_rebase_behind_envelope"
       REBASE_VERDICT="NEEDS_REBASE (main delta > envelope, author live, bounced)"
       if [ "$(gate_marker_status_ensure "$MARKER_ID" "the behind-envelope bounce")" = "repaired" ]; then
-        : # already logged, commented, and mailed inside gate_marker_status_ensure
+        warn "ga-kgtiw SELF-HEAL: marker $MARKER_ID had no gate-status label after the behind-envelope bounce — self-heal force-wrote and verified gate-status:error (see marker comment + Mayor mail for detail)."
       fi
       log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
       mkdir -p "$(dirname "$QG_LOG")"
@@ -5970,7 +6028,7 @@ Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, re
       >> "$QG_LOG" 2>/dev/null || true
 
     if [ "$(gate_marker_status_ensure "$MARKER_ID" "the auto-rebase decision (merge-conflict/transient-retry/circuit-break)")" = "repaired" ]; then
-      : # already logged, commented, and mailed inside gate_marker_status_ensure
+      warn "ga-kgtiw SELF-HEAL: marker $MARKER_ID had no gate-status label after the auto-rebase decision — self-heal force-wrote and verified gate-status:error (see marker comment + Mayor mail for detail)."
     fi
     log "=== Dispatcher sweep complete: branch=$BRANCH verdict=$REBASE_VERDICT ==="
     exit 0

@@ -69,6 +69,40 @@
 # case (e2) covers the (unlikely but still handled) truly-empty-stdout shape
 # the emptiness check still guards.
 #
+# GATE-FIX-4 (gate_run=ga-wisp-twg3gh8 FAILED, attempt 3/3, plus the Mayor's
+# 2026-08-02 15:29 follow-up correcting the Mayor's own prior guidance): two
+# independent blocking issues.
+#   (1) gate_marker_status_ensure's warn()/err() calls used this script's own
+#       log()/warn()/err() helpers, which write to STDOUT via plain `echo` —
+#       not `>&2`. Every call site captures this function's output via
+#       `$(...)`, so those calls polluted the captured token (e.g. "[ts] ...
+#       ERROR: ga-kgtiw SELF-HEAL: ...\nrepaired" instead of the bare string
+#       "repaired") — `= "repaired"` came out FALSE even when a repair
+#       genuinely fired. THIS SUITE STAYED GREEN (57/57) THROUGH THAT BUG
+#       because it stubbed log/warn/err to pure no-ops (see the comment right
+#       above their definitions below, and the git history of this file) —
+#       the mock was silent, so it could never demonstrate the pollution the
+#       real helpers caused. Fixed by making the function MUTE (zero
+#       log/warn/err calls in its body; the caller logs after reading the
+#       signal, at the 6 real call sites) — and by this suite's log/warn/err
+#       mocks now emitting a distinctive, unmistakable, non-empty marker
+#       instead of true silence, so a regression would visibly corrupt the
+#       captured token and fail the existing EXACT-match `eq()` assertions
+#       below (a `contains`-style check would NOT have caught the original
+#       bug: "repaired" is still a substring of the polluted value).
+#   (2) the repair branch's `bd label add ... || true` — the write that
+#       performs the actual fix — was never verified; a silently-failed write
+#       left the function still printing 'repaired' and mailing the Mayor a
+#       false "fixed it". Fixed by falsifying the write: a NEW post-write
+#       re-read (factored into gate_marker_label_snapshot, shared with the
+#       pre-write read so the two can never drift into different
+#       error-detection rules) must CONFIRM the label landed before 'repaired'
+#       is printed. Cases (c3)/(c4) below cover the write silently not taking
+#       effect, and the post-write verification read itself failing — both
+#       fall back to 'unknown' per the Mayor's 3-token contract
+#       (ok/repaired/unknown), still mailing the Mayor but with honest
+#       "could not confirm" wording rather than a false "fixed it".
+#
 # This harness SOURCES the dispatcher in lib-only mode (GATE_DISPATCHER_LIB_ONLY)
 # to unit-test gate_labels_have_status (pure) and gate_marker_status_ensure
 # (bd/gc-backed, driven by in-shell mocks — NO live Dolt/gc/launchd), then
@@ -91,16 +125,28 @@ has() { if grep -qE "$2" "$1"; then ok "$3"; else bad "$3 — pattern not found:
 GATE_DISPATCHER_LIB_ONLY=1 source "$DISPATCHER" \
   || { echo "FATAL: could not source dispatcher in lib-only mode"; exit 1; }
 
-for fn in gate_labels_have_status gate_marker_status_ensure gate_bead_active_sibling_branch; do
+for fn in gate_labels_have_status gate_marker_label_snapshot gate_marker_status_ensure gate_bead_active_sibling_branch; do
   type "$fn" >/dev/null 2>&1 \
     || { echo "FATAL: $fn not defined by dispatcher (ga-kgtiw fix missing?)"; exit 1; }
 done
 
-# Quiet logging noise from sourced helpers (matches every other selftest in
-# this suite) — assertions below use the mock call counters, not log text.
-log()  { :; }
-warn() { :; }
-err()  { :; }
+# gate-fix-4: log/warn/err are DELIBERATELY NOT stubbed to pure no-ops here.
+# The gate-fix-2/3 version of this suite did exactly that ("Quiet logging
+# noise... assertions below use the mock call counters, not log text") — and
+# that silence is precisely why 57/57 assertions stayed green while
+# gate_marker_status_ensure's real warn()/err() calls (this script's own
+# helpers, plain `echo` to STDOUT, not `>&2`) were actively corrupting its
+# captured return value in production (gate_run=ga-wisp-twg3gh8). These mocks
+# instead emit a distinctive, unmistakable marker on every call: if
+# gate_marker_status_ensure (or any future edit to it) ever calls one of
+# these again, the marker glues itself onto the captured token and every
+# EXACT-match `eq()` assertion below goes red. A `contains`-style check
+# (`case "$CAPTURED" in *repaired*)`) would NOT have caught this — "repaired"
+# is still a substring of "LOGCALL:err:...\nrepaired" — which is exactly the
+# distinction the Mayor's gate-fix-4 AC called out.
+log()  { printf 'LOGCALL:log:%s\n' "$*"; }
+warn() { printf 'LOGCALL:warn:%s\n' "$*"; }
+err()  { printf 'LOGCALL:err:%s\n' "$*"; }
 
 # ── 1. gate_labels_have_status — pure predicate ───────────────────────────────
 echo "── 1. gate_labels_have_status (pure) ──"
@@ -196,19 +242,40 @@ eq "(b) status present → bd comment NOT called" "$MOCK_COMMENT_COUNT" "0"
 eq "(b) status present → gc mail send NOT called (no spam on the healthy path)" "$MOCK_MAIL_COUNT" "0"
 
 # (c) THE BUG: marker has labels but NO gate-status → self-heal fires, and
-# the function still returns 0 (gate-fix-2: never abort the sweep).
+# the function still returns 0 (gate-fix-2: never abort the sweep). The mock
+# is STATEFUL (gate-fix-4): a real `bd label add` would change what a
+# subsequent `bd show` returns, and this function now re-reads after its own
+# write to verify it (blocking issue 2, gate_run=ga-wisp-twg3gh8) — a mock
+# that never changes MOCK_SHOW_JSON would make every successful repair
+# misread as a failed one.
 MOCK_SHOW_JSON='[{"id":"m2","labels":["source-bead:wa-x","branch:crew/me/wa-x"]}]'
 MOCK_LABEL_ADD_COUNT=0; MOCK_COMMENT_COUNT=0; MOCK_MAIL_COUNT=0
+bd() {
+  case " $* " in
+    *" show "*) printf '%s\n' "$MOCK_SHOW_JSON" ;;
+    *" label add "*)
+      MOCK_LABEL_ADD_COUNT=$((MOCK_LABEL_ADD_COUNT + 1))
+      MOCK_LABEL_ADD_LAST="$*"
+      MOCK_SHOW_JSON='[{"id":"m2","labels":["source-bead:wa-x","branch:crew/me/wa-x","gate-status:error"]}]'
+      ;;
+    *" comment "*)
+      MOCK_COMMENT_COUNT=$((MOCK_COMMENT_COUNT + 1))
+      MOCK_COMMENT_LAST="$*"
+      ;;
+    *) : ;;
+  esac
+  return 0
+}
 _capture_out gate_marker_status_ensure 'm2' 'the transient-retry queue write'
-eq "(c) status missing → return 0 even though it repaired (gate-fix-2)" "$CAPTURED_RC" "0"
-eq "(c) status missing → stdout 'repaired' (caller tells via stdout, not exit code)" "$CAPTURED" "repaired"
-eq "(c) status missing → bd label add called exactly once" "$MOCK_LABEL_ADD_COUNT" "1"
+eq "(c) status missing, write verified → return 0 even though it repaired (gate-fix-2)" "$CAPTURED_RC" "0"
+eq "(c) status missing, write verified → stdout 'repaired' (caller tells via stdout, not exit code)" "$CAPTURED" "repaired"
+eq "(c) status missing, write verified → bd label add called exactly once" "$MOCK_LABEL_ADD_COUNT" "1"
 case "$MOCK_LABEL_ADD_LAST" in
   *"m2"*"gate-status:error"*) ok "(c) repair wrote gate-status:error onto the right marker" ;;
   *) bad "(c) expected label add m2 gate-status:error, got: $MOCK_LABEL_ADD_LAST" ;;
 esac
-eq "(c) status missing → bd comment called exactly once (durable trail on the marker)" "$MOCK_COMMENT_COUNT" "1"
-eq "(c) status missing → gc mail send called exactly once (Mayor alerted)" "$MOCK_MAIL_COUNT" "1"
+eq "(c) status missing, write verified → bd comment called exactly once (durable trail on the marker)" "$MOCK_COMMENT_COUNT" "1"
+eq "(c) status missing, write verified → gc mail send called exactly once (Mayor alerted)" "$MOCK_MAIL_COUNT" "1"
 case "$MOCK_MAIL_LAST" in
   *"mayor"*"m2"*) ok "(c) mail addressed to mayor, names the marker" ;;
   *) bad "(c) expected mail to mayor naming m2, got: $MOCK_MAIL_LAST" ;;
@@ -220,13 +287,113 @@ esac
 # Under set -euo pipefail, attempt-1's `return 1` on this exact path aborted
 # the whole script here — this line never running would mean the FAIL (the
 # script would die above without ever reaching the PASS/FAIL tally at the end).
+# Fresh, independent mock (not carried over from (c)): (c)'s mock left
+# MOCK_SHOW_JSON mutated to already carry gate-status:error, which would
+# short-circuit this marker onto the "ok" fast path and never even reach the
+# repair code this case exists to exercise.
+MOCK_SHOW_JSON='[{"id":"m2b","labels":["source-bead:wa-x"]}]'
 MOCK_LABEL_ADD_COUNT=0; MOCK_COMMENT_COUNT=0; MOCK_MAIL_COUNT=0
+bd() {
+  case " $* " in
+    *" show "*) printf '%s\n' "$MOCK_SHOW_JSON" ;;
+    *" label add "*)
+      MOCK_LABEL_ADD_COUNT=$((MOCK_LABEL_ADD_COUNT + 1))
+      MOCK_SHOW_JSON='[{"id":"m2b","labels":["source-bead:wa-x","gate-status:error"]}]'
+      ;;
+    *" comment "*) MOCK_COMMENT_COUNT=$((MOCK_COMMENT_COUNT + 1)) ;;
+    *) : ;;
+  esac
+  return 0
+}
 gate_marker_status_ensure 'm2b' 'bare-call regression guard' >/dev/null
 ok "(c2) bare (unguarded) call on the repair path did NOT abort the script under set -euo pipefail"
 
+# (c3) gate-fix-4 (reviewer blocking issue 2 on gate_run=ga-wisp-twg3gh8): the
+# label-add write is accepted but does NOT change the marker's actual labels
+# — simulating the exact transient-Dolt-write failure this bug was originally
+# measured with live (3/3 markers). The post-write verification re-read must
+# catch this and refuse to claim 'repaired', falling back to 'unknown' (the
+# Mayor's contract names exactly three tokens — ok/repaired/unknown — so an
+# unconfirmed repair does not get a token of its own). Mail must still fire
+# (human-in-the-loop fallback) but must NOT claim the marker is fixed.
+MOCK_SHOW_JSON='[{"id":"m2c","labels":["source-bead:wa-x"]}]'
+MOCK_LABEL_ADD_COUNT=0; MOCK_COMMENT_COUNT=0; MOCK_MAIL_COUNT=0
+bd() {
+  case " $* " in
+    *" show "*) printf '%s\n' "$MOCK_SHOW_JSON" ;;
+    *" label add "*) MOCK_LABEL_ADD_COUNT=$((MOCK_LABEL_ADD_COUNT + 1)) ;;  # accepted, MOCK_SHOW_JSON deliberately left unchanged
+    *" comment "*) MOCK_COMMENT_COUNT=$((MOCK_COMMENT_COUNT + 1)) ;;
+    *) : ;;
+  esac
+  return 0
+}
+_capture_out gate_marker_status_ensure 'm2c' 'the transient-retry queue write'
+eq "(c3) repair write does not take effect → return 0 (never aborts the sweep)" "$CAPTURED_RC" "0"
+eq "(c3) repair write does not take effect → stdout 'unknown', NOT falsely 'repaired'" "$CAPTURED" "unknown"
+eq "(c3) repair write does not take effect → bd label add was still attempted once" "$MOCK_LABEL_ADD_COUNT" "1"
+eq "(c3) repair write does not take effect → still comments (audit trail) even though unconfirmed" "$MOCK_COMMENT_COUNT" "1"
+eq "(c3) repair write does not take effect → still mails the Mayor (human-in-the-loop fallback)" "$MOCK_MAIL_COUNT" "1"
+case "$MOCK_MAIL_LAST" in
+  *"m2c"*) ok "(c3) mail names the marker m2c" ;;
+  *) bad "(c3) expected mail naming m2c, got: $MOCK_MAIL_LAST" ;;
+esac
+# Positive check, not a substring-absence check: "not fixed" legitimately
+# contains "fixed" as a substring (a `*fixed*` exclusion would itself be the
+# exact naive-substring mistake this whole bug saga is about), so assert the
+# HONEST wording is present rather than trying to prove a negative.
+case "$MOCK_MAIL_LAST" in
+  *"could NOT confirm"*|*"could NOT verify"*) ok "(c3) mail honestly states the repair could not be confirmed, not a false 'fixed it'" ;;
+  *) bad "(c3) expected honest could-not-confirm/verify wording, got: $MOCK_MAIL_LAST" ;;
+esac
+
+# (c4) gate-fix-4: the SECOND (post-write verification) read itself fails —
+# must be 'unknown', never misread as either a confirmed fix or a confirmed
+# ongoing failure. Same [[error-and-empty-must-not-produce-the-same-value]]
+# class this whole bug is about, one layer further down: a failed
+# verification read is genuinely indeterminate, distinct from a verification
+# read that succeeds and shows the label still missing (c3, above) — both
+# happen to map to the same 'unknown' token, but for different, non-conflated
+# reasons internally.
+MOCK_SHOW_JSON='[{"id":"m2d","labels":["source-bead:wa-x"]}]'
+MOCK_SHOW_CALL_COUNT=0
+MOCK_LABEL_ADD_COUNT=0; MOCK_COMMENT_COUNT=0; MOCK_MAIL_COUNT=0
+bd() {
+  case " $* " in
+    *" show "*)
+      MOCK_SHOW_CALL_COUNT=$((MOCK_SHOW_CALL_COUNT + 1))
+      if [ "$MOCK_SHOW_CALL_COUNT" -eq 1 ]; then
+        printf '%s\n' "$MOCK_SHOW_JSON"
+      else
+        printf '%s\n' '{"error": "no issues found matching the provided IDs", "schema_version": 1}'
+        return 1
+      fi
+      ;;
+    *" label add "*) MOCK_LABEL_ADD_COUNT=$((MOCK_LABEL_ADD_COUNT + 1)) ;;
+    *" comment "*) MOCK_COMMENT_COUNT=$((MOCK_COMMENT_COUNT + 1)) ;;
+    *) : ;;
+  esac
+  return 0
+}
+_capture_out gate_marker_status_ensure 'm2d' 'test context'
+eq "(c4) post-write verification read itself fails → return 0" "$CAPTURED_RC" "0"
+eq "(c4) post-write verification read itself fails → stdout 'unknown'" "$CAPTURED" "unknown"
+eq "(c4) post-write verification read itself fails → bd label add was still attempted once" "$MOCK_LABEL_ADD_COUNT" "1"
+eq "(c4) post-write verification read itself fails → still mails the Mayor (can't confirm either way)" "$MOCK_MAIL_COUNT" "1"
+
 # (d) marker JSON returned as a bare object (not array) — same shape gate_bead_live_merge_block tolerates.
+# Own explicit mock (not the (c4) leftover): (c4)'s bd() keys behavior off a
+# call counter that would otherwise still be primed from (c4)'s two calls,
+# misrouting this case's single call into (c4)'s injected-failure branch.
 MOCK_SHOW_JSON='{"id":"m3","labels":["gate-status:running"]}'
 MOCK_LABEL_ADD_COUNT=0; MOCK_MAIL_COUNT=0
+bd() {
+  case " $* " in
+    *" show "*) printf '%s\n' "$MOCK_SHOW_JSON" ;;
+    *" label add "*) MOCK_LABEL_ADD_COUNT=$((MOCK_LABEL_ADD_COUNT + 1)) ;;
+    *) : ;;
+  esac
+  return 0
+}
 _capture_out gate_marker_status_ensure 'm3' 'test context'
 eq "(d) bare-object show JSON, status present → return 0" "$CAPTURED_RC" "0"
 eq "(d) bare-object show JSON, status present → stdout 'ok', no repair" "$CAPTURED" "ok"
@@ -389,12 +556,24 @@ FN_BODY_END=$(awk -v start="$FN_BODY_START" 'NR>start && /^}/ {print NR; exit}' 
 if [ -n "$FN_BODY_START" ] && [ -n "$FN_BODY_END" ]; then
   RETURN1_COUNT=$(sed -n "${FN_BODY_START},${FN_BODY_END}p" "$DISPATCHER" | grep -cE 'return 1\b' || true)
   eq "gate_marker_status_ensure body contains zero 'return 1' (always returns 0)" "$RETURN1_COUNT" "0"
+
+  # gate-fix-4 (blocking issue 1, gate_run=ga-wisp-twg3gh8): the function must
+  # stay MUTE — zero log/warn/err calls anywhere in its body — since its
+  # stdout is captured via $(...) by every call site. Comment-only lines are
+  # excluded first so the extensive gate-fix-4 documentation ABOVE the
+  # function (which necessarily talks ABOUT log/warn/err in prose) can't
+  # false-positive this check; only lines that survive as actual code are
+  # searched for real call syntax (bare word + whitespace + open-quote).
+  LOGCALL_COUNT=$(sed -n "${FN_BODY_START},${FN_BODY_END}p" "$DISPATCHER" \
+    | grep -v '^\s*#' \
+    | grep -cE '(^|[^a-zA-Z0-9_])(log|warn|err)[[:space:]]+"' || true)
+  eq "gate_marker_status_ensure body contains zero log/warn/err calls (mute by construction, gate-fix-4)" "$LOGCALL_COUNT" "0"
 else
   bad "could not locate gate_marker_status_ensure function body bounds (start=$FN_BODY_START end=$FN_BODY_END)"
 fi
 
 CUTOFF_LN=$(grep -n 'if \[ -n "\${GATE_DISPATCHER_LIB_ONLY:-}" \]; then' "$DISPATCHER" | head -1 | cut -d: -f1)
-for fn in gate_labels_have_status gate_marker_status_ensure; do
+for fn in gate_labels_have_status gate_marker_label_snapshot gate_marker_status_ensure; do
   DEF_LN=$(grep -n "^${fn}() {" "$DISPATCHER" | head -1 | cut -d: -f1)
   if [ -n "$DEF_LN" ] && [ -n "$CUTOFF_LN" ] && [ "$DEF_LN" -lt "$CUTOFF_LN" ]; then
     ok "$fn (line $DEF_LN) defined before the lib-only cutoff (line $CUTOFF_LN)"
@@ -402,6 +581,18 @@ for fn in gate_labels_have_status gate_marker_status_ensure; do
     bad "$fn must be defined before the GATE_DISPATCHER_LIB_ONLY cutoff (def=$DEF_LN cutoff=$CUTOFF_LN)"
   fi
 done
+
+# gate-fix-4: the 6 call sites must actually log on "repaired" now that the
+# function itself is mute — the STALE "already logged... inside
+# gate_marker_status_ensure" no-op comment would mean the self-heal event
+# never reaches this dispatcher's own log stream at all (mail + bd comment
+# still fire from inside the function, but that's a different, out-of-band
+# channel — see gate-fix-4 docstring).
+STALE_NOOP_COUNT=$(grep -cF 'already logged, commented, and mailed inside gate_marker_status_ensure' "$DISPATCHER" || true)
+eq "zero call sites still carry the stale gate-fix-3-era 'already logged inside' no-op comment" "$STALE_NOOP_COUNT" "0"
+
+CALLER_LOG_COUNT=$(grep -cE '(log|warn|err) "ga-kgtiw SELF-HEAL: marker \$MARKER_ID had no gate-status label after' "$DISPATCHER" || true)
+eq "all 6 call sites log on a 'repaired' outcome (caller logs after reading the signal, gate-fix-4)" "$CALLER_LOG_COUNT" "6"
 
 # ── 5. syntax ──────────────────────────────────────────────────────────────
 echo "── 5. syntax ──"
