@@ -320,6 +320,25 @@ for _repo in "$GT"/*/; do
   [ -d "$_repo/.git" ] || [ -f "$_repo/.git" ] || continue
   case "$(basename "$_repo")" in .gc-worktrees|.git|.claude|.worktrees) continue ;; esac
   reap_pool_worktrees "$_repo"
+  # wa-bptki (2026-08-02): a named crew member's clone (<rig>/crew/oracle, crew/mila, …)
+  # is its OWN independent repo — a real `git clone` with its own .git DIRECTORY and its
+  # own `origin` remote — not a linked worktree of $_repo. `git -C $_repo worktree list`
+  # therefore CANNOT see worktrees registered under crew/<name>/.claude/worktrees/: they
+  # live in crew/<name>'s OWN worktree registry, invisible from $_repo. Confirmed: zero
+  # such entries in weeks of sweep logs while $_repo's own worker-wa-* worktrees reaped
+  # normally — 94 agent worktrees / 5.9G accumulated over 3-7 weeks across 5 crew clones
+  # in whatsapp_automation alone before this was caught. Recurse into each rig's crew/*/
+  # subdirs and run the SAME reap on any that are a repo root in their own right — a
+  # linked worktree's .git is always a FILE (pointer), only a real clone/init has a .git
+  # DIRECTORY, so this also naturally skips crew/worker, which has no .git of its own at
+  # all (shares the rig's) and is never mistaken for an independent repo.
+  if [ -d "$_repo/crew" ]; then
+    for _crew in "$_repo/crew"/*/; do
+      _crew="${_crew%/}"
+      [ -d "$_crew/.git" ] || continue
+      reap_pool_worktrees "$_crew"
+    done
+  fi
 done
 
 printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s}\n' \

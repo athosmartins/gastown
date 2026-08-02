@@ -255,6 +255,66 @@ git -C "$YRIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/.c
   && ok "ENABLED=0: zombie-locked tree NOT removed (dry-run)" || bad "ENABLED=0 removed a zombie-locked tree"
 grep -q '"event":"would_reap_zombie_lock"' "$TMP/reaperY.jsonl" 2>/dev/null && ok "ENABLED=0: logged would_reap_zombie_lock intent" || bad "ENABLED=0: no zombie dry intent logged"
 
+# ══ INDEPENDENT CREW-CLONE COVERAGE (wa-bptki) ═══════════════════════════════════
+# A named crew member's clone (<rig>/crew/oracle, crew/mila, …) is its OWN independent
+# repo — a real `git clone` with its own .git DIRECTORY + own `origin` remote — NOT a
+# linked worktree of the rig repo (which is how every other case in this file builds its
+# fixtures, via `git worktree add "$RIG/crew/..."` FROM the rig itself). `git -C <rig>
+# worktree list` cannot see worktrees registered inside such a clone. Proves: (i) a
+# stale+clean worktree inside an independent crew clone IS reaped; (ii) a crew/ subdir
+# with NO .git of its own (mirrors the real crew/worker, which shares the rig's .git) is
+# left alone, not mistaken for an independent repo, no crash.
+echo "── independent crew-clone coverage (wa-bptki) ──"
+CTOWN="$TMP/ctown"; mkdir -p "$CTOWN"
+CREMOTE="$TMP/cremote.git"; git init -q --bare "$CREMOTE"
+CRIG="$CTOWN/crig"; git init -q -b main "$CRIG"
+( cd "$CRIG"
+  git remote add origin "$CREMOTE"
+  echo r > r.txt; git add r.txt; git commit -qm rbase
+  git push -q origin main; git fetch -q origin; git remote set-head origin main 2>/dev/null || true
+) >/dev/null 2>&1
+# the bare remote's HEAD symref defaults to whatever this git install's default branch
+# name is (often master), NOT necessarily "main" — leaving it unset makes `git clone`
+# below try to check out a branch that was never pushed, failing silently under the
+# >/dev/null redirects and making every assertion in this section vacuously pass
+# regardless of whether the reaper fix works. Point it at the branch that actually exists.
+git -C "$CREMOTE" symbolic-ref HEAD refs/heads/main >/dev/null 2>&1
+mkdir -p "$CRIG/crew"
+# independent clone at crew/oracle — own .git DIRECTORY, own origin remote (mirrors the
+# real crew/oracle: a `git clone` + `git remote add rootwt <rig>`, not `git worktree add`)
+git clone -q "$CREMOTE" "$CRIG/crew/oracle" >/dev/null 2>&1
+( cd "$CRIG/crew/oracle"
+  git remote add rootwt "$CRIG" 2>/dev/null || true
+  git branch crew/oracle/stale main
+  git worktree add -q "$CRIG/crew/oracle/.claude/worktrees/agent-stale" crew/oracle/stale
+) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$CRIG/crew/oracle/.claude/worktrees/agent-stale" 2>/dev/null || true
+# crew/worker — a plain dir with NO .git of its own — must be left alone, not crash
+mkdir -p "$CRIG/crew/worker"
+
+# precondition: the fixture itself must exist BEFORE reaping, independent of the fix —
+# otherwise an "it's gone" assertion below would pass vacuously on a setup that silently
+# failed to create it (this is exactly what happened the first time this section was
+# written: an unset bare-remote HEAD broke the clone, and the reap assertion "passed"
+# against the UNFIXED reaper because there was nothing there to reap in the first place).
+if [ -d "$CRIG/crew/oracle/.claude/worktrees/agent-stale" ]; then
+  ok "fixture precondition: agent-stale worktree exists before reap"
+else
+  bad "fixture precondition FAILED: agent-stale worktree was never created — assertions below are meaningless"
+fi
+
+WORKTREE_REAPER_GT="$CTOWN" WORKTREE_REAPER_LOG="$TMP/reaperC.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+  bash "$REAPER" >/dev/null 2>&1
+
+git -C "$CRIG/crew/oracle" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/oracle/\.claude/worktrees/agent-stale\$" \
+  && bad "independent crew-clone's stale worktree NOT reaped (scope gap NOT fixed)" \
+  || ok "independent crew-clone's stale worktree reaped (wa-bptki scope gap fixed)"
+branch_exists_in() { git -C "$1" rev-parse --verify -q "refs/heads/$2" >/dev/null 2>&1; }
+branch_exists_in "$CRIG/crew/oracle" crew/oracle/stale \
+  && bad "crew clone's merged orphan branch NOT deleted" || ok "crew clone's merged orphan branch deleted"
+[ -d "$CRIG/crew/worker" ] && ok "crew/worker (no own .git) left alone, no crash" || bad "crew/worker directory unexpectedly gone"
+
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ] || exit 1
