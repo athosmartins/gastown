@@ -321,7 +321,7 @@ auto_refino_has_lifecycle_label() {
   echo "no"
 }
 
-# auto_refino_is_ingestable_raw <id> <issue_type> <labels_csv> <ephemeral> <exclude_labels> <age_minutes> <min_age_minutes> <assignee> <has_children>
+# auto_refino_is_ingestable_raw <id> <issue_type> <labels_csv> <ephemeral> <exclude_labels> <age_minutes> <min_age_minutes> <assignee> <has_children> <has_refino_metadata>
 #   Emit "yes" iff this bead is a RAW Triagem story eligible for AUTO-INGESTION
 #   into the funnel — i.e. it qualifies the way the painel's _qualifies_for_triagem
 #   does, restricted to the funnel's product-story scope. ALL must hold:
@@ -367,12 +367,29 @@ auto_refino_has_lifecycle_label() {
 #           structural trace). The actual fix is upstream, at the point a
 #           POLICY-GAP escalation gets resolved: see the escalate-time
 #           reminder next to the `story:needs-human` stamp below.
+#         - has_refino_metadata="yes" (caller MUST compute via `bd show <id>
+#           --json` checking whether ANY of the story.refino_mode /
+#           story.refino_gate_rounds / story.criterios metadata keys is
+#           non-empty) → this bead already carries real refino output,
+#           independent of its CURRENT label state (bug ga-mk6ve, 9th
+#           confirmed re-ingestion — ga-m3n1x: refined, gate-approved,
+#           Athos-approved TWICE, still got re-ingested as a fresh idea).
+#           Every prior fix in this function enumerated a SPECIFIC label or
+#           mechanism that zeroed the bead's story:* tags — reclaim-guard
+#           clearing story:in-flight, a namespaced needs-human variant, an
+#           unexplained label loss, and finally a HUMAN clearing block labels
+#           via the painel. A blocklist can never be exhaustive against "the
+#           label is simply absent" — that is not a label prefix to add to
+#           the list, it is the absence of any label at all. Metadata written
+#           once at refino time is untouched by any of those label-clearing
+#           paths, so it is the first POSITIVE, not-label-based signal that
+#           this bead was already refined.
 #   Status (open) is enforced at the query level (--status open), exactly as the
 #   labelled queries already are; this pure predicate covers the rest.
 auto_refino_is_ingestable_raw() {
   local id="$1" itype="$2" labels="$3" ephemeral="$4" ex="${5:-}"
   local age_min="${6:-}" min_age="${7:-0}"
-  local assignee="${8:-}" has_children="${9:-no}"
+  local assignee="${8:-}" has_children="${9:-no}" has_refino_metadata="${10:-no}"
   # Sanitize like auto_refino_next_attempt: garbage/empty age_min fails OPEN
   # (treated as ancient, i.e. never age-excluded) so a missing/unparseable
   # updated_at can never silently starve the RAW funnel. Garbage min_age
@@ -384,6 +401,11 @@ auto_refino_is_ingestable_raw() {
   [ "$(auto_refino_type_eligible "$itype")" = "yes" ] || { echo "no"; return; }
   # must be RAW — no story:* lifecycle label.
   [ "$(auto_refino_has_lifecycle_label "$labels")" = "no" ] || { echo "no"; return; }
+  # already carries real refino output (bug ga-mk6ve, 9th confirmed
+  # re-ingestion): a positive signal independent of current label state — see
+  # the has_refino_metadata param doc above for why labels alone can never be
+  # sufficient here.
+  [ "$has_refino_metadata" = "yes" ] && { echo "no"; return; }
   # ephemeral beads are engine coordination, never human stories.
   [ "$ephemeral" = "true" ] && { echo "no"; return; }
   # dc-* (deacon coordination) and *-wisp-* (reconciler wisps) ids are automation.
@@ -931,6 +953,11 @@ if [ "$AUTO_REFINO_INGEST_RAW_TRIAGEM" = "1" ]; then
     # robust fallback for that gap; it needs a live `bd children` call this
     # pure jq layer cannot make, so it is NOT mirrored here.
     | map(select(((.assignee // "") | length) == 0))
+    # has_refino_metadata (bug ga-mk6ve, 9th confirmed re-ingestion) is ALSO
+    # classifier-only, same reason as has_children directly above: it needs a
+    # live `bd show <id>` call this pure jq layer cannot make, so a bead
+    # already carrying real refino metadata still passes this jq stage and
+    # relies on the classifier has_refino_metadata check to be excluded.
     # Drop beads under an active hold from another authority (bug ga-268cr,
     # occurrences 2/3/5/6): blocked:*, needs-human*, pilot:held* (bare or
     # -until:<epoch>), blocked-on:* (hyphenated — distinct prefix from
@@ -1015,7 +1042,29 @@ while IFS= read -r row; do
         if bd_ children "$c_id" --json 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1; then
           c_has_children="yes"
         fi
-        if [ "$(auto_refino_is_ingestable_raw "$c_id" "$c_type" "$c_labels" "$c_ephemeral" "$AUTO_REFINO_EXCLUDE_LABELS" "$c_age_min" "$AUTO_REFINO_RAW_MIN_AGE_MINUTES" "$c_assignee" "$c_has_children")" = "yes" ]; then
+        # has_refino_metadata (bug ga-mk6ve, 9th confirmed re-ingestion of
+        # ga-m3n1x): computed HERE, lazily, same rationale as c_has_children
+        # directly above — one extra `bd show` call at most per sweep, only
+        # for the specific candidate reaching this branch. A bead already
+        # carrying real refino output (story.refino_mode / .criterios /
+        # .refino_gate_rounds metadata) is NOT raw regardless of current
+        # label state — labels are mutable and get zeroed by daemon
+        # side-effects AND human painel actions (9 confirmed occurrences);
+        # this metadata is the first POSITIVE, not-label-based signal. A
+        # failed/empty `bd show` call fails OPEN (c_has_refino_metadata stays
+        # "no") — never a new starvation vector for a genuinely-raw bead with
+        # no refino metadata yet.
+        c_has_refino_metadata="no"
+        if bd_ show "$c_id" --json 2>/dev/null | jq -e '
+              (if type=="array" then .[0] else . end) as $b
+              | ($b.metadata // {}) as $m
+              | (($m["story.refino_mode"] // "") | tostring | length > 0) or
+                (($m["story.refino_gate_rounds"] // "") | tostring | length > 0) or
+                (($m["story.criterios"] // "") | tostring | length > 0)
+            ' >/dev/null 2>&1; then
+          c_has_refino_metadata="yes"
+        fi
+        if [ "$(auto_refino_is_ingestable_raw "$c_id" "$c_type" "$c_labels" "$c_ephemeral" "$AUTO_REFINO_EXCLUDE_LABELS" "$c_age_min" "$AUTO_REFINO_RAW_MIN_AGE_MINUTES" "$c_assignee" "$c_has_children" "$c_has_refino_metadata")" = "yes" ]; then
           STORY="$row"; RAW_INGEST=1
           log "  ingest $c_id: raw Triagem story (no story:* label) → applying story:unrefined entry label"
           break

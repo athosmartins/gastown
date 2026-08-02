@@ -1393,16 +1393,18 @@ echo "Scenario 16: claimed/split/escalated RAW beads are excluded (bug ga-blron)
 
 # 16b. Drift-guard: assignee + refino:policy-gap are mirrored in BOTH the RAW
 #      jq filter and the classifier (defense in depth, same structure as 15b).
-#      has_children is classifier-ONLY by design (jq cannot shell out to `bd
-#      children`) — assert the classification loop actually wires it through.
+#      has_children/has_refino_metadata are classifier-ONLY by design (jq
+#      cannot shell out to `bd children`/`bd show`) — assert the
+#      classification loop actually wires BOTH through.
 if grep -qF 'map(select(((.assignee // "") | length) == 0))' "$DISPATCHER" \
    && grep -qF 'any(. == "refino:policy-gap")) | not' "$DISPATCHER" \
    && grep -qF '*,refino:policy-gap,*) echo "no"' "$DISPATCHER" \
    && grep -qF 'bd_ children "$c_id" --json' "$DISPATCHER" \
-   && grep -qF '"$c_assignee" "$c_has_children")' "$DISPATCHER"; then
-  ok "16b. claimed/split/escalated guard present in jq filter (assignee+policy-gap) AND classifier (all 3 + has_children wiring) (bug ga-blron)"
+   && grep -qF 'bd_ show "$c_id" --json' "$DISPATCHER" \
+   && grep -qF '"$c_assignee" "$c_has_children" "$c_has_refino_metadata")' "$DISPATCHER"; then
+  ok "16b. claimed/split/escalated guard present in jq filter (assignee+policy-gap) AND classifier (all 3 + has_children + has_refino_metadata wiring) (bug ga-blron, ga-mk6ve)"
 else
-  bad "16b. claimed/split/escalated guard missing from jq filter or classifier wiring — occurrences 1-4 can re-form"
+  bad "16b. claimed/split/escalated guard missing from jq filter or classifier wiring — occurrences 1-4 (or the 9th, ga-mk6ve) can re-form"
 fi
 
 # ── Scenario 17: POLICY-GAP escalations stamp an Epic Split Convention
@@ -1435,6 +1437,63 @@ if [ -n "$_reminder_line" ] && [ -n "$_outcome_if_line" ] && [ "$_reminder_line"
   ok "17b. reminder fires BEFORE the OUTCOME!=ESCALATE branch — reaches POLICY-GAP escalations, not just budget-exhaustion"
 else
   bad "17b. reminder is gated behind OUTCOME!=ESCALATE (or missing) — POLICY-GAP escalations would never see it"
+fi
+
+# ── Scenario 18: positive already-refined signal — a bead already carrying
+#    real refino output (story.refino_mode / story.refino_gate_rounds /
+#    story.criterios metadata) is NOT raw, independent of current label state
+#    (bug ga-mk6ve, 9th confirmed re-ingestion). ga-m3n1x was refined
+#    simplificado, gate-approved, and Athos-approved TWICE — then a human
+#    clearing block labels via the painel zeroed every story:* tag and the RAW
+#    sweep re-ingested it as if it were a brand-new Triagem idea, even though
+#    its refino metadata was intact the entire time. Every PRIOR fix in this
+#    function (occurrences 1-8) enumerated a specific label/mechanism that
+#    zeroed labels; this is the first check that does not depend on labels at
+#    all. has_refino_metadata is a NEW OPTIONAL trailing (10th) param, same
+#    backward-compat convention as has_children directly above — every prior
+#    call site in this file (Scenarios 1-17) omits it and must stay green.
+EX="scraper build infra config deploy migration pipeline"
+echo "Scenario 18: already-refined metadata excludes RAW re-ingestion (bug ga-mk6ve)"
+
+# (e) the exact ga-m3n1x 9th-occurrence shape: zero story:* labels (painel
+#     manual unblock cleared them all) but has_refino_metadata=yes → no.
+[ "$(auto_refino_is_ingestable_raw "ga-m3n1x" "feature" "" "false" "$EX" "" "" "" "" "yes")" = "no" ] \
+  && ok "(e) has_refino_metadata=yes, zero story:* labels (ga-m3n1x 9th-occurrence shape) → no (already refined, not raw)" \
+  || bad "(e) has_refino_metadata=yes → expected no (9th occurrence would re-form)"
+[ "$(auto_refino_is_ingestable_raw "ga-fresh7" "feature" "frontend" "false" "$EX")" = "yes" ] \
+  && ok "(e) has_refino_metadata param omitted → yes (backward-compat default, funnel not starved)" \
+  || bad "(e) omitted has_refino_metadata → expected yes"
+[ "$(auto_refino_is_ingestable_raw "ga-fresh7" "feature" "frontend" "false" "$EX" "" "" "" "no" "no")" = "yes" ] \
+  && ok "(e) has_refino_metadata=no explicit → yes" \
+  || bad "(e) has_refino_metadata=no explicit → expected yes"
+
+# (f) the metadata guard excludes even when EVERY other guard would
+#     independently pass — isolates that this is its own, new gate, not a
+#     side effect of the age/assignee/children checks (age 10 >= floor 5
+#     passes on its own; has_refino_metadata=yes must still force "no").
+[ "$(auto_refino_is_ingestable_raw "ga-m3n1x" "feature" "" "false" "$EX" "10" "5" "" "no" "yes")" = "no" ] \
+  && ok "(f) has_refino_metadata=yes even though the age guard independently passes (10>=5) → no (metadata guard is its own gate)" \
+  || bad "(f) has_refino_metadata isolated from age guard → expected no"
+
+# Regression: a genuinely raw story with no refino metadata is STILL ingested
+# — the starvation the RAW-ingestion fix originally solved must not return.
+[ "$(auto_refino_is_ingestable_raw "ga-fresh8" "feature" "frontend" "false" "$EX" "" "" "" "no" "no")" = "yes" ] \
+  && ok "genuine orphan raw story (no refino metadata) → still yes (funnel not starved)" \
+  || bad "genuine orphan raw story (no refino metadata) → expected yes (starvation regression)"
+
+# 18b. Drift-guard: the param, its gate check, the bd-show metadata predicate
+#      (all 3 keys), and the caller-side computation are all wired through —
+#      same structure as 16b/17b above.
+if grep -qF 'has_refino_metadata="${10:-no}"' "$DISPATCHER" \
+   && grep -qF '[ "$has_refino_metadata" = "yes" ] && { echo "no"; return; }' "$DISPATCHER" \
+   && grep -qF 'story.refino_mode' "$DISPATCHER" \
+   && grep -qF 'story.refino_gate_rounds' "$DISPATCHER" \
+   && grep -qF 'story.criterios' "$DISPATCHER" \
+   && grep -qF 'c_has_refino_metadata="no"' "$DISPATCHER" \
+   && grep -qF 'bd_ show "$c_id" --json' "$DISPATCHER"; then
+  ok "18b. has_refino_metadata param + gate check + bd-show metadata predicate + caller computation all present (bug ga-mk6ve)"
+else
+  bad "18b. has_refino_metadata wiring incomplete — 9th occurrence (ga-m3n1x) can re-form"
 fi
 
 echo ""
