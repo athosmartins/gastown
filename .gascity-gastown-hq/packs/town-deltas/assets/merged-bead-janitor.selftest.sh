@@ -28,6 +28,7 @@ JANITOR_LIB_ONLY=1 source "$JANITOR" \
   || { echo "FATAL: could not source janitor in lib-only mode"; exit 1; }
 for fn in janitor_decide janitor_story_decide token_bounded scan_commit_for_bead \
           scan_commit_subject_for_bead subject_impl_scopes_bead branch_merged content_in_main \
+          crew_branches_for_bead unmerged_crew_branches_for_bead \
           has_open_marker has_terminal_passed_marker has_terminal_superseded_marker \
           branch_label_from_markers rig_gitdir \
           janitor_branch_decide normalize_bead_status branch_is_fresh \
@@ -934,6 +935,85 @@ grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$
 grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER"' "$JANITOR" \
   && ok "story sweep threads sig_marker_superseded into janitor_story_decide" \
   || bad "story sweep not threading sig_marker_superseded"
+
+# ── 13. crew_branches_for_bead + unmerged_crew_branches_for_bead (wa-1jk89) ──
+# The measured real-world shape: wa-a7e98 had a PRIMARY branch (merged) and a
+# follow-up "-fix" branch (unmerged) — the janitor closed the bead anyway
+# because ITS signal (a terminal gate marker) only ever looked at ONE branch.
+echo "── 13. crew_branches_for_bead + unmerged_crew_branches_for_bead (wa-1jk89) ──"
+T11="$(mktemp -d 2>/dev/null || mktemp -d -t janitor-t11)"
+trap 'rm -rf "$T11" 2>/dev/null || true; rm -rf "$T10" 2>/dev/null || true; rm -rf "$T7B" 2>/dev/null || true; rm -rf "$T7" 2>/dev/null || true; rm -rf "$T" 2>/dev/null || true' EXIT
+R11="$T11/repo11"
+git init -q -b main "$R11"
+( cd "$R11" && echo base > base.txt && git add base.txt && git commit -q -m "base commit" )
+# unmerged_crew_branches_for_bead operates on FETCHED origin/* refs (the live
+# sweep never reads local branches) — stand up the remote-tracking main ref
+# without a real remote, same idiom §11b already uses for R10.
+git -C "$R11" update-ref refs/remotes/origin/main refs/heads/main
+
+# Primary branch for tt-multi: identical to main at creation time → merged.
+git -C "$R11" branch crew/x/tt-multi main
+git -C "$R11" update-ref refs/remotes/origin/crew/x/tt-multi refs/heads/crew/x/tt-multi
+
+# Follow-up "-fix" branch for the SAME bead: a real commit not yet in main.
+git -C "$R11" checkout -q -b crew/y/tt-multi-fix main
+( cd "$R11" && echo fixup > fixup.txt && git add fixup.txt && git commit -q -m "fix(tt-multi): follow-up not yet merged" )
+git -C "$R11" update-ref refs/remotes/origin/crew/y/tt-multi-fix refs/heads/crew/y/tt-multi-fix
+git -C "$R11" checkout -q main
+
+# A DIFFERENT, similarly-prefixed bead's branch must never be mistaken for a
+# tt-multi follow-up — the exact false-match this helper must reject: no
+# hyphen boundary after the shared prefix (tt-multi9 vs tt-multi-fix).
+git -C "$R11" branch crew/z/tt-multi9 main
+git -C "$R11" update-ref refs/remotes/origin/crew/z/tt-multi9 refs/heads/crew/z/tt-multi9
+
+echo "  -- crew_branches_for_bead --"
+GOT_CANDS=$(crew_branches_for_bead "$R11" 0 "tt-multi" | sort | tr '\n' ',')
+eq "finds primary + -fix follow-up, excludes the tt-multi9 near-miss" \
+   "$GOT_CANDS" "crew/x/tt-multi,crew/y/tt-multi-fix,"
+eq "unrelated id → no candidates at all" \
+   "$(crew_branches_for_bead "$R11" 0 "tt-nothing")" ""
+
+echo "  -- unmerged_crew_branches_for_bead (the wa-1jk89 AC) --"
+# Both branches present, one pending → the AC's first half: "uma branch mergeada
+# E outra pendente NÃO é fechado" — this must report the pending one.
+eq "primary merged + follow-up pending → follow-up reported pending" \
+   "$(unmerged_crew_branches_for_bead "$R11" 0 "main" "tt-multi")" "crew/y/tt-multi-fix"
+
+# Merge the follow-up into main → the AC's second half: "todas mergeadas continua
+# sendo fechado" — once every candidate lands, nothing blocks the close.
+git -C "$R11" merge -q --no-ff -m "merge follow-up" crew/y/tt-multi-fix
+git -C "$R11" update-ref refs/remotes/origin/main refs/heads/main
+eq "once the follow-up merges too, nothing is pending (close may proceed)" \
+   "$(unmerged_crew_branches_for_bead "$R11" 0 "main" "tt-multi")" ""
+
+# A bead with NO crew branches at all (delivered purely by commit/marker signal)
+# must never be blocked by this veto just for lacking a branch to check.
+eq "no candidate branches at all → empty (never blocks a commit/marker-only close)" \
+   "$(unmerged_crew_branches_for_bead "$R11" 0 "main" "tt-nobranch")" ""
+
+echo "── 14. Drift-guard: wa-1jk89 pending-crew-branch veto wired into the close path ──"
+grep -q 'crew_branches_for_bead()' "$JANITOR" \
+  && ok "defines crew_branches_for_bead" \
+  || bad "missing crew_branches_for_bead def"
+grep -q 'unmerged_crew_branches_for_bead()' "$JANITOR" \
+  && ok "defines unmerged_crew_branches_for_bead" \
+  || bad "missing unmerged_crew_branches_for_bead def"
+grep -qF 'PENDING_BRANCHES=$(unmerged_crew_branches_for_bead "$RGITDIR" "$RCONTAINER" "$RDEFAULT" "$BID")' "$JANITOR" \
+  && ok "in_progress close path computes the pending-crew-branch veto before closing" \
+  || bad "in_progress close path not computing the pending-crew-branch veto"
+grep -qF 'if [ -n "$PENDING_BRANCHES" ]; then' "$JANITOR" \
+  && ok "a non-empty pending list is checked before the actual close call" \
+  || bad "pending-branch check missing/loosened"
+# The veto must run BEFORE the real close call, not after — a textual ordering
+# check (the close call's line number must be greater than the veto's).
+VETO_LINE=$(grep -n 'PENDING_BRANCHES=\$(unmerged_crew_branches_for_bead' "$JANITOR" | head -1 | cut -d: -f1)
+CLOSE_LINE=$(grep -n 'bd -C "\$RPATH" close "\$BID" -r "\$REASON_MSG"' "$JANITOR" | head -1 | cut -d: -f1)
+if [ -n "$VETO_LINE" ] && [ -n "$CLOSE_LINE" ] && [ "$VETO_LINE" -lt "$CLOSE_LINE" ] 2>/dev/null; then
+  ok "veto check (line $VETO_LINE) precedes the real close call (line $CLOSE_LINE)"
+else
+  bad "veto check does not precede the real close call (veto=$VETO_LINE close=$CLOSE_LINE)"
+fi
 
 echo ""
 echo "──────────────────────────────────────────"

@@ -43,6 +43,18 @@
 # If any fires → close the bead + drop story:in-flight + comment the evidence
 # (sha / marker / branch) + notify.
 #
+# PENDING-CREW-BRANCH VETO (wa-1jk89, 2026-08-02): a bead can have MULTIPLE
+# crew/*/<id>[-<suffix>] branches — e.g. a "-fix" follow-up pushed after the
+# primary branch already merged/gated. Whichever signal above fired only proves
+# ONE thing merged; it says nothing about a SIBLING branch for the same bead
+# still sitting unmerged. Measured live: wa-a7e98 closed on signal B (terminal
+# marker) while crew/batista/wa-a7e98-fix (2 commits) stayed unmerged — the
+# fix's own content (a CLAUDE.md guard-section correction) was silently lost
+# behind a closed bead. Before any close actually happens, ALL discovered
+# crew/*/<id>[-<suffix>] candidate branches must be ancestors of origin/<default>
+# — see unmerged_crew_branches_for_bead. If any is pending, the close is
+# vetoed: the bead stays open and a comment names the pending branch(es).
+#
 # GUARDS (zero false-positive is AC3, the paramount constraint):
 #   • EPIC beads are NEVER auto-closed (they are parents; keep them).
 #   • A bead with ANY OPEN gate marker (queued/ready/dispatching/needs-rebase/
@@ -563,6 +575,45 @@ content_in_main() {
   [ "$n" = "0" ]
 }
 
+# crew_branches_for_bead <git_dir> <is_container> <bead_id> — echoes (one per line,
+# de-duplicated) every refs/remotes/origin/** branch (origin/ stripped) whose FINAL
+# path segment is EXACTLY <bead_id>, or STARTS WITH "<bead_id>-" — the crew/<persona>/<id>
+# AND crew/<persona>/<id>-<suffix> follow-up-branch conventions (wa-1jk89: a bead's fix
+# is often pushed as a SECOND branch named <id>-fix / <id>-canary-fix after the primary
+# branch already merged). Boundary-safe: "wa-a7e98" must never match "wa-a7e980" (a
+# DIFFERENT bead) — only an exact segment or a hyphen-delimited prefix qualifies.
+crew_branches_for_bead() {
+  local gdir="$1" container="$2" id="$3"
+  git_in "$gdir" "$container" for-each-ref --format='%(refname:short)' 'refs/remotes/origin/**' 2>/dev/null \
+    | sed 's#^origin/##' \
+    | awk -v id="$id" -F/ '$NF==id || index($NF, id "-")==1' \
+    | awk '!seen[$0]++' \
+    || true
+}
+
+# unmerged_crew_branches_for_bead <git_dir> <is_container> <default_ref> <bead_id> —
+# echoes (one per line) every crew_branches_for_bead candidate that is NOT
+# branch_merged against origin/<default_ref>. Empty output ⟺ every discovered
+# candidate (primary branch AND any follow-up/-fix/-suffix branch) is fully merged
+# — including the common case of NO candidates at all (a bead delivered purely by
+# commit/marker evidence must never be blocked just because it has zero branches).
+#
+# wa-1jk89: the janitor's THREE close signals (commit/marker/branch) each prove only
+# that SOME evidence of delivery exists for THIS bead — none of them prove that a
+# SIBLING branch for the same bead (pushed later, e.g. a "-fix" follow-up after
+# review) has also landed. This is the universal pre-close veto: call it regardless
+# of WHICH signal(s) fired, and require its output to be empty before the janitor is
+# allowed to actually close the bead.
+unmerged_crew_branches_for_bead() {
+  local gdir="$1" container="$2" rdefault="$3" id="$4" br
+  while IFS= read -r br; do
+    [ -z "$br" ] && continue
+    branch_merged "$gdir" "$container" "origin/$br" "origin/$rdefault" || printf '%s\n' "$br"
+  done <<EOF
+$(crew_branches_for_bead "$gdir" "$container" "$id")
+EOF
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # BEAD / MARKER HELPERS (live Dolt; only used in the sweep, not the pure tests).
 # ═════════════════════════════════════════════════════════════════════════════
@@ -980,6 +1031,30 @@ EOF
       [ -n "$COMMIT_EVID" ] && EVID="$EVID [$COMMIT_EVID]"
       [ -n "$BRANCH_EVID" ] && EVID="$EVID [$BRANCH_EVID]"
       [ "$SIG_MARKER" = "1" ] && EVID="$EVID [terminal-marker]"
+
+      # wa-1jk89: whichever signal fired above proves only ONE thing merged — it
+      # says nothing about a SIBLING crew/*/<id>[-<suffix>] branch (a follow-up
+      # fix pushed after the primary branch already merged/gated) still sitting
+      # unmerged. Enumerate every candidate and require ALL of them ancestors of
+      # origin/$RDEFAULT before the close below is allowed to proceed.
+      PENDING_BRANCHES=$(unmerged_crew_branches_for_bead "$RGITDIR" "$RCONTAINER" "$RDEFAULT" "$BID")
+      if [ -n "$PENDING_BRANCHES" ]; then
+        PENDING_LIST=$(printf '%s' "$PENDING_BRANCHES" | tr '\n' ',' | sed 's/,$//')
+        if [ "$DRY_RUN" = "1" ]; then
+          log "WOULD-KEEP $BID ($RNAME) — pending-crew-branch veto blocks close ($EVID would otherwise close): $PENDING_LIST"
+        else
+          ALREADY_FLAGGED=0
+          printf '%s' "$(comments_for_bead "$RPATH" "$BID")" | jq -e --arg pl "$PENDING_LIST" \
+            'any(.[]?; ((.text // "") | contains("pending-crew-branch")) and ((.text // "") | contains($pl)))' \
+            >/dev/null 2>&1 && ALREADY_FLAGGED=1
+          if [ "$ALREADY_FLAGGED" = "0" ]; then
+            bd -C "$RPATH" comment "$BID" "merged-bead-janitor ($SOURCE_BEAD): pending-crew-branch veto — $EVID would otherwise close this bead, but branch(es) not yet ancestors of origin/$RDEFAULT: $PENDING_LIST. Merge or supersede them; the next sweep re-checks automatically." 2>/dev/null || true
+          fi
+          log "KEPT $BID ($RNAME) — pending-crew-branch veto blocks close ($EVID would otherwise close): $PENDING_LIST"
+        fi
+        continue
+      fi
+
       if [ "$DRY_RUN" = "1" ]; then
         log "WOULD-CLOSE $BID ($RNAME) — $EVID — \"$BTITLE\""
       else

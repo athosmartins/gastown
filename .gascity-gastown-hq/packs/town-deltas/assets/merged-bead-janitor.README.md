@@ -32,6 +32,24 @@ For each `in_progress` bead, **any** of:
 
 → close the bead + drop `story:in-flight` + comment the evidence + `notify`.
 
+## Pending-crew-branch veto (wa-1jk89) — one signal can't vouch for a sibling branch
+
+A bead can have **more than one** `crew/*/<id>[-<suffix>]` branch — e.g. a
+follow-up `-fix` branch pushed after the primary branch already merged/gated.
+Whichever signal fires above only proves **one thing** merged; it says nothing
+about a sibling branch for the *same bead* still sitting unmerged. Measured
+live: `wa-a7e98` closed on signal (B) (a terminal gate marker) while
+`crew/batista/wa-a7e98-fix` — 2 commits fixing a since-stale `CLAUDE.md` guard
+section — stayed unmerged, orphaning the fix behind a closed bead.
+
+Before any close actually happens, the janitor now enumerates **every**
+`crew/*/<id>[-<suffix>]` branch on the remote and requires **all** of them to
+be ancestors of `origin/<default>`. If any is pending, the close is vetoed —
+the bead stays open and a comment names the pending branch(es) instead.
+A bead with **zero** crew branches (delivered purely by commit/marker
+evidence) is never blocked by this — it's an all-or-nothing gate over
+*discovered* branches, not a requirement that one exist.
+
 ## Guards (zero false-positive is the paramount constraint)
 
 - **Epics are never auto-closed** (they are parents).
