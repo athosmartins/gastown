@@ -841,7 +841,12 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
         ZV_ACTION=$(reconcile_zero_verdict_run_action "$MARKER_AGE" "$GATE_ZERO_VERDICT_GRACE_MINUTES" "$MARKER_STATUS")
         case "$ZV_ACTION" in
           supersede:still-queued)
-            log "  Vector B (ga-jfo7): closing orphan gate-run $GR_ID (marker age=${MARKER_AGE}m, 0 verdict beads, marker $COMPANION_MARKER_ID still queued — healthy backlog/Dolt-hot defer, nothing stuck)."
+            # ga-4t5xe: reassurance FIRST, entities named explicitly (marker vs.
+            # tracking bead) — three independent readers on 2026-08-01 conflated
+            # "closing $GR_ID" with "the marker died" because the old ordering led
+            # with alarm words ("closing orphan", "0 verdict beads") and buried the
+            # healthy verdict at the end of a long line.
+            log "  Vector B (ga-jfo7): healthy backlog/Dolt-hot defer, nothing stuck — marker $COMPANION_MARKER_ID stays queued and will be reviewed normally; closing $GR_ID (its claim-time tracking bead only — 0 verdict beads, no reviewer was ever attached; marker age=${MARKER_AGE}m)."
             set_gate_status "$GR_ID" "superseded"
             bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-jfo7): orphan claim-time tracking bead closed — 0 verdict beads (no reviewer was ever attached to THIS bead's id) and companion marker $COMPANION_MARKER_ID is still healthily queued. Self-healed by guard." 2>/dev/null || true
             bd -C "$GC_CITY" close "$GR_ID" -r "gate-run superseded (terminal) — 0-verdict orphan tracking bead, marker still queued. Closed by guard (ga-jfo7)." 2>/dev/null || true
