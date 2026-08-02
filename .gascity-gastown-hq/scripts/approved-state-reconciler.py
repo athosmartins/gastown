@@ -61,6 +61,7 @@ import park_labels
 # ── paths ─────────────────────────────────────────────────────────────────────
 CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
 PILOT_LOG = os.path.join(CITY, ".gc/logs/pilot-dispatcher.log")
+GATE_DISPATCHER_LOG = os.path.join(CITY, ".gc/logs/quality-gate-dispatcher.log")
 NOTIFY_BIN = os.environ.get("NOTIFY_BIN", "/Users/athos/.local/bin/notify")
 GC_BIN = os.environ.get("GC_BIN", "gc")
 BD_BIN = os.environ.get("BD_BIN", "bd")
@@ -118,6 +119,13 @@ BD_TIMEOUT = int(os.environ.get("ARC_BD_TIMEOUT", "25"))
 # Pilot alive window: if no Pilot sweep-complete within this many minutes → pilot dead.
 PILOT_ALIVE_WINDOW_MIN = int(os.environ.get("ARC_PILOT_ALIVE_WINDOW_MIN", "20"))
 LOG_TAIL = int(os.environ.get("ARC_LOG_TAIL", "2000"))
+# GATE_LOG_TAIL (ga-dbfm9): quality-gate-dispatcher.log is far chattier than the pilot
+# log (measured 2026-08-02: ~507 lines for a real trailing hour on a busy day) — sized
+# with ~8x margin so _gate_queue_throughput()'s "did the tail reach back a full
+# GATE_QUEUE_WINDOW_MIN" completeness check (see that function) very rarely trips
+# during a genuine traffic burst, not just on the median day.
+GATE_LOG_TAIL = int(os.environ.get("ARC_GATE_LOG_TAIL", "4000"))
+GATE_QUEUE_WINDOW_MIN = int(os.environ.get("ARC_GATE_QUEUE_WINDOW_MIN", "60"))
 FLOW_AUTHORITY_TTL_SEC = int(os.environ.get("ARC_FLOW_AUTHORITY_TTL_SEC", "3600"))
 # Marker label stamped on a bead after its first Step 1b keyword-flag comment. Idempotency
 # gate (ga-1iz2e/AC1): a bead that already carries this label is skipped — comment once,
@@ -166,6 +174,8 @@ _bd_blocked = None          # (rig_root) -> list[dict]|None; None return = query
 _bd_has_built_branch = None  # (bead_id) -> bool; True iff a crew/*/<id> or fix/<id>-*
                               # branch exists (local or origin remote-tracking) anywhere
 _bd_branch_stranded = None  # (bead_id) -> (repo, ref, age_days)|None; ga-32u6s orphan-branch probe
+_bd_gate_queue_markers = None  # () -> list[dict]|None; OPEN gate-status:queued markers (HQ store)
+_read_gate_log_lines = None  # () -> list[str]; tail of quality-gate-dispatcher.log
 
 
 # ── guarded subprocess ────────────────────────────────────────────────────────
@@ -809,7 +819,7 @@ def _alarm_record(state, bead_id):
         return 0.0, 0, None
 
 
-def _alarm_starving(rig_root, bead, age_min, now, state):
+def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_throughput=None):
     """Fire a starve alarm for a buildable bead that has not been dispatched.
 
     This is case 3 of the core guarantee: the bead matched NONE of this
@@ -820,6 +830,14 @@ def _alarm_starving(rig_root, bead, age_min, now, state):
 
     Never fires in DRY_RUN mode. See _alarm_backoff_sec()/_ALARM_ESCALATION_TIERS_SEC
     for the per-bead backoff/dedup policy (AC3) — this is no longer a flat cooldown.
+
+    gate_depth/gate_throughput (ga-dbfm9): the once-per-cycle gate-queue backlog
+    reading from run_cycle() (None if unmeasurable) — this function only renders
+    them into the body via _gate_queue_body_line(); by the time this is called,
+    _process_store() has already consulted _gate_queue_suppress_reason() and
+    decided the backlog does NOT explain the wait (or couldn't be measured), so
+    every alarm that actually fires still needs the context spelled out for the
+    operator (AC1).
     """
     bead_id = bead.get("id") or bead.get("issue_id") or ""
     if not bead_id:
@@ -867,11 +885,14 @@ def _alarm_starving(rig_root, bead, age_min, now, state):
     # incomplete (exactly this bug: blocked-on:/waiting-on:/etc. WERE explicit
     # signals the reconciler simply didn't know). Say what was actually
     # checked, and hedge honestly that the list can itself go stale again.
+    gate_line = _gate_queue_body_line(gate_depth, gate_throughput, age_min)
+
     body = (
         "APPROVED-STATE-RECONCILER: buildable bead starving — dispatch path failing\n\n"
         "Bead: %s — %s\n"
         "Status: story:approved, age: %dmin, not dispatched, pilot alive, "
-        "alarm #%d for this incident\n\n"
+        "alarm #%d for this incident\n"
+        "%s\n\n"
         "This bead matched NONE of this reconciler's known non-buildable signals\n"
         "(blocked-on:*, waiting-on:*, depends-on:*, next-action:*, pool:refused:*,\n"
         "gate:{needs-fix,failed,queued,reviewing,needs-human}, exec:manual,\n"
@@ -886,7 +907,7 @@ def _alarm_starving(rig_root, bead, age_min, now, state):
         "   este reconciler ainda não reconhece — ver _process_store()/\n"
         "   _extra_alarm_suppress_reason() em scripts/approved-state-reconciler.py antes\n"
         "   de re-despachar manualmente ou adicionar story:approved de volta.\n"
-    ) % (bead_id, title, int(age_min), alarm_ordinal, STARVE_MIN, rig_root, bead_id)
+    ) % (bead_id, title, int(age_min), alarm_ordinal, gate_line, STARVE_MIN, rig_root, bead_id)
 
     notify_msg = ("STARVE ALARM%s: bead %s story:approved há %dmin, pilot alive, "
                   "não despachado — dispatch path failing" % (
@@ -1126,6 +1147,160 @@ def _gate_marker_source_beads():
     return out
 
 
+# ── gate-queue backlog (ga-dbfm9) ──────────────────────────────────────────────
+def _gate_queue_depth():
+    """Count of OPEN quality-gate-marker rows currently gate-status:queued in the
+    HQ store — the exact backlog quality-gate-dispatcher.sh's own "Step 0b: Find a
+    queued marker" scan (packs/town-deltas/assets/quality-gate-dispatcher.sh,
+    ~line 4269) works through before it reaches any given marker. Paired with
+    _gate_queue_throughput() by _gate_queue_suppress_reason() — see that
+    function's docstring for the false-positive history this addresses.
+
+    Markers are ALWAYS in the HQ store, same reasoning as
+    _gate_marker_source_beads() above — query CITY once per cycle, not rig_root.
+
+    Returns None on query/parse error — same fail-toward-'cannot confirm
+    suppression' convention as every other None-on-error helper in this file: an
+    unreadable queue depth says nothing about whether a wait is justified, so it
+    must not silently license a suppression (root-class:error-vs-empty).
+    """
+    if _bd_gate_queue_markers is not None:
+        rows = _bd_gate_queue_markers()   # test seam
+    else:
+        r = _sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--json",
+                 "-l", "type:quality-gate-marker", "-l", "gate-status:queued"],
+                timeout=BD_TIMEOUT)
+        if r is None or r.returncode != 0:
+            return None
+        rows = _parse_bd_json(r.stdout, strict=True)
+    if rows is None:
+        return None
+    return len(rows)
+
+
+def _gate_queue_throughput(now):
+    """Verdicts/hour observed in quality-gate-dispatcher.log over the last
+    GATE_QUEUE_WINDOW_MIN minutes, or None if unmeasurable.
+
+    Paired with _gate_queue_depth() by _gate_queue_suppress_reason() to tell an
+    expected gate-review-backlog pacing delay from a genuine dispatch failure —
+    see that function's docstring for the false-positive history (ga-dbfm9).
+
+    Returns None (unmeasurable — caller must NOT default to 0, root-class:
+    error-vs-empty) when:
+      - the log can't be read (_tail() swallows the error and returns [] —
+        indistinguishable at that layer from "empty file", so treat any
+        empty/unreadable tail as failure here, never as "0 runs happened")
+      - the fetched tail (GATE_LOG_TAIL lines) doesn't itself reach back a full
+        GATE_QUEUE_WINDOW_MIN minutes (checked via the oldest timestamp seen) —
+        an UNDERcounted numerator would understate throughput, which makes
+        _gate_queue_suppress_reason MORE eager to suppress (the wrong
+        direction). Better to say "couldn't measure" than silently under-
+        report — this also naturally covers log rotation/startup, where there
+        genuinely isn't a full hour of history yet.
+    """
+    if _read_gate_log_lines is not None:
+        lines = _read_gate_log_lines()   # test seam
+    else:
+        lines = _tail(GATE_DISPATCHER_LOG, GATE_LOG_TAIL)
+
+    if not lines:
+        return None
+
+    cutoff = now - GATE_QUEUE_WINDOW_MIN * 60
+    count = 0
+    oldest_epoch = None
+    for line in lines:
+        epoch = _ts_epoch(line)
+        if epoch is None:
+            continue
+        if oldest_epoch is None or epoch < oldest_epoch:
+            oldest_epoch = epoch
+        if epoch >= cutoff and "Gate run complete" in line and "verdict=" in line:
+            count += 1
+
+    if oldest_epoch is None or oldest_epoch > cutoff:
+        return None  # tail didn't reach back a full window — can't confirm the count
+
+    return count / (GATE_QUEUE_WINDOW_MIN / 60.0)
+
+
+def _gate_queue_suppress_reason(gate_depth, gate_throughput, age_min):
+    """Suppress reason if the gate-review backlog alone explains this starving
+    bead's dispatch wait, else None (ga-dbfm9).
+
+    ROOT CAUSE (3 false positives observed 2026-08-01: wa-skhsx, wa-n2anz,
+    wa-4s4cc): _alarm_starving fires purely on "not dispatched, pool has a free
+    slot" — it has no signal for *why* the Pilot hasn't gotten to a bead yet.
+    All three incidents shared one explanation this reconciler couldn't see: the
+    gate REVIEW queue (a separate resource from the builder pool
+    _pool_has_capacity already checks) was 30-43 markers deep at ~5 verdicts/
+    hour — a multi-hour backlog. A bead waiting less than that projected
+    backlog is waiting on system load, not a broken dispatch path.
+
+    Pure function over already-measured (once per cycle) inputs — no I/O.
+
+    Returns None (do NOT suppress — fall through to alarm) when:
+      - either measurement is None (an unmeasured queue must never license a
+        suppression — root-class:error-vs-empty)
+      - gate_depth == 0 — a confirmed EMPTY queue never explains a wait (this
+        check may only EXPLAIN a wait, never blanket-silence the alarm — a
+        genuinely non-dispatched bead with an empty queue must still alarm)
+      - gate_throughput <= 0 — measured, but zero verdicts in the window; the
+        projected drain time is undefined/infinite. A stalled gate is a
+        DIFFERENT problem (surfaced by other watchdogs) and must not become an
+        unbounded free pass for an unrelated dispatch failure here
+      - the projected drain time (gate_depth/gate_throughput, in minutes) does
+        not exceed this bead's own age_min — the queue hasn't actually held it
+        up that long
+
+    A reason string (suppress) only when depth>0, throughput>0, and the
+    projected drain time exceeds age_min — a positively-measured explanation,
+    never a default.
+    """
+    if gate_depth is None or gate_throughput is None:
+        return None
+    if gate_depth == 0:
+        return None
+    if gate_throughput <= 0:
+        return None
+    projected_wait_min = (gate_depth / gate_throughput) * 60.0
+    if projected_wait_min > age_min:
+        return ("gate queue backlog explains wait (depth=%d queued, "
+                 "throughput=%.1f verdict/h, projected=%.0fmin > age=%.0fmin)"
+                 % (gate_depth, gate_throughput, projected_wait_min, age_min))
+    return None
+
+
+def _gate_queue_body_line(gate_depth, gate_throughput, age_min):
+    """Format the gate-queue context line for _alarm_starving's mail body — AC1
+    (ga-dbfm9): depth + throughput + this bead's standing relative to the
+    projected drain time, or an explicit measurement-failure note. NEVER
+    silent, NEVER fabricates a 0 for a value that could not be measured (see
+    _gate_queue_depth()/_gate_queue_throughput()'s own docstrings)."""
+    if gate_depth is None or gate_throughput is None:
+        depth_txt = ("%d marker(s)" % gate_depth) if gate_depth is not None else "COULD NOT MEASURE"
+        tp_txt = ("%.1f verdict(s)/h" % gate_throughput) if gate_throughput is not None else "COULD NOT MEASURE"
+        return ("Gate queue: %s gate-status:queued | throughput (last %dmin): %s "
+                 "| queue-based suppression NOT applied — measurement incomplete, "
+                 "alarm kept (safe default)." % (depth_txt, GATE_QUEUE_WINDOW_MIN, tp_txt))
+    if gate_depth == 0:
+        return ("Gate queue: 0 marker(s) gate-status:queued (empty) | throughput "
+                 "(last %dmin): %.1f verdict(s)/h | empty queue never explains a "
+                 "wait." % (GATE_QUEUE_WINDOW_MIN, gate_throughput))
+    if gate_throughput <= 0:
+        return ("Gate queue: %d marker(s) gate-status:queued | throughput (last "
+                 "%dmin): 0 verdict(s)/h (gate idle or stalled) | projected drain "
+                 "undefined — queue-based suppression NOT applied." % (
+                 gate_depth, GATE_QUEUE_WINDOW_MIN))
+    projected_wait_min = (gate_depth / gate_throughput) * 60.0
+    return ("Gate queue: %d marker(s) gate-status:queued | throughput (last "
+             "%dmin): %.1f verdict(s)/h | projected drain: ~%.0fmin vs this "
+             "bead's wait: %.0fmin — queue does NOT explain the wait." % (
+             gate_depth, GATE_QUEUE_WINDOW_MIN, gate_throughput,
+             projected_wait_min, age_min))
+
+
 def _blocked_bead_ids(rig_root):
     """Set of bead ids in `rig_root` currently blocked by an open formal dependency
     (ga-yavyq AC2), per bd's own blocker-aware `bd blocked` computation.
@@ -1345,7 +1520,8 @@ def _branch_stranded_reason(bead_id):
 
 
 # ── process one store ─────────────────────────────────────────────────────────
-def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
+def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
+                    gate_depth=None, gate_throughput=None):
     """Scan story:approved open beads in rig_root; classify and act on each one.
 
     built_ids: set of bead ids with a live BUILT marker (from _gate_marker_source_beads(),
@@ -1356,6 +1532,12 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
     (from _blocked_bead_ids(rig_root), computed once per rig_root — dependencies are
     rig-scoped, unlike built_ids), or None if that query failed (same fail-safe: caller
     must not alarm when dependency-block state is unknown, ga-yavyq AC2).
+
+    gate_depth/gate_throughput (ga-dbfm9): gate-review backlog reading from
+    _gate_queue_depth()/_gate_queue_throughput(), computed ONCE per cycle in
+    run_cycle() (HQ-global, same reasoning as built_ids) — None if unmeasurable.
+    Consulted by _gate_queue_suppress_reason() immediately before the starve
+    alarm fires, and rendered into that alarm's body regardless.
 
     Returns (processed, routed, alarmed) int counts.
     On query error: logs + returns (0, 0, 0) — fail-open; other stores are unaffected.
@@ -1691,8 +1873,23 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids):
             alarmed += 1
             continue
 
+        # GATE QUEUE BACKLOG (ga-dbfm9): the gate-review queue is a separate resource
+        # from the builder pool _pool_has_capacity already checked above; a deep
+        # backlog there paces down how fast the Pilot effectively gets to new
+        # dispatches even with a free pool slot (3 false positives 2026-08-01:
+        # wa-skhsx, wa-n2anz, wa-4s4cc — see _gate_queue_suppress_reason()'s
+        # docstring for the full incident analysis). Checked LAST, right before the
+        # alarm itself — every other, cheaper/more-specific suppression above still
+        # wins first.
+        gate_suppress_reason = _gate_queue_suppress_reason(
+            gate_depth, gate_throughput, starve_age_min)
+        if gate_suppress_reason is not None:
+            _log("  %s: no signal, daemon-age=%.0fmin, %s — no alarm" % (
+                 bead_id, starve_age_min, gate_suppress_reason))
+            continue
+
         # ALARM: buildable bead starving, pilot alive, pool has capacity, dispatch failing.
-        _alarm_starving(rig_root, bead, starve_age_min, now, state)
+        _alarm_starving(rig_root, bead, starve_age_min, now, state, gate_depth, gate_throughput)
         alarmed += 1
 
     return processed, routed, alarmed
@@ -1718,6 +1915,21 @@ def run_cycle(now, state):
         _log("  gate-marker query FAILED — built-bead check degrades fail-safe "
              "(no starve alarms this cycle on the BUILT check; see ga-6927)")
 
+    # Gate-review backlog (ga-dbfm9): also HQ-global — same once-per-cycle
+    # reasoning as built_ids above, not once-per-bead (would re-run the same bd
+    # query and re-scan the same log tail once per starving bead in this cycle).
+    # None = unmeasurable; _gate_queue_suppress_reason() treats that as "cannot
+    # confirm suppression" (fail toward alarming), never as an empty/zero queue.
+    gate_depth = _gate_queue_depth()
+    if gate_depth is None:
+        _log("  gate-queue depth query FAILED — starve-alarm queue-backlog "
+             "suppression degrades to 'unmeasured' this cycle (see ga-dbfm9)")
+    gate_throughput = _gate_queue_throughput(now)
+    if gate_throughput is None:
+        _log("  gate-queue throughput unmeasurable (log unreadable or tail didn't "
+             "reach back %dmin) — starve-alarm queue-backlog suppression degrades "
+             "to 'unmeasured' this cycle (see ga-dbfm9)" % GATE_QUEUE_WINDOW_MIN)
+
     total_p = total_r = total_a = 0
 
     for rig_root in RIG_ROOTS:
@@ -1738,7 +1950,7 @@ def run_cycle(now, state):
                  "check; see ga-yavyq)" % rig_root)
         try:
             p, r, a = _process_store(rig_root, now, state, pilot_alive, built_ids,
-                                      blocked_ids)
+                                      blocked_ids, gate_depth, gate_throughput)
             total_p += p
             total_r += r
             total_a += a
@@ -1893,6 +2105,21 @@ def _selftest():
       (ga-32u6s-d) branch-stranded alert does not repeat across cycles for
                 the same bead — local state backstop, mirrors
                 _alarm_reclaim_exhausted's one-time-only shape (scenario (t))
+      (ga-dbfm9-a) gate queue backlog (depth=30, throughput=5/h) projects a
+                wait longer than this bead's age → starve alarm SUPPRESSED
+                (the wa-skhsx/wa-n2anz/wa-4s4cc false-positive shape)
+      (ga-dbfm9-b) falsification: small backlog (projected drain < bead age)
+                → STILL alarms; body carries the measured depth+throughput+
+                projected drain (AC1)
+      (ga-dbfm9-c) both queue measurements fail (depth query errors, log
+                unreadable) → STILL alarms (never silently suppressed on
+                unmeasurable data) with body saying "COULD NOT MEASURE",
+                never a fabricated 0 (root-class:error-vs-empty, AC4)
+      (ga-dbfm9-d) depth=0 (confirmed EMPTY queue) → STILL alarms regardless
+                of throughput — explicit non-suppression floor ("não
+                desligue a checagem... fila VAZIA continua alarmando")
+      (ga-dbfm9-e) throughput=0 measured (e.g. stalled gate) with depth>0 →
+                STILL alarms, no division-by-zero crash
       (ga-32u6s-e) gate-fix-1 regression guard: _real_branch_stranded_reason's
                 merge-base ancestry check must fail OPEN (None) when
                 `git merge-base --is-ancestor` is unresolvable — both
@@ -1907,6 +2134,7 @@ def _selftest():
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
     global _bd_blocked, _bd_show_full, _bd_has_built_branch, _bd_branch_stranded
+    global _bd_gate_queue_markers, _read_gate_log_lines
     global DRY_RUN, STARVE_MIN, FLOW_GRACE_MIN, ROUTE_COOLDOWN_SEC, ALARM_COOLDOWN_SEC
     global _OWNERSHIP_REPOS
 
@@ -1962,19 +2190,28 @@ def _selftest():
         docstring, instead of ballooning in wall-clock as scenario count grows.
 
         Returns a generic "successful, empty" response (rc=0, stdout="[]") rather
-        than a failure — the two real call sites this can reach when their own
-        seam is unstubbed (_pool_has_capacity's `gc session list`, and
-        _gate_marker_source_beads' `bd ... type:quality-gate-marker` fallback)
-        need DIFFERENT-looking failure handling: an rc!=0 here would make the
-        marker query return None (query error) instead of an empty set, which
-        flips built_ids-is-None → "unknown, fail-safe, no alarm" for every
-        scenario that doesn't explicitly stub _bd_gate_markers — silently
-        suppressing the very alarms scenarios (g)/(o)/(dd)/etc. exist to check
-        for. "[]" satisfies both: the marker query parses it as zero open
-        markers (correct, harmless); gc-session-list's dict .get() raises on a
-        bare list, caught by that call site's own try/except → "capacity
-        unknown, alarm conservatively" — the same fail-open outcome, just via
-        the exception path instead of the empty-stdout path.
+        than a failure — the three real call sites this can reach when their own
+        seam is unstubbed (_pool_has_capacity's `gc session list`,
+        _gate_marker_source_beads' `bd ... type:quality-gate-marker` fallback,
+        and _gate_queue_depth's `bd ... gate-status:queued` fallback) need
+        DIFFERENT-looking failure handling: an rc!=0 here would make the marker
+        query return None (query error) instead of an empty set, which flips
+        built_ids-is-None → "unknown, fail-safe, no alarm" for every scenario
+        that doesn't explicitly stub _bd_gate_markers — silently suppressing the
+        very alarms scenarios (g)/(o)/(dd)/etc. exist to check for. "[]"
+        satisfies all three: the marker/queue-depth queries parse it as zero
+        rows (correct, harmless — for gate-queue depth specifically, depth=0
+        is also the deliberate neutral default: _gate_queue_suppress_reason()
+        never suppresses on a confirmed-empty queue, so scenarios that don't
+        care about the gate-queue feature are unaffected); gc-session-list's
+        dict .get() raises on a bare list, caught by that call site's own
+        try/except → "capacity unknown, alarm conservatively" — the same
+        fail-open outcome, just via the exception path instead of the
+        empty-stdout path. Every OTHER real _sh call site (label add/remove/
+        comment, notify, mail send, the main story:approved query) is only
+        reached when its own dedicated seam (_bd_label_add etc.) is None, and
+        every scenario in this suite always stubs those directly — this
+        generic fallback never reaches them.
 
         ga-lzxhi: `git for-each-ref` (_real_has_built_branch, reached whenever a
         scenario doesn't stub _bd_has_built_branch) is NOT a JSON caller — it
@@ -2001,6 +2238,18 @@ def _selftest():
     _do_mail_mayor = _stub_mail
     _do_notify = _stub_notify
     _sh = _stub_sh_fast
+    # Hermetic default for the gate-queue throughput log read (ga-dbfm9): unlike
+    # the bd-query seams above, _gate_queue_throughput() does its own file I/O
+    # via _tail() when _read_gate_log_lines is unstubbed — it never routes
+    # through _sh/_stub_sh_fast, so without this it would read the REAL
+    # quality-gate-dispatcher.log on disk during every scenario below, violating
+    # this suite's own "stubs all I/O" docstring. Empty tail → unmeasurable
+    # (None) → _gate_queue_suppress_reason() never suppresses (paired with the
+    # gate_depth=0 default above) — the same neutral, alarm-preserving default
+    # any scenario not explicitly testing the gate-queue feature relies on.
+    # Scenarios below that DO test it override this directly, same convention
+    # as _read_pilot_log_lines.
+    _read_gate_log_lines = lambda: []
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _make_bead(bid, labels=None, title="Test story", assignee="",
@@ -3180,6 +3429,112 @@ def _selftest():
     else:
         _bad("(ga-32u6s-d)", "first_cycle_count=%d second_cycle_count=%d" % (
              first_cycle_count, second_cycle_count))
+
+    # ── gate-queue backlog suppression (ga-dbfm9) ─────────────────────────────
+    def _gate_log_fixture(verdict_epochs, filler_before=True):
+        """Fake quality-gate-dispatcher.log lines: one 'Gate run complete ...
+        verdict=' line per epoch in verdict_epochs, plus (if filler_before) one
+        OLD non-matching line at NOW-2h so _gate_queue_throughput's reach-back
+        completeness check is satisfied without the fixture needing to straddle
+        the exact 1h window boundary itself."""
+        lines = []
+        if filler_before:
+            old_ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(NOW - 2 * 3600))
+            lines.append("%s [quality-gate-dispatcher] unrelated log line" % old_ts)
+        for e in verdict_epochs:
+            ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(e))
+            lines.append("%s [quality-gate-dispatcher] === Gate run complete: "
+                          "gate_run=ga-wisp-x branch=crew/x verdict=PASS elapsed=1s ==="
+                          % ts)
+        return lines
+
+    print("\nScenario (ga-dbfm9-a): gate queue backlog (depth=30, throughput=5/h) "
+          "projects a wait > bead age → starve alarm SUPPRESSED")
+    _bd_gate_queue_markers = lambda: [{"id": "ga-wisp-%d" % i} for i in range(30)]
+    _read_gate_log_lines = lambda: _gate_log_fixture([NOW - i * 600 for i in range(5)])
+    _bd_approved = lambda root: [_make_bead("hq-042", age_min=_STARVE + 5.0)]  # 25min old
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["hq-042"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    if not mail_calls and not notify_calls:
+        _ok("(ga-dbfm9-a): depth=30/throughput=5.0/h projects ~360min wait > "
+            "bead age 25min → starve alarm suppressed")
+    else:
+        _bad("(ga-dbfm9-a)", "mail_calls=%s notify_calls=%s" % (mail_calls, notify_calls))
+
+    print("\nScenario (ga-dbfm9-b): falsification — small backlog (depth=1, "
+          "throughput=5/h) does NOT explain the wait → STILL alarms; body carries "
+          "measured depth+throughput+projected drain (AC1)")
+    _bd_gate_queue_markers = lambda: [{"id": "ga-wisp-only"}]
+    _read_gate_log_lines = lambda: _gate_log_fixture([NOW - i * 600 for i in range(5)])
+    _bd_approved = lambda root: [_make_bead("hq-043", age_min=_STARVE + 5.0)]  # 25min old
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["hq-043"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    body_b = next((b for s, b in mail_calls if "hq-043" in s), None)
+    has_depth_b = body_b is not None and "1 marker(s)" in body_b
+    has_tp_b = body_b is not None and "5.0 verdict(s)/h" in body_b
+    has_drain_b = body_b is not None and "projected drain" in body_b
+    if body_b is not None and has_depth_b and has_tp_b and has_drain_b:
+        _ok("(ga-dbfm9-b): depth=1/throughput=5.0/h projects ~12min wait <= bead "
+            "age 25min → alarm fires; body shows depth+throughput+projected drain")
+    else:
+        _bad("(ga-dbfm9-b)", "body=%r" % (body_b,))
+
+    print("\nScenario (ga-dbfm9-c): both queue measurements fail (depth query "
+          "errors, log unreadable) → STILL alarms, body says COULD NOT MEASURE "
+          "(never silent, never a fabricated 0 — root-class:error-vs-empty, AC4)")
+    _bd_gate_queue_markers = lambda: None   # simulated query error
+    _read_gate_log_lines = lambda: []       # simulated unreadable/empty log
+    _bd_approved = lambda root: [_make_bead("hq-044", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["hq-044"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    body_c = next((b for s, b in mail_calls if "hq-044" in s), None)
+    if body_c is not None and "COULD NOT MEASURE" in body_c and "0 marker" not in body_c:
+        _ok("(ga-dbfm9-c): unmeasurable queue → alarm STILL fires (not silenced) "
+            "with an honest 'COULD NOT MEASURE' note, not a fabricated 0")
+    else:
+        _bad("(ga-dbfm9-c)", "body=%r" % (body_c,))
+
+    print("\nScenario (ga-dbfm9-d): confirmed EMPTY gate queue (depth=0) → STILL "
+          "alarms regardless of throughput (empty queue never explains a wait)")
+    _bd_gate_queue_markers = lambda: []     # confirmed empty, not an error
+    _read_gate_log_lines = lambda: _gate_log_fixture([NOW - i * 150 for i in range(20)])
+    _bd_approved = lambda root: [_make_bead("hq-045", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["hq-045"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    if any("hq-045" in subj for subj, _ in mail_calls):
+        _ok("(ga-dbfm9-d): depth=0 (confirmed empty) → alarm still fires, high "
+            "throughput does not create a false suppression")
+    else:
+        _bad("(ga-dbfm9-d)", "mail_calls=%s" % (mail_calls,))
+
+    print("\nScenario (ga-dbfm9-e): throughput=0 measured (stalled gate) + depth=10 "
+          "→ STILL alarms, no division-by-zero crash")
+    _bd_gate_queue_markers = lambda: [{"id": "ga-wisp-%d" % i} for i in range(10)]
+    _read_gate_log_lines = lambda: _gate_log_fixture([])  # filler only, zero verdicts
+    _bd_approved = lambda root: [_make_bead("hq-046", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["hq-046"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    body_e = next((b for s, b in mail_calls if "hq-046" in s), None)
+    if body_e is not None and "0 verdict(s)/h" in body_e:
+        _ok("(ga-dbfm9-e): throughput=0.0/h (measured, stalled gate) + depth=10 → "
+            "alarm still fires (undefined projection ≠ suppression), no crash")
+    else:
+        _bad("(ga-dbfm9-e)", "mail_calls=%s body=%r" % (mail_calls, body_e))
+
+    # Restore the neutral hermetic defaults so later scenarios (which don't
+    # exercise the gate-queue feature) are unaffected by the last fixture above.
+    _bd_gate_queue_markers = None
+    _read_gate_log_lines = lambda: []
 
     print("\nScenario (ga-32u6s-e) gate-fix-1 regression guard: unresolvable "
           "`git merge-base --is-ancestor` (r is None, or returncode not in (0,1) e.g. "
