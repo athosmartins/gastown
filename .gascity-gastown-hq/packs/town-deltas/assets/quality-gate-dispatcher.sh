@@ -6208,7 +6208,7 @@ case "$DIFF_LINE_COUNT" in ''|*[!0-9]*) DIFF_LINE_COUNT=0 ;; esac
 _VT_BASE="$VERDICT_TIMEOUT_MINUTES"
 VERDICT_TIMEOUT_MINUTES=$(gate_scaled_verdict_timeout "$_VT_BASE" "$DIFF_FILE_COUNT" "$DIFF_LINE_COUNT")
 if [ "$VERDICT_TIMEOUT_MINUTES" != "$_VT_BASE" ]; then
-  log "ga-ltr3c: scaled verdict timeout ${_VT_BASE}m → ${VERDICT_TIMEOUT_MINUTES}m for diff (${DIFF_FILE_COUNT} files, ${DIFF_LINE_COUNT} lines; cap=${VERDICT_TIMEOUT_MAX_MINUTES}m)."
+  log "ga-ltr3c: scaled verdict timeout ${_VT_BASE}m → ${VERDICT_TIMEOUT_MINUTES}m for diff (marker=${MARKER_ID} bead=${BEAD_ID} ${DIFF_FILE_COUNT} files, ${DIFF_LINE_COUNT} lines; cap=${VERDICT_TIMEOUT_MAX_MINUTES}m)."
 fi
 
 # ga-evjs2: scale the frozen-reviewer staleness window by the SAME diff size, so a
@@ -6217,7 +6217,7 @@ fi
 # probe below. Falls back to REVIEWER_STALE_SECS for any path that skips this block.
 REVIEWER_STALE_SECS_SCALED=$(gate_scaled_reviewer_stale "$REVIEWER_STALE_SECS" "$DIFF_FILE_COUNT" "$DIFF_LINE_COUNT")
 if [ "$REVIEWER_STALE_SECS_SCALED" != "$REVIEWER_STALE_SECS" ]; then
-  log "ga-evjs2: scaled reviewer-staleness window ${REVIEWER_STALE_SECS}s → ${REVIEWER_STALE_SECS_SCALED}s for diff (${DIFF_FILE_COUNT} files, ${DIFF_LINE_COUNT} lines; cap=${REVIEWER_STALE_MAX_SECS}s)."
+  log "ga-evjs2: scaled reviewer-staleness window ${REVIEWER_STALE_SECS}s → ${REVIEWER_STALE_SECS_SCALED}s for diff (marker=${MARKER_ID} bead=${BEAD_ID} ${DIFF_FILE_COUNT} files, ${DIFF_LINE_COUNT} lines; cap=${REVIEWER_STALE_MAX_SECS}s)."
 fi
 
 TIER="CODE"

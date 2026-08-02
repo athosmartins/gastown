@@ -1,0 +1,5 @@
+[order]
+description = "Semanal: correlaciona tamanho do diff x veredito do gate e manda ao Mayor decidir o passo 2 do ga-ub8yq"
+trigger = "cooldown"
+interval = "168h"
+exec = "bash /Users/athos/gt/.gascity-gastown-hq/scripts/gate-review-size-report-mail.sh"
