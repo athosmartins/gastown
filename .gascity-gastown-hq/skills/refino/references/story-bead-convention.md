@@ -191,6 +191,38 @@ bd -C "$GC_CITY_PATH" update "$ID" \
   --set-metadata "story.aprovado_em=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ```
 
+### Preserving 🚨 compliance/safety blocks on rewrite (ga-fnnyy)
+
+`--description` is a full REPLACE, not an append (`bd` has no append-description
+primitive — only `--append-notes`, a separate field). If the bead's CURRENT
+description contains a line starting with 🚨 — an agent-authored compliance or
+safety gate, e.g. `"🚨 PORTÃO DE COMPLIANCE — LGPD: expor dado de proprietário
+na ficha é exposição de dado pessoal. Checar ANTES de implementar, não
+depois."` — step 2 above MUST NOT silently drop it. This is not hypothetical:
+it happened for real (`wa-qgft5`, 2026-08-02) and the bead nearly got
+auto-dispatched with an unchecked LGPD exposure because the gate lived only as
+prose that a rewrite discarded.
+
+Before running step 2's `--description` update:
+
+1. Read the CURRENT description (`bd show "$ID" --json | jq -r '.[0].description'`)
+   and check for any line starting with 🚨.
+2. If found, carry it forward **verbatim** (character-for-character, not
+   paraphrased) into the new description text you pass to `--description` —
+   e.g. append it under a trailing `## Portões preservados` heading.
+3. Also add these two labels, structurally, so the gate does not depend on the
+   preserved text surviving a FUTURE rewrite or being read at all:
+   ```bash
+   bd -C "$GC_CITY_PATH" label add "$ID" "needs-human"
+   bd -C "$GC_CITY_PATH" label add "$ID" "pilot:no-auto-dispatch"
+   ```
+   A human clears both explicitly once the compliance/safety concern has
+   actually been addressed — do not clear them as part of a routine refino
+   pass.
+
+If the current description has zero 🚨 lines, none of the above applies —
+proceed with step 2 as normal.
+
 ### Saving partial progress (session interrupted)
 
 ```bash

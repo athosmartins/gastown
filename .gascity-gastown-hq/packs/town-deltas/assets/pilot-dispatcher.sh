@@ -1745,6 +1745,26 @@ _filter_candidates() {
         and (((.title // "") + " " + (.description // ""))
              | test("s[óo] o athos decide"; "i")
              | not)
+        # ga-fnnyy: same belt-and-suspenders shape as the two vetoes directly
+        # above, for a third failure mode in the identical class — a signal
+        # that lives only in prose might never get labeled. Here the prose
+        # signal is an agent-authored compliance/safety gate (e.g. "🚨 PORTÃO
+        # DE COMPLIANCE — LGPD: ..."), and the label never arriving is not
+        # hypothetical: the auto-refino --description rewrite (see
+        # auto-refino-dispatcher.sh REFINE_TASK write-back) is what deletes
+        # it, so the one thing the label-based vetoes above depend on
+        # (needs-human / pilot:no-auto-dispatch actually landing) can be
+        # destroyed by that same daemon write-back before this filter ever
+        # runs. Scan title+description directly, same as the two vetoes
+        # above, so dispatch cannot proceed on an unresolved 🚨 marker
+        # regardless of whether the label side of the fix held. Self-clears
+        # once a human either labels the bead (existing vetoes above then
+        # hold it) or resolves/removes the marker text. Marker-specific
+        # (the literal emoji), not keyword-based — deliberately narrow to
+        # avoid false-positiving on ordinary safety-adjacent prose.
+        # NOTE: no literal apostrophes anywhere in this comment block —
+        # same reason as the DECISAO comment above (single-quoted jq arg).
+        and (((.title // "") + " " + (.description // "")) | test("🚨") | not)
      )]' \
     2>/dev/null)
   [ -z "$_cf_out" ] && _cf_out="[]"
@@ -1801,7 +1821,9 @@ _filter_candidates() {
            elif ( ((($b.title // "") + " " + ($b.description // ""))
                    | test("s[óo] o athos decide"; "i")) )
            then "athos-decide-phrase-text-pattern"
-           else empty end)
+           else empty end),
+          (if ( ((($b.title // "") + " " + ($b.description // "")) | test("🚨")) )
+           then "compliance-marker-text-pattern" else empty end)
         ] as $reasons
       | select(($reasons | length) > 0)
       | [$id, ($reasons | join(";"))] | @tsv

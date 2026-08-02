@@ -1069,6 +1069,35 @@ BENIGN_DECISION_WORD='[{"id":"bd-benign-decision","assignee":null,"labels":[],"t
 echo "$_FC_FN" | grep -qE 'DECIS\[' && ok "_filter_candidates carries the DECISAO/DECISION title-anchor clause" || bad "DECISAO/DECISION title-anchor clause missing from _filter_candidates"
 echo "$_FC_FN" | grep -qE 'athos decide' && ok "_filter_candidates carries the so-o-Athos-decide body-phrase clause" || bad "so-o-Athos-decide body-phrase clause missing from _filter_candidates"
 
+# ── Scenario ga-fnnyy: 🚨 compliance/safety marker excluded via body-text veto,
+# independent of labels ──────────────────────────────────────────────────────
+# wa-qgft5: the Mayor wrote "🚨 PORTÃO DE COMPLIANCE — LGPD: expor dado de
+# proprietário na ficha é exposição de dado pessoal. Checar ANTES de
+# implementar, não depois." into a story description. auto-refino's own
+# --description rewrite (a full replace, see auto-refino-dispatcher.sh
+# REFINE_TASK) then silently deleted that paragraph, and with the dependency
+# closed and the bead in story:approved, the reconciler alarmed that Pilot
+# WASN'T dispatching it — i.e. the system was complaining that nobody had yet
+# shipped unchecked personal-data exposure. Same belt-and-suspenders shape as
+# the DECISAO veto directly above: a bead carrying a 🚨 line in title or
+# description must never be dispatched, even with zero human-gate labels,
+# because the ONE thing the label-based vetoes depend on (needs-human /
+# pilot:no-auto-dispatch actually landing) is exactly what this daemon's own
+# write-back can destroy before this filter ever runs.
+echo "Scenario ga-fnnyy: 🚨-marked description excluded even with zero human-gate labels; clean sibling kept"
+COMPLIANCE_MARKED='[{"id":"bd-compliance","assignee":null,"labels":["story:approved"],"title":"aplicar consulta-ao-vivo ao proprietario","description":"🚨 PORTAO DE COMPLIANCE — LGPD: expor dado de proprietario na ficha e exposicao de dado pessoal. Checar ANTES de implementar, nao depois."},{"id":"bd-clean","assignee":null,"labels":["story:approved"],"title":"fix pagination bug","description":"fixture body"}]'
+[ "$(_fc "$COMPLIANCE_MARKED")" = '["bd-clean"]' ] && ok "ga-fnnyy: 🚨-marked bead excluded; clean sibling kept" || bad "ga-fnnyy: compliance-marker veto failed (got: $(_fc "$COMPLIANCE_MARKED"))"
+
+echo "Scenario ga-fnnyy-title: 🚨 in TITLE alone (no description) also excludes, same title+description combined scan as the DECISAO/engine-rebuild vetoes"
+TITLE_ONLY='[{"id":"bd-title-marker","assignee":null,"labels":[],"title":"🚨 needs legal review before shipping","description":"fixture body"},{"id":"bd-keep-title","assignee":null,"labels":[],"title":"Fix pagination bug","description":"fixture body"}]'
+[ "$(_fc "$TITLE_ONLY")" = '["bd-keep-title"]' ] && ok "ga-fnnyy: 🚨-marked title excluded; unrelated bug kept" || bad "ga-fnnyy: title-only compliance-marker veto failed (got: $(_fc "$TITLE_ONLY"))"
+
+echo "Scenario ga-fnnyy-noemoji: plain-language safety mention WITHOUT the 🚨 marker is NOT caught (marker-specific, not keyword-based — no over-broad regex)"
+NO_EMOJI='[{"id":"bd-no-emoji","assignee":null,"labels":[],"title":"expose owner data on the ficha","description":"this touches personal data, compliance should look at it eventually"}]'
+[ "$(_fc "$NO_EMOJI")" = '["bd-no-emoji"]' ] && ok "ga-fnnyy: no false-positive on safety-adjacent prose lacking the 🚨 marker" || bad "ga-fnnyy: REGRESSION — non-marked bead wrongly excluded (got: $(_fc "$NO_EMOJI"))"
+
+echo "$_FC_FN" | grep -qF '🚨' && ok "_filter_candidates carries the 🚨 compliance-marker clause" || bad "🚨 compliance-marker clause missing from _filter_candidates"
+
 # ── Scenario OWN-GUARD (ga-htjni ext; wa-5wv49 / wa-xnuxd) ──────────────────────
 # The reported systemic double-dispatch: a crew/human creates a bead intending to
 # build it THEMSELVES and claims it (status=in_progress + assignee=<self>) — yet the

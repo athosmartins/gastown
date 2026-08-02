@@ -1220,6 +1220,16 @@ Description / context:
 $STORY_DESC
 $GATE_NOTES_BLOCK
 
+🚨 COMPLIANCE/SAFETY GATE CHECK (ga-fnnyy) — read before you touch --description:
+Scan the "Description / context" above for any line starting with a 🚨 marker
+(an agent-authored compliance/safety gate — e.g. LGPD, PII exposure, legal or
+financial risk). If you find one, you must not let --description silently
+drop it — carry every 🚨 line forward verbatim (character-for-character, do
+not paraphrase or summarize) into the new description you write back, e.g.
+under a trailing "## Portoes preservados" heading. This applies on EVERY path
+below, REFINE or ESCALATE alike. If you find zero 🚨 lines in the original
+description, ignore this section entirely.
+
 SIMPLIFICADO FIELD SET (fill F1, F2, F6, F7, F8; F3/F4/F5 are skipped):
   F1 story.resumo       — headline em 1 frase (<=15 palavras, orientada a ação,
                           sem "sistema deve"/voz passiva).
@@ -1267,6 +1277,11 @@ bd -C "$AR_BEAD_STORE" update "$STORY_ID" \\
   --set-metadata "story.dashboard=$SKIP_SENTINEL" \\
   --set-metadata "story.refino_mode=simplificado" \\
   --set-metadata "story.refino_refiner=$AUTO_REFINO_ACTOR"
+# ga-fnnyy: ONLY if the original description had a 🚨 block (skip these two
+# lines entirely if it did not) — the preserved text above must not depend
+# solely on being read; stamp a structural dispatch hold too:
+bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "needs-human"
+bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "pilot:no-auto-dispatch"
 # Hand to the refino gate (the 'em revisão' pill keys off story:refino-review).
 # Transition ADDITIVELY (remove the in-progress lifecycle, add refino-review) so
 # unrelated labels are preserved; do NOT use --set-labels (it would clobber them).
@@ -1325,6 +1340,9 @@ bd -C "$AR_BEAD_STORE" close "$TASK_BEAD_ID"
 RULES: Never write story:approved or story:needs-approval. Never dispatch.
 Never invent a product decision — when in doubt, ESCALATE. Do not start any
 other work. Record the outcome and exit.
+🚨 Never let --description silently drop a 🚨-marked line from the original —
+carry it forward verbatim, and on the REFINE path also add needs-human +
+pilot:no-auto-dispatch when (and only when) one was present.
 TASK
 
 # ── Step 5: Spawn the Sonnet refiner session ──────────────────────────────────

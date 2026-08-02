@@ -511,6 +511,40 @@ else
 fi
 rm -rf "$_drycity"
 
+# ── Drift-guard ga-fnnyy: 🚨 compliance/safety block preservation ────────────
+# Bug ga-fnnyy: auto-refino's --description rewrite (step 4 REFINE_TASK,
+# "IF YOU CAN REFINE" path) silently dropped a 🚨-marked compliance gate the
+# Mayor had written into a story's description (wa-qgft5, LGPD/PII exposure),
+# and nothing blocked the resulting bead from being auto-dispatched — the
+# reconciler even alarmed that it WASN'T being dispatched. These are
+# grep-based drift-guards (same idiom as guards 1-8 above): the actual
+# preserve-or-not decision is made by the spawned LLM refiner reading this
+# heredoc as a prompt, not by testable shell logic, so the guarantee here is
+# "the instruction ships in the prompt", not "the behavior is unit-testable".
+_flat_task="$(tr '\n' ' ' < "$DISPATCHER")"
+if grep -q '🚨' "$DISPATCHER"; then
+  ok "ga-fnnyy: REFINE_TASK heredoc mentions the 🚨 compliance marker"
+else
+  bad "ga-fnnyy: REFINE_TASK heredoc has no mention of the 🚨 marker — nothing tells the refiner to preserve it"
+fi
+if printf '%s' "$_flat_task" | grep -qiF 'must not let --description silently drop it'; then
+  ok "ga-fnnyy: REFINE_TASK heredoc has an explicit preserve-verbatim instruction for 🚨 blocks"
+else
+  bad "ga-fnnyy: REFINE_TASK heredoc does not explicitly instruct verbatim preservation of 🚨 blocks"
+fi
+if grep -q 'label add "\$STORY_ID" "needs-human"' "$DISPATCHER" \
+   && grep -q 'label add "\$STORY_ID" "pilot:no-auto-dispatch"' "$DISPATCHER"; then
+  ok "ga-fnnyy: REFINE_TASK heredoc example includes needs-human + pilot:no-auto-dispatch label-add commands"
+else
+  bad "ga-fnnyy: REFINE_TASK heredoc does not show needs-human + pilot:no-auto-dispatch as commands to run"
+fi
+_rules_block=$(awk '/^RULES:/{f=1} f{print}' "$DISPATCHER")
+if printf '%s' "$_rules_block" | grep -q '🚨'; then
+  ok "ga-fnnyy: RULES section (final checklist read by the refiner) restates the 🚨 rule"
+else
+  bad "ga-fnnyy: RULES section does not restate the 🚨 rule — easy to miss on a long prompt"
+fi
+
 # ── Scenario 9: DELIVERED-DUP CHECK (wa-ca4jm) ───────────────────────────────
 # A REFINED story whose twin is closed/done must NOT be promoted (handoff
 # bookkeeping skipped); it must get refino:info-gap + auto-refino:escalado
