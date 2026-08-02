@@ -268,18 +268,49 @@ context_check_is_parked() {
   echo "no"
 }
 
-# context_check_is_candidate <id> <issue_type> <labels_csv> <ephemeral> <has_story_lifecycle yes|no>
+# context_check_is_sling_stub <issue_type> <title> <desc_len>
+#   emit "yes" iff this bead is a Pilot-minted dispatch "sling stub" — a
+#   type=task bead titled "build story <id>" / "fix bug <id>" / "build <id>" /
+#   "fix <id>" / "implement <id>" (see pilot-dispatcher.sh SLING_TITLE) with a
+#   0-char description. Mirrors sling-task-janitor.py's SLING_RE so both
+#   scripts agree on what counts as a sling stub, rather than drifting apart.
+#   ga-mzkx2: a sling stub's description is PERMANENTLY empty BY DESIGN — the
+#   real spec always lives on the parent <id>, never on the stub itself. Before
+#   this exclusion, context_check_mechanical_verdict's dlen<40 rule
+#   unconditionally stamped ctx:thin on every sling stub (0 < 40 always
+#   holds), and Step 1c's dog-pool probe hard-excludes ctx:thin — so no dog
+#   could ever discover the stub before sling-task-janitor's 60min orphan
+#   sweep closed it, unclaimed, as an abandoned dispatch (the parent bug/story
+#   fix work never got picked up). Requiring desc_len==0 in addition to the
+#   title shape (true for every real sling stub) costs nothing for true
+#   positives, while guarding against a coincidentally-titled, genuinely
+#   under-specified task with real content some day trimmed to empty — that
+#   case is already correctly handled by the normal mechanical-thin path.
+context_check_is_sling_stub() {
+  local itype="$1" title="$2" dlen="$3" title_lc
+  [ "$itype" = "task" ] || { echo "no"; return; }
+  [ "$dlen" -eq 0 ] 2>/dev/null || { echo "no"; return; }
+  title_lc=$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]')
+  local sling_pat='^(build story|implement|fix bug|build|fix) [a-z]{2,3}-[a-z0-9]+'
+  if [[ "$title_lc" =~ $sling_pat ]]; then echo "yes"; else echo "no"; fi
+}
+
+# context_check_is_candidate <id> <issue_type> <labels_csv> <ephemeral> <has_story_lifecycle yes|no> [title] [desc_len]
 #   The master per-bead gate. emit "yes" iff this bead should be context-judged:
 #     - type-eligible (bug/chore/task/debt, OR feature WITHOUT a story:* label);
 #     - NOT plumbing;
 #     - NOT already carrying a ctx:* verdict (idempotence / anti-loop);
 #     - NOT in a lifecycle-skip state (in-flight/done/gate-stuck/dispatched);
-#     - NOT parked (needs-human/pool:refused:*/story:blocked — ga-ipm4).
+#     - NOT parked (needs-human/pool:refused:*/story:blocked — ga-ipm4);
+#     - NOT a Pilot-minted sling-task dispatch stub (ga-mzkx2 — only checked
+#       when [title]/[desc_len] are BOTH supplied; omitted by a caller not
+#       exercising this dimension, e.g. existing selftest scenarios, preserves
+#       prior behavior).
 #   <has_story_lifecycle> is the caller's precomputed answer to "does it carry any
 #   story:* label" (a feature WITH a story:* label is in the refino funnel — leave
 #   it; only feature WITHOUT story:* is a raw actionable item we judge).
 context_check_is_candidate() {
-  local id="$1" itype="$2" labels="$3" ephemeral="$4" has_story="$5"
+  local id="$1" itype="$2" labels="$3" ephemeral="$4" has_story="$5" title="${6:-}" dlen="${7:-}"
   [ "$(context_check_type_eligible "$itype")" = "yes" ] || { echo "no"; return; }
   # A feature in the refino funnel (carries a story:* label) is NOT ours.
   if [ "$itype" = "feature" ] && [ "$has_story" = "yes" ]; then echo "no"; return; fi
@@ -287,6 +318,9 @@ context_check_is_candidate() {
   [ "$(context_check_has_ctx_label "$labels")" = "no" ] || { echo "no"; return; }
   [ "$(context_check_lifecycle_skip "$labels")" = "no" ] || { echo "no"; return; }
   [ "$(context_check_is_parked "$labels")" = "no" ] || { echo "no"; return; }
+  if [ -n "$title" ] || [ -n "$dlen" ]; then
+    [ "$(context_check_is_sling_stub "$itype" "$title" "$dlen")" = "no" ] || { echo "no"; return; }
+  fi
   echo "yes"
 }
 
@@ -701,15 +735,16 @@ while IFS= read -r row; do
   c_labels=$(_labels_csv "$row")
   c_ephemeral=$(echo "$row" | jq -r 'if (.ephemeral // false)==true then "true" else "false" end')
   c_has_story=$(echo "$row" | jq -r 'if ((.labels // []) | any(type=="string" and startswith("story:"))) then "yes" else "no" end')
-
-  # Master candidacy gate (pure).
-  if [ "$(context_check_is_candidate "$c_id" "$c_type" "$c_labels" "$c_ephemeral" "$c_has_story")" != "yes" ]; then
-    continue
-  fi
-
   c_title=$(echo "$row" | jq -r '.title // ""')
   c_desc=$(echo "$row" | jq -r '.description // ""')
   c_dlen=${#c_desc}
+
+  # Master candidacy gate (pure). title/dlen additionally exclude a Pilot-minted
+  # sling-task dispatch stub (ga-mzkx2) — see context_check_is_sling_stub.
+  if [ "$(context_check_is_candidate "$c_id" "$c_type" "$c_labels" "$c_ephemeral" "$c_has_story" "$c_title" "$c_dlen")" != "yes" ]; then
+    continue
+  fi
+
   c_tlen=${#c_title}
   c_sig=$(context_check_has_verifiable_signal "$c_desc")
   MECH=$(context_check_mechanical_verdict "$c_dlen" "$c_sig" "$c_tlen")

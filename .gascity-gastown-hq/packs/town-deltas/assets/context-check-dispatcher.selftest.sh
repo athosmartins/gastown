@@ -127,6 +127,23 @@ echo "Scenario 4a: park-exclusion — needs-human/pool:refused:*/story:blocked/p
 [ "$(context_check_is_parked "area:infra,pilot:no-auto-dispatch,epic:ga-05604")" = "yes" ] \
   && ok "ga-0x4tv post-strip label set (no ctx:*, no exec:*, no story:approved) → still parked" || bad "ga-0x4tv post-strip set → expected parked"
 
+# ── Scenario 4a2: sling-stub detection (ga-mzkx2) ──────────────────────────────
+echo "Scenario 4a2: context_check_is_sling_stub — Pilot-minted dispatch stubs are by-design empty, not thin"
+[ "$(context_check_is_sling_stub "task" "fix bug ga-mzkx2: sling-task-janitor closes ctx:thin dispatch stubs" 0)" = "yes" ] \
+  && ok "task, 'fix bug <id>: ...' title, empty desc → sling stub" || bad "fix bug shape → expected sling stub"
+[ "$(context_check_is_sling_stub "task" "build story ga-mk6ve: raw classifier signal" 0)" = "yes" ] \
+  && ok "task, 'build story <id>: ...' title, empty desc → sling stub" || bad "build story shape → expected sling stub"
+[ "$(context_check_is_sling_stub "task" "implement ga-x: something" 0)" = "yes" ] \
+  && ok "task, 'implement <id>: ...' title, empty desc → sling stub" || bad "implement shape → expected sling stub"
+[ "$(context_check_is_sling_stub "bug" "fix bug ga-mzkx2: something" 0)" = "no" ] \
+  && ok "issue_type=bug (not task) → NOT a sling stub (Pilot only mints type=task stubs)" || bad "bug type → expected not sling stub"
+[ "$(context_check_is_sling_stub "task" "fix bug ga-mzkx2: something" 42)" = "no" ] \
+  && ok "non-empty description → NOT a sling stub (a real, independently-described task)" || bad "non-empty desc → expected not sling stub"
+[ "$(context_check_is_sling_stub "task" "Refatorar o dashboard de clientes" 0)" = "no" ] \
+  && ok "title doesn't match the dispatch-stub pattern → NOT a sling stub" || bad "unrelated title → expected not sling stub"
+[ "$(context_check_is_sling_stub "task" "" 0)" = "no" ] \
+  && ok "empty title → NOT a sling stub (no pattern to match)" || bad "empty title → expected not sling stub"
+
 # ── Scenario 4b: master candidate gate composes all the above ─────────────────
 echo "Scenario 4b: context_check_is_candidate composes type+plumbing+ctx+lifecycle+park"
 [ "$(context_check_is_candidate "ga-good" "task" "tech-debt" "false" "no")" = "yes" ] \
@@ -158,6 +175,27 @@ echo "Scenario 4b: context_check_is_candidate composes type+plumbing+ctx+lifecyc
 [ "$(context_check_is_candidate "ga-sh5zv" "task" "digest,daily" "false" "no")" = "no" ] \
   && ok "digest-archive bead (task, label=digest) → NOT a candidate (ga-aq5cw)" \
   || bad "REGRESSION ga-aq5cw: digest-archive bead would be armed ctx:ready+exec:auto with nothing to build"
+# ga-mzkx2: the exact ga-tdaeq shape — a freshly-minted sling-task stub (task,
+# "fix bug <id>: ..." title, 0-char description, no labels yet) — must never be
+# granted candidacy (and thus never get ctx:thin), so Step 1c's dog-pool probe
+# (--exclude-label ctx:thin) can still discover it before sling-task-janitor's
+# 60min orphan sweep closes it, unclaimed, as an abandoned dispatch.
+[ "$(context_check_is_candidate "ga-tdaeq" "task" "" "false" "no" "fix bug ga-mk6ve: raw classifier signal" 0)" = "no" ] \
+  && ok "sling-task stub (task, dispatch-shaped title, empty desc) → NOT a candidate (ga-mzkx2, no ctx:thin mislabel)" \
+  || bad "REGRESSION ga-mzkx2: sling stub would be stamped ctx:thin and become invisible to Step 1c's dog-pool probe"
+# The same dimension omitted (title/dlen not supplied) must preserve prior
+# behavior exactly — existing callers of this function (and every scenario
+# above) never break just because the sling-stub check exists.
+[ "$(context_check_is_candidate "ga-good" "task" "tech-debt" "false" "no")" = "yes" ] \
+  && ok "title/dlen omitted → sling-stub dimension skipped, prior behavior unchanged" \
+  || bad "omitted title/dlen → expected unchanged prior behavior"
+# A real, independently-described task whose title MATCHES the dispatch-stub
+# pattern (cites another bead's id) must NOT be swallowed — the desc_len==0
+# guard, not the title shape alone, is what keeps context_check_is_sling_stub
+# from over-firing on real work that happens to reference an id in its title.
+[ "$(context_check_is_candidate "ga-realbug" "task" "tech-debt" "false" "no" "fix bug ga-real1: add missing null check" 42)" = "yes" ] \
+  && ok "sling-shaped title (cites ga-real1) but a REAL, non-empty description → still a candidate" \
+  || bad "real described task → expected candidate despite title resembling the dispatch-stub pattern"
 
 # ── Scenario 5: verifiable-signal detection ───────────────────────────────────
 echo "Scenario 5: verifiable-signal detection (HOW-TO-VERIFY / concrete artifact)"
