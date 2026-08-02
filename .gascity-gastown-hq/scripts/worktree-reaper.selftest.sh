@@ -69,8 +69,14 @@ wt_exists worker-merged   && bad "stale+clean merged worktree NOT reaped"       
 branch_exists crew/x/merged   && bad "merged orphan branch NOT deleted"          || ok "merged orphan branch deleted (unblocks _filter_built)"
 wt_exists worker-unmerged && bad "stale+clean unmerged worktree NOT reaped"      || ok "stale+clean unmerged pool worktree reaped"
 branch_exists crew/x/unmerged && ok "UNMERGED branch KEPT (no data loss)"        || bad "unmerged branch wrongly deleted (DATA LOSS!)"
-wt_exists worker-dirty    && ok "dirty worktree SKIPPED (live WIP protected)"    || bad "dirty worktree wrongly reaped (WIP loss!)"
-branch_exists crew/x/dirty    && ok "dirty worktree's branch kept"              || bad "dirty worktree's branch wrongly deleted"
+wt_exists worker-dirty    && bad "ga-xv78c: dirty worktree NOT reaped after preserve (disk never freed)" || ok "ga-xv78c: dirty worktree preserved+reaped (disk freed)"
+branch_exists crew/x/dirty    && ok "dirty worktree's local branch kept"        || bad "dirty worktree's local branch wrongly deleted"
+git -C "$REMOTE" rev-parse -q --verify refs/heads/crew/x/dirty >/dev/null 2>&1 \
+  && ok "ga-xv78c: dirty WIP preserved to origin before reap (own branch name)" \
+  || bad "ga-xv78c: dirty WIP LOST — not preserved to origin before reap!"
+git -C "$REMOTE" show refs/heads/crew/x/dirty:dirty.txt 2>/dev/null | grep -qx dirty \
+  && ok "ga-xv78c: preserved commit contains the actual WIP content" \
+  || bad "ga-xv78c: preserved ref exists but WIP content is wrong/missing"
 wt_exists worker-fresh    && ok "fresh worktree KEPT (age gate)"                 || bad "fresh worktree wrongly reaped"
 
 # ── kill switch: ENABLED=0 → would_reap only, no mutation ────────────────────────
@@ -140,11 +146,24 @@ ZRIG="$TOWNZ/zrig"; git init -q -b main "$ZRIG"
   # (g) UNLOCKED stale+clean under .claude/worktrees, crew merged → normal reap + branch del
   git branch crew/z/unlocked main
   git worktree add -q "$ZRIG/.claude/worktrees/agent-unlocked" crew/z/unlocked
+  # (h) ga-xv78c: UNLOCKED + DIRTY under .claude/worktrees/agent-* (the exact reported
+  # shape — subagent isolation:"worktree" trees). Own branch name is free on origin →
+  # exercises the "push under familiar name" success path.
+  git worktree add -q "$ZRIG/.claude/worktrees/agent-dirty" -b wa-agent-dirty-wip main
+  ( cd "$ZRIG/.claude/worktrees/agent-dirty"; echo agentwip > wip.txt )   # uncommitted → dirty
+  # (i) ga-xv78c: UNLOCKED + DIRTY, but the branch name is ALREADY TAKEN on origin by
+  # UNRELATED history (orphan root commit, no common ancestor) → the reaper's own-name
+  # push must non-fast-forward-reject, and it must fall back to
+  # refs/reclaimed/<label>/<sha> rather than force-clobbering someone else's ref.
+  git -C "$ZRIG" commit-tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904 -m "unrelated origin history" > "$TMP/collide_sha.txt"
+  git -C "$ZRIG" push -q origin "$(cat "$TMP/collide_sha.txt"):refs/heads/wa-collide-wip" >/dev/null 2>&1
+  git worktree add -q "$ZRIG/.claude/worktrees/agent-collide" -b wa-collide-wip main
+  ( cd "$ZRIG/.claude/worktrees/agent-collide"; echo collidewip > collide.txt )   # uncommitted → dirty
 ) >/dev/null 2>&1
 
 # backdate every zrig worktree past the age gate (dir mtime) — agent-young is OLD by dir-age
 # yet must be KEPT because its HOLDER is young/active (proves holder-age, not dir-age, decides).
-for w in agent-dead agent-ancient agent-young agent-busy agent-noreason agent-unlocked; do
+for w in agent-dead agent-ancient agent-young agent-busy agent-noreason agent-unlocked agent-dirty agent-collide; do
   touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$ZRIG/.claude/worktrees/$w" 2>/dev/null || true
 done
 touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$ZRIG/.gc-worktrees/zb-mainbase" 2>/dev/null || true
@@ -176,6 +195,30 @@ zwt ".gc-worktrees/zb-mainbase"        && bad "gate-review DEAD-locked tree NOT 
 zwt ".claude/worktrees/agent-noreason" && ok "UNPARSEABLE lock KEPT (fail-safe)"                || bad "unparseable lock wrongly reaped"
 zwt ".claude/worktrees/agent-unlocked" && bad "unlocked stale+clean .claude tree NOT reaped"    || ok "unlocked stale+clean .claude/worktrees tree reaped (path coverage)"
 zbr crew/z/unlocked                    && bad "unlocked's merged crew branch NOT deleted"       || ok "unlocked's merged crew branch deleted"
+
+# ── ga-xv78c: dirty + unlocked + aged under .claude/worktrees/agent-* — the exact
+# reported failure shape. Old behavior left these stuck forever (dirty never
+# self-clears); 94 leaked this way (5.9G, 5 crews) and broke the ITBI pipeline's
+# SQLite at 95% disk. Must now be preserved to a durable ref, THEN reaped.
+zwt ".claude/worktrees/agent-dirty"    && bad "ga-xv78c: dirty .claude/worktrees tree NOT reaped (disk never freed)" || ok "ga-xv78c: dirty .claude/worktrees tree preserved+reaped"
+git -C "$ZREMOTE" rev-parse -q --verify refs/heads/wa-agent-dirty-wip >/dev/null 2>&1 \
+  && ok "ga-xv78c: dirty WIP preserved to origin (own branch name free → used directly)" \
+  || bad "ga-xv78c: dirty WIP LOST — own-name preserve path broken"
+git -C "$ZREMOTE" show refs/heads/wa-agent-dirty-wip:wip.txt 2>/dev/null | grep -qx agentwip \
+  && ok "ga-xv78c: preserved own-name commit has the real WIP content" \
+  || bad "ga-xv78c: preserved own-name ref exists but content is wrong/missing"
+grep -q '"event":"reaped_dirty_preserved"' "$TMP/reaperZ.jsonl" 2>/dev/null && ok "reaped_dirty_preserved logged" || bad "reaped_dirty_preserved NOT logged"
+
+# ── ga-xv78c: same, but the branch name collides with UNRELATED history already on
+# origin → own-name push must non-fast-forward-reject, falling back to
+# refs/reclaimed/<label>/<sha> WITHOUT clobbering the pre-existing unrelated ref.
+zwt ".claude/worktrees/agent-collide"  && bad "ga-xv78c: colliding-name dirty tree NOT reaped" || ok "ga-xv78c: colliding-name dirty tree preserved+reaped (fallback path)"
+[ "$(git -C "$ZREMOTE" rev-parse -q --verify refs/heads/wa-collide-wip 2>/dev/null)" = "$(cat "$TMP/collide_sha.txt" 2>/dev/null)" ] \
+  && ok "ga-xv78c: pre-existing unrelated origin ref NOT clobbered (no force-push)" \
+  || bad "ga-xv78c: collision ref was overwritten — unrelated history destroyed!"
+git -C "$ZREMOTE" for-each-ref "refs/reclaimed/agent-collide/" --format='%(objectname)' 2>/dev/null | grep -q . \
+  && ok "ga-xv78c: collision WIP preserved under refs/reclaimed/ fallback" \
+  || bad "ga-xv78c: collision WIP LOST — refs/reclaimed/ fallback path broken"
 grep -q '"event":"reaped_zombie_lock"' "$TMP/reaperZ.jsonl" 2>/dev/null && ok "reaped_zombie_lock logged" || bad "reaped_zombie_lock NOT logged"
 grep -q '"event":"kept_locked_live"'   "$TMP/reaperZ.jsonl" 2>/dev/null && ok "kept_locked_live logged (live holder)" || bad "kept_locked_live NOT logged"
 

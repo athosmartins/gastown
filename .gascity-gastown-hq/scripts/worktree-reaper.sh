@@ -45,7 +45,7 @@ gate_hours="$STALE_HOURS"
 mode="normal"
 if [ "$free_gb" -lt "$PRESSURE_FREE_GB" ] 2>/dev/null; then gate_hours="$PRESSURE_HOURS"; mode="pressure"; fi
 
-reaped=0; skipped_dirty=0; kept=0; branches_deleted=0; pool_reaped=0; zombie_reaped=0
+reaped=0; skipped_dirty=0; kept=0; branches_deleted=0; pool_reaped=0; zombie_reaped=0; preserved_dirty=0
 # ga-pdrij: the rig-worktree backlog is LARGE (704 observed — the legacy loop used
 # `git -C $GT` and could never remove rig-owned worktrees, so they piled up). Bound the
 # per-sweep pool reaping so a single run is never a massive destructive operation; the
@@ -78,6 +78,47 @@ delete_merged_local_branch() {
       printf '{"ts":"%s","event":"would_delete_branch","repo":"%s","branch":"%s"}\n' "$(ts)" "$(basename "$repo")" "$br" >> "$LOG" 2>/dev/null
     fi
   fi
+}
+
+# ── preserve_and_reap_dirty <repo> <wt> <br> <age> — ga-xv78c: an UNLOCKED pool
+# worktree that plain `worktree remove` refused is DIRTY (uncommitted/untracked
+# WIP) — the old behavior counted it as skipped_dirty and left it forever, since
+# dirty state never self-clears. 94 subagent trees leaked this way across 5 crews
+# (5.9G), and disk hit 95%, breaking the ITBI pipeline's SQLite. Commit the WIP,
+# push it durable to origin (own branch name if free, else refs/reclaimed/<label>/
+# <sha> — same convention as inflight-reclaim-guard.py's preserve_unpushed_branch),
+# THEN force-remove. Never force before the push confirms the work survived — a
+# failed preserve leaves the worktree exactly as before (fail-safe: any doubt →
+# keep, matching this file's zombie-lock philosophy). Returns 0 (reaped) or 1 (kept).
+preserve_and_reap_dirty() {
+  local repo="$1" wt="$2" br="$3" age="$4" label sha tag_ref preserved_to
+  git -C "$wt" status --porcelain 2>/dev/null | grep -q . || return 1   # not actually dirty — leave to normal skip
+  git -C "$wt" add -A >/dev/null 2>&1
+  git -C "$wt" commit -q -m "worktree-reaper: preserve before reap (aged+dirty, age=${age}h)" >/dev/null 2>&1 || return 1
+  sha="$(git -C "$wt" rev-parse HEAD 2>/dev/null)"
+  [ -n "$sha" ] || return 1
+  label="$(basename "$wt")"
+  if [ -n "$br" ] && git -C "$repo" push origin "${sha}:refs/heads/${br}" >/dev/null 2>&1; then
+    preserved_to="refs/heads/${br}"
+  else
+    tag_ref="refs/reclaimed/${label}/${sha}"
+    if git -C "$repo" push origin "${sha}:${tag_ref}" >/dev/null 2>&1; then
+      preserved_to="$tag_ref"
+    else
+      printf '{"ts":"%s","event":"preserve_failed_dirty_kept","repo":"%s","wt":"%s","branch":"%s","age_h":%s}\n' \
+        "$(ts)" "$(basename "$repo")" "$label" "$br" "$age" >> "$LOG" 2>/dev/null
+      return 1
+    fi
+  fi
+  if git -C "$repo" worktree remove --force "$wt" 2>/dev/null; then
+    printf '{"ts":"%s","event":"reaped_dirty_preserved","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"preserved_to":"%s","mode":"%s"}\n' \
+      "$(ts)" "$(basename "$repo")" "$label" "$br" "$age" "$preserved_to" "$mode" >> "$LOG" 2>/dev/null
+    delete_merged_local_branch "$repo" "$br"
+    return 0
+  fi
+  printf '{"ts":"%s","event":"preserve_ok_reap_failed","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"preserved_to":"%s"}\n' \
+    "$(ts)" "$(basename "$repo")" "$label" "$br" "$age" "$preserved_to" >> "$LOG" 2>/dev/null
+  return 1
 }
 
 # ── ZOMBIE-LOCK DETECTION (the fix for wa-8y45) ──────────────────────────────────
@@ -264,8 +305,10 @@ reap_pool_worktrees() {
           pool_reaped=$((pool_reaped+1))
           printf '{"ts":"%s","event":"reaped_pool","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"mode":"%s"}\n' "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$age" "$mode" >> "$LOG" 2>/dev/null
           delete_merged_local_branch "$repo" "$br"
+        elif preserve_and_reap_dirty "$repo" "$wt" "$br" "$age"; then
+          pool_reaped=$((pool_reaped+1)); preserved_dirty=$((preserved_dirty+1))
         else
-          skipped_dirty=$((skipped_dirty+1))   # dirty/locked/live WIP → leave it
+          skipped_dirty=$((skipped_dirty+1))   # dirty/locked/live WIP, or preserve failed → leave it
         fi
         wt=""; br=""; lock=""
         ;;
@@ -341,6 +384,6 @@ for _repo in "$GT"/*/; do
   fi
 done
 
-printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s}\n' \
-  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$branches_deleted" "$skipped_dirty" "$kept" >> "$LOG" 2>/dev/null
+printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"preserved_dirty":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s}\n' \
+  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$preserved_dirty" "$branches_deleted" "$skipped_dirty" "$kept" >> "$LOG" 2>/dev/null
 exit 0
