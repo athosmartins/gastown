@@ -2221,17 +2221,31 @@ _filter_built() {
     fi
   fi
 
-  # ── Combine: drop a candidate that is branch-built (except gate:needs-fix, whose
-  #    own fix-branch is expected) OR in-gate (ingate_ids already encodes the
-  #    needs-fix carve-out, so a needs-fix id is present here ONLY when actively
+  # ── Combine: drop a candidate that is branch-built (except gate:needs-fix OR
+  #    gate:fix-attempt:N, whose own fix-branch is expected) OR in-gate (ingate_ids
+  #    already encodes both carve-outs, so an id is present here ONLY when actively
   #    re-gated). FAIL-OPEN to the unfiltered array on any jq error.
+  #
+  # ga-ltjdx: this OR used to check ONLY the literal "gate:needs-fix" label — a
+  # DIFFERENT, narrower check than the _bounced computation two blocks up (which
+  # ga-d3eg2 already widened to ALSO match gate:fix-attempt:N). A bead bounced via
+  # fix-attempt:N alone (gate:fix-attempt:1 + gate-sha-failed:<sha>, no needs-fix —
+  # exactly what a gate FAIL leaves behind) correctly avoided ingate_ids here, but
+  # then still lost to this OR's narrower label check whenever its own fix branch
+  # existed — the normal, expected state of a bead mid gate-fix-loop. Net effect
+  # (measured live, ga-ub8yq): _filter_built excluded it from EVERY sweep, so no
+  # fixer was ever (re-)dispatched. Widening this OR to the same startswith match
+  # closes the gap; ingate_ids (unchanged) still independently vetoes an ACTIVELY
+  # re-gated bead of either flavor, so the ga-htjni double-dispatch protection is
+  # preserved.
   if [ -z "$built_ids" ] && [ -z "$ingate_ids" ]; then
     printf '%s' "$arr"; return
   fi
   _out=$(printf '%s' "$arr" | jq --arg b "$built_ids" --arg g "$ingate_ids" '
       ($b|split(" ")) as $bi | ($g|split(" ")) as $gi
       | [ .[] | select(
-            ( ((.id as $i | $bi | index($i)) | not) or ((.labels // []) | index("gate:needs-fix")) )
+            ( ((.id as $i | $bi | index($i)) | not)
+              or ((.labels // []) | any(. == "gate:needs-fix" or startswith("gate:fix-attempt:"))) )
             and ((.id as $i | $gi | index($i)) | not)
         ) ]' \
     2>/dev/null || printf '%s' "$arr")

@@ -3956,6 +3956,54 @@ else
   bad "_filter_built gate:needs-fix exemption broke (got: '$FB_NF')"
 fi
 
+# ── Scenario ga-ltjdx: the SAME branch-veto exemption above, widened to gate:fix-attempt:N ──
+# Bug ga-ltjdx: the combine-step OR just above (built_ids exemption) checked ONLY the
+# literal "gate:needs-fix" label — narrower than the _bounced computation in the
+# gate-marker consultation below (ga-d3eg2 already widened THAT one to also match
+# gate:fix-attempt:N). A bead bounced via fix-attempt:N alone (gate:fix-attempt:1 +
+# gate-sha-failed:<sha>, no gate:needs-fix — exactly what a gate FAIL leaves behind)
+# correctly avoided ingate_ids, but still lost to THIS narrower check whenever its own
+# fix branch existed — the normal, expected state of a bead mid gate-fix-loop. Measured
+# live (ga-ub8yq): excluded from EVERY sweep, no fixer ever (re-)dispatched, P0 stalled
+# 15h. (ga-ltjdx-1)/(ga-ltjdx-3) are the bug's own Fixture 1 + Fixture CONTROLE;
+# (ga-ltjdx-2) is Fixture 2 (the ga-htjni double-dispatch boundary, enforced
+# independently by ingate_ids — unchanged by this fix). Fixture 4 (orphan branch) is
+# already covered below by Scenario ga-rcees, which re-extracts _filter_built fresh
+# (this fix's edit) against real orphan/merged/recent branch shapes with no
+# fix-attempt/needs-fix label on any fixture bead — confirming this widening cannot
+# regress orphan classification, which lives entirely upstream of built_ids.
+FB_FA1="$(eval "$_FB_FN"; export PILOT_TEST_BRANCH_BEADS="wa-built wa-fa1" PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS=""
+  printf '%s' '[{"id":"wa-built","labels":["story:approved"]},{"id":"wa-fa1","labels":["story:approved","gate:fix-attempt:1"]},{"id":"wa-fresh","labels":[]}]' \
+    | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
+if [ "$FB_FA1" = '["wa-fa1","wa-fresh"]' ]; then
+  ok "_filter_built(ga-ltjdx-1): gate:fix-attempt:N alone (needs-fix absent) + own branch + zero active marker → kept (ga-ub8yq shape; plain built still dropped)"
+else
+  bad "_filter_built(ga-ltjdx-1): fix-attempt-only branched bead wrongly dropped by branch veto — DEADLOCK regression (got: '$FB_FA1')"
+fi
+# (ga-ltjdx-2) boundary: SAME shape, but a marker is ACTIVELY re-gating it right now →
+# MUST stay vetoed. ingate_ids (untouched by this fix) enforces this independently of
+# the built_ids carve-out just widened above.
+FB_FA2="$(eval "$_FB_FN"; export PILOT_TEST_BRANCH_BEADS="wa-fa2" PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS="wa-fa2"
+  printf '%s' '[{"id":"wa-fa2","labels":["story:approved","gate:fix-attempt:1"]},{"id":"wa-fresh","labels":[]}]' \
+    | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
+if [ "$FB_FA2" = '["wa-fresh"]' ]; then
+  ok "_filter_built(ga-ltjdx-2): gate:fix-attempt:N + branch + ACTIVE marker → still dropped (actively re-gating; no double-dispatch)"
+else
+  bad "_filter_built(ga-ltjdx-2): actively-regated fix-attempt+branch bead leaked — ga-htjni double-dispatch regression (got: '$FB_FA2')"
+fi
+# (ga-ltjdx-3) control: branch exists but NO gate label at all (no fix-attempt, no
+# needs-fix) → MUST stay vetoed. Proves the widened carve-out stays scoped to proof of
+# a prior gate FAIL, not "branch exists is never a veto" — which would reopen the
+# ga-6jqr/ga-htjni double-dispatch hole this filter exists to close.
+FB_FA3="$(eval "$_FB_FN"; export PILOT_TEST_BRANCH_BEADS="wa-fa3" PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS=""
+  printf '%s' '[{"id":"wa-fa3","labels":["story:approved"]},{"id":"wa-fresh","labels":[]}]' \
+    | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
+if [ "$FB_FA3" = '["wa-fresh"]' ]; then
+  ok "_filter_built(ga-ltjdx-3) control: branch exists, no gate label at all → still dropped (carve-out correctly scoped, not over-widened)"
+else
+  bad "_filter_built(ga-ltjdx-3) control: carve-out over-widened — bare branched bead leaked (got: '$FB_FA3')"
+fi
+
 # ── Scenario 22g-gate: _filter_built is GATE-MARKER-AWARE (wa-8y45 leak fix) ──────────
 # ROOT of the wa-8y45 leak: _filter_built decided "built?" ONLY by crew-branch existence.
 # When the gate parks a marker at needs-rebase/error it PRUNES the branch, so the git probe
