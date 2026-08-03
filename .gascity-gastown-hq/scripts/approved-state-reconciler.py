@@ -69,6 +69,16 @@ GATE_DISPATCHER_LOG = os.path.join(CITY, ".gc/logs/quality-gate-dispatcher.log")
 PILOT_DISPATCHABLE_FILE = os.environ.get(
     "PILOT_DISPATCHABLE_FILE",
     os.path.join(os.environ.get("HOME", os.path.expanduser("~")), ".gc/pilot-dispatchable.json"))
+# QPOS_ABSENT/QPOS_UNREADABLE (ga-tky97 GATE-FEEDBACK fix): a bead's queue
+# position can fail to resolve to an int for two causally different reasons —
+# the dispatch queue snapshot itself was unreadable this cycle (unmeasured),
+# or the snapshot was read fine and the bead simply wasn't in it (measured,
+# confirmed absent). Both used to collapse to bare `None`, so a later delta
+# comparison could assert "unchanged" across a cycle where one side was never
+# actually measured. These sentinels (JSON-serializable strings, distinct from
+# any int position) keep the two apart through state persistence and re-read.
+QPOS_ABSENT = "absent"
+QPOS_UNREADABLE = "unreadable"
 NOTIFY_BIN = os.environ.get("NOTIFY_BIN", "/Users/athos/.local/bin/notify")
 GC_BIN = os.environ.get("GC_BIN", "gc")
 BD_BIN = os.environ.get("BD_BIN", "bd")
@@ -865,6 +875,12 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
     prev_alarm_raw = state.get("alarmed", {}).get(bead_id)
     prev_qpos_known = isinstance(prev_alarm_raw, dict) and "qpos" in prev_alarm_raw
     prev_qpos = prev_alarm_raw.get("qpos") if prev_qpos_known else None
+    if prev_qpos_known and prev_qpos is None:
+        # Legacy record from before this fix: bare None was written for BOTH
+        # ABSENT and UNREADABLE, so which one it was is unrecoverable. Treat
+        # it as the conservative side — UNREADABLE — so the delta below never
+        # asserts a continuity claim it can't actually back up.
+        prev_qpos = QPOS_UNREADABLE
     state_changed = prev_fp is not None and prev_fp != labels_fp
     if state_changed:
         count = 0   # new incident — restart escalation
@@ -911,13 +927,42 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
     # (position improved/worsened/unchanged), not just repeat the same claim —
     # only meaningful when a PRIOR alarm actually recorded a qpos (a bead's
     # first-ever alarm, or one alarmed before this feature shipped, has none).
-    cur_qpos_pos = _pilot_queue_position(bead_id, dispatchable)
-    cur_qpos = cur_qpos_pos[0] if cur_qpos_pos is not None else None
+    #
+    # cur_qpos is one of: an int (0-based queue position, measured), QPOS_ABSENT
+    # (queue read fine, bead confirmed not in it), or QPOS_UNREADABLE (the
+    # snapshot itself couldn't be read this cycle — unmeasured). GATE-FEEDBACK
+    # (attempt 1): collapsing ABSENT and UNREADABLE into bare None let the delta
+    # below assert "unchanged" across a comparison where one side was never
+    # measured — e.g. the mail body saying both "COULD NOT READ ... UNCERTAIN"
+    # and "Since last alarm: unchanged" in the same message. The discriminated
+    # values below make an unmeasured operand impossible to compare silently.
+    if dispatchable is None:
+        cur_qpos = QPOS_UNREADABLE
+    else:
+        cur_qpos_pos = _pilot_queue_position(bead_id, dispatchable)
+        cur_qpos = cur_qpos_pos[0] if cur_qpos_pos is not None else QPOS_ABSENT
     queue_line = _pilot_queue_body_line(bead_id, dispatchable)
     if alarm_ordinal > 1 and prev_qpos_known:
         def _qpos_desc(q):
-            return "front of queue (position 1)" if q == 0 else "not found in queue"
-        if prev_qpos == cur_qpos:
+            if q == QPOS_UNREADABLE:
+                return "queue unreadable"
+            if q == QPOS_ABSENT:
+                return "not found in queue"
+            return "front of queue (position 1)" if q == 0 else "position %d" % (q + 1)
+        if cur_qpos == QPOS_UNREADABLE or prev_qpos == QPOS_UNREADABLE:
+            # At least one side was never measured — "unchanged"/"changed" would
+            # be a continuity claim neither side can support. Say so explicitly
+            # instead (this is the exact contradiction the gate reviewer
+            # reproduced: "COULD NOT READ ... UNCERTAIN" next to "unchanged").
+            if prev_qpos == QPOS_UNREADABLE and cur_qpos == QPOS_UNREADABLE:
+                where = "in the previous cycle and this cycle"
+            elif prev_qpos == QPOS_UNREADABLE:
+                where = "in the previous cycle"
+            else:
+                where = "in this cycle"
+            queue_line += (" Since last alarm: not comparable — the Pilot "
+                            "dispatch queue could not be read %s." % where)
+        elif prev_qpos == cur_qpos:
             queue_line += " Since last alarm: unchanged (%s)." % _qpos_desc(cur_qpos)
         else:
             queue_line += " Since last alarm: changed from %s to %s." % (
@@ -2362,6 +2407,20 @@ def _selftest():
                 I/O + UTC-epoch math, never exercised by a-e above) parses a
                 genuinely fresh file, rejects a stale one (past ttl_seconds),
                 and returns None for a missing file
+      (ga-tky97-g..i) GATE-FEEDBACK fix (attempt 1 FAIL): qpos=None used to
+                mean both ABSENT (queue read fine, bead not in it) and
+                UNREADABLE (snapshot itself failed this cycle) — a delta
+                comparing two such Nones could assert "unchanged" across an
+                unmeasured cycle. g/h/i cover the three UNREADABLE-involved
+                transitions (prev-unreadable→cur-absent, prev-absent→
+                cur-unreadable — the exact reviewer repro — and both-
+                unreadable): none may claim unchanged/changed, and h/i assert
+                the literal symptom never recurs (same body never pairs
+                "COULD NOT READ" with a continuity claim)
+      (ga-tky97-j) GATE-FEEDBACK fix overcorrection guard: prev=ABSENT and
+                cur=ABSENT are BOTH measured (queue read fine both times, bead
+                genuinely not in it) — delta must still say "unchanged"; the
+                fix must not blanket every non-int qpos as incomparable
       (ga-32u6s-e) gate-fix-1 regression guard: _real_branch_stranded_reason's
                 merge-base ancestry check must fail OPEN (None) when
                 `git merge-base --is-ancestor` is unresolvable — both
@@ -3881,7 +3940,7 @@ def _selftest():
     _read_pilot_log_lines = lambda: _pilot_recent()
     st = _reset()
     st["first_seen_approved"]["hq-074"] = NOW - (_STARVE + 5) * 60
-    run_cycle(NOW, st)   # alarm #1 — bead absent from queue, qpos=None recorded
+    run_cycle(NOW, st)   # alarm #1 — bead absent from queue, qpos=QPOS_ABSENT recorded
     first_body_e = next((b for s, b in mail_calls if "hq-074" in s), None)
     # Second cycle >1h later (past the AC3 1h escalation tier): hq-074 now
     # appears at the FRONT of a fresh queue — still not suppressed (index 0),
@@ -3942,6 +4001,136 @@ def _selftest():
     else:
         _bad("(ga-tky97-f)", "fresh_result=%r stale_result=%r missing_result=%r" % (
              fresh_result, stale_result, missing_result))
+
+    # (ga-tky97-g..j) GATE-FEEDBACK fix (attempt 1 FAIL): qpos=None used to mean
+    # both ABSENT (queue read fine, bead not in it) and UNREADABLE (queue snapshot
+    # itself failed this cycle) — a delta comparing two such Nones could assert
+    # "unchanged" across a cycle that was never actually measured. These four
+    # scenarios are the falsifiable AC from the Mayor's fix spec: the three
+    # UNREADABLE-involved transitions must never claim unchanged/changed, and the
+    # one all-measured transition (ABSENT -> ABSENT) still must.
+    print("\nScenario (ga-tky97-g): GATE-FEEDBACK fix — previous cycle's queue was "
+          "UNREADABLE, current cycle confirms the bead absent from a fresh read → "
+          "delta must NOT claim unchanged/changed (previous side was never measured)")
+    _read_pilot_dispatchable_file = lambda: None   # cycle 1: unreadable
+    _bd_approved = lambda root: [_make_bead("hq-075", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["hq-075"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)   # alarm #1 — dispatchable unreadable, qpos=QPOS_UNREADABLE recorded
+    first_body_g = next((b for s, b in mail_calls if "hq-075" in s), None)
+    _read_pilot_dispatchable_file = lambda: {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + 3700)),
+        "ttl_seconds": 600,
+        "count": 1,
+        "items": [{"id": "ga-someone-else", "priority": 1}],   # hq-075 confirmed absent
+    }
+    _read_pilot_log_lines = lambda: _pilot_recent_at(NOW + 3700)
+    _reset_captures()
+    run_cycle(NOW + 3700, st)   # alarm #2 — queue now readable, bead confirmed absent
+    second_body_g = next((b for s, b in mail_calls if "hq-075" in s), None)
+    if (first_body_g is not None and "COULD NOT READ" in first_body_g
+            and second_body_g is not None
+            and "not comparable" in second_body_g
+            and "previous cycle" in second_body_g
+            and "unchanged" not in second_body_g and "changed from" not in second_body_g):
+        _ok("(ga-tky97-g): prev cycle unreadable, current confirmed-absent → "
+            "delta says not-comparable instead of fabricating unchanged/changed")
+    else:
+        _bad("(ga-tky97-g)", "first_body=%r second_body=%r" % (first_body_g, second_body_g))
+
+    print("\nScenario (ga-tky97-h): GATE-FEEDBACK fix — THE EXACT REVIEWER REPRO: "
+          "previous cycle confirmed the bead absent from a readable queue, current "
+          "cycle's queue is UNREADABLE → the same mail body must not say both "
+          "'COULD NOT READ ... UNCERTAIN' and 'Since last alarm: unchanged'")
+    _read_pilot_dispatchable_file = lambda: {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
+        "ttl_seconds": 600,
+        "count": 1,
+        "items": [{"id": "ga-someone-else", "priority": 1}],   # hq-076 confirmed absent
+    }
+    _bd_approved = lambda root: [_make_bead("hq-076", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["hq-076"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)   # alarm #1 — confirmed absent, qpos=QPOS_ABSENT recorded
+    first_body_h = next((b for s, b in mail_calls if "hq-076" in s), None)
+    _read_pilot_dispatchable_file = lambda: None   # cycle 2: unreadable
+    _read_pilot_log_lines = lambda: _pilot_recent_at(NOW + 3700)
+    _reset_captures()
+    run_cycle(NOW + 3700, st)   # alarm #2 — dispatchable unreadable this cycle
+    second_body_h = next((b for s, b in mail_calls if "hq-076" in s), None)
+    if (first_body_h is not None and "NOT found among 1 dispatchable" in first_body_h
+            and second_body_h is not None
+            and "COULD NOT READ" in second_body_h
+            and "not comparable" in second_body_h
+            and "this cycle" in second_body_h
+            and "unchanged" not in second_body_h and "changed from" not in second_body_h):
+        _ok("(ga-tky97-h): prev confirmed-absent, current unreadable → same "
+            "message never pairs COULD NOT READ with a continuity claim")
+    else:
+        _bad("(ga-tky97-h)", "first_body=%r second_body=%r" % (first_body_h, second_body_h))
+
+    print("\nScenario (ga-tky97-i): GATE-FEEDBACK fix — BOTH the previous and "
+          "current cycle's queue were UNREADABLE → delta must NOT claim "
+          "unchanged/changed (neither side was ever measured)")
+    _read_pilot_dispatchable_file = lambda: None
+    _bd_approved = lambda root: [_make_bead("hq-077", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["hq-077"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)   # alarm #1 — unreadable
+    first_body_i = next((b for s, b in mail_calls if "hq-077" in s), None)
+    _read_pilot_log_lines = lambda: _pilot_recent_at(NOW + 3700)
+    _reset_captures()
+    run_cycle(NOW + 3700, st)   # alarm #2 — still unreadable
+    second_body_i = next((b for s, b in mail_calls if "hq-077" in s), None)
+    if (first_body_i is not None and "COULD NOT READ" in first_body_i
+            and second_body_i is not None
+            and "COULD NOT READ" in second_body_i
+            and "not comparable" in second_body_i
+            and "previous cycle and this cycle" in second_body_i
+            and "unchanged" not in second_body_i and "changed from" not in second_body_i):
+        _ok("(ga-tky97-i): both cycles unreadable → delta names both sides as "
+            "not comparable, never fabricates continuity")
+    else:
+        _bad("(ga-tky97-i)", "first_body=%r second_body=%r" % (first_body_i, second_body_i))
+
+    print("\nScenario (ga-tky97-j): GATE-FEEDBACK fix guard — both the previous "
+          "AND current cycle confirm the bead absent from a freshly-read queue → "
+          "delta MUST still say 'unchanged' (both sides were actually measured; "
+          "the fix must not overcorrect into treating every non-int qpos as "
+          "incomparable)")
+    _read_pilot_dispatchable_file = lambda: {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
+        "ttl_seconds": 600,
+        "count": 1,
+        "items": [{"id": "ga-someone-else", "priority": 1}],   # hq-078 confirmed absent
+    }
+    _bd_approved = lambda root: [_make_bead("hq-078", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["hq-078"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)   # alarm #1 — confirmed absent
+    first_body_j = next((b for s, b in mail_calls if "hq-078" in s), None)
+    _read_pilot_dispatchable_file = lambda: {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + 3700)),
+        "ttl_seconds": 600,
+        "count": 1,
+        "items": [{"id": "ga-someone-else", "priority": 1}],   # still absent
+    }
+    _read_pilot_log_lines = lambda: _pilot_recent_at(NOW + 3700)
+    _reset_captures()
+    run_cycle(NOW + 3700, st)   # alarm #2 — still confirmed absent
+    second_body_j = next((b for s, b in mail_calls if "hq-078" in s), None)
+    if (first_body_j is not None and "NOT found among 1 dispatchable" in first_body_j
+            and second_body_j is not None
+            and "unchanged (not found in queue)" in second_body_j):
+        _ok("(ga-tky97-j): both cycles confirm absence (measured, not unreadable) "
+            "→ delta correctly says 'unchanged' — fix doesn't overcorrect into "
+            "blanket uncertainty")
+    else:
+        _bad("(ga-tky97-j)", "first_body=%r second_body=%r" % (first_body_j, second_body_j))
 
     # Restore the neutral hermetic default so later scenarios (which don't
     # exercise the pilot-queue-position feature) are unaffected.
