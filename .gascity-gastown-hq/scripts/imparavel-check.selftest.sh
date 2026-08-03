@@ -375,6 +375,151 @@ eq("_sh failure → None (unknown)", m._sweep_in_flight(m._read_pilot_log_tail()
 eq("_sweep_in_flight(None) — no snapshot at all → None (pure-function contract, no I/O)",
    m._sweep_in_flight(None), None)
 
+print("── ga-zkxdw attempt 4: _sweep_in_flight_elapsed_min() reads the CURRENT sweep's "
+      "OWN start timestamp, capped by SWEEP_IN_FLIGHT_BUDGET_MIN in main() ──")
+import time as _time4
+def _ts_ago(minutes_ago):
+    return _time4.strftime("%Y-%m-%d %H:%M:%S", _time4.localtime(m.NOW - minutes_ago * 60))
+
+m._sh = _fake_sh_factory(
+    "[%s] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n" % _ts_ago(3))
+_elapsed_3 = m._sweep_in_flight_elapsed_min(m._read_pilot_log_tail())
+eq("in-flight sweep started ~3min ago -> elapsed ~= 3.0",
+   _elapsed_3 is not None and abs(_elapsed_3 - 3.0) < 0.2, True)
+
+m._sh = _fake_sh_factory(
+    "[%s] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n" % _ts_ago(45))
+_elapsed_45 = m._sweep_in_flight_elapsed_min(m._read_pilot_log_tail())
+eq("in-flight sweep started ~45min ago -> elapsed ~= 45.0",
+   _elapsed_45 is not None and abs(_elapsed_45 - 45.0) < 0.2, True)
+
+# heartbeat proof: incidental lines AFTER 'start' (the kind that keep
+# check_pilot()'s separate 20min liveness heartbeat alive during a stuck
+# retry) must NOT reset the elapsed clock — it stays keyed to the sweep's OWN
+# start line, never the tail's last line.
+m._sh = _fake_sh_factory(
+    ("[%s] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n" % _ts_ago(45))
+    + "[%s] [pilot-dispatcher] In-flight: live=6 small=5/5  big=1/2\n" % _ts_ago(20)
+    + "[%s] [pilot-dispatcher] In-flight: live=6 small=5/5  big=1/2\n" % _ts_ago(1))
+_elapsed_hb = m._sweep_in_flight_elapsed_min(m._read_pilot_log_tail())
+eq("incidental heartbeat lines after 'start' don't reset elapsed -> still ~=45min from the START line",
+   _elapsed_hb is not None and abs(_elapsed_hb - 45.0) < 0.2, True)
+
+m._sh = _fake_sh_factory(
+    "[2026-08-02 21:34:54] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n"
+    "[2026-08-02 21:40:12] [pilot-dispatcher] === Pilot sweep complete: dispatched=6"
+    " (small_slots=0 big_slots=2 dolt_saturated_at_start=0) ===\n")
+eq("most recent boundary is 'complete' (not in flight) -> None, nothing to report",
+   m._sweep_in_flight_elapsed_min(m._read_pilot_log_tail()), None)
+
+m._sh = _fake_sh_factory(
+    "[pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n")   # no leading timestamp
+eq("in-flight but 'sweep start' timestamp unparseable -> None (not measured, not 'fresh')",
+   m._sweep_in_flight_elapsed_min(m._read_pilot_log_tail()), None)
+
+m._sh = _fake_sh_factory("")
+eq("empty log -> None", m._sweep_in_flight_elapsed_min(m._read_pilot_log_tail()), None)
+
+m._sh = lambda args, timeout=20: None
+eq("_sh failure -> None", m._sweep_in_flight_elapsed_min(m._read_pilot_log_tail()), None)
+
+eq("_sweep_in_flight_elapsed_min(None) — no snapshot at all -> None (pure-function contract, no I/O)",
+   m._sweep_in_flight_elapsed_min(None), None)
+
+print("── main() end-to-end: ga-zkxdw attempt 4 — sweep_in_flight budget cap "
+      "(a hung sweep must eventually escalate to ❌, not wait forever) ──")
+_e_ca, _e_cg, _e_cp, _e_cd, _e_rigs = m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS
+_e_sh = m._sh
+
+m.check_gate = lambda: {"active": [], "parked": [], "last_pass_min": 1.0,
+                         "reviewer_alive": True, "oldest_active_min": None,
+                         "stalled": False, "stall_reason": ""}
+m.check_pilot = lambda: {"alive": True, "last_sweep_min": 0.5}
+m.check_dolt = lambda: {"responsive": True, "latency_ms": 10}
+m.RIGS = []
+m.check_approved = lambda: {
+    "total": 1, "parked_count": 0, "in_gate_count": 0, "buildable_count": 1,
+    "flowing_count": 0, "held_count": 0,
+    "stuck": [{"id": "wa-HUNG", "rig": "WA", "title": "room+demand+sweep hung", "lane": "small"}],
+    "read_err": [], "warns": [], "from_dispatchable": True, "snap_age_min": 1.0,
+}
+
+# Fixture: sweep started ~3min ago, no complete, matching room+demand -> still
+# within budget -> WARN (exit 2), NOT FAIL. This is attempt-2's original,
+# intentional behavior — must not regress while fixing the budget gap.
+m._sh = _fake_sh_factory(
+    ("[%s] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n" % _ts_ago(3))
+    + "[%s] [pilot-dispatcher] Available slots: small=1  big=0\n" % _ts_ago(3)
+    + "[%s] [pilot-dispatcher] Candidates split: small=1  big=0\n" % _ts_ago(3))
+_bufD1 = io.StringIO(); _exitD1 = None
+try:
+    with contextlib.redirect_stdout(_bufD1):
+        m.main()
+except SystemExit as e:
+    _exitD1 = e.code
+eq("sweep in flight ~3min (within budget): exit 2 (INCERTO, not FAIL) — attempt-2 behavior preserved",
+   _exitD1, 2)
+eq("sweep in flight ~3min: report does NOT say NAO IMPARAVEL", "NÃO IMPARÁVEL" in _bufD1.getvalue(), False)
+
+# Fixture: sweep started ~45min ago, no complete, matching room+demand -> PAST
+# budget -> the sweep can no longer justify a wait. This is the test that
+# DEFINES the attempt-4 defect (a hung sweep must eventually escalate).
+m._sh = _fake_sh_factory(
+    ("[%s] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n" % _ts_ago(45))
+    + "[%s] [pilot-dispatcher] Available slots: small=1  big=0\n" % _ts_ago(45)
+    + "[%s] [pilot-dispatcher] Candidates split: small=1  big=0\n" % _ts_ago(45))
+_bufD2 = io.StringIO(); _exitD2 = None
+try:
+    with contextlib.redirect_stdout(_bufD2):
+        m.main()
+except SystemExit as e:
+    _exitD2 = e.code
+eq("sweep in flight ~45min (past budget): exit 1 (FAIL) — the attempt-4 defect fixture",
+   _exitD2, 1)
+eq("sweep in flight ~45min: report says NAO IMPARAVEL", "NÃO IMPARÁVEL" in _bufD2.getvalue(), True)
+eq("sweep in flight ~45min: report explains the elapsed/budget, not silent",
+   "orçamento" in _bufD2.getvalue(), True)
+
+# Fixture: sweep hung, but KEEPS emitting incidental heartbeat lines (the kind
+# that would keep check_pilot()'s separate 20min liveness heartbeat alive
+# indefinitely) — proves the cap is anchored to the sweep's OWN start
+# timestamp, not the log's last line.
+m._sh = _fake_sh_factory(
+    ("[%s] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n" % _ts_ago(45))
+    + "[%s] [pilot-dispatcher] Available slots: small=1  big=0\n" % _ts_ago(45)
+    + "[%s] [pilot-dispatcher] Candidates split: small=1  big=0\n" % _ts_ago(45)
+    + "[%s] [pilot-dispatcher] In-flight: live=6 small=5/5  big=1/2\n" % _ts_ago(10)
+    + "[%s] [pilot-dispatcher] In-flight: live=6 small=5/5  big=1/2\n" % _ts_ago(1))
+_bufD3 = io.StringIO(); _exitD3 = None
+try:
+    with contextlib.redirect_stdout(_bufD3):
+        m.main()
+except SystemExit as e:
+    _exitD3 = e.code
+eq("sweep hung + incidental heartbeat lines keep coming, still past budget: exit 1 (cap doesn't depend on heartbeat)",
+   _exitD3, 1)
+
+# Fixture: 'sweep start' timestamp unreadable — NOT MEASURED. Must not
+# downgrade forever; falls through to the fail path (with a note explaining why).
+m._sh = _fake_sh_factory(
+    "[pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n"
+    "[pilot-dispatcher] Available slots: small=1  big=0\n"
+    "[pilot-dispatcher] Candidates split: small=1  big=0\n")
+_bufD4 = io.StringIO(); _exitD4 = None
+try:
+    with contextlib.redirect_stdout(_bufD4):
+        m.main()
+except SystemExit as e:
+    _exitD4 = e.code
+eq("sweep start timestamp unreadable: exit 1 (does not wait forever on an unmeasured clock)",
+   _exitD4, 1)
+eq("sweep start timestamp unreadable: report says NAO IMPARAVEL", "NÃO IMPARÁVEL" in _bufD4.getvalue(), True)
+eq("sweep start timestamp unreadable: report explains the limitation (not silent)",
+   ("ilegível" in _bufD4.getvalue()) or ("não medido" in _bufD4.getvalue()), True)
+
+m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS = _e_ca, _e_cg, _e_cp, _e_cd, _e_rigs
+m._sh = _e_sh
+
 print("── ga-zkxdw GATE-FEEDBACK (attempt 1 FAIL): _pilot_slots()/_pilot_candidates() "
       "never cross a sweep boundary ──")
 # Reviewer's traced regression, confirmed by the Mayor's spec comment: a backward
@@ -477,6 +622,14 @@ print("── main() end-to-end: ga-zkxdw regression — defects 1+2, all 3 fals
 _z_ca, _z_cg, _z_cp, _z_cd = m.check_approved, m.check_gate, m.check_pilot, m.check_dolt
 _z_slots, _z_cand, _z_swf, _z_rigs = m._pilot_slots, m._pilot_candidates, m._sweep_in_flight, m.RIGS
 _z_read_tail = m._read_pilot_log_tail
+_z_swf_elapsed = m._sweep_in_flight_elapsed_min
+# ga-zkxdw attempt 4: sweep_in_flight alone is no longer sufficient to downgrade
+# a FAIL to WARN — main() now also checks elapsed time via
+# _sweep_in_flight_elapsed_min(). Pin it to a small in-budget value wherever a
+# test pins _sweep_in_flight directly to True (bypassing real log parsing) so
+# these cenários keep testing what they originally meant: a NORMAL, healthy
+# in-flight sweep well within its usual ~5-6min duration, not an unmeasured one.
+m._sweep_in_flight_elapsed_min = lambda lines: 3.0
 m._read_pilot_log_tail = lambda: None   # irrelevant: the 3 signals below are pinned directly
 
 m.check_gate = lambda: {"active": [], "parked": [], "last_pass_min": 1.0,
@@ -548,6 +701,7 @@ eq("Cenário C: report says NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _bufC.getvalu
 m.check_approved, m.check_gate, m.check_pilot, m.check_dolt = _z_ca, _z_cg, _z_cp, _z_cd
 m._pilot_slots, m._pilot_candidates, m._sweep_in_flight, m.RIGS = _z_slots, _z_cand, _z_swf, _z_rigs
 m._read_pilot_log_tail = _z_read_tail
+m._sweep_in_flight_elapsed_min = _z_swf_elapsed
 
 print("── ga-zkxdw GATE-FEEDBACK (attempt 2 FAIL): main() reads PILOT_LOG's tail EXACTLY ONCE per "
       "veredito, shares ONE snapshot across slots/candidates/sweep_in_flight ──")

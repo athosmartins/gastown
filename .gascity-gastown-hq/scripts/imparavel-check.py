@@ -50,6 +50,9 @@ HELD_LOOP_MAX = int(os.environ.get("IMP_HELD_LOOP_MAX", "5"))
 GATE_STALL_MIN = int(os.environ.get("IMP_GATE_STALL_MIN", "165"))
 PILOT_DEAD_MIN = int(os.environ.get("IMP_PILOT_DEAD_MIN", "20"))
 MAX_CLASSIFY = int(os.environ.get("IMP_MAX_CLASSIFY", "40"))  # cap to avoid hanging
+# ga-zkxdw attempt 4: cap on how long a genuinely in-flight sweep may downgrade
+# a FAIL to a WARN — past this, a hung sweep must escalate, not wait forever.
+SWEEP_IN_FLIGHT_BUDGET_MIN = int(os.environ.get("IMP_SWEEP_BUDGET_MIN", "15"))
 
 # Labels that mark a bead as NOT auto-dispatchable right now (not a silent stall).
 # A bead carrying ANY of these is parked for a real reason — the Pilot correctly
@@ -577,6 +580,25 @@ def _pool_saturated(slots, candidates):
     return slots["small"] <= 0 and slots["big"] <= 0
 
 
+def _last_sweep_boundary(lines):
+    """Scan the shared PILOT_LOG snapshot `lines` (see _read_pilot_log_tail)
+    backward for the most recent sweep boundary marker. Returns (kind, line)
+    with kind 'start' or 'complete', or None if `lines` is None or no boundary
+    is visible. Shared by _sweep_in_flight()/_sweep_in_flight_elapsed_min() so
+    both agree on exactly which line the current sweep's state comes from —
+    scanning the SAME in-memory list twice here is safe (no new file read);
+    only re-reading PILOT_LOG itself would reintroduce the TOCTOU attempt 3
+    fixed."""
+    if lines is None:
+        return None
+    for line in reversed(lines):
+        if "=== Pilot sweep complete" in line:
+            return ("complete", line)
+        if "=== Pilot sweep start" in line:
+            return ("start", line)
+    return None
+
+
 def _sweep_in_flight(lines):
     """True if the shared PILOT_LOG snapshot `lines`' (see _read_pilot_log_tail
     — the SAME snapshot passed to _pilot_slots()/_pilot_candidates() for this
@@ -600,15 +622,46 @@ def _sweep_in_flight(lines):
 
     Returns None if `lines` is None/unreadable — caller must NOT suppress a
     real stall on unknown; only a POSITIVELY-observed in-flight sweep may
-    downgrade a fail to a warn (same fail-open convention as _pilot_slots())."""
-    if lines is None:
+    downgrade a fail to a warn (same fail-open convention as _pilot_slots()) —
+    AND, per attempt 4, only for as long as that sweep's own elapsed time stays
+    within SWEEP_IN_FLIGHT_BUDGET_MIN (see _sweep_in_flight_elapsed_min)."""
+    b = _last_sweep_boundary(lines)
+    if b is None:
         return None
-    for line in reversed(lines):
-        if "=== Pilot sweep complete" in line:
-            return False
-        if "=== Pilot sweep start" in line:
-            return True
-    return None
+    return b[0] == "start"
+
+
+def _sweep_in_flight_elapsed_min(lines):
+    """When the current sweep IS in flight (per _last_sweep_boundary — the
+    SAME shared `lines` snapshot as _sweep_in_flight()), minutes elapsed since
+    ITS OWN '=== Pilot sweep start' timestamp. Returns None when: `lines` is
+    None, the most recent boundary is a completion (nothing in flight), no
+    boundary is visible at all, or the start line's timestamp can't be parsed
+    — caller must treat None as NOT MEASURED, never as "still fresh".
+
+    GATE-FEEDBACK on ga-zkxdw attempt 3 (reviewer FAIL, 2026-08-03):
+    _sweep_in_flight() correctly detects WHETHER a sweep is running but never
+    checked HOW LONG — a hung sweep (deadlock, stuck subprocess, stuck retry
+    loop) that logs 'start' and never reaches 'complete' downgraded every
+    subsequent FAIL to WARN forever, trusting "in flight is transient (~5-6min)"
+    without checking the timestamp already sitting on the boundary line that
+    would falsify it. Deliberately keyed on the START line's OWN timestamp, not
+    the tail's last line — pilot-dispatcher.sh keeps emitting incidental
+    progress lines (e.g. repeated 'In-flight: ...') during a stuck retry, which
+    would otherwise make a hung sweep look perpetually recent to a last-line
+    heartbeat check."""
+    b = _last_sweep_boundary(lines)
+    if b is None or b[0] != "start":
+        return None
+    import re, datetime
+    mt = re.match(r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\]", b[1])
+    if not mt:
+        return None
+    try:
+        dt = datetime.datetime.strptime(mt.group(1), "%Y-%m-%d %H:%M:%S")
+        return max(0.0, (NOW - dt.timestamp()) / 60.0)
+    except Exception:
+        return None
 
 
 def check_pilot():
@@ -648,6 +701,7 @@ def main():
     slots = _pilot_slots(pilot_log_lines)
     candidates = _pilot_candidates(pilot_log_lines)
     sweep_in_flight = _sweep_in_flight(pilot_log_lines)
+    sweep_elapsed_min = _sweep_in_flight_elapsed_min(pilot_log_lines)
 
     fails, warns, notes = [], [], []
 
@@ -666,6 +720,15 @@ def main():
     # _pool_saturated() for the lane-aware logic (ga-zkxdw DEFEITO 1).
     pool_saturated = _pool_saturated(slots, candidates)
 
+    # ga-zkxdw attempt 4 GATE-FEEDBACK: a positively in-flight sweep may only
+    # justify downgrading FAIL->WARN for as long as ITS OWN elapsed time stays
+    # within budget — otherwise a hung sweep (deadlock, stuck subprocess) reads
+    # as "please wait" forever. sweep_elapsed_min is None whenever the start
+    # timestamp can't be read at all — that is NOT MEASURED, never "still
+    # fresh", so it expires the wait too (na dúvida, FLAGA).
+    sweep_wait_expired = (sweep_in_flight is True) and (
+        sweep_elapsed_min is None or sweep_elapsed_min > SWEEP_IN_FLIGHT_BUDGET_MIN)
+
     if a["stuck"] and (p.get("alive") is not False):
         if pool_saturated:
             notes.append(
@@ -673,28 +736,38 @@ def main():
                 " na fila atrás de slots cheios, NÃO é falha: %s"
                 % (slots["small"], slots["big"], len(a["stuck"]),
                    ", ".join("%s/%s" % (s["rig"], s["id"]) for s in a["stuck"][:6])))
-        elif sweep_in_flight:
+        elif sweep_in_flight and not sweep_wait_expired:
             # ga-zkxdw DEFEITO 2: a sweep takes ~5-6min; a snapshot taken mid-sweep
             # cannot distinguish "skipped" from "not reached yet" — genuinely
-            # uncertain, not a confirmed ✅ NOR a confirmed ❌.
+            # uncertain, not a confirmed ✅ NOR a confirmed ❌ (bounded by budget,
+            # attempt 4 — see sweep_wait_expired above).
             warns.append(
                 "%d bead(s) construível(is) na fila, sweep do Pilot AINDA EM VOO"
-                " (não deu tempo de dispatchar) — aguardando conclusão antes de"
-                " julgar stall: %s"
-                % (len(a["stuck"]),
-                   ", ".join("%s/%s" % (s["rig"], s["id"]) for s in a["stuck"][:6])))
-        elif a.get("from_dispatchable"):
-            fails.append(
-                "%d bead(s) CONSTRUÍVEIS na fila do Pilot, 0 em build (pilot vivo): %s"
-                % (len(a["stuck"]),
+                " há %.0fmin (dentro do orçamento de %dmin) — aguardando conclusão"
+                " antes de julgar stall: %s"
+                % (len(a["stuck"]), sweep_elapsed_min, SWEEP_IN_FLIGHT_BUDGET_MIN,
                    ", ".join("%s/%s" % (s["rig"], s["id"]) for s in a["stuck"][:6])))
         else:
-            # fallback path
-            fails.append(
-                "%d bead(s) APROVADA(s) parada(s) em silêncio (pilot vivo, fallback story:approved): %s"
-                % (len(a["stuck"]),
-                   ", ".join("%s/%s (%s)" % (s["rig"], s["id"], s.get("reason", "?"))
-                             for s in a["stuck"][:6])))
+            reason = ""
+            if sweep_wait_expired:
+                reason = ((" [sweep em voo há %.0fmin, acima do orçamento de %dmin —"
+                          " tratando como stall, não espera]"
+                          % (sweep_elapsed_min, SWEEP_IN_FLIGHT_BUDGET_MIN))
+                         if sweep_elapsed_min is not None else
+                         (" [sweep em voo, mas timestamp do 'sweep start' ilegível —"
+                          " não medido; tratando como stall em vez de esperar sem teto]"))
+            if a.get("from_dispatchable"):
+                fails.append(
+                    "%d bead(s) CONSTRUÍVEIS na fila do Pilot, 0 em build (pilot vivo)%s: %s"
+                    % (len(a["stuck"]), reason,
+                       ", ".join("%s/%s" % (s["rig"], s["id"]) for s in a["stuck"][:6])))
+            else:
+                # fallback path
+                fails.append(
+                    "%d bead(s) APROVADA(s) parada(s) em silêncio (pilot vivo, fallback story:approved)%s: %s"
+                    % (len(a["stuck"]), reason,
+                       ", ".join("%s/%s (%s)" % (s["rig"], s["id"], s.get("reason", "?"))
+                                 for s in a["stuck"][:6])))
 
     # --- Gate check ---
     if g.get("read_err"):
