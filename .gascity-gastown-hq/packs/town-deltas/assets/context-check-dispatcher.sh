@@ -699,7 +699,10 @@ for CC_STORE in $CONTEXT_CHECK_STORES; do
   # O(1) membership in the loop. FAIL-OPEN (git fails → empty set → no exclusion). The Pilot already
   # filters these from dispatch (_filter_built); this keeps the CLASSIFIER from re-labelling them.
   # Test seam CONTEXT_CHECK_TEST_BUILT_IDS; kill-switch CONTEXT_CHECK_EXCLUDE_BUILT=0. (2026-06-22)
-  CC_BUILT_IDS="${CONTEXT_CHECK_TEST_BUILT_IDS-$(git -C "$CC_STORE" for-each-ref --format='%(refname)' 2>/dev/null | grep -oE 'crew/[^/]+/[^/]+$' | sed -E 's@crew/[^/]+/@@' | sort -u)}"
+  # || true: a non-repo CC_STORE (git -C fails) or zero crew/* refs (grep finds
+  # no matches) both legitimately yield an empty set under pipefail — neither
+  # should abort the script before any bead is classified (ga-6qpna).
+  CC_BUILT_IDS="${CONTEXT_CHECK_TEST_BUILT_IDS-$(git -C "$CC_STORE" for-each-ref --format='%(refname)' 2>/dev/null | grep -oE 'crew/[^/]+/[^/]+$' | sed -E 's@crew/[^/]+/@@' | sort -u || true)}"
 
   # Dep-BLOCKED bead-ids in this store (wa-9t2ty fix): a bead with an active
   # blocking dependency is NOT ready-to-code — it must not (re)enter ctx:ready.
