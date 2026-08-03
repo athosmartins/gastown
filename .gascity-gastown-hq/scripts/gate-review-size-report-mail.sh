@@ -36,4 +36,12 @@ fi
 
 gc mail send mayor \
   -s "Relatório semanal: tamanho do diff x veredito do gate (decidir passo 2 do ga-ub8yq)" \
-  -m "$(printf '%s\n\n─────────────────────────────────────────────\nCONTEXTO PRA QUEM LER (ga-ub8yq, P0):\n\nEste relatório existe pra decidir UMA coisa: se o gate deve barrar/fatiar diffs\ngrandes em vez de revisá-los com mais afinco.\n\nA literatura (Cisco/SmartBear, 2.500 revisões) diz que acima de ~400 linhas a\ndetecção de defeitos despenca. Medimos que 33%% das nossas revisões estão acima\ndisso. Mas o dado que DECIDE é a correlação acima — se a taxa de reprovação CAI\nnos diffs grandes, o revisor está degradando e o gate de tamanho se justifica com\nDADO NOSSO, não por analogia.\n\nAÇÃO ESPERADA DO MAYOR:\n 1. registrar a leitura como comentário em ga-ub8yq;\n 2. decidir o passo (2): implementar gate de tamanho, ajustar o limiar, ou\n    DESCARTAR o passo se a correlação não sustentar;\n 3. se ainda faltar volume numa faixa, dizer isso no bead e deixar rodar mais uma\n    semana — NÃO concluir sobre n pequeno.\n\n⚠️ Se a seção de correlação vier vazia, isso significa SEM MEDIÇÃO, não sem\nproblema. Nesse caso o conserto é do script/parser, não do gate.\n' "$OUT")" 2>/dev/null || true
+  -m "$(printf '%s\n\n─────────────────────────────────────────────\nCONTEXTO PRA QUEM LER (ga-ub8yq, P0):\n\nEste relatório existe pra decidir UMA coisa: se o gate deve barrar/fatiar diffs\ngrandes em vez de revisá-los com mais afinco.\n\nA literatura (Cisco/SmartBear, 2.500 revisões) diz que acima de ~400 linhas a\ndetecção de defeitos despenca. Medimos que 33%% das nossas revisões estão acima\ndisso. Mas o dado que DECIDE é a correlação acima — se a taxa de reprovação CAI\nnos diffs grandes, o revisor está degradando e o gate de tamanho se justifica com\nDADO NOSSO, não por analogia.\n\nAÇÃO ESPERADA DO MAYOR:\n 1. registrar a leitura como comentário em ga-ub8yq;\n 2. decidir o passo (2): implementar gate de tamanho, ajustar o limiar, ou\n    DESCARTAR o passo se a correlação não sustentar;\n 3. se ainda faltar volume numa faixa, dizer isso no bead e deixar rodar mais uma\n    semana — NÃO concluir sobre n pequeno.\n\n⚠️ Se a seção de correlação vier vazia, isso significa SEM MEDIÇÃO, não sem\nproblema. Nesse caso o conserto é do script/parser, não do gate.\n' "$OUT")" 2>/dev/null
+MAIL_RC=$?
+if [ $MAIL_RC -ne 0 ]; then
+  # Não engolir esta falha com "|| true": o relatório RODOU mas não chegou ao Mayor,
+  # que é o mesmo "sem erro, sem aviso" que este script inteiro existe pra evitar —
+  # só que aplicado à própria entrega, não ao dado que ela carrega.
+  echo "gate-review-size-report-mail: relatório gerado mas ENTREGA ao Mayor falhou (rc=$MAIL_RC)." >&2
+  exit "$MAIL_RC"
+fi
