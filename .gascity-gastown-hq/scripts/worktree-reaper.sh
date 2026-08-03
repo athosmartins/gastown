@@ -113,7 +113,7 @@ delete_merged_local_branch() {
 # and deleted paths alike.)
 # Returns 0 (reaped) or 1 (kept/refused — always logged, never silent).
 preserve_and_reap_dirty() {
-  local repo="$1" wt="$2" br="$3" age="$4" label sha tag_ref preserved_to parent tmp_index tree
+  local repo="$1" wt="$2" br="$3" age="$4" label sha tag_ref preserved_to parent tmp_index tree ignored_path
   git -C "$wt" status --porcelain 2>/dev/null | grep -q . || return 1   # not actually dirty — leave to normal skip
   parent="$(git -C "$wt" rev-parse HEAD 2>/dev/null)" || return 1
   tmp_index="$(mktemp)" || return 1
@@ -122,6 +122,20 @@ preserve_and_reap_dirty() {
   # so a failed push below leaves nothing to undo.
   GIT_INDEX_FILE="$tmp_index" git -C "$wt" read-tree HEAD >/dev/null 2>&1
   GIT_INDEX_FILE="$tmp_index" git -C "$wt" add -A >/dev/null 2>&1
+  # ga-0j2zc: `add -A` only skips .gitignore for NEW/untracked paths — a path that was
+  # tracked BEFORE it became gitignored (e.g. a vendorized/materialized dir like
+  # whatsapp_automation's .gc/) still has its on-disk drift (or deletion) swept in as a
+  # "modification", because gitignore never un-tracks an already-tracked file. Reported
+  # live: a preserve commit carried 166 FILES / 24,021 lines of incidental .gc/ drift
+  # into a crew branch — none of it the crew's own work. Pin every currently-ignored
+  # tracked path back to its HEAD blob in the scratch index (index-only — the real
+  # index/working tree are untouched) so only genuine crew changes — new files, and
+  # modifications/deletions of paths NOT matching the current .gitignore — survive
+  # into the preserve commit.
+  while IFS= read -r ignored_path; do
+    [ -n "$ignored_path" ] || continue
+    GIT_INDEX_FILE="$tmp_index" git -C "$wt" reset -q HEAD -- "$ignored_path" 2>/dev/null
+  done < <(git -C "$wt" ls-files -ci --exclude-standard 2>/dev/null)
   tree="$(GIT_INDEX_FILE="$tmp_index" git -C "$wt" write-tree 2>/dev/null)"
   rm -f "$tmp_index"
   [ -n "$tree" ] || return 1

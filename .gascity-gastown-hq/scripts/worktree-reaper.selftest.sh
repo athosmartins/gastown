@@ -415,6 +415,74 @@ branch_exists_in "$CRIG/crew/oracle" crew/oracle/stale \
   && bad "crew clone's merged orphan branch NOT deleted" || ok "crew clone's merged orphan branch deleted"
 [ -d "$CRIG/crew/worker" ] && ok "crew/worker (no own .git) left alone, no crash" || bad "crew/worker directory unexpectedly gone"
 
+# ══ ga-0j2zc: gitignored-but-tracked drift must not leak into the preserve commit ══
+# The dirty-worktree preserve path (ga-xv78c) stages the full working-tree state via
+# `add -A` into a scratch index. `add -A` correctly skips NEW untracked files that match
+# .gitignore, but it does NOT skip modifications to files that are ALREADY TRACKED and
+# merely happen to also match a (later-added) .gitignore pattern — e.g. a vendorized/
+# materialized dir like whatsapp_automation's .gc/, tracked before it was gitignored.
+# Reported live: a preserve-before-reap commit (82e40efb6) carried 166 FILES / 24,021
+# lines of .gc/ into a crew branch — none of it the crew's own work, all of it incidental
+# drift in an already-tracked, now-ignored directory. Prove: (i) a tracked+now-ignored
+# file's on-disk DRIFT is excluded from the preserve commit (pinned back to its pre-drift
+# committed content); (ii) a tracked+now-ignored file's on-disk DELETION is likewise not
+# swept in; (iii) genuine crew WIP in a NOT-ignored file is still captured (no regression
+# on the ga-xv78c feature itself); (iv) a brand-new untracked file under the ignored dir
+# stays excluded (pre-existing correct add -A behavior, must not regress).
+echo "── ga-0j2zc: gitignored-but-tracked drift excluded from preserve commit ──"
+GTOWN="$TMP/gtown"; mkdir -p "$GTOWN"
+GREMOTE="$TMP/gremote.git"; git init -q --bare "$GREMOTE"
+GRIG="$GTOWN/grig"; git init -q -b main "$GRIG"
+( cd "$GRIG"
+  git remote add origin "$GREMOTE"
+  mkdir -p .gc
+  echo orig-keep > .gc/keep.txt
+  echo orig-del  > .gc/will-delete.txt
+  git add .gc/keep.txt .gc/will-delete.txt
+  git commit -qm "base: tracked files under .gc/ (before it was ignored)"
+  echo ".gc/" > .gitignore
+  git add .gitignore
+  git commit -qm "ignore .gc/ going forward (already-tracked files stay tracked)"
+  git push -q origin main
+  git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  git worktree add -q "$GRIG/crew/worker-ga0j2zc" -b crew/g/ga0j2zc main
+) >/dev/null 2>&1
+( cd "$GRIG/crew/worker-ga0j2zc"
+  echo "DRIFTED-BY-LIVE-DAEMON" > .gc/keep.txt        # tracked+ignored, modified on disk
+  rm -f .gc/will-delete.txt                            # tracked+ignored, deleted on disk
+  echo "new ignored artifact" > .gc/new-artifact.txt   # untracked+ignored — add -A already excludes this
+  echo "genuine crew wip" > crew_wip.txt               # untracked, NOT ignored — must be captured
+) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$GRIG/crew/worker-ga0j2zc" 2>/dev/null || true
+
+WORKTREE_REAPER_GT="$GTOWN" WORKTREE_REAPER_LOG="$TMP/reaperG.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+  bash "$REAPER" >/dev/null 2>&1
+
+gwt() { git -C "$GRIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/worker-ga0j2zc\$"; }
+gwt && bad "ga-0j2zc: dirty worktree with ignored-tracked drift NOT reaped" || ok "ga-0j2zc: dirty worktree with ignored-tracked drift preserved+reaped"
+
+git -C "$GREMOTE" rev-parse -q --verify refs/heads/crew/g/ga0j2zc >/dev/null 2>&1 \
+  && ok "ga-0j2zc: preserve commit landed on origin" \
+  || bad "ga-0j2zc: preserve commit never reached origin — cannot check its contents"
+
+git -C "$GREMOTE" show refs/heads/crew/g/ga0j2zc:.gc/keep.txt 2>/dev/null | grep -qx orig-keep \
+  && ok "ga-0j2zc: tracked+ignored file's on-disk DRIFT excluded (preserve kept pre-drift committed content)" \
+  || bad "ga-0j2zc: tracked+ignored file's drift LEAKED into the preserve commit (the reported bug)"
+
+git -C "$GREMOTE" show refs/heads/crew/g/ga0j2zc:.gc/will-delete.txt 2>/dev/null | grep -qx orig-del \
+  && ok "ga-0j2zc: tracked+ignored file's on-disk DELETION not swept into the preserve commit" \
+  || bad "ga-0j2zc: tracked+ignored file's deletion leaked into the preserve commit"
+
+git -C "$GREMOTE" show refs/heads/crew/g/ga0j2zc:crew_wip.txt 2>/dev/null | grep -qx "genuine crew wip" \
+  && ok "ga-0j2zc: genuine (non-ignored) crew WIP still captured (no ga-xv78c regression)" \
+  || bad "ga-0j2zc: genuine crew WIP LOST — regression on the ga-xv78c preserve feature"
+
+git -C "$GREMOTE" show refs/heads/crew/g/ga0j2zc:.gc/new-artifact.txt >/dev/null 2>&1 \
+  && bad "ga-0j2zc: new untracked file under the ignored dir wrongly captured" \
+  || ok "ga-0j2zc: new untracked file under the ignored dir correctly excluded (pre-existing add -A behavior)"
+
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ] || exit 1
