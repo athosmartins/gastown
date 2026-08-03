@@ -107,13 +107,19 @@ eq("gate:needs-fix NOT in-flight (re-dispatchable)", m._label_is_gate_inflight("
 eq("gate:needs-human NOT in-flight (parked separately)", m._label_is_gate_inflight("gate:needs-human"), False)
 eq("ctx:ready NOT gate-inflight", m._label_is_gate_inflight("ctx:ready"), False)
 
-print("── _pilot_slots(): parses the Pilot's 'Available slots' log line ──")
+print("── _read_pilot_log_tail()+_pilot_slots(): parses the Pilot's 'Available slots' log line ──")
 import types
 def _fake_sh_factory(stdout):
     def _fake(args, timeout=20):
         return types.SimpleNamespace(returncode=0, stdout=stdout)
     return _fake
 
+# ga-zkxdw attempt 2 GATE-FEEDBACK: _pilot_slots()/_pilot_candidates()/_sweep_in_flight()
+# no longer call _sh()/tail on their own — main() reads PILOT_LOG's tail EXACTLY ONCE via
+# _read_pilot_log_tail() and threads that SAME snapshot into all three, so they can never
+# describe different sweeps. Tests below fake _sh, take the seam's reading via
+# _read_pilot_log_tail(), then feed that snapshot into the pure functions — the same
+# integration path main() uses.
 # NOTE: every fixture below needs a leading '=== Pilot sweep start' marker —
 # _pilot_slots()/_pilot_candidates() are sweep-segmented post-GATE-FEEDBACK fix
 # (see the dedicated section further down) and return None without one.
@@ -126,23 +132,28 @@ m._sh = _fake_sh_factory(
     "[2026-07-16 13:50:34] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n"
     "[2026-07-16 13:50:34] [pilot-dispatcher] In-flight: live=5 small=4/5  big=1/2\n"
     "[2026-07-16 13:50:36] [pilot-dispatcher] Available slots: small=1  big=1\n")
-eq("picks the CURRENT sweep's Available-slots line, not an older sweep's", m._pilot_slots(), {"small": 1, "big": 1})
+eq("picks the CURRENT sweep's Available-slots line, not an older sweep's",
+   m._pilot_slots(m._read_pilot_log_tail()), {"small": 1, "big": 1})
 
 m._sh = _fake_sh_factory(
     "[2026-07-16 13:42:49] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n"
     "[2026-07-16 13:42:49] [pilot-dispatcher] In-flight: live=6 small=5/5  big=1/2\n")
-eq("sweep started but no Available-slots line yet → None", m._pilot_slots(), None)
+eq("sweep started but no Available-slots line yet → None", m._pilot_slots(m._read_pilot_log_tail()), None)
 
 m._sh = _fake_sh_factory("")
-eq("empty log → None", m._pilot_slots(), None)
+eq("empty log → None (_read_pilot_log_tail)", m._read_pilot_log_tail(), None)
+eq("empty log → None (_pilot_slots)", m._pilot_slots(m._read_pilot_log_tail()), None)
 
 m._sh = lambda args, timeout=20: None
-eq("_sh failure (command errored) → None", m._pilot_slots(), None)
+eq("_sh failure (command errored) → None (_read_pilot_log_tail)", m._read_pilot_log_tail(), None)
+eq("_sh failure (command errored) → None (_pilot_slots)", m._pilot_slots(m._read_pilot_log_tail()), None)
 
 m._sh = _fake_sh_factory(
     "[2026-07-16 13:42:49] [pilot-dispatcher] In-flight: live=6 small=5/5  big=1/2\n"
     "[2026-07-16 13:42:54] [pilot-dispatcher] Available slots: small=9  big=9\n")
-eq("no sweep-start marker visible at all → None, not a best-effort read", m._pilot_slots(), None)
+eq("no sweep-start marker visible at all → None, not a best-effort read", m._pilot_slots(m._read_pilot_log_tail()), None)
+
+eq("_pilot_slots(None) — no snapshot at all → None (pure-function contract, no I/O)", m._pilot_slots(None), None)
 
 print("── ga-wmrr regression: saturated pool downgrades ❌ stuck → ℹ️  note, not fails ──")
 # Reproduces the reported incident: pilot-dispatchable.json has 1 genuinely
@@ -162,7 +173,7 @@ eq("fixture: exactly one genuinely-stuck bead pre-fix", [s["id"] for s in _a2["s
 m._sh = _fake_sh_factory(
     "[2026-07-16 14:00:00] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n"
     "[2026-07-16 14:00:00] [pilot-dispatcher] Available slots: small=0  big=0\n")
-_slots_sat = m._pilot_slots()
+_slots_sat = m._pilot_slots(m._read_pilot_log_tail())
 eq("both lanes saturated parses as small=0 big=0", _slots_sat, {"small": 0, "big": 0})
 _pool_saturated = bool(_slots_sat) and _slots_sat["small"] <= 0 and _slots_sat["big"] <= 0
 eq("pool_saturated flag true when both lanes are 0", _pool_saturated, True)
@@ -170,7 +181,7 @@ eq("pool_saturated flag true when both lanes are 0", _pool_saturated, True)
 m._sh = _fake_sh_factory(
     "[2026-07-16 14:00:00] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n"
     "[2026-07-16 14:00:00] [pilot-dispatcher] Available slots: small=0  big=2\n")
-_slots_room = m._pilot_slots()
+_slots_room = m._pilot_slots(m._read_pilot_log_tail())
 _pool_saturated2 = bool(_slots_room) and _slots_room["small"] <= 0 and _slots_room["big"] <= 0
 eq("pool_saturated flag false when a lane still has room (small=0 big=2)", _pool_saturated2, False)
 
@@ -180,6 +191,7 @@ _orig_check_approved, _orig_check_gate = m.check_approved, m.check_gate
 _orig_check_pilot, _orig_check_dolt = m.check_pilot, m.check_dolt
 _orig_pilot_slots, _orig_rigs = m._pilot_slots, m.RIGS
 _orig_pilot_candidates0, _orig_sweep_in_flight0 = m._pilot_candidates, m._sweep_in_flight
+_orig_read_pilot_log_tail0 = m._read_pilot_log_tail
 
 m.check_approved = lambda: {
     "total": 1, "parked_count": 0, "in_gate_count": 0, "buildable_count": 1,
@@ -192,13 +204,18 @@ m.check_gate = lambda: {"active": [], "parked": [], "last_pass_min": 1.0,
                          "stalled": False, "stall_reason": ""}
 m.check_pilot = lambda: {"alive": True, "last_sweep_min": 0.5}
 m.check_dolt = lambda: {"responsive": True, "latency_ms": 10}
-m._pilot_slots = lambda: {"small": 0, "big": 0}
+# _read_pilot_log_tail() is pinned to a harmless constant — the snapshot value is
+# irrelevant here since _pilot_slots()/_pilot_candidates()/_sweep_in_flight() are
+# ALSO pinned below and ignore whatever `lines` they receive; pinning it too just
+# avoids a real subprocess `tail` against the live PILOT_LOG path during this test.
+m._read_pilot_log_tail = lambda: None
+m._pilot_slots = lambda lines: {"small": 0, "big": 0}
 # _pilot_candidates()/_sweep_in_flight() explicitly pinned (not left to whatever
 # m._sh happened to be set to by an earlier, unrelated section) — this end-to-end
 # block tests main()'s branching on pool_saturated alone, so the other two signals
 # must be neutral/unknown rather than an accidental leftover value deciding it.
-m._pilot_candidates = lambda: None
-m._sweep_in_flight = lambda: False
+m._pilot_candidates = lambda lines: None
+m._sweep_in_flight = lambda lines: False
 m.RIGS = []   # skip the live `bd` subprocess calls in the building_now loop
 
 _buf = io.StringIO()
@@ -215,8 +232,8 @@ eq("saturated pool: ✅ summary names the saturation, not silence", "Pool satura
 eq("saturated pool: report does NOT say NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _out, False)
 
 print("── main() end-to-end: a lane still has room + stuck → STILL ❌ (real stall preserved) ──")
-m._pilot_slots = lambda: {"small": 1, "big": 0}   # small has a free slot, queue skipped it anyway
-m._pilot_candidates = lambda: None   # pinned — see note above; sweep_in_flight stays False
+m._pilot_slots = lambda lines: {"small": 1, "big": 0}   # small has a free slot, queue skipped it anyway
+m._pilot_candidates = lambda lines: None   # pinned — see note above; sweep_in_flight stays False
 _buf2 = io.StringIO()
 _exit_code2 = None
 try:
@@ -232,6 +249,7 @@ m.check_approved, m.check_gate = _orig_check_approved, _orig_check_gate
 m.check_pilot, m.check_dolt = _orig_check_pilot, _orig_check_dolt
 m._pilot_slots, m.RIGS = _orig_pilot_slots, _orig_rigs
 m._pilot_candidates, m._sweep_in_flight = _orig_pilot_candidates0, _orig_sweep_in_flight0
+m._read_pilot_log_tail = _orig_read_pilot_log_tail0
 
 print("── end-to-end: check_approved() over a fixture snapshot (bd/Dolt mocked) ──")
 # Snapshot mixes an already-built in-gate bead with a GENUINELY stuck one. The in-gate
@@ -289,21 +307,24 @@ m._sh = _fake_sh_factory(
     "[2026-08-02 21:26:00] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n"
     "[2026-08-02 21:26:00] [pilot-dispatcher] Available slots: small=0  big=2\n"
     "[2026-08-02 21:26:01] [pilot-dispatcher] Candidates split: small=9  big=0\n")
-eq("picks the CURRENT sweep's Candidates-split line", m._pilot_candidates(), {"small": 9, "big": 0})
+eq("picks the CURRENT sweep's Candidates-split line", m._pilot_candidates(m._read_pilot_log_tail()), {"small": 9, "big": 0})
 
 m._sh = _fake_sh_factory(
     "[2026-08-02 21:26:00] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n"
     "[2026-08-02 21:26:00] [pilot-dispatcher] Available slots: small=0  big=2\n")
-eq("sweep started but no Candidates-split/no-candidates line yet → None", m._pilot_candidates(), None)
+eq("sweep started but no Candidates-split/no-candidates line yet → None", m._pilot_candidates(m._read_pilot_log_tail()), None)
 
 m._sh = _fake_sh_factory("")
-eq("empty log → None (candidates)", m._pilot_candidates(), None)
+eq("empty log → None (candidates)", m._pilot_candidates(m._read_pilot_log_tail()), None)
 
 m._sh = _fake_sh_factory(
     "[2026-08-02 21:26:00] [pilot-dispatcher] Available slots: small=0  big=2\n"
     "[2026-08-02 21:26:01] [pilot-dispatcher] Candidates split: small=9  big=0\n")
 eq("no sweep-start marker visible at all → None, not a best-effort read (candidates)",
-   m._pilot_candidates(), None)
+   m._pilot_candidates(m._read_pilot_log_tail()), None)
+
+eq("_pilot_candidates(None) — no snapshot at all → None (pure-function contract, no I/O)",
+   m._pilot_candidates(None), None)
 
 print("── ga-zkxdw DEFEITO 1: _pool_saturated() is lane-aware, not just both-lanes-empty ──")
 # Cenário A (measured live 2026-08-02 21:26): small=0 big=2 slots, but ALL 9 real
@@ -325,31 +346,34 @@ eq("no slots data at all → NOT saturated (unknown must never suppress a real s
 print("── ga-zkxdw DEFEITO 2: _sweep_in_flight() detects an unfinished Pilot sweep ──")
 m._sh = _fake_sh_factory(
     "[2026-08-02 21:34:54] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n")
-eq("sweep started, no complete line yet → True (in flight)", m._sweep_in_flight(), True)
+eq("sweep started, no complete line yet → True (in flight)", m._sweep_in_flight(m._read_pilot_log_tail()), True)
 
 m._sh = _fake_sh_factory(
     "[2026-08-02 21:34:54] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n"
     "[2026-08-02 21:40:12] [pilot-dispatcher] === Pilot sweep complete: dispatched=6"
     " (small_slots=0 big_slots=2 dolt_saturated_at_start=0) ===\n")
-eq("sweep start THEN complete → False (finished)", m._sweep_in_flight(), False)
+eq("sweep start THEN complete → False (finished)", m._sweep_in_flight(m._read_pilot_log_tail()), False)
 
 m._sh = _fake_sh_factory(
     "[2026-08-02 21:34:54] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n"
     "[2026-08-02 21:40:12] [pilot-dispatcher] === Pilot sweep complete: dispatched=6 (...) ===\n"
     "[2026-08-02 21:45:00] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n")
-eq("complete THEN a new start → True (next sweep now in flight)", m._sweep_in_flight(), True)
+eq("complete THEN a new start → True (next sweep now in flight)", m._sweep_in_flight(m._read_pilot_log_tail()), True)
 
 m._sh = _fake_sh_factory(
     "[2026-08-02 21:38:00] [pilot-dispatcher] === Pilot sweep complete: dispatched=0"
     " (paused: cota 5h limitada) ===\n")
 eq("an early-exit 'sweep complete' variant also counts as finished → False",
-   m._sweep_in_flight(), False)
+   m._sweep_in_flight(m._read_pilot_log_tail()), False)
 
 m._sh = _fake_sh_factory("")
-eq("empty log → None (unknown, not False)", m._sweep_in_flight(), None)
+eq("empty log → None (unknown, not False)", m._sweep_in_flight(m._read_pilot_log_tail()), None)
 
 m._sh = lambda args, timeout=20: None
-eq("_sh failure → None (unknown)", m._sweep_in_flight(), None)
+eq("_sh failure → None (unknown)", m._sweep_in_flight(m._read_pilot_log_tail()), None)
+
+eq("_sweep_in_flight(None) — no snapshot at all → None (pure-function contract, no I/O)",
+   m._sweep_in_flight(None), None)
 
 print("── ga-zkxdw GATE-FEEDBACK (attempt 1 FAIL): _pilot_slots()/_pilot_candidates() "
       "never cross a sweep boundary ──")
@@ -373,8 +397,8 @@ m._sh = _fake_sh_factory(
     "[2026-08-03 05:26:01] [pilot-dispatcher] Available slots: small=2  big=0\n"
     "[2026-08-03 05:26:02] [pilot-dispatcher] No dispatchable candidates (Tier 1 or Tier 2). Exiting.\n")
 eq("Fixture1: current sweep's explicit zero-candidates exit reads 0/0, not the older sweep's split",
-   m._pilot_candidates(), {"small": 0, "big": 0})
-eq("Fixture1: slots still read from the CURRENT sweep only", m._pilot_slots(), {"small": 2, "big": 0})
+   m._pilot_candidates(m._read_pilot_log_tail()), {"small": 0, "big": 0})
+eq("Fixture1: slots still read from the CURRENT sweep only", m._pilot_slots(m._read_pilot_log_tail()), {"small": 2, "big": 0})
 
 # Fixture 2 (Cenário B): sweep in flight — has 'start', no 'complete', no
 # candidates-related line yet. Must be None (unknown), never an older sweep's
@@ -384,8 +408,8 @@ m._sh = _fake_sh_factory(
     " (small_slots=0 big_slots=2 dolt_saturated_at_start=0) ===\n"
     "[2026-08-03 05:34:54] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n")
 eq("Fixture2: sweep in flight, no candidates line yet → None (not the prior sweep's reading)",
-   m._pilot_candidates(), None)
-eq("Fixture2: sweep in flight, no slots line yet → None", m._pilot_slots(), None)
+   m._pilot_candidates(m._read_pilot_log_tail()), None)
+eq("Fixture2: sweep in flight, no slots line yet → None", m._pilot_slots(m._read_pilot_log_tail()), None)
 
 # Fixture 3: log rotated/truncated mid-sweep — no '=== Pilot sweep start' marker
 # visible anywhere in the tail window. Must be None, not a partial/best-effort
@@ -394,9 +418,9 @@ m._sh = _fake_sh_factory(
     "[2026-08-03 05:20:01] [pilot-dispatcher] Candidates split: small=9  big=0\n"
     "[2026-08-03 05:20:05] [pilot-dispatcher] Available slots: small=3  big=1\n")
 eq("Fixture3: no sweep-start marker visible at all → None, not a partial read (candidates)",
-   m._pilot_candidates(), None)
+   m._pilot_candidates(m._read_pilot_log_tail()), None)
 eq("Fixture3: no sweep-start marker visible at all → None, not a partial read (slots)",
-   m._pilot_slots(), None)
+   m._pilot_slots(m._read_pilot_log_tail()), None)
 
 # Fixture 4 (Mayor's control — must NOT become a false negative): free slot +
 # matching candidate + sweep COMPLETE + 0 dispatch, all within the SAME segment.
@@ -408,13 +432,15 @@ m._sh = _fake_sh_factory(
     "[2026-08-03 05:40:03] [pilot-dispatcher] === Pilot sweep complete: dispatched=0"
     " (small_slots=1 big_slots=0 dolt_saturated_at_start=0) ===\n")
 eq("Fixture4 control: matching lane demand still reads through (not swallowed by the fix)",
-   m._pilot_candidates(), {"small": 1, "big": 0})
-eq("Fixture4 control: slots still reads through", m._pilot_slots(), {"small": 1, "big": 0})
+   m._pilot_candidates(m._read_pilot_log_tail()), {"small": 1, "big": 0})
+eq("Fixture4 control: slots still reads through", m._pilot_slots(m._read_pilot_log_tail()), {"small": 1, "big": 0})
 
 print("── main() end-to-end: GATE-FEEDBACK Fixture 1 — confirmed-zero candidates must not "
       "fabricate a stale 9 nor fail ──")
 _zz_ca, _zz_cg, _zz_cp, _zz_cd = m.check_approved, m.check_gate, m.check_pilot, m.check_dolt
 _zz_slots, _zz_cand, _zz_swf, _zz_rigs = m._pilot_slots, m._pilot_candidates, m._sweep_in_flight, m.RIGS
+_zz_read_tail = m._read_pilot_log_tail
+m._read_pilot_log_tail = lambda: None   # irrelevant: the 3 signals below are pinned directly
 # pilot-dispatchable.json can lag the live sweep by up to ttl*2 (~20min per the
 # reviewer's comment), so a snapshot-stuck bead coexisting with a live sweep that
 # just read zero real candidates is a realistic, not contrived, combination.
@@ -430,9 +456,9 @@ m.check_gate = lambda: {"active": [], "parked": [], "last_pass_min": 1.0,
 m.check_pilot = lambda: {"alive": True, "last_sweep_min": 0.5}
 m.check_dolt = lambda: {"responsive": True, "latency_ms": 10}
 m.RIGS = []
-m._pilot_slots = lambda: {"small": 2, "big": 0}
-m._pilot_candidates = lambda: {"small": 0, "big": 0}   # correctly-segmented read: explicit zero
-m._sweep_in_flight = lambda: False
+m._pilot_slots = lambda lines: {"small": 2, "big": 0}
+m._pilot_candidates = lambda lines: {"small": 0, "big": 0}   # correctly-segmented read: explicit zero
+m._sweep_in_flight = lambda lines: False
 _bufZ = io.StringIO()
 _exitZ = None
 try:
@@ -445,10 +471,13 @@ eq("confirmed-zero candidates: report does NOT say NÃO IMPARÁVEL", "NÃO IMPAR
 
 m.check_approved, m.check_gate, m.check_pilot, m.check_dolt = _zz_ca, _zz_cg, _zz_cp, _zz_cd
 m._pilot_slots, m._pilot_candidates, m._sweep_in_flight, m.RIGS = _zz_slots, _zz_cand, _zz_swf, _zz_rigs
+m._read_pilot_log_tail = _zz_read_tail
 
 print("── main() end-to-end: ga-zkxdw regression — defects 1+2, all 3 falsifiable cenários ──")
 _z_ca, _z_cg, _z_cp, _z_cd = m.check_approved, m.check_gate, m.check_pilot, m.check_dolt
 _z_slots, _z_cand, _z_swf, _z_rigs = m._pilot_slots, m._pilot_candidates, m._sweep_in_flight, m.RIGS
+_z_read_tail = m._read_pilot_log_tail
+m._read_pilot_log_tail = lambda: None   # irrelevant: the 3 signals below are pinned directly
 
 m.check_gate = lambda: {"active": [], "parked": [], "last_pass_min": 1.0,
                          "reviewer_alive": True, "oldest_active_min": None,
@@ -465,9 +494,9 @@ m.check_approved = lambda: {
               for i in range(9)],
     "read_err": [], "warns": [], "from_dispatchable": True, "snap_age_min": 1.0,
 }
-m._pilot_slots = lambda: {"small": 0, "big": 2}
-m._pilot_candidates = lambda: {"small": 9, "big": 0}
-m._sweep_in_flight = lambda: False
+m._pilot_slots = lambda lines: {"small": 0, "big": 2}
+m._pilot_candidates = lambda lines: {"small": 9, "big": 0}
+m._sweep_in_flight = lambda lines: False
 _bufA = io.StringIO()
 _exitA = None
 try:
@@ -481,9 +510,9 @@ eq("Cenário A: report does NOT say NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _bufA
 
 # Cenário B: lane is now RIGHT (small=2 free, matches candidates) — defeito 1 alone
 # would flag this. Only defeito 2 (sweep still running) can save it.
-m._pilot_slots = lambda: {"small": 2, "big": 0}
-m._pilot_candidates = lambda: {"small": 9, "big": 0}
-m._sweep_in_flight = lambda: True
+m._pilot_slots = lambda lines: {"small": 2, "big": 0}
+m._pilot_candidates = lambda lines: {"small": 9, "big": 0}
+m._sweep_in_flight = lambda lines: True
 _bufB = io.StringIO()
 _exitB = None
 try:
@@ -502,9 +531,9 @@ m.check_approved = lambda: {
     "stuck": [{"id": "wa-REALSTALL", "rig": "WA", "title": "room+demand+sweep done", "lane": "small"}],
     "read_err": [], "warns": [], "from_dispatchable": True, "snap_age_min": 1.0,
 }
-m._pilot_slots = lambda: {"small": 1, "big": 0}
-m._pilot_candidates = lambda: {"small": 1, "big": 0}
-m._sweep_in_flight = lambda: False
+m._pilot_slots = lambda lines: {"small": 1, "big": 0}
+m._pilot_candidates = lambda lines: {"small": 1, "big": 0}
+m._sweep_in_flight = lambda lines: False
 _bufC = io.StringIO()
 _exitC = None
 try:
@@ -518,6 +547,85 @@ eq("Cenário C: report says NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _bufC.getvalu
 
 m.check_approved, m.check_gate, m.check_pilot, m.check_dolt = _z_ca, _z_cg, _z_cp, _z_cd
 m._pilot_slots, m._pilot_candidates, m._sweep_in_flight, m.RIGS = _z_slots, _z_cand, _z_swf, _z_rigs
+m._read_pilot_log_tail = _z_read_tail
+
+print("── ga-zkxdw GATE-FEEDBACK (attempt 2 FAIL): main() reads PILOT_LOG's tail EXACTLY ONCE per "
+      "veredito, shares ONE snapshot across slots/candidates/sweep_in_flight ──")
+# Reviewer's traced regression (attempt 2): _pilot_slots()/_pilot_candidates() each called
+# _current_sweep_lines() independently, and _sweep_in_flight() did its own third independent
+# read — three live `tail` subprocess calls racing an actively-appended file. If a sweep
+# boundary passed between calls, the three signals could each describe a DIFFERENT sweep and
+# get silently combined into one incoherent verdict. The Mayor's spec (attempt 3): read once,
+# thread the SAME immutable snapshot into all three. Two falsifiable properties below:
+#   (1) instrumentation — the tail-read seam is invoked EXACTLY ONCE per full main() run
+#       (today, pre-fix, this would be 3 — one from each of _pilot_slots/_pilot_candidates/
+#       _sweep_in_flight; check_pilot()'s separate -n 60 liveness read is a different seam
+#       and is not counted here);
+#   (2) mutant content — a seam that would hand out DIFFERENT content on a second call proves,
+#       by never reaching that branch, that slots/candidates/sweep_in_flight cannot disagree
+#       about which sweep is "current".
+_i_ca, _i_cg, _i_cp, _i_cd, _i_rigs = m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS
+_i_orig_slots, _i_orig_cand, _i_orig_swf = m._pilot_slots, m._pilot_candidates, m._sweep_in_flight
+
+m.check_approved = lambda: {
+    "total": 0, "parked_count": 0, "in_gate_count": 0, "buildable_count": 0,
+    "flowing_count": 0, "held_count": 0, "stuck": [],
+    "read_err": [], "warns": [], "from_dispatchable": True, "snap_age_min": 1.0,
+}
+m.check_gate = lambda: {"active": [], "parked": [], "last_pass_min": 1.0,
+                         "reviewer_alive": True, "oldest_active_min": None,
+                         "stalled": False, "stall_reason": ""}
+m.check_pilot = lambda: {"alive": True, "last_sweep_min": 0.5}
+m.check_dolt = lambda: {"responsive": True, "latency_ms": 10}
+m.RIGS = []
+
+SWEEP_N = (
+    "[2026-08-03 05:20:00] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n"
+    "[2026-08-03 05:20:01] [pilot-dispatcher] Available slots: small=1  big=0\n"
+    "[2026-08-03 05:20:02] [pilot-dispatcher] Candidates split: small=1  big=0\n"
+    "[2026-08-03 05:20:03] [pilot-dispatcher] === Pilot sweep complete: dispatched=0"
+    " (small_slots=1 big_slots=0 dolt_saturated_at_start=0) ===\n")
+SWEEP_N_ADVANCED = SWEEP_N + (
+    "[2026-08-03 05:26:00] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n"
+    "[2026-08-03 05:26:01] [pilot-dispatcher] No dispatchable candidates (Tier 1 or Tier 2). Exiting.\n")
+
+_sh_calls = {"n": 0}
+def _counting_mutant_sh(args, timeout=20):
+    _sh_calls["n"] += 1
+    # A correct fix reads PILOT_LOG's tail once; this fake proves it by only ever handing
+    # out sweep N to that single read. If the code under test were to read a SECOND time
+    # (the attempt-2 bug), it would observe the log having advanced to sweep N+1 (explicit-
+    # zero candidates, early exit) and produce a mixed, incoherent verdict.
+    text = SWEEP_N if _sh_calls["n"] == 1 else SWEEP_N_ADVANCED
+    return types.SimpleNamespace(returncode=0, stdout=text)
+m._sh = _counting_mutant_sh
+
+_captured = {}
+def _spy_slots(lines):
+    r = _i_orig_slots(lines); _captured["slots"] = r; return r
+def _spy_cand(lines):
+    r = _i_orig_cand(lines); _captured["candidates"] = r; return r
+def _spy_swf(lines):
+    r = _i_orig_swf(lines); _captured["sweep_in_flight"] = r; return r
+m._pilot_slots, m._pilot_candidates, m._sweep_in_flight = _spy_slots, _spy_cand, _spy_swf
+
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        m.main()
+except SystemExit:
+    pass
+
+eq("instrumentation: PILOT_LOG tail read EXACTLY ONCE for the whole verdict (today this would be 3)",
+   _sh_calls["n"], 1)
+eq("mutant content: slots reflect sweep N (the only sweep actually read)",
+   _captured.get("slots"), {"small": 1, "big": 0})
+eq("mutant content: candidates ALSO reflect sweep N — same snapshot as slots, never sweep N+1's explicit zero",
+   _captured.get("candidates"), {"small": 1, "big": 0})
+eq("mutant content: sweep_in_flight ALSO reflects sweep N (complete) — same snapshot, not sweep N+1 (in-flight)",
+   _captured.get("sweep_in_flight"), False)
+
+m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS = _i_ca, _i_cg, _i_cp, _i_cd, _i_rigs
+m._pilot_slots, m._pilot_candidates, m._sweep_in_flight = _i_orig_slots, _i_orig_cand, _i_orig_swf
 
 print()
 print("RESULT: %d passed, %d failed" % (PASS, FAIL))

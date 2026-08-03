@@ -447,43 +447,68 @@ def check_gate():
 
 
 # ── CHECK 3 & 4: pilot + dolt liveness ───────────────────────────────────────
-def _current_sweep_lines():
-    """Lines of PILOT_LOG's tail belonging ONLY to the most recent sweep, bounded
-    by the last '=== Pilot sweep start' marker in view. Returns None if no start
-    marker is visible in the tail window — a rotated log, or the current sweep
-    has already produced more than the tail window's worth of lines before
-    reaching the point being read — rather than guess from whatever happens to
-    be in view.
+def _read_pilot_log_tail():
+    """The ONE place a verdict touches PILOT_LOG's tail for sweep-segmentation
+    purposes. Returns the list of lines (most recent ~500), or None if
+    unreadable. main() calls this EXACTLY ONCE per run and threads the SAME
+    immutable snapshot into _current_sweep_lines()/_pilot_slots()/
+    _pilot_candidates()/_sweep_in_flight() below — none of them may read
+    PILOT_LOG on their own.
 
-    Shared by _pilot_slots()/_pilot_candidates() so both read the SAME segment:
-    the two signals must be joined by sweep (the event), never by file proximity.
-    GATE-FEEDBACK on ga-zkxdw attempt 1 (reviewer FAIL, 2026-08-03): a backward
-    scan with no boundary awareness paired the CURRENT sweep's 'Available slots'
-    with an OLDER sweep's 'Candidates split' line whenever the current sweep hit
-    the zero-candidates early exit — which logs 'Available slots' (unconditional,
-    pilot-dispatcher.sh ~L3974) but then exits at ~L4491-4493 without ever
-    reaching 'Candidates split' (~L4525). Two readings from different moments,
-    joined by nothing but adjacency in the file — the exact bug class this whole
-    check exists to catch, reintroduced inside its own fix."""
+    GATE-FEEDBACK on ga-zkxdw attempt 2 (reviewer FAIL, 2026-08-03): before this
+    seam existed, _pilot_slots() and _pilot_candidates() each called
+    _current_sweep_lines() independently, and _sweep_in_flight() did its own
+    third independent tail — three live reads of an actively-appended file. If
+    a new sweep started between reads, the three signals could each describe a
+    DIFFERENT sweep and get silently combined into one verdict — the docstring
+    on the old _current_sweep_lines() claimed "both read the SAME segment", but
+    "shared" only meant the same *algorithm* ran twice, not the same *snapshot*.
+    Same root mistake as attempt 1 (joining two readings by proximity instead of
+    by a shared snapshot of one event), one level up. A veredito must be
+    computed over a single immutable snapshot; splitting the read from the
+    parse (this function vs. the pure functions below) is what makes that
+    checkable — see the selftest's instrumentation + mutant-content tests."""
     r = _sh(["tail", "-n", "500", PILOT_LOG])
     if not (r and r.stdout):
         return None
-    lines = r.stdout.splitlines()
+    return r.stdout.splitlines()
+
+
+def _current_sweep_lines(lines):
+    """Given the shared PILOT_LOG snapshot `lines` (see _read_pilot_log_tail —
+    read ONCE per verdict, passed in here, never re-fetched), return only the
+    lines belonging to the most recent sweep, bounded by the last '=== Pilot
+    sweep start' marker. Returns None if `lines` is None, or no start marker is
+    visible — a rotated log, or the current sweep has already produced more
+    than the tail window's worth of lines before reaching the point being read
+    — rather than guess from whatever happens to be in view.
+
+    GATE-FEEDBACK on ga-zkxdw attempt 1: a backward scan with no boundary
+    awareness paired the CURRENT sweep's 'Available slots' with an OLDER
+    sweep's 'Candidates split' line whenever the current sweep hit the
+    zero-candidates early exit — which logs 'Available slots' (unconditional,
+    pilot-dispatcher.sh ~L3974) but then exits at ~L4491-4493 without ever
+    reaching 'Candidates split' (~L4525). Two readings from different moments,
+    joined by nothing but adjacency in the file."""
+    if lines is None:
+        return None
     for i in range(len(lines) - 1, -1, -1):
         if "=== Pilot sweep start" in lines[i]:
             return lines[i:]
     return None
 
 
-def _pilot_slots():
-    """'Available slots: small=X  big=Y' from the CURRENT sweep only (see
-    _current_sweep_lines) — the same line pilot-dispatcher.sh emits from
-    MAX_lane - in_flight_lane. Returns {'small': int, 'big': int}, or None if no
-    sweep boundary is visible, or this sweep hasn't reached that line yet.
-    Caller must treat None as 'unknown' and fall back to the pre-ga-wmrr strict
-    behavior — an unreadable signal must never SUPPRESS a real stall; only a
-    POSITIVELY-confirmed 0/0 may downgrade one."""
-    seg = _current_sweep_lines()
+def _pilot_slots(lines):
+    """'Available slots: small=X  big=Y' from the CURRENT sweep only, within the
+    shared PILOT_LOG snapshot `lines` (see _read_pilot_log_tail —
+    _pilot_candidates()/_sweep_in_flight() must receive the SAME `lines` object
+    for a given verdict, so this can never disagree with them about which sweep
+    is "current"). Returns {'small': int, 'big': int}, or None if `lines` is
+    None, no sweep boundary is visible, or this sweep hasn't reached that line
+    yet. Caller must treat None as 'unknown' and fall back to the pre-ga-wmrr
+    strict behavior — an unreadable signal must never SUPPRESS a real stall;
+    only a POSITIVELY-confirmed 0/0 may downgrade one."""
+    seg = _current_sweep_lines(lines)
     if seg is None:
         return None
     import re
@@ -494,9 +519,10 @@ def _pilot_slots():
     return None
 
 
-def _pilot_candidates():
-    """The CURRENT sweep's (see _current_sweep_lines) own per-lane classification
-    of its candidate scan (classify_lane: explicit lane:* label, then
+def _pilot_candidates(lines):
+    """The CURRENT sweep's (within the shared PILOT_LOG snapshot `lines` — see
+    _read_pilot_log_tail/_pilot_slots) own per-lane classification of its
+    candidate scan (classify_lane: explicit lane:* label, then
     story.size_check==epic, then acceptance-criteria count, default small).
     Reused as-is rather than re-implementing that heuristic here (ga-zkxdw
     DEFEITO 1). Three-way result, not two:
@@ -511,7 +537,7 @@ def _pilot_candidates():
     Caller must treat None the same fail-open way as _pilot_slots() — an
     unreadable signal must never SUPPRESS a real stall, only a
     positively-confirmed reading (a count OR the explicit-zero exit) may."""
-    seg = _current_sweep_lines()
+    seg = _current_sweep_lines(lines)
     if seg is None:
         return None
     import re
@@ -551,9 +577,11 @@ def _pool_saturated(slots, candidates):
     return slots["small"] <= 0 and slots["big"] <= 0
 
 
-def _sweep_in_flight():
-    """True if the Pilot log's most recent sweep boundary marker is a START
-    with no matching COMPLETE after it — i.e. a sweep is currently running.
+def _sweep_in_flight(lines):
+    """True if the shared PILOT_LOG snapshot `lines`' (see _read_pilot_log_tail
+    — the SAME snapshot passed to _pilot_slots()/_pilot_candidates() for this
+    verdict) most recent sweep boundary marker is a START with no matching
+    COMPLETE after it — i.e. a sweep is currently running.
 
     ga-zkxdw DEFEITO 2: pilot-dispatcher.sh sweeps take ~5-6min end to end. A
     stuck-queue snapshot taken mid-sweep sees 'dispatched=0' simply because the
@@ -563,13 +591,19 @@ def _sweep_in_flight():
     dispatch 6 beads by 21:42). Matches ANY of the 3 '=== Pilot sweep complete'
     variants the dispatcher emits (normal / cota-paused / gate-congested-deferred).
 
-    Returns None if the log is missing/unreadable — caller must NOT suppress a
+    GATE-FEEDBACK on ga-zkxdw attempt 2: this used to do its own independent
+    `_sh(tail)` read — a third live read racing the two inside
+    _current_sweep_lines(), able to observe a LATER sweep than _pilot_slots()/
+    _pilot_candidates() did. Taking `lines` as a parameter instead closes that:
+    same snapshot, so this can never disagree with the other two about which
+    sweep is "current".
+
+    Returns None if `lines` is None/unreadable — caller must NOT suppress a
     real stall on unknown; only a POSITIVELY-observed in-flight sweep may
     downgrade a fail to a warn (same fail-open convention as _pilot_slots())."""
-    r = _sh(["tail", "-n", "500", PILOT_LOG])
-    if not (r and r.stdout):
+    if lines is None:
         return None
-    for line in reversed(r.stdout.splitlines()):
+    for line in reversed(lines):
         if "=== Pilot sweep complete" in line:
             return False
         if "=== Pilot sweep start" in line:
@@ -607,9 +641,13 @@ def main():
     g = check_gate()
     p = check_pilot()
     d = check_dolt()
-    slots = _pilot_slots()
-    candidates = _pilot_candidates()
-    sweep_in_flight = _sweep_in_flight()
+    # ga-zkxdw attempt 2 GATE-FEEDBACK: read PILOT_LOG's tail ONCE here and
+    # thread the SAME immutable snapshot into all three sweep-aware signals —
+    # they must never each fetch their own reading (see _read_pilot_log_tail).
+    pilot_log_lines = _read_pilot_log_tail()
+    slots = _pilot_slots(pilot_log_lines)
+    candidates = _pilot_candidates(pilot_log_lines)
+    sweep_in_flight = _sweep_in_flight(pilot_log_lines)
 
     fails, warns, notes = [], [], []
 
