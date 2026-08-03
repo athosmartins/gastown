@@ -1,0 +1,7 @@
+idle_timeout = "1h"
+max_active_sessions = 2
+min_active_sessions = 0
+model = "sonnet"
+provider = "claude-headless"
+scope = "city"
+wake_mode = "fresh"
