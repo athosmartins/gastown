@@ -79,6 +79,63 @@ git -C "$REMOTE" show refs/heads/crew/x/dirty:dirty.txt 2>/dev/null | grep -qx d
   || bad "ga-xv78c: preserved ref exists but WIP content is wrong/missing"
 wt_exists worker-fresh    && ok "fresh worktree KEPT (age gate)"                 || bad "fresh worktree wrongly reaped"
 
+# ── ga-xv78c gate-feedback (fix-attempt 1 FAILED review): BOTH push attempts fail
+# (origin unreachable) → the worktree must be left byte-for-byte as it was — still
+# dirty — so the NEXT sweep's plain non-force `worktree remove` refuses it again
+# too. Attempt 1 committed the WIP with a real `git commit` BEFORE either push was
+# tried; when both failed it correctly returned "kept", but the tree was already
+# git-CLEAN from that commit, so sweep 2's plain remove silently succeeded and
+# deleted it, logging a routine reaped_pool event indistinguishable from an
+# ordinary clean reap. This is the reviewer's exact live repro. No fixture in this
+# suite exercised it before this addition.
+echo "── ga-xv78c gate-feedback: both-pushes-fail leaves worktree dirty across sweeps ──"
+UTOWN="$TMP/utown"; mkdir -p "$UTOWN"
+URIG="$UTOWN/urig"; git init -q -b main "$URIG"
+( cd "$URIG"
+  # origin points at a path that is not a git repo at all → every push fails fast
+  # and deterministically, no real network involved — a hermetic stand-in for
+  # "origin unreachable" that can't flake or hang.
+  git remote add origin "$TMP/no-such-remote.git"
+  echo u > u.txt; git add u.txt; git commit -qm ubase
+  git worktree add -q "$URIG/crew/worker-unreachable" -b crew/u/unreachable main
+  ( cd "$URIG/crew/worker-unreachable"; echo wip > wip.txt )   # uncommitted → dirty
+) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$URIG/crew/worker-unreachable" 2>/dev/null || true
+
+uwt() { git -C "$URIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/worker-unreachable\$"; }
+BEFORE_STATUS="$(git -C "$URIG/crew/worker-unreachable" status --porcelain 2>/dev/null)"
+
+WORKTREE_REAPER_GT="$UTOWN" WORKTREE_REAPER_LOG="$TMP/reaperU1.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+  bash "$REAPER" >/dev/null 2>&1
+
+uwt && ok "gate-feedback: both-pushes-fail worktree survives sweep 1 (not deleted)" \
+     || bad "gate-feedback: worktree deleted on sweep 1 despite BOTH pushes failing — DATA LOSS!"
+grep -q '"event":"preserve_failed_dirty_kept"' "$TMP/reaperU1.jsonl" 2>/dev/null \
+  && ok "gate-feedback: preserve_failed_dirty_kept logged (distinguishable from a routine reap)" \
+  || bad "gate-feedback: failure not logged — would be indistinguishable from a routine skip"
+
+AFTER_STATUS="$(git -C "$URIG/crew/worker-unreachable" status --porcelain 2>/dev/null)"
+[ "$BEFORE_STATUS" = "$AFTER_STATUS" ] \
+  && ok "gate-feedback: worktree status BYTE-FOR-BYTE unchanged after failed preserve (no premature commit)" \
+  || bad "gate-feedback: worktree status CHANGED after failed preserve — the exact fix-attempt-1 bug (silent commit before push confirmed)"
+
+# sweep 2 against the SAME still-dirty worktree: attempt-1 would have silently
+# reaped it here via the plain non-force path, since its earlier commit had
+# already cleaned the tree. Our fix must still see it as dirty and refuse+retry.
+WORKTREE_REAPER_GT="$UTOWN" WORKTREE_REAPER_LOG="$TMP/reaperU2.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+  bash "$REAPER" >/dev/null 2>&1
+
+uwt && ok "gate-feedback: worktree ALSO survives sweep 2 (cross-sweep persistence)" \
+     || bad "gate-feedback: worktree silently deleted on sweep 2 — the exact ga-xv78c attempt-1 regression!"
+grep -q '"event":"reaped_pool".*worker-unreachable' "$TMP/reaperU2.jsonl" 2>/dev/null \
+  && bad "gate-feedback: sweep 2 logged a ROUTINE reaped_pool for a preserve-failed tree — indistinguishable from an ordinary reap!" \
+  || ok "gate-feedback: sweep 2 did NOT silently log it as a routine reap"
+grep -q '"event":"preserve_failed_dirty_kept"' "$TMP/reaperU2.jsonl" 2>/dev/null \
+  && ok "gate-feedback: sweep 2 retried preserve and logged the failure again (never silently skipped)" \
+  || bad "gate-feedback: sweep 2 gave no signal at all"
+
 # ── kill switch: ENABLED=0 → would_reap only, no mutation ────────────────────────
 echo "── kill switch (ENABLED=0 = dry) ──"
 git -C "$RIG" worktree add -q "$RIG/crew/worker-ks" -b crew/x/ks main >/dev/null 2>&1
