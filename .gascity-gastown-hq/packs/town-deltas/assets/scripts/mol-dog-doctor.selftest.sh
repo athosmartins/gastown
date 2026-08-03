@@ -1,6 +1,10 @@
 #!/bin/bash
 # mol-dog-doctor.selftest.sh — checks for the ga-3wdlv/ga-v6y3p backup-freshness
-# threshold fix and the runtime.sh vendoring fix that accompanies it.
+# threshold fix, the runtime.sh vendoring fix that accompanies it, and the
+# ga-br5sw/ga-ouqtg latency-threshold + ms-precision fix (LATENCY_WARN_S +
+# latency.sh sourcing) — the latter regressed once already (ga-ouqtg) with no
+# detector, which is why this file grew a matching arithmetic-reproduction
+# section instead of just fixing the value again.
 #
 # Hermetic: never sources mol-dog-doctor.sh (it has no library mode, and its main
 # body needs a live Dolt server + GC_CITY_PATH; sourcing it here would require
@@ -8,13 +12,15 @@
 # of noise this fix exists to stop, e.g. this city currently has 3 real orphan
 # DBs, which would trip ORPHAN_WARN on any live run). Instead: (1) static text
 # checks against the shipped script, mirroring mol-dog-backup.selftest.sh's
-# drift-guards, (2) a real filesystem check that the runtime.sh path the script
-# resolves at is actually present right now — the concrete thing a lib-mode/
-# early-return selftest would be structurally blind to (see
+# drift-guards, (2) a real filesystem check that the runtime.sh/latency.sh paths
+# the script resolves at are actually present right now — the concrete thing a
+# lib-mode/early-return selftest would be structurally blind to (see
 # hermetic-selftest-cannot-test-the-bootstrap-it-stubs: 20/20 PASS + mutation
 # test still missed a runtime.sh path that didn't exist), and (3) a pure
-# arithmetic reproduction of the reported bug using the ACTUAL threshold value
-# extracted from the script, not a hand-copied constant.
+# arithmetic reproduction of each reported bug using the ACTUAL values/functions
+# extracted from (or sourced from) the shipped scripts, not hand-copied constants
+# — latency.sh itself is pure/leaf (no GC_CITY_PATH, no live Dolt) so it is
+# sourced for real here rather than reimplemented.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -122,6 +128,114 @@ if [ -f "$ORDER_TOML" ] && grep -qF 'exec = "$PACK_DIR/assets/scripts/mol-dog-do
   ok "town-deltas order override points at the vendored script, cooldown interval unchanged (5m)"
 else
   bad "town-deltas order override missing or does not match expected [order] shape: $ORDER_TOML"
+fi
+
+# ── ga-br5sw: latency threshold + ms-precision fix — this is the SECOND time ──
+# ── this exact class regressed (ga-ouqtg was the 1st, closed 52 days earlier, ─
+# ── no detector). Same recipe as the BACKUP_STALE_S checks above: extract the ─
+# ── ACTUAL value from the shipped script (not a hand-copied constant) and ─────
+# ── reproduce the real bug arithmetic, so a future regression of THIS SAME ────
+# ── pattern (threshold too low + whole-second quantization) fails the next ────
+# ── selftest run instead of being discovered only once the inbox floods again.
+echo "── latency threshold + ms-precision (ga-br5sw) ──"
+
+LATENCY_THRESHOLD_LINE=$(grep -E '^LATENCY_WARN_S=' "$SCRIPT" || true)
+NEW_LATENCY_THRESHOLD_S=$(printf '%s\n' "$LATENCY_THRESHOLD_LINE" | grep -oE ':-[0-9]+' | grep -oE '[0-9]+' || true)
+if [ -n "$NEW_LATENCY_THRESHOLD_S" ]; then
+  ok "extracted LATENCY_WARN_S default from shipped script: ${NEW_LATENCY_THRESHOLD_S}s"
+else
+  bad "could not extract LATENCY_WARN_S default from shipped script — got line: '$LATENCY_THRESHOLD_LINE'"
+fi
+
+# Defense in depth: whole-second quantization can only ever read 0s or 1s, so
+# any threshold >= 2s independently blocks the ga-ouqtg/ga-br5sw failure mode
+# even if the ms-precision sourcing below were ever reverted on its own.
+if [ -n "$NEW_LATENCY_THRESHOLD_S" ] && [ "$NEW_LATENCY_THRESHOLD_S" -ge 2 ]; then
+  ok "LATENCY_WARN_S (${NEW_LATENCY_THRESHOLD_S}s) clears the quantization floor (>=2s) — safe even if ms-precision regresses independently"
+else
+  bad "LATENCY_WARN_S (${NEW_LATENCY_THRESHOLD_S:-unset}s) does NOT clear 2s — whole-second quantization (0s or 1s only) can trip this threshold on ANY sub-second probe"
+fi
+
+# ── drift-guard: latency.sh must still be sourced, and the probe must still ───
+# ── use it — if any of these lines are stripped back out, the script silently
+# ── falls back to whole-second `date +%s` (the exact ga-ouqtg/ga-br5sw class).
+if grep -qF '. "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/latency.sh"' "$SCRIPT"; then
+  ok "latency.sh is sourced from the dolt pack's GC_CITY_PATH-anchored live location"
+else
+  bad "latency.sh sourcing is missing or no longer anchors to GC_CITY_PATH/.gc/system/packs/dolt — script will regress to whole-second quantization (ga-ouqtg/ga-br5sw class)"
+fi
+if grep -qF 'PROBE_START_MS=$(now_ms)' "$SCRIPT" && grep -qF 'PROBE_END_MS=$(now_ms)' "$SCRIPT"; then
+  ok "probe timing uses now_ms() (ms-resolution), not whole-second date +%s"
+else
+  bad "probe timing no longer uses now_ms() — regressed to whole-second date +%s (ga-ouqtg/ga-br5sw class)"
+fi
+if grep -qF 'if latency_should_warn "$LATENCY_MS" "$LATENCY_WARN_MS"; then' "$SCRIPT"; then
+  ok "warn comparison uses latency_should_warn() in ms, not a raw integer-second comparison"
+else
+  bad "warn comparison no longer uses latency_should_warn() — check the comparison logic by hand"
+fi
+
+# ── bootstrap reality-check: the resolved latency.sh path must actually EXIST ─
+RESOLVED_LATENCY="${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/latency.sh"
+if [ -f "$RESOLVED_LATENCY" ]; then
+  ok "resolved latency.sh path exists on disk: $RESOLVED_LATENCY"
+else
+  bad "resolved latency.sh path does NOT exist: $RESOLVED_LATENCY — script would abort at the sourcing line under set -e"
+fi
+
+# ── real arithmetic, not hand-copied: source the ACTUAL latency.sh (pure, no ──
+# ── GC_CITY_PATH/live-Dolt dependency, safe to source directly) and drive it ──
+# ── with the real reported numbers instead of reimplementing the comparison. ──
+if [ -f "$RESOLVED_LATENCY" ] && [ -n "$NEW_LATENCY_THRESHOLD_S" ]; then
+  # shellcheck disable=SC1090
+  source "$RESOLVED_LATENCY"
+  NEW_THRESHOLD_MS=$((NEW_LATENCY_THRESHOLD_S * 1000))
+
+  # Falsifying check: the EXACT reported real latencies (84ms and 272ms, per
+  # ga-br5sw) must NOT trip the new ms-based threshold.
+  for REPORTED_MS in 84 272; do
+    if latency_should_warn "$REPORTED_MS" "$NEW_THRESHOLD_MS"; then
+      bad "reported real latency (${REPORTED_MS}ms) STILL trips the new threshold (${NEW_THRESHOLD_MS}ms) — bug not fixed"
+    else
+      ok "reported real latency (${REPORTED_MS}ms) does not trip the new threshold (${NEW_THRESHOLD_MS}ms)"
+    fi
+  done
+
+  # Sanity: the OLD symptom — a sub-second probe quantized to 1s under
+  # whole-second `date +%s` — DOES trip the OLD 1s(=1000ms) threshold. Confirms
+  # this reproduces the real bug, not a vacuous comparison.
+  if latency_should_warn 1000 1000; then
+    ok "sanity: a quantized 1s reading DOES trip the old 1s threshold — confirms this reproduces the real bug"
+  else
+    bad "sanity check failed: 1000ms does not trip a 1000ms threshold — the reproduction itself is wrong"
+  fi
+
+  # Alarm-not-deaf check (explicit ga-br5sw acceptance criterion): forcing the
+  # threshold to 0 must STILL fire on any positive latency — trading a
+  # false-positive for a false-negative would be worse, per the bug report.
+  if latency_should_warn 1 0; then
+    ok "GC_DOCTOR_LATENCY_WARN_S=0 still fires on a 1ms latency — alarm has not gone deaf"
+  else
+    bad "GC_DOCTOR_LATENCY_WARN_S=0 does NOT fire on a 1ms latency — false-positive traded for a worse false-negative"
+  fi
+
+  # now_ms() correctness (explicit ga-br5sw acceptance criterion): a real
+  # ~200ms probe must read back as ~200, not exactly 0 or exactly 1000 — the
+  # signature of whole-second quantization. Uses a real sleep against the
+  # ACTUAL now_ms(), not a hand-simulated value.
+  PROBE_BEFORE_MS=$(now_ms)
+  sleep 0.2
+  PROBE_AFTER_MS=$(now_ms)
+  MEASURED_MS=$((PROBE_AFTER_MS - PROBE_BEFORE_MS))
+  if [ "$MEASURED_MS" -eq 0 ] || [ "$MEASURED_MS" -eq 1000 ]; then
+    bad "a real ~200ms probe read back as exactly ${MEASURED_MS}ms — the ga-ouqtg whole-second quantization signature (reads only ever 0 or 1000) is back"
+  elif [ "$MEASURED_MS" -ge 100 ] && [ "$MEASURED_MS" -le 3000 ]; then
+    ok "a real ~200ms probe reads back as ${MEASURED_MS}ms (neither 0 nor 1000) — now_ms() has real ms resolution"
+  else
+    bad "a real ~200ms probe read back as ${MEASURED_MS}ms — outside the sane 100-3000ms band, something else is wrong"
+  fi
+else
+  bad "skipping latency.sh arithmetic checks — resolved path missing or LATENCY_WARN_S extraction failed (see checks above)"
 fi
 
 # ── real-bootstrap check (ga-v75ka): the "resolved runtime.sh path exists" ────

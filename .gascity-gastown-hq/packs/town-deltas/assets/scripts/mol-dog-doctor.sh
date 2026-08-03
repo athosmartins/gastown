@@ -32,11 +32,25 @@ set -euo pipefail
 # override it to dolt's own pack dir for this source, or the dog dies on boot.
 GC_PACK_DIR="${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt" \
     . "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/runtime.sh"
+# ga-br5sw: ms-resolution now_ms()/latency_should_warn() — see latency.sh's own
+# header for why whole-second `date +%s` quantizes a sub-second probe to 0s/1s.
+# Same live-sourcing rationale as runtime.sh above (not vendored, so both stay
+# in lockstep with the dolt pack's copy instead of drifting independently).
+. "${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt/assets/scripts/latency.sh"
 
 PORT="$GC_DOLT_PORT"
 HOST="${GC_DOLT_HOST:-127.0.0.1}"
 USER="${GC_DOLT_USER:-root}"
-LATENCY_WARN_S="${GC_DOCTOR_LATENCY_WARN_S:-1}"
+# ga-br5sw (2ª regressão desta classe — ga-ouqtg foi a 1ª, fechada 52 dias
+# antes): default 1s -> 5s. Com 1s + medição em segundo inteiro (ver
+# PROBE_START_MS/PROBE_END_MS abaixo), qualquer sondagem sub-segundo que
+# cruzasse o tick do relógio arredondava para 1s e disparava o WARN —
+# inundou a inbox do Mayor a cada 5min com "Dolt health advisory [MEDIUM]"
+# mesmo com o Dolt saudável (latência real medida: 84-272ms). 5s continua
+# pegando degradação real sem inundar. Medido em ms (não segundo inteiro)
+# via latency.sh logo abaixo — mol-dog-doctor.selftest.sh fixa as duas
+# garantias para que essa classe de regressão pare de voltar sem detector.
+LATENCY_WARN_S="${GC_DOCTOR_LATENCY_WARN_S:-5}"
 CONN_MAX="${GC_DOCTOR_CONN_MAX:-50}"
 CONN_WARN_PCT="${GC_DOCTOR_CONN_WARN_PCT:-80}"
 BACKUP_STALE_S="${GC_DOCTOR_BACKUP_STALE_S:-108000}"  # 30h: this city's backup runs once/day at 04:00 (dolt-s3-backup.sh), not every 6h — see override comment above (ga-3wdlv)
@@ -107,7 +121,7 @@ send_mayor_mail() {
 
 # --- Step 1: Probe connectivity and measure latency ---
 
-PROBE_START=$(date +%s)
+PROBE_START_MS=$(now_ms)
 if ! dolt_sql -q "SELECT active_branch()" >/dev/null 2>&1; then
     if send_mayor_mail \
         -s "ESCALATION: Dolt server unreachable on port $PORT [CRITICAL]" \
@@ -120,11 +134,12 @@ if ! dolt_sql -q "SELECT active_branch()" >/dev/null 2>&1; then
     fi
     exit 0
 fi
-PROBE_END=$(date +%s)
-LATENCY_S=$((PROBE_END - PROBE_START))
+PROBE_END_MS=$(now_ms)
+LATENCY_MS=$((PROBE_END_MS - PROBE_START_MS))
+LATENCY_WARN_MS=$((LATENCY_WARN_S * 1000))
 LATENCY_WARN=""
-if [ "$LATENCY_S" -ge "$LATENCY_WARN_S" ]; then
-    LATENCY_WARN=" [WARN: latency ${LATENCY_S}s >= threshold ${LATENCY_WARN_S}s]"
+if latency_should_warn "$LATENCY_MS" "$LATENCY_WARN_MS"; then
+    LATENCY_WARN=" [WARN: latency ${LATENCY_MS}ms >= threshold ${LATENCY_WARN_MS}ms]"
 fi
 
 # --- Step 2: Check resource conditions ---
@@ -197,7 +212,7 @@ WARNINGS="${LATENCY_WARN}${CONN_WARN}${ORPHAN_WARN}${BACKUP_STALE}"
 if [ -n "$WARNINGS" ]; then
     if ! send_mayor_mail \
         -s "Dolt health advisory [MEDIUM]" \
-        -m "Latency: ${LATENCY_S}s${LATENCY_WARN}
+        -m "Latency: ${LATENCY_MS}ms${LATENCY_WARN}
 Connections: ${CONN_COUNT}/${CONN_MAX}${CONN_WARN}
 Disk: ${DISK_USAGE}
 Orphan DBs: ${ORPHAN_COUNT}${ORPHAN_WARN}${BACKUP_STALE}"; then
@@ -205,6 +220,6 @@ Orphan DBs: ${ORPHAN_COUNT}${ORPHAN_WARN}${BACKUP_STALE}"; then
     fi
 fi
 
-SUMMARY="doctor — server: ok, latency: ${LATENCY_S}s, conns: ${CONN_COUNT}/${CONN_MAX}, disk: ${DISK_USAGE}, orphans: ${ORPHAN_COUNT}"
+SUMMARY="doctor — server: ok, latency: ${LATENCY_MS}ms, conns: ${CONN_COUNT}/${CONN_MAX}, disk: ${DISK_USAGE}, orphans: ${ORPHAN_COUNT}"
 gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
 echo "doctor: $SUMMARY"
