@@ -114,18 +114,29 @@ log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; echo "[$(ts)] [golw] $
 _store_name() { basename "$1"; }
 
 # _gate_artifact_probe <bead_id>
-# Prints "<active:0|1>\t<last_artifact_gate_status_or_none>\t<open_artifact_count>"
+# Prints "<active:0|1|error>\t<last_artifact_gate_status_or_none|unknown>\t<open_artifact_count>"
 # The active bit replicates pilot-dispatcher.sh's _beadid_has_active_gate_artifact
 # (ga-wisp signal (d), ~line 3212) EXACTLY — same active-state set, same query
 # shape (bd list -l "source-bead:<id>" against the HQ store; empirically
 # verified 2026-08-03 that this label-scoped query surfaces
 # type:quality-gate-marker/-run beads without needing --all/--include-gates).
 # The other two fields are reporting-only extras computed from the same read.
+# FAIL-OPEN: a non-zero exit from the bd|jq pipe (pipefail-visible via $?) prints
+# "error\tunknown\t0" instead of the confirmed-zero "0\tnone\t0" — a failed read
+# must never be indistinguishable from a genuinely-empty result (gate-feedback
+# 2026-08-03: the caller posts a durable comment asserting "0 = none ever
+# found", which is false when the true state is "the query failed").
 # Test seam: routes through $BD_BIN, stubbed in --selftest.
 _gate_artifact_probe() {
-  local _bid="$1" _arts _out
+  local _bid="$1" _arts _out _rc
   _arts=$("$BD_BIN" -C "$HQ" list -l "source-bead:$_bid" --json 2>/dev/null \
     | jq -c 'if type=="array" then . else [.] end' 2>/dev/null)
+  _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    log "WARN: gate-artifact probe failed for bead '$_bid' (bd/jq exit $_rc) — fail-open, not treating as confirmed-zero"
+    printf 'error\tunknown\t0\n'
+    return 1
+  fi
   if [ -z "${_arts:-}" ] || [ "$_arts" = "null" ]; then
     printf '0\tnone\t0\n'
     return 0
@@ -239,7 +250,8 @@ run_sweep() {
       lstatus="$(printf '%s' "$probe" | cut -f2)"
       lcount="$(printf '%s' "$probe" | cut -f3)"
       case "$active" in
-        1) continue ;;  # has an ACTIVE marker/run right now — not orphaned, skip
+        1) continue ;;      # has an ACTIVE marker/run right now — not orphaned, skip
+        error) continue ;;  # probe read failed (WARN already logged by _gate_artifact_probe) — fail-open, don't flag on unknown state
       esac
       local bepoch
       bepoch="$(printf '%s' "$bts" | jq -Rr 'fromdateiso8601? // empty' 2>/dev/null)"
@@ -410,11 +422,17 @@ case "$verb" in
     if [[ "$args" == *"-l source-bead:"* ]]; then
       id="$(printf '%s' "$args" | grep -oE 'source-bead:[A-Za-z0-9_.-]+' | head -1 | cut -d: -f2)"
       f="$GOLW_TEST_FIXTURES_DIR/artifacts-${id}.json"
-      [ -f "$f" ] && cat "$f" || echo "[]"
     else
       f="$GOLW_TEST_FIXTURES_DIR/candidates-${storename}.json"
-      [ -f "$f" ] && cat "$f" || echo "[]"
     fi
+    # __BD_FAIL__ sentinel fixture simulates a genuine bd command failure
+    # (non-zero exit, no valid stdout) — distinct from a missing fixture,
+    # which simulates a real, successful, empty result ("[]").
+    if [ -f "$f" ] && grep -qx '__BD_FAIL__' "$f" 2>/dev/null; then
+      echo "simulated bd failure: connection refused" >&2
+      exit 1
+    fi
+    [ -f "$f" ] && cat "$f" || echo "[]"
     ;;
   comment)
     bid="$1"
@@ -607,15 +625,35 @@ BDSTUB
   [ "$rc" -eq 0 ] && ok "scenario 9: disabled returns 0" || bad "scenario 9: disabled should return 0, got $rc"
   [ ! -s "$NOTIF9" ] && ok "scenario 9: no notify when disabled" || bad "scenario 9: notify fired despite disabled"
 
-  # ── Scenario 10: bd/jq read failure on one store → fail-open, other store still swept ──
-  echo "Scenario 10 (ga-p5q3): unreadable store → fail-open (skip it), does not crash or false-flag"
-  rm -f "$TMP/fixtures/candidates-hq.json"   # missing fixture → stub prints "[]" (simulates empty/failed read, not a crash)
+  # ── Scenario 10: bd/jq read failure on one store's candidate listing → fail-open (skip that store), other store still swept ──
+  echo "Scenario 10 (ga-p5q3): unreadable store (bd exits non-zero) → fail-open (skip it), does not crash or false-flag"
+  printf '%s\n' "__BD_FAIL__" > "$TMP/fixtures/candidates-hq.json"   # genuine bd failure (non-zero exit), not just an empty result
   printf '[%s]' "$(mk_candidate cand-i "$TMP/wa" "gate:fix-attempt:1" "$OLD_TS")" > "$TMP/fixtures/candidates-wa.json"
   echo '[]' > "$TMP/fixtures/artifacts-cand-i.json"
-  NOTIF10="$TMP/notif10"; : > "$NOTIF10"
+  NOTIF10="$TMP/notif10"; : > "$NOTIF10"; : > "$LOG"
   GOLW_TEST_NOTIFIED="$NOTIF10" GOLW_TEST_MAILED="$TMP/mail10" GOLW_TEST_COMMENTS_LOG="$TMP/comm10" run_sweep
   rc=$?
-  [ "$rc" -eq 1 ] && ok "scenario 10: other store's candidate still flagged despite one empty store" || bad "scenario 10: should still flag cand-i from the wa store, got $rc"
+  [ "$rc" -eq 1 ] && ok "scenario 10: other store's candidate still flagged despite one unreadable store" || bad "scenario 10: should still flag cand-i from the wa store, got $rc"
+  grep -q "WARN: could not read store" "$LOG" 2>/dev/null && ok "scenario 10: WARN logged for the unreadable store" || bad "scenario 10: no WARN logged for the unreadable hq store"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 10b (blocking issue 1, gate-feedback 2026-08-03): a bd/jq FAILURE
+  # on the per-bead ARTIFACT PROBE (not the store-level candidate listing) must
+  # NOT be treated as "confirmed zero artifacts" — regression test for the exact
+  # defect the reviewer found, which Scenario 10 (store-level only) never
+  # exercised. ──────────────────────────────────────────────────────────────────
+  echo "Scenario 10b (blocking issue 1): artifact-probe bd failure on a stale candidate → fail-open, NOT flagged as orphaned"
+  printf '[%s]' "$(mk_candidate cand-j "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  printf '%s\n' "__BD_FAIL__" > "$TMP/fixtures/artifacts-cand-j.json"   # the artifact-probe bd call itself fails
+  NOTIF10B="$TMP/notif10b"; MAIL10B="$TMP/mail10b"; COMM10B="$TMP/comm10b"
+  : > "$NOTIF10B"; : > "$MAIL10B"; : > "$COMM10B"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF10B" GOLW_TEST_MAILED="$MAIL10B" GOLW_TEST_COMMENTS_LOG="$COMM10B" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 10b: probe failure → candidate not flagged (return 0)" || bad "scenario 10b (blocking issue 1 regression): a bd/jq failure on the artifact probe must fail-open, not flag as orphaned — got $rc"
+  [ ! -s "$COMM10B" ] && ok "scenario 10b: no comment posted despite probe failure" || bad "scenario 10b: comment posted on a bead whose artifact probe failed to read (false 'confirmed zero' claim)"
+  [ ! -s "$NOTIF10B" ] && ok "scenario 10b: no notify despite probe failure" || bad "scenario 10b: notify fired despite probe failure"
+  grep -q "WARN.*cand-j" "$LOG" 2>/dev/null && ok "scenario 10b: WARN logged naming the failed candidate" || bad "scenario 10b: no WARN logged for the failed artifact probe"
   rm -f "$STATE_FILE" 2>/dev/null
 
   # ── Scenario 11: bash -n syntax check ──────────────────────────────────────
