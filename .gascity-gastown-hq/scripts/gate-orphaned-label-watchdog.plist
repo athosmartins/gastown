@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gascity.gate-orphaned-label-watchdog</string>
+
+  <!-- Detection-only sweep (ga-l8yh6, follow-up AC4 of ga-d3eg2): finds beads
+       carrying a gate:* lifecycle label with zero ACTIVE quality-gate-marker/
+       -run behind them for >= GOLW_STALE_MINUTES (default 180min). Reports via
+       bd comment (per bead) + notify (low priority) + gc mail send mayor —
+       NEVER mutates a bead. See the script's own header comment for the full
+       rationale and the R4/R5 precedent this is intentionally scoped away from. -->
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/gate-orphaned-label-watchdog.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-orphaned-label-watchdog-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-orphaned-label-watchdog-launchd.err</string>
+
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key><string>/Users/athos</string>
+    <key>BD_ACTOR</key><string>automation</string>
+    <!-- Staleness threshold (minutes) before a gate:*-labeled, marker-less bead
+         is flagged. Default: 180 (3h) — generous vs. normal gate-review latency. -->
+    <!-- <key>GOLW_STALE_MINUTES</key><string>180</string> -->
+    <!-- Per-bead re-alert cooldown (seconds). Default: 21600 (6h). -->
+    <!-- <key>GOLW_ALERT_COOLDOWN_S</key><string>21600</string> -->
+    <!-- Kill-switch: GOLW_ENABLED=0 disables the watchdog entirely. -->
+    <!-- <key>GOLW_ENABLED</key><string>1</string> -->
+    <!-- Dry-run: GOLW_DRY_RUN=1 logs findings but sends no comment/notify/mail. -->
+    <!-- <key>GOLW_DRY_RUN</key><string>0</string> -->
+  </dict>
+</dict></plist>
