@@ -67,6 +67,23 @@ from gate_queue_backlog import (
 CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
 PILOT_LOG = os.path.join(CITY, ".gc/logs/pilot-dispatcher.log")
 GATE_DISPATCHER_LOG = os.path.join(CITY, ".gc/logs/quality-gate-dispatcher.log")
+# PILOT_DISPATCHABLE_FILE (ga-tky97): the Pilot's own fully-filtered, dispatch-
+# ordered candidate queue, emitted fresh every sweep (ttl_seconds=600) by
+# _pilot_emit_dispatchable() in pilot-dispatcher.sh. Same env var name as that
+# script so both can be overridden together; same default path.
+PILOT_DISPATCHABLE_FILE = os.environ.get(
+    "PILOT_DISPATCHABLE_FILE",
+    os.path.join(os.environ.get("HOME", os.path.expanduser("~")), ".gc/pilot-dispatchable.json"))
+# QPOS_ABSENT/QPOS_UNREADABLE (ga-tky97 GATE-FEEDBACK fix): a bead's queue
+# position can fail to resolve to an int for two causally different reasons —
+# the dispatch queue snapshot itself was unreadable this cycle (unmeasured),
+# or the snapshot was read fine and the bead simply wasn't in it (measured,
+# confirmed absent). Both used to collapse to bare `None`, so a later delta
+# comparison could assert "unchanged" across a cycle where one side was never
+# actually measured. These sentinels (JSON-serializable strings, distinct from
+# any int position) keep the two apart through state persistence and re-read.
+QPOS_ABSENT = "absent"
+QPOS_UNREADABLE = "unreadable"
 NOTIFY_BIN = os.environ.get("NOTIFY_BIN", "/Users/athos/.local/bin/notify")
 GC_BIN = os.environ.get("GC_BIN", "gc")
 BD_BIN = os.environ.get("BD_BIN", "bd")
@@ -176,6 +193,8 @@ _bd_has_built_branch = None  # (bead_id) -> bool; True iff a crew/*/<id> or fix/
 _bd_branch_stranded = None  # (bead_id) -> (repo, ref, age_days)|None; ga-32u6s orphan-branch probe
 # _bd_gate_queue_markers/_read_gate_log_lines moved to gate_queue_backlog.py (ga-ahn3v) —
 # selftest scenarios below stub them as gate_queue_backlog.<name>, not a local global.
+_read_pilot_dispatchable_file = None  # () -> dict|None; parsed+freshness-checked
+                                        # pilot-dispatchable.json (ga-tky97 test seam)
 
 
 # ── guarded subprocess ────────────────────────────────────────────────────────
@@ -819,7 +838,8 @@ def _alarm_record(state, bead_id):
         return 0.0, 0, None
 
 
-def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_throughput=None):
+def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_throughput=None,
+                     dispatchable=None):
     """Fire a starve alarm for a buildable bead that has not been dispatched.
 
     This is case 3 of the core guarantee: the bead matched NONE of this
@@ -838,6 +858,13 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
     decided the backlog does NOT explain the wait (or couldn't be measured), so
     every alarm that actually fires still needs the context spelled out for the
     operator (AC1).
+
+    dispatchable (ga-tky97): the once-per-cycle Pilot dispatch-queue snapshot
+    from run_cycle() (None if unmeasurable) — by the time this is called,
+    _process_store() has already consulted _pilot_queue_suppress_reason() and
+    decided the bead's queue position does NOT explain the wait, so this only
+    renders context via _pilot_queue_body_line() (AC1-AC3) plus a delta against
+    the PREVIOUS alarm's recorded position, if any (AC4).
     """
     bead_id = bead.get("id") or bead.get("issue_id") or ""
     if not bead_id:
@@ -845,6 +872,15 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
 
     labels_fp = ",".join(sorted(_get_labels(bead)))
     last_alarmed, count, prev_fp = _alarm_record(state, bead_id)
+    prev_alarm_raw = state.get("alarmed", {}).get(bead_id)
+    prev_qpos_known = isinstance(prev_alarm_raw, dict) and "qpos" in prev_alarm_raw
+    prev_qpos = prev_alarm_raw.get("qpos") if prev_qpos_known else None
+    if prev_qpos_known and prev_qpos is None:
+        # Legacy record from before this fix: bare None was written for BOTH
+        # ABSENT and UNREADABLE, so which one it was is unrecoverable. Treat
+        # it as the conservative side — UNREADABLE — so the delta below never
+        # asserts a continuity claim it can't actually back up.
+        prev_qpos = QPOS_UNREADABLE
     state_changed = prev_fp is not None and prev_fp != labels_fp
     if state_changed:
         count = 0   # new incident — restart escalation
@@ -887,11 +923,57 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
     # checked, and hedge honestly that the list can itself go stale again.
     gate_line = _gate_queue_body_line(gate_depth, gate_throughput, age_min)
 
+    # ga-tky97 AC4: a repeat alarm should say what changed since the last one
+    # (position improved/worsened/unchanged), not just repeat the same claim —
+    # only meaningful when a PRIOR alarm actually recorded a qpos (a bead's
+    # first-ever alarm, or one alarmed before this feature shipped, has none).
+    #
+    # cur_qpos is one of: an int (0-based queue position, measured), QPOS_ABSENT
+    # (queue read fine, bead confirmed not in it), or QPOS_UNREADABLE (the
+    # snapshot itself couldn't be read this cycle — unmeasured). GATE-FEEDBACK
+    # (attempt 1): collapsing ABSENT and UNREADABLE into bare None let the delta
+    # below assert "unchanged" across a comparison where one side was never
+    # measured — e.g. the mail body saying both "COULD NOT READ ... UNCERTAIN"
+    # and "Since last alarm: unchanged" in the same message. The discriminated
+    # values below make an unmeasured operand impossible to compare silently.
+    if dispatchable is None:
+        cur_qpos = QPOS_UNREADABLE
+    else:
+        cur_qpos_pos = _pilot_queue_position(bead_id, dispatchable)
+        cur_qpos = cur_qpos_pos[0] if cur_qpos_pos is not None else QPOS_ABSENT
+    queue_line = _pilot_queue_body_line(bead_id, dispatchable)
+    if alarm_ordinal > 1 and prev_qpos_known:
+        def _qpos_desc(q):
+            if q == QPOS_UNREADABLE:
+                return "queue unreadable"
+            if q == QPOS_ABSENT:
+                return "not found in queue"
+            return "front of queue (position 1)" if q == 0 else "position %d" % (q + 1)
+        if cur_qpos == QPOS_UNREADABLE or prev_qpos == QPOS_UNREADABLE:
+            # At least one side was never measured — "unchanged"/"changed" would
+            # be a continuity claim neither side can support. Say so explicitly
+            # instead (this is the exact contradiction the gate reviewer
+            # reproduced: "COULD NOT READ ... UNCERTAIN" next to "unchanged").
+            if prev_qpos == QPOS_UNREADABLE and cur_qpos == QPOS_UNREADABLE:
+                where = "in the previous cycle and this cycle"
+            elif prev_qpos == QPOS_UNREADABLE:
+                where = "in the previous cycle"
+            else:
+                where = "in this cycle"
+            queue_line += (" Since last alarm: not comparable — the Pilot "
+                            "dispatch queue could not be read %s." % where)
+        elif prev_qpos == cur_qpos:
+            queue_line += " Since last alarm: unchanged (%s)." % _qpos_desc(cur_qpos)
+        else:
+            queue_line += " Since last alarm: changed from %s to %s." % (
+                _qpos_desc(prev_qpos), _qpos_desc(cur_qpos))
+
     body = (
         "APPROVED-STATE-RECONCILER: buildable bead starving — dispatch path failing\n\n"
         "Bead: %s — %s\n"
         "Status: story:approved, age: %dmin, not dispatched, pilot alive, "
         "alarm #%d for this incident\n"
+        "%s\n"
         "%s\n\n"
         "This bead matched NONE of this reconciler's known non-buildable signals\n"
         "(blocked-on:*, waiting-on:*, depends-on:*, next-action:*, pool:refused:*,\n"
@@ -907,7 +989,8 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
         "   este reconciler ainda não reconhece — ver _process_store()/\n"
         "   _extra_alarm_suppress_reason() em scripts/approved-state-reconciler.py antes\n"
         "   de re-despachar manualmente ou adicionar story:approved de volta.\n"
-    ) % (bead_id, title, int(age_min), alarm_ordinal, gate_line, STARVE_MIN, rig_root, bead_id)
+    ) % (bead_id, title, int(age_min), alarm_ordinal, gate_line, queue_line, STARVE_MIN, rig_root,
+         bead_id)
 
     notify_msg = ("STARVE ALARM%s: bead %s story:approved há %dmin, pilot alive, "
                   "não despachado — dispatch path failing" % (
@@ -938,7 +1021,7 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
 
     _write_flow_authority(now, "approved-starve:%s" % bead_id)
     state.setdefault("alarmed", {})[bead_id] = {
-        "last": now, "count": alarm_ordinal, "fp": labels_fp,
+        "last": now, "count": alarm_ordinal, "fp": labels_fp, "qpos": cur_qpos,
     }
 
 
@@ -1152,6 +1235,149 @@ def _gate_marker_source_beads():
 # _gate_queue_body_line extracted to gate_queue_backlog.py (ga-ahn3v) — the same
 # mechanism also confirmed and adopted by throughput-stall-watchdog.py (ga-u2u8z).
 # Imported above; call sites below are unchanged.
+
+
+# ── pilot dispatch-queue position (ga-tky97) ──────────────────────────────────
+def _read_pilot_dispatchable(now):
+    """Return the parsed pilot-dispatchable.json contract dict, or None if the
+    file is missing, unreadable, malformed, or past its own ttl_seconds.
+
+    Contract (packs/town-deltas/assets/pilot-dispatcher.sh, _pilot_emit_dispatchable):
+      {"generated_at": "<ISO8601 UTC>", "ttl_seconds": <int>, "count": <int>,
+       "items": [ {"id","title","type","rig","priority","created_at","assignee",
+                   "store"}, … ]}
+    `items` is pre-sorted in the SAME dispatch order (priority, created_at, id)
+    the Pilot's real sweep uses, across every store — this reads that queue, it
+    does not re-derive or guess at ordering.
+
+    A stale/missing/malformed file means "cannot confirm queue position", NEVER
+    "queue is empty" (root-class:error-vs-empty, same convention as every other
+    None-on-error helper in this file) — callers must treat None as unmeasured,
+    never as "bead not queued".
+    """
+    if _read_pilot_dispatchable_file is not None:
+        return _read_pilot_dispatchable_file()   # test seam
+    try:
+        with open(PILOT_DISPATCHABLE_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        return None
+    gen = data.get("generated_at") or ""
+    ttl = data.get("ttl_seconds")
+    if not gen or not isinstance(ttl, (int, float)):
+        return None
+    try:
+        gen_epoch = datetime.datetime.strptime(
+            gen[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except Exception:
+        return None
+    if (now - gen_epoch) > ttl:
+        return None
+    return data
+
+
+def _pilot_queue_position(bead_id, dispatchable):
+    """Return (index, total, ahead_by_priority) for bead_id within an already-
+    read `dispatchable` dict (see _read_pilot_dispatchable), or None if
+    `dispatchable` is None or bead_id isn't present in its items.
+
+    `index` is the bead's 0-based position in the Pilot's own dispatch-ordered
+    queue (0 = next to be dispatched); `ahead_by_priority` is a {priority: count}
+    breakdown of the `index` items strictly ahead of it, used to render "atrás
+    de N itens de prioridade maior (P0=a, P1=b)" in the suppression log line.
+    """
+    if dispatchable is None:
+        return None
+    items = dispatchable.get("items") or []
+    for i, item in enumerate(items):
+        if item.get("id") == bead_id:
+            ahead = {}
+            for prior in items[:i]:
+                p = prior.get("priority")
+                ahead[p] = ahead.get(p, 0) + 1
+            return i, len(items), ahead
+    return None
+
+
+def _pilot_queue_suppress_reason(bead_id, dispatchable):
+    """Suppress reason if the Pilot's OWN dispatch-ordered queue snapshot shows
+    `bead_id` legitimately queued behind other work, else None (ga-tky97).
+
+    ROOT CAUSE (mail ga-wisp-6ab3m74, alarm #3 for ga-m3n1x, 2026-08-02):
+    _alarm_starving had no signal for WHERE in the Pilot's actual dispatch
+    order a starving bead sits. ga-m3n1x — a correctly-P2 feature queued behind
+    a P0 task and two P1 bugs in a saturated 5-slot "small" lane — alarmed 3x as
+    "dispatch path failing" while dispatch was working exactly as designed
+    (bugs/tech-debt before features). The queue-position data already exists —
+    the Pilot emits its fully-filtered, dispatch-ordered candidate queue every
+    sweep (pilot-dispatchable.json, ttl=600s) — this reads it rather than
+    re-deriving or guessing at order.
+
+    Returns None (do NOT suppress — fall through to the alarm) when:
+      - dispatchable is None (file missing/stale/unreadable — an unmeasured
+        queue must never license a suppression, root-class:error-vs-empty;
+        _pilot_queue_body_line() still marks the resulting alarm UNCERTAIN)
+      - bead_id is not present in the queue (AC2: a bead genuinely invisible to
+        the Pilot's own dispatch queue must keep alarming — this fix must not
+        turn a false positive into a false negative)
+      - bead_id IS present but at index 0 (nothing ahead of it) — an unexplained
+        wait at the front of the queue is still a real dispatch-failure
+        candidate; this signal has nothing to explain it with
+
+    A reason string (suppress) only when the bead is found with >=1 item ahead
+    of it in the Pilot's own dispatch order — a positively-measured explanation,
+    never a default.
+    """
+    pos = _pilot_queue_position(bead_id, dispatchable)
+    if pos is None:
+        return None
+    index, total, ahead = pos
+    if index == 0:
+        return None
+    ahead_desc = ", ".join(
+        "P%s=%d" % (p, n)
+        for p, n in sorted(ahead.items(), key=lambda kv: (kv[0] is None, kv[0])))
+    return ("enfileirado atrás de %d item(ns) no dispatch queue do Pilot "
+             "(%s) — posição %d/%d, despacho saudável"
+             % (index, ahead_desc, index + 1, total))
+
+
+def _pilot_queue_body_line(bead_id, dispatchable):
+    """Format the Pilot dispatch-queue context line for _alarm_starving's mail
+    body (ga-tky97 AC1-AC3) — NEVER silent, NEVER fabricates a position for a
+    queue that could not be read (mirrors _gate_queue_body_line's convention).
+
+    Only reached for a bead _pilot_queue_suppress_reason() did NOT suppress, so
+    in practice this only ever describes 'unreadable', 'not found', or 'first'
+    — the index>0 branch below is kept for defensive completeness only.
+    """
+    if dispatchable is None:
+        return ("Pilot dispatch queue (pilot-dispatchable.json): COULD NOT READ "
+                 "(missing/stale/unreadable) — position-based suppression NOT "
+                 "applied; alarm kept but UNCERTAIN: cannot confirm this is a "
+                 "genuine dispatch failure vs. an unread queue position.")
+    pos = _pilot_queue_position(bead_id, dispatchable)
+    total = len(dispatchable.get("items") or [])
+    if pos is None:
+        return ("Pilot dispatch queue (pilot-dispatchable.json): bead NOT found "
+                 "among %d dispatchable item(s) — position-based suppression NOT "
+                 "applied; this may indicate a real filter/query bug." % total)
+    index, total, ahead = pos
+    if index == 0:
+        return ("Pilot dispatch queue (pilot-dispatchable.json): bead is FIRST "
+                 "(position 1/%d, nothing ahead of it) — position-based "
+                 "suppression NOT applied; an unexplained wait at the front of "
+                 "the queue is a real dispatch-failure candidate." % total)
+    ahead_desc = ", ".join(
+        "P%s=%d" % (p, n)
+        for p, n in sorted(ahead.items(), key=lambda kv: (kv[0] is None, kv[0])))
+    return ("Pilot dispatch queue (pilot-dispatchable.json): bead at position "
+             "%d/%d, %d item(s) ahead (%s) — this should already have been "
+             "suppressed; treat as a _pilot_queue_suppress_reason() bug if seen "
+             "live." % (index + 1, total, index, ahead_desc))
 
 
 def _blocked_bead_ids(rig_root):
@@ -1374,7 +1600,7 @@ def _branch_stranded_reason(bead_id):
 
 # ── process one store ─────────────────────────────────────────────────────────
 def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
-                    gate_depth=None, gate_throughput=None):
+                    gate_depth=None, gate_throughput=None, dispatchable=None):
     """Scan story:approved open beads in rig_root; classify and act on each one.
 
     built_ids: set of bead ids with a live BUILT marker (from _gate_marker_source_beads(),
@@ -1391,6 +1617,13 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
     run_cycle() (HQ-global, same reasoning as built_ids) — None if unmeasurable.
     Consulted by _gate_queue_suppress_reason() immediately before the starve
     alarm fires, and rendered into that alarm's body regardless.
+
+    dispatchable (ga-tky97): the Pilot's own fully-filtered, dispatch-ordered
+    candidate queue from _read_pilot_dispatchable(), computed ONCE per cycle in
+    run_cycle() (HQ-independent — the Pilot emits one cross-store file), or
+    None if missing/stale/unreadable. Consulted by _pilot_queue_suppress_reason()
+    immediately before the starve alarm fires, and rendered into that alarm's
+    body regardless (same pattern as gate_depth/gate_throughput above).
 
     Returns (processed, routed, alarmed) int counts.
     On query error: logs + returns (0, 0, 0) — fail-open; other stores are unaffected.
@@ -1726,6 +1959,24 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
             alarmed += 1
             continue
 
+        # PILOT DISPATCH-QUEUE POSITION (ga-tky97): the Pilot's own fully-
+        # filtered, dispatch-ordered candidate queue (pilot-dispatchable.json)
+        # is a more direct, per-bead signal than any label or backlog estimate
+        # — if it shows this bead legitimately queued behind other work, the
+        # wait is healthy dispatch pacing, not a broken dispatch path (3x false
+        # alarm on ga-m3n1x: a correctly-P2 feature behind a P0 and two P1s in
+        # a saturated lane — mail ga-wisp-6ab3m74). See
+        # _pilot_queue_suppress_reason()'s docstring for the false-positive
+        # history and the AC2 false-negative guard (a bead absent from the
+        # Pilot's own queue must still alarm). Checked before the gate-queue
+        # backlog check below — both are "last, measurement-based"
+        # suppressions; this one is the more precise, per-bead signal.
+        pilot_queue_suppress_reason = _pilot_queue_suppress_reason(bead_id, dispatchable)
+        if pilot_queue_suppress_reason is not None:
+            _log("  %s: no signal, daemon-age=%.0fmin, %s — no alarm" % (
+                 bead_id, starve_age_min, pilot_queue_suppress_reason))
+            continue
+
         # GATE QUEUE BACKLOG (ga-dbfm9): the gate-review queue is a separate resource
         # from the builder pool _pool_has_capacity already checked above; a deep
         # backlog there paces down how fast the Pilot effectively gets to new
@@ -1742,7 +1993,8 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
             continue
 
         # ALARM: buildable bead starving, pilot alive, pool has capacity, dispatch failing.
-        _alarm_starving(rig_root, bead, starve_age_min, now, state, gate_depth, gate_throughput)
+        _alarm_starving(rig_root, bead, starve_age_min, now, state, gate_depth, gate_throughput,
+                         dispatchable)
         alarmed += 1
 
     return processed, routed, alarmed
@@ -1783,6 +2035,17 @@ def run_cycle(now, state):
              "reach back %dmin) — starve-alarm queue-backlog suppression degrades "
              "to 'unmeasured' this cycle (see ga-dbfm9)" % GATE_QUEUE_WINDOW_MIN)
 
+    # Pilot dispatch-queue snapshot (ga-tky97): also HQ-independent (the Pilot
+    # emits ONE cross-store file) — read once per cycle, not once per bead.
+    # None = missing/stale/unreadable; _pilot_queue_suppress_reason() treats
+    # that as "cannot confirm queue position" (fail toward alarming, AC3),
+    # never as "bead not queued".
+    dispatchable = _read_pilot_dispatchable(now)
+    if dispatchable is None:
+        _log("  pilot-dispatchable.json missing/stale/unreadable — starve-alarm "
+             "queue-position suppression degrades to 'unmeasured' this cycle "
+             "(see ga-tky97)")
+
     total_p = total_r = total_a = 0
 
     for rig_root in RIG_ROOTS:
@@ -1803,7 +2066,8 @@ def run_cycle(now, state):
                  "check; see ga-yavyq)" % rig_root)
         try:
             p, r, a = _process_store(rig_root, now, state, pilot_alive, built_ids,
-                                      blocked_ids, gate_depth, gate_throughput)
+                                      blocked_ids, gate_depth, gate_throughput,
+                                      dispatchable)
             total_p += p
             total_r += r
             total_a += a
@@ -1973,6 +2237,43 @@ def _selftest():
                 desligue a checagem... fila VAZIA continua alarmando")
       (ga-dbfm9-e) throughput=0 measured (e.g. stalled gate) with depth>0 →
                 STILL alarms, no division-by-zero crash
+      (ga-tky97-a) AC1: bead found in the Pilot's own dispatch queue with 3
+                higher-precedence items ahead of it → starve alarm SUPPRESSED
+                — the ga-m3n1x 3x false-positive shape (P2 feature correctly
+                behind a P0 task + two P1 bugs in a saturated lane)
+      (ga-tky97-b) AC2 falsification: bead NOT present in a FRESH dispatch
+                queue → STILL alarms — a bead genuinely invisible to the
+                Pilot's own queue must keep alarming; this fix must not turn
+                a false positive into a false negative
+      (ga-tky97-c) falsification: bead is FIRST in the queue (index 0,
+                nothing ahead of it) → STILL alarms — this signal has
+                nothing to explain an unexplained front-of-queue wait with
+      (ga-tky97-d) AC3: pilot-dispatchable.json missing/stale/unreadable →
+                STILL alarms, body says "COULD NOT READ" / UNCERTAIN — never
+                silently trusts an unmeasured queue (root-class:error-vs-empty)
+      (ga-tky97-e) AC4: a second, still-unsuppressed repeat alarm reports the
+                queue-position delta since the previous alarm ("changed from
+                not found in queue to front of queue"), not just a bare
+                repeat count
+      (ga-tky97-f) hermetic-selftest-blind-to-bootstrap guard: with the test
+                seam OFF, the REAL _read_pilot_dispatchable() (actual file
+                I/O + UTC-epoch math, never exercised by a-e above) parses a
+                genuinely fresh file, rejects a stale one (past ttl_seconds),
+                and returns None for a missing file
+      (ga-tky97-g..i) GATE-FEEDBACK fix (attempt 1 FAIL): qpos=None used to
+                mean both ABSENT (queue read fine, bead not in it) and
+                UNREADABLE (snapshot itself failed this cycle) — a delta
+                comparing two such Nones could assert "unchanged" across an
+                unmeasured cycle. g/h/i cover the three UNREADABLE-involved
+                transitions (prev-unreadable→cur-absent, prev-absent→
+                cur-unreadable — the exact reviewer repro — and both-
+                unreadable): none may claim unchanged/changed, and h/i assert
+                the literal symptom never recurs (same body never pairs
+                "COULD NOT READ" with a continuity claim)
+      (ga-tky97-j) GATE-FEEDBACK fix overcorrection guard: prev=ABSENT and
+                cur=ABSENT are BOTH measured (queue read fine both times, bead
+                genuinely not in it) — delta must still say "unchanged"; the
+                fix must not blanket every non-int qpos as incomparable
       (ga-32u6s-e) gate-fix-1 regression guard: _real_branch_stranded_reason's
                 merge-base ancestry check must fail OPEN (None) when
                 `git merge-base --is-ancestor` is unresolvable — both
@@ -1987,6 +2288,7 @@ def _selftest():
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
     global _bd_blocked, _bd_show_full, _bd_has_built_branch, _bd_branch_stranded
+    global _read_pilot_dispatchable_file
     global DRY_RUN, STARVE_MIN, FLOW_GRACE_MIN, ROUTE_COOLDOWN_SEC, ALARM_COOLDOWN_SEC
     global _OWNERSHIP_REPOS
 
@@ -2042,28 +2344,32 @@ def _selftest():
         docstring, instead of ballooning in wall-clock as scenario count grows.
 
         Returns a generic "successful, empty" response (rc=0, stdout="[]") rather
-        than a failure — the three real call sites this can reach when their own
-        seam is unstubbed (_pool_has_capacity's `gc session list`,
-        _gate_marker_source_beads' `bd ... type:quality-gate-marker` fallback,
-        and _gate_queue_depth's `bd ... gate-status:queued` fallback) need
-        DIFFERENT-looking failure handling: an rc!=0 here would make the marker
-        query return None (query error) instead of an empty set, which flips
-        built_ids-is-None → "unknown, fail-safe, no alarm" for every scenario
-        that doesn't explicitly stub _bd_gate_markers — silently suppressing the
-        very alarms scenarios (g)/(o)/(dd)/etc. exist to check for. "[]"
-        satisfies all three: the marker/queue-depth queries parse it as zero
-        rows (correct, harmless — for gate-queue depth specifically, depth=0
-        is also the deliberate neutral default: _gate_queue_suppress_reason()
-        never suppresses on a confirmed-empty queue, so scenarios that don't
-        care about the gate-queue feature are unaffected); gc-session-list's
-        dict .get() raises on a bare list, caught by that call site's own
-        try/except → "capacity unknown, alarm conservatively" — the same
-        fail-open outcome, just via the exception path instead of the
-        empty-stdout path. Every OTHER real _sh call site (label add/remove/
-        comment, notify, mail send, the main story:approved query) is only
-        reached when its own dedicated seam (_bd_label_add etc.) is None, and
-        every scenario in this suite always stubs those directly — this
-        generic fallback never reaches them.
+        than a failure — the two real call sites this can reach when their own
+        seam is unstubbed (_pool_has_capacity's `gc session list` and
+        _gate_marker_source_beads' `bd ... type:quality-gate-marker` fallback)
+        need DIFFERENT-looking failure handling: an rc!=0 here would make the
+        marker query return None (query error) instead of an empty set, which
+        flips built_ids-is-None → "unknown, fail-safe, no alarm" for every
+        scenario that doesn't explicitly stub _bd_gate_markers — silently
+        suppressing the very alarms scenarios (g)/(o)/(dd)/etc. exist to check
+        for. "[]" satisfies both: the marker query parses it as zero rows
+        (correct, harmless); gc-session-list's dict .get() raises on a bare
+        list, caught by that call site's own try/except → "capacity unknown,
+        alarm conservatively" — the same fail-open outcome, just via the
+        exception path instead of the empty-stdout path. Every OTHER real _sh
+        call site (label add/remove/comment, notify, mail send, the main
+        story:approved query) is only reached when its own dedicated seam
+        (_bd_label_add etc.) is None, and every scenario in this suite always
+        stubs those directly — this generic fallback never reaches them.
+
+        ga-ahn3v: `_gate_queue_depth`'s `bd ... gate-status:queued` fallback
+        used to be a third call site this stub covered, back when
+        _gate_queue_depth lived inside this file and its bare `_sh(...)` call
+        resolved to this same global. The ga-ahn3v extraction moved it (plus
+        the other 3 gate-queue-backlog functions) into gate_queue_backlog.py,
+        which keeps its own separate `_sh` — rebinding THIS `_sh` no longer
+        reaches it. See the `gate_queue_backlog._bd_gate_queue_markers`
+        blanket default set right after this stub is installed below.
 
         ga-lzxhi: `git for-each-ref` (_real_has_built_branch, reached whenever a
         scenario doesn't stub _bd_has_built_branch) is NOT a JSON caller — it
@@ -2090,18 +2396,42 @@ def _selftest():
     _do_mail_mayor = _stub_mail
     _do_notify = _stub_notify
     _sh = _stub_sh_fast
-    # Hermetic default for the gate-queue throughput log read (ga-dbfm9): unlike
-    # the bd-query seams above, _gate_queue_throughput() does its own file I/O
-    # via _tail() when _read_gate_log_lines is unstubbed — it never routes
-    # through _sh/_stub_sh_fast, so without this it would read the REAL
-    # quality-gate-dispatcher.log on disk during every scenario below, violating
-    # this suite's own "stubs all I/O" docstring. Empty tail → unmeasurable
-    # (None) → _gate_queue_suppress_reason() never suppresses (paired with the
-    # gate_depth=0 default above) — the same neutral, alarm-preserving default
-    # any scenario not explicitly testing the gate-queue feature relies on.
-    # Scenarios below that DO test it override this directly, same convention
-    # as _read_pilot_log_lines.
+    # Hermetic defaults for the gate-queue-backlog module (ga-dbfm9/ga-ahn3v):
+    # gate_queue_backlog.py keeps its own separate _sh (deliberately not shared
+    # with callers — see that module's docstring), so rebinding _sh above does
+    # NOT cover it — neither _gate_queue_depth() nor _gate_queue_throughput()
+    # route through this file's _sh/_stub_sh_fast. Both need their OWN blanket
+    # default here, or every scenario below that doesn't explicitly test the
+    # gate-queue feature would shell out for real / read the REAL
+    # quality-gate-dispatcher.log on disk, violating this suite's own "stubs
+    # all I/O" docstring — and could non-deterministically suppress an
+    # unrelated alarm depending on the live gate queue's actual depth/
+    # throughput at the moment the suite happens to run (GATE-FEEDBACK,
+    # ga-ahn3v attempt 1: this was caught as a hermetic-selftest regression
+    # introduced by extracting these functions out of this file).
+    #   depth: confirmed-empty (`[]`) is the same neutral default _stub_sh_fast
+    #   used to produce for this call before the extraction — a query/parse
+    #   error would be `None` instead, but that's what the (dd)-lettered
+    #   scenario explicitly stubs when it wants to test that path.
+    #   _gate_queue_suppress_reason() never suppresses on a confirmed-empty
+    #   queue, so scenarios that don't care about the gate-queue feature are
+    #   unaffected.
+    #   throughput: empty tail → unmeasurable (None) → same never-suppress
+    #   outcome.
+    # Scenarios below that DO test the feature override these directly, same
+    # convention as _read_pilot_log_lines.
+    gate_queue_backlog._bd_gate_queue_markers = lambda: []
     gate_queue_backlog._read_gate_log_lines = lambda: []
+    # Hermetic default for the Pilot dispatch-queue read (ga-tky97): unlike the
+    # bd-query seams above, _read_pilot_dispatchable() does its own file I/O
+    # (json.load) when _read_pilot_dispatchable_file is unstubbed — it never
+    # routes through _sh/_stub_sh_fast, so without this it would read the REAL
+    # pilot-dispatchable.json on disk during every scenario below. None
+    # (missing/unreadable) → _pilot_queue_suppress_reason() never suppresses —
+    # the same neutral, alarm-preserving default any scenario not explicitly
+    # testing the queue-position feature relies on. Scenarios below that DO
+    # test it override this directly, same convention as _read_gate_log_lines.
+    _read_pilot_dispatchable_file = lambda: None
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _make_bead(bid, labels=None, title="Test story", assignee="",
@@ -3384,9 +3714,302 @@ def _selftest():
         _bad("(ga-dbfm9-e)", "mail_calls=%s body=%r" % (mail_calls, body_e))
 
     # Restore the neutral hermetic defaults so later scenarios (which don't
-    # exercise the gate-queue feature) are unaffected by the last fixture above.
-    gate_queue_backlog._bd_gate_queue_markers = None
+    # exercise the gate-queue feature) are unaffected by the last fixture
+    # above. `None` would silently un-stub the seam and fall through to
+    # gate_queue_backlog's own real _sh (GATE-FEEDBACK, ga-ahn3v attempt 1) —
+    # restore to the same `lambda: []` neutral default set at selftest setup,
+    # not to `None`.
+    gate_queue_backlog._bd_gate_queue_markers = lambda: []
     gate_queue_backlog._read_gate_log_lines = lambda: []
+
+    # ── pilot dispatch-queue position suppression (ga-tky97) ─────────────────
+    print("\nScenario (ga-tky97-a): bead queued behind 3 higher-precedence "
+          "items in the Pilot's own dispatch queue → starve alarm SUPPRESSED "
+          "(the ga-m3n1x 3x false-positive shape, AC1)")
+    _read_pilot_dispatchable_file = lambda: {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
+        "ttl_seconds": 600,
+        "count": 4,
+        "items": [
+            {"id": "ga-ub8yq", "priority": 0},
+            {"id": "wa-q6rbe", "priority": 1},
+            {"id": "ga-zkxdw", "priority": 1},
+            {"id": "hq-070", "priority": 2},
+        ],
+    }
+    _bd_approved = lambda root: [_make_bead("hq-070", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["hq-070"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    if not mail_calls and not notify_calls:
+        _ok("(ga-tky97-a): bead at position 4/4 (3 higher-precedence items "
+            "ahead) in the Pilot's own queue → starve alarm suppressed")
+    else:
+        _bad("(ga-tky97-a)", "mail_calls=%s notify_calls=%s" % (mail_calls, notify_calls))
+
+    print("\nScenario (ga-tky97-b): falsification (AC2) — bead absent from a "
+          "FRESH dispatch queue → STILL alarms (must not become a false negative)")
+    _read_pilot_dispatchable_file = lambda: {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
+        "ttl_seconds": 600,
+        "count": 1,
+        "items": [{"id": "ga-someone-else", "priority": 1}],
+    }
+    _bd_approved = lambda root: [_make_bead("hq-071", age_min=_STARVE + 5.0)]
+    st = _reset()
+    st["first_seen_approved"]["hq-071"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    body_tky_b = next((b for s, b in mail_calls if "hq-071" in s), None)
+    if body_tky_b is not None and "NOT found among 1 dispatchable" in body_tky_b:
+        _ok("(ga-tky97-b): bead absent from a fresh queue → alarm STILL fires; "
+            "body notes it wasn't found (possible real filter/query bug)")
+    else:
+        _bad("(ga-tky97-b)", "mail_calls=%s body=%r" % (mail_calls, body_tky_b))
+
+    print("\nScenario (ga-tky97-c): falsification — bead is FIRST in the "
+          "queue (index 0, nothing ahead) → STILL alarms")
+    _read_pilot_dispatchable_file = lambda: {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
+        "ttl_seconds": 600,
+        "count": 1,
+        "items": [{"id": "hq-072", "priority": 1}],
+    }
+    _bd_approved = lambda root: [_make_bead("hq-072", age_min=_STARVE + 5.0)]
+    st = _reset()
+    st["first_seen_approved"]["hq-072"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    body_tky_c = next((b for s, b in mail_calls if "hq-072" in s), None)
+    if body_tky_c is not None and "bead is FIRST" in body_tky_c:
+        _ok("(ga-tky97-c): bead first in queue, nothing ahead → alarm STILL "
+            "fires (this signal has nothing to explain the wait with)")
+    else:
+        _bad("(ga-tky97-c)", "mail_calls=%s body=%r" % (mail_calls, body_tky_c))
+
+    print("\nScenario (ga-tky97-d): AC3 — pilot-dispatchable.json missing/"
+          "stale/unreadable → STILL alarms, body says COULD NOT READ / "
+          "UNCERTAIN (never trusts an unmeasured queue, root-class:error-vs-empty)")
+    _read_pilot_dispatchable_file = lambda: None   # simulated missing/stale/unreadable
+    _bd_approved = lambda root: [_make_bead("hq-073", age_min=_STARVE + 5.0)]
+    st = _reset()
+    st["first_seen_approved"]["hq-073"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)
+    body_tky_d = next((b for s, b in mail_calls if "hq-073" in s), None)
+    if body_tky_d is not None and "COULD NOT READ" in body_tky_d and "UNCERTAIN" in body_tky_d:
+        _ok("(ga-tky97-d): unreadable dispatch queue → alarm STILL fires, "
+            "body honestly says COULD NOT READ / UNCERTAIN, never fabricates "
+            "a position")
+    else:
+        _bad("(ga-tky97-d)", "mail_calls=%s body=%r" % (mail_calls, body_tky_d))
+
+    print("\nScenario (ga-tky97-e): AC4 — a second, still-unsuppressed repeat "
+          "alarm reports the queue-position delta since the previous alarm, "
+          "not just a bare repeat count")
+    _read_pilot_dispatchable_file = lambda: {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
+        "ttl_seconds": 600,
+        "count": 1,
+        "items": [{"id": "ga-someone-else", "priority": 1}],   # hq-074 absent
+    }
+    _bd_approved = lambda root: [_make_bead("hq-074", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["hq-074"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)   # alarm #1 — bead absent from queue, qpos=QPOS_ABSENT recorded
+    first_body_e = next((b for s, b in mail_calls if "hq-074" in s), None)
+    # Second cycle >1h later (past the AC3 1h escalation tier): hq-074 now
+    # appears at the FRONT of a fresh queue — still not suppressed (index 0),
+    # so alarm #2 fires; its body should say what changed since alarm #1.
+    _read_pilot_dispatchable_file = lambda: {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + 3700)),
+        "ttl_seconds": 600,
+        "count": 1,
+        "items": [{"id": "hq-074", "priority": 1}],
+    }
+    _read_pilot_log_lines = lambda: _pilot_recent_at(NOW + 3700)
+    _reset_captures()
+    run_cycle(NOW + 3700, st)
+    second_body_e = next((b for s, b in mail_calls if "hq-074" in s), None)
+    if (first_body_e is not None and "NOT found among 1 dispatchable" in first_body_e
+            and second_body_e is not None
+            and "changed from not found in queue to front of queue" in second_body_e):
+        _ok("(ga-tky97-e): repeat alarm #2 reports the queue-status delta "
+            "('not found' → 'front of queue') since alarm #1, not just a "
+            "bare repeat count")
+    else:
+        _bad("(ga-tky97-e)", "first_body=%r second_body=%r" % (first_body_e, second_body_e))
+
+    # (ga-tky97-f) hermetic-selftest-cannot-test-the-bootstrap-it-stubs class:
+    # every scenario above bypasses _read_pilot_dispatchable()'s ACTUAL file
+    # I/O + UTC-epoch math via the _read_pilot_dispatchable_file seam — a bug
+    # in that real parsing logic (e.g. a local-time-vs-UTC mistake) would ship
+    # with every scenario above still green. Un-stub the seam and exercise the
+    # real function against a genuine file on disk.
+    print("\nScenario (ga-tky97-f): REAL _read_pilot_dispatchable() (seam OFF) "
+          "— a genuinely fresh file parses correctly, a stale one (past its "
+          "own ttl_seconds) returns None, a missing file returns None")
+    _read_pilot_dispatchable_file = None   # un-stub — force the real function body
+    _tmp_pd_path = "/tmp/arc-selftest-pilot-dispatchable-%d.json" % os.getpid()
+    _real_pd_const = PILOT_DISPATCHABLE_FILE
+    globals()["PILOT_DISPATCHABLE_FILE"] = _tmp_pd_path
+    _fresh_gen = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - 60))    # 1min old
+    _stale_gen = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - 700))   # 11.67min old
+    with open(_tmp_pd_path, "w") as _f:
+        json.dump({"generated_at": _fresh_gen, "ttl_seconds": 600, "count": 1,
+                    "items": [{"id": "hq-099", "priority": 1}]}, _f)
+    fresh_result = _read_pilot_dispatchable(NOW)
+    with open(_tmp_pd_path, "w") as _f:
+        json.dump({"generated_at": _stale_gen, "ttl_seconds": 600, "count": 1,
+                    "items": [{"id": "hq-099", "priority": 1}]}, _f)
+    stale_result = _read_pilot_dispatchable(NOW)
+    os.remove(_tmp_pd_path)
+    missing_result = _read_pilot_dispatchable(NOW)
+    globals()["PILOT_DISPATCHABLE_FILE"] = _real_pd_const
+    fresh_ok = (fresh_result is not None
+                and fresh_result.get("items") == [{"id": "hq-099", "priority": 1}])
+    stale_ok = stale_result is None
+    missing_ok = missing_result is None
+    if fresh_ok and stale_ok and missing_ok:
+        _ok("(ga-tky97-f): REAL file I/O — fresh file (1min old, ttl=600s) "
+            "parses correctly; stale file (11.67min old, ttl=600s) → None; "
+            "missing file → None (never silently trusts unmeasured data)")
+    else:
+        _bad("(ga-tky97-f)", "fresh_result=%r stale_result=%r missing_result=%r" % (
+             fresh_result, stale_result, missing_result))
+
+    # (ga-tky97-g..j) GATE-FEEDBACK fix (attempt 1 FAIL): qpos=None used to mean
+    # both ABSENT (queue read fine, bead not in it) and UNREADABLE (queue snapshot
+    # itself failed this cycle) — a delta comparing two such Nones could assert
+    # "unchanged" across a cycle that was never actually measured. These four
+    # scenarios are the falsifiable AC from the Mayor's fix spec: the three
+    # UNREADABLE-involved transitions must never claim unchanged/changed, and the
+    # one all-measured transition (ABSENT -> ABSENT) still must.
+    print("\nScenario (ga-tky97-g): GATE-FEEDBACK fix — previous cycle's queue was "
+          "UNREADABLE, current cycle confirms the bead absent from a fresh read → "
+          "delta must NOT claim unchanged/changed (previous side was never measured)")
+    _read_pilot_dispatchable_file = lambda: None   # cycle 1: unreadable
+    _bd_approved = lambda root: [_make_bead("hq-075", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["hq-075"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)   # alarm #1 — dispatchable unreadable, qpos=QPOS_UNREADABLE recorded
+    first_body_g = next((b for s, b in mail_calls if "hq-075" in s), None)
+    _read_pilot_dispatchable_file = lambda: {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + 3700)),
+        "ttl_seconds": 600,
+        "count": 1,
+        "items": [{"id": "ga-someone-else", "priority": 1}],   # hq-075 confirmed absent
+    }
+    _read_pilot_log_lines = lambda: _pilot_recent_at(NOW + 3700)
+    _reset_captures()
+    run_cycle(NOW + 3700, st)   # alarm #2 — queue now readable, bead confirmed absent
+    second_body_g = next((b for s, b in mail_calls if "hq-075" in s), None)
+    if (first_body_g is not None and "COULD NOT READ" in first_body_g
+            and second_body_g is not None
+            and "not comparable" in second_body_g
+            and "previous cycle" in second_body_g
+            and "unchanged" not in second_body_g and "changed from" not in second_body_g):
+        _ok("(ga-tky97-g): prev cycle unreadable, current confirmed-absent → "
+            "delta says not-comparable instead of fabricating unchanged/changed")
+    else:
+        _bad("(ga-tky97-g)", "first_body=%r second_body=%r" % (first_body_g, second_body_g))
+
+    print("\nScenario (ga-tky97-h): GATE-FEEDBACK fix — THE EXACT REVIEWER REPRO: "
+          "previous cycle confirmed the bead absent from a readable queue, current "
+          "cycle's queue is UNREADABLE → the same mail body must not say both "
+          "'COULD NOT READ ... UNCERTAIN' and 'Since last alarm: unchanged'")
+    _read_pilot_dispatchable_file = lambda: {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
+        "ttl_seconds": 600,
+        "count": 1,
+        "items": [{"id": "ga-someone-else", "priority": 1}],   # hq-076 confirmed absent
+    }
+    _bd_approved = lambda root: [_make_bead("hq-076", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["hq-076"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)   # alarm #1 — confirmed absent, qpos=QPOS_ABSENT recorded
+    first_body_h = next((b for s, b in mail_calls if "hq-076" in s), None)
+    _read_pilot_dispatchable_file = lambda: None   # cycle 2: unreadable
+    _read_pilot_log_lines = lambda: _pilot_recent_at(NOW + 3700)
+    _reset_captures()
+    run_cycle(NOW + 3700, st)   # alarm #2 — dispatchable unreadable this cycle
+    second_body_h = next((b for s, b in mail_calls if "hq-076" in s), None)
+    if (first_body_h is not None and "NOT found among 1 dispatchable" in first_body_h
+            and second_body_h is not None
+            and "COULD NOT READ" in second_body_h
+            and "not comparable" in second_body_h
+            and "this cycle" in second_body_h
+            and "unchanged" not in second_body_h and "changed from" not in second_body_h):
+        _ok("(ga-tky97-h): prev confirmed-absent, current unreadable → same "
+            "message never pairs COULD NOT READ with a continuity claim")
+    else:
+        _bad("(ga-tky97-h)", "first_body=%r second_body=%r" % (first_body_h, second_body_h))
+
+    print("\nScenario (ga-tky97-i): GATE-FEEDBACK fix — BOTH the previous and "
+          "current cycle's queue were UNREADABLE → delta must NOT claim "
+          "unchanged/changed (neither side was ever measured)")
+    _read_pilot_dispatchable_file = lambda: None
+    _bd_approved = lambda root: [_make_bead("hq-077", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["hq-077"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)   # alarm #1 — unreadable
+    first_body_i = next((b for s, b in mail_calls if "hq-077" in s), None)
+    _read_pilot_log_lines = lambda: _pilot_recent_at(NOW + 3700)
+    _reset_captures()
+    run_cycle(NOW + 3700, st)   # alarm #2 — still unreadable
+    second_body_i = next((b for s, b in mail_calls if "hq-077" in s), None)
+    if (first_body_i is not None and "COULD NOT READ" in first_body_i
+            and second_body_i is not None
+            and "COULD NOT READ" in second_body_i
+            and "not comparable" in second_body_i
+            and "previous cycle and this cycle" in second_body_i
+            and "unchanged" not in second_body_i and "changed from" not in second_body_i):
+        _ok("(ga-tky97-i): both cycles unreadable → delta names both sides as "
+            "not comparable, never fabricates continuity")
+    else:
+        _bad("(ga-tky97-i)", "first_body=%r second_body=%r" % (first_body_i, second_body_i))
+
+    print("\nScenario (ga-tky97-j): GATE-FEEDBACK fix guard — both the previous "
+          "AND current cycle confirm the bead absent from a freshly-read queue → "
+          "delta MUST still say 'unchanged' (both sides were actually measured; "
+          "the fix must not overcorrect into treating every non-int qpos as "
+          "incomparable)")
+    _read_pilot_dispatchable_file = lambda: {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW)),
+        "ttl_seconds": 600,
+        "count": 1,
+        "items": [{"id": "ga-someone-else", "priority": 1}],   # hq-078 confirmed absent
+    }
+    _bd_approved = lambda root: [_make_bead("hq-078", age_min=_STARVE + 5.0)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st = _reset()
+    st["first_seen_approved"]["hq-078"] = NOW - (_STARVE + 5) * 60
+    run_cycle(NOW, st)   # alarm #1 — confirmed absent
+    first_body_j = next((b for s, b in mail_calls if "hq-078" in s), None)
+    _read_pilot_dispatchable_file = lambda: {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + 3700)),
+        "ttl_seconds": 600,
+        "count": 1,
+        "items": [{"id": "ga-someone-else", "priority": 1}],   # still absent
+    }
+    _read_pilot_log_lines = lambda: _pilot_recent_at(NOW + 3700)
+    _reset_captures()
+    run_cycle(NOW + 3700, st)   # alarm #2 — still confirmed absent
+    second_body_j = next((b for s, b in mail_calls if "hq-078" in s), None)
+    if (first_body_j is not None and "NOT found among 1 dispatchable" in first_body_j
+            and second_body_j is not None
+            and "unchanged (not found in queue)" in second_body_j):
+        _ok("(ga-tky97-j): both cycles confirm absence (measured, not unreadable) "
+            "→ delta correctly says 'unchanged' — fix doesn't overcorrect into "
+            "blanket uncertainty")
+    else:
+        _bad("(ga-tky97-j)", "first_body=%r second_body=%r" % (first_body_j, second_body_j))
+
+    # Restore the neutral hermetic default so later scenarios (which don't
+    # exercise the pilot-queue-position feature) are unaffected.
+    _read_pilot_dispatchable_file = lambda: None
 
     print("\nScenario (ga-32u6s-e) gate-fix-1 regression guard: unresolvable "
           "`git merge-base --is-ancestor` (r is None, or returncode not in (0,1) e.g. "

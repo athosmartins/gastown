@@ -6319,6 +6319,15 @@ if [ -z "$GATE_RUN_ID" ]; then
   GATE_RUN_ID="unknown"
 fi
 log "Gate-run bead: $GATE_RUN_ID"
+# ga-ub8yq: one self-contained record joining run+bead+size, keyed by GATE_RUN_ID
+# (unique per attempt) so gate-review-size-report.py can pair each attempt with
+# its own "Gate run complete: gate_run=..." verdict line without guessing from
+# bead/branch substrings. Skip when GATE_RUN_ID is the "unknown" sentinel — every
+# failed-to-create run would share that key, which would silently re-collide
+# unrelated runs' sizes, the exact bug class this line exists to eliminate.
+if [ "$GATE_RUN_ID" != "unknown" ]; then
+  log "Gate-run size: gate_run=$GATE_RUN_ID bead=$BEAD_ID files=$DIFF_FILE_COUNT lines=$DIFF_LINE_COUNT"
+fi
 
 # ── Step 7: Create verdict beads (one per reviewer) ───────────────────────────
 # Each reviewer session writes its verdict to its personal verdict bead:

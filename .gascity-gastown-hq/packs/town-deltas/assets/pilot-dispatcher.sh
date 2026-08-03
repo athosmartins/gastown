@@ -2166,11 +2166,12 @@ _filter_built() {
   done < <(printf '%s' "$arr" | jq -r '
       .[]? | (.labels // []) as $L | (.id // "") as $id | select($id != "")
       | [ $id,
-          (if ($L | index("gate:needs-fix")) then "1" else "0" end),
+          (if (($L | index("gate:needs-fix")) or ($L | any(startswith("gate:fix-attempt:")))) then "1" else "0" end),
           (if (($L | map(select(
                 (. == "gate" or startswith("gate:"))
                 and (. != "gate:needs-fix") and (startswith("gate:needs-fix:") | not)
                 and (. != "gate:needs-human") and (startswith("gate:needs-human") | not)
+                and (startswith("gate:fix-attempt:") | not)
               )) | length) > 0) then "1" else "0" end)
         ] | @tsv' 2>/dev/null)
 
@@ -2220,17 +2221,31 @@ _filter_built() {
     fi
   fi
 
-  # ── Combine: drop a candidate that is branch-built (except gate:needs-fix, whose
-  #    own fix-branch is expected) OR in-gate (ingate_ids already encodes the
-  #    needs-fix carve-out, so a needs-fix id is present here ONLY when actively
+  # ── Combine: drop a candidate that is branch-built (except gate:needs-fix OR
+  #    gate:fix-attempt:N, whose own fix-branch is expected) OR in-gate (ingate_ids
+  #    already encodes both carve-outs, so an id is present here ONLY when actively
   #    re-gated). FAIL-OPEN to the unfiltered array on any jq error.
+  #
+  # ga-ltjdx: this OR used to check ONLY the literal "gate:needs-fix" label — a
+  # DIFFERENT, narrower check than the _bounced computation two blocks up (which
+  # ga-d3eg2 already widened to ALSO match gate:fix-attempt:N). A bead bounced via
+  # fix-attempt:N alone (gate:fix-attempt:1 + gate-sha-failed:<sha>, no needs-fix —
+  # exactly what a gate FAIL leaves behind) correctly avoided ingate_ids here, but
+  # then still lost to this OR's narrower label check whenever its own fix branch
+  # existed — the normal, expected state of a bead mid gate-fix-loop. Net effect
+  # (measured live, ga-ub8yq): _filter_built excluded it from EVERY sweep, so no
+  # fixer was ever (re-)dispatched. Widening this OR to the same startswith match
+  # closes the gap; ingate_ids (unchanged) still independently vetoes an ACTIVELY
+  # re-gated bead of either flavor, so the ga-htjni double-dispatch protection is
+  # preserved.
   if [ -z "$built_ids" ] && [ -z "$ingate_ids" ]; then
     printf '%s' "$arr"; return
   fi
   _out=$(printf '%s' "$arr" | jq --arg b "$built_ids" --arg g "$ingate_ids" '
       ($b|split(" ")) as $bi | ($g|split(" ")) as $gi
       | [ .[] | select(
-            ( ((.id as $i | $bi | index($i)) | not) or ((.labels // []) | index("gate:needs-fix")) )
+            ( ((.id as $i | $bi | index($i)) | not)
+              or ((.labels // []) | any(. == "gate:needs-fix" or startswith("gate:fix-attempt:"))) )
             and ((.id as $i | $gi | index($i)) | not)
         ) ]' \
     2>/dev/null || printf '%s' "$arr")
@@ -3406,10 +3421,30 @@ _ownership_guard_should_refuse() {
   # signal (a) refuses EVERY fix attempt forever (observed: ps-2w5d attempt 3 refused
   # every sweep for 40+min). Skip the standalone branch refusal for gate:needs-fix;
   # signal (b) below still blocks a genuinely LIVE crew owner (an in-flight fixer).
+  #
+  # ga-d3eg2: ALSO exempt on gate:fix-attempt:<N> alone (needs-fix may be absent).
+  # Measured live (ga-xv78c, dolt_diff_labels forensics): a single commit stripped
+  # gate:failed + gate:needs-fix together (root mechanism not attributable to any
+  # daemon script found — see bead comment) while gate:fix-attempt:1 and
+  # gate-sha-failed:<sha> survived untouched. The label-only carve-out above then
+  # silently deactivated: signal (a) fell through to _beadid_branch_signal, which
+  # blocks any unmerged branch not yet past PILOT_ORPHAN_BRANCH_STALE_HOURS (48h
+  # default) — refusing EVERY sweep for the bead's remaining lifetime short of that
+  # window (observed: ~20h, until a human hand-fixed the label). gate:fix-attempt:N
+  # is exactly as durable a "this bead is in the gate-fix loop" fingerprint as
+  # gate:needs-fix — _ns_label_blocks_release below documents both as persisting
+  # "across a bead's ENTIRE redispatch cycle by design" — so trusting it here is
+  # consistent with existing doctrine, not a new risk class. Deliberately does NOT
+  # widen to "branch exists + no assignee" alone: that would refuse nothing
+  # differently for a bead with NO gate history (ga-8jxe1(a3)'s gj8-recent fixture:
+  # a branch pushed moments ago, assignee not yet set) — the exact ga-6jqr/ga-htjni
+  # push-then-metadata-lag double-dispatch race this file already protects against.
+  # Requiring proof of a PRIOR gate FAIL (the attempt counter) is what distinguishes
+  # "abandoned mid-fix-cycle" from "just claimed, metadata still catching up".
   local _og_labels
   _og_labels=$(printf '%s' "$_json" | jq -r '(.labels // []) | join(",")' 2>/dev/null || echo "")
   case ",$_og_labels," in
-    *,gate:needs-fix,*)
+    *,gate:needs-fix,*|*,gate:fix-attempt:*,*)
       : ;;   # in the gate-fix loop → its own branch is not a competing owner
     *)
       # (a) crew branch — strongest, evaluated first and standalone. ga-8jxe1:
@@ -3492,13 +3527,15 @@ _ownership_guard_should_refuse() {
   # pilot.sling_bead. That is NOT a fresh EXTERNAL claim; the reclaim paths
   # (NEVERSTARTED / ga-e5yw2 / ga-v3z4z) own it, so (c) must NOT block it (else
   # re-dispatch of a legitimately-released bead would deadlock). gate:needs-fix is
-  # likewise the Pilot's own gate-fix loop (assignee already cleared by the gate).
+  # likewise the Pilot's own gate-fix loop (assignee already cleared by the gate);
+  # ga-d3eg2: same for gate:fix-attempt:N alone — see the signal-(a) carve-out
+  # above for why this is a durable-enough fingerprint on its own.
   _has_pilot_fp=$(printf '%s' "$_fresh" | jq -r '
       (((.labels // []) | index("pilot:dispatched")) != null)
       or (((.metadata["pilot.dispatched_at"]) // "") != "")
       or (((.metadata["pilot.sling_bead"]) // "") != "")
       | if . then "1" else "0" end' 2>/dev/null || echo "0")
-  case ",$_og_labels," in *,gate:needs-fix,*) _has_pilot_fp="1" ;; esac
+  case ",$_og_labels," in *,gate:needs-fix,*|*,gate:fix-attempt:*,*) _has_pilot_fp="1" ;; esac
 
   # ── (c) EXTERNAL ACTIVE CLAIM (ga-htjni ext; wa-5wv49 / wa-xnuxd) ─────────────
   # The reported systemic double-dispatch: a crew/human creates a bead intending to

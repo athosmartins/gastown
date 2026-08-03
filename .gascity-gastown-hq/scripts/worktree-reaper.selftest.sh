@@ -69,9 +69,72 @@ wt_exists worker-merged   && bad "stale+clean merged worktree NOT reaped"       
 branch_exists crew/x/merged   && bad "merged orphan branch NOT deleted"          || ok "merged orphan branch deleted (unblocks _filter_built)"
 wt_exists worker-unmerged && bad "stale+clean unmerged worktree NOT reaped"      || ok "stale+clean unmerged pool worktree reaped"
 branch_exists crew/x/unmerged && ok "UNMERGED branch KEPT (no data loss)"        || bad "unmerged branch wrongly deleted (DATA LOSS!)"
-wt_exists worker-dirty    && ok "dirty worktree SKIPPED (live WIP protected)"    || bad "dirty worktree wrongly reaped (WIP loss!)"
-branch_exists crew/x/dirty    && ok "dirty worktree's branch kept"              || bad "dirty worktree's branch wrongly deleted"
+wt_exists worker-dirty    && bad "ga-xv78c: dirty worktree NOT reaped after preserve (disk never freed)" || ok "ga-xv78c: dirty worktree preserved+reaped (disk freed)"
+branch_exists crew/x/dirty    && ok "dirty worktree's local branch kept"        || bad "dirty worktree's local branch wrongly deleted"
+git -C "$REMOTE" rev-parse -q --verify refs/heads/crew/x/dirty >/dev/null 2>&1 \
+  && ok "ga-xv78c: dirty WIP preserved to origin before reap (own branch name)" \
+  || bad "ga-xv78c: dirty WIP LOST — not preserved to origin before reap!"
+git -C "$REMOTE" show refs/heads/crew/x/dirty:dirty.txt 2>/dev/null | grep -qx dirty \
+  && ok "ga-xv78c: preserved commit contains the actual WIP content" \
+  || bad "ga-xv78c: preserved ref exists but WIP content is wrong/missing"
 wt_exists worker-fresh    && ok "fresh worktree KEPT (age gate)"                 || bad "fresh worktree wrongly reaped"
+
+# ── ga-xv78c gate-feedback (fix-attempt 1 FAILED review): BOTH push attempts fail
+# (origin unreachable) → the worktree must be left byte-for-byte as it was — still
+# dirty — so the NEXT sweep's plain non-force `worktree remove` refuses it again
+# too. Attempt 1 committed the WIP with a real `git commit` BEFORE either push was
+# tried; when both failed it correctly returned "kept", but the tree was already
+# git-CLEAN from that commit, so sweep 2's plain remove silently succeeded and
+# deleted it, logging a routine reaped_pool event indistinguishable from an
+# ordinary clean reap. This is the reviewer's exact live repro. No fixture in this
+# suite exercised it before this addition.
+echo "── ga-xv78c gate-feedback: both-pushes-fail leaves worktree dirty across sweeps ──"
+UTOWN="$TMP/utown"; mkdir -p "$UTOWN"
+URIG="$UTOWN/urig"; git init -q -b main "$URIG"
+( cd "$URIG"
+  # origin points at a path that is not a git repo at all → every push fails fast
+  # and deterministically, no real network involved — a hermetic stand-in for
+  # "origin unreachable" that can't flake or hang.
+  git remote add origin "$TMP/no-such-remote.git"
+  echo u > u.txt; git add u.txt; git commit -qm ubase
+  git worktree add -q "$URIG/crew/worker-unreachable" -b crew/u/unreachable main
+  ( cd "$URIG/crew/worker-unreachable"; echo wip > wip.txt )   # uncommitted → dirty
+) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$URIG/crew/worker-unreachable" 2>/dev/null || true
+
+uwt() { git -C "$URIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/worker-unreachable\$"; }
+BEFORE_STATUS="$(git -C "$URIG/crew/worker-unreachable" status --porcelain 2>/dev/null)"
+
+WORKTREE_REAPER_GT="$UTOWN" WORKTREE_REAPER_LOG="$TMP/reaperU1.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+  bash "$REAPER" >/dev/null 2>&1
+
+uwt && ok "gate-feedback: both-pushes-fail worktree survives sweep 1 (not deleted)" \
+     || bad "gate-feedback: worktree deleted on sweep 1 despite BOTH pushes failing — DATA LOSS!"
+grep -q '"event":"preserve_failed_dirty_kept"' "$TMP/reaperU1.jsonl" 2>/dev/null \
+  && ok "gate-feedback: preserve_failed_dirty_kept logged (distinguishable from a routine reap)" \
+  || bad "gate-feedback: failure not logged — would be indistinguishable from a routine skip"
+
+AFTER_STATUS="$(git -C "$URIG/crew/worker-unreachable" status --porcelain 2>/dev/null)"
+[ "$BEFORE_STATUS" = "$AFTER_STATUS" ] \
+  && ok "gate-feedback: worktree status BYTE-FOR-BYTE unchanged after failed preserve (no premature commit)" \
+  || bad "gate-feedback: worktree status CHANGED after failed preserve — the exact fix-attempt-1 bug (silent commit before push confirmed)"
+
+# sweep 2 against the SAME still-dirty worktree: attempt-1 would have silently
+# reaped it here via the plain non-force path, since its earlier commit had
+# already cleaned the tree. Our fix must still see it as dirty and refuse+retry.
+WORKTREE_REAPER_GT="$UTOWN" WORKTREE_REAPER_LOG="$TMP/reaperU2.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+  bash "$REAPER" >/dev/null 2>&1
+
+uwt && ok "gate-feedback: worktree ALSO survives sweep 2 (cross-sweep persistence)" \
+     || bad "gate-feedback: worktree silently deleted on sweep 2 — the exact ga-xv78c attempt-1 regression!"
+grep -q '"event":"reaped_pool".*worker-unreachable' "$TMP/reaperU2.jsonl" 2>/dev/null \
+  && bad "gate-feedback: sweep 2 logged a ROUTINE reaped_pool for a preserve-failed tree — indistinguishable from an ordinary reap!" \
+  || ok "gate-feedback: sweep 2 did NOT silently log it as a routine reap"
+grep -q '"event":"preserve_failed_dirty_kept"' "$TMP/reaperU2.jsonl" 2>/dev/null \
+  && ok "gate-feedback: sweep 2 retried preserve and logged the failure again (never silently skipped)" \
+  || bad "gate-feedback: sweep 2 gave no signal at all"
 
 # ── kill switch: ENABLED=0 → would_reap only, no mutation ────────────────────────
 echo "── kill switch (ENABLED=0 = dry) ──"
@@ -140,11 +203,24 @@ ZRIG="$TOWNZ/zrig"; git init -q -b main "$ZRIG"
   # (g) UNLOCKED stale+clean under .claude/worktrees, crew merged → normal reap + branch del
   git branch crew/z/unlocked main
   git worktree add -q "$ZRIG/.claude/worktrees/agent-unlocked" crew/z/unlocked
+  # (h) ga-xv78c: UNLOCKED + DIRTY under .claude/worktrees/agent-* (the exact reported
+  # shape — subagent isolation:"worktree" trees). Own branch name is free on origin →
+  # exercises the "push under familiar name" success path.
+  git worktree add -q "$ZRIG/.claude/worktrees/agent-dirty" -b wa-agent-dirty-wip main
+  ( cd "$ZRIG/.claude/worktrees/agent-dirty"; echo agentwip > wip.txt )   # uncommitted → dirty
+  # (i) ga-xv78c: UNLOCKED + DIRTY, but the branch name is ALREADY TAKEN on origin by
+  # UNRELATED history (orphan root commit, no common ancestor) → the reaper's own-name
+  # push must non-fast-forward-reject, and it must fall back to
+  # refs/reclaimed/<label>/<sha> rather than force-clobbering someone else's ref.
+  git -C "$ZRIG" commit-tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904 -m "unrelated origin history" > "$TMP/collide_sha.txt"
+  git -C "$ZRIG" push -q origin "$(cat "$TMP/collide_sha.txt"):refs/heads/wa-collide-wip" >/dev/null 2>&1
+  git worktree add -q "$ZRIG/.claude/worktrees/agent-collide" -b wa-collide-wip main
+  ( cd "$ZRIG/.claude/worktrees/agent-collide"; echo collidewip > collide.txt )   # uncommitted → dirty
 ) >/dev/null 2>&1
 
 # backdate every zrig worktree past the age gate (dir mtime) — agent-young is OLD by dir-age
 # yet must be KEPT because its HOLDER is young/active (proves holder-age, not dir-age, decides).
-for w in agent-dead agent-ancient agent-young agent-busy agent-noreason agent-unlocked; do
+for w in agent-dead agent-ancient agent-young agent-busy agent-noreason agent-unlocked agent-dirty agent-collide; do
   touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$ZRIG/.claude/worktrees/$w" 2>/dev/null || true
 done
 touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$ZRIG/.gc-worktrees/zb-mainbase" 2>/dev/null || true
@@ -176,6 +252,30 @@ zwt ".gc-worktrees/zb-mainbase"        && bad "gate-review DEAD-locked tree NOT 
 zwt ".claude/worktrees/agent-noreason" && ok "UNPARSEABLE lock KEPT (fail-safe)"                || bad "unparseable lock wrongly reaped"
 zwt ".claude/worktrees/agent-unlocked" && bad "unlocked stale+clean .claude tree NOT reaped"    || ok "unlocked stale+clean .claude/worktrees tree reaped (path coverage)"
 zbr crew/z/unlocked                    && bad "unlocked's merged crew branch NOT deleted"       || ok "unlocked's merged crew branch deleted"
+
+# ── ga-xv78c: dirty + unlocked + aged under .claude/worktrees/agent-* — the exact
+# reported failure shape. Old behavior left these stuck forever (dirty never
+# self-clears); 94 leaked this way (5.9G, 5 crews) and broke the ITBI pipeline's
+# SQLite at 95% disk. Must now be preserved to a durable ref, THEN reaped.
+zwt ".claude/worktrees/agent-dirty"    && bad "ga-xv78c: dirty .claude/worktrees tree NOT reaped (disk never freed)" || ok "ga-xv78c: dirty .claude/worktrees tree preserved+reaped"
+git -C "$ZREMOTE" rev-parse -q --verify refs/heads/wa-agent-dirty-wip >/dev/null 2>&1 \
+  && ok "ga-xv78c: dirty WIP preserved to origin (own branch name free → used directly)" \
+  || bad "ga-xv78c: dirty WIP LOST — own-name preserve path broken"
+git -C "$ZREMOTE" show refs/heads/wa-agent-dirty-wip:wip.txt 2>/dev/null | grep -qx agentwip \
+  && ok "ga-xv78c: preserved own-name commit has the real WIP content" \
+  || bad "ga-xv78c: preserved own-name ref exists but content is wrong/missing"
+grep -q '"event":"reaped_dirty_preserved"' "$TMP/reaperZ.jsonl" 2>/dev/null && ok "reaped_dirty_preserved logged" || bad "reaped_dirty_preserved NOT logged"
+
+# ── ga-xv78c: same, but the branch name collides with UNRELATED history already on
+# origin → own-name push must non-fast-forward-reject, falling back to
+# refs/reclaimed/<label>/<sha> WITHOUT clobbering the pre-existing unrelated ref.
+zwt ".claude/worktrees/agent-collide"  && bad "ga-xv78c: colliding-name dirty tree NOT reaped" || ok "ga-xv78c: colliding-name dirty tree preserved+reaped (fallback path)"
+[ "$(git -C "$ZREMOTE" rev-parse -q --verify refs/heads/wa-collide-wip 2>/dev/null)" = "$(cat "$TMP/collide_sha.txt" 2>/dev/null)" ] \
+  && ok "ga-xv78c: pre-existing unrelated origin ref NOT clobbered (no force-push)" \
+  || bad "ga-xv78c: collision ref was overwritten — unrelated history destroyed!"
+git -C "$ZREMOTE" for-each-ref "refs/reclaimed/agent-collide/" --format='%(objectname)' 2>/dev/null | grep -q . \
+  && ok "ga-xv78c: collision WIP preserved under refs/reclaimed/ fallback" \
+  || bad "ga-xv78c: collision WIP LOST — refs/reclaimed/ fallback path broken"
 grep -q '"event":"reaped_zombie_lock"' "$TMP/reaperZ.jsonl" 2>/dev/null && ok "reaped_zombie_lock logged" || bad "reaped_zombie_lock NOT logged"
 grep -q '"event":"kept_locked_live"'   "$TMP/reaperZ.jsonl" 2>/dev/null && ok "kept_locked_live logged (live holder)" || bad "kept_locked_live NOT logged"
 
@@ -314,6 +414,74 @@ branch_exists_in() { git -C "$1" rev-parse --verify -q "refs/heads/$2" >/dev/nul
 branch_exists_in "$CRIG/crew/oracle" crew/oracle/stale \
   && bad "crew clone's merged orphan branch NOT deleted" || ok "crew clone's merged orphan branch deleted"
 [ -d "$CRIG/crew/worker" ] && ok "crew/worker (no own .git) left alone, no crash" || bad "crew/worker directory unexpectedly gone"
+
+# ══ ga-0j2zc: gitignored-but-tracked drift must not leak into the preserve commit ══
+# The dirty-worktree preserve path (ga-xv78c) stages the full working-tree state via
+# `add -A` into a scratch index. `add -A` correctly skips NEW untracked files that match
+# .gitignore, but it does NOT skip modifications to files that are ALREADY TRACKED and
+# merely happen to also match a (later-added) .gitignore pattern — e.g. a vendorized/
+# materialized dir like whatsapp_automation's .gc/, tracked before it was gitignored.
+# Reported live: a preserve-before-reap commit (82e40efb6) carried 166 FILES / 24,021
+# lines of .gc/ into a crew branch — none of it the crew's own work, all of it incidental
+# drift in an already-tracked, now-ignored directory. Prove: (i) a tracked+now-ignored
+# file's on-disk DRIFT is excluded from the preserve commit (pinned back to its pre-drift
+# committed content); (ii) a tracked+now-ignored file's on-disk DELETION is likewise not
+# swept in; (iii) genuine crew WIP in a NOT-ignored file is still captured (no regression
+# on the ga-xv78c feature itself); (iv) a brand-new untracked file under the ignored dir
+# stays excluded (pre-existing correct add -A behavior, must not regress).
+echo "── ga-0j2zc: gitignored-but-tracked drift excluded from preserve commit ──"
+GTOWN="$TMP/gtown"; mkdir -p "$GTOWN"
+GREMOTE="$TMP/gremote.git"; git init -q --bare "$GREMOTE"
+GRIG="$GTOWN/grig"; git init -q -b main "$GRIG"
+( cd "$GRIG"
+  git remote add origin "$GREMOTE"
+  mkdir -p .gc
+  echo orig-keep > .gc/keep.txt
+  echo orig-del  > .gc/will-delete.txt
+  git add .gc/keep.txt .gc/will-delete.txt
+  git commit -qm "base: tracked files under .gc/ (before it was ignored)"
+  echo ".gc/" > .gitignore
+  git add .gitignore
+  git commit -qm "ignore .gc/ going forward (already-tracked files stay tracked)"
+  git push -q origin main
+  git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  git worktree add -q "$GRIG/crew/worker-ga0j2zc" -b crew/g/ga0j2zc main
+) >/dev/null 2>&1
+( cd "$GRIG/crew/worker-ga0j2zc"
+  echo "DRIFTED-BY-LIVE-DAEMON" > .gc/keep.txt        # tracked+ignored, modified on disk
+  rm -f .gc/will-delete.txt                            # tracked+ignored, deleted on disk
+  echo "new ignored artifact" > .gc/new-artifact.txt   # untracked+ignored — add -A already excludes this
+  echo "genuine crew wip" > crew_wip.txt               # untracked, NOT ignored — must be captured
+) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$GRIG/crew/worker-ga0j2zc" 2>/dev/null || true
+
+WORKTREE_REAPER_GT="$GTOWN" WORKTREE_REAPER_LOG="$TMP/reaperG.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+  bash "$REAPER" >/dev/null 2>&1
+
+gwt() { git -C "$GRIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/worker-ga0j2zc\$"; }
+gwt && bad "ga-0j2zc: dirty worktree with ignored-tracked drift NOT reaped" || ok "ga-0j2zc: dirty worktree with ignored-tracked drift preserved+reaped"
+
+git -C "$GREMOTE" rev-parse -q --verify refs/heads/crew/g/ga0j2zc >/dev/null 2>&1 \
+  && ok "ga-0j2zc: preserve commit landed on origin" \
+  || bad "ga-0j2zc: preserve commit never reached origin — cannot check its contents"
+
+git -C "$GREMOTE" show refs/heads/crew/g/ga0j2zc:.gc/keep.txt 2>/dev/null | grep -qx orig-keep \
+  && ok "ga-0j2zc: tracked+ignored file's on-disk DRIFT excluded (preserve kept pre-drift committed content)" \
+  || bad "ga-0j2zc: tracked+ignored file's drift LEAKED into the preserve commit (the reported bug)"
+
+git -C "$GREMOTE" show refs/heads/crew/g/ga0j2zc:.gc/will-delete.txt 2>/dev/null | grep -qx orig-del \
+  && ok "ga-0j2zc: tracked+ignored file's on-disk DELETION not swept into the preserve commit" \
+  || bad "ga-0j2zc: tracked+ignored file's deletion leaked into the preserve commit"
+
+git -C "$GREMOTE" show refs/heads/crew/g/ga0j2zc:crew_wip.txt 2>/dev/null | grep -qx "genuine crew wip" \
+  && ok "ga-0j2zc: genuine (non-ignored) crew WIP still captured (no ga-xv78c regression)" \
+  || bad "ga-0j2zc: genuine crew WIP LOST — regression on the ga-xv78c preserve feature"
+
+git -C "$GREMOTE" show refs/heads/crew/g/ga0j2zc:.gc/new-artifact.txt >/dev/null 2>&1 \
+  && bad "ga-0j2zc: new untracked file under the ignored dir wrongly captured" \
+  || ok "ga-0j2zc: new untracked file under the ignored dir correctly excluded (pre-existing add -A behavior)"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"

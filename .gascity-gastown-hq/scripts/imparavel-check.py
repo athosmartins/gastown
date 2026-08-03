@@ -50,6 +50,9 @@ HELD_LOOP_MAX = int(os.environ.get("IMP_HELD_LOOP_MAX", "5"))
 GATE_STALL_MIN = int(os.environ.get("IMP_GATE_STALL_MIN", "165"))
 PILOT_DEAD_MIN = int(os.environ.get("IMP_PILOT_DEAD_MIN", "20"))
 MAX_CLASSIFY = int(os.environ.get("IMP_MAX_CLASSIFY", "40"))  # cap to avoid hanging
+# ga-zkxdw attempt 4: cap on how long a genuinely in-flight sweep may downgrade
+# a FAIL to a WARN — past this, a hung sweep must escalate, not wait forever.
+SWEEP_IN_FLIGHT_BUDGET_MIN = int(os.environ.get("IMP_SWEEP_BUDGET_MIN", "15"))
 
 # Labels that mark a bead as NOT auto-dispatchable right now (not a silent stall).
 # A bead carrying ANY of these is parked for a real reason — the Pilot correctly
@@ -302,6 +305,9 @@ def check_approved():
             held_count += 1
         else:  # 'stuck' (plain, or held-loop — reason carries "held-loop:Nx")
             s = {"id": bead_id, "rig": rig, "title": title}
+            lane_label = next((l.split(":", 1)[1] for l in labels if l.startswith("lane:")), None)
+            if lane_label:
+                s["lane"] = lane_label
             if reason:
                 s["reason"] = reason
             stuck.append(s)
@@ -444,22 +450,310 @@ def check_gate():
 
 
 # ── CHECK 3 & 4: pilot + dolt liveness ───────────────────────────────────────
-def _pilot_slots():
-    """Most recent 'Available slots: small=X  big=Y' line from the Pilot log —
-    the same line pilot-dispatcher.sh emits from MAX_lane - in_flight_lane.
-    Returns {'small': int, 'big': int}, or None if the log is missing/unreadable
-    or has no such line yet. Caller must treat None as 'unknown' and fall back
-    to the pre-ga-wmrr strict behavior — an unreadable signal must never
-    SUPPRESS a real stall; only a POSITIVELY-confirmed 0/0 may downgrade one."""
+def _read_pilot_log_tail():
+    """The ONE place a verdict touches PILOT_LOG's tail for sweep-segmentation
+    purposes. Returns the list of lines (most recent ~500), or None if
+    unreadable. main() calls this EXACTLY ONCE per run and threads the SAME
+    immutable snapshot into _current_sweep_lines()/_pilot_slots()/
+    _pilot_candidates()/_sweep_in_flight() below — none of them may read
+    PILOT_LOG on their own.
+
+    GATE-FEEDBACK on ga-zkxdw attempt 2 (reviewer FAIL, 2026-08-03): before this
+    seam existed, _pilot_slots() and _pilot_candidates() each called
+    _current_sweep_lines() independently, and _sweep_in_flight() did its own
+    third independent tail — three live reads of an actively-appended file. If
+    a new sweep started between reads, the three signals could each describe a
+    DIFFERENT sweep and get silently combined into one verdict — the docstring
+    on the old _current_sweep_lines() claimed "both read the SAME segment", but
+    "shared" only meant the same *algorithm* ran twice, not the same *snapshot*.
+    Same root mistake as attempt 1 (joining two readings by proximity instead of
+    by a shared snapshot of one event), one level up. A veredito must be
+    computed over a single immutable snapshot; splitting the read from the
+    parse (this function vs. the pure functions below) is what makes that
+    checkable — see the selftest's instrumentation + mutant-content tests."""
     r = _sh(["tail", "-n", "500", PILOT_LOG])
     if not (r and r.stdout):
         return None
+    return r.stdout.splitlines()
+
+
+def _current_sweep_lines(lines):
+    """Given the shared PILOT_LOG snapshot `lines` (see _read_pilot_log_tail —
+    read ONCE per verdict, passed in here, never re-fetched), return only the
+    lines belonging to the most recent sweep, bounded by the last '=== Pilot
+    sweep start' marker. Returns None if `lines` is None, or no start marker is
+    visible — a rotated log, or the current sweep has already produced more
+    than the tail window's worth of lines before reaching the point being read
+    — rather than guess from whatever happens to be in view.
+
+    GATE-FEEDBACK on ga-zkxdw attempt 1: a backward scan with no boundary
+    awareness paired the CURRENT sweep's 'Available slots' with an OLDER
+    sweep's 'Candidates split' line whenever the current sweep hit the
+    zero-candidates early exit — which logs 'Available slots' (unconditional,
+    pilot-dispatcher.sh ~L3974) but then exits at ~L4491-4493 without ever
+    reaching 'Candidates split' (~L4525). Two readings from different moments,
+    joined by nothing but adjacency in the file."""
+    if lines is None:
+        return None
+    for i in range(len(lines) - 1, -1, -1):
+        if "=== Pilot sweep start" in lines[i]:
+            return lines[i:]
+    return None
+
+
+def _pilot_slots(lines):
+    """'Available slots: small=X  big=Y' from the CURRENT sweep only, within the
+    shared PILOT_LOG snapshot `lines` (see _read_pilot_log_tail —
+    _pilot_candidates()/_sweep_in_flight() must receive the SAME `lines` object
+    for a given verdict, so this can never disagree with them about which sweep
+    is "current"). Returns {'small': int, 'big': int}, or None if `lines` is
+    None, no sweep boundary is visible, or this sweep hasn't reached that line
+    yet. Caller must treat None as 'unknown' and fall back to the pre-ga-wmrr
+    strict behavior — an unreadable signal must never SUPPRESS a real stall;
+    only a POSITIVELY-confirmed 0/0 may downgrade one."""
+    seg = _current_sweep_lines(lines)
+    if seg is None:
+        return None
     import re
-    for line in reversed(r.stdout.splitlines()):
+    for line in seg:
         mt = re.search(r"Available slots:\s*small=(\d+)\s+big=(\d+)", line)
         if mt:
             return {"small": int(mt.group(1)), "big": int(mt.group(2))}
     return None
+
+
+def _pilot_candidates(lines):
+    """The CURRENT sweep's (within the shared PILOT_LOG snapshot `lines` — see
+    _read_pilot_log_tail/_pilot_slots) own per-lane classification of its
+    candidate scan (classify_lane: explicit lane:* label, then
+    story.size_check==epic, then acceptance-criteria count, default small).
+    Reused as-is rather than re-implementing that heuristic here (ga-zkxdw
+    DEFEITO 1). Three-way result, not two:
+      - 'Candidates split: small=N  big=M' present → {'small': N, 'big': M}.
+      - absent, but 'No dispatchable candidates (Tier 1 or Tier 2).' present →
+        {'small': 0, 'big': 0}. This is an EXPLICIT zero, not unknown: that
+        early exit (pilot-dispatcher.sh ~L4491-4493) happens BEFORE the split
+        log line, so its absence here means the sweep had zero candidates, not
+        'hasn't gotten there yet'.
+      - neither present (sweep still running past 'start', or no sweep boundary
+        visible at all) → None = genuinely unknown.
+    Caller must treat None the same fail-open way as _pilot_slots() — an
+    unreadable signal must never SUPPRESS a real stall, only a
+    positively-confirmed reading (a count OR the explicit-zero exit) may."""
+    seg = _current_sweep_lines(lines)
+    if seg is None:
+        return None
+    import re
+    for line in seg:
+        mt = re.search(r"Candidates split:\s*small=(\d+)\s+big=(\d+)", line)
+        if mt:
+            return {"small": int(mt.group(1)), "big": int(mt.group(2))}
+    for line in seg:
+        if "No dispatchable candidates (Tier 1 or Tier 2)." in line:
+            return {"small": 0, "big": 0}
+    return None
+
+
+def _pool_saturated(slots, candidates):
+    """PURE (no I/O — unit-testable). True when NO lane could possibly have
+    dispatched anything this sweep — every lane is either out of free slots OR
+    has zero candidates wanting it. A 'stuck' bead behind a pool saturated FOR
+    ITS OWN LANE is healthy backpressure (ga-wmrr), not a silent stall.
+
+    ga-zkxdw DEFEITO 1: the original check only looked at slots (small<=0 AND
+    big<=0 GLOBALLY), so a bead stuck in a full lane read as a real failure
+    whenever the OTHER lane had room — even though that room was the wrong
+    shape for it (measured live: small=0/big=2 slots, 9 candidates all
+    lane:small → false ❌). Mirrors the Pilot's OWN per-lane dispatch-eligibility
+    test (pilot-dispatcher.sh: `[ small_slots -gt 0 ] && [ small_count -gt 0 ]`).
+
+    candidates=None (log has no 'Candidates split' line yet) falls back to the
+    original both-lanes-empty check — an unreadable signal must never SUPPRESS
+    a real stall, so without per-lane demand data only the strictest, most
+    conservative case downgrades."""
+    if not slots:
+        return False
+    if candidates:
+        lane_could_dispatch = ((slots["small"] > 0 and candidates["small"] > 0)
+                               or (slots["big"] > 0 and candidates["big"] > 0))
+        return not lane_could_dispatch
+    return slots["small"] <= 0 and slots["big"] <= 0
+
+
+def _saturation_reason(slots, candidates):
+    """Classifies WHY _pool_saturated(slots, candidates) is True, so diagnostic
+    text can name the actual cause instead of collapsing three distinct causes
+    into one claim (ga-zkxdw GATE-FEEDBACK, attempt 5): the two call sites that
+    print when pool_saturated=True both said "slots cheios"/"saturado" even
+    when Cenário A (small=0 big=2, all-small candidates) or the confirmed-
+    zero-candidates fixture (small=2 big=0) had a lane plainly free — the
+    printed slot numbers contradicted the prose right next to them.
+
+    Delegates the True/False question to _pool_saturated() itself — never
+    re-implements or diverges from it — so a reason can only ever be returned
+    when _pool_saturated() agrees the pool IS saturated; this only adds an
+    explanation on top. Returns None when not saturated (mirrors
+    _pool_saturated exactly, including its `not slots` guard). Otherwise one of:
+      'zero_candidates' — this sweep's own scan confirmed 0 candidates in BOTH
+          lanes (Pilot's early-exit) — nothing is waiting, whatever slots show.
+          Checked FIRST: if nothing is waiting, that explains 0-dispatch on its
+          own regardless of what slots happen to read.
+      'both_empty'      — both lanes literally have 0 free slots.
+      'wrong_lane'      — some lane has a free slot, but this sweep's own
+          candidates don't want it — the lane(s) with candidates have none
+          free. Backpressure of shape, not capacity.
+    """
+    if not _pool_saturated(slots, candidates):
+        return None
+    if candidates and candidates["small"] == 0 and candidates["big"] == 0:
+        return "zero_candidates"
+    if slots["small"] <= 0 and slots["big"] <= 0:
+        return "both_empty"
+    return "wrong_lane"
+
+
+def _starved_lanes(slots, candidates):
+    """Names the lane(s) this sweep's own candidates want but have no free slot
+    — the concrete fact behind a 'wrong_lane' _saturation_reason. Reads ONLY
+    the same slots/candidates dicts _pool_saturated() already consulted — never
+    a["stuck"]'s per-bead lane labels, a separate signal (pilot-dispatchable.json)
+    that this bug's own history (the stale-snapshot GATE-FEEDBACK Fixture 1)
+    already showed can disagree with what a live sweep just measured."""
+    return "/".join(lane for lane in ("small", "big")
+                    if candidates[lane] > 0 and slots[lane] <= 0) or "?"
+
+
+def _saturation_note(reason, slots, candidates, stuck):
+    """Builds the pool_saturated ℹ️ note text for the given reason (see
+    _saturation_reason) — shared by the inline note and the ✅ summary recap
+    below so the two can never disagree (ga-zkxdw attempt 5 GATE-FEEDBACK: the
+    two call sites used to hardcode "slots cheios"/"saturado" for ALL three
+    causes). Caller must only pass a `reason` obtained from
+    _saturation_reason(slots, candidates) — i.e. never None — the same
+    pool_saturated-gates-slots-access convention already used at both call
+    sites below."""
+    ids = ", ".join("%s/%s" % (s["rig"], s["id"]) for s in stuck[:6])
+    if reason == "zero_candidates":
+        return ("o Pilot não viu candidato algum neste sweep (early-exit de zero"
+                " candidatos; slots small=%d big=%d livres) — não há nada"
+                " esperando; %d bead(s) do dispatchable podem estar"
+                " desatualizados ou já tratados: %s"
+                % (slots["small"], slots["big"], len(stuck), ids))
+    if reason == "wrong_lane":
+        return ("há vaga livre (small=%d big=%d), mas não na lane que este"
+                " sweep pede: candidatos small=%d big=%d, sem vaga pra lane %s"
+                " — backpressure de FORMA (demanda x capacidade no formato"
+                " errado), não falta de capacidade. %d construível(is) na"
+                " fila: %s"
+                % (slots["small"], slots["big"], candidates["small"], candidates["big"],
+                   _starved_lanes(slots, candidates), len(stuck), ids))
+    # "both_empty"
+    return ("pool cheio: nenhuma vaga em nenhuma lane (small=%d big=%d) — %d"
+            " construível(is) normalmente na fila atrás de capacidade cheia,"
+            " NÃO é falha: %s"
+            % (slots["small"], slots["big"], len(stuck), ids))
+
+
+def _saturation_summary(reason, slots, candidates):
+    """Short phrase for the ✅ success-path recap (main(), 'elif notes:' branch)
+    — same 3-way branch as _saturation_note(), terser. ga-zkxdw attempt 5
+    GATE-FEEDBACK: this line said "Pool saturado (slots cheios)" unconditionally
+    with NO numbers at all — even less checkable than the inline note it
+    referred back to. Every branch below carries the numbers it claims. Same
+    caller contract as _saturation_note(): `reason` must come from
+    _saturation_reason(), never None."""
+    if reason == "zero_candidates":
+        return ("Zero candidatos neste sweep (slots small=%d big=%d livres)"
+                % (slots["small"], slots["big"]))
+    if reason == "wrong_lane":
+        return ("Vaga na lane errada (slots small=%d big=%d, candidatos"
+                " small=%d big=%d)"
+                % (slots["small"], slots["big"], candidates["small"], candidates["big"]))
+    return "Pool cheio (slots small=%d big=%d)" % (slots["small"], slots["big"])
+
+
+def _last_sweep_boundary(lines):
+    """Scan the shared PILOT_LOG snapshot `lines` (see _read_pilot_log_tail)
+    backward for the most recent sweep boundary marker. Returns (kind, line)
+    with kind 'start' or 'complete', or None if `lines` is None or no boundary
+    is visible. Shared by _sweep_in_flight()/_sweep_in_flight_elapsed_min() so
+    both agree on exactly which line the current sweep's state comes from —
+    scanning the SAME in-memory list twice here is safe (no new file read);
+    only re-reading PILOT_LOG itself would reintroduce the TOCTOU attempt 3
+    fixed."""
+    if lines is None:
+        return None
+    for line in reversed(lines):
+        if "=== Pilot sweep complete" in line:
+            return ("complete", line)
+        if "=== Pilot sweep start" in line:
+            return ("start", line)
+    return None
+
+
+def _sweep_in_flight(lines):
+    """True if the shared PILOT_LOG snapshot `lines`' (see _read_pilot_log_tail
+    — the SAME snapshot passed to _pilot_slots()/_pilot_candidates() for this
+    verdict) most recent sweep boundary marker is a START with no matching
+    COMPLETE after it — i.e. a sweep is currently running.
+
+    ga-zkxdw DEFEITO 2: pilot-dispatcher.sh sweeps take ~5-6min end to end. A
+    stuck-queue snapshot taken mid-sweep sees 'dispatched=0' simply because the
+    sweep hasn't reached those candidates yet, not because anything was skipped
+    (measured live: re-checked at 21:38 with the lane fixed by defeito-1's own
+    criteria, still false ❌ — the sweep that started 21:34:54 went on to
+    dispatch 6 beads by 21:42). Matches ANY of the 3 '=== Pilot sweep complete'
+    variants the dispatcher emits (normal / cota-paused / gate-congested-deferred).
+
+    GATE-FEEDBACK on ga-zkxdw attempt 2: this used to do its own independent
+    `_sh(tail)` read — a third live read racing the two inside
+    _current_sweep_lines(), able to observe a LATER sweep than _pilot_slots()/
+    _pilot_candidates() did. Taking `lines` as a parameter instead closes that:
+    same snapshot, so this can never disagree with the other two about which
+    sweep is "current".
+
+    Returns None if `lines` is None/unreadable — caller must NOT suppress a
+    real stall on unknown; only a POSITIVELY-observed in-flight sweep may
+    downgrade a fail to a warn (same fail-open convention as _pilot_slots()) —
+    AND, per attempt 4, only for as long as that sweep's own elapsed time stays
+    within SWEEP_IN_FLIGHT_BUDGET_MIN (see _sweep_in_flight_elapsed_min)."""
+    b = _last_sweep_boundary(lines)
+    if b is None:
+        return None
+    return b[0] == "start"
+
+
+def _sweep_in_flight_elapsed_min(lines):
+    """When the current sweep IS in flight (per _last_sweep_boundary — the
+    SAME shared `lines` snapshot as _sweep_in_flight()), minutes elapsed since
+    ITS OWN '=== Pilot sweep start' timestamp. Returns None when: `lines` is
+    None, the most recent boundary is a completion (nothing in flight), no
+    boundary is visible at all, or the start line's timestamp can't be parsed
+    — caller must treat None as NOT MEASURED, never as "still fresh".
+
+    GATE-FEEDBACK on ga-zkxdw attempt 3 (reviewer FAIL, 2026-08-03):
+    _sweep_in_flight() correctly detects WHETHER a sweep is running but never
+    checked HOW LONG — a hung sweep (deadlock, stuck subprocess, stuck retry
+    loop) that logs 'start' and never reaches 'complete' downgraded every
+    subsequent FAIL to WARN forever, trusting "in flight is transient (~5-6min)"
+    without checking the timestamp already sitting on the boundary line that
+    would falsify it. Deliberately keyed on the START line's OWN timestamp, not
+    the tail's last line — pilot-dispatcher.sh keeps emitting incidental
+    progress lines (e.g. repeated 'In-flight: ...') during a stuck retry, which
+    would otherwise make a hung sweep look perpetually recent to a last-line
+    heartbeat check."""
+    b = _last_sweep_boundary(lines)
+    if b is None or b[0] != "start":
+        return None
+    import re, datetime
+    mt = re.match(r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\]", b[1])
+    if not mt:
+        return None
+    try:
+        dt = datetime.datetime.strptime(mt.group(1), "%Y-%m-%d %H:%M:%S")
+        return max(0.0, (NOW - dt.timestamp()) / 60.0)
+    except Exception:
+        return None
 
 
 def check_pilot():
@@ -492,7 +786,14 @@ def main():
     g = check_gate()
     p = check_pilot()
     d = check_dolt()
-    slots = _pilot_slots()
+    # ga-zkxdw attempt 2 GATE-FEEDBACK: read PILOT_LOG's tail ONCE here and
+    # thread the SAME immutable snapshot into all three sweep-aware signals —
+    # they must never each fetch their own reading (see _read_pilot_log_tail).
+    pilot_log_lines = _read_pilot_log_tail()
+    slots = _pilot_slots(pilot_log_lines)
+    candidates = _pilot_candidates(pilot_log_lines)
+    sweep_in_flight = _sweep_in_flight(pilot_log_lines)
+    sweep_elapsed_min = _sweep_in_flight_elapsed_min(pilot_log_lines)
 
     fails, warns, notes = [], [], []
 
@@ -503,32 +804,63 @@ def main():
         warns.append("não consegui classificar %d bead(s) (bd show falhou): %s"
                      % (len(a["read_err"]), ", ".join(str(x) for x in a["read_err"][:8])))
 
-    # ga-wmrr: a construível queued behind a FULLY saturated pool (0 slots free
-    # in EVERY lane) has nowhere to go regardless of its own lane — that is
-    # healthy high-demand queueing (the reported HÍGIDO-e-CHEIO incident), not a
-    # silent stall. Only report a real ❌ when some lane still has room and the
-    # queue didn't use it (a genuine skip: empty routed_to, or a dispatch bug).
-    pool_saturated = bool(slots) and slots["small"] <= 0 and slots["big"] <= 0
+    # ga-wmrr/ga-zkxdw: a construível queued behind a pool saturated FOR ITS OWN
+    # LANE has nowhere to go regardless of what the OTHER lane has free — that is
+    # healthy high-demand queueing, not a silent stall. Only report a real ❌ when
+    # some lane BOTH has room AND has a candidate wanting it, and the queue didn't
+    # use it (a genuine skip: empty routed_to, or a dispatch bug) — see
+    # _pool_saturated() for the lane-aware logic (ga-zkxdw DEFEITO 1).
+    pool_saturated = _pool_saturated(slots, candidates)
+    # ga-zkxdw attempt 5 GATE-FEEDBACK: same two inputs, classified ONCE here and
+    # threaded into both message sites below (the inline note + the ✅ summary
+    # recap), so the two can never name a different cause than pool_saturated's
+    # own verdict or than each other.
+    saturation_reason = _saturation_reason(slots, candidates)
+
+    # ga-zkxdw attempt 4 GATE-FEEDBACK: a positively in-flight sweep may only
+    # justify downgrading FAIL->WARN for as long as ITS OWN elapsed time stays
+    # within budget — otherwise a hung sweep (deadlock, stuck subprocess) reads
+    # as "please wait" forever. sweep_elapsed_min is None whenever the start
+    # timestamp can't be read at all — that is NOT MEASURED, never "still
+    # fresh", so it expires the wait too (na dúvida, FLAGA).
+    sweep_wait_expired = (sweep_in_flight is True) and (
+        sweep_elapsed_min is None or sweep_elapsed_min > SWEEP_IN_FLIGHT_BUDGET_MIN)
 
     if a["stuck"] and (p.get("alive") is not False):
         if pool_saturated:
-            notes.append(
-                "pool saturado (slots small=%d big=%d) — %d construível(is) normalmente"
-                " na fila atrás de slots cheios, NÃO é falha: %s"
-                % (slots["small"], slots["big"], len(a["stuck"]),
-                   ", ".join("%s/%s" % (s["rig"], s["id"]) for s in a["stuck"][:6])))
-        elif a.get("from_dispatchable"):
-            fails.append(
-                "%d bead(s) CONSTRUÍVEIS na fila do Pilot, 0 em build (pilot vivo): %s"
-                % (len(a["stuck"]),
+            notes.append(_saturation_note(saturation_reason, slots, candidates, a["stuck"]))
+        elif sweep_in_flight and not sweep_wait_expired:
+            # ga-zkxdw DEFEITO 2: a sweep takes ~5-6min; a snapshot taken mid-sweep
+            # cannot distinguish "skipped" from "not reached yet" — genuinely
+            # uncertain, not a confirmed ✅ NOR a confirmed ❌ (bounded by budget,
+            # attempt 4 — see sweep_wait_expired above).
+            warns.append(
+                "%d bead(s) construível(is) na fila, sweep do Pilot AINDA EM VOO"
+                " há %.0fmin (dentro do orçamento de %dmin) — aguardando conclusão"
+                " antes de julgar stall: %s"
+                % (len(a["stuck"]), sweep_elapsed_min, SWEEP_IN_FLIGHT_BUDGET_MIN,
                    ", ".join("%s/%s" % (s["rig"], s["id"]) for s in a["stuck"][:6])))
         else:
-            # fallback path
-            fails.append(
-                "%d bead(s) APROVADA(s) parada(s) em silêncio (pilot vivo, fallback story:approved): %s"
-                % (len(a["stuck"]),
-                   ", ".join("%s/%s (%s)" % (s["rig"], s["id"], s.get("reason", "?"))
-                             for s in a["stuck"][:6])))
+            reason = ""
+            if sweep_wait_expired:
+                reason = ((" [sweep em voo há %.0fmin, acima do orçamento de %dmin —"
+                          " tratando como stall, não espera]"
+                          % (sweep_elapsed_min, SWEEP_IN_FLIGHT_BUDGET_MIN))
+                         if sweep_elapsed_min is not None else
+                         (" [sweep em voo, mas timestamp do 'sweep start' ilegível —"
+                          " não medido; tratando como stall em vez de esperar sem teto]"))
+            if a.get("from_dispatchable"):
+                fails.append(
+                    "%d bead(s) CONSTRUÍVEIS na fila do Pilot, 0 em build (pilot vivo)%s: %s"
+                    % (len(a["stuck"]), reason,
+                       ", ".join("%s/%s" % (s["rig"], s["id"]) for s in a["stuck"][:6])))
+            else:
+                # fallback path
+                fails.append(
+                    "%d bead(s) APROVADA(s) parada(s) em silêncio (pilot vivo, fallback story:approved)%s: %s"
+                    % (len(a["stuck"]), reason,
+                       ", ".join("%s/%s (%s)" % (s["rig"], s["id"], s.get("reason", "?"))
+                                 for s in a["stuck"][:6])))
 
     # --- Gate check ---
     if g.get("read_err"):
@@ -568,16 +900,23 @@ def main():
         print("FILA DO PILOT (dispatchable%s): %d total"
               % ((" — " + snap_note) if snap_note else "", a["total"]))
         if slots:
-            print("  • slots do Pilot: small=%d livre(s)   big=%d livre(s)"
-                  % (slots["small"], slots["big"]))
+            cand_note = (("   • candidatos do Pilot: small=%d big=%d" % (candidates["small"], candidates["big"]))
+                        if candidates else "")
+            print("  • slots do Pilot: small=%d livre(s)   big=%d livre(s)%s"
+                  % (slots["small"], slots["big"], cand_note))
         print("  • parked (needs-human/on-device/blocked/já-no-gate): %d (já-construídas-no-gate: %d)"
               "   • genuinamente construíveis: %d   • em build agora (in-flight): %d   • held: %d"
               % (a["parked_count"], a.get("in_gate_count", 0),
                  a["buildable_count"], a["flowing_count"], a["held_count"]))
         if a["stuck"]:
+            # ga-zkxdw item 3: show each stuck bead's own lane inline — previously
+            # the reader had to cross-reference the bead's labels separately to see
+            # whether a free slot was even the right shape for it.
             print("  • CONSTRUÍVEIS MAS PARADAS (%d): %s"
                   % (len(a["stuck"]),
-                     ", ".join("%s/%s" % (s["rig"], s["id"]) for s in a["stuck"][:8])))
+                     ", ".join("%s/%s%s" % (s["rig"], s["id"],
+                                            "(lane:%s)" % s["lane"] if s.get("lane") else "")
+                               for s in a["stuck"][:8])))
     else:
         # Fallback display
         ok_r = a.get("_ok_reasons", {})
@@ -633,8 +972,8 @@ def main():
                   % ("ocioso correto" if not building_now else "fila dispatchable parqueada (mas há build ativo acima)",
                      a["parked_count"]))
         elif notes:
-            print("  Pool saturado (slots cheios) — construíveis na fila normal atrás de capacidade"
-                  " (ver nota ℹ️ acima). Alta demanda saudável, não travamento.")
+            print("  %s (ver nota ℹ️ acima). Alta demanda saudável, não travamento."
+                  % _saturation_summary(saturation_reason, slots, candidates))
         else:
             print("  Nenhuma construível parada em silêncio; gate fluindo ou ocioso-com-fila-vazia;"
                   " pilot e Dolt vivos.")

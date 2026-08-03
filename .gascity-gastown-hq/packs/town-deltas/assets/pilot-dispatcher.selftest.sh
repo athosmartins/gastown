@@ -3956,6 +3956,54 @@ else
   bad "_filter_built gate:needs-fix exemption broke (got: '$FB_NF')"
 fi
 
+# ── Scenario ga-ltjdx: the SAME branch-veto exemption above, widened to gate:fix-attempt:N ──
+# Bug ga-ltjdx: the combine-step OR just above (built_ids exemption) checked ONLY the
+# literal "gate:needs-fix" label — narrower than the _bounced computation in the
+# gate-marker consultation below (ga-d3eg2 already widened THAT one to also match
+# gate:fix-attempt:N). A bead bounced via fix-attempt:N alone (gate:fix-attempt:1 +
+# gate-sha-failed:<sha>, no gate:needs-fix — exactly what a gate FAIL leaves behind)
+# correctly avoided ingate_ids, but still lost to THIS narrower check whenever its own
+# fix branch existed — the normal, expected state of a bead mid gate-fix-loop. Measured
+# live (ga-ub8yq): excluded from EVERY sweep, no fixer ever (re-)dispatched, P0 stalled
+# 15h. (ga-ltjdx-1)/(ga-ltjdx-3) are the bug's own Fixture 1 + Fixture CONTROLE;
+# (ga-ltjdx-2) is Fixture 2 (the ga-htjni double-dispatch boundary, enforced
+# independently by ingate_ids — unchanged by this fix). Fixture 4 (orphan branch) is
+# already covered below by Scenario ga-rcees, which re-extracts _filter_built fresh
+# (this fix's edit) against real orphan/merged/recent branch shapes with no
+# fix-attempt/needs-fix label on any fixture bead — confirming this widening cannot
+# regress orphan classification, which lives entirely upstream of built_ids.
+FB_FA1="$(eval "$_FB_FN"; export PILOT_TEST_BRANCH_BEADS="wa-built wa-fa1" PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS=""
+  printf '%s' '[{"id":"wa-built","labels":["story:approved"]},{"id":"wa-fa1","labels":["story:approved","gate:fix-attempt:1"]},{"id":"wa-fresh","labels":[]}]' \
+    | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
+if [ "$FB_FA1" = '["wa-fa1","wa-fresh"]' ]; then
+  ok "_filter_built(ga-ltjdx-1): gate:fix-attempt:N alone (needs-fix absent) + own branch + zero active marker → kept (ga-ub8yq shape; plain built still dropped)"
+else
+  bad "_filter_built(ga-ltjdx-1): fix-attempt-only branched bead wrongly dropped by branch veto — DEADLOCK regression (got: '$FB_FA1')"
+fi
+# (ga-ltjdx-2) boundary: SAME shape, but a marker is ACTIVELY re-gating it right now →
+# MUST stay vetoed. ingate_ids (untouched by this fix) enforces this independently of
+# the built_ids carve-out just widened above.
+FB_FA2="$(eval "$_FB_FN"; export PILOT_TEST_BRANCH_BEADS="wa-fa2" PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS="wa-fa2"
+  printf '%s' '[{"id":"wa-fa2","labels":["story:approved","gate:fix-attempt:1"]},{"id":"wa-fresh","labels":[]}]' \
+    | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
+if [ "$FB_FA2" = '["wa-fresh"]' ]; then
+  ok "_filter_built(ga-ltjdx-2): gate:fix-attempt:N + branch + ACTIVE marker → still dropped (actively re-gating; no double-dispatch)"
+else
+  bad "_filter_built(ga-ltjdx-2): actively-regated fix-attempt+branch bead leaked — ga-htjni double-dispatch regression (got: '$FB_FA2')"
+fi
+# (ga-ltjdx-3) control: branch exists but NO gate label at all (no fix-attempt, no
+# needs-fix) → MUST stay vetoed. Proves the widened carve-out stays scoped to proof of
+# a prior gate FAIL, not "branch exists is never a veto" — which would reopen the
+# ga-6jqr/ga-htjni double-dispatch hole this filter exists to close.
+FB_FA3="$(eval "$_FB_FN"; export PILOT_TEST_BRANCH_BEADS="wa-fa3" PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS=""
+  printf '%s' '[{"id":"wa-fa3","labels":["story:approved"]},{"id":"wa-fresh","labels":[]}]' \
+    | _filter_built | jq -rc '[.[].id]' 2>/dev/null)"
+if [ "$FB_FA3" = '["wa-fresh"]' ]; then
+  ok "_filter_built(ga-ltjdx-3) control: branch exists, no gate label at all → still dropped (carve-out correctly scoped, not over-widened)"
+else
+  bad "_filter_built(ga-ltjdx-3) control: carve-out over-widened — bare branched bead leaked (got: '$FB_FA3')"
+fi
+
 # ── Scenario 22g-gate: _filter_built is GATE-MARKER-AWARE (wa-8y45 leak fix) ──────────
 # ROOT of the wa-8y45 leak: _filter_built decided "built?" ONLY by crew-branch existence.
 # When the gate parks a marker at needs-rebase/error it PRUNES the branch, so the git probe
@@ -3988,6 +4036,26 @@ FB_NF2="$(_fb "wa-rf" "" '[{"id":"wa-rf","labels":["story:approved","gate:needs-
 FB_NF3="$(_fb "wa-rq" "wa-rq" '[{"id":"wa-rq","labels":["story:approved","gate:needs-fix"]},{"id":"wa-fresh","labels":["ctx:ready"]}]')"
 [ "$FB_NF3" = '["wa-fresh"]' ] && ok "_filter_built(ii-b): gate:needs-fix + ACTIVE marker → dropped (actively re-gating, don't double-dispatch)" \
                                || bad "_filter_built(ii-b): actively-regated needs-fix bead leaked (got: '$FB_NF3')"
+# (ii-fa) ga-d3eg2: gate:fix-attempt:N ALONE (needs-fix ABSENT — the measured ga-xv78c
+# shape: a single mutation stripped gate:needs-fix while gate:fix-attempt:1 survived)
+# with only a failed/error marker (non-active) → STILL dispatchable, same carve-out as
+# (ii). Without this, _filter_built drops the bead here — UPSTREAM of dispatch_one() —
+# so it never even reaches _ownership_guard_should_refuse for its own (already-fixed)
+# gate:fix-attempt:N carve-out to matter (confirmed live: pilot-dispatcher.log showed
+# "EXCLUÍDO ga-xv78c por _filter_built: gate:* lifecycle label present" on 2026-08-03).
+FB_NF2_FA="$(_fb "wa-rf2" "" '[{"id":"wa-rf2","labels":["gate:queued","gate:fix-attempt:1"]},{"id":"wa-fresh","labels":["ctx:ready"]}]')"
+[ "$FB_NF2_FA" = '["wa-rf2","wa-fresh"]' ] && ok "_filter_built(ii-fa): gate:fix-attempt:N alone (needs-fix absent) + only failed marker → kept (ga-d3eg2 fix; the exact ga-xv78c shape)" \
+                                            || bad "_filter_built(ii-fa): ga-d3eg2 fix-attempt-only bead wrongly dropped — DEADLOCK regression (got: '$FB_NF2_FA')"
+# (ii-fa-b) carve-out BOUNDARY: gate:fix-attempt:N WITH an active marker (re-queued) → dropped.
+FB_NF3_FA="$(_fb "wa-rq2" "wa-rq2" '[{"id":"wa-rq2","labels":["gate:queued","gate:fix-attempt:1"]},{"id":"wa-fresh","labels":["ctx:ready"]}]')"
+[ "$FB_NF3_FA" = '["wa-fresh"]' ] && ok "_filter_built(ii-fa-b): gate:fix-attempt:N + ACTIVE marker → dropped (actively re-gating, don't double-dispatch)" \
+                                  || bad "_filter_built(ii-fa-b): actively-regated fix-attempt bead leaked (got: '$FB_NF3_FA')"
+# (ii-fa-c) control: bare gate:queued, NO fix-attempt, NO needs-fix → still dropped
+# (mirrors Scenario ga-d3eg2(2)'s ownership-guard control — carve-out stays scoped to
+# proof-of-a-prior-FAIL, not "any gate:* label").
+FB_QONLY="$(_fb "" "" '[{"id":"wa-qonly","labels":["gate:queued"]},{"id":"wa-fresh","labels":["ctx:ready"]}]')"
+[ "$FB_QONLY" = '["wa-fresh"]' ] && ok "_filter_built(ii-fa-c) control: bare gate:queued (no fix-attempt/needs-fix) STILL dropped — carve-out correctly scoped (got: '$FB_QONLY')" \
+                                 || bad "_filter_built(ii-fa-c) control: carve-out over-widened — bare gate:queued bead leaked (got: '$FB_QONLY')"
 # (iii) normal fresh bead, no marker, no branch, no gate label → still a candidate.
 FB_F="$(_fb "" "" '[{"id":"wa-fresh","labels":["story:approved"]}]')"
 [ "$FB_F" = '["wa-fresh"]' ] && ok "_filter_built(iii): fresh bead (no marker/branch/gate-label) → kept as candidate" \
@@ -4074,6 +4142,123 @@ case "$OG_CTL" in
   *branch:fix/wa-built-test*) ok "ownership guard STILL refuses a plain branched bead, now with the REAL matched ref (ga-htjni double-dispatch guard intact; ga-8jxe1 AC2 evidence not hardcoded) (got: '$OG_CTL')" ;;
   *) bad "ownership guard no longer refuses a plain branched bead — ga-htjni regression (got: '$OG_CTL')" ;;
 esac
+
+# ── Scenario ga-d3eg2: gate:fix-attempt:N alone also exempts signal (a) ─────────
+# Bug ga-d3eg2 (measured 2026-08-03, ga-xv78c): the gate:needs-fix carve-out above
+# is keyed on a LABEL, and dolt_diff_labels forensics on the live incident proved a
+# single commit stripped gate:failed + gate:needs-fix together (root mechanism not
+# attributable to any daemon script found in this repo) while gate:fix-attempt:1
+# and gate-sha-failed:<sha> survived untouched. With needs-fix gone, signal (a) fell
+# through to _beadid_branch_signal, which blocks any unmerged branch until it is
+# older than PILOT_ORPHAN_BRANCH_STALE_HOURS (48h default) — refusing the bead on
+# EVERY sweep for the rest of that window (measured: ~20h, until a human hand-fixed
+# the label). gate:fix-attempt:N is exactly as durable a "this bead is in the
+# gate-fix loop" fingerprint as gate:needs-fix (see _ns_label_blocks_release's own
+# doc below: both persist "across a bead's ENTIRE redispatch cycle by design") —
+# (1)-(2) prove the widened carve-out fires on it alone and stays correctly scoped;
+# (3)-(4) prove it does NOT bypass the independent liveness signals (b)/(d), so a
+# genuinely-live crew owner or an actively-gating marker still refuses (the bug's
+# own AC2/AC3 fixtures — must not trade the deadlock for the ga-htjni double-dispatch
+# it was designed to prevent); (5) proves the glob match survives the documented
+# multi-fix-attempt-label residue shape (a different hazard class than the
+# sed-substitution bug _ns_label_blocks_release's own doc warns about).
+echo "Scenario ga-d3eg2: ownership guard exempts gate:fix-attempt:N (needs-fix ABSENT) from the branch-exists refusal"
+
+# (1) gate:fix-attempt:1 alone (no gate:needs-fix) + branch → signal (a) suppressed → NOT refused.
+OG_D3EG2_1="$( bd() { echo ""; }; eval "$_OG_FNS"
+  export PILOT_TEST_CREW_BRANCH_BEADS="ga-d3eg2-fa" _DEADWORKER_OK=0 \
+         PILOT_TEST_BRANCH_MERGED_BEADS="" PILOT_TEST_ORPHAN_BRANCH_BEADS=""
+  _ownership_guard_should_refuse "ga-d3eg2-fa" '{"labels":["story:approved","gate:fix-attempt:1"]}' "/nonexistent" 2>/dev/null
+  printf 'rc=%s' "$?" )"
+case "$OG_D3EG2_1" in
+  *branch:*) bad "ga-d3eg2(1): ownership guard STILL refuses a gate:fix-attempt:N bead (needs-fix ABSENT) on its own branch (got: '$OG_D3EG2_1') — the exact ga-xv78c deadlock shape: needs-fix stripped, fix-attempt survives, guard still blocks every sweep" ;;
+  *rc=1*)    ok  "ga-d3eg2(1): ownership guard does NOT refuse a gate:fix-attempt:N bead despite needs-fix being absent (fix — measured ga-xv78c shape)" ;;
+  *)         bad "ga-d3eg2(1): unexpected ownership-guard result for gate:fix-attempt:N-only bead (got: '$OG_D3EG2_1')" ;;
+esac
+
+# (2) control — bare gate:queued, NO fix-attempt, NO needs-fix (never proven through a
+# gate FAIL) → STILL refuses. Proves the widened carve-out did not become "any gate:*
+# label" or "no live claim generically" — that would reopen the ga-6jqr/ga-htjni
+# push-then-metadata-lag double-dispatch race (a branch pushed moments ago, assignee
+# not yet set — see Scenario ga-8jxe1(a3) below, same protection, same shape).
+OG_D3EG2_2="$( bd() { echo ""; }; eval "$_OG_FNS"
+  export PILOT_TEST_CREW_BRANCH_BEADS="ga-d3eg2-qonly" _DEADWORKER_OK=0 \
+         PILOT_TEST_BRANCH_MERGED_BEADS="" PILOT_TEST_ORPHAN_BRANCH_BEADS=""
+  _ownership_guard_should_refuse "ga-d3eg2-qonly" '{"labels":["story:approved","gate:queued"]}' "/nonexistent" 2>/dev/null
+  printf 'rc=%s' "$?" )"
+case "$OG_D3EG2_2" in
+  *branch:fix/ga-d3eg2-qonly-test*) ok "ga-d3eg2(2) control: a bare gate:queued bead (no fix-attempt, no needs-fix) STILL refuses on branch — carve-out correctly scoped, push-lag protection not weakened (got: '$OG_D3EG2_2')" ;;
+  *) bad "ga-d3eg2(2) control: carve-out over-widened — a bare gate:queued bead with no gate-FAIL history was wrongly allowed (got: '$OG_D3EG2_2') — this would reopen the ga-6jqr/ga-htjni push-then-metadata-lag race" ;;
+esac
+
+# (3)-(4) need signal (d) live (not stubbed away), so extract it fresh alongside the
+# real guard rather than reusing _OG_FNS (which only carries the branch-signal chain).
+_OG_D3EG2_FN="$(awk '/^_ownership_guard_should_refuse\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_GATE_D3EG2_FN="$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+[ -n "$_OG_D3EG2_FN" ] && [ -n "$_GATE_D3EG2_FN" ] \
+  || bad "ga-d3eg2: failed to extract _ownership_guard_should_refuse/_beadid_has_active_gate_artifact from $DISPATCHER — awk markers drifted"
+
+# (3) Fixture 2 (ga-d3eg2 AC): gate:fix-attempt:1 present, but a FRESH read shows a
+# LIVE named-crew owner → signal (b) still refuses. Proves the carve-out (which also
+# forces _has_pilot_fp=1, skipping signal (c)'s checks) does not bypass (b), which is
+# unconditional — "must continue refusing (don't trade deadlock for double-dispatch,
+# the ga-htjni original bug)" per the bug's own acceptance criteria.
+OG_D3EG2_3="$(
+  eval "$_OG_D3EG2_FN"; eval "$_GATE_D3EG2_FN"
+  SELF_BEAD_ID=""; _DEADWORKER_OK=1
+  bd() { [[ "$*" == *" show "* ]] && printf '%s' '{"id":"ga-d3eg2-live","assignee":"peter-wa-live123","status":"in_progress","labels":["gate:fix-attempt:1"],"metadata":{}}' || :; }
+  _beadid_has_crew_branch()               { return 1; }   # not under test here
+  _beadid_branch_signal()                 { return 1; }   # not under test here (carve-out skips it anyway)
+  _beadid_mentioned_in_attached_session() { return 1; }   # isolate (e)
+  _beadid_has_active_gate_artifact()      { return 1; }   # isolate (d)
+  _session_is_live() { [ "$1" = "peter-wa-live123" ]; }
+  _ownership_guard_should_refuse "ga-d3eg2-live" '{"labels":["gate:fix-attempt:1"],"assignee":""}' "ignored-db"
+)"
+case "$OG_D3EG2_3" in
+  owner:peter-wa-live123) ok "ga-d3eg2(3): a gate:fix-attempt:N bead with a LIVE external crew owner is STILL refused (Fixture 2 preserved — got: '$OG_D3EG2_3')" ;;
+  *) bad "ga-d3eg2(3): gate:fix-attempt:N carve-out leaked past signal (b) — a live crew owner was NOT refused (got: '$OG_D3EG2_3') — reopens ga-htjni double-dispatch" ;;
+esac
+
+# (4) Fixture 3 (ga-d3eg2 AC): gate:fix-attempt:1 present, AND an active gate
+# marker/run IS gating the branch RIGHT NOW → signal (d) still refuses (it runs
+# unconditionally, independent of the case-statement carve-out above it).
+OG_D3EG2_4="$(
+  eval "$_OG_D3EG2_FN"; eval "$_GATE_D3EG2_FN"
+  SELF_BEAD_ID=""; _DEADWORKER_OK=1
+  bd() { [[ "$*" == *" show "* ]] && printf '%s' '{"id":"ga-d3eg2-gating","assignee":"","status":"open","labels":["gate:fix-attempt:1"],"metadata":{}}' || :; }
+  _beadid_has_crew_branch()               { return 1; }
+  _beadid_branch_signal()                 { return 1; }
+  _beadid_mentioned_in_attached_session() { return 1; }
+  _beadid_has_active_gate_artifact()      { return 0; }   # ACTIVE marker/run — under test
+  _session_is_live()                      { return 1; }
+  _ownership_guard_should_refuse "ga-d3eg2-gating" '{"labels":["gate:fix-attempt:1"],"assignee":""}' "ignored-db"
+)"
+[ "$OG_D3EG2_4" = "gating:active" ] \
+  && ok "ga-d3eg2(4): a gate:fix-attempt:N bead with an ACTIVE gate marker/run is STILL refused (Fixture 3 preserved — got: '$OG_D3EG2_4')" \
+  || bad "ga-d3eg2(4): gate:fix-attempt:N carve-out leaked past signal (d) — an active gate artifact was NOT refused (got: '$OG_D3EG2_4') — reopens the wa-0hnsi gate-handoff race"
+
+# (5) TWO coexisting gate:fix-attempt:N labels (documented transient residue — see
+# _ns_label_blocks_release's doc: "a transient Dolt hiccup ... leaves the stale label
+# behind"). A case/glob presence match has none of the adjacent-delimiter-consumption
+# hazard that sed-substitution removal has (a DIFFERENT operation) — confirm directly
+# rather than assume.
+OG_D3EG2_5="$( bd() { echo ""; }; eval "$_OG_FNS"
+  export PILOT_TEST_CREW_BRANCH_BEADS="ga-d3eg2-multi" _DEADWORKER_OK=0 \
+         PILOT_TEST_BRANCH_MERGED_BEADS="" PILOT_TEST_ORPHAN_BRANCH_BEADS=""
+  _ownership_guard_should_refuse "ga-d3eg2-multi" '{"labels":["story:approved","gate:fix-attempt:1","gate:fix-attempt:2"]}' "/nonexistent" 2>/dev/null
+  printf 'rc=%s' "$?" )"
+case "$OG_D3EG2_5" in
+  *branch:*) bad "ga-d3eg2(5): TWO coexisting gate:fix-attempt:N labels (documented transient-residue shape) broke the carve-out match (got: '$OG_D3EG2_5')" ;;
+  *rc=1*)    ok  "ga-d3eg2(5): carve-out match is robust to two coexisting gate:fix-attempt:N labels (glob match, not the sed-substitution hazard class)" ;;
+  *)         bad "ga-d3eg2(5): unexpected result with two fix-attempt labels (got: '$OG_D3EG2_5')" ;;
+esac
+
+# Structural drift-guard: the widened pattern itself is present in source.
+if grep -qF '*,gate:needs-fix,*|*,gate:fix-attempt:*,*)' "$DISPATCHER"; then
+  ok "ga-d3eg2: dispatcher source carries the widened gate:fix-attempt:N carve-out pattern (drift-guard)"
+else
+  bad "ga-d3eg2: widened carve-out pattern not found in dispatcher source — drifted or reverted"
+fi
 
 # ── Scenario ga-8jxe1: branch-exists ≠ in-flight (AC1/AC3) ──────────────────────
 # Bug ga-8jxe1: signal (a) treated ANY matched crew/fix branch as a permanent

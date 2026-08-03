@@ -17,10 +17,14 @@
 # unmerged local-only branches are LEFT, never auto-deleted — no data loss).
 #
 # SAFETY: uses `git worktree remove` WITHOUT --force, so a worktree with UNCOMMITTED
-# changes (a live long-running build's WIP) is REFUSED/skipped — only CLEAN stale
-# worktrees are reaped. Age gate protects anything touched recently. Pressure mode
-# lowers the age gate when disk is genuinely low. Branch deletion is merged-only.
-# Kill switch: WORKTREE_REAPER_ENABLED=0.
+# changes (a live long-running build's WIP) is REFUSED by the plain path below — but an
+# aged, UNLOCKED, dirty pool worktree then falls through to preserve_and_reap_dirty(),
+# which snapshots the WIP to a commit object, confirms it landed on origin (own branch
+# name, else refs/reclaimed/<label>/<sha>), and ONLY THEN force-removes. If durability
+# can't be confirmed, the worktree is left byte-for-byte as it was — still dirty, so the
+# next sweep refuses it again too; nothing is ever removed on an unconfirmed guess. Age
+# gate protects anything touched recently. Pressure mode lowers the age gate when disk is
+# genuinely low. Branch deletion is merged-only. Kill switch: WORKTREE_REAPER_ENABLED=0.
 set -uo pipefail
 GT="${WORKTREE_REAPER_GT:-/Users/athos/gt}"   # overridable for the selftest (temp repo)
 WT_DIR="$GT/.gc-worktrees"
@@ -45,7 +49,7 @@ gate_hours="$STALE_HOURS"
 mode="normal"
 if [ "$free_gb" -lt "$PRESSURE_FREE_GB" ] 2>/dev/null; then gate_hours="$PRESSURE_HOURS"; mode="pressure"; fi
 
-reaped=0; skipped_dirty=0; kept=0; branches_deleted=0; pool_reaped=0; zombie_reaped=0
+reaped=0; skipped_dirty=0; kept=0; branches_deleted=0; pool_reaped=0; zombie_reaped=0; preserved_dirty=0
 # ga-pdrij: the rig-worktree backlog is LARGE (704 observed — the legacy loop used
 # `git -C $GT` and could never remove rig-owned worktrees, so they piled up). Bound the
 # per-sweep pool reaping so a single run is never a massive destructive operation; the
@@ -78,6 +82,94 @@ delete_merged_local_branch() {
       printf '{"ts":"%s","event":"would_delete_branch","repo":"%s","branch":"%s"}\n' "$(ts)" "$(basename "$repo")" "$br" >> "$LOG" 2>/dev/null
     fi
   fi
+}
+
+# ── preserve_and_reap_dirty <repo> <wt> <br> <age> — ga-xv78c: an UNLOCKED pool
+# worktree that plain `worktree remove` refused is DIRTY (uncommitted/untracked
+# WIP) — the old behavior counted it as skipped_dirty and left it forever, since
+# dirty state never self-clears. 94 subagent trees leaked this way across 5 crews
+# (5.9G), and disk hit 95%, breaking the ITBI pipeline's SQLite. Snapshot the WIP
+# into a commit object via a SCRATCH index (GIT_INDEX_FILE) — the real working tree
+# and index are never touched — push it durable to origin (own branch name if free,
+# else refs/reclaimed/<label>/<sha> — same convention as inflight-reclaim-guard.py's
+# preserve_unpushed_branch), and ONLY THEN force-remove.
+#
+# gate-feedback (fix-attempt 1): the first version did a real `git commit` BEFORE
+# either push was attempted. When both pushes failed, the function correctly
+# returned "kept" — but the worktree was now git-CLEAN (the commit already
+# happened locally), so the very next sweep's plain, non-force `worktree remove`
+# (the branch above this one, in reap_pool_worktrees) silently succeeded and
+# deleted it, logging a routine reaped_pool event indistinguishable from an
+# ordinary clean reap. The WIP was never actually durable anywhere but a local
+# branch ref in the rig's own object DB — exactly the state this feature exists
+# to prevent. Snapshotting into a scratch index instead means a failed push
+# leaves the worktree in its EXACT original state (git status --porcelain
+# byte-for-byte unchanged) — dirty stays dirty, so the plain non-force remove
+# refuses again next sweep too, and preserve is retried rather than silently
+# skipped. (A plain `git stash create` was considered first — it shares the
+# no-mutation property but was verified empirically to silently drop untracked
+# files from the snapshot, which would lose newly-created WIP files even on a
+# successful preserve; the scratch-index approach captures modified, untracked,
+# and deleted paths alike.)
+# Returns 0 (reaped) or 1 (kept/refused — always logged, never silent).
+preserve_and_reap_dirty() {
+  local repo="$1" wt="$2" br="$3" age="$4" label sha tag_ref preserved_to parent tmp_index tree ignored_path
+  git -C "$wt" status --porcelain 2>/dev/null | grep -q . || return 1   # not actually dirty — leave to normal skip
+  parent="$(git -C "$wt" rev-parse HEAD 2>/dev/null)" || return 1
+  tmp_index="$(mktemp)" || return 1
+  # Stage the full current state (modified + untracked + deleted) into a SCRATCH
+  # index via GIT_INDEX_FILE — the real index and working tree are never touched,
+  # so a failed push below leaves nothing to undo.
+  GIT_INDEX_FILE="$tmp_index" git -C "$wt" read-tree HEAD >/dev/null 2>&1
+  GIT_INDEX_FILE="$tmp_index" git -C "$wt" add -A >/dev/null 2>&1
+  # ga-0j2zc: `add -A` only skips .gitignore for NEW/untracked paths — a path that was
+  # tracked BEFORE it became gitignored (e.g. a vendorized/materialized dir like
+  # whatsapp_automation's .gc/) still has its on-disk drift (or deletion) swept in as a
+  # "modification", because gitignore never un-tracks an already-tracked file. Reported
+  # live: a preserve commit carried 166 FILES / 24,021 lines of incidental .gc/ drift
+  # into a crew branch — none of it the crew's own work. Pin every currently-ignored
+  # tracked path back to its HEAD blob in the scratch index (index-only — the real
+  # index/working tree are untouched) so only genuine crew changes — new files, and
+  # modifications/deletions of paths NOT matching the current .gitignore — survive
+  # into the preserve commit.
+  while IFS= read -r ignored_path; do
+    [ -n "$ignored_path" ] || continue
+    GIT_INDEX_FILE="$tmp_index" git -C "$wt" reset -q HEAD -- "$ignored_path" 2>/dev/null
+  done < <(git -C "$wt" ls-files -ci --exclude-standard 2>/dev/null)
+  tree="$(GIT_INDEX_FILE="$tmp_index" git -C "$wt" write-tree 2>/dev/null)"
+  rm -f "$tmp_index"
+  [ -n "$tree" ] || return 1
+  sha="$(git -C "$wt" commit-tree "$tree" -p "$parent" -m "worktree-reaper: preserve before reap (aged+dirty, age=${age}h)" 2>/dev/null)"
+  [ -n "$sha" ] || return 1
+  label="$(basename "$wt")"
+  if [ -n "$br" ] && git -C "$repo" push origin "${sha}:refs/heads/${br}" >/dev/null 2>&1; then
+    preserved_to="refs/heads/${br}"
+  else
+    tag_ref="refs/reclaimed/${label}/${sha}"
+    if git -C "$repo" push origin "${sha}:${tag_ref}" >/dev/null 2>&1; then
+      preserved_to="$tag_ref"
+    else
+      printf '{"ts":"%s","event":"preserve_failed_dirty_kept","repo":"%s","wt":"%s","branch":"%s","age_h":%s}\n' \
+        "$(ts)" "$(basename "$repo")" "$label" "$br" "$age" >> "$LOG" 2>/dev/null
+      return 1
+    fi
+  fi
+  if git -C "$repo" worktree remove --force "$wt" 2>/dev/null; then
+    # The worktree is gone, so $br is no longer checked out anywhere — safe to
+    # force it to the confirmed-durable snapshot now (git refuses this while a
+    # worktree still has the branch checked out). Keeps the local branch in
+    # sync with what was actually pushed, so delete_merged_local_branch's
+    # merged-into-origin/main check below sees the true (unmerged) state
+    # instead of a branch that never moved past its pre-WIP start point.
+    [ -n "$br" ] && git -C "$repo" branch -f "$br" "$sha" >/dev/null 2>&1
+    printf '{"ts":"%s","event":"reaped_dirty_preserved","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"preserved_to":"%s","mode":"%s"}\n' \
+      "$(ts)" "$(basename "$repo")" "$label" "$br" "$age" "$preserved_to" "$mode" >> "$LOG" 2>/dev/null
+    delete_merged_local_branch "$repo" "$br"
+    return 0
+  fi
+  printf '{"ts":"%s","event":"preserve_ok_reap_failed","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"preserved_to":"%s"}\n' \
+    "$(ts)" "$(basename "$repo")" "$label" "$br" "$age" "$preserved_to" >> "$LOG" 2>/dev/null
+  return 1
 }
 
 # ── ZOMBIE-LOCK DETECTION (the fix for wa-8y45) ──────────────────────────────────
@@ -264,8 +356,10 @@ reap_pool_worktrees() {
           pool_reaped=$((pool_reaped+1))
           printf '{"ts":"%s","event":"reaped_pool","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"mode":"%s"}\n' "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$age" "$mode" >> "$LOG" 2>/dev/null
           delete_merged_local_branch "$repo" "$br"
+        elif preserve_and_reap_dirty "$repo" "$wt" "$br" "$age"; then
+          pool_reaped=$((pool_reaped+1)); preserved_dirty=$((preserved_dirty+1))
         else
-          skipped_dirty=$((skipped_dirty+1))   # dirty/locked/live WIP → leave it
+          skipped_dirty=$((skipped_dirty+1))   # dirty/locked/live WIP, or preserve failed → leave it
         fi
         wt=""; br=""; lock=""
         ;;
@@ -341,6 +435,6 @@ for _repo in "$GT"/*/; do
   fi
 done
 
-printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s}\n' \
-  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$branches_deleted" "$skipped_dirty" "$kept" >> "$LOG" 2>/dev/null
+printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"preserved_dirty":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s}\n' \
+  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$preserved_dirty" "$branches_deleted" "$skipped_dirty" "$kept" >> "$LOG" 2>/dev/null
 exit 0
