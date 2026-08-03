@@ -3387,6 +3387,7 @@ rig_content_merged() {
   [ "$n" = "0" ]
 }
 
+# SELFTEST-EXTRACT gate-mergedriver-precheck: BEGIN
 # ── ga-78n2z: union-aware conflict pre-check ──────────────────────────────────
 # GATE_UNION_AWARE_PRECHECK=1 (default ON) makes the merge-tree pre-check honor
 # the `merge=union` gitattributes driver. =0 restores the EXACT legacy behavior
@@ -3399,6 +3400,14 @@ rig_content_merged() {
 # with zero conflict markers because union concatenates both sides). The result
 # was a recurring pile of SPURIOUS needs-rebase escalations for branches whose
 # only conflict is in a union-driver file (wa-40xb, wa-jjea, ...).
+#
+# ga-kjlhk: the fallback below (rig_path_is_union_resolvable) originally only
+# recognized the literal `union` driver name, so any RIG-SPECIFIC custom driver
+# (e.g. WA's `merge=deploydeps`, scripts/merge_deploy_deps.py) fell through as a
+# false "genuine conflict" too — same bug, narrower fix scope than the flag name
+# suggests. Despite the name, GATE_UNION_AWARE_PRECHECK now covers any path with
+# a driver actually registered via `git config merge.<name>.driver`, not just
+# the builtin union.
 GATE_UNION_AWARE_PRECHECK="${GATE_UNION_AWARE_PRECHECK:-1}"
 
 # rig_conflict_paths <main_ref> <branch_ref> — echo the NUL-free newline list of
@@ -3421,21 +3430,31 @@ rig_conflict_paths() {
 }
 
 # rig_path_is_union_resolvable <merge_ref> <path> — return 0 (true) iff <path> is
-# governed by a merge driver that resolves WITHOUT producing conflict markers
-# (currently only the builtin `union`). check-attr is evaluated against the merge
-# context ref (the branch being merged) so .gitattributes as the author sees it is
-# authoritative. Any unset/unspecified/other driver → return 1 (NOT union-safe).
+# governed by a merge driver that resolves WITHOUT producing conflict markers:
+# the builtin `union`, OR any custom driver registered via
+# `git config merge.<name>.driver` (ga-kjlhk — a rig's own driver, e.g. WA's
+# `merge=deploydeps`, is exactly as resolvable as `union`; hardcoding just the
+# one name meant every OTHER custom driver fell through as a false "genuine
+# conflict"). check-attr is evaluated against the merge context ref (the
+# branch being merged) so .gitattributes as the author sees it is
+# authoritative. Any unset/unspecified driver, or a name with no driver
+# actually registered, → return 1 (NOT resolvable; fail-safe — caller
+# escalates as a real conflict rather than risk a false clean).
 rig_path_is_union_resolvable() {
   local merge_ref="$1" path="$2" drv=""
   # `git check-attr` on a tree-ish: use --source (git ≥2.40) to read attributes
   # from <merge_ref> rather than the working tree. Fall back to plain check-attr
   # (working-tree .gitattributes) if --source is unsupported. Conservative on any
-  # failure: empty/err driver → not union → caller escalates as a real conflict.
+  # failure: empty/err driver → not resolvable → caller escalates as a real conflict.
   drv=$(git_rig check-attr --source "$merge_ref" merge -- "$path" 2>/dev/null | sed 's/.*: merge: //' )
   if [ -z "$drv" ] || [ "$drv" = "merge: unspecified" ]; then
     drv=$(git_rig check-attr merge -- "$path" 2>/dev/null | sed 's/.*: merge: //')
   fi
-  [ "$drv" = "union" ]
+  case "$drv" in
+    ""|unspecified|unset|set) return 1 ;;
+    union) return 0 ;;
+    *) git_rig config --get "merge.$drv.driver" >/dev/null 2>&1 ;;
+  esac
 }
 
 # rig_real_merge_is_clean <main_ref> <branch_ref> — perform a REAL throwaway
@@ -3540,6 +3559,7 @@ EOF
   echo "1"
   return 0
 }
+# SELFTEST-EXTRACT gate-mergedriver-precheck: END
 
 # SELFTEST-EXTRACT gate-resolve-rig-context-fn: BEGIN
 # gate_resolve_rig_context — given $RIG and $BEAD_ID, resolve RIG_PATH (+
