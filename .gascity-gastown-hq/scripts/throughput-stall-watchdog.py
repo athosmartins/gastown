@@ -146,6 +146,16 @@ DELIVERY_STALL_HOURS = float(os.environ.get("TSW_DELIVERY_STALL_HOURS", "3"))
 DELIVERY_STALL_MIN_BEADS = int(os.environ.get("TSW_DELIVERY_STALL_MIN_BEADS", "1"))
 DELIVERY_CONFIRM_SWEEPS = int(os.environ.get("TSW_DELIVERY_CONFIRM_SWEEPS", "2"))
 DELIVERY_COOLDOWN_SEC = int(os.environ.get("TSW_DELIVERY_COOLDOWN_SEC", "10800"))  # 3h cooldown
+# ga-u2u8z: gate-queue backlog context for the delivery-stall alarm — mirrors
+# approved-state-reconciler.py's ga-dbfm9 fix for the STARVING alarm (same
+# resource: gate-status:queued type:quality-gate-marker beads in the HQ/CITY
+# store; same depth/throughput/projected-drain-vs-age formula). Kept as a fresh
+# in-file implementation rather than a shared import — ga-dbfm9's own docstring
+# deliberately deferred that extraction until a second real adopter existed; see
+# _gate_queue_suppress_reason()'s docstring for why an exact per-bead queue
+# POSITION (as opposed to aggregate depth) is not computed here either.
+GATE_QUEUE_LOG_TAIL = int(os.environ.get("TSW_GATE_QUEUE_LOG_TAIL", "4000"))
+GATE_QUEUE_WINDOW_MIN = int(os.environ.get("TSW_GATE_QUEUE_WINDOW_MIN", "60"))
 
 # ── imp24: heal-action branch knobs ──────────────────────────────────────────
 # When TSW_HEAL_ENABLED=1, before escalating a confirmed throughput or delivery
@@ -239,6 +249,10 @@ _git_log_count = None          # (root, since_iso) -> int; None = run git
 _bd_backlog = None             # (rig_root) -> list[dict]; None = run bd
 _bd_delivery = None            # (rig_root) -> list[dict]; None = run bd (imp23 delivery)
 _bd_marker_for_bead = None     # (root, bead_id) -> ("found"|"absent"|"error", marker_dict|None); None = run bd (ga-g0v96)
+_bd_gate_queue_markers = None  # () -> list[dict]|None; OPEN gate-status:queued markers, HQ store (ga-u2u8z)
+_read_gate_verdict_log_lines = None  # () -> [str]; tail of quality-gate-dispatcher.log for verdict-throughput
+                                      # (ga-u2u8z; distinct from _read_gate_log_lines above, which is
+                                      # merge_signal's narrower Gate-PASSED-only seam over the same file)
 _bd_sling_state = None         # (sling_id) -> ("live"|"stale"|"absent"|"error", stall_hours|None); None = run bd (ga-ebm7c)
 _do_dolt_cpu = None            # () -> float pct or None; None = run ps (ga-g0v96 headroom annotation)
 _do_notify = None              # (msg, prio) -> None; None = run notify binary
@@ -795,10 +809,26 @@ def _queued_marker_state(root, bead_id):
     [[error-and-empty-must-not-produce-the-same-value]]) even though the
     caller currently treats both the same way (fall back to unexplained): a
     query failure must never be misread as "confirmed no marker exists".
+
+    ga-u2u8z: queries CITY, not the passed-in per-rig `root` — gate markers are
+    ALWAYS created/labeled via `bd -C "$GC_CITY"` by quality-gate-guard.sh and
+    quality-gate-dispatcher.sh, regardless of which rig the source bead belongs
+    to (verified live 2026-08-03: the CITY store holds 137 type:quality-gate-
+    marker beads carrying a source-bead:wa-* label; the whatsapp_automation
+    rig's OWN store has no matching entries under the same query — a `-C root`
+    query for any non-HQ bead was structurally unable to ever find its marker,
+    always returning "absent" even when a real queued marker existed). This is
+    very likely the actual mechanism behind the wa-539tp false alarm that
+    motivated this fix (a human checking manually found "marker queued,
+    position 8 of 31"; this function's own query, scoped to the WA rig root,
+    could not have seen it). `root` is kept as a parameter purely so the
+    existing call site and every selftest stub (_bd_marker_for_bead(root,
+    bead_id)) stay unchanged — the real (unstubbed) query path below no longer
+    reads it.
     Test seam: _bd_marker_for_bead."""
     if _bd_marker_for_bead is not None:
         return _bd_marker_for_bead(root, bead_id)
-    r = _sh([BD_BIN, "-C", root, "list",
+    r = _sh([BD_BIN, "-C", CITY, "list",
              "-l", "type:quality-gate-marker",
              "-l", "source-bead:%s" % bead_id,
              "-l", "gate-status:queued",
@@ -811,6 +841,171 @@ def _queued_marker_state(root, bead_id):
         return ("absent", None)
     m = markers[0] if isinstance(markers[0], dict) else {}
     return ("found", {"id": m.get("id") or m.get("issue_id") or "?"})
+
+
+# ── gate-queue backlog (ga-u2u8z) ────────────────────────────────────────────
+def _gate_queue_depth():
+    """Count of OPEN type:quality-gate-marker rows currently gate-status:queued,
+    city-wide (gate markers always live in the HQ/CITY store regardless of the
+    source bead's rig — see _queued_marker_state's docstring). Mirrors approved-
+    state-reconciler.py's ga-dbfm9 _gate_queue_depth() exactly — same query,
+    same resource.
+
+    Returns None on query/parse error — same fail-toward-'cannot confirm
+    suppression' convention as every other None-on-error helper in this file: an
+    unreadable queue depth says nothing about whether a wait is justified, so it
+    must not silently license a suppression (root-class:error-vs-empty).
+    Test seam: _bd_gate_queue_markers."""
+    if _bd_gate_queue_markers is not None:
+        rows = _bd_gate_queue_markers()   # test seam
+    else:
+        r = _sh([BD_BIN, "-C", CITY, "list", "--json",
+                 "-l", "type:quality-gate-marker", "-l", "gate-status:queued"],
+                timeout=BD_TIMEOUT)
+        if r is None or r.returncode != 0:
+            return None
+        rows = _parse_bd_json(r.stdout)
+    if rows is None:
+        return None
+    return len(rows)
+
+
+def _gate_queue_throughput(now):
+    """Verdicts/hour observed in quality-gate-dispatcher.log over the last
+    GATE_QUEUE_WINDOW_MIN minutes, or None if unmeasurable. Mirrors approved-
+    state-reconciler.py's ga-dbfm9 _gate_queue_throughput() exactly.
+
+    Returns None (unmeasurable — caller must NOT default to 0, root-class:
+    error-vs-empty) when the log can't be read, or when the fetched tail
+    (GATE_QUEUE_LOG_TAIL lines) doesn't itself reach back a full
+    GATE_QUEUE_WINDOW_MIN minutes (checked via the oldest timestamp seen) — an
+    UNDERcounted numerator would understate throughput, which makes
+    _gate_queue_suppress_reason MORE eager to suppress (the wrong direction).
+    Test seam: _read_gate_verdict_log_lines (a DEDICATED seam distinct from
+    _read_gate_log_lines above — that one is merge_signal's pre-existing,
+    narrower Gate-PASSED-only reader over this same physical log file; reusing
+    it here would make every one of that seam's ~25 existing stub sites in this
+    suite implicitly also drive this new computation, which is not what any of
+    them intend)."""
+    if _read_gate_verdict_log_lines is not None:
+        lines = _read_gate_verdict_log_lines()   # test seam
+    else:
+        lines = _tail(DISPATCH_LOG, GATE_QUEUE_LOG_TAIL)
+
+    if not lines:
+        return None
+
+    cutoff = now - GATE_QUEUE_WINDOW_MIN * 60
+    count = 0
+    oldest_epoch = None
+    for line in lines:
+        epoch = _ts_epoch(line)
+        if epoch is None:
+            continue
+        if oldest_epoch is None or epoch < oldest_epoch:
+            oldest_epoch = epoch
+        if epoch >= cutoff and "Gate run complete" in line and "verdict=" in line:
+            count += 1
+
+    if oldest_epoch is None or oldest_epoch > cutoff:
+        return None  # tail didn't reach back a full window — can't confirm the count
+
+    return count / (GATE_QUEUE_WINDOW_MIN / 60.0)
+
+
+def _gate_queue_suppress_reason(gate_depth, gate_throughput, age_min):
+    """Suppress reason if the gate-review backlog alone explains why a delivery-
+    stalled bead's own queued marker hasn't cleared yet, else None (ga-u2u8z).
+
+    Same formula as approved-state-reconciler.py's ga-dbfm9
+    _gate_queue_suppress_reason(), applied to a DIFFERENT alarm — SAME
+    mechanism, not a different one (see the ga-u2u8z bead comment for the full
+    same-or-different writeup this bug's AC required). One deliberate
+    divergence: there, the bead has NOT yet been dispatched into the gate queue
+    at all (no marker exists), so aggregate depth is the only signal available,
+    and it stays that way here too even though this bead already has ITS OWN
+    queued marker (via _queued_marker_state). An exact per-bead POSITION would
+    be a more precise signal in principle ("position 8 of 31" is literally what
+    a human derived by hand to debug the motivating wa-539tp incident) — but
+    quality-gate-dispatcher.sh's Step 0b marker selection is a multi-tier
+    priority/aging sort (priority × aged × has-rebase-fail, alternating
+    oldest-first/newest-first per tier — see the MARKER=... jq sort_by chain in
+    quality-gate-dispatcher.sh, ~line 4655), not a plain FIFO a fixed queue
+    index could represent. Reimplementing that tier logic a second time here,
+    just to print a specific-looking number, risks silently drifting from the
+    real dispatcher and FABRICATING a wrong-but-confident position — worse than
+    the honest, coarser aggregate-depth proxy ga-dbfm9 already shipped and
+    passed gate review with.
+
+    Returns None (do NOT suppress — fall through to alarm) when:
+      - either measurement is None (an unmeasured queue must never license a
+        suppression — root-class:error-vs-empty)
+      - gate_depth == 0 — a confirmed EMPTY queue never explains a wait (a
+        bead with a marker in an otherwise-empty queue is not explained by
+        backlog — something else is wrong with that specific marker)
+      - gate_throughput <= 0 — measured, but zero verdicts in the window; the
+        projected drain time is undefined/infinite. A stalled gate is a
+        DIFFERENT problem (surfaced by other watchdogs) and must not become an
+        unbounded free pass here
+      - the projected drain time (gate_depth/gate_throughput, in minutes) does
+        not exceed this bead's own age_min — the current backlog hasn't
+        actually held it up that long
+
+    A reason string (suppress) only when depth>0, throughput>0, and the
+    projected drain time exceeds age_min — a positively-measured explanation,
+    never a default."""
+    if gate_depth is None or gate_throughput is None:
+        return None
+    if gate_depth == 0:
+        return None
+    if gate_throughput <= 0:
+        return None
+    projected_wait_min = (gate_depth / gate_throughput) * 60.0
+    if projected_wait_min > age_min:
+        return ("gate queue backlog explains wait (depth=%d queued, "
+                 "throughput=%.1f verdict/h, projected=%.0fmin > age=%.0fmin)"
+                 % (gate_depth, gate_throughput, projected_wait_min, age_min))
+    return None
+
+
+def _gate_queue_body_line(gate_depth, gate_throughput, age_min):
+    """Format the gate-queue context line for a delivery-stalled bead's mail
+    mention — same AC as ga-dbfm9: depth + throughput + this bead's standing
+    relative to the projected drain time, or an explicit measurement-failure
+    note. NEVER silent, NEVER fabricates a 0 for a value that could not be
+    measured (see _gate_queue_depth()/_gate_queue_throughput()'s own
+    docstrings).
+
+    ga-u2u8z: unlike approved-state-reconciler.py's sibling function — which is
+    only ever called from within the starving alarm's own body, i.e. only in the
+    NOT-suppressed case — this one is called for BOTH outcomes (see
+    delivery_signal(): a found marker gets this line whether it lands in
+    `explained` or falls through to `unexplained`), so the closing verdict text
+    below must reflect the ACTUAL projected-vs-age comparison, not assume the
+    caller only ever reaches this on the non-suppressed path."""
+    if gate_depth is None or gate_throughput is None:
+        depth_txt = ("%d marker(s)" % gate_depth) if gate_depth is not None else "COULD NOT MEASURE"
+        tp_txt = ("%.1f verdict(s)/h" % gate_throughput) if gate_throughput is not None else "COULD NOT MEASURE"
+        return ("Gate queue: %s gate-status:queued | throughput (last %dmin): %s "
+                 "| queue-based suppression NOT applied — measurement incomplete, "
+                 "alarm kept (safe default)." % (depth_txt, GATE_QUEUE_WINDOW_MIN, tp_txt))
+    if gate_depth == 0:
+        return ("Gate queue: 0 marker(s) gate-status:queued (empty) | throughput "
+                 "(last %dmin): %.1f verdict(s)/h | empty queue never explains a "
+                 "wait." % (GATE_QUEUE_WINDOW_MIN, gate_throughput))
+    if gate_throughput <= 0:
+        return ("Gate queue: %d marker(s) gate-status:queued | throughput (last "
+                 "%dmin): 0 verdict(s)/h (gate idle or stalled) | projected drain "
+                 "undefined — queue-based suppression NOT applied." % (
+                 gate_depth, GATE_QUEUE_WINDOW_MIN))
+    projected_wait_min = (gate_depth / gate_throughput) * 60.0
+    verdict_txt = ("queue explains the wait" if projected_wait_min > age_min
+                   else "queue does NOT explain the wait")
+    return ("Gate queue: %d marker(s) gate-status:queued | throughput (last "
+             "%dmin): %.1f verdict(s)/h | projected drain: ~%.0fmin vs this "
+             "bead's wait: %.0fmin — %s." % (
+             gate_depth, GATE_QUEUE_WINDOW_MIN, gate_throughput,
+             projected_wait_min, age_min, verdict_txt))
 
 
 def _parse_ts_epoch(raw):
@@ -868,7 +1063,7 @@ def _sling_bead_state(sling_id, now):
 
 
 # ── imp23: delivery-stall signal ─────────────────────────────────────────────
-def delivery_signal(now):
+def delivery_signal(now, gate_depth=None, gate_throughput=None):
     """Returns (count, sample_beads, explained) of story:in-flight beads stalled
     past DELIVERY_STALL_HOURS.
 
@@ -880,6 +1075,19 @@ def delivery_signal(now):
     (see _queued_marker_state) are split into `explained` and EXCLUDED from
     count/sample — they are not an anomaly, so they must never drive escalation
     or get lumped in with genuinely-abandoned beads.
+
+    gate_depth/gate_throughput (ga-u2u8z): once-per-tick gate-queue backlog
+    reading from _tick_delivery() (None if unmeasurable). A found marker is no
+    longer BY ITSELF sufficient to land a bead in `explained` — it is now also
+    checked against _gate_queue_suppress_reason(): only kept in `explained` when
+    the CURRENT aggregate backlog quantitatively projects a drain time longer
+    than this bead's own wait (same mechanism as approved-state-reconciler.py's
+    ga-dbfm9 fix for the starving alarm). A found marker whose backlog does NOT
+    justify the wait falls through to `unexplained` instead (still alarms,
+    carrying the marker id + measured queue math) — this is AC1's "não silenciar
+    o caso legítimo" floor applied to the one case ga-g0v96's binary check had
+    missed: a marker that exists but is stuck far longer than the CURRENT queue
+    would predict.
 
     On any error returns (None, [], []) — fail-open (no false alert).
     Test seam: _bd_delivery(rig_root) -> list[dict]; None = run bd."""
@@ -960,12 +1168,29 @@ def delivery_signal(now):
 
         marker_verdict, marker = _queued_marker_state(root, bid)
         if marker_verdict == "found":
-            explained.append({
-                "id": bid,
-                "title": (b.get("title") or b.get("name") or "?")[:80],
-                "stall_hours": b.get("_tsw_stall_hours", 0.0),
-                "marker_id": marker["id"],
-            })
+            # ga-u2u8z: a found marker is no longer unconditionally "explained" —
+            # only when the CURRENT gate-queue backlog quantitatively projects a
+            # drain time longer than this bead has actually been waiting.
+            age_min = b.get("_tsw_stall_hours", 0.0) * 60.0
+            gate_line = _gate_queue_body_line(gate_depth, gate_throughput, age_min)
+            suppress_reason = _gate_queue_suppress_reason(gate_depth, gate_throughput, age_min)
+            if suppress_reason is not None:
+                explained.append({
+                    "id": bid,
+                    "title": (b.get("title") or b.get("name") or "?")[:80],
+                    "stall_hours": b.get("_tsw_stall_hours", 0.0),
+                    "marker_id": marker["id"],
+                    "gate_line": gate_line,
+                })
+            else:
+                # A marker exists but the measured backlog does not justify this
+                # bead's actual wait (or the backlog itself is unmeasurable) — do
+                # NOT silently suppress (AC1 floor). Alarm, but carry the marker
+                # id + queue math so the reader isn't back to square one — the
+                # exact gap the wa-539tp incident exposed.
+                b["_tsw_marker_id"] = marker["id"]
+                b["_tsw_gate_line"] = gate_line
+                unexplained[bid] = b
         else:
             # "absent" (checked, no marker) and "error" (couldn't check) both fall
             # back to pre-fix behavior (unexplained) — an error must never SUPPRESS
@@ -976,7 +1201,9 @@ def delivery_signal(now):
 
     unique = list(unexplained.values())
     sample = [{"id": b.get("id", "?"), "title": (b.get("title") or b.get("name") or "?")[:80],
-               "sling_id": b.get("_tsw_sling_id")}
+               "sling_id": b.get("_tsw_sling_id"),
+               "marker_id": b.get("_tsw_marker_id"),
+               "gate_line": b.get("_tsw_gate_line")}
               for b in unique[:5]]
     return len(unique), sample, explained
 
@@ -998,8 +1225,17 @@ def _escalate_delivery(count, sample, explained, now):
         "Beads com story:in-flight não atualizados há > %.0fh (amostra):" % DELIVERY_STALL_HOURS,
     ]
     for b in sample:
+        annotations = []
         if b.get("sling_id"):
-            lines.append("  • %s — %s (sling parado: %s)" % (b["id"], b["title"], b["sling_id"]))
+            annotations.append("sling parado: %s" % b["sling_id"])
+        if b.get("marker_id"):
+            # ga-u2u8z: this bead HAS a queued gate marker, but the measured
+            # backlog does not justify a wait this long (or is unmeasurable) —
+            # say so explicitly rather than just naming the marker, else the
+            # reader has to re-derive the same queue math by hand (AC1).
+            annotations.append("marker %s: %s" % (b["marker_id"], b.get("gate_line") or "?"))
+        if annotations:
+            lines.append("  • %s — %s (%s)" % (b["id"], b["title"], "; ".join(annotations)))
         else:
             lines.append("  • %s — %s" % (b["id"], b["title"]))
     lines += [
@@ -1024,8 +1260,12 @@ def _escalate_delivery(count, sample, explained, now):
             "gate:queued nestes (auto-refino re-ingere o bead como história crua se você remover):" % len(explained),
         ]
         for e in explained:
-            lines.append("  • %s — %s (aguardando headroom há %.0fh; Dolt cpu=%s; marker %s)" % (
-                e["id"], e["title"], e["stall_hours"], cpu_str, e["marker_id"]))
+            # ga-u2u8z: append the measured queue math (depth/throughput/projected
+            # drain) alongside the pre-existing headroom/Dolt-cpu annotation —
+            # additive only, so this does not disturb the ga-g0v96 O2 assertions.
+            gate_suffix = (" | %s" % e["gate_line"]) if e.get("gate_line") else ""
+            lines.append("  • %s — %s (aguardando headroom há %.0fh; Dolt cpu=%s; marker %s)%s" % (
+                e["id"], e["title"], e["stall_hours"], cpu_str, e["marker_id"], gate_suffix))
     body = "\n".join(lines)
 
     _tsw_ledger("human-touch", {
@@ -1059,11 +1299,27 @@ def _tick_delivery(now, state):
     Fires when story:in-flight beads go stale for > DELIVERY_STALL_HOURS.
     Runs every tick independently of the main throughput-stall logic.
     Updates state["delivery_pending"] and state["delivery_last_escalate"].
-    Returns True if a delivery stall was escalated this tick."""
+    Returns True if a delivery stall was escalated this tick.
+
+    ga-u2u8z: computes the gate-queue backlog (depth+throughput) once here —
+    this is the only call site of delivery_signal() (unlike approved-state-
+    reconciler.py's run_cycle()/_process_store() split, which hoists the
+    equivalent computation up a level to avoid re-querying once per rig), so
+    there is no redundant-query concern from computing it right here."""
     state.setdefault("delivery_pending", 0)
     state.setdefault("delivery_last_escalate", 0.0)
 
-    count, sample, explained = delivery_signal(now)
+    gate_depth = _gate_queue_depth()
+    if gate_depth is None:
+        _log("delivery: gate-queue depth query FAILED — marker-found suppression "
+             "degrades to 'unmeasured' this tick (see ga-u2u8z)")
+    gate_throughput = _gate_queue_throughput(now)
+    if gate_throughput is None:
+        _log("delivery: gate-queue throughput unmeasurable (log unreadable or tail "
+             "didn't reach back %dmin) — marker-found suppression degrades to "
+             "'unmeasured' this tick (see ga-u2u8z)" % GATE_QUEUE_WINDOW_MIN)
+
+    count, sample, explained = delivery_signal(now, gate_depth, gate_throughput)
     if count is None:
         _log("delivery_signal ERROR → fail-open (no delivery verdict)")
         state["delivery_pending"] = 0
@@ -1588,6 +1844,7 @@ def _selftest():
     global _read_pilot_log_lines, _read_gate_log_lines, _git_log_count
     global _bd_backlog, _bd_delivery, _do_mail_mayor, _do_notify, _do_dolt_probe
     global _suspended_rigs, _bd_marker_for_bead, _do_dolt_cpu, _bd_sling_state
+    global _bd_gate_queue_markers, _read_gate_verdict_log_lines
 
     ok_count = [0]
     fail_count = [0]
@@ -1628,6 +1885,29 @@ def _selftest():
         return [{"id": "wa-%04d" % i, "title": "Test story %d" % i,
                  "labels": ["story:approved"]} for i in range(count)]
 
+    def _gate_verdict_fixture(n_verdicts, filler_before=True):
+        """n 'Gate run complete ... verdict=' lines packed within the last few
+        minutes of NOW (ga-u2u8z), plus (if filler_before) one OLD non-matching
+        line at NOW-2h so _gate_queue_throughput's reach-back completeness check
+        is satisfied. Spacing is deliberately TIGHT (60s apart, not proportional
+        to GATE_QUEUE_WINDOW_MIN) so the fixture stays fully inside the trailing
+        60-min window across a short run of ticks 30min apart (a scenario that
+        loops more than ~2 ticks will see this fixture's count/throughput drift
+        as the window slides past it — by design, since a fixed fixture cannot
+        represent a log that keeps growing every real cycle; keep multi-tick
+        scenarios using this fixture to 2 ticks, matching DELIVERY_CONFIRM_SWEEPS)."""
+        lines = []
+        if filler_before:
+            old_ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(NOW - 2 * 3600))
+            lines.append("%s [quality-gate-dispatcher] unrelated log line" % old_ts)
+        for i in range(n_verdicts):
+            e = NOW - i * 60
+            ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(e))
+            lines.append("%s [quality-gate-dispatcher] === Gate run complete: "
+                          "gate_run=ga-wisp-x branch=crew/x verdict=PASS elapsed=1s ==="
+                          % ts)
+        return lines
+
     def _reset():
         return {"pending": 0, "last_escalate": 0.0, "escalations": 0,
                 "blind_pending": 0, "blind_last_escalate": 0.0,
@@ -1655,6 +1935,17 @@ def _selftest():
     # every stalled bead is unexplained) — overridden in the ga-g0v96 scenarios below.
     _bd_marker_for_bead = lambda root, bead_id: ("absent", None)
     _do_dolt_cpu = lambda: 42.0
+    # ga-u2u8z: hermetic defaults for the gate-queue backlog seams — depth=0
+    # (empty list) and throughput=unmeasurable (empty tail) by default. Every
+    # tick now calls _gate_queue_depth()/_gate_queue_throughput() unconditionally
+    # (see _tick_delivery), so EVERY existing scenario in this suite — not just
+    # the delivery-stall ones — would otherwise fall through to the real `_sh`/
+    # `_tail` calls and hang/spawn real subprocesses. Neither default value is
+    # actually consulted by scenarios that don't stub _bd_marker_for_bead to
+    # return "found" (the only branch that reads gate_depth/gate_throughput) —
+    # overridden in the ga-u2u8z scenarios below.
+    _bd_gate_queue_markers = lambda: []
+    _read_gate_verdict_log_lines = lambda: []
     # imp24: heal disabled by default so existing scenarios are not affected.
     _do_heal_throughput = None   # overridden in P/Q scenarios
     # imp12: quota check stubbed as available by default
@@ -2053,21 +2344,37 @@ def _selftest():
 
     # ── ga-g0v96 Scenario O1: bead explained by a healthy queued marker never
     # escalates, no matter how many sweeps (AC1: not an anomaly) ────────────────
-    print("\nga-g0v96 Scenario O1: explained-by-marker bead never escalates")
+    # ga-u2u8z: "explained" now additionally requires the CURRENT gate-queue
+    # backlog to quantitatively justify the wait, not just a found marker by
+    # itself — stub depth/throughput with values that comfortably do so across
+    # every tick in this loop. Loop shortened 5→3 ticks: _gate_verdict_fixture's
+    # docstring explains why a static log fixture cannot represent a queue that
+    # keeps draining every real cycle much past DELIVERY_CONFIRM_SWEEPS-worth of
+    # ticks — that limitation is a test-fixture artifact, not a product one, and
+    # the "no matter how many sweeps" guarantee itself only ever needed to
+    # survive DELIVERY_CONFIRM_SWEEPS ticks: a suppressed bead resets
+    # delivery_pending to 0 every single qualifying tick, so it can never
+    # accumulate toward escalation regardless of how many MORE ticks follow.
+    print("\nga-g0v96 Scenario O1: explained-by-marker bead never escalates "
+          "(now additionally backed by a justifying gate-queue backlog, ga-u2u8z)")
     _read_pilot_log_lines = lambda: _pilot_lines(0, 3)
     _read_gate_log_lines  = lambda: []
     _git_log_count        = lambda root, since: 0
     _bd_backlog           = lambda root: []
     _bd_delivery = lambda root: [_stale_bead("wa-o001", DELIVERY_STALL_HOURS + 1)]
     _bd_marker_for_bead = lambda root, bead_id: ("found", {"id": "ga-wisp-o001"})
+    _bd_gate_queue_markers = lambda: [{"id": "ga-wisp-%d" % i} for i in range(30)]
+    _read_gate_verdict_log_lines = lambda: _gate_verdict_fixture(5)
     _do_dolt_probe = lambda: 0
     mail_calls.clear(); notify_calls.clear()
     st = _reset()
-    for i in range(5):
+    for i in range(3):
         run_tick(NOW + i * 1800, st)
     delivery_notifies_o1 = [n for n in notify_calls if "DELIVERY" in n[0].upper()]
     if not delivery_notifies_o1 and st.get("delivery_pending", 0) == 0:
-        _ok("O1: bead with a healthy queued marker never triggers delivery-stall escalation (ga-g0v96 AC1)")
+        _ok("O1: bead with a healthy queued marker + a backlog that justifies the "
+            "wait never triggers delivery-stall escalation across 3 sweeps "
+            "(ga-g0v96 AC1 + ga-u2u8z)")
     else:
         _bad("O1", "delivery_pending=%d notifies=%d" % (st.get("delivery_pending", 0), len(delivery_notifies_o1)))
 
@@ -2082,6 +2389,13 @@ def _selftest():
             return ("found", {"id": "ga-wisp-o002"})
         return ("absent", None)
     _bd_marker_for_bead = _marker_o2
+    # ga-u2u8z: backlog that comfortably justifies wa-o002-explained's wait
+    # (5h+ at tick0, growing across 2 ticks) — depth=30/throughput=5.0/h
+    # projects ~360min, safely above this bead's ~300-330min actual stall
+    # across both ticks. wa-o003-real's marker is "absent", so this backlog is
+    # never even consulted for it — it stays unexplained regardless.
+    _bd_gate_queue_markers = lambda: [{"id": "ga-wisp-%d" % i} for i in range(30)]
+    _read_gate_verdict_log_lines = lambda: _gate_verdict_fixture(5)
     _do_dolt_cpu = lambda: 210.0
     mail_calls.clear(); notify_calls.clear()
     st = _reset()
@@ -2105,6 +2419,20 @@ def _selftest():
             _ok("O2b: mail explicitly warns not to remove gate:queued from explained beads (ga-g0v96 AC2)")
         else:
             _bad("O2b", "expected an explicit 'do not remove gate:queued' warning in the mail body")
+        # ga-u2u8z: _gate_queue_body_line is called for BOTH the explained and
+        # unexplained outcomes (unlike its approved-state-reconciler.py sibling,
+        # which is only ever reached on the non-suppressed path) — its closing
+        # verdict text must match which outcome ACTUALLY happened for this bead,
+        # not hardcode one direction. Caught live before this assertion existed
+        # (2026-08-03): the line said "does NOT explain the wait" for a bead
+        # that was, in fact, being suppressed BECAUSE the queue explained it.
+        if "queue explains the wait" in o2_body and "queue does NOT explain the wait" not in o2_body:
+            _ok("O2c: explained bead's gate-queue line correctly says 'explains the "
+                "wait' (not the not-suppressed wording) — regression guard for a "
+                "real contradiction caught via live verification")
+        else:
+            _bad("O2c", "expected 'queue explains the wait' (and NOT the negated "
+                        "form) in the explained bead's annotation, body=%r" % (o2_body,))
     else:
         _bad("O2", "expected a delivery mail for the unexplained bead, got: %r" % mail_calls)
 
@@ -2126,6 +2454,8 @@ def _selftest():
 
     _bd_marker_for_bead = lambda root, bead_id: ("absent", None)   # restore default
     _do_dolt_cpu = lambda: 42.0
+    _bd_gate_queue_markers = lambda: []             # restore hermetic default (ga-u2u8z)
+    _read_gate_verdict_log_lines = lambda: []        # restore hermetic default (ga-u2u8z)
 
     # ── ga-9ni9w/ga-ebm7c: sling-aware delivery stall. FALSIFYING TEST (per the
     # bug's own Aceite): pair a story stale well past the window with a FRESH
@@ -2220,6 +2550,158 @@ def _selftest():
                     "silent-collapse regressed" % (
                         (_q4_verdict_missing, _q4_hours_missing),
                         (_q4_verdict_garbled, _q4_hours_garbled)))
+
+    # ── ga-u2u8z Scenario T: companion fix — _queued_marker_state's real path
+    # queries CITY, not the passed-in per-rig root. Gate markers always live in
+    # the HQ store regardless of which rig the source bead belongs to (verified
+    # live 2026-08-03: 137 CITY-store markers carry a source-bead:wa-* label;
+    # the whatsapp_automation rig's own store has no matching entries under the
+    # same query). Found while implementing ga-u2u8z's own ask, and very likely
+    # the actual mechanism behind the wa-539tp false alarm that motivated this
+    # whole fix — a human checking manually found "marker queued, position 8 of
+    # 31"; this function's OWN query, previously scoped to the WA rig root,
+    # could never have seen it ──────────────────────────────────────────────────
+    print("\nga-u2u8z Scenario T: _queued_marker_state real path queries CITY, "
+          "not the passed-in per-rig root")
+    import types as _types_t
+    _saved_bd_marker_for_bead_t = _bd_marker_for_bead
+    _bd_marker_for_bead = None   # force the real _sh-backed implementation, not the seam
+    _saved_sh_t = globals().get("_sh")
+
+    def _fake_sh_t(args, timeout=20, stdin=None):
+        # args = [BD_BIN, "-C", <target>, "list", ...] — only a CITY-scoped
+        # query finds the marker; any other -C target (e.g. a rig root) does not.
+        target = args[2] if len(args) > 2 else None
+        if target == CITY:
+            return _types_t.SimpleNamespace(returncode=0, stdout='[{"id":"ga-wisp-t001"}]')
+        return _types_t.SimpleNamespace(returncode=0, stdout='[]')
+
+    globals()["_sh"] = _fake_sh_t
+    _t_verdict, _t_marker = _queued_marker_state(
+        "/Users/athos/gt/whatsapp_automation", "wa-999")
+    globals()["_sh"] = _saved_sh_t
+    _bd_marker_for_bead = _saved_bd_marker_for_bead_t
+
+    if _t_verdict == "found" and _t_marker and _t_marker.get("id") == "ga-wisp-t001":
+        _ok("T: _queued_marker_state real path queries CITY (%s) even when called "
+            "with a non-HQ rig root — a `-C <rigroot>` query would have returned "
+            "'absent' for this exact bead, mirroring the live wa-539tp incident" % CITY)
+    else:
+        _bad("T", "verdict=%r marker=%r — expected ('found', {'id':'ga-wisp-t001'}); "
+                  "a regression back to `-C root` would silently return 'absent' "
+                  "here" % (_t_verdict, _t_marker))
+
+    # ── ga-u2u8z Scenarios U1-U5: gate-queue backlog context + suppression for
+    # the delivery-stall alarm — mirrors approved-state-reconciler.py's
+    # ga-dbfm9-a..e scenarios (same formula, same resource; see
+    # _gate_queue_suppress_reason()'s docstring for the same-mechanism writeup) ──
+    print("\nga-u2u8z Scenario U1: gate queue backlog (depth=30, throughput=5/h) "
+          "projects a wait > this bead's own stall → moves from 'unexplained' to "
+          "'explained', no escalation (the wa-539tp false-positive shape)")
+    _read_pilot_log_lines = lambda: _pilot_lines(0, 3)
+    _read_gate_log_lines  = lambda: []
+    _git_log_count        = lambda root, since: 0
+    _bd_backlog           = lambda root: []
+    _bd_delivery = lambda root: [_stale_bead("wa-u001", DELIVERY_STALL_HOURS + 25 / 60.0)]  # 205min stalled
+    _bd_marker_for_bead = lambda root, bead_id: ("found", {"id": "ga-wisp-u001"})
+    _bd_gate_queue_markers = lambda: [{"id": "ga-wisp-%d" % i} for i in range(30)]
+    _read_gate_verdict_log_lines = lambda: _gate_verdict_fixture(5)
+    _do_dolt_probe = lambda: 0
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    if not notify_calls and not mail_calls and st.get("delivery_pending", 0) == 0:
+        _ok("U1: depth=30/throughput=5.0/h projects ~360min wait > bead's 205min "
+            "stall → suppressed on first tick, matches the wa-539tp false-positive shape")
+    else:
+        _bad("U1", "delivery_pending=%d notifies=%d mails=%d" % (
+             st.get("delivery_pending", 0), len(notify_calls), len(mail_calls)))
+
+    print("\nga-u2u8z Scenario U2: falsification — small backlog (depth=1, "
+          "throughput=5/h) does NOT explain a bead stalled well past that "
+          "projection → STILL alarms; body carries marker id + measured "
+          "depth+throughput+projected-drain (AC1)")
+    _bd_delivery = lambda root: [_stale_bead("wa-u002", DELIVERY_STALL_HOURS + 25 / 60.0)]
+    _bd_marker_for_bead = lambda root, bead_id: ("found", {"id": "ga-wisp-u002"})
+    _bd_gate_queue_markers = lambda: [{"id": "ga-wisp-only"}]
+    _read_gate_verdict_log_lines = lambda: _gate_verdict_fixture(5)
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)
+    delivery_mails_u2 = [m for m in mail_calls if "DELIVERY" in m[0]]
+    body_u2 = delivery_mails_u2[0][1] if delivery_mails_u2 else None
+    has_marker = body_u2 is not None and "ga-wisp-u002" in body_u2
+    has_depth = body_u2 is not None and "1 marker(s)" in body_u2
+    has_tp = body_u2 is not None and "5.0 verdict(s)/h" in body_u2
+    has_drain = body_u2 is not None and "does NOT explain the wait" in body_u2
+    if body_u2 is not None and has_marker and has_depth and has_tp and has_drain:
+        _ok("U2: depth=1/throughput=5.0/h projects ~12min wait, far below this "
+            "bead's actual 205-235min stall → still alarms; body shows marker id "
+            "+ depth + throughput + projected drain")
+    else:
+        _bad("U2", "body=%r" % (body_u2,))
+
+    print("\nga-u2u8z Scenario U3: both gate-queue measurements fail (depth query "
+          "errors, verdict log unreadable) → STILL alarms; body says COULD NOT "
+          "MEASURE, never a fabricated 0 (root-class:error-vs-empty)")
+    _bd_delivery = lambda root: [_stale_bead("wa-u003", DELIVERY_STALL_HOURS + 1)]
+    _bd_marker_for_bead = lambda root, bead_id: ("found", {"id": "ga-wisp-u003"})
+    _bd_gate_queue_markers = lambda: None      # simulated query error
+    _read_gate_verdict_log_lines = lambda: []  # simulated unreadable/empty log
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)
+    delivery_mails_u3 = [m for m in mail_calls if "DELIVERY" in m[0]]
+    body_u3 = delivery_mails_u3[0][1] if delivery_mails_u3 else None
+    if body_u3 is not None and "COULD NOT MEASURE" in body_u3 and "0 marker" not in body_u3:
+        _ok("U3: unmeasurable gate queue → alarm STILL fires (marker found but "
+            "unmeasured backlog never suppresses) with an honest 'COULD NOT "
+            "MEASURE' note, never a fabricated 0")
+    else:
+        _bad("U3", "body=%r" % (body_u3,))
+
+    print("\nga-u2u8z Scenario U4: confirmed EMPTY gate queue (depth=0) → STILL "
+          "alarms despite a found marker, regardless of throughput")
+    _bd_delivery = lambda root: [_stale_bead("wa-u004", DELIVERY_STALL_HOURS + 1)]
+    _bd_marker_for_bead = lambda root, bead_id: ("found", {"id": "ga-wisp-u004"})
+    _bd_gate_queue_markers = lambda: []       # confirmed empty, not an error
+    _read_gate_verdict_log_lines = lambda: _gate_verdict_fixture(20)   # high throughput
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)
+    delivery_mails_u4 = [m for m in mail_calls if "DELIVERY" in m[0]]
+    if any("wa-u004" in b for _, b in delivery_mails_u4):
+        _ok("U4: depth=0 (confirmed empty) → alarm still fires; high throughput "
+            "does not create a false suppression")
+    else:
+        _bad("U4", "mail_calls=%s" % (mail_calls,))
+
+    print("\nga-u2u8z Scenario U5: throughput=0 measured (stalled gate) + "
+          "depth=10 → STILL alarms, no division-by-zero crash")
+    _bd_delivery = lambda root: [_stale_bead("wa-u005", DELIVERY_STALL_HOURS + 1)]
+    _bd_marker_for_bead = lambda root, bead_id: ("found", {"id": "ga-wisp-u005"})
+    _bd_gate_queue_markers = lambda: [{"id": "ga-wisp-%d" % i} for i in range(10)]
+    _read_gate_verdict_log_lines = lambda: _gate_verdict_fixture(0)   # filler only, zero verdicts
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)
+    delivery_mails_u5 = [m for m in mail_calls if "DELIVERY" in m[0]]
+    body_u5 = delivery_mails_u5[0][1] if delivery_mails_u5 else None
+    if body_u5 is not None and "0 verdict(s)/h" in body_u5:
+        _ok("U5: throughput=0.0/h (measured, stalled gate) + depth=10 → alarm "
+            "still fires (undefined projection != suppression), no crash")
+    else:
+        _bad("U5", "mail_calls=%s body=%r" % (mail_calls, body_u5))
+
+    # Restore hermetic defaults so later scenarios (which don't exercise the
+    # gate-queue feature) are unaffected by the fixtures above.
+    _bd_gate_queue_markers = lambda: []
+    _read_gate_verdict_log_lines = lambda: []
+    _bd_marker_for_bead = lambda root, bead_id: ("absent", None)
 
     # ── imp24-P: heal-action branch wiring ───────────────────────────────────────
     print("\nimp24 Scenario P1: HEAL_ENABLED=0 → heal not attempted, stall escalates normally")
@@ -2510,6 +2992,8 @@ def _selftest():
     _do_dolt_probe        = None
     _do_heal_throughput   = None
     _suspended_rigs       = None
+    _bd_gate_queue_markers = None
+    _read_gate_verdict_log_lines = None
     globals()["_do_check_quota"] = None
 
     print("\n[tsw selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
