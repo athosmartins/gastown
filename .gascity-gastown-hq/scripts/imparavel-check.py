@@ -302,6 +302,9 @@ def check_approved():
             held_count += 1
         else:  # 'stuck' (plain, or held-loop — reason carries "held-loop:Nx")
             s = {"id": bead_id, "rig": rig, "title": title}
+            lane_label = next((l.split(":", 1)[1] for l in labels if l.startswith("lane:")), None)
+            if lane_label:
+                s["lane"] = lane_label
             if reason:
                 s["reason"] = reason
             stuck.append(s)
@@ -462,6 +465,78 @@ def _pilot_slots():
     return None
 
 
+def _pilot_candidates():
+    """Most recent 'Candidates split: small=N  big=M' line from the Pilot log —
+    the Pilot's OWN per-lane classification of its candidate scan (classify_lane:
+    explicit lane:* label, then story.size_check==epic, then acceptance-criteria
+    count, default small). Reused as-is rather than re-implementing that heuristic
+    here (ga-zkxdw DEFEITO 1). Returns {'small': int, 'big': int}, or None if the
+    log is missing/unreadable or has no such line yet — caller must treat None as
+    'unknown' and fall back to the pre-fix both-lanes-empty check, same fail-open
+    convention as _pilot_slots()."""
+    r = _sh(["tail", "-n", "500", PILOT_LOG])
+    if not (r and r.stdout):
+        return None
+    import re
+    for line in reversed(r.stdout.splitlines()):
+        mt = re.search(r"Candidates split:\s*small=(\d+)\s+big=(\d+)", line)
+        if mt:
+            return {"small": int(mt.group(1)), "big": int(mt.group(2))}
+    return None
+
+
+def _pool_saturated(slots, candidates):
+    """PURE (no I/O — unit-testable). True when NO lane could possibly have
+    dispatched anything this sweep — every lane is either out of free slots OR
+    has zero candidates wanting it. A 'stuck' bead behind a pool saturated FOR
+    ITS OWN LANE is healthy backpressure (ga-wmrr), not a silent stall.
+
+    ga-zkxdw DEFEITO 1: the original check only looked at slots (small<=0 AND
+    big<=0 GLOBALLY), so a bead stuck in a full lane read as a real failure
+    whenever the OTHER lane had room — even though that room was the wrong
+    shape for it (measured live: small=0/big=2 slots, 9 candidates all
+    lane:small → false ❌). Mirrors the Pilot's OWN per-lane dispatch-eligibility
+    test (pilot-dispatcher.sh: `[ small_slots -gt 0 ] && [ small_count -gt 0 ]`).
+
+    candidates=None (log has no 'Candidates split' line yet) falls back to the
+    original both-lanes-empty check — an unreadable signal must never SUPPRESS
+    a real stall, so without per-lane demand data only the strictest, most
+    conservative case downgrades."""
+    if not slots:
+        return False
+    if candidates:
+        lane_could_dispatch = ((slots["small"] > 0 and candidates["small"] > 0)
+                               or (slots["big"] > 0 and candidates["big"] > 0))
+        return not lane_could_dispatch
+    return slots["small"] <= 0 and slots["big"] <= 0
+
+
+def _sweep_in_flight():
+    """True if the Pilot log's most recent sweep boundary marker is a START
+    with no matching COMPLETE after it — i.e. a sweep is currently running.
+
+    ga-zkxdw DEFEITO 2: pilot-dispatcher.sh sweeps take ~5-6min end to end. A
+    stuck-queue snapshot taken mid-sweep sees 'dispatched=0' simply because the
+    sweep hasn't reached those candidates yet, not because anything was skipped
+    (measured live: re-checked at 21:38 with the lane fixed by defeito-1's own
+    criteria, still false ❌ — the sweep that started 21:34:54 went on to
+    dispatch 6 beads by 21:42). Matches ANY of the 3 '=== Pilot sweep complete'
+    variants the dispatcher emits (normal / cota-paused / gate-congested-deferred).
+
+    Returns None if the log is missing/unreadable — caller must NOT suppress a
+    real stall on unknown; only a POSITIVELY-observed in-flight sweep may
+    downgrade a fail to a warn (same fail-open convention as _pilot_slots())."""
+    r = _sh(["tail", "-n", "500", PILOT_LOG])
+    if not (r and r.stdout):
+        return None
+    for line in reversed(r.stdout.splitlines()):
+        if "=== Pilot sweep complete" in line:
+            return False
+        if "=== Pilot sweep start" in line:
+            return True
+    return None
+
+
 def check_pilot():
     r = _sh(["tail", "-n", "60", PILOT_LOG])
     if not (r and r.stdout):
@@ -493,6 +568,8 @@ def main():
     p = check_pilot()
     d = check_dolt()
     slots = _pilot_slots()
+    candidates = _pilot_candidates()
+    sweep_in_flight = _sweep_in_flight()
 
     fails, warns, notes = [], [], []
 
@@ -503,12 +580,13 @@ def main():
         warns.append("não consegui classificar %d bead(s) (bd show falhou): %s"
                      % (len(a["read_err"]), ", ".join(str(x) for x in a["read_err"][:8])))
 
-    # ga-wmrr: a construível queued behind a FULLY saturated pool (0 slots free
-    # in EVERY lane) has nowhere to go regardless of its own lane — that is
-    # healthy high-demand queueing (the reported HÍGIDO-e-CHEIO incident), not a
-    # silent stall. Only report a real ❌ when some lane still has room and the
-    # queue didn't use it (a genuine skip: empty routed_to, or a dispatch bug).
-    pool_saturated = bool(slots) and slots["small"] <= 0 and slots["big"] <= 0
+    # ga-wmrr/ga-zkxdw: a construível queued behind a pool saturated FOR ITS OWN
+    # LANE has nowhere to go regardless of what the OTHER lane has free — that is
+    # healthy high-demand queueing, not a silent stall. Only report a real ❌ when
+    # some lane BOTH has room AND has a candidate wanting it, and the queue didn't
+    # use it (a genuine skip: empty routed_to, or a dispatch bug) — see
+    # _pool_saturated() for the lane-aware logic (ga-zkxdw DEFEITO 1).
+    pool_saturated = _pool_saturated(slots, candidates)
 
     if a["stuck"] and (p.get("alive") is not False):
         if pool_saturated:
@@ -516,6 +594,16 @@ def main():
                 "pool saturado (slots small=%d big=%d) — %d construível(is) normalmente"
                 " na fila atrás de slots cheios, NÃO é falha: %s"
                 % (slots["small"], slots["big"], len(a["stuck"]),
+                   ", ".join("%s/%s" % (s["rig"], s["id"]) for s in a["stuck"][:6])))
+        elif sweep_in_flight:
+            # ga-zkxdw DEFEITO 2: a sweep takes ~5-6min; a snapshot taken mid-sweep
+            # cannot distinguish "skipped" from "not reached yet" — genuinely
+            # uncertain, not a confirmed ✅ NOR a confirmed ❌.
+            warns.append(
+                "%d bead(s) construível(is) na fila, sweep do Pilot AINDA EM VOO"
+                " (não deu tempo de dispatchar) — aguardando conclusão antes de"
+                " julgar stall: %s"
+                % (len(a["stuck"]),
                    ", ".join("%s/%s" % (s["rig"], s["id"]) for s in a["stuck"][:6])))
         elif a.get("from_dispatchable"):
             fails.append(
@@ -568,16 +656,23 @@ def main():
         print("FILA DO PILOT (dispatchable%s): %d total"
               % ((" — " + snap_note) if snap_note else "", a["total"]))
         if slots:
-            print("  • slots do Pilot: small=%d livre(s)   big=%d livre(s)"
-                  % (slots["small"], slots["big"]))
+            cand_note = (("   • candidatos do Pilot: small=%d big=%d" % (candidates["small"], candidates["big"]))
+                        if candidates else "")
+            print("  • slots do Pilot: small=%d livre(s)   big=%d livre(s)%s"
+                  % (slots["small"], slots["big"], cand_note))
         print("  • parked (needs-human/on-device/blocked/já-no-gate): %d (já-construídas-no-gate: %d)"
               "   • genuinamente construíveis: %d   • em build agora (in-flight): %d   • held: %d"
               % (a["parked_count"], a.get("in_gate_count", 0),
                  a["buildable_count"], a["flowing_count"], a["held_count"]))
         if a["stuck"]:
+            # ga-zkxdw item 3: show each stuck bead's own lane inline — previously
+            # the reader had to cross-reference the bead's labels separately to see
+            # whether a free slot was even the right shape for it.
             print("  • CONSTRUÍVEIS MAS PARADAS (%d): %s"
                   % (len(a["stuck"]),
-                     ", ".join("%s/%s" % (s["rig"], s["id"]) for s in a["stuck"][:8])))
+                     ", ".join("%s/%s%s" % (s["rig"], s["id"],
+                                            "(lane:%s)" % s["lane"] if s.get("lane") else "")
+                               for s in a["stuck"][:8])))
     else:
         # Fallback display
         ok_r = a.get("_ok_reasons", {})

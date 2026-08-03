@@ -257,6 +257,137 @@ eq("reviewer dead + 475min-old marker: stalled must STILL be True (real stall pr
 
 m._bd_json, m._age_min, m._sh = _orig_bd_json, _orig_age_min, _orig_sh_gate
 
+print("── ga-zkxdw DEFEITO 1: _pilot_candidates() parses 'Candidates split' log line ──")
+m._sh = _fake_sh_factory(
+    "[2026-08-02 21:26:00] [pilot-dispatcher] Available slots: small=0  big=2\n"
+    "[2026-08-02 21:26:01] [pilot-dispatcher] Candidates split: small=9  big=0\n")
+eq("picks the LAST Candidates-split line", m._pilot_candidates(), {"small": 9, "big": 0})
+
+m._sh = _fake_sh_factory("[2026-08-02 21:26:00] [pilot-dispatcher] Available slots: small=0  big=2\n")
+eq("no Candidates-split line yet → None", m._pilot_candidates(), None)
+
+m._sh = _fake_sh_factory("")
+eq("empty log → None (candidates)", m._pilot_candidates(), None)
+
+print("── ga-zkxdw DEFEITO 1: _pool_saturated() is lane-aware, not just both-lanes-empty ──")
+# Cenário A (measured live 2026-08-02 21:26): small=0 big=2 slots, but ALL 9 real
+# candidates are lane:small — the free big slots are the WRONG shape for them, so
+# this must still read as saturated (healthy backpressure), not a dispatch skip.
+eq("Cenário A: small=0/big=2 slots, candidates ALL small (9/0) → saturated",
+   m._pool_saturated({"small": 0, "big": 2}, {"small": 9, "big": 0}), True)
+# Cenário C: a free small slot exists AND a small candidate wants it → NOT saturated —
+# the defeito-1 fix must not overcorrect into hiding a genuine skip.
+eq("Cenário C: small=1/big=0 slots, candidates small=1 → NOT saturated (real stall preserved)",
+   m._pool_saturated({"small": 1, "big": 0}, {"small": 1, "big": 0}), False)
+eq("both lanes literally 0 slots, no candidates data → saturated (ga-wmrr fallback preserved)",
+   m._pool_saturated({"small": 0, "big": 0}, None), True)
+eq("a lane has room, no candidates data → NOT saturated (fallback, old behavior preserved)",
+   m._pool_saturated({"small": 0, "big": 2}, None), False)
+eq("no slots data at all → NOT saturated (unknown must never suppress a real stall)",
+   m._pool_saturated(None, {"small": 9, "big": 0}), False)
+
+print("── ga-zkxdw DEFEITO 2: _sweep_in_flight() detects an unfinished Pilot sweep ──")
+m._sh = _fake_sh_factory(
+    "[2026-08-02 21:34:54] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n")
+eq("sweep started, no complete line yet → True (in flight)", m._sweep_in_flight(), True)
+
+m._sh = _fake_sh_factory(
+    "[2026-08-02 21:34:54] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n"
+    "[2026-08-02 21:40:12] [pilot-dispatcher] === Pilot sweep complete: dispatched=6"
+    " (small_slots=0 big_slots=2 dolt_saturated_at_start=0) ===\n")
+eq("sweep start THEN complete → False (finished)", m._sweep_in_flight(), False)
+
+m._sh = _fake_sh_factory(
+    "[2026-08-02 21:34:54] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n"
+    "[2026-08-02 21:40:12] [pilot-dispatcher] === Pilot sweep complete: dispatched=6 (...) ===\n"
+    "[2026-08-02 21:45:00] [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===\n")
+eq("complete THEN a new start → True (next sweep now in flight)", m._sweep_in_flight(), True)
+
+m._sh = _fake_sh_factory(
+    "[2026-08-02 21:38:00] [pilot-dispatcher] === Pilot sweep complete: dispatched=0"
+    " (paused: cota 5h limitada) ===\n")
+eq("an early-exit 'sweep complete' variant also counts as finished → False",
+   m._sweep_in_flight(), False)
+
+m._sh = _fake_sh_factory("")
+eq("empty log → None (unknown, not False)", m._sweep_in_flight(), None)
+
+m._sh = lambda args, timeout=20: None
+eq("_sh failure → None (unknown)", m._sweep_in_flight(), None)
+
+print("── main() end-to-end: ga-zkxdw regression — defects 1+2, all 3 falsifiable cenários ──")
+_z_ca, _z_cg, _z_cp, _z_cd = m.check_approved, m.check_gate, m.check_pilot, m.check_dolt
+_z_slots, _z_cand, _z_swf, _z_rigs = m._pilot_slots, m._pilot_candidates, m._sweep_in_flight, m.RIGS
+
+m.check_gate = lambda: {"active": [], "parked": [], "last_pass_min": 1.0,
+                         "reviewer_alive": True, "oldest_active_min": None,
+                         "stalled": False, "stall_reason": ""}
+m.check_pilot = lambda: {"alive": True, "last_sweep_min": 0.5}
+m.check_dolt = lambda: {"responsive": True, "latency_ms": 10}
+m.RIGS = []
+
+# Cenário A: small=0 big=2, ALL 9 candidates lane:small, sweep already complete.
+m.check_approved = lambda: {
+    "total": 9, "parked_count": 0, "in_gate_count": 0, "buildable_count": 9,
+    "flowing_count": 0, "held_count": 0,
+    "stuck": [{"id": "wa-S%d" % i, "rig": "WA", "title": "small candidate", "lane": "small"}
+              for i in range(9)],
+    "read_err": [], "warns": [], "from_dispatchable": True, "snap_age_min": 1.0,
+}
+m._pilot_slots = lambda: {"small": 0, "big": 2}
+m._pilot_candidates = lambda: {"small": 9, "big": 0}
+m._sweep_in_flight = lambda: False
+_bufA = io.StringIO()
+_exitA = None
+try:
+    with contextlib.redirect_stdout(_bufA):
+        m.main()
+except SystemExit as e:
+    _exitA = e.code
+eq("Cenário A: wrong-shape free slots (small=0/big=2, all-small candidates) → exit 0, not ❌",
+   _exitA, 0)
+eq("Cenário A: report does NOT say NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _bufA.getvalue(), False)
+
+# Cenário B: lane is now RIGHT (small=2 free, matches candidates) — defeito 1 alone
+# would flag this. Only defeito 2 (sweep still running) can save it.
+m._pilot_slots = lambda: {"small": 2, "big": 0}
+m._pilot_candidates = lambda: {"small": 9, "big": 0}
+m._sweep_in_flight = lambda: True
+_bufB = io.StringIO()
+_exitB = None
+try:
+    with contextlib.redirect_stdout(_bufB):
+        m.main()
+except SystemExit as e:
+    _exitB = e.code
+eq("Cenário B: sweep still in flight → exit 2 (⚠️ INCERTO), never ❌", _exitB, 2)
+eq("Cenário B: report does NOT say NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _bufB.getvalue(), False)
+
+# Cenário C: room + matching demand + sweep COMPLETE + 0 dispatch → the false-negative
+# fix from defeito 1/2 must NOT become a false-positive — this must stay ❌.
+m.check_approved = lambda: {
+    "total": 1, "parked_count": 0, "in_gate_count": 0, "buildable_count": 1,
+    "flowing_count": 0, "held_count": 0,
+    "stuck": [{"id": "wa-REALSTALL", "rig": "WA", "title": "room+demand+sweep done", "lane": "small"}],
+    "read_err": [], "warns": [], "from_dispatchable": True, "snap_age_min": 1.0,
+}
+m._pilot_slots = lambda: {"small": 1, "big": 0}
+m._pilot_candidates = lambda: {"small": 1, "big": 0}
+m._sweep_in_flight = lambda: False
+_bufC = io.StringIO()
+_exitC = None
+try:
+    with contextlib.redirect_stdout(_bufC):
+        m.main()
+except SystemExit as e:
+    _exitC = e.code
+eq("Cenário C: room+demand+sweep done+0 dispatch → exit 1 (❌ preserved, no regression)",
+   _exitC, 1)
+eq("Cenário C: report says NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _bufC.getvalue(), True)
+
+m.check_approved, m.check_gate, m.check_pilot, m.check_dolt = _z_ca, _z_cg, _z_cp, _z_cd
+m._pilot_slots, m._pilot_candidates, m._sweep_in_flight, m.RIGS = _z_slots, _z_cand, _z_swf, _z_rigs
+
 print()
 print("RESULT: %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
