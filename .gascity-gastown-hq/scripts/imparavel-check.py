@@ -580,6 +580,98 @@ def _pool_saturated(slots, candidates):
     return slots["small"] <= 0 and slots["big"] <= 0
 
 
+def _saturation_reason(slots, candidates):
+    """Classifies WHY _pool_saturated(slots, candidates) is True, so diagnostic
+    text can name the actual cause instead of collapsing three distinct causes
+    into one claim (ga-zkxdw GATE-FEEDBACK, attempt 5): the two call sites that
+    print when pool_saturated=True both said "slots cheios"/"saturado" even
+    when Cenário A (small=0 big=2, all-small candidates) or the confirmed-
+    zero-candidates fixture (small=2 big=0) had a lane plainly free — the
+    printed slot numbers contradicted the prose right next to them.
+
+    Delegates the True/False question to _pool_saturated() itself — never
+    re-implements or diverges from it — so a reason can only ever be returned
+    when _pool_saturated() agrees the pool IS saturated; this only adds an
+    explanation on top. Returns None when not saturated (mirrors
+    _pool_saturated exactly, including its `not slots` guard). Otherwise one of:
+      'zero_candidates' — this sweep's own scan confirmed 0 candidates in BOTH
+          lanes (Pilot's early-exit) — nothing is waiting, whatever slots show.
+          Checked FIRST: if nothing is waiting, that explains 0-dispatch on its
+          own regardless of what slots happen to read.
+      'both_empty'      — both lanes literally have 0 free slots.
+      'wrong_lane'      — some lane has a free slot, but this sweep's own
+          candidates don't want it — the lane(s) with candidates have none
+          free. Backpressure of shape, not capacity.
+    """
+    if not _pool_saturated(slots, candidates):
+        return None
+    if candidates and candidates["small"] == 0 and candidates["big"] == 0:
+        return "zero_candidates"
+    if slots["small"] <= 0 and slots["big"] <= 0:
+        return "both_empty"
+    return "wrong_lane"
+
+
+def _starved_lanes(slots, candidates):
+    """Names the lane(s) this sweep's own candidates want but have no free slot
+    — the concrete fact behind a 'wrong_lane' _saturation_reason. Reads ONLY
+    the same slots/candidates dicts _pool_saturated() already consulted — never
+    a["stuck"]'s per-bead lane labels, a separate signal (pilot-dispatchable.json)
+    that this bug's own history (the stale-snapshot GATE-FEEDBACK Fixture 1)
+    already showed can disagree with what a live sweep just measured."""
+    return "/".join(lane for lane in ("small", "big")
+                    if candidates[lane] > 0 and slots[lane] <= 0) or "?"
+
+
+def _saturation_note(reason, slots, candidates, stuck):
+    """Builds the pool_saturated ℹ️ note text for the given reason (see
+    _saturation_reason) — shared by the inline note and the ✅ summary recap
+    below so the two can never disagree (ga-zkxdw attempt 5 GATE-FEEDBACK: the
+    two call sites used to hardcode "slots cheios"/"saturado" for ALL three
+    causes). Caller must only pass a `reason` obtained from
+    _saturation_reason(slots, candidates) — i.e. never None — the same
+    pool_saturated-gates-slots-access convention already used at both call
+    sites below."""
+    ids = ", ".join("%s/%s" % (s["rig"], s["id"]) for s in stuck[:6])
+    if reason == "zero_candidates":
+        return ("o Pilot não viu candidato algum neste sweep (early-exit de zero"
+                " candidatos; slots small=%d big=%d livres) — não há nada"
+                " esperando; %d bead(s) do dispatchable podem estar"
+                " desatualizados ou já tratados: %s"
+                % (slots["small"], slots["big"], len(stuck), ids))
+    if reason == "wrong_lane":
+        return ("há vaga livre (small=%d big=%d), mas não na lane que este"
+                " sweep pede: candidatos small=%d big=%d, sem vaga pra lane %s"
+                " — backpressure de FORMA (demanda x capacidade no formato"
+                " errado), não falta de capacidade. %d construível(is) na"
+                " fila: %s"
+                % (slots["small"], slots["big"], candidates["small"], candidates["big"],
+                   _starved_lanes(slots, candidates), len(stuck), ids))
+    # "both_empty"
+    return ("pool cheio: nenhuma vaga em nenhuma lane (small=%d big=%d) — %d"
+            " construível(is) normalmente na fila atrás de capacidade cheia,"
+            " NÃO é falha: %s"
+            % (slots["small"], slots["big"], len(stuck), ids))
+
+
+def _saturation_summary(reason, slots, candidates):
+    """Short phrase for the ✅ success-path recap (main(), 'elif notes:' branch)
+    — same 3-way branch as _saturation_note(), terser. ga-zkxdw attempt 5
+    GATE-FEEDBACK: this line said "Pool saturado (slots cheios)" unconditionally
+    with NO numbers at all — even less checkable than the inline note it
+    referred back to. Every branch below carries the numbers it claims. Same
+    caller contract as _saturation_note(): `reason` must come from
+    _saturation_reason(), never None."""
+    if reason == "zero_candidates":
+        return ("Zero candidatos neste sweep (slots small=%d big=%d livres)"
+                % (slots["small"], slots["big"]))
+    if reason == "wrong_lane":
+        return ("Vaga na lane errada (slots small=%d big=%d, candidatos"
+                " small=%d big=%d)"
+                % (slots["small"], slots["big"], candidates["small"], candidates["big"]))
+    return "Pool cheio (slots small=%d big=%d)" % (slots["small"], slots["big"])
+
+
 def _last_sweep_boundary(lines):
     """Scan the shared PILOT_LOG snapshot `lines` (see _read_pilot_log_tail)
     backward for the most recent sweep boundary marker. Returns (kind, line)
@@ -719,6 +811,11 @@ def main():
     # use it (a genuine skip: empty routed_to, or a dispatch bug) — see
     # _pool_saturated() for the lane-aware logic (ga-zkxdw DEFEITO 1).
     pool_saturated = _pool_saturated(slots, candidates)
+    # ga-zkxdw attempt 5 GATE-FEEDBACK: same two inputs, classified ONCE here and
+    # threaded into both message sites below (the inline note + the ✅ summary
+    # recap), so the two can never name a different cause than pool_saturated's
+    # own verdict or than each other.
+    saturation_reason = _saturation_reason(slots, candidates)
 
     # ga-zkxdw attempt 4 GATE-FEEDBACK: a positively in-flight sweep may only
     # justify downgrading FAIL->WARN for as long as ITS OWN elapsed time stays
@@ -731,11 +828,7 @@ def main():
 
     if a["stuck"] and (p.get("alive") is not False):
         if pool_saturated:
-            notes.append(
-                "pool saturado (slots small=%d big=%d) — %d construível(is) normalmente"
-                " na fila atrás de slots cheios, NÃO é falha: %s"
-                % (slots["small"], slots["big"], len(a["stuck"]),
-                   ", ".join("%s/%s" % (s["rig"], s["id"]) for s in a["stuck"][:6])))
+            notes.append(_saturation_note(saturation_reason, slots, candidates, a["stuck"]))
         elif sweep_in_flight and not sweep_wait_expired:
             # ga-zkxdw DEFEITO 2: a sweep takes ~5-6min; a snapshot taken mid-sweep
             # cannot distinguish "skipped" from "not reached yet" — genuinely
@@ -879,8 +972,8 @@ def main():
                   % ("ocioso correto" if not building_now else "fila dispatchable parqueada (mas há build ativo acima)",
                      a["parked_count"]))
         elif notes:
-            print("  Pool saturado (slots cheios) — construíveis na fila normal atrás de capacidade"
-                  " (ver nota ℹ️ acima). Alta demanda saudável, não travamento.")
+            print("  %s (ver nota ℹ️ acima). Alta demanda saudável, não travamento."
+                  % _saturation_summary(saturation_reason, slots, candidates))
         else:
             print("  Nenhuma construível parada em silêncio; gate fluindo ou ocioso-com-fila-vazia;"
                   " pilot e Dolt vivos.")

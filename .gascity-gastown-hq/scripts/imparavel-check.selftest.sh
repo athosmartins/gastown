@@ -227,8 +227,14 @@ except SystemExit as e:
     _exit_code = e.code
 _out = _buf.getvalue()
 eq("saturated pool (small=0 big=0): exit code 0 (✅, no ❌/⚠️)", _exit_code, 0)
-eq("saturated pool: report mentions 'pool saturado'", "pool saturado" in _out, True)
-eq("saturated pool: ✅ summary names the saturation, not silence", "Pool saturado (slots cheios)" in _out, True)
+# ga-zkxdw attempt 5 GATE-FEEDBACK: both lanes are literally 0 here (the one
+# real "both_empty" case) — the exact wording changed from "pool saturado" to
+# "pool cheio" (matching the Mayor's spec text), but the claim itself is still
+# correctly made, with numbers, since this fixture genuinely has 0 free
+# capacity in both lanes.
+eq("saturated pool: report mentions 'pool cheio'", "pool cheio" in _out, True)
+eq("saturated pool: ✅ summary names it with numbers, not silence",
+   "Pool cheio (slots small=0 big=0)" in _out, True)
 eq("saturated pool: report does NOT say NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _out, False)
 
 print("── main() end-to-end: a lane still has room + stuck → STILL ❌ (real stall preserved) ──")
@@ -342,6 +348,57 @@ eq("a lane has room, no candidates data → NOT saturated (fallback, old behavio
    m._pool_saturated({"small": 0, "big": 2}, None), False)
 eq("no slots data at all → NOT saturated (unknown must never suppress a real stall)",
    m._pool_saturated(None, {"small": 9, "big": 0}), False)
+
+print("── ga-zkxdw attempt 5 GATE-FEEDBACK: _saturation_reason() names WHY pool_saturated is "
+      "True — the notes/summary text must never say cheio/saturado unless it actually is ──")
+eq("both lanes 0, no candidates data → both_empty",
+   m._saturation_reason({"small": 0, "big": 0}, None), "both_empty")
+eq("both lanes 0 even WITH unmatched demand present → still both_empty (slots decide this, not candidates)",
+   m._saturation_reason({"small": 0, "big": 0}, {"small": 3, "big": 0}), "both_empty")
+eq("Cenário A shape (small=0/big=2, candidates all small) → wrong_lane",
+   m._saturation_reason({"small": 0, "big": 2}, {"small": 9, "big": 0}), "wrong_lane")
+eq("confirmed zero candidates this sweep → zero_candidates regardless of slots",
+   m._saturation_reason({"small": 2, "big": 0}, {"small": 0, "big": 0}), "zero_candidates")
+eq("overlap (confirmed zero candidates AND both slots 0) → zero_candidates wins: nothing is "
+   "waiting explains 0-dispatch on its own",
+   m._saturation_reason({"small": 0, "big": 0}, {"small": 0, "big": 0}), "zero_candidates")
+eq("not saturated (room + matching demand) → None",
+   m._saturation_reason({"small": 1, "big": 0}, {"small": 1, "big": 0}), None)
+eq("slots None → None (mirrors _pool_saturated's own `not slots` guard)",
+   m._saturation_reason(None, {"small": 1, "big": 0}), None)
+
+eq("_starved_lanes: small starved (small=0 slot, small=9 candidates, big has room but no demand)",
+   m._starved_lanes({"small": 0, "big": 2}, {"small": 9, "big": 0}), "small")
+eq("_starved_lanes: big starved (mirror case)",
+   m._starved_lanes({"small": 2, "big": 0}, {"small": 0, "big": 9}), "big")
+
+_note_a = m._saturation_note("wrong_lane", {"small": 0, "big": 2}, {"small": 9, "big": 0},
+                              [{"id": "wa-S0", "rig": "WA"}])
+eq("wrong_lane note: no 'chei' substring (cheio/cheios/cheia)", "chei" in _note_a, False)
+eq("wrong_lane note: no 'satura' substring (saturado/saturação/...)", "satura" in _note_a, False)
+eq("wrong_lane note: names the starved lane computed by _starved_lanes",
+   m._starved_lanes({"small": 0, "big": 2}, {"small": 9, "big": 0}) in _note_a, True)
+
+_note_z = m._saturation_note("zero_candidates", {"small": 2, "big": 0}, {"small": 0, "big": 0},
+                              [{"id": "ga-STALE", "rig": "HQ"}])
+eq("zero_candidates note: no 'chei' substring", "chei" in _note_z, False)
+eq("zero_candidates note: no 'satura' substring", "satura" in _note_z, False)
+eq("zero_candidates note: says this sweep saw no candidate",
+   ("candidato" in _note_z and "sweep" in _note_z), True)
+
+_note_both = m._saturation_note("both_empty", {"small": 0, "big": 0}, None,
+                                 [{"id": "wa-X", "rig": "WA"}])
+eq("both_empty note: DOES say 'chei' (the one case this claim is true — must not "
+   "become a text false-negative)", "chei" in _note_both, True)
+
+_sum_a = m._saturation_summary("wrong_lane", {"small": 0, "big": 2}, {"small": 9, "big": 0})
+eq("wrong_lane summary: no chei/satura", ("chei" in _sum_a) or ("satura" in _sum_a), False)
+eq("wrong_lane summary: carries the real numbers (0, 2, 9)",
+   all(n in _sum_a for n in ("0", "2", "9")), True)
+_sum_z = m._saturation_summary("zero_candidates", {"small": 2, "big": 0}, {"small": 0, "big": 0})
+eq("zero_candidates summary: no chei/satura", ("chei" in _sum_z) or ("satura" in _sum_z), False)
+_sum_both = m._saturation_summary("both_empty", {"small": 0, "big": 0}, None)
+eq("both_empty summary: DOES say chei", "chei" in _sum_both, True)
 
 print("── ga-zkxdw DEFEITO 2: _sweep_in_flight() detects an unfinished Pilot sweep ──")
 m._sh = _fake_sh_factory(
@@ -613,6 +670,15 @@ except SystemExit as e:
     _exitZ = e.code
 eq("confirmed-zero candidates this sweep → exit 0, never ❌ (not a fabricated 9)", _exitZ, 0)
 eq("confirmed-zero candidates: report does NOT say NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _bufZ.getvalue(), False)
+# ga-zkxdw attempt 5 GATE-FEEDBACK: slots here are small=2 big=0 — a lane plainly
+# has room — so the report must not claim the pool is full, and must say WHY
+# nothing dispatched (this sweep saw zero real candidates), not just "cheio".
+eq("REGRESSION GREP: this fixture has a free slot (small=2>0) → no 'chei' anywhere in report",
+   "chei" in _bufZ.getvalue(), False)
+eq("REGRESSION GREP: this fixture has a free slot (small=2>0) → no 'satura' anywhere in report",
+   "satura" in _bufZ.getvalue(), False)
+eq("confirmed-zero candidates: report says the Pilot saw no candidate this sweep",
+   ("candidato" in _bufZ.getvalue() and "sweep" in _bufZ.getvalue()), True)
 
 m.check_approved, m.check_gate, m.check_pilot, m.check_dolt = _zz_ca, _zz_cg, _zz_cp, _zz_cd
 m._pilot_slots, m._pilot_candidates, m._sweep_in_flight, m.RIGS = _zz_slots, _zz_cand, _zz_swf, _zz_rigs
@@ -660,6 +726,20 @@ except SystemExit as e:
 eq("Cenário A: wrong-shape free slots (small=0/big=2, all-small candidates) → exit 0, not ❌",
    _exitA, 0)
 eq("Cenário A: report does NOT say NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _bufA.getvalue(), False)
+# ga-zkxdw attempt 5 GATE-FEEDBACK: big=2 is plainly free here — the report must
+# not claim the pool is full, and must name the actual wrong-shape lane (small).
+eq("REGRESSION GREP: Cenário A has a free slot (big=2>0) → no 'chei' anywhere in report",
+   "chei" in _bufA.getvalue(), False)
+eq("REGRESSION GREP: Cenário A has a free slot (big=2>0) → no 'satura' anywhere in report",
+   "satura" in _bufA.getvalue(), False)
+# Precise phrase check (not just "small" anywhere — that substring would also
+# trivially match the pre-existing slots/candidates/lane-annotation lines that
+# print regardless of this fix): the NEW wrong_lane branch must itself name the
+# starved lane via _starved_lanes(), which computes "small" for this fixture.
+eq("Cenário A: report's saturation text itself names the wrong lane ('sem vaga pra lane small')",
+   "sem vaga pra lane small" in _bufA.getvalue(), True)
+eq("Cenário A: report's saturation text says backpressure is about FORMA, not capacity",
+   "backpressure de FORMA" in _bufA.getvalue(), True)
 
 # Cenário B: lane is now RIGHT (small=2 free, matches candidates) — defeito 1 alone
 # would flag this. Only defeito 2 (sweep still running) can save it.
@@ -697,6 +777,33 @@ except SystemExit as e:
 eq("Cenário C: room+demand+sweep done+0 dispatch → exit 1 (❌ preserved, no regression)",
    _exitC, 1)
 eq("Cenário C: report says NÃO IMPARÁVEL", "NÃO IMPARÁVEL" in _bufC.getvalue(), True)
+
+# Cenário E (ga-zkxdw attempt 5): BOTH lanes literally 0 free slots — the one
+# real case where the report legitimately MUST say the pool is full. Candidates
+# carry real demand in both lanes (not the confirmed-zero-candidates shape) so
+# this fixture is unambiguously "both_empty", not "zero_candidates" — a false
+# NEGATIVE here (never saying "cheio" when it is actually true) would be the
+# mirror-image mistake of Cenário A/the zero-candidates fixture.
+m.check_approved = lambda: {
+    "total": 1, "parked_count": 0, "in_gate_count": 0, "buildable_count": 1,
+    "flowing_count": 0, "held_count": 0,
+    "stuck": [{"id": "wa-BOTHFULL", "rig": "WA", "title": "both lanes full", "lane": "small"}],
+    "read_err": [], "warns": [], "from_dispatchable": True, "snap_age_min": 1.0,
+}
+m._pilot_slots = lambda lines: {"small": 0, "big": 0}
+m._pilot_candidates = lambda lines: {"small": 5, "big": 3}
+m._sweep_in_flight = lambda lines: False
+_bufE = io.StringIO()
+_exitE = None
+try:
+    with contextlib.redirect_stdout(_bufE):
+        m.main()
+except SystemExit as e:
+    _exitE = e.code
+eq("Cenário E: both lanes literally 0 free slots → exit 0 (healthy backpressure, not ❌)", _exitE, 0)
+eq("Cenário E: report DOES say cheio (the one case where this claim is true — a text "
+   "false-negative here would be as wrong as Cenário A's false-positive)",
+   "chei" in _bufE.getvalue(), True)
 
 m.check_approved, m.check_gate, m.check_pilot, m.check_dolt = _z_ca, _z_cg, _z_cp, _z_cd
 m._pilot_slots, m._pilot_candidates, m._sweep_in_flight, m.RIGS = _z_slots, _z_cand, _z_swf, _z_rigs
