@@ -447,18 +447,47 @@ def check_gate():
 
 
 # ── CHECK 3 & 4: pilot + dolt liveness ───────────────────────────────────────
-def _pilot_slots():
-    """Most recent 'Available slots: small=X  big=Y' line from the Pilot log —
-    the same line pilot-dispatcher.sh emits from MAX_lane - in_flight_lane.
-    Returns {'small': int, 'big': int}, or None if the log is missing/unreadable
-    or has no such line yet. Caller must treat None as 'unknown' and fall back
-    to the pre-ga-wmrr strict behavior — an unreadable signal must never
-    SUPPRESS a real stall; only a POSITIVELY-confirmed 0/0 may downgrade one."""
+def _current_sweep_lines():
+    """Lines of PILOT_LOG's tail belonging ONLY to the most recent sweep, bounded
+    by the last '=== Pilot sweep start' marker in view. Returns None if no start
+    marker is visible in the tail window — a rotated log, or the current sweep
+    has already produced more than the tail window's worth of lines before
+    reaching the point being read — rather than guess from whatever happens to
+    be in view.
+
+    Shared by _pilot_slots()/_pilot_candidates() so both read the SAME segment:
+    the two signals must be joined by sweep (the event), never by file proximity.
+    GATE-FEEDBACK on ga-zkxdw attempt 1 (reviewer FAIL, 2026-08-03): a backward
+    scan with no boundary awareness paired the CURRENT sweep's 'Available slots'
+    with an OLDER sweep's 'Candidates split' line whenever the current sweep hit
+    the zero-candidates early exit — which logs 'Available slots' (unconditional,
+    pilot-dispatcher.sh ~L3974) but then exits at ~L4491-4493 without ever
+    reaching 'Candidates split' (~L4525). Two readings from different moments,
+    joined by nothing but adjacency in the file — the exact bug class this whole
+    check exists to catch, reintroduced inside its own fix."""
     r = _sh(["tail", "-n", "500", PILOT_LOG])
     if not (r and r.stdout):
         return None
+    lines = r.stdout.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if "=== Pilot sweep start" in lines[i]:
+            return lines[i:]
+    return None
+
+
+def _pilot_slots():
+    """'Available slots: small=X  big=Y' from the CURRENT sweep only (see
+    _current_sweep_lines) — the same line pilot-dispatcher.sh emits from
+    MAX_lane - in_flight_lane. Returns {'small': int, 'big': int}, or None if no
+    sweep boundary is visible, or this sweep hasn't reached that line yet.
+    Caller must treat None as 'unknown' and fall back to the pre-ga-wmrr strict
+    behavior — an unreadable signal must never SUPPRESS a real stall; only a
+    POSITIVELY-confirmed 0/0 may downgrade one."""
+    seg = _current_sweep_lines()
+    if seg is None:
+        return None
     import re
-    for line in reversed(r.stdout.splitlines()):
+    for line in seg:
         mt = re.search(r"Available slots:\s*small=(\d+)\s+big=(\d+)", line)
         if mt:
             return {"small": int(mt.group(1)), "big": int(mt.group(2))}
@@ -466,22 +495,33 @@ def _pilot_slots():
 
 
 def _pilot_candidates():
-    """Most recent 'Candidates split: small=N  big=M' line from the Pilot log —
-    the Pilot's OWN per-lane classification of its candidate scan (classify_lane:
-    explicit lane:* label, then story.size_check==epic, then acceptance-criteria
-    count, default small). Reused as-is rather than re-implementing that heuristic
-    here (ga-zkxdw DEFEITO 1). Returns {'small': int, 'big': int}, or None if the
-    log is missing/unreadable or has no such line yet — caller must treat None as
-    'unknown' and fall back to the pre-fix both-lanes-empty check, same fail-open
-    convention as _pilot_slots()."""
-    r = _sh(["tail", "-n", "500", PILOT_LOG])
-    if not (r and r.stdout):
+    """The CURRENT sweep's (see _current_sweep_lines) own per-lane classification
+    of its candidate scan (classify_lane: explicit lane:* label, then
+    story.size_check==epic, then acceptance-criteria count, default small).
+    Reused as-is rather than re-implementing that heuristic here (ga-zkxdw
+    DEFEITO 1). Three-way result, not two:
+      - 'Candidates split: small=N  big=M' present → {'small': N, 'big': M}.
+      - absent, but 'No dispatchable candidates (Tier 1 or Tier 2).' present →
+        {'small': 0, 'big': 0}. This is an EXPLICIT zero, not unknown: that
+        early exit (pilot-dispatcher.sh ~L4491-4493) happens BEFORE the split
+        log line, so its absence here means the sweep had zero candidates, not
+        'hasn't gotten there yet'.
+      - neither present (sweep still running past 'start', or no sweep boundary
+        visible at all) → None = genuinely unknown.
+    Caller must treat None the same fail-open way as _pilot_slots() — an
+    unreadable signal must never SUPPRESS a real stall, only a
+    positively-confirmed reading (a count OR the explicit-zero exit) may."""
+    seg = _current_sweep_lines()
+    if seg is None:
         return None
     import re
-    for line in reversed(r.stdout.splitlines()):
+    for line in seg:
         mt = re.search(r"Candidates split:\s*small=(\d+)\s+big=(\d+)", line)
         if mt:
             return {"small": int(mt.group(1)), "big": int(mt.group(2))}
+    for line in seg:
+        if "No dispatchable candidates (Tier 1 or Tier 2)." in line:
+            return {"small": 0, "big": 0}
     return None
 
 
