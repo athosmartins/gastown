@@ -1771,19 +1771,40 @@ def hung_run_verdict(age_sec, hang_sec, n_verdict_beads, n_delivered,
 
 
 def error_requeue_verdict(age_sec, threshold_sec, source_resolved, source_closed,
-                          source_needs_human, requeue_count, max_attempts):
+                          source_needs_human, requeue_count, max_attempts,
+                          branch_state="unknown"):
     """PURE decision for a gate-status:error marker. Returns:
-      close:source-done      — the source bead is CLOSED (work merged/abandoned) → the
-                               marker is a leftover; close it, do NOT requeue (checked
-                               FIRST, before the age gate: a done marker never waits)
+      close:source-done      — the source bead is CLOSED **and branch_state confirms
+                               the work actually landed (merged) or the branch is gone
+                               (missing)** → the marker is a leftover; close it, do NOT
+                               requeue (checked FIRST, before the age gate: a done
+                               marker never waits). A closed source bead ALONE does NOT
+                               prove this (ga-hckn3 — the textually identical gap FIX 7's
+                               deferred_requeue_verdict had before ga-gd706): the normal
+                               dog-self-closes-its-sling-bead-on-submission doctrine
+                               closes the source immediately after /gate-done, regardless
+                               of whether a reviewer ever ran. Same discipline as FIX 4's
+                               orphan_marker_verdict (ga-w5agg/ga-d2jil) and FIX 7's
+                               post-ga-gd706 deferred_requeue_verdict — branch_state is
+                               the truth, a closed source is not.
       skip:young             — in error < threshold; let a transient self-clear first
       skip:parked-needs-human— source bead carries gate:needs-human (ga-acb permanent
                                park) → deliberately awaiting a human; never requeue
       escalate:oscillating   — already requeued max_attempts times and it keeps
                                re-erroring → stop the infinite loop, page the Mayor
-      requeue                — genuinely stuck transient error → error→queued
+      requeue                — genuinely stuck transient error → error→queued. Also the
+                               recovery path when the source is CLOSED but branch_state
+                               is 'unmerged' (real stranding) or 'unknown' (can't verify)
+                               — falls through to here instead of closing, same as FIX 7's
+                               post-ga-gd706 fall-through.
+    branch_state ∈ {'merged','unmerged','missing','unknown'} (ga-hckn3, porting ga-gd706's
+    fix shape from FIX 7): only decides the outcome when source_resolved and
+    source_closed are both True — the sole case where 'closed' could lie about 'done'.
+    'unmerged' (real stranding) and 'unknown' (can't verify — fail-safe default) both
+    fall through to the age/needs-human/oscillation handling below instead of closing;
+    NEVER false-close a marker whose branch hasn't actually landed.
     """
-    if source_resolved and source_closed:
+    if source_resolved and source_closed and branch_state in ("merged", "missing"):
         return "close:source-done"
     if age_sec <= threshold_sec:
         return "skip:young"
@@ -2713,8 +2734,15 @@ def requeue_error_markers(now, rstate):
                     label_count = 0
         req_count = max(label_count, rstate.error_requeues.get(mid, 0))
         resolved, sclosed, needs_human = _source_bead_state(source_bead, rig_name)
+        # Pay for the git-ancestry check ONLY when the source is CLOSED — the sole case
+        # where 'source closed' could be a FALSE 'done' (ga-hckn3, porting ga-gd706: the
+        # normal dog-self-closes-its-sling-bead-on-submission doctrine closes the source
+        # immediately after /gate-done, regardless of whether a reviewer ever ran).
+        # Mirrors reap_orphan_and_stale_markers' FIX 4 gating exactly.
+        branch_state = _branch_merged_state(branch, rig_name) if (resolved and sclosed) else "unknown"
         verdict = error_requeue_verdict(age, ERROR_REQUEUE_MINUTES * 60, resolved,
-                                        sclosed, needs_human, req_count, ERROR_REQUEUE_MAX_ATTEMPTS)
+                                        sclosed, needs_human, req_count, ERROR_REQUEUE_MAX_ATTEMPTS,
+                                        branch_state)
 
         if verdict == "skip:young":
             continue
@@ -2726,16 +2754,17 @@ def requeue_error_markers(now, rstate):
 
         if verdict == "close:source-done":
             if GRW_DRY_RUN:
-                print("[watchdog] requeue DRY-RUN would CLOSE error marker %s (source bead %s closed — work done)"
-                      % (mid, source_bead), flush=True)
-                _recovery_ledger("would_close_done_marker", {"marker": mid, "source_bead": source_bead, "branch": branch, "dry_run": True})
+                print("[watchdog] requeue DRY-RUN would CLOSE error marker %s (source bead %s closed, branch %s VERIFIED merged/absent — work done)"
+                      % (mid, source_bead, branch_state), flush=True)
+                _recovery_ledger("would_close_done_marker", {"marker": mid, "source_bead": source_bead, "branch": branch, "branch_state": branch_state, "dry_run": True})
                 acted += 1
                 continue
             set_gate_status_py(mid, "superseded")
             sh(["bd", "-C", CITY, "close", mid,
-                "-r", "source bead %s closed — gate work done/abandoned; error marker superseded (grw error-marker self-heal)" % source_bead], timeout=25)
-            _recovery_ledger("closed_done_marker", {"marker": mid, "source_bead": source_bead, "branch": branch})
-            print("[watchdog] CLOSED done error marker %s (source %s closed)" % (mid, source_bead), flush=True)
+                "-r", "source bead %s closed and branch %s VERIFIED merged/absent (%s) — error marker superseded (grw error-marker self-heal, ga-hckn3 hardening — merge confirmed via git ancestry, not assumed from a closed source)"
+                % (source_bead, branch or "?", branch_state)], timeout=25)
+            _recovery_ledger("closed_done_marker", {"marker": mid, "source_bead": source_bead, "branch": branch, "branch_state": branch_state})
+            print("[watchdog] CLOSED done error marker %s (source %s closed, branch %s)" % (mid, source_bead, branch_state), flush=True)
             acted += 1
             continue
 
@@ -3639,9 +3668,25 @@ def _selftest():
     # free — this pins that inheritance explicitly rather than relying on the general
     # non-active-state case above.
     ok(frozen_reviewer_verdict("creating", 5000, 900) == "keep", "booting session (state=creating) → keep, NEVER killed (boot-grace inherited for free, AC3 ga-pp5vh)")
-    # FIX 2 — error_requeue_verdict (gate-status:error marker requeue decision)
+    # FIX 2 — error_requeue_verdict (gate-status:error marker requeue decision; now
+    # branch-merge-aware, ga-hckn3 — ports FIX 4's orphan_marker_verdict/FIX 7's
+    # deferred_requeue_verdict branch_state discipline to the sibling gate-status:error
+    # path, which had the textually identical gap)
     E = 8 * 60
-    ok(error_requeue_verdict(300, E, True, True, False, 0, 3) == "close:source-done", "source resolved+CLOSED → close regardless of age (checked first)")
+    ok(error_requeue_verdict(300, E, True, True, False, 0, 3, "merged") == "close:source-done", "source resolved+CLOSED+branch MERGED → close regardless of age (checked first)")
+    ok(error_requeue_verdict(300, E, True, True, False, 0, 3, "missing") == "close:source-done", "source resolved+CLOSED+branch MISSING (abandoned) → close regardless of age")
+    # the ga-w5agg/ga-d2jil bug class (ga-hckn3: FIX 2 had the same gap as pre-fix FIX 7/
+    # ga-gd706): a closed source bead ALONE does NOT prove the branch landed — the normal
+    # dog-self-closes-its-sling-bead-on-submission doctrine closes it immediately after
+    # /gate-done regardless of whether a reviewer ever ran. branch_state UNMERGED or
+    # UNKNOWN must fall through to the normal age/needs-human/oscillation handling below,
+    # NEVER silently close-as-done.
+    ok(error_requeue_verdict(600, E, True, True, False, 0, 3, "unmerged") == "requeue", "source CLOSED but branch UNMERGED (real stranding) → falls through to requeue, NEVER false-close (ga-hckn3)")
+    ok(error_requeue_verdict(600, E, True, True, False, 0, 3, "unknown") == "requeue", "source CLOSED but branch state UNKNOWN (can't verify) → falls through to requeue, fail-safe (ga-hckn3)")
+    ok(error_requeue_verdict(300, E, True, True, False, 0, 3, "unmerged") == "skip:young", "source CLOSED + branch UNMERGED but still in error < threshold → falls through to skip:young, not an immediate close (ga-hckn3)")
+    ok(error_requeue_verdict(600, E, True, True, False, 3, 3, "unmerged") == "escalate:oscillating", "source CLOSED + branch UNMERGED + attempts exhausted → falls through to escalate, not a silent close (ga-hckn3)")
+    ok(error_requeue_verdict(600, E, True, True, True, 0, 3, "unmerged") == "skip:parked-needs-human", "source CLOSED + branch UNMERGED but source ALSO needs-human → parked carve-out still wins over a bare requeue fall-through (ga-hckn3)")
+    ok(error_requeue_verdict(600, E, True, True, False, 0, 3) == "requeue", "branch_state omitted → defaults to 'unknown' (fail-safe default, never close-as-done without explicit verification)")
     ok(error_requeue_verdict(60, E, True, False, False, 0, 3) == "skip:young", "in error < threshold → skip:young (let transient self-clear)")
     ok(error_requeue_verdict(600, E, True, False, True, 0, 3) == "skip:parked-needs-human", "source resolved + needs-human → NEVER requeue (the ga-c1s8 circuit-break carve-out)")
     ok(error_requeue_verdict(600, E, False, False, False, 0, 3) == "requeue", "source UNRESOLVABLE → fail-toward-recovery requeue (bounded by the oscillation cap below — the ga-c1s8 failure mode when rig resolution silently fails)")

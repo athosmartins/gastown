@@ -285,15 +285,39 @@ else:
     bad("expected requeue for unresolved source")
 
 # ── Scenario 14 (FIX2 iv): error marker whose source bead is CLOSED → close ───
-print("Scenario 14 (FIX2 iv): source bead CLOSED (merged/abandoned) → close marker, NOT requeue")
-if m.error_requeue_verdict(ETH + 600, ETH, True, True, False, 0, KMAX) == "close:source-done":
-    ok("done marker (closed source bead) is closed, never re-queued")
+print("Scenario 14 (FIX2 iv): source bead CLOSED + branch VERIFIED merged/absent → close marker, NOT requeue")
+if m.error_requeue_verdict(ETH + 600, ETH, True, True, False, 0, KMAX, "merged") == "close:source-done":
+    ok("done marker (closed source bead, branch MERGED) is closed, never re-queued")
 else:
-    bad("expected close:source-done, got %r" % (m.error_requeue_verdict(ETH + 600, ETH, True, True, False, 0, KMAX),))
-if m.error_requeue_verdict(30, ETH, True, True, False, 0, KMAX) == "close:source-done":
-    ok("closed source short-circuits BEFORE the age gate — a done marker closes immediately, doesn't wait")
+    bad("expected close:source-done, got %r" % (m.error_requeue_verdict(ETH + 600, ETH, True, True, False, 0, KMAX, "merged"),))
+if m.error_requeue_verdict(30, ETH, True, True, False, 0, KMAX, "merged") == "close:source-done":
+    ok("closed source + branch MERGED short-circuits BEFORE the age gate — a done marker closes immediately, doesn't wait")
 else:
-    bad("expected close:source-done for young+closed")
+    bad("expected close:source-done for young+closed+merged")
+if m.error_requeue_verdict(ETH + 600, ETH, True, True, False, 0, KMAX, "missing") == "close:source-done":
+    ok("done marker (closed source bead, branch MISSING/abandoned) is also closed — same as merged")
+else:
+    bad("expected close:source-done for closed+missing, got %r" % (m.error_requeue_verdict(ETH + 600, ETH, True, True, False, 0, KMAX, "missing"),))
+
+# ── Scenario 14b (FIX2 iv, ga-hckn3): closed source ALONE does NOT prove done ──
+# The ga-w5agg/ga-d2jil bug class, ported here from FIX 4's orphan_marker_verdict via
+# ga-gd706's FIX 7 hardening: the normal dog-self-closes-its-sling-bead-on-submission
+# doctrine closes the source bead immediately after /gate-done, regardless of whether a
+# reviewer ever ran — so "source closed" alone is common, not rare, and must NEVER
+# false-close a marker whose branch never actually landed.
+print("Scenario 14b (FIX2 iv, ga-hckn3): source CLOSED but branch UNMERGED/UNKNOWN → NEVER close, falls through")
+if m.error_requeue_verdict(ETH + 600, ETH, True, True, False, 0, KMAX, "unmerged") == "requeue":
+    ok("closed source + branch UNMERGED (real stranding) → falls through to requeue, NEVER false-close")
+else:
+    bad("expected requeue for closed+unmerged (must NOT false-close), got %r" % (m.error_requeue_verdict(ETH + 600, ETH, True, True, False, 0, KMAX, "unmerged"),))
+if m.error_requeue_verdict(ETH + 600, ETH, True, True, False, 0, KMAX, "unknown") == "requeue":
+    ok("closed source + branch state UNKNOWN (git check couldn't verify) → falls through to requeue, fail-safe")
+else:
+    bad("expected requeue for closed+unknown (fail-safe), got %r" % (m.error_requeue_verdict(ETH + 600, ETH, True, True, False, 0, KMAX, "unknown"),))
+if m.error_requeue_verdict(ETH + 600, ETH, True, True, False, 0, KMAX) == "requeue":
+    ok("branch_state omitted defaults to 'unknown' — never close-as-done without explicit verification")
+else:
+    bad("expected requeue when branch_state omitted (default must be fail-safe), got %r" % (m.error_requeue_verdict(ETH + 600, ETH, True, True, False, 0, KMAX),))
 
 # ── Scenario 15 (FIX2 v): oscillating marker (K re-errors) → escalate ─────────
 print("Scenario 15 (FIX2 v): marker re-errored ERROR_REQUEUE_MAX_ATTEMPTS times → escalate, NOT infinite requeue")
