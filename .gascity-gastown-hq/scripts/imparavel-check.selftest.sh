@@ -99,6 +99,34 @@ eq("un-parked bead NOT in the gate set → stuck", C("other", ["ctx:ready"], IN_
 print("── flowing ──")
 eq("story:in-flight → flowing", C("b", ["ctx:ready", "story:in-flight"], NONE)[0], "flowing")
 
+print("── ga-26us5: classify_in_flight() — a story:in-flight LABEL alone is not proof of "
+      "progress; only real recent updated_at is (AC1/AC3) ──")
+CIF = m.classify_in_flight
+eq("just updated (0min), well within a 180min threshold -> building", CIF(0.0, 180.0), "building")
+eq("fresh (5min) within threshold -> building", CIF(5.0, 180.0), "building")
+eq("exactly at the threshold boundary (180min == 180min) -> building (inclusive)",
+   CIF(180.0, 180.0), "building")
+eq("just past the boundary (180.1min > 180min) -> delivery-stalled", CIF(180.1, 180.0), "delivery-stalled")
+eq("4h stale (240min) against the default 3h(180min) threshold -> delivery-stalled "
+   "(reproduces the wa-v66xt shape from the original report)", CIF(240.0, 180.0), "delivery-stalled")
+eq("unknown age (None, e.g. missing/unparseable updated_at) -> delivery-stalled, NEVER a free pass",
+   CIF(None, 180.0), "delivery-stalled")
+
+print("── ga-26us5 AC2: DELIVERY_STALL_HOURS is IMPORTED from throughput-stall-watchdog.py, "
+      "never a new hardcoded number — cross-checked against an independent fresh import of "
+      "the real source, so the two checks cannot silently drift apart ──")
+import os
+eq("import of DELIVERY_STALL_HOURS from throughput-stall-watchdog.py succeeded (no fallback warning)",
+   m._TSW_LOAD_WARN, None)
+_tsw_indep_spec = importlib.util.spec_from_file_location(
+    "tsw_independent",
+    os.path.join(os.path.dirname(os.path.abspath(m.__file__)), "throughput-stall-watchdog.py"))
+_tsw_indep = importlib.util.module_from_spec(_tsw_indep_spec)
+_tsw_indep_spec.loader.exec_module(_tsw_indep)
+eq("imparavel-check.DELIVERY_STALL_HOURS == an INDEPENDENTLY loaded throughput-stall-watchdog.DELIVERY_STALL_HOURS "
+   "(not just internal self-consistency — proves single-sourcing, not a coincidental fallback match)",
+   m.DELIVERY_STALL_HOURS, _tsw_indep.DELIVERY_STALL_HOURS)
+
 print("── _label_is_gate_inflight helper ──")
 eq("gate:reviewing in-flight", m._label_is_gate_inflight("gate:reviewing"), True)
 eq("gate:needs-rebase in-flight", m._label_is_gate_inflight("gate:needs-rebase"), True)
@@ -267,6 +295,10 @@ snap = {"generated_at": "2999-01-01T00:00:00Z", "ttl_seconds": 600, "count": 2,
             {"id": "wa-STUCK",  "store": "whatsapp_automation", "title": "buildable, never built"}]}
 _fd, _p = tempfile.mkstemp(suffix=".json"); os.write(_fd, json.dumps(snap).encode()); os.close(_fd)
 m.DISPATCHABLE_JSON = _p
+_ca_orig_age_min = m._age_min                       # ga-26us5: restore below — this was
+                                                      # previously left permanently faked,
+                                                      # silently corrupting every later test
+                                                      # that depends on real _age_min() output.
 m._age_min = lambda iso: 1.0                       # treat snapshot as 1 min old (live)
 m._gate_source_beads = lambda: {"wa-INGATE"}       # only the in-gate bead has an open marker
 _LIVE = {"wa-INGATE": ["ctx:ready", "exec:auto", "gate:reviewing"],
@@ -274,6 +306,7 @@ _LIVE = {"wa-INGATE": ["ctx:ready", "exec:auto", "gate:reviewing"],
 m._bd_show_labels_text = lambda root, bid: _LIVE.get(bid)
 _a = m.check_approved()
 os.unlink(_p)
+m._age_min = _ca_orig_age_min
 eq("in_gate_count == 1", _a["in_gate_count"], 1)
 eq("stuck list == [wa-STUCK] (in-gate NOT flagged, genuine IS)",
    [s["id"] for s in _a["stuck"]], ["wa-STUCK"])
@@ -884,6 +917,106 @@ eq("mutant content: candidates ALSO reflect sweep N — same snapshot as slots, 
    _captured.get("candidates"), {"small": 1, "big": 0})
 eq("mutant content: sweep_in_flight ALSO reflects sweep N (complete) — same snapshot, not sweep N+1 (in-flight)",
    _captured.get("sweep_in_flight"), False)
+
+print("── ga-26us5 end-to-end: main() must not count a delivery-stalled story:in-flight bead as "
+      "building, must name it as awaiting-human, and must not let it alone sustain a ✅ "
+      "'producing' claim (AC1/AC3/AC4) ──")
+
+def _if_iso_ago(minutes_ago):
+    return _time4.strftime("%Y-%m-%dT%H:%M:%SZ", _time4.gmtime(m.NOW - minutes_ago * 60))
+
+_if_orig_run = m.subprocess.run
+_if_calls = []
+
+m.check_approved = lambda: {
+    "total": 0, "parked_count": 0, "in_gate_count": 0, "buildable_count": 0,
+    "flowing_count": 0, "held_count": 0, "stuck": [],
+    "read_err": [], "warns": [], "from_dispatchable": True, "snap_age_min": 1.0,
+}
+m.check_gate = lambda: {"active": [], "parked": [], "last_pass_min": 1.0,
+                         "reviewer_alive": True, "oldest_active_min": None,
+                         "stalled": False, "stall_reason": ""}
+m.check_pilot = lambda: {"alive": True, "last_sweep_min": 0.5}
+m.check_dolt = lambda: {"responsive": True, "latency_ms": 10}
+m.RIGS = [("HQ", "/fake/hq/root")]
+
+# Mixed fixture: one genuinely fresh build, one 4h-stale (the wa-v66xt shape), one with
+# unknown age, and one wisp-id (must stay excluded regardless — pre-existing, unrelated
+# behavior this fix must not disturb).
+_if_mixed_fixture = [
+    {"id": "ga-freshb", "updated_at": _if_iso_ago(5)},
+    {"id": "ga-stale4h", "updated_at": _if_iso_ago(240)},
+    {"id": "ga-noage", "updated_at": None},
+    {"id": "ga-wisp-skip", "updated_at": _if_iso_ago(1)},
+]
+def _if_fake_run_mixed(args, **kwargs):
+    _if_calls.append(args)
+    return types.SimpleNamespace(returncode=0, stdout=json.dumps(_if_mixed_fixture))
+m.subprocess.run = _if_fake_run_mixed
+
+_bufI = io.StringIO()
+_exitI = None
+try:
+    with contextlib.redirect_stdout(_bufI):
+        m.main()
+except SystemExit as e:
+    _exitI = e.code
+_outI = _bufI.getvalue()
+_if_lines = _outI.split("\n")
+_if_building_line = next((l for l in _if_lines if l.startswith("🔨 EM BUILD AGORA")), "")
+_if_stalled_line = next((l for l in _if_lines if l.startswith("⏸️")), "")
+
+eq("mixed fixture: nothing else wrong -> exit 0 (✅)", _exitI, 0)
+eq("mixed: fresh (5min) bead DOES appear in the building-now line (regression guard — real "
+   "progress still detected, not over-corrected)", "ga-freshb" in _if_building_line, True)
+eq("mixed: 4h-stale bead does NOT appear in the building-now line (AC1)",
+   "ga-stale4h" in _if_building_line, False)
+eq("mixed: unknown-age bead does NOT appear in the building-now line (never a free pass)",
+   "ga-noage" in _if_building_line, False)
+eq("mixed: 4h-stale bead IS named in the awaiting-human line (AC4)",
+   "ga-stale4h" in _if_stalled_line, True)
+eq("mixed: unknown-age bead IS named in the awaiting-human line too (AC4, treated as stalled)",
+   "ga-noage" in _if_stalled_line, True)
+eq("mixed: fresh bead is NOT in the awaiting-human line (not misclassified the other way)",
+   "ga-freshb" in _if_stalled_line, False)
+eq("mixed: the awaiting-human line cites the SAME threshold the watchdog uses (no drift, AC2)",
+   ("%.0fh" % m.DELIVERY_STALL_HOURS) in _if_stalled_line, True)
+eq("mixed: wisp-id beads stay excluded from BOTH lines (pre-existing behavior, undisturbed)",
+   ("ga-wisp-skip" in _if_building_line) or ("ga-wisp-skip" in _if_stalled_line), False)
+
+# Lone-stale fixture: AC3's exact clause — if the ONLY 'in-flight' bead is delivery-stalled,
+# it must not alone sustain a ✅ 'the machine IS producing' narrative.
+def _if_fake_run_lone(args, **kwargs):
+    _if_calls.append(args)
+    return types.SimpleNamespace(returncode=0,
+                                  stdout=json.dumps([{"id": "ga-lonestale", "updated_at": _if_iso_ago(240)}]))
+m.subprocess.run = _if_fake_run_lone
+
+_bufJ = io.StringIO()
+_exitJ = None
+try:
+    with contextlib.redirect_stdout(_bufJ):
+        m.main()
+except SystemExit as e:
+    _exitJ = e.code
+_outJ = _bufJ.getvalue()
+
+eq("AC3: lone 4h-stale in-flight bead, nothing else wrong -> still exit 0 (✅)", _exitJ, 0)
+eq("AC3: the ✅ narrative must NOT claim the machine is producing off this phantom build",
+   "ESTÁ produzindo" in _outJ, False)
+eq("AC3: the building-now line must not print at all (building_now == 0, no phantom count)",
+   "🔨 EM BUILD AGORA" in _outJ, False)
+eq("AC3: the lone stale bead is still named as awaiting-human even as the sole in-flight bead",
+   "ga-lonestale" in _outJ, True)
+
+eq("regression guard: the story:in-flight query carries NO --status flag — attempt-1's exact "
+   "bug was switching to _bd_json()'s implicit status=\"open\" default, which silently drops "
+   "in_progress beads (the NORMAL state of a freshly-dispatched in-flight bead)",
+   any("--status" in c for c in _if_calls), False)
+eq("regression guard: the query still filters on the right label",
+   all(("story:in-flight" in c) for c in _if_calls), True)
+
+m.subprocess.run = _if_orig_run
 
 m.check_approved, m.check_gate, m.check_pilot, m.check_dolt, m.RIGS = _i_ca, _i_cg, _i_cp, _i_cd, _i_rigs
 m._pilot_slots, m._pilot_candidates, m._sweep_in_flight = _i_orig_slots, _i_orig_cand, _i_orig_swf

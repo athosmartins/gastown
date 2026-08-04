@@ -35,6 +35,28 @@ import json, os, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import park_labels
 
+# ga-26us5: reuse the SAME delivery-stall threshold throughput-stall-watchdog.py uses
+# (DELIVERY_STALL_HOURS) so this check's "building now" count and the watchdog's
+# delivery-stall alarm can never drift apart and disagree — the recurring
+# error-and-empty-must-not-produce-the-same-value class, applied to this file itself.
+# The watchdog's filename has a hyphen so it isn't a valid module name for a plain
+# `import` — load by path, same technique test_production_stall_watchdog.py already
+# uses for its hyphenated sibling. A load failure falls back to the watchdog's own
+# documented default (3h) and is surfaced as a warning — never a silent guess.
+import importlib.util as _importlib_util
+_TSW_LOAD_WARN = None
+try:
+    _tsw_spec = _importlib_util.spec_from_file_location(
+        "throughput_stall_watchdog",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "throughput-stall-watchdog.py"))
+    _tsw = _importlib_util.module_from_spec(_tsw_spec)
+    _tsw_spec.loader.exec_module(_tsw)
+    DELIVERY_STALL_HOURS = _tsw.DELIVERY_STALL_HOURS
+except Exception as _tsw_exc:
+    DELIVERY_STALL_HOURS = float(os.environ.get("TSW_DELIVERY_STALL_HOURS", "3"))
+    _TSW_LOAD_WARN = ("não consegui importar DELIVERY_STALL_HOURS de throughput-stall-watchdog.py"
+                       " (%s) — usando default %.0fh, pode divergir" % (str(_tsw_exc)[:80], DELIVERY_STALL_HOURS))
+
 CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
 RIGS = [("HQ", CITY),
         ("WA", "/Users/athos/gt/whatsapp_automation"),
@@ -228,6 +250,20 @@ def classify_bead(bead_id, labels, gate_source_beads, held_loop_max=HELD_LOOP_MA
             return ("stuck", "held-loop:%dx" % len(held))
         return ("held", "")
     return ("stuck", "")
+
+
+def classify_in_flight(age_min, stall_min):
+    """PURE classifier (no I/O — unit-testable). A story:in-flight bead only counts
+    as 'building' while it shows real recent progress: age_min (minutes since
+    updated_at, None if unparseable) within stall_min of now. Beyond that window —
+    or when age can't be determined at all — it is 'delivery-stalled': the same
+    threshold throughput-stall-watchdog's DELIVERY_STALL_HOURS uses, so the two
+    checks can't drift apart and disagree (ga-26us5). Unknown age is treated as
+    stalled, never building — an unverifiable timestamp must never stand in for
+    confirmed progress (same class this whole file exists to catch)."""
+    if age_min is not None and age_min <= stall_min:
+        return "building"
+    return "delivery-stalled"
 
 
 # ── CHECK 1: pilot dispatchable queue ────────────────────────────────────────
@@ -797,6 +833,9 @@ def main():
 
     fails, warns, notes = [], [], []
 
+    if _TSW_LOAD_WARN:
+        warns.append(_TSW_LOAD_WARN)
+
     # --- Buildable queue verdict ---
     for w in a.get("warns", []):
         warns.append(w)
@@ -878,15 +917,30 @@ def main():
     # carry story:in-flight in their OWN store, invisible to an HQ-only view (the same
     # cross-store class that bit the daemons). This is the honest "is the machine
     # producing RIGHT NOW?" signal — without it the check under-reports active builds.
-    building_ids = []
+    #
+    # ga-26us5: a story:in-flight label alone is NOT proof of progress — a worker can
+    # reach a terminal state (device flaky, crashed, abandoned) and leave the label
+    # stale. Cross-check each bead's updated_at against the delivery-stall threshold
+    # (DELIVERY_STALL_HOURS, imported above) and exclude anything past it from
+    # "building now"; name it explicitly instead so it reads as awaiting-human, not
+    # phantom progress. Query intentionally unchanged from before (no --status flag
+    # at all, so it is NOT subject to _bd_json's status="open" default, which would
+    # silently drop the in_progress beads a fresh dispatch normally sits in).
+    stall_min = DELIVERY_STALL_HOURS * 60
+    building_ids, stalled_ids = [], []
     for _bn_name, _bn_root in RIGS:
         try:
             _bn_out = subprocess.run([BD, "-C", _bn_root, "list", "-l", "story:in-flight", "--json"],
                                      capture_output=True, text=True, timeout=15)
             for _bn_b in json.loads(_bn_out.stdout or "[]"):
                 _bn_id = _bn_b.get("id", "")
-                if _bn_id and "wisp" not in _bn_id:
+                if not _bn_id or "wisp" in _bn_id:
+                    continue
+                _bn_age = _age_min(_bn_b.get("updated_at"))
+                if classify_in_flight(_bn_age, stall_min) == "building":
                     building_ids.append("%s/%s" % (_bn_name, _bn_id))
+                else:
+                    stalled_ids.append("%s/%s" % (_bn_name, _bn_id))
         except Exception:
             pass
     building_now = len(building_ids)
@@ -943,6 +997,9 @@ def main():
     if building_now:
         print("🔨 EM BUILD AGORA (real, todos os stores): %d — %s"
               % (building_now, ", ".join(building_ids[:8])))
+    if stalled_ids:
+        print("⏸️  %d in-flight mas parado(s) > %.0fh sem atualização → aguardando humano, não building: %s"
+              % (len(stalled_ids), DELIVERY_STALL_HOURS, ", ".join(stalled_ids[:8])))
     for n in notes:
         print("ℹ️  " + n)
     print("")
