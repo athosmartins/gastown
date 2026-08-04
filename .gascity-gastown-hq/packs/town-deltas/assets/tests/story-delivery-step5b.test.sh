@@ -51,10 +51,17 @@ EOF
   local DRY_RUN=0
   local STORY_ID="ga-test"
   local STORY='{"assignee":"crew/tester","created_by":"tester"}'
+  # ga-o643d: production derives this from $STORY._store, falling back to
+  # $GC_CITY when absent (story-delivery.sh:~487) — STORY has no _store here,
+  # so mirror that same fallback rather than inventing a fixture value.
+  local STORY_STORE="$GC_CITY"
   get_runbook_field() { echo "central-sender"; }
 
-  # Run the real block in a subshell; capture its exit code.
-  ( eval "$BLOCK" ) >/dev/null 2>&1
+  # Run the real block in a subshell; capture its exit code. Wrapped in a
+  # for-loop (matches story-delivery-staleness.test.sh) so the block's
+  # `continue` — a real loop-continue in production's per-story sweep
+  # (story-delivery.sh:473 `while IFS= read -r STORY`) — is valid here too.
+  ( for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
   RUN_RC=$?
   LAST_BD="$(cat "$BD_LOG" 2>/dev/null || true)"
   LAST_GC="$(cat "$GC_LOG" 2>/dev/null || true)"
@@ -68,7 +75,8 @@ run_block OK
 
 # C2: NEEDS_GUARDED_RESTART → halt
 run_block NEEDS_GUARDED_RESTART
-[ "$RUN_RC" -ne 0 ] && ok "C2 guarded verdict → block exits non-zero (halts)" || nok "C2 exit" "rc=$RUN_RC"
+# Block halts via `continue` (loop-based); for-loop exits 0. BD state is the halt signal.
+[ "$RUN_RC" -eq 0 ] && ok "C2 guarded verdict → block exits 0 (continue-based halt; BD state is primary signal)" || nok "C2 exit" "rc=$RUN_RC"
 echo "$LAST_BD" | grep -q "label add ga-test delivery:failed" && ok "C2 delivery:failed added" || nok "C2 failed-label" "$LAST_BD"
 echo "$LAST_BD" | grep -q "label remove ga-test delivery:running" && ok "C2 delivery:running removed" || nok "C2 running-removed" "$LAST_BD"
 ! echo "$LAST_BD" | grep -q "label add ga-test story:done" && ok "C2 story:done label NOT set" || nok "C2 story-done" "$LAST_BD"

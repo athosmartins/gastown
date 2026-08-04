@@ -80,6 +80,10 @@ run_block() {
   local DRY_RUN=0
   local STORY_ID="ga-test"
   local STORY='{"assignee":"crew/tester","created_by":"tester"}'
+  # ga-o643d: production derives this from $STORY._store, falling back to
+  # $GC_CITY when absent (line ~487) — STORY has no _store here, so mirror
+  # that same fallback rather than inventing a fixture value.
+  local STORY_STORE="$GC_CITY"
 
   # Wrap in a for-loop so the block's `continue` (loop-based halt) is valid.
   ( for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1

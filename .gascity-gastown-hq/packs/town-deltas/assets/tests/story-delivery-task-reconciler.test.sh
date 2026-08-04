@@ -22,6 +22,16 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DELIVERY="$SCRIPT_DIR/../story-delivery.sh"
 
+# ga-o643d: load the REAL merge-verification helpers (rig_gitdir,
+# scan_commit_subject_for_bead, task_reconciler_verdict, ...) that Step 1b
+# calls — lib-only mode defines them without running the live sweep, mirrors
+# merged-bead-janitor.selftest.sh's established pattern (one source of truth).
+STORY_DELIVERY_LIB_ONLY=1 source "$DELIVERY" \
+  || { echo "FATAL: could not source story-delivery.sh in lib-only mode"; exit 1; }
+
+export GIT_AUTHOR_NAME=selftest GIT_AUTHOR_EMAIL=selftest@local
+export GIT_COMMITTER_NAME=selftest GIT_COMMITTER_EMAIL=selftest@local
+
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ok   - $1"; }
 nok() { FAIL=$((FAIL+1)); echo "  FAIL - $1"; [ -n "${2:-}" ] && echo "         $2"; }
@@ -65,6 +75,20 @@ run_block() {
   local DELIVERY_LOG="$T/delivery.jsonl"
   local FORCE_STORY_ID="$force_id"
   local DRY_RUN="$dry_run"
+  # ga-o643d: the block fans out over ALL_STORES (ga-mt03s) and computes
+  # TASK_DEFAULT_BRANCH from RIG_LIST_JSON — both unset here under set -u
+  # would abort the eval before any bd/log call. One store (this temp dir).
+  local ALL_STORES="$T"
+  local RIG_LIST_JSON='{"rigs":[]}'
+
+  # ga-o643d: real git repo so the ga-266z8 merge-verification guard
+  # (scan_commit_subject_for_bead) has real history to check TASK_BEAD_JSON's
+  # id against — mirrors merged-bead-janitor.selftest.sh's real-git fixtures
+  # rather than stubbing the verification itself away.
+  git init -q -b main "$T" >/dev/null 2>&1
+  ( cd "$T" && echo x > f.txt && git add f.txt \
+      && git commit -q -m "fix(ga-test-task): synthetic commit for reconciler selftest" ) >/dev/null 2>&1
+  git -C "$T" update-ref refs/remotes/origin/main refs/heads/main >/dev/null 2>&1
 
   # Run block; capture TASK_COUNT (set inside block)
   local TASK_COUNT=0
