@@ -2841,6 +2841,25 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
       IS_STORY=0
       if printf '%s' "$SRC_LABELS" | grep -q "story:approved"; then IS_STORY=1; fi
 
+      # ga-k2wjn: does the source bead's OWN body look like it enumerates
+      # multiple approved deliverables? If so, "the gate approved this diff"
+      # is NOT proof "this bead's full scope is done" — hold instead of
+      # closing (bug/task path only; stories already hand off without
+      # closing, see below). scope_covered:all is an explicit author
+      # override — the cheaper of ga-k2wjn's two proposed mechanisms,
+      # realized as a label instead of a new marker field so it needs no
+      # gate-done.md/marker-schema change — for when the diff DOES cover
+      # every enumerated item.
+      IS_PARTIAL=0
+      if [ "$IS_STORY" != "1" ]; then
+        if printf '%s' "$SRC_LABELS" | grep -q "scope_covered:all"; then
+          IS_PARTIAL=0
+        else
+          SRC_DESC=$(printf '%s' "$SRC_JSON" | jq -r '((.description // "") + "\n" + (.notes // ""))' 2>/dev/null || echo "")
+          if gate_delivery_looks_partial "$SRC_DESC"; then IS_PARTIAL=1; fi
+        fi
+      fi
+
       # (1) Clear the live builder assignee on EVERY source bead. This is what
       #     removes it from the pool in_progress crash-recovery selector
       #     (--assignee <builder>) and from the Pilot's assigned-bead exclusion,
@@ -2866,6 +2885,30 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
         bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
         log "Source story $BEAD_ID handed off to delivery (gate:passed set; story:in-flight + gate:reviewing cleared; builder assignee cleared)."
         bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate PASS handoff (ga-3h8l fix): builder assignee cleared; story:in-flight stripped (lane slot freed at merge); gate:reviewing cleared (wa-qq33j); story:approved + gate:passed in place. story-delivery will deploy + prod-test, then mark story:done." 2>/dev/null || true
+      elif [ "$IS_PARTIAL" = "1" ]; then
+        # ga-k2wjn: body looks multi-item and no scope_covered:all override —
+        # hold, don't close. gate:passed (already set above) already keeps
+        # Pilot from re-dispatching it; delivery:partial + gate:needs-human
+        # is the durable "why" and puts it in front of a human instead of
+        # letting the remaining scope silently exit every open-work queue.
+        log "Source bug/task $BEAD_ID looks PARTIAL (ga-k2wjn heuristic) — holding, NOT closing; escalating to Mayor."
+        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
+        bd -C "$BEAD_CITY" label add "$BEAD_ID" "delivery:partial" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-human" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-human:partial-delivery" -q 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED and branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) — but NOT closing (ga-k2wjn): this bead body looks like it enumerates multiple approved deliverables (a numbered or lettered list, or fatia/fatias/itens aprovados), and the gate only reviewed this one diff. The gate verdict is about the DIFF, not about whether the full scope of the BEAD is done — those are different claims. Labeled delivery:partial + gate:needs-human; Pilot will not re-dispatch it. If this diff genuinely covers every enumerated item, add label scope_covered:all and re-run the gate (or close manually)." 2>/dev/null || true
+        gc --city "$GC_CITY" mail send mayor \
+          -s "Gate held for scope review: $BEAD_ID (ga-k2wjn)" \
+          -m "$(printf 'Source bead %s PASSED the quality gate and merged (branch %s, sha %s, gate_run %s) but was NOT closed.\n\nga-k2wjn: the bead body looks like it enumerates multiple approved deliverables (numbered or lettered list, or fatia/fatias/itens aprovados), and a gate PASS only proves this one diff does what it claims, not that the full scope of the bead is done. Labeled delivery:partial + gate:needs-human; Pilot will not re-dispatch it.\n\nReview the diff against the full enumerated scope: if complete, add label scope_covered:all and close manually (or re-submit to the gate); if partial, the remaining items are still live on this bead.\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s, sha %s)' \
+            "$BEAD_ID" "$BRANCH" "$MERGE_SHA" "$GATE_RUN_ID" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID" "$MERGE_SHA")" \
+          2>/dev/null || warn "Could not mail Mayor scope-hold escalation for $BEAD_ID (ga-k2wjn)"
+        if [ -n "$AUTHOR" ]; then
+          gc --city "$GC_CITY" mail send "$AUTHOR" \
+            -s "Your gate PASS is held for scope review: $BEAD_ID (ga-k2wjn)" \
+            -m "$(printf 'Your branch %s PASSED gate review and merged (sha %s), but the source bead %s was NOT closed.\n\nga-k2wjn: the bead body looks like it enumerates multiple approved deliverables, and a gate PASS only proves this diff does what it claims, not that the full scope of the bead is done. Held as delivery:partial + gate:needs-human pending Mayor review.\n\nIf this diff genuinely covers every enumerated item, add label scope_covered:all and close manually (or re-submit to the gate); otherwise the remaining items are still live on this bead.\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s)' \
+              "$BRANCH" "$MERGE_SHA" "$BEAD_ID" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID")" \
+            2>/dev/null || warn "Could not mail author $AUTHOR for scope-hold on $BEAD_ID (ga-k2wjn)"
+        fi
       else
         # BUG/TASK → close it. bd list defaults to OPEN-only, so closing removes
         # the bead from EVERY open-work selector (Pilot Tier-1 bug & tech-debt),
@@ -2895,7 +2938,11 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
       fi
       # b/c) Pilot Tier-1 open-bug / open-tech-debt re-pick. Stories are EXEMPT
       #      from Tier-1 checks (open for delivery; not type:bug / tech-debt).
-      if [ "$IS_STORY" != "1" ]; then
+      #      ga-k2wjn: a held-as-delivery:partial bead is ALSO exempt — it is
+      #      deliberately left open+unassigned pending Mayor review, and would
+      #      otherwise false-flag as a respawn vector here even though
+      #      gate:passed already keeps Pilot from re-dispatching it.
+      if [ "$IS_STORY" != "1" ] && [ "$IS_PARTIAL" != "1" ]; then
         if _still_listed -t bug;        then RESPAWN_HITS="$RESPAWN_HITS pilot:open-bug"; fi
         if _still_listed -l tech-debt;  then RESPAWN_HITS="$RESPAWN_HITS pilot:open-tech-debt"; fi
       fi

@@ -106,11 +106,15 @@ else
 fi
 
 echo "── 4. Regression guard: pre-existing wa-qq33j clear sites are untouched ──"
+# ga-k2wjn added a 12th site: the new delivery:partial hold branch also
+# leaves the PASS-reviewing state, so it clears gate:reviewing too (tagged
+# wa-qq33j, same convention as its close/story-handoff siblings) — 10
+# wa-qq33j-tagged (9 pre-existing + 1 from ga-k2wjn) + 2 ga-n2cpe-tagged = 12.
 TOTAL_CLEARS=$(grep -cF "$CLEAR_NEEDLE" "$DISPATCHER")
-if [ "$TOTAL_CLEARS" = "11" ]; then
-  ok "total gate:reviewing clear call sites = 11 (9 pre-existing + 2 new, ga-n2cpe) — got $TOTAL_CLEARS"
+if [ "$TOTAL_CLEARS" = "12" ]; then
+  ok "total gate:reviewing clear call sites = 12 (9 pre-existing + 1 ga-k2wjn + 2 ga-n2cpe) — got $TOTAL_CLEARS"
 else
-  bad "expected 11 total gate:reviewing clear call sites (9 pre-existing + 2 new), got $TOTAL_CLEARS — either a pre-existing site was lost or the new count drifted"
+  bad "expected 12 total gate:reviewing clear call sites (9 pre-existing + 1 ga-k2wjn + 2 ga-n2cpe), got $TOTAL_CLEARS — either a pre-existing site was lost or the new count drifted"
 fi
 
 echo "── 5. MUTATION TEST: stripping the ga-n2cpe clears must flip sections 1-2 to RED ──"

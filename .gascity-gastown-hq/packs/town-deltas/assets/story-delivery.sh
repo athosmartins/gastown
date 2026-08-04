@@ -108,15 +108,25 @@ EOF
   return 1
 }
 
-# task_reconciler_verdict <is_contradicted> <is_merge_verified> — pure decision:
-# echoes "close:<reason>" iff gate:passed may be trusted, "keep:<reason>"
-# otherwise. A contradicting gate:failed/gate:needs-fix label always wins
-# (gate:passed is then stale/propagated, not evidence); absent that, the bead
-# must show independent content proof before the sweep may close it.
+# task_reconciler_verdict <is_contradicted> <is_merge_verified> [is_partial] —
+# pure decision: echoes "close:<reason>" iff gate:passed may be trusted,
+# "keep:<reason>" otherwise. A contradicting gate:failed/gate:needs-fix label
+# always wins (gate:passed is then stale/propagated, not evidence). Absent
+# that, ga-k2wjn: a bead whose body looks like it enumerates multiple
+# approved deliverables is kept regardless of merge-verification — "this diff
+# is verified merged" and "this bead's full scope is done" are different
+# claims, and closing on the former silently drops the rest of the latter.
+# is_partial defaults to "0" so existing 2-arg call sites are unaffected.
+# Absent both of those, the bead must show independent content proof before
+# the sweep may close it.
 task_reconciler_verdict() {
-  local is_contradicted="$1" is_merge_verified="$2"
+  local is_contradicted="$1" is_merge_verified="$2" is_partial="${3:-0}"
   if [ "$is_contradicted" = "1" ]; then
     echo "keep:contradicted-by-gate-failed-or-needs-fix"
+    return 0
+  fi
+  if [ "$is_partial" = "1" ]; then
+    echo "keep:partial-delivery"
     return 0
   fi
   if [ "$is_merge_verified" = "1" ]; then
@@ -124,6 +134,20 @@ task_reconciler_verdict() {
     return 0
   fi
   echo "keep:merge-not-verified"
+}
+
+# gate_delivery_looks_partial <bead_text> — ga-k2wjn. Mirrors
+# quality-gate-guard.sh's copy VERBATIM (one proven heuristic, not a second
+# one to drift — same discipline as the rig_gitdir-adjacent helpers above).
+# See that copy for the full rationale; kept in sync by inspection.
+gate_delivery_looks_partial() {
+  local text="${1:-}" digit_hits letter_hits
+  digit_hits=$(printf '%s\n' "$text" | grep -Ec '^[[:space:]]*[0-9]{1,2}\.[[:space:]]' || true)
+  [ "${digit_hits:-0}" -ge 3 ] 2>/dev/null && return 0
+  letter_hits=$(printf '%s\n' "$text" | grep -Ec '^[[:space:]]*[a-z]\.[[:space:]]' || true)
+  [ "${letter_hits:-0}" -ge 3 ] 2>/dev/null && return 0
+  printf '%s' "$text" | grep -qiE 'fatia(s)?|itens aprovados' && return 0
+  return 1
 }
 
 # Lib-only mode: `STORY_DELIVERY_LIB_ONLY=1 source story-delivery.sh` defines the
@@ -423,7 +447,24 @@ if [ -z "$FORCE_STORY_ID" ]; then
         fi
       fi
 
-      TASK_VERDICT=$(task_reconciler_verdict "$TASK_CONTRADICTED" "$TASK_MERGE_VERIFIED")
+      # ga-k2wjn: does the task bead ALREADY carry delivery:partial (primary
+      # dispatcher already held+escalated it — nothing new to do here beyond
+      # not closing) or scope_covered:all (explicit author override — trust
+      # it), or — the crash-window case, primary dispatcher never reached
+      # this decision — does its OWN body look like it enumerates multiple
+      # approved deliverables? gate_delivery_looks_partial mirrors
+      # quality-gate-guard.sh's copy verbatim (see that copy for rationale).
+      TASK_ALREADY_PARTIAL=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | contains(["delivery:partial"])) then "1" else "0" end' 2>/dev/null || echo "0")
+      TASK_SCOPE_COVERED_ALL=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | contains(["scope_covered:all"])) then "1" else "0" end' 2>/dev/null || echo "0")
+      TASK_IS_PARTIAL=0
+      if [ "$TASK_ALREADY_PARTIAL" = "1" ]; then
+        TASK_IS_PARTIAL=1
+      elif [ "$TASK_SCOPE_COVERED_ALL" != "1" ]; then
+        TASK_TEXT=$(echo "$TASK_BEAD" | jq -r '((.description // "") + "\n" + (.notes // ""))' 2>/dev/null || echo "")
+        if gate_delivery_looks_partial "$TASK_TEXT"; then TASK_IS_PARTIAL=1; fi
+      fi
+
+      TASK_VERDICT=$(task_reconciler_verdict "$TASK_CONTRADICTED" "$TASK_MERGE_VERIFIED" "$TASK_IS_PARTIAL")
       case "$TASK_VERDICT" in
         close:*)
           log "Task reconciler: gate:passed non-story bead $TASK_BEAD_ID ($TASK_BEAD_TITLE) in store $TASK_STORE — verified merged ($TASK_VERDICT) — closing (no deploy/prod-test)."
@@ -446,6 +487,26 @@ if [ -z "$FORCE_STORY_ID" ]; then
               >> "$DELIVERY_LOG" 2>/dev/null || true
           fi
           TASK_ACTED=1
+          ;;
+        keep:partial-delivery)
+          if [ "$TASK_ALREADY_PARTIAL" = "1" ]; then
+            log "Task reconciler: $TASK_BEAD_ID already held as delivery:partial (ga-k2wjn) — NOT closing; checking next candidate this sweep."
+          else
+            log "Task reconciler: $TASK_BEAD_ID gate:passed but body looks PARTIAL (ga-k2wjn heuristic, crash-window catch — primary dispatcher never labeled it) — holding, NOT closing; escalating to Mayor."
+            if [ "$DRY_RUN" = "1" ]; then
+              log "DRY_RUN=1 — WOULD: label $TASK_BEAD_ID delivery:partial + gate:needs-human, comment, mail mayor (ga-k2wjn task-reconciler backstop)"
+            else
+              bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "delivery:partial" -q 2>/dev/null || true
+              bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "gate:needs-human" -q 2>/dev/null || true
+              bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "gate:needs-human:partial-delivery" -q 2>/dev/null || true
+              bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-k2wjn backstop): gate:passed is set and this bead is not a story, but its body looks like it enumerates multiple approved deliverables. The primary gate dispatcher never labeled this (crash-window — ga-esbg did not complete on it), so this sweep is doing so now instead of closing. If this diff genuinely covers every enumerated item, add label scope_covered:all and close manually; otherwise the remaining items are still live on this bead." 2>/dev/null || true
+              gc --city "$GC_CITY" mail send mayor \
+                -s "Gate held for scope review: $TASK_BEAD_ID (ga-k2wjn backstop)" \
+                -m "$(printf 'Task bead %s carries gate:passed and looks merged, but its body looks like it enumerates multiple approved deliverables (ga-k2wjn). The primary gate dispatcher never labeled it delivery:partial (crash-window), so the story-delivery task reconciler is holding it now instead of closing.\n\nReview the diff against the full enumerated scope: if complete, add label scope_covered:all and close manually; if partial, the remaining items are still live on this bead.\n\nBead: %s   Store: %s' \
+                  "$TASK_BEAD_ID" "$TASK_BEAD_ID" "$TASK_STORE")" \
+                2>/dev/null || warn "Task reconciler: could not mail Mayor scope-hold escalation for $TASK_BEAD_ID (ga-k2wjn)"
+            fi
+          fi
           ;;
         keep:contradicted-by-gate-failed-or-needs-fix)
           log "Task reconciler: $TASK_BEAD_ID carries gate:passed but ALSO gate:failed/gate:needs-fix (ga-266z8 contradiction guard) — NOT closing; checking next candidate this sweep."

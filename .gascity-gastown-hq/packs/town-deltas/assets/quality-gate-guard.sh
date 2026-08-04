@@ -449,6 +449,33 @@ session_matches_author() {
   fi
 }
 
+# gate_delivery_looks_partial <bead_text>
+# ga-k2wjn: cheap heuristic — does <bead_text> (a bead's description + notes,
+# CONCATENATED) look like it enumerates multiple approved deliverables, such
+# that "the gate approved this diff" is not the same claim as "this bead's
+# full scope is done"? Confirmed empirically against the 3 real false-closes
+# ga-k2wjn cites (wa-uhbqb: lettered list a.-i.; wa-a7e98: numbered list
+# 1.-4.; wa-k0m1q: numbered list 1.-11. + literal "FATIAS") — wa-k0m1q's own
+# list lives ENTIRELY in bd's notes field (description is empty), so the
+# caller must pass description+notes concatenated, never description alone.
+# Triggers (any one is sufficient):
+#   - >=3 lines start with "N. " (1-2 digit number + period + space), or
+#   - >=3 lines start with "x. " (single lowercase letter + period + space), or
+#   - the text contains (case-insensitive) fatia, fatias, or "itens aprovados"
+# False positives are the accepted/cheap failure mode here (costs one human
+# review — ga-k2wjn's own stated tradeoff); false negatives silently drop
+# approved work, which is the bug this exists to stop.
+# Returns: 0 (true) iff it looks partial; 1 (false) otherwise.
+gate_delivery_looks_partial() {
+  local text="${1:-}" digit_hits letter_hits
+  digit_hits=$(printf '%s\n' "$text" | grep -Ec '^[[:space:]]*[0-9]{1,2}\.[[:space:]]' || true)
+  [ "${digit_hits:-0}" -ge 3 ] 2>/dev/null && return 0
+  letter_hits=$(printf '%s\n' "$text" | grep -Ec '^[[:space:]]*[a-z]\.[[:space:]]' || true)
+  [ "${letter_hits:-0}" -ge 3 ] 2>/dev/null && return 0
+  printf '%s' "$text" | grep -qiE 'fatia(s)?|itens aprovados' && return 0
+  return 1
+}
+
 # ── Lib-only mode: source with GATE_GUARD_LIB_ONLY=1 to load pure functions ──
 # without running the live guard sweep. Used by tests and by the dispatcher.
 if [ -n "${GATE_GUARD_LIB_ONLY:-}" ]; then
