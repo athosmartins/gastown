@@ -330,6 +330,83 @@ if m.error_requeue_verdict(ETH + 600, ETH, True, False, True, 0, KMAX) == "skip:
 else:
     bad("expected skip:parked-needs-human")
 
+# ═══ ga-gd706: FIX 7's close:source-done branch gains a branch_state guard ════
+# RAIZ: deferred_requeue_verdict()'s close:source-done fired purely off
+# (source_resolved AND source_closed) — but the NORMAL dog-self-closes-its-own-
+# sling-bead-on-submission doctrine closes the branch-embedded source bead
+# immediately after /gate-done, regardless of whether a reviewer ever ran. A
+# marker only REACHES gate-status:deferred because authorship couldn't be
+# verified in the first place (guard.sh Step 5) — so "source closed" is the
+# COMMON case here, not a rare one, and closing on it alone silently stranded
+# every multi-attempt gate-fix cycle whose branch-embedded bead got
+# force-reclaimed (assignee nulled) mid-cycle: the deferred marker got closed
+# as "superseded", which reads as routine cleanup, while the branch itself
+# never merged. Same discipline FIX 4's orphan_marker_verdict already applies
+# (ga-w5agg/ga-d2jil) — branch_state is the truth, a closed source is not.
+DTH = m.DEFERRED_REQUEUE_MINUTES * 60
+DMAX = m.DEFERRED_REQUEUE_MAX_ATTEMPTS
+
+print("Scenario 19 (ga-gd706 i): source CLOSED but branch UNMERGED (real stranding) → NOT closed")
+v = m.deferred_requeue_verdict(DTH + 600, DTH, True, True, False, True, 0, DMAX, branch_state="unmerged")
+if v == "requeue":
+    ok("closed source + unmerged branch + derivable author → requeue (give the dispatcher a real shot), never silently superseded")
+else:
+    bad("REGRESSION ga-gd706: expected requeue for closed-source/unmerged-branch, got %r" % (v,))
+
+print("Scenario 20 (ga-gd706 ii): source CLOSED, branch UNMERGED, author NOT derivable, cap exhausted → LOUD close, never silent")
+v = m.deferred_requeue_verdict(DTH + 600, DTH, True, True, False, False, DMAX, DMAX, branch_state="unmerged")
+if v == "close:unresolvable":
+    ok("still terminates (doesn't rot forever) but via the LOUD, explicit close:unresolvable path — not the silent close:source-done")
+else:
+    bad("expected close:unresolvable, got %r" % (v,))
+
+print("Scenario 21 (ga-gd706 iii): source CLOSED, branch_state UNKNOWN (git check failed) → fail-safe, NOT closed")
+v = m.deferred_requeue_verdict(DTH + 600, DTH, True, True, False, True, 0, DMAX, branch_state="unknown")
+if v == "requeue":
+    ok("can't verify branch state → never treat as done (fail-safe), falls through to normal resolvable handling")
+else:
+    bad("expected requeue (fail-safe fallthrough) for unknown branch_state, got %r" % (v,))
+
+print("Scenario 22 (ga-gd706 iv): source CLOSED and branch actually MERGED → close:source-done (unchanged happy path)")
+v = m.deferred_requeue_verdict(DTH + 600, DTH, True, True, False, True, 0, DMAX, branch_state="merged")
+if v == "close:source-done":
+    ok("genuinely landed work still closes normally — the fix doesn't block the true-done case")
+else:
+    bad("REGRESSION: expected close:source-done when branch is actually merged, got %r" % (v,))
+
+print("Scenario 22b (ga-gd706 iv-b): closed+merged still short-circuits BEFORE the age gate (unchanged FIX7 ordering)")
+v = m.deferred_requeue_verdict(30, DTH, True, True, False, True, 0, DMAX, branch_state="merged")
+if v == "close:source-done":
+    ok("young+closed+merged still closes immediately — the branch_state guard doesn't disturb the existing closed-before-age ordering")
+else:
+    bad("REGRESSION: closed+merged should short-circuit before the age gate regardless of age, got %r" % (v,))
+
+print("Scenario 23 (ga-gd706 v): source CLOSED and branch MISSING (deleted/renamed) → close:source-done (abandoned)")
+v = m.deferred_requeue_verdict(DTH + 600, DTH, True, True, False, True, 0, DMAX, branch_state="missing")
+if v == "close:source-done":
+    ok("no branch left to ever review → safe to close as abandoned")
+else:
+    bad("expected close:source-done for a missing branch, got %r" % (v,))
+
+print("Scenario 24 (ga-gd706 vi): omitting branch_state defaults to 'unknown' — fail-safe, never a silent close-by-omission")
+v = m.deferred_requeue_verdict(DTH + 600, DTH, True, True, False, True, 0, DMAX)
+if v == "requeue":
+    ok("callers that forget to pass branch_state get the fail-safe default, not the old silent-close behavior")
+else:
+    bad("expected requeue when branch_state is omitted (safe default), got %r" % (v,))
+
+# ── Drift guard: the wiring actually computes and passes branch_state ────────
+print("Scenario 25 (ga-gd706 vii): requeue_deferred_markers() wiring computes branch_state before trusting a closed source")
+if 'branch_state = _branch_merged_state(branch, rig_name) if (resolved and sclosed) else "unknown"' in src:
+    ok("wiring gates the git-ancestry check the same lazy way FIX 4 does (only when resolved+closed)")
+else:
+    bad("MISSING: requeue_deferred_markers does not compute branch_state — the pure-function fix is unreachable from the real sweep")
+if ("def requeue_deferred_markers(" in src
+        and "DEFERRED_REQUEUE_MAX_ATTEMPTS, branch_state)" in src):
+    ok("branch_state is actually threaded into the deferred_requeue_verdict() call, not just computed and dropped")
+else:
+    bad("MISSING: branch_state computed but not passed into deferred_requeue_verdict()")
+
 # ═══ ga-5t5w: FIX5 stranded-verdict recovery anchored on LAST-VERDICT time ════
 # RAIZ: reap_stranded_verdict_runs anchored its age on the RUN's created_at instead
 # of the LAST VERDICT's delivered_at. A slow-but-healthy review and a genuinely

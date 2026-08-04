@@ -1816,14 +1816,27 @@ def error_requeue_verdict(age_sec, threshold_sec, source_resolved, source_closed
 
 
 def deferred_requeue_verdict(age_sec, threshold_sec, source_resolved, source_closed,
-                             source_needs_human, has_derivable_author, attempts, max_attempts):
+                             source_needs_human, has_derivable_author, attempts, max_attempts,
+                             branch_state="unknown"):
     """PURE decision for a gate-status:deferred marker (FIX 7, ga-y1kk). A marker lands
     here when the dispatcher's/guard's own AUTHOR-derivation fail-safe could not resolve
     AUTHOR and nothing else ever re-reads gate-status:deferred. Unlike FIX 2's transient
     gate-status:error, a blind requeue is unlikely to help — the marker got stuck
     BECAUSE no author field resolved, so it only requeues once the source actually has
     something to derive from. Returns:
-      close:source-done      — source CLOSED (work done/abandoned) → close, don't requeue
+      close:source-done      — source CLOSED **and branch_state confirms the work
+                               actually landed (merged) or the branch is gone
+                               (missing)** → close, don't requeue. A closed source
+                               bead ALONE does not prove this (ga-gd706): the normal
+                               dog-self-closes-its-sling-bead-on-submission doctrine
+                               closes the branch-embedded source immediately after
+                               /gate-done, regardless of whether a reviewer ever ran
+                               — and a marker only reaches gate-status:deferred
+                               BECAUSE authorship couldn't be verified in the first
+                               place, so "source closed" is the common case here, not
+                               a rare one. Same discipline as FIX 4's
+                               orphan_marker_verdict (ga-w5agg/ga-d2jil) — branch_state
+                               is the truth, a closed source is not.
       skip:young             — deferred < threshold; give gate.submitted_by (written by a
                                human/automation doing a partial manual recovery) or the
                                source bead's own fields time to land before we intervene
@@ -1833,7 +1846,10 @@ def deferred_requeue_verdict(age_sec, threshold_sec, source_resolved, source_clo
                                counts on its own — it does NOT require source_resolved;
                                that's exactly the ga-wisp-5zki27 scenario this fix exists
                                for) → worth another dispatcher pass (it re-derives AUTHOR
-                               itself)
+                               itself). Also the recovery path when the source is CLOSED
+                               but branch_state is 'unmerged' or 'unknown' (ga-gd706
+                               stranding, or a git check that couldn't run) — falls
+                               through to here instead of closing.
       escalate:oscillating   — attempts exhausted while author WAS derivable (the
                                dispatcher keeps re-deferring for some other reason) →
                                stop looping, page a human
@@ -1843,8 +1859,14 @@ def deferred_requeue_verdict(age_sec, threshold_sec, source_resolved, source_clo
                                reason instead of rotting silently
       skip:unresolvable      — not yet at max_attempts; wait for another sweep before
                                concluding it's genuinely gone (never close on one blip)
+    branch_state ∈ {'merged','unmerged','missing','unknown'} (ga-gd706): only decides
+    the outcome when source_resolved and source_closed are both True — the sole case
+    where 'closed' could lie about 'done'. 'unmerged' (real stranding) and 'unknown'
+    (can't verify — fail-safe default) both fall through to the resolvability handling
+    below instead of closing; NEVER false-close a marker whose branch hasn't actually
+    landed.
     """
-    if source_resolved and source_closed:
+    if source_resolved and source_closed and branch_state in ("merged", "missing"):
         return "close:source-done"
     if age_sec <= threshold_sec:
         return "skip:young"
@@ -2911,9 +2933,15 @@ def requeue_deferred_markers(now, rstate):
         resolved, sclosed, needs_human = _source_bead_state(source_bead, rig_name)
         has_author = bool(marker_meta.get("gate.submitted_by")) or (
             resolved and _source_bead_has_author_fields(source_bead, rig_name))
+        # Pay for the git-ancestry check ONLY when the source is CLOSED — the sole case
+        # where 'source closed' could be a FALSE 'done' (ga-gd706: the normal
+        # dog-self-closes-its-sling-bead-on-submission doctrine closes the source
+        # immediately after /gate-done, regardless of whether a reviewer ever ran).
+        # Mirrors reap_orphan_and_stale_markers' FIX 4 gating exactly.
+        branch_state = _branch_merged_state(branch, rig_name) if (resolved and sclosed) else "unknown"
         verdict = deferred_requeue_verdict(age, DEFERRED_REQUEUE_MINUTES * 60, resolved,
                                            sclosed, needs_human, has_author, attempts,
-                                           DEFERRED_REQUEUE_MAX_ATTEMPTS)
+                                           DEFERRED_REQUEUE_MAX_ATTEMPTS, branch_state)
 
         if verdict == "skip:young":
             continue
@@ -2932,8 +2960,9 @@ def requeue_deferred_markers(now, rstate):
                 continue
             set_gate_status_py(mid, "superseded")
             sh(["bd", "-C", CITY, "close", mid,
-                "-r", "source bead %s closed — gate work done/abandoned; deferred marker superseded (grw deferred-marker self-heal, ga-y1kk)" % source_bead], timeout=25)
-            _recovery_ledger("closed_done_deferred_marker", {"marker": mid, "source_bead": source_bead, "branch": branch})
+                "-r", "source bead %s closed and branch %s VERIFIED merged/absent (%s) — deferred marker superseded (grw deferred-marker self-heal, ga-gd706 hardening of ga-y1kk — merge confirmed via git ancestry, not assumed from a closed source)"
+                % (source_bead, branch or "?", branch_state)], timeout=25)
+            _recovery_ledger("closed_done_deferred_marker", {"marker": mid, "source_bead": source_bead, "branch": branch, "branch_state": branch_state})
             print("[watchdog] CLOSED done deferred marker %s (source %s closed)" % (mid, source_bead), flush=True)
             acted += 1
             continue
