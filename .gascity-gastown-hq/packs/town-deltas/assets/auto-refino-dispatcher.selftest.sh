@@ -57,6 +57,13 @@
 #   by another authority — blocked:*, needs-human*, pilot:held*, blocked-on:*, and
 #   pool:refused:* were all unchecked by either layer) → Scenario 15 (classifier +
 #   RAW jq filter, defense in depth + drift-guard 15b).
+#   Outcome vocabulary gap (bug ga-9mfnw: an already-resolved policy-gap escalation,
+#   executed by the refiner as an epic split, had no terminal outcome of its own —
+#   REFINED would revert the --type epic conversion, ESCALATE would re-page Mayor
+#   for a decision already made) → Scenario 19 (SPLIT → split, terminal, no attempt
+#   cap) + drift-guards 19b (poll loop wiring) / 19c (Step 7 branch's two
+#   invariants: no --type flip, no Mayor mail) / 19d (heredoc teaches the refiner
+#   to report SPLIT deliberately instead of inventing an unrecognized label).
 #
 # Exit 0 iff every assertion holds.
 
@@ -253,16 +260,16 @@ fi
 # ── Scenario 6: NEVER approve / NEVER dispatch — decision vocabulary is bounded ─
 echo "Scenario 6: the decision core can NEVER emit approve/needs-approval/dispatch (ga-flxp6 AC)"
 seen_bad=0
-for o in REFINED ESCALATE TIMEOUT GARBAGE ""; do
+for o in REFINED ESCALATE SPLIT TIMEOUT GARBAGE ""; do
   for a in 0 1 2 3 4 5; do
     d=$(auto_refino_handoff_decision "$o" "$a" 3)
     case "$d" in
       approve|story:approved|needs-approval|story:needs-approval|dispatch) seen_bad=1 ;;
     esac
-    case "$d" in handoff|escalate|requeue) : ;; *) bad "unexpected decision token '$d' for outcome=$o attempt=$a"; esac
+    case "$d" in handoff|escalate|split|requeue) : ;; *) bad "unexpected decision token '$d' for outcome=$o attempt=$a"; esac
   done
 done
-[ "$seen_bad" = "0" ] && ok "no input ever yields approve/needs-approval/dispatch (only handoff/escalate/requeue)" || bad "REGRESSION: decision core emitted an approve/dispatch token"
+[ "$seen_bad" = "0" ] && ok "no input ever yields approve/needs-approval/dispatch (only handoff/escalate/split/requeue)" || bad "REGRESSION: decision core emitted an approve/dispatch token"
 
 # ── Scenario 7: TIMEOUT / unknown → requeue (never promote) ───────────────────
 echo "Scenario 7: TIMEOUT / unknown → requeue (never promote, never approve)"
@@ -1528,6 +1535,76 @@ if grep -qF 'has_refino_metadata="${10:-no}"' "$DISPATCHER" \
   ok "18b. has_refino_metadata param + gate check + bd-show metadata predicate + caller computation all present (bug ga-mk6ve)"
 else
   bad "18b. has_refino_metadata wiring incomplete — 9th occurrence (ga-m3n1x) can re-form"
+fi
+
+# ── Scenario 19 (bug ga-9mfnw): SPLIT — an already-resolved policy-gap
+#    escalation, executed by the refiner as an epic split, is its own
+#    terminal decision — distinct from handoff/escalate. Before this fix the
+#    vocabulary had no SPLIT token: REFINED would misfire (the dispatcher's
+#    unconditional `bd update --type feature` would revert the --type epic
+#    the refiner had just applied) and ESCALATE would misfire (re-paging
+#    Mayor for a decision already made and executed). The live mitigation
+#    (attempt 2 on ga-sb11i) sidestepped both by using a label the poll loop
+#    didn't recognize at all — safe by accident (falls through to TIMEOUT →
+#    requeue), but silent and undocumented. This scenario proves the real
+#    fix: the vocabulary, the poll wiring, the Step 7 branch's two
+#    invariants (no --type flip, no Mayor mail), and the heredoc guidance
+#    that lets a refiner report SPLIT deliberately instead of inventing it.
+echo "Scenario 19 (ga-9mfnw): SPLIT — already-resolved policy-gap executed as an epic split"
+D=$(auto_refino_handoff_decision "SPLIT" 1 3)
+[ "$D" = "split" ] && ok "SPLIT attempt 1 → split" || bad "SPLIT → expected split, got '$D'"
+D=$(auto_refino_handoff_decision "SPLIT" 9 3)
+[ "$D" = "split" ] && ok "SPLIT beyond the attempt budget → still split (terminal, no gate-bounce analog, no cap)" || bad "SPLIT beyond budget → expected split, got '$D'"
+
+# 19b. Drift-guard: the Step 6 poll loop actually recognizes outcome:SPLIT —
+#      else it falls through to TIMEOUT/requeue, the exact silent-mitigation
+#      shape the bug reported.
+if grep -qF 'grep -q "outcome:SPLIT"' "$DISPATCHER" \
+   && grep -qF 'OUTCOME="SPLIT"; break' "$DISPATCHER"; then
+  ok "19b. Step 6 poll loop recognizes outcome:SPLIT (breaks immediately, not just at TIMEOUT)"
+else
+  bad "19b. Step 6 poll loop does not recognize outcome:SPLIT — falls through to TIMEOUT/requeue (ga-9mfnw regression)"
+fi
+
+# 19c. Drift-guard: the Step 7 'split' branch exists and does NOT flip
+#      --type (would revert the refiner's own epic conversion) and does NOT
+#      mail Mayor (the decision was already made and executed — nothing
+#      left for a human to do). Isolate the branch's OWN source lines
+#      (between 'split)' and the next top-level case arm) rather than
+#      grepping the whole file — the escalate branch right above it
+#      deliberately DOES both, so a whole-file grep would false-pass by
+#      matching the WRONG branch.
+_split_branch=$(awk '/^  split\)$/{flag=1} flag{print} /^  requeue\|\*\)$/{if(flag)exit}' "$DISPATCHER")
+if [ -n "$_split_branch" ] && printf '%s' "$_split_branch" | grep -qF 'outcome SPLIT registrado'; then
+  ok "19c. Step 7 split branch is present"
+else
+  bad "19c. Step 7 split branch missing or unrecognizable"
+fi
+# Match the actual dangerous SHAPE (an update call carrying --type), not the
+# bare substring — the branch's own explanatory comments and audit-comment
+# string legitimately discuss "--type" in prose (documenting that it does
+# NOT touch it), and a naive substring match on those is a false positive.
+if printf '%s' "$_split_branch" | grep -qF 'update "$STORY_ID" --type'; then
+  bad "19c. split branch touches --type — would revert the refiner's own epic conversion (ga-9mfnw)"
+else
+  ok "19c. split branch does NOT touch --type (epic conversion preserved)"
+fi
+if printf '%s' "$_split_branch" | grep -qF 'mail send mayor'; then
+  bad "19c. split branch mails Mayor — re-pages a decision already made and executed (ga-9mfnw)"
+else
+  ok "19c. split branch does NOT mail Mayor (decision already made and executed)"
+fi
+
+# 19d. Drift-guard: the REFINE_TASK heredoc teaches the refiner to check for
+#      an already-resolved escalation FIRST and report it via outcome:SPLIT
+#      (PATH C) instead of inventing a label — the gap ga-9mfnw's suggestion
+#      2 flagged (the heredoc used to only teach REFINE vs ESCALATE).
+if grep -qF 'FIRST — check whether this story is a RE-ATTEMPT on an ALREADY-RESOLVED' "$DISPATCHER" \
+   && grep -qF '[PATH C — SPLIT:' "$DISPATCHER" \
+   && grep -qF 'outcome:SPLIT"' "$DISPATCHER"; then
+  ok "19d. REFINE_TASK heredoc teaches the refiner the SPLIT report-back path (PATH C, ga-9mfnw)"
+else
+  bad "19d. REFINE_TASK heredoc missing the SPLIT pre-check / PATH C — refiner still has to invent the mitigation"
 fi
 
 echo ""

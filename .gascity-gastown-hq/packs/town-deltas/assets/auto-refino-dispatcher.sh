@@ -245,7 +245,7 @@ auto_refino_lifecycle_state() {
 }
 
 # auto_refino_handoff_decision <outcome> <attempts_so_far> <max_attempts>
-#   outcome        : REFINED | ESCALATE | TIMEOUT | <anything-else>
+#   outcome        : REFINED | ESCALATE | SPLIT | TIMEOUT | <anything-else>
 #   attempts_so_far: how many refine attempts this story has had INCLUDING the one
 #                    that just produced this outcome (>=1).
 #   max_attempts   : the daemon's re-refine ceiling (AUTO_REFINO_MAX_ATTEMPTS).
@@ -255,12 +255,20 @@ auto_refino_lifecycle_state() {
 #                 the daemon, later promotes to needs-approval. NEVER approves.
 #     escalate  — ESCALATE (can't refine confidently) OR the attempt budget is
 #                 spent: record gaps + hand to Athos, do NOT promote, do NOT loop.
+#     split     — SPLIT (ga-9mfnw): the refiner found an ALREADY-RESOLVED
+#                 policy-gap escalation on this story (decision recorded in
+#                 comments by Mayor/Athos in a prior attempt) and executed the
+#                 Epic Split Convention itself (--type epic + story:epic-split +
+#                 --parent children — see the escalate branch's ga-8bjhl
+#                 reminder). Terminal, like escalate — there is no gate-bounce
+#                 analog for a split (the children re-enter the funnel on their
+#                 own), so unlike REFINED it does NOT consult the attempt cap.
 #     requeue   — TIMEOUT / unknown: leave for a later sweep; do NOT consume an
 #                 attempt, do NOT promote.
 #
 #   GUARANTEE (ga-flxp6 AC "nenhuma história é auto-aprovada nem despachada"):
-#   this function can ONLY ever emit handoff/escalate/requeue — there is no token
-#   for approve, needs-approval, or dispatch, and no code path writes them.
+#   this function can ONLY ever emit handoff/escalate/split/requeue — there is no
+#   token for approve, needs-approval, or dispatch, and no code path writes them.
 auto_refino_handoff_decision() {
   local outcome="$1" attempts="$2" maxa="$3"
   case "$outcome" in
@@ -277,6 +285,7 @@ auto_refino_handoff_decision() {
     # imp16: info-gap = thin/duplicate/trivial — technical, not a product decision
     "ESCALATE:info-gap") echo "escalate-info-gap" ;;
     ESCALATE) echo "escalate" ;;
+    SPLIT) echo "split" ;;   # ga-9mfnw: already-resolved policy-gap, executed as an epic split
     *) echo "requeue" ;;   # TIMEOUT, empty, or any unexpected token
   esac
 }
@@ -1242,6 +1251,23 @@ SIMPLIFICADO FIELD SET (fill F1, F2, F6, F7, F8; F3/F4/F5 are skipped):
                           e >=1 exclusão explícita de escopo.
   F8 story.size_check   — "story" se cabe em uma entrega; "epic" se grande demais.
 
+FIRST — check whether this story is a RE-ATTEMPT on an ALREADY-RESOLVED
+escalation (ga-9mfnw): read $STORY_ID's FULL comment history via a live bd
+show (not just the description above). If a PRIOR attempt escalated a
+policy-gap (refino:policy-gap / auto-refino:escalated / story:refino-escalado)
+and Mayor or Athos already answered it in a comment, do NOT re-escalate and
+do NOT guess a fresh REFINE — resume exactly where that decision left off:
+  - If the recorded decision resolves the product question WITHOUT splitting
+    the story, use that answer as the missing product input and continue with
+    the normal CONFIDENCE GATE / REFINE path below.
+  - If the recorded decision was to SPLIT this story into sub-stories, execute
+    the Epic Split Convention yourself (if not already applied) and report it
+    via PATH C below — do NOT use REFINE (would misfire: the dispatcher would
+    revert your --type epic back to feature) and do NOT use ESCALATE (would
+    misfire: the dispatcher would re-page Mayor for a decision already made).
+  - If you find no recorded resolution (fresh story, or a still-open
+    escalation), this does not apply — use the CONFIDENCE GATE below as usual.
+
 CONFIDENCE GATE — decide REFINE vs ESCALATE (do NOT guess):
   REFINE only if you can write ALL of F1, F2, F6 (>=2 verifiable criteria), F7,
   F8 from the title/description WITHOUT inventing product scope or making a
@@ -1337,6 +1363,29 @@ bd -C "$AR_BEAD_STORE" label add "$TASK_BEAD_ID" "outcome:ESCALATE"
 bd -C "$AR_BEAD_STORE" label remove "$TASK_BEAD_ID" "outcome:pending"
 bd -C "$AR_BEAD_STORE" close "$TASK_BEAD_ID"
 
+[PATH C — SPLIT: a PRIOR policy-gap escalation on this story was already
+resolved by Mayor/Athos (found via the FIRST check above) as "divide into
+sub-stories"]
+Use this ONLY when you found an explicit split decision already recorded in
+the comment history — never invent this decision yourself; with no recorded
+resolution, this path does not apply (use the CONFIDENCE GATE instead).
+
+Apply the Epic Split Convention (skills/refino/references/story-bead-
+convention.md) to the STORY now, if not already applied:
+
+bd -C "$AR_BEAD_STORE" update "$STORY_ID" --type epic
+bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:refinement-in-progress"
+bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "story:epic-split"
+bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "auto-refino:refining"
+bd -C "$AR_BEAD_STORE" create "<sub-história 1: título>" --type feature --parent $STORY_ID --label story:unrefined --no-inherit-labels
+bd -C "$AR_BEAD_STORE" create "<sub-história N: título>" --type feature --parent $STORY_ID --label story:unrefined --no-inherit-labels
+# Do NOT write the SIMPLIFICADO fields (F1/F2/F6/F7/F8) on the STORY here —
+# it is now a container; each child is refined individually by the funnel.
+bd -C "$AR_BEAD_STORE" comment "$STORY_ID" "Auto-refino: Epic Split Convention aplicado (attempt $THIS_ATTEMPT), executando a decisão de divisão já registrada em comentário anterior."
+bd -C "$AR_BEAD_STORE" label add "$TASK_BEAD_ID" "outcome:SPLIT"
+bd -C "$AR_BEAD_STORE" label remove "$TASK_BEAD_ID" "outcome:pending"
+bd -C "$AR_BEAD_STORE" close "$TASK_BEAD_ID"
+
 RULES: Never write story:approved or story:needs-approval. Never dispatch.
 Never invent a product decision — when in doubt, ESCALATE. Do not start any
 other work. Record the outcome and exit.
@@ -1398,7 +1447,7 @@ gc --city "$GC_CITY" session nudge "$SESSION_ID" "$REFINE_TASK" --delivery queue
   || warn "  Initial queue/submit to refiner failed — durable pull channel still active."
 log "  Simplificado task delivered to refiner for $STORY_ID."
 
-# ── Step 6: Poll the task bead until REFINED/ESCALATE or timeout ──────────────
+# ── Step 6: Poll the task bead until REFINED/ESCALATE/SPLIT or timeout ────────
 DEADLINE=$(( $(date +%s) + AUTO_REFINO_TIMEOUT_MINUTES * 60 ))
 _LAST_DRAINED_CHECK=$(date +%s)
 OUTCOME="TIMEOUT"
@@ -1411,6 +1460,8 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     OUTCOME="ESCALATE:info-gap"; break
   elif echo "$TB_LABELS" | grep -q "outcome:ESCALATE"; then
     OUTCOME="ESCALATE"; break
+  elif echo "$TB_LABELS" | grep -q "outcome:SPLIT"; then
+    OUTCOME="SPLIT"; break
   fi
   # ga-bvbm: past the boot grace period, periodically check whether the refiner
   # itself has already drained (stale_async_start race) — if so it will NEVER
@@ -1607,6 +1658,34 @@ Sem o --parent + o label story:epic-split na história-mãe, o guard de RAW-inge
     gc --city "$GC_CITY" mail send mayor -s "Auto-refino escalou $STORY_ID" \
       -m "$STORY_ID não pôde ser refinado autonomamente com confiança (outcome=$OUTCOME, attempt $THIS_ATTEMPT/$AUTO_REFINO_MAX_ATTEMPTS). Flagged auto-refino:escalated, mantido pré-aprovação (NÃO promovido, NÃO despachado). Veja story.auto_refino_gaps / comentários para as perguntas." 2>/dev/null || true
     log "  $STORY_ID → ESCALATED to Athos (outcome=$OUTCOME)."
+    ;;
+  split)
+    # ga-9mfnw: the refiner found an ALREADY-RESOLVED policy-gap escalation on
+    # this story (Mayor/Athos decided in a prior attempt, recorded in
+    # comments) and executed the Epic Split Convention itself: STORY_ID is
+    # already --type epic + story:epic-split, children already created with
+    # --parent (see the ga-8bjhl reminder stamped in the escalate branch
+    # above). Unlike handoff, do NOT flip --type (would revert the exact
+    # conversion the refiner just applied). Unlike escalate, do NOT
+    # notify/mail Mayor (the decision was already made AND executed — there
+    # is nothing left for a human to do).
+    bd_ update "$STORY_ID" --set-metadata "story.auto_refino_attempts=$THIS_ATTEMPT" -q 2>/dev/null || true
+    # Defensive: ensure the claim marker is gone even if the refiner forgot
+    # (same reasoning as the handoff branch).
+    bd_ label remove "$STORY_ID" "auto-refino:refining" -q 2>/dev/null || true
+    # Defensive: strip any leftover lifecycle label (e.g. story:refinement-in-
+    # progress, if the refiner forgot to swap it per the convention). Safe —
+    # story:epic-split is deliberately NOT in AUTO_REFINO_LIFECYCLE_LABELS
+    # (same reasoning as story:refino-escalado above), so _clear_lifecycle
+    # never touches it.
+    _clear_lifecycle "$STORY_ID"
+    # PHANTOM-ASSIGNEE FIX: clear the claim assignee, same reasoning as the
+    # other two terminal branches — the daemon is done with this story either
+    # way (an epic does not re-enter this funnel; its children do, on their
+    # own, as fresh raw stories).
+    bd_ update "$STORY_ID" --assignee "" -q 2>/dev/null || true
+    bd_ comment "$STORY_ID" "Auto-refino: outcome SPLIT registrado (attempt $THIS_ATTEMPT). O refiner já executou o Epic Split Convention (história convertida em epic, filhas criadas via --parent) para uma escalação de policy-gap já resolvida em attempt anterior. Nenhuma ação adicional do daemon — não reaplica --type, não reabre a escalação, não notifica Mayor/Athos." 2>/dev/null || true
+    log "  $STORY_ID → SPLIT (already-resolved policy-gap executed as epic split by the refiner; daemon made no further changes)."
     ;;
   requeue|*)
     # TIMEOUT / unknown → leave for a later sweep. Drop the claim marker and
