@@ -3492,6 +3492,154 @@ has "$DISPATCHER" '_pilot_crew_aliases\(\)'                  "ga-7ti1t: crew-ali
 has "$DISPATCHER" 'PILOT_OWNER_INFER_GUARD'                  "ga-7ti1t: owner-inference knob is wired"
 has "$DISPATCHER" '_DOM_DEFAULT=\$\(_pilot_infer_crew_from_owner' "ga-7ti1t: owner-inference wired into the ga-lfvs6 guard (fills _DOM_DEFAULT, reusing the existing busy-check/hold fallback)"
 
+# ── Scenario 18ag–18ak (ga-hn3kh): ga-zzqza defeated by the <rig>/.gc/ runtime mirror ──
+# ROOT: every rig gets a runtime MIRROR of the HQ scripts/skills/agents tree at
+# <rig>/.gc/ (verified: whatsapp_automation/.gc/scripts/root-class-count.sh is a
+# byte-identical, UNTRACKED copy of the HQ canonical scripts/root-class-count.sh). The
+# ga-zzqza HQ-only-path check's disk-fallback treated that mirror as "whatsapp_automation
+# genuinely has this file", permanently defeating the override for any bead whose cited
+# path collided with a mirrored relative form. SEPARATELY: bead_cited_paths requires a
+# slash, so ga-shqn (which names "root-class-count.sh" by bare filename, never
+# "scripts/root-class-count.sh") extracted NO candidate at all — the guard silently never
+# ran. Two fixes: (1) _rig_has_any_path's disk-fallback now excludes .gc/-rooted
+# candidates; (2) a new bead_cited_basenames/_rig_has_any_basename pair checks bare-
+# filename citations via a git-tracked-only basename search (no disk-fallback, so it is
+# immune to the mirror by construction — untracked files never appear in `git ls-files`).
+echo "Scenario 18ag (ga-hn3kh): _rig_has_any_path UNIT — .gc/ mirror copy is NOT genuine rig content"
+_RHAP_FN_HN3="$(awk '/^_rig_has_any_path\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_RRP_FN_HN3="$(awk '/^rig_root_path\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+MIRRORROOT="$WORK/hn3kh-mirrorroot"
+rm -rf "$MIRRORROOT"; mkdir -p "$MIRRORROOT/scripts" "$MIRRORROOT/.gc/scripts"
+git init -q "$MIRRORROOT"
+git -C "$MIRRORROOT" config user.email "selftest@example.com"
+git -C "$MIRRORROOT" config user.name "selftest"
+printf '#!/bin/sh\necho real\n' > "$MIRRORROOT/scripts/foo.sh"
+git -C "$MIRRORROOT" add scripts/foo.sh
+git -C "$MIRRORROOT" commit -q -m "tracked script"
+# the .gc/ mirror copy is intentionally left UNTRACKED (never git-added) — exactly how
+# the real runtime mirror is installed (a deploy-time copy, not a commit).
+printf '#!/bin/sh\necho real\n' > "$MIRRORROOT/.gc/scripts/foo.sh"
+# a THIRD file, untracked but genuinely NOT under .gc/ — proves the disk-fallback still
+# rescues a legitimate just-created/uncommitted file (the exclusion must stay narrow).
+printf 'uncommitted' > "$MIRRORROOT/scripts/new_uncommitted.sh"
+_probe_hn3_path() { ( unset PILOT_TEST_RIG_HAS_FILE; PILOT_RIG_PATHS_JSON='{"rigs":[{"name":"whatsapp_automation","path":"'"$MIRRORROOT"'"}]}'; eval "$_RRP_FN_HN3"; eval "$_RHAP_FN_HN3"; _rig_has_any_path whatsapp_automation "$1" && echo present || echo absent ); }
+[ "$(_probe_hn3_path '.gc/scripts/foo.sh')" = absent ] \
+  && ok "ga-hn3kh: untracked .gc/-mirrored copy is NOT counted as rig-owned content" \
+  || bad "REGRESSION (ga-hn3kh): .gc/ mirror still counted as present — the ga-zzqza defeat is back"
+[ "$(_probe_hn3_path 'scripts/foo.sh')" = present ] \
+  && ok "ga-hn3kh preservation: a genuinely tracked non-.gc/ path is still found present" \
+  || bad "REGRESSION: tracked scripts/foo.sh no longer found present"
+[ "$(_probe_hn3_path 'scripts/new_uncommitted.sh')" = present ] \
+  && ok "ga-hn3kh preservation: an untracked file OUTSIDE .gc/ is still rescued via disk-fallback (exclusion stayed narrow)" \
+  || bad "REGRESSION: disk-fallback broken for a legitimate untracked non-.gc/ file (exclusion too broad)"
+
+echo "Scenario 18ah (ga-hn3kh): _rig_has_any_basename UNIT — bare filename via tracked-basename search, mirror excluded"
+_RHAB_FN_HN3="$(awk '/^_rig_has_any_basename\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+printf 'mirror-only' > "$MIRRORROOT/.gc/scripts/mirror_only.sh"   # exists ONLY via the untracked mirror
+_probe_hn3_base() { ( unset PILOT_TEST_RIG_HAS_FILE; PILOT_RIG_PATHS_JSON='{"rigs":[{"name":"whatsapp_automation","path":"'"$MIRRORROOT"'"}]}'; eval "$_RRP_FN_HN3"; eval "$_RHAB_FN_HN3"; _rig_has_any_basename whatsapp_automation "$1" && echo present || echo absent ); }
+[ "$(_probe_hn3_base 'foo.sh')" = present ] \
+  && ok "ga-hn3kh: bare 'foo.sh' matches the tracked scripts/foo.sh via basename search" \
+  || bad "REGRESSION: basename search failed to find a genuinely tracked file"
+[ "$(_probe_hn3_base 'root-class-count.sh')" = absent ] \
+  && ok "ga-hn3kh: a bare filename tracked nowhere in the rig → correctly absent" \
+  || bad "REGRESSION: basename search false-positived on a name not tracked anywhere"
+[ "$(_probe_hn3_base 'mirror_only.sh')" = absent ] \
+  && ok "ga-hn3kh: untracked .gc/-mirror-only file NOT found via basename search (git-tracked-only, no disk walk)" \
+  || bad "REGRESSION: basename search picked up an untracked .gc/ mirror file"
+
+# ── Scenario 18ai (ga-hn3kh, gate attempt-1 blocking issue): bead_cited_basenames must
+# span INTERIOR dots, not stop at the first one. The first cut of this extractor used
+# '[A-Za-z0-9_-]+\.[A-Za-z0-9]+', whose second class cannot span a dot:
+# "pilot-dispatcher.selftest.sh" matched only as far as "pilot-dispatcher.selftest",
+# which then failed the extension whitelist ("selftest" is not py|sh|…) and was silently
+# dropped — reproducing this very function's motivating bug (extracted NO candidate →
+# guard silently no-ops) for every *.selftest.sh / *.spec.ts / *.test.js name, a
+# convention used pervasively in this repo (including this dispatcher's own
+# pilot-dispatcher.selftest.sh). Self-contained (extracts its own copies of the
+# functions) so it does not depend on scenario ordering below.
+echo "Scenario 18ai (ga-hn3kh): bead_cited_basenames UNIT — multi-dot filenames extracted WHOLE"
+_HAY_FN_HN3U="$(awk '/^_bead_path_haystack\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_BCB_FN_HN3U="$(awk '/^bead_cited_basenames\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_bcb_hn3_probe() { ( eval "$_HAY_FN_HN3U"; eval "$_BCB_FN_HN3U"; bead_cited_basenames "$1" ); }
+MULTIDOT_BEAD='[{"id":"ga-multidot","title":"gate feedback: see pilot-dispatcher.selftest.sh for the failing case","priority":2,"issue_type":"bug","description":"reproduces exactly against pilot-dispatcher.selftest.sh itself","status":"open","labels":[],"assignee":null,"created_by":"selftest","created_at":"2026-07-24T00:00:00Z","metadata":{}}]'
+MULTIDOT_OUT="$(_bcb_hn3_probe "$(echo "$MULTIDOT_BEAD" | jq -c '.[0]')")"
+[ "$MULTIDOT_OUT" = "pilot-dispatcher.selftest.sh" ] \
+  && ok "ga-hn3kh: pilot-dispatcher.selftest.sh (double extension) extracted WHOLE, not truncated to 'pilot-dispatcher.selftest'" \
+  || bad "REGRESSION (gate attempt-1 blocking issue): multi-dot filename mis-extracted — got '${MULTIDOT_OUT:-empty}'"
+NOISE_BEAD='[{"id":"ga-multidotnoise","title":"version 0.5.0, see v22.17.0, e.g. this","priority":2,"issue_type":"task","description":"painel.urblink.com.br is our domain; config.yaml.example is just an example, not a real file","status":"open","labels":[],"assignee":null,"created_by":"selftest","created_at":"2026-07-24T00:00:00Z","metadata":{}}]'
+NOISE_OUT="$(_bcb_hn3_probe "$(echo "$NOISE_BEAD" | jq -c '.[0]')")"
+[ -z "$NOISE_OUT" ] \
+  && ok "ga-hn3kh: version numbers / domains / example configs still correctly filtered (multi-dot span didn't widen false positives)" \
+  || bad "REGRESSION: multi-dot extraction now false-positives on non-file text — got '$NOISE_OUT'"
+
+# ── Scenario 18aj (ga-hn3kh, THE NAMED TEST): ga-shqn's exact shape — bare filename,
+# no slash, created_by=*-wa, zero product keyword — must route to gascity/dog, not WA.
+# Uses the PILOT_TEST_RIG_HAS_FILE seam (drives the full dispatch loop deterministically
+# via run_capacity's env -i boundary, which does not propagate PILOT_RIG_PATHS_JSON) to
+# prove the WIRING: the ga-zzqza block must consult bead_cited_basenames/
+# _rig_has_any_basename, not just bead_cited_paths — this fixture cites NO slash-joined
+# path at all, so before this fix _EXIST_CITED_PATHS was always empty and the guard never
+# ran regardless of PILOT_TEST_RIG_HAS_FILE.
+echo "Scenario 18aj (ga-hn3kh): bare-filename-only citation (root-class-count.sh, no directory) still fires the HQ-only override"
+BARE_FILE_BEAD='[{"id":"ga-baretest","title":"root-class-count.sh store list is hardcoded and skips a missing store silently","priority":2,"issue_type":"bug","description":"the guard already catches a failed query but a missing store dir is skipped with a silent continue before the guard runs — fix root-class-count.sh to warn instead of skipping quietly","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"mila-wa-gawisphchfmo","created_at":"2026-07-17T00:00:00Z","metadata":{}}]'
+_BCP_FN_HN3="$(awk '/^bead_cited_paths\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_BCB_FN_HN3="$(awk '/^bead_cited_basenames\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_HAY_FN_HN3="$(awk '/^_bead_path_haystack\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+BARE_FILE_OBJ="$(echo "$BARE_FILE_BEAD" | jq -c '.[0]')"
+_bcp_hn3() { ( eval "$_HAY_FN_HN3"; eval "$_BCP_FN_HN3"; bead_cited_paths "$1" ); }
+_bcb_hn3() { ( eval "$_HAY_FN_HN3"; eval "$_BCB_FN_HN3"; bead_cited_basenames "$1" ); }
+[ -z "$(_bcp_hn3 "$BARE_FILE_OBJ")" ] \
+  && ok "precondition: fixture cites NO slash-joined path (isolates the basename pathway)" \
+  || bad "precondition changed: fixture unexpectedly has a slash path: '$(_bcp_hn3 "$BARE_FILE_OBJ")'"
+[ "$(_bcb_hn3 "$BARE_FILE_OBJ")" = "root-class-count.sh" ] \
+  && ok "precondition: fixture cites bare filename root-class-count.sh" \
+  || bad "precondition changed: bead_cited_basenames='$(_bcb_hn3 "$BARE_FILE_OBJ")'"
+LOG18AJ="$(PILOT_TEST_RIG_HAS_FILE=gascity run_capacity 10 "[]" 1 "$BARE_FILE_BEAD")"
+B18AJ="$(dispatched_builder "$LOG18AJ")"
+if echo "$B18AJ" | grep -qE '^gastown\.dog'; then
+  ok "ga-hn3kh: bare-filename-only citation triggers the ga-zzqza HQ-only override → dog dispatch (ga-shqn shape FIXED)"
+elif [ "$B18AJ" = whatsapp_automation ] || { [ -z "$B18AJ" ] && echo "$LOG18AJ" | grep -q "REFUSING"; }; then
+  bad "REGRESSION (ga-hn3kh): bare-filename citation still refused/held on whatsapp_automation — the ga-shqn misroute is back"
+else
+  bad "ga-hn3kh bare-filename scenario routed unexpectedly (got: '${B18AJ:-none}')"
+fi
+echo "$LOG18AJ" | grep -q "ga-zzqza: ga-baretest cites" && ok "ga-zzqza override fired+logged for the bare-filename citation" || bad "ga-zzqza override did not fire/log for the bare-filename citation"
+
+echo "Scenario 18aj2 (control): PILOT_HQ_PATH_EXISTS_GUARD=0 → bare-filename signal ignored too, owner wins"
+LOG18AJ0="$(PILOT_TEST_RIG_HAS_FILE=gascity PILOT_HQ_PATH_EXISTS_GUARD=0 run_capacity 10 "[]" 1 "$BARE_FILE_BEAD")"
+B18AJ0="$(dispatched_builder "$LOG18AJ0")"
+if echo "$LOG18AJ0" | grep -q "ga-nlh79.*owner-authoritative" || [ -z "$B18AJ0" ]; then
+  ok "kill-switch: PILOT_HQ_PATH_EXISTS_GUARD=0 disables the bare-filename override too (owner-authoritative path taken)"
+else
+  bad "kill-switch did not disable the bare-filename override (got builder='${B18AJ0:-none}')"
+fi
+
+# ── Scenario 18ak (ga-hn3kh, KNOWN LIMITATION — needs an explicit Mayor policy call,
+# NOT resolved here): a content-free ga-* WA-owner bead (the ga-9oyvj shape: zero cited
+# paths, zero cited basenames, zero bead_content_rig keyword match) is structurally
+# INDISTINGUISHABLE from Scenario 18k2's mila-wa-owned "code-mode MCP servers" bead,
+# which MUST keep routing to WA (ga-nlh79) — a blanket "ga-* prefix beats owner" rule
+# (the story's AC2 as literally worded) would fix ga-9oyvj's shape only by breaking
+# 18k2's. This existence-based fix intentionally does not touch that tradeoff; this
+# scenario documents and locks the current (unchanged) behavior so a future change to
+# it is a deliberate, visible decision, not silent drift.
+echo "Scenario 18ak (KNOWN LIMITATION): content-free ga-*/WA-owner POV bead (ga-9oyvj shape) still owner-routes to WA, unchanged"
+POV_NOFILE='[{"id":"ga-povtest","title":"POV+spike: integrar modelos chineses baratos ao Gas City","priority":1,"issue_type":"feature","description":"modelos chineses sao mais baratos e hoje nao tem integracao com o Gas City; comparar custo e performance","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_by":"mila-wa-gawisphchfmo","created_at":"2026-07-17T00:00:00Z","metadata":{}}]'
+LOG18AK="$(run_capacity 10 "[]" 1 "$POV_NOFILE")"
+B18AK="$(dispatched_builder "$LOG18AK")"
+if echo "$B18AK" | grep -qE '^gastown\.dog'; then
+  bad "behavior changed: content-free ga-* POV bead now dogged — if intentional this needs its own story/AC, not a side effect of ga-hn3kh"
+elif echo "$LOG18AK" | grep -q "ga-nlh79.*owner-authoritative" || [ -z "$B18AK" ]; then
+  ok "confirmed unchanged: content-free ga-*/WA-owner bead still owner-routes to WA — same as Scenario 18k2, intentionally NOT fixed by ga-hn3kh"
+else
+  bad "content-free POV bead routed unexpectedly (got: '${B18AK:-none}')"
+fi
+
+echo "Scenario 18al: drift-guard — the ga-hn3kh basename functions are wired into the live dispatcher"
+has "$DISPATCHER" 'bead_cited_basenames\(\)'    "bead_cited_basenames() is defined (drift-guard)"
+has "$DISPATCHER" '_rig_has_any_basename\(\)'   "_rig_has_any_basename() is defined (drift-guard)"
+has "$DISPATCHER" 'ga-hn3kh'                    "ga-hn3kh guard comment is wired"
+
 # ── Scenario 19 (wa-u5r1): dispatchable-queue emit for the painel ─────────────
 echo "Scenario 19a: emit writes valid JSON with the contract shape + count + items"
 F19="$(run_emit)"

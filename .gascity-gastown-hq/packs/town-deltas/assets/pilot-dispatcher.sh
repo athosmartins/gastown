@@ -817,6 +817,33 @@ bead_cited_paths() {
   printf '%s' "$out"
 }
 
+# bead_cited_basenames <bead_json> — echo BARE filenames (no directory) a bead names,
+# one per line (deduped): a known code/config extension with NO slash anywhere in the
+# token. ga-hn3kh: bead_cited_paths requires a slash, so a bead that names a real script
+# by filename alone (e.g. "root-class-count.sh", never "scripts/root-class-count.sh")
+# extracts NO candidate at all — the ga-zzqza HQ-only-path check then has nothing to
+# probe and silently no-ops, even when the file is genuinely HQ-exclusive. This is the
+# companion extractor _rig_has_any_basename consumes.
+# The token may contain INTERIOR dots, and the extension is everything after the LAST
+# one — '(\.[A-Za-z0-9_-]+)+' consumes the whole dotted run so a name like
+# "pilot-dispatcher.selftest.sh" is captured whole and the whitelist below sees the REAL
+# final extension "sh" (a single '\.[A-Za-z0-9]+' segment would stop at "selftest",
+# which then fails the whitelist and silently drops the candidate — the *.selftest.sh /
+# *.spec.ts / *.test.js convention is pervasive in this repo, including this dispatcher's
+# own selftest file). Non-file noise still gets filtered because the whitelist anchors on
+# that last segment: "0.5.0", "v22.17.0", "e.g", "painel.urblink.com.br" all fail it.
+# FAIL-OPEN: any jq/grep error or no match → "".
+bead_cited_basenames() {
+  local bead="$1" hay out
+  hay=$(_bead_path_haystack "$bead")
+  [ -z "$hay" ] && { printf ''; return 0; }
+  out=$(printf '%s' "$hay" \
+        | grep -oE '\b[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+\b' 2>/dev/null \
+        | grep -iE '\.(py|sh|js|ts|tsx|jsx|toml|md|json|ya?ml|sql|txt|cfg|ini|go|rb|html|css|plist|conf)$' 2>/dev/null \
+        | sort -u 2>/dev/null || true)
+  printf '%s' "$out"
+}
+
 # bead_path_rig <bead_json> — infer the OWNING RIG from the FILE PATHS a bead names.
 # Prints one of:
 #   gascity              — an UNAMBIGUOUS HQ/framework path (packs//skills//agents//
@@ -901,11 +928,59 @@ _rig_has_any_path() {
     _rc=0; timeout 5 git -C "$_root" ls-files --error-unmatch -- "$_p" >/dev/null 2>&1 || _rc=$?
     case "$_rc" in
       0) return 0 ;;                          # tracked → present
-      1) [ -e "$_root/$_p" ] && return 0 ;;   # cleanly not tracked → check disk
+      1)
+        # ga-hn3kh: a path under .gc/ is NEVER genuine rig-owned content — every rig gets
+        # a RUNTIME MIRROR of the HQ scripts/skills/agents tree at <rig>/.gc/ (verified:
+        # whatsapp_automation/.gc/scripts/root-class-count.sh is a byte-identical, UNTRACKED
+        # copy of the HQ canonical scripts/root-class-count.sh). The raw disk-fallback below
+        # would treat that mirror copy as "whatsapp_automation has this file", defeating the
+        # ga-zzqza HQ-only-path check for any bead whose cited path collides with a mirrored
+        # relative form. Skip the disk-fallback rescue for a .gc/-rooted candidate; git-tracked
+        # .gc/ content (if it ever existed) is still honored above via the ls-files check, so
+        # this only removes the untracked-mirror false positive, not genuine tracked content.
+        case "$_p" in
+          .gc/*|*/.gc/*) : ;;
+          *) [ -e "$_root/$_p" ] && return 0 ;;   # cleanly not tracked → check disk
+        esac
+        ;;
       *) return 0 ;;                          # probe FAILED → fail-open (present, never refuse)
     esac
   done
   return 1  # every cited path is CLEANLY absent (not tracked AND not on disk)
+}
+
+# _rig_has_any_basename <rig> <newline-or-space-separated-filenames> — return 0 (true)
+# when the bead cites no bare filenames, when the rig root is unknown/off-disk, or when
+# at least one cited filename matches the BASENAME of some file GIT-TRACKED anywhere in
+# the rig's repo. Return 1 (false) ONLY when the rig root is known AND none of the cited
+# filenames match any tracked basename. ga-hn3kh companion to _rig_has_any_path: a bare
+# filename (no directory) can't be checked via a pathspec — it has no path to match — so
+# this does a basename search over `git ls-files` instead of `ls-files --error-unmatch`.
+# DELIBERATELY git-tracked-only, no disk-fallback: unlike a full relative path (where an
+# untracked-but-on-disk hit is plausibly a just-created file), a bare-filename disk walk
+# would need a recursive search and would resurrect the exact untracked-mirror problem
+# this guard exists to close (every <rig>/.gc/ mirror would match by basename on disk).
+# Test seam: PILOT_TEST_RIG_HAS_FILE (same contract as _rig_has_any_path). FAIL-OPEN.
+_rig_has_any_basename() {
+  local _rig="$1" _names="$2" _root _n _list _grc
+  [ -z "$_names" ] && return 0
+  if [ -n "${PILOT_TEST_RIG_HAS_FILE:-}" ]; then
+    case "$PILOT_TEST_RIG_HAS_FILE" in
+      1) return 0 ;;
+      0) return 1 ;;
+      *) case " $PILOT_TEST_RIG_HAS_FILE " in *" $_rig "*) return 0 ;; *) return 1 ;; esac ;;
+    esac
+  fi
+  _root=$(rig_root_path "$_rig" 2>/dev/null || echo "")
+  [ -z "$_root" ] && return 0
+  [ -d "$_root" ] || return 0
+  _list=$(timeout 5 git -C "$_root" ls-files 2>/dev/null); _grc=$?
+  [ "$_grc" != "0" ] && return 0   # probe FAILED (timeout/not-a-repo) → fail-open (present)
+  for _n in $_names; do
+    [ -z "$_n" ] && continue
+    printf '%s\n' "$_list" | grep -qE "(^|/)$(printf '%s' "$_n" | sed -E 's/\./\\./g')\$" 2>/dev/null && return 0
+  done
+  return 1  # every cited filename is absent from every tracked path in the rig
 }
 
 # ── ga-mfeip gate (e): suspended-crew exclusion ───────────────────────────────
@@ -5140,19 +5215,44 @@ LIVESEC
               # (default 1). Fail-open: no cited path, or _rig_has_any_path unable to confirm
               # absence from EVERY product rig ⇒ _HQ_ONLY_PATH stays 0 ⇒ the owner signal commits
               # exactly as before.
-              local _HQ_ONLY_PATH=0 _EXIST_CITED_PATHS=""
+              #
+              # ga-hn3kh: ALSO check bare-filename citations (_rig_has_any_basename), not just
+              # slash-joined paths. ga-shqn (the motivating case: root-class-count.sh, cited by
+              # bare filename only, never "scripts/root-class-count.sh") proved bead_cited_paths
+              # alone leaves this guard permanently inert for any bead that names a real HQ
+              # script without its directory — _EXIST_CITED_PATHS is empty, the guard below
+              # never runs, and _OWNER_RIG_SIGNAL commits unchallenged even though the file is
+              # genuinely HQ-only. Each rig-hit is computed explicitly (not via `||` across two
+              # fail-open-on-empty predicates, which would short-circuit true and defeat the
+              # absence checks) so a bead can supply either signal, both, or neither.
+              # NOTE (scope decision): a bare ga-* PREFIX is deliberately NOT used as a tie-
+              # breaker here (contrast the story's AC2 wording) — Scenario 18k2's mila-wa-owned
+              # "code-mode MCP servers" bead is ga-* prefixed, has zero path/keyword evidence,
+              # and must STILL route to WA (ga-nlh79). It is structurally indistinguishable from
+              # a content-free ga-* WA-owner POV bead (e.g. ga-9oyvj) that this story also names
+              # as affected — prefix-vs-owner is a genuine policy conflict between two already-
+              # adjudicated rulings, not a bug this existence-based guard can resolve; it needs
+              # an explicit Mayor call, not a builder's unilateral pick between the two.
+              local _HQ_ONLY_PATH=0 _EXIST_CITED_PATHS="" _EXIST_CITED_NAMES=""
               if [ "${PILOT_HQ_PATH_EXISTS_GUARD:-1}" = "1" ]; then
                 _EXIST_CITED_PATHS=$(bead_cited_paths "$STORY" 2>/dev/null || echo "")
-                if [ -n "$_EXIST_CITED_PATHS" ] \
-                   && _rig_has_any_path "gascity" "$_EXIST_CITED_PATHS" \
-                   && ! _rig_has_any_path "whatsapp_automation" "$_EXIST_CITED_PATHS" \
-                   && ! _rig_has_any_path "property_scrapers" "$_EXIST_CITED_PATHS"; then
-                  _HQ_ONLY_PATH=1
+                _EXIST_CITED_NAMES=$(bead_cited_basenames "$STORY" 2>/dev/null || echo "")
+                if [ -n "$_EXIST_CITED_PATHS" ] || [ -n "$_EXIST_CITED_NAMES" ]; then
+                  local _HQZ_HQ_HIT=0 _HQZ_WA_HIT=0 _HQZ_PS_HIT=0
+                  [ -n "$_EXIST_CITED_PATHS" ] && _rig_has_any_path "gascity" "$_EXIST_CITED_PATHS" && _HQZ_HQ_HIT=1
+                  [ -n "$_EXIST_CITED_NAMES" ] && _rig_has_any_basename "gascity" "$_EXIST_CITED_NAMES" && _HQZ_HQ_HIT=1
+                  [ -n "$_EXIST_CITED_PATHS" ] && _rig_has_any_path "whatsapp_automation" "$_EXIST_CITED_PATHS" && _HQZ_WA_HIT=1
+                  [ -n "$_EXIST_CITED_NAMES" ] && _rig_has_any_basename "whatsapp_automation" "$_EXIST_CITED_NAMES" && _HQZ_WA_HIT=1
+                  [ -n "$_EXIST_CITED_PATHS" ] && _rig_has_any_path "property_scrapers" "$_EXIST_CITED_PATHS" && _HQZ_PS_HIT=1
+                  [ -n "$_EXIST_CITED_NAMES" ] && _rig_has_any_basename "property_scrapers" "$_EXIST_CITED_NAMES" && _HQZ_PS_HIT=1
+                  if [ "$_HQZ_HQ_HIT" = "1" ] && [ "$_HQZ_WA_HIT" = "0" ] && [ "$_HQZ_PS_HIT" = "0" ]; then
+                    _HQ_ONLY_PATH=1
+                  fi
                 fi
               fi
               if [ "$_HQ_ONLY_PATH" = "1" ]; then
                 _DOMAIN_RIG=""
-                log "ga-zzqza: $STORY_ID cites path(s) present in HQ (gascity) and absent from every known product rig ($(printf '%s' "$_EXIST_CITED_PATHS" | tr '\n' ' ')) — unambiguous framework work per Mayor ruling; overriding owner-authoritative (created_by='$_BEAD_CREATED_BY' assignee='$_BEAD_ASSIGNEE_RAW' would have routed $_OWNER_RIG_SIGNAL). Disable with PILOT_HQ_PATH_EXISTS_GUARD=0."
+                log "ga-zzqza: $STORY_ID cites path(s) present in HQ (gascity) and absent from every known product rig (paths=[$(printf '%s' "$_EXIST_CITED_PATHS" | tr '\n' ' ')] basenames=[$(printf '%s' "$_EXIST_CITED_NAMES" | tr '\n' ' ')]) — unambiguous framework work per Mayor ruling (ga-hn3kh: basename-only citations count too); overriding owner-authoritative (created_by='$_BEAD_CREATED_BY' assignee='$_BEAD_ASSIGNEE_RAW' would have routed $_OWNER_RIG_SIGNAL). Disable with PILOT_HQ_PATH_EXISTS_GUARD=0."
               else
                 _DOMAIN_RIG="$_OWNER_RIG_SIGNAL"
                 log "ga-nlh79: $STORY_ID owner-authoritative rig (created_by='$_BEAD_CREATED_BY' assignee='$_BEAD_ASSIGNEE_RAW') → $_DOMAIN_RIG (BEFORE content-keyword inference, preventing misroute to property_scrapers)"
