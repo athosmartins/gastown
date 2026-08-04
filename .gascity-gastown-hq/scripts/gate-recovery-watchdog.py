@@ -3723,7 +3723,10 @@ def _selftest():
     ok(error_requeue_verdict(600, E, True, False, False, 2, 3) == "requeue", "requeue_count below max → requeue (one attempt left)")
     # FIX 7 — deferred_requeue_verdict (gate-status:deferred marker recovery, ga-y1kk)
     D = 8 * 60
-    ok(deferred_requeue_verdict(300, D, True, True, False, True, 0, 3) == "close:source-done", "source resolved+CLOSED → close regardless of age/author (checked first)")
+    ok(deferred_requeue_verdict(300, D, True, True, False, True, 0, 3, branch_state="merged") == "close:source-done", "source resolved+CLOSED+branch MERGED → close regardless of age/author (checked first; ga-gd706 fix-attempt-2: branch_state now required to reach this verdict)")
+    ok(deferred_requeue_verdict(600, D, True, True, False, True, 0, 3, branch_state="unmerged") == "requeue", "source resolved+CLOSED but branch UNMERGED (real stranding, ga-gd706) → falls through to requeue, never silently superseded")
+    ok(deferred_requeue_verdict(600, D, True, True, False, True, 0, 3) == "requeue", "branch_state omitted → fail-safe default 'unknown' → falls through same as unmerged, never a silent close-by-omission (ga-gd706)")
+    ok(deferred_requeue_verdict(600, D, True, True, False, True, 0, 3, branch_state="missing") == "close:source-done", "source resolved+CLOSED and branch MISSING (deleted/renamed) → close, safe to treat as abandoned")
     ok(deferred_requeue_verdict(60, D, True, False, False, True, 0, 3) == "skip:young", "deferred < threshold → skip:young (give gate.submitted_by/a human time to land)")
     ok(deferred_requeue_verdict(600, D, True, False, True, True, 0, 3) == "skip:parked-needs-human", "source needs-human → never requeue")
     ok(deferred_requeue_verdict(600, D, True, False, False, True, 0, 3) == "requeue", "source resolved + derivable author now present → requeue (the ga-y1kk fix)")
