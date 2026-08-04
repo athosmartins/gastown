@@ -305,6 +305,13 @@ run_sweep() {
     state="$(printf '%s' "$state" | jq -c --argjson keep "$flagged_ids" 'with_entries(select(.key as $k | $keep | index($k) != null))' 2>/dev/null)"
   fi
 
+  # ga-lnpa7: cooldown is correctly per-bead, but the mail used to report the
+  # FULL flagged_tsv every time ANY bead was due — one new bead re-spammed
+  # every already-alerted bead still in cooldown. Compute the delta up front
+  # so both the "nothing changed" gate and the mail body key off it.
+  local new_count; new_count="$(printf '%b' "$to_alert_tsv" | grep -c . || true)"
+  local resolved_count; resolved_count="$(printf '%s\n' "${resolved_ids:-}" | grep -c . || true)"
+
   local total_flagged; total_flagged="$(printf '%b' "$flagged_tsv" | grep -c . || true)"
   log "FLAGGED: ${total_flagged} bead(s) with gate:* label and zero active marker (>=${GOLW_STALE_MINUTES}min)"
   printf '%b' "$flagged_tsv" | while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
@@ -312,7 +319,7 @@ run_sweep() {
     log "  - $bid ($(_store_name "$store2")) age=${age_min}min labels=[${labels}] last_artifact=${lstatus} (${lcount} open)"
   done
 
-  if [ -z "${to_alert_tsv:-}" ]; then
+  if [ "${new_count:-0}" -eq 0 ] && [ "${resolved_count:-0}" -eq 0 ]; then
     log "OK: all ${total_flagged} flagged bead(s) already alerted within cooldown (${GOLW_ALERT_COOLDOWN_S}s) — no new notification"
     if [ "${GOLW_DRY_RUN:-0}" != "1" ]; then
       mkdir -p "$GOLW_STATE_DIR" 2>/dev/null || true
@@ -338,9 +345,10 @@ run_sweep() {
     fi
   done < <(printf '%b' "$to_alert_tsv")
 
-  # ── aggregate notify + mail ────────────────────────────────────────────────
-  local new_count; new_count="$(printf '%b' "$to_alert_tsv" | grep -c . || true)"
-  local summary="GATE ORPHANED LABEL: ${total_flagged} bead(s) carry a gate:* label with zero active marker (>=${GOLW_STALE_MINUTES}min); ${new_count} new/due this cycle."
+  # ── aggregate notify + mail — DELTA report (ga-lnpa7): new/due + resolved +
+  # a count of what's unchanged, not the full flagged set every cycle. ───────
+  local unchanged_count=$(( total_flagged - new_count ))
+  local summary="GATE ORPHANED LABEL: ${new_count} new/due, ${resolved_count} resolved, ${unchanged_count} unchanged-already-reported — ${total_flagged} total currently flagged (>=${GOLW_STALE_MINUTES}min)."
 
   if [ -n "${GOLW_TEST_NOTIFIED:-}" ]; then
     echo "notify:$summary" >> "$GOLW_TEST_NOTIFIED" 2>/dev/null || true
@@ -352,27 +360,50 @@ run_sweep() {
   local mail_body="GATE ORPHANED-LABEL WATCHDOG — detection-only report (ga-l8yh6, follow-up of ga-d3eg2 AC4).
 "
   mail_body="${mail_body}
-${total_flagged} bead(s) currently carry a gate:* lifecycle label with no active quality-gate-marker/-run (threshold: ${GOLW_STALE_MINUTES}min):
+${summary}
 "
-  local detail_lines; detail_lines="$(printf '%b' "$flagged_tsv" | while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
-    [ -z "${bid:-}" ] && continue
-    echo "  ${bid}  (${store2})  age=${age_min}min  labels=[${labels}]  last_artifact=${lstatus} (${lcount} open)"
-  done)"
-  mail_body="${mail_body}
-${detail_lines}
 
+  if [ "${new_count:-0}" -gt 0 ]; then
+    local new_lines; new_lines="$(printf '%b' "$to_alert_tsv" | while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
+      [ -z "${bid:-}" ] && continue
+      echo "  ${bid}  (${store2})  age=${age_min}min  labels=[${labels}]  last_artifact=${lstatus} (${lcount} open)"
+    done)"
+    mail_body="${mail_body}
+NEW/DUE (${new_count}) — why this cycle alerted:
+${new_lines}
+"
+  fi
+
+  if [ "${resolved_count:-0}" -gt 0 ]; then
+    local resolved_lines; resolved_lines="$(printf '%s\n' "$resolved_ids" | while IFS= read -r rid; do
+      [ -z "${rid:-}" ] && continue
+      echo "  ${rid}  (no longer carries an orphaned gate:* label)"
+    done)"
+    mail_body="${mail_body}
+RESOLVED (${resolved_count}) since last alert:
+${resolved_lines}
+"
+  fi
+
+  if [ "${unchanged_count:-0}" -gt 0 ]; then
+    mail_body="${mail_body}
++${unchanged_count} already reported previously, unchanged — see the log for the full current list.
+"
+  fi
+
+  mail_body="${mail_body}
 This is SURFACE-ONLY — no label/status/assignee was touched on any bead. Common
 root causes seen historically (ga-d3eg2's own measurement): a stale label left
 after a manual fix, a branch that conflicts with main and needs re-anchor, work
 already merged but the bead never closed, or an intentional park (gate:needs-human,
 blocked-by:*) that just isn't obvious from gate-idleness alone.
 
-Per-bead detail is also posted as a comment on each new/due bead. Re-alerts for
-an already-flagged bead are suppressed for ${GOLW_ALERT_COOLDOWN_S}s (state:
-${STATE_FILE}). Log: ${LOG}"
+Per-bead detail for NEW/DUE beads is also posted as a comment on each bead.
+Re-alerts for an already-flagged bead are suppressed for ${GOLW_ALERT_COOLDOWN_S}s
+(state: ${STATE_FILE}). Full current list always in the log: ${LOG}"
 
   if [ -n "${GOLW_TEST_MAILED:-}" ]; then
-    echo "mail:gate-orphaned-label:$summary" >> "$GOLW_TEST_MAILED" 2>/dev/null || true
+    { echo "mail:gate-orphaned-label:$summary"; printf '%s\n' "$mail_body"; } >> "$GOLW_TEST_MAILED" 2>/dev/null || true
   else
     command -v "$GC_BIN" >/dev/null 2>&1 && \
       "$GC_BIN" mail send mayor \
@@ -654,6 +685,91 @@ BDSTUB
   [ ! -s "$COMM10B" ] && ok "scenario 10b: no comment posted despite probe failure" || bad "scenario 10b: comment posted on a bead whose artifact probe failed to read (false 'confirmed zero' claim)"
   [ ! -s "$NOTIF10B" ] && ok "scenario 10b: no notify despite probe failure" || bad "scenario 10b: notify fired despite probe failure"
   grep -q "WARN.*cand-j" "$LOG" 2>/dev/null && ok "scenario 10b: WARN logged naming the failed candidate" || bad "scenario 10b: no WARN logged for the failed artifact probe"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 12 (ga-lnpa7 AC1): already-alerted beads + 1 new → mail
+  # highlights the NEW bead, summarizes the rest as a COUNT, does not re-list
+  # their per-bead detail. Also locks AC5: the LOG still gets the full set. ──
+  echo "Scenario 12 (ga-lnpa7 AC1): already-alerted beads + 1 new → mail highlights NEW, counts the rest"
+  printf '[%s,%s]' "$(mk_candidate cand-k1 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" "$(mk_candidate cand-k2 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-k1.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-k2.json"
+  GOLW_TEST_NOTIFIED="$TMP/notif12a" GOLW_TEST_MAILED="$TMP/mail12a" GOLW_TEST_COMMENTS_LOG="$TMP/comm12a" run_sweep >/dev/null
+  printf '[%s,%s,%s]' \
+    "$(mk_candidate cand-k1 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" \
+    "$(mk_candidate cand-k2 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" \
+    "$(mk_candidate cand-k3 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" \
+    > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-k3.json"
+  MAIL12B="$TMP/mail12b"; : > "$MAIL12B"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$TMP/notif12b" GOLW_TEST_MAILED="$MAIL12B" GOLW_TEST_COMMENTS_LOG="$TMP/comm12b" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 12: 2nd sweep still flags (return 1)" || bad "scenario 12: 2nd sweep should flag, got $rc"
+  grep -q "cand-k3" "$MAIL12B" 2>/dev/null && ok "scenario 12: mail highlights the NEW bead (cand-k3)" || bad "scenario 12: mail does not mention the new bead cand-k3"
+  grep -q "cand-k1" "$MAIL12B" 2>/dev/null && bad "scenario 12 (ga-lnpa7 regression): mail re-lists an already-reported bead (cand-k1) individually" || ok "scenario 12: already-reported cand-k1 not individually re-listed"
+  grep -q "cand-k2" "$MAIL12B" 2>/dev/null && bad "scenario 12 (ga-lnpa7 regression): mail re-lists an already-reported bead (cand-k2) individually" || ok "scenario 12: already-reported cand-k2 not individually re-listed"
+  grep -q "+2 already reported" "$MAIL12B" 2>/dev/null && ok "scenario 12: mail includes a count-only summary for the 2 already-reported beads" || bad "scenario 12: mail missing count-only summary for already-reported beads"
+  grep -q "cand-k1" "$LOG" 2>/dev/null && grep -q "cand-k2" "$LOG" 2>/dev/null && grep -q "cand-k3" "$LOG" 2>/dev/null \
+    && ok "scenario 12: log still records the FULL flagged list (k1,k2,k3) even though mail summarizes k1/k2" \
+    || bad "scenario 12 (ga-lnpa7 AC5 regression): log is missing one or more flagged beads"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 13 (ga-lnpa7 AC2): nothing changed since the last alert (no
+  # new/due bead, none resolved) → ZERO mail (not just zero notify). ─────────
+  echo "Scenario 13 (ga-lnpa7 AC2): nothing changed since last alert → zero mail"
+  printf '[%s]' "$(mk_candidate cand-l "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-l.json"
+  GOLW_TEST_NOTIFIED="$TMP/notif13a" GOLW_TEST_MAILED="$TMP/mail13a" GOLW_TEST_COMMENTS_LOG="$TMP/comm13a" run_sweep >/dev/null
+  MAIL13B="$TMP/mail13b"; : > "$MAIL13B"
+  GOLW_TEST_NOTIFIED="$TMP/notif13b" GOLW_TEST_MAILED="$MAIL13B" GOLW_TEST_COMMENTS_LOG="$TMP/comm13b" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 13: 2nd sweep still reports flagged state (return 1)" || bad "scenario 13: 2nd sweep should still return 1 (still orphaned), got $rc"
+  [ ! -s "$MAIL13B" ] && ok "scenario 13: no mail sent when nothing changed" || bad "scenario 13 (ga-lnpa7 AC2 regression): mail sent despite nothing changing since last alert"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 14 (ga-lnpa7 AC3): a bead resolves while a SIBLING bead stays
+  # flagged (still within its own cooldown, not due) → the resolution alone
+  # triggers a mail, and that mail names the resolved bead. ──────────────────
+  echo "Scenario 14 (ga-lnpa7 AC3): a resolved bead appears in the next mail even if nothing else is due"
+  printf '[%s,%s]' "$(mk_candidate cand-m1 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" "$(mk_candidate cand-m2 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-m1.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-m2.json"
+  GOLW_TEST_NOTIFIED="$TMP/notif14a" GOLW_TEST_MAILED="$TMP/mail14a" GOLW_TEST_COMMENTS_LOG="$TMP/comm14a" run_sweep >/dev/null
+  printf '[%s]' "$(mk_candidate cand-m2 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  MAIL14B="$TMP/mail14b"; : > "$MAIL14B"
+  GOLW_TEST_NOTIFIED="$TMP/notif14b" GOLW_TEST_MAILED="$MAIL14B" GOLW_TEST_COMMENTS_LOG="$TMP/comm14b" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 14: sweep still returns 1 (cand-m2 still flagged)" || bad "scenario 14: should still return 1, got $rc"
+  [ -s "$MAIL14B" ] && ok "scenario 14: a mail fired for the resolution alone (no bead was newly due)" || bad "scenario 14 (ga-lnpa7 AC3 regression): resolved bead did not trigger a mail"
+  grep -q "cand-m1" "$MAIL14B" 2>/dev/null && ok "scenario 14: mail names the resolved bead (cand-m1)" || bad "scenario 14 (ga-lnpa7 AC3 regression): mail does not mention the resolved bead cand-m1"
+  grep -q "RESOLVED" "$MAIL14B" 2>/dev/null && ok "scenario 14: mail labels it under a RESOLVED section" || bad "scenario 14: mail missing a RESOLVED section header"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 15 (ga-lnpa7 AC4, CONTROL): first-ever sweep (no prior state)
+  # → every flagged bead is "new" and gets full per-bead detail in the mail —
+  # the fix must not silence or truncate the FIRST report. ───────────────────
+  echo "Scenario 15 (ga-lnpa7 AC4 control): first execution (no prior state) → full detail for every bead, nothing suppressed"
+  printf '[%s,%s,%s]' \
+    "$(mk_candidate cand-n1 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" \
+    "$(mk_candidate cand-n2 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" \
+    "$(mk_candidate cand-n3 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" \
+    > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-n1.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-n2.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-n3.json"
+  MAIL15="$TMP/mail15"; : > "$MAIL15"
+  [ -f "$STATE_FILE" ] && bad "scenario 15: state file should not pre-exist for this control" || ok "scenario 15: no prior state (genuine first run)"
+  GOLW_TEST_NOTIFIED="$TMP/notif15" GOLW_TEST_MAILED="$MAIL15" GOLW_TEST_COMMENTS_LOG="$TMP/comm15" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 15: first sweep flags (return 1)" || bad "scenario 15: first sweep should flag, got $rc"
+  for id in cand-n1 cand-n2 cand-n3; do
+    grep -q "$id" "$MAIL15" 2>/dev/null && ok "scenario 15: first report includes $id" || bad "scenario 15 (ga-lnpa7 AC4 regression): first report is missing $id"
+  done
+  grep -q "already reported" "$MAIL15" 2>/dev/null && bad "scenario 15: first report should have zero already-reported beads to summarize" || ok "scenario 15: no spurious already-reported summary on a first run"
   rm -f "$STATE_FILE" 2>/dev/null
 
   # ── Scenario 11: bash -n syntax check ──────────────────────────────────────
