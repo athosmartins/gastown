@@ -77,8 +77,18 @@ passa a ser do lote certo. Isso é do desenho do cockpit, não um resto de bug.
 `imovel_id` é o id do ANÚNCIO e `fonte` é o portal, e a correção é por link do Google Maps ou
 por clique em lotes. Não aponte este script pra Contagem.
 
-**O mapa** (mapa.urblink) monta a camada de lotes por outro caminho
-(`scripts/map_viewer/rebuild_lotes_layer.py`), que **não** lê a tabela de override. Uma
-correção feita aqui aparece no dashboard de anúncios; a ficha do lote no mapa pode seguir
-mostrando o vínculo antigo. Se isso importar no caso, diga explicitamente em vez de assumir
-que os dois estão alinhados.
+## O mapa (mapa.urblink) — semântica assimétrica
+
+A camada de lotes (`scripts/map_viewer/rebuild_lotes_layer.py`) aplica a MESMA tabela de
+override, mas o modelo dela é diferente: o grouped guarda **um anúncio por lote**. Então:
+
+- o lote errado **sempre** perde o anúncio (é o que conserta o filtro `has_anuncio`);
+- o lote certo só **ganha** se estiver livre. Se já anunciar por outro portal, o anúncio
+  **não** é movido — sobrescrever apagaria um anúncio real. A colisão sai no log do rebuild.
+
+No caso que originou isto (NET 1151704 → lote 324, que já anunciava no Zap) o resultado é
+esse: o 571 para de mostrar anúncio, o 324 mantém o do Zap. Os dois ficam verdadeiros, mas o
+anúncio do NET não aparece no mapa — ele segue no dashboard de anúncios.
+
+Entrou em `fix/mapa-aplica-override-anuncio` (04/08). Confira se já foi mergeado:
+`git -C ~/gt/whatsapp_automation log --oneline -S bh_match_overrides -- scripts/map_viewer/rebuild_lotes_layer.py`
