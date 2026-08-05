@@ -449,30 +449,64 @@ session_matches_author() {
   fi
 }
 
+# _gate_delivery_list_run <text> <line_regex> <label>
+# ga-zhfk8: structural half of gate_delivery_looks_partial. Finds the longest
+# run of >=3 CONSECUTIVE lines (no gap) in <text> that each match <line_regex>
+# anchored at the start of the line. On a qualifying run, prints "detectei
+# (<label>):" followed by the matched lines — so a caller can quote real
+# evidence in the hold message instead of asserting without showing (ga-zhfk8
+# fix 3) — and returns 0. Prints nothing and returns 1 otherwise.
+_gate_delivery_list_run() {
+  local text="$1" pattern="$2" label="$3" line
+  local run="" run_n=0 best="" best_n=0
+  while IFS= read -r line; do
+    if printf '%s\n' "$line" | grep -Eq "$pattern"; then
+      run="${run}${line}"$'\n'
+      run_n=$((run_n + 1))
+    else
+      if [ "$run_n" -gt "$best_n" ]; then best="$run"; best_n=$run_n; fi
+      run=""; run_n=0
+    fi
+  done <<EOF
+$text
+EOF
+  if [ "$run_n" -gt "$best_n" ]; then best="$run"; best_n=$run_n; fi
+  [ "$best_n" -ge 3 ] || return 1
+  printf 'detectei (%s):\n%s' "$label" "$best"
+  return 0
+}
+
 # gate_delivery_looks_partial <bead_text>
-# ga-k2wjn: cheap heuristic — does <bead_text> (a bead's description + notes,
-# CONCATENATED) look like it enumerates multiple approved deliverables, such
-# that "the gate approved this diff" is not the same claim as "this bead's
-# full scope is done"? Confirmed empirically against the 3 real false-closes
-# ga-k2wjn cites (wa-uhbqb: lettered list a.-i.; wa-a7e98: numbered list
-# 1.-4.; wa-k0m1q: numbered list 1.-11. + literal "FATIAS") — wa-k0m1q's own
-# list lives ENTIRELY in bd's notes field (description is empty), so the
-# caller must pass description+notes concatenated, never description alone.
-# Triggers (any one is sufficient):
-#   - >=3 lines start with "N. " (1-2 digit number + period + space), or
-#   - >=3 lines start with "x. " (single lowercase letter + period + space), or
-#   - the text contains (case-insensitive) fatia, fatias, or "itens aprovados"
-# False positives are the accepted/cheap failure mode here (costs one human
-# review — ga-k2wjn's own stated tradeoff); false negatives silently drop
-# approved work, which is the bug this exists to stop.
-# Returns: 0 (true) iff it looks partial; 1 (false) otherwise.
+# ga-k2wjn, tightened by ga-zhfk8 (measured 2026-08-04, wa-zlgye false
+# positive): does <bead_text> (a bead's description + notes, CONCATENATED)
+# look like it enumerates multiple approved deliverables, such that "the gate
+# approved this diff" is not the same claim as "this bead's full scope is
+# done"? Confirmed empirically against the 3 real false-closes ga-k2wjn cites
+# (wa-uhbqb: lettered list a.-i.; wa-a7e98: numbered list 1.-4.; wa-k0m1q:
+# numbered list 1.-11., list lives ENTIRELY in bd's notes field — description
+# is empty, so the caller must pass description+notes concatenated, never
+# description alone) — and against wa-zlgye (ga-zhfk8's measured false
+# positive: prose using "a)"/"d)"/"e)" and the bare word "fatia"/"fatias",
+# zero real list items), which must NOT trigger.
+#
+# v1 (ga-k2wjn) also fired on an isolated "fatia"/"fatias"/"itens aprovados"
+# TOKEN anywhere in the text, no list structure required at all — common
+# words in this city's technical Portuguese, and the actual root cause of the
+# wa-zlgye false positive. v2 (ga-zhfk8) drops that standalone-token trigger
+# entirely and requires genuine list STRUCTURE: >=3 CONSECUTIVE lines (no
+# gap), each starting with "N. " (1-2 digit number) or "x. " (single
+# lowercase letter). On a match it prints the detected lines to stdout (see
+# _gate_delivery_list_run) for the caller to quote in the hold message.
+#
+# False positives on genuine list structure are still the accepted/cheap
+# failure mode (costs one human review — ga-k2wjn's own stated tradeoff);
+# false negatives silently drop approved work, which is the bug this exists
+# to stop. Returns 0 (true, evidence on stdout) iff it looks partial; 1
+# (false, nothing on stdout) otherwise.
 gate_delivery_looks_partial() {
-  local text="${1:-}" digit_hits letter_hits
-  digit_hits=$(printf '%s\n' "$text" | grep -Ec '^[[:space:]]*[0-9]{1,2}\.[[:space:]]' || true)
-  [ "${digit_hits:-0}" -ge 3 ] 2>/dev/null && return 0
-  letter_hits=$(printf '%s\n' "$text" | grep -Ec '^[[:space:]]*[a-z]\.[[:space:]]' || true)
-  [ "${letter_hits:-0}" -ge 3 ] 2>/dev/null && return 0
-  printf '%s' "$text" | grep -qiE 'fatia(s)?|itens aprovados' && return 0
+  local text="${1:-}"
+  _gate_delivery_list_run "$text" '^[[:space:]]*[0-9]{1,2}\.[[:space:]]' 'lista numerada' && return 0
+  _gate_delivery_list_run "$text" '^[[:space:]]*[a-z]\.[[:space:]]' 'lista com letras' && return 0
   return 1
 }
 

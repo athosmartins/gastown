@@ -1,29 +1,40 @@
 #!/usr/bin/env bash
-# gate-delivery-partial-scope.selftest.sh (ga-k2wjn)
+# gate-delivery-partial-scope.selftest.sh (ga-k2wjn, tightened by ga-zhfk8)
 #
 # Proves the ga-k2wjn fix: a gate PASS on a bug/task bead whose body enumerates
-# multiple approved deliverables (a numbered/lettered list, or the words
-# fatia/fatias/"itens aprovados") is held as delivery:partial + escalated to
+# multiple approved deliverables (>=3 CONSECUTIVE numbered or lettered list
+# items, anchored at line start) is held as delivery:partial + escalated to
 # Mayor instead of auto-closed. "The gate approved the diff" and "the bead's
 # full scope is done" are different claims — three real incidents (wa-uhbqb,
 # wa-a7e98, wa-k0m1q) conflated them and silently dropped the remaining scope.
 #
+# ga-zhfk8 (measured 2026-08-04): v1 also held wa-zlgye — a LEGITIMATE merge —
+# because it fired on the bare word "fatia"/"fatias"/"itens aprovados"
+# ANYWHERE in prose, no list structure required at all. v2 drops that
+# standalone-token trigger, requires a genuine CONSECUTIVE run (not just >=3
+# matching lines anywhere in the text), and prints the detected lines so the
+# hold message can CITE them instead of asserting without showing.
+#
 # WHAT it guards:
 #   - gate_delivery_looks_partial() (quality-gate-guard.sh): the pure heuristic,
-#     re-run against synthetic fixtures AND the 3 real historical bead bodies
-#     (embedded verbatim) — ga-k2wjn's falsifiable "should have been held" AC.
-#     Checks BOTH numbered ("1. ") and lettered ("a. ") list markers, and BOTH
-#     description+notes (wa-k0m1q's own list lives entirely in .notes — its
-#     .description is empty; a description-only check would have missed it).
+#     re-run against synthetic fixtures AND 4 real historical bead bodies
+#     (embedded verbatim) — 3 true positives (ga-k2wjn's falsifiable "should
+#     have been held" AC) plus wa-zlgye, the measured false positive that must
+#     NOT hold (ga-zhfk8's falsifiable AC). Checks BOTH numbered ("1. ") and
+#     lettered ("a. ") list markers, BOTH description+notes (wa-k0m1q's own
+#     list lives entirely in .notes — its .description is empty; a
+#     description-only check would have missed it), that non-consecutive hits
+#     do NOT count, and that a qualifying hit prints its evidence to stdout.
 #   - quality-gate-dispatcher.sh: the bug/task PASS branch forks on IS_PARTIAL
 #     before the close call; a scope_covered:all label bypasses the heuristic;
 #     the post-merge re-pick verification does not false-flag a held bead as a
-#     respawn vector.
+#     respawn vector; the hold comment/mail quote the detected evidence.
 #   - story-delivery.sh: the Step 1b task reconciler's task_reconciler_verdict
 #     gains a partial-delivery branch so a bead the primary dispatcher already
 #     held for review is not silently closed a sweep later by this backstop
 #     (and, for the crash-window case where the primary never ran, the
-#     backstop applies the same hold+escalate treatment itself).
+#     backstop applies the same hold+escalate treatment itself, also quoting
+#     evidence).
 #
 # Exit 0 iff every assertion holds.
 set -uo pipefail
@@ -39,6 +50,23 @@ bad() { FAIL=$((FAIL+1)); echo "  ✗ $1"; }
 eq()  { if [ "$2" = "$3" ]; then ok "$1 (=$2)"; else bad "$1: expected [$3], got [$2]"; fi; }
 rc0() { if "$@" >/dev/null 2>&1; then ok "rc0: $*"; else bad "expected rc0: $*"; fi; }
 rc1() { if "$@" >/dev/null 2>&1; then bad "expected non-zero: $*"; else ok "rc!=0: $*"; fi; }
+# out_has <needle> -- <cmd...> — asserts <cmd>'s STDOUT contains <needle> (ga-zhfk8 fix 3).
+out_has() {
+  local needle="$1"; shift
+  [ "${1:-}" = "--" ] && shift
+  local got
+  # ga-zhfk8: quality-gate-guard.sh sets `set -euo pipefail` at its own top,
+  # which leaks into this shell via `source` even in lib-only mode — a bare
+  # assignment from a command that legitimately returns 1 (no match) would
+  # kill the whole selftest under the inherited errexit. `|| true` is the
+  # same idiom already used throughout quality-gate-guard.sh itself for this
+  # exact reason (e.g. digit_hits=$(... grep -Ec ... || true)).
+  got=$("$@" 2>/dev/null) || true
+  case "$got" in
+    *"$needle"*) ok "stdout has '$needle': $*" ;;
+    *) bad "stdout missing '$needle': $* (got: $got)" ;;
+  esac
+}
 
 echo "== gate-delivery-partial-scope.selftest (ga-k2wjn) =="
 
@@ -67,16 +95,34 @@ rc1 gate_delivery_looks_partial "$(printf '1. only one item\n2. and a second\n')
 
 rc0 gate_delivery_looks_partial "$(printf 'Fix the thing.\n1. first\n2. second\n3. third\n')"        # 3 numbered items
 rc0 gate_delivery_looks_partial "$(printf 'a. socios\nb. datas\nc. permeabilidades\nd. anuncio\n')"  # lettered list
-rc0 gate_delivery_looks_partial "Precisa fatiar esse trabalho em partes menores."
-rc0 gate_delivery_looks_partial "Fatias pequenas, por favor."
-rc0 gate_delivery_looks_partial "Os itens aprovados pelo Athos foram: X, Y, Z."
-rc0 gate_delivery_looks_partial "FATIA grande demais"     # case-insensitive
-rc0 gate_delivery_looks_partial "ITENS APROVADOS: tudo"   # case-insensitive
 
-# ── 2. Re-run against the 3 REAL historical false-closes (ga-k2wjn's AC) ───
+# ga-zhfk8: >=3 numbered lines that are NOT consecutive (real prose between
+# them) must NOT trigger. v1 counted matching lines anywhere in the text —
+# exactly the gap that let it over-fire; v2 requires a genuine run.
+rc1 gate_delivery_looks_partial "$(printf '1. first item discussed here.\nSome unrelated paragraph explains context in between.\n2. second item, mentioned much later.\nAnother unrelated paragraph follows.\n3. third item, in passing.\n')"
+
+# ga-zhfk8 (measured 2026-08-04, wa-zlgye false positive): v1 held a bead on
+# the bare word "fatia"/"fatias"/"itens aprovados" ANYWHERE in prose, with
+# ZERO list structure — common words in this city's technical Portuguese. v2
+# drops that standalone-token trigger; these must NOT hold anymore.
+rc1 gate_delivery_looks_partial "Precisa fatiar esse trabalho em partes menores."
+rc1 gate_delivery_looks_partial "Fatias pequenas, por favor."
+rc1 gate_delivery_looks_partial "Os itens aprovados pelo Athos foram: X, Y, Z."
+rc1 gate_delivery_looks_partial "FATIA grande demais"     # case-insensitive — still no list structure
+rc1 gate_delivery_looks_partial "ITENS APROVADOS: tudo"   # case-insensitive — still no list structure
+
+# ── 1b. Evidence on stdout (ga-zhfk8 fix 3: cite, don't just assert) ───────
+echo "── 1b. gate_delivery_looks_partial prints detected evidence ──"
+out_has "1. first" -- gate_delivery_looks_partial "$(printf 'Fix the thing.\n1. first\n2. second\n3. third\n')"
+out_has "a. socios" -- gate_delivery_looks_partial "$(printf 'a. socios\nb. datas\nc. permeabilidades\nd. anuncio\n')"
+NO_EVIDENCE=$(gate_delivery_looks_partial "Just prose, no list, mentions fatia once." 2>/dev/null) || true
+eq "no stdout when it does not look partial" "$NO_EVIDENCE" ""
+
+# ── 2. Re-run against the 4 REAL historical bodies (ga-k2wjn + ga-zhfk8 AC) ─
 # Embedded verbatim from `bd show` (description+notes) as of 2026-08-04, the
 # day this fix was written. ga-k2wjn: "as tres deveriam ter sido retidas."
-echo "── 2. Re-run against the 3 real historical bodies (ga-k2wjn AC) ──"
+# ga-zhfk8: wa-zlgye should NOT have been (measured false positive).
+echo "── 2. Re-run against the 4 real historical bodies (ga-k2wjn + ga-zhfk8 AC) ──"
 WA_UHBQB='ESCOPO
 a. ESTABELECIMENTOS — adicionar os SÓCIOS.
 b. DATAS combinadas que não apareceram.
@@ -111,6 +157,36 @@ $WA_K0M1Q_NOTES"
 # must NOT be mistaken for sufficient — document the gap explicitly:
 rc1 gate_delivery_looks_partial "$WA_K0M1Q_DESCRIPTION"
 
+# ga-zhfk8's measured false positive (embedded verbatim from `bd show wa-zlgye`
+# .description, 2026-08-04 — .notes was empty for this bead). Zero numbered or
+# lettered list items; the only thing v1 matched was the bare word "fatia" in
+# "fatiar"/"fatiei" plus "a)" as a substring of "detectada)" (x3) appearing in
+# ordinary prose. Mayor verified and released it manually the same day: "o
+# heurístico casou na PROSA... não como lista de entregas." Must NOT hold.
+WA_ZLGYE='O coletor de gravações do Drive manda o arquivo INTEIRO pro Groq Whisper. O Groq recusa
+acima de ~25 MB; o `except` em `_transcribe_audio_bytes` (scripts/peter/peter_gdrive_collect.py:111)
+loga um warning e devolve None, e o chamador (linha 229) grava o literal
+"(sem fala detectada)".
+
+Ou seja: FALHA vira SILÊNCIO. E o viés é o pior possível — quanto MAIOR a ligação, maior o
+arquivo, maior a chance de estourar. As ligações longas são exatamente as substantivas.
+
+MEDIDO (03/08/2026): a ligação Athos↔André das 16h54 tem 46min20 e 42,9 MB. O JSON do
+/peter-review trazia content="(sem fala detectada)". Baixei, converti pra wav mono 16k,
+fatiei em blocos de 10 min e transcrevi via o mesmo Groq: **27.491 caracteres de fala** —
+o debrief mais denso do dia (desistência do Cláudio/MCF no Leopoldina, custo de obra da MCF
+vs ProTempo, posição financeira do Cláudio, Victor Pardini, Zé Maria Alphansu, projeto
+aprovado do Luxemburgo). Tudo isso teria se perdido em silêncio.
+
+CONSERTO: fatiar antes de enviar (ffmpeg -f segment, blocos de ~10 min, wav mono 16k) e
+concatenar as transcrições. Receita já validada em
+/private/tmp/.../scratchpad/transcribe_long_call.py.
+
+E o mais importante: **nunca gravar "(sem fala detectada)" quando houve ERRO.** Silêncio
+genuíno e falha de transcrição precisam ser estados DIFERENTES no JSON — hoje o consumidor
+(eu, no /peter-review) não tem como distinguir.'
+rc1 gate_delivery_looks_partial "$WA_ZLGYE"
+
 # ── 3. Control: a normal, single-scope bug (the common case) is unaffected ─
 echo "── 3. Control: normal single-item bug body ──"
 NORMAL_BUG='O botão X não responde ao clique no mobile.
@@ -137,10 +213,34 @@ else
   bad "post-merge re-pick verification does not exempt IS_PARTIAL"
 fi
 
+# ga-zhfk8 fix 3: the hold message must CITE detected evidence, not just assert.
+if grep -qF 'PARTIAL_EVIDENCE=$(gate_delivery_looks_partial' "$DISPATCHER"; then
+  ok "dispatcher.sh captures gate_delivery_looks_partial's stdout evidence"
+else
+  bad "dispatcher.sh does not capture evidence (still asserting without showing)"
+fi
+if grep -q '\$PARTIAL_EVIDENCE' "$DISPATCHER"; then
+  ok "dispatcher.sh quotes \$PARTIAL_EVIDENCE in the hold comment/mail"
+else
+  bad "dispatcher.sh never uses \$PARTIAL_EVIDENCE — evidence captured but not shown"
+fi
+
 # ── 5. Structural wiring: story-delivery.sh task reconciler backstop ───────
 echo "── 5. Wiring: story-delivery.sh task reconciler ──"
 if grep -q 'gate_delivery_looks_partial' "$DELIVERY"; then ok "story-delivery.sh mirrors gate_delivery_looks_partial"; else bad "story-delivery.sh does not check gate_delivery_looks_partial"; fi
 if grep -q 'keep:partial-delivery' "$DELIVERY"; then ok "story-delivery.sh's task_reconciler_verdict has a partial-delivery verdict"; else bad "story-delivery.sh missing keep:partial-delivery verdict"; fi
+
+# ga-zhfk8 fix 3, mirrored: same evidence-capture-and-quote discipline.
+if grep -qF 'TASK_PARTIAL_EVIDENCE=$(gate_delivery_looks_partial' "$DELIVERY"; then
+  ok "story-delivery.sh captures gate_delivery_looks_partial's stdout evidence"
+else
+  bad "story-delivery.sh does not capture evidence (still asserting without showing)"
+fi
+if grep -q '\$TASK_PARTIAL_EVIDENCE' "$DELIVERY"; then
+  ok "story-delivery.sh quotes \$TASK_PARTIAL_EVIDENCE in the hold comment/mail"
+else
+  bad "story-delivery.sh never uses \$TASK_PARTIAL_EVIDENCE — evidence captured but not shown"
+fi
 
 # ── 6. task_reconciler_verdict (story-delivery.sh) — 3rd-arg extension ─────
 # Sourced separately (own LIB_ONLY var) so this file also drift-guards the
