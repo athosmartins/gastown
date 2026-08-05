@@ -2032,10 +2032,6 @@ fi
 mkdir -p "$LOG_DIR"
 exec >> "$LOG" 2>&1
 
-log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] $*"; }
-err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] ERROR: $*"; }
-warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] WARN: $*"; }
-
 # ── Per-cycle heartbeat (DPW anti-false-WEDGE) ────────────────────────────────
 # Touch a dedicated heartbeat file at the VERY START of every run — including
 # runs that exit early (lock-contention yield, no-work, headroom DEFER). The
@@ -2047,9 +2043,44 @@ warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] WARN: $*
 # tmpfs full) is silently swallowed — it must never abort the dispatcher.
 # The heartbeat file path is $HQ/.gc/logs/quality-gate-dispatcher.heartbeat;
 # $LOG_DIR is set above and mkdir -p'd before exec >> "$LOG".
+#
+# ga-2vf9b: touching ONLY here conflated "a sweep started" with "a sweep is
+# still alive" — Phase C's own preamble (per-in-flight-run bd queries, marker
+# scan, headroom check, claim+rebase+spawn) can legitimately run 500-900s+
+# under Dolt latency or several in-flight runs, comfortably past DPW's 600s
+# threshold BEFORE this single invocation even finishes, even though log()
+# output during that same stretch never gaps past ~200s (measured against
+# quality-gate-dispatcher.log: 0 of the last 4999 inter-line gaps exceeded
+# 600s; the daemon was always actively progressing). So log() now re-touches
+# this SAME file on every call — a strict superset of the original single
+# touch (log() always fires at least once early in a normal run, covering
+# fast-exit paths identically) that ALSO keeps the heartbeat fresh through a
+# long-but-active sweep. A sweep that genuinely stops logging for >600s (truly
+# hung, e.g. wedged on an unresponsive syscall) still goes stale and still
+# gets kickstarted — that path is unchanged.
+#
+# ga-2vf9b (adversarial review tweak): `: > file` (truncate via shell redirect)
+# bumps mtime identically to `touch` without forking an external process — the
+# original once-per-run touch is cheap either way, but log()/err()/warn() below
+# can now fire dozens of times per sweep, so avoid the per-call fork. Content
+# is never read (only mtime), so truncating to empty each time is harmless.
+#
+# COUPLING WARNING: daemon-presence-watchdog.sh (same bead, ga-2vf9b) ALSO
+# gained an in-flight-gate-run suppression that widens its effective
+# tolerance for a stale heartbeat on THIS daemon specifically, whenever a
+# quality-gate-run bead is gate-status:running. That suppression is
+# defense-in-depth ON TOP OF this fix, not a substitute for it — if this
+# per-call refresh is ever reverted while that suppression stays, DPW's
+# effective wedge-detection window for a genuinely hung dispatcher silently
+# stretches from 600s to however long a gate-run bead happens to persist as
+# gate-status:running (commonly tens of minutes), which is WORSE than the
+# pre-fix baseline. Revert both together, never just this one.
 _GATE_HB_FILE="$LOG_DIR/quality-gate-dispatcher.heartbeat"
-touch "$_GATE_HB_FILE" 2>/dev/null || true
-unset _GATE_HB_FILE
+: > "$_GATE_HB_FILE" 2>/dev/null || true
+
+log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] $*"; : > "$_GATE_HB_FILE" 2>/dev/null || true; }
+err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] ERROR: $*"; : > "$_GATE_HB_FILE" 2>/dev/null || true; }
+warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] WARN: $*"; : > "$_GATE_HB_FILE" 2>/dev/null || true; }
 
 # ── ga-piscg: systemic spawn-abort escalation (consecutive-abort alert) ───────
 # The dispatcher processes exactly ONE queued marker per sweep. A broken spawn

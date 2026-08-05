@@ -208,6 +208,103 @@ _secs_since_avail() {
   [ "$latest" -gt 0 ] 2>/dev/null && echo $(( now - latest ))
 }
 
+# ── ga-2vf9b: in-flight gate-run guard (quality-gate-dispatcher-SPECIFIC) ────
+# Defense-in-depth on top of the log()-driven heartbeat fix (quality-gate-
+# dispatcher.sh, same bead): before kickstarting a WEDGED
+# com.gascity.quality-gate-dispatcher, check whether a real gate-run is in
+# flight. Phase B (ga-eqjo) intentionally leaves the dispatcher PROCESS
+# exited between sweeps while a spawned reviewer works independently — the
+# heartbeat can legitimately go stale during that gap even though nothing is
+# wrong. Reuses the EXACT label pair Phase C itself uses to find its own
+# in-flight runs (bd-list-cached.sh -l type:quality-gate-run -l
+# gate-status:running), so this is the same source of truth, not a new
+# heuristic.
+#
+# COUPLING WARNING (mirrors the identical note in quality-gate-dispatcher.sh):
+# this suppression is defense-in-depth ON TOP OF that script's log()-driven
+# heartbeat refresh, not a substitute for it. If THIS suppression is ever
+# reverted while that refresh stays, nothing changes (the heartbeat already
+# doesn't go stale during a genuinely active sweep). But if THAT refresh is
+# reverted while THIS suppression stays, DPW's effective wedge-detection
+# window for a genuinely hung dispatcher silently stretches from 600s to
+# however long a gate-run bead's own verdict-timeout+margin window happens to
+# be (commonly tens of minutes) — WORSE than the pre-fix baseline. The two
+# fixes must be reverted together, never just the dispatcher-side one alone.
+#
+# Deliberately scoped to ONE label, not a generic mechanism for every
+# wedge-checked daemon — this is bug-specific business logic, not an infra
+# primitive; adding it here would be scope creep the other daemons never
+# asked for.
+#
+# The freshness ceiling matters: a gate-run stuck at gate-status:running past
+# its own timeout means something is ALREADY wrong (a dead reviewer, or a
+# dispatcher that is genuinely dead and will never run Phase C again to notice)
+# — in that case DPW must NOT suppress, because kickstarting the dispatcher is
+# exactly what lets a fresh sweep's Phase C finally finalize the stale run.
+# Suppressing on bead-existence alone, with no age bound, would convert "kills
+# too eagerly" into "never recovers from a real hang".
+#
+# ga-2vf9b (adversarial review tweak): the ceiling is NOT a flat literal —
+# an earlier version hardcoded 3600s as "comfortably above
+# VERDICT_TIMEOUT_MAX_MINUTES=50m", but that constant lives in a DIFFERENT
+# script/process with no shared runtime state, is itself env-overridable with
+# no cap, and per-diff SCALING already produces a run-specific value (see
+# gate_scaled_verdict_timeout in quality-gate-dispatcher.sh). A second,
+# independently-edited copy of "the verdict-timeout window" is exactly the
+# failure class this codebase has already been burned by once (multiple
+# independent deadlines on one run; tightest wins wrongly, silently, until
+# someone bumps one constant and forgets its sibling). quality-gate-guard.sh
+# avoids this correctly (GATE_ZOMBIE_AGE_MINUTES = its verdict-timeout var +
+# GATE_DEAD_REVIEWER_MARGIN_MINUTES, not a bare number) — this check follows
+# the SAME pattern, but reads the run's OWN persisted `verdict_timeout_minutes`
+# field (written into the gate-run bead's description by the dispatcher at
+# spawn time — the exact field Phase C's own `extract "verdict_timeout_minutes"`
+# already reads for this identical question) instead of a global constant, so
+# it is correct per-run regardless of future scaling/ceiling changes in the
+# dispatcher. Falls back to DPW_GATE_RUN_DEFAULT_TIMEOUT_MIN (mirrors the
+# dispatcher's own VERDICT_TIMEOUT_MAX_MINUTES default) if the field is
+# missing/unparseable — never a bare "3600" anywhere in this logic.
+#
+# Fail-safe in BOTH directions of the "what could go wrong" question: any
+# error (bd/jq missing, Dolt unreachable, malformed JSON, timeout) makes this
+# return 1 (not in flight) — the caller then falls through to the PRE-EXISTING
+# kill behavior. A broken check must never leave a genuinely wedged daemon
+# un-killed forever; it may only ADD a suppression on POSITIVE, VERIFIED
+# evidence.
+DPW_GATE_RUN_DEFAULT_TIMEOUT_MIN="${DPW_GATE_RUN_DEFAULT_TIMEOUT_MIN:-50}"  # mirrors dispatcher's VERDICT_TIMEOUT_MAX_MINUTES default
+DPW_GATE_RUN_MARGIN_MIN="${DPW_GATE_RUN_MARGIN_MIN:-10}"                    # mirrors guard's GATE_DEAD_REVIEWER_MARGIN_MINUTES default
+_gate_run_in_flight() {
+  local now="$1" out
+  # Selftest seam: DPW_TEST_GATE_INFLIGHT="1"/"0" bypasses bd/jq/Dolt entirely,
+  # exactly like DPW_TEST_AVAIL_AGE bypasses the real sysctl call above — lets
+  # the WEDGE-block scenarios test the WIRING (does the elif fire, does it log
+  # correctly, is it scoped to the right label) without a live Dolt round-trip.
+  # The jq/date MATH itself is unit-tested separately by calling this function
+  # directly with a stubbed bd-list-cached.sh (Scenarios 7j–7o).
+  if [ -n "${DPW_TEST_GATE_INFLIGHT+x}" ]; then
+    [ "$DPW_TEST_GATE_INFLIGHT" = "1" ]
+    return
+  fi
+  command -v bd >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  [ -f "$HQ/scripts/bd-list-cached.sh" ] || return 1
+  out=$(timeout 8 bash "$HQ/scripts/bd-list-cached.sh" -C "$HQ" list --json \
+          -l type:quality-gate-run -l gate-status:running 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+  # Per-bead: created_at + (its OWN verdict_timeout_minutes, or the default,
+  # plus the dead-reviewer margin) > now  ⇒  still legitimately in its window.
+  printf '%s' "$out" | jq -e \
+    --argjson now "$now" \
+    --argjson marginmin "$DPW_GATE_RUN_MARGIN_MIN" \
+    --argjson defaultmin "$DPW_GATE_RUN_DEFAULT_TIMEOUT_MIN" \
+    'any(.[]?;
+      (((.created_at // "") | fromdateiso8601?) // 0) as $created
+      | ($created > 0) and
+        ((((.description // "") | capture("(?m)^verdict_timeout_minutes: *(?<m>[0-9]+)"; "").m) // ($defaultmin | tostring) | tonumber) as $vtm
+          | ($now - $created) < (($vtm + $marginmin) * 60))
+    )' >/dev/null 2>&1
+}
+
 # ── imp05: count consecutive nonzero exits for a label ───────────────────────
 # State files for consecutive-exit tracking live in STATE.fail-counts/; format "COUNT".
 _fail_count_file() { echo "${STATE}.fail-counts/$1"; }
@@ -565,6 +662,15 @@ run_sweep() {
           # post-wake is re-flagged a cycle later, once avail-age exceeds the threshold.
           if [ "${DPW_WAKE_GRACE:-1}" = "1" ] && [ -n "$_AVAIL_AGE" ] && [ "$_AVAIL_AGE" -lt "$_hbmax" ] 2>/dev/null; then
             log "WEDGE-SUPPRESSED (recent wake/boot): $lbl heartbeat stale ${_age}s but system only up ${_AVAIL_AGE}s (< ${_hbmax}s) — expected post-sleep, self-heals on next launch"
+          elif [ "$lbl" = "com.gascity.quality-gate-dispatcher" ] && [ "${DPW_GATE_INFLIGHT_GUARD:-1}" = "1" ] && _gate_run_in_flight "$NOW"; then
+            # ga-2vf9b: a quality-gate-run bead is gate-status:running and still
+            # within ITS OWN persisted verdict_timeout_minutes + margin (not a
+            # flat ceiling — see _gate_run_in_flight's own docs). Phase B
+            # legitimately leaves the dispatcher process exited between sweeps
+            # while its spawned reviewer works independently. Heartbeat
+            # staleness alone cannot prove a hang here; not killing, waiting
+            # for a future sweep's Phase C to finalize naturally.
+            log "WEDGE-SUPPRESSED (run in flight): $lbl heartbeat stale ${_age}s but a quality-gate-run bead is gate-status:running and still within its own verdict-timeout+margin window — Phase B (ga-eqjo) leaves the dispatcher process exited between sweeps by design; not killing, waiting for a future sweep's Phase C to finalize (ga-2vf9b, run in flight, waiting)"
           else
             wedged="$wedged $lbl(stale=${_age}s)"
             if [ "$DPW_RELOAD" = "1" ] && launchctl kickstart -k "gui/$UID_NUM/$lbl" 2>/dev/null; then
@@ -793,6 +899,112 @@ SYS
   _av="$(_secs_since_avail 1000000500)"   # now = boot_epoch + 500s
   [ "$_av" = "500" ] && ok "_secs_since_avail returns 500s (parsed sec, ignored usec + waketime=0)" || bad "_secs_since_avail mis-parsed boottime (got '$_av'; expected 500 — usec-collision regex regression?)"
   rm -f "$TMP/sysctl"
+
+  # ── ga-2vf9b: in-flight gate-run guard selftests (scenarios 7f–7o) ─────────
+  # 7f–7i exercise the WEDGE-block WIRING via the DPW_TEST_GATE_INFLIGHT bypass
+  # seam (no live bd/jq/Dolt call) — same style as 7b–7d using
+  # DPW_TEST_AVAIL_AGE. 7j–7o unit-test _gate_run_in_flight's REAL jq/date
+  # logic directly (including the per-bead verdict_timeout_minutes field, not
+  # just the fallback default), with a stubbed bd-list-cached.sh under a FAKE
+  # $HQ (restored immediately after) — never touches the real production
+  # script. All of
+  # 7f–7i pin DPW_TEST_AVAIL_AGE to a large value so they never depend on the
+  # REAL machine's uptime (unlike 6/7, which tolerate that dependency because
+  # a long-running Mac's uptime is comfortably > their thresholds anyway).
+
+  echo "Scenario 7f (ga-2vf9b): WEDGE + gate-run genuinely in flight → SUPPRESSED, no kickstart"
+  : > "$STATE"; rm -rf "${STATE}.fail-counts"; : > "$DPW_TEST_KICKSTARTS"
+  DPW_CRITICAL="com.gascity.quality-gate-dispatcher"; DPW_TEST_LOADED="com.gascity.quality-gate-dispatcher"; DPW_TEST_EXIT=""
+  GATE_HB="$TMP/gate-hb.log"; DPW_HEARTBEAT="com.gascity.quality-gate-dispatcher|$GATE_HB|600"
+  touch -t "$(date -v-20M +%Y%m%d%H%M 2>/dev/null || echo 202601010000)" "$GATE_HB"   # stale ~20min > 600s
+  DPW_TEST_AVAIL_AGE=99999; DPW_TEST_GATE_INFLIGHT=1
+  run_sweep && ok "gate-run in flight suppresses WEDGE (return 0)" || bad "WEDGE not suppressed despite gate-run in flight"
+  [ ! -s "$DPW_TEST_KICKSTARTS" ] && ok "no kickstart when a real gate-run is in flight" || bad "kickstarted despite gate-run in flight (regression)"
+  grep -q "run in flight" "$LOG" && ok "log names the suppression reason (run in flight)" || bad "log missing 'run in flight' suppression message"
+
+  echo "Scenario 7g (ga-2vf9b): WEDGE + NO gate-run in flight → still kickstarts (unchanged)"
+  : > "$STATE"; rm -rf "${STATE}.fail-counts"; : > "$DPW_TEST_KICKSTARTS"
+  DPW_TEST_GATE_INFLIGHT=0
+  run_sweep && bad "genuine wedge (no in-flight run) should still alert" || ok "genuine wedge still fires when no gate-run is in flight"
+  grep -q "com.gascity.quality-gate-dispatcher" "$DPW_TEST_KICKSTARTS" && ok "genuine wedge still kickstarted (no in-flight run to protect)" || bad "genuine wedge NOT kickstarted — regression"
+
+  echo "Scenario 7h (ga-2vf9b): in-flight guard is SCOPED — a different wedge-checked daemon is NOT protected"
+  : > "$STATE"; rm -rf "${STATE}.fail-counts"; : > "$DPW_TEST_KICKSTARTS"
+  DPW_CRITICAL="com.gascity.beta"; DPW_TEST_LOADED="com.gascity.beta"
+  OTHER_HB="$TMP/other-hb.log"; DPW_HEARTBEAT="com.gascity.beta|$OTHER_HB|300"
+  touch -t "$(date -v-1H +%Y%m%d%H%M 2>/dev/null || echo 202601010000)" "$OTHER_HB"
+  DPW_TEST_GATE_INFLIGHT=1   # even with a positive in-flight signal...
+  run_sweep && bad "a DIFFERENT daemon's wedge should still fire (guard is gate-dispatcher-only)" || ok "in-flight guard does NOT leak to a different daemon's wedge check"
+  grep -q "com.gascity.beta" "$DPW_TEST_KICKSTARTS" && ok "unrelated daemon still kickstarted (scoping confirmed)" || bad "scoping leaked — unrelated daemon wrongly protected"
+
+  echo "Scenario 7i (ga-2vf9b): DPW_GATE_INFLIGHT_GUARD=0 → escape hatch disables the new check"
+  : > "$STATE"; rm -rf "${STATE}.fail-counts"; : > "$DPW_TEST_KICKSTARTS"
+  DPW_CRITICAL="com.gascity.quality-gate-dispatcher"; DPW_TEST_LOADED="com.gascity.quality-gate-dispatcher"
+  DPW_HEARTBEAT="com.gascity.quality-gate-dispatcher|$GATE_HB|600"
+  DPW_TEST_GATE_INFLIGHT=1; DPW_GATE_INFLIGHT_GUARD=0
+  run_sweep && bad "guard disabled + in-flight=1 should still wedge (escape hatch)" || ok "DPW_GATE_INFLIGHT_GUARD=0 reverts to legacy (wedge fires despite in-flight=1)"
+  DPW_GATE_INFLIGHT_GUARD=1; unset DPW_TEST_GATE_INFLIGHT DPW_TEST_AVAIL_AGE
+  DPW_HEARTBEAT=""; DPW_CRITICAL="$ALL"
+
+  echo "Scenario 7j (ga-2vf9b): _gate_run_in_flight — fresh running gate-run bead → true"
+  _REAL_HQ_FOR_TEST="$HQ"; _now7="$(date +%s)"
+  HQ="$TMP/fake-hq-7j"; mkdir -p "$HQ/scripts"
+  _fresh_iso="$(date -u -r "$((_now7 - 100))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  cat > "$HQ/scripts/bd-list-cached.sh" <<EOF
+#!/usr/bin/env bash
+echo '[{"id":"ga-wisp-test1","created_at":"$_fresh_iso"}]'
+EOF
+  chmod +x "$HQ/scripts/bd-list-cached.sh"
+  _gate_run_in_flight "$_now7" && ok "fresh (100s old) running gate-run → in flight (true)" || bad "fresh running gate-run wrongly read as NOT in flight"
+
+  echo "Scenario 7k (ga-2vf9b): _gate_run_in_flight — no description field, PAST the 60min fallback ceiling (default 50min+10min margin) → false (do not suppress forever)"
+  _stale_iso="$(date -u -r "$((_now7 - 4000))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"   # 4000s ≈ 66.7min > 60min fallback
+  cat > "$HQ/scripts/bd-list-cached.sh" <<EOF
+#!/usr/bin/env bash
+echo '[{"id":"ga-wisp-test2","created_at":"$_stale_iso"}]'
+EOF
+  _gate_run_in_flight "$_now7" && bad "gate-run older than the fallback ceiling should NOT count as in flight" || ok "gate-run past the fallback timeout+margin correctly does NOT suppress (avoids never-recovers regression)"
+
+  echo "Scenario 7l (ga-2vf9b): _gate_run_in_flight — no running gate-run beads → false"
+  cat > "$HQ/scripts/bd-list-cached.sh" <<'EOF'
+#!/usr/bin/env bash
+echo '[]'
+EOF
+  _gate_run_in_flight "$_now7" && bad "empty result should not count as in flight" || ok "no gate-run beads → correctly not in flight"
+
+  echo "Scenario 7m (ga-2vf9b): _gate_run_in_flight — bd-list-cached.sh errors → false (fail-safe)"
+  cat > "$HQ/scripts/bd-list-cached.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+  _gate_run_in_flight "$_now7" && bad "a failing bd-list-cached.sh should fail safe to NOT in flight" || ok "bd-list-cached.sh error correctly falls through to NOT in flight (fail-safe)"
+
+  echo "Scenario 7n (ga-2vf9b): _gate_run_in_flight — PER-BEAD verdict_timeout_minutes governs, not a flat default"
+  # A SHORT-lived run (verdict_timeout_minutes=15, +10min margin = 25min window).
+  # 20min old: still within its OWN window → true, even though 20min would also
+  # be within the 60min fallback default — this doesn't yet prove the field is
+  # actually being read instead of ignored (7o proves that negatively).
+  _20min_ago_iso="$(date -u -r "$((_now7 - 1200))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  cat > "$HQ/scripts/bd-list-cached.sh" <<EOF
+#!/usr/bin/env bash
+printf '%s' '[{"id":"ga-wisp-test3","created_at":"$_20min_ago_iso","description":"source_bead: wa-1\nbranch: crew/x\nverdict_timeout_minutes: 15\nrig: whatsapp_automation"}]'
+EOF
+  _gate_run_in_flight "$_now7" && ok "20min-old run with its own 15min+10min-margin=25min window → in flight (true)" || bad "wrongly read as NOT in flight within its own window"
+
+  echo "Scenario 7o (ga-2vf9b): _gate_run_in_flight — a SHORT run's own timeout EXPIRES sooner than the 60min fallback (proves the field is actually read, not ignored)"
+  # Same verdict_timeout_minutes=15 (+10min margin=25min window), but now 30min
+  # old: past ITS OWN window (30 > 25) even though 30min is still comfortably
+  # inside the 60min fallback default. If this returned true, the field would
+  # be getting silently ignored in favor of the flat default — the exact
+  # regression the adversarial review flagged.
+  _30min_ago_iso="$(date -u -r "$((_now7 - 1800))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  cat > "$HQ/scripts/bd-list-cached.sh" <<EOF
+#!/usr/bin/env bash
+printf '%s' '[{"id":"ga-wisp-test4","created_at":"$_30min_ago_iso","description":"verdict_timeout_minutes: 15"}]'
+EOF
+  _gate_run_in_flight "$_now7" && bad "30min-old run past its own 15min+10min=25min window should NOT count as in flight (field being ignored?)" || ok "short run's own timeout correctly expires before the 60min fallback would (field is genuinely read, not ignored)"
+
+  HQ="$_REAL_HQ_FOR_TEST"
 
   # ── RECYCLER selftests (scenarios 8–12) ──────────────────────────────────
   # All recycler scenarios use seams: a stub `ps` that returns a controlled RSS,
