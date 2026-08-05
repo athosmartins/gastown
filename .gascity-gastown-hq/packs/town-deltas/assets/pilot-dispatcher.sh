@@ -1794,8 +1794,20 @@ _filter_candidates() {
         # false-positive on "search engine", "rebuild index", etc.) — checked
         # both word orders, since real bug bodies say both "rebuild...gascity"
         # and "gascity engine rebuild".
+        # ga-w3vn3: a lone "engine[ -]window" alternative used to live in this
+        # list too — removed because it IS the own name of the needs:engine-window
+        # label, so any bead merely CITING that label (e.g. a bug report whose
+        # scope section lists labels a related defect drops) got vetoed as if
+        # it were requesting the operation itself — ga-xvxvf blocked 13 sweeps
+        # straight for describing its own bug. The already-labeled case stays
+        # covered independently: every bd list/bd ready call site above already
+        # passes its own --exclude-label flag for this same label name; a
+        # genuine pre-label rebuild request still matches one of the
+        # co-occurring alternatives here. Do not re-add a standalone
+        # label-name alternative to this pattern — same failure class this
+        # comment already warns against.
         and (((.title // "") + " " + (.description // ""))
-             | test("gascity.*rebuild|rebuild.*gascity|swap.*bin[áa]rio|swap.*binary|binary swap|town bounce|engine[ -]window"; "i")
+             | test("gascity.*rebuild|rebuild.*gascity|swap.*bin[áa]rio|swap.*binary|binary swap|town bounce"; "i")
              | not)
         # ga-xdukc/ga-hd87d: independent safety net (defense-in-depth), same
         # shape as the engine-rebuild veto directly above. A bead whose TITLE

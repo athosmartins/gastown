@@ -6046,6 +6046,27 @@ else
   bad "ga-y1m40 observability REGRESSION: streak did not reset after a successful dispatch broke it"
 fi
 
+# ── Scenario ga-w3vn3: body-text veto must not match a bare CITATION of the
+# needs:engine-window label name; a genuine rebuild request must still be caught ──
+# The _filter_candidates body-text regex used to carry a lone "engine[ -]window"
+# alternative — the own name of the needs:engine-window label, unlike every other
+# alternative in the pattern, which requires two strong terms to CO-OCCUR. Any
+# bead that merely mentioned the label (not asked for the operation) matched it.
+# Real damage: ga-xvxvf (P0) was excluded from 13 consecutive Pilot sweeps because
+# its own ALCANCE section listed labels a related bug drops, and the label name
+# was one of them — bd-labelcite below reproduces that section verbatim. This is
+# a false-positive fixture (today it is wrongly vetoed) paired with a co-occurrence
+# control (mirrors tt-engsignal in Scenario 3b) that must remain vetoed — proving
+# the fix removed only the bare label-name alternative, not the compound ones.
+echo "Scenario ga-w3vn3: bead citing needs:engine-window as a label name is not vetoed; genuine rebuild request still is"
+LABELCITE='[
+  {"id":"bd-labelcite","assignee":null,"labels":[],"description":"ALCANCE: Qualquer label nao-de-fluxo morre na promocao: area:infra, lane:*, safety:*, crew:*, needs:engine-window, pilot:no-auto-dispatch, blocked-by:*."},
+  {"id":"bd-realrebuild","assignee":null,"labels":[],"description":"requires a full gascity engine rebuild + binary swap + town bounce before this can ship"}
+]'
+[ "$(_fc "$LABELCITE")" = '["bd-labelcite"]' ] \
+  && ok "ga-w3vn3: label-name citation survives _filter_candidates (no false-positive); co-occurring rebuild request still vetoed" \
+  || bad "ga-w3vn3: unexpected candidate set — false-positive not fixed or co-occurrence control regressed (got: $(_fc "$LABELCITE"))"
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
