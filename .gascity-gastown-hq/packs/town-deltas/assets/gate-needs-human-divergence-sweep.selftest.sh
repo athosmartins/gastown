@@ -199,9 +199,14 @@ if [ -f "$DISPATCHER" ]; then
   # each in lockstep so this never drifts again; a SILENT site (label added,
   # no mail) breaks the count match and fails loudly instead of staying red
   # forever waiting for a human to notice and re-bump a number.
+  # ga-409f4: count "mail send \$AUTHOR" OR "mail send \$NOTIFY_AUTHOR" — the
+  # branch-author-aware variable now used at some (not all) of these sites is
+  # the same durable-mail-to-a-real-identity signal this check tracks, just no
+  # longer always the bead-assignee-derived variable (see quality-gate-dispatcher.sh's
+  # gate_finalize_run header comment for why the two variables coexist).
   NEEDS_HUMAN_SITE_COUNT=$(grep -cE 'label add[[:space:]]+"\$BEAD_ID"[[:space:]]+"gate:needs-human"' "$DISPATCHER")
   eq "dispatcher mails AUTHOR at every gate:needs-human site ($NEEDS_HUMAN_SITE_COUNT, ga-u4yi/ga-huaxo self-consistent count)" \
-     "$(grep -c 'mail send "\$AUTHOR"' "$DISPATCHER")" "$NEEDS_HUMAN_SITE_COUNT"
+     "$(grep -cE 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"' "$DISPATCHER")" "$NEEDS_HUMAN_SITE_COUNT"
 else
   bad "dispatcher not found at $DISPATCHER"
 fi

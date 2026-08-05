@@ -176,9 +176,12 @@ grep -qE 'if \[ -n "\$BEAD_RAW" \]' "$GUARD" \
 # restarted session, unlike a comment — same rationale as ga-u4yi's AUTHOR
 # mail at the dispatcher's gate:needs-human transition sites), scoped to the
 # Step 5a block specifically (isolate from Step 6+ / dispatcher content).
+# ga-409f4: the mail target is now $NOTIFY_AUTHOR (branch-author-aware),
+# not the bead-derived $AUTHOR — same durable-mail property, different
+# (more correct) identity source. Both patterns are accepted below.
 echo "── 7. drift-guard: ga-oo66 — AUTHOR is mailed on Step 5a park (not just commented) ──"
 STEP5A_BLOCK=$(awk '/# ── Step 5a:/{f=1} f{print} f&&/# ── Resolve the store that OWNS the source bead/{exit}' "$GUARD")
-printf '%s\n' "$STEP5A_BLOCK" | grep -q 'mail send "\$AUTHOR"' \
+printf '%s\n' "$STEP5A_BLOCK" | grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"' \
   && ok "Step 5a mails AUTHOR on park (ga-oo66)" \
   || bad "Step 5a still only comments — author has no durable park signal (ga-oo66 regression)"
 # Both park reasons (needs-approval, needs-human) plus the fail-open default
@@ -201,7 +204,7 @@ printf '%s\n' "$STEP5A_BLOCK" | grep -q '|| warn "Could not mail author' \
 # "missing" branch below — the same error/empty conflation this codebase's
 # own ga-p5q3 doctrine warns against, just inverted (empty caught as a hard
 # abort instead of a graceful signal).
-MAIL_LINE=$(printf '%s\n' "$STEP5A_BLOCK" | grep -n 'mail send "\$AUTHOR"' | head -1 | cut -d: -f1 || true)
+MAIL_LINE=$(printf '%s\n' "$STEP5A_BLOCK" | grep -nE 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"' | head -1 | cut -d: -f1 || true)
 CLOSE_LINE=$(printf '%s\n' "$STEP5A_BLOCK" | grep -n 'close "\$MARKER_ID"' | head -1 | cut -d: -f1 || true)
 if [ -n "$MAIL_LINE" ] && [ -n "$CLOSE_LINE" ] && [ "$MAIL_LINE" -lt "$CLOSE_LINE" ]; then
   ok "Step 5a author mail fires BEFORE the marker close"

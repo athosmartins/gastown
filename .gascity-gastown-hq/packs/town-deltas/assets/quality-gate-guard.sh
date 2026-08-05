@@ -1620,6 +1620,23 @@ fi
 
 log "Authoritative author: $AUTHOR"
 
+# ga-409f4: notification target for this guard's own nudges/mails below,
+# resolved separately from $AUTHOR. $AUTHOR (Step 5 above) is derived from
+# the bead's assignee/created_by/owner for the DIFFERENT purpose of
+# self-review exclusion (SECURITY note above) — a bead's assignee can be a
+# reporter/PM who delegated the coding to someone else without reassigning
+# the bead. Reproduced live: bead assignee=digo-wa, actual branch
+# author=mila on crew/mila/wa-o4ygn-r2 — a gate notification went to
+# digo-wa, costing the real author 2 hops/~15min to learn about it. The
+# branch's own crew/<name>/ segment is immutable once pushed and always
+# names the real author for crew branches; anything else (dog fix/*,
+# wa-worker/* branches) falls back to $AUTHOR unchanged — the CONTROLE case
+# from ga-409f4's acceptance criteria (no crew segment -> today's behavior).
+# SELFTEST-EXTRACT notify-author-resolve: BEGIN
+NOTIFY_AUTHOR=$(printf '%s' "$BRANCH" | sed -n 's#^crew/\([^/]\{1,\}\)/.*#\1#p')
+[ -z "$NOTIFY_AUTHOR" ] && NOTIFY_AUTHOR="$AUTHOR"
+# SELFTEST-EXTRACT notify-author-resolve: END
+
 # ── Step 5a: park markers whose source-bead is not approved or circuit-broken ──
 # BEAD_RAW was fetched in Step 5 above. Extract labels and run the pure decision.
 # This check fires BEFORE the gate-run bead is created (Step 6) so no reviewer is
@@ -1663,12 +1680,13 @@ To re-enter the gate: resolve the blocking condition on $BEAD_ID (get it approve
       park:needs-human)    UNBLOCK_HINT="Get a human/Mayor to resolve the gate:needs-human circuit-break on $BEAD_ID" ;;
       *)                   UNBLOCK_HINT="Resolve the blocking condition on $BEAD_ID" ;;
     esac
-    if [ -n "$AUTHOR" ]; then
-      gc --city "$GC_CITY" mail send "$AUTHOR" \
+    # ga-409f4: NOTIFY_AUTHOR (branch-author-aware), not the bead-derived $AUTHOR.
+    if [ -n "$NOTIFY_AUTHOR" ]; then
+      gc --city "$GC_CITY" mail send "$NOTIFY_AUTHOR" \
         -s "Gate marker parked (not queued): $BEAD_ID" \
         -m "$(printf 'Your gate marker %s (bead %s, branch %s) was PARKED, not queued — %s.\n\nNo gate-run was created and no reviewer was spawned. This is different from "queued, reviewers incoming": nothing further will happen on this marker.\n\n%s, then submit a fresh gate marker. Until then, any further /gate-done resubmission for this bead will keep being silently parked — this mail is the one signal you get for THIS attempt.' \
           "$MARKER_ID" "$BEAD_ID" "$BRANCH" "$PARK_REASON" "$UNBLOCK_HINT")" \
-        2>/dev/null || warn "Could not mail author $AUTHOR for Step 5a park on $BEAD_ID (marker $MARKER_ID)"
+        2>/dev/null || warn "Could not mail author $NOTIFY_AUTHOR for Step 5a park on $BEAD_ID (marker $MARKER_ID)"
     fi
     bd -C "$GC_CITY" close "$MARKER_ID" \
       -r "Gate guard Step 5a: marker parked (terminal) — $PARK_REASON. No gate-run created." \
@@ -1896,9 +1914,11 @@ if [ -n "$BEAD_ID" ]; then
   log "  wa-qq33j: gate:reviewing set on $BEAD_ID (kanban: in-review state)"
 fi
 
-# Notify the author (not Mayor) that their branch is queued for autonomous review
-if [ -n "$AUTHOR" ]; then
-  gc --city "$GC_CITY" session nudge "$AUTHOR" \
+# Notify the author (not Mayor) that their branch is queued for autonomous
+# review. ga-409f4: NOTIFY_AUTHOR (branch-author-aware), not the
+# bead-derived $AUTHOR.
+if [ -n "$NOTIFY_AUTHOR" ]; then
+  gc --city "$GC_CITY" session nudge "$NOTIFY_AUTHOR" \
     "Your branch $BRANCH ($BEAD_ID) has passed guard validation and is queued for autonomous quality gate review (G). No action needed — G will process it within ~2 minutes." \
     --delivery wait-idle 2>/dev/null || true
 fi

@@ -2190,6 +2190,23 @@ supersede_sibling_runs() {
 # by textual position, so callers earlier in the file can invoke a function
 # defined here as long as this definition itself runs first each sweep.
 gate_finalize_run() {
+# ga-409f4: notification target for THIS run's FAIL/PASS-hold nudges/mails,
+# resolved separately from $AUTHOR. $AUTHOR (set above, Step 3) is derived
+# from the bead's assignee/created_by/owner for the DIFFERENT purpose of
+# self-review exclusion (quality-gate-guard.sh Step 5's SECURITY note) — a
+# bead's assignee can be a reporter/PM who delegated the coding to someone
+# else without reassigning the bead. Reproduced live: bead assignee=digo-wa,
+# actual branch author=mila on crew/mila/wa-o4ygn-r2 — the FAIL nudge went
+# to digo-wa, costing the real author 2 hops/~15min to learn about it. The
+# branch's own crew/<name>/ segment is immutable once pushed and always
+# names the real author for crew branches; anything else (dog fix/*,
+# wa-worker/* branches) falls back to $AUTHOR unchanged — the CONTROLE case
+# from ga-409f4's acceptance criteria (no crew segment -> today's behavior).
+# SELFTEST-EXTRACT notify-author-resolve: BEGIN
+NOTIFY_AUTHOR=$(printf '%s' "$BRANCH" | sed -n 's#^crew/\([^/]\{1,\}\)/.*#\1#p')
+[ -z "$NOTIFY_AUTHOR" ] && NOTIFY_AUTHOR="$AUTHOR"
+# SELFTEST-EXTRACT notify-author-resolve: END
+
 # ── Step 9: Close reviewer sessions ──────────────────────────────────────────
 # Close promptly here (before the Step 10 merge) to free the gate-reviewer cap
 # slots ASAP. The EXIT trap (ga-zl277) is the safety net for every abort path
@@ -2399,15 +2416,16 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; the
     # ga-huaxo bijection guard (gate-selfheal.selftest.sh §8) caught it. The author's
     # branch PASSED review but is held for human reconciliation; they need a DURABLE
     # signal (mail survives a dead/restarted session, unlike an ephemeral bd comment).
-    # $AUTHOR is the global populated by `extract "author"` before gate_finalize_run is
-    # called (same as the working cap-exhaustion site below), so this reaches the real
-    # author — not a hollow guard-satisfier.
-    if [ -n "$AUTHOR" ]; then
-      gc --city "$GC_CITY" mail send "$AUTHOR" \
+    # ga-409f4: mail NOTIFY_AUTHOR (branch-author-aware), not the bead-derived
+    # $AUTHOR — see the header comment at the top of this function. This site
+    # nudges/mails whoever should actually act on the outcome, not whoever
+    # the bead happens to be assigned to.
+    if [ -n "$NOTIFY_AUTHOR" ]; then
+      gc --city "$GC_CITY" mail send "$NOTIFY_AUTHOR" \
         -s "Your gate PASS is held for reconciliation: 2 branches on $BEAD_ID (ga-lxz5w)" \
         -m "$(printf 'Your branch %s PASSED gate review, but it was NOT merged.\n\nA sibling branch %s is concurrently active in the gate for the same source bead %s (gate-status:%s). Auto-merging either branch would silently discard the other, so %s was labeled gate:needs-human and the Pilot will not re-dispatch it.\n\nNothing to do from your side right now — a human must pick the correct/superset branch and clear gate:needs-human before either can proceed.\n\nBead: %s   Rig: %s\nYour branch: %s (gate run %s)\nSibling branch: %s (gate-status:%s)' \
           "$BRANCH" "$GATE_LXZ5W_SIB_BRANCH" "$BEAD_ID" "$GATE_LXZ5W_SIB_STATUS" "$BRANCH" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID" "$GATE_LXZ5W_SIB_BRANCH" "$GATE_LXZ5W_SIB_STATUS")" \
-        2>/dev/null || warn "Could not mail author $AUTHOR for sibling-branch race on $BEAD_ID (ga-lxz5w)"
+        2>/dev/null || warn "Could not mail author $NOTIFY_AUTHOR for sibling-branch race on $BEAD_ID (ga-lxz5w)"
     fi
     warn "ga-lxz5w: sibling branch $GATE_LXZ5W_SIB_BRANCH (gate-status:$GATE_LXZ5W_SIB_STATUS) active for bead $BEAD_ID — downgrading $BRANCH's PASS to FAIL, labeling gate:needs-human."
   fi
@@ -2940,12 +2958,13 @@ $PARTIAL_EVIDENCE" 2>/dev/null || true
           -m "$(printf 'Source bead %s PASSED the quality gate and merged (branch %s, sha %s, gate_run %s) but was NOT closed.\n\nga-k2wjn/ga-zhfk8: the bead body looks like it enumerates multiple approved deliverables (>=3 consecutive numbered or lettered list items), and a gate PASS only proves this one diff does what it claims, not that the full scope of the bead is done.\n\n%s\n\nLabeled delivery:partial + gate:needs-human; Pilot will not re-dispatch it.\n\nReview the diff against the full enumerated scope: if complete, add label scope_covered:all and close manually (or re-submit to the gate); if partial, the remaining items are still live on this bead.\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s, sha %s)' \
             "$BEAD_ID" "$BRANCH" "$MERGE_SHA" "$GATE_RUN_ID" "$PARTIAL_EVIDENCE" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID" "$MERGE_SHA")" \
           2>/dev/null || warn "Could not mail Mayor scope-hold escalation for $BEAD_ID (ga-k2wjn)"
-        if [ -n "$AUTHOR" ]; then
-          gc --city "$GC_CITY" mail send "$AUTHOR" \
+        # ga-409f4: NOTIFY_AUTHOR (branch-author-aware), not the bead-derived $AUTHOR.
+        if [ -n "$NOTIFY_AUTHOR" ]; then
+          gc --city "$GC_CITY" mail send "$NOTIFY_AUTHOR" \
             -s "Your gate PASS is held for scope review: $BEAD_ID (ga-k2wjn)" \
             -m "$(printf 'Your branch %s PASSED gate review and merged (sha %s), but the source bead %s was NOT closed.\n\nga-k2wjn/ga-zhfk8: the bead body looks like it enumerates multiple approved deliverables (>=3 consecutive numbered or lettered list items), and a gate PASS only proves this diff does what it claims, not that the full scope of the bead is done. Held as delivery:partial + gate:needs-human pending Mayor review.\n\n%s\n\nIf this diff genuinely covers every enumerated item, add label scope_covered:all and close manually (or re-submit to the gate); otherwise the remaining items are still live on this bead.\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s)' \
               "$BRANCH" "$MERGE_SHA" "$BEAD_ID" "$PARTIAL_EVIDENCE" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID")" \
-            2>/dev/null || warn "Could not mail author $AUTHOR for scope-hold on $BEAD_ID (ga-k2wjn)"
+            2>/dev/null || warn "Could not mail author $NOTIFY_AUTHOR for scope-hold on $BEAD_ID (ga-k2wjn)"
         fi
       else
         # BUG/TASK → close it. bd list defaults to OPEN-only, so closing removes
@@ -3109,11 +3128,13 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
     bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run terminal: FAILED (branch $BRANCH). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
   fi
 
-  # Notify the author (not the Mayor) via nudge
-  if [ -n "$AUTHOR" ]; then
-    gc --city "$GC_CITY" session nudge "$AUTHOR" \
+  # Notify the author (not the Mayor) via nudge. ga-409f4: NOTIFY_AUTHOR
+  # (branch-author-aware), not the bead-derived $AUTHOR — see this
+  # function's header comment.
+  if [ -n "$NOTIFY_AUTHOR" ]; then
+    gc --city "$GC_CITY" session nudge "$NOTIFY_AUTHOR" \
       "QUALITY GATE FAILED for branch $BRANCH. Blocking reasons: $(echo -e "$FAIL_REASONS" | head -3). Gate run: $GATE_RUN_ID. Fix the issues and re-run /gate-done when ready." \
-      --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR (session may not exist)"
+      --delivery wait-idle 2>/dev/null || warn "Could not nudge author $NOTIFY_AUTHOR (session may not exist)"
   fi
 
   # ── ga-jb4l: SELF-HEALING FAIL LOOP ────────────────────────────────────────
@@ -3203,13 +3224,14 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         # ga-u4yi: durable mail to the AUTHOR too — a bd comment alone left
         # thies-wa's branch rotting 20h in silence because nothing durable told
         # her she was stuck (only Mayor was mailed; mail, not nudge, survives a
-        # dead/restarted author session).
-        if [ -n "$AUTHOR" ]; then
-          gc --city "$GC_CITY" mail send "$AUTHOR" \
+        # dead/restarted author session). ga-409f4: NOTIFY_AUTHOR
+        # (branch-author-aware), not the bead-derived $AUTHOR.
+        if [ -n "$NOTIFY_AUTHOR" ]; then
+          gc --city "$GC_CITY" mail send "$NOTIFY_AUTHOR" \
             -s "Gate needs-human: your branch $BRANCH exhausted $GATE_FIX_CAP fix attempts" \
             -m "$(printf 'Your branch %s (bead %s) failed the quality gate %s times. Auto-retry is now DISABLED (label gate:needs-human): the Pilot will NOT re-dispatch this bead, and any further /gate-done resubmission will be silently parked until a human resolves this.\n\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene before this can proceed.' \
               "$BRANCH" "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
-            2>/dev/null || warn "Could not mail author $AUTHOR for gate-fix-cap escalation on $BEAD_ID"
+            2>/dev/null || warn "Could not mail author $NOTIFY_AUTHOR for gate-fix-cap escalation on $BEAD_ID"
         fi
       fi
       # ga-5w0hr: a needs-human bead has NO active worker — the gate just gave up
@@ -3313,9 +3335,13 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
           fi
         fi
         bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; gate:reviewing cleared (wa-qq33j). Author $AUTHOR is a LIVE crew session, so this dispatcher acted to KEEP assignee + story:in-flight (ga-jyox) instead of letting the Pilot dispatch a stranger — verified post-write on the raw bead, not display: $KEEP_ASSIGNEE_OBS; $KEEP_INFLIGHT_OBS. See GATE-FEEDBACK above; re-run /gate-done after fixing." 2>/dev/null || true
-        gc --city "$GC_CITY" session nudge "$AUTHOR" \
+        # ga-409f4: the NUDGE target is NOTIFY_AUTHOR (branch-author-aware) —
+        # the assignee-keep decision above stays on $AUTHOR (bead ownership
+        # is a separate concern from who wrote the code; see this
+        # function's header comment).
+        gc --city "$GC_CITY" session nudge "$NOTIFY_AUTHOR" \
           "Gate FAILED for $BEAD_ID (branch $BRANCH, attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — see GATE-FEEDBACK on the bead. Your assignee was kept (ga-jyox); fix and re-run /gate-done." \
-          --delivery wait-idle 2>/dev/null || warn "Could not nudge live-crew author $AUTHOR for gate FAIL feedback"
+          --delivery wait-idle 2>/dev/null || warn "Could not nudge live-crew author $NOTIFY_AUTHOR for gate FAIL feedback"
         # ga-7rvyt: gc hook / routed-pool surfacing has no live-in-flight-owner
         # guard (unlike Pilot's _filter_candidates), so a bead kept in-flight
         # here for a live crew author was still re-offered to generic pool

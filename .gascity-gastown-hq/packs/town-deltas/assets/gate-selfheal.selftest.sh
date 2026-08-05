@@ -160,7 +160,9 @@ echo "── 8. drift-guard: ga-u4yi — AUTHOR (not just Mayor) is mailed at ev
 # enumeration: a magic number lies by default, and a chronically-RED guard can no longer
 # distinguish "someone added a legit site" from "someone added a SILENT park" — the exact
 # thing this guard exists to catch. The structural invariant is: EVERY line that applies
-# gate:needs-human has a `mail send "$AUTHOR"` within the same escalation block (measured
+# gate:needs-human has a `mail send "$AUTHOR"` (or, post-ga-409f4, the branch-author-aware
+# `mail send "$NOTIFY_AUTHOR"` — same durable-mail-to-a-real-identity property, just no
+# longer the bead-assignee-derived variable) within the same escalation block (measured
 # window: the site→mail distance is 13–20 lines across all current sites, so 40 is safe).
 # A future Nth site WITH its mail passes untouched; a SILENT site fails, naming its line.
 # (This subsumes the old 4→5→6 hand-bumped count, incl. ga-y43lq's fix of the ga-tgwq
@@ -172,7 +174,7 @@ NEEDS_HUMAN_SITES=$(grep -nE 'label add[[:space:]]+"\$BEAD_ID"[[:space:]]+"gate:
   | grep -v 'gate:needs-human:' | cut -d: -f1)
 _bij_ok=1; _bij_bad_line=""
 for _site in $NEEDS_HUMAN_SITES; do
-  if ! sed -n "${_site},$((_site + 40))p" "$GATE" | grep -q 'mail send "\$AUTHOR"'; then
+  if ! sed -n "${_site},$((_site + 40))p" "$GATE" | grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"'; then
     _bij_ok=0; _bij_bad_line="$_site"; break
   fi
 done
@@ -182,14 +184,14 @@ if [ "$_bij_ok" = 1 ] && [ "$_n_sites" -ge 1 ]; then
 else
   bad "gate:needs-human site at line $_bij_bad_line has NO AUTHOR mail within 40 lines — a SILENT park (ga-u4yi/ga-huaxo)"
 fi
-grep -q 'mail send "\$AUTHOR"' "$GATE" \
+grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"' "$GATE" \
   && ok "gate escalates to the AUTHOR, not just Mayor" \
   || bad "gate still only mails Mayor — author has no durable needs-human signal (ga-u4yi regression)"
 # The cap-exhaustion author-mail MUST live inside the SAME once-only idempotency
 # guard as the existing Mayor mail, or a bead already needs-human before this
 # code path re-triggers (defensively) would re-mail the author every time.
 CAP_MAIL_BLOCK="$(awk '/Escalate EXACTLY once/{f=1} f{print} f&&/^      fi[[:space:]]*$/{exit}' "$GATE")"
-printf '%s\n' "$CAP_MAIL_BLOCK" | grep -q 'mail send "\$AUTHOR"' \
+printf '%s\n' "$CAP_MAIL_BLOCK" | grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"' \
   && ok "cap-exhaustion author-mail is inside the escalate-exactly-once guard" \
   || bad "cap-exhaustion author-mail is OUTSIDE the once-only guard — would spam on re-entry"
 
