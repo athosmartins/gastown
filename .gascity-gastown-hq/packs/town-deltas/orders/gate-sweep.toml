@@ -2,6 +2,12 @@
 # (root cause = poll frequency). gate-sweep is mechanical (timer + GitHub status); ≤30s
 # extra latency on gate closes is acceptable. Script vendored into town-deltas/assets so
 # $PACK_DIR resolves here (the embedded maintenance copy is gitignored/ephemeral).
+#
+# ga-23z6a: interval is further widened to 150s by
+# packs/town-deltas/assets/scripts/eval-window-concurrency-guard.sh during the 3
+# named weekly eval windows, then restored to 60s. Do not hand-edit this value
+# while a window might be active — check
+# .gc/logs/eval-window-concurrency-guard.log first.
 [order]
 description = "Evaluate and close pending gates (timer, GitHub)"
 trigger = "cooldown"

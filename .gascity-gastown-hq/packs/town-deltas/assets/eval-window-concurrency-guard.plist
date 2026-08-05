@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.eval-window-concurrency-guard</string>
+
+  <!-- Runs every 300 seconds (5 minutes). Computes whether "now" falls inside
+       one of the 3 named weekly eval windows (lexbh Fri 05:07, whatsapp Mon
+       09:17, quality-gate-eval ~7d drifting/advisory-only) and, if the
+       desired profile (normal/throttled) differs from what's currently on
+       disk, rewrites 5 target values (gastown.dog max_active_sessions,
+       oracle-wa min_active_sessions, and 3 town-deltas order intervals) then
+       runs `gc reload --soft` once. Caps/floors only — never kills a live
+       session, never touches job schedules (see ga-7xne1 for that). Full
+       rationale + safety valves: eval-window-concurrency-guard.sh header.
+
+       Supervised first-dispatch procedure (DO NOT load unsupervised):
+         1. DRY_RUN=1 bash eval-window-concurrency-guard.sh   # decision only
+         2. bash eval-window-concurrency-guard.sh             # 1 supervised pass
+         3. launchctl bootstrap gui/$(id -u) \
+              ~/Library/LaunchAgents/com.gascity.eval-window-concurrency-guard.plist
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/eval-window-concurrency-guard.sh</string>
+  </array>
+
+  <key>StartInterval</key><integer>300</integer>
+
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/eval-window-concurrency-guard-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/eval-window-concurrency-guard-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>

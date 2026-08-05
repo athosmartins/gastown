@@ -74,6 +74,27 @@ provider = "claude-headless"
 # blocks a spawn. inflight-reclaim-guard's poll is the authoritative backstop.
 pre_start = ["/Users/athos/gt/.gascity-gastown-hq/scripts/dog-pool-preflight-reclaim.py"]
 
+# BEGIN ga-23z6a eval-window-concurrency-guard (managed by
+# packs/town-deltas/assets/scripts/eval-window-concurrency-guard.sh — do not
+# hand-edit the two value lines below; the guard rewrites them in place when a
+# window opens/closes and always follows with `gc reload --soft`. Values here
+# are the NORMAL (outside-window) profile, matching each agent's un-patched
+# default (confirmed via `gc config explain`) — see the guard script header
+# for the 3 named window schedules and the full ga-sb11i.2 rationale.
+# Log: .gc/logs/eval-window-concurrency-guard.log
+# Note: the oracle-wa patch only resolves once oracle-wa itself is defined,
+# which today comes from this rig's own (pre-existing, uncommitted) root
+# pack.toml, not from any git-tracked source — a real gap, but predates this
+# story and applies to every reference to oracle-wa, not just this one.
+[[patches.agent]]
+name = "gastown.dog"
+max_active_sessions = 3
+
+[[patches.agent]]
+name = "oracle-wa"
+min_active_sessions = 1
+# END ga-23z6a eval-window-concurrency-guard
+
 [daemon]
 formula_v2 = true
 patrol_interval = "120s"

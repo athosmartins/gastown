@@ -1,6 +1,12 @@
 # town-deltas override: loosen beads-health poll 30s→120s to cut Dolt connection-churn
 # load (root cause = poll frequency, not query cost). Durable: town-deltas is a local
 # git-tracked pack imported AFTER gastown, so it overrides the embedded system order.
+#
+# ga-23z6a: interval is further widened to 300s by
+# packs/town-deltas/assets/scripts/eval-window-concurrency-guard.sh during the 3
+# named weekly eval windows, then restored to 120s. Do not hand-edit this value
+# while a window might be active — check
+# .gc/logs/eval-window-concurrency-guard.log first.
 [order]
 description = "Check beads provider health and recover on failure"
 trigger = "cooldown"
