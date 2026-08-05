@@ -28,9 +28,11 @@
 # CONTRACT): the refiner sets lifecycle label `story:refino-review` on a refined
 # bead (instead of writing story:needs-approval directly). Any refiner — the
 # auto-refino daemon (ga-flxp6), Refino Rápido, or a manual /refino session —
-# targets this gate the same way:
-#       bd -C "$GC_CITY" update <id> --set-labels story:refino-review \
-#          --set-metadata story.refino_refiner=<refiner-actor>
+# targets this gate the same way, ADDITIVELY (ga-xvxvf: never --set-labels — it
+# REPLACES the whole label set, dropping guard/qualifier labels like
+# story:blocked):
+#       bd -C "$GC_CITY" label add <id> story:refino-review
+#       bd -C "$GC_CITY" update <id> --set-metadata story.refino_refiner=<refiner-actor>
 # `story.refino_refiner` records WHO to bounce back to. If absent, the dispatcher
 # falls back to the bead's current assignee, then created_by.
 #
@@ -237,6 +239,29 @@ refino_slot_action() {
   if [ "$bead_closed" = "1" ]; then echo "received"; return 0; fi
   if [ "$session_dead" = "1" ] && [ "$budget" -gt 0 ] 2>/dev/null; then echo "respawn"; return 0; fi
   echo "wait"
+}
+
+# ── TESTABLE I/O HELPER (bd_ is dependency-injected — selftest stubs it) ───────
+# Not side-effect-free like the decision core above (it calls bd_), but its
+# CALLER-visible behavior is fully exercised in lib mode by having the selftest
+# define its own bd_ stub before invoking it — same technique, one indirection
+# further out.
+
+# _refino_gate_relabel <story_id> <target_lifecycle_label>
+#   Move OFF the gate's own input label (story:refino-review) ONTO
+#   <target_lifecycle_label> — ADDITIVELY. ga-xvxvf: the old
+#   `bd_ update <id> --set-labels <target>` REPLACED THE ENTIRE LABEL SET,
+#   silently dropping every other label the bead carried — including guard/
+#   qualifier labels (story:blocked, area:infra, pilot:no-auto-dispatch,
+#   needs:engine-window, ...) that exist specifically to PREVENT dispatch.
+#   This is exactly how an Athos-deferred story (ga-sb11i.4 — "NÃO DEVE SER
+#   INICIADA SÓ POR ESTAR APROVADA NO FUNIL") became dispatchable: promotion
+#   silently wiped its story:blocked guard. Add-then-remove instead: every
+#   unrelated label survives, and only the gate's own input label is retired.
+_refino_gate_relabel() {
+  local sid="$1" target="$2"
+  bd_ label add "$sid" "$target" -q 2>/dev/null || true
+  bd_ label remove "$sid" "story:refino-review" -q 2>/dev/null || true
 }
 
 # If sourced by the selftest, stop here — expose the pure functions only.
@@ -668,13 +693,13 @@ bd_ update "$STORY_ID" --set-metadata "story.refino_gate_rounds=$THIS_ROUND" -q 
 case "$DECISION" in
   promote)
     # PASS → Athos's queue. NEVER story:approved (only Athos approves).
-    bd_ update "$STORY_ID" --set-labels story:needs-approval -q 2>/dev/null || true
+    _refino_gate_relabel "$STORY_ID" story:needs-approval
     bd_ comment "$STORY_ID" "Refino-gate: APROVADO na revisão de qualidade (round $THIS_ROUND). Promovido para 'Aguardando Aprovação' (story:needs-approval). O Athos faz a aprovação final." 2>/dev/null || true
     log "  $STORY_ID → story:needs-approval (Athos's queue)."
     ;;
   bounce)
     # FAIL within budget → back to the refiner with concrete notes.
-    bd_ update "$STORY_ID" --set-labels story:refinement-in-progress -q 2>/dev/null || true
+    _refino_gate_relabel "$STORY_ID" story:refinement-in-progress
     if [ -n "$REFINER" ]; then
       bd_ update "$STORY_ID" --assignee "$REFINER" -q 2>/dev/null || true
     fi
@@ -686,7 +711,7 @@ ${FAIL_NOTES:-(sem notas — ver verdict bead $VERDICT_BEAD_ID)}" 2>/dev/null ||
   escalate)
     # FAIL but round budget spent → hand to Athos, do not loop. Promote to the
     # queue so it is VISIBLE to Athos, flagged escalated with the history.
-    bd_ update "$STORY_ID" --set-labels story:needs-approval -q 2>/dev/null || true
+    _refino_gate_relabel "$STORY_ID" story:needs-approval
     bd_ label add "$STORY_ID" "refino-gate:escalated" -q 2>/dev/null || true
     bd_ comment "$STORY_ID" "Refino-gate: ESCALADO ao Athos. Estourou o limite de $REFINO_MAX_ROUNDS rodadas de revisão sem passar. Última reprovação:
 ${FAIL_NOTES:-(sem notas)}

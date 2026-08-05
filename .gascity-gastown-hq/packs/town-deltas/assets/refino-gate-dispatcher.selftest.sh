@@ -19,6 +19,9 @@
 #        → Scenario 3 (escalate at the ceiling) + Scenario 4 (round counter).
 #   AC "pill 'em revisão' enquanto revisa"
 #        → drift-guard 4 (claim adds refino-gate:reviewing, keeps story:refino-review).
+#   AC "promoção/bounce/escalação preservam labels qualificadoras" (ga-xvxvf)
+#        → drift-guards 2b (no --set-labels regression), 2c (input label retired,
+#          no accumulation).
 #   Timeout safety → Scenario 6 (TIMEOUT/unknown → requeue, never promote, no round burn).
 #
 # Exit 0 iff every assertion holds.
@@ -136,17 +139,64 @@ else
   ok "dispatcher never writes story:approved anywhere (AC: nunca aprova no lugar do Athos)"
 fi
 
-# 2. PASS path promotes to story:needs-approval (Athos's queue).
-if grep -q 'set-labels story:needs-approval' "$DISPATCHER"; then
-  ok "promote path sets story:needs-approval (Athos's queue)"
+# 2. PASS path promotes to story:needs-approval (Athos's queue) — ADDITIVELY,
+#    via the _refino_gate_relabel helper (ga-xvxvf: NOT --set-labels, which
+#    replaces the whole label set and drops guard/qualifier labels).
+if grep -q '_refino_gate_relabel "\$STORY_ID" story:needs-approval' "$DISPATCHER"; then
+  ok "promote path additively sets story:needs-approval (Athos's queue)"
 else
-  bad "promote path does not set story:needs-approval"
+  bad "promote path does not additively set story:needs-approval"
 fi
 
-# 3. Bounce path returns the story to refinement-in-progress and reassigns the refiner.
-if grep -q 'set-labels story:refinement-in-progress' "$DISPATCHER" \
+# 2b. ga-xvxvf REGRESSION GUARD: --set-labels must never reappear in live code.
+#     It REPLACES the entire label set, silently dropping guard/qualifier labels
+#     (story:blocked, area:infra, pilot:no-auto-dispatch, needs:engine-window,
+#     ...) — this is exactly how the Athos-deferred story ga-sb11i.4 became
+#     dispatchable. Every lifecycle transition must be additive label add/remove.
+#     (Comment lines that merely document the old/wrong pattern are excluded.)
+if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -q -- '--set-labels'; then
+  bad "REGRESSION (ga-xvxvf): --set-labels present in code — it clobbers guard/qualifier labels; use additive label add/remove"
+else
+  ok "no --set-labels in code (additive label add/remove only — no label clobber, ga-xvxvf)"
+fi
+
+# 2c. CONTROL for 2b: additive-only must not degenerate into label ACCUMULATION.
+#     _refino_gate_relabel must explicitly retire the gate's own input label
+#     (story:refino-review) on every transition, or a promoted/bounced bead
+#     would keep BOTH the old and new lifecycle label forever.
+if grep -q 'bd_ label remove "\$sid" "story:refino-review"' "$DISPATCHER"; then
+  ok "relabel helper explicitly retires the gate's own input label (no accumulation)"
+else
+  bad "relabel helper does not retire story:refino-review — risk of label accumulation"
+fi
+
+# 2d. Fixture proof (ga-xvxvf AC, both named fixtures combined): a bead entering
+#     promotion with guard/qualifier labels (story:blocked, area:infra,
+#     lane:small, pilot:no-auto-dispatch) alongside the gate's input label must
+#     exit with ONLY story:refino-review removed and story:needs-approval added
+#     — every unrelated label untouched. Exercised against the REAL helper
+#     (sourced from the dispatcher, lib mode), with `bd_` stubbed to mutate an
+#     in-memory label set instead of hitting live Dolt.
+LABELS="story:refino-review,story:blocked,area:infra,lane:small,pilot:no-auto-dispatch"
+bd_() {
+  case "$1 $2" in
+    "label add") LABELS="$LABELS,$4" ;;
+    "label remove") LABELS=$(echo ",$LABELS," | sed "s/,$4,/,/" | sed 's/^,//;s/,$//') ;;
+  esac
+}
+STORY_ID="fixture-bead"
+_refino_gate_relabel "$STORY_ID" story:needs-approval
+case ",$LABELS," in *,story:refino-review,*) bad "fixture: story:refino-review survived promotion (should be retired)" ;; *) ok "fixture: story:refino-review retired on promotion" ;; esac
+case ",$LABELS," in *,story:needs-approval,*) ok "fixture: story:needs-approval added on promotion" ;; *) bad "fixture: story:needs-approval missing after promotion" ;; esac
+for guard in story:blocked area:infra lane:small pilot:no-auto-dispatch; do
+  case ",$LABELS," in *,$guard,*) ok "fixture: guard label $guard survives promotion" ;; *) bad "REGRESSION (ga-sb11i.4 class): guard label $guard was dropped by promotion" ;; esac
+done
+
+# 3. Bounce path returns the story to refinement-in-progress (additively) and
+#    reassigns the refiner.
+if grep -q '_refino_gate_relabel "\$STORY_ID" story:refinement-in-progress' "$DISPATCHER" \
    && grep -q -- '--assignee "$REFINER"' "$DISPATCHER"; then
-  ok "bounce path sets story:refinement-in-progress + reassigns the original refiner"
+  ok "bounce path additively sets story:refinement-in-progress + reassigns the original refiner"
 else
   bad "bounce path missing refinement-in-progress transition or refiner reassignment"
 fi
