@@ -3375,6 +3375,59 @@ _beadid_branch_signal() {
   return 0
 }
 
+# _beadid_needs_remerge_branch <bead_id> — ga-e2n96 companion to
+# _beadid_matched_crew_branch_ref above: the gate-fix re-dispatch path (a bead
+# carrying gate:needs-fix/gate:needs-remerge with ZERO reviewer feedback) needs
+# an ACTUAL branch name to resubmit to the gate, not just a repo+existence
+# signal — that function's own ref can be EMPTY on an ls-remote-only match (see
+# its doc comment), which isn't enough to build a gate marker. Scoped ONLY to
+# the bug-tier convention dispatch_one() itself tells builders to use
+# (fix/<bead>-<slug>, see the "Steps" section of DISPATCH_TASK below) — narrower
+# than the crew-branch checker's crew/*/<bead> OR fix/<bead>-* union, since a
+# re-merge candidate is by definition a bug/task bead (GAP-2's own "bugtask"
+# verdict), never a fresh crew assignment. A 4th sibling function rather than a
+# refactor of the existing three, following this file's established pattern
+# (ga-8jxe1's own comment) of several independently-testable functions with
+# overlapping probe logic, rather than risking their existing selftest coverage.
+#
+# Prints "<repo>\t<ref>" on a match (ref is ALWAYS populated — the whole reason
+# for a dedicated helper); exit 0/1. Test seam: PILOT_TEST_REMERGE_BEADS
+# (space-list), PILOT_TEST_REMERGE_REPO, PILOT_TEST_REMERGE_REF — consulted
+# when PILOT_TEST_REMERGE_BEADS is DEFINED, keeps the selftest hermetic (no
+# real git/network). FAIL-OPEN when undecidable: no git / no repos / no match
+# → return 1 (caller falls back to human escalation, never a silent re-dispatch).
+_beadid_needs_remerge_branch() {
+  local _bid="${1:-}" _repo _match
+  [ -n "$_bid" ] || return 1
+  if [ -n "${PILOT_TEST_REMERGE_BEADS+x}" ]; then
+    case " $PILOT_TEST_REMERGE_BEADS " in
+      *" $_bid "*) printf '%s\t%s' "${PILOT_TEST_REMERGE_REPO:-.}" "${PILOT_TEST_REMERGE_REF:-fix/${_bid}-test}"; return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  command -v git >/dev/null 2>&1 || return 1
+  local _repos
+  _repos=$(_ownership_guard_repos)
+  [ -n "$_repos" ] || return 1
+  while IFS= read -r _repo; do
+    [ -n "$_repo" ] && [ -d "$_repo" ] || continue
+    _match=$(git -C "$_repo" for-each-ref --format='%(refname:short)' "refs/heads/fix/${_bid}-*" "refs/remotes/origin/fix/${_bid}-*" 2>/dev/null | head -1)
+    if [ -n "$_match" ]; then
+      printf '%s\t%s' "$_repo" "${_match#origin/}"
+      return 0
+    fi
+    if git -C "$_repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 \
+       || git -C "$_repo" remote 2>/dev/null | grep -q .; then
+      _match=$(timeout 8 git -C "$_repo" ls-remote --heads origin "fix/${_bid}-*" 2>/dev/null | head -1 | awk '{print $2}')
+      if [ -n "$_match" ]; then
+        printf '%s\t%s' "$_repo" "${_match#refs/heads/}"
+        return 0
+      fi
+    fi
+  done <<< "$_repos"
+  return 1
+}
+
 # _ownership_guard_flag_orphan_branch <bead_id> <bead_city> <detail> — ga-8jxe1
 # AC3: give an ownership-guard ORPHAN verdict (_beadid_branch_signal's "orphan"
 # class) a path to resolution instead of a silent forever-veto. <detail> is
@@ -4984,6 +5037,84 @@ FIXSEC
     fi
   fi
 
+  # ── ga-e2n96: gate:needs-fix / gate:needs-remerge with ZERO feedback — do NOT
+  # blind-dispatch a builder with an empty brief. This happens when a reconciler
+  # (ga-pa36 GAP-2) re-arms the label purely to trigger a re-submission to the
+  # gate — no reviewer ever rejected the code, so STORY_GATE_FEEDBACK above is
+  # "". A builder given zero context tends to either reimplement already-working
+  # code from scratch (a second, colliding branch) or spin until TTL-reclaim —
+  # both burn a full session and the real fix still never reaches the gate.
+  #
+  # Detected on TWO signals: the source-level label gate:needs-remerge (the
+  # reconciler's pure re-merge arm sets this ALONGSIDE gate:needs-fix, additive
+  # so every existing gate:needs-fix consumer/filter in this file and elsewhere
+  # keeps working unchanged) and, defensively, the bare gate:needs-fix + 0-char-
+  # feedback shape (covers beads already in this state before this fix shipped,
+  # and any other producer that ends up with nothing to say). Either way: never
+  # sling a builder here. Try to resubmit the bead's OWN existing branch
+  # straight to the gate (correct when a branch exists — no code is broken,
+  # only a resubmission is needed) or escalate to a human when no such branch
+  # can be found. Whichever path runs, gate:needs-fix/needs-remerge is stripped
+  # so the bead never sits ambiguous — it moves into gate:queued or
+  # gate:needs-human, both pre-existing, independently-monitored states.
+  if echo "$STORY_LABELS" | grep -q "gate:needs-remerge" \
+     || { echo "$STORY_LABELS" | grep -q "gate:needs-fix" && [ -z "$STORY_GATE_FEEDBACK" ]; }; then
+    log "  ga-e2n96: $STORY_ID carries gate:needs-fix/needs-remerge with ZERO feedback — will NOT dispatch a builder with an empty brief. Searching for an existing branch to resubmit..."
+
+    local REMERGE_MATCH="" REMERGE_REPO="" REMERGE_REF=""
+    if REMERGE_MATCH=$(_beadid_needs_remerge_branch "$STORY_ID"); then
+      REMERGE_REPO="${REMERGE_MATCH%%$'\t'*}"
+      REMERGE_REF="${REMERGE_MATCH#*$'\t'}"
+    fi
+
+    if [ "$DRY_RUN" = "1" ]; then
+      if [ -n "$REMERGE_REF" ]; then
+        log "  ga-e2n96: DRY_RUN=1 — WOULD: resubmit $STORY_ID branch '$REMERGE_REF' directly to the gate (skip builder dispatch)"
+      else
+        log "  ga-e2n96: DRY_RUN=1 — WOULD: escalate $STORY_ID to gate:needs-human (no existing branch found, zero feedback)"
+      fi
+      return 1
+    fi
+
+    if [ -n "$REMERGE_REF" ]; then
+      log "  ga-e2n96: found existing branch '$REMERGE_REF' for $STORY_ID (repo=$REMERGE_REPO) — resubmitting directly to the gate (no builder needed)."
+      local REMERGE_BASE_SHA REMERGE_MARKER_ID
+      REMERGE_BASE_SHA=$(git -C "$REMERGE_REPO" rev-parse origin/main 2>/dev/null || echo "unknown")
+      REMERGE_MARKER_ID=$(bd -C "$GC_CITY" create \
+        "ready-for-gate: $REMERGE_REF" \
+        -t chore --ephemeral \
+        -l type:quality-gate-marker \
+        -l gate-status:ready \
+        -l "branch:$REMERGE_REF" \
+        -l "source-bead:$STORY_ID" \
+        -l "bead-rig:$STORY_RIG" \
+        -d "branch: $REMERGE_REF
+bead_id: $STORY_ID
+author: pilot-dispatcher(ga-e2n96-auto-remerge)
+base_commit: $REMERGE_BASE_SHA
+rig: $STORY_RIG
+bead_rig: $STORY_RIG
+submitted_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --json 2>/dev/null | jq -r '.id // empty')
+      if [ -n "$REMERGE_MARKER_ID" ]; then
+        bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "gate:needs-fix"     -q 2>/dev/null || true
+        bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "gate:needs-remerge" -q 2>/dev/null || true
+        bd -C "$STORY_BEAD_CITY" label add    "$STORY_ID" "gate:queued"        -q 2>/dev/null || true
+        bd -C "$STORY_BEAD_CITY" comment "$STORY_ID" "ga-e2n96: Pilot auto-resubmitted existing branch '$REMERGE_REF' to the quality gate (marker $REMERGE_MARKER_ID) instead of dispatching a builder with an empty brief — gate:needs-fix/needs-remerge carried zero reviewer feedback, so no code fix was needed, only a resubmission." 2>/dev/null || true
+        log "  ga-e2n96: gate marker $REMERGE_MARKER_ID created for $STORY_ID branch $REMERGE_REF — skipping builder dispatch this sweep."
+      else
+        warn "ga-e2n96: found branch $REMERGE_REF for $STORY_ID but FAILED to create gate marker — leaving labels as-is for next sweep to retry."
+      fi
+    else
+      warn "ga-e2n96: $STORY_ID carries gate:needs-fix/needs-remerge with zero feedback and NO existing fix/$STORY_ID-* branch found — escalating to human instead of blind-dispatching a builder."
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "gate:needs-fix"     -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "gate:needs-remerge" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" label add    "$STORY_ID" "gate:needs-human"   -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" comment "$STORY_ID" "ga-e2n96: Pilot found gate:needs-fix/needs-remerge with zero reviewer feedback and no existing fix/$STORY_ID-* branch to resubmit — escalating to gate:needs-human rather than dispatching a builder with an empty brief." 2>/dev/null || true
+    fi
+    return 1
+  fi
+
   # ── ga-qm7u: prior zero-progress attempt(s) — nudge builder to verify live first ──
   # A bead carrying pilot:reclaim-count:N (N>=1, scripts/inflight-reclaim-guard.py)
   # already burned at least one full dispatch+TTL cycle on a builder that made ZERO
@@ -6253,8 +6384,16 @@ TASK
     _sling_attempt=0
     while [ "$_sling_attempt" -lt "$_sling_max" ]; do
       _sling_attempt=$((_sling_attempt + 1))
-      SLING_OUT=$(gc --city "$GC_CITY" sling "$_SLING_TARGET" \
-        "$SLING_TITLE" \
+      # ga-e2n96 AC3: pass the full dispatch prompt via --stdin (first line =
+      # title, rest = description) instead of a bare title argument, so the
+      # DURABLE sling bead itself carries real content. Before this fix the
+      # created bead's Description was unconditionally "" — the rich prompt
+      # only ever reached the builder via the one-shot ephemeral nudge/submit
+      # below, so a scrolled/missed terminal message left `bd show` on the
+      # bead with nothing to go on.
+      SLING_OUT=$(printf '%s\n%s\n' "$SLING_TITLE" "$DISPATCH_TASK" \
+        | gc --city "$GC_CITY" sling "$_SLING_TARGET" \
+        --stdin \
         --json \
         2>"$_sling_err_file" || echo "{}")
       SLING_BEAD_ID=$(echo "$SLING_OUT" | jq -r '.bead_id // .id // empty' 2>/dev/null || echo "")

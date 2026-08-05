@@ -1373,9 +1373,21 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
                 2>/dev/null || warn "Could not close parent $SC_ID after pass-stranded detection (untracked delivery)"
               ;;
             *)
-              warn "GAP-2: $SC_ID sling $SLING_ID gate-passed+closed but parent's own fix NOT verified in origin/main (ga-6ync4 — sling-passed is a signal, not proof) — NOT closing; re-arming gate:needs-fix"
+              warn "GAP-2: $SC_ID sling $SLING_ID gate-passed+closed but parent's own fix NOT verified in origin/main (ga-6ync4 — sling-passed is a signal, not proof) — NOT closing; re-arming gate:needs-fix + gate:needs-remerge"
+              # ga-e2n96: this arm is a PURE re-merge signal — no reviewer ever
+              # rejected $SC_ID's code, the sling already gate-passed. Reusing
+              # bare gate:needs-fix for this made it indistinguishable from a
+              # real reviewer rejection to the Pilot dispatcher (and every other
+              # consumer of the label), which then dispatched a builder with a
+              # completely empty brief. gate:needs-remerge is the reconciler's
+              # OWN signal for "resubmit, nothing is broken" — set ADDITIVELY
+              # (gate:needs-fix stays too) so every existing gate:needs-fix
+              # consumer/filter keeps working unchanged; the Pilot dispatcher
+              # checks for gate:needs-remerge FIRST and resubmits/escalates
+              # instead of slinging a builder.
               bd -C "$GC_CITY" label add "$SC_ID" "gate:needs-fix" -q 2>/dev/null || true
-              bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed+closed, but no independent evidence the parent's own fix ($SC_ID) is merged into origin/main was found (checked branches fix/$SC_ID*, feature/$SC_ID*, and sling fix/$SLING_ID*, feature/$SLING_ID*). ga-6ync4 fix: never trust sling-passed alone. story:in-flight + pilot:dispatched cleared; gate:needs-fix set so Pilot re-dispatches / this can re-merge. (If this parent's delivery is legitimately untracked, apply the delivery:untracked label — see ga-x2x63.)" 2>/dev/null || true
+              bd -C "$GC_CITY" label add "$SC_ID" "gate:needs-remerge" -q 2>/dev/null || true
+              bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed+closed, but no independent evidence the parent's own fix ($SC_ID) is merged into origin/main was found (checked branches fix/$SC_ID*, feature/$SC_ID*, and sling fix/$SLING_ID*, feature/$SLING_ID*). ga-6ync4 fix: never trust sling-passed alone. story:in-flight + pilot:dispatched cleared; gate:needs-fix + gate:needs-remerge set (ga-e2n96: needs-remerge is the distinct re-submission signal — no reviewer ever rejected this code) so Pilot resubmits the existing branch to the gate or escalates, instead of dispatching a builder with an empty brief. (If this parent's delivery is legitimately untracked, apply the delivery:untracked label — see ga-x2x63.)" 2>/dev/null || true
               ;;
           esac
         fi

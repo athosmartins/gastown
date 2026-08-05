@@ -180,7 +180,19 @@ case "$args" in
         # test isn't about racing the LABEL, it's about racing a MAYOR COMMENT).
         [ "${FAKE_GATE_NEEDS_FIX:-0}" = "1" ] && lbls="${lbls:+$lbls,}\"gate:needs-fix\""
         st="open"
-        case "$id" in *sling*) st="${FAKE_SLING_STATUS:-open}" ;; esac
+        desc=""
+        case "$id" in
+          *sling*)
+            st="${FAKE_SLING_STATUS:-open}"
+            # ga-e2n96 AC3: mirror whatever the gc shim actually received via
+            # --stdin (captured to $STATE/sling_stdin.txt) — everything after
+            # the first line is the description, matching the real gc binary's
+            # --stdin contract (first line=title, rest=description). Lets a
+            # scenario assert the durable sling bead never has an empty
+            # description (the AC3 invariant this bug's fix introduces).
+            [ -f "$STATE/sling_stdin.txt" ] && desc=$(tail -n +2 "$STATE/sling_stdin.txt" 2>/dev/null)
+            ;;
+        esac
         # ga-e5yw2: the dead-worker correction resolves a sling task's assignee.
         # FAKE_SLING_ASSIGNEES is a JSON map {"<slingid>":"<assignee>", …}.
         asg=""
@@ -194,7 +206,8 @@ case "$args" in
           extra=$(printf '%s' "$FAKE_SLING_LABELS" | jq -r --arg id "$id" '.[$id] // ""' 2>/dev/null || echo "")
           [ -n "$extra" ] && lbls="${lbls:+$lbls,}\"$extra\""
         fi
-        printf '{"id":"%s","status":"%s","assignee":"%s","labels":[%s]}' "$id" "$st" "$asg" "$lbls" ;;
+        printf '{"id":"%s","status":"%s","assignee":"%s","labels":[%s],"description":%s}' \
+          "$id" "$st" "$asg" "$lbls" "$(printf '%s' "$desc" | jq -Rs .)" ;;
     esac ;;
   *"-l ctx:ready"*)
     # ctx:ready chore/task/debt candidate query (PILOT_CTX_READY_QUERIES). MUST be
@@ -350,6 +363,13 @@ case "$*" in
     printf 'WARN native_store_unavailable gate=version_compat reason="bd/beads version compatibility could not be confirmed"\n' >&2
     _st="${PILOT_TEST_STATE:-/tmp/pilot-selftest-state}"
     _cnt=$(cat "$_st/sling_n" 2>/dev/null || echo 0); _cnt=$((_cnt + 1)); echo "$_cnt" > "$_st/sling_n"
+    # ga-e2n96 AC3: capture the --stdin payload (title+description) so a scenario
+    # can assert the durable sling bead never has an empty description — the
+    # exact defect this bug reports (gc sling was called with a title argument
+    # only, no --stdin, so the created bead's Description was unconditionally "").
+    case "$*" in
+      *--stdin*) cat > "$_st/sling_stdin.txt" 2>/dev/null || true ;;
+    esac
     if [ "${FAKE_SLING_ALWAYS_FAIL:-0}" = "1" ] || [ "$_cnt" -le "${FAKE_SLING_FAIL_TIMES:-0}" ]; then
       printf '{"schema_version":"1","ok":false,"error":{"code":"native_store_unavailable","message":"sling: Store is required"}}'
       exit 1
@@ -508,10 +528,23 @@ run_real_dispatch_escalate() { # FAKE_ESCALATE_AFTER_SHOWS
 # injected via FAKE_STORY_COMMENTS_JSON (ga-pd7j Mayor-hold grace window).
 # Arg 1: FAKE_STORY_COMMENTS_JSON (unset/empty = no comments, plain happy path).
 # Arg 2: PILOT_MAYOR_HOLD_GRACE_SECS override (default 300 if omitted).
+# ga-e2n96: this scenario tests the ga-pd7j Mayor-hold-grace check in ISOLATION —
+# it must not also trip the newer ga-e2n96 zero-feedback guard, a DIFFERENT check
+# on the same gate:needs-fix label that skips dispatch entirely when the injected
+# GATE-FEEDBACK comment is empty. Seed a baseline GATE-FEEDBACK comment so
+# STORY_GATE_FEEDBACK is always non-empty here (real reprovacao shape, AC2); the
+# caller's JSON (Mayor-hold comments, or "" for the plain-happy-path controls) is
+# merged on top via jq rather than replacing the comment list outright.
 run_real_dispatch_mayorhold() { # FAKE_STORY_COMMENTS_JSON [PILOT_MAYOR_HOLD_GRACE_SECS]
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
+  local _mh_extra="${1:-}"
+  [ -z "$_mh_extra" ] && _mh_extra="[]"
+  local _mh_base='[{"text":"GATE-FEEDBACK (gate_run=test): fixture reviewer feedback so this scenario stays isolated from the ga-e2n96 zero-feedback path.","author":"gate-reviewer","created_at":"2026-01-01T00:00:00Z"}]'
+  local _mh_comments
+  _mh_comments=$(jq -c -n --argjson base "$_mh_base" --argjson extra "$_mh_extra" '$base + $extra' 2>/dev/null) \
+    || _mh_comments="$_mh_base"
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
@@ -524,9 +557,56 @@ run_real_dispatch_mayorhold() { # FAKE_STORY_COMMENTS_JSON [PILOT_MAYOR_HOLD_GRA
     FAKE_BLOCKED_IDS="" \
     FAKE_SUPPRESS_INFLIGHT=0 \
     FAKE_GATE_NEEDS_FIX=1 \
-    FAKE_STORY_COMMENTS_JSON="${1:-}" \
+    FAKE_STORY_COMMENTS_JSON="$_mh_comments" \
     PILOT_MAYOR_HOLD_GRACE_SECS="${2:-300}" \
     FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["gate:needs-fix"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# Runs a DRY dispatch with a single bug candidate carrying ZERO feedback under
+# gate:needs-fix and/or gate:needs-remerge (ga-e2n96) — proves the dispatcher
+# does NOT blind-dispatch a builder with an empty brief, instead resubmitting an
+# existing branch or escalating. FAKE_STORY_COMMENTS_JSON is left at the default
+# [] (no GATE-FEEDBACK comment) so STORY_GATE_FEEDBACK is always "" here.
+#   $1 = extra label(s) on the candidate, comma-joined (e.g. "gate:needs-remerge"
+#        or "gate:needs-fix")
+#   $2 = PILOT_TEST_REMERGE_BEADS (space-list; "tt-remerge" → branch found, "" → not found)
+run_dispatch_remerge() { # $1=label  $2=PILOT_TEST_REMERGE_BEADS
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    FAKE_BLOCKED_IDS="" \
+    PILOT_TEST_REMERGE_BEADS="${2:-}" \
+    FAKE_BUGS_JSON='[{"id":"tt-remerge","title":"Remerge fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["'"$1"'"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# Same as run_dispatch_remerge but with a real GATE-FEEDBACK comment attached —
+# the AC2 control: real feedback must continue dispatching a builder, unaffected
+# by the ga-e2n96 zero-feedback guard.
+run_dispatch_remerge_with_feedback() { # $1=label
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    FAKE_BLOCKED_IDS="" \
+    FAKE_STORY_COMMENTS_JSON='[{"text":"GATE-FEEDBACK (gate_run=test): real reviewer rejection — fix the thing.","author":"gate-reviewer","created_at":"2026-01-01T00:00:00Z"}]' \
+    FAKE_BUGS_JSON='[{"id":"tt-remerge","title":"Remerge fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["'"$1"'"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
@@ -1510,6 +1590,23 @@ else
   ok "no false in-flight failure on the happy path"
 fi
 
+# ga-e2n96 AC3: the durable sling/task bead must NEVER be created with an empty
+# description. Before the fix, `gc sling <target> "$SLING_TITLE" --json` passed
+# only a title — Description was unconditionally "" for every dispatch (bug
+# reproduced live on the sling bead this very fix was dispatched through,
+# ga-7ekr3). The fix pipes title+full dispatch prompt via --stdin instead.
+if [ -f "$STATE/sling_stdin.txt" ]; then
+  SLING_STDIN_LINES=$(wc -l < "$STATE/sling_stdin.txt" | tr -d ' ')
+  SLING_STDIN_DESC=$(tail -n +2 "$STATE/sling_stdin.txt" 2>/dev/null | tr -d '[:space:]')
+  if [ -n "$SLING_STDIN_DESC" ]; then
+    ok "ga-e2n96 AC3: gc sling invoked with --stdin and a non-empty description ($SLING_STDIN_LINES lines total)"
+  else
+    bad "ga-e2n96 AC3 REGRESSION: gc sling --stdin payload has a title but an EMPTY description"
+  fi
+else
+  bad "ga-e2n96 AC3 REGRESSION: gc sling was not invoked with --stdin at all — sling bead description is unconditionally empty (the original defect)"
+fi
+
 # 5b: failure injection — in-flight write swallowed → must NOT release the claim.
 LOG5B="$(run_real_dispatch 1)"
 if echo "$LOG5B" | grep -q "DURABLE-INFLIGHT FAILED on tt-flight"; then
@@ -1621,6 +1718,67 @@ if [ -f "$STATE/tt-flight.inflight" ]; then
   ok "story:in-flight still set normally when no IN-WINDOW Mayor comment is present"
 else
   bad "REGRESSION: old-Mayor/fresh-non-Mayor comments incorrectly blocked dispatch"
+fi
+
+# ── Scenario ga-e2n96: gate:needs-fix / gate:needs-remerge with ZERO feedback ──
+# Bug: Pilot dispatched a builder with an EMPTY brief whenever gate:needs-fix
+# carried no GATE-FEEDBACK comment — the shape left behind when a reconciler
+# (ga-pa36 GAP-2) re-arms the label purely to trigger a re-submission, not
+# because a reviewer rejected anything. The builder then either reimplements
+# already-working code (a colliding second branch) or spins until TTL-reclaim.
+# Fix: on zero feedback, never sling a builder — resubmit the bead's own
+# existing branch straight to the gate, or escalate to gate:needs-human when no
+# such branch exists. Either way the reason is logged, naming the bead (AC1).
+echo "Scenario ga-e2n96(a): gate:needs-remerge + existing branch → resubmit to gate, no builder dispatched"
+LOGE2N96A="$(run_dispatch_remerge "gate:needs-remerge" "tt-remerge")"
+if echo "$LOGE2N96A" | grep -q "ga-e2n96:.*WOULD: resubmit.*tt-remerge"; then
+  ok "ga-e2n96(a): resubmit-to-gate path chosen and logged, naming the bead"
+else
+  bad "ga-e2n96(a) REGRESSION: no resubmit-to-gate log line for tt-remerge with a matched branch"
+fi
+if echo "$LOGE2N96A" | grep -q "Dispatch complete:"; then
+  bad "ga-e2n96(a) REGRESSION: a builder was dispatched despite zero feedback (empty-brief bug reproduced)"
+else
+  ok "ga-e2n96(a): no builder was dispatched — empty-brief dispatch correctly skipped"
+fi
+
+echo "Scenario ga-e2n96(b): gate:needs-remerge + NO existing branch → escalate to gate:needs-human, no builder dispatched"
+LOGE2N96B="$(run_dispatch_remerge "gate:needs-remerge" "")"
+if echo "$LOGE2N96B" | grep -q "ga-e2n96:.*WOULD: escalate.*tt-remerge"; then
+  ok "ga-e2n96(b): escalate-to-human path chosen and logged, naming the bead"
+else
+  bad "ga-e2n96(b) REGRESSION: no escalate log line for tt-remerge with no matched branch"
+fi
+if echo "$LOGE2N96B" | grep -q "Dispatch complete:"; then
+  bad "ga-e2n96(b) REGRESSION: a builder was dispatched despite zero feedback and no branch"
+else
+  ok "ga-e2n96(b): no builder was dispatched — empty-brief dispatch correctly skipped"
+fi
+
+echo "Scenario ga-e2n96(c): legacy bare gate:needs-fix (pre-fix label shape) + zero feedback + branch found → same resubmit safety net"
+LOGE2N96C="$(run_dispatch_remerge "gate:needs-fix" "tt-remerge")"
+if echo "$LOGE2N96C" | grep -q "ga-e2n96:.*WOULD: resubmit.*tt-remerge"; then
+  ok "ga-e2n96(c): bare gate:needs-fix with zero feedback ALSO takes the safety net (covers pre-fix / already-in-flight beads)"
+else
+  bad "ga-e2n96(c) REGRESSION: bare gate:needs-fix + zero feedback fell through to blind builder dispatch"
+fi
+if echo "$LOGE2N96C" | grep -q "Dispatch complete:"; then
+  bad "ga-e2n96(c) REGRESSION: a builder was dispatched for bare gate:needs-fix with zero feedback"
+else
+  ok "ga-e2n96(c): no builder was dispatched for the legacy bare-label shape"
+fi
+
+echo "Scenario ga-e2n96(d) CONTROL: gate:needs-fix + REAL feedback (>0 chars) still dispatches a builder normally (AC2, must not regress)"
+LOGE2N96D="$(run_dispatch_remerge_with_feedback "gate:needs-fix")"
+if echo "$LOGE2N96D" | grep -q "ga-e2n96:.*WOULD:"; then
+  bad "ga-e2n96(d) REGRESSION: the zero-feedback guard fired despite REAL feedback being present — would break the whole gate-fix loop (AC2)"
+else
+  ok "ga-e2n96(d): zero-feedback guard stayed silent — real feedback takes the ordinary path"
+fi
+if echo "$LOGE2N96D" | grep -q "injecting reviewer feedback (6[0-9] chars)\|injecting reviewer feedback ([1-9][0-9]* chars)"; then
+  ok "ga-e2n96(d): real feedback still gets injected into the builder brief, as before"
+else
+  bad "ga-e2n96(d) REGRESSION: real feedback was not injected (chars count wrong or missing)"
 fi
 
 # ── Scenario 6: source bead never carries dog routing (ga-ms1jm) ──────────────

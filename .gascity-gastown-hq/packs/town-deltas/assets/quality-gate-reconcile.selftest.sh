@@ -278,6 +278,13 @@ grep -q 'gate:needs-fix'            "$GUARD" && ok "guard checks gate:needs-fix 
 grep -q 'free:fail-stranded'        "$GUARD" && ok "guard handles free:fail-stranded action"    || bad "guard missing free:fail-stranded handler"
 grep -q 'free:pass-stranded'        "$GUARD" && ok "guard handles free:pass-stranded action"    || bad "guard missing free:pass-stranded handler"
 grep -q 'merge-base --is-ancestor'  "$GUARD" && ok "guard uses merge-base for branch check (GAP-1)" || bad "guard missing merge-base check"
+# ga-e2n96: the free:pass-stranded unverified-merge default arm is a PURE
+# re-merge signal (sling already gate-passed+closed; no reviewer ever rejected
+# anything) — distinct from a real gate failure. It must set its OWN label
+# (gate:needs-remerge) additively alongside the legacy gate:needs-fix, so the
+# Pilot dispatcher (and any future consumer) can tell "re-submit, no code is
+# broken" apart from "a reviewer rejected this, dispatch a fixer".
+grep -q 'gate:needs-remerge'        "$GUARD" && ok "guard sets gate:needs-remerge on the pure re-merge arm (ga-e2n96)" || bad "guard missing gate:needs-remerge — re-merge signal still collides with real gate:needs-fix failures"
 # Fix: reconcile_marker_action must remove BOTH transient labels before target state (ga-pa36 gate-feedback)
 [ "$(grep -c 'label remove.*gate-status:dispatching' "$GUARD")" -ge 2 ] \
   && ok "requeue:ready removes gate-status:dispatching (both transient labels cleared)" \
