@@ -1124,6 +1124,7 @@ _og() { (
     _beadid_has_crew_branch() { return 1; }   # no crew branch → signal (a) does not fire
     _beadid_branch_signal()   { return 1; }   # ga-8jxe1: signal (a)'s real entry point now — see below
     _session_is_live()        { return 1; }   # never a live session → isolate (c) from (b)
+    _session_is_active_owner() { return 1; }   # ga-46wq5: signal (b) now calls this, not _session_is_live — keep the isolation matched
     _beadid_mentioned_in_attached_session() { return 1; }   # isolate from (e) — has its own dedicated scenario below
     _ownership_guard_should_refuse "$1" "$2" "ignored-db"
 ); }
@@ -1254,6 +1255,7 @@ _og_e() { (
     _beadid_has_crew_branch()          { return 1; }   # isolate (a)
     _beadid_has_active_gate_artifact() { return 1; }   # isolate (d)
     _session_is_live()                 { return 1; }   # isolate (b)/(c)
+    _session_is_active_owner()         { return 1; }   # ga-46wq5: signal (b) now calls this, not _session_is_live
     _ownership_guard_should_refuse "$1" "$2" "ignored-db"
 ); }
 
@@ -4422,6 +4424,7 @@ OG_D3EG2_3="$(
   _beadid_mentioned_in_attached_session() { return 1; }   # isolate (e)
   _beadid_has_active_gate_artifact()      { return 1; }   # isolate (d)
   _session_is_live() { [ "$1" = "peter-wa-live123" ]; }
+  _session_is_active_owner() { [ "$1" = "peter-wa-live123" ]; }   # ga-46wq5: signal (b) now calls this
   _ownership_guard_should_refuse "ga-d3eg2-live" '{"labels":["gate:fix-attempt:1"],"assignee":""}' "ignored-db"
 )"
 case "$OG_D3EG2_3" in
@@ -4441,6 +4444,7 @@ OG_D3EG2_4="$(
   _beadid_mentioned_in_attached_session() { return 1; }
   _beadid_has_active_gate_artifact()      { return 0; }   # ACTIVE marker/run — under test
   _session_is_live()                      { return 1; }
+  _session_is_active_owner()              { return 1; }   # ga-46wq5: signal (b) now calls this (unreachable here — assignee is empty, (b) early-returns first — kept for symmetry)
   _ownership_guard_should_refuse "ga-d3eg2-gating" '{"labels":["gate:fix-attempt:1"],"assignee":""}' "ignored-db"
 )"
 [ "$OG_D3EG2_4" = "gating:active" ] \

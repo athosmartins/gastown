@@ -1494,6 +1494,19 @@ _FILTER_PREAPPROVAL_LABELS='["story:unrefined","story:refinement-in-progress","s
 # from a bash filter).
 _FILTER_RECLAIM_CAP=3
 
+# ga-46wq5: active-owner roster globals, EARLY safe-default. _filter_candidates
+# is called from _pilot_emit_dispatchable (~line 2515, the painel-preview path)
+# BEFORE the real session roster is fetched (~line 2708) — the same
+# before-its-dependency-is-defined shape that already crash-looped this file
+# once under `set -u` (see "ga-wisp-1gdiik" a few hundred lines down). Default
+# to "no known active owners, not yet safe to loosen the veto" so the early
+# call site is a no-op (identical to pre-fix behavior) instead of an unbound
+# variable; the real block near _LIVE_SESSION_IDS overwrites both before any
+# call site that matters for actual dispatch decisions runs.
+_ACTIVE_OWNER_IDS_JSON='[]'
+_ROSTER_OK_FOR_FILTER=0
+PILOT_ASSIGNEE_IDLE_MINUTES="${PILOT_ASSIGNEE_IDLE_MINUTES:-180}"
+
 # ── ga-2n7xw: refusal-successor invariant — shared hold/escalate counter ──────
 # Every Pilot refusal must ROUTE, ESCALATE, or TERMINATE — never silently
 # "defer and retry the same" forever (the pattern behind 3 real incidents:
@@ -1627,11 +1640,33 @@ _filter_candidates() {
   local _now_ts; _now_ts=$(date +%s)
   local _cf_in; _cf_in=$(cat)
   local _cf_out _cf_kept
+  # ga-46wq5: local, self-defending defaults for the active-owner globals —
+  # NOT just the early top-of-file default (that one only protects the real
+  # dispatcher's first in-process call site; a test or any other caller that
+  # extracts/evals this function body in isolation, without ever sourcing the
+  # lines that set the globals, would otherwise pass literal empty strings to
+  # --argjson, which is invalid JSON and makes the WHOLE jq call error out —
+  # collapsing _cf_out to "[]" for every bead, not just assignee-holding ones.
+  # Mirrors this function's own existing "$([ -z "$_cf_out" ] && ...)" fallback
+  # philosophy: never let a missing dependency silently zero out the output.
+  local _cf_roster_ok="${_ROSTER_OK_FOR_FILTER:-0}"
+  local _cf_active_owner_ids_json="${_ACTIVE_OWNER_IDS_JSON:-[]}"
   _cf_out=$(printf '%s' "$_cf_in" | jq --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
      --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" \
+     --argjson roster_ok "$_cf_roster_ok" --argjson active_owner_ids "$_cf_active_owner_ids_json" \
     '[.[] | select(
         .id != $self
-        and (.assignee == null or .assignee == "")
+        # ga-46wq5: an assignee alone is no longer an unconditional veto. It
+        # still is when the roster is untrustworthy ($roster_ok != 1 — jq
+        # treats bare 0 as truthy, so this MUST be an explicit comparison, not
+        # `$roster_ok and ...`) or the assignee IS a confirmed active owner
+        # (live, not asleep, not idle beyond PILOT_ASSIGNEE_IDLE_MINUTES — see
+        # _session_is_active_owner). Otherwise (closed / asleep / idle-beyond-
+        # threshold) the bead is a candidate again, same as if unassigned —
+        # this is the ga-46wq5 fix: a Mayor-assigned bead whose owner went
+        # quiet no longer drains the dispatch queue in silence.
+        and (.assignee == null or .assignee == ""
+             or (($roster_ok == 1) and (.assignee as $a | ($active_owner_ids | index($a)) == null)))
         and ((.issue_type // .type // "") != "epic")
         and (((.labels // []) | index("story:epic-split")) | not)
         # ga-iu9m/ga-enfe: a bead belonging to a graph.v2 formula/workflow is a
@@ -1856,18 +1891,39 @@ _filter_candidates() {
     2>/dev/null)
   [ -z "$_cf_out" ] && _cf_out="[]"
 
+  _cf_kept=$(printf '%s' "$_cf_out" | jq -c '[.[].id]' 2>/dev/null); [ -z "$_cf_kept" ] && _cf_kept="[]"
+
+  # ga-46wq5 FIX PEDIDO #2: alarm for beads admitted specifically because their
+  # assignee is NOT a confirmed active owner (closed / asleep / idle beyond
+  # PILOT_ASSIGNEE_IDLE_MINUTES). Pre-fix, .assignee!="" was excluded
+  # unconditionally, so no such entry could ever appear in $_cf_out — its mere
+  # presence here IS the alarm signal (no separate scan/query needed), and it
+  # fires every sweep the condition persists, not only after the queue empties.
+  printf '%s' "$_cf_out" | jq -r '.[] | select((.assignee // "") != "") | "\(.id)\t\(.assignee)"' 2>/dev/null \
+    | while IFS=$'\t' read -r _aid _aowner; do
+        [ -z "$_aid" ] && continue
+        warn "[pilot] ALERTA ga-46wq5: $_aid tem assignee '$_aowner' que NÃO é dono ativo (closed/asleep/idle>${PILOT_ASSIGNEE_IDLE_MINUTES}min) — readmitido à fila de dispatch." >&2
+      done
+
   # ── ga-yolmi PASSO 1: per-bead exclusion trace (see _log_exclusions). This pass
   # NEVER influences $_cf_out — it independently mirrors each clause above, read-only,
   # restricted (via $kept) to ids already known to be dropped. A bug in this mirror
   # can only under-report a reason, never change what actually gets dispatched.
-  _cf_kept=$(printf '%s' "$_cf_out" | jq -c '[.[].id]' 2>/dev/null); [ -z "$_cf_kept" ] && _cf_kept="[]"
   printf '%s' "$_cf_in" | jq -r --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
-      --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" --argjson kept "$_cf_kept" '
+      --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" --argjson kept "$_cf_kept" \
+      --argjson roster_ok "$_cf_roster_ok" --argjson active_owner_ids "$_cf_active_owner_ids_json" '
       .[] | . as $b | ($b.id // "") as $id | ($b.labels // []) as $L
       | select($id != "" and (($kept | index($id)) | not))
       | [
           (if $id == $self then "self-bead" else empty end),
-          (if (($b.assignee // "") != "") then "assignee:\($b.assignee)" else empty end),
+          # ga-46wq5: explicit liveness detail (FIX PEDIDO #3) instead of the
+          # bare name — a human/detector reading this log no longer has to
+          # infer whether the exclusion means "owner is working" or "roster
+          # was untrustworthy this sweep, failed safe".
+          (if (($b.assignee // "") != "") then
+             (if ($roster_ok == 1) then "assignee:\($b.assignee):active-owner"
+              else "assignee:\($b.assignee):roster-untrustworthy-failsafe" end)
+           else empty end),
           (if ((($b.issue_type // $b.type // "")) == "epic") then "issue_type:epic" else empty end),
           (if ($L | index("story:epic-split")) then "label:story:epic-split" else empty end),
           (if (($b.metadata["gc.root_bead_id"] // "") | test("\\S")) then "graph.v2-step:gc.root_bead_id" else empty end),
@@ -2781,6 +2837,65 @@ _session_is_live_builder() {
   return 0
 }
 
+# ── Active-owner roster (ga-46wq5: idle/asleep-but-not-closed owner ≠ active
+# owner). last_active is RFC3339 with a NUMERIC offset (e.g. "-03:00"), not a
+# literal "Z" — confirmed live that jq's fromdateiso8601 in this environment
+# REJECTS that format outright (only accepts "...Z"), so this file's existing
+# created_at truncate-and-append-Z trick (used elsewhere for bd-native
+# timestamps, which ARE always "Z"-suffixed) cannot be reused here: applied to
+# an offset string it would silently misinterpret local time as UTC. Compute
+# idle-minutes in python3 instead — the same approach
+# scripts/adhoc-session-reaper.sh already uses for this exact field — once per
+# sweep over the WHOLE roster (not per-assignee), mirroring how _SESSIONS_JSON
+# itself is fetched once above.
+_SESSIONS_IDLE_JSON=$(printf '%s' "$_SESSIONS_JSON" | python3 -c '
+import sys, json, datetime
+data = json.load(sys.stdin)
+now = datetime.datetime.now(datetime.timezone.utc)
+for s in data.get("sessions") or []:
+    la = s.get("last_active") or ""
+    idle = None
+    if la and not la.startswith("0001-01-01"):
+        try:
+            t = la[:-1] + "+00:00" if la.endswith("Z") else la
+            idle = int((now - datetime.datetime.fromisoformat(t)).total_seconds() // 60)
+        except Exception:
+            idle = None
+    s["idle_minutes"] = idle
+json.dump(data, sys.stdout)
+' 2>/dev/null)
+[ -n "$_SESSIONS_IDLE_JSON" ] || _SESSIONS_IDLE_JSON="$_SESSIONS_JSON"
+
+# "Active owner" = live AND NOT asleep AND NOT idle beyond threshold. Folding
+# in state=="asleep" directly (not just idle-minutes) matters: an asleep
+# session's last_active IS the Go zero-time sentinel by design (confirmed live
+# — every currently-asleep session in this roster, adhoc AND named/core alike,
+# reports last_active="0001-01-01T00:00:00Z"; this is routine per this file's
+# own REUSE-not-respawn doctrine a few hundred lines up, not an edge case), so
+# an idle-minutes-only check would silently NEVER flag a merely-asleep owner —
+# failing the bug's own first fixture ("sessão está asleep... É despachado").
+PILOT_ASSIGNEE_IDLE_MINUTES="${PILOT_ASSIGNEE_IDLE_MINUTES:-180}"
+_ACTIVE_OWNER_IDS=$(echo "$_SESSIONS_IDLE_JSON" \
+  | jq -r --argjson thresh "$PILOT_ASSIGNEE_IDLE_MINUTES" \
+    '[.sessions[]? | select(.closed != true) | select(.state != "asleep")
+             | select((.idle_minutes == null) or (.idle_minutes < $thresh))
+             | (.session_name, .name, .alias, .id, .agent_name)]
+            | map(select(. != null and . != "")) | unique | .[]' 2>/dev/null || echo "")
+_ACTIVE_OWNER_IDS_JSON=$(printf '%s' "$_ACTIVE_OWNER_IDS" \
+  | jq -R -s 'split("\n") | map(select(length>0))' 2>/dev/null || echo "[]")
+_ROSTER_OK_FOR_FILTER=$_DEADWORKER_OK
+
+# _session_is_active_owner <identifier> — exit 0 iff <identifier> is a
+# confirmed active owner: not closed, not asleep, and (idle-time unknown OR
+# under PILOT_ASSIGNEE_IDLE_MINUTES). Unknown idle-time deliberately resolves
+# to "still active" (fail toward NO behavior change vs pre-fix) — most
+# unknowns are fresh -adhoc- pool workers that never populated last_active at
+# all, and mass-reclaiming THEIR beads was never what ga-46wq5 asked for.
+_session_is_active_owner() {
+  [ -n "${1:-}" ] || return 1
+  printf '%s\n' "$_ACTIVE_OWNER_IDS" | grep -Fxq -- "$1"
+}
+
 # ── Stale-sling liveness (dead-builder HOL-block fix) ─────────────────────────
 # An OPEN sling/wrapper whose worker DIED leaks open forever, and both the TTL-release
 # and the dedup guard trusted open-ness as "builder active" → the bead is HOL-blocked
@@ -3664,11 +3779,20 @@ _ownership_guard_should_refuse() {
   # Roster must be trustworthy to judge liveness; otherwise fail-open (allow), so
   # a racy `session list` read can never deadlock a legitimately-orphaned bead.
   [ "${_DEADWORKER_OK:-0}" = "1" ] || return 1
-  if _session_is_live "$_asg"; then
+  # ga-46wq5: was bare _session_is_live (not-closed only) — a crew that went
+  # asleep or has sat idle for hours still read as "live", so a bead a human
+  # hand-assigned to a quiet crew could never be reclaimed by THIS guard either
+  # (moot pre-fix, since _filter_candidates never let it reach here at all —
+  # see that function's comment for the incident). _session_is_active_owner
+  # adds the same not-asleep / not-idle-beyond-PILOT_ASSIGNEE_IDLE_MINUTES
+  # check _filter_candidates now applies upstream — the two chokepoints must
+  # agree, or a bead _filter_candidates re-admits just gets refused again
+  # here, a silent no-op that looks fixed but isn't.
+  if _session_is_active_owner "$_asg"; then
     printf 'owner:%s' "$_asg"
     return 0
   fi
-  # Owner set but session DEAD and (a) already proved no branch → genuine orphan:
+  # Owner set but session DEAD/asleep/idle-past-threshold and (a) already proved no branch → genuine orphan:
   # do NOT block — let the upstream reclaim paths (ga-e5yw2 / ga-v3z4z) recover it.
   return 1
 }
