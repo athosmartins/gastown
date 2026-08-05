@@ -554,7 +554,7 @@ fi
 
 # ── Scenario 9: DELIVERED-DUP CHECK (wa-ca4jm) ───────────────────────────────
 # A REFINED story whose twin is closed/done must NOT be promoted (handoff
-# bookkeeping skipped); it must get refino:info-gap + auto-refino:escalado
+# bookkeeping skipped); it must get refino:info-gap + auto-refino:escalated
 # instead.  We mock bd_ using a stub that:
 #   • returns a JSON pairs array containing STORY_ID paired with a twin
 #   • returns a closed bead JSON for the twin on `bd show`
@@ -826,10 +826,23 @@ else
   bad "dup-check does not call find-duplicates --method mechanical"
 fi
 
-if grep -q 'refino:info-gap' "$DISPATCHER" && grep -q 'auto-refino:escalado' "$DISPATCHER"; then
-  ok "dup-block sets refino:info-gap + auto-refino:escalado labels"
+# Scoped to the dup-block branch itself (not a blanket file grep) — the English
+# auto-refino:escalated string already appears elsewhere in the file (PATH B,
+# escalate-info-gap), so an unscoped grep would pass even if dup-block itself
+# were never fixed. ga-64u1b: dup-block previously set the Portuguese
+# auto-refino:escalado (missing final 'd'), which the classifier's
+# auto-refino:escalated check (line ~429, English-only) never recognized —
+# defeating DUP-BLOCKED's own re-ingestion-loop protection.
+_dupblock=$(awk '/if \[ -n "\$_dup_twin" \]/{f=1} f{print} /No delivered twin/{exit}' "$DISPATCHER")
+if printf '%s' "$_dupblock" | grep -q 'refino:info-gap' && printf '%s' "$_dupblock" | grep -q 'auto-refino:escalated'; then
+  ok "dup-block sets refino:info-gap + auto-refino:escalated labels (ga-64u1b: fixed from the 'escalado' typo)"
 else
-  bad "dup-block does not set the expected revert labels"
+  bad "dup-block does not set the expected revert labels (refino:info-gap + auto-refino:escalated)"
+fi
+if printf '%s' "$_dupblock" | grep -q 'auto-refino:escalado\b'; then
+  bad "ga-64u1b: dup-block still carries the auto-refino:escalado (Portuguese) typo — defeats the escalated-marker classifier check, re-ingestion loop reproduces"
+else
+  ok "ga-64u1b: dup-block does not carry the auto-refino:escalado typo"
 fi
 
 # The normal handoff bookkeeping (attempt metadata + assignee clear) must be
@@ -1020,6 +1033,39 @@ if grep -qF 'if [ "$AUTO_REFINO_INGEST_RAW_TRIAGEM" = "1" ]; then' "$DISPATCHER"
 else
   bad "(d) AUTO_REFINO_INGEST_RAW_TRIAGEM flag gate missing — flag-off behaviour changed"
 fi
+
+# ── Drift-guard ga-64u1b: PATH A (INFO-GAP) heredoc must add auto-refino:escalated ──
+# Bug ga-64u1b (2nd confirmed occurrence, ps-d6xv): PATH A (the spawned refiner's
+# INFO-GAP escalation instructions, REFINE_TASK heredoc) stripped every story:*
+# lifecycle label and added only refino:info-gap — a label
+# auto_refino_is_ingestable_raw() never checks. Unlike PATH B (which explicitly
+# re-adds auto-refino:escalated, mirrored a few lines below in this same
+# heredoc), PATH A had no equivalent line, so the very next RAW sweep read the
+# now label-free story as fresh and re-ingested it, looping the same
+# already-answered INFO-GAP verdict forever. The actual bd command is executed
+# by the spawned LLM refiner reading this heredoc as a prompt, not by testable
+# shell logic — same idiom as the ga-fnnyy guards above: the guarantee here is
+# "the instruction ships in the prompt", not "the behavior is unit-testable".
+_patha_block=$(awk '/^\[PATH A/{f=1} /^\[PATH B/{f=0} f{print}' "$DISPATCHER")
+if printf '%s' "$_patha_block" | grep -q 'label add "\$STORY_ID" "auto-refino:escalated"'; then
+  ok "ga-64u1b: PATH A (INFO-GAP) heredoc adds auto-refino:escalated (re-ingestion loop killed)"
+else
+  bad "ga-64u1b: PATH A (INFO-GAP) heredoc does NOT add auto-refino:escalated — re-ingestion loop reproduces"
+fi
+
+# Functional companion: once a story carries PATH A's fixed post-escalate label
+# set (refino:info-gap + auto-refino:escalated, story:* stripped), it must NOT
+# be re-ingestible by the RAW source — mirrors Scenario 11(b)'s PATH B proof.
+[ "$(auto_refino_is_ingestable_raw "ga-64u1b-fixed" "feature" "refino:info-gap,auto-refino:escalated" "false" "$EX")" = "no" ] \
+  && ok "ga-64u1b: PATH A post-INFO-GAP label set (refino:info-gap+escalated) → NOT ingested (loop killed)" \
+  || bad "ga-64u1b: PATH A post-INFO-GAP label set → expected NOT ingestable (re-ingestion loop reproduces)"
+
+# Regression proof: refino:info-gap ALONE (the pre-fix label shape — no escalated
+# marker) WAS ingestible — this is exactly why the loop reproduced twice live,
+# and guards against a future refactor mistaking that shape for already safe.
+[ "$(auto_refino_is_ingestable_raw "ga-64u1b-prefix" "feature" "refino:info-gap" "false" "$EX")" = "yes" ] \
+  && ok "ga-64u1b: refino:info-gap ALONE (no escalated marker) is still ingestible — confirms why the marker is required" \
+  || bad "ga-64u1b: refino:info-gap alone → expected ingestable (re-check the loop-kill mechanism if this changed)"
 
 # ── Scenario 12: MULTI-STORE funnel (rig-store ingestion fix) ──────────────────
 # The daemon must query AND write back to all THREE bead stores (HQ + WA + PS),

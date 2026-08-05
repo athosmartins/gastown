@@ -156,7 +156,7 @@ AUTO_REFINO_RAW_MIN_AGE_MINUTES="${AUTO_REFINO_RAW_MIN_AGE_MINUTES:-5}"
 # DELIVERED twin already exists in the same store. A twin is "delivered" when
 # its status=closed OR it carries gate:passed OR story:done.  If one is found,
 # the handoff is blocked: the story is reverted to refino:info-gap +
-# auto-refino:escalado and Athos is paged — preventing the gate from re-approving
+# auto-refino:escalated and Athos is paged — preventing the gate from re-approving
 # already-built work (wa-v3tz, wa-nvn9, wa-cqh5 slipped through this week).
 #
 # FAIL-OPEN: any error in the dup-check (bad JSON, bd failure) is swallowed and
@@ -1330,6 +1330,7 @@ trivial, or mis-pasted). Do NOT page Athos — this is a technical context gap.
 bd -C "$AR_BEAD_STORE" update "$STORY_ID" \\
   --set-metadata "story.auto_refino_gaps=<what context is missing — one item per line>"
 bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "refino:info-gap"
+bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "auto-refino:escalated"
 bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "auto-refino:refining"
 bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:refinement-in-progress"
 bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:triage"
@@ -1535,14 +1536,14 @@ case "$DECISION" in
       bd_ label remove "$STORY_ID" "story:refino-review" -q 2>/dev/null || true
       bd_ label remove "$STORY_ID" "auto-refino:refining" -q 2>/dev/null || true
       bd_ label add "$STORY_ID" "refino:info-gap" -q 2>/dev/null || true
-      bd_ label add "$STORY_ID" "auto-refino:escalado" -q 2>/dev/null || true
+      bd_ label add "$STORY_ID" "auto-refino:escalated" -q 2>/dev/null || true
       bd_ update "$STORY_ID" --set-metadata "story.auto_refino_attempts=$THIS_ATTEMPT" -q 2>/dev/null || true
       bd_ update "$STORY_ID" --assignee "" -q 2>/dev/null || true
-      bd_ comment "$STORY_ID" "Auto-refino: história BLOQUEADA — twin entregue detectado: $_dup_twin. Se for distinta, remova refino:info-gap + auto-refino:escalado e re-submeta." 2>/dev/null || true
+      bd_ comment "$STORY_ID" "Auto-refino: história BLOQUEADA — twin entregue detectado: $_dup_twin. Se for distinta, remova refino:info-gap + auto-refino:escalated e re-submeta." 2>/dev/null || true
       bd_ dolt commit -m "auto-refino: dup-block $STORY_ID (twin=$_dup_twin)" 2>/dev/null || true
       notify -t "Auto-refino: dup bloqueado $STORY_ID" -p 3 "Não promovi $STORY_ID ao gate — twin entregue: $_dup_twin. Verifique se são histórias distintas." 2>/dev/null || true
       gc --city "$GC_CITY" mail send mayor -s "Auto-refino: dup-block em $STORY_ID" \
-        -m "$STORY_ID (refinada, pronta pro gate) bloqueada: twin entregue encontrado ($_dup_twin). Labels: refino:info-gap + auto-refino:escalado. Se forem histórias distintas, remova esses labels e o gate retomará." 2>/dev/null || true
+        -m "$STORY_ID (refinada, pronta pro gate) bloqueada: twin entregue encontrado ($_dup_twin). Labels: refino:info-gap + auto-refino:escalated. Se forem histórias distintas, remova esses labels e o gate retomará." 2>/dev/null || true
     else
       # No delivered twin — complete the normal handoff.
       bd_ update "$STORY_ID" --set-metadata "story.auto_refino_attempts=$THIS_ATTEMPT" -q 2>/dev/null || true
