@@ -148,6 +148,7 @@ GRW_REAP_FROZEN_ENABLED = os.environ.get("GRW_REAP_FROZEN_ENABLED", "1") != "0"
 FROZEN_KILL_SECS = int(os.environ.get("GRW_FROZEN_KILL_SECS", "900"))            # 15min of last_active silence on a STILL-active reviewer = definitively wedged (past the dispatcher's own detect+respawn cycle); SUSTAINED-confirmed on a resample before any kill
 FROZEN_KILL_MAX_PER_SWEEP = int(os.environ.get("GRW_FROZEN_KILL_MAX_PER_SWEEP", "2"))  # blast-radius cap: if MANY reviewers are silent at once (systemic Dolt/quota outage) killing them only churns — cap it and let the infra detectors + Mayor escalation handle a mass outage
 GRW_FROZEN_REQUEUE_ENABLED = os.environ.get("GRW_FROZEN_REQUEUE_ENABLED", "1") != "0"  # ga-pp5vh: after FIX 3 kills a confirmed-frozen reviewer, ALSO supersede+requeue its now-orphaned run if that reviewer was the run's sole pending one — closing the ~15min(kill)->~29min(dispatcher Phase C timeout) gap that zeroed gate throughput 2026-07-22. Independent toggle from GRW_REAP_FROZEN_ENABLED so the requeue extension can be killed without disabling the frozen-reviewer kill itself.
+GRW_FROZEN_PERMISSION_CHECK_ENABLED = os.environ.get("GRW_FROZEN_PERMISSION_CHECK_ENABLED", "1") != "0"  # ga-42nfj: before a SUSTAINED-confirmed frozen reviewer is killed, check whether its pane shows an OPEN PERMISSION-PROMPT DIALOG (same class of bug as ga-lxk26, different mechanism — reap_hung_runs (FIX 1)/agent-stuck-escalation.sh never see this path at all) and skip the kill + escalate instead of destroying a session that is one human keypress from resolving. Independent toggle from GRW_REAP_FROZEN_ENABLED, same precedent as GRW_FROZEN_REQUEUE_ENABLED, so the permission check can be killed without disabling the frozen-reviewer reap itself.
 # FIX 4 — reap a QUEUED marker whose SOURCE is done, and clear a STALE gate:reviewing
 # label that STARVES a queued marker. Root (2026-07-02, a 9h head-of-line stall): a
 # reviewer that DRAINS during startup leaves `gate:reviewing` on its SOURCE bead with
@@ -2215,6 +2216,35 @@ def reap_stranded_verdict_runs(now, open_running_runs):
         print("[watchdog] FIX5 stranded-verdict sweep: %d run(s) recovered%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
 
 
+_PERMISSION_PROMPT_RE = re.compile(r"Do you want to proceed\?|requires confirmation")
+
+
+def pane_shows_permission_prompt(sid):
+    """ga-42nfj: I/O check mirroring agent-stuck-escalation.sh's pane_shows_permission_prompt()
+    (ga-iog1v/ga-q640n) — reads the RENDERED pane (not the transcript JSONL; the dialog
+    is CLI chrome, never written to the conversation) via `gc session peek`, looking for
+    the confirmation dialog's stable textual signature. Restricted to the LAST lines of
+    the peek (not the whole scrollback): a dialog that is genuinely open and blocking is
+    always the last thing rendered — old scrollback text that happens to mention these
+    phrases (e.g. an agent discussing this very check) does not stay pinned near the end
+    once a session is truly frozen.
+
+    FAIL-CLOSED on purpose, mirroring the bash original but the OPPOSITE direction from
+    frozen_reviewer_verdict's own fail-safe: a missing/unreadable peek NEVER becomes
+    'prompt confirmed' — worst case reap_frozen_reviewers proceeds exactly as it did
+    before this fix existed. This check only ever turns a 'kill' into a 'skip', never
+    the reverse, so it cannot itself become a new way to strand a genuinely-wedged
+    reviewer."""
+    r = sh(["gc", "session", "peek", sid, "--lines", "40"], timeout=15)
+    if r is None or r.returncode != 0:
+        return False
+    out = (r.stdout or "").strip()
+    if not out:
+        return False
+    tail = "\n".join(out.splitlines()[-12:])
+    return bool(_PERMISSION_PROMPT_RE.search(tail))
+
+
 def reap_frozen_reviewers(sessions, now, rstate, open_running_runs):
     """FIX 3: kill a FROZEN gate-reviewer — state=active but last_active silent past
     FROZEN_KILL_SECS. This is the gap reap_hung_runs (FIX 1) can't see: a frozen
@@ -2279,6 +2309,21 @@ def reap_frozen_reviewers(sessions, now, rstate, open_running_runs):
                 print("[watchdog] frozen-reviewer %s RESUMED/changed on resample — NOT killing (fail-safe)" % sid, flush=True)
                 continue
             s_fresh = s
+        # ga-42nfj: SUSTAINED-confirmed frozen is not proof of a hang — it is also what a
+        # reviewer blocked on a real permission dialog (e.g. an `rm -rf` confirmation)
+        # looks like from last_active alone. Check the pane BEFORE killing; a confirmed
+        # dialog means a human is one keypress from resolving this, and killing would
+        # destroy the evidence and never even ask. Same bug class as ga-lxk26
+        # (agent-stuck-escalation.sh's in-gate suppression), different mechanism.
+        if GRW_FROZEN_PERMISSION_CHECK_ENABLED and pane_shows_permission_prompt(sid):
+            print("[watchdog] frozen-reviewer %s pane shows an OPEN PERMISSION PROMPT (last_active=%s, silent %dm) — NOT killing (ga-42nfj fail-safe)"
+                  % (sid, la_iso, silence // 60), flush=True)
+            _recovery_ledger("frozen_reviewer_permission_prompt_skip",
+                             {"session": sid, "last_active": la_iso, "silent_min": silence // 60, "dry_run": GRW_DRY_RUN})
+            if not GRW_DRY_RUN:
+                notify("Gate self-heal: revisor CONGELADO %s (%dmin) está BLOQUEADO EM PROMPT DE PERMISSÃO — sessão NÃO foi morta (ga-42nfj). Responda: gc session peek %s --lines 40"
+                       % (sid, silence // 60, sid), 5)
+            continue
         if GRW_DRY_RUN:
             print("[watchdog] FROZEN DRY-RUN would kill reviewer %s (last_active=%s, silent %dm) → reconciler revives fresh"
                   % (sid, la_iso, silence // 60), flush=True)

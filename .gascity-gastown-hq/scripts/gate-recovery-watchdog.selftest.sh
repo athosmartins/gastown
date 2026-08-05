@@ -637,6 +637,165 @@ finally:
     m.sh = _real_sh
     os.unlink(_tmp_log.name)
 
+# ═══ ga-42nfj: reap_frozen_reviewers() must not kill a session blocked on a REAL ═══
+# ═══ permission-prompt dialog (same bug class as ga-lxk26, different mechanism) ═══
+# FIX 3 kills any gate-reviewer session that reads state=active but has been silent
+# past FROZEN_KILL_SECS — with no check for whether that silence is a wedged Claude
+# (the case it exists to fix) or a reviewer sitting at a permission dialog waiting on
+# a human keypress. Killing a session blocked on a real dialog destroys the evidence
+# and never even asks (ga-lxk26 fixed the analogous gap in agent-stuck-escalation.sh's
+# separate stall path; this is the DIFFERENT mechanism the fix's own follow-up noted).
+
+print("Scenario ga-42nfj-1: pane_shows_permission_prompt() — FAIL-CLOSED contract")
+
+def _fake_sh_peek(rc, out):
+    def _inner(args, timeout=20, stdin=None):
+        return _FakeResult(rc, out)
+    return _inner
+
+_real_sh_pp = m.sh
+
+m.sh = _fake_sh_peek(0, "Permission rule Bash(rm -rf:*) requires confirmation for this command.\nDo you want to proceed?\n1. Yes\n2. Yes, and don't ask again\n3. No")
+if m.pane_shows_permission_prompt("any-sid") is True:
+    ok("confirmed dialog ('Do you want to proceed?') in the tail -> True")
+else:
+    bad("expected True for a confirmed dialog in the tail")
+
+m.sh = _fake_sh_peek(0, "some tool is blocked and this action requires confirmation before it can continue")
+if m.pane_shows_permission_prompt("any-sid") is True:
+    ok("'requires confirmation' alone in the tail -> True")
+else:
+    bad("expected True for 'requires confirmation' in the tail")
+
+m.sh = _fake_sh_peek(0, "Reading file foo.py...\nWriting file bar.py...\nRunning tests...\nAll green.")
+if m.pane_shows_permission_prompt("any-sid") is False:
+    ok("normal reviewer output, no dialog signature -> False")
+else:
+    bad("REGRESSION: normal output false-flagged as a permission prompt")
+
+_stale_lines = ["Do you want to proceed?"] + ["normal output line %d" % i for i in range(20)]
+m.sh = _fake_sh_peek(0, "\n".join(_stale_lines))
+if m.pane_shows_permission_prompt("any-sid") is False:
+    ok("dialog phrase present but pushed out of the last-12-line tail (old scrollback) -> False (not a currently-open dialog)")
+else:
+    bad("REGRESSION: matched a stale scrollback mention outside the tail window -- would false-positive on e.g. an agent discussing this very check")
+
+m.sh = _fake_sh_peek(1, "")
+if m.pane_shows_permission_prompt("any-sid") is False:
+    ok("peek command fails (non-zero rc) -> False (fail-closed, never blocks a legitimate kill on a read error)")
+else:
+    bad("expected False when the peek command itself fails")
+
+m.sh = _fake_sh_peek(0, "")
+if m.pane_shows_permission_prompt("any-sid") is False:
+    ok("empty peek output -> False (fail-closed)")
+else:
+    bad("expected False for empty peek output")
+
+def _fake_sh_none(args, timeout=20, stdin=None):
+    return None
+m.sh = _fake_sh_none
+if m.pane_shows_permission_prompt("any-sid") is False:
+    ok("sh() itself returns None (gc unreachable) -> False (fail-closed)")
+else:
+    bad("expected False when sh() returns None")
+
+m.sh = _real_sh_pp
+
+print("Scenario ga-42nfj-2: reap_frozen_reviewers() -- FIXTURE (dialog open) skipped, CONTROL (no dialog) still killed, same sweep")
+
+NOW42 = 3_000_000.0
+FROZEN_LA_42 = datetime.datetime.utcfromtimestamp(NOW42 - m.FROZEN_KILL_SECS - 120).strftime("%Y-%m-%dT%H:%M:%SZ")
+FIXTURE_SID = "gate-reviewer-permblocked"
+CONTROL_SID = "gate-reviewer-genuinelyfrozen"
+
+def _mk_frozen_reviewer(sid):
+    return {"id": sid, "template": "gate-reviewer", "closed": False, "state": "active", "last_active": FROZEN_LA_42}
+
+_PANE_BY_SID = {
+    FIXTURE_SID: "Permission rule Bash(rm -rf:*) requires confirmation for this command.\nDo you want to proceed?\n1. Yes\n2. Yes, and don't ask again\n3. No",
+    CONTROL_SID: "Reading file foo.py...\nWriting file bar.py...\nStill thinking...",
+}
+_kill_calls = []
+_peek_calls = []
+
+def _fake_sh_reap(args, timeout=20, stdin=None):
+    if len(args) >= 3 and args[0] == "gc" and args[1] == "session" and args[2] == "list":
+        rows = [_mk_frozen_reviewer(FIXTURE_SID), _mk_frozen_reviewer(CONTROL_SID)]
+        return _FakeResult(0, m.json.dumps({"sessions": rows}))
+    if len(args) >= 4 and args[0] == "gc" and args[1] == "session" and args[2] == "peek":
+        _peek_calls.append(args[3])
+        return _FakeResult(0, _PANE_BY_SID.get(args[3], ""))
+    if len(args) >= 4 and args[0] == "gc" and args[1] == "session" and args[2] == "kill":
+        _kill_calls.append(args[3])
+        return _FakeResult(0, "")
+    return _FakeResult(0, "")
+
+_real_sh_42 = m.sh
+_real_resample_42 = m.LIVENESS_RESAMPLE_SEC
+_real_reclog_42 = m.RECOVERY_LOG
+_tmp_reclog_42 = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+_tmp_reclog_42.close()
+m.RECOVERY_LOG = _tmp_reclog_42.name
+try:
+    m.sh = _fake_sh_reap
+    m.LIVENESS_RESAMPLE_SEC = 0  # skip the real 8s SUSTAINED-confirm gap in the test
+    sessions42 = [_mk_frozen_reviewer(FIXTURE_SID), _mk_frozen_reviewer(CONTROL_SID)]
+    m.reap_frozen_reviewers(sessions42, NOW42, None, None)
+
+    if FIXTURE_SID in _peek_calls and CONTROL_SID in _peek_calls:
+        ok("both SUSTAINED-confirmed-frozen candidates were pane-checked before any kill decision")
+    else:
+        bad("expected both %r and %r to be peeked, got peek_calls=%r" % (FIXTURE_SID, CONTROL_SID, _peek_calls))
+
+    if FIXTURE_SID not in _kill_calls:
+        ok("FIXTURE (pane shows an open permission dialog) was NOT killed -- ga-42nfj fail-safe")
+    else:
+        bad("REGRESSION ga-42nfj: killed a reviewer session that was blocked on a real permission dialog")
+
+    if CONTROL_SID in _kill_calls:
+        ok("CONTROL (frozen, no dialog) was still killed -- the pre-existing FIX 3 behavior is unchanged")
+    else:
+        bad("REGRESSION: a genuinely-frozen reviewer with no permission dialog was no longer killed")
+
+    if _kill_calls == [CONTROL_SID]:
+        ok("the SAME sweep produced two DIFFERENT outcomes for the two candidates -- proves the check discriminates, not a blanket suppress")
+    else:
+        bad("expected kill_calls == [%r] exactly, got %r" % (CONTROL_SID, _kill_calls))
+
+    # ── Scenario ga-42nfj-3: operator escape hatch -- toggle OFF reverts to legacy kill-on-sight ──
+    print("Scenario ga-42nfj-3: GRW_FROZEN_PERMISSION_CHECK_ENABLED=False reverts to legacy kill-on-sight (operator escape hatch)")
+    _kill_calls3 = []
+
+    def _fake_sh_reap3(args, timeout=20, stdin=None):
+        if len(args) >= 3 and args[0] == "gc" and args[1] == "session" and args[2] == "list":
+            rows = [_mk_frozen_reviewer(FIXTURE_SID)]
+            return _FakeResult(0, m.json.dumps({"sessions": rows}))
+        if len(args) >= 4 and args[0] == "gc" and args[1] == "session" and args[2] == "peek":
+            return _FakeResult(0, _PANE_BY_SID[FIXTURE_SID])
+        if len(args) >= 4 and args[0] == "gc" and args[1] == "session" and args[2] == "kill":
+            _kill_calls3.append(args[3])
+            return _FakeResult(0, "")
+        return _FakeResult(0, "")
+
+    _real_toggle_43 = m.GRW_FROZEN_PERMISSION_CHECK_ENABLED
+    m.sh = _fake_sh_reap3
+    m.GRW_FROZEN_PERMISSION_CHECK_ENABLED = False
+    try:
+        m.reap_frozen_reviewers([_mk_frozen_reviewer(FIXTURE_SID)], NOW42, None, None)
+    finally:
+        m.GRW_FROZEN_PERMISSION_CHECK_ENABLED = _real_toggle_43
+
+    if _kill_calls3 == [FIXTURE_SID]:
+        ok("toggle OFF -> the SAME dialog-blocked session is killed exactly as pre-ga-42nfj code -- confirms the new check (not something else) gates the skip")
+    else:
+        bad("expected the toggle-off path to kill %r regardless of the open dialog, got kill_calls=%r" % (FIXTURE_SID, _kill_calls3))
+finally:
+    m.sh = _real_sh_42
+    m.LIVENESS_RESAMPLE_SEC = _real_resample_42
+    m.RECOVERY_LOG = _real_reclog_42
+    os.unlink(_tmp_reclog_42.name)
+
 print("")
 print("Results: %d passed, %d failed" % (PASS, FAIL))
 if FAIL == 0:
