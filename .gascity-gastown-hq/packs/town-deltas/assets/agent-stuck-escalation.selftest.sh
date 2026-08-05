@@ -54,6 +54,16 @@ if [ "$1" = "list" ] && [ "$2" = "-l" ]; then
             fi
             exit 0
             ;;
+        gate-run:*)
+            _rid="${3#gate-run:}"
+            _f="${GATE_VERDICTS_DIR:-}/${_rid}.json"
+            if [ -n "${GATE_VERDICTS_DIR:-}" ] && [ -f "$_f" ]; then
+                cat "$_f"
+            else
+                echo "[]"
+            fi
+            exit 0
+            ;;
     esac
 fi
 echo "[]"
@@ -134,6 +144,7 @@ run_script() {
     LOGS_FIXTURE_DIR="${LOGS_FIXTURE_DIR:-}" \
     PEEK_FIXTURE_DIR="${PEEK_FIXTURE_DIR:-}" \
     GATE_MARKERS_DIR="${GATE_MARKERS_DIR:-}" \
+    GATE_VERDICTS_DIR="${GATE_VERDICTS_DIR:-}" \
     ACTIONS_FILE="$ACTIONS" \
     STUCK_AGENT_SEC="${STUCK_AGENT_SEC:-1800}" \
     COOLDOWN_SEC="${COOLDOWN_SEC:-10800}" \
@@ -159,8 +170,9 @@ SESSIONS_FIXTURE="$WORK/sessions.json"
 LOGS_FIXTURE_DIR="$WORK/logsfx"
 PEEK_FIXTURE_DIR="$WORK/peekfx"
 GATE_MARKERS_DIR="$WORK/gatemarkers"
-mkdir -p "$LOGS_FIXTURE_DIR" "$WORK/transcripts" "$GATE_MARKERS_DIR" "$PEEK_FIXTURE_DIR"
-export BEADS_FIXTURE SESSIONS_FIXTURE LOGS_FIXTURE_DIR PEEK_FIXTURE_DIR GATE_MARKERS_DIR
+GATE_VERDICTS_DIR="$WORK/gateverdicts"
+mkdir -p "$LOGS_FIXTURE_DIR" "$WORK/transcripts" "$GATE_MARKERS_DIR" "$PEEK_FIXTURE_DIR" "$GATE_VERDICTS_DIR"
+export BEADS_FIXTURE SESSIONS_FIXTURE LOGS_FIXTURE_DIR PEEK_FIXTURE_DIR GATE_MARKERS_DIR GATE_VERDICTS_DIR
 
 # Default: empty sessions
 echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
@@ -182,6 +194,30 @@ make_gate_marker_fixture() {
     local bid="$1" status="${2:-queued}"
     printf '[{"id":"ga-wisp-%s","status":"open","labels":["type:quality-gate-marker","source-bead:%s","gate-status:%s"]}]' \
         "$bid" "$bid" "$status" > "$GATE_MARKERS_DIR/$bid.json"
+}
+
+# make_gate_run_fixture <bead-id> <run-id> (ga-lxk26)
+# Registers an OPEN type:quality-gate-run/gate-status:running bead naming
+# <bead-id> via source-bead — the SAME `-l source-bead:<id>` query
+# make_gate_marker_fixture above feeds, just a different bead TYPE in the
+# result set. This is what gate_reviewer_permission_prompt_session()'s hop 1
+# looks for (real bd would return marker+run beads together for this query;
+# tests that only need the run, not a marker too, can call this alone).
+make_gate_run_fixture() {
+    local bid="$1" run_id="$2"
+    printf '[{"id":"%s","status":"open","labels":["type:quality-gate-run","source-bead:%s","gate-status:running"]}]' \
+        "$run_id" "$bid" > "$GATE_MARKERS_DIR/$bid.json"
+}
+
+# make_gate_verdict_fixture <run-id> <verdict-bead-id> <reviewer-session> [status] (ga-lxk26)
+# Registers an open (default) or closed type:quality-gate-verdict bead for
+# `-l gate-run:<run-id>` — hop 2 of gate_reviewer_permission_prompt_session():
+# .assignee is the reviewer's live session name, exactly as
+# quality-gate-dispatcher.sh's assign_verdict_bead_verified() sets it.
+make_gate_verdict_fixture() {
+    local run_id="$1" vid="$2" reviewer="$3" status="${4:-open}"
+    printf '[{"id":"%s","status":"%s","assignee":"%s","labels":["type:quality-gate-verdict","gate-run:%s","reviewer-index:1","verdict:pending"]}]' \
+        "$vid" "$status" "$reviewer" "$run_id" > "$GATE_VERDICTS_DIR/$run_id.json"
 }
 
 # make_transcript_fixture <session-name> <age-secs> [entries_json]
@@ -722,6 +758,93 @@ rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test27"
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
 assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test27" "T42: escalation still fires — batch-absent + inconclusive probe, same as before this fix (AC1: não-encontrada alone still escalates)"
+
+# ── T43-T46: bead EM GATE, but its ACTIVE gate-run's REVIEWER session is ────
+# blocked on a permission dialog (ga-lxk26). The ga-n937 suppression above
+# (T16-T18) is correct for "gate queue has no builder session" — but it ran
+# BEFORE any check of the reviewer session ga-n937 itself never looked at,
+# so a human silently blocking the WHOLE gate (Athos: "eu nem sabia que isso
+# estava pendente em mim") produced total silence for 20+ minutes. These
+# tests are the falsifiable acceptance criteria from the bug report:
+#   T43 = FIXTURE (AC1): reviewer blocked → escalates + notify.
+#   T44 = CONTROL: reviewer working normally → still suppressed (ga-n937 intact).
+#   T45 = AC3: both shapes in the SAME pass, asserted to produce DIFFERENT
+#         outputs from the SAME actions/log capture — "o coração do bug".
+#   T46 = CONTROL: no gate-run dispatched yet (queue simply parked, the most
+#         common real shape) → still suppressed; traceability companion to T16.
+
+echo "T43: bead EM GATE, reviewer session pane confirms permission dialog → escalates + notify (ga-lxk26 AC1)"
+echo '{"sessions":[{"name":"gate-reviewer-test1","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_gate_run_fixture ga-gatelock01 ga-wisp-testrun1
+make_gate_verdict_fixture ga-wisp-testrun1 ga-verdict1 gate-reviewer-test1
+make_transcript_fixture gate-reviewer-test1 3600 '[{"type":"assistant","message":{"stop_reason":"tool_use"},"blocks":[{"type":"tool_use","name":"Bash","input":{"command":"rm -rf .gc-worktrees/ga-lxk26-reviewer-test"}}]}]'
+{
+    echo "Permission rule Bash(rm -rf:*) requires confirmation for this command."
+    echo "Do you want to proceed?  1. Yes  2. Yes, and don't ask again  3. No"
+} > "$PEEK_FIXTURE_DIR/gate-reviewer-test1.txt"
+printf '[%s]' "$(make_bead_json ga-gatelock01 "" 2200 '["ctx:ready","gate:queued"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gatelock01"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente BLOQUEADO EM PROMPT (1 tecla resolve): ga-gatelock01" "T43: escalates despite EM GATE — reviewer confirmed blocked"
+assert_contains "$ACTIONS" "notify" "T43: notify fires (imp07 notify-first honored)"
+log_contains "T43" "ga-lxk26" "T43: log cites ga-lxk26 as the reason suppression was lifted"
+log_contains "T43" "rm -rf .gc-worktrees/ga-lxk26-reviewer-test" "T43: log includes the reviewer's exact blocked command"
+[ -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gatelock01" ] && ok "T43: state file written (cooldown honored)" || bad "T43: missing state file — cooldown would not hold"
+rm -f "$GATE_MARKERS_DIR/ga-gatelock01.json" "$GATE_VERDICTS_DIR/ga-wisp-testrun1.json" "$PEEK_FIXTURE_DIR/gate-reviewer-test1.txt" "$LOGS_FIXTURE_DIR/gate-reviewer-test1.json"
+
+echo "T44: bead EM GATE, reviewer session working normally (no dialog) → still suppressed (ga-lxk26 CONTROL)"
+echo '{"sessions":[{"name":"gate-reviewer-test2","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_gate_run_fixture ga-gatelock02 ga-wisp-testrun2
+make_gate_verdict_fixture ga-wisp-testrun2 ga-verdict2 gate-reviewer-test2
+{
+    echo "Reading file src/foo.go..."
+    echo "Running go test ./..."
+} > "$PEEK_FIXTURE_DIR/gate-reviewer-test2.txt"
+printf '[%s]' "$(make_bead_json ga-gatelock02 "" 2200 '["ctx:ready","gate:reviewing"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gatelock02"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor" "T44: no mail — reviewer pane shows no permission dialog"
+assert_absent "$ACTIONS" "notify" "T44: no notify — same"
+log_contains "T44" "SUPRIMINDO escalação (sem builder por design, ga-n937)" "T44: log preserves the ORIGINAL ga-n937 suppression message"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gatelock02" ] && ok "T44: no state file (suppression is log-only, matches ga-n937 shape)" || bad "T44: unexpected state file on suppression"
+rm -f "$GATE_MARKERS_DIR/ga-gatelock02.json" "$GATE_VERDICTS_DIR/ga-wisp-testrun2.json" "$PEEK_FIXTURE_DIR/gate-reviewer-test2.txt"
+
+echo "T45: blocked-reviewer bead and normal-reviewer bead in the SAME pass → asserted DIFFERENT outcomes (ga-lxk26 AC3)"
+echo '{"sessions":[{"name":"gate-reviewer-test3","state":"active"},{"name":"gate-reviewer-test4","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_gate_run_fixture ga-gatelock03 ga-wisp-testrun3
+make_gate_verdict_fixture ga-wisp-testrun3 ga-verdict3 gate-reviewer-test3
+make_gate_run_fixture ga-gatelock04 ga-wisp-testrun4
+make_gate_verdict_fixture ga-wisp-testrun4 ga-verdict4 gate-reviewer-test4
+{
+    echo "Permission rule Bash(rm -rf:*) requires confirmation for this command."
+    echo "Do you want to proceed?  1. Yes  2. Yes, and don't ask again  3. No"
+} > "$PEEK_FIXTURE_DIR/gate-reviewer-test3.txt"
+{
+    echo "Editing file bar.go..."
+} > "$PEEK_FIXTURE_DIR/gate-reviewer-test4.txt"
+printf '[%s,%s]' \
+    "$(make_bead_json ga-gatelock03 "" 2200 '["ctx:ready","gate:queued"]')" \
+    "$(make_bead_json ga-gatelock04 "" 2200 '["ctx:ready","gate:queued"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gatelock03" "$WORK/city/.gc/state/agent-stuck-escalation/ga-gatelock04"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente BLOQUEADO EM PROMPT (1 tecla resolve): ga-gatelock03" "T45: blocked-reviewer bead escalates"
+assert_absent   "$ACTIONS" "ga-gatelock04" "T45: SAME pass — normal-reviewer bead produces NO action line at all (the difference the bug swallowed)"
+log_contains "T45" "ga-gatelock03: EM GATE mas reviewer gate-reviewer-test3 BLOQUEADO-EM-PROMPT" "T45: log distinguishes the blocked bead"
+log_contains "T45" "ga-gatelock04: bead.updated_at parado" "T45: log still shows the normal bead going through the unchanged ga-n937 path"
+rm -f "$GATE_MARKERS_DIR/ga-gatelock03.json" "$GATE_VERDICTS_DIR/ga-wisp-testrun3.json" "$PEEK_FIXTURE_DIR/gate-reviewer-test3.txt"
+rm -f "$GATE_MARKERS_DIR/ga-gatelock04.json" "$GATE_VERDICTS_DIR/ga-wisp-testrun4.json" "$PEEK_FIXTURE_DIR/gate-reviewer-test4.txt"
+
+echo "T46: bead EM GATE, no gate-run yet (queue parked) → still suppressed (ga-lxk26 CONTROL, companion to T16)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead_json ga-gatelock05 "" 2200 '["ctx:ready","gate:queued"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gatelock05"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor" "T46: no mail — no gate-run dispatched yet"
+log_contains "T46" "SUPRIMINDO escalação (sem builder por design, ga-n937)" "T46: log preserves the ORIGINAL ga-n937 suppression message"
 
 # ── T10–T12: Layer 1 routing integration (ga-qw3p.1) ────────────────────────
 # Deploy the real escalation-router.sh so the script can source it.

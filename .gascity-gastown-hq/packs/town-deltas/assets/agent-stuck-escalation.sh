@@ -310,6 +310,188 @@ except Exception:
 ' 2>/dev/null
 }
 
+# gate_reviewer_permission_prompt_session (ga-lxk26): a bead EM GATE has NO
+# builder session by design (ga-n937 below) — bead.assignee is typically
+# empty, so every assignee-keyed check in this file (session health,
+# transcript tri-state, pane_shows_permission_prompt) never runs for it. But
+# the gate itself has a LIVE reviewer session, and THAT session can be the
+# one blocked on a permission dialog — this is the actual ga-lxk26 incident
+# (Athos, live: "tem uma bead sendo revisada no gate ha mais de 20 minutos...
+# eu nem sabia que isso estava pendente em mim" — a gate-reviewer stuck on an
+# `rm -rf` confirmation while the ga-n937 suppression below ran every 5min
+# and never looked past "EM GATE").
+#
+# Resolves bead_id -> its OPEN, actively-running gate-run (type:quality-
+# gate-run, gate-status:running, source-bead:<id> — the SAME query
+# bead_has_open_gate_marker() below already issues, just widened to also
+# recognize this other bead type in the same result set) -> that run's
+# still-open (non-closed) type:quality-gate-verdict beads -> each verdict's
+# .assignee, which IS the reviewer's live session name (set by
+# quality-gate-dispatcher.sh's assign_verdict_bead_verified(), read-back
+# verified there). Checks pane_shows_permission_prompt() against each
+# candidate session in turn; echoes the FIRST confirmed-blocked session name
+# and returns 0.
+#
+# FAIL-CLOSED throughout, same direction as pane_shows_permission_prompt()
+# itself: a missing/unreadable run, verdict, assignee, or any query failure
+# returns 1 with nothing echoed. This function only ever LIFTS ga-n937's
+# suppression on a positive, confirmed signal — never on the absence of one
+# — so a caller that gets nothing back here must fall through to the
+# existing (safe, already-shipped) in-gate suppression unchanged.
+gate_reviewer_permission_prompt_session() {
+    local bid="${1:-}" arts run_id verdicts candidates cand
+    [ -n "$bid" ] || return 1
+    command -v "$BD" >/dev/null 2>&1 || return 1
+
+    arts="$(timeout 15 "$BD" -C "$CITY" list -l "source-bead:$bid" --json 2>/dev/null || true)"
+    [ -z "$arts" ] && return 1
+    run_id="$(printf '%s' "$arts" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if isinstance(d, dict):
+    d = [d]
+if not isinstance(d, list):
+    sys.exit(0)
+for b in d:
+    if not isinstance(b, dict):
+        continue
+    if b.get("status") != "open":
+        continue
+    labels = b.get("labels") or []
+    if "type:quality-gate-run" in labels and "gate-status:running" in labels:
+        print(b.get("id") or "")
+        break
+' 2>/dev/null || true)"
+    [ -z "$run_id" ] && return 1
+
+    verdicts="$(timeout 15 "$BD" -C "$CITY" list -l "gate-run:$run_id" --json 2>/dev/null || true)"
+    [ -z "$verdicts" ] && return 1
+    candidates="$(printf '%s' "$verdicts" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if isinstance(d, dict):
+    d = [d]
+if not isinstance(d, list):
+    sys.exit(0)
+for b in d:
+    if not isinstance(b, dict):
+        continue
+    if b.get("status") == "closed":
+        continue
+    labels = b.get("labels") or []
+    if "type:quality-gate-verdict" not in labels:
+        continue
+    a = b.get("assignee") or ""
+    if a:
+        print(a)
+' 2>/dev/null || true)"
+    [ -z "$candidates" ] && return 1
+
+    while IFS= read -r cand; do
+        [ -z "$cand" ] && continue
+        if pane_shows_permission_prompt "$cand"; then
+            printf '%s' "$cand"
+            return 0
+        fi
+    done <<< "$candidates"
+    return 1
+}
+
+# build_permission_prompt_body / send_escalation (ga-lxk26 factor-out): the
+# body template and routing/DRY_RUN/notify/mail/cooldown-write tail for a
+# CONFIRMED permission-dialog escalation, used verbatim by both the original
+# per-assignee frozen-session path (further below, in the main loop) and the
+# new in-gate reviewer-session path above. Factored out so the two call
+# sites cannot drift into two different-looking messages for the same "1
+# tecla resolve" situation. Neither function changes behavior for the
+# existing call site — they're the exact same statements, just callable from
+# two places now.
+build_permission_prompt_body() {
+    local bead_id="$1" title="$2" assignee_display="$3" live_session_name="$4" \
+          blocked_cmd="$5" age_min="$6" failure_markers="$7"
+    cat <<BODY
+CAMADA 2 — ESCALAÇÃO AUTOMÁTICA: agente BLOQUEADO EM PROMPT DE PERMISSÃO
+(NÃO é um stall genérico — o pane confirma um diálogo interativo aberto).
+
+Bead:      $bead_id — $title
+Assignee:  ${assignee_display:-'(não atribuído)'}
+Sessão:    $live_session_name
+Comando bloqueado: $blocked_cmd
+Sem update há: ${age_min} minutos (limiar: $(( STUCK_AGENT_SEC / 60 )) min)
+Marcadores de falha: $failure_markers
+
+O QUE ACONTECEU: mesmo com bypass de permissões ativo, uma regra "ask"
+explícita ainda exigiu confirmação e a sessão está parada num diálogo como:
+  "Do you want to proceed?  1. Yes  2. Yes, and don't ask again  3. No"
+\`gc session nudge\` NÃO resolve isso — a mensagem fica em fila e só é
+processada DEPOIS do diálogo (verificado: 105s+ sem efeito). Não tente
+nudge aqui.
+
+AÇÃO SUGERIDA (confirmação antes de agir, resolve em segundos, não é kill):
+1. gc session peek $live_session_name --lines 40 — confirme o texto exato do prompt
+2. Responda a tecla certa DIRETAMENTE no pane (exceção documentada da
+   doutrina de pool — nudge não serve pra isto): tmux send-keys -t <pane>
+   '1' Enter (ou a tecla da opção CORRETA — leia o prompt antes, não assuma
+   sempre '1')
+3. Depois de destravar: se esta regra de permissão alcança sessões de pool
+   não-supervisionadas, considere virar "deny"/"allow" — nunca "ask"
+   (ga-q640n/AC3).
+
+Limiar configurável via STUCK_AGENT_SEC (atual: ${STUCK_AGENT_SEC}s).
+(Daemon: agent-stuck-escalation · ga-qw3p.2 · permission-prompt: ga-iog1v/ga-q640n)
+BODY
+}
+
+send_escalation() {
+    local bead_id="$1" title="$2" labels="$3" age_min="$4" assignee_for_notify="$5" \
+          permission_prompt_detected="$6" mail_subject_prefix="$7" body="$8" sf="$9"
+
+    local _esc_target="$MAYOR_ADDR" _esc_topic=""
+    if [ "$_ROUTER_AVAILABLE" = "1" ] && command -v escalation_classify_topic >/dev/null 2>&1; then
+        _esc_topic=$(escalation_classify_topic "$title $labels" 2>/dev/null || echo "")
+        if [ -n "$_esc_topic" ]; then
+            _esc_target=$(escalation_topic_to_crew "$_esc_topic" 2>/dev/null || echo "$MAYOR_ADDR")
+        fi
+    fi
+    log "$bead_id: escalation target=$_esc_target (topic=${_esc_topic:-none})"
+
+    if [ "$DRY_RUN" = "1" ]; then
+        log "  [DRY_RUN] would send mail to $_esc_target for $bead_id"
+        log "  [DRY_RUN] subject: ${mail_subject_prefix}: $bead_id (${age_min}min sem progresso)"
+        printf '%s' "$now" > "$sf"
+        return 0
+    fi
+
+    if command -v "$NOTIFY" >/dev/null 2>&1; then
+        if [ "$permission_prompt_detected" = "1" ]; then
+            "$NOTIFY" -t "Agente bloqueado em prompt" -p 5 \
+                "$bead_id (${assignee_for_notify:-?}) BLOQUEADO em prompt de permissão — 1 tecla resolve → ${_esc_target}" \
+                >/dev/null 2>&1 || true
+        else
+            "$NOTIFY" -t "Agente travado" -p 4 \
+                "$bead_id (${assignee_for_notify:-?}) sem progresso há ${age_min}min — escalando → ${_esc_target}" \
+                >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if timeout 45 "$GC" mail send "$_esc_target" \
+            -s "${mail_subject_prefix}: $bead_id — ${age_min}min sem progresso (assignee=${assignee_for_notify:-?})" \
+            -m "$body" \
+            >/dev/null 2>&1; then
+        log "  mail enviado a $_esc_target (topic=${_esc_topic:-none}) para $bead_id"
+        printf '%s\n' "$now" > "$sf"
+    else
+        log "  WARN: gc mail send falhou para $bead_id — notify já disparado"
+        printf '%s\n' "$now" > "$sf"
+    fi
+}
+
 # gate_label_present (ga-n937): true iff the comma-joined label list $1
 # carries a gate:* lifecycle label (queued/reviewing/passed/merging/…)
 # OTHER than gate:needs-fix or gate:needs-human — mirrors pilot-
@@ -631,6 +813,36 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
     # gate:needs-fix — there a fixer SHOULD be working; frozen is a real
     # stall and must still escalate.
     if gate_label_present "$labels" || bead_has_open_gate_marker "$bead_id"; then
+        # ga-lxk26: BEFORE suppressing, check whether the bead's ACTIVE
+        # gate-run has a reviewer session confirmed BLOCKED on a
+        # permission-confirmation dialog. The ga-n937 suppression above is
+        # correct for "gate queue has no builder" — the defect was
+        # suppressing before ever asking whether a human is silently
+        # blocking the gate. Escalates with the SAME differentiated
+        # BLOQUEADO-EM-PROMPT message the assignee-path below already sends
+        # (build_permission_prompt_body/send_escalation), and respects the
+        # same COOLDOWN via $sf. Any unconfirmed/unresolvable case (no
+        # running gate-run, reviewer working normally, queue simply parked)
+        # falls through to the unchanged ga-n937 suppression right below —
+        # this check only ever LIFTS suppression on a positive, confirmed
+        # signal, never reintroducing the noise ga-n937 killed.
+        gate_reviewer_sess="$(gate_reviewer_permission_prompt_session "$bead_id" 2>/dev/null || true)"
+        if [ -n "$gate_reviewer_sess" ]; then
+            gate_blocked_cmd="$(permission_prompt_blocked_command "$gate_reviewer_sess" 2>/dev/null || true)"
+            [ -z "$gate_blocked_cmd" ] && gate_blocked_cmd="(comando não determinado — veja gc session peek $gate_reviewer_sess --lines 40)"
+            log "$bead_id: EM GATE mas reviewer $gate_reviewer_sess BLOQUEADO-EM-PROMPT ${age_min}min — NÃO suprimindo (ga-lxk26): comando=[$gate_blocked_cmd]"
+            gate_failure_markers=""
+            if printf '%s' "$labels" | grep -q "gate:needs-human"; then
+                gate_failure_markers="${gate_failure_markers}gate:needs-human "
+            fi
+            if printf '%s' "$labels" | grep -q "story:blocked"; then
+                gate_failure_markers="${gate_failure_markers}story:blocked "
+            fi
+            [ -z "$gate_failure_markers" ] && gate_failure_markers="nenhum"
+            gate_body="$(build_permission_prompt_body "$bead_id" "$title" "(bead sem assignee — EM GATE; reviewer=$gate_reviewer_sess)" "$gate_reviewer_sess" "$gate_blocked_cmd" "$age_min" "$gate_failure_markers")"
+            send_escalation "$bead_id" "$title" "$labels" "$age_min" "$gate_reviewer_sess" "1" "Agente BLOQUEADO EM PROMPT (1 tecla resolve)" "$gate_body" "$sf"
+            continue
+        fi
         log "$bead_id: bead.updated_at parado ${age_min}min mas EM GATE (labels=$labels) — SUPRIMINDO escalação (sem builder por design, ga-n937)"
         continue
     fi
@@ -819,38 +1031,7 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
     mail_subject_prefix="Agente travado"
     if [ "$permission_prompt_detected" = "1" ]; then
         mail_subject_prefix="Agente BLOQUEADO EM PROMPT (1 tecla resolve)"
-        body="$(cat <<BODY
-CAMADA 2 — ESCALAÇÃO AUTOMÁTICA: agente BLOQUEADO EM PROMPT DE PERMISSÃO
-(NÃO é um stall genérico — o pane confirma um diálogo interativo aberto).
-
-Bead:      $bead_id — $title
-Assignee:  ${assignee:-'(não atribuído)'}
-Sessão:    $live_session_name
-Comando bloqueado: $blocked_cmd
-Sem update há: ${age_min} minutos (limiar: $(( STUCK_AGENT_SEC / 60 )) min)
-Marcadores de falha: $failure_markers
-
-O QUE ACONTECEU: mesmo com bypass de permissões ativo, uma regra "ask"
-explícita ainda exigiu confirmação e a sessão está parada num diálogo como:
-  "Do you want to proceed?  1. Yes  2. Yes, and don't ask again  3. No"
-\`gc session nudge\` NÃO resolve isso — a mensagem fica em fila e só é
-processada DEPOIS do diálogo (verificado: 105s+ sem efeito). Não tente
-nudge aqui.
-
-AÇÃO SUGERIDA (confirmação antes de agir, resolve em segundos, não é kill):
-1. gc session peek $live_session_name --lines 40 — confirme o texto exato do prompt
-2. Responda a tecla certa DIRETAMENTE no pane (exceção documentada da
-   doutrina de pool — nudge não serve pra isto): tmux send-keys -t <pane>
-   '1' Enter (ou a tecla da opção CORRETA — leia o prompt antes, não assuma
-   sempre '1')
-3. Depois de destravar: se esta regra de permissão alcança sessões de pool
-   não-supervisionadas, considere virar "deny"/"allow" — nunca "ask"
-   (ga-q640n/AC3).
-
-Limiar configurável via STUCK_AGENT_SEC (atual: ${STUCK_AGENT_SEC}s).
-(Daemon: agent-stuck-escalation · ga-qw3p.2 · permission-prompt: ga-iog1v/ga-q640n)
-BODY
-)"
+        body="$(build_permission_prompt_body "$bead_id" "$title" "$assignee" "$live_session_name" "$blocked_cmd" "$age_min" "$failure_markers")"
     else
         body="$(cat <<BODY
 CAMADA 2 — ESCALAÇÃO AUTOMÁTICA: bead in_progress sem progresso detectado.
@@ -875,49 +1056,7 @@ BODY
 )"
     fi
 
-    # Layer 1 routing (ga-qw3p.1): classify bead title+labels to find domain owner.
-    # Falls back to Mayor when router unavailable or topic unrecognised.
-    _esc_target="$MAYOR_ADDR"
-    _esc_topic=""
-    if [ "$_ROUTER_AVAILABLE" = "1" ] && command -v escalation_classify_topic >/dev/null 2>&1; then
-        _esc_topic=$(escalation_classify_topic "$title $labels" 2>/dev/null || echo "")
-        if [ -n "$_esc_topic" ]; then
-            _esc_target=$(escalation_topic_to_crew "$_esc_topic" 2>/dev/null || echo "$MAYOR_ADDR")
-        fi
-    fi
-    log "$bead_id: escalation target=$_esc_target (topic=${_esc_topic:-none})"
-
-    if [ "$DRY_RUN" = "1" ]; then
-        log "  [DRY_RUN] would send mail to $_esc_target for $bead_id"
-        log "  [DRY_RUN] subject: ${mail_subject_prefix}: $bead_id (${age_min}min sem progresso)"
-        printf '%s' "$now" > "$sf"
-        continue
-    fi
-
-    # imp07 invariant: notify FIRST (Dolt-independent), mail SECONDARY (best-effort)
-    if command -v "$NOTIFY" >/dev/null 2>&1; then
-        if [ "$permission_prompt_detected" = "1" ]; then
-            "$NOTIFY" -t "Agente bloqueado em prompt" -p 5 \
-                "$bead_id (${assignee:-?}) BLOQUEADO em prompt de permissão — 1 tecla resolve → ${_esc_target}" \
-                >/dev/null 2>&1 || true
-        else
-            "$NOTIFY" -t "Agente travado" -p 4 \
-                "$bead_id (${assignee:-?}) sem progresso há ${age_min}min — escalando → ${_esc_target}" \
-                >/dev/null 2>&1 || true
-        fi
-    fi
-
-    if timeout 45 "$GC" mail send "$_esc_target" \
-            -s "${mail_subject_prefix}: $bead_id — ${age_min}min sem progresso (assignee=${assignee:-?})" \
-            -m "$body" \
-            >/dev/null 2>&1; then
-        log "  mail enviado a $_esc_target (topic=${_esc_topic:-none}) para $bead_id"
-        printf '%s\n' "$now" > "$sf"
-    else
-        log "  WARN: gc mail send falhou para $bead_id — notify já disparado"
-        # Record partial escalation (notify fired) so we respect cooldown
-        printf '%s\n' "$now" > "$sf"
-    fi
+    send_escalation "$bead_id" "$title" "$labels" "$age_min" "$assignee" "$permission_prompt_detected" "$mail_subject_prefix" "$body" "$sf"
 
 done <<< "$STUCK_ITEMS"
 
