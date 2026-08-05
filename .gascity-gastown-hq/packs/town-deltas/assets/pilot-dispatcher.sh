@@ -4248,7 +4248,40 @@ IN_FLIGHT_BIG=$(echo "$IN_FLIGHT_JSON" | jq --argjson gr "$IN_FLIGHT_GATE_RESIDE
 IN_FLIGHT_SMALL=$((IN_FLIGHT_TOTAL - GATE_RESIDENT - IN_FLIGHT_BIG))
 [ "$IN_FLIGHT_SMALL" -lt 0 ] 2>/dev/null && IN_FLIGHT_SMALL=0
 
-log "In-flight: live=$IN_FLIGHT_TOTAL (raw=$IN_FLIGHT_RAW_TOTAL stale=$STALE_INFLIGHT age=$STALE_AGE dead=$DEAD_WORKER)  gate_resident=$GATE_RESIDENT  small=$IN_FLIGHT_SMALL/${MAX_SMALL}  big=$IN_FLIGHT_BIG/${MAX_BIG}"
+# ga-wtqli: IN_FLIGHT_SMALL above is a RESIDUE (total minus every other named
+# category), not a classification — a bead with NEITHER lane:big NOR lane:small
+# (never classified, for any reason) lands here exactly like a deliberately-
+# tagged lane:small bead, and nothing distinguished the two until now. Audited
+# (ga-wtqli AC#1): not just stale data — dispatch_one()'s lane:${LANE} stamp is
+# a best-effort `bd label add ... || true` with no retry or read-after-write
+# check, unlike the story:in-flight write two lines later (retries 5x,
+# durability-confirmed), so a Dolt blip in that narrow window is a LIVE path to
+# this state (real fix filed separately per AC#5 — this block is observability
+# only and does not touch IN_FLIGHT_SMALL or SMALL_SLOTS below).
+IN_FLIGHT_UNCLASSIFIED_JSON=$(echo "$IN_FLIGHT_JSON" | jq --argjson gr "$IN_FLIGHT_GATE_RESIDENT_JSON" '
+    ($gr | map(.id)) as $gate_ids
+    | [ .[] | select((.id as $i | $gate_ids | index($i)) | not)
+             | select((.labels // []) | (contains(["lane:big"]) or contains(["lane:small"])) | not) ]' 2>/dev/null || echo "[]")
+[ -z "$IN_FLIGHT_UNCLASSIFIED_JSON" ] && IN_FLIGHT_UNCLASSIFIED_JSON="[]"
+IN_FLIGHT_UNCLASSIFIED=$(echo "$IN_FLIGHT_UNCLASSIFIED_JSON" | jq 'length' 2>/dev/null || echo "0")
+[ -z "$IN_FLIGHT_UNCLASSIFIED" ] 2>/dev/null && IN_FLIGHT_UNCLASSIFIED=0
+
+if [ "$IN_FLIGHT_UNCLASSIFIED" -gt 0 ] 2>/dev/null; then
+  warn "Unclassified-lane in-flight: ${IN_FLIGHT_UNCLASSIFIED} bead(s) with NEITHER lane:big NOR lane:small — still counted against the small lane cap by residue (SMALL_SLOTS unchanged, ga-wtqli AC#5), but NOT provably the same as a deliberately-classified lane:small bead. Unclassified ids: $(echo "$IN_FLIGHT_UNCLASSIFIED_JSON" | jq -r '[.[].id] | join(",")' 2>/dev/null || echo "?")"
+fi
+
+# Log-only breakdown of the residue: small=N still means "occupies a small
+# cap slot" (SMALL_SLOTS below still subtracts the full IN_FLIGHT_SMALL
+# residue, unchanged) — IN_FLIGHT_SMALL_CLASSIFIED further splits THAT same
+# number into explicit-vs-unclassified so small=N stops silently absorbing
+# unclassified_lane=N (ga-wtqli AC#2-4). Non-negative by construction: the
+# unclassified set above is a subset of the same gate-resident-excluded,
+# non-big beads IN_FLIGHT_SMALL sums — so small_classified + big +
+# unclassified_lane always equals live - gate_resident exactly.
+IN_FLIGHT_SMALL_CLASSIFIED=$((IN_FLIGHT_SMALL - IN_FLIGHT_UNCLASSIFIED))
+[ "$IN_FLIGHT_SMALL_CLASSIFIED" -lt 0 ] 2>/dev/null && IN_FLIGHT_SMALL_CLASSIFIED=0
+
+log "In-flight: live=$IN_FLIGHT_TOTAL (raw=$IN_FLIGHT_RAW_TOTAL stale=$STALE_INFLIGHT age=$STALE_AGE dead=$DEAD_WORKER)  gate_resident=$GATE_RESIDENT  small=$IN_FLIGHT_SMALL_CLASSIFIED/${MAX_SMALL}  unclassified_lane=$IN_FLIGHT_UNCLASSIFIED  big=$IN_FLIGHT_BIG/${MAX_BIG}"
 
 # ── Per-builder busy set (ga-mtlm6) ───────────────────────────────────────────
 # For a POOLED rig (multiple interchangeable crew), a builder is BUSY iff it
@@ -4335,7 +4368,7 @@ if [ "$SMALL_SLOTS" -eq "0" ] && [ "$BIG_SLOTS" -eq "0" ]; then
     --exclude-label "pilot:dispatched" \
     -n 0 2>/dev/null | jq 'length' 2>/dev/null || echo "?")
   log "Dispatch queue: ${WAITING_APPROVED} story:approved waiting (HQ; both lanes full — none can dispatch this sweep)."
-  log "Both lanes full (small=${IN_FLIGHT_SMALL}/${MAX_SMALL}, big=${IN_FLIGHT_BIG}/${MAX_BIG}). Pilot backing off."
+  log "Both lanes full (small=${IN_FLIGHT_SMALL_CLASSIFIED}/${MAX_SMALL} unclassified_lane=${IN_FLIGHT_UNCLASSIFIED}, big=${IN_FLIGHT_BIG}/${MAX_BIG}). Pilot backing off."
   exit 0
 fi
 

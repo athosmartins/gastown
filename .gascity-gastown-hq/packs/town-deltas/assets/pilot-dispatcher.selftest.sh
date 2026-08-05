@@ -4401,9 +4401,14 @@ FB_VI="$(_fb "" "" '[{"id":"wa-rev","labels":["gate:reviewing"]},{"id":"wa-fresh
 # gate:fix-attempt:N the way a bounced-then-requeued bead looks) → occupancy
 # must read 3 (2 small + 1 big), not 7.
 echo "Scenario 4uhrp: gate-resident in-flight bead frees its lane slot (occupancy), stays vetoed from candidacy (_filter_built)"
+# if-build1/if-build2 carry an explicit lane:small (ga-wtqli) so this fixture
+# tests gate-resident exclusion ONLY — kept decoupled from the unclassified-
+# lane dimension covered by its own "Scenario ga-wtqli" below. Before ga-wtqli
+# these two were bare `story:in-flight` and still read small=2 by RESIDUE —
+# an accidental live example of the exact bug ga-wtqli makes observable.
 INFLIGHT_4UHRP='[
-  {"id":"if-build1","labels":["story:in-flight"]},
-  {"id":"if-build2","labels":["story:in-flight"]},
+  {"id":"if-build1","labels":["story:in-flight","lane:small"]},
+  {"id":"if-build2","labels":["story:in-flight","lane:small"]},
   {"id":"if-build3","labels":["story:in-flight","lane:big"]},
   {"id":"if-gate1","labels":["story:in-flight","gate:queued","gate:reviewing"]},
   {"id":"if-gate2","labels":["story:in-flight","gate:fix-attempt:1","gate:queued"]},
@@ -4424,10 +4429,10 @@ else
   bad "did not detect gate-resident in-flight occupants (expected 'Gate-resident in-flight: 4 bead')"
 fi
 
-if echo "$LOG4UHRP" | grep -q "gate_resident=4  small=2/5  big=1/2"; then
-  ok "AC1: occupancy corrected to 2 small + 1 big = 3 actually-building occupants (not 7)"
+if echo "$LOG4UHRP" | grep -q "gate_resident=4  small=2/5  unclassified_lane=0  big=1/2"; then
+  ok "AC1: occupancy corrected to 2 small + 1 big = 3 actually-building occupants (not 7); unclassified_lane=0 control (ga-wtqli)"
 else
-  bad "AC1 FAILED: occupancy not corrected (expected 'gate_resident=4  small=2/5  big=1/2', got: $(echo "$LOG4UHRP" | grep 'In-flight:'))"
+  bad "AC1 FAILED: occupancy not corrected (expected 'gate_resident=4  small=2/5  unclassified_lane=0  big=1/2', got: $(echo "$LOG4UHRP" | grep 'In-flight:'))"
 fi
 
 if echo "$LOG4UHRP" | grep -qE "Gate-resident in-flight:.*if-build[123]"; then
@@ -4444,6 +4449,90 @@ if [ "$FB_4UHRP" = '["wa-fresh"]' ]; then
   ok "AC3: the SAME bead (if-gate1) freed from lane occupancy above is STILL excluded from candidacy by _filter_built — no double-dispatch"
 else
   bad "AC3 FAILED: _filter_built no longer vetoes the gate-resident bead — DOUBLE-DISPATCH REGRESSION (got: '$FB_4UHRP')"
+fi
+
+# ── Scenario ga-wtqli: unclassified-lane in-flight distinguished from a real
+# lane:small classification, not silently summed into it (ga-05604.1, 10th
+# instance of the error-vs-empty class) ───────────────────────────────────────
+# IN_FLIGHT_SMALL is a RESIDUE (total - gate_resident - big) — a bead with
+# NEITHER lane:big NOR lane:small (never classified) lands in it exactly like
+# a deliberately-tagged lane:small bead. AC#1 (audit): confirmed a LIVE path —
+# dispatch_one()'s lane:${LANE} stamp is `bd label add ... || true` with no
+# retry/read-after-write check, unlike the story:in-flight write two lines
+# later (retries, durability-confirmed) — a Dolt blip in that window is a real
+# way to reach this state, not just stale data (real fix filed separately,
+# AC#5). Below: AC#2 (named-id observability) + AC#3 (distinguishing fixture)
+# + AC#4 (control invariant) + a direct check that AC#5 held (dispatch cap
+# arithmetic byte-identical to before).
+echo "Scenario ga-wtqli AC2/AC3: 1 explicit lane:small + 1 unclassified distinguished, not summed"
+INFLIGHT_WTQLI_AC3='[
+  {"id":"wt-small1","labels":["story:in-flight","lane:small"]},
+  {"id":"wt-unclass1","labels":["story:in-flight"]}
+]'
+LOG_WTQLI_AC3="$(run_capacity 10 "$INFLIGHT_WTQLI_AC3")"
+
+if echo "$LOG_WTQLI_AC3" | grep -q "gate_resident=0  small=1/5  unclassified_lane=1  big=0/2"; then
+  ok "AC3: small=1 unclassified_lane=1 — distinguished, not summed into small=2"
+else
+  bad "AC3 FAILED: expected 'small=1/5  unclassified_lane=1', got: $(echo "$LOG_WTQLI_AC3" | grep 'In-flight:')"
+fi
+
+if echo "$LOG_WTQLI_AC3" | grep -qE "Unclassified-lane in-flight: 1 bead.*wt-unclass1"; then
+  ok "AC2: unclassified occupant named by id in the warn line (Stale/Dead/Gate-resident pattern)"
+else
+  bad "AC2 FAILED: unclassified-lane warn line missing or doesn't name wt-unclass1 (got: $(echo "$LOG_WTQLI_AC3" | grep -i unclassified))"
+fi
+
+if echo "$LOG_WTQLI_AC3" | grep -qE "Unclassified-lane in-flight:.*wt-small1"; then
+  bad "AC3 REGRESSION: the explicitly-classified lane:small bead (wt-small1) was wrongly counted as unclassified"
+else
+  ok "AC3 control: the explicitly-classified lane:small bead is NOT named in the unclassified warn"
+fi
+
+# AC5 control: SMALL_SLOTS (the actual dispatch cap arithmetic) must be
+# byte-identical to pre-ga-wtqli behavior — an unclassified bead STILL
+# consumes a small-lane slot exactly as before; only the LOG breakdown
+# changed. 5 small slots, 2 occupants (wt-small1 + wt-unclass1, both count
+# against the cap) → 3 free. A behavior-changing "fix" would show 4 free.
+if echo "$LOG_WTQLI_AC3" | grep -q "Available slots: small=3"; then
+  ok "AC5: dispatch cap unchanged — unclassified bead still consumes a small slot (3/5 free, not 4/5)"
+else
+  bad "AC5 FAILED: dispatch behavior changed (expected 'Available slots: small=3', got: $(echo "$LOG_WTQLI_AC3" | grep 'Available slots'))"
+fi
+
+# AC4: control invariant — small + big + unclassified_lane must equal the
+# live in-flight total minus gate_resident EXACTLY, with no bead evaporating
+# or duplicating, on a fixture that exercises all four categories at once.
+echo "Scenario ga-wtqli AC4: control invariant holds across gate-resident + big + small + unclassified together"
+INFLIGHT_WTQLI_AC4='[
+  {"id":"wt4-gate1","labels":["story:in-flight","gate:queued"]},
+  {"id":"wt4-gate2","labels":["story:in-flight","gate:reviewing"]},
+  {"id":"wt4-big1","labels":["story:in-flight","lane:big"]},
+  {"id":"wt4-small1","labels":["story:in-flight","lane:small"]},
+  {"id":"wt4-small2","labels":["story:in-flight","lane:small"]},
+  {"id":"wt4-unclass1","labels":["story:in-flight"]},
+  {"id":"wt4-unclass2","labels":["story:in-flight"]},
+  {"id":"wt4-unclass3","labels":["story:in-flight"]}
+]'
+LOG_WTQLI_AC4="$(run_capacity 10 "$INFLIGHT_WTQLI_AC4")"
+INFLIGHT_LINE_AC4="$(echo "$LOG_WTQLI_AC4" | grep 'In-flight:' | head -1)"
+LIVE_AC4="$(echo "$INFLIGHT_LINE_AC4" | grep -oE 'live=[0-9]+' | cut -d= -f2)"
+GR_AC4="$(echo "$INFLIGHT_LINE_AC4" | grep -oE 'gate_resident=[0-9]+' | cut -d= -f2)"
+SMALL_AC4="$(echo "$INFLIGHT_LINE_AC4" | grep -oE 'small=[0-9]+' | cut -d= -f2)"
+UNCLASS_AC4="$(echo "$INFLIGHT_LINE_AC4" | grep -oE 'unclassified_lane=[0-9]+' | cut -d= -f2)"
+BIG_AC4="$(echo "$INFLIGHT_LINE_AC4" | grep -oE 'big=[0-9]+' | cut -d= -f2)"
+
+if [ "$LIVE_AC4" = "8" ] && [ "$GR_AC4" = "2" ] && [ "$SMALL_AC4" = "2" ] && [ "$UNCLASS_AC4" = "3" ] && [ "$BIG_AC4" = "1" ]; then
+  ok "AC4 precondition: fixture read live=8 gate_resident=2 small=2 unclassified_lane=3 big=1 (2 gate + 1 big + 2 small + 3 unclassified)"
+else
+  bad "AC4 precondition FAILED: got live=$LIVE_AC4 gate_resident=$GR_AC4 small=$SMALL_AC4 unclassified_lane=$UNCLASS_AC4 big=$BIG_AC4 (expected 8/2/2/3/1)"
+fi
+
+SUM_AC4=$((SMALL_AC4 + BIG_AC4 + UNCLASS_AC4 + GR_AC4))
+if [ "$SUM_AC4" = "$LIVE_AC4" ]; then
+  ok "AC4: small($SMALL_AC4) + big($BIG_AC4) + unclassified_lane($UNCLASS_AC4) + gate_resident($GR_AC4) = $SUM_AC4 == live($LIVE_AC4) — no bead evaporated or duplicated"
+else
+  bad "AC4 FAILED: categories don't partition the live set (small=$SMALL_AC4 big=$BIG_AC4 unclassified_lane=$UNCLASS_AC4 gate_resident=$GR_AC4 sum=$SUM_AC4 != live=$LIVE_AC4)"
 fi
 
 has "$DISPATCHER" '_filter_built()'                        "_filter_built helper defined (HOL-block layer 2)"
