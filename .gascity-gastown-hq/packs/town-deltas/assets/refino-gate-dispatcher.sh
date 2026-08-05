@@ -258,10 +258,19 @@ refino_slot_action() {
 #   INICIADA SÓ POR ESTAR APROVADA NO FUNIL") became dispatchable: promotion
 #   silently wiped its story:blocked guard. Add-then-remove instead: every
 #   unrelated label survives, and only the gate's own input label is retired.
+#   Gate re-dispatch (fix attempt 1/3): a prior version of this helper issued
+#   the add and remove as two INDEPENDENT `bd_ label` calls, each swallowing
+#   its own error via `|| true`. If the add succeeded but the remove failed
+#   (or vice versa, e.g. a transient Dolt hiccup between the two OS-level
+#   invocations), the bead could end up with BOTH labels or NEITHER — silently
+#   stranded, invisible to both the refino-review and needs-approval queues,
+#   while the caller's log/comment lines still claimed success. `bd update`
+#   supports `--add-label`/`--remove-label` as repeatable flags on ONE call
+#   (confirmed via `bd update --help`), so the add and remove land in a single
+#   invocation instead of two independently-failable ones.
 _refino_gate_relabel() {
   local sid="$1" target="$2"
-  bd_ label add "$sid" "$target" -q 2>/dev/null || true
-  bd_ label remove "$sid" "story:refino-review" -q 2>/dev/null || true
+  bd_ update "$sid" --add-label "$target" --remove-label "story:refino-review" -q 2>/dev/null || true
 }
 
 # If sourced by the selftest, stop here — expose the pure functions only.

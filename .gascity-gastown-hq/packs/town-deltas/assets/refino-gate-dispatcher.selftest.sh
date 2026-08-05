@@ -21,7 +21,8 @@
 #        → drift-guard 4 (claim adds refino-gate:reviewing, keeps story:refino-review).
 #   AC "promoção/bounce/escalação preservam labels qualificadoras" (ga-xvxvf)
 #        → drift-guards 2b (no --set-labels regression), 2c (input label retired,
-#          no accumulation).
+#          no accumulation), 2d (single atomic bd_ call — no split-failure window,
+#          ga-xvxvf gate re-dispatch fix attempt 1), 2e (fixture proof of all three).
 #   Timeout safety → Scenario 6 (TIMEOUT/unknown → requeue, never promote, no round burn).
 #
 # Exit 0 iff every assertion holds.
@@ -164,28 +165,56 @@ fi
 #     _refino_gate_relabel must explicitly retire the gate's own input label
 #     (story:refino-review) on every transition, or a promoted/bounced bead
 #     would keep BOTH the old and new lifecycle label forever.
-if grep -q 'bd_ label remove "\$sid" "story:refino-review"' "$DISPATCHER"; then
+if grep -q -- '--remove-label "story:refino-review"' "$DISPATCHER"; then
   ok "relabel helper explicitly retires the gate's own input label (no accumulation)"
 else
   bad "relabel helper does not retire story:refino-review — risk of label accumulation"
 fi
 
-# 2d. Fixture proof (ga-xvxvf AC, both named fixtures combined): a bead entering
-#     promotion with guard/qualifier labels (story:blocked, area:infra,
+# 2d. ga-xvxvf GATE RE-DISPATCH REGRESSION GUARD (fix attempt 1/3): the add and
+#     the remove must land in ONE atomic `bd_ update` call, not two independent
+#     `bd_ label add` / `bd_ label remove` calls. Two independent calls each
+#     swallow their own error via `|| true` with no check that the first
+#     succeeded before the second runs — if one lands and the other doesn't
+#     (transient Dolt hiccup, concurrent writer racing the same bead row, both
+#     routine in this town), the bead ends up with BOTH labels or NEITHER:
+#     stranded, invisible to every queue, while the caller's log/comment lines
+#     still claim success. This is a WORSE failure mode than the --set-labels
+#     bug 2b/2c guard against.
+if grep -q 'bd_ label add "\$sid"' "$DISPATCHER" || grep -q 'bd_ label remove "\$sid"' "$DISPATCHER"; then
+  bad "REGRESSION (ga-xvxvf re-dispatch): relabel helper issues split bd_ label add/remove calls — reintroduces the split-failure race; use one bd_ update --add-label/--remove-label call"
+else
+  ok "relabel helper issues a single atomic bd_ update call (no split-failure window, ga-xvxvf re-dispatch)"
+fi
+
+# 2e. Fixture proof (ga-xvxvf AC, all three guards above combined): a bead
+#     entering promotion with guard/qualifier labels (story:blocked, area:infra,
 #     lane:small, pilot:no-auto-dispatch) alongside the gate's input label must
 #     exit with ONLY story:refino-review removed and story:needs-approval added
-#     — every unrelated label untouched. Exercised against the REAL helper
-#     (sourced from the dispatcher, lib mode), with `bd_` stubbed to mutate an
-#     in-memory label set instead of hitting live Dolt.
+#     — every unrelated label untouched — via EXACTLY ONE underlying bd_ call
+#     (proves the add+remove cannot partially fail). Exercised against the REAL
+#     helper (sourced from the dispatcher, lib mode), with `bd_` stubbed to
+#     mutate an in-memory label set instead of hitting live Dolt.
 LABELS="story:refino-review,story:blocked,area:infra,lane:small,pilot:no-auto-dispatch"
+BD_CALL_COUNT=0
 bd_() {
-  case "$1 $2" in
-    "label add") LABELS="$LABELS,$4" ;;
-    "label remove") LABELS=$(echo ",$LABELS," | sed "s/,$4,/,/" | sed 's/^,//;s/,$//') ;;
-  esac
+  BD_CALL_COUNT=$((BD_CALL_COUNT + 1))
+  [ "$1" = "update" ] || return 0
+  shift 2  # drop "update" and the story id — only the flags matter here
+  local add_label="" remove_label=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --add-label) add_label="$2"; shift 2 ;;
+      --remove-label) remove_label="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$add_label" ] && LABELS="$LABELS,$add_label"
+  [ -n "$remove_label" ] && LABELS=$(echo ",$LABELS," | sed "s/,$remove_label,/,/" | sed 's/^,//;s/,$//')
 }
 STORY_ID="fixture-bead"
 _refino_gate_relabel "$STORY_ID" story:needs-approval
+[ "$BD_CALL_COUNT" -eq 1 ] && ok "fixture: relabel issues exactly ONE bd_ call (atomic — no split-failure window)" || bad "REGRESSION (ga-xvxvf re-dispatch): relabel issued $BD_CALL_COUNT bd_ calls, not 1"
 case ",$LABELS," in *,story:refino-review,*) bad "fixture: story:refino-review survived promotion (should be retired)" ;; *) ok "fixture: story:refino-review retired on promotion" ;; esac
 case ",$LABELS," in *,story:needs-approval,*) ok "fixture: story:needs-approval added on promotion" ;; *) bad "fixture: story:needs-approval missing after promotion" ;; esac
 for guard in story:blocked area:infra lane:small pilot:no-auto-dispatch; do
