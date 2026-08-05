@@ -755,7 +755,12 @@ bead_targets_beads_repo() {
         ((.labels // []) | join(" ")) ] | join("  ")
     ' 2>/dev/null || echo "")
   [ -z "$hay" ] && { echo ""; return 0; }
-  if printf '%s' "$hay" | grep -iqE 'steveyegge/beads|gastownhall/beads|athosmartins/beads|\bgt/beads\b|\bbeads repo\b|\bbeads-repo\b'; then
+  # ga-yn5w8: added bd-binary-separate-from-gascity-engine — the HQ memory slug
+  # that IS the beads-CLI/gascity-engine distinction, cited verbatim by bugs
+  # that describe the beads-repo symptom in "bd binary" terms instead of
+  # naming the repo. Same false-positive profile as the six literals above:
+  # a specific, narrow, stable compound string, not a bare "bd"/"beads" mention.
+  if printf '%s' "$hay" | grep -iqE 'steveyegge/beads|gastownhall/beads|athosmartins/beads|\bgt/beads\b|\bbeads repo\b|\bbeads-repo\b|\bbd-binary-separate-from-gascity-engine\b'; then
     echo "1"; return 0
   fi
   echo ""
