@@ -136,9 +136,11 @@ task_reconciler_verdict() {
   echo "keep:merge-not-verified"
 }
 
-# _gate_delivery_list_run <text> <line_regex> <label> — ga-zhfk8. Mirrors
-# quality-gate-guard.sh's copy VERBATIM. See that copy for the full
-# rationale; kept in sync by inspection.
+# _gate_delivery_list_run <text> <line_regex> <label> — ga-zhfk8 (tightened
+# again in fix attempt 2: tolerate indented wrapped-continuation lines, see
+# quality-gate-guard.sh for the full rationale). Mirrors quality-gate-guard.sh's
+# copy VERBATIM. See that copy for the full rationale; kept in sync by
+# inspection.
 _gate_delivery_list_run() {
   local text="$1" pattern="$2" label="$3" line
   local run="" run_n=0 best="" best_n=0
@@ -146,6 +148,9 @@ _gate_delivery_list_run() {
     if printf '%s\n' "$line" | grep -Eq "$pattern"; then
       run="${run}${line}"$'\n'
       run_n=$((run_n + 1))
+    elif printf '%s' "$line" | grep -Eq '^[[:space:]]+[^[:space:]]'; then
+      : # indented, non-blank, non-matching: wrapped continuation of the
+        # current item's text — does not break the run, not counted.
     else
       if [ "$run_n" -gt "$best_n" ]; then best="$run"; best_n=$run_n; fi
       run=""; run_n=0

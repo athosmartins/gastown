@@ -451,11 +451,28 @@ session_matches_author() {
 
 # _gate_delivery_list_run <text> <line_regex> <label>
 # ga-zhfk8: structural half of gate_delivery_looks_partial. Finds the longest
-# run of >=3 CONSECUTIVE lines (no gap) in <text> that each match <line_regex>
-# anchored at the start of the line. On a qualifying run, prints "detectei
-# (<label>):" followed by the matched lines — so a caller can quote real
+# run of >=3 lines in <text> that each match <line_regex> anchored at the
+# start of the line, tolerating INDENTED non-matching lines in between as
+# wrapped continuations of the previous item's text (e.g. "1. foo,\n   bar."
+# — a realistic way to write a deliverables list, not just one line per
+# item). A line that is blank, OR non-blank but NOT indented (flush-left
+# prose — a new paragraph/sentence, not a continuation of the item above),
+# ends the run instead. On a qualifying run, prints "detectei (<label>):"
+# followed by the matched item-start lines — so a caller can quote real
 # evidence in the hold message instead of asserting without showing (ga-zhfk8
 # fix 3) — and returns 0. Prints nothing and returns 1 otherwise.
+#
+# ga-zhfk8 fix attempt 2 (gate-rejected attempt 1): a STRICT no-gap
+# consecutive-line requirement regressed on exactly this wrapped-item shape —
+# any non-matching line, including an indented continuation, reset the run to
+# zero, so a genuine 3-item list where each item's rationale wraps to a
+# second line never reached the threshold (empirically confirmed by the
+# reviewer against this file's pre-fix logic). The indented/flush-left
+# distinction restores that case without reopening the ORIGINAL bug this
+# backstop exists to fix: prose with scattered flush-left lines that merely
+# LOOK like list markers (see the "non-consecutive numbered refs in unrelated
+# prose" and wa-zlgye fixtures in the selftest) still does not accumulate a
+# run, because those in-between lines are not indented.
 _gate_delivery_list_run() {
   local text="$1" pattern="$2" label="$3" line
   local run="" run_n=0 best="" best_n=0
@@ -463,6 +480,9 @@ _gate_delivery_list_run() {
     if printf '%s\n' "$line" | grep -Eq "$pattern"; then
       run="${run}${line}"$'\n'
       run_n=$((run_n + 1))
+    elif printf '%s' "$line" | grep -Eq '^[[:space:]]+[^[:space:]]'; then
+      : # indented, non-blank, non-matching: wrapped continuation of the
+        # current item's text — does not break the run, not counted.
     else
       if [ "$run_n" -gt "$best_n" ]; then best="$run"; best_n=$run_n; fi
       run=""; run_n=0
@@ -493,9 +513,13 @@ EOF
 # TOKEN anywhere in the text, no list structure required at all — common
 # words in this city's technical Portuguese, and the actual root cause of the
 # wa-zlgye false positive. v2 (ga-zhfk8) drops that standalone-token trigger
-# entirely and requires genuine list STRUCTURE: >=3 CONSECUTIVE lines (no
-# gap), each starting with "N. " (1-2 digit number) or "x. " (single
-# lowercase letter). On a match it prints the detected lines to stdout (see
+# entirely and requires genuine list STRUCTURE: >=3 lines each starting with
+# "N. " (1-2 digit number) or "x. " (single lowercase letter), tolerating
+# indented wrapped-continuation lines between them but not flush-left prose
+# or blank-line paragraph breaks (see _gate_delivery_list_run — tightened
+# again in ga-zhfk8 fix attempt 2 after gate review found the first attempt's
+# strict no-gap requirement false-negatived on multi-line list items). On a
+# match it prints the detected item lines to stdout (see
 # _gate_delivery_list_run) for the caller to quote in the hold message.
 #
 # False positives on genuine list structure are still the accepted/cheap

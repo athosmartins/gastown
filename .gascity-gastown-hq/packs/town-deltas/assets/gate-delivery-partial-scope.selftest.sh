@@ -2,18 +2,25 @@
 # gate-delivery-partial-scope.selftest.sh (ga-k2wjn, tightened by ga-zhfk8)
 #
 # Proves the ga-k2wjn fix: a gate PASS on a bug/task bead whose body enumerates
-# multiple approved deliverables (>=3 CONSECUTIVE numbered or lettered list
-# items, anchored at line start) is held as delivery:partial + escalated to
-# Mayor instead of auto-closed. "The gate approved the diff" and "the bead's
-# full scope is done" are different claims — three real incidents (wa-uhbqb,
+# multiple approved deliverables (>=3 numbered or lettered list items,
+# anchored at line start) is held as delivery:partial + escalated to Mayor
+# instead of auto-closed. "The gate approved the diff" and "the bead's full
+# scope is done" are different claims — three real incidents (wa-uhbqb,
 # wa-a7e98, wa-k0m1q) conflated them and silently dropped the remaining scope.
 #
 # ga-zhfk8 (measured 2026-08-04): v1 also held wa-zlgye — a LEGITIMATE merge —
 # because it fired on the bare word "fatia"/"fatias"/"itens aprovados"
 # ANYWHERE in prose, no list structure required at all. v2 drops that
-# standalone-token trigger, requires a genuine CONSECUTIVE run (not just >=3
-# matching lines anywhere in the text), and prints the detected lines so the
-# hold message can CITE them instead of asserting without showing.
+# standalone-token trigger, requires a genuine run (not just >=3 matching
+# lines anywhere in the text), and prints the detected lines so the hold
+# message can CITE them instead of asserting without showing.
+#
+# ga-zhfk8 fix attempt 2 (gate-rejected attempt 1): a STRICT no-gap
+# consecutive-line run false-negatived on realistic multi-line (wrapped) list
+# items — see the WRAPPED_ITEMS fixture below. Fix attempt 2 tolerates
+# INDENTED non-matching lines (wrapped continuations) inside a run without
+# reopening the original bug: a BLANK line or FLUSH-LEFT non-matching line
+# (unrelated prose, not a continuation) still ends the run, same as before.
 #
 # WHAT it guards:
 #   - gate_delivery_looks_partial() (quality-gate-guard.sh): the pure heuristic,
@@ -96,10 +103,29 @@ rc1 gate_delivery_looks_partial "$(printf '1. only one item\n2. and a second\n')
 rc0 gate_delivery_looks_partial "$(printf 'Fix the thing.\n1. first\n2. second\n3. third\n')"        # 3 numbered items
 rc0 gate_delivery_looks_partial "$(printf 'a. socios\nb. datas\nc. permeabilidades\nd. anuncio\n')"  # lettered list
 
-# ga-zhfk8: >=3 numbered lines that are NOT consecutive (real prose between
-# them) must NOT trigger. v1 counted matching lines anywhere in the text —
-# exactly the gap that let it over-fire; v2 requires a genuine run.
+# ga-zhfk8: >=3 numbered lines separated by unrelated FLUSH-LEFT prose (a new
+# sentence/paragraph, not a continuation of the item above) must NOT trigger.
+# v1 counted matching lines anywhere in the text — exactly the gap that let
+# it over-fire; v2 requires a genuine run; fix attempt 2 (below) narrows what
+# breaks a run from "any non-matching line" to "blank or flush-left
+# non-matching line" specifically, so this must still NOT trigger.
 rc1 gate_delivery_looks_partial "$(printf '1. first item discussed here.\nSome unrelated paragraph explains context in between.\n2. second item, mentioned much later.\nAnother unrelated paragraph follows.\n3. third item, in passing.\n')"
+
+# ga-zhfk8 fix attempt 2 (gate-rejected attempt 1, GATE-FEEDBACK 2026-08-05
+# 06:35): attempt 1's STRICT no-gap consecutive-line requirement regressed on
+# realistic multi-line (wrapped) list items — a common way to write a
+# deliverables list, arguably more common than terse one-liners. Reviewer's
+# own adversarial fixture (embedded verbatim, translated from the gate
+# comment): a 3-item numbered list where each item's rationale wraps to an
+# INDENTED second line. Attempt 1 flagged this as NOT partial (false
+# negative — regressed the exact bug this backstop exists to stop); it MUST
+# trigger. Distinguishing signal from the flush-left-prose fixture directly
+# above: continuation lines here are indented (hang under the item text),
+# those are not.
+WRAPPED_ITEMS="$(printf '1. Corrigir o timeout no endpoint X - esta causando falhas ha 2 semanas,\n   afetando mais de 500 usuarios por dia.\n2. Adicionar validacao no campo Y - sem isso, dados corrompidos continuam\n   entrando no banco.\n3. Atualizar a documentacao do endpoint Z.\n')"
+rc0 gate_delivery_looks_partial "$WRAPPED_ITEMS"
+out_has "1. Corrigir o timeout" -- gate_delivery_looks_partial "$WRAPPED_ITEMS"
+out_has "3. Atualizar a documentacao" -- gate_delivery_looks_partial "$WRAPPED_ITEMS"
 
 # ga-zhfk8 (measured 2026-08-04, wa-zlgye false positive): v1 held a bead on
 # the bare word "fatia"/"fatias"/"itens aprovados" ANYWHERE in prose, with
