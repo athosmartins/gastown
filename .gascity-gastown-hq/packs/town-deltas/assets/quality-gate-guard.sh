@@ -480,6 +480,26 @@ session_matches_author() {
   fi
 }
 
+# _gate_delivery_header_class <line> — ga-1yxyt: classifies a single candidate
+# section-header line as "scope" (a SCOPE/WORK header: FIX PEDIDO,
+# ENTREGAVEIS, ESCOPO, CRITERIO DE ACEITE, O QUE FAZER), "diagnostic" (a
+# DIAGNOSTIC/OBSERVATION header: O CICLO, A CADEIA, SINTOMA, A MEDICAO, O
+# DEFEITO, EVIDENCIA, COMO ACONTECE), or "unknown" (neither recognized).
+# Case- and accent-insensitive: this city's bug reports mix
+# "CRITÉRIO"/"CRITERIO", "MEDIÇÃO"/"MEDICAO" freely depending on author.
+_gate_delivery_header_class() {
+  local norm
+  norm=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]' \
+    | sed -e 's/[ÁÀÂÃ]/A/g; s/[ÉÊ]/E/g; s/[ÍÎ]/I/g; s/[ÓÔÕ]/O/g; s/[ÚÛ]/U/g; s/Ç/C/g')
+  if printf '%s' "$norm" | grep -Eq 'FIX PEDIDO|ENTREGAVEIS|ESCOPO|CRITERIO DE ACEITE|O QUE FAZER'; then
+    echo "scope"; return 0
+  fi
+  if printf '%s' "$norm" | grep -Eq 'O CICLO|A CADEIA|SINTOMA|A MEDICAO|O DEFEITO|EVIDENCIA|COMO ACONTECE'; then
+    echo "diagnostic"; return 0
+  fi
+  echo "unknown"
+}
+
 # _gate_delivery_list_run <text> <line_regex> <label>
 # ga-zhfk8: structural half of gate_delivery_looks_partial. Finds the longest
 # run of >=3 lines in <text> that each match <line_regex> anchored at the
@@ -504,24 +524,48 @@ session_matches_author() {
 # LOOK like list markers (see the "non-consecutive numbered refs in unrelated
 # prose" and wa-zlgye fixtures in the selftest) still does not accumulate a
 # run, because those in-between lines are not indented.
+#
+# ga-1yxyt: a qualifying run only counts toward `best` if the nearest
+# preceding flush-left, non-blank line (the run's "header", tracked via
+# `pending_header` — blank lines are skipped over, indented continuation
+# lines never touch it) does NOT classify as "diagnostic" via
+# _gate_delivery_header_class. This is the fix for ga-o5de8: a numbered list
+# under "O CICLO:" describes the 3-step DEADLOCK being reported, not 3
+# approved deliverables — v2 (ga-zhfk8) found the list structure correctly
+# but had no notion of what the list was FOR. A "scope" header or no
+# recognizable header at all (fail-safe — see ga-1yxyt's own AC) both still
+# count, same as before this fix; only a confirmed "diagnostic" header newly
+# excludes a run. Excluding a run does not zero it out silently — a LONGER
+# diagnostic run yields the slot to a SHORTER qualifying one found elsewhere
+# in the same text, so a real partial-scope list past a diagnostic section
+# is still caught.
 _gate_delivery_list_run() {
   local text="$1" pattern="$2" label="$3" line
   local run="" run_n=0 best="" best_n=0
+  local run_header="" pending_header=""
   while IFS= read -r line; do
     if printf '%s\n' "$line" | grep -Eq "$pattern"; then
+      [ "$run_n" -eq 0 ] && run_header="$pending_header"
       run="${run}${line}"$'\n'
       run_n=$((run_n + 1))
     elif printf '%s' "$line" | grep -Eq '^[[:space:]]+[^[:space:]]'; then
       : # indented, non-blank, non-matching: wrapped continuation of the
-        # current item's text — does not break the run, not counted.
+        # current item's text — does not break the run, not counted, and
+        # (ga-1yxyt) never updates pending_header — a continuation is part
+        # of the item's own text, not a new section header.
     else
-      if [ "$run_n" -gt "$best_n" ]; then best="$run"; best_n=$run_n; fi
-      run=""; run_n=0
+      if [ "$run_n" -gt "$best_n" ] && [ "$(_gate_delivery_header_class "$run_header")" != "diagnostic" ]; then
+        best="$run"; best_n=$run_n
+      fi
+      run=""; run_n=0; run_header=""
+      [ -n "$line" ] && pending_header="$line"
     fi
   done <<EOF
 $text
 EOF
-  if [ "$run_n" -gt "$best_n" ]; then best="$run"; best_n=$run_n; fi
+  if [ "$run_n" -gt "$best_n" ] && [ "$(_gate_delivery_header_class "$run_header")" != "diagnostic" ]; then
+    best="$run"; best_n=$run_n
+  fi
   [ "$best_n" -ge 3 ] || return 1
   printf 'detectei (%s):\n%s' "$label" "$best"
   return 0
@@ -558,6 +602,18 @@ EOF
 # false negatives silently drop approved work, which is the bug this exists
 # to stop. Returns 0 (true, evidence on stdout) iff it looks partial; 1
 # (false, nothing on stdout) otherwise.
+#
+# v3 (ga-1yxyt, measured 2026-08-05, ga-o5de8 false positive): v2 found list
+# STRUCTURE correctly but not what the list was FOR — ga-o5de8's "O CICLO:"
+# section numbers the 3 steps of the DEADLOCK being reported, not 3 approved
+# deliverables, and got held anyway. v3 has _gate_delivery_list_run classify
+# the header immediately preceding a run (see _gate_delivery_header_class)
+# and skip runs headed by a DIAGNOSTIC/OBSERVATION label (O CICLO, A CADEIA,
+# SINTOMA, A MEDICAO, O DEFEITO, EVIDENCIA, COMO ACONTECE). A SCOPE/WORK
+# header (FIX PEDIDO, ENTREGAVEIS, ESCOPO, CRITERIO DE ACEITE, O QUE FAZER)
+# or no recognizable header at all still counts — fail-safe unchanged from
+# v1/v2: retaining too much costs a human review, retaining too little
+# silently drops scope, so an unclassifiable header must keep retaining.
 gate_delivery_looks_partial() {
   local text="${1:-}"
   _gate_delivery_list_run "$text" '^[[:space:]]*[0-9]{1,2}\.[[:space:]]' 'lista numerada' && return 0

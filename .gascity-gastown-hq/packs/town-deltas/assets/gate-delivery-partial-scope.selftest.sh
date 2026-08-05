@@ -213,6 +213,71 @@ genuíno e falha de transcrição precisam ser estados DIFERENTES no JSON — ho
 (eu, no /peter-review) não tem como distinguir.'
 rc1 gate_delivery_looks_partial "$WA_ZLGYE"
 
+# ── 2b. ga-1yxyt: header-aware run classification ──────────────────────────
+# v2 (ga-zhfk8) found list STRUCTURE but had no notion of what a list was
+# FOR. ga-o5de8 passed the gate, merged, and was STILL held as
+# delivery:partial: its ">=3 numbered lines" were the "O CICLO:" section
+# describing the 3-step DEADLOCK being reported, not 3 approved deliverables.
+# v3 skips a run whose nearest preceding header classifies as
+# DIAGNOSTIC/OBSERVATION; a SCOPE/WORK header or no recognizable header at
+# all must still count (fail-safe unchanged).
+echo "── 2b. ga-1yxyt: header-aware run classification ──"
+
+# AC #1 (falsifiable, ga-1yxyt): ga-o5de8 verbatim (`bd show ga-o5de8`
+# .description, 2026-08-05 — .notes was empty). "O CICLO:" numbers the
+# deadlock's 3 steps (must NOT count); "FIX PEDIDO:"/"CRITÉRIO DE ACEITE:"
+# use inline "(a)/(b)" and "· " bullets, neither of which is list STRUCTURE
+# by this heuristic's own line-start rule, so this fixture also proves the
+# fix doesn't depend on those sections lacking real content — they simply
+# never formed a qualifying run in the first place. Must NOT hold.
+GA_O5DE8='REPORTADO por digo-wa 05/08, com o ciclo mapeado e a saída que ele usou.
+
+O CICLO:
+1. O reconciler do ga-k2wjn aplica park:needs-human em bead com gate:passed cujo corpo
+   enumera vários entregáveis e que não tem scope_covered:all.
+2. O autor NÃO PODE marcar scope_covered:all se um item realmente não foi entregue —
+   marcar seria mentir, e é o que a retenção existe para impedir.
+3. O gate RECUSA mergear branch cujo source-bead está parked.
+=> Se o item que falta está numa branch pendente do MESMO bead, ele NUNCA mergeia: o park
+   impede o merge que removeria o park.
+
+⚠️ É um deadlock introduzido por um mecanismo que EU pedi (ga-k2wjn). Ele resolve um
+problema real (4 casos de escopo parcial pegos), mas criou este. Não desligar — consertar.
+
+FIX PEDIDO: a retenção por escopo não pode bloquear o merge de uma branch que ENTREGA um
+dos itens faltantes. Opções: (a) o park vetar só o FECHAMENTO da bead, não o merge das
+branches; (b) permitir merge quando a branch declara qual item do escopo ela cobre.
+
+CRITÉRIO DE ACEITE:
+· Bead parked por escopo parcial + branch nova que entrega o item faltante -> MERGEIA.
+· CONTROLE: bead parked + branch que NÃO entrega nada do escopo -> continua barrada.
+· A bead só FECHA quando o escopo estiver coberto (o valor original do ga-k2wjn preservado).'
+rc1 gate_delivery_looks_partial "$GA_O5DE8"
+
+# AC #2 (control — the ga-k2wjn value must not be lost): WA_UHBQB above
+# (real ga-k2wjn true-positive) already proves a genuine SCOPE-headed list
+# ("ESCOPO" directly preceding the a.-i. run) keeps holding. Direct fixture
+# for the "FIX PEDIDO"/"CRITERIO DE ACEITE" vocabulary specifically, since
+# ga-o5de8 (above) shows those headers WITHOUT list structure — this shows
+# them WITH it, so the header vocabulary itself isn't what's being rejected:
+FIX_PEDIDO_WITH_LIST="$(printf 'FIX PEDIDO:\n1. Corrigir o parser de datas.\n2. Adicionar teste de regressao.\n3. Atualizar o changelog.\n')"
+rc0 gate_delivery_looks_partial "$FIX_PEDIDO_WITH_LIST"
+
+# AC #3 (fail-safe, falsifiable): a numbered list under a header that is
+# NEITHER recognized vocabulary must still retain — "não consegui
+# classificar" and "classifiquei como descrição" cannot produce the same
+# result as "classifiquei como diagnóstico".
+UNKNOWN_HEADER_LIST="$(printf 'ALGUMA SECAO SEM NOME RECONHECIVEL:\n1. item um\n2. item dois\n3. item tres\n')"
+rc0 gate_delivery_looks_partial "$UNKNOWN_HEADER_LIST"
+
+# Exclusion isn't a blanket "stop at the first diagnostic run": a LONGER
+# diagnostic-headed run must yield the `best` slot to a SHORTER qualifying
+# (scope-headed) run found later in the same text — a real partial-scope
+# list past a diagnostic section must still be caught.
+DIAGNOSTIC_THEN_SCOPE="$(printf 'SINTOMA:\n1. primeiro sintoma observado\n2. segundo sintoma observado\n3. terceiro sintoma observado\n4. quarto sintoma observado\n\nENTREGAVEIS:\n1. corrigir o parser\n2. adicionar teste\n3. atualizar doc\n')"
+rc0 gate_delivery_looks_partial "$DIAGNOSTIC_THEN_SCOPE"
+out_has "corrigir o parser" -- gate_delivery_looks_partial "$DIAGNOSTIC_THEN_SCOPE"
+
 # ── 3. Control: a normal, single-scope bug (the common case) is unaffected ─
 echo "── 3. Control: normal single-item bug body ──"
 NORMAL_BUG='O botão X não responde ao clique no mobile.

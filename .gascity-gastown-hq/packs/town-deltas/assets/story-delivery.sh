@@ -136,36 +136,63 @@ task_reconciler_verdict() {
   echo "keep:merge-not-verified"
 }
 
+# _gate_delivery_header_class <line> — ga-1yxyt. Mirrors
+# quality-gate-guard.sh's copy VERBATIM. See that copy for the full
+# rationale; kept in sync by inspection.
+_gate_delivery_header_class() {
+  local norm
+  norm=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]' \
+    | sed -e 's/[ÁÀÂÃ]/A/g; s/[ÉÊ]/E/g; s/[ÍÎ]/I/g; s/[ÓÔÕ]/O/g; s/[ÚÛ]/U/g; s/Ç/C/g')
+  if printf '%s' "$norm" | grep -Eq 'FIX PEDIDO|ENTREGAVEIS|ESCOPO|CRITERIO DE ACEITE|O QUE FAZER'; then
+    echo "scope"; return 0
+  fi
+  if printf '%s' "$norm" | grep -Eq 'O CICLO|A CADEIA|SINTOMA|A MEDICAO|O DEFEITO|EVIDENCIA|COMO ACONTECE'; then
+    echo "diagnostic"; return 0
+  fi
+  echo "unknown"
+}
+
 # _gate_delivery_list_run <text> <line_regex> <label> — ga-zhfk8 (tightened
-# again in fix attempt 2: tolerate indented wrapped-continuation lines, see
+# again in fix attempt 2: tolerate indented wrapped-continuation lines;
+# ga-1yxyt: skip runs headed by a DIAGNOSTIC/OBSERVATION label, see
 # quality-gate-guard.sh for the full rationale). Mirrors quality-gate-guard.sh's
 # copy VERBATIM. See that copy for the full rationale; kept in sync by
 # inspection.
 _gate_delivery_list_run() {
   local text="$1" pattern="$2" label="$3" line
   local run="" run_n=0 best="" best_n=0
+  local run_header="" pending_header=""
   while IFS= read -r line; do
     if printf '%s\n' "$line" | grep -Eq "$pattern"; then
+      [ "$run_n" -eq 0 ] && run_header="$pending_header"
       run="${run}${line}"$'\n'
       run_n=$((run_n + 1))
     elif printf '%s' "$line" | grep -Eq '^[[:space:]]+[^[:space:]]'; then
       : # indented, non-blank, non-matching: wrapped continuation of the
-        # current item's text — does not break the run, not counted.
+        # current item's text — does not break the run, not counted, and
+        # (ga-1yxyt) never updates pending_header — a continuation is part
+        # of the item's own text, not a new section header.
     else
-      if [ "$run_n" -gt "$best_n" ]; then best="$run"; best_n=$run_n; fi
-      run=""; run_n=0
+      if [ "$run_n" -gt "$best_n" ] && [ "$(_gate_delivery_header_class "$run_header")" != "diagnostic" ]; then
+        best="$run"; best_n=$run_n
+      fi
+      run=""; run_n=0; run_header=""
+      [ -n "$line" ] && pending_header="$line"
     fi
   done <<EOF
 $text
 EOF
-  if [ "$run_n" -gt "$best_n" ]; then best="$run"; best_n=$run_n; fi
+  if [ "$run_n" -gt "$best_n" ] && [ "$(_gate_delivery_header_class "$run_header")" != "diagnostic" ]; then
+    best="$run"; best_n=$run_n
+  fi
   [ "$best_n" -ge 3 ] || return 1
   printf 'detectei (%s):\n%s' "$label" "$best"
   return 0
 }
 
-# gate_delivery_looks_partial <bead_text> — ga-k2wjn, tightened by ga-zhfk8.
-# Mirrors quality-gate-guard.sh's copy VERBATIM (one proven heuristic, not a
+# gate_delivery_looks_partial <bead_text> — ga-k2wjn, tightened by ga-zhfk8,
+# then by ga-1yxyt (header-aware run classification). Mirrors
+# quality-gate-guard.sh's copy VERBATIM (one proven heuristic, not a
 # second one to drift — same discipline as the rig_gitdir-adjacent helpers
 # above). See that copy for the full rationale; kept in sync by inspection.
 gate_delivery_looks_partial() {
