@@ -92,6 +92,9 @@ mkdir -p "$SHIMBIN" "$FIXCITY/.gc/logs" "$STATE"
 #                          dropped only when --exclude-label is actually passed
 #   FAKE_SUPPRESS_INFLIGHT =1 → `label add story:in-flight` is silently dropped
 #                          (simulates Dolt swallowing the write → never confirms)
+#   FAKE_SUPPRESS_LANE     =1 → `label add lane:*` is silently dropped (ga-05604.2:
+#                          same failure mode as FAKE_SUPPRESS_INFLIGHT, but for the
+#                          lane tag's own retry+verify loop)
 #   FAKE_SLING_STATUS      status returned for `show <…sling…>` (default open)
 #   FAKE_STORY_COMMENTS_JSON  JSON array returned for `comments <id> --json`
 #                          (ga-pd7j mayor-hold-grace seam; default [])
@@ -129,6 +132,16 @@ case "$args" in
     id="$(after add)"
     [ "${FAKE_SUPPRESS_INFLIGHT:-0}" = "1" ] || touch "$STATE/$id.inflight" 2>/dev/null || true
     : ;;
+  *"label add"*"lane:"*)
+    # ga-05604.2: track lane-label state the same way story:in-flight is
+    # tracked above, so the lane write's own retry+verify loop can be
+    # faithfully exercised. FAKE_SUPPRESS_LANE=1 simulates Dolt silently
+    # swallowing the write (write returns 0 but never lands) — the failure
+    # mode the retry loop exists to catch.
+    id="$(after add)"
+    lane_tok=$(printf '%s' "$args" | grep -oE 'lane:[A-Za-z0-9_-]+' | head -1)
+    [ "${FAKE_SUPPRESS_LANE:-0}" = "1" ] || { [ -n "$lane_tok" ] && printf '%s' "$lane_tok" > "$STATE/$id.lane" 2>/dev/null; }
+    : ;;
   *"label add"*pilot:dispatching*)
     touch "$STATE/$(after add).dispatching" 2>/dev/null || true ; : ;;
   *"label remove"*pilot:dispatching*)
@@ -136,7 +149,7 @@ case "$args" in
     rm -f "$STATE/$id.dispatching" 2>/dev/null || true
     echo "released $id" >> "$STATE/releases.log" 2>/dev/null || true ; : ;;
   *"label add"*|*"label remove"*)
-    : ;;          # other label ops (lane:*, pilot:dispatched, …) → no-op.
+    : ;;          # other label ops (pilot:dispatched, …) → no-op.
                   # NOTE: must match the 'label add/remove' SUBCOMMAND, not the
                   # '--exclude-label' flag that appears in the list queries below.
   *comments*)
@@ -159,6 +172,10 @@ case "$args" in
       *)
         lbls=""
         [ -f "$STATE/$id.inflight" ]    && lbls="\"story:in-flight\""
+        if [ -f "$STATE/$id.lane" ]; then
+          _lane_val="$(cat "$STATE/$id.lane" 2>/dev/null || echo "")"
+          [ -n "$_lane_val" ] && lbls="${lbls:+$lbls,}\"$_lane_val\""
+        fi
         [ -f "$STATE/$id.dispatching" ] && lbls="${lbls:+$lbls,}\"pilot:dispatching\""
         # ga-88g2: simulate a concurrent inflight-reclaim-guard escalation landing
         # gate:needs-human MID-DISPATCH — i.e. AFTER the ga-zzrts claim-verify's
@@ -477,8 +494,9 @@ run_neverstarted() {
 }
 
 # Runs a REAL (non-dry) dispatch of a single bug candidate through finalization.
-# Arg 1: FAKE_SUPPRESS_INFLIGHT (0|1). Sleep is zeroed so the retry loop is fast.
-run_real_dispatch() { # FAKE_SUPPRESS_INFLIGHT
+# Arg 1: FAKE_SUPPRESS_INFLIGHT (0|1). Arg 2: FAKE_SUPPRESS_LANE (0|1, ga-05604.2,
+# default 0). Sleep is zeroed so the retry loops are fast.
+run_real_dispatch() { # FAKE_SUPPRESS_INFLIGHT FAKE_SUPPRESS_LANE
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
@@ -493,6 +511,7 @@ run_real_dispatch() { # FAKE_SUPPRESS_INFLIGHT
     PILOT_INFLIGHT_SLEEP=0 \
     FAKE_BLOCKED_IDS="" \
     FAKE_SUPPRESS_INFLIGHT="$1" \
+    FAKE_SUPPRESS_LANE="${2:-0}" \
     FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
@@ -6379,6 +6398,66 @@ LABELCITE='[
 [ "$(_fc "$LABELCITE")" = '["bd-labelcite"]' ] \
   && ok "ga-w3vn3: label-name citation survives _filter_candidates (no false-positive); co-occurring rebuild request still vetoed" \
   || bad "ga-w3vn3: unexpected candidate set — false-positive not fixed or co-occurrence control regressed (got: $(_fc "$LABELCITE"))"
+
+# ── Scenario ga-05604.2: durable lane-label write does not gate claim release ──
+# Companion to Scenario 5 (ga-2azzj durable story:in-flight). Before this fix,
+# `lane:${LANE}` was a single fire-and-forget `label add ... || true` — no
+# retry, no verification — while story:in-flight right after it already had
+# both. A transient Dolt blip landing in that window silently dropped the lane
+# write while story:in-flight (which retried) typically survived the same
+# blip, leaving the bead durably story:in-flight with NO lane:* label.
+# Proves: (a) happy path — the lane write is retried+verified same as
+# in-flight, no false WARN; (b) failure injection — an unconfirmed lane write
+# logs a loud WARN but, UNLIKE an unconfirmed in-flight write, does NOT abort
+# the dispatch: story:in-flight still lands and pilot:dispatching still
+# releases (AC#2 — the builder may already be slung).
+echo "Scenario ga-05604.2-a: lane-label write is retried + verified same as story:in-flight (non-dry, happy path)"
+
+LOG_LANE_A="$(run_real_dispatch 0 0)"
+if [ -f "$STATE/tt-flight.lane" ] && [ -s "$STATE/tt-flight.lane" ]; then
+  ok "lane:* label was set and confirmed"
+else
+  bad "lane:* label was never set/confirmed on the happy path"
+fi
+if echo "$LOG_LANE_A" | grep -q "LANE WRITE UNCONFIRMED"; then
+  bad "happy path wrongly reported LANE WRITE UNCONFIRMED"
+else
+  ok "no false lane-write failure on the happy path"
+fi
+if [ -f "$STATE/tt-flight.inflight" ] && grep -q "released tt-flight" "$STATE/releases.log" 2>/dev/null; then
+  ok "story:in-flight still lands and claim still releases normally alongside the lane write"
+else
+  bad "REGRESSION: normal in-flight/claim-release behavior broke when the lane retry loop was added"
+fi
+
+echo "Scenario ga-05604.2-b: lane-write exhaustion WARNs but does NOT abort the dispatch (unlike in-flight exhaustion)"
+
+LOG_LANE_B="$(run_real_dispatch 0 1)"
+if echo "$LOG_LANE_B" | grep -q "LANE WRITE UNCONFIRMED on tt-flight"; then
+  ok "unconfirmed lane write → loud WARN naming the bead"
+else
+  bad "did not detect/announce the unconfirmed lane write"
+fi
+if [ -f "$STATE/tt-flight.lane" ]; then
+  bad "lane marker unexpectedly present despite FAKE_SUPPRESS_LANE=1 (shim seam broken)"
+else
+  ok "lane write genuinely did not land under suppression (shim seam correct)"
+fi
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  ok "story:in-flight STILL landed despite the lane write failing — dispatch was not aborted by the lane failure"
+else
+  bad "REGRESSION: story:in-flight did not land — an unconfirmed lane write incorrectly blocked the rest of dispatch"
+fi
+if grep -q "released tt-flight" "$STATE/releases.log" 2>/dev/null; then
+  ok "pilot:dispatching STILL released despite the lane write failing (lane failure is non-fatal, per AC#2)"
+else
+  bad "REGRESSION: claim was not released — an unconfirmed lane write incorrectly blocked claim release"
+fi
+if echo "$LOG_LANE_B" | grep -q "DURABLE-INFLIGHT FAILED"; then
+  bad "REGRESSION: lane-write failure alone triggered the (unrelated) DURABLE-INFLIGHT FAILED abort path"
+else
+  ok "lane-write failure did not cross-trigger the in-flight abort path"
+fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""

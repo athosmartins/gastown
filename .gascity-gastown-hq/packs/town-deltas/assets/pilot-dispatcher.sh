@@ -6509,10 +6509,15 @@ TASK
     log "Dispatch complete: sling_bead=$SLING_BEAD_ID target=$_SLING_TARGET slot=$BUILDER_TARGET reuse=${_DISPATCH_REUSE} session_state=${_DISPATCH_SESS_STATE}"
   fi
 
-  # ── Transition bead: lane tag + DURABLE story:in-flight (ga-2azzj fix 1) ──────
+  # ── Transition bead: DURABLE lane tag + DURABLE story:in-flight (ga-2azzj fix 1,
+  #    lane durability ga-05604.2) ────────────────────────────────────────────
   # ORDER IS LOAD-BEARING. The candidate queries EXCLUDE story:in-flight; that
   # label is the ONLY thing that makes a slung bead non-re-dispatchable. So:
-  #   1. lane tag (cosmetic accounting — non-fatal).
+  #   1. lane tag — retry + VERIFY (read-after-write), same treatment as
+  #      story:in-flight below (ga-05604.2). Unlike in-flight, an unconfirmed
+  #      lane write does NOT abort the dispatch on exhaustion — only WARN (see
+  #      below) — because the builder may already be slung and a late-aborted
+  #      dispatch is worse (ga-2azzj).
   #   2. add story:in-flight and VERIFY it stuck (read-after-write retry). This
   #      write is NOT swallowed — a slung-but-unmarked bead is the dangerous
   #      state that caused the ga-8nu8x double-dispatch.
@@ -6526,7 +6531,36 @@ TASK
   # The builder is already slung; an unmarked re-dispatchable bead is worse than
   # a claim that TTL recovery cleans up once the sling task is closed.
   if [ "$DRY_RUN" != "1" ]; then
-    bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "lane:${LANE}" -q 2>/dev/null || true
+    # ga-05604.2: lane tag write used to be a single fire-and-forget
+    # `label add ... || true` — no retry, no verification — while the
+    # story:in-flight write 5 lines below it already had both. A transient
+    # Dolt blip landing exactly in this window silently dropped the lane
+    # write while story:in-flight (which retries) typically survived the
+    # same blip, leaving the bead durably story:in-flight with NO lane:*
+    # label — misread downstream as an "unclassified" residual
+    # (ga-wtqli/ga-05604.1) even though classify_lane() never actually
+    # returned empty; the WRITE just lost the race. This loop gives the
+    # lane write the SAME retry+verify treatment as story:in-flight. On
+    # exhaustion it only WARNs (does not abort/return 1) — the
+    # unclassified_lane residual (ga-wtqli) already surfaces the bead for
+    # observability when this genuinely happens; this fix just narrows the
+    # failure window instead of reinventing that observability path.
+    local _lane_ok=0 _lane_i=1
+    local _lane_retries="${PILOT_INFLIGHT_RETRIES:-5}"
+    local _lane_sleep="${PILOT_INFLIGHT_SLEEP:-2}"
+    while [ "$_lane_i" -le "$_lane_retries" ]; do
+      bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "lane:${LANE}" -q 2>/dev/null || true
+      if bd -C "$STORY_BEAD_CITY" show "$STORY_ID" --json 2>/dev/null \
+          | jq -e --arg lane "lane:${LANE}" 'if type=="array" then .[0] else . end | (.labels // []) | any(. == $lane)' \
+          >/dev/null 2>&1; then
+        _lane_ok=1; break
+      fi
+      [ "$_lane_i" -lt "$_lane_retries" ] && sleep "$_lane_sleep"
+      _lane_i=$((_lane_i + 1))
+    done
+    if [ "$_lane_ok" = "0" ]; then
+      warn "LANE WRITE UNCONFIRMED on $STORY_ID after ${_lane_retries} attempts (Dolt down?). NOT aborting dispatch — builder '$BUILDER_TARGET' already slung or about to be (bead=$SLING_BEAD_ID). Bead will surface via the unclassified_lane residual (ga-wtqli) until relabeled."
+    fi
 
     local _inflight_ok=0 _inflight_i=1
     local _inflight_retries="${PILOT_INFLIGHT_RETRIES:-5}"
