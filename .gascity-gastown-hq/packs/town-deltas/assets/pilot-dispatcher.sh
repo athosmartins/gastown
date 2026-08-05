@@ -4149,7 +4149,17 @@ fi
 # untouched; and (b) a feature with NO lifecycle label at all is not dropped here
 # (it simply fails the Tier 2 `-l story:approved` source-query and so is never
 # dispatched as a feature). Approved stories are never blocked.
-
+#
+# ga-opzlf: BUGS_JSON/DEBT_JSON now also pipe through _filter_built, which they
+# never did — every OTHER candidate pipeline in this file (TIER2_JSON, CTXREADY_JSON,
+# the HQ-empty rig fallback, the painel emit, and even the per-rig RIG_BUGS/RIG_DEBT
+# equivalent of this exact tier) already runs it. Without it, a bug/tech-debt bead
+# already sitting in the quality gate (gate:queued/gate:reviewing/an open
+# quality-gate-marker) was dispatch-eligible with zero gate-state check — the Tier-1
+# half of the "gate:queued invisible to Pilot and painel" leak (4 beads showed
+# Aprovadas while genuinely queued, re-dispatched in parallel, colliding branches
+# reconciled by hand 2x on 04/08). _filter_built's gate-marker/label logic is
+# unchanged; this only wires it into the one tier that was skipping it.
 BUGS_JSON=$(bd -C "$GC_CITY" list --json \
   -t bug \
   --exclude-label "story:in-flight" \
@@ -4162,7 +4172,7 @@ BUGS_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-BUGS_JSON=$(echo "$BUGS_JSON" | _filter_candidates)
+BUGS_JSON=$(echo "$BUGS_JSON" | _filter_candidates | _filter_built)
 
 DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   -l "tech-debt" \
@@ -4176,7 +4186,7 @@ DEBT_JSON=$(bd -C "$GC_CITY" list --json \
   --exclude-type epic \
   -n 0 \
   2>/dev/null || echo "[]")
-DEBT_JSON=$(echo "$DEBT_JSON" | _filter_candidates)
+DEBT_JSON=$(echo "$DEBT_JSON" | _filter_candidates | _filter_built)
 
 # Merge bugs + debt, deduplicate by id
 TIER1_JSON=$(echo "$BUGS_JSON $DEBT_JSON" \

@@ -4243,6 +4243,38 @@ has "$DISPATCHER" '_filter_exec_manual \| _filter_candidates \| _filter_dispatch
 has "$DISPATCHER" 'assign "\$_bid" ""' \
   "NEVERSTARTED release clears the dead-worker assignee (ga-mrfb: else _filter_candidates hides the released bead)"
 
+# ── Scenario ga-opzlf: Tier-1 (BUGS_JSON/DEBT_JSON) was gate-marker BLIND ────────
+# Athos: 4 story:approved beads (wa-a2eht/wa-uyt49/wa-0ac3z/wa-nh37r) showed as
+# "Aprovadas" in the painel while genuinely queued in the quality gate, and could be
+# re-dispatched in parallel — the exact branch-collision root cause reconciled by
+# hand twice on 04/08 (wa-oddg8, wa-0beh7). _filter_built ALREADY handles gate:queued
+# correctly in isolation (Scenario 22g-gate FB_QONLY above) — the gap was that
+# BUGS_JSON/DEBT_JSON (Tier 1: type:bug + tech-debt — the exact pool a `type:bug`
+# bead like ga-opzlf itself dispatches from) never called _filter_built at all,
+# unlike every OTHER candidate pipeline in this file: TIER2_JSON, CTXREADY_JSON, the
+# HQ-empty rig fallback, the painel emit (_emit_query_one), and even the per-rig
+# RIG_BUGS/RIG_DEBT equivalent of this EXACT tier (confirmed by has() below — the
+# per-rig path already had it, only the HQ path was the outlier).
+echo "Scenario ga-opzlf: Tier-1 bug/tech-debt pipeline is now gate-marker-aware"
+_FCB_FN="$_FC_FN
+$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} /^_beadid_has_open_gate_marker\(\)/{f=1} /^_filter_built\(\)/{f=1} f{print} f&&/^}$/{f=0}' "$DISPATCHER")"
+_fcb() { ( eval "$_FCB_FN"; SELF_BEAD_ID=""
+  export PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS=""
+  printf '%s' "$1" | _filter_candidates | _filter_built | jq -rc '[.[].id]' 2>/dev/null ); }
+GA_OPZLF_BUGS='[{"id":"bd-bug-queued","assignee":null,"issue_type":"bug","labels":["gate:queued"],"description":"x"},{"id":"bd-bug-clean","assignee":null,"issue_type":"bug","labels":[],"description":"x"}]'
+GA_OPZLF_OUT="$(_fcb "$GA_OPZLF_BUGS")"
+[ "$GA_OPZLF_OUT" = '["bd-bug-clean"]' ] \
+  && ok "ga-opzlf: gate:queued bug excluded by the SAME _filter_candidates|_filter_built chain BUGS_JSON now uses; clean sibling kept" \
+  || bad "ga-opzlf: gate:queued bug leaked through the Tier-1 chain (got: '$GA_OPZLF_OUT')"
+# Wiring drift-guards: BUGS_JSON and DEBT_JSON must literally pipe through _filter_built
+# (structural — the behavioral pass above proves the chain WORKS, this proves it's the
+# chain ACTUALLY WIRED IN, so a future edit that reorders/drops the pipe segment fails
+# loudly here even if it somehow left the standalone behavior looking right).
+has "$DISPATCHER" 'BUGS_JSON=\$\(echo "\$BUGS_JSON" \| _filter_candidates \| _filter_built\)' \
+  "ga-opzlf: BUGS_JSON (Tier-1 bugs) now pipes through _filter_built — HQ no longer gate-marker-blind"
+has "$DISPATCHER" 'DEBT_JSON=\$\(echo "\$DEBT_JSON" \| _filter_candidates \| _filter_built\)' \
+  "ga-opzlf: DEBT_JSON (Tier-1 tech-debt) now pipes through _filter_built — HQ no longer gate-marker-blind"
+
 # ── Scenario 22h: ownership guard exempts gate:needs-fix from the branch-exists refusal
 # A gate-failed bead in the gate-fix loop OWNS its branch crew/*/<bead> from the prior
 # attempt; _filter_built is blind to it on CONTAINER rigs (branch is remote-only, not a
