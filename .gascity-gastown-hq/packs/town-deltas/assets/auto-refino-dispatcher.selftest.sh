@@ -284,8 +284,11 @@ D=$(auto_refino_handoff_decision "weird" 1 3)
 echo "Drift guards: live wiring matches the acceptance criteria"
 
 # 1. The refine handoff sets story:refino-review (the gate's input / 'em revisão')
-#    ADDITIVELY (label add, not --set-labels — see drift-guard 0/bug 2).
-if grep -qF 'label add "$STORY_ID" "story:refino-review"' "$DISPATCHER"; then
+#    ADDITIVELY (label add, not --set-labels — see drift-guard 0/bug 2). ga-78tut:
+#    now written via the atomic `--add-label` flag form (one bd update call per
+#    transition), not the old independent `label add`/`label remove` subcommand
+#    sequence — match either shape.
+if grep -qE 'label add "\$STORY_ID" "story:refino-review"|--add-label "story:refino-review"' "$DISPATCHER"; then
   ok "refine handoff adds story:refino-review (gate input / 'em revisão' pill, additive)"
 else
   bad "refine handoff does not add story:refino-review"
@@ -300,6 +303,36 @@ if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -q -- '--set-labels'; then
   bad "REGRESSION (bug 2): --set-labels present in code — it clobbers unrelated labels; use additive label add/remove"
 else
   ok "no --set-labels in code (additive label add/remove only — no label clobber)"
+fi
+
+# 0a2. ga-78tut: the OPPOSITE anti-pattern — a single state transition split into
+#      N INDEPENDENT `label add`/`label remove` subcommand invocations inside the
+#      REFINE_TASK heredoc (the prompt template instructing the spawned refiner).
+#      Each invocation swallows its own error independently (`|| true` at the
+#      shell level, or simply no checking at the LLM-instruction level) without
+#      checking the previous one — if one fails mid-sequence, the bead is left in
+#      a state neither the refine queue nor the escalation queue recognizes,
+#      while the log still claims the transition succeeded. The gate caught this
+#      exact class in a sibling file (ga-xvxvf, refino-gate-dispatcher.sh) first.
+#      Fix: consolidate every transition into ONE atomic
+#      `bd update <id> --add-label A --add-label B --remove-label C` call — the
+#      two flags are repeatable and the whole call is one bd/Dolt operation, so
+#      a failure leaves ALL labels unchanged instead of a partial mix.
+#      Isolate the heredoc body first (grep -v the case/type declarations method
+#      above scans the WHOLE file, but this anti-pattern is specifically about
+#      the PROMPT TEXT — a live daemon-side single `label remove` call, like the
+#      Step-0 TTL recovery pass, is a single op already and is not in scope).
+_heredoc_start=$(grep -n "IFS= read -r -d '' REFINE_TASK <<TASK" "$DISPATCHER" | head -1 | cut -d: -f1)
+_heredoc_end=$(grep -n '^TASK$' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$_heredoc_start" ] && [ -n "$_heredoc_end" ]; then
+  _heredoc_body=$(sed -n "${_heredoc_start},${_heredoc_end}p" "$DISPATCHER")
+  if printf '%s' "$_heredoc_body" | grep -qE '"\$(AR_BEAD_STORE)" label (add|remove)'; then
+    bad "REGRESSION (ga-78tut): REFINE_TASK heredoc still contains independent 'label add'/'label remove' subcommand invocations — consolidate each transition into one 'bd update --add-label/--remove-label' call (same class as ga-xvxvf, caught by the gate)"
+  else
+    ok "ga-78tut: REFINE_TASK heredoc has no independent label add/remove invocations — every transition is one atomic bd update call"
+  fi
+else
+  bad "ga-78tut: could not locate the REFINE_TASK heredoc boundaries to check for independent label writes"
 fi
 
 # 0b. BUG 1: the escalate path durably persists auto-refino:escalated (additively)
@@ -401,9 +434,12 @@ fi
 #     painel _SUAVEZ_LABELS member) so escalations surface in the human "Sua vez"
 #     queue instead of rendering in TRIAGEM. It must appear in BOTH escalate paths:
 #     the inline daemon escalate (bd_ label add "$STORY_ID" ...) AND the spawned
-#     refiner's task heredoc (bd -C "$GC_CITY" label add "$STORY_ID" ...). Count
-#     both occurrences; require at least 2.
-_escalado_hits=$(grep -cF 'label add "$STORY_ID" "story:refino-escalado"' "$DISPATCHER")
+#     refiner's task heredoc. Count both occurrences; require at least 2.
+#     ga-78tut: the heredoc path now writes this via the atomic
+#     `--add-label "story:refino-escalado"` form (not the subcommand form), so
+#     match either shape — the inline path is untouched and still uses the
+#     subcommand form.
+_escalado_hits=$(grep -cE 'label add "\$STORY_ID" "story:refino-escalado"|--add-label "story:refino-escalado"' "$DISPATCHER")
 if [ "$_escalado_hits" -ge 2 ]; then
   ok "escalate adds story:refino-escalado in BOTH paths ($_escalado_hits hits) → surfaces in 'Sua vez' (ga-lfua3 bug 1)"
 elif [ "$_escalado_hits" -eq 1 ]; then
@@ -539,8 +575,10 @@ if printf '%s' "$_flat_task" | grep -qiF 'must not let --description silently dr
 else
   bad "ga-fnnyy: REFINE_TASK heredoc does not explicitly instruct verbatim preservation of 🚨 blocks"
 fi
-if grep -q 'label add "\$STORY_ID" "needs-human"' "$DISPATCHER" \
-   && grep -q 'label add "\$STORY_ID" "pilot:no-auto-dispatch"' "$DISPATCHER"; then
+# ga-78tut: both labels now ship as one atomic `bd update --add-label ... --add-label ...`
+# call rather than two independent `label add` invocations — match either shape.
+if grep -qE 'label add "\$STORY_ID" "needs-human"|--add-label "needs-human"' "$DISPATCHER" \
+   && grep -qE 'label add "\$STORY_ID" "pilot:no-auto-dispatch"|--add-label "pilot:no-auto-dispatch"' "$DISPATCHER"; then
   ok "ga-fnnyy: REFINE_TASK heredoc example includes needs-human + pilot:no-auto-dispatch label-add commands"
 else
   bad "ga-fnnyy: REFINE_TASK heredoc does not show needs-human + pilot:no-auto-dispatch as commands to run"
@@ -1047,7 +1085,10 @@ fi
 # shell logic — same idiom as the ga-fnnyy guards above: the guarantee here is
 # "the instruction ships in the prompt", not "the behavior is unit-testable".
 _patha_block=$(awk '/^\[PATH A/{f=1} /^\[PATH B/{f=0} f{print}' "$DISPATCHER")
-if printf '%s' "$_patha_block" | grep -q 'label add "\$STORY_ID" "auto-refino:escalated"'; then
+# ga-78tut: PATH A's label writes now ship as one atomic
+# `bd update --add-label ... --remove-label ...` call rather than independent
+# `label add`/`label remove` invocations — match either shape.
+if printf '%s' "$_patha_block" | grep -qE 'label add "\$STORY_ID" "auto-refino:escalated"|--add-label "auto-refino:escalated"'; then
   ok "ga-64u1b: PATH A (INFO-GAP) heredoc adds auto-refino:escalated (re-ingestion loop killed)"
 else
   bad "ga-64u1b: PATH A (INFO-GAP) heredoc does NOT add auto-refino:escalated — re-ingestion loop reproduces"

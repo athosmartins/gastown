@@ -1303,22 +1303,26 @@ bd -C "$AR_BEAD_STORE" update "$STORY_ID" \\
   --set-metadata "story.dashboard=$SKIP_SENTINEL" \\
   --set-metadata "story.refino_mode=simplificado" \\
   --set-metadata "story.refino_refiner=$AUTO_REFINO_ACTOR"
-# ga-fnnyy: ONLY if the original description had a 🚨 block (skip these two
-# lines entirely if it did not) — the preserved text above must not depend
-# solely on being read; stamp a structural dispatch hold too:
-bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "needs-human"
-bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "pilot:no-auto-dispatch"
+# ga-fnnyy: ONLY if the original description had a 🚨 block (skip this line
+# entirely if it did not) — the preserved text above must not depend solely on
+# being read; stamp a structural dispatch hold too. ONE atomic call (ga-78tut:
+# never split one transition into independent label writes — a failure partway
+# through could leave e.g. needs-human present but pilot:no-auto-dispatch
+# absent, a bead that "needs a human" yet remains auto-dispatchable):
+bd -C "$AR_BEAD_STORE" update "$STORY_ID" --add-label "needs-human" --add-label "pilot:no-auto-dispatch"
 # Hand to the refino gate (the 'em revisão' pill keys off story:refino-review).
-# Transition ADDITIVELY (remove the in-progress lifecycle, add refino-review) so
-# unrelated labels are preserved; do NOT use --set-labels (it would clobber them).
+# ONE atomic call: add refino-review, remove the in-progress lifecycle + claim
+# label. Never --set-labels (it clobbers unrelated labels) and never split into
+# independent label add/remove invocations (ga-78tut: a failure mid-sequence
+# leaves a state neither queue recognizes, while the log still claims success).
 # This does NOT set needs-approval — only the gate promotes.
-bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:refinement-in-progress"
-bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "story:refino-review"
-bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "auto-refino:refining"
+bd -C "$AR_BEAD_STORE" update "$STORY_ID" \\
+  --add-label "story:refino-review" \\
+  --remove-label "story:refinement-in-progress" \\
+  --remove-label "auto-refino:refining"
 bd -C "$AR_BEAD_STORE" comment "$STORY_ID" "Auto-refino: refinado autonomamente (simplificado, attempt $THIS_ATTEMPT). Enviado ao gate de refino (ga-gpr2v) para revisão de qualidade."
-# Signal the dispatcher:
-bd -C "$AR_BEAD_STORE" label add "$TASK_BEAD_ID" "outcome:REFINED"
-bd -C "$AR_BEAD_STORE" label remove "$TASK_BEAD_ID" "outcome:pending"
+# Signal the dispatcher (one atomic call, same reasoning):
+bd -C "$AR_BEAD_STORE" update "$TASK_BEAD_ID" --add-label "outcome:REFINED" --remove-label "outcome:pending"
 bd -C "$AR_BEAD_STORE" close "$TASK_BEAD_ID"
 
 IF YOU CANNOT REFINE CONFIDENTLY — choose the escalation path (imp16):
@@ -1329,15 +1333,21 @@ trivial, or mis-pasted). Do NOT page Athos — this is a technical context gap.
 
 bd -C "$AR_BEAD_STORE" update "$STORY_ID" \\
   --set-metadata "story.auto_refino_gaps=<what context is missing — one item per line>"
-bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "refino:info-gap"
-bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "auto-refino:escalated"
-bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "auto-refino:refining"
-bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:refinement-in-progress"
-bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:triage"
-bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:unrefined"
+# ONE atomic call for the whole escalation transition (ga-78tut: 6 independent
+# label writes for a single transition meant a mid-sequence failure could leave
+# the bead in a state neither the refine queue nor the escalation queue
+# recognizes, while the log still claims success). auto-refino:escalated is
+# load-bearing here (ga-64u1b): without it this bead is invisible to the
+# terminal-escalate check and gets re-ingested by the next RAW sweep.
+bd -C "$AR_BEAD_STORE" update "$STORY_ID" \\
+  --add-label "refino:info-gap" \\
+  --add-label "auto-refino:escalated" \\
+  --remove-label "auto-refino:refining" \\
+  --remove-label "story:refinement-in-progress" \\
+  --remove-label "story:triage" \\
+  --remove-label "story:unrefined"
 bd -C "$AR_BEAD_STORE" comment "$STORY_ID" "Auto-refino INFO-GAP: história sem contexto suficiente (attempt $THIS_ATTEMPT). Lacuna técnica — não é decisão de produto. Aguardando mais contexto."
-bd -C "$AR_BEAD_STORE" label add "$TASK_BEAD_ID" "outcome:ESCALATE:info-gap"
-bd -C "$AR_BEAD_STORE" label remove "$TASK_BEAD_ID" "outcome:pending"
+bd -C "$AR_BEAD_STORE" update "$TASK_BEAD_ID" --add-label "outcome:ESCALATE:info-gap" --remove-label "outcome:pending"
 bd -C "$AR_BEAD_STORE" close "$TASK_BEAD_ID"
 
 [PATH B — POLICY-GAP: genuine product decision — needs Athos]
@@ -1346,22 +1356,26 @@ that only Athos can make. Page Athos via story:refino-escalado.
 
 bd -C "$AR_BEAD_STORE" update "$STORY_ID" \\
   --set-metadata "story.auto_refino_gaps=<perguntas/lacunas concretas, uma por linha — o que falta para refinar>"
-bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "refino:policy-gap"
-bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "gate:needs-human:product"
-bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "auto-refino:escalated"
-bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "auto-refino:refining"
-# TERMINAL escalate: remove EVERY lifecycle label so no candidate query can re-pick
-# this story (the dispatcher reconciles this too, but be terminal here as well).
-bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:refinement-in-progress"
-bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:triage"
-bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:unrefined"
-# SURFACE in the painel "Sua vez" human queue (ga-lfua3): story:refino-escalado
-bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "story:refino-escalado"
+# ONE atomic call for the whole escalation transition (ga-78tut: same class as
+# PATH A — N independent label writes for one transition risk a mid-sequence
+# failure leaving neither queue able to recognize the bead's real state).
+# TERMINAL escalate: every lifecycle label is removed so no candidate query can
+# re-pick this story (the dispatcher reconciles this too, but be terminal here
+# as well). story:refino-escalado SURFACEs it in the painel "Sua vez" human
+# queue (ga-lfua3).
+bd -C "$AR_BEAD_STORE" update "$STORY_ID" \\
+  --add-label "refino:policy-gap" \\
+  --add-label "gate:needs-human:product" \\
+  --add-label "auto-refino:escalated" \\
+  --add-label "story:refino-escalado" \\
+  --remove-label "auto-refino:refining" \\
+  --remove-label "story:refinement-in-progress" \\
+  --remove-label "story:triage" \\
+  --remove-label "story:unrefined"
 bd -C "$AR_BEAD_STORE" comment "$STORY_ID" "Auto-refino POLICY-GAP: não conseguiu refinar — precisa de decisão de produto do Athos (attempt $THIS_ATTEMPT). Perguntas/lacunas:
 <liste as perguntas — decisões de produto que só o Athos toma>
 NÃO promovido, NÃO despachado."
-bd -C "$AR_BEAD_STORE" label add "$TASK_BEAD_ID" "outcome:ESCALATE"
-bd -C "$AR_BEAD_STORE" label remove "$TASK_BEAD_ID" "outcome:pending"
+bd -C "$AR_BEAD_STORE" update "$TASK_BEAD_ID" --add-label "outcome:ESCALATE" --remove-label "outcome:pending"
 bd -C "$AR_BEAD_STORE" close "$TASK_BEAD_ID"
 
 [PATH C — SPLIT: a PRIOR policy-gap escalation on this story was already
@@ -1374,17 +1388,21 @@ resolution, this path does not apply (use the CONFIDENCE GATE instead).
 Apply the Epic Split Convention (skills/refino/references/story-bead-
 convention.md) to the STORY now, if not already applied:
 
-bd -C "$AR_BEAD_STORE" update "$STORY_ID" --type epic
-bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "story:refinement-in-progress"
-bd -C "$AR_BEAD_STORE" label add "$STORY_ID" "story:epic-split"
-bd -C "$AR_BEAD_STORE" label remove "$STORY_ID" "auto-refino:refining"
+# ONE atomic call: switch to epic type and swap the lifecycle label in the same
+# transition (ga-78tut: independent label writes risk a mid-sequence failure —
+# e.g. type flips to epic while the OLD in-progress/refining labels linger, an
+# inconsistent combination the split machinery doesn't expect).
+bd -C "$AR_BEAD_STORE" update "$STORY_ID" \\
+  --type epic \\
+  --add-label "story:epic-split" \\
+  --remove-label "story:refinement-in-progress" \\
+  --remove-label "auto-refino:refining"
 bd -C "$AR_BEAD_STORE" create "<sub-história 1: título>" --type feature --parent $STORY_ID --label story:unrefined --no-inherit-labels
 bd -C "$AR_BEAD_STORE" create "<sub-história N: título>" --type feature --parent $STORY_ID --label story:unrefined --no-inherit-labels
 # Do NOT write the SIMPLIFICADO fields (F1/F2/F6/F7/F8) on the STORY here —
 # it is now a container; each child is refined individually by the funnel.
 bd -C "$AR_BEAD_STORE" comment "$STORY_ID" "Auto-refino: Epic Split Convention aplicado (attempt $THIS_ATTEMPT), executando a decisão de divisão já registrada em comentário anterior."
-bd -C "$AR_BEAD_STORE" label add "$TASK_BEAD_ID" "outcome:SPLIT"
-bd -C "$AR_BEAD_STORE" label remove "$TASK_BEAD_ID" "outcome:pending"
+bd -C "$AR_BEAD_STORE" update "$TASK_BEAD_ID" --add-label "outcome:SPLIT" --remove-label "outcome:pending"
 bd -C "$AR_BEAD_STORE" close "$TASK_BEAD_ID"
 
 RULES: Never write story:approved or story:needs-approval. Never dispatch.
