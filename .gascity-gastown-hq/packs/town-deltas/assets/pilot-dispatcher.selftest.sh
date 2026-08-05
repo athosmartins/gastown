@@ -4224,6 +4224,68 @@ FB_VI="$(_fb "" "" '[{"id":"wa-rev","labels":["gate:reviewing"]},{"id":"wa-fresh
 [ "$FB_VI" = '["wa-fresh"]' ] && ok "_filter_built(vi): gate:* lifecycle label (no marker) → dropped (label signal, imparavel-check parity)" \
                              || bad "_filter_built(vi): gate:* label bead leaked (got: '$FB_VI')"
 
+# ── Scenario 4uhrp: gate-resident in-flight bead frees its LANE SLOT but stays
+# vetoed from CANDIDACY (ga-4uhrp) ────────────────────────────────────────────
+# `story:in-flight` conflated two meanings: "a builder is building this now"
+# (occupies a slot) vs. "already built, waiting in the gate" (occupies
+# nothing). Measured live 2026-08-05: 7 story:in-flight beads, only 3 actually
+# building — small lane read 7/5 (over cap), 3 consecutive sweeps logged
+# dispatched=0 with a P0 waiting behind beads no builder was touching. Gate
+# slower → more gate-resident occupants → fewer free builder slots → less
+# throughput → gate queue doesn't drain → gate slower: a deadlock attractor,
+# not just a slowdown.
+#
+# FIXTURE mirrors the live measurement: 3 in-flight beads with NO gate:* label
+# (genuinely building; one on lane:big) + 4 with a RESIDENT gate:* label
+# (gate:queued / gate:reviewing / gate:rebase-retry:N, one stacked with
+# gate:fix-attempt:N the way a bounced-then-requeued bead looks) → occupancy
+# must read 3 (2 small + 1 big), not 7.
+echo "Scenario 4uhrp: gate-resident in-flight bead frees its lane slot (occupancy), stays vetoed from candidacy (_filter_built)"
+INFLIGHT_4UHRP='[
+  {"id":"if-build1","labels":["story:in-flight"]},
+  {"id":"if-build2","labels":["story:in-flight"]},
+  {"id":"if-build3","labels":["story:in-flight","lane:big"]},
+  {"id":"if-gate1","labels":["story:in-flight","gate:queued","gate:reviewing"]},
+  {"id":"if-gate2","labels":["story:in-flight","gate:fix-attempt:1","gate:queued"]},
+  {"id":"if-gate3","labels":["story:in-flight","gate:fix-attempt:2","gate:queued","gate:rebase-retry:2","gate:reviewing"]},
+  {"id":"if-gate4","labels":["story:in-flight","gate:reviewing"]}
+]'
+LOG4UHRP="$(run_capacity 10 "$INFLIGHT_4UHRP")"
+
+if echo "$LOG4UHRP" | grep -q "live=7 (raw=7 stale=0 age=0 dead=0)"; then
+  ok "raw in-flight total (live=7) untouched by the gate-resident stage — only the lane split changes"
+else
+  bad "in-flight total corrupted by the gate-resident stage (expected 'live=7 (raw=7 stale=0 age=0 dead=0)', got: $(echo "$LOG4UHRP" | grep 'In-flight:'))"
+fi
+
+if echo "$LOG4UHRP" | grep -q "Gate-resident in-flight: 4 bead"; then
+  ok "detected the 4 gate-resident occupants"
+else
+  bad "did not detect gate-resident in-flight occupants (expected 'Gate-resident in-flight: 4 bead')"
+fi
+
+if echo "$LOG4UHRP" | grep -q "gate_resident=4  small=2/5  big=1/2"; then
+  ok "AC1: occupancy corrected to 2 small + 1 big = 3 actually-building occupants (not 7)"
+else
+  bad "AC1 FAILED: occupancy not corrected (expected 'gate_resident=4  small=2/5  big=1/2', got: $(echo "$LOG4UHRP" | grep 'In-flight:'))"
+fi
+
+if echo "$LOG4UHRP" | grep -qE "Gate-resident in-flight:.*if-build[123]"; then
+  bad "AC2 REGRESSION: a genuinely-building bead (no gate:* label) was wrongly freed from the lane count"
+else
+  ok "AC2: beads without a gate:* label still count as occupants (control, no over-freeing)"
+fi
+
+# AC3: the SAME bead just freed from occupancy (if-gate1) must remain excluded
+# from candidacy by the INDEPENDENT _filter_built filter — this is what
+# prevents the freed slot from double-dispatching the bead that vacated it.
+FB_4UHRP="$(_fb "" "" '[{"id":"if-gate1","labels":["story:in-flight","gate:queued","gate:reviewing"]},{"id":"wa-fresh","labels":["ctx:ready"]}]')"
+if [ "$FB_4UHRP" = '["wa-fresh"]' ]; then
+  ok "AC3: the SAME bead (if-gate1) freed from lane occupancy above is STILL excluded from candidacy by _filter_built — no double-dispatch"
+else
+  bad "AC3 FAILED: _filter_built no longer vetoes the gate-resident bead — DOUBLE-DISPATCH REGRESSION (got: '$FB_4UHRP')"
+fi
+
 has "$DISPATCHER" '_filter_built()'                        "_filter_built helper defined (HOL-block layer 2)"
 has "$DISPATCHER" '_beadid_has_open_gate_marker'           "_filter_built consults _beadid_has_open_gate_marker (any-open marker, wa-8y45 leak fix)"
 has "$DISPATCHER" '_beadid_has_active_gate_artifact "\$id"' "_filter_built reuses signal-(d) _beadid_has_active_gate_artifact for the needs-fix carve-out"

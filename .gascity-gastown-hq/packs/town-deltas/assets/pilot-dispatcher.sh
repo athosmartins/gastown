@@ -4031,10 +4031,47 @@ if [ "$DEAD_WORKER" -gt 0 ] 2>/dev/null; then
   warn "Dead-worker in-flight: ${DEAD_WORKER} bead(s) whose builder session is gone — NOT counted as live occupants, freeing their slot(s) for pending work (ga-e5yw2). Dead ids: $(jq -rn --argjson a "$IN_FLIGHT_AGE_JSON" --argjson b "$IN_FLIGHT_JSON" '(($a|map(.id)) - ($b|map(.id))) | join(",")' 2>/dev/null || echo "?")"
 fi
 
-IN_FLIGHT_BIG=$(echo "$IN_FLIGHT_JSON" | jq '[.[] | select((.labels // []) | contains(["lane:big"]))] | length' 2>/dev/null || echo "0")
-IN_FLIGHT_SMALL=$((IN_FLIGHT_TOTAL - IN_FLIGHT_BIG))
+# ga-4uhrp: a gate-resident in-flight bead (any gate:* lifecycle label OTHER
+# than the needs-fix/needs-human/fix-attempt:N redispatch markers — same
+# carve-out _filter_built applies at ~L2244-2250; duplicated here rather than
+# shared as a jq function because the two run as separate jq invocations over
+# differently-shaped inputs and _filter_built's own history — ga-d3eg2,
+# ga-ltjdx, ga-ub8yq — shows this classification is worth keeping textually
+# obvious at each call site, not one line of bash/jq-quoting indirection away)
+# has ALREADY FINISHED BUILDING; no builder session is attached to it.
+# Counting it against the lane cap starves builders exactly when the gate is
+# slow — measured live 2026-08-05: 7 story:in-flight beads, only 3 actually
+# building, small lane read 7/5, 3 consecutive sweeps logged dispatched=0
+# with a P0 waiting behind it (the gate slowing down throttles builders,
+# which slows the gate further — a deadlock attractor, not just a slowdown).
+# This does NOT reopen the bead for redispatch — that's a SEPARATE filter
+# (_filter_built independently vetoes any candidate carrying a gate:* label),
+# so freeing its lane slot here can only let a DIFFERENT, fresh bead use it.
+IN_FLIGHT_GATE_RESIDENT_JSON=$(echo "$IN_FLIGHT_JSON" | jq '
+  [ .[] | select((.labels // []) | any(
+      (. == "gate" or startswith("gate:"))
+      and (. != "gate:needs-fix") and (startswith("gate:needs-fix:") | not)
+      and (. != "gate:needs-human") and (startswith("gate:needs-human") | not)
+      and (startswith("gate:fix-attempt:") | not)
+    )) ]' 2>/dev/null || echo "[]")
+[ -z "$IN_FLIGHT_GATE_RESIDENT_JSON" ] && IN_FLIGHT_GATE_RESIDENT_JSON="[]"
+GATE_RESIDENT=$(echo "$IN_FLIGHT_GATE_RESIDENT_JSON" | jq 'length' 2>/dev/null || echo "0")
+[ -z "$GATE_RESIDENT" ] 2>/dev/null && GATE_RESIDENT=0
 
-log "In-flight: live=$IN_FLIGHT_TOTAL (raw=$IN_FLIGHT_RAW_TOTAL stale=$STALE_INFLIGHT age=$STALE_AGE dead=$DEAD_WORKER)  small=$IN_FLIGHT_SMALL/${MAX_SMALL}  big=$IN_FLIGHT_BIG/${MAX_BIG}"
+if [ "$GATE_RESIDENT" -gt 0 ] 2>/dev/null; then
+  warn "Gate-resident in-flight: ${GATE_RESIDENT} bead(s) already built, waiting in the quality gate — NOT counted against the lane cap, freeing their slot(s) for pending work (ga-4uhrp; still excluded from redispatch by _filter_built's own gate:* veto). Gate-resident ids: $(echo "$IN_FLIGHT_GATE_RESIDENT_JSON" | jq -r '[.[].id] | join(",")' 2>/dev/null || echo "?")"
+fi
+
+IN_FLIGHT_BIG=$(echo "$IN_FLIGHT_JSON" | jq --argjson gr "$IN_FLIGHT_GATE_RESIDENT_JSON" '
+    ($gr | map(.id)) as $gate_ids
+    | [ .[] | select((.labels // []) | contains(["lane:big"]))
+             | select((.id as $i | $gate_ids | index($i)) | not) ]
+    | length' 2>/dev/null || echo "0")
+[ -z "$IN_FLIGHT_BIG" ] && IN_FLIGHT_BIG=0
+IN_FLIGHT_SMALL=$((IN_FLIGHT_TOTAL - GATE_RESIDENT - IN_FLIGHT_BIG))
+[ "$IN_FLIGHT_SMALL" -lt 0 ] 2>/dev/null && IN_FLIGHT_SMALL=0
+
+log "In-flight: live=$IN_FLIGHT_TOTAL (raw=$IN_FLIGHT_RAW_TOTAL stale=$STALE_INFLIGHT age=$STALE_AGE dead=$DEAD_WORKER)  gate_resident=$GATE_RESIDENT  small=$IN_FLIGHT_SMALL/${MAX_SMALL}  big=$IN_FLIGHT_BIG/${MAX_BIG}"
 
 # ── Per-builder busy set (ga-mtlm6) ───────────────────────────────────────────
 # For a POOLED rig (multiple interchangeable crew), a builder is BUSY iff it
