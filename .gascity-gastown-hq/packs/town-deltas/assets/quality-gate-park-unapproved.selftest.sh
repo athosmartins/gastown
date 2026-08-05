@@ -122,9 +122,12 @@ grep -q 'check_source_bead_park()'           "$GUARD" \
 grep -q 'story:needs-approval'               "$GUARD" \
   && ok "guard checks story:needs-approval in check_source_bead_park" \
   || bad "guard missing story:needs-approval check"
-grep -qE 'gate:needs-human\|gate:needs-human:\*' "$GUARD" \
-  && ok "guard checks gate:needs-human (exact + wildcard suffix)" \
+grep -q 'gate:needs-human:\*)' "$GUARD" \
+  && ok "guard checks gate:needs-human (wildcard suffix)" \
   || bad "guard missing gate:needs-human wildcard check"
+grep -q 'gate:needs-human)' "$GUARD" \
+  && ok "guard checks gate:needs-human (exact, bare)" \
+  || bad "guard missing gate:needs-human exact check"
 grep -q 'park:needs-approval'                "$GUARD" \
   && ok "guard emits park:needs-approval" \
   || bad "guard missing park:needs-approval return"
@@ -205,6 +208,67 @@ if [ -n "$MAIL_LINE" ] && [ -n "$CLOSE_LINE" ] && [ "$MAIL_LINE" -lt "$CLOSE_LIN
 else
   bad "Step 5a author mail ordering wrong (mail must precede close): mail=${MAIL_LINE:-missing} close=${CLOSE_LINE:-missing}"
 fi
+
+# ── 8. ga-o5de8: gate:needs-human:partial-delivery must NOT park ─────────────
+# Deadlock this fixes: the ga-k2wjn/ga-zhfk8 scope backstop (quality-gate-
+# dispatcher.sh) holds a gate-PASSED bug/task bead open by labeling it
+# delivery:partial + gate:needs-human + gate:needs-human:partial-delivery
+# instead of closing it, when its body looks like it enumerates more
+# deliverables than the reviewed diff covered. Before this fix, Step 5a
+# treated that bare gate:needs-human co-tag as a generic circuit-break and
+# parked EVERY future marker for the bead — including a brand-new branch
+# submitted specifically to deliver the missing item. The park blocked the
+# only merge that could ever clear the label: permanent deadlock (reported by
+# digo-wa, hit 3x in one day).
+echo "── 8. gate:needs-human:partial-delivery (ga-o5de8) → ok, not parked ──"
+eq "partial-delivery alone → ok" \
+  "$(check_source_bead_park 'gate:needs-human:partial-delivery')" \
+  "ok"
+eq "real-world combo (bare co-tag + partial-delivery, as dispatcher actually sets both) → ok" \
+  "$(check_source_bead_park 'gate:needs-human gate:needs-human:partial-delivery')" \
+  "ok"
+eq "full real-world combo incl. delivery:partial → ok" \
+  "$(check_source_bead_park 'delivery:partial gate:needs-human gate:needs-human:partial-delivery')" \
+  "ok"
+eq "partial-delivery + unrelated labels → ok" \
+  "$(check_source_bead_park 'lane:small gate:needs-human gate:needs-human:partial-delivery pilot:dispatched')" \
+  "ok"
+
+echo "── 8b. CONTROL: a genuine circuit-break sub-reason still parks, even alongside partial-delivery ──"
+eq "partial-delivery + :technical (mixed reasons) → park" \
+  "$(check_source_bead_park 'gate:needs-human gate:needs-human:partial-delivery gate:needs-human:technical')" \
+  "park:needs-human"
+eq "partial-delivery + :sibling-race (mixed reasons) → park" \
+  "$(check_source_bead_park 'gate:needs-human:partial-delivery gate:needs-human:sibling-race')" \
+  "park:needs-human"
+eq "story:needs-approval + partial-delivery → park:needs-approval (approval check runs first, unaffected)" \
+  "$(check_source_bead_park 'story:needs-approval gate:needs-human:partial-delivery')" \
+  "park:needs-approval"
+
+echo "── 8c. CONTROL: other real gate:needs-human sub-reasons (no partial-delivery) still park unchanged ──"
+eq "gate:needs-human:technical alone → park" \
+  "$(check_source_bead_park 'gate:needs-human gate:needs-human:technical')" \
+  "park:needs-human"
+eq "gate:needs-human:sibling-race alone → park" \
+  "$(check_source_bead_park 'gate:needs-human gate:needs-human:sibling-race')" \
+  "park:needs-human"
+eq "gate:needs-human:diverging alone → park" \
+  "$(check_source_bead_park 'gate:needs-human:diverging')" \
+  "park:needs-human"
+eq "gate:needs-human:product alone → park" \
+  "$(check_source_bead_park 'gate:needs-human:product')" \
+  "park:needs-human"
+eq "bare gate:needs-human with no sub-reason at all → still park (conservative default preserved)" \
+  "$(check_source_bead_park 'gate:needs-human')" \
+  "park:needs-human"
+
+echo "── 8d. drift-guard: guard's own comment cites the ga-o5de8 rationale ──"
+grep -q 'ga-o5de8' "$GUARD" \
+  && ok "guard documents the ga-o5de8 partial-delivery exemption" \
+  || bad "guard missing ga-o5de8 rationale comment"
+grep -q 'gate:needs-human:partial-delivery)' "$GUARD" \
+  && ok "guard has a dedicated case arm for gate:needs-human:partial-delivery" \
+  || bad "guard missing dedicated partial-delivery case arm"
 
 echo ""
 echo "──────────────────────────────────────────"

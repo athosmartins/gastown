@@ -335,8 +335,25 @@ classify_gap2_bugtask_verdict() {
 # state that must not enter the review cycle?
 #   story:needs-approval — bead was never product-approved; the gate would spawn
 #     reviewers who reject it, the crew re-submits, and the cycle repeats forever.
-#   gate:needs-human / gate:needs-human:* — bead is circuit-broken and requires
-#     human intervention; the same re-submit loop applies.
+#   gate:needs-human / gate:needs-human:* (EXCEPT :partial-delivery, see below)
+#     — bead is circuit-broken and requires human intervention; the same
+#     re-submit loop applies.
+#   gate:needs-human:partial-delivery — ga-o5de8: NOT a circuit-break. This
+#     sub-reason is the ga-k2wjn/ga-zhfk8 scope backstop holding a gate-PASSED
+#     bead open because its body looks like it enumerates more deliverables
+#     than the one diff that was just reviewed covered (see
+#     gate_delivery_looks_partial in quality-gate-dispatcher.sh). Parking Step
+#     5a on it deadlocked: the only way to clear the label is to merge a branch
+#     that delivers the missing item, and merging requires passing Step 5a
+#     first. So a source bead carrying gate:needs-human(:partial-delivery) with
+#     NO OTHER circuit-break sub-reason present is left eligible for review — a
+#     freshly submitted marker is NOT parked here. This does not reopen the
+#     door to premature closure: the scope check re-runs at PASS/merge time
+#     (quality-gate-dispatcher.sh's IS_PARTIAL branch) and re-holds the bead —
+#     open, delivery:partial, gate:needs-human:partial-delivery — regardless of
+#     which branch merged, until some diff actually adds scope_covered:all.
+#     This function only ever gates whether Step 5a spawns a reviewer, never
+#     whether the bead is allowed to close.
 #   gate:needs-fix ALONE is NOT a park reason — it is the normal fix-iterate path
 #     (crew fixed, re-submitted; gate should review it).
 # The check is FAIL-OPEN: if labels are empty/unrecognized, returns "ok" so a
@@ -344,12 +361,26 @@ classify_gap2_bugtask_verdict() {
 # Returns: ok | park:needs-approval | park:needs-human
 check_source_bead_park() {
   local labels="$1" lbl
+  local saw_bare=0 saw_partial_delivery=0 saw_other_reason=0
   for lbl in $labels; do
     case "$lbl" in
-      story:needs-approval)         echo "park:needs-approval"; return ;;
-      gate:needs-human|gate:needs-human:*) echo "park:needs-human"; return ;;
+      story:needs-approval) echo "park:needs-approval"; return ;;
     esac
   done
+  for lbl in $labels; do
+    case "$lbl" in
+      gate:needs-human:partial-delivery) saw_partial_delivery=1 ;;
+      gate:needs-human:*)                saw_other_reason=1 ;;
+      gate:needs-human)                  saw_bare=1 ;;
+    esac
+  done
+  # A genuine (non-partial-delivery) circuit-break sub-reason always parks,
+  # even alongside a co-present partial-delivery label.
+  [ "$saw_other_reason" = "1" ] && { echo "park:needs-human"; return; }
+  # partial-delivery-only (with or without the bare co-tag) — exempt (ga-o5de8).
+  [ "$saw_partial_delivery" = "1" ] && { echo "ok"; return; }
+  # bare gate:needs-human with no sub-reason at all — preserve prior behavior.
+  [ "$saw_bare" = "1" ] && { echo "park:needs-human"; return; }
   echo "ok"
 }
 
