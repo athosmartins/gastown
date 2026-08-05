@@ -81,6 +81,22 @@
 # WARN, never let a read failure masquerade as "confirmed orphaned" (ga-p5q3
 # defense (a): a failed query is not the same value as zero/confirmed).
 #
+# RESOLVED-PRUNING IS INDIVIDUALLY VERIFIED (ga-tqe4j): the mirror-image of
+# the FAIL-OPEN rule above. A prior version declared a tracked bead RESOLVED
+# and pruned it from state the moment it was simply ABSENT from this sweep's
+# flagged set — collapsing "re-checked it, the label is really gone" and
+# "this sweep just failed to re-observe it" into the same verdict. Verified
+# live 2026-08-05: 18 beads logged RESOLVED in one sweep while >=4 of them
+# still carried the gate:* label. Every bead about to be pruned is now
+# individually re-checked against its own store (_bead_recheck_status) before
+# the verdict is written; anything that cannot be positively confirmed
+# cleared (query fails, store unknown, or the label is still there) stays in
+# state with first_seen intact and is logged UNVERIFIED, never RESOLVED. This
+# applies even when the WHOLE sweep comes back empty (every store failing at
+# once is the most severe case of the same conflation, not a different one)
+# — see _golw_resolve_tracked_state, the single choke point both branches of
+# run_sweep funnel through.
+#
 # KILL-SWITCH: GOLW_ENABLED=0 → no-op.
 # DRY-RUN: GOLW_DRY_RUN=1 → log findings, skip comment/notify/mail/state-write.
 #
@@ -185,6 +201,49 @@ _gate_artifact_probe() {
   fi
 }
 
+# _bead_recheck_status <bead_id> <store> <exclude_prefixes_json>
+# Individually re-verifies ONE bead's current orphan-suspect status directly
+# against its store — the ga-tqe4j fix. Used ONLY when a bead already tracked
+# in state did not appear in this sweep's flagged set, to decide whether that
+# absence means "genuinely resolved" or "this sweep simply failed to
+# re-observe it" (those two must never collapse to the same verdict — see the
+# RESOLVED-PRUNING header comment). Uses the safe `list --id <id>` FLAG form
+# (not a positional `bd show <id>`) — an exact-match filter, immune to bd's
+# fuzzy positional-id matching. Prints exactly one token to stdout:
+#   error   — the query itself failed (bd/jq non-zero, unreadable output):
+#             UNKNOWN, caller must NOT prune (fail-open, ga-p5q3 defense (a)).
+#   gone    — store has no record at all for this id (rare: hard-deleted):
+#             treated as resolved.
+#   closed  — bead exists, status=closed: no longer "stuck in gate limbo" by
+#             definition, treated as resolved regardless of label residue.
+#   absent  — bead exists, open, carries NO non-excluded gate:* label: the
+#             label genuinely cleared — the exact case the bug asks to
+#             confirm before declaring RESOLVED.
+#   present — bead exists, open, STILL carries a non-excluded gate:* label:
+#             it dropped out of this sweep for some OTHER reason (transient
+#             probe failure, reclassified as park, etc.) — NOT resolved.
+_bead_recheck_status() {
+  local _id="$1" _store="$2" _excl="$3" _out _rc
+  _out=$("$BD_BIN" -C "$_store" list --id "$_id" --all --json 2>/dev/null \
+    | jq -c 'if type=="array" then . else [.] end' 2>/dev/null)
+  _rc=$?
+  if [ "$_rc" -ne 0 ] || [ -z "${_out:-}" ] || [ "$_out" = "null" ]; then
+    printf 'error\n'
+    return 1
+  fi
+  printf '%s' "$_out" | jq -r --arg id "$_id" --argjson excl "$_excl" '
+      ([ .[] | select(.id == $id) ] | .[0]) as $b
+      | if $b == null then "gone"
+        elif ($b.status // "") == "closed" then "closed"
+        else ( (($b.labels // []) | map(select(startswith("gate:")))) as $gl
+               | if ($gl | length) == 0 then "absent"
+                 elif ($gl | all(. as $x | $excl | any(. as $p | $x | startswith($p)))) then "absent"
+                 else "present"
+                 end )
+        end
+    ' 2>/dev/null
+}
+
 # _state_load — prints the current state JSON (or "{}" on missing/corrupt file, fail-open)
 _state_load() {
   if [ -f "$STATE_FILE" ]; then
@@ -192,6 +251,63 @@ _state_load() {
   else
     echo '{}'
   fi
+}
+
+# _golw_resolve_tracked_state <state_json> <flagged_ids_json> <exclude_prefixes_json>
+# ga-tqe4j: the single choke point BOTH branches of run_sweep funnel through
+# before pruning anything from state. For every bead in <state_json> that is
+# NOT in <flagged_ids_json> (i.e. a resolution candidate — including the
+# degenerate case where <flagged_ids_json> is "[]" because the whole sweep
+# came back empty), individually re-verifies it via _bead_recheck_status
+# before deciding. Only a positively-confirmed clear (absent/closed/gone)
+# gets pruned; anything else (query error, unknown store, or the label is
+# genuinely still there) stays in state untouched, first_seen intact, and is
+# logged UNVERIFIED rather than RESOLVED — see the RESOLVED-PRUNING header
+# comment for why this must never collapse into one verdict.
+# Prints ONE json object on stdout: {"state": <pruned-state>, "resolved_ids":
+# [<ids individually confirmed resolved this call>]}. Every keep/prune
+# decision is also written to $LOG via `log`.
+_golw_resolve_tracked_state() {
+  local _state="$1" _keep="$2" _excl="$3"
+  local _candidates
+  _candidates="$(printf '%s' "$_state" | jq -r --argjson keep "$_keep" 'keys - $keep | .[]' 2>/dev/null)"
+  local _resolved="" _rid _rstore _rstatus _unverified_count=0
+  if [ -n "${_candidates:-}" ]; then
+    while IFS= read -r _rid; do
+      [ -z "$_rid" ] && continue
+      _rstore="$(printf '%s' "$_state" | jq -r --arg id "$_rid" '.[$id].store // empty' 2>/dev/null)"
+      if [ -z "${_rstore:-}" ]; then
+        log "UNVERIFIED: $_rid absent from this sweep but no store on record (pre-fix state entry) — cannot re-check, keeping (fail-safe)"
+        _unverified_count=$((_unverified_count + 1))
+        continue
+      fi
+      _rstatus="$(_bead_recheck_status "$_rid" "$_rstore" "$_excl")"
+      case "$_rstatus" in
+        absent|closed|gone)
+          log "RESOLVED: $_rid re-checked individually (${_rstatus}) — no longer carries an orphaned gate:* label — cleared from state"
+          _resolved="${_resolved}${_rid}"$'\n'
+          ;;
+        present)
+          log "UNVERIFIED: $_rid re-checked and STILL carries a gate:* label (dropped from this sweep for another reason) — keeping in state, NOT resolved"
+          _unverified_count=$((_unverified_count + 1))
+          ;;
+        *)
+          log "UNVERIFIED: $_rid re-check query failed (store '$_rstore') — fail-safe, keeping in state, NOT declaring resolved"
+          _unverified_count=$((_unverified_count + 1))
+          ;;
+      esac
+    done <<< "$_candidates"
+  fi
+  if [ "$_unverified_count" -gt 0 ]; then
+    log "UNVERIFIED total this sweep: ${_unverified_count} bead(s) absent from the flagged set but not positively confirmed cleared — kept in state"
+  fi
+  local _resolved_json
+  _resolved_json="$(printf '%s' "$_resolved" | jq -R -s -c 'split("\n") | map(select(length>0))' 2>/dev/null)"
+  [ -z "${_resolved_json:-}" ] && _resolved_json="[]"
+  local _new_state
+  _new_state="$(printf '%s' "$_state" | jq -c --argjson gone "$_resolved_json" 'with_entries(select(.key as $k | ($gone | index($k)) == null))' 2>/dev/null)"
+  [ -z "${_new_state:-}" ] && _new_state="$_state"
+  jq -nc --argjson st "$_new_state" --argjson rid "$_resolved_json" '{state: $st, resolved_ids: $rid}' 2>/dev/null
 }
 
 run_sweep() {
@@ -211,6 +327,12 @@ run_sweep() {
   local exclude_prefixes_json
   exclude_prefixes_json="$(printf '%s\n' $GOLW_EXCLUDE_LABEL_PREFIXES | jq -R . | jq -s -c '[.[] | select(length > 0)]' 2>/dev/null)"
   [ -z "${exclude_prefixes_json:-}" ] && exclude_prefixes_json="[]"
+
+  # ga-tqe4j: loaded up-front (was previously loaded further down, only in
+  # the non-empty branch) so BOTH the empty-sweep fast path and the normal
+  # cooldown/resolve path below can run beads already in state through
+  # _golw_resolve_tracked_state before anything gets pruned.
+  local state; state="$(_state_load)"
 
   # Accumulate flagged candidates as TSV lines: id\tstore\tage_min\tlabels\tartifact_status\tartifact_count
   local flagged_tsv=""
@@ -330,22 +452,47 @@ run_sweep() {
   fi
 
   if [ -z "${flagged_tsv:-}" ]; then
-    # Nothing currently orphaned — clear any stale state so a future episode
-    # starts fresh (mirrors GTSW's cooldown-reset-on-clear convention).
-    if [ -f "$STATE_FILE" ] && [ "${GOLW_DRY_RUN:-0}" != "1" ]; then
-      rm -f "$STATE_FILE" 2>/dev/null || true
-      log "STATE CLEARED: no orphaned gate-labeled beads found — previous episode(s) resolved"
-    fi
     local park_suffix=""
     [ "$park_count" -gt 0 ] && park_suffix=" (${park_count} parked, excluded)"
+    if [ "$state" = "{}" ]; then
+      # Nothing currently orphaned AND nothing was ever tracked — genuine
+      # no-op, nothing to verify or prune.
+      if [ -f "$STATE_FILE" ] && [ "${GOLW_DRY_RUN:-0}" != "1" ]; then
+        rm -f "$STATE_FILE" 2>/dev/null || true
+      fi
+      log "OK: 0 beads with gate:* label and zero active marker (>=${GOLW_STALE_MINUTES}min) across ${GOLW_STORES}${park_suffix}"
+      return 0
+    fi
+    # ga-tqe4j: pre-existing tracked state but nothing flagged THIS sweep —
+    # this is the MOST SEVERE form of the exact bug this fix targets (a total
+    # read failure across every store looks byte-for-byte identical to "every
+    # tracked bead just got fixed"). Never blind-wipe here either — run every
+    # tracked bead through the same individual-recheck choke point as the
+    # normal path below before touching anything. The recheck itself is
+    # read-only, so (matching how the rest of this file treats DRY_RUN) it
+    # still runs and still logs — only the STATE FILE WRITE is skipped.
+    local _envelope0; _envelope0="$(_golw_resolve_tracked_state "$state" "[]" "$exclude_prefixes_json")"
+    state="$(printf '%s' "$_envelope0" | jq -c '.state' 2>/dev/null)"
+    [ -z "${state:-}" ] && state="{}"
+    if [ "${GOLW_DRY_RUN:-0}" != "1" ]; then
+      if [ "$state" = "{}" ]; then
+        if [ -f "$STATE_FILE" ]; then
+          rm -f "$STATE_FILE" 2>/dev/null || true
+          log "STATE CLEARED: no orphaned gate-labeled beads found — previous episode(s) resolved"
+        fi
+      else
+        mkdir -p "$GOLW_STATE_DIR" 2>/dev/null || true
+        printf '%s' "$state" > "$STATE_FILE" 2>/dev/null || true
+      fi
+    fi
     log "OK: 0 beads with gate:* label and zero active marker (>=${GOLW_STALE_MINUTES}min) across ${GOLW_STORES}${park_suffix}"
     return 0
   fi
 
   # ── cooldown/state handling: only ALERT on new-or-cooldown-expired beads,
   # but the aggregate report always lists the FULL current flagged set so a
-  # human sees the whole picture, not just what's new this cycle. ──
-  local state; state="$(_state_load)"
+  # human sees the whole picture, not just what's new this cycle. `state` was
+  # already loaded up-front (see above the empty-sweep branch). ──
   local flagged_ids="[]"
   local to_alert_tsv=""
   local bid store2 age_min labels lstatus lcount last_alert
@@ -356,21 +503,26 @@ run_sweep() {
     case "$last_alert" in ''|*[!0-9]*) last_alert=0 ;; esac
     if [ "$last_alert" -eq 0 ] || [ $(( now - last_alert )) -ge "$GOLW_ALERT_COOLDOWN_S" ]; then
       to_alert_tsv="${to_alert_tsv}${bid}\t${store2}\t${age_min}\t${labels}\t${lstatus}\t${lcount}\n"
-      state="$(printf '%s' "$state" | jq -c --arg id "$bid" --argjson now "$now" \
-        '.[$id] = {first_seen: (.[$id].first_seen // $now), last_alert: $now, store: (.[$id].store // "")}' 2>/dev/null)"
+      # ga-tqe4j: record the REAL store2 path, not the old self-referential
+      # `.[$id].store // ""` (which only ever read back what a prior write put
+      # there — and no write ever put anything but "" — so this field was
+      # empty for every bead, forever; the Mayor flagged it live as a lead).
+      # It's the prerequisite for _bead_recheck_status to know where to verify
+      # a bead that later drops out of a sweep.
+      state="$(printf '%s' "$state" | jq -c --arg id "$bid" --argjson now "$now" --arg st "$store2" \
+        '.[$id] = {first_seen: (.[$id].first_seen // $now), last_alert: $now, store: $st}' 2>/dev/null)"
     fi
   done < <(printf '%b' "$flagged_tsv")
 
-  # Prune resolved beads (no longer in the flagged set) from state.
+  # Prune resolved beads (no longer in the flagged set) from state — ga-tqe4j:
+  # routed through the same individually-verified choke point as the
+  # empty-sweep branch above, not a blind keys-subtraction (see the
+  # RESOLVED-PRUNING header comment and _golw_resolve_tracked_state).
+  local _envelope; _envelope="$(_golw_resolve_tracked_state "$state" "$flagged_ids" "$exclude_prefixes_json")"
+  state="$(printf '%s' "$_envelope" | jq -c '.state' 2>/dev/null)"
+  [ -z "${state:-}" ] && state="{}"
   local resolved_ids
-  resolved_ids="$(printf '%s' "$state" | jq -r --argjson keep "$flagged_ids" 'keys - $keep | .[]' 2>/dev/null)"
-  if [ -n "${resolved_ids:-}" ]; then
-    while IFS= read -r rid; do
-      [ -z "$rid" ] && continue
-      log "RESOLVED: $rid no longer carries an orphaned gate:* label — cleared from state"
-    done <<< "$resolved_ids"
-    state="$(printf '%s' "$state" | jq -c --argjson keep "$flagged_ids" 'with_entries(select(.key as $k | $keep | index($k) != null))' 2>/dev/null)"
-  fi
+  resolved_ids="$(printf '%s' "$_envelope" | jq -r '.resolved_ids[]' 2>/dev/null)"
 
   # ga-lnpa7: cooldown is correctly per-bead, but the mail used to report the
   # FULL flagged_tsv every time ANY bead was due — one new bead re-spammed
@@ -515,7 +667,8 @@ if [ "${1:-}" = "--selftest" ] || [ "${GOLW_SELFTEST:-0}" = "1" ]; then
 
   # Fake bd: routes on the verb + args. Candidate sweep = `list --json --limit 0`
   # with NO `-l` flag; artifact probe = `list -l source-bead:<id> --json`;
-  # per-bead alert = `comment <id> --stdin`.
+  # per-bead alert = `comment <id> --stdin`; ga-tqe4j individual re-check =
+  # `list --id <id> --all --json`.
   cat > "$BD_BIN" <<'BDSTUB'
 #!/usr/bin/env bash
 store="$2"; verb="$3"; shift 3 2>/dev/null || true
@@ -526,6 +679,9 @@ case "$verb" in
     if [[ "$args" == *"-l source-bead:"* ]]; then
       id="$(printf '%s' "$args" | grep -oE 'source-bead:[A-Za-z0-9_.-]+' | head -1 | cut -d: -f2)"
       f="$GOLW_TEST_FIXTURES_DIR/artifacts-${id}.json"
+    elif [[ "$args" == *"--id "* ]]; then
+      id="$(printf '%s' "$args" | grep -oE -- '--id [A-Za-z0-9_.-]+' | head -1 | awk '{print $2}')"
+      f="$GOLW_TEST_FIXTURES_DIR/recheck-${id}.json"
     else
       f="$GOLW_TEST_FIXTURES_DIR/candidates-${storename}.json"
     fi
@@ -926,6 +1082,137 @@ BDSTUB
   grep -q "+2 parado" "$MAIL19" 2>/dev/null && ok "scenario 19: mail summary counts both parked beads" || bad "scenario 19: mail summary missing the '+2 parado(s)' count"
   grep -q "cand-mix-park1" "$MAIL19" 2>/dev/null && bad "scenario 19 (ga-cjk1j regression): mail individually names a parked bead" || ok "scenario 19: mail does not individually name cand-mix-park1"
   grep -q "PARK: 2 bead" "$LOG" 2>/dev/null && ok "scenario 19: log records park_count=2" || bad "scenario 19: log missing PARK count of 2"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 20 (ga-tqe4j AC1+AC4, FIXTURE): a bead tracked in state drops
+  # out of this sweep's candidate list AND its individual re-check query also
+  # fails (the exact incident: 18 beads pruned RESOLVED while the sweep had
+  # simply failed to re-observe them) → must stay in state, first_seen
+  # UNCHANGED, and must NEVER be logged as RESOLVED. ─────────────────────────
+  echo "Scenario 20 (ga-tqe4j AC1+AC4 fixture): bead vanishes from sweep AND its recheck query fails → stays in state, first_seen intact, never RESOLVED"
+  rm -f "$STATE_FILE" 2>/dev/null
+  printf '[%s]' "$(mk_candidate cand-r1 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-r1.json"
+  GOLW_TEST_NOTIFIED="$TMP/notif20a" GOLW_TEST_MAILED="$TMP/mail20a" GOLW_TEST_COMMENTS_LOG="$TMP/comm20a" run_sweep >/dev/null
+  STORE_REC="$(jq -r '.["cand-r1"].store // empty' "$STATE_FILE" 2>/dev/null)"
+  [ "$STORE_REC" = "$TMP/hq" ] && ok "scenario 20: state records the correct store for cand-r1 (store-field regression check)" || bad "scenario 20 (store-field regression): expected store='$TMP/hq', got '$STORE_REC'"
+  FIRST_SEEN_A="$(jq -r '.["cand-r1"].first_seen // empty' "$STATE_FILE" 2>/dev/null)"
+  [ -n "$FIRST_SEEN_A" ] && ok "scenario 20: first_seen recorded after 1st sweep" || bad "scenario 20: first_seen missing after 1st sweep"
+  echo '[]' > "$TMP/fixtures/candidates-hq.json"                     # bead vanishes from the main sweep
+  printf '%s\n' "__BD_FAIL__" > "$TMP/fixtures/recheck-cand-r1.json" # AND its individual recheck also fails
+  : > "$LOG"
+  GOLW_TEST_NOTIFIED="$TMP/notif20b" GOLW_TEST_MAILED="$TMP/mail20b" GOLW_TEST_COMMENTS_LOG="$TMP/comm20b" run_sweep >/dev/null
+  grep -q '"cand-r1"' "$STATE_FILE" 2>/dev/null && ok "scenario 20 (AC1): cand-r1 SURVIVES in state when its recheck query fails" || bad "scenario 20 (AC1 regression — the exact bug): cand-r1 was pruned from state despite an unverifiable recheck"
+  FIRST_SEEN_B="$(jq -r '.["cand-r1"].first_seen // empty' "$STATE_FILE" 2>/dev/null)"
+  [ "$FIRST_SEEN_B" = "$FIRST_SEEN_A" ] && ok "scenario 20 (AC4): first_seen unchanged across the degraded sweep" || bad "scenario 20 (AC4 regression): first_seen changed ($FIRST_SEEN_A -> $FIRST_SEEN_B) — age clock reset on a degraded sweep"
+  grep -q "RESOLVED: cand-r1" "$LOG" 2>/dev/null && bad "scenario 20 (AC1 regression — the exact bug): cand-r1 logged as RESOLVED despite an unverifiable recheck" || ok "scenario 20: cand-r1 never logged as RESOLVED"
+  grep -q "UNVERIFIED: cand-r1 re-check query failed" "$LOG" 2>/dev/null && ok "scenario 20: log reports cand-r1's recheck failure as unverified this run" || bad "scenario 20: log does not report cand-r1's recheck failure as unverified"
+  rm -f "$TMP/fixtures/recheck-cand-r1.json"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 21 (ga-tqe4j AC2, CONTROL — must not regress): a bead whose
+  # label genuinely disappeared, confirmed by its individual recheck → still
+  # declared RESOLVED and pruned. If this breaks, state grows forever. ───────
+  echo "Scenario 21 (ga-tqe4j AC2 control): bead's label genuinely cleared, recheck confirms it → still RESOLVED and pruned"
+  rm -f "$STATE_FILE" 2>/dev/null
+  printf '[%s]' "$(mk_candidate cand-r2 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-r2.json"
+  GOLW_TEST_NOTIFIED="$TMP/notif21a" GOLW_TEST_MAILED="$TMP/mail21a" GOLW_TEST_COMMENTS_LOG="$TMP/comm21a" run_sweep >/dev/null
+  echo '[]' > "$TMP/fixtures/candidates-hq.json"        # bead vanishes from the main sweep
+  printf '[%s]' "$(mk_candidate cand-r2 "$TMP/hq" "ctx:ready" "$OLD_TS")" > "$TMP/fixtures/recheck-cand-r2.json"  # recheck: label genuinely gone
+  : > "$LOG"
+  GOLW_TEST_NOTIFIED="$TMP/notif21b" GOLW_TEST_MAILED="$TMP/mail21b" GOLW_TEST_COMMENTS_LOG="$TMP/comm21b" run_sweep >/dev/null
+  grep -q '"cand-r2"' "$STATE_FILE" 2>/dev/null && bad "scenario 21 (AC2 regression): cand-r2 still lingers in state after a confirmed resolution" || ok "scenario 21 (AC2): cand-r2 pruned from state after a confirmed resolution"
+  grep -q "RESOLVED: cand-r2" "$LOG" 2>/dev/null && ok "scenario 21 (AC2): cand-r2 logged as RESOLVED" || bad "scenario 21 (AC2 regression): cand-r2 not logged as RESOLVED despite a confirmed-cleared recheck"
+  rm -f "$TMP/fixtures/recheck-cand-r2.json"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 22 (ga-tqe4j AC3 — the heart of the bug): re-run the AC1 and
+  # AC2 conditions side by side in the SAME sweep and assert their outcomes
+  # DIFFER. Before this fix both cases collapsed to the identical "RESOLVED,
+  # pruned" verdict — that collapse, not either case alone, was the bug. ────
+  echo "Scenario 22 (ga-tqe4j AC3): unverifiable-vs-confirmed-resolved must produce DIFFERENT outcomes in the same sweep"
+  rm -f "$STATE_FILE" 2>/dev/null
+  printf '[%s,%s]' \
+    "$(mk_candidate cand-r3 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" \
+    "$(mk_candidate cand-r4 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" \
+    > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-r3.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-r4.json"
+  GOLW_TEST_NOTIFIED="$TMP/notif22a" GOLW_TEST_MAILED="$TMP/mail22a" GOLW_TEST_COMMENTS_LOG="$TMP/comm22a" run_sweep >/dev/null
+  # cand-r3: same absence, UNVERIFIABLE recheck (store fails)
+  # cand-r4: same absence, CONFIRMED-cleared recheck
+  echo '[]' > "$TMP/fixtures/candidates-hq.json"
+  printf '%s\n' "__BD_FAIL__" > "$TMP/fixtures/recheck-cand-r3.json"
+  printf '[%s]' "$(mk_candidate cand-r4 "$TMP/hq" "ctx:ready" "$OLD_TS")" > "$TMP/fixtures/recheck-cand-r4.json"
+  : > "$LOG"
+  GOLW_TEST_NOTIFIED="$TMP/notif22b" GOLW_TEST_MAILED="$TMP/mail22b" GOLW_TEST_COMMENTS_LOG="$TMP/comm22b" run_sweep >/dev/null
+  R3_SURVIVES="no"; grep -q '"cand-r3"' "$STATE_FILE" 2>/dev/null && R3_SURVIVES="yes"
+  R4_SURVIVES="no"; grep -q '"cand-r4"' "$STATE_FILE" 2>/dev/null && R4_SURVIVES="yes"
+  [ "$R3_SURVIVES" != "$R4_SURVIVES" ] && ok "scenario 22 (AC3): unverifiable (cand-r3, kept=$R3_SURVIVES) and confirmed-resolved (cand-r4, kept=$R4_SURVIVES) produced DIFFERENT outcomes" || bad "scenario 22 (AC3 — the heart of the bug): both cases produced the SAME outcome (kept=$R3_SURVIVES for both) — absence-from-sweep and confirmed-clear are still indistinguishable"
+  [ "$R3_SURVIVES" = "yes" ] && ok "scenario 22: the unverifiable one (cand-r3) is the one KEPT" || bad "scenario 22: cand-r3 (unverifiable) should be kept, was pruned"
+  [ "$R4_SURVIVES" = "no" ] && ok "scenario 22: the confirmed-resolved one (cand-r4) is the one PRUNED" || bad "scenario 22: cand-r4 (confirmed resolved) should be pruned, still lingers"
+  rm -f "$TMP/fixtures/recheck-cand-r3.json" "$TMP/fixtures/recheck-cand-r4.json"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 23 (ga-tqe4j, extra coverage — the "present" recheck path): a
+  # bead drops out of the main sweep's candidate list but its individual
+  # recheck shows the gate:* label is STILL there → must stay tracked, NOT be
+  # declared resolved. ────────────────────────────────────────────────────────
+  echo "Scenario 23 (ga-tqe4j extra): recheck confirms the label is STILL present → kept, not resolved"
+  rm -f "$STATE_FILE" 2>/dev/null
+  printf '[%s]' "$(mk_candidate cand-r5 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-r5.json"
+  GOLW_TEST_NOTIFIED="$TMP/notif23a" GOLW_TEST_MAILED="$TMP/mail23a" GOLW_TEST_COMMENTS_LOG="$TMP/comm23a" run_sweep >/dev/null
+  echo '[]' > "$TMP/fixtures/candidates-hq.json"
+  printf '[%s]' "$(mk_candidate cand-r5 "$TMP/hq" "gate:fix-attempt:2" "$OLD_TS")" > "$TMP/fixtures/recheck-cand-r5.json"
+  : > "$LOG"
+  GOLW_TEST_NOTIFIED="$TMP/notif23b" GOLW_TEST_MAILED="$TMP/mail23b" GOLW_TEST_COMMENTS_LOG="$TMP/comm23b" run_sweep >/dev/null
+  grep -q '"cand-r5"' "$STATE_FILE" 2>/dev/null && ok "scenario 23: cand-r5 stays tracked when its recheck still shows the gate:* label" || bad "scenario 23: cand-r5 was pruned despite its recheck confirming the label is still present"
+  grep -q "RESOLVED: cand-r5" "$LOG" 2>/dev/null && bad "scenario 23 regression: cand-r5 logged RESOLVED despite still carrying the label" || ok "scenario 23: cand-r5 never logged as RESOLVED"
+  rm -f "$TMP/fixtures/recheck-cand-r5.json"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 24 (ga-tqe4j, extra coverage — the "closed" recheck path): a
+  # bead that got CLOSED (merged+closed, or manually closed) is no longer
+  # "stuck in gate limbo" by definition — resolved regardless of label
+  # residue. ───────────────────────────────────────────────────────────────
+  echo "Scenario 24 (ga-tqe4j extra): bead closed → treated as resolved even if the label wasn't explicitly stripped"
+  rm -f "$STATE_FILE" 2>/dev/null
+  printf '[%s]' "$(mk_candidate cand-r6 "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-r6.json"
+  GOLW_TEST_NOTIFIED="$TMP/notif24a" GOLW_TEST_MAILED="$TMP/mail24a" GOLW_TEST_COMMENTS_LOG="$TMP/comm24a" run_sweep >/dev/null
+  echo '[]' > "$TMP/fixtures/candidates-hq.json"
+  printf '[{"id":"cand-r6","status":"closed","updated_at":"%s","labels":["gate:fix-attempt:1"]}]' "$OLD_TS" > "$TMP/fixtures/recheck-cand-r6.json"
+  : > "$LOG"
+  GOLW_TEST_NOTIFIED="$TMP/notif24b" GOLW_TEST_MAILED="$TMP/mail24b" GOLW_TEST_COMMENTS_LOG="$TMP/comm24b" run_sweep >/dev/null
+  grep -q '"cand-r6"' "$STATE_FILE" 2>/dev/null && bad "scenario 24: cand-r6 still lingers in state after being closed" || ok "scenario 24: closed bead cand-r6 pruned from state"
+  grep -q "RESOLVED: cand-r6" "$LOG" 2>/dev/null && ok "scenario 24: closed bead logged as RESOLVED" || bad "scenario 24: closed bead not logged as RESOLVED"
+  rm -f "$TMP/fixtures/recheck-cand-r6.json"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 25 (ga-tqe4j, extra coverage — the MOST SEVERE form + migration
+  # safety): a LEGACY state entry (store field empty — the exact shape the
+  # Mayor found live, from before this fix) whose sweep comes back TOTALLY
+  # empty (0 candidates from any store — the 100%-drop extreme of the same
+  # bug) cannot be re-checked (no store on record) → must stay tracked rather
+  # than be silently wiped by the empty-sweep fast path. ─────────────────────
+  echo "Scenario 25 (ga-tqe4j extra): legacy pre-fix state entry (empty store field), sweep totally empty → kept, not resolved, not wiped"
+  rm -f "$STATE_FILE" 2>/dev/null
+  mkdir -p "$GOLW_STATE_DIR"
+  printf '{"cand-r7":{"first_seen":1700000000,"last_alert":1700000000,"store":""}}' > "$STATE_FILE"
+  echo '[]' > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  : > "$LOG"
+  GOLW_TEST_NOTIFIED="$TMP/notif25" GOLW_TEST_MAILED="$TMP/mail25" GOLW_TEST_COMMENTS_LOG="$TMP/comm25" run_sweep >/dev/null
+  grep -q '"cand-r7"' "$STATE_FILE" 2>/dev/null && ok "scenario 25: legacy entry with no store on record is kept (cannot verify, fail-safe) even on a totally-empty sweep" || bad "scenario 25 (migration-safety regression): a legacy entry with no recorded store was wiped by the empty-sweep fast path without any re-check"
+  grep -q "RESOLVED: cand-r7" "$LOG" 2>/dev/null && bad "scenario 25 regression: legacy entry logged RESOLVED without ever being re-checked" || ok "scenario 25: legacy entry never logged as RESOLVED"
+  grep -q "STATE CLEARED" "$LOG" 2>/dev/null && bad "scenario 25 (the total-wipe form of the bug): log shows a blind STATE CLEARED despite an unverifiable tracked bead" || ok "scenario 25: no blind STATE CLEARED — the totally-empty sweep did not bypass verification"
   rm -f "$STATE_FILE" 2>/dev/null
 
   # ── Scenario 11: bash -n syntax check ──────────────────────────────────────
