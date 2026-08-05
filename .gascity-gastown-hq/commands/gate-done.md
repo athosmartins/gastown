@@ -294,6 +294,22 @@ The marker MUST be written to the city database (same database the guard reads).
 We use `-C "$GC_CITY_PATH"` to target the city DB explicitly.
 
 ```bash
+# ga-kkwsa: fail-closed guard, mirroring Step 2's existing BEAD_ID fail-closed
+# check. If Step 2 and Step 3 ran as SEPARATE tool calls, shell variables set
+# in Step 2 do not persist here (this harness's Bash tool only persists CWD
+# between calls, not shell state) and BRANCH/BEAD_ID would be silently empty
+# — producing an unreviewable "ready-for-gate: " marker with every field
+# blank (real incident: ga-wisp-vv2pmqo, stranded 44+ min before anyone
+# noticed). The old check here only verified $MARKER_ID was non-empty (i.e.
+# `bd create` itself succeeded) — never that the CONTENT it just wrote was.
+if [ -z "$BRANCH" ] || [ -z "$BEAD_ID" ]; then
+  echo "ERROR: BRANCH or BEAD_ID unset. Did Step 2 run in THIS shell?"
+  echo "  Run the entire gate-done sequence as ONE script/tool call —"
+  echo "  shell variables do not persist across separate invocations."
+  echo "  Marker NOT created."
+  exit 1
+fi
+
 MARKER_ID=$(bd -C "$GC_CITY_PATH" create \
   "ready-for-gate: $BRANCH" \
   -t chore --ephemeral \

@@ -605,6 +605,118 @@ else
   bad "(L) gate-done.md not found at $GATE_DONE"
 fi
 
+# ── (M) ga-kkwsa: Step 3 (marker creation) fails closed if BRANCH or BEAD_ID
+#    is empty, mirroring the fail-closed pattern Step 2 already uses for
+#    BEAD_ID (see the FAIL CLOSED block feeding (H)/(K) above).
+#
+# Root bug (ga-kkwsa, filed by gastown.dog-2 from a live incident): the
+# skill presents Pre-flight/Step 1/Step 2/Step 3 as 4 separate ```bash
+# blocks. This harness's Bash tool persists CWD between calls but NOT shell
+# variable state, so running Step 2 and Step 3 as separate tool calls leaves
+# every var Step 3 references (BRANCH, BEAD_ID, ...) unset in Step 3's shell.
+# Step 3's old success check only verified $MARKER_ID was non-empty (i.e.
+# `bd create` itself succeeded) — it never checked that the CONTENT it just
+# wrote was non-empty. Result: a real incident created marker ga-wisp-vv2pmqo
+# with title "ready-for-gate: " and every interpolated field blank, which sat
+# unreviewable at gate-status:queued for 44+ minutes before anyone noticed.
+#
+# step3_marker_guard <branch> <bead_id> — replica of the ga-kkwsa fail-closed
+# guard added to the TOP of Step 3, before the `bd create` call. Returns 0
+# (safe to proceed) or 1 (must abort BEFORE calling bd create).
+step3_marker_guard() {
+  local branch="$1" bead_id="$2"
+  [ -z "$branch" ] && return 1
+  [ -z "$bead_id" ] && return 1
+  return 0
+}
+
+# run_step3_fixed / run_step3_prefix — replicas of the FULL Step 3 flow
+# (guard, then create) for the fixed and pre-fix shapes respectively.
+# MOCK_BD_CREATE_CALLS proves whether `bd create` — the exact call that
+# shipped the blank marker in the real incident — was ever reached.
+MOCK_BD_CREATE_CALLS=0
+mock_bd_create() { MOCK_BD_CREATE_CALLS=$((MOCK_BD_CREATE_CALLS+1)); }
+run_step3_fixed() {
+  local branch="$1" bead_id="$2"
+  step3_marker_guard "$branch" "$bead_id" || return 1
+  mock_bd_create
+  return 0
+}
+run_step3_prefix() {
+  # pre-ga-kkwsa Step 3: no guard at all, goes straight to bd create
+  # regardless of blank vars — the exact incident shape.
+  mock_bd_create
+  return 0
+}
+
+# (M1) both blank — the exact incident shape (Step 2 never ran in this shell).
+MOCK_BD_CREATE_CALLS=0
+run_step3_fixed "" ""
+M1_RC=$?
+[ "$M1_RC" -ne 0 ] && [ "$MOCK_BD_CREATE_CALLS" -eq 0 ] \
+  && ok "(M1) blank BRANCH+BEAD_ID: guard aborts (rc=$M1_RC), bd create NOT called" \
+  || bad "(M1) blank BRANCH+BEAD_ID: expected abort with zero bd-create calls, got rc=$M1_RC calls=$MOCK_BD_CREATE_CALLS"
+
+# (M2) BRANCH set, BEAD_ID blank.
+MOCK_BD_CREATE_CALLS=0
+run_step3_fixed "fix/ga-z5cm2-guard" ""
+M2_RC=$?
+[ "$M2_RC" -ne 0 ] && [ "$MOCK_BD_CREATE_CALLS" -eq 0 ] \
+  && ok "(M2) blank BEAD_ID alone: guard aborts, bd create NOT called" \
+  || bad "(M2) blank BEAD_ID alone: expected abort with zero bd-create calls, got rc=$M2_RC calls=$MOCK_BD_CREATE_CALLS"
+
+# (M3) BEAD_ID set, BRANCH blank.
+MOCK_BD_CREATE_CALLS=0
+run_step3_fixed "" "ga-z5cm2"
+M3_RC=$?
+[ "$M3_RC" -ne 0 ] && [ "$MOCK_BD_CREATE_CALLS" -eq 0 ] \
+  && ok "(M3) blank BRANCH alone: guard aborts, bd create NOT called" \
+  || bad "(M3) blank BRANCH alone: expected abort with zero bd-create calls, got rc=$M3_RC calls=$MOCK_BD_CREATE_CALLS"
+
+# (M4) control: both populated — the normal, working case must be UNCHANGED.
+MOCK_BD_CREATE_CALLS=0
+run_step3_fixed "fix/ga-z5cm2-guard" "ga-z5cm2"
+M4_RC=$?
+[ "$M4_RC" -eq 0 ] && [ "$MOCK_BD_CREATE_CALLS" -eq 1 ] \
+  && ok "(M4) control: populated vars → marker created exactly once, no behavior change" \
+  || bad "(M4) control: expected success with exactly 1 bd-create call, got rc=$M4_RC calls=$MOCK_BD_CREATE_CALLS"
+
+# (M5) mutation guard: the ORIGINAL (pre-fix) Step 3 — no guard at all — MUST
+# still call bd create even with both vars blank, reproducing the exact
+# incident. Proves M1-M3 would actually catch a reversion of the guard, not
+# just happen to pass either way.
+MOCK_BD_CREATE_CALLS=0
+run_step3_prefix "" ""
+[ "$MOCK_BD_CREATE_CALLS" -eq 1 ] \
+  && ok "(M5) mutation check: pre-fix Step 3 (no guard) creates a blank marker from empty vars — reproduces the ga-kkwsa incident" \
+  || bad "(M5) mutation check: pre-fix replica unexpectedly did not call bd create — (M1-M3) would not catch a guard reversion"
+
+# ── (N) ga-kkwsa source drift-guard: deployed gate-done.md's Step 3 fails
+#    closed on blank BRANCH/BEAD_ID BEFORE calling bd create.
+if [ -f "$GATE_DONE" ]; then
+  src=$(cat "$GATE_DONE")
+  # Isolate Step 3's block so this cannot be satisfied by Step 2's UNRELATED
+  # BEAD_ID fail-closed guard earlier in the same file.
+  step3_src=$(printf '%s\n' "$src" | awk '/^## Step 3:/{flag=1} flag; /^## Step 4:/{flag=0}')
+  printf '%s' "$step3_src" | grep -qE '\[ -z "\$BRANCH" \]' \
+    && ok "(N1) gate-done.md Step 3 checks for blank BRANCH before creating the marker" \
+    || bad "(N1) gate-done.md Step 3 missing a blank-BRANCH check (ga-kkwsa regression)"
+  printf '%s' "$step3_src" | grep -qE '\[ -z "\$BEAD_ID" \]' \
+    && ok "(N2) gate-done.md Step 3 checks for blank BEAD_ID before creating the marker" \
+    || bad "(N2) gate-done.md Step 3 missing a blank-BEAD_ID check (ga-kkwsa regression)"
+  # The guard must appear BEFORE the `bd ... create` call within Step 3, not
+  # merely somewhere in the block.
+  guard_line=$(printf '%s\n' "$step3_src" | grep -nE '\[ -z "\$BRANCH" \] \|\| \[ -z "\$BEAD_ID" \]' | head -1 | cut -d: -f1)
+  create_line=$(printf '%s\n' "$step3_src" | grep -nE '^MARKER_ID=\$\(bd ' | head -1 | cut -d: -f1)
+  if [ -n "$guard_line" ] && [ -n "$create_line" ] && [ "$guard_line" -lt "$create_line" ]; then
+    ok "(N3) gate-done.md Step 3 guard runs BEFORE the bd create call (line $guard_line < $create_line)"
+  else
+    bad "(N3) gate-done.md Step 3 guard does not precede bd create (guard_line='$guard_line' create_line='$create_line')"
+  fi
+else
+  bad "(N) gate-done.md not found at $GATE_DONE"
+fi
+
 echo
 echo "  PASS=$PASS  FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
