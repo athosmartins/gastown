@@ -64,18 +64,65 @@ fi
 log "SSTI closed OK"
 
 # ── Check 4: admin :8097 shows the Kanban de histórias registration ────────
+# ga-pbbs8: a single transient render glitch (non-empty body, momentarily
+# missing the registration list — admin aggregates several upstreams) used
+# to hard-fail on one attempt AND assert a cause (registration missing /
+# daemon not restarted) that was never measured. Retry absorbs the transient
+# case; the fail message states only what was measured and labels the rest
+# as an explicit, unverified hypothesis. curl-failure, empty-body, and
+# non-empty-without-string are kept as three distinct states so the message
+# never points investigation at the wrong thing.
 log "Check 4: admin http://127.0.0.1:${ADMIN_PORT}/ shows Kanban de histórias registration ..."
-ADMIN_BODY=$(curl -s --max-time 10 "http://127.0.0.1:${ADMIN_PORT}/" 2>/dev/null || echo "")
-if [ -z "$ADMIN_BODY" ]; then
-  fail "admin :${ADMIN_PORT} unreachable or empty — admin console down?"
+ADMIN_RETRIES="${ADMIN_RETRIES:-3}"
+ADMIN_RETRY_DELAY="${ADMIN_RETRY_DELAY:-2}"
+admin_attempt=0
+admin_state=""
+admin_detail=""
+while [ "$admin_attempt" -lt "$ADMIN_RETRIES" ]; do
+  admin_attempt=$((admin_attempt + 1))
+  ADMIN_BODY_FILE="/tmp/wa-prodtest-admin.$$.html"
+  ADMIN_CODE=$(curl -s --max-time 10 -o "$ADMIN_BODY_FILE" -w "%{http_code}" \
+    "http://127.0.0.1:${ADMIN_PORT}/" 2>/dev/null)
+  ADMIN_CURL_EXIT=$?
+  ADMIN_BODY=""
+  ADMIN_BODY_SIZE=0
+  if [ -f "$ADMIN_BODY_FILE" ]; then
+    ADMIN_BODY_SIZE=$(wc -c < "$ADMIN_BODY_FILE" | tr -d '[:space:]')
+    ADMIN_BODY=$(cat "$ADMIN_BODY_FILE")
+    rm -f "$ADMIN_BODY_FILE"
+  fi
+
+  if [ "$ADMIN_CURL_EXIT" -ne 0 ]; then
+    admin_state="curl_failed"
+    admin_detail="admin :${ADMIN_PORT} check failed — curl could not connect (exit ${ADMIN_CURL_EXIT}) after ${admin_attempt} attempt(s). MEASURED: connection failure only. Possible causes (not verified by this check): admin daemon down, port not listening, network/firewall issue."
+  elif [ "$ADMIN_BODY_SIZE" -eq 0 ]; then
+    admin_state="empty_body"
+    admin_detail="admin :${ADMIN_PORT} check failed — HTTP ${ADMIN_CODE}, empty response body (0 bytes) after ${admin_attempt} attempt(s). MEASURED: empty body only. Possible causes (not verified by this check): daemon returned an empty response, upstream aggregation error."
+  elif ! printf '%s' "$ADMIN_BODY" | grep -q "Kanban de histórias"; then
+    admin_state="string_missing"
+    admin_detail="admin :${ADMIN_PORT} check failed — HTTP ${ADMIN_CODE}, body ${ADMIN_BODY_SIZE} bytes, does not contain 'Kanban de histórias' after ${admin_attempt} attempt(s). MEASURED: string absent from a non-empty body only. Possible causes (not verified by this check): registration missing, admin daemon not restarted after ga-52ib rename, or a transient aggregation render issue."
+  else
+    admin_state="ok"
+    break
+  fi
+
+  if [ "$admin_attempt" -lt "$ADMIN_RETRIES" ]; then
+    log "Check 4 attempt ${admin_attempt}/${ADMIN_RETRIES}: ${admin_state} — retrying in ${ADMIN_RETRY_DELAY}s ..."
+    sleep "$ADMIN_RETRY_DELAY"
+  fi
+done
+
+if [ "$admin_state" != "ok" ]; then
+  fail "$admin_detail"
 fi
-if ! echo "$ADMIN_BODY" | grep -q "Kanban de histórias"; then
-  fail "admin :${ADMIN_PORT} does not list 'Kanban de histórias' — registration missing or admin daemon not restarted after ga-52ib rename."
+if [ "$admin_attempt" -gt 1 ]; then
+  log "admin registration present OK (needed retry: passed on attempt ${admin_attempt}/${ADMIN_RETRIES})"
+else
+  log "admin registration present OK"
 fi
-if ! echo "$ADMIN_BODY" | grep -q "${PAINEL_PORT}"; then
+if ! printf '%s' "$ADMIN_BODY" | grep -q "${PAINEL_PORT}"; then
   log "WARN: admin console lists the painel but not port ${PAINEL_PORT} explicitly (non-fatal)."
 fi
-log "admin registration present OK"
 
 # ── Optional story-specific test ──────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
