@@ -33,8 +33,15 @@
 #      gate-status (ready/claimed/queued/dispatching/reviewing/running) means
 #      the gate IS holding the branch right now — not orphaned, skip. Otherwise
 #      (no artifact at all, OR only parked/terminal ones like needs-rebase/
-#      error/passed/failed/superseded/deferred, OR a closed artifact) → FLAG.
-#   4. Report only — this daemon NEVER mutates a bead (no label/status/assignee/
+#      error/passed/failed/superseded/deferred, OR a closed artifact) → a
+#      CANDIDATE for flagging.
+#   4. Split candidates into orphan-suspect vs. parado-de-proposito (ga-cjk1j):
+#      a bead carrying gate:needs-human* / blocked-by:* / status=blocked is a
+#      human's self-declared park — it's counted (see the "PARK:" log line and
+#      the mail summary) but never enters the age-based alert/cooldown/comment
+#      pipeline below. Everything else is an orphan-suspect and flows through
+#      step 5 exactly as before this split.
+#   5. Report only — this daemon NEVER mutates a bead (no label/status/assignee/
 #      close calls of any kind). Per-bead: `bd comment` (durable, lives on the
 #      bead itself). Aggregate: `notify` (low priority — see note below) +
 #      `gc mail send mayor`. Re-alerting on an already-flagged bead is
@@ -49,9 +56,19 @@
 # ga-d3eg2 explicitly scoped this follow-up to detection-only for that reason:
 # "Detection-only is the safer starting point; auto-remediation (if ever
 # wanted) should be a separate, later decision made with real detector data in
-# hand." Some flagged beads are EXPECTED to look this way (gate:needs-human,
-# blocked-by:*) — this watchdog does not try to distinguish "expected park"
-# from "silently stranded"; it surfaces the raw labels so a human/Mayor can.
+# hand."
+#
+# PARK-VS-ORPHAN SPLIT (ga-cjk1j, fixing a ga-l8yh6 blind spot): the first
+# release of this watchdog surfaced every gate:*-labeled bead with no active
+# marker alike, whether silently stranded or deliberately parked by a human
+# (gate:needs-human*, blocked-by:*, status=blocked). Measured 2026-08-05: 11 of
+# 20 (55%) flagged beads were self-declared, intentional parks — a channel
+# that re-alerts on the same 11 every cooldown cycle trains readers to ignore
+# the whole report, and that's how the 9 real orphan-suspects hid in the
+# noise. A park bead is now excluded from the age-based alert/cooldown/comment
+# pipeline entirely and only contributes to a count (see the "PARK:" log line
+# and the mail summary) — it is still logged every sweep, but it no longer
+# competes for attention with a bead nobody decided to leave alone.
 #
 # NOTIFY PRIORITY: low (-p 2), not the -p 4 used by throughput-stall-watchdog.
 # That watchdog pages Athos only when auto-recovery of a SYSTEMIC stall fails
@@ -239,11 +256,32 @@ run_sweep() {
     fi
 
     local ids_labels
-    ids_labels=$(printf '%s' "$aged_json" | jq -r '.[] | [.id, ((.labels//[]) | map(select(startswith("gate:"))) | join(",")), (.updated_at // .created_at // "")] | @tsv' 2>/dev/null)
+    # is_park (ga-cjk1j): computed per-label via jq's own startswith() (exact
+    # prefix semantics on each label individually) rather than a substring
+    # match on the joined-labels string later in bash — a joined string like
+    # "gate:needs-human,gate:queued" makes "contains gate:needs-human" easy to
+    # get right, but a naive bash substring check is the wrong tool once any
+    # label could plausibly share a prefix (e.g. a hypothetical
+    # "gate:needs-humanoid"); doing it once here on the real label array is
+    # unambiguous. status=blocked is the other park signal (ga-cjk1j AC3): 4 of
+    # the 11 known intentional parks carry status=blocked with NO
+    # gate:needs-human label at all — a labels-only check would miss them.
+    ids_labels=$(printf '%s' "$aged_json" | jq -r '
+        .[] | . as $b
+        | ($b.labels // []) as $L
+        | [ $b.id,
+            ([$L[] | select(startswith("gate:"))] | join(",")),
+            ($b.updated_at // $b.created_at // ""),
+            ( if ( ($L | any(startswith("gate:needs-human")))
+                   or ($L | any(startswith("blocked-by:")))
+                   or (($b.status // "") == "blocked") )
+              then "1" else "0" end )
+          ] | @tsv
+      ' 2>/dev/null)
     [ -z "${ids_labels:-}" ] && continue
 
-    local bid blabels bts age_min probe active lstatus lcount
-    while IFS=$'\t' read -r bid blabels bts; do
+    local bid blabels bts is_park age_min probe active lstatus lcount
+    while IFS=$'\t' read -r bid blabels bts is_park; do
       [ -z "${bid:-}" ] && continue
       probe="$(_gate_artifact_probe "$bid")"
       active="$(printf '%s' "$probe" | cut -f1)"
@@ -260,9 +298,36 @@ run_sweep() {
       else
         age_min="?"
       fi
-      flagged_tsv="${flagged_tsv}${bid}\t${store}\t${age_min}\t${blabels}\t${lstatus}\t${lcount}\n"
+      flagged_tsv="${flagged_tsv}${bid}\t${store}\t${age_min}\t${blabels}\t${lstatus}\t${lcount}\t${is_park}\n"
     done <<< "$ids_labels"
   done
+
+  # ── ga-cjk1j: split flagged candidates into orphan-suspect (drives the
+  # age-based alert below, unchanged) vs. parado-de-proposito (counted only).
+  # Splitting here, before ANY state/cooldown/comment/notify/mail logic runs,
+  # means every downstream stage operates on orphan_tsv exactly as it did
+  # before this fix — an un-parked bead's behavior is byte-for-byte identical
+  # (AC2 control: a real orphan must keep alerting exactly as today). ────────
+  local orphan_tsv="" park_tsv="" park_count=0
+  local bid store2 age_min labels lstatus lcount is_park
+  while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount is_park; do
+    [ -z "${bid:-}" ] && continue
+    if [ "$is_park" = "1" ]; then
+      park_tsv="${park_tsv}${bid}\t${store2}\t${age_min}\t${labels}\t${lstatus}\t${lcount}\n"
+      park_count=$((park_count + 1))
+    else
+      orphan_tsv="${orphan_tsv}${bid}\t${store2}\t${age_min}\t${labels}\t${lstatus}\t${lcount}\n"
+    fi
+  done < <(printf '%b' "$flagged_tsv")
+  flagged_tsv="$orphan_tsv"
+
+  if [ "$park_count" -gt 0 ]; then
+    log "PARK: ${park_count} bead(s) parado(s) de proposito (gate:needs-human*/blocked-by:*/status=blocked) — nao contam para o alerta de orfao"
+    printf '%b' "$park_tsv" | while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
+      [ -z "${bid:-}" ] && continue
+      log "  - PARK $bid ($(_store_name "$store2")) age=${age_min}min labels=[${labels}]"
+    done
+  fi
 
   if [ -z "${flagged_tsv:-}" ]; then
     # Nothing currently orphaned — clear any stale state so a future episode
@@ -271,7 +336,9 @@ run_sweep() {
       rm -f "$STATE_FILE" 2>/dev/null || true
       log "STATE CLEARED: no orphaned gate-labeled beads found — previous episode(s) resolved"
     fi
-    log "OK: 0 beads with gate:* label and zero active marker (>=${GOLW_STALE_MINUTES}min) across ${GOLW_STORES}"
+    local park_suffix=""
+    [ "$park_count" -gt 0 ] && park_suffix=" (${park_count} parked, excluded)"
+    log "OK: 0 beads with gate:* label and zero active marker (>=${GOLW_STALE_MINUTES}min) across ${GOLW_STORES}${park_suffix}"
     return 0
   fi
 
@@ -320,7 +387,9 @@ run_sweep() {
   done
 
   if [ "${new_count:-0}" -eq 0 ] && [ "${resolved_count:-0}" -eq 0 ]; then
-    log "OK: all ${total_flagged} flagged bead(s) already alerted within cooldown (${GOLW_ALERT_COOLDOWN_S}s) — no new notification"
+    local park_suffix2=""
+    [ "$park_count" -gt 0 ] && park_suffix2=" (+${park_count} parked, excluded)"
+    log "OK: all ${total_flagged} flagged bead(s) already alerted within cooldown (${GOLW_ALERT_COOLDOWN_S}s) — no new notification${park_suffix2}"
     if [ "${GOLW_DRY_RUN:-0}" != "1" ]; then
       mkdir -p "$GOLW_STATE_DIR" 2>/dev/null || true
       printf '%s' "$state" > "$STATE_FILE" 2>/dev/null || true
@@ -337,7 +406,7 @@ run_sweep() {
   local msg
   while IFS=$'\t' read -r bid store2 age_min labels lstatus lcount; do
     [ -z "${bid:-}" ] && continue
-    msg="gate-orphaned-label-watchdog (ga-l8yh6): this bead carries gate:* label(s) [${labels}] with no ACTIVE quality-gate-marker/-run for >= ${GOLW_STALE_MINUTES}min (age: ${age_min}min). Last known gate artifact: ${lstatus} (${lcount} open artifact(s) referencing this bead; 0 = none ever found in the HQ store). Detection-only report — no label/status/assignee was touched. Common causes seen historically (ga-d3eg2): stale label after a manual fix, branch conflicts needing re-anchor, already-merged-but-never-closed, or an intentional park (gate:needs-human, blocked-by:*) — a human/Mayor should triage."
+    msg="gate-orphaned-label-watchdog (ga-l8yh6): this bead carries gate:* label(s) [${labels}] with no ACTIVE quality-gate-marker/-run for >= ${GOLW_STALE_MINUTES}min (age: ${age_min}min). Last known gate artifact: ${lstatus} (${lcount} open artifact(s) referencing this bead; 0 = none ever found in the HQ store). Detection-only report — no label/status/assignee was touched. Common causes seen historically (ga-d3eg2): stale label after a manual fix, branch conflicts needing re-anchor, or already-merged-but-never-closed (an intentional park via gate:needs-human*/blocked-by:*/status=blocked is excluded from this alert entirely — see ga-cjk1j) — a human/Mayor should triage."
     if [ -n "${GOLW_TEST_COMMENTS_LOG:-}" ]; then
       echo "comment:${store2}:${bid}:${msg}" >> "$GOLW_TEST_COMMENTS_LOG" 2>/dev/null || true
     else
@@ -349,6 +418,9 @@ run_sweep() {
   # a count of what's unchanged, not the full flagged set every cycle. ───────
   local unchanged_count=$(( total_flagged - new_count ))
   local summary="GATE ORPHANED LABEL: ${new_count} new/due, ${resolved_count} resolved, ${unchanged_count} unchanged-already-reported — ${total_flagged} total currently flagged (>=${GOLW_STALE_MINUTES}min)."
+  if [ "$park_count" -gt 0 ]; then
+    summary="${summary} +${park_count} parado(s) por decisao humana (gate:needs-human*/blocked-by:*/status=blocked) — nao contam para o alerta acima."
+  fi
 
   if [ -n "${GOLW_TEST_NOTIFIED:-}" ]; then
     echo "notify:$summary" >> "$GOLW_TEST_NOTIFIED" 2>/dev/null || true
@@ -394,9 +466,10 @@ ${resolved_lines}
   mail_body="${mail_body}
 This is SURFACE-ONLY — no label/status/assignee was touched on any bead. Common
 root causes seen historically (ga-d3eg2's own measurement): a stale label left
-after a manual fix, a branch that conflicts with main and needs re-anchor, work
-already merged but the bead never closed, or an intentional park (gate:needs-human,
-blocked-by:*) that just isn't obvious from gate-idleness alone.
+after a manual fix, a branch that conflicts with main and needs re-anchor, or
+work already merged but the bead never closed. Beads carrying an intentional
+park signal (gate:needs-human*, blocked-by:*, status=blocked) are excluded from
+this list entirely (ga-cjk1j) — see the parked-count line above.
 
 Per-bead detail for NEW/DUE beads is also posted as a comment on each bead.
 Re-alerts for an already-flagged bead are suppressed for ${GOLW_ALERT_COOLDOWN_S}s
@@ -770,6 +843,89 @@ BDSTUB
     grep -q "$id" "$MAIL15" 2>/dev/null && ok "scenario 15: first report includes $id" || bad "scenario 15 (ga-lnpa7 AC4 regression): first report is missing $id"
   done
   grep -q "already reported" "$MAIL15" 2>/dev/null && bad "scenario 15: first report should have zero already-reported beads to summarize" || ok "scenario 15: no spurious already-reported summary on a first run"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 16 (ga-cjk1j AC1, FIXTURE): a bead carrying gate:queued +
+  # gate:needs-human, stale (>180min) → must NOT enter NEW/DUE at all; appears
+  # at most in the parked count. This is the exact bug measured 2026-08-05:
+  # 11 of 20 flagged beads were self-declared parks re-alerted every cycle. ──
+  echo "Scenario 16 (ga-cjk1j AC1 fixture): gate:queued+gate:needs-human, stale → NOT flagged as orphan, counted as PARK only"
+  printf '[%s]' "$(mk_candidate cand-park1 "$TMP/hq" "gate:queued,gate:needs-human" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-park1.json"
+  NOTIF16="$TMP/notif16"; MAIL16="$TMP/mail16"; COMM16="$TMP/comm16"
+  : > "$NOTIF16"; : > "$MAIL16"; : > "$COMM16"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF16" GOLW_TEST_MAILED="$MAIL16" GOLW_TEST_COMMENTS_LOG="$COMM16" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 16: park-labeled bead does not enter NEW/DUE (return 0)" || bad "scenario 16 (ga-cjk1j AC1 regression): a gate:needs-human bead was treated as an orphan-suspect, got $rc"
+  [ ! -s "$COMM16" ] && ok "scenario 16: no comment posted on the parked bead" || bad "scenario 16: comment posted on a bead carrying gate:needs-human (should be excluded)"
+  [ ! -s "$NOTIF16" ] && ok "scenario 16: no notify fired for a park-only sweep" || bad "scenario 16: notify fired despite only a parked bead being present"
+  [ ! -s "$MAIL16" ] && ok "scenario 16: no mail fired for a park-only sweep" || bad "scenario 16: mail fired despite only a parked bead being present"
+  grep -q "PARK: 1 bead" "$LOG" 2>/dev/null && ok "scenario 16: log records the park count" || bad "scenario 16: log missing the PARK count line"
+  grep -q "cand-park1" "$LOG" 2>/dev/null && ok "scenario 16: log names the parked bead" || bad "scenario 16: log does not name the parked bead cand-park1"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 17 (ga-cjk1j AC2, CONTROL — the real alert must not disappear):
+  # a bead with gate:queued and NO park signal, stale → CONTINUES alerting
+  # exactly as before this fix. If this fails, the fix blinded the watchdog,
+  # which is worse than the bug it fixes. ──────────────────────────────────
+  echo "Scenario 17 (ga-cjk1j AC2 control): gate:queued with NO park signal, stale → still flags exactly as before this fix"
+  printf '[%s]' "$(mk_candidate cand-orphan1 "$TMP/hq" "gate:queued" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-orphan1.json"
+  NOTIF17="$TMP/notif17"; MAIL17="$TMP/mail17"; COMM17="$TMP/comm17"
+  : > "$NOTIF17"; : > "$MAIL17"; : > "$COMM17"
+  GOLW_TEST_NOTIFIED="$NOTIF17" GOLW_TEST_MAILED="$MAIL17" GOLW_TEST_COMMENTS_LOG="$COMM17" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 17: real orphan (no park signal) still flags (return 1)" || bad "scenario 17 (ga-cjk1j AC2 regression): the fix must not blind the watchdog to a genuine orphan, got $rc"
+  grep -q "cand-orphan1" "$COMM17" 2>/dev/null && ok "scenario 17: comment posted on the real orphan" || bad "scenario 17 (ga-cjk1j AC2 regression): no comment on cand-orphan1 — the fix silenced a real alert"
+  [ -s "$NOTIF17" ] && ok "scenario 17: notify still fires for a real orphan" || bad "scenario 17: notify did not fire for a real orphan"
+  [ -s "$MAIL17" ] && ok "scenario 17: mail still fires for a real orphan" || bad "scenario 17: mail did not fire for a real orphan"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 18 (ga-cjk1j AC3, CONTROL2): status=blocked with NO
+  # gate:needs-human/blocked-by label → still counts as park. 4 of the 11
+  # known intentional parks in production carry status=blocked with no
+  # needs-human label at all — a labels-only check would miss exactly these. ──
+  echo "Scenario 18 (ga-cjk1j AC3 control2): status=blocked with NO gate:needs-human/blocked-by label → still counted as park, not orphan"
+  printf '[{"id":"cand-park2","status":"blocked","updated_at":"%s","labels":["gate:queued"]}]' "$OLD_TS" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-park2.json"
+  NOTIF18="$TMP/notif18"; MAIL18="$TMP/mail18"; COMM18="$TMP/comm18"
+  : > "$NOTIF18"; : > "$MAIL18"; : > "$COMM18"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF18" GOLW_TEST_MAILED="$MAIL18" GOLW_TEST_COMMENTS_LOG="$COMM18" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 18: status=blocked alone (no needs-human label) is still treated as park (return 0)" || bad "scenario 18 (ga-cjk1j AC3 regression): a status=blocked bead with no needs-human label was misflagged as orphan, got $rc"
+  [ ! -s "$COMM18" ] && ok "scenario 18: no comment posted on the status=blocked bead" || bad "scenario 18: comment posted despite status=blocked"
+  grep -q "PARK: 1 bead" "$LOG" 2>/dev/null && ok "scenario 18: log records the park count for the status=blocked bead" || bad "scenario 18: log missing PARK count for a status=blocked-only park signal"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 19 (ga-cjk1j, mixed — mirrors the real production shape): 1
+  # real orphan + 2 parked beads (one label-based, one status-based) in the
+  # SAME sweep. Verifies the split doesn't cross-contaminate: the orphan must
+  # still alert on its own merits, and neither park bead may leak into its
+  # comment/mail, while both parks are counted together. ───────────────────
+  echo "Scenario 19 (ga-cjk1j mixed): 1 real orphan + 2 parked beads (label-based and status-based) in the same sweep"
+  printf '[%s,%s,%s]' \
+    "$(mk_candidate cand-mix-orphan "$TMP/hq" "gate:fix-attempt:1" "$OLD_TS")" \
+    "$(mk_candidate cand-mix-park1 "$TMP/hq" "gate:fix-attempt:1,gate:needs-human:technical" "$OLD_TS")" \
+    "$(printf '{"id":"cand-mix-park2","status":"blocked","updated_at":"%s","labels":["gate:fix-attempt:1"]}' "$OLD_TS")" \
+    > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-mix-orphan.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-mix-park1.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-mix-park2.json"
+  NOTIF19="$TMP/notif19"; MAIL19="$TMP/mail19"; COMM19="$TMP/comm19"
+  : > "$NOTIF19"; : > "$MAIL19"; : > "$COMM19"; : > "$LOG"
+  GOLW_TEST_NOTIFIED="$NOTIF19" GOLW_TEST_MAILED="$MAIL19" GOLW_TEST_COMMENTS_LOG="$COMM19" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 19: mixed sweep still flags the real orphan (return 1)" || bad "scenario 19: mixed sweep should flag cand-mix-orphan, got $rc"
+  grep -q "cand-mix-orphan" "$COMM19" 2>/dev/null && ok "scenario 19: comment posted on the real orphan only" || bad "scenario 19: no comment on cand-mix-orphan"
+  grep -q "cand-mix-park1" "$COMM19" 2>/dev/null && bad "scenario 19 (ga-cjk1j regression): comment posted on a gate:needs-human-labeled park bead" || ok "scenario 19: no comment on the label-based park bead"
+  grep -q "cand-mix-park2" "$COMM19" 2>/dev/null && bad "scenario 19 (ga-cjk1j regression): comment posted on a status=blocked park bead" || ok "scenario 19: no comment on the status-based park bead"
+  grep -q "+2 parado" "$MAIL19" 2>/dev/null && ok "scenario 19: mail summary counts both parked beads" || bad "scenario 19: mail summary missing the '+2 parado(s)' count"
+  grep -q "cand-mix-park1" "$MAIL19" 2>/dev/null && bad "scenario 19 (ga-cjk1j regression): mail individually names a parked bead" || ok "scenario 19: mail does not individually name cand-mix-park1"
+  grep -q "PARK: 2 bead" "$LOG" 2>/dev/null && ok "scenario 19: log records park_count=2" || bad "scenario 19: log missing PARK count of 2"
   rm -f "$STATE_FILE" 2>/dev/null
 
   # ── Scenario 11: bash -n syntax check ──────────────────────────────────────
