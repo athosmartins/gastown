@@ -1,0 +1,4 @@
+# DRAFT — HQ pack contido (sem named_session = containment). Herda system gastown via city.toml.
+[pack]
+name = "gastown-hq"
+schema = 2
