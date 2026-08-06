@@ -75,7 +75,12 @@ GC_CITY="/Users/athos/gt/.gascity-gastown-hq"
 # Query-tool token allowed inside a `VAR=$( ... )` assignment for the shell
 # detector. Boundary-safe via explicit non-identifier character classes —
 # never `\b` (see style note above).
-QUERY_TOOL_RE='([^A-Za-z0-9_]|^)(bd|dolt|jq|grep|git|gh|curl|sqlite3|mysql|aws)([^A-Za-z0-9_]|$)'
+#
+# ga-l4nx1: gc was missing — the tool this whole scanner exists to cover (ga-p5q3's
+# own motivating incident, "gc <cmd> --json prints an error envelope on failure",
+# ga-07509) was invisible to it. Verified: none of ga-07509's 16 real call sites
+# would have been caught before this line added `gc`.
+QUERY_TOOL_RE='([^A-Za-z0-9_]|^)(bd|gc|dolt|jq|grep|git|gh|curl|sqlite3|mysql|aws)([^A-Za-z0-9_]|$)'
 
 # ── C2 (priority) + C1-shell: query-command assignment whose failure is ────
 # masked by an empty-looking fallback (C2) or by an unconditional `|| true`
@@ -90,8 +95,22 @@ scan_shell_query_masking() {
     esac
     printf '%s' "$line" | grep -Eq "$QUERY_TOOL_RE" || continue
     case "$line" in
+      # ga-l4nx1: gc_json_or_unknown() (ga-07509's own fix) already captures the
+      # real exit code AND validates the JSON envelope's `ok` field before ever
+      # returning — a trailing `|| true` here is the documented memoized-cache-
+      # with-retry idiom (see the helper's own doc comment: "CACHE=$(gc_json_or_
+      # unknown gc ...) || true; [ -z "$CACHE" ] unambiguously means failed"), not
+      # the raw-gc-call masking this scanner exists to catch. Adding gc to
+      # QUERY_TOOL_RE above would otherwise flag ga-07509's own fix at every one
+      # of its ~16 real call sites across pilot-dispatcher.sh / quality-gate-
+      # dispatcher.sh / quality-gate-guard.sh / auto-refino-dispatcher.sh — the
+      # exact "flags everything" failure this scanner's own header warns is as
+      # useless as flagging nothing. Matches both real call shapes: bare
+      # (`VAR=$(gc_json_or_unknown gc ...)`) and env-prefixed
+      # (`VAR=$(GC_CITY="$GC_CITY" gc_json_or_unknown timeout 15 gc ...)`).
+      *'=$('*'gc_json_or_unknown '*) ;;
       *'|| echo "[]"'* | *"|| echo '[]'"* | *'|| echo ""'* | *"|| echo ''"* | \
-        *'|| echo "0"'* | *'|| echo "null"'*)
+        *'|| echo "0"'* | *'|| echo "null"'* | *'|| echo "{}"'* | *"|| echo '{}'"*)
         echo "${file}:${lineno}:C2:${line}"
         ;;
       *'|| true'*)

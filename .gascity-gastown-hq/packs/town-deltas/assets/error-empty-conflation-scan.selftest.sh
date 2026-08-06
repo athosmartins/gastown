@@ -89,6 +89,42 @@ cat > "$FIXDIR/mixed/good_echo_var_jq.sh" <<'EOF'
 c_type=$(echo "$row" | jq -r '.issue_type // ""')
 EOF
 
+# ── ga-l4nx1: gc was missing from QUERY_TOOL_RE — this is the ga-07509 anti-
+# pattern's own tool, unable to catch its own motivating incident. Re-uses the
+# already-covered "[]" literal so this fixture isolates the gc-token addition
+# only (the {} literal is falsified separately below) ─────────────────────────
+cat > "$FIXDIR/mixed/bad_query_mask_gc.sh" <<'EOF'
+OUT=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "[]")
+EOF
+
+# ── ga-l4nx1: the C2 literal list didn't include `|| echo "{}"` / `|| echo
+# '{}'` — several of ga-07509's real 16 sites used the object-shaped empty
+# fallback (a `gc ... --json` failure "recovers" to an empty object, not an
+# empty array). Re-uses the already-covered `bd` tool so this fixture isolates
+# the {}-literal addition only ──────────────────────────────────────────────
+cat > "$FIXDIR/mixed/bad_query_mask_echo_object.sh" <<'EOF'
+_found=$(bd -C "$_store" show "$BEAD_ID" --json 2>/dev/null || echo "{}")
+EOF
+
+# ── GOOD (must NOT be flagged, ga-l4nx1): gc_json_or_unknown() is ga-07509's
+# OWN fix — it captures the real exit code and validates the JSON envelope's
+# `ok` field before ever returning; a trailing `|| true` here is the
+# documented memoized-cache-with-retry idiom (see the helper's own doc
+# comment), not the raw-gc-call masking this scanner exists to catch. Without
+# this exclusion, adding gc to QUERY_TOOL_RE would flag ga-07509's fix at
+# every one of its ~16 real call sites — two shapes, both real (grep-verified
+# across pilot-dispatcher.sh / quality-gate-dispatcher.sh / quality-gate-
+# guard.sh / auto-refino-dispatcher.sh): bare, and env-var-prefixed ──────────
+cat > "$FIXDIR/mixed/good_gc_json_or_unknown.sh" <<'EOF'
+PILOT_RIG_PATHS_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json) || true
+EOF
+cp "$FIXDIR/mixed/good_gc_json_or_unknown.sh" "$FIXDIR/clean/"
+
+cat > "$FIXDIR/mixed/good_gc_json_or_unknown_envprefix.sh" <<'EOF'
+HR_H=$(GC_CITY="$GC_CITY" gc_json_or_unknown timeout 15 gc dolt health --json) || true
+EOF
+cp "$FIXDIR/mixed/good_gc_json_or_unknown_envprefix.sh" "$FIXDIR/clean/"
+
 # ── GOOD (must NOT be flagged): the established FIXED idiom — explicit rc
 # capture via `if ! VAR=$(cmd); then`, same shape as verdict_count_from_query
 # (ga-jfo7) / prune_decision (ga-u4yi attempt 1) ───────────────────────────
@@ -391,6 +427,20 @@ r="$(scan_shell_query_masking "$FIXDIR/mixed/good_echo_var_jq.sh")"
 [ -z "$r" ] && ok "ga-vkjs: echo \$var | jq // \"\" → NAO flagged (fonte inerte; falsificação da propria regra)" \
   || bad "ga-vkjs REGRESSION: echo-var-jq flagged (89% de ruido volta): '$r'"
 
+r="$(scan_shell_query_masking "$FIXDIR/mixed/bad_query_mask_gc.sh")"
+case "$r" in *:C2:*) ok "ga-l4nx1: gc --json ... || echo \"[]\" → flagged C2 (gc added to QUERY_TOOL_RE)" ;; *) bad "ga-l4nx1: gc token NOT flagged — the scanner is still blind to its own motivating tool: '$r'" ;; esac
+
+r="$(scan_shell_query_masking "$FIXDIR/mixed/bad_query_mask_echo_object.sh")"
+case "$r" in *:C2:*) ok "ga-l4nx1: bd ... || echo \"{}\" → flagged C2 ({} added to literal list)" ;; *) bad "ga-l4nx1: {} literal NOT flagged: '$r'" ;; esac
+
+r="$(scan_shell_query_masking "$FIXDIR/mixed/good_gc_json_or_unknown.sh")"
+[ -z "$r" ] && ok "ga-l4nx1: gc_json_or_unknown(...) || true (bare) → NOT flagged (ga-07509's own fix, not the bug)" \
+  || bad "ga-l4nx1 REGRESSION: gc_json_or_unknown bare shape flagged: '$r'"
+
+r="$(scan_shell_query_masking "$FIXDIR/mixed/good_gc_json_or_unknown_envprefix.sh")"
+[ -z "$r" ] && ok "ga-l4nx1: gc_json_or_unknown(...) || true (env-prefixed) → NOT flagged" \
+  || bad "ga-l4nx1 REGRESSION: gc_json_or_unknown env-prefixed shape flagged: '$r'"
+
 r="$(scan_shell_query_masking "$FIXDIR/mixed/good_rc_capture.sh")"
 [ -z "$r" ] && ok "fixed if-!-rc-capture idiom → NOT flagged (no false positive)" || bad "REGRESSION: fixed idiom flagged: '$r'"
 
@@ -452,9 +502,11 @@ mixed_count=$(wc -l <"$MIXED_OUT" | tr -d '[:space:]')
 # ga-9krhl: +1 for canonical_control_except.py (must still be counted — it is
 # NOT under any excluded path). The 6 dupe_*/mayor/rig,refinery/rig,polecats,
 # .worktrees,bak-dir fixtures must all stay find-excluded (net +0), so the
-# total becomes 11, not 17.
-[ "$mixed_count" = "11" ] && ok "mixed fixture dir → 11 findings (10 pre-existing + 1 canonical control; the 6 ga-9krhl copy/backup dupes correctly excluded, nothing missed or double-counted)" \
-  || bad "expected 11 findings in mixed dir, got $mixed_count"
+# total becomes 11. ga-l4nx1: +2 for bad_query_mask_gc.sh (gc token) and
+# bad_query_mask_echo_object.sh ({} literal) — the 2 good_gc_json_or_unknown*
+# fixtures add 0 (must NOT be flagged), so the total becomes 13, not 17.
+[ "$mixed_count" = "13" ] && ok "mixed fixture dir → 13 findings (11 pre-existing + 2 ga-l4nx1 new-detection cases; the 2 gc_json_or_unknown good fixtures correctly excluded, nothing missed or double-counted)" \
+  || bad "expected 13 findings in mixed dir, got $mixed_count"
 
 case "$(cat "$MIXED_OUT")" in
   *fixture_shape.selftest.sh*) bad "ga-6jfuo REGRESSION: *.selftest.sh file was scanned by run_scan (should be find-excluded): $(grep 'fixture_shape.selftest.sh' "$MIXED_OUT")" ;;
@@ -501,8 +553,8 @@ rm -f "$CLEAN_OUT"
 echo "── CLI wrapper ──"
 out="$(bash "$SCANNER" --path "$FIXDIR/mixed" --quiet)"; rc=$?
 [ "$rc" = "0" ] && ok "CLI exits 0 on a completed scan with findings" || bad "CLI exit code was $rc, expected 0"
-printf '%s\n' "$out" | grep -q '^error-empty-conflation-scan: 11 finding(s)$' \
-  && ok "CLI summary line reports 11 finding(s)" || bad "CLI summary line unexpected: $(printf '%s\n' "$out" | head -1)"
+printf '%s\n' "$out" | grep -q '^error-empty-conflation-scan: 13 finding(s)$' \
+  && ok "CLI summary line reports 13 finding(s)" || bad "CLI summary line unexpected: $(printf '%s\n' "$out" | head -1)"
 
 bash "$SCANNER" --path "$FIXDIR/does-not-exist" --quiet >/tmp/.conflation-selftest-missing-path.$$ 2>&1
 rc=$?
