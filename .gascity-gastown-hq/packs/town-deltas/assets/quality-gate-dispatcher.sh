@@ -2342,6 +2342,117 @@ read_rebase_attempt() {
   printf '%s' "$n"
 }
 
+# is_transient_spawn_error <spawn_err_text> — "1" if the captured stderr from a
+# failed `gc session new` reviewer spawn looks like a TRANSIENT connectivity
+# blip (Dolt/MySQL connection dropped mid-call), "0" otherwise. Pure (no I/O),
+# same shape as gate_should_exile_tier5 above, so a selftest can drift-guard
+# the classification directly without touching Dolt.
+# ga-2u38b: a reviewer-spawn failure used to be ONE undifferentiated bucket —
+# ANY empty session_id aborted the run and parked the marker at
+# gate-status:error (which no sweep re-admits), mixing "the network blinked"
+# with "the template/session cap is broken"
+# (root-class:transient-infra-is-terminal). The patterns below are the
+# signature observed live in the 2026-08-06 08:10:23 incident ("gc session
+# new: listing sessions: search wisps (merge): search wisps: invalid
+# connection", 12 occurrences that sweep) plus the standard Go/MySQL-driver
+# connection-drop family it belongs to. Deliberately NOT matching bare "EOF"
+# or "timeout" — those are common substrings of unrelated failures too, and a
+# false "transient" classification would silently mask a real broken-spawn
+# outage behind endless auto-retries instead of ever reaching gate-status:error.
+is_transient_spawn_error() {
+  local err_text="${1:-}"
+  case "$err_text" in
+    *"invalid connection"*|*"read tcp"*|*"broken pipe"*|*"connection reset"*|*"dial tcp"*|*"connection refused"*|*"i/o timeout"*)
+      printf '1' ;;
+    *)
+      printf '0' ;;
+  esac
+}
+
+# read_spawn_fail_count <marker_id> — fetch the current highest
+# gate:spawn-fail-count:N value recorded on the marker (0 if none present).
+# ga-2u38b: mirrors read_rebase_attempt's label-counter convention above, but
+# on its OWN label prefix — a separate counter/budget from rebase retries so
+# the two failure classes (rebase-vs-main conflicts, reviewer-spawn
+# connectivity blips) can never shadow or exhaust each other's cap.
+read_spawn_fail_count() {
+  local marker_id="${1:-}" n
+  n=$(bd -C "$GC_CITY" show "$marker_id" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null \
+    | sed -nE 's/^gate:spawn-fail-count:([0-9]+)$/\1/p' | sort -rn | head -1 || true)
+  [ -z "$n" ] && n=0
+  printf '%s' "$n"
+}
+
+# ga-2u38b: transient reviewer-spawn retry knobs — kept separate from the
+# ga-piscg systemic-outage counters (defined further below, near
+# SPAWN_ABORT_THRESHOLD). Those answer "is spawn broken town-wide" (file-based,
+# spans all markers); these answer "has THIS marker's spawn hit a transient
+# connection blip" (per-marker label, read via read_spawn_fail_count). A
+# systemic outage still pages a human (unchanged); an isolated blip on one
+# marker now self-heals instead. Declared here, BEFORE the
+# GATE_DISPATCHER_LIB_ONLY cutoff below (unlike SPAWN_ABORT_*), because
+# gate_spawn_failure_requeue_or_error (next function) reads
+# GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS directly — a lib-only source (selftests)
+# must see a real default, not an unbound variable at call time.
+GATE_SPAWN_RETRY_MAX="${GATE_SPAWN_RETRY_MAX:-1}"                           # in-process retries before giving up on this sweep
+GATE_SPAWN_RETRY_BACKOFF_SECS="${GATE_SPAWN_RETRY_BACKOFF_SECS:-3}"         # short backoff between in-process retries
+GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS="${GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS:-3}" # cross-sweep cap before parking at gate-status:error
+
+# gate_spawn_failure_requeue_or_error <marker_id> <spawn_err> — decides AND
+# APPLIES (bd label/comment writes) whether a reviewer-spawn failure on
+# <marker_id> requeues to gate-status:ready (transient, under cap, write
+# verified) or falls through to gate-status:error (non-transient, cap
+# exceeded, or the counter write itself could not be verified). Echoes
+# "ready" or "error"; the CALLER always performs the actual gate-status:error
+# write itself on "error" (this function never writes it) — exactly one
+# place in the spawn-failure path writes gate-status:error, matching every
+# other error path in this file. ga-2u38b.
+#
+# MUTE BY CONSTRUCTION (ga-kgtiw/gate-fix-4 lesson,
+# [[error-and-empty-must-not-produce-the-same-value]]): zero log/warn/err
+# calls in this body. Every real call site consumes this function's stdout
+# via $(...) — a log/warn/err call using this script's own helpers (plain
+# `echo`, not `>&2`) would splice straight into the captured token and
+# corrupt the ready/error comparison silently. The caller logs AFTER reading
+# the returned token, same discipline as gate_marker_status_ensure.
+gate_spawn_failure_requeue_or_error() {
+  local marker_id="${1:-}" spawn_err="${2:-}"
+  local prev next
+
+  if [ "$(is_transient_spawn_error "$spawn_err")" != "1" ]; then
+    printf 'error'
+    return 0
+  fi
+
+  prev=$(read_spawn_fail_count "$marker_id")
+  case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
+  next=$((prev + 1))
+
+  if [ "$next" -ge "$GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS" ]; then
+    bd -C "$GC_CITY" comment "$marker_id" "ga-2u38b: reviewer-spawn transient connection failures persisted for $GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS attempts (last spawn_err=${spawn_err:-none}) — giving up on auto-retry, parking at gate-status:error for human/Mayor triage." 2>/dev/null || true
+    printf 'error'
+    return 0
+  fi
+
+  bd -C "$GC_CITY" label remove "$marker_id" "gate:spawn-fail-count:$prev" -q 2>/dev/null || true
+  bd -C "$GC_CITY" label add    "$marker_id" "gate:spawn-fail-count:$next" -q 2>/dev/null || true
+
+  # ga-6dp9 pattern: the label add above is fire-and-forget — verify it
+  # actually stuck instead of trusting it, so a silently-lost write can't
+  # replay "attempt 1/N" forever.
+  if [ "$(gate_rebase_attempt_advanced "$next" "$(read_spawn_fail_count "$marker_id")")" = "stuck" ]; then
+    bd -C "$GC_CITY" comment "$marker_id" "ga-2u38b: reviewer-spawn hit a transient connection error (spawn_err=${spawn_err:-none}) but the gate:spawn-fail-count label write did not verifiably land — escalating to gate-status:error now rather than risk an infinite attempt-1 retry loop." 2>/dev/null || true
+    printf 'error'
+    return 0
+  fi
+
+  bd -C "$GC_CITY" label add "$marker_id" "gate-status:ready" -q 2>/dev/null || true
+  bd -C "$GC_CITY" comment "$marker_id" "ga-2u38b: reviewer-spawn hit a transient connection error (spawn_err=${spawn_err:-none}) — attempt $next/$GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS. Requeued to gate-status:ready for automatic re-admission next sweep; no human action needed. Work already done this run (rebase/push/stale-base-check/sizing/verdict beads) is not being thrown away for a socket blip." 2>/dev/null || true
+  printf 'ready'
+  return 0
+}
+
 # branch_tip_is_merge_commit <branch_ref> — "1" if <branch_ref>'s tip commit
 # itself has a second parent (i.e. IS a merge commit), "0" otherwise —
 # including when the ref cannot be resolved at all (fail toward the existing,
@@ -7474,10 +7585,37 @@ TASK
 
   SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.session_id // empty')
 
+  # ── ga-2u38b: short in-process retry BEFORE giving up on the run. The
+  # rebase/push/stale-base-check/sizing/verdict-bead work above is already
+  # done and paid for — if this is a transient Dolt/MySQL connection blip, a
+  # few seconds' backoff often clears it outright and the run never has to
+  # touch the marker's gate-status at all. Only loops while the failure still
+  # classifies as transient; a non-transient failure (broken template,
+  # session-cap deadlock) gets zero extra tries here and falls straight
+  # through to the classification below, same as before this fix.
+# SELFTEST-EXTRACT spawn-retry-loop: BEGIN
+  _spawn_retry_n=0
+  while [ -z "$SESSION_ID" ] \
+      && [ "$_spawn_retry_n" -lt "$GATE_SPAWN_RETRY_MAX" ] \
+      && [ "$(is_transient_spawn_error "$_spawn_err")" = "1" ]; do
+    _spawn_retry_n=$((_spawn_retry_n + 1))
+    warn "  Reviewer $i spawn hit a transient connection error (spawn_err=${_spawn_err:-none}) — in-process retry $_spawn_retry_n/$GATE_SPAWN_RETRY_MAX after ${GATE_SPAWN_RETRY_BACKOFF_SECS}s backoff (ga-2u38b)."
+    sleep "$GATE_SPAWN_RETRY_BACKOFF_SECS" 2>/dev/null || true
+    _spawn_err_file="/tmp/gate-reviewer-spawn-err-$$.${i}.r${_spawn_retry_n}"
+    SESSION_JSON=$(gc --city "$GC_CITY" session new gate-reviewer \
+      --no-attach \
+      --title "gate-reviewer-$i: $BRANCH" \
+      --json \
+      2>"$_spawn_err_file" || echo "{}")
+    _spawn_err=$(head -c 300 "$_spawn_err_file" 2>/dev/null || echo "")
+    rm -f "$_spawn_err_file"
+    SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.session_id // empty')
+  done
+# SELFTEST-EXTRACT spawn-retry-loop: END
+
   if [ -z "$SESSION_ID" ]; then
     err "Failed to spawn reviewer session $i (ga-mzc3h). Aborting gate. spawn_err=${_spawn_err:-no output}"
     bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
 
     # ── ga-piscg: account this abort + escalate on K consecutive (across markers).
     # Every $() is guarded with `|| echo …` and every numeric is sanitized so this
@@ -7514,6 +7652,27 @@ TASK
         echo "$_sa_now" > "$SPAWN_ABORT_ALERT_FILE" 2>/dev/null || true
       fi
     fi
+
+    # ── ga-2u38b: transient connection failure ≠ terminal logic failure. ─────
+    # 12 occurrences observed 2026-08-06, heaviest exactly when the queue is
+    # full and Dolt is under load (worst possible time to discard a run).
+    # gate_spawn_failure_requeue_or_error (defined above, mirrors
+    # gate_marker_status_ensure's mute-function/caller-logs discipline)
+    # decides AND applies the requeue: a recognized transient-connection
+    # signature routes the marker back to gate-status:ready (auto re-admitted
+    # by the guard, ga-o64z1 Step 4b) with a bounded attempt counter instead
+    # of gate-status:error (which no sweep re-admits — a human had to flip it
+    # back by hand every time). Anything NOT matching the transient
+    # signature, a spent retry budget, or an unverifiable counter write
+    # returns "error" and falls through to the unchanged gate-status:error
+    # write below — the ACEITE test requires this distinction to actually
+    # exist, not just the transient path to work.
+    if [ "$(gate_spawn_failure_requeue_or_error "$MARKER_ID" "$_spawn_err")" = "ready" ]; then
+      log "SUPPRESSED PUSH (ga-2u38b non-terminal): reviewer-spawn transient connection failure for $MARKER_ID — gate-status:ready, spawn_err=${_spawn_err:-no output}."
+      exit 1
+    fi
+
+    bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
     exit 1
   fi
 
