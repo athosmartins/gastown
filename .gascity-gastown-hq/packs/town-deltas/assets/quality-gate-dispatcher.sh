@@ -1354,9 +1354,9 @@ GATE_MAX_ROUNDS_PER_SWEEP=$(printf '%s' "$GATE_MAX_ROUNDS_PER_SWEEP" | sed 's/^0
 
 # ── ga-991au: an INELIGIBLE marker must not end the whole sweep ───────────────
 # Step 0b selects ONE marker (`.[0]`). If that marker turns out to be ineligible
-# — Step 5b finds a live sibling gate-run for the same branch — the sweep used to
-# `exit 0` right there, having admitted nothing, and the other N queued markers
-# were never even looked at. Measured 2026-08-06: TEN consecutive sweeps admitted
+# — a live sibling gate-run for the same branch — the sweep used to `exit 0`
+# right there, having admitted nothing, and the other N queued markers were
+# never even looked at. Measured 2026-08-06: TEN consecutive sweeps admitted
 # NOTHING (6 YIELDED, 2 NEEDS_REBASE, 2 QUEUED) while 47 markers sat queued and
 # ZERO reviewers ran. One legitimate 11-17min run sterilises the entire queue for
 # its whole duration, because every sweep in that window re-picks that branch.
@@ -1364,6 +1364,35 @@ GATE_MAX_ROUNDS_PER_SWEEP=$(printf '%s' "$GATE_MAX_ROUNDS_PER_SWEEP" | sed 's/^0
 # gate_continue_or_exit() converts that dead sweep into another attempt, reusing
 # the ga-309v3 re-exec continuation verbatim: fresh process (no state leak),
 # SAME lock (the burst is one logical sweep), bounded by the SAME round counter.
+# Ownership of that lock across the re-exec is proven from the lock ITSELF (dir
+# exists + on-disk heartbeat token + pid half == $$, see the GATE_LOCK_ENABLED
+# block above) — never from the exported env alone, which every descendant
+# (including the gate-reviewer sessions this round spawns) also inherits.
+#
+# ROUND 1 (abandoned — reference only, commit 6de2210 on this branch): excluded
+# the yielded BRANCH, not just the marker, from later rounds' selection, because
+# a second queued marker for the same branch is common and Step 4c's auto-rebase
+# ends in `git push --force-with-lease`, which used to run BEFORE the
+# live-sibling check — so a same-branch sibling marker could force-push a SECOND
+# time before discovering the live run. A 5-round adversarial review found that
+# list mechanism itself had a real blocker (`$(printf '\n')` is an EMPTY STRING —
+# command substitution eats the trailing newline — so the branch list silently
+# concatenated without a separator and the exclusion died from the 2nd yield
+# onward) plus two more serious issues (the filter read a label that a second,
+# driftable code path also resolves independently; and jq failure fell back to
+# the UNFILTERED list — fail-open in the one spot here where fail-CLOSED is the
+# safe default, since the failure mode is a force-push on a branch reviewers are
+# reading). Replaced by:
+#
+# ROUND 2 (this version): the live-sibling check is HOISTED to run right after
+# Step 4b (branch not already merged) and BEFORE Step 4c's rebase/force-push —
+# see the call site there. This closes the problem STRUCTURALLY instead of
+# derivatively: no force-push can ever precede a live-sibling discovery, for ANY
+# marker, ANY round, including round 0 — so a same-branch sibling marker yields
+# at that SAME early checkpoint every time, without ever touching the branch.
+# Marker-level exclusion (the invariant below) is sufficient again; no
+# branch-level list is needed. Step 5b keeps an identical check as a safety net
+# for the residual window between the early check and actual review-spawn.
 #
 # No exclusion list is needed and that is not an accident: the yield path
 # deliberately leaves its marker in gate-status:dispatching (never re-queued),
@@ -1372,22 +1401,7 @@ GATE_MAX_ROUNDS_PER_SWEEP=$(printf '%s' "$GATE_MAX_ROUNDS_PER_SWEEP" | sed 's/^0
 # this function silently degrades into "retry the same marker until the round
 # budget runs out" — bounded, but useless. The selftest pins it.
 gate_continue_or_exit() {
-  local _why="${1:-ineligible}" _skip_branch="${2:-}"
-  # BRANCH-level exclusion, and the marker-level reasoning is NOT enough here.
-  # Parking the yielding marker in gate-status:dispatching stops the next round
-  # re-picking THAT MARKER — but the contended resource is the BRANCH. A second
-  # queued marker for the same branch is common (the live queue has held two for
-  # fix/ga-clgc2-deacon-nudge-flood at once), and Step 4c's auto-rebase ends in
-  # `git push --force-with-lease`, which runs BEFORE Step 5b's sibling guard.
-  # So without this, round 1 picks the sibling marker, force-pushes the branch a
-  # SECOND time, discovers the live run, and yields again — rewriting the tip up
-  # to GATE_MAX_ROUNDS_PER_SWEEP times underneath reviewers that are holding the
-  # old sha (the gate-sha-failed / silently-rebased-between-attempts class), and
-  # destroying the one-branch-one-authoritative-run invariant this very yield
-  # exists to defend.
-  if [ -n "$_skip_branch" ]; then
-    GATE_SKIP_BRANCHES="${GATE_SKIP_BRANCHES:+$GATE_SKIP_BRANCHES$(printf '\n')}$_skip_branch"
-  fi
+  local _why="${1:-ineligible}"
   if [ "$((GATE_ADMIT_ROUND + 1))" -lt "$GATE_MAX_ROUNDS_PER_SWEEP" ] 2>/dev/null; then
     # Deliberately NOT calling cleanup_reviewer_sessions here. This round spawned
     # NOTHING, so there is nothing of ours to clean — and the array that function
@@ -1422,7 +1436,6 @@ gate_continue_or_exit() {
     export GATE_ADMITS_DONE
     export GATE_MAX_ADMITS_PER_SWEEP
     export GATE_MAX_ROUNDS_PER_SWEEP
-    export GATE_SKIP_BRANCHES
     # No "$@": inside a function the positional params are the FUNCTION's, so
     # `exec bash "$0" "$@"` would re-exec the daemon as `bash <script> live-sibling`,
     # mutating its argv (visible to ps/pgrep -f matchers) and propagating that
@@ -4935,22 +4948,6 @@ MARKERS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --js
   -l gate-status:queued \
   2>/dev/null || echo "[]")
 
-# ga-991au: drop markers whose BRANCH a previous round of THIS burst already
-# yielded on. Marker-level parking is not enough — a sibling marker for the same
-# branch would re-enter Step 4c and force-push the branch again underneath the
-# live run's reviewers. Newline-delimited so branch names with any shell-special
-# character are safe; empty/unset means "no exclusions", i.e. round 0 behaviour.
-if [ -n "${GATE_SKIP_BRANCHES:-}" ]; then
-  _skip_before=$(printf '%s\n' "$MARKERS_JSON" | jq 'length' 2>/dev/null || echo "0")
-  MARKERS_JSON=$(printf '%s\n' "$MARKERS_JSON" | jq --arg skip "$GATE_SKIP_BRANCHES" '
-      ($skip | split("\n") | map(select(length > 0))) as $bad
-      | [ .[] | select( ((.labels // []) | map(select(startswith("branch:")) | ltrimstr("branch:")) | first // "") as $b
-                        | ($b | length) == 0 or ($bad | index($b) | not) ) ]' 2>/dev/null \
-      || printf '%s\n' "$MARKERS_JSON")
-  _skip_after=$(printf '%s\n' "$MARKERS_JSON" | jq 'length' 2>/dev/null || echo "0")
-  log "Multi-admit round ${GATE_ADMIT_ROUND}: excluded $(( _skip_before - _skip_after )) marker(s) whose branch this burst already yielded on (ga-991au)."
-fi
-
 COUNT=$(printf '%s\n' "$MARKERS_JSON" | jq 'length' 2>/dev/null || echo "0")
 log "Found $COUNT queued marker(s)"
 
@@ -5730,6 +5727,56 @@ if [ "$ALREADY_MERGED" = "1" ]; then
 fi
 
 log "  Branch $BRANCH not yet merged into $DEFAULT_BRANCH — proceeding with review."
+
+# ── Step 4b-1 (ga-991au round 2): live-sibling-run guard, HOISTED before any
+# rebase/force-push ───────────────────────────────────────────────────────────
+# Originally this check ran only at Step 5b, AFTER Step 4c's auto-rebase — which
+# ends in `git push --force-with-lease` on THIS branch. A marker for a branch
+# that already has a live gate-run would force-push it a SECOND time, rewriting
+# the tip underneath reviewers still holding the old sha, and only THEN discover
+# the sibling and yield. Checking here, before Step 4c ever touches the branch,
+# closes that failure mode STRUCTURALLY: no force-push can precede a
+# live-sibling discovery, for ANY marker, ANY round — including round 0 — so a
+# same-branch sibling marker yields at this SAME early checkpoint every time,
+# without ever touching the branch. (ga-991au round 1 tried a branch-level
+# exclusion LIST instead of moving the check; see the retired-round note on
+# gate_continue_or_exit() above for why that approach was abandoned.)
+#
+# Step 5b (below) keeps an IDENTICAL check as a safety net for the residual
+# race window between this early check and actual review-spawn — a sibling run
+# that starts during Step 4c's rebase or Step 5's tier classification is still
+# caught before reviewers are spawned, just not before THIS marker's own
+# rebase/force-push (a narrower, rarer window than the one this hoist closes).
+if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
+  SIBLING_VERDICT=$(live_sibling_run_for_branch "$BRANCH" || echo "")
+  case "$SIBLING_VERDICT" in
+    "LIVE "*)
+      SIBLING_RUN_ID="${SIBLING_VERDICT#LIVE }"
+      log "Live sibling gate-run $SIBLING_RUN_ID already running for branch $BRANCH — YIELDING before any rebase/force-push (one branch = one authoritative run). NOT spawning a duplicate."
+      # Leave the marker in gate-status:dispatching (do NOT re-queue): re-queuing
+      # would let this same (oldest) marker be re-selected every sweep and
+      # head-of-line-block other branches. Step 0a re-queues it after its TTL if
+      # the sibling never terminates, so the branch is never permanently stranded.
+      # We touch NEITHER the source bead NOR any verdict, so the duplicate path can
+      # never write a terminal FAIL over the healthy sibling. (Idempotent, fail-safe.)
+      log "  Marker $MARKER_ID left dispatching; Step 0a TTL re-queues it once the sibling terminates."
+      log "=== Dispatcher sweep complete: branch=$BRANCH verdict=YIELDED (live sibling $SIBLING_RUN_ID, pre-rebase) ==="
+      # ga-991au: this branch is busy, but the other queued markers are not. Try
+      # the next one in THIS sweep instead of burning the whole cadence on a
+      # branch we already know we cannot touch. Safe to re-enter: our marker
+      # stayed in gate-status:dispatching just above, and Step 0b only selects
+      # gate-status:queued — so the next round cannot pick it again.
+      gate_continue_or_exit "live-sibling-pre-rebase"
+      ;;
+    "STALE "*)
+      SIBLING_RUN_ID="${SIBLING_VERDICT#STALE }"
+      warn "Stale sibling gate-run $SIBLING_RUN_ID for branch $BRANCH (older than ${SIBLING_RUN_STALE_MINUTES}m — its dispatcher died mid-run and never drove it terminal). Superseding it and proceeding with a fresh run."
+      set_gate_status "$SIBLING_RUN_ID" "superseded" 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$SIBLING_RUN_ID" "Dispatcher: superseded as STALE (> ${SIBLING_RUN_STALE_MINUTES}m — dispatcher died mid-run) so a fresh gate-run for branch $BRANCH can take over. (ga-dupnv live-sibling guard, pre-rebase check)" 2>/dev/null || true
+      bd -C "$GC_CITY" close "$SIBLING_RUN_ID" -r "gate-run superseded (stale sibling) — fresh run for branch $BRANCH takes over. (ga-dupnv)" 2>/dev/null || true
+      ;;
+  esac
+fi
 
 # ── Step 4c: Stale-base check (Bug 1a) ───────────────────────────────────────
 # Require that the branch be CURRENT with main before review starts.
@@ -6701,7 +6748,7 @@ esac
 
 log "Tier: $TIER  required_reviewers: $REQUIRED_REVIEWERS"
 
-# ── Step 5b (ga-dupnv, bug 1): live-sibling-run guard — one branch = one run ──
+# ── Step 5b (ga-dupnv, bug 1): live-sibling-run guard — SAFETY NET ────────────
 # A marker can be claimed twice for the SAME branch: the dispatcher dies mid-run
 # (Terminated/SIGTERM/launchd overlap) leaving the marker gate-status:dispatching,
 # Step 0a re-queues it after its TTL, and a later sweep re-claims it — OR a re-gate
@@ -6713,6 +6760,12 @@ log "Tier: $TIER  required_reviewers: $REQUIRED_REVIEWERS"
 # FIRST authoritative — i.e. it superseded the HEALTHY run. Here, BEFORE creating
 # our run, we defer to any gate-run already running for THIS branch. Branch is the
 # correct key (NOT source-bead: wa-86jr and wa-86jr-reland share bead wa-86jr).
+#
+# ga-991au round 2: this is now the SECOND of two identical checks — the PRIMARY
+# one runs at Step 4b-1, before Step 4c's rebase/force-push ever touches the
+# branch. This copy stays as a safety net for the narrower residual window
+# where a sibling run starts DURING Step 4c/Step 5 (auto-rebase, tier
+# classification) — rare, but a real gap the early check alone cannot close.
 if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
   SIBLING_VERDICT=$(live_sibling_run_for_branch "$BRANCH" || echo "")
   case "$SIBLING_VERDICT" in
@@ -6732,7 +6785,7 @@ if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
       # branch we already know we cannot touch. Safe to re-enter: our marker
       # stayed in gate-status:dispatching just above, and Step 0b only selects
       # gate-status:queued — so the next round cannot pick it again.
-      gate_continue_or_exit "live-sibling" "$BRANCH"
+      gate_continue_or_exit "live-sibling"
       ;;
     "STALE "*)
       SIBLING_RUN_ID="${SIBLING_VERDICT#STALE }"

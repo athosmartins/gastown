@@ -713,10 +713,18 @@ has "$DISPATCHER" 'gate_continue_or_exit "live-sibling"' \
 #   (b) Step 0b selects ONLY gate-status:queued.
 has "$DISPATCHER" 'l gate-status:queued' \
   "ga-991au invariant (b): marker selection filters on gate-status:queued ONLY"
-if grep -B12 'gate_continue_or_exit "live-sibling"' "$DISPATCHER" | grep -q 'left dispatching'; then
+if grep -B12 'gate_continue_or_exit "live-sibling"$' "$DISPATCHER" | grep -q 'left dispatching'; then
   ok "ga-991au invariant (a): the yielding marker stays in dispatching (so the next round cannot re-pick it)"
 else
   bad "ga-991au invariant (a) BROKEN: the yield path no longer leaves the marker dispatching — the retry would re-pick the SAME marker and spin the round budget for nothing"
+fi
+# Same invariant, checked separately for the HOISTED call site (distinct reason
+# string "live-sibling-pre-rebase") — the check above is anchored to '$' so it
+# only sees the Step 5b safety-net site; this is not redundant coverage.
+if grep -B12 'gate_continue_or_exit "live-sibling-pre-rebase"' "$DISPATCHER" | grep -q 'left dispatching'; then
+  ok "ga-991au invariant (a), hoisted site: the pre-rebase yield ALSO leaves its marker in dispatching"
+else
+  bad "ga-991au invariant (a) BROKEN at the hoisted site: the pre-rebase yield does not leave the marker dispatching — same silent-spin risk, one checkpoint earlier"
 fi
 # Guard against someone 'helpfully' re-queuing the marker on the yield path:
 # that single change would silently convert this fix into a no-op loop.
@@ -805,38 +813,61 @@ _g=$(_real_knob GATE_MAX_ROUNDS_PER_SWEEP 99); [ "$_g" = "12" ] \
   && ok "ga-991au: an over-large round budget clamps to 12" \
   || bad "ga-991au: round budget upper clamp missing — 99 resolved to $_g"
 
-# ── ga-991au round-4: branch-level exclusion + trap correctness ───────────────
-echo "── ga-991au: round-4 blocker regressions ──"
+# ── ga-991au round 2: hoist replaces the round-1 branch-exclusion list ───────
+echo "── ga-991au: round-2 hoist (post 5-round adversarial review) ──"
 
-# BLOCKER-C: marker-level parking is NOT enough. Step 4c force-pushes the branch
-# BEFORE Step 5b's sibling guard runs, so a sibling marker for the SAME branch
-# would rewrite that branch again on the next round — underneath reviewers still
-# holding the old sha (gate-sha-failed class), destroying the one-branch-one-run
-# invariant the yield exists to defend.
-has "$DISPATCHER" 'gate_continue_or_exit "live-sibling" "\$BRANCH"' \
-  "ga-991au BLOCKER-C: the yield passes its BRANCH so the burst excludes the whole branch, not just the marker"
-has "$DISPATCHER" 'export GATE_SKIP_BRANCHES' \
-  "ga-991au BLOCKER-C: the exclusion list survives the re-exec"
-has "$DISPATCHER" 'excluded .* marker\(s\) whose branch this burst already yielded' \
-  "ga-991au BLOCKER-C: the exclusion is APPLIED to marker selection and logged with a count"
-# Ordering: the filter must run before the marker is picked.
-_L_FILT=$(grep -n 'GATE_SKIP_BRANCHES:-' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
-_L_PICK=$(grep -n '^MARKER=\$(printf' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
-if [ -n "$_L_FILT" ] && [ -n "$_L_PICK" ] && [ "$_L_FILT" -lt "$_L_PICK" ]; then
-  ok "ga-991au BLOCKER-C: branch exclusion (L$_L_FILT) is applied BEFORE the marker is selected (L$_L_PICK)"
+# ROUND 1 (abandoned, reference-only on commit 6de2210): excluded the yielded
+# BRANCH from later rounds' Step 0b selection. A 5th adversarial-review round
+# found a real blocker in that list mechanism ($(printf '\n') is an EMPTY
+# STRING — command substitution eats the trailing newline — so the branch list
+# silently concatenated without a separator and the exclusion died from the 2nd
+# yield onward) plus two more serious issues (a second, driftable source of
+# truth for "which branch"; fail-open on jq failure in the one spot here where
+# fail-CLOSED is the safe default). Replaced by hoisting the check itself.
+if grep -q 'GATE_SKIP_BRANCHES' "$DISPATCHER"; then
+  bad "ga-991au: round-1 branch-exclusion machinery (GATE_SKIP_BRANCHES) is still present — should be fully gone now that the hoist makes it unnecessary"
 else
-  bad "ga-991au BLOCKER-C: exclusion runs after selection (filter=$_L_FILT pick=$_L_PICK) — the burst could still re-pick the excluded branch"
+  ok "ga-991au: round-1 branch-exclusion machinery (GATE_SKIP_BRANCHES) fully removed — the hoist needs no list"
 fi
 
-# Behavioural: the real jq filter drops same-branch markers and keeps others.
-_out=$(echo '[{"labels":["branch:fix/A"]},{"labels":["branch:fix/B"]},{"labels":["branch:fix/A"]}]' \
-  | jq --arg skip "fix/A" '
-      ($skip | split("\n") | map(select(length > 0))) as $bad
-      | [ .[] | select( ((.labels // []) | map(select(startswith("branch:")) | ltrimstr("branch:")) | first // "") as $b
-                        | ($b | length) == 0 or ($bad | index($b) | not) ) ]' 2>/dev/null | jq -r 'length' 2>/dev/null)
-[ "$_out" = "1" ] \
-  && ok "ga-991au BLOCKER-C (behavioural): the exclusion filter drops both markers of the yielded branch and keeps the other" \
-  || bad "ga-991au BLOCKER-C (behavioural): filter kept $_out marker(s), expected 1"
+# ROUND 2 (this version): the live-sibling check now runs BEFORE Step 4c's
+# rebase/force-push, not just at Step 5b after it — closing the force-push race
+# STRUCTURALLY. No force-push can precede a live-sibling discovery, for ANY
+# marker, ANY round, including round 0.
+has "$DISPATCHER" 'Step 4b-1 \(ga-991au round 2\)' \
+  "ga-991au ROUND 2: the hoisted pre-rebase live-sibling check exists"
+has "$DISPATCHER" 'gate_continue_or_exit "live-sibling-pre-rebase"' \
+  "ga-991au ROUND 2: the hoisted check yields via the same skip-and-continue helper, distinct reason string"
+
+# Ordering: the HOISTED check's live_sibling_run_for_branch call must precede
+# BOTH of Step 4c's force-with-lease pushes (container-rig and self-repo
+# branches) — that IS the fix. If a future edit moves either push above the
+# check, this fails. Anchored on `-C "$TMP_REBASE_WT"` specifically: a generic
+# 'push origin "HEAD:refs/heads/$BRANCH" --force-with-lease' pattern ALSO
+# matches two unrelated merge-time-rebase pushes elsewhere in the file (using
+# $TMP_MR_WT, a different worktree var) — those aren't Step 4c and matching
+# them silently tested the wrong lines the first time this was written.
+_L_HOIST=$(grep -n 'SIBLING_VERDICT=\$(live_sibling_run_for_branch "\$BRANCH"' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
+_L_PUSH1=$(grep -n 'git -C "\$TMP_REBASE_WT" push origin' "$DISPATCHER" | sed -n '1p' | cut -d: -f1 || true)
+_L_PUSH2=$(grep -n 'git -C "\$TMP_REBASE_WT" push origin' "$DISPATCHER" | sed -n '2p' | cut -d: -f1 || true)
+if [ -n "$_L_HOIST" ] && [ -n "$_L_PUSH1" ] && [ -n "$_L_PUSH2" ] \
+   && [ "$_L_HOIST" -lt "$_L_PUSH1" ] && [ "$_L_HOIST" -lt "$_L_PUSH2" ]; then
+  ok "ga-991au ROUND 2: hoisted sibling check (L$_L_HOIST) precedes BOTH Step 4c force-with-lease pushes (L$_L_PUSH1, L$_L_PUSH2)"
+else
+  bad "ga-991au ROUND 2: ordering broken (hoist=$_L_HOIST push1=$_L_PUSH1 push2=$_L_PUSH2) — a force-push could still precede the live-sibling check"
+fi
+
+# The safety-net copy at Step 5b must still exist, still fire AFTER Step 4c
+# (defense in depth for the residual race window), and no longer needs a
+# branch arg (marker-level exclusion is sufficient once the primary check is
+# hoisted before any force-push — anchored on '$' so it does not also match
+# the hoisted call's "live-sibling-pre-rebase" reason string).
+_L_NET=$(grep -n 'gate_continue_or_exit "live-sibling"$' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
+if [ -n "$_L_NET" ] && [ -n "$_L_PUSH2" ] && [ "$_L_NET" -gt "$_L_PUSH2" ]; then
+  ok "ga-991au ROUND 2: Step 5b's safety-net check (L$_L_NET) still exists and still runs after Step 4c (L$_L_PUSH2)"
+else
+  bad "ga-991au ROUND 2: Step 5b's safety-net check missing or mis-ordered (net=$_L_NET vs push2=$_L_PUSH2)"
+fi
 
 # SERIOUS: no `trap - EXIT` in the skip helper. On that path the active trap is
 # the plain _release_gate_lock; clearing it turns an exec FAILURE (truncated $0
