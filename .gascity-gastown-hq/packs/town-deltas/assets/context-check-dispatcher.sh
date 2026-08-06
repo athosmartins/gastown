@@ -261,7 +261,22 @@ context_check_is_parked() {
   IFS=',' read -ra _lbls <<< "$labels"
   for l in "${_lbls[@]+"${_lbls[@]}"}"; do
     case "$l" in
-      needs-human|story:blocked|pilot:no-auto-dispatch) echo "yes"; return ;;
+      # ga-r8haw (follow-up to ga-6qbgy): needs-human matched bare-or-suffixed
+      # (":" or "-"), same rule as park_labels.py's label_matches() and the
+      # pool:refused:* line right below — NOT exact-only. Bare `needs-human`
+      # is the bug/chore/task/debt human-gate label (distinct from the
+      # story:*/gate:* families, which lifecycle-skip/has_story already
+      # handle elsewhere); pilot-dispatcher.sh's own candidate filter already
+      # treats it as prefix-matched (startswith("needs-human")), and
+      # needs-human-decision is a real sibling variant it excludes
+      # separately. An exact-only check here missed that: a bead parked by a
+      # suffixed variant (e.g. needs-human-decision) would not read as
+      # parked, so on this daemon's next ~10min sweep it would look
+      # "fresh, never judged" and get silently (re)armed with
+      # ctx:ready/exec:auto — the exact ga-66wc/ga-0x4tv mechanism the
+      # PARK-EXCLUSION comment above already warns about, just reachable via
+      # an un-globbed label instead of a stripped one.
+      needs-human|needs-human:*|needs-human-*|story:blocked|pilot:no-auto-dispatch) echo "yes"; return ;;
       pool:refused:*) echo "yes"; return ;;
     esac
   done

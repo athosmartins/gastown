@@ -106,6 +106,24 @@ echo "Scenario 4a: park-exclusion — needs-human/pool:refused:*/story:blocked/p
 [ "$(context_check_is_parked "pool:refused:engine-rebuild-required")" = "yes" ] && ok "pool:refused:<reason> → parked" || bad "pool:refused:* → expected parked"
 [ "$(context_check_is_parked "pool:refused:anything-else")" = "yes" ] && ok "pool:refused:* prefix matches any reason suffix" || bad "pool:refused:<other> → expected parked"
 [ "$(context_check_is_parked "root-class:error-vs-empty,needs-human,lane:small")" = "yes" ] && ok "needs-human mixed with unrelated labels → parked" || bad "mixed labels → expected parked"
+# ga-r8haw (follow-up to ga-6qbgy): bare needs-human must match suffixed
+# variants too, not just the exact literal — same bare-or-":"/"-"-suffix
+# rule as park_labels.py's label_matches() and this function's own
+# pool:refused:* line above. needs-human-decision is a real sibling label
+# (pilot-dispatcher.sh's candidate filter excludes it as a distinct case
+# alongside bare needs-human); a colon-suffixed needs-human:<reason> would
+# use the same convention gate:needs-human:* already uses one namespace over.
+[ "$(context_check_is_parked "needs-human-decision")" = "yes" ] \
+  && ok "needs-human-decision (dash-suffixed sibling) → parked (ga-r8haw)" || bad "needs-human-decision → expected parked (ga-r8haw)"
+[ "$(context_check_is_parked "needs-human:technical")" = "yes" ] \
+  && ok "needs-human:technical (colon-suffixed) → parked (ga-r8haw)" || bad "needs-human:technical → expected parked (ga-r8haw)"
+[ "$(context_check_is_parked "lane:small,needs-human-decision,area:infra")" = "yes" ] \
+  && ok "needs-human-decision mixed with unrelated labels → parked (ga-r8haw)" || bad "mixed labels → expected parked (ga-r8haw)"
+# Negative control: a label that merely SHARES the "needs-human" characters
+# without the "-"/":" separator must NOT false-positive (mirrors the "PREFIX
+# of needs-human → ok" negative control in quality-gate-park-unapproved.selftest.sh).
+[ "$(context_check_is_parked "needs-humanoid-unrelated")" = "no" ] \
+  && ok "needs-humanoid-unrelated (no separator) → NOT parked, no over-match (ga-r8haw)" || bad "needs-humanoid-unrelated → expected NOT parked (ga-r8haw)"
 [ "$(context_check_is_parked "tech-debt,lane:small")" = "no" ] && ok "no park label → not parked" || bad "clean labels → expected not parked"
 [ "$(context_check_is_parked "")" = "no" ] && ok "empty labels → not parked" || bad "empty → expected not parked"
 # ga-66wc repro: a park label surviving ALONE (ctx:ready/exec:auto already stripped
