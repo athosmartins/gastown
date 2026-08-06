@@ -310,6 +310,169 @@ session_is_dead() {
 }
 # SELFTEST-EXTRACT session-is-dead-fn: END
 
+# gate_run_marker_reclaim_decision <age_min> <ttl_min> <absolute_ttl_min> <liveness:live|dead|unknown>
+#   → "skip" | "requeue" | "requeue-past-absolute-ceiling"
+# Pure decision function for Step 0a's TTL-recovery sweep (ga-9uwbw AC1-AC4).
+# Mirrors quality-gate-guard.sh's reconcile_marker_action in style (status/age/
+# ttl args → a plain decision string) so this file's own reclaim logic is
+# unit-testable the same way, with zero bd/gc mocking needed. Deliberately
+# separates "should we reclaim" (this function) from "how do we know if a
+# reviewer is actually alive" (gate_run_has_live_reviewer, just below — that
+# one needs live bd/gc and is the part ga-9uwbw's root cause lived in: the OLD
+# call site trusted a `gate-status:running` LABEL on the run bead as if it
+# were proof of a live reviewer, instead of positively resolving one).
+#   skip                        — age <= ttl (AC4: nothing stuck yet, always
+#                                  skip regardless of liveness — the pre-fix
+#                                  behavior for this branch, unchanged), OR
+#                                  liveness is "live" or "unknown" and we're
+#                                  still under the absolute ceiling (AC1: a
+#                                  VERIFIED live reviewer is never reclaimed;
+#                                  AC2: a query FAILURE — "unknown" — must not
+#                                  be silently treated as "confirmed dead",
+#                                  so it also skips-and-retries-next-sweep,
+#                                  same root-class:error-vs-empty stance this
+#                                  file already takes everywhere else, e.g.
+#                                  Phase C's VB_SENTINEL handling above).
+#   requeue                     — liveness is "dead" (no live reviewer session
+#                                  found for this marker's gate-run — the
+#                                  classic, now-VERIFIED zombie case), or
+#                                  liveness is "unknown" but age has exceeded
+#                                  the absolute ceiling too (AC3: an
+#                                  unverifiable marker cannot be protected
+#                                  forever either).
+#   requeue-past-absolute-ceiling — AC3: age has exceeded the absolute ceiling
+#                                  (2x VERDICT_TIMEOUT_MAX_MINUTES — no
+#                                  legitimate run outlives that) EVEN THOUGH
+#                                  liveness verified "live". Reclaiming a
+#                                  genuinely live run costs one extra review
+#                                  pass; silently stalling for hours (the
+#                                  ga-9uwbw incident: 375m) costs far more —
+#                                  distinct return value purely so the caller
+#                                  can log which situation actually happened.
+# SELFTEST-EXTRACT gate-run-marker-reclaim-decision-fn: BEGIN
+gate_run_marker_reclaim_decision() {
+  local age_min="$1" ttl_min="$2" absolute_ttl_min="$3" liveness="$4"
+  if [ "$age_min" -le "$ttl_min" ] 2>/dev/null; then
+    echo "skip"
+    return 0
+  fi
+  if [ "$age_min" -gt "$absolute_ttl_min" ] 2>/dev/null; then
+    if [ "$liveness" = "live" ]; then
+      echo "requeue-past-absolute-ceiling"
+    else
+      echo "requeue"
+    fi
+    return 0
+  fi
+  case "$liveness" in
+    live)    echo "skip" ;;
+    unknown) echo "skip" ;;
+    *)       echo "requeue" ;;
+  esac
+}
+# SELFTEST-EXTRACT gate-run-marker-reclaim-decision-fn: END
+
+# gate_run_has_live_reviewer <gate_run_id> → echoes "live" | "dead" | "unknown"
+# Positively resolves whether a `type:quality-gate-run` bead has an ACTUAL live
+# reviewer session working it (ga-9uwbw AC1) — as opposed to the pre-fix check,
+# which only asked "does a gate-status:running bead exist whose description
+# mentions this marker_id" and trusted that LABEL as proof of liveness. A run
+# bead's label can go stale independently of whatever its reviewers are
+# actually doing (that label is only ever set once, at Step 6 creation — see
+# Phase C's header comment above: "context ... is re-derived from bead state,
+# never process-local variables"), which is exactly how ga-wisp-wqxq55z stalled
+# 375m: verified live 2026-08-06 by the Mayor that exactly one gate-reviewer
+# session existed city-wide, and it was reviewing a COMPLETELY DIFFERENT bead
+# — zero reviewers were actually working this run, yet its gate-run bead's
+# gate-status:running label was enough for the old check to declare LIVE.
+#
+# Reuses the SAME data path Phase C's own dead-reviewer classifier already
+# trusts (verdict beads, keyed by the `gate-run:<id>` label — see
+# phase-c-dead-reviewer-classify-fn above) rather than inventing a second one:
+# a verdict bead's `assignee` is the reviewer's session_name (set durably at
+# spawn via assign_verdict_bead_verified — see "durable pull channel" above),
+# and `gc session list` is the ground truth for whether that session is still
+# present and not closed (session_is_dead, defined just above).
+#
+#   live    — >=1 still-open (not yet closed/delivered) verdict bead for this
+#             run is assigned to a session gc session list confirms present
+#             and not closed.
+#   dead    — the verdict-bead query succeeded and no such session was found
+#             (zero verdict beads counts as dead too — Phase A died before
+#             Step 7 ever spawned anyone; Phase C's own zero-verdict-beads
+#             branch already backstops finalizing that case independently).
+#   unknown — the verdict-bead query itself failed (transient Dolt hiccup), or
+#             an individual verdict bead's status/assignee couldn't be read —
+#             kept DISTINCT from "dead" (AC2: absence of evidence of life is
+#             not evidence of death) so the caller can defer to a future
+#             sweep instead of guessing, mirroring Phase C's own VB_SENTINEL /
+#             __UNKNOWN__-sentinel handling immediately above in this file.
+# SELFTEST-EXTRACT gate-run-has-live-reviewer-fn: BEGIN
+gate_run_has_live_reviewer() {
+  local gate_run_id="$1"
+  local vb_sentinel="__GRHLR_QUERY_FAILED__"
+  local vb_json
+  vb_json=$(bd -C "$GC_CITY" list --json --all -l type:quality-gate-verdict -l "gate-run:$gate_run_id" 2>/dev/null || echo "$vb_sentinel")
+  if [ "$vb_json" = "$vb_sentinel" ]; then
+    echo "unknown"
+    return 0
+  fi
+  local vb_ids=()
+  local _vbid
+  while IFS= read -r _vbid; do
+    [ -z "$_vbid" ] && continue
+    vb_ids+=("$_vbid")
+  done < <(printf '%s' "$vb_json" | jq -r '.[].id' 2>/dev/null)
+  # bash 3.2 (only bash on this host): "${arr[@]}" on a declared-but-EMPTY
+  # array throws "unbound variable" under set -euo pipefail — guard with the
+  # count check BEFORE any values-expansion, same pattern Phase C already
+  # uses for VERDICT_BEAD_IDS above (its comment explains the crash in full).
+  if [ "${#vb_ids[@]}" -eq 0 ]; then
+    echo "dead"
+    return 0
+  fi
+  local sess_json
+  sess_json=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "")
+  local vbid vb_json_one vb_status sid present_n present_flag closed_flag
+  for vbid in "${vb_ids[@]}"; do
+    if ! vb_json_one=$(bd -C "$GC_CITY" show "$vbid" --json 2>/dev/null); then
+      echo "unknown"
+      return 0
+    fi
+    vb_status=$(printf '%s' "$vb_json_one" | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
+    [ "$vb_status" = "closed" ] && continue
+    sid=$(printf '%s' "$vb_json_one" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || true)
+    [ -z "$sid" ] && continue
+    # ga-9uwbw: match on session_name FIRST — assign_verdict_bead_verified
+    # (above: "ga-vdurb: VERIFIED verdict-bead assignment to a reviewer's
+    # session NAME... it keys on the session NAME, not the id") is the ONLY
+    # writer of a verdict bead's assignee, and it always writes session_name.
+    # Confirmed live against a real gate-reviewer entry in `gc session list
+    # --json`: .id and .session_name are DIFFERENT values (e.g.
+    # id="ga-wisp-xxxxxxx" vs session_name="gate-reviewer-adhoc-xxxxxxxxxx")
+    # for the exact same session — matching assignee (=session_name) against
+    # .id/.session_id alone, as Phase C's own dead-reviewer classifier and a
+    # couple of other call sites in this file do, would never find a match
+    # for a genuinely alive reviewer. .id/.session_id are kept as permissive
+    # fallbacks (harmless, matches nothing extra today) in case some other
+    # write path ever assigns a different identifier.
+    present_n=$(printf '%s' "$sess_json" | jq -r --arg s "$sid" 'if type=="array" then . else .sessions end | map(select(.session_name==$s or .id==$s or .session_id==$s)) | length' 2>/dev/null || echo 0)
+    case "$present_n" in ''|*[!0-9]*) present_n=0 ;; esac
+    present_flag=0
+    closed_flag=false
+    if [ "$present_n" -ge 1 ]; then
+      present_flag=1
+      closed_flag=$(printf '%s' "$sess_json" | jq -r --arg s "$sid" 'if type=="array" then . else .sessions end | map(select(.session_name==$s or .id==$s or .session_id==$s)) | .[0].closed // false' 2>/dev/null || echo false)
+    fi
+    if [ "$(session_is_dead "$present_flag" "$closed_flag")" != "1" ]; then
+      echo "live"
+      return 0
+    fi
+  done
+  echo "dead"
+}
+# SELFTEST-EXTRACT gate-run-has-live-reviewer-fn: END
+
 # classify_slot_action <bead_closed 0|1> <session_dead 0|1> <budget_remaining int>
 # The single decision for ONE reviewer slot in a poll iteration. Pure; no I/O.
 #   received → verdict bead is closed (a verdict — PASS or FAIL — was recorded);
@@ -4761,7 +4924,25 @@ fi
 # dispatcher never died. Before reclaiming, check for a LIVE
 # type:quality-gate-run bead (gate-status:running) whose marker_id: matches —
 # that proves Phase B is legitimately still in progress, not a zombie.
+#
+# ga-9uwbw: that LIVE check used to stop at "does such a bead exist" — a
+# gate-status:running LABEL, set once at Step 6 and never touched again during
+# Phase B. It is not evidence anyone is still reviewing; a run whose own
+# finalization never landed (for whatever reason) keeps that label forever.
+# ga-wisp-wqxq55z stalled 375m this way: verified live by the Mayor that the
+# ONE gate-reviewer session running city-wide was reviewing a different bead
+# entirely — zero reviewers were actually on this run, yet the label alone
+# was enough to declare LIVE every single sweep. gate_run_has_live_reviewer()
+# (above) now positively resolves an actual live session via this run's
+# verdict beads, the same data path Phase C's own dead-reviewer classifier
+# already trusts. gate_run_marker_reclaim_decision() (also above) then folds
+# that liveness verdict together with an absolute age ceiling — AC3: no
+# legitimate run outlives 2x VERDICT_TIMEOUT_MAX_MINUTES, so past that point a
+# marker is reclaimed regardless of what the liveness check says, closing off
+# an indefinite silent stall even if some future bug reopens a liveness gap.
+# SELFTEST-EXTRACT step-0a-ttl-recovery: BEGIN
 DISPATCHING_TTL_MINUTES=30
+DISPATCHING_TTL_ABSOLUTE_MINUTES=$(( VERDICT_TIMEOUT_MAX_MINUTES * 2 ))
 
 # ga-h199q: routed through the read-cache shim (see live_sibling_run_for_branch's
 # header comment — identical query, same-sweep dedup across 4 call sites). A
@@ -4798,20 +4979,60 @@ if [ "$DISPATCHING_COUNT" -gt 0 ]; then
       || date -d "$D_UPDATED" +%s 2>/dev/null || echo "0")
     D_AGE_MINUTES=$(( (NOW_EPOCH_D - D_EPOCH) / 60 ))
     if [ "$D_AGE_MINUTES" -gt "$DISPATCHING_TTL_MINUTES" ]; then
-      D_HAS_LIVE_RUN=$(printf '%s' "$LIVE_RUN_MARKER_IDS_JSON" | jq -r --arg mid "$D_ID" \
-        '[ .[] | select(((.description // "") | test("(^|\n)marker_id: *" + $mid + "( |\n|$)")) ) ] | length' 2>/dev/null || echo "0")
-      case "$D_HAS_LIVE_RUN" in ''|*[!0-9]*) D_HAS_LIVE_RUN=0 ;; esac
-      if [ "$D_HAS_LIVE_RUN" -gt 0 ]; then
-        log "Marker $D_ID is ${D_AGE_MINUTES}m old in gate-status:dispatching but has a LIVE gate-run (Phase B legitimately still in progress, ga-eqjo) — NOT reclaiming as a zombie."
-        continue
+      # ga-9uwbw AC1: resolve every candidate gate-run bead for this marker
+      # (same marker_id: description match as before — unchanged) and, for
+      # each, POSITIVELY check for a live reviewer session (not just the
+      # run bead's own gate-status:running label). "live" wins if ANY
+      # candidate has a verified live reviewer; "unknown" wins over "dead"
+      # when neither a live one was found nor could every candidate be
+      # fully verified (AC2: a query failure must not read as "confirmed
+      # dead") — this mirrors bash 3.2's declared-but-empty-array guard
+      # used throughout this file (count check before values-expansion).
+      D_RUN_IDS=()
+      while IFS= read -r _d_rid; do
+        [ -z "$_d_rid" ] && continue
+        D_RUN_IDS+=("$_d_rid")
+      done < <(printf '%s' "$LIVE_RUN_MARKER_IDS_JSON" | jq -r --arg mid "$D_ID" \
+        '[ .[] | select(((.description // "") | test("(^|\n)marker_id: *" + $mid + "( |\n|$)")) ) | .id ] | .[]' 2>/dev/null)
+
+      D_LIVENESS="dead"
+      if [ "${#D_RUN_IDS[@]}" -gt 0 ]; then
+        for D_RID in "${D_RUN_IDS[@]}"; do
+          D_RID_VERDICT=$(gate_run_has_live_reviewer "$D_RID")
+          if [ "$D_RID_VERDICT" = "live" ]; then
+            D_LIVENESS="live"
+            break
+          elif [ "$D_RID_VERDICT" = "unknown" ] && [ "$D_LIVENESS" != "live" ]; then
+            D_LIVENESS="unknown"
+          fi
+        done
       fi
-      warn "Re-queuing zombie dispatching marker $D_ID (age=${D_AGE_MINUTES}m > TTL=${DISPATCHING_TTL_MINUTES}m — dispatcher died mid-run, no live gate-run found)"
+
+      D_DECISION=$(gate_run_marker_reclaim_decision "$D_AGE_MINUTES" "$DISPATCHING_TTL_MINUTES" "$DISPATCHING_TTL_ABSOLUTE_MINUTES" "$D_LIVENESS")
+
+      case "$D_DECISION" in
+        skip)
+          if [ "$D_LIVENESS" = "live" ]; then
+            log "Marker $D_ID is ${D_AGE_MINUTES}m old in gate-status:dispatching — VERIFIED a live reviewer session on its gate-run (ga-9uwbw: positively resolved via verdict-bead assignee + gc session list, not just a gate-status:running label) — NOT reclaiming as a zombie."
+          else
+            log "Marker $D_ID is ${D_AGE_MINUTES}m old in gate-status:dispatching — liveness check could NOT VERIFY (query failure, not a confirmed-dead reviewer; ga-9uwbw AC2) — leaving for a future sweep rather than guessing."
+          fi
+          continue
+          ;;
+        requeue-past-absolute-ceiling)
+          warn "Re-queuing dispatching marker $D_ID despite a VERIFIED live reviewer session: age=${D_AGE_MINUTES}m exceeds the absolute ceiling=${DISPATCHING_TTL_ABSOLUTE_MINUTES}m (2x VERDICT_TIMEOUT_MAX_MINUTES=${VERDICT_TIMEOUT_MAX_MINUTES}m). No legitimate run outlives this; re-review is cheaper than an indefinite silent stall (ga-9uwbw AC3)."
+          ;;
+        *)
+          warn "Re-queuing zombie dispatching marker $D_ID (age=${D_AGE_MINUTES}m > TTL=${DISPATCHING_TTL_MINUTES}m — no live gate-run reviewer session found, verified via verdict-bead assignee + gc session list, ga-9uwbw)"
+          ;;
+      esac
       bd -C "$GC_CITY" label remove "$D_ID" "gate-status:dispatching" -q 2>/dev/null || true
       bd -C "$GC_CITY" label add    "$D_ID" "gate-status:queued"      -q 2>/dev/null || true
-      bd -C "$GC_CITY" comment "$D_ID" "Dispatcher TTL recovery: marker was stuck in gate-status:dispatching for ${D_AGE_MINUTES}m (> ${DISPATCHING_TTL_MINUTES}m TTL) with no live gate-run bead found. Dispatcher process died mid-run. Re-queuing for re-processing." 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$D_ID" "Dispatcher TTL recovery: marker was stuck in gate-status:dispatching for ${D_AGE_MINUTES}m (> ${DISPATCHING_TTL_MINUTES}m TTL). Liveness check: ${D_LIVENESS} (verified via verdict-bead assignee + gc session list, ga-9uwbw). Decision: ${D_DECISION}. Re-queuing for re-processing." 2>/dev/null || true
     fi
   done
 fi
+# SELFTEST-EXTRACT step-0a-ttl-recovery: END
 
 # ── Step 0a-2 (ga-zl277): reap orphaned gate-reviewer sessions ────────────────
 # Backstop for the EXIT trap below: a dispatcher killed by SIGKILL/OOM/launchd
