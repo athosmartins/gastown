@@ -50,6 +50,8 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
+TMPDIR_309="$(mktemp -d 2>/dev/null || echo /tmp/ga309v3-$$)"
+trap 'rm -rf "$TMPDIR_309" 2>/dev/null || true' EXIT
 
 PASS=0
 FAIL=0
@@ -468,6 +470,230 @@ else
   bad "ordering wrong: swap probe=L${SWAP_CALL_LN:-?} decision=L${DECISION_CALL_LN:-?} (decision could consume a stale/empty swap reading)"
 fi
 has "$DISPATCHER" '"\${HR_SWAP_FREE:-}" "\$GATE_SWAP_FREE_FLOOR_MB"' "decision call passes the live swap reading + floor through"
+
+# ── ga-309v3: multi-admit rounds (re-exec continuation) ───────────────────────
+# The gate admitted exactly ONE marker per sweep, so with runs lasting 11-17min
+# and a 4-6min cadence the concurrent-run count settled at ~1 no matter how high
+# the headroom ceiling was (measured 2026-08-06: ceiling=6, observed 1). The fix
+# continues the burst by RE-EXECing the dispatcher instead of looping Step
+# 0b..Step 8 in-process — a fresh process image resets every global, so marker A
+# can never leak its branch/sha/tier into marker B (which would merge the WRONG
+# branch). These tests pin the properties that, if broken, take the gate DOWN.
+echo "── ga-309v3: multi-admit burst ──"
+
+# AC-lock (the wedge risk): a continuation round presents the INHERITED token, so
+# the final round must still be able to release the lock. A token mismatch here
+# would leave the lock held until GATE_LOCK_MAX_AGE (30min) with NO sweep running
+# — the gate would look alive and silently process nothing.
+_T309="$TMPDIR_309"
+mkdir -p "$_T309" 2>/dev/null || true
+(
+  export GATE_LOCK_DIR="$_T309/lock.d" GATE_LOCK_HB="$_T309/lock.d/heartbeat"
+  export GATE_LOCK_TOKEN="12345:inherited-token"
+  mkdir -p "$GATE_LOCK_DIR" 2>/dev/null
+  printf '%s\n' "$GATE_LOCK_TOKEN" > "$GATE_LOCK_HB"
+  _release_gate_lock
+  [ ! -d "$GATE_LOCK_DIR" ]
+) && ok "ga-309v3 AC-lock: inherited token still releases the lock (no 30min wedge)" \
+  || bad "ga-309v3 AC-lock: inherited token did NOT release the lock — burst would wedge the gate"
+
+# A FOREIGN token must NOT release someone else's lock (pre-existing guarantee
+# that the inheritance change must not weaken).
+(
+  export GATE_LOCK_DIR="$_T309/lock2.d" GATE_LOCK_HB="$_T309/lock2.d/heartbeat"
+  export GATE_LOCK_TOKEN="99999:mine"
+  mkdir -p "$GATE_LOCK_DIR" 2>/dev/null
+  printf '%s\n' "77777:someone-else" > "$GATE_LOCK_HB"
+  _release_gate_lock
+  [ -d "$GATE_LOCK_DIR" ]
+) && ok "ga-309v3: a foreign token still cannot release another holder's lock (unchanged)" \
+  || bad "ga-309v3 REGRESSION: token-mismatch release guard weakened — a peer can free our lock"
+
+# AC5 non-regression: default entry (no GATE_ADMIT_ROUND) must behave exactly as
+# before — round 0, and a max of 1 disables the burst entirely.
+has "$DISPATCHER" 'GATE_ADMIT_ROUND="\$\{GATE_ADMIT_ROUND:-0\}"' \
+  "ga-309v3 AC5: unset GATE_ADMIT_ROUND defaults to 0 (normal launchd entry unchanged)"
+has "$DISPATCHER" 'GATE_LOCK_TOKEN="\$\{GATE_LOCK_TOKEN:-\$\$:' \
+  "ga-309v3: lock token is inheritable but falls back to the original pid:random form"
+has "$DISPATCHER" 'GATE_MAX_ADMITS_PER_SWEEP="\$\{GATE_MAX_ADMITS_PER_SWEEP:-3\}"' \
+  "ga-309v3 AC1: admits-per-sweep is configurable (default 3)"
+
+# AC3 (isolation): the continuation MUST be an exec of a fresh process — that is
+# the whole reason cross-marker state leakage is impossible. If someone ever
+# "simplifies" this into an in-process loop, this guard fails loudly.
+has "$DISPATCHER" 'exec bash "\$0"' \
+  "ga-309v3 AC3: continuation is a fresh exec (globals reset by construction — no cross-marker leak)"
+# Anchored to real shell loop SYNTAX at statement start — an earlier version of
+# this guard matched `while|for` anywhere on the line and tripped on the
+# dispatcher's own log string ("re-exec for round $GATE_ADMIT_ROUND"), i.e. it
+# fired on PROSE about the mechanism rather than the mechanism. Same trap as
+# ga-w3vn3, where a veto regex matched a bead that merely cited the label name.
+if grep -qE '^[[:space:]]*(while|until|for)[[:space:]].*GATE_ADMIT_ROUND' "$DISPATCHER"; then
+  bad "ga-309v3 AC3: an in-process LOOP over admit rounds was introduced — reintroduces the state-leak risk exec was chosen to eliminate"
+else
+  ok "ga-309v3 AC3: no in-process loop over admit rounds (exec-only continuation)"
+fi
+
+# AC2: the lock must be held across the whole burst. GATE_SWEEP_HAS_MORE_WORK
+# has to be set BEFORE cleanup runs, or cleanup frees the lock and a concurrent
+# launchd fire starts a second sweep mid-burst.
+_L309_FLAG=$(grep -n 'GATE_SWEEP_HAS_MORE_WORK=1' "$DISPATCHER" | tail -1 | cut -d: -f1)
+_L309_CLEAN=$(grep -n '^    cleanup_reviewer_sessions$' "$DISPATCHER" | tail -1 | cut -d: -f1)
+_L309_EXEC=$(grep -n 'exec bash "\$0"' "$DISPATCHER" | tail -1 | cut -d: -f1)
+if [ -n "$_L309_FLAG" ] && [ -n "$_L309_CLEAN" ] && [ -n "$_L309_EXEC" ] \
+   && [ "$_L309_FLAG" -lt "$_L309_CLEAN" ] && [ "$_L309_CLEAN" -lt "$_L309_EXEC" ]; then
+  ok "ga-309v3 AC2: HAS_MORE_WORK set (L$_L309_FLAG) BEFORE cleanup (L$_L309_CLEAN) BEFORE exec (L$_L309_EXEC) — lock survives the burst"
+else
+  bad "ga-309v3 AC2: ordering broken (flag=$_L309_FLAG cleanup=$_L309_CLEAN exec=$_L309_EXEC) — the lock can be freed mid-burst"
+fi
+
+# AC4 + bound: the burst is capped by the counter, and every round re-runs the
+# real headroom probe (no duplicated policy that could drift from Step 0b-1).
+has "$DISPATCHER" '\$\(\(GATE_ADMIT_ROUND \+ 1\)\)" -lt "\$GATE_MAX_ADMITS_PER_SWEEP' \
+  "ga-309v3 AC1: burst is hard-bounded by GATE_MAX_ADMITS_PER_SWEEP"
+has "$DISPATCHER" 'export GATE_ADMIT_ROUND=' \
+  "ga-309v3: the round counter is exported so the bound actually advances across the exec"
+
+# ── ga-309v3 BLOCKER regressions (found by adversarial review, 2026-08-06) ────
+# Two blockers were caught BEFORE ship. These tests exist so they cannot return.
+echo "── ga-309v3: blocker regressions ──"
+
+# BLOCKER 1 — ownership must come from the LOCK, not from inherited env.
+# export GATE_ADMIT_ROUND/GATE_LOCK_TOKEN reach every DESCENDANT, including the
+# gate-reviewer sessions a round spawns. A reviewer that later runs the
+# dispatcher by hand would inherit "I am round N", skip the single-instance
+# guard, run a concurrent sweep and then delete the live holder's lock.
+# The pid half is the discriminator: exec preserves $$, a descendant does not.
+has "$DISPATCHER" '\$\{GATE_LOCK_TOKEN%%:\*\}" = "\$\$"' \
+  "ga-309v3 BLOCKER-1: skip-acquire requires the token's pid half to equal \$\$ (a descendant cannot impersonate a continuation)"
+has "$DISPATCHER" '\[ -d "\$GATE_LOCK_DIR" \]' \
+  "ga-309v3 BLOCKER-1: skip-acquire requires the lock dir to actually exist (no 'continuing under the lock' while unlocked)"
+has "$DISPATCHER" '_gate_hb_tok" = "\$GATE_LOCK_TOKEN"' \
+  "ga-309v3 BLOCKER-1: skip-acquire compares the ON-DISK heartbeat token, not just the env var"
+
+# Behavioural: the 4-way guard must FAIL CLOSED for a descendant — same token,
+# same lock dir, but a different pid. This is the exact impersonation scenario.
+_t309b="$TMPDIR_309/b1"; mkdir -p "$_t309b" 2>/dev/null
+(
+  GATE_LOCK_DIR="$_t309b/lock.d"; GATE_LOCK_HB="$GATE_LOCK_DIR/heartbeat"
+  mkdir -p "$GATE_LOCK_DIR" 2>/dev/null
+  GATE_LOCK_TOKEN="999999:tok"                 # pid half is NOT this shell's $$
+  printf '%s\n' "$GATE_LOCK_TOKEN" > "$GATE_LOCK_HB"
+  GATE_ADMIT_ROUND=1
+  _hb=$(head -n1 "$GATE_LOCK_HB" 2>/dev/null || true)
+  if [ "$GATE_ADMIT_ROUND" -gt 0 ] && [ -d "$GATE_LOCK_DIR" ] \
+     && [ "$_hb" = "$GATE_LOCK_TOKEN" ] && [ "${GATE_LOCK_TOKEN%%:*}" = "$$" ]; then
+    exit 1   # took the skip-acquire path => impersonation succeeded => BAD
+  fi
+  exit 0
+) && ok "ga-309v3 BLOCKER-1 (behavioural): a descendant with the inherited token+round FAILS the guard and falls through to a real acquire" \
+  || bad "ga-309v3 BLOCKER-1 (behavioural): a foreign-pid process was accepted as a continuation round — concurrent-sweep risk is back"
+
+# And the genuine continuation (token pid == our own $$) must still be accepted,
+# or the burst deadlocks against its own lock on every round.
+(
+  GATE_LOCK_DIR="$_t309b/lock2.d"; GATE_LOCK_HB="$GATE_LOCK_DIR/heartbeat"
+  mkdir -p "$GATE_LOCK_DIR" 2>/dev/null
+  GATE_LOCK_TOKEN="$$:realtoken"
+  printf '%s\n' "$GATE_LOCK_TOKEN" > "$GATE_LOCK_HB"
+  GATE_ADMIT_ROUND=1
+  _hb=$(head -n1 "$GATE_LOCK_HB" 2>/dev/null || true)
+  [ "$GATE_ADMIT_ROUND" -gt 0 ] && [ -d "$GATE_LOCK_DIR" ] \
+    && [ "$_hb" = "$GATE_LOCK_TOKEN" ] && [ "${GATE_LOCK_TOKEN%%:*}" = "$$" ]
+) && ok "ga-309v3 BLOCKER-1: a GENUINE continuation (exec preserves \$\$) is still accepted — burst does not deadlock on itself" \
+  || bad "ga-309v3 BLOCKER-1: genuine continuation REJECTED — every burst would re-acquire and yield, silently disabling multi-admit"
+
+# BLOCKER 2 — the burst must add back its own spawns before the headroom probe.
+# Step 0a-2's drained-exclusion has no booting guard, so a round's own reviewers
+# (still inside the ~210s deferred-start window) read as drained and LIVE_REVIEWERS
+# collapses to 0 — leaving the burst with NO brake at all.
+has "$DISPATCHER" 'GATE_ADMIT_ROUND \* GATE_REVIEWERS_PER_RUN' \
+  "ga-309v3 BLOCKER-2: prior rounds' spawns are added back into LIVE_REVIEWERS"
+_L309_LR=$(grep -n '^LIVE_REVIEWERS=\$(headroom_live_reviewers' "$DISPATCHER" | tail -1 | cut -d: -f1)
+_L309_ADD=$(grep -n 'GATE_ADMIT_ROUND \* GATE_REVIEWERS_PER_RUN' "$DISPATCHER" | tail -1 | cut -d: -f1)
+_L309_USE=$(grep -n '"\$HR_QLIM" "\$LIVE_REVIEWERS"' "$DISPATCHER" | tail -1 | cut -d: -f1)
+if [ -n "$_L309_LR" ] && [ -n "$_L309_ADD" ] && [ -n "$_L309_USE" ] \
+   && [ "$_L309_LR" -lt "$_L309_ADD" ] && [ "$_L309_ADD" -lt "$_L309_USE" ]; then
+  ok "ga-309v3 BLOCKER-2: correction applied AFTER the count (L$_L309_LR->L$_L309_ADD) and BEFORE the headroom decision (L$_L309_USE)"
+else
+  bad "ga-309v3 BLOCKER-2: ordering broken (count=$_L309_LR add=$_L309_ADD decide=$_L309_USE) — the burst would run unbraked"
+fi
+
+# Bound hygiene (adversarial MINORs): upper clamp + octal safety.
+has "$DISPATCHER" 'GATE_MAX_ADMITS_PER_SWEEP" -le 6' \
+  "ga-309v3: admits-per-sweep has an UPPER clamp (a typo cannot spawn past the reviewer cap)"
+# (zero-strip correctness is covered BEHAVIOURALLY below by _real_knob
+#  GATE_MAX_ADMITS_PER_SWEEP=0/00/000 -> 1, which drives the real code.)
+
+# ── ga-309v3 round 2: drive the REAL dispatcher code, not a re-implementation ──
+# The first cut of these tests re-implemented the ownership guard inline, so they
+# would have kept passing while the real one drifted. These source the dispatcher
+# in lib-only mode with a hostile env and read back what IT actually computed.
+echo "── ga-309v3: real-code behaviour (round-2 review) ──"
+
+# _real_token <inherited GATE_LOCK_TOKEN> → the token the dispatcher settles on.
+_real_token() {
+  env GATE_DISPATCHER_LIB_ONLY=1 GATE_LOCK_TOKEN="$1" \
+    bash -c 'source "$0" >/dev/null 2>&1; echo "$GATE_LOCK_TOKEN"' "$DISPATCHER"
+}
+# _real_knob <VAR> <value> → what the dispatcher clamps that knob to.
+_real_knob() {
+  # The var NAME is interpolated into the inner script at definition time —
+  # inside `bash -c`, $1 is the subshell's own positional, not this function's
+  # argument, so an eval on "$1" there reads the wrong thing (and trips set -u).
+  env GATE_DISPATCHER_LIB_ONLY=1 "$1=$2" \
+    bash -c "source \"\$0\" >/dev/null 2>&1; printf '%s' \"\$$1\"" "$DISPATCHER" 2>/dev/null
+}
+
+# BLOCKER-3 (round 2): a token inherited from a DEAD parent must be rejected and
+# re-minted. If kept, the acquiring process writes a heartbeat advertising a dead
+# pid; the next sweep's holder-dead check then reclaims the lock FROM THE LIVE
+# HOLDER → two concurrent sweeps → concurrent merges.
+_tok_foreign=$(_real_token "999999:stale-from-dead-parent")
+case "$_tok_foreign" in
+  999999:*) bad "ga-309v3 BLOCKER-3: a foreign-pid token was KEPT — heartbeat would advertise a dead holder and the lock gets reclaimed from a live sweep (got: $_tok_foreign)" ;;
+  *:*)      ok  "ga-309v3 BLOCKER-3: foreign-pid token re-minted to our own pid (got pid half: ${_tok_foreign%%:*})" ;;
+  *)        bad "ga-309v3 BLOCKER-3: token malformed after re-mint (got: $_tok_foreign)" ;;
+esac
+_tok_unset=$(_real_token "")
+case "$_tok_unset" in
+  *:*) ok "ga-309v3: with no inherited token the dispatcher still mints the normal pid:random form" ;;
+  *)   bad "ga-309v3: unset-token path produced a malformed token (got: $_tok_unset)" ;;
+esac
+
+# The kill switch must actually kill. An operator typing the universal "off"
+# value during an incident must NOT get the maximum burst — an inverted kill
+# switch is worse than none. (A bare `sed 's/^0*//'` mapped "0" -> "" -> default 3.)
+for _z in 0 00 000; do
+  _got=$(_real_knob GATE_MAX_ADMITS_PER_SWEEP "$_z")
+  if [ "$_got" = "1" ]; then
+    ok "ga-309v3: GATE_MAX_ADMITS_PER_SWEEP=$_z disables the burst (clamped to 1, not the default 3)"
+  else
+    bad "ga-309v3: KILL SWITCH INVERTED — GATE_MAX_ADMITS_PER_SWEEP=$_z resolved to $_got (expected 1)"
+  fi
+done
+# Octal-looking values must not blow up $(( )) — an arithmetic error at the
+# re-exec site fires AFTER `trap - EXIT` and leaks the lock.
+for _o in 08 09 010; do
+  _got=$(_real_knob GATE_MAX_ADMITS_PER_SWEEP "$_o")
+  case "$_got" in
+    ''|*[!0-9]*) bad "ga-309v3: octal-ish '$_o' produced a non-numeric knob ($_got) — \$(( )) would abort after trap removal" ;;
+    *)           ok  "ga-309v3: octal-ish '$_o' sanitized to a plain integer ($_got)" ;;
+  esac
+done
+_got=$(_real_knob GATE_MAX_ADMITS_PER_SWEEP 30)
+[ "$_got" = "6" ] \
+  && ok "ga-309v3: an over-large admits knob (30) is clamped to the reviewer cap (6)" \
+  || bad "ga-309v3: upper clamp not applied — 30 resolved to $_got (would spawn past max_active_sessions, ga-zl277)"
+
+# SERIOUS (round 2): the yield branch must install a release trap, or an owner
+# that fails the guard exits holding its own lock.
+_L309_ELSE=$(grep -n '^  else$' "$DISPATCHER" | awk -F: -v a="$(grep -n 'elif _acquire_gate_lock; then' "$DISPATCHER" | head -1 | cut -d: -f1)" '$1>a{print $1; exit}')
+if [ -n "$_L309_ELSE" ] && sed -n "$((_L309_ELSE)),$((_L309_ELSE+22))p" "$DISPATCHER" | grep -q "trap '_release_gate_lock' EXIT"; then
+  ok "ga-309v3: the yield branch installs a release trap (an owner that fails the guard cannot leak its own lock)"
+else
+  bad "ga-309v3: yield branch has NO release trap — a guard-fail while owning the lock wedges the gate (30min under pid reuse)"
+fi
 
 echo ""
 echo "──────────────────────────────────────────────"
