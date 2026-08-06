@@ -140,11 +140,11 @@ notify_athos() {
 # ═════════════════════════════════════════════════════════════════════════════
 # PURE DECISION FUNCTION — the heart of the janitor; fully unit-testable.
 # janitor_decide <is_epic> <has_open_marker> <sig_commit> <sig_marker> <sig_branch_merged>
-#                <sig_commit_stale>
-# Each arg is 0|1 (sig_commit_stale defaults to 0 when omitted — backward-compatible
-# with every pre-ga-2zp4h caller/test). Echoes "<verdict>:<reason>" where verdict ∈
-# {keep,close}. Guards are evaluated FIRST (an open marker or epic always wins over
-# signals).
+#                <sig_commit_stale> <sig_marker_superseded> <is_delivery_partial>
+# Each arg is 0|1 (sig_commit_stale/sig_marker_superseded/is_delivery_partial default to
+# 0 when omitted — backward-compatible with every pre-ga-2zp4h/pre-ga-f54ui caller/test).
+# Echoes "<verdict>:<reason>" where verdict ∈ {keep,close}. Guards are evaluated FIRST (an
+# open marker, epic, or unresolved partial-delivery scope always wins over signals).
 #
 # sig_commit_stale (ga-2zp4h, 2026-07-26): Signal A alone only proves "a conventional
 # commit scoped to this bead id landed in origin/main" — not that THIS bead's own
@@ -157,12 +157,34 @@ notify_athos() {
 # commit; the commit alone may not mean THIS bead is finished." It suppresses ONLY
 # signal A's ability to close ALONE — signals B (marker) and C (branch) are
 # bead-specific and authoritative, so they are UNAFFECTED and still close normally.
+#
+# is_delivery_partial (ga-f54ui, 2026-08-06): a bead carrying the delivery:partial label
+# was already judged, by ga-k2wjn's own heuristic (gate_delivery_looks_partial, run at
+# gate-PASS time in quality-gate-dispatcher.sh), to enumerate MULTIPLE approved
+# deliverables of which only one diff was reviewed — "the gate approved the DIFF" is not
+# "the BEAD's full scope is done" (ga-k2wjn's central lesson). That dispatcher-side check
+# guards its OWN immediate close call, but this janitor is a SEPARATE, independent close
+# path (signals A/B/C below) that runs periodically against ANY in_progress bead — it
+# never consulted the label, so a delivery:partial bead that is later re-claimed
+# in_progress (e.g. by a pool worker picking up the still-open remaining scope) gets
+# silently re-closed the moment ANY merge signal fires, even though the label exists
+# precisely to say "one diff merging here proves nothing about the rest." Live incident:
+# ga-f54ui itself — Signal B (terminal gate-status:passed marker for the FIRST of its two
+# deliverables) closed it out from under an active claim while its own delivery:partial
+# label and a same-day Mayor comment both said the remaining scope was still open. Applies
+# uniformly to all three signals (A/B/C all only prove "something merged", never "the full
+# enumerated scope merged") — same precedence class as is_epic/has_open_marker, not a
+# per-signal carve-out. scope_covered:all (the dispatcher's own override label) is not
+# re-checked here: if a human/Mayor adds it and the bead is re-gated, the dispatcher's PASS
+# path closes it directly (see quality-gate-dispatcher.sh's IS_PARTIAL branch), so this
+# janitor never needs to independently re-derive that override.
 # ═════════════════════════════════════════════════════════════════════════════
 janitor_decide() {
   local is_epic="$1" has_open_marker="$2" sig_commit="$3" sig_marker="$4" sig_branch="$5" \
-        sig_commit_stale="${6:-0}" sig_marker_superseded="${7:-0}"
+        sig_commit_stale="${6:-0}" sig_marker_superseded="${7:-0}" is_delivery_partial="${8:-0}"
   if [ "$is_epic" = "1" ]; then            echo "keep:epic-parent-never-autoclosed"; return 0; fi
   if [ "$has_open_marker" = "1" ]; then    echo "keep:active-open-gate-marker"; return 0; fi
+  if [ "$is_delivery_partial" = "1" ]; then echo "keep:delivery-partial-unresolved-scope"; return 0; fi
   if [ "$sig_commit" = "1" ] && [ "$sig_commit_stale" != "1" ]; then
                                             echo "close:commit-in-origin-main"; return 0; fi
   if [ "$sig_marker" = "1" ]; then         echo "close:terminal-gate-marker-passed"; return 0; fi
@@ -947,6 +969,11 @@ while IFS= read -r rig; do
     [ -z "$BID" ] && continue
 
     IS_EPIC=0; [ "$BTYPE" = "epic" ] && IS_EPIC=1
+    # ga-f54ui: label read straight off the already-fetched bead JSON (no extra
+    # bd call) — same source as BTYPE/BTITLE above.
+    IS_DELIV_PARTIAL=0
+    printf '%s' "$b" | jq -e '(.labels // []) | index("delivery:partial")' >/dev/null 2>&1 \
+      && IS_DELIV_PARTIAL=1
 
     # Gate markers (HQ) for this bead → open-marker guard + terminal signal + branch.
     MK=$(markers_for_bead "$BID")
@@ -1023,7 +1050,7 @@ EOF
       done
     fi
 
-    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE" "$SIG_MK_SUPER")
+    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE" "$SIG_MK_SUPER" "$IS_DELIV_PARTIAL")
     VERDICT="${VERDICT_LINE%%:*}"; REASON="${VERDICT_LINE#*:}"
 
     if [ "$VERDICT" = "close" ]; then
@@ -1118,6 +1145,10 @@ EOF
     [ -z "$FID" ] && continue
 
     F_EPIC=0; [ "$FTYPE" = "epic" ] && F_EPIC=1
+    # ga-f54ui: same delivery:partial guard as the in_progress sweep above.
+    F_DELIV_PARTIAL=0
+    printf '%s' "$f" | jq -e '(.labels // []) | index("delivery:partial")' >/dev/null 2>&1 \
+      && F_DELIV_PARTIAL=1
 
     FMK=$(markers_for_bead "$FID")
     F_HASOPEN=0; has_open_marker "$FMK" && F_HASOPEN=1
@@ -1168,7 +1199,7 @@ EOF
       done
     fi
 
-    F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER")
+    F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL")
     F_VERDICT="${F_VERDICT_LINE%%:*}"; F_REASON="${F_VERDICT_LINE#*:}"
 
     # ga-vokwv: sling-bead-name fallback. FID's OWN id carried no merge

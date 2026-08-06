@@ -109,6 +109,39 @@ eq "epic beats superseded-only → keep (epic reason, not superseded reason)" \
 eq "open-marker beats superseded-only → keep (open-marker reason)" \
    "$(janitor_decide 0 1 0 0 0 0 1)" "keep:active-open-gate-marker"
 
+# ── 1a4. janitor_decide is_delivery_partial — partial scope ≠ delivered (ga-f54ui) ──
+# ga-k2wjn's own heuristic (gate_delivery_looks_partial, quality-gate-dispatcher.sh)
+# already proved this bead's body enumerates MULTIPLE approved deliverables of which
+# only one diff was gated — that is why the delivery:partial label exists at all. A
+# merge signal here proves the SAME single diff merged; it says nothing about the rest
+# of the bead's scope. Live incident: ga-f54ui carried delivery:partial (root-cause
+# investigation still open) yet Signal B (a terminal gate-status:passed marker for its
+# FIRST deliverable only) closed it the moment it was re-claimed in_progress. Applies
+# uniformly to all three signals — same precedence class as is_epic/has_open_marker.
+echo "── 1a4. janitor_decide is_delivery_partial (partial scope ≠ delivered, ga-f54ui) ──"
+eq "backward-compat: 7 args, no 8th → unaffected (defaults to 0)" \
+   "$(janitor_decide 0 0 0 0 0 0 0)" "keep:no-merge-evidence"
+eq "backward-compat: 7 args + marker signal, no 8th → still closes" \
+   "$(janitor_decide 0 0 0 1 0 0 0)" "close:terminal-gate-marker-passed"
+eq "partial + marker signal → KEEP (the ga-f54ui false-close this fix prevents)" \
+   "$(janitor_decide 0 0 0 1 0 0 0 1)" "keep:delivery-partial-unresolved-scope"
+eq "partial + commit signal → KEEP (one diff merging proves nothing about the rest)" \
+   "$(janitor_decide 0 0 1 0 0 0 0 1)" "keep:delivery-partial-unresolved-scope"
+eq "partial + branch signal → KEEP (branch-ancestor is the same single-diff evidence)" \
+   "$(janitor_decide 0 0 0 0 1 0 0 1)" "keep:delivery-partial-unresolved-scope"
+eq "partial + every signal at once → KEEP (guard beats all three uniformly)" \
+   "$(janitor_decide 0 0 1 1 1 0 0 1 | cut -d: -f1)" "keep"
+# Guard precedence unchanged: epic/open-marker still beat a partial-delivery bead too
+# (their own reason wins — delivery:partial does not need to be checked at all).
+eq "epic beats partial+signals → keep (epic reason, not partial reason)" \
+   "$(janitor_decide 1 0 1 1 1 0 0 1)" "keep:epic-parent-never-autoclosed"
+eq "open-marker beats partial+signals → keep (open-marker reason)" \
+   "$(janitor_decide 0 1 1 1 1 0 0 1)" "keep:active-open-gate-marker"
+# Fixture CONTROLE (mirrors ga-k2wjn's own control fixture): NOT partial (0) → every
+# signal closes exactly as before. The fix must not turn every close into a hold.
+eq "not-partial + marker signal → still closes normally" \
+   "$(janitor_decide 0 0 0 1 0 0 0 0)" "close:terminal-gate-marker-passed"
+
 # ── 1b. janitor_story_decide — merged story:approved → story:done (ga-gosfs) ──
 # Args: <is_epic> <has_open_marker> <already_done> <in_flight> <has_builder>
 #       <delivery_active> <sig_commit> <sig_marker> <sig_branch>
@@ -1013,6 +1046,48 @@ if [ -n "$VETO_LINE" ] && [ -n "$CLOSE_LINE" ] && [ "$VETO_LINE" -lt "$CLOSE_LIN
   ok "veto check (line $VETO_LINE) precedes the real close call (line $CLOSE_LINE)"
 else
   bad "veto check does not precede the real close call (veto=$VETO_LINE close=$CLOSE_LINE)"
+fi
+
+# ── 15. Drift-guard: ga-f54ui delivery:partial not a merge signal ───────────
+# ga-k2wjn already proved (at gate-PASS time, quality-gate-dispatcher.sh) that a
+# delivery:partial bead's body enumerates multiple approved deliverables of which
+# only one diff was reviewed. This janitor is a SEPARATE, independent close path
+# (periodic sweep, not gate-PASS time) that never consulted the label — a
+# delivery:partial bead re-claimed in_progress got silently re-closed the moment
+# ANY merge signal fired (live incident: ga-f54ui, Signal B). Must be wired into
+# BOTH bug/task-shaped call sites (in_progress sweep + ga-hcj4 stranded-wrapper
+# sweep) — the story sweep is deliberately UNTOUCHED: ga-k2wjn's own heuristic
+# only ever runs "if IS_STORY != 1" (quality-gate-dispatcher.sh), so a story bead
+# never receives the delivery:partial label in the first place — there is
+# nothing for janitor_story_decide to consult.
+echo "── 15. Drift-guard: ga-f54ui delivery:partial not a merge signal ──"
+grep -qF 'is_delivery_partial="${8:-0}"' "$JANITOR" \
+  && ok "janitor_decide accepts optional is_delivery_partial (backward-compatible default)" \
+  || bad "janitor_decide missing is_delivery_partial param"
+grep -qF 'keep:delivery-partial-unresolved-scope' "$JANITOR" \
+  && ok "delivery-partial keep reason is distinguishable from generic no-merge-evidence" \
+  || bad "delivery-partial-unresolved-scope reason missing"
+# Both bug/task call sites must compute the label read AND thread it into janitor_decide.
+grep -qF 'printf '"'"'%s'"'"' "$b" | jq -e '"'"'(.labels // []) | index("delivery:partial")'"'"' >/dev/null 2>&1 \' "$JANITOR" \
+  && ok "in_progress sweep computes IS_DELIV_PARTIAL from the bead's own labels" \
+  || bad "in_progress sweep not computing IS_DELIV_PARTIAL"
+grep -qF 'printf '"'"'%s'"'"' "$f" | jq -e '"'"'(.labels // []) | index("delivery:partial")'"'"' >/dev/null 2>&1 \' "$JANITOR" \
+  && ok "ga-hcj4 stranded-wrapper sweep computes F_DELIV_PARTIAL from the bead's own labels" \
+  || bad "ga-hcj4 sweep not computing F_DELIV_PARTIAL"
+grep -qF 'janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE" "$SIG_MK_SUPER" "$IS_DELIV_PARTIAL"' "$JANITOR" \
+  && ok "in_progress sweep threads is_delivery_partial into janitor_decide" \
+  || bad "in_progress sweep not threading is_delivery_partial"
+grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL"' "$JANITOR" \
+  && ok "ga-hcj4 stranded-wrapper sweep threads is_delivery_partial into janitor_decide" \
+  || bad "ga-hcj4 sweep not threading is_delivery_partial"
+# Negative check: the story sweep's own janitor_story_decide call must NOT have grown
+# an 8th arg — confirms this fix deliberately left that sweep alone (see header above)
+# rather than silently drifting it out of sync with a copy-paste that half-applies.
+if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER"' "$JANITOR" \
+   && ! grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_' "$JANITOR"; then
+  ok "story sweep's janitor_story_decide call deliberately untouched (no delivery:partial label ever reaches a story bead)"
+else
+  bad "story sweep's janitor_story_decide call signature changed unexpectedly — re-check ga-f54ui's story-sweep-exclusion rationale"
 fi
 
 echo ""
