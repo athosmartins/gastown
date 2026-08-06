@@ -68,16 +68,20 @@
 #      execução ("Running N shell command(s)…", presente + reticências —
 #      distinto de "Ran N shell commands", o resumo passado que todo turno
 #      JÁ CONCLUÍDO também deixa no scrollback); (b) o contador de tokens do
-#      próprio CLI ("↓ NNk tokens") subiu desde a última amostra — ou é a
-#      primeira vez que este bead é visto travado (amostra "não-provada"
-#      nunca vira veredito de morto, mesma lógica tri-state de
-#      transcript_is_advancing() acima). Comparar VALORES em vez de casar
-#      texto é o que torna (b) auto-corretivo contra um pane congelado num
-#      crash: o número não muda entre amostras, então para de suprimir
-#      depois de UMA passada de graça e volta a escalar normalmente — nunca
-#      um blind spot permanente. Limiar padrão também subiu de 1800s pra
-#      3600s (mesma medição) como defesa em profundidade, não como o fix em
-#      si. Ver pane_shows_active_child_process()/tokens_rising_or_first_sample()
+#      próprio CLI ("↓ NNk tokens") MUDOU desde a última amostra — subiu OU
+#      desceu (gate fix-attempt-2: um reset de contexto ou uma troca pra um
+#      contador de SUBAGENTE — ex. "Explore … ↓140.3k tokens" — pode
+#      legitimamente BAIXAR o valor lido; queda também é vida, só a IGUALDADE
+#      exata prova pane congelado) — ou é a primeira vez que este bead é
+#      visto travado (amostra "não-provada" nunca vira veredito de morto,
+#      mesma lógica tri-state de transcript_is_advancing() acima). Comparar
+#      VALORES em vez de casar texto é o que torna (b) auto-corretivo contra
+#      um pane congelado num crash: o número fica EXATAMENTE igual entre
+#      amostras, então para de suprimir depois de UMA passada de graça e
+#      volta a escalar normalmente — nunca um blind spot permanente. Limiar
+#      padrão também subiu de 1800s pra 3600s (mesma medição) como defesa em
+#      profundidade, não como o fix em si. Ver
+#      pane_shows_active_child_process()/tokens_rising_or_first_sample()
 #      abaixo.
 #
 # ANTI-SPAM: uma escalação por bead por janela COOLDOWN_SEC (padrão 3h).
@@ -402,6 +406,24 @@ pane_extract_token_count() {
 # escalation path — never a permanent blind spot, unlike a pure text match
 # on a pane that could stay frozen forever.
 #
+# DESPITE THE NAME (kept as-is for git-blame continuity across the gate's
+# fix-attempt-2 — a rename would touch every call site and comment below for
+# no behavior change): this suppresses on ANY observed change, not only a
+# rise. Gate fix-attempt-1 compared `current > prev` and treated a DECREASE
+# as "not suppress-worthy" — but pane_extract_token_count() reads whichever
+# status line is LAST in the pane's tail, and that can legitimately switch
+# from the main turn's own counter to an active SUBAGENT's counter (e.g.
+# "Explore … ↓140.3k tokens") mid-turn — exactly the scenario this whole fix
+# targets. That switch can just as easily read LOWER as higher. A decrease
+# still proves the pane re-rendered since the last sample, i.e. the session
+# is alive — so it must suppress exactly like a rise does. The ONLY value
+# that proves a frozen pane is EQUALITY (current == prev): the renderer
+# produced the identical frame twice in a row. Do NOT "fix" the decrease
+# case with `>=` instead of `!=` — `>=` would additionally suppress on
+# equality, which is the one case that must be allowed to escalate; that
+# swaps a false-positive (rare, self-correcting after one grace pass) for a
+# false-negative (a truly-stuck session never gets reported again).
+#
 # "No baseline yet" (first time this bead is seen stuck) suppresses too —
 # ONE grace pass, same fail-safe posture as every other tri-state check in
 # this file (UNKNOWN transcript, failed session-list query, empty assignee
@@ -410,8 +432,10 @@ pane_extract_token_count() {
 # 5-minute grace period, then the flat comparison on the next pass falls
 # through to escalate normally — bounded, not indefinite.
 #
-#   0 = suppress-worthy (first sample, or current > previous)
-#   1 = not suppress-worthy (current <= previous — flat/stale, or no count given)
+#   0 = suppress-worthy (first sample, or current != previous — changed in
+#       EITHER direction, which is proof of life)
+#   1 = not suppress-worthy (current == previous — the one value that proves
+#       a flat/frozen pane — or no count given)
 tokens_rising_or_first_sample() {
     # Two separate `local` statements, not one (shellcheck SC2318): `tf`'s
     # RHS references `$bead_id`, and a same-statement `local a=X b=$a` does
@@ -430,10 +454,15 @@ tokens_rising_or_first_sample() {
     [ -f "$tf" ] && prev="$(head -1 "$tf" 2>/dev/null || echo "")"
     printf '%s\n' "$current" > "$tf"
     [ -z "$prev" ] && return 0
+    # != , not > and NOT >=: any observed change (rise OR fall) is proof of
+    # life; only exact equality proves the pane rendered the identical frame
+    # twice, i.e. frozen. See the function docstring above (gate
+    # fix-attempt-2) for why >= is the wrong fix — it would additionally
+    # suppress on equality, the one case that must escalate.
     python3 -c "
 import sys
 try:
-    sys.exit(0 if float('$current') > float('$prev') else 1)
+    sys.exit(0 if float('$current') != float('$prev') else 1)
 except Exception:
     sys.exit(1)
 "
@@ -1134,8 +1163,11 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
     # doc (item 7) and the two helper functions above for the full
     # rationale. Two independent, externally-observable signals, checked in
     # order: (a) a tool call is actively in flight; (b) the CLI's streaming
-    # token counter is present and rising (or this is the first sample ever
-    # taken for this bead — one grace pass).
+    # token counter is present and CHANGED since the last sample — rose OR
+    # fell, since a fall can legitimately happen when the pane's last line
+    # switches from the main turn's counter to an active subagent's own
+    # counter (gate fix-attempt-2) — or this is the first sample ever taken
+    # for this bead — one grace pass.
     if [ "$transcript_state" = "frozen" ] && [ -n "$live_session_name" ]; then
         if pane_shows_active_child_process "$live_session_name"; then
             log "$bead_id: bead.updated_at parado ${age_min}min — transcript de $live_session_name CONGELADO mas pane confirma processo filho ativo (shell/tool em execução) — SUPRIMINDO escalação (fail-safe ga-0xmxt: meio de turno)"
@@ -1143,7 +1175,7 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
         fi
         _tok="$(pane_extract_token_count "$live_session_name" 2>/dev/null || true)"
         if [ -n "$_tok" ] && tokens_rising_or_first_sample "$bead_id" "$_tok"; then
-            log "$bead_id: bead.updated_at parado ${age_min}min — transcript de $live_session_name CONGELADO mas contador de tokens do pane em ${_tok}k (subindo desde a última amostra, ou primeira amostra) — SUPRIMINDO escalação (fail-safe ga-0xmxt: meio de turno)"
+            log "$bead_id: bead.updated_at parado ${age_min}min — transcript de $live_session_name CONGELADO mas contador de tokens do pane em ${_tok}k (mudou desde a última amostra — subiu ou desceu —, ou primeira amostra) — SUPRIMINDO escalação (fail-safe ga-0xmxt: meio de turno)"
             continue
         fi
     fi

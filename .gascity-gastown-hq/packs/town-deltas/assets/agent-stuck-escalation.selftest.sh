@@ -943,10 +943,17 @@ STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
 assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test30" "T45: no mail — token count rose since last sample (50.0 → 80.0)"
 [ "$(cat "$WORK/city/.gc/state/agent-stuck-escalation-tokens/ga-test30" 2>/dev/null)" = "80.0" ] && ok "T45: token baseline updated (80.0) — proves the comparison used the real prior sample, not just presence" || bad "T45: token baseline not updated"
 
-echo "T46: SAME bead, third pass with the SAME (flat) token count → escalation FINALLY fires (ga-0xmxt CONTROLE: a stale/frozen counter is not indefinitely suppressed)"
+echo "T45b: SAME bead, third pass with a LOWER token count than the previous sample → STILL suppressed (ga-0xmxt gate fix-attempt-2 CONTROLE: a decrease is ALSO life, not just a rise — this is the exact regression the gate caught: comparing current>prev falls through to escalation on a decrease, e.g. the pane's tail switching from the main turn's counter to a fresh subagent's own lower counter mid-turn)"
+echo "✽ Thinking… (22m 10s · ↓ 45.0k tokens)" > "$PEEK_FIXTURE_DIR/dog-ga0xmxt-2.txt"
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
-assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test30" "T46: escalation fires — token count is flat (80.0 == 80.0), not proven rising, not a fresh grace pass"
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test30" "T45b: no mail — token count FELL since last sample (80.0 → 45.0) but a change in either direction proves the pane re-rendered, i.e. alive"
+[ "$(cat "$WORK/city/.gc/state/agent-stuck-escalation-tokens/ga-test30" 2>/dev/null)" = "45.0" ] && ok "T45b: token baseline updated to the lower value (45.0) — proves != is being used, not > alone" || bad "T45b: token baseline not updated"
+
+echo "T46: SAME bead, fourth pass with the SAME (flat) token count as T45b → escalation FINALLY fires (ga-0xmxt CONTROLE: a stale/frozen counter is not indefinitely suppressed; also proves the fix isn't >= — equality must NOT suppress)"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test30" "T46: escalation fires — token count is flat (45.0 == 45.0), the one value that proves a frozen pane"
 rm -f "$LOGS_FIXTURE_DIR/dog-ga0xmxt-2.json" "$PEEK_FIXTURE_DIR/dog-ga0xmxt-2.txt"
 
 echo "T47: transcript frozen, NO active child process, NO token counter, session genuinely absent → escalation still fires (ga-0xmxt CONTROLE: real hang, no regression)"
