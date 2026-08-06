@@ -50,7 +50,13 @@ rig_path() {
   printf '%s' "$RIGS_JSON" | jq -r --arg n "$name" '.rigs[]? | select(.name==$n) | .path' 2>/dev/null | head -1
 }
 
-MARKERS=$(bd -C "$HQ" list -l type:quality-gate-marker --json 2>/dev/null)
+# --limit 0 é OBRIGATÓRIO: `bd list` trunca em 50 por padrão. Em modo humano ele
+# avisa ("more results matched but were hidden by --limit"), mas o aviso vai pro
+# STDERR — e o `2>/dev/null` idiomático desta cidade o engole. O --json devolve um
+# array puro, sem nenhum campo dizendo que truncou. Resultado: uma fila com 60
+# markers seria reportada como 50, e a composição REAL/FANTASMA sairia errada sem
+# nenhum sinal. Um diagnóstico que subconta em silêncio é pior que não ter.
+MARKERS=$(bd -C "$HQ" list --limit 0 -l type:quality-gate-marker --json 2>/dev/null)
 if [ -z "$MARKERS" ] || ! printf '%s' "$MARKERS" | jq -e 'type=="array"' >/dev/null 2>&1; then
   echo "ERRO: não consegui ler os markers (bd falhou ou devolveu envelope de erro)." >&2
   echo "      Isto é UNKNOWN, não 'fila vazia' — não conclua nada a partir daqui." >&2
