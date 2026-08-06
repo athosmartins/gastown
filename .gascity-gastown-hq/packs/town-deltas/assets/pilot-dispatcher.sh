@@ -505,6 +505,60 @@ wa_worker_template() {
 # instruct — it never silently flips state. Fail-open: any lookup miss → no
 # directive (identical to pre-change behaviour).
 
+# gc_json_or_unknown <cmd...>
+#
+# ga-07509: `VAR=$(gc ... --json 2>/dev/null || echo "")` does not protect
+# against a failing `gc` call — gc still prints a JSON envelope to STDOUT
+# even when it exits non-zero (e.g. {"ok":false,"error":{...}}, or for
+# `gc bd <sub>` a bare {"error":"..."} with no "ok" key at all), so the
+# command substitution already captured that non-empty envelope before
+# `|| echo` ever runs. The envelope then parses as valid JSON, and a
+# downstream `.field | length` read on it silently returns 0 —
+# indistinguishable from "queried successfully, zero results".
+#
+# This wrapper captures the REAL exit code before anything can discard it
+# (via `if VAR=$(...); then`, exempt from this file's `set -e` the same way
+# the rest of its guard clauses are), and additionally checks the envelope's
+# own `ok` field (some gc paths print an error envelope and still exit 0).
+# It resolves to exactly one of three states — never collapses the last two:
+#   - valid data / legitimate-empty: prints the raw JSON to stdout, returns
+#     0. The JSON may legitimately describe an empty result (e.g.
+#     {"sessions": []}) — that is for the CALLER to determine via its own
+#     field-specific jq query, exactly as before this fix. This helper only
+#     answers "did the call itself succeed", not "was the result empty".
+#   - FAILURE: prints nothing, returns 1. Callers MUST treat this distinctly
+#     from a legitimate empty result — never proceed as if the answer was
+#     "no data" (defer/retry/explicit fail-open per call site's own policy).
+#
+# Usage:
+#   if _OUT=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json); then
+#     ... use $_OUT, e.g. echo "$_OUT" | jq '.sessions | length' ...
+#   else
+#     ... gc call FAILED — decide explicitly what this call site does ...
+#   fi
+# Or, for a memoized cache that should retry-on-failure rather than pin an
+# empty sentinel: CACHE=$(gc_json_or_unknown gc ...) || true; [ -z "$CACHE" ]
+# unambiguously means "failed" — a real success is never an empty string
+# (this helper's own success path always prints at least "{}"/"[]").
+gc_json_or_unknown() {
+  local _gjou_out _gjou_rc
+  if _gjou_out=$("$@" 2>/dev/null); then
+    _gjou_rc=0
+  else
+    _gjou_rc=$?
+  fi
+  [ "$_gjou_rc" -eq 0 ] || return 1
+  [ -n "$_gjou_out" ] || return 1
+  if ! printf '%s' "$_gjou_out" | jq -e . >/dev/null 2>&1; then
+    return 1   # exit 0 but unparseable — never hand malformed JSON upstream
+  fi
+  if printf '%s' "$_gjou_out" | jq -e 'has("ok") and (.ok == false)' >/dev/null 2>&1; then
+    return 1   # exit 0 but envelope explicitly says ok:false
+  fi
+  printf '%s' "$_gjou_out"
+  return 0
+}
+
 # rig_root_path <rig> — registered production-root path for a rig, or "" if none.
 # Memoized across the sweep in PILOT_RIG_PATHS_JSON (one `gc rig list` per run).
 PILOT_RIG_PATHS_JSON=""
@@ -512,7 +566,12 @@ rig_root_path() {
   local _rig="$1"
   [ -z "$_rig" ] && return 0
   if [ -z "$PILOT_RIG_PATHS_JSON" ]; then
-    PILOT_RIG_PATHS_JSON=$(gc --city "$GC_CITY" rig list --json 2>/dev/null || echo '{}')
+    # ga-07509: on failure PILOT_RIG_PATHS_JSON stays "" (never cached as a
+    # poisoned '{}') so the NEXT call this sweep retries instead of being
+    # permanently stuck on one transient gc hiccup — matches the retry
+    # behavior of the sibling cache in quality-gate-dispatcher.sh's
+    # _grlc_fetch/_GATE_RIG_LIST_CACHE.
+    PILOT_RIG_PATHS_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json) || true
   fi
   printf '%s' "$PILOT_RIG_PATHS_JSON" \
     | jq -r --arg n "$_rig" '.rigs[]? | select(.name == $n) | .path' 2>/dev/null \
@@ -1376,7 +1435,12 @@ _dolt_probe() {
   # and the probe returns empty → fail-safe saturated → the feature would be
   # permanently throttled off. Scope the city via the GC_CITY env var instead
   # (the leaf walks up from cwd / honors GC_CITY); this is the form that works.
-  _h=$(GC_CITY="$GC_CITY" timeout 15 gc dolt health --json 2>/dev/null || echo "")
+  # ga-07509: on FAILURE (timeout, nonzero exit, or an ok:false envelope) _h
+  # stays "" — identical to the pre-fix empty-fallback shape, so the existing
+  # fail-safe "both signals blind -> saturated" path below is unchanged; the
+  # fix is that a failure can no longer be mistaken for a *successful* health
+  # read that merely omitted these fields.
+  _h=$(GC_CITY="$GC_CITY" gc_json_or_unknown timeout 15 gc dolt health --json) || true
   DOLT_LATENCY_MS=$(printf '%s' "$_h" | jq -r '.server.latency_ms // empty' 2>/dev/null || echo "")
   DOLT_PID=$(printf '%s' "$_h" | jq -r '.server.pid // empty' 2>/dev/null || echo "")
 }
@@ -2800,7 +2864,13 @@ IN_FLIGHT_RAW_TOTAL=$(echo "$IN_FLIGHT_RAW_JSON" | jq 'length' 2>/dev/null || ec
 # ── Live-session roster (ga-e5yw2) ────────────────────────────────────────────
 # Fetch the session roster ONCE per sweep; reused below for the dead-worker
 # in-flight correction AND the gate-reviewer readout (one gc call, not two).
-_SESSIONS_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo '{}')
+# ga-07509: on failure _SESSIONS_JSON stays "" (never the look-alike-valid
+# '{}' the old fallback produced) — the .sessions|type=="array" shape check
+# just below already treats that the same as "unreadable", so the existing
+# fail-safe (disable the dead-worker check) is unchanged; only the failure
+# DETECTION itself moves off an incidental shape heuristic onto the
+# authoritative exit-code+envelope signal.
+_SESSIONS_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json) || true
 # Newline-delimited identifiers of every session that is NOT closed. A sling
 # bead's assignee is a session_name, but index every name field so any form of
 # the id resolves. `unique` keeps the membership grep cheap.

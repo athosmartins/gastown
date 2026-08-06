@@ -648,6 +648,60 @@ _ar_quota_limited() {
   printf '0'; return 0
 }
 
+# gc_json_or_unknown <cmd...>
+#
+# ga-07509: `VAR=$(gc ... --json 2>/dev/null || echo "")` does not protect
+# against a failing `gc` call — gc still prints a JSON envelope to STDOUT
+# even when it exits non-zero (e.g. {"ok":false,"error":{...}}, or for
+# `gc bd <sub>` a bare {"error":"..."} with no "ok" key at all), so the
+# command substitution already captured that non-empty envelope before
+# `|| echo` ever runs. The envelope then parses as valid JSON, and a
+# downstream `.field | length` read on it silently returns 0 —
+# indistinguishable from "queried successfully, zero results".
+#
+# This wrapper captures the REAL exit code before anything can discard it
+# (via `if VAR=$(...); then`, exempt from this file's `set -e` the same way
+# the rest of its guard clauses are), and additionally checks the envelope's
+# own `ok` field (some gc paths print an error envelope and still exit 0).
+# It resolves to exactly one of three states — never collapses the last two:
+#   - valid data / legitimate-empty: prints the raw JSON to stdout, returns
+#     0. The JSON may legitimately describe an empty result (e.g.
+#     {"sessions": []}) — that is for the CALLER to determine via its own
+#     field-specific jq query, exactly as before this fix. This helper only
+#     answers "did the call itself succeed", not "was the result empty".
+#   - FAILURE: prints nothing, returns 1. Callers MUST treat this distinctly
+#     from a legitimate empty result — never proceed as if the answer was
+#     "no data" (defer/retry/explicit fail-open per call site's own policy).
+#
+# Usage:
+#   if _OUT=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json); then
+#     ... use $_OUT, e.g. echo "$_OUT" | jq '.sessions | length' ...
+#   else
+#     ... gc call FAILED — decide explicitly what this call site does ...
+#   fi
+# Or, for a memoized cache that should retry-on-failure rather than pin an
+# empty sentinel: CACHE=$(gc_json_or_unknown gc ...) || true; [ -z "$CACHE" ]
+# unambiguously means "failed" — a real success is never an empty string
+# (this helper's own success path always prints at least "{}"/"[]").
+gc_json_or_unknown() {
+  local _gjou_out _gjou_rc
+  if _gjou_out=$("$@" 2>/dev/null); then
+    _gjou_rc=0
+  else
+    _gjou_rc=$?
+  fi
+  [ "$_gjou_rc" -eq 0 ] || return 1
+  [ -n "$_gjou_out" ] || return 1
+  if ! printf '%s' "$_gjou_out" | jq -e . >/dev/null 2>&1; then
+    return 1   # exit 0 but unparseable — never hand malformed JSON upstream
+  fi
+  if printf '%s' "$_gjou_out" | jq -e 'has("ok") and (.ok == false)' >/dev/null 2>&1; then
+    return 1   # exit 0 but envelope explicitly says ok:false
+  fi
+  printf '%s' "$_gjou_out"
+  return 0
+}
+
 # _ar_dolt_hot → "1" iff Dolt is saturated (latency OR cpu over ceiling), else "0".
 # Mirrors the Pilot's _dolt_probe/_dolt_saturated (ga-rk5va). NOTE the
 # deliberate difference: the Pilot fail-SAFEs a blind probe to SATURATED because it
@@ -659,7 +713,10 @@ _ar_dolt_hot() {
   if [ -n "$AUTO_REFINO_DOLT_LATENCY_OVERRIDE_MS" ]; then
     _lat="$AUTO_REFINO_DOLT_LATENCY_OVERRIDE_MS"
   else
-    _h=$(GC_CITY="$GC_CITY" timeout 15 gc dolt health --json 2>/dev/null || echo "")
+    # ga-07509: on FAILURE _h stays "" — identical to the pre-fix empty shape,
+    # so the existing fail-OPEN ("blind -> 0/not-hot") below is unchanged;
+    # only a failure can no longer be mistaken for a successful-but-blank read.
+    _h=$(GC_CITY="$GC_CITY" gc_json_or_unknown timeout 15 gc dolt health --json) || true
     _lat=$(printf '%s' "$_h" | jq -r '.server.latency_ms // empty' 2>/dev/null || echo "")
     _pid=$(printf '%s' "$_h" | jq -r '.server.pid // empty' 2>/dev/null || echo "")
   fi
@@ -1496,7 +1553,8 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   _now=$(date +%s)
   if [ $(( _now - _LAST_DRAINED_CHECK )) -ge "$AUTO_REFINO_DRAINED_GRACE_SECONDS" ]; then
     _LAST_DRAINED_CHECK=$_now
-    _SESSIONS_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo '{}')
+    # ga-07509: "" on failure (not '{}') — auto_refino_session_drained() below already fail-opens to "no" on that.
+    _SESSIONS_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json) || true
     if [ "$(auto_refino_session_drained "$_SESSIONS_JSON" "$SESSION_ID")" = "yes" ]; then
       OUTCOME="SPAWN_DRAINED"
       warn "  Refiner session $SESSION_ID drained before delivering an outcome for $STORY_ID (stale_async_start race, ga-bvbm) — requeuing now instead of waiting out the full timeout."

@@ -1880,10 +1880,75 @@ gate_fail_assignee_action() {
 # per bead. This wrapper preserves author_is_alive()'s original live-fetch
 # contract for its own call sites unchanged. Single source of truth for the
 # match predicate across all three call sites so they cannot diverge again.
+# gc_json_or_unknown <cmd...>
+#
+# ga-07509: `VAR=$(gc ... --json 2>/dev/null || echo "")` does not protect
+# against a failing `gc` call — gc still prints a JSON envelope to STDOUT
+# even when it exits non-zero (e.g. {"ok":false,"error":{...}}, or for
+# `gc bd <sub>` a bare {"error":"..."} with no "ok" key at all), so the
+# command substitution already captured that non-empty envelope before
+# `|| echo` ever runs. The envelope then parses as valid JSON, and a
+# downstream `.field | length` read on it silently returns 0 —
+# indistinguishable from "queried successfully, zero results".
+#
+# This wrapper captures the REAL exit code before anything can discard it
+# (via `if VAR=$(...); then`, exempt from this file's `set -e` the same way
+# the rest of its guard clauses are), and additionally checks the envelope's
+# own `ok` field (some gc paths print an error envelope and still exit 0).
+# It resolves to exactly one of three states — never collapses the last two:
+#   - valid data / legitimate-empty: prints the raw JSON to stdout, returns
+#     0. The JSON may legitimately describe an empty result (e.g.
+#     {"sessions": []}) — that is for the CALLER to determine via its own
+#     field-specific jq query, exactly as before this fix. This helper only
+#     answers "did the call itself succeed", not "was the result empty".
+#   - FAILURE: prints nothing, returns 1. Callers MUST treat this distinctly
+#     from a legitimate empty result — never proceed as if the answer was
+#     "no data" (defer/retry/explicit fail-open per call site's own policy).
+#
+# Usage:
+#   if _OUT=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json); then
+#     ... use $_OUT, e.g. echo "$_OUT" | jq '.sessions | length' ...
+#   else
+#     ... gc call FAILED — decide explicitly what this call site does ...
+#   fi
+# Or, for a memoized cache that should retry-on-failure rather than pin an
+# empty sentinel: CACHE=$(gc_json_or_unknown gc ...) || true; [ -z "$CACHE" ]
+# unambiguously means "failed" — a real success is never an empty string
+# (this helper's own success path always prints at least "{}"/"[]").
+gc_json_or_unknown() {
+  local _gjou_out _gjou_rc
+  if _gjou_out=$("$@" 2>/dev/null); then
+    _gjou_rc=0
+  else
+    _gjou_rc=$?
+  fi
+  [ "$_gjou_rc" -eq 0 ] || return 1
+  [ -n "$_gjou_out" ] || return 1
+  if ! printf '%s' "$_gjou_out" | jq -e . >/dev/null 2>&1; then
+    return 1   # exit 0 but unparseable — never hand malformed JSON upstream
+  fi
+  if printf '%s' "$_gjou_out" | jq -e 'has("ok") and (.ok == false)' >/dev/null 2>&1; then
+    return 1   # exit 0 but envelope explicitly says ok:false
+  fi
+  printf '%s' "$_gjou_out"
+  return 0
+}
+
 author_is_alive() {
   local author="${1:-}"
   local sessions_json
-  sessions_json=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "{}")
+  # ga-07509: on a FAILED `gc session list` call, fail toward ALIVE (1), not
+  # dead (0) — the old fallback ('{}' on failure) silently read as "no live
+  # sessions" here, which flows into gate_fail_assignee_action()'s 'clear'
+  # branch and wipes a possibly-very-much-alive author's claim. That is
+  # EXACTLY the mechanism behind ga-1url/ga-u4yi: two builders raced on the
+  # same branch and destroyed the same epic twice in one night. A false
+  # "alive" only costs one extra sweep before a truly-dead author's claim is
+  # cleared — far cheaper than a double-dispatch.
+  if ! sessions_json=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json); then
+    printf '1'
+    return 0
+  fi
   session_matches_author "$author" "$sessions_json"
 }
 
@@ -4004,7 +4069,12 @@ RIG_PATH=""
 # subsequent Phase C iteration this sweep with an empty registry from one
 # blip.
 if [ -z "${_GATE_RIG_LIST_CACHE:-}" ]; then
-  _grlc_fetch=$(gc --city "$GC_CITY" rig list --json 2>/dev/null || echo '{}')
+  # ga-07509: on failure _grlc_fetch stays "" (never the look-alike-valid
+  # '{}' the old fallback produced) — _grlc_count's own `|| echo "0"` and the
+  # `-gt 0` gate below already treat that the same as "no rigs", so the
+  # existing retry-on-failure design (this comment block, above) is
+  # unchanged; only failure DETECTION moves onto the authoritative signal.
+  _grlc_fetch=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json) || true
   _grlc_count=$(printf '%s' "$_grlc_fetch" | jq '.rigs | length' 2>/dev/null || echo "0")
   case "$_grlc_count" in ''|*[!0-9]*) _grlc_count=0 ;; esac
   if [ "$_grlc_count" -gt 0 ]; then
@@ -4630,7 +4700,12 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
         # pending slot is confirmed dead — if even one reviewer is still
         # alive (slow, or wedged on a huge diff), fall through to the
         # existing FAIL path unchanged, same as before this fix.
-        PC_SESS_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "")
+        # ga-07509: on failure PC_SESS_JSON stays "" (never a look-alike-
+        # valid fallback) — the loop below now guards this explicitly (see
+        # the PC_SESS_JSON emptiness check, mirroring its two sibling
+        # guards) instead of relying on PC_PRESENT_N's `|| echo 1` to
+        # accidentally land on the same safe outcome for the wrong reason.
+        PC_SESS_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json) || true
         PC_ANY_PENDING=0
         PC_ALL_PENDING_DEAD=1
         # SELFTEST-EXTRACT phase-c-dead-reviewer-classify-fn: BEGIN
@@ -4663,6 +4738,18 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
           # the TIMEOUT path instead of guessing.
           if [ "$PC_SID" = "__UNKNOWN__" ]; then
             warn "  Phase C: verdict bead $PC_VB assignee capture was unreadable earlier this sweep (bd show failed — transient Dolt hiccup?) — not confirming dead-reviewer classification; falling through to the TIMEOUT path instead of guessing (root-class:error-vs-empty, ga-i5s5)."
+            PC_ALL_PENDING_DEAD=0
+            break
+          fi
+          # ga-07509: mirror the two guards above — an unreadable session
+          # roster (gc session list failed) means we cannot confirm THIS
+          # reviewer is dead either. Without this, PC_PRESENT_N's own
+          # `|| echo 1` fallback would silently land on the same "treat as
+          # present" outcome, but for the wrong reason (a jq-parse-failure
+          # default, not a confirmed inability to classify) — fragile if
+          # that fallback value ever changes for unrelated reasons.
+          if [ -z "$PC_SESS_JSON" ]; then
+            warn "  Phase C: gc session list unreadable this sweep (transient hiccup?) — not confirming dead-reviewer classification; falling through to the TIMEOUT path instead of guessing (root-class:error-vs-empty, ga-07509)."
             PC_ALL_PENDING_DEAD=0
             break
           fi
@@ -4840,7 +4927,20 @@ reviewer_session_should_reap() {
   if [ "$age" -gt "$ttl" ]; then echo "reap"; else echo "keep"; fi
 }
 
-REVIEWER_SESSIONS_RAW=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo '{}')
+# ga-07509: on failure REVIEWER_SESSIONS_RAW stays "" (never the look-alike
+# -valid '{}' the old fallback produced). REVIEWER_SESSION_COUNT's own
+# `''|*[!0-9]*) =0` normalization below still treats that as "zero
+# reviewers" this sweep — the orphan-reap (ga-zl277) is skipped and
+# LIVE_REVIEWERS (the headroom-gate denominator, gt-bewtm) under-counts for
+# one sweep, same as a genuinely-empty roster. Both are self-healing (next
+# sweep re-fetches) and nothing here arms a destructive action off the false
+# zero, so this failure mode stays fail-open, matching the headroom gate's
+# own Dolt-outage handling below — but it must be LOGGED so a real,
+# recurring gc outage isn't invisible.
+REVIEWER_SESSIONS_RAW=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json) || true
+if [ -z "$REVIEWER_SESSIONS_RAW" ]; then
+  warn "  gc session list unreadable this sweep — skipping gate-reviewer orphan-reap (ga-zl277) and reading REVIEWER_SESSION_COUNT=0 for headroom this sweep only (ga-07509, self-heals next sweep)."
+fi
 REVIEWER_SESSIONS_JSON=$(echo "$REVIEWER_SESSIONS_RAW" \
   | jq -c '[.sessions[]? | select(.template=="gate-reviewer")]' 2>/dev/null || echo "[]")
 REVIEWER_SESSION_COUNT=$(echo "$REVIEWER_SESSIONS_JSON" | jq 'length' 2>/dev/null || echo "0")
@@ -4912,7 +5012,18 @@ fi
 # Cheap + idempotent: a single-ref fetch + ancestry check; only a forked ref is
 # rewritten (to origin; forked tip backed up first). Silent on the common no-op so
 # it does not spam the log every ~2 min.
-RECON_RIG_JSON=$(gc --city "$GC_CITY" rig list --json 2>/dev/null || echo '{}')
+# ga-07509: on failure RECON_RIG_JSON stays "" (never the look-alike-valid
+# '{}' the old fallback produced). RECON_RIG_COUNT's own normalization below
+# still reads that as "zero rigs" — this sweep's bare-main reconciliation is
+# skipped, self-healing next sweep exactly like a genuine zero-rig registry
+# would (this step is cheap + idempotent by design). Unlike a genuine no-op
+# though, a FAILURE re-exposes the ga-rstw5 false-FAIL risk this whole step
+# exists to prevent, so — unlike the no-op case, which stays silent on
+# purpose — a failed fetch must be logged.
+RECON_RIG_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json) || true
+if [ -z "$RECON_RIG_JSON" ]; then
+  warn "  gc rig list unreadable this sweep — skipping bare-main reconciliation (ga-rstw5 defense) this sweep only (ga-07509, self-heals next sweep)."
+fi
 RECON_RIG_COUNT=$(echo "$RECON_RIG_JSON" | jq '.rigs | length' 2>/dev/null || echo "0")
 case "$RECON_RIG_COUNT" in ''|*[!0-9]*) RECON_RIG_COUNT=0 ;; esac
 if [ "$RECON_RIG_COUNT" -gt 0 ]; then
@@ -5027,7 +5138,11 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
   if [ -n "${GATE_DOLT_LATENCY_OVERRIDE_MS:-}" ]; then
     HR_LAT="$GATE_DOLT_LATENCY_OVERRIDE_MS"; HR_PID="TEST"
   else
-    HR_H=$(GC_CITY="$GC_CITY" timeout 15 gc dolt health --json 2>/dev/null || echo "")
+    # ga-07509: on FAILURE HR_H stays "" — identical to the pre-fix empty
+    # shape, so the FAIL-OPEN "no-signal" branch documented above is
+    # unchanged; only a failure can no longer be mistaken for a successful
+    # read that merely omitted these fields.
+    HR_H=$(GC_CITY="$GC_CITY" gc_json_or_unknown timeout 15 gc dolt health --json) || true
     HR_LAT=$(printf '%s' "$HR_H" | jq -r '.server.latency_ms // empty' 2>/dev/null || echo "")
     HR_PID=$(printf '%s' "$HR_H" | jq -r '.server.pid // empty' 2>/dev/null || echo "")
   fi
@@ -5376,7 +5491,11 @@ bead_field_grep() {
 if [ -z "$AUTHOR" ] && [ -n "$BEAD_ID" ]; then
   # 1. Cross-rig lookup via gc bd (authoritative — queries the owning rig's DB).
   #    This handles beads in rig DBs (e.g. wa-*, ps-*) that are NOT in the HQ DB.
-  BEAD_RAW=$(gc --city "$GC_CITY" bd show "$BEAD_ID" --json 2>/dev/null || echo "")
+  # ga-07509: on failure BEAD_RAW stays "" exactly as before — the fallback-
+  # to-HQ-DB guard right below already treats empty as "try the other
+  # lookup", correct whether gc failed OR the bead genuinely wasn't found
+  # there; only the failure DETECTION changes.
+  BEAD_RAW=$(gc_json_or_unknown gc --city "$GC_CITY" bd show "$BEAD_ID" --json) || true
 
   # If cross-rig lookup returned nothing, fall back to HQ DB
   if [ -z "$BEAD_RAW" ]; then
@@ -7409,7 +7528,11 @@ for _ack_attempt in $(seq 1 "$ACK_MAX_RETRIES"); do
   ACK_SESS_JSON=""
   _ack_now=$(date +%s 2>/dev/null || echo 0)
   if [ "$_ack_attempt" -gt 1 ]; then
-    ACK_SESS_JSON=$(gc --city "$GC_CITY" session list --json 2>/dev/null || echo "")
+    # ga-07509: on failure ACK_SESS_JSON stays "" exactly as before — the
+    # `-n "$ACK_SESS_JSON"` shape gate right below already keeps ACK_LIST_OK
+    # at 0 for that case, so the fail-safe documented above is unchanged;
+    # only the failure DETECTION moves onto the authoritative signal.
+    ACK_SESS_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json) || true
     if [ -n "$ACK_SESS_JSON" ] && echo "$ACK_SESS_JSON" \
          | jq -e 'if type=="array" then true else has("sessions") end' >/dev/null 2>&1; then
       ACK_LIST_OK=1

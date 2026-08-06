@@ -1830,6 +1830,60 @@ fi
 
 AUTHOR=""
 
+# gc_json_or_unknown <cmd...>
+#
+# ga-07509: `VAR=$(gc ... --json 2>/dev/null || echo "")` does not protect
+# against a failing `gc` call — gc still prints a JSON envelope to STDOUT
+# even when it exits non-zero (e.g. {"ok":false,"error":{...}}, or for
+# `gc bd <sub>` a bare {"error":"..."} with no "ok" key at all), so the
+# command substitution already captured that non-empty envelope before
+# `|| echo` ever runs. The envelope then parses as valid JSON, and a
+# downstream `.field | length` read on it silently returns 0 —
+# indistinguishable from "queried successfully, zero results".
+#
+# This wrapper captures the REAL exit code before anything can discard it
+# (via `if VAR=$(...); then`, exempt from this file's `set -e` the same way
+# the rest of its guard clauses are), and additionally checks the envelope's
+# own `ok` field (some gc paths print an error envelope and still exit 0).
+# It resolves to exactly one of three states — never collapses the last two:
+#   - valid data / legitimate-empty: prints the raw JSON to stdout, returns
+#     0. The JSON may legitimately describe an empty result (e.g.
+#     {"sessions": []}) — that is for the CALLER to determine via its own
+#     field-specific jq query, exactly as before this fix. This helper only
+#     answers "did the call itself succeed", not "was the result empty".
+#   - FAILURE: prints nothing, returns 1. Callers MUST treat this distinctly
+#     from a legitimate empty result — never proceed as if the answer was
+#     "no data" (defer/retry/explicit fail-open per call site's own policy).
+#
+# Usage:
+#   if _OUT=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json); then
+#     ... use $_OUT, e.g. echo "$_OUT" | jq '.sessions | length' ...
+#   else
+#     ... gc call FAILED — decide explicitly what this call site does ...
+#   fi
+# Or, for a memoized cache that should retry-on-failure rather than pin an
+# empty sentinel: CACHE=$(gc_json_or_unknown gc ...) || true; [ -z "$CACHE" ]
+# unambiguously means "failed" — a real success is never an empty string
+# (this helper's own success path always prints at least "{}"/"[]").
+gc_json_or_unknown() {
+  local _gjou_out _gjou_rc
+  if _gjou_out=$("$@" 2>/dev/null); then
+    _gjou_rc=0
+  else
+    _gjou_rc=$?
+  fi
+  [ "$_gjou_rc" -eq 0 ] || return 1
+  [ -n "$_gjou_out" ] || return 1
+  if ! printf '%s' "$_gjou_out" | jq -e . >/dev/null 2>&1; then
+    return 1   # exit 0 but unparseable — never hand malformed JSON upstream
+  fi
+  if printf '%s' "$_gjou_out" | jq -e 'has("ok") and (.ok == false)' >/dev/null 2>&1; then
+    return 1   # exit 0 but envelope explicitly says ok:false
+  fi
+  printf '%s' "$_gjou_out"
+  return 0
+}
+
 # bead_field_grep <raw_json_text> <field_name>
 # Extracts a simple string field from potentially-malformed JSON output.
 # Uses grep/sed instead of jq because gc bd output may contain literal newlines
@@ -1846,7 +1900,11 @@ BEAD_RAW=""
 if [ -n "$BEAD_ID" ]; then
   # 1. Cross-rig lookup via gc bd (authoritative — queries the owning rig's Dolt DB).
   #    Handles beads in rig DBs (e.g. wa-*, ps-*) that are NOT in the HQ DB.
-  BEAD_RAW=$(gc --city "$GC_CITY" bd show "$BEAD_ID" --json 2>/dev/null || echo "")
+  # ga-07509: on failure BEAD_RAW stays "" exactly as before — the fallback-
+  # to-HQ-DB guard right below already treats empty as "try the other
+  # lookup", which is the correct response whether gc failed OR the bead
+  # genuinely wasn't found there; only the failure DETECTION changes.
+  BEAD_RAW=$(gc_json_or_unknown gc --city "$GC_CITY" bd show "$BEAD_ID" --json) || true
 
   if [ -z "$BEAD_RAW" ]; then
     log "  gc bd cross-rig lookup empty; falling back to HQ DB."
@@ -1993,7 +2051,14 @@ fi
 # wrong guess only leaves the bead attached — exactly the pre-fix behavior, never
 # worse.
 RIG_PATH=""
-RIG_LIST_JSON=$(gc --city "$GC_CITY" rig list --json 2>/dev/null || echo '{}')
+# ga-07509: on failure RIG_LIST_JSON stays "" (never the look-alike-valid
+# '{}' the old fallback produced). Every fallback below already treats
+# "no match" the same regardless of whether RIG_LIST_JSON is "" or '{}' (all
+# read via `jq ... 2>/dev/null | head -1 || echo ""`, which degrades to
+# empty either way) — and per the comment above, an unresolved RIG_PATH here
+# is explicitly non-fatal (best-effort detach), so this migration only moves
+# failure DETECTION onto the authoritative signal without changing behavior.
+RIG_LIST_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json) || true
 if [ -n "$RIG" ]; then
   RIG_PATH=$(echo "$RIG_LIST_JSON" \
     | jq -r --arg r "$RIG" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")

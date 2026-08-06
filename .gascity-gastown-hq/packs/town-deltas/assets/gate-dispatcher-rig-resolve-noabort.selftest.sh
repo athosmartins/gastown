@@ -103,6 +103,26 @@ run_rig_resolve() {
     bd() { echo "$*" >> "$BD_LOG"; return 0; }
     err() { echo "ERR: $*" >&2; }
     log() { echo "LOG: $*" >&2; }
+    # ga-07509: gate_resolve_rig_context() now calls gc_json_or_unknown
+    # (extracted verbatim below along with it) — this sandbox needs its own
+    # copy to run against. Double-quoted jq filters throughout purely to
+    # avoid nested-single-quote escaping inside this already-quoted bash -c
+    # string; behaviorally identical to the production copies (drift-
+    # guarded separately, byte-for-byte, by gc-json-or-unknown.selftest.sh).
+    gc_json_or_unknown() {
+      local _gjou_out _gjou_rc
+      if _gjou_out=$("$@" 2>/dev/null); then
+        _gjou_rc=0
+      else
+        _gjou_rc=$?
+      fi
+      [ "$_gjou_rc" -eq 0 ] || return 1
+      [ -n "$_gjou_out" ] || return 1
+      if ! printf "%s" "$_gjou_out" | jq -e . >/dev/null 2>&1; then return 1; fi
+      if printf "%s" "$_gjou_out" | jq -e "has(\"ok\") and (.ok == false)" >/dev/null 2>&1; then return 1; fi
+      printf "%s" "$_gjou_out"
+      return 0
+    }
     '"$fn_bead_city"'
     '"$fn_resolve_ctx"'
     '"$block"'

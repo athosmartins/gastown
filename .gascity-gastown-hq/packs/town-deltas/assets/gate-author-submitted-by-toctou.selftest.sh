@@ -127,6 +127,29 @@ fi
 # ── C. backward compat: legacy marker (no metadata) still falls through ─────
 echo "C. dispatcher: legacy marker without gate.submitted_by still re-derives from the bead"
 
+# ga-07509: the BEAD_RAW line below now goes through gc_json_or_unknown (the
+# same migration quality-gate-guard.sh/-dispatcher.sh got), so this sandbox
+# needs its own copy to run against — double-quoted jq filters throughout
+# purely to avoid nested-single-quote escaping inside this already-quoted
+# bash -c string; behaviorally identical to the production copies (drift-
+# guarded separately, byte-for-byte, by gc-json-or-unknown.selftest.sh).
+GC_JSON_OR_UNKNOWN_SANDBOX_SRC='
+      gc_json_or_unknown() {
+        local _gjou_out _gjou_rc
+        if _gjou_out=$("$@" 2>/dev/null); then
+          _gjou_rc=0
+        else
+          _gjou_rc=$?
+        fi
+        [ "$_gjou_rc" -eq 0 ] || return 1
+        [ -n "$_gjou_out" ] || return 1
+        if ! printf "%s" "$_gjou_out" | jq -e . >/dev/null 2>&1; then return 1; fi
+        if printf "%s" "$_gjou_out" | jq -e "has(\"ok\") and (.ok == false)" >/dev/null 2>&1; then return 1; fi
+        printf "%s" "$_gjou_out"
+        return 0
+      }
+'
+
 if [ -n "${BLOCK:-}" ]; then
   RESULT="$(
     bash -c '
@@ -138,12 +161,13 @@ if [ -n "${BLOCK:-}" ]; then
           | sed "s/\"${field}\": *\"\(.*\)\"/\1/" \
           | head -1 || true
       }
+      '"$GC_JSON_OR_UNKNOWN_SANDBOX_SRC"'
       gc() { echo "{\"assignee\":\"legacy-author\"}"; }
       bd() { echo "{\"assignee\":\"legacy-author\"}"; }
       VERIFY_JSON="{\"metadata\":{}}"; BEAD_ID="wa-legacy"
       '"$BLOCK"'
       if [ -z "$AUTHOR" ] && [ -n "$BEAD_ID" ]; then
-        BEAD_RAW=$(gc --city x bd show "$BEAD_ID" --json 2>/dev/null || echo "")
+        BEAD_RAW=$(gc_json_or_unknown gc --city x bd show "$BEAD_ID" --json) || true
         AUTHOR=$(bead_field_grep "$BEAD_RAW" "assignee")
       fi
       echo "AUTHOR=${AUTHOR}"
@@ -152,6 +176,37 @@ if [ -n "${BLOCK:-}" ]; then
   case "$RESULT" in
     "AUTHOR=legacy-author") ok "no metadata → falls through to bead assignee (legacy markers unaffected)" ;;
     *) bad "expected AUTHOR=legacy-author, got '$RESULT'" ;;
+  esac
+
+  # ga-07509: previously untested here — a FAILING gc bd show (nonzero exit,
+  # bare {"error":...} envelope, no "ok" key) must NOT be misread as "bead
+  # has no assignee". AUTHOR must stay unresolved (empty), never silently
+  # resolve to something derived from the failure envelope itself.
+  RESULT_FAIL="$(
+    bash -c '
+      set -euo pipefail
+      log() { :; }
+      bead_field_grep() {
+        local raw="$1" field="$2"
+        echo "$raw" | grep -o "\"${field}\": *\"[^\"]*\"" \
+          | sed "s/\"${field}\": *\"\(.*\)\"/\1/" \
+          | head -1 || true
+      }
+      '"$GC_JSON_OR_UNKNOWN_SANDBOX_SRC"'
+      gc() { echo "{\"error\":\"no issues found matching the provided IDs\",\"schema_version\":1}"; return 1; }
+      bd() { echo "{\"error\":\"no issues found matching the provided IDs\",\"schema_version\":1}"; return 1; }
+      VERIFY_JSON="{\"metadata\":{}}"; BEAD_ID="wa-legacy"
+      '"$BLOCK"'
+      if [ -z "$AUTHOR" ] && [ -n "$BEAD_ID" ]; then
+        BEAD_RAW=$(gc_json_or_unknown gc --city x bd show "$BEAD_ID" --json) || true
+        AUTHOR=$(bead_field_grep "$BEAD_RAW" "assignee")
+      fi
+      echo "AUTHOR=${AUTHOR}"
+    ' _ 2>/dev/null
+  )"
+  case "$RESULT_FAIL" in
+    "AUTHOR=") ok "ga-07509: a FAILING gc bd show leaves AUTHOR unresolved (empty), not misread as a resolved-but-blank assignee" ;;
+    *) bad "ga-07509 REGRESSION: a failing gc call resolved to '$RESULT_FAIL' instead of staying unresolved" ;;
   esac
 else
   bad "block not isolated (see section B) — skipping C"
