@@ -9,12 +9,13 @@
        CONTEXTO: quando um agente/crew não consegue resolver um item de trabalho,
        o sistema escala autonomamente em camadas:
          Camada 1 (ga-qw3p.1): roteamento por tópico → crew certo
-         Camada 2 (ESTE):      sem progresso em 30min → Mayor
+         Camada 2 (ESTE):      sem progresso em 60min → Mayor
          Camada 3 (ga-qw3p.3): Mayor travado → quórum 2-de-3
          Camada 4 (ga-qw3p.4): quórum falhou → notify 🚨 humano
 
-       DETECÇÃO: lista beads in_progress; qualquer bead cujo updated_at é >30min
-       atrás é "travado". Exclui tipos de infraestrutura (warrant/sling/wisp).
+       DETECÇÃO: lista beads in_progress; qualquer bead cujo updated_at é >60min
+       atrás E cujo pane não mostra atividade real (ga-0xmxt) é "travado".
+       Exclui tipos de infraestrutura (warrant/sling/wisp).
 
        ESCALAÇÃO: gc mail send mayor com diagnóstico (bead, assignee, tempo parado,
        status da sessão, marcadores de falha). Notify -p 4 ao Athos primeiro
@@ -24,7 +25,9 @@
        Quando bead fecha ou avança (updated_at move) → estado limpo no próximo pass.
 
        Limiares configuráveis via EnvironmentVariables:
-         STUCK_AGENT_SEC (padrão 1800 = 30min)
+         STUCK_AGENT_SEC (padrão 3600 = 60min — ga-0xmxt, subiu de 1800/30min:
+                          medido ao vivo um turno de max-effort em 33m18s e
+                          ainda rodando, 30min dava zero margem)
          COOLDOWN_SEC    (padrão 10800 = 3h)
        Kill-switch: .gc/state/agent-stuck-escalation.disabled
 
@@ -58,9 +61,10 @@
     <string>/Users/athos/gt/.gascity-gastown-hq</string>
     <key>BD_ACTOR</key>
     <string>automation</string>
-    <!-- Threshold: beads in_progress sem update por este tempo são "travados". -->
+    <!-- Threshold: beads in_progress sem update por este tempo são candidatos
+         a "travado" (ainda sujeitos aos sinais de atividade real, ga-0xmxt). -->
     <key>STUCK_AGENT_SEC</key>
-    <string>1800</string>
+    <string>3600</string>
     <!-- Re-escalation cooldown por bead (3h). Evita spam enquanto Mayor age. -->
     <key>COOLDOWN_SEC</key>
     <string>10800</string>

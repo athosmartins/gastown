@@ -106,15 +106,20 @@ case "$1 $2" in
     exit 0
     ;;
   "mail send")
-    # $3 = recipient; find subject after -s flag
+    # $3 = recipient; subject after -s flag (unchanged format/behavior);
+    # body after -m flag written to MAIL_BODY_FILE (ga-0xmxt: needed to
+    # assert on escalation-body wording, which the subject-only ACTIONS log
+    # can't capture). Scans ALL args now instead of breaking at -s, so both
+    # flags are found regardless of order — existing subject-only assertions
+    # are unaffected since the ACTIONS line format/content is identical.
     _recipient="${3:-mayor}"
     shift 3 2>/dev/null || true
     while [ $# -gt 0 ]; do
-      if [ "$1" = "-s" ]; then
-        echo "mail:${_recipient}|$2" >> "$ACTIONS_FILE"
-        break
-      fi
-      shift
+      case "$1" in
+        -s) echo "mail:${_recipient}|$2" >> "$ACTIONS_FILE"; shift 2 ;;
+        -m) printf '%s' "$2" > "${MAIL_BODY_FILE:-/dev/null}"; shift 2 ;;
+        *) shift ;;
+      esac
     done
     exit 0
     ;;
@@ -146,6 +151,7 @@ run_script() {
     GATE_MARKERS_DIR="${GATE_MARKERS_DIR:-}" \
     GATE_VERDICTS_DIR="${GATE_VERDICTS_DIR:-}" \
     ACTIONS_FILE="$ACTIONS" \
+    MAIL_BODY_FILE="$WORK/last_mail_body.txt" \
     STUCK_AGENT_SEC="${STUCK_AGENT_SEC:-1800}" \
     COOLDOWN_SEC="${COOLDOWN_SEC:-10800}" \
     TRANSCRIPT_FRESH_SEC="${TRANSCRIPT_FRESH_SEC:-1800}" \
@@ -882,6 +888,135 @@ rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-gen01"
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 run_script > /dev/null
 assert_contains "$ACTIONS" "mail:mayor|" "T12: no-topic bead fallback to Mayor"
+
+# ── T43-T51: pane_shows_active_child_process / pane_extract_token_count / ───
+# tokens_rising_or_first_sample (ga-0xmxt). Falsifiable acceptance criteria
+# from the bug: FIXTURE (active child / rising tokens → NOT escala),
+# CONTROLE (dead process, no activity signals → CONTINUA escalando),
+# CONTROLE 3 (the two cases produce DIFFERENT outputs, asserted together).
+
+echo "T43: transcript frozen, pane shows live 'Running N shell command…' → suppressed (ga-0xmxt FIXTURE: active child process)"
+echo '{"sessions":[{"name":"dog-ga0xmxt-1","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-ga0xmxt-1 3600
+echo "⏺ Running 1 shell command…" > "$PEEK_FIXTURE_DIR/dog-ga0xmxt-1.txt"
+printf '[%s]' "$(make_bead ga-test28 dog-ga0xmxt-1 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test28"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test28" "T43: no mail — pane confirms an active child process (shell command running)"
+assert_absent "$ACTIONS" "notify" "T43: no notify — active child process suppresses"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test28" ] && ok "T43: no escalation state written (suppression is log-only)" || bad "T43: unexpected state file written on suppression"
+log_contains "T43" "processo filho ativo" "T43: log notes active-child-process suppression"
+rm -f "$LOGS_FIXTURE_DIR/dog-ga0xmxt-1.json" "$PEEK_FIXTURE_DIR/dog-ga0xmxt-1.txt"
+
+echo "T43b: transcript frozen, pane shows only the PAST-TENSE 'Ran N shell commands' summary (no live indicator) → generic escalation (no false match on completed-turn scrollback)"
+echo '{"sessions":[{"name":"dog-ga0xmxt-1b","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-ga0xmxt-1b 3600
+{
+    echo "⏺ All done here."
+    echo ""
+    echo "  Ran 3 shell commands"
+} > "$PEEK_FIXTURE_DIR/dog-ga0xmxt-1b.txt"
+printf '[%s]' "$(make_bead ga-test29 dog-ga0xmxt-1b 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test29"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test29" "T43b: escalation fires — 'Ran N shell commands' is a past-tense completed-turn summary, not live activity"
+rm -f "$LOGS_FIXTURE_DIR/dog-ga0xmxt-1b.json" "$PEEK_FIXTURE_DIR/dog-ga0xmxt-1b.txt"
+
+echo "T44: transcript frozen, pane shows a live token counter, FIRST sample for this bead → suppressed (grace pass, ga-0xmxt FIXTURE: rising tokens part 1)"
+echo '{"sessions":[{"name":"dog-ga0xmxt-2","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-ga0xmxt-2 3600
+echo "✽ Thinking… (12m 3s · ↓ 50.0k tokens)" > "$PEEK_FIXTURE_DIR/dog-ga0xmxt-2.txt"
+printf '[%s]' "$(make_bead ga-test30 dog-ga0xmxt-2 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test30" "$WORK/city/.gc/state/agent-stuck-escalation-tokens/ga-test30"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test30" "T44: no mail — first token sample for this bead is a grace pass"
+log_contains "T44" "contador de tokens" "T44: log notes the token-counter suppression path"
+[ "$(cat "$WORK/city/.gc/state/agent-stuck-escalation-tokens/ga-test30" 2>/dev/null)" = "50.0" ] && ok "T44: token baseline stored (50.0)" || bad "T44: token baseline not stored correctly"
+
+echo "T45: SAME bead, second pass with a HIGHER token count → suppressed (ga-0xmxt FIXTURE: rising tokens part 2 — proven rising, not just first-sample)"
+echo "✽ Thinking… (18m 40s · ↓ 80.0k tokens)" > "$PEEK_FIXTURE_DIR/dog-ga0xmxt-2.txt"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test30" "T45: no mail — token count rose since last sample (50.0 → 80.0)"
+[ "$(cat "$WORK/city/.gc/state/agent-stuck-escalation-tokens/ga-test30" 2>/dev/null)" = "80.0" ] && ok "T45: token baseline updated (80.0) — proves the comparison used the real prior sample, not just presence" || bad "T45: token baseline not updated"
+
+echo "T46: SAME bead, third pass with the SAME (flat) token count → escalation FINALLY fires (ga-0xmxt CONTROLE: a stale/frozen counter is not indefinitely suppressed)"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test30" "T46: escalation fires — token count is flat (80.0 == 80.0), not proven rising, not a fresh grace pass"
+rm -f "$LOGS_FIXTURE_DIR/dog-ga0xmxt-2.json" "$PEEK_FIXTURE_DIR/dog-ga0xmxt-2.txt"
+
+echo "T47: transcript frozen, NO active child process, NO token counter, session genuinely absent → escalation still fires (ga-0xmxt CONTROLE: real hang, no regression)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead ga-test31 dog-ga0xmxt-dead 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test31" "$WORK/city/.gc/state/agent-stuck-escalation-tokens/ga-test31"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test31" "T47: escalation fires — no session, no activity signals to suppress on"
+
+echo "T48: CONTROLE 3 — active-work case and dead-process case produce DIFFERENT outcomes, asserted together in the same test"
+echo '{"sessions":[{"name":"dog-ga0xmxt-4a","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-ga0xmxt-4a 3600
+echo "⏺ Running 1 shell command…" > "$PEEK_FIXTURE_DIR/dog-ga0xmxt-4a.txt"
+printf '[%s]' "$(make_bead ga-test32 dog-ga0xmxt-4a 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test32"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+_caseA_mailed=0
+grep -qF "mail:mayor|Agente travado: ga-test32" "$ACTIONS" && _caseA_mailed=1
+rm -f "$LOGS_FIXTURE_DIR/dog-ga0xmxt-4a.json" "$PEEK_FIXTURE_DIR/dog-ga0xmxt-4a.txt"
+
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead ga-test33 dog-ga0xmxt-4b 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test33"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+_caseB_mailed=0
+grep -qF "mail:mayor|Agente travado: ga-test33" "$ACTIONS" && _caseB_mailed=1
+
+if [ "$_caseA_mailed" != "$_caseB_mailed" ]; then
+    ok "T48: active-work case (suppressed) and dead-process case (escalated) diverge as required"
+else
+    bad "T48: expected divergent outcomes — got caseA_mailed=$_caseA_mailed caseB_mailed=$_caseB_mailed (both same, detector is not discriminating)"
+fi
+
+echo "T49: 'Running…'/'↓ Nk tokens' text present only in OLD scrollback (outside the tail window) → generic escalation (tail-anchoring holds, mirrors T37)"
+echo '{"sessions":[{"name":"dog-ga0xmxt-5","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-ga0xmxt-5 3600
+{
+    echo "⏺ Running 1 shell command…"
+    echo "✽ Thinking… (5m 0s · ↓ 99.0k tokens)"
+    for i in $(seq 1 25); do echo "unrelated old scrollback line $i"; done
+} > "$PEEK_FIXTURE_DIR/dog-ga0xmxt-5.txt"
+printf '[%s]' "$(make_bead ga-test34 dog-ga0xmxt-5 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test34" "$WORK/city/.gc/state/agent-stuck-escalation-tokens/ga-test34"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test34" "T49: generic escalation — activity text is stale scrollback, not the pane's current tail"
+rm -f "$LOGS_FIXTURE_DIR/dog-ga0xmxt-5.json" "$PEEK_FIXTURE_DIR/dog-ga0xmxt-5.txt"
+
+echo "T50: STUCK_AGENT_SEC unset entirely → script's own internal default is 3600s, not the old 1800s (ga-0xmxt threshold raise)"
+_log_before=$(wc -l < "$WORK/city/.gc/logs/agent-stuck-escalation.log" 2>/dev/null || echo 0)
+echo "[]" > "$BEADS_FIXTURE"
+GC_CITY_PATH="$WORK/city" GC="$SHIM/gc" BD="$SHIM/bd" NOTIFY_BIN="$SHIM/notify" \
+    BEADS_FIXTURE="$BEADS_FIXTURE" SESSIONS_FIXTURE="$SESSIONS_FIXTURE" \
+    ESCALATION_STORES="$WORK/city" \
+    bash "$SCRIPT" > /dev/null 2>&1
+_new_lines="$(tail -n "+$((_log_before + 1))" "$WORK/city/.gc/logs/agent-stuck-escalation.log")"
+printf '%s' "$_new_lines" | grep -qF "STUCK=3600s" && ok "T50: script's own default is 3600s when STUCK_AGENT_SEC is unset" || bad "T50: expected internal default STUCK=3600s in pass-start log line"
+
+echo "T51: generic escalation mail body leads with confirmation, not destructive action (ga-0xmxt wording change)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead ga-test35 dog-ga0xmxt-wording 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test35"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-test35" "T51: escalation fires (dead process, sanity check)"
+assert_contains "$WORK/last_mail_body.txt" "SÓ DEPOIS de confirmar" "T51: mail body requires peek confirmation before any destructive action"
+assert_contains "$WORK/last_mail_body.txt" "raciocínio longo, subagente ativo" "T51: mail body flags the false-positive possibility up front"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

@@ -55,6 +55,30 @@
 #      permissões e as 3 escalações que dispararam nesse intervalo diziam
 #      só "sem progresso" — ninguém soube que bastava 1 tecla. Ver
 #      pane_shows_permission_prompt() abaixo.
+#   7. EXCETO se o transcript CONGELADO é porque o TURNO em si é longo, não
+#      porque o agente morreu (ga-0xmxt): max-effort thinking / um subagente
+#      ativo podem rodar 30min+ como uma unidade só antes do CLI sequer
+#      flush-ar uma escrita no transcript — medido ao vivo: uma sessão real
+#      mostrou "Wandering… (33m 18s · ↓ 138.6k tokens)" ainda em andamento,
+#      já passando o limiar antigo de 1800s. "Pensando há 30min" e "morto há
+#      30min" viravam o MESMO sinal, e a própria escalação recomendava
+#      kill/shutdown-dance — descartando o raciocínio e o contexto já
+#      carregados de um agente vivo. Dois sinais observáveis de FORA, sem
+#      depender de escrita no transcript: (a) o pane mostra uma tool call em
+#      execução ("Running N shell command(s)…", presente + reticências —
+#      distinto de "Ran N shell commands", o resumo passado que todo turno
+#      JÁ CONCLUÍDO também deixa no scrollback); (b) o contador de tokens do
+#      próprio CLI ("↓ NNk tokens") subiu desde a última amostra — ou é a
+#      primeira vez que este bead é visto travado (amostra "não-provada"
+#      nunca vira veredito de morto, mesma lógica tri-state de
+#      transcript_is_advancing() acima). Comparar VALORES em vez de casar
+#      texto é o que torna (b) auto-corretivo contra um pane congelado num
+#      crash: o número não muda entre amostras, então para de suprimir
+#      depois de UMA passada de graça e volta a escalar normalmente — nunca
+#      um blind spot permanente. Limiar padrão também subiu de 1800s pra
+#      3600s (mesma medição) como defesa em profundidade, não como o fix em
+#      si. Ver pane_shows_active_child_process()/tokens_rising_or_first_sample()
+#      abaixo.
 #
 # ANTI-SPAM: uma escalação por bead por janela COOLDOWN_SEC (padrão 3h).
 #   Per-bead state: .gc/state/agent-stuck-escalation/<bead-id>
@@ -75,8 +99,9 @@ LOG_DIR="$CITY/.gc/logs"
 LOG="$LOG_DIR/agent-stuck-escalation.log"
 STATE_DIR="$CITY/.gc/state"
 ESCDIR="$STATE_DIR/agent-stuck-escalation"
+TOKDIR="$STATE_DIR/agent-stuck-escalation-tokens"  # ga-0xmxt: per-bead last-seen token count
 
-STUCK_AGENT_SEC="${STUCK_AGENT_SEC:-1800}"   # 30min sem update → travado
+STUCK_AGENT_SEC="${STUCK_AGENT_SEC:-3600}"   # 60min sem update → travado (ga-0xmxt: subiu de 1800s — medido ao vivo um turno de max-effort em 33m18s e ainda rodando, 1800s dava zero margem)
 COOLDOWN_SEC="${COOLDOWN_SEC:-10800}"        # 3h antes de re-escalar o mesmo bead
 TRANSCRIPT_FRESH_SEC="${TRANSCRIPT_FRESH_SEC:-$STUCK_AGENT_SEC}"  # ga-hehi: transcript escrito há menos disso = avançando
 MAYOR_ADDR="${MAYOR_ADDR:-mayor}"
@@ -97,7 +122,7 @@ fi
 # Types to skip — utility/infrastructure beads, not work items
 SKIP_TYPES="warrant sling wisp"
 
-mkdir -p "$LOG_DIR" "$STATE_DIR" "$ESCDIR"
+mkdir -p "$LOG_DIR" "$STATE_DIR" "$ESCDIR" "$TOKDIR"
 
 if [ "$DRY_RUN" != "1" ]; then
     exec >> "$LOG" 2>&1
@@ -310,6 +335,109 @@ except Exception:
 ' 2>/dev/null
 }
 
+# pane_shows_active_child_process (ga-0xmxt): the transcript-frozen signal
+# above conflates "no tool boundary has closed in TRANSCRIPT_FRESH_SEC" with
+# "dead" — but a single tool call (a shell command, a subagent) can run well
+# past that window as ONE unit, with nothing to flush until it returns. The
+# CLI renders its OWN present-tense, in-flight indicator for this
+# ("Running 2 shell commands…", captured live from a real gate-reviewer
+# session) — distinct from "Ran N shell commands", the PAST-TENSE summary
+# every already-completed turn leaves in scrollback (also observed live,
+# same session, describing a call that had already finished). Matching only
+# the present-tense + ellipsis form is what keeps this from tripping on the
+# ubiquitous historical "Ran N shell commands" lines. Restricted to the tail
+# of the pane (not the whole 40-line capture) for the same reason
+# pane_shows_permission_prompt() is: old scrollback that happens to mention
+# "Running" (e.g. an agent's own prose *about* this bug) shouldn't count —
+# only what's actually being rendered right now should. Wider tail window
+# than pane_shows_permission_prompt() (20 vs 12): a permission dialog is
+# always the literal last thing rendered (the CLI is fully blocked on it),
+# but a live "Running…" indicator can have a multi-line command preview
+# AND a subsequent spinner line after it before the footer chrome.
+#
+#   0 = CONFIRMED  — pane's tail shows a live "Running…" tool indicator
+#   1 = not confirmed (peek failed/empty, or no match)
+pane_shows_active_child_process() {
+    local sess="$1" peek_out tail_out
+    peek_out="$(timeout 15 "$GC" session peek "$sess" --lines 40 2>/dev/null || true)"
+    [ -z "$peek_out" ] && return 1
+    tail_out="$(printf '%s\n' "$peek_out" | tail -20)"
+    printf '%s' "$tail_out" | grep -qE 'Running [0-9]+ shell (command|commands)|Running…|Running\.\.\.'
+}
+
+# pane_extract_token_count (ga-0xmxt): reads the CLI's own streaming token
+# counter off its live spinner / active-subagent status line — e.g.
+# "✽ Wandering… (33m 18s · ↓ 138.6k tokens)" or "◯ Explore  <desc>  3m 49s ·
+# ↓ 140.3k tokens" (both captured live from real sessions actively working).
+# Prints the bare numeric value (in k) on stdout; the caller decides what to
+# do with it — this function only extracts, never judges "active" by
+# itself, because a single sample can't distinguish "captured mid-turn" from
+# "pane frozen at the last frame before a crash". See
+# tokens_rising_or_first_sample() for the stateful comparison that makes
+# that distinction. Same tail-20 rationale as pane_shows_active_child_process
+# above (avoid matching a stale mention in old scrollback — this exact
+# string was, in fact, quoted verbatim in an agent's own prose while
+# discussing this bug, confirmed live, so the risk is not hypothetical).
+#
+#   stdout = numeric token count (k), return 0  — a live counter was found
+#   (nothing printed), return 1                 — no counter in the pane's tail
+pane_extract_token_count() {
+    local sess="$1" peek_out val
+    peek_out="$(timeout 15 "$GC" session peek "$sess" --lines 40 2>/dev/null || true)"
+    [ -z "$peek_out" ] && return 1
+    val="$(printf '%s\n' "$peek_out" | tail -20 | grep -oE '↓[[:space:]]*[0-9]+(\.[0-9]+)?k tokens' | tail -1 | grep -oE '[0-9]+(\.[0-9]+)?')"
+    [ -z "$val" ] && return 1
+    printf '%s' "$val"
+}
+
+# tokens_rising_or_first_sample (ga-0xmxt): persists the last-seen token
+# count per bead (mirrors the per-bead escalation-cooldown state file
+# pattern already used for $sf, but in its own directory so its lifecycle
+# isn't tied to escalation/cooldown bookkeeping) and compares across
+# CONSECUTIVE DAEMON PASSES (StartInterval 300s) rather than matching text —
+# this is what makes it "separar pensando de morto SEM heurística de tempo"
+# (the bug's own framing): a genuinely dead session's last-rendered token
+# count never changes between samples, so this signal naturally stops
+# suppressing after one grace pass and falls through to the normal
+# escalation path — never a permanent blind spot, unlike a pure text match
+# on a pane that could stay frozen forever.
+#
+# "No baseline yet" (first time this bead is seen stuck) suppresses too —
+# ONE grace pass, same fail-safe posture as every other tri-state check in
+# this file (UNKNOWN transcript, failed session-list query, empty assignee
+# all suppress on ambiguity rather than treat "unproven" as "confirmed
+# dead"). A truly-dead session with a stale counter visible gets exactly one
+# 5-minute grace period, then the flat comparison on the next pass falls
+# through to escalate normally — bounded, not indefinite.
+#
+#   0 = suppress-worthy (first sample, or current > previous)
+#   1 = not suppress-worthy (current <= previous — flat/stale, or no count given)
+tokens_rising_or_first_sample() {
+    # Two separate `local` statements, not one (shellcheck SC2318): `tf`'s
+    # RHS references `$bead_id`, and a same-statement `local a=X b=$a` does
+    # NOT see `a`'s new value while evaluating `b` — it resolves through
+    # whatever `$bead_id` already meant in the CALLER's scope. Confirmed
+    # live: with a pre-existing caller-scope `bead_id` (exactly this
+    # function's own real call site, nested in the per-bead `while read -r
+    # bead_id ...` loop) `tf` silently built from the OUTER bead_id instead
+    # of this function's `$1` — invisible today only because the caller's
+    # `bead_id` always equals `$1` at this exact call site (same loop
+    # iteration, no recursion), not because the line was actually correct.
+    local bead_id="$1" current="${2:-}"
+    local tf="$TOKDIR/$bead_id" prev
+    [ -z "$current" ] && return 1
+    prev=""
+    [ -f "$tf" ] && prev="$(head -1 "$tf" 2>/dev/null || echo "")"
+    printf '%s\n' "$current" > "$tf"
+    [ -z "$prev" ] && return 0
+    python3 -c "
+import sys
+try:
+    sys.exit(0 if float('$current') > float('$prev') else 1)
+except Exception:
+    sys.exit(1)
+"
+}
 # gate_reviewer_permission_prompt_session (ga-lxk26): a bead EM GATE has NO
 # builder session by design (ga-n937 below) — bead.assignee is typically
 # empty, so every assignee-keyed check in this file (session health,
@@ -776,6 +904,17 @@ for sf in "$ESCDIR"/*; do
     fi
 done
 
+# GC (ga-0xmxt): same cleanup for the per-bead token-sample state — a bead
+# that closes or advances shouldn't leave its last-seen-token-count file
+# behind forever.
+for tf in "$TOKDIR"/*; do
+    [ -f "$tf" ] || continue
+    bn="$(basename "$tf")"
+    if ! printf '%s' " $ALL_INPROGRESS_IDS " | grep -qF " $bn "; then
+        rm -f "$tf"
+    fi
+done
+
 if [ -z "$STUCK_ITEMS" ]; then
     log "no stuck beads (all in_progress beads updated within ${STUCK_AGENT_SEC}s)"
     exit 0
@@ -990,6 +1129,25 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
         continue
     fi
 
+    # ga-0xmxt: transcript CONFIRMED frozen + session alive is STILL not
+    # proof of a hang when the turn itself is simply LONG — see the header
+    # doc (item 7) and the two helper functions above for the full
+    # rationale. Two independent, externally-observable signals, checked in
+    # order: (a) a tool call is actively in flight; (b) the CLI's streaming
+    # token counter is present and rising (or this is the first sample ever
+    # taken for this bead — one grace pass).
+    if [ "$transcript_state" = "frozen" ] && [ -n "$live_session_name" ]; then
+        if pane_shows_active_child_process "$live_session_name"; then
+            log "$bead_id: bead.updated_at parado ${age_min}min — transcript de $live_session_name CONGELADO mas pane confirma processo filho ativo (shell/tool em execução) — SUPRIMINDO escalação (fail-safe ga-0xmxt: meio de turno)"
+            continue
+        fi
+        _tok="$(pane_extract_token_count "$live_session_name" 2>/dev/null || true)"
+        if [ -n "$_tok" ] && tokens_rising_or_first_sample "$bead_id" "$_tok"; then
+            log "$bead_id: bead.updated_at parado ${age_min}min — transcript de $live_session_name CONGELADO mas contador de tokens do pane em ${_tok}k (subindo desde a última amostra, ou primeira amostra) — SUPRIMINDO escalação (fail-safe ga-0xmxt: meio de turno)"
+            continue
+        fi
+    fi
+
     # pane_shows_permission_prompt (ga-iog1v / AC1+AC2 de ga-q640n): diferente
     # do check acima (que SUPRIME quando o turno terminou limpo), aqui o
     # turno ainda tem um tool_use PENDENTE — a escalação abaixo vai disparar
@@ -1034,7 +1192,11 @@ while IFS='|' read -r bead_id assignee age_secs title labels; do
         body="$(build_permission_prompt_body "$bead_id" "$title" "$assignee" "$live_session_name" "$blocked_cmd" "$age_min" "$failure_markers")"
     else
         body="$(cat <<BODY
-CAMADA 2 — ESCALAÇÃO AUTOMÁTICA: bead in_progress sem progresso detectado.
+CAMADA 2 — ESCALAÇÃO AUTOMÁTICA: bead in_progress sem ESCRITA detectada há
+${age_min}min. Isto NÃO é confirmação de travamento — pode ser falso
+positivo (raciocínio longo, subagente ativo) que os sinais automáticos
+disponíveis nesta passada não conseguiram provar nem descartar. CONFIRME
+antes de agir.
 
 Bead:      $bead_id — $title
 Assignee:  ${assignee:-'(não atribuído)'}
@@ -1043,15 +1205,15 @@ Sessão:    $sess_status
 Transcript: $transcript_note
 Marcadores de falha: $failure_markers
 
-AÇÃO SUGERIDA:
-1. gc session peek ${assignee:-<assignee>} — confirme se realmente travado ou só lento
+AÇÃO SUGERIDA (nesta ordem — passo 1 é obrigatório antes de qualquer ação destrutiva):
+1. gc session peek ${assignee:-<assignee>} — confirme se realmente travado ou só lento/em turno longo
 2. gc bd show $bead_id — veja estado atual do bead
-3. Se travado: shutdown-dance (3 nudges via dog pool) ou kill+re-despache
+3. SÓ DEPOIS de confirmar no passo 1 que não há atividade real: shutdown-dance (3 nudges via dog pool) ou kill+re-despache. Matar uma sessão ativa descarta o raciocínio e o contexto já carregados.
 4. Se misroute: circuit-break (gate:needs-human) e reassinalação ao dono correto
 5. Se bead avançou mas updated_at não se moveu: update manual para parar alertas
 
 Limiar configurável via STUCK_AGENT_SEC (atual: ${STUCK_AGENT_SEC}s).
-(Daemon: agent-stuck-escalation · ga-qw3p.2)
+(Daemon: agent-stuck-escalation · ga-qw3p.2 · falso-positivo de turno longo: ga-0xmxt)
 BODY
 )"
     fi
