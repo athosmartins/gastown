@@ -69,6 +69,7 @@ _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 from gc_ledger import gc_ledger_append as _tsw_ledger
 import datetime as _tsw_datetime
 import park_labels
+import reclaim_liveness
 
 # ── paths ────────────────────────────────────────────────────────────────────
 CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
@@ -254,6 +255,8 @@ _read_gate_verdict_log_lines = None  # () -> [str]; tail of quality-gate-dispatc
                                       # (ga-u2u8z; distinct from _read_gate_log_lines above, which is
                                       # merge_signal's narrower Gate-PASSED-only seam over the same file)
 _bd_sling_state = None         # (sling_id) -> ("live"|"stale"|"absent"|"error", stall_hours|None); None = run bd (ga-ebm7c)
+_branch_recent = None          # (bead_id) -> bool; None-seam = run reclaim_liveness.get_branch_recent (ga-nxgxz)
+_active_sessions = None        # () -> list[dict]|None (None=probe failed); None-seam = run reclaim_liveness.list_active_sessions (ga-nxgxz)
 _do_dolt_cpu = None            # () -> float pct or None; None = run ps (ga-g0v96 headroom annotation)
 _do_notify = None              # (msg, prio) -> None; None = run notify binary
 _do_mail_mayor = None          # (subject, body) -> bool; None = run gc mail
@@ -1062,6 +1065,63 @@ def _sling_bead_state(sling_id, now):
     return ("stale", stall_hours) if stall_hours > DELIVERY_STALL_HOURS else ("live", stall_hours)
 
 
+# ── ga-nxgxz: real-progress check (branch commit / live session) ────────────
+def _real_progress_verdict(bead_id, assignee, sessions, now):
+    """Tri-state: is there REAL evidence of work on `bead_id`, independent of
+    any bd `updated_at` field? Returns "live" | "dead" | "unknown".
+
+    ga-nxgxz: bd `updated_at` only moves on bd mutations (label/status/comment/
+    assign) — a builder who is actively committing and pushing code does not
+    necessarily touch bd at all. Treating "bd wasn't touched" as "nothing
+    happened" false-positives on a fully live, actively-committing agent (the
+    reported case: session live, branch committed 27min before the alert,
+    flagged as parked for 10h because only the bead's own updated_at was
+    checked). Before trusting bd-timestamp staleness, check at least one REAL
+    signal: a recent commit on the bead's branch, or a live session owning it
+    (via `assignee`).
+
+    "live"    — branch has a commit within the delivery-stall window, OR a
+                live session matches `assignee`.
+    "dead"    — both signals were checked and BOTH came back negative (branch
+                confirmed stale, no live session found). Existing staleness-
+                based checks (sling/marker) proceed exactly as before this fix.
+    "unknown" — a signal could not be determined at all (the session-list
+                probe itself failed) and the other signal did not
+                independently confirm "live". Per the bug's own acceptance
+                criteria an illegible signal must never itself manufacture a
+                stall alert ("Não alarme por ausência de evidência") — the
+                caller silences on "unknown" same as "live", but logs it
+                under a distinct message so the two stay auditably different.
+
+    get_branch_recent() already fails SAFE on any git error (returns True —
+    branch-might-exist), so a branch-check failure surfaces here as "live",
+    never "unknown" — only the session dimension can produce "unknown"
+    (`sessions` is None when reclaim_liveness.list_active_sessions() errors).
+    """
+    if _branch_recent is not None:
+        branch_ok = _branch_recent(bead_id)
+    else:
+        try:
+            branch_ok = reclaim_liveness.get_branch_recent(
+                bead_id, fetch=True, window_seconds=DELIVERY_STALL_HOURS * 3600)
+        except Exception as e:
+            _log("_real_progress_verdict: get_branch_recent(%s) errored: %s — "
+                 "treating as live (fail-safe, mirrors the function's own contract)" % (
+                     bead_id, e))
+            branch_ok = True
+
+    if branch_ok:
+        return "live"
+
+    if sessions is None:
+        return "unknown"
+
+    if assignee and reclaim_liveness.session_is_live(assignee, sessions, now):
+        return "live"
+
+    return "dead"
+
+
 # ── imp23: delivery-stall signal ─────────────────────────────────────────────
 def delivery_signal(now, gate_depth=None, gate_throughput=None):
     """Returns (count, sample_beads, explained) of story:in-flight beads stalled
@@ -1139,12 +1199,39 @@ def delivery_signal(now, gate_depth=None, gate_throughput=None):
         _log("delivery_signal: all bd queries failed — ERROR (fail-open)")
         return None, [], []
 
+    # ga-nxgxz: fetch the live-session roster ONCE for the whole sweep (not per
+    # bead) — every stalled bead's real-progress check below reads the same
+    # snapshot. None means the probe itself failed (fed through as "unknown").
+    if _active_sessions is not None:
+        _tsw_sessions = _active_sessions()
+    else:
+        try:
+            _tsw_sessions = reclaim_liveness.list_active_sessions()
+        except Exception as e:
+            _log("delivery_signal: list_active_sessions errored: %s" % e)
+            _tsw_sessions = None
+
     # ga-g0v96 (AC1/AC2): split out beads explained by a healthy queued marker —
     # they are not an anomaly and must never count toward the escalation threshold.
     unexplained = {}
     explained = []
     for bid, b in stalled.items():
         root = stall_root[bid]
+
+        # ga-nxgxz: real-progress check BEFORE trusting any bd-timestamp
+        # staleness (this bead's own OR its sling's — see _real_progress_verdict
+        # docstring). "live" silences outright; "unknown" (illegible signals)
+        # also silences, per the bug's explicit Aceite, but logs separately so
+        # it stays distinguishable from a confirmed-live silence. Only "dead"
+        # (both signals confirmed negative) falls through to the existing
+        # sling/marker checks below, unchanged.
+        progress = _real_progress_verdict(bid, b.get("assignee") or "", _tsw_sessions, now)
+        if progress == "live":
+            continue
+        if progress == "unknown":
+            _log("delivery_signal: %s — real-progress signals (branch+session) "
+                 "unreadable; not treated as a confirmed stall (ga-nxgxz)" % bid)
+            continue
 
         # ga-9ni9w: the story's own updated_at freezes by construction once a
         # sling/wrapper task is dispatched for it — check pilot.sling_bead
@@ -1845,6 +1932,7 @@ def _selftest():
     global _bd_backlog, _bd_delivery, _do_mail_mayor, _do_notify, _do_dolt_probe
     global _suspended_rigs, _bd_marker_for_bead, _do_dolt_cpu, _bd_sling_state
     global _bd_gate_queue_markers, _read_gate_verdict_log_lines
+    global _branch_recent, _active_sessions
 
     ok_count = [0]
     fail_count = [0]
@@ -1946,6 +2034,13 @@ def _selftest():
     # overridden in the ga-u2u8z scenarios below.
     _bd_gate_queue_markers = lambda: []
     _read_gate_verdict_log_lines = lambda: []
+    # ga-nxgxz: hermetic defaults for the real-progress check — no recent branch
+    # commit, no active sessions at all. Every existing stalled-bead scenario
+    # (L, O1-O3, Q1-Q4, etc.) therefore resolves to "dead" and falls through to
+    # the pre-existing sling/marker checks completely unchanged. The ga-nxgxz
+    # scenarios below override these explicitly to exercise "live"/"unknown".
+    _branch_recent = lambda bead_id: False
+    _active_sessions = lambda: []
     # imp24: heal disabled by default so existing scenarios are not affected.
     _do_heal_throughput = None   # overridden in P/Q scenarios
     # imp12: quota check stubbed as available by default
@@ -2550,6 +2645,113 @@ def _selftest():
                     "silent-collapse regressed" % (
                         (_q4_verdict_missing, _q4_hours_missing),
                         (_q4_verdict_garbled, _q4_hours_garbled)))
+
+    # ── ga-nxgxz: real-progress check (branch commit / live session). Falsifying
+    # tests per the bug's own Aceite: a story whose bd `updated_at` is stale
+    # must NOT alert if there is REAL evidence of work — bd's own timestamp
+    # only moves on bd mutations, never on a git commit. Reported case: a
+    # live session, a branch committed 27min before the alert, flagged as
+    # parked for 10h because only the bead's own updated_at was checked ───────
+    print("\nga-nxgxz Scenario 1: bead updated_at stale + branch has a recent "
+          "commit → SILENCE (Aceite bullets 1+2)")
+    _read_pilot_log_lines = lambda: _pilot_lines(0, 3)
+    _read_gate_log_lines  = lambda: []
+    _git_log_count        = lambda root, since: 0
+    _bd_backlog           = lambda root: []
+    _bd_marker_for_bead   = lambda root, bead_id: ("absent", None)
+    _bd_delivery = lambda root: [_stale_bead("wa-52pou", DELIVERY_STALL_HOURS + 3)]
+    _branch_recent = lambda bead_id: bead_id == "wa-52pou"   # recent commit on this bead's branch
+    _active_sessions = lambda: []   # session signal irrelevant — branch alone must suffice
+    _do_dolt_probe = lambda: 0
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    for i in range(5):
+        run_tick(NOW + i * 1800, st)
+    notifies_nx1 = [n for n in notify_calls if "DELIVERY" in n[0].upper()]
+    if not notifies_nx1 and st.get("delivery_pending", 0) == 0:
+        _ok("ga-nxgxz-1: stale bd updated_at but a recent branch commit → no "
+            "delivery-stall alert, no matter how many sweeps (the wa-52pou "
+            "false-positive case)")
+    else:
+        _bad("ga-nxgxz-1", "delivery_pending=%d notifies=%d" % (
+             st.get("delivery_pending", 0), len(notifies_nx1)))
+
+    print("\nga-nxgxz Scenario 2: bead updated_at stale + NO branch commit + a "
+          "live session owning it → SILENCE (session half of the OR)")
+    # Anchor "fresh" 60s before the LAST simulated tick (not real wall-clock
+    # NOW) — session_activity_age() computes (tick_now - last_active), and
+    # each tick below advances simulated now by 1800s, so a timestamp fresh
+    # only relative to the first tick would read as stale (> STALE_ACTIVITY_TTL
+    # = 30min) by the second.
+    _nx2_last_tick = NOW + 1800
+    _nx_fresh_ts = _tsw_datetime.datetime.fromtimestamp(
+        _nx2_last_tick - 60, tz=_tsw_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _branch_recent = lambda bead_id: False
+    _active_sessions = lambda: [
+        {"id": "oracle-wa-gau2poo", "name": "oracle-wa-gau2poo", "session_name": "",
+         "alias": "", "agent_name": "", "state": "active", "last_active": _nx_fresh_ts},
+    ]
+    _bd_delivery = lambda root: [
+        {**_stale_bead("wa-52pou", DELIVERY_STALL_HOURS + 3), "assignee": "oracle-wa-gau2poo"}]
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(_nx2_last_tick, st)
+    notifies_nx2 = [n for n in notify_calls if "DELIVERY" in n[0].upper()]
+    if not notifies_nx2 and st.get("delivery_pending", 0) == 0:
+        _ok("ga-nxgxz-2: no branch commit but a live session owns the bead → "
+            "no delivery-stall alert (session signal alone suffices)")
+    else:
+        _bad("ga-nxgxz-2", "delivery_pending=%d notifies=%d" % (
+             st.get("delivery_pending", 0), len(notifies_nx2)))
+
+    print("\nga-nxgxz Scenario 3: bead updated_at stale + NO branch commit + NO "
+          "live session → ALERT unchanged (Aceite bullet 3, regression guard)")
+    _branch_recent = lambda bead_id: False
+    _active_sessions = lambda: []
+    _bd_delivery = lambda root: [_stale_bead("wa-52pou", DELIVERY_STALL_HOURS + 1)]
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)
+    notifies_nx3 = [n for n in notify_calls if "DELIVERY" in n[0].upper()]
+    if notifies_nx3:
+        _ok("ga-nxgxz-3: no branch commit and no live session → genuinely stalled, "
+            "still alerts exactly as before (no regression from the new check)")
+    else:
+        _bad("ga-nxgxz-3", "expected the genuinely-stalled case to still alert: %r" % notify_calls)
+
+    print("\nga-nxgxz Scenario 4: session probe fails (illegible) + no branch "
+          "commit → SILENCE, but logged separately (Aceite bullet 4)")
+    _branch_recent = lambda bead_id: False
+    _active_sessions = lambda: None   # probe failure — illegible, not "confirmed absent"
+    _bd_delivery = lambda root: [_stale_bead("wa-52pou", DELIVERY_STALL_HOURS + 1)]
+    _nx4_log_calls = []
+    _saved_log_nx4 = globals()["_log"]
+
+    def _capture_log_nx4(msg):
+        _nx4_log_calls.append(msg)
+        _saved_log_nx4(msg)
+
+    globals()["_log"] = _capture_log_nx4
+    mail_calls.clear(); notify_calls.clear()
+    st = _reset()
+    run_tick(NOW, st)
+    run_tick(NOW + 1800, st)
+    globals()["_log"] = _saved_log_nx4
+    notifies_nx4 = [n for n in notify_calls if "DELIVERY" in n[0].upper()]
+    logged_unreadable = any("unreadable" in m and "wa-52pou" in m for m in _nx4_log_calls)
+    if not notifies_nx4 and st.get("delivery_pending", 0) == 0 and logged_unreadable:
+        _ok("ga-nxgxz-4: illegible progress signals (session probe failed) → no "
+            "delivery-stall alert, but the illegible condition is logged "
+            "separately from a confirmed-live silence")
+    else:
+        _bad("ga-nxgxz-4", "notifies=%d delivery_pending=%d logged_unreadable=%s" % (
+             len(notifies_nx4), st.get("delivery_pending", 0), logged_unreadable))
+
+    # restore hermetic defaults so later scenarios are unaffected
+    _branch_recent = lambda bead_id: False
+    _active_sessions = lambda: []
 
     # ── ga-u2u8z Scenario T: companion fix — _queued_marker_state's real path
     # queries CITY, not the passed-in per-rig root. Gate markers always live in

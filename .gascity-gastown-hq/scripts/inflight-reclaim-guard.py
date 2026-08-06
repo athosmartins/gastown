@@ -1776,10 +1776,10 @@ def preserve_unpushed_branch(bead_id):
     return preserved
 
 
-def get_branch_recent(bead_id, fetch=True):
+def get_branch_recent(bead_id, fetch=True, window_seconds=None):
     """Return True if any remote branch whose final path segment equals <bead-id>
     (or starts with <bead-id> followed by '-'/'_'/'.') has a commit within
-    RECLAIM_TTL seconds of now.
+    window_seconds (default RECLAIM_TTL) seconds of now.
 
     fetch=False skips the `git fetch` (gt-fppb0): the dog pre_start preflight must
     be FAST and must never block a spawn on a slow network fetch, so it reads the
@@ -1787,6 +1787,13 @@ def get_branch_recent(bead_id, fetch=True):
     Slightly staler, but fails the SAME safe way — a recent local ref still blocks
     the reclaim — and the authoritative run_cycle sweep (fetch=True) is the
     backstop. run_cycle keeps fetch=True; all existing callers are unchanged.
+
+    window_seconds (ga-nxgxz): defaults to None, which preserves the original
+    RECLAIM_TTL (~25min) behavior for every existing caller. Callers outside this
+    guard's own domain — e.g. throughput-stall-watchdog.py's delivery-stall
+    check, whose staleness window is hours, not minutes — pass an explicit,
+    larger window so "does this bead's branch show real progress" is evaluated
+    against the CALLER's own staleness definition, not this guard's reclaim TTL.
 
     Matches ALL branch naming conventions regardless of prefix:
       crew/<pool>/<bead-id>     (dominant: 416 branches, e.g. crew/wa-worker/wa-quoy)
@@ -1805,6 +1812,7 @@ def get_branch_recent(bead_id, fetch=True):
     than the bead's assignee field.
     """
     now = time.time()
+    window = RECLAIM_TTL if window_seconds is None else window_seconds
     for repo in REPOS:
         # Fetch to update remote-tracking refs.
         # Fail-safe: fetch error → branch might exist → do NOT reclaim.
@@ -1851,7 +1859,7 @@ def get_branch_recent(bead_id, fetch=True):
                     continue
                 try:
                     ts = float(ts_str)
-                    if now - ts < RECLAIM_TTL:
+                    if now - ts < window:
                         return True
                 except ValueError:
                     continue
@@ -3458,6 +3466,22 @@ def _selftest():
             f"refs/remotes/origin/crew/wa-worker/other-bead {int(T_br - 60)}"
         ])
         check("BR-8: no matching branch → False (reclaim allowed)",
+              not get_branch_recent("wa-quoy"))
+
+        # BR-9 (ga-nxgxz): window_seconds overrides RECLAIM_TTL for callers with a
+        # different staleness definition (e.g. throughput-stall-watchdog.py's
+        # multi-hour delivery-stall window). A commit older than RECLAIM_TTL but
+        # newer than a caller-supplied larger window must read as recent under
+        # that larger window, and default (window_seconds omitted) must be
+        # unaffected — same fixture as BR-7, both assertions against it.
+        subprocess.run = _make_git_stub([
+            f"refs/remotes/origin/crew/wa-worker/wa-quoy {int(T_br - RECLAIM_TTL - 100)}"
+        ])
+        check("BR-9a: commit stale for default RECLAIM_TTL but within a custom "
+              "3h window_seconds → True",
+              get_branch_recent("wa-quoy", window_seconds=3 * 3600))
+        check("BR-9b: same fixture, window_seconds omitted → still False "
+              "(default RECLAIM_TTL unaffected by the new parameter)",
               not get_branch_recent("wa-quoy"))
 
     finally:
