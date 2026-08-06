@@ -6399,6 +6399,50 @@ LABELCITE='[
   && ok "ga-w3vn3: label-name citation survives _filter_candidates (no false-positive); co-occurring rebuild request still vetoed" \
   || bad "ga-w3vn3: unexpected candidate set — false-positive not fixed or co-occurrence control regressed (got: $(_fc "$LABELCITE"))"
 
+# ── Scenario ga-ffop9: the exclusion-TRACE reason must not diverge from the
+# SELECT regex — the ga-w3vn3 fix above patched only the inline literal in the
+# select; the reason-trace mirror (the _log_exclusions input further down in
+# _filter_candidates) kept its own separate copy of the pattern, stray
+# "engine[ -]window" alternative and all. Consequence: a bead excluded for an
+# UNRELATED reason (e.g. an empty description) whose TITLE happens to cite the
+# label name got a second, WRONG reason logged alongside the real one —
+# "engine-rebuild-text-pattern" — misdirecting whoever reads the log next (this
+# is exactly how the Mayor nearly misdiagnosed ga-w3vn3 itself). Fixed by
+# extracting ONE shell variable ($engine_rebuild_re, see _cf_engine_rebuild_re)
+# that both the select and the reason block now consume via the identical
+# --arg — this fixture proves the reason-block copy is gone, not just the
+# select's. _fc_reason mirrors _fc but swaps stdout/stderr so it captures the
+# EXCLUÍDO trace lines (written via log "..." >&2 inside _log_exclusions)
+# instead of the candidate-id list.
+_fc_reason() { ( eval "$_FC_FN"; SELF_BEAD_ID=""; echo "$1" | _filter_candidates 2>&1 1>/dev/null ); }
+echo "Scenario ga-ffop9: exclusion-trace reason for engine-window text no longer diverges from the select regex"
+GAFFOP9='[
+  {"id":"bd-emptydesc-engwin","assignee":null,"labels":[],"title":"needs:engine-window follow-up cleanup","description":""},
+  {"id":"bd-ctl-realrebuild","assignee":null,"labels":[],"description":"this bead requires a full gascity engine rebuild + binary swap + town bounce before it can ship"}
+]'
+GAFFOP9_TRACE="$(_fc_reason "$GAFFOP9")"
+EMPTYDESC_LINE="$(printf '%s\n' "$GAFFOP9_TRACE" | grep 'EXCLUÍDO bd-emptydesc-engwin ')"
+case "$EMPTYDESC_LINE" in
+  *empty-description*engine-rebuild-text-pattern*|*engine-rebuild-text-pattern*empty-description*)
+    bad "ga-ffop9 AC2: empty-description bead citing engine-window STILL also logs engine-rebuild-text-pattern (reason-block copy not fixed; got: '$EMPTYDESC_LINE')" ;;
+  *empty-description*)
+    ok "ga-ffop9 AC2: empty-description bead citing engine-window logs empty-description ONLY (reason-block copy fixed; got: '$EMPTYDESC_LINE')" ;;
+  *)
+    bad "ga-ffop9 AC2: unexpected/missing trace line for bd-emptydesc-engwin (got: '$EMPTYDESC_LINE')" ;;
+esac
+CTL_LINE="$(printf '%s\n' "$GAFFOP9_TRACE" | grep 'EXCLUÍDO bd-ctl-realrebuild ')"
+case "$CTL_LINE" in
+  *engine-rebuild-text-pattern*) ok "ga-ffop9 AC3 control: genuine co-occurrence bead still logs engine-rebuild-text-pattern (real reason not lost; got: '$CTL_LINE')" ;;
+  *) bad "ga-ffop9 AC3 control: genuine co-occurrence bead NO LONGER logs engine-rebuild-text-pattern — real reason lost (got: '$CTL_LINE')" ;;
+esac
+# ── AC1 (structural): exactly ONE literal definition of the veto pattern body
+# in the whole file — select and reason block are now structurally unable to
+# diverge again because there is only one place to edit.
+PATTERN_LITERAL_COUNT="$(grep -c 'gascity\.\*rebuild|rebuild\.\*gascity|swap\.\*bin' "$DISPATCHER")"
+[ "$PATTERN_LITERAL_COUNT" = "1" ] \
+  && ok "ga-ffop9 AC1: engine-rebuild veto pattern has exactly ONE literal definition in $DISPATCHER (select and reason block both consume it via \$engine_rebuild_re)" \
+  || bad "ga-ffop9 AC1: expected exactly 1 literal definition of the veto pattern, found $PATTERN_LITERAL_COUNT — select/reason copies may have re-diverged (got count: $PATTERN_LITERAL_COUNT)"
+
 # ── Scenario ga-05604.2: durable lane-label write does not gate claim release ──
 # Companion to Scenario 5 (ga-2azzj durable story:in-flight). Before this fix,
 # `lane:${LANE}` was a single fire-and-forget `label add ... || true` — no

@@ -1645,6 +1645,16 @@ _filter_candidates() {
   local _now_ts; _now_ts=$(date +%s)
   local _cf_in; _cf_in=$(cat)
   local _cf_out _cf_kept
+  # ga-ffop9: SINGLE source of truth for the body-text engine-rebuild veto
+  # pattern — both the select below and the reason-trace block further down
+  # consume this SAME variable via --arg, so it is structurally impossible
+  # to fix/edit one copy without the other ever diverging again (ga-w3vn3
+  # fixed only the inline literal in the select; the reason block kept its own
+  # separate copy with the stray "engine[ -]window" alternative, producing a
+  # false "engine-rebuild-text-pattern" diagnosis for beads excluded for an
+  # unrelated reason). Do not reintroduce a second inline literal — add any
+  # future change here only.
+  local _cf_engine_rebuild_re='gascity.*rebuild|rebuild.*gascity|swap.*bin[áa]rio|swap.*binary|binary swap|town bounce'
   # ga-46wq5: local, self-defending defaults for the active-owner globals —
   # NOT just the early top-of-file default (that one only protects the real
   # dispatcher's first in-process call site; a test or any other caller that
@@ -1658,6 +1668,7 @@ _filter_candidates() {
   local _cf_active_owner_ids_json="${_ACTIVE_OWNER_IDS_JSON:-[]}"
   _cf_out=$(printf '%s' "$_cf_in" | jq --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
      --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" \
+     --arg engine_rebuild_re "$_cf_engine_rebuild_re" \
      --argjson roster_ok "$_cf_roster_ok" --argjson active_owner_ids "$_cf_active_owner_ids_json" \
     '[.[] | select(
         .id != $self
@@ -1846,8 +1857,15 @@ _filter_candidates() {
         # co-occurring alternatives here. Do not re-add a standalone
         # label-name alternative to this pattern — same failure class this
         # comment already warns against.
+        # ga-ffop9: pattern now lives in $engine_rebuild_re (single source,
+        # see the _cf_engine_rebuild_re shell var above) — the reason-trace
+        # block below consumes the identical --arg, so the do-not-re-add
+        # warning above cannot silently go stale in only one copy again.
+        # NOTE: no literal apostrophes in this comment block — it lives
+        # inside one bash single-quoted jq argument (see the NOTE further
+        # below in this same function for the same reminder).
         and (((.title // "") + " " + (.description // ""))
-             | test("gascity.*rebuild|rebuild.*gascity|swap.*bin[áa]rio|swap.*binary|binary swap|town bounce"; "i")
+             | test($engine_rebuild_re; "i")
              | not)
         # ga-xdukc/ga-hd87d: independent safety net (defense-in-depth), same
         # shape as the engine-rebuild veto directly above. A bead whose TITLE
@@ -1916,6 +1934,7 @@ _filter_candidates() {
   # can only under-report a reason, never change what actually gets dispatched.
   printf '%s' "$_cf_in" | jq -r --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
       --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" --argjson kept "$_cf_kept" \
+      --arg engine_rebuild_re "$_cf_engine_rebuild_re" \
       --argjson roster_ok "$_cf_roster_ok" --argjson active_owner_ids "$_cf_active_owner_ids_json" '
       .[] | . as $b | ($b.id // "") as $id | ($b.labels // []) as $L
       | select($id != "" and (($kept | index($id)) | not))
@@ -1961,8 +1980,11 @@ _filter_candidates() {
             ))) as $bl
             | if ($bl | length) > 0 then "blocking-label:\($bl | join(","))" else empty end ),
           (if ((($b.description // "") | test("\\S")) | not) then "empty-description" else empty end),
+          # ga-ffop9: consumes the SAME $engine_rebuild_re --arg as the select
+          # above (single source — see _cf_engine_rebuild_re) — this reason
+          # can never again diverge from what actually got the bead excluded.
           (if ( ((($b.title // "") + " " + ($b.description // ""))
-                 | test("gascity.*rebuild|rebuild.*gascity|swap.*bin[áa]rio|swap.*binary|binary swap|town bounce|engine[ -]window"; "i")) )
+                 | test($engine_rebuild_re; "i")) )
            then "engine-rebuild-text-pattern" else empty end),
           (if (($b.title // "") | test("^\\s*(DECIS[ÃA]O|DECISION)\\b"; "i"))
            then "decisao-title-text-pattern"
