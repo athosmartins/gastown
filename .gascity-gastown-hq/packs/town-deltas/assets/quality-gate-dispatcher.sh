@@ -1325,6 +1325,113 @@ GATE_MAX_ADMITS_PER_SWEEP=$(printf '%s' "$GATE_MAX_ADMITS_PER_SWEEP" | sed 's/^0
 [ "$GATE_MAX_ADMITS_PER_SWEEP" -le 6 ] 2>/dev/null || GATE_MAX_ADMITS_PER_SWEEP=6
 GATE_ADMIT_ROUND="${GATE_ADMIT_ROUND:-0}"
 case "$GATE_ADMIT_ROUND" in ''|*[!0-9]*) GATE_ADMIT_ROUND=0 ;; esac
+
+# ga-991au: TWO counters, because a round and an admit stopped being the same
+# thing once skip-rounds exist. Conflating them broke two separate invariants:
+#   · a skip round admitted NOTHING, yet the LIVE_REVIEWERS add-back below is
+#     "reviewers this burst already spawned" — charging it for skips invents
+#     phantom reviewers. On the CALM path over-counting merely defers earlier
+#     (safe), but on the HOT path gate_headroom_decision only admits when
+#     inflight==0 (the ga-q4gqq dolt-hot-floor, added because 37 sweeps
+#     self-deadlocked at ceiling=0), so ONE phantom flips admit -> defer and
+#     neutralises this fix in exactly the degraded state it targets.
+#   · GATE_MAX_ADMITS_PER_SWEEP is documented and clamped as an ADMISSION cap
+#     (<=6 == GATE_MAX_REVIEWERS). Letting skips consume it means two yields
+#     end a sweep having admitted nothing while the log reads "round 2/3".
+# So: GATE_ADMITS_DONE counts real admits (bounds spawns, feeds the add-back);
+# GATE_ADMIT_ROUND counts every round (bounds total work per lock hold).
+GATE_ADMITS_DONE="${GATE_ADMITS_DONE:-0}"
+case "$GATE_ADMITS_DONE" in ''|*[!0-9]*) GATE_ADMITS_DONE=0 ;; esac
+GATE_ADMITS_DONE=$(printf '%s' "$GATE_ADMITS_DONE" | sed 's/^0*\([0-9]\)/\1/'); : "${GATE_ADMITS_DONE:=0}"
+# Total rounds may exceed admits (skips cost a round, not an admit). Kept modest:
+# every round pays a full preamble (Phase C + janitors + a dolt health probe), so
+# an unbounded skip chain would be real load for no reviews.
+GATE_MAX_ROUNDS_PER_SWEEP="${GATE_MAX_ROUNDS_PER_SWEEP:-6}"
+case "$GATE_MAX_ROUNDS_PER_SWEEP" in ''|*[!0-9]*) GATE_MAX_ROUNDS_PER_SWEEP=6 ;; esac
+GATE_MAX_ROUNDS_PER_SWEEP=$(printf '%s' "$GATE_MAX_ROUNDS_PER_SWEEP" | sed 's/^0*\([0-9]\)/\1/'); : "${GATE_MAX_ROUNDS_PER_SWEEP:=6}"
+[ "$GATE_MAX_ROUNDS_PER_SWEEP" -ge 1 ] 2>/dev/null || GATE_MAX_ROUNDS_PER_SWEEP=1
+[ "$GATE_MAX_ROUNDS_PER_SWEEP" -le 12 ] 2>/dev/null || GATE_MAX_ROUNDS_PER_SWEEP=12
+
+# ── ga-991au: an INELIGIBLE marker must not end the whole sweep ───────────────
+# Step 0b selects ONE marker (`.[0]`). If that marker turns out to be ineligible
+# — Step 5b finds a live sibling gate-run for the same branch — the sweep used to
+# `exit 0` right there, having admitted nothing, and the other N queued markers
+# were never even looked at. Measured 2026-08-06: TEN consecutive sweeps admitted
+# NOTHING (6 YIELDED, 2 NEEDS_REBASE, 2 QUEUED) while 47 markers sat queued and
+# ZERO reviewers ran. One legitimate 11-17min run sterilises the entire queue for
+# its whole duration, because every sweep in that window re-picks that branch.
+#
+# gate_continue_or_exit() converts that dead sweep into another attempt, reusing
+# the ga-309v3 re-exec continuation verbatim: fresh process (no state leak),
+# SAME lock (the burst is one logical sweep), bounded by the SAME round counter.
+#
+# No exclusion list is needed and that is not an accident: the yield path
+# deliberately leaves its marker in gate-status:dispatching (never re-queued),
+# and Step 0b only ever selects `-l gate-status:queued` — so the next round
+# cannot re-pick the marker that just yielded. If that invariant ever changes,
+# this function silently degrades into "retry the same marker until the round
+# budget runs out" — bounded, but useless. The selftest pins it.
+gate_continue_or_exit() {
+  local _why="${1:-ineligible}" _skip_branch="${2:-}"
+  # BRANCH-level exclusion, and the marker-level reasoning is NOT enough here.
+  # Parking the yielding marker in gate-status:dispatching stops the next round
+  # re-picking THAT MARKER — but the contended resource is the BRANCH. A second
+  # queued marker for the same branch is common (the live queue has held two for
+  # fix/ga-clgc2-deacon-nudge-flood at once), and Step 4c's auto-rebase ends in
+  # `git push --force-with-lease`, which runs BEFORE Step 5b's sibling guard.
+  # So without this, round 1 picks the sibling marker, force-pushes the branch a
+  # SECOND time, discovers the live run, and yields again — rewriting the tip up
+  # to GATE_MAX_ROUNDS_PER_SWEEP times underneath reviewers that are holding the
+  # old sha (the gate-sha-failed / silently-rebased-between-attempts class), and
+  # destroying the one-branch-one-authoritative-run invariant this very yield
+  # exists to defend.
+  if [ -n "$_skip_branch" ]; then
+    GATE_SKIP_BRANCHES="${GATE_SKIP_BRANCHES:+$GATE_SKIP_BRANCHES$(printf '\n')}$_skip_branch"
+  fi
+  if [ "$((GATE_ADMIT_ROUND + 1))" -lt "$GATE_MAX_ROUNDS_PER_SWEEP" ] 2>/dev/null; then
+    # Deliberately NOT calling cleanup_reviewer_sessions here. This round spawned
+    # NOTHING, so there is nothing of ours to clean — and the array that function
+    # iterates is not ours either: Phase C fills SESSION_IDS with the LIVE
+    # SIBLING's reviewer sessions (and sets GATE_RUN_LEAVE_SESSIONS_ALIVE=0 per
+    # iteration), so calling it here would take the close-loop and shut down the
+    # very reviewers this yield exists to protect. They would never post a
+    # verdict, the healthy run would hit its verdict timeout, and Phase C would
+    # write a terminal FAIL over a good branch — precisely the clobber ga-dupnv's
+    # yield was written to prevent. And when Phase C did NOT populate the array
+    # (disabled, or an early `continue`), the same call dies on `set -u`
+    # (SESSION_IDS: unbound variable) and takes the dispatcher down — the ga-eqjo
+    # AUTHOR_AGENT outage class. Both failure modes, one line, so: no cleanup.
+    # The lock carries over because `exec` replaces the process image and the
+    # lock dir simply outlives it — NOT because of any flag. (An earlier version
+    # of this comment credited GATE_SWEEP_HAS_MORE_WORK; that flag's only reader
+    # was cleanup_reviewer_sessions, which is deliberately not called here, so
+    # setting it would be dead code. Wrong comments on lock-critical paths are
+    # worse than no comments.)
+    #
+    # And NO `trap - EXIT` here. On this path the active trap is still the plain
+    # `_release_gate_lock` (the swap to cleanup_reviewer_sessions happens later,
+    # at Step 5b's tail). If exec SUCCEEDS the trap vanishes with the process
+    # image either way, so clearing it buys nothing; if exec FAILS — `$0` is the
+    # live pack asset this very dispatcher merges into, so a truncated read
+    # mid-redeploy is real — the trap is the only thing that frees the lock.
+    # Clearing it would convert a clean release into a leaked lock, on the
+    # path that re-execs most often (skips are ~6 of every 10 sweeps).
+    log "Skip-ineligible ($_why): trying the NEXT queued marker in this same sweep — round $((GATE_ADMIT_ROUND + 1))/$GATE_MAX_ROUNDS_PER_SWEEP, admits ${GATE_ADMITS_DONE}/${GATE_MAX_ADMITS_PER_SWEEP} (ga-991au)."
+    export GATE_LOCK_TOKEN
+    export GATE_ADMIT_ROUND="$((GATE_ADMIT_ROUND + 1))"
+    export GATE_ADMITS_DONE
+    export GATE_MAX_ADMITS_PER_SWEEP
+    export GATE_MAX_ROUNDS_PER_SWEEP
+    export GATE_SKIP_BRANCHES
+    # No "$@": inside a function the positional params are the FUNCTION's, so
+    # `exec bash "$0" "$@"` would re-exec the daemon as `bash <script> live-sibling`,
+    # mutating its argv (visible to ps/pgrep -f matchers) and propagating that
+    # bogus arg through every later round. The script takes no arguments.
+    exec bash "$0"
+  fi
+  log "Skip-ineligible ($_why): round budget exhausted (${GATE_ADMIT_ROUND}/${GATE_MAX_ROUNDS_PER_SWEEP}) — ending sweep; the next launchd fire continues (ga-991au)."
+  exit 0
+}
 GATE_ADMIT_ROUND=$(printf '%s' "$GATE_ADMIT_ROUND" | sed 's/^0*\([0-9]\)/\1/'); : "${GATE_ADMIT_ROUND:=0}"
 
 # Age (seconds) of an arbitrary path's mtime; a huge number if it is missing.
@@ -4804,10 +4911,14 @@ LIVE_REVIEWERS=$(headroom_live_reviewers "${REVIEWER_SESSION_COUNT:-0}" "${REAPE
 # direction — it defers earlier — whereas under-counting is what removes the
 # brake. This corrects the burst's own blind spot without touching the
 # pre-existing probe, which is a separate fix on its own bead.
-if [ "${GATE_ADMIT_ROUND:-0}" -gt 0 ] 2>/dev/null; then
-  _burst_admitted=$(( GATE_ADMIT_ROUND * GATE_REVIEWERS_PER_RUN ))
+# ga-991au: charge the add-back to ADMITS, not rounds. A skip round spawned
+# nothing; counting it would invent a reviewer that does not exist and, on the
+# hot path, flip the ga-q4gqq dolt-hot-floor (which admits only at inflight==0)
+# from admit to defer — killing the burst in the exact degraded state it is for.
+if [ "${GATE_ADMITS_DONE:-0}" -gt 0 ] 2>/dev/null; then
+  _burst_admitted=$(( GATE_ADMITS_DONE * GATE_REVIEWERS_PER_RUN ))
   LIVE_REVIEWERS=$(( LIVE_REVIEWERS + _burst_admitted ))
-  log "Multi-admit round ${GATE_ADMIT_ROUND}: +${_burst_admitted} reviewer(s) added back to LIVE_REVIEWERS=${LIVE_REVIEWERS} — this burst's own spawns can still be inside the ~210s boot window and read as drained (ga-309v3)."
+  log "Multi-admit round ${GATE_ADMIT_ROUND} (${GATE_ADMITS_DONE} admit(s) so far): +${_burst_admitted} reviewer(s) added back to LIVE_REVIEWERS=${LIVE_REVIEWERS} — this burst's own spawns can still be inside the ~210s boot window and read as drained (ga-309v3/ga-991au)."
 fi
 
 # ── Step 0b: Find a queued marker ────────────────────────────────────────────
@@ -4823,6 +4934,22 @@ MARKERS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --js
   -l type:quality-gate-marker \
   -l gate-status:queued \
   2>/dev/null || echo "[]")
+
+# ga-991au: drop markers whose BRANCH a previous round of THIS burst already
+# yielded on. Marker-level parking is not enough — a sibling marker for the same
+# branch would re-enter Step 4c and force-push the branch again underneath the
+# live run's reviewers. Newline-delimited so branch names with any shell-special
+# character are safe; empty/unset means "no exclusions", i.e. round 0 behaviour.
+if [ -n "${GATE_SKIP_BRANCHES:-}" ]; then
+  _skip_before=$(printf '%s\n' "$MARKERS_JSON" | jq 'length' 2>/dev/null || echo "0")
+  MARKERS_JSON=$(printf '%s\n' "$MARKERS_JSON" | jq --arg skip "$GATE_SKIP_BRANCHES" '
+      ($skip | split("\n") | map(select(length > 0))) as $bad
+      | [ .[] | select( ((.labels // []) | map(select(startswith("branch:")) | ltrimstr("branch:")) | first // "") as $b
+                        | ($b | length) == 0 or ($bad | index($b) | not) ) ]' 2>/dev/null \
+      || printf '%s\n' "$MARKERS_JSON")
+  _skip_after=$(printf '%s\n' "$MARKERS_JSON" | jq 'length' 2>/dev/null || echo "0")
+  log "Multi-admit round ${GATE_ADMIT_ROUND}: excluded $(( _skip_before - _skip_after )) marker(s) whose branch this burst already yielded on (ga-991au)."
+fi
 
 COUNT=$(printf '%s\n' "$MARKERS_JSON" | jq 'length' 2>/dev/null || echo "0")
 log "Found $COUNT queued marker(s)"
@@ -6600,7 +6727,12 @@ if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
       # never write a terminal FAIL over the healthy sibling. (Idempotent, fail-safe.)
       log "  Marker $MARKER_ID left dispatching; Step 0a TTL re-queues it once the sibling terminates."
       log "=== Dispatcher sweep complete: branch=$BRANCH verdict=YIELDED (live sibling $SIBLING_RUN_ID) ==="
-      exit 0
+      # ga-991au: this branch is busy, but the other queued markers are not. Try
+      # the next one in THIS sweep instead of burning the whole cadence on a
+      # branch we already know we cannot touch. Safe to re-enter: our marker
+      # stayed in gate-status:dispatching just above, and Step 0b only selects
+      # gate-status:queued — so the next round cannot pick it again.
+      gate_continue_or_exit "live-sibling" "$BRANCH"
       ;;
     "STALE "*)
       SIBLING_RUN_ID="${SIBLING_VERDICT#STALE }"
@@ -7202,17 +7334,24 @@ else
   # to drift out of sync with Step 0b-1, and a round that finds nothing to do
   # exits on its own at Step 0b. A hot data plane stops the burst on the next
   # round's own headroom probe.
-  if [ "$((GATE_ADMIT_ROUND + 1))" -lt "$GATE_MAX_ADMITS_PER_SWEEP" ] 2>/dev/null; then
+  # ga-991au: this round DID admit, so it is bounded by the ADMIT cap (and must
+  # also respect the total-round cap). GATE_ADMITS_DONE advances only here.
+  if [ "$((GATE_ADMITS_DONE + 1))" -lt "$GATE_MAX_ADMITS_PER_SWEEP" ] 2>/dev/null \
+     && [ "$((GATE_ADMIT_ROUND + 1))" -lt "$GATE_MAX_ROUNDS_PER_SWEEP" ] 2>/dev/null; then
     # Keep the lock across the re-exec: cleanup_reviewer_sessions releases it
     # unless this flag is set, and `exec` would otherwise fire no trap at all —
     # set it FIRST so both the explicit call below and any signal path agree.
     GATE_SWEEP_HAS_MORE_WORK=1
     cleanup_reviewer_sessions
     trap - EXIT
-    log "Multi-admit: round $GATE_ADMIT_ROUND done, re-exec for round $((GATE_ADMIT_ROUND + 1))/$GATE_MAX_ADMITS_PER_SWEEP under the same lock (ga-309v3)."
+    log "Multi-admit: round $GATE_ADMIT_ROUND done (admit $((GATE_ADMITS_DONE + 1))/$GATE_MAX_ADMITS_PER_SWEEP), re-exec for round $((GATE_ADMIT_ROUND + 1))/$GATE_MAX_ROUNDS_PER_SWEEP under the same lock (ga-309v3)."
     export GATE_LOCK_TOKEN
     export GATE_ADMIT_ROUND="$((GATE_ADMIT_ROUND + 1))"
+    export GATE_ADMITS_DONE="$((GATE_ADMITS_DONE + 1))"
     export GATE_MAX_ADMITS_PER_SWEEP
-    exec bash "$0" "$@"
+    export GATE_MAX_ROUNDS_PER_SWEEP
+    # No "$@" — the script takes no arguments, and forwarding a stale positional
+    # would mutate the daemon's argv for every later round (ps / pgrep -f).
+    exec bash "$0"
   fi
 fi

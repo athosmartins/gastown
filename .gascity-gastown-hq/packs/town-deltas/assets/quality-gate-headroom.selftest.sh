@@ -203,8 +203,8 @@ has "$DISPATCHER" 'Headroom OK'                 "admit path logs an OK line"
 echo "── 16. ORDERING guard: the headroom gate runs BEFORE the atomic claim ──"
 # On defer we must exit 0 WITHOUT mutating any marker — so the Step 0b-1 block
 # must appear strictly before the first 'label remove … gate-status:queued'.
-HG_LINE=$(grep -n 'Step 0b-1' "$DISPATCHER" | head -1 | cut -d: -f1)
-CLAIM_LINE=$(grep -n 'label remove "\$MARKER_ID" "gate-status:queued"' "$DISPATCHER" | head -1 | cut -d: -f1)
+HG_LINE=$(grep -n 'Step 0b-1' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
+CLAIM_LINE=$(grep -n 'label remove "\$MARKER_ID" "gate-status:queued"' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
 if [ -n "$HG_LINE" ] && [ -n "$CLAIM_LINE" ] && [ "$HG_LINE" -lt "$CLAIM_LINE" ]; then
   ok "headroom gate (L$HG_LINE) precedes the atomic claim (L$CLAIM_LINE)"
 else
@@ -268,8 +268,8 @@ else
 fi
 
 echo "── 21. ORDERING guard: the re-queue handler precedes the merge/FAIL branches ──"
-RQ_LINE=$(grep -n 'QUOTA_REQUEUE:-0' "$DISPATCHER" | head -1 | cut -d: -f1)
-MERGE_LINE=$(grep -n 'ALL PASS — proceeding to merge' "$DISPATCHER" | head -1 | cut -d: -f1)
+RQ_LINE=$(grep -n 'QUOTA_REQUEUE:-0' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
+MERGE_LINE=$(grep -n 'ALL PASS — proceeding to merge' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
 if [ -n "$RQ_LINE" ] && [ -n "$MERGE_LINE" ] && [ "$RQ_LINE" -lt "$MERGE_LINE" ]; then
   ok "re-queue handler (L$RQ_LINE) precedes the merge branch (L$MERGE_LINE)"
 else
@@ -359,7 +359,7 @@ DEFER_EXIT_LN=$(awk '
   }
   /Headroom DEFER/ { in_block=1 }
 ' "$DISPATCHER")
-RUN_CREATE_LN=$(grep -n 'GATE_RUN_ID=\$(bd -C "\$GC_CITY" create' "$DISPATCHER" | head -1 | cut -d: -f1)
+RUN_CREATE_LN=$(grep -n 'GATE_RUN_ID=\$(bd -C "\$GC_CITY" create' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
 if [ -n "$DEFER_EXIT_LN" ] && [ -n "$RUN_CREATE_LN" ] && [ "$DEFER_EXIT_LN" -lt "$RUN_CREATE_LN" ]; then
   ok "DEFER's exit (L$DEFER_EXIT_LN) strictly precedes gate-run creation (L$RUN_CREATE_LN) — no run bead can be created that sweep"
 else
@@ -463,7 +463,7 @@ has "$DISPATCHER" 'swap_free='                                "log surfaces the 
 
 echo "── 34. ga-92azu drift-guard: swap probe is called BEFORE the decision, and the decision consumes it ──"
 SWAP_CALL_LN=$(grep -n 'HR_SWAP_FREE=\$(gate_swap_free_mb)' "$DISPATCHER" | head -1 | cut -d: -f1)
-DECISION_CALL_LN=$(grep -n 'HR_DECISION=\$(gate_headroom_decision' "$DISPATCHER" | head -1 | cut -d: -f1)
+DECISION_CALL_LN=$(grep -n 'HR_DECISION=\$(gate_headroom_decision' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
 if [ -n "$SWAP_CALL_LN" ] && [ -n "$DECISION_CALL_LN" ] && [ "$SWAP_CALL_LN" -lt "$DECISION_CALL_LN" ]; then
   ok "swap probe (L$SWAP_CALL_LN) precedes the decision call (L$DECISION_CALL_LN)"
 else
@@ -537,9 +537,9 @@ fi
 # AC2: the lock must be held across the whole burst. GATE_SWEEP_HAS_MORE_WORK
 # has to be set BEFORE cleanup runs, or cleanup frees the lock and a concurrent
 # launchd fire starts a second sweep mid-burst.
-_L309_FLAG=$(grep -n 'GATE_SWEEP_HAS_MORE_WORK=1' "$DISPATCHER" | tail -1 | cut -d: -f1)
-_L309_CLEAN=$(grep -n '^    cleanup_reviewer_sessions$' "$DISPATCHER" | tail -1 | cut -d: -f1)
-_L309_EXEC=$(grep -n 'exec bash "\$0"' "$DISPATCHER" | tail -1 | cut -d: -f1)
+_L309_FLAG=$(grep -n 'GATE_SWEEP_HAS_MORE_WORK=1' "$DISPATCHER" | tail -1 | cut -d: -f1 || true)
+_L309_CLEAN=$(grep -n '^    cleanup_reviewer_sessions$' "$DISPATCHER" | tail -1 | cut -d: -f1 || true)
+_L309_EXEC=$(grep -n 'exec bash "\$0"' "$DISPATCHER" | tail -1 | cut -d: -f1 || true)
 if [ -n "$_L309_FLAG" ] && [ -n "$_L309_CLEAN" ] && [ -n "$_L309_EXEC" ] \
    && [ "$_L309_FLAG" -lt "$_L309_CLEAN" ] && [ "$_L309_CLEAN" -lt "$_L309_EXEC" ]; then
   ok "ga-309v3 AC2: HAS_MORE_WORK set (L$_L309_FLAG) BEFORE cleanup (L$_L309_CLEAN) BEFORE exec (L$_L309_EXEC) — lock survives the burst"
@@ -549,8 +549,8 @@ fi
 
 # AC4 + bound: the burst is capped by the counter, and every round re-runs the
 # real headroom probe (no duplicated policy that could drift from Step 0b-1).
-has "$DISPATCHER" '\$\(\(GATE_ADMIT_ROUND \+ 1\)\)" -lt "\$GATE_MAX_ADMITS_PER_SWEEP' \
-  "ga-309v3 AC1: burst is hard-bounded by GATE_MAX_ADMITS_PER_SWEEP"
+has "$DISPATCHER" '\$\(\(GATE_ADMITS_DONE \+ 1\)\)" -lt "\$GATE_MAX_ADMITS_PER_SWEEP' \
+  "ga-309v3 AC1: admissions are hard-bounded by GATE_MAX_ADMITS_PER_SWEEP (ga-991au split the counter: admits, not rounds)"
 has "$DISPATCHER" 'export GATE_ADMIT_ROUND=' \
   "ga-309v3: the round counter is exported so the bound actually advances across the exec"
 
@@ -607,11 +607,11 @@ _t309b="$TMPDIR_309/b1"; mkdir -p "$_t309b" 2>/dev/null
 # Step 0a-2's drained-exclusion has no booting guard, so a round's own reviewers
 # (still inside the ~210s deferred-start window) read as drained and LIVE_REVIEWERS
 # collapses to 0 — leaving the burst with NO brake at all.
-has "$DISPATCHER" 'GATE_ADMIT_ROUND \* GATE_REVIEWERS_PER_RUN' \
-  "ga-309v3 BLOCKER-2: prior rounds' spawns are added back into LIVE_REVIEWERS"
-_L309_LR=$(grep -n '^LIVE_REVIEWERS=\$(headroom_live_reviewers' "$DISPATCHER" | tail -1 | cut -d: -f1)
-_L309_ADD=$(grep -n 'GATE_ADMIT_ROUND \* GATE_REVIEWERS_PER_RUN' "$DISPATCHER" | tail -1 | cut -d: -f1)
-_L309_USE=$(grep -n '"\$HR_QLIM" "\$LIVE_REVIEWERS"' "$DISPATCHER" | tail -1 | cut -d: -f1)
+has "$DISPATCHER" 'GATE_ADMITS_DONE \* GATE_REVIEWERS_PER_RUN' \
+  "ga-309v3 BLOCKER-2: prior ADMITS' spawns are added back into LIVE_REVIEWERS (ga-991au: skips must not count)"
+_L309_LR=$(grep -n '^LIVE_REVIEWERS=\$(headroom_live_reviewers' "$DISPATCHER" | tail -1 | cut -d: -f1 || true)
+_L309_ADD=$(grep -n 'GATE_ADMITS_DONE \* GATE_REVIEWERS_PER_RUN' "$DISPATCHER" | tail -1 | cut -d: -f1 || true)
+_L309_USE=$(grep -n '"\$HR_QLIM" "\$LIVE_REVIEWERS"' "$DISPATCHER" | tail -1 | cut -d: -f1 || true)
 if [ -n "$_L309_LR" ] && [ -n "$_L309_ADD" ] && [ -n "$_L309_USE" ] \
    && [ "$_L309_LR" -lt "$_L309_ADD" ] && [ "$_L309_ADD" -lt "$_L309_USE" ]; then
   ok "ga-309v3 BLOCKER-2: correction applied AFTER the count (L$_L309_LR->L$_L309_ADD) and BEFORE the headroom decision (L$_L309_USE)"
@@ -688,11 +688,165 @@ _got=$(_real_knob GATE_MAX_ADMITS_PER_SWEEP 30)
 
 # SERIOUS (round 2): the yield branch must install a release trap, or an owner
 # that fails the guard exits holding its own lock.
-_L309_ELSE=$(grep -n '^  else$' "$DISPATCHER" | awk -F: -v a="$(grep -n 'elif _acquire_gate_lock; then' "$DISPATCHER" | head -1 | cut -d: -f1)" '$1>a{print $1; exit}')
+_L309_ELSE=$(grep -n '^  else$' "$DISPATCHER" | awk -F: -v a="$(grep -n 'elif _acquire_gate_lock; then' "$DISPATCHER" | head -1 | cut -d: -f1 || true)" '$1>a{print $1; exit}')
 if [ -n "$_L309_ELSE" ] && sed -n "$((_L309_ELSE)),$((_L309_ELSE+22))p" "$DISPATCHER" | grep -q "trap '_release_gate_lock' EXIT"; then
   ok "ga-309v3: the yield branch installs a release trap (an owner that fails the guard cannot leak its own lock)"
 else
   bad "ga-309v3: yield branch has NO release trap — a guard-fail while owning the lock wedges the gate (30min under pid reuse)"
+fi
+
+# ── ga-991au: an ineligible marker must not end the whole sweep ───────────────
+# Measured 2026-08-06: TEN consecutive sweeps admitted NOTHING (6 YIELDED,
+# 2 NEEDS_REBASE, 2 QUEUED) with 47 markers queued and ZERO reviewers running.
+# A single live 11-17min run sterilised the queue for its whole duration.
+echo "── ga-991au: skip ineligible marker ──"
+
+has "$DISPATCHER" 'gate_continue_or_exit\(\)' \
+  "ga-991au: the skip-ineligible continuation helper exists"
+has "$DISPATCHER" 'gate_continue_or_exit "live-sibling"' \
+  "ga-991au AC1: the live-sibling yield path continues instead of ending the sweep"
+
+# THE INVARIANT that lets this work with no exclusion list — and the one that
+# degrades SILENTLY if broken (the retry would re-pick the same marker until the
+# round budget runs out, looking busy while achieving nothing):
+#   (a) the yield path leaves its marker in gate-status:dispatching, and
+#   (b) Step 0b selects ONLY gate-status:queued.
+has "$DISPATCHER" 'l gate-status:queued' \
+  "ga-991au invariant (b): marker selection filters on gate-status:queued ONLY"
+if grep -B12 'gate_continue_or_exit "live-sibling"' "$DISPATCHER" | grep -q 'left dispatching'; then
+  ok "ga-991au invariant (a): the yielding marker stays in dispatching (so the next round cannot re-pick it)"
+else
+  bad "ga-991au invariant (a) BROKEN: the yield path no longer leaves the marker dispatching — the retry would re-pick the SAME marker and spin the round budget for nothing"
+fi
+# Guard against someone 'helpfully' re-queuing the marker on the yield path:
+# that single change would silently convert this fix into a no-op loop.
+# Match the re-queue ACTION (`label add ... gate-status:queued`), never prose:
+# an earlier version matched the label NAME and fired on this fix's OWN comment
+# explaining that Step 0b selects queued markers. Third time tonight that a guard
+# tripped on the system's own vocabulary (cf. ga-w3vn3).
+if grep -A6 'verdict=YIELDED' "$DISPATCHER" | grep -qE 'label add .*gate-status:queued'; then
+  bad "ga-991au: the yield path re-queues its marker — the next round would re-select it (silent no-op loop)"
+else
+  ok "ga-991au: the yield path does NOT re-queue its marker (head-of-line stays broken open)"
+fi
+
+# Bounded, and the lock survives the retry — same contract as ga-309v3.
+has "$DISPATCHER" 'Skip-ineligible.*round budget exhausted' \
+  "ga-991au: exhausting the round budget ends the sweep explicitly (never an unbounded retry)"
+# Round-4 design pin: the skip helper must set NO flag, call NO cleanup and clear
+# NO trap. Each was removed for a MEASURED failure:
+#   · cleanup would close the LIVE SIBLING's reviewers (Phase C owns SESSION_IDS)
+#     -> healthy run times out -> terminal FAIL over a good branch; or, when
+#     Phase C did not populate the array, die on `set -u` and kill the gate.
+#   · GATE_SWEEP_HAS_MORE_WORK's only reader WAS that cleanup -> dead code.
+#   · `trap - EXIT` turns an exec failure into a LEAKED lock (the trap is the
+#     only thing that would release it), on the most frequent re-exec path.
+# The admit site keeps the flag+cleanup+exec protocol and is pinned separately.
+_L991_D=$(grep -n 'gate_continue_or_exit()' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
+if [ -n "$_L991_D" ]; then
+  _body=$(sed -n "${_L991_D},$((_L991_D+90))p" "$DISPATCHER" | grep -vE '^[[:space:]]*#' || true)
+  _viol=""
+  printf '%s\n' "$_body" | grep -q 'cleanup_reviewer_sessions'  && _viol="$_viol cleanup"
+  printf '%s\n' "$_body" | grep -q 'trap - EXIT'                && _viol="$_viol trap-clear"
+  printf '%s\n' "$_body" | grep -q 'GATE_SWEEP_HAS_MORE_WORK=1' && _viol="$_viol dead-flag"
+  printf '%s\n' "$_body" | grep -q 'exec bash' || _viol="$_viol missing-exec"
+  if [ -z "$_viol" ]; then
+    ok "ga-991au: the skip helper is minimal by design — no cleanup, no trap-clear, no dead flag, and it does exec"
+  else
+    bad "ga-991au: skip helper regressed —$_viol (each was removed for a measured failure; see the helper comment)"
+  fi
+fi
+
+# ── ga-991au round-3 review: the two BLOCKERs and the counter split ───────────
+echo "── ga-991au: round-3 blocker regressions ──"
+
+# BLOCKER-A: the skip helper must NOT call cleanup_reviewer_sessions. On the
+# yield path Phase C has filled SESSION_IDS with the LIVE SIBLING's reviewer
+# sessions and set GATE_RUN_LEAVE_SESSIONS_ALIVE=0, so the call takes the
+# close-loop and shuts down the reviewers the yield exists to protect -> they
+# never post a verdict -> the healthy run times out -> Phase C writes a terminal
+# FAIL over a good branch (the exact ga-dupnv clobber). And when Phase C did NOT
+# populate the array, the same line dies on `set -u` and takes the gate down.
+_L991_D=$(grep -n 'gate_continue_or_exit()' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$_L991_D" ] && sed -n "${_L991_D},$((_L991_D+34))p" "$DISPATCHER" \
+     | grep -vE '^\s*#' | grep -q 'cleanup_reviewer_sessions'; then
+  bad "ga-991au BLOCKER-A: the skip helper CALLS cleanup_reviewer_sessions — it would close the live sibling's reviewers (FAIL over a healthy branch) or die on set -u"
+else
+  ok "ga-991au BLOCKER-A: the skip helper does not call cleanup (nothing was spawned; SESSION_IDS belongs to the sibling)"
+fi
+
+# BLOCKER-B: `exec bash "$0" "$@"` inside a FUNCTION forwards the function's own
+# args, re-execing the daemon as `bash <script> live-sibling` and mutating argv
+# for every later round (ps / pgrep -f matchers).
+if grep -vE '^\s*#' "$DISPATCHER" | grep -q 'exec bash "\$0" "\$@"'; then
+  bad "ga-991au BLOCKER-B: an exec still forwards \"\$@\" — inside a function that is the FUNCTION's args, corrupting the daemon's argv"
+else
+  ok "ga-991au BLOCKER-B: no exec forwards \"\$@\" (script takes no arguments)"
+fi
+
+# Counter split: admits and rounds are different things now.
+has "$DISPATCHER" 'GATE_ADMITS_DONE \* GATE_REVIEWERS_PER_RUN' \
+  "ga-991au: the LIVE_REVIEWERS add-back is charged to real ADMITS, not to rounds"
+if grep -vE '^\s*#' "$DISPATCHER" | grep -q 'GATE_ADMIT_ROUND \* GATE_REVIEWERS_PER_RUN'; then
+  bad "ga-991au: add-back still multiplies by GATE_ADMIT_ROUND — a skip round would invent a phantom reviewer and flip the dolt-hot floor from admit to defer"
+else
+  ok "ga-991au: no phantom reviewers — skip rounds contribute nothing to the add-back"
+fi
+has "$DISPATCHER" 'GATE_MAX_ROUNDS_PER_SWEEP="\$\{GATE_MAX_ROUNDS_PER_SWEEP:-6\}"' \
+  "ga-991au: total-round budget is separate from the admission cap"
+has "$DISPATCHER" 'export GATE_ADMITS_DONE="\$\(\(GATE_ADMITS_DONE \+ 1\)\)"' \
+  "ga-991au: GATE_ADMITS_DONE advances ONLY at the real admit site"
+
+# Real-code behaviour: the new knob sanitises like the others.
+_g=$(_real_knob GATE_MAX_ROUNDS_PER_SWEEP 0);  [ "$_g" = "1" ] \
+  && ok "ga-991au: GATE_MAX_ROUNDS_PER_SWEEP=0 clamps to 1 (kill switch not inverted)" \
+  || bad "ga-991au: GATE_MAX_ROUNDS_PER_SWEEP=0 resolved to $_g (expected 1)"
+_g=$(_real_knob GATE_MAX_ROUNDS_PER_SWEEP 99); [ "$_g" = "12" ] \
+  && ok "ga-991au: an over-large round budget clamps to 12" \
+  || bad "ga-991au: round budget upper clamp missing — 99 resolved to $_g"
+
+# ── ga-991au round-4: branch-level exclusion + trap correctness ───────────────
+echo "── ga-991au: round-4 blocker regressions ──"
+
+# BLOCKER-C: marker-level parking is NOT enough. Step 4c force-pushes the branch
+# BEFORE Step 5b's sibling guard runs, so a sibling marker for the SAME branch
+# would rewrite that branch again on the next round — underneath reviewers still
+# holding the old sha (gate-sha-failed class), destroying the one-branch-one-run
+# invariant the yield exists to defend.
+has "$DISPATCHER" 'gate_continue_or_exit "live-sibling" "\$BRANCH"' \
+  "ga-991au BLOCKER-C: the yield passes its BRANCH so the burst excludes the whole branch, not just the marker"
+has "$DISPATCHER" 'export GATE_SKIP_BRANCHES' \
+  "ga-991au BLOCKER-C: the exclusion list survives the re-exec"
+has "$DISPATCHER" 'excluded .* marker\(s\) whose branch this burst already yielded' \
+  "ga-991au BLOCKER-C: the exclusion is APPLIED to marker selection and logged with a count"
+# Ordering: the filter must run before the marker is picked.
+_L_FILT=$(grep -n 'GATE_SKIP_BRANCHES:-' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
+_L_PICK=$(grep -n '^MARKER=\$(printf' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
+if [ -n "$_L_FILT" ] && [ -n "$_L_PICK" ] && [ "$_L_FILT" -lt "$_L_PICK" ]; then
+  ok "ga-991au BLOCKER-C: branch exclusion (L$_L_FILT) is applied BEFORE the marker is selected (L$_L_PICK)"
+else
+  bad "ga-991au BLOCKER-C: exclusion runs after selection (filter=$_L_FILT pick=$_L_PICK) — the burst could still re-pick the excluded branch"
+fi
+
+# Behavioural: the real jq filter drops same-branch markers and keeps others.
+_out=$(echo '[{"labels":["branch:fix/A"]},{"labels":["branch:fix/B"]},{"labels":["branch:fix/A"]}]' \
+  | jq --arg skip "fix/A" '
+      ($skip | split("\n") | map(select(length > 0))) as $bad
+      | [ .[] | select( ((.labels // []) | map(select(startswith("branch:")) | ltrimstr("branch:")) | first // "") as $b
+                        | ($b | length) == 0 or ($bad | index($b) | not) ) ]' 2>/dev/null | jq -r 'length' 2>/dev/null)
+[ "$_out" = "1" ] \
+  && ok "ga-991au BLOCKER-C (behavioural): the exclusion filter drops both markers of the yielded branch and keeps the other" \
+  || bad "ga-991au BLOCKER-C (behavioural): filter kept $_out marker(s), expected 1"
+
+# SERIOUS: no `trap - EXIT` in the skip helper. On that path the active trap is
+# the plain _release_gate_lock; clearing it turns an exec FAILURE (truncated $0
+# mid-redeploy is real — the dispatcher merges into its own file) from a clean
+# release into a leaked lock, on the path that re-execs most often.
+_L_H=$(grep -n 'gate_continue_or_exit()' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$_L_H" ] && sed -n "${_L_H},$((_L_H+45))p" "$DISPATCHER" | grep -vE '^\s*#' | grep -q 'trap - EXIT'; then
+  bad "ga-991au: the skip helper clears the EXIT trap — an exec failure would leak the lock instead of releasing it"
+else
+  ok "ga-991au: the skip helper leaves the release trap armed (exec failure still frees the lock)"
 fi
 
 echo ""
