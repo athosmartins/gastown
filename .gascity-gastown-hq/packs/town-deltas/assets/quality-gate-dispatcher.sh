@@ -3199,7 +3199,25 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
           # hold message below can CITE them instead of asserting without
           # showing (fix 3 of ga-zhfk8) — a human reviewer can then see in one
           # glance whether it's a real list or the heuristic's own prose.
-          if PARTIAL_EVIDENCE=$(gate_delivery_looks_partial "$SRC_DESC"); then IS_PARTIAL=1; fi
+          # ga-cjrxh: pass the TITLE as well. Across the 4 holds the Mayor
+          # sampled on 2026-08-05 (3 of them false), the one signal that
+          # separated the true positive from the false ones was an explicit
+          # count in the title — wa-se0zu's "prod diverge do mockup em 8
+          # pontos". The heuristic cannot use what it is never given.
+          SRC_TITLE=$(printf '%s' "$SRC_JSON" | jq -r '.title // ""' 2>/dev/null || echo "")
+          # ga-cjrxh AC3: the heuristic now NAMES its outcome on stderr —
+          # held / released-with-warning / nothing-to-read were previously one
+          # silent rc=1, so "the guard cleared this bead" and "the guard could
+          # not read this bead" looked identical in the log. Capture it and
+          # log it against the bead id so the distinction is greppable.
+          PARTIAL_REASON_FILE=$(mktemp 2>/dev/null || echo "/tmp/gdlp-$$.err")
+          if PARTIAL_EVIDENCE=$(gate_delivery_looks_partial "$SRC_DESC" "$SRC_TITLE" 2>"$PARTIAL_REASON_FILE"); then IS_PARTIAL=1; fi
+          PARTIAL_REASON=$(tr '\n' ' ' < "$PARTIAL_REASON_FILE" 2>/dev/null || echo "")
+          rm -f "$PARTIAL_REASON_FILE"
+          # `|| true`: this is the last statement of the branch, and a bare
+          # short-circuited AND-list must not become the block's exit status
+          # under the errexit this script runs with.
+          { [ -n "$PARTIAL_REASON" ] && log "escopo $BEAD_ID: $PARTIAL_REASON"; } || true
         fi
       fi
 

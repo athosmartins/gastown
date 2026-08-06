@@ -74,6 +74,22 @@ out_has() {
     *) bad "stdout missing '$needle': $* (got: $got)" ;;
   esac
 }
+# err_has <needle> -- <cmd...> — asserts <cmd>'s STDERR contains <needle>
+# (ga-cjrxh AC3). The release path must SAY WHY it released: "avaliei e nao
+# achei escopo multiplo" and "nao consegui avaliar" are different facts and
+# must not share one silent rc=1 (root-class error-vs-empty). Stderr, not
+# stdout, because stdout on a HOLD is the quoted evidence the dispatcher
+# pastes into the hold message — polluting it would corrupt that message.
+err_has() {
+  local needle="$1"; shift
+  [ "${1:-}" = "--" ] && shift
+  local got
+  got=$("$@" 2>&1 >/dev/null) || true
+  case "$got" in
+    *"$needle"*) ok "stderr has '$needle': $*" ;;
+    *) bad "stderr missing '$needle': $* (got: $got)" ;;
+  esac
+}
 
 echo "== gate-delivery-partial-scope.selftest (ga-k2wjn) =="
 
@@ -100,8 +116,15 @@ rc1 gate_delivery_looks_partial ""
 rc1 gate_delivery_looks_partial "Just a normal single-item bug description with no list at all."
 rc1 gate_delivery_looks_partial "$(printf '1. only one item\n2. and a second\n')"   # 2 items — below threshold
 
-rc0 gate_delivery_looks_partial "$(printf 'Fix the thing.\n1. first\n2. second\n3. third\n')"        # 3 numbered items
-rc0 gate_delivery_looks_partial "$(printf 'a. socios\nb. datas\nc. permeabilidades\nd. anuncio\n')"  # lettered list
+# ga-cjrxh: these two assert LIST STRUCTURE (a run of >=3 items is found at
+# all), which is still exactly what they test. They now carry an explicit
+# "ESCOPO:" header because after ga-cjrxh structure ALONE no longer holds a
+# bead — structure under a SCOPE or ENUMERATING header does, and structure
+# under an unclassifiable header releases with a warning instead (asserted
+# separately in 2c, so this section keeps testing structure and only
+# structure).
+rc0 gate_delivery_looks_partial "$(printf 'Fix the thing.\nESCOPO:\n1. first\n2. second\n3. third\n')"        # 3 numbered items
+rc0 gate_delivery_looks_partial "$(printf 'ESCOPO:\na. socios\nb. datas\nc. permeabilidades\nd. anuncio\n')"  # lettered list
 
 # ga-zhfk8: >=3 numbered lines separated by unrelated FLUSH-LEFT prose (a new
 # sentence/paragraph, not a continuation of the item above) must NOT trigger.
@@ -122,7 +145,11 @@ rc1 gate_delivery_looks_partial "$(printf '1. first item discussed here.\nSome u
 # trigger. Distinguishing signal from the flush-left-prose fixture directly
 # above: continuation lines here are indented (hang under the item text),
 # those are not.
-WRAPPED_ITEMS="$(printf '1. Corrigir o timeout no endpoint X - esta causando falhas ha 2 semanas,\n   afetando mais de 500 usuarios por dia.\n2. Adicionar validacao no campo Y - sem isso, dados corrompidos continuam\n   entrando no banco.\n3. Atualizar a documentacao do endpoint Z.\n')"
+# (ga-cjrxh: "ESCOPO:" prepended for the same reason as the fixtures above —
+# this fixture exists to assert WRAPPED-ITEM run detection, not header policy.
+# Its three items are change verbs (Corrigir/Adicionar/Atualizar), so the
+# per-item verification rule leaves all three counting, as intended.)
+WRAPPED_ITEMS="$(printf 'ESCOPO:\n1. Corrigir o timeout no endpoint X - esta causando falhas ha 2 semanas,\n   afetando mais de 500 usuarios por dia.\n2. Adicionar validacao no campo Y - sem isso, dados corrompidos continuam\n   entrando no banco.\n3. Atualizar a documentacao do endpoint Z.\n')"
 rc0 gate_delivery_looks_partial "$WRAPPED_ITEMS"
 out_has "1. Corrigir o timeout" -- gate_delivery_looks_partial "$WRAPPED_ITEMS"
 out_has "3. Atualizar a documentacao" -- gate_delivery_looks_partial "$WRAPPED_ITEMS"
@@ -139,8 +166,11 @@ rc1 gate_delivery_looks_partial "ITENS APROVADOS: tudo"   # case-insensitive —
 
 # ── 1b. Evidence on stdout (ga-zhfk8 fix 3: cite, don't just assert) ───────
 echo "── 1b. gate_delivery_looks_partial prints detected evidence ──"
-out_has "1. first" -- gate_delivery_looks_partial "$(printf 'Fix the thing.\n1. first\n2. second\n3. third\n')"
-out_has "a. socios" -- gate_delivery_looks_partial "$(printf 'a. socios\nb. datas\nc. permeabilidades\nd. anuncio\n')"
+# (ga-cjrxh: "ESCOPO:" added for the same reason as in section 1 — these
+# assert that a HOLD quotes its evidence, so the fixtures must be ones that
+# still hold.)
+out_has "1. first" -- gate_delivery_looks_partial "$(printf 'Fix the thing.\nESCOPO:\n1. first\n2. second\n3. third\n')"
+out_has "a. socios" -- gate_delivery_looks_partial "$(printf 'ESCOPO:\na. socios\nb. datas\nc. permeabilidades\nd. anuncio\n')"
 NO_EVIDENCE=$(gate_delivery_looks_partial "Just prose, no list, mentions fatia once." 2>/dev/null) || true
 eq "no stdout when it does not look partial" "$NO_EVIDENCE" ""
 
@@ -263,12 +293,33 @@ rc1 gate_delivery_looks_partial "$GA_O5DE8"
 FIX_PEDIDO_WITH_LIST="$(printf 'FIX PEDIDO:\n1. Corrigir o parser de datas.\n2. Adicionar teste de regressao.\n3. Atualizar o changelog.\n')"
 rc0 gate_delivery_looks_partial "$FIX_PEDIDO_WITH_LIST"
 
-# AC #3 (fail-safe, falsifiable): a numbered list under a header that is
-# NEITHER recognized vocabulary must still retain — "não consegui
-# classificar" and "classifiquei como descrição" cannot produce the same
-# result as "classifiquei como diagnóstico".
+# AC #3 (fail-safe) — DELIBERATELY REVERSED BY ga-cjrxh (P1, 2026-08-06).
+# ga-1yxyt asserted that a list under an UNRECOGNIZED header must still HOLD,
+# reasoning that retaining too much costs one human review while retaining too
+# little silently drops scope. Measurement overturned the first half: the
+# Mayor sampled 4 holds in one session and 3 were false (75%), and both false
+# ones re-measured for this bead (ga-tqe4j, ga-05604.2) fire on exactly this
+# branch — an unrecognized header ("=== POR QUE E O PIOR CASO DESSA CLASSE
+# ===", a criteria section). The real cost is not "one human review": the bead
+# stops, the Pilot is barred from re-dispatching it, and it does not shout —
+# so the error this fail-safe caused is both EXPENSIVE and SILENT, worse than
+# the one it prevents. ga-cjrxh directs the reversal in as many words:
+# "preferir errar liberando + reportando a errar segurando".
+#
+# What ga-1yxyt actually needed — that "could not classify" never collapse
+# into "classified as description" — is PRESERVED and strengthened: it now has
+# its own named channel on stderr instead of being inferred from a shared rc.
+# So the fixture keeps its falsifiable value; only the direction changed, and
+# releasing must still WARN, never go silent.
 UNKNOWN_HEADER_LIST="$(printf 'ALGUMA SECAO SEM NOME RECONHECIVEL:\n1. item um\n2. item dois\n3. item tres\n')"
-rc0 gate_delivery_looks_partial "$UNKNOWN_HEADER_LIST"
+rc1 gate_delivery_looks_partial "$UNKNOWN_HEADER_LIST"
+err_has "escopo-multiplo:possivel" -- gate_delivery_looks_partial "$UNKNOWN_HEADER_LIST"
+err_has "ALGUMA SECAO SEM NOME RECONHECIVEL" -- gate_delivery_looks_partial "$UNKNOWN_HEADER_LIST"
+# ...and the three outcomes stay mutually distinguishable (ga-1yxyt's real
+# invariant, restated as ga-cjrxh AC3): held / released-with-warning /
+# nothing-to-read.
+err_has "escopo-multiplo:nao-detectado" -- gate_delivery_looks_partial "Prosa comum, sem lista nenhuma."
+err_has "escopo-multiplo:nao-avaliavel" -- gate_delivery_looks_partial ""
 
 # Exclusion isn't a blanket "stop at the first diagnostic run": a LONGER
 # diagnostic-headed run must yield the `best` slot to a SHORTER qualifying
@@ -277,6 +328,104 @@ rc0 gate_delivery_looks_partial "$UNKNOWN_HEADER_LIST"
 DIAGNOSTIC_THEN_SCOPE="$(printf 'SINTOMA:\n1. primeiro sintoma observado\n2. segundo sintoma observado\n3. terceiro sintoma observado\n4. quarto sintoma observado\n\nENTREGAVEIS:\n1. corrigir o parser\n2. adicionar teste\n3. atualizar doc\n')"
 rc0 gate_delivery_looks_partial "$DIAGNOSTIC_THEN_SCOPE"
 out_has "corrigir o parser" -- gate_delivery_looks_partial "$DIAGNOSTIC_THEN_SCOPE"
+
+# ── 2c. ga-cjrxh: a VERIFICATION list is not a DELIVERABLE list ─────────────
+# Measured by the Mayor 2026-08-05: in ONE session the guard produced 4 holds
+# and 3 were FALSE POSITIVES (75%). The pattern is structural, not bad luck —
+# a well-written BUG bead in this city enumerates ACCEPTANCE CRITERIA and TEST
+# FIXTURES, so the better the report, the likelier the wrongful hold. And the
+# failure mode is BIASED TOWARD SILENCE: a held bead does not shout, it stops.
+# v4 therefore inverts the bias — prefer releasing and reporting over holding.
+echo "── 2c. ga-cjrxh: verification lists vs deliverable lists ──"
+
+# AC1 (falsifiable): ga-tqe4j verbatim (`bd show ga-tqe4j`, 2026-08-06). The
+# run that fired sits under "=== CRITERIO DE ACEITE (falsificavel) ===" — a
+# header v3 classified as *scope*, which is why it held. Its 5 items are ONE
+# deliverable's acceptance criteria: a FIXTURE, two named CONTROLE, one
+# invariant, and "Rodar a suite". Must NOT hold.
+GA_TQE4J='=== FIX PEDIDO ===
+So declarar RESOLVED apos re-checar o bead individualmente (o label sumiu de
+fato). Se o bead nao pode ser re-checado (store nao resolve, consulta falha,
+timeout), NAO podar: manter no estado e reportar como "nao verificado nesta
+execucao" -- fail-safe. Manter o first_seen intacto nesse caso.
+
+=== CRITERIO DE ACEITE (falsificavel) ===
+1. FIXTURE: bead no estado que NAO aparece no flagged_ids porque a consulta do
+   seu store falhou -> permanece no estado, com first_seen preservado.
+2. CONTROLE (nao pode regredir): bead cujo label REALMENTE sumiu -> continua
+   sendo declarado RESOLVED e podado.
+3. CONTROLE 3 (o coracao do bug): os dois casos acima devem produzir saidas
+   DIFERENTES. Assertar a diferenca, nao so cada um isolado.
+4. first_seen sobrevive a uma execucao degradada (nao zera o relogio de idade).
+5. Rodar a suite completa e reportar o PLACAR TOTAL.'
+rc1 gate_delivery_looks_partial "$GA_TQE4J"
+
+# AC2 (non-regression control — MANDATORY, ga-cjrxh names it explicitly):
+# wa-se0zu verbatim excerpt (`bd show wa-se0zu`, 2026-08-06). REAL multi-scope
+# — 8 independent layout deltas, of which the merge covered 2. v3 held it, but
+# by ACCIDENT: it fired on a numbered VERIFICATION list elsewhere in the body,
+# while the actual A.-H. scope list escaped entirely because the lettered
+# pattern was lowercase-only. Fixing AC1 without this would RELEASE it. It
+# must keep holding — and now for the right reason.
+WA_SE0ZU='DELTA MEDIDO com as DUAS TELAS RENDERIZADAS no navegador em 1200px:
+
+A. CREDITOS — hoje grade de 2 COLUNAS compacta; no mockup e 1 COLUNA de linhas em largura
+   cheia. E a maior area da pagina e a diferenca mais visivel.
+B. BARRA DE SALDO — hoje traco fino/tracejado; no mockup e uma barra VERDE solida e curta.
+C. IDADE POR SERVICO — no mockup vem LOGO ABAIXO DO NOME do servico ("ha 25m").
+D. CONSUMO DO MES — hoje 5 cards lado a lado numa faixa; no mockup sao LINHAS iguais.
+E. CARD DO CLAUDE — hoje grade 2x2 de contas; no mockup as contas sao EMPILHADAS.
+F. SELO "RESETA PRIMEIRO" verde na primeira conta + rodape explicativo.
+G. RODAPE EXPLICATIVO — o mockup fecha com duas notas curtas. Hoje nao existe.
+H. TIMESTAMP DO CARD DO CLAUDE — hoje e uma pilula com borda; no mockup e texto discreto.'
+WA_SE0ZU_TITLE='Saldos & Creditos: o LAYOUT aprovado nao chegou na tela — prod diverge do mockup em 8 pontos'
+# Held — and the honest reason, measured against the real bead, is the TITLE,
+# not the A.-H. list. That run sits under an unclassifiable header ("DELTA
+# MEDIDO ..."), so on its own it only warns. Passing the title is what the
+# dispatcher does for the real bead, so the assertion mirrors production.
+rc0 gate_delivery_looks_partial "$WA_SE0ZU" "$WA_SE0ZU_TITLE"
+# Body alone: releases, but never silently — the signal survives as a warning.
+rc1 gate_delivery_looks_partial "$WA_SE0ZU"
+err_has "escopo-multiplo:possivel" -- gate_delivery_looks_partial "$WA_SE0ZU"
+# The [A-Za-z] widening earns its place where it actually decides a hold: an
+# UPPERCASE lettered list under a scope header. v3's [a-z]-only pattern could
+# not see this shape at all, which is why wa-se0zu's real scope list escaped.
+UPPER_UNDER_SCOPE="$(printf 'ESCOPO:\nA. Reescrever a grade de creditos em 1 coluna.\nB. Trocar a barra de saldo por barra solida.\nC. Empilhar as contas do card do Claude.\n')"
+rc0 gate_delivery_looks_partial "$UPPER_UNDER_SCOPE"
+out_has "A. Reescrever" -- gate_delivery_looks_partial "$UPPER_UNDER_SCOPE"
+
+# ga-cjrxh (d), reinforced by the Mayor: across the 4 measured holds, the one
+# signal that separated the true positive from the 3 false ones was the TITLE
+# ("prod diverge do mockup em 8 pontos"). It is cheap, independent of how the
+# author formatted the body, and it still fires when the body list is written
+# in some shape the structural patterns miss. Optional 2nd arg = bead title.
+rc0 gate_delivery_looks_partial "Corpo em prosa corrida, sem lista nenhuma." "$WA_SE0ZU_TITLE"
+out_has "8 pontos" -- gate_delivery_looks_partial "Corpo em prosa corrida, sem lista nenhuma." "$WA_SE0ZU_TITLE"
+# ...but a title with no enumeration must not start holding everything:
+rc1 gate_delivery_looks_partial "Corpo em prosa corrida." "Corrigir o parser de datas"
+# ...and "2 pontos" is below the >=3 threshold the rest of the guard uses:
+rc1 gate_delivery_looks_partial "Corpo em prosa corrida." "prod diverge do mockup em 2 pontos"
+
+# ga-cjrxh (e), Mayor's addition: an item beginning with a NEGATION ("NAO
+# mudar X") is never a deliverable — it is a scope RESTRICTION, satisfied by
+# doing nothing. Modeled on ga-05604.2's measured shape: 2 real fix items + 1
+# fixture + 1 negative constraint, which v3 counted as 4 and held.
+GA_05604_SHAPE="$(printf 'ESCOPO:\n1. Reordenar a escrita do label lane antes do in-flight.\n2. Adicionar retry com verificacao na escrita do lane.\n3. FIXTURE: bead cujo lane some entre as duas escritas.\n4. NAO mudar o CAP de concorrencia neste bead.\n')"
+rc1 gate_delivery_looks_partial "$GA_05604_SHAPE"
+
+# (b) item-level test verbs. Anchored at the ITEM START on purpose: "Adicionar
+# teste de regressao" is a DELIVERABLE that merely mentions a test and must
+# keep counting — FIX_PEDIDO_WITH_LIST above is the control that proves it.
+VERIF_VERBS="$(printf 'COMO TESTAR:\n1. Rodar a suite completa.\n2. Conferir o placar no log.\n3. Medir a latencia antes e depois.\n4. Verificar que o artefato mudou de data.\n')"
+rc1 gate_delivery_looks_partial "$VERIF_VERBS"
+
+# AC3 (root-class error-vs-empty): "avaliei e nao achei escopo multiplo" and
+# "nao consegui avaliar" are DIFFERENT facts and must not share one silent
+# rc=1 — otherwise a guard that failed to read the bead looks exactly like a
+# guard that read it and cleared it.
+err_has "escopo-multiplo:nao-detectado" -- gate_delivery_looks_partial "$GA_TQE4J"
+err_has "escopo-multiplo:nao-avaliavel" -- gate_delivery_looks_partial ""
+err_has "escopo-multiplo:nao-avaliavel" -- gate_delivery_looks_partial "   "
 
 # ── 3. Control: a normal, single-scope bug (the common case) is unaffected ─
 echo "── 3. Control: normal single-item bug body ──"

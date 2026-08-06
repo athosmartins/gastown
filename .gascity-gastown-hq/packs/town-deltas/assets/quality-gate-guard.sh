@@ -487,17 +487,75 @@ session_matches_author() {
 # DEFEITO, EVIDENCIA, COMO ACONTECE), or "unknown" (neither recognized).
 # Case- and accent-insensitive: this city's bug reports mix
 # "CRITÉRIO"/"CRITERIO", "MEDIÇÃO"/"MEDICAO" freely depending on author.
+#
+# ga-cjrxh: a third class, "verification". CRITERIO DE ACEITE moved OUT of
+# "scope" into it — measured 2026-08-06 against ga-tqe4j, whose held run sits
+# under "=== CRITERIO DE ACEITE (falsificavel) ===". ga-1yxyt listed that
+# header as scope vocabulary, but its own fixture only exercised "FIX PEDIDO"
+# with list structure (ga-o5de8's CRITERIO section used "· " bullets, which
+# never form a run), so nothing actually asserted the CRITERIO classification
+# — the reclassification breaks no existing assertion. Acceptance criteria
+# enumerate how ONE deliverable will be PROVEN, which is the opposite of
+# enumerating several approved deliverables.
+#
+# _gate_delivery_norm <s> — uppercase + deaccent, the shared normalizer.
+# ga-cjrxh BUGFIX (measured, not theorized): the inline version this replaces
+# deaccented only UPPERCASE vowels, but `tr '[:lower:]' '[:upper:]'` is
+# byte-wise and leaves multibyte "é" untouched — so a lowercase-accented
+# header never got folded. Measured against ga-05604.2, whose real header is
+# "=== CRITÉRIO DE ACEITE (falsificável) ===": it classified as "unknown"
+# instead of matching the CRITERIO vocabulary at all. ga-1yxyt's fixtures
+# happened to be written in caps, so nothing caught it. Deaccent BOTH cases
+# first, then uppercase.
+_gate_delivery_norm() {
+  printf '%s' "${1:-}" \
+    | sed -e 's/[áàâãÁÀÂÃ]/a/g; s/[éêÉÊ]/e/g; s/[íîÍÎ]/i/g; s/[óôõÓÔÕ]/o/g; s/[úûÚÛ]/u/g; s/[çÇ]/c/g' \
+    | tr '[:lower:]' '[:upper:]'
+}
+
 _gate_delivery_header_class() {
   local norm
-  norm=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]' \
-    | sed -e 's/[ÁÀÂÃ]/A/g; s/[ÉÊ]/E/g; s/[ÍÎ]/I/g; s/[ÓÔÕ]/O/g; s/[ÚÛ]/U/g; s/Ç/C/g')
-  if printf '%s' "$norm" | grep -Eq 'FIX PEDIDO|ENTREGAVEIS|ESCOPO|CRITERIO DE ACEITE|O QUE FAZER'; then
+  norm=$(_gate_delivery_norm "$1")
+  # Checked FIRST: "CRITERIO DE ACEITE" would otherwise be caught by the
+  # scope branch below, which is exactly the ga-tqe4j false positive.
+  if printf '%s' "$norm" | grep -Eq 'CRITERIO DE ACEITE|CRITERIOS DE ACEITE|COMO TESTAR|VERIFICACAO|PLANO DE TESTE|TESTES?:|AC[0-9]'; then
+    echo "verification"; return 0
+  fi
+  if printf '%s' "$norm" | grep -Eq 'FIX PEDIDO|ENTREGAVEIS|ESCOPO|O QUE FAZER'; then
     echo "scope"; return 0
   fi
   if printf '%s' "$norm" | grep -Eq 'O CICLO|A CADEIA|SINTOMA|A MEDICAO|O DEFEITO|EVIDENCIA|COMO ACONTECE'; then
     echo "diagnostic"; return 0
   fi
   echo "unknown"
+}
+
+# _gate_delivery_item_is_verification <item_line> — ga-cjrxh. Is ONE list item
+# a verification/constraint step rather than a deliverable? The header rule
+# above only fires when the author wrote a recognizable header; this is the
+# rule that generalizes when they did not. Three signals, all anchored at the
+# START of the item's text (after its "1." / "a." marker), never as a
+# substring — "Adicionar teste de regressao" is a DELIVERABLE that merely
+# mentions a test, and must keep counting:
+#   · a verification LABEL     — FIXTURE:, CONTROLE, AC1, CENARIO, INVARIANTE…
+#   · a test VERB in infinitive — rodar, conferir, medir, verificar, validar…
+#     (deliverables read as change verbs: corrigir, adicionar, remover, mover)
+#   · a NEGATION               — "NAO mudar o CAP" (Mayor's item (e)): never a
+#     deliverable, it is a scope RESTRICTION satisfied by doing nothing.
+_gate_delivery_item_is_verification() {
+  local norm
+  # Strip the list marker ("1. ", "a. ", "A. ") and any leading space, then
+  # normalize case/accents the same way the header classifier does.
+  norm=$(_gate_delivery_norm "$(printf '%s' "$1" \
+    | sed -E 's/^[[:space:]]*([0-9]{1,2}|[A-Za-z])\.[[:space:]]*//')")
+  printf '%s' "$norm" | grep -Eq \
+    '^(FIXTURE|CONTROLE|CONTROL|CENARIO|CASO DE TESTE|INVARIANTE|PLACAR|REGRESSAO|EVIDENCIA|PROVA|BASELINE|AC[0-9])' \
+    && return 0
+  printf '%s' "$norm" | grep -Eq \
+    '^(RODAR|CONFERIR|MEDIR|VERIFICAR|VALIDAR|CHECAR|TESTAR|GARANTIR|CONFIRMAR|REPRODUZIR|PROVAR|ASSERTAR|OBSERVAR)\b' \
+    && return 0
+  printf '%s' "$norm" | grep -Eq '^(NAO|NUNCA|JAMAIS)\b' && return 0
+  return 1
 }
 
 # _gate_delivery_list_run <text> <line_regex> <label>
@@ -539,35 +597,119 @@ _gate_delivery_header_class() {
 # diagnostic run yields the slot to a SHORTER qualifying one found elsewhere
 # in the same text, so a real partial-scope list past a diagnostic section
 # is still caught.
+#
+# ga-cjrxh: a run is now scored by its DELIVERABLE count, not its raw item
+# count — verification items (see _gate_delivery_item_is_verification) stay in
+# the run for continuity and for the quoted evidence, but do not count toward
+# the >=3 threshold. This is what fixes ga-05604.2, where 2 real fix items + 1
+# fixture + 1 negative constraint counted as 4. A run under a "verification"
+# header is skipped wholesale, same as "diagnostic".
+# _gate_delivery_run_verdict <header> — ga-cjrxh direction (c), softened by
+# what measuring the real bodies showed. Taken literally, (c) says "only hold
+# when the list is in a SCOPE section". Measured against the three original
+# ga-k2wjn true positives, that would have RELEASED wa-k0m1q, whose list is
+# headed "Os 11 itens, na ordem em que ele pediu:" — no scope vocabulary at
+# all. So an ENUMERATING header (>=3 units) counts as scope-equivalent.
+#
+# What is left over — a qualifying run under a header that is neither scope,
+# nor enumerating, nor recognizably diagnostic/verification — is the case that
+# produced the measured 75% false-positive rate (ga-tqe4j's "POR QUE E O PIOR
+# CASO DESSA CLASSE", ga-05604.2's criteria section). ga-1yxyt made that case
+# HOLD, as its fail-safe. ga-cjrxh reverses the fail-safe deliberately, and
+# says why: holding good work is the EXPENSIVE, SILENT error (the bead stops,
+# does not shout, and the triage lands on the Mayor), while releasing is
+# cheap — "preferir errar liberando + reportando a errar segurando". The
+# "+ reportando" is not optional, and is why this is a THIRD verdict rather
+# than a silent release: the caller emits an advisory naming the header it
+# could not classify, so the signal survives without blocking the merge.
+_gate_delivery_run_verdict() {
+  local cls
+  cls=$(_gate_delivery_header_class "$1")
+  case "$cls" in
+    diagnostic|verification) echo "skip";  return 0 ;;
+    scope)                   echo "hold";  return 0 ;;
+  esac
+  if _gate_delivery_enumerates "$1" >/dev/null 2>&1; then echo "hold"; return 0; fi
+  echo "advisory"
+}
+
 _gate_delivery_list_run() {
-  local text="$1" pattern="$2" label="$3" line
-  local run="" run_n=0 best="" best_n=0
-  local run_header="" pending_header=""
+  local text="$1" pattern="$2" label="$3" line verdict
+  local run="" run_n=0 run_d=0 run_header="" pending_header=""
+  local best="" best_d=0 adv="" adv_d=0 adv_hdr=""
+  # Inlined twice (loop body + post-loop flush) rather than factored into a
+  # helper, because it mutates five locals — same shape as the pre-ga-cjrxh
+  # code, which flushed in both places for the same reason.
   while IFS= read -r line; do
     if printf '%s\n' "$line" | grep -Eq "$pattern"; then
       [ "$run_n" -eq 0 ] && run_header="$pending_header"
       run="${run}${line}"$'\n'
       run_n=$((run_n + 1))
+      _gate_delivery_item_is_verification "$line" || run_d=$((run_d + 1))
     elif printf '%s' "$line" | grep -Eq '^[[:space:]]+[^[:space:]]'; then
       : # indented, non-blank, non-matching: wrapped continuation of the
         # current item's text — does not break the run, not counted, and
         # (ga-1yxyt) never updates pending_header — a continuation is part
         # of the item's own text, not a new section header.
     else
-      if [ "$run_n" -gt "$best_n" ] && [ "$(_gate_delivery_header_class "$run_header")" != "diagnostic" ]; then
-        best="$run"; best_n=$run_n
+      verdict=$(_gate_delivery_run_verdict "$run_header")
+      if [ "$verdict" = "hold" ] && [ "$run_d" -gt "$best_d" ]; then
+        best="$run"; best_d=$run_d
+      elif [ "$verdict" = "advisory" ] && [ "$run_d" -gt "$adv_d" ]; then
+        adv="$run"; adv_d=$run_d; adv_hdr="$run_header"
       fi
-      run=""; run_n=0; run_header=""
+      run=""; run_n=0; run_d=0; run_header=""
       [ -n "$line" ] && pending_header="$line"
     fi
   done <<EOF
 $text
 EOF
-  if [ "$run_n" -gt "$best_n" ] && [ "$(_gate_delivery_header_class "$run_header")" != "diagnostic" ]; then
-    best="$run"; best_n=$run_n
+  verdict=$(_gate_delivery_run_verdict "$run_header")
+  if [ "$verdict" = "hold" ] && [ "$run_d" -gt "$best_d" ]; then
+    best="$run"; best_d=$run_d
+  elif [ "$verdict" = "advisory" ] && [ "$run_d" -gt "$adv_d" ]; then
+    adv="$run"; adv_d=$run_d; adv_hdr="$run_header"
   fi
-  [ "$best_n" -ge 3 ] || return 1
-  printf 'detectei (%s):\n%s' "$label" "$best"
+  if [ "$best_d" -ge 3 ]; then
+    printf 'detectei (%s):\n%s' "$label" "$best"
+    return 0
+  fi
+  # Not a hold — but if an unclassifiable run cleared the same bar, hand the
+  # caller something to warn with instead of dropping the signal on the floor.
+  if [ "$adv_d" -ge 3 ] && [ -z "${_GDLR_ADVISORY:-}" ]; then
+    _GDLR_ADVISORY=$(printf '%s de %d itens sob cabecalho nao classificado "%s"' \
+      "$label" "$adv_d" "$(printf '%s' "$adv_hdr" | cut -c1-60)")
+    _GDLR_ADVISORY_EVIDENCE="$adv"
+  fi
+  return 1
+}
+
+# _gate_delivery_enumerates <string> — ga-cjrxh direction (d), reinforced by
+# the Mayor's measurement: across the 4 holds sampled on 2026-08-05, the one
+# signal that separated the single TRUE positive from the 3 false ones was an
+# explicit COUNT in the bead's TITLE — wa-se0zu's reads "prod diverge do
+# mockup em 8 pontos". Cheap, independent of how the author formatted the
+# body, and it still fires when the body list is written in a shape the
+# structural patterns miss.
+#
+# Applied to the run's own HEADER as well as the title, because measuring the
+# real bodies showed the header carries the same signal: wa-k0m1q — one of the
+# three original ga-k2wjn true positives — heads its list with "Os 11 itens,
+# na ordem em que ele pediu:". That header is not in any scope vocabulary, so
+# a scope-header-only rule (direction (c) taken literally) would have RELEASED
+# a known real partial delivery. The enumeration is what saves it.
+#
+# Prints the matched phrase, returns 0, iff it enumerates >=3 units — the same
+# >=3 threshold the rest of this guard uses, so "2 pontos" is not multi-scope.
+_gate_delivery_enumerates() {
+  local norm n
+  norm=$(_gate_delivery_norm "${1:-}")
+  n=$(printf '%s' "$norm" \
+    | grep -oE '[0-9]{1,3}[[:space:]]+(PONTOS|ITENS|FRENTES|LUGARES|PARTES|CASOS|ETAPAS|TELAS|ARQUIVOS)' \
+    | head -1 || true)
+  [ -n "$n" ] || return 1
+  [ "$(printf '%s' "$n" | grep -oE '^[0-9]{1,3}')" -ge 3 ] 2>/dev/null || return 1
+  printf '%s' "$n"
   return 0
 }
 
@@ -614,10 +756,53 @@ EOF
 # or no recognizable header at all still counts — fail-safe unchanged from
 # v1/v2: retaining too much costs a human review, retaining too little
 # silently drops scope, so an unclassifiable header must keep retaining.
+#
+# v4 (ga-cjrxh, measured 2026-08-05: 4 holds in one session, 3 false = 75%).
+# v3 could find a list and tell scope from diagnosis, but could not tell a
+# list of DELIVERABLES from a list of ACCEPTANCE CRITERIA — and in this city's
+# bug-report convention those look identical, so the better the report, the
+# likelier the wrongful hold. v4 fixes both directions at once, because
+# fixing only the first would have RELEASED wa-se0zu (the one true positive,
+# which v3 held for an unrelated reason):
+#   · stop counting verification items (header class + per-item rule);
+#   · start catching the multi-scope signals that escaped — UPPERCASE lettered
+#     lists and an enumeration in the TITLE.
+# Bias, stated explicitly: ga-cjrxh directs that holding good work is the
+# EXPENSIVE, SILENT error (a held bead does not shout, it stops, and the cost
+# lands on the Mayor as manual triage), while releasing with a warning is
+# cheap. Where this heuristic must guess, it now prefers to release and say
+# so. Optional 2nd arg is the bead TITLE.
 gate_delivery_looks_partial() {
-  local text="${1:-}"
+  local text="${1:-}" title="${2:-}" hit=""
+  _GDLR_ADVISORY=""; _GDLR_ADVISORY_EVIDENCE=""   # globals, set by the run scanner
+  # AC3 (root-class error-vs-empty): "the body was empty so I could not
+  # evaluate" and "I evaluated and found no multiple scope" are different
+  # facts that used to share one silent rc=1. Name which one happened.
+  if [ -z "$(printf '%s' "$text" | tr -d '[:space:]')" ] && [ -z "$title" ]; then
+    echo "escopo-multiplo:nao-avaliavel (corpo do bead vazio ou so espaco — o guard nao teve o que ler)" >&2
+    return 1
+  fi
   _gate_delivery_list_run "$text" '^[[:space:]]*[0-9]{1,2}\.[[:space:]]' 'lista numerada' && return 0
-  _gate_delivery_list_run "$text" '^[[:space:]]*[a-z]\.[[:space:]]' 'lista com letras' && return 0
+  # ga-cjrxh: [A-Za-z], not [a-z]. wa-se0zu enumerates its 8 real deliverables
+  # as "A." .. "H." — that run escaped the guard entirely, and the bead was
+  # held only by accident, on an unrelated numbered verification list. Fixing
+  # the false positives without this would have released a true positive.
+  _gate_delivery_list_run "$text" '^[[:space:]]*[A-Za-z]\.[[:space:]]' 'lista com letras' && return 0
+  if hit=$(_gate_delivery_enumerates "$title"); then
+    printf 'detectei (titulo enumera escopo): "%s" — o titulo declara %s\n' "$title" "$hit"
+    return 0
+  fi
+  # ga-cjrxh "errar liberando + REPORTANDO": a run cleared the >=3 deliverable
+  # bar but sits under a header this guard cannot classify. Releasing it
+  # silently would throw the signal away; holding it is the expensive silent
+  # error that this bead exists to stop. Release, and say exactly what was
+  # seen and why it was let through.
+  if [ -n "${_GDLR_ADVISORY:-}" ]; then
+    printf 'escopo-multiplo:possivel — %s. LIBERADO (ga-cjrxh: segurar trabalho bom e o erro caro e silencioso, liberar custa uma conferida); confira se o diff cobre todo o escopo.\n' \
+      "$_GDLR_ADVISORY" >&2
+    return 1
+  fi
+  echo "escopo-multiplo:nao-detectado (avaliei corpo e titulo; nenhuma lista de >=3 entregaveis, nem enumeracao no titulo ou no cabecalho)" >&2
   return 1
 }
 
