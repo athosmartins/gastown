@@ -930,9 +930,223 @@ BDSTUB
   echo "Scenario 26: bash -n syntax check"
   bash -n "$0" 2>/dev/null && ok "scenario 26: bash -n passes" || bad "scenario 26: bash -n FAILED — syntax error"
 
+  # ── Scenario 27 (ga-y0g5x): single-instance lock — two REAL concurrent
+  # invocations of the actual script ENTRY POINT (the lock guards the entry
+  # point, not the run_sweep function, so this must fire real subprocesses —
+  # a background `&` job is a genuine separate OS process — not call
+  # run_sweep in-process like every scenario above). AC: the second run must
+  # exit without working AND without alarming (no comment/notify/mail — not
+  # exercised here beyond "did it even reach run_sweep", which the other
+  # scenarios already cover exhaustively for alarm behavior).
+  echo "Scenario 27 (ga-y0g5x): two concurrent real invocations — exactly one proceeds, the other backs off silently"
+  reset_stores
+  LOCKTEST27="$TMP/locktest27"; mkdir -p "$LOCKTEST27/tmp" "$LOCKTEST27/state"
+  SHARED_LOG27="$LOCKTEST27/pmrw.log"; : > "$SHARED_LOG27"
+  run_pmrw_race27() {
+    env -i \
+      PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+      HOME="$HOME" \
+      TMPDIR="$LOCKTEST27/tmp" \
+      PMRW_ENABLED=1 PMRW_LOCK_ENABLED=1 PMRW_DRY_RUN=0 \
+      PMRW_TEST_MODE=1 \
+      PMRW_HQ="$HQ" \
+      PMRW_LOG="$SHARED_LOG27" \
+      PMRW_NOTIFY_BIN="$NOTIFY_BIN" \
+      PMRW_GC_BIN="$GC_BIN" \
+      PMRW_BD_BIN="$BD_BIN" \
+      PMRW_STATE_DIR="$LOCKTEST27/state" \
+      PMRW_STORES="$STORE_A $STORE_B" \
+      PMRW_TEST_FIXTURES_DIR="$PMRW_TEST_FIXTURES_DIR" \
+      PMRW_TEST_RECHECK_DIR="$PMRW_TEST_RECHECK_DIR" \
+      PMRW_TEST_GATEPROBE_DIR="$PMRW_TEST_GATEPROBE_DIR" \
+      bash "$0" >/dev/null 2>&1 || true
+  }
+  run_pmrw_race27 &
+  RP27_1=$!
+  run_pmrw_race27 &
+  RP27_2=$!
+  wait "$RP27_1" "$RP27_2"
+  RAN27=$(grep -cE "OK:|FLAGGED:" "$SHARED_LOG27" 2>/dev/null | tr -d ' '); RAN27=${RAN27:-0}
+  BACKOFF27=$(grep -c "backing off (single-instance guard" "$SHARED_LOG27" 2>/dev/null | tr -d ' '); BACKOFF27=${BACKOFF27:-0}
+  [ "$RAN27" -eq 1 ] && ok "scenario 27: exactly one of two concurrent runs executed the sweep ($RAN27)" || bad "scenario 27: expected exactly 1 run to execute the sweep, got $RAN27 — double-run or zero-run"
+  [ "$BACKOFF27" -eq 1 ] && ok "scenario 27: exactly one run backed off on the live lock, silently ($BACKOFF27)" || bad "scenario 27: expected exactly 1 back-off, got $BACKOFF27"
+  rm -rf "$LOCKTEST27"
+
+  # ── Scenario 28 (ga-y0g5x): a lock held by a DEAD pid, with a FRESH
+  # heartbeat mtime, is reclaimed IMMEDIATELY — proving the reclaim is
+  # PID-liveness-gated, not merely age-gated. An age-only check would let a
+  # killed run's lock block every future sweep for PMRW_LOCK_MAX_AGE (up to
+  # 900s default) — the exact failure mode the bug calls out ("o modo de
+  # falha que troca 'sobreposicao' por 'nunca mais roda'").
+  echo "Scenario 28 (ga-y0g5x): lock held by a DEAD pid (fresh mtime) is reclaimed immediately, not after MAX_AGE"
+  reset_stores
+  LOCKTEST28="$TMP/locktest28"; mkdir -p "$LOCKTEST28/tmp"
+  LOCK28_DIR="$LOCKTEST28/tmp/pilot-missing-route-watchdog$(printf '%s' "$HQ" | tr '/ ' '__').lock.d"
+  mkdir -p "$LOCK28_DIR"
+  ( : ) & DEADPID28=$!
+  wait "$DEADPID28" 2>/dev/null
+  printf '%s:1\n' "$DEADPID28" > "$LOCK28_DIR/heartbeat"   # fresh mtime, dead pid
+  LOG28="$LOCKTEST28/pmrw.log"; : > "$LOG28"
+  env -i \
+    PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+    HOME="$HOME" \
+    TMPDIR="$LOCKTEST28/tmp" \
+    PMRW_ENABLED=1 PMRW_LOCK_ENABLED=1 PMRW_DRY_RUN=0 \
+    PMRW_LOCK_MAX_AGE=900 \
+    PMRW_TEST_MODE=1 \
+    PMRW_HQ="$HQ" \
+    PMRW_LOG="$LOG28" \
+    PMRW_NOTIFY_BIN="$NOTIFY_BIN" \
+    PMRW_GC_BIN="$GC_BIN" \
+    PMRW_BD_BIN="$BD_BIN" \
+    PMRW_STATE_DIR="$LOCKTEST28/state" \
+    PMRW_STORES="$STORE_A $STORE_B" \
+    PMRW_TEST_FIXTURES_DIR="$PMRW_TEST_FIXTURES_DIR" \
+    PMRW_TEST_RECHECK_DIR="$PMRW_TEST_RECHECK_DIR" \
+    PMRW_TEST_GATEPROBE_DIR="$PMRW_TEST_GATEPROBE_DIR" \
+    bash "$0" >/dev/null 2>&1
+  grep -qE "OK:|FLAGGED:" "$LOG28" 2>/dev/null && ok "scenario 28: dead-pid lock reclaimed immediately, sweep ran" || bad "scenario 28: dead-pid lock blocked the run — a killed holder would wedge the watchdog forever"
+  grep -q "Recovered STALE/DEAD lock" "$LOG28" 2>/dev/null && ok "scenario 28: reclaim logged" || bad "scenario 28: no reclaim log line"
+  rm -rf "$LOCKTEST28"
+
   echo ""
   echo "pilot-missing-route-watchdog selftest: PASS=$PASS FAIL=$FAIL"
   [ "$FAIL" -eq 0 ] && exit 0 || exit 1
+fi
+
+# ── Single-instance lock (ga-y0g5x) ────────────────────────────────────────
+# REGRESSION 2026-08-06 (Mayor): StartInterval (300s) < one full sweep's
+# duration (scans every PMRW_STORES entry), so launchd does NOT serialize —
+# it fires the next run regardless of whether the previous one finished.
+# Measured: 4 simultaneous instances, 6 Dolt queries >10s stacked, bd
+# throwing i/o timeouts city-wide. Proven by causality (unload+pkill dropped
+# slow queries 6->2->0 in ~40s, no other variable changed), not correlation.
+# The gate-orphaned-label-watchdog.sh sibling has the SAME defect (3
+# simultaneous instances measured in the same incident) and gets the
+# identical fix below.
+#
+# Same lock shape quality-gate-dispatcher.sh already uses in this city (don't
+# invent another, per the bug's own instruction): an atomic mkdir mutex +
+# heartbeat mtime for staleness + PID-liveness for a KILLED holder (mtime
+# alone would still look "fresh" for up to PMRW_LOCK_MAX_AGE after a kill —
+# ga-T1 #7's own lesson) + a sentinel-gated reclaim that overwrites the stale
+# heartbeat IN PLACE — the lock dir is never renamed away, so there is no
+# window where the path is briefly absent for a TOCTOU double-acquisition
+# (ga-T1 #4's own lesson; the simpler mv-then-recreate shape used by
+# pilot-dispatcher.sh/auto-refino-dispatcher.sh does have that window — see
+# ga-byd3u/ga-bong5 — this sentinel variant doesn't need that fix because it
+# never creates the window in the first place).
+#
+# A LIVE holder makes the second run exit 0 SILENTLY — not an error, pure
+# serialization, no comment/notify/mail (the ACEITE requirement: the second
+# run must not alarm). A DEAD holder (PID no longer running) is reclaimed
+# immediately regardless of heartbeat age — an age-only check would let a
+# killed run's zombie lock block every future sweep for up to
+# PMRW_LOCK_MAX_AGE, trading "overlap" for "never runs again" (the failure
+# mode the bug explicitly calls out to avoid).
+PMRW_LOCK_ENABLED="${PMRW_LOCK_ENABLED:-1}"
+PMRW_LOCK_DIR="${TMPDIR:-/tmp}/pilot-missing-route-watchdog$(printf '%s' "$HQ" | tr '/ ' '__').lock.d"
+PMRW_LOCK_HB="$PMRW_LOCK_DIR/heartbeat"
+# A full multi-store sweep normally takes seconds; this margin still reclaims
+# a wedged holder within a couple of launchd intervals.
+PMRW_LOCK_MAX_AGE="${PMRW_LOCK_MAX_AGE:-900}"
+PMRW_LOCK_REAP_TTL="${PMRW_LOCK_REAP_TTL:-10}"
+PMRW_LOCK_TOKEN="${PMRW_LOCK_TOKEN:-$$:${RANDOM}${RANDOM}}"
+
+_pmrw_lock_path_age() {
+  local _p="$1" _mt _now
+  _now=$(date +%s)
+  _mt=$(stat -f %m "$_p" 2>/dev/null || stat -c %Y "$_p" 2>/dev/null || echo "")
+  [ -z "$_mt" ] && { echo 999999999; return; }
+  echo $(( _now - _mt ))
+}
+_pmrw_lock_hb_age() { _pmrw_lock_path_age "$PMRW_LOCK_HB"; }
+
+# Empty/non-numeric token → treat as ALIVE (do not fast-reclaim); PID reuse
+# only falls back to the (still-bounded) mtime path, never a wrong reclaim of
+# a genuinely live holder.
+_pmrw_lock_holder_dead() {
+  local _pid
+  _pid=$(head -n1 "$PMRW_LOCK_HB" 2>/dev/null | cut -d: -f1 || true)
+  case "$_pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$_pid" 2>/dev/null && return 1
+  return 0
+}
+
+_pmrw_lock_write_hb() { printf '%s\n' "$PMRW_LOCK_TOKEN" > "$PMRW_LOCK_HB" 2>/dev/null || true; }
+
+# Remove the lock dir only if WE still own it (token match) — never clobber a
+# peer that recovered our lock after we were (wrongly) judged stale.
+_release_pmrw_lock() {
+  local _own
+  _own=$(head -n1 "$PMRW_LOCK_HB" 2>/dev/null || true)
+  [ "$_own" = "$PMRW_LOCK_TOKEN" ] && rm -rf "$PMRW_LOCK_DIR" 2>/dev/null
+  return 0
+}
+
+# Returns 0 if we own the lock, 1 if a LIVE run holds it (caller backs off).
+_acquire_pmrw_lock() {
+  if mkdir "$PMRW_LOCK_DIR" 2>/dev/null; then
+    _pmrw_lock_write_hb
+    if [ ! -s "$PMRW_LOCK_HB" ]; then
+      rm -rf "$PMRW_LOCK_DIR" 2>/dev/null || true
+      return 1
+    fi
+    return 0
+  fi
+  local _age
+  _age=$(_pmrw_lock_hb_age)
+  if [ "$_age" -lt "$PMRW_LOCK_MAX_AGE" ] && ! _pmrw_lock_holder_dead; then
+    return 1   # fresh heartbeat + live holder → a live run is in progress.
+  fi
+  # An absent/empty heartbeat on an existing dir is a holder caught in the µs
+  # window between its mkdir and its hb write (a write-failed acquire tears
+  # its own dir down above, so this is only ever transient) — treat as LIVE
+  # and back off.
+  if [ ! -s "$PMRW_LOCK_HB" ]; then
+    return 1
+  fi
+  # Single-winner stale reclaim: gate the recovery on ONE atomic sentinel at a
+  # FIXED path, and take the stale dir over IN PLACE (heartbeat overwritten,
+  # dir never removed) so no entry-mkdir gap is ever exposed to a racing
+  # acquirer — mirrors quality-gate-dispatcher.sh's _acquire_gate_lock exactly.
+  local _reaping="${PMRW_LOCK_DIR}.reaping"
+  if ! mkdir "$_reaping" 2>/dev/null; then
+    if [ "$(_pmrw_lock_path_age "$_reaping")" -ge "$PMRW_LOCK_REAP_TTL" ]; then
+      local _dead="${_reaping}.dead.${PMRW_LOCK_TOKEN}"
+      if mv "$_reaping" "$_dead" 2>/dev/null; then
+        rm -rf "$_dead" 2>/dev/null || true
+      fi
+    fi
+    if ! mkdir "$_reaping" 2>/dev/null; then
+      return 1   # another reclaimer owns the recovery → back off (no double-win).
+    fi
+  fi
+  # Re-check UNDER the sentinel: if the lock turned live while we waited, an
+  # earlier reclaimer already took over — back off rather than clobber it.
+  if [ "$(_pmrw_lock_hb_age)" -lt "$PMRW_LOCK_MAX_AGE" ] && ! _pmrw_lock_holder_dead; then
+    rmdir "$_reaping" 2>/dev/null || true
+    return 1
+  fi
+  _pmrw_lock_write_hb
+  if [ ! -s "$PMRW_LOCK_HB" ]; then
+    rmdir "$_reaping" 2>/dev/null || true
+    return 1
+  fi
+  rmdir "$_reaping" 2>/dev/null || true
+  log "Recovered STALE/DEAD lock (heartbeat age ${_age}s) — taking over (ga-y0g5x)."
+  return 0
+}
+
+if [ "$PMRW_LOCK_ENABLED" = "1" ]; then
+  if _acquire_pmrw_lock; then
+    trap '_release_pmrw_lock' EXIT
+  else
+    log "Another pilot-missing-route-watchdog run holds the lock — backing off (single-instance guard, ga-y0g5x)."
+    exit 0
+  fi
 fi
 
 run_sweep; exit 0  # daemon health = "ran OK"; findings (if any) already sent via comment+notify+mail

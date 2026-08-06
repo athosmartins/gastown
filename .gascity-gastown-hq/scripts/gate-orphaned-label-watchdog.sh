@@ -1219,9 +1219,211 @@ BDSTUB
   echo "Scenario 11: bash -n syntax check"
   bash -n "$0" 2>/dev/null && ok "scenario 11: bash -n passes" || bad "scenario 11: bash -n FAILED — syntax error"
 
+  # ── Scenario 26 (ga-y0g5x): single-instance lock — two REAL concurrent
+  # invocations of the actual script ENTRY POINT (the lock guards the entry
+  # point, not the run_sweep function, so this must fire real subprocesses —
+  # a background `&` job is a genuine separate OS process — not call
+  # run_sweep in-process like every scenario above). AC: the second run must
+  # exit without working AND without alarming.
+  echo "Scenario 26 (ga-y0g5x): two concurrent real invocations — exactly one proceeds, the other backs off silently"
+  echo '[]' > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  LOCKTEST26="$TMP/locktest26"; mkdir -p "$LOCKTEST26/tmp" "$LOCKTEST26/state"
+  SHARED_LOG26="$LOCKTEST26/golw.log"; : > "$SHARED_LOG26"
+  run_golw_race26() {
+    env -i \
+      PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+      HOME="$HOME" \
+      TMPDIR="$LOCKTEST26/tmp" \
+      GOLW_ENABLED=1 GOLW_LOCK_ENABLED=1 GOLW_DRY_RUN=0 \
+      GOLW_TEST_MODE=1 \
+      GOLW_HQ="$HQ" \
+      GOLW_LOG="$SHARED_LOG26" \
+      GOLW_NOTIFY_BIN="$NOTIFY_BIN" \
+      GOLW_GC_BIN="$GC_BIN" \
+      GOLW_BD_BIN="$BD_BIN" \
+      GOLW_STATE_DIR="$LOCKTEST26/state" \
+      GOLW_STORES="$GOLW_STORES" \
+      GOLW_TEST_FIXTURES_DIR="$GOLW_TEST_FIXTURES_DIR" \
+      bash "$0" >/dev/null 2>&1 || true
+  }
+  run_golw_race26 &
+  RG26_1=$!
+  run_golw_race26 &
+  RG26_2=$!
+  wait "$RG26_1" "$RG26_2"
+  RAN26=$(grep -cE "OK:|FLAGGED:" "$SHARED_LOG26" 2>/dev/null | tr -d ' '); RAN26=${RAN26:-0}
+  BACKOFF26=$(grep -c "backing off (single-instance guard" "$SHARED_LOG26" 2>/dev/null | tr -d ' '); BACKOFF26=${BACKOFF26:-0}
+  [ "$RAN26" -eq 1 ] && ok "scenario 26: exactly one of two concurrent runs executed the sweep ($RAN26)" || bad "scenario 26: expected exactly 1 run to execute the sweep, got $RAN26 — double-run or zero-run"
+  [ "$BACKOFF26" -eq 1 ] && ok "scenario 26: exactly one run backed off on the live lock, silently ($BACKOFF26)" || bad "scenario 26: expected exactly 1 back-off, got $BACKOFF26"
+  rm -rf "$LOCKTEST26"
+
+  # ── Scenario 27 (ga-y0g5x): a lock held by a DEAD pid, with a FRESH
+  # heartbeat mtime, is reclaimed IMMEDIATELY — proving the reclaim is
+  # PID-liveness-gated, not merely age-gated. An age-only check would let a
+  # killed run's lock block every future sweep for GOLW_LOCK_MAX_AGE (up to
+  # 900s default) — the exact failure mode the bug calls out ("o modo de
+  # falha que troca 'sobreposicao' por 'nunca mais roda'").
+  echo "Scenario 27 (ga-y0g5x): lock held by a DEAD pid (fresh mtime) is reclaimed immediately, not after MAX_AGE"
+  echo '[]' > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  LOCKTEST27="$TMP/locktest27"; mkdir -p "$LOCKTEST27/tmp"
+  LOCK27_DIR="$LOCKTEST27/tmp/gate-orphaned-label-watchdog$(printf '%s' "$HQ" | tr '/ ' '__').lock.d"
+  mkdir -p "$LOCK27_DIR"
+  ( : ) & DEADPID27=$!
+  wait "$DEADPID27" 2>/dev/null
+  printf '%s:1\n' "$DEADPID27" > "$LOCK27_DIR/heartbeat"   # fresh mtime, dead pid
+  LOG27="$LOCKTEST27/golw.log"; : > "$LOG27"
+  env -i \
+    PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+    HOME="$HOME" \
+    TMPDIR="$LOCKTEST27/tmp" \
+    GOLW_ENABLED=1 GOLW_LOCK_ENABLED=1 GOLW_DRY_RUN=0 \
+    GOLW_LOCK_MAX_AGE=900 \
+    GOLW_TEST_MODE=1 \
+    GOLW_HQ="$HQ" \
+    GOLW_LOG="$LOG27" \
+    GOLW_NOTIFY_BIN="$NOTIFY_BIN" \
+    GOLW_GC_BIN="$GC_BIN" \
+    GOLW_BD_BIN="$BD_BIN" \
+    GOLW_STATE_DIR="$LOCKTEST27/state" \
+    GOLW_STORES="$GOLW_STORES" \
+    GOLW_TEST_FIXTURES_DIR="$GOLW_TEST_FIXTURES_DIR" \
+    bash "$0" >/dev/null 2>&1
+  grep -qE "OK:|FLAGGED:" "$LOG27" 2>/dev/null && ok "scenario 27: dead-pid lock reclaimed immediately, sweep ran" || bad "scenario 27: dead-pid lock blocked the run — a killed holder would wedge the watchdog forever"
+  grep -q "Recovered STALE/DEAD lock" "$LOG27" 2>/dev/null && ok "scenario 27: reclaim logged" || bad "scenario 27: no reclaim log line"
+  rm -rf "$LOCKTEST27"
+
   echo ""
   echo "gate-orphaned-label-watchdog selftest: PASS=$PASS FAIL=$FAIL"
   [ "$FAIL" -eq 0 ] && exit 0 || exit 1
+fi
+
+# ── Single-instance lock (ga-y0g5x) ────────────────────────────────────────
+# REGRESSION 2026-08-06 (Mayor): the sibling pilot-missing-route-watchdog.sh
+# was found overlapping 4-way (StartInterval < one full sweep's duration, so
+# launchd never serializes) and stacking Dolt queries badly enough to throw
+# bd's `bd` client city-wide. The SAME measurement found this watchdog with
+# 3 simultaneous instances — same pre-existing defect, same fix applied here.
+#
+# Same lock shape quality-gate-dispatcher.sh already uses in this city (don't
+# invent another, per the bug's own instruction): an atomic mkdir mutex +
+# heartbeat mtime for staleness + PID-liveness for a KILLED holder (mtime
+# alone would still look "fresh" for up to GOLW_LOCK_MAX_AGE after a kill —
+# ga-T1 #7's own lesson) + a sentinel-gated reclaim that overwrites the stale
+# heartbeat IN PLACE — the lock dir is never renamed away, so there is no
+# window where the path is briefly absent for a TOCTOU double-acquisition
+# (ga-T1 #4's own lesson).
+#
+# A LIVE holder makes the second run exit 0 SILENTLY — not an error, pure
+# serialization, no comment/notify/mail. A DEAD holder (PID no longer
+# running) is reclaimed immediately regardless of heartbeat age — an
+# age-only check would let a killed run's zombie lock block every future
+# sweep for up to GOLW_LOCK_MAX_AGE, trading "overlap" for "never runs
+# again."
+GOLW_LOCK_ENABLED="${GOLW_LOCK_ENABLED:-1}"
+GOLW_LOCK_DIR="${TMPDIR:-/tmp}/gate-orphaned-label-watchdog$(printf '%s' "$HQ" | tr '/ ' '__').lock.d"
+GOLW_LOCK_HB="$GOLW_LOCK_DIR/heartbeat"
+# A full multi-store sweep normally takes seconds; this margin still reclaims
+# a wedged holder within a couple of launchd intervals.
+GOLW_LOCK_MAX_AGE="${GOLW_LOCK_MAX_AGE:-900}"
+GOLW_LOCK_REAP_TTL="${GOLW_LOCK_REAP_TTL:-10}"
+GOLW_LOCK_TOKEN="${GOLW_LOCK_TOKEN:-$$:${RANDOM}${RANDOM}}"
+
+_golw_lock_path_age() {
+  local _p="$1" _mt _now
+  _now=$(date +%s)
+  _mt=$(stat -f %m "$_p" 2>/dev/null || stat -c %Y "$_p" 2>/dev/null || echo "")
+  [ -z "$_mt" ] && { echo 999999999; return; }
+  echo $(( _now - _mt ))
+}
+_golw_lock_hb_age() { _golw_lock_path_age "$GOLW_LOCK_HB"; }
+
+# Empty/non-numeric token → treat as ALIVE (do not fast-reclaim); PID reuse
+# only falls back to the (still-bounded) mtime path, never a wrong reclaim of
+# a genuinely live holder.
+_golw_lock_holder_dead() {
+  local _pid
+  _pid=$(head -n1 "$GOLW_LOCK_HB" 2>/dev/null | cut -d: -f1 || true)
+  case "$_pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$_pid" 2>/dev/null && return 1
+  return 0
+}
+
+_golw_lock_write_hb() { printf '%s\n' "$GOLW_LOCK_TOKEN" > "$GOLW_LOCK_HB" 2>/dev/null || true; }
+
+# Remove the lock dir only if WE still own it (token match) — never clobber a
+# peer that recovered our lock after we were (wrongly) judged stale.
+_release_golw_lock() {
+  local _own
+  _own=$(head -n1 "$GOLW_LOCK_HB" 2>/dev/null || true)
+  [ "$_own" = "$GOLW_LOCK_TOKEN" ] && rm -rf "$GOLW_LOCK_DIR" 2>/dev/null
+  return 0
+}
+
+# Returns 0 if we own the lock, 1 if a LIVE run holds it (caller backs off).
+_acquire_golw_lock() {
+  if mkdir "$GOLW_LOCK_DIR" 2>/dev/null; then
+    _golw_lock_write_hb
+    if [ ! -s "$GOLW_LOCK_HB" ]; then
+      rm -rf "$GOLW_LOCK_DIR" 2>/dev/null || true
+      return 1
+    fi
+    return 0
+  fi
+  local _age
+  _age=$(_golw_lock_hb_age)
+  if [ "$_age" -lt "$GOLW_LOCK_MAX_AGE" ] && ! _golw_lock_holder_dead; then
+    return 1   # fresh heartbeat + live holder → a live run is in progress.
+  fi
+  # An absent/empty heartbeat on an existing dir is a holder caught in the µs
+  # window between its mkdir and its hb write (a write-failed acquire tears
+  # its own dir down above, so this is only ever transient) — treat as LIVE
+  # and back off.
+  if [ ! -s "$GOLW_LOCK_HB" ]; then
+    return 1
+  fi
+  # Single-winner stale reclaim: gate the recovery on ONE atomic sentinel at a
+  # FIXED path, and take the stale dir over IN PLACE (heartbeat overwritten,
+  # dir never removed) so no entry-mkdir gap is ever exposed to a racing
+  # acquirer — mirrors quality-gate-dispatcher.sh's _acquire_gate_lock exactly.
+  local _reaping="${GOLW_LOCK_DIR}.reaping"
+  if ! mkdir "$_reaping" 2>/dev/null; then
+    if [ "$(_golw_lock_path_age "$_reaping")" -ge "$GOLW_LOCK_REAP_TTL" ]; then
+      local _dead="${_reaping}.dead.${GOLW_LOCK_TOKEN}"
+      if mv "$_reaping" "$_dead" 2>/dev/null; then
+        rm -rf "$_dead" 2>/dev/null || true
+      fi
+    fi
+    if ! mkdir "$_reaping" 2>/dev/null; then
+      return 1   # another reclaimer owns the recovery → back off (no double-win).
+    fi
+  fi
+  # Re-check UNDER the sentinel: if the lock turned live while we waited, an
+  # earlier reclaimer already took over — back off rather than clobber it.
+  if [ "$(_golw_lock_hb_age)" -lt "$GOLW_LOCK_MAX_AGE" ] && ! _golw_lock_holder_dead; then
+    rmdir "$_reaping" 2>/dev/null || true
+    return 1
+  fi
+  _golw_lock_write_hb
+  if [ ! -s "$GOLW_LOCK_HB" ]; then
+    rmdir "$_reaping" 2>/dev/null || true
+    return 1
+  fi
+  rmdir "$_reaping" 2>/dev/null || true
+  log "Recovered STALE/DEAD lock (heartbeat age ${_age}s) — taking over (ga-y0g5x)."
+  return 0
+}
+
+if [ "$GOLW_LOCK_ENABLED" = "1" ]; then
+  if _acquire_golw_lock; then
+    trap '_release_golw_lock' EXIT
+  else
+    log "Another gate-orphaned-label-watchdog run holds the lock — backing off (single-instance guard, ga-y0g5x)."
+    exit 0
+  fi
 fi
 
 run_sweep; exit 0  # daemon health = "ran OK"; findings (if any) already sent via comment+notify+mail
