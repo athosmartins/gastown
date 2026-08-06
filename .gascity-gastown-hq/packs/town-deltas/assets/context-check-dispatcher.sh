@@ -441,6 +441,45 @@ context_check_verdict_label() {
   esac
 }
 
+# ── Comment-aware context (ga-o9uvc: erro-vs-vazio) ────────────────────────────
+# .description is not the only place context lives — a human often explains
+# WHAT/HOW-TO-VERIFY in a COMMENT after a bead was filed with a thin
+# description. Treating "description empty" as "context empty" conflates an
+# empty READ with a no-context read. Confirmed live (2026-07-24 audit):
+# ga-pgzes, ga-r7uec, wa-atnuh, wa-2ddr0 each carry a real human-authored
+# comment with full context yet were judged ctx:thin because only
+# .description was ever read. Both functions are pure (no I/O) — the CALLER
+# fetches comments and passes the JSON/text in.
+
+# context_check_join_comments <comments_json> — join comment .text fields from
+#   a `bd comments --json` array into one blob, EXCLUDING this daemon's own
+#   auto-generated gap comments (they start with the literal gap-comment head
+#   string — see context_check_gap_comment). Without this exclusion the
+#   classifier would read its own prior THIN verdict back as if it were
+#   human-supplied context (circular self-rescue on a re-judged bead).
+context_check_join_comments() {
+  local comments_json="${1:-[]}"
+  printf '%s' "$comments_json" | jq -r '
+    if type == "array" then
+      [ .[] | select(((.text // "") | startswith("Context-check: marcado")) | not) | (.text // "") ]
+      | join("\n---\n")
+    else empty end
+  ' 2>/dev/null || echo ""
+}
+
+# context_check_effective_text <desc> <comments_text> — join description +
+#   (already-filtered) comment text into ONE context blob so the length/signal
+#   checks see context that lives in comments, not only in .description. Pure
+#   string-join; a desc-only caller (comments_text="") gets desc back unchanged.
+context_check_effective_text() {
+  local desc="${1:-}" comments="${2:-}"
+  if [ -n "$comments" ]; then
+    printf '%s\n%s' "$desc" "$comments"
+  else
+    printf '%s' "$desc"
+  fi
+}
+
 # ── EXEC-CLASS (automation-debt) classifier ───────────────────────────────────
 # Applied ONLY to a bead that has just been judged ctx:ready. Answers: can a crew
 # agent fully execute this WITHOUT a human/physical action, or does it need a
@@ -543,7 +582,7 @@ context_check_gap_comment() {
   local head="Context-check: marcado ctx:thin — falta contexto para um agente genérico construir sem um humano."
   local body=""
   if [ "$dlen" -lt "$CONTEXT_CHECK_THIN_MAXLEN" ] 2>/dev/null; then
-    body="  • O QUÊ: descrição vazia ou quase vazia (${dlen} chars). Diga o que precisa ser feito e por quê."
+    body="  • O QUÊ: descrição + comentários vazios ou quase vazios (${dlen} chars combinados). Diga o que precisa ser feito e por quê — na descrição ou em um comentário."
   elif [ "$sig" = "no" ]; then
     body="  • COMO-VERIFICAR: nenhum critério verificável ou artefato concreto (arquivo/comando/resultado esperado). Adicione ≥1 critério de aceitação observável."
   elif [ "$mech" = "uncertain" ] && [ "$sonnet" != "READY" ]; then
@@ -554,15 +593,22 @@ context_check_gap_comment() {
   printf '%s\n%s\nQuando estiver completo, remova o label ctx:thin para re-avaliação.' "$head" "$body"
 }
 
-# ── context_check_sonnet_judge <id> <title> <desc> <type> ───────────────────────
+# ── context_check_sonnet_judge <id> <title> <desc> <type> [comments_text] ─────
 # Spawn ONE independent Sonnet reviewer to judge the ambiguous-band bead against
 # the 3-field rubric (WHAT / HOW-TO-VERIFY / SCOPE), poll a verdict bead, and echo
 # READY | THIN | TIMEOUT. Modeled on the refino-gate's reviewer pattern (genuine
 # gc session, durable-pull verdict bead, outer timeout). Fail-toward-thin: any
 # non-READY outcome (FAIL, spawn failure, timeout) → THIN/TIMEOUT (→ ctx:thin).
+# ga-o9uvc: the optional 5th arg surfaces comment context to the judge too — a
+# bead escalated to Sonnet with a thin description but a substantive comment
+# must not be judged on the description alone.
 context_check_sonnet_judge() {
-  local _id="$1" _title="$2" _desc="$3" _type="$4"
+  local _id="$1" _title="$2" _desc="$3" _type="$4" _comments="${5:-}"
   local _run_id="ctxcheck-$(date -u +%Y%m%dT%H%M%SZ)-$_id"
+  local _comments_block=""
+  if [ -n "$_comments" ]; then
+    _comments_block=$(printf 'Comments:\n%s\n' "$_comments")
+  fi
   local _verdict_bead
   _verdict_bead=$(bd_ create \
     "ctx-verdict: $_id" \
@@ -584,12 +630,13 @@ CONTEXT-CHECK (creation gate) — Judge whether a GENERIC agent could implement 
 bead WITHOUT a human, using the 3-field rubric. You do NOT build it and you do NOT
 dispatch it. You only attest context-completeness. Be strict but fair: a terse
 bead that nonetheless names a clear WHAT + a verifiable outcome + a coherent SCOPE
-is READY; default to THIN whenever you are unsure.
+is READY; default to THIN whenever you are unsure. Context can live in the
+description OR in the comments below — read both before judging.
 
 BEAD: $_id ($_type) — $_title
 Description:
 $_desc
-
+$_comments_block
 RUBRIC — answer all three:
   1. WHAT: is the intent/goal unambiguous (a generic agent knows what to change)?
   2. HOW-TO-VERIFY: is there ≥1 verifiable acceptance criterion OR a concrete
@@ -749,7 +796,34 @@ while IFS= read -r row; do
   fi
 
   c_tlen=${#c_title}
-  c_sig=$(context_check_has_verifiable_signal "$c_desc")
+
+  # ga-o9uvc: fold comment context into the signal/length check, not just
+  # .description (erro-vs-vazio — an empty description is not the same as no
+  # context; context often lives in a comment). Only fetch when the row
+  # already reports comments — fail-open, no extra query for the common
+  # comment-free case, and keeps this a no-op for the many candidates that
+  # never had a comment to begin with.
+  c_comment_count=$(echo "$row" | jq -r '.comment_count // 0')
+  case "$c_comment_count" in ''|*[!0-9]*) c_comment_count=0 ;; esac
+  c_comments_text=""
+  if [ "$c_comment_count" -gt 0 ] 2>/dev/null; then
+    # || true: matches every other bd_ call in this loop (see CC_BUILT_IDS/
+    # CC_BLOCKED_IDS above, and the label/comment writes below). Without it,
+    # a transient bd failure (Dolt hiccup, timeout, or the bead closing
+    # between the batch `bd list` snapshot and this iteration) assigns a
+    # non-zero exit to this plain (non-local) variable under set -euo
+    # pipefail and aborts the ENTIRE sweep, not just this candidate
+    # (gate-reviewed FAIL on fix-attempt 1, ga-o9uvc).
+    c_comments_json=$(bd_ comments "$c_id" --json 2>/dev/null || true)
+    c_comments_text=$(context_check_join_comments "$c_comments_json")
+  fi
+  c_ctxtext=$(context_check_effective_text "$c_desc" "$c_comments_text")
+  # Re-assign c_dlen: above it held the raw description length for the
+  # candidacy/sling-stub gate; from here down it means the COMBINED
+  # description+comments length used for the thin/mechanical verdict. Same
+  # variable, two sequential, non-overlapping uses — not a bug.
+  c_dlen=${#c_ctxtext}
+  c_sig=$(context_check_has_verifiable_signal "$c_ctxtext")
   MECH=$(context_check_mechanical_verdict "$c_dlen" "$c_sig" "$c_tlen")
 
   SONNET_VERDICT=""
@@ -766,7 +840,7 @@ while IFS= read -r row; do
         log "  WOULD spawn Sonnet context-judge for $c_id (uncertain) — DRY_RUN; projecting as ctx:thin (conservative default)."
         SONNET_VERDICT="TIMEOUT"   # projection: treat as the conservative default
       else
-        SONNET_VERDICT=$(context_check_sonnet_judge "$c_id" "$c_title" "$c_desc" "$c_type")
+        SONNET_VERDICT=$(context_check_sonnet_judge "$c_id" "$c_title" "$c_desc" "$c_type" "$c_comments_text")
       fi
       SONNET_USED=$((SONNET_USED+1))
       N_SONNET=$((N_SONNET+1))
@@ -802,11 +876,11 @@ while IFS= read -r row; do
   fi
 
   if [ "$DRY_RUN" = "1" ]; then
-    log "  WOULD label $c_id → $LABEL${EXEC:+ + $EXEC} (mech=$MECH sig=$c_sig dlen=$c_dlen) — $c_title"
+    log "  WOULD label $c_id → $LABEL${EXEC:+ + $EXEC} (mech=$MECH sig=$c_sig dlen=$c_dlen comments=$c_comment_count) — $c_title"
     jq -c -n --arg ts "$(ts)" --arg id "$c_id" --arg label "$LABEL" \
       --arg exec "$EXEC" \
-      --arg mech "$MECH" --arg sig "$c_sig" --argjson dlen "$c_dlen" \
-      '{ts:$ts, event:"dry_run_judge", id:$id, label:$label, exec_class:$exec, mechanical:$mech, signal:$sig, desc_len:$dlen}' \
+      --arg mech "$MECH" --arg sig "$c_sig" --argjson dlen "$c_dlen" --argjson comments "$c_comment_count" \
+      '{ts:$ts, event:"dry_run_judge", id:$id, label:$label, exec_class:$exec, mechanical:$mech, signal:$sig, desc_len:$dlen, comment_count:$comments}' \
       >> "$CC_LOG" 2>/dev/null || true
     continue
   fi
@@ -852,11 +926,11 @@ while IFS= read -r row; do
       bd_ label add "$c_id" "$EXEC" -q 2>/dev/null || true
     fi
   fi
-  log "  $c_id → $LABEL${EXEC:+ + $EXEC} (mech=$MECH sig=$c_sig dlen=$c_dlen)"
+  log "  $c_id → $LABEL${EXEC:+ + $EXEC} (mech=$MECH sig=$c_sig dlen=$c_dlen comments=$c_comment_count)"
   jq -c -n --arg ts "$(ts)" --arg id "$c_id" --arg label "$LABEL" \
     --arg exec "$EXEC" \
-    --arg mech "$MECH" --arg sig "$c_sig" --argjson dlen "$c_dlen" \
-    '{ts:$ts, event:"judge", id:$id, label:$label, exec_class:$exec, mechanical:$mech, signal:$sig, desc_len:$dlen}' \
+    --arg mech "$MECH" --arg sig "$c_sig" --argjson dlen "$c_dlen" --argjson comments "$c_comment_count" \
+    '{ts:$ts, event:"judge", id:$id, label:$label, exec_class:$exec, mechanical:$mech, signal:$sig, desc_len:$dlen, comment_count:$comments}' \
     >> "$CC_LOG" 2>/dev/null || true
 
 done < <(echo "$CANDIDATES" | jq -c 'sort_by(.created_at // .id) | .[]')

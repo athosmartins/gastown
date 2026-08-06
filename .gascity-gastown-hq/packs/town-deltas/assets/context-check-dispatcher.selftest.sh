@@ -495,11 +495,31 @@ if [ "$cmd" = "list" ]; then
   while [ $# -gt 0 ]; do case "$1" in --type) want="$2"; shift 2;; *) shift;; esac; done
   if [ "$want" = "task" ]; then
     cat <<'JSON'
-[{"id":"ga-manual1","issue_type":"task","title":"experimentar phone-as-Claro-mobile-proxy","description":"Plugar o celular físico como proxy móvel da Claro e medir a latência. Critério de aceitação: a chamada de teste retorna 200 e o IP observado é o da operadora. Passos: ligar o aparelho, conectar manualmente, rodar o probe.","labels":[],"ephemeral":false,"created_at":"2026-01-01T00:00:00Z"},{"id":"ga-auto1","issue_type":"task","title":"Verificar saúde do token PDPJ","description":"Fazer health-check do token PDPJ via API e reportar o status. Critério de aceitação: o script retorna o expected output {status:ok} e grava em scripts/pdpj-health.sh o resultado. Comando: bd list para confirmar.","labels":[],"ephemeral":false,"created_at":"2026-01-02T00:00:00Z"},{"id":"ga-thin1","issue_type":"task","title":"arrumar","description":"x","labels":[],"ephemeral":false,"created_at":"2026-01-03T00:00:00Z"}]
+[{"id":"ga-manual1","issue_type":"task","title":"experimentar phone-as-Claro-mobile-proxy","description":"Plugar o celular físico como proxy móvel da Claro e medir a latência. Critério de aceitação: a chamada de teste retorna 200 e o IP observado é o da operadora. Passos: ligar o aparelho, conectar manualmente, rodar o probe.","labels":[],"ephemeral":false,"created_at":"2026-01-01T00:00:00Z"},{"id":"ga-auto1","issue_type":"task","title":"Verificar saúde do token PDPJ","description":"Fazer health-check do token PDPJ via API e reportar o status. Critério de aceitação: o script retorna o expected output {status:ok} e grava em scripts/pdpj-health.sh o resultado. Comando: bd list para confirmar.","labels":[],"ephemeral":false,"created_at":"2026-01-02T00:00:00Z"},{"id":"ga-thin1","issue_type":"task","title":"arrumar","description":"x","labels":[],"ephemeral":false,"created_at":"2026-01-03T00:00:00Z"},{"id":"ga-ctxrescue1","issue_type":"task","title":"corrigir latência do endpoint de health-check","description":"","labels":[],"ephemeral":false,"created_at":"2026-01-04T00:00:00Z","comment_count":2},{"id":"ga-stillthin2","issue_type":"task","title":"revisar item pendente","description":"","labels":[],"ephemeral":false,"created_at":"2026-01-05T00:00:00Z","comment_count":1}]
 JSON
   else
     echo "[]"
   fi
+  exit 0
+fi
+# ga-o9uvc: serve `comments <id> --json` for the two comment-context fixtures
+# above (empty description; the real/only context lives in a comment). Any
+# other id gets [] (matches the "no comments" real-world default).
+if [ "$cmd" = "comments" ]; then
+  id="$1"
+  case "$id" in
+    ga-ctxrescue1)
+      cat <<'JSON2'
+[{"text":"Context-check: marcado ctx:thin — falta contexto para um agente genérico construir sem um humano."},{"text":"Reported by mayor 2026-07-09: root cause confirmed via scripts/diagnose.sh — the health-check was hitting a stale cache. Acceptance criteria: the script returns exit 0 and the expected output is status ok after the fix lands."}]
+JSON2
+      ;;
+    ga-stillthin2)
+      cat <<'JSON3'
+[{"text":"Context-check: marcado ctx:thin — falta contexto para um agente genérico construir sem um humano.\n  • O QUÊ: descrição + comentários vazios ou quase vazios (0 chars combinados). Diga o que precisa ser feito e por quê — na descrição ou em um comentário.\nQuando estiver completo, remova o label ctx:thin para re-avaliação."}]
+JSON3
+      ;;
+    *) echo "[]" ;;
+  esac
   exit 0
 fi
 # Capture mutating writes to a ledger so the test can assert on them.
@@ -508,8 +528,21 @@ exit 0
 STUB
 chmod +x "$_ecity/bd"
 LEDGER="$_ecity/ledger.txt"; export LEDGER
+# ga-o9uvc (incidental, pre-existing): $_ecity is a bare mktemp dir, not a git
+# repo — CC_BUILT_IDS's `git -C "$CC_STORE" for-each-ref | grep ...` pipeline
+# exits non-zero (git fails outright, or grep finds no crew/* matches even in
+# a real repo) and aborts the WHOLE dispatcher under set -euo pipefail before
+# it judges a single candidate, despite the code's own comment promising
+# "FAIL-OPEN (git fails → empty set → no exclusion)". Verified this was
+# already silently broken on the unmodified baseline (same failure, same
+# empty-ledger symptom, before any of this file's ga-o9uvc changes) — use the
+# test seams the dispatcher already provides (CONTEXT_CHECK_TEST_BUILT_IDS /
+# _BLOCKED_IDS) to bypass the git/bd_ calls entirely, matching how every other
+# e2e block in this file avoids live I/O.
 CONTEXT_CHECK_CITY_OVERRIDE="$_ecity" \
   CONTEXT_CHECK_STORES="$_ecity" \
+  CONTEXT_CHECK_TEST_BUILT_IDS="" \
+  CONTEXT_CHECK_TEST_BLOCKED_IDS="" \
   CONTEXT_CHECK_MAX_SONNET_PER_SWEEP=0 \
   CONTEXT_CHECK_EXEC_CLASS=1 \
   PATH="$_ecity:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
@@ -536,10 +569,27 @@ if echo "$_eled" | grep -qE 'label add ga-thin1 ctx:thin' \
 else
   bad "e2e: thin bead wrongly got an exec label or no ctx:thin (ledger: $(echo "$_eled" | tr '\n' ';'))"
 fi
+# ga-ctxrescue1 (ga-o9uvc): empty description, but a real comment carries the
+# full report (ga-pgzes/ga-r7uec live shape) → must clear ctx:ready, not thin.
+if echo "$_eled" | grep -qE 'label add ga-ctxrescue1 ctx:ready'; then
+  ok "e2e: comment-carried context rescues an empty-description bead → ctx:ready (not falsely ctx:thin)"
+else
+  bad "e2e REGRESSION: comment-carried context did not rescue ga-ctxrescue1 (ledger: $(echo "$_eled" | tr '\n' ';'))"
+fi
+# ga-stillthin2 (ga-o9uvc): empty description, only comment is the daemon's
+# OWN prior gap-notice (ga-u8fly/gh-b2d live shape) → must stay ctx:thin, no
+# circular self-rescue from reading its own past verdict as context.
+if echo "$_eled" | grep -qE 'label add ga-stillthin2 ctx:thin'; then
+  ok "e2e: only-the-daemon's-own-gap-comment present → stays ctx:thin (no circular self-rescue)"
+else
+  bad "e2e REGRESSION: daemon's own gap-comment was read back as rescuing context for ga-stillthin2 (ledger: $(echo "$_eled" | tr '\n' ';'))"
+fi
 # Feature-gate OFF: CONTEXT_CHECK_EXEC_CLASS=0 → ctx:ready still written, NO exec label.
 LEDGER="$_ecity/ledger2.txt"; export LEDGER; : > "$LEDGER"
 CONTEXT_CHECK_CITY_OVERRIDE="$_ecity" \
   CONTEXT_CHECK_STORES="$_ecity" \
+  CONTEXT_CHECK_TEST_BUILT_IDS="" \
+  CONTEXT_CHECK_TEST_BLOCKED_IDS="" \
   CONTEXT_CHECK_MAX_SONNET_PER_SWEEP=0 \
   CONTEXT_CHECK_EXEC_CLASS=0 \
   PATH="$_ecity:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
@@ -652,6 +702,50 @@ if [ -z "$(context_check_skip_reason wa-X '' wa-X 1 0)" ]; then
 else
   bad "skip_reason: blocked kill-switch ignored"
 fi
+
+# ── Scenario 13: comment-aware context (ga-o9uvc: erro-vs-vazio) ──────────────
+# ctx:thin must not fire purely because .description is empty when the real
+# context lives in a comment. Also: the daemon's OWN prior gap-comment must be
+# excluded from the signal check (no circular self-rescue on a re-judged bead).
+echo "Scenario 13: comment-aware context — comments count, but not the daemon's own gap-comment"
+
+# 13a — join_comments: real comments are joined; the daemon's own gap-comment
+#       (identified by its literal head string) is filtered out.
+_join_in='[{"text":"Context-check: marcado ctx:thin — falta contexto para um agente genérico construir sem um humano."},{"text":"Reported by mayor: root cause is X, fix is Y, verify via scripts/z.sh"}]'
+_joined=$(context_check_join_comments "$_join_in")
+if echo "$_joined" | grep -q "Reported by mayor" && ! echo "$_joined" | grep -q "marcado ctx:thin"; then
+  ok "join_comments: keeps real comment text, excludes the daemon's own gap-comment"
+else
+  bad "join_comments: did not filter correctly (got: $_joined)"
+fi
+[ -z "$(context_check_join_comments "[]")" ] && ok "join_comments: empty array → empty text" || bad "join_comments: empty array should yield empty text"
+[ -z "$(context_check_join_comments "")" ] && ok "join_comments: empty/malformed input → empty text (no crash)" || bad "join_comments: empty input should yield empty text, not crash"
+
+# 13b — effective_text: comments appended to description; desc-only unchanged when no comments.
+[ "$(context_check_effective_text "hello" "")" = "hello" ] && ok "effective_text: no comments → description unchanged" || bad "effective_text: no-comments case changed the description"
+_eff=$(context_check_effective_text "" "world")
+case "$_eff" in *world*) ok "effective_text: empty description + comments → comments included" ;; *) bad "effective_text: comments not folded in (got: '$_eff')" ;; esac
+
+# 13c — end-to-end mechanical verdict, pure-function pipeline (no I/O):
+# baseline unchanged — empty description with NO comments is still thin.
+_base_sig=$(context_check_has_verifiable_signal "")
+_base_mech=$(context_check_mechanical_verdict 0 "$_base_sig" 10)
+[ "$_base_mech" = "thin" ] && ok "baseline unchanged: empty description, no comments → thin" || bad "REGRESSION: empty desc, no comments should still be thin"
+# ga-pgzes/ga-r7uec live shape: description empty, but a real comment carries
+# the full report — folding it in must clear the ready bar.
+_rescue_comment="Reported by mayor 2026-07-09: root cause confirmed via scripts/diagnose.sh, expected output is status ok. Acceptance criteria: the health-check returns 0 and scripts/diagnose.sh --apply completes without error."
+_rescue_text=$(context_check_effective_text "" "$_rescue_comment")
+_rescue_sig=$(context_check_has_verifiable_signal "$_rescue_text")
+_rescue_mech=$(context_check_mechanical_verdict "${#_rescue_text}" "$_rescue_sig" 10)
+[ "$_rescue_mech" = "ready" ] && ok "ga-pgzes/ga-r7uec shape: empty description + verifiable comment → ready (was falsely thin pre-fix)" || bad "REGRESSION: comment-carried context did not rescue an empty-description bead (mech=$_rescue_mech sig=$_rescue_sig)"
+# ga-u8fly/gh-b2d live shape: the ONLY comment is the daemon's own prior
+# gap-notice — must NOT self-rescue (still genuinely thin).
+_selfnotice='[{"text":"Context-check: marcado ctx:thin — falta contexto para um agente genérico construir sem um humano.\n  • O QUÊ: descrição + comentários vazios ou quase vazios (0 chars combinados). Diga o que precisa ser feito e por quê — na descrição ou em um comentário.\nQuando estiver completo, remova o label ctx:thin para re-avaliação."}]'
+_selfnotice_text=$(context_check_join_comments "$_selfnotice")
+_selfnotice_eff=$(context_check_effective_text "" "$_selfnotice_text")
+_selfnotice_sig=$(context_check_has_verifiable_signal "$_selfnotice_eff")
+_selfnotice_mech=$(context_check_mechanical_verdict "${#_selfnotice_eff}" "$_selfnotice_sig" 10)
+[ "$_selfnotice_mech" = "thin" ] && ok "ga-u8fly/gh-b2d shape: only the daemon's own gap-comment present → stays thin (no circular self-rescue)" || bad "REGRESSION: daemon's own gap-comment was read back as rescuing context (mech=$_selfnotice_mech)"
 
 echo ""
 echo "context-check-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
