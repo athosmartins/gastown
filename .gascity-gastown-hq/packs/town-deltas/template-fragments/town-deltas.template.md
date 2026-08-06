@@ -83,7 +83,19 @@ conselhos: cada uma tem um caso que a produziu.
    presas em `needs-rebase` — estado que elas nunca poderiam satisfazer, porque
    rebasear branch mergeada dá branch vazia. Um comando resolvia:
    `git merge-base --is-ancestor origin/<branch> origin/main`. Antes de otimizar
-   uma fila, descubra o que ela realmente contém.
+   uma fila, descubra o que ela realmente contém. **Não faça isso à mão — rode:**
+   ```bash
+   bash ~/gt/.gascity-gastown-hq/scripts/gate-queue-composition.sh
+   ```
+   Ele quebra a profundidade em REAL / FANTASMA / ILEGÍVEL. Só `real` responde a
+   mais capacidade. Read-only, roda a qualquer hora. **O número de profundidade
+   sozinho (`gate_queue_backlog.py`) não distingue os três** — foi exatamente ele
+   que me fez otimizar transporte de carga que não existia.
+   Corolário que me custou uma degradação da cidade no mesmo dia: **detector tem
+   custo de poll.** Ao subir guard novo, meça a duração de UM run, garanta
+   `StartInterval` > essa duração, e ponha lock de instância única — sem isso o
+   launchd empilha execuções e o guard vira a carga que deveria observar
+   (ga-y0g5x: 4 instâncias simultâneas derrubaram o `bd` da cidade inteira).
 
 2. **Verifique o ARTEFATO, nunca o relato — inclusive o seu.** Duas vezes
    declarei gate-runs mortos; os três markers depois passaram e mergearam
