@@ -192,6 +192,23 @@ case "$args" in
           echo "$_sc" > "$_scf"
           [ "$_sc" -gt "$FAKE_ESCALATE_AFTER_SHOWS" ] && lbls="${lbls:+$lbls,}\"gate:needs-human\""
         fi
+        # ga-4iw15: same counter-based race shape as ga-88g2 above, but for the
+        # label the LATE re-check did NOT cover before this fix: pilot:no-auto-
+        # dispatch landing (simulating the Mayor's hold — remove gate:needs-fix,
+        # add pilot:no-auto-dispatch) between the claim-verify show and the late
+        # pre-dispatch re-check. Separate counter file so it can be exercised
+        # independently of (or alongside) FAKE_ESCALATE_AFTER_SHOWS.
+        # FAKE_NOAUTO_AFTER_SHOWS=N: Nth and earlier `bd show` calls return
+        # clean; (N+1)th and later carry pilot:no-auto-dispatch. Unset/empty
+        # (the default) never injects it — every existing scenario is
+        # byte-identical to before this seam existed.
+        if [ -n "${FAKE_NOAUTO_AFTER_SHOWS:-}" ]; then
+          _scf2="$STATE/$id.showcount2"
+          _sc2=$(cat "$_scf2" 2>/dev/null || echo 0)
+          _sc2=$((_sc2 + 1))
+          echo "$_sc2" > "$_scf2"
+          [ "$_sc2" -gt "$FAKE_NOAUTO_AFTER_SHOWS" ] && lbls="${lbls:+$lbls,}\"pilot:no-auto-dispatch\""
+        fi
         # ga-pd7j: mark the fixture as already in the gate-fix loop (stable label,
         # present from the start — unlike the counter-based escalation above, this
         # test isn't about racing the LABEL, it's about racing a MAYOR COMMENT).
@@ -543,27 +560,18 @@ run_real_dispatch_escalate() { # FAKE_ESCALATE_AFTER_SHOWS
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
 
-# Runs a REAL (non-dry) dispatch of a gate:needs-fix candidate, with comments
-# injected via FAKE_STORY_COMMENTS_JSON (ga-pd7j Mayor-hold grace window).
-# Arg 1: FAKE_STORY_COMMENTS_JSON (unset/empty = no comments, plain happy path).
-# Arg 2: PILOT_MAYOR_HOLD_GRACE_SECS override (default 300 if omitted).
-# ga-e2n96: this scenario tests the ga-pd7j Mayor-hold-grace check in ISOLATION —
-# it must not also trip the newer ga-e2n96 zero-feedback guard, a DIFFERENT check
-# on the same gate:needs-fix label that skips dispatch entirely when the injected
-# GATE-FEEDBACK comment is empty. Seed a baseline GATE-FEEDBACK comment so
-# STORY_GATE_FEEDBACK is always non-empty here (real reprovacao shape, AC2); the
-# caller's JSON (Mayor-hold comments, or "" for the plain-happy-path controls) is
-# merged on top via jq rather than replacing the comment list outright.
-run_real_dispatch_mayorhold() { # FAKE_STORY_COMMENTS_JSON [PILOT_MAYOR_HOLD_GRACE_SECS]
+# Runs a REAL (non-dry) dispatch where pilot:no-auto-dispatch lands on the
+# candidate MID-DISPATCH — after N `bd show` reads have already happened —
+# simulating the Mayor's hold (remove gate:needs-fix, add pilot:no-auto-
+# dispatch) racing the SAME builder-target-resolution window as ga-88g2 above
+# (ga-4iw15 / ga-9uwbw incident: the hold landed 253s before dispatch, well
+# inside the window, and was silently bypassed because the late re-check only
+# knew about 4 labels). Arg 1: FAKE_NOAUTO_AFTER_SHOWS (unset/empty = never
+# injects it, i.e. the plain happy path).
+run_real_dispatch_noauto() { # FAKE_NOAUTO_AFTER_SHOWS
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
-  local _mh_extra="${1:-}"
-  [ -z "$_mh_extra" ] && _mh_extra="[]"
-  local _mh_base='[{"text":"GATE-FEEDBACK (gate_run=test): fixture reviewer feedback so this scenario stays isolated from the ga-e2n96 zero-feedback path.","author":"gate-reviewer","created_at":"2026-01-01T00:00:00Z"}]'
-  local _mh_comments
-  _mh_comments=$(jq -c -n --argjson base "$_mh_base" --argjson extra "$_mh_extra" '$base + $extra' 2>/dev/null) \
-    || _mh_comments="$_mh_base"
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
@@ -575,10 +583,57 @@ run_real_dispatch_mayorhold() { # FAKE_STORY_COMMENTS_JSON [PILOT_MAYOR_HOLD_GRA
     PILOT_INFLIGHT_SLEEP=0 \
     FAKE_BLOCKED_IDS="" \
     FAKE_SUPPRESS_INFLIGHT=0 \
-    FAKE_GATE_NEEDS_FIX=1 \
+    FAKE_NOAUTO_AFTER_SHOWS="${1:-}" \
+    FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+# Runs a REAL (non-dry) dispatch of a gate:needs-fix candidate, with comments
+# injected via FAKE_STORY_COMMENTS_JSON (ga-pd7j Mayor-hold grace window).
+# Arg 1: FAKE_STORY_COMMENTS_JSON (unset/empty = no comments, plain happy path).
+# Arg 2: PILOT_MAYOR_HOLD_GRACE_SECS override (default 300 if omitted).
+# ga-e2n96: this scenario tests the ga-pd7j Mayor-hold-grace check in ISOLATION —
+# it must not also trip the newer ga-e2n96 zero-feedback guard, a DIFFERENT check
+# on the same gate:needs-fix label that skips dispatch entirely when the injected
+# GATE-FEEDBACK comment is empty. Seed a baseline GATE-FEEDBACK comment so
+# STORY_GATE_FEEDBACK is always non-empty here (real reprovacao shape, AC2); the
+# caller's JSON (Mayor-hold comments, or "" for the plain-happy-path controls) is
+# merged on top via jq rather than replacing the comment list outright.
+# Arg 3 (ga-4iw15 AC2, default 1 = byte-identical to every pre-existing call
+# site): FAKE_GATE_NEEDS_FIX override. Pass 0 to prove the grace window now
+# fires for an ORDINARY candidate that never carried gate:needs-fix at all —
+# the AC2 broadening (grace check no longer gated on gate:needs-fix being
+# present) — as opposed to arg-default 1, which exercises the pre-existing
+# gate:needs-fix-specific path (ga-pd7j's original scope, scenarios 5e-5g).
+run_real_dispatch_mayorhold() { # FAKE_STORY_COMMENTS_JSON [PILOT_MAYOR_HOLD_GRACE_SECS] [FAKE_GATE_NEEDS_FIX]
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  local _mh_extra="${1:-}"
+  [ -z "$_mh_extra" ] && _mh_extra="[]"
+  local _mh_base='[{"text":"GATE-FEEDBACK (gate_run=test): fixture reviewer feedback so this scenario stays isolated from the ga-e2n96 zero-feedback path.","author":"gate-reviewer","created_at":"2026-01-01T00:00:00Z"}]'
+  local _mh_comments
+  _mh_comments=$(jq -c -n --argjson base "$_mh_base" --argjson extra "$_mh_extra" '$base + $extra' 2>/dev/null) \
+    || _mh_comments="$_mh_base"
+  local _mh_needsfix="${3:-1}"
+  local _mh_labels='[]'
+  [ "$_mh_needsfix" = "1" ] && _mh_labels='["gate:needs-fix"]'
+  env -i \
+    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    DRY_RUN=0 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    PILOT_INFLIGHT_RETRIES=3 \
+    PILOT_INFLIGHT_SLEEP=0 \
+    FAKE_BLOCKED_IDS="" \
+    FAKE_SUPPRESS_INFLIGHT=0 \
+    FAKE_GATE_NEEDS_FIX="$_mh_needsfix" \
     FAKE_STORY_COMMENTS_JSON="$_mh_comments" \
     PILOT_MAYOR_HOLD_GRACE_SECS="${2:-300}" \
-    FAKE_BUGS_JSON='[{"id":"tt-flight","title":"Durable in-flight fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["gate:needs-fix"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
+    FAKE_BUGS_JSON="[{\"id\":\"tt-flight\",\"title\":\"Durable in-flight fixture\",\"priority\":0,\"issue_type\":\"bug\",\"description\":\"fixture body — context for veto test\",\"status\":\"open\",\"labels\":$_mh_labels,\"assignee\":null,\"created_at\":\"2026-06-01T00:00:00Z\",\"metadata\":{}}]" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
@@ -1737,6 +1792,81 @@ if [ -f "$STATE/tt-flight.inflight" ]; then
   ok "story:in-flight still set normally when no IN-WINDOW Mayor comment is present"
 else
   bad "REGRESSION: old-Mayor/fresh-non-Mayor comments incorrectly blocked dispatch"
+fi
+
+# ── Scenario 5h/5i: pilot:no-auto-dispatch mid-dispatch (ga-4iw15 AC1) ───────
+# The ga-9uwbw incident: the Mayor posted an explicit hold — removed
+# gate:needs-fix, added blocked:needs-remeasure + pilot:no-auto-dispatch — yet
+# Pilot dispatched a builder 253s later anyway, because the late re-check
+# (5c/5d above) only knew about 4 labels; pilot:no-auto-dispatch was never in
+# that set even though _filter_candidates already excludes it at candidate-
+# SELECTION time (ga-1mqdz) — the two chokepoints checked DIFFERENT lists.
+# These scenarios prove the broadened re-check closes that gap and stays
+# silent otherwise.
+echo "Scenario 5h: pilot:no-auto-dispatch landing mid-dispatch aborts BEFORE a builder is dispatched (ga-4iw15 AC1)"
+
+LOG5H="$(run_real_dispatch_noauto 1)"
+if echo "$LOG5H" | grep -q "ga-4iw15:.*tt-flight.*pilot:no-auto-dispatch"; then
+  ok "pre-dispatch re-check detected the mid-dispatch Mayor hold (pilot:no-auto-dispatch) and logged it"
+else
+  bad "REGRESSION: no ga-4iw15 pre-dispatch re-check fired for pilot:no-auto-dispatch — the ga-9uwbw race is still unguarded"
+fi
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  bad "REGRESSION: story:in-flight was set despite the mid-dispatch pilot:no-auto-dispatch hold — the builder dispatch was NOT stopped"
+else
+  ok "story:in-flight was never set — dispatch correctly aborted before finalization"
+fi
+if echo "$LOG5H" | grep -q "Dispatch complete:"; then
+  bad "REGRESSION: dispatch completed (builder notified) despite the mid-dispatch pilot:no-auto-dispatch hold"
+else
+  ok "no builder was notified — aborted before the sling/nudge step"
+fi
+
+echo "Scenario 5i: control — no pilot:no-auto-dispatch injected → new re-check never false-positives (ga-4iw15 AC1)"
+LOG5I="$(run_real_dispatch_noauto "")"
+if echo "$LOG5I" | grep -q "ga-4iw15:"; then
+  bad "REGRESSION: pre-dispatch re-check fired with no pilot:no-auto-dispatch injected (false positive)"
+else
+  ok "no false positive — re-check stayed silent on the plain happy path"
+fi
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  ok "story:in-flight still set normally when nothing was held"
+else
+  bad "REGRESSION: adding the AC1 re-check broke the ordinary happy-path dispatch"
+fi
+
+# ── Scenario 5j/5k: Mayor grace window independent of gate:needs-fix (ga-4iw15 AC2) ──
+# ga-pd7j's grace window only ever ran for gate:needs-fix beads (gated behind
+# `grep -q gate:needs-fix`). AC2: the real signal is "the Mayor commented just
+# now", not "the bead still carries label X" — the Mayor's correct hold action
+# (removing gate:needs-fix as part of applying the hold) disarmed the guard
+# built specifically to catch this race. A fresh out-of-band Mayor comment on
+# ANY dispatch candidate — not just a gate-retry — must get the same one-sweep
+# deferral.
+echo "Scenario 5j: fresh gastown__mayor comment defers an ORDINARY (non gate:needs-fix) dispatch (ga-4iw15 AC2)"
+LOG5J="$(run_real_dispatch_mayorhold "[{\"author\":\"gastown__mayor\",\"text\":\"HOLD: re-measure first\",\"created_at\":\"$_MH_RECENT\"}]" 300 0)"
+if echo "$LOG5J" | grep -q "ga-pd7j:.*tt-flight has a gastown__mayor comment"; then
+  ok "pre-dispatch re-check deferred an ordinary candidate on a fresh Mayor comment, independent of gate:needs-fix (AC2)"
+else
+  bad "REGRESSION: AC2 did not fire — the Mayor-grace window is still gated on gate:needs-fix, so a hold on any other kind of dispatch can still be raced"
+fi
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  bad "REGRESSION: story:in-flight was set despite the fresh Mayor comment on a non-gate:needs-fix candidate"
+else
+  ok "story:in-flight was never set — dispatch correctly deferred before finalization"
+fi
+
+echo "Scenario 5k: control — ordinary candidate, NO Mayor comment, gate:needs-fix absent → still dispatches normally (ga-4iw15 AC2)"
+LOG5K="$(run_real_dispatch_mayorhold "" 300 0)"
+if echo "$LOG5K" | grep -q "ga-pd7j:"; then
+  bad "REGRESSION: AC2 broadening false-positived on an ordinary candidate with no Mayor activity at all"
+else
+  ok "no false positive — broadened grace check stays silent with no Mayor comment present"
+fi
+if [ -f "$STATE/tt-flight.inflight" ]; then
+  ok "story:in-flight still set normally for an ordinary candidate with no Mayor activity"
+else
+  bad "REGRESSION: AC2 broadening broke the ordinary non-gate:needs-fix happy path"
 fi
 
 # ── Scenario ga-e2n96: gate:needs-fix / gate:needs-remerge with ZERO feedback ──

@@ -6223,29 +6223,71 @@ TASK
       return 1
     fi
 
+    # ── ga-4iw15 AC1: broaden the late re-check to the SAME human-gate label
+    # set _filter_candidates (candidate-SELECTION time, ga-1mqdz, ~L1779-1830)
+    # and _filter_dispatch_gates (blocked-on/blocked/depends-on precondition
+    # labels, ~L2224) already exclude — not just the 4 labels above. The
+    # ga-9uwbw incident: the Mayor posted an explicit hold at 08:50:52Z
+    # (removed gate:needs-fix + gate:queued, added blocked:needs-remeasure +
+    # pilot:no-auto-dispatch), yet Pilot dispatched a builder 253s later
+    # anyway — INSIDE the ga-pd7j grace window below — because neither label
+    # was in the 4-label set this re-check knew about, even though
+    # pilot:no-auto-dispatch already vetoes candidate SELECTION (ga-1mqdz).
+    # Two chokepoints checking DIFFERENT lists is the exact ga-3lsy1 lesson
+    # this bug repeats. One combined check (not 6 more near-duplicate
+    # if-blocks) so the label set lives in one place and can't silently
+    # diverge from this one again. Reuses $_PREDISPATCH_LABELS — no extra
+    # bd round-trip.
+    local _PREDISPATCH_HUMANGATE
+    _PREDISPATCH_HUMANGATE=$(echo "$_PREDISPATCH_LABELS" | grep -oE \
+      'pilot:no-auto-dispatch|blocked:[^,]*|story:needs-human|story:needs-approval|needs-human[^,]*|pool:refused[^,]*|pilot:refused-reason:[^,]*' \
+      | head -1)
+    if [ -n "$_PREDISPATCH_HUMANGATE" ]; then
+      warn "ga-4iw15: $STORY_ID now carries $_PREDISPATCH_HUMANGATE (human-gate label landed during builder-target resolution, after the ga-zzrts claim-verify passed clean — same TOCTOU class as the ga-88g2 checks above, extended to the full human-gate set). Releasing claim and skipping — NOT dispatching a builder onto a bead an explicit human/Mayor decision already parked."
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+      return 1
+    fi
+
     # ── ga-pd7j: Mayor out-of-band hold grace window ─────────────────────────
     # Same TOCTOU class as the checks above, for a signal that ISN'T a label yet:
-    # the Mayor can post a hold-disposition comment on a gate:needs-fix bead in
-    # the same window this function is resolving the builder target (ga-z6uo/
-    # ga-06um: dispatch fired 16:30:34Z, Mayor's comment landed 16:32:16Z, still
-    # no pilot:held label). Only relevant for gate:needs-fix — that is the
-    # label Pilot auto-redispatches without waiting for a human/Mayor beat.
-    # Fail-open: an unreadable/empty comments fetch never blocks a real dispatch.
-    if echo "$_PREDISPATCH_LABELS" | grep -q "gate:needs-fix"; then
-      local _mayor_hold_active _predispatch_now
-      _predispatch_now=$(date +%s)
-      _mayor_hold_active=$(bd -C "$STORY_BEAD_CITY" comments "$STORY_ID" --json 2>/dev/null | jq -r \
-        --argjson now "$_predispatch_now" --argjson grace "${PILOT_MAYOR_HOLD_GRACE_SECS:-300}" \
-        'if type == "array" then . else [] end
-         | any(.[]; .author == "gastown__mayor"
-               and ((try (.created_at | fromdateiso8601) catch 0) > ($now - $grace)))' \
-        2>/dev/null || echo "false")
-      if [ "$_mayor_hold_active" = "true" ]; then
-        warn "ga-pd7j: $STORY_ID is gate:needs-fix with a gastown__mayor comment inside the ${PILOT_MAYOR_HOLD_GRACE_SECS:-300}s grace window — deferring this sweep so an out-of-band hold isn't raced onto a builder. Releasing claim and skipping."
-        bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
-        bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
-        return 1
-      fi
+    # the Mayor can post a hold-disposition comment on a bead in the same window
+    # this function is resolving the builder target (ga-z6uo/ga-06um: dispatch
+    # fired 16:30:34Z, Mayor's comment landed 16:32:16Z, still no pilot:held
+    # label).
+    # ga-4iw15 AC2: originally gated on gate:needs-fix (the label Pilot
+    # auto-redispatches without waiting for a human/Mayor beat) — removed.
+    # The real signal is "the Mayor commented just now", not "the bead still
+    # carries label X", and the ga-9uwbw incident showed the OLD gating
+    # actively worked against itself: the Mayor's textually-correct hold
+    # action (removing gate:needs-fix as PART OF applying the hold, same
+    # comment: "removi gate:needs-fix + gate:queued e adicionei
+    # blocked:needs-remeasure + pilot:no-auto-dispatch") disarmed the very
+    # guard built to catch this exact race, on exactly the sweep it needed to
+    # fire. (AC1 above now also catches this specific bead via
+    # pilot:no-auto-dispatch; this generalizes the protection to a Mayor
+    # comment with NO label at all yet — the original ga-z6uo/ga-06um shape —
+    # regardless of what kind of dispatch is about to happen.) Runs for every
+    # dispatch now, at the cost of one extra read-only `bd comments` fetch per
+    # DISPATCH (not per candidate — bounded by MAX_SMALL+MAX_BIG per sweep,
+    # same order of magnitude as the unconditional `bd show` re-fetch above).
+    # Fail-open: an unreadable/empty comments fetch never blocks a real
+    # dispatch.
+    local _mayor_hold_active _predispatch_now
+    _predispatch_now=$(date +%s)
+    _mayor_hold_active=$(bd -C "$STORY_BEAD_CITY" comments "$STORY_ID" --json 2>/dev/null | jq -r \
+      --argjson now "$_predispatch_now" --argjson grace "${PILOT_MAYOR_HOLD_GRACE_SECS:-300}" \
+      'if type == "array" then . else [] end
+       | any(.[]; .author == "gastown__mayor"
+             and ((try (.created_at | fromdateiso8601) catch 0) > ($now - $grace)))' \
+      2>/dev/null || echo "false")
+    if [ "$_mayor_hold_active" = "true" ]; then
+      local _gwlabel_desc="has"
+      echo "$_PREDISPATCH_LABELS" | grep -q "gate:needs-fix" && _gwlabel_desc="is gate:needs-fix with"
+      warn "ga-pd7j: $STORY_ID $_gwlabel_desc a gastown__mayor comment inside the ${PILOT_MAYOR_HOLD_GRACE_SECS:-300}s grace window — deferring this sweep so an out-of-band hold isn't raced onto a builder. Releasing claim and skipping."
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+      return 1
     fi
   fi
 
