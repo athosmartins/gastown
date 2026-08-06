@@ -232,6 +232,29 @@ dedup_gaterun_action() {
   echo "supersede:duplicate"
 }
 
+# dup_marker_ids_for_branch <markers_json> <branch> <exclude_id>
+# Pure (no bd/gc I/O — takes the query result as data): given the JSON array of
+# type:quality-gate-marker beads already filtered by the caller to
+# gate-status:{ready,queued,needs-rebase} (ga-o64z1's Step 4b query), return the
+# ids (one per line, empty output = none) whose description carries a `branch:`
+# line EXACTLY equal to <branch>, excluding <exclude_id> (the marker THIS sweep
+# just claimed) and re-checking status=open per-candidate as defense-in-depth
+# (mirrors live_sibling_run_for_branch's own belt-and-suspenders status gate in
+# quality-gate-dispatcher.sh — ga-tgj23 showed a label/list inconsistency can
+# otherwise surface a closed bead as a false candidate). Matches on the
+# DESCRIPTION's branch: line, not the branch: LABEL — the label is display-only
+# for the painel (docs/gate-marker-recipe.md), the description is the field
+# every real consumer (including this guard's own Step 3 extract()) trusts.
+# Exact string equality, not substring/regex — avoids fix/ga-1 matching
+# fix/ga-10.
+dup_marker_ids_for_branch() {
+  local markers_json="$1" branch="$2" exclude_id="$3"
+  printf '%s\n' "$markers_json" | jq -r --arg mid "$exclude_id" --arg branch "$branch" '
+    def branch_of(d): (d // "") | split("\n") | map(select(startswith("branch:"))) | (.[0] // "") | ltrimstr("branch:") | sub("^ +"; "");
+    [ .[] | select(.id != $mid) | select((.status // "") == "open") | select(branch_of(.description) == $branch) | .id ] | .[]
+  ' 2>/dev/null || true
+}
+
 # ── set_gate_status <bead_id> <new_status> ─────────────────────────────────
 # Atomic-effect gate-status transition: leave EXACTLY ONE gate-status:* label on
 # the bead. The legacy `label remove <known>; label add <new>` pattern is
@@ -1737,6 +1760,61 @@ Marker set to gate-status:error. Fix the marker fields and re-submit." 2>/dev/nu
   # wa-uthi: non-terminal (marker error, fixable + resubmittable) — no push. Logged only.
   log "SUPPRESSED PUSH (wa-uthi non-terminal): invalid marker $MARKER_ID — security check failed (gate-status:error)."
   exit 1
+fi
+
+# ── Step 4b (ga-o64z1): supersede duplicate open markers for the same branch ──
+# BUG: every /gate-done resubmission (gate FAIL -> author fixes -> resubmit)
+# creates a brand-new marker, but nothing ever closes the PRIOR marker for the
+# same branch. Confirmed live: fix/ga-0xmxt-midturn-liveness accumulated 3
+# simultaneous open markers; fix/ga-991au-skip-ineligible and
+# fix/ga-kyxih-gate-rebase-merge-commit-tip 2 each. Not just queue litter:
+# quality-gate-dispatcher.sh's Step 5b (ga-dupnv, "one branch = one
+# authoritative run") sees a live gate-run for the branch and makes the WHOLE
+# sweep YIELD without admitting any other marker — so a duplicate sterilizes
+# sweeps while its sibling runs, and the cost grows with every resubmission.
+# Step 0a only re-queues zombie `dispatching` markers past a TTL; it never
+# closes a duplicate sitting in ready/queued/needs-rebase. Fixing it HERE
+# (not gate-done.md, which is agent-executed markdown and does not source
+# this file's helpers, so duplicating the query there would drift) means
+# every marker gets deduped exactly once, right after BRANCH is validated
+# (Step 4) and before this marker does anything else. Every resubmission
+# creates a fresh gate-status:ready marker (gate-done.md Step 3), so Step 1's
+# unclaimed-ready scan always eventually reaches it and fires this check —
+# even when the OLDER siblings have since aged into queued/needs-rebase.
+# Only ready/queued/needs-rebase are touched (AC1) — dispatching/running are
+# deliberately left alone; a legitimate live run for this branch is the
+# dispatcher's Step 5b's job, not this one's.
+DUP_QUERY_OK=1
+DUP_MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all --status open \
+  -l type:quality-gate-marker \
+  --label-any gate-status:ready \
+  --label-any gate-status:queued \
+  --label-any gate-status:needs-rebase \
+  2>/dev/null) || DUP_QUERY_OK=0
+[ -z "$DUP_MARKERS_JSON" ] && DUP_MARKERS_JSON="[]"
+
+if [ "$DUP_QUERY_OK" = "0" ]; then
+  # AC2: a failed query must not read the same as "checked, found none" — log
+  # it as its own distinct outcome so a broken query is diagnosable instead
+  # of silently passing as a clean branch.
+  warn "Step 4b: sibling-marker query failed for branch $BRANCH — dedup check SKIPPED (non-fatal, distinct from '0 duplicates found')."
+else
+  DUP_IDS=$(dup_marker_ids_for_branch "$DUP_MARKERS_JSON" "$BRANCH" "$MARKER_ID")
+  DUP_COUNT=$(printf '%s\n' "$DUP_IDS" | grep -c . || true)
+  case "$DUP_COUNT" in ''|*[!0-9]*) DUP_COUNT=0 ;; esac
+
+  if [ "$DUP_COUNT" -gt 0 ]; then
+    log "Step 4b: branch $BRANCH has $DUP_COUNT pre-existing open marker(s) in {ready,queued,needs-rebase} — superseding by $MARKER_ID."
+    printf '%s\n' "$DUP_IDS" | while IFS= read -r DUP_ID; do
+      [ -z "$DUP_ID" ] && continue
+      set_gate_status "$DUP_ID" "superseded"
+      bd -C "$GC_CITY" comment "$DUP_ID" "Superseded by $MARKER_ID — newer /gate-done submission for the same branch ($BRANCH). Gate guard Step 4b (ga-o64z1): at most one open marker per branch." 2>/dev/null || true
+      bd -C "$GC_CITY" close "$DUP_ID" -r "Superseded by $MARKER_ID for branch $BRANCH (ga-o64z1 marker dedup)." 2>/dev/null || true
+      log "  Step 4b: superseded $DUP_ID (branch $BRANCH)."
+    done
+  else
+    log "Step 4b: no pre-existing open marker for branch $BRANCH — nothing to supersede."
+  fi
 fi
 
 # ── Step 5: Derive author from the authoritative bead record ─────────────────
