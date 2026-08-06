@@ -157,28 +157,39 @@ clear_lock
 mkdir -p "$LOCK_DIR"
 echo "zombie-holder-token" > "$LOCK_HB"
 touch -t 200001010000 "$LOCK_HB" 2>/dev/null || true
-LOGD1="$FIXCITY/.gc/logs/raceD1.log"
-LOGD2="$FIXCITY/.gc/logs/raceD2.log"
-run_race() { # $1=outfile
+SHARED_LOG="$FIXCITY/.gc/logs/pilot-dispatcher.log"
+: > "$SHARED_LOG"
+run_race() {
   env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" TMPDIR="$FIXTMP" DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_LOCK_MAX_AGE=2 \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
-  cp "$FIXCITY/.gc/logs/pilot-dispatcher.log" "$1" 2>/dev/null || true
 }
-# Each invocation overwrites the shared log, so capture per-process copies. The
-# shared-log clobber doesn't matter: we count how many REACHED sweep start by
-# inspecting both copies; with two racers one must win the atomic rename.
-( : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"; run_race "$LOGD1" ) &
+# Both racers append (pilot-dispatcher.sh: `exec >> "$LOG"`) to the SAME
+# shared log — there is no way to attribute a line to "which process wrote
+# it" from a per-racer snapshot taken at an uncoordinated time: a snapshot
+# taken right after racer A's own run can still observe lines racer B
+# already appended (or will append moments later, before A's own copy is
+# even read back). A prior version of this harness captured per-process
+# copies via `cp` and counted files containing the banner — that produces
+# false positives whenever the loser's copy is taken after the winner's
+# (early) recovery line has landed in the shared log, well before the
+# winner finishes its full sweep (confirmed via ga-byd3u: reproduced with a
+# byte-identical "Recovered STALE" line — same timestamp, same token — that
+# had simply leaked into both copies, i.e. ONE real event, not two).
+# Counting occurrences directly in the shared log, ONCE, after `wait`
+# guarantees both processes are fully done, has no such window: each real
+# recovery is exactly one `log "Recovered STALE..."` call, so this is an
+# exact, race-free measure of how many times recovery actually fired.
+run_race &
 P1=$!
-( run_race "$LOGD2" ) &
+run_race &
 P2=$!
 wait "$P1" "$P2"
-RECOVERED=$(grep -l "Recovered STALE" "$LOGD1" "$LOGD2" 2>/dev/null | wc -l | tr -d ' ')
-# Exactly one process may win the recovery. (The shared live log is racy, hence
-# the per-process copies; at most one copy may contain a recovery banner.)
+RECOVERED=$(grep -c "Recovered STALE" "$SHARED_LOG" 2>/dev/null | tr -d ' ')
+RECOVERED=${RECOVERED:-0}
 if [ "$RECOVERED" -le 1 ]; then
   ok "at most one recoverer proceeded ($RECOVERED) — no double-dispatch"
 else

@@ -1316,11 +1316,13 @@ PILOT_LOCK_HB="$PILOT_LOCK_DIR/heartbeat"
 PILOT_LOCK_MAX_AGE="${PILOT_LOCK_MAX_AGE:-600}"
 PILOT_LOCK_TOKEN="$$:${RANDOM}${RANDOM}"
 
-# Age (seconds) of the heartbeat file; a huge number if it is missing.
+# Age (seconds) of a heartbeat file; a huge number if it is missing.
+# $1 (optional): path to check; defaults to our own lock's heartbeat.
 _lock_hb_age() {
+  local _path="${1:-$PILOT_LOCK_HB}"
   local _mt _now
   _now=$(date +%s)
-  _mt=$(stat -f %m "$PILOT_LOCK_HB" 2>/dev/null || stat -c %Y "$PILOT_LOCK_HB" 2>/dev/null || echo "")
+  _mt=$(stat -f %m "$_path" 2>/dev/null || stat -c %Y "$_path" 2>/dev/null || echo "")
   [ -z "$_mt" ] && { echo 999999999; return; }
   echo $(( _now - _mt ))
 }
@@ -1348,9 +1350,28 @@ _acquire_pilot_lock() {
     return 1   # fresh heartbeat → a live sweep is running.
   fi
   # Stale holder. Atomically claim the recovery by renaming the dir aside; only
-  # one concurrent recoverer can win this rename (the rest get ENOENT).
+  # one concurrent recoverer can win a rename of THIS SPECIFIC original path
+  # (the rest get ENOENT) — but that alone isn't sufficient: our "$_age" read
+  # above is a point-in-time snapshot, and mv doesn't know or care WHAT it's
+  # renaming. If a peer wins the SAME race first and recreates a fresh lock
+  # at $PILOT_LOCK_DIR before we get here, our mv will happily rename THEIR
+  # live lock away instead of the original zombie (ga-byd3u: confirmed live,
+  # 2/200 in an isolated repro — this is the exact double-dispatch class
+  # ga-7s0or was written to prevent). So re-validate staleness on the copy we
+  # now exclusively own (nobody else can touch this uniquely-tokened path)
+  # before trusting the mv actually caught what we think it did.
   local _reaped="${PILOT_LOCK_DIR}.reaping.${PILOT_LOCK_TOKEN}"
   if mv "$PILOT_LOCK_DIR" "$_reaped" 2>/dev/null; then
+    local _reaped_age
+    _reaped_age=$(_lock_hb_age "$_reaped/heartbeat")
+    if [ "$_reaped_age" -lt "$PILOT_LOCK_MAX_AGE" ]; then
+      # What we grabbed was actually live (a peer refreshed it between our
+      # staleness read and this mv) — restore it and back off instead of
+      # stealing a peer's freshly-acquired lock out from under it.
+      mv "$_reaped" "$PILOT_LOCK_DIR" 2>/dev/null
+      rm -rf "$_reaped" 2>/dev/null || true
+      return 1
+    fi
     rm -rf "$_reaped" 2>/dev/null || true
     if mkdir "$PILOT_LOCK_DIR" 2>/dev/null; then
       _lock_write_hb
