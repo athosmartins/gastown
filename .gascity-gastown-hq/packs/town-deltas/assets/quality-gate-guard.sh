@@ -518,7 +518,12 @@ _gate_delivery_header_class() {
   norm=$(_gate_delivery_norm "$1")
   # Checked FIRST: "CRITERIO DE ACEITE" would otherwise be caught by the
   # scope branch below, which is exactly the ga-tqe4j false positive.
-  if printf '%s' "$norm" | grep -Eq 'CRITERIO DE ACEITE|CRITERIOS DE ACEITE|COMO TESTAR|VERIFICACAO|PLANO DE TESTE|TESTES?:|AC[0-9]'; then
+  # (GATE-FEEDBACK ga-wisp-05gt4qu, same class, found by self-audit rather than
+  # by the reviewer: these are SUBSTRING matches by design — a header reads
+  # "=== CRITERIO DE ACEITE (falsificavel) ===" — but bare "AC[0-9]" would then
+  # fire on any header merely CONTAINING "ac" before a digit. Anchored to a word
+  # start; the rest stay substrings on purpose.)
+  if printf '%s' "$norm" | grep -Eq 'CRITERIO DE ACEITE|CRITERIOS DE ACEITE|COMO TESTAR|VERIFICACAO|PLANO DE TESTE|TESTES?:|\bAC[0-9]'; then
     echo "verification"; return 0
   fi
   if printf '%s' "$norm" | grep -Eq 'FIX PEDIDO|ENTREGAVEIS|ESCOPO|O QUE FAZER'; then
@@ -548,9 +553,21 @@ _gate_delivery_item_is_verification() {
   # normalize case/accents the same way the header classifier does.
   norm=$(_gate_delivery_norm "$(printf '%s' "$1" \
     | sed -E 's/^[[:space:]]*([0-9]{1,2}|[A-Za-z])\.[[:space:]]*//')")
+  # GATE-FEEDBACK ga-wisp-05gt4qu: the \b is LOAD-BEARING and was missing here
+  # while its sibling verb alternation below already had it. Without it, any
+  # deliverable that merely shares a PREFIX with a short label was silently
+  # counted as verification — measured: "Provavelmente resolve..." hit PROVA,
+  # "Controlemos os efeitos..." hit CONTROLE, "Evidenciar o problema..." hit
+  # EVIDENCIA. A silent -1 on the deliverable count flips an exactly-3-item
+  # real multi-scope run from HOLD to RELEASE, and can drop it under the
+  # ADVISORY bar too, so not even the warning fires.
   printf '%s' "$norm" | grep -Eq \
-    '^(FIXTURE|CONTROLE|CONTROL|CENARIO|CASO DE TESTE|INVARIANTE|PLACAR|REGRESSAO|EVIDENCIA|PROVA|BASELINE|AC[0-9])' \
+    '^(FIXTURE|CONTROLE|CONTROL|CENARIO|CASO DE TESTE|INVARIANTE|PLACAR|REGRESSAO|EVIDENCIA|PROVA|BASELINE)\b' \
     && return 0
+  # AC1/AC10/AC11 — deliberately NOT \b-anchored, and therefore split out of the
+  # alternation above instead of taking a blanket \b on the whole group: \b
+  # between two DIGITS is not a boundary, so "AC[0-9]\b" stops matching at AC10.
+  printf '%s' "$norm" | grep -Eq '^AC[0-9]' && return 0
   printf '%s' "$norm" | grep -Eq \
     '^(RODAR|CONFERIR|MEDIR|VERIFICAR|VALIDAR|CHECAR|TESTAR|GARANTIR|CONFIRMAR|REPRODUZIR|PROVAR|ASSERTAR|OBSERVAR)\b' \
     && return 0
@@ -705,7 +722,7 @@ _gate_delivery_enumerates() {
   local norm n
   norm=$(_gate_delivery_norm "${1:-}")
   n=$(printf '%s' "$norm" \
-    | grep -oE '[0-9]{1,3}[[:space:]]+(PONTOS|ITENS|FRENTES|LUGARES|PARTES|CASOS|ETAPAS|TELAS|ARQUIVOS)' \
+    | grep -oE '[0-9]{1,3}[[:space:]]+(PONTOS|ITENS|FRENTES|LUGARES|PARTES|CASOS|ETAPAS|TELAS|ARQUIVOS)\b' \
     | head -1 || true)
   [ -n "$n" ] || return 1
   [ "$(printf '%s' "$n" | grep -oE '^[0-9]{1,3}')" -ge 3 ] 2>/dev/null || return 1

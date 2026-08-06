@@ -419,6 +419,34 @@ rc1 gate_delivery_looks_partial "$GA_05604_SHAPE"
 VERIF_VERBS="$(printf 'COMO TESTAR:\n1. Rodar a suite completa.\n2. Conferir o placar no log.\n3. Medir a latencia antes e depois.\n4. Verificar que o artefato mudou de data.\n')"
 rc1 gate_delivery_looks_partial "$VERIF_VERBS"
 
+# GATE-FEEDBACK (gate run ga-wisp-05gt4qu, reviewer 1, 2026-08-06) — CONFIRMED
+# by re-running the real function, then fixed. The verification-LABEL
+# alternation carried NO trailing word boundary while its sibling verb
+# alternation did, so ordinary Portuguese deliverable openers that merely SHARE
+# A PREFIX with a short label were silently counted as verification:
+#   "Provavelmente resolve..."  matched PROVA
+#   "Controlemos os efeitos..." matched CONTROLE
+#   "Evidenciar o problema..."  matched EVIDENCIA
+# The damage is a silent -1 on the deliverable count, so an exactly-3-item REAL
+# multi-scope run flips from HOLD to RELEASE — and can sink below the ADVISORY
+# bar too, meaning not even the warning fires. That is strictly worse than v3
+# for that case and undermines the exact distinction this bead introduces.
+# None of the fixtures above caught it: they only ever exercised whole-word
+# matches (FIXTURE/CONTROLE/RODAR), never a same-prefix DIFFERENT word.
+PREFIX_TRAP="$(printf 'ESCOPO:\n1. Provavelmente resolve o problema do timeout, mas confirmar depois.\n2. Controlemos os efeitos colaterais antes de liberar.\n3. Evidenciar o problema no dashboard de metricas.\n')"
+rc0 gate_delivery_looks_partial "$PREFIX_TRAP"
+out_has "1. Provavelmente" -- gate_delivery_looks_partial "$PREFIX_TRAP"
+# ...and the real labels those three collide with must STILL be verification,
+# or the fix would have traded one miscount for the opposite one:
+REAL_LABELS="$(printf 'ESCOPO:\n1. PROVA: o log mostra o erro na linha 12.\n2. CONTROLE: o caso oposto nao pode regredir.\n3. EVIDENCIA: screenshot anexado ao bead.\n')"
+rc1 gate_delivery_looks_partial "$REAL_LABELS"
+# AC[0-9] stays UNBOUNDED on purpose, split out of the \b-anchored alternation:
+# \b between two digits is not a boundary, so "AC[0-9]\b" silently stops
+# matching AC10 and up. The reviewer flagged this as the trap hiding inside the
+# obvious one-line fix; both ends are asserted so neither can regress alone.
+AC_MULTIDIGIT="$(printf 'ESCOPO:\n1. AC1 o placar total bate.\n2. AC10 o first_seen sobrevive.\n3. AC11 as saidas sao diferentes.\n')"
+rc1 gate_delivery_looks_partial "$AC_MULTIDIGIT"
+
 # AC3 (root-class error-vs-empty): "avaliei e nao achei escopo multiplo" and
 # "nao consegui avaliar" are DIFFERENT facts and must not share one silent
 # rc=1 — otherwise a guard that failed to read the bead looks exactly like a
