@@ -333,24 +333,78 @@ classify_parent_gap2() {
   echo "skip:active-sling"
 }
 
-# classify_gap2_bugtask_verdict <merge_verified> <has_untracked_marker> — ga-6ync4: a
-# bug/task parent's sling passed+closed is a done-SIGNAL, not proof — the sling can
-# gate-pass on a review of code that never actually landed on the parent's own fix.
-# Mirrors story-delivery.sh's task_reconciler_verdict (ga-266z8, same root flaw,
-# different code path): require independent content/ancestry evidence before trusting
-# a passed+closed sling enough to close the parent.
+# classify_gap2_bugtask_verdict <merge_verified> <has_untracked_marker> [has_active_marker]
+# — ga-6ync4: a bug/task parent's sling passed+closed is a done-SIGNAL, not proof —
+# the sling can gate-pass on a review of code that never actually landed on the
+# parent's own fix. Mirrors story-delivery.sh's task_reconciler_verdict (ga-266z8,
+# same root flaw, different code path): require independent content/ancestry
+# evidence before trusting a passed+closed sling enough to close the parent.
 # ga-x2x63: "no fix/feature branch found" must not collapse to the same verdict as
 # "checked and genuinely not merged" — a parent explicitly labeled delivery:untracked
 # has a legitimate deliverable that is a git-ignored/untracked file edit (no branch
 # could ever exist to find), and treating that structural absence as proof-of-not-done
 # is the error-vs-empty class of bug (ga-p5q3/ga-eu2x). has_untracked_marker only
 # matters when merge_verified didn't already succeed.
-# Returns: close:merge-verified | close:untracked-delivery | keep:merge-not-verified
+# ga-4tgga: "not (yet) verified merged" must not collapse to "abandoned" either — the
+# SAME error-vs-empty shape, one signal later. A parent whose own fix has an ACTIVE
+# quality-gate-marker (gate-status ready/queued/claimed/dispatching/running) is mid
+# review, not orphaned: re-arming gate:needs-fix strips pilot:dispatched and lets
+# Pilot dispatch a SECOND builder racing the gate's own in-flight review (observed
+# live: a marker went gate-status:QUEUED at 17:58:46Z, GAP-2 declared the same bead
+# unmerged-and-abandoned 74s later — ga-ffop9). has_active_marker only matters when
+# neither stronger signal above already resolved the verdict.
+# Returns: close:merge-verified | close:untracked-delivery | wait:active-marker | keep:merge-not-verified
 classify_gap2_bugtask_verdict() {
-  local merge_verified="$1" has_untracked_marker="${2:-}"
+  local merge_verified="$1" has_untracked_marker="${2:-}" has_active_marker="${3:-}"
   [ "$merge_verified" = "1" ]       && { echo "close:merge-verified"; return; }
   [ "$has_untracked_marker" = "1" ] && { echo "close:untracked-delivery"; return; }
+  [ "$has_active_marker" = "1" ]    && { echo "wait:active-marker"; return; }
   echo "keep:merge-not-verified"
+}
+
+# gap2_query_active_markers — ga-4tgga: I/O helper (not pure, like set_gate_status
+# above) fetching every type:quality-gate-marker whose gate-status is still ACTIVE
+# (ready/queued/claimed/dispatching/running — anything short of terminal). Defined
+# here in the lib region so the selftest can source + exercise its companion pure
+# filter (gap2_marker_for_bead) against fixture JSON of this exact shape. Echoes
+# "[]" on any query failure — fail-safe: an empty/failed fetch makes
+# gap2_marker_for_bead find nothing, which flows into the existing
+# keep:merge-not-verified path, never a false "found none, so it's safe to
+# redispatch" from a query that actually errored.
+gap2_query_active_markers() {
+  bd -C "$GC_CITY" list --json --all \
+    -l type:quality-gate-marker \
+    --label-any gate-status:ready \
+    --label-any gate-status:queued \
+    --label-any gate-status:claimed \
+    --label-any gate-status:dispatching \
+    --label-any gate-status:running \
+    2>/dev/null || echo "[]"
+}
+
+# gap2_marker_for_bead <active_markers_json> <bead_id> — pure jq filter (no I/O of
+# its own; <active_markers_json> is whatever gap2_query_active_markers returned).
+# Echoes "<marker_id> <gate-status-value>" for the first active marker matching
+# <bead_id>, or empty if none. Matches on EITHER signal, the same dual-source
+# convention the dispatcher's own BEAD_ID resolution uses: the source-bead:<id>
+# LABEL (present once the guard has claimed+parked the marker — Step 6/7 below,
+# wa-qq33j) OR a `bead_id: <id>` line in the DESCRIPTION (present from creation per
+# the canonical /gate-done recipe, docs/gate-marker-recipe.md — the ONLY signal
+# available while the marker still sits gate-status:ready, before any guard sweep
+# has touched it). Checking the label alone would miss exactly the freshest,
+# not-yet-claimed submissions — the description field is the MANDATORY one per
+# that doc; the label is "secondary/display". Line-anchored (not a bare substring
+# test) so bead_id ga-ffop9 does not false-match a description carrying ga-ffop9x.
+gap2_marker_for_bead() {
+  local json="$1" bid="$2"
+  [ -z "$bid" ] && return 0
+  printf '%s' "$json" | jq -r --arg b "$bid" '
+    .[] | select(
+      ((.labels // []) | index("source-bead:" + $b)) or
+      ((.description // "") | split("\n") | any(test("^bead_id:[ \t]*" + $b + "[ \t]*$")))
+    ) |
+    "\(.id) \((.labels // []) | map(select(startswith("gate-status:"))) | .[0] // "gate-status:unknown" | sub("^gate-status:"; ""))"
+  ' 2>/dev/null | head -1
 }
 
 # check_source_bead_park <space_sep_labels>
@@ -1448,6 +1502,10 @@ fi
 # hides it forever. Detect via "Sling task bead: $ID" comment the Pilot writes.
 # Safe-default: if sling bead ID is absent from comments or state is ambiguous
 # → do NOT act.
+# ga-4tgga: for the bug/task (non-story) branch below, "parent's fix not yet
+# verified in origin/main" ALSO gets a safe-default now — if an ACTIVE gate
+# marker is currently processing that fix, we wait instead of re-arming
+# gate:needs-fix (see classify_gap2_bugtask_verdict above).
 
 log "Step 0c.2 (ga-pa36 GAP-2): sweep stranded parent stories..."
 
@@ -1523,11 +1581,10 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
         warn "GAP-2: $SC_ID stranded (sling $SLING_ID closed/passed) — freeing lane"
         SC_LABELS=$(echo "$SC_SHOW" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
 
-        bd -C "$GC_CITY" label remove "$SC_ID" "story:in-flight"  -q 2>/dev/null || true
-        bd -C "$GC_CITY" label remove "$SC_ID" "pilot:dispatched" -q 2>/dev/null || true
-
         if echo "$SC_LABELS" | grep -q "story:approved"; then
           # Story-type parent: set gate:passed so story-delivery finalizes it.
+          bd -C "$GC_CITY" label remove "$SC_ID" "story:in-flight"  -q 2>/dev/null || true
+          bd -C "$GC_CITY" label remove "$SC_ID" "pilot:dispatched" -q 2>/dev/null || true
           bd -C "$GC_CITY" label add "$SC_ID" "gate:passed" -q 2>/dev/null || true
           bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: parent stranded after sling bead $SLING_ID gate-passed+closed. story:in-flight + pilot:dispatched cleared; gate:passed set — story-delivery will deploy and mark story:done." 2>/dev/null || true
         else
@@ -1548,12 +1605,37 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
           # for that case instead of letting it run and find nothing — running
           # it anyway would collapse "structurally inapplicable" into "checked
           # and not merged", the exact false-positive this bug reports.
+          #
+          # ga-4tgga: labels are now left UNTOUCHED (not just the verdict — the
+          # actual bd label calls below) until we know we are not simply waiting
+          # on the gate. The old code stripped story:in-flight/pilot:dispatched
+          # unconditionally before any of this ran, so even the "waiting on an
+          # active marker" case let Pilot redispatch a second builder the moment
+          # the strip landed, regardless of what the verdict turned out to be.
           GAP2_HAS_UNTRACKED_MARKER=0
           echo "$SC_LABELS" | grep -q "delivery:untracked" && GAP2_HAS_UNTRACKED_MARKER=1
+
+          # Check for an ACTIVE gate marker on the parent's OWN fix BEFORE
+          # running the (slower) merge-ancestry search below — same
+          # error-vs-empty shape as the untracked-delivery check above. "Not
+          # yet verified in origin/main" only means "abandoned" if nothing is
+          # currently reviewing it; a marker still ready/queued/claimed/
+          # dispatching/running for this exact source-bead means the fix
+          # simply hasn't finished its turn in the gate queue yet.
+          GAP2_HAS_ACTIVE_MARKER=0
+          GAP2_ACTIVE_HIT=""
+          if [ "$GAP2_HAS_UNTRACKED_MARKER" != "1" ]; then
+            GAP2_ACTIVE_MARKERS_JSON=$(gap2_query_active_markers)
+            GAP2_ACTIVE_HIT=$(gap2_marker_for_bead "$GAP2_ACTIVE_MARKERS_JSON" "$SC_ID")
+            [ -z "$GAP2_ACTIVE_HIT" ] && GAP2_ACTIVE_HIT=$(gap2_marker_for_bead "$GAP2_ACTIVE_MARKERS_JSON" "$SLING_ID")
+            [ -n "$GAP2_ACTIVE_HIT" ] && GAP2_HAS_ACTIVE_MARKER=1
+          fi
 
           GAP2_MERGE_VERIFIED=0
           if [ "$GAP2_HAS_UNTRACKED_MARKER" = "1" ]; then
             log "GAP-2: $SC_ID carries delivery:untracked — skipping branch/merge search"
+          elif [ "$GAP2_HAS_ACTIVE_MARKER" = "1" ]; then
+            log "GAP-2: $SC_ID — active gate marker found ($GAP2_ACTIVE_HIT) — skipping branch/merge search, waiting for the gate instead"
           else
             GAP2_MAIN_SHA=""
             git -C "$GC_CITY" fetch origin main --quiet 2>/dev/null || true
@@ -1585,34 +1667,57 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
             fi
           fi
 
-          GAP2_VERDICT=$(classify_gap2_bugtask_verdict "$GAP2_MERGE_VERIFIED" "$GAP2_HAS_UNTRACKED_MARKER")
+          GAP2_VERDICT=$(classify_gap2_bugtask_verdict "$GAP2_MERGE_VERIFIED" "$GAP2_HAS_UNTRACKED_MARKER" "$GAP2_HAS_ACTIVE_MARKER")
           case "$GAP2_VERDICT" in
             close:merge-verified)
+              bd -C "$GC_CITY" label remove "$SC_ID" "story:in-flight"  -q 2>/dev/null || true
+              bd -C "$GC_CITY" label remove "$SC_ID" "pilot:dispatched" -q 2>/dev/null || true
               bd -C "$GC_CITY" close "$SC_ID" \
                 -r "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed and closed, and parent's own fix verified merged into origin/main (ga-6ync4) — work is done; closing parent." \
                 2>/dev/null || warn "Could not close parent $SC_ID after pass-stranded detection"
               ;;
             close:untracked-delivery)
+              bd -C "$GC_CITY" label remove "$SC_ID" "story:in-flight"  -q 2>/dev/null || true
+              bd -C "$GC_CITY" label remove "$SC_ID" "pilot:dispatched" -q 2>/dev/null || true
               bd -C "$GC_CITY" close "$SC_ID" \
                 -r "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed and closed; parent carries delivery:untracked (ga-x2x63) — no git artifact is expected by design, so merge verification was skipped and the sling-passed signal is trusted; closing parent." \
                 2>/dev/null || warn "Could not close parent $SC_ID after pass-stranded detection (untracked delivery)"
               ;;
+            wait:active-marker)
+              log "GAP-2: $SC_ID sling $SLING_ID gate-passed+closed, parent's own fix not yet verified in origin/main, but an ACTIVE gate marker ($GAP2_ACTIVE_HIT) is still processing it — not touching labels, waiting for the gate."
+              bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed+closed; parent's own fix not yet independently verified in origin/main, but an ACTIVE quality-gate-marker ($GAP2_ACTIVE_HIT) is currently processing it — still queued for review, not abandoned. No labels changed; will re-check next sweep. (ga-4tgga)" 2>/dev/null || true
+              ;;
             *)
-              warn "GAP-2: $SC_ID sling $SLING_ID gate-passed+closed but parent's own fix NOT verified in origin/main (ga-6ync4 — sling-passed is a signal, not proof) — NOT closing; re-arming gate:needs-fix + gate:needs-remerge"
-              # ga-e2n96: this arm is a PURE re-merge signal — no reviewer ever
-              # rejected $SC_ID's code, the sling already gate-passed. Reusing
-              # bare gate:needs-fix for this made it indistinguishable from a
-              # real reviewer rejection to the Pilot dispatcher (and every other
-              # consumer of the label), which then dispatched a builder with a
-              # completely empty brief. gate:needs-remerge is the reconciler's
-              # OWN signal for "resubmit, nothing is broken" — set ADDITIVELY
-              # (gate:needs-fix stays too) so every existing gate:needs-fix
-              # consumer/filter keeps working unchanged; the Pilot dispatcher
-              # checks for gate:needs-remerge FIRST and resubmits/escalates
-              # instead of slinging a builder.
-              bd -C "$GC_CITY" label add "$SC_ID" "gate:needs-fix" -q 2>/dev/null || true
-              bd -C "$GC_CITY" label add "$SC_ID" "gate:needs-remerge" -q 2>/dev/null || true
-              bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed+closed, but no independent evidence the parent's own fix ($SC_ID) is merged into origin/main was found (checked branches fix/$SC_ID*, feature/$SC_ID*, and sling fix/$SLING_ID*, feature/$SLING_ID*). ga-6ync4 fix: never trust sling-passed alone. story:in-flight + pilot:dispatched cleared; gate:needs-fix + gate:needs-remerge set (ga-e2n96: needs-remerge is the distinct re-submission signal — no reviewer ever rejected this code) so Pilot resubmits the existing branch to the gate or escalates, instead of dispatching a builder with an empty brief. (If this parent's delivery is legitimately untracked, apply the delivery:untracked label — see ga-x2x63.)" 2>/dev/null || true
+              # ga-4tgga race guard: re-check for an active marker RIGHT before
+              # this mutation — the git branch-search above can take several
+              # seconds, wide enough for a fresh submission to land while it
+              # ran. Fail-safe toward NOT touching labels, per the bug's own
+              # cost asymmetry: a wrong redispatch costs a duplicate branch; a
+              # wrongly-skipped sweep costs one more reconciler pass (cheap,
+              # self-corrects next run).
+              GAP2_RECHECK_JSON=$(gap2_query_active_markers)
+              GAP2_RECHECK_HIT=$(gap2_marker_for_bead "$GAP2_RECHECK_JSON" "$SC_ID")
+              [ -z "$GAP2_RECHECK_HIT" ] && GAP2_RECHECK_HIT=$(gap2_marker_for_bead "$GAP2_RECHECK_JSON" "$SLING_ID")
+              if [ -n "$GAP2_RECHECK_HIT" ]; then
+                log "GAP-2: $SC_ID — active marker ($GAP2_RECHECK_HIT) appeared during merge-search — waiting instead of re-arming (race guard)"
+                bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed+closed; an active quality-gate-marker ($GAP2_RECHECK_HIT) for the parent's own fix appeared while this sweep was verifying merge state — treating as in-flight, not abandoned. No labels changed. (ga-4tgga)" 2>/dev/null || true
+              else
+                warn "GAP-2: $SC_ID sling $SLING_ID gate-passed+closed but parent's own fix NOT verified in origin/main (ga-6ync4 — sling-passed is a signal, not proof) — NOT closing; re-arming gate:needs-fix + gate:needs-remerge"
+                # ga-e2n96: this arm is a PURE re-merge signal — no reviewer ever
+                # rejected $SC_ID's code, the sling already gate-passed. Reusing
+                # bare gate:needs-fix for this made it indistinguishable from a
+                # real reviewer rejection to the Pilot dispatcher (and every other
+                # consumer of the label), which then dispatched a builder with a
+                # completely empty brief. gate:needs-remerge is the reconciler's
+                # OWN signal for "resubmit, nothing is broken" — set ADDITIVELY
+                # (gate:needs-fix stays too) so every existing gate:needs-fix
+                # consumer/filter keeps working unchanged; the Pilot dispatcher
+                # checks for gate:needs-remerge FIRST and resubmits/escalates
+                # instead of slinging a builder.
+                bd -C "$GC_CITY" label add "$SC_ID" "gate:needs-fix" -q 2>/dev/null || true
+                bd -C "$GC_CITY" label add "$SC_ID" "gate:needs-remerge" -q 2>/dev/null || true
+                bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed+closed, but no independent evidence the parent's own fix ($SC_ID) is merged into origin/main was found (checked branches fix/$SC_ID*, feature/$SC_ID*, and sling fix/$SLING_ID*, feature/$SLING_ID*). ga-6ync4 fix: never trust sling-passed alone. story:in-flight + pilot:dispatched cleared; gate:needs-fix + gate:needs-remerge set (ga-e2n96: needs-remerge is the distinct re-submission signal — no reviewer ever rejected this code) so Pilot resubmits the existing branch to the gate or escalates, instead of dispatching a builder with an empty brief. (If this parent's delivery is legitimately untracked, apply the delivery:untracked label — see ga-x2x63.)" 2>/dev/null || true
+              fi
               ;;
           esac
         fi

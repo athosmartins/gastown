@@ -54,6 +54,9 @@ type parse_marker_id          >/dev/null 2>&1 || { echo "FATAL: parse_marker_id 
 type classify_inflight_gap1   >/dev/null 2>&1 || { echo "FATAL: classify_inflight_gap1 not defined by guard"; exit 1; }
 type classify_parent_gap2     >/dev/null 2>&1 || { echo "FATAL: classify_parent_gap2 not defined by guard"; exit 1; }
 type session_matches_author   >/dev/null 2>&1 || { echo "FATAL: session_matches_author not defined by guard (ga-bnu1)"; exit 1; }
+type classify_gap2_bugtask_verdict >/dev/null 2>&1 || { echo "FATAL: classify_gap2_bugtask_verdict not defined by guard (ga-4tgga)"; exit 1; }
+type gap2_query_active_markers     >/dev/null 2>&1 || { echo "FATAL: gap2_query_active_markers not defined by guard (ga-4tgga)"; exit 1; }
+type gap2_marker_for_bead          >/dev/null 2>&1 || { echo "FATAL: gap2_marker_for_bead not defined by guard (ga-4tgga)"; exit 1; }
 
 # ── 0. age_minutes_of must read the bead 'Z' timestamps as UTC (not local) ───
 # Regression lock for the TZ bug that made every age negative (off by the host's
@@ -266,6 +269,67 @@ eq "sling gate:needs-fix beats sling closed"           "$(classify_parent_gap2 1
 eq "sling closed (PASS) → free PASS-stranded"          "$(classify_parent_gap2 1 0 1 0 1)"  "free:pass-stranded"
 eq "sling still active → skip"                         "$(classify_parent_gap2 1 0 1 0 0)"  "skip:active-sling"
 
+# ── 6b. classify_gap2_bugtask_verdict (ga-4tgga: active-marker wait state) ───
+# Signature: classify_gap2_bugtask_verdict <merge_verified> <has_untracked_marker> <has_active_marker>
+echo "── 6b. classify_gap2_bugtask_verdict (ga-4tgga: active-marker wait state) ──"
+eq "merge verified, no marker → close (baseline unchanged)" \
+   "$(classify_gap2_bugtask_verdict 1 0 0)" "close:merge-verified"
+eq "merge verified BEATS a co-present active marker"        \
+   "$(classify_gap2_bugtask_verdict 1 0 1)" "close:merge-verified"
+eq "untracked delivery, no marker → close (baseline unchanged)" \
+   "$(classify_gap2_bugtask_verdict 0 1 0)" "close:untracked-delivery"
+eq "untracked delivery BEATS a co-present active marker"    \
+   "$(classify_gap2_bugtask_verdict 0 1 1)" "close:untracked-delivery"
+
+# FIXTURE (ga-4tgga acceptance criterion 1): sling closed, fix not (yet)
+# verified in main, AND an active marker is processing it → wait, don't touch.
+GAP4TGGA_FIXTURE="$(classify_gap2_bugtask_verdict 0 0 1)"
+eq "FIXTURE: not verified + ACTIVE marker → wait (no label mutation upstream)" \
+   "$GAP4TGGA_FIXTURE" "wait:active-marker"
+
+# CONTROL (ga-4tgga acceptance criterion 2): same, but NO active marker → must
+# keep reconciling exactly as today (ga-6ync4's value not lost — this is the
+# real-orphan case, ga-sb11i.2 / ga-46wq5).
+GAP4TGGA_CONTROL="$(classify_gap2_bugtask_verdict 0 0 0)"
+eq "CONTROL: not verified + no active marker → keep (today's behavior, unchanged)" \
+   "$GAP4TGGA_CONTROL" "keep:merge-not-verified"
+
+# CONTROL 3 (ga-4tgga acceptance criterion 3): FIXTURE and CONTROL MUST differ
+# — this distinction is the entire point of the bug.
+if [ "$GAP4TGGA_FIXTURE" != "$GAP4TGGA_CONTROL" ]; then
+  ok "CONTROL 3: FIXTURE ([$GAP4TGGA_FIXTURE]) and CONTROL ([$GAP4TGGA_CONTROL]) verdicts differ"
+else
+  bad "CONTROL 3: FIXTURE and CONTROL produced the SAME verdict [$GAP4TGGA_FIXTURE] — the bug is not actually fixed"
+fi
+
+eq "has_active_marker omitted (2-arg back-compat call) → same as 0" \
+   "$(classify_gap2_bugtask_verdict 0 0)" "keep:merge-not-verified"
+
+# ── 6c. gap2_marker_for_bead (ga-4tgga: label + description dual-signal match) ──
+# Signature: gap2_marker_for_bead <active_markers_json> <bead_id>
+echo "── 6c. gap2_marker_for_bead (label + description dual-signal match) ──"
+
+GAP2_MARKERS_FIXTURE='[
+  {"id":"ga-wisp-aaa","labels":["type:quality-gate-marker","gate-status:queued","source-bead:ga-ffop9"],"description":"branch: fix/ga-ffop9\nbead_id: ga-ffop9\nauthor: gastown.dog-1"},
+  {"id":"ga-wisp-bbb","labels":["type:quality-gate-marker","gate-status:ready"],"description":"branch: fix/ga-xvxvf\nbead_id: ga-xvxvf\nauthor: gastown.dog-2"},
+  {"id":"ga-wisp-ccc","labels":["type:quality-gate-marker","gate-status:claimed","source-bead:ga-cjk1j"],"description":"branch: fix/ga-cjk1j-extra\nauthor: mayor"}
+]'
+
+eq "matches via source-bead: LABEL (marker already claimed+parked)" \
+   "$(gap2_marker_for_bead "$GAP2_MARKERS_FIXTURE" "ga-ffop9")" "ga-wisp-aaa queued"
+eq "matches via bead_id: DESCRIPTION line (marker still bare gate-status:ready, no label yet)" \
+   "$(gap2_marker_for_bead "$GAP2_MARKERS_FIXTURE" "ga-xvxvf")" "ga-wisp-bbb ready"
+eq "matches via source-bead: LABEL even when description carries a DIFFERENT id (sling-vs-parent naming)" \
+   "$(gap2_marker_for_bead "$GAP2_MARKERS_FIXTURE" "ga-cjk1j")" "ga-wisp-ccc claimed"
+eq "no match for an unrelated bead id" \
+   "$(gap2_marker_for_bead "$GAP2_MARKERS_FIXTURE" "ga-e2n96")" ""
+eq "substring is NOT a match (ga-ffop9 must not match a ga-ffop9x marker)" \
+   "$(gap2_marker_for_bead '[{"id":"ga-wisp-ddd","labels":[],"description":"bead_id: ga-ffop9x"}]' "ga-ffop9")" ""
+eq "empty markers list → no match" \
+   "$(gap2_marker_for_bead '[]' "ga-ffop9")" ""
+eq "empty bead id → no match (fail-safe)" \
+   "$(gap2_marker_for_bead "$GAP2_MARKERS_FIXTURE" "")" ""
+
 # ── 7. drift-guard: guard implements both GAP-1 and GAP-2 sweeps ──────────────
 echo "── 7. drift-guard: guard implements ga-pa36 GAP-1 + GAP-2 sweeps ──"
 grep -q 'classify_inflight_gap1()'  "$GUARD" && ok "guard defines classify_inflight_gap1"  || bad "guard missing classify_inflight_gap1 def"
@@ -296,6 +360,17 @@ grep -q 'gate:needs-remerge'        "$GUARD" && ok "guard sets gate:needs-remerg
 ! grep -q '| contains(\.' "$GUARD" \
   && ok "live-builder checks use exact match (no substring contains)" \
   || bad "live-builder check still uses substring contains — must use exact match"
+
+# ga-4tgga: GAP-2's bug/task branch must consult an ACTIVE gate marker before
+# concluding the parent's fix is abandoned, and must re-check right before the
+# risky mutation (race guard) — not just once, up front.
+grep -q 'gap2_query_active_markers()' "$GUARD" && ok "guard defines gap2_query_active_markers (ga-4tgga)" || bad "guard missing gap2_query_active_markers def"
+grep -q 'gap2_marker_for_bead()'      "$GUARD" && ok "guard defines gap2_marker_for_bead (ga-4tgga)"      || bad "guard missing gap2_marker_for_bead def"
+grep -q 'wait:active-marker'          "$GUARD" && ok "guard handles wait:active-marker verdict (ga-4tgga)" || bad "guard missing wait:active-marker handler"
+[ "$(grep -c 'gap2_marker_for_bead "' "$GUARD")" -ge 4 ] \
+  && ok "Step 0c.2 calls gap2_marker_for_bead at both the pre-search check and the pre-mutation race guard (>=4 call sites)" \
+  || bad "expected >=4 gap2_marker_for_bead call sites (pre-search + race-guard, x2 ids each) — the race guard may have been dropped"
+grep -q 'race guard' "$GUARD" && ok "guard documents the ga-4tgga race-guard re-check before arming gate:needs-fix" || bad "guard missing the race-guard re-check before arming gate:needs-fix"
 
 echo ""
 # ── 7b. session_matches_author (ga-bnu1: GAP-1/GAP-2 false-dead liveness) ────
