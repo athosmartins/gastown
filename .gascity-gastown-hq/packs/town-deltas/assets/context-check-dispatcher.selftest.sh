@@ -495,7 +495,7 @@ if [ "$cmd" = "list" ]; then
   while [ $# -gt 0 ]; do case "$1" in --type) want="$2"; shift 2;; *) shift;; esac; done
   if [ "$want" = "task" ]; then
     cat <<'JSON'
-[{"id":"ga-manual1","issue_type":"task","title":"experimentar phone-as-Claro-mobile-proxy","description":"Plugar o celular físico como proxy móvel da Claro e medir a latência. Critério de aceitação: a chamada de teste retorna 200 e o IP observado é o da operadora. Passos: ligar o aparelho, conectar manualmente, rodar o probe.","labels":[],"ephemeral":false,"created_at":"2026-01-01T00:00:00Z"},{"id":"ga-auto1","issue_type":"task","title":"Verificar saúde do token PDPJ","description":"Fazer health-check do token PDPJ via API e reportar o status. Critério de aceitação: o script retorna o expected output {status:ok} e grava em scripts/pdpj-health.sh o resultado. Comando: bd list para confirmar.","labels":[],"ephemeral":false,"created_at":"2026-01-02T00:00:00Z"},{"id":"ga-thin1","issue_type":"task","title":"arrumar","description":"x","labels":[],"ephemeral":false,"created_at":"2026-01-03T00:00:00Z"},{"id":"ga-ctxrescue1","issue_type":"task","title":"corrigir latência do endpoint de health-check","description":"","labels":[],"ephemeral":false,"created_at":"2026-01-04T00:00:00Z","comment_count":2},{"id":"ga-stillthin2","issue_type":"task","title":"revisar item pendente","description":"","labels":[],"ephemeral":false,"created_at":"2026-01-05T00:00:00Z","comment_count":1}]
+[{"id":"ga-manual1","issue_type":"task","title":"experimentar phone-as-Claro-mobile-proxy","description":"Plugar o celular físico como proxy móvel da Claro e medir a latência. Critério de aceitação: a chamada de teste retorna 200 e o IP observado é o da operadora. Passos: ligar o aparelho, conectar manualmente, rodar o probe.","labels":[],"ephemeral":false,"created_at":"2026-01-01T00:00:00Z"},{"id":"ga-auto1","issue_type":"task","title":"Verificar saúde do token PDPJ","description":"Fazer health-check do token PDPJ via API e reportar o status. Critério de aceitação: o script retorna o expected output {status:ok} e grava em scripts/pdpj-health.sh o resultado. Comando: bd list para confirmar.","labels":[],"ephemeral":false,"created_at":"2026-01-02T00:00:00Z"},{"id":"ga-thin1","issue_type":"task","title":"arrumar","description":"x","labels":[],"ephemeral":false,"created_at":"2026-01-03T00:00:00Z"},{"id":"ga-commentsfail1","issue_type":"task","title":"revisar outro item pendente","description":"","labels":[],"ephemeral":false,"created_at":"2026-01-03T12:00:00Z","comment_count":1},{"id":"ga-ctxrescue1","issue_type":"task","title":"corrigir latência do endpoint de health-check","description":"","labels":[],"ephemeral":false,"created_at":"2026-01-04T00:00:00Z","comment_count":2},{"id":"ga-stillthin2","issue_type":"task","title":"revisar item pendente","description":"","labels":[],"ephemeral":false,"created_at":"2026-01-05T00:00:00Z","comment_count":1}]
 JSON
   else
     echo "[]"
@@ -508,6 +508,14 @@ fi
 if [ "$cmd" = "comments" ]; then
   id="$1"
   case "$id" in
+    ga-commentsfail1)
+      # ga-o9uvc fix-attempt 3: simulate a real `bd comments` failure (Dolt
+      # hiccup/timeout) — nonzero exit, no JSON on stdout. Must NOT be
+      # collapsed into "0 comments"; the candidate should be skipped this
+      # sweep instead of judged on incomplete context.
+      echo "error: connection refused" >&2
+      exit 1
+      ;;
     ga-ctxrescue1)
       cat <<'JSON2'
 [{"text":"Context-check: marcado ctx:thin — falta contexto para um agente genérico construir sem um humano."},{"text":"Reported by mayor 2026-07-09: root cause confirmed via scripts/diagnose.sh — the health-check was hitting a stale cache. Acceptance criteria: the script returns exit 0 and the expected output is status ok after the fix lands."}]
@@ -583,6 +591,29 @@ if echo "$_eled" | grep -qE 'label add ga-stillthin2 ctx:thin'; then
   ok "e2e: only-the-daemon's-own-gap-comment present → stays ctx:thin (no circular self-rescue)"
 else
   bad "e2e REGRESSION: daemon's own gap-comment was read back as rescuing context for ga-stillthin2 (ledger: $(echo "$_eled" | tr '\n' ';'))"
+fi
+# ga-commentsfail1 (ga-o9uvc fix-attempt 3): comment_count>0 but the `bd
+# comments` fetch itself fails (nonzero exit, no JSON). Must be SKIPPED this
+# sweep — no ctx:ready, no ctx:thin — never judged on incomplete context.
+# This is the exact gap that survived fix-attempt 2 (a blanket `|| true`
+# collapsed "fetch failed" into "0 comments", producing an identical thin
+# verdict as a genuinely-empty bead — gate-FAILED on this precise point).
+if echo "$_eled" | grep -qE 'label add ga-commentsfail1 ctx:(ready|thin)'; then
+  bad "e2e REGRESSION: ga-commentsfail1 got a verdict despite its comments fetch failing (should be skipped, not judged on incomplete context) (ledger: $(echo "$_eled" | tr '\n' ';'))"
+else
+  ok "e2e: comments-fetch failure → candidate skipped this sweep, no verdict on incomplete context"
+fi
+# The failure must be visible (not silently absorbed) and, critically, must
+# NOT abort the rest of the sweep — the ga-ctxrescue1/ga-stillthin2 checks
+# above already prove later candidates still got judged (they sort AFTER
+# ga-commentsfail1 by created_at), which is the direct regression test for
+# fix-attempt 1's original bug (an unguarded fetch failure killing the whole
+# sweep under set -euo pipefail).
+_eclog="$_ecity/.gc/logs/context-check-dispatcher.log"
+if [ -f "$_eclog" ] && grep -q "ga-commentsfail1: comments fetch failed" "$_eclog"; then
+  ok "e2e: comments-fetch failure is logged distinctly (not silently absorbed into '0 comments')"
+else
+  bad "e2e: no distinct log line for ga-commentsfail1's comments-fetch failure (log: $([ -f "$_eclog" ] && cat "$_eclog" || echo '<missing>'))"
 fi
 # Feature-gate OFF: CONTEXT_CHECK_EXEC_CLASS=0 → ctx:ready still written, NO exec label.
 LEDGER="$_ecity/ledger2.txt"; export LEDGER; : > "$LEDGER"

@@ -807,14 +807,26 @@ while IFS= read -r row; do
   case "$c_comment_count" in ''|*[!0-9]*) c_comment_count=0 ;; esac
   c_comments_text=""
   if [ "$c_comment_count" -gt 0 ] 2>/dev/null; then
-    # || true: matches every other bd_ call in this loop (see CC_BUILT_IDS/
-    # CC_BLOCKED_IDS above, and the label/comment writes below). Without it,
-    # a transient bd failure (Dolt hiccup, timeout, or the bead closing
-    # between the batch `bd list` snapshot and this iteration) assigns a
-    # non-zero exit to this plain (non-local) variable under set -euo
-    # pipefail and aborts the ENTIRE sweep, not just this candidate
-    # (gate-reviewed FAIL on fix-attempt 1, ga-o9uvc).
-    c_comments_json=$(bd_ comments "$c_id" --json 2>/dev/null || true)
+    # Explicit exit-status check, NOT `|| true` (gate-FAILED fix-attempt 2,
+    # ga-o9uvc): `|| true` swallows a transient bd failure into an empty
+    # c_comments_json, and context_check_join_comments("") falls to the same
+    # empty-string path a bead with GENUINELY zero comments takes — "fetch
+    # failed" and "no comments exist" become indistinguishable, reproducing
+    # the exact erro-vs-vazio collapse this whole fix exists to close, one
+    # level deeper. A bead whose row reports comment_count>0 (a comment
+    # really exists) must not be thin-flagged on incomplete context because a
+    # read transiently failed. Mirror the "Sonnet budget spent this sweep"
+    # skip further down in this same loop: skip this candidate for THIS
+    # sweep only — no label, no verdict, re-judged with complete context
+    # once the fetch succeeds. The
+    # `if !` form (not a bare command under set -e) is itself the fix for
+    # fix-attempt 1's original crash: a command inside an `if` condition is
+    # exempt from set -e's abort-on-nonzero, so this is both crash-safe AND,
+    # unlike `|| true`, still lets us tell success from failure.
+    if ! c_comments_json=$(bd_ comments "$c_id" --json 2>/dev/null); then
+      log "  $c_id: comments fetch failed (comment_count=$c_comment_count) — skipped this sweep rather than judged on incomplete context (re-tried next sweep)."
+      continue
+    fi
     c_comments_text=$(context_check_join_comments "$c_comments_json")
   fi
   c_ctxtext=$(context_check_effective_text "$c_desc" "$c_comments_text")
