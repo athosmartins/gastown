@@ -273,6 +273,62 @@ grep -q 'gate:needs-human:partial-delivery)' "$GUARD" \
   && ok "guard has a dedicated case arm for gate:needs-human:partial-delivery" \
   || bad "guard missing dedicated partial-delivery case arm"
 
+# ── 9. ga-6qbgy: PARK_REASON cites the EXACT label(s) that matched, not the ──
+#      bare prefix name. Real incident: a marker parked citing bare
+#      "gate:needs-human" while the label actually present was
+#      "gate:needs-human:technical" — an operator who removed only the bare
+#      label (the only name the message ever gave them) verified a clean
+#      list BY EXACT NAME and declared the veto cleared, while the sibling
+#      variant kept parking every resubmission (wa-vcd01, 2026-08-06).
+echo "── 9. ga-6qbgy: matching_veto_labels cites exact label(s), not bare prefix ──"
+
+type matching_veto_labels >/dev/null 2>&1 \
+  || { echo "FATAL: matching_veto_labels not defined by guard (ga-6qbgy fix missing?)"; exit 1; }
+
+eq "bare label only → echoes the bare label" \
+  "$(matching_veto_labels 'gate:needs-human gate:needs-fix' 'gate:needs-human')" \
+  "gate:needs-human"
+
+eq "bare + :technical both present → echoes BOTH, not just the bare prefix" \
+  "$(matching_veto_labels 'gate:needs-human gate:needs-human:technical' 'gate:needs-human')" \
+  "gate:needs-human gate:needs-human:technical"
+
+eq "sub-reason only (no bare co-tag) → echoes the sub-reason variant" \
+  "$(matching_veto_labels 'gate:needs-human:refused' 'gate:needs-human')" \
+  "gate:needs-human:refused"
+
+eq "unrelated labels are excluded" \
+  "$(matching_veto_labels 'lane:small gate:needs-human:diverging pilot:dispatched' 'gate:needs-human')" \
+  "gate:needs-human:diverging"
+
+eq "no match → empty" \
+  "$(matching_veto_labels 'gate:needs-fix lane:small' 'gate:needs-human')" \
+  ""
+
+eq "does not false-match a different label that merely shares the prefix as a substring" \
+  "$(matching_veto_labels 'gate:needs-human-ish' 'gate:needs-human')" \
+  ""
+
+# CONTROL — reproduce the pre-fix bug shape directly: a check that only ever
+# names the bare prefix cannot distinguish "bare only" from "bare + sibling
+# variant present". This is the exact test the bug report calls for: one
+# that FAILS if collapsed back to bare-prefix-only reporting.
+BARE_ONLY_REPORT="gate:needs-human"
+ACTUAL_MATCH=$(matching_veto_labels 'gate:needs-human gate:needs-human:technical' 'gate:needs-human')
+if [ "$ACTUAL_MATCH" != "$BARE_ONLY_REPORT" ]; then
+  ok "control: exact-match output DIFFERS from bare-prefix-only reporting (the bug is fixed)"
+else
+  bad "control: output collapsed to bare prefix — ga-6qbgy regression (sibling variant would be invisible again)"
+fi
+
+echo "── 9b. drift-guard: Step 5a's PARK_REASON construction actually USES matching_veto_labels ──"
+grep -q 'MATCHED_VETO_LABELS=\$(matching_veto_labels "\$SRC_LABELS_PARK" "gate:needs-human")' "$GUARD" \
+  && ok "Step 5a wires matching_veto_labels into the needs-human PARK_REASON" \
+  || bad "Step 5a does not call matching_veto_labels for needs-human — would regress to bare-prefix text"
+grep -q 'MATCHED_VETO_LABELS=\$(matching_veto_labels "\$SRC_LABELS_PARK" "story:needs-approval")' "$GUARD" \
+  && ok "Step 5a wires matching_veto_labels into the needs-approval PARK_REASON" \
+  || bad "Step 5a does not call matching_veto_labels for needs-approval"
+
 echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"

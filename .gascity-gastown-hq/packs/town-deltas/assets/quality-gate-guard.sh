@@ -556,6 +556,39 @@ check_source_bead_park() {
   echo "ok"
 }
 
+# matching_veto_labels <space_sep_labels> <prefix> — ga-6qbgy.
+# Echoes the space-joined subset of <labels> that equal <prefix> exactly OR
+# start with "<prefix>:" (the same bare-or-colon-suffixed rule
+# check_source_bead_park() above uses to PARK — kept in sync by inspection,
+# same idiom as resolve_author_agent_alias's deny-list comment below).
+#
+# WHY THIS EXISTS: check_source_bead_park() above deliberately collapses
+# gate:needs-human, gate:needs-human:technical, gate:needs-human:refused,
+# etc. into one generic "park:needs-human" token — correct for the yes/no
+# park decision, but the caller then had no way to say WHICH label actually
+# fired. It hardcoded the bare prefix name in the park message instead
+# ("carries gate:needs-human"). `bd label remove` only removes an EXACT
+# name, so an operator who reads that message, removes the bare
+# gate:needs-human label, and re-checks BY EXACT NAME sees a clean list and
+# declares the veto cleared — while gate:needs-human:technical (a label
+# they never saw named) silently keeps parking every resubmission. Real
+# incident: wa-vcd01, 2026-08-06 — ~4h of blocked crew work plus a dead
+# marker requiring manual resubmission, because the verification the
+# operator ran was incapable of detecting the state it was checking for.
+# This function lets a caller cite the label(s) that ACTUALLY matched
+# instead of the prefix family name, so the message people act on is never
+# less specific than the guard's own decision.
+matching_veto_labels() {
+  local labels="$1" prefix="$2" lbl out=""
+  for lbl in $labels; do
+    case "$lbl" in
+      "$prefix"|"$prefix":*)
+        out="${out:+$out }$lbl" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 # resolve_author_agent_alias <author> — ga-pyzo. Best-effort maps a
 # session_name-form AUTHOR (<agent>-<sessionid>, e.g. batista-wa-gawispiwq9sj)
 # to its durable agent alias (e.g. batista-wa) via a live `gc session list`
@@ -2317,9 +2350,17 @@ if [ -n "$BEAD_RAW" ]; then
     2>/dev/null || echo "")
   PARK_ACTION=$(check_source_bead_park "$SRC_LABELS_PARK")
   if [ "$PARK_ACTION" != "ok" ]; then
+    # ga-6qbgy: cite the label(s) that ACTUALLY matched, not the bare prefix
+    # name — see matching_veto_labels() above for why. Falls back to the old
+    # bare-name text only if extraction somehow comes up empty (defensive;
+    # should be unreachable since PARK_ACTION already proved a match exists).
     case "$PARK_ACTION" in
-      park:needs-approval) PARK_REASON="source bead $BEAD_ID carries story:needs-approval (not yet product-approved)" ;;
-      park:needs-human)    PARK_REASON="source bead $BEAD_ID carries gate:needs-human (circuit-broken — human intervention required)" ;;
+      park:needs-approval)
+        MATCHED_VETO_LABELS=$(matching_veto_labels "$SRC_LABELS_PARK" "story:needs-approval")
+        PARK_REASON="source bead $BEAD_ID carries ${MATCHED_VETO_LABELS:-story:needs-approval} (not yet product-approved)" ;;
+      park:needs-human)
+        MATCHED_VETO_LABELS=$(matching_veto_labels "$SRC_LABELS_PARK" "gate:needs-human")
+        PARK_REASON="source bead $BEAD_ID carries ${MATCHED_VETO_LABELS:-gate:needs-human} (circuit-broken — human intervention required)" ;;
       *)                   PARK_REASON="source bead $BEAD_ID is not eligible for gate review ($PARK_ACTION)" ;;
     esac
     warn "Step 5a: parking marker $MARKER_ID — $PARK_REASON"
@@ -2344,8 +2385,8 @@ To re-enter the gate: resolve the blocking condition on $BEAD_ID (get it approve
     # (compaction, crash, different agent) — same rationale as ga-u4yi's
     # AUTHOR mail at the dispatcher's gate:needs-human transition sites.
     case "$PARK_ACTION" in
-      park:needs-approval) UNBLOCK_HINT="Get $BEAD_ID product-approved (clear story:needs-approval)" ;;
-      park:needs-human)    UNBLOCK_HINT="Get a human/Mayor to resolve the gate:needs-human circuit-break on $BEAD_ID" ;;
+      park:needs-approval) UNBLOCK_HINT="Get $BEAD_ID product-approved (clear ${MATCHED_VETO_LABELS:-story:needs-approval})" ;;
+      park:needs-human)    UNBLOCK_HINT="Get a human/Mayor to resolve the gate:needs-human circuit-break on $BEAD_ID — clear ALL of: ${MATCHED_VETO_LABELS:-gate:needs-human} (bd label remove only takes exact names, so removing just the bare label can leave a sibling variant live and parking silently; scripts/gate-unhold.sh $BEAD_ID gate:needs-human clears every variant in one verified operation — ga-6qbgy)" ;;
       *)                   UNBLOCK_HINT="Resolve the blocking condition on $BEAD_ID" ;;
     esac
     # ga-409f4: NOTIFY_AUTHOR (branch-author-aware), not the bead-derived $AUTHOR.
