@@ -59,8 +59,9 @@ LATENCY_WARN_S="${GC_DOCTOR_LATENCY_WARN_S:-5}"
 # needed to be believed. Resolved from the live server in Step 2 below
 # (SELECT @@max_connections — the same variable used to measure the real cap
 # by hand while diagnosing this bug); only an explicit GC_DOCTOR_CONN_MAX
-# override skips that query. If neither is available, the connection check is
-# SKIPPED — never a second guessed literal standing in for the first.
+# override skips that query. If neither is available, CONN_COUNT is still
+# reported but no WARN is ever emitted for it (displayed as "N/unknown", see
+# CONN_MAX_DISPLAY) — never a second guessed literal standing in for the first.
 CONN_MAX="${GC_DOCTOR_CONN_MAX:-}"
 CONN_WARN_PCT="${GC_DOCTOR_CONN_WARN_PCT:-80}"
 BACKUP_STALE_S="${GC_DOCTOR_BACKUP_STALE_S:-108000}"  # 30h: this city's backup runs once/day at 04:00 (dolt-s3-backup.sh), not every 6h — see override comment above (ga-3wdlv)
