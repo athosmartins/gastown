@@ -341,5 +341,104 @@ else
 fi
 rm -f "$DEACON_FN_SNIPPET"
 
+# ── ga-ood0l: CONN_MAX must come from the live server, not a hardcoded guess ──
+# ── (last value: 50, silently drifted from this town's real 256 for months, ───
+# ── producing a false WARN at 16% of the real cap and — far worse — a
+# ── numerically absurd "410% of max 50" right when a real near-exhaustion
+# ── needed to be believed instead of dismissed as a monitor bug).
+echo "── connection-cap resolution (ga-ood0l) ──"
+
+if grep -qF 'CONN_MAX="${GC_DOCTOR_CONN_MAX:-}"' "$SCRIPT"; then
+  ok "CONN_MAX has no hardcoded numeric default — only the explicit GC_DOCTOR_CONN_MAX override"
+else
+  bad "CONN_MAX default changed shape — verify by hand it still carries no numeric literal fallback"
+fi
+
+if grep -qF 'SELECT @@max_connections' "$SCRIPT"; then
+  ok "CONN_MAX is resolved from the live server's own @@max_connections when no override is set"
+else
+  bad "no live @@max_connections query found — CONN_MAX can no longer learn the real cap"
+fi
+
+# ── real arithmetic, not hand-copied: extract conn_should_warn()'s ACTUAL ─────
+# ── source from the shipped script and source just that function — pure, no ──
+# ── GC_CITY_PATH/live-Dolt dependency, same rationale as deacon_nudge_allowed.
+CONN_FN_SNIPPET="$(mktemp)"
+sed -n '/^conn_should_warn()/,/^}/p' "$SCRIPT" > "$CONN_FN_SNIPPET"
+if [ -s "$CONN_FN_SNIPPET" ]; then
+  # shellcheck disable=SC1090
+  source "$CONN_FN_SNIPPET"
+  if command -v conn_should_warn >/dev/null 2>&1; then
+    # Falsifying check: the EXACT reported false positive (42 connections,
+    # real cap 256) must NOT warn against the real cap.
+    if conn_should_warn 42 256 80; then
+      bad "42 connections against the real cap (256) STILL warns — bug not fixed"
+    else
+      ok "42 connections against the real cap (256) does not warn"
+    fi
+
+    # Sanity: the SAME 42 DOES warn against the OLD hardcoded 50 — confirms
+    # this reproduces the real bug, not a vacuous comparison.
+    if conn_should_warn 42 50 80; then
+      ok "sanity: 42 connections DOES warn against the old hardcoded cap (50) — confirms this reproduces the real bug"
+    else
+      bad "sanity check failed: 42 against 50 does not warn — the reproduction itself is wrong"
+    fi
+
+    # A genuine near-exhaustion against the real cap must still alarm — the
+    # fix must not go deaf right when it matters (explicit ga-ood0l AC).
+    if conn_should_warn 205 256 80; then
+      ok "205/256 connections (>=80% of the real cap) still warns — real exhaustion is still caught"
+    else
+      bad "205/256 connections does NOT warn — fix over-corrected into silence at the real cap"
+    fi
+
+    # AC: "teste com teto injetado != 50 (ex. 256 e 1000)" — a second, larger
+    # cap the old hardcoded 50 never exercised, so this can't pass by accident.
+    if conn_should_warn 799 1000 80; then
+      bad "799/1000 connections (<80%) incorrectly warns against an injected max=1000"
+    else
+      ok "799/1000 connections (<80% of an injected max=1000) does not warn"
+    fi
+    if conn_should_warn 801 1000 80; then
+      ok "801/1000 connections (>=80% of an injected max=1000) warns"
+    else
+      bad "801/1000 connections (>=80% of an injected max=1000) does NOT warn"
+    fi
+
+    # An unmeasured cap (empty/non-numeric — the live query failed or
+    # returned garbage) must never warn: a guessed cap presented as measured
+    # is the bug being fixed, not an acceptable fallback (explicit ga-ood0l
+    # AC: "nenhum default numérico novo entra no caminho do aviso").
+    if conn_should_warn 999 "" 80; then
+      bad "an empty (unmeasured) cap still warns — a silent numeric fallback is back"
+    else
+      ok "an empty (unmeasured) cap never warns — no silent numeric fallback"
+    fi
+    if conn_should_warn 999 "notanumber" 80; then
+      bad "a non-numeric cap still warns — invalid input is not being rejected"
+    else
+      ok "a non-numeric cap never warns — invalid input is rejected, not coerced"
+    fi
+  else
+    bad "conn_should_warn() extracted but not callable after sourcing — extraction produced invalid bash"
+  fi
+else
+  bad "could not extract conn_should_warn() source from $SCRIPT — sed range matched nothing"
+fi
+rm -f "$CONN_FN_SNIPPET"
+
+# ── drift-guard: the report/summary lines must cite the ACTUAL resolved cap ───
+# ── (CONN_MAX_DISPLAY), not the raw CONN_MAX — which is allowed to be empty ───
+# ── when unmeasured, so printing it raw would silently render "N/" instead of
+# ── "N/unknown".
+if grep -qF 'CONN_MAX_DISPLAY="${CONN_MAX:-unknown}"' "$SCRIPT" \
+    && grep -qF 'Connections: ${CONN_COUNT}/${CONN_MAX_DISPLAY}${CONN_WARN}' "$SCRIPT" \
+    && grep -qF 'conns: ${CONN_COUNT}/${CONN_MAX_DISPLAY}' "$SCRIPT"; then
+  ok "report and summary lines render an unmeasured cap as 'unknown', not a blank"
+else
+  bad "report/summary lines may print a blank instead of 'unknown' for an unmeasured cap — check CONN_MAX_DISPLAY usage"
+fi
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

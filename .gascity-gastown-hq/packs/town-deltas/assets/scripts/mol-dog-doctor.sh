@@ -51,7 +51,17 @@ USER="${GC_DOLT_USER:-root}"
 # via latency.sh logo abaixo — mol-dog-doctor.selftest.sh fixa as duas
 # garantias para que essa classe de regressão pare de voltar sem detector.
 LATENCY_WARN_S="${GC_DOCTOR_LATENCY_WARN_S:-5}"
-CONN_MAX="${GC_DOCTOR_CONN_MAX:-50}"
+# ga-ood0l: CONN_MAX has no hardcoded numeric default anymore. The old literal
+# (50) drifted from this town's real max_connections (256, set outside this
+# script by the city's server-start tooling) and stayed wrong for months —
+# false WARN at healthy usage (42 connections = 16% of the real cap), and,
+# worse, a numerically absurd "410% of max 50" right when a real exhaustion
+# needed to be believed. Resolved from the live server in Step 2 below
+# (SELECT @@max_connections — the same variable used to measure the real cap
+# by hand while diagnosing this bug); only an explicit GC_DOCTOR_CONN_MAX
+# override skips that query. If neither is available, the connection check is
+# SKIPPED — never a second guessed literal standing in for the first.
+CONN_MAX="${GC_DOCTOR_CONN_MAX:-}"
 CONN_WARN_PCT="${GC_DOCTOR_CONN_WARN_PCT:-80}"
 BACKUP_STALE_S="${GC_DOCTOR_BACKUP_STALE_S:-108000}"  # 30h: this city's backup runs once/day at 04:00 (dolt-s3-backup.sh), not every 6h — see override comment above (ga-3wdlv)
 BACKUP_ARTIFACT_DIR="${GC_BACKUP_ARTIFACT_DIR:-$GC_CITY_PATH/.dolt-backup}"
@@ -156,6 +166,22 @@ nudge_deacon_done() {
     gc session nudge deacon/ "$message" 2>/dev/null || true
 }
 
+# conn_should_warn <count> <max> <warn_pct> — pure predicate: true (0) once
+# connection usage has crossed warn_pct of max. Isolated so a test can inject
+# max values the old hardcoded 50 never exercised (e.g. 256, 1000) — a test
+# that only ever checks max=50 can't tell "reads the live cap" from "silently
+# stayed hardcoded" (ga-ood0l). An empty/non-numeric max means "unmeasured":
+# never warn on a cap we don't actually know — a guessed cap presented as
+# measured is the bug this replaces, not a safe fallback.
+conn_should_warn() {
+    local count="$1" max="$2" warn_pct="$3"
+    case "$max" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    local warn_at=$(( (max * warn_pct) / 100 ))
+    [ "${count:-0}" -ge "$warn_at" ]
+}
+
 # --- Step 1: Probe connectivity and measure latency ---
 
 PROBE_START_MS=$(now_ms)
@@ -181,11 +207,18 @@ fi
 
 # --- Step 2: Check resource conditions ---
 
+if [ -z "$CONN_MAX" ]; then
+    CONN_MAX=$(dolt_sql -r csv -q "SELECT @@max_connections" 2>/dev/null | tail -1 || true)
+    case "$CONN_MAX" in
+        ''|*[!0-9]*) CONN_MAX="" ;;
+    esac
+fi
+CONN_MAX_DISPLAY="${CONN_MAX:-unknown}"
+
 CONN_COUNT=$(dolt_sql -r csv -q "SELECT COUNT(*) FROM information_schema.PROCESSLIST" 2>/dev/null \
     | tail -1 || echo "0")
 CONN_WARN=""
-CONN_WARN_AT=$(( (CONN_MAX * CONN_WARN_PCT) / 100 ))
-if [ "${CONN_COUNT:-0}" -ge "$CONN_WARN_AT" ]; then
+if conn_should_warn "$CONN_COUNT" "$CONN_MAX" "$CONN_WARN_PCT"; then
     CONN_WARN=" [WARN: ${CONN_COUNT} connections >= ${CONN_WARN_PCT}% of max ${CONN_MAX}]"
 fi
 
@@ -250,13 +283,13 @@ if [ -n "$WARNINGS" ]; then
     if ! send_mayor_mail \
         -s "Dolt health advisory [MEDIUM]" \
         -m "Latency: ${LATENCY_MS}ms${LATENCY_WARN}
-Connections: ${CONN_COUNT}/${CONN_MAX}${CONN_WARN}
+Connections: ${CONN_COUNT}/${CONN_MAX_DISPLAY}${CONN_WARN}
 Disk: ${DISK_USAGE}
 Orphan DBs: ${ORPHAN_COUNT}${ORPHAN_WARN}${BACKUP_STALE}"; then
         :
     fi
 fi
 
-SUMMARY="doctor — server: ok, latency: ${LATENCY_MS}ms, conns: ${CONN_COUNT}/${CONN_MAX}, disk: ${DISK_USAGE}, orphans: ${ORPHAN_COUNT}"
+SUMMARY="doctor — server: ok, latency: ${LATENCY_MS}ms, conns: ${CONN_COUNT}/${CONN_MAX_DISPLAY}, disk: ${DISK_USAGE}, orphans: ${ORPHAN_COUNT}"
 nudge_deacon_done "DOG_DONE: $SUMMARY"
 echo "doctor: $SUMMARY"
