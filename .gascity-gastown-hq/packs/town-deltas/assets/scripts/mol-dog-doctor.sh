@@ -119,6 +119,43 @@ send_mayor_mail() {
     fi
 }
 
+# ── PURE decision logic — is it safe to nudge the deacon? (ga-clgc2) ──
+# Nudging a suspended agent queues forever: the recipient never wakes to
+# consume it, and every `gc nudge poll` iteration reloads the ENTIRE queue
+# state regardless of size — 379 such DOG_DONE nudges to a 20-day-asleep,
+# suspended deacon dominated Dolt poll load (48-58% of total load across 3
+# measurements — see ga-clgc2). deacon's `suspended` flag (city.toml) is the
+# same authoritative signal `gc agent list`/`gc agent suspend` already read
+# and write. Fail-CLOSED by construction: only the literal string "false"
+# allows the nudge — empty/unknown/garbage input (lookup failure, deacon not
+# found) is treated as suspended and skipped, never guessed-open. This lives
+# in the pure function itself (not just the caller's fallback) so the safety
+# invariant holds regardless of how deacon_nudge_allowed() gets called.
+# Unit-tested by mol-dog-doctor.selftest.sh.
+deacon_nudge_allowed() {
+    local suspended_flag="$1"
+    [ "$suspended_flag" = "false" ]
+}
+
+# nudge_deacon_done <message> — best-effort DOG_DONE status ping, sent ONLY
+# when deacon can actually consume it. `gc agent list --json` is a static
+# city.toml read (no Dolt round-trip, ~0.1-0.2s) — cheap enough for every dog
+# run. Any lookup failure (gc/jq error, deacon not found) fails CLOSED
+# (treated as suspended, nudge skipped) — the same "when in doubt, don't
+# queue forever" bias as the rest of this fix. Skip is logged to stderr:
+# visible, not the old `2>/dev/null || true` silent swallow (ga-clgc2 AC2).
+nudge_deacon_done() {
+    local message="$1" suspended
+    suspended=$(gc agent list --json 2>/dev/null \
+        | jq -r '.agents[]? | select(.qualified_name=="gastown.deacon") | .suspended' 2>/dev/null \
+        | head -1 || echo "true")
+    if ! deacon_nudge_allowed "${suspended:-true}"; then
+        echo "doctor: skipped DOG_DONE nudge to deacon (suspended=${suspended:-unknown}) — $message" >&2
+        return 0
+    fi
+    gc session nudge deacon/ "$message" 2>/dev/null || true
+}
+
 # --- Step 1: Probe connectivity and measure latency ---
 
 PROBE_START_MS=$(now_ms)
@@ -126,10 +163,10 @@ if ! dolt_sql -q "SELECT active_branch()" >/dev/null 2>&1; then
     if send_mayor_mail \
         -s "ESCALATION: Dolt server unreachable on port $PORT [CRITICAL]" \
         -m "Doctor probe failed: server did not respond to active_branch() query."; then
-        gc session nudge deacon/ "DOG_DONE: doctor — server: UNREACHABLE (escalated)" 2>/dev/null || true
+        nudge_deacon_done "DOG_DONE: doctor — server: UNREACHABLE (escalated)"
         echo "doctor: server unreachable on port $PORT (escalated)"
     else
-        gc session nudge deacon/ "DOG_DONE: doctor — server: UNREACHABLE (mail failed)" 2>/dev/null || true
+        nudge_deacon_done "DOG_DONE: doctor — server: UNREACHABLE (mail failed)"
         echo "doctor: server unreachable on port $PORT (mail failed)"
     fi
     exit 0
@@ -221,5 +258,5 @@ Orphan DBs: ${ORPHAN_COUNT}${ORPHAN_WARN}${BACKUP_STALE}"; then
 fi
 
 SUMMARY="doctor — server: ok, latency: ${LATENCY_MS}ms, conns: ${CONN_COUNT}/${CONN_MAX}, disk: ${DISK_USAGE}, orphans: ${ORPHAN_COUNT}"
-gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
+nudge_deacon_done "DOG_DONE: $SUMMARY"
 echo "doctor: $SUMMARY"

@@ -60,6 +60,24 @@ classify_sync_failure() {
     fi
 }
 
+# deacon_nudge_allowed <suspended_flag> — PURE. Nudging a suspended agent
+# queues forever: the recipient never wakes to consume it, and every
+# `gc nudge poll` iteration reloads the ENTIRE queue state regardless of
+# size — 379 such DOG_DONE nudges to a 20-day-asleep, suspended deacon
+# dominated Dolt poll load (48-58% of total load across 3 measurements —
+# see ga-clgc2). deacon's `suspended` flag (city.toml) is the same
+# authoritative signal `gc agent list`/`gc agent suspend` already read and
+# write. Fail-CLOSED by construction: only the literal string "false" allows
+# the nudge — empty/unknown/garbage input (lookup failure, deacon not found)
+# is treated as suspended and skipped, never guessed-open. This lives in the
+# pure function itself (not just the caller's fallback) so the safety
+# invariant holds regardless of how deacon_nudge_allowed() gets called.
+# Unit-tested by mol-dog-backup.selftest.sh (library mode).
+deacon_nudge_allowed() {
+    local suspended_flag="$1"
+    [ "$suspended_flag" = "false" ]
+}
+
 # Library mode: `MOL_DOG_BACKUP_LIB=1 source mol-dog-backup.sh` defines the pure
 # functions above without resolving a live Dolt runtime or running the backup
 # flow (port resolution, real syncs, mail/nudge).
@@ -134,6 +152,25 @@ append_failed_db() {
     fi
 }
 
+# nudge_deacon_done <message> — best-effort DOG_DONE status ping, sent ONLY
+# when deacon can actually consume it (ga-clgc2). `gc agent list --json` is a
+# static city.toml read (no Dolt round-trip, ~0.1-0.2s) — cheap enough for
+# every dog run. Any lookup failure (gc/jq error, deacon not found) fails
+# CLOSED (treated as suspended, nudge skipped) — same "when in doubt, don't
+# queue forever" bias as the rest of this fix. Skip is logged to stderr:
+# visible, not the old `2>/dev/null || true` silent swallow (ga-clgc2 AC2).
+nudge_deacon_done() {
+    local message="$1" suspended
+    suspended=$(gc agent list --json 2>/dev/null \
+        | jq -r '.agents[]? | select(.qualified_name=="gastown.deacon") | .suspended' 2>/dev/null \
+        | head -1 || echo "true")
+    if ! deacon_nudge_allowed "${suspended:-true}"; then
+        echo "backup: skipped DOG_DONE nudge to deacon (suspended=${suspended:-unknown}) — $message" >&2
+        return 0
+    fi
+    gc session nudge deacon/ "$message" 2>/dev/null || true
+}
+
 # --- Step 1: Preflight Dolt version before backup sync ---
 
 DOLT_VERSION="$(dolt version 2>/dev/null | awk 'NR == 1 {print $NF}' || true)"
@@ -143,7 +180,7 @@ if ! dolt_version_at_least "$DOLT_VERSION" "$MIN_DOLT_BACKUP_VERSION"; then
         -m "Skipping backup sync: dolt version ${DOLT_VERSION:-unknown} is below required ${MIN_DOLT_BACKUP_VERSION}. Older versions can hang the sql-server during dolt backup sync." \
         2>/dev/null || true
     SUMMARY="backup — dolt-too-old: ${DOLT_VERSION:-unknown}, required: $MIN_DOLT_BACKUP_VERSION"
-    gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
+    nudge_deacon_done "DOG_DONE: $SUMMARY"
     echo "backup: $SUMMARY"
     exit 1
 fi
@@ -227,5 +264,5 @@ if [ "$FAILED_COUNT" -gt 0 ]; then
 fi
 
 SUMMARY="backup — synced: $SYNCED/$TOTAL, offsite: $OFFSITE_STATUS"
-gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
+nudge_deacon_done "DOG_DONE: $SUMMARY"
 echo "backup: $SUMMARY"

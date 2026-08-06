@@ -270,5 +270,76 @@ else
   fi
 fi
 
+
+# ── ga-clgc2: deacon_nudge_allowed()/nudge_deacon_done() — nudging a suspended
+# ── agent queues forever and gets reloaded on every gc nudge poll iteration;
+# ── 379 such DOG_DONE nudges to a 20-day-asleep, suspended deacon dominated
+# ── Dolt poll load (48-58% across 3 measurements). Same hermetic philosophy as
+# ── the rest of this file: deacon_nudge_allowed() is pure/leaf (a single
+# ── string comparison, no GC_CITY_PATH/live-Dolt dependency) so its REAL
+# ── source is extracted from the shipped script and sourced directly — not
+# ── hand-copied — while nudge_deacon_done() (which shells out to `gc agent
+# ── list`) stays a drift-guard-only check, same treatment as send_mayor_mail().
+echo "── deacon suspended-agent nudge guard (ga-clgc2) ──"
+
+if grep -qE '^deacon_nudge_allowed\(\)' "$SCRIPT" && grep -qE '^nudge_deacon_done\(\)' "$SCRIPT"; then
+  ok "deacon_nudge_allowed() and nudge_deacon_done() are defined in the shipped script"
+else
+  bad "deacon_nudge_allowed() and/or nudge_deacon_done() missing from the shipped script"
+fi
+
+# ── drift-guard: every call site must route through the guard, not raw `gc
+# ── session nudge deacon/ ... || true` (the original silent-swallow bug) ─────
+RAW_NUDGE_COUNT=$(grep -cE '^\s*gc session nudge deacon/' "$SCRIPT" || true)
+if [ "${RAW_NUDGE_COUNT:-0}" -eq 1 ]; then
+  ok "exactly one raw 'gc session nudge deacon/' call remains — inside nudge_deacon_done() itself, as expected"
+else
+  bad "expected exactly 1 raw 'gc session nudge deacon/' call (inside the wrapper), found $RAW_NUDGE_COUNT — a call site may have bypassed the guard"
+fi
+CALL_SITE_COUNT=$(grep -cE '^\s*(nudge_deacon_done|\s+nudge_deacon_done) ' "$SCRIPT" || true)
+if [ "${CALL_SITE_COUNT:-0}" -ge 3 ]; then
+  ok "found $CALL_SITE_COUNT call sites routed through nudge_deacon_done() (expect >=3: unreachable-escalated, unreachable-mail-failed, normal summary)"
+else
+  bad "expected >=3 call sites routed through nudge_deacon_done(), found $CALL_SITE_COUNT — a DOG_DONE nudge may still call gc session nudge directly"
+fi
+
+# ── real arithmetic, not hand-copied: extract deacon_nudge_allowed()'s ACTUAL
+# ── source from the shipped script (sed range /^func()/,/^}/) and source ─────
+# ── just that function definition — no live Dolt/GC_CITY_PATH needed, so this
+# ── is safe to do directly, same rationale as sourcing latency.sh above. ─────
+DEACON_FN_SNIPPET="$(mktemp)"
+sed -n '/^deacon_nudge_allowed()/,/^}/p' "$SCRIPT" > "$DEACON_FN_SNIPPET"
+if [ -s "$DEACON_FN_SNIPPET" ]; then
+  # shellcheck disable=SC1090
+  source "$DEACON_FN_SNIPPET"
+  if command -v deacon_nudge_allowed >/dev/null 2>&1; then
+    # Falsifying check: the EXACT reported scenario — deacon's real suspended
+    # flag (city.toml: suspended=true) — must now be REFUSED, not queued.
+    if deacon_nudge_allowed "true"; then
+      bad "suspended=true is ALLOWED to nudge — the exact ga-clgc2 scenario is NOT fixed"
+    else
+      ok "suspended=true is REFUSED (skipped) — the exact ga-clgc2 scenario is fixed"
+    fi
+    # AC4 non-regression: an ACTIVE (non-suspended) agent must still be nudged.
+    if deacon_nudge_allowed "false"; then
+      ok "suspended=false is ALLOWED to nudge — non-regression: active agents are still reachable"
+    else
+      bad "suspended=false is REFUSED — active-agent nudging regressed (AC4 violated)"
+    fi
+    # Fail-closed on lookup failure/unknown (empty string — gc/jq error, or
+    # deacon not found in `gc agent list --json`): must skip, not guess-allow.
+    if deacon_nudge_allowed ""; then
+      bad "empty/unknown suspended flag is ALLOWED to nudge — lookup failure should fail CLOSED (skip), not open"
+    else
+      ok "empty/unknown suspended flag is REFUSED — lookup failure fails closed (skip), as designed"
+    fi
+  else
+    bad "deacon_nudge_allowed() extracted but not callable after sourcing — extraction produced invalid bash"
+  fi
+else
+  bad "could not extract deacon_nudge_allowed() source from $SCRIPT — sed range matched nothing"
+fi
+rm -f "$DEACON_FN_SNIPPET"
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

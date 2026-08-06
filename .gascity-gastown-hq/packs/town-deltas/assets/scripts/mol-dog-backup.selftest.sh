@@ -178,5 +178,65 @@ else
   fi
 fi
 
+
+# ── ga-clgc2: deacon_nudge_allowed() — nudging a suspended agent queues
+# ── forever and gets reloaded on every gc nudge poll iteration; 379 such
+# ── DOG_DONE nudges to a 20-day-asleep, suspended deacon dominated Dolt poll
+# ── load (48-58% across 3 measurements). Pure/leaf function, defined before
+# ── the MOL_DOG_BACKUP_LIB early-return, so lib_call exercises the real code
+# ── — same treatment as classify_sync_failure/bound_for_size_kb above.
+echo "── deacon suspended-agent nudge guard (ga-clgc2) ──"
+
+if lib_call type deacon_nudge_allowed >/dev/null 2>&1; then
+  ok "deacon_nudge_allowed defined by lib-mode source"
+else
+  bad "deacon_nudge_allowed NOT defined — lib mode broken or function missing"
+fi
+
+# Falsifying check: the EXACT reported scenario — deacon's real suspended
+# flag (city.toml: suspended=true) — must now be REFUSED, not queued.
+if lib_call deacon_nudge_allowed "true"; then
+  bad "suspended=true is ALLOWED to nudge — the exact ga-clgc2 scenario is NOT fixed"
+else
+  ok "suspended=true is REFUSED (skipped) — the exact ga-clgc2 scenario is fixed"
+fi
+
+# AC4 non-regression: an ACTIVE (non-suspended) agent must still be nudged.
+if lib_call deacon_nudge_allowed "false"; then
+  ok "suspended=false is ALLOWED to nudge — non-regression: active agents are still reachable"
+else
+  bad "suspended=false is REFUSED — active-agent nudging regressed (AC4 violated)"
+fi
+
+# Fail-closed on lookup failure/unknown (empty string, or any value other than
+# the literal "false" — gc/jq error, deacon not found in `gc agent list
+# --json`, malformed jq output): must skip, not guess-allow.
+if lib_call deacon_nudge_allowed ""; then
+  bad "empty/unknown suspended flag is ALLOWED to nudge — lookup failure should fail CLOSED (skip), not open"
+else
+  ok "empty/unknown suspended flag is REFUSED — lookup failure fails closed (skip), as designed"
+fi
+if lib_call deacon_nudge_allowed "garbage"; then
+  bad "garbage suspended flag is ALLOWED to nudge — anything other than the literal 'false' must fail closed"
+else
+  ok "garbage suspended flag is REFUSED — anything other than the literal 'false' fails closed"
+fi
+
+# ── drift-guard: every DOG_DONE call site must route through
+# ── nudge_deacon_done(), not raw `gc session nudge deacon/ ... || true` (the
+# ── original silent-swallow bug) ──────────────────────────────────────────
+RAW_NUDGE_COUNT=$(grep -cE '^\s*gc session nudge deacon/' "$SCRIPT" || true)
+if [ "${RAW_NUDGE_COUNT:-0}" -eq 1 ]; then
+  ok "exactly one raw 'gc session nudge deacon/' call remains — inside nudge_deacon_done() itself, as expected"
+else
+  bad "expected exactly 1 raw 'gc session nudge deacon/' call (inside the wrapper), found $RAW_NUDGE_COUNT — a call site may have bypassed the guard"
+fi
+CALL_SITE_COUNT=$(grep -cE '^\s*nudge_deacon_done ' "$SCRIPT" || true)
+if [ "${CALL_SITE_COUNT:-0}" -ge 2 ]; then
+  ok "found $CALL_SITE_COUNT call sites routed through nudge_deacon_done() (expect >=2: dolt-too-old early exit, normal summary)"
+else
+  bad "expected >=2 call sites routed through nudge_deacon_done(), found $CALL_SITE_COUNT — a DOG_DONE nudge may still call gc session nudge directly"
+fi
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
