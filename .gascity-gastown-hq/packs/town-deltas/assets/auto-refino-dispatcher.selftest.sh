@@ -1277,6 +1277,58 @@ else
 fi
 rm -rf "$_kscity" "$_kstmp"
 
+# 13e (ga-bong5): drift-guard — the stale-recovery mv must re-validate what it
+# grabbed before trusting it, or a slow recoverer can steal a peer's freshly
+# recreated lock (the exact TOCTOU class independently found and fixed twice
+# already: quality-gate-dispatcher.sh's sentinel approach, and
+# pilot-dispatcher.sh's re-check approach via ga-byd3u — this is the third,
+# auto-refino-dispatcher.sh's sibling copy of the same original shape).
+if grep -qF '_ar_lock_hb_age "$_reaped/heartbeat"' "$DISPATCHER"; then
+  ok "(C, ga-bong5) stale-recovery re-validates the reaped copy's heartbeat before trusting it"
+else
+  bad "(C, ga-bong5) REGRESSION: no re-validation of the reaped copy — TOCTOU double-acquisition possible again"
+fi
+
+# 13f (ga-bong5): LIVE — N concurrent stale-lock recoverers, EXACTLY ONE
+# proceeds. Mirrors pilot-dispatcher.lock.selftest.sh's Scenario D technique
+# (count "Recovered STALE" occurrences once in the shared append-only log,
+# after all racers are confirmed done via `wait` — a per-racer snapshot taken
+# at an uncoordinated time can double-count one real event, see ga-byd3u).
+# Uses more than 2 racers (pilot's Scenario D uses 2) to raise the odds of
+# landing inside the narrow post-mv, pre-recreate window that the ga-bong5 fix
+# re-validates against.
+echo "Scenario 13f (ga-bong5): N concurrent stale-lock recoverers — no double-dispatch race"
+_rccity="$(mktemp -d)"; _rctmp="$(mktemp -d)"
+_rc_san="$(printf '%s' "$_rccity" | tr '/ ' '__')"
+_rc_dir="$_rctmp/auto-refino-dispatcher${_rc_san}.lock.d"
+mkdir -p "$_rc_dir"
+printf 'zombie-holder-token\n' > "$_rc_dir/heartbeat"
+touch -t 200001010000 "$_rc_dir/heartbeat" 2>/dev/null || true
+_rc_shared_log="$_rccity/.gc/logs/auto-refino-dispatcher.log"
+mkdir -p "$_rccity/.gc/logs"
+: > "$_rc_shared_log"
+run_ar_race() {
+  TMPDIR="$_rctmp" AUTO_REFINO_CITY_OVERRIDE="$_rccity" AUTO_REFINO_STORES="$_rccity" \
+    AUTO_REFINO_LOCK_MAX_AGE=2 DRY_RUN=1 \
+    PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+}
+_rc_pids=""
+for _rc_i in 1 2 3 4 5 6; do
+  run_ar_race &
+  _rc_pids="$_rc_pids $!"
+done
+# shellcheck disable=SC2086
+wait $_rc_pids
+_rc_recovered=$(grep -c "Recovered STALE" "$_rc_shared_log" 2>/dev/null | tr -d ' ')
+_rc_recovered=${_rc_recovered:-0}
+if [ "$_rc_recovered" -le 1 ]; then
+  ok "(C, ga-bong5) at most one of 6 concurrent recoverers proceeded ($_rc_recovered) — no double-dispatch"
+else
+  bad "(C, ga-bong5) REGRESSION: $_rc_recovered concurrent recoverers proceeded — double-dispatch race"
+fi
+rm -rf "$_rccity" "$_rctmp"
+
 # ── Scenario 14: FIX B — cross-stage contention-yield ─────────────────────────
 # WHY: refino is the LOWEST stage and must yield to a congested gate / waiting Pilot
 # when resources are contended, but NEVER serialize pointlessly when resources are
