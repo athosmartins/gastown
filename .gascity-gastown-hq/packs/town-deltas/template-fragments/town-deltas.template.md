@@ -69,6 +69,70 @@ domínio (oracle/peter/mila/thies/batista conforme o rig); ou (c) mandar pro gat
 / revisão adversarial, que existe exatamente pra isso. O Athos não é revisor
 técnico nem desempatador de engenharia.
 
+**AUTONOMIA — trabalhe até acabar, não até ter dúvida (Athos, 2026-08-06).**
+Mandato dele, verbatim: *"melhor pedir 'desculpa' por algo que não foi bem feito
+do que 'por favor' pra pedir minha bênção pra fazer algo"*. Só pare se for
+**realmente impossível** destravar via adversarial review ou conversando com
+outro worker. Dúvida técnica não é motivo de parada — é motivo de medir. As
+regras abaixo saíram de uma madrugada de trabalho não supervisionado que levou
+a fila do gate de 23 markers a 1 e mergeou 63 commits num dia (recorde). Não são
+conselhos: cada uma tem um caso que a produziu.
+
+1. **Meça antes de teorizar; o número muda o problema.** A fila do gate parecia
+   funda. Metade era fantasma: 5 de 10 markers eram de branches JÁ MERGEADAS,
+   presas em `needs-rebase` — estado que elas nunca poderiam satisfazer, porque
+   rebasear branch mergeada dá branch vazia. Um comando resolvia:
+   `git merge-base --is-ancestor origin/<branch> origin/main`. Antes de otimizar
+   uma fila, descubra o que ela realmente contém.
+
+2. **Verifique o ARTEFATO, nunca o relato — inclusive o seu.** Duas vezes
+   declarei gate-runs mortos; os três markers depois passaram e mergearam
+   (ga-9uwbw, fechado como não-bug). Para trabalho que dura horas, ausência de
+   sessão num snapshot NÃO prova morte — o discriminador honesto é o desfecho.
+   E mail de watchdog é **retrato com timestamp**, não estado vivo: reagi a um
+   alerta de 13:58 às 15:21 e quase declarei uma falha inexistente.
+
+3. **Erro e vazio não podem produzir o mesmo valor.** Foi a família dominante:
+   6 reprovações do gate num dia, todas terceiro estado colapsado em booleano.
+   Em toda leitura que pode faltar, pergunte: *"não encontrei" dá o mesmo
+   resultado que "encontrei e vale X"?* São TRÊS estados — tem / não-tem /
+   não-consegui-saber. Se o caminho for destrutivo, o default sob dúvida é o
+   estado INERTE, sempre.
+
+4. **Conserte a CLASSE, não a instância citada.** Um bead reprovou 3x seguidas
+   consertando só o exemplo do revisor e reintroduzindo a mesma família noutro
+   ponto do próprio diff. O revisor cita UM caso; varra o diff inteiro atrás dos
+   irmãos. Quem fez isso (peter-wa) achou o "segundo meio" do bug e uma terceira
+   instância que o veredito nem mencionou — e passou.
+
+5. **Comentário que promete mais do que o código entrega é pior que nenhum.**
+   Ele faz o próximo leitor parar de procurar o buraco. Um código postava
+   "labels cleared" sem limpar — a lane entupia e quem investigasse leria
+   "cleared" e riscaria a hipótese certa. Releia cada comentário do seu diff
+   perguntando: *o código ao lado realmente faz isto?*
+
+6. **Fonte ≠ o que roda. Mergeado ≠ vivo.** Li um guard e quase abri um P0
+   inexistente: o arquivo não era o que o launchd executa. E dois guards
+   mergearam sem ninguém carregar o plist — existindo e entregando zero. Derive
+   sempre do processo vivo (`ps -o command=`, `launchctl list`), nunca de um
+   caminho escrito em doc.
+
+7. **Teste que só passa não prova nada.** Rode-o contra o HEAD anterior: se não
+   falha lá, ele não pega o bug. O padrão-ouro do dia foi um builder que provou
+   que 3 dos 5 testes novos reprovavam antes do fix, com o sintoma literal do
+   veredito.
+
+8. **Não invente ID nem assuma sucesso de escrita.** Citei 3 beads antes de
+   criá-los (viraram errata). E `-q` + saída truncada transformaram um `exit=1`
+   em silêncio: o comando falhou, o label não mudou, e eu segui adiante. Verifique
+   o efeito, não o retorno.
+
+9. **Detector > desentupimento.** Desentupir à mão é Sísifo: a causa reescreve o
+   que você corrigiu. Quando um problema aparece 2x, pare de limpar e construa o
+   guard — e faça a query dele **inverter** a do consumidor cego, nunca replicá-la,
+   senão herda o mesmo ponto cego. Prefira **detection-only**: um guard que repara
+   sem conseguir distinguir "perdido" de "em transição legítima" quebra coisa boa.
+
 **Secrets — Bitwarden é source of truth.** Tokens (MOTHERDUCK_TOKEN, whapi,
 pipedrive, hex, etc.) vêm do vault via `secret <item-name>` (~/.local/bin/secret).
 Nunca hardcode. Falha: `~/.gastown/scripts/secrets-bootstrap.sh --ensure`.
