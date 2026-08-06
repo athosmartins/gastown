@@ -372,7 +372,19 @@ classify_gap2_bugtask_verdict() {
 # keep:merge-not-verified path, never a false "found none, so it's safe to
 # redispatch" from a query that actually errored.
 gap2_query_active_markers() {
-  bd -C "$GC_CITY" list --json --all \
+  # ga-4tgga gate-feedback (blocking issue 1): --all alone RE-ADMITS CLOSED
+  # markers (see the --all doc comment above, ~L1371) and bd close never
+  # touches labels — a marker closed as superseded/duplicate can keep a
+  # stale non-terminal gate-status:{ready,queued,...} label forever
+  # (live-verified: ga-wisp-qiij1x1, closed by the Mayor as superseded,
+  # still carries gate-status:queued). Without --status open, that dead
+  # record makes this function return a false active hit, which flows into
+  # gap2_marker_for_bead -> wait:active-marker and silently masks a
+  # genuinely-stranded parent — the exact failure ga-4tgga exists to fix,
+  # reintroduced via a different path. Mirrors DUP_MARKERS_JSON's own
+  # --all --status open convention ~200 lines below (~L1893) — nothing
+  # here is a new pattern, just the one this file already established.
+  bd -C "$GC_CITY" list --json --all --status open \
     -l type:quality-gate-marker \
     --label-any gate-status:ready \
     --label-any gate-status:queued \
@@ -401,7 +413,18 @@ gap2_marker_for_bead() {
   printf '%s' "$json" | jq -r --arg b "$bid" '
     .[] | select(
       ((.labels // []) | index("source-bead:" + $b)) or
-      ((.description // "") | split("\n") | any(test("^bead_id:[ \t]*" + $b + "[ \t]*$")))
+      # ga-4tgga gate-feedback (secondary, non-blocking): do NOT splice $b
+      # into a regex — dotted sub-bead IDs (ga-sb11i.2 is a real, live shape
+      # in this city) put a "." in the QUERY, which as a spliced-in pattern
+      # matches ANY character, so a query for ga-sb11i.2 could false-match
+      # an UNRELATED marker whose description says ga-sb11iX2. Match the
+      # "bead_id:" prefix with a FIXED (non-interpolated) regex, strip it,
+      # then compare the remainder to $b via plain string equality — zero
+      # regex-metachar risk from bid, whatever characters it contains.
+      ((.description // "") | split("\n") | any(
+        test("^bead_id:[ \t]*") and
+        ((sub("^bead_id:[ \t]*"; "") | sub("[ \t]*$"; "")) == $b)
+      ))
     ) |
     "\(.id) \((.labels // []) | map(select(startswith("gate-status:"))) | .[0] // "gate-status:unknown" | sub("^gate-status:"; ""))"
   ' 2>/dev/null | head -1

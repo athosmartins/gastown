@@ -325,10 +325,68 @@ eq "no match for an unrelated bead id" \
    "$(gap2_marker_for_bead "$GAP2_MARKERS_FIXTURE" "ga-e2n96")" ""
 eq "substring is NOT a match (ga-ffop9 must not match a ga-ffop9x marker)" \
    "$(gap2_marker_for_bead '[{"id":"ga-wisp-ddd","labels":[],"description":"bead_id: ga-ffop9x"}]' "ga-ffop9")" ""
+# ga-4tgga gate-feedback (secondary, non-blocking): a dotted sub-bead id in
+# the QUERY used to be spliced unescaped into a jq regex — its "." matched
+# ANY character, so querying for ga-sb11i.2 could false-match an unrelated
+# marker whose description says ga-sb11iX2 (dotted sub-bead IDs like
+# ga-sb11i.2 are a real, live id shape in this city — verified via bd list).
+eq "dotted bead id in QUERY does not wildcard-match an unrelated marker (ga-sb11i.2 vs ga-sb11iX2)" \
+   "$(gap2_marker_for_bead '[{"id":"ga-wisp-eee","labels":[],"description":"bead_id: ga-sb11iX2"}]' "ga-sb11i.2")" ""
+eq "dotted bead id still matches its OWN exact marker (no false negative from the fix)" \
+   "$(gap2_marker_for_bead '[{"id":"ga-wisp-fff","labels":[],"description":"bead_id: ga-sb11i.2"}]' "ga-sb11i.2")" "ga-wisp-fff unknown"
 eq "empty markers list → no match" \
    "$(gap2_marker_for_bead '[]' "ga-ffop9")" ""
 eq "empty bead id → no match (fail-safe)" \
    "$(gap2_marker_for_bead "$GAP2_MARKERS_FIXTURE" "")" ""
+
+# ── 6d. gap2_query_active_markers (ga-4tgga gate-feedback: --status open) ───
+# Signature: gap2_query_active_markers (no args; reads $GC_CITY, calls bd list)
+# Exercises the REAL, unmodified function against a mock `bd` (same technique
+# as section 8b below) so this is a behavioral proof the --status open flag
+# is actually IN the invocation, not just documented as intended. Fixture:
+# two markers both pass the label filter (type:quality-gate-marker,
+# gate-status:queued) — one genuinely open, one CLOSED. bd close never
+# touches labels, so a marker closed as superseded/duplicate can keep a
+# stale non-terminal gate-status label forever — this is the live-verified
+# shape (ga-wisp-qiij1x1, closed by the Mayor as superseded, still carries
+# gate-status:queued). Correct behavior: only the open one comes back.
+echo "── 6d. gap2_query_active_markers (ga-4tgga gate-feedback: --status open) ──"
+
+GAP2_BD_FIXTURE_ALL='[
+  {"id":"ga-wisp-open1","status":"open","labels":["type:quality-gate-marker","gate-status:queued","source-bead:ga-live1"],"description":"bead_id: ga-live1"},
+  {"id":"ga-wisp-closed1","status":"closed","labels":["type:quality-gate-marker","gate-status:queued","source-bead:ga-stale1"],"description":"bead_id: ga-stale1"}
+]'
+GC_CITY=/tmp/ga-4tgga-fake-city
+bd() {
+  # Mirror the real `bd list --status open` filter server-side, keyed off
+  # whether the caller's OWN invocation actually included the flag — this
+  # is what makes the test fail if --status open is ever dropped again.
+  local verb="$3" args="$*"
+  if [ "$verb" = "list" ]; then
+    case "$args" in
+      *"--status open"*) printf '%s' "$GAP2_BD_FIXTURE_ALL" | jq -c '[.[] | select(.status=="open")]' ;;
+      *)                 printf '%s' "$GAP2_BD_FIXTURE_ALL" ;;
+    esac
+    return 0
+  fi
+  return 0
+}
+GAP2_QAM_RESULT=$(gap2_query_active_markers)
+unset -f bd
+
+eq "gap2_query_active_markers returns the open marker" \
+   "$(printf '%s' "$GAP2_QAM_RESULT" | jq -r '[.[] | select(.id=="ga-wisp-open1")] | length')" "1"
+eq "gap2_query_active_markers EXCLUDES the closed-but-mislabeled marker (ga-4tgga gate-feedback blocking issue 1)" \
+   "$(printf '%s' "$GAP2_QAM_RESULT" | jq -r '[.[] | select(.id=="ga-wisp-closed1")] | length')" "0"
+
+# Drift-guard companion to the behavioral test above: assert --status open
+# is present specifically WITHIN gap2_query_active_markers's own body (not
+# merely somewhere else in the file — DUP_MARKERS_JSON already has it, so a
+# bare file-wide grep would false-pass even with this call site unfixed).
+GAP2_QAM_BODY=$(sed -n '/^gap2_query_active_markers() {/,/^}/p' "$GUARD")
+printf '%s' "$GAP2_QAM_BODY" | grep -q -- '--status open' \
+  && ok "gap2_query_active_markers's own body filters --status open" \
+  || bad "gap2_query_active_markers missing --status open in its own body — closed-but-mislabeled markers will false-positive as active (ga-4tgga gate-feedback)"
 
 # ── 7. drift-guard: guard implements both GAP-1 and GAP-2 sweeps ──────────────
 echo "── 7. drift-guard: guard implements ga-pa36 GAP-1 + GAP-2 sweeps ──"
