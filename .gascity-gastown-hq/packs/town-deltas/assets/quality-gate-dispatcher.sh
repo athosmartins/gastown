@@ -2420,8 +2420,8 @@ read_spawn_fail_count() {
 # gate_spawn_failure_requeue_or_error (next function) reads
 # GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS directly — a lib-only source (selftests)
 # must see a real default, not an unbound variable at call time.
-GATE_SPAWN_RETRY_MAX="${GATE_SPAWN_RETRY_MAX:-1}"                           # in-process retries before giving up on this sweep
-GATE_SPAWN_RETRY_BACKOFF_SECS="${GATE_SPAWN_RETRY_BACKOFF_SECS:-3}"         # short backoff between in-process retries
+GATE_SPAWN_RETRY_MAX="${GATE_SPAWN_RETRY_MAX:-3}"                           # in-process retries before giving up on this sweep
+GATE_SPAWN_RETRY_BACKOFF_SECS="${GATE_SPAWN_RETRY_BACKOFF_SECS:-3}"         # BASE backoff; doubles per attempt (see spawn-retry-loop)
 GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS="${GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS:-3}" # cross-sweep cap before parking at gate-status:error
 
 # gate_spawn_failure_requeue_or_error <marker_id> <spawn_err> — decides AND
@@ -7651,14 +7651,26 @@ TASK
   # classifies as transient; a non-transient failure (broken template,
   # session-cap deadlock) gets zero extra tries here and falls straight
   # through to the classification below, same as before this fix.
+  #
+  # ga-3jn3a: GATE_SPAWN_RETRY_MAX=1 + a flat 3s backoff (the original
+  # ga-2u38b shape) survived a short blip but not the ~39s Dolt outage
+  # observed live (08/06 16:00) — two consecutive failures 39s apart
+  # exhausted the single retry and the run aborted straight to
+  # gate-status:error, three separate times in one day requiring manual
+  # rescue. Backoff now DOUBLES per attempt (base * 2^(n-1): 3s, 6s, 12s
+  # with the default base and max) instead of repeating the same short
+  # wait — cumulative in-process coverage grows from ~3s to ~21s, closer to
+  # the observed outage duration, before ever falling through to the
+  # cross-sweep gate_spawn_failure_requeue_or_error path below.
 # SELFTEST-EXTRACT spawn-retry-loop: BEGIN
   _spawn_retry_n=0
   while [ -z "$SESSION_ID" ] \
       && [ "$_spawn_retry_n" -lt "$GATE_SPAWN_RETRY_MAX" ] \
       && [ "$(is_transient_spawn_error "$_spawn_err")" = "1" ]; do
     _spawn_retry_n=$((_spawn_retry_n + 1))
-    warn "  Reviewer $i spawn hit a transient connection error (spawn_err=${_spawn_err:-none}) — in-process retry $_spawn_retry_n/$GATE_SPAWN_RETRY_MAX after ${GATE_SPAWN_RETRY_BACKOFF_SECS}s backoff (ga-2u38b)."
-    sleep "$GATE_SPAWN_RETRY_BACKOFF_SECS" 2>/dev/null || true
+    _spawn_backoff_secs=$((GATE_SPAWN_RETRY_BACKOFF_SECS * (1 << (_spawn_retry_n - 1))))
+    warn "  Reviewer $i spawn hit a transient connection error (spawn_err=${_spawn_err:-none}) — in-process retry $_spawn_retry_n/$GATE_SPAWN_RETRY_MAX after ${_spawn_backoff_secs}s backoff (ga-2u38b/ga-3jn3a)."
+    sleep "$_spawn_backoff_secs" 2>/dev/null || true
     _spawn_err_file="/tmp/gate-reviewer-spawn-err-$$.${i}.r${_spawn_retry_n}"
     SESSION_JSON=$(gc --city "$GC_CITY" session new gate-reviewer \
       --no-attach \

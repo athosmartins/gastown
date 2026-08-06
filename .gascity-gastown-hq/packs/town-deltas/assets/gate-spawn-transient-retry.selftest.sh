@@ -381,12 +381,94 @@ case "$OUT" in
   *) bad "(c) expected SESSION_ID= GC_CALLS=0 (no retry on a non-transient error), got: $OUT" ;;
 esac
 
+# ── 4b. ga-3jn3a: real shipped defaults survive the exact live-incident shape ─
+echo "── 4b. spawn-retry-loop with REAL shipped defaults (ga-3jn3a) ──"
+
+# Pull the real GATE_SPAWN_RETRY_MAX/BACKOFF_SECS default-assignment lines
+# verbatim too (distinct from RETRY_BLOCK, the loop body) — tests (d)/(e)
+# below must exercise what actually SHIPS, not a value re-typed by hand here
+# that could silently drift from the source.
+DEFAULTS_BLOCK="$(grep -E '^GATE_SPAWN_RETRY_(MAX|BACKOFF_SECS)=' "$DISPATCHER")"
+if [ -z "$DEFAULTS_BLOCK" ]; then
+  echo "FATAL: could not locate GATE_SPAWN_RETRY_MAX/BACKOFF_SECS default assignments in $DISPATCHER"
+  exit 1
+fi
+
+# (d) THE ACEITE test, verbatim: inject a transient-connection failure on TWO
+# consecutive attempts, using the dispatcher's own real defaults (DEFAULTS_BLOCK,
+# NOT hand-set here unlike (a)-(c) above) — the run must recover on the 3rd
+# attempt rather than exhausting the retry budget after 2 failures the way the
+# pre-fix GATE_SPAWN_RETRY_MAX=1 shape did on 2026-08-06 (39s outage, 2
+# failures 39s apart, straight to gate-status:error — the incident this fix
+# exists for).
+GC_TWO_FAILURES_SCRIPT='
+CALL_LOG=$(mktemp)
+gc() {
+  echo x >> "$CALL_LOG"
+  n=$(wc -l < "$CALL_LOG" | tr -d "[:space:]")
+  if [ "$n" -ge 3 ]; then
+    printf "{\"session_id\":\"sess-recovered\"}"
+  else
+    echo "invalid connection" >&2
+    return 1
+  fi
+}
+sleep() { :; }
+warn() { :; }
+i=1; BRANCH="fix/ga-3jn3a"; GC_CITY="test-city"
+SESSION_ID=""; _spawn_err="invalid connection"
+'"$DEFAULTS_BLOCK"'
+'"$RETRY_BLOCK"'
+GC_CALLS=$(wc -l < "$CALL_LOG" | tr -d "[:space:]")
+rm -f "$CALL_LOG"
+printf "SESSION_ID=%s GC_CALLS=%s MAX=%s\n" "$SESSION_ID" "$GC_CALLS" "$GATE_SPAWN_RETRY_MAX"
+'
+OUT=$(bash -c "$GC_TWO_FAILURES_SCRIPT" 2>/dev/null)
+case "$OUT" in
+  "SESSION_ID=sess-recovered GC_CALLS=3 MAX=3")
+    ok "(d) ACEITE: 2 consecutive transient failures + shipped defaults (MAX=3) recover on the 3rd attempt, never reach gate-status:error" ;;
+  *" MAX=1")
+    bad "(d) GATE_SPAWN_RETRY_MAX default is still 1 — the pre-fix value — 2 consecutive failures would still exhaust the budget: $OUT" ;;
+  *)
+    bad "(d) expected SESSION_ID=sess-recovered GC_CALLS=3 MAX=3, got: $OUT" ;;
+esac
+
+# (e) backoff GROWS per attempt (doubles from the base) instead of repeating
+# the same short wait every time — capture the actual computed sleep
+# durations via a sleep() mock that logs its argument to a file (same
+# survives-the-subshell technique as the gc() CALL_LOG mocks above, since
+# sleep() here also runs inside the command-substitution subshell — a plain
+# shell-variable accumulator would lose every append the instant that
+# subshell exits, same lesson as CALL_LOG above).
+GC_BACKOFF_CAPTURE_SCRIPT='
+SLEEP_LOG=$(mktemp)
+gc() { echo "invalid connection" >&2; return 1; }
+sleep() { printf "%s\n" "$1" >> "$SLEEP_LOG"; }
+warn() { :; }
+i=1; BRANCH="fix/ga-3jn3a"; GC_CITY="test-city"
+SESSION_ID=""; _spawn_err="invalid connection"
+'"$DEFAULTS_BLOCK"'
+'"$RETRY_BLOCK"'
+cat "$SLEEP_LOG"
+rm -f "$SLEEP_LOG"
+'
+BACKOFFS=$(bash -c "$GC_BACKOFF_CAPTURE_SCRIPT" 2>/dev/null | tr "\n" "," | sed "s/,$//")
+if [ "$BACKOFFS" = "3,6,12" ]; then
+  ok "(e) backoff doubles per attempt from the base (3,6,12 — not a flat 3,3,3): $BACKOFFS"
+else
+  bad "(e) expected doubling backoff '3,6,12', got: '$BACKOFFS'"
+fi
+
 # ── 5. drift-guards: shipped dispatcher still carries the ga-2u38b fix ───────
 echo "── 5. drift-guards ──"
 has "$DISPATCHER" 'is_transient_spawn_error\(\)' "transient classifier present"
 has "$DISPATCHER" 'gate_spawn_failure_requeue_or_error\(\)' "decision/apply function present"
 has "$DISPATCHER" 'GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS' "attempt cap is a configurable GATE_\* tunable (house convention)"
 has "$DISPATCHER" 'GATE_SPAWN_RETRY_MAX' "in-process retry count is a configurable GATE_\* tunable"
+has "$DISPATCHER" 'GATE_SPAWN_RETRY_MAX:-3' "ga-3jn3a: default retry count raised to 3 (was 1 — too low for the observed ~39s outage)"
+grep -qF '_spawn_backoff_secs=$((GATE_SPAWN_RETRY_BACKOFF_SECS * (1 << (_spawn_retry_n - 1))))' "$DISPATCHER" \
+  && ok "ga-3jn3a: backoff doubles per attempt (not a flat repeat)" \
+  || bad "ga-3jn3a: doubling backoff formula not found — did the retry loop get refactored?"
 has "$DISPATCHER" '# SELFTEST-EXTRACT spawn-retry-loop: BEGIN' "spawn-retry-loop extraction sentinel present"
 has "$DISPATCHER" 'invalid connection.*read tcp.*broken pipe' "classifier still covers the live-incident signature family"
 grep -q 'gate_spawn_failure_requeue_or_error "\$MARKER_ID" "\$_spawn_err"' "$DISPATCHER" \
