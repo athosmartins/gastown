@@ -2640,11 +2640,18 @@ _pilot_emit_dispatchable() {
   PILOT_EMITTED_DONE=1
   # Everything below is best-effort; a failure must never break the sweep.
   {
-    local _all _rig_paths _rp _items _count _now _tmp _dir
+    local _all _rig_paths _rp _items _count _now _tmp _dir _rig_json
     _all=$(_emit_query_one "$GC_CITY" "hq" 2>/dev/null || echo "[]")
     # Union every non-HQ rig store too (the eligible queue spans all stores).
-    _rig_paths=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
-      | jq -r '.rigs[] | select(.hq == false) | "\(.path)\t\(.name)"' 2>/dev/null || echo "")
+    # ga-07rb3: best-effort telemetry emission (see the block's own header) —
+    # on a gc failure this just emits HQ-only for this cycle (self-heals next
+    # sweep); the explicit warn is so a PERSISTENT failure is visible instead
+    # of silently under-reporting forever.
+    _rig_json=""
+    if ! _rig_json=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
+      warn "gc rig list failed while emitting the eligible-queue metric — HQ-only this cycle (ga-07rb3)."
+    fi
+    _rig_paths=$(printf '%s' "$_rig_json" | jq -r '.rigs[] | select(.hq == false) | "\(.path)\t\(.name)"' 2>/dev/null)
     while IFS=$'\t' read -r _rp _rname; do
       [ -z "$_rp" ] || [ ! -d "$_rp" ] && continue
       [ "$_rp" = "$GC_CITY" ] && continue
@@ -2874,8 +2881,16 @@ _ttl_recover_db() {
 _IN_FLIGHT_HQ=$(bd -C "$GC_CITY" list --json -l "story:in-flight" 2>/dev/null \
   | jq --arg db "$GC_CITY" '[ .[] | . + {"_rig_db": $db} ]' 2>/dev/null || echo "[]")
 IN_FLIGHT_RAW_JSON="$_IN_FLIGHT_HQ"
-_in_flight_rig_paths=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
-  | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
+# ga-07rb3: a gc failure here undercounts in-flight rig-side beads (lane
+# capacity would look more free than it is) rather than blocking dispatch
+# outright — deliberately: a persistent gc outage should degrade capacity
+# accuracy for a cycle, not halt the Pilot entirely. The warn makes a
+# transient/persistent failure visible instead of silently under-reporting.
+_in_flight_rig_json=""
+if ! _in_flight_rig_json=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
+  warn "gc rig list failed while counting in-flight rig-side beads — lane capacity check is HQ-only this cycle (ga-07rb3)."
+fi
+_in_flight_rig_paths=$(printf '%s' "$_in_flight_rig_json" | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null)
 while IFS= read -r _in_flight_rig; do
   [ -z "$_in_flight_rig" ] || [ ! -d "$_in_flight_rig" ] && continue
   _rig_inflight=$(bd -C "$_in_flight_rig" list --json -l "story:in-flight" 2>/dev/null \
@@ -2883,7 +2898,7 @@ while IFS= read -r _in_flight_rig; do
   IN_FLIGHT_RAW_JSON=$(printf '%s\n%s' "$IN_FLIGHT_RAW_JSON" "$_rig_inflight" \
     | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "$IN_FLIGHT_RAW_JSON")
 done <<< "$_in_flight_rig_paths"
-unset _IN_FLIGHT_HQ _in_flight_rig_paths _in_flight_rig _rig_inflight
+unset _IN_FLIGHT_HQ _in_flight_rig_paths _in_flight_rig _rig_inflight _in_flight_rig_json
 
 IN_FLIGHT_RAW_TOTAL=$(echo "$IN_FLIGHT_RAW_JSON" | jq 'length' 2>/dev/null || echo "0")
 
@@ -3142,9 +3157,22 @@ _beadid_live_crew_owner() {
       && [ "$(( _phantom_now - _upd_epoch ))" -gt "${PILOT_PHANTOM_STALE_SECS:-2700}" ] \
       2>/dev/null && _is_stale=1
   fi
+  # ga-07rb3: capture the repos list AND _ownership_guard_repos's own exit
+  # code TOGETHER, in one command substitution — the exit code of a `$(...)`
+  # survives into $? normally, unlike a plain variable the function might set
+  # internally (that dies with the subshell the substitution itself creates).
+  # This is the ONE forcing caller of _ownership_guard_repos (it actively
+  # RELEASES the bead), so unlike the header's documented "fail-open, no
+  # false block" default for the other callers, here an unverifiable
+  # rig-side branch must not be read as "confirmed no branch" (double-dispatch
+  # risk) — a failed fetch skips this guard (falls through to "not phantom,
+  # keep") instead of trusting a town-root-only search.
+  local _og_repos _og_rig_list_ok
+  _og_repos="$(_ownership_guard_repos 2>/dev/null)"; _og_rig_list_ok=$?
   if [ "$_is_stale" = "1" ] \
      && command -v git >/dev/null 2>&1 \
-     && [ -n "$(_ownership_guard_repos 2>/dev/null)" ] \
+     && [ -n "$_og_repos" ] \
+     && [ "$_og_rig_list_ok" -eq 0 ] \
      && ! _beadid_has_crew_branch "$_bid"; then
     return 1   # phantom: stale + no branch → release for wa-worker re-dispatch
   fi
@@ -3255,6 +3283,14 @@ _beadid_has_branch() {
     case " $PILOT_TEST_BRANCH_BEADS " in *" $_bid "*) return 0 ;; *) return 1 ;; esac
   fi
   command -v git >/dev/null 2>&1 || return 0
+  # ga-07rb3: a FAILED gc rig list means _NS_BRANCH_REPOS silently degraded to
+  # just the town root (dirname "$GC_CITY" always succeeds, so the "repos
+  # empty" guard below never actually catches this — a rig-list failure and
+  # "confirmed zero non-HQ rigs" look IDENTICAL to that guard). Check the
+  # fetch's own success explicitly: on failure we cannot rule out a rig-side
+  # branch, so fail toward this function's OWN already-documented safe
+  # default (branch may exist -> KEEP), same as the "no git available" case.
+  [ "${_NS_RIG_LIST_OK:-1}" = "0" ] && return 0
   [ -n "${_NS_BRANCH_REPOS:-}" ] || return 0
   while IFS= read -r _repo; do
     [ -n "$_repo" ] && [ -d "$_repo" ] || continue
@@ -3280,6 +3316,14 @@ _crew_progressed_since() {
     case " $PILOT_TEST_CREW_PROGRESSED " in *" $_crew "*) return 0 ;; *) return 1 ;; esac
   fi
   command -v git >/dev/null 2>&1 || return 1
+  # ga-07rb3: explicit, not just incidental — this function's existing
+  # default (return 1, "not progressed") already happens to be the safe
+  # direction when _NS_BRANCH_REPOS degraded to town-root-only (the owner's
+  # progress branches are rig-side, so a town-root-only search naturally
+  # finds nothing and falls through to this same return 1). Stating it
+  # explicitly means that stays true by design, not by coincidence of which
+  # repos happen to be missing.
+  [ "${_NS_RIG_LIST_OK:-1}" = "0" ] && return 1
   [ -n "${_NS_BRANCH_REPOS:-}" ] || return 1
   _short="${_crew%-*}"   # mila-wa -> mila (the crew/<short>/<bead> branch convention)
   while IFS= read -r _repo; do
@@ -3299,22 +3343,47 @@ _crew_progressed_since() {
 # could live in (the shared town root + every registered rig path), de-duped and
 # memoized for the whole sweep. Self-sufficient: it does NOT depend on the
 # never-started block's _NS_BRANCH_REPOS (which is only set when that detector is
-# enabled), so the guard works even with PILOT_NEVERSTARTED_MINUTES=0. Fail-open:
-# any `gc rig list` error yields just the town root (or nothing) → the branch
-# probe then simply finds no branch → no false block.
+# enabled), so the guard works even with PILOT_NEVERSTARTED_MINUTES=0. Fail-open
+# for the MOST callers here (_target_has_real_branch, _beadid_has_crew_branch,
+# the remerge lookup): each is documented "any uncertainty -> assert NO branch,
+# never forces a release" defense-in-depth, so a `gc rig list` error degrading
+# this to just the town root is an accepted, low-stakes trade-off for them.
+# ga-07rb3: ONE caller is NOT defense-in-depth — the phantom-claim guard
+# actively RELEASES a bead for re-dispatch when it concludes "no branch". For
+# that one, "town root only, checked, found nothing" must not be trusted the
+# same as "confirmed no branch anywhere" (double-dispatch risk if the branch
+# is rig-side). Every caller invokes this via `repos="$(_ownership_guard_repos)"`
+# — a command SUBSHELL — so a plain internal variable can never signal failure
+# back to the caller (its assignment dies with the subshell). The exit CODE of
+# a command substitution DOES survive it, so: return 1 iff the underlying gc
+# fetch failed (stdout still prints the fail-open town-root-only list either
+# way, unchanged for every non-forcing caller); the phantom-claim guard below
+# is the one caller that additionally checks $? for this reason.
 _OWNERSHIP_GUARD_REPOS=""
 _OWNERSHIP_GUARD_REPOS_DONE=""
 _ownership_guard_repos() {
+  local _og_failed=0
   if [ -z "$_OWNERSHIP_GUARD_REPOS_DONE" ]; then
+    local _og_repos_json=""
+    if ! _og_repos_json=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
+      _og_failed=1
+      warn "gc rig list failed while building _ownership_guard_repos — rig-side branch checks degraded to HQ-only this sweep (ga-07rb3)."
+    fi
     _OWNERSHIP_GUARD_REPOS=$(
       { dirname "$GC_CITY"
-        gc --city "$GC_CITY" rig list --json 2>/dev/null \
-          | jq -r '.rigs[]?.path // empty' 2>/dev/null
+        printf '%s' "$_og_repos_json" | jq -r '.rigs[]?.path // empty' 2>/dev/null
       } | awk 'NF && !seen[$0]++'
     )
     _OWNERSHIP_GUARD_REPOS_DONE=1
   fi
   printf '%s' "$_OWNERSHIP_GUARD_REPOS"
+  # ga-07rb3: memoization itself (_OWNERSHIP_GUARD_REPOS_DONE) has this exact
+  # same subshell limitation and only ever survives within a single call — a
+  # pre-existing characteristic of this helper, not something this fix
+  # changes or relies on. Each call re-derives its own success/failure
+  # independently, which is why _og_failed is local and freshly computed
+  # every time rather than trusted from a prior call.
+  [ "$_og_failed" -eq 0 ]
 }
 
 # ── TTL claim-recovery (relocated from ~L1586, ga-wisp-1gdiik) ────────────────
@@ -3326,8 +3395,15 @@ TTL_SECS=$((CLAIM_TTL_MINUTES * 60))
 
 _ttl_recover_db "$GC_CITY" "$TTL_NOW_EPOCH" "$TTL_SECS"
 
-_ttl_rig_paths=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
-  | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
+# ga-07rb3: on a gc failure, non-HQ rigs simply don't get a TTL-recovery pass
+# this cycle (HQ already ran above) — self-heals next sweep since this list
+# is re-fetched fresh every time, never cached. The warn makes a persistent
+# failure visible instead of silently skipping rig-side TTL recovery forever.
+_ttl_rig_json=""
+if ! _ttl_rig_json=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
+  warn "gc rig list failed while building the TTL-recovery rig list — rig-side TTL recovery skipped this cycle (ga-07rb3)."
+fi
+_ttl_rig_paths=$(printf '%s' "$_ttl_rig_json" | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null)
 while IFS= read -r _ttl_rig; do
   [ -z "$_ttl_rig" ] || [ ! -d "$_ttl_rig" ] && continue
   _ttl_recover_db "$_ttl_rig" "$TTL_NOW_EPOCH" "$TTL_SECS"
@@ -3721,10 +3797,16 @@ _beadid_has_open_gate_marker() {
 # calling shell's function table). Echoes the peek's `.output` field, or "" on
 # any failure/timeout.
 _gc_session_peek_output() {
-  local _sess="${1:-}"
+  local _sess="${1:-}" _peek_json
   [ -n "$_sess" ] || return 1
-  timeout 8 gc --city "$GC_CITY" session peek "$_sess" --lines 80 --json 2>/dev/null \
-    | jq -r '.output // empty' 2>/dev/null || echo ""
+  # ga-07rb3: "" on failure was already this function's documented, deliberate
+  # contract (see above) — a failed/empty peek correctly denies the recent-
+  # mention exemption rather than granting one, the safe direction for a
+  # heuristic that only ever EXEMPTS, never blocks. gc_json_or_unknown just
+  # makes that explicit instead of relying on a bare `|| echo ""` to also
+  # absorb a "succeeded but unparseable" envelope the same way.
+  _peek_json=$(gc_json_or_unknown timeout 8 gc --city "$GC_CITY" session peek "$_sess" --lines 80 --json) || true
+  printf '%s' "$_peek_json" | jq -r '.output // empty' 2>/dev/null
 }
 
 # _attached_session_peek_cache — lazy, ONCE-per-sweep cache: recent output from
@@ -4293,15 +4375,35 @@ if [ "${PILOT_NEVERSTARTED_MINUTES:-15}" != "0" ]; then
   _NS_NOW_EPOCH=$(date +%s)
   # Repos a crew branch could live in: the shared town root (HQ ga-* branches) +
   # every rig repo (wa-*/ps-*/lx-* crew branches). Resolved once per sweep.
+  # ga-07rb3: track the gc rig list fetch's OWN success separately from the
+  # resulting repo list — dirname "$GC_CITY" always succeeds, so a bare "is
+  # the list non-empty" check can never distinguish "gc failed" from
+  # "confirmed zero non-HQ rigs." _beadid_has_branch/_crew_progressed_since
+  # consult _NS_RIG_LIST_OK before trusting an empty rig-side result, so a
+  # transient gc failure can't silently look like "no rig branches anywhere"
+  # and wrongly let NEVERSTARTED-recovery reclaim a bead with real rig-side
+  # in-flight work (the exact double-dispatch class this story exists for).
+  _NS_RIG_LIST_OK=1
+  _ns_repos_json=""
+  if ! _ns_repos_json=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
+    _NS_RIG_LIST_OK=0
+    warn "gc rig list failed while building _NS_BRANCH_REPOS — rig-side branch checks degraded to HQ-only this sweep; NEVERSTARTED-recovery treats every bead as 'branch may exist' (no reclaim) until it succeeds again (ga-07rb3)."
+  fi
   _NS_BRANCH_REPOS=$(
     { dirname "$GC_CITY"
-      gc --city "$GC_CITY" rig list --json 2>/dev/null \
-        | jq -r '.rigs[]?.path // empty' 2>/dev/null
+      printf '%s' "$_ns_repos_json" | jq -r '.rigs[]?.path // empty' 2>/dev/null
     } | awk 'NF && !seen[$0]++'
   )
   _neverstarted_recover_db "$GC_CITY" "$_NS_NOW_EPOCH"
-  _ns_rig_paths=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
-    | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
+  # ga-07rb3: gates WHICH rigs get their own _neverstarted_recover_db pass —
+  # unlike _NS_BRANCH_REPOS above, a failure here means the detector simply
+  # doesn't RUN for non-HQ rigs this cycle (no false reclaim possible; safe,
+  # self-heals next sweep since this is re-fetched fresh every time).
+  _ns_rig_json=""
+  if ! _ns_rig_json=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
+    warn "gc rig list failed while selecting rigs for NEVERSTARTED-recovery — rig-side sweeps skipped this cycle (ga-07rb3)."
+  fi
+  _ns_rig_paths=$(printf '%s' "$_ns_rig_json" | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null)
   while IFS= read -r _ns_rig; do
     [ -z "$_ns_rig" ] || [ ! -d "$_ns_rig" ] && continue
     _neverstarted_recover_db "$_ns_rig" "$_NS_NOW_EPOCH"
@@ -4311,8 +4413,13 @@ fi
 if [ "${PILOT_MAYOR_DEFERRED_HOLD:-1}" != "0" ]; then
   _MDH_NOW_EPOCH=$(date +%s)
   _mayor_deferred_hold_db "$GC_CITY" "$_MDH_NOW_EPOCH"
-  _mdh_rig_paths=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
-    | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
+  # ga-07rb3: gates which rigs get their own _mayor_deferred_hold_db pass — a
+  # failure here just skips rig-side scanning this cycle (safe, self-heals).
+  _mdh_rig_json=""
+  if ! _mdh_rig_json=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
+    warn "gc rig list failed while selecting rigs for mayor-deferred-hold scanning — rig-side sweeps skipped this cycle (ga-07rb3)."
+  fi
+  _mdh_rig_paths=$(printf '%s' "$_mdh_rig_json" | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null)
   while IFS= read -r _mdh_rig; do
     [ -z "$_mdh_rig" ] || [ ! -d "$_mdh_rig" ] && continue
     _mayor_deferred_hold_db "$_mdh_rig" "$_MDH_NOW_EPOCH"
@@ -4719,8 +4826,14 @@ fi
 CTXREADY_RIG_JSON="[]"
 CTXREADY_RIG_COUNT="0"
 if [ "$PILOT_CTX_READY_RIG_QUERIES" = "1" ]; then
-  _rig_ctx_rows=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
-    | jq -r '.rigs[] | select(.hq == false) | "\(.name)\t\(.path)"' 2>/dev/null || echo "")
+  # ga-07rb3: same "gates which rigs get scanned" shape as the block's own
+  # documented fail-open philosophy above — a gc failure skips rig-side
+  # ctx:ready scanning this cycle (safe, self-heals; HQ dispatch unaffected).
+  _rig_ctx_json=""
+  if ! _rig_ctx_json=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
+    warn "gc rig list failed while selecting rigs for ctx:ready scanning — rig-side scan skipped this cycle (ga-07rb3)."
+  fi
+  _rig_ctx_rows=$(printf '%s' "$_rig_ctx_json" | jq -r '.rigs[] | select(.hq == false) | "\(.name)\t\(.path)"' 2>/dev/null)
   while IFS=$'\t' read -r _rig_ctx_name _rig_ctx_path; do
     [ -z "$_rig_ctx_path" ] || [ ! -d "$_rig_ctx_path" ] && continue
     # ga-mfeip scope gate: only scan rigs in PILOT_CTX_READY_RIGS (default WA-only).
@@ -4811,8 +4924,13 @@ if [ "$PILOT_WA_RIG_APPROVED_QUERIES" = "1" ]; then
       | _filter_exec_manual | _filter_candidates | _filter_dispatch_gates | _filter_built \
       | _filter_unblocked "${GC_CITY}" | _filter_explicit_deps "${GC_CITY}")
   else
-    _wa_rig2_rows=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
-      | jq -r '.rigs[] | select(.hq == false) | "\(.name)\t\(.path)"' 2>/dev/null || echo "")
+    # ga-07rb3: same "gates which rigs get scanned" shape as PILOT_CTX_READY_RIG_QUERIES
+    # above — a gc failure skips this tier-2 rig scan this cycle (safe, self-heals).
+    _wa_rig2_json=""
+    if ! _wa_rig2_json=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
+      warn "gc rig list failed while selecting rigs for the WA tier-2 approved scan — rig-side scan skipped this cycle (ga-07rb3)."
+    fi
+    _wa_rig2_rows=$(printf '%s' "$_wa_rig2_json" | jq -r '.rigs[] | select(.hq == false) | "\(.name)\t\(.path)"' 2>/dev/null)
     while IFS=$'\t' read -r _wa_rig2_name _wa_rig2_path; do
       [ -z "$_wa_rig2_path" ] || [ ! -d "$_wa_rig2_path" ] && continue
       # Same scope gate as ctx:ready rig scan: only rigs in PILOT_CTX_READY_RIGS.
@@ -4917,8 +5035,15 @@ _scan_rig_fallback_pool() {
     return 0
   fi
 
-  RIG_PATHS=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
-    | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null || echo "")
+  # ga-07rb3: this feeds a reporting metric (RIG_MERGED_COUNT/ALL_RIG_TIER1/2),
+  # not a dispatch decision — a gc failure just undercounts to HQ-only this
+  # cycle. The warn makes a persistent failure visible instead of silently
+  # under-reporting merged/tier counts forever.
+  RIG_PATHS_JSON=""
+  if ! RIG_PATHS_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
+    warn "gc rig list failed while computing rig-merged tier counts — HQ-only this cycle (ga-07rb3)."
+  fi
+  RIG_PATHS=$(printf '%s' "$RIG_PATHS_JSON" | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null)
 
   ALL_RIG_TIER1="[]"
   ALL_RIG_TIER2="[]"
@@ -5160,9 +5285,17 @@ dispatch_one() {
     esac
     log "  story.rig inferred from bead prefix '$_early_prefix': $STORY_RIG"
   fi
-  STORY_BEAD_CITY=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
-    | jq -r --arg name "$STORY_RIG" '.rigs[] | select(.name == $name) | .path' \
-    2>/dev/null | head -1 || echo "")
+  # ga-07rb3: a gc failure here and "$STORY_RIG isn't a registered rig" already
+  # shared the same HQ fallback below before this fix — the warn just makes a
+  # gc failure specifically visible (vs. a genuinely-unregistered rig, which
+  # is expected/silent). Not changing the fallback itself: retrying inline
+  # mid-dispatch has no clean seam here, and HQ is the same safe landing spot
+  # this code already used for "rig unknown" for both causes.
+  local _story_rig_json=""
+  if ! _story_rig_json=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
+    warn "gc rig list failed while resolving STORY_BEAD_CITY for rig '$STORY_RIG' — falling back to HQ (ga-07rb3)."
+  fi
+  STORY_BEAD_CITY=$(printf '%s' "$_story_rig_json" | jq -r --arg name "$STORY_RIG" '.rigs[] | select(.name == $name) | .path' 2>/dev/null | head -1)
   if [ -z "$STORY_BEAD_CITY" ] || [ ! -d "$STORY_BEAD_CITY" ]; then
     STORY_BEAD_CITY="$GC_CITY"
   fi

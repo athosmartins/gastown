@@ -585,13 +585,20 @@ resolve_author_agent_alias() {
     ''|mayor|gastown.dog|gastown.dog-*|dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*)
       return 0 ;;  # pool/ephemeral or empty — no agent fallback, echo nothing
   esac
-  local agent
-  agent=$(gc --city "$GC_CITY" session list --json 2>/dev/null \
-    | jq -r --arg a "$author" \
+  local agent agent_sessions_json
+  # ga-07rb3: the prior `| head -1 || true` swallowed a gc failure the same
+  # way as a legitimate zero-match result — both silently produced an empty
+  # $agent. That happens to already be this function's safe/best-effort
+  # fallback (see the docstring above: caller falls back to no agent alias),
+  # so behavior is unchanged; gc_json_or_unknown just makes the distinction
+  # explicit instead of accidental, consistent with every other site fixed
+  # by this story.
+  agent_sessions_json=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json) || true
+  agent=$(printf '%s' "$agent_sessions_json" | jq -r --arg a "$author" \
         '(if type=="array" then . else (.sessions // []) end)[]
          | select(.closed != true)
          | select((.session_name==$a) or (.id==$a) or (.name==$a) or (.alias==$a) or (.agent_name==$a))
-         | (.alias // .name // .agent_name // empty)' 2>/dev/null | head -1 || true)
+         | (.alias // .name // .agent_name // empty)' 2>/dev/null | head -1)
   [ "$agent" = "$author" ] && agent=""
   [ "$agent" = "null" ] && agent=""
   printf '%s' "$agent"
@@ -1057,12 +1064,78 @@ validate_bead_id() {
   return 1
 }
 
+# gc_json_or_unknown <cmd...>
+#
+# ga-07509: `VAR=$(gc ... --json 2>/dev/null || echo "")` does not protect
+# against a failing `gc` call — gc still prints a JSON envelope to STDOUT
+# even when it exits non-zero (e.g. {"ok":false,"error":{...}}, or for
+# `gc bd <sub>` a bare {"error":"..."} with no "ok" key at all), so the
+# command substitution already captured that non-empty envelope before
+# `|| echo` ever runs. The envelope then parses as valid JSON, and a
+# downstream `.field | length` read on it silently returns 0 —
+# indistinguishable from "queried successfully, zero results".
+#
+# This wrapper captures the REAL exit code before anything can discard it
+# (via `if VAR=$(...); then`, exempt from this file's `set -e` the same way
+# the rest of its guard clauses are), and additionally checks the envelope's
+# own `ok` field (some gc paths print an error envelope and still exit 0).
+# It resolves to exactly one of three states — never collapses the last two:
+#   - valid data / legitimate-empty: prints the raw JSON to stdout, returns
+#     0. The JSON may legitimately describe an empty result (e.g.
+#     {"sessions": []}) — that is for the CALLER to determine via its own
+#     field-specific jq query, exactly as before this fix. This helper only
+#     answers "did the call itself succeed", not "was the result empty".
+#   - FAILURE: prints nothing, returns 1. Callers MUST treat this distinctly
+#     from a legitimate empty result — never proceed as if the answer was
+#     "no data" (defer/retry/explicit fail-open per call site's own policy).
+#
+# Usage:
+#   if _OUT=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json); then
+#     ... use $_OUT, e.g. echo "$_OUT" | jq '.sessions | length' ...
+#   else
+#     ... gc call FAILED — decide explicitly what this call site does ...
+#   fi
+# Or, for a memoized cache that should retry-on-failure rather than pin an
+# empty sentinel: CACHE=$(gc_json_or_unknown gc ...) || true; [ -z "$CACHE" ]
+# unambiguously means "failed" — a real success is never an empty string
+# (this helper's own success path always prints at least "{}"/"[]").
+#
+# ga-07rb3: relocated from near the bottom of this file (was defined AFTER
+# validate_rig, its first caller here — harmless for the two call sites that
+# already existed further down, but would have been a "command not found" at
+# runtime for validate_rig's own use added by this same story). Defining it
+# once, early, keeps every in-file caller — this one plus the two below —
+# working regardless of call order.
+gc_json_or_unknown() {
+  local _gjou_out _gjou_rc
+  if _gjou_out=$("$@" 2>/dev/null); then
+    _gjou_rc=0
+  else
+    _gjou_rc=$?
+  fi
+  [ "$_gjou_rc" -eq 0 ] || return 1
+  [ -n "$_gjou_out" ] || return 1
+  if ! printf '%s' "$_gjou_out" | jq -e . >/dev/null 2>&1; then
+    return 1   # exit 0 but unparseable — never hand malformed JSON upstream
+  fi
+  if printf '%s' "$_gjou_out" | jq -e 'has("ok") and (.ok == false)' >/dev/null 2>&1; then
+    return 1   # exit 0 but envelope explicitly says ok:false
+  fi
+  printf '%s' "$_gjou_out"
+  return 0
+}
+
 # Validate rig name against the known registered rigs.
 validate_rig() {
   local val="$1"
-  local known_rigs
-  known_rigs=$(gc --city "$GC_CITY" rig list --json 2>/dev/null \
-    | jq -r '.rigs[].name' 2>/dev/null || echo "")
+  local known_rigs known_rigs_json
+  # ga-07rb3: known_rigs empty ALREADY gets an explicit, deliberate fallback
+  # below (warn + regex-based injection check) regardless of WHY it's empty —
+  # this just makes "gc genuinely failed" distinguishable from "gc succeeded,
+  # zero rigs registered" in that warning, rather than relying on a bare
+  # `|| echo ""` that would also silently swallow a malformed-but-exit-0 envelope.
+  known_rigs_json=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json) || true
+  known_rigs=$(printf '%s' "$known_rigs_json" | jq -r '.rigs[].name' 2>/dev/null)
   if [ -z "$known_rigs" ]; then
     warn "Could not fetch rig list for validation; allowing rig='$val' with caution."
     # Still reject obvious injection attempts
@@ -2140,60 +2213,6 @@ fi
 #      suffix → "digo" (the crew role/identity). Prevents false unresolvable on crew beads.
 
 AUTHOR=""
-
-# gc_json_or_unknown <cmd...>
-#
-# ga-07509: `VAR=$(gc ... --json 2>/dev/null || echo "")` does not protect
-# against a failing `gc` call — gc still prints a JSON envelope to STDOUT
-# even when it exits non-zero (e.g. {"ok":false,"error":{...}}, or for
-# `gc bd <sub>` a bare {"error":"..."} with no "ok" key at all), so the
-# command substitution already captured that non-empty envelope before
-# `|| echo` ever runs. The envelope then parses as valid JSON, and a
-# downstream `.field | length` read on it silently returns 0 —
-# indistinguishable from "queried successfully, zero results".
-#
-# This wrapper captures the REAL exit code before anything can discard it
-# (via `if VAR=$(...); then`, exempt from this file's `set -e` the same way
-# the rest of its guard clauses are), and additionally checks the envelope's
-# own `ok` field (some gc paths print an error envelope and still exit 0).
-# It resolves to exactly one of three states — never collapses the last two:
-#   - valid data / legitimate-empty: prints the raw JSON to stdout, returns
-#     0. The JSON may legitimately describe an empty result (e.g.
-#     {"sessions": []}) — that is for the CALLER to determine via its own
-#     field-specific jq query, exactly as before this fix. This helper only
-#     answers "did the call itself succeed", not "was the result empty".
-#   - FAILURE: prints nothing, returns 1. Callers MUST treat this distinctly
-#     from a legitimate empty result — never proceed as if the answer was
-#     "no data" (defer/retry/explicit fail-open per call site's own policy).
-#
-# Usage:
-#   if _OUT=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json); then
-#     ... use $_OUT, e.g. echo "$_OUT" | jq '.sessions | length' ...
-#   else
-#     ... gc call FAILED — decide explicitly what this call site does ...
-#   fi
-# Or, for a memoized cache that should retry-on-failure rather than pin an
-# empty sentinel: CACHE=$(gc_json_or_unknown gc ...) || true; [ -z "$CACHE" ]
-# unambiguously means "failed" — a real success is never an empty string
-# (this helper's own success path always prints at least "{}"/"[]").
-gc_json_or_unknown() {
-  local _gjou_out _gjou_rc
-  if _gjou_out=$("$@" 2>/dev/null); then
-    _gjou_rc=0
-  else
-    _gjou_rc=$?
-  fi
-  [ "$_gjou_rc" -eq 0 ] || return 1
-  [ -n "$_gjou_out" ] || return 1
-  if ! printf '%s' "$_gjou_out" | jq -e . >/dev/null 2>&1; then
-    return 1   # exit 0 but unparseable — never hand malformed JSON upstream
-  fi
-  if printf '%s' "$_gjou_out" | jq -e 'has("ok") and (.ok == false)' >/dev/null 2>&1; then
-    return 1   # exit 0 but envelope explicitly says ok:false
-  fi
-  printf '%s' "$_gjou_out"
-  return 0
-}
 
 # bead_field_grep <raw_json_text> <field_name>
 # Extracts a simple string field from potentially-malformed JSON output.
