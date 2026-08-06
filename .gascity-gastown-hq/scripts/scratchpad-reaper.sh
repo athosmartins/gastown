@@ -18,10 +18,13 @@
 #   1. DEAD  — <session-id> (the UUID segment, matches `gc session list --json`'s
 #      `.sessions[].session_key`) does NOT appear in the default `gc session
 #      list` output (active + suspended + anything not closed). Absence = dead.
-#   2. STALE — directory mtime is older than MIN_AGE_HOURS (default 24h). This
-#      is a grace buffer on top of the liveness check, not the primary safety
-#      mechanism — it protects against a session that died moments ago and
-#      whose disappearance from the live list hasn't propagated yet.
+#   2. STALE — directory mtime is older than MIN_AGE_HOURS (default 24h), OR
+#      (ga-rjhfz) the caller signals SCRATCHPAD_REAPER_PRESSURE=CRITICAL and
+#      the directory is BOTH at least CRITICAL_MIN_AGE_HOURS old (default 1h)
+#      AND at least LARGE_GB large (default 2GB). Either way this is a grace
+#      buffer on top of the liveness check, not the primary safety mechanism —
+#      it protects against a session that died moments ago and whose
+#      disappearance from the live list hasn't propagated yet.
 #
 # SAFETY (ga-02pnu's explicit ask: "NUNCA reapar sessao ATIVA ... nem o dir da
 # sessao corrente"):
@@ -42,8 +45,30 @@
 #
 # OUT OF SCOPE: does not touch `tasks/` or any other per-session directory;
 # does not reap registered git worktrees (worktree-reaper's job); does not
-# gate on disk pressure itself — the caller (dolt-disk-floor-guard.sh) decides
-# WHEN to invoke this; this script always applies the same dead+stale criteria.
+# decide WHEN to run under pressure — the caller (dolt-disk-floor-guard.sh)
+# still owns that decision and passes SCRATCHPAD_REAPER_PRESSURE as a signal,
+# it is never self-detected here.
+#
+# SIZE ESCAPE (ga-rjhfz, 2026-08-06): a 2026-08-06 CRITICAL disk incident
+# (avail=3GB for 2 cycles) found the standard reclaim levers recovered
+# nothing, while a single dead session's scratchpad sat at 10GB and only 3.5h
+# old — stuck behind the 24h MIN_AGE_HOURS gate no matter how severe the
+# pressure got. Age-only staleness is structurally incapable of releasing the
+# single largest recoverable item during a crisis, and the faster a session
+# fills disk the MORE certain it is to still be under 24h old when pressure
+# hits. Fix: when the caller sets SCRATCHPAD_REAPER_PRESSURE=CRITICAL, a dead
+# candidate that is at least LARGE_GB (default 2GB) may reap once it clears
+# the much shorter CRITICAL_MIN_AGE_HOURS (default 1h) instead of the full
+# MIN_AGE_HOURS — see `_should_reap_size_escape`. This NEVER touches the
+# liveness/self-protection gate (`_is_dead`, shared verbatim with the normal
+# path) — only how stale a dead-and-large directory needs to be. Outside
+# SCRATCHPAD_REAPER_PRESSURE=CRITICAL (unset, or e.g. "WARN"), behavior is
+# byte-identical to before ga-rjhfz. A dead candidate that qualifies for
+# neither path is logged explicitly as PULADO (skipped) with its size and
+# age, and the per-cycle summary distinguishes "nada encontrado" (no dead
+# candidates at all) from "nada elegivel" (dead candidates existed, none
+# qualified) — the prior generic summary read identically for both, which is
+# exactly what made the 10GB survivor invisible in the caller's own report.
 #
 # Kill switch: SCRATCHPAD_REAPER_ENABLED=0 -> dry-run regardless of
 # SCRATCHPAD_REAPER_DRY_RUN (logs candidates, deletes nothing).
@@ -74,6 +99,12 @@ DRY_RUN="${SCRATCHPAD_REAPER_DRY_RUN:-0}"
 MIN_AGE_HOURS="${SCRATCHPAD_REAPER_MIN_AGE_HOURS:-24}"
 SELF_SESSION_ID="${CLAUDE_CODE_SESSION_ID:-}"
 PROD="${SCRATCHPAD_REAPER_PROD:-0}"
+# ga-rjhfz: size-escape config. PRESSURE is a caller-supplied signal (never
+# self-detected) — only "CRITICAL" activates the escape; unset/anything else
+# (e.g. "WARN") leaves behavior identical to before ga-rjhfz.
+LARGE_GB="${SCRATCHPAD_REAPER_LARGE_GB:-2}"
+CRITICAL_MIN_AGE_HOURS="${SCRATCHPAD_REAPER_CRITICAL_MIN_AGE_HOURS:-1}"
+PRESSURE="${SCRATCHPAD_REAPER_PRESSURE:-}"
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
@@ -107,16 +138,49 @@ _is_stale() {
   [ $(( (now - mtime) / 3600 )) -ge "$min_hours" ]
 }
 
-# _should_reap <session_id> <live_keys_file> <mtime_epoch> <now_epoch>
-#              <min_age_hours> <self_session_id>
-# → 0 (true) iff: not the caller's own session, AND not in the live list, AND
-# stale past min_age_hours. This is the SOLE gate for deletion — it composes
-# every safety condition so no caller can accidentally skip one of them.
-_should_reap() {
-  local sid="$1" keyfile="$2" mtime="$3" now="$4" min_hours="$5" self="$6"
+# _is_dead <session_id> <live_keys_file> <self_session_id> → 0 (true) iff NOT
+# the caller's own session AND NOT in the live list. ga-rjhfz: extracted out
+# of _should_reap so the CRITICAL-pressure size escape below can reuse this
+# EXACT same absolute gate instead of re-deriving it — pressure must never get
+# its own, potentially looser, copy of self/liveness protection.
+_is_dead() {
+  local sid="$1" keyfile="$2" self="$3"
   [ -n "$self" ] && [ "$sid" = "$self" ] && return 1
   _session_is_live "$sid" "$keyfile" && return 1
+  return 0
+}
+
+# _should_reap <session_id> <live_keys_file> <mtime_epoch> <now_epoch>
+#              <min_age_hours> <self_session_id>
+# → 0 (true) iff: dead (see _is_dead) AND stale past min_age_hours. This is
+# the normal-pressure gate for deletion — it composes every safety condition
+# so no caller can accidentally skip one of them. Behavior unchanged by
+# ga-rjhfz (still just _is_dead + _is_stale); see _should_reap_size_escape
+# below for the CRITICAL-pressure-only widening.
+_should_reap() {
+  local sid="$1" keyfile="$2" mtime="$3" now="$4" min_hours="$5" self="$6"
+  _is_dead "$sid" "$keyfile" "$self" || return 1
   _is_stale "$mtime" "$now" "$min_hours"
+}
+
+# _should_reap_size_escape <session_id> <live_keys_file> <mtime_epoch>
+#     <now_epoch> <critical_min_age_hours> <self_session_id> <size_kb>
+#     <large_gb>
+# → 0 (true) iff: dead (SAME _is_dead as _should_reap — self/liveness are
+# NEVER loosened by pressure) AND at/past critical_min_age_hours old AND
+# at/past large_gb in size. ga-rjhfz: under CRITICAL disk pressure, a large
+# dead scratchpad shouldn't have to wait out the FULL MIN_AGE_HOURS grace
+# window — but it still needs SOME age buffer (protects a session that died
+# moments ago, same reasoning as MIN_AGE_HOURS itself) and it still needs to
+# actually be large enough to matter. Unreadable/non-numeric size_kb NEVER
+# authorizes (fails toward keep, same idiom as _is_stale's mtime handling).
+_should_reap_size_escape() {
+  local sid="$1" keyfile="$2" mtime="$3" now="$4" critical_min_hours="$5" self="$6" size_kb="$7" large_gb="$8"
+  _is_dead "$sid" "$keyfile" "$self" || return 1
+  _is_stale "$mtime" "$now" "$critical_min_hours" || return 1
+  case "$size_kb" in ''|*[!0-9]*) return 1 ;; esac
+  case "$large_gb" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$size_kb" -ge $(( large_gb * 1024 * 1024 )) ]
 }
 
 # _prod_sentinel_active <resolved_root> <real_default_root> <prod_flag> → 0
@@ -157,6 +221,15 @@ _fetch_live_keys() {
   printf '%s' "$raw" | jq -r '.sessions[]?.session_key // empty' > "$out" 2>/dev/null
 }
 
+# _dir_size_kb <dir> → prints size in KB (via `du -sk`), empty on failure.
+# ga-rjhfz: thin wrapper so main()'s size-escape decision and skip-logging
+# are stubbable in tests without creating real multi-GB fixture directories —
+# same reasoning as _fetch_live_keys being its own function instead of an
+# inline `gc session list` call.
+_dir_size_kb() {
+  du -sk "$1" 2>/dev/null | awk '{print $1}'
+}
+
 main() {
   if [ ! -d "$SCRATCH_ROOT" ]; then
     log "SCRATCH_ROOT $SCRATCH_ROOT does not exist — nothing to do"
@@ -179,28 +252,74 @@ main() {
 
   now=$(date +%s)
   shopt -s nullglob
-  local dir sid proj mtime kb
+  local dir sid proj mtime kb reap_reason age_h
+  local scanned=0 skipped=0
   for dir in "$SCRATCH_ROOT"/*/*/scratchpad; do
     [ -d "$dir" ] || continue
+    scanned=$((scanned + 1))
     sid="$(basename "$(dirname "$dir")")"
     proj="$(basename "$(dirname "$(dirname "$dir")")")"
     mtime="$(stat -f %m "$dir" 2>/dev/null || echo "")"
-    if _should_reap "$sid" "$keyfile" "$mtime" "$now" "$MIN_AGE_HOURS" "$SELF_SESSION_ID"; then
-      candidates=$((candidates + 1))
-      kb="$(du -sk "$dir" 2>/dev/null | awk '{print $1}')"
+    kb=""
+    reap_reason=""
+
+    # Self/liveness is ABSOLUTE and identical for both paths below — pressure
+    # never gets a say in it. A live or self dir isn't even a "candidate";
+    # skip silently, exactly as before ga-rjhfz.
+    _is_dead "$sid" "$keyfile" "$SELF_SESSION_ID" || continue
+
+    if _is_stale "$mtime" "$now" "$MIN_AGE_HOURS"; then
+      reap_reason="age"
+    elif [ "$PRESSURE" = "CRITICAL" ]; then
+      # Only pay the du(1) cost for the size-escape check when pressure
+      # actually makes it relevant — a dir already reaping via the normal
+      # age path, or with no CRITICAL signal at all, never needs it here.
+      kb="$(_dir_size_kb "$dir")"
+      if _should_reap_size_escape "$sid" "$keyfile" "$mtime" "$now" "$CRITICAL_MIN_AGE_HOURS" "$SELF_SESSION_ID" "${kb:-0}" "$LARGE_GB"; then
+        reap_reason="size-escape"
+      fi
+    fi
+
+    candidates=$((candidates + 1))
+
+    if [ -n "$reap_reason" ]; then
+      [ -n "$kb" ] || kb="$(_dir_size_kb "$dir")"
       if [ "$ENABLED" != "1" ] || [ "$DRY_RUN" = "1" ]; then
-        log "DRY-RUN would reap: $proj/$sid/scratchpad (${kb:-?}KB)"
+        log "DRY-RUN would reap ($reap_reason): $proj/$sid/scratchpad (${kb:-?}KB)"
       elif rm -rf "$dir" 2>>"$LOG"; then
         reaped=$((reaped + 1))
         freed_kb=$((freed_kb + ${kb:-0}))
-        log "reaped: $proj/$sid/scratchpad (${kb:-?}KB freed)"
+        log "reaped ($reap_reason): $proj/$sid/scratchpad (${kb:-?}KB freed)"
       else
         log "FAILED to reap: $proj/$sid/scratchpad"
       fi
+    else
+      # ga-rjhfz: a dead-but-ineligible candidate is NEWS, not noise — the
+      # real incident's mail read "cleanup attempted" as "nothing was there"
+      # when 10GB of dead data sat right here, silently skipped. Cite size +
+      # age + every threshold so a human never has to re-derive this by hand.
+      skipped=$((skipped + 1))
+      [ -n "$kb" ] || kb="$(_dir_size_kb "$dir")"
+      case "$mtime" in
+        ''|*[!0-9]*) age_h="?" ;;
+        *) age_h=$(( (now - mtime) / 3600 )) ;;
+      esac
+      log "scratch-reap: candidato morto PULADO: $proj/$sid/scratchpad (${kb:-?}KB, idade=${age_h}h, min_age_hours=${MIN_AGE_HOURS}h, pressure=${PRESSURE:-none}, critical_min_age_hours=${CRITICAL_MIN_AGE_HOURS}h, large_gb=${LARGE_GB}GB)"
     fi
   done
 
-  log "cycle complete: candidates=$candidates reaped=$reaped freed_kb=$freed_kb root=$SCRATCH_ROOT min_age_hours=$MIN_AGE_HOURS enabled=$ENABLED dry_run=$DRY_RUN"
+  # ga-rjhfz: distinguish "nada encontrado" (no dead candidates at all — the
+  # town is quiet) from "nada elegivel" (dead candidates existed, none
+  # qualified) — the prior single generic line read identically for both,
+  # which is exactly what let a real 10GB survivor hide behind "cleanup was
+  # already attempted" in the caller's own incident mail.
+  if [ "$candidates" -eq 0 ]; then
+    log "cycle complete: nada encontrado (scanned=$scanned dead_candidates=0) root=$SCRATCH_ROOT min_age_hours=$MIN_AGE_HOURS pressure=${PRESSURE:-none}"
+  elif [ "$reaped" -eq 0 ]; then
+    log "cycle complete: nada elegivel ($candidates candidato(s) morto(s), 0 elegivel — ver PULADO acima) scanned=$scanned root=$SCRATCH_ROOT min_age_hours=$MIN_AGE_HOURS pressure=${PRESSURE:-none} critical_min_age_hours=$CRITICAL_MIN_AGE_HOURS large_gb=$LARGE_GB"
+  else
+    log "cycle complete: candidates=$candidates reaped=$reaped skipped=$skipped freed_kb=$freed_kb scanned=$scanned root=$SCRATCH_ROOT min_age_hours=$MIN_AGE_HOURS pressure=${PRESSURE:-none} enabled=$ENABLED dry_run=$DRY_RUN"
+  fi
 }
 
 # ── run unless sourced as a library (selftest sources with SCRATCHPAD_REAPER_LIB=1) ──

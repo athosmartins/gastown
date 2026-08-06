@@ -283,7 +283,19 @@ _safe_reclaim() {
 # real default; without it, a harness bug that leaves that root at the default
 # (exactly what caused the sibling transcript-reaper.sh incident) forces a
 # dry-run instead of deleting real data.
+#
+# <was_critical> (ga-rjhfz, optional, defaults "0"): main() passes whether
+# THIS cycle was CRITICAL at any point (pre- or post-reclaim — see the
+# was_critical latch above). "1" sets SCRATCHPAD_REAPER_PRESSURE=CRITICAL,
+# which is the ONLY thing that activates scratchpad-reaper.sh's own
+# size-escape gate (independently selftested there) — a large dead scratchpad
+# too fresh for its normal 24h grace window can still be freed during a real
+# crisis instead of surviving it, which is what happened 2026-08-06 (a 10GB/
+# 3.5h dead scratchpad outlived two CRITICAL cycles because age was the only
+# gate). "0"/omitted leaves the variable unset — behavior identical to before
+# ga-rjhfz.
 _reap_dead_scratch() {
+  local was_critical="${1:-0}"
   if [ "$ENABLED" != "1" ]; then
     log "scratch-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
     return
@@ -293,11 +305,20 @@ _reap_dead_scratch() {
     log "scratch-reap SKIP — $reaper not found"
     return
   fi
-  log "scratch-reap: running dead-session scratchpad cleanup …"
-  if SCRATCHPAD_REAPER_PROD=1 timeout 60 bash "$reaper" >> "$LOG" 2>&1; then
-    log "scratch-reap OK"
+  if [ "$was_critical" = "1" ]; then
+    log "scratch-reap: running dead-session scratchpad cleanup (pressure=CRITICAL, size-escape eligible) …"
+    if SCRATCHPAD_REAPER_PROD=1 SCRATCHPAD_REAPER_PRESSURE=CRITICAL timeout 60 bash "$reaper" >> "$LOG" 2>&1; then
+      log "scratch-reap OK"
+    else
+      log "scratch-reap FAILED or aborted (nonzero exit) — see log lines above"
+    fi
   else
-    log "scratch-reap FAILED or aborted (nonzero exit) — see log lines above"
+    log "scratch-reap: running dead-session scratchpad cleanup …"
+    if SCRATCHPAD_REAPER_PROD=1 timeout 60 bash "$reaper" >> "$LOG" 2>&1; then
+      log "scratch-reap OK"
+    else
+      log "scratch-reap FAILED or aborted (nonzero exit) — see log lines above"
+    fi
   fi
 }
 
@@ -402,7 +423,7 @@ main() {
 
   _read_state
   _safe_reclaim "$avail"
-  _reap_dead_scratch
+  _reap_dead_scratch "$was_critical"
   _reap_dead_transcripts
 
   # re-read avail — reclaim may have freed space; `class` becomes the CURRENT

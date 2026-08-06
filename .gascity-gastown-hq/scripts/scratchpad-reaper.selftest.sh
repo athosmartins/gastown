@@ -145,5 +145,170 @@ echo "=== production constant sanity (ga-h565g) ==="
 # default-resolution line and the sentinel-comparison constant).
 [ "$PRODUCTION_REAL_DEFAULT_ROOT" = "/private/tmp/claude-$(id -u)" ] && ok "production constant: SCRATCH_REAL_DEFAULT_ROOT matches the expected real default path" || bad "production constant drifted: got '$PRODUCTION_REAL_DEFAULT_ROOT'"
 
+echo ""
+echo "=== _is_dead: extracted self+liveness primitive (ga-rjhfz) ==="
+# ga-rjhfz factors _should_reap's self/liveness half out into _is_dead so the
+# CRITICAL-pressure size-escape gate (below) can reuse the exact same ABSOLUTE
+# check without duplicating it — pressure must never get its own, potentially
+# looser, copy of this logic.
+_is_dead "dead-session-9"  "$KEYFILE" ""               && ok "is_dead: dead, no self set → true"                                  || bad "dead+no-self should be dead"
+_is_dead "alive-session-1" "$KEYFILE" ""                && bad "is_dead: live session must never be dead"                          || ok "is_dead: live session → false"
+_is_dead "dead-session-9"  "$KEYFILE" "dead-session-9"  && bad "is_dead: CURRENT session id must never be dead"                     || ok "is_dead: self id → false (self-protection)"
+_is_dead "alive-session-1" "$KEYFILE" "dead-session-9"  && bad "is_dead: unrelated self id must not change a live session's outcome" || ok "is_dead: self set but different id → still protected by liveness"
+
+echo ""
+echo "=== _should_reap_size_escape: ga-rjhfz CRITICAL-pressure large-dead-dir escape ==="
+# Composes _is_dead (ABSOLUTE — self/liveness, identical to _should_reap's own
+# gate) with its OWN age+size thresholds. Never widens self/liveness; only
+# ever widens how STALE a dead dir needs to be, and only when it's also large.
+LARGE_KB=$(( 2 * 1024 * 1024 ))   # 2GB in KB, matching the default large_gb=2
+BIG=$(( LARGE_KB + 1024 ))        # just over 2GB
+SMALL=$(( LARGE_KB - 1024 ))      # just under 2GB
+CRIT_OLD=$(( NOW - 2*3600 ))      # 2h old — past a 1h critical_min_age_hours
+CRIT_FRESH=$(( NOW - 30*60 ))     # 30min old — under a 1h critical_min_age_hours
+
+_should_reap_size_escape "dead-session-9"  "$KEYFILE" "$CRIT_OLD"   "$NOW" 1 ""              "$BIG"      2 && ok "size_escape: dead + old-enough + large-enough → escape reap"                                    || bad "dead+2h+big should size-escape"
+_should_reap_size_escape "alive-session-1" "$KEYFILE" "$CRIT_OLD"   "$NOW" 1 ""              "$BIG"      2 && bad "size_escape: live session must NEVER escape-reap regardless of size/pressure"                  || ok "size_escape: live session → never (liveness absolute)"
+_should_reap_size_escape "dead-session-9"  "$KEYFILE" "$CRIT_OLD"   "$NOW" 1 "dead-session-9" "$BIG"      2 && bad "size_escape: CURRENT session id must never escape-reap"                                        || ok "size_escape: self id → never (self-protection absolute)"
+_should_reap_size_escape "dead-session-9"  "$KEYFILE" "$CRIT_FRESH" "$NOW" 1 ""              "$BIG"      2 && bad "size_escape: dead+large but younger than critical_min_age_hours must NOT escape"               || ok "size_escape: too fresh for critical window → not yet"
+_should_reap_size_escape "dead-session-9"  "$KEYFILE" "$CRIT_OLD"   "$NOW" 1 ""              "$SMALL"    2 && bad "size_escape: dead+old-enough but under large_gb must NOT escape"                               || ok "size_escape: too small → not eligible"
+_should_reap_size_escape "dead-session-9"  "$KEYFILE" "$CRIT_OLD"   "$NOW" 1 ""              ""          2 && bad "size_escape: empty/unreadable size must NEVER authorize (fail toward keep)"                    || ok "size_escape: empty size_kb → false"
+_should_reap_size_escape "dead-session-9"  "$KEYFILE" "$CRIT_OLD"   "$NOW" 1 ""              "abc"       2 && bad "size_escape: non-numeric size must NEVER authorize"                                            || ok "size_escape: non-numeric size_kb → false"
+_should_reap_size_escape "dead-session-9"  "$KEYFILE" "$CRIT_OLD"   "$NOW" 1 ""              "$LARGE_KB" 2 && ok "size_escape: exactly at large_gb boundary → eligible (inclusive)"                                || bad "exactly 2GB should be inclusive"
+
+echo ""
+echo "=== main(): ga-rjhfz size-escape under CRITICAL pressure (bead ACEITE criteria) ==="
+# Hermetic: own fixture root (never the real default — sentinel stays
+# inactive, same non-regression trick as the FIXTURE_ROOT scenario above),
+# own liveness stub (toggle FAKE_LIVE_SID per scenario instead of the
+# always-empty stub used by the sentinel section above), and _dir_size_kb
+# STUBBED so multi-GB scenarios never touch real disk — a fixture dir is a
+# few bytes on disk; only the stubbed return value claims it's 10GB.
+PRESSURE_ROOT="$(mktemp -d /tmp/scratchpad-reaper-selftest-pressure.XXXXXX)"
+SCRATCH_REAL_DEFAULT_ROOT="/private/tmp/claude-nonexistent-marker-ga-rjhfz-$$"
+SCRATCH_ROOT="$PRESSURE_ROOT"
+# shellcheck disable=SC2034  # read by main()/_should_reap in the sourced script
+MIN_AGE_HOURS=24
+# shellcheck disable=SC2034  # read by main()/_should_reap_size_escape in the sourced script
+CRITICAL_MIN_AGE_HOURS=1
+# shellcheck disable=SC2034  # read by main()/_should_reap_size_escape in the sourced script
+LARGE_GB=2
+# shellcheck disable=SC2034  # read by main() in the sourced script
+ENABLED=1
+# shellcheck disable=SC2034  # read by main() in the sourced script
+DRY_RUN=0
+# shellcheck disable=SC2034  # read by _prod_sentinel_active() in the sourced script
+PROD=0
+# shellcheck disable=SC2034  # read by main() in the sourced script
+SELF_SESSION_ID=""
+
+FAKE_LIVE_SID=""
+_fetch_live_keys() {
+  if [ -n "$FAKE_LIVE_SID" ]; then printf '%s\n' "$FAKE_LIVE_SID" > "$1"; else : > "$1"; fi
+}
+FAKE_SIZE_KB=""
+_dir_size_kb() { printf '%s' "$FAKE_SIZE_KB"; }
+
+make_pressure_fixture() {  # make_pressure_fixture <sid> <touch_ts>
+  rm -rf "$PRESSURE_ROOT/proj/$1"
+  mkdir -p "$PRESSURE_ROOT/proj/$1/scratchpad"
+  touch -t "$2" "$PRESSURE_ROOT/proj/$1/scratchpad"
+}
+TS_3H30="$(date -v-3H -v-30M +%Y%m%d%H%M.%S)"   # dead+3.5h: too fresh for MIN_AGE_HOURS=24, old enough for critical(1h)
+TS_10MIN="$(date -v-10M +%Y%m%d%H%M.%S)"        # dead+10min: too fresh even for the critical window
+
+# ACEITE #1 — the incident itself: dead, ~10GB, 3.5h old, CRITICAL pressure →
+# today's code leaves this stuck behind the 24h gate; the fix must free it.
+make_pressure_fixture "dead-big" "$TS_3H30"
+FAKE_LIVE_SID=""; FAKE_SIZE_KB=$(( 10 * 1024 * 1024 )); PRESSURE=CRITICAL
+main
+[ -d "$PRESSURE_ROOT/proj/dead-big/scratchpad" ] && bad "ACEITE#1: dead+10G+3.5h under CRITICAL should be REAPED, but it survived" || ok "ACEITE#1: dead+10G+3.5h under CRITICAL pressure → reaped (size-escape)"
+
+# ACEITE #2 — identical dir, but the session is LIVE: pressure must NEVER
+# matter. This is the only proof that liveness wasn't loosened along with age.
+make_pressure_fixture "live-big" "$TS_3H30"
+FAKE_LIVE_SID="live-big"; FAKE_SIZE_KB=$(( 10 * 1024 * 1024 )); PRESSURE=CRITICAL
+main
+[ -d "$PRESSURE_ROOT/proj/live-big/scratchpad" ] && ok "ACEITE#2: LIVE session's 10G/3.5h dir survives CRITICAL pressure (liveness never loosened)" || bad "ACEITE#2: REGRESSION — a LIVE session's scratchpad was reaped under pressure"
+
+# Same proof for the OTHER absolute gate: the caller's own current session.
+make_pressure_fixture "self-big" "$TS_3H30"
+FAKE_LIVE_SID=""; SELF_SESSION_ID="self-big"; FAKE_SIZE_KB=$(( 10 * 1024 * 1024 )); PRESSURE=CRITICAL
+main
+# shellcheck disable=SC2034  # read by main() in the sourced script
+SELF_SESSION_ID=""
+[ -d "$PRESSURE_ROOT/proj/self-big/scratchpad" ] && ok "ACEITE#2b: CURRENT session's own 10G/3.5h dir survives CRITICAL pressure (self-protection never loosened)" || bad "ACEITE#2b: REGRESSION — the caller's OWN session scratchpad was reaped under pressure"
+
+# ACEITE #3 — same dead+10G+3.5h dir, but no CRITICAL signal at all (ordinary
+# WARN or a manual/non-guard invocation) → behavior outside CRITICAL is
+# byte-identical to before ga-rjhfz: too fresh for 24h, survives.
+make_pressure_fixture "dead-big-nopressure" "$TS_3H30"
+FAKE_LIVE_SID=""; FAKE_SIZE_KB=$(( 10 * 1024 * 1024 )); PRESSURE=""
+main
+[ -d "$PRESSURE_ROOT/proj/dead-big-nopressure/scratchpad" ] && ok "ACEITE#3: outside CRITICAL pressure, dead+10G+3.5h survives — 24h behavior unchanged (no regression)" || bad "ACEITE#3: REGRESSION — reaped a fresh dir with no pressure signal"
+
+# WARN specifically (not just unset) must not get the escape either — the
+# bead scopes the widened gate to CRITICAL only.
+make_pressure_fixture "dead-big-warn" "$TS_3H30"
+FAKE_LIVE_SID=""; FAKE_SIZE_KB=$(( 10 * 1024 * 1024 )); PRESSURE="WARN"
+main
+[ -d "$PRESSURE_ROOT/proj/dead-big-warn/scratchpad" ] && ok "ACEITE#3b: WARN pressure (not CRITICAL) does not get the size-escape either" || bad "ACEITE#3b: REGRESSION — WARN pressure reaped a fresh dir (escape must be CRITICAL-only)"
+
+# Dead + old enough + CRITICAL, but under LARGE_GB → still survives.
+make_pressure_fixture "dead-small" "$TS_3H30"
+FAKE_LIVE_SID=""; FAKE_SIZE_KB=$(( 500 * 1024 )); PRESSURE=CRITICAL
+main
+[ -d "$PRESSURE_ROOT/proj/dead-small/scratchpad" ] && ok "size_escape: dead+500MB+3.5h under CRITICAL survives (too small for LARGE_GB=2)" || bad "REGRESSION — reaped a small dir under the size-escape"
+
+# Dead + large + CRITICAL, but younger than CRITICAL_MIN_AGE_HOURS → survives
+# (the escape still needs SOME age buffer — protects a session that died
+# moments ago from being reaped before its death has even settled).
+make_pressure_fixture "dead-fresh" "$TS_10MIN"
+FAKE_LIVE_SID=""; FAKE_SIZE_KB=$(( 10 * 1024 * 1024 )); PRESSURE=CRITICAL
+main
+[ -d "$PRESSURE_ROOT/proj/dead-fresh/scratchpad" ] && ok "size_escape: dead+10G+10min under CRITICAL survives (younger than critical_min_age_hours=1)" || bad "REGRESSION — reaped a 10-minute-old dir under the size-escape"
+
+echo ""
+echo "=== main(): skip-logging + cycle-summary distinguish nada-elegivel from nada-encontrado (ga-rjhfz) ==="
+# The real incident's mail said "cleanup was already attempted" when 10GB of
+# genuinely-dead data existed but wasn't eligible — "tried and found nothing"
+# and "tried and nothing qualified" collapsed into the same silence. These
+# assertions are the log-level half of the fix: a dead-but-ineligible
+# candidate must be named explicitly (not silently skipped), and the cycle
+# summary must use different words for "nothing was even dead" vs "something
+# was dead but none qualified".
+SKIP_LOG="$(mktemp /tmp/scratchpad-reaper-selftest-skiplog.XXXXXX)"
+# shellcheck disable=SC2034  # read by log() in the sourced script
+LOG="$SKIP_LOG"
+
+make_pressure_fixture "dead-fresh2" "$TS_10MIN"
+: > "$SKIP_LOG"
+FAKE_LIVE_SID=""; FAKE_SIZE_KB=$(( 10 * 1024 * 1024 ))
+# shellcheck disable=SC2034  # read by main() in the sourced script
+PRESSURE=CRITICAL
+main
+if grep -q "PULADO" "$SKIP_LOG" && grep -q "dead-fresh2" "$SKIP_LOG"; then
+  ok "skip-log: dead-but-ineligible candidate gets an explicit PULADO line (not silent)"
+else
+  bad "skip-log: no explicit PULADO line for a dead-but-ineligible candidate — got: $(cat "$SKIP_LOG")"
+fi
+if grep -q "nada elegivel" "$SKIP_LOG"; then
+  ok "cycle-summary: candidates found but none eligible → reports 'nada elegivel' explicitly"
+else
+  bad "cycle-summary: did not distinguish 'nada elegivel' — got: $(cat "$SKIP_LOG")"
+fi
+
+EMPTY_ROOT="$(mktemp -d /tmp/scratchpad-reaper-selftest-empty.XXXXXX)"
+# shellcheck disable=SC2034  # read by main() in the sourced script
+SCRATCH_ROOT="$EMPTY_ROOT"
+: > "$SKIP_LOG"
+main
+if grep -q "nada encontrado" "$SKIP_LOG" && ! grep -q "nada elegivel" "$SKIP_LOG"; then
+  ok "cycle-summary: empty root → reports 'nada encontrado', distinct from 'nada elegivel'"
+else
+  bad "cycle-summary: empty root did not report 'nada encontrado' distinctly — got: $(cat "$SKIP_LOG")"
+fi
+rm -rf "$EMPTY_ROOT" "$PRESSURE_ROOT" "$SKIP_LOG"
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

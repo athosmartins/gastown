@@ -111,6 +111,53 @@ fi
 rm -rf "$FAKE_CITY"
 
 echo ""
+echo "=== _reap_dead_scratch: CRITICAL-pressure plumbing (ga-rjhfz) ==="
+# scratchpad-reaper.sh's own size-escape gate (independently selftested)
+# only activates when it sees SCRATCHPAD_REAPER_PRESSURE=CRITICAL.
+# _reap_dead_scratch is the ONLY place that can set it — main() passes
+# was_critical (1 iff this cycle was CRITICAL at any point, pre- or
+# post-reclaim) as $1. Same hermetic fake-CITY/capture-file technique as the
+# PROD=1 wiring test above: never touches the real reaper.
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/scratchpad-reaper.sh" <<EOF
+#!/bin/bash
+echo "PRESSURE=\${SCRATCHPAD_REAPER_PRESSURE:-unset}" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/scratchpad-reaper.sh"
+
+REAL_CITY="$CITY"
+CITY="$FAKE_CITY"
+_reap_dead_scratch 1
+CITY="$REAL_CITY"
+if [ -f "$CAPTURE_FILE" ] && grep -qx "PRESSURE=CRITICAL" "$CAPTURE_FILE"; then
+  ok "_reap_dead_scratch(was_critical=1): sets SCRATCHPAD_REAPER_PRESSURE=CRITICAL (size-escape enabled)"
+else
+  bad "_reap_dead_scratch(was_critical=1): did NOT set SCRATCHPAD_REAPER_PRESSURE=CRITICAL (got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing'))"
+fi
+
+CITY="$FAKE_CITY"
+_reap_dead_scratch 0
+CITY="$REAL_CITY"
+if [ -f "$CAPTURE_FILE" ] && grep -qx "PRESSURE=unset" "$CAPTURE_FILE"; then
+  ok "_reap_dead_scratch(was_critical=0): leaves SCRATCHPAD_REAPER_PRESSURE unset (non-critical cycle, no escape)"
+else
+  bad "_reap_dead_scratch(was_critical=0): should NOT set SCRATCHPAD_REAPER_PRESSURE (got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing'))"
+fi
+
+CITY="$FAKE_CITY"
+_reap_dead_scratch   # no arg at all — must default the same as explicit 0 (backward compatible with the PROD=1 test above, which calls it bare)
+CITY="$REAL_CITY"
+if [ -f "$CAPTURE_FILE" ] && grep -qx "PRESSURE=unset" "$CAPTURE_FILE"; then
+  ok "_reap_dead_scratch(no arg): defaults was_critical to non-critical (backward compatible)"
+else
+  bad "_reap_dead_scratch(no arg): should default to no pressure escape (got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing'))"
+fi
+rm -rf "$FAKE_CITY"
+
+echo ""
 echo "=== _reap_dead_transcripts: production sentinel wiring (ga-lfj05) ==="
 # Same proof as _reap_dead_scratch above, for the sibling lever: transcript-
 # reaper.sh's own header names _reap_dead_transcripts as the ONLY allowed
@@ -262,8 +309,12 @@ _safe_reclaim() { :; }
 # which has its own independent selftest). REAP_CALLS proves main() actually
 # invokes it as part of the reclaim step (integration wiring), without ever
 # running the real reaper (no `gc session list`, no `rm -rf`, hermetic).
+# REAP_LAST_ARG (ga-rjhfz) captures the was_critical arg main() passes, so a
+# scenario below can prove the CRITICAL-latch value actually reaches this
+# call, not just that the call happened.
 REAP_CALLS=0
-_reap_dead_scratch() { REAP_CALLS=$((REAP_CALLS+1)); }
+REAP_LAST_ARG=""
+_reap_dead_scratch() { REAP_CALLS=$((REAP_CALLS+1)); REAP_LAST_ARG="${1:-}"; }
 
 # _reap_dead_transcripts is new (ga-t1ub9), same reasoning: EXECUTION code
 # (shells out to transcript-reaper.sh, which has its own independent unit +
@@ -292,7 +343,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; GC_MAIL_CALLS=0; REAP_CALLS=0; REAP_TRANSCRIPT_CALLS=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; GC_MAIL_CALLS=0; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -417,6 +468,25 @@ if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ]; then
   ok "main(): _reap_dead_scratch AND _reap_dead_transcripts each invoked exactly once alongside _safe_reclaim"
 else
   bad "main(): expected both reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS"
+fi
+if [ "$REAP_LAST_ARG" = "1" ]; then
+  ok "main(): CRITICAL cycle (even after reclaim recovers it to NONE) passes was_critical=1 to _reap_dead_scratch (ga-rjhfz pressure plumbing)"
+else
+  bad "main(): expected _reap_dead_scratch to receive was_critical=1 on a CRITICAL cycle, got REAP_LAST_ARG='$REAP_LAST_ARG'"
+fi
+
+# Scenario E2 (ga-rjhfz) — a cycle that is WARN, never CRITICAL, must pass
+# was_critical=0 — the size-escape must not activate on ordinary WARN
+# pressure. Reuses scenario C's readings (WARN both before and after).
+reset_capture; seed_state "" ""
+past_epoch=$(( $(date +%s) - 100 ))
+seed_state "$past_epoch" 6
+queue_avail 6 6
+main
+if [ "$REAP_LAST_ARG" = "0" ]; then
+  ok "main(): non-critical WARN cycle passes was_critical=0 to _reap_dead_scratch (no size-escape)"
+else
+  bad "main(): expected _reap_dead_scratch to receive was_critical=0 on a WARN-only cycle, got REAP_LAST_ARG='$REAP_LAST_ARG'"
 fi
 
 # Scenario F — a cycle that never reaches the floor at all (avail comfortably
