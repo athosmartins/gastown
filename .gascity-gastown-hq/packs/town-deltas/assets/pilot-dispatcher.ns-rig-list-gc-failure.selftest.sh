@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # pilot-dispatcher.ns-rig-list-gc-failure.selftest.sh — regression harness for
 # ga-07rb3 (gc <cmd> --json error-vs-empty idiom variants beyond ga-07509's 16
-# sites: bare captures + jq-piped fallbacks).
+# sites: bare captures + jq-piped fallbacks) AND ga-130et (_ownership_guard_repos
+# memoization never actually reaching a second real caller in the same sweep,
+# because every real call site wrapped the call in `$(...)`, forking a subshell
+# that discarded the memo state — see section 5 below).
 #
 # ROOT BUG (this file's slice of it): _NS_BRANCH_REPOS and _OWNERSHIP_GUARD_REPOS
 # are built as `{ dirname "$GC_CITY"; gc rig list --json | jq ...; } | awk ...`.
@@ -24,14 +27,16 @@
 #     function some caller wraps in `$(...)`), so a plain global
 #     (_NS_RIG_LIST_OK) works and is what _beadid_has_branch/
 #     _crew_progressed_since consult.
-#   - _ownership_guard_repos() IS a function every caller invokes via
-#     `repos="$(_ownership_guard_repos)"` — a variable it sets internally
-#     would be silently discarded when that subshell exits (caught live by
-#     an earlier draft of this very test: it asserted a variable that never
-#     actually propagated). Fixed by using the function's own RETURN CODE
-#     instead — command substitution's exit status ($?) DOES survive into
-#     the caller, so _ownership_guard_repos returns 1 iff the underlying gc
-#     fetch failed, and the phantom-claim guard checks $? directly.
+#   - _ownership_guard_repos() IS a function every caller invokes UNWRAPPED
+#     (ga-130et) — `_ownership_guard_repos >/dev/null; rc=$?` then a direct
+#     read of $_OWNERSHIP_GUARD_REPOS — never via
+#     `repos="$(_ownership_guard_repos)"`. A command-substitution-wrapped
+#     call forks a subshell; a variable the function sets internally would
+#     be silently discarded when that subshell exits (caught live by an
+#     earlier draft of this very test: it asserted a variable that never
+#     actually propagated). Calling unwrapped avoids the subshell entirely,
+#     so both the memo globals and the function's own RETURN CODE reach the
+#     caller for real — the phantom-claim guard checks $? directly.
 #
 # Extracts the real function bodies from pilot-dispatcher.sh (the canonical
 # copy) rather than re-typing them — same philosophy as
@@ -204,28 +209,27 @@ rm -rf "$SANDBOX_BIN"
 #     Gate reviewer's blocking issue 2 on fix-attempt-1: this scenario was
 #     never exercised. This section closes that gap.
 #
-#     IMPORTANT — why these calls do NOT use `$(_ownership_guard_repos)`
-#     the way every real caller in pilot-dispatcher.sh does: command
-#     substitution forks a subshell, and a subshell's variable assignments
-#     (including _OWNERSHIP_GUARD_REPOS_DONE/_FAILED) never propagate back
-#     to the parent — verified empirically, this is standard POSIX subshell
-#     semantics, not a test artifact. An earlier draft of this test used
-#     `$(...)` for BOTH the priming and checking call and got a FALSE PASS
-#     on the failure scenario (both calls independently re-fetched and
-#     independently failed — coincidentally the same observable result as a
-#     real cache-hit) and a real, honest FAIL on the success scenario
-#     (proving no persistence crosses two separate $(...) calls at all).
-#     That is a SEPARATE, deeper, already-filed bug (ga-130et): because
-#     every one of the 6 real call sites uses `$(...)`, this memoization
-#     never actually triggers in production either — gc rig list --json
-#     refetches on every single call, not once per sweep as documented.
-#     This section tests the FIX's own persistence logic in isolation, via
-#     plain output redirection (`f > file`), which — unlike `$(...)` — does
-#     NOT fork a subshell for a shell function and so lets the assignments
-#     survive, the same way they would if ga-130et is ever fixed and a
-#     caller starts priming this cache with a direct call. This is honest
-#     about testing the fix's logic, not a production end-to-end guarantee;
-#     see ga-130et for the production-reachability caveat.
+#     IMPORTANT — why these calls do NOT use `$(_ownership_guard_repos)`:
+#     command substitution forks a subshell, and a subshell's variable
+#     assignments (including _OWNERSHIP_GUARD_REPOS_DONE/_FAILED) never
+#     propagate back to the parent — verified empirically, this is standard
+#     POSIX subshell semantics, not a test artifact. An earlier draft of
+#     this test used `$(...)` for BOTH the priming and checking call and got
+#     a FALSE PASS on the failure scenario (both calls independently
+#     re-fetched and independently failed — coincidentally the same
+#     observable result as a real cache-hit) and a real, honest FAIL on the
+#     success scenario (proving no persistence crosses two separate `$(...)`
+#     calls at all). At the time this section was written, that was a
+#     SEPARATE, deeper, still-open bug (ga-130et): every one of the 6 real
+#     call sites used `$(...)` too, so this memoization never actually
+#     triggered in production either — gc rig list --json refetched on
+#     every single call, not once per sweep as documented. This section
+#     tests the memoization logic in isolation, via plain output redirection
+#     (`f > file`), which — unlike `$(...)` — does NOT fork a subshell for a
+#     shell function and so lets the assignments survive. ga-130et is now
+#     FIXED (every real call site was switched to this same unwrapped-call
+#     shape) — section 5 below proves it end-to-end through an actual,
+#     unmodified call site instead of this isolated harness.
 # ═════════════════════════════════════════════════════════════════════════
 echo "-- _ownership_guard_repos: cache-HIT after a failure must still return 1 (the real bug) --"
 SANDBOX_BIN2="$(mktemp -d)"
@@ -302,15 +306,65 @@ phantom_block="$(awk '
   /^_beadid_live_crew_owner\(\) \{/ { p=1 }
   p { print; if ($0 == "}") exit }
 ' "$DISPATCHER")"
-if printf '%s' "$phantom_block" | grep -qE '_og_repos="\$\(_ownership_guard_repos[^)]*\)"; *_og_rig_list_ok=\$\?'; then
-  ok "_beadid_live_crew_owner captures _ownership_guard_repos's output AND exit code together"
+if printf '%s' "$phantom_block" | grep -qE '_ownership_guard_repos >/dev/null 2>&1; *_og_rig_list_ok=\$\?'; then
+  ok "_beadid_live_crew_owner calls _ownership_guard_repos unwrapped and captures its exit code (ga-130et shape)"
 else
-  bad "REGRESSION: _beadid_live_crew_owner no longer captures _ownership_guard_repos's exit code the way this fix requires"
+  bad "REGRESSION: _beadid_live_crew_owner no longer calls _ownership_guard_repos unwrapped + captures its exit code the way ga-130et requires"
+fi
+if printf '%s' "$phantom_block" | grep -qE '_og_repos="\$\{_OWNERSHIP_GUARD_REPOS:-\}"'; then
+  ok "_beadid_live_crew_owner reads the memoized repos list directly from the global (ga-130et shape)"
+else
+  bad "REGRESSION: _beadid_live_crew_owner no longer reads \$_OWNERSHIP_GUARD_REPOS directly — may have reverted to a \$(...)-wrapped call"
 fi
 if printf '%s' "$phantom_block" | grep -qE '&& \[ "\$_og_rig_list_ok" -eq 0 \]'; then
   ok "the exit-code check is wired as a required (&&) condition of the release path"
 else
   bad "REGRESSION: \$_og_rig_list_ok is not wired as a required && condition — a gc failure could silently look like 'confirmed no branch' again"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════
+# 5. ga-130et END-TO-END: an actual, unmodified real call site — not this
+#    file's isolated harness — must reuse the memoized fetch across two
+#    "beads" processed in the same simulated sweep. Section 3b proved the
+#    function's OWN persistence logic works via plain redirection; this
+#    proves that proof actually reaches production, by extracting
+#    _target_has_real_branch() verbatim (same extract_fn helper as the
+#    top-of-file loader) and counting real `gc` invocations across two
+#    calls with NO reset of the memo globals in between — exactly how
+#    pilot-dispatcher.sh's real sweep loop calls it once per candidate bead.
+#    Before ga-130et's fix this counted 2 (every call independently
+#    re-fetched); the fix makes it 1.
+# ═════════════════════════════════════════════════════════════════════════
+echo "-- ga-130et end-to-end: _target_has_real_branch (real call site) reuses the memoized fetch across 2 calls --"
+_e2e_src="$(extract_fn _target_has_real_branch "$DISPATCHER")"
+if [ -z "$_e2e_src" ]; then
+  bad "FATAL: _target_has_real_branch() not found in $DISPATCHER — cannot run section 5"
+else
+  eval "$_e2e_src"
+  SANDBOX_BIN5="$(mktemp -d)"
+  GC_CALL_COUNT_FILE="$(mktemp)"
+  echo 0 > "$GC_CALL_COUNT_FILE"
+  cat > "$SANDBOX_BIN5/gc" <<EOF
+#!/usr/bin/env bash
+echo "\$(( \$(cat "$GC_CALL_COUNT_FILE") + 1 ))" > "$GC_CALL_COUNT_FILE"
+echo '{"schema_version":"1","ok":true,"rigs":[]}'
+exit 0
+EOF
+  chmod +x "$SANDBOX_BIN5/gc"
+  _OWNERSHIP_GUARD_REPOS=""
+  _OWNERSHIP_GUARD_REPOS_DONE=""
+  _OWNERSHIP_GUARD_REPOS_FAILED=""
+  PATH="$SANDBOX_BIN5:$PATH" _target_has_real_branch "e2e-bead-one" >/dev/null 2>&1
+  PATH="$SANDBOX_BIN5:$PATH" _target_has_real_branch "e2e-bead-two" >/dev/null 2>&1
+  _gc_calls="$(cat "$GC_CALL_COUNT_FILE" 2>/dev/null || echo "?")"
+  if [ "$_gc_calls" = "1" ]; then
+    ok "ga-130et FIXED end-to-end: 2 real calls to _target_has_real_branch (simulating 2 beads, 1 sweep) invoked gc rig list only ONCE"
+  else
+    bad "ga-130et REGRESSION: 2 real calls to _target_has_real_branch invoked gc $_gc_calls time(s), expected 1 — memoization is not reaching this real call site (a \$(...)-wrapped call may have crept back in)"
+  fi
+  rm -rf "$SANDBOX_BIN5"
+  rm -f "$GC_CALL_COUNT_FILE"
+  unset -f _target_has_real_branch 2>/dev/null || true
 fi
 
 echo ""

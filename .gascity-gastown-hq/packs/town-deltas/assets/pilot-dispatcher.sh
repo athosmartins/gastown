@@ -2455,7 +2455,15 @@ _filter_built() {
       built_reasons="${built_reasons}${id}"$'\t'"branch exists (PILOT_TEST_BRANCH_BEADS test seam)"$'\n'
     done
   elif command -v git >/dev/null 2>&1; then
-    repos="$(_ownership_guard_repos)"
+    # ga-2wcz6: when _filter_built runs via _pilot_emit_dispatchable's early
+    # call chain (painel preview, ~line 2850), this executes BEFORE
+    # _ownership_guard_repos is defined (~line 3368) — "command not found",
+    # $repos empty, branch-consultation silently skipped for that call only.
+    # The real Tier1/Tier2 dispatch path calls _filter_built again later,
+    # after the definition, so actual dispatch is unaffected — separate,
+    # believed-cosmetic bug, not fixed here (see ga-2wcz6 for detail).
+    _ownership_guard_repos >/dev/null
+    repos="${_OWNERSHIP_GUARD_REPOS:-}"
     if [ -n "$repos" ]; then
       while IFS= read -r id; do
         [ -z "$id" ] && continue
@@ -3077,7 +3085,8 @@ _iso_to_epoch() {
 _target_has_real_branch() {
   command -v git >/dev/null 2>&1 || return 1
   local _repos _r
-  _repos="$(_ownership_guard_repos 2>/dev/null)" || return 1
+  _ownership_guard_repos >/dev/null 2>&1 || return 1
+  _repos="${_OWNERSHIP_GUARD_REPOS:-}"
   [ -n "$_repos" ] || return 1
   while IFS= read -r _r; do
     [ -n "$_r" ] && [ -d "$_r" ] || continue
@@ -3168,7 +3177,8 @@ _beadid_live_crew_owner() {
   # risk) — a failed fetch skips this guard (falls through to "not phantom,
   # keep") instead of trusting a town-root-only search.
   local _og_repos _og_rig_list_ok
-  _og_repos="$(_ownership_guard_repos 2>/dev/null)"; _og_rig_list_ok=$?
+  _ownership_guard_repos >/dev/null 2>&1; _og_rig_list_ok=$?
+  _og_repos="${_OWNERSHIP_GUARD_REPOS:-}"
   if [ "$_is_stale" = "1" ] \
      && command -v git >/dev/null 2>&1 \
      && [ -n "$_og_repos" ] \
@@ -3352,13 +3362,24 @@ _crew_progressed_since() {
 # actively RELEASES a bead for re-dispatch when it concludes "no branch". For
 # that one, "town root only, checked, found nothing" must not be trusted the
 # same as "confirmed no branch anywhere" (double-dispatch risk if the branch
-# is rig-side). Every caller invokes this via `repos="$(_ownership_guard_repos)"`
-# — a command SUBSHELL — so a plain internal variable can never signal failure
-# back to the caller (its assignment dies with the subshell). The exit CODE of
-# a command substitution DOES survive it, so: return 1 iff the underlying gc
-# fetch failed (stdout still prints the fail-open town-root-only list either
-# way, unchanged for every non-forcing caller); the phantom-claim guard below
-# is the one caller that additionally checks $? for this reason.
+# is rig-side). Return value: 0 iff the underlying gc fetch succeeded (or
+# never needed to re-run — see ga-130et below), 1 iff it failed; stdout/the
+# global still print the fail-open town-root-only list either way, unchanged
+# for every non-forcing caller. The phantom-claim guard below is the one
+# caller that additionally checks $? for this reason.
+# ga-130et: every real call site invokes this UNWRAPPED — plain
+# `_ownership_guard_repos >/dev/null; rc=$?` — then reads $_OWNERSHIP_GUARD_REPOS
+# directly, never via `repos="$(_ownership_guard_repos)"`. A command
+# substitution forks a subshell, and this function's memo state
+# (_OWNERSHIP_GUARD_REPOS_DONE/_FAILED, both plain internal assignments) dies
+# with that subshell on exit — so a `$(...)`-wrapped call could never actually
+# observe a PRIOR call's memoized fetch; every one of the 6 real call sites
+# independently re-ran `gc rig list --json`, despite the "memoized for the
+# whole sweep" claim above (found and left unfixed by ga-07rb3 fix-attempt-2;
+# see pilot-dispatcher.ns-rig-list-gc-failure.selftest.sh for the isolated
+# proof this predates the actual fix). Calling unwrapped forks no subshell at
+# all, so both the memo globals and $? are visible to every caller for real,
+# in production — not just inside an isolated test harness.
 _OWNERSHIP_GUARD_REPOS=""
 _OWNERSHIP_GUARD_REPOS_DONE=""
 _OWNERSHIP_GUARD_REPOS_FAILED=""
@@ -3385,13 +3406,10 @@ _ownership_guard_repos() {
   # success regardless of what the cached data actually came from. The exit
   # code must reflect the fetch that produced the CACHED data currently being
   # returned, not "did today's invocation of this function do any work".
-  # Caveat (ga-130et, found while building this fix): every real call site
-  # below wraps this function in `$(...)`, which forks a subshell — so a
-  # memoized cache-HIT never actually reaches a second real caller today
-  # (each independently re-fetches and gets its own correct answer). This
-  # fix is still correct and worth keeping — it becomes load-bearing the
-  # moment ga-130et's deeper issue is fixed — but don't read "memoized for
-  # the whole sweep" above as true of the current call sites; see ga-130et.
+  # ga-130et: this IS load-bearing for real now — every call site below
+  # invokes this function unwrapped (see header comment above), so a
+  # memoized cache-HIT's $? really does reach every real caller after the
+  # first in the same sweep, not just this file's isolated selftest.
   [ -z "$_OWNERSHIP_GUARD_REPOS_FAILED" ]
 }
 
@@ -3442,7 +3460,8 @@ _beadid_has_crew_branch() {
   fi
   command -v git >/dev/null 2>&1 || return 1
   local _repos _re
-  _repos=$(_ownership_guard_repos)
+  _ownership_guard_repos >/dev/null
+  _repos="${_OWNERSHIP_GUARD_REPOS:-}"
   [ -n "$_repos" ] || return 1
   # crew/<anything>/<bead> at a ref tail, OR a bare crew/<bead> (defensive), OR
   # a dog-built fix/<bead>-<slug> (ga-6jqr — the DOG builder branch shape; the
@@ -3496,7 +3515,8 @@ _beadid_matched_crew_branch_ref() {
   fi
   command -v git >/dev/null 2>&1 || return 1
   local _repos _re _match
-  _repos=$(_ownership_guard_repos)
+  _ownership_guard_repos >/dev/null
+  _repos="${_OWNERSHIP_GUARD_REPOS:-}"
   [ -n "$_repos" ] || return 1
   _re="(crew/([^/]+/)?${_bid}|fix/${_bid}-[^/]+)\$"
   while IFS= read -r _repo; do
@@ -3634,7 +3654,8 @@ _beadid_needs_remerge_branch() {
   fi
   command -v git >/dev/null 2>&1 || return 1
   local _repos
-  _repos=$(_ownership_guard_repos)
+  _ownership_guard_repos >/dev/null
+  _repos="${_OWNERSHIP_GUARD_REPOS:-}"
   [ -n "$_repos" ] || return 1
   while IFS= read -r _repo; do
     [ -n "$_repo" ] && [ -d "$_repo" ] || continue

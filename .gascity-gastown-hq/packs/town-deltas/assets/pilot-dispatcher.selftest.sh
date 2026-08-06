@@ -5055,7 +5055,7 @@ _GJ8_SIGNAL_FN="$(awk '/^_beadid_branch_signal\(\)/{f=1} f{print} f&&/^}$/{exit}
 
 GJ8_R_MERGED="$(
   unset PILOT_TEST_CREW_BRANCH_BEADS PILOT_TEST_BRANCH_MERGED_BEADS PILOT_TEST_ORPHAN_BRANCH_BEADS
-  _ownership_guard_repos() { printf '%s' "$GJ8_REPO"; }
+  _ownership_guard_repos() { _OWNERSHIP_GUARD_REPOS="$GJ8_REPO"; printf '%s' "$GJ8_REPO"; }
   eval "$_GJ8_MATCHED_FN"; eval "$_GJ8_SIGNAL_FN"
   _beadid_branch_signal "gj8-merged" '{}'
 )"
@@ -5066,7 +5066,7 @@ esac
 
 GJ8_R_OLD="$(
   unset PILOT_TEST_CREW_BRANCH_BEADS PILOT_TEST_BRANCH_MERGED_BEADS PILOT_TEST_ORPHAN_BRANCH_BEADS
-  _ownership_guard_repos() { printf '%s' "$GJ8_REPO"; }
+  _ownership_guard_repos() { _OWNERSHIP_GUARD_REPOS="$GJ8_REPO"; printf '%s' "$GJ8_REPO"; }
   eval "$_GJ8_MATCHED_FN"; eval "$_GJ8_SIGNAL_FN"
   PILOT_ORPHAN_BRANCH_STALE_HOURS=48 _beadid_branch_signal "gj8-old" '{}'
 )"
@@ -5077,7 +5077,7 @@ esac
 
 GJ8_R_NEW="$(
   unset PILOT_TEST_CREW_BRANCH_BEADS PILOT_TEST_BRANCH_MERGED_BEADS PILOT_TEST_ORPHAN_BRANCH_BEADS
-  _ownership_guard_repos() { printf '%s' "$GJ8_REPO"; }
+  _ownership_guard_repos() { _OWNERSHIP_GUARD_REPOS="$GJ8_REPO"; printf '%s' "$GJ8_REPO"; }
   eval "$_GJ8_MATCHED_FN"; eval "$_GJ8_SIGNAL_FN"
   PILOT_ORPHAN_BRANCH_STALE_HOURS=48 _beadid_branch_signal "gj8-new" '{}'
 )"
@@ -5110,7 +5110,7 @@ _FBO_FN="$(awk '
 FBO_OUT="$(
   unset PILOT_TEST_BRANCH_BEADS PILOT_TEST_CREW_BRANCH_BEADS PILOT_TEST_BRANCH_MERGED_BEADS PILOT_TEST_ORPHAN_BRANCH_BEADS
   export PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS="" PILOT_TEST_NOOP_ORPHAN_FLAG=1 PILOT_ORPHAN_BRANCH_STALE_HOURS=48
-  _ownership_guard_repos() { printf '%s' "$GJ8_REPO"; }
+  _ownership_guard_repos() { _OWNERSHIP_GUARD_REPOS="$GJ8_REPO"; printf '%s' "$GJ8_REPO"; }
   eval "$_FBO_FN"
   printf '%s' '[{"id":"gj8-old"},{"id":"gj8-new"},{"id":"gj8-merged"},{"id":"gj8-fresh"}]' \
     | _filter_built 2>/dev/null | jq -rc '[.[].id]' 2>/dev/null
@@ -5967,7 +5967,7 @@ _GJ6_HAS_CREW_BRANCH_FN="$(awk '/^_beadid_has_crew_branch\(\)/{f=1} f{print} f&&
 GJ6_S1="$(
   unset PILOT_TEST_BRANCH_BEADS
   export PILOT_TEST_GATE_OPEN_BEADS="" PILOT_TEST_GATE_ACTIVE_BEADS=""
-  _ownership_guard_repos() { printf '%s' "$GJ6_REPO"; }
+  _ownership_guard_repos() { _OWNERSHIP_GUARD_REPOS="$GJ6_REPO"; printf '%s' "$GJ6_REPO"; }
   eval "$_GJ6_FILTER_BUILT_FN"
   printf '%s' '[{"id":"gj6-crew-l"},{"id":"gj6-crew-r"},{"id":"gj6-fix-l"},{"id":"gj6-fix-r"},{"id":"gj6-none"}]' \
     | _filter_built | jq -rc '[.[].id]' 2>/dev/null
@@ -5980,7 +5980,7 @@ GJ6_S1="$(
 GJ6_S2_RESULT=""
 for _id in gj6-crew-l gj6-crew-r gj6-fix-l gj6-fix-r gj6-none; do
   if (
-    _ownership_guard_repos() { printf '%s' "$GJ6_REPO"; }
+    _ownership_guard_repos() { _OWNERSHIP_GUARD_REPOS="$GJ6_REPO"; printf '%s' "$GJ6_REPO"; }
     eval "$_GJ6_TARGET_HAS_REAL_BRANCH_FN"
     _target_has_real_branch "$_id"
   ); then GJ6_S2_RESULT="${GJ6_S2_RESULT}${_id}=1 "; else GJ6_S2_RESULT="${GJ6_S2_RESULT}${_id}=0 "; fi
@@ -5995,7 +5995,7 @@ GJ6_S3_RESULT=""
 for _id in gj6-crew-l gj6-crew-r gj6-fix-l gj6-fix-r gj6-remoteonly gj6-none; do
   if (
     unset PILOT_TEST_CREW_BRANCH_BEADS
-    _ownership_guard_repos() { printf '%s' "$GJ6_REPO"; }
+    _ownership_guard_repos() { _OWNERSHIP_GUARD_REPOS="$GJ6_REPO"; printf '%s' "$GJ6_REPO"; }
     eval "$_GJ6_HAS_CREW_BRANCH_FN"
     _beadid_has_crew_branch "$_id"
   ); then GJ6_S3_RESULT="${GJ6_S3_RESULT}${_id}=1 "; else GJ6_S3_RESULT="${GJ6_S3_RESULT}${_id}=0 "; fi
