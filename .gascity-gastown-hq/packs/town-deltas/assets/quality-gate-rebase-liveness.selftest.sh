@@ -267,9 +267,16 @@ else
   eq "no session-nudge call inside the rebase block targets the bare \$AUTHOR" \
     "$_NUDGE_AUTHOR_COUNT" \
     "0"
-  eq "all 4 REBASE_AUTHOR_ALIVE-gated branches (bounce x2, transient-retry-live x2) nudge \$REBASE_AUTHOR" \
+  # ga-kyxih: was 4 (bounce x2, transient-retry-live x2) until the transient-
+  # retry-live "queued" call site was split in two (still/only $REBASE_AUTHOR
+  # in both halves) so a merge-commit-tip branch gets an action-oriented
+  # nudge instead of the generic "no action needed" — see section 10d below.
+  # The count moved from 4 to 5; the invariant this test actually protects
+  # (never the bare, possibly-dead $AUTHOR — asserted just above, count=0)
+  # is unchanged.
+  eq "all REBASE_AUTHOR_ALIVE-gated branches (bounce x2, transient-retry-live x2 now split into 2 sub-variants = 3) nudge \$REBASE_AUTHOR" \
     "$_NUDGE_REBASE_AUTHOR_COUNT" \
-    "4"
+    "5"
 fi
 
 # ── 9. ga-g0v96: exile-after-N-attempts decouples the retry counter from the
@@ -365,6 +372,103 @@ fi
 grep -qF 'bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:rebase-retry:$NEXT_ATTEMPT"' "$DISPATCHER" \
   && ok "retry state is written to \$BEAD_CITY/\$BEAD_ID (visible on the source bead), not only \$GC_CITY/\$MARKER_ID" \
   || bad "gate:rebase-retry is not written to the source bead — AC5 (visibility outside the marker) regressed"
+
+# ── 10. ga-kyxih: merge-commit-tip branches route to `git merge`, not `git
+#    rebase` — and the messaging tells the author what to do ─────────────────
+# BUG (ga-kyxih): `git rebase` (used unconditionally, no --rebase-merges)
+# linearizes/mishandles a branch whose OWN tip is itself a merge commit (e.g.
+# the author already did a manual "merge origin/main" once). Two real
+# incidents (ga-ffop9, ga-mmdm2, measured by the Mayor 2026-08-05) confirmed
+# `git merge-tree` correctly predicts a clean 3-way merge while a literal
+# `git rebase` still fails or misbehaves on such a branch — and the failure
+# was mislabeled "transient" identically to a genuinely random push race, so a
+# deterministic, retry-proof condition burned attempts before the author was
+# ever told to act.
+echo "── 10. ga-kyxih: merge-commit-tip branches route to git merge, not git rebase ──"
+
+echo "── 10a. branch_tip_is_merge_commit: real git fixtures, not string matching ──"
+_FIXTURE_REPO="$(mktemp -d "${TMPDIR:-/tmp}/gc-gate-mergetip-fixture.XXXXXX")"
+git -C "$_FIXTURE_REPO" init -q -b main
+git -C "$_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" commit -q --allow-empty -m "root"
+git -C "$_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" branch linear-branch
+git -C "$_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" checkout -q linear-branch
+git -C "$_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" commit -q --allow-empty -m "linear commit 1"
+git -C "$_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" commit -q --allow-empty -m "linear commit 2"
+git -C "$_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" checkout -q main
+git -C "$_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" commit -q --allow-empty -m "main-only commit"
+git -C "$_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" checkout -q linear-branch
+git -C "$_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" merge -q -m "merge main into linear-branch" main
+# linear-branch's tip is NOW itself a merge commit — pin it under its own
+# name for clarity, and keep a SEPARATE, genuinely-linear branch (off main,
+# never merged into) as the negative case.
+git -C "$_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" branch merge-tip-branch
+git -C "$_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" checkout -q main
+git -C "$_FIXTURE_REPO" -c user.email="t@t" -c user.name="t" branch still-linear-branch main
+
+# git_rig, as sourced from the dispatcher in lib-only mode, is UNDEFINED here
+# (it's defined AFTER the GATE_DISPATCHER_LIB_ONLY early-return by design —
+# see that guard's own comment above). Shim it to the fixture repo, mirroring
+# the real wrapper's self-repo-rig branch (`git -C "$GIT_DIR_PATH" "$@"`) —
+# same technique as the `bd()` mock in 9b above, but against a REAL git repo
+# so parent-count detection is exercised for real, not string-matched.
+git_rig() { git -C "$_FIXTURE_REPO" "$@"; }
+
+eq "still-linear-branch tip (plain commit, single parent) → 0 (not a merge commit)" \
+  "$(branch_tip_is_merge_commit "still-linear-branch")" \
+  "0"
+eq "merge-tip-branch tip (the merge commit just created) → 1 (IS a merge commit)" \
+  "$(branch_tip_is_merge_commit "merge-tip-branch")" \
+  "1"
+eq "empty ref → 0 (fail toward the existing, well-tested rebase path)" \
+  "$(branch_tip_is_merge_commit "")" \
+  "0"
+eq "unresolvable ref → 0 (fail toward the existing rebase path, never toward the newer merge path on an ambiguous read)" \
+  "$(branch_tip_is_merge_commit "refs/heads/does-not-exist-xyz")" \
+  "0"
+
+unset -f git_rig
+rm -rf "$_FIXTURE_REPO"
+
+echo "── 10b. drift-guard: both rebase-attempt sites route on BRANCH_TIP_IS_MERGE_COMMIT before falling to git rebase ──"
+_MERGE_ROUTE_COUNT=$(grep -c 'if \[ "\$BRANCH_TIP_IS_MERGE_COMMIT" = "1" \]; then' "$DISPATCHER" || true)
+if [ "${_MERGE_ROUTE_COUNT:-0}" -ge 2 ]; then
+  ok "BRANCH_TIP_IS_MERGE_COMMIT routing present at both rig-type call sites (count=$_MERGE_ROUTE_COUNT)"
+else
+  bad "BRANCH_TIP_IS_MERGE_COMMIT routing found fewer than 2 times (count=${_MERGE_ROUTE_COUNT:-0}) — one rig-type call site may be missing the fix"
+fi
+grep -qF 'elif git -C "$TMP_REBASE_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then' "$DISPATCHER" \
+  && ok "the ORIGINAL rebase invocation is preserved verbatim as the elif fallback (AC3 non-regression: linear branches still rebase)" \
+  || bad "original rebase invocation (as an elif fallback) not found verbatim — AC3 non-regression may be broken"
+grep -qF 'BRANCH_TIP_IS_MERGE_COMMIT=$(branch_tip_is_merge_commit "origin/$BRANCH")' "$DISPATCHER" \
+  && ok "BRANCH_TIP_IS_MERGE_COMMIT is computed once per sweep from the live branch tip" \
+  || bad "BRANCH_TIP_IS_MERGE_COMMIT computation call site missing/renamed"
+
+echo "── 10c. drift-guard: AC2 — merge-commit-tip auto-fix path is logged distinctly from a real git-rebase failure ──"
+grep -qF 'Auto-merge (ga-kyxih: tip is itself a merge commit — rebase is not applicable)' "$DISPATCHER" \
+  && ok "auto-merge path (container-rig) logs a distinct message naming the merge-commit-tip cause" \
+  || bad "container-rig auto-merge log message missing/reworded"
+grep -qF 'Auto-merge (self-repo, ga-kyxih: tip is itself a merge commit — rebase is not applicable)' "$DISPATCHER" \
+  && ok "auto-merge path (self-repo-rig) logs a distinct message naming the merge-commit-tip cause" \
+  || bad "self-repo-rig auto-merge log message missing/reworded"
+grep -qF 'warn "  Auto-rebase git rebase command failed (unexpected — merge-tree reported no conflicts)"' "$DISPATCHER" \
+  && ok "the original 'real rebase failed' warning text is untouched — still distinguishable from the new auto-merge messages" \
+  || bad "original rebase-failure warning text missing/reworded — AC2 distinction may have regressed"
+
+echo "── 10d. drift-guard: AC4 — merge-commit-tip transient retries tell the author what to do, others keep 'no action needed' ──"
+grep -qF "don't wait: run 'git merge origin/\$DEFAULT_BRANCH' into \$BRANCH yourself and push" "$DISPATCHER" \
+  && ok "merge-commit-tip transient-retry nudge tells the author the deterministic fallback action" \
+  || bad "merge-commit-tip transient-retry action-oriented nudge missing/reworded"
+grep -qF 'No action needed unless this keeps retrying.' "$DISPATCHER" \
+  && ok "the original 'no action needed' wording is PRESERVED for the non-merge-commit-tip (genuinely transient) case" \
+  || bad "original 'no action needed' wording missing — non-merge-commit-tip transient retries may have lost their correct framing"
+
+echo "── 10e. drift-guard: AC1/AC4 — genuine-conflict bounce (live + dead author) names the merge-not-rebase fix ──"
+grep -qF "run 'git merge origin/\$DEFAULT_BRANCH' into \$BRANCH, resolve the conflict, and push" "$DISPATCHER" \
+  && ok "live-author genuine-conflict bounce advises merge (not rebase) for a merge-commit-tip branch" \
+  || bad "live-author genuine-conflict merge-not-rebase advice missing/reworded"
+grep -qF "re-anchoring means 'git merge origin/\$DEFAULT_BRANCH' into \$BRANCH, not a rebase" "$DISPATCHER" \
+  && ok "dead-author genuine-conflict marker comment advises merge (not rebase) for a merge-commit-tip branch" \
+  || bad "dead-author genuine-conflict merge-not-rebase advice missing/reworded"
 
 # ── Result ────────────────────────────────────────────────────────────────────
 echo ""
