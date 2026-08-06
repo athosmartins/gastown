@@ -57,6 +57,7 @@ type session_matches_author   >/dev/null 2>&1 || { echo "FATAL: session_matches_
 type classify_gap2_bugtask_verdict >/dev/null 2>&1 || { echo "FATAL: classify_gap2_bugtask_verdict not defined by guard (ga-4tgga)"; exit 1; }
 type gap2_query_active_markers     >/dev/null 2>&1 || { echo "FATAL: gap2_query_active_markers not defined by guard (ga-4tgga)"; exit 1; }
 type gap2_marker_for_bead          >/dev/null 2>&1 || { echo "FATAL: gap2_marker_for_bead not defined by guard (ga-4tgga)"; exit 1; }
+type gap2_arm_needs_remerge        >/dev/null 2>&1 || { echo "FATAL: gap2_arm_needs_remerge not defined by guard (ga-4tgga attempt 3)"; exit 1; }
 
 # ── 0. age_minutes_of must read the bead 'Z' timestamps as UTC (not local) ───
 # Regression lock for the TZ bug that made every age negative (off by the host's
@@ -387,6 +388,64 @@ GAP2_QAM_BODY=$(sed -n '/^gap2_query_active_markers() {/,/^}/p' "$GUARD")
 printf '%s' "$GAP2_QAM_BODY" | grep -q -- '--status open' \
   && ok "gap2_query_active_markers's own body filters --status open" \
   || bad "gap2_query_active_markers missing --status open in its own body — closed-but-mislabeled markers will false-positive as active (ga-4tgga gate-feedback)"
+
+# ── 6e. gap2_arm_needs_remerge (ga-4tgga gate-feedback, attempt 3, blocking) ──
+# Mayor + reviewer, 2026-08-06: attempt 2's version of this arm POSTED a
+# comment claiming "story:in-flight + pilot:dispatched cleared" but never
+# made the bd label remove calls that would make it true — the labels
+# survived, permanently stranding the bead (invisible to every Pilot
+# dispatch query, which all --exclude-label both) while the reconciler kept
+# re-selecting it and re-posting the same false claim. A test asserting the
+# COMMENT TEXT was posted would have passed with that bug intact — exactly
+# how it shipped. This test asserts the ACTUAL bd calls instead: it records
+# every call the real, unmodified gap2_arm_needs_remerge() makes against a
+# mock bd (same call-recording technique as pilot-dispatcher.selftest.sh and
+# gate-marker-status-selfheal.selftest.sh) and checks the label-remove calls
+# are actually IN the log, not just the comment.
+echo "── 6e. gap2_arm_needs_remerge (ga-4tgga gate-feedback attempt 3: labels must ACTUALLY be removed) ──"
+
+GAP2_ARM_CALLS="$(mktemp)"
+GC_CITY=/tmp/ga-4tgga-fake-city
+bd() { printf '%s\n' "$*" >> "$GAP2_ARM_CALLS"; return 0; }
+gap2_arm_needs_remerge "ga-fake-parent" "ga-fake-sling"
+unset -f bd
+
+# Fixed-string matches (grep -F), deliberately — no regex metachars/anchors
+# (e.g. \b) whose support varies by grep implementation across environments
+# this selftest might run under.
+grep -qF -- "-C $GC_CITY label remove ga-fake-parent story:in-flight" "$GAP2_ARM_CALLS" \
+  && ok "gap2_arm_needs_remerge actually calls bd label remove ... story:in-flight (not just claims to in the comment)" \
+  || bad "gap2_arm_needs_remerge did NOT call bd label remove story:in-flight — bead would be permanently stranded (ga-4tgga attempt 2 regression)"
+grep -qF -- "-C $GC_CITY label remove ga-fake-parent pilot:dispatched" "$GAP2_ARM_CALLS" \
+  && ok "gap2_arm_needs_remerge actually calls bd label remove ... pilot:dispatched (not just claims to in the comment)" \
+  || bad "gap2_arm_needs_remerge did NOT call bd label remove pilot:dispatched — bead would be permanently stranded (ga-4tgga attempt 2 regression)"
+grep -qF -- "-C $GC_CITY label add ga-fake-parent gate:needs-fix" "$GAP2_ARM_CALLS" \
+  && ok "gap2_arm_needs_remerge still sets gate:needs-fix (unchanged legacy consumer path)" \
+  || bad "gap2_arm_needs_remerge dropped gate:needs-fix — legacy consumers would stop seeing this bead"
+grep -qF -- "-C $GC_CITY label add ga-fake-parent gate:needs-remerge" "$GAP2_ARM_CALLS" \
+  && ok "gap2_arm_needs_remerge still sets gate:needs-remerge (ga-e2n96 distinct re-submit signal)" \
+  || bad "gap2_arm_needs_remerge dropped gate:needs-remerge — Pilot would dispatch a builder with an empty brief again (ga-e2n96 regression)"
+grep -qF -- "comment ga-fake-parent" "$GAP2_ARM_CALLS" \
+  && ok "gap2_arm_needs_remerge still posts its explanatory comment" \
+  || bad "gap2_arm_needs_remerge stopped posting a comment — silent label mutation with no audit trail"
+
+# Ordering: the removes must land BEFORE the adds (mirrors close:merge-verified
+# / close:untracked-delivery exactly) — strip old status before re-arming new.
+GAP2_ARM_REMOVE_LINE=$(grep -nF -- "label remove ga-fake-parent pilot:dispatched" "$GAP2_ARM_CALLS" | head -1 | cut -d: -f1)
+GAP2_ARM_ADD_LINE=$(grep -nF -- "label add ga-fake-parent gate:needs-fix" "$GAP2_ARM_CALLS" | head -1 | cut -d: -f1)
+if [ -n "$GAP2_ARM_REMOVE_LINE" ] && [ -n "$GAP2_ARM_ADD_LINE" ] && [ "$GAP2_ARM_REMOVE_LINE" -lt "$GAP2_ARM_ADD_LINE" ]; then
+  ok "gap2_arm_needs_remerge removes old status labels BEFORE adding new ones"
+else
+  bad "gap2_arm_needs_remerge ordering wrong (or calls missing) — removes must precede adds, mirroring the close:* arms"
+fi
+rm -f "$GAP2_ARM_CALLS"
+
+# Drift-guard companion: the case-statement call site must actually invoke
+# the function (a correct function that nothing calls is exactly as broken
+# as attempt 2, just relocated).
+grep -q 'gap2_arm_needs_remerge "\$SC_ID" "\$SLING_ID"' "$GUARD" \
+  && ok "Step 0c.2's final re-arm arm actually calls gap2_arm_needs_remerge" \
+  || bad "gap2_arm_needs_remerge is defined but the case-statement arm never calls it"
 
 # ── 7. drift-guard: guard implements both GAP-1 and GAP-2 sweeps ──────────────
 echo "── 7. drift-guard: guard implements ga-pa36 GAP-1 + GAP-2 sweeps ──"

@@ -430,6 +430,45 @@ gap2_marker_for_bead() {
   ' 2>/dev/null | head -1
 }
 
+# gap2_arm_needs_remerge <bead_id> <sling_id> — ga-4tgga: the genuine
+# "abandoned, needs resubmit" outcome (classify_gap2_bugtask_verdict's
+# default `*)` case, after the race-guard recheck finds no active marker).
+# Extracted into its own function — like gap2_query_active_markers and
+# gap2_marker_for_bead above — specifically so the selftest can call it
+# directly with a mocked bd() and assert on the ACTUAL label-remove calls it
+# makes, not merely that it posts a comment claiming to have made them.
+# ga-4tgga gate-feedback (attempt 2, blocking): this arm's comment has always
+# CLAIMED "story:in-flight + pilot:dispatched cleared", mirroring the
+# close:merge-verified / close:untracked-delivery arms which strip both
+# labels before their terminal action — but attempt 2's version of this body
+# never made the two `bd label remove` calls that would have made the claim
+# true. The two labels survived, so the bead stayed permanently invisible to
+# every Pilot dispatch query (all of which --exclude-label story:in-flight
+# and --exclude-label pilot:dispatched), permanently holding its lane slot,
+# while this exact sweep kept re-selecting the same bead and re-posting the
+# same false "cleared" claim every pass — a comment that promises more than
+# the code delivers is worse than no comment, because it tells the next
+# reader to stop looking here (Mayor, 2026-08-06). Strip both BEFORE
+# re-arming, mirroring the close:* arms exactly.
+gap2_arm_needs_remerge() {
+  local bead_id="$1" sling_id="$2"
+  bd -C "$GC_CITY" label remove "$bead_id" "story:in-flight"  -q 2>/dev/null || true
+  bd -C "$GC_CITY" label remove "$bead_id" "pilot:dispatched" -q 2>/dev/null || true
+  # ga-e2n96: this arm is a PURE re-merge signal — no reviewer ever rejected
+  # $bead_id's code, the sling already gate-passed. Reusing bare
+  # gate:needs-fix for this made it indistinguishable from a real reviewer
+  # rejection to the Pilot dispatcher (and every other consumer of the
+  # label), which then dispatched a builder with a completely empty brief.
+  # gate:needs-remerge is the reconciler's OWN signal for "resubmit, nothing
+  # is broken" — set ADDITIVELY (gate:needs-fix stays too) so every existing
+  # gate:needs-fix consumer/filter keeps working unchanged; the Pilot
+  # dispatcher checks for gate:needs-remerge FIRST and resubmits/escalates
+  # instead of slinging a builder.
+  bd -C "$GC_CITY" label add "$bead_id" "gate:needs-fix" -q 2>/dev/null || true
+  bd -C "$GC_CITY" label add "$bead_id" "gate:needs-remerge" -q 2>/dev/null || true
+  bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler: sling bead $sling_id gate-passed+closed, but no independent evidence the parent's own fix ($bead_id) is merged into origin/main was found (checked branches fix/$bead_id*, feature/$bead_id*, and sling fix/$sling_id*, feature/$sling_id*). ga-6ync4 fix: never trust sling-passed alone. story:in-flight + pilot:dispatched cleared; gate:needs-fix + gate:needs-remerge set (ga-e2n96: needs-remerge is the distinct re-submission signal — no reviewer ever rejected this code) so Pilot resubmits the existing branch to the gate or escalates, instead of dispatching a builder with an empty brief. (If this parent's delivery is legitimately untracked, apply the delivery:untracked label — see ga-x2x63.)" 2>/dev/null || true
+}
+
 # check_source_bead_park <space_sep_labels>
 # Pure decision: should the gate park a marker because the source-bead is in a
 # state that must not enter the review cycle?
@@ -1726,20 +1765,11 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
                 bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed+closed; an active quality-gate-marker ($GAP2_RECHECK_HIT) for the parent's own fix appeared while this sweep was verifying merge state — treating as in-flight, not abandoned. No labels changed. (ga-4tgga)" 2>/dev/null || true
               else
                 warn "GAP-2: $SC_ID sling $SLING_ID gate-passed+closed but parent's own fix NOT verified in origin/main (ga-6ync4 — sling-passed is a signal, not proof) — NOT closing; re-arming gate:needs-fix + gate:needs-remerge"
-                # ga-e2n96: this arm is a PURE re-merge signal — no reviewer ever
-                # rejected $SC_ID's code, the sling already gate-passed. Reusing
-                # bare gate:needs-fix for this made it indistinguishable from a
-                # real reviewer rejection to the Pilot dispatcher (and every other
-                # consumer of the label), which then dispatched a builder with a
-                # completely empty brief. gate:needs-remerge is the reconciler's
-                # OWN signal for "resubmit, nothing is broken" — set ADDITIVELY
-                # (gate:needs-fix stays too) so every existing gate:needs-fix
-                # consumer/filter keeps working unchanged; the Pilot dispatcher
-                # checks for gate:needs-remerge FIRST and resubmits/escalates
-                # instead of slinging a builder.
-                bd -C "$GC_CITY" label add "$SC_ID" "gate:needs-fix" -q 2>/dev/null || true
-                bd -C "$GC_CITY" label add "$SC_ID" "gate:needs-remerge" -q 2>/dev/null || true
-                bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed+closed, but no independent evidence the parent's own fix ($SC_ID) is merged into origin/main was found (checked branches fix/$SC_ID*, feature/$SC_ID*, and sling fix/$SLING_ID*, feature/$SLING_ID*). ga-6ync4 fix: never trust sling-passed alone. story:in-flight + pilot:dispatched cleared; gate:needs-fix + gate:needs-remerge set (ga-e2n96: needs-remerge is the distinct re-submission signal — no reviewer ever rejected this code) so Pilot resubmits the existing branch to the gate or escalates, instead of dispatching a builder with an empty brief. (If this parent's delivery is legitimately untracked, apply the delivery:untracked label — see ga-x2x63.)" 2>/dev/null || true
+                # ga-4tgga gate-feedback (attempt 2, blocking): extracted to
+                # gap2_arm_needs_remerge() (lib region above) so this arm's
+                # label-remove calls are independently unit-testable — see
+                # that function's doc-comment for why.
+                gap2_arm_needs_remerge "$SC_ID" "$SLING_ID"
               fi
               ;;
           esac
