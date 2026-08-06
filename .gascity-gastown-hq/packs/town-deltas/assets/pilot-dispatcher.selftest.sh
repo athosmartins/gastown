@@ -1036,6 +1036,41 @@ UNRELATED_META='[{"id":"bd-has-meta","assignee":null,"labels":[],"description":"
 
 echo "$_FC_FN" | grep -q 'gc.root_bead_id' && ok "_filter_candidates carries the gc.root_bead_id workflow-step exclusion clause" || bad "gc.root_bead_id exclusion clause missing from _filter_candidates"
 
+# ── Scenario 3e4 (ga-nimyz): Pilot's own sling/dispatch-wrapper beads excluded ──
+# Live reproduction: dispatching ga-4iw15 created sling bead ga-mr8ej
+# (ga-4iw15.metadata.pilot.sling_bead=ga-mr8ej). ga-mr8ej inherited
+# ctx:ready+exec:auto+lane:small+pilot:dispatched+story:in-flight from the
+# sling-creation template — the EXACT label shape of a real dispatch
+# candidate — and nothing on ga-mr8ej itself said "I am a dispatch wrapper,
+# not a story". 26min later a sweep found it in the pool and dispatched a
+# builder to "build" it, creating a SECOND sling bead (ga-xc3lg) with the
+# same problem — a nested double-dispatch that would grow one level per
+# sweep until claimed. Root cause: sling creation (dispatch_one, ~L6621-6627)
+# wrote the FORWARD pointer (story.metadata.pilot.sling_bead=<sling-id>) but
+# never a REVERSE one on the sling bead itself. Fix: every sling bead now
+# gets pilot.sling_for=<parent-story-id> at creation, right after the
+# phantom-bead verify confirms it exists in Dolt (same chokepoint timing as
+# the forward pointer). This clause excludes any bead carrying that marker,
+# at the SAME chokepoint as the gc.kind/gc.root_bead_id exclusion directly
+# above (ga-iu9m/ga-enfe) — keep the select clause and the reason-trace
+# mirror (~L2017) in sync, same lesson ga-3lsy1 already taught this function
+# twice.
+echo "Scenario 3e4 (ga-nimyz): Pilot's own sling/dispatch-wrapper beads excluded from candidates"
+SLING_WRAPPER_BEAD='[{"id":"bd-sling","assignee":null,"labels":["ctx:ready","exec:auto","lane:small","pilot:dispatched","story:in-flight"],"description":"x","metadata":{"pilot.sling_for":"bd-parent-story"}},{"id":"bd-normal4","assignee":null,"labels":[],"description":"x","metadata":{}}]'
+[ "$(_fc "$SLING_WRAPPER_BEAD")" = '["bd-normal4"]' ] && ok "ga-nimyz: sling-wrapper bead (pilot.sling_for, real ga-mr8ej label shape, open+unassigned) excluded; normal bug kept" || bad "ga-nimyz: sling-wrapper exclusion failed (got: $(_fc "$SLING_WRAPPER_BEAD"))"
+
+# AC4 non-regression: a REAL story re-dispatched after gate:needs-fix legitimately
+# keeps pilot:dispatched from a prior attempt but carries NO pilot.sling_for (it is
+# not itself a sling bead) — must remain candidatable. Confirms the exclusion keys
+# on the marker alone, never on pilot:dispatched — the bug report is explicit that
+# pilot:dispatched cannot be the guard here (ga-mr8ej already carried it too), and
+# that label is a durable, legitimately-reused marker on real re-dispatches (see
+# gate-refix-sling-bead-closes-story-bead-stays-open).
+REDISPATCH_STORY_BEAD='[{"id":"bd-redispatch","assignee":null,"labels":["pilot:dispatched"],"description":"x","metadata":{}}]'
+[ "$(_fc "$REDISPATCH_STORY_BEAD")" = '["bd-redispatch"]' ] && ok "ga-nimyz AC4: real re-dispatched story (pilot:dispatched, no pilot.sling_for) stays candidatable" || bad "ga-nimyz AC4: false-positive — re-dispatched story wrongly excluded (got: $(_fc "$REDISPATCH_STORY_BEAD"))"
+
+echo "$_FC_FN" | grep -q 'pilot.sling_for' && ok "_filter_candidates carries the pilot.sling_for sling-wrapper exclusion clause" || bad "pilot.sling_for exclusion clause missing from _filter_candidates"
+
 # ── Scenario ga-nf4x5 (SECURITY): story:needs-approval is the Athos
 # MERIT/legal sign-off gate — distinct from story:needs-human (an INFO-GAP:
 # the bead itself is unbuildable) but must be excluded from auto-dispatch the

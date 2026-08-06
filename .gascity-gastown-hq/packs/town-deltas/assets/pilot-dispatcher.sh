@@ -1766,6 +1766,17 @@ _filter_candidates() {
         and (((.metadata["gc.kind"] // "") as $k
               | ["workflow","scope","ralph","retry","check","fanout","retry-eval","scope-check","workflow-finalize"]
               | index($k)) == null)
+        # ga-nimyz: a sling/dispatch-wrapper bead created BY this same dispatch
+        # flow (dispatch_one, ~L6621) carries pilot.sling_for=<parent-story-id>
+        # — it is a Pilot-created hook pointing at real work, not a code-build
+        # story itself, and inherits the same ctx:ready/exec:auto/
+        # pilot:dispatched shape as a genuine candidate (ga-4iw15 → ga-mr8ej →
+        # ga-xc3lg nested double-dispatch, live repro). Exclude it here, same
+        # chokepoint/style as the gc.kind/gc.root_bead_id graph.v2 exclusion
+        # directly above — keep this clause and its reason-trace mirror
+        # (~L2017 below, search pilot.sling_for) in sync: same lesson ga-3lsy1
+        # already taught this function twice.
+        and ((.metadata["pilot.sling_for"] // "") | test("\\S") | not)
         and (
           (((.labels // []) | index("pilot:held")) | not)
           or
@@ -2019,6 +2030,10 @@ _filter_candidates() {
           (if ((($b.metadata["gc.kind"] // "") as $k
                 | ["workflow","scope","ralph","retry","check","fanout","retry-eval","scope-check","workflow-finalize"]
                 | index($k)) != null) then "gc.kind:\($b.metadata["gc.kind"] // "")" else empty end),
+          # ga-nimyz: mirrors the pilot.sling_for select-clause exclusion above
+          # (~L1770) — keep these two in sync, same lesson ga-3lsy1 already
+          # taught this function twice.
+          (if (($b.metadata["pilot.sling_for"] // "") | test("\\S")) then "pilot-sling-wrapper:pilot.sling_for" else empty end),
           (if ( ($L | index("pilot:held"))
                 and (($L | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber)) |
                      if length > 0 then (max >= $now_ts) else true end) )
@@ -6628,6 +6643,28 @@ TASK
       DISPATCH_RESULT="sling_phantom_bead"
       return 1
     fi
+
+    # ga-nimyz AC1: stamp the REVERSE pointer on the sling bead itself, right
+    # after it is confirmed to exist (verify loop directly above) — the
+    # earliest safe point, since `bd update` against a not-yet-visible bead
+    # would silently no-op. Without this, a sling bead is indistinguishable
+    # from a real story to _filter_candidates: it inherits the same
+    # ctx:ready/exec:auto/pilot:dispatched shape from the sling-creation
+    # template, so a sweep that finds it before a builder claims it
+    # re-dispatches it as if it were a fresh code-build story — creating a
+    # SECOND sling bead with the same gap (live repro: ga-4iw15 → ga-mr8ej →
+    # ga-xc3lg, a nested double-dispatch that grows one level per sweep until
+    # claimed). _filter_candidates (~L1764) excludes any bead carrying this
+    # marker — same chokepoint, same style as the gc.kind/gc.root_bead_id
+    # graph.v2 exclusion beside it. `gc sling` has no --metadata flag to set
+    # this atomically at creation (checked: gc sling --help), so this is the
+    # earliest point reachable from the shell side; the verify loop above
+    # already proves the bead is live in Dolt before we get here, so the
+    # residual exposure is bounded to that loop's own window (seconds), not
+    # the unbounded "never" this bug reproduced. AC5 (a nesting-depth
+    # backstop) is the documented defense-in-depth for that residual —
+    # deliberately not implemented here; see the ga-nimyz fix notes for why.
+    bd -C "$GC_CITY" update "$SLING_BEAD_ID" --set-metadata "pilot.sling_for=$STORY_ID" -q 2>/dev/null || true
 
     # ga-2azzj fix 3: record the slung builder task so TTL recovery can tell a
     # genuinely-stuck claim (sling task closed/gone) from an active long build
