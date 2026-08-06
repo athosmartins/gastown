@@ -96,5 +96,19 @@ min_active_sessions = 1
 # END ga-23z6a eval-window-concurrency-guard
 
 [daemon]
+# nudge_dispatcher: EXPLICITAMENTE "legacy" — nao remova sem MEDIR (ga-yxuab).
+# O modo runtime (socket wake) e melhor no papel: o poll `gc nudge poll` por sessao
+# batendo no Dolt a cada 2s era ~48% da carga do plano de dados. Eu LIGUEI o runtime
+# em 05/08 depois de ler a fonte, MEDI, e os nudges NAO chegavam (>3min). Causa: o
+# binario gc em uso foi compilado 48s ANTES do arquivo-fonte mudar — ou seja, a fonte
+# prometia um comportamento que o binario que roda nao tem.
+# Reverti pra legacy e e por isso que a linha e EXPLICITA: omitir cai no default, e o
+# default pode religar silenciosamente um modo que este binario nao implementa.
+# PRA VOLTAR A TENTAR: rebuild do gc, confirmar mtime do binario > mtime da fonte, e so
+# entao trocar. Teste de aceite falsificavel: sessao VIVA e SEM poller + gc session nudge
+# + LAST NUDGE muda em < patrol_interval. Sessao COM poller entrega pelo caminho legacy
+# e da FALSO-POSITIVO.
+nudge_dispatcher = "legacy"
+
 formula_v2 = true
 patrol_interval = "120s"
