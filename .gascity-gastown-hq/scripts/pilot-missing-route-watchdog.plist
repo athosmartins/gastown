@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gascity.pilot-missing-route-watchdog</string>
+
+  <!-- Detection-only sweep (ga-f54ui): finds beads carrying ctx:ready AND
+       exec:auto (armed, "looks ready" in the panel) with NO gc.routed_to
+       metadata for >= PMRW_GRACE_MINUTES (default 10min) — invisible to a
+       pool worker's own self-serve discovery. Multi-store (same set as
+       gate-orphaned-label-watchdog.sh) — armed-but-unrouted beads span every
+       rig, not just HQ. Reports via bd comment (per bead) + notify + gc mail
+       send mayor — NEVER mutates a bead (no gc.routed_to is ever set by this
+       script). See the script's own header comment for the full rationale,
+       the five label/metadata exclusions added after the first live
+       dry-run cut a 54-candidate false-positive-heavy sweep down to 9, and
+       the ga-5jyo8 sibling watchdog this one's shape is modeled on. -->
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/pilot-missing-route-watchdog.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/pilot-missing-route-watchdog-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/pilot-missing-route-watchdog-launchd.err</string>
+
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key><string>/Users/athos</string>
+    <key>BD_ACTOR</key><string>automation</string>
+    <!-- Grace period (minutes) before an armed-but-unrouted bead is flagged.
+         Default: 10 (short by design — the field can be lost/cleared at
+         multiple points in a bead's lifecycle, not just creation; see the
+         script header for why this differs from GMMSW's 5min). -->
+    <!-- <key>PMRW_GRACE_MINUTES</key><string>10</string> -->
+    <!-- Per-bead re-alert cooldown (seconds). Default: 21600 (6h). -->
+    <!-- <key>PMRW_ALERT_COOLDOWN_S</key><string>21600</string> -->
+    <!-- Kill-switch: PMRW_ENABLED=0 disables the watchdog entirely. -->
+    <!-- <key>PMRW_ENABLED</key><string>1</string> -->
+    <!-- Dry-run: PMRW_DRY_RUN=1 logs findings but sends no comment/notify/mail. -->
+    <!-- <key>PMRW_DRY_RUN</key><string>0</string> -->
+  </dict>
+</dict></plist>
