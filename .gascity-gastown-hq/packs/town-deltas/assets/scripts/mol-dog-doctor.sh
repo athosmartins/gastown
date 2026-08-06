@@ -228,14 +228,36 @@ DISK_USAGE=$(du -sh "$DOLT_DATA_DIR" 2>/dev/null | cut -f1 || echo "unknown")
 
 # Orphan database detection.
 ALL_DBS=$(dolt_sql -r csv -q "SHOW DATABASES" 2>/dev/null | tail -n +2 || true)
-ORPHAN_PATTERNS="^(testdb_|beads_t|beads_pt|beads_vr|doctest_|doctortest_)"
 SYSTEM_DBS="^(information_schema|mysql|dolt_cluster|__gc_probe|performance_schema|sys)$"
 USER_DBS=$(printf '%s\n' "$ALL_DBS" | grep -viE "$SYSTEM_DBS" || true)
-ORPHANS=$(printf '%s\n' "$USER_DBS" | grep -iE "$ORPHAN_PATTERNS" || true)
-ORPHAN_COUNT=$(printf '%s\n' "$ORPHANS" | awk 'NF {count++} END {print count + 0}')
+# ga-fwzg4: delegate the orphan COUNT to `gc dolt-cleanup` (hyphen) itself —
+# the prefix-gated, dry-run-by-default tool this advisory tells the reader to
+# run — instead of a local regex. The prior inline pattern here was a second,
+# independently-maintained definition of "orphan" (dolt-cleanup's Go
+# classifier uses more prefixes, a hex-suffix check on beads_t, and excludes
+# anything in the live rig registry) that had already drifted: this advisory
+# reported 1 orphan while `gc dolt-cleanup` found 0 for the same server.
+# Delegating makes the two impossible to disagree. Bounded like dolt_sql
+# above — dolt-cleanup queries the live server too, so a wedged Dolt must not
+# hang this script either. Any failure (timeout, or a run whose "ok":true
+# still carries a connect error in summary.errors_total — confirmed live: a
+# refused connection reports ok:true with dropped.count:0 and the failure
+# surfaced only in summary.errors_total/errors, per dolt-cleanup's own
+# --help note that automation must inspect errors_total, not just ok)
+# reports "unknown" rather than a guessed 0 — an unmeasured count must
+# never look like a measured all-clear (mirrors CONN_MAX "unknown" above).
+ORPHAN_JSON=$(run_bounded 10 gc dolt-cleanup --json --city "$GC_CITY_PATH" --port "$PORT" 2>/dev/null || true)
+ORPHAN_OK=$(printf '%s' "$ORPHAN_JSON" | jq -r 'if (.ok == true) and ((.summary.errors_total // 1) == 0) then "true" else "false" end' 2>/dev/null || echo false)
+if [ "$ORPHAN_OK" = "true" ]; then
+    ORPHAN_COUNT=$(printf '%s' "$ORPHAN_JSON" | jq -r '.dropped.count // 0' 2>/dev/null)
+    case "$ORPHAN_COUNT" in ''|*[!0-9]*) ORPHAN_COUNT="" ;; esac
+else
+    ORPHAN_COUNT=""
+fi
+ORPHAN_COUNT_DISPLAY="${ORPHAN_COUNT:-unknown}"
 ORPHAN_WARN=""
-if [ "${ORPHAN_COUNT:-0}" -gt 0 ]; then
-    ORPHAN_WARN=" [WARN: $ORPHAN_COUNT orphan DBs detected — run gc dolt cleanup]"
+if [ -n "$ORPHAN_COUNT" ] && [ "$ORPHAN_COUNT" -gt 0 ]; then
+    ORPHAN_WARN=" [WARN: $ORPHAN_COUNT orphan DBs detected — run gc dolt-cleanup]"
 fi
 
 # Backup freshness: check newest backup artifact per database.
@@ -286,11 +308,11 @@ if [ -n "$WARNINGS" ]; then
         -m "Latency: ${LATENCY_MS}ms${LATENCY_WARN}
 Connections: ${CONN_COUNT}/${CONN_MAX_DISPLAY}${CONN_WARN}
 Disk: ${DISK_USAGE}
-Orphan DBs: ${ORPHAN_COUNT}${ORPHAN_WARN}${BACKUP_STALE}"; then
+Orphan DBs: ${ORPHAN_COUNT_DISPLAY}${ORPHAN_WARN}${BACKUP_STALE}"; then
         :
     fi
 fi
 
-SUMMARY="doctor — server: ok, latency: ${LATENCY_MS}ms, conns: ${CONN_COUNT}/${CONN_MAX_DISPLAY}, disk: ${DISK_USAGE}, orphans: ${ORPHAN_COUNT}"
+SUMMARY="doctor — server: ok, latency: ${LATENCY_MS}ms, conns: ${CONN_COUNT}/${CONN_MAX_DISPLAY}, disk: ${DISK_USAGE}, orphans: ${ORPHAN_COUNT_DISPLAY}"
 nudge_deacon_done "DOG_DONE: $SUMMARY"
 echo "doctor: $SUMMARY"
