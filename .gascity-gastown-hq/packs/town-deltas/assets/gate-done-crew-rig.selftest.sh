@@ -717,6 +717,68 @@ else
   bad "(N) gate-done.md not found at $GATE_DONE"
 fi
 
+# ── (O) ga-ogvyk source drift-guard: /gate-done runs a mandatory pre-flight
+#    self-audit for the "third state" (error-vs-empty) defect class BEFORE
+#    the marker is created, and records the result in the marker so the
+#    practice leaves a trail instead of living only in prose nobody executes.
+#
+# Root bug (ga-ogvyk, filed by the Mayor from a live measurement): the gate
+# rejected six submissions in one day for the SAME defect class
+# (root-class:error-vs-empty) — reviewers catch it consistently, but only
+# AFTER a full review cycle burns, and only the cited example is learned, not
+# the class (one bead was rejected on this shape 3 times running). The rule
+# lived only in the reviewer's prompt template — a path builders never read
+# before submitting — so it never reached the WRITE side at all.
+if [ -f "$GATE_DONE" ]; then
+  src=$(cat "$GATE_DONE")
+  printf '%s' "$src" | grep -qF 'Pre-flight Self-Audit: THE THIRD STATE' \
+    && ok "(O1) gate-done.md has a mandatory Pre-flight Self-Audit section" \
+    || bad "(O1) gate-done.md missing the Pre-flight Self-Audit section (ga-ogvyk regression)"
+  printf '%s' "$src" | grep -qF 'root-class:error-vs-empty' \
+    && ok "(O2) gate-done.md's self-audit cites the same taxonomy reviewers use (root-class:error-vs-empty)" \
+    || bad "(O2) gate-done.md self-audit missing the root-class:error-vs-empty cross-reference"
+
+  # The audit must run BEFORE Step 1 (push) — catching a bug here should be
+  # cheap (fix, recommit, re-push), not something discovered after the
+  # branch is already on origin and a marker is one command away.
+  audit_line=$(printf '%s\n' "$src" | grep -nF '## Pre-flight Self-Audit: THE THIRD STATE' | head -1 | cut -d: -f1)
+  step1_line=$(printf '%s\n' "$src" | grep -nE '^## Step 1:' | head -1 | cut -d: -f1)
+  if [ -n "$audit_line" ] && [ -n "$step1_line" ] && [ "$audit_line" -lt "$step1_line" ]; then
+    ok "(O3) gate-done.md's self-audit section runs BEFORE Step 1 (line $audit_line < $step1_line)"
+  else
+    bad "(O3) gate-done.md's self-audit section does not precede Step 1 (audit_line='$audit_line' step1_line='$step1_line')"
+  fi
+
+  # The result must be RECORDED in the marker (Step 3), not just asked for in
+  # prose — a check that leaves no trace can't be measured later, which is
+  # exactly the failure mode ga-ogvyk's acceptance criteria warns about.
+  step3_src=$(printf '%s\n' "$src" | awk '/^## Step 3:/{flag=1} flag; /^## Step 4:/{flag=0}')
+  printf '%s' "$step3_src" | grep -qF 'self_audit: $SELF_AUDIT_SUMMARY' \
+    && ok "(O4) gate-done.md Step 3 records self_audit in the marker description" \
+    || bad "(O4) gate-done.md Step 3 missing the self_audit: field (ga-ogvyk regression)"
+
+  # This must FAIL OPEN, not closed: the sweep is a judgment call, not a
+  # lint (ga-ogvyk's explicit NAO FAZER), and a hard block would just train
+  # builders to type a meaningless string to get past it (Goodhart) instead
+  # of doing the sweep. Assert the parameter-expansion DEFAULT exists
+  # (fail-open) and that Step 3 does NOT separately abort on a blank
+  # SELF_AUDIT_SUMMARY (which would be a fail-closed regression). Written as
+  # explicit if/then, not the file's usual &&/|| idiom — inverted polarity
+  # ("presence is the BAD outcome") is exactly the kind of collapsed-boolean
+  # shape this whole section exists to catch, so the check for it should not
+  # itself read ambiguously.
+  printf '%s' "$step3_src" | grep -qF 'SELF_AUDIT_SUMMARY:-' \
+    && ok "(O5a) gate-done.md Step 3 defaults SELF_AUDIT_SUMMARY when unset (fail-open)" \
+    || bad "(O5a) gate-done.md Step 3 missing the SELF_AUDIT_SUMMARY fallback default"
+  if printf '%s' "$step3_src" | grep -qE '\[ -z "\$SELF_AUDIT_SUMMARY" \]'; then
+    bad "(O5b) gate-done.md Step 3 hard-blocks on blank SELF_AUDIT_SUMMARY — must stay fail-open (ga-ogvyk: judgment sweep, not a lint)"
+  else
+    ok "(O5b) gate-done.md Step 3 does not hard-block on SELF_AUDIT_SUMMARY (correctly fail-open)"
+  fi
+else
+  bad "(O) gate-done.md not found at $GATE_DONE"
+fi
+
 echo
 echo "  PASS=$PASS  FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

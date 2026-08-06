@@ -1,7 +1,7 @@
 ---
 description: Signal work ready for quality gate (writes durable marker; launchd guard picks it up within ~2 min)
 argument-hint: ""
-allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash(git log:*), Bash(git config:*), Bash(bd create:*), Bash(bd label:*), Bash(bd list:*), Bash(bd show:*), Bash(gc rig list:*)
+allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash(git log:*), Bash(git diff:*), Bash(git config:*), Bash(bd create:*), Bash(bd label:*), Bash(bd list:*), Bash(bd show:*), Bash(gc rig list:*)
 ---
 
 # Gate Done — Signal Work Ready for Quality Gate
@@ -14,9 +14,11 @@ Arguments: $ARGUMENTS
 
 ## What This Does
 
-1. Validates your working tree is clean and pushed.
-2. Creates a durable bead marker in the CITY database (so the guard can find it).
-3. You are DONE — the launchd guard sweeps every ~2 min, claims the marker,
+1. Runs a mandatory self-audit of your OWN diff for the "third state" defect
+   class (see below) — the single class reviewers reject most often.
+2. Validates your working tree is clean and pushed.
+3. Creates a durable bead marker in the CITY database (so the guard can find it).
+4. You are DONE — the launchd guard sweeps every ~2 min, claims the marker,
    and spawns a gate-runner in a separate session. You will be mailed when the
    gate passes or fails.
 
@@ -30,6 +32,56 @@ git log --oneline origin/main..HEAD     # Must have at least 1 commit
 ```
 
 If uncommitted changes exist, commit them first.
+
+## Pre-flight Self-Audit: THE THIRD STATE (mandatory — before you push)
+
+Six gate rejections in one day were the same defect class wearing different
+clothes, not six unrelated bugs — a missing/empty/unknown read collapsed into
+the same value as a present one. Reviewers catch this reliably (label
+`root-class:error-vs-empty`; it's a mandatory dimension in every reviewer's
+prompt) — but only AFTER a full review cycle burns. You learn the specific
+example a reviewer cited, not the class, and the same shape resurfaces
+elsewhere in the SAME diff — one bead was rejected on this 3 times running.
+Do this sweep yourself, now: it's the same check, just earlier and cheaper.
+
+**Scope: your ENTIRE diff since origin/main — not just your latest commit.**
+If this is a resubmission after a gate FAIL, re-sweep everything, not only the
+point a reviewer cited. The same defect shape hides in code you haven't
+touched on this pass.
+
+```bash
+# ga-ogvyk: read the FULL diff — not `--stat`, not a mental summary of what
+# you remember changing. The bug this section exists to catch is exactly the
+# kind that hides outside the lines you were already looking at.
+git diff origin/main...HEAD
+```
+
+**The ruler — ask it of every data read in that diff:** *"If this code
+COULDN'T know, what would it do?"* If the answer is **"the same thing it does
+when it knows,"** that's the bug. Reality has three answers — yes / no / I
+DON'T KNOW — and code with only two collapses "don't know" into a verdict,
+silently, and the direction it collapses to is arbitrary.
+
+Hunt every `.get()`, possibly-sparse dict/array/column, JSON key that might be
+absent, query that might return empty, or command whose stdout might be an
+error envelope instead of data. For each one you find:
+
+1. Does "not found" produce the SAME value as "found, and it's worth X"? If
+   yes, that's the defect — fix it now.
+2. What's the default when the read fails? It MUST be the INERT state — don't
+   act, don't write, don't contact. Mandatory if the path is destructive
+   (deletes, sends, spends, mutates state). Fail-open is often the right call;
+   SILENT fail-open is not — the correct shape is visible and counted ("N
+   unverified"), never quiet.
+3. Does every comment or log line in this diff describe what the code beside
+   it ACTUALLY does? ("labels cleared" when nothing was cleared, or a claim
+   that exists only in the comment and not the code next to it, is how two of
+   today's six rejections happened.)
+
+This is a judgment sweep, not a lint — nothing here can grade it for you but
+you. You'll record a one-line result of it in Step 3 below, so the sweep
+leaves a trail instead of disappearing into the same silence it exists to
+catch.
 
 ## Step 1: Push your branch (fail-closed verification)
 
@@ -293,6 +345,12 @@ the correct store.
 The marker MUST be written to the city database (same database the guard reads).
 We use `-C "$GC_CITY_PATH"` to target the city DB explicitly.
 
+Before running this, set `SELF_AUDIT_SUMMARY` to a one-line result of the
+Pre-flight Self-Audit above — e.g. `"swept full diff, no absent-data reads
+found"` or `"found+fixed 1 instance: <what and where>"`. If you skip this, the
+marker records it as unaudited rather than silently omitting the field —
+visible, not quiet, the same principle the audit itself asks you to apply.
+
 ```bash
 # ga-kkwsa: fail-closed guard, mirroring Step 2's existing BEAD_ID fail-closed
 # check. If Step 2 and Step 3 ran as SEPARATE tool calls, shell variables set
@@ -310,6 +368,14 @@ if [ -z "$BRANCH" ] || [ -z "$BEAD_ID" ]; then
   exit 1
 fi
 
+# ga-ogvyk: fail-open but VISIBLE, never silent — mirrors the third-state
+# principle the self-audit above just asked you to apply to your own diff. An
+# unset SELF_AUDIT_SUMMARY records as explicitly unaudited, not as a blank
+# field indistinguishable from "audited, found nothing." Collapsed to one
+# line: an embedded newline in a hand-written summary could otherwise inject
+# a bogus extra "key: value" line into the marker description below.
+SELF_AUDIT_SUMMARY=$(printf '%s' "${SELF_AUDIT_SUMMARY:-<not recorded - see Pre-flight Self-Audit above>}" | tr '\n' ' ')
+
 MARKER_ID=$(bd -C "$GC_CITY_PATH" create \
   "ready-for-gate: $BRANCH" \
   -t chore --ephemeral \
@@ -324,7 +390,8 @@ author: $AUTHOR
 base_commit: $BASE_COMMIT
 rig: $RIG
 bead_rig: $BEAD_RIG
-submitted_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+submitted_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+self_audit: $SELF_AUDIT_SUMMARY" \
   --json 2>/dev/null | jq -r '.id // empty')
 
 if [ -z "$MARKER_ID" ]; then
@@ -377,6 +444,11 @@ echo "You are done. The gate-runner handles the rest."
 name. Alternatively, ensure you have an in_progress bead with label `story:in-flight`
 assigned to your session. /gate-done aborts rather than writing a marker with
 `bead_id=unknown` (which the guard would reject with `gate-status:error`).
+
+**Found a third-state bug during the Pre-flight Self-Audit**: Fix it, commit,
+and `git push origin HEAD` again before continuing, then re-run the sequence
+from the top. This is the self-audit doing its job, not a failure — it is far
+cheaper here than at gate review, and far cheaper there than in production.
 
 **Long wait (>5 min)**: Check guard is running:
 ```bash
