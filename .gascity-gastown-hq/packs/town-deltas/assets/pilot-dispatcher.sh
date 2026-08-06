@@ -2960,7 +2960,16 @@ for s in data.get("sessions") or []:
             idle = None
     s["idle_minutes"] = idle
 json.dump(data, sys.stdout)
-' 2>/dev/null)
+' 2>/dev/null) || true
+# ga-r7m8b: the python3 call above raises uncaught (nonzero exit) when
+# _SESSIONS_JSON is genuinely empty — e.g. gc_json_or_unknown correctly
+# classified `gc session list --json` as failed/unknown (ga-07509 semantics)
+# rather than parseable data. Under `set -euo pipefail`, an unguarded
+# `VAR=$(pipeline)` propagates that nonzero straight to script exit, killing
+# the WHOLE sweep silently (no log line — the death lands between two `log`
+# calls) before Tier 1 candidate gathering ever runs. `|| true` lets the
+# fallback on the next line (already written for exactly this case) do its
+# job, mirroring the same guard already used on `_SESSIONS_JSON` above.
 [ -n "$_SESSIONS_IDLE_JSON" ] || _SESSIONS_IDLE_JSON="$_SESSIONS_JSON"
 
 # "Active owner" = live AND NOT asleep AND NOT idle beyond threshold. Folding
