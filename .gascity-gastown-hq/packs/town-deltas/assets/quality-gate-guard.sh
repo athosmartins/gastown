@@ -1851,8 +1851,21 @@ else
   for EXT_ID in $EXT_IDS; do
     [ -z "$EXT_ID" ] && continue
 
-    EXT_SHOW=$(bd -C "$GC_CITY" show "$EXT_ID" --json --include-comments 2>/dev/null \
-      | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
+    # ga-jto05 gate-FAIL fix: bd's own failure convention prints a non-empty
+    # JSON error object ({"error":...}) to STDOUT with a nonzero exit — the
+    # previous version piped straight into jq, whose `if type=="array"`
+    # passes that object through unchanged (else-branch), so `-z` on the
+    # RESULT never saw an empty string and this branch never fired. Checking
+    # bd's own exit status directly, before jq ever sees the output, is the
+    # only way to tell "bd show failed" apart from "bd show succeeded but
+    # returned something jq couldn't use" — the two checks below are
+    # deliberately two separate steps, not one combined pipeline.
+    if ! EXT_SHOW_RAW=$(bd -C "$GC_CITY" show "$EXT_ID" --json --include-comments 2>/dev/null); then
+      log "GAP-3: $EXT_ID — bd show --include-comments failed (nonzero exit) — safe-skip"
+      continue
+    fi
+
+    EXT_SHOW=$(echo "$EXT_SHOW_RAW" | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
 
     # ga-jto05 self-audit: "no PR ref found" and "couldn't even read the bead"
     # are different failures with the same downstream action (skip) but a
@@ -1861,7 +1874,7 @@ else
     # kind of misleading-comment defect this file's own doctrine warns about
     # (a log line that stops the next reader from looking further).
     if [ -z "$EXT_SHOW" ]; then
-      log "GAP-3: $EXT_ID — bd show --include-comments failed or returned unparseable data — safe-skip"
+      log "GAP-3: $EXT_ID — bd show --include-comments returned unparseable data — safe-skip"
       continue
     fi
 
