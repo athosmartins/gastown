@@ -99,7 +99,11 @@ while IFS= read -r row; do
   fi
 
   RP=$(rig_path "$RIG")
-  if [ -z "$RP" ] || [ ! -d "$RP/.git" ]; then
+  # NÃO teste `-d "$RP/.git"`: num worktree ou submodule o .git é um ARQUIVO, não
+  # diretório, e o teste dá falso negativo — property_scrapers caiu nisso e virou
+  # ILEGÍVEL sem ser. `rev-parse --git-dir` responde a pergunta real ("isto é um
+  # repo utilizável?") em vez de inferi-la do formato do .git.
+  if [ -z "$RP" ] || ! git -C "$RP" rev-parse --git-dir >/dev/null 2>&1; then
     UNKNOWN=$((UNKNOWN+1)); UNK_L="$UNK_L\n    $ID  rig '$RIG' não resolveu — ILEGÍVEL, não é fantasma"
     continue
   fi
