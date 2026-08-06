@@ -160,6 +160,7 @@ EOF
 chmod +x "$SANDBOX_BIN/gc"
 _OWNERSHIP_GUARD_REPOS=""
 _OWNERSHIP_GUARD_REPOS_DONE=""
+_OWNERSHIP_GUARD_REPOS_FAILED=""
 _repos_out="$(PATH="$SANDBOX_BIN:$PATH" _ownership_guard_repos)"
 _repos_rc=$?
 if [ "$_repos_rc" -eq 1 ]; then
@@ -182,6 +183,7 @@ EOF
 chmod +x "$SANDBOX_BIN/gc"
 _OWNERSHIP_GUARD_REPOS=""
 _OWNERSHIP_GUARD_REPOS_DONE=""
+_OWNERSHIP_GUARD_REPOS_FAILED=""
 _repos_out2="$(PATH="$SANDBOX_BIN:$PATH" _ownership_guard_repos)"
 _repos_rc2=$?
 if [ "$_repos_rc2" -eq 0 ]; then
@@ -190,6 +192,104 @@ else
   bad "a real succeeding gc -> _ownership_guard_repos returned $_repos_rc2, expected 0"
 fi
 rm -rf "$SANDBOX_BIN"
+
+# ═════════════════════════════════════════════════════════════════════════
+# 3b. _ownership_guard_repos: the ACTUAL bug fix-attempt-2 targets — a
+#     memoized CACHE-HIT call (2nd+ bead processed in the SAME sweep) must
+#     still report the failure that produced the cached data, not silently
+#     report success just because the fetch itself didn't run again this
+#     time. Fix-attempt-1's test (section 3 above) reset
+#     _OWNERSHIP_GUARD_REPOS_DONE before EVERY call, so every assertion
+#     there took the cache-MISS path — exactly where the bug does not live.
+#     Gate reviewer's blocking issue 2 on fix-attempt-1: this scenario was
+#     never exercised. This section closes that gap.
+#
+#     IMPORTANT — why these calls do NOT use `$(_ownership_guard_repos)`
+#     the way every real caller in pilot-dispatcher.sh does: command
+#     substitution forks a subshell, and a subshell's variable assignments
+#     (including _OWNERSHIP_GUARD_REPOS_DONE/_FAILED) never propagate back
+#     to the parent — verified empirically, this is standard POSIX subshell
+#     semantics, not a test artifact. An earlier draft of this test used
+#     `$(...)` for BOTH the priming and checking call and got a FALSE PASS
+#     on the failure scenario (both calls independently re-fetched and
+#     independently failed — coincidentally the same observable result as a
+#     real cache-hit) and a real, honest FAIL on the success scenario
+#     (proving no persistence crosses two separate $(...) calls at all).
+#     That is a SEPARATE, deeper, already-filed bug (ga-130et): because
+#     every one of the 6 real call sites uses `$(...)`, this memoization
+#     never actually triggers in production either — gc rig list --json
+#     refetches on every single call, not once per sweep as documented.
+#     This section tests the FIX's own persistence logic in isolation, via
+#     plain output redirection (`f > file`), which — unlike `$(...)` — does
+#     NOT fork a subshell for a shell function and so lets the assignments
+#     survive, the same way they would if ga-130et is ever fixed and a
+#     caller starts priming this cache with a direct call. This is honest
+#     about testing the fix's logic, not a production end-to-end guarantee;
+#     see ga-130et for the production-reachability caveat.
+# ═════════════════════════════════════════════════════════════════════════
+echo "-- _ownership_guard_repos: cache-HIT after a failure must still return 1 (the real bug) --"
+SANDBOX_BIN2="$(mktemp -d)"
+cat > "$SANDBOX_BIN2/gc" <<'EOF'
+#!/usr/bin/env bash
+echo '{"schema_version":"1","ok":false,"error":{"code":"command_failed","message":"boom","exit_code":1}}'
+exit 1
+EOF
+chmod +x "$SANDBOX_BIN2/gc"
+_OWNERSHIP_GUARD_REPOS=""
+_OWNERSHIP_GUARD_REPOS_DONE=""
+_OWNERSHIP_GUARD_REPOS_FAILED=""
+_memo_tmp="$(mktemp)"
+PATH="$SANDBOX_BIN2:$PATH" _ownership_guard_repos > "$_memo_tmp"; _first_rc=$?
+_first_out="$(cat "$_memo_tmp")"
+if [ "$_first_rc" -eq 1 ]; then
+  ok "first call (cache-miss) with failing gc -> returns 1, as before"
+else
+  bad "first call with failing gc returned $_first_rc, expected 1 — setup broken, cannot test cache-hit path"
+fi
+# Simulate a SECOND bead in the SAME sweep: call again with NO reset of the
+# memo state, still via plain redirection (see header note above — this is
+# what lets the memoization actually be observed at all). Remove gc from
+# PATH entirely first — under correct caching this second call must never
+# invoke it (cache-hit skips the fetch entirely), so a missing binary
+# cannot change the outcome if the fix is correct, but turns "the fetch ran
+# again and coincidentally also failed" into a loud, unambiguous failure
+# instead of a test that could pass for the wrong reason.
+rm -f "$SANDBOX_BIN2/gc"
+PATH="$SANDBOX_BIN2:$PATH" _ownership_guard_repos > "$_memo_tmp"; _second_rc=$?
+_second_out="$(cat "$_memo_tmp")"
+if [ "$_second_rc" -eq 1 ]; then
+  ok "second call, SAME sweep, no reset (cache-hit) -> still returns 1 (fix-attempt-2: closes the gate's blocking issue 1)"
+else
+  bad "REGRESSION (the exact bug fix-attempt-2 targets): cache-hit call after a failure returned $_second_rc, expected 1 — a second bead in the same sweep would silently see 'success' and could be released for re-dispatch on unverified data"
+fi
+if [ "$_second_out" = "$_first_out" ]; then
+  ok "cache-hit stdout matches the cached (fail-open) list from the first call, unchanged"
+else
+  bad "cache-hit stdout '$_second_out' differs from first call's '$_first_out' — memoization itself broke"
+fi
+rm -rf "$SANDBOX_BIN2"
+
+echo "-- _ownership_guard_repos control: cache-HIT after a SUCCESS must still return 0 --"
+SANDBOX_BIN3="$(mktemp -d)"
+cat > "$SANDBOX_BIN3/gc" <<EOF
+#!/usr/bin/env bash
+echo '{"schema_version":"1","ok":true,"rigs":[{"name":"fakerig","path":"$TOWNROOT","hq":false}]}'
+exit 0
+EOF
+chmod +x "$SANDBOX_BIN3/gc"
+_OWNERSHIP_GUARD_REPOS=""
+_OWNERSHIP_GUARD_REPOS_DONE=""
+_OWNERSHIP_GUARD_REPOS_FAILED=""
+PATH="$SANDBOX_BIN3:$PATH" _ownership_guard_repos > "$_memo_tmp"; _c1_rc=$?
+rm -f "$SANDBOX_BIN3/gc"
+PATH="$SANDBOX_BIN3:$PATH" _ownership_guard_repos > "$_memo_tmp"; _c2_rc=$?
+if [ "$_c1_rc" -eq 0 ] && [ "$_c2_rc" -eq 0 ]; then
+  ok "success caches clean -> both first call and cache-hit return 0 (happy path unaffected by the fix)"
+else
+  bad "success-path memoization broke: first_rc=$_c1_rc second_rc=$_c2_rc, expected 0/0"
+fi
+rm -rf "$SANDBOX_BIN3"
+rm -f "$_memo_tmp"
 
 # ═════════════════════════════════════════════════════════════════════════
 # 4. Drift guard: the phantom-claim guard inside _beadid_live_crew_owner

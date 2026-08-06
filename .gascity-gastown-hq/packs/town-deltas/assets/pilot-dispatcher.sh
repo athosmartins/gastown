@@ -3361,12 +3361,12 @@ _crew_progressed_since() {
 # is the one caller that additionally checks $? for this reason.
 _OWNERSHIP_GUARD_REPOS=""
 _OWNERSHIP_GUARD_REPOS_DONE=""
+_OWNERSHIP_GUARD_REPOS_FAILED=""
 _ownership_guard_repos() {
-  local _og_failed=0
   if [ -z "$_OWNERSHIP_GUARD_REPOS_DONE" ]; then
     local _og_repos_json=""
     if ! _og_repos_json=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
-      _og_failed=1
+      _OWNERSHIP_GUARD_REPOS_FAILED=1
       warn "gc rig list failed while building _ownership_guard_repos — rig-side branch checks degraded to HQ-only this sweep (ga-07rb3)."
     fi
     _OWNERSHIP_GUARD_REPOS=$(
@@ -3377,13 +3377,22 @@ _ownership_guard_repos() {
     _OWNERSHIP_GUARD_REPOS_DONE=1
   fi
   printf '%s' "$_OWNERSHIP_GUARD_REPOS"
-  # ga-07rb3: memoization itself (_OWNERSHIP_GUARD_REPOS_DONE) has this exact
-  # same subshell limitation and only ever survives within a single call — a
-  # pre-existing characteristic of this helper, not something this fix
-  # changes or relies on. Each call re-derives its own success/failure
-  # independently, which is why _og_failed is local and freshly computed
-  # every time rather than trusted from a prior call.
-  [ "$_og_failed" -eq 0 ]
+  # ga-07rb3 fix-attempt-2: _OWNERSHIP_GUARD_REPOS_FAILED is a persisted global,
+  # set (never reset) the one time per sweep the fetch actually runs, and read
+  # on EVERY call including memoized cache-hits — unlike the local _og_failed
+  # this replaces, which reset to 0 on every call and only ever got recomputed
+  # inside the cache-miss branch, so any call after the first silently reported
+  # success regardless of what the cached data actually came from. The exit
+  # code must reflect the fetch that produced the CACHED data currently being
+  # returned, not "did today's invocation of this function do any work".
+  # Caveat (ga-130et, found while building this fix): every real call site
+  # below wraps this function in `$(...)`, which forks a subshell — so a
+  # memoized cache-HIT never actually reaches a second real caller today
+  # (each independently re-fetches and gets its own correct answer). This
+  # fix is still correct and worth keeping — it becomes load-bearing the
+  # moment ga-130et's deeper issue is fixed — but don't read "memoized for
+  # the whole sweep" above as true of the current call sites; see ga-130et.
+  [ -z "$_OWNERSHIP_GUARD_REPOS_FAILED" ]
 }
 
 # ── TTL claim-recovery (relocated from ~L1586, ga-wisp-1gdiik) ────────────────
