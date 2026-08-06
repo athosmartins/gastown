@@ -28,6 +28,23 @@
 #   AC3 zero thundering-herd: a 2nd run is deferred while one run keeps Dolt warm,
 #       and ALL runs are deferred once Dolt crosses the hot ceiling.
 #   AC4 logs 'gate em N runs (Dolt X% / cota Y%)'.
+#
+# ga-92azu additions (the reservation-vs-consumption bug + Mayor's resource-
+# brake amendment on the same bead):
+#   AC5 (bead)   the admission unit (GATE_REVIEWERS_PER_RUN) reserves what a
+#                CODE run ACTUALLY consumes (GATE_CODE_REVIEWERS, deployed=1),
+#                not a stale worst-case of 3 — so ceiling=6/perrun=1 admits
+#                THREE concurrent runs where the old perrun=3 admitted only two.
+#   AC6 (bead)   if a tier ever needs 3 reviewers again, the reservation still
+#                reserves 3 — the fix ties two constants together, it does not
+#                hardcode 1.
+#   AC7 (Mayor)  admission also respects a MACHINE resource floor (free swap):
+#                logical ceiling 6 + Dolt calm but swap below the floor → still
+#                opens NO new run, and logs a reason distinct from every other
+#                defer path ('swap-low', never confusable with "queue empty").
+#   AC8 (Mayor)  with swap healthy AND Dolt calm, admission scales to the full
+#                ceiling exactly as before — the resource brake is a floor, not
+#                a permanent throttle.
 
 set -uo pipefail
 
@@ -53,6 +70,7 @@ GATE_DISPATCHER_LIB_ONLY=1 source "$DISPATCHER" \
 type gate_headroom_decision >/dev/null 2>&1 || { echo "FATAL: gate_headroom_decision not defined"; exit 1; }
 type gate_dolt_cpu          >/dev/null 2>&1 || { echo "FATAL: gate_dolt_cpu not defined"; exit 1; }
 type gate_quota_limited     >/dev/null 2>&1 || { echo "FATAL: gate_quota_limited not defined"; exit 1; }
+type gate_swap_free_mb      >/dev/null 2>&1 || { echo "FATAL: gate_swap_free_mb not defined"; exit 1; }
 
 # Quiet any logging from sourced helpers (none call it today, but be safe).
 log()  { :; }
@@ -61,8 +79,26 @@ err()  { :; }
 
 # Fixed thresholds for the matrix (the dispatcher's defaults).
 #   gate_headroom_decision <cpu> <lat> <qlim> <inflight> \
-#     <cpu_hot=180> <cpu_warm=100> <lat_hot=2500> <maxr=6> <perrun=3> <failopen>
-HD() { gate_headroom_decision "$1" "$2" "$3" "$4" 180 100 2500 6 3 "${5:-1}"; }
+#     <cpu_hot=180> <cpu_warm=100> <lat_hot=2500> <maxr=6> <perrun=3> <failopen> \
+#     [<swap_free_mb> <swap_floor_mb>]
+# swap args default to "" (no signal → never blocks) so every existing call
+# below keeps exercising ONLY the Dolt/quota matrix, unchanged.
+HD() { gate_headroom_decision "$1" "$2" "$3" "$4" 180 100 2500 6 3 "${5:-1}" "${6:-}" "${7:-}"; }
+
+# HDSW <cpu> <lat> <qlim> <inflight> <swap_free_mb> <swap_floor_mb> — same fixed
+# Dolt/quota thresholds as HD(), fail-open forced on, but exercises the ga-92azu
+# resource brake explicitly instead of leaving swap args empty.
+HDSW() { gate_headroom_decision "$1" "$2" "$3" "$4" 180 100 2500 6 3 1 "$5" "$6"; }
+
+# _derived_perrun_for <GATE_CODE_REVIEWERS, "" = unset> [<GATE_REVIEWERS_PER_RUN
+# override, "" = unset>] → what GATE_REVIEWERS_PER_RUN resolves to when the
+# dispatcher is sourced FRESH with that env. Runs in an isolated subprocess —
+# the copy already sourced at the top of this file has its constants fixed from
+# ITS OWN env and must not be re-sourced in-process with different values.
+_derived_perrun_for() {
+  env GATE_DISPATCHER_LIB_ONLY=1 GATE_CODE_REVIEWERS="${1:-}" GATE_REVIEWERS_PER_RUN="${2:-}" \
+    bash -c 'source "$0" >/dev/null 2>&1; echo "$GATE_REVIEWERS_PER_RUN"' "$DISPATCHER"
+}
 
 echo "── 1. AC2: Dolt CALM scales up to the ceiling (static 6) ──"
 eq "calm + 0 in-flight   → admit run 1"        "$(HD 50 120 0 0)" "admit 6 dolt-calm"
@@ -348,6 +384,90 @@ eq "production threshold (250): cpu=275 + idle → hot-floor (ONE run)" \
 # 250 boundary is the thing being read (and that 'hot-floor' is not a catch-all).
 eq "production threshold (250): cpu=249 + idle → warm" \
   "$(gate_headroom_decision 249 48 0 0 250 130 2500 6 3 1)" "admit 3 dolt-warm"
+
+echo "── 26. ga-92azu AC5/AC6: GATE_REVIEWERS_PER_RUN derives from GATE_CODE_REVIEWERS ──"
+# The bug: the deployed plist sets GATE_CODE_REVIEWERS=1 (995 logged CODE runs
+# all used required_reviewers=1, zero used 3) but GATE_REVIEWERS_PER_RUN stayed
+# hardcoded at 3 — the admission unit no longer matched what a run actually
+# consumes. The fix ties the two together instead of hardcoding a fresh number,
+# per the bead's own warning: "não troque a constante por 1 fixo sem amarrar ao
+# tier" — so if a tier ever needs 3 again, bumping GATE_CODE_REVIEWERS alone
+# must be enough.
+eq "unset GATE_CODE_REVIEWERS → bare default (2), perrun follows"     "$(_derived_perrun_for '')"  "2"
+eq "REAL deployed value (1) → perrun follows to 1 (was stuck at 3)"   "$(_derived_perrun_for 1)"   "1"
+eq "AC6 control: tier reverts to 3 → perrun follows to 3, not stuck"  "$(_derived_perrun_for 3)"   "3"
+eq "explicit GATE_REVIEWERS_PER_RUN override still wins over the derived default" \
+  "$(_derived_perrun_for 1 5)" "5"
+eq "degenerate GATE_CODE_REVIEWERS=0 → floored to 1 (never 0 — 0 would disable the reservation entirely)" \
+  "$(_derived_perrun_for 0)" "1"
+
+echo "── 27. ga-92azu AC5 FIXTURE (bead's own acceptance criterion 1, verbatim): ceiling=6, Dolt calm, REAL perrun=1 → THREE queued CODE runs are ALL admitted (old perrun=3 admitted only two — see § 1's 'calm + 2 runs (6) → defer' with perrun=3) ──"
+eq "run 1 (idle)"                    "$(gate_headroom_decision 50 120 0 0 180 100 2500 6 1 1)" "admit 6 dolt-calm"
+eq "run 2 (1 already live)"          "$(gate_headroom_decision 50 120 0 1 180 100 2500 6 1 1)" "admit 6 dolt-calm"
+eq "run 3 — THE fixture: old code deferred here" "$(gate_headroom_decision 50 120 0 2 180 100 2500 6 1 1)" "admit 6 dolt-calm"
+eq "scales all the way to the full ceiling (run 6, 5 live)" "$(gate_headroom_decision 50 120 0 5 180 100 2500 6 1 1)" "admit 6 dolt-calm"
+eq "7th would exceed the ceiling → defer (cap still respected)" "$(gate_headroom_decision 50 120 0 6 180 100 2500 6 1 1)" "defer 6 dolt-calm-cap-reached"
+
+echo "── 28. ga-92azu AC7 (Mayor's amendment, bead's acceptance criterion 5, verbatim): logical ceiling 6 + Dolt calm + swap BELOW floor → NO new run, reason is NOT confusable with an empty queue ──"
+eq "calm Dolt, idle, swap critically low → defer (independent of Dolt state)" \
+  "$(HDSW 50 120 0 0 800 1024)" "defer 0 swap-low"
+eq "calm Dolt, runs already live, swap low → still defer (never revokes in-flight, never admits new)" \
+  "$(HDSW 50 120 0 3 800 1024)" "defer 0 swap-low"
+eq "swap-low overrides even the dolt-hot-floor idle carve-out (§ 2b does not apply — different mechanism)" \
+  "$(gate_headroom_decision 220 120 0 0 180 100 2500 6 3 1 800 1024)" "defer 0 swap-low"
+eq "reason string is 'swap-low' — distinct from 'no queued markers' (a totally separate early-exit path) and from every other defer reason" \
+  "$(HDSW 50 120 0 0 800 1024 | cut -d' ' -f3)" "swap-low"
+
+echo "── 29. ga-92azu AC8 (Mayor's amendment, bead's acceptance criterion 6, verbatim): swap HEALTHY + Dolt calm → scales to the full ceiling exactly as before (the brake is a floor, not a permanent throttle) ──"
+eq "ample free swap + calm Dolt, idle → admits at the full ceiling"      "$(HDSW 50 120 0 0 4096 1024)" "admit 6 dolt-calm"
+# HDSW fixes perrun=3 (matching HD's reference value) — inflight=3 is the last
+# slot that still fits (3+3<=6); this proves the ceiling is reached, not
+# artificially capped short of it by the swap check being always-on.
+eq "ample free swap + calm Dolt, 3 live (last run that still fits) → admits"   "$(HDSW 50 120 0 3 4096 1024)" "admit 6 dolt-calm"
+
+echo "── 30. ga-92azu: swap-floor boundary is strict (< not ≤) — exactly-at-floor is safe, matching § 5's cpu boundary convention ──"
+eq "swap == floor exactly → NOT low"      "$(HDSW 50 120 0 0 1024 1024)" "admit 6 dolt-calm"
+eq "swap == floor-1 → low"                "$(HDSW 50 120 0 0 1023 1024)" "defer 0 swap-low"
+
+echo "── 31. ga-92azu: swap check is fail-OPEN — a missing/partial reading never blocks (same contract as every other probe here) ──"
+eq "no swap args at all (HD default) → unaffected, normal calm admit" "$(HD 50 120 0 0)" "admit 6 dolt-calm"
+eq "swap_free present but swap_floor missing → no check fires (both required)" \
+  "$(gate_headroom_decision 50 120 0 0 180 100 2500 6 3 1 800 '')" "admit 6 dolt-calm"
+eq "swap_floor present but swap_free missing → no check fires (both required)" \
+  "$(gate_headroom_decision 50 120 0 0 180 100 2500 6 3 1 '' 1024)" "admit 6 dolt-calm"
+eq "non-numeric swap_free → treated as no-signal, never blocks" \
+  "$(gate_headroom_decision 50 120 0 0 180 100 2500 6 3 1 NaN 1024)" "admit 6 dolt-calm"
+
+echo "── 32. gate_swap_free_mb — override seam + live sysctl probe shape ──"
+eq "override seam returns the forced value" "$(GATE_SWAP_FREE_OVERRIDE_MB=777 gate_swap_free_mb)" "777"
+# No override: read the REAL live sysctl. Don't assert a specific number (it
+# changes every run) — assert it is a plain non-negative integer, proving the
+# parser actually extracts something usable from `sysctl vm.swapusage` rather
+# than silently degrading to empty on every real machine.
+LIVE_SWAP=$(gate_swap_free_mb)
+case "$LIVE_SWAP" in
+  ''|*[!0-9]*) bad "live gate_swap_free_mb did not return a plain integer (got [$LIVE_SWAP])" ;;
+  *)           ok "live gate_swap_free_mb returned a plain integer ($LIVE_SWAP MB)" ;;
+esac
+
+echo "── 33. ga-92azu drift-guards: live wiring ──"
+has "$DISPATCHER" 'gate_swap_free_mb\(\)'                    "swap-free probe is defined"
+has "$DISPATCHER" 'GATE_SWAP_FREE_FLOOR_MB'                  "swap-free floor threshold configured"
+has "$DISPATCHER" 'GATE_SWAP_FREE_OVERRIDE_MB'                "swap override seam wired"
+has "$DISPATCHER" 'GATE_CODE_REVIEWERS'                       "code-tier reviewer knob configured (perrun derivation source)"
+has "$DISPATCHER" 'GATE_REVIEWERS_PER_RUN:-\$GATE_CODE_REVIEWERS' "perrun default derives from the code-reviewer knob, not a bare constant"
+has "$DISPATCHER" 'HR_SWAP_FREE=\$\(gate_swap_free_mb\)'      "swap probe called from the live sweep"
+has "$DISPATCHER" 'swap_free='                                "log surfaces the swap_free reading (both OK and DEFER lines)"
+
+echo "── 34. ga-92azu drift-guard: swap probe is called BEFORE the decision, and the decision consumes it ──"
+SWAP_CALL_LN=$(grep -n 'HR_SWAP_FREE=\$(gate_swap_free_mb)' "$DISPATCHER" | head -1 | cut -d: -f1)
+DECISION_CALL_LN=$(grep -n 'HR_DECISION=\$(gate_headroom_decision' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$SWAP_CALL_LN" ] && [ -n "$DECISION_CALL_LN" ] && [ "$SWAP_CALL_LN" -lt "$DECISION_CALL_LN" ]; then
+  ok "swap probe (L$SWAP_CALL_LN) precedes the decision call (L$DECISION_CALL_LN)"
+else
+  bad "ordering wrong: swap probe=L${SWAP_CALL_LN:-?} decision=L${DECISION_CALL_LN:-?} (decision could consume a stale/empty swap reading)"
+fi
+has "$DISPATCHER" '"\${HR_SWAP_FREE:-}" "\$GATE_SWAP_FREE_FLOOR_MB"' "decision call passes the live swap reading + floor through"
 
 echo ""
 echo "──────────────────────────────────────────────"

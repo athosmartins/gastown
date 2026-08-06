@@ -275,12 +275,27 @@ GATE_DOLT_CPU_HOT="${GATE_DOLT_CPU_HOT:-180}"          # cpu% above which NO new
 GATE_DOLT_CPU_WARM="${GATE_DOLT_CPU_WARM:-100}"        # cpu% above which only ONE run runs
 GATE_DOLT_LATENCY_HOT_MS="${GATE_DOLT_LATENCY_HOT_MS:-2500}"  # server latency ceiling (matches Pilot)
 GATE_MAX_REVIEWERS="${GATE_MAX_REVIEWERS:-6}"          # full ceiling when calm (= template max_active_sessions)
-GATE_REVIEWERS_PER_RUN="${GATE_REVIEWERS_PER_RUN:-3}"  # a CODE run's reviewer count (worst-case admission unit)
+GATE_CODE_REVIEWERS="${GATE_CODE_REVIEWERS:-2}"        # real reviewer count for a CODE-tier run (mirrors the Step 6 tier dispatch below)
+GATE_SWAP_FREE_FLOOR_MB="${GATE_SWAP_FREE_FLOOR_MB:-512}"  # below this free swap, admit NO new run (ga-92azu resource brake)
 case "$GATE_DOLT_CPU_HOT"        in ''|*[!0-9]*) GATE_DOLT_CPU_HOT=180 ;; esac
 case "$GATE_DOLT_CPU_WARM"       in ''|*[!0-9]*) GATE_DOLT_CPU_WARM=100 ;; esac
 case "$GATE_DOLT_LATENCY_HOT_MS" in ''|*[!0-9]*) GATE_DOLT_LATENCY_HOT_MS=2500 ;; esac
 case "$GATE_MAX_REVIEWERS"       in ''|*[!0-9]*) GATE_MAX_REVIEWERS=6 ;; esac
-case "$GATE_REVIEWERS_PER_RUN"   in ''|*[!0-9]*) GATE_REVIEWERS_PER_RUN=3 ;; esac
+case "$GATE_CODE_REVIEWERS"      in ''|*[!0-9]*) GATE_CODE_REVIEWERS=2 ;; esac
+case "$GATE_SWAP_FREE_FLOOR_MB"  in ''|*[!0-9]*) GATE_SWAP_FREE_FLOOR_MB=512 ;; esac
+# ga-92azu: admission must reserve what a run ACTUALLY consumes, not a stale
+# worst-case. GATE_CODE_REVIEWERS (just above, validated) is that worst case
+# across BOTH tiers — NON-CODE is a fixed 1 reviewer, always <= it (see the
+# Step 6 tier dispatch below) — so default HERE from THAT SAME knob, instead of
+# a second hardcoded constant that can silently drift from it. That drift is
+# exactly what happened: the deployed plist dropped GATE_CODE_REVIEWERS to 1
+# (995 logged CODE runs all used required_reviewers=1, zero used 3) while this
+# constant stayed hardcoded at 3, wasting 2/3 of every admission reservation. If
+# a tier ever needs 3 reviewers again, bumping GATE_CODE_REVIEWERS alone is
+# enough — this default follows it automatically.
+GATE_REVIEWERS_PER_RUN="${GATE_REVIEWERS_PER_RUN:-$GATE_CODE_REVIEWERS}"  # a CODE run's reviewer count (worst-case admission unit)
+case "$GATE_REVIEWERS_PER_RUN"   in ''|*[!0-9]*) GATE_REVIEWERS_PER_RUN="$GATE_CODE_REVIEWERS" ;; esac
+[ "$GATE_REVIEWERS_PER_RUN" -ge 1 ] 2>/dev/null || GATE_REVIEWERS_PER_RUN=1
 
 # session_is_dead <present 0|1> <closed true|false|1|0> → echoes 1 (dead) | 0 (alive)
 # A reviewer session is DEAD iff it is absent from the session list (present=0)
@@ -1051,6 +1066,25 @@ gate_quota_limited() {
   printf '0'; return 0
 }
 
+# gate_swap_free_mb → integer MB of free swap, or "" if unreadable. The Gas
+# Town host fleet is macOS-only, so this reads `sysctl vm.swapusage` directly
+# (no cross-platform fallback needed). Honors GATE_SWAP_FREE_OVERRIDE_MB
+# (selftest seam — no live sysctl), matching the GATE_DOLT_CPU_OVERRIDE /
+# GATE_QUOTA_OVERRIDE convention. Fail-soft: any parse failure returns ""
+# rather than a wrong number — gate_headroom_decision treats an empty reading
+# as no-signal (never blocks), the same contract as every other probe here.
+# ga-92azu: this is the resource brake Mayor's review added — Dolt CPU/latency
+# and Claude quota both bound the GATE's own load; neither says anything about
+# whether the MACHINE has room for one more live Claude session.
+gate_swap_free_mb() {
+  if [ -n "${GATE_SWAP_FREE_OVERRIDE_MB:-}" ]; then printf '%s' "$GATE_SWAP_FREE_OVERRIDE_MB"; return 0; fi
+  local _raw
+  _raw=$(sysctl -n vm.swapusage 2>/dev/null | sed -n 's/.*free *= *\([0-9.]*\)M.*/\1/p')
+  [ -n "$_raw" ] || { printf ''; return 0; }
+  awk -v v="$_raw" 'BEGIN{printf "%d", v}' 2>/dev/null
+  return 0
+}
+
 # ── ga-x3nmz: quota-aware verdict resolution ──────────────────────────────────
 # gate_quota_stop_verdict <quota_limited 0|1> → "requeue" | "proceed"
 # PURE (no IO, set -e safe). A reviewer that stalls or times out with NO
@@ -1083,20 +1117,28 @@ quota_reset_eta() {
 }
 
 # gate_headroom_decision <cpu> <lat_ms> <quota_limited 0|1> <inflight_reviewers> \
-#   <cpu_hot> <cpu_warm> <lat_hot_ms> <max_reviewers> <reviewers_per_run> <failopen 0|1>
+#   <cpu_hot> <cpu_warm> <lat_hot_ms> <max_reviewers> <reviewers_per_run> <failopen 0|1> \
+#   [<swap_free_mb> <swap_floor_mb>]
 # → echoes "<verdict> <ceiling> <reason>"  (verdict ∈ admit|defer).
 # PURE; no I/O; set -e safe. Computes a DYNAMIC ceiling on concurrent reviewer
-# sessions from Dolt health + quota, then admits a NEW run iff it fits under it:
+# sessions from Dolt health + quota + machine resource headroom, then admits a
+# NEW run iff it fits under it:
 #   quota-limited              → ceiling 0   (defer; never burn into a hard limit)
+#   swap < floor (ga-92azu)    → ceiling 0   (defer; the MACHINE has no room for
+#                                             one more live session — see § 1b)
 #   Dolt hot (cpu>hot|lat>hot) → ceiling 0   (defer; open NO run on a hot plane → AC1/AC3)
 #   no signal + failopen=0     → ceiling 0   (defer; conservative)
 #   no signal + failopen=1     → ceiling max (proceed; a wedged probe must never deadlock the gate)
 #   Dolt warm (cpu>warm)       → ceiling = reviewers_per_run (exactly ONE run; 2nd waits)
 #   Dolt calm                  → ceiling = max_reviewers (scale up to the static cap → AC2)
-# admit iff inflight + reviewers_per_run <= ceiling.
+# admit iff inflight + reviewers_per_run <= ceiling. swap_free_mb/swap_floor_mb
+# are OPTIONAL trailing args — default "" (no signal, never blocks) so every
+# existing 10-arg call site (including this selftest's HD() helper) keeps
+# working unchanged.
 gate_headroom_decision() {
   local cpu="$1" lat="$2" qlim="$3" inflight="$4"
   local cpu_hot="$5" cpu_warm="$6" lat_hot="$7" maxr="$8" perrun="$9" failopen="${10}"
+  local swap_free="${11:-}" swap_floor="${12:-}"
   case "$cpu"      in ''|*[!0-9]*) cpu="" ;; esac
   case "$lat"      in ''|*[!0-9]*) lat="" ;; esac
   case "$inflight" in ''|*[!0-9]*) inflight=0 ;; esac
@@ -1105,9 +1147,44 @@ gate_headroom_decision() {
   case "$lat_hot"  in ''|*[!0-9]*) lat_hot=2500 ;; esac
   case "$maxr"     in ''|*[!0-9]*) maxr=6 ;; esac
   case "$perrun"   in ''|*[!0-9]*) perrun=3 ;; esac
+  case "$swap_free"  in ''|*[!0-9]*) swap_free="" ;; esac
+  case "$swap_floor" in ''|*[!0-9]*) swap_floor="" ;; esac
 
   # 1. Quota hard-stop — independent of Dolt.
   if [ "$qlim" = "1" ]; then echo "defer 0 quota-limited"; return 0; fi
+
+  # 1b. Low free swap — independent RESOURCE hard-stop (ga-92azu, added on
+  # Mayor's review of this bead). The Dolt/quota checks above bound the GATE's
+  # OWN load; neither says anything about whether the MACHINE has room for one
+  # more live Claude session. Measured 2026-08-05: 13 unrelated sessions had
+  # already consumed ~20.5 of 21.5GB swap (819MB free, 96% used) — scaling the
+  # ceiling to 6 there would not drain the queue faster, it would thrash the
+  # whole box (every process on it, not just the gate's reviewers), which is
+  # worse than a slow queue. Same fail-open contract as every other probe
+  # here: only a POSITIVELY-measured low reading blocks; a missing/unparseable
+  # one never does. Deliberately NO in-flight==0 floor (unlike dolt-hot's § 2
+  # below): that floor exists because dolt-hot load is self-inflicted by the
+  # gate's OWN reviewers, so "the gate owns none of it while idle" holds and
+  # justifies always allowing one. Swap pressure here comes from OTHER
+  # processes the gate does not control and cannot shed by having opened zero
+  # runs — idle is not evidence the machine can absorb a new one.
+  #
+  # GATE_SWAP_FREE_FLOOR_MB default (512) is calibrated BELOW the 819-961MB
+  # range actually observed 2026-08-05, not above it: Mayor's own math sized
+  # ONE new reviewer at ~250-300MB (145MB RSS + aux), and objected specifically
+  # to jumping straight to 6 (+5 sessions, ~1.25-1.5GB) against 819MB free — not
+  # to admitting one more. A floor near 1GB would defer EVERY admission at
+  # today's readings, turning "stop wasting 2/3 of the ceiling" into "stop the
+  # gate entirely" — a regression, not the fix. 512MB leaves room for a couple
+  # more sessions' worth of margin below what was actually measured, so it does
+  # not trip on typical readings, while a real slide toward exhaustion still
+  # hits it (each admitted run consumes real RSS, so the ratchet in § 3 below
+  # self-limits as swap actually drains — it does not require this floor to be
+  # high to be protective).
+  if [ -n "$swap_free" ] && [ -n "$swap_floor" ] \
+     && [ "$swap_free" -lt "$swap_floor" ] 2>/dev/null; then
+    echo "defer 0 swap-low"; return 0
+  fi
 
   # 2. Dolt state from whatever signals we have.
   local have=0 hot=0 warm=0
@@ -4657,11 +4734,15 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
   HR_CPU=$(gate_effective_headroom_cpu "${GATE_AMBIENT_DOLT_CPU:-}" "${HR_CPU_POSTJANITOR:-}")
   # 2. Claude quota (optional ga-wjlv9 dep; fail-open when the checker is absent).
   HR_QLIM=$(gate_quota_limited)
+  # 2b. Free swap (ga-92azu resource brake) — independent of Dolt/quota; see
+  #     gate_headroom_decision § 1b for why this cannot piggyback on either.
+  HR_SWAP_FREE=$(gate_swap_free_mb)
   # 3. Pure dynamic-concurrency decision.
   HR_DECISION=$(gate_headroom_decision \
     "${HR_CPU:-}" "${HR_LAT:-}" "$HR_QLIM" "$LIVE_REVIEWERS" \
     "$GATE_DOLT_CPU_HOT" "$GATE_DOLT_CPU_WARM" "$GATE_DOLT_LATENCY_HOT_MS" \
-    "$GATE_MAX_REVIEWERS" "$GATE_REVIEWERS_PER_RUN" "${GATE_HEADROOM_FAILOPEN:-1}")
+    "$GATE_MAX_REVIEWERS" "$GATE_REVIEWERS_PER_RUN" "${GATE_HEADROOM_FAILOPEN:-1}" \
+    "${HR_SWAP_FREE:-}" "$GATE_SWAP_FREE_FLOOR_MB")
   HR_VERDICT=$(printf '%s' "$HR_DECISION" | awk '{print $1}')
   HR_CEILING=$(printf '%s' "$HR_DECISION" | awk '{print $2}')
   HR_REASON=$(printf '%s' "$HR_DECISION" | cut -d' ' -f3-)
@@ -4669,10 +4750,10 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
   HR_RUNS=$(( ( LIVE_REVIEWERS + GATE_REVIEWERS_PER_RUN - 1 ) / GATE_REVIEWERS_PER_RUN ))
   if [ "$HR_QLIM" = "1" ]; then HR_COTA="LIMITED"; else HR_COTA="ok"; fi
   if [ "$HR_VERDICT" = "defer" ]; then
-    log "Headroom DEFER: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% [ambient; post-janitor=${HR_CPU_POSTJANITOR:-?}%] lat=${HR_LAT:-?}ms / cota=${HR_COTA}) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, leaving $COUNT marker(s) queued (ga-cw4pm)."
+    log "Headroom DEFER: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% [ambient; post-janitor=${HR_CPU_POSTJANITOR:-?}%] lat=${HR_LAT:-?}ms / cota=${HR_COTA} / swap_free=${HR_SWAP_FREE:-?}MB) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, leaving $COUNT marker(s) queued (ga-cw4pm)."
     exit 0
   fi
-  log "Headroom OK: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% [ambient; post-janitor=${HR_CPU_POSTJANITOR:-?}%] lat=${HR_LAT:-?}ms / cota=${HR_COTA}) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, admitting a new run (ga-cw4pm)."
+  log "Headroom OK: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% [ambient; post-janitor=${HR_CPU_POSTJANITOR:-?}%] lat=${HR_LAT:-?}ms / cota=${HR_COTA} / swap_free=${HR_SWAP_FREE:-?}MB) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, admitting a new run (ga-cw4pm)."
 fi
 
 # QUEUE ORDER: newest-first tiebreak (4cae0a2c49, 2026-06-24 — Athos: gate>
