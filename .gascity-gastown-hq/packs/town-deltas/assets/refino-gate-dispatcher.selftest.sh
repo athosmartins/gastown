@@ -24,6 +24,15 @@
 #          no accumulation), 2d (single atomic bd_ call — no split-failure window,
 #          ga-xvxvf gate re-dispatch fix attempt 1), 2e (fixture proof of all three).
 #   Timeout safety → Scenario 6 (TIMEOUT/unknown → requeue, never promote, no round burn).
+#   AC "veredito nunca se perde em silêncio" (ga-hmcs0)
+#        → drift-guard 8 + the _verdict_fixture scenarios. NOTE the claim was
+#          CORRECTED after two gate reviews: `bd update --add-label --remove-label`
+#          is ONE CLI call but NOT one transaction (applyLabelUpdates runs the ADD
+#          loop then the REMOVE loop; each of AddLabel/RemoveLabel commits its own
+#          sql.Tx). What the fix actually guarantees is that the VERDICT IS NEVER
+#          LOST: the worst residual state is both labels present — visible and
+#          self-correcting — instead of neither, which was silent and looked
+#          identical to "the reviewer never ran".
 #
 # Exit 0 iff every assertion holds.
 
@@ -274,6 +283,149 @@ else
   bad "DRY_RUN did not run cleanly in proof mode (rc=$_dryrc)"
 fi
 rm -rf "$_drycity"
+
+# 8. ga-hmcs0: the reviewer's verdict-recording instructions (REVIEW_TASK heredoc)
+#    must record PASS/FAIL via ONE atomic `bd update --add-label/--remove-label`
+#    call, never two independent `bd label remove` + `bd label add` calls. The
+#    reviewer is a freshly spawned Claude session with no `bd_` wrapper — it
+#    executes these lines literally, so the split form is a real, reachable race:
+#    if the remove succeeds and the add fails (Dolt hiccup / concurrent writer,
+#    both routine in this town), the verdict bead ends up with NEITHER label —
+#    an entire review's result lost in silence, indistinguishable downstream
+#    from "not yet reviewed" (root-class: error-vs-empty).
+echo "Drift guard 8: verdict recorded via one atomic bd update call (ga-hmcs0)"
+
+# 8a. REGRESSION GUARD: the split remove-then-add must not reappear.
+if grep -qE '^bd -C "\$REFINO_GATE_STORE" label remove "\$VERDICT_BEAD_ID"' "$DISPATCHER"; then
+  bad "REGRESSION (ga-hmcs0): verdict instructions issue a split 'label remove' — reintroduces the lost-verdict race"
+else
+  ok "verdict instructions no longer issue a split 'label remove' (ga-hmcs0)"
+fi
+
+# 8b. The atomic replacement must be present for BOTH the live PASS path and the
+#     commented-out FAIL example (the bug explicitly warns: leaving the old
+#     split pattern there, even inert, models it for the next editor).
+if grep -qE '^bd -C "\$REFINO_GATE_STORE" update "\$VERDICT_BEAD_ID" --add-label verdict:PASS --remove-label verdict:pending' "$DISPATCHER"; then
+  ok "PASS recorded via one atomic bd update --add-label/--remove-label call (ga-hmcs0)"
+else
+  bad "PASS verdict instructions missing the atomic bd update --add-label/--remove-label form"
+fi
+if grep -qE '^# bd -C "\$REFINO_GATE_STORE" update "\$VERDICT_BEAD_ID" --add-label verdict:FAIL --remove-label verdict:pending' "$DISPATCHER"; then
+  ok "commented-out FAIL example also uses the atomic form (not left as a wrong model, ga-hmcs0)"
+else
+  bad "commented-out FAIL example still models the split (non-atomic) pattern"
+fi
+
+# 8c. Fixture proof (falsifiable, ga-hmcs0 AC #1-#3): simulate a Dolt store as a
+#     single in-memory label value and run the EXACT command forms the reviewer
+#     is told to run — split vs atomic — against a stub `bd`, injecting a write
+#     failure at a chosen call index. This is what the reviewer literally
+#     executes (raw `bd`, no `bd_` wrapper — it has no dispatcher functions in
+#     scope), so exercising the literal command strings IS exercising the
+#     shipped behavior, not a parallel reimplementation.
+# ga-hmcs0 (2nd gate review): this fixture must model the MECHANISM, not the claim.
+# The earlier version failed at the top of bd() — before any mutation — so `update`
+# behaved as one indivisible all-or-nothing step. That is what the diff CLAIMED, and
+# modelling the claim made the test structurally blind to the only failure the fix
+# leaves open.
+#
+# The real mechanism, traced in the live beads source: cmd/bd/update.go ->
+# applyLabelUpdates (cmd/bd/show_unit_helpers.go) runs the whole ADD loop, THEN the
+# REMOVE loop, and internal/storage/dolt/labels.go gives AddLabel and RemoveLabel
+# each their OWN sql.Tx. One CLI call, TWO commits. So `update` is modelled here as
+# two internal steps that can fail independently:
+#   fail_at="update:remove"  -> the ADD committed, the REMOVE did not
+# LABELS is a SET (space-separated) because the honest partial state has BOTH labels
+# present at once — a single-string variable literally could not represent it, which
+# is the second reason the old fixture could not see this bug.
+_verdict_fixture() {
+  local mode="$1" fail_at="$2"
+  local LABELS="verdict:pending"   # a fresh verdict bead always starts life here (see bead-create, -l verdict:pending)
+  local _call_n=0
+  _lbl_add() { case " $LABELS " in *" $1 "*) ;; *) LABELS="${LABELS:+$LABELS }$1" ;; esac; }
+  _lbl_rm()  { local out="" l; for l in $LABELS; do [ "$l" = "$1" ] || out="${out:+$out }$l"; done; LABELS="$out"; }
+  bd() {
+    _call_n=$((_call_n + 1))
+    [ "$_call_n" = "$fail_at" ] && return 1   # whole-invocation failure (split form)
+    if [ "$3" = "label" ] && [ "$4" = "remove" ]; then
+      _lbl_rm "$6"
+    elif [ "$3" = "label" ] && [ "$4" = "add" ]; then
+      _lbl_add "$6"
+    elif [ "$3" = "update" ]; then
+      shift 4
+      local add="" rem=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --add-label) add="$2"; shift 2 ;;
+          --remove-label) rem="$2"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      # Internal step 1: the ADD loop commits its own transaction.
+      [ "$fail_at" = "update:add" ] && return 1
+      [ -n "$add" ] && _lbl_add "$add"
+      # Internal step 2: the REMOVE loop commits a SEPARATE transaction. A failure
+      # here is the real residual risk — the add already landed and cannot roll back.
+      [ "$fail_at" = "update:remove" ] && return 1
+      [ -n "$rem" ] && _lbl_rm "$rem"
+    fi
+    return 0
+  }
+  REFINO_GATE_STORE="fixture-store"; VERDICT_BEAD_ID="fixture-verdict"
+  if [ "$mode" = "split" ]; then
+    bd -C "$REFINO_GATE_STORE" label remove "$VERDICT_BEAD_ID" "verdict:pending"
+    bd -C "$REFINO_GATE_STORE" label add    "$VERDICT_BEAD_ID" "verdict:PASS"
+  else
+    bd -C "$REFINO_GATE_STORE" update "$VERDICT_BEAD_ID" --add-label verdict:PASS --remove-label verdict:pending
+  fi
+  echo "$LABELS"
+  unset -f bd _lbl_add _lbl_rm
+}
+
+# CONTROL (AC #2): happy path, no injected failure — atomic form must land
+# identically to today's happy-path outcome (verdict:PASS, verdict:pending gone).
+# This proves the fix is an ATOMICITY change, not a semantic one.
+HAPPY=$(_verdict_fixture atomic 0)
+[ "$HAPPY" = "verdict:PASS" ] && ok "fixture control: atomic call, no failure → verdict:PASS only (same happy-path result as before)" \
+  || bad "fixture control: atomic happy-path produced '$HAPPY', expected 'verdict:PASS'"
+
+# CHARACTERIZATION: the OLD split form with the 2nd write failing reproduces the
+# documented bug — bead ends with NEITHER label. (Proves the fixture itself is
+# faithful to the reported failure, not just to the fix.)
+OLD_BUG=$(_verdict_fixture split 2)
+[ "$OLD_BUG" = "" ] && ok "fixture characterizes the reported bug: split form + 2nd-write failure → neither label survives" \
+  || bad "fixture: split form + injected failure produced '$OLD_BUG', expected empty (failed to characterize the known bug)"
+
+# AC #1 (REWRITTEN after the 2nd gate review): the one-call form is NOT one
+# transaction, so assert what actually survives — not what the comment wished for.
+# Internal REMOVE fails after the internal ADD already committed: the bead ends with
+# BOTH labels. That is a partial state, and pretending otherwise is what the reviewer
+# rejected twice.
+FAILED=$(_verdict_fixture atomic update:remove)
+case "$FAILED" in
+  *verdict:PASS*)
+    case "$FAILED" in
+      *verdict:pending*) ok "fixture AC#1: one-call form + internal REMOVE failure → BOTH labels survive ('$FAILED') — a VISIBLE partial state, not silent loss (ga-hmcs0)" ;;
+      *) bad "fixture AC#1: expected both labels after an internal REMOVE failure, got '$FAILED'" ;;
+    esac ;;
+  *) bad "fixture AC#1: the internal ADD should have committed before the REMOVE failed, got '$FAILED'" ;;
+esac
+
+# AC #1b: the failure the fix DOES eliminate — the verdict is never LOST. Whatever
+# the outcome, verdict:PASS must be present, so the bead is never left looking like
+# "the reviewer never ran" (the error-vs-empty collapse this bead exists to kill).
+for _fp in update:remove 0; do
+  _out=$(_verdict_fixture atomic "$_fp")
+  case "$_out" in
+    *verdict:PASS*) ok "fixture AC#1b: one-call form (fail_at=$_fp) never loses the verdict — verdict:PASS present ('$_out')" ;;
+    *) bad "fixture AC#1b: verdict LOST with fail_at=$_fp (got '$_out') — that is the ga-hmcs0 bug itself" ;;
+  esac
+done
+
+# AC #3: "failed" and "transitioned" must be OBSERVABLY DIFFERENT states — the
+# heart of the bug (a lost verdict must never look the same as a recorded one).
+[ "$FAILED" != "$HAPPY" ] && ok "fixture AC#3: failed state ('$FAILED') and transitioned state ('$HAPPY') are observably different" \
+  || bad "REGRESSION AC#3: failed and transitioned states are indistinguishable ('$FAILED')"
 
 echo ""
 echo "refino-gate-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"

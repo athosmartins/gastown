@@ -472,15 +472,34 @@ EVALUATE (PASS only if ALL hold):
 
 RECORD YOUR VERDICT with EXACTLY these commands, then exit:
 
-bd -C "$REFINO_GATE_STORE" label remove "$VERDICT_BEAD_ID" "verdict:pending"
-# If the refinement is good enough for Athos's queue:
-bd -C "$REFINO_GATE_STORE" label add "$VERDICT_BEAD_ID" "verdict:PASS"
+# PASS — good enough for Athos's queue. ONE command instead of two (ga-hmcs0).
+#
+# What this DOES buy: the reviewing session cannot die *between* two separate
+# commands and leave the bead with no verdict at all. That window was real and is
+# now closed — a single invocation either runs or does not.
+#
+# What it does NOT buy, and do not let this comment claim otherwise: it is NOT one
+# transaction. Traced in the live beads source — cmd/bd/update.go calls
+# applyLabelUpdates (cmd/bd/show_unit_helpers.go), which runs the entire ADD loop
+# to completion and THEN the REMOVE loop; internal/storage/dolt/labels.go has
+# AddLabel and RemoveLabel each opening and committing their OWN sql.Tx. This town
+# runs dolt_mode="server" against a live dolt sql-server with no `bd serve` proxy,
+# which is exactly that code path. So a mid-call failure still leaves a partial
+# state — it just moved: the surviving half is now "verdict:PASS added, pending
+# NOT removed" (both labels present) instead of "pending removed, PASS never
+# added" (no verdict at all).
+#
+# Both-labels-present is the strictly better failure: it is VISIBLE and
+# self-correcting on inspection, whereas no-verdict-at-all is silent and
+# indistinguishable from "the reviewer never ran" — the error-vs-empty collapse
+# this bead exists to kill. That is the real win here, not atomicity.
+bd -C "$REFINO_GATE_STORE" update "$VERDICT_BEAD_ID" --add-label verdict:PASS --remove-label verdict:pending
 bd -C "$REFINO_GATE_STORE" comment "$VERDICT_BEAD_ID" "VERDICT: PASS
 Resumo: <1-2 frases do que você checou e por que passa>"
 bd -C "$REFINO_GATE_STORE" close "$VERDICT_BEAD_ID"
 
 # If it needs more refinement (bounced back to the refiner):
-# bd -C "$REFINO_GATE_STORE" label add "$VERDICT_BEAD_ID" "verdict:FAIL"
+# bd -C "$REFINO_GATE_STORE" update "$VERDICT_BEAD_ID" --add-label verdict:FAIL --remove-label verdict:pending
 # bd -C "$REFINO_GATE_STORE" comment "$VERDICT_BEAD_ID" "VERDICT: FAIL
 # Problema 1: <o que corrigir, concreto e acionável>
 # Problema 2: <...>"
