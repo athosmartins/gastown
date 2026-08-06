@@ -136,6 +136,65 @@ task_reconciler_verdict() {
   echo "keep:merge-not-verified"
 }
 
+# ═════════════════════════════════════════════════════════════════════════════
+# ga-mmdm2: pre-deploy merge-verification helpers for the STORY delivery loop
+# below (Step 3.6). gate:passed is a LABEL, not proof the story's commit ever
+# reached the rig's remote main — the story path had NO check at all before
+# this (unlike the ga-266z8 task-reconciler block above, which already verifies
+# by content). Proven broken live on ga-sb11i.2: gate:passed AND
+# gate-sha-failed on the SAME sha, the commit existing only on its feature
+# branch — deploy would have pulled the rig's main as-is (no fix) and still
+# marked the story done, losing 511 reviewed lines of work. These helpers
+# apply the same "verify by content, never by label" discipline to that gap.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# extract_gate_merge_info <bd_comments_text> — echoes "<rig>/<branch>\t<sha>"
+# from the LAST "... merged to <rig>/<branch> (sha=<sha>)" gate-dispatcher
+# comment (quality-gate-dispatcher.sh's PASSED comment). A story can accumulate
+# several gate:fix-attempt cycles, so only the MOST RECENT merge comment is
+# authoritative — never gate-sha-failed:<sha>, which records what FAILED, not
+# what merged. rc1 + no output when no such comment exists — the caller must
+# treat that as UNVERIFIED, not skip the check (ga-mmdm2 control #2: an absent
+# merge comment is itself evidence the merge never happened).
+extract_gate_merge_info() {
+  local text="$1" line rig_branch sha
+  line=$(printf '%s\n' "$text" \
+    | grep -oE 'merged to [a-z_]+/[A-Za-z0-9_.-]+ \(sha=[0-9a-f]{7,40}\)' \
+    | tail -1)
+  [ -n "$line" ] || return 1
+  rig_branch=$(printf '%s' "$line" | sed -E 's#^merged to ([a-z_]+/[A-Za-z0-9_.-]+) \(sha=.*#\1#')
+  sha=$(printf '%s' "$line" | sed -E 's#.*\(sha=([0-9a-f]{7,40})\).*#\1#')
+  [ -n "$rig_branch" ] && [ -n "$sha" ] || return 1
+  printf '%s\t%s' "$rig_branch" "$sha"
+}
+
+# story_merge_verdict <gdir> <container> <branch_ref> <sha> — echoes
+# "verified"|"not-ancestor"|"unresolvable"; rc0 iff "verified". Pure content
+# check: does <branch_ref> (e.g. origin/main, already fetched by the caller)
+# CONTAIN <sha> (the commit the gate said it merged)? Fails closed to
+# "unresolvable" (rc1) if either <sha> or <branch_ref> cannot be resolved in
+# <gdir> at all — unresolvable is not proof of absence, but it is also not
+# proof of merge, so it must never be treated the same as "verified" (ga-mmdm2:
+# "não consegui verificar" and "verifiquei e está ok" must not produce the
+# same result).
+#
+# DISTINCT from this file's existing post-deploy staleness check (~line 860,
+# `merge-base --is-ancestor "$STALE_REF" HEAD`) — that asks "is the LOCAL
+# runtime tree fresh relative to origin" (ga-rhtu), already assuming origin has
+# the fix. This asks the prior question: did the story's own commit reach
+# origin's main AT ALL (ga-mmdm2). Both gaps are real and different.
+story_merge_verdict() {
+  local gdir="$1" container="$2" branch_ref="$3" sha="$4"
+  git_in "$gdir" "$container" rev-parse -q --verify "${sha}^{commit}" >/dev/null 2>&1 || { echo "unresolvable"; return 1; }
+  git_in "$gdir" "$container" rev-parse -q --verify "$branch_ref" >/dev/null 2>&1 || { echo "unresolvable"; return 1; }
+  if git_in "$gdir" "$container" merge-base --is-ancestor "$sha" "$branch_ref" 2>/dev/null; then
+    echo "verified"
+  else
+    echo "not-ancestor"
+    return 1
+  fi
+}
+
 # _gate_delivery_header_class <line> — ga-1yxyt. Mirrors
 # quality-gate-guard.sh's copy VERBATIM. See that copy for the full
 # rationale; kept in sync by inspection.
@@ -599,6 +658,9 @@ while IFS= read -r STORY; do
   PRE_DEPLOY_SHA=""
   POST_DEPLOY_SHA=""
   STALENESS_GATE=0
+  MERGE_VERDICT=""
+  MERGE_SHA=""
+  MERGE_REF=""
 
   STORY_ID=$(echo "$STORY" | jq -r '.id')
   # Cross-store (ga-mt03s): each bead carries a _store field set during fan-out.
@@ -798,6 +860,88 @@ These were NOT removed — uncommitted prod work is never destroyed. Resolve man
   warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID reconcile conflict — untracked prod file differs from merge:$RECONCILE_DIFF_LIST."
   continue
 fi
+
+# ── Step 3.6: Pre-deploy merge verification (ga-mmdm2) ────────────────────────
+# THE BUG: gate:passed is a label, not proof the story's commit reached the
+# rig's remote main. Deploy (Step 4 below) used to trust the label alone and
+# pull whatever origin/main currently is — proven broken live on ga-sb11i.2:
+# gate:passed AND gate-sha-failed on the SAME sha, the commit existing only on
+# its feature branch. Deploying would have pulled main AS-IS (no fix), the
+# baseline prod test would still pass (main is healthy, just missing the
+# feature), and the story would be marked done while the work sat only on its
+# source branch — 511 reviewed lines silently lost.
+#
+# Verify by content before deploying:
+#   1. Extract the sha the gate itself reported merging, from the gate's OWN
+#      comment ("merged to <rig>/<branch> (sha=<sha>)") — never from
+#      gate-sha-failed, which records what FAILED, not what merged.
+#   2. Confirm that sha is an ancestor of the rig's own origin/<branch>
+#      (fetched fresh, bounded, from RUNTIME_DIR — the same tree Step 4 is
+#      about to deploy). No merge comment, or an unresolvable sha/ref, is
+#      UNVERIFIED — blocked the SAME as a confirmed non-ancestor. Delivery is
+#      never defaulted to "proceed" just because verification was impossible.
+#
+# MERGE_VERDICT starts (and stays, on any early branch) at "unresolvable" —
+# only the explicit success path below sets it to "verified". Fail-closed by
+# construction, not by remembering to add a check on every exit.
+MERGE_VERDICT="unresolvable"
+MERGE_SHA=""
+MERGE_REF=""
+MERGE_FAIL_MSG=""
+if [ -z "$RUNTIME_DIR" ] || ! git -C "$RUNTIME_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  MERGE_FAIL_MSG="RUNTIME_DIR ('$RUNTIME_DIR') for rig $RIG is unset or not a git work tree — cannot verify the story's commit reached $RIG's main."
+else
+  STORY_COMMENTS_TEXT=$(bd -C "$STORY_STORE" comments "$STORY_ID" 2>/dev/null || echo "")
+  if MERGE_INFO=$(extract_gate_merge_info "$STORY_COMMENTS_TEXT"); then
+    MERGE_RIG_BRANCH="${MERGE_INFO%%$'\t'*}"
+    MERGE_SHA="${MERGE_INFO#*$'\t'}"
+    MERGE_BRANCH="${MERGE_RIG_BRANCH#*/}"
+    MERGE_REF="origin/$MERGE_BRANCH"
+    timeout 30 git -C "$RUNTIME_DIR" fetch origin "$MERGE_BRANCH" --quiet 2>/dev/null \
+      || warn "Merge-verify: 'git fetch origin $MERGE_BRANCH' failed/timed out for $RIG — verifying against last-known $MERGE_REF."
+    MERGE_GITDIR_PAIR=$(rig_gitdir "$RUNTIME_DIR")
+    MERGE_GDIR="${MERGE_GITDIR_PAIR%$'\t'*}"
+    MERGE_CONTAINER="${MERGE_GITDIR_PAIR#*$'\t'}"
+    # ga-mmdm2 gate-fix-attempt-2: story_merge_verdict returns rc1 on both
+    # "not-ancestor" and "unresolvable" (only "verified" is rc0) — a bare
+    # assignment here triggers this file's own `set -euo pipefail` (errexit)
+    # and aborts the WHOLE script before the halt-and-escalate block below
+    # ever runs, since this loop is fed via process substitution (not a
+    # subshell) and errexit isn't scoped to one iteration. Guard it, matching
+    # the extract_gate_merge_info call two lines above.
+    if ! MERGE_VERDICT=$(story_merge_verdict "$MERGE_GDIR" "$MERGE_CONTAINER" "$MERGE_REF" "$MERGE_SHA"); then
+      : # non-"verified" outcome — $MERGE_VERDICT is still captured; handled below
+    fi
+    if [ "$MERGE_VERDICT" != "verified" ]; then
+      MERGE_FAIL_MSG="sha $MERGE_SHA (from the gate's merge comment) is NOT an ancestor of $MERGE_REF in $RUNTIME_DIR (verdict=$MERGE_VERDICT) — the story's commit has not reached $RIG's main. gate:passed does not imply merged (ga-mmdm2)."
+    fi
+  else
+    MERGE_FAIL_MSG="no gate merge comment with a sha was found on $STORY_ID — cannot verify the story's commit ever reached $RIG's main."
+  fi
+fi
+
+if [ "$MERGE_VERDICT" != "verified" ]; then
+  err "Pre-deploy merge verification HALT (ga-mmdm2): $MERGE_FAIL_MSG"
+  if [ "$DRY_RUN" != "1" ]; then
+    bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+    bd -C "$STORY_STORE" label add    "$STORY_ID" "delivery:failed"  -q 2>/dev/null || true
+    bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HALTED (ga-mmdm2 pre-deploy merge verification): $MERGE_FAIL_MSG story:done WITHHELD — deploying now would pull $RIG's main AS-IS (without this story's fix) and could still pass a baseline prod test, marking the story done while the work sits only on its source branch. NON-TERMINAL: re-picked next cycle once the branch is actually merged to $RIG's main via the gate (re-submit through gate re-anchor, not a manual merge)." 2>/dev/null || true
+    AUTHOR=$(echo "$STORY" | jq -r '.assignee // .created_by // ""' 2>/dev/null || echo "")
+    if [ -n "$AUTHOR" ] && [ "$AUTHOR" != "null" ]; then
+      gc --city "$GC_CITY" session nudge "$AUTHOR" \
+        "DELIVERY HALTED for story $STORY_ID (ga-mmdm2): $MERGE_FAIL_MSG" \
+        --delivery wait-idle 2>/dev/null || warn "Could not nudge author $AUTHOR"
+    fi
+    gc --city "$GC_CITY" session nudge mayor \
+      "DELIVERY HALTED ($STORY_ID, rig $RIG, ga-mmdm2 merge verification): $MERGE_FAIL_MSG" \
+      2>/dev/null || true
+  fi
+  # wa-uthi: non-terminal (delivery:failed re-picked every cycle once the story
+  # is actually merged) — no push. Author + Mayor nudged above.
+  warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID pre-deploy merge verification $MERGE_VERDICT."
+  continue
+fi
+log "Pre-deploy merge verification OK: sha $MERGE_SHA is an ancestor of $MERGE_REF."
 
 # ── Step 4: Deploy ─────────────────────────────────────────────────────────────
 # Capture the deploy timestamp + pre-deploy HEAD so Step 5b (ga-iwv0) can tell

@@ -146,7 +146,9 @@ run_sweep_multi() {
       A_JSON='{"id":"ga-ms-a","title":"story-a-no-deploy","description":"halt","status":"open","labels":["story:approved","gate:passed","rig:lexbh"],"metadata":{}}'
       ;;
   esac
-  # Story B — property_scrapers: deploy_cmd present, prod_test_script on disk → proceeds in DRY_RUN.
+  # Story B — property_scrapers: deploy_cmd present, prod_test_script on disk,
+  # AND (ga-mmdm2) a real gate merge comment naming a sha the git stub below
+  # resolves as an ancestor of origin/main → proceeds in DRY_RUN.
   local B_JSON='{"id":"ga-ms-b","title":"story-b-valid","description":"proceed","status":"open","labels":["story:approved","gate:passed","rig:property_scrapers"],"metadata":{}}'
 
   local FIXTURE="$T/stories.json"
@@ -155,18 +157,26 @@ run_sweep_multi() {
   # PATH stubs — bd, git, gc, notify, launchctl
   mkdir -p "$T/bin"
 
-  # bd: list → fixture; comments/show → safe empty defaults; else → true
+  # bd: list → fixture; ga-ms-b's own comments → a real gate merge comment
+  # (ga-mmdm2 Step 3.6 requires this to proceed); other comments/show → safe
+  # empty defaults; else → true.
   cat > "$T/bin/bd" << BDEOF
 #!/usr/bin/env bash
 case "\$*" in
-  *list*)     cat "$FIXTURE" ;;
-  *comments*) echo "[]" ;;
-  *show*)     echo '{"id":"x","labels":[],"metadata":{}}' ;;
-  *)          true ;;
+  *list*)               cat "$FIXTURE" ;;
+  *"comments ga-ms-b"*) echo "Quality gate PASSED. Branch fix/ga-ms-b-x merged to property_scrapers/main (sha=1234567890abcdef1234567890abcdef12345678) via autonomous dispatcher (gate_run=ga-wisp-test)." ;;
+  *comments*)           echo "[]" ;;
+  *show*)               echo '{"id":"x","labels":[],"metadata":{}}' ;;
+  *)                    true ;;
 esac
 BDEOF
 
-  # git: is-inside-work-tree → exit 1 so reconcile/daemon-refresh skip cleanly
+  # git: is-inside-work-tree → exit 0 (ga-mmdm2 Step 3.6 gates its whole check
+  # on this being a real work tree; reconcile/daemon-refresh still skip
+  # cleanly downstream via their own no-upstream/no-untracked-files fallbacks,
+  # proven unaffected by S1-S6 all still passing). rev-parse --verify and
+  # merge-base --is-ancestor both fall through the catch-all (exit 0 = ancestor
+  # confirmed) — this stub simulates Story B's sha genuinely being merged.
   cat > "$T/bin/git" << 'GITEOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = "-C" ]; then shift 2; fi
@@ -174,7 +184,7 @@ sub="${1:-}"; shift 2>/dev/null || true
 case "$sub" in
   rev-parse)
     case "${1:-}" in
-      --is-inside-work-tree) exit 1 ;;
+      --is-inside-work-tree) exit 0 ;;
       HEAD) echo "deadbeef00"; exit 0 ;;
       --abbrev-ref) echo "main"; exit 0 ;;
       *) exit 0 ;;

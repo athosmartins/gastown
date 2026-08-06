@@ -42,7 +42,8 @@ rm -f /tmp/story-delivery-selftest-syntax.$$
 STORY_DELIVERY_LIB_ONLY=1 source "$SCRIPT" \
   || { echo "FATAL: could not source story-delivery.sh in lib-only mode"; exit 1; }
 for fn in rig_gitdir git_in token_bounded subject_impl_scopes_bead \
-          scan_commit_subject_for_bead task_reconciler_verdict; do
+          scan_commit_subject_for_bead task_reconciler_verdict \
+          extract_gate_merge_info story_merge_verdict; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by story-delivery.sh"; exit 1; }
 done
 
@@ -145,6 +146,63 @@ eq "DoD#1 e2e: never-landed bead → keep verdict (not closed)" \
 # vs DoD#3's independent proof that the content-check machinery itself works).
 eq "DoD#2 e2e: merged bead but contradicted by gate:needs-fix → keep" \
    "$(task_reconciler_verdict 1 "$MERGED_VERIFIED")" "keep:contradicted-by-gate-failed-or-needs-fix"
+
+# ── 5. extract_gate_merge_info — gate-comment parsing (ga-mmdm2) ────────────
+# gate:passed is a LABEL; the sha it actually merged lives only in the gate
+# dispatcher's own comment text ("merged to <rig>/<branch> (sha=<sha>)",
+# quality-gate-dispatcher.sh's PASSED comment). This is the STORY-path analog
+# of scan_commit_subject_for_bead above — content, not label, decides.
+echo "── 5. extract_gate_merge_info (gate-comment parsing) ──"
+REAL_COMMENT="Quality gate PASSED. Branch fix/ga-mmdm2-x merged to gascity/main (sha=b97b13384330605cc2dbc81abbd2d518f7e380ae) via autonomous dispatcher (gate_run=ga-wisp-bt5lw8)."
+INFO=$(extract_gate_merge_info "$REAL_COMMENT")
+eq "real gate comment: rig/branch" "${INFO%%$'\t'*}" "gascity/main"
+eq "real gate comment: sha"        "${INFO#*$'\t'}"  "b97b13384330605cc2dbc81abbd2d518f7e380ae"
+
+# Multiple gate cycles (fix-attempt retries) accumulate comments — only the
+# MOST RECENT merge is authoritative; must pick the LAST match, not the first.
+MULTI_COMMENT="Quality gate PASSED. Branch fix/ga-x-attempt1 merged to gascity/main (sha=1111111111111111111111111111111111111111) via autonomous dispatcher (gate_run=ga-wisp-aaa).
+Quality gate PASSED. Branch fix/ga-x-attempt2 merged to gascity/main (sha=2222222222222222222222222222222222222222) via autonomous dispatcher (gate_run=ga-wisp-bbb)."
+INFO=$(extract_gate_merge_info "$MULTI_COMMENT")
+eq "multiple merge comments: picks the LAST (most recent) sha" "${INFO#*$'\t'}" "2222222222222222222222222222222222222222"
+
+# No merge comment at all (never merged, or gate:passed set some other way) —
+# ga-mmdm2 control #2: this is NOT skip-the-check, it is evidence of no merge.
+rc1 extract_gate_merge_info "Quality gate PASSED. Branch fix/x could not determine rig automatically."
+rc1 extract_gate_merge_info ""
+
+# A "merged to X/Y" mention that ISN'T immediately followed by "(sha=...)"
+# must not false-positive — e.g. a comment discussing gate-sha-failed (the sha
+# that FAILED, not what merged) in prose near an unrelated "merged to" phrase.
+rc1 extract_gate_merge_info "The bug ga-sb11i.2 has gate-sha-failed:8b612cf5eb42875c8080b65778d98c6ac64c5180 on a branch that never merged to gascity/main; sha=8b612cf5e is what FAILED, not what merged."
+
+# ── 6. story_merge_verdict — real-git ancestor check (ga-mmdm2) ─────────────
+echo "── 6. story_merge_verdict (real-git ancestor check) ──"
+# Extend the section-3 fixture with a side branch: a real commit that lands in
+# the SAME repo but is never merged to main — the exact ga-sb11i.2 shape
+# (commit exists, gate said "merged", but main never received it).
+git -C "$WORK" checkout -q -b side-branch main
+echo "side" > "$WORK/side.txt"
+git -C "$WORK" add side.txt
+git -C "$WORK" commit -q -m "chore: side commit never merged to main"
+SIDE_SHA=$(git -C "$WORK" rev-parse HEAD)
+git -C "$WORK" push -q origin side-branch
+git -C "$WORK" checkout -q main
+
+eq "verdict: sha IS ancestor of main → verified" \
+   "$(story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "main" "$FOUND_SHA")" "verified"
+rc0 story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "main" "$FOUND_SHA"
+
+eq "verdict: sha exists but NOT ancestor of main (side-branch only) → not-ancestor" \
+   "$(story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "main" "$SIDE_SHA")" "not-ancestor"
+rc1 story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "main" "$SIDE_SHA"
+
+eq "verdict: sha never existed → unresolvable (fail-closed, not false-pass)" \
+   "$(story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "main" "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")" "unresolvable"
+rc1 story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "main" "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+eq "verdict: branch_ref does not resolve → unresolvable" \
+   "$(story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "no-such-ref" "$FOUND_SHA")" "unresolvable"
+rc1 story_merge_verdict "$BARE_GDIR" "$BARE_CONTAINER" "no-such-ref" "$FOUND_SHA"
 
 echo ""
 echo "═══════════════════════════════════════"
