@@ -1863,6 +1863,31 @@ gate_fail_assignee_action() {
   fi
 }
 
+# default_pool_route_for_rig <rig> — pure; selftest-sourceable.
+# ga-f54ui: what gc.routed_to should be RESTORED to when a bead returns to the
+# generic pool (e.g. after a gate FAIL whose author is not a live named crew —
+# see the FAIL-handling "else" arm below). Echoes the bare pool-worker template
+# name a pool worker's own self-serve probe expects
+# (`bd ready --metadata-field gc.routed_to=<target> --unassigned`) — never a
+# slot instance (e.g. "wa-worker-1"), only the template ("wa-worker").
+#
+# Mirrors pilot-dispatcher.sh's rig_to_builder()+wa_worker_template()
+# composition exactly (gascity->gastown.dog, whatsapp_automation->wa-worker,
+# property_scrapers->ps-worker, every other/unknown rig->gastown.dog).
+# Duplicated rather than sourced: quality-gate-dispatcher.sh and
+# pilot-dispatcher.sh are two independently-running daemon processes with no
+# shared-lib chokepoint today — keep the two mappings in sync by hand if
+# either changes (same tradeoff this file already accepts for e.g.
+# gate_delivery_looks_partial vs its story-delivery.sh mirror).
+default_pool_route_for_rig() {
+  local rig="${1:-}"
+  case "$rig" in
+    whatsapp_automation|wa) printf 'wa-worker' ;;
+    property_scrapers|ps)   printf 'ps-worker' ;;
+    *)                      printf 'gastown.dog' ;;
+  esac
+}
+
 # author_is_alive <author> — canonical liveness check for a gate marker's
 # AUTHOR. Echoes 1 if AUTHOR matches session_name, name, alias, id, or
 # agent_name of a live (non-closed) `gc session list` entry; 0 otherwise
@@ -3877,7 +3902,40 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         # Tier-2 features), so a stale builder assignee makes a failed bead invisible.
         # Clear it so the next sweep can re-pick this bead.
         bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) and builder assignee cleared. The Pilot will re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
+        # ga-f54ui: this branch used to say "the Pilot will re-dispatch a builder"
+        # without making that true. quality-gate-guard.sh Step 5b (ga-e7zk7) strips
+        # gc.routed_to from the source bead unconditionally at gate-CLAIM time —
+        # every review, pass or fail — expecting the Pilot's OWN re-dispatch to set
+        # it fresh on the next sweep. Nothing on THIS path (the fail-and-return-to-
+        # pool branch) ever did that, so a bead could sit ctx:ready + unassigned,
+        # invisible to every pool worker's self-serve probe
+        # (`bd ready --metadata-field gc.routed_to=<target> --unassigned`), for as
+        # long as it took some UNRELATED event to next touch the field — measured
+        # live at up to 13 days (ga-f54ui's own incident report, 8 beads same-day).
+        # Restore it directly here, the same way a human/Mayor was doing it by
+        # hand (rig -> default pool template) — see default_pool_route_for_rig
+        # above for the mapping and why it is duplicated, not shared, with
+        # pilot-dispatcher.sh's rig_to_builder()+wa_worker_template().
+        _GFAIL_ROUTE=$(default_pool_route_for_rig "$RIG")
+        bd -C "$BEAD_CITY" update "$BEAD_ID" --set-metadata "gc.routed_to=$_GFAIL_ROUTE" -q 2>/dev/null || true
+        # Verify the write actually stuck (ga-p5q3 error-vs-empty discipline) — a
+        # post-write READ failure must never be reported as "restore failed"; it is
+        # its own third state, distinct from both success and a confirmed failure.
+        _GFAIL_ROUTE_VERIFY_JSON=""
+        _GFAIL_ROUTE_VERIFY_READ_OK=1
+        _GFAIL_ROUTE_VERIFY_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _GFAIL_ROUTE_VERIFY_READ_OK=0
+        [ -n "$_GFAIL_ROUTE_VERIFY_JSON" ] || _GFAIL_ROUTE_VERIFY_READ_OK=0
+        if [ "$_GFAIL_ROUTE_VERIFY_READ_OK" = "0" ]; then
+          _GFAIL_ROUTE_OBS="gc.routed_to=UNVERIFIED (post-write read failed — state unknown, NOT a claim the restore failed)"
+        else
+          _GFAIL_ROUTE_OBSERVED=$(printf '%s' "$_GFAIL_ROUTE_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.routed_to"] // ""' 2>/dev/null || echo "")
+          if [ "$_GFAIL_ROUTE_OBSERVED" = "$_GFAIL_ROUTE" ]; then
+            _GFAIL_ROUTE_OBS="gc.routed_to=$_GFAIL_ROUTE (restored)"
+          else
+            _GFAIL_ROUTE_OBS="gc.routed_to='${_GFAIL_ROUTE_OBSERVED}' NOT $_GFAIL_ROUTE — restore did not stick, needs investigation"
+          fi
+        fi
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) and builder assignee cleared. gc.routed_to restored to $_GFAIL_ROUTE so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS. The Pilot will also re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
       fi
     fi
   fi

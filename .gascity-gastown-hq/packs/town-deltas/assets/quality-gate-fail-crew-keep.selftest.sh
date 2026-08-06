@@ -163,10 +163,10 @@ if grep -qF 'bd -C "$BEAD_CITY" assign "$BEAD_ID" "$AUTHOR" 2>/dev/null || true'
 else
   bad "needs-fix 'keep' arm missing the re-assign-to-\$AUTHOR call"
 fi
-if grep -qF 'story:in-flight + gate:reviewing (wa-qq33j) and builder assignee cleared. The Pilot will re-dispatch a builder with the GATE-FEEDBACK above.' "$DISPATCHER"; then
-  ok "needs-fix 'clear' arm preserves the original unconditional-clear wording verbatim"
+if grep -qF 'story:in-flight + gate:reviewing (wa-qq33j) and builder assignee cleared.' "$DISPATCHER"; then
+  ok "needs-fix 'clear' arm preserves the original clear-path wording prefix"
 else
-  bad "needs-fix 'clear' arm's original clear-path wording is missing/changed"
+  bad "needs-fix 'clear' arm's original clear-path wording prefix is missing/changed"
 fi
 # needs-human (cap-exhausted) branch drift guard: confirm it is UNTOUCHED —
 # its own unique comment (ga-5w0hr) must still exist, unconditionally clearing
@@ -212,6 +212,94 @@ if printf '%s' "$KEEP_ARM" | grep -qF 'label remove "$BEAD_ID" "gate:queued"'; t
   ok "'keep' arm removes the stale gate:queued label"
 else
   bad "'keep' arm does NOT remove gate:queued — marker was already closed terminal-FAILED above, label would stay stale"
+fi
+
+# ── 10. ga-f54ui: default_pool_route_for_rig — pure function, every branch ───
+# What gc.routed_to should be RESTORED to when a bead returns to the generic
+# pool. Mirrors pilot-dispatcher.sh's rig_to_builder()+wa_worker_template()
+# composition — bare template names only, never a slot instance.
+echo "── 10. ga-f54ui: default_pool_route_for_rig (pure function) ──"
+type default_pool_route_for_rig >/dev/null 2>&1 \
+  || { echo "FATAL: default_pool_route_for_rig not defined by dispatcher (ga-f54ui missing?)"; exit 1; }
+eq "whatsapp_automation (long form) -> wa-worker" \
+  "$(default_pool_route_for_rig "whatsapp_automation")" "wa-worker"
+eq "wa (short alias) -> wa-worker" \
+  "$(default_pool_route_for_rig "wa")" "wa-worker"
+eq "property_scrapers (long form) -> ps-worker" \
+  "$(default_pool_route_for_rig "property_scrapers")" "ps-worker"
+eq "ps (short alias) -> ps-worker" \
+  "$(default_pool_route_for_rig "ps")" "ps-worker"
+eq "gascity -> gastown.dog" \
+  "$(default_pool_route_for_rig "gascity")" "gastown.dog"
+eq "gastown -> gastown.dog (default bucket)" \
+  "$(default_pool_route_for_rig "gastown")" "gastown.dog"
+eq "lexbh -> gastown.dog (default bucket)" \
+  "$(default_pool_route_for_rig "lexbh")" "gastown.dog"
+eq "marketing -> gastown.dog (default bucket)" \
+  "$(default_pool_route_for_rig "marketing")" "gastown.dog"
+eq "deacon (not in pilot-dispatcher.sh's own case either) -> gastown.dog (default bucket)" \
+  "$(default_pool_route_for_rig "deacon")" "gastown.dog"
+eq "unknown/empty rig -> gastown.dog (fail-safe default, never empty output)" \
+  "$(default_pool_route_for_rig "")" "gastown.dog"
+
+# ── 11. ga-f54ui: needs-fix 'clear' arm restores gc.routed_to ────────────────
+# Signal B (merged-bead-janitor) and quality-gate-guard.sh Step 5b both strip
+# gc.routed_to at various points in a bead's gate lifecycle, on the documented
+# assumption that "the Pilot will re-dispatch a builder" restores it. This arm
+# is exactly the return-to-pool transition that promise depends on — before
+# this fix, nothing here ever set the field, so a bead could sit ctx:ready +
+# unassigned, invisible to every pool worker's self-serve probe, for as long
+# as 13 days (ga-f54ui's own incident: 8 beads same-day, all this shape).
+echo "── 11. ga-f54ui: needs-fix 'clear' arm restores gc.routed_to ──"
+# Isolate the 'clear'/else arm's own body — same awk-slice technique as
+# section 9's KEEP_ARM extraction, continued from the same unique anchor: the
+# 'else' this captures is the exact 'else' KEEP_ARM's extraction (section 9)
+# stops AT, so the two slices are the true, non-overlapping if/else halves of
+# the SAME conditional, not two independently-anchored guesses.
+CLEAR_ARM=$(awk '
+  /GATE_FAIL_ASSIGNEE_ACTION" = "keep"/ { flag=1 }
+  flag==1 && /^      else$/             { flag=2 }
+  flag==2                               { print }
+  flag==2 && /^      fi$/               { exit }
+' "$DISPATCHER")
+if [ -z "$CLEAR_ARM" ]; then
+  bad "CLEAR_ARM extraction produced nothing — anchor/indentation drifted, cannot verify wiring"
+else
+  if printf '%s' "$CLEAR_ARM" | grep -qF '_GFAIL_ROUTE=$(default_pool_route_for_rig "$RIG")'; then
+    ok "'clear' arm computes the restore route via default_pool_route_for_rig"
+  else
+    bad "'clear' arm does NOT call default_pool_route_for_rig — wiring missing/renamed"
+  fi
+  if printf '%s' "$CLEAR_ARM" | grep -qF -- '--set-metadata "gc.routed_to=$_GFAIL_ROUTE"'; then
+    ok "'clear' arm writes gc.routed_to via --set-metadata (key-scoped, not a whole-object replace)"
+  else
+    bad "'clear' arm does NOT restore gc.routed_to — ga-f54ui fix missing from this arm"
+  fi
+  if printf '%s' "$CLEAR_ARM" | grep -qF 'bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null'; then
+    ok "'clear' arm verifies the restore with a post-write read (not just assumed)"
+  else
+    bad "'clear' arm does NOT verify its own write — error-vs-empty risk (ga-p5q3)"
+  fi
+  # The verify step's own third-state discipline: a read failure must produce
+  # a THIRD, distinguishable observation string — never silently reuse the
+  # same text a confirmed mismatch would produce.
+  if printf '%s' "$CLEAR_ARM" | grep -qF 'UNVERIFIED (post-write read failed' \
+     && printf '%s' "$CLEAR_ARM" | grep -qF 'NOT $_GFAIL_ROUTE — restore did not stick'; then
+    ok "'clear' arm's verify step distinguishes UNVERIFIED (read failed) from a confirmed mismatch"
+  else
+    bad "'clear' arm's verify step collapses read-failure and confirmed-mismatch into the same observation"
+  fi
+fi
+# Negative control: the needs-human (cap-exhausted) branch must remain
+# untouched by this fix — same scope boundary as section 8's own drift guard
+# (Pilot excludes gate:needs-human beads outright; no double-dispatch risk).
+NEEDS_HUMAN_ARM=$(awk '/PREV_ATTEMPT" -ge "\$GATE_FIX_CAP"/{flag=1} flag{print} /^    else$/{if(flag) exit}' "$DISPATCHER")
+if [ -z "$NEEDS_HUMAN_ARM" ]; then
+  bad "NEEDS_HUMAN_ARM extraction produced nothing — anchor/indentation drifted, cannot verify scope boundary (would otherwise pass vacuously)"
+elif printf '%s' "$NEEDS_HUMAN_ARM" | grep -qF 'default_pool_route_for_rig'; then
+  bad "needs-human (cap-exhausted) branch unexpectedly calls default_pool_route_for_rig — scope crept beyond ga-f54ui's needs-fix-only ACEITE"
+else
+  ok "needs-human (cap-exhausted) branch untouched — gc.routed_to restore correctly scoped to the re-dispatchable needs-fix arm only"
 fi
 
 # ── Result ────────────────────────────────────────────────────────────────────
