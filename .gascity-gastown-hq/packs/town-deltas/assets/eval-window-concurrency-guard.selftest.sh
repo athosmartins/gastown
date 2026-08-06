@@ -35,7 +35,13 @@ cp "$SELF_DIR/../orders/order-tracking-sweep.toml" "$SANDBOX/packs/town-deltas/o
 # the rest of this script, not just for the duration of the source call.
 export GC_CITY_PATH="$SANDBOX"
 export EVAL_WINDOW_GUARD_LIB_ONLY=1
-export GC=/bin/true
+# Resolved via PATH, not hardcoded to /bin/true: on this machine (and
+# presumably others with a minimal /bin) /bin/true does not exist at all —
+# only /usr/bin/true does — so a hardcoded path silently makes every
+# `timeout 30 "$GC" reload --soft` call fail with "command not found",
+# which would make the reload-success log assertions below vacuously true
+# regardless of what apply_profile actually does.
+export GC="$(command -v true)"
 source "$SCRIPT" \
   || { echo "FATAL: could not source guard script in lib-only mode"; exit 1; }
 
@@ -96,9 +102,13 @@ DRY_RUN=1 apply_profile "throttled" >/dev/null
 SUM_AFTER="$(cat "$CITY_TOML" "$BEADS_HEALTH_TOML" "$GATE_SWEEP_TOML" "$ORDER_TRACKING_TOML" | shasum)"
 eq "DRY_RUN leaves all 4 files byte-identical" "$SUM_AFTER" "$SUM_BEFORE"
 
-# ── 6. real apply (GC stubbed to /bin/true — never touches the live city) ─────
+# ── 6. real apply (GC stubbed to `true` — never touches the live city) ────────
 echo "── 6. apply_profile(throttled) rewrites all 5 targets ──"
-apply_profile "throttled" >/dev/null
+LOG_6="$(apply_profile "throttled" 2>&1)"
+case "$LOG_6" in
+  *"gc reload --soft OK — profile=throttled is now live"*) ok "clean full apply logs the unqualified 'is now live' success" ;;
+  *) bad "expected the unqualified 'is now live' success line on a clean full apply, got: $LOG_6" ;;
+esac
 eq "gastown.dog max_active_sessions -> throttled" "$(get_dog_max)" "1"
 eq "oracle-wa min_active_sessions -> throttled" "$(get_oracle_min)" "0"
 eq "beads-health interval -> throttled" "$(get_order_interval "$BEADS_HEALTH_TOML")" "300s"
@@ -149,6 +159,86 @@ if grep -q '<integer>300</integer>' "$PLIST"; then
 else
   bad "plist StartInterval changed — re-check window pre-roll margins still cover one poll cycle"
 fi
+
+# ── 10. malformed anchor: read failure must NOT be treated as "differs" ───────
+# Regression coverage for the exact gate-rejected bug (ga-sb11i.2, GATE-FEEDBACK
+# 2026-08-06T03:24): an anchor regex that fails to match (out-of-band edit
+# disturbed the adjacency it depends on) must be surfaced as a read ERROR,
+# never silently treated as an empty-but-legitimate value that "differs from
+# target" — which would fire a write through the SAME broken anchor (also a
+# silent no-op) and still get reported as success.
+echo "── 10. malformed anchor: read failure ≠ 'differs from target' ──"
+
+# 10a. Corrupt ONLY the gastown.dog anchor (insert a line between the two
+# fields the read regex depends on being directly adjacent) — everything
+# else in the sandbox stays well-formed.
+perl -0777 -pi -e 's/(name = "gastown\.dog"\n)(max_active_sessions = \d+)/${1}# out-of-band edit disturbed this adjacency\n${2}/' "$CITY_TOML"
+grep -q 'out-of-band edit disturbed this adjacency' "$CITY_TOML" \
+  || { echo "FATAL: test setup failed to corrupt the sandbox city.toml"; exit 1; }
+
+if get_dog_max >/dev/null 2>&1; then
+  bad "get_dog_max should return non-zero exit on a broken anchor, got success"
+else
+  ok "get_dog_max returns non-zero exit on a broken anchor"
+fi
+eq "get_dog_max prints nothing on a broken anchor (no false value)" "$(get_dog_max 2>/dev/null || true)" ""
+
+# 10b. apply_profile against the corrupted file: the other 4 well-formed
+# targets still throttle correctly (narrow scope preserved / partial
+# degradation, not total abort); the corrupted one is skipped rather than
+# blindly written, and the pass must not claim unqualified success.
+LOG_10B="$(apply_profile "throttled" 2>&1)"
+eq "corrupted gastown.dog anchor: left untouched, not blindly rewritten" \
+   "$(grep -c 'out-of-band edit disturbed this adjacency' "$CITY_TOML")" "1"
+eq "oracle-wa min_active_sessions STILL throttles despite the sibling anchor being broken" \
+   "$(get_oracle_min)" "$ORACLE_MIN_THROTTLED"
+eq "beads-health interval STILL throttles despite the sibling anchor being broken" \
+   "$(get_order_interval "$BEADS_HEALTH_TOML")" "$BEADS_HEALTH_THROTTLED"
+case "$LOG_10B" in
+  *"ERROR: could not read gastown.dog max_active_sessions"*) ok "broken anchor logged as ERROR, not silently swallowed" ;;
+  *) bad "expected an ERROR log line for the broken gastown.dog anchor, got: $LOG_10B" ;;
+esac
+case "$LOG_10B" in
+  *"is now live"*) bad "must NOT claim unqualified success ('is now live') while a target's anchor is unreadable: $LOG_10B" ;;
+  *) ok "does not claim unqualified success while a target is unreadable" ;;
+esac
+case "$LOG_10B" in
+  *"PARTIALLY live"*) ok "reports PARTIALLY live instead — honest about the one target that didn't apply" ;;
+  *) bad "expected the qualified 'PARTIALLY live' message (4/5 targets did succeed and should still take effect), got: $LOG_10B" ;;
+esac
+
+# 10c. No reload-spam: once every readable target is AT its throttled value
+# and only the corrupted one remains stuck, re-running must be a true no-op.
+# An unreadable anchor must never masquerade as "still differs from target"
+# forever — outside a real window this was the spam-reload-every-5-minutes
+# half of the gate-rejected bug.
+LOG_10C="$(apply_profile "throttled" 2>&1)"
+case "$LOG_10C" in
+  *"reload --soft OK"*) bad "must not reload when the only outstanding diff is an unreadable anchor (spam risk): $LOG_10C" ;;
+  *"no changes applied this pass"*) ok "no reload triggered when the only remaining diff is an unreadable anchor (no spam)" ;;
+  *) bad "expected the 'no changes applied' no-op message, got: $LOG_10C" ;;
+esac
+
+# 10d. A write that doesn't take effect must be caught by the post-write
+# verify, not assumed successful. `chmod` on the FILE does NOT reproduce
+# this (verified empirically: perl -pi in-place edit works via a temp-file
+# rename, which bypasses the target file's own permission bits as long as
+# the directory is writable) — it's the CONTAINING DIRECTORY that must be
+# read-only, since rename()/unlink() are gated on directory write
+# permission. All 3 order-interval files share one directory, so this
+# blocks all 3 writes at once; beads-health is checked as representative.
+ORDERS_DIR="$(dirname "$BEADS_HEALTH_TOML")"
+chmod 555 "$ORDERS_DIR"
+LOG_10D="$(apply_profile "normal" 2>&1)"
+chmod 755 "$ORDERS_DIR"
+case "$LOG_10D" in
+  *"ERROR: wrote beads-health interval but verify-read shows"*) ok "unwritable target caught by post-write verify, not assumed successful" ;;
+  *) bad "expected a verify-failure ERROR for the unwritable beads-health interval, got: $LOG_10D" ;;
+esac
+
+# Sandbox is intentionally left corrupted/mixed after section 10 — this is
+# the last section before RESULTS and the trap deletes the whole sandbox on
+# exit, so no later section depends on a pristine state here.
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"

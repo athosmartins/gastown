@@ -59,6 +59,11 @@
 #   - Every `gc` call is bounded with `timeout` so the guard can't itself hang.
 #   - QGE window prediction fails safe: if its log is unreadable/missing, that
 #     window is simply never considered active (never throttles on a guess).
+#   - A read failure (anchor not found/unreadable) is NEVER treated as
+#     "differs from target" — it's skipped and logged as ERROR, never
+#     silently written or folded into a reported success. Every write is
+#     re-read afterward to verify it actually took effect before the pass
+#     claims "is now live"; a write that didn't stick logs ERROR instead.
 #
 # Deployed as launchd agent com.gascity.eval-window-concurrency-guard
 # (StartInterval 300). Log: .gc/logs/eval-window-concurrency-guard.log
@@ -167,20 +172,41 @@ desired_profile() { # window_name
 
 # ── Read current on-disk values ────────────────────────────────────────────────
 
+# Each getter prints the current value and exits 0 on success. If the anchor
+# regex fails to match — file missing/unreadable, or the exact line adjacency
+# it depends on was disturbed by an out-of-band edit (this repo has a
+# documented history of concurrent edits clobbering shared config/assets) —
+# it exits 1 with EMPTY stdout instead of silently printing "" as if that
+# were a legitimate reading. None of these 5 fields can legitimately be an
+# empty string, so callers below treat empty+exit1 as "could not determine
+# the current value" and NEVER as "differs from target, must write" — that
+# conflation was the exact bug the gate rejected: an unreadable anchor would
+# get treated identically to a real mismatch, triggering a write through the
+# SAME broken anchor pattern (which also silently no-ops), then reported as
+# success either way.
 get_dog_max() {
-    perl -0777 -ne 'print $1 if /name = "gastown\.dog"\nmax_active_sessions = (\d+)/' "$CITY_TOML"
+    local val
+    val="$(perl -0777 -ne 'print $1 if /name = "gastown\.dog"\nmax_active_sessions = (\d+)/' "$CITY_TOML" 2>/dev/null)"
+    [ -n "$val" ] || return 1
+    printf '%s' "$val"
 }
 get_oracle_min() {
-    perl -0777 -ne 'print $1 if /name = "oracle-wa"\nmin_active_sessions = (\d+)/' "$CITY_TOML"
+    local val
+    val="$(perl -0777 -ne 'print $1 if /name = "oracle-wa"\nmin_active_sessions = (\d+)/' "$CITY_TOML" 2>/dev/null)"
+    [ -n "$val" ] || return 1
+    printf '%s' "$val"
 }
 get_order_interval() { # file
-    perl -ne 'print $1 if /^interval = "(.*)"$/' "$1"
+    local val
+    val="$(perl -ne 'print $1 if /^interval = "(.*)"$/' "$1" 2>/dev/null)"
+    [ -n "$val" ] || return 1
+    printf '%s' "$val"
 }
 
 # ── Apply a profile (idempotent: only writes + reloads if something changed) ───
 
 apply_profile() { # normal|throttled
-    local profile="$1" changed=0
+    local profile="$1" changed=0 read_err=0 verify_err=0 chk
     local dog_target oracle_target bh_target gs_target ots_target
     if [ "$profile" = "throttled" ]; then
         dog_target="$DOG_MAX_THROTTLED"; oracle_target="$ORACLE_MIN_THROTTLED"
@@ -190,42 +216,101 @@ apply_profile() { # normal|throttled
         bh_target="$BEADS_HEALTH_NORMAL"; gs_target="$GATE_SWEEP_NORMAL"; ots_target="$ORDER_TRACKING_NORMAL"
     fi
 
+    # Read every target explicitly in THIS shell (not inside a captured
+    # subshell helper) so a read failure can set read_err here directly —
+    # a flag set inside a `$(...)` capture never escapes that subshell.
+    # A failed read clears cur_* to "" and is logged now; it is never
+    # inferred later from an empty string alone.
     local cur_dog cur_oracle cur_bh cur_gs cur_ots
-    cur_dog="$(get_dog_max)"; cur_oracle="$(get_oracle_min)"
-    cur_bh="$(get_order_interval "$BEADS_HEALTH_TOML")"
-    cur_gs="$(get_order_interval "$GATE_SWEEP_TOML")"
-    cur_ots="$(get_order_interval "$ORDER_TRACKING_TOML")"
+    if cur_dog="$(get_dog_max)"; then :; else
+        read_err=1; cur_dog=""
+        log "ERROR: could not read gastown.dog max_active_sessions from $CITY_TOML (anchor not found/unreadable) — skipping this target this pass"
+    fi
+    if cur_oracle="$(get_oracle_min)"; then :; else
+        read_err=1; cur_oracle=""
+        log "ERROR: could not read oracle-wa min_active_sessions from $CITY_TOML (anchor not found/unreadable) — skipping this target this pass"
+    fi
+    if cur_bh="$(get_order_interval "$BEADS_HEALTH_TOML")"; then :; else
+        read_err=1; cur_bh=""
+        log "ERROR: could not read interval from $BEADS_HEALTH_TOML (anchor not found/unreadable) — skipping this target this pass"
+    fi
+    if cur_gs="$(get_order_interval "$GATE_SWEEP_TOML")"; then :; else
+        read_err=1; cur_gs=""
+        log "ERROR: could not read interval from $GATE_SWEEP_TOML (anchor not found/unreadable) — skipping this target this pass"
+    fi
+    if cur_ots="$(get_order_interval "$ORDER_TRACKING_TOML")"; then :; else
+        read_err=1; cur_ots=""
+        log "ERROR: could not read interval from $ORDER_TRACKING_TOML (anchor not found/unreadable) — skipping this target this pass"
+    fi
 
     log "profile=$profile current(dog_max=$cur_dog oracle_min=$cur_oracle beads_health=$cur_bh gate_sweep=$cur_gs order_tracking=$cur_ots) target(dog_max=$dog_target oracle_min=$oracle_target beads_health=$bh_target gate_sweep=$gs_target order_tracking=$ots_target)"
 
-    if [ "$cur_dog" != "$dog_target" ]; then
+    # Each write is gated on a SUCCESSFUL read (never on an unreadable one
+    # looking "different"), and re-read afterward to confirm it actually
+    # took effect — a write that silently no-ops (e.g. the same broken
+    # anchor the read just failed on) must not be counted as done.
+    if [ -n "$cur_dog" ] && [ "$cur_dog" != "$dog_target" ]; then
         changed=1
         log "gastown.dog max_active_sessions: $cur_dog -> $dog_target"
-        [ "$DRY_RUN" = "1" ] || perl -0777 -pi -e 's/(name = "gastown\.dog"\nmax_active_sessions = )\d+/${1}'"$dog_target"'/' "$CITY_TOML"
+        if [ "$DRY_RUN" != "1" ]; then
+            perl -0777 -pi -e 's/(name = "gastown\.dog"\nmax_active_sessions = )\d+/${1}'"$dog_target"'/' "$CITY_TOML"
+            if chk="$(get_dog_max)" && [ "$chk" = "$dog_target" ]; then :; else
+                verify_err=1
+                log "ERROR: wrote gastown.dog max_active_sessions but verify-read shows '${chk:-<unreadable>}' (expected '$dog_target') — write did not take effect, will retry next pass"
+            fi
+        fi
     fi
-    if [ "$cur_oracle" != "$oracle_target" ]; then
+    if [ -n "$cur_oracle" ] && [ "$cur_oracle" != "$oracle_target" ]; then
         changed=1
         log "oracle-wa min_active_sessions: $cur_oracle -> $oracle_target"
-        [ "$DRY_RUN" = "1" ] || perl -0777 -pi -e 's/(name = "oracle-wa"\nmin_active_sessions = )\d+/${1}'"$oracle_target"'/' "$CITY_TOML"
+        if [ "$DRY_RUN" != "1" ]; then
+            perl -0777 -pi -e 's/(name = "oracle-wa"\nmin_active_sessions = )\d+/${1}'"$oracle_target"'/' "$CITY_TOML"
+            if chk="$(get_oracle_min)" && [ "$chk" = "$oracle_target" ]; then :; else
+                verify_err=1
+                log "ERROR: wrote oracle-wa min_active_sessions but verify-read shows '${chk:-<unreadable>}' (expected '$oracle_target') — write did not take effect, will retry next pass"
+            fi
+        fi
     fi
-    if [ "$cur_bh" != "$bh_target" ]; then
+    if [ -n "$cur_bh" ] && [ "$cur_bh" != "$bh_target" ]; then
         changed=1
         log "beads-health interval: $cur_bh -> $bh_target"
-        [ "$DRY_RUN" = "1" ] || perl -pi -e 's/^interval = ".*"$/interval = "'"$bh_target"'"/' "$BEADS_HEALTH_TOML"
+        if [ "$DRY_RUN" != "1" ]; then
+            perl -pi -e 's/^interval = ".*"$/interval = "'"$bh_target"'"/' "$BEADS_HEALTH_TOML"
+            if chk="$(get_order_interval "$BEADS_HEALTH_TOML")" && [ "$chk" = "$bh_target" ]; then :; else
+                verify_err=1
+                log "ERROR: wrote beads-health interval but verify-read shows '${chk:-<unreadable>}' (expected '$bh_target') — write did not take effect, will retry next pass"
+            fi
+        fi
     fi
-    if [ "$cur_gs" != "$gs_target" ]; then
+    if [ -n "$cur_gs" ] && [ "$cur_gs" != "$gs_target" ]; then
         changed=1
         log "gate-sweep interval: $cur_gs -> $gs_target"
-        [ "$DRY_RUN" = "1" ] || perl -pi -e 's/^interval = ".*"$/interval = "'"$gs_target"'"/' "$GATE_SWEEP_TOML"
+        if [ "$DRY_RUN" != "1" ]; then
+            perl -pi -e 's/^interval = ".*"$/interval = "'"$gs_target"'"/' "$GATE_SWEEP_TOML"
+            if chk="$(get_order_interval "$GATE_SWEEP_TOML")" && [ "$chk" = "$gs_target" ]; then :; else
+                verify_err=1
+                log "ERROR: wrote gate-sweep interval but verify-read shows '${chk:-<unreadable>}' (expected '$gs_target') — write did not take effect, will retry next pass"
+            fi
+        fi
     fi
-    if [ "$cur_ots" != "$ots_target" ]; then
+    if [ -n "$cur_ots" ] && [ "$cur_ots" != "$ots_target" ]; then
         changed=1
         log "order-tracking-sweep interval: $cur_ots -> $ots_target"
-        [ "$DRY_RUN" = "1" ] || perl -pi -e 's/^interval = ".*"$/interval = "'"$ots_target"'"/' "$ORDER_TRACKING_TOML"
+        if [ "$DRY_RUN" != "1" ]; then
+            perl -pi -e 's/^interval = ".*"$/interval = "'"$ots_target"'"/' "$ORDER_TRACKING_TOML"
+            if chk="$(get_order_interval "$ORDER_TRACKING_TOML")" && [ "$chk" = "$ots_target" ]; then :; else
+                verify_err=1
+                log "ERROR: wrote order-tracking-sweep interval but verify-read shows '${chk:-<unreadable>}' (expected '$ots_target') — write did not take effect, will retry next pass"
+            fi
+        fi
     fi
 
     if [ "$changed" -eq 0 ]; then
-        log "already at profile=$profile, no-op"
+        if [ "$read_err" -eq 1 ]; then
+            log "no changes applied this pass — one or more targets unreadable this pass (see ERROR lines above); an unreadable anchor is never treated as needing a write, so no reload is triggered"
+        else
+            log "already at profile=$profile, no-op"
+        fi
         return 0
     fi
 
@@ -235,7 +320,11 @@ apply_profile() { # normal|throttled
     fi
 
     if timeout 30 "$GC" reload --soft >>"$LOG" 2>&1; then
-        log "gc reload --soft OK — profile=$profile is now live"
+        if [ "$read_err" -eq 1 ] || [ "$verify_err" -eq 1 ]; then
+            log "gc reload --soft OK — profile=$profile PARTIALLY live: one or more targets were unreadable or failed to verify this pass (see ERROR lines above); will retry them next pass"
+        else
+            log "gc reload --soft OK — profile=$profile is now live"
+        fi
     else
         log "ERROR: gc reload --soft failed — files were rewritten to profile=$profile but the running city may still be on the old values until the next successful reload (will retry next pass)"
     fi
