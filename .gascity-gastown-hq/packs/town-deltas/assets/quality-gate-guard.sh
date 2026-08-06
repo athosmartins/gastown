@@ -362,6 +362,39 @@ classify_gap2_bugtask_verdict() {
   echo "keep:merge-not-verified"
 }
 
+# classify_external_pr_gap3 <pr_state> <review_decision>
+# Pure decision for ga-jto05 GAP-3: a story:awaiting-external-merge bead's real
+# deliverable is a PR in a DIFFERENT repo (fork -> PR -> upstream-review flow,
+# e.g. the beads CLI's own gastownhall/beads — bd-binary-separate-from-gascity-
+# engine). GAP-1/GAP-2 above only ever check gascity-hq's own origin/main, which
+# by construction never contains a foreign repo's commits, so they are
+# structurally blind to this bead class. story:awaiting-external-merge's own
+# doc-comment (pilot-dispatcher.sh, ga-spux4) says "no daemon watches external
+# PRs for merge yet, so removal is manual" — this is that daemon.
+# Cost of the gap (ga-jto05): 2 confirmed beads sat merged-but-open ~11 days
+# each before a dog happened to check gh pr view by hand; a 3rd was one
+# accidental GAP-2 re-arm away from the same fate.
+# pr_state: MERGED | CLOSED | OPEN | "" (gh call failed, no PR ref found, or the
+#   PR could not be resolved — all fold to the same fail-safe skip:indeterminate).
+# review_decision: APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | "" (none
+#   yet). Only consulted when pr_state=OPEN — irrelevant once the PR is terminal.
+# Returns: close:merged | flag:closed-not-merged | flag:changes-requested | wait:pending | skip:indeterminate
+classify_external_pr_gap3() {
+  local pr_state="$1" review_decision="${2:-}"
+  case "$pr_state" in
+    MERGED) echo "close:merged" ;;
+    CLOSED) echo "flag:closed-not-merged" ;;
+    OPEN)
+      if [ "$review_decision" = "CHANGES_REQUESTED" ]; then
+        echo "flag:changes-requested"
+      else
+        echo "wait:pending"
+      fi
+      ;;
+    *) echo "skip:indeterminate" ;;
+  esac
+}
+
 # gap2_query_active_markers — ga-4tgga: I/O helper (not pure, like set_gate_status
 # above) fetching every type:quality-gate-marker whose gate-status is still ACTIVE
 # (ready/queued/claimed/dispatching/running — anything short of terminal). Defined
@@ -1786,6 +1819,102 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
         ;;
       skip:not-dispatched)
         log "GAP-2: $SC_ID not pilot:dispatched — skip (should not reach here)"
+        ;;
+    esac
+  done
+fi
+
+# ── Step 0c.3 (ga-jto05 GAP-3): external-PR re-check ────────────────────────
+# GAP-1/GAP-2 above only ever look for evidence in gascity-hq's OWN origin/main
+# — structurally blind to a bead whose real deliverable is a PR in a DIFFERENT
+# repo (fork -> PR -> upstream-review flow, e.g. the beads CLI's own
+# gastownhall/beads). story:awaiting-external-merge is documented as "the
+# manual marker" for exactly this path (pilot-dispatcher.sh, ga-spux4): "a
+# human/Mayor sweep removes the label once the PR merges... no daemon watches
+# external PRs for merge yet, so removal is manual." This step IS that daemon.
+# Cost of the gap (ga-jto05): ga-ahnxx/ga-hqchm sat merged-but-open ~11 days
+# each before a dog checked gh pr view by hand; ga-yp9r8 was one accidental
+# GAP-2 re-arm away from the same fate (GAP-2's blind spot mislabeled it
+# gate:needs-fix/needs-remerge — a real reviewer never rejected anything, the
+# PR was simply clean and unreviewed).
+# Safe-default: no PR URL found in comments, or gh call fails/PR state
+# ambiguous -> do NOT act (both fold into a silent, logged no-op).
+
+log "Step 0c.3 (ga-jto05 GAP-3): sweep story:awaiting-external-merge beads for external PR state..."
+
+if ! command -v gh >/dev/null 2>&1; then
+  log "GAP-3: gh CLI not found on PATH — skipping external-PR sweep entirely"
+else
+  EXT_IDS=$(bd -C "$GC_CITY" list --json --all --status open -l story:awaiting-external-merge 2>/dev/null \
+    | jq -r '.[].id' 2>/dev/null || echo "")
+
+  for EXT_ID in $EXT_IDS; do
+    [ -z "$EXT_ID" ] && continue
+
+    EXT_SHOW=$(bd -C "$GC_CITY" show "$EXT_ID" --json --include-comments 2>/dev/null \
+      | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
+
+    # Newest-first: if a bead was dispatched more than once (a prior PR
+    # abandoned, a fresh one opened later), the most recent comment is the
+    # live reference — mirrors GAP-2's own "Sling task bead" extraction
+    # (sort_by(.created_at)|reverse, select() before capture() so a
+    # non-matching comment never reaches capture() and aborts the pipeline).
+    EXT_PR_REF=$(echo "$EXT_SHOW" | jq -r '
+      .comments // [] | sort_by(.created_at) | reverse |
+      .[] | .text // "" |
+      select(test("https://github\\.com/[^/[:space:]]+/[^/[:space:]]+/pull/[0-9]+")) |
+      capture("https://github\\.com/(?<owner>[^/\\s]+)/(?<repo>[^/\\s]+)/pull/(?<num>[0-9]+)") |
+      "\(.owner)/\(.repo) \(.num)"
+    ' 2>/dev/null | head -1 || echo "")
+
+    if [ -z "$EXT_PR_REF" ]; then
+      log "GAP-3: $EXT_ID — no GitHub PR URL found in comments — safe-skip"
+      continue
+    fi
+
+    EXT_REPO="${EXT_PR_REF%% *}"
+    EXT_NUM="${EXT_PR_REF##* }"
+
+    EXT_PR_JSON=$(gh pr view "$EXT_NUM" --repo "$EXT_REPO" --json state,reviewDecision,mergedAt,mergeCommit,url 2>/dev/null || echo "")
+
+    if [ -z "$EXT_PR_JSON" ]; then
+      log "GAP-3: $EXT_ID — gh pr view $EXT_NUM --repo $EXT_REPO failed (network/auth/not-found) — safe-skip"
+      continue
+    fi
+
+    EXT_STATE=$(echo "$EXT_PR_JSON" | jq -r '.state // ""' 2>/dev/null || echo "")
+    EXT_REVIEW=$(echo "$EXT_PR_JSON" | jq -r '.reviewDecision // ""' 2>/dev/null || echo "")
+    EXT_MERGE_SHA=$(echo "$EXT_PR_JSON" | jq -r '.mergeCommit.oid // ""' 2>/dev/null || echo "")
+    EXT_URL=$(echo "$EXT_PR_JSON" | jq -r '.url // ""' 2>/dev/null || echo "")
+    [ -z "$EXT_URL" ] && EXT_URL="https://github.com/$EXT_REPO/pull/$EXT_NUM"
+
+    EXT_ACTION=$(classify_external_pr_gap3 "$EXT_STATE" "$EXT_REVIEW")
+
+    case "$EXT_ACTION" in
+      close:merged)
+        warn "GAP-3: $EXT_ID — PR $EXT_URL is MERGED${EXT_MERGE_SHA:+ ($EXT_MERGE_SHA)} — closing"
+        bd -C "$GC_CITY" label remove "$EXT_ID" "story:awaiting-external-merge" -q 2>/dev/null || true
+        bd -C "$GC_CITY" close "$EXT_ID" \
+          -r "ga-jto05 GAP-3 reconciler: external PR $EXT_URL merged${EXT_MERGE_SHA:+ (commit $EXT_MERGE_SHA)} — work is done; closing." \
+          2>/dev/null || warn "GAP-3: could not close $EXT_ID after external-PR-merged detection"
+        ;;
+      flag:closed-not-merged)
+        warn "GAP-3: $EXT_ID — PR $EXT_URL is CLOSED without merging — flagging needs-human"
+        bd -C "$GC_CITY" label remove "$EXT_ID" "story:awaiting-external-merge" -q 2>/dev/null || true
+        bd -C "$GC_CITY" label add    "$EXT_ID" "gate:needs-human"              -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$EXT_ID" "ga-jto05 GAP-3 reconciler: external PR $EXT_URL was closed WITHOUT merging (rejected/abandoned upstream). story:awaiting-external-merge cleared; gate:needs-human set — a human should decide whether to open a new PR or abandon this bead." 2>/dev/null || true
+        ;;
+      flag:changes-requested)
+        warn "GAP-3: $EXT_ID — PR $EXT_URL has CHANGES_REQUESTED — surfacing real gate:needs-fix"
+        bd -C "$GC_CITY" label remove "$EXT_ID" "story:awaiting-external-merge" -q 2>/dev/null || true
+        bd -C "$GC_CITY" label add    "$EXT_ID" "gate:needs-fix"                -q 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$EXT_ID" "ga-jto05 GAP-3 reconciler: external PR $EXT_URL is OPEN with reviewDecision=CHANGES_REQUESTED — an upstream reviewer requested changes. story:awaiting-external-merge cleared; gate:needs-fix set so Pilot dispatches a builder with the real review feedback as brief (fetch via gh pr view $EXT_NUM --repo $EXT_REPO --json reviews,comments — this is the case ga-e2n96 says gate:needs-fix should actually mean: a reviewer really did reject the code)." 2>/dev/null || true
+        ;;
+      wait:pending)
+        log "GAP-3: $EXT_ID — PR $EXT_URL is OPEN, reviewDecision=${EXT_REVIEW:-none} — still genuinely pending, no action"
+        ;;
+      skip:indeterminate)
+        log "GAP-3: $EXT_ID — PR state indeterminate (state='$EXT_STATE') — safe-skip"
         ;;
     esac
   done

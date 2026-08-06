@@ -85,6 +85,21 @@ r=$(classify_gap2_bugtask_verdict '' 1); [ "$r" = "close:untracked-delivery" ] &
 r=$(classify_gap2_bugtask_verdict 0 0); [ "$r" = "keep:merge-not-verified" ] && ok "not merged, no untracked marker → keep:merge-not-verified (unchanged legitimate-failure path)" || bad "not-merged-no-marker got '$r'"
 r=$(classify_gap2_bugtask_verdict 1 1); [ "$r" = "close:merge-verified" ] && ok "merge_verified=1 wins over untracked marker (evidence beats trust)" || bad "verified-and-marker got '$r'"
 
+# ── classify_external_pr_gap3 <pr_state> <review_decision> — ga-jto05: re-check
+# story:awaiting-external-merge beads against the real gh pr view state instead
+# of leaving the label to a human sweep forever. ─────────────────────────────
+echo "classify_external_pr_gap3: external PR state routing"
+r=$(classify_external_pr_gap3 MERGED); [ "$r" = "close:merged" ] && ok "MERGED → close:merged" || bad "MERGED got '$r'"
+r=$(classify_external_pr_gap3 MERGED APPROVED); [ "$r" = "close:merged" ] && ok "MERGED (with a review decision too) → close:merged (state wins, review_decision irrelevant once terminal)" || bad "MERGED+APPROVED got '$r'"
+r=$(classify_external_pr_gap3 CLOSED); [ "$r" = "flag:closed-not-merged" ] && ok "CLOSED (not merged — rejected/abandoned upstream) → flag:closed-not-merged" || bad "CLOSED got '$r'"
+r=$(classify_external_pr_gap3 OPEN); [ "$r" = "wait:pending" ] && ok "OPEN, no review_decision → wait:pending (genuinely still pending, ga-yp9r8's actual live state)" || bad "OPEN got '$r'"
+r=$(classify_external_pr_gap3 OPEN ''); [ "$r" = "wait:pending" ] && ok "OPEN, explicit empty review_decision → wait:pending" || bad "OPEN+empty got '$r'"
+r=$(classify_external_pr_gap3 OPEN REVIEW_REQUIRED); [ "$r" = "wait:pending" ] && ok "OPEN, review_decision=REVIEW_REQUIRED → wait:pending (not a rejection)" || bad "OPEN+REVIEW_REQUIRED got '$r'"
+r=$(classify_external_pr_gap3 OPEN APPROVED); [ "$r" = "wait:pending" ] && ok "OPEN, review_decision=APPROVED but not yet merged → wait:pending (nothing to fix, just waiting on the merge itself)" || bad "OPEN+APPROVED got '$r'"
+r=$(classify_external_pr_gap3 OPEN CHANGES_REQUESTED); [ "$r" = "flag:changes-requested" ] && ok "OPEN, review_decision=CHANGES_REQUESTED → flag:changes-requested (ga-e2n96: the one case gate:needs-fix should actually mean — a reviewer really did reject the code)" || bad "OPEN+CHANGES_REQUESTED got '$r'"
+r=$(classify_external_pr_gap3 ''); [ "$r" = "skip:indeterminate" ] && ok "empty pr_state (gh call failed / PR not found) → skip:indeterminate (fail-safe, never guess)" || bad "empty pr_state got '$r'"
+r=$(classify_external_pr_gap3 DRAFT); [ "$r" = "skip:indeterminate" ] && ok "unrecognized pr_state → skip:indeterminate (fail-safe)" || bad "unrecognized pr_state got '$r'"
+
 echo ""
 echo "Results: $P passed, $F failed"
 [ "$F" -eq 0 ] && { echo "SELFTEST PASS"; exit 0; } || { echo "SELFTEST FAIL"; exit 1; }
