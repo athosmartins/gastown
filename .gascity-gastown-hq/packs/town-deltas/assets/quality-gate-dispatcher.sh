@@ -1265,7 +1265,67 @@ GATE_LOCK_HB="$GATE_LOCK_DIR/heartbeat"
 # (30 min) is a margin past that which still reclaims a wedged holder within a
 # few launchd intervals.
 GATE_LOCK_MAX_AGE="${GATE_LOCK_MAX_AGE:-1800}"
-GATE_LOCK_TOKEN="$$:${RANDOM}${RANDOM}"
+# ga-309v3: INHERITABLE across a multi-admit re-exec. A continuation round
+# (GATE_ADMIT_ROUND>0) re-execs this same script to admit another marker under
+# the SAME lock acquisition; it must present the SAME token or _release_gate_lock
+# would refuse to free the lock at the end (token mismatch) and wedge the gate
+# until GATE_LOCK_MAX_AGE. `exec` preserves $$, so the pid half stays valid too.
+# Unset (the normal launchd entry) => identical to the previous behaviour.
+GATE_LOCK_TOKEN="${GATE_LOCK_TOKEN:-$$:${RANDOM}${RANDOM}}"
+# ...but an inherited token is only OURS if its pid half is this process. `exec`
+# preserves $$, so a genuine continuation always passes; any DESCENDANT (the
+# gate-reviewer sessions a round spawns inherit the exported var, and an agent
+# in one may later run this dispatcher by hand) gets a fresh token instead.
+# WITHOUT this, the descendant fails the skip-acquire guard, correctly falls
+# through to _acquire_gate_lock, and then writes the INHERITED token as the
+# heartbeat — advertising a holder pid that is long dead while it is very much
+# alive. The next sweep's _gate_lock_holder_dead reads that dead pid, declares
+# the lock stale, and RECLAIMS IT FROM THE LIVE HOLDER: two concurrent sweeps,
+# concurrent claims, concurrent merges — the ga-7s0or/ga-T1 class. Self-validating
+# here means acquire, release AND holder-dead all agree everywhere, so this line
+# is the keystone, not the 4-way guard further down.
+[ "${GATE_LOCK_TOKEN%%:*}" = "$$" ] || GATE_LOCK_TOKEN="$$:${RANDOM}${RANDOM}"
+
+# ── ga-309v3: multi-admit rounds ──────────────────────────────────────────────
+# A sweep admits at most ONE marker (Step 0b picks `.[0]`), so with runs lasting
+# 11-17min and a sweep cadence of 4-6min the number of CONCURRENT runs settles at
+# ~1-2 no matter how high the Step 0b-1 headroom ceiling is — the ceiling is never
+# fed fast enough to be reached. Measured 2026-08-06: ceiling=6 with a sustained
+# observed concurrency of exactly 1.
+#
+# Instead of wrapping Step 0b..Step 8 (~2400 lines, dozens of globals) in a loop —
+# where any conditionally-skipped reassignment would leak state from marker A into
+# marker B and merge the WRONG branch — a continuation round RE-EXECS this script.
+# exec replaces the process image, so every global is reset by construction and
+# cross-round leakage is impossible. The lock is carried over deliberately (see
+# GATE_LOCK_TOKEN above) so the whole burst stays ONE logical sweep.
+#
+# Each round re-runs the full Step 0b-1 headroom probe on its own, so a data plane
+# that heats up mid-burst stops admitting immediately — the round counter is a
+# hard ceiling, not the only brake. A round with no queued marker simply exits at
+# Step 0b, so the burst self-terminates.
+GATE_MAX_ADMITS_PER_SWEEP="${GATE_MAX_ADMITS_PER_SWEEP:-3}"
+case "$GATE_MAX_ADMITS_PER_SWEEP" in ''|*[!0-9]*) GATE_MAX_ADMITS_PER_SWEEP=3 ;; esac
+# Strip leading zeros BEFORE any arithmetic: bash reads 010 as OCTAL, and an
+# 08/09 is a hard $(( )) error — which, at the re-exec site, would die AFTER
+# `trap - EXIT` and leak the lock. 10# would also work but breaks on empty.
+#
+# `^0*\([0-9]\)` — NOT `^0*` — deliberately KEEPS the final digit, so a literal
+# "0" survives as 0 and the `-ge 1` clamp below turns it into 1 (burst off). A
+# bare `^0*` maps "0" to the empty string, the `:=3` default then fires, and an
+# operator typing the universal off-switch into the plist during an incident
+# would silently get the MAXIMUM burst instead. Inverting a kill switch is worse
+# than not having one.
+GATE_MAX_ADMITS_PER_SWEEP=$(printf '%s' "$GATE_MAX_ADMITS_PER_SWEEP" | sed 's/^0*\([0-9]\)/\1/'); : "${GATE_MAX_ADMITS_PER_SWEEP:=3}"
+[ "$GATE_MAX_ADMITS_PER_SWEEP" -ge 1 ] 2>/dev/null || GATE_MAX_ADMITS_PER_SWEEP=1
+# Upper clamp: this knob multiplies concurrent reviewer spawns inside ONE lock
+# hold. A typo (30, or a seconds value pasted into the wrong knob) would admit
+# far past the gate-reviewer template's max_active_sessions and trip ga-zl277.
+# 6 == GATE_MAX_REVIEWERS, the most the headroom ceiling can ever allow anyway.
+[ "$GATE_MAX_ADMITS_PER_SWEEP" -le 6 ] 2>/dev/null || GATE_MAX_ADMITS_PER_SWEEP=6
+GATE_ADMIT_ROUND="${GATE_ADMIT_ROUND:-0}"
+case "$GATE_ADMIT_ROUND" in ''|*[!0-9]*) GATE_ADMIT_ROUND=0 ;; esac
+GATE_ADMIT_ROUND=$(printf '%s' "$GATE_ADMIT_ROUND" | sed 's/^0*\([0-9]\)/\1/'); : "${GATE_ADMIT_ROUND:=0}"
 
 # Age (seconds) of an arbitrary path's mtime; a huge number if it is missing.
 # Used for both the heartbeat file and the .reaping reclaim sentinel (ga-T1 #4).
@@ -4093,9 +4153,51 @@ cleanup_reviewer_sessions() {
 # instant it completes. If neither fires (SIGKILL/OOM), the stale-heartbeat
 # recovery above reclaims it — the anti-wedge guarantee.
 if [ "$GATE_LOCK_ENABLED" = "1" ]; then
-  if _acquire_gate_lock; then
+  # ga-309v3: a continuation round already holds the lock from round 0 (it is
+  # deliberately not released across the re-exec), so re-acquiring would deadlock
+  # against ourselves. BUT ownership must be proven from the LOCK ITSELF, never
+  # from the inherited env alone: `export GATE_ADMIT_ROUND/GATE_LOCK_TOKEN` reach
+  # EVERY descendant, including the gate-reviewer sessions this round spawns. A
+  # reviewer agent that later runs this dispatcher by hand (routine when
+  # debugging a gate bug) would otherwise inherit "I am round N", skip the
+  # single-instance guard entirely, run a concurrent sweep, stomp the live
+  # holder's heartbeat and then rm -rf the lock out from under it — the
+  # double-sweep/concurrent-merge class ga-7s0or and ga-T1 exist to prevent.
+  #
+  # `${GATE_LOCK_TOKEN%%:*}" = "$$"` is the decisive half: exec PRESERVES $$, so a
+  # genuine continuation always matches, while any descendant process has a
+  # different pid and fails closed into the normal _acquire_gate_lock path.
+  _gate_hb_tok=$(head -n1 "$GATE_LOCK_HB" 2>/dev/null || true)
+  if [ "$GATE_ADMIT_ROUND" -gt 0 ] 2>/dev/null \
+     && [ -d "$GATE_LOCK_DIR" ] \
+     && [ "$_gate_hb_tok" = "$GATE_LOCK_TOKEN" ] \
+     && [ "${GATE_LOCK_TOKEN%%:*}" = "$$" ]; then
+    # Refresh the heartbeat: a burst outlives a single round, and a heartbeat
+    # left to age past GATE_LOCK_MAX_AGE would let a concurrent fire reclaim the
+    # lock mid-burst.
+    _gate_lock_write_hb
+    trap '_release_gate_lock' EXIT
+    log "Multi-admit round ${GATE_ADMIT_ROUND}/${GATE_MAX_ADMITS_PER_SWEEP} — continuing under the round-0 lock, ownership verified (ga-309v3)."
+  elif _acquire_gate_lock; then
     trap '_release_gate_lock' EXIT
   else
+    # ga-309v3: yielding here does NOT prove we are lock-free. A continuation
+    # round that (rarely) fails the ownership guard above — lock dir vanished, a
+    # transient `head` failure, or a peer reclaim after an unusually long round —
+    # still HELD the lock, and _acquire_gate_lock's mkdir then fails against our
+    # OWN dir: _gate_lock_holder_dead reads our own live pid, reports "alive",
+    # and we land here and exit 0. Without a release trap the lock survives our
+    # death, and while the dead-pid fast path normally reclaims it within one
+    # launchd cadence, a RECYCLED pid makes `kill -0` succeed and wedges the gate
+    # for the full GATE_LOCK_MAX_AGE (30min) with no sweep running at all.
+    #
+    # Safe only because GATE_LOCK_TOKEN is self-validating (pid half == $$, see
+    # its definition): _release_gate_lock removes the dir ONLY on a token match,
+    # so a genuine owner frees its own lock while a yielding peer — whose token
+    # is freshly minted and cannot match the live holder's heartbeat — is a no-op.
+    # Installing this trap BEFORE the :1274 self-validation would have let a
+    # descendant with an inherited token delete the live holder's lock.
+    trap '_release_gate_lock' EXIT
     _gate_holder_pid=$(head -n1 "$GATE_LOCK_HB" 2>/dev/null | cut -d: -f1 || true)
     log "Live gate sweep already running (pid=${_gate_holder_pid:-?}) — yielding (single-instance guard)."
     exit 0
@@ -4679,6 +4781,34 @@ fi
 # "dolt-calm-cap-reached" ceiling, DEFERring every sweep with Dolt calm + queue
 # full (the 2026-06-12 town-wide deadlock).
 LIVE_REVIEWERS=$(headroom_live_reviewers "${REVIEWER_SESSION_COUNT:-0}" "${REAPED_REVIEWERS:-0}" "${DRAINED_REVIEWERS:-0}")
+
+# ── ga-309v3: burst-aware correction — DO NOT REMOVE ──────────────────────────
+# Step 0a-2's drained-exclusion calls session_peek_reports_dead with no booting
+# guard, and `gc session peek` reports "session not found" for BOTH a drained
+# session AND one still inside its ~210s deferred-start window (ga-flfo/ga-xwdl;
+# the ACK path at Step 7b pairs that probe with session_is_booting +
+# RECONVENE_GRACE_SECS for exactly this reason, this one does not).
+#
+# A continuation round runs ~30-120s after the previous round called
+# `gc session new` — squarely inside that window. Its reviewers are still
+# state=creating, get counted as DRAINED and subtracted, so LIVE_REVIEWERS reads
+# 0 and the headroom gate believes the plane is empty. That turns the multi-admit
+# burst into an UNBRAKED loop: on a genuinely hot Dolt the `dolt-hot-floor`
+# in-flight==0 branch flips defer into admit on every round, and on the calm path
+# a burst starting near the cap can push past the gate-reviewer template's
+# max_active_sessions (the ga-zl277 vicious cycle, where the gate can no longer
+# spawn reviewers at all).
+#
+# Each prior round of THIS burst admitted exactly one run, so add back what those
+# rounds spawned. Over-counting (when the probe DOES see them) is the safe
+# direction — it defers earlier — whereas under-counting is what removes the
+# brake. This corrects the burst's own blind spot without touching the
+# pre-existing probe, which is a separate fix on its own bead.
+if [ "${GATE_ADMIT_ROUND:-0}" -gt 0 ] 2>/dev/null; then
+  _burst_admitted=$(( GATE_ADMIT_ROUND * GATE_REVIEWERS_PER_RUN ))
+  LIVE_REVIEWERS=$(( LIVE_REVIEWERS + _burst_admitted ))
+  log "Multi-admit round ${GATE_ADMIT_ROUND}: +${_burst_admitted} reviewer(s) added back to LIVE_REVIEWERS=${LIVE_REVIEWERS} — this burst's own spawns can still be inside the ~210s boot window and read as drained (ga-309v3)."
+fi
 
 # ── Step 0b: Find a queued marker ────────────────────────────────────────────
 # quality-gate-guard.sh claims, validates, derives author, and parks markers as
@@ -7059,4 +7189,30 @@ else
   # run, instead of being duplicated per call site.
   log "Run $GATE_RUN_ID admitted: $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdict(s) in so far — reviewers keep working independently (Phase B); a future sweep's Phase C will finalize (ga-eqjo)."
   GATE_RUN_LEAVE_SESSIONS_ALIVE=1
+
+  # ── ga-309v3: continue the multi-admit burst ────────────────────────────────
+  # Reached ONLY on the leave-in-flight path — i.e. we just admitted a run and
+  # its reviewers are working unsupervised. That is exactly when the gate has
+  # spare capacity it currently throws away: today the sweep ends here and the
+  # next marker waits a full launchd cadence (4-6min) for a fresh sweep.
+  #
+  # The ONLY guard here is the round counter. Everything else (headroom, queue
+  # depth, quota, swap, rebase health) is re-evaluated from scratch by the next
+  # round, because it is a full fresh run of this script — no duplicated policy
+  # to drift out of sync with Step 0b-1, and a round that finds nothing to do
+  # exits on its own at Step 0b. A hot data plane stops the burst on the next
+  # round's own headroom probe.
+  if [ "$((GATE_ADMIT_ROUND + 1))" -lt "$GATE_MAX_ADMITS_PER_SWEEP" ] 2>/dev/null; then
+    # Keep the lock across the re-exec: cleanup_reviewer_sessions releases it
+    # unless this flag is set, and `exec` would otherwise fire no trap at all —
+    # set it FIRST so both the explicit call below and any signal path agree.
+    GATE_SWEEP_HAS_MORE_WORK=1
+    cleanup_reviewer_sessions
+    trap - EXIT
+    log "Multi-admit: round $GATE_ADMIT_ROUND done, re-exec for round $((GATE_ADMIT_ROUND + 1))/$GATE_MAX_ADMITS_PER_SWEEP under the same lock (ga-309v3)."
+    export GATE_LOCK_TOKEN
+    export GATE_ADMIT_ROUND="$((GATE_ADMIT_ROUND + 1))"
+    export GATE_MAX_ADMITS_PER_SWEEP
+    exec bash "$0" "$@"
+  fi
 fi
