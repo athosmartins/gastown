@@ -2062,6 +2062,39 @@ gate_behind_envelope_action() {
   fi
 }
 
+# gate_branch_already_merged <branch> <default_branch>
+# ga-88sl7: reusable predicate wrapping the SAME already-merged detection
+# Step 4b uses (is-ancestor, then a patch-id fallback for a rebase-merge
+# whose SHAs changed but whose content is 100% in main — mirrors
+# rig_content_merged's ga-01yq logic, inlined rather than called so this
+# predicate has a SINGLE external dependency, git_rig, for lib-only-selftest
+# shimming) — but callable independently of Step 4b's per-sweep candidate,
+# so a SEPARATE sweep (Step 0a-4, below) can ask "is THIS branch merged NOW?"
+# for a marker Step 4b already passed judgment on in an earlier sweep.
+# Requires git_rig (and its GIT_DIR_PATH/IS_CONTAINER_RIG context) already
+# resolved for the marker's rig — same precondition Step 4b has. Deliberately
+# defined BEFORE the GATE_DISPATCHER_LIB_ONLY early-return below (unlike
+# git_rig/rig_content_merged themselves) so it loads under lib-only sourcing;
+# see gate-needs-rebase-terminality-reap.selftest.sh.
+# FAIL-CLOSED: empty args or an unresolvable ref echo "0" (never reap on
+# doubt — matches rig_content_merged's own FAIL-CLOSED contract). Echoes
+# "1"/"0"; never exits non-zero (pure yes/no, matches this file's other
+# decision-function style).
+gate_branch_already_merged() {
+  local _branch="$1" _default_branch="$2" _n
+  if [ -z "$_branch" ] || [ -z "$_default_branch" ]; then
+    printf '0'; return 0
+  fi
+  if git_rig merge-base --is-ancestor "origin/$_branch" "origin/$_default_branch" 2>/dev/null; then
+    printf '1'; return 0
+  fi
+  _n=$(git_rig rev-list --count --cherry-pick --right-only "origin/$_default_branch...origin/$_branch" 2>/dev/null || echo ERR)
+  if [ "$_n" = "0" ]; then
+    printf '1'; return 0
+  fi
+  printf '0'
+}
+
 # gate_rebase_attempt_advanced <intended_next_attempt> <actual_highest_after_write>
 # ga-6dp9 (bug 3 of 3): the gate:exiled-tier5:N label swap (remove old, add
 # new) is fire-and-forget (`|| true`, matching this script's fail-soft
@@ -5047,6 +5080,103 @@ if [ "$RECON_RIG_COUNT" -gt 0 ]; then
       esac
     fi
   done
+fi
+
+# ── Step 0a-4 (ga-88sl7): reap needs-rebase markers for already-merged branches ─
+# gate-status:needs-rebase is EXCLUDED from Step 0b's queued-only selection
+# (`-l gate-status:queued`, below) by design — a genuinely-behind branch must
+# not be re-bounced/re-nudged every ~2min sweep. quality-gate-guard.sh's own
+# reclaim (Vector A) explicitly treats needs-rebase as terminal too. Net
+# effect: once a marker is bounced to needs-rebase, NOTHING ever re-checks it
+# against the CURRENT state of main again — Step 4b's already-merged
+# detection only ever runs ONCE, at that marker's original dispatch. If the
+# underlying work ships through any other route afterward (a fresh
+# branch/marker for the same bead, a manual merge) this marker is stranded
+# holding a queue slot forever — correctly classified at the time, never
+# re-evaluated since. Measured live (ga-88sl7, Mayor 06/08): 5 of 10 open
+# gate markers were exactly this — two with behind>250 — and all 5 source
+# beads were already closed (the work shipped some other way).
+# This sweep is the periodic re-check Step 4b's one-shot classification
+# cannot be: cheap (one merge-base per candidate, no author/session IO, no
+# push/nudge), and scoped ONLY to "is it merged now?" — a genuinely-still-
+# diverged branch is untouched and stays in needs-rebase exactly as before
+# this fix (AC4 non-regression).
+NEEDS_REBASE_JSON=$(bd -C "$GC_CITY" list --json --all --status open \
+  -l type:quality-gate-marker \
+  -l gate-status:needs-rebase \
+  2>/dev/null || echo "[]")
+NEEDS_REBASE_COUNT=$(printf '%s\n' "$NEEDS_REBASE_JSON" | jq 'length' 2>/dev/null || echo "0")
+case "$NEEDS_REBASE_COUNT" in ''|*[!0-9]*) NEEDS_REBASE_COUNT=0 ;; esac
+
+if [ "$NEEDS_REBASE_COUNT" -gt 0 ]; then
+  REAPED_NEEDS_REBASE=0
+  for nri in $(seq 0 $((NEEDS_REBASE_COUNT - 1))); do
+    NR_MARKER=$(printf '%s\n' "$NEEDS_REBASE_JSON" | jq -c ".[$nri]" 2>/dev/null || echo "{}")
+    NR_MARKER_ID=$(printf '%s' "$NR_MARKER" | jq -r '.id // empty' 2>/dev/null || echo "")
+    DESC=$(printf '%s' "$NR_MARKER" | jq -r '.description // ""' 2>/dev/null || echo "")
+    [ -z "$NR_MARKER_ID" ] && continue
+    [ -z "$DESC" ] && continue
+
+    NR_BRANCH=$(extract "branch")
+    NR_BEAD_ID=$(extract "bead_id")
+    NR_RIG=$(extract "rig")
+    [ -z "$NR_BRANCH" ] && continue
+
+    # Resolve THIS candidate's rig context fresh — gate_resolve_rig_context
+    # reads/writes $RIG/$BEAD_ID/$RIG_PATH/$GIT_DIR_PATH/$IS_CONTAINER_RIG/
+    # $DEFAULT_BRANCH/$BEAD_CITY as globals. Step 0b/Step 2/Step 4 below
+    # re-derive all of these fresh from the sweep's OWN candidate before use,
+    # so leaving them set to this loop's last iteration here is safe.
+    RIG="$NR_RIG"
+    BEAD_ID="$NR_BEAD_ID"
+    if ! gate_resolve_rig_context; then
+      log "  Step 0a-4: cannot resolve rig context for marker $NR_MARKER_ID (rig=$NR_RIG) — skipping this sweep."
+      continue
+    fi
+
+    [ "$(gate_branch_already_merged "$NR_BRANCH" "$DEFAULT_BRANCH")" != "1" ] && continue
+
+    log "Step 0a-4: branch $NR_BRANCH (marker $NR_MARKER_ID) is already merged into $DEFAULT_BRANCH — reaping stranded needs-rebase marker (ga-88sl7)."
+    set_gate_status "$NR_MARKER_ID" "superseded"
+    bd -C "$GC_CITY" comment "$NR_MARKER_ID" "Branch $NR_BRANCH is already merged into $DEFAULT_BRANCH (git merge-base --is-ancestor confirmed). This marker was stranded at gate-status:needs-rebase — needs-rebase is excluded from normal re-dispatch, so nothing re-checked it after the original bounce. Reaped by the Step 0a-4 periodic terminality sweep (ga-88sl7)." 2>/dev/null || true
+    bd -C "$GC_CITY" close "$NR_MARKER_ID" -r "Gate marker terminal: SUPERSEDED (branch $NR_BRANCH already merged to $DEFAULT_BRANCH; reaped from stranded needs-rebase by Step 0a-4, ga-88sl7)." 2>/dev/null || true
+
+    if [ -n "$BEAD_ID" ]; then
+      if NR_BD_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null); then
+        NR_BD_STATUS=$(printf '%s' "$NR_BD_JSON" | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || echo "open")
+      else
+        NR_BD_STATUS="__UNKNOWN__"
+      fi
+      case "$NR_BD_STATUS" in
+        closed) : ;;  # already terminal — the common case: the work shipped some other way.
+        __UNKNOWN__)
+          log "  Step 0a-4: source bead $BEAD_ID status unreadable this sweep — leaving it untouched (marker already reaped; will retry bead cleanup next sweep if still open)."
+          ;;
+        *)
+          NR_SRC_LABELS=$(printf '%s' "$NR_BD_JSON" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
+          # ga-67hae pilot-cascade fix, mirrored: strip story:in-flight so the
+          # Pilot lane slot frees regardless of story/bug routing below.
+          bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
+          bd -C "$BEAD_CITY" assign "$BEAD_ID" "" -q 2>/dev/null || true
+          if printf '%s' "$NR_SRC_LABELS" | grep -q "story:approved"; then
+            # STORY → hand off to story-delivery, same as Step 4b's already-merged
+            # path: gate:passed is delivery's pickup signal; do not close here.
+            bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
+            bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $NR_BRANCH already in $DEFAULT_BRANCH — gate skipped (marker $NR_MARKER_ID superseded, reaped from stranded needs-rebase). STORY: handed off to story-delivery (gate:passed set; story:approved kept; story:in-flight stripped). (ga-88sl7)" 2>/dev/null || true
+          else
+            bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
+            bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $NR_BRANCH already in $DEFAULT_BRANCH — gate superseded (marker $NR_MARKER_ID, reaped from stranded needs-rebase). story:in-flight stripped; work already merged. (ga-88sl7)" 2>/dev/null || true
+            bd -C "$BEAD_CITY" close "$BEAD_ID" -r "Branch $NR_BRANCH already merged to $DEFAULT_BRANCH — delivered via prior merge; gate superseded (marker $NR_MARKER_ID, reaped from stranded needs-rebase, ga-88sl7)." 2>/dev/null \
+              || warn "Could not close already-merged non-story source bead $BEAD_ID (non-fatal)."
+          fi
+          ;;
+      esac
+    fi
+    REAPED_NEEDS_REBASE=$((REAPED_NEEDS_REBASE + 1))
+  done
+  if [ "$REAPED_NEEDS_REBASE" -gt 0 ]; then
+    log "Step 0a-4: reaped $REAPED_NEEDS_REBASE stranded needs-rebase marker(s) this sweep (ga-88sl7)."
+  fi
 fi
 
 # ── ga-cw4pm / gt-bewtm: live reviewer-session count for the headroom gate ────
