@@ -363,6 +363,15 @@ run_sweep() {
   local flagged_tsv=""
   local store cand_json sel_json
   for store in $PMRW_STORES; do
+    # Re-stamp the lock heartbeat once per store (mirrors quality-gate-
+    # dispatcher.sh's per-verdict-poll re-stamp — see header). Guarded via
+    # `command -v`: during in-process selftest scenarios (run_sweep called
+    # directly, before the script reaches the lock section below in file
+    # order) this function doesn't exist yet and the call is a silent no-op;
+    # in the real script and in the lock-race selftest scenarios (which
+    # invoke a full subprocess) it's already defined by the time run_sweep
+    # executes for real.
+    command -v _pmrw_lock_write_hb >/dev/null 2>&1 && _pmrw_lock_write_hb
     cand_json=$("$BD_BIN" -C "$store" list --json --limit 0 2>/dev/null \
       | jq -c 'if type=="array" then . else [.] end' 2>/dev/null)
     if [ -z "${cand_json:-}" ] || [ "$cand_json" = "null" ]; then
@@ -1009,6 +1018,46 @@ BDSTUB
   grep -q "Recovered STALE/DEAD lock" "$LOG28" 2>/dev/null && ok "scenario 28: reclaim logged" || bad "scenario 28: no reclaim log line"
   rm -rf "$LOCKTEST28"
 
+  # ── Scenario 29 (ga-y0g5x GATE-FEEDBACK, mirror of 28): a lock held by an
+  # ALIVE pid, with a heartbeat mtime backdated PAST PMRW_LOCK_MAX_AGE, must
+  # NOT be reclaimed by a second run — proving reclaim is gated on PID
+  # liveness alone, never on age. This is the exact case the gate reviewer
+  # found unexercised: scenario 28 only proved "dead + fresh mtime →
+  # reclaim"; this proves the missing mirror, "alive + stale mtime → NEVER
+  # reclaim" — the case where the original bug's fix-attempt-1 broke.
+  echo "Scenario 29 (ga-y0g5x GATE-FEEDBACK): lock held by an ALIVE pid with a heartbeat mtime OLDER than MAX_AGE is NEVER reclaimed (age must not override liveness)"
+  reset_stores
+  LOCKTEST29="$TMP/locktest29"; mkdir -p "$LOCKTEST29/tmp"
+  LOCK29_DIR="$LOCKTEST29/tmp/pilot-missing-route-watchdog$(printf '%s' "$HQ" | tr '/ ' '__').lock.d"
+  mkdir -p "$LOCK29_DIR"
+  sleep 30 & ALIVEPID29=$!
+  printf '%s:1\n' "$ALIVEPID29" > "$LOCK29_DIR/heartbeat"
+  OLD29="$(date -v-20M +%Y%m%d%H%M.%S 2>/dev/null || date -d '20 minutes ago' +%Y%m%d%H%M.%S)"
+  touch -t "$OLD29" "$LOCK29_DIR/heartbeat"
+  LOG29="$LOCKTEST29/pmrw.log"; : > "$LOG29"
+  env -i \
+    PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+    HOME="$HOME" \
+    TMPDIR="$LOCKTEST29/tmp" \
+    PMRW_ENABLED=1 PMRW_LOCK_ENABLED=1 PMRW_DRY_RUN=0 \
+    PMRW_LOCK_MAX_AGE=900 \
+    PMRW_TEST_MODE=1 \
+    PMRW_HQ="$HQ" \
+    PMRW_LOG="$LOG29" \
+    PMRW_NOTIFY_BIN="$NOTIFY_BIN" \
+    PMRW_GC_BIN="$GC_BIN" \
+    PMRW_BD_BIN="$BD_BIN" \
+    PMRW_STATE_DIR="$LOCKTEST29/state" \
+    PMRW_STORES="$STORE_A $STORE_B" \
+    PMRW_TEST_FIXTURES_DIR="$PMRW_TEST_FIXTURES_DIR" \
+    PMRW_TEST_RECHECK_DIR="$PMRW_TEST_RECHECK_DIR" \
+    PMRW_TEST_GATEPROBE_DIR="$PMRW_TEST_GATEPROBE_DIR" \
+    bash "$0" >/dev/null 2>&1
+  kill "$ALIVEPID29" 2>/dev/null; wait "$ALIVEPID29" 2>/dev/null
+  grep -qE "OK:|FLAGGED:" "$LOG29" 2>/dev/null && bad "scenario 29: sweep RAN despite a live holder with a stale heartbeat — age wrongly overrode liveness (the exact GATE-FEEDBACK regression)" || ok "scenario 29: sweep did NOT run — live holder protected despite a stale heartbeat"
+  grep -q "backing off (single-instance guard" "$LOG29" 2>/dev/null && ok "scenario 29: second run backed off silently, as required" || bad "scenario 29: no back-off log line — second run may not have deferred correctly"
+  rm -rf "$LOCKTEST29"
+
   echo ""
   echo "pilot-missing-route-watchdog selftest: PASS=$PASS FAIL=$FAIL"
   [ "$FAIL" -eq 0 ] && exit 0 || exit 1
@@ -1036,6 +1085,42 @@ fi
 # pilot-dispatcher.sh/auto-refino-dispatcher.sh does have that window — see
 # ga-byd3u/ga-bong5 — this sentinel variant doesn't need that fix because it
 # never creates the window in the first place).
+#
+# GATE-FEEDBACK FIX (gate_run=ga-wisp-ohox1gs, fix-attempt 1): the first cut
+# of this lock gated reclaim on `age < MAX_AGE && holder alive` — which backs
+# off ONLY when BOTH are true, so an old-but-genuinely-ALIVE holder (a
+# legitimately slow multi-store sweep under sustained Dolt degradation —
+# exactly the condition that caused the original 4-instance incident) fell
+# through to reclaim and got its lock STOLEN, reproducing the double-run bug
+# this fix exists to prevent. Reviewer + Mayor both confirmed: this is a
+# collapsed-OR bug in the same family that dominated this day's other fixes
+# ("faz quanto tempo?" and "ainda existe?" are DIFFERENT questions). Three
+# states, resolved by PID-liveness ALONE — age is NOT a gating input at all:
+#   holder ALIVE   → NEVER reclaim, regardless of heartbeat age. Age doesn't
+#                    kill anyone; only a confirmed-dead PID does.
+#   holder DEAD    → reclaim immediately, regardless of heartbeat age (a
+#                    killed run's lock must not wedge the watchdog forever —
+#                    proven by scenario 28's dead-pid+fresh-mtime case).
+#   liveness UNKNOWN (malformed/empty heartbeat token) → treated as ALIVE by
+#                    _pmrw_lock_holder_dead's own existing safe default →
+#                    never reclaim. The safe direction under doubt: at worst
+#                    the watchdog loses a cycle; stealing a live lock
+#                    corrupts the other run.
+# quality-gate-dispatcher.sh's own age-gated fallback is safe ONLY because its
+# live holder re-stamps the heartbeat every verdict poll, so MAX_AGE is
+# practically unreachable while genuinely progressing — that compensating
+# mechanism was the one piece that did NOT get ported when this lock was
+# first written here, despite the file's own comment claiming an exact
+# mirror. This fix does two things, not one: (1) drops age as a reclaim
+# GATE entirely — liveness is the sole authority — and (2) still adds the
+# heartbeat re-stamp during run_sweep's per-store loop (mirroring the
+# reference file for real this time), so a genuinely-progressing multi-store
+# sweep keeps proving itself roughly once per store rather than only once at
+# acquisition. (2) is defense-in-depth / diagnostic value only — (1) alone
+# already closes the reported hole completely, since a hung single bd call
+# mid-sweep would otherwise let heartbeat age cross MAX_AGE while the holder
+# is still legitimately (if silently) alive, and age must never be fatal to
+# that holder either way.
 #
 # A LIVE holder makes the second run exit 0 SILENTLY — not an error, pure
 # serialization, no comment/notify/mail (the ACEITE requirement: the second
@@ -1098,8 +1183,11 @@ _acquire_pmrw_lock() {
   fi
   local _age
   _age=$(_pmrw_lock_hb_age)
-  if [ "$_age" -lt "$PMRW_LOCK_MAX_AGE" ] && ! _pmrw_lock_holder_dead; then
-    return 1   # fresh heartbeat + live holder → a live run is in progress.
+  # Liveness ALONE gates reclaim — age is never a gating input (see header:
+  # age-OR-dead let an old-but-alive holder get its lock stolen). _age is
+  # still computed/logged below purely for diagnostics.
+  if ! _pmrw_lock_holder_dead; then
+    return 1   # holder is ALIVE (or liveness unreadable, treated as alive by design) → never reclaim, no matter how old the heartbeat is.
   fi
   # An absent/empty heartbeat on an existing dir is a holder caught in the µs
   # window between its mkdir and its hb write (a write-failed acquire tears
@@ -1126,7 +1214,8 @@ _acquire_pmrw_lock() {
   fi
   # Re-check UNDER the sentinel: if the lock turned live while we waited, an
   # earlier reclaimer already took over — back off rather than clobber it.
-  if [ "$(_pmrw_lock_hb_age)" -lt "$PMRW_LOCK_MAX_AGE" ] && ! _pmrw_lock_holder_dead; then
+  # Same liveness-only gate as the initial check above — age plays no part.
+  if ! _pmrw_lock_holder_dead; then
     rmdir "$_reaping" 2>/dev/null || true
     return 1
   fi
