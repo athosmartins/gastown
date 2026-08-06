@@ -1854,6 +1854,17 @@ else
     EXT_SHOW=$(bd -C "$GC_CITY" show "$EXT_ID" --json --include-comments 2>/dev/null \
       | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
 
+    # ga-jto05 self-audit: "no PR ref found" and "couldn't even read the bead"
+    # are different failures with the same downstream action (skip) but a
+    # DIFFERENT cause a human triaging the log needs to see distinctly — a
+    # collapsed "no GitHub PR URL found" message here would itself become the
+    # kind of misleading-comment defect this file's own doctrine warns about
+    # (a log line that stops the next reader from looking further).
+    if [ -z "$EXT_SHOW" ]; then
+      log "GAP-3: $EXT_ID — bd show --include-comments failed or returned unparseable data — safe-skip"
+      continue
+    fi
+
     # Newest-first: if a bead was dispatched more than once (a prior PR
     # abandoned, a fresh one opened later), the most recent comment is the
     # live reference — mirrors GAP-2's own "Sling task bead" extraction
