@@ -3565,9 +3565,37 @@ $PARTIAL_EVIDENCE" 2>/dev/null || true
         # query. Closing is the durable fix for non-story source beads.
         log "Closing source bug/task $BEAD_ID (gate PASS + merged sha=$MERGE_SHA)."
         bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
-        bd -C "$BEAD_CITY" close "$BEAD_ID" \
-          -r "Quality gate PASSED — branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA, gate_run=$GATE_RUN_ID). Closed by autonomous dispatcher (ga-esbg)." \
-          2>/dev/null || warn "Could not close source bead $BEAD_ID"
+        _CLOSE_REASON="Quality gate PASSED — branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA, gate_run=$GATE_RUN_ID). Closed by autonomous dispatcher (ga-esbg)."
+        # ⚠️ O `&& _CLOSE_RC=0 || _CLOSE_RC=$?` NÃO é enfeite: este script roda sob
+        # `set -euo pipefail` (linha 30). Um `_CLOSE_OUT=$(cmd)` cru, com cmd
+        # falhando, mata o dispatcher INTEIRO ali mesmo — e falhar é precisamente o
+        # caso que este bloco existe pra tratar. Dentro de uma lista `&&`/`||` a
+        # atribuição fica isenta do -e.
+        _CLOSE_RC=0
+        _CLOSE_OUT=$(bd -C "$BEAD_CITY" close "$BEAD_ID" -r "$_CLOSE_REASON" 2>&1) || _CLOSE_RC=$?
+        if [ "$_CLOSE_RC" -ne 0 ]; then
+          # ga-esbg / wa-j824s: o motivo NUMERO UM de o close falhar aqui é o bead
+          # estar reivindicado por um worker MORTO. O bd recusa com
+          #   "cannot close X: assignee is <w>, actor is <a>; reclaim or use --force"
+          # e o código antigo apenas emitia warn — deixando um bead JÁ MERGEADO
+          # aberto e re-despachável. A verificação pós-merge logo abaixo detectava
+          # isso e escalava corretamente, mas ninguém CONSERTAVA: a deteção
+          # funcionava e a ação não, então a mesma escalação se repetia.
+          #
+          # Aqui a claim é stale POR DEFINIÇÃO: o branch já está no main. Ninguém
+          # pode estar legitimamente trabalhando num trabalho que já entregou. Então
+          # limpamos o dono e refazemos o close. Uso --force só neste segundo passo,
+          # nunca como primeira tentativa — o caminho normal continua sendo o normal,
+          # e o privilégio extra só entra quando o caminho normal já falhou.
+          warn "  Close de $BEAD_ID falhou: $(printf '%s' "$_CLOSE_OUT" | head -1)"
+          warn "  Tentando destravar: o branch já está mergeado, então a claim é stale."
+          bd -C "$BEAD_CITY" assign "$BEAD_ID" "" --force -q 2>/dev/null || true
+          bd -C "$BEAD_CITY" close "$BEAD_ID" --force \
+            -r "$_CLOSE_REASON Assignee estava travado num worker que não respondia; a claim é stale por definição (o branch já está no main), então liberei e fechei com --force." \
+            2>/dev/null \
+            && log "  Source bead $BEAD_ID fechado após liberar claim stale." \
+            || warn "Could not close source bead $BEAD_ID nem após liberar a claim — vetor de re-pick permanece, ver verificação pós-merge abaixo"
+        fi
       fi
 
       # (3) POST-MERGE VERIFICATION (ga-esbg): assert the source bead no longer
