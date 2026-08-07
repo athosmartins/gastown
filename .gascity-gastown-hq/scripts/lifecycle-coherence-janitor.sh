@@ -632,9 +632,18 @@ run_sweep() {
     # non-implementable, drains — burning pool slots in a loop with zero useful work. Self-heals:
     # any bead carrying one of these labels AND active routing/sling/molecule → clear the routing
     # metadata (open it back up if in_progress), and close the sling/molecule (and its steps).
+    #
+    # ga-rccry (2026-08-06): the refino family used to be matched by a BROAD prefix
+    # (^refino:|^auto-refino:) that also caught bookkeeping/terminal labels never meant to
+    # block implementability — refino:creator-swept (creation-sweep accounting, ~94% of what
+    # the old prefix captured in a live count) and refino:done (refino JUST FINISHED, i.e. the
+    # bead is BY DEFINITION implementable — clearing its route was the bug's most damning
+    # symptom). Fixed by enumerating the labels that actually indicate a blocked refino state
+    # instead of excluding the ones that don't: a denylist silently misclassifies any future
+    # accounting label as blocking; an allowlist defaults new labels to non-blocking.
     local non_imp_beads
     non_imp_beads=$("$BD" -C "$store" list --all --json 2>/dev/null \
-                    | jq -r '.[] | select([.labels[]?] | any(test("^story:epic$|^story:unrefined$|^story:needs-approval$|^story:refino-|^story:refinement-in-progress$|^refino:|^auto-refino:|^gate:needs-human(:.*)?$")) ) | .id' 2>/dev/null)
+                    | jq -r '.[] | select([.labels[]?] | any(test("^story:epic$|^story:unrefined$|^story:needs-approval$|^story:refino-|^story:refinement-in-progress$|^refino:policy-gap$|^refino:info-gap$|^auto-refino:escalated$|^gate:needs-human(:.*)?$")) ) | .id' 2>/dev/null)
     for id in $non_imp_beads; do
       [ -n "$id" ] || continue
       case "$_gate_active" in
@@ -878,15 +887,25 @@ case "\$a" in
   *"show r6-exp"*) echo '[{"id":"r6-exp","labels":["pilot:held","pilot:held-until:1000000"]}]' ;;
   *"show r6-noexp"*) echo '[{"id":"r6-noexp","labels":["pilot:held"]}]' ;;
   # R7 (wa-muesb): historical recurrences + one bead per exclusion label + a valid control
-  *"list --all"*)                               echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}},{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human-bare","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-gate-protect","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"r7-original-target","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  # ga-rccry: t-auto now carries the REAL enumerated blocking label (auto-refino:escalated);
+  # t-auto-generic proves a non-enumerated auto-refino:* label is left alone; t-refino-swept/
+  # t-refino-done prove bookkeeping/terminal refino labels are left alone; t-refino-combo proves
+  # a real blocking label wins over a bookkeeping label on the same bead; t-refino-infogap covers
+  # the third enumerated blocker (refino:info-gap, alongside t-refino's refino:policy-gap).
+  *"list --all"*)                               echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}},{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-infogap","status":"open","labels":["refino:info-gap"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-swept","status":"open","labels":["refino:creator-swept"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-done","status":"open","labels":["refino:done"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-refino-combo","status":"open","labels":["refino:creator-swept","auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto","status":"open","labels":["auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-auto-generic","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-human-bare","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}},{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"wa-gate-protect","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}},{"id":"r7-original-target","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show wa-o4kuh"*)                             echo '[{"id":"wa-o4kuh","status":"open","labels":["story:epic"],"metadata":{"gc.routed_to":"pool","molecule_id":"mol-o4kuh"}}]' ;;
   *"show wa-06yog"*)                             echo '[{"id":"wa-06yog","status":"open","labels":["story:needs-approval"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show wa-8yw4i.1"*)                           echo '[{"id":"wa-8yw4i.1","status":"in_progress","assignee":"mila-wa","labels":["story:refino-escalado"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-mayor-assigned"*)                     echo '[{"id":"t-mayor-assigned","status":"in_progress","assignee":"mayor","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-unrefined"*)                          echo '[{"id":"t-unrefined","status":"open","labels":["story:unrefined"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-refinement"*)                         echo '[{"id":"t-refinement","status":"open","labels":["story:refinement-in-progress"],"metadata":{"gc.routed_to":"pool"}}]' ;;
-  *"show t-refino"*)                             echo '[{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}}]' ;;
-  *"show t-auto"*)                               echo '[{"id":"t-auto","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"show t-refino "*)                            echo '[{"id":"t-refino","status":"open","labels":["refino:policy-gap"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"show t-refino-infogap"*)                     echo '[{"id":"t-refino-infogap","status":"open","labels":["refino:info-gap"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"show t-refino-swept"*)                       echo '[{"id":"t-refino-swept","status":"open","labels":["refino:creator-swept"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"show t-refino-done"*)                        echo '[{"id":"t-refino-done","status":"open","labels":["refino:done"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"show t-refino-combo"*)                       echo '[{"id":"t-refino-combo","status":"open","labels":["refino:creator-swept","auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"show t-auto "*)                              echo '[{"id":"t-auto","status":"open","labels":["auto-refino:escalated"],"metadata":{"gc.routed_to":"pool"}}]' ;;
+  *"show t-auto-generic"*)                       echo '[{"id":"t-auto-generic","status":"open","labels":["auto-refino:foo"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-human "*)                             echo '[{"id":"t-human","status":"open","labels":["gate:needs-human:bar"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-human-bare"*)                         echo '[{"id":"t-human-bare","status":"open","labels":["gate:needs-human"],"metadata":{"gc.routed_to":"pool"}}]' ;;
   *"show t-valid"*)                              echo '[{"id":"t-valid","status":"in_progress","labels":["story:in-flight"],"metadata":{"gc.routed_to":"pool"}}]' ;;
@@ -1085,10 +1104,19 @@ GITSHIM
   grep -q 'update t-unrefined --unset-metadata gc.routed_to' "$ACT" && ok "R7: unset gc.routed_to on story:unrefined" || bad "R7 did not unset gc.routed_to on t-unrefined"
   grep -q 'update t-refinement --unset-metadata gc.routed_to' "$ACT" && ok "R7: unset gc.routed_to on story:refinement-in-progress" || bad "R7 did not unset gc.routed_to on t-refinement"
   grep -q 'update t-refino --unset-metadata gc.routed_to' "$ACT" && ok "R7: unset gc.routed_to on refino:policy-gap" || bad "R7 did not unset gc.routed_to on t-refino"
-  grep -q 'update t-auto --unset-metadata gc.routed_to' "$ACT" && ok "R7: unset gc.routed_to on auto-refino:foo" || bad "R7 did not unset gc.routed_to on t-auto"
+  grep -q 'update t-refino-infogap --unset-metadata gc.routed_to' "$ACT" && ok "R7 (ga-rccry): unset gc.routed_to on refino:info-gap" || bad "R7 (ga-rccry) did not unset gc.routed_to on t-refino-infogap"
+  grep -q 'update t-auto --unset-metadata gc.routed_to' "$ACT" && ok "R7 (ga-rccry): unset gc.routed_to on auto-refino:escalated" || bad "R7 (ga-rccry) did not unset gc.routed_to on t-auto (auto-refino:escalated)"
   grep -q 'update t-human --unset-metadata gc.routed_to' "$ACT" && ok "R7: unset gc.routed_to on gate:needs-human:bar" || bad "R7 did not unset gc.routed_to on t-human"
   grep -q 'update t-human-bare --unset-metadata gc.routed_to' "$ACT" && ok "R7 (gate_run=ga-wisp-05leh8 fix): unset gc.routed_to on BARE gate:needs-human" || bad "R7 did not unset gc.routed_to on t-human-bare (bare-label trigger still broken)"
   grep -q 't-valid' "$ACT" && bad "R7: modified a valid in-flight bead (t-valid)" || ok "R7 left valid bead t-valid alone"
+  # ga-rccry: refino:creator-swept and refino:done are bookkeeping/terminal, not blocking —
+  # must be left alone. auto-refino:foo is a non-enumerated auto-refino:* label — also left
+  # alone (allowlist, not denylist). t-refino-combo carries creator-swept (bookkeeping) AND
+  # escalated (real block) on the SAME bead — the real state must still win.
+  grep -q 't-refino-swept' "$ACT" && bad "R7 (ga-rccry) over-broad: touched t-refino-swept (refino:creator-swept is bookkeeping, not blocking)" || ok "R7 (ga-rccry): left t-refino-swept alone (refino:creator-swept is bookkeeping, not blocking)"
+  grep -q 't-refino-done' "$ACT" && bad "R7 (ga-rccry) over-broad: touched t-refino-done (refino:done means the bead is IMPLEMENTABLE — the bug's most damning false positive)" || ok "R7 (ga-rccry): left t-refino-done alone (refino:done means implementable)"
+  grep -q 't-auto-generic' "$ACT" && bad "R7 (ga-rccry) over-broad: touched t-auto-generic (auto-refino:foo is not an enumerated blocking state)" || ok "R7 (ga-rccry): left t-auto-generic alone (non-enumerated auto-refino:* label is not blocking)"
+  grep -q 'update t-refino-combo --unset-metadata gc.routed_to' "$ACT" && ok "R7 (ga-rccry): real blocking label (auto-refino:escalated) wins over bookkeeping label (refino:creator-swept) on the same bead" || bad "R7 (ga-rccry) did not unset gc.routed_to on t-refino-combo — blocking label should win over bookkeeping label"
 
   # R8 (ga-ipm4): park+arm invariant — a parked bead (needs-human/pool:refused:*/
   # story:blocked) must never keep exec:auto/ctx:ready. Reproduced live on ga-66wc.
