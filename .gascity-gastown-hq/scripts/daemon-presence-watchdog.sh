@@ -357,12 +357,45 @@ _ledger_touch() {
   command -v gc_ledger_append >/dev/null 2>&1 && gc_ledger_append "dpw" "$*" 2>/dev/null || true
 }
 
+# ── ga-95bi4: generic mail cooldown — gates `gc mail send` ONLY ──────────────
+# Measured incident: one persisting condition re-mailed the SAME subject every
+# 5-min sweep for hours (194x "critical daemon absent/crash-looping..." alone),
+# making mail wisps (issue_type=message, never archived) the single hottest
+# hq.wisps query working-set and a real Dolt CPU contributor. Generalizes the
+# per-label cooldown ga-4l2sn already proved out for PRESENCE-DRIFT (see
+# _pd_last_get/_pd_last_set below) into a reusable keyed cooldown so callers
+# added later don't reinvent the state-file bookkeeping.
+# Deliberately gates mail ONLY — ntfy (no Dolt cost, Athos still wants the
+# phone buzz) and the log (always full detail) stay unthrottled every sweep.
+DPW_ALERT_WINDOW_SEC="${DPW_ALERT_WINDOW_SEC:-14400}"
+_alert_cd_file() { echo "${STATE}.alert-cooldown/$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"; }
+_alert_cd_ok() {
+  local key="$1" now="$2" f last
+  f="$(_alert_cd_file "$key")"
+  last="$([ -f "$f" ] && cat "$f" 2>/dev/null || echo 0)"
+  if [ -n "$last" ] && [ "$last" -gt 0 ] 2>/dev/null && [ $(( now - last )) -lt "$DPW_ALERT_WINDOW_SEC" ] 2>/dev/null; then
+    return 1
+  fi
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\n' "$now" > "$f" 2>/dev/null || true
+  return 0
+}
+
 # ── imp05: alert helper (ntfy primary, gc mail secondary, ledger best-effort) ─
+# 3rd arg (optional, any non-empty value): skip the cooldown gate below —
+# for a caller (presence-drift) that already deduped more precisely upstream
+# (per-label, not per-subject); double-gating on top of that would let this
+# coarser subject-level window mask a DIFFERENT label's already-warranted
+# alert just because some other label used the same subject recently.
 _alert() {
-  local subject="$1" msg="$2"
+  local subject="$1" msg="$2" skip_cd="${3:-}"
   log "ALERT $subject — $msg"
   command -v notify >/dev/null 2>&1 && notify -t "Daemon watchdog: $subject" -p 4 "$msg" 2>/dev/null || true
-  command -v gc >/dev/null 2>&1 && gc mail send mayor -s "Daemon-presence: $subject" -m "$msg" 2>/dev/null || true
+  if [ -n "$skip_cd" ] || _alert_cd_ok "$subject" "$(date +%s)"; then
+    command -v gc >/dev/null 2>&1 && gc mail send mayor -s "Daemon-presence: $subject" -m "$msg" 2>/dev/null || true
+  else
+    log "ALERT-SUPPRESSED (mail, within ${DPW_ALERT_WINDOW_SEC}s cooldown): $subject"
+  fi
   _ledger_touch "$subject" "$msg"
 }
 
@@ -548,7 +581,11 @@ run_presence_drift_sweep() {
   if [ -n "$alerted" ]; then
     local msg="Daemon-presence watchdog: PRESENCE-DRIFT —${alerted} (each shown with its SOURCE directory — versioned source under scripts/ or packs/town-deltas/assets/, NOT the deployed ~/Library/LaunchAgents copy — found there but NOT loaded in launchd: never bootstrapped, or fell out silently — ga-u04vp)."
     log "ALERT $msg"
-    _alert "presence-drift (undeployed plist)" "$msg"
+    # skip_cd=1: this label already passed its OWN per-label cooldown check
+    # above (DPW_PRESENCE_DRIFT_COOLDOWN_SEC, ga-4l2sn) — the generic per-
+    # subject cooldown in _alert would otherwise mask a DIFFERENT label's
+    # already-warranted alert (ga-95bi4).
+    _alert "presence-drift (undeployed plist)" "$msg" 1
   fi
   if [ -n "$undeployed" ]; then
     return 1
@@ -749,7 +786,28 @@ run_sweep() {
     [ -n "$path_missing" ] && msg="$msg PATH-MISSING:${path_missing} (ProgramArguments script absent from disk — daemon will fail on restart)."
     log "ALERT $msg"
     command -v notify >/dev/null 2>&1 && notify -t "Daemon watchdog" -p 4 "$msg" 2>/dev/null || true
-    command -v gc >/dev/null 2>&1 && gc mail send mayor -s "Daemon-presence: critical daemon absent/crash-looping/failing/wedged/path-missing" -m "$msg" 2>/dev/null || true
+    # ga-95bi4: this was the dominant offender (194 identical mails measured in
+    # one incident) — subject text is a FIXED constant regardless of which
+    # daemon(s) triggered it, so it mailed unconditionally every 5-min sweep
+    # for as long as ANY condition persisted. Cooldown key = which of the 6
+    # buckets are firing (not raw $msg — its embedded counters like
+    # sweeps=N/stale=Ns change every round even for the exact same ongoing
+    # incident, which would defeat a content-hash key and never suppress
+    # anything). A genuinely new failure SHAPE (e.g. WEDGED escalating to also
+    # CRASH-LOOP) re-mails immediately; the same shape persisting is throttled
+    # to once per DPW_ALERT_WINDOW_SEC. ntfy + log stay unthrottled above.
+    local _shape=""
+    [ -n "$absent" ]       && _shape="${_shape}A"
+    [ -n "$crashloop" ]    && _shape="${_shape}C"
+    [ -n "$failing" ]      && _shape="${_shape}F"
+    [ -n "$oom_killed" ]   && _shape="${_shape}O"
+    [ -n "$wedged" ]       && _shape="${_shape}W"
+    [ -n "$path_missing" ] && _shape="${_shape}P"
+    if _alert_cd_ok "sweep-shape-$_shape" "$NOW"; then
+      command -v gc >/dev/null 2>&1 && gc mail send mayor -s "Daemon-presence: critical daemon absent/crash-looping/failing/wedged/path-missing" -m "$msg" 2>/dev/null || true
+    else
+      log "ALERT-SUPPRESSED (mail, failure shape [$_shape] within ${DPW_ALERT_WINDOW_SEC}s cooldown)"
+    fi
     _ledger_touch "sweep-alert" "$msg"
     return 1
   fi
@@ -795,6 +853,14 @@ STUB
   # already ran at load, so setting DPW_LAUNCH_DIR now would be too late.
   LAUNCH_DIR="$TMP/agents"; mkdir -p "$LAUNCH_DIR"
   LOG="$TMP/log"; STATE="$TMP/state"
+  # ga-95bi4: STATE (and so ${STATE}.alert-cooldown/) is set ONCE for the whole
+  # selftest run, not per-scenario — a nonzero window would let one scenario's
+  # failure SHAPE (e.g. crash-loop → "C") silently suppress an unrelated LATER
+  # scenario sharing the same shape, since real wall-clock barely advances across
+  # the whole suite. Disable the gate by default so every pre-existing scenario
+  # keeps its original always-mails behavior; the dedicated ga-95bi4 scenarios
+  # near the end of this suite opt a nonzero window back in locally.
+  DPW_ALERT_WINDOW_SEC=0
   DPW_CRITICAL="com.gascity.alpha com.gascity.beta com.gascity.gamma"
   export DPW_TEST_BOOTSTRAPS="$TMP/bootstraps"; : > "$DPW_TEST_BOOTSTRAPS"
   export DPW_TEST_KICKSTARTS="$TMP/kicks";      : > "$DPW_TEST_KICKSTARTS"
@@ -1389,6 +1455,76 @@ GCSTUB31
   run_presence_drift_sweep >/dev/null 2>&1
   [ -s "$MAILSENT31" ] && ok "same label drifts again post-recovery: alerts fresh (no inherited cooldown)" || bad "same label post-recovery: unexpectedly suppressed"
   unset DPW_TEST_NOW
+
+  # ── ga-95bi4 selftest scenarios 34–38 ────────────────────────────────────
+  # The acceptance bar from the bug report itself: running the watchdog N times
+  # with the condition PERSISTING must produce 1 mail, not N — and the exact
+  # test is running it twice in a row with the condition still true and
+  # confirming the second call sent no new mail.
+  DPW_CHECK_GC_PROVENANCE=0; DPW_CHECK_GT_PROVENANCE=0
+
+  echo "Scenario 34 (ga-95bi4): persisting ABSENT condition — 2 sweeps mail ONCE, not every sweep"
+  : > "$LOG"; rm -rf "${STATE}.alert-cooldown"; : > "$STATE"
+  _fail_count_reset com.gascity.alpha; _cl_heal_reset com.gascity.alpha
+  DPW_ALERT_WINDOW_SEC=3600
+  DPW_CRASHLOOP_AUTOHEAL=0
+  DPW_TEST_LOADED="com.gascity.alpha com.gascity.gamma"; DPW_TEST_EXIT=""   # beta absent
+  : > "$DPW_TEST_BOOTSTRAPS"
+  MAILSENT34="$TMP/mailsent34"; : > "$MAILSENT34"
+  cat > "$TMP/gc" <<GCSTUB34
+#!/usr/bin/env bash
+[ "\$1" = "mail" ] && echo "\$*" >> "$MAILSENT34"
+exit 0
+GCSTUB34
+  chmod +x "$TMP/gc"
+  run_sweep >/dev/null 2>&1
+  [ -s "$MAILSENT34" ] && ok "1st sweep with beta ABSENT: mail sent" || bad "1st sweep with beta ABSENT: expected mail, none sent"
+  : > "$MAILSENT34"
+  run_sweep >/dev/null 2>&1   # beta still absent (bootstrap stub never changes DPW_TEST_LOADED) — identical failure shape
+  [ ! -s "$MAILSENT34" ] && ok "2nd sweep, same persisting ABSENT: mail suppressed (ga-95bi4 fix — was the 194x-mail bug)" || bad "2nd sweep: mail wrongly re-sent for the exact same persisting condition"
+  grep -q "ALERT-SUPPRESSED (mail, failure shape" "$LOG" && ok "2nd sweep: suppression logged with the failure shape" || bad "2nd sweep: missing shape-suppression log line"
+
+  echo "Scenario 35 (ga-95bi4): ABSENT cooldown EXPIRES → re-alerts"
+  : > "$MAILSENT34"
+  printf '%s\n' "$(( $(date +%s) - DPW_ALERT_WINDOW_SEC - 1 ))" > "$(_alert_cd_file "sweep-shape-A")"
+  run_sweep >/dev/null 2>&1
+  [ -s "$MAILSENT34" ] && ok "sweep after cooldown expiry: re-alerts (mail sent)" || bad "sweep after cooldown expiry: expected fresh mail"
+
+  echo "Scenario 36 (ga-95bi4): a NEW failure shape (escalation) re-mails immediately, even while the OLD shape is still cooling down"
+  : > "$MAILSENT34"
+  DPW_TEST_EXIT="com.gascity.alpha:1"
+  run_sweep >/dev/null 2>&1   # 1st nonzero exit for alpha: not yet 2 consecutive, so shape is still "A"-only (beta absent) — still cooling down from scenario 35
+  [ ! -s "$MAILSENT34" ] && ok "priming sweep (shape still A-only): mail correctly still suppressed" || bad "priming sweep: mail unexpectedly sent"
+  : > "$MAILSENT34"
+  run_sweep >/dev/null 2>&1   # 2nd consecutive nonzero exit for alpha → crash-loop bucket now also fires → shape becomes "AC", a brand-new key
+  [ -s "$MAILSENT34" ] && ok "escalation to a NEW failure shape (AC) mails immediately despite the A-only shape still cooling down" || bad "escalation to a new failure shape was wrongly suppressed"
+  grep -q "CRASH-LOOP" "$MAILSENT34" && ok "escalation mail body includes the new CRASH-LOOP bucket" || bad "escalation mail body missing CRASH-LOOP bucket"
+  unset DPW_TEST_EXIT
+  DPW_ALERT_WINDOW_SEC=0; DPW_CRASHLOOP_AUTOHEAL=1
+  _fail_count_reset com.gascity.alpha; _cl_heal_reset com.gascity.alpha
+
+  echo "Scenario 37 (ga-95bi4): _alert() cooldown — a 2nd identical provenance failure within the window does not re-mail"
+  : > "$LOG"; rm -rf "${STATE}.alert-cooldown"
+  DPW_ALERT_WINDOW_SEC=3600
+  MAILSENT37="$TMP/mailsent37"; : > "$MAILSENT37"
+  cat > "$TMP/gc" <<GCSTUB37
+#!/usr/bin/env bash
+[ "\$1" = "mail" ] && echo "\$*" >> "$MAILSENT37"
+exit 0
+GCSTUB37
+  chmod +x "$TMP/gc"
+  _alert "gc binary provenance" "first detection"
+  [ -s "$MAILSENT37" ] && ok "_alert 1st call: mail sent" || bad "_alert 1st call: expected mail, none sent"
+  : > "$MAILSENT37"
+  _alert "gc binary provenance" "still absent next sweep"
+  [ ! -s "$MAILSENT37" ] && ok "_alert 2nd call, same subject within window: mail suppressed" || bad "_alert 2nd call: mail wrongly re-sent"
+  grep -q "ALERT-SUPPRESSED (mail, within" "$LOG" && ok "_alert 2nd call: suppression logged" || bad "_alert 2nd call: missing suppression log line"
+
+  echo "Scenario 38 (ga-95bi4): _alert() skip_cd 3rd-arg bypasses the cooldown (presence-drift already deduped upstream, ga-4l2sn)"
+  : > "$MAILSENT37"
+  _alert "gc binary provenance" "still absent, caller opts out of the generic gate" 1
+  [ -s "$MAILSENT37" ] && ok "_alert with skip_cd=1: mail sent despite same subject still within window" || bad "_alert with skip_cd=1: wrongly suppressed"
+  DPW_ALERT_WINDOW_SEC=0
 
   echo ""
   echo "daemon-presence-watchdog selftest: PASS=$PASS FAIL=$FAIL"
