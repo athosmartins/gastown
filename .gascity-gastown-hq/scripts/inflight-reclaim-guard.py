@@ -2072,6 +2072,50 @@ def _promote_refusal_labels(bead_id, labels, refusal_count, rig_root=None, bridg
     return new_refusal_count, fresh_slugs, all_slugs
 
 
+def _remove_label_verified(bd_prefix, bead_id, label, attempts=4, delay_secs=1.0):
+    """Remove `label` from `bead_id` and confirm via read-back that it is
+    actually gone, retrying on failure (ga-jzye0; mirrors the read-back +
+    retry-x4 pattern quality-gate-dispatcher.sh already uses for verified
+    assignee writes — assign_verdict_bead_verified).
+
+    Verification reads the CURRENT label set off the bead, not the remove
+    command's own returncode: a `bd label remove` can report success on a
+    race (label already gone) or failure on a transient Dolt hiccup that
+    landed anyway — the only fact that matters is whether the label is
+    present NOW, not what the command claimed.
+
+    Returns True once a read-back confirms the label is absent (including if
+    it was already absent — the label-remove call is then simply skipped by
+    the caller, which only invokes this when the label was in the last-known
+    label set). Returns False if, after `attempts` tries, a read-back still
+    shows the label present or is itself unreadable — fail toward "could not
+    confirm", so a caller never proceeds to clear ownership on the strength
+    of an unverified label removal.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            subprocess.run(bd_prefix + ["label", "remove", bead_id, label, "-q"],
+                            capture_output=True, text=True, timeout=15)
+        except Exception as exc:
+            print(f"[INFLIGHT-RECLAIM] warn: label remove {label} on {bead_id} "
+                  f"attempt {attempt}/{attempts}: {exc}", flush=True)
+        try:
+            r = subprocess.run(bd_prefix + ["show", bead_id, "--json"],
+                                capture_output=True, text=True, timeout=15)
+            data = json.loads(r.stdout)
+            bead = data[0] if isinstance(data, list) else data
+            current_labels = bead.get("labels") or []
+        except Exception as exc:
+            print(f"[INFLIGHT-RECLAIM] warn: read-back verify {label} on {bead_id} "
+                  f"attempt {attempt}/{attempts}: {exc}", flush=True)
+            current_labels = None
+        if current_labels is not None and label not in current_labels:
+            return True
+        if attempt < attempts:
+            time.sleep(delay_secs)
+    return False
+
+
 def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=None,
                 has_explicit_refusal=False, refusal_count=0, bridge_sources=None):
     """Strip story:in-flight (+pilot:dispatched if present), clear assignee,
@@ -2091,6 +2135,23 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     refusal-triggered reclaim is still a reclaim (MAX_RECLAIMS stays a valid
     backstop) — refusal_count just ALSO feeds the faster
     REFUSAL_ESCALATE_THRESHOLD circuit-breaker in reclaim_decision.
+
+    ga-jzye0: label removal (step 1) is now verified-with-retry, and this
+    function returns False WITHOUT touching assignee/status/reclaim-count if
+    it cannot confirm removal. Previously each label-remove was a single
+    unverified attempt; a transient Dolt hiccup hitting JUST that call (while
+    the separate assignee-clear/status-open/reclaim-count-bump calls below
+    still succeeded) left a bead with assignee cleared, status=open,
+    pilot:reclaim-count bumped — YET story:in-flight/pilot:dispatched still
+    attached. That combination is invisible to re-dispatch (still reads
+    in-flight) AND invisible to every dead-worker/lane-occupancy check
+    (they only evaluate a NON-EMPTY assignee; an empty one is deliberately
+    treated as an unresolved leg -> keep). Confirmed live: wa-zly4n sat in
+    exactly this state — pilot:reclaim-count:1, assignee cleared,
+    story:in-flight still present — hours after the reclaim that produced it.
+    Aborting before assignee/status are touched means a failed reclaim now
+    leaves the bead exactly as it was (still reads in-flight+assigned, safe,
+    retried next sweep) instead of half-done.
 
     Returns True if all bd ops succeeded, False if any failed (still best-effort).
     """
@@ -2113,20 +2174,18 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     # 1. Remove lifecycle labels that are actually present. ga-7m191:
     #    pilot:dispatched may be absent (stripped by a partial prior reclaim);
     #    skipping it avoids a spurious RECLAIM-FAILED on a successful reclaim.
+    #    ga-jzye0: verified-with-retry (see _remove_label_verified) — abort
+    #    HERE, before assignee/status/reclaim-count are touched, if a label
+    #    still can't be confirmed gone. Never leave in-flight labels and
+    #    cleared ownership out of sync.
     for lbl in ("story:in-flight", "pilot:dispatched"):
         if lbl not in labels:
             continue
-        try:
-            r = subprocess.run(
-                _bd + ["label", "remove", bead_id, lbl, "-q"],
-                capture_output=True, text=True, timeout=15)
-            if r.returncode != 0:
-                print(f"[INFLIGHT-RECLAIM] warn: remove {lbl} from {bead_id} rc={r.returncode}",
-                      flush=True)
-                ok = False
-        except Exception as exc:
-            print(f"[INFLIGHT-RECLAIM] warn: remove {lbl} from {bead_id}: {exc}", flush=True)
-            ok = False
+        if not _remove_label_verified(_bd, bead_id, lbl):
+            print(f"[INFLIGHT-RECLAIM] warn: could not confirm removal of {lbl} from "
+                  f"{bead_id} after retries — aborting this reclaim before assignee/status "
+                  f"are touched (ga-jzye0); will retry next sweep", flush=True)
+            return False
 
     # 1b. ga-be4x: consume the ephemeral refusal marker(s) and fold each reason
     #     into a PERMANENT audit label, via the helper shared with do_escalate()
