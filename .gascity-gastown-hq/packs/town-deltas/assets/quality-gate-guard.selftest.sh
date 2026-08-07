@@ -65,7 +65,7 @@ r=$(dedup_gaterun_action 3 1); [ "$r" = "keep" ] && ok "3-member group, this IS 
 r=$(dedup_gaterun_action abc 0); [ "$r" = "keep" ] && ok "non-numeric group_count → keep (fail-safe, never guess)" || bad "non-numeric group_count got '$r'"
 r=$(dedup_gaterun_action '' 0);  [ "$r" = "keep" ] && ok "empty group_count → keep (fail-safe)" || bad "empty group_count got '$r'"
 
-# ── classify_parent_gap2 <dispatched> <live_assignee> <sling_found> <sling_needs_fix> <sling_closed> ─
+# ── classify_parent_gap2 <dispatched> <live_assignee> <sling_found> <sling_needs_fix> <sling_closed> [sling_refused] ─
 echo "classify_parent_gap2: dispatch/assignee/sling routing"
 r=$(classify_parent_gap2 1 0 1 1 0); [ "$r" = "free:fail-stranded" ] && ok "sling gate-failed → free:fail-stranded" || bad "sling-failed got '$r'"
 r=$(classify_parent_gap2 1 0 1 0 1); [ "$r" = "free:pass-stranded" ] && ok "sling gate-passed+closed → free:pass-stranded" || bad "sling-passed got '$r'"
@@ -73,6 +73,39 @@ r=$(classify_parent_gap2 0 0 1 0 1); [ "$r" = "skip:not-dispatched" ] && ok "not
 r=$(classify_parent_gap2 1 1 1 0 1); [ "$r" = "skip:live-assignee" ] && ok "live assignee → skip:live-assignee (never race a live builder)" || bad "live-assignee got '$r'"
 r=$(classify_parent_gap2 1 0 0 0 0); [ "$r" = "skip:no-sling" ] && ok "no 'Sling task bead' comment found → skip:no-sling" || bad "no-sling got '$r'"
 r=$(classify_parent_gap2 1 0 1 0 0); [ "$r" = "skip:active-sling" ] && ok "sling still open/active → skip:active-sling" || bad "active-sling got '$r'"
+# ga-eu75w: every line above omits the 6th arg entirely (the pre-existing 5-arg
+# call shape) — this whole block passing unchanged IS the backward-compat proof
+# that sling_refused defaults to 0 and reproduces the exact old routing.
+
+# ── classify_parent_gap2 sling_refused (ga-eu75w: a refusal ≠ a gate-pass) ───
+# Bug: "sling closed + no gate:needs-fix" used to be read as "gate-passed",
+# silently conflating an explicit pool:refused[:reason] worker refusal (which
+# never reached a gate review at all) with a genuine pass. The observed
+# consequence: parents re-armed with gate:needs-fix/gate:needs-remerge with no
+# branch and no gate-run anywhere, which gate-orphaned-label-watchdog.sh then
+# flagged every cycle forever (ga-1ztxb, ga-6bghe, ga-aw0db/ga-avvu2, one night).
+echo "classify_parent_gap2: sling_refused must not be read as gate-passed"
+r=$(classify_parent_gap2 1 0 1 0 1 1); [ "$r" = "free:refused-stranded" ] && ok "sling closed via refusal → free:refused-stranded (NOT free:pass-stranded)" || bad "refused-closed got '$r'"
+r=$(classify_parent_gap2 1 0 1 0 1 0); [ "$r" = "free:pass-stranded" ] && ok "sling closed, explicitly NOT refused → free:pass-stranded unchanged" || bad "explicit-not-refused got '$r'"
+r=$(classify_parent_gap2 1 0 1 0 0 1); [ "$r" = "skip:active-sling" ] && ok "refused but sling still OPEN (not closed) → skip:active-sling (inflight-reclaim-guard.py owns that in-flight window, not GAP-2)" || bad "refused-but-open got '$r'"
+r=$(classify_parent_gap2 1 0 1 1 0 1); [ "$r" = "free:fail-stranded" ] && ok "ga-eu75w ACCEPTANCE CRITERION: a genuine gate-FAIL beats a coincidental refused signal — never swallow a real rejection" || bad "fail-beats-refused got '$r'"
+r=$(classify_parent_gap2 1 0 1 1 1 1); [ "$r" = "free:fail-stranded" ] && ok "gate-failed AND closed AND refused-token all present → still free:fail-stranded (fail wins regardless)" || bad "fail-wins-all got '$r'"
+r=$(classify_parent_gap2 1 1 1 0 1 1); [ "$r" = "skip:live-assignee" ] && ok "live assignee still short-circuits even with a refused sling" || bad "live-assignee-with-refused got '$r'"
+
+# ── gap2_refused_token <sling_labels> <parent_labels> <sling_close_reason> — ga-eu75w ─
+# Three-tier scan, priority order, because the real refusal location varies:
+# documented ps-worker/wa-worker path labels the SLING; the ga-1ztxb/ga-0hela
+# live incident instead labeled the PARENT and left the reason only in the
+# sling's own close_reason text (confirmed: ga-0hela's real labels were just
+# ["ctx:ready","exec:auto"] — no pool:refused anywhere on the sling itself).
+echo "gap2_refused_token: three-tier detection (sling label > parent label > close_reason text)"
+r=$(gap2_refused_token "pool:refused:engine-rebuild-required" "" ""); [ "$r" = "pool:refused:engine-rebuild-required" ] && ok "sling's own label (documented path) → found" || bad "sling-label got '$r'"
+r=$(gap2_refused_token "ctx:ready exec:auto" "pool:refused:engine-rebuild-required" ""); [ "$r" = "pool:refused:engine-rebuild-required" ] && ok "parent's own label (ga-1ztxb precedent: sling carries no pool:refused label at all) → found" || bad "parent-label got '$r'"
+r=$(gap2_refused_token "ctx:ready exec:auto" "framework:observability lane:small" "pool:refused:engine-rebuild-required — see comment + label on target bead ga-1ztxb."); [ "$r" = "pool:refused:engine-rebuild-required" ] && ok "close_reason text only (real ga-0hela shape: neither sling nor parent labeled yet) → found" || bad "close-reason got '$r'"
+r=$(gap2_refused_token "pool:refused" "" ""); [ "$r" = "pool:refused" ] && ok "bare pool:refused (no reason suffix) is a valid complete match" || bad "bare-refused got '$r'"
+r=$(gap2_refused_token "pool:refused:sling-reason" "pool:refused:parent-reason" ""); [ "$r" = "pool:refused:sling-reason" ] && ok "sling label wins over parent label when both present (documented source takes priority)" || bad "priority-order got '$r'"
+r=$(gap2_refused_token "gate:needs-fix" "story:in-flight pilot:dispatched" "gate-failed, see review comments"); [ "$r" = "" ] && ok "no pool:refused anywhere → empty (this is the pass/fail-stranded case, not refused)" || bad "no-match got '$r'"
+r=$(gap2_refused_token "" "" ""); [ "$r" = "" ] && ok "all-empty inputs → empty, no crash" || bad "all-empty got '$r'"
 
 # ── classify_gap2_bugtask_verdict <merge_verified> <has_untracked_marker> — ga-6ync4: sling-passed ≠ parent-fix-merged ─
 echo "classify_gap2_bugtask_verdict: a passed+closed sling must NOT alone close the parent"

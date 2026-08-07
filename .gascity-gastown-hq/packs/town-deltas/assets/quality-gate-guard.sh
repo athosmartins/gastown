@@ -317,20 +317,35 @@ guard_content_merged() {
   [ "$n" = "0" ]
 }
 
-# classify_parent_gap2 <has_pilot_dispatched> <has_live_assignee> <sling_found> <sling_needs_fix> <sling_closed>
+# classify_parent_gap2 <has_pilot_dispatched> <has_live_assignee> <sling_found> <sling_needs_fix> <sling_closed> [sling_refused]
 # Pure decision for ga-pa36 GAP-2: parent story/bug retains story:in-flight after
 # the gate ran on a sling/work bead (Pilot-dispatched path) and that bead is terminal.
 # sling_needs_fix: 1 if sling bead has gate:needs-fix or gate:needs-human (gate FAILED).
 # sling_closed:    1 if sling bead is closed (gate PASSED, work done).
-# Returns: free:fail-stranded | free:pass-stranded | skip:not-dispatched | skip:live-assignee | skip:no-sling | skip:active-sling
+# sling_refused (ga-eu75w, optional, defaults to 0 — old 5-arg callers unchanged):
+#   1 if the sling carries an explicit pool:refused[:reason] signal (on the sling
+#   itself, bridged from the parent's own labels, or only in the sling's
+#   close_reason text — see gap2_refused_token). A refusal means the builder
+#   declared the work out of scope and drained BEFORE any gate review ran, so
+#   the sling was never actually "gate-passed" — the OLD bug read "closed + no
+#   needs-fix" as proof of a pass, silently conflating an explicit refusal with
+#   a real review outcome. Checked only AFTER sling_needs_fix (a genuine gate
+#   failure always wins — never swallow a real rejection, even if something
+#   else mistakenly also stamped pool:refused on the same bead) and only once
+#   the sling has actually closed — a refusal on a still-open/in_progress sling
+#   is left to inflight-reclaim-guard.py (list_refused_sling_source_beads /
+#   _promote_refusal_labels), which already owns that in-flight window; GAP-2
+#   only cleans up once the sling has terminated.
+# Returns: free:fail-stranded | free:refused-stranded | free:pass-stranded | skip:not-dispatched | skip:live-assignee | skip:no-sling | skip:active-sling
 classify_parent_gap2() {
-  local has_pilot_dispatched="$1" has_live_assignee="$2" sling_found="$3" sling_needs_fix="$4" sling_closed="$5"
+  local has_pilot_dispatched="$1" has_live_assignee="$2" sling_found="$3" sling_needs_fix="$4" sling_closed="$5" sling_refused="${6:-0}"
   [ "$has_pilot_dispatched" != "1" ] && { echo "skip:not-dispatched"; return; }
   [ "$has_live_assignee" = "1" ]     && { echo "skip:live-assignee"; return; }
   [ "$sling_found" != "1" ]          && { echo "skip:no-sling"; return; }
   [ "$sling_needs_fix" = "1" ]       && { echo "free:fail-stranded"; return; }
-  [ "$sling_closed" = "1" ]          && { echo "free:pass-stranded"; return; }
-  echo "skip:active-sling"
+  [ "$sling_closed" != "1" ]         && { echo "skip:active-sling"; return; }
+  [ "$sling_refused" = "1" ]         && { echo "free:refused-stranded"; return; }
+  echo "free:pass-stranded"
 }
 
 # classify_gap2_bugtask_verdict <merge_verified> <has_untracked_marker> [has_active_marker]
@@ -461,6 +476,67 @@ gap2_marker_for_bead() {
     ) |
     "\(.id) \((.labels // []) | map(select(startswith("gate-status:"))) | .[0] // "gate-status:unknown" | sub("^gate-status:"; ""))"
   ' 2>/dev/null | head -1
+}
+
+# gap2_refused_token <sling_labels> <parent_labels> <sling_close_reason> — pure
+# text scan (ga-eu75w). A worker refusing pool-ineligible work (e.g. a fix that
+# needs an engine rebuild) stamps pool:refused[:<reason-slug>] somewhere before
+# the sling terminates — but WHERE varies by observed precedent, not a single
+# documented contract: the ps-worker/wa-worker refusal protocol labels the
+# SLING itself and leaves it for inflight-reclaim-guard.py to close; a
+# dog-pool refusal observed live (ga-1ztxb / its sling ga-0hela) instead
+# labeled the PARENT directly and closed the sling itself, with the marker
+# surfacing on the sling only in its own close_reason text — confirmed live:
+# ga-0hela's own labels are just ["ctx:ready","exec:auto"], no pool:refused
+# anywhere on the sling itself. Checking any ONE location would have missed
+# that real incident, so this checks all three, in priority order (the
+# sling's own label first — the documented/most-authoritative source), and
+# returns the FIRST literal pool:refused[:<reason>] token found, or "" if
+# none. A bare "pool:refused" (no reason suffix) is a valid, complete match.
+gap2_refused_token() {
+  local sling_labels="$1" parent_labels="$2" sling_close_reason="$3" tok=""
+  tok=$(printf '%s' "$sling_labels" | grep -oE 'pool:refused(:[A-Za-z0-9_-]+)?' | head -1 || echo "")
+  [ -z "$tok" ] && tok=$(printf '%s' "$parent_labels" | grep -oE 'pool:refused(:[A-Za-z0-9_-]+)?' | head -1 || echo "")
+  [ -z "$tok" ] && tok=$(printf '%s' "$sling_close_reason" | grep -oE 'pool:refused(:[A-Za-z0-9_-]+)?' | head -1 || echo "")
+  printf '%s' "$tok"
+}
+
+# gap2_free_refused_stranded <bead_id> <sling_id> <refused_token> — ga-eu75w:
+# the refused-parallel to gap2_arm_needs_remerge() below. A sling that closed
+# via an explicit worker refusal never reached a real gate review, so the OLD
+# default behavior here (falling through to free:pass-stranded, since a
+# refused sling usually carries no gate:needs-fix either) asserted a review
+# outcome that never happened — a parent left with gate:needs-fix/
+# gate:needs-remerge but no branch and no gate-run anywhere is exactly what
+# gate-orphaned-label-watchdog.sh's own detection criterion is, and nothing
+# upstream ever resolved it, so the watchdog re-flagged the same beads every
+# cycle forever (measured: ga-1ztxb, ga-6bghe, ga-aw0db/ga-avvu2, same night).
+# Extracted into its own function — like gap2_arm_needs_remerge — so the
+# selftest can call it directly with a mocked bd() and assert on the ACTUAL
+# label remove/add calls it makes (ga-4tgga attempt-2's lesson: a comment
+# that only CLAIMS labels were cleared, without the bd calls to back it up,
+# is worse than no comment — it tells the next reader to stop looking here).
+# Clears ONLY the four gate:* labels that can carry the false claim (never a
+# wildcard gate:* strip) — gate:needs-human* and gate:passed are structurally
+# unreachable by this function. Stamps the REAL reason (idempotent if a
+# worker already stamped pool:refused directly on the parent, per the
+# ga-1ztxb precedent) and frees the lane like the fail/pass-stranded arms.
+# Freeing the lane here does not reopen a re-dispatch loop: pilot-dispatcher.sh's
+# _filter_candidates already excludes any bead carrying pool:refused[:*] from
+# future dispatch consideration (ga-y8qh) — the SAME label this function
+# stamps is what stops Pilot from re-selecting this bead and walking a fresh
+# builder into the identical refusal.
+gap2_free_refused_stranded() {
+  local bead_id="$1" sling_id="$2" refused_token="$3"
+  [ -z "$refused_token" ] && refused_token="pool:refused"
+  bd -C "$GC_CITY" label remove "$bead_id" "gate:needs-fix"     -q 2>/dev/null || true
+  bd -C "$GC_CITY" label remove "$bead_id" "gate:needs-remerge" -q 2>/dev/null || true
+  bd -C "$GC_CITY" label remove "$bead_id" "gate:queued"        -q 2>/dev/null || true
+  bd -C "$GC_CITY" label remove "$bead_id" "gate:failed"        -q 2>/dev/null || true
+  bd -C "$GC_CITY" label remove "$bead_id" "story:in-flight"    -q 2>/dev/null || true
+  bd -C "$GC_CITY" label remove "$bead_id" "pilot:dispatched"   -q 2>/dev/null || true
+  bd -C "$GC_CITY" label add    "$bead_id" "$refused_token"     -q 2>/dev/null || true
+  bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler (ga-eu75w): sling bead $sling_id closed via an explicit worker refusal ($refused_token), not a gate review — no branch or gate-run ever existed for this attempt, so gate:needs-fix/needs-remerge/queued/failed would have asserted a review outcome that never happened (the exact false state gate-orphaned-label-watchdog.sh kept flagging forever). Those labels are now removed; story:in-flight + pilot:dispatched cleared; $refused_token stamped on this bead so pilot-dispatcher.sh's _filter_candidates (ga-y8qh) excludes it from re-dispatch instead of walking a fresh builder into the same refusal. gate:needs-human* labels, if any, are left untouched." 2>/dev/null || true
 }
 
 # gap2_arm_needs_remerge <bead_id> <sling_id> — ga-4tgga: the genuine
@@ -1726,6 +1802,7 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
     SC_SHOW=$(bd -C "$GC_CITY" show "$SC_ID" --json --include-comments 2>/dev/null \
       | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
     SC_ASSIGNEE=$(echo "$SC_SHOW" | jq -r '.assignee // ""' 2>/dev/null || echo "")
+    SC_LABELS=$(echo "$SC_SHOW" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
 
     HAS_SC_ASSIGNEE=0
     if [ -n "$SC_ASSIGNEE" ] && [ "$SC_ASSIGNEE" != "null" ]; then
@@ -1743,6 +1820,8 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
     SLING_FOUND=0
     SLING_NEEDS_FIX=0
     SLING_CLOSED=0
+    SLING_REFUSED=0
+    SLING_REFUSED_TOKEN=""
 
     if [ -n "$SLING_ID" ] && [ "$SLING_ID" != "null" ]; then
       SLING_FOUND=1
@@ -1750,12 +1829,21 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
         | jq 'if type=="array" then .[0] else . end' 2>/dev/null || echo "")
       SLING_STATUS=$(echo "$SLING_JSON" | jq -r '.status // ""' 2>/dev/null || echo "")
       SLING_LABELS=$(echo "$SLING_JSON" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
+      SLING_CLOSE_REASON=$(echo "$SLING_JSON" | jq -r '.close_reason // ""' 2>/dev/null || echo "")
 
       [ "$SLING_STATUS" = "closed" ] && SLING_CLOSED=1
       echo "$SLING_LABELS" | grep -qE "gate:needs-fix|gate:needs-human" && SLING_NEEDS_FIX=1 || true
+
+      # ga-eu75w: a refused sling was never gate-reviewed — its terminal state
+      # must not be read as "gate-passed" just because it lacks gate:needs-fix
+      # (the old bug). The refusal marker can land on the sling itself, on the
+      # PARENT directly (ga-1ztxb precedent), or only in the sling's own
+      # close_reason text — gap2_refused_token checks all three.
+      SLING_REFUSED_TOKEN=$(gap2_refused_token "$SLING_LABELS" "$SC_LABELS" "$SLING_CLOSE_REASON" || echo "")
+      [ -n "$SLING_REFUSED_TOKEN" ] && SLING_REFUSED=1 || true
     fi
 
-    ACTION=$(classify_parent_gap2 "1" "$HAS_SC_ASSIGNEE" "$SLING_FOUND" "$SLING_NEEDS_FIX" "$SLING_CLOSED")
+    ACTION=$(classify_parent_gap2 "1" "$HAS_SC_ASSIGNEE" "$SLING_FOUND" "$SLING_NEEDS_FIX" "$SLING_CLOSED" "$SLING_REFUSED")
 
     case "$ACTION" in
       free:fail-stranded)
@@ -1778,9 +1866,12 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
           bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: parent stranded after sling bead $SLING_ID gate-failed (labels: $SLING_LABELS). story:in-flight + pilot:dispatched cleared; gate:needs-fix set. Pilot will re-dispatch." 2>/dev/null || true
         fi
         ;;
+      free:refused-stranded)
+        warn "GAP-2: $SC_ID stranded (sling $SLING_ID closed via refusal: $SLING_REFUSED_TOKEN) — clearing false gate labels, freeing lane"
+        gap2_free_refused_stranded "$SC_ID" "$SLING_ID" "$SLING_REFUSED_TOKEN"
+        ;;
       free:pass-stranded)
         warn "GAP-2: $SC_ID stranded (sling $SLING_ID closed/passed) — freeing lane"
-        SC_LABELS=$(echo "$SC_SHOW" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || echo "")
 
         if echo "$SC_LABELS" | grep -q "story:approved"; then
           # Story-type parent: set gate:passed so story-delivery finalizes it.

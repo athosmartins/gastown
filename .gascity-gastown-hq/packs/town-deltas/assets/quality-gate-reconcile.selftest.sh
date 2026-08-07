@@ -58,6 +58,8 @@ type classify_gap2_bugtask_verdict >/dev/null 2>&1 || { echo "FATAL: classify_ga
 type gap2_query_active_markers     >/dev/null 2>&1 || { echo "FATAL: gap2_query_active_markers not defined by guard (ga-4tgga)"; exit 1; }
 type gap2_marker_for_bead          >/dev/null 2>&1 || { echo "FATAL: gap2_marker_for_bead not defined by guard (ga-4tgga)"; exit 1; }
 type gap2_arm_needs_remerge        >/dev/null 2>&1 || { echo "FATAL: gap2_arm_needs_remerge not defined by guard (ga-4tgga attempt 3)"; exit 1; }
+type gap2_refused_token            >/dev/null 2>&1 || { echo "FATAL: gap2_refused_token not defined by guard (ga-eu75w)"; exit 1; }
+type gap2_free_refused_stranded    >/dev/null 2>&1 || { echo "FATAL: gap2_free_refused_stranded not defined by guard (ga-eu75w)"; exit 1; }
 
 # ── 0. age_minutes_of must read the bead 'Z' timestamps as UTC (not local) ───
 # Regression lock for the TZ bug that made every age negative (off by the host's
@@ -260,7 +262,7 @@ eq "live builder trumps merged branch"     "$(classify_inflight_gap1 open   0 1 
 eq "already-handled before live check"     "$(classify_inflight_gap1 closed 0 1 1)"   "skip:already-handled"
 
 # ── 6. classify_parent_gap2 (ga-pa36 GAP-2: parent-story stranding) ──────────
-# Signature: classify_parent_gap2 <has_pilot_dispatched> <has_live_assignee> <sling_found> <sling_needs_fix> <sling_closed>
+# Signature: classify_parent_gap2 <has_pilot_dispatched> <has_live_assignee> <sling_found> <sling_needs_fix> <sling_closed> [sling_refused]
 echo "── 6. classify_parent_gap2 (GAP-2: parent-story stranding) ──"
 eq "not pilot:dispatched → skip"                       "$(classify_parent_gap2 0 0 1 0 0)"  "skip:not-dispatched"
 eq "live assignee on parent → safe-skip"               "$(classify_parent_gap2 1 1 1 0 0)"  "skip:live-assignee"
@@ -269,6 +271,30 @@ eq "sling gate:needs-fix → free FAIL-stranded"         "$(classify_parent_gap2
 eq "sling gate:needs-fix beats sling closed"           "$(classify_parent_gap2 1 0 1 1 1)"  "free:fail-stranded"
 eq "sling closed (PASS) → free PASS-stranded"          "$(classify_parent_gap2 1 0 1 0 1)"  "free:pass-stranded"
 eq "sling still active → skip"                         "$(classify_parent_gap2 1 0 1 0 0)"  "skip:active-sling"
+# ga-eu75w: the 5-arg calls above (no 6th positional) are the pre-existing
+# call shape — this section passing unchanged with sling_refused implicitly
+# defaulting to 0 IS the backward-compatibility proof.
+
+# ── 6-refused (ga-eu75w GAP-2: a worker refusal is not a gate-pass) ──────────
+# Bug (Mayor, 2026-08-07, same night, 3x — ga-1ztxb/ga-6bghe/ga-aw0db/ga-avvu2):
+# "sling closed + no gate:needs-fix" used to be read as "gate-passed", silently
+# conflating an explicit pool:refused[:reason] worker refusal — which never
+# reached a gate review at all — with a genuine pass. GAP-2 then re-armed
+# gate:needs-fix + gate:needs-remerge on the parent with no branch and no
+# gate-run anywhere, which gate-orphaned-label-watchdog.sh flagged forever.
+echo "── 6-refused. classify_parent_gap2 sling_refused (ga-eu75w) ──"
+eq "sling closed via refusal → free REFUSED-stranded, NOT pass-stranded" \
+   "$(classify_parent_gap2 1 0 1 0 1 1)" "free:refused-stranded"
+eq "sling closed, explicitly not refused → free PASS-stranded (unchanged)" \
+   "$(classify_parent_gap2 1 0 1 0 1 0)" "free:pass-stranded"
+eq "refused but sling still OPEN (not closed) → skip (inflight-reclaim-guard.py owns that window)" \
+   "$(classify_parent_gap2 1 0 1 0 0 1)" "skip:active-sling"
+eq "ACCEPTANCE CRITERION: genuine gate-FAIL beats a coincidental refused signal" \
+   "$(classify_parent_gap2 1 0 1 1 0 1)" "free:fail-stranded"
+eq "gate-failed AND closed AND refused all present → fail still wins" \
+   "$(classify_parent_gap2 1 0 1 1 1 1)" "free:fail-stranded"
+eq "live assignee short-circuits even with a refused sling" \
+   "$(classify_parent_gap2 1 1 1 0 1 1)" "skip:live-assignee"
 
 # ── 6b. classify_gap2_bugtask_verdict (ga-4tgga: active-marker wait state) ───
 # Signature: classify_gap2_bugtask_verdict <merge_verified> <has_untracked_marker> <has_active_marker>
@@ -447,6 +473,103 @@ grep -q 'gap2_arm_needs_remerge "\$SC_ID" "\$SLING_ID"' "$GUARD" \
   && ok "Step 0c.2's final re-arm arm actually calls gap2_arm_needs_remerge" \
   || bad "gap2_arm_needs_remerge is defined but the case-statement arm never calls it"
 
+# ── 6f. gap2_refused_token + gap2_free_refused_stranded (ga-eu75w) ───────────
+# GAP-2's refused-stranded arm: a sling that closed via an explicit worker
+# refusal never reached a gate review, so the parent must not be left with
+# (or re-armed with) gate:needs-fix/needs-remerge/queued/failed — the exact
+# false state gate-orphaned-label-watchdog.sh flagged forever on ga-1ztxb,
+# ga-6bghe, ga-aw0db/ga-avvu2 (same night — Mayor manually cleaned up all three
+# by hand, which is what this function now does automatically).
+echo "── 6f. gap2_refused_token + gap2_free_refused_stranded (ga-eu75w) ──"
+
+eq "gap2_refused_token: sling's own label (documented ps-worker/wa-worker path)" \
+   "$(gap2_refused_token "pool:refused:engine-rebuild-required" "" "")" "pool:refused:engine-rebuild-required"
+eq "gap2_refused_token: parent's own label (ga-1ztxb precedent — sling carries no pool:refused label at all)" \
+   "$(gap2_refused_token "ctx:ready exec:auto" "pool:refused:engine-rebuild-required" "")" "pool:refused:engine-rebuild-required"
+eq "gap2_refused_token: close_reason text only (real ga-0hela shape: neither sling nor parent labeled)" \
+   "$(gap2_refused_token "ctx:ready exec:auto" "framework:observability" "pool:refused:engine-rebuild-required — see comment on ga-1ztxb.")" "pool:refused:engine-rebuild-required"
+eq "gap2_refused_token: no signal anywhere → empty" \
+   "$(gap2_refused_token "gate:needs-fix" "story:in-flight" "gate review failed")" ""
+
+# Mocked-bd() call-recording test (ga-4tgga attempt-2's own lesson, reapplied
+# here: a comment that only CLAIMS labels were cleared, without the bd calls
+# to back it up, is worse than no comment — assert the ACTUAL calls made).
+GAP2_REFUSED_CALLS="$(mktemp)"
+GC_CITY=/tmp/ga-eu75w-fake-city
+bd() { printf '%s\n' "$*" >> "$GAP2_REFUSED_CALLS"; return 0; }
+gap2_free_refused_stranded "ga-fake-parent" "ga-fake-sling" "pool:refused:engine-rebuild-required"
+unset -f bd
+
+grep -qF -- "-C $GC_CITY label remove ga-fake-parent gate:needs-fix" "$GAP2_REFUSED_CALLS" \
+  && ok "gap2_free_refused_stranded removes gate:needs-fix" \
+  || bad "gap2_free_refused_stranded did NOT remove gate:needs-fix — the false state survives"
+grep -qF -- "-C $GC_CITY label remove ga-fake-parent gate:needs-remerge" "$GAP2_REFUSED_CALLS" \
+  && ok "gap2_free_refused_stranded removes gate:needs-remerge" \
+  || bad "gap2_free_refused_stranded did NOT remove gate:needs-remerge"
+grep -qF -- "-C $GC_CITY label remove ga-fake-parent gate:queued" "$GAP2_REFUSED_CALLS" \
+  && ok "gap2_free_refused_stranded removes gate:queued" \
+  || bad "gap2_free_refused_stranded did NOT remove gate:queued"
+grep -qF -- "-C $GC_CITY label remove ga-fake-parent gate:failed" "$GAP2_REFUSED_CALLS" \
+  && ok "gap2_free_refused_stranded removes gate:failed" \
+  || bad "gap2_free_refused_stranded did NOT remove gate:failed"
+grep -qF -- "-C $GC_CITY label remove ga-fake-parent story:in-flight" "$GAP2_REFUSED_CALLS" \
+  && ok "gap2_free_refused_stranded frees the lane (story:in-flight)" \
+  || bad "gap2_free_refused_stranded did NOT clear story:in-flight — bead stays permanently stranded"
+grep -qF -- "-C $GC_CITY label remove ga-fake-parent pilot:dispatched" "$GAP2_REFUSED_CALLS" \
+  && ok "gap2_free_refused_stranded frees the lane (pilot:dispatched)" \
+  || bad "gap2_free_refused_stranded did NOT clear pilot:dispatched — GAP-2 would re-select this bead every cycle forever"
+grep -qF -- "-C $GC_CITY label add ga-fake-parent pool:refused:engine-rebuild-required" "$GAP2_REFUSED_CALLS" \
+  && ok "gap2_free_refused_stranded stamps the real reason onto the parent" \
+  || bad "gap2_free_refused_stranded did NOT stamp pool:refused — the true state never reaches the parent (ga-eu75w acceptance criterion)"
+grep -qF -- "comment ga-fake-parent" "$GAP2_REFUSED_CALLS" \
+  && ok "gap2_free_refused_stranded posts its explanatory comment" \
+  || bad "gap2_free_refused_stranded stopped posting a comment — silent label mutation with no audit trail"
+
+# gate:needs-human* must be STRUCTURALLY unreachable — assert no LABEL
+# mutation call ever names it (ga-eu75w acceptance criterion: "gate:needs-human*
+# SURVIVES"). Scoped to actual "label add"/"label remove" calls, via the
+# two-token phrase (not a bare "label" substring): the function's own
+# explanatory comment text legitimately SAYS "gate:needs-human* labels, if
+# any, are left untouched" — and "labels" (plural) itself contains "label" as
+# a substring, so a bare substring grep over the whole log false-positives on
+# that prose. Caught live while writing this very test (ga-eu75w) — the exact
+# error-vs-empty shape this city's own doctrine warns about: a match must
+# mean what it claims to mean, not just contain the right characters.
+if grep -E -- 'label (add|remove)' "$GAP2_REFUSED_CALLS" | grep -qF -- "needs-human"; then
+  bad "gap2_free_refused_stranded issued a label add/remove naming needs-human — acceptance criterion violated"
+else
+  ok "gap2_free_refused_stranded never issues a label mutation naming gate:needs-human*"
+fi
+
+# Ordering: removes before adds, mirroring gap2_arm_needs_remerge / the close:* arms.
+GAP2_REFUSED_REMOVE_LINE=$(grep -nF -- "label remove ga-fake-parent pilot:dispatched" "$GAP2_REFUSED_CALLS" | head -1 | cut -d: -f1)
+GAP2_REFUSED_ADD_LINE=$(grep -nF -- "label add ga-fake-parent pool:refused:engine-rebuild-required" "$GAP2_REFUSED_CALLS" | head -1 | cut -d: -f1)
+if [ -n "$GAP2_REFUSED_REMOVE_LINE" ] && [ -n "$GAP2_REFUSED_ADD_LINE" ] && [ "$GAP2_REFUSED_REMOVE_LINE" -lt "$GAP2_REFUSED_ADD_LINE" ]; then
+  ok "gap2_free_refused_stranded removes old status labels BEFORE adding the refusal label"
+else
+  bad "gap2_free_refused_stranded ordering wrong (or calls missing) — removes must precede adds"
+fi
+rm -f "$GAP2_REFUSED_CALLS"
+
+# Bare "pool:refused" (no reason) fallback — must still stamp something sane,
+# never an empty label add.
+GAP2_REFUSED_BARE_CALLS="$(mktemp)"
+bd() { printf '%s\n' "$*" >> "$GAP2_REFUSED_BARE_CALLS"; return 0; }
+gap2_free_refused_stranded "ga-fake-parent2" "ga-fake-sling2" ""
+unset -f bd
+grep -qF -- "-C $GC_CITY label add ga-fake-parent2 pool:refused" "$GAP2_REFUSED_BARE_CALLS" \
+  && ok "gap2_free_refused_stranded falls back to bare pool:refused when no token was extracted" \
+  || bad "gap2_free_refused_stranded with empty token did not stamp a sane fallback label"
+rm -f "$GAP2_REFUSED_BARE_CALLS"
+
+# Drift-guard companions: the case-statement call site must actually invoke it.
+grep -q 'free:refused-stranded)' "$GUARD" \
+  && ok "Step 0c.2's case statement defines the free:refused-stranded arm" \
+  || bad "free:refused-stranded verdict is classified but the case statement has no matching arm"
+grep -q 'gap2_free_refused_stranded "\$SC_ID" "\$SLING_ID" "\$SLING_REFUSED_TOKEN"' "$GUARD" \
+  && ok "the free:refused-stranded arm actually calls gap2_free_refused_stranded" \
+  || bad "gap2_free_refused_stranded is defined but the case-statement arm never calls it"
+
 # ── 7. drift-guard: guard implements both GAP-1 and GAP-2 sweeps ──────────────
 echo "── 7. drift-guard: guard implements ga-pa36 GAP-1 + GAP-2 sweeps ──"
 grep -q 'classify_inflight_gap1()'  "$GUARD" && ok "guard defines classify_inflight_gap1"  || bad "guard missing classify_inflight_gap1 def"
@@ -457,6 +580,7 @@ grep -q 'pilot:dispatched'          "$GUARD" && ok "guard sweeps pilot:dispatche
 grep -q 'Sling task bead'           "$GUARD" && ok "guard parses 'Sling task bead' comment"  || bad "guard missing Sling-task-bead parse"
 grep -q 'gate:needs-fix'            "$GUARD" && ok "guard checks gate:needs-fix on sling bead"  || bad "guard missing gate:needs-fix check"
 grep -q 'free:fail-stranded'        "$GUARD" && ok "guard handles free:fail-stranded action"    || bad "guard missing free:fail-stranded handler"
+grep -q 'free:refused-stranded'     "$GUARD" && ok "guard handles free:refused-stranded action (ga-eu75w)" || bad "guard missing free:refused-stranded handler"
 grep -q 'free:pass-stranded'        "$GUARD" && ok "guard handles free:pass-stranded action"    || bad "guard missing free:pass-stranded handler"
 grep -q 'merge-base --is-ancestor'  "$GUARD" && ok "guard uses merge-base for branch check (GAP-1)" || bad "guard missing merge-base check"
 # ga-e2n96: the free:pass-stranded unverified-merge default arm is a PURE
