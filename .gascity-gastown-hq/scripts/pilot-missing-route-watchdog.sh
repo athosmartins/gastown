@@ -495,7 +495,7 @@ run_sweep() {
           ] | @tsv
       ' 2>/dev/null)
     [ -z "${rows:-}" ] && continue
-    local gate_active dispatched_at sling_bead dispatch_age_s recency_threshold_s sling_status sling_override
+    local gate_active dispatched_at sling_bead dispatch_age_s recency_threshold_s sling_status sling_override sling_note
     while IFS=$'\t' read -r bid blabels btype age_min dispatched_at sling_bead; do
       [ -z "${bid:-}" ] && continue
 
@@ -509,12 +509,21 @@ run_sweep() {
           recency_threshold_s=$(( PMRW_DISPATCH_RECENCY_MINUTES * 60 ))
           if [ "$dispatch_age_s" -ge 0 ] && [ "$dispatch_age_s" -lt "$recency_threshold_s" ]; then
             sling_override=0
+            sling_note=""
             if [ -n "${sling_bead:-}" ]; then
               sling_status="$(_pmrw_sling_status_probe "$sling_bead" "$store")"
-              [ "$sling_status" = "closed" ] && sling_override=1
+              if [ "$sling_status" = "closed" ]; then
+                sling_override=1
+              else
+                # ga-hhj7u self-audit: name the actual sling_status (open vs
+                # error) rather than folding "confirmed open" and "couldn't
+                # tell" into one identical SKIP line — a reader of the log
+                # later must be able to tell which happened.
+                sling_note=" (sling $sling_bead checked: $sling_status, not overriding)"
+              fi
             fi
             if [ "$sling_override" -ne 1 ]; then
-              log "  - SKIP $bid ($(_store_name "$store")): pilot.dispatched_at ${dispatch_age_s}s ago (< ${PMRW_DISPATCH_RECENCY_MINUTES}m recency window) — route intentionally lives on the sling wrapper, not a routing gap (ga-hhj7u)"
+              log "  - SKIP $bid ($(_store_name "$store")): pilot.dispatched_at ${dispatch_age_s}s ago (< ${PMRW_DISPATCH_RECENCY_MINUTES}m recency window) — route intentionally lives on the sling wrapper, not a routing gap (ga-hhj7u)${sling_note}"
               continue
             fi
             log "  - $bid ($(_store_name "$store")): recently dispatched (${dispatch_age_s}s ago) but sling wrapper $sling_bead is CLOSED while still armed+unrouted — strong signal, NOT excluded (ga-hhj7u bonus)"
@@ -1207,6 +1216,7 @@ BDSTUB
   rc=$?
   [ "$rc" -eq 0 ] && ok "scenario 33: open sling does not override recency exclusion (return 0)" || bad "scenario 33: open sling must not override, got $rc"
   [ ! -s "$C33" ] && ok "scenario 33: no comment posted" || bad "scenario 33: comment posted despite sling still open"
+  grep -q "sling ga-33-sling checked: open" "$LOG" 2>/dev/null && ok "scenario 33: log names the confirmed-open sling explicitly (not folded into the error case)" || bad "scenario 33: log does not distinguish confirmed-open from probe-failed"
 
   # ── Scenario 34 (ga-hhj7u bonus): RECENT dispatch + sling_bead present +
   # sling CLOSED while target still armed+unrouted → overrides back to
@@ -1234,6 +1244,7 @@ BDSTUB
   rc=$?
   [ "$rc" -eq 0 ] && ok "scenario 35: sling probe failure fails open toward no-alarm (return 0)" || bad "scenario 35: a failed sling probe must not force a flag, got $rc"
   [ ! -s "$C35" ] && ok "scenario 35: no comment posted despite probe failure" || bad "scenario 35: comment posted off an unconfirmed (failed) sling probe"
+  grep -q "sling ga-35-sling checked: error" "$LOG" 2>/dev/null && ok "scenario 35: log names the probe failure explicitly (not folded into the confirmed-open case)" || bad "scenario 35: log does not distinguish probe-failed from confirmed-open"
 
   echo ""
   echo "pilot-missing-route-watchdog selftest: PASS=$PASS FAIL=$FAIL"
