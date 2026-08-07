@@ -1,0 +1,11 @@
+# town-deltas order (ga-8f40w): backstop for mol-digest-generate's source fix
+# (packs/town-deltas/formulas/mol-digest-generate.toml). Independent of
+# issue_type on purpose — catches any open "Digest: YYYY-MM-DD" bead
+# regardless of producer, not just ones the source fix covers. Daily cadence
+# only (digest is a daily object; see ga-y0g5x for why a guard must never
+# poll faster than its own run needs).
+[order]
+description = "Close past-day digest beads still open (any issue_type)"
+trigger = "cooldown"
+interval = "24h"
+exec = "$PACK_DIR/assets/scripts/digest-sweep.sh"

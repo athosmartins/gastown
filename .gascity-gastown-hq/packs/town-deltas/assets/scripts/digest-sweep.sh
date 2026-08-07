@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# digest-sweep — close past-day "Digest: YYYY-MM-DD" beads that are still open.
+#
+# Runs as an exec order (no LLM, no agent, no wisp). Backstop for
+# mol-digest-generate's source-level fix (packs/town-deltas/formulas/
+# mol-digest-generate.toml, ga-8f40w): that fix makes new digests archive as
+# --type=message and close immediately, but this sweep is independent of
+# issue_type on purpose — it catches ANY open "Digest: YYYY-MM-DD" bead
+# (old producer, manual creation, a future regression in the formula) as a
+# true safety net, not a mirror of the source fix.
+#
+# Daily cadence only — a digest is a daily object, no need to poll faster
+# (see ga-y0g5x: a guard that outruns its own interval stacks concurrent
+# runs and can take down Dolt).
+#
+# Safety: a title that doesn't parse as "Digest: YYYY-MM-DD", or whose date
+# is today or in the future, is left untouched. Closing by mistake destroys
+# information; the asymmetric cost means erring toward keep (a failed/absent
+# parse must KEEP, never CLOSE).
+set -euo pipefail
+
+__SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+. "$__SCRIPT_DIR/_bd_trace.sh" "digest-sweep"
+
+TODAY="$(date -u +%Y-%m-%d)"
+
+bd list --status open --json --limit 0 2>/dev/null \
+  | jq -r --arg today "$TODAY" '
+      .[]
+      | select(.title | test("^Digest: [0-9]{4}-[0-9]{2}-[0-9]{2}$"))
+      | {id, date: (.title | capture("^Digest: (?<d>[0-9]{4}-[0-9]{2}-[0-9]{2})$").d)}
+      | select(.date < $today)
+      | .id
+    ' \
+  | while IFS= read -r id; do
+      [ -z "$id" ] && continue
+      bd close "$id" --reason "digest-sweep: past-day digest archived, informational artifact with no pending action" || true
+    done
