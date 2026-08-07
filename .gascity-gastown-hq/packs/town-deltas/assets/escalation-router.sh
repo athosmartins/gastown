@@ -43,6 +43,23 @@
 #   ESCALATION_INFRA_CREW      default mayor
 #   ESCALATION_FALLBACK_CREW   default mayor
 #   DRY_RUN                    1 = classify + log, no mail (default 0)
+#   NOTIFY_BIN                 notify binary to invoke (default "notify"; override
+#                              in tests to a stub — see escalation-router.selftest.sh)
+#
+# DOLT-INDEPENDENT FALLBACK (ga-mvkp5): `gc mail send` creates a bead + Dolt
+# commit, so a degraded/unreachable Dolt takes the escalation channel down with
+# it — right when it matters most. When BOTH the topic-crew send AND the mayor
+# fallback fail, escalation_route no longer swallows the failure: it appends a
+# durable record to $CITY/.gc/logs/escalations.jsonl (gc-ledger.sh, Dolt-
+# independent by construction) and pushes a live ntfy alert via $NOTIFY_BIN
+# (title always carries 🆘 so it can never be silently demoted to the hourly
+# digest — see notify's own classify_route). The trigger is the OBJECTIVE fact
+# that both mail attempts failed, not a text guess about "is this about Dolt" —
+# a degraded Dolt is exactly what makes both sends fail, so this never fires on
+# an ordinary single-send hiccup and never fires on every escalation (no
+# notification noise on the happy path). escalation_route's exit code now
+# reflects real delivery status end-to-end: 0 if mail OR the notify fallback
+# reached somewhere live, 1 if only the ledger record survives.
 #
 # RIG-ORIGIN ROUTING (secondary signal, used when content classification returns ""):
 #   Pass --rig <rig-name> (CLI) or escalation_route subject body "" rig (library).
@@ -51,6 +68,8 @@
 #                 gastown/gascity → infra | unknown/missing → fallback to content
 #
 # LOGGING: appends to $GC_CITY/.gc/logs/escalation-router.jsonl
+#   Plus $GC_CITY/.gc/logs/escalations.jsonl, ONLY when the Dolt-independent
+#   fallback above fires (both the crew and mayor mail sends failed).
 
 set -uo pipefail
 
@@ -199,10 +218,86 @@ escalation_route() {
     return 0
   fi
 
-  gc --city "$CITY" mail send "$crew" -s "$subject" -m "$body" 2>&1 \
-    && _er_log "INFO" "escalation sent → $crew (topic=${topic:-none}): $subject" \
-    || { _er_log "WARN" "gc mail send $crew failed for '$subject' — falling back to mayor"; \
-         gc --city "$CITY" mail send mayor -s "$subject" -m "$body" 2>/dev/null || true; }
+  if gc --city "$CITY" mail send "$crew" -s "$subject" -m "$body"; then
+    _er_log "INFO" "escalation sent → $crew (topic=${topic:-none}): $subject"
+    return 0
+  fi
+  _er_log "WARN" "gc mail send $crew failed for '$subject' — falling back to mayor"
+
+  if gc --city "$CITY" mail send mayor -s "$subject" -m "$body"; then
+    _er_log "INFO" "escalation sent → mayor fallback (topic=${topic:-none}): $subject"
+    return 0
+  fi
+  _er_log "ERROR" "gc mail send mayor fallback ALSO failed for '$subject' — mail system unreachable, using Dolt-independent channel"
+  _escalation_dolt_independent_fallback "$subject" "$body" "$topic"
+}
+
+# ── _escalation_dolt_independent_fallback <subject> <body> <topic> ───────────
+# ga-mvkp5: last-resort path when BOTH the topic-crew send and the mayor
+# fallback failed above — i.e. the mail system itself (bd create → Dolt
+# commit) could not accept the escalation. The trigger is the OBJECTIVE fact
+# that both mail attempts failed, not a content guess about "is this about
+# Dolt" — a degraded Dolt is exactly what makes both of those sends fail, so
+# this fires precisely when the mail-based channel is unusable and never on an
+# ordinary single-send hiccup or on every escalation (no notification noise on
+# the happy path).
+#
+# Two independent, Dolt-independent actions — neither blocks the other:
+#   1. Durable record → escalations ledger (gc-ledger.sh, imp04, pure local
+#      file I/O). Survives even if notify/ntfy is also down.
+#   2. Live human ping → $NOTIFY_BIN -k gate-human (ntfy push, the imp07
+#      pattern already used by gc-dolt-probe.sh / dolt-hang-watchdog.sh). The
+#      title always contains "🆘" so it force-matches notify's own push
+#      allowlist (classify_route) regardless of message content — it can
+#      never be silently demoted to the hourly digest.
+# Bounded with `timeout`: notify's own curl already bounds itself at ~6s, but
+# its Bitwarden secret lookup (ntfy-access-token) could still stall — defense
+# in depth, matching the 10s bound production-stall-watchdog.py already uses
+# for the same call.
+#
+# Returns 0 if the ntfy push is CONFIRMED delivered; 1 otherwise. The ledger
+# write is attempted regardless of the notify outcome — "1" means "no live
+# channel confirmed", not "lost": the record is still on disk.
+_escalation_dolt_independent_fallback() {
+  local subject="$1" body="$2" topic="$3"
+  local ts esc_subject esc_body esc_topic json_line ledger_sh notify_bin notify_rc=1
+
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+  esc_subject=$(printf '%s' "$subject" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || printf '"%s"' "$subject")
+  esc_body=$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || printf '"%s"' "$body")
+  esc_topic=$(printf '%s' "${topic:-none}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || printf '"%s"' "${topic:-none}")
+  json_line=$(printf '{"ts":"%s","subject":%s,"body":%s,"topic":%s,"reason":"mail-send-failed-crew-and-mayor"}' \
+    "$ts" "$esc_subject" "$esc_body" "$esc_topic")
+
+  ledger_sh="$CITY/scripts/gc-ledger.sh"
+  if [ -r "$ledger_sh" ]; then
+    # shellcheck disable=SC1090
+    source "$ledger_sh"
+    if gc_ledger_append "escalations" "$json_line"; then
+      _er_log "INFO" "escalation ledgered (mail unreachable): $subject"
+    else
+      _er_log "ERROR" "escalation ledger write ALSO failed for '$subject'"
+    fi
+  else
+    _er_log "ERROR" "gc-ledger.sh not found at $ledger_sh — escalation NOT durably recorded: $subject"
+  fi
+
+  notify_bin="${NOTIFY_BIN:-notify}"
+  if command -v "$notify_bin" >/dev/null 2>&1; then
+    if timeout 10 "$notify_bin" -k gate-human -t "🆘 Escalação sem entrega (mail falhou 2x): ${subject}" \
+        "$body
+
+[topic=${topic:-none}; gc mail send failed for both the topic crew and mayor — provável Dolt degradado. ga-mvkp5]"; then
+      notify_rc=0
+      _er_log "INFO" "escalation Dolt-independent notify SENT (mail unreachable): $subject"
+    else
+      _er_log "ERROR" "escalation Dolt-independent notify ALSO failed for '$subject' — only the ledger record remains"
+    fi
+  else
+    _er_log "ERROR" "notify binary '$notify_bin' not found — escalation '$subject' has only the ledger record (if that succeeded)"
+  fi
+
+  return "$notify_rc"
 }
 
 # ── CLI main ──────────────────────────────────────────────────────────────────

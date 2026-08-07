@@ -177,9 +177,88 @@ result=$(escalation_route "chip warming error" "oracle socket" "" "property-scra
 eq "content wins over rig: warming beats property-rig" "$result" "ROUTED:warming:oracle-wa"
 DRY_RUN=0
 
-# ── 4. file structure guards ─────────────────────────────────────────────────
+# ── 4. Dolt-independent fallback when mail is fully unreachable (ga-mvkp5) ──
+# gc mail send creates a bead + Dolt commit, so a degraded Dolt takes the
+# escalation channel down with it. escalation_route must still reach a durable
+# record and/or a live human when BOTH the crew send and the mayor fallback
+# fail — and the caller must be able to tell (real exit code, not a silent 0).
 echo ""
-echo "── 4. file structure ──"
+echo "── 4. escalation_route Dolt-independent fallback (mail fully down) ──"
+
+FAKE_NOTIFY_LOG="$(mktemp -t escalation-router-notify-log)"
+FAKE_NOTIFY="$(mktemp -t escalation-router-fake-notify)"
+cat > "$FAKE_NOTIFY" <<'FAKENOTIFYEOF'
+#!/usr/bin/env bash
+printf 'NOTIFY_CALLED %s\n' "$*" >> "$FAKE_NOTIFY_LOG_TARGET"
+exit "${FAKE_NOTIFY_EXIT:-0}"
+FAKENOTIFYEOF
+chmod +x "$FAKE_NOTIFY"
+
+FAKE_LEDGER_DIR="$(mktemp -d -t escalation-router-ledger)"
+LEDGER_FILE="$FAKE_LEDGER_DIR/escalations.jsonl"
+
+# 5a. Both mail attempts fail, notify succeeds → fallback fires, route reports success (rc=0)
+gc() { return 1; }   # every gc mail send fails — simulates a degraded/unreachable Dolt
+: > "$FAKE_NOTIFY_LOG"
+FAKE_NOTIFY_LOG_TARGET="$FAKE_NOTIFY_LOG" NOTIFY_BIN="$FAKE_NOTIFY" GC_LEDGER_DIR="$FAKE_LEDGER_DIR" \
+  escalation_route "Dolt: gate stalled" "evidence here" "infra" >/dev/null 2>/dev/null
+rc=$?
+eq "both mail attempts fail + notify ok → route reports success" "$rc" "0"
+
+if grep -q "NOTIFY_CALLED" "$FAKE_NOTIFY_LOG" 2>/dev/null; then ok "notify fallback invoked"; else bad "notify fallback NOT invoked"; fi
+if grep -q '🆘' "$FAKE_NOTIFY_LOG" 2>/dev/null; then ok "notify title carries 🆘 (forces push, never digest)"; else bad "notify title missing 🆘"; fi
+
+if [ -f "$LEDGER_FILE" ]; then ok "escalations ledger file created"; else bad "escalations ledger file NOT created"; fi
+if [ -f "$LEDGER_FILE" ] && python3 -c "import json; json.loads(open('$LEDGER_FILE').read().strip().splitlines()[-1])" 2>/dev/null; then
+  ok "ledger line is valid JSON"
+else
+  bad "ledger line is not valid JSON (or file missing)"
+fi
+if [ -f "$LEDGER_FILE" ] && tail -1 "$LEDGER_FILE" | grep -q "Dolt: gate stalled"; then
+  ok "ledger line carries the original subject"
+else
+  bad "ledger line missing original subject"
+fi
+
+# 5b. Both mail attempts AND notify fail → route reports real failure (rc=1), ledger still written
+: > "$FAKE_NOTIFY_LOG"
+rm -f "$LEDGER_FILE"
+FAKE_NOTIFY_LOG_TARGET="$FAKE_NOTIFY_LOG" NOTIFY_BIN="$FAKE_NOTIFY" FAKE_NOTIFY_EXIT=1 GC_LEDGER_DIR="$FAKE_LEDGER_DIR" \
+  escalation_route "Dolt: gate stalled" "evidence here" "infra" >/dev/null 2>/dev/null
+rc=$?
+eq "both mail + notify fail → route reports failure, not silent" "$rc" "1"
+if [ -f "$LEDGER_FILE" ]; then ok "ledger STILL written even when notify also fails"; else bad "ledger missing when notify also fails — record would be lost"; fi
+
+# 5c. Crew send succeeds → happy path unaffected, zero fallback noise (regression guard)
+gc() { return 0; }   # every gc mail send succeeds
+: > "$FAKE_NOTIFY_LOG"
+FAKE_NOTIFY_LOG_TARGET="$FAKE_NOTIFY_LOG" NOTIFY_BIN="$FAKE_NOTIFY" GC_LEDGER_DIR="$FAKE_LEDGER_DIR" \
+  escalation_route "routine thing" "body" "infra" >/dev/null 2>/dev/null
+rc=$?
+eq "crew send succeeds → route reports success" "$rc" "0"
+if [ ! -s "$FAKE_NOTIFY_LOG" ]; then ok "happy path: no notify fallback noise"; else bad "happy path incorrectly triggered notify fallback"; fi
+
+# 5d. Crew fails, mayor fallback succeeds → mayor already has it, no Dolt-independent noise
+_gc_call_n=0
+gc() {
+  _gc_call_n=$((_gc_call_n+1))
+  [ "$_gc_call_n" -eq 1 ] && return 1   # crew send fails
+  return 0                              # mayor fallback succeeds
+}
+: > "$FAKE_NOTIFY_LOG"
+FAKE_NOTIFY_LOG_TARGET="$FAKE_NOTIFY_LOG" NOTIFY_BIN="$FAKE_NOTIFY" GC_LEDGER_DIR="$FAKE_LEDGER_DIR" \
+  escalation_route "routine thing" "body" "property" >/dev/null 2>/dev/null
+rc=$?
+eq "crew fails, mayor succeeds → route reports success" "$rc" "0"
+if [ ! -s "$FAKE_NOTIFY_LOG" ]; then ok "mayor-fallback-succeeds path: no Dolt-independent noise"; else bad "mayor-fallback-succeeds path incorrectly fired notify"; fi
+
+rm -f "$FAKE_NOTIFY_LOG" "$FAKE_NOTIFY"
+rm -rf "$FAKE_LEDGER_DIR"
+unset -f gc
+
+# ── 5. file structure guards ─────────────────────────────────────────────────
+echo ""
+echo "── 5. file structure ──"
 [ -f "$ROUTER" ]                              && ok "router file exists"          || bad "router missing: $ROUTER"
 grep -q 'escalation_classify_topic'  "$ROUTER" && ok "classify fn defined"         || bad "classify fn missing"
 grep -q 'escalation_topic_to_crew'   "$ROUTER" && ok "map fn defined"              || bad "map fn missing"
