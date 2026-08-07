@@ -1311,9 +1311,26 @@ warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pilot-dispatcher] WARN: $*"; }
 # the loser gets ENOENT and backs off (ga-7s0or AC3, no double-dispatch).
 PILOT_LOCK_DIR="${TMPDIR:-/tmp}/pilot-dispatcher$(printf '%s' "$GC_CITY" | tr '/ ' '__').lock.d"
 PILOT_LOCK_HB="$PILOT_LOCK_DIR/heartbeat"
-# A real sweep finishes in seconds; 600s (10 min) is a vast margin that still
-# reclaims a wedged holder within two launchd intervals.
-PILOT_LOCK_MAX_AGE="${PILOT_LOCK_MAX_AGE:-600}"
+# MEASURED (ga-6atm7, 2026-08-07): 2099 completed sweeps parsed from this
+# script's own start/complete log lines over a 16-day window (2026-07-23 ..
+# 2026-08-07) — p50=192s p75=344s p90=523s p95=667s p99=1092s max=3048s. The
+# old comment here ("finishes in seconds") and the old 600s default were both
+# wrong: real sweeps routinely exceed 600s (141/2099 measured, 6.7%, and that
+# undercounts the effect — once StartInterval < duration, most slow sweeps get
+# reclaimed by an overlapping instance before they can log their own
+# "complete", so they never show up as a clean sample at all: 184 sweeps were
+# taken over mid-run in the same window, live example "heartbeat age 761s >=
+# 600s" on 2026-08-07). A slow-but-alive sweep was routinely declared dead and
+# its lock stolen, discarding its in-flight work (ga-y0g5x is the same root
+# class in a sibling watchdog: StartInterval shorter than the job's own real
+# duration). 1200s clears p99 (1092s) with real margin — this threshold exists
+# to catch a DEAD/wedged holder, not a merely slow one — while still reclaiming
+# a truly wedged sweep within two StartInterval periods, the same "two launchd
+# intervals" intent the old comment stated, just recalibrated to the real
+# number. Pairs with com.gascity.pilot.plist's StartInterval, raised from 300s
+# to 600s (itself > p90) in the same fix — see scripts/com.gascity.pilot.plist,
+# the newly git-tracked copy of the live ~/Library/LaunchAgents plist.
+PILOT_LOCK_MAX_AGE="${PILOT_LOCK_MAX_AGE:-1200}"
 PILOT_LOCK_TOKEN="$$:${RANDOM}${RANDOM}"
 
 # Age (seconds) of a heartbeat file; a huge number if it is missing.

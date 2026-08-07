@@ -197,6 +197,55 @@ else
 fi
 clear_lock
 
+# ── Scenario E (ga-6atm7 AC): the numbers actually align — StartInterval <
+# default PILOT_LOCK_MAX_AGE, and the default has real margin over a merely
+# slow (but alive) sweep instead of the pre-fix 600s that declared a routine
+# ~10min sweep dead (measured: p90=523s, 141/2099 sweeps > 600s, 184 sweeps
+# taken over mid-run in a 16-day window). ─────────────────────────────────────
+echo "Scenario E: PILOT_LOCK_MAX_AGE default has real margin (ga-6atm7)"
+
+DEFAULT_MAX_AGE="$(grep -oE 'PILOT_LOCK_MAX_AGE:-[0-9]+' "$DISPATCHER" | head -1 | grep -oE '[0-9]+$')"
+PLIST="$SELF_DIR/../../../scripts/com.gascity.pilot.plist"
+if [ -f "$PLIST" ]; then
+  PLIST_INTERVAL="$(sed -n '/<key>StartInterval<\/key>/{n;p;}' "$PLIST" | grep -oE '[0-9]+')"
+else
+  PLIST_INTERVAL=""
+fi
+
+if [ -n "$DEFAULT_MAX_AGE" ] && [ -n "$PLIST_INTERVAL" ] && [ "$PLIST_INTERVAL" -lt "$DEFAULT_MAX_AGE" ]; then
+  ok "com.gascity.pilot.plist StartInterval (${PLIST_INTERVAL}s) < default PILOT_LOCK_MAX_AGE (${DEFAULT_MAX_AGE}s)"
+else
+  bad "StartInterval/PILOT_LOCK_MAX_AGE misaligned (plist=${PLIST_INTERVAL:-?}s, default=${DEFAULT_MAX_AGE:-?}s) — a normal sweep can overlap its own next invocation and get its lock stolen"
+fi
+
+# A lock aged 900s is well above the historical p90 (523s) a slow-but-alive
+# sweep can legitimately take, and above the OLD 600s default that used to
+# kill it — but must stay below the new default, so it must NOT be reclaimed.
+clear_lock
+mkdir -p "$LOCK_DIR"
+echo "slow-but-alive-token" > "$LOCK_HB"
+touch -t "$(date -v-900S +%Y%m%d%H%M.%S)" "$LOCK_HB" 2>/dev/null || true
+LOGE1="$(run_dispatch)"     # no override — exercises the PRODUCTION default
+if echo "$LOGE1" | grep -q "Recovered STALE"; then
+  bad "REGRESSION: a 900s-old heartbeat was reclaimed under the production default — a routine slow sweep would get its lock stolen mid-work"
+else
+  ok "a 900s-old heartbeat (slow-but-alive range) backs off, not reclaimed, under the production default"
+fi
+clear_lock
+
+# A lock aged 1300s is past the new default (1200s) — a genuinely wedged
+# holder must still be recovered in bounded time, not left to wedge forever.
+mkdir -p "$LOCK_DIR"
+echo "zombie-holder-token" > "$LOCK_HB"
+touch -t "$(date -v-1300S +%Y%m%d%H%M.%S)" "$LOCK_HB" 2>/dev/null || true
+LOGE2="$(run_dispatch)"     # no override — exercises the PRODUCTION default
+if echo "$LOGE2" | grep -q "Recovered STALE"; then
+  ok "a 1300s-old heartbeat (past the new default) is still recovered under the production default"
+else
+  bad "a 1300s-old heartbeat was NOT recovered — a genuinely dead holder would wedge the dispatcher indefinitely"
+fi
+clear_lock
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "lock.selftest: $PASS passed, $FAIL failed"

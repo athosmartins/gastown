@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>BEADS_DOLT_SERVER_PORT</key>
+		<string>52756</string>
+		<key>GC_CITY_PATH</key>
+		<string>/Users/athos/gt/.gascity-gastown-hq</string>
+		<key>HOME</key>
+		<string>/Users/athos</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+		<key>PILOT_CTX_READY_RIG_QUERIES</key>
+		<string>1</string>
+		<key>PILOT_CTX_READY_RIGS</key>
+		<string>whatsapp_automation property_scrapers</string>
+		<key>PILOT_SPAWN_PS_WORKER</key>
+		<string>1</string>
+		<key>PILOT_PS_WORKER_MAX</key>
+		<string>2</string>
+		<key>PILOT_SPAWN_WA_WORKER</key>
+		<string>1</string>
+		<key>PILOT_SUSPENDED_CREWS_OVERRIDE</key>
+		<string>batista-ps</string>
+		<key>PILOT_WA_WORKER_MAX</key>
+		<string>4</string>
+	</dict>
+	<key>Label</key>
+	<string>com.gascity.pilot</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/pilot-dispatcher.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/pilot-dispatcher-launchd.err</string>
+	<key>StandardOutPath</key>
+	<string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/pilot-dispatcher-launchd.out</string>
+	<key>StartInterval</key>
+	<integer>600</integer>
+</dict>
+</plist>
