@@ -328,7 +328,9 @@ done < <(echo "$IN_PROGRESS" | jq -r '
     | (try ($ts | fromdateiso8601) catch null) as $epoch
     | ((.labels // [])
        | map(select(startswith("orphan-sweep:shielded-until:"))
-             | ltrimstr("orphan-sweep:shielded-until:") | tonumber)
+             | ltrimstr("orphan-sweep:shielded-until:")
+             | (try tonumber catch null))
+       | map(select(. != null))
        | max // 0) as $shield_until
     | [.id, .assignee,
        (if $epoch != null then (($now - $epoch) | floor) else 999999999 end),
