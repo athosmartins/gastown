@@ -3441,10 +3441,20 @@ _ownership_guard_repos() {
 # this exact priming step is independently extractable and testable via the
 # same extract_fn helper pilot-dispatcher.ns-rig-list-gc-failure.selftest.sh
 # already uses for every other function under test here.
+# ga-130et fix-attempt-3: gate review of fix-attempt-2 found the bare call
+# below crashed the ENTIRE script under this file's `set -euo pipefail` any
+# time `gc rig list` failed — _ownership_guard_repos legitimately returns 1
+# on a real fetch failure (gc_json_or_unknown's documented failure modes),
+# and an unguarded function call whose last statement fails propagates that
+# failure straight through errexit. `|| true` at the call site (matching the
+# sibling rig_root_path cache's own `$(...) || true` fail-open convention,
+# ga-07509) keeps the memo globals — including _OWNERSHIP_GUARD_REPOS_FAILED,
+# which every real caller already checks — set exactly as before; only the
+# incidental script-aborting side effect of a failed prime is suppressed.
 _ownership_guard_repos_prime() {
   _ownership_guard_repos >/dev/null
 }
-_ownership_guard_repos_prime
+_ownership_guard_repos_prime || true
 
 # ── TTL claim-recovery (relocated from ~L1586, ga-wisp-1gdiik) ────────────────
 # Runs HERE, after the stale-sling helpers + _ownership_guard_repos are defined, so

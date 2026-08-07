@@ -449,6 +449,109 @@ EOF
 fi
 unset -f _ownership_guard_repos_prime _filter_built _beadid_matched_crew_branch_ref 2>/dev/null || true
 
+# ═════════════════════════════════════════════════════════════════════════
+# 7. ga-130et fix-attempt-3: gate review of fix-attempt-2 found that the
+#    top-level `_ownership_guard_repos_prime` call (section 6) is invoked
+#    BARE, under pilot-dispatcher.sh's own top-of-file `set -euo pipefail`.
+#    _ownership_guard_repos legitimately returns 1 whenever
+#    `gc rig list --json` fails (subprocess failure, empty output, bad JSON,
+#    or an explicit ok:false envelope — gc_json_or_unknown's four documented
+#    failure modes), and a bare, unguarded call whose last statement fails
+#    aborts the ENTIRE script under set -e before the dispatch loop even
+#    runs — turning a transient gc/Dolt hiccup at startup into total sweep
+#    failure, a regression from the documented fail-open design (the sibling
+#    rig_root_path cache explicitly retries-on-failure rather than crashing,
+#    citing ga-07509).
+#    Sections 5/6's mocked `gc` always exits 0, so neither exercises this
+#    path. This test harness itself runs under `set -uo pipefail` (no -e,
+#    see top of file) so it cannot observe an errexit abort by simply
+#    calling the extracted function in-process — it needs a REAL child bash
+#    process with `set -euo pipefail` actually enabled, matching the
+#    dispatcher's own top-level semantics, to reproduce (or fail to
+#    reproduce) the abort.
+#    Negative control hand-sets fix-attempt-2's exact shipped shape (bare
+#    call, same convention section 6 uses for its negative control) to prove
+#    this harness can detect the crash at all. The positive proof instead
+#    extracts the ACTUAL shipped top-level invocation line via grep — not
+#    hand-typed — so a future regression back to a bare call is caught here
+#    too, not just today's specific fix.
+# ═════════════════════════════════════════════════════════════════════════
+echo "-- ga-130et fix-attempt-3: a gc failure at prime time must not abort the whole dispatcher under set -e --"
+
+_p3_setline="$(grep -n '^set -' "$DISPATCHER" | head -1 | cut -d: -f2-)"
+_p3_gjou_src="$(extract_fn gc_json_or_unknown "$DISPATCHER")"
+_p3_ogr_src="$(extract_fn _ownership_guard_repos "$DISPATCHER")"
+_p3_prime_src="$(extract_fn _ownership_guard_repos_prime "$DISPATCHER")"
+_p3_invoke_line="$(grep -n '^_ownership_guard_repos_prime' "$DISPATCHER" | grep -v '()' | head -1 | cut -d: -f2-)"
+
+if [ -z "$_p3_setline" ] || [ -z "$_p3_gjou_src" ] || [ -z "$_p3_ogr_src" ] \
+   || [ -z "$_p3_prime_src" ] || [ -z "$_p3_invoke_line" ]; then
+  bad "FATAL: could not extract set-line/gc_json_or_unknown/_ownership_guard_repos/_ownership_guard_repos_prime/invoke-line from $DISPATCHER — cannot run section 7"
+else
+  SANDBOX_BIN7="$(mktemp -d)"
+  cat > "$SANDBOX_BIN7/gc" <<'GCEOF'
+#!/usr/bin/env bash
+exit 1
+GCEOF
+  chmod +x "$SANDBOX_BIN7/gc"
+  _P3_GC_CITY="$(mktemp -d)"
+
+  # Common preamble shared by both child scripts: real set -e semantics,
+  # real (extracted) function bodies, a warn() stub (pilot-dispatcher.sh's
+  # own logger, not under test here — same stub the top of this file uses),
+  # and a PRE marker proving the child got this far before either variant's
+  # own invocation line runs.
+  _p3_base="$(mktemp)"
+  {
+    printf '%s\n' "$_p3_setline"
+    echo 'warn() { :; }'
+    printf '%s\n' "$_p3_gjou_src"
+    printf '%s\n' "$_p3_ogr_src"
+    echo '_OWNERSHIP_GUARD_REPOS=""'
+    echo '_OWNERSHIP_GUARD_REPOS_DONE=""'
+    echo '_OWNERSHIP_GUARD_REPOS_FAILED=""'
+    printf '%s\n' "$_p3_prime_src"
+    printf 'GC_CITY=%q\n' "$_P3_GC_CITY"
+    echo 'echo PRE_PRIME_MARKER'
+  } > "$_p3_base"
+
+  _p3_neg_script="$(mktemp)"
+  cat "$_p3_base" > "$_p3_neg_script"
+  {
+    echo '_ownership_guard_repos_prime'
+    echo 'echo POST_PRIME_MARKER'
+  } >> "$_p3_neg_script"
+
+  _p3_pos_script="$(mktemp)"
+  cat "$_p3_base" > "$_p3_pos_script"
+  {
+    printf '%s\n' "$_p3_invoke_line"
+    echo 'echo POST_PRIME_MARKER'
+  } >> "$_p3_pos_script"
+  rm -f "$_p3_base"
+
+  # -- Negative control: fix-attempt-2's exact shipped shape (bare call) —
+  #    must abort before the post marker prints. --
+  _p3_neg_out="$(PATH="$SANDBOX_BIN7:$PATH" bash "$_p3_neg_script" 2>&1)"; _p3_neg_rc=$?
+  if [ "$_p3_neg_rc" -ne 0 ] && ! printf '%s' "$_p3_neg_out" | grep -q POST_PRIME_MARKER; then
+    ok "negative control: fix-attempt-2's bare invocation shape aborts the whole script on a gc failure (rc=$_p3_neg_rc, post-marker absent) — confirms this test can detect the bug"
+  else
+    bad "negative control did not reproduce the crash (rc=$_p3_neg_rc, output: $_p3_neg_out) — the positive result below would not be meaningful; investigate before trusting it"
+  fi
+
+  # -- Positive proof: the ACTUAL shipped top-level invocation line — must
+  #    survive a gc failure and keep running. --
+  _p3_pos_out="$(PATH="$SANDBOX_BIN7:$PATH" bash "$_p3_pos_script" 2>&1)"; _p3_pos_rc=$?
+  if [ "$_p3_pos_rc" -eq 0 ] && printf '%s' "$_p3_pos_out" | grep -q POST_PRIME_MARKER; then
+    ok "ga-130et fix-attempt-3 FIXED: the shipped top-level invocation ('$_p3_invoke_line') survives a gc rig list failure and the script keeps running"
+  else
+    bad "ga-130et fix-attempt-3 REGRESSION: the shipped top-level invocation ('$_p3_invoke_line') still aborts the whole script on a gc failure (rc=$_p3_pos_rc, output: $_p3_pos_out)"
+  fi
+
+  rm -f "$_p3_neg_script" "$_p3_pos_script"
+  rm -rf "$SANDBOX_BIN7" "$_P3_GC_CITY"
+fi
+
 echo ""
 echo "Results: $P passed, $F failed"
 [ "$F" -eq 0 ] && exit 0 || exit 1
