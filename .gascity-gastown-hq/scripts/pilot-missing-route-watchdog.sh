@@ -114,10 +114,45 @@
 #     now" (the exact ga-5jyo8/ga-elvua trap this same dog session hit
 #     twice earlier reading its OWN pool-probe candidates), so only an
 #     active marker excludes, not label residue.
+# TWELFTH exclusion (ga-hhj7u): pilot.dispatched_at RECENT (within
+# PMRW_DISPATCH_RECENCY_MINUTES, default 240/4h) → excluded. Root cause:
+# Pilot's own chore/task/debt dispatch path (pilot-dispatcher.sh) does NOT
+# stamp gc.routed_to on the TARGET bead itself — only on the Pilot-created
+# sling/dispatch-wrapper bead (the eleventh exclusion above, pilot.sling_for,
+# already excludes the WRAPPER; this is the mirror-image gap on the TARGET
+# side). So every freshly-dispatched chore/task/debt bead legitimately reads
+# armed+open+unrouted for the bead's entire in-flight duration — normal,
+# by-design behavior, not a routing gap. Measured directly against this
+# bug's own incident (Mayor, 2026-08-07): of 13 beads flagged that sweep, 6
+# had a dispatched_at under 4h old and were ALL confirmed still-legitimate
+# in-flight work; the 4h line cleanly separated them from the one genuinely-
+# stuck case (dispatched_at > 4h old). This default is that measured split,
+# not a blind guess — PMRW_DISPATCH_RECENCY_MINUTES remains env-overridable
+# if a future sweep's data suggests tightening or loosening it.
+#   ⚠️ dispatched_at OLD (>= the window) or ABSENT is NOT exonerating — it's
+#   the opposite. ga-o9uvc (cited above) was a 13-day-stale dispatched_at
+#   COMPOUNDING the invisibility (Pilot read "already dispatched", skipped
+#   re-dispatch, two blockers stacked). This clause only fires on RECENT
+#   dispatched_at; old-or-absent falls through to every other check exactly
+#   as before this fix — the discriminator is the AGE of dispatched_at,
+#   never merely its presence.
+#   BONUS OVERRIDE (cheap, one extra per-candidate query, only paid when the
+#   recency clause would otherwise exclude): if pilot.sling_bead is also
+#   set, the sling wrapper bead's OWN status is checked
+#   (_pmrw_sling_status_probe). A CLOSED sling wrapper while the target is
+#   still open+armed+unrouted is a STRONG signal independent of dispatch
+#   recency (the dispatch attempt concluded one way or another, yet the
+#   target was never claimed/routed/closed) — this overrides the recency
+#   exclusion back to a flag. A query failure or a still-OPEN sling does
+#   NOT override (fails toward keeping the recency exclusion in effect — an
+#   unreliable bonus probe must not undermine the primary fix's
+#   reliability).
+#
 # What's left: status=open, NOT epic, ctx:ready AND exec:auto BOTH present
 # (the "looks ready in the panel" signal ga-f54ui's own text uses),
 # gc.routed_to empty/absent, no story:* label, aged past grace, none of the
-# eleven holds/wrappers/graph-steps/parks/active-gates above applying.
+# twelve holds/wrappers/graph-steps/parks/active-gates/recent-dispatches
+# above applying.
 #
 # GRACE PERIOD (PMRW_GRACE_MINUTES, default 10): unlike GMMSW's gate-status
 # loss (happens once, atomically, at marker creation — 5min grace), an armed
@@ -179,6 +214,11 @@ PMRW_DRY_RUN="${PMRW_DRY_RUN:-0}"
 PMRW_GRACE_MINUTES="${PMRW_GRACE_MINUTES:-10}"
 PMRW_ALERT_COOLDOWN_S="${PMRW_ALERT_COOLDOWN_S:-21600}"   # 6h — matches GMMSW/GOLW precedent
 PMRW_NOTIFY_PRIORITY="${PMRW_NOTIFY_PRIORITY:-2}"
+# ga-hhj7u: window during which a RECENT pilot.dispatched_at excludes a
+# candidate (route intentionally lives on the sling wrapper, not the target
+# — see header). Default 240min/4h — the measured split from this bug's own
+# incident, not a guess (see header for the full derivation).
+PMRW_DISPATCH_RECENCY_MINUTES="${PMRW_DISPATCH_RECENCY_MINUTES:-240}"
 
 HQ="${PMRW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 # Same store set as GOLW (gate-orphaned-label-watchdog.sh), same rationale:
@@ -235,6 +275,36 @@ _gate_artifact_probe() {
                       ((.labels // []) | index("gate-status:reviewing"))   or
                       ((.labels // []) | index("gate-status:running")) )
       ] | if length > 0 then "1" else "0" end
+    ' 2>/dev/null
+}
+
+# _pmrw_sling_status_probe <sling_bead_id> <store>
+# ga-hhj7u bonus check: prints "closed" if the named sling/dispatch-wrapper
+# bead is closed, "open" if it's still open, "error" if the query failed or
+# the bead is gone/unresolvable. Uses the exact-match `list --id <id>` flag
+# form, never a positional `bd show <id>` (same
+# [[bd-cli-invalid-id-fuzzy-matches-unrelated-bead-silently]] hygiene as
+# _bead_recheck_status). FAIL-OPEN direction is the OPPOSITE of
+# _gate_artifact_probe's on purpose: this probe only ever OVERRIDES an
+# exclusion the recency clause already granted, it does not gate the
+# primary detector — so "error"/"gone" must not flip a normal recent
+# dispatch into a false alarm. Caller treats anything other than a
+# confirmed "closed" as "don't override."
+_pmrw_sling_status_probe() {
+  local _sid="$1" _store="$2" _out _rc
+  _out=$("$BD_BIN" -C "$_store" list --id "$_sid" --all --json 2>/dev/null \
+    | jq -c 'if type=="array" then . else [.] end' 2>/dev/null)
+  _rc=$?
+  if [ "$_rc" -ne 0 ] || [ -z "${_out:-}" ] || [ "$_out" = "null" ]; then
+    printf 'error\n'
+    return 1
+  fi
+  printf '%s' "$_out" | jq -r --arg id "$_sid" '
+      ([ .[] | select(.id == $id) ] | .[0]) as $b
+      | if $b == null then "error"
+        elif ($b.status // "") == "closed" then "closed"
+        else "open"
+        end
     ' 2>/dev/null
 }
 
@@ -419,13 +489,39 @@ run_sweep() {
         | [ $b.id,
             ($L | join(",")),
             ($b.issue_type // $b.type // "?"),
-            ( if $epoch then (((($now_ts) - $epoch) / 60) | floor | tostring) else "?" end )
+            ( if $epoch then (((($now_ts) - $epoch) / 60) | floor | tostring) else "?" end ),
+            ($b.metadata["pilot.dispatched_at"] // ""),
+            ($b.metadata["pilot.sling_bead"] // "")
           ] | @tsv
       ' 2>/dev/null)
     [ -z "${rows:-}" ] && continue
-    local gate_active
-    while IFS=$'\t' read -r bid blabels btype age_min; do
+    local gate_active dispatched_at sling_bead dispatch_age_s recency_threshold_s sling_status sling_override
+    while IFS=$'\t' read -r bid blabels btype age_min dispatched_at sling_bead; do
       [ -z "${bid:-}" ] && continue
+
+      # ga-hhj7u: recent pilot.dispatched_at → normally excluded (route
+      # intentionally lives on the sling wrapper, not this bead — see
+      # header). Bash-only, no query, so it's checked first (cheapest).
+      case "${dispatched_at:-}" in
+        ''|*[!0-9]*) ;;  # absent/non-numeric — not exonerating, fall through unchanged
+        *)
+          dispatch_age_s=$(( now - dispatched_at ))
+          recency_threshold_s=$(( PMRW_DISPATCH_RECENCY_MINUTES * 60 ))
+          if [ "$dispatch_age_s" -ge 0 ] && [ "$dispatch_age_s" -lt "$recency_threshold_s" ]; then
+            sling_override=0
+            if [ -n "${sling_bead:-}" ]; then
+              sling_status="$(_pmrw_sling_status_probe "$sling_bead" "$store")"
+              [ "$sling_status" = "closed" ] && sling_override=1
+            fi
+            if [ "$sling_override" -ne 1 ]; then
+              log "  - SKIP $bid ($(_store_name "$store")): pilot.dispatched_at ${dispatch_age_s}s ago (< ${PMRW_DISPATCH_RECENCY_MINUTES}m recency window) — route intentionally lives on the sling wrapper, not a routing gap (ga-hhj7u)"
+              continue
+            fi
+            log "  - $bid ($(_store_name "$store")): recently dispatched (${dispatch_age_s}s ago) but sling wrapper $sling_bead is CLOSED while still armed+unrouted — strong signal, NOT excluded (ga-hhj7u bonus)"
+          fi
+          ;;
+      esac
+
       gate_active="$(_gate_artifact_probe "$bid")"
       if [ "$gate_active" = "1" ]; then
         log "  - SKIP $bid ($(_store_name "$store")): active gate marker/run in flight — already dispatched+built+submitted, not a routing gap"
@@ -665,6 +761,10 @@ BDSTUB
 
   OLD_TS="$(date -u -v-1H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)"
   FRESH_TS="$(date -u -v-1M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%SZ)"
+  # ga-hhj7u: epoch (not ISO) timestamps for pilot.dispatched_at fixtures —
+  # a separate concept from the updated_at/created_at aging above.
+  DISPATCH_RECENT_EPOCH=$(( $(date +%s) - 1800 ))    # 30min ago — within the 240min default window
+  DISPATCH_OLD_EPOCH=$(( $(date +%s) - 18000 ))      # 5h ago — past the 240min default window
 
   mk() {  # id status labels_csv updated_at [metadata_json]
     local id="$1" status="$2" labels="$3" updated="$4" meta="${5:-}"
@@ -1057,6 +1157,83 @@ BDSTUB
   grep -qE "OK:|FLAGGED:" "$LOG29" 2>/dev/null && bad "scenario 29: sweep RAN despite a live holder with a stale heartbeat — age wrongly overrode liveness (the exact GATE-FEEDBACK regression)" || ok "scenario 29: sweep did NOT run — live holder protected despite a stale heartbeat"
   grep -q "backing off (single-instance guard" "$LOG29" 2>/dev/null && ok "scenario 29: second run backed off silently, as required" || bad "scenario 29: no back-off log line — second run may not have deferred correctly"
   rm -rf "$LOCKTEST29"
+
+  # ── Scenario 30 (ga-hhj7u): RECENT pilot.dispatched_at, no sling_bead →
+  # excluded. The core false-positive this bug reports: a freshly-dispatched
+  # chore/task/debt bead legitimately reads armed+unrouted for its whole
+  # in-flight duration (route lives on the sling wrapper, not this bead).
+  echo "Scenario 30 (ga-hhj7u): armed+unrouted+aged but pilot.dispatched_at RECENT (30min ago) → excluded, not a routing gap"
+  reset_stores
+  printf '[%s]' "$(mk ga-30 open 'ctx:ready,exec:auto' "$OLD_TS" "$(printf '{"pilot.dispatched_at":"%s"}' "$DISPATCH_RECENT_EPOCH")")" > "$TMP/fixtures/store-a.json"
+  N30="$TMP/notif30"; M30="$TMP/mail30"; C30="$TMP/comm30"; : > "$N30"; : > "$M30"; : > "$C30"
+  PMRW_TEST_NOTIFIED="$N30" PMRW_TEST_MAILED="$M30" PMRW_TEST_COMMENTS_LOG="$C30" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 30: recent dispatch excluded (return 0)" || bad "scenario 30: recent dispatch should be excluded, got $rc"
+  [ ! -s "$C30" ] && ok "scenario 30: no comment posted" || bad "scenario 30 (false positive): comment posted on a recently-dispatched bead"
+
+  # ── Scenario 31 (ga-hhj7u): OLD pilot.dispatched_at → still flags. The
+  # bug's own core discriminator: age exonerates nothing — an OLD
+  # dispatched_at is aggravating (ga-o9uvc precedent), never exonerating.
+  echo "Scenario 31 (ga-hhj7u): pilot.dispatched_at OLD (5h ago, past the 240min window) → still flagged — age is not exonerating"
+  reset_stores
+  printf '[%s]' "$(mk ga-31 open 'ctx:ready,exec:auto' "$OLD_TS" "$(printf '{"pilot.dispatched_at":"%s"}' "$DISPATCH_OLD_EPOCH")")" > "$TMP/fixtures/store-a.json"
+  N31="$TMP/notif31"; M31="$TMP/mail31"; C31="$TMP/comm31"; : > "$N31"; : > "$M31"; : > "$C31"
+  PMRW_TEST_NOTIFIED="$N31" PMRW_TEST_MAILED="$M31" PMRW_TEST_COMMENTS_LOG="$C31" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 31: old dispatch still flags (return 1)" || bad "scenario 31: old dispatch should still flag, got $rc"
+  grep -q "comment:ga-31" "$C31" 2>/dev/null && ok "scenario 31: comment posted despite dispatched_at being present" || bad "scenario 31: no comment — old dispatched_at wrongly treated as exonerating"
+
+  # ── Scenario 32 (ga-hhj7u): NO pilot.dispatched_at (never dispatched) →
+  # still flags. The other real-signal population from the bug's own count
+  # (6 of 13: never dispatched, armed and invisible).
+  echo "Scenario 32 (ga-hhj7u): no pilot.dispatched_at at all (never dispatched) → still flagged"
+  reset_stores
+  printf '[%s]' "$(mk ga-32 open 'ctx:ready,exec:auto' "$OLD_TS")" > "$TMP/fixtures/store-a.json"
+  N32="$TMP/notif32"; M32="$TMP/mail32"; C32="$TMP/comm32"; : > "$N32"; : > "$M32"; : > "$C32"
+  PMRW_TEST_NOTIFIED="$N32" PMRW_TEST_MAILED="$M32" PMRW_TEST_COMMENTS_LOG="$C32" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 32: never-dispatched bead still flags (return 1)" || bad "scenario 32: never-dispatched bead should still flag, got $rc"
+  grep -q "comment:ga-32" "$C32" 2>/dev/null && ok "scenario 32: comment posted for never-dispatched bead" || bad "scenario 32: no comment for never-dispatched bead"
+
+  # ── Scenario 33 (ga-hhj7u bonus): RECENT dispatch + sling_bead present +
+  # sling still OPEN → still excluded (the override must NOT fire on a
+  # merely-open sling, only on a CONFIRMED-closed one).
+  echo "Scenario 33 (ga-hhj7u bonus): recent dispatch, sling wrapper present and still OPEN → still excluded"
+  reset_stores
+  printf '[%s]' "$(mk ga-33 open 'ctx:ready,exec:auto' "$OLD_TS" "$(printf '{"pilot.dispatched_at":"%s","pilot.sling_bead":"ga-33-sling"}' "$DISPATCH_RECENT_EPOCH")")" > "$TMP/fixtures/store-a.json"
+  printf '[{"id":"ga-33-sling","status":"open"}]' > "$TMP/recheck/store-a-ga-33-sling.json"
+  N33="$TMP/notif33"; M33="$TMP/mail33"; C33="$TMP/comm33"; : > "$N33"; : > "$M33"; : > "$C33"
+  PMRW_TEST_NOTIFIED="$N33" PMRW_TEST_MAILED="$M33" PMRW_TEST_COMMENTS_LOG="$C33" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 33: open sling does not override recency exclusion (return 0)" || bad "scenario 33: open sling must not override, got $rc"
+  [ ! -s "$C33" ] && ok "scenario 33: no comment posted" || bad "scenario 33: comment posted despite sling still open"
+
+  # ── Scenario 34 (ga-hhj7u bonus): RECENT dispatch + sling_bead present +
+  # sling CLOSED while target still armed+unrouted → overrides back to
+  # flagged. The strong-signal case Mayor called out explicitly.
+  echo "Scenario 34 (ga-hhj7u bonus): recent dispatch, sling wrapper CLOSED while target still armed+unrouted → overrides recency, still flags"
+  reset_stores
+  printf '[%s]' "$(mk ga-34 open 'ctx:ready,exec:auto' "$OLD_TS" "$(printf '{"pilot.dispatched_at":"%s","pilot.sling_bead":"ga-34-sling"}' "$DISPATCH_RECENT_EPOCH")")" > "$TMP/fixtures/store-a.json"
+  printf '[{"id":"ga-34-sling","status":"closed"}]' > "$TMP/recheck/store-a-ga-34-sling.json"
+  N34="$TMP/notif34"; M34="$TMP/mail34"; C34="$TMP/comm34"; : > "$N34"; : > "$M34"; : > "$C34"
+  PMRW_TEST_NOTIFIED="$N34" PMRW_TEST_MAILED="$M34" PMRW_TEST_COMMENTS_LOG="$C34" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 34: closed sling overrides recency exclusion (return 1)" || bad "scenario 34: closed sling should override and flag, got $rc"
+  grep -q "comment:ga-34" "$C34" 2>/dev/null && ok "scenario 34: comment posted (override fired)" || bad "scenario 34: no comment — override did not fire on a closed sling"
+
+  # ── Scenario 35 (ga-hhj7u bonus, fail-safe): RECENT dispatch + sling_bead
+  # present but the sling status query FAILS → stays excluded (an
+  # unreliable bonus probe must not undermine the primary fix's precision;
+  # see _pmrw_sling_status_probe's documented fail-open direction).
+  echo "Scenario 35 (ga-hhj7u bonus, fail-safe): sling status query fails → recency exclusion still holds, no false alarm"
+  reset_stores
+  printf '[%s]' "$(mk ga-35 open 'ctx:ready,exec:auto' "$OLD_TS" "$(printf '{"pilot.dispatched_at":"%s","pilot.sling_bead":"ga-35-sling"}' "$DISPATCH_RECENT_EPOCH")")" > "$TMP/fixtures/store-a.json"
+  echo '__BD_FAIL__' > "$TMP/recheck/store-a-ga-35-sling.json"
+  N35="$TMP/notif35"; M35="$TMP/mail35"; C35="$TMP/comm35"; : > "$N35"; : > "$M35"; : > "$C35"
+  PMRW_TEST_NOTIFIED="$N35" PMRW_TEST_MAILED="$M35" PMRW_TEST_COMMENTS_LOG="$C35" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 35: sling probe failure fails open toward no-alarm (return 0)" || bad "scenario 35: a failed sling probe must not force a flag, got $rc"
+  [ ! -s "$C35" ] && ok "scenario 35: no comment posted despite probe failure" || bad "scenario 35: comment posted off an unconfirmed (failed) sling probe"
 
   echo ""
   echo "pilot-missing-route-watchdog selftest: PASS=$PASS FAIL=$FAIL"

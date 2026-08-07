@@ -39,6 +39,11 @@
     <!-- <key>PMRW_GRACE_MINUTES</key><string>10</string> -->
     <!-- Per-bead re-alert cooldown (seconds). Default: 21600 (6h). -->
     <!-- <key>PMRW_ALERT_COOLDOWN_S</key><string>21600</string> -->
+    <!-- ga-hhj7u: window (minutes) during which a RECENT pilot.dispatched_at
+         excludes a candidate — the route intentionally lives on the Pilot's
+         sling wrapper bead, not the target, for this long. Default: 240
+         (4h), the measured split from this bug's own incident data. -->
+    <!-- <key>PMRW_DISPATCH_RECENCY_MINUTES</key><string>240</string> -->
     <!-- Kill-switch: PMRW_ENABLED=0 disables the watchdog entirely. -->
     <!-- <key>PMRW_ENABLED</key><string>1</string> -->
     <!-- Dry-run: PMRW_DRY_RUN=1 logs findings but sends no comment/notify/mail. -->
