@@ -225,7 +225,7 @@ for needle, desc in [
     ("def reap_hung_runs(", "FIX1 reap_hung_runs() driver is defined"),
     ("def error_requeue_verdict(", "FIX2 pure requeue decision is defined"),
     ("def requeue_error_markers(", "FIX2 requeue_error_markers() driver is defined"),
-    ("reap_hung_runs(sessions, now, rstate)", "main() reaps hung reviewers each loop"),
+    ("reap_hung_runs(sessions, now, rstate, open_running_runs)", "main() reaps hung reviewers each loop"),  # ga-dr1g9: needle updated for ga-7e7a's open_running_runs dedup param (was stale 3-arg form)
     ("requeue_error_markers(now, rstate)", "main() requeues stuck error markers each loop"),
     ("def set_gate_status_py(", "canonical gate-status transition helper is defined"),
     # ga-m1o5: Pilot-silence sleep/wake grace (ports daemon-presence-watchdog.sh's DPW_WAKE_GRACE)
@@ -503,7 +503,7 @@ else:
 print("Scenario 15g: drift-guard — reap_stranded_verdict_runs anchors on _run_verdicts' 4th value, not run started_at")
 src2 = open(wd_path).read()
 import re as _re_dg
-fn_match = _re_dg.search(r"def reap_stranded_verdict_runs\(now\):.*?(?=\ndef )", src2, _re_dg.S)
+fn_match = _re_dg.search(r"def reap_stranded_verdict_runs\(now, open_running_runs\):.*?(?=\ndef )", src2, _re_dg.S)  # ga-dr1g9: signature gained open_running_runs (ga-7e7a dedup); was stale \(now\)-only pattern
 if not fn_match:
     bad("could not isolate reap_stranded_verdict_runs() body for drift-guard scan")
 else:
