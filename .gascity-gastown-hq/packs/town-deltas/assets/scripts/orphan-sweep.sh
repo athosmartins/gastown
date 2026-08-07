@@ -34,6 +34,23 @@
 # the same sweep, proving this isn't a dog-pool-specific gap. See
 # RECENT_UPDATE_GRACE_SECS below for the added mitigation.
 #
+# ga-114ll: RECENT_UPDATE_GRACE_SECS + CONFIRM_THRESHOLD together still
+# weren't enough — confirmed live 2026-08-06/07: a claim genuinely alive the
+# whole time (owning process at 16.7% CPU, 5h+ tmux session) was reset and
+# self-healed on a ~45min cycle, for hours, because whatever intermittently
+# drops a live claimant from `gc session list --json` (the same gap ga-u0vzx/
+# ga-kq4jf document, still not reproducible on demand) doesn't need to persist
+# long — it only has to land on CONFIRM_THRESHOLD consecutive post-grace
+# sweeps, and eventually does. Widening these same two knobs a third time
+# would only lengthen the cycle, not close it (the read is what's unreliable,
+# not the threshold). Instead: scripts/inflight-reclaim-guard.py's self-heal
+# now stamps orphan-sweep:shielded-until:<epoch> on every claim it restores.
+# This sweep honors that stamp unconditionally in Step 3 below — skipping
+# candidacy regardless of what is_known_agent() concludes — trusting the
+# sibling daemon's fresh, explicit verdict over re-deriving liveness from the
+# exact read that just missed it. A bead that was never healed (a genuinely
+# dead claimant) carries no stamp and sweeps normally.
+#
 # Runs as an exec order (no LLM, no agent, no wisp).
 set -euo pipefail
 
@@ -267,7 +284,16 @@ ORPHANED=0
 CANDIDATES='{}'
 # Process substitution (not a pipe) keeps the loop body in the parent
 # shell so $ORPHANED/$COUNTS/$CANDIDATES survive for the code below.
-while IFS=$'\t' read -r bead_id assignee update_age_secs; do
+while IFS=$'\t' read -r bead_id assignee update_age_secs shield_remaining; do
+    # ga-114ll: inflight-reclaim-guard's self-heal just vouched for this exact
+    # claim on its own, independent poll — honor that verdict unconditionally
+    # for the shield window instead of re-deriving liveness from the same
+    # is_known_agent() check that already missed it once this cycle (see the
+    # header comment above for the full rationale). A bead never healed
+    # carries no stamp (shield_remaining <= 0) and falls through untouched.
+    if [ -n "$shield_remaining" ] && [ "$shield_remaining" -gt 0 ] 2>/dev/null; then
+        continue
+    fi
     if ! is_known_agent "$assignee"; then
         # ga-kq4jf: a recently-updated bead is presumed to have a live owner
         # even though this sweep's session snapshot didn't resolve it — skip
@@ -300,7 +326,13 @@ done < <(echo "$IN_PROGRESS" | jq -r '
     | select(.assignee != null and .assignee != "")
     | (.updated_at // .started_at // .created_at // "") as $ts
     | (try ($ts | fromdateiso8601) catch null) as $epoch
-    | [.id, .assignee, (if $epoch != null then (($now - $epoch) | floor) else 999999999 end)]
+    | ((.labels // [])
+       | map(select(startswith("orphan-sweep:shielded-until:"))
+             | ltrimstr("orphan-sweep:shielded-until:") | tonumber)
+       | max // 0) as $shield_until
+    | [.id, .assignee,
+       (if $epoch != null then (($now - $epoch) | floor) else 999999999 end),
+       (($shield_until - $now) | floor)]
     | @tsv
 ' 2>/dev/null)
 

@@ -9,8 +9,12 @@
 # builtin copy's own orphan-sweep.fake-gc sibling was missing entirely, so
 # that selftest could never actually run — see orphan-sweep.fake-gc's header
 # for a note). Sections 0-6 are the original ga-u0vzx regression coverage,
-# unchanged. Sections 7-8 are new: they prove the ga-a8t68 grace period
-# rescues a recently-touched claim and still lets a genuinely-stale one reset.
+# unchanged. Sections 7-8 prove the ga-a8t68 grace period rescues a
+# recently-touched claim and still lets a genuinely-stale one reset. Sections
+# 9-11 are new (ga-114ll): they prove the self-heal shield label
+# (orphan-sweep:shielded-until:<epoch>) protects unconditionally while
+# active, does not over-protect once expired, and takes the MAX across
+# accumulated stamps rather than the first (ga-4aree class).
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -80,6 +84,7 @@ echo "── 2. drift guards ──"
 if grep -q "CONFIRM_THRESHOLD" "$SCRIPT"; then ok "hysteresis threshold present"; else bad "CONFIRM_THRESHOLD missing — fix reverted?"; fi
 if grep -q "orphan-sweep-counts.json" "$SCRIPT"; then ok "ledger file wired in"; else bad "ledger reference missing"; fi
 if grep -q "RECENT_UPDATE_GRACE_SECS" "$SCRIPT"; then ok "ga-a8t68 grace-period signal present"; else bad "RECENT_UPDATE_GRACE_SECS missing — fix reverted?"; fi
+if grep -q "orphan-sweep:shielded-until:" "$SCRIPT"; then ok "ga-114ll self-heal shield signal present"; else bad "orphan-sweep:shielded-until: missing — fix reverted?"; fi
 
 echo "── 3. functional: single-sweep orphan candidate is NOT reset ──"
 DEAD_ASSIGNEE="dog-longgoneagent"
@@ -131,6 +136,32 @@ INPROGRESS5='[{"id":"ga-test5","assignee":"'"$GONE_ASSIGNEE"'","updated_at":"'"$
 run_sweep '{"sessions":[]}' "$INPROGRESS5" "gastown.dog" >/dev/null
 run_sweep '{"sessions":[]}' "$INPROGRESS5" "gastown.dog" >/dev/null
 if [ "$(count_resets ga-test5)" = "1" ]; then ok "stale-updated_at bead still resets after 2 consecutive sweeps"; else bad "stale-updated_at bead was NOT reset — grace period incorrectly protected it forever (got $(count_resets ga-test5) resets)"; fi
+
+echo "── 9. functional (ga-114ll): an active self-heal shield protects a bead across MANY sweeps, even with an unresolvable assignee every time — and it never enters the ledger ──"
+SHIELDED_ASSIGNEE="dog-shieldedbutalive"
+FUTURE_EPOCH=$(($(date -u +%s) + 3600))
+INPROGRESS6='[{"id":"ga-test6","assignee":"'"$SHIELDED_ASSIGNEE"'","labels":["orphan-sweep:shielded","orphan-sweep:shielded-until:'"$FUTURE_EPOCH"'"]}]'
+run_sweep '{"sessions":[]}' "$INPROGRESS6" "gastown.dog" >/dev/null
+run_sweep '{"sessions":[]}' "$INPROGRESS6" "gastown.dog" >/dev/null
+run_sweep '{"sessions":[]}' "$INPROGRESS6" "gastown.dog" >/dev/null
+if [ "$(count_resets ga-test6)" = "0" ]; then ok "shielded bead survives 3 consecutive sweeps unresolved"; else bad "shielded bead was reset despite an active shield (got $(count_resets ga-test6) resets)"; fi
+if [ "$(ledger_count ga-test6)" = "0" ]; then ok "shielded bead never even entered the hysteresis ledger"; else bad "shielded bead leaked into the ledger (got count $(ledger_count ga-test6)) — shield should skip candidacy entirely"; fi
+
+echo "── 10. functional (ga-114ll): an EXPIRED shield does not over-protect — bead still resets after threshold ──"
+EXPIRED_ASSIGNEE="dog-expiredshield"
+PAST_EPOCH=$(($(date -u +%s) - 3600))
+INPROGRESS7='[{"id":"ga-test7","assignee":"'"$EXPIRED_ASSIGNEE"'","labels":["orphan-sweep:shielded","orphan-sweep:shielded-until:'"$PAST_EPOCH"'"]}]'
+run_sweep '{"sessions":[]}' "$INPROGRESS7" "gastown.dog" >/dev/null
+run_sweep '{"sessions":[]}' "$INPROGRESS7" "gastown.dog" >/dev/null
+if [ "$(count_resets ga-test7)" = "1" ]; then ok "expired-shield bead still resets after 2 consecutive sweeps"; else bad "expired-shield bead was NOT reset — shield incorrectly protected it forever (got $(count_resets ga-test7) resets)"; fi
+
+echo "── 11. functional (ga-114ll): accumulated shield labels (ga-4aree class) — MAX taken, not the first/oldest ──"
+MULTI_ASSIGNEE="dog-multishield"
+FUTURE_EPOCH2=$(($(date -u +%s) + 3600))
+INPROGRESS8='[{"id":"ga-test8","assignee":"'"$MULTI_ASSIGNEE"'","labels":["orphan-sweep:shielded-until:1000000000","orphan-sweep:shielded-until:'"$FUTURE_EPOCH2"'","orphan-sweep:shielded-until:1000000001"]}]'
+run_sweep '{"sessions":[]}' "$INPROGRESS8" "gastown.dog" >/dev/null
+run_sweep '{"sessions":[]}' "$INPROGRESS8" "gastown.dog" >/dev/null
+if [ "$(count_resets ga-test8)" = "0" ]; then ok "MAX of multiple shielded-until labels wins (not the first/an expired one) — bead stays protected"; else bad "took the wrong shielded-until label instead of the MAX — bead was incorrectly reset"; fi
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

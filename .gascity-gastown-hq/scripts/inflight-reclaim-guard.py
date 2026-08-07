@@ -108,26 +108,34 @@ Safety invariants (CRITICAL — actuates on real work beads):
 
 ga-seuh4 / ga-a8t68 (self-heal a DIFFERENT component's false reset): a
 separate, non-Python mechanism — the `order:orphan-sweep` engine order
-(.gc/system/packs/maintenance/assets/scripts/orphan-sweep.sh, go:embed'd into
-the `gc` binary, NOT part of this file and not editable from this repo without
-a Mayor-coordinated engine rebuild+swap) independently resets in_progress
-dog/wa-worker-pool claims it judges orphaned. It already carries a
-CONFIRM_THRESHOLD=2-consecutive-sweep hysteresis (docs/runbooks/
+(default source go:embed'd into the `gc` binary, but THIS city overrides it
+via packs/town-deltas/orders/orphan-sweep.toml, which points at the
+git-tracked, freely-editable packs/town-deltas/assets/scripts/orphan-sweep.sh
+— NOT go:embed'd here, no engine rebuild needed; an earlier version of this
+paragraph said otherwise and that claim was WRONG, see ga-114ll) independently
+resets in_progress dog/wa-worker-pool claims it judges orphaned. It already
+carries a CONFIRM_THRESHOLD=2-consecutive-sweep hysteresis (docs/runbooks/
 ga-u0vzx-orphan-sweep-hysteresis-engine-window.md), but that has proven
-insufficient: confirmed live re-occurrences (ga-adkny, ga-kq4jf x2, ga-0fw8g)
-show the underlying `gc session list --json` transient can persist across 2+
-consecutive ~5min sweeps for a freshly-spawned pool session, wrongfully
-resetting (status=open, assignee cleared) a claim whose session is still
-genuinely alive. Its reset never touches the bead's gc.* metadata
+insufficient: confirmed live re-occurrences (ga-adkny, ga-kq4jf x2, ga-0fw8g,
+ga-114ll) show the underlying `gc session list --json` transient can persist
+across 2+ consecutive ~5min sweeps for a pool session, wrongfully resetting
+(status=open, assignee cleared) a claim whose session is still genuinely
+alive. Its reset never touches the bead's gc.* metadata
 (gc.session_name/gc.work_dir/gc.routed_to, written at claim time), so that
 metadata surviving alongside an empty assignee is a reliable tell.
 heal_orphan_sweep_false_resets() (called once per cycle, below) finds beads
 matching that tell and — ONLY if the stale gc.session_name still resolves to
-a live session — restores status=in_progress + assignee. This is a
-compensating heal, not a prevention: it cannot stop orphan-sweep's reset, but
-it closes the window before a competing worker races into the reopened bead,
-and it self-limits (a genuinely dead session is correctly left alone for
-normal re-dispatch).
+a live session — restores status=in_progress + assignee, AND (ga-114ll)
+stamps orphan-sweep:shielded-until:<epoch> so orphan-sweep.sh skips the same
+bead for ORPHAN_SWEEP_SELFHEAL_SHIELD_SECS instead of re-deriving liveness
+from the exact read that just missed it — widening RECENT_UPDATE_GRACE_SECS/
+CONFIRM_THRESHOLD again would only lengthen the wrongful-reset cycle, not
+close it, since the read itself (not the threshold) is what's unreliable.
+This is a compensating heal, not a prevention: it cannot stop orphan-sweep's
+own is_known_agent() check from failing, but it closes the window before a
+competing worker races into the reopened bead, and it self-limits (a
+genuinely dead session is correctly left alone for normal re-dispatch, and
+never carries a shield since it was never healed).
 """
 import json
 import os
@@ -190,6 +198,22 @@ EPHEMERAL_POOL_ASSIGNEES = frozenset({"wa-worker", "gastown.dog"})
 # Longer than RECLAIM_TTL (25min): no Pilot marker is a weaker signal, and a
 # genuine build (even slow) won't go branchless for 2h.
 POOL_ZOMBIE_TTL = 7200  # 2 hours
+
+# ga-114ll: orphan-sweep.sh's own liveness check (is_known_agent(), bash-side) has
+# no staleness/health notion at all — just "does this identifier appear in a
+# snapshot of `gc session list --json`" — and that snapshot has repeatedly (if
+# rarely) missed a genuinely-live claimant for 2+ consecutive sweeps (ga-u0vzx,
+# ga-kq4jf, ga-114ll). Its own CONFIRM_THRESHOLD + RECENT_UPDATE_GRACE_SECS
+# (30min) mitigations still weren't enough to stop a ~45min wrongful-reset/
+# self-heal cycle recurring for hours. Widening those two knobs a third time
+# would only lengthen the cycle, not close it — the read is what's unreliable,
+# not the threshold. Instead, every successful self-heal restore stamps this
+# much longer, EXPLICIT protection window (orphan-sweep:shielded-until:<epoch>)
+# on the bead; orphan-sweep.sh honors it unconditionally, trusting this guard's
+# fresh verdict over re-deriving liveness from the same read that just missed
+# it. Reuses POOL_ZOMBIE_TTL's already-validated 2h horizon by default rather
+# than inventing a new number.
+ORPHAN_SWEEP_SELFHEAL_SHIELD_SECS = int(os.environ.get("ORPHAN_SWEEP_SELFHEAL_SHIELD_SECS", "7200"))
 
 # ga-hkpwv: session states that definitively prove a non-working session.
 # Used in pool_has_live_worker() to distinguish dead vs unknown states.
@@ -2426,16 +2450,19 @@ def heal_orphan_sweep_false_resets(sessions, now):
     (ga-seuh4/ga-a8t68) while the claiming session was still genuinely alive.
 
     See the module docstring's "ga-seuh4 / ga-a8t68" section for the full
-    root-cause writeup. In short: orphan-sweep.sh is go:embed'd into the `gc`
-    binary and not editable from this repo (a hand-edit of the deployed copy
-    is auto-reverted by the engine's own reconcile within ~1-2min, per the
-    ga-u0vzx runbook's own empirical test) — a real fix needs a Mayor-
-    coordinated rebuild+swap. This is a compensating self-heal in the
-    meantime: it cannot stop orphan-sweep from resetting a bead, but it
-    detects the reset within one of THIS guard's own poll cycles (same ~5min
-    cadence as orphan-sweep's own sweep) and restores the claim before a
-    competing worker can race into the reopened bead — provided the original
-    session is still alive when this check runs.
+    root-cause writeup. In short: orphan-sweep.sh's own is_known_agent() check
+    (bash-side, packs/town-deltas/assets/scripts/orphan-sweep.sh — a
+    git-tracked override, NOT go:embed'd in this city) has no staleness/health
+    notion, just raw presence-in-a-snapshot, and that snapshot has repeatedly
+    missed a genuinely-live claimant despite two prior hardening layers
+    (ga-u0vzx, ga-kq4jf). This is a compensating self-heal, not a prevention:
+    it cannot stop orphan-sweep's own check from failing, but it detects the
+    reset within one of THIS guard's own poll cycles (same ~5min cadence as
+    orphan-sweep's own sweep), restores the claim before a competing worker
+    can race into the reopened bead, and (ga-114ll) stamps a much longer
+    explicit shield so the SAME transient can't immediately re-trigger the
+    same wrongful reset — provided the original session is still alive when
+    this check runs.
 
     Reuses concrete_adhoc_session_is_live() for the liveness check — the same
     multi-field identifier matching + staleness/awaiting-human-input handling
@@ -2499,20 +2526,46 @@ def heal_orphan_sweep_false_resets(sessions, now):
                   f"bead={bead_id}: {exc}", flush=True)
             continue
         healed += 1
+        # ga-114ll: stamp an explicit, much-longer protection window on top of
+        # the restore itself. RECENT_UPDATE_GRACE_SECS (30min, bash-side) already
+        # treats this restore's own bd-update as "recently touched," but that
+        # alone proved insufficient — the same read that missed this claim once
+        # can miss it again after the grace period lapses. This shield is a
+        # distinct, purpose-built signal orphan-sweep.sh honors unconditionally
+        # (see label_matches-style "-until:<epoch>" convention already used for
+        # pilot:held-until elsewhere in this file); it accumulates rather than
+        # overwrites (ga-4aree class), so readers must take the MAX, never the
+        # first/last.
+        _shield_until = int(now) + ORPHAN_SWEEP_SELFHEAL_SHIELD_SECS
+        try:
+            subprocess.run(
+                _bd + ["label", "add", bead_id, "orphan-sweep:shielded", "-q"],
+                capture_output=True, text=True, timeout=15)
+            subprocess.run(
+                _bd + ["label", "add", bead_id,
+                       f"orphan-sweep:shielded-until:{_shield_until}", "-q"],
+                capture_output=True, text=True, timeout=15)
+        except Exception:
+            pass  # shield-stamp failure is non-fatal — the claim restore above already landed
         try:
             subprocess.run(
                 _bd + ["comment", bead_id,
                        f"inflight-reclaim-guard self-heal (ga-seuh4/ga-a8t68): "
                        f"restored to assignee={stale_assignee!r}, status=in_progress "
                        f"after order:orphan-sweep wrongfully reset this claim while "
-                       f"the owning session was still live. Root cause: orphan-sweep.sh "
-                       f"is go:embed'd (can't be fixed from this repo without an engine "
-                       f"rebuild); this is a compensating heal, not a prevention."],
+                       f"the owning session was still live. Stamped "
+                       f"orphan-sweep:shielded-until:{_shield_until} (ga-114ll, "
+                       f"{ORPHAN_SWEEP_SELFHEAL_SHIELD_SECS}s) so orphan-sweep skips "
+                       f"this bead for a while instead of re-deriving liveness from "
+                       f"the same read that just missed it. This is a compensating "
+                       f"heal, not a prevention — orphan-sweep.sh's own check can "
+                       f"still fail the same way once the shield expires."],
                 capture_output=True, text=True, timeout=15)
         except Exception:
             pass  # comment failure is non-fatal
         emit(f"[INFLIGHT-RECLAIM] [SELF-HEALED] bead={bead_id} "
-             f"restored assignee={stale_assignee!r} (order:orphan-sweep false-reset)")
+             f"restored assignee={stale_assignee!r} (order:orphan-sweep false-reset), "
+             f"shielded until {_shield_until}")
     return healed
 
 
@@ -5300,9 +5353,10 @@ def _selftest():
 
     # -----------------------------------------------------------------------
     # Section SH: heal_orphan_sweep_false_resets() / list_orphan_sweep_false_resets()
-    # ga-seuh4/ga-a8t68: order:orphan-sweep (go:embed'd, not editable here)
-    # wrongfully resets live dog-pool claims; these two functions are a
-    # compensating self-heal added to this guard instead.
+    # ga-seuh4/ga-a8t68: order:orphan-sweep (packs/town-deltas/assets/scripts/
+    # orphan-sweep.sh — git-tracked here, not go:embed'd) wrongfully resets live
+    # dog-pool claims; these two functions are a compensating self-heal added to
+    # this guard instead. ga-114ll extends the heal with a shield-label stamp.
     # -----------------------------------------------------------------------
     global _list_rig_stores
     _orig_list_rig_stores = _list_rig_stores
@@ -5327,12 +5381,20 @@ def _selftest():
 
     # SH-1: candidate whose stale gc.session_name matches a LIVE session → healed.
     _sh_update_calls = []
+    _sh_label_calls = []
+    _sh_comment_calls = []
 
     def _stub_sh_heal(cmd, **kw):
         if cmd[:2] == ["bd", "list"]:
             return _FakeGitResult(0, json.dumps([_sh_bead("ga-shtest1", "dog-galive1")]))
         if cmd[:2] == ["bd", "update"]:
             _sh_update_calls.append(list(cmd))
+            return _FakeGitResult(0, "")
+        if cmd[:2] == ["bd", "label"]:
+            _sh_label_calls.append(list(cmd))
+            return _FakeGitResult(0, "")
+        if cmd[:2] == ["bd", "comment"]:
+            _sh_comment_calls.append(list(cmd))
             return _FakeGitResult(0, "")
         return _FakeGitResult(0, "")
 
@@ -5345,18 +5407,39 @@ def _selftest():
               any(c[:2] == ["bd", "update"] and "in_progress" in c and "dog-galive1" in c
                   for c in _sh_update_calls),
               f"calls={_sh_update_calls!r}")
+        # ga-114ll: every successful heal also stamps a shield the next
+        # orphan-sweep pass must honor unconditionally.
+        _expected_shield_until = int(T_sh) + ORPHAN_SWEEP_SELFHEAL_SHIELD_SECS
+        check("SH-1c (ga-114ll): stamps orphan-sweep:shielded on the healed bead",
+              any(c[:2] == ["bd", "label"] and "ga-shtest1" in c and "orphan-sweep:shielded" in c
+                  for c in _sh_label_calls),
+              f"label calls={_sh_label_calls!r}")
+        check("SH-1d (ga-114ll): stamps orphan-sweep:shielded-until:<now+SHIELD_SECS>",
+              any(c[:2] == ["bd", "label"] and "ga-shtest1" in c
+                  and f"orphan-sweep:shielded-until:{_expected_shield_until}" in c
+                  for c in _sh_label_calls),
+              f"expected_until={_expected_shield_until} label calls={_sh_label_calls!r}")
+        check("SH-1e (ga-114ll): self-heal comment cites the shield stamp",
+              any(c[:2] == ["bd", "comment"] and "ga-shtest1" in c
+                  and any(f"shielded-until:{_expected_shield_until}" in arg for arg in c)
+                  for c in _sh_comment_calls),
+              f"comment calls={_sh_comment_calls!r}")
     finally:
         subprocess.run = _orig_run_sh
 
     # SH-2: candidate whose stale gc.session_name matches no live session → left alone
     # (genuinely dead — orphan-sweep's reset was correct, normal re-dispatch applies).
     _sh_update_calls2 = []
+    _sh_label_calls2 = []
 
     def _stub_sh_dead(cmd, **kw):
         if cmd[:2] == ["bd", "list"]:
             return _FakeGitResult(0, json.dumps([_sh_bead("ga-shtest2", "dog-galong-gone")]))
         if cmd[:2] == ["bd", "update"]:
             _sh_update_calls2.append(list(cmd))
+            return _FakeGitResult(0, "")
+        if cmd[:2] == ["bd", "label"]:
+            _sh_label_calls2.append(list(cmd))
             return _FakeGitResult(0, "")
         return _FakeGitResult(0, "")
 
@@ -5366,6 +5449,8 @@ def _selftest():
         check("SH-2: does NOT heal a candidate whose stale gc.session_name matches no live session",
               _healed2 == 0 and _sh_update_calls2 == [],
               f"healed={_healed2} calls={_sh_update_calls2!r}")
+        check("SH-2b (ga-114ll): a genuinely-dead candidate is never shielded either",
+              _sh_label_calls2 == [], f"label calls={_sh_label_calls2!r}")
     finally:
         subprocess.run = _orig_run_sh
 
