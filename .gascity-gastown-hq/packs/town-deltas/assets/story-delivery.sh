@@ -609,11 +609,16 @@ if [ -z "$FORCE_STORY_ID" ]; then
           else
             log "Task reconciler: $TASK_BEAD_ID gate:passed but body looks PARTIAL (ga-k2wjn heuristic, crash-window catch — primary dispatcher never labeled it) — holding, NOT closing; escalating to Mayor."
             if [ "$DRY_RUN" = "1" ]; then
-              log "DRY_RUN=1 — WOULD: label $TASK_BEAD_ID delivery:partial + gate:needs-human, comment, mail mayor (ga-k2wjn task-reconciler backstop)"
+              log "DRY_RUN=1 — WOULD: label $TASK_BEAD_ID delivery:partial + scope:needs-review, comment, mail mayor (ga-k2wjn task-reconciler backstop)"
             else
+              # ga-6dpoa: scope:needs-review, NOT gate:needs-human(:partial-delivery) — the
+              # latter collides with lifecycle-coherence-janitor's R7 rule (treats any
+              # gate:needs-human* label as non-implementable and strips gc.routed_to).
+              # gate:passed (already set) is what actually keeps Pilot from re-dispatching;
+              # this label is purely the human-visible "why". See quality-gate-dispatcher.sh's
+              # primary-path sibling of this block for the full rationale.
               bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "delivery:partial" -q 2>/dev/null || true
-              bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "gate:needs-human" -q 2>/dev/null || true
-              bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "gate:needs-human:partial-delivery" -q 2>/dev/null || true
+              bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "scope:needs-review" -q 2>/dev/null || true
               bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-k2wjn/ga-zhfk8 backstop): gate:passed is set and this bead is not a story, but its body looks like it enumerates multiple approved deliverables (>=3 consecutive numbered or lettered list items — see detected lines below). The primary gate dispatcher never labeled this (crash-window — ga-esbg did not complete on it), so this sweep is doing so now instead of closing. If this diff genuinely covers every enumerated item, add label scope_covered:all and close manually; otherwise the remaining items are still live on this bead.
 
 $TASK_PARTIAL_EVIDENCE" 2>/dev/null || true

@@ -469,6 +469,25 @@ if grep -q 'gate_delivery_looks_partial' "$DISPATCHER"; then ok "dispatcher.sh c
 if grep -q '"delivery:partial"' "$DISPATCHER"; then ok "dispatcher.sh labels delivery:partial"; else bad "dispatcher.sh does not label delivery:partial"; fi
 if grep -q 'scope_covered:all' "$DISPATCHER"; then ok "dispatcher.sh honors scope_covered:all override"; else bad "dispatcher.sh missing scope_covered:all override"; fi
 
+# ga-6dpoa: the IS_PARTIAL branch must use ITS OWN label (scope:needs-review), not
+# gate:needs-human — the latter is read by lifecycle-coherence-janitor's R7 rule as
+# "not implementable" and strips gc.routed_to, silently losing routing on beads that
+# were only awaiting a scope glance, not blocked on anything. Scoped to the IS_PARTIAL
+# branch specifically (via sed range) because dispatcher.sh legitimately sets
+# gate:needs-human elsewhere for real circuit-breaks, e.g. ga-lxz5w's sibling-race
+# hold — a file-wide grep would give a false read on those unrelated sites.
+PARTIAL_BRANCH=$(sed -n '/elif \[ "\$IS_PARTIAL" = "1" \]; then/,/# BUG\/TASK/p' "$DISPATCHER")
+if printf '%s' "$PARTIAL_BRANCH" | grep -q '"scope:needs-review"'; then
+  ok "dispatcher.sh's IS_PARTIAL branch labels scope:needs-review (ga-6dpoa)"
+else
+  bad "dispatcher.sh's IS_PARTIAL branch does not label scope:needs-review (ga-6dpoa)"
+fi
+if printf '%s' "$PARTIAL_BRANCH" | grep -qF 'label add "$BEAD_ID" "gate:needs-human"'; then
+  bad "dispatcher.sh's IS_PARTIAL branch still adds bare gate:needs-human (ga-6dpoa regression — collides with janitor R7)"
+else
+  ok "dispatcher.sh's IS_PARTIAL branch does not add gate:needs-human (ga-6dpoa)"
+fi
+
 if grep -qF 'Quality gate PASSED — branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA, gate_run=$GATE_RUN_ID). Closed by autonomous dispatcher (ga-esbg).' "$DISPATCHER"; then
   ok "existing close-reason text preserved (no regression on the full-scope path)"
 else
@@ -497,6 +516,20 @@ fi
 echo "── 5. Wiring: story-delivery.sh task reconciler ──"
 if grep -q 'gate_delivery_looks_partial' "$DELIVERY"; then ok "story-delivery.sh mirrors gate_delivery_looks_partial"; else bad "story-delivery.sh does not check gate_delivery_looks_partial"; fi
 if grep -q 'keep:partial-delivery' "$DELIVERY"; then ok "story-delivery.sh's task_reconciler_verdict has a partial-delivery verdict"; else bad "story-delivery.sh missing keep:partial-delivery verdict"; fi
+
+# ga-6dpoa: same fix, mirrored in the task-reconciler backstop's keep:partial-delivery
+# case arm. Scoped via sed range for the same reason as the dispatcher.sh check above.
+TASK_PARTIAL_ARM=$(sed -n '/keep:partial-delivery)/,/keep:contradicted-by-gate-failed-or-needs-fix)/p' "$DELIVERY")
+if printf '%s' "$TASK_PARTIAL_ARM" | grep -q '"scope:needs-review"'; then
+  ok "story-delivery.sh's keep:partial-delivery arm labels scope:needs-review (ga-6dpoa)"
+else
+  bad "story-delivery.sh's keep:partial-delivery arm does not label scope:needs-review (ga-6dpoa)"
+fi
+if printf '%s' "$TASK_PARTIAL_ARM" | grep -qF 'label add "$TASK_BEAD_ID" "gate:needs-human"'; then
+  bad "story-delivery.sh's keep:partial-delivery arm still adds bare gate:needs-human (ga-6dpoa regression — collides with janitor R7)"
+else
+  ok "story-delivery.sh's keep:partial-delivery arm does not add gate:needs-human (ga-6dpoa)"
+fi
 
 # ga-zhfk8 fix 3, mirrored: same evidence-capture-and-quote discipline.
 if grep -qF 'TASK_PARTIAL_EVIDENCE=$(gate_delivery_looks_partial' "$DELIVERY"; then
