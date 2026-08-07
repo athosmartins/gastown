@@ -563,7 +563,15 @@ def _queued_markers():
     (status check) layers, since a future query refactor could silently drop
     the CLI flag (ga-huke4). Returns [] on any error (fail-safe: no markers →
     no orphan fire)."""
-    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "--status", "open,in_progress",  # ga-h199q
+    # --include-infra é OBRIGATÓRIO (Mayor, 07/08): o bd 1.1.0 classifica bead
+    # `--ephemeral` como INFRA e o OMITE de `bd list` por padrão. Markers de gate
+    # nasciam ephemeral, então ESTE watchdog — cujo trabalho é justamente detectar
+    # gate parado — ficava cego exatamente aos beads que vigia. Medido: enquanto o
+    # gate passou 2h sem revisar nada, este vigia não alarmou uma vez, porque para
+    # ele não havia marker nenhum parado. Um vigia cego não fica quieto: ele diz
+    # que está tudo bem. Era o oposto do fail-safe que o docstring acima promete.
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "--limit", "0", "--include-infra",
+            "--status", "open,in_progress",  # ga-h199q
             "-l", "type:quality-gate-marker", "-l", "gate-status:queued", "--json"], timeout=25)
     if not r or r.returncode != 0:
         return []
@@ -840,9 +848,15 @@ def snapshot(reason, dolt_hits):
                 # call sites in this file (ga-h199q) — this is a diagnostic dump
                 # (triggered only on anomaly detection, not the routine poll path),
                 # not a read-after-write.
-                ("queued markers", ["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l",
+                # --include-infra/--limit 0: mesma razão da consulta principal. Num
+                # dump de diagnóstico a cegueira é especialmente perversa — ele é lido
+                # por humano DEPOIS do alarme, como prova do estado, e mostraria uma
+                # fila vazia enquanto ela estava cheia.
+                ("queued markers", ["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "--limit", "0",
+                                    "--include-infra", "-l",
                                     "type:quality-gate-marker", "-l", "gate-status:queued", "--json"]),
-                ("dispatching markers", ["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l",
+                ("dispatching markers", ["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "--limit", "0",
+                                         "--include-infra", "-l",
                                          "type:quality-gate-marker", "-l", "gate-status:dispatching", "--json"]),
                 ("sessions", ["gc", "session", "list"]),
             ]:
@@ -1687,7 +1701,11 @@ def _run_verdicts(run_id):
     FIX5's stranded-run check needs; ga-5t5w), or None if nothing has been
     delivered yet or no closed row parsed. Returns (set(), -1, -1, None) on query
     failure so the caller fail-safe skips."""
-    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "gate-run:%s" % run_id, "--json"])  # ga-h199q
+    # --include-infra/--limit 0 (Mayor, 07/08): beads de verdict e de run podiam nascer
+    # ephemeral = INFRA, e INFRA some de `bd list` por padrão. Sem isto, um run com
+    # veredito entregue parecia SEM veredito, e o chamador concluía "revisor sumiu".
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "--limit", "0", "--include-infra",
+            "-l", "gate-run:%s" % run_id, "--json"])  # ga-h199q
     if not r or r.returncode != 0:
         return (set(), -1, -1, None)
     try:
@@ -1714,7 +1732,11 @@ def _run_pending_reviewers(run_id):
     delivered yet. Used by FIX 3's post-kill recovery (ga-pp5vh) to tell whether a
     just-killed reviewer was the run's SOLE pending one. None on query failure
     (fail-safe: caller never supersedes on unreadable state)."""
-    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "gate-run:%s" % run_id, "--json"])  # ga-h199q
+    # --include-infra/--limit 0 (Mayor, 07/08): beads de verdict e de run podiam nascer
+    # ephemeral = INFRA, e INFRA some de `bd list` por padrão. Sem isto, um run com
+    # veredito entregue parecia SEM veredito, e o chamador concluía "revisor sumiu".
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "--limit", "0", "--include-infra",
+            "-l", "gate-run:%s" % run_id, "--json"])  # ga-h199q
     if not r or r.returncode != 0:
         return None
     try:
