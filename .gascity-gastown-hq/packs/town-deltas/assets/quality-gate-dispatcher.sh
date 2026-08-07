@@ -677,7 +677,7 @@ live_sibling_run_for_branch() {
   # Left live deliberately; see ga-h199q comment on the other 3 call sites for
   # why THIS EXACT query is still cached elsewhere (verified byte-identical
   # results; here it just could not be, given the test's mocking strategy).
-  run_json=$(bd -C "$GC_CITY" list --json \
+  run_json=$(bd -C "$GC_CITY" list --json --include-infra \
     -l type:quality-gate-run \
     -l gate-status:running \
     2>/dev/null || echo "[]")
@@ -2675,7 +2675,7 @@ supersede_sibling_runs() {
   # ga-h199q: routed through the read-cache shim (see live_sibling_run_for_branch
   # above — identical query, same-sweep dedup). Superseding is idempotent and a
   # briefly-stale miss just delays cleanup to the next sweep, not a correctness issue.
-  running_json=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json \
+  running_json=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra \
     -l type:quality-gate-run \
     -l gate-status:running \
     2>/dev/null || echo "[]")
@@ -4701,7 +4701,7 @@ fi
 if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
   # ga-h199q: routed through the read-cache shim (see live_sibling_run_for_branch's
   # header comment — identical query, same-sweep dedup across 4 call sites).
-  PHASE_C_RUNNING_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json -l type:quality-gate-run -l gate-status:running 2>/dev/null || echo "[]")
+  PHASE_C_RUNNING_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra -l type:quality-gate-run -l gate-status:running 2>/dev/null || echo "[]")
   PHASE_C_COUNT=$(printf '%s' "$PHASE_C_RUNNING_JSON" | jq 'length' 2>/dev/null || echo "0")
   case "$PHASE_C_COUNT" in ''|*[!0-9]*) PHASE_C_COUNT=0 ;; esac
   if [ "$PHASE_C_COUNT" -gt 0 ]; then
@@ -4828,7 +4828,7 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       # Mirrors the sibling `vb_status_action` unknown-branch (ga-art5), which
       # already skips-and-retries on an unreadable `bd show` instead of guessing.
       VB_SENTINEL="__VB_QUERY_FAILED__"
-      VB_JSON=$(bd -C "$GC_CITY" list --json --all -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID" 2>/dev/null || echo "$VB_SENTINEL")
+      VB_JSON=$(bd -C "$GC_CITY" list --json --all --include-infra -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID" 2>/dev/null || echo "$VB_SENTINEL")
       if [ "$VB_JSON" = "$VB_SENTINEL" ]; then
         log "  Phase C: verdict-bead query for gate-run $GATE_RUN_ID failed this sweep (transient Dolt hiccup?) — skipping, will retry next sweep (root-class:error-vs-empty). NOT treating as died-before-Step-7."
         continue
@@ -5068,7 +5068,7 @@ DISPATCHING_TTL_MINUTES=30
 # ≤5s-stale miss here is inconsequential against the 30-minute reclaim threshold
 # this feeds (~360x the cache TTL) — a run that started in the last 5s is never
 # the same marker that's been dispatching for 30 minutes.
-LIVE_RUN_MARKER_IDS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json \
+LIVE_RUN_MARKER_IDS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra \
   -l type:quality-gate-run \
   -l gate-status:running \
   2>/dev/null || echo "[]")
@@ -5076,7 +5076,7 @@ LIVE_RUN_MARKER_IDS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CIT
 # ga-h199q: routed through the read-cache shim — feeds the same 30-minute TTL
 # reclaim check as LIVE_RUN_MARKER_IDS_JSON just above; a ≤5s-stale read is
 # inconsequential against that threshold.
-DISPATCHING_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json \
+DISPATCHING_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra \
   -l type:quality-gate-marker \
   -l gate-status:dispatching \
   2>/dev/null || echo "[]")
@@ -5281,7 +5281,7 @@ fi
 # push/nudge), and scoped ONLY to "is it merged now?" — a genuinely-still-
 # diverged branch is untouched and stays in needs-rebase exactly as before
 # this fix (AC4 non-regression).
-NEEDS_REBASE_JSON=$(bd -C "$GC_CITY" list --json --all --status open \
+NEEDS_REBASE_JSON=$(bd -C "$GC_CITY" list --json --all --include-infra --status open \
   -l type:quality-gate-marker \
   -l gate-status:needs-rebase \
   2>/dev/null || echo "[]")
@@ -5414,7 +5414,7 @@ fi
 # here just defers newly-queued work to the next 180s sweep (this script has no
 # internal loop; launchd re-execs it), the same bounded delay the TTL-recovery
 # checks above already tolerate.
-MARKERS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json \
+MARKERS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra \
   -l type:quality-gate-marker \
   -l gate-status:queued \
   2>/dev/null || echo "[]")
@@ -7398,7 +7398,7 @@ GATE_START_EPOCH=$(date +%s)
 
 GATE_RUN_ID=$(bd -C "$GC_CITY" create \
   "gate-run: $BRANCH ($BEAD_ID)" \
-  -t chore --ephemeral \
+  -t chore \
   -l type:quality-gate-run \
   -l gate-status:running \
   -l "source-bead:$BEAD_ID" \
