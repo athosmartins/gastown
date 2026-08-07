@@ -53,9 +53,16 @@ git -C "$CITY" add scripts/daemon-b.py
 GIT_AUTHOR_DATE="@$OLD" GIT_COMMITTER_DATE="@$OLD" \
     git -C "$CITY" commit -q -m "fix(ga-realbead): daemon-b fix"
 
-# daemon-c: NO KeepAlive (StartInterval-only). Deliberately given a git/ps
-# fixture that WOULD read as stale if ever compared -- must never be
-# compared at all, proving the KeepAlive gate actually skips it.
+# daemon-c: NO KeepAlive (StartInterval-only). Commit is fresh (NOW) and it
+# IS present in FAKE_PS_OUTPUT below with an old elapsed time -- the same
+# stale shape as daemon-a. If the KeepAlive gate were ever removed or
+# broken, find_process would succeed for daemon-c too and it would get
+# reported as stale. Its absence from the output below must therefore be
+# proof the KeepAlive gate is what excludes it, not an accident of it never
+# being looked up (a prior version of this fixture left daemon-c out of
+# FAKE_PS_OUTPUT entirely, so find_process failed for the wrong reason and
+# a broken KeepAlive gate would have gone undetected -- ga-fckwc gate
+# feedback, fix-attempt 2).
 echo "# stub" > "$CITY/scripts/daemon-c.sh"
 git -C "$CITY" add scripts/daemon-c.sh
 GIT_AUTHOR_DATE="@$NOW" GIT_COMMITTER_DATE="@$NOW" \
@@ -109,12 +116,15 @@ write_plist "$CITY/packs/town-deltas/assets/daemon-d.plist" "com.test.daemon-d" 
 write_plist "$CITY/packs/town-deltas/assets/daemon-e.plist" "com.test.daemon-e" "$CITY/scripts/daemon-e.py" \
     '<key>KeepAlive</key><true/><key>RunAtLoad</key><true/>'
 
-# daemon-c and daemon-d are deliberately absent from FAKE_PS_OUTPUT:
-# daemon-c must never even be looked up (no KeepAlive); daemon-d simulates
-# "loaded but not currently running".
+# daemon-c IS present here (old elapsed time, same stale shape as
+# daemon-a) -- see the setup comment above for why. daemon-d is the one
+# deliberately absent from FAKE_PS_OUTPUT: it simulates "loaded but not
+# currently running", a real (KeepAlive=true) exercise of find_process's
+# not-found path.
 FAKE_PS_OUTPUT="111   02:00:00 /usr/bin/python3 $CITY/scripts/daemon-a.py
 222   00:00:05 /usr/bin/python3 $CITY/scripts/daemon-b.py
-333   02:00:00 /usr/bin/python3 $CITY/scripts/daemon-e.py"
+333   02:00:00 /usr/bin/python3 $CITY/scripts/daemon-e.py
+444   02:00:00 /usr/bin/python3 $CITY/scripts/daemon-c.sh"
 
 run_guard() {
     env -i \
@@ -138,7 +148,7 @@ OUT1=$(run_guard)
 
 if printf '%s' "$OUT1" | grep -q "com.test.daemon-a"; then ok "daemon-a (stale, KeepAlive) reported"; else bad "daemon-a NOT reported (should be stale)"; fi
 if printf '%s' "$OUT1" | grep -q "com.test.daemon-b"; then bad "daemon-b (fresh) incorrectly reported"; else ok "daemon-b (fresh, commit older than process) correctly silent"; fi
-if printf '%s' "$OUT1" | grep -q "com.test.daemon-c"; then bad "daemon-c (no KeepAlive) incorrectly reported -- fresh-exec class must never alarm"; else ok "daemon-c (StartInterval-only, no KeepAlive) correctly skipped"; fi
+if printf '%s' "$OUT1" | grep -q "com.test.daemon-c"; then bad "daemon-c (no KeepAlive) incorrectly reported -- fresh-exec class must never alarm"; else ok "daemon-c (StartInterval-only, no KeepAlive, present+stale-shaped in ps fixture) correctly skipped by the KeepAlive gate itself"; fi
 if printf '%s' "$OUT1" | grep -q "com.test.daemon-d"; then bad "daemon-d (not running) incorrectly reported"; else ok "daemon-d (KeepAlive but not currently running) correctly skipped, no crash"; fi
 if printf '%s' "$OUT1" | grep -q "com.test.daemon-e"; then ok "daemon-e (stale, unresolvable bead) reported"; else bad "daemon-e NOT reported (should be stale)"; fi
 
