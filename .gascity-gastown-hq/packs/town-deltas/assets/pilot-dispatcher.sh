@@ -3004,12 +3004,52 @@ _ttl_recover_db() {
 # Count in-flight beads per lane by reading their lane:big / lane:small labels.
 # Beads without a lane label (manually dispatched) count as small (conservative).
 
+# inflight_slots_from_query <query_ok: 0|1> <max_slots> <in_flight_count>
+# Pure decision (ga-1fssl): how many dispatch slots a lane should report as
+# available, given whether the shared story:in-flight fetch below actually
+# succeeded this sweep. THE POINT: a FAILED query must never collapse to "0
+# beads in flight" — indistinguishable from a query that succeeded and found
+# genuinely none — because SMALL_SLOTS/BIG_SLOTS (Step 3 below) read that as
+# "every slot is free," and the Pilot's response to a free slot is not
+# passive: it DISPATCHES onto it. Fail-safe direction here is the OPPOSITE of
+# ga-07rb3's rig-list-failure handling a few lines below (which degrades
+# gracefully to HQ-only counting, because undercounting there only misses
+# rig-side extras on top of an otherwise-real HQ count): this function feeds
+# the hard per-sweep capacity gate, so an unreliable count must make the lane
+# look FULLY OCCUPIED (0 slots) rather than fully free — under-counting
+# occupancy is what causes double-dispatch onto live builders, the exact
+# class this bug reports (root-class:error-vs-empty). The cost of guessing
+# wrong this way is one sweep with no new dispatch; the cost of guessing
+# wrong the other way is a second builder landing on work already in flight.
+inflight_slots_from_query() {
+  local query_ok="$1" max_slots="$2" in_flight_count="$3"
+  [ "$query_ok" != "1" ] && { echo 0; return; }
+  local slots=$((max_slots - in_flight_count))
+  [ "$slots" -lt 0 ] && slots=0
+  echo "$slots"
+}
+
 # ga-mfeip: fan-out to HQ + every non-HQ rig store so rig-native in-flight beads
 # (wa-*/ps-*/lx-* prefixes, living in rig-own Dolt stores) are visible to the
 # dead-worker detector and busy-builder tracker below. Attach _rig_db to each bead
 # so store-aware sling lookups can route to the right Dolt instance.
-_IN_FLIGHT_HQ=$(bd -C "$GC_CITY" list --json -l "story:in-flight" 2>/dev/null \
-  | jq --arg db "$GC_CITY" '[ .[] | . + {"_rig_db": $db} ]' 2>/dev/null || echo "[]")
+# ga-1fssl: capture bd's exit status WITHOUT masking it — the old
+# `2>/dev/null || echo "[]"` collapsed a FAILED query (Dolt timeout/contention)
+# into "zero beads in flight", indistinguishable from a genuinely empty
+# result. IN_FLIGHT_QUERY_OK propagates the distinction to
+# inflight_slots_from_query above, which is what SMALL_SLOTS/BIG_SLOTS
+# actually consult — see that function's header for why the naive default
+# was destructive. -n 0 additionally fixes a latent truncation (ga-21kmp):
+# bd's default list limit is 50, silently — the warning goes to stderr, which
+# this fetch already redirects to /dev/null — and only bites once real
+# in-flight count crosses it, exactly when this counter matters most.
+IN_FLIGHT_QUERY_OK=1
+if ! _IN_FLIGHT_HQ=$(bd -C "$GC_CITY" list --json -l "story:in-flight" -n 0 2>/dev/null \
+    | jq --arg db "$GC_CITY" '[ .[] | . + {"_rig_db": $db} ]' 2>/dev/null); then
+  IN_FLIGHT_QUERY_OK=0
+  _IN_FLIGHT_HQ="[]"
+  warn "story:in-flight query failed for HQ ($GC_CITY) — in-flight lane capacity is UNKNOWN this sweep; failing safe as fully-occupied (no dispatch) rather than guessing empty (root-class:error-vs-empty, ga-1fssl)."
+fi
 IN_FLIGHT_RAW_JSON="$_IN_FLIGHT_HQ"
 # ga-07rb3: a gc failure here undercounts in-flight rig-side beads (lane
 # capacity would look more free than it is) rather than blocking dispatch
@@ -3023,8 +3063,16 @@ fi
 _in_flight_rig_paths=$(printf '%s' "$_in_flight_rig_json" | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null)
 while IFS= read -r _in_flight_rig; do
   [ -z "$_in_flight_rig" ] || [ ! -d "$_in_flight_rig" ] && continue
-  _rig_inflight=$(bd -C "$_in_flight_rig" list --json -l "story:in-flight" 2>/dev/null \
-    | jq --arg db "$_in_flight_rig" '[ .[] | . + {"_rig_db": $db} ]' 2>/dev/null || echo "[]")
+  # ga-1fssl: same explicit-exit-status idiom as the HQ fetch above — a
+  # failed rig-side story:in-flight query must taint IN_FLIGHT_QUERY_OK too
+  # (this rig's contribution becomes an undercount, same consequence as the
+  # HQ fetch failing), not just silently contribute "[]" to the union.
+  if ! _rig_inflight=$(bd -C "$_in_flight_rig" list --json -l "story:in-flight" -n 0 2>/dev/null \
+      | jq --arg db "$_in_flight_rig" '[ .[] | . + {"_rig_db": $db} ]' 2>/dev/null); then
+    _rig_inflight="[]"
+    IN_FLIGHT_QUERY_OK=0
+    warn "story:in-flight query failed for rig db $_in_flight_rig — in-flight lane capacity is UNKNOWN this sweep; failing safe as fully-occupied (ga-1fssl)."
+  fi
   IN_FLIGHT_RAW_JSON=$(printf '%s\n%s' "$IN_FLIGHT_RAW_JSON" "$_rig_inflight" \
     | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "$IN_FLIGHT_RAW_JSON")
 done <<< "$_in_flight_rig_paths"
@@ -4711,11 +4759,14 @@ _compute_busy_builders() {
 _compute_busy_builders
 [ -n "$PILOT_BUSY_BUILDERS" ] && log "Busy builders (live in-flight): $PILOT_BUSY_BUILDERS"
 
-SMALL_SLOTS=$((MAX_SMALL - IN_FLIGHT_SMALL))
-BIG_SLOTS=$((MAX_BIG - IN_FLIGHT_BIG))
-
-[ "$SMALL_SLOTS" -lt "0" ] && SMALL_SLOTS=0
-[ "$BIG_SLOTS"   -lt "0" ] && BIG_SLOTS=0
+# ga-1fssl: route through inflight_slots_from_query (defined at Step 1 above)
+# instead of raw subtraction — a failed story:in-flight query this sweep
+# (IN_FLIGHT_QUERY_OK=0) must report ZERO slots in both lanes, not whatever
+# MAX_SMALL/MAX_BIG happens to be, or Pilot dispatches onto lanes it could
+# not actually verify were free (root-class:error-vs-empty). The function
+# already floors at 0, so no separate clamp is needed here.
+SMALL_SLOTS=$(inflight_slots_from_query "$IN_FLIGHT_QUERY_OK" "$MAX_SMALL" "$IN_FLIGHT_SMALL")
+BIG_SLOTS=$(inflight_slots_from_query "$IN_FLIGHT_QUERY_OK" "$MAX_BIG" "$IN_FLIGHT_BIG")
 
 log "Available slots: small=$SMALL_SLOTS  big=$BIG_SLOTS"
 
