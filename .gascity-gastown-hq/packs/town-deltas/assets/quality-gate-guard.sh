@@ -2143,7 +2143,22 @@ fi
 
 # ── Step 1: Find unclaimed ready-for-gate markers ─────────────────────────────
 
-MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all \
+# ⚠️ --include-infra e --limit 0 são OBRIGATÓRIOS aqui (Mayor, 07/08).
+#
+# --include-infra: o bd 1.1.0 classifica bead `--ephemeral` como INFRA e o OMITE
+# de `bd list` por padrão. Markers antigos (e qualquer um criado por um /gate-done
+# ainda não atualizado) são ephemeral, então esta consulta — a DESCOBERTA PRIMÁRIA
+# do gate — enxergava zero e o guard saía logando honestamente "No work. Exiting."
+# Medido no momento do conserto: **o guard via 0, existiam 7** markers
+# gate-status:ready. Foi a causa do gate passar 2h sem revisar nada.
+#
+# --limit 0: `bd list` trunca em 50 e o aviso vai pro stderr, que o `2>/dev/null`
+# logo abaixo engole (ga-21kmp). Com fila funda o guard veria só os 50 primeiros —
+# defeito latente que aparece justamente quando há backlog.
+#
+# Este é o par error-vs-empty: "não achei" e "não existe" produziam o mesmo valor,
+# e o valor significava "não há trabalho".
+MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all --limit 0 --include-infra \
   -l type:quality-gate-marker \
   -l gate-status:ready \
   2>/dev/null || echo "[]")
@@ -2293,7 +2308,12 @@ fi
 # deliberately left alone; a legitimate live run for this branch is the
 # dispatcher's Step 5b's job, not this one's.
 DUP_QUERY_OK=1
-DUP_MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all --status open \
+# --include-infra/--limit 0: mesma razão da consulta do Step 1 (ver comentário lá).
+# Aqui o custo de ficar cego é PIOR e mais silencioso: esta consulta detecta marker
+# DUPLICADO. Sem enxergar os ephemeral, ela conclui "não há duplicata" e o guard
+# deixa passar dois markers para a mesma branch — dois runs, dois revisores, e
+# possivelmente dois merges. Um detector cego não fica quieto: ele dá sinal verde.
+DUP_MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all --status open --limit 0 --include-infra \
   -l type:quality-gate-marker \
   --label-any gate-status:ready \
   --label-any gate-status:queued \
@@ -2638,9 +2658,14 @@ fi
 # those consumers.
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+# ⚠️ NÃO reintroduza --ephemeral aqui (Mayor, 07/08). No bd 1.1.0 ephemeral = INFRA,
+# e INFRA some de `bd list` por padrão — o bead de run ficava invisível para todo
+# monitor, watchdog e diagnóstico da cidade, que então reportavam "nenhum run ativo"
+# com um run acontecendo. O bead de run é barato e o wisp-reaper já o recolhe; a
+# economia de mantê-lo ephemeral não paga a cegueira que ela causa.
 GATE_RUN_ID=$(bd -C "$GC_CITY" create \
   "quality-gate: $BRANCH ($BEAD_ID)" \
-  -t chore --ephemeral \
+  -t chore \
   -l type:quality-gate-run \
   -l gate-status:claimed \
   -l "source-bead:$BEAD_ID" \
