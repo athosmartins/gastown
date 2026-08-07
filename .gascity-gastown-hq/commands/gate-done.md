@@ -376,9 +376,19 @@ fi
 # a bogus extra "key: value" line into the marker description below.
 SELF_AUDIT_SUMMARY=$(printf '%s' "${SELF_AUDIT_SUMMARY:-<not recorded - see Pre-flight Self-Audit above>}" | tr '\n' ' ')
 
+# ⚠️ NÃO adicione --ephemeral aqui (Mayor, 2026-08-07).
+# O bd 1.1.0 classifica bead ephemeral como INFRA e o esconde de `bd list` por
+# padrão. O dispatcher procura markers exatamente com
+#     bd list -l type:quality-gate-marker -l gate-status:queued
+# então um marker ephemeral fica INVISÍVEL. O gate passou 2h sem revisar nada,
+# logando honestamente "Found 0 queued markers" enquanto markers eram criados —
+# não estava travado, estava cego.
+# Provado com par controlado: marker ephemeral ve=0 e um idêntico não-ephemeral
+# ve=1, na MESMA consulta. Se algum dia voltar a usar --ephemeral, as ~113
+# consultas por type:quality-gate-marker precisam de --include-infra ANTES.
 MARKER_ID=$(bd -C "$GC_CITY_PATH" create \
   "ready-for-gate: $BRANCH" \
-  -t chore --ephemeral \
+  -t chore \
   -l type:quality-gate-marker \
   -l gate-status:ready \
   -l "branch:$BRANCH" \
