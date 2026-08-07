@@ -161,15 +161,27 @@ if grep -q "^LABEL ga-realbead daemon-stale:detected$" "$BD_LOG"; then ok "label
 if grep -q "^COMMENT ga-realbead$" "$BD_LOG"; then ok "comment added to resolvable bead ga-realbead"; else bad "comment missing for ga-realbead"; fi
 if grep -q "ga-unknwn" "$BD_LOG"; then bad "bd was mutated for ga-unknwn -- an UNVERIFIED regex match must never be trusted (bd-cli-invalid-id-fuzzy-matches-unrelated-bead-silently)"; else ok "no bd mutation attempted for the unresolvable id ga-unknwn (bd show was invoked and correctly rejected it)"; fi
 
-echo "── 5. functional: dedup -- immediate re-run within the escalate window does NOT re-notify ──"
+# Baseline for the bd.log dedup checks below -- captured now, before any
+# repeat run_guard() call, so sections 5-6 can prove the label/comment block
+# rides on the SAME escalate window as notify instead of firing every tick
+# (ga-fckwc gate feedback, fix-attempt 3: this exact block was unconditional
+# and had zero coverage because BD_LOG was previously only ever inspected
+# once, in section 4, before either repeat invocation below happened).
+BD_COUNT1=$(wc -l < "$BD_LOG" | tr -d ' ')
+
+echo "── 5. functional: dedup -- immediate re-run within the escalate window does NOT re-notify, and does NOT re-comment ──"
 run_guard >/dev/null
 NOTIFY_COUNT2=$(wc -l < "$NOTIFY_LOG" | tr -d ' ')
 if [ "$NOTIFY_COUNT2" = "$NOTIFY_COUNT" ]; then ok "second run within escalate window added zero new notifies ($NOTIFY_COUNT2 total)"; else bad "second run re-notified (got $NOTIFY_COUNT2, expected $NOTIFY_COUNT) -- dedup ledger not honored"; fi
+BD_COUNT2=$(wc -l < "$BD_LOG" | tr -d ' ')
+if [ "$BD_COUNT2" = "$BD_COUNT1" ]; then ok "second run within escalate window added zero new bd label/comment calls ($BD_COUNT2 bd.log lines total)"; else bad "second run added new bd label/comment calls (bd.log grew $BD_COUNT1 -> $BD_COUNT2) -- label/comment block is not gated on notify's dedup window, will spam the bead once per order tick for as long as the daemon stays stale"; fi
 
-echo "── 6. functional: a run past the escalate window DOES re-notify (dedup is a re-fire cadence, not a permanent silence) ──"
+echo "── 6. functional: a run past the escalate window DOES re-notify AND DOES re-comment (dedup is a re-fire cadence, not a permanent silence) ──"
 TEST_ESCALATE_AFTER_S=0 run_guard >/dev/null
 NOTIFY_COUNT3=$(wc -l < "$NOTIFY_LOG" | tr -d ' ')
 if [ "$NOTIFY_COUNT3" -gt "$NOTIFY_COUNT2" ]; then ok "re-notified after escalate window elapsed ($NOTIFY_COUNT2 -> $NOTIFY_COUNT3)"; else bad "did NOT re-notify after escalate window elapsed (stuck at $NOTIFY_COUNT3) -- a real still-unfixed daemon would go silent forever"; fi
+BD_COUNT3=$(wc -l < "$BD_LOG" | tr -d ' ')
+if [ "$BD_COUNT3" -gt "$BD_COUNT2" ]; then ok "re-commented after escalate window elapsed ($BD_COUNT2 -> $BD_COUNT3 bd.log lines)"; else bad "did NOT re-comment after escalate window elapsed (stuck at $BD_COUNT3) -- a real still-unfixed daemon's bead would go silent forever too"; fi
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

@@ -109,16 +109,26 @@ find_process() {
 # WA's {key: last_notified_epoch} escalation ledger — a plain seen-set would
 # either never re-fire on a fix that's STILL not live days later, or spam on
 # every tick; this re-fires on a bounded cadence instead).
+#
+# Return status doubles as the ledger verdict (0 = fired this call, 1 =
+# suppressed, still within window) so callers can gate OTHER per-occurrence
+# side effects (e.g. bd comment) on this SAME window instead of adding their
+# own ad-hoc check — a second gate would drift from this one and reopen
+# per-tick spam under a different key (ga-fckwc gate feedback, fix-attempt
+# 3: the bd label/comment block sat outside this function entirely and
+# fired unconditionally on every tick, ~1 near-duplicate bead comment per
+# 30m order cadence for as long as a daemon stayed stale).
 notify_once() {
     local key="$1" title="$2" body="$3" last
     last=$(printf '%s' "$SEEN_JSON" | jq -r --arg k "$key" '.[$k] // 0' 2>/dev/null || echo 0)
     case "$last" in ''|*[!0-9]*) last=0 ;; esac
     if [ "$last" != "0" ] && [ $(( NOW - last )) -lt "$ESCALATE_AFTER_S" ]; then
-        return 0
+        return 1
     fi
     "$NOTIFY_BIN" -t "$title" -p 3 "$body" >/dev/null 2>&1 || true
     SEEN_JSON=$(printf '%s' "$SEEN_JSON" | jq --arg k "$key" --argjson n "$NOW" '.[$k] = $n' 2>/dev/null) || true
     [ -n "$SEEN_JSON" ] || SEEN_JSON='{}'
+    return 0
 }
 
 # Conservative extraction from a conventional-commit-style subject, e.g.
@@ -178,15 +188,18 @@ for plist in "$ASSETS_DIR"/*.plist; do
 
     echo "[STALE-DAEMON] $label (PID $pid) running code from before its own last commit — ${stale_h}h behind. Entrypoint: $entry. Suggested: $kickstart_hint"
 
-    notify_once "$label" "Daemon rodando código antigo" \
-        "$label (PID $pid) está ${stale_h}h atrás do último commit em $(basename "$entry"). $kickstart_hint"
-
-    bead_id=$(bead_id_from_subject "$commit_subject") || bead_id=""
-    if [ -n "$bead_id" ] && "$BD_BIN" -C "$CITY" show "$bead_id" >/dev/null 2>&1; then
-        "$BD_BIN" -C "$CITY" label add "$bead_id" "daemon-stale:detected" -q >/dev/null 2>&1 || true
-        "$BD_BIN" -C "$CITY" comment "$bead_id" \
-            "stale-persistent-daemon-guard (ga-fckwc): $label (PID $pid) ainda está rodando código de antes deste commit em $entry — ${stale_h}h de defasagem. Restart sugerido, NÃO executado automaticamente: $kickstart_hint" \
-            >/dev/null 2>&1 || true
+    # bd label/comment ride on notify_once's own escalate window (its return
+    # status) rather than a separate check -- see the comment on notify_once
+    # for why a second gate here would drift from it.
+    if notify_once "$label" "Daemon rodando código antigo" \
+        "$label (PID $pid) está ${stale_h}h atrás do último commit em $(basename "$entry"). $kickstart_hint"; then
+        bead_id=$(bead_id_from_subject "$commit_subject") || bead_id=""
+        if [ -n "$bead_id" ] && "$BD_BIN" -C "$CITY" show "$bead_id" >/dev/null 2>&1; then
+            "$BD_BIN" -C "$CITY" label add "$bead_id" "daemon-stale:detected" -q >/dev/null 2>&1 || true
+            "$BD_BIN" -C "$CITY" comment "$bead_id" \
+                "stale-persistent-daemon-guard (ga-fckwc): $label (PID $pid) ainda está rodando código de antes deste commit em $entry — ${stale_h}h de defasagem. Restart sugerido, NÃO executado automaticamente: $kickstart_hint" \
+                >/dev/null 2>&1 || true
+        fi
     fi
 done
 
