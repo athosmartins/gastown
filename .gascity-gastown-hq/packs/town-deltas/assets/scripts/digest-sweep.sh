@@ -35,5 +35,10 @@ bd list --status open --json --limit 0 2>/dev/null \
     ' \
   | while IFS= read -r id; do
       [ -z "$id" ] && continue
-      bd close "$id" --reason "digest-sweep: past-day digest archived, informational artifact with no pending action" || true
+      # No `|| true` here on purpose (ga-8f40w self-audit): a close failure
+      # (race, DB hiccup) must abort visibly under set -e so the order-dispatch
+      # controller log records it (it only logs on non-zero exit — see
+      # gate-sweep.sh's header comment for the same convention), not disappear
+      # silently while the sweep reports a clean run.
+      bd close "$id" --reason "digest-sweep: past-day digest archived, informational artifact with no pending action"
     done
