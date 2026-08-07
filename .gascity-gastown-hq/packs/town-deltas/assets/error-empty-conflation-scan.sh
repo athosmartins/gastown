@@ -94,57 +94,33 @@ scan_shell_query_masking() {
       *) continue ;;
     esac
     printf '%s' "$line" | grep -Eq "$QUERY_TOOL_RE" || continue
-    case "$line" in
-      # ga-l4nx1: gc_json_or_unknown() (ga-07509's own fix) already captures the
-      # real exit code AND validates the JSON envelope's `ok` field before ever
-      # returning — a trailing `|| true` here is the documented memoized-cache-
-      # with-retry idiom (see the helper's own doc comment: "CACHE=$(gc_json_or_
-      # unknown gc ...) || true; [ -z "$CACHE" ] unambiguously means failed"), not
-      # the raw-gc-call masking this scanner exists to catch. Adding gc to
-      # QUERY_TOOL_RE above would otherwise flag ga-07509's own fix at every one
-      # of its ~16 real call sites across pilot-dispatcher.sh / quality-gate-
-      # dispatcher.sh / quality-gate-guard.sh / auto-refino-dispatcher.sh — the
-      # exact "flags everything" failure this scanner's own header warns is as
-      # useless as flagging nothing. Matches both real call shapes: bare
-      # (`VAR=$(gc_json_or_unknown gc ...)`) and env-prefixed
-      # (`VAR=$(GC_CITY="$GC_CITY" gc_json_or_unknown timeout 15 gc ...)`).
-      *'=$('*'gc_json_or_unknown '*) ;;
-      *'|| echo "[]"'* | *"|| echo '[]'"* | *'|| echo ""'* | *"|| echo ''"* | \
-        *'|| echo "0"'* | *'|| echo "null"'* | *'|| echo "{}"'* | *"|| echo '{}'"*)
-        echo "${file}:${lineno}:C2:${line}"
-        ;;
-      *'|| true'*)
-        echo "${file}:${lineno}:C1:${line}"
-        ;;
-      # ga-vkjs: o idioma que faltava, e é o MAIS COMUM na city — a query é
-      # canalizada pra um PARSER que fabrica um default, então não há `||` nenhum
-      # pros case-suffixes acima casarem. Perigoso porque o parser ZERA o rc do
-      # pipe (o rc de um pipeline é o do ÚLTIMO comando): erro-de-query e
-      # campo-genuinamente-ausente saem com o MESMO valor E o MESMO rc=0.
-      # PROVADO (não hipótese):
-      #   bd -C /nao/existe show x --json 2>/dev/null | jq -r '.a // ""'  ->  '' rc=0
-      #   echo '{}'                                   | jq -r '.a // ""'  ->  '' rc=0
-      # Instâncias reais: o gc sling (ga-66wc, "não roteado" era a query falhando)
-      # e a checagem do mila-wa que leu "o worker não despachou".
-      # ⚠️ A FONTE DO PIPE TEM QUE PODER FALHAR. `VAR=$(echo "$row" | jq -r '.a // ""')`
-      # NÃO é este bug: `echo` de uma variável não falha, então não existe o estado
-      # "a pergunta falhou" — só existe "o campo não está lá", que é um fato legítimo.
-      # Medido: sem esta exclusão, 48 dos 54 achados novos eram esse shape (89% ruído).
-      # ⚠️ O ESCOPO É A SUBSTITUIÇÃO, NÃO A LINHA — e é por isso que isto virou função.
-      # A v1 testava a linha INTEIRA num `case`, que casa o primeiro padrão e PARA. Numa
-      # linha com duas substituições —  `x=$(echo a); y=$(cmd 2>/dev/null | jq -r '.a // ""')` —
-      # a inerte casava primeiro e a ARRISCADA nunca era flagrada. Multi-statement na mesma
-      # linha é estilo corrente aqui (este diff mesmo: `notify_mode=0; seed_mode=0`), então
-      # não é canto raro. Achado pelo revisor do gate (run ga-wisp-3ip2my).
-      *) _c2_scan_substitutions "$file" "$lineno" "$line" ;;
-    esac
+    # ga-50m2: TUDO passa pela classificação POR SUBSTITUIÇÃO agora — não há mais um
+    # `case` sobre a LINHA INTEIRA aqui. A versão anterior tinha um `case` que casava
+    # `gc_json_or_unknown`/`|| echo <empty>`/`|| true` na linha inteira e decidia
+    # (excluir ou flagrar) direto, e só o fallback `*)` chamava a função por-
+    # substituição que checa fonte inerte. MEDIDO (ga-50m2): 181 de 304 achados no HQ
+    # (60%) eram `VAR=$(echo "$var" | jq ... || echo "")` — fonte INERTE — flagrados
+    # como C2 porque o `|| echo ""` os pegava no caminho cego-à-fonte, ANTES do
+    # fallback. A MESMA bifurcação deixava a exclusão do gc_json_or_unknown (ga-l4nx1)
+    # vulnerável ao bug do revisor (ga-wisp-3ip2my) também: numa linha com um
+    # gc_json_or_unknown seguro E uma substituição arriscada separada, o match
+    # whole-line da exclusão vencia primeiro e a arriscada nunca era vista — um falso-
+    # negativo, pior que o falso-positivo original. Agora as três decisões (fonte
+    # inerte, gc_json_or_unknown, idioma de mascaramento) passam todas pela MESMA porta
+    # por substituição — ver _c2_scan_substitutions logo abaixo.
+    _c2_scan_substitutions "$file" "$lineno" "$line"
   done < "$file"
 }
 
-# ── C2: classifica CADA `VAR=$(...)` da linha, isoladamente ─────────────────
-# Existe porque o `case` sobre a linha inteira casa o primeiro padrão e para: numa linha
-# com uma substituição inerte E uma arriscada, a inerte vencia e a arriscada sumia
-# (revisor do gate, run ga-wisp-3ip2my). Aqui cada substituição é julgada sozinha.
+# ── C2/C1-shell: classifica CADA `VAR=$(...)` da linha, isoladamente ────────
+# ÚNICO classificador de assignment-masking agora (ga-50m2) — não há mais um `case`
+# sobre a linha inteira antes dele. Existe porque julgar a LINHA INTEIRA casa o
+# primeiro padrão e para: numa linha com uma substituição inerte E uma arriscada (ou
+# uma gc_json_or_unknown segura E uma arriscada separada), a primeira vencia e a
+# segunda sumia (revisor do gate, run ga-wisp-3ip2my — mesmo buraco valia pro
+# ga-l4nx1). Aqui cada substituição é julgada sozinha, e as três decisões — fonte
+# inerte, gc_json_or_unknown, idioma de mascaramento (parser-default / echo-vazio /
+# true) — passam todas por esta função.
 #
 # ⚠️ O FIM DO FRAGMENTO É O PRÓXIMO `=$(`, NUNCA o primeiro ')'. Cortar no ')' parece
 # óbvio e está ERRADO: `n=$(bd ... 2>/dev/null | python3 -c "...print(len(json.load(
@@ -165,16 +141,46 @@ _c2_scan_substitutions() {
       *)       _frag="$_rest" ;;             # última: vai até o fim da linha
     esac
     case "$_frag" in
-      # FONTE INERTE: `echo`/`printf`/`cat` de uma variável não falha ⇒ não existe o
+      # FONTE INERTE — a MESMA porta pra todos os idiomas de mascaramento abaixo agora
+      # (ga-50m2). `echo`/`printf`/`cat` de uma variável não falha ⇒ não existe o
       # estado "a pergunta falhou", só "o campo não está lá", que é fato legítimo.
-      # Medido: sem esta exclusão, 48 dos 54 achados eram este shape (89% de ruído).
+      # Medido: 181 de 304 achados (60%) eram este shape, flagrados à toa porque um
+      # `|| echo <vazio>`/`|| true` LITERAL os pegava num caminho que pulava esta
+      # checagem (o antigo `case` sobre a linha inteira, eliminado neste fix).
       'echo '* | 'printf '* | 'cat '* | ' echo '* | ' printf '* | ' cat '*) continue ;;
+      # ga-l4nx1, agora POR SUBSTITUIÇÃO (ga-50m2): gc_json_or_unknown já captura o rc
+      # real e valida o envelope `ok` antes de retornar — um `|| true` depois dele
+      # NESTA MESMA substituição é o idioma memoized-cache-com-retry documentado (ver
+      # o próprio doc comment do helper), não a máscara crua que este scanner existe
+      # pra caçar. Antes vivia num `case` sobre a linha inteira, o que deixava uma
+      # substituição arriscada SEPARADA na mesma linha invisível — falso-negativo,
+      # pior que o falso-positivo original do ga-50m2. Casa as duas formas reais: bare
+      # (`VAR=$(gc_json_or_unknown gc ...)`) e com prefixo de env
+      # (`VAR=$(GC_CITY="$GC_CITY" gc_json_or_unknown timeout 15 gc ...)`).
+      *'gc_json_or_unknown '*) continue ;;
     esac
     case "$_frag" in
+      # C2 — parser fabrica o default (o rc do pipe é o do ÚLTIMO comando = 0, então
+      # erro-de-query e campo-genuinamente-ausente saem com o MESMO valor e o MESMO
+      # rc=0). PROVADO: `bd -C /nao/existe show x --json 2>/dev/null | jq -r '.a //
+      # ""'` -> '' rc=0, igual a `echo '{}' | jq -r '.a // ""'` -> '' rc=0 (ga-vkjs).
       *'2>/dev/null |'*' // '* | *'2>/dev/null |'*'2>/dev/null'* | \
         *'| jq '*' // "'* | *"| jq "*" // '"*)
         echo "${_file}:${_lineno}:C2:${_frag}"
-        return 0 ;;   # 1 achado por linha basta: o objetivo é a linha ser OLHADA
+        return 0 ;;
+      # C2 — fallback literal fabrica um valor vazio-parece-válido (ga-50m2: agora
+      # julgado por substituição, não mais casado contra a linha inteira — uma
+      # substituição inerte com este MESMO sufixo já foi excluída acima e nunca chega
+      # aqui).
+      *'|| echo "[]"'* | *"|| echo '[]'"* | *'|| echo ""'* | *"|| echo ''"* | \
+        *'|| echo "0"'* | *'|| echo "null"'* | *'|| echo "{}"'* | *"|| echo '{}'"*)
+        echo "${_file}:${_lineno}:C2:${_frag}"
+        return 0 ;;
+      # C1 — o erro simplesmente some, nenhum sinal sobrevive (ga-50m2: idem, por
+      # substituição — não mais pela linha inteira).
+      *'|| true'*)
+        echo "${_file}:${_lineno}:C1:${_frag}"
+        return 0 ;;
     esac
   done
   return 1

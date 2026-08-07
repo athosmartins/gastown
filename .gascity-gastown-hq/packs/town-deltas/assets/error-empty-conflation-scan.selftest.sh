@@ -125,6 +125,53 @@ HR_H=$(GC_CITY="$GC_CITY" gc_json_or_unknown timeout 15 gc dolt health --json) |
 EOF
 cp "$FIXDIR/mixed/good_gc_json_or_unknown_envprefix.sh" "$FIXDIR/clean/"
 
+# ── ga-50m2: a exclusão de fonte inerte (echo/printf/cat de uma variável não pode
+# falhar) só valia no FALLBACK antes deste fix — uma linha com um sufixo LITERAL
+# `|| echo <vazio>`/`|| true` era classificada pelo `case` sobre a linha inteira,
+# ANTES de chegar em _c2_scan_substitutions, e pulava a checagem de fonte inerte.
+# Medido: 181 de 304 achados no HQ (60%) eram exatamente este shape. Estas 3
+# fixtures cruzam os 3 verbos inertes (echo/printf/cat) com os 2 sufixos literais
+# (echo-vazio, true); o idioma parser-com-default já tinha sua própria falsificação
+# (good_echo_var_jq.sh, ga-vkjs) e não precisa de repetição aqui ─────────────────
+cat > "$FIXDIR/mixed/good_inert_echo_suffix.sh" <<'EOF'
+a=$(echo "$x" | jq -r '.k // ""' 2>/dev/null || echo "")
+EOF
+cp "$FIXDIR/mixed/good_inert_echo_suffix.sh" "$FIXDIR/clean/"
+
+cat > "$FIXDIR/mixed/good_inert_true_suffix.sh" <<'EOF'
+c=$(printf '%s' "$z" | jq '.n' 2>/dev/null || true)
+EOF
+cp "$FIXDIR/mixed/good_inert_true_suffix.sh" "$FIXDIR/clean/"
+
+cat > "$FIXDIR/mixed/good_inert_cat_array_suffix.sh" <<'EOF'
+e=$(cat "$f" | jq -r '.k // ""' || echo "[]")
+EOF
+cp "$FIXDIR/mixed/good_inert_cat_array_suffix.sh" "$FIXDIR/clean/"
+
+# ── ga-50m2 (o caso misto do revisor, ga-wisp-3ip2my, com o sufixo LITERAL — a
+# versão parser-com-default deste caso já era coberta e já passava antes deste fix;
+# esta é a forma que NÃO era coberta): duas substituições na MESMA linha — a
+# primeira INERTE com sufixo `|| echo ""` literal, a segunda REAL (dolt) mascarada
+# via `|| true`. Sob o bug antigo, o `case` sobre a linha inteira via o
+# `|| echo ""` da PRIMEIRA substituição e flagrava a linha INTEIRA como C2 —
+# categoria ERRADA (a substituição real usa `|| true`, que é C1) e pelo motivo
+# ERRADO (quem casou foi a inerte, não a real). A categoria correta é C1, vinda da
+# SEGUNDA substituição ─────────────────────────────────────────────────────────
+cat > "$FIXDIR/mixed/bad_mixed_inert_echo_then_real_true.sh" <<'EOF'
+a=$(echo "$x" | jq -r '.k // ""' || echo ""); b=$(dolt sql -q "select 1" 2>/dev/null) || true
+EOF
+
+# ── ga-50m2 (o mesmo buraco, agora pro gc_json_or_unknown do ga-l4nx1): duas
+# substituições na mesma linha — a primeira é um gc_json_or_unknown seguro (deve
+# ser excluída), a segunda é uma chamada bd REAL mascarada via `|| echo ""` (deve
+# ser flagrada). Sob o bug antigo, o `case` sobre a linha inteira casava
+# `gc_json_or_unknown` na PRIMEIRA substituição e excluía a linha INTEIRA — a
+# segunda substituição, real e arriscada, nunca era vista. Falso-negativo, pior
+# que o falso-positivo original do ga-50m2 ──────────────────────────────────────
+cat > "$FIXDIR/mixed/bad_mixed_gc_json_or_unknown_then_real.sh" <<'EOF'
+A=$(gc_json_or_unknown gc rig list --json) || true; B=$(bd show "$X" --json 2>/dev/null || echo "")
+EOF
+
 # ── GOOD (must NOT be flagged): the established FIXED idiom — explicit rc
 # capture via `if ! VAR=$(cmd); then`, same shape as verdict_count_from_query
 # (ga-jfo7) / prune_decision (ga-u4yi attempt 1) ───────────────────────────
@@ -441,6 +488,26 @@ r="$(scan_shell_query_masking "$FIXDIR/mixed/good_gc_json_or_unknown_envprefix.s
 [ -z "$r" ] && ok "ga-l4nx1: gc_json_or_unknown(...) || true (env-prefixed) → NOT flagged" \
   || bad "ga-l4nx1 REGRESSION: gc_json_or_unknown env-prefixed shape flagged: '$r'"
 
+r="$(scan_shell_query_masking "$FIXDIR/mixed/good_inert_echo_suffix.sh")"
+[ -z "$r" ] && ok "ga-50m2: echo \$var | jq // \"\" seguido de || echo \"\" LITERAL → NAO flagged (fonte inerte, sufixo literal agora tambem exclui)" \
+  || bad "ga-50m2 REGRESSION: fonte inerte com sufixo || echo literal ainda flagrado (o bug original, 60% do ruido): '$r'"
+
+r="$(scan_shell_query_masking "$FIXDIR/mixed/good_inert_true_suffix.sh")"
+[ -z "$r" ] && ok "ga-50m2: printf \$var | jq seguido de || true LITERAL → NAO flagged (fonte inerte)" \
+  || bad "ga-50m2 REGRESSION: fonte inerte com sufixo || true literal ainda flagrado: '$r'"
+
+r="$(scan_shell_query_masking "$FIXDIR/mixed/good_inert_cat_array_suffix.sh")"
+[ -z "$r" ] && ok "ga-50m2: cat \$var | jq seguido de || echo \"[]\" LITERAL → NAO flagged (fonte inerte, verbo cat)" \
+  || bad "ga-50m2 REGRESSION: fonte inerte (cat) com sufixo || echo [] literal ainda flagrado: '$r'"
+
+r="$(scan_shell_query_masking "$FIXDIR/mixed/bad_mixed_inert_echo_then_real_true.sh")"
+case "$r" in *:C1:*) ok "ga-50m2: linha com inerte(|| echo literal) + real(|| true) → flagra C1 da substituicao REAL, nao C2 da inerte" ;;
+  *) bad "ga-50m2: caso misto inerte-entao-real (sufixo literal) nao flagrado corretamente (esperado C1): '$r'" ;; esac
+
+r="$(scan_shell_query_masking "$FIXDIR/mixed/bad_mixed_gc_json_or_unknown_then_real.sh")"
+case "$r" in *:C2:*) ok "ga-50m2: linha com gc_json_or_unknown seguro + bd real mascarado → flagra C2 da substituicao REAL, nao exclui a linha inteira" ;;
+  *) bad "ga-50m2: gc_json_or_unknown NAO deve excluir substituicao real separada na mesma linha (falso-negativo): '$r'" ;; esac
+
 r="$(scan_shell_query_masking "$FIXDIR/mixed/good_rc_capture.sh")"
 [ -z "$r" ] && ok "fixed if-!-rc-capture idiom → NOT flagged (no false positive)" || bad "REGRESSION: fixed idiom flagged: '$r'"
 
@@ -504,9 +571,13 @@ mixed_count=$(wc -l <"$MIXED_OUT" | tr -d '[:space:]')
 # .worktrees,bak-dir fixtures must all stay find-excluded (net +0), so the
 # total becomes 11. ga-l4nx1: +2 for bad_query_mask_gc.sh (gc token) and
 # bad_query_mask_echo_object.sh ({} literal) — the 2 good_gc_json_or_unknown*
-# fixtures add 0 (must NOT be flagged), so the total becomes 13, not 17.
-[ "$mixed_count" = "13" ] && ok "mixed fixture dir → 13 findings (11 pre-existing + 2 ga-l4nx1 new-detection cases; the 2 gc_json_or_unknown good fixtures correctly excluded, nothing missed or double-counted)" \
-  || bad "expected 13 findings in mixed dir, got $mixed_count"
+# fixtures add 0 (must NOT be flagged), so the total becomes 13. ga-50m2: +2 for
+# bad_mixed_inert_echo_then_real_true.sh and bad_mixed_gc_json_or_unknown_then_real.sh
+# (each 1 real finding buried behind an inert/safe first substitution on the same
+# line) — the 3 good_inert_*_suffix.sh fixtures add 0 (fonte inerte, must NOT be
+# flagged even with a literal || echo/|| true suffix), so the total becomes 15.
+[ "$mixed_count" = "15" ] && ok "mixed fixture dir → 15 findings (13 pre-existing + 2 ga-50m2 new-detection cases hidden behind a same-line inert/safe substitution; the 3 inert-source-with-literal-suffix good fixtures correctly excluded, nothing missed or double-counted)" \
+  || bad "expected 15 findings in mixed dir, got $mixed_count"
 
 case "$(cat "$MIXED_OUT")" in
   *fixture_shape.selftest.sh*) bad "ga-6jfuo REGRESSION: *.selftest.sh file was scanned by run_scan (should be find-excluded): $(grep 'fixture_shape.selftest.sh' "$MIXED_OUT")" ;;
@@ -553,8 +624,8 @@ rm -f "$CLEAN_OUT"
 echo "── CLI wrapper ──"
 out="$(bash "$SCANNER" --path "$FIXDIR/mixed" --quiet)"; rc=$?
 [ "$rc" = "0" ] && ok "CLI exits 0 on a completed scan with findings" || bad "CLI exit code was $rc, expected 0"
-printf '%s\n' "$out" | grep -q '^error-empty-conflation-scan: 13 finding(s)$' \
-  && ok "CLI summary line reports 13 finding(s)" || bad "CLI summary line unexpected: $(printf '%s\n' "$out" | head -1)"
+printf '%s\n' "$out" | grep -q '^error-empty-conflation-scan: 15 finding(s)$' \
+  && ok "CLI summary line reports 15 finding(s)" || bad "CLI summary line unexpected: $(printf '%s\n' "$out" | head -1)"
 
 bash "$SCANNER" --path "$FIXDIR/does-not-exist" --quiet >/tmp/.conflation-selftest-missing-path.$$ 2>&1
 rc=$?
