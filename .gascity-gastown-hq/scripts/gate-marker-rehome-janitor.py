@@ -127,7 +127,13 @@ def _list_orphan_markers(store):
 def _create_in_hq(title, desc, labels):
     if _create_hq_fn is not None:
         return _create_hq_fn(title, desc, labels)
-    args = [BD_BIN, "-C", CITY, "create", title, "-t", "chore", "--ephemeral", "-d", desc]
+    # ⚠️ NÃO reintroduza --ephemeral (Mayor, 07/08). No bd 1.1.0 ephemeral = INFRA, e
+    # INFRA some de `bd list` por padrão. Este janitor existe para RE-ALOJAR em HQ um
+    # marker que ficou no store errado, ou seja, para tornar encontrável um marker que
+    # ninguém achava — e criava o substituto invisível. Ele fabricava exatamente a
+    # falha que veio consertar. O wisp-reaper recolhe o bead depois; a economia do
+    # ephemeral não paga a cegueira.
+    args = [BD_BIN, "-C", CITY, "create", title, "-t", "chore", "-d", desc]
     for l in labels:
         args += ["-l", l]
     args += ["--json"]

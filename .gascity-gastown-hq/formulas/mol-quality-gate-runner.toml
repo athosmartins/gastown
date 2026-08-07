@@ -630,9 +630,13 @@ TESTS_STATUS=$(bd -C "$GC_CITY_PATH" show {{gate_run_id}} --json 2>/dev/null \
 
 **3. Create the review assignment bead:**
 ```bash
+# ⚠️ NÃO reintroduza --ephemeral (Mayor, 07/08): no bd 1.1.0 ephemeral = INFRA e
+# INFRA some de `bd list` por padrão, então a atribuição de revisão ficava invisível
+# a todo monitor e watchdog — que passavam a reportar "nenhuma revisão pendente" com
+# revisão pendente. O wisp-reaper recolhe o bead depois.
 REVIEW_BEAD_ID=$(bd -C "$GC_CITY_PATH" create \
   "gate-review: {{branch}} (NON-CODE)" \
-  -t chore --ephemeral \
+  -t chore \
   -l type:gate-review-assignment \
   -l gate-review:pending \
   -l "source-gate:{{gate_run_id}}" \
@@ -922,9 +926,10 @@ create_reviewer_bead() {
   local LENS_DESC="$2"
   local LENS_FOCUS="$3"
 
+  # ⚠️ NÃO reintroduza --ephemeral — mesma razão da perna NON-CODE acima.
   bd -C "$GC_CITY_PATH" create \
     "gate-review: {{branch}} ($LENS)" \
-    -t chore --ephemeral \
+    -t chore \
     -l type:gate-review-assignment \
     -l gate-review:pending \
     -l "review-lens:$LENS" \
