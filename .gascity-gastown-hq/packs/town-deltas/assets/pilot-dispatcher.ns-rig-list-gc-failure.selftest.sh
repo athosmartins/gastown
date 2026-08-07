@@ -367,6 +367,88 @@ EOF
   unset -f _target_has_real_branch 2>/dev/null || true
 fi
 
+# ═════════════════════════════════════════════════════════════════════════
+# 6. ga-130et fix-attempt-2 END-TO-END: the gate review of fix-attempt-1
+#    found that unwrapping each call site's OWN invocation (what section 5
+#    proves) only closes the gap for a chain with ZERO subshells anywhere
+#    above it. 5 of the 6 real call sites are reached through a caller that
+#    wraps the containing function in `$(...)` (_beadid_live_crew_owner,
+#    _beadid_matched_crew_branch_ref, _beadid_needs_remerge_branch) or pipes
+#    it (_filter_built, 10 real call sites) — section 5's proof, using only
+#    _target_has_real_branch, could not have caught that gap, and didn't.
+#    This proves fix-attempt-2's actual mechanism (_ownership_guard_repos_
+#    prime, called once at top level) closes BOTH previously-broken shapes,
+#    using two real, unmodified functions: _beadid_matched_crew_branch_ref
+#    (the $(...) shape) and _filter_built (the pipe shape) — not synthetic
+#    stand-ins, so this can't silently drift from the shipped code either.
+#    Negative control first: the SAME two real calls, with NO prime call,
+#    must reproduce fix-attempt-1's exact gap (gc invoked more than once) —
+#    proof this test would actually have failed against fix-attempt-1, not
+#    just that it passes against fix-attempt-2.
+# ═════════════════════════════════════════════════════════════════════════
+echo "-- ga-130et fix-attempt-2 end-to-end: prime-once reaches the \$(...)-wrapped AND piped real call shapes gate flagged --"
+_e2e2_ok=1
+for _fn in _ownership_guard_repos_prime _filter_built _beadid_matched_crew_branch_ref; do
+  _e2e2_src="$(extract_fn "$_fn" "$DISPATCHER")"
+  if [ -z "$_e2e2_src" ]; then
+    bad "FATAL: $_fn() not found in $DISPATCHER — cannot run section 6"
+    _e2e2_ok=0
+  else
+    eval "$_e2e2_src"
+  fi
+done
+
+if [ "$_e2e2_ok" -eq 1 ]; then
+  SANDBOX_BIN6="$(mktemp -d)"
+  GC_CALL_COUNT_FILE6="$(mktemp)"
+  cat > "$SANDBOX_BIN6/gc" <<EOF
+#!/usr/bin/env bash
+echo "\$(( \$(cat "$GC_CALL_COUNT_FILE6") + 1 ))" > "$GC_CALL_COUNT_FILE6"
+echo '{"schema_version":"1","ok":true,"rigs":[]}'
+exit 0
+EOF
+  chmod +x "$SANDBOX_BIN6/gc"
+
+  # -- Negative control: no prime call — matches fix-attempt-1's shape
+  #    exactly (every call site unwrapped, but nothing primes the cache
+  #    before either real chain runs) --
+  _OWNERSHIP_GUARD_REPOS=""
+  _OWNERSHIP_GUARD_REPOS_DONE=""
+  _OWNERSHIP_GUARD_REPOS_FAILED=""
+  echo 0 > "$GC_CALL_COUNT_FILE6"
+  _e2e2_rt=$(PATH="$SANDBOX_BIN6:$PATH" _beadid_matched_crew_branch_ref "e2e2-bead-nocontrol" 2>/dev/null) || true
+  printf '[]' | PATH="$SANDBOX_BIN6:$PATH" _filter_built >/dev/null 2>&1 || true
+  _gc_calls_nocontrol="$(cat "$GC_CALL_COUNT_FILE6" 2>/dev/null || echo "?")"
+  if [ "$_gc_calls_nocontrol" -gt 1 ] 2>/dev/null; then
+    ok "negative control: WITHOUT the prime call, 1 \$(...)-wrapped call + 1 piped call invoke gc $_gc_calls_nocontrol times — reproduces fix-attempt-1's exact gap, confirming this test can actually detect it"
+  else
+    bad "negative control did not reproduce the gap (gc called $_gc_calls_nocontrol time(s), expected >1) — the positive result below would not be meaningful; investigate before trusting it"
+  fi
+
+  # -- Positive proof: same two real chains, but _ownership_guard_repos_prime
+  #    runs ONCE first, unwrapped, at this (top) level — exactly how the real
+  #    script calls it, right after the function definition --
+  _OWNERSHIP_GUARD_REPOS=""
+  _OWNERSHIP_GUARD_REPOS_DONE=""
+  _OWNERSHIP_GUARD_REPOS_FAILED=""
+  echo 0 > "$GC_CALL_COUNT_FILE6"
+  PATH="$SANDBOX_BIN6:$PATH" _ownership_guard_repos_prime
+  _e2e2_rt=$(PATH="$SANDBOX_BIN6:$PATH" _beadid_matched_crew_branch_ref "e2e2-bead-one" 2>/dev/null) || true
+  _e2e2_rt2=$(PATH="$SANDBOX_BIN6:$PATH" _beadid_matched_crew_branch_ref "e2e2-bead-two" 2>/dev/null) || true
+  printf '[]' | PATH="$SANDBOX_BIN6:$PATH" _filter_built >/dev/null 2>&1 || true
+  printf '[]' | PATH="$SANDBOX_BIN6:$PATH" _filter_built >/dev/null 2>&1 || true
+  _gc_calls="$(cat "$GC_CALL_COUNT_FILE6" 2>/dev/null || echo "?")"
+  if [ "$_gc_calls" = "1" ]; then
+    ok "ga-130et fix-attempt-2 FIXED end-to-end: prime once, then 2 \$(...)-wrapped calls (_beadid_matched_crew_branch_ref) + 2 piped calls (_filter_built) invoke gc rig list only ONCE total"
+  else
+    bad "ga-130et fix-attempt-2 REGRESSION: a primed sweep still invoked gc $_gc_calls time(s), expected 1 — the \$(...)-wrapped or piped real call shapes are still re-fetching"
+  fi
+
+  rm -rf "$SANDBOX_BIN6"
+  rm -f "$GC_CALL_COUNT_FILE6"
+fi
+unset -f _ownership_guard_repos_prime _filter_built _beadid_matched_crew_branch_ref 2>/dev/null || true
+
 echo ""
 echo "Results: $P passed, $F failed"
 [ "$F" -eq 0 ] && exit 0 || exit 1

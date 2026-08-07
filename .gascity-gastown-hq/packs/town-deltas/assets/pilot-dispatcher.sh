@@ -3367,19 +3367,33 @@ _crew_progressed_since() {
 # global still print the fail-open town-root-only list either way, unchanged
 # for every non-forcing caller. The phantom-claim guard below is the one
 # caller that additionally checks $? for this reason.
-# ga-130et: every real call site invokes this UNWRAPPED — plain
+# ga-130et fix-attempt-1: every real call site invokes this UNWRAPPED — plain
 # `_ownership_guard_repos >/dev/null; rc=$?` — then reads $_OWNERSHIP_GUARD_REPOS
-# directly, never via `repos="$(_ownership_guard_repos)"`. A command
-# substitution forks a subshell, and this function's memo state
-# (_OWNERSHIP_GUARD_REPOS_DONE/_FAILED, both plain internal assignments) dies
-# with that subshell on exit — so a `$(...)`-wrapped call could never actually
-# observe a PRIOR call's memoized fetch; every one of the 6 real call sites
-# independently re-ran `gc rig list --json`, despite the "memoized for the
-# whole sweep" claim above (found and left unfixed by ga-07rb3 fix-attempt-2;
-# see pilot-dispatcher.ns-rig-list-gc-failure.selftest.sh for the isolated
-# proof this predates the actual fix). Calling unwrapped forks no subshell at
-# all, so both the memo globals and $? are visible to every caller for real,
-# in production — not just inside an isolated test harness.
+# directly, never via `repos="$(_ownership_guard_repos)"`. That alone is
+# NECESSARY but NOT SUFFICIENT: unwrapping the immediate call site only
+# removes the subshell THIS invocation would otherwise fork — it does nothing
+# for a subshell forked one or more levels ABOVE it. The gate review of
+# fix-attempt-1 traced this exactly: 5 of the 6 real call sites sit inside a
+# function (_beadid_live_crew_owner, _beadid_matched_crew_branch_ref,
+# _beadid_needs_remerge_branch) or a pipe stage (_filter_built) that the
+# CALLER wraps in `$(...)` or a pipe — an unwrapped call nested inside an
+# already-subshelled ancestor still runs inside that ancestor's subshell, so
+# the memo writes still die on exit there. Only _target_has_real_branch's
+# whole chain (sweep loop -> _sling_is_live -> _target_has_real_branch)
+# happens to have zero subshells anywhere in it, which is why that ONE chain
+# already worked and the other 5 did not, despite all 6 sharing the identical
+# unwrapped-call shape at their own immediate call site.
+# ga-130et fix-attempt-2: the actual fix is _ownership_guard_repos_prime
+# (defined immediately below this function), called ONCE, unconditionally,
+# at plain top-level script scope — before any pipeline or `$(...)` anywhere
+# in this file gets a chance to be the sweep's first caller. A subshell
+# forked AFTER that point still inherits _OWNERSHIP_GUARD_REPOS_DONE=1 from
+# the parent at fork time (a subshell can't write a value back to its parent,
+# but it DOES inherit whatever the parent already had at the moment it was
+# forked) — so every real call site below, regardless of how many subshell
+# layers its own caller chain wraps it in, hits the cache-HIT branch and
+# never re-invokes `gc rig list --json`, without needing each call site to
+# individually avoid $(...) itself.
 _OWNERSHIP_GUARD_REPOS=""
 _OWNERSHIP_GUARD_REPOS_DONE=""
 _OWNERSHIP_GUARD_REPOS_FAILED=""
@@ -3406,12 +3420,31 @@ _ownership_guard_repos() {
   # success regardless of what the cached data actually came from. The exit
   # code must reflect the fetch that produced the CACHED data currently being
   # returned, not "did today's invocation of this function do any work".
-  # ga-130et: this IS load-bearing for real now — every call site below
-  # invokes this function unwrapped (see header comment above), so a
-  # memoized cache-HIT's $? really does reach every real caller after the
-  # first in the same sweep, not just this file's isolated selftest.
+  # ga-130et: this reaches every real caller ONLY because of the top-level
+  # _ownership_guard_repos_prime call below, not merely because this call
+  # site is unwrapped (see the header comment's fix-attempt-1-vs-2
+  # correction) — a call nested inside a still-subshelled ancestor gets this
+  # same cache-HIT only once the prime call has already run in the
+  # un-subshelled parent shell.
   [ -z "$_OWNERSHIP_GUARD_REPOS_FAILED" ]
 }
+
+# _ownership_guard_repos_prime — call _ownership_guard_repos exactly ONCE,
+# here, at plain top-level script scope (not inside any function, pipe, or
+# `$(...)`), so its memo cache is populated in THIS shell — the one every
+# subshell forked for the rest of the sweep inherits from — before any of
+# the 6 real call sites below get a chance to be the first invocation from
+# inside their own (sometimes several-levels-deep) subshell. A subshell
+# cannot write the memo back to its parent, but it CAN read a value the
+# parent already set before the fork; that asymmetry is the entire fix.
+# Wrapped in its own named function (rather than a bare statement) only so
+# this exact priming step is independently extractable and testable via the
+# same extract_fn helper pilot-dispatcher.ns-rig-list-gc-failure.selftest.sh
+# already uses for every other function under test here.
+_ownership_guard_repos_prime() {
+  _ownership_guard_repos >/dev/null
+}
+_ownership_guard_repos_prime
 
 # ── TTL claim-recovery (relocated from ~L1586, ga-wisp-1gdiik) ────────────────
 # Runs HERE, after the stale-sling helpers + _ownership_guard_repos are defined, so
