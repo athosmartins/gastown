@@ -20,8 +20,15 @@
 #      scratchpad-reaper.sh's _fetch_live_keys — same call, same jq, same
 #      abort-on-failure discipline.
 #   2. STALE — the `.jsonl` file's mtime is older than MIN_AGE_HOURS (default
-#      72h = 3 days, matching the established manual-cleanup cadence per
-#      ga-t1ub9's own comment: "o Mayor limpa manual >3d entre ciclos").
+#      24h; lowered from the original 72h per ga-5ppqo — measured 2026-08-07:
+#      at 72h only 281MB of 1.6GB total was ever eligible, since 82% of
+#      volume was newer than that threshold, so the reaper could never keep
+#      pace with growth even running perfectly. The 72h number traced to a
+#      human habit ("o Mayor limpa manual >3d entre ciclos"), not a safety
+#      requirement — condition 1 (DEAD) is what actually protects a session;
+#      this is only the grace-period slack on top of it. 24h dry-run
+#      validated against live data: 1056 candidates, zero overlap with the
+#      live/suspended session-key set).
 #
 # SAFETY (ga-t1ub9's explicit ask: "CRITICO: NUNCA reapar sessao VIVA nem
 # SUSPENSA (sessao suspensa resume e precisa do transcript) — checar contra o
@@ -79,7 +86,7 @@ LOG="${TRANSCRIPT_REAPER_LOG:-$CITY/.gc/logs/transcript-reaper.log}"
 GC="${GC_BIN:-gc}"
 ENABLED="${TRANSCRIPT_REAPER_ENABLED:-1}"
 DRY_RUN="${TRANSCRIPT_REAPER_DRY_RUN:-0}"
-MIN_AGE_HOURS="${TRANSCRIPT_REAPER_MIN_AGE_HOURS:-72}"
+MIN_AGE_HOURS="${TRANSCRIPT_REAPER_MIN_AGE_HOURS:-24}"
 SELF_SESSION_ID="${CLAUDE_CODE_SESSION_ID:-}"
 PROD="${TRANSCRIPT_REAPER_PROD:-0}"
 

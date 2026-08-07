@@ -36,6 +36,18 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 
 echo "=== transcript-reaper.selftest.sh ==="
 
+echo ""
+echo "=== MIN_AGE_HOURS default (ga-5ppqo: 72h only ever reached 281MB/1.6G — 82% of volume was newer) ==="
+# Fresh subshell, no TRANSCRIPT_REAPER_MIN_AGE_HOURS override — exercises the
+# actual `${TRANSCRIPT_REAPER_MIN_AGE_HOURS:-24}` fallback in the script file
+# itself, not a copy of the number. The main sourcing at the top of this file
+# doesn't re-test this: env-var defaults resolve once at source time, so a
+# change to the fallback constant would otherwise go unnoticed here.
+DEFAULT_MIN_AGE="$(env -u TRANSCRIPT_REAPER_MIN_AGE_HOURS SCRIPT_PATH="$SCRIPT" bash -c 'TRANSCRIPT_REAPER_LIB=1 . "$SCRIPT_PATH"; echo "$MIN_AGE_HOURS"' 2>/dev/null)"
+[ "$DEFAULT_MIN_AGE" = "24" ] \
+  && ok "MIN_AGE_HOURS default: fresh source, no env override → 24 (was 72; ga-5ppqo measured 82% of volume newer than 72h)" \
+  || bad "MIN_AGE_HOURS default: expected 24, got '$DEFAULT_MIN_AGE'"
+
 # ── fixture: a live-keys file with two known session ids ────────────────────
 KEYFILE="$(mktemp /tmp/transcript-reaper-selftest-keys.XXXXXX)"
 printf 'alive-session-1\nalive-session-2\n' > "$KEYFILE"
@@ -290,6 +302,60 @@ main
 [ -f "$TMPROOT/proj/self-sess.jsonl" ] && ok "main(): CALLER's own session transcript survives even though absent from the (stubbed) live list" || bad "main(): self-sess.jsonl was wrongly reaped — self-protection failed"
 
 rm -rf "$TMPROOT"
+
+echo ""
+echo "=== main(): lowered default (24h) — suspended-in-band survives, newly-stale dead is reaped (ga-5ppqo) ==="
+# Fixture ages chosen INSIDE the 24h-72h band ga-5ppqo measured as 82% of
+# total volume — previously unreachable no matter how well the reaper ran,
+# now exactly the band the lowered threshold must handle correctly:
+#   proj/suspended-30h.jsonl — 30h old, session IS in the (stubbed) live set
+#     (simulates a suspended/asleep session `gc session list`'s default
+#     listing still tracks) → must survive: liveness beats age regardless of
+#     how low the threshold goes. This is the literal risk ga-5ppqo's own
+#     acceptance criteria calls out: "o teste tem que incluir uma sessao
+#     SUSPENSA de mais de 24h".
+#   proj/dead-30h.jsonl      — 30h old, DEAD (absent from the live set) —
+#     was NOT reachable at the old 72h default; must now be reaped at 24h.
+#     This is the actual space the fix recovers.
+#   proj/dead-20h.jsonl      — 20h old, DEAD — still inside the (shorter)
+#     grace window; must still survive. The grace period isn't gone, just
+#     shorter.
+BAND_ROOT="$(mktemp -d /tmp/transcript-reaper-selftest-band.XXXXXX)"
+mkdir -p "$BAND_ROOT/proj"
+: > "$BAND_ROOT/proj/suspended-30h.jsonl"
+: > "$BAND_ROOT/proj/dead-30h.jsonl"
+: > "$BAND_ROOT/proj/dead-20h.jsonl"
+
+BAND_NOW_EPOCH=$(date +%s)
+touch -t "$(date -r $((BAND_NOW_EPOCH - 30*3600)) +%Y%m%d%H%M.%S)" "$BAND_ROOT/proj/suspended-30h.jsonl"
+touch -t "$(date -r $((BAND_NOW_EPOCH - 30*3600)) +%Y%m%d%H%M.%S)" "$BAND_ROOT/proj/dead-30h.jsonl"
+touch -t "$(date -r $((BAND_NOW_EPOCH - 20*3600)) +%Y%m%d%H%M.%S)" "$BAND_ROOT/proj/dead-20h.jsonl"
+
+# Stub liveness: only "suspended-30h" is in the live set — exactly how a real
+# suspended session appears in `gc session list`'s default (active +
+# suspended/asleep + anything not closed) output.
+_fetch_live_keys() { printf 'suspended-30h\n' > "$1"; }
+
+# shellcheck disable=SC2034  # read by main() in the sourced script
+TRANSCRIPT_ROOT="$BAND_ROOT"
+ENABLED=1
+DRY_RUN=0
+MIN_AGE_HOURS=24
+SELF_SESSION_ID=""
+
+main
+
+[ -f "$BAND_ROOT/proj/suspended-30h.jsonl" ] \
+  && ok "main(): suspended session in the 24-72h band survives at the lowered threshold (liveness beats age)" \
+  || bad "main(): suspended-30h.jsonl was wrongly reaped — THE EXACT RISK ga-5ppqo's fix must not introduce"
+[ -f "$BAND_ROOT/proj/dead-30h.jsonl" ] \
+  && bad "main(): dead session at 30h should now be reaped at the lowered 24h threshold (was unreachable at 72h)" \
+  || ok "main(): dead session at 30h now reaped — the actual space ga-5ppqo's fix recovers"
+[ -f "$BAND_ROOT/proj/dead-20h.jsonl" ] \
+  && ok "main(): dead session at 20h still survives — grace period holds, just shorter" \
+  || bad "main(): dead-20h.jsonl reaped before its (lowered) grace period elapsed"
+
+rm -rf "$BAND_ROOT"
 
 echo ""
 echo "=== main(): production sentinel end-to-end (ga-h565g/ga-lfj05) ==="
