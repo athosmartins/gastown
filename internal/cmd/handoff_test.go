@@ -679,7 +679,17 @@ func TestWarnHandoffGitStatus(t *testing.T) {
 	})
 
 	t.Run("no warning outside git repo", func(t *testing.T) {
-		os.Chdir(os.TempDir())
+		// Use a fresh, empty directory rather than os.TempDir() itself:
+		// os.TempDir() is not guaranteed to be free of an ambient git repo
+		// (a stray .git can end up sitting at the OS temp root from an
+		// unrelated tool/test), and git's normal upward directory discovery
+		// would then treat this "outside any repo" case as inside one.
+		// GIT_CEILING_DIRECTORIES bounds that discovery at the fresh dir's
+		// parent so it can't walk into whatever ancestor the OS temp root
+		// happens to be.
+		dir := t.TempDir()
+		t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(dir))
+		os.Chdir(dir)
 		output := captureStderr(t, func() {
 			warnHandoffGitStatus()
 		})

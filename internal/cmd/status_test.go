@@ -13,6 +13,11 @@ import (
 	"github.com/steveyegge/gastown/internal/rig"
 )
 
+// captureStderr redirects os.Stderr to a pipe, calls fn, then returns whatever
+// fn wrote. Reading happens in a goroutine so the pipe buffer cannot deadlock
+// even when fn produces more output than the OS pipe buffer (e.g. a git
+// status warning listing thousands of untracked files) — mirrors captureStdout
+// in prime_test.go.
 func captureStderr(t *testing.T, fn func()) string {
 	t.Helper()
 	old := os.Stderr
@@ -22,18 +27,37 @@ func captureStderr(t *testing.T, fn func()) string {
 	}
 	os.Stderr = w
 
+	var buf bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		io.Copy(&buf, r)
+		close(done)
+	}()
+
 	fn()
 
 	_ = w.Close()
+	<-done
 	os.Stderr = old
-
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, r); err != nil {
-		t.Fatalf("read stderr: %v", err)
-	}
 	_ = r.Close()
 
 	return buf.String()
+}
+
+// TestCaptureStderr_LargeOutputDoesNotDeadlock is a regression test for
+// ga-owhj3: captureStderr used to read the pipe only after fn() returned, so
+// fn() would block forever inside a single Write() once it wrote more than
+// the OS pipe buffer (64KB on macOS/Linux). This writes well past that in one
+// burst — independent of any ambient git/filesystem state — and confirms
+// captureStderr returns the intact output instead of hanging.
+func TestCaptureStderr_LargeOutputDoesNotDeadlock(t *testing.T) {
+	payload := strings.Repeat("x", 200*1024)
+	output := captureStderr(t, func() {
+		_, _ = os.Stderr.WriteString(payload)
+	})
+	if output != payload {
+		t.Errorf("captured output corrupted or truncated: got %d bytes, want %d", len(output), len(payload))
+	}
 }
 
 func TestDiscoverRigAgents_UsesRigPrefix(t *testing.T) {
