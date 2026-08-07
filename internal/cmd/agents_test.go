@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -283,6 +284,11 @@ func TestFilterAndSortSessions_BootSessionFiltered(t *testing.T) {
 
 func TestFilterAndSortSessions_SortOrder(t *testing.T) {
 	setupCmdTestRegistry(t)
+	// "mr-witness" below needs "mr" registered or session.ParseSessionName
+	// fails to recognize the prefix, categorizeSession returns nil, and
+	// filterAndSortSessions silently drops the session (one short of the 8
+	// expected entries) rather than misordering it.
+	session.DefaultRegistry().Register("mr", "myrig")
 	input := []string{
 		"gt-crew-zed",   // crew (gastown)
 		"gt-witness",    // witness (gastown)
@@ -601,6 +607,13 @@ func TestFindTestSockets_SkipsNonTestSockets(t *testing.T) {
 
 func TestGuessSessionFromWorkerDir(t *testing.T) {
 	setupCmdTestRegistry(t)
+	// The "different rig" case below needs its own rig registered with a
+	// distinct prefix — session.PrefixForRig documents (and correctly
+	// implements) falling back to DefaultPrefix ("gt") for any rig not in
+	// the registry, so without this, guessSessionFromWorkerDir returning
+	// "gt-crew-alpha" is the registry-driven code doing exactly what it's
+	// supposed to, not a bug.
+	session.DefaultRegistry().Register("mr", "myrig")
 	townRoot := "/town"
 
 	tests := []struct {

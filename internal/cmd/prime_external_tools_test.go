@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -32,6 +33,21 @@ func setupPrimeExternalToolTest(t *testing.T, bdScript, gtScript string) string 
 	}
 	writePrimeToolScript(t, filepath.Join(binDir, "bd"), bdScript)
 	writePrimeToolScript(t, filepath.Join(binDir, "gt"), gtScript)
+
+	// The OS pays a one-time cold-exec cost (measured 100-150ms on this
+	// machine — likely Gatekeeper/AMFI scanning a just-written executable)
+	// the first time it execs a brand new file; a warm re-exec of the same
+	// path drops to single-digit ms. That cold cost lands inside the
+	// artificially tight primeExternalToolTimeout below and can alone exceed
+	// it, killing the subprocess before its script body ever runs —
+	// unrelated to whatever behavior a given test is actually exercising
+	// (including the tests that assert normal, non-timeout completion). Pay
+	// it up front, outside the timed test window and before
+	// PRIME_TOOL_CALL_LOG is set so the warm-up call's own log line (or its
+	// absence, since the env var is unset) never reaches assertions below.
+	warmUpPrimeToolScript(t, filepath.Join(binDir, "bd"))
+	warmUpPrimeToolScript(t, filepath.Join(binDir, "gt"))
+
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("PRIME_TOOL_CALL_LOG", logPath)
 	t.Setenv("TMUX", "")
@@ -51,6 +67,14 @@ func writePrimeToolScript(t *testing.T, path, body string) {
 	if err := os.WriteFile(path, []byte(script), 0700); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
+}
+
+// warmUpPrimeToolScript execs path once and discards the outcome entirely —
+// its only purpose is to absorb the one-time cold-exec cost described above
+// before any timed assertion runs.
+func warmUpPrimeToolScript(t *testing.T, path string) {
+	t.Helper()
+	_ = exec.Command(path, "__warmup__").Run()
 }
 
 func assertElapsedUnder(t *testing.T, elapsed time.Duration, max time.Duration) {

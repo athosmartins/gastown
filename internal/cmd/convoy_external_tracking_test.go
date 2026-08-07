@@ -68,9 +68,13 @@ func TestGetTrackedIssues_FallsBackToShowTrackedDependencies(t *testing.T) {
 	scriptBody := fmt.Sprintf(`
 case "$*" in
   "--allow-stale version")
-    exit 0
+    # Must print a non-empty, "unknown flag"-free response:
+    # beads.BdSupportsAllowStaleWithEnv treats empty probe output as
+    # "unsupported" (fail-closed), which would silently drop --allow-stale
+    # from the dep list call below and break its case-pattern match.
+    echo "bd 1.0.3"
     ;;
-  "dep list hq-cv-ext --direction=down --type=tracks --allow-stale --json")
+  "--allow-stale dep list hq-cv-ext --direction=down --type=tracks --json")
     echo '[]'
     ;;
   "show hq-cv-ext --json")

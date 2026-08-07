@@ -126,6 +126,15 @@ func TestSlingNewlyCreatedRigBeadRoutesBDCommandsToTargetRig(t *testing.T) {
 	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
 
 	townRoot := t.TempDir()
+	// Resolve immediately: production code derives directories both via
+	// simple string-joins from this value AND via getwd() after chdir-ing
+	// into it, and the latter canonicalizes /var -> /private/var on macOS.
+	// Starting from a resolved townRoot keeps every downstream path
+	// (rigDir, wantBeadsDir, the create/routing bd calls below) consistent
+	// regardless of which derivation a given code path uses.
+	if resolved, err := filepath.EvalSymlinks(townRoot); err == nil {
+		townRoot = resolved
+	}
 	newBeadID := "gt-new123"
 
 	// Minimal workspace marker so workspace.FindFromCwd() succeeds.
@@ -321,10 +330,14 @@ exit /b 0
 	if resolved, err := filepath.EvalSymlinks(wantDir); err == nil {
 		wantDir = resolved
 	}
-	wantBeadsDir := filepath.Join(rigDir, ".beads")
-	if resolved, err := filepath.EvalSymlinks(wantBeadsDir); err == nil {
-		wantBeadsDir = resolved
-	}
+	// Join .beads onto the already-resolved wantDir rather than resolving
+	// rigDir+".beads" directly: that subdirectory is never actually created
+	// on disk in this test, so EvalSymlinks on it fails (silently, via the
+	// err==nil guard) and leaves the path unresolved — while the real,
+	// production-computed BEADS_DIR comes out already-resolved (getwd()
+	// after chdir canonicalizes /var -> /private/var on macOS), so the two
+	// would never match on a machine where TMPDIR sits behind that symlink.
+	wantBeadsDir := filepath.Join(wantDir, ".beads")
 	gotPolecatCook := false
 	gotPolecatWisp := false
 	gotReviewCook := false
@@ -412,6 +425,15 @@ func TestRoutedBeadReadUsesCanonicalShowWithoutUnsupportedAllowStale(t *testing.
 	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
 
 	townRoot := t.TempDir()
+	// Resolve immediately: this test passes townRoot both directly (e.g. to
+	// getBeadInfoFromTownRoot, which joins it into BEADS_DIR verbatim) and
+	// indirectly via cwd-discovery (os.Chdir + workspace.FindFromCwdOrError,
+	// which canonicalizes /var -> /private/var on macOS through getwd()).
+	// Starting resolved keeps both derivations consistent with each other
+	// and with the RIG_BEADS comparison below.
+	if resolved, err := filepath.EvalSymlinks(townRoot); err == nil {
+		townRoot = resolved
+	}
 	beadID := "gt-new123"
 	rigDir := filepath.Join(townRoot, "gastown", "mayor", "rig")
 	rigBeadsDir := filepath.Join(rigDir, ".beads")
@@ -796,6 +818,16 @@ exit /b 0
 
 func TestSlingRejectsBeadMissingFromTargetRigBeforeSpawn(t *testing.T) {
 	townRoot := t.TempDir()
+	// Resolve immediately: TARGET_BEADS_DIR below is joined from townRoot
+	// directly, but production code derives the actual BEADS_DIR it queries
+	// via getwd() after chdir, which canonicalizes /var -> /private/var on
+	// macOS. Unresolved, the fake bd script's equality check against
+	// TARGET_BEADS_DIR never matches, so the "not found in target rig"
+	// simulation never fires and the validation this test exists to check
+	// never runs.
+	if resolved, err := filepath.EvalSymlinks(townRoot); err == nil {
+		townRoot = resolved
+	}
 
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
 		t.Fatalf("mkdir mayor/rig: %v", err)
@@ -928,6 +960,16 @@ func setupCrossDatabaseSlingGuardTest(t *testing.T) (townRoot, logPath string) {
 	t.Helper()
 
 	townRoot = t.TempDir()
+	// Resolve immediately: TARGET_BEADS_DIR below is joined from townRoot
+	// directly, but callers that discover their town root via cwd (e.g.
+	// scheduleBead, after the os.Chdir below) get it back through getwd(),
+	// which canonicalizes /var -> /private/var on macOS. Unresolved, the
+	// fake bd script's equality check against TARGET_BEADS_DIR never
+	// matches, so the "not found in target rig" simulation this test
+	// depends on never fires.
+	if resolved, err := filepath.EvalSymlinks(townRoot); err == nil {
+		townRoot = resolved
+	}
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
 		t.Fatalf("mkdir mayor/rig: %v", err)
 	}

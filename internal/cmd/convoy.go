@@ -1699,20 +1699,15 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 	if fields == nil {
 		fields = &beads.ConvoyFields{}
 	}
-	if fields.CompletionNotifiedAt != "" {
-		return
-	}
-	fields.CompletionNotifiedAt = time.Now().UTC().Format(time.RFC3339)
-	newDesc := beads.SetConvoyFields(&beads.Issue{Description: convoys[0].Description}, fields)
-	if err := BdCmd("update", convoyID, "--description="+newDesc).Dir(townBeads).WithAutoCommit().Run(); err != nil {
-		style.PrintWarning("could not record convoy completion notification state for %s: %v", convoyID, err)
-		return
-	}
 
 	// Persistent dedup: if completion notifications already fired, skip. The
 	// refinery patrol's auto-close runs on each cycle and would otherwise
-	// re-fire the same notification stack every iteration (dc-4zss).
-	if fields != nil && fields.CompletionNotifiedAt != "" {
+	// re-fire the same notification stack every iteration (dc-4zss). Checked
+	// once, here, before sending — and persisted once, after sending, below
+	// — so a crash between the two costs at most one re-send on the next
+	// cycle rather than silently marking a notification "sent" that a
+	// failed mail/update call never actually delivered.
+	if fields.CompletionNotifiedAt != "" {
 		return
 	}
 
@@ -1785,7 +1780,7 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 		updatedFields = &beads.ConvoyFields{}
 	}
 	updatedFields.CompletionNotifiedAt = time.Now().UTC().Format(time.RFC3339)
-	newDesc = beads.SetConvoyFields(&beads.Issue{Description: convoys[0].Description}, updatedFields)
+	newDesc := beads.SetConvoyFields(&beads.Issue{Description: convoys[0].Description}, updatedFields)
 	if err := updateConvoyDescription(townBeads, convoyID, newDesc); err != nil {
 		style.PrintWarning("could not stamp CompletionNotifiedAt on %s: %v", convoyID, err)
 	}

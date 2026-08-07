@@ -91,8 +91,13 @@ func TestRunConvoyList_UsesTownRootAndStripsBeadsDir(t *testing.T) {
 	t.Setenv("BEADS_DIR", "/wrong/.beads")
 
 	scriptBody := fmt.Sprintf(`
-# Allow-stale version probe is exempt from BEADS_DIR check.
+# Allow-stale version probe is exempt from BEADS_DIR check. Must print a
+# non-empty, "unknown flag"-free response: beads.BdSupportsAllowStaleWithEnv
+# treats empty probe output as "unsupported" (fail-closed), which would
+# silently drop --allow-stale from every subsequent call below and break
+# their case-pattern matches.
 if [ "$*" = "--allow-stale version" ]; then
+  echo "bd 1.0.3"
   exit 0
 fi
 
@@ -112,7 +117,7 @@ case "$*" in
 	  "list --json --limit=0 --all --flat")
 	    echo '[]'
 	    ;;
-  "dep list hq-cv-town --direction=down --type=tracks --allow-stale --json")
+  "--allow-stale dep list hq-cv-town --direction=down --type=tracks --json")
     if [ "$PWD" != "%s" ]; then
       echo "expected town root, got $PWD" >&2
       exit 1
@@ -167,8 +172,13 @@ func TestRunConvoyStatus_UsesTownRootAndStripsBeadsDir(t *testing.T) {
 	t.Setenv("BEADS_DIR", "/wrong/.beads")
 
 	scriptBody := fmt.Sprintf(`
-# Allow-stale version probe is exempt from BEADS_DIR check.
+# Allow-stale version probe is exempt from BEADS_DIR check. Must print a
+# non-empty, "unknown flag"-free response: beads.BdSupportsAllowStaleWithEnv
+# treats empty probe output as "unsupported" (fail-closed), which would
+# silently drop --allow-stale from every subsequent call below and break
+# their case-pattern matches.
 if [ "$*" = "--allow-stale version" ]; then
+  echo "bd 1.0.3"
   exit 0
 fi
 
@@ -185,7 +195,7 @@ case "$*" in
     fi
     echo '[{"id":"hq-cv-status","title":"Status convoy","status":"open","issue_type":"convoy","created_at":"2026-03-09T00:00:00Z","labels":[],"dependencies":[]}]'
     ;;
-  "dep list hq-cv-status --direction=down --type=tracks --allow-stale --json")
+  "--allow-stale dep list hq-cv-status --direction=down --type=tracks --json")
     if [ "$PWD" != "%s" ]; then
       echo "expected town root, got $PWD" >&2
       exit 1

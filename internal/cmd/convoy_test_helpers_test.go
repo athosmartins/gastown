@@ -304,7 +304,11 @@ func (d *testDAG) BdStubScript() string {
 	sb.WriteString(fmt.Sprintf("    echo '%s'\n", convoyListJSON))
 	sb.WriteString("    exit 0\n")
 	sb.WriteString("    ;;\n")
-	sb.WriteString("  list\\ --json\\ --limit=0|list\\ --json\\ --limit=0\\ --all|list\\ --json\\ --limit=0\\ --status=*)\n")
+	// The --all alternative needs a trailing wildcard: beads.InjectFlatForListJSON
+	// appends --flat to every "bd list --json" call (bd v0.59+ requires it for
+	// JSON output), so the actual call is "list --json --limit=0 --all --flat",
+	// not the bare form below.
+	sb.WriteString("  list\\ --json\\ --limit=0|list\\ --json\\ --limit=0\\ --all*|list\\ --json\\ --limit=0\\ --status=*)\n")
 	sb.WriteString("    echo '[]'\n")
 	sb.WriteString("    exit 0\n")
 	sb.WriteString("    ;;\n")

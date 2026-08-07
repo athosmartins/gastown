@@ -831,7 +831,12 @@ func TestCollectGitState(t *testing.T) {
 	})
 
 	t.Run("returns_empty_outside_git_repo", func(t *testing.T) {
+		// GIT_CEILING_DIRECTORIES bounds git's upward discovery at tmpDir's
+		// parent: os.TempDir() is not guaranteed git-free (a stray ambient
+		// .git can sit at the OS temp root — see ga-owhj3), so without this
+		// bound, git would walk up past tmpDir and find that repo instead.
 		tmpDir := t.TempDir()
+		t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(tmpDir))
 		t.Chdir(tmpDir)
 
 		state := collectGitState()
