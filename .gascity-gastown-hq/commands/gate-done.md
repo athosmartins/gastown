@@ -410,6 +410,44 @@ _BEAD_STORE="$GC_CITY_PATH"
 [ "$BEAD_RIG" != "gascity" ] && [ "$BEAD_RIG" != "unknown" ] && [ -n "${_BEAD_RIG_PATH:-}" ] && _BEAD_STORE="$_BEAD_RIG_PATH"
 bd -C "$_BEAD_STORE" label add "$BEAD_ID" "gate:queued" -q 2>/dev/null || true
 
+# ga-6lwpy: auto-close the CALLING sling/task bead now, instead of leaving it as a
+# manual post-gate-done step. Root incident: a dog built+pushed+gate-done'd a fix via
+# sling bead ga-0l58y but exited/recycled before manually closing ga-0l58y itself (the
+# documented-but-unenforced "close your sling right after gate-done" step). The
+# dangling in_progress sling was later resumed by a session with zero memory of the
+# prior work; it correctly found the merge and stood down without rebuilding, but had
+# no record that its own lineage produced that merge, and reported "a concurrent
+# independent build" — a self-attribution error, not a real double-dispatch. Closing
+# the sling synchronously with the marker that proves the work is submitted removes
+# the manual step and the exposure window entirely.
+#
+# pilot.sling_bead lives on the STORY bead (stamped by pilot-dispatcher.sh at dispatch
+# time) and points at the wrapper task bead, always in GC_CITY_PATH (`gc sling` always
+# creates task beads in HQ). For RIG-NATIVE dispatch (crews assigned directly,
+# ga-mfeip), pilot.sling_bead == the STORY bead's own id — must NOT close in that case,
+# the story bead stays open until the gate merges. Fail-open throughout: never block
+# marker creation (already done above) on this being findable/closable.
+_SLING_BEAD_ID=$(bd -C "$_BEAD_STORE" show "$BEAD_ID" --json 2>/dev/null \
+  | jq -r 'if type=="array" then .[0] else . end | .metadata["pilot.sling_bead"] // empty' 2>/dev/null || echo "")
+
+if [ -n "$_SLING_BEAD_ID" ] && [ "$_SLING_BEAD_ID" != "$BEAD_ID" ]; then
+  _SLING_INFO=$(bd -C "$GC_CITY_PATH" show "$_SLING_BEAD_ID" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | "\(.status)\t\(.assignee // "")"' 2>/dev/null || printf '\t')
+  _SLING_STATUS=$(printf '%s' "$_SLING_INFO" | cut -f1)
+  _SLING_ASSIGNEE=$(printf '%s' "$_SLING_INFO" | cut -f2)
+  _SLING_IS_MINE=0
+  for _MY_ID in "${GC_SESSION_NAME:-}" "${GC_SESSION_ID:-}" "${BEADS_ACTOR:-}" "${GC_ALIAS:-}"; do
+    [ -n "$_MY_ID" ] && [ -n "$_SLING_ASSIGNEE" ] && [ "$_MY_ID" = "$_SLING_ASSIGNEE" ] && _SLING_IS_MINE=1
+  done
+  if [ "$_SLING_STATUS" = "in_progress" ] && [ "$_SLING_IS_MINE" = "1" ]; then
+    bd -C "$GC_CITY_PATH" close "$_SLING_BEAD_ID" --reason \
+      "Submitted to gate: marker $MARKER_ID for branch $BRANCH (story bead $BEAD_ID stays open until the gate merges). Auto-closed by /gate-done (ga-6lwpy)." \
+      -q 2>/dev/null \
+      && echo "Closed sling/task bead: $_SLING_BEAD_ID" \
+      || true
+  fi
+fi
+
 echo "Marker created: $MARKER_ID"
 ```
 
