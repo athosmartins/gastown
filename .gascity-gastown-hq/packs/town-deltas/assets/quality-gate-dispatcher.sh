@@ -3534,7 +3534,9 @@ $PARTIAL_EVIDENCE" 2>/dev/null || true
       #     silently leave it).
       RESPAWN_HITS=""
       _still_listed() {  # 0 (true) iff $BEAD_ID is present in `bd list --json <args>`
-        bd -C "$BEAD_CITY" list --json "$@" 2>/dev/null \
+        # ga-21kmp: --limit 0 required — default 50 silently truncates, and a
+        # truncated-out hit here would falsely clear a live re-spawn vector.
+        bd -C "$BEAD_CITY" list --json --limit 0 "$@" 2>/dev/null \
           | jq -e --arg id "$BEAD_ID" 'any(.[]?; .id == $id)' >/dev/null 2>&1
       }
       # a) Pool in_progress crash-recovery (applies to ALL beads — the core loop).

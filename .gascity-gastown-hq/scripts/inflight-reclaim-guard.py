@@ -748,7 +748,7 @@ def list_inflight_beads():
             ["bd", "list",
              "--label", "story:in-flight",
              "--status", "open,in_progress",
-             "--json"],
+             "--json", "--limit", "0"],
             capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
             return None
@@ -861,7 +861,7 @@ def list_stranded_inprogress_beads():
         result = subprocess.run(
             ["bd", "list",
              "--status", "in_progress",
-             "--json"],
+             "--json", "--limit", "0"],
             capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
             return None
@@ -1017,7 +1017,7 @@ def list_gate_active_source_beads():
                 ["bd", "list",
                  "--label", "type:quality-gate-marker",
                  "--label", gate_lbl,
-                 "--json"],
+                 "--json", "--limit", "0"],
                 capture_output=True, text=True, timeout=20)
             if result.returncode != 0:
                 # A sub-query FAILURE (e.g. transient Dolt contention) is not the
@@ -1470,7 +1470,7 @@ def list_live_sling_source_beads(sessions, now):
     """
     try:
         result = subprocess.run(
-            ["bd", "list", "--status", "in_progress", "--json"],
+            ["bd", "list", "--status", "in_progress", "--json", "--limit", "0"],
             capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
             return None
@@ -1622,7 +1622,7 @@ def list_refused_sling_source_beads():
     for status in ("open", "in_progress"):
         try:
             result = subprocess.run(
-                ["bd", "list", "--status", status, "--json"],
+                ["bd", "list", "--status", status, "--json", "--limit", "0"],
                 capture_output=True, text=True, timeout=20)
             if result.returncode != 0 or not result.stdout.strip():
                 continue
@@ -2385,7 +2385,7 @@ def list_orphan_sweep_false_resets():
         result = subprocess.run(
             ["bd", "list", "--status", "open",
              "--has-metadata-key", "gc.session_name",
-             "--no-assignee", "--json"],
+             "--no-assignee", "--json", "--limit", "0"],
             capture_output=True, text=True, timeout=20)
         if result.returncode == 0 and result.stdout.strip():
             data = json.loads(result.stdout)
@@ -2573,7 +2573,7 @@ def reclaim_dead_dog_claims(exclude_session_ids=None, sessions=None,
         try:
             r = subprocess.run(
                 ["bd", "list", "--status", "in_progress",
-                 "--assignee", DOG_POOL_ALIAS, "--json"],
+                 "--assignee", DOG_POOL_ALIAS, "--json", "--limit", "0"],
                 capture_output=True, text=True, timeout=15)
         except Exception:
             return reclaimed  # fail-open

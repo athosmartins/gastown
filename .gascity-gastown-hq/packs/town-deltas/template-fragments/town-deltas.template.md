@@ -348,4 +348,35 @@ limite do plano) — deletar+recriar seria churn puro, decisão correta e dentro
 do domínio de quem os criou. O bead existe pelo buraco estrutural na
 instrução, não pela conduta do worker: o relato foi exemplar, mediu o próprio
 estrago na API (não no relato) e reportou com rastro.
+
+**`bd list --json` trunca em 50 SEM sinal no JSON — todo sweep precisa de
+`--limit 0` explícito (ga-21kmp).** O CLI faz a coisa certa e avisa em texto
+humano ("Showing 50 issues; more results matched but were hidden by --limit.
+Use --limit 0 for all"), mas o aviso vai pro STDERR — e o idioma desta cidade
+é `2>/dev/null`. `bd list --json` sozinho devolve um ARRAY PURO de até 50
+itens, sem nenhum campo de aviso nem envelope; o consumidor programático não
+tem como saber que faltou. `--all` devolve tudo (todo status, todo tempo —
+49.884 num teste real desta cidade); `--limit 0` (== `-n 0`) devolve tudo do
+filtro atual sem truncar (335 abertos no mesmo teste). Uma consulta filtrada
+cujo conjunto é <50 funciona por acidente — o defeito é latente e aparece
+justo quando há backlog, que é exatamente quando o diagnóstico mais importa.
+Já causou dois erros reais do Mayor no mesmo dia (concluir "não existem
+digest beads" quando havia 10 fora dos primeiros 50; subcontar "10 beads
+armados sem rota" quando eram 19) e foi encontrado ao vivo, sem `--limit`
+algum, em vários daemons que contam/decidem sobre listas de beads
+(`inflight-reclaim-guard.py`, `quality-gate-dispatcher.sh`'s
+`_still_listed()`, `gate-health-monitor.py`, `production-stall-watchdog.py`,
+`throughput-stall-watchdog.py`) — cada um silenciosamente ignorando o 51º+
+item do conjunto que deveria estar varrendo.
+
+**Como aplicar:** qualquer `bd list ... --json` (shell OU
+`subprocess.run(["bd", "list", ...])` em Python) que VARRE um conjunto
+(conta, decide, ou itera o resultado inteiro) precisa de `--limit 0`
+explícito — nunca confie no default de 50. Só dispensa quem busca UM id
+específico, ou já usa `--all`/`-n <N>` deliberado com um N que o autor
+escolheu conscientemente (não mexa nesses). Ao auditar um arquivo, procure os
+DOIS padrões — um grep textual `bd list.*--json` pega o shell, mas PERDE o
+Python: `["bd", "list", ...]` não tem "bd list" adjacente como substring
+(há vírgula+aspas no meio), então precisa de um grep separado por `"bd",`
+seguido de `"list"` numa janela de poucas linhas.
 {{ end }}

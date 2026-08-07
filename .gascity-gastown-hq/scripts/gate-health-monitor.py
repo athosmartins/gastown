@@ -101,7 +101,7 @@ def list_error_markers():
     try:
         result = subprocess.run(
             ["gc", "bd", "list", "-l", "type:quality-gate-marker",
-             "-l", "gate-status:error", "--json"],
+             "-l", "gate-status:error", "--json", "--limit", "0"],
             capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
             return []
@@ -131,7 +131,7 @@ def pending_verdicts_by_run():
     failure so the caller simply skips this cycle's idle-reviewer check."""
     try:
         result = subprocess.run(
-            ["gc", "bd", "list", "-l", "type:quality-gate-verdict", "--json"],
+            ["gc", "bd", "list", "-l", "type:quality-gate-verdict", "--json", "--limit", "0"],
             capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
             return {}
@@ -159,7 +159,7 @@ def verdict_beads_missing_assignee():
     try:
         result = subprocess.run(
             ["gc", "bd", "list", "-l", "type:quality-gate-verdict",
-             "-l", "verdict:pending", "--no-assignee", "--json"],
+             "-l", "verdict:pending", "--no-assignee", "--json", "--limit", "0"],
             capture_output=True, text=True, timeout=20)
         if result.returncode != 0:
             return None
@@ -191,7 +191,7 @@ def queued_marker_ids():
     try:
         result = subprocess.run(
             ["gc", "bd", "list", "-l", "type:quality-gate-marker",
-             "-l", "gate-status:queued", "--json"],
+             "-l", "gate-status:queued", "--json", "--limit", "0"],
             capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
             return []

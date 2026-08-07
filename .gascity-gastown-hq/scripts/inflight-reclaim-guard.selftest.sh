@@ -232,6 +232,33 @@ if _secs == 0.0 and "first_seen_stranded" not in _st:
 else:
     bad("not-stranded did not reset (%.0fs)" % _secs)
 
+# ── Scenario 9 (ga-21kmp): every sub-query must emit --limit 0. `bd list --json`
+# defaults to --limit 50 and truncates SILENTLY (no error, no envelope flag) —
+# a gate-status label with 51+ active markers would drop the 51st+ out of the
+# active source-bead set without either sub-query returning non-zero, so
+# scenarios 3-6 above (which all key off returncode/JSON shape) cannot catch
+# this failure mode at all. ──
+print("Scenario 9 (ga-21kmp): every sub-query emits --limit 0 (no silent truncation)")
+_captured_cmds = []
+def _capture_run(cmd, capture_output=True, text=True, timeout=20):
+    _captured_cmds.append(cmd)
+    return FakeResult(0, "[]")
+orig = m.subprocess.run
+m.subprocess.run = _capture_run
+try:
+    m.list_gate_active_source_beads()
+    _missing = [c for c in _captured_cmds
+                if "--limit" not in c or c[c.index("--limit") + 1] != "0"]
+    if _captured_cmds and not _missing:
+        ok("all %d sub-queries include --limit 0" % len(_captured_cmds))
+    elif not _captured_cmds:
+        bad("no sub-queries were issued — cannot verify --limit 0 (test setup problem)")
+    else:
+        bad("%d/%d sub-queries missing --limit 0 — silent-truncation regression: %r" % (
+            len(_missing), len(_captured_cmds), _missing))
+finally:
+    m.subprocess.run = orig
+
 print("")
 print("Results: %d passed, %d failed" % (PASS, FAIL))
 if FAIL == 0:

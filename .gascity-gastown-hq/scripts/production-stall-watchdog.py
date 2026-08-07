@@ -279,7 +279,7 @@ def merge_stall(now=None):
 
     # Also count open story:approved beads (work waiting to be dispatched/gated).
     approved = 0
-    r = sh([BD, "list", "-l", "story:approved", "--status", "open", "--json"], timeout=20)
+    r = sh([BD, "list", "-l", "story:approved", "--status", "open", "--json", "--limit", "0"], timeout=20)
     if r and r.returncode == 0:
         approved = len(parse_bd_json(r.stdout))
 
@@ -305,7 +305,7 @@ def stuck_execution(now=None):
     STUCK_EXEC_SEC (assigned but not progressing); else None. FAIL-OPEN: a failed
     `bd list` or an unparseable timestamp yields no finding."""
     now = now if now is not None else time.time()
-    r = sh([BD, "list", "--status", "in_progress", "--json"], timeout=25)
+    r = sh([BD, "list", "--status", "in_progress", "--json", "--limit", "0"], timeout=25)
     if not r or r.returncode != 0:
         return None
     beads = parse_bd_json(r.stdout)

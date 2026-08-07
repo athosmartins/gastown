@@ -862,7 +862,7 @@ def _gate_queue_depth():
     if _bd_gate_queue_markers is not None:
         rows = _bd_gate_queue_markers()   # test seam
     else:
-        r = _sh([BD_BIN, "-C", CITY, "list", "--json",
+        r = _sh([BD_BIN, "-C", CITY, "list", "--json", "--limit", "0",
                  "-l", "type:quality-gate-marker", "-l", "gate-status:queued"],
                 timeout=BD_TIMEOUT)
         if r is None or r.returncode != 0:
