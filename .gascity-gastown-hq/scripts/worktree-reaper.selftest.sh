@@ -612,6 +612,104 @@ wnested && bad "ga-t14of: nested-root (.gascity-gastown-hq/.gc-worktrees) merged
 wnestedbusy && ok "ga-t14of: nested-root merged+IN-USE worktree KEPT (in-use protection applies via loop 1 too)" \
   || bad "ga-t14of: nested-root merged+IN-USE worktree wrongly reaped via loop 1 — turns cleanup into an incident!"
 
+# ══ ga-t14of gate-feedback (fix-attempt 1 FAILED review): the REAL (non-fake) lsof
+# code path had ZERO coverage — every fixture above sets WORKTREE_REAPER_FAKE_LSOF,
+# which short-circuits _worktree_in_use before it ever invokes lsof at all. These
+# cases PATH-inject a stand-in `lsof` executable so the function's actual invocation
+# (command -v lsof, then the real pipe/capture) runs for real, proving the reviewer's
+# exact failure mode is fixed rather than merely reasoned about:
+#   (i)   a real lsof that EXITS NONZERO while still printing a genuine match is read
+#         as in-use — the pipefail-inversion bug (lsof's own often-nonzero exit no
+#         longer overwrites awk's correctly-computed found=1, since lsof's exit code
+#         is no longer consulted at all once its output is captured separately);
+#   (ii)  a real lsof that prints NO output at all (any reason — permission-scoped
+#         visibility, transient error, version skew) fails SAFE (kept), instead of
+#         collapsing "couldn't tell" and "confirmed free" into the same value;
+#   (iii) a real lsof that runs and genuinely finds no match is still correctly read
+#         as not-in-use (no over-conservative regression from the (i)/(ii) hardening).
+echo "── ga-t14of gate-feedback: real (non-fake) lsof path, fail-safe on error/empty ──"
+FAKEBIN="$TMP/fakebin"; mkdir -p "$FAKEBIN"
+
+# (i) exits 1 (mirrors lsof's real-world nonzero exit from permission errors on
+# processes unrelated to the match) while still printing a genuine match.
+R1TOWN="$TMP/r1town"; mkdir -p "$R1TOWN"
+R1REMOTE="$TMP/r1remote.git"; git init -q --bare "$R1REMOTE"
+R1RIG="$R1TOWN/r1rig"; git init -q -b main "$R1RIG"
+( cd "$R1RIG"
+  git remote add origin "$R1REMOTE"
+  echo r1 > r1.txt; git add r1.txt; git commit -qm r1base
+  git push -q origin main; git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  git worktree add -q "$R1RIG/crew/worker-real-busy" -b crew/r1/busy main
+) >/dev/null 2>&1
+touch -t "$(date -v-35M +%Y%m%d%H%M 2>/dev/null || date -d '35 minutes ago' +%Y%m%d%H%M)" "$R1RIG/crew/worker-real-busy" 2>/dev/null || true
+REAL_BUSY_PATH="$(cd "$R1RIG/crew/worker-real-busy" && pwd -P)"
+cat > "$FAKEBIN/lsof" <<EOF
+#!/usr/bin/env bash
+echo "n${REAL_BUSY_PATH}"
+exit 1
+EOF
+chmod +x "$FAKEBIN/lsof"
+PATH="$FAKEBIN:$PATH" \
+WORKTREE_REAPER_GT="$R1TOWN" WORKTREE_REAPER_LOG="$TMP/reaperR1.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+  bash "$REAPER" >/dev/null 2>&1
+r1wt() { git -C "$R1RIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/worker-real-busy\$"; }
+r1wt && ok "gate-feedback: real lsof exit!=0-but-matched → still read as in-use (pipefail-inversion fixed)" \
+       || bad "gate-feedback: real lsof's own nonzero exit inverted a genuine match into 'not in use' — the exact reported bug"
+
+# (ii) prints NO output at all → fail SAFE (treated as in-use, kept)
+R2TOWN="$TMP/r2town"; mkdir -p "$R2TOWN"
+R2REMOTE="$TMP/r2remote.git"; git init -q --bare "$R2REMOTE"
+R2RIG="$R2TOWN/r2rig"; git init -q -b main "$R2RIG"
+( cd "$R2RIG"
+  git remote add origin "$R2REMOTE"
+  echo r2 > r2.txt; git add r2.txt; git commit -qm r2base
+  git push -q origin main; git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  git worktree add -q "$R2RIG/crew/worker-real-empty" -b crew/r2/empty main
+) >/dev/null 2>&1
+touch -t "$(date -v-35M +%Y%m%d%H%M 2>/dev/null || date -d '35 minutes ago' +%Y%m%d%H%M)" "$R2RIG/crew/worker-real-empty" 2>/dev/null || true
+cat > "$FAKEBIN/lsof" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$FAKEBIN/lsof"
+PATH="$FAKEBIN:$PATH" \
+WORKTREE_REAPER_GT="$R2TOWN" WORKTREE_REAPER_LOG="$TMP/reaperR2.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+  bash "$REAPER" >/dev/null 2>&1
+r2wt() { git -C "$R2RIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/worker-real-empty\$"; }
+r2wt && ok "gate-feedback: real lsof with ZERO output fails SAFE (kept, not silently reaped)" \
+       || bad "gate-feedback: real lsof's empty output was read as 'confirmed free' — the exact reported bug"
+
+# (iii) runs cleanly and genuinely finds no match → still correctly reaped (no
+# over-conservative regression from the (i)/(ii) hardening above)
+R3TOWN="$TMP/r3town"; mkdir -p "$R3TOWN"
+R3REMOTE="$TMP/r3remote.git"; git init -q --bare "$R3REMOTE"
+R3RIG="$R3TOWN/r3rig"; git init -q -b main "$R3RIG"
+( cd "$R3RIG"
+  git remote add origin "$R3REMOTE"
+  echo r3 > r3.txt; git add r3.txt; git commit -qm r3base
+  git push -q origin main; git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  git worktree add -q "$R3RIG/crew/worker-real-clean" -b crew/r3/clean main
+) >/dev/null 2>&1
+touch -t "$(date -v-35M +%Y%m%d%H%M 2>/dev/null || date -d '35 minutes ago' +%Y%m%d%H%M)" "$R3RIG/crew/worker-real-clean" 2>/dev/null || true
+cat > "$FAKEBIN/lsof" <<'EOF'
+#!/usr/bin/env bash
+echo "nSOME/OTHER/UNRELATED/PATH"
+exit 0
+EOF
+chmod +x "$FAKEBIN/lsof"
+PATH="$FAKEBIN:$PATH" \
+WORKTREE_REAPER_GT="$R3TOWN" WORKTREE_REAPER_LOG="$TMP/reaperR3.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+  bash "$REAPER" >/dev/null 2>&1
+r3wt() { git -C "$R3RIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/worker-real-clean\$"; }
+r3wt && bad "gate-feedback: real lsof clean-exit + genuine non-match NOT reaped (over-conservative regression)" \
+       || ok "gate-feedback: real lsof clean-exit + genuine non-match correctly reaped (no over-conservative regression)"
+
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ] || exit 1

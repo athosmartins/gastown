@@ -141,7 +141,26 @@ _worktree_in_use() {
     return
   fi
   command -v lsof >/dev/null 2>&1 || return 0
-  lsof -d cwd -Fn 2>/dev/null | awk -v p="$path" '
+  # gate-feedback (fix-attempt 1): piping lsof directly into awk let lsof's OWN exit
+  # code silently override awk's correctly-computed found/not-found result — under
+  # this script's `set -o pipefail`, the pipeline reports the last NONZERO exit among
+  # its stages, and lsof frequently exits nonzero for reasons unrelated to our answer
+  # (e.g. permission-denied probing an unrelated process it can't inspect) even while
+  # its stdout already contains the match awk needs. Empirically confirmed: a pipeline
+  # shaped exactly like this — lsof exiting 1, awk exiting 0 after finding its match —
+  # reports the pipeline as failed, inverting a real "found" into a returned "not
+  # found". Capture lsof's output via command substitution FIRST (which discards its
+  # exit code entirely — deliberately: it is not a trustworthy signal here) and reason
+  # only about what it printed:
+  #   - no output at all, for ANY reason (missing perms, transient error, version
+  #     skew, or genuinely nothing) → fail SAFE (treat as in-use; never conflate
+  #     "couldn't tell" with "confirmed free" — they are not the same value);
+  #   - output exists → lsof is demonstrably working, so trust awk's match/no-match
+  #     verdict on what it actually printed, regardless of lsof's own exit code.
+  local lsof_out
+  lsof_out="$(lsof -d cwd -Fn 2>/dev/null)"
+  [ -n "$lsof_out" ] || return 0
+  printf '%s\n' "$lsof_out" | awk -v p="$path" '
     /^n/ { d = substr($0, 2); if (d == p || index(d, p "/") == 1) { found=1; exit } }
     END { exit(found ? 0 : 1) }
   '
