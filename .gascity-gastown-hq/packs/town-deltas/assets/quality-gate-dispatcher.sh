@@ -2426,10 +2426,23 @@ read_rebase_attempt() {
 # or "timeout" — those are common substrings of unrelated failures too, and a
 # false "transient" classification would silently mask a real broken-spawn
 # outage behind endless auto-retries instead of ever reaching gate-status:error.
+# ga-jeicm: also matches the `native_store_unavailable gate=version_compat`
+# preflight WARN. Confirmed live (2026-08-07 16:23 and 19:09-11, the ga-oj9pc
+# incident) — when this WARN is the ONLY captured stderr (no mysql/connection
+# text follows it, e.g. the native-store fallback path failed without a more
+# specific message), the classifier fell through to "0" and the spawn aborted
+# with ZERO retries, skipping both the in-process loop and the cross-sweep
+# cap. Despite the name, this gate is a known false-negative correlated with
+# Dolt load, not a permanent config/version mismatch (see
+# gc-binary-rebuild-version-compat-fix) — it belongs with the connectivity
+# family above. Still bounded by GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS, so a
+# genuinely broken spawn still reaches gate-status:error after 3 attempts,
+# same as every other pattern here — this widens what gets a retry, not
+# whether the cap exists.
 is_transient_spawn_error() {
   local err_text="${1:-}"
   case "$err_text" in
-    *"invalid connection"*|*"read tcp"*|*"broken pipe"*|*"connection reset"*|*"dial tcp"*|*"connection refused"*|*"i/o timeout"*)
+    *"invalid connection"*|*"read tcp"*|*"broken pipe"*|*"connection reset"*|*"dial tcp"*|*"connection refused"*|*"i/o timeout"*|*"native_store_unavailable"*)
       printf '1' ;;
     *)
       printf '0' ;;

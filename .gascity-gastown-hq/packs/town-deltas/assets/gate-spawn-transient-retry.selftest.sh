@@ -98,6 +98,8 @@ eq "dial tcp + connection refused → transient" \
   "$(is_transient_spawn_error 'dial tcp 127.0.0.1:52756: connect: connection refused')" "1"
 eq "i/o timeout → transient" \
   "$(is_transient_spawn_error 'read tcp 127.0.0.1:52756: i/o timeout')" "1"
+eq "native_store_unavailable WARN only, no mysql text (ga-jeicm, ga-oj9pc incident 2026-08-07 19:09-11) → transient" \
+  "$(is_transient_spawn_error '2026/08/07 19:09:58 WARN native_store_unavailable gate=version_compat reason="bd version differs from linked beads library version" scope=/Users/athos/gt/.gascity-gastown-hq')" "1"
 eq "empty spawn_err → NOT transient (no output means no evidence of a connection blip)" \
   "$(is_transient_spawn_error '')" "0"
 eq "unknown template (ga-mzc3h class) → NOT transient" \
