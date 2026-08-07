@@ -212,6 +212,32 @@ verdict_count_from_query() {
   echo "$n"
 }
 
+# companion_liveness_from_query <query_ok: 0|1> <marker_found_running: 0|1>
+# Pure decision (ga-qj1xh): what has_live_companion_run should be, given whether
+# the SHARED gate-runs query (Vector A/B prelude, GATE_RUNS_JSON below) actually
+# succeeded this sweep. THE POINT: a FAILED query must never collapse to "this
+# marker has no companion" — that is indistinguishable from a query that
+# succeeded and genuinely found none, and has_live_companion_run is DECISIVE
+# counter-evidence in reconcile_marker_action (ga-cgynn): 1 forces skip no
+# matter how stale the marker looks or how many reclaims it has used. Reported
+# live (ga-qj1xh, Mayor, Dolt at 215% CPU / 3-dog boot burst): the guard's own
+# `bd list ... || echo "[]"` shared-prelude fetch can fail exactly when Dolt is
+# under the same contention that produces real stuck markers — collapsing
+# "unknown" into "definitely 0 companions" would then fire a false
+# reclaim/error against a marker whose real companion gate-run IS alive, just
+# invisible to this sweep's failed read. Fail-safe direction: unknown reads as
+# "assume a companion might be alive" (1) — the same direction
+# reconcile_marker_action already treats as "don't touch this marker," and the
+# cost of guessing wrong that way is one skipped sweep, not a killed review.
+# marker_found is ignored once query_ok=0 — it was computed from data we now
+# know is untrustworthy, not from a genuine empty result.
+companion_liveness_from_query() {
+  local query_ok="$1" marker_found="$2"
+  [ "$query_ok" != "1" ] && { echo 1; return; }
+  [ "$marker_found" = "1" ] && { echo 1; return; }
+  echo 0
+}
+
 # dedup_gaterun_action <group_count> <is_newest: 0|1>
 # Pure decision: enforce ≤1 running gate-run per source-bead/marker (ga-o57gn (c)).
 # The guard creates a tracking gate-run at claim time (gate-status:claimed as of
@@ -1271,11 +1297,32 @@ validate_rig() {
 # gate-run bead supersedes them — they'd accumulate as permanently-open beads
 # forever (nothing else queries gate-status:claimed gate-runs). --label-any is
 # OR (verified empirically: passed OR failed counts summed to the union count).
-GATE_RUNS_JSON=$(bd -C "$GC_CITY" list --json --all \
-  -l type:quality-gate-run \
-  --label-any gate-status:running \
-  --label-any gate-status:claimed \
-  2>/dev/null || echo "[]")
+# ga-qj1xh: capture bd's exit status WITHOUT masking it — the old
+# `2>/dev/null || echo "[]"` collapsed a FAILED query (Dolt timeout/contention)
+# into "zero gate-runs running", indistinguishable from a genuinely empty
+# result. That false-empty then propagates two ways: Vector B's dedup loop
+# below is gated on GATE_RUN_COUNT>0, so on failure it happens to skip rather
+# than supersede — but silently, with no signal this sweep couldn't actually
+# see the sibling state. RUNNING_GATERUN_MARKER_IDS (built from this same JSON
+# just below) is the dangerous one: on failure it defaults to empty, so every
+# has_live_companion_run lookup in Vector A reads false even when a real
+# companion run is alive — exactly the false-reclaim/error ga-cgynn's
+# companion-liveness check exists to prevent, sourced from the very query
+# meant to feed it. GATE_RUNS_QUERY_OK propagates the distinction downstream;
+# see companion_liveness_from_query above. The `if` keeps `set -euo pipefail`
+# from aborting on a nonzero bd exit (same idiom as reviewers_alive_for_run /
+# verdict_bead_count_for_run below, ga-48xcv).
+if GATE_RUNS_JSON=$(bd -C "$GC_CITY" list --json --all \
+    -l type:quality-gate-run \
+    --label-any gate-status:running \
+    --label-any gate-status:claimed \
+    2>/dev/null); then
+  GATE_RUNS_QUERY_OK=1
+else
+  GATE_RUNS_QUERY_OK=0
+  GATE_RUNS_JSON="[]"
+  warn "Shared prelude: gate-runs query failed — cannot determine running/claimed siblings this sweep. Vector B dedup and Vector A companion-liveness both fail-safe (skip) rather than guess (root-class:error-vs-empty, ga-qj1xh)."
+fi
 GATE_RUN_COUNT=$(printf '%s\n' "$GATE_RUNS_JSON" | jq 'length' 2>/dev/null || echo "0")
 case "$GATE_RUN_COUNT" in ''|*[!0-9]*) GATE_RUN_COUNT=0 ;; esac
 
@@ -1327,11 +1374,17 @@ if [ "$TRANSIENT_COUNT" -gt 0 ]; then
       | sed -n 's/^gate-reclaim-count:\([0-9]*\)$/\1/p' | sort -n | tail -1)
     [ -z "$T_COUNT" ] && T_COUNT=0
 
-    HAS_LIVE_COMPANION=0
+    _T_MARKER_FOUND=0
     if [ -n "$RUNNING_GATERUN_MARKER_IDS" ] \
       && printf '%s\n' "$RUNNING_GATERUN_MARKER_IDS" | grep -qx "$T_ID"; then
-      HAS_LIVE_COMPANION=1
+      _T_MARKER_FOUND=1
     fi
+    # ga-qj1xh: route through companion_liveness_from_query so a failed shared
+    # gate-runs query (GATE_RUNS_QUERY_OK=0 above) fails safe as "assume live"
+    # instead of silently reading as "confirmed no companion" — see that
+    # function's header for why the naive default was destructive under Dolt
+    # load.
+    HAS_LIVE_COMPANION=$(companion_liveness_from_query "$GATE_RUNS_QUERY_OK" "$_T_MARKER_FOUND")
 
     ACTION=$(reconcile_marker_action "$T_STATUS" "$T_AGE" "$CLAIM_TTL_MINUTES" "$T_COUNT" "$MAX_RECLAIMS" "$HAS_LIVE_COMPANION")
     case "$ACTION" in
@@ -1365,7 +1418,9 @@ if [ "$TRANSIENT_COUNT" -gt 0 ]; then
         bd -C "$GC_CITY" comment "$T_ID" "Vector A (ga-tmug): marker exhausted ${MAX_RECLAIMS} reclaim attempts stuck in gate-status:${T_STATUS}. Marking gate-status:error — human/Mayor intervention required." 2>/dev/null || true
         ;;
       skip)
-        if [ "$HAS_LIVE_COMPANION" = "1" ]; then
+        if [ "$GATE_RUNS_QUERY_OK" != "1" ]; then
+          log "  Marker $T_ID in $T_STATUS — shared gate-runs query failed this sweep, cannot verify companion liveness; fail-safe skip (ga-qj1xh)."
+        elif [ "$HAS_LIVE_COMPANION" = "1" ]; then
           log "  Marker $T_ID in $T_STATUS has a live companion gate-run — legitimate yield-bounce, not stuck (ga-cgynn). Skipping."
         else
           log "  Marker $T_ID in $T_STATUS for ${T_AGE}m — within TTL, skipping."

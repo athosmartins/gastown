@@ -49,6 +49,7 @@ GATE_GUARD_LIB_ONLY=1 source "$GUARD" \
 type reconcile_marker_action  >/dev/null 2>&1 || { echo "FATAL: reconcile_marker_action not defined by guard"; exit 1; }
 type reconcile_gaterun_action >/dev/null 2>&1 || { echo "FATAL: reconcile_gaterun_action not defined by guard"; exit 1; }
 type dedup_gaterun_action     >/dev/null 2>&1 || { echo "FATAL: dedup_gaterun_action not defined by guard"; exit 1; }
+type companion_liveness_from_query >/dev/null 2>&1 || { echo "FATAL: companion_liveness_from_query not defined by guard (ga-qj1xh)"; exit 1; }
 type age_minutes_of           >/dev/null 2>&1 || { echo "FATAL: age_minutes_of not defined by guard"; exit 1; }
 type parse_marker_id          >/dev/null 2>&1 || { echo "FATAL: parse_marker_id not defined by guard"; exit 1; }
 type classify_inflight_gap1   >/dev/null 2>&1 || { echo "FATAL: classify_inflight_gap1 not defined by guard"; exit 1; }
@@ -119,6 +120,40 @@ eq "live companion=0 explicit → unchanged (requeues)" \
 eq "5-arg back-compat: requeue unaffected"  "$(reconcile_marker_action dispatching 31 30 0 3)" "requeue:queued"
 eq "5-arg back-compat: error unaffected"    "$(reconcile_marker_action claimed     99 30 3 3)" "error"
 
+# ── 1c. companion_liveness_from_query (ga-qj1xh: shared query-failure fail-safe) ──
+# Bug ga-qj1xh (Mayor, live, Dolt at 215% CPU / 3-dog boot burst): the guard's
+# shared GATE_RUNS_JSON prelude fetch used `2>/dev/null || echo "[]"`, so a
+# FAILED query (Dolt timeout/contention) collapsed to "zero gate-runs running"
+# — indistinguishable from a genuinely empty result. RUNNING_GATERUN_MARKER_IDS
+# is built from that same JSON, so has_live_companion_run silently read false
+# for EVERY marker on a failed sweep, even one with a real, live companion gate-
+# run — reintroducing the exact false-reclaim/error ga-cgynn's companion-
+# liveness check (section 1b above) exists to prevent, sourced from the query
+# meant to feed it. companion_liveness_from_query is the extracted pure
+# decision: signature <query_ok: 0|1> <marker_found_running: 0|1>. Three cases,
+# matching the bug's own acceptance criteria verbatim (irmão existe / irmão não
+# existe / consulta falhou):
+echo "── 1c. companion_liveness_from_query (ga-qj1xh: query-failure fail-safe) ──"
+eq "irmão existe: query ok, marker found running → 1 (has companion)" \
+   "$(companion_liveness_from_query 1 1)" "1"
+eq "irmão não existe: query ok, marker NOT found running → 0 (no companion, proceed normally)" \
+   "$(companion_liveness_from_query 1 0)" "0"
+eq "consulta falhou: query FAILED, marker found (stale data) → 1 (fail-safe, never trust a failed query's body)" \
+   "$(companion_liveness_from_query 0 1)" "1"
+eq "consulta falhou: query FAILED, marker not found → 1 (fail-safe — 'not found' is meaningless when the query itself failed)" \
+   "$(companion_liveness_from_query 0 0)" "1"
+# THE regression this guards: on failure, the OLD code's implicit default was
+# always 0 (via `HAS_LIVE_COMPANION=0; if <lookup succeeds>; then =1; fi` — a
+# failed query makes the lookup fail too, so it silently stayed 0). Assert the
+# fixed direction explicitly so a future refactor that reverts to that default
+# fails loudly here, not live against Dolt under load.
+FAILED_QUERY_RESULT=$(companion_liveness_from_query 0 0)
+if [ "$FAILED_QUERY_RESULT" = "1" ]; then
+  ok "REGRESSION GUARD: query failure never defaults to has_live_companion_run=0"
+else
+  bad "REGRESSION: query failure produced has_live_companion_run='$FAILED_QUERY_RESULT' — the ga-qj1xh bug is back (a failed query would fire false reclaim/error against a possibly-live marker)"
+fi
+
 # ── 2. Vector B — gate-run reconcile decision ────────────────────────────────
 # Signature: reconcile_gaterun_action <age_min> <ttl_min> <marker_active 0|1> \
 #                                     [verdict_timeout_min] [reviewers_alive 0|1]
@@ -175,13 +210,23 @@ grep -q 'MAX_RECLAIMS'                       "$GUARD" && ok "guard caps re-queue
 # ga-cgynn: Vector A must not miscount a legitimate sibling-yield bounce as a
 # stuck-marker reclaim — a live companion gate-run is decisive counter-evidence.
 grep -q 'RUNNING_GATERUN_MARKER_IDS'         "$GUARD" && ok "guard builds RUNNING_GATERUN_MARKER_IDS (companion-liveness index, ga-cgynn)" || bad "guard missing RUNNING_GATERUN_MARKER_IDS"
-grep -q 'HAS_LIVE_COMPANION=0'               "$GUARD" && ok "guard computes HAS_LIVE_COMPANION per transient marker"                       || bad "guard missing HAS_LIVE_COMPANION"
+grep -q 'companion_liveness_from_query "\$GATE_RUNS_QUERY_OK" "\$_T_MARKER_FOUND"' "$GUARD" \
+  && ok "guard computes HAS_LIVE_COMPANION via companion_liveness_from_query (ga-qj1xh)" \
+  || bad "guard missing HAS_LIVE_COMPANION computation (or reverted to the pre-ga-qj1xh literal-0-default)"
 grep -q 'reconcile_marker_action "\$T_STATUS" "\$T_AGE" "\$CLAIM_TTL_MINUTES" "\$T_COUNT" "\$MAX_RECLAIMS" "\$HAS_LIVE_COMPANION"' "$GUARD" \
   && ok "guard wires HAS_LIVE_COMPANION into the reconcile_marker_action call (ga-cgynn)" \
   || bad "guard not passing has_live_companion_run into reconcile_marker_action"
 [ "$(grep -c 'GATE_RUNS_JSON=\$(bd' "$GUARD")" -eq 1 ] \
   && ok "GATE_RUNS_JSON fetched exactly once (hoisted shared prelude, no duplicate bd round-trip)" \
   || bad "GATE_RUNS_JSON fetch count != 1 (duplicate-fetch regression, or the ga-cgynn hoist was reverted)"
+# ── ga-qj1xh drift-guards: the shared gate-runs fetch fails safe, not silent ──
+grep -q 'companion_liveness_from_query()'    "$GUARD" && ok "guard defines companion_liveness_from_query (ga-qj1xh)" || bad "guard missing companion_liveness_from_query def"
+grep -qE 'if GATE_RUNS_JSON=\$\(bd .* list' "$GUARD" \
+  && ok "GATE_RUNS_JSON fetch captures bd's exit status via if/then (not '|| echo \"[]\"' masking)" \
+  || bad "GATE_RUNS_JSON fetch no longer uses the if/then rc-capture idiom — may have reverted to error/empty conflation (ga-qj1xh)"
+grep -q 'GATE_RUNS_QUERY_OK=1'               "$GUARD" && ok "guard sets GATE_RUNS_QUERY_OK=1 on fetch success"  || bad "guard missing GATE_RUNS_QUERY_OK success branch"
+grep -q 'GATE_RUNS_QUERY_OK=0'               "$GUARD" && ok "guard sets GATE_RUNS_QUERY_OK=0 on fetch failure"  || bad "guard missing GATE_RUNS_QUERY_OK failure branch"
+grep -q 'gate-runs query failed'             "$GUARD" && ok "guard logs a warning when the shared gate-runs query fails (ga-qj1xh: 'loga que não pode decidir')" || bad "guard does not log the gate-runs query failure — silent fail-safe is still a silent failure"
 # Vector B: supersede orphans by marker state + keep the age fallback.
 # (ga-jhyu: terminal transitions now flow through set_gate_status, which emits
 #  the gate-status:superseded/aborted label at runtime — assert the call sites.)
