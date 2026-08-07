@@ -1,17 +1,16 @@
 package config
 
 import (
-	"os"
 	"testing"
 )
 
 func TestValidCostTiers(t *testing.T) {
 	t.Parallel()
 	tiers := ValidCostTiers()
-	if len(tiers) != 5 {
-		t.Fatalf("ValidCostTiers() returned %d tiers, want 5", len(tiers))
+	if len(tiers) != 3 {
+		t.Fatalf("ValidCostTiers() returned %d tiers, want 3", len(tiers))
 	}
-	expected := map[string]bool{"standard": true, "economy": true, "budget": true, "custom-groq-opus": true, "custom-groq-sonnet": true}
+	expected := map[string]bool{"standard": true, "economy": true, "budget": true}
 	for _, tier := range tiers {
 		if !expected[tier] {
 			t.Errorf("unexpected tier %q", tier)
@@ -28,7 +27,6 @@ func TestIsValidTier(t *testing.T) {
 		{"standard", true},
 		{"economy", true},
 		{"budget", true},
-		{"custom-groq-opus", true},
 		{"premium", false},
 		{"", false},
 		{"Standard", false}, // case-sensitive
@@ -116,29 +114,6 @@ func TestCostTierRoleAgents(t *testing.T) {
 		for role, want := range expected {
 			if got := ra[role]; got != want {
 				t.Errorf("budget[%q] = %q, want %q", role, got, want)
-			}
-		}
-	})
-
-	t.Run("custom-groq-opus has correct assignments", func(t *testing.T) {
-		t.Parallel()
-		ra := CostTierRoleAgents(TierCustomGroqOpus)
-		if ra == nil {
-			t.Fatal("custom-groq-opus tier returned nil")
-		}
-		expected := map[string]string{
-			"mayor":    "",
-			"deacon":   "groq-compound",
-			"witness":  "groq-compound",
-			"refinery": "groq-compound",
-			"polecat":  "groq-compound",
-			"crew":     "",
-			"boot":     "groq-compound",
-			"dog":      "groq-compound",
-		}
-		for role, want := range expected {
-			if got := ra[role]; got != want {
-				t.Errorf("custom-groq-opus[%q] = %q, want %q", role, got, want)
 			}
 		}
 	})
@@ -232,33 +207,6 @@ func TestCostTierAgents(t *testing.T) {
 		}
 	})
 
-	t.Run("custom-groq-opus returns groq-compound preset", func(t *testing.T) {
-		t.Parallel()
-		agents := CostTierAgents(TierCustomGroqOpus)
-		if agents == nil {
-			t.Fatal("custom-groq-opus tier returned nil")
-		}
-		groq, ok := agents["groq-compound"]
-		if !ok {
-			t.Fatal("custom-groq-opus tier missing groq-compound agent")
-		}
-		if groq.Command != "claude" {
-			t.Errorf("groq-compound Command = %q, want %q", groq.Command, "claude")
-		}
-		if groq.Env == nil {
-			t.Fatal("groq-compound Env is nil, want Groq API env vars")
-		}
-		if groq.Env["ANTHROPIC_BASE_URL"] != "https://api.groq.com/openai/v1" {
-			t.Errorf("groq-compound ANTHROPIC_BASE_URL = %q, want Groq API URL", groq.Env["ANTHROPIC_BASE_URL"])
-		}
-		if groq.Env["ANTHROPIC_MODEL"] != "compound-beta" {
-			t.Errorf("groq-compound ANTHROPIC_MODEL = %q, want compound-beta", groq.Env["ANTHROPIC_MODEL"])
-		}
-		// Verify the preset reads GROQ_API_KEY from the environment (not a hardcoded value)
-		if groq.Env["ANTHROPIC_API_KEY"] != os.Getenv("GROQ_API_KEY") {
-			t.Errorf("groq-compound ANTHROPIC_API_KEY = %q, want value of GROQ_API_KEY env var", groq.Env["ANTHROPIC_API_KEY"])
-		}
-	})
 }
 
 func TestApplyCostTier(t *testing.T) {

@@ -52,6 +52,33 @@ func TestBuiltinPresets(t *testing.T) {
 	}
 }
 
+// TestNoNonAnthropicBaseURLOverrideOnClaudeCommand is a regression guard for
+// ga-4u1al (removed AgentGroqCompound): a preset that runs Command "claude"
+// with ANTHROPIC_BASE_URL pointed at a non-Anthropic host can never work
+// end-to-end. The claude CLI validates --model/ANTHROPIC_MODEL client-side
+// against its own known-model list and refuses anything else before any
+// network call; even past that, ANTHROPIC_BASE_URL only redirects the host,
+// not the wire protocol, so a non-Anthropic endpoint would still receive an
+// Anthropic Messages API request it can't parse. See the AgentPreset doc
+// comment in agents.go for the full writeup.
+func TestNoNonAnthropicBaseURLOverrideOnClaudeCommand(t *testing.T) {
+	t.Parallel()
+	for preset, info := range builtinPresets {
+		if !isClaudeCmd(info.Command) {
+			continue
+		}
+		baseURL, ok := info.Env["ANTHROPIC_BASE_URL"]
+		if !ok {
+			continue
+		}
+		if !strings.Contains(baseURL, "anthropic.com") {
+			t.Errorf("preset %s uses Command %q with ANTHROPIC_BASE_URL=%q — the claude CLI's "+
+				"client-side model validation and Anthropic-only wire protocol make this "+
+				"non-functional (see ga-4u1al)", preset, info.Command, baseURL)
+		}
+	}
+}
+
 func TestGetAgentPresetByName(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

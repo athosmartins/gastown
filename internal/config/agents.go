@@ -17,6 +17,17 @@ type rawAgentRegistry struct {
 
 // AgentPreset identifies a supported LLM agent runtime.
 // These presets provide sensible defaults that can be overridden in config.
+//
+// Do not add a preset that reuses Command: "claude" with ANTHROPIC_BASE_URL
+// overridden to a non-Anthropic endpoint (e.g. Groq, or any other
+// OpenAI-compatible API). Tested live 2026-08-07 (ga-4u1al), removed as
+// AgentGroqCompound: the claude CLI validates --model/ANTHROPIC_MODEL
+// client-side against its own known-model list and refuses anything else
+// before any network call, so a custom model name is never reached. Even
+// past that check, ANTHROPIC_BASE_URL only redirects the host — it doesn't
+// translate the wire protocol — so a non-Anthropic endpoint would still be
+// sent an Anthropic Messages API request it can't parse. Use AgentOpenCode
+// for real multi-provider model routing instead.
 type AgentPreset string
 
 // Supported agent presets (built-in, E2E tested).
@@ -44,12 +55,6 @@ const (
 	AgentOmp AgentPreset = "omp"
 	// AgentMistral is Mistral Vibe CLI.
 	AgentMistral AgentPreset = "vibe"
-	// AgentGroqCompound routes the Claude CLI to Groq's compound-beta model via
-	// Groq's OpenAI-compatible API endpoint. The claude binary acts as the SDK
-	// proxy; ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY are overridden at runtime
-	// to redirect traffic to api.groq.com. GROQ_API_KEY must be set in the shell
-	// environment — it is read dynamically and never stored in config files.
-	AgentGroqCompound AgentPreset = "groq-compound"
 )
 
 // AgentPresetInfo contains the configuration details for an agent preset.
@@ -470,51 +475,6 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		ReadyPromptPrefix: "❯ ",
 		ReadyDelayMs:      5000,
 		InstructionsFile:  "AGENTS.md",
-	},
-	// AgentGroqCompound uses the Claude CLI as an SDK proxy but routes all
-	// requests to Groq's OpenAI-compatible endpoint by overriding the two
-	// Anthropic SDK environment variables that control the backend:
-	//
-	//   ANTHROPIC_BASE_URL  → https://api.groq.com/openai/v1
-	//   ANTHROPIC_API_KEY   → $GROQ_API_KEY  (read from the shell env at spawn time)
-	//
-	// The model flag --model groq/compound-beta selects Groq's compound
-	// reasoning model. Because the transport is the Claude binary, all Gas
-	// Town hooks, session tracking, tmux readiness detection, and Claude-SDK
-	// lifecycle events work identically to the standard claude preset.
-	//
-	// Prerequisites:
-	//   export GROQ_API_KEY=gsk_...
-	//
-	// The key is resolved at agent spawn time — never stored in config files.
-	AgentGroqCompound: {
-		Name:    AgentGroqCompound,
-		Command: "claude",
-		Args: []string{
-			"--dangerously-skip-permissions",
-		},
-		Env: map[string]string{
-			"ANTHROPIC_BASE_URL": "https://api.groq.com/openai/v1",
-			"ANTHROPIC_MODEL":    "compound-beta",
-			"ANTHROPIC_API_KEY":  "$GROQ_API_KEY",
-		},
-		ProcessNames:         []string{"node", "claude"},
-		SessionIDEnv:         "CLAUDE_SESSION_ID",
-		ResumeFlag:           "--resume",
-		ContinueFlag:         "--continue",
-		ResumeStyle:          "flag",
-		SupportsHooks:        true,
-		PromptMode:           "arg",
-		ConfigDirEnv:         "CLAUDE_CONFIG_DIR",
-		ConfigDir:            ".claude",
-		HooksProvider:        "claude",
-		HooksDir:             ".claude",
-		HooksSettingsFile:    "settings.json",
-		HooksUseSettingsDir:  true,
-		ReadyPromptPrefix:    "❯ ",
-		ReadyDelayMs:         10000,
-		InstructionsFile:     "CLAUDE.md",
-		HasTurnBoundaryDrain: true,
 	},
 }
 
