@@ -1,0 +1,15 @@
+# ga-fckwc: detects KeepAlive=true (persistent) LaunchAgents whose live
+# process predates the last commit to their own entrypoint — the class of
+# bug where a merged fix sits inert in a long-running interpreter (Python
+# does not hot-reload) with zero error signal until a manual restart.
+# Detection-only (notify + best-effort bd comment); never restarts a daemon
+# itself. Deliberately a gc order (fresh exec each tick), not a raw
+# KeepAlive plist, so this guard can never itself be a member of the bug
+# class it exists to detect. 30m cadence: this is a structural-drift check,
+# not an urgent throughput guard — no need to compete with the city's
+# 5min-cadence watchdogs for Dolt/poll budget.
+[order]
+description = "Detect persistent LaunchAgents running code older than their own last commit"
+trigger = "cooldown"
+interval = "30m"
+exec = "$PACK_DIR/assets/scripts/stale-persistent-daemon-guard.sh"

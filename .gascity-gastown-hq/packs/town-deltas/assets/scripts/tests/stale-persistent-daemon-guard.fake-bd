@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# fake-bd — argv-dispatch stub for stale-persistent-daemon-guard.selftest.sh.
+# Handles exactly the three invocation shapes the real script uses:
+#   bd -C <city> show <id>
+#   bd -C <city> label add <id> <label> -q
+#   bd -C <city> comment <id> <text>
+set -euo pipefail
+shift || true   # drop -C
+shift || true   # drop <city>
+sub="${1:-}"; shift || true
+
+case "$sub" in
+    show)
+        id="${1:-}"
+        for known in ${FAKE_BD_KNOWN_IDS:-}; do
+            [ "$known" = "$id" ] && exit 0
+        done
+        exit 1
+        ;;
+    label)
+        [ "${1:-}" = "add" ] || exit 1
+        id="${2:-}"; label="${3:-}"
+        printf 'LABEL %s %s\n' "$id" "$label" >> "${BD_LOG:-/dev/null}"
+        ;;
+    comment)
+        id="${1:-}"
+        printf 'COMMENT %s\n' "$id" >> "${BD_LOG:-/dev/null}"
+        ;;
+    *)
+        echo "fake-bd: unhandled: $sub $*" >&2
+        exit 1
+        ;;
+esac
