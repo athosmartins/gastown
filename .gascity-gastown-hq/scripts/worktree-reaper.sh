@@ -27,12 +27,33 @@
 # genuinely low. Branch deletion is merged-only. Kill switch: WORKTREE_REAPER_ENABLED=0.
 set -uo pipefail
 GT="${WORKTREE_REAPER_GT:-/Users/athos/gt}"   # overridable for the selftest (temp repo)
-WT_DIR="$GT/.gc-worktrees"
+# ga-t14of: .gc-worktrees accumulates under MULTIPLE physical roots in practice — the
+# "canonical" $GT/.gc-worktrees AND $GT/.gascity-gastown-hq/.gc-worktrees (most agents'
+# cwd is inside .gascity-gastown-hq, so `git worktree add .gc-worktrees/<name> ...` run
+# from there lands on the nested path instead). Both are worktrees of the SAME repo as
+# $GT — .gascity-gastown-hq has no .git of its own (confirmed: `git -C .../gascity-
+# gastown-hq rev-parse --show-toplevel` reports $GT) — so it is invisible to the per-rig
+# loop below too, which deliberately skips $GT itself on the assumption "loop 1 already
+# covers $GT's worktrees". That assumption held for the flat path but not this nested
+# one: measured live, 105 dirs / 2.9G sat here, NEVER once scanned (zero hits in months
+# of reaper-log history) while the flat path quietly drained on schedule the whole time.
+WT_DIRS="${WORKTREE_REAPER_WT_DIRS:-$GT/.gc-worktrees $GT/.gascity-gastown-hq/.gc-worktrees}"
 LOG="${WORKTREE_REAPER_LOG:-$GT/.gascity-gastown-hq/.gc/logs/worktree-reaper.jsonl}"
 ENABLED="${WORKTREE_REAPER_ENABLED:-1}"
 STALE_HOURS="${WORKTREE_REAPER_STALE_HOURS:-24}"           # normal reap age
 PRESSURE_HOURS="${WORKTREE_REAPER_PRESSURE_HOURS:-12}"     # reap age when disk low
 PRESSURE_FREE_GB="${WORKTREE_REAPER_PRESSURE_FREE_GB:-8}"  # <this many GiB free = pressure
+# ga-t14of: minimum age (minutes) before a MERGED worktree is eligible for the fast-path
+# reap below, bypassing STALE_HOURS/PRESSURE_HOURS. Without this, a worktree branched
+# from origin/main seconds ago and not yet touched is trivially "merged" too — its HEAD
+# already equals main's tip, since nothing has diverged yet — and would be reaped before
+# its agent got a chance to start (caught live: this fix's own selftest, "fresh worktree
+# wrongly reaped", would have destroyed the in-progress worktree this very fix was built
+# in). This is a separate, much smaller grace period than STALE_HOURS — long enough that
+# a just-claimed worktree survives the read-context/gc-prime window before first commit,
+# short enough to still resolve the reported multi-day pileup on the very next sweep.
+MERGED_MIN_AGE_MIN="${WORKTREE_REAPER_MERGED_MIN_AGE_MIN:-30}"
+case "$MERGED_MIN_AGE_MIN" in ''|*[!0-9]*) MERGED_MIN_AGE_MIN=30 ;; esac
 # ── zombie-lock reaping (wa-8y45): a worktree LOCKED by a stuck/ancient agent ─────
 ZOMBIE_LOCK_ENABLED="${WORKTREE_REAPER_ZOMBIE_LOCK_ENABLED:-1}"  # 0 = old behavior (skip ALL locked)
 ZOMBIE_HOURS="${WORKTREE_REAPER_ZOMBIE_HOURS:-48}"               # alive holder must EXCEED this AND be idle
@@ -82,6 +103,48 @@ delete_merged_local_branch() {
       printf '{"ts":"%s","event":"would_delete_branch","repo":"%s","branch":"%s"}\n' "$(ts)" "$(basename "$repo")" "$br" >> "$LOG" 2>/dev/null
     fi
   fi
+}
+
+# ── _worktree_head_merged <repo> <wt> — ga-t14of: true iff the worktree's current HEAD
+# commit is already an ancestor of origin/<default>. Uses the worktree's OWN checked-out
+# commit (git -C "$wt" rev-parse HEAD) rather than a branch name, so it works whether the
+# worktree is on a branch or DETACHED — what actually matters for safety is "is this
+# CONTENT already in main", not branch bookkeeping. <repo> supplies the origin/<default>
+# lookup (shared git dir/refs across every worktree of the same repo). Any uncertainty
+# (no HEAD, no origin/default, git failure) → NOT merged, never guess — same fail-closed
+# philosophy as delete_merged_local_branch above.
+_worktree_head_merged() {
+  local repo="$1" wt="$2" def head
+  head="$(git -C "$wt" rev-parse HEAD 2>/dev/null)"
+  [ -n "$head" ] || return 1
+  def="$(git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')"
+  [ -n "$def" ] || def="main"
+  git -C "$repo" rev-parse --verify -q "refs/remotes/origin/$def" >/dev/null 2>&1 || return 1
+  git -C "$repo" merge-base --is-ancestor "$head" "refs/remotes/origin/$def" 2>/dev/null
+}
+
+# ── _worktree_in_use <path> — ga-t14of: true iff a live process's CWD is the worktree
+# path itself or a subdirectory of it. Defense-in-depth beyond git's own dirty-check: a
+# git-CLEAN worktree can still be someone's live shell/build cwd, and removing it out
+# from under that process breaks it even though no file content is lost — the exact
+# failure mode ga-t14of's acceptance criteria calls out ("worktree em uso não é
+# removido, mesmo que a branch esteja mergeada"). Gates the merged-branch fast path
+# below, which otherwise bypasses the age gate that used to be the only thing standing
+# between "just created" and "removed". lsof unavailable/failing → fail SAFE (treat as
+# in-use; never guess a worktree is free). Seam: WORKTREE_REAPER_FAKE_LSOF=<file>, one
+# absolute cwd path per line, for a hermetic selftest.
+_worktree_in_use() {
+  local path="$1"
+  if [ -n "${WORKTREE_REAPER_FAKE_LSOF:-}" ]; then
+    [ -f "$WORKTREE_REAPER_FAKE_LSOF" ] || return 1
+    awk -v p="$path" '{ if ($0 == p || index($0, p "/") == 1) { found=1; exit } } END { exit(found ? 0 : 1) }' "$WORKTREE_REAPER_FAKE_LSOF"
+    return
+  fi
+  command -v lsof >/dev/null 2>&1 || return 0
+  lsof -d cwd -Fn 2>/dev/null | awk -v p="$path" '
+    /^n/ { d = substr($0, 2); if (d == p || index(d, p "/") == 1) { found=1; exit } }
+    END { exit(found ? 0 : 1) }
+  '
 }
 
 # ── preserve_and_reap_dirty <repo> <wt> <br> <age> — ga-xv78c: an UNLOCKED pool
@@ -327,8 +390,24 @@ reap_pool_worktrees() {
           [ "$pool_cap_hit" = "0" ] && { pool_cap_hit=1; printf '{"ts":"%s","event":"pool_cap_hit","cap":%s,"note":"backlog drains over next sweeps"}\n' "$(ts)" "$REAP_MAX_PER_SWEEP" >> "$LOG" 2>/dev/null; }
           wt=""; continue
         fi
-        local age=$(( ( $(date +%s) - $(stat -f %m "$wt" 2>/dev/null || echo 0) ) / 3600 ))
-        if [ "$age" -le "$gate_hours" ] 2>/dev/null; then kept=$((kept+1)); wt=""; br=""; lock=""; continue; fi
+        local now_s; now_s=$(date +%s)
+        local mtime_s; mtime_s=$(stat -f %m "$wt" 2>/dev/null || echo 0)
+        local age=$(( (now_s - mtime_s) / 3600 ))
+        local age_min=$(( (now_s - mtime_s) / 60 ))
+        # ga-t14of: a branch already merged into origin/<default> bypasses the age gate —
+        # the work is durably in main, so waiting out STALE_HOURS just for the worktree to
+        # catch up buys nothing but disk. Gated on MERGED_MIN_AGE_MIN (not just "merged")
+        # so a worktree that hasn't diverged from main YET — trivially "merged" because
+        # nothing has happened there — isn't reaped out from under an agent that hasn't
+        # started. Still must clear _worktree_in_use below either way.
+        local merged=0
+        if [ "$age_min" -ge "$MERGED_MIN_AGE_MIN" ] && _worktree_head_merged "$repo" "$wt"; then merged=1; fi
+        if [ "$age" -le "$gate_hours" ] 2>/dev/null && [ "$merged" != "1" ]; then kept=$((kept+1)); wt=""; br=""; lock=""; continue; fi
+        if [ "$merged" = "1" ] && _worktree_in_use "$wt"; then
+          kept=$((kept+1))
+          printf '{"ts":"%s","event":"kept_merged_in_use","repo":"%s","wt":"%s","branch":"%s","age_h":%s}\n' "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$age" >> "$LOG" 2>/dev/null
+          wt=""; br=""; lock=""; continue
+        fi
         # ── LOCKED worktree: reap ONLY if the lock holder is a ZOMBIE (dead / ancient+idle).
         # A live agent's lock (young, or recent CPU) is ALWAYS kept — never reap active work.
         if [ -n "$lock" ]; then
@@ -368,21 +447,45 @@ reap_pool_worktrees() {
   [ "$ENABLED" = "1" ] && git -C "$repo" worktree prune 2>/dev/null
 }
 
-# ── 1. legacy path-glob scan of .gc-worktrees (town repo) — UNCHANGED, proven ─────
-if [ -d "$WT_DIR" ]; then
+# ── 1. legacy path-glob scan of known .gc-worktrees roots (town repo) ─────────────
+# ga-t14of: a branch already merged into origin/main bypasses the age gate below (the
+# work is durably in main — waiting out STALE_HOURS buys nothing) but must still clear
+# _worktree_in_use before being reaped. Loops over WT_DIRS (plural — see its definition
+# above for why one root was never enough).
+for WT_DIR in $WT_DIRS; do
+  [ -d "$WT_DIR" ] || continue
   for d in "$WT_DIR"/*/; do
     [ -d "$d" ] || continue
     d="${d%/}"
-    age=$(( ( $(date +%s) - $(stat -f %m "$d") ) / 3600 ))
-    if [ "$age" -le "$gate_hours" ]; then kept=$((kept+1)); continue; fi
+    # ga-t14of: realpath-normalize — unlike section 2's $wt (already resolved by git's
+    # own porcelain output), $d here comes straight from a filesystem glob. lsof (and
+    # git) report the OS-resolved path, so an un-normalized $d would silently mismatch
+    # against _worktree_in_use on any symlinked $GT, false-negativing "in use" into
+    # "free". No-op on this town's actual path (/Users/athos/gt has no symlink hop); only
+    # matters for symlinked deployments and the selftest's mktemp (/var → /private/var).
+    d="$(cd "$d" 2>/dev/null && pwd -P)" || continue
+    now_s=$(date +%s)
+    mtime_s=$(stat -f %m "$d")
+    age=$(( (now_s - mtime_s) / 3600 ))
+    age_min=$(( (now_s - mtime_s) / 60 ))
+    merged=0
+    # ga-t14of: gated on MERGED_MIN_AGE_MIN — see reap_pool_worktrees for why a bare
+    # "merged" check alone would reap a just-created, not-yet-touched worktree too.
+    if [ "$age_min" -ge "$MERGED_MIN_AGE_MIN" ] && _worktree_head_merged "$GT" "$d"; then merged=1; fi
+    if [ "$age" -le "$gate_hours" ] && [ "$merged" != "1" ]; then kept=$((kept+1)); continue; fi
+    if [ "$merged" = "1" ] && _worktree_in_use "$d"; then
+      kept=$((kept+1))
+      printf '{"ts":"%s","event":"kept_merged_in_use","wt":"%s","age_h":%s}\n' "$(ts)" "$(basename "$d")" "$age" >> "$LOG" 2>/dev/null
+      continue
+    fi
     if [ "$ENABLED" != "1" ]; then
-      printf '{"ts":"%s","event":"would_reap","wt":"%s","age_h":%s,"mode":"%s"}\n' "$(ts)" "$(basename "$d")" "$age" "$mode" >> "$LOG" 2>/dev/null
+      printf '{"ts":"%s","event":"would_reap","wt":"%s","age_h":%s,"mode":"%s","merged":%s}\n' "$(ts)" "$(basename "$d")" "$age" "$mode" "$merged" >> "$LOG" 2>/dev/null
       continue
     fi
     # no --force: a worktree with uncommitted WIP (a live build) is REFUSED → protected.
     if git -C "$GT" worktree remove "$d" 2>/dev/null; then
       reaped=$((reaped+1))
-      printf '{"ts":"%s","event":"reaped","wt":"%s","age_h":%s,"mode":"%s"}\n' "$(ts)" "$(basename "$d")" "$age" "$mode" >> "$LOG" 2>/dev/null
+      printf '{"ts":"%s","event":"reaped","wt":"%s","age_h":%s,"mode":"%s","merged":%s}\n' "$(ts)" "$(basename "$d")" "$age" "$mode" "$merged" >> "$LOG" 2>/dev/null
     elif [ "$ZOMBIE_LOCK_ENABLED" = "1" ] && \
          lock_reason="$(git -C "$GT" worktree list --porcelain 2>/dev/null | awk -v p="$d" '$1=="worktree"{c=$2} $1=="locked"{ if(c==p){ $1=""; sub(/^ /,""); print; exit } }')" && \
          [ -n "$lock_reason" ]; then
@@ -396,12 +499,13 @@ if [ -d "$WT_DIR" ]; then
       skipped_dirty=$((skipped_dirty+1))   # dirty/locked (live) → has live WIP, leave it
     fi
   done
-  [ "$ENABLED" = "1" ] && git -C "$GT" worktree prune 2>/dev/null
-fi
+done
+[ "$ENABLED" = "1" ] && git -C "$GT" worktree prune 2>/dev/null
 
 # ── 2. ga-pdrij: per-RIG scan for POOL worktrees ──────────────────────────────────
 # ONLY the rig repos (whatsapp_automation, property_scrapers, …) — NOT the town repo
-# $GT, whose worktrees (.gc-worktrees gate-runs) are already handled by loop 1; running
+# $GT (nor its no-.git-of-its-own subdirectory .gascity-gastown-hq — see WT_DIRS above),
+# whose worktrees (.gc-worktrees gate-runs) are already handled by loop 1; running
 # the pool scan on $GT would re-enumerate all ~700 town worktrees (overlap + noise, seen
 # in the ga-pdrij dry-run). A rig's `git worktree list` catches its pool worktrees at ANY
 # checkout path — <rig>/crew/worker-*, $GT/worker-<bead> (owned by the rig), <rig>/.claude/

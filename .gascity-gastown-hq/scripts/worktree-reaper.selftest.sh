@@ -483,6 +483,135 @@ git -C "$GREMOTE" show refs/heads/crew/g/ga0j2zc:.gc/new-artifact.txt >/dev/null
   && bad "ga-0j2zc: new untracked file under the ignored dir wrongly captured" \
   || ok "ga-0j2zc: new untracked file under the ignored dir correctly excluded (pre-existing add -A behavior)"
 
+# ══ ga-t14of: MERGED branch bypasses the age gate — but never while in use ═══════
+# Reported live: 114 worktrees / 2.9G, 15 already merged into origin/main, sitting for
+# hours to days because the age gate never distinguished "branch is done" from "branch
+# is still live" — it only ever asked "how old is this directory". Proves: (i) a
+# worktree whose branch is already merged, backdated PAST MERGED_MIN_AGE_MIN but still
+# WELL UNDER the normal STALE_HOURS gate, is reaped anyway (the actual fix); (ii) the
+# same shape, but with a live process's cwd inside it (WORKTREE_REAPER_FAKE_LSOF), is
+# KEPT — the acceptance criteria's explicit test ("worktree em uso não é removido,
+# mesmo que a branch esteja mergeada"); (iii) a worktree branched from main SECONDS ago
+# (zero commits, so HEAD trivially equals main — "merged" in the literal sense, but
+# nobody has started working yet) is KEPT, not reaped on sight — MERGED_MIN_AGE_MIN
+# closing exactly the gap this fix's own selftest caught (see git history: an earlier
+# version of this fix reaped its own in-progress worktree the instant it branched).
+echo "── ga-t14of: merged-branch age-gate bypass (never while in use) ──"
+MTOWN="$TMP/mtown"; mkdir -p "$MTOWN"
+MREMOTE="$TMP/mremote.git"; git init -q --bare "$MREMOTE"
+MRIG="$MTOWN/mrig"; git init -q -b main "$MRIG"
+( cd "$MRIG"
+  git remote add origin "$MREMOTE"
+  echo m > m.txt; git add m.txt; git commit -qm mbase
+  git push -q origin main; git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  # both branches sit at main's tip (merged); one will be faked as "in use", one not.
+  git worktree add -q "$MRIG/crew/worker-merged-idle" -b crew/m/idle main
+  git worktree add -q "$MRIG/crew/worker-merged-busy" -b crew/m/busy main
+) >/dev/null 2>&1
+# backdate PAST MERGED_MIN_AGE_MIN (default 30min) but dir-mtime age stays 0 in HOURS —
+# well under STALE_HOURS=1 — so a reap here can ONLY be the merge fast-path, never the
+# ordinary hour-granularity age gate.
+for w in worker-merged-idle worker-merged-busy; do
+  touch -t "$(date -v-35M +%Y%m%d%H%M 2>/dev/null || date -d '35 minutes ago' +%Y%m%d%H%M)" "$MRIG/crew/$w" 2>/dev/null || true
+done
+MFAKELSOF="$TMP/mfakelsof.txt"
+# resolve to the REALPATH — macOS mktemp gives /var/..., git worktree list reports the
+# realpath /private/var/..., and _worktree_in_use compares against git's form (same
+# gotcha wt_exists() already works around above via suffix matching).
+(cd "$MRIG/crew/worker-merged-busy" && pwd -P) > "$MFAKELSOF"
+
+WORKTREE_REAPER_GT="$MTOWN" WORKTREE_REAPER_LOG="$TMP/reaperM.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+WORKTREE_REAPER_FAKE_LSOF="$MFAKELSOF" \
+  bash "$REAPER" >/dev/null 2>&1
+
+mwt() { git -C "$MRIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/$1\$"; }
+
+mwt worker-merged-idle && bad "ga-t14of: merged+idle worktree, past grace period, NOT reaped (age-gate bypass broken)" \
+  || ok "ga-t14of: merged+idle worktree reaped despite being under STALE_HOURS (age-gate bypass works)"
+mwt worker-merged-busy && ok "ga-t14of: merged+IN-USE worktree KEPT (never reap out from under a live process)" \
+  || bad "ga-t14of: merged+IN-USE worktree wrongly reaped — turns cleanup into an incident!"
+grep -q '"event":"kept_merged_in_use"' "$TMP/reaperM.jsonl" 2>/dev/null \
+  && ok "ga-t14of: kept_merged_in_use logged (distinguishable from an ordinary keep)" \
+  || bad "ga-t14of: in-use protection fired silently (no log signal)"
+
+# ── a JUST-CREATED worktree is trivially "merged" (HEAD==main, nothing has diverged
+# yet) but must NOT be reaped on sight — own dedicated town, not backdated at all.
+FTOWN="$TMP/ftown"; mkdir -p "$FTOWN"
+FREMOTE="$TMP/fremote.git"; git init -q --bare "$FREMOTE"
+FRIG="$FTOWN/frig"; git init -q -b main "$FRIG"
+( cd "$FRIG"
+  git remote add origin "$FREMOTE"
+  echo f > f.txt; git add f.txt; git commit -qm fbase
+  git push -q origin main; git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  git worktree add -q "$FRIG/crew/worker-merged-fresh" -b crew/f/fresh main
+) >/dev/null 2>&1
+WORKTREE_REAPER_GT="$FTOWN" WORKTREE_REAPER_LOG="$TMP/reaperF.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+  bash "$REAPER" >/dev/null 2>&1
+git -C "$FRIG" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/crew/worker-merged-fresh\$" \
+  && ok "ga-t14of: freshly-branched (trivially merged) worktree KEPT (grace period protects not-yet-started work)" \
+  || bad "ga-t14of: freshly-branched worktree wrongly reaped the instant it was created — destroys work before it starts!"
+
+# ══ ga-t14of: WT_DIRS multi-root scan (the actual reported coverage gap) ══════════
+# Loop 1 (the flat .gc-worktrees path-glob) had ZERO dedicated selftest coverage before
+# this fix — every fixture above exercises loop 2 (reap_pool_worktrees) via <rig>/crew/*
+# or <rig>/.claude|.gc-worktrees paths, never $TOWN/.gc-worktrees directly. Live measured
+# root cause: .gascity-gastown-hq has no .git of its own (just a subdirectory sharing
+# $GT's), so it's invisible to loop 2's per-rig scan (which deliberately skips $GT on the
+# assumption loop 1 already covers it) — and loop 1 only ever looked at the FLAT
+# $GT/.gc-worktrees root, never the NESTED $GT/.gascity-gastown-hq/.gc-worktrees one.
+# Result: 105 of 113 real worktrees sat under exactly that nested shape, NEVER scanned
+# by anything, for as long as 729 hours (30 days). Proves: (i) the flat root still reaps
+# a stale worktree (loop-1 baseline, now with explicit coverage); (ii) the NESTED root is
+# ALSO scanned — the actual fix; (iii) a merged branch in the nested root bypasses the
+# age gate same as the flat one; (iv) a merged+IN-USE worktree in the nested root is
+# KEPT — the safety property holds via loop 1 too, not just loop 2.
+echo "── ga-t14of: WT_DIRS multi-root scan (.gascity-gastown-hq nesting) ──"
+WTOWN="$TMP/wtown"; mkdir -p "$WTOWN/.gc-worktrees" "$WTOWN/.gascity-gastown-hq/.gc-worktrees"
+WREMOTE="$TMP/wremote.git"; git init -q --bare "$WREMOTE"
+# $WTOWN itself is the "repo" — mirrors real life, where .gascity-gastown-hq has no .git
+# of its own and just shares $GT's: one shared checkout, two different `worktree add`
+# targets (flat vs nested), both registered in the SAME repo's worktree list.
+git init -q -b main "$WTOWN"
+( cd "$WTOWN"
+  git remote add origin "$WREMOTE"
+  echo w > w.txt; git add w.txt; git commit -qm wbase
+  git push -q origin main; git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  # flat root: unmerged branch — should reap on the ordinary age gate (loop-1 baseline)
+  git worktree add -q "$WTOWN/.gc-worktrees/flat-unmerged" -b w/flat-unmerged main
+  ( cd "$WTOWN/.gc-worktrees/flat-unmerged"; echo x > x.txt; git add x.txt; git commit -qm "ahead" )
+  # nested root: merged branch (at main's tip), past grace period — the reported shape
+  git worktree add -q "$WTOWN/.gascity-gastown-hq/.gc-worktrees/nested-merged" -b w/nested-merged main
+  # nested root: SECOND merged branch, will be faked as in-use — must stay KEPT
+  git worktree add -q "$WTOWN/.gascity-gastown-hq/.gc-worktrees/nested-merged-busy" -b w/nested-merged-busy main
+) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$WTOWN/.gc-worktrees/flat-unmerged" 2>/dev/null || true
+for w in nested-merged nested-merged-busy; do
+  touch -t "$(date -v-35M +%Y%m%d%H%M 2>/dev/null || date -d '35 minutes ago' +%Y%m%d%H%M)" "$WTOWN/.gascity-gastown-hq/.gc-worktrees/$w" 2>/dev/null || true
+done
+WFAKELSOF="$TMP/wfakelsof.txt"
+(cd "$WTOWN/.gascity-gastown-hq/.gc-worktrees/nested-merged-busy" && pwd -P) > "$WFAKELSOF"
+
+WORKTREE_REAPER_GT="$WTOWN" WORKTREE_REAPER_LOG="$TMP/reaperW.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+WORKTREE_REAPER_FAKE_LSOF="$WFAKELSOF" \
+  bash "$REAPER" >/dev/null 2>&1
+
+wflat()       { git -C "$WTOWN" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/\.gc-worktrees/flat-unmerged\$"; }
+wnested()     { git -C "$WTOWN" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/\.gascity-gastown-hq/\.gc-worktrees/nested-merged\$"; }
+wnestedbusy() { git -C "$WTOWN" worktree list --porcelain 2>/dev/null | grep -qE "^worktree .*/\.gascity-gastown-hq/\.gc-worktrees/nested-merged-busy\$"; }
+
+wflat && bad "ga-t14of: flat-root stale worktree NOT reaped (loop-1 baseline broken)" \
+  || ok "ga-t14of: flat-root (\$GT/.gc-worktrees) stale worktree reaped (loop-1 baseline holds)"
+wnested && bad "ga-t14of: nested-root (.gascity-gastown-hq/.gc-worktrees) merged worktree NOT reaped — the actual reported bug NOT fixed" \
+  || ok "ga-t14of: nested-root (.gascity-gastown-hq/.gc-worktrees) merged worktree reaped — coverage gap closed"
+wnestedbusy && ok "ga-t14of: nested-root merged+IN-USE worktree KEPT (in-use protection applies via loop 1 too)" \
+  || bad "ga-t14of: nested-root merged+IN-USE worktree wrongly reaped via loop 1 — turns cleanup into an incident!"
+
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ] || exit 1
