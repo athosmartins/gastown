@@ -124,7 +124,13 @@ CONTEXT_CHECK_EXEC_CLASS="${CONTEXT_CHECK_EXEC_CLASS:-1}"
 # type-eligible and the bead carries no park label, so it got armed with
 # ctx:ready+exec:auto on its first sweep pass → Pilot dispatched a "build
 # story" task with nothing to build (ga-sh5zv, ga-mun9x).
-CONTEXT_CHECK_EXCLUDE_LABELS="${CONTEXT_CHECK_EXCLUDE_LABELS:-gt:agent gt:rig gt:convoy gc:nudge digest}"
+# `pinned` (ga-gzv7g): a permanent-reference/preservation note (native Dog
+# Context: "pinned... for permanent reference beads" — e.g. the Mayor's
+# pre-restart capture of unsubmitted Athos instructions). Same shape as
+# digest above: often an operational action, not code, so granting
+# ctx:ready+exec:auto armed a pinned note (ga-sxbvj) for ordinary Tier-2
+# feature dispatch (ga-lvtqi) with nothing to build.
+CONTEXT_CHECK_EXCLUDE_LABELS="${CONTEXT_CHECK_EXCLUDE_LABELS:-gt:agent gt:rig gt:convoy gc:nudge digest pinned}"
 # Label PREFIXES that mark plumbing (matched as startswith). Covers the gate
 # marker/run/verdict family, gate-status:*, nudge:*, reviewer-index:*, source:*,
 # and the ctx:* family itself (idempotence).

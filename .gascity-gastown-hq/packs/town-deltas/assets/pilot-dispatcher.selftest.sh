@@ -1226,6 +1226,21 @@ EXTPR_PENDING='[{"id":"bd-extpr-pending","assignee":null,"labels":["story:approv
 [ "$(_fc "$EXTPR_PENDING")" = '["bd-free7"]' ] && ok "ga-spux4: story:awaiting-external-merge bead excluded; free story:approved kept (external-PR hold honored)" || bad "ga-spux4: story:awaiting-external-merge not excluded (got: $(_fc "$EXTPR_PENDING"))"
 grep -qE '"story:awaiting-external-merge"' "$DISPATCHER" && ok "_filter_candidates carries the story:awaiting-external-merge clause" || bad "story:awaiting-external-merge clause missing from _filter_candidates"
 
+# ── Scenario 3e2l (ga-gzv7g): pinned excluded from candidates ─────────────────
+# ga-sxbvj/ga-lvtqi pattern: the Mayor tags a bead `pinned` as a permanent
+# preservation note (native Dog Context: "pinned... for permanent reference
+# beads") but the bead also carried ctx:ready+exec:auto from creation — Pilot
+# dispatched it as an ordinary Tier-2 feature story (empty AC/Estrela
+# Guia/Equilíbrios, since the origin note was never that kind of bead). A dog
+# caught it only by reading the full body before forcing a fake branch/
+# gate-done. _filter_candidates must exclude pinned the same static way it
+# excludes story:blocked/on-device, so a pinned note never re-enters the
+# dispatch pool.
+echo "Scenario 3e2l (ga-gzv7g): pinned bead is excluded from the candidate pool (permanent reference note, not build work)"
+PINNED_NOTE='[{"id":"bd-pinned-note","assignee":null,"labels":["ctx:ready","exec:auto","pinned"],"description":"x"},{"id":"bd-free8","assignee":null,"labels":["story:approved"],"description":"x"}]'
+[ "$(_fc "$PINNED_NOTE")" = '["bd-free8"]' ] && ok "ga-gzv7g: pinned bead excluded; free story:approved kept (permanent-reference note honored)" || bad "ga-gzv7g: pinned not excluded (got: $(_fc "$PINNED_NOTE"))"
+grep -qE '"pinned"' "$DISPATCHER" && ok "_filter_candidates carries the pinned clause" || bad "pinned clause missing from _filter_candidates"
+
 # ── Scenario 3e2k (ga-xdukc/ga-hd87d): DECISAO-titled / Athos-decide-phrased beads
 # excluded via body-text veto, independent of labels ────────────────────────────
 # wa-5ch02 ("DECISAO (Athos): classificacao deve pagar conexoes (R$0,32/CPF) ou

@@ -1924,6 +1924,17 @@ _filter_candidates() {
           # the PR merges, same as engine-window:pending above — no daemon
           # watches external PRs for merge yet, so removal is manual.
           or . == "story:awaiting-external-merge"
+          # ga-gzv7g: pinned marks a permanent-reference/preservation note
+          # (native Dog Context: "pinned... for permanent reference beads";
+          # `bd close --help` treats it as first-class: "-f Force close
+          # pinned issues"). Nothing previously excluded it here, so a
+          # Mayor pre-restart preservation note that happened to carry
+          # ctx:ready+exec:auto (ga-sxbvj) was dispatched as an ordinary
+          # Tier-2 feature story with empty AC/Estrela Guia/Equilíbrios
+          # (ga-lvtqi sling) — caught only because the dispatched dog read
+          # the full body before forcing a fake branch/gate-done. Honor it
+          # the same static way as story:blocked/on-device above.
+          or . == "pinned"
         )) | length) == 0
         and ((.description // "") | test("\\S"))
         # ga-vhyd: needs:engine-window (excluded above via --exclude-label at
@@ -2077,6 +2088,7 @@ _filter_candidates() {
               or . == "engine-window:pending"
               or . == "framework:engine"
               or . == "story:awaiting-external-merge"
+              or . == "pinned"
             ))) as $bl
             | if ($bl | length) > 0 then "blocking-label:\($bl | join(","))" else empty end ),
           (if ((($b.description // "") | test("\\S")) | not) then "empty-description" else empty end),
