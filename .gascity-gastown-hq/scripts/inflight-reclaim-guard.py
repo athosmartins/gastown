@@ -2802,16 +2802,38 @@ def reclaim_dead_dog_claims(exclude_session_ids=None, sessions=None,
             )
 
             if action == "reclaim":
-                if not dry_run:
-                    do_reclaim(bead_id, b.get("title", "")[:60], reclaim_count,
-                               0.0, labels, rig_root=b.get("rig_root"),
-                               has_explicit_refusal=has_explicit_refusal,
-                               refusal_count=refusal_count)
-                reclaimed.append(bead_id)
-                print(f"[DOG-PREFLIGHT] gt-fppb0: reclaimed provably-dead dog "
-                      f"claim bead={bead_id} assignee={assignee!r} "
-                      f"reclaim={reclaim_count + 1}/{MAX_RECLAIMS}"
-                      + (" (dry-run)" if dry_run else ""), flush=True)
+                if dry_run:
+                    reclaimed.append(bead_id)
+                    print(f"[DOG-PREFLIGHT] gt-fppb0: reclaimed provably-dead dog "
+                          f"claim bead={bead_id} assignee={assignee!r} "
+                          f"reclaim={reclaim_count + 1}/{MAX_RECLAIMS} (dry-run)", flush=True)
+                else:
+                    # ga-jzye0 GATE-FEEDBACK (gate_run=ga-dr98s): do_reclaim() can now
+                    # return False without mutating anything (label removal unconfirmed
+                    # — e.g. a Dolt hiccup). This caller used to discard that return
+                    # value and report success unconditionally, same as run_cycle did
+                    # before ga-vw26y. That meant a bead left completely untouched
+                    # (assignee still gastown.dog, status still in_progress) got logged
+                    # as "reclaimed" and counted in `reclaimed` anyway — so the fresh
+                    # dog's own Tier-1 query re-adopted the SAME zombie next cycle: the
+                    # exact NEVERSTART respawn loop this preflight exists to prevent,
+                    # reintroduced under its own trigger condition. Mirror run_cycle's
+                    # audited pattern (below, "ok = do_reclaim(...)"): only count/log a
+                    # reclaim that actually happened.
+                    ok = do_reclaim(bead_id, b.get("title", "")[:60], reclaim_count,
+                                     0.0, labels, rig_root=b.get("rig_root"),
+                                     has_explicit_refusal=has_explicit_refusal,
+                                     refusal_count=refusal_count)
+                    if ok:
+                        reclaimed.append(bead_id)
+                        print(f"[DOG-PREFLIGHT] gt-fppb0: reclaimed provably-dead dog "
+                              f"claim bead={bead_id} assignee={assignee!r} "
+                              f"reclaim={reclaim_count + 1}/{MAX_RECLAIMS}", flush=True)
+                    else:
+                        print(f"[DOG-PREFLIGHT] gt-fppb0: reclaim attempt unconfirmed for "
+                              f"bead={bead_id} assignee={assignee!r} — label removal could "
+                              f"not be confirmed; leaving bead untouched, will retry next "
+                              f"sweep", flush=True)
             # escalate / noop → left for run_cycle; the preflight only fast-reclaims.
     except Exception as exc:
         # Absolute fail-open contract: never propagate out of a pre_start hook.
@@ -4379,14 +4401,39 @@ def _selftest():
     #     label, and bumps pilot:refusal-count — while still performing the
     #     normal reclaim mechanics unchanged. ---
     _rf_mutations = []
+    # ga-jzye0 fix-attempt-2: lazily tracks each bead's label set so `bd show`
+    # read-backs (_remove_label_verified) see a real bead shape reflecting
+    # prior add/remove calls, instead of unconditionally looking like an
+    # unreadable error envelope. Pre-fix this stub always returned empty
+    # stdout for `bd show`, so EVERY do_reclaim() call in RF-12/RS-12/RS-14
+    # aborted at step 1 (label removal never confirmable) before ever
+    # reaching the code these tests exist to exercise — a latent regression
+    # from fix-attempt-1 itself, uncaught because /gate-done didn't run this
+    # file's own --selftest before submitting.
+    _rf_labels = {}
 
     def _stub_run_rf(cmd, **kw):
-        if isinstance(cmd, (list, tuple)):
-            _rf_mutations.append(list(cmd))
         class _R:
-            returncode = 0
-            stdout = ""
-            stderr = ""
+            def __init__(self, rc=0, out=""):
+                self.returncode = rc
+                self.stdout = out
+                self.stderr = ""
+        if not isinstance(cmd, (list, tuple)):
+            return _R()
+        _rf_mutations.append(list(cmd))
+        args = list(cmd)
+        if args and args[0] == "bd":
+            rest = args[1:]
+            if len(rest) >= 2 and rest[0] == "-C":
+                rest = rest[2:]
+            if len(rest) >= 4 and rest[0] == "label" and rest[1] in ("add", "remove"):
+                bead_id, label = rest[2], rest[3]
+                cur = _rf_labels.setdefault(bead_id, set())
+                (cur.discard if rest[1] == "remove" else cur.add)(label)
+            elif len(rest) >= 2 and rest[0] == "show":
+                bead_id = rest[1]
+                return _R(0, json.dumps(
+                    {"id": bead_id, "labels": sorted(_rf_labels.get(bead_id, set()))}))
         return _R()
 
     _orig_run_rf = subprocess.run
@@ -5108,7 +5155,7 @@ def _selftest():
 
     def _make_dd_stub(dog_beads, sessions, inprogress=None, markers=None,
                       titles=None, agents=None, refs=None, quota_rc=0,
-                      sessions_fail=False):
+                      sessions_fail=False, never_confirm_removal=False):
         inprogress = inprogress if inprogress is not None else []
         markers = markers or {}
         titles = titles or {}
@@ -5116,6 +5163,16 @@ def _selftest():
         refs = refs or []
         mutations = []
         calls = []
+        # ga-jzye0 fix-attempt-2: seeded from dog_beads' own "labels" so `bd
+        # show` read-backs (_remove_label_verified) reflect a real bead shape
+        # and can actually confirm a removal. Pre-fix this stub's `show`
+        # response never carried a "labels" key at all, so after the
+        # self-audit commit (042a08ea4) tightened the shape check, EVERY
+        # removal looked unconfirmable and do_reclaim() aborted before ever
+        # reaching the assign/status mutations DD-1b/DD-1c check for.
+        # never_confirm_removal=True keeps the old (label-less) shape on
+        # purpose, to simulate a genuine Dolt hiccup (DD-11).
+        labels_state = {b["id"]: set(b.get("labels", [])) for b in dog_beads if b.get("id")}
 
         class _R:
             def __init__(self, rc=0, out=""):
@@ -5163,9 +5220,20 @@ def _selftest():
                     return _R(0, "[]")
                 if sub == "show":
                     ids = [a for a in args[1:] if a != "--json"]
-                    return _R(0, json.dumps([{"id": i, "title": titles.get(i, "")} for i in ids]))
+                    if never_confirm_removal:
+                        return _R(0, json.dumps(
+                            [{"id": i, "title": titles.get(i, "")} for i in ids]))
+                    return _R(0, json.dumps([
+                        {"id": i, "title": titles.get(i, ""),
+                         "labels": sorted(labels_state.get(i, set()))}
+                        for i in ids
+                    ]))
                 if sub in ("label", "assign", "update", "comment"):
                     mutations.append(list(cmd))
+                    if sub == "label" and len(args) >= 4 and args[1] in ("add", "remove"):
+                        bead_id, lbl = args[2], args[3]
+                        cur = labels_state.setdefault(bead_id, set())
+                        (cur.discard if args[1] == "remove" else cur.add)(lbl)
                     return _R(0, "")
                 return _R(0, "")
             return _R(0, "")
@@ -5267,6 +5335,29 @@ def _selftest():
         _r10 = reclaim_dead_dog_claims(now=T_dd, dry_run=True)
         check("DD-10: dry_run → identifies zombie but performs no bd mutation",
               _r10 == ["ga-zomb1"] and muts == [], f"got={_r10!r} muts={muts!r}")
+
+        # DD-11 (GATE-FEEDBACK regression anchor, gate_run=ga-dr98s, fix-attempt-2):
+        # when do_reclaim() cannot confirm label removal (Dolt hiccup — the exact
+        # condition fix-attempt-1 targets), it returns False and touches NOTHING
+        # (assignee/status untouched). Pre-fix-attempt-2, this caller ignored that
+        # return value and still reported success — reclaimed=[bead_id] plus a
+        # "[DOG-PREFLIGHT]...reclaimed..." log line — even though the bead was
+        # left completely untouched. The fresh dog's own Tier-1 query (bd list
+        # --status in_progress --assignee gastown.dog) would then re-adopt the
+        # SAME zombie next cycle: the exact NEVERSTART respawn loop this
+        # preflight exists to prevent, reintroduced under its own trigger
+        # condition. Fixed by mirroring run_cycle's audited "ok = do_reclaim(...)"
+        # pattern instead of discarding the return value.
+        subprocess.run, muts, calls = _make_dd_stub(
+            [_X], [_dd_other], inprogress=[_X], never_confirm_removal=True)
+        _r11 = reclaim_dead_dog_claims(now=T_dd)
+        check("DD-11a (GATE-FEEDBACK): unconfirmable label removal → NOT reported "
+              "as reclaimed (reclaimed list stays accurate, was ['ga-zomb1'] pre-fix)",
+              _r11 == [], f"got={_r11!r}")
+        check("DD-11b (GATE-FEEDBACK): unconfirmable label removal → NO assign/update "
+              "mutation — bead left exactly as found, never half-done",
+              not any(m[:2] in (["bd", "assign"], ["bd", "update"]) for m in muts),
+              f"muts={muts!r}")
     finally:
         subprocess.run = _orig_run_dd
         time.time = _orig_time_dd
