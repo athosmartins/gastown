@@ -369,6 +369,13 @@ _ledger_touch() {
 # phone buzz) and the log (always full detail) stay unthrottled every sweep.
 DPW_ALERT_WINDOW_SEC="${DPW_ALERT_WINDOW_SEC:-14400}"
 _alert_cd_file() { echo "${STATE}.alert-cooldown/$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"; }
+# _alert_cd_ok: READ-ONLY check — is this key currently OUT of cooldown?
+# Does NOT write state. Callers must call _alert_cd_mark separately, and only
+# after confirming the mail send it gates actually succeeded (gate feedback on
+# ga-95bi4 attempt 1: marking unconditionally here made a FAILED/absent `gc
+# mail send` indistinguishable from a delivered one, silently blacking out the
+# mayor-facing mail channel for up to DPW_ALERT_WINDOW_SEC on the first failed
+# attempt for a new failure shape).
 _alert_cd_ok() {
   local key="$1" now="$2" f last
   f="$(_alert_cd_file "$key")"
@@ -376,9 +383,14 @@ _alert_cd_ok() {
   if [ -n "$last" ] && [ "$last" -gt 0 ] 2>/dev/null && [ $(( now - last )) -lt "$DPW_ALERT_WINDOW_SEC" ] 2>/dev/null; then
     return 1
   fi
+  return 0
+}
+# _alert_cd_mark: record that a send for <key> was CONFIRMED successful.
+_alert_cd_mark() {
+  local key="$1" now="$2" f
+  f="$(_alert_cd_file "$key")"
   mkdir -p "$(dirname "$f")" 2>/dev/null || true
   printf '%s\n' "$now" > "$f" 2>/dev/null || true
-  return 0
 }
 
 # ── imp05: alert helper (ntfy primary, gc mail secondary, ledger best-effort) ─
@@ -387,16 +399,28 @@ _alert_cd_ok() {
 # (per-label, not per-subject); double-gating on top of that would let this
 # coarser subject-level window mask a DIFFERENT label's already-warranted
 # alert just because some other label used the same subject recently.
+# _alert return code: 0 = mail sent (or correctly suppressed by cooldown),
+# 1 = a send was attempted and failed (or gc was unavailable). Callers that
+# keep their OWN send-independent state (e.g. run_presence_drift_sweep's
+# per-label _pd_last_set) key off this to defer marking until delivery is
+# confirmed, same reasoning as _alert_cd_mark above.
 _alert() {
-  local subject="$1" msg="$2" skip_cd="${3:-}"
+  local subject="$1" msg="$2" skip_cd="${3:-}" now rc=0
+  now="$(date +%s)"
   log "ALERT $subject — $msg"
   command -v notify >/dev/null 2>&1 && notify -t "Daemon watchdog: $subject" -p 4 "$msg" 2>/dev/null || true
-  if [ -n "$skip_cd" ] || _alert_cd_ok "$subject" "$(date +%s)"; then
-    command -v gc >/dev/null 2>&1 && gc mail send mayor -s "Daemon-presence: $subject" -m "$msg" 2>/dev/null || true
+  if [ -n "$skip_cd" ] || _alert_cd_ok "$subject" "$now"; then
+    if command -v gc >/dev/null 2>&1 && gc mail send mayor -s "Daemon-presence: $subject" -m "$msg" 2>/dev/null; then
+      [ -n "$skip_cd" ] || _alert_cd_mark "$subject" "$now"
+    else
+      log "ALERT (mail send failed or gc unavailable — cooldown NOT marked, will retry next sweep): $subject"
+      rc=1
+    fi
   else
     log "ALERT-SUPPRESSED (mail, within ${DPW_ALERT_WINDOW_SEC}s cooldown): $subject"
   fi
   _ledger_touch "$subject" "$msg"
+  return $rc
 }
 
 # _rss_mb <label> — return current RSS in MiB for the process running under <label>.
@@ -550,7 +574,7 @@ _pd_last_clear() { rm -f "$(_pd_state_file "$1")" 2>/dev/null || true; }
 
 run_presence_drift_sweep() {
   [ "${DPW_PRESENCE_DRIFT_ENABLED:-1}" = "1" ] || return 0
-  local dir f label undeployed="" alerted="" now last since remaining
+  local dir f label undeployed="" alerted="" to_mark="" now last since remaining
   now="${DPW_TEST_NOW:-$(date +%s)}"
   for dir in $DPW_PRESENCE_DIRS; do
     [ -d "$dir" ] || continue
@@ -574,7 +598,7 @@ run_presence_drift_sweep() {
         log "PRESENCE-DRIFT $label: already alerted ${since}s ago (cooldown ${remaining}min remaining, src=$dir)"
       else
         alerted="$alerted $label(src:$dir)"
-        _pd_last_set "$label" "$now"
+        to_mark="$to_mark $label"
       fi
     done
   done
@@ -585,7 +609,20 @@ run_presence_drift_sweep() {
     # above (DPW_PRESENCE_DRIFT_COOLDOWN_SEC, ga-4l2sn) — the generic per-
     # subject cooldown in _alert would otherwise mask a DIFFERENT label's
     # already-warranted alert (ga-95bi4).
-    _alert "presence-drift (undeployed plist)" "$msg" 1
+    # _pd_last_set is deferred until here — and only on a CONFIRMED send —
+    # instead of inside the loop above: marking eagerly had the same
+    # regression the gate caught in _alert_cd_ok (ga-95bi4 gate feedback,
+    # fix round 2): a failed/absent gc would have recorded every drifted
+    # label as "alerted" for DPW_PRESENCE_DRIFT_COOLDOWN_SEC (3h) despite no
+    # mail ever going out.
+    if _alert "presence-drift (undeployed plist)" "$msg" 1; then
+      local _pd_label
+      for _pd_label in $to_mark; do
+        _pd_last_set "$_pd_label" "$now"
+      done
+    else
+      log "PRESENCE-DRIFT: send failed — per-label cooldowns NOT marked for:$to_mark (will retry next sweep)"
+    fi
   fi
   if [ -n "$undeployed" ]; then
     return 1
@@ -804,7 +841,11 @@ run_sweep() {
     [ -n "$wedged" ]       && _shape="${_shape}W"
     [ -n "$path_missing" ] && _shape="${_shape}P"
     if _alert_cd_ok "sweep-shape-$_shape" "$NOW"; then
-      command -v gc >/dev/null 2>&1 && gc mail send mayor -s "Daemon-presence: critical daemon absent/crash-looping/failing/wedged/path-missing" -m "$msg" 2>/dev/null || true
+      if command -v gc >/dev/null 2>&1 && gc mail send mayor -s "Daemon-presence: critical daemon absent/crash-looping/failing/wedged/path-missing" -m "$msg" 2>/dev/null; then
+        _alert_cd_mark "sweep-shape-$_shape" "$NOW"
+      else
+        log "ALERT (mail send failed or gc unavailable — cooldown NOT marked, will retry next sweep): sweep-shape-$_shape"
+      fi
     else
       log "ALERT-SUPPRESSED (mail, failure shape [$_shape] within ${DPW_ALERT_WINDOW_SEC}s cooldown)"
     fi
@@ -1525,6 +1566,105 @@ GCSTUB37
   _alert "gc binary provenance" "still absent, caller opts out of the generic gate" 1
   [ -s "$MAILSENT37" ] && ok "_alert with skip_cd=1: mail sent despite same subject still within window" || bad "_alert with skip_cd=1: wrongly suppressed"
   DPW_ALERT_WINDOW_SEC=0
+
+  # ── ga-95bi4 gate-fix regression scenarios 39-40 ─────────────────────────
+  # Gate feedback on attempt 1: _alert_cd_ok used to WRITE the cooldown
+  # timestamp as part of the "may I send" check, before the caller's `gc mail
+  # send` was confirmed to succeed. A failed/absent gc was swallowed by
+  # `2>/dev/null || true` with zero effect on control flow, but the cooldown
+  # was already armed — silently blacking out the mail channel for up to
+  # DPW_ALERT_WINDOW_SEC on exactly the first attempt for a new failure shape.
+  # Every gc stub above unconditionally `exit 0`s, so none of them could have
+  # caught this. These two scenarios use a gc stub whose FIRST `mail`
+  # invocation fails and whose SECOND succeeds, to prove: (a) a failed send
+  # does not arm the cooldown — the very next sweep retries and succeeds —
+  # and (b) a confirmed successful send still arms it normally afterward.
+
+  echo "Scenario 39 (ga-95bi4 gate-fix): run_sweep's shape-cooldown — a FAILED gc mail send must NOT mark cooldown"
+  : > "$LOG"; rm -rf "${STATE}.alert-cooldown"; : > "$STATE"
+  _fail_count_reset com.gascity.alpha; _cl_heal_reset com.gascity.alpha
+  DPW_ALERT_WINDOW_SEC=3600
+  DPW_CRASHLOOP_AUTOHEAL=0
+  DPW_TEST_LOADED="com.gascity.alpha com.gascity.gamma"; DPW_TEST_EXIT=""   # beta absent
+  : > "$DPW_TEST_BOOTSTRAPS"
+  MAILSENT39="$TMP/mailsent39"; : > "$MAILSENT39"
+  GCCALLS39="$TMP/gccalls39"; : > "$GCCALLS39"
+  cat > "$TMP/gc" <<GCSTUB39
+#!/usr/bin/env bash
+if [ "\$1" = "mail" ]; then
+  echo x >> "$GCCALLS39"
+  n=\$(wc -l < "$GCCALLS39" | tr -d ' ')
+  [ "\$n" -eq 1 ] && exit 1   # 1st send attempt fails (simulates Dolt down)
+  echo "\$*" >> "$MAILSENT39"
+  exit 0
+fi
+exit 0
+GCSTUB39
+  chmod +x "$TMP/gc"
+  run_sweep >/dev/null 2>&1
+  [ ! -s "$MAILSENT39" ] && ok "1st sweep, gc mail send FAILS: no mail recorded as sent" || bad "1st sweep: mail unexpectedly recorded despite stub failing"
+  grep -q "cooldown NOT marked" "$LOG" && ok "1st sweep: failed send logged as NOT marking cooldown" || bad "1st sweep: missing 'cooldown NOT marked' log line"
+  run_sweep >/dev/null 2>&1   # same persisting ABSENT condition; gc mail send now succeeds
+  [ -s "$MAILSENT39" ] && ok "2nd sweep, same persisting condition: mail sent (prior FAILED attempt did not block the retry — the gate-fix)" || bad "2nd sweep: mail wrongly suppressed after a prior failed attempt (regression to gate-failed behavior)"
+  : > "$MAILSENT39"
+  run_sweep >/dev/null 2>&1   # same condition again; this time cooldown should be armed from the CONFIRMED successful 2nd send
+  [ ! -s "$MAILSENT39" ] && ok "3rd sweep, same persisting condition: mail suppressed (cooldown correctly armed after a confirmed successful send)" || bad "3rd sweep: mail wrongly re-sent — cooldown not armed after a successful send"
+  DPW_ALERT_WINDOW_SEC=0
+  _fail_count_reset com.gascity.alpha; _cl_heal_reset com.gascity.alpha
+
+  echo "Scenario 40 (ga-95bi4 gate-fix): _alert() cooldown — a FAILED gc mail send must NOT mark cooldown either"
+  : > "$LOG"; rm -rf "${STATE}.alert-cooldown"
+  DPW_ALERT_WINDOW_SEC=3600
+  MAILSENT40="$TMP/mailsent40"; : > "$MAILSENT40"
+  GCCALLS40="$TMP/gccalls40"; : > "$GCCALLS40"
+  cat > "$TMP/gc" <<GCSTUB40
+#!/usr/bin/env bash
+if [ "\$1" = "mail" ]; then
+  echo x >> "$GCCALLS40"
+  n=\$(wc -l < "$GCCALLS40" | tr -d ' ')
+  [ "\$n" -eq 1 ] && exit 1   # 1st send attempt fails
+  echo "\$*" >> "$MAILSENT40"
+  exit 0
+fi
+exit 0
+GCSTUB40
+  chmod +x "$TMP/gc"
+  _alert "gc binary provenance" "first detection, send will fail"
+  [ ! -s "$MAILSENT40" ] && ok "_alert 1st call, gc mail send FAILS: no mail recorded" || bad "_alert 1st call: mail unexpectedly recorded despite stub failing"
+  grep -q "cooldown NOT marked" "$LOG" && ok "_alert 1st call: failed send logged as NOT marking cooldown" || bad "_alert 1st call: missing 'cooldown NOT marked' log line"
+  _alert "gc binary provenance" "still absent, retry should succeed now"
+  [ -s "$MAILSENT40" ] && ok "_alert 2nd call, same subject: mail sent (prior FAILED attempt did not block the retry)" || bad "_alert 2nd call: mail wrongly suppressed after a prior failed attempt"
+  DPW_ALERT_WINDOW_SEC=0
+
+  echo "Scenario 41 (ga-95bi4 gate-fix): presence-drift's OWN per-label cooldown (_pd_last_set) — same class of bug, same fix"
+  : > "$LOG"; rm -rf "${STATE}.presence-drift"; DPW_CRITICAL="$ALL"; DPW_PRESENCE_DIRS="$PDIR"; DPW_TEST_LOADED="com.gascity.epsilon"   # delta undeployed
+  MAILSENT41="$TMP/mailsent41"; : > "$MAILSENT41"
+  GCCALLS41="$TMP/gccalls41"; : > "$GCCALLS41"
+  cat > "$TMP/gc" <<GCSTUB41
+#!/usr/bin/env bash
+if [ "\$1" = "mail" ]; then
+  echo x >> "$GCCALLS41"
+  n=\$(wc -l < "$GCCALLS41" | tr -d ' ')
+  [ "\$n" -eq 1 ] && exit 1   # 1st send attempt fails
+  echo "\$*" >> "$MAILSENT41"
+  exit 0
+fi
+exit 0
+GCSTUB41
+  chmod +x "$TMP/gc"
+  DPW_TEST_NOW=2000000000
+  run_presence_drift_sweep >/dev/null 2>&1
+  [ ! -s "$MAILSENT41" ] && ok "1st drift sweep, gc mail send FAILS: no mail recorded as sent" || bad "1st drift sweep: mail unexpectedly recorded despite stub failing"
+  grep -q "cooldown NOT marked" "$LOG" && ok "1st drift sweep: failed send logged as NOT marking per-label cooldown" || bad "1st drift sweep: missing 'cooldown NOT marked' log line"
+  DPW_TEST_NOW=2000000010   # 10s later — still well inside the 10800s cooldown IF it had been (wrongly) marked
+  run_presence_drift_sweep >/dev/null 2>&1
+  [ -s "$MAILSENT41" ] && ok "2nd drift sweep, same persisting drift: mail sent (prior FAILED attempt did not block the retry)" || bad "2nd drift sweep: mail wrongly suppressed after a prior failed attempt"
+  : > "$MAILSENT41"
+  DPW_TEST_NOW=2000000020
+  run_presence_drift_sweep >/dev/null 2>&1
+  [ ! -s "$MAILSENT41" ] && ok "3rd drift sweep, same persisting drift: mail suppressed (per-label cooldown correctly armed after a confirmed successful send)" || bad "3rd drift sweep: mail wrongly re-sent — per-label cooldown not armed after a successful send"
+  unset DPW_TEST_NOW
+  DPW_PRESENCE_DIRS=""
 
   echo ""
   echo "daemon-presence-watchdog selftest: PASS=$PASS FAIL=$FAIL"
