@@ -6683,6 +6683,29 @@ else
   ok "lane-write failure did not cross-trigger the in-flight abort path"
 fi
 
+echo "Scenario ga-2wcz6: structural — _ownership_guard_repos defined before _filter_built and before the unconditional _pilot_emit_dispatchable call (define-after-use regression guard)"
+# Bug ga-2wcz6: bash resolves a function call at EXECUTION time, not lexically.
+# _filter_built (called from _pilot_emit_dispatchable via _emit_query_one, wa-u5r1's
+# "ALWAYS, fail-open" painel-preview emit — the FIRST thing a sweep does after the
+# Dolt probe) calls _ownership_guard_repos for its branch consultation. When
+# _ownership_guard_repos was defined ~900 lines further down (after _filter_built
+# AND after the top-level _pilot_emit_dispatchable call), that first invocation hit
+# "_ownership_guard_repos: command not found" — silently, since _pilot_emit_dispatchable's
+# whole body is `{ ... } 2>/dev/null`. Effect: the branch-existence built-check
+# silently no-op'd for the painel "Aprovadas" preview queue only (confirmed by the
+# real Tier1/Tier2 dispatch logic, which calls _filter_built again later in the file
+# after the def, being unaffected). This assertion pins the definition BEFORE both
+# points that must be able to see it, so the ordering can never silently regress.
+GA2WCZ6_DEF_LINE="$(grep -n '^_ownership_guard_repos()' "$DISPATCHER" | head -1 | cut -d: -f1)"
+GA2WCZ6_FILTERBUILT_LINE="$(grep -n '^_filter_built()' "$DISPATCHER" | head -1 | cut -d: -f1)"
+GA2WCZ6_EMIT_CALL_LINE="$(grep -n '^_pilot_emit_dispatchable$' "$DISPATCHER" | head -1 | cut -d: -f1)"
+if [ -n "$GA2WCZ6_DEF_LINE" ] && [ -n "$GA2WCZ6_FILTERBUILT_LINE" ] && [ -n "$GA2WCZ6_EMIT_CALL_LINE" ] \
+   && [ "$GA2WCZ6_DEF_LINE" -lt "$GA2WCZ6_FILTERBUILT_LINE" ] && [ "$GA2WCZ6_DEF_LINE" -lt "$GA2WCZ6_EMIT_CALL_LINE" ]; then
+  ok "ga-2wcz6: _ownership_guard_repos (L$GA2WCZ6_DEF_LINE) is defined before _filter_built (L$GA2WCZ6_FILTERBUILT_LINE) and before the unconditional top-level _pilot_emit_dispatchable call (L$GA2WCZ6_EMIT_CALL_LINE)"
+else
+  bad "ga-2wcz6 REGRESSION: _ownership_guard_repos def (L${GA2WCZ6_DEF_LINE:-?}) is not safely before _filter_built (L${GA2WCZ6_FILTERBUILT_LINE:-?}) and/or the top-level _pilot_emit_dispatchable call (L${GA2WCZ6_EMIT_CALL_LINE:-?}) — reintroduces the painel built-check silent no-op"
+fi
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

@@ -2384,6 +2384,75 @@ _filter_dispatch_gates() {
 
   printf '%s' "$_dg_out"
 }
+
+# ── ga-htjni: ownership / in-flight collision guard helpers ───────────────────
+# _ownership_guard_repos — newline list of repos a `crew/<owner>/<bead>` branch
+# could live in (the shared town root + every registered rig path), de-duped and
+# memoized for the whole sweep. Self-sufficient: it does NOT depend on the
+# never-started block's _NS_BRANCH_REPOS (which is only set when that detector is
+# enabled), so the guard works even with PILOT_NEVERSTARTED_MINUTES=0. Fail-open
+# for the MOST callers here (_target_has_real_branch, _beadid_has_crew_branch,
+# the remerge lookup): each is documented "any uncertainty -> assert NO branch,
+# never forces a release" defense-in-depth, so a `gc rig list` error degrading
+# this to just the town root is an accepted, low-stakes trade-off for them.
+# ga-07rb3: ONE caller is NOT defense-in-depth — the phantom-claim guard
+# actively RELEASES a bead for re-dispatch when it concludes "no branch". For
+# that one, "town root only, checked, found nothing" must not be trusted the
+# same as "confirmed no branch anywhere" (double-dispatch risk if the branch
+# is rig-side). Every caller invokes this via `repos="$(_ownership_guard_repos)"`
+# — a command SUBSHELL — so a plain internal variable can never signal failure
+# back to the caller (its assignment dies with the subshell). The exit CODE of
+# a command substitution DOES survive it, so: return 1 iff the underlying gc
+# fetch failed (stdout still prints the fail-open town-root-only list either
+# way, unchanged for every non-forcing caller); the phantom-claim guard below
+# is the one caller that additionally checks $? for this reason.
+# ga-2wcz6: relocated here (was ~L3365, AFTER _filter_built and the top-level
+# _pilot_emit_dispatchable call) — bash resolves a function call at EXECUTION
+# time, not lexically, so a top-level script calling _pilot_emit_dispatchable
+# (wa-u5r1, "ALWAYS, fail-open", unconditional) before this def had been reached
+# meant _filter_built's branch consultation below (its first real caller in the
+# sweep) hit "_ownership_guard_repos: command not found" on that path — silently,
+# since _pilot_emit_dispatchable's whole body is `{ ... } 2>/dev/null`. Confirmed
+# empirically (a `type _ownership_guard_repos` probe at the real call site printed
+# NOTYETDEFINED on the first invocation, only defined on the second+). Dependencies
+# verified already defined at this earlier position: gc_json_or_unknown (L543),
+# warn (L1281), GC_CITY (L80).
+_OWNERSHIP_GUARD_REPOS=""
+_OWNERSHIP_GUARD_REPOS_DONE=""
+_OWNERSHIP_GUARD_REPOS_FAILED=""
+_ownership_guard_repos() {
+  if [ -z "$_OWNERSHIP_GUARD_REPOS_DONE" ]; then
+    local _og_repos_json=""
+    if ! _og_repos_json=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
+      _OWNERSHIP_GUARD_REPOS_FAILED=1
+      warn "gc rig list failed while building _ownership_guard_repos — rig-side branch checks degraded to HQ-only this sweep (ga-07rb3)."
+    fi
+    _OWNERSHIP_GUARD_REPOS=$(
+      { dirname "$GC_CITY"
+        printf '%s' "$_og_repos_json" | jq -r '.rigs[]?.path // empty' 2>/dev/null
+      } | awk 'NF && !seen[$0]++'
+    )
+    _OWNERSHIP_GUARD_REPOS_DONE=1
+  fi
+  printf '%s' "$_OWNERSHIP_GUARD_REPOS"
+  # ga-07rb3 fix-attempt-2: _OWNERSHIP_GUARD_REPOS_FAILED is a persisted global,
+  # set (never reset) the one time per sweep the fetch actually runs, and read
+  # on EVERY call including memoized cache-hits — unlike the local _og_failed
+  # this replaces, which reset to 0 on every call and only ever got recomputed
+  # inside the cache-miss branch, so any call after the first silently reported
+  # success regardless of what the cached data actually came from. The exit
+  # code must reflect the fetch that produced the CACHED data currently being
+  # returned, not "did today's invocation of this function do any work".
+  # Caveat (ga-130et, found while building this fix): every real call site
+  # below wraps this function in `$(...)`, which forks a subshell — so a
+  # memoized cache-HIT never actually reaches a second real caller today
+  # (each independently re-fetches and gets its own correct answer). This
+  # fix is still correct and worth keeping — it becomes load-bearing the
+  # moment ga-130et's deeper issue is fixed — but don't read "memoized for
+  # the whole sweep" above as true of the current call sites; see ga-130et.
+  [ -z "$_OWNERSHIP_GUARD_REPOS_FAILED" ]
+}
+
 # _filter_built — drop ctx:ready candidates that ALREADY have a crew OR dog fix/ branch
 # (built work awaiting gate/delivery, NOT a fresh dispatch candidate; ga-6jqr: the branch
 # probe used to match ONLY crew/*/<id>, blind to the fix/<id>-* shape dog builders push —
@@ -3360,86 +3429,17 @@ _crew_progressed_since() {
   return 1
 }
 
-# ── ga-htjni: ownership / in-flight collision guard helpers ───────────────────
-# _ownership_guard_repos — newline list of repos a `crew/<owner>/<bead>` branch
-# could live in (the shared town root + every registered rig path), de-duped and
-# memoized for the whole sweep. Self-sufficient: it does NOT depend on the
-# never-started block's _NS_BRANCH_REPOS (which is only set when that detector is
-# enabled), so the guard works even with PILOT_NEVERSTARTED_MINUTES=0. Fail-open
-# for the MOST callers here (_target_has_real_branch, _beadid_has_crew_branch,
-# the remerge lookup): each is documented "any uncertainty -> assert NO branch,
-# never forces a release" defense-in-depth, so a `gc rig list` error degrading
-# this to just the town root is an accepted, low-stakes trade-off for them.
-# ga-07rb3: ONE caller is NOT defense-in-depth — the phantom-claim guard
-# actively RELEASES a bead for re-dispatch when it concludes "no branch". For
-# that one, "town root only, checked, found nothing" must not be trusted the
-# same as "confirmed no branch anywhere" (double-dispatch risk if the branch
-# is rig-side). Return value: 0 iff the underlying gc fetch succeeded (or
-# never needed to re-run — see ga-130et below), 1 iff it failed; stdout/the
-# global still print the fail-open town-root-only list either way, unchanged
-# for every non-forcing caller. The phantom-claim guard below is the one
-# caller that additionally checks $? for this reason.
-# ga-130et fix-attempt-1: every real call site invokes this UNWRAPPED — plain
-# `_ownership_guard_repos >/dev/null; rc=$?` — then reads $_OWNERSHIP_GUARD_REPOS
-# directly, never via `repos="$(_ownership_guard_repos)"`. That alone is
-# NECESSARY but NOT SUFFICIENT: unwrapping the immediate call site only
-# removes the subshell THIS invocation would otherwise fork — it does nothing
-# for a subshell forked one or more levels ABOVE it. The gate review of
-# fix-attempt-1 traced this exactly: 5 of the 6 real call sites sit inside a
-# function (_beadid_live_crew_owner, _beadid_matched_crew_branch_ref,
-# _beadid_needs_remerge_branch) or a pipe stage (_filter_built) that the
-# CALLER wraps in `$(...)` or a pipe — an unwrapped call nested inside an
-# already-subshelled ancestor still runs inside that ancestor's subshell, so
-# the memo writes still die on exit there. Only _target_has_real_branch's
-# whole chain (sweep loop -> _sling_is_live -> _target_has_real_branch)
-# happens to have zero subshells anywhere in it, which is why that ONE chain
-# already worked and the other 5 did not, despite all 6 sharing the identical
-# unwrapped-call shape at their own immediate call site.
-# ga-130et fix-attempt-2: the actual fix is _ownership_guard_repos_prime
-# (defined immediately below this function), called ONCE, unconditionally,
-# at plain top-level script scope — before any pipeline or `$(...)` anywhere
-# in this file gets a chance to be the sweep's first caller. A subshell
-# forked AFTER that point still inherits _OWNERSHIP_GUARD_REPOS_DONE=1 from
-# the parent at fork time (a subshell can't write a value back to its parent,
-# but it DOES inherit whatever the parent already had at the moment it was
-# forked) — so every real call site below, regardless of how many subshell
-# layers its own caller chain wraps it in, hits the cache-HIT branch and
-# never re-invokes `gc rig list --json`, without needing each call site to
-# individually avoid $(...) itself.
-_OWNERSHIP_GUARD_REPOS=""
-_OWNERSHIP_GUARD_REPOS_DONE=""
-_OWNERSHIP_GUARD_REPOS_FAILED=""
-_ownership_guard_repos() {
-  if [ -z "$_OWNERSHIP_GUARD_REPOS_DONE" ]; then
-    local _og_repos_json=""
-    if ! _og_repos_json=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
-      _OWNERSHIP_GUARD_REPOS_FAILED=1
-      warn "gc rig list failed while building _ownership_guard_repos — rig-side branch checks degraded to HQ-only this sweep (ga-07rb3)."
-    fi
-    _OWNERSHIP_GUARD_REPOS=$(
-      { dirname "$GC_CITY"
-        printf '%s' "$_og_repos_json" | jq -r '.rigs[]?.path // empty' 2>/dev/null
-      } | awk 'NF && !seen[$0]++'
-    )
-    _OWNERSHIP_GUARD_REPOS_DONE=1
-  fi
-  printf '%s' "$_OWNERSHIP_GUARD_REPOS"
-  # ga-07rb3 fix-attempt-2: _OWNERSHIP_GUARD_REPOS_FAILED is a persisted global,
-  # set (never reset) the one time per sweep the fetch actually runs, and read
-  # on EVERY call including memoized cache-hits — unlike the local _og_failed
-  # this replaces, which reset to 0 on every call and only ever got recomputed
-  # inside the cache-miss branch, so any call after the first silently reported
-  # success regardless of what the cached data actually came from. The exit
-  # code must reflect the fetch that produced the CACHED data currently being
-  # returned, not "did today's invocation of this function do any work".
-  # ga-130et: this reaches every real caller ONLY because of the top-level
-  # _ownership_guard_repos_prime call below, not merely because this call
-  # site is unwrapped (see the header comment's fix-attempt-1-vs-2
-  # correction) — a call nested inside a still-subshelled ancestor gets this
-  # same cache-HIT only once the prime call has already run in the
-  # un-subshelled parent shell.
-  [ -z "$_OWNERSHIP_GUARD_REPOS_FAILED" ]
-}
+# ── ga-htjni: ownership / in-flight collision guard helpers — RELOCATED (ga-2wcz6) ──
+# _ownership_guard_repos (and its memoization globals) used to be defined here —
+# AFTER _filter_built (which calls it) and after the unconditional top-level
+# _pilot_emit_dispatchable invocation, a define-after-use bug (bash resolves
+# function calls at execution time, not lexically). Moved to before
+# _filter_built's definition; search "ga-htjni: ownership" above for the
+# current definition, its ga-130et memoization/caveat notes, and full
+# rationale. _ownership_guard_repos_prime (ga-130et's own fix for the
+# subshell-loses-the-memo problem, immediately below) was not moved — it
+# already runs after the relocated definition regardless of where either
+# lives, so its own placement is unaffected by this relocation.
 
 # _ownership_guard_repos_prime — call _ownership_guard_repos exactly ONCE,
 # here, at plain top-level script scope (not inside any function, pipe, or
