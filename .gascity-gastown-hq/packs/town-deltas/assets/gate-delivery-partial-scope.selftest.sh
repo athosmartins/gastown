@@ -477,6 +477,13 @@ if grep -q 'scope_covered:all' "$DISPATCHER"; then ok "dispatcher.sh honors scop
 # gate:needs-human elsewhere for real circuit-breaks, e.g. ga-lxz5w's sibling-race
 # hold — a file-wide grep would give a false read on those unrelated sites.
 PARTIAL_BRANCH=$(sed -n '/elif \[ "\$IS_PARTIAL" = "1" \]; then/,/# BUG\/TASK/p' "$DISPATCHER")
+# Explicit extraction-succeeded check: without this, a broken sed anchor (e.g. the
+# IS_PARTIAL branch gets refactored) would silently empty $PARTIAL_BRANCH, and the
+# NEGATIVE check below ("does not add gate:needs-human") would then vacuously pass
+# on empty input — a real absence misread as a verified-clean absence.
+if [ -z "$PARTIAL_BRANCH" ]; then
+  bad "dispatcher.sh's IS_PARTIAL branch extraction found nothing — sed anchors stale? (ga-6dpoa test itself would silently pass its negative check on this empty input)"
+fi
 if printf '%s' "$PARTIAL_BRANCH" | grep -q '"scope:needs-review"'; then
   ok "dispatcher.sh's IS_PARTIAL branch labels scope:needs-review (ga-6dpoa)"
 else
@@ -520,6 +527,10 @@ if grep -q 'keep:partial-delivery' "$DELIVERY"; then ok "story-delivery.sh's tas
 # ga-6dpoa: same fix, mirrored in the task-reconciler backstop's keep:partial-delivery
 # case arm. Scoped via sed range for the same reason as the dispatcher.sh check above.
 TASK_PARTIAL_ARM=$(sed -n '/keep:partial-delivery)/,/keep:contradicted-by-gate-failed-or-needs-fix)/p' "$DELIVERY")
+# Same extraction-succeeded guard as the dispatcher.sh check above — see its comment.
+if [ -z "$TASK_PARTIAL_ARM" ]; then
+  bad "story-delivery.sh's keep:partial-delivery arm extraction found nothing — sed anchors stale? (ga-6dpoa test itself would silently pass its negative check on this empty input)"
+fi
 if printf '%s' "$TASK_PARTIAL_ARM" | grep -q '"scope:needs-review"'; then
   ok "story-delivery.sh's keep:partial-delivery arm labels scope:needs-review (ga-6dpoa)"
 else
