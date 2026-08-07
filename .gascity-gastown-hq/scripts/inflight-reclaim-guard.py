@@ -2537,35 +2537,46 @@ def heal_orphan_sweep_false_resets(sessions, now):
         # overwrites (ga-4aree class), so readers must take the MAX, never the
         # first/last.
         _shield_until = int(now) + ORPHAN_SWEEP_SELFHEAL_SHIELD_SECS
+        _shield_ok = False
         try:
-            subprocess.run(
+            _r1 = subprocess.run(
                 _bd + ["label", "add", bead_id, "orphan-sweep:shielded", "-q"],
                 capture_output=True, text=True, timeout=15)
-            subprocess.run(
+            _r2 = subprocess.run(
                 _bd + ["label", "add", bead_id,
                        f"orphan-sweep:shielded-until:{_shield_until}", "-q"],
                 capture_output=True, text=True, timeout=15)
+            _shield_ok = (_r1.returncode == 0 and _r2.returncode == 0)
         except Exception:
             pass  # shield-stamp failure is non-fatal — the claim restore above already landed
+        # ga-114ll / ga-ogvyk (third-state audit): the comment/log below must say
+        # what actually happened, not what was attempted — a claimed-but-failed
+        # shield read back later as "protected" would be worse than no claim at
+        # all (the exact "comment promises more than the code delivers" class).
+        if _shield_ok:
+            _shield_note = (f"Stamped orphan-sweep:shielded-until:{_shield_until} (ga-114ll, "
+                             f"{ORPHAN_SWEEP_SELFHEAL_SHIELD_SECS}s) so orphan-sweep skips "
+                             f"this bead for a while instead of re-deriving liveness from "
+                             f"the same read that just missed it.")
+        else:
+            _shield_note = ("Shield stamp FAILED (label add error) — no extra protection "
+                             "beyond the claim restore itself; orphan-sweep.sh's own check "
+                             "can re-fail this exact bead on the next post-grace sweep.")
         try:
             subprocess.run(
                 _bd + ["comment", bead_id,
                        f"inflight-reclaim-guard self-heal (ga-seuh4/ga-a8t68): "
                        f"restored to assignee={stale_assignee!r}, status=in_progress "
                        f"after order:orphan-sweep wrongfully reset this claim while "
-                       f"the owning session was still live. Stamped "
-                       f"orphan-sweep:shielded-until:{_shield_until} (ga-114ll, "
-                       f"{ORPHAN_SWEEP_SELFHEAL_SHIELD_SECS}s) so orphan-sweep skips "
-                       f"this bead for a while instead of re-deriving liveness from "
-                       f"the same read that just missed it. This is a compensating "
-                       f"heal, not a prevention — orphan-sweep.sh's own check can "
-                       f"still fail the same way once the shield expires."],
+                       f"the owning session was still live. {_shield_note} This is a "
+                       f"compensating heal, not a prevention — orphan-sweep.sh's own "
+                       f"check can still fail the same way once the shield expires."],
                 capture_output=True, text=True, timeout=15)
         except Exception:
             pass  # comment failure is non-fatal
         emit(f"[INFLIGHT-RECLAIM] [SELF-HEALED] bead={bead_id} "
              f"restored assignee={stale_assignee!r} (order:orphan-sweep false-reset), "
-             f"shielded until {_shield_until}")
+             f"shielded={_shield_ok}" + (f" until {_shield_until}" if _shield_ok else ""))
     return healed
 
 
@@ -5424,6 +5435,37 @@ def _selftest():
                   and any(f"shielded-until:{_expected_shield_until}" in arg for arg in c)
                   for c in _sh_comment_calls),
               f"comment calls={_sh_comment_calls!r}")
+    finally:
+        subprocess.run = _orig_run_sh
+
+    # SH-1f (ga-114ll third-state audit): if the label-add calls themselves FAIL,
+    # the claim restore still counts as healed, but the comment must NOT claim a
+    # shield that never landed — "attempted" and "succeeded" are different facts.
+    _sh_comment_calls_f = []
+
+    def _stub_sh_heal_label_fails(cmd, **kw):
+        if cmd[:2] == ["bd", "list"]:
+            return _FakeGitResult(0, json.dumps([_sh_bead("ga-shtest1f", "dog-galive1")]))
+        if cmd[:2] == ["bd", "update"]:
+            return _FakeGitResult(0, "")
+        if cmd[:2] == ["bd", "label"]:
+            return _FakeGitResult(1, "")  # label add fails
+        if cmd[:2] == ["bd", "comment"]:
+            _sh_comment_calls_f.append(list(cmd))
+            return _FakeGitResult(0, "")
+        return _FakeGitResult(0, "")
+
+    subprocess.run = _stub_sh_heal_label_fails
+    try:
+        _healedf = heal_orphan_sweep_false_resets(_sh_live_sessions, T_sh)
+        check("SH-1f: still counts as healed even when the shield label-add fails",
+              _healedf == 1, f"healed={_healedf}")
+        check("SH-1f (ga-114ll): comment does NOT falsely claim a shield that failed to land",
+              not any("shielded-until:" in arg for c in _sh_comment_calls_f for arg in c),
+              f"comment calls={_sh_comment_calls_f!r}")
+        check("SH-1f (ga-114ll): comment instead reports the shield stamp failure honestly",
+              any("Shield stamp FAILED" in arg for c in _sh_comment_calls_f for arg in c),
+              f"comment calls={_sh_comment_calls_f!r}")
     finally:
         subprocess.run = _orig_run_sh
 
