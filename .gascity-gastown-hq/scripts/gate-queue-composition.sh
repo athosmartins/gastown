@@ -56,7 +56,14 @@ rig_path() {
 # array puro, sem nenhum campo dizendo que truncou. Resultado: uma fila com 60
 # markers seria reportada como 50, e a composição REAL/FANTASMA sairia errada sem
 # nenhum sinal. Um diagnóstico que subconta em silêncio é pior que não ter.
-MARKERS=$(bd -C "$HQ" list --limit 0 -l type:quality-gate-marker --json 2>/dev/null)
+#
+# --include-infra é IGUALMENTE obrigatório, e por pouco esta ferramenta não
+# ensinou a cidade inteira a errar. O bd 1.1.0 classifica bead `--ephemeral` como
+# INFRA e o OMITE de `bd list` por padrão; markers de gate nasciam ephemeral.
+# Sem a flag, este script imprimia "total de markers: 0" com 7 markers na fila e
+# o gate parado — e ele é o script que a doutrina manda rodar ANTES de teorizar.
+# Um medidor cego não é neutro: ele é uma teoria errada com cara de medição.
+MARKERS=$(bd -C "$HQ" list --limit 0 --include-infra -l type:quality-gate-marker --json 2>/dev/null)
 if [ -z "$MARKERS" ] || ! printf '%s' "$MARKERS" | jq -e 'type=="array"' >/dev/null 2>&1; then
   echo "ERRO: não consegui ler os markers (bd falhou ou devolveu envelope de erro)." >&2
   echo "      Isto é UNKNOWN, não 'fila vazia' — não conclua nada a partir daqui." >&2
