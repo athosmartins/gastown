@@ -6628,7 +6628,43 @@ TASK
     # yields empty → we proceed (never block a dispatch on a probe error).
     _cur_asg=$(timeout 10 bd -C "$STORY_BEAD_CITY" show "$STORY_ID" --json 2>/dev/null \
       | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
-    if [ -n "$_cur_asg" ] && [ "$_cur_asg" != "$_SLING_TARGET" ]; then
+    # ── ga-jzye0: este gate contradizia o filtro a montante e PAROU A CIDADE ────
+    # O _filter_candidates (ga-46wq5) já readmite bead cujo assignee NÃO é dono
+    # ativo, logando "tem assignee 'X' que NÃO é dono ativo (closed/asleep/
+    # idle>${PILOT_ASSIGNEE_IDLE_MINUTES}min) — readmitido à fila de despacho".
+    # Este gate então recusava despachar EXATAMENTE por aquele assignee, sem
+    # aplicar o mesmo teste. Um guarda dizia "pode, o dono sumiu"; o outro dizia
+    # "não pode, tem dono".
+    #
+    # POR QUE ISSO PARA A CIDADE INTEIRA (medido 07/08 15:1x, varredura real): o
+    # slot do pool é consumido ANTES deste gate rodar, então cada contradição
+    # destas queima um slot sem despachar nada. Foram 4 seguidas — wa-2vtjo,
+    # wa-14w79, wa-g6aaw, wa-3li7x, atribuídos a mila-wa/batista-wa (ociosos
+    # >180min, sessão viva) — queimando wa-worker-1..4 em sequência. Da 5ª escolha
+    # em diante toda varredura terminava em "all crew busy/used ... busy=[none]
+    # used=[todos]" e "dispatched=0 with free slots". Zero builders vivos e o gate
+    # sem receber nada. O gate estava BEM; faltava trabalho CHEGANDO nele.
+    #
+    # A correção é consultar o MESMO roster: só bloqueia se o assignee atual for
+    # dono ATIVO. FAIL-SAFE deliberado — se o roster não for confiável
+    # (_ROSTER_OK_FOR_FILTER != 1, p.ex. a consulta de sessões falhou), mantém o
+    # bloqueio antigo. Afrouxar só quando se SABE que o dono está inativo; "não
+    # sei" tem que continuar significando "não mexe", senão volta a regressão
+    # wa-6m6h (dois crews no mesmo bead), que é o motivo deste gate existir.
+    # Usa o predicado que JÁ existe (_session_is_active_owner) em vez de
+    # reimplementar a consulta ao roster: se os dois divergirem um dia, volta
+    # exatamente a contradição que este conserto elimina. O helper trata o caso
+    # "idle desconhecido" como ATIVO de propósito (worker -adhoc- recém-nascido
+    # que ainda não populou last_active), o que aqui é a direção segura — na
+    # dúvida, não despacha por cima.
+    _gatef_owner_inactive=0
+    if [ "${_ROSTER_OK_FOR_FILTER:-0}" = "1" ] && [ -n "$_cur_asg" ]; then
+      _session_is_active_owner "$_cur_asg" || _gatef_owner_inactive=1
+    fi
+    if [ -n "$_cur_asg" ] && [ "$_cur_asg" != "$_SLING_TARGET" ] && [ "$_gatef_owner_inactive" = "1" ]; then
+      log "  gate-f (ga-jzye0): $STORY_ID consta atribuído a '$_cur_asg', que NÃO é dono ativo — mesmo teste que readmitiu este bead. Prosseguindo com o despacho em vez de queimar o slot do pool."
+    fi
+    if [ -n "$_cur_asg" ] && [ "$_cur_asg" != "$_SLING_TARGET" ] && [ "$_gatef_owner_inactive" != "1" ]; then
       warn "ga-mfeip gate-f: $STORY_ID already assigned to $_cur_asg — skipping dispatch to $_SLING_TARGET (dedup)."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
