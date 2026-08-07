@@ -112,3 +112,39 @@ nudge_dispatcher = "legacy"
 
 formula_v2 = true
 patrol_interval = "120s"
+
+# max_wakes_per_tick: 5 -> 2 (ga-nawd3, 2026-08-07). Root cause: the reconciler's
+# per-tick wake budget was uncapped enough (default 5) that a mass respawn (5
+# crew sessions all reset to open+unassigned within ~36s, after an operator
+# mistakenly killed 7 crew sessions) fit inside a SINGLE tick and fired fully
+# concurrently — 0s spacing between them (session_lifecycle logs: all 5 in
+# wave=0, each taking 22-25s wall time with an 8-12s Dolt-heavy
+# post_start_observe phase). Dolt entered ~8min of congestive collapse
+# (30-74s queries, 47 ESTABLISHED connections). This is not specific to that
+# one trigger — ANY cause of mass respawn (machine reboot, supervisor
+# restart, crash recovery) hits the same uncapped-concurrency path.
+#
+# This value caps how many sessions may start CONCURRENTLY within one tick;
+# excess candidates wait for the next tick rather than piling onto Dolt at
+# once. It does not add a sleep/stagger inside a tick (that requires an
+# engine-Go change — see the session_lifecycle_parallel.go spawn loop; out of
+# scope for a config-only fix, tracked separately).
+#
+# TRADE-OFF (honest, from config.go's own documented formula: wall time to
+# wake N sessions is roughly ceil(N/max_wakes_per_tick) * patrol_interval,
+# and patrol_interval is 120s in THIS city, not the code's 30s default):
+# a legitimate multi-session cold start (machine reboot, `gc start`) now
+# takes proportionally longer to fully wake the pool — e.g. 5 candidates
+# spread across ceil(5/2)=3 ticks instead of 1, up to ~4min (240s) for the
+# last straggler instead of ~0s. Chosen as a deliberate trade: bounding peak
+# concurrent Dolt-heavy boots to 2 (down from 5, a 60% cut) is worth a slower
+# worst-case cold start, given the alternative already observed once is an
+# ~8min citywide Dolt outage. NOT touching patrol_interval itself — poll/
+# patrol frequency is a separately-documented historical root cause of Dolt
+# CPU pressure in this city; shortening it to compensate would trade one
+# known risk for a re-run of a different one.
+#
+# Does NOT fix: true per-spawn stagger within a tick (Go engine change,
+# refused by dog doctrine — pool:refused:engine-rebuild-required). Follow-up
+# tracked for that half of the fix.
+max_wakes_per_tick = 2
