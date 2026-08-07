@@ -75,7 +75,7 @@ GIT_AUTHOR_DATE="@$NOW" GIT_COMMITTER_DATE="@$NOW" \
 echo "# stub" > "$CITY/scripts/daemon-e.py"
 git -C "$CITY" add scripts/daemon-e.py
 GIT_AUTHOR_DATE="@$NOW" GIT_COMMITTER_DATE="@$NOW" \
-    git -C "$CITY" commit -q -m "fix(ga-unknownxx): daemon-e fix"
+    git -C "$CITY" commit -q -m "fix(ga-unknwn): daemon-e fix"
 
 git -C "$CITY" update-ref refs/remotes/origin/main HEAD
 
@@ -149,7 +149,7 @@ if [ "$NOTIFY_COUNT" = "2" ]; then ok "exactly 2 notify calls (daemon-a + daemon
 echo "── 4. functional: bd comment/label only for the RESOLVABLE bead id (daemon-a), never for the unverified one (daemon-e) ──"
 if grep -q "^LABEL ga-realbead daemon-stale:detected$" "$BD_LOG"; then ok "label added to resolvable bead ga-realbead"; else bad "label missing for ga-realbead"; fi
 if grep -q "^COMMENT ga-realbead$" "$BD_LOG"; then ok "comment added to resolvable bead ga-realbead"; else bad "comment missing for ga-realbead"; fi
-if grep -q "ga-unknownxx" "$BD_LOG"; then bad "bd was mutated for ga-unknownxx -- an UNVERIFIED regex match must never be trusted (bd-cli-invalid-id-fuzzy-matches-unrelated-bead-silently)"; else ok "no bd mutation attempted for the unresolvable id ga-unknownxx"; fi
+if grep -q "ga-unknwn" "$BD_LOG"; then bad "bd was mutated for ga-unknwn -- an UNVERIFIED regex match must never be trusted (bd-cli-invalid-id-fuzzy-matches-unrelated-bead-silently)"; else ok "no bd mutation attempted for the unresolvable id ga-unknwn (bd show was invoked and correctly rejected it)"; fi
 
 echo "── 5. functional: dedup -- immediate re-run within the escalate window does NOT re-notify ──"
 run_guard >/dev/null
