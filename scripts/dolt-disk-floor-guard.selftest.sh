@@ -4,9 +4,9 @@
 # detection, and cooldown + worsening-bypass notify gating.
 #
 # Hermetic: sources the script as a LIBRARY (DOLT_DISK_FLOOR_GUARD_LIB=1) so main()
-# never runs, points the log at a throwaway path. Never calls `gc dolt cleanup`,
-# `gc mail send`, or `notify`; nothing is deleted, nothing is sent, nothing in
-# Dolt's data dir is touched.
+# never runs, points the log at a throwaway path. Never calls `gc dolt-cleanup`,
+# `gc mail send`, `notify`, or the real scratchpad-reaper.sh; nothing is deleted,
+# nothing is sent, nothing in Dolt's data dir or /private/tmp is touched.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,6 +67,191 @@ _should_notify 1000 1100 3600 8 5  && bad "should_notify: within cooldown, impro
 _should_notify 1000 4601 3600 8 8  && ok "should_notify: cooldown elapsed, stable avail → notify (repeat allowed)" || bad "should_notify: elapsed cooldown should notify regardless of trend"
 _should_notify "" 1100 3600 8 ""   && ok "should_notify: never notified before → notify (fail-open)"               || bad "should_notify: first-ever call should notify"
 
+# ── _sustain_confirmed: CRITICAL-mail debounce gate (ga-q4cqr) — the
+#    boundary is >= (inclusive), and a corrupt/non-numeric pending count
+#    fails CLOSED (never confirmed), the opposite direction from
+#    _cooldown_elapsed's fail-open — see the function's own comment for why.
+_sustain_confirmed 2 2   && ok "sustain_confirmed: pending==threshold → confirmed (boundary inclusive)" || bad "sustain_confirmed: 2>=2 should confirm"
+_sustain_confirmed 3 2   && ok "sustain_confirmed: pending>threshold → confirmed"                        || bad "sustain_confirmed: 3>=2 should confirm"
+_sustain_confirmed 1 2   && bad "sustain_confirmed: pending<threshold should NOT confirm"                || ok "sustain_confirmed: 1<2 → not yet confirmed"
+_sustain_confirmed 0 2   && bad "sustain_confirmed: pending=0 should NOT confirm"                        || ok "sustain_confirmed: 0<2 → not yet confirmed"
+_sustain_confirmed "" 2  && bad "sustain_confirmed: empty pending should fail CLOSED, not confirm"       || ok "sustain_confirmed: empty pending → fails closed (never confirmed)"
+_sustain_confirmed abc 2 && bad "sustain_confirmed: non-numeric pending should fail CLOSED"              || ok "sustain_confirmed: non-numeric pending → fails closed"
+_sustain_confirmed 1 1   && ok "sustain_confirmed: threshold=1 (sustain disabled/immediate) → confirmed on 1st sample" || bad "sustain_confirmed: 1>=1 should confirm"
+
+echo ""
+echo "=== _reap_dead_scratch: production sentinel wiring (ga-h565g) ==="
+# _reap_dead_scratch is the REAL caller scratchpad-reaper.sh's own header
+# names as the one allowed to set SCRATCHPAD_REAPER_PROD=1 (ga-h565g) — this
+# proves it actually does, BEFORE _reap_dead_scratch gets stubbed out below
+# for the main() scenarios. Hermetic: CITY is a plain global (not readonly),
+# reassigned here to a disposable tmp dir containing a FAKE
+# scratchpad-reaper.sh that only records what env it received — never touches
+# the real scratchpad-reaper.sh, no real `gc session list`, no real deletion.
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/scratchpad-reaper.sh" <<EOF
+#!/bin/bash
+echo "PROD=\${SCRATCHPAD_REAPER_PROD:-unset}" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/scratchpad-reaper.sh"
+
+REAL_CITY="$CITY"
+CITY="$FAKE_CITY"
+_reap_dead_scratch
+CITY="$REAL_CITY"
+
+if [ -f "$CAPTURE_FILE" ] && grep -qx "PROD=1" "$CAPTURE_FILE"; then
+  ok "_reap_dead_scratch: sets SCRATCHPAD_REAPER_PROD=1 when invoking the real reaper (production opt-in wired)"
+else
+  bad "_reap_dead_scratch: did NOT set SCRATCHPAD_REAPER_PROD=1 — real launchd path would silently dry-run forever (got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing'))"
+fi
+rm -rf "$FAKE_CITY"
+
+echo ""
+echo "=== _reap_dead_scratch: CRITICAL-pressure plumbing (ga-rjhfz) ==="
+# scratchpad-reaper.sh's own size-escape gate (independently selftested)
+# only activates when it sees SCRATCHPAD_REAPER_PRESSURE=CRITICAL.
+# _reap_dead_scratch is the ONLY place that can set it — main() passes
+# was_critical (1 iff this cycle was CRITICAL at any point, pre- or
+# post-reclaim) as $1. Same hermetic fake-CITY/capture-file technique as the
+# PROD=1 wiring test above: never touches the real reaper.
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/scratchpad-reaper.sh" <<EOF
+#!/bin/bash
+echo "PRESSURE=\${SCRATCHPAD_REAPER_PRESSURE:-unset}" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/scratchpad-reaper.sh"
+
+REAL_CITY="$CITY"
+CITY="$FAKE_CITY"
+_reap_dead_scratch 1
+CITY="$REAL_CITY"
+if [ -f "$CAPTURE_FILE" ] && grep -qx "PRESSURE=CRITICAL" "$CAPTURE_FILE"; then
+  ok "_reap_dead_scratch(was_critical=1): sets SCRATCHPAD_REAPER_PRESSURE=CRITICAL (size-escape enabled)"
+else
+  bad "_reap_dead_scratch(was_critical=1): did NOT set SCRATCHPAD_REAPER_PRESSURE=CRITICAL (got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing'))"
+fi
+
+CITY="$FAKE_CITY"
+_reap_dead_scratch 0
+CITY="$REAL_CITY"
+if [ -f "$CAPTURE_FILE" ] && grep -qx "PRESSURE=unset" "$CAPTURE_FILE"; then
+  ok "_reap_dead_scratch(was_critical=0): leaves SCRATCHPAD_REAPER_PRESSURE unset (non-critical cycle, no escape)"
+else
+  bad "_reap_dead_scratch(was_critical=0): should NOT set SCRATCHPAD_REAPER_PRESSURE (got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing'))"
+fi
+
+CITY="$FAKE_CITY"
+_reap_dead_scratch   # no arg at all — must default the same as explicit 0 (backward compatible with the PROD=1 test above, which calls it bare)
+CITY="$REAL_CITY"
+if [ -f "$CAPTURE_FILE" ] && grep -qx "PRESSURE=unset" "$CAPTURE_FILE"; then
+  ok "_reap_dead_scratch(no arg): defaults was_critical to non-critical (backward compatible)"
+else
+  bad "_reap_dead_scratch(no arg): should default to no pressure escape (got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing'))"
+fi
+rm -rf "$FAKE_CITY"
+
+echo ""
+echo "=== _reap_dead_transcripts: production sentinel wiring (ga-lfj05) ==="
+# Same proof as _reap_dead_scratch above, for the sibling lever: transcript-
+# reaper.sh's own header names _reap_dead_transcripts as the ONLY allowed
+# setter of TRANSCRIPT_REAPER_PROD=1. Hermetic: CITY is a plain global (not
+# readonly), reassigned here to a disposable tmp dir containing a FAKE
+# transcript-reaper.sh that only records what env it received — never
+# touches the real transcript-reaper.sh, no real `gc session list`, no real
+# deletion.
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city2.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/transcript-reaper.sh" <<EOF
+#!/bin/bash
+echo "PROD=\${TRANSCRIPT_REAPER_PROD:-unset}" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/transcript-reaper.sh"
+
+REAL_CITY="$CITY"
+CITY="$FAKE_CITY"
+_reap_dead_transcripts
+CITY="$REAL_CITY"
+
+if [ -f "$CAPTURE_FILE" ] && grep -qx "PROD=1" "$CAPTURE_FILE"; then
+  ok "_reap_dead_transcripts: sets TRANSCRIPT_REAPER_PROD=1 when invoking the real reaper (production opt-in wired)"
+else
+  bad "_reap_dead_transcripts: did NOT set TRANSCRIPT_REAPER_PROD=1 — real launchd path would silently dry-run forever (got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing'))"
+fi
+rm -rf "$FAKE_CITY"
+
+echo ""
+echo "=== _reap_dead_transcripts: TIMEOUT and FAILURE must not log the same thing ==="
+# WHY: measured 2026-08-01 in the live guard log — 5 runs, 5 timeouts, ZERO
+# successes, each lasting exactly ~60s against the old `timeout 60`. Every one
+# logged the generic "transcript-reap FAILED or aborted (nonzero exit)", which
+# reads as "tried and could not free space" when the truth was "was killed
+# before it could try". A full pass measures ~39s on this host, and the
+# liveness call it makes first stretches 1.3s -> 10-20s exactly when Dolt is
+# warm — i.e. exactly when disk pressure triggers this path. Collapsing the two
+# outcomes hid a completely broken emergency disk-reclaim (root-class:error-vs-empty).
+FAKE_CITY_T="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city3.XXXXXX)"
+mkdir -p "$FAKE_CITY_T/scripts"
+REAL_CITY="$CITY"; REAL_LOG="$LOG"
+
+# (a) reaper that OUTLIVES the bound -> must say TIMED OUT, not FAILED
+cat > "$FAKE_CITY_T/scripts/transcript-reaper.sh" <<'EOF'
+#!/bin/bash
+sleep 5
+exit 0
+EOF
+chmod +x "$FAKE_CITY_T/scripts/transcript-reaper.sh"
+LOG="$FAKE_CITY_T/timeout.log"; : > "$LOG"
+CITY="$FAKE_CITY_T"; TRANSCRIPT_REAP_TIMEOUT_SECS=1 _reap_dead_transcripts; CITY="$REAL_CITY"
+if grep -q "TIMED OUT" "$LOG" 2>/dev/null; then
+  ok "_reap_dead_transcripts: a run killed by the bound logs TIMED OUT (reclaim did not complete)"
+else
+  bad "_reap_dead_transcripts: bound-kill did NOT log TIMED OUT — got: $(tr '\n' ';' < "$LOG" | cut -c1-140)"
+fi
+if grep -qE "FAILED after" "$LOG" 2>/dev/null; then
+  bad "_reap_dead_transcripts: a TIMEOUT was also reported as FAILED — the two are still conflated"
+else
+  ok "_reap_dead_transcripts: a TIMEOUT is not also reported as a genuine failure"
+fi
+
+# (b) reaper that exits nonzero QUICKLY -> must say FAILED, not TIMED OUT
+cat > "$FAKE_CITY_T/scripts/transcript-reaper.sh" <<'EOF'
+#!/bin/bash
+exit 3
+EOF
+chmod +x "$FAKE_CITY_T/scripts/transcript-reaper.sh"
+LOG="$FAKE_CITY_T/failed.log"; : > "$LOG"
+CITY="$FAKE_CITY_T"; TRANSCRIPT_REAP_TIMEOUT_SECS=30 _reap_dead_transcripts; CITY="$REAL_CITY"
+if grep -qE "FAILED after" "$LOG" 2>/dev/null && ! grep -q "TIMED OUT" "$LOG" 2>/dev/null; then
+  ok "_reap_dead_transcripts: a genuine nonzero exit logs FAILED (not TIMED OUT) — no blind spot introduced"
+else
+  bad "_reap_dead_transcripts: genuine failure misreported — got: $(tr '\n' ';' < "$LOG" | cut -c1-140)"
+fi
+
+# (c) the real default bound must cover the measured ~39s pass with margin
+LOG="$FAKE_CITY_T/default.log"; : > "$LOG"
+cat > "$FAKE_CITY_T/scripts/transcript-reaper.sh" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+chmod +x "$FAKE_CITY_T/scripts/transcript-reaper.sh"
+CITY="$FAKE_CITY_T"; unset TRANSCRIPT_REAP_TIMEOUT_SECS; _reap_dead_transcripts; CITY="$REAL_CITY"
+if grep -q "bound=300s" "$LOG" 2>/dev/null; then
+  ok "_reap_dead_transcripts: default bound is 300s — covers the measured ~39s pass even when Dolt is warm"
+else
+  bad "_reap_dead_transcripts: default bound is not 300s — got: $(tr '\n' ';' < "$LOG" | cut -c1-140)"
+fi
+LOG="$REAL_LOG"
+rm -rf "$FAKE_CITY_T"
+
 echo ""
 echo "=== main(): CRITICAL-latch across reclaim reclassification (gate-fix-1: GATE-FEEDBACK gate_run=ga-wisp-9b4hnh) ==="
 # The pure-function tests above prove _should_notify is correct in ISOLATION.
@@ -75,10 +260,10 @@ echo "=== main(): CRITICAL-latch across reclaim reclassification (gate-fix-1: GA
 # that alone to decide the CRITICAL-only "always notify, mail Mayor" path —
 # so a reclaim that recovered avail lost all memory that the cycle was ever
 # CRITICAL. These tests call main() directly (still library-sourced, so it
-# doesn't auto-run) with _avail_gb/_safe_reclaim/NOTIFY/GC stubbed — no real
-# df dependency, no real reclaim, no real notification or mail sent, and the
-# state files are redirected to a throwaway tmp dir (never touches the real
-# .gc/logs state).
+# doesn't auto-run) with _avail_gb/_safe_reclaim/_reap_dead_scratch/NOTIFY/GC
+# stubbed — no real df dependency, no real reclaim, no real scratchpad reap, no
+# real notification or mail sent, and the state files are redirected to a
+# throwaway tmp dir (never touches the real .gc/logs state).
 
 STATE_TMP="/tmp/dolt-disk-floor-guard-selftest-state-$$"
 mkdir -p "$STATE_TMP"
@@ -86,6 +271,15 @@ mkdir -p "$STATE_TMP"
 STATE_DIR="$STATE_TMP"
 STATE_EPOCH_FILE="$STATE_TMP/.last-notify"
 STATE_AVAIL_FILE="$STATE_TMP/.last-notify-avail-gb"
+# ga-q4cqr: MUST be redirected exactly like the two state files above — it was
+# evaluated at SOURCE time against the real $CITY/.gc/logs (before this
+# override runs), and _read_critical_sustain/_write_critical_sustain reference
+# the variable by name at call time, so without this line every scenario below
+# would read/write the REAL production sustain-count file instead of this
+# disposable one (caught live: a first draft of this suite leaked a stray
+# `.dolt-disk-floor-guard.critical-sustain-count` file into the real
+# $CITY/.gc/logs before this redirect was added).
+STATE_CRITICAL_SUSTAIN_FILE="$STATE_TMP/.critical-sustain-count"
 
 # Canned avail-GB readings: main() calls _avail_gb exactly twice per cycle
 # (pre-reclaim, then post-reclaim), both via `$(...)` command substitution —
@@ -105,10 +299,29 @@ _avail_gb() {
   mv "$AVAIL_QUEUE_FILE.tmp" "$AVAIL_QUEUE_FILE"
   echo "$v"
 }
-# _safe_reclaim's own mechanics (gc dolt cleanup --force, health probe) are
+# _safe_reclaim's own mechanics (gc dolt-cleanup --force, health probe) are
 # EXECUTION code out of scope for this file (see section banner above) —
 # stubbed as a no-op here too, same as every other main()-only side effect.
 _safe_reclaim() { :; }
+
+# _reap_dead_scratch is new (ga-02pnu): stubbed as a no-op for the SAME reason
+# _safe_reclaim is — it's EXECUTION code (shells out to scratchpad-reaper.sh,
+# which has its own independent selftest). REAP_CALLS proves main() actually
+# invokes it as part of the reclaim step (integration wiring), without ever
+# running the real reaper (no `gc session list`, no `rm -rf`, hermetic).
+# REAP_LAST_ARG (ga-rjhfz) captures the was_critical arg main() passes, so a
+# scenario below can prove the CRITICAL-latch value actually reaches this
+# call, not just that the call happened.
+REAP_CALLS=0
+REAP_LAST_ARG=""
+_reap_dead_scratch() { REAP_CALLS=$((REAP_CALLS+1)); REAP_LAST_ARG="${1:-}"; }
+
+# _reap_dead_transcripts is new (ga-t1ub9), same reasoning: EXECUTION code
+# (shells out to transcript-reaper.sh, which has its own independent unit +
+# integration selftest) stubbed as a no-op here so main()'s WIRING is what
+# gets proven, not the real reaper's file-deletion logic.
+REAP_TRANSCRIPT_CALLS=0
+_reap_dead_transcripts() { REAP_TRANSCRIPT_CALLS=$((REAP_TRANSCRIPT_CALLS+1)); }
 
 NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""
 record_notify() {
@@ -130,23 +343,68 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; GC_MAIL_CALLS=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; GC_MAIL_CALLS=0; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
 }
+# ga-q4cqr: seed/read the CRITICAL-mail sustain counter directly, so scenarios
+# can set up "already N cycles into a streak" without needing N real main()
+# calls, and can verify main() left the expected count behind afterward.
+seed_critical_sustain() {
+  if [ -n "$1" ]; then echo "$1" > "$STATE_CRITICAL_SUSTAIN_FILE"; else rm -f "$STATE_CRITICAL_SUSTAIN_FILE"; fi
+}
+read_critical_sustain_state() { [ -f "$STATE_CRITICAL_SUSTAIN_FILE" ] && cat "$STATE_CRITICAL_SUSTAIN_FILE" || echo ""; }
 
 # Scenario A — repro path (a) from the GATE-FEEDBACK: CRITICAL (2GB) fully
 # recovers to NONE (20GB) after reclaim. Pre-fix, main() hit the early return
 # "back above floor after reclaim — no notify needed" and NEITHER notify nor
 # mail-Mayor ever fired for a reading that was CRITICAL moments earlier.
-reset_capture; seed_state "" ""
+# ga-q4cqr: mail is now sustain-gated (default threshold 2) — a single
+# CRITICAL cycle notifies immediately (prio 5, unconditional per imp07) but
+# must NOT yet mail; it should leave a pending count of 1 behind for the next
+# cycle to potentially confirm. See Scenario A2 for the 2nd-cycle confirm.
+reset_capture; seed_state "" ""; seed_critical_sustain ""
 queue_avail 2 20
 main
-if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CALLS" = "1" ]; then
-  ok "main(): CRITICAL avail fully recovered by reclaim still notifies (prio 5) + mails Mayor"
+if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CALLS" = "0" ] && [ "$(read_critical_sustain_state)" = "1" ]; then
+  ok "main(): CRITICAL avail fully recovered by reclaim still notifies (prio 5); mail debounced (pending 1/2)"
 else
-  bad "main(): CRITICAL->NONE recovery lost the notify/mail (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS)"
+  bad "main(): CRITICAL->NONE recovery — notify/debounce wrong (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS pending=$(read_critical_sustain_state))"
+fi
+
+# Scenario A2 — ga-q4cqr sustain confirm: a SECOND consecutive CRITICAL cycle
+# (pending already 1 from a prior cycle) must confirm the streak and mail the
+# Mayor this time, while notify keeps firing unconditionally every cycle
+# regardless (same as before this bead — only mail is new/gated).
+reset_capture; seed_state "" ""; seed_critical_sustain 1
+queue_avail 2 20
+main
+if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CALLS" = "1" ] && [ "$(read_critical_sustain_state)" = "2" ]; then
+  ok "main(): 2nd consecutive CRITICAL cycle confirms sustain (2/2) — mails Mayor"
+else
+  bad "main(): 2nd consecutive CRITICAL cycle should confirm + mail (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS pending=$(read_critical_sustain_state))"
+fi
+
+# Scenario A3 — ga-q4cqr streak reset: a non-critical cycle between two
+# CRITICAL cycles must reset the sustain counter, so the second CRITICAL
+# cycle (pending resets to 1, not 3) does NOT prematurely mail. Reuses
+# Scenario D's readings (6 -> 20, fully resolved, non-critical) to perform
+# the reset, then a fresh CRITICAL cycle.
+reset_capture; seed_state "" ""; seed_critical_sustain 1
+queue_avail 6 20
+main
+if [ "$(read_critical_sustain_state)" != "0" ]; then
+  bad "main(): non-critical cycle should reset sustain count to 0, got '$(read_critical_sustain_state)'"
+else
+  reset_capture
+  queue_avail 2 20
+  main
+  if [ "$GC_MAIL_CALLS" = "0" ] && [ "$(read_critical_sustain_state)" = "1" ]; then
+    ok "main(): sustain streak correctly reset by an intervening non-critical cycle (next CRITICAL starts back at 1/2, does not prematurely mail)"
+  else
+    bad "main(): streak reset didn't take — next CRITICAL cycle should start at 1/2 (mail_calls=$GC_MAIL_CALLS pending=$(read_critical_sustain_state))"
+  fi
 fi
 
 # Scenario B — repro path (b), reviewer's exact numbers (WARN=8 CRIT=3
@@ -154,13 +412,19 @@ fi
 # (8GB), within cooldown and not "worsening" vs. a last-notified avail of
 # 8GB. Pre-fix, class was reclassified WARN post-reclaim and ordinary WARN
 # cooldown/worsening suppression swallowed the CRITICAL-only mail-Mayor alert.
+# ga-q4cqr: seeds sustain=1 explicitly (this cycle is the CONFIRMING 2nd) so
+# this scenario stays self-contained/order-independent and keeps proving its
+# original point — cooldown/worsening suppression must never swallow an
+# already-sustain-confirmed CRITICAL mail — rather than accidentally passing
+# on leftover state from whichever scenario happened to run before it.
 reset_capture
 past_epoch=$(( $(date +%s) - 600 ))
 seed_state "$past_epoch" 8
+seed_critical_sustain 1
 queue_avail 2 8
 main
 if [ "$NOTIFY_CALLS" = "1" ] && [ "$NOTIFY_LAST_PRIO" = "5" ] && [ "$GC_MAIL_CALLS" = "1" ]; then
-  ok "main(): CRITICAL avail partially recovered into WARN tier still bypasses cooldown + mails Mayor"
+  ok "main(): CRITICAL avail partially recovered into WARN tier still bypasses cooldown + mails Mayor (sustain already confirmed)"
 else
   bad "main(): CRITICAL->WARN partial recovery lost the always-notify/mail-Mayor guarantee (notify_calls=$NOTIFY_CALLS prio=$NOTIFY_LAST_PRIO mail_calls=$GC_MAIL_CALLS)"
 fi
@@ -188,6 +452,54 @@ if [ "$NOTIFY_CALLS" = "0" ] && [ "$GC_MAIL_CALLS" = "0" ]; then
   ok "main(): non-critical WARN fully resolved by reclaim stays silent (no regression)"
 else
   bad "main(): non-critical WARN->NONE early-return regressed (notify_calls=$NOTIFY_CALLS mail_calls=$GC_MAIL_CALLS)"
+fi
+
+echo ""
+echo "=== main(): scratchpad + transcript reap integration (ga-02pnu, ga-t1ub9) ==="
+# Scenario E — BOTH new reclaim levers must actually be wired into main()'s
+# reclaim step (called alongside _safe_reclaim, before the post-reclaim avail
+# re-read) on EVERY cycle that reaches the reclaim step at all — regardless of
+# whether the outcome ends up CRITICAL, WARN-notify, or WARN-suppressed. Reuses
+# scenario A's readings (CRITICAL -> recovers to NONE).
+reset_capture; seed_state "" ""
+queue_avail 2 20
+main
+if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ]; then
+  ok "main(): _reap_dead_scratch AND _reap_dead_transcripts each invoked exactly once alongside _safe_reclaim"
+else
+  bad "main(): expected both reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS"
+fi
+if [ "$REAP_LAST_ARG" = "1" ]; then
+  ok "main(): CRITICAL cycle (even after reclaim recovers it to NONE) passes was_critical=1 to _reap_dead_scratch (ga-rjhfz pressure plumbing)"
+else
+  bad "main(): expected _reap_dead_scratch to receive was_critical=1 on a CRITICAL cycle, got REAP_LAST_ARG='$REAP_LAST_ARG'"
+fi
+
+# Scenario E2 (ga-rjhfz) — a cycle that is WARN, never CRITICAL, must pass
+# was_critical=0 — the size-escape must not activate on ordinary WARN
+# pressure. Reuses scenario C's readings (WARN both before and after).
+reset_capture; seed_state "" ""
+past_epoch=$(( $(date +%s) - 100 ))
+seed_state "$past_epoch" 6
+queue_avail 6 6
+main
+if [ "$REAP_LAST_ARG" = "0" ]; then
+  ok "main(): non-critical WARN cycle passes was_critical=0 to _reap_dead_scratch (no size-escape)"
+else
+  bad "main(): expected _reap_dead_scratch to receive was_critical=0 on a WARN-only cycle, got REAP_LAST_ARG='$REAP_LAST_ARG'"
+fi
+
+# Scenario F — a cycle that never reaches the floor at all (avail comfortably
+# above warn on the FIRST read) must take the top early-return and never touch
+# ANY reclaim lever — proves neither reap call got hoisted above the floor
+# check.
+reset_capture; seed_state "" ""
+queue_avail 20
+main
+if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ]; then
+  ok "main(): avail above floor on first read never invokes either dead-session reaper"
+else
+  bad "main(): expected zero reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS"
 fi
 
 rm -rf "$STATE_TMP"
