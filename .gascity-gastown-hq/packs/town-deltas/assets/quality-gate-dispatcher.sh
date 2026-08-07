@@ -241,6 +241,44 @@ if [ -n "${GATE_DISPATCHER_LIB_ONLY:-}" ] && [ -z "${GATE_NUDGE_TIMEOUT_FORCE:-}
   GATE_NUDGE_TIMEOUT=""
 fi
 
+# ── gate_nudge(): não depender SÓ do exit code do `gc session nudge` (ga-vne2) ──
+#
+# ESTADO MEDIDO HOJE (07/08), e é diferente do que ga-vne2 descreve:
+#     $ OUT=$(gc --city . session nudge nao-existe-xyz "teste" 2>&1); echo $?
+#     1                      ← sai 1, corretamente
+#     gc session nudge: session not found: "nao-existe-xyz"
+# Ou seja: no binário atual o exit code NÃO mente, e os `if ... nudge` deste
+# arquivo não estavam quebrados. O ga-vne2 (17/07) afirma exit 0; não reproduz
+# aqui — ou foi consertado, ou a medição original tinha o mesmo artefato que a
+# minha primeira teve (`$?` depois de um pipe mede o ÚLTIMO comando do pipe, não
+# o `gc`; `cmd | head` devolve o status do `head`). Registrado no bead.
+#
+# ENTÃO POR QUE ESTA FUNÇÃO EXISTE: porque o modo de falha que o bead descreve é
+# real e já aconteceu, e o custo de se proteger dele é ~15 linhas. Se o exit code
+# regredir para 0, o `case` abaixo ainda pega pelo texto e o fallback de submit
+# continua alcançável. Sem ela, uma regressão nesse exit code volta a transformar
+# o `elif`/`else` destes call sites em código morto, silenciosamente.
+#
+# Uso: gate_nudge <sid> <mensagem> [flags...]   → 0 entregue, != 0 não entregue.
+# A saída do gc é repassada pro stderr para não engolir diagnóstico.
+gate_nudge() {
+  local _out _rc
+  _out=$($GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session nudge "$@" 2>&1)
+  _rc=$?
+  [ -n "$_out" ] && printf '%s\n' "$_out" >&2
+  [ "$_rc" -ne 0 ] && return "$_rc"
+  # ⚠️ Casar por SUBSTRING, não por linha inteira: o gc prefixa avisos
+  # (native_store_unavailable etc.) na mesma saída, então uma âncora ^...$ não
+  # casaria. E casar o texto de sucesso ("nudged"/"queued") NÃO serve como prova
+  # ao contrário — foi assim que o próprio bead ga-vne2 quase se enganou: um
+  # filtro por texto de sucesso volta vazio tanto quando falha quanto quando o
+  # formato muda, e vazio vira "entregue" na leitura apressada.
+  case "$_out" in
+    *"session not found"*|*"no such session"*|*"unknown session"*) return 3 ;;
+  esac
+  return 0
+}
+
 # ── ga-dupnv (bug 1): one branch = one authoritative gate-run. SIBLING_RUN_STALE
 # is the age (minutes) past which a still-running gate-run for a branch is judged
 # ABANDONED (its dispatcher died mid-run and never drove it terminal) and may be
@@ -600,7 +638,11 @@ respawn_reviewer_slot() {
   # an empty result here is the conservative case (no false ACK), still backed by
   # the verdict-progressed strong check.
   REVIEWER_PEEK_BASELINE[$_idx]=$(gc --city "$GC_CITY" session peek "$_new_sid" --lines 40 2>/dev/null | cksum 2>/dev/null | awk '{print $1}' || echo "")
-  if $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session nudge "$_new_sid" "${REVIEW_TASKS[$_idx]}" --delivery queue 2>/dev/null; then
+  # gate_nudge em vez do `gc` direto: mesma semântica hoje (o gc sai 1 quando a
+  # sessão não existe — medido 07/08), mas imune a esse exit code regredir. Aqui
+  # o fallback importa: numa re-convocação a sessão nova pode não ter subido, e
+  # um `if` que nunca falha logaria "re-queued" sem nada entregue.
+  if gate_nudge "$_new_sid" "${REVIEW_TASKS[$_idx]}" --delivery queue 2>/dev/null; then
     log "  Re-convene: review task re-queued to fresh session ${_new_sid} (slot ${_idx}, verdict bead ${VERDICT_BEAD_IDS[$_idx]} reused)."
   elif $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session submit "$_new_sid" "${REVIEW_TASKS[$_idx]}" 2>/dev/null; then
     log "  Re-convene: review task re-submitted to fresh session ${_new_sid} (slot ${_idx})."
@@ -7809,7 +7851,11 @@ TASK
   # blocking wait on a never-idle reviewer would stall spawning reviewers 2&3 —
   # `queue` returns immediately. Do NOT log "delivered" here (it would lie on a
   # send the reviewer never consumed); Step 7b confirms a real ACK.
-  if $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session nudge "$SESSION_ID" "$REVIEW_TASK" --delivery queue 2>/dev/null; then
+  # gate_nudge (ga-vne2): entrega INICIAL da tarefa de revisão — é o call site
+  # onde um falso sucesso custa mais caro (gate-run que não faz nada, descoberto
+  # só no timeout). Hoje o exit code do gc é honesto; o helper garante que o
+  # `elif`/`else` continue alcançável mesmo se deixar de ser.
+  if gate_nudge "$SESSION_ID" "$REVIEW_TASK" --delivery queue 2>/dev/null; then
     log "  Review task QUEUED to session $SESSION_ID (reviewer $i) — ACK pending (Step 7b)"
   elif $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session submit "$SESSION_ID" "$REVIEW_TASK" 2>/dev/null; then
     log "  Review task SUBMITTED to session $SESSION_ID (reviewer $i) — ACK pending (Step 7b)"
@@ -7972,7 +8018,13 @@ for _ack_attempt in $(seq 1 "$ACK_MAX_RETRIES"); do
         else
           warn "  No ACK from reviewer $((k+1)) (attempt $_ack_attempt/$ACK_MAX_RETRIES) — re-queuing task session=$_sid"
         fi
-        $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session nudge "$_sid" "${REVIEW_TASKS[$k]}" --delivery queue 2>/dev/null || true
+        # warn no lugar de `|| true` (ga-vne2): a re-fila é best-effort de
+        # propósito (o laço de ACK continua), mas engolir o DIAGNÓSTICO junto não
+        # é. Se a sessão sumiu, insistir nela é inútil e o log precisa dizer isso
+        # — senão o operador vê N tentativas idênticas sem nenhuma pista de que o
+        # destino não existe mais.
+        gate_nudge "$_sid" "${REVIEW_TASKS[$k]}" --delivery queue 2>/dev/null \
+          || warn "  Re-fila para $_sid NÃO entregue (sessão inexistente ou nudge falhou) — reviewer $((k+1))"
       fi
     fi
   done
