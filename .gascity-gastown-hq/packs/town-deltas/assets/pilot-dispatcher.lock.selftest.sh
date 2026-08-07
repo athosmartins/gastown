@@ -226,10 +226,18 @@ mkdir -p "$LOCK_DIR"
 echo "slow-but-alive-token" > "$LOCK_HB"
 touch -t "$(date -v-900S +%Y%m%d%H%M.%S)" "$LOCK_HB" 2>/dev/null || true
 LOGE1="$(run_dispatch)"     # no override — exercises the PRODUCTION default
+# Absence of "Recovered STALE" alone is not proof of correct backoff — a
+# crashed/non-running dispatcher would ALSO produce no such line, and would
+# otherwise pass this check right along with a genuinely-correct backoff
+# (the exact "couldn't know" collapsing into "verdict" shape the pre-gate
+# self-audit exists to catch). Require the POSITIVE backoff signal too, same
+# as Scenario B, so a broken script fails loudly instead of reading as green.
 if echo "$LOGE1" | grep -q "Recovered STALE"; then
   bad "REGRESSION: a 900s-old heartbeat was reclaimed under the production default — a routine slow sweep would get its lock stolen mid-work"
-else
+elif echo "$LOGE1" | grep -q "backing off"; then
   ok "a 900s-old heartbeat (slow-but-alive range) backs off, not reclaimed, under the production default"
+else
+  bad "neither 'Recovered STALE' nor 'backing off' logged — dispatcher did not run as expected (cannot confirm correct behavior, not just absence of the regression)"
 fi
 clear_lock
 
