@@ -133,6 +133,35 @@ try:
 finally:
     restore_run(orig)
 
+# ── Scenario 3b (self-audit, ga-jzye0): read-back returns an error envelope ──
+# Third-state check on THIS fix's own read-back: `bead.get("labels")` alone
+# can't tell "confirmed empty labels list" apart from "bd show returned an
+# error envelope with no labels key at all" — both look like `[]`/None to a
+# bare .get(). An error envelope must NOT be read as "label confirmed gone".
+print("Scenario 3b (ga-jzye0 self-audit): bd show returns an error envelope, "
+      "not a real bead -> never confirmed, not silently treated as removed")
+def fake_run_error_envelope(cmd, capture_output=True, text=True, timeout=15):
+    if len(cmd) >= 3 and cmd[1] == "label" and cmd[2] == "remove":
+        return FakeResult(0, "")
+    if len(cmd) >= 2 and cmd[1] == "show":
+        # No "labels" key at all -- an error envelope, not a bead object.
+        return FakeResult(0, json.dumps({"error": "no issues found matching the provided IDs"}))
+    raise AssertionError("unexpected cmd: %r" % (cmd,))
+
+orig = m.subprocess.run
+m.subprocess.run = fake_run_error_envelope
+try:
+    res = m._remove_label_verified(["bd"], "wa-zly4n", "story:in-flight", attempts=2)
+    if res is False:
+        ok("error envelope (no labels key) correctly NOT treated as confirmed-gone")
+    else:
+        bad("REGRESSION (ga-jzye0 self-audit): an error envelope with no labels key "
+            "was read as 'label confirmed absent' -> got %r, expected False. This is "
+            "the exact third-state collapse (can't-check == confirmed) the fix exists "
+            "to eliminate." % res)
+finally:
+    restore_run(orig)
+
 # ── Scenario 4: do_reclaim aborts before mutating further ────────────────
 print("Scenario 4 (ga-jzye0 integration): do_reclaim returns False and never "
       "calls assign/update when label removal can't be confirmed")

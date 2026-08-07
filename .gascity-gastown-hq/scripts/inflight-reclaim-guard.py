@@ -2088,9 +2088,18 @@ def _remove_label_verified(bd_prefix, bead_id, label, attempts=4, delay_secs=1.0
     it was already absent — the label-remove call is then simply skipped by
     the caller, which only invokes this when the label was in the last-known
     label set). Returns False if, after `attempts` tries, a read-back still
-    shows the label present or is itself unreadable — fail toward "could not
-    confirm", so a caller never proceeds to clear ownership on the strength
-    of an unverified label removal.
+    shows the label present, or the read-back cannot be trusted at all (bd
+    show failed, returned unparseable JSON, or returned something that isn't
+    a real bead object) — fail toward "could not confirm", so a caller never
+    proceeds to clear ownership on the strength of an unverified removal.
+
+    ga-jzye0 self-audit: an error envelope (bead not found, transient query
+    failure) is NOT a bead with an empty labels list — collapsing the two
+    would read "couldn't check" as "confirmed gone", the same third-state bug
+    this whole fix exists to close elsewhere. `bead.get("labels")` alone
+    can't tell the two apart (both yield `None`/missing -> `[]`), so the
+    shape is checked explicitly: only a dict that actually carries a
+    "labels" key counts as a real read-back.
     """
     for attempt in range(1, attempts + 1):
         try:
@@ -2099,16 +2108,21 @@ def _remove_label_verified(bd_prefix, bead_id, label, attempts=4, delay_secs=1.0
         except Exception as exc:
             print(f"[INFLIGHT-RECLAIM] warn: label remove {label} on {bead_id} "
                   f"attempt {attempt}/{attempts}: {exc}", flush=True)
+        current_labels = None
         try:
             r = subprocess.run(bd_prefix + ["show", bead_id, "--json"],
                                 capture_output=True, text=True, timeout=15)
+            if r.returncode != 0:
+                raise RuntimeError(f"bd show rc={r.returncode}: {(r.stderr or '').strip()[:200]}")
             data = json.loads(r.stdout)
             bead = data[0] if isinstance(data, list) else data
+            if not isinstance(bead, dict) or "labels" not in bead:
+                raise RuntimeError(f"bd show did not return a bead object with a labels "
+                                    f"field (got: {str(data)[:200]})")
             current_labels = bead.get("labels") or []
         except Exception as exc:
             print(f"[INFLIGHT-RECLAIM] warn: read-back verify {label} on {bead_id} "
                   f"attempt {attempt}/{attempts}: {exc}", flush=True)
-            current_labels = None
         if current_labels is not None and label not in current_labels:
             return True
         if attempt < attempts:
