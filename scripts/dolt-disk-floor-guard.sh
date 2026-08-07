@@ -18,23 +18,46 @@
 #
 #   WARN_GB (default 8)     — attempt the pre-sanctioned-safe reclaim
 #                             (`gc dolt-cleanup --force` — orphan test-DB SQL DROP,
-#                             documented safe while Dolt is up), PLUS two more
+#                             documented safe while Dolt is up), PLUS three more
 #                             levers — reaping dead-session scratchpads under
 #                             /private/tmp (see _reap_dead_scratch, ga-hjcxy/
 #                             ga-02pnu: a single dead session's 1GB scratchpad
 #                             caused a CRITICAL incident that this follow-up
 #                             fixes — dolt-cleanup alone never touched that class
-#                             of file) and dead-session transcripts under
+#                             of file), dead-session transcripts under
 #                             ~/.claude/projects (see _reap_dead_transcripts,
 #                             ga-t1ub9: 1.4GB/1232 files accumulated with no
 #                             reaper at all — a disjoint leak class from
-#                             scratch) — then rate-limited notify. Cooldown is
-#                             bypassed if avail is WORSENING since the last notify
-#                             (mirrors the exact fix ga-vs55 furo #2 added to
+#                             scratch), and capping known unrotated app logs
+#                             under /private/tmp and ~/shared/logs (see
+#                             _reap_growing_logs, ga-dnc2m: ~4G across six
+#                             never-rotated logs on the SAME APFS container as
+#                             Dolt's own data-dir competed directly for this
+#                             guard's floor, and none of the other three
+#                             levers touch that file class — the guard used to
+#                             log "reclaim OK — avail 6GB -> 6GB" through an
+#                             entire log-driven CRITICAL dip, a reported
+#                             success over a complete non-effect) — then
+#                             rate-limited notify. Cooldown is bypassed if
+#                             avail is WORSENING since the last notify (mirrors
+#                             the exact fix ga-vs55 furo #2 added to
 #                             disk-pressure-monitor.sh's dpm_should_notify — a
 #                             cooldown blind to trend is what let the city monitor
 #                             stay silent 28min before Dolt died; must not regress
 #                             that lesson onto this guard).
+#
+#                             UNLIKE the other three levers, _reap_growing_logs
+#                             runs on EVERY cycle regardless of floor class
+#                             (see its call at the top of main(), before the
+#                             avail/class computation) — ga-dnc2m's own
+#                             acceptance criteria ask for these logs to always
+#                             carry a cap, not merely to be capped reactively
+#                             once Dolt is already under pressure. It is still
+#                             gated by ENABLED (see Kill switch below), and
+#                             being cheap (a handful of `stat` calls; a
+#                             copytruncate only when a file is actually over
+#                             its threshold) costs nothing on the common no-op
+#                             cycle.
 #
 #   CRITICAL_GB (default 3) — same reclaim attempts + notify ALWAYS (cooldown
 #                             bypassed unconditionally — this is the last rung
@@ -65,12 +88,12 @@
 # sign-off rather than being silently bundled into a no-human-review small-lane
 # merge. Filed as a separate follow-up bead (see this commit's gate-done note).
 #
-# Kill switch: DOLT_DISK_FLOOR_GUARD_ENABLED=0 → skip ALL THREE reclaim actions
-# (dolt-cleanup, the scratchpad reaper, AND the transcript reaper) only.
-# Notification is NEVER gated by this switch (imp07 CALL INVARIANT: alerting
-# is the lowest-blast-radius action here and the one furo #2 just fixed for
-# being wrongly suppressible — don't reintroduce that failure mode one guard
-# over).
+# Kill switch: DOLT_DISK_FLOOR_GUARD_ENABLED=0 → skip ALL FOUR reclaim actions
+# (dolt-cleanup, the scratchpad reaper, the transcript reaper, AND the log
+# reaper) only. Notification is NEVER gated by this switch (imp07 CALL
+# INVARIANT: alerting is the lowest-blast-radius action here and the one furo
+# #2 just fixed for being wrongly suppressible — don't reintroduce that
+# failure mode one guard over).
 #
 # TEST (no Dolt, no deletions, no real disk mutation, no mail/notify sent):
 #   bash scripts/dolt-disk-floor-guard.selftest.sh
@@ -391,8 +414,45 @@ _reap_dead_transcripts() {
   fi
 }
 
+# _reap_growing_logs — fourth reclaim lever, alongside _safe_reclaim,
+# _reap_dead_scratch, and _reap_dead_transcripts (ga-dnc2m): known app logs
+# under /private/tmp and ~/shared/logs that nothing ever rotated — a distinct
+# leak class from the other three (none of them look at app-log files at
+# all). Delegates to the standalone, independently-selftested log-reaper.sh
+# so its size-cap logic is unit-tested in isolation rather than inlined here
+# — same pattern as the scratch/transcript levers. Cheap and bounded by
+# timeout so it can safely run on every cycle (see the UNLIKE note in this
+# file's own header): a handful of `stat` calls, with a `cp`+truncate only
+# for a file that is actually over threshold.
+#
+# LOG_REAPER_PROD=1 (same ga-h565g pattern as the other two reapers): this
+# function IS the real, launchd-driven caller log-reaper.sh's own
+# production-sentinel guard is designed to trust — the ONLY place that
+# should ever set this opt-in.
+_reap_growing_logs() {
+  if [ "$ENABLED" != "1" ]; then
+    log "log-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
+    return
+  fi
+  local reaper="$CITY/scripts/log-reaper.sh"
+  if [ ! -f "$reaper" ]; then
+    log "log-reap SKIP — $reaper not found"
+    return
+  fi
+  if LOG_REAPER_PROD=1 timeout 30 bash "$reaper" >> "$LOG" 2>&1; then
+    log "log-reap OK"
+  else
+    log "log-reap FAILED or aborted (nonzero exit) — see log lines above"
+  fi
+}
+
 main() {
   local avail class now
+
+  # UNLIKE the other three levers below, this runs UNCONDITIONALLY, before
+  # the avail/class computation — see this file's own header for why.
+  _reap_growing_logs
+
   avail="$(_avail_gb "$DOLTDIR")"
   now=$(date +%s)
   class="$(_floor_class "$avail" "$FLOOR_WARN_GB" "$FLOOR_CRITICAL_GB")"
