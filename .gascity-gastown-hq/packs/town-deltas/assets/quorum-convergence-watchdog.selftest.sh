@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # quorum-convergence-watchdog.selftest.sh — hermetic unit tests for
-# quorum-convergence-watchdog.py (ga-qw3p.3).
+# quorum-convergence-watchdog.py (ga-qw3p.3 + Path C trigger, ga-yesdn).
 #
 # Tests the Python logic via DRY_RUN=1 with environment stubs.
 # Passes: prints "OK N/N" at the end. Fails: non-zero exit.
@@ -217,6 +217,74 @@ print('imports OK')
 check       "DRY_RUN smoke: all assertions pass" "$smoke" "imports OK"
 check_absent "DRY_RUN smoke: no traceback"       "$smoke" "Traceback"
 check_absent "DRY_RUN smoke: no AssertionError"  "$smoke" "AssertionError"
+
+echo ""
+
+# ── 6. Trigger detection: Path C (ga-yesdn) ───────────────────────────────────
+# Exercises the REAL _detect_triggered_beads against a monkeypatched
+# _list_beads — proves the actual regex/threshold/exclusion logic, not a
+# reimplementation of it (a test that reimplements the logic it's checking
+# can't catch a regression in the real thing).
+echo "6. Trigger detection: Path C (ga-yesdn)"
+
+trigger_test=$(QUORUM_DRY_RUN=1 QUORUM_WATCHDOG_ENABLED=0 GC_CITY_PATH=/tmp \
+    python3 -c "
+import sys, os, types, json, time
+sys.path.insert(0, '$(dirname "$WATCHDOG")')
+mod = types.ModuleType('gc_ledger')
+mod.gc_ledger_append = lambda *a, **kw: None
+sys.modules['gc_ledger'] = mod
+import importlib.util
+spec = importlib.util.spec_from_file_location('qcw6', '$(realpath "$WATCHDOG")')
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+NOW = 2000000000.0  # fixed epoch — hermetic, no wall-clock dependency
+STALE = m.MAYOR_STALE_SEC + 60        # just past the 30min threshold
+FRESH = 60                            # 1min old — nowhere near stale
+
+def iso(secs_ago):
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(NOW - secs_ago))
+
+BEADS = {
+  'ga-c-fires':      {'id': 'ga-c-fires', 'updated_at': iso(STALE),
+                       'labels': ['story:in-flight', 'pilot:reclaim-count:2']},
+  'ga-c-below-thresh':{'id': 'ga-c-below-thresh', 'updated_at': iso(STALE),
+                       'labels': ['story:in-flight', 'pilot:reclaim-count:1']},
+  'ga-c-not-stale':  {'id': 'ga-c-not-stale', 'updated_at': iso(FRESH),
+                       'labels': ['story:in-flight', 'pilot:reclaim-count:3']},
+  'ga-c-human-park': {'id': 'ga-c-human-park', 'updated_at': iso(STALE),
+                       'labels': ['story:in-flight', 'pilot:reclaim-count:2', 'gate:needs-human']},
+  'ga-c-already-quorum': {'id': 'ga-c-already-quorum', 'updated_at': iso(STALE),
+                       'labels': ['story:in-flight', 'pilot:reclaim-count:2', 'quorum:convening']},
+  'ga-c-higher-count': {'id': 'ga-c-higher-count', 'updated_at': iso(STALE),
+                       'labels': ['story:in-flight', 'pilot:reclaim-count:5']},
+}
+
+def fake_list_beads(extra_args):
+    if 'escalation:mayor-escalated' in extra_args:
+        return []  # Path A: nothing ever sets this label (see docstring) — empty is correct.
+    if 'gate:needs-human:technical' in extra_args:
+        return []  # Path B: none of the fixtures carry this label.
+    if 'story:in-flight' in extra_args:
+        return list(BEADS.values())  # Path C's broader query.
+    return []
+
+m._list_beads = fake_list_beads
+
+triggered_ids = sorted(b['id'] for b in m._detect_triggered_beads(NOW))
+assert triggered_ids == ['ga-c-fires', 'ga-c-higher-count'], \
+    f'Path C detection mismatch: {triggered_ids}'
+print('PATH_C_OK:' + ','.join(triggered_ids))
+" 2>&1)
+
+check "Path C: fires on reclaim-count=2 + stale"        "$trigger_test" "ga-c-fires"
+check "Path C: fires on reclaim-count=5 (>=2 not ==2)"  "$trigger_test" "ga-c-higher-count"
+check_absent "Path C: does not fire below threshold (count=1)" "$trigger_test" "ga-c-below-thresh"
+check_absent "Path C: does not fire while fresh"              "$trigger_test" "ga-c-not-stale"
+check_absent "Path C: excludes human gate:needs-human park"   "$trigger_test" "ga-c-human-park"
+check_absent "Path C: excludes bead already in a quorum"      "$trigger_test" "ga-c-already-quorum"
+check_absent "Path C: no traceback"                           "$trigger_test" "Traceback"
 
 echo ""
 

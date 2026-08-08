@@ -8,15 +8,37 @@ concrete resolution. If 2-of-3 agree on the same action, it is executed
 autonomously and the convergence is recorded on the bead. If no majority emerges
 after VOTE_TIMEOUT_SEC (900s/15min), the bead is escalated via 🚨 to the human.
 
-TRIGGER (either signal sufficient):
+TRIGGER (any signal sufficient):
   A. Primary: bead has label 'escalation:mayor-escalated' AND
      metadata.escalation.mayor_escalated_at older than MAYOR_STALE_SEC.
-     (Set by ga-qw3p.2 — the Mayor-escalation layer.)
+     (Meant to be set by ga-qw3p.2 — the Mayor-escalation layer. ga-yesdn
+     verified 2026-08-08: nothing in the live codebase ever sets this label —
+     agent-stuck-escalation.sh's header documents the ga-qw3p.1-4 layering but
+     its body implements a different, narrower signal — an agent session
+     frozen on a permission prompt — not "Mayor hasn't dispatched/closed
+     anything." Path A is dead code today; kept in case a future ga-qw3p.2
+     lands and starts emitting the label.)
   B. Fallback: bead has 'gate:needs-human:technical' + 'story:in-flight' AND
      bead.updated_at older than MAYOR_STALE_SEC. (inflight-reclaim-guard's max-
      reclaim-cap escalation, which represents the same "crew stuck" condition;
-     used when ga-qw3p.2 is not yet deployed.)
-  Either signal requires the bead is NOT already in a quorum state (no quorum:*
+     used when ga-qw3p.2 is not yet deployed. ga-yesdn: this path additionally
+     inherits ga-vu718 — a live session that refuses twice never reaches
+     gate:needs-human because has_live_session short-circuits the guard's own
+     escalate check — so it under-fires for exactly the deterministic-pool-
+     identity beads that hit it most.)
+  C. ga-yesdn (2026-08-08): bead has 'story:in-flight' + a 'pilot:reclaim-
+     count:N' label with N>=2 ("crew travou: reclaim-guard: 2 reclaims sem
+     progresso de branch" — reclaim-guard's own RECLAIM_TTL hysteresis already
+     guarantees each reclaim confirms no recent branch commit, so reclaim-
+     count alone is sufficient evidence, no need to also reach a gate:* label)
+     AND bead.updated_at older than MAYOR_STALE_SEC ("Mayor travou: 30min sem
+     despachar/fechar"). This is ga-yesdn's own literal acceptance criterion,
+     read directly off reclaim-guard's label rather than through paths A/B's
+     escalation labels — neither of which reliably fires (see above), which is
+     the likely reason this watchdog has convened zero quorums in 6+ weeks of
+     live operation despite real Mayor-bottleneck days (state file confirmed
+     empty, launchd log confirmed startup-only, 2026-08-08).
+  Every signal requires the bead is NOT already in a quorum state (no quorum:*
   label) and does NOT already have gate:needs-human from a human decision.
 
 QUORUM PROTOCOL:
@@ -115,6 +137,11 @@ VALID_ACTION_RE = re.compile(
 
 # Pattern to parse a vote from a comment body.
 VOTE_LINE_RE = re.compile(r'^QUORUM_VOTE:\s*(.+)$', re.MULTILINE | re.IGNORECASE)
+
+# ga-yesdn: matches pilot:reclaim-count:N labels (inflight-reclaim-guard's own
+# per-reclaim counter) so Path C can read the numeric count without an exact-
+# match label query (bd's --label filter can't express ">= 2").
+RECLAIM_COUNT_RE = re.compile(r'^pilot:reclaim-count:(\d+)$')
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -299,6 +326,37 @@ def _detect_triggered_beads(now: float) -> list[dict]:
         # Fallback doesn't trigger if there's a HUMAN gate:needs-human decision
         # (the technical sub-label means it came from automation, not a human).
         # We trust that gate:needs-human:technical → automation-only park.
+        updated = _parse_iso(b.get("updated_at", ""))
+        if updated and (now - updated) >= MAYOR_STALE_SEC:
+            seen_ids.add(bid)
+            triggered.append(b)
+
+    # Path C (ga-yesdn): pilot:reclaim-count:N >= 2 + stale updated_at. Reads
+    # reclaim-guard's own counter directly instead of waiting for an
+    # escalation label — see the module docstring for why paths A and B
+    # under-fire. Broader query than A/B (by story:in-flight alone, not a
+    # specific label) so the human-park exclusion below is load-bearing here,
+    # not just documentation: A/B's bd-side queries already exclude plain
+    # gate:needs-human by construction (they filter FOR a different, more
+    # specific label); this path's query does not, so it must post-filter.
+    for b in _list_beads(["--label", "story:in-flight",
+                           "--status", "open", "--status", "in_progress"]):
+        bid = b.get("id", "")
+        if not bid or bid in seen_ids:
+            continue
+        labels = _bead_labels(b)
+        if any(l.startswith("quorum:") for l in labels):
+            continue
+        if any(l == "gate:needs-human" or l.startswith("gate:needs-human:")
+               for l in labels):
+            continue
+        reclaim_n = 0
+        for l in labels:
+            m = RECLAIM_COUNT_RE.match(l)
+            if m:
+                reclaim_n = max(reclaim_n, int(m.group(1)))
+        if reclaim_n < 2:
+            continue
         updated = _parse_iso(b.get("updated_at", ""))
         if updated and (now - updated) >= MAYOR_STALE_SEC:
             seen_ids.add(bid)
