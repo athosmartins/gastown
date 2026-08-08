@@ -1048,6 +1048,55 @@ else
   bad "veto check does not precede the real close call (veto=$VETO_LINE close=$CLOSE_LINE)"
 fi
 
+# ── 14b. Drift-guard: ga-02nlo — the SAME veto on the story `done` path ─────
+# wa-1jk89 (section 14 above) installed the pending-crew-branch veto on the CLOSE
+# path only. The story `done` path drives a bead to the very same durable terminal
+# (story:done + bd close) and had NO veto — so a bead whose sibling branch was still
+# unmerged got closed there instead, and the asymmetry between two paths reaching one
+# terminal WAS the bug.
+#
+# MEASURED (2026-08-07 13:14:13, live log):
+#   "DONE wa-uhbqb (whatsapp_automation) — branch-ancestor-of-origin-main
+#    [origin/crew/mila/wa-uhbqb ⊑ origin/main]"
+#   sweep summary: `closed=0 ... story_done=1`  ⟹ never entered the guarded path.
+# Sibling origin/crew/mila/wa-uhbqb-hero (1 commit, tests green, no gate marker) was
+# left out of main with its bead CLOSED — nothing left in the system to push it. Same
+# day, wa-ylzhs closed on crew/batista/wa-ylzhs and stranded crew/mila/wa-ylzhs-data
+# (2 commits): CROSS-AGENT, so not "someone superseded their own work".
+echo "── 14b. Drift-guard: ga-02nlo pending-crew-branch veto wired into the story done path ──"
+grep -qF 'S_PENDING=$(unmerged_crew_branches_for_bead "$RGITDIR" "$RCONTAINER" "$RDEFAULT" "$SID")' "$JANITOR" \
+  && ok "story done path computes the pending-crew-branch veto before finishing" \
+  || bad "story done path not computing the pending-crew-branch veto (ga-02nlo regression)"
+grep -qF 'if [ -n "$S_PENDING" ]; then' "$JANITOR" \
+  && ok "a non-empty story pending list is checked before the done/close call" \
+  || bad "story pending-branch check missing/loosened"
+# Ordering: the veto must precede the story close, exactly as section 14 asserts for
+# the close path. A veto computed AFTER the close would read as guarded and do nothing.
+S_VETO_LINE=$(grep -n 'S_PENDING=\$(unmerged_crew_branches_for_bead' "$JANITOR" | head -1 | cut -d: -f1)
+S_CLOSE_LINE=$(grep -n 'bd -C "\$RPATH" close "\$SID" -r "\$JCLOSE_MSG"' "$JANITOR" | head -1 | cut -d: -f1)
+if [ -n "$S_VETO_LINE" ] && [ -n "$S_CLOSE_LINE" ] && [ "$S_VETO_LINE" -lt "$S_CLOSE_LINE" ] 2>/dev/null; then
+  ok "story veto (line $S_VETO_LINE) precedes the story close call (line $S_CLOSE_LINE)"
+else
+  bad "story veto does not precede the story close (veto=$S_VETO_LINE close=$S_CLOSE_LINE)"
+fi
+# The veto must also gate the LABEL writes, not just the close: story:approved being
+# removed while the sibling is unmerged would strand the bead out of Aprovadas even if
+# the close itself were skipped.
+S_LABEL_LINE=$(grep -n 'bd -C "\$RPATH" label add "\$SID" "story:done"' "$JANITOR" | head -1 | cut -d: -f1)
+if [ -n "$S_VETO_LINE" ] && [ -n "$S_LABEL_LINE" ] && [ "$S_VETO_LINE" -lt "$S_LABEL_LINE" ] 2>/dev/null; then
+  ok "story veto (line $S_VETO_LINE) precedes the story:done label write (line $S_LABEL_LINE)"
+else
+  bad "story veto does not precede the label writes (veto=$S_VETO_LINE label=$S_LABEL_LINE)"
+fi
+# Both terminal paths must be guarded — count the call sites so adding a THIRD
+# terminal path without a veto trips this too.
+N_VETO_CALLS=$(grep -c '=\$(unmerged_crew_branches_for_bead' "$JANITOR")
+if [ "$N_VETO_CALLS" -ge 2 ] 2>/dev/null; then
+  ok "both terminal paths (close + story done) compute the veto ($N_VETO_CALLS call sites)"
+else
+  bad "only $N_VETO_CALLS veto call site(s) — a terminal path is unguarded again"
+fi
+
 # ── 15. Drift-guard: ga-f54ui delivery:partial not a merge signal ───────────
 # ga-k2wjn already proved (at gate-PASS time, quality-gate-dispatcher.sh) that a
 # delivery:partial bead's body enumerates multiple approved deliverables of which

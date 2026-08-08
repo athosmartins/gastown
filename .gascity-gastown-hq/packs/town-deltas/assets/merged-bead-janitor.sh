@@ -1362,6 +1362,44 @@ EOF
       [ -n "$S_COMMIT_EVID" ] && S_EVID="$S_EVID [$S_COMMIT_EVID]"
       [ -n "$S_BRANCH_EVID" ] && S_EVID="$S_EVID [$S_BRANCH_EVID]"
       [ "$S_SIGMK" = "1" ] && S_EVID="$S_EVID [terminal-marker]"
+
+      # ga-02nlo: the SAME pending-crew-branch veto the close path runs (search
+      # unmerged_crew_branches_for_bead above). wa-1jk89 installed it on `close` ONLY, and
+      # this `done` path — which also drives the bead to a durable terminal — kept closing
+      # with a sibling branch still unmerged. The asymmetry WAS the bug: two paths reach the
+      # same terminal, one guarded.
+      #
+      # MEASURED (2026-08-07 13:14:13): wa-uhbqb closed here —
+      #   "DONE wa-uhbqb ... [origin/crew/mila/wa-uhbqb ⊑ origin/main]"
+      # with the sweep summary reading `closed=0 ... story_done=1`, i.e. it never entered the
+      # guarded path at all. Its sibling origin/crew/mila/wa-uhbqb-hero (1 commit, tests
+      # green) was NOT in main and had no gate marker. Same day, wa-ylzhs closed on
+      # crew/batista/wa-ylzhs and stranded crew/mila/wa-ylzhs-data (2 commits) — CROSS-AGENT,
+      # so it cannot be explained away as someone superseding their own work.
+      #
+      # Closing the bead is what makes the loss PERMANENT and SILENT: with no open bead
+      # nothing in the system pushes the surviving branch, it appears in no queue, and the
+      # end state is indistinguishable from delivered.
+      S_PENDING=$(unmerged_crew_branches_for_bead "$RGITDIR" "$RCONTAINER" "$RDEFAULT" "$SID")
+      if [ -n "$S_PENDING" ]; then
+        S_PENDING_LIST=$(printf '%s' "$S_PENDING" | tr '\n' ',' | sed 's/,$//')
+        if [ "$DRY_RUN" = "1" ]; then
+          log "WOULD-KEEP-STORY $SID ($RNAME) — pending-crew-branch veto blocks done ($S_EVID would otherwise finish): $S_PENDING_LIST"
+        else
+          # Comment once per distinct pending set — mirrors the close path's ALREADY_FLAGGED
+          # idiom so a bead vetoed every sweep does not grow an unbounded comment thread.
+          S_ALREADY_FLAGGED=0
+          printf '%s' "$(comments_for_bead "$RPATH" "$SID")" | jq -e --arg pl "$S_PENDING_LIST" \
+            'any(.[]?; ((.text // "") | contains("pending-crew-branch")) and ((.text // "") | contains($pl)))' \
+            >/dev/null 2>&1 && S_ALREADY_FLAGGED=1
+          if [ "$S_ALREADY_FLAGGED" = "0" ]; then
+            bd -C "$RPATH" comment "$SID" "merged-bead-janitor ($SOURCE_BEAD): pending-crew-branch veto (ga-02nlo) — $S_EVID would otherwise drive this story to done, but branch(es) not yet ancestors of origin/$RDEFAULT: $S_PENDING_LIST. Merge or supersede them; the next sweep re-checks automatically." 2>/dev/null || true
+          fi
+          log "KEPT-STORY $SID ($RNAME) — pending-crew-branch veto blocks done ($S_EVID would otherwise finish): $S_PENDING_LIST"
+        fi
+        continue
+      fi
+
       if [ "$DRY_RUN" = "1" ]; then
         log "WOULD-DONE $SID ($RNAME) — $S_EVID — \"$STITLE\""
         log "WOULD-DONE: story:done added, story:approved removed, story:in-flight removed, bead closed (delivery close_reason → painel Done)"
