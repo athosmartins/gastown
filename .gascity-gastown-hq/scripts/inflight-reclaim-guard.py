@@ -1038,7 +1038,14 @@ def list_gate_active_source_beads():
     for gate_lbl in ("gate-status:ready", "gate-status:dispatching", "gate-status:queued", "gate-status:claimed"):
         try:
             result = subprocess.run(
+                # --include-infra (ga-vm20x, Mayor 07/08): gate markers are
+                # born --ephemeral, which bd 1.1.0 classifies as INFRA and
+                # hides from `bd list` by default. Without this flag every
+                # gate_lbl here reads as zero matches, so this reclaim guard
+                # could not see a bead's own ACTIVE gate marker and would
+                # reclaim it as if no gate work were in flight.
                 ["bd", "list",
+                 "--include-infra",
                  "--label", "type:quality-gate-marker",
                  "--label", gate_lbl,
                  "--json", "--limit", "0"],
@@ -3852,8 +3859,14 @@ def _selftest():
                     # ga-ap7od (a non-zero exit means the query FAILED; real `bd list`
                     # returns rc=0 + "[]" for zero matches, verified live).
                     return _R(0, "{not valid json")
-                # cmd shape: ["bd","list","--label","type:quality-gate-marker","--label",gate_lbl,"--json"]
-                gate_lbl = cmd[5] if len(cmd) > 5 else ""
+                # cmd shape: ["bd","list",...,"--label","type:quality-gate-marker","--label",gate_lbl,...]
+                # gate_lbl is the value after the SECOND "--label" flag (the first is
+                # always type:quality-gate-marker). Found by flag name, not fixed
+                # position (ga-vm20x): a hardcoded cmd[5] broke the instant
+                # list_gate_active_source_beads() gained a new flag ahead of --label
+                # (--include-infra at index 2) — searching by flag survives the next one.
+                _label_positions = [i for i, a in enumerate(cmd) if a == "--label"]
+                gate_lbl = cmd[_label_positions[1] + 1] if len(_label_positions) >= 2 and _label_positions[1] + 1 < len(cmd) else ""
                 markers = markers_by_gatelbl.get(gate_lbl, [])
                 payload = [{"id": f"marker-{i}", "labels": lbls} for i, lbls in enumerate(markers)]
                 return _R(0, json.dumps(payload))

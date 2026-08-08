@@ -1549,13 +1549,19 @@ _pilot_gate_congested() {
     printf '0'; return 0
   fi
   local _q _r _n
+  # --include-infra (ga-vm20x, Mayor 07/08): bd 1.1.0 hides --ephemeral beads
+  # (INFRA) from `bd list` by default, and gate markers/runs are born
+  # ephemeral. Without this flag both queries below undercount to zero,
+  # which — per the FAIL-OPEN contract this function documents — makes a
+  # genuinely congested gate look clear and lets Pilot dispatch INTO the
+  # backlog instead of holding.
   # Queued markers — work waiting at the gate (set by quality-gate-guard.sh).
-  _q=$(GC_CITY="$GC_CITY" timeout 15 bd -C "$GC_CITY" list --json \
+  _q=$(GC_CITY="$GC_CITY" timeout 15 bd -C "$GC_CITY" list --json --include-infra \
         -l type:quality-gate-marker -l gate-status:queued 2>/dev/null || echo "")
   _n=$(printf '%s' "$_q" | jq 'length' 2>/dev/null || echo "")
   if [ -n "$_n" ] && [ "$_n" -gt 0 ] 2>/dev/null; then printf '1'; return 0; fi
   # Runs in review — reviews currently in progress (gate-status:running).
-  _r=$(GC_CITY="$GC_CITY" timeout 15 bd -C "$GC_CITY" list --json \
+  _r=$(GC_CITY="$GC_CITY" timeout 15 bd -C "$GC_CITY" list --json --include-infra \
         -l type:quality-gate-run -l gate-status:running 2>/dev/null || echo "")
   _n=$(printf '%s' "$_r" | jq 'length' 2>/dev/null || echo "")
   if [ -n "$_n" ] && [ "$_n" -gt 0 ] 2>/dev/null; then printf '1'; return 0; fi
@@ -3878,7 +3884,13 @@ _beadid_has_active_gate_artifact() {
   fi
   command -v bd >/dev/null 2>&1 || return 1
   local _arts _hit
-  _arts=$(bd -C "$GC_CITY" list -l "source-bead:$_bid" --json 2>/dev/null \
+  # --include-infra (ga-vm20x, Mayor 07/08): gate markers/runs are born
+  # --ephemeral (INFRA), which bd 1.1.0 hides from `bd list` by default even
+  # when filtering by source-bead: rather than type:. Without this flag every
+  # source-bead here reads as having NO gate artifact, and this is a
+  # fail-open ALLOW check — the fix restores the actual safety check instead
+  # of a silent always-allow.
+  _arts=$(bd -C "$GC_CITY" list --include-infra -l "source-bead:$_bid" --json 2>/dev/null \
     | jq -c 'if type=="array" then . else [.] end' 2>/dev/null || echo "")
   [ -n "$_arts" ] || return 1
   # Count OPEN gate markers/runs for this source-bead carrying an ACTIVELY-processing
@@ -3921,7 +3933,11 @@ _beadid_has_open_gate_marker() {
   fi
   command -v bd >/dev/null 2>&1 || return 1
   local _arts _hit
-  _arts=$(bd -C "$GC_CITY" list -l "source-bead:$_bid" --json 2>/dev/null \
+  # --include-infra (ga-vm20x, Mayor 07/08): same gap as _beadid_has_active_gate_artifact
+  # above — gate markers are born --ephemeral (INFRA) and bd 1.1.0 hides them from
+  # `bd list` by default. Without this flag this fail-open ALLOW check never sees a
+  # real marker and always allows re-dispatch onto an already-gated bead.
+  _arts=$(bd -C "$GC_CITY" list --include-infra -l "source-bead:$_bid" --json 2>/dev/null \
     | jq -c 'if type=="array" then . else [.] end' 2>/dev/null || echo "")
   [ -n "$_arts" ] || return 1
   # Count OPEN quality-gate-markers for this source-bead, ANY gate-status. A closed

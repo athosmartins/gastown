@@ -164,7 +164,13 @@ _GATE_UNKNOWN_SENTINEL="__GATE_ACTIVE_UNKNOWN__"
 _gate_active_beads() {
   local lbl raw ids="" resolved
   for lbl in gate-status:ready gate-status:dispatching gate-status:queued gate-status:claimed; do
-    raw=$("$BD" -C "$LCJ_GATE_CITY" list --label type:quality-gate-marker --label "$lbl" --json -n 0 2>/dev/null)
+    # --include-infra (ga-vm20x, Mayor 07/08): gate markers are born
+    # --ephemeral, which bd 1.1.0 classifies INFRA and hides from `bd list`
+    # by default. This function's whole job is gate PROTECTION for R3/R7 —
+    # without this flag it would silently see zero active markers and let a
+    # gated bead's labels get mutated as if nothing were in flight, the
+    # exact false-reclaim class the comment above already warns about.
+    raw=$("$BD" -C "$LCJ_GATE_CITY" list --include-infra --label type:quality-gate-marker --label "$lbl" --json -n 0 2>/dev/null)
     if [ $? -ne 0 ]; then
       printf '%s' "$_GATE_UNKNOWN_SENTINEL"
       return 0
@@ -919,16 +925,20 @@ case "\$a" in
   *"list --status open,in_progress"*)            echo '[{"id":"sling-wa-06yog","title":"sling-wa-06yog","status":"open","issue_type":"convoy"},{"id":"sling-8yw4i","title":"fix wa-8yw4i.1","status":"open","issue_type":"convoy"},{"id":"sling-8yw4iX1","title":"fix wa-8yw4iX1","status":"open","issue_type":"convoy"},{"id":"dep-only-wrap","title":"tracks wa-06yog work","status":"open","issue_type":"convoy","dependencies":[{"depends_on_id":"wa-06yog","type":"tracks"}]},{"id":"real-tracker-bug","title":"investigate related issue","status":"open","issue_type":"bug","dependencies":[{"depends_on_id":"wa-06yog","type":"tracks"}]},{"id":"real-title-collision","title":"fix wa-06yog","status":"open","issue_type":"bug"}]' ;;
   # Gate-active fixtures (ga-ibz0): gm-r3/gm-sling under gate-status:ready, gm-r7 under
   # gate-status:queued. LCJ_TEST_GATE_FAIL toggles a simulated query failure (fail-safe test).
-  *"list --label type:quality-gate-marker --label gate-status:ready"*)
+  # Wildcarded between "list" and "--label" (ga-vm20x): a fixed-substring
+  # pattern (no gap) broke the instant _gate_active_beads() gained
+  # --include-infra ahead of --label — matching by flag-presence instead of
+  # exact adjacency survives the next flag insertion too.
+  *"list "*"--label type:quality-gate-marker --label gate-status:ready"*)
     [ "\${LCJ_TEST_GATE_FAIL:-0}" = "1" ] && exit 1
     echo '[{"id":"gm-r3","labels":["type:quality-gate-marker","gate-status:ready","source-bead:ip-gate-active"]},{"id":"gm-sling","labels":["type:quality-gate-marker","gate-status:ready","source-bead:sling-gate-src"]}]' ;;
-  *"list --label type:quality-gate-marker --label gate-status:dispatching"*)
+  *"list "*"--label type:quality-gate-marker --label gate-status:dispatching"*)
     [ "\${LCJ_TEST_GATE_FAIL:-0}" = "1" ] && exit 1
     echo '[]' ;;
-  *"list --label type:quality-gate-marker --label gate-status:queued"*)
+  *"list "*"--label type:quality-gate-marker --label gate-status:queued"*)
     [ "\${LCJ_TEST_GATE_FAIL:-0}" = "1" ] && exit 1
     echo '[{"id":"gm-r7","labels":["type:quality-gate-marker","gate-status:queued","source-bead:wa-gate-protect"]}]' ;;
-  *"list --label type:quality-gate-marker --label gate-status:claimed"*)
+  *"list "*"--label type:quality-gate-marker --label gate-status:claimed"*)
     [ "\${LCJ_TEST_GATE_FAIL:-0}" = "1" ] && exit 1
     echo '[]' ;;
   # Multi-id resolve of the directly-active source beads (ga-lrglm sling→original parity):

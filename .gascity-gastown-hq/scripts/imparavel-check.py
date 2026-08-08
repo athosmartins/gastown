@@ -97,9 +97,17 @@ def _sh(args, timeout=20):
         return None
 
 
-def _bd_json(root, label, status="open"):
-    """Returns (list_or_None, ok). ok=False on read error (→ flag, never false-pass)."""
-    r = _sh([BD, "-C", root, "list", "-l", label, "--status", status, "--json", "-n", "200"])
+def _bd_json(root, label, status="open", include_infra=False):
+    """Returns (list_or_None, ok). ok=False on read error (→ flag, never false-pass).
+
+    include_infra (ga-vm20x, Mayor 07/08): pass True for gate-marker/-run
+    labels — those beads are born --ephemeral (INFRA), hidden from `bd list`
+    by default under bd 1.1.0. Defaults False so non-gate callers (e.g.
+    story:approved, never ephemeral) keep their existing query shape."""
+    args = [BD, "-C", root, "list", "-l", label, "--status", status, "--json", "-n", "200"]
+    if include_infra:
+        args.append("--include-infra")
+    r = _sh(args)
     if r is None or r.returncode != 0:
         return None, False
     try:
@@ -208,7 +216,7 @@ def _gate_source_beads():
     Pilot-dispatch stall. Read once per run; returns an EMPTY set on any read error
     so a Dolt hiccup never SUPPRESSES a real stall (fail-open toward flagging)."""
     ids = set()
-    markers, ok = _bd_json(CITY, "type:quality-gate-marker")
+    markers, ok = _bd_json(CITY, "type:quality-gate-marker", include_infra=True)
     if not ok or not markers:
         return ids
     for m in markers:
@@ -438,7 +446,7 @@ def _check_approved_fallback(inherited_warns):
 
 # ── CHECK 2: gate silently stalled ───────────────────────────────────────────
 def check_gate():
-    markers, ok = _bd_json(CITY, "type:quality-gate-marker")
+    markers, ok = _bd_json(CITY, "type:quality-gate-marker", include_infra=True)
     if not ok:
         return {"read_err": True}
     active, parked, oldest_active_min = [], [], None

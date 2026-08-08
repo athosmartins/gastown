@@ -491,7 +491,15 @@ gap2_query_active_markers() {
   # reintroduced via a different path. Mirrors DUP_MARKERS_JSON's own
   # --all --status open convention ~200 lines below (~L1893) — nothing
   # here is a new pattern, just the one this file already established.
-  bd -C "$GC_CITY" list --json --all --status open \
+  # --include-infra (ga-vm20x, Mayor 07/08): this file's own Step 1 fix
+  # (~L2252 below) already covers the SAME blindness for a different query —
+  # markers are born --ephemeral (INFRA), hidden from `bd list` by default
+  # under bd 1.1.0. This gap2_* helper was missed in that pass; without the
+  # flag it silently returns fewer active markers than really exist, which
+  # flows into gap2_marker_for_bead as a false "no active marker" and can
+  # mask a genuinely gate-active parent (the same failure shape ga-4tgga
+  # fixed for the closed-marker case just above).
+  bd -C "$GC_CITY" list --json --all --include-infra --status open \
     -l type:quality-gate-marker \
     --label-any gate-status:ready \
     --label-any gate-status:queued \
@@ -1345,7 +1353,14 @@ validate_rig() {
 # see companion_liveness_from_query above. The `if` keeps `set -euo pipefail`
 # from aborting on a nonzero bd exit (same idiom as reviewers_alive_for_run /
 # verdict_bead_count_for_run below, ga-48xcv).
-if GATE_RUNS_JSON=$(bd -C "$GC_CITY" list --json --all \
+
+# --include-infra (ga-vm20x, Mayor 07/08): gate-run beads are born
+# --ephemeral (INFRA), hidden from `bd list` by default under bd 1.1.0.
+# This shared-prelude query feeds BOTH Vector B dedup and Vector A
+# companion-liveness (see the block above) — without the flag it
+# undercounts the same way a query FAILURE does, except silently, with
+# GATE_RUNS_QUERY_OK=1 masking that anything was missed.
+if GATE_RUNS_JSON=$(bd -C "$GC_CITY" list --json --all --include-infra \
     -l type:quality-gate-run \
     --label-any gate-status:running \
     --label-any gate-status:claimed \
@@ -1379,10 +1394,16 @@ fi
 
 log "Step 0: Vector A reclaim — stuck transient markers (TTL=${CLAIM_TTL_MINUTES}m, MAX_RECLAIMS=${MAX_RECLAIMS})..."
 
-DISP_JSON=$(bd -C "$GC_CITY" list --json --all \
+# --include-infra (ga-vm20x, Mayor 07/08): gate markers are born --ephemeral
+# (INFRA), hidden from `bd list` by default under bd 1.1.0. Without this
+# flag, an ephemeral marker stuck in dispatching/claimed is invisible to
+# THIS reclaim step — the one mechanism ga-tmug Vector A relies on to
+# unstick it — so it strands forever exactly the way the comment above
+# describes for a crashed dispatcher, just via a different root cause.
+DISP_JSON=$(bd -C "$GC_CITY" list --json --all --include-infra \
   -l type:quality-gate-marker -l gate-status:dispatching \
   2>/dev/null || echo "[]")
-CLAIM_JSON_V=$(bd -C "$GC_CITY" list --json --all \
+CLAIM_JSON_V=$(bd -C "$GC_CITY" list --json --all --include-infra \
   -l type:quality-gate-marker -l gate-status:claimed \
   2>/dev/null || echo "[]")
 TRANSIENT_JSON=$(printf '%s\n%s' "$DISP_JSON" "$CLAIM_JSON_V" \

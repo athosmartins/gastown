@@ -500,7 +500,13 @@ gate_reviewer_permission_prompt_session() {
     [ -n "$bid" ] || return 1
     command -v "$BD" >/dev/null 2>&1 || return 1
 
-    arts="$(timeout 15 "$BD" -C "$CITY" list -l "source-bead:$bid" --json 2>/dev/null || true)"
+    # --include-infra (ga-vm20x, Mayor 07/08): the type:quality-gate-run
+    # marker this looks for below is born --ephemeral (INFRA), hidden from
+    # `bd list` by default under bd 1.1.0. Without this flag a genuinely
+    # running gate review reads as "no run found", so this suppression
+    # never fires and a permission-prompt session under active gate review
+    # gets falsely escalated as stuck.
+    arts="$(timeout 15 "$BD" -C "$CITY" list --include-infra -l "source-bead:$bid" --json 2>/dev/null || true)"
     [ -z "$arts" ] && return 1
     run_id="$(printf '%s' "$arts" | python3 -c '
 import json, sys
@@ -694,7 +700,14 @@ bead_has_open_gate_marker() {
     local bid="${1:-}" arts hit
     [ -n "$bid" ] || return 1
     command -v "$BD" >/dev/null 2>&1 || return 1
-    arts="$(timeout 15 "$BD" -C "$CITY" list -l "source-bead:$bid" --json 2>/dev/null || true)"
+    # --include-infra (ga-vm20x, Mayor 07/08): same gap as
+    # gate_reviewer_permission_prompt_session above — gate markers are born
+    # --ephemeral (INFRA) and hidden from `bd list` by default. Without this
+    # flag a bead with a genuinely open gate marker reads as having none, so
+    # this helper's whole purpose — suppressing a stall escalation for a
+    # bead that's actually fine, just sitting in the gate — never fires,
+    # and the caller escalates a false-positive "stuck" report instead.
+    arts="$(timeout 15 "$BD" -C "$CITY" list --include-infra -l "source-bead:$bid" --json 2>/dev/null || true)"
     [ -z "$arts" ] && return 1
     hit="$(printf '%s' "$arts" | python3 -c '
 import json, sys

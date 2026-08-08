@@ -188,9 +188,17 @@ _store_name() { basename "$1"; }
 # Prints "<active:0|1|error>\t<last_artifact_gate_status_or_none|unknown>\t<open_artifact_count>"
 # The active bit replicates pilot-dispatcher.sh's _beadid_has_active_gate_artifact
 # (ga-wisp signal (d), ~line 3212) EXACTLY — same active-state set, same query
-# shape (bd list -l "source-bead:<id>" against the HQ store; empirically
-# verified 2026-08-03 that this label-scoped query surfaces
-# type:quality-gate-marker/-run beads without needing --all/--include-gates).
+# shape (bd list -l "source-bead:<id>" against the HQ store).
+# CORRECTION (ga-vm20x, Mayor 07/08): the line above used to claim this
+# label-scoped query surfaces type:quality-gate-marker/-run beads without
+# needing --include-infra, "empirically verified 2026-08-03." That was true
+# when written but bd 1.1.0 changed the ground under it: --ephemeral beads
+# are now classified INFRA and hidden from `bd list` by default, including
+# gate markers/runs. Re-verified live (ga-vm20x): of 8 sampled source-bead:
+# queries against real markers, 2 diverged (1 result without --include-infra
+# vs the true 2 with it) — this probe WAS silently under-counting. Flag added
+# below; a comment asserting a query property is only as durable as the bd
+# version it was measured against — don't trust it without re-measuring.
 # The other two fields are reporting-only extras computed from the same read.
 # FAIL-OPEN: a non-zero exit from the bd|jq pipe (pipefail-visible via $?) prints
 # "error\tunknown\t0" instead of the confirmed-zero "0\tnone\t0" — a failed read
@@ -200,7 +208,7 @@ _store_name() { basename "$1"; }
 # Test seam: routes through $BD_BIN, stubbed in --selftest.
 _gate_artifact_probe() {
   local _bid="$1" _arts _out _rc
-  _arts=$("$BD_BIN" -C "$HQ" list -l "source-bead:$_bid" --json 2>/dev/null \
+  _arts=$("$BD_BIN" -C "$HQ" list --include-infra -l "source-bead:$_bid" --json 2>/dev/null \
     | jq -c 'if type=="array" then . else [.] end' 2>/dev/null)
   _rc=$?
   if [ "$_rc" -ne 0 ]; then

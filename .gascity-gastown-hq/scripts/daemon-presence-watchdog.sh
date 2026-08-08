@@ -288,7 +288,12 @@ _gate_run_in_flight() {
   command -v bd >/dev/null 2>&1 || return 1
   command -v jq >/dev/null 2>&1 || return 1
   [ -f "$HQ/scripts/bd-list-cached.sh" ] || return 1
-  out=$(timeout 8 bash "$HQ/scripts/bd-list-cached.sh" -C "$HQ" list --json \
+  # --include-infra (ga-vm20x, Mayor 07/08): gate-run beads are born
+  # --ephemeral (INFRA), hidden from `bd list` by default under bd 1.1.0.
+  # Without this flag a genuinely-running gate review reads as none, and
+  # this presence check can't tell "reviewer still in its legitimate
+  # timeout window" from "no run at all".
+  out=$(timeout 8 bash "$HQ/scripts/bd-list-cached.sh" -C "$HQ" list --json --include-infra \
           -l type:quality-gate-run -l gate-status:running 2>/dev/null) || return 1
   [ -n "$out" ] || return 1
   # Per-bead: created_at + (its OWN verdict_timeout_minutes, or the default,

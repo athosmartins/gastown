@@ -151,7 +151,11 @@ run_sweep() {
   elif command -v "$BD_BIN" >/dev/null 2>&1; then
     # ga-xwza2: routed through the read-cache shim — a count-only liveness check
     # (active marker count for stall detection), not a read-after-write.
-    markers_json="$(bash "$BD_LIST_CACHED" -C "$HQ" list --json -l type:quality-gate-marker --status open --limit 0 2>/dev/null)" || markers_json=""
+    # --include-infra (ga-vm20x, Mayor 07/08): markers are born --ephemeral
+    # (INFRA), hidden from `bd list` by default under bd 1.1.0. Without this
+    # flag a genuinely backed-up gate reads as empty, and this watchdog's
+    # whole job is detecting exactly that stall.
+    markers_json="$(bash "$BD_LIST_CACHED" -C "$HQ" list --json --include-infra -l type:quality-gate-marker --status open --limit 0 2>/dev/null)" || markers_json=""
   else
     log "WARN: bd not on PATH — cannot read gate-marker state — fail-open (no stall verdict)"
     return 0

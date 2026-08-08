@@ -644,7 +644,11 @@ EOF
 # whose source-bead label is this bead. Empty array on any failure.
 markers_for_bead() {
   local id="$1" out
-  out=$(bd -C "$GC_CITY" list --all --json -l type:quality-gate-marker -l "source-bead:$id" 2>/dev/null || echo '[]')
+  # --include-infra (ga-vm20x, Mayor 07/08): bd 1.1.0 classifies --ephemeral
+  # beads as INFRA and hides them from `bd list` by default; gate markers are
+  # born ephemeral, so this janitor could not find the very markers it exists
+  # to reconcile without this flag.
+  out=$(bd -C "$GC_CITY" list --all --include-infra --json -l type:quality-gate-marker -l "source-bead:$id" 2>/dev/null || echo '[]')
   [ -z "$out" ] && out='[]'
   printf '%s' "$out"
 }

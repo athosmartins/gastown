@@ -831,7 +831,12 @@ def _queued_marker_state(root, bead_id):
     Test seam: _bd_marker_for_bead."""
     if _bd_marker_for_bead is not None:
         return _bd_marker_for_bead(root, bead_id)
-    r = _sh([BD_BIN, "-C", CITY, "list",
+    # --include-infra (ga-vm20x, Mayor 07/08): a SECOND, independent way this
+    # exact query can under-report "absent" even after the cross-rig-root fix
+    # documented above — markers are born --ephemeral (INFRA), hidden from
+    # `bd list` by default under bd 1.1.0. Same false-alarm shape as wa-539tp,
+    # different root cause.
+    r = _sh([BD_BIN, "-C", CITY, "list", "--include-infra",
              "-l", "type:quality-gate-marker",
              "-l", "source-bead:%s" % bead_id,
              "-l", "gate-status:queued",
@@ -862,7 +867,12 @@ def _gate_queue_depth():
     if _bd_gate_queue_markers is not None:
         rows = _bd_gate_queue_markers()   # test seam
     else:
-        r = _sh([BD_BIN, "-C", CITY, "list", "--json", "--limit", "0",
+        # --include-infra (ga-vm20x, Mayor 07/08): markers are born
+        # --ephemeral (INFRA), hidden from `bd list` by default under bd
+        # 1.1.0. Without this flag a genuinely nonzero queue depth reads as
+        # 0, which (per the docstring above) risks silently licensing a
+        # suppression that isn't actually justified.
+        r = _sh([BD_BIN, "-C", CITY, "list", "--json", "--limit", "0", "--include-infra",
                  "-l", "type:quality-gate-marker", "-l", "gate-status:queued"],
                 timeout=BD_TIMEOUT)
         if r is None or r.returncode != 0:

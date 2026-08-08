@@ -318,7 +318,7 @@ print("── ga-lwi4b regression: check_gate()'s stalled_by_age must respect re
 # reviewing it that instant. stalled_by_age used to ignore reviewer_alive (only
 # stalled_by_silence consulted it), so age alone declared a false GATE travado.
 _orig_bd_json, _orig_age_min, _orig_sh_gate = m._bd_json, m._age_min, m._sh
-m._bd_json = lambda root, label, status="open": (
+m._bd_json = lambda root, label, status="open", include_infra=False: (
     [{"id": "mk-OLD", "updated_at": "2020-01-01T00:00:00Z", "labels": ["gate-status:dispatching"]}],
     True)
 m._age_min = lambda iso: 475.0

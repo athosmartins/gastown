@@ -65,8 +65,15 @@ def sh(args, timeout=20):
         return ""
 
 
-def bd_list(store, *labels, status="open"):
+def bd_list(store, *labels, status="open", include_infra=False):
+    # include_infra (ga-vm20x, Mayor 07/08): pass True for gate-marker/-run
+    # labels — those beads are born --ephemeral (INFRA), hidden from `bd
+    # list` by default under bd 1.1.0. Defaults False so the other callers
+    # here (story:in-flight, story:approved, ctx:ready, refino:* — none
+    # ever ephemeral) keep their existing query shape.
     args = ["bash", BD_LIST_CACHED, "-C", store, "list", "--status", status, "--json"]
+    if include_infra:
+        args.append("--include-infra")
     for l in labels:
         args += ["-l", l]
     out = sh(args)
@@ -158,7 +165,7 @@ def sample():
             "dolt_ok": False, "reviewing": 0, "building": 0, "refining": 0,
             "dolt_cpu": dolt_cpu_pct(),
         }
-    hq_markers = bd_list(HQ, "type:quality-gate-marker")
+    hq_markers = bd_list(HQ, "type:quality-gate-marker", include_infra=True)
     def marker_status(b):
         for l in labels_of(b):
             if l.startswith("gate-status:"):

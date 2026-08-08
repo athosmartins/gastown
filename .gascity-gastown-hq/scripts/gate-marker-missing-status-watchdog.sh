@@ -148,7 +148,12 @@ run_sweep() {
   local state; state="$(_state_load)"
 
   local cand_json rc
-  cand_json=$("$BD_BIN" -C "$HQ" list --label-any type:quality-gate-marker \
+  # --include-infra (ga-vm20x, Mayor 07/08): bd 1.1.0 hides --ephemeral
+  # (INFRA) beads from `bd list` by default, and gate markers/runs — this
+  # watchdog's entire subject — are born ephemeral. Without this flag the
+  # whole candidate set reads as empty and the watchdog can never detect a
+  # marker stuck with no gate-status label.
+  cand_json=$("$BD_BIN" -C "$HQ" list --include-infra --label-any type:quality-gate-marker \
       --label-any type:quality-gate-run --status open --json 2>/dev/null \
     | jq -c 'if type=="array" then . else [.] end' 2>/dev/null)
   rc=$?

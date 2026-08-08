@@ -153,7 +153,12 @@ def _gate_queue_depth():
     if _bd_gate_queue_markers is not None:
         rows = _bd_gate_queue_markers()   # test seam
     else:
-        r = _sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--json",
+        # --include-infra (ga-vm20x, Mayor 07/08): markers are born
+        # --ephemeral (INFRA), hidden from `bd list` by default under bd
+        # 1.1.0. Without this flag a genuinely nonzero queue depth reads as
+        # 0, which (per the docstring above) risks silently licensing a
+        # suppression that isn't actually justified.
+        r = _sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--json", "--include-infra",
                  "-l", "type:quality-gate-marker", "-l", "gate-status:queued"],
                 timeout=BD_TIMEOUT)
         if r is None or r.returncode != 0:

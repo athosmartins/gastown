@@ -42,29 +42,39 @@ if [ "$1 $2" = "list --status" ] && [ "$3" = "in_progress" ]; then
     cat "${BEADS_FIXTURE:-/dev/null}"
     exit 0
 fi
-if [ "$1" = "list" ] && [ "$2" = "-l" ]; then
-    case "$3" in
-        source-bead:*)
-            _bid="${3#source-bead:}"
-            _f="${GATE_MARKERS_DIR:-}/${_bid}.json"
-            if [ -n "${GATE_MARKERS_DIR:-}" ] && [ -f "$_f" ]; then
-                cat "$_f"
-            else
-                echo "[]"
-            fi
-            exit 0
-            ;;
-        gate-run:*)
-            _rid="${3#gate-run:}"
-            _f="${GATE_VERDICTS_DIR:-}/${_rid}.json"
-            if [ -n "${GATE_VERDICTS_DIR:-}" ] && [ -f "$_f" ]; then
-                cat "$_f"
-            else
-                echo "[]"
-            fi
-            exit 0
-            ;;
-    esac
+if [ "$1" = "list" ]; then
+    # Scan remaining args for "-l <label>" pairs instead of assuming -l is
+    # exactly $2 — a fixed positional check broke the instant the real
+    # callers gained --include-infra ahead of -l (ga-vm20x). Any other flag
+    # (--include-infra, --json, ...) anywhere else in argv is simply skipped.
+    shift
+    while [ $# -gt 0 ]; do
+        if [ "$1" = "-l" ] && [ -n "${2:-}" ]; then
+            case "$2" in
+                source-bead:*)
+                    _bid="${2#source-bead:}"
+                    _f="${GATE_MARKERS_DIR:-}/${_bid}.json"
+                    if [ -n "${GATE_MARKERS_DIR:-}" ] && [ -f "$_f" ]; then
+                        cat "$_f"
+                    else
+                        echo "[]"
+                    fi
+                    exit 0
+                    ;;
+                gate-run:*)
+                    _rid="${2#gate-run:}"
+                    _f="${GATE_VERDICTS_DIR:-}/${_rid}.json"
+                    if [ -n "${GATE_VERDICTS_DIR:-}" ] && [ -f "$_f" ]; then
+                        cat "$_f"
+                    else
+                        echo "[]"
+                    fi
+                    exit 0
+                    ;;
+            esac
+        fi
+        shift
+    done
 fi
 echo "[]"
 SHIM

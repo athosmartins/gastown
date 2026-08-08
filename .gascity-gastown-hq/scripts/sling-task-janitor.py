@@ -244,7 +244,13 @@ def _gated_bead_ids():
     ids = set()
     # ga-xwza2: routed through the read-cache shim — informational marker scan
     # (which beads are tracked at the gate), not a read-after-write.
-    r = _sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",
+    # --include-infra (ga-vm20x, Mayor 07/08): markers are born --ephemeral
+    # (INFRA), hidden from `bd list` by default under bd 1.1.0. Without this
+    # flag a genuinely gate-tracked sling task reads as untracked, and this
+    # janitor can close it and let the orphaned-marker reaper false-close
+    # the marker as 'merged' — exactly the ga-w5agg/ga-d2jil strand this
+    # function exists to prevent.
+    r = _sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "--include-infra", "-l", "type:quality-gate-marker",
              "--status", "open", "--json", "-n", "0"], timeout=BD_TIMEOUT)
     if not r or r.returncode != 0:
         return ids

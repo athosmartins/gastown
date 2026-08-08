@@ -99,8 +99,11 @@ def list_error_markers():
     Markers that are also 'superseded' are excluded — they are terminal.
     Uses no --all so only open (non-closed) markers are returned."""
     try:
+        # --include-infra (ga-vm20x, Mayor 07/08): markers are born
+        # --ephemeral (INFRA), hidden from `gc bd list` by default under bd
+        # 1.1.0. Without this flag a genuinely-errored marker reads as none.
         result = subprocess.run(
-            ["gc", "bd", "list", "-l", "type:quality-gate-marker",
+            ["gc", "bd", "list", "--include-infra", "-l", "type:quality-gate-marker",
              "-l", "gate-status:error", "--json", "--limit", "0"],
             capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
@@ -177,7 +180,11 @@ def dolt_responsive():
     guard required by ga-noxbv)."""
     try:
         t0 = time.time()
-        r = subprocess.run(["gc", "bd", "list", "-l", "type:quality-gate-marker", "--json"],
+        # --include-infra (ga-vm20x): not load-bearing for THIS probe (it only
+        # times the round-trip, doesn't inspect the result), but kept
+        # consistent with every other type:quality-gate-marker query in this
+        # file so a future reader doesn't wonder why this one differs.
+        r = subprocess.run(["gc", "bd", "list", "--include-infra", "-l", "type:quality-gate-marker", "--json"],
                            capture_output=True, text=True, timeout=8)
         return r.returncode == 0 and (time.time() - t0) < 5
     except Exception:
@@ -189,8 +196,13 @@ def queued_marker_ids():
     picked up). Used by the GATE-NOMERGE throughput check to confirm there IS work
     the gate is failing to advance. Returns [] on any failure (skip the check)."""
     try:
+        # --include-infra (ga-vm20x, Mayor 07/08): markers are born
+        # --ephemeral (INFRA), hidden from `gc bd list` by default under bd
+        # 1.1.0. Without this flag genuinely-queued work reads as none, so
+        # the GATE-NOMERGE throughput check can't confirm there IS work the
+        # gate is failing to advance — the exact thing it exists to detect.
         result = subprocess.run(
-            ["gc", "bd", "list", "-l", "type:quality-gate-marker",
+            ["gc", "bd", "list", "--include-infra", "-l", "type:quality-gate-marker",
              "-l", "gate-status:queued", "--json", "--limit", "0"],
             capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():

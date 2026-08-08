@@ -1211,7 +1211,12 @@ def _gate_marker_source_beads():
         # ga-xwza2: routed through the read-cache shim — informational membership
         # check (which beads have a BUILT marker), computed once per 30min cycle;
         # nothing in this cycle writes then re-reads this exact query.
-        r = _sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "-l", "type:quality-gate-marker",
+        # --include-infra (ga-vm20x, Mayor 07/08): markers are born --ephemeral
+        # (INFRA), hidden from `bd list` by default under bd 1.1.0 — without
+        # this flag a genuinely-built bead reads as having no marker, which
+        # (per the docstring above) risks licensing a false starve alarm.
+        r = _sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--include-infra",
+                 "-l", "type:quality-gate-marker",
                  "--json", "-n", "200"], timeout=BD_TIMEOUT)
         if r is None or r.returncode != 0:
             return None

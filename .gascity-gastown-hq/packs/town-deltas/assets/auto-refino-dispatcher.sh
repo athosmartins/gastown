@@ -771,11 +771,17 @@ _ar_gate_congested() {
     printf '0'; return 0
   fi
   local _hq="$GC_CITY" _q _r _n
-  _q=$(GC_CITY="$_hq" timeout 15 bd -C "$_hq" list --json --all \
+  # --include-infra (ga-vm20x, Mayor 07/08): mirrors the SAME fix in Pilot's
+  # _pilot_gate_congested — gate markers/runs are born --ephemeral (INFRA),
+  # hidden from `bd list` by default under bd 1.1.0. Without this flag both
+  # queries undercount to zero, so a congested gate looks clear and
+  # auto-refino dispatches into the backlog instead of holding (FAIL-OPEN
+  # "0" contract this function documents above).
+  _q=$(GC_CITY="$_hq" timeout 15 bd -C "$_hq" list --json --all --include-infra \
         -l type:quality-gate-marker -l gate-status:queued 2>/dev/null || echo "")
   _n=$(printf '%s' "$_q" | jq 'length' 2>/dev/null || echo "")
   if [ -n "$_n" ] && [ "$_n" -gt 0 ] 2>/dev/null; then printf '1'; return 0; fi
-  _r=$(GC_CITY="$_hq" timeout 15 bd -C "$_hq" list --json --all \
+  _r=$(GC_CITY="$_hq" timeout 15 bd -C "$_hq" list --json --all --include-infra \
         -l type:quality-gate-run -l gate-status:running 2>/dev/null || echo "")
   _n=$(printf '%s' "$_r" | jq 'length' 2>/dev/null || echo "")
   if [ -n "$_n" ] && [ "$_n" -gt 0 ] 2>/dev/null; then printf '1'; return 0; fi

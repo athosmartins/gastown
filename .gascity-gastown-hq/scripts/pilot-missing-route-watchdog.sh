@@ -253,7 +253,14 @@ _store_name() { basename "$1"; }
 # status hide a candidate").
 _gate_artifact_probe() {
   local _bid="$1" _arts _rc
-  _arts=$("$BD_BIN" -C "$HQ" list -l "source-bead:$_bid" --json 2>/dev/null \
+  # --include-infra (ga-vm20x, Mayor 07/08): mirrors gate-orphaned-label-
+  # watchdog.sh's _gate_artifact_probe — gate markers/runs are born
+  # --ephemeral (INFRA), hidden from `bd list` by default under bd 1.1.0.
+  # Without this flag a genuinely active gate artifact reads as absent
+  # (gate_active="0"), which skips the caller's SKIP-if-active branch
+  # (~L541 below) and wrongly FLAGS an already-dispatched, gate-tracked
+  # bead as a false-positive missing-route finding.
+  _arts=$("$BD_BIN" -C "$HQ" list --include-infra -l "source-bead:$_bid" --json 2>/dev/null \
     | jq -c 'if type=="array" then . else [.] end' 2>/dev/null)
   _rc=$?
   if [ "$_rc" -ne 0 ]; then
@@ -737,9 +744,16 @@ case "$verb" in
         exit 1
       fi
       [ -f "$f" ] && cat "$f" || echo "[]"
-    elif [ "${args[3]:-}" = "-l" ] && [[ "${args[4]:-}" == source-bead:* ]]; then
-      # gate-artifact-probe form: bd -C <store> list -l "source-bead:<id>" --json
-      sbid="${args[4]#source-bead:}"
+    elif { sbid=""; for ((j=0; j<${#args[@]}; j++)); do
+             if [ "${args[$j]}" = "-l" ] && [[ "${args[$((j+1))]:-}" == source-bead:* ]]; then
+               sbid="${args[$((j+1))]#source-bead:}"; break
+             fi
+           done; [ -n "$sbid" ]; }; then
+      # gate-artifact-probe form: bd -C <store> list [--include-infra] -l
+      # "source-bead:<id>" --json. Scans the FULL args array for "-l
+      # source-bead:*" instead of assuming a fixed position — a fixed-index
+      # check (was: args[3]/args[4]) broke the instant the real caller
+      # gained a flag (--include-infra) ahead of -l (ga-vm20x).
       f="$PMRW_TEST_GATEPROBE_DIR/${sbid}.json"
       [ -f "$f" ] && cat "$f" || echo "[]"
     else
