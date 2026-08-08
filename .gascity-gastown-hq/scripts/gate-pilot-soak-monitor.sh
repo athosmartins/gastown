@@ -170,6 +170,13 @@ if { [ "$READY_MARKERS" -gt 0 ] || [ "$MARKER_QUERY_FAILED" -eq 1 ]; } \
    && { [ "$MERGE_TIME_UNKNOWN" -eq 1 ] || [ "$MINS_SINCE_MERGE" -gt "$STALL_MAX_MIN" ]; }; then
   STALL_VIOLATION=1
 fi
+# ga-qb6yg gate-feedback (gate_run=ga-ruqpq): when STALL_VIOLATION trips via the
+# MERGE_TIME_UNKNOWN branch above, MINS_SINCE_MERGE is the -1 sentinel, so the
+# MAXSTALL accumulator below can never register it (a real duration is
+# unknowable, not just large). Track that subset separately so the report can
+# say so explicitly instead of silently under-reporting "Maior stall observado".
+UNKNOWN_DURATION_STALL=0
+[ "$STALL_VIOLATION" -eq 1 ] && [ "$MERGE_TIME_UNKNOWN" -eq 1 ] && UNKNOWN_DURATION_STALL=1
 
 # new merges since last sample (offset scan)
 NEW_MERGES=$(scan_new "$DISP_LOG" disp_offset "\] \[quality-gate-dispatcher\] Gate PASSED:")
@@ -216,6 +223,7 @@ T_FALSEKILL=$(( $(get_state falsekill_events 0) + NEW_FALSEKILL ))
 # unqualified even if some fraction of samples were actually unverified.
 T_MARKER_QUERY_FAILED=$(( $(get_state marker_query_failed_count 0) + MARKER_QUERY_FAILED ))
 T_MERGE_TIME_UNKNOWN=$(( $(get_state merge_time_unknown_count 0) + MERGE_TIME_UNKNOWN ))
+T_UNKNOWN_DURATION_STALL=$(( $(get_state unknown_duration_stall_count 0) + UNKNOWN_DURATION_STALL ))
 SAMPLES=$(( $(get_state samples 0) + 1 ))
 CPU_SUM=$(fadd "$(get_state cpu_sum 0)" "$DOLT_CPU")
 CPU_PEAK=$(fmax "$(get_state cpu_peak 0)" "$DOLT_CPU")
@@ -242,6 +250,7 @@ set_state crew_events "$T_CREW"
 set_state falsekill_events "$T_FALSEKILL"
 set_state marker_query_failed_count "$T_MARKER_QUERY_FAILED"
 set_state merge_time_unknown_count "$T_MERGE_TIME_UNKNOWN"
+set_state unknown_duration_stall_count "$T_UNKNOWN_DURATION_STALL"
 set_state samples "$SAMPLES"
 set_state cpu_sum "$CPU_SUM"
 set_state cpu_peak "$CPU_PEAK"
@@ -286,6 +295,7 @@ VIOL_DETAIL=""
 ATTENTION_DETAIL=""
 [ "$T_MARKER_QUERY_FAILED" -gt 0 ] && ATTENTION_DETAIL="${ATTENTION_DETAIL}  - ATENÇÃO: ${T_MARKER_QUERY_FAILED}/${SAMPLES} amostra(s) com marker-query falhou/timeout — tratadas como 'pode estar esperando' (nunca como zero confirmado), mas o sinal real ficou sem confirmar nessas janelas.\n"
 [ "$T_MERGE_TIME_UNKNOWN" -gt 0 ] && ATTENTION_DETAIL="${ATTENTION_DETAIL}  - ATENÇÃO: ${T_MERGE_TIME_UNKNOWN}/${SAMPLES} amostra(s) sem 'Gate PASSED' localizável no log (possível truncamento) — tratadas como possível-stall, não como recém-mergeado.\n"
+[ "$T_UNKNOWN_DURATION_STALL" -gt 0 ] && ATTENTION_DETAIL="${ATTENTION_DETAIL}  - ATENÇÃO: ${T_UNKNOWN_DURATION_STALL}/${SAMPLES} amostra(s) confirmaram stall (markers prontos + último-merge desconhecido) SEM duração numérica — 'Maior stall observado' abaixo NÃO inclui essas amostras e pode subestimar a severidade real.\n"
 
 REPORT=$(printf '%s' "\
 SOAK 24h ga-spd2n — VEREDITO: ${VERDICT}

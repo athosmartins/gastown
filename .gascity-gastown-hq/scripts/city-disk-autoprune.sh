@@ -5,8 +5,11 @@
 # ⚠️ SAFE BY CONSTRUCTION — written against tonight's destructive-daemon lessons
 # (disk-floor-guard ga-eu2x, gatefix-janitor ga-0re8j). Every reclaim here is
 # provably non-destructive to live/production/unmerged data:
-#   • transcripts: only *.jsonl OLDER than N days (default 7) — a live session's
-#     transcript is written continuously, so mtime>7d ⇒ dead session.
+#   • transcripts: only *.jsonl OLDER than N days (default 7) AND scoped to
+#     this city's own tree (Gas Town project dirs only — see
+#     TRANSCRIPT_SCOPE_PREFIX below, never another project on the machine) —
+#     a live session's transcript is written continuously, so mtime>7d ⇒ dead
+#     session.
 #   • worktrees: `git worktree remove` WITHOUT --force — git REFUSES if the
 #     worktree is dirty or locked. And removing a worktree never deletes the
 #     branch ref (the janitor's exact bug). Only worktrees whose HEAD is an
@@ -27,6 +30,16 @@ DRY="${CITY_AUTOPRUNE_DRY_RUN:-0}"
 TRANSCRIPT_DAYS="${CITY_AUTOPRUNE_TRANSCRIPT_DAYS:-7}"
 LOG_CAP_MB="${CITY_AUTOPRUNE_LOG_CAP_MB:-50}"
 TRANSCRIPT_ROOT="${CITY_AUTOPRUNE_TRANSCRIPT_ROOT:-/Users/athos/.claude/projects}"
+# ga-qb6yg gate-feedback (gate_run=ga-ruqpq): TRANSCRIPT_ROOT above is the
+# user's ENTIRE Claude Code transcript tree, not scoped to this city — without
+# a further filter, section 1 below would rm -f any project's transcript on
+# the machine, not just Gas Town's. Claude Code encodes a session's cwd into
+# its project-dir name by replacing "/" (and other separators) with "-", so
+# every Gas Town project dir starts with this prefix (verified empirically
+# 2026-08-08: 114/115 live project dirs on this host matched; the one
+# exception was a /private/tmp scratchpad path — scratchpad-reaper.sh's job,
+# not this one's). Only transcripts under a matching project dir are eligible.
+TRANSCRIPT_SCOPE_PREFIX="${CITY_AUTOPRUNE_TRANSCRIPT_SCOPE_PREFIX:--Users-athos-gt}"
 
 ts() { python3 -c 'import datetime;print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))'; }
 emit() { printf '%s\n' "$1" >> "$LOG" 2>/dev/null || true; }
@@ -43,6 +56,16 @@ if [ -d "$TRANSCRIPT_ROOT" ]; then
   # this can only match sessions dead >N days.
   while IFS= read -r f; do
     [ -n "$f" ] || continue
+    # Scope guard (ga-qb6yg gate-feedback): only ever touch a transcript whose
+    # Claude Code project dir is this city's own tree. projdir is the path
+    # component immediately under TRANSCRIPT_ROOT; require an exact match or a
+    # "-"-separated continuation so a lookalike like "-Users-athos-gtown" can
+    # never pass as a prefix collision.
+    projdir="${f#"$TRANSCRIPT_ROOT"/}"; projdir="${projdir%%/*}"
+    case "$projdir" in
+      "$TRANSCRIPT_SCOPE_PREFIX"|"$TRANSCRIPT_SCOPE_PREFIX"-*) : ;;
+      *) continue ;;
+    esac
     if [ "$DRY" = "1" ]; then
       emit "{\"ts\":\"$(ts)\",\"event\":\"would_delete_transcript\",\"file\":\"$f\"}"
     else
