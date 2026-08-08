@@ -99,37 +99,110 @@ gc rig list
 
 **2. For each rig, collect:**
 
-a) **Issues filed and closed:**
+a) **Issues filed and closed** — bounded on BOTH ends, [SINCE, UNTIL):
 ```bash
-gc bd list --created-after=$SINCE --json --limit=0
-gc bd list --status=closed --closed-after=$SINCE --json --limit=0
+gc bd list --created-after=$SINCE --created-before=$UNTIL --json --limit=0
+gc bd list --status=closed --closed-after=$SINCE --closed-before=$UNTIL --json --limit=0
 ```
 
-b) **Merge activity:**
+b) **Merge activity** — also bounded, or today's not-yet-elapsed merges bleed in:
 ```bash
-git -C <rig-path> log --merges --since=$SINCE --oneline main
+git -C <rig-path> log --merges --since=$SINCE --until=$UNTIL --oneline main
 ```
 
 c) **Incidents:**
 ```bash
-gc bd list --label=incident --created-after=$SINCE --json
+gc bd list --label=incident --created-after=$SINCE --created-before=$UNTIL --json --limit=0
 ```
+
+**Why every query above needs BOTH bounds:** this formula fires on the
+deacon's cooldown trigger, not a midnight cron — it can run at any
+wall-clock hour. A `--created-after=$SINCE` with no `--created-before=$UNTIL`
+silently extends the window from SINCE through "now", inflating every count
+by whatever fraction of "today" has already elapsed. Measured impact
+(ga-swvjo, 2026-08-07): the missing UNTIL bound alone inflated one day's
+closed-issue count by ~40% (640 open-ended vs. 391 correctly bounded).
+`--limit=0` on every `bd list --json` matters too — the default caps at 50
+rows and the warning goes to stderr only; a filtered query easily clears 50
+on a busy day.
 
 **3. Collect town-level data:**
 
-a) **Session lifecycle events:**
+a) **Session lifecycle events** — three live CLI mismatches to know before
+writing this query (verified live, ga-swvjo):
+- `gc events --since` takes a DURATION ("1h", "30m"), never an absolute
+  timestamp — passing $SINCE directly errors ("invalid --since ...: unknown
+  unit").
+- `--type` does NOT support comma-separated values as an OR-filter —
+  `--type=a,b` silently matches ZERO events even though `a` and `b` each
+  match individually when queried alone. Query one type per call.
+- `session.crashed` is not a real event type in this city's current
+  taxonomy (zero matches, even completely unfiltered) — omit it; a
+  crashed-session count cannot be measured this way today.
+
+Compute a duration that overshoots UNTIL (elapsed time since SINCE, rounded
+up to the next hour), then filter the result down to the exact [SINCE,
+UNTIL) window client-side — **in epoch seconds, never by comparing the raw
+ts strings**: `gc events`' `ts` field is LOCAL time (e.g. `-03:00`) while
+$SINCE/$UNTIL are UTC, and a string compare near a UTC day boundary
+misclassifies events (one already past UNTIL in UTC can still sort as
+"before UNTIL" going purely by local wall-clock digits):
+
 ```bash
-gc events --since=$SINCE --type=session.woke,session.stopped,session.crashed --json
+SINCE_EPOCH=$(date -u -d "$SINCE" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$SINCE" +%s)
+UNTIL_EPOCH=$(date -u -d "$UNTIL" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$UNTIL" +%s)
+NOW_EPOCH=$(date -u +%s)
+ELAPSED_H=$(( (NOW_EPOCH - SINCE_EPOCH + 3599) / 3600 ))
+
+JQ_WINDOW_FILTER='
+  def iso_offset_to_epoch:
+    .[0:19] as $base
+    | (if endswith("Z") then 0
+       else
+         (.[-6:-5]) as $sign
+         | (.[-5:-3] | tonumber) as $oh
+         | (.[-2:]   | tonumber) as $om
+         | ($oh*3600 + $om*60) as $mag
+         | (if $sign == "-" then -$mag else $mag end)
+       end) as $offset_signed
+    | ($base + "Z" | fromdateiso8601) - $offset_signed;
+  select((.ts | iso_offset_to_epoch) >= $since_epoch and (.ts | iso_offset_to_epoch) < $until_epoch)
+'
+
+gc events --since="${ELAPSED_H}h" --type=session.woke | jq -c --argjson since_epoch "$SINCE_EPOCH" --argjson until_epoch "$UNTIL_EPOCH" "$JQ_WINDOW_FILTER"
+gc events --since="${ELAPSED_H}h" --type=session.stopped | jq -c --argjson since_epoch "$SINCE_EPOCH" --argjson until_epoch "$UNTIL_EPOCH" "$JQ_WINDOW_FILTER"
 ```
+
+Note: `gc events` caps at 500 rows with no truncation signal in its JSONL
+output — an unfiltered 2h window alone hit that cap in a live check
+(ga-swvjo). Querying one type per call (as above) keeps volume well under
+it on a normal day; if a result ever lands at exactly 500, treat it as
+possibly truncated, not as a true count.
+
+**Separate, deeper caveat (not fixable from this recipe — flag it, don't
+hide it):** `--since` can only see the CURRENT event-log segment; the log
+rotates every few days into `.gc/events.jsonl.archive-*.gz`, and once
+rotated, that history is gone from every `--since` query regardless of how
+large a duration you request (verified live: `--since=24h`, `48h`, and
+`72h` returned the IDENTICAL row count and earliest timestamp for
+session.woke — the query wasn't reaching further back, it had run out of
+live-segment data). A rotation can land inside any digest's [SINCE, UNTIL)
+window, silently truncating the session-lifecycle section for however much
+of the window preceded it. Before trusting a low/zero count here, compare
+the EARLIEST timestamp actually returned against $SINCE — if the earliest
+is later than $SINCE, the window is truncated by rotation, not genuinely
+quiet, and the digest should say so explicitly rather than report a count
+that reads as complete. Tracked separately as a `gc events` capability gap,
+not a recipe bug — see the formula's own bug history for the follow-up.
 
 b) **Escalations:**
 ```bash
-gc bd list --label=escalation --created-after=$SINCE --json
+gc bd list --label=escalation --created-after=$SINCE --created-before=$UNTIL --json --limit=0
 ```
 
 c) **Warrants filed:**
 ```bash
-gc bd list --label=warrant --created-after=$SINCE --json
+gc bd list --label=warrant --created-after=$SINCE --created-before=$UNTIL --json --limit=0
 ```
 
 Close this step when all data is collected."""
