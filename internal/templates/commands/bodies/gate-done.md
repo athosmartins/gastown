@@ -17,7 +17,9 @@ Arguments: $ARGUMENTS
 1. Runs a mandatory self-audit of your OWN diff for the "third state" defect
    class (see below) — the single class reviewers reject most often.
 2. Validates your working tree is clean and pushed.
-3. Creates a durable bead marker in the CITY database (so the guard can find it).
+3. Creates a durable bead marker in the CITY database (so the guard can find
+   it), then re-reads it to confirm the ready-for-gate label landed —
+   self-healing if not (ga-ehbw5).
 4. You are DONE — the launchd guard sweeps every ~2 min, claims the marker,
    and spawns a gate-runner in a separate session. You will be mailed when the
    gate passes or fails.
@@ -410,6 +412,37 @@ if [ -z "$MARKER_ID" ]; then
   echo "  Check GC_CITY_PATH: $GC_CITY_PATH"
   exit 1
 fi
+
+# ga-ehbw5: re-read the marker we just created and confirm gate-status:ready
+# actually landed, self-healing at the SOURCE if not — a prevention layer on
+# top of gate-marker-missing-status-watchdog.sh (ga-5jyo8), which only
+# DETECTS a labelless marker on its next sweep (minutes later). The --json/jq
+# extraction above only proves `bd create` returned an id; it does not prove
+# the label list the dispatcher filters on (`bd list -l type:quality-gate-marker
+# -l gate-status:ready`) is what we asked for. This does not make the write
+# atomic (ga-hmcs0: label add/remove are separate transactions in dolt server
+# mode) — it only shortens the exposure window for a labelless marker from
+# "next watchdog sweep" to "immediately," same pattern as ga-kkwsa's
+# fail-closed guard above.
+_MARKER_LABELS=$(bd -C "$GC_CITY_PATH" show "$MARKER_ID" --json 2>/dev/null \
+  | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
+case ",$_MARKER_LABELS," in
+  *,gate-status:ready,*)
+    : # present — nothing to do
+    ;;
+  *)
+    # Covers both a CONFIRMED-missing label and an unreadable readback
+    # (bd/jq failure): the third-state rule is to default to the safe
+    # action, not to silence — and re-adding an already-present label is a
+    # harmless no-op, so acting on "don't know" costs nothing here.
+    echo "Warning: marker $MARKER_ID did not read back gate-status:ready (labels: ${_MARKER_LABELS:-<unreadable>}). Self-healing..."
+    if bd -C "$GC_CITY_PATH" label add "$MARKER_ID" "gate-status:ready" -q 2>/dev/null; then
+      echo "Self-healed: gate-status:ready added to $MARKER_ID."
+    else
+      echo "Self-heal FAILED for $MARKER_ID — gate-marker-missing-status-watchdog.sh (ga-5jyo8) will still catch this within minutes."
+    fi
+    ;;
+esac
 
 # Stamp gate:queued on the SOURCE bead (ga-dt6bu / ga-oonk3 thrash fix). Without it, a
 # bead created with no lifecycle label sits RAW between marker creation and the gate
