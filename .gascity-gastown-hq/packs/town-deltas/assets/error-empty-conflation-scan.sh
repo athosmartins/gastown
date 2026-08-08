@@ -82,6 +82,71 @@ GC_CITY="/Users/athos/gt/.gascity-gastown-hq"
 # would have been caught before this line added `gc`.
 QUERY_TOOL_RE='([^A-Za-z0-9_]|^)(bd|gc|dolt|jq|grep|git|gh|curl|sqlite3|mysql|aws)([^A-Za-z0-9_]|$)'
 
+# ga-q0n6a: inline-comment allowlist, shared by C1/C2 and the new C4-C9
+# detectors below. Required by the bead's own design constraint — a
+# heuristic grep-class scanner with no escape hatch becomes noise and people
+# stop running it (same lesson C1/C2/C3 already learned the hard way via
+# their own false-positive fixes above: ga-l4nx1, ga-50m2, ga-g2eg). Mark a
+# specific line as reviewed-and-fine with a trailing inline comment:
+#   some_risky_line   # erro-vs-vazio: ok porque <razao>
+# Deliberately a SUBSTRING match on the marker text, not a structured
+# parser — consistent with this file's stated heuristic philosophy.
+#
+# Deliberately NOT wired into C3 (scan_launchd_no_notify) at all: (a) its
+# real finding is reported against the .plist (XML) file at a hardcoded line
+# 1, which has no natural home for a shell-style inline comment — an XML
+# file's own comment syntax is different, and checking literal line 1 of a
+# plist for this marker string would be checking essentially arbitrary XML
+# preamble text, not a human's actual annotation; (b) its "plist unreadable"
+# case is an "I don't know", not a finding — allowlisting a "don't know" is
+# a category error, there is nothing there yet to have reviewed as fine.
+_allowlisted() {
+  local file="$1" lineno="$2"
+  [ -z "$lineno" ] && return 1
+  case "$lineno" in ''|*[!0-9]*) return 1 ;; esac
+  sed -n "${lineno}p" "$file" 2>/dev/null | grep -qi 'erro-vs-vazio:[[:space:]]*ok'
+}
+
+# ga-q0n6a: join backslash-line-continued shell statements into one logical
+# line before scanning, for detectors where it matters (C4/C5/C9 below — all
+# of which look for an ABSENT flag/word anywhere in a `bd`/`git` invocation
+# that routinely spans several physical lines in this exact codebase's own
+# style, e.g.:
+#   MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all --limit 0 \
+#     -l type:quality-gate-marker \
+#     2>/dev/null || echo "[]")
+# A single-physical-line scan would see only the first line, miss the
+# --limit 0 on line 2, and FALSE-POSITIVE on a call that is actually fine —
+# worse than the false-negative the existing C1/C2 shell detectors accept as
+# a documented limitation (a missed real bug vs. a wrong accusation; this
+# scanner's own report-only philosophy tolerates the former far better than
+# the latter). Outputs "STARTLINE<TAB>JOINED TEXT" per logical line — the
+# tab is deliberate (a literal backslash "\" inside a bd command's own
+# argument text, e.g. a description string, could otherwise be misread as a
+# field separator if a naive delimiter like ":" or space were used instead).
+_join_continued_lines() {
+  local file="$1" lineno=0 start=0 buf="" line
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    if [ -z "$buf" ]; then start=$lineno; fi
+    case "$line" in
+      *'\')
+        buf="${buf}${line%\\} "
+        continue
+        ;;
+    esac
+    buf="${buf}${line}"
+    printf '%s\t%s\n' "$start" "$buf"
+    buf=""
+  done <"$file"
+  # A file ending mid-continuation (dangling trailing backslash, no final
+  # newline) still has buffered content to flush — report what was gathered
+  # rather than silently dropping the tail of the file.
+  if [ -n "$buf" ]; then
+    printf '%s\t%s\n' "$start" "$buf"
+  fi
+}
+
 # ── C2 (priority) + C1-shell: query-command assignment whose failure is ────
 # masked by an empty-looking fallback (C2) or by an unconditional `|| true`
 # (C1) instead of an explicit `if ! VAR=$(cmd); then ...` rc capture.
@@ -166,7 +231,10 @@ _c2_scan_substitutions() {
       # ""'` -> '' rc=0, igual a `echo '{}' | jq -r '.a // ""'` -> '' rc=0 (ga-vkjs).
       *'2>/dev/null |'*' // '* | *'2>/dev/null |'*'2>/dev/null'* | \
         *'| jq '*' // "'* | *"| jq "*" // '"*)
-        echo "${_file}:${_lineno}:C2:${_frag}"
+        # ga-q0n6a: allowlist check wraps the echo, not the return — still
+        # "classified" (first-match-wins per this loop's own design above),
+        # just silently instead of printed.
+        _allowlisted "$_file" "$_lineno" || echo "${_file}:${_lineno}:C2:${_frag}"
         return 0 ;;
       # C2 — fallback literal fabrica um valor vazio-parece-válido (ga-50m2: agora
       # julgado por substituição, não mais casado contra a linha inteira — uma
@@ -174,12 +242,12 @@ _c2_scan_substitutions() {
       # aqui).
       *'|| echo "[]"'* | *"|| echo '[]'"* | *'|| echo ""'* | *"|| echo ''"* | \
         *'|| echo "0"'* | *'|| echo "null"'* | *'|| echo "{}"'* | *"|| echo '{}'"*)
-        echo "${_file}:${_lineno}:C2:${_frag}"
+        _allowlisted "$_file" "$_lineno" || echo "${_file}:${_lineno}:C2:${_frag}"
         return 0 ;;
       # C1 — o erro simplesmente some, nenhum sinal sobrevive (ga-50m2: idem, por
       # substituição — não mais pela linha inteira).
       *'|| true'*)
-        echo "${_file}:${_lineno}:C1:${_frag}"
+        _allowlisted "$_file" "$_lineno" || echo "${_file}:${_lineno}:C1:${_frag}"
         return 0 ;;
     esac
   done
@@ -210,7 +278,7 @@ scan_js_empty_catch() {
       compact="$(printf '%s' "$line" | tr -d '[:space:]')"
       if [ -z "$compact" ]; then continue; fi
       case "$compact" in
-        '}'*) echo "${file}:${start}:C1:empty catch block (multi-line)" ;;
+        '}'*) _allowlisted "$file" "$start" || echo "${file}:${start}:C1:empty catch block (multi-line)" ;;
       esac
       waiting=0
       continue
@@ -223,7 +291,7 @@ scan_js_empty_catch() {
       *) continue ;;
     esac
     if printf '%s\n' "$line" | grep -Eq 'catch[[:space:]]*\([^)]*\)[[:space:]]*\{[[:space:]]*\}'; then
-      echo "${file}:${lineno}:C1:${line}"
+      _allowlisted "$file" "$lineno" || echo "${file}:${lineno}:C1:${line}"
     elif printf '%s\n' "$line" | grep -Eq 'catch[[:space:]]*\([^)]*\)[[:space:]]*\{[[:space:]]*$'; then
       waiting=1
       start=$lineno
@@ -242,7 +310,7 @@ scan_py_bare_except() {
       compact="$(printf '%s' "$line" | tr -d '[:space:]')"
       if [ -z "$compact" ]; then continue; fi
       case "$compact" in
-        pass | pass'#'*) echo "${file}:${start}:C1:bare except: pass (multi-line)" ;;
+        pass | pass'#'*) _allowlisted "$file" "$start" || echo "${file}:${start}:C1:bare except: pass (multi-line)" ;;
       esac
       waiting=0
       continue
@@ -252,7 +320,7 @@ scan_py_bare_except() {
       *) continue ;;
     esac
     if printf '%s\n' "$line" | grep -Eq '^[[:space:]]*except([[:space:]]+[A-Za-z_][A-Za-z0-9_.,[:space:]]*)?:[[:space:]]*pass[[:space:]]*(#.*)?$'; then
-      echo "${file}:${lineno}:C1:${line}"
+      _allowlisted "$file" "$lineno" || echo "${file}:${lineno}:C1:${line}"
     elif printf '%s\n' "$line" | grep -Eq '^[[:space:]]*except([[:space:]]+[A-Za-z_][A-Za-z0-9_.,[:space:]]*)?:[[:space:]]*(#.*)?$'; then
       waiting=1
       start=$lineno
@@ -315,6 +383,219 @@ scan_launchd_no_notify() {
   [ -r "$script" ] || return 0
   grep -qiE 'notify|ntfy|gc mail send|gc session nudge' "$script" && return 0
   echo "${plist}:1:C3:launchd job (script: $script) has no failure-notification call (notify/gc mail send/gc session nudge/ntfy)"
+}
+
+# ═════════════════════════════════════════════════════════════════════════
+# ga-q0n6a: C4-C9 — 6 additional error-vs-empty idioms sliced from the
+# erro-vs-vazio epic (ga-05604), each with a real measured instance in this
+# city at the time the bead was written. Deliberately NOT folded into C1/C2's
+# existing shape-matching — each idiom below has its own distinct trigger
+# condition and would only dilute the well-tested C1/C2 logic if merged in.
+# All 6 are shell-only (.sh) detectors: `$?`-after-pipe, jq field-existence,
+# and the various bd/git flag-omission idioms below are shell-specific
+# concepts with no direct JS/Python equivalent (those languages have their
+# own distinct failure-modes, out of scope for this slice — see C1's JS/
+# Python detectors above for that separate territory).
+# ═════════════════════════════════════════════════════════════════════════
+
+# ── C4: `bd list --json` without `--limit 0` in a sweep ─────────────────────
+# bd 1.1.0 truncates `bd list --json` at 50 results by default; the warning
+# ("Showing 50 issues... use --limit 0 for all") goes to stderr, which this
+# very codebase's own idiom (`2>/dev/null`) routinely swallows — a filtered
+# query whose real result set is under 50 works by accident, and the defect
+# is latent until the backlog crosses 50, which is exactly when a diagnostic
+# matters most (ga-21kmp: measured 96 call sites city-wide at bead-write
+# time; two real Mayor misjudgments cited: "no digest beads exist" when 10
+# existed past the first 50, and "10 armed beads" when there were 19).
+# Scoped to `--json` invocations only — a bare interactive `bd list` (no
+# --json) is a human eyeballing output directly, not a program silently
+# under-seeing a truncated result, which is the actual danger this idiom
+# names. Uses the joined-logical-line view (see _join_continued_lines above)
+# so a `--limit 0` on a continuation line 2+ is not missed.
+#
+# Optional 2nd arg <joined>: a pre-computed _join_continued_lines output, so
+# run_scan's hot loop can compute it ONCE per file and share it across this
+# function and C5/C6/C8 below instead of each re-reading the same file
+# independently (ga-kqznp: this scanner's per-file cost is the live known
+# bottleneck; 4 redundant full-file read loops per file would have made that
+# measurably worse for zero new coverage). Defaults to computing it locally
+# when called standalone (as every direct-function selftest call above does),
+# so the calling convention used throughout this file's existing tests is
+# unchanged.
+#
+# ga-q0n6a perf fix (falsified against pilot-dispatcher.sh, a real 7426-line
+# bd-heavy dispatcher — an earlier draft with a bash-case pre-filter INSIDE
+# the per-joined-line loop still forked grep -Eq 2x for every "list"-
+# containing line, and this file alone has hundreds; that measurably hung
+# the whole scan). The candidate search itself is now done via `grep -E`
+# PIPED over the WHOLE joined blob (grep's own fast internal C loop scans
+# every line in one process), not a bash while-loop forking grep once per
+# line — only the FEW lines that survive both greps ever reach the bash
+# loop below, where the remaining check (is --limit 0 present?) is cheap
+# because there are now only a handful of candidates, not hundreds.
+scan_bd_list_no_limit() {
+  local file="$1" joined="${2:-}" ln frag
+  [ -z "$joined" ] && joined="$(_join_continued_lines "$file")"
+  while IFS="$(printf '\t')" read -r ln frag; do
+    [ -z "$ln" ] && continue
+    printf '%s' "$frag" | grep -Eq -- '--limit[[:space:]]+0|-n[[:space:]]+0|--limit=0' && continue
+    _allowlisted "$file" "$ln" && continue
+    echo "${file}:${ln}:C4:${frag}"
+  done < <(printf '%s\n' "$joined" \
+    | grep -E "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]]list([[:space:]]|\$)" \
+    | grep -F -- '--json')
+}
+
+# ── C5: `bd list`/`show` on `type:quality-gate-*` without `--include-infra` ──
+# bd 1.1.0 classifies an `--ephemeral` bead as INFRA and omits it from `bd
+# list` by default. Gate marker/run/verdict beads are the confirmed-affected
+# family in this city (ga-vm20x: a guard saw 0 markers where 7 existed,
+# logging the honest-sounding "No work. Exiting." for 2 hours while real
+# submissions queued). Scoped narrowly to the `type:quality-gate-` prefix —
+# the confirmed-affected family — rather than every `type:` filter, since
+# this scanner reports only what has been actually verified affected (see
+# ga-vm20x's own P1→P3 rescoping note: guessing at unverified affected types
+# is exactly the "measure, don't guess" failure this whole epic is about).
+# Optional 2nd arg <joined>: see scan_bd_list_no_limit's docstring above —
+# same shared-computation rationale, same default-if-omitted behavior.
+scan_bd_gate_no_infra() {
+  local file="$1" joined="${2:-}" ln frag
+  [ -z "$joined" ] && joined="$(_join_continued_lines "$file")"
+  # Perf: piped grep over the whole blob, not a per-line bash loop — see
+  # scan_bd_list_no_limit's docstring above for why this matters.
+  while IFS="$(printf '\t')" read -r ln frag; do
+    [ -z "$ln" ] && continue
+    printf '%s' "$frag" | grep -Eq -- '--include-infra' && continue
+    _allowlisted "$file" "$ln" && continue
+    echo "${file}:${ln}:C5:${frag}"
+  done < <(printf '%s\n' "$joined" \
+    | grep -E "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]](list|show)([[:space:]]|\$)" \
+    | grep -F -- 'type:quality-gate-')
+}
+
+# ── C6: parsing FORMATTED (non-JSON) `bd comments`/`bd show` output ─────────
+# `bd comments`/`bd show` without `--json` produce human-readable text that
+# `bd` itself wraps at ~80 columns — a grep/sed/awk pattern written against
+# one-line-per-record output silently breaks when a matched string happens to
+# straddle a wrap point (ga-fic5d: story-delivery's merge-detection regex
+# missed a real merge because `bd comments`'s line wrap split the commit SHA
+# across two lines). The fix is `--json` + `jq`, which this scanner already
+# encourages via C1/C2's own query-tool vocabulary. Only flags when the
+# unparsed output is actually piped into a text-processing tool — a bare `bd
+# show "$ID"` for a human to read on a terminal is not this bug.
+# Optional 2nd arg <joined>: see scan_bd_list_no_limit's docstring above —
+# same shared-computation rationale, same default-if-omitted behavior.
+scan_bd_formatted_output_parsed() {
+  local file="$1" joined="${2:-}" ln frag
+  [ -z "$joined" ] && joined="$(_join_continued_lines "$file")"
+  # Perf: piped grep chain over the whole blob, not a per-line bash loop —
+  # see scan_bd_list_no_limit's docstring above. The --json exemption is a
+  # `grep -v` stage (drop lines that already have it) rather than a bash
+  # check, kept in the same fast chain.
+  while IFS="$(printf '\t')" read -r ln frag; do
+    [ -z "$ln" ] && continue
+    _allowlisted "$file" "$ln" && continue
+    echo "${file}:${ln}:C6:${frag}"
+  done < <(printf '%s\n' "$joined" \
+    | grep -E "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]](comments|show)([[:space:]]|\$)" \
+    | grep -E '\|[[:space:]]*(grep|egrep|sed|awk)([^A-Za-z0-9_]|$)' \
+    | grep -v -- '--json')
+}
+
+# ── C7: `$?` read immediately after a piped command ──────────────────────────
+# `$?` reflects only the LAST command in a pipeline — `risky_cmd | head -1;
+# echo $?` is always 0 regardless of whether risky_cmd itself failed, because
+# head succeeded. A real incident this idiom exists to name: a "confirming" a
+# false P0 premise this way, same day this bead was written. Single-physical-
+# line detector only (declared limitation, matching this file's own honest
+# style for C1/C2's documented backslash-continuation gap above) — the
+# continuation-joiner is not used here because `;`-separated statements on
+# one joined logical line would make "immediately after" ambiguous to detect
+# reliably; the common real shape is two adjacent physical lines or a `;` on
+# one line, both handled below.
+# The `[^|]\|[^|]` shape matches a lone `|` (pipe) that is not part of a `||`
+# (or-operator, already handled by C1) — deliberately avoids `\b`/`\s` per
+# this file's house style (BSD grep does not reliably support them).
+# ga-q0n6a perf fix: rewritten to use ONLY bash-builtin string checks, zero
+# grep subprocess calls per line (the original draft called grep 1-3x per
+# LINE unconditionally, measurably worsening the ga-kqznp performance
+# concern — falsified by benchmarking the live tree before/after, see the
+# bead's own comments). "Has a real pipe" is computed by stripping every
+# literal `||` first via bash's own `${var//pat/repl}` substitution, then
+# checking whether any `|` remains — a lone survivor is a real pipe, not an
+# or-operator (that's C1's territory, not C7's). Trades exact same-line
+# ordering precision (is the `$?` actually AFTER the pipe?) for speed — this
+# file is a heuristic grep-class scanner by its own stated design, not a
+# parser; in practice a `$?` on a line with a real pipe is checking that
+# pipe's result in the overwhelming majority of real code.
+scan_pipe_then_exit_code() {
+  local file="$1" lineno=0 prev_has_pipe=0 prev_line="" line stripped has_pipe has_dollarq
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    stripped="${line//||/}"
+    case "$stripped" in *'|'*) has_pipe=1 ;; *) has_pipe=0 ;; esac
+    case "$line" in *'$?'*) has_dollarq=1 ;; *) has_dollarq=0 ;; esac
+
+    if [ "$has_pipe" = "1" ] && [ "$has_dollarq" = "1" ]; then
+      # Same-line shape: `cmd1 | cmd2; echo $?` (or `[ $? ... ]`, `if [ $? ...`).
+      _allowlisted "$file" "$lineno" || echo "${file}:${lineno}:C7:${line}"
+    elif [ "$prev_has_pipe" = "1" ] && [ "$has_dollarq" = "1" ]; then
+      # Adjacent-line shape: pipe on the line before, $? read on this one.
+      _allowlisted "$file" "$((lineno - 1))" || echo "${file}:$((lineno - 1)):C7:${prev_line}"
+    fi
+    prev_has_pipe="$has_pipe"
+    prev_line="$line"
+  done <"$file"
+}
+
+# ── C8: `jq '.field | length'` used as an existence test ─────────────────────
+# ABSENT and EMPTY-ARRAY both report length 0 — `.field | length` cannot tell
+# "the key never existed" from "the key exists and holds []". The correct
+# existence test is `has("field")`. Two real same-day near-misses cited in
+# this bead: almost filing a P0 claiming bd's contract had changed, and
+# almost declaring a P0 that a scope-check field was absent, when both were
+# actually present-but-empty. Scoped to a DOTTED FIELD PATH piped to length
+# (`.foo`, `.foo.bar`) — a bare `jq 'length'` (no leading field) is counting
+# the WHOLE input's own size, a different and legitimate operation this
+# detector does not flag.
+# Optional 2nd arg <joined>: see scan_bd_list_no_limit's docstring above —
+# same shared-computation rationale, same default-if-omitted behavior.
+scan_jq_length_as_existence() {
+  local file="$1" joined="${2:-}" ln frag
+  [ -z "$joined" ] && joined="$(_join_continued_lines "$file")"
+  # Perf: piped grep chain over the whole blob, not a per-line bash loop —
+  # see scan_bd_list_no_limit's docstring above.
+  while IFS="$(printf '\t')" read -r ln frag; do
+    [ -z "$ln" ] && continue
+    _allowlisted "$file" "$ln" && continue
+    echo "${file}:${ln}:C8:${frag}"
+  done < <(printf '%s\n' "$joined" \
+    | grep -E "([^A-Za-z0-9_]|^)jq([^A-Za-z0-9_]|\$)" \
+    | grep -E '\.[A-Za-z_][A-Za-z0-9_.]*[[:space:]]*\|[[:space:]]*length')
+}
+
+# ── C9: `git merge-base --is-ancestor` / `git rev-parse origin/<br>` with no
+# `git fetch` anywhere in the same file ──────────────────────────────────────
+# Both commands answer against the LOCAL cached view of origin — fast and
+# silent, with no error, even when that cache is stale. Without a preceding
+# `git fetch`, the answer reflects whatever origin looked like at the last
+# unrelated fetch, not now. Real incident cited: incorrectly disarming a bead
+# that actually had pending work, same day this bead was written. FILE-LEVEL
+# heuristic (declared limitation, matching C3's own file-level notify-
+# presence check above) — true execution-order analysis (is the fetch
+# actually BEFORE this specific call?) needs control-flow tracking, out of
+# scope for a heuristic grep-class scanner; a file containing both is treated
+# as fine even if their relative order is wrong, exactly as C3 treats a
+# notify call anywhere in a launchd target script as fine regardless of
+# whether it's actually reachable from the failure branch.
+scan_git_stale_cache_check() {
+  local file="$1"
+  grep -Eq -- '--is-ancestor|rev-parse[[:space:]]+.*origin/' "$file" || return 0
+  grep -Eq -- 'git[[:space:]]+fetch' "$file" && return 0
+  grep -nE -- '--is-ancestor|rev-parse[[:space:]]+.*origin/' "$file" | while IFS=: read -r ln rest; do
+    _allowlisted "$file" "$ln" && continue
+    echo "${file}:${ln}:C9:no git fetch found anywhere in this file: ${rest}"
+  done
 }
 
 # ── driver ───────────────────────────────────────────────────────────────────
@@ -382,9 +663,46 @@ run_scan() {
     -not -name '*.selftest.sh'
   )
 
-  local f
+  local f _joined
+  # ga-q0n6a: C4-C9 folded into this SAME .sh loop/find pass rather than each
+  # getting their own — ga-kqznp already flags this scanner's per-file cost
+  # as the live bottleneck (~5 files/s); a second full-tree find+read pass
+  # for the same file set would double that cost for zero new coverage.
+  # _join_continued_lines is computed ONCE per file here (when needed at
+  # all — see the file-level pre-filters below) and threaded into C4/C5/C6/
+  # C8 (their optional 2nd arg) — same rationale, one level down: those 4
+  # would otherwise each independently re-read+re-join the same file,
+  # quadrupling that specific cost for zero new coverage.
+  #
+  # File-level pre-filters (cheap single grep -q per file) skip the join AND
+  # the per-line detector call entirely for files that cannot possibly
+  # match — same "cheap check before expensive work" principle as each
+  # detector's own internal bash-case line pre-filter. Benchmarked: an
+  # earlier draft without any of this (per-line grep -Eq calls unconditional,
+  # no file-level skip) did not complete a full HQ scan within 90s; with
+  # these two layers plus the per-line bash-case prefilters above, see the
+  # bead's own comment for the measured result.
   while IFS= read -r -d '' f; do
     scan_shell_query_masking "$f" >>"$findings_file"
+    _joined=""
+
+    if grep -q 'bd' "$f" 2>/dev/null; then
+      _joined="$(_join_continued_lines "$f")"
+      scan_bd_list_no_limit "$f" "$_joined" >>"$findings_file"
+      scan_bd_gate_no_infra "$f" "$_joined" >>"$findings_file"
+      scan_bd_formatted_output_parsed "$f" "$_joined" >>"$findings_file"
+    fi
+
+    if grep -q '|' "$f" 2>/dev/null; then
+      scan_pipe_then_exit_code "$f" >>"$findings_file"
+    fi
+
+    if grep -q 'jq' "$f" 2>/dev/null; then
+      [ -z "$_joined" ] && _joined="$(_join_continued_lines "$f")"
+      scan_jq_length_as_existence "$f" "$_joined" >>"$findings_file"
+    fi
+
+    scan_git_stale_cache_check "$f" >>"$findings_file"
   done < <(find "${roots[@]}" -type f -name '*.sh' "${EXCL[@]}" -print0 2>/dev/null)
 
   while IFS= read -r -d '' f; do

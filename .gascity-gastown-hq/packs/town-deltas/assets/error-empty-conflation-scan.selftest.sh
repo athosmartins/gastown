@@ -30,7 +30,9 @@ CONFLATION_SCAN_LIB_ONLY=1 . "$SCANNER" \
   || { echo "FATAL: could not source scanner in lib-only mode"; exit 1; }
 set +e  # the harness counts its own pass/fail
 
-for fn in scan_shell_query_masking scan_js_empty_catch scan_py_bare_except scan_launchd_no_notify run_scan; do
+for fn in scan_shell_query_masking scan_js_empty_catch scan_py_bare_except scan_launchd_no_notify \
+  scan_bd_list_no_limit scan_bd_gate_no_infra scan_bd_formatted_output_parsed scan_pipe_then_exit_code \
+  scan_jq_length_as_existence scan_git_stale_cache_check _allowlisted _join_continued_lines run_scan; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by scanner"; exit 1; }
 done
 
@@ -175,8 +177,14 @@ EOF
 # ── GOOD (must NOT be flagged): the established FIXED idiom — explicit rc
 # capture via `if ! VAR=$(cmd); then`, same shape as verdict_count_from_query
 # (ga-jfo7) / prune_decision (ga-u4yi attempt 1) ───────────────────────────
+# ga-q0n6a: --limit 0 added here (was previously absent) — this fixture is
+# copied into $FIXDIR/clean and held up as a fully-correct reference idiom;
+# without --limit 0 it genuinely also trips C4 (a real, independent gap this
+# bead's own scanner extension now catches), which is correct behavior from
+# C4's side but would have broken the "clean dir -> 0 findings" falsification
+# below. Fixing the fixture, not the detector.
 cat > "$FIXDIR/mixed/good_rc_capture.sh" <<'EOF'
-if ! _found=$(bd -C "$_store" list --label "gate:needs-human" --status=open --json 2>/dev/null); then
+if ! _found=$(bd -C "$_store" list --label "gate:needs-human" --status=open --json --limit 0 2>/dev/null); then
   warn "candidate query failed for store $_store — not pruning this sweep"
 fi
 EOF
@@ -451,6 +459,145 @@ except:
     pass
 EOF
 
+# ── ga-q0n6a: C4-C9 fixtures — 6 additional idioms sliced from the erro-vs-
+# vazio epic (ga-05604). One BAD + one GOOD per idiom, per the bead's own
+# acceptance criteria ("7 casos positivos... e um caso NEGATIVO por idioma").
+# ─────────────────────────────────────────────────────────────────────────
+
+# ── C4: bd list --json without --limit 0 ────────────────────────────────
+cat > "$FIXDIR/mixed/bad_c4_no_limit.sh" <<'EOF'
+MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all --include-infra -l type:x 2>/dev/null || echo "[]")
+EOF
+
+# ga-q0n6a: explicit rc-capture (matching good_rc_capture.sh's own idiom
+# above), not `|| echo "[]"` — a good-for-C4 fixture that still masks a
+# query failure via C2's own bug shape would break the clean-dir
+# falsification the moment it's copied there (found and fixed the same way
+# for good_rc_capture.sh above — same lesson, applied consistently here).
+cat > "$FIXDIR/mixed/good_c4_has_limit.sh" <<'EOF'
+if ! MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all --limit 0 --include-infra -l type:x 2>/dev/null); then
+  warn "query failed"
+fi
+EOF
+cp "$FIXDIR/mixed/good_c4_has_limit.sh" "$FIXDIR/clean/"
+
+# ga-q0n6a: multi-line continuation shape (this codebase's own dominant
+# style) — --limit 0 lives on a continuation line, not the first physical
+# line. Proves _join_continued_lines actually closes the gap it exists for.
+cat > "$FIXDIR/mixed/good_c4_multiline_has_limit.sh" <<'EOF'
+if ! MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all --limit 0 --include-infra \
+  -l type:quality-gate-marker \
+  --label-any gate-status:ready \
+  2>/dev/null); then
+  warn "query failed"
+fi
+EOF
+cp "$FIXDIR/mixed/good_c4_multiline_has_limit.sh" "$FIXDIR/clean/"
+
+# ── C5: bd list/show on type:quality-gate-* without --include-infra ─────
+cat > "$FIXDIR/mixed/bad_c5_no_infra.sh" <<'EOF'
+GATE_RUNS_JSON=$(bd -C "$GC_CITY" list --json --all --limit 0 -l type:quality-gate-run --label-any gate-status:running 2>/dev/null)
+EOF
+
+cat > "$FIXDIR/mixed/good_c5_has_infra.sh" <<'EOF'
+GATE_RUNS_JSON=$(bd -C "$GC_CITY" list --json --all --limit 0 --include-infra -l type:quality-gate-run --label-any gate-status:running 2>/dev/null)
+EOF
+cp "$FIXDIR/mixed/good_c5_has_infra.sh" "$FIXDIR/clean/"
+
+# ga-q0n6a: not a quality-gate type at all — must not be flagged (the
+# detector is deliberately scoped narrow, not every type: filter).
+cat > "$FIXDIR/mixed/good_c5_not_gate_type.sh" <<'EOF'
+OTHER_JSON=$(bd -C "$GC_CITY" list --json --all --limit 0 -l type:something-else 2>/dev/null)
+EOF
+cp "$FIXDIR/mixed/good_c5_not_gate_type.sh" "$FIXDIR/clean/"
+
+# ── C6: bd comments/show (non-JSON) piped into grep/sed/awk ─────────────
+cat > "$FIXDIR/mixed/bad_c6_formatted_parse.sh" <<'EOF'
+bd comments "$ID" | grep -A2 "some text"
+EOF
+
+cat > "$FIXDIR/mixed/good_c6_json_parse.sh" <<'EOF'
+bd show "$ID" --json | jq -r .status
+EOF
+cp "$FIXDIR/mixed/good_c6_json_parse.sh" "$FIXDIR/clean/"
+
+# ga-q0n6a: no downstream text-tool pipe at all — a human reading terminal
+# output directly is not this bug.
+cat > "$FIXDIR/mixed/good_c6_no_downstream_parse.sh" <<'EOF'
+bd show "$ID"
+EOF
+cp "$FIXDIR/mixed/good_c6_no_downstream_parse.sh" "$FIXDIR/clean/"
+
+# ── C7: $? read immediately after a piped command ────────────────────────
+cat > "$FIXDIR/mixed/bad_c7_pipe_dollarq_sameline.sh" <<'EOF'
+risky_cmd | head -1; echo $?
+EOF
+
+cat > "$FIXDIR/mixed/bad_c7_pipe_dollarq_nextline.sh" <<'EOF'
+risky_cmd | head -1
+echo $?
+EOF
+
+cat > "$FIXDIR/mixed/good_c7_no_pipe.sh" <<'EOF'
+risky_cmd
+echo $?
+EOF
+cp "$FIXDIR/mixed/good_c7_no_pipe.sh" "$FIXDIR/clean/"
+
+# ga-q0n6a: `||` (or-operator) must never be misread as a real pipe — this
+# is C1's territory (query masked via `|| true`-shaped fallback), not C7's.
+cat > "$FIXDIR/mixed/good_c7_oror_not_pipe.sh" <<'EOF'
+cmd1 || cmd2
+echo $?
+EOF
+cp "$FIXDIR/mixed/good_c7_oror_not_pipe.sh" "$FIXDIR/clean/"
+
+# ── C8: jq '.field | length' used as an existence test ───────────────────
+cat > "$FIXDIR/mixed/bad_c8_length_existence.sh" <<'EOF'
+n=$(echo "$json" | jq '.items | length')
+EOF
+
+cat > "$FIXDIR/mixed/good_c8_has.sh" <<'EOF'
+h=$(echo "$json" | jq 'has("items")')
+EOF
+cp "$FIXDIR/mixed/good_c8_has.sh" "$FIXDIR/clean/"
+
+# ga-q0n6a: bare `length` (no leading field path) counts the WHOLE input's
+# own size — a different, legitimate operation, not the existence-test bug.
+cat > "$FIXDIR/mixed/good_c8_bare_length.sh" <<'EOF'
+n=$(echo "$arr" | jq 'length')
+EOF
+cp "$FIXDIR/mixed/good_c8_bare_length.sh" "$FIXDIR/clean/"
+
+# ── C9: git merge-base --is-ancestor / rev-parse origin/<br> without fetch ─
+cat > "$FIXDIR/mixed/bad_c9_no_fetch.sh" <<'EOF'
+if git merge-base --is-ancestor "origin/$branch" origin/main; then
+  echo "merged"
+fi
+EOF
+
+cat > "$FIXDIR/mixed/good_c9_has_fetch.sh" <<'EOF'
+git fetch origin main --quiet
+if git merge-base --is-ancestor "origin/$branch" origin/main; then
+  echo "merged"
+fi
+EOF
+cp "$FIXDIR/mixed/good_c9_has_fetch.sh" "$FIXDIR/clean/"
+
+cat > "$FIXDIR/mixed/good_c9_irrelevant.sh" <<'EOF'
+echo "nothing to see here"
+git status
+EOF
+cp "$FIXDIR/mixed/good_c9_irrelevant.sh" "$FIXDIR/clean/"
+
+# ── Allowlist mechanism (shared across C1/C2/C4-C9) ──────────────────────
+# ga-q0n6a's own design requirement: a would-be C4 finding, silenced by the
+# inline marker comment on the same line.
+cat > "$FIXDIR/mixed/good_allowlisted_c4.sh" <<'EOF'
+MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all --include-infra -l type:x 2>/dev/null || echo "[]")  # erro-vs-vazio: ok porque single-tenant test fixture, never has >50 rows
+EOF
+cp "$FIXDIR/mixed/good_allowlisted_c4.sh" "$FIXDIR/clean/"
+
 # ═════════════════════════════════════════════════════════════════════════
 # 1. Direct pure-function detection tests
 # ═════════════════════════════════════════════════════════════════════════
@@ -559,6 +706,64 @@ r="$(scan_launchd_no_notify "$FIXDIR/progkey/ilegivel.plist")"
 case "$r" in *:C3:*) ok "ga-vkjs: plist ilegivel -> reporta 'nao sei' em vez de engolir (nao-sei != esta-ok)" ;;
   *) bad "ga-vkjs: plist ilegivel passou EM SILENCIO — o fail-open que este scanner existe pra caçar: '$r'" ;; esac
 
+# ── ga-q0n6a: C4-C9 direct-function detection tests ──────────────────────
+echo "── scan_bd_list_no_limit (C4) ──"
+r="$(scan_bd_list_no_limit "$FIXDIR/mixed/bad_c4_no_limit.sh")"
+case "$r" in *:C4:*) ok "bd list --json, no --limit 0 → flagged C4" ;; *) bad "no-limit NOT flagged: '$r'" ;; esac
+r="$(scan_bd_list_no_limit "$FIXDIR/mixed/good_c4_has_limit.sh")"
+[ -z "$r" ] && ok "bd list --json --limit 0 → NOT flagged" || bad "REGRESSION: has-limit flagged: '$r'"
+r="$(scan_bd_list_no_limit "$FIXDIR/mixed/good_c4_multiline_has_limit.sh")"
+[ -z "$r" ] && ok "multi-line continuation: --limit 0 on line 2+ still found (joiner works) → NOT flagged" \
+  || bad "REGRESSION: multiline --limit 0 not recognized, false positive: '$r'"
+
+echo "── scan_bd_gate_no_infra (C5) ──"
+r="$(scan_bd_gate_no_infra "$FIXDIR/mixed/bad_c5_no_infra.sh")"
+case "$r" in *:C5:*) ok "bd list on type:quality-gate-*, no --include-infra → flagged C5" ;; *) bad "no-infra NOT flagged: '$r'" ;; esac
+r="$(scan_bd_gate_no_infra "$FIXDIR/mixed/good_c5_has_infra.sh")"
+[ -z "$r" ] && ok "bd list with --include-infra → NOT flagged" || bad "REGRESSION: has-infra flagged: '$r'"
+r="$(scan_bd_gate_no_infra "$FIXDIR/mixed/good_c5_not_gate_type.sh")"
+[ -z "$r" ] && ok "bd list on a non-gate type: → NOT flagged (scoped narrow)" || bad "REGRESSION: non-gate-type flagged: '$r'"
+
+echo "── scan_bd_formatted_output_parsed (C6) ──"
+r="$(scan_bd_formatted_output_parsed "$FIXDIR/mixed/bad_c6_formatted_parse.sh")"
+case "$r" in *:C6:*) ok "bd comments piped to grep, no --json → flagged C6" ;; *) bad "formatted-parse NOT flagged: '$r'" ;; esac
+r="$(scan_bd_formatted_output_parsed "$FIXDIR/mixed/good_c6_json_parse.sh")"
+[ -z "$r" ] && ok "bd show --json piped to jq → NOT flagged" || bad "REGRESSION: json-parse flagged: '$r'"
+r="$(scan_bd_formatted_output_parsed "$FIXDIR/mixed/good_c6_no_downstream_parse.sh")"
+[ -z "$r" ] && ok "bd show with no downstream text-tool pipe → NOT flagged" || bad "REGRESSION: no-pipe flagged: '$r'"
+
+echo "── scan_pipe_then_exit_code (C7) ──"
+r="$(scan_pipe_then_exit_code "$FIXDIR/mixed/bad_c7_pipe_dollarq_sameline.sh")"
+case "$r" in *:C7:*) ok "pipe then \$? same line (cmd | head; echo \$?) → flagged C7" ;; *) bad "same-line NOT flagged: '$r'" ;; esac
+r="$(scan_pipe_then_exit_code "$FIXDIR/mixed/bad_c7_pipe_dollarq_nextline.sh")"
+case "$r" in *:C7:*) ok "pipe then \$? next line → flagged C7" ;; *) bad "next-line NOT flagged: '$r'" ;; esac
+r="$(scan_pipe_then_exit_code "$FIXDIR/mixed/good_c7_no_pipe.sh")"
+[ -z "$r" ] && ok "no pipe before \$? → NOT flagged" || bad "REGRESSION: no-pipe flagged: '$r'"
+r="$(scan_pipe_then_exit_code "$FIXDIR/mixed/good_c7_oror_not_pipe.sh")"
+[ -z "$r" ] && ok "|| (or-operator) before \$? → NOT flagged (C1's territory, not C7's)" \
+  || bad "REGRESSION: || misread as a real pipe: '$r'"
+
+echo "── scan_jq_length_as_existence (C8) ──"
+r="$(scan_jq_length_as_existence "$FIXDIR/mixed/bad_c8_length_existence.sh")"
+case "$r" in *:C8:*) ok "jq '.field | length' as existence test → flagged C8" ;; *) bad "field-length NOT flagged: '$r'" ;; esac
+r="$(scan_jq_length_as_existence "$FIXDIR/mixed/good_c8_has.sh")"
+[ -z "$r" ] && ok "jq 'has(\"field\")' → NOT flagged" || bad "REGRESSION: has() flagged: '$r'"
+r="$(scan_jq_length_as_existence "$FIXDIR/mixed/good_c8_bare_length.sh")"
+[ -z "$r" ] && ok "jq 'length' (bare, whole-input size) → NOT flagged" || bad "REGRESSION: bare length flagged: '$r'"
+
+echo "── scan_git_stale_cache_check (C9) ──"
+r="$(scan_git_stale_cache_check "$FIXDIR/mixed/bad_c9_no_fetch.sh")"
+case "$r" in *:C9:*) ok "git merge-base --is-ancestor, no git fetch in file → flagged C9" ;; *) bad "no-fetch NOT flagged: '$r'" ;; esac
+r="$(scan_git_stale_cache_check "$FIXDIR/mixed/good_c9_has_fetch.sh")"
+[ -z "$r" ] && ok "git fetch present in file → NOT flagged" || bad "REGRESSION: has-fetch flagged: '$r'"
+r="$(scan_git_stale_cache_check "$FIXDIR/mixed/good_c9_irrelevant.sh")"
+[ -z "$r" ] && ok "no is-ancestor/rev-parse-origin at all → NOT flagged" || bad "REGRESSION: irrelevant file flagged: '$r'"
+
+echo "── allowlist mechanism (_allowlisted, shared C1/C2/C4-C9) ──"
+r="$(scan_bd_list_no_limit "$FIXDIR/mixed/good_allowlisted_c4.sh")"
+[ -z "$r" ] && ok "ga-q0n6a: inline 'erro-vs-vazio: ok porque ...' comment silences a would-be C4 finding" \
+  || bad "REGRESSION: allowlisted line still flagged: '$r'"
+
 echo "── run_scan end-to-end (mixed fixture dir) ──"
 MIXED_OUT="$(mktemp)"
 run_scan "$MIXED_OUT" "$FIXDIR/mixed"
@@ -576,8 +781,27 @@ mixed_count=$(wc -l <"$MIXED_OUT" | tr -d '[:space:]')
 # (each 1 real finding buried behind an inert/safe first substitution on the same
 # line) — the 3 good_inert_*_suffix.sh fixtures add 0 (fonte inerte, must NOT be
 # flagged even with a literal || echo/|| true suffix), so the total becomes 15.
-[ "$mixed_count" = "15" ] && ok "mixed fixture dir → 15 findings (13 pre-existing + 2 ga-50m2 new-detection cases hidden behind a same-line inert/safe substitution; the 3 inert-source-with-literal-suffix good fixtures correctly excluded, nothing missed or double-counted)" \
-  || bad "expected 15 findings in mixed dir, got $mixed_count"
+#
+# ga-q0n6a: +10 for the C4-C9 slice, bringing the total to 25:
+#   +1 C4 (bad_c4_no_limit.sh) — but that fixture ALSO carries the pre-
+#     existing `|| echo "[]"` shape, so it doubles as +1 C2 too: +2 total.
+#     Same cross-trigger already happens on 2 of the ORIGINAL 15 fixtures
+#     (bad_query_mask_echo.sh, bad_query_py_default.sh) — both now also
+#     legitimately trip C4 (they genuinely lack --limit 0 too, an
+#     independent real gap C4 correctly catches on top of their original
+#     C2 finding): +2 more, for +4 from C4 alone across old+new fixtures.
+#   +1 C5 (bad_c5_no_infra.sh)
+#   +1 C6 (bad_c6_formatted_parse.sh)
+#   +2 C7 (bad_c7_pipe_dollarq_sameline.sh, bad_c7_pipe_dollarq_nextline.sh)
+#   +1 C8 (bad_c8_length_existence.sh)
+#   +1 C9 (bad_c9_no_fetch.sh)
+#   All good_c4/c5/c6/c7/c8/c9_*.sh and good_allowlisted_c4.sh fixtures add 0
+#   (verified individually in the direct-function-test section above, AND
+#   via the clean-dir falsification below — every one of them is ALSO
+#   copied into $FIXDIR/clean).
+#   4 (C4 total) + 1 (C5) + 1 (C6) + 2 (C7) + 1 (C8) + 1 (C9) = 10 → 15+10=25.
+[ "$mixed_count" = "25" ] && ok "mixed fixture dir → 25 findings (15 pre-C4-C9 + 10 from the C4-C9 slice: 4 C4 [2 new fixtures + 2 legitimate cross-triggers on pre-existing C2 fixtures] + 1 C5 + 1 C6 + 2 C7 + 1 C8 + 1 C9), nothing missed or double-counted" \
+  || bad "expected 25 findings in mixed dir, got $mixed_count"
 
 case "$(cat "$MIXED_OUT")" in
   *fixture_shape.selftest.sh*) bad "ga-6jfuo REGRESSION: *.selftest.sh file was scanned by run_scan (should be find-excluded): $(grep 'fixture_shape.selftest.sh' "$MIXED_OUT")" ;;
@@ -624,8 +848,8 @@ rm -f "$CLEAN_OUT"
 echo "── CLI wrapper ──"
 out="$(bash "$SCANNER" --path "$FIXDIR/mixed" --quiet)"; rc=$?
 [ "$rc" = "0" ] && ok "CLI exits 0 on a completed scan with findings" || bad "CLI exit code was $rc, expected 0"
-printf '%s\n' "$out" | grep -q '^error-empty-conflation-scan: 15 finding(s)$' \
-  && ok "CLI summary line reports 15 finding(s)" || bad "CLI summary line unexpected: $(printf '%s\n' "$out" | head -1)"
+printf '%s\n' "$out" | grep -q '^error-empty-conflation-scan: 25 finding(s)$' \
+  && ok "CLI summary line reports 25 finding(s)" || bad "CLI summary line unexpected: $(printf '%s\n' "$out" | head -1)"
 
 bash "$SCANNER" --path "$FIXDIR/does-not-exist" --quiet >/tmp/.conflation-selftest-missing-path.$$ 2>&1
 rc=$?
