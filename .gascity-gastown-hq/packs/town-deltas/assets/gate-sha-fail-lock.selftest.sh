@@ -12,17 +12,42 @@
 #   gate:passed AND story:done simultaneously — the signature of the race.
 #
 #   FIX: fail-closed by SHA. When a run FAILs, durably stamp the rejected
-#   commit SHA onto the source bead (gate-sha-failed:<sha> label). Before any
-#   future run acts on a PASS verdict, check whether THIS EXACT SHA already
-#   carries that stamp; if so, downgrade to FAIL before the merge is even
-#   attempted. A NEW commit (new SHA, i.e. an actual fix) carries no stamp and
-#   re-gates normally — the legitimate re-fix loop is never blocked.
+#   commit SHA onto the source bead (gate-sha-failed:<sha>:<class> label).
+#   Before any future run acts on a PASS verdict, check whether THIS EXACT
+#   SHA already carries a blocking stamp; if so, downgrade to FAIL before the
+#   merge is even attempted. A NEW commit (new SHA, i.e. an actual fix)
+#   carries no stamp and re-gates normally — the legitimate re-fix loop is
+#   never blocked.
+#
+#   BUG #2 (ga-4cy2t), found operating the fix above: the stamp recorded ONLY
+#   the verdict, not the REASON. A gate FAIL can happen two ways — (a) a
+#   reviewer/content verdict actually rejected the code, or (b) the code
+#   PASSED but a non-code administrative refusal (a hold/park/needs-human
+#   label applied mid-run, a sibling branch racing the same bead, the bead
+#   closed elsewhere) downgraded it after the fact. Both wrote the identical
+#   unclassed "gate-sha-failed:<sha>" stamp, so once a hold-driven FAIL
+#   happened, the exact same commit stayed permanently blocked even after the
+#   hold was proven wrong and removed — the only way out was pushing a new,
+#   often empty, commit just to change the SHA. Live incident: commit
+#   48a365ae (bead ga-y9a1d) was correct and reviewed clean, but a Pilot
+#   brief-void hold (ga-e2n96) forced a FAIL; removing the hold and
+#   re-submitting the SAME commit still hit the sha-fail lock, because the
+#   lock could not tell "held" from "rejected".
+#
+#   FIX #2: gate_sha_fail_label now takes a <class> — "code" (rejected by
+#   review/content; keeps blocking, unchanged from BUG #1's fix) or "hold"
+#   (a non-code administrative downgrade of an already-PASS verdict; does
+#   NOT block re-review — the live hold check re-guards independently while
+#   the hold is still active). A pre-fix unclassed label is treated as "code"
+#   (ambiguous defaults to the blocking/safe branch). If the SAME sha ever
+#   accumulates both a hold stamp and a code stamp (across separate runs), it
+#   stays blocked — one real rejection is enough, regardless of order.
 #
 # This harness SOURCES the dispatcher in lib-only mode to unit-test the REAL
 # pure decision (gate_labels_have_sha_fail, gate_sha_fail_label) and the REAL
 # bd-backed resolver (gate_bead_has_prior_sha_fail, driven by an in-shell bd
 # mock), then DRIFT-GUARDS the live script so a future refactor that drops or
-# reorders the fix fails loudly. Exit 0 iff every assertion holds.
+# reorders either fix fails loudly. Exit 0 iff every assertion holds.
 
 set -euo pipefail
 
@@ -51,20 +76,34 @@ err()  { :; }
 
 # ── 1. gate_sha_fail_label — canonical label shape (pure) ────────────────────
 echo "── 1. gate_sha_fail_label (label naming) ──"
-eq "formats sha into the canonical stamp" "$(gate_sha_fail_label 'deadbeef')" "gate-sha-failed:deadbeef"
-eq "formats a full 40-char sha"           "$(gate_sha_fail_label 'afb591200000000000000000000000000000ab')" "gate-sha-failed:afb591200000000000000000000000000000ab"
+eq "formats sha+class into the canonical stamp" "$(gate_sha_fail_label 'deadbeef' 'code')" "gate-sha-failed:deadbeef:code"
+eq "formats the hold class"                     "$(gate_sha_fail_label 'deadbeef' 'hold')" "gate-sha-failed:deadbeef:hold"
+eq "formats a full 40-char sha"                 "$(gate_sha_fail_label 'afb591200000000000000000000000000000ab' 'code')" "gate-sha-failed:afb591200000000000000000000000000000ab:code"
+eq "class omitted defaults to code (ga-4cy2t: safe/blocking branch)" "$(gate_sha_fail_label 'deadbeef')" "gate-sha-failed:deadbeef:code"
 
-# ── 2. gate_labels_have_sha_fail — pure membership decision ──────────────────
+# ── 2. gate_labels_have_sha_fail — pure blocking decision (ga-4cy2t) ─────────
+# BUG this closes: gate-sha-failed used to record ONLY a verdict, not a
+# reason, so a non-code administrative refusal (a hold applied mid-run, later
+# proven wrong and removed) stamped the exact same label as a genuine code
+# rejection — permanently poisoning a commit the reviewer never actually
+# rejected. Now: a "code" stamp blocks re-review forever (unchanged); a
+# "hold" stamp alone does not (the live hold check re-guards it independently
+# while the hold is still active); a legacy unclassed stamp (written before
+# this fix shipped) blocks, since its class can't be recovered retroactively.
 echo "── 2. gate_labels_have_sha_fail (pure label-set membership) ──"
 eq "empty label set → no"                                  "$(gate_labels_have_sha_fail '' 'abc123')"                                    "no"
 eq "unrelated labels only → no"                             "$(gate_labels_have_sha_fail 'gate:failed area:gate' 'abc123')"                "no"
-eq "exact match, sole label → yes"                          "$(gate_labels_have_sha_fail 'gate-sha-failed:abc123' 'abc123')"               "yes"
-eq "match among other labels → yes"                         "$(gate_labels_have_sha_fail 'gate:failed gate-sha-failed:abc123 area:gate' 'abc123')" "yes"
-eq "different sha's stamp present → no"                     "$(gate_labels_have_sha_fail 'gate-sha-failed:def456' 'abc123')"               "no"
+eq "code-class stamp, sole label → yes"                     "$(gate_labels_have_sha_fail 'gate-sha-failed:abc123:code' 'abc123')"          "yes"
+eq "code-class stamp among other labels → yes"              "$(gate_labels_have_sha_fail 'gate:failed gate-sha-failed:abc123:code area:gate' 'abc123')" "yes"
+eq "hold-class stamp ALONE → no (never code-rejected)"      "$(gate_labels_have_sha_fail 'gate-sha-failed:abc123:hold' 'abc123')"          "no"
+eq "hold-class stamp among other labels → no"                "$(gate_labels_have_sha_fail 'gate:failed gate-sha-failed:abc123:hold area:gate' 'abc123')" "no"
+eq "MIXED: hold AND code stamps for same sha → yes (stays blocked)" "$(gate_labels_have_sha_fail 'gate-sha-failed:abc123:hold gate-sha-failed:abc123:code' 'abc123')" "yes"
+eq "legacy pre-ga-4cy2t unclassed stamp → yes (ambiguous defaults to blocking)" "$(gate_labels_have_sha_fail 'gate-sha-failed:abc123' 'abc123')" "yes"
+eq "different sha's code stamp present → no"                "$(gate_labels_have_sha_fail 'gate-sha-failed:def456:code' 'abc123')"          "no"
 # Boundary anchoring: a longer/shorter sha sharing a prefix/suffix must NOT
 # false-positive via naive substring containment.
-eq "longer sha sharing our prefix does NOT match (boundary)" "$(gate_labels_have_sha_fail 'gate-sha-failed:abc1234' 'abc123')"              "no"
-eq "sha embedded as a suffix does NOT match (boundary)"      "$(gate_labels_have_sha_fail 'gate-sha-failed:xabc123' 'abc123')"               "no"
+eq "longer sha sharing our prefix does NOT match (boundary)" "$(gate_labels_have_sha_fail 'gate-sha-failed:abc1234:code' 'abc123')"         "no"
+eq "sha embedded as a suffix does NOT match (boundary)"      "$(gate_labels_have_sha_fail 'gate-sha-failed:xabc123:code' 'abc123')"          "no"
 
 # ── 3. gate_bead_has_prior_sha_fail — bd-backed resolver (mock bd) ────────────
 echo "── 3. gate_bead_has_prior_sha_fail (bd show + label check, mock bd) ──"
@@ -87,13 +126,13 @@ eq "(b) empty sha → no (never calls bd)"        "$(gate_bead_has_prior_sha_fai
 MOCK_SHOW_JSON='[{"id":"bead1","labels":["gate:failed","area:gate"]}]'
 eq "(c) bead has no gate-sha-failed label → no" "$(gate_bead_has_prior_sha_fail 'city' 'bead1' 'abc123')" "no"
 
-MOCK_SHOW_JSON='[{"id":"bead1","labels":["gate:failed","gate-sha-failed:abc123"]}]'
-eq "(d) bead stamped for THIS sha → yes"        "$(gate_bead_has_prior_sha_fail 'city' 'bead1' 'abc123')" "yes"
+MOCK_SHOW_JSON='[{"id":"bead1","labels":["gate:failed","gate-sha-failed:abc123:code"]}]'
+eq "(d) bead stamped CODE for THIS sha → yes"   "$(gate_bead_has_prior_sha_fail 'city' 'bead1' 'abc123')" "yes"
 
-MOCK_SHOW_JSON='[{"id":"bead1","labels":["gate-sha-failed:def456"]}]'
+MOCK_SHOW_JSON='[{"id":"bead1","labels":["gate-sha-failed:def456:code"]}]'
 eq "(e) bead stamped for a DIFFERENT sha → no"  "$(gate_bead_has_prior_sha_fail 'city' 'bead1' 'abc123')" "no"
 
-MOCK_SHOW_JSON='{"id":"bead1","labels":["gate-sha-failed:abc123"]}'
+MOCK_SHOW_JSON='{"id":"bead1","labels":["gate-sha-failed:abc123:code"]}'
 eq "(f) bare object (not array) response → yes" "$(gate_bead_has_prior_sha_fail 'city' 'bead1' 'abc123')" "yes"
 
 MOCK_SHOW_JSON='[{"id":"bead1"}]'
@@ -103,6 +142,20 @@ MOCK_SHOW_JSON='[]'
 MOCK_SHOW_FAIL=1
 eq "(h) bd show fails (transient) → no (fail-open)" "$(gate_bead_has_prior_sha_fail 'city' 'bead1' 'abc123')" "no"
 MOCK_SHOW_FAIL=0
+
+# ── 3b. ga-4cy2t: hold-only refusal must NOT poison the sha; mixed stays blocked ──
+echo "── 3b. gate_bead_has_prior_sha_fail (ga-4cy2t: hold vs code class, mock bd) ──"
+MOCK_SHOW_JSON='[{"id":"bead1","labels":["gate:failed","gate-sha-failed:abc123:hold"]}]'
+eq "(i) bead stamped HOLD-only for THIS sha → no (re-submittable once the hold clears, no new commit needed)" \
+  "$(gate_bead_has_prior_sha_fail 'city' 'bead1' 'abc123')" "no"
+
+MOCK_SHOW_JSON='[{"id":"bead1","labels":["gate-sha-failed:abc123:hold","gate-sha-failed:abc123:code"]}]'
+eq "(j) MIXED: same sha has a hold stamp (earlier run) AND a code stamp (later run) → yes (stays blocked)" \
+  "$(gate_bead_has_prior_sha_fail 'city' 'bead1' 'abc123')" "yes"
+
+MOCK_SHOW_JSON='[{"id":"bead1","labels":["gate-sha-failed:abc123"]}]'
+eq "(k) LEGACY pre-ga-4cy2t unclassed stamp for THIS sha → yes (ambiguous defaults to blocking)" \
+  "$(gate_bead_has_prior_sha_fail 'city' 'bead1' 'abc123')" "yes"
 
 # ── 4. DRIFT GUARD: helpers defined before the lib-only cutoff ───────────────
 echo "── 4. drift guard: helpers are selftest-sourceable (defined before lib-only guard) ──"
@@ -128,19 +181,42 @@ else
   bad "fail-closed check must precede the merge attempt (check=$CHECK_LN merge=$MERGE_LOG_LN)"
 fi
 
-# ── 6. DRIFT GUARD: FAIL path stamps the rejected SHA ─────────────────────────
-echo "── 6. drift guard: FAIL path stamps the rejected SHA ──"
-STAMP_LN=$(grep -n 'label add "\$BEAD_ID" "\$(gate_sha_fail_label "\$BRANCH_SHA")"' "$DISPATCHER" | head -1 | cut -d: -f1)
+# ── 6. DRIFT GUARD: FAIL path stamps the rejected SHA, classed (ga-4cy2t) ─────
+echo "── 6. drift guard: FAIL path stamps the rejected SHA, classed by reason ──"
+STAMP_LN=$(grep -n 'label add "\$BEAD_ID" "\$(gate_sha_fail_label "\$BRANCH_SHA" "\${GATE_SHA_FAIL_CLASS:-code}")"' "$DISPATCHER" | head -1 | cut -d: -f1)
 FAILED_LABEL_LN=$(grep -n 'label add "\$BEAD_ID" "gate:failed" -q' "$DISPATCHER" | head -1 | cut -d: -f1)
 if [ -n "$STAMP_LN" ]; then
-  ok "FAIL path stamps the rejected SHA via gate_sha_fail_label (line $STAMP_LN)"
+  ok "FAIL path stamps the rejected SHA via gate_sha_fail_label, passing the tracked class (line $STAMP_LN)"
 else
-  bad "FAIL path must stamp the rejected SHA via gate_sha_fail_label"
+  bad "FAIL path must stamp the rejected SHA via gate_sha_fail_label \"\$BRANCH_SHA\" \"\${GATE_SHA_FAIL_CLASS:-code}\" — found the old unclassed call, or none at all?"
 fi
 if [ -n "$STAMP_LN" ] && [ -n "$FAILED_LABEL_LN" ] && [ "$STAMP_LN" -gt "$FAILED_LABEL_LN" ]; then
   ok "SHA stamp (line $STAMP_LN) is written in the same FAIL path as gate:failed (line $FAILED_LABEL_LN)"
 else
   bad "SHA stamp must sit in the FAIL path, after the gate:failed label add (stamp=$STAMP_LN failed=$FAILED_LABEL_LN)"
+fi
+
+# ── 6b. DRIFT GUARD: fail-class tracker resets to "code" before ga-nooaw,
+# and every ga-lxz5w administrative downgrade (closed / live park / sibling-
+# race) overrides it to "hold" — the wiring ga-4cy2t depends on. Without
+# this, gate_labels_have_sha_fail's new hold-vs-code logic is correct but
+# dead code: every stamp would silently keep going out as "code" (the
+# default), reproducing the exact bug this bead fixes.
+echo "── 6b. drift guard: fail-class reset + all 3 administrative downgrades classify as hold ──"
+RESET_LN=$(grep -n '^GATE_SHA_FAIL_CLASS="code"$' "$DISPATCHER" | head -1 | cut -d: -f1)
+NOOAW_LN=$(grep -n '# ── ga-nooaw: FAIL-CLOSED BY SHA' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$RESET_LN" ] && [ -n "$NOOAW_LN" ] && [ "$RESET_LN" -lt "$NOOAW_LN" ]; then
+  ok "fail-class resets to \"code\" (line $RESET_LN) before the ga-nooaw block (line $NOOAW_LN) — no leakage across beads in the same sweep"
+else
+  bad "fail-class reset must precede the ga-nooaw block (reset=$RESET_LN nooaw=$NOOAW_LN)"
+fi
+
+HOLD_COUNT=$(grep -c 'GATE_SHA_FAIL_CLASS="hold"' "$DISPATCHER" || true)
+HOLD_COUNT=${HOLD_COUNT:-0}
+if [ "$HOLD_COUNT" -ge 3 ]; then
+  ok "all 3 ga-lxz5w administrative downgrades (closed bead / live park / sibling-race) classify as hold ($HOLD_COUNT sites found)"
+else
+  bad "expected >=3 GATE_SHA_FAIL_CLASS=\"hold\" sites (closed bead, live park, sibling-race), found $HOLD_COUNT"
 fi
 
 # ── 7. syntax ──────────────────────────────────────────────────────────────

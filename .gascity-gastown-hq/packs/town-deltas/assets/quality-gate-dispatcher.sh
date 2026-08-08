@@ -837,22 +837,46 @@ reconcile_bare_main_to_origin() {
 # source of truth, no copy-drift between the write site (FAIL path) and the
 # read site (pre-merge check).
 
-# gate_sha_fail_label <sha> — canonical label naming the "this SHA already
-# failed" stamp. Pure string formatting; the ONLY place this label's shape is
-# spelled out, so the write and read sites can never drift apart.
+# gate_sha_fail_label <sha> [class] — canonical label naming a "this SHA was
+# involved in a FAIL" stamp. Pure string formatting; the ONLY place this
+# label's shape is spelled out, so the write and read sites can never drift
+# apart. <class> (ga-4cy2t — see the flagrant incident that motivated this:
+# a Pilot brief-void hold applied gate:needs-human mid-run, the gate correctly
+# refused to merge, but the SAME stamp this produced then permanently blocked
+# the identical commit even after the hold was proven wrong and removed):
+#   code — an actual reviewer/content verdict rejected this exact commit.
+#          Re-review of the same SHA must stay blocked; a new commit is the
+#          only way out (unchanged, original ga-nooaw behavior).
+#   hold — verdict was PASS; a non-code administrative refusal (closed bead /
+#          live park-or-needs-human / sibling-branch race — see the
+#          ga-lxz5w checks below) downgraded it AFTER the code was already
+#          judged clean. The code itself was never rejected, so once the hold
+#          clears this exact SHA may re-earn a PASS with no new commit.
+# Defaults to "code" when omitted — the safe/blocking branch, so any call
+# site that forgets to classify never accidentally unblocks a real rejection.
 gate_sha_fail_label() {
-  printf 'gate-sha-failed:%s' "$1"
+  local sha="$1" class="${2:-code}"
+  printf 'gate-sha-failed:%s:%s' "$sha" "$class"
 }
 
 # gate_labels_have_sha_fail <space_joined_labels> <sha> — pure (no IO, set -e
-# safe). Prints "yes" iff the label set already carries gate_sha_fail_label(sha).
+# safe). Prints "yes" iff the label set carries a stamp for $sha that must
+# keep blocking re-review: the "code"-class stamp (gate_sha_fail_label sha
+# code), OR the pre-ga-4cy2t LEGACY unclassed stamp "gate-sha-failed:<sha>"
+# (written before this fix shipped — its class can't be recovered
+# retroactively, and an unknown class must default to the blocking branch,
+# never the permissive one — same "ambiguity defaults to inert/safe" doctrine
+# as elsewhere in this file). A lone "hold"-class stamp does NOT block — see
+# gate_sha_fail_label's header above.
 gate_labels_have_sha_fail() {
-  local hay=" $1 " needle
-  needle=" $(gate_sha_fail_label "$2") "
+  local hay=" $1 " sha="$2"
   case "$hay" in
-    *"$needle"*) printf 'yes' ;;
-    *)           printf 'no' ;;
+    *" $(gate_sha_fail_label "$sha" "code") "*) printf 'yes'; return 0 ;;
   esac
+  case "$hay" in
+    *" gate-sha-failed:${sha} "*)                printf 'yes'; return 0 ;;
+  esac
+  printf 'no'
 }
 
 # gate_bead_has_prior_sha_fail <bead_city> <bead_id> <sha> — bd-backed. Prints
@@ -3204,6 +3228,19 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
   return 0
 fi
 
+# ga-4cy2t: reset the per-run fail-class tracker used by the SHA stamp below.
+# Defaults to "code" — if OVERALL_VERDICT is already FAIL here, it came from
+# the reviewer/content verdict computed earlier in this same run (Phase C or
+# the fast path, both above), a genuine code rejection. Only the specific
+# administrative downgrades further down (ga-lxz5w: closed bead, live
+# park/needs-human, sibling-branch race) override this to "hold" — see
+# gate_sha_fail_label's header for what each class means. Reset
+# unconditionally on every entry to this function: gate_finalize_run() runs
+# once per in-flight run bead in a sweep loop (see the quota-stop comment
+# above), so a "hold" set while finalizing a PRIOR bead this sweep must never
+# leak into THIS bead's stamp.
+GATE_SHA_FAIL_CLASS="code"
+
 # ── ga-nooaw: FAIL-CLOSED BY SHA ─────────────────────────────────────────────
 # A prior, independent gate-run may already have rejected this EXACT commit
 # (gate_bead_has_prior_sha_fail, defined above the lib-only guard). If so,
@@ -3229,11 +3266,13 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ]; then
   case "$GATE_LXZ5W_BLOCK" in
     closed)
       OVERALL_VERDICT="FAIL"
+      GATE_SHA_FAIL_CLASS="hold"  # ga-4cy2t: administrative (resolved elsewhere), not a code rejection
       FAIL_REASONS="Source bead $BEAD_ID is already closed — a different branch/process resolved it after this gate-run began (ga-lxz5w: 2-branch race, sequential variant). Not merging $BRANCH onto an already-terminal bead; a human should confirm whether these changes are still needed as a follow-up."
       warn "ga-lxz5w: bead $BEAD_ID already closed (resolved elsewhere) — downgrading $BRANCH's in-flight PASS to FAIL before merge."
       ;;
     park:*)
       OVERALL_VERDICT="FAIL"
+      GATE_SHA_FAIL_CLASS="hold"  # ga-4cy2t: hold/needs-human, not a code rejection — see gate_sha_fail_label
       FAIL_REASONS="Source bead $BEAD_ID now carries a park-worthy label ($GATE_LXZ5W_BLOCK) applied after this gate-run began — re-checked live immediately before merge (ga-lxz5w). Not merging $BRANCH; clear the hold, then re-submit."
       warn "ga-lxz5w: live re-check — bead $BEAD_ID now parks ($GATE_LXZ5W_BLOCK) — downgrading $BRANCH's in-flight PASS to FAIL before merge."
       ;;
@@ -3258,6 +3297,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; the
     GATE_LXZ5W_SIB_BRANCH="${GATE_LXZ5W_SIBLING%%$'\t'*}"
     GATE_LXZ5W_SIB_STATUS="${GATE_LXZ5W_SIBLING#*$'\t'}"
     OVERALL_VERDICT="FAIL"
+    GATE_SHA_FAIL_CLASS="hold"  # ga-4cy2t: this branch's code PASSED review; held for human reconciliation, not a code rejection
     FAIL_REASONS="Another branch ($GATE_LXZ5W_SIB_BRANCH, gate-status:$GATE_LXZ5W_SIB_STATUS) is concurrently active in the gate for the same source bead $BEAD_ID (ga-lxz5w: 2 branches, same bead — auto-merging the first PASS without reconciling would silently discard whichever branch loses the race). Not merging $BRANCH; a human must reconcile (pick the correct/superset branch) and clear gate:needs-human before either can proceed."
     bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-human"              -q 2>/dev/null || true
     bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-human:sibling-race" -q 2>/dev/null || true
@@ -4250,7 +4290,11 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       # ga-nooaw: stamp this exact commit as rejected — see
       # gate_bead_has_prior_sha_fail, checked before the PASS/FAIL branch
       # above, before ANY future run (same SHA) is allowed to merge it.
-      bd -C "$BEAD_CITY" label add "$BEAD_ID" "$(gate_sha_fail_label "$BRANCH_SHA")" -q 2>/dev/null || true
+      # ga-4cy2t: classed by GATE_SHA_FAIL_CLASS (reset to "code" at the top
+      # of the ga-nooaw block above, overridden to "hold" only at the
+      # specific administrative downgrade sites) so a hold-only refusal
+      # doesn't permanently poison a commit the code review never rejected.
+      bd -C "$BEAD_CITY" label add "$BEAD_ID" "$(gate_sha_fail_label "$BRANCH_SHA" "${GATE_SHA_FAIL_CLASS:-code}")" -q 2>/dev/null || true
     fi
 
     if [ "$PREV_ATTEMPT" -ge "$GATE_FIX_CAP" ]; then
