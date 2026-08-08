@@ -91,6 +91,29 @@ else
   echo "  TOTAL: $total"
 fi
 echo
-echo "  baseline 2026-07-16 = 13. Subiu muito em 1 semana → o remédio (a dimensão"
-echo "  'terceiro estado' no prompt do gate-reviewer, ga-31ac) não pegou. Quase parado"
-echo "  → pegou. Etiquete TODA nova instância ao filar, em QUALQUER store."
+cat <<'INTERP'
+  ⚠️ NÃO LEIA ESTE TOTAL COMO "PIOROU" OU "MELHOROU". ELE NÃO MEDE ISSO.
+
+  baseline 2026-07-16 = 13  ·  2026-07-17 = 33  (+20 em UM DIA)
+
+  Esse salto NÃO significa que a classe explodiu. Significa que na madrugada de 17/07
+  quatro agentes fizeram uma CAÇADA e etiquetaram 20 instâncias que já existiam há
+  semanas. Este contador mede **quantas foram ETIQUETADAS**, não quantas EXISTEM.
+  "A classe piorou" e "nós olhamos com mais cuidado" produzem O MESMO NÚMERO — que é,
+  literalmente, a classe que este script existe para medir, cometida pelo script.
+  (O texto anterior aqui mandava ler alta = remédio falhou. Estava errado e foi removido:
+  uma métrica confundida que dá veredito é pior que métrica nenhuma, porque autoriza ação.)
+
+  ⇒ A PERGUNTA CERTA, que ESTE script não responde: o remédio (a dimensão 'terceiro estado'
+  no prompt do gate-reviewer, ga-31ac) existe pra fazer o GATE PEGAR a instância ANTES do
+  merge. Então a métrica honesta é a TAXA DE CAPTURA, não a contagem:
+
+      pegas pelo gate (verdict FAIL citando a classe)  ÷  (pegas pelo gate + achadas depois em prod)
+
+  Essa fração tem denominador e não é inflada por caçada: se dobrarmos o esforço de busca,
+  os dois lados sobem juntos. Subir = o remédio pegando. Cair = escapando.
+
+  ENQUANTO ISSO, use este total só para: (a) inventário — saber o que existe pra consertar;
+  (b) confirmar que instâncias novas estão sendo etiquetadas em TODOS os stores.
+  Nunca para: julgar se melhorou. Etiquete TODA nova instância ao filar, em QUALQUER store.
+INTERP
