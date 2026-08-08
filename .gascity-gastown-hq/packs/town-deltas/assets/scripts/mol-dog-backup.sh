@@ -168,7 +168,13 @@ nudge_deacon_done() {
         echo "backup: skipped DOG_DONE nudge to deacon (suspended=${suspended:-unknown}) — $message" >&2
         return 0
     fi
-    gc session nudge deacon/ "$message" 2>/dev/null || true
+    # Bare "deacon/" resolves via bd issue-ID lookup and fuzzy-matches ANY
+    # bead whose ID contains "deacon" as a substring — this city has two
+    # (dc-deacon-refinery, dc-deacon-witness), so it fails ambiguous and the
+    # nudge below was silently lost via `|| true` (ga-4zbjs). Target the
+    # verified live session by its qualified name instead — same name this
+    # function already keys its suspension check on, three lines up.
+    gc session nudge gastown.deacon/ "$message" 2>/dev/null || true
 }
 
 # --- Step 1: Preflight Dolt version before backup sync ---

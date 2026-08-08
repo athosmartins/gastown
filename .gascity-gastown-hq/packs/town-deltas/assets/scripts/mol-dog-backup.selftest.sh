@@ -223,13 +223,23 @@ else
 fi
 
 # ── drift-guard: every DOG_DONE call site must route through
-# ── nudge_deacon_done(), not raw `gc session nudge deacon/ ... || true` (the
-# ── original silent-swallow bug) ──────────────────────────────────────────
-RAW_NUDGE_COUNT=$(grep -cE '^\s*gc session nudge deacon/' "$SCRIPT" || true)
+# ── nudge_deacon_done(), not raw `gc session nudge gastown.deacon/ ... ||
+# ── true` (the original silent-swallow bug) ────────────────────────────────
+RAW_NUDGE_COUNT=$(grep -cE '^\s*gc session nudge gastown\.deacon/' "$SCRIPT" || true)
 if [ "${RAW_NUDGE_COUNT:-0}" -eq 1 ]; then
-  ok "exactly one raw 'gc session nudge deacon/' call remains — inside nudge_deacon_done() itself, as expected"
+  ok "exactly one raw 'gc session nudge gastown.deacon/' call remains — inside nudge_deacon_done() itself, as expected"
 else
-  bad "expected exactly 1 raw 'gc session nudge deacon/' call (inside the wrapper), found $RAW_NUDGE_COUNT — a call site may have bypassed the guard"
+  bad "expected exactly 1 raw 'gc session nudge gastown.deacon/' call (inside the wrapper), found $RAW_NUDGE_COUNT — a call site may have bypassed the guard"
+fi
+# ── mutation-guard (ga-4zbjs): bare "deacon/" (no gastown. qualifier) resolves
+# ── via bd issue-ID lookup and fuzzy-matches 2 unrelated beads in this city
+# ── (dc-deacon-refinery, dc-deacon-witness) — ambiguous, so the nudge fails
+# ── and `|| true` swallows it silently. Must never reappear. ────────────────
+BARE_DEACON_COUNT=$(grep -cE '^\s*gc session nudge deacon/' "$SCRIPT" || true)
+if [ "${BARE_DEACON_COUNT:-0}" -eq 0 ]; then
+  ok "no bare 'gc session nudge deacon/' call sites — the ambiguous-target bug (ga-4zbjs) has not regressed"
+else
+  bad "found $BARE_DEACON_COUNT bare 'gc session nudge deacon/' call site(s) — ga-4zbjs ambiguous-target bug has regressed"
 fi
 CALL_SITE_COUNT=$(grep -cE '^\s*nudge_deacon_done ' "$SCRIPT" || true)
 if [ "${CALL_SITE_COUNT:-0}" -ge 2 ]; then
