@@ -66,7 +66,13 @@ fi
 
 # 24h reached → final verdict + self-unload
 if [ "$elapsed_h" -ge "$SOAK_HOURS" ]; then
-  fails=$(grep -c '"wedged":1' "$LOG" 2>/dev/null || echo 0)
+  # ga-ebgw9 gate-feedback: same grep -c double-zero gotcha as `merges` above (see
+  # its own comment) — missed here on the first pass despite fixing the sibling
+  # right next to the warning. Same fix: capture stdout, sanitize, never chain
+  # `|| echo 0`.
+  fails=$(grep -c '"wedged":1' "$LOG" 2>/dev/null)
+  fails=$(printf '%s' "$fails" | tr -dc '0-9')
+  fails="${fails:-0}"
   total=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')
   maxstrike=$(grep -oE '"strikes":[0-9]+' "$LOG" 2>/dev/null | grep -oE '[0-9]+' | sort -rn | head -1)
   verdict="PASS"; [ "${maxstrike:-0}" -ge "$WEDGE_FAIL_STRIKES" ] && verdict="FAIL"

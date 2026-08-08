@@ -366,8 +366,21 @@ main() {
 
   # all 4 restarted healthy -> confirm all now run code newer than the merge
   log "all 4 restarted healthy; confirming fresh start times (newer than merge)..."
+  # ga-ebgw9 gate-feedback: `git show` failing (unresolvable SHA, git missing from
+  # launchd's minimal PATH, etc.) used to silently collapse to merge_epoch=0 via
+  # `|| echo 0` — every real process start-epoch is a large positive number, so
+  # `sepoch > merge_epoch` was then trivially true for EVERY daemon regardless of
+  # whether the freshness comparison was ever actually performed. That let a
+  # confirmed-fresh claim (flip_bead_label + notify_ok "todos saudaveis") through
+  # indistinguishable from an unverified one. Fail the same way the file already
+  # fails a genuine "not fresh" result (notify_fail + exit 1) instead of silently
+  # treating "couldn't check" as "checked and fine".
   local merge_epoch
-  merge_epoch=$(cd "$WA_BASE" && git show -s --format=%ct "$GA_D81_SHA" 2>/dev/null || echo 0)
+  if ! merge_epoch=$(cd "$WA_BASE" && git show -s --format=%ct "$GA_D81_SHA" 2>/dev/null); then
+    notify_fail "ga-d81 restart: não foi possível determinar o merge_epoch de $GA_D81_SHA (git show falhou) — freshness check abortado, NÃO é possível confirmar que os daemons rodam código pós-merge. Verificar manualmente."
+    log "MARKER ga-d81 hot-path restart END (FAILED — could not resolve merge_epoch for $GA_D81_SHA)"
+    exit 1
+  fi
   local fresh_ok=1
   for d in "${ORDER[@]}"; do
     local pid sepoch
