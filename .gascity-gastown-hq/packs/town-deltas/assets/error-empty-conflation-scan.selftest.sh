@@ -598,6 +598,47 @@ MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all --include-infra -l type:x 2>/d
 EOF
 cp "$FIXDIR/mixed/good_allowlisted_c4.sh" "$FIXDIR/clean/"
 
+# ── ga-a4gfd gate-feedback regressions ───────────────────────────────────
+# Both empirically reproduced by the reviewer sourcing the real diff and
+# calling the functions directly, then re-reproduced here independently
+# before fixing (not just trusted).
+
+# (1) Multi-line allowlist marker: a backslash continuation REQUIRES the "\"
+# to be the line's literal last character, so the ONLY grammatically-valid
+# place for a trailing "# erro-vs-vazio: ok ..." comment on a multi-line
+# statement is the FINAL line — never the block's start line, which is all
+# the original _allowlisted checked. Paired with a "same shape, no marker"
+# control (bad_a4gfd_multiline_no_limit.sh) so this test actually proves
+# suppression, not just "the joiner never would have flagged this anyway".
+cat > "$FIXDIR/mixed/bad_a4gfd_multiline_no_limit.sh" <<'EOF'
+MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all --include-infra \
+  -l type:x \
+  2>/dev/null || echo "[]")
+EOF
+
+cat > "$FIXDIR/mixed/good_a4gfd_multiline_allowlisted.sh" <<'EOF'
+MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all --include-infra \
+  -l type:x \
+  2>/dev/null || echo "[]")  # erro-vs-vazio: ok porque single-tenant test fixture, never has >50 rows
+EOF
+cp "$FIXDIR/mixed/good_a4gfd_multiline_allowlisted.sh" "$FIXDIR/clean/"
+
+# (2a) C4 false negative: two independent ;-chained bd calls on one line —
+# the first has --limit 0, the second does not. Whole-line reasoning let
+# the first call's fix mask the second call's real, unaddressed gap.
+cat > "$FIXDIR/mixed/bad_a4gfd_c4_two_calls_one_masks_other.sh" <<'EOF'
+bd -C "$A" list --json --limit 0 2>/dev/null; bd -C "$B" list --json 2>/dev/null
+EOF
+
+# (2b) C6 false positive: an unrelated pipe (echo|grep) followed by a bare
+# `bd show` — the pipe belongs to a completely different, earlier command.
+# Directly contradicts this detector's own stated intent ("a bare bd show
+# for a human to read on a terminal is not this bug").
+cat > "$FIXDIR/mixed/good_a4gfd_c6_unrelated_pipe_before_bd_show.sh" <<'EOF'
+echo "$x" | grep -q foo; bd show "$ID"
+EOF
+cp "$FIXDIR/mixed/good_a4gfd_c6_unrelated_pipe_before_bd_show.sh" "$FIXDIR/clean/"
+
 # ═════════════════════════════════════════════════════════════════════════
 # 1. Direct pure-function detection tests
 # ═════════════════════════════════════════════════════════════════════════
@@ -764,6 +805,30 @@ r="$(scan_bd_list_no_limit "$FIXDIR/mixed/good_allowlisted_c4.sh")"
 [ -z "$r" ] && ok "ga-q0n6a: inline 'erro-vs-vazio: ok porque ...' comment silences a would-be C4 finding" \
   || bad "REGRESSION: allowlisted line still flagged: '$r'"
 
+echo "── ga-a4gfd gate-feedback regressions ──"
+r="$(scan_bd_list_no_limit "$FIXDIR/mixed/bad_a4gfd_multiline_no_limit.sh")"
+case "$r" in *:C4:*) ok "ga-a4gfd control: multi-line, no --limit 0, NO marker → still flagged C4 "\
+    "(proves the allowlist fix below is real suppression, not 'never would have found it')" ;;
+  *) bad "ga-a4gfd control REGRESSION: multi-line violation with no marker not flagged: '$r'" ;; esac
+
+r="$(scan_bd_list_no_limit "$FIXDIR/mixed/good_a4gfd_multiline_allowlisted.sh")"
+[ -z "$r" ] && ok "ga-a4gfd FIX: marker on the FINAL line of a multi-line statement silences it "\
+    "(_allowlisted_range checks the whole [start,end] span, not just the start line)" \
+  || bad "ga-a4gfd REGRESSION: multi-line allowlist marker on its only valid (trailing) line ignored: '$r'"
+
+r="$(scan_bd_list_no_limit "$FIXDIR/mixed/bad_a4gfd_c4_two_calls_one_masks_other.sh")"
+case "$r" in
+  *'$B'*) ok "ga-a4gfd FIX: 2 ;-chained bd calls, first fixed second not → flags the SECOND "\
+      "(per-statement scoping; whole-line reasoning used to report nothing here)" ;;
+  '') bad "ga-a4gfd REGRESSION: false negative reproduced — first call's --limit 0 masked the second's absence" ;;
+  *) bad "ga-a4gfd: flagged something, but not the expected second bd call: '$r'" ;;
+esac
+
+r="$(scan_bd_formatted_output_parsed "$FIXDIR/mixed/good_a4gfd_c6_unrelated_pipe_before_bd_show.sh")"
+[ -z "$r" ] && ok "ga-a4gfd FIX: unrelated pipe (echo|grep) before a bare 'bd show' → NOT flagged "\
+    "(per-statement scoping; whole-line reasoning used to false-positive here)" \
+  || bad "ga-a4gfd REGRESSION: false positive reproduced — unrelated pipe misattributed to bd show: '$r'"
+
 echo "── run_scan end-to-end (mixed fixture dir) ──"
 MIXED_OUT="$(mktemp)"
 run_scan "$MIXED_OUT" "$FIXDIR/mixed"
@@ -800,8 +865,15 @@ mixed_count=$(wc -l <"$MIXED_OUT" | tr -d '[:space:]')
 #   via the clean-dir falsification below — every one of them is ALSO
 #   copied into $FIXDIR/clean).
 #   4 (C4 total) + 1 (C5) + 1 (C6) + 2 (C7) + 1 (C8) + 1 (C9) = 10 → 15+10=25.
-[ "$mixed_count" = "25" ] && ok "mixed fixture dir → 25 findings (15 pre-C4-C9 + 10 from the C4-C9 slice: 4 C4 [2 new fixtures + 2 legitimate cross-triggers on pre-existing C2 fixtures] + 1 C5 + 1 C6 + 2 C7 + 1 C8 + 1 C9), nothing missed or double-counted" \
-  || bad "expected 25 findings in mixed dir, got $mixed_count"
+# ga-a4gfd: +2 for the gate-feedback regression fixtures — bad_a4gfd_
+# multiline_no_limit.sh (the allowlist-fix control, still-flagged-without-
+# marker) and bad_a4gfd_c4_two_calls_one_masks_other.sh (the per-statement-
+# scoping fix, now correctly flags the second bd call) — bringing 25 to 27.
+# good_a4gfd_multiline_allowlisted.sh and good_a4gfd_c6_unrelated_pipe_
+# before_bd_show.sh add 0 (verified individually above, AND via the
+# clean-dir falsification below — both are ALSO copied into $FIXDIR/clean).
+[ "$mixed_count" = "27" ] && ok "mixed fixture dir → 27 findings (25 pre-ga-a4gfd + 2 from the gate-feedback regression fixtures), nothing missed or double-counted" \
+  || bad "expected 27 findings in mixed dir, got $mixed_count"
 
 case "$(cat "$MIXED_OUT")" in
   *fixture_shape.selftest.sh*) bad "ga-6jfuo REGRESSION: *.selftest.sh file was scanned by run_scan (should be find-excluded): $(grep 'fixture_shape.selftest.sh' "$MIXED_OUT")" ;;
@@ -848,8 +920,8 @@ rm -f "$CLEAN_OUT"
 echo "── CLI wrapper ──"
 out="$(bash "$SCANNER" --path "$FIXDIR/mixed" --quiet)"; rc=$?
 [ "$rc" = "0" ] && ok "CLI exits 0 on a completed scan with findings" || bad "CLI exit code was $rc, expected 0"
-printf '%s\n' "$out" | grep -q '^error-empty-conflation-scan: 25 finding(s)$' \
-  && ok "CLI summary line reports 25 finding(s)" || bad "CLI summary line unexpected: $(printf '%s\n' "$out" | head -1)"
+printf '%s\n' "$out" | grep -q '^error-empty-conflation-scan: 27 finding(s)$' \
+  && ok "CLI summary line reports 27 finding(s)" || bad "CLI summary line unexpected: $(printf '%s\n' "$out" | head -1)"
 
 bash "$SCANNER" --path "$FIXDIR/does-not-exist" --quiet >/tmp/.conflation-selftest-missing-path.$$ 2>&1
 rc=$?

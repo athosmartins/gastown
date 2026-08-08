@@ -107,6 +107,33 @@ _allowlisted() {
   sed -n "${lineno}p" "$file" 2>/dev/null | grep -qi 'erro-vs-vazio:[[:space:]]*ok'
 }
 
+# _allowlisted_range <file> <start> <end> — ga-a4gfd gate-feedback fix.
+# A backslash line-continuation REQUIRES the trailing "\" to be the line's
+# literal last character — a human cannot append a trailing "# erro-vs-vazio:
+# ok ..." comment on any continuation line without breaking the statement.
+# The only grammatically-valid place to mark a multi-line bd/git call as
+# reviewed is its FINAL physical line. _allowlisted alone only ever checks
+# the block's START line (the one _join_continued_lines reports), which for
+# any real multi-line statement is never where a human COULD have put the
+# marker — a 100% failure rate for the dominant multi-line style this file's
+# own docstring says this codebase uses, not an edge case. Checks every
+# line from start to end (inclusive) so the marker is honored wherever a
+# human could actually have placed it. Single-line callers (start==end,
+# or omitted end) degrade to the exact behavior of a plain _allowlisted call.
+_allowlisted_range() {
+  local file="$1" start="$2" end="$3" i
+  [ -z "$start" ] && return 1
+  case "$start" in ''|*[!0-9]*) return 1 ;; esac
+  [ -z "$end" ] && end="$start"
+  case "$end" in ''|*[!0-9]*) end="$start" ;; esac
+  i="$start"
+  while [ "$i" -le "$end" ]; do
+    _allowlisted "$file" "$i" && return 0
+    i=$((i + 1))
+  done
+  return 1
+}
+
 # ga-q0n6a: join backslash-line-continued shell statements into one logical
 # line before scanning, for detectors where it matters (C4/C5/C9 below — all
 # of which look for an ABSENT flag/word anywhere in a `bd`/`git` invocation
@@ -120,10 +147,14 @@ _allowlisted() {
 # worse than the false-negative the existing C1/C2 shell detectors accept as
 # a documented limitation (a missed real bug vs. a wrong accusation; this
 # scanner's own report-only philosophy tolerates the former far better than
-# the latter). Outputs "STARTLINE<TAB>JOINED TEXT" per logical line — the
-# tab is deliberate (a literal backslash "\" inside a bd command's own
-# argument text, e.g. a description string, could otherwise be misread as a
-# field separator if a naive delimiter like ":" or space were used instead).
+# the latter). Outputs "STARTLINE<TAB>ENDLINE<TAB>JOINED TEXT" per logical
+# line — the tab is deliberate (a literal backslash "\" inside a bd command's
+# own argument text, e.g. a description string, could otherwise be misread
+# as a field separator if a naive delimiter like ":" or space were used
+# instead). ENDLINE (ga-a4gfd gate-feedback) exists so callers can allowlist
+# a multi-line block via _allowlisted_range across its whole span — the
+# block's START line is never a valid place for a human to put the marker
+# comment (see _allowlisted_range's own docstring for why).
 _join_continued_lines() {
   local file="$1" lineno=0 start=0 buf="" line
   while IFS= read -r line || [ -n "$line" ]; do
@@ -136,14 +167,14 @@ _join_continued_lines() {
         ;;
     esac
     buf="${buf}${line}"
-    printf '%s\t%s\n' "$start" "$buf"
+    printf '%s\t%s\t%s\n' "$start" "$lineno" "$buf"
     buf=""
   done <"$file"
   # A file ending mid-continuation (dangling trailing backslash, no final
   # newline) still has buffered content to flush — report what was gathered
   # rather than silently dropping the tail of the file.
   if [ -n "$buf" ]; then
-    printf '%s\t%s\n' "$start" "$buf"
+    printf '%s\t%s\t%s\n' "$start" "$lineno" "$buf"
   fi
 }
 
@@ -427,20 +458,39 @@ scan_launchd_no_notify() {
 # bd-heavy dispatcher — an earlier draft with a bash-case pre-filter INSIDE
 # the per-joined-line loop still forked grep -Eq 2x for every "list"-
 # containing line, and this file alone has hundreds; that measurably hung
-# the whole scan). The candidate search itself is now done via `grep -E`
-# PIPED over the WHOLE joined blob (grep's own fast internal C loop scans
-# every line in one process), not a bash while-loop forking grep once per
-# line — only the FEW lines that survive both greps ever reach the bash
-# loop below, where the remaining check (is --limit 0 present?) is cheap
-# because there are now only a handful of candidates, not hundreds.
+# the whole scan). The CANDIDATE search is done via `grep -E` PIPED over the
+# WHOLE joined blob (grep's own fast internal C loop scans every line in one
+# process) — only the FEW lines that survive both greps ever reach the bash
+# loop below, where the PRECISE per-statement check runs (cheap, because
+# there are now only a handful of candidates, not hundreds).
+#
+# ga-a4gfd gate-feedback fix: the precise check below now scopes to each
+# `;`-separated STATEMENT within a candidate line/block independently,
+# rather than reasoning over the whole joined line. Reproduced live before
+# fixing: `bd -C "$A" list --json --limit 0 2>/dev/null; bd -C "$B" list
+# --json 2>/dev/null` — two independent bd calls, one fixed, one not — used
+# to report ZERO findings, because the first call's --limit 0 satisfied the
+# whole-line check and silently masked the second call's real, unaddressed
+# truncation risk (the exact ga-21kmp class this detector exists for). This
+# is the identical scoping mistake _c2_scan_substitutions's own docstring
+# above documents already diagnosing and fixing once, for C1/C2 (ga-50m2) —
+# reintroduced here in new code that didn't inherit that fix. Split is a
+# naive `tr ';' '\n'` (does not respect quoting — an accepted limitation
+# matching this file's own house style; a bd list/show invocation's own
+# arguments are not expected to contain a literal semicolon in practice).
 scan_bd_list_no_limit() {
-  local file="$1" joined="${2:-}" ln frag
+  local file="$1" joined="${2:-}" start end frag stmt
   [ -z "$joined" ] && joined="$(_join_continued_lines "$file")"
-  while IFS="$(printf '\t')" read -r ln frag; do
-    [ -z "$ln" ] && continue
-    printf '%s' "$frag" | grep -Eq -- '--limit[[:space:]]+0|-n[[:space:]]+0|--limit=0' && continue
-    _allowlisted "$file" "$ln" && continue
-    echo "${file}:${ln}:C4:${frag}"
+  while IFS="$(printf '\t')" read -r start end frag; do
+    [ -z "$start" ] && continue
+    while IFS= read -r stmt || [ -n "$stmt" ]; do
+      [ -z "$stmt" ] && continue
+      printf '%s' "$stmt" | grep -Eq "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]]list([[:space:]]|\$)" || continue
+      printf '%s' "$stmt" | grep -Eq -- '--json' || continue
+      printf '%s' "$stmt" | grep -Eq -- '--limit[[:space:]]+0|-n[[:space:]]+0|--limit=0' && continue
+      _allowlisted_range "$file" "$start" "$end" && continue
+      echo "${file}:${start}:C4:${stmt}"
+    done < <(printf '%s' "$frag" | tr ';' '\n')
   done < <(printf '%s\n' "$joined" \
     | grep -E "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]]list([[:space:]]|\$)" \
     | grep -F -- '--json')
@@ -458,16 +508,25 @@ scan_bd_list_no_limit() {
 # is exactly the "measure, don't guess" failure this whole epic is about).
 # Optional 2nd arg <joined>: see scan_bd_list_no_limit's docstring above —
 # same shared-computation rationale, same default-if-omitted behavior.
+# ga-a4gfd gate-feedback fix: same per-statement scoping as scan_bd_list_no_
+# limit above, for the identical reason — a whole-line check lets one
+# bd call's --include-infra mask a different, unrelated bd call's real
+# absence of it on the same joined line.
 scan_bd_gate_no_infra() {
-  local file="$1" joined="${2:-}" ln frag
+  local file="$1" joined="${2:-}" start end frag stmt
   [ -z "$joined" ] && joined="$(_join_continued_lines "$file")"
   # Perf: piped grep over the whole blob, not a per-line bash loop — see
   # scan_bd_list_no_limit's docstring above for why this matters.
-  while IFS="$(printf '\t')" read -r ln frag; do
-    [ -z "$ln" ] && continue
-    printf '%s' "$frag" | grep -Eq -- '--include-infra' && continue
-    _allowlisted "$file" "$ln" && continue
-    echo "${file}:${ln}:C5:${frag}"
+  while IFS="$(printf '\t')" read -r start end frag; do
+    [ -z "$start" ] && continue
+    while IFS= read -r stmt || [ -n "$stmt" ]; do
+      [ -z "$stmt" ] && continue
+      printf '%s' "$stmt" | grep -Eq "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]](list|show)([[:space:]]|\$)" || continue
+      printf '%s' "$stmt" | grep -Eq -- 'type:quality-gate-' || continue
+      printf '%s' "$stmt" | grep -Eq -- '--include-infra' && continue
+      _allowlisted_range "$file" "$start" "$end" && continue
+      echo "${file}:${start}:C5:${stmt}"
+    done < <(printf '%s' "$frag" | tr ';' '\n')
   done < <(printf '%s\n' "$joined" \
     | grep -E "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]](list|show)([[:space:]]|\$)" \
     | grep -F -- 'type:quality-gate-')
@@ -485,21 +544,35 @@ scan_bd_gate_no_infra() {
 # show "$ID"` for a human to read on a terminal is not this bug.
 # Optional 2nd arg <joined>: see scan_bd_list_no_limit's docstring above —
 # same shared-computation rationale, same default-if-omitted behavior.
+# ga-a4gfd gate-feedback fix: same per-statement scoping, for a false
+# POSITIVE this time (not just a false negative) — reproduced live before
+# fixing: `echo "$x" | grep -q foo; bd show "$ID"` used to flag C6 even
+# though bd show's own output is not piped anywhere — the pipe belongs to
+# the entirely unrelated first command. Whole-line reasoning treated "a bd
+# (show|comments) call exists somewhere" and "a pipe-to-grep/sed/awk exists
+# somewhere" as if they had to be the SAME command, which directly
+# contradicts this function's own stated intent above ("a bare `bd show
+# "$ID"` for a human to read on a terminal is not this bug") for any line
+# also containing an unrelated pipe. Ordinary `;`-chained shell style (e.g.
+# `ps aux | grep proc; bd show "$ID"`) triggered this.
 scan_bd_formatted_output_parsed() {
-  local file="$1" joined="${2:-}" ln frag
+  local file="$1" joined="${2:-}" start end frag stmt
   [ -z "$joined" ] && joined="$(_join_continued_lines "$file")"
   # Perf: piped grep chain over the whole blob, not a per-line bash loop —
-  # see scan_bd_list_no_limit's docstring above. The --json exemption is a
-  # `grep -v` stage (drop lines that already have it) rather than a bash
-  # check, kept in the same fast chain.
-  while IFS="$(printf '\t')" read -r ln frag; do
-    [ -z "$ln" ] && continue
-    _allowlisted "$file" "$ln" && continue
-    echo "${file}:${ln}:C6:${frag}"
+  # see scan_bd_list_no_limit's docstring above.
+  while IFS="$(printf '\t')" read -r start end frag; do
+    [ -z "$start" ] && continue
+    while IFS= read -r stmt || [ -n "$stmt" ]; do
+      [ -z "$stmt" ] && continue
+      printf '%s' "$stmt" | grep -Eq "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]](comments|show)([[:space:]]|\$)" || continue
+      printf '%s' "$stmt" | grep -Eq -- '--json' && continue
+      printf '%s' "$stmt" | grep -Eq '\|[[:space:]]*(grep|egrep|sed|awk)([^A-Za-z0-9_]|$)' || continue
+      _allowlisted_range "$file" "$start" "$end" && continue
+      echo "${file}:${start}:C6:${stmt}"
+    done < <(printf '%s' "$frag" | tr ';' '\n')
   done < <(printf '%s\n' "$joined" \
     | grep -E "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]](comments|show)([[:space:]]|\$)" \
-    | grep -E '\|[[:space:]]*(grep|egrep|sed|awk)([^A-Za-z0-9_]|$)' \
-    | grep -v -- '--json')
+    | grep -E '\|[[:space:]]*(grep|egrep|sed|awk)([^A-Za-z0-9_]|$)')
 }
 
 # ── C7: `$?` read immediately after a piped command ──────────────────────────
@@ -560,15 +633,31 @@ scan_pipe_then_exit_code() {
 # detector does not flag.
 # Optional 2nd arg <joined>: see scan_bd_list_no_limit's docstring above —
 # same shared-computation rationale, same default-if-omitted behavior.
+#
+# ga-a4gfd gate-feedback: uses _allowlisted_range (not the old start-line-
+# only _allowlisted) for the same reason as C4/C5/C6 — see
+# _allowlisted_range's own docstring. Deliberately NOT given the same
+# per-statement `;`-split restructuring those three received: this
+# detector's trigger is ONE self-contained regex
+# (`\.field[[:space:]]*\|[[:space:]]*length`) that captures the risky
+# field-path AND its pipe-to-length together in a single match, unlike
+# C4/C5/C6's bug — which was treating two INDEPENDENTLY-matched facts
+# (e.g. "a bd call exists" and "--limit 0 exists") as if they had to
+# belong to the same statement, when whole-line matching let them come
+# from two different, unrelated statements. There is no equivalent second
+# fact here to misattribute: a `.field | length` match is real wherever it
+# occurs in the fragment, regardless of what other jq calls share the
+# line, so whole-fragment presence-checking does not introduce the same
+# false-negative/false-positive class for this detector specifically.
 scan_jq_length_as_existence() {
-  local file="$1" joined="${2:-}" ln frag
+  local file="$1" joined="${2:-}" start end frag
   [ -z "$joined" ] && joined="$(_join_continued_lines "$file")"
   # Perf: piped grep chain over the whole blob, not a per-line bash loop —
   # see scan_bd_list_no_limit's docstring above.
-  while IFS="$(printf '\t')" read -r ln frag; do
-    [ -z "$ln" ] && continue
-    _allowlisted "$file" "$ln" && continue
-    echo "${file}:${ln}:C8:${frag}"
+  while IFS="$(printf '\t')" read -r start end frag; do
+    [ -z "$start" ] && continue
+    _allowlisted_range "$file" "$start" "$end" && continue
+    echo "${file}:${start}:C8:${frag}"
   done < <(printf '%s\n' "$joined" \
     | grep -E "([^A-Za-z0-9_]|^)jq([^A-Za-z0-9_]|\$)" \
     | grep -E '\.[A-Za-z_][A-Za-z0-9_.]*[[:space:]]*\|[[:space:]]*length')
