@@ -342,8 +342,16 @@ fi
 echo "── 6. already-merged-source-bead-cleanup-fn: unreadable source bead is skipped, not treated as open ──"
 FN_MERGE="$(extract_block "$DISPATCHER" "already-merged-source-bead-cleanup-fn")"
 FN_VSA3="$(extract_block "$DISPATCHER" "vb-status-action-fn")"
-if [ -z "$FN_MERGE" ] || [ -z "$FN_VSA3" ]; then
-  bad "could not extract already-merged-source-bead-cleanup-fn or vb-status-action-fn — aborting Part 6"
+# ga-v5acl: the cleanup block now calls gate_release_stale_assignee /
+# gate_close_source_terminal instead of ad hoc `bd assign`/`bd close` — this
+# sandbox only stubs bd()/log()/warn() and evals the extracted blocks
+# verbatim (no `source` of the whole dispatcher), so both new functions must
+# be spliced in too or the block fails with "command not found" (exit 127)
+# the instant it calls them.
+FN_RELEASE="$(extract_block "$DISPATCHER" "gate-release-stale-assignee-fn")"
+FN_CLOSE_TERM="$(extract_block "$DISPATCHER" "gate-close-source-terminal-fn")"
+if [ -z "$FN_MERGE" ] || [ -z "$FN_VSA3" ] || [ -z "$FN_RELEASE" ] || [ -z "$FN_CLOSE_TERM" ]; then
+  bad "could not extract already-merged-source-bead-cleanup-fn, vb-status-action-fn, gate-release-stale-assignee-fn, or gate-close-source-terminal-fn — aborting Part 6"
 else
   run_merge_cleanup() {
     local scenario="$1" bd_log="$2"
@@ -369,13 +377,15 @@ else
               open)       echo "$VB_OPEN"; return 0 ;;
             esac
             ;;
-          *" label "*|*" comment "*|*" close "*|*" assign "*) echo "$*" >> "$BD_LOG"; return 0 ;;
+          *" label "*|*" comment "*|*" close "*|*" assign "*|*" reclaim "*) echo "$*" >> "$BD_LOG"; return 0 ;;
         esac
         return 0
       }
       log()  { echo "LOG: $*" >&2; }
       warn() { echo "WARN: $*" >&2; }
       '"$FN_VSA3"'
+      '"$FN_RELEASE"'
+      '"$FN_CLOSE_TERM"'
       '"$FN_MERGE"'
     ' _ "$bd_log" "$scenario"
     return $?
