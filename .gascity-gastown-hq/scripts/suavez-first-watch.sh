@@ -11,7 +11,12 @@ LABEL="com.gascity.suavez-first-watch"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # current open needs-approval bead ids (cross-store)
-cur_raw=$(bd -C "$CITY" list --all --json 2>/dev/null)
+# ga-qb6yg self-review before resubmission: --all only lifts the closed-status
+# filter, it does NOT lift the separate 50-row --limit default (confirmed via
+# `bd list --help`) — without --limit 0 this silently truncates at 50 (the
+# ga-21kmp gotcha), same fix already applied to the sibling query in
+# routed-to-eraser-capture.sh in this same diff.
+cur_raw=$(bd -C "$CITY" list --all --limit 0 --json 2>/dev/null)
 BD_RC=$?
 cur=$(printf '%s' "$cur_raw" | jq -r '.[] | select((.labels//[])|any(.=="story:needs-approval")) | select(.status=="open") | .id' 2>/dev/null | sort -u)
 

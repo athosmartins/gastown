@@ -124,10 +124,21 @@ fi
 # (2) Gate merge cadence ------------------------------------------------------
 LAST_PASS_LINE=$(grep -aE "\] \[quality-gate-dispatcher\] Gate PASSED:" "$DISP_LOG" 2>/dev/null | tail -1)
 LAST_MERGE_EPOCH=$(bracket_to_epoch "$LAST_PASS_LINE")
+# ga-qb6yg self-review before resubmission: same blind spot the MARKER_QUERY_FAILED
+# fix below already addresses for READY_MARKERS, but left unaddressed here — an
+# unknown last-merge-time (no "Gate PASSED" line found, e.g. DISP_LOG was just
+# truncated by city-disk-autoprune.sh, also new in this branch) used to set
+# MINS_SINCE_MERGE=-1, which trivially fails `-gt "$STALL_MAX_MIN"` forever, so
+# "we don't know when the last merge was" silently read as "definitely not
+# stalled" instead of "can't rule out a stall." Track it explicitly and let it
+# feed the same violation checks MARKER_QUERY_FAILED already feeds.
 if [ -n "$LAST_MERGE_EPOCH" ]; then
   MINS_SINCE_MERGE=$(( (NOW - LAST_MERGE_EPOCH) / 60 ))
+  MERGE_TIME_UNKNOWN=0
 else
   MINS_SINCE_MERGE=-1   # unknown
+  MERGE_TIME_UNKNOWN=1
+  log "WARN: no 'Gate PASSED' line found in $DISP_LOG — last-merge time unknown, treating as unverified for the stall check."
 fi
 
 # ga-sdkrl gate-feedback: the old `|| true` on the subshell masked the query's OWN
@@ -155,7 +166,8 @@ else
 fi
 
 STALL_VIOLATION=0
-if { [ "$READY_MARKERS" -gt 0 ] || [ "$MARKER_QUERY_FAILED" -eq 1 ]; } && [ "$MINS_SINCE_MERGE" -gt "$STALL_MAX_MIN" ]; then
+if { [ "$READY_MARKERS" -gt 0 ] || [ "$MARKER_QUERY_FAILED" -eq 1 ]; } \
+   && { [ "$MERGE_TIME_UNKNOWN" -eq 1 ] || [ "$MINS_SINCE_MERGE" -gt "$STALL_MAX_MIN" ]; }; then
   STALL_VIOLATION=1
 fi
 
@@ -197,6 +209,13 @@ T_MERGES=$(( $(get_state merges 0) + NEW_MERGES ))
 T_REAPS=$(( $(get_state reviewer_reaps 0) + NEW_REVIEWER_REAPS ))
 T_CREW=$(( $(get_state crew_events 0) + NEW_CREW_EVENTS ))
 T_FALSEKILL=$(( $(get_state falsekill_events 0) + NEW_FALSEKILL ))
+# ga-qb6yg self-review before resubmission: MARKER_QUERY_FAILED/MERGE_TIME_UNKNOWN
+# were computed per-sample and logged per-line (SAMPLE below), but never
+# accumulated or surfaced in the final 24h REPORT — so the report's own
+# "CONFIANÇA DO VEREDITO: ALTA" claim for the stall signal could stand
+# unqualified even if some fraction of samples were actually unverified.
+T_MARKER_QUERY_FAILED=$(( $(get_state marker_query_failed_count 0) + MARKER_QUERY_FAILED ))
+T_MERGE_TIME_UNKNOWN=$(( $(get_state merge_time_unknown_count 0) + MERGE_TIME_UNKNOWN ))
 SAMPLES=$(( $(get_state samples 0) + 1 ))
 CPU_SUM=$(fadd "$(get_state cpu_sum 0)" "$DOLT_CPU")
 CPU_PEAK=$(fmax "$(get_state cpu_peak 0)" "$DOLT_CPU")
@@ -221,6 +240,8 @@ set_state merges "$T_MERGES"
 set_state reviewer_reaps "$T_REAPS"
 set_state crew_events "$T_CREW"
 set_state falsekill_events "$T_FALSEKILL"
+set_state marker_query_failed_count "$T_MARKER_QUERY_FAILED"
+set_state merge_time_unknown_count "$T_MERGE_TIME_UNKNOWN"
 set_state samples "$SAMPLES"
 set_state cpu_sum "$CPU_SUM"
 set_state cpu_peak "$CPU_PEAK"
@@ -262,6 +283,10 @@ VIOL_DETAIL=""
 [ "$L_FALSEKILL" -eq 1 ] && VIOL_DETAIL="${VIOL_DETAIL}  - false-kill de reviewer saudável (${T_FALSEKILL} sinais / sentinel)\n"
 [ -z "$VIOL_DETAIL" ] && VIOL_DETAIL="  (nenhuma violação dura)\n"
 
+ATTENTION_DETAIL=""
+[ "$T_MARKER_QUERY_FAILED" -gt 0 ] && ATTENTION_DETAIL="${ATTENTION_DETAIL}  - ATENÇÃO: ${T_MARKER_QUERY_FAILED}/${SAMPLES} amostra(s) com marker-query falhou/timeout — tratadas como 'pode estar esperando' (nunca como zero confirmado), mas o sinal real ficou sem confirmar nessas janelas.\n"
+[ "$T_MERGE_TIME_UNKNOWN" -gt 0 ] && ATTENTION_DETAIL="${ATTENTION_DETAIL}  - ATENÇÃO: ${T_MERGE_TIME_UNKNOWN}/${SAMPLES} amostra(s) sem 'Gate PASSED' localizável no log (possível truncamento) — tratadas como possível-stall, não como recém-mergeado.\n"
+
 REPORT=$(printf '%s' "\
 SOAK 24h ga-spd2n — VEREDITO: ${VERDICT}
 
@@ -277,10 +302,13 @@ MÉTRICAS DA JANELA:
   - Reviewer reaps do self-healer (observacional/WARN): ${T_REAPS}
   - Sinais explícitos de false-kill (hard): ${T_FALSEKILL}
   - Eventos crew RESET/CLOSED: ${T_CREW}
+  - Amostras com marker-query falhou/inconclusivo: ${T_MARKER_QUERY_FAILED}/${SAMPLES}
+  - Amostras com último-merge desconhecido (sem 'Gate PASSED' no log): ${T_MERGE_TIME_UNKNOWN}/${SAMPLES}
 
 CONFIANÇA DO VEREDITO (honesto):
-  - ALTA: cadência de merge / stall (#2), carga Dolt (#5), estabilidade crew (#6),
-    merges (#7) — medidos diretamente de logs/ps.
+$(printf '%b' "$ATTENTION_DETAIL")  - ALTA: cadência de merge / stall (#2), carga Dolt (#5), estabilidade crew (#6),
+    merges (#7) — medidos diretamente de logs/ps. Ver ressalvas acima se alguma
+    amostra ficou inconclusiva.
   - APROX/BAIXA: false-kill de reviewer (#3) e intervenção manual (#4) — detecção
     best-effort via sentinel + assinaturas de log. Self-healer reaping de reviewer
     peek-morto é POR DESIGN e contado só como WARN. Mis-routing de domínio do Pilot

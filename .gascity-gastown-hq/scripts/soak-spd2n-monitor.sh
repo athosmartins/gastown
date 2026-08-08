@@ -66,25 +66,44 @@ fi
 
 # 24h reached → final verdict + self-unload
 if [ "$elapsed_h" -ge "$SOAK_HOURS" ]; then
-  # ga-ebgw9 gate-feedback: same grep -c double-zero gotcha as `merges` above (see
-  # its own comment) — missed here on the first pass despite fixing the sibling
-  # right next to the warning. Same fix: capture stdout, sanitize, never chain
-  # `|| echo 0`.
-  fails=$(grep -c '"wedged":1' "$LOG" 2>/dev/null)
-  fails=$(printf '%s' "$fails" | tr -dc '0-9')
-  fails="${fails:-0}"
-  total=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')
-  maxstrike=$(grep -oE '"strikes":[0-9]+' "$LOG" 2>/dev/null | grep -oE '[0-9]+' | sort -rn | head -1)
-  verdict="PASS"; [ "${maxstrike:-0}" -ge "$WEDGE_FAIL_STRIKES" ] && verdict="FAIL"
-  printf '{"ts":"%s","event":"FINAL","verdict":"%s","elapsed_h":%s,"checks":%s,"wedged_checks":%s,"max_consecutive_wedge":%s}\n' \
-    "$ts" "$verdict" "$elapsed_h" "$total" "$fails" "${maxstrike:-0}" >> "$LOG" 2>/dev/null
-  command -v notify >/dev/null 2>&1 && notify -p 4 -t "Soak ga-spd2n $verdict" "24h soak done: $verdict ($total checks, $fails wedged, max-consecutive=${maxstrike:-0}). Gate+Pilot imparáveis = $([ "$verdict" = PASS ] && echo SIM || echo NÃO)." >/dev/null 2>&1 || true
+  # ga-qb6yg self-review before resubmission: maxstrike's `${maxstrike:-0}`
+  # default is mechanically fine (unlike the `fails` bug below), but it makes
+  # "couldn't read $LOG at all" produce the exact same 0 as "read it fully and
+  # genuinely never wedged" — and that value alone decides PASS/FAIL, the
+  # single most consequential computation in this file. Check readability
+  # once, up front, and fail loud instead of silently reporting a clean soak.
+  if [ ! -r "$LOG" ]; then
+    log_unreadable=1
+    fails=0; total=0; maxstrike="unknown"; verdict="FAIL"
+  else
+    log_unreadable=0
+    # ga-ebgw9 gate-feedback: same grep -c double-zero gotcha as `merges` above (see
+    # its own comment) — missed here on the first pass despite fixing the sibling
+    # right next to the warning. Same fix: capture stdout, sanitize, never chain
+    # `|| echo 0`.
+    fails=$(grep -c '"wedged":1' "$LOG" 2>/dev/null)
+    fails=$(printf '%s' "$fails" | tr -dc '0-9')
+    fails="${fails:-0}"
+    total=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')
+    maxstrike=$(grep -oE '"strikes":[0-9]+' "$LOG" 2>/dev/null | grep -oE '[0-9]+' | sort -rn | head -1)
+    maxstrike="${maxstrike:-0}"
+    verdict="PASS"; [ "$maxstrike" -ge "$WEDGE_FAIL_STRIKES" ] && verdict="FAIL"
+  fi
+  printf '{"ts":"%s","event":"FINAL","verdict":"%s","elapsed_h":%s,"checks":%s,"wedged_checks":%s,"max_consecutive_wedge":%s,"log_unreadable":%s}\n' \
+    "$ts" "$verdict" "$elapsed_h" "$total" "$fails" "$maxstrike" "$log_unreadable" >> "$LOG" 2>/dev/null
+  if [ "$log_unreadable" -eq 1 ]; then
+    command -v notify >/dev/null 2>&1 && notify -p 5 -t "Soak ga-spd2n $verdict" "24h soak done but $LOG was unreadable at finalize — could NOT compute a real verdict. Treating as FAIL; verify manually." >/dev/null 2>&1 || true
+  else
+    command -v notify >/dev/null 2>&1 && notify -p 4 -t "Soak ga-spd2n $verdict" "24h soak done: $verdict ($total checks, $fails wedged, max-consecutive=${maxstrike}). Gate+Pilot imparáveis = $([ "$verdict" = PASS ] && echo SIM || echo NÃO)." >/dev/null 2>&1 || true
+  fi
   # Durable handoff: mail the mayor so the NEXT mayor session reviews the verdict
   # even if no session was alive at conclusion (survives session death — the exact
   # use case for mail over nudge). The next mayor reads this in its inbox.
+  MAIL_NOTE="If PASS → declare refine→review→approve funnel + gate/pilot PRODUCTION-READY, close ga-spd2n, update memory. If FAIL → diagnose the wedged checkpoints + fix root."
+  [ "$log_unreadable" -eq 1 ] && MAIL_NOTE="FAIL is forced here because $LOG was unreadable at finalize time — this is NOT a wedge signal, it's an unverifiable soak. Fix log access and re-run the soak rather than diagnosing a wedge that was never actually observed."
   ( cd "$CITY" && GC_CITY="$CITY" gc mail send mayor \
       -s "Soak ga-spd2n CONCLUDED: $verdict" \
-      -m "24h imparável soak done. Verdict=$verdict. $total checks, $fails wedged, max-consecutive-wedge=${maxstrike:-0}. Log: .gc/logs/soak-spd2n.jsonl (event:FINAL). If PASS → declare refine→review→approve funnel + gate/pilot PRODUCTION-READY, close ga-spd2n, update memory. If FAIL → diagnose the wedged checkpoints + fix root. Also verify ga-fhhsh reached 'Sua vez' and wa-jjea merged via union-aware gate. (auto-sent by soak-spd2n-monitor at 24h)." >/dev/null 2>&1 ) || true
+      -m "24h imparável soak done. Verdict=$verdict. $total checks, $fails wedged, max-consecutive-wedge=${maxstrike}. Log: .gc/logs/soak-spd2n.jsonl (event:FINAL). $MAIL_NOTE Also verify ga-fhhsh reached 'Sua vez' and wa-jjea merged via union-aware gate. (auto-sent by soak-spd2n-monitor at 24h)." >/dev/null 2>&1 ) || true
   launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
 fi
 exit 0

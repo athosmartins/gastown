@@ -138,7 +138,18 @@ drain() {
   [[ ! -f "$slog" ]] && { log "  drain($d): no stdout log to observe -> proceed"; return; }
   while (( waited < DRAIN_WAIT )); do
     now=$(date +%s)
-    mtime=$(stat -f %m "$slog" 2>/dev/null || echo 0)
+    # ga-qb6yg self-review before resubmission: a stat failure on a log file we
+    # just confirmed exists (transient race, not "file doesn't exist") used to
+    # collapse to mtime=0 -> age=huge -> immediate "quiescent, proceed", the
+    # same outcome as a genuinely idle log. Treat "couldn't read mtime" as
+    # possibly-still-active instead, so it falls through to the bounded wait
+    # loop below rather than skipping the drain entirely.
+    if ! mtime=$(stat -f %m "$slog" 2>/dev/null); then
+      log "  drain($d): couldn't stat log (transient?) — treating as still-active, waiting 1s (waited ${waited}s/${DRAIN_WAIT}s)"
+      sleep 1
+      waited=$(( waited + 1 ))
+      continue
+    fi
     age=$(( now - mtime ))
     if (( age >= 3 )); then
       log "  drain($d): quiescent (log idle ${age}s) -> proceed"
@@ -160,7 +171,14 @@ drain() {
 # that are noise, not a daemon crash. We strip those before testing for fatals.
 stderr_has_real_fatal() {
   local d="$1" raw filtered
-  raw=$(tail -n 40 "$(stderrlog_for "$d")" 2>/dev/null) || return 1
+  # ga-qb6yg self-review before resubmission: a tail failure (log rotated /
+  # briefly unreadable right after kickstart) used to `return 1` — the exact
+  # same code as "read 40 lines, found no fatal" — which verify_healthy()
+  # treats as license to declare the daemon healthy for worker daemons with no
+  # HTTP port. "Couldn't check" must not look like "checked, clean": return 0
+  # (possible-fatal) so the caller keeps waiting/retries instead of confirming
+  # health off a check that never actually ran.
+  raw=$(tail -n 40 "$(stderrlog_for "$d")" 2>/dev/null) || return 0
   # Drop known-benign lines so they can never trip the fatal detector.
   filtered=$(printf '%s\n' "$raw" \
     | grep -viE 'MallocStackLogging' \
@@ -303,13 +321,25 @@ main() {
   if [[ "$DRY_RUN" != "1" && -f "$SENTINEL" ]]; then
     log "sentinel present ($SENTINEL) -> already completed; re-verifying freshness only (no kickstart)"
     local all_fresh=1
-    local sentinel_epoch
-    sentinel_epoch=$(stat -f %m "$SENTINEL" 2>/dev/null || echo 0)
+    local sentinel_epoch sentinel_epoch_unknown=0
+    # ga-qb6yg self-review before resubmission: a stat failure on the
+    # just-confirmed-present $SENTINEL used to collapse to epoch 0, which makes
+    # `sepoch >= sentinel_epoch - 120` trivially true for any running daemon —
+    # "couldn't read sentinel mtime" silently reading as "confirmed fresh",
+    # the opposite of the fail-safe direction the merge_epoch check below
+    # takes for the equivalent unknown case. Track it explicitly instead.
+    if ! sentinel_epoch=$(stat -f %m "$SENTINEL" 2>/dev/null); then
+      sentinel_epoch=0
+      sentinel_epoch_unknown=1
+    fi
     for d in "${ORDER[@]}"; do
       local pid sepoch
       pid=$(pid_of "$(label_for "$d")")
       sepoch=$(start_epoch_of "$pid")
-      if (( sepoch > 0 && sepoch >= sentinel_epoch - 120 )); then
+      if (( sentinel_epoch_unknown )); then
+        log "  reverify($d): sentinel mtime unreadable — cannot confirm freshness (pid=${pid:-none})"
+        all_fresh=0
+      elif (( sepoch > 0 && sepoch >= sentinel_epoch - 120 )); then
         log "  reverify($d): fresh (pid=$pid started=$(date -r "$sepoch" '+%H:%M:%S'))"
       else
         log "  reverify($d): NOT fresh (pid=${pid:-none}) — but sentinel says done; leaving untouched"

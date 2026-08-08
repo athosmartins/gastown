@@ -71,6 +71,7 @@ while true; do
       NEW=$(printf '%s' "$NEWLINE" | jq -r '.m["gc.routed_to"] // ""' 2>/dev/null)
       if [ -z "$NEW" ]; then
         REST=$(printf '%s' "$NEWLINE" | jq -c '.m' 2>/dev/null)
+        REST_RC=$?
         # DESPACHO NORMAL vs APAGADORA: o Pilot CONSOME gc.routed_to ao despachar, e isso
         # é comportamento correto — não é o bug que este script caça. O discriminador não
         # é "pilot.* sobreviveu" (sobrevive nos dois casos), é se dispatched_at MUDOU:
@@ -85,7 +86,15 @@ while true; do
           echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] despacho normal $ID — rota '$OLD' consumida (dispatched_at $DA_OLD -> $DA_NEW). NAO e a apagadora." >> "$LOG"
           continue
         fi
-        if [ "$REST" = "{}" ] || [ "$REST" = "null" ]; then P="PADRAO-1 (metadata inteiro vazio)"; else P="PADRAO-2 (cirurgico, pilot.* sobreviveu)"; fi
+        # ga-qb6yg self-review before resubmission: a jq parse failure on $NEWLINE
+        # (e.g. an embedded newline from a title field) used to yield an empty
+        # $REST, which matches neither "{}" nor "null" and so fell into the
+        # PADRAO-2 else-branch — logging a CONFIRMED "cirurgico" classification
+        # for evidence that was never actually parsed. This script exists to
+        # produce a reliable evidence trail for a hard-to-reproduce bug hunt, so
+        # an unparseable sample must say so, not silently masquerade as a
+        # confirmed pattern match.
+        if [ "$REST_RC" -ne 0 ]; then P="INCONCLUSIVO (falha ao parsear metadata pos-evento — nao classificavel)"; elif [ "$REST" = "{}" ] || [ "$REST" = "null" ]; then P="PADRAO-1 (metadata inteiro vazio)"; else P="PADRAO-2 (cirurgico, pilot.* sobreviveu)"; fi
         echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] FLAGRADO $ID — rota '$OLD' sumiu SEM despacho novo | $P | metadata agora: $REST" >> "$LOG"
       fi
     done <<<"$(cat "$PREV")"

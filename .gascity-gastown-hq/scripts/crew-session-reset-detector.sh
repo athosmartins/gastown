@@ -24,9 +24,21 @@ CUR="$(cd "$CITY" && GC_CITY="$CITY" timeout 15 bash "$CITY/scripts/gc-session-l
       | select(.template | test("-(wa|ps|lx)$"))
       | select(.state=="active" or .state=="asleep" or .state=="start-pending")
       | "\(.template)\t\(.id)"' 2>/dev/null | sort -u)"
+CUR_RC=$?
 
-# Probe failure (Dolt down / gc hung) → skip silently, keep prior snapshot.
-[ -z "$CUR" ] && { log "skip: no crew session data (gc/Dolt unavailable?)"; exit 0; }
+# ga-qb6yg self-review before resubmission: `-z "$CUR"` alone can't tell a probe
+# failure (timeout/bad JSON — gc-session-list-cached.sh always emits valid JSON
+# on success, even with zero sessions) apart from the genuine "all crew sessions
+# are gone right now" state — which is exactly the mass-incident case this
+# detector's own header exists to catch ("agent vanishes entirely = closed").
+# Collapsing both into the same silent skip would swallow the CLOSED alert for
+# every previously-tracked agent during a real mass-reap. `set -uo pipefail` is
+# active, so the pipeline's real exit code (captured above, before anything else
+# can reset $?) distinguishes them: only a non-zero CUR_RC is a probe failure.
+if [ "$CUR_RC" -ne 0 ]; then
+  log "skip: session-list probe failed (rc=$CUR_RC, gc/Dolt unavailable?) — keeping prior snapshot"
+  exit 0
+fi
 
 # First run: just record.
 [ -f "$SNAP" ] || { printf '%s\n' "$CUR" > "$SNAP"; log "baseline recorded ($(printf '%s\n' "$CUR" | wc -l | tr -d ' ') crew session(s))."; exit 0; }

@@ -139,10 +139,16 @@ else
   bad "expected stubbed kickstart call; calls=$(cat "$CALLS")"
 fi
 # Confirm NO real binaries were invoked: the only recorded calls are stubs.
-if grep -qvE '^(launchctl|mail|notify) ' "$CALLS" 2>/dev/null; then
-  bad "unexpected non-stub call recorded: $(cat "$CALLS")"
-else
+# ga-qb6yg self-review before resubmission: `grep -qv` on an EMPTY $CALLS also
+# finds zero non-stub lines, so this passed identically whether the stubs
+# fired correctly or the stub seam was broken entirely (env var typo, sourcing
+# failure) and never invoked FLOW_HEALER_FAKE_* at all — the exact
+# "always-green trains you to stop reading it" failure this file's own header
+# already calls out for a different bug. Require at least one recorded call.
+if [ -s "$CALLS" ] && ! grep -qvE '^(launchctl|mail|notify) ' "$CALLS" 2>/dev/null; then
   ok "only stubbed side-effects recorded (zero real launchctl/gc/bd/notify)"
+else
+  bad "expected only stub calls recorded, got: calls=$(cat "$CALLS" 2>/dev/null || echo '(empty)')"
 fi
 unset FLOW_HEALER_FAKE_LAUNCHCTL FLOW_HEALER_FAKE_MAIL FLOW_HEALER_FAKE_NOTIFY FLOW_HEALER_FAKE_MTIME_AUTO_REFINO_DISPATCHER_LOG
 
