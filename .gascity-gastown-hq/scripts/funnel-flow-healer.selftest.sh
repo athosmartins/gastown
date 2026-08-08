@@ -4,7 +4,18 @@
 # launchctl / gc mail / bd / notify calls — all are stubbed. No daemons are touched.
 set -uo pipefail
 
-HEALER="${HEALER:-/tmp/funnel-flow-healer.sh}"
+# ga-qb6yg gate-feedback: default resolves relative to THIS file's own location,
+# matching every other *.selftest.sh sibling in this dir (dolt-hang-watchdog,
+# gate-health-monitor, inflight-reclaim-guard, production-drift-guard,
+# log-reaper, worktree-reaper, transcript-reaper — verified 7/7). The old
+# hardcoded /tmp default doesn't exist on a normal checkout and nothing in the
+# repo ever set HEALER before invoking this file, so it failed closed on every
+# run (source failed, decide_action/handle_signature left undefined, every
+# assertion then compared '' against expected — PASS=3 FAIL=20 of 23,
+# unconditionally) for a reason that has nothing to do with the decision logic
+# it exists to test. An always-red selftest trains whoever watches it to stop
+# reading it, which is how a real regression later slips through.
+HEALER="${HEALER:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/funnel-flow-healer.sh}"
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  FAIL - $1"; }
