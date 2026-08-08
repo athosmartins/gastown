@@ -33,7 +33,18 @@ dolt_ok=$(timeout 8 python3 -c "import pymysql;pymysql.connect(host='127.0.0.1',
 dolt_cpu=$(ps -p "$(pgrep -f 'dolt sql-server' | head -1)" -o %cpu= 2>/dev/null | tr -d ' ' || echo "?")
 refino_ok=$(launchctl list 2>/dev/null | grep -qE 'com.gascity.(auto-refino|refino-gate)-dispatcher' && echo 1 || echo 0)
 # progress: merges in the whole soak window (monotonic non-decreasing health signal)
-merges=$(grep -c "verdict=PASS\|merge_sha" "$GATE_LOG" 2>/dev/null || echo 0)
+# ga-879wu gate-feedback: grep -c always prints a number on stdout (even "0" with
+# exit 1 on no match), so the old `|| echo 0` chain doubled to a literal "0\n0" on
+# a zero-match cycle — embedded raw into the printf below (line ~48), that splits
+# the JSONL log line's "merges" field across two lines, corrupting it. Matches
+# gate-pilot-soak-monitor.sh's own established fix for this exact gotcha: capture
+# stdout and sanitize, don't chain `|| echo 0`. Also covers the one gap that
+# pattern has here (no upstream GATE_LOG existence check, unlike that sibling's
+# own `[ -f "$lf" ] || ...` guard) — a missing file makes grep -c print NOTHING
+# at all, not even "0", so the trailing ${merges:-0} backstops that to a valid int.
+merges=$(grep -c "verdict=PASS\|merge_sha" "$GATE_LOG" 2>/dev/null)
+merges=$(printf '%s' "$merges" | tr -dc '0-9')
+merges="${merges:-0}"
 
 wedged=0
 [ "$gate_alive" = "0" ] && wedged=1

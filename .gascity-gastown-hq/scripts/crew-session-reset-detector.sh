@@ -38,7 +38,14 @@ cur_agents="$(printf '%s\n' "$CUR" | cut -f1 | sort -u)"
 alerts=0
 while IFS=$'\t' read -r agent id; do
   [ -z "$agent" ] && continue
-  if printf '%s\n' "$CUR" | grep -qF "$(printf '%s\t%s' "$agent" "$id")"; then
+  # ga-879wu gate-feedback: -x (whole-LINE match), not a bare -F substring search.
+  # CUR's lines are exactly "agent<TAB>id" and nothing else, so an unanchored -F
+  # would count a match even when the search string is only a PREFIX of the real
+  # line — e.g. old id "abc123" vs a genuinely NEW id "abc123X" for the same
+  # agent (a real reset) would false-negative as "still the same, no change".
+  # Line 44 below already uses -qxF for its own single-column check; this one
+  # was the one site left unanchored.
+  if printf '%s\n' "$CUR" | grep -qxF "$(printf '%s\t%s' "$agent" "$id")"; then
     continue   # same id still live → no change
   fi
   if printf '%s\n' "$cur_agents" | grep -qxF "$agent"; then

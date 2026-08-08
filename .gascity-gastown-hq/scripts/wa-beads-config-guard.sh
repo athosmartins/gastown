@@ -67,7 +67,7 @@ except Exception as e:
 repair_config() {
     [ -f "$CONFIG" ] || return 1
 
-    local repair_result
+    local repair_result repair_rc
     repair_result=$(python3 << 'PYEOF' 2>&1
 import re, os, sys
 
@@ -132,8 +132,16 @@ except Exception as e:
     sys.exit(1)
 PYEOF
     )
+    # ga-879wu gate-feedback: $? right after `echo` reflected echo's own status
+    # (always 0), never python3's — capture it immediately after the assignment
+    # instead, so check_and_repair()'s `[ $exit_code -ne 0 ]` branch (its
+    # dedicated "Repair failed (exit ...)" message) can actually fire. Neutral
+    # in practice before this fix (check_and_repair's own validate_config()
+    # re-check catches a failed repair either way and still returns 1), but the
+    # dead branch's more specific diagnostic was unreachable.
+    repair_rc=$?
     echo "$repair_result"
-    return $?
+    return "$repair_rc"
 }
 
 # ── Check-and-repair cycle ────────────────────────────────────────────────────
