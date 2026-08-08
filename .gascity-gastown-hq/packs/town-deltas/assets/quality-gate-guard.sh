@@ -234,6 +234,30 @@ verdict_count_from_query() {
   echo "$n"
 }
 
+# open_verdict_ids_from_json <verdict_beads_json> — pure fn (ga-g4m18).
+# Companion to verdict_count_from_query/verdict_bead_count_for_run, same input
+# shape (the JSON array from `bd list --json --all -l type:quality-gate-verdict
+# -l gate-run:<id>`), different projection: instead of a count, return the ids
+# of every bead whose status is NOT closed, one per line.
+#
+# THE POINT (ga-g4m18): when Vector B confirms a gate-run's reviewers are all
+# dead and supersedes the gate-run bead itself (supersede:dead-reviewers,
+# ga-o57gn), the per-reviewer verdict beads that run spawned were never
+# touched — they sat open+in_progress, assigned to the now-confirmed-dead
+# reviewer session, forever (observed live: ga-ydf9v/ga-z8erc, hand-closed by
+# the Mayor as a one-off). This is the pure half of the cascade-close fix —
+# the live I/O half (close_dead_reviewer_verdicts, below the lib-only cutoff)
+# fetches the JSON and calls this to decide which ids to close.
+#
+# Pure: no bd/gc I/O, deterministic given the input string — the selftest
+# exercises it directly with a fixture instead of a mocked bd.
+open_verdict_ids_from_json() {
+  local vbs="$1"
+  printf '%s\n' "$vbs" \
+    | jq -r '.[]? | select((.status // "") != "closed") | .id // empty' \
+    2>/dev/null || true
+}
+
 # companion_liveness_from_query <query_ok: 0|1> <marker_found_running: 0|1>
 # Pure decision (ga-qj1xh): what has_live_companion_run should be, given whether
 # the SHARED gate-runs query (Vector A/B prelude, GATE_RUNS_JSON below) actually
@@ -1543,6 +1567,38 @@ reviewers_alive_for_run() {
   echo 0
 }
 
+# close_dead_reviewer_verdicts <gate_run_id> — I/O helper (ga-g4m18).
+# Cascades Vector B's dead-reviewer supersede onto sibling verdict beads.
+# reviewers_alive_for_run already confirmed (immediately above, same loop
+# iteration) that every OPEN verdict bead for this gate-run is assigned to a
+# dead session before the caller ever reaches supersede:dead-reviewers — this
+# closes those verdict beads themselves once $gr_id's gate-run is superseded,
+# instead of leaving them orphaned open+in_progress forever (ga-g4m18: the
+# gap reviewers_alive_for_run's own liveness check never closed, observed
+# live as ga-ydf9v/ga-z8erc, hand-closed by the Mayor as a one-off).
+#
+# ga-48xcv: reuses reviewers_alive_for_run's exact query shape (same labels,
+# same gr_id) — the read-cache shim (default TTL 5s) collapses the pair into
+# one live Dolt round-trip since this always runs in the same loop iteration,
+# right after reviewers_alive_for_run's own call for the same $gr_id.
+#
+# (Live section only — uses bd/gc; never called in lib-only mode. The pure
+# projection it depends on, open_verdict_ids_from_json, lives above the
+# GATE_GUARD_LIB_ONLY cutoff and IS selftest-exercised directly.)
+close_dead_reviewer_verdicts() {
+  local gr_id="$1" vbs ids v_id
+  [ -z "$gr_id" ] && return
+  vbs=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --all \
+    -l type:quality-gate-verdict -l "gate-run:$gr_id" 2>/dev/null || echo "[]")
+  ids=$(open_verdict_ids_from_json "$vbs")
+  [ -z "$ids" ] && return
+  for v_id in $ids; do
+    [ -z "$v_id" ] && continue
+    bd -C "$GC_CITY" comment "$v_id" "Vector B (ga-g4m18): cascade-closed — parent gate-run $gr_id was superseded (dead reviewer, no live session assigned to this verdict). Self-healed by guard." 2>/dev/null || true
+    bd -C "$GC_CITY" close "$v_id" -r "quality-gate-verdict orphaned (terminal) — parent gate-run $gr_id superseded, dead reviewer. Closed by guard (ga-g4m18)." 2>/dev/null || true
+  done
+}
+
 # verdict_bead_count_for_run <gate_run_id> — I/O helper (ga-jfo7).
 # Total (open+closed) verdict beads ever created for this gate-run id. 0 means
 # no dispatcher-spawned reviewer was ever attached to THIS bead's id (see
@@ -1730,6 +1786,11 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
         set_gate_status "$GR_ID" "superseded"
         bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-o57gn): zombie gate-run superseded — age ${GR_AGE}m exceeds verdict-timeout+margin (${GATE_ZOMBIE_AGE_MINUTES}m) AND no live reviewer is assigned to an open verdict bead. The owning dispatcher died/was killed mid-run. Self-healed by guard." 2>/dev/null || true
         bd -C "$GC_CITY" close "$GR_ID" -r "gate-run superseded (terminal) — zombie: age>verdict-timeout, no live reviewer. Closed by guard (ga-o57gn)." 2>/dev/null || true
+        # ga-g4m18: cascade-close this run's own OPEN verdict beads — Vector B
+        # closed the gate-run above but previously left its sibling verdict
+        # beads (the ones reviewers_alive_for_run just confirmed are all
+        # assigned to dead sessions) orphaned open forever.
+        close_dead_reviewer_verdicts "$GR_ID"
         ;;
       abort:age)
         warn "Vector B: aborting gate-run $GR_ID by TTL fallback (age=${GR_AGE}m > ${GATE_RUN_TTL_MINUTES}m, marker_active=${MARKER_ACTIVE})"

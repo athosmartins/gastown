@@ -61,6 +61,7 @@ type gap2_marker_for_bead          >/dev/null 2>&1 || { echo "FATAL: gap2_marker
 type gap2_arm_needs_remerge        >/dev/null 2>&1 || { echo "FATAL: gap2_arm_needs_remerge not defined by guard (ga-4tgga attempt 3)"; exit 1; }
 type gap2_refused_token            >/dev/null 2>&1 || { echo "FATAL: gap2_refused_token not defined by guard (ga-eu75w)"; exit 1; }
 type gap2_free_refused_stranded    >/dev/null 2>&1 || { echo "FATAL: gap2_free_refused_stranded not defined by guard (ga-eu75w)"; exit 1; }
+type open_verdict_ids_from_json    >/dev/null 2>&1 || { echo "FATAL: open_verdict_ids_from_json not defined by guard (ga-g4m18)"; exit 1; }
 
 # ── 0. age_minutes_of must read the bead 'Z' timestamps as UTC (not local) ───
 # Regression lock for the TZ bug that made every age negative (off by the host's
@@ -197,6 +198,36 @@ eq "group of 3, older → supersede:duplicate"  "$(dedup_gaterun_action 3 0)" "s
 eq "group of 0 (ungroupable) → keep (safe)"   "$(dedup_gaterun_action 0 1)" "keep"
 eq "non-numeric group_count → keep (safe)"    "$(dedup_gaterun_action x 0)" "keep"
 
+# ── 2d. open_verdict_ids_from_json (ga-g4m18: verdict cascade-close projection) ──
+# Signature: open_verdict_ids_from_json <verdict_beads_json>. Pure projection
+# over the same JSON shape reviewers_alive_for_run already fetches (`bd list
+# --json --all -l type:quality-gate-verdict -l gate-run:<id>`): return the ids
+# of every NOT-closed bead, one per line. This is the pure half of the
+# ga-g4m18 fix — Vector B's supersede:dead-reviewers case now calls the live
+# wrapper (close_dead_reviewer_verdicts, below the lib-only cutoff, so it is
+# drift-guarded via grep in section 3 instead of sourced here) to actually
+# close what this function says is still open.
+echo "── 2d. open_verdict_ids_from_json (ga-g4m18: verdict cascade-close projection) ──"
+
+GA_G4M18_MIXED='[
+  {"id":"ga-verdict-open1","status":"open"},
+  {"id":"ga-verdict-inprog1","status":"in_progress"},
+  {"id":"ga-verdict-closed1","status":"closed"}
+]'
+eq "mixed open+in_progress+closed → only the two non-closed ids" \
+   "$(open_verdict_ids_from_json "$GA_G4M18_MIXED" | sort | tr '\n' ',')" \
+   "ga-verdict-inprog1,ga-verdict-open1,"
+eq "all-closed → empty (nothing left to cascade-close)" \
+   "$(open_verdict_ids_from_json '[{"id":"ga-v1","status":"closed"},{"id":"ga-v2","status":"closed"}]')" ""
+eq "empty array → empty" \
+   "$(open_verdict_ids_from_json '[]')" ""
+eq "single open bead → exactly that id" \
+   "$(open_verdict_ids_from_json '[{"id":"ga-solo","status":"open"}]')" "ga-solo"
+eq "missing status field → treated as non-closed (fail-safe: cascade-close, don't strand)" \
+   "$(open_verdict_ids_from_json '[{"id":"ga-nostat"}]')" "ga-nostat"
+eq "malformed JSON → empty (fail-safe: never guess ids out of garbage)" \
+   "$(open_verdict_ids_from_json 'not-json')" ""
+
 # ── 3. Drift-guard: the guard still wires both vectors into the live sweep ────
 echo "── 3. drift-guard: guard implements both reconciler vectors ──"
 grep -q 'GATE_GUARD_LIB_ONLY'                "$GUARD" && ok "guard is sourceable in lib-only mode"        || bad "guard missing lib-only guard"
@@ -247,6 +278,61 @@ grep -q 'supersede:duplicate' "$GUARD" && ok "guard supersedes stale duplicate g
 [ "$(grep -c 'Closed by guard (ga-o57gn)' "$GUARD")" -ge 2 ] \
   && ok "guard closes dead-reviewer + duplicate gate-runs at terminal (ga-jhyu invariant)" \
   || bad "guard ga-o57gn terminal paths do not both close the gate-run"
+
+# ── ga-g4m18 drift-guards: verdict-bead cascade-close on dead-reviewer supersede ──
+# Bug ga-g4m18: reviewers_alive_for_run confirms every OPEN verdict bead for a
+# gate-run is assigned to a dead session right before this branch runs, and
+# Vector B supersedes+closes the gate-run bead itself here — but never
+# touched those verdict beads, which sat open+in_progress, assigned to a
+# ghost session, indefinitely (ga-ydf9v/ga-z8erc, hand-closed by the Mayor as
+# a one-off). The pure projection (open_verdict_ids_from_json) is unit-tested
+# directly in section 2d above; this section drift-guards the live wiring.
+echo "── ga-g4m18 drift-guards: verdict cascade-close on dead-reviewer supersede ──"
+grep -q 'open_verdict_ids_from_json()'   "$GUARD" && ok "guard defines open_verdict_ids_from_json (pure projection, ga-g4m18)" || bad "guard missing open_verdict_ids_from_json def"
+grep -q 'close_dead_reviewer_verdicts()' "$GUARD" && ok "guard defines close_dead_reviewer_verdicts (I/O wrapper, ga-g4m18)"    || bad "guard missing close_dead_reviewer_verdicts def"
+
+eq "close_dead_reviewer_verdicts has exactly ONE call site in the guard" \
+   "$(grep -c 'close_dead_reviewer_verdicts "\$GR_ID"' "$GUARD")" "1"
+
+# ACCEPTANCE CRITERIA (ga-g4m18): (1) a verdict bead whose run IS superseded
+# via dead-reviewers gets cascade-closed in the same pass; (2) a verdict bead
+# belonging to a run that is NOT dead is never touched by this path. Combined
+# with the single-call-site count above, proving that ONE call site lives
+# inside the supersede:dead-reviewers) arm (bounded by its own ;;) is
+# sufficient to prove BOTH — there is nowhere else in the file left for a
+# second call site to hide, so it structurally cannot also fire from
+# supersede:marker)/abort:age)/skip).
+G4M18_DEAD_ARM=$(sed -n '/supersede:dead-reviewers)/,/;;/p' "$GUARD")
+printf '%s\n' "$G4M18_DEAD_ARM" | grep -q 'close_dead_reviewer_verdicts "\$GR_ID"' \
+  && ok "the single call site lives INSIDE the supersede:dead-reviewers arm (acceptance criteria 1+2)" \
+  || bad "close_dead_reviewer_verdicts is not called inside supersede:dead-reviewers) — ga-g4m18 acceptance criteria not met"
+
+# Mutation-lock (CLAUDE.md rule: a test that only passes proves nothing — run
+# it against the pre-fix shape too). A scratch copy of the guard with the
+# cascade-close call site stripped out must make the SAME detection logic
+# above report "missing" — proving the checks exercise live wiring, not just
+# vacuously grep the file.
+MUT_G4M18="$(mktemp)"
+grep -v 'close_dead_reviewer_verdicts "\$GR_ID"' "$GUARD" > "$MUT_G4M18"
+MUT_G4M18_DEAD_ARM=$(sed -n '/supersede:dead-reviewers)/,/;;/p' "$MUT_G4M18")
+if printf '%s\n' "$MUT_G4M18_DEAD_ARM" | grep -q 'close_dead_reviewer_verdicts "\$GR_ID"'; then
+  bad "mutation-test: stripping the call site did not make the detection logic go red — the check above may be vacuous"
+else
+  ok "mutation-test: stripping the call site correctly flips the detection logic red — the check above is not vacuous"
+fi
+rm -f "$MUT_G4M18"
+# NOTE: close_dead_reviewer_verdicts itself (the I/O wrapper, live-only —
+# calls bd-list-cached.sh + bd close/comment) is intentionally NOT sourced
+# or behaviorally exercised here, matching its siblings reviewers_alive_
+# for_run/verdict_bead_count_for_run immediately above it in the guard:
+# all three are defined past the GATE_GUARD_LIB_ONLY cutoff (line ~1207,
+# "load PURE functions" by design) and so are unavailable to a lib-only
+# source — the file's own established convention tests that category via
+# drift-guard greps only, never a mocked-bd behavioral run. The projection
+# it depends on (open_verdict_ids_from_json) sits BEFORE the cutoff
+# specifically so it CAN get the stronger, behaviorally-exercised test
+# (section 2d above).
+
 grep -q 'date -j -u -f'                      "$GUARD" && ok "guard parses bead timestamps as UTC (-u)"   || bad "guard missing -u (TZ bug regressed)"
 # Dispatcher Step 0a (D_EPOCH) + reviewer janitor (R_EPOCH) must ALL parse UTC.
 # A bare `grep 'date -j -u -f'` would false-pass (R_EPOCH already has it), so we
