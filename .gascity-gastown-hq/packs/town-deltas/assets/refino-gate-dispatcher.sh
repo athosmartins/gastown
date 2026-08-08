@@ -273,6 +273,33 @@ _refino_gate_relabel() {
   bd_ update "$sid" --add-label "$target" --remove-label "story:refino-review" -q 2>/dev/null || true
 }
 
+
+# ── ga-g0af2: a mensagem de bounce, quando NAO ha notas legiveis ──────────────
+# O gate le as notas do VERDICT BEAD, que e efemero (wisp) e e purgado. Se a
+# extracao vinha vazia, o bounce escrevia mesmo assim "Corrija os pontos abaixo
+# e re-marque story:refino-review quando pronto:" seguido de "(sem notas — ver
+# verdict bead <id>)". As duas metades falham juntas: nao ha pontos abaixo para
+# corrigir, e o bead apontado some. O story bead fica em
+# story:refinement-in-progress esperando uma correcao que ninguem consegue ler —
+# e esse estado LE COMO PROGRESSO, entao ninguem investiga.
+# Medido em producao (08/08): 4 beads presos assim (32d, 16d, 7d e um de 01/08),
+# todos citando verdict beads que nao existem em nenhuma store.
+#
+# A regra: "reprovou por X" e "reprovou mas nao sei dizer por que" sao estados
+# DIFERENTES e precisam produzir mensagens diferentes. O segundo nao pode fingir
+# ser o primeiro — e tem que dizer como sair, senao trava igual, so que com um
+# texto mais bonito.
+refino_gate_bounce_comment() {
+  local round="$1" max="$2" notes="$3" vbid="$4"
+  if [ -n "$notes" ]; then
+    printf 'Refino-gate: DEVOLVIDO para refino (round %s/%s). Corrija os pontos abaixo e re-marque story:refino-review quando pronto:\n%s' \
+      "$round" "$max" "$notes"
+    return 0
+  fi
+  printf 'Refino-gate: DEVOLVIDO para refino (round %s/%s) — porem SEM NOTAS LEGIVEIS.\n\nO reviewer reprovou, mas o gate NAO consegui extrair o texto do veredito%s. Nao ha o que corrigir a partir desta mensagem: nao existem "pontos abaixo", e o verdict bead e efemero (pode ja ter sido purgado), entao nao adianta procura-lo.\n\nComo destravar (escolha uma):\n  1. Re-marque story:refino-review para uma passada NOVA de revisao — gera um veredito novo e legivel;\n  2. Se o refino ja estiver bom, promova normalmente; esta rodada nao apontou defeito algum que alguem consiga ler.\n\nNAO deixe o bead parado em story:refinement-in-progress: esse estado le como "refino em andamento" e ninguem vai investiga-lo.' \
+    "$round" "$max" "${vbid:+ (verdict bead $vbid)}"
+}
+
 # If sourced by the selftest, stop here — expose the pure functions only.
 if [ "${REFINO_GATE_LIB:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
@@ -731,8 +758,7 @@ case "$DECISION" in
     if [ -n "$REFINER" ]; then
       bd_ update "$STORY_ID" --assignee "$REFINER" -q 2>/dev/null || true
     fi
-    bd_ comment "$STORY_ID" "Refino-gate: DEVOLVIDO para refino (round $THIS_ROUND/$REFINO_MAX_ROUNDS). Corrija os pontos abaixo e re-marque story:refino-review quando pronto:
-${FAIL_NOTES:-(sem notas — ver verdict bead $VERDICT_BEAD_ID)}" 2>/dev/null || true
+    bd_ comment "$STORY_ID" "$(refino_gate_bounce_comment "$THIS_ROUND" "$REFINO_MAX_ROUNDS" "$FAIL_NOTES" "$VERDICT_BEAD_ID")" 2>/dev/null || true
     [ -n "$REFINER" ] && gc --city "$GC_CITY" nudge "$REFINER" "Refino-gate devolveu $STORY_ID para ajuste (round $THIS_ROUND). Veja as notas no bead." 2>/dev/null || true
     log "  $STORY_ID → bounced to refiner ${REFINER:-<unknown>} (round $THIS_ROUND)."
     ;;

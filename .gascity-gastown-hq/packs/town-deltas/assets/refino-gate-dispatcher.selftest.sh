@@ -427,6 +427,88 @@ done
 [ "$FAILED" != "$HAPPY" ] && ok "fixture AC#3: failed state ('$FAILED') and transitioned state ('$HAPPY') are observably different" \
   || bad "REGRESSION AC#3: failed and transitioned states are indistinguishable ('$FAILED')"
 
+
+# ── ga-g0af2: um bounce SEM notas nao pode mandar "corrija os pontos abaixo" ──
+# O gate lia as notas do verdict bead (efemero). Quando a extracao vinha vazia,
+# ele mesmo assim escrevia "Corrija os pontos abaixo e re-marque
+# story:refino-review quando pronto:" e delegava a "(sem notas — ver verdict bead
+# <id>)". Esse bead some, e o story bead fica preso em
+# story:refinement-in-progress esperando uma correcao que ninguem consegue ler.
+# Medido em producao: 4 beads nesse estado (32d, 16d, 7d e um 4o de 01/08), todos
+# citando verdict beads inexistentes.
+echo "Scenario ga-g0af2: bounce sem notas legiveis"
+
+_MSG_COM=$(refino_gate_bounce_comment 1 3 "faltou criterio de aceite mensuravel" "ga-wisp-abc")
+case "$_MSG_COM" in
+  *"faltou criterio de aceite mensuravel"*) ok "com notas: o texto do veredito e transportado para o story bead" ;;
+  *) bad "com notas: as notas sumiram da mensagem ('$_MSG_COM')" ;;
+esac
+case "$_MSG_COM" in
+  *"orrija os pontos"*) ok "com notas: mantem a instrucao de corrigir (comportamento atual preservado)" ;;
+  *) bad "com notas: perdeu a instrucao de corrigir" ;;
+esac
+
+_MSG_SEM=$(refino_gate_bounce_comment 1 3 "" "ga-wisp-abc")
+# O ponto do bug: sem notas, NAO pode mandar corrigir "os pontos abaixo" — nao ha
+# pontos abaixo, e apontar para o verdict bead e apontar para algo que some.
+case "$_MSG_SEM" in
+  *"orrija os pontos abaixo"*) bad "sem notas: AINDA manda 'corrija os pontos abaixo' — instrucao impossivel de cumprir (o bug)" ;;
+  *) ok "sem notas: nao manda corrigir pontos que nao existem" ;;
+esac
+case "$_MSG_SEM" in
+  *"ver verdict bead"*) bad "sem notas: AINDA delega ao verdict bead efemero (que e purgado — o bug)" ;;
+  *) ok "sem notas: nao delega a um bead efemero" ;;
+esac
+# Terceiro estado explicito: "reprovou mas nao sei dizer por que" tem que ser
+# DIZIVEL, e diferente de "reprovou por X". Sem isso volta a colapsar.
+case "$_MSG_SEM" in
+  *"NAO consegui"*|*"nao consegui"*|*"sem notas legiveis"*|*"SEM NOTAS"*)
+     ok "sem notas: declara explicitamente que o gate nao obteve as notas" ;;
+  *) bad "sem notas: nao declara o terceiro estado ('$_MSG_SEM')" ;;
+esac
+# E precisa dizer o que FAZER, senao o bead trava do mesmo jeito, so que com
+# uma mensagem mais bonita.
+case "$_MSG_SEM" in
+  *"refino:review"*|*"story:refino-review"*|*"nova passada"*|*"re-marque"*)
+     ok "sem notas: da um caminho acionavel (como destravar)" ;;
+  *) bad "sem notas: nao diz o que fazer — o bead trava igual" ;;
+esac
+# As duas mensagens tem que ser DISTINGUIVEIS: e o invariante que o selftest ja
+# defende noutro ponto (failed != transitioned).
+[ "$_MSG_COM" != "$_MSG_SEM" ] && ok "com-notas e sem-notas produzem mensagens observavelmente diferentes" \
+  || bad "REGRESSAO: com-notas e sem-notas produzem a MESMA mensagem"
+
+
+# ── Drift guard ga-g0af2: o bounce REAL tem que passar pela funcao ────────────
+# Os testes acima exercitam refino_gate_bounce_comment isoladamente e ficariam
+# VERDES mesmo que o call site voltasse a montar a mensagem inline — a funcao
+# viraria uma rede de seguranca inerte, presente e nao usada. Este guard le o
+# dispatcher e cobra as duas metades: o call site chama a funcao, E a string
+# antiga (que delegava ao verdict bead efemero) nao voltou.
+echo "Drift guard ga-g0af2: o bounce real usa a funcao"
+
+if grep -q 'refino_gate_bounce_comment "\$THIS_ROUND"' "$DISPATCHER"; then
+  ok "call site do bounce chama refino_gate_bounce_comment"
+else
+  bad "REGRESSAO: o bounce nao chama mais refino_gate_bounce_comment — a funcao virou codigo morto"
+fi
+
+if grep -q 'ver verdict bead \$VERDICT_BEAD_ID' "$DISPATCHER"; then
+  bad "REGRESSAO: a delegacao ao verdict bead efemero voltou ao dispatcher (o bug ga-g0af2)"
+else
+  ok "a delegacao '(sem notas — ver verdict bead ...)' nao existe mais no dispatcher"
+fi
+
+# O caminho de ESCALATE continua com o seu proprio '(sem notas)', e isso e
+# DELIBERADO: escalate promove para needs-approval e vai para a fila do Athos —
+# ele nao trava o bead em refinement-in-progress, que era o dano. Registrado aqui
+# para o proximo leitor nao "consertar" o que nao esta quebrado.
+if grep -q '${FAIL_NOTES:-(sem notas)}' "$DISPATCHER"; then
+  ok "escalate mantem seu proprio fallback (nao trava o bead — fora do escopo do ga-g0af2)"
+else
+  ok "escalate nao usa mais o fallback antigo (mudanca posterior — nao e regressao deste bead)"
+fi
+
 echo ""
 echo "refino-gate-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
