@@ -500,9 +500,12 @@ def _blocking_verdict(bead, blocker_status, in_sweep=frozenset()):
       • blocker status UNRESOLVED    → do not try either. "I could not find out" must
                                        never produce the same action as "I know it is
                                        gone" — and the inert choice here is to not call.
-    A blocker that is ITSELF an orphan in this sweep (`in_sweep`) is not a reason to
-    skip: _order_orphans_by_blockers closes it first, and then this bead is closable in
-    the same sweep. That is the only case where "blocked" resolves itself.
+    `in_sweep` is the set of blockers ALREADY CLOSED SUCCESSFULLY in this sweep — never
+    the set of candidates queued to close. The distinction is the whole point: a queued
+    blocker that then FAILS to close (blocked by something outside the batch, or a plain
+    transient `bd` error) still refuses every dependent, so treating "queued" as "gone"
+    re-creates the WARN-spam this function exists to remove. Only observed success takes
+    a blocker off the path; the caller adds an id here after `_try_close` reports it.
     """
     blockers = _deps(bead, "blocks")
     if not blockers:
@@ -713,9 +716,18 @@ def run_cycle(now):
         for store, b in unresolvable:
             _log("  KEEP %s/%s (step): ciclo de dependência entre órfãos — não forçado"
                  % (os.path.basename(store), b.get("id", "?")))
-        in_sweep_steps = {b.get("id") for _s, b in ordered if b.get("id")}
+        # ga-0bhon (gate attempt 1): este set guarda quem REALMENTE fechou, e cresce a
+        # cada close bem-sucedido. A primeira versão o preenchia de uma vez com a lista
+        # ORDENADA DE CANDIDATOS, antes de qualquer close acontecer — ou seja, tratava
+        # "está na fila pra fechar" como "já fechou". Se o bloqueador falhasse (bloqueado
+        # por algo FORA do lote, ou um erro transitório do `bd`), todo bead que dependia
+        # dele era tentado assim mesmo, batia na recusa real e logava
+        # "WARN: failed to close … retry next sweep" — exatamente a classe de 798
+        # ocorrências que este PR existe pra eliminar, reintroduzida pelo próprio PR.
+        # Só o SUCESSO observado remove um bloqueador do caminho.
+        closed_ok_ids = set()
         for store, b in ordered:
-            ok_to_try, blocked_why = _blocking_verdict(b, blocker_status, in_sweep_steps)
+            ok_to_try, blocked_why = _blocking_verdict(b, blocker_status, closed_ok_ids)
             if not ok_to_try:
                 _log("  KEEP %s/%s (step): %s" % (os.path.basename(store), b.get("id", "?"), blocked_why))
                 continue
@@ -728,9 +740,15 @@ def run_cycle(now):
                 "primeiro), sem --force: o guard que recusa fechar step bloqueado está certo "
                 "e é preservado."
             )
+            before = closed
             closed, hit_cap = _try_close(store, b.get("id", "?"), "molecule-pai CLOSED", reason, closed)
             if hit_cap:
                 return closed
+            # `_try_close` só incrementa em SUCESSO — é o único sinal honesto de que este
+            # bloqueador saiu do caminho dos próximos. Falha (bloqueio real ou `bd`
+            # engasgando) deixa o id de fora, e quem depende dele é pulado com razão.
+            if closed > before and b.get("id"):
+                closed_ok_ids.add(b.get("id"))
 
 
     for store, beads in store_beads.items():
@@ -1248,9 +1266,9 @@ print(json.dumps(found))
     okt, _w = _blocking_verdict(mk("b4", "fix bug ga-y"), {})
     _ok("BD: bead sem bloqueador segue closable") if okt else _bad("BD: bloqueou bead sem aresta")
 
-    print("Scenario BE: bloqueador é ele mesmo órfão DESTE sweep → não é motivo pra pular; "
-          "_order_orphans_by_blockers fecha o bloqueador antes e o bead fica closable no mesmo sweep")
-    okt, _w = _blocking_verdict(mkblocked("b5", "b6"), {"b6": "open"}, in_sweep={"b6"})
+    print("Scenario BE: bloqueador JÁ FECHADO COM SUCESSO neste sweep → não trava o dependente "
+          "(o set é de closes CONFIRMADOS, nunca de candidatos enfileirados — ver BH)")
+    okt, _w = _blocking_verdict(mkblocked("b5", "b6"), {"b6": "open"}, in_sweep={"b6"})  # b6 JA FECHOU neste sweep
     _ok("BE: bloqueador órfão do sweep não trava o bead") if okt else _bad("BE: pulou um bead que o sweep ia destravar", _w)
 
     print("Scenario BF: run_cycle END-TO-END — o stub bloqueado por bead VIVO não gera mais "
@@ -1277,6 +1295,42 @@ print(json.dumps(found))
     run_cycle(NOW)
     _ok("BG: segue limpando o órfão não-bloqueado") if closed_idsBG == ["bs2"] else \
         _bad("BG: parou de limpar", "closed=%s" % closed_idsBG)
+    _target_status_fn = None
+
+    print("Scenario BH: o bloqueador do lote FALHA ao fechar → quem depende dele NÃO é tentado. "
+          "(gate attempt 1: `in_sweep` vinha da lista de CANDIDATOS, montada antes de qualquer "
+          "close — 'está na fila' era lido como 'já fechou', e a falha do primeiro reproduzia o "
+          "WARN-spam que este PR existe pra eliminar)")
+    dw2 = mkstep("sf1", "mol9")                 # bloqueador: vai FALHAR ao fechar
+    dr2 = mkstep("sf2", "mol9", blocks=("sf1",))  # depende dele
+    tried = []
+    def _close_fail_first(store, bid, reason):
+        tried.append(bid)
+        return bid != "sf1"                      # sf1 falha (bd recusa/engasga), sf2 "fecharia"
+    _rigs_fn = lambda: ["HQ"]
+    _bd_list_open_fn = lambda store: [dr2, dw2]
+    _sessions_fn = lambda: set()
+    _bd_close_fn = _close_fail_first
+    _do_notify_fn = lambda m, p: None
+    _target_status_fn = lambda targets_by_store: {"mol9": "closed", "sf1": "open"}
+    run_cycle(NOW)
+    if tried == ["sf1"]:
+        _ok("BH: tentou só o bloqueador; o dependente foi pulado após a falha")
+    else:
+        _bad("BH: tentou fechar dependente de um bloqueador que NÃO fechou", "tried=%s" % tried)
+    _target_status_fn = None
+
+    print("Scenario BI: e quando o bloqueador FECHA de verdade, o dependente segue sendo fechado "
+          "no MESMO sweep (o conserto do BH não pode virar 'nunca fecha nada encadeado')")
+    dw3 = mkstep("sg1", "mol10")
+    dr3 = mkstep("sg2", "mol10", blocks=("sg1",))
+    tried2 = []
+    _bd_list_open_fn = lambda store: [dr3, dw3]
+    _bd_close_fn = lambda store, bid, reason: (tried2.append(bid) or True)
+    _target_status_fn = lambda targets_by_store: {"mol10": "closed", "sg1": "open"}
+    run_cycle(NOW)
+    _ok("BI: fecha os dois, na ordem (%s)" % tried2) if tried2 == ["sg1", "sg2"] else \
+        _bad("BI: encadeamento quebrou", "tried=%s" % tried2)
     _target_status_fn = None
 
     print("\n[sling-janitor selftest] %d passed, %d failed" % (ok[0], bad[0]))
