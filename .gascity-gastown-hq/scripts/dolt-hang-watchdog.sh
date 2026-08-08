@@ -165,6 +165,33 @@ fi
 # restart proceed, escalating loudly first. Visible and counted, never silent.
 _cpu_now="$(dolt_cpu_pct)"
 _vetoes=$(cat "$CPU_VETO_FILE" 2>/dev/null || echo 0)
+
+# ga-153cq FIX (gate attempt 1 FAIL, reviewer was right): the DRY_RUN gate used to
+# sit 15 lines BELOW this point, guarding only the kill -QUIT. Everything from here
+# to the restart ran unconditionally — so `DOLT_WATCHDOG_DRY_RUN=1` still wrote the
+# real $CPU_VETO_FILE and still fired real notify's, including a P5 saying
+# "restarting Dolt anyway" for a restart the dry run then never performed. That is
+# the exact bug shape this whole change exists to remove (a claim asserted louder
+# than what the code does), reintroduced by me one branch over, in the feature whose
+# doc comment promised "without signalling or restarting anything".
+#
+# ⚠️ And my own verification MASKED it: the dry-run test passed
+# DOLT_WATCHDOG_CPU_VETO_FILE explicitly, so the state write landed in scratch and
+# looked clean. A test that supplies the override cannot discover that the override
+# is REQUIRED. The selftest now asserts the no-override case.
+#
+# So decide first, THEN act — with the dry run intercepting before any write or
+# notify, while still reporting which branch it would have taken.
+if [ "${DOLT_WATCHDOG_DRY_RUN:-0}" = "1" ]; then
+  if [ -n "$_cpu_now" ] && [ "$_cpu_now" -ge "$CPU_ALIVE_PCT" ] && [ "$_vetoes" -lt "$CPU_VETO_MAX" ]; then
+    log "DRY-RUN: would VETO the restart — Dolt at ${_cpu_now}% CPU (>=${CPU_ALIVE_PCT}%), veto would become $(( _vetoes + 1 ))/${CPU_VETO_MAX}. No counter written, no notify sent."
+  else
+    _pid_dr="$(pgrep -f 'dolt sql-server' 2>/dev/null | head -1 || true)"
+    log "DRY-RUN: would kill -QUIT pid=${_pid_dr:-<none>} and run 'gc dolt restart' (strikes=${n}, cpu=${_cpu_now:-?}%, vetoes=${_vetoes}/${CPU_VETO_MAX}). Nothing signalled; strikes and veto counter left intact."
+  fi
+  exit 0
+fi
+
 if [ -n "$_cpu_now" ] && [ "$_cpu_now" -ge "$CPU_ALIVE_PCT" ] && [ "$_vetoes" -lt "$CPU_VETO_MAX" ]; then
   _vetoes=$(( _vetoes + 1 ))
   echo "$_vetoes" > "$CPU_VETO_FILE"
@@ -183,17 +210,13 @@ rm -f "$CPU_VETO_FILE" 2>/dev/null || true
 log "CONFIRMED Dolt hang (${n} consecutive strikes, cpu=${_cpu_now:-?}%) — capturing goroutine dump + restarting."
 PID="$(pgrep -f 'dolt sql-server' 2>/dev/null | head -1 || true)"
 
-# ga-153cq: DOLT_WATCHDOG_DRY_RUN=1 walks the whole decision path and reports what
-# it WOULD do, without signalling or restarting anything. Added because there was
-# previously no way to exercise this branch at all: the only way to see it run was
-# for it to actually SIGQUIT the city's data plane, so in practice it was never
-# tested, only observed after the fact — 87 times. An unrunnable safety path is an
-# unverified one. Note this exits BEFORE the restart, so a dry run never clears
-# $STRIKES either: the real episode is left exactly as it was found.
-if [ "${DOLT_WATCHDOG_DRY_RUN:-0}" = "1" ]; then
-  log "DRY-RUN: would kill -QUIT pid=${PID:-<none>} and run 'gc dolt restart' (strikes=${n}, cpu=${_cpu_now:-?}%). Nothing was signalled; strikes left intact."
-  exit 0
-fi
+# ga-153cq: the DRY_RUN interception lives ABOVE the veto section now (see the note
+# there). It must stay there: any dry-run gate placed at this point is already past
+# the veto counter write and both notify calls, which is exactly what failed review.
+# DOLT_WATCHDOG_DRY_RUN=1 exists because the only other way to exercise this branch
+# was to actually SIGQUIT the city's data plane — so in practice it was never
+# tested, only observed after the fact, 87 times. An unrunnable safety path is an
+# unverified one.
 
 if [ -n "$PID" ]; then
   kill -QUIT "$PID" 2>/dev/null || true   # dumps goroutines to dolt.log (also exits Dolt; restart below recovers)
