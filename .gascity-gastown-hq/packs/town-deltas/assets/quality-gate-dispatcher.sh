@@ -3295,7 +3295,21 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH_SHA" ];
       # Diagnostic value-add: surface which OTHER bead(s) the content actually
       # looks like, so a human doesn't have to re-derive it by hand (the
       # original incident cost the Mayor a manual git-archaeology session).
-      GATE_Y9A1D_SUSPECTS=$(printf '%s' "$GATE_Y9A1D_MSGS" | grep -oE '\b(ga|wa|dc|lexbh|marketing)-[a-z0-9]{4,7}\b' | sort -u | tr '\n' ' ')
+      # ga-y9a1d (gate review fix-attempt-1 FAIL, caught live): `grep -oE`
+      # exits 1 on no-match — a REAL case here, not contrived (generic/docs/
+      # squash commits, or a bead-prefix family outside these 5, all produce
+      # zero matches). Under this file's `set -euo pipefail` (line 6), that
+      # propagates through the 3-stage pipe as a bare `VAR=$(...)` failure and
+      # aborts the WHOLE dispatcher — before OVERALL_VERDICT/FAIL_REASONS, both
+      # gate:needs-human label adds, the bd comment, and both mail sends below
+      # ever run. Every sibling assignment in this block already guards with
+      # `|| echo ""` (see GATE_Y9A1D_BASE/COUNT/MSGS above); this one didn't.
+      # A silent crash here is the exact opposite of this block's own stated
+      # purpose two paragraphs up ("never silently merges" / "must never
+      # itself become a new false-FAIL source") — it defeats the FAIL path
+      # for precisely the sub-case (no other recognizable bead ID present)
+      # most likely to occur. Guarded now, matching its siblings.
+      GATE_Y9A1D_SUSPECTS=$(printf '%s' "$GATE_Y9A1D_MSGS" | grep -oE '\b(ga|wa|dc|lexbh|marketing)-[a-z0-9]{4,7}\b' | sort -u | tr '\n' ' ' || echo "")
       OVERALL_VERDICT="FAIL"
       FAIL_REASONS="Branch $BRANCH's own commits (${GATE_Y9A1D_COUNT} unique vs $DEFAULT_BRANCH) do not reference source bead $BEAD_ID anywhere (ga-y9a1d: branch-content-coherence). This is the exact signature of a branch ref silently reused by unrelated work — nothing else failed, the branch name is intact, but the content is not this bead's. Not merging $BRANCH.${GATE_Y9A1D_SUSPECTS:+ Content instead references: $GATE_Y9A1D_SUSPECTS.} A human must verify: is this bead's real fix still on some other ref (check \`git log --all -S '<known marker text>'\`), or does $BEAD_ID need a fresh submission?"
       bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-human"                        -q 2>/dev/null || true

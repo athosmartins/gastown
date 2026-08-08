@@ -233,6 +233,60 @@ has "$DISPATCHER" 'rev-list --count "\$\{CUR_MAIN\}\.\.\$\{NEW_TIP_MR\}"' \
 echo "── 7. syntax ──"
 if bash -n "$DISPATCHER"; then ok "dispatcher passes bash -n"; else bad "dispatcher bash -n FAILED"; fi
 
+# ── 8. regression: ga-y9a1d fix-attempt-1 FAIL — GATE_Y9A1D_SUSPECTS crashed
+#      the WHOLE dispatcher under set -e when grep found zero matches (a real
+#      case: mismatched commits with no OTHER recognizable ga/wa/dc/lexbh/
+#      marketing-prefixed bead id anywhere — generic/docs/squash commits, or a
+#      bead-prefix family outside those 5, both produce this). Caught live by
+#      the gate's own reviewer against real branch content, NOT by this
+#      selftest — sections 1-7 above never actually EXECUTE this line under
+#      set -e, so a missing `|| echo ""` guard was structurally invisible to
+#      the whole suite (same class as [[sibling-function-guard-not-inherited]]
+#      one level down: not a sibling FUNCTION missing a guard, but a sibling
+#      COMMAND in the same block). Test the REAL failure mechanism directly —
+#      not the pure function (which never touches grep) — with `set -e`
+#      actually enabled, matching the live dispatcher's own top-of-file
+#      setting (line 6), and a fixture with a genuine zero-match shape.
+# Extract and EXECUTE the LIVE dispatcher's actual assignment line — not a
+# hand-copied duplicate. A duplicate would always carry whatever guard *I*
+# remembered to write, and could never fail against a future regression that
+# drops it again (caught myself doing exactly this on the first draft of this
+# section: the hand-copied version passed even with the fix stashed out —
+# see [[test-that-supplies-the-override-cannot-find-it-is-required]]).
+#
+# Run it as a genuinely SEPARATE bash process (a temp script file), not a
+# same-process `( subshell )`. Verified empirically: a `( set -euo pipefail;
+# X=$(failing-pipe); ... )` subshell run inline in this harness's own process
+# does NOT reproduce the crash, while `bash <scriptfile>` and `bash -c '...'`
+# both do (same discrepancy independent of eval/quoting — confirmed with a
+# minimal repro before writing this). This isn't just a workaround: the real
+# dispatcher.sh is ALWAYS invoked as its own top-level `#!/usr/bin/env bash`
+# process (launchd/direct exec), never as a subshell inside another script —
+# so the separate-process form is also the more faithful reproduction.
+echo "── 8. regression: GATE_Y9A1D_SUSPECTS must not crash under set -e on zero matches ──"
+SUSPECTS_LINE=$(grep -E '^[[:space:]]*GATE_Y9A1D_SUSPECTS=' "$DISPATCHER" | head -1)
+if [ -z "$SUSPECTS_LINE" ]; then
+  bad "could not locate the live GATE_Y9A1D_SUSPECTS assignment in $DISPATCHER"
+else
+  PROBE_SCRIPT="$(mktemp "${TMPDIR:-/tmp}/gate-y9a1d-probe.XXXXXX")"
+  {
+    echo 'set -euo pipefail'
+    # NOT "fix(ga-y9a1d): ..." — that would match the pattern on its OWN
+    # bead id (the grep doesn't exclude the current bead) and silently stop
+    # being a zero-match fixture. Genuinely no ga/wa/dc/lexbh/marketing-
+    # <4-7chars> substring anywhere in this text (verified separately).
+    echo 'GATE_Y9A1D_MSGS="chore: tighten validation regex, address earlier review feedback"'
+    printf '%s\n' "$SUSPECTS_LINE"
+    echo 'exit 0'
+  } > "$PROBE_SCRIPT"
+  if bash "$PROBE_SCRIPT" >/dev/null 2>&1; then
+    ok "the LIVE dispatcher's actual GATE_Y9A1D_SUSPECTS line survives a zero-match fixture under set -euo pipefail (separate-process)"
+  else
+    bad "the LIVE dispatcher's actual GATE_Y9A1D_SUSPECTS line CRASHES under set -euo pipefail on zero matches — this is the fix-attempt-1 FAIL regression (missing || echo \"\" guard)"
+  fi
+  rm -f "$PROBE_SCRIPT"
+fi
+
 echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"
