@@ -23,7 +23,9 @@ worse than the status quo.
 
 ROUTING SIGNALS (explicit LABELS only — keywords NEVER trigger routing):
   • needs-device: label story:needs-device ONLY.
-  • needs-human: label gate:needs-human* (prefix) or story:needs-human ONLY.
+  • needs-human: label gate:needs-human* (prefix), story:needs-human, or bare
+    needs-human ONLY (ga-m0ksy: bare added — ~half the city's actual usage
+    of this signal, not an edge case; see _classify()'s own comment).
   • blocked: label blocked/story:blocked ONLY.
   • post-build: label gate:passed → remove story:approved only (delivery owns it).
   Keywords (warming, aquecimento, celular, etc.) trigger a LOW-PRIORITY FLAG only
@@ -451,9 +453,22 @@ def _classify(bead):
     if park_labels.NEEDS_DEVICE_LABEL in labels:
         return "needs-device", "label %s" % park_labels.NEEDS_DEVICE_LABEL
 
-    # 3. needs-human: gate:needs-human* (prefix) OR story:needs-human LABEL ONLY.
+    # 3. needs-human: gate:needs-human* (prefix), story:needs-human, or the
+    # BARE "needs-human" LABEL — ga-m0ksy: bare was missing here despite
+    # being an established, near-equally-common spelling (measured across
+    # 3 stores: 10 gate:needs-human, 9 bare needs-human, 6/5 gate:needs-
+    # human:technical/:refused, 4 story:needs-human — bare is roughly half
+    # the city's actual usage of this signal, not an outlier). A bead
+    # correctly parked on human decision with the bare spelling (e.g.
+    # wa-41fry, a P0 waiting on an owner-key-exposure decision) was
+    # therefore treated as unrouted-and-starving and alarmed every cycle
+    # indefinitely. Fixing the reader's incomplete label set, not the 9
+    # writers using an already-legitimate spelling (see park_labels.py's
+    # NEEDS_HUMAN_BARE_LABEL docstring for why that's the right direction).
     if park_labels.NEEDS_HUMAN_LABEL in labels:
         return "needs-human", "label %s" % park_labels.NEEDS_HUMAN_LABEL
+    if park_labels.NEEDS_HUMAN_BARE_LABEL in labels:
+        return "needs-human", "label %s" % park_labels.NEEDS_HUMAN_BARE_LABEL
     for lab in labels:
         if lab.startswith(park_labels.GATE_NEEDS_HUMAN_PREFIX):
             return "needs-human", "label %s" % lab
@@ -2555,6 +2570,63 @@ def _selftest():
         _ok("(c): gate:needs-human:product → routed to story:needs-human")
     else:
         _bad("(c)", "removes=%s adds=%s" % (label_removes, label_adds))
+
+    # ── (c2) ga-m0ksy: BARE needs-human label → routed (THE FIX) ────────────
+    # wa-41fry's actual shape (P0, owner-key-exposure, correctly parked awaiting
+    # Athos's decision) — was alarmed every cycle indefinitely before this fix
+    # because bare "needs-human" matched neither of the two forms _classify()
+    # previously checked.
+    print("\nScenario (c2): bare 'needs-human' label → needs-human route (ga-m0ksy fix)")
+    _bd_approved = lambda root: [
+        _make_bead("wa-41fry", labels=["story:approved", "needs-human"])]
+    st = _reset()
+    run_cycle(NOW, st)
+    if ("wa-41fry", "story:approved") in label_removes and \
+       ("wa-41fry", "story:needs-human") in label_adds:
+        _ok("(c2): bare needs-human → routed to story:needs-human (ga-m0ksy)")
+    else:
+        _bad("(c2): ga-m0ksy REGRESSION — bare needs-human NOT routed, would alarm forever "
+             "on a bead correctly parked awaiting human decision",
+             "removes=%s adds=%s" % (label_removes, label_adds))
+
+    # ── (c3) ga-m0ksy: story:needs-human label (exact INPUT form) → routed ──
+    # Pre-existing path, unmodified by this fix — asserted here per the bead's
+    # own acceptance criteria ("teste cobre as 3 grafias") so all three
+    # spellings have an explicit, individually-checkable regression case in
+    # one place, not just the prefix form (c) already covered.
+    print("\nScenario (c3): story:needs-human label (exact) → needs-human route")
+    _bd_approved = lambda root: [
+        _make_bead("wa-6xn82", labels=["story:approved", "story:needs-human"])]
+    st = _reset()
+    run_cycle(NOW, st)
+    if ("wa-6xn82", "story:approved") in label_removes and \
+       ("wa-6xn82", "story:needs-human") in label_adds:
+        _ok("(c3): story:needs-human (exact) → routed to story:needs-human")
+    else:
+        _bad("(c3)", "removes=%s adds=%s" % (label_removes, label_adds))
+
+    # ── (c4) ga-m0ksy: story:approved with NO park signal at all → STILL alarms ──
+    # The acceptance criterion the fix must NOT break: this is the reconciler's
+    # actual job (§4 case 3, buildable-but-not-flowing → ALARM). Without this
+    # assertion surviving, "recognize bare needs-human" could silently regress
+    # into "stop alarming altogether" and nobody would notice until real
+    # dispatch failures went quiet.
+    print("\nScenario (c4): story:approved, zero park signals, starving → STILL alarms "
+          "(ga-m0ksy: the fix must not swallow real dispatch failures)")
+    _bd_approved = lambda root: [_make_bead(
+        "hq-c4", labels=["story:approved"], age_min=0.1)]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_c4 = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_c4["first_seen_approved"]["hq-c4"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_c4)
+    alarmed_c4 = any("hq-c4" in subj for subj, _ in mail_calls)
+    if alarmed_c4:
+        _ok("(c4): no park signal + starving → still alarms (ga-m0ksy did not over-suppress)")
+    else:
+        _bad("(c4): ga-m0ksy REGRESSION — genuinely starving bead with NO park signal "
+             "failed to alarm; the bare-needs-human fix over-reached",
+             "mail_calls=%s" % mail_calls)
 
     # ── (d) story:blocked label → routed ─────────────────────────────────────
     # Keywords alone no longer route; test label-based blocked routing instead.

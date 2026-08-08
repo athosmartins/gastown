@@ -51,6 +51,17 @@ GATE_PASSED_LABEL = "gate:passed"
 NEEDS_DEVICE_LABEL = "story:needs-device"
 NEEDS_HUMAN_LABEL = "story:needs-human"
 GATE_NEEDS_HUMAN_PREFIX = "gate:needs-human"
+# ga-m0ksy: the BARE spelling, named individually (not folded into the
+# NEEDS_HUMAN_LABELS grouped set's consumption below) so a consumer that
+# wants exactly {bare, gate:needs-human*, story:needs-human} — and NOT the
+# grouped set's 4th member "needs-label-review", a distinct signal this bead
+# never measured or asked about — can reference it without silently
+# adopting label semantics beyond what was verified. Already present in
+# NEEDS_HUMAN_LABELS below (has been since ga-hzt8s) — that set's other
+# consumers (imparavel-check.py, throughput-stall-watchdog.py) already
+# recognize it; approved-state-reconciler.py's _classify() is the one
+# consumer with its own bespoke routing table that had fallen out of sync.
+NEEDS_HUMAN_BARE_LABEL = "needs-human"
 BLOCKED_LABELS = ("blocked", "story:blocked")
 GATE_NEEDS_FIX_LABEL = "gate:needs-fix"
 GATE_FAILED_LABEL = "gate:failed"
