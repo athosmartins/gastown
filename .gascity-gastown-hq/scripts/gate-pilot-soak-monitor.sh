@@ -130,13 +130,32 @@ else
   MINS_SINCE_MERGE=-1   # unknown
 fi
 
-MARKER_OUT=$( (cd "$CITY" && GC_CITY="$CITY" timeout 25 gc bd list --all \
-  -l type:quality-gate-marker -l gate-status:queued 2>/dev/null) || true )
-READY_MARKERS=$(printf '%s\n' "$MARKER_OUT" | grep -cE '^[○●◐] ' || true)
-READY_MARKERS=$(printf '%s' "$READY_MARKERS" | tr -dc '0-9'); READY_MARKERS=${READY_MARKERS:-0}
+# ga-sdkrl gate-feedback: the old `|| true` on the subshell masked the query's OWN
+# exit code, so a timeout/failure (25s exceeded, Dolt unreachable, etc.) and a
+# genuine "queried fine, zero queued markers" result both sanitized down to
+# READY_MARKERS=0 — indistinguishable, and STALL_VIOLATION only fires when
+# READY_MARKERS -gt 0, so a query failure could NEVER trigger the one check this
+# script exists to make. The failure mode most likely to cause this exact timeout
+# — Dolt under CPU load — is the SAME condition that would also be causing a real
+# stall, so silently reading "0 ready markers" here is optimistic in exactly the
+# case it should be most suspicious. Capture the query's real exit code BEFORE any
+# masking; on failure, treat it as equivalent to "markers may be waiting" for the
+# stall check (never silently equivalent to "confirmed clean").
+MARKER_OUT=$(cd "$CITY" && GC_CITY="$CITY" timeout 25 gc bd list --all \
+  -l type:quality-gate-marker -l gate-status:queued 2>/dev/null)
+MARKER_QUERY_RC=$?
+MARKER_QUERY_FAILED=0
+if [ "$MARKER_QUERY_RC" -ne 0 ]; then
+  MARKER_QUERY_FAILED=1
+  READY_MARKERS=0
+  log "WARN: ready-marker query failed/timed out (rc=$MARKER_QUERY_RC) — cannot confirm zero, treating as unverified for the stall check."
+else
+  READY_MARKERS=$(printf '%s\n' "$MARKER_OUT" | grep -cE '^[○●◐] ' || true)
+  READY_MARKERS=$(printf '%s' "$READY_MARKERS" | tr -dc '0-9'); READY_MARKERS=${READY_MARKERS:-0}
+fi
 
 STALL_VIOLATION=0
-if [ "$READY_MARKERS" -gt 0 ] && [ "$MINS_SINCE_MERGE" -gt "$STALL_MAX_MIN" ]; then
+if { [ "$READY_MARKERS" -gt 0 ] || [ "$MARKER_QUERY_FAILED" -eq 1 ]; } && [ "$MINS_SINCE_MERGE" -gt "$STALL_MAX_MIN" ]; then
   STALL_VIOLATION=1
 fi
 
@@ -183,9 +202,12 @@ CPU_SUM=$(fadd "$(get_state cpu_sum 0)" "$DOLT_CPU")
 CPU_PEAK=$(fmax "$(get_state cpu_peak 0)" "$DOLT_CPU")
 CPU_AVG=$(favg "$CPU_SUM" "$SAMPLES")
 
-# max stall observed (only meaningful when there was queued work)
+# max stall observed (only meaningful when there was queued work) — same
+# query-failure blind spot as STALL_VIOLATION above, same fix: an unverified
+# ready-marker count must not silently behave like a confirmed-zero one here
+# either, or a stall during a marker-query outage would be under-reported.
 MAXSTALL=$(get_state max_stall_min 0)
-if [ "$READY_MARKERS" -gt 0 ] && [ "$MINS_SINCE_MERGE" -gt "$MAXSTALL" ]; then
+if { [ "$READY_MARKERS" -gt 0 ] || [ "$MARKER_QUERY_FAILED" -eq 1 ]; } && [ "$MINS_SINCE_MERGE" -gt "$MAXSTALL" ]; then
   MAXSTALL="$MINS_SINCE_MERGE"
 fi
 
@@ -207,11 +229,14 @@ set_state latch_stall "$L_STALL"
 set_state latch_manual "$L_MANUAL"
 set_state latch_falsekill "$L_FALSEKILL"
 
-# per-sample metrics line (machine-readable)
+# per-sample metrics line (machine-readable). marker_query_failed: ga-sdkrl
+# gate-feedback — visible+counted, not silently folded into ready_markers=0,
+# so a human reading this trail can tell "confirmed zero" from "unverified".
 SAMPLE="t=$(ts) elapsed_min=$ELAPSED_MIN ready_markers=$READY_MARKERS mins_since_merge=$MINS_SINCE_MERGE \
 new_merges=$NEW_MERGES stall_viol=$STALL_VIOLATION dolt_cpu=$DOLT_CPU cpu_avg=$CPU_AVG cpu_peak=$CPU_PEAK \
 new_reviewer_reaps=$NEW_REVIEWER_REAPS new_falsekill=$NEW_FALSEKILL manual_viol=$MANUAL_VIOLATION \
-new_crew_events=$NEW_CREW_EVENTS max_stall_min=$MAXSTALL hard_violations=$HARD_VIOLATIONS"
+new_crew_events=$NEW_CREW_EVENTS max_stall_min=$MAXSTALL hard_violations=$HARD_VIOLATIONS \
+marker_query_failed=$MARKER_QUERY_FAILED"
 echo "$SAMPLE" >> "$METRICS" 2>/dev/null
 log "sample: $SAMPLE"
 

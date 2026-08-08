@@ -80,7 +80,21 @@ else
 fi
 
 # 2. Restore to main — the exact recipe the Mayor uses by hand. Conservative, no force.
+# ga-sdkrl gate-feedback: `git stash push -- <clean-path>` is a NO-OP — creates NO
+# stash entry, just prints "No local changes to save" — whenever daemons/ has no
+# local changes (the common case). The old code then did an UNCONDITIONAL `stash
+# drop` below regardless, which always drops whatever sits at the TOP of the stash
+# stack. ROOT is a shared production root crews/Mayor operate in directly — if any
+# unrelated stash (a human's `git stash`, another process's) already sat at
+# stash@{0} when this guard fired and daemons/ happened to be clean, that unrelated
+# work was silently destroyed. Reproduced end-to-end in a throwaway repo before
+# fixing: pre-existing stash -> scoped push on a clean path (no-op, stash list
+# unchanged) -> unconditional drop -> pre-existing stash gone. Fix: capture the
+# stash ref before/after and only drop if it actually changed — i.e. only if THIS
+# push genuinely created a new entry, never someone else's.
+STASH_BEFORE="$(g rev-parse -q --verify refs/stash 2>/dev/null || echo '')"
 g stash push -- daemons/ >/dev/null 2>&1 || true   # redundant staged daemon syncs, if any
+STASH_AFTER="$(g rev-parse -q --verify refs/stash 2>/dev/null || echo '')"
 
 if ! g switch main >/dev/null 2>&1; then
   log "WARN: 'git switch main' FAILED (dirty/conflict?) — NOT forcing. Left on '$BRANCH'. Backup tag=$BACKUP_TAG. NEEDS HUMAN."
@@ -96,7 +110,13 @@ if ! g merge --ff-only origin/main >/dev/null 2>&1; then
   # We are on main now (the dangerous off-main state is resolved), so do not exit nonzero.
 fi
 
-g stash drop >/dev/null 2>&1 || true
+# Only drop if OUR push above genuinely created a new stash entry (ref changed).
+# If it was a no-op (daemons/ was clean), STASH_AFTER == STASH_BEFORE (both empty,
+# or both pointing at whatever unrelated stash already existed) — never drop in
+# that case, so an unrelated pre-existing stash is never touched.
+if [ -n "$STASH_AFTER" ] && [ "$STASH_AFTER" != "$STASH_BEFORE" ]; then
+  g stash drop >/dev/null 2>&1 || true
+fi
 
 NOW="$(g branch --show-current 2>/dev/null || echo '?')"
 if [ "$NOW" = "main" ]; then

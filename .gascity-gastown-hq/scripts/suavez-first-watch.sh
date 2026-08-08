@@ -11,11 +11,28 @@ LABEL="com.gascity.suavez-first-watch"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # current open needs-approval bead ids (cross-store)
-cur=$(bd -C "$CITY" list --all --json 2>/dev/null \
-  | jq -r '.[] | select((.labels//[])|any(.=="story:needs-approval")) | select(.status=="open") | .id' 2>/dev/null | sort -u)
+cur_raw=$(bd -C "$CITY" list --all --json 2>/dev/null)
+BD_RC=$?
+cur=$(printf '%s' "$cur_raw" | jq -r '.[] | select((.labels//[])|any(.=="story:needs-approval")) | select(.status=="open") | .id' 2>/dev/null | sort -u)
 
-# baseline must exist (created at setup); if missing, seed it and wait (don't fire on existing)
-if [ ! -f "$BASELINE" ]; then printf '%s\n' "$cur" > "$BASELINE"; echo "[$(ts)] seeded baseline" >> "$LOG"; exit 0; fi
+# ga-sdkrl gate-feedback: baseline must exist (created at setup); if missing, seed it
+# and wait (don't fire on existing) — but ONLY from a query that actually succeeded.
+# The whole point of the baseline is to exclude the pre-existing ga-fhhsh test-seed
+# bead from ever triggering the "first real arrival" notification; if the seeding
+# run coincided with a query failure, `cur` would be empty/wrong and get written
+# verbatim as an incomplete baseline. The NEXT successful poll would then read the
+# still-open ga-fhhsh seed as "new" (not in that bad baseline), fire an incorrect
+# notification pointing at the test seed instead of a real arrival, and self-unload
+# (launchctl bootout below) — permanently disabling itself before the genuine first
+# arrival could ever be notified. On failure, skip this cycle without writing
+# anything; the next scheduled run (every 3min) tries again.
+if [ ! -f "$BASELINE" ]; then
+  if [ "$BD_RC" -ne 0 ]; then
+    echo "[$(ts)] WARN: bd list failed (rc=$BD_RC) during baseline seed — NOT writing baseline, will retry next cycle" >> "$LOG"
+    exit 0
+  fi
+  printf '%s\n' "$cur" > "$BASELINE"; echo "[$(ts)] seeded baseline" >> "$LOG"; exit 0
+fi
 base=$(cat "$BASELINE" 2>/dev/null)
 
 # first id in cur that is NOT in baseline = first real arrival
