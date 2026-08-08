@@ -279,6 +279,159 @@ bd() {
 RESULT=$(gate_spawn_failure_requeue_or_error "ga-wisp-mute" "invalid connection")
 eq "(e) function is mute — captured token is exactly 'ready', no log/warn/err leakage" "$RESULT" "ready"
 
+# ── 3b. gate_status_transition — mutual exclusion (ga-ia7m7) ─────────────────
+echo "── 3b. gate_status_transition (mock bd, ga-ia7m7) ──"
+
+# (a) marker carries TWO gate-status:* labels — the exact shape Mayor measured
+# live on ga-c4pil (a stale 'queued' left by gate-recovery-watchdog's
+# starvation self-heal, still present hours later when the spawn-failure path
+# writes 'error'). Transition to error must remove BOTH pre-existing
+# gate-status:* labels and add exactly one.
+MOCK_SHOW_JSON='[{"id":"ga-c4pil-like","labels":["type:quality-gate-marker","gate-status:dispatching","gate-status:queued"]}]'
+MOCK_LABEL_ADD_CALLS=""; MOCK_LABEL_REMOVE_CALLS=""
+bd() {
+  case " $* " in
+    *" show "*) printf '%s\n' "$MOCK_SHOW_JSON" ;;
+    *" label add "*)    MOCK_LABEL_ADD_CALLS="$MOCK_LABEL_ADD_CALLS|$*" ;;
+    *" label remove "*) MOCK_LABEL_REMOVE_CALLS="$MOCK_LABEL_REMOVE_CALLS|$*" ;;
+    *) : ;;
+  esac
+  return 0
+}
+gate_status_transition "ga-c4pil-like" "error"
+case "$MOCK_LABEL_REMOVE_CALLS" in
+  *"gate-status:dispatching"*) ok "(a) pre-existing gate-status:dispatching removed" ;;
+  *) bad "(a) expected gate-status:dispatching to be removed, got: $MOCK_LABEL_REMOVE_CALLS" ;;
+esac
+case "$MOCK_LABEL_REMOVE_CALLS" in
+  *"gate-status:queued"*) ok "(a) pre-existing STALE gate-status:queued removed (ga-c4pil incident shape)" ;;
+  *) bad "(a) expected gate-status:queued to be removed, got: $MOCK_LABEL_REMOVE_CALLS" ;;
+esac
+case "$MOCK_LABEL_ADD_CALLS" in
+  *"gate-status:error"*) ok "(a) gate-status:error added" ;;
+  *) bad "(a) expected gate-status:error to be added, got: $MOCK_LABEL_ADD_CALLS" ;;
+esac
+
+# (b) marker's ONLY gate-status:* label already equals the target -> no
+# redundant remove-then-readd churn on the target itself.
+MOCK_SHOW_JSON='[{"id":"ga-already-ready","labels":["gate-status:ready"]}]'
+MOCK_LABEL_ADD_CALLS=""; MOCK_LABEL_REMOVE_CALLS=""
+gate_status_transition "ga-already-ready" "ready"
+case "$MOCK_LABEL_REMOVE_CALLS" in
+  *"gate-status:ready"*) bad "(b) must not remove the label that already matches the target, got: $MOCK_LABEL_REMOVE_CALLS" ;;
+  *) ok "(b) already-correct label left alone, no churn" ;;
+esac
+
+# (c) no gate-status:* label present at all (fresh marker) -> just adds the
+# target, zero remove calls.
+MOCK_SHOW_JSON='[{"id":"ga-fresh","labels":["type:quality-gate-marker"]}]'
+MOCK_LABEL_ADD_CALLS=""; MOCK_LABEL_REMOVE_CALLS=""
+gate_status_transition "ga-fresh" "queued"
+eq "(c) no pre-existing gate-status:* -> zero remove calls" "$MOCK_LABEL_REMOVE_CALLS" ""
+case "$MOCK_LABEL_ADD_CALLS" in
+  *"gate-status:queued"*) ok "(c) target label added on a fresh marker" ;;
+  *) bad "(c) expected gate-status:queued to be added, got: $MOCK_LABEL_ADD_CALLS" ;;
+esac
+
+# (d) repair pass: a gate-status:* label appears BETWEEN the first read and
+# the verify-by-re-read (a concurrent writer racing in, e.g.
+# gate-recovery-watchdog). The stateful mock only reveals the intruder on the
+# SECOND `show` call — proves the repair pass genuinely re-reads rather than
+# trusting its own first snapshot.
+#
+# gate-fix-2 subtlety (same lesson section 3 already applies to
+# _capture_out, and section 4 applies to GC_CALLS): gate_status_transition
+# pipes `bd show ... | jq ...`, and bash runs each pipeline stage — including
+# this mocked bd() — in a SUBSHELL. A plain shell-variable increment inside
+# bd() would be invisible to the rest of THIS shell the instant that subshell
+# exits, so the mock would keep re-serving call #1's response forever. Count
+# via a FILE instead (real I/O survives the subshell), same technique as
+# GC_CALLS in section 4 below.
+MOCK_SHOW_JSON='[{"id":"ga-race","labels":["gate-status:dispatching"]}]'
+MOCK_SHOW_CALL_LOG=$(mktemp)
+MOCK_LABEL_ADD_CALLS=""; MOCK_LABEL_REMOVE_CALLS=""
+bd() {
+  case " $* " in
+    *" show "*)
+      echo x >> "$MOCK_SHOW_CALL_LOG"
+      _n=$(wc -l < "$MOCK_SHOW_CALL_LOG" | tr -d '[:space:]')
+      if [ "$_n" -ge 2 ]; then
+        printf '%s\n' '[{"id":"ga-race","labels":["gate-status:error","gate-status:queued"]}]'
+      else
+        printf '%s\n' "$MOCK_SHOW_JSON"
+      fi
+      ;;
+    *" label add "*)    MOCK_LABEL_ADD_CALLS="$MOCK_LABEL_ADD_CALLS|$*" ;;
+    *" label remove "*) MOCK_LABEL_REMOVE_CALLS="$MOCK_LABEL_REMOVE_CALLS|$*" ;;
+    *) : ;;
+  esac
+  return 0
+}
+gate_status_transition "ga-race" "error"
+rm -f "$MOCK_SHOW_CALL_LOG"
+case "$MOCK_LABEL_REMOVE_CALLS" in
+  *"gate-status:queued"*) ok "(d) repair pass caught + removed a label that appeared AFTER the first read (race window)" ;;
+  *) bad "(d) repair pass missed the raced-in label, got: $MOCK_LABEL_REMOVE_CALLS" ;;
+esac
+
+# (e) STDOUT FIDELITY — a mock that emits the REAL bd binary's confirmation
+# text (verified live against an unmodified dispatcher + a real scratch bead,
+# 2026-08-08: `bd label add/remove -q` prints `✓ Added/Removed label ...` to
+# STDOUT, NOT suppressed by -q, and NOT on stderr — every prior mock in this
+# file is silent on label add/remove, which is exactly why this class of bug
+# shipped undetected). If gate_status_transition's own bd calls ever regress
+# back to `2>/dev/null`-only (stderr), this test must catch the leak.
+MOCK_SHOW_JSON='[{"id":"ga-fidelity","labels":["gate-status:dispatching"]}]'
+bd() {
+  case " $* " in
+    *" show "*) printf '%s\n' "$MOCK_SHOW_JSON" ;;
+    *" label add "*)    printf "%s\n" "✓ Added label 'gate-status:error' to ga-fidelity" ;;
+    *" label remove "*) printf "%s\n" "✓ Removed label 'gate-status:dispatching' from ga-fidelity" ;;
+    *) : ;;
+  esac
+  return 0
+}
+_capture_out gate_status_transition "ga-fidelity" "error"
+eq "(e) gate_status_transition emits NOTHING to stdout even when bd's real confirmation text is present" "$CAPTURED" ""
+
+# (f) FULL end-to-end fidelity through gate_spawn_failure_requeue_or_error —
+# THE actual production bug ga-ia7m7 fixes. Pre-fix, this exact
+# realistic-bd-output scenario produced a captured token like "✓ Removed
+# label...\n✓ Added label...\n✓ Comment added...\nready" — NOT the literal
+# "ready" — so the real caller's `[ "$(...)" = "ready" ]` check ALWAYS fell
+# through to writing gate-status:error right after gate-status:ready had just
+# been written, on every single transient-retry. Confirmed live before this
+# fix, against the unmodified dispatcher + a real scratch bead (not just
+# reasoned about) — captured token was 296 bytes, ended in "ready" but did
+# not equal it; final labels included both gate-status:ready AND a leftover
+# from the fall-through. Fixed by redirecting BOTH streams on every bd/comment
+# call inside this function (not just stderr).
+#
+# Stateful mock (same convention as section 3(a) above): the counter-label
+# add must be reflected in the NEXT show response, or the ga-6dp9
+# verify-by-re-read check (gate_rebase_attempt_advanced) reads back "0"
+# instead of "1", misreads the write as unverified, and this test would
+# incorrectly exercise the "stuck" fallback path instead of the happy path
+# it's meant to prove.
+MOCK_SHOW_JSON='[{"id":"ga-e2e","labels":["gate-status:dispatching"]}]'
+bd() {
+  case " $* " in
+    *" show "*) printf '%s\n' "$MOCK_SHOW_JSON" ;;
+    *" label add "*)
+      printf "%s\n" "✓ Added label 'x' to ga-e2e"
+      case " $* " in
+        *"gate:spawn-fail-count:1"*) MOCK_SHOW_JSON='[{"id":"ga-e2e","labels":["gate:spawn-fail-count:1"]}]' ;;
+      esac
+      ;;
+    *" label remove "*) printf "%s\n" "✓ Removed label 'x' from ga-e2e" ;;
+    *" comment "*)      printf "%s\n" "✓ Comment added to ga-e2e — some text" ;;
+    *) : ;;
+  esac
+  return 0
+}
+RESULT=$(gate_spawn_failure_requeue_or_error "ga-e2e" "invalid connection")
+eq "(f) end-to-end: captured token is EXACTLY 'ready' even with realistic noisy bd output (the actual production bug, ga-ia7m7)" "$RESULT" "ready"
+
 # ── 4. spawn-retry-loop — genuine live extraction, in-process recovery ───────
 echo "── 4. spawn-retry-loop (live extraction, mocked gc + sleep) ──"
 RETRY_BLOCK="$(sed -n '/# SELFTEST-EXTRACT spawn-retry-loop: BEGIN/,/# SELFTEST-EXTRACT spawn-retry-loop: END/p' "$DISPATCHER")"
@@ -477,16 +630,43 @@ grep -q 'gate_spawn_failure_requeue_or_error "\$MARKER_ID" "\$_spawn_err"' "$DIS
   && ok "real call site wires MARKER_ID + _spawn_err into the decision function" \
   || bad "call site wiring not found — did the spawn-abort block get refactored again?"
 
+# ga-ia7m7 drift-guards: atomic gate-status transition helper present and
+# wired into both write sites it replaced (the "ready" write inside
+# gate_spawn_failure_requeue_or_error, and the "error" write in the caller —
+# the latter is also covered end-to-end by ERROR_WRITE_COUNT below).
+has "$DISPATCHER" 'gate_status_transition\(\) \{' "gate_status_transition helper present (ga-ia7m7)"
+has "$DISPATCHER" 'gate_status_transition "\$marker_id" "ready"' "ready-path wired through gate_status_transition, not a raw label add"
+
 # gate-status:error must still be written exactly once in the abort block (the
 # shared fallback for non-transient / cap-exhausted / unverified-write), not
 # duplicated back into an early unconditional write the way it was pre-fix.
+# ga-ia7m7: the raw `label add gate-status:error` this used to grep for is now
+# a `gate_status_transition ... "error"` call (mutual-exclusion fix) — updated
+# to match, same one-write-only intent.
 ERROR_WRITE_COUNT=$(awk '
   /err "Failed to spawn reviewer session \$i/ { infn=1 }
-  infn && /bd -C "\$GC_CITY" label add "\$MARKER_ID" "gate-status:error"/ { c++ }
+  infn && /gate_status_transition "\$MARKER_ID" "error"/ { c++ }
   infn && /^  fi$/ { exit }
   END { print c+0 }
 ' "$DISPATCHER")
 eq "gate-status:error written exactly once in the abort block (no early duplicate)" "$ERROR_WRITE_COUNT" "1"
+
+# ga-ia7m7: the standalone `label remove gate-status:dispatching` that used to
+# sit right after the "Aborting gate" log line, INSIDE THIS SPECIFIC abort
+# block, is gone (folded into gate_status_transition's own full removal) —
+# assert it's actually gone THERE, not just moved, so a future edit can't
+# silently reintroduce the redundant early-remove-then-later-add-only-one
+# window this fix closed. Scoped the same way as ERROR_WRITE_COUNT above
+# (not a bare file-wide grep): this exact literal line legitimately still
+# exists at ~12 OTHER, unrelated call sites elsewhere in this file.
+DISPATCHING_REMOVE_IN_ABORT_BLOCK=$(awk '
+  /err "Failed to spawn reviewer session \$i/ { infn=1 }
+  infn && /label remove "\$MARKER_ID" "gate-status:dispatching"/ { c++ }
+  infn && /^  fi$/ { exit }
+  END { print c+0 }
+' "$DISPATCHER")
+eq "standalone dispatching-removal inside the ga-mzc3h abort block correctly removed (folded into gate_status_transition)" \
+  "$DISPATCHING_REMOVE_IN_ABORT_BLOCK" "0"
 
 CUTOFF_LN=$(grep -n 'if \[ -n "\${GATE_DISPATCHER_LIB_ONLY:-}" \]; then' "$DISPATCHER" | head -1 | cut -d: -f1)
 for fn in is_transient_spawn_error read_spawn_fail_count gate_spawn_failure_requeue_or_error; do

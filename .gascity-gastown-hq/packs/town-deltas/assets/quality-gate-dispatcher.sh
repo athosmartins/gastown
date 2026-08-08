@@ -2479,6 +2479,76 @@ GATE_SPAWN_RETRY_MAX="${GATE_SPAWN_RETRY_MAX:-3}"                           # in
 GATE_SPAWN_RETRY_BACKOFF_SECS="${GATE_SPAWN_RETRY_BACKOFF_SECS:-3}"         # BASE backoff; doubles per attempt (see spawn-retry-loop)
 GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS="${GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS:-3}" # cross-sweep cap before parking at gate-status:error
 
+# gate_status_transition <marker_id> <new_status> — replace ALL gate-status:*
+# labels on <marker_id> with a single gate-status:<new_status>, instead of
+# the per-callsite pattern this file otherwise uses (`label remove
+# gate-status:<one-specific-value>` + `label add gate-status:<new>`), which
+# only ever strips the ONE status the caller happened to know about.
+#
+# ga-ia7m7 (fatiado de ga-jeicm, Mayor 2026-08-08 00:03 UTC): a marker that
+# picked up an out-of-band gate-status:queued (e.g. gate-recovery-watchdog's
+# starvation self-heal, potentially hours earlier) kept BOTH labels after the
+# spawn-failure path's old `label add gate-status:error` — this city's
+# daemons decide by LABEL, not a single status field (see
+# quality-gate-guard.sh Step 0b: `-l gate-status:queued`), so a marker in two
+# states is read inconsistently by different consumers
+# (root-class:error-vs-empty). Confirmed live 3x in one day (ga-wisp-q543mny,
+# ga-oj9pc, ga-c4pil).
+#
+# Re-reads labels fresh (not any caller-cached copy) immediately before
+# removing, then verifies by re-read after writing and repairs once if
+# another gate-status:* snuck back in during the write — same discipline as
+# gate_marker_status_ensure above (ga-kgtiw), applied to "duplicate label"
+# instead of "missing label". No lock: this file doesn't use one anywhere
+# else either, and the write-time re-read already collapses the original
+# incident's hours-wide staleness window to this function's own short
+# read-then-write gap.
+#
+# MUTE BY CONSTRUCTION, same reason as gate_spawn_failure_requeue_or_error
+# right below (which calls this): zero stdout output of its own — no printf/
+# echo, AND every bd call redirects BOTH streams (`>/dev/null 2>&1`), not
+# just stderr, because the real `bd` binary prints `✓ Added/Removed label...`
+# to stdout even with `-q` (verified live, ga-ia7m7). A future call site
+# inside that function would splice any such output straight into its own
+# captured ready/error token.
+gate_status_transition() {
+  local marker_id="${1:-}" new_status="${2:-}" lbl current
+  [ -z "$marker_id" ] && return 0
+  [ -z "$new_status" ] && return 0
+
+  current=$(bd -C "$GC_CITY" show "$marker_id" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null)
+  while IFS= read -r lbl; do
+    case "$lbl" in
+      gate-status:*)
+        [ "$lbl" = "gate-status:$new_status" ] && continue
+        bd -C "$GC_CITY" label remove "$marker_id" "$lbl" -q >/dev/null 2>&1 || true
+        ;;
+    esac
+  done <<EOF
+$current
+EOF
+
+  bd -C "$GC_CITY" label add "$marker_id" "gate-status:$new_status" -q >/dev/null 2>&1 || true
+
+  # Verify + single repair pass: close the gap between our read above and
+  # our write, in case a concurrent writer (e.g. the recovery watchdog) added
+  # a stray gate-status:* label during it.
+  current=$(bd -C "$GC_CITY" show "$marker_id" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]' 2>/dev/null)
+  while IFS= read -r lbl; do
+    case "$lbl" in
+      gate-status:*)
+        [ "$lbl" = "gate-status:$new_status" ] && continue
+        bd -C "$GC_CITY" label remove "$marker_id" "$lbl" -q >/dev/null 2>&1 || true
+        ;;
+    esac
+  done <<EOF
+$current
+EOF
+  return 0
+}
+
 # gate_spawn_failure_requeue_or_error <marker_id> <spawn_err> — decides AND
 # APPLIES (bd label/comment writes) whether a reviewer-spawn failure on
 # <marker_id> requeues to gate-status:ready (transient, under cap, write
@@ -2495,7 +2565,28 @@ GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS="${GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS:-3}" # cr
 # via $(...) — a log/warn/err call using this script's own helpers (plain
 # `echo`, not `>&2`) would splice straight into the captured token and
 # corrupt the ready/error comparison silently. The caller logs AFTER reading
-# the returned token, same discipline as gate_marker_status_ensure.
+# the returned token, same discipline as gate_marker_status_ensure. Below,
+# gate_status_transition is called instead of a raw `label add
+# gate-status:ready` (ga-ia7m7) — it is itself mute, so this invariant holds.
+#
+# ga-ia7m7 SECOND, MORE FUNDAMENTAL muteness gap found and closed here: this
+# doc comment's own "zero log/warn/err calls" claim missed that the REAL `bd`
+# binary — not the mocked one this file's selftest uses — prints `✓ Added
+# label '<x>' to <id>` / `✓ Removed label ...` / `✓ Comment added ...` TO
+# STDOUT even with `-q`, confirmed by direct invocation (bd's `-q` does not
+# suppress it, and none of this function's bd/comment calls redirected
+# stdout — only `2>/dev/null`, stderr). Verified live against an unmodified
+# dispatcher + a real scratch bead: gate_spawn_failure_requeue_or_error's
+# captured output on the transient/under-cap path was NOT the literal string
+# "ready" but four "✓ ..." lines followed by "ready" — so the caller's
+# `[ "$(...)" = "ready" ]` check was ALWAYS false in production, and EVERY
+# transient-retry fell through to write gate-status:error right after this
+# function had already written gate-status:ready + gate:spawn-fail-count:N —
+# almost certainly the dominant source of the exact dual-gate-status-label
+# defect this bead was filed for (a stale watchdog-added label surviving a
+# write, ga-c4pil's traced scenario, is real but likely the MINORITY case).
+# Every bd/comment call in this function (and in gate_status_transition
+# above) now redirects BOTH streams (`>/dev/null 2>&1`), not just stderr.
 gate_spawn_failure_requeue_or_error() {
   local marker_id="${1:-}" spawn_err="${2:-}"
   local prev next
@@ -2510,25 +2601,25 @@ gate_spawn_failure_requeue_or_error() {
   next=$((prev + 1))
 
   if [ "$next" -ge "$GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS" ]; then
-    bd -C "$GC_CITY" comment "$marker_id" "ga-2u38b: reviewer-spawn transient connection failures persisted for $GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS attempts (last spawn_err=${spawn_err:-none}) — giving up on auto-retry, parking at gate-status:error for human/Mayor triage." 2>/dev/null || true
+    bd -C "$GC_CITY" comment "$marker_id" "ga-2u38b: reviewer-spawn transient connection failures persisted for $GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS attempts (last spawn_err=${spawn_err:-none}) — giving up on auto-retry, parking at gate-status:error for human/Mayor triage." >/dev/null 2>&1 || true
     printf 'error'
     return 0
   fi
 
-  bd -C "$GC_CITY" label remove "$marker_id" "gate:spawn-fail-count:$prev" -q 2>/dev/null || true
-  bd -C "$GC_CITY" label add    "$marker_id" "gate:spawn-fail-count:$next" -q 2>/dev/null || true
+  bd -C "$GC_CITY" label remove "$marker_id" "gate:spawn-fail-count:$prev" -q >/dev/null 2>&1 || true
+  bd -C "$GC_CITY" label add    "$marker_id" "gate:spawn-fail-count:$next" -q >/dev/null 2>&1 || true
 
   # ga-6dp9 pattern: the label add above is fire-and-forget — verify it
   # actually stuck instead of trusting it, so a silently-lost write can't
   # replay "attempt 1/N" forever.
   if [ "$(gate_rebase_attempt_advanced "$next" "$(read_spawn_fail_count "$marker_id")")" = "stuck" ]; then
-    bd -C "$GC_CITY" comment "$marker_id" "ga-2u38b: reviewer-spawn hit a transient connection error (spawn_err=${spawn_err:-none}) but the gate:spawn-fail-count label write did not verifiably land — escalating to gate-status:error now rather than risk an infinite attempt-1 retry loop." 2>/dev/null || true
+    bd -C "$GC_CITY" comment "$marker_id" "ga-2u38b: reviewer-spawn hit a transient connection error (spawn_err=${spawn_err:-none}) but the gate:spawn-fail-count label write did not verifiably land — escalating to gate-status:error now rather than risk an infinite attempt-1 retry loop." >/dev/null 2>&1 || true
     printf 'error'
     return 0
   fi
 
-  bd -C "$GC_CITY" label add "$marker_id" "gate-status:ready" -q 2>/dev/null || true
-  bd -C "$GC_CITY" comment "$marker_id" "ga-2u38b: reviewer-spawn hit a transient connection error (spawn_err=${spawn_err:-none}) — attempt $next/$GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS. Requeued to gate-status:ready for automatic re-admission next sweep; no human action needed. Work already done this run (rebase/push/stale-base-check/sizing/verdict beads) is not being thrown away for a socket blip." 2>/dev/null || true
+  gate_status_transition "$marker_id" "ready"
+  bd -C "$GC_CITY" comment "$marker_id" "ga-2u38b: reviewer-spawn hit a transient connection error (spawn_err=${spawn_err:-none}) — attempt $next/$GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS. Requeued to gate-status:ready for automatic re-admission next sweep; no human action needed. Work already done this run (rebase/push/stale-base-check/sizing/verdict beads) is not being thrown away for a socket blip." >/dev/null 2>&1 || true
   printf 'ready'
   return 0
 }
@@ -7779,7 +7870,15 @@ TASK
 
   if [ -z "$SESSION_ID" ]; then
     err "Failed to spawn reviewer session $i (ga-mzc3h). Aborting gate. spawn_err=${_spawn_err:-no output}"
-    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
+    # ga-ia7m7: the standalone `label remove gate-status:dispatching` that used
+    # to live here is gone — gate_status_transition (called below, either via
+    # gate_spawn_failure_requeue_or_error's "ready" path or the "error" write
+    # a few lines down) now clears WHATEVER gate-status:* labels are present,
+    # dispatching included, in the same operation that writes the new one.
+    # Removing it standalone left a window with NO gate-status:* label at all
+    # between here and that later write (exactly what the ga-kgtiw self-heal
+    # exists to catch) — folding it into the transition write shrinks that
+    # window instead of widening it.
 
     # ── ga-piscg: account this abort + escalate on K consecutive (across markers).
     # Every $() is guarded with `|| echo …` and every numeric is sanitized so this
@@ -7836,7 +7935,7 @@ TASK
       exit 1
     fi
 
-    bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
+    gate_status_transition "$MARKER_ID" "error"
     exit 1
   fi
 
