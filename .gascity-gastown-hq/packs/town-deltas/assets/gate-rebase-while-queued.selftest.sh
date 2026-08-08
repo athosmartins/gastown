@@ -104,9 +104,15 @@ has "$DISPATCHER" \
 echo "── 4. drift-guard: needs-rebase still applied to genuine conflicts ──"
 
 # 4a. The genuine-conflict + alive path must still set needs-rebase.
+# ga-7fwt1: the direct literal `"gate-status:needs-rebase"` label-add calls in
+# this rebase-decision block were consolidated into set_gate_status() calls
+# (add-before-remove, queried live — closes the zero-gate-status-label window
+# this block used to leave open across all ~400 lines of it). Accept either
+# shape so this drift-guard still recognizes the (behaviorally unchanged)
+# needs-rebase outcome.
 has "$DISPATCHER" \
-  '"gate-status:needs-rebase"' \
-  "gate-status:needs-rebase label is still set in at least one path"
+  '"gate-status:needs-rebase"|set_gate_status "\$MARKER_ID" "needs-rebase"' \
+  "gate-status:needs-rebase label is still set in at least one path (literal or via set_gate_status, ga-7fwt1)"
 
 # 4b. The ga-q3ig2 dead-author + genuine-conflict path must be preserved.
 has "$DISPATCHER" \

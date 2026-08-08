@@ -975,7 +975,20 @@ gate_bead_active_sibling_branch() {
       branch=$(printf '%s\n' "$desc" | sed -n 's/^branch:[ \t]*\(.*\)$/\1/p' | head -1)
     fi
     [ -z "$branch" ] && continue
-    status=$(printf '%s\n' "$labels" | tr ' ' '\n' | sed -n 's/^gate-status:\(.*\)$/\1/p' | head -1)
+    # ga-7fwt1: route through the shared marker_status_from_labels() (guard.sh,
+    # sourced lib-only above this function's own call site — see the L2684
+    # source and the author_is_alive()/session_matches_author() precedent for
+    # why that ordering already makes lib functions safe to call here in both
+    # production and lib-only/selftest mode) instead of a bare `head -1`. A
+    # sibling mid-transition through one of ga-7fwt1's now-fixed add-before-
+    # remove sites (or any future interruption) can briefly carry TWO
+    # gate-status:* labels; blind `head -1` would pick one arbitrarily and
+    # could feed gate_pick_active_sibling/gate_bead_live_merge_block a WRONG
+    # status, hiding or fabricating a genuinely concurrent sibling during a
+    # merge decision. marker_status_from_labels() returns the value IFF
+    # exactly one match exists, else empty — 0 and 2+ both collapse to the
+    # same safe "unknown" outcome handled below, never a guess.
+    status=$(marker_status_from_labels "$labels")
     if [ -z "$status" ]; then
       # ga-kgtiw: an OPEN marker/gate-run with a real branch but NO gate-status
       # label is the exact invisible-forever signature (every dispatcher sweep
@@ -987,8 +1000,18 @@ gate_bead_active_sibling_branch() {
       # (not via warn/log, which echo to stdout): this function's own return
       # value is captured via "$(...)" by every caller, and a stdout write
       # here would corrupt that captured string.
-      printf '[%s] [quality-gate-dispatcher] ALERT: sibling marker %s (bead %s, branch %s) is OPEN with NO gate-status label — ga-kgtiw invisible-marker signature. Excluded from sibling-race detection; needs manual gate-status repair.\n' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" "${sib_id:-$(printf '%s' "$sib" | jq -r '.id // "unknown"' 2>/dev/null || echo unknown)}" "$bead_id" "$branch" >&2
+      # ga-7fwt1: $status is now ALSO empty on 2+ ambiguous gate-status labels
+      # (not just 0) — distinguish the two in the alert text so a human
+      # reading it isn't told "NO gate-status label" when there were actually
+      # several and marker_status_from_labels() correctly refused to guess.
+      _gs_count=$(printf '%s\n' "$labels" | tr ' ' '\n' | grep -c '^gate-status:' || true)
+      if [ "${_gs_count:-0}" = "0" ]; then
+        _gs_reason="NO gate-status label"
+      else
+        _gs_reason="AMBIGUOUS gate-status state (${_gs_count} labels: $(printf '%s\n' "$labels" | tr ' ' '\n' | grep '^gate-status:' | tr '\n' ',' | sed 's/,$//'))"
+      fi
+      printf '[%s] [quality-gate-dispatcher] ALERT: sibling marker %s (bead %s, branch %s) is OPEN with %s — ga-kgtiw/ga-7fwt1 invisible-or-ambiguous-marker signature. Excluded from sibling-race detection; needs manual gate-status repair.\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "${sib_id:-$(printf '%s' "$sib" | jq -r '.id // "unknown"' 2>/dev/null || echo unknown)}" "$bead_id" "$branch" "$_gs_reason" >&2
       continue
     fi
     lines="${lines}${branch}	${status}
@@ -2935,8 +2958,14 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
           ;;
       esac
     done
-    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:queued"      -q 2>/dev/null || true
+    # ga-7fwt1: routed through the shared set_gate_status() (quality-gate-
+    # guard.sh, sourced lib-only above — see the L2684 source comment) instead
+    # of a standalone remove-then-add pair. set_gate_status() adds the new
+    # label BEFORE removing whatever gate-status:* is currently present
+    # (queried live, not assumed to be "dispatching") — same invariant
+    # ga-i0n83 already proved for the shared helper itself: an interrupted
+    # transition leaves at most two gate-status labels, never zero.
+    set_gate_status "$MARKER_ID" "queued"
     # ga-n2cpe: every OTHER terminal path in this function clears gate:reviewing
     # on the source bead (wa-qq33j) — this one didn't. A reviewer that died
     # before ever ACKing (stale_async_start drain during startup, ga-flfo/
@@ -2988,8 +3017,9 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
     esac
   done
   # Re-queue the marker (reverse of the atomic claim): dispatching → queued.
-  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
-  bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:queued"      -q 2>/dev/null || true
+  # ga-7fwt1: set_gate_status() (see the earlier dead-reviewer branch's
+  # matching comment) — add-before-remove, queried live, not a fixed guess.
+  set_gate_status "$MARKER_ID" "queued"
   # ga-n2cpe: same gap as the dead-reviewer branch above (sibling requeue
   # path, identical shape, identical missing clear) — a quota-stop can strand
   # gate:reviewing on the source bead just as permanently as a dead reviewer
@@ -5292,8 +5322,8 @@ if [ "$DISPATCHING_COUNT" -gt 0 ]; then
         continue
       fi
       warn "Re-queuing zombie dispatching marker $D_ID (age=${D_AGE_MINUTES}m > TTL=${DISPATCHING_TTL_MINUTES}m — dispatcher died mid-run, no live gate-run found)"
-      bd -C "$GC_CITY" label remove "$D_ID" "gate-status:dispatching" -q 2>/dev/null || true
-      bd -C "$GC_CITY" label add    "$D_ID" "gate-status:queued"      -q 2>/dev/null || true
+      # ga-7fwt1: set_gate_status() — add-before-remove, queried live.
+      set_gate_status "$D_ID" "queued"
       bd -C "$GC_CITY" comment "$D_ID" "Dispatcher TTL recovery: marker was stuck in gate-status:dispatching for ${D_AGE_MINUTES}m (> ${DISPATCHING_TTL_MINUTES}m TTL) with no live gate-run bead found. Dispatcher process died mid-run. Re-queuing for re-processing." 2>/dev/null || true
     fi
   done
@@ -6068,8 +6098,15 @@ fi
 
 if [ -z "$AUTHOR" ] || [ "$AUTHOR" = "null" ]; then
   err "Cannot derive author authoritatively for bead $BEAD_ID — aborting (fail-safe)."
-  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
+  # ga-7fwt1: add-before-remove, kept manual (not set_gate_status) — this site
+  # sits inside the "gate-author-final-fallback" SELFTEST-EXTRACT block, which
+  # gate-author-branch-fallback.selftest.sh runs standalone in a bash -c
+  # sandbox with only bd/gc/err/log stubbed, no guard.sh sourced. Same
+  # invariant as set_gate_status (add lands before remove, so an interrupted
+  # transition leaves at most two gate-status labels, never zero) — just
+  # inlined so this block stays dependency-free for that isolated test.
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:deferred"    -q 2>/dev/null || true
+  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
   # wa-uthi: non-terminal (deferred) — no push to Athos. Logged only.
   log "SUPPRESSED PUSH (wa-uthi non-terminal): author unresolvable for $MARKER_ID — deferred."
   # ga-tmkjg: a silently-deferred marker re-enters the SAME oldest-first queue
@@ -6109,8 +6146,15 @@ log "Authoritative author: $AUTHOR"
 # (gate_resolve_rig_context() already logged the specific "cannot resolve"
 # reason via its own err call before returning 1 — no need to repeat it here.)
 if ! gate_resolve_rig_context; then
-  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
+  # ga-7fwt1: add-before-remove, kept manual (not set_gate_status) — this site
+  # sits inside the "rig-path-resolve" SELFTEST-EXTRACT block, which
+  # gate-dispatcher-rig-resolve-noabort.selftest.sh runs standalone in a
+  # bash -c sandbox with only bd/gc/err/log stubbed, no guard.sh sourced.
+  # Same invariant as set_gate_status (add before remove, so an interrupted
+  # transition leaves at most two gate-status labels, never zero) — just
+  # inlined so this block stays dependency-free for that isolated test.
   bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
+  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
   bd -C "$GC_CITY" comment "$MARKER_ID" "ga-dmox: rig path unresolved for rig='${RIG:-<empty>}' bead_id='${BEAD_ID:-<empty>}' — marker's branch:/bead_id:/rig: fields did not resolve to any registered rig via exact name, bead-id prefix, or trailing-segment match. Marker skipped (gate-status:error); other queued markers are unaffected. Resubmit via /gate-done with a corrected bead_id:/rig: field, or fix by hand and re-queue." 2>/dev/null || true
   log "SUPPRESSED PUSH (ga-dmox non-terminal): rig path unresolvable for $MARKER_ID — gate-status:error (skipped, not a daemon failure)."
   exit 0
@@ -6166,8 +6210,8 @@ if [ -z "$BRANCH_SHA" ]; then
   if [ "$_NB_CLASS" = "rescuable" ]; then
     _NB_LOCAL_SHA=$(rig_resolve_commit "refs/heads/$BRANCH")
     err "  ga-tgwq: branch $BRANCH absent from origin but exists LOCALLY at $_NB_LOCAL_SHA with a clean worktree — looks like a session died between commit and push. NOT circuit-breaking; flagging as rescuable."
-    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
+    # ga-7fwt1: set_gate_status() — add-before-remove, queried live.
+    set_gate_status "$MARKER_ID" "error"
     bd -C "$GC_CITY" comment "$MARKER_ID" "ga-tgwq: branch '$BRANCH' is absent from origin, but a local ref exists at $_NB_LOCAL_SHA with a clean worktree — reads as a session that died between commit and push, not missing work. Rescue: \`git -C $GIT_DIR_PATH push -u origin $BRANCH\` (verify after with \`git ls-remote origin $BRANCH\`). Marker left at gate-status:error (retriable) — NOT circuit-broken: this is a push away, not a human re-anchor decision." 2>/dev/null || true
     if [ -n "$BEAD_ID" ]; then
       bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-tgwq: gate found branch '$BRANCH' absent from origin but present locally (committed, clean) at $_NB_LOCAL_SHA — likely the session died between commit and push. Rescue: \`git -C $GIT_DIR_PATH push -u origin $BRANCH\`. Bead left as-is (no gate:needs-human, assignee untouched) — this is a 3-second push, not a re-anchor decision." 2>/dev/null || true
@@ -6180,8 +6224,8 @@ if [ -z "$BRANCH_SHA" ]; then
     exit 0
   elif [ "$_NB_CLASS" = "escalate" ]; then
     err "  ga-tgwq: branch $BRANCH absent from origin; local worktree has UNCOMMITTED changes — session likely died mid-edit. Escalating, not circuit-breaking or pushing."
-    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
+    # ga-7fwt1: set_gate_status() — add-before-remove, queried live.
+    set_gate_status "$MARKER_ID" "error"
     bd -C "$GC_CITY" comment "$MARKER_ID" "ga-tgwq: branch '$BRANCH' is absent from origin; a local ref exists but its worktree has UNCOMMITTED changes — the owning session likely died mid-edit. NOT circuit-broken, NOT auto-pushed (would silently strand the uncommitted diff). Human or Mayor must inspect the local worktree and decide: commit+push, or discard." 2>/dev/null || true
     if [ -n "$BEAD_ID" ]; then
       # ga-tgwq: same needs-human + Pilot-lane-free convention as the true
@@ -6226,8 +6270,8 @@ if [ -z "$BRANCH_SHA" ]; then
   _ACB=$(gate_circuit_break_check "no_branch" "" "0" "0" "3" "10")
   if [ "$_ACB" != "ok" ]; then
     err "  ga-acb: circuit-breaking marker $MARKER_ID (${_ACB}) — branch $BRANCH is GONE from origin."
-    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
+    # ga-7fwt1: set_gate_status() — add-before-remove, queried live.
+    set_gate_status "$MARKER_ID" "error"
     bd -C "$GC_CITY" comment "$MARKER_ID" "ga-acb AUTO-CIRCUIT-BREAK (${_ACB}): branch '$BRANCH' is absent from origin. No reviewer can ever merge a non-existent branch. Marker permanently parked at gate-status:error. Source bead $BEAD_ID set gate:needs-human so the guard does NOT recreate a marker." 2>/dev/null || true
     if [ -n "$BEAD_ID" ]; then
       bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human"           -q 2>/dev/null || true
@@ -6259,8 +6303,8 @@ if [ -z "$BRANCH_SHA" ]; then
     exit 0
   fi
   # GATE_AUTO_CIRCUIT_BREAK=0: fall through to legacy gate-status:error (retriable).
-  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
-  bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
+  # ga-7fwt1: set_gate_status() — add-before-remove, queried live.
+  set_gate_status "$MARKER_ID" "error"
   # wa-uthi: non-terminal (marker error, fixable + resubmittable) — no push. Logged only.
   log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH not found on remote — gate-status:error."
   # ga-dmox: retriable per-marker state (comment above says so) must not exit 1.
@@ -6469,8 +6513,8 @@ fi
 MAIN_HEAD_SHA=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
 if [ -z "$MAIN_HEAD_SHA" ]; then
   err "Cannot resolve origin/$DEFAULT_BRANCH to a real commit (dangling/garbage ref). Marking gate-status:error for retry."
-  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
-  bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
+  # ga-7fwt1: set_gate_status() — add-before-remove, queried live.
+  set_gate_status "$MARKER_ID" "error"
   bd -C "$GC_CITY" comment "$MARKER_ID" "Gate transient error: origin/$DEFAULT_BRANCH did not resolve to a present commit object (likely a racing fetch). NOT a conflict — will retry on next sweep." 2>/dev/null || true
   log "SUPPRESSED PUSH (wa-uthi non-terminal): origin/$DEFAULT_BRANCH unresolvable — gate-status:error (retriable)."
   if [ "$(gate_marker_status_ensure "$MARKER_ID" "the main-ref-unresolvable guard")" = "repaired" ]; then
@@ -6530,8 +6574,8 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # needs-rebase — that strands a possibly-clean branch on a dead author. Mark
     # gate-status:error so the next sweep re-attempts once refs settle.
     err "  Conflict pre-check undeterminable for $BRANCH (merge-tree err; base=${MERGE_BASE_SHA:-none}). Marking gate-status:error for retry."
-    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
+    # ga-7fwt1: set_gate_status() — add-before-remove, queried live.
+    set_gate_status "$MARKER_ID" "error"
     bd -C "$GC_CITY" comment "$MARKER_ID" "Gate transient error: merge-tree conflict pre-check for $BRANCH vs $DEFAULT_BRANCH was undeterminable (merge-base=${MERGE_BASE_SHA:-none}). NOT necessarily a conflict — will retry on next sweep." 2>/dev/null || true
     log "SUPPRESSED PUSH (wa-uthi non-terminal): merge-tree undeterminable for $BRANCH — gate-status:error (retriable)."
     if [ "$(gate_marker_status_ensure "$MARKER_ID" "the merge-tree-undeterminable guard")" = "repaired" ]; then
@@ -6965,7 +7009,25 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     # Read current rebase-attempt counter from the marker labels.
     REBASE_ATTEMPT=$(read_rebase_attempt "$MARKER_ID")
 
-    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
+    # ga-7fwt1: the standalone `label remove gate-status:dispatching` that used
+    # to live here is gone (same fix shape as ga-ia7m7's spawn-failure path,
+    # a few thousand lines below). This whole block below decides the new
+    # gate-status across 10 different exit branches (circuit-breaks, bounces,
+    # retries) — a top-of-block unconditional remove left "dispatching" gone
+    # for the ENTIRE span between here and whichever branch's `label add`
+    # eventually runs (up to ~400 lines: mail sends, nudges, jq/log calls),
+    # the widest zero-gate-status-label window in this file ("unreachable by
+    # construction", ga-5jyo8) — and the ONLY thing that could still notice
+    # was gate_marker_status_ensure()'s post-hoc self-heal at each branch's
+    # tail, which cannot help if the process dies before reaching it. Every
+    # `label add "$MARKER_ID" "gate-status:..."` below is now
+    # `set_gate_status "$MARKER_ID" "..."` instead — it queries whatever
+    # gate-status:* is actually present (dispatching, in every real case)
+    # live and removes it in the SAME operation that adds the new label,
+    # right at the point the new status is actually decided. Window closed,
+    # not just narrowed; gate_marker_status_ensure() stays in place as a
+    # second line of defense for any interruption inside set_gate_status()
+    # itself.
 
     # ga-acb: ahead_dead circuit-break — branch has more own commits than the
     # rebase envelope allows AND no live author to re-anchor a large divergence.
@@ -6974,7 +7036,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     _ACB_AHEAD=$(gate_circuit_break_check "ahead_dead" "${REBASE_AHEAD:-}" "$REBASE_AUTHOR_ALIVE" "$REBASE_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX" "$REBASE_AHEAD_CAP_ONLY")
     if [ "$_ACB_AHEAD" != "ok" ]; then
       err "  ga-acb: circuit-breaking marker $MARKER_ID (${_ACB_AHEAD}): ahead=${REBASE_AHEAD:-?} > GATE_REBASE_AHEAD_MAX=${GATE_REBASE_AHEAD_MAX} and author dead/empty."
-      bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
+      set_gate_status "$MARKER_ID" "error"  # ga-7fwt1
       bd -C "$GC_CITY" comment "$MARKER_ID" "ga-acb AUTO-CIRCUIT-BREAK (${_ACB_AHEAD}): branch $BRANCH is ${REBASE_AHEAD:-?} commits ahead of main (> GATE_REBASE_AHEAD_MAX=${GATE_REBASE_AHEAD_MAX}) with no live author session. A server-side rebase of a large divergence with no one to resolve conflicts is futile. Marker permanently parked at gate-status:error. Source bead $BEAD_ID set gate:needs-human." 2>/dev/null || true
       if [ -n "$BEAD_ID" ]; then
         bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human"           -q 2>/dev/null || true
@@ -7031,7 +7093,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     _BEHIND_ACTION=$(gate_behind_envelope_action "$REBASE_BEHIND_EXCEEDED" "$REBASE_AUTHOR_ALIVE")
     if [ "$_BEHIND_ACTION" = "circuit_break" ]; then
       err "  ga-6dp9: circuit-breaking marker $MARKER_ID (behind_dead): behind=${REBASE_BEHIND:-?} > GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX} and author dead/empty."
-      bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
+      set_gate_status "$MARKER_ID" "error"  # ga-7fwt1
       bd -C "$GC_CITY" comment "$MARKER_ID" "ga-6dp9 AUTO-CIRCUIT-BREAK (behind_dead): branch $BRANCH's base is ${REBASE_BEHIND:-?} commits behind current main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}) with no live author session. main only moves forward, so this delta cannot shrink on its own, and a server-side rebase this large risks conflicts with no one to resolve them. Marker permanently parked at gate-status:error. Source bead $BEAD_ID set gate:needs-human." 2>/dev/null || true
       if [ -n "$BEAD_ID" ]; then
         bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human"           -q 2>/dev/null || true
@@ -7074,7 +7136,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       exit 0
     elif [ "$_BEHIND_ACTION" = "bounce" ]; then
       warn "Branch $BRANCH: main is ${REBASE_BEHIND:-?} commits ahead of branch base (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}); author $REBASE_AUTHOR is live — bouncing for manual/assisted rebase instead of auto-retrying a permanent condition."
-      bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
+      set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
       bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED (ga-6dp9): branch $BRANCH's base is ${REBASE_BEHIND:-?} commits behind current main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}). This is a permanent condition (main only moves forward) — auto-retry cannot help. Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH and re-run /gate-done." 2>/dev/null || true
       if [ -n "$BEAD_ID" ]; then
         bd -C "$BEAD_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
@@ -7118,7 +7180,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       # them to rebase again). Re-queue instead (same logic as dead-author transient
       # path) so the next sweep re-reads the author's rebased tip and proceeds.
       warn "Branch $BRANCH: genuine merge conflict (${CONFLICT_FILES:-conflicts}); author $REBASE_AUTHOR is live — bouncing for manual rebase."
-      bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
+      set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
       # ga-kyxih (AC2/AC4): when this branch's OWN tip is already a merge
       # commit, a manual "rebase" is not the applicable fix either (see
       # branch_tip_is_merge_commit() above — the same reason auto-rebase
@@ -7205,7 +7267,7 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
           warn "Branch $BRANCH: transient auto-rebase-fail (author $REBASE_AUTHOR live; attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, still in the healthy queue) — gate-status:queued for server-side retry."
           _TIER5_NOTE=""
         fi
-        bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:queued" -q 2>/dev/null || true
+        set_gate_status "$MARKER_ID" "queued"  # ga-7fwt1
         bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS (gt-4tk5m): branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) — $_PUSH_DIAG. Re-queued for next sweep; no /gate-done re-run needed.${_TIER5_NOTE}" 2>/dev/null || true
         # ga-6dp9 (gate-fix-2): same notify-identity fix as the bounce branches
         # above — REBASE_AUTHOR is this branch's own verified-alive identity.
@@ -7230,7 +7292,7 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
         REBASE_VERDICT="QUEUED (transient rebase race, author $REBASE_AUTHOR live, retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS)"
       else
         err "Branch $BRANCH: transient auto-rebase failure persists after $MAX_REBASE_ATTEMPTS attempts even with live author $REBASE_AUTHOR — escalating."
-        bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
+        set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
         bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED (gt-4tk5m): branch $BRANCH hit persistent transient auto-rebase failures ($MAX_REBASE_ATTEMPTS attempts) despite live author $REBASE_AUTHOR. Last attempt: $_PUSH_DIAG. Parked at needs-rebase for human/Mayor resolution." 2>/dev/null || true
         # ga-g0v96 (AC5): the retry saga is now terminal (bounced) — drop the
         # informational label from the source bead so it doesn't linger.
@@ -7259,7 +7321,7 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
       # so the marker leaves the active queue on its FIRST determination and the
       # gate-health-monitor / a fresh re-dispatch can re-anchor or rebuild it.
       err "Branch $BRANCH: genuine merge conflict vs $DEFAULT_BRANCH, author dead/empty — immediate needs-rebase (no retry; conflict is deterministic)."
-      bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
+      set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
       # ga-kyxih (AC2): name the merge-commit-tip cause distinctly when it
       # applies (see branch_tip_is_merge_commit() above). No live author to
       # notify here (AC4 targets the live-author paths above) — this only
@@ -7318,7 +7380,7 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
           warn "Branch $BRANCH: transient auto-rebase-fail, author dead/empty (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, still in the healthy queue) — gate-status:queued for server-side retry."
           _TIER5_NOTE=""
         fi
-        bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:queued" -q 2>/dev/null || true
+        set_gate_status "$MARKER_ID" "queued"  # ga-7fwt1
         bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS: branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) and the author session is gone. Queued for server-side retry on next sweep (NOT stranded on a dead author).${_TIER5_NOTE}" 2>/dev/null || true
         REBASE_EVENT="dispatcher_autorebase_retry"
         REBASE_VERDICT="QUEUED (retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, dead author)"
@@ -7333,7 +7395,7 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
         _ACB_RETRY=$(gate_circuit_break_check "retry_dead" "" "$REBASE_AUTHOR_ALIVE" "$NEXT_ATTEMPT" "$MAX_REBASE_ATTEMPTS" "$GATE_REBASE_AHEAD_MAX" "$REBASE_AHEAD_CAP_ONLY")
         if [ "$_ACB_RETRY" != "ok" ]; then
           err "Branch $BRANCH: retries exhausted ($NEXT_ATTEMPT >= $MAX_REBASE_ATTEMPTS) + dead author — ga-acb circuit-break (${_ACB_RETRY})."
-          bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
+          set_gate_status "$MARKER_ID" "error"  # ga-7fwt1
           bd -C "$GC_CITY" comment "$MARKER_ID" "ga-acb AUTO-CIRCUIT-BREAK (${_ACB_RETRY}): branch $BRANCH could not auto-rebase (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) after $MAX_REBASE_ATTEMPTS attempts, and no live author session exists. Marker permanently parked at gate-status:error. Source bead $BEAD_ID set gate:needs-human so Pilot does NOT re-dispatch." 2>/dev/null || true
           if [ -n "$BEAD_ID" ]; then
             bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-human"           -q 2>/dev/null || true
@@ -7362,7 +7424,7 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
         else
           # GATE_AUTO_CIRCUIT_BREAK=0: fall through to legacy needs-rebase escalation.
           err "Branch $BRANCH: transient auto-rebase failure persists after $MAX_REBASE_ATTEMPTS server-side attempts, author dead/empty — escalating to Mayor."
-          bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:needs-rebase" -q 2>/dev/null || true
+          set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
           bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED: branch $BRANCH could not auto-rebase (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) after $MAX_REBASE_ATTEMPTS attempts, and no live author session exists. Escalated to Mayor for resolution." 2>/dev/null || true
           if [ -n "$BEAD_ID" ]; then
             bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
@@ -7432,7 +7494,16 @@ DOUBLE_PREFIXED_FILES=$(printf '%s\n' "$CHANGED_FILES" | grep '\(^\|/\)\([^/]*\)
 if [ -n "$DOUBLE_PREFIXED_FILES" ]; then
   err "Branch $BRANCH: double-prefixed (mis-rooted-worktree) path(s) detected — rejecting before dispatch:
 $DOUBLE_PREFIXED_FILES"
-  bd -C "$GC_CITY" label add "$MARKER_ID" "gate-status:error" -q 2>/dev/null || true
+  # ga-7fwt1: this site reaches Step 5 only when the earlier stale-base check
+  # (above) found the branch current with main and never touched gate-status —
+  # the marker is still sitting at gate-status:dispatching from the original
+  # claim. The bare `label add gate-status:error` used to leave BOTH labels
+  # stuck forever (a genuine "forgot to remove", not just wrong ORDER — worse
+  # than the plain remove-then-add sites elsewhere in this bead, since nothing
+  # downstream ever clears "dispatching" on this path). set_gate_status()
+  # queries current gate-status:* labels live and removes all but the new one,
+  # so it closes this gap the same way as every other site in this fix.
+  set_gate_status "$MARKER_ID" "error"
   bd -C "$GC_CITY" comment "$MARKER_ID" "ga-ir033 REJECTED before reviewer dispatch: branch $BRANCH contains file path(s) with a directory segment repeated back-to-back — the signature of a mis-rooted nested-worktree build (git-worktree-nested-city-path-prefix-gotcha):
 $DOUBLE_PREFIXED_FILES
 These are almost certainly ghost duplicates of a correctly-placed file one level up (e.g. .gascity-gastown-hq/.gascity-gastown-hq/foo instead of .gascity-gastown-hq/foo) and are never read by any deploy/launchd job. Verify 'git rev-parse --show-toplevel' resolves to the true repo root and target paths relative to THAT before building; remove the ghost path(s); re-run /gate-done." 2>/dev/null || true
@@ -7765,8 +7836,8 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
 
   if [ -z "$VERDICT_BEAD_ID" ]; then
     err "Failed to create verdict bead for reviewer $i. Aborting gate."
-    bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true
-    bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:error"       -q 2>/dev/null || true
+    # ga-7fwt1: set_gate_status() — add-before-remove, queried live.
+    set_gate_status "$MARKER_ID" "error"
     exit 1
   fi
 

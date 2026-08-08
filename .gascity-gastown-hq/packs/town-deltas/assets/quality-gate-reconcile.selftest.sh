@@ -893,6 +893,128 @@ eq "still exactly ONE gate-status:* label once both calls land" "$_n" "1"
 unset -f bd
 
 echo ""
+# ── 9. ga-7fwt1: dispatcher's OWN inline gate-status transitions ─────────────
+# Follow-up to ga-i0n83 (section 8 above): that fix reordered the SHARED
+# set_gate_status/set_gate_status_py, but quality-gate-dispatcher.sh had
+# several raw inline remove-then-add pairs that bypassed the shared helper
+# entirely, plus a first-match ambiguity in a sibling-status extraction that
+# could feed the wrong status into a concurrent-sibling merge-block decision.
+
+# (a) Structural drift-guard: no `label remove ... "gate-status:X"` line is
+# immediately followed by a `label add ... "gate-status:Y"` line anywhere in
+# the dispatcher — that exact adjacency is the ga-i0n83 bug shape (remove
+# lands before add, leaving a window where the marker has ZERO gate-status:*
+# labels if interrupted). Every site of this shape found during the ga-7fwt1
+# audit (12 simple pairs + a 10-branch multi-exit block that removed
+# "dispatching" unconditionally up front, the widest such window in the file)
+# was consolidated into set_gate_status() — add-before-remove, queried live,
+# same invariant ga-i0n83 already proved. Two sites embedded in an isolated
+# SELFTEST-EXTRACT block (gate-author-final-fallback, rig-path-resolve — each
+# unit-tested standalone without guard.sh sourced) were manually reordered to
+# add-then-remove instead, to stay dependency-free for those tests. The
+# deliberate claim/lock sites (queued→dispatching, ready→claimed) are NOT
+# adjacent — they re-fetch and verify between remove and add — so they never
+# match this shape and correctly never trigger this guard.
+echo "── 9a. drift-guard: no adjacent remove-then-add gate-status:* pairs remain (ga-7fwt1) ──"
+ADJACENT_PAIRS=$(awk '
+  /label remove.*"gate-status:/ { remove_line=NR; next }
+  /label add.*"gate-status:/ && NR == remove_line+1 { print remove_line }
+' "$DISPATCHER")
+if [ -z "$ADJACENT_PAIRS" ]; then
+  ok "no adjacent remove-then-add gate-status:* pairs remain in dispatcher"
+else
+  bad "REGRESSION ga-7fwt1: adjacent remove-then-add gate-status:* pair(s) reintroduced at dispatcher line(s): $ADJACENT_PAIRS"
+fi
+
+# (a-mutation) Prove 9a is not vacuous: a scratch copy with ONE pre-fix-shaped
+# pair deliberately reinjected must turn it red.
+MUT_9A="$(mktemp)"
+cp "$DISPATCHER" "$MUT_9A"
+python3 - "$MUT_9A" <<'PYEOF'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+anchor = 'log "  Branch $BRANCH is current with $DEFAULT_BRANCH — stale-base check passed."\n'
+assert text.count(anchor) == 1, "anchor not unique — mutation-test needs a different anchor"
+injected = (
+    anchor
+    + '  bd -C "$GC_CITY" label remove "$MARKER_ID" "gate-status:dispatching" -q 2>/dev/null || true\n'
+    + '  bd -C "$GC_CITY" label add    "$MARKER_ID" "gate-status:queued"      -q 2>/dev/null || true\n'
+)
+text = text.replace(anchor, injected, 1)
+open(path, 'w').write(text)
+PYEOF
+MUT_HITS=$(awk '
+  /label remove.*"gate-status:/ { remove_line=NR; next }
+  /label add.*"gate-status:/ && NR == remove_line+1 { print remove_line }
+' "$MUT_9A")
+if [ -n "$MUT_HITS" ]; then
+  ok "mutation-test: reinjecting a remove-then-add pair turns 9a red — guard is not vacuous"
+else
+  bad "mutation-test: 9a did not detect a deliberately reinjected remove-then-add pair"
+fi
+rm -f "$MUT_9A"
+
+# (b) gate_bead_active_sibling_branch (dispatcher.sh, the L978-area caller)
+# must never guess between an ambiguous (0 or 2+) gate-status:* label set on
+# a sibling marker — it now routes through the shared marker_status_from_labels
+# (guard.sh, sourced above) instead of a bare `head -1`. Source the dispatcher
+# itself in lib-only mode to exercise the REAL function (its own internal
+# guard.sh source, a few thousand lines in, is a harmless idempotent re-source
+# of the same functions already defined above — proven by gate-rebase-while-
+# queued.selftest.sh's identical pattern run standalone).
+echo "── 9b. gate_bead_active_sibling_branch never guesses on ambiguous sibling status (ga-7fwt1) ──"
+GATE_DISPATCHER_LIB_ONLY=1 source "$DISPATCHER" \
+  || { echo "FATAL: could not source dispatcher in lib-only mode"; exit 1; }
+type gate_bead_active_sibling_branch >/dev/null 2>&1 || { echo "FATAL: gate_bead_active_sibling_branch not defined by dispatcher"; exit 1; }
+
+# 9b-i: a sibling with TWO gate-status:* labels (a mid-transition snapshot) on
+# a DIFFERENT branch must be EXCLUDED — never picked as the active sibling,
+# never crash the caller, and surfaced via the existing ALERT (not silently
+# dropped).
+bd() {
+  local verb="$3"
+  if [ "$verb" = "list" ]; then
+    printf '[{"id":"sib-1","status":"open","description":"","labels":["source-bead:bead-1","branch:other-branch","gate-status:queued","gate-status:dispatching"]}]'
+    return 0
+  fi
+  return 0
+}
+AMBIG_STDERR="$(mktemp)"
+AMBIG_RESULT=$(gate_bead_active_sibling_branch "/fake/city" "bead-1" "my-own-branch" 2>"$AMBIG_STDERR")
+unset -f bd
+if [ -z "$AMBIG_RESULT" ]; then
+  ok "sibling with 2 ambiguous gate-status:* labels is excluded, not guessed at (empty result)"
+else
+  bad "sibling with 2 ambiguous gate-status:* labels was NOT excluded — got: $AMBIG_RESULT (a guess here could hide or fabricate a concurrent-sibling merge-block decision)"
+fi
+if grep -q "AMBIGUOUS gate-status state" "$AMBIG_STDERR"; then
+  ok "ambiguous sibling is surfaced via the ALERT (not silently dropped)"
+else
+  bad "ambiguous sibling produced no ALERT — got stderr: $(cat "$AMBIG_STDERR")"
+fi
+rm -f "$AMBIG_STDERR"
+
+# 9b-ii: CONTRAST — a sibling with exactly ONE gate-status:* label on a
+# different, ACTIVE branch must still be correctly picked up. Proves 9b-i
+# isn't vacuous (the function isn't just "always returns empty" — it
+# distinguishes exactly-one from ambiguous).
+bd() {
+  local verb="$3"
+  if [ "$verb" = "list" ]; then
+    printf '[{"id":"sib-2","status":"open","description":"","labels":["source-bead:bead-1","branch:other-branch","gate-status:queued"]}]'
+    return 0
+  fi
+  return 0
+}
+CLEAN_RESULT=$(gate_bead_active_sibling_branch "/fake/city" "bead-1" "my-own-branch" 2>/dev/null)
+unset -f bd
+case "$CLEAN_RESULT" in
+  "other-branch"$'\t'"queued") ok "sibling with exactly ONE gate-status:* label is correctly picked up as active (=$CLEAN_RESULT)";;
+  *) bad "sibling with exactly ONE gate-status:* label was NOT picked up — got: [$CLEAN_RESULT] (9b-i result may be vacuous)";;
+esac
+
+echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"
 if [ "$FAIL" -gt 0 ]; then echo "  RESULT: FAIL"; exit 1; fi

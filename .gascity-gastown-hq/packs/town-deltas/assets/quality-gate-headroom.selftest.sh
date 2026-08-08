@@ -248,7 +248,10 @@ has "$DISPATCHER" 'Gate pausado: cota 5h'                       "AC4 quota-pause
 
 echo "── 20. ga-x3nmz: a quota-stop re-queues (queued) instead of FAILing the marker ──"
 # The handler must set gate-status:queued (re-runnable), never gate-status:failed.
-if awk '/QUOTA_REQUEUE:-0/{f=1} f&&/label add    "\$MARKER_ID" "gate-status:queued"/{print "ok"; exit}' "$DISPATCHER" | grep -q ok; then
+# ga-7fwt1: the direct literal `label add    "$MARKER_ID" "gate-status:queued"`
+# calls in this QUOTA_REQUEUE block were consolidated into set_gate_status()
+# (add-before-remove, queried live) — accept either shape.
+if awk '/QUOTA_REQUEUE:-0/{f=1} f&&(/label add    "\$MARKER_ID" "gate-status:queued"/||/set_gate_status "\$MARKER_ID" "queued"/){print "ok"; exit}' "$DISPATCHER" | grep -q ok; then
   ok "re-queue handler restores gate-status:queued"
 else
   bad "re-queue handler does not set gate-status:queued"
