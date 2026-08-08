@@ -239,19 +239,32 @@ QUOTA_CHECK = os.environ.get(
 
 
 def _list_rig_stores():
-    """Return list of (name, path) for non-HQ rig stores. Fail-open: [] on error.
+    """Return list of (name, path) for non-HQ rig stores, or None on a
+    genuine query failure — distinct from a genuine empty result ([]).
 
     ga-mfeip: used by list_inflight_beads / list_stranded_inprogress_beads to
     fan-out queries across every Dolt store so rig-native in-flight beads
     (wa-*/ps-*/lx-*/ma-* prefixes, living in rig-own stores) are visible to
     the cross-store reclaim sweep. HQ-native beads are unaffected.
+
+    ga-u8fly: this used to collapse "gc rig list failed/timed out" and
+    "there are genuinely zero non-HQ rigs" into the same [] return. Callers
+    then treated [] as "scan complete, nothing else to look at" and
+    proceeded — silently dropping every non-HQ-rig bead from that cycle's
+    result with no error signal. Combined with run_cycle's end-of-cycle
+    state prune (state.pop for any bead not seen that cycle), a single
+    transient `gc rig list` hiccup wiped a pool-zombie bead's ENTIRE
+    accumulated stranded-clock progress, forcing it to restart from zero.
+    Live-confirmed: wa-m4j75's clock only started tracking 2h05m after its
+    actual claim began. None now propagates as a whole-cycle skip in both
+    callers, matching every other fail-safe query in this file.
     """
     try:
         result = subprocess.run(
             ["gc", "--city", GC_CITY, "rig", "list", "--json"],
             capture_output=True, text=True, timeout=20)
         if result.returncode != 0 or not result.stdout.strip():
-            return []
+            return None
         data = json.loads(result.stdout)
         rigs = data.get("rigs", [])
         return [
@@ -262,7 +275,7 @@ def _list_rig_stores():
             and os.path.isdir(r.get("path", ""))
         ]
     except Exception:
-        return []
+        return None
 
 # Repos to search for builder branches
 REPOS = [
@@ -354,15 +367,26 @@ def account_is_rate_limited():
 
 
 def _has_needs_human_label(labels):
-    """True if labels contain gate:needs-human (exact) OR any gate:needs-human:* variant.
+    """True if labels contain gate:needs-human (exact), any gate:needs-human:*
+    variant, or the bare "needs-human" label.
 
     ga-hkpwv / bead-spec: the Mayor's circuit-breaker uses sub-labels like
     gate:needs-human:on-device, :routing, :technical. An exact-match check misses
     these, allowing pool-zombie sweep to re-reclaim a deliberately-parked bead —
     a safety-critical false reclaim. Prefix check closes the gap.
+
+    ga-u8fly: the bare "needs-human" label (no gate: prefix) is the
+    general-purpose "a human must look at this" marker used citywide —
+    including by Pilot's own pool-dispatch exclusion filters — but was
+    invisible here. wa-fvmo8 (legitimately parked pending Athos's phone
+    call to Assertiva support) carried only the bare form and was
+    incorrectly auto-reclaimed as a result. Same bug class already fixed
+    in production-stall-watchdog.py under ga-m0ksy.
     """
     return any(
-        lbl == "gate:needs-human" or lbl.startswith("gate:needs-human:")
+        lbl == "gate:needs-human"
+        or lbl.startswith("gate:needs-human:")
+        or lbl == "needs-human"
         for lbl in labels
     )
 
@@ -762,9 +786,13 @@ def list_inflight_beads():
     ga-mfeip (cross-store): also queries non-HQ rig stores so rig-native in-flight
     beads (wa-*/ps-*/lx-*/ma-* prefixes, living in rig-own Dolt stores) are
     visible. Attaches rig_root to each bead dict for store-aware bd routing in
-    do_reclaim(). Fail-open per rig store: a rig query error skips that store but
-    never aborts the cycle. HQ failure still returns None per existing contract.
-    Returns list of bead dicts (each with a rig_root key), or None on HQ error.
+    do_reclaim(). Once the rig list itself is known, a query error on one
+    INDIVIDUAL rig store still fails open (skips that store, never aborts
+    the cycle). ga-u8fly: failing to even ENUMERATE the rigs (gc rig list
+    itself errors/times out) is different — that now aborts the whole
+    function (returns None, same as an HQ failure) instead of silently
+    proceeding as if there were zero non-HQ rigs.
+    Returns list of bead dicts (each with a rig_root key), or None on error.
     """
     # HQ query — fail-safe: return None on error per existing contract.
     try:
@@ -790,15 +818,22 @@ def list_inflight_beads():
             b.setdefault("rig_root", None)
             merged[bid] = b
 
-    # Rig stores — fail-open per store (a rig error must not skip HQ results)
-    for _rig_name, rig_path in _list_rig_stores():
+    # Rig stores — ga-u8fly: a failed/timed-out rig-list enumeration must
+    # propagate as a whole-function failure (None), matching the HQ-query
+    # contract above. Previously this silently degraded to "zero non-HQ
+    # rigs" and returned whatever HQ-only results it had, letting a
+    # transient `gc rig list` hiccup masquerade as "scan complete".
+    _rig_stores = _list_rig_stores()
+    if _rig_stores is None:
+        return None
+    for _rig_name, rig_path in _rig_stores:
         try:
             r = subprocess.run(
                 ["bd", "-C", rig_path,
                  "list",
                  "--label", "story:in-flight",
                  "--status", "open,in_progress",
-                 "--json"],
+                 "--json", "--limit", "0"],
                 capture_output=True, text=True, timeout=20)
             if r.returncode != 0 or not r.stdout.strip():
                 continue
@@ -877,8 +912,15 @@ def list_stranded_inprogress_beads():
 
     ga-mfeip (cross-store): also queries non-HQ rig stores for the same reason
     as list_inflight_beads(). Attaches rig_root to each qualifying bead.
-    Fail-open per rig store. HQ failure returns None per existing contract.
-    Returns list of bead dicts (each with a rig_root key), or None on HQ error.
+    A query error on one individual rig store still fails open (skips that
+    store). ga-u8fly: failing to even ENUMERATE the rigs (gc rig list itself
+    errors/times out) now aborts the whole function (returns None, same as
+    an HQ failure) instead of silently proceeding as if there were zero
+    non-HQ rigs — see _list_rig_stores()'s docstring for the incident this
+    closes (a transient rig-list hiccup was repeatedly wiping a pool-zombie
+    bead's entire accumulated stranded-clock progress via the end-of-cycle
+    state prune in run_cycle, preventing it from ever crossing its TTL).
+    Returns list of bead dicts (each with a rig_root key), or None on error.
     """
     # HQ query — fail-safe: return None on error per existing contract.
     try:
@@ -905,14 +947,18 @@ def list_stranded_inprogress_beads():
             b.setdefault("rig_root", None)
             merged[bid] = b
 
-    # Rig stores — fail-open per store
-    for _rig_name, rig_path in _list_rig_stores():
+    # Rig stores — ga-u8fly: rig-list enumeration failure propagates as a
+    # whole-function failure (None); see docstring above.
+    _rig_stores = _list_rig_stores()
+    if _rig_stores is None:
+        return None
+    for _rig_name, rig_path in _rig_stores:
         try:
             r = subprocess.run(
                 ["bd", "-C", rig_path,
                  "list",
                  "--status", "in_progress",
-                 "--json"],
+                 "--json", "--limit", "0"],
                 capture_output=True, text=True, timeout=20)
             if r.returncode != 0 or not r.stdout.strip():
                 continue
@@ -1530,11 +1576,18 @@ def list_live_sling_source_beads(sessions, now):
     protected = set()
     _collect(data, protected)
 
-    # Rig stores — fail-open per store (ga-mfeip cross-store consistency)
-    for _rig_name, rig_path in _list_rig_stores():
+    # Rig stores — fail-open per store (ga-mfeip cross-store consistency).
+    # ga-u8fly: _list_rig_stores() can now return None (enumeration failure,
+    # distinct from a genuine empty result) — `or []` preserves this
+    # function's own documented fail-open contract unchanged (a rig-list
+    # hiccup here just means fewer sling-protections apply for one cycle,
+    # not a whole-cycle abort; this function computes a fresh, non-persisted
+    # set each cycle, so there is no accumulated state for a hiccup to wipe).
+    for _rig_name, rig_path in (_list_rig_stores() or []):
         try:
             r = subprocess.run(
-                ["bd", "-C", rig_path, "list", "--status", "in_progress", "--json"],
+                ["bd", "-C", rig_path, "list", "--status", "in_progress",
+                 "--json", "--limit", "0"],
                 capture_output=True, text=True, timeout=20)
             if r.returncode != 0 or not r.stdout.strip():
                 continue
@@ -1664,11 +1717,15 @@ def list_refused_sling_source_beads():
         except Exception:
             continue  # fail-open per query
 
-    for _rig_name, rig_path in _list_rig_stores():
+    # ga-u8fly: `or []` preserves this function's own documented fail-open
+    # contract when _list_rig_stores() reports a genuine enumeration
+    # failure (None) — see the sibling comment in list_live_sling_source_beads.
+    for _rig_name, rig_path in (_list_rig_stores() or []):
         for status in ("open", "in_progress"):
             try:
                 r = subprocess.run(
-                    ["bd", "-C", rig_path, "list", "--status", status, "--json"],
+                    ["bd", "-C", rig_path, "list", "--status", status,
+                     "--json", "--limit", "0"],
                     capture_output=True, text=True, timeout=20)
                 if r.returncode != 0 or not r.stdout.strip():
                     continue
@@ -2223,28 +2280,48 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
         new_refusal_count, refused_reason_slugs, _all_reason_slugs = _promote_refusal_labels(
             bead_id, labels, refusal_count, rig_root=rig_root, bridge_sources=bridge_sources)
 
-    # 2. Clear assignee so Pilot can claim it fresh
+    # 2. Reset status to open so the Pilot can actually re-dispatch (ga-vw26y).
+    #    bd list — and the Pilot's re-dispatch query — default to open-only. A
+    #    bead reclaimed but left in_progress is invisible to re-dispatch and
+    #    simply strands again (the exact loop this guard exists to break).
+    #    Idempotent: a harmless no-op on an already-open bead.
+    #
+    #    ga-u8fly: this MUST run BEFORE the assignee clear (step 2b) below.
+    #    `bd assign` refuses to overwrite another actor's live in_progress
+    #    claim without --force (bd-98s5c). While status is still
+    #    in_progress, clearing the assignee is silently refused — this
+    #    code never checked the subprocess returncode — leaving the bead
+    #    "open but still assigned" once this status flip ran anyway, which
+    #    any --unassigned dispatch query then excludes forever. Live-
+    #    confirmed: wa-m4j75 and wa-fvmo8 both "reclaimed" today (status
+    #    flipped to open) but kept their dead session as assignee. Once
+    #    status is no longer in_progress, bd assign's refusal condition no
+    #    longer applies (empirically verified against the live bd binary),
+    #    so step 2b below succeeds without needing --force — no broader
+    #    override of bd's own safety check is required.
     try:
-        subprocess.run(
+        r = subprocess.run(
+            _bd + ["update", bead_id, "--status", "open"],
+            capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            print(f"[INFLIGHT-RECLAIM] warn: reset status open {bead_id} "
+                  f"rc={r.returncode}: {(r.stderr or '').strip()[:200]}", flush=True)
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] warn: reset status open {bead_id}: {exc}", flush=True)
+        # Non-fatal: the next cycle re-finds the bead (still in_progress +
+        # pilot:reclaim-count) and retries.
+
+    # 2b. Clear assignee so Pilot can claim it fresh.
+    try:
+        r = subprocess.run(
             _bd + ["assign", bead_id, ""],
             capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            print(f"[INFLIGHT-RECLAIM] warn: clear assignee {bead_id} "
+                  f"rc={r.returncode}: {(r.stderr or '').strip()[:200]}", flush=True)
     except Exception as exc:
         print(f"[INFLIGHT-RECLAIM] warn: clear assignee {bead_id}: {exc}", flush=True)
         # Non-fatal: Pilot can still re-dispatch without assignee being empty
-
-    # 2b. Reset status to open so the Pilot can actually re-dispatch (ga-vw26y).
-    #     bd list — and the Pilot's re-dispatch query — default to open-only. A
-    #     bead reclaimed but left in_progress is invisible to re-dispatch and
-    #     simply strands again (the exact loop this guard exists to break).
-    #     Idempotent: a harmless no-op on an already-open bead. Non-fatal: if it
-    #     fails, the labels/assignee are already cleared and the next cycle
-    #     re-finds the bead (still in_progress + pilot:reclaim-count) and retries.
-    try:
-        subprocess.run(
-            _bd + ["update", bead_id, "--status", "open"],
-            capture_output=True, text=True, timeout=15)
-    except Exception as exc:
-        print(f"[INFLIGHT-RECLAIM] warn: reset status open {bead_id}: {exc}", flush=True)
 
     # 3. Bump reclaim count label (remove old, add new)
     if reclaim_count > 0:
@@ -2502,12 +2579,15 @@ def list_orphan_sweep_false_resets():
     except Exception:
         pass  # HQ failure just yields fewer candidates; rig loop below is independent
 
-    for _rig_name, rig_path in _list_rig_stores():
+    # ga-u8fly: `or []` preserves this function's own documented fail-open
+    # contract ("[] on query error... never worse than not healing at all")
+    # when _list_rig_stores() reports a genuine enumeration failure (None).
+    for _rig_name, rig_path in (_list_rig_stores() or []):
         try:
             r = subprocess.run(
                 ["bd", "-C", rig_path, "list", "--status", "open",
                  "--has-metadata-key", "gc.session_name",
-                 "--no-assignee", "--json"],
+                 "--no-assignee", "--json", "--limit", "0"],
                 capture_output=True, text=True, timeout=20)
             if r.returncode != 0 or not r.stdout.strip():
                 continue
@@ -5784,6 +5864,223 @@ def _selftest():
         subprocess.run = _orig_run_sh
 
     _list_rig_stores = _orig_list_rig_stores
+
+    # -----------------------------------------------------------------------
+    # Section 12: ga-u8fly — three independent defects found while chasing
+    # "ephemeral wa-worker zombie claims never reclaimed": (1) needs-human
+    # bare-label recognition gap, (2) _list_rig_stores() silent fail-open
+    # wipes accumulated stranded-clock progress via the end-of-cycle prune,
+    # (3) do_reclaim() clears the assignee BEFORE flipping status to open,
+    # but `bd assign` refuses to overwrite another actor's live in_progress
+    # claim without --force (bd-98s5c) — so the clear is silently ignored
+    # (returncode never checked) and the bead ends up open-but-still-
+    # assigned, which --unassigned dispatch queries then exclude forever.
+    # -----------------------------------------------------------------------
+
+    # --- NH-*: _has_needs_human_label must recognize the bare "needs-human"
+    # label, not just the gate:needs-human[:*] circuit-breaker variant. Live
+    # incident: wa-fvmo8 carries bare "needs-human" (Athos mid phone call to
+    # Assertiva support) and was incorrectly auto-reclaimed today because
+    # this check missed it entirely. ---
+    check("NH-1 (ga-u8fly): _has_needs_human_label recognizes bare 'needs-human'",
+          _has_needs_human_label(["exec:manual", "needs-human"]))
+    check("NH-2: still recognizes gate:needs-human (no regression)",
+          _has_needs_human_label(["gate:needs-human"]))
+    check("NH-3: still recognizes gate:needs-human:<variant> (no regression)",
+          _has_needs_human_label(["gate:needs-human:on-device"]))
+    check("NH-4: unrelated labels → False",
+          not _has_needs_human_label(["ctx:ready", "exec:manual"]))
+
+    # --- CTRL-1: explicit pointer to ga-u8fly's own acceptance control (2) —
+    # a FRESH claim (assignee changed since last cycle) must get a full TTL
+    # window, never inherit the prior claim's already-elapsed clock. Preexisting
+    # mechanism (wa-og36j); asserted here directly for this bead's audit trail. ---
+    _ctrl_state = {"first_seen_stranded": 1000.0, "last_assignee": "wa-worker-adhoc-old"}
+    _ctrl_secs, _ctrl_event = update_strand_clock(
+        _ctrl_state, is_currently_stranded=True,
+        assignee="wa-worker-adhoc-new", now=1000.0 + 3 * 3600)
+    check("CTRL-1 (ga-u8fly control 2): a fresh claim (assignee changed) resets the "
+          "clock instead of inheriting 3h of the prior claim's staleness",
+          _ctrl_event == "fresh_claim_reset" and _ctrl_secs == 0.0,
+          f"event={_ctrl_event} secs={_ctrl_secs}")
+
+    # --- RGL-*: _list_rig_stores() must distinguish a genuine query FAILURE
+    # (gc rig list errors/times out) from a genuine empty result, and that
+    # failure must propagate as a whole-cycle skip — never a silent partial
+    # scan. Live incident: wa-m4j75's stranded clock only started tracking
+    # 2h05m after its actual claim began — ~12 consecutive cycles treated a
+    # rig-list hiccup as "zero non-HQ rigs", and run_cycle's end-of-cycle
+    # state prune (state.pop for any bead not seen that cycle) repeatedly
+    # wiped its accumulated progress before it could ever cross
+    # POOL_ZOMBIE_TTL. ---
+    class _RglResult:
+        def __init__(self, rc=0, out=""):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = ""
+
+    def _rgl_stub(rig_list_rc, rig_list_out, hq_inprogress=None):
+        hq_inprogress = hq_inprogress if hq_inprogress is not None else []
+        calls = []
+
+        def _run(cmd, **kw):
+            if not isinstance(cmd, (list, tuple)):
+                return _RglResult(0, "")
+            calls.append(list(cmd))
+            if cmd[0] == "gc" and "rig" in cmd and "list" in cmd:
+                return _RglResult(rig_list_rc, rig_list_out)
+            if cmd[0] == "bd":
+                args = list(cmd[1:])
+                if args and args[0] == "list":
+                    return _RglResult(0, json.dumps(hq_inprogress))
+                return _RglResult(0, "[]")
+            return _RglResult(0, "")
+        return _run, calls
+
+    _orig_run_rgl = subprocess.run
+
+    # RGL-1: gc rig list fails (rc=1) → _list_rig_stores() returns None, not []
+    subprocess.run, _ = _rgl_stub(1, "")
+    try:
+        _rgl_result = _list_rig_stores()
+    finally:
+        subprocess.run = _orig_run_rgl
+    check("RGL-1 (ga-u8fly): _list_rig_stores() returns None (not []) when "
+          "gc rig list fails",
+          _rgl_result is None, f"got {_rgl_result!r}")
+
+    # RGL-2: a genuinely successful, genuinely-empty rig list → [] (still
+    # distinct from failure — the fix must not over-correct the success path)
+    subprocess.run, _ = _rgl_stub(0, json.dumps({"rigs": []}))
+    try:
+        _rgl_result2 = _list_rig_stores()
+    finally:
+        subprocess.run = _orig_run_rgl
+    check("RGL-2: _list_rig_stores() returns [] (not None) on a genuine "
+          "empty-but-successful result",
+          _rgl_result2 == [], f"got {_rgl_result2!r}")
+
+    # RGL-3: rig-list failure must make list_stranded_inprogress_beads() skip
+    # the WHOLE cycle (return None) rather than silently returning HQ-only
+    # results — this is what stops the amnesia/prune mechanism from firing.
+    subprocess.run, _rgl_calls3 = _rgl_stub(1, "", hq_inprogress=[
+        {"id": "wa-hq1", "status": "in_progress", "assignee": "wa-worker",
+         "labels": [], "issue_type": "bug"}])
+    try:
+        _rgl_result3 = list_stranded_inprogress_beads()
+    finally:
+        subprocess.run = _orig_run_rgl
+    check("RGL-3 (ga-u8fly): list_stranded_inprogress_beads() returns None "
+          "(skips cycle) when the rig-store scan fails, instead of silently "
+          "returning HQ-only results",
+          _rgl_result3 is None, f"got {_rgl_result3!r}")
+
+    # RGL-4: same contract for list_inflight_beads()
+    subprocess.run, _rgl_calls4 = _rgl_stub(1, "")
+    try:
+        _rgl_result4 = list_inflight_beads()
+    finally:
+        subprocess.run = _orig_run_rgl
+    check("RGL-4 (ga-u8fly): list_inflight_beads() returns None (skips cycle) "
+          "when the rig-store scan fails",
+          _rgl_result4 is None, f"got {_rgl_result4!r}")
+
+    # RGL-5: when the rig list DOES succeed, the per-rig bd list call must
+    # carry --limit 0 (ga-21kmp class — bd list --json silently truncates at
+    # 50 with no JSON-visible signal; the HQ-scoped queries in this same
+    # file were already fixed by 848fb99b6, but the -C <rig_path>
+    # cross-store queries use a structurally different call shape and were
+    # missed).
+    subprocess.run, _rgl_calls5 = _rgl_stub(
+        0, json.dumps({"rigs": [{"name": "whatsapp_automation",
+                                  "path": "/tmp", "hq": False}]}))
+    _orig_isdir = os.path.isdir
+    os.path.isdir = lambda p: True
+    try:
+        list_stranded_inprogress_beads()
+    finally:
+        subprocess.run = _orig_run_rgl
+        os.path.isdir = _orig_isdir
+    _rig_bd_list_calls = [c for c in _rgl_calls5
+                           if c and c[0] == "bd" and "-C" in c and "list" in c]
+    _rig_calls_have_limit_0 = bool(_rig_bd_list_calls) and all(
+        any(c[i:i + 2] == ["--limit", "0"] for i in range(len(c) - 1))
+        for c in _rig_bd_list_calls
+    )
+    check("RGL-5 (ga-u8fly): rig-store bd list call includes --limit 0",
+          _rig_calls_have_limit_0, f"calls={_rig_bd_list_calls}")
+
+    # --- RCO-*: do_reclaim() must actually free the bead for re-dispatch.
+    # bd assign refuses to overwrite another actor's live in_progress claim
+    # without --force (bd-98s5c) — do_reclaim cleared the assignee BEFORE
+    # flipping status to open, so the assign was silently refused
+    # (returncode checked nowhere) and the bead ended up open-but-still-
+    # assigned, which --unassigned dispatch queries exclude. Live incident:
+    # wa-m4j75 and wa-fvmo8 both "reclaimed" today (status→open) but
+    # retained their dead assignee. This reproduces bd's real refusal
+    # semantics and checks the END STATE, not just call presence. ---
+    class _RcoResult:
+        def __init__(self, rc=0, out="", err=""):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = err
+
+    def _make_rco_stub(initial_assignee="wa-worker-adhoc-dead"):
+        state = {"status": "in_progress", "assignee": initial_assignee, "labels": []}
+
+        def _run(cmd, **kw):
+            if not isinstance(cmd, (list, tuple)):
+                return _RcoResult(0, "")
+            if cmd[0] == "git":
+                return _RcoResult(0, "")
+            if cmd[0] == "bd":
+                args = list(cmd[1:])
+                sub = args[0] if args else ""
+                if sub == "assign":
+                    if state["status"] == "in_progress" and "--force" not in args:
+                        return _RcoResult(1, "", "refuses to overwrite live in_progress claim")
+                    state["assignee"] = args[2] if len(args) > 2 else ""
+                    return _RcoResult(0, "")
+                if sub == "update" and "--status" in args:
+                    i = args.index("--status")
+                    state["status"] = args[i + 1]
+                    return _RcoResult(0, "")
+                if sub in ("label", "comment"):
+                    return _RcoResult(0, "")
+                if sub == "show":
+                    return _RcoResult(0, json.dumps([{"id": "wa-x", "labels": state["labels"]}]))
+            return _RcoResult(0, "")
+        return _run, state
+
+    _orig_run_rco = subprocess.run
+    subprocess.run, _rco_state = _make_rco_stub()
+    try:
+        do_reclaim("wa-x", "title", reclaim_count=0, idle_min=125, labels=[])
+    finally:
+        subprocess.run = _orig_run_rco
+    check("RCO-1 (ga-u8fly): do_reclaim actually clears the assignee even "
+          "though bd assign refuses while status is still in_progress",
+          _rco_state["assignee"] == "", f"final state={_rco_state}")
+    check("RCO-2: status ends as open",
+          _rco_state["status"] == "open", f"final state={_rco_state}")
+
+    # RCO-3 (ga-u8fly control 3): a dead session holding TWO beads must
+    # release BOTH independently — mirrors the real incident where
+    # wa-worker-adhoc-b979abfb35 held both wa-fvmo8 and wa-m4j75 at once.
+    subprocess.run, _rco_state_a = _make_rco_stub()
+    try:
+        do_reclaim("wa-bead-a", "title a", reclaim_count=0, idle_min=130, labels=[])
+    finally:
+        subprocess.run = _orig_run_rco
+    subprocess.run, _rco_state_b = _make_rco_stub()
+    try:
+        do_reclaim("wa-bead-b", "title b", reclaim_count=0, idle_min=130, labels=[])
+    finally:
+        subprocess.run = _orig_run_rco
+    check("RCO-3 (ga-u8fly control 3): two independent beads held by the "
+          "same dead session both end up fully released",
+          _rco_state_a["assignee"] == "" and _rco_state_b["assignee"] == "",
+          f"a={_rco_state_a} b={_rco_state_b}")
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0
