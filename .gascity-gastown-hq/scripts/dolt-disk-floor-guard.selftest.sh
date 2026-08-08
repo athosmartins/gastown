@@ -253,6 +253,60 @@ LOG="$REAL_LOG"
 rm -rf "$FAKE_CITY_T"
 
 echo ""
+echo "=== _reap_growing_logs: production sentinel wiring (ga-dnc2m) ==="
+# Same proof as _reap_dead_scratch/_reap_dead_transcripts above, for the 4th
+# lever: log-reaper.sh's own header names _reap_growing_logs as the ONLY
+# allowed setter of LOG_REAPER_PROD=1. Hermetic: CITY is a plain global (not
+# readonly), reassigned here to a disposable tmp dir containing a FAKE
+# log-reaper.sh that only records what env it received — never touches the
+# real log-reaper.sh, no real file truncation.
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city4.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/log-reaper.sh" <<EOF
+#!/bin/bash
+echo "PROD=\${LOG_REAPER_PROD:-unset}" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/log-reaper.sh"
+
+REAL_CITY="$CITY"
+CITY="$FAKE_CITY"
+_reap_growing_logs
+CITY="$REAL_CITY"
+
+if [ -f "$CAPTURE_FILE" ] && grep -qx "PROD=1" "$CAPTURE_FILE"; then
+  ok "_reap_growing_logs: sets LOG_REAPER_PROD=1 when invoking the real reaper (production opt-in wired)"
+else
+  bad "_reap_growing_logs: did NOT set LOG_REAPER_PROD=1 — real launchd path would silently dry-run forever (got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'capture file missing'))"
+fi
+rm -rf "$FAKE_CITY"
+
+echo ""
+echo "=== _reap_growing_logs: guard-level ENABLED kill switch (ga-dnc2m) ==="
+# DOLT_DISK_FLOOR_GUARD_ENABLED=0 must skip this lever too, same as the other
+# three — the header's "Kill switch" note says ALL FOUR reclaim actions.
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city5.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts"
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/log-reaper.sh" <<EOF
+#!/bin/bash
+echo "CALLED" > "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/log-reaper.sh"
+
+REAL_CITY="$CITY"
+CITY="$FAKE_CITY"
+ENABLED=0
+_reap_growing_logs
+# shellcheck disable=SC2034  # read by every _reap_* call and main() in later scenarios below
+ENABLED=1
+CITY="$REAL_CITY"
+[ -f "$CAPTURE_FILE" ] && bad "_reap_growing_logs: ran the real log-reaper.sh despite ENABLED=0" || ok "_reap_growing_logs: ENABLED=0 skips this lever too (not just the other three)"
+rm -rf "$FAKE_CITY"
+
+echo ""
 echo "=== main(): CRITICAL-latch across reclaim reclassification (gate-fix-1: GATE-FEEDBACK gate_run=ga-wisp-9b4hnh) ==="
 # The pure-function tests above prove _should_notify is correct in ISOLATION.
 # They do NOT exercise main() itself, which is where the actual bug lived:
@@ -323,6 +377,14 @@ _reap_dead_scratch() { REAP_CALLS=$((REAP_CALLS+1)); REAP_LAST_ARG="${1:-}"; }
 REAP_TRANSCRIPT_CALLS=0
 _reap_dead_transcripts() { REAP_TRANSCRIPT_CALLS=$((REAP_TRANSCRIPT_CALLS+1)); }
 
+# _reap_growing_logs is new (ga-dnc2m), same reasoning as the other two reap
+# stubs: EXECUTION code (shells out to log-reaper.sh, which has its own
+# independent selftest) stubbed as a no-op here so main()'s WIRING is what
+# gets proven. REAP_LOGS_CALLS is checked in Scenario F below specifically
+# BECAUSE it must behave differently from the other two — see that scenario.
+REAP_LOGS_CALLS=0
+_reap_growing_logs() { REAP_LOGS_CALLS=$((REAP_LOGS_CALLS+1)); }
+
 NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""
 record_notify() {
   NOTIFY_CALLS=$((NOTIFY_CALLS+1))
@@ -343,7 +405,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; GC_MAIL_CALLS=0; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; }
+reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; GC_MAIL_CALLS=0; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; }
 seed_state() {
   if [ -n "$1" ]; then echo "$1" > "$STATE_EPOCH_FILE"; else rm -f "$STATE_EPOCH_FILE"; fi
   if [ -n "$2" ]; then echo "$2" > "$STATE_AVAIL_FILE"; else rm -f "$STATE_AVAIL_FILE"; fi
@@ -464,10 +526,10 @@ echo "=== main(): scratchpad + transcript reap integration (ga-02pnu, ga-t1ub9) 
 reset_capture; seed_state "" ""
 queue_avail 2 20
 main
-if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ]; then
-  ok "main(): _reap_dead_scratch AND _reap_dead_transcripts each invoked exactly once alongside _safe_reclaim"
+if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ]; then
+  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, AND _reap_growing_logs each invoked exactly once alongside _safe_reclaim"
 else
-  bad "main(): expected both reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS"
+  bad "main(): expected all three reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS"
 fi
 if [ "$REAP_LAST_ARG" = "1" ]; then
   ok "main(): CRITICAL cycle (even after reclaim recovers it to NONE) passes was_critical=1 to _reap_dead_scratch (ga-rjhfz pressure plumbing)"
@@ -491,15 +553,29 @@ fi
 
 # Scenario F — a cycle that never reaches the floor at all (avail comfortably
 # above warn on the FIRST read) must take the top early-return and never touch
-# ANY reclaim lever — proves neither reap call got hoisted above the floor
-# check.
+# the scratch/transcript dead-session reapers — proves neither reap call got
+# hoisted above the floor check.
 reset_capture; seed_state "" ""
 queue_avail 20
 main
 if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ]; then
   ok "main(): avail above floor on first read never invokes either dead-session reaper"
 else
-  bad "main(): expected zero reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS"
+  bad "main(): expected zero dead-session reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS"
+fi
+
+# Scenario F2 (ga-dnc2m) — UNLIKE the two dead-session reapers just proven
+# absent above, _reap_growing_logs must STILL run on this exact same
+# comfortably-above-floor cycle — it is deliberately unconditional (see this
+# file's own header note and the call site at the very top of main(), before
+# the avail/class computation at all). This is the one assertion that
+# actually distinguishes the 4th lever's behavior from the other three; if a
+# future edit accidentally moves its call site below the floor check, this
+# is what catches it.
+if [ "$REAP_LOGS_CALLS" = "1" ]; then
+  ok "main(): _reap_growing_logs runs even when avail never breaches the floor (unconditional, unlike the dead-session reapers)"
+else
+  bad "main(): _reap_growing_logs should run unconditionally every cycle, got REAP_LOGS_CALLS=$REAP_LOGS_CALLS"
 fi
 
 rm -rf "$STATE_TMP"
