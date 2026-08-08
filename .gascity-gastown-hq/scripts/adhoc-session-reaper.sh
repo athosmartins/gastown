@@ -17,13 +17,18 @@
 #     NAMED crew / core session (mila/digo/batista/oracle/peter/thies/mayor/deacon/
 #     boot/control-dispatcher/gastown__) means a misclassified row can NEVER be reaped.
 #   * An asleep/draining/drained session is reaped on the existing path. A session
-#     that reports state=active is reaped ONLY if it has ALSO been IDLE (no last_active
-#     update) for >= IDLE_MIN minutes — i.e. it finished its turn and is sitting at an
-#     empty prompt, NOT mid-work. A session that is genuinely working refreshes
-#     last_active continuously, so it can never satisfy the idle floor. (Observed
-#     2026-06-16, ga-tads0: headless Claude adhoc reviewers/dogs finish their turn and
-#     stay state="active" forever instead of going asleep, so the old active==never-reap
-#     rule leaked all of them — 8 sessions, 44 sweeps, 0 reaped.)
+#     that reports state=active is reaped if EITHER (a) it has ALSO been IDLE (no
+#     last_active update) for >= IDLE_MIN minutes — i.e. it finished its turn and is
+#     sitting at an empty prompt, NOT mid-work — OR (b) it never claimed a task at all
+#     (title still equals its own session name past the age floor; see
+#     title_shows_no_task below): a self-serve session's own poll-for-work loop keeps
+#     refreshing last_active forever, so (a) can NEVER fire for it and the idle floor
+#     would otherwise be permanently defeated (ga-dd2h0). A session that IS genuinely
+#     working a claimed task refreshes last_active continuously and has a task-bearing
+#     title, so it can never satisfy either path. (Observed 2026-06-16, ga-tads0:
+#     headless Claude adhoc reviewers/dogs finish their turn and stay state="active"
+#     forever instead of going asleep, so the old active==never-reap rule leaked all of
+#     them — 8 sessions, 44 sweeps, 0 reaped.)
 #   * Age floor (MIN_AGE, default 30m) so a just-spawned reviewer mid-review is never
 #     killed even if it momentarily reads asleep between turns.
 #   * The drained/idle signal is REQUIRED together with age — we never reap on age
@@ -35,7 +40,7 @@ set -uo pipefail
 
 GT=/Users/athos/gt
 CITY="$GT/.gascity-gastown-hq"
-LOG="$CITY/.gc/logs/adhoc-session-reaper.jsonl"
+LOG="${ADHOC_REAPER_LOG:-$CITY/.gc/logs/adhoc-session-reaper.jsonl}"
 ENABLED="${ADHOC_REAPER_ENABLED:-1}"
 MIN_AGE_MIN="${ADHOC_REAPER_MIN_AGE_MIN:-30}"   # don't touch a session younger than this
 IDLE_MIN="${ADHOC_REAPER_IDLE_MIN:-20}"         # an "active" session must be idle (no last_active
@@ -189,14 +194,38 @@ except Exception:
 #   id<TAB>name<TAB>state<TAB>closed<TAB>created_at<TAB>last_active<TAB>title
 # (title is LAST so the read loop can keep it as the remainder; last_active is sanitized
 # of tabs defensively too.)
-list_sessions() {
-  bash "$SESSION_LIST_SCRIPT" 2>/dev/null | python3 -c '
+#
+# Split into two steps (ga-dd2h0 gate-feedback round 1) so a census FAILURE and a
+# census that is genuinely empty can never collapse into the same signal: previously
+# both the list script failing and the python parser hitting bad/missing JSON were
+# swallowed by blanket `2>/dev/null` + `except Exception: sys.exit(0)`, so an empty
+# $CENSUS meant three completely different things with zero way to tell them apart —
+# exactly the error==empty bug this reaper exists to stop leaking sessions from.
+
+# list_sessions_raw → $SESSION_LIST_SCRIPT's stdout verbatim; returns ITS real exit
+# code (stderr still discarded — noisy, not needed for the classification below —
+# but the exit code is not, so a broken/missing script is visible to the caller
+# instead of silently reading as "no sessions").
+list_sessions_raw() {
+  bash "$SESSION_LIST_SCRIPT" 2>/dev/null
+}
+
+# parse_census <json on stdin> → tab-separated session rows on stdout (zero rows is
+# legitimate for a genuinely empty session list — that is NOT a failure). Exit code
+# tells the caller WHY there might be no rows:
+#   0 = parsed cleanly (rows may legitimately be empty)
+#   2 = stdin was not valid JSON
+#   3 = valid JSON but no "sessions" list in it (schema drift)
+parse_census() {
+  python3 -c '
 import sys, json
 try:
     d = json.load(sys.stdin)
 except Exception:
-    sys.exit(0)
-for s in d.get("sessions", []):
+    sys.exit(2)
+if not isinstance(d, dict) or not isinstance(d.get("sessions"), list):
+    sys.exit(3)
+for s in d["sessions"]:
     print("\t".join([
         str(s.get("id","")),
         str(s.get("name","")),
@@ -215,9 +244,22 @@ for s in d.get("sessions", []):
 
 reaped=0; kept_young=0; kept_active=0; kept_alive_peek=0; kept_peek_inconclusive=0; skipped_other=0; would_reap=0; eligible=0
 
-CENSUS="$(list_sessions)"
+RAW_JSON="$(list_sessions_raw)"; raw_status=$?
+if [ "$raw_status" -ne 0 ]; then
+  log "$(printf '{"ts":"%s","event":"noop","reason":"list_command_failed","exit_code":%s}' "$(ts)" "$raw_status")"
+  exit 0
+fi
+
+CENSUS="$(printf '%s' "$RAW_JSON" | parse_census)"; parse_status=$?
+case "$parse_status" in
+  2) log "$(printf '{"ts":"%s","event":"noop","reason":"unparseable_json"}' "$(ts)")"; exit 0 ;;
+  3) log "$(printf '{"ts":"%s","event":"noop","reason":"missing_sessions_key"}' "$(ts)")"; exit 0 ;;
+  0) : ;;
+  *) log "$(printf '{"ts":"%s","event":"noop","reason":"census_parse_failed","exit_code":%s}' "$(ts)" "$parse_status")"; exit 0 ;;
+esac
+
 if [ -z "$CENSUS" ]; then
-  log "$(printf '{"ts":"%s","event":"noop","reason":"no_sessions_or_list_failed"}' "$(ts)")"
+  log "$(printf '{"ts":"%s","event":"noop","reason":"no_eligible_sessions"}' "$(ts)")"
   exit 0
 fi
 

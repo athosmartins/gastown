@@ -111,24 +111,46 @@ export AHR_FIXTURE AHR_PEEK_MODE
 # into a false FAIL. This second stub, contract-compatible with the real script
 # (stdout = {"sessions":[...]}, same as `gc session list --json`), closes that
 # gap the same way GC_STUB already does for peek/close.
+# AHR_LIST_MODE=fail (ga-dd2h0 gate-feedback round 1) makes the stub itself exit
+# non-zero, exercising list_sessions_raw()'s failure path — the real
+# gc-session-list-cached.sh breaking or Dolt being down.
 SESSION_LIST_STUB="$STUBDIR/gc-session-list-cached.sh"
 cat > "$SESSION_LIST_STUB" <<'STUB'
 #!/usr/bin/env bash
-cat "$AHR_FIXTURE"
+case "${AHR_LIST_MODE:-ok}" in
+  fail) exit 7 ;;
+  *) cat "$AHR_FIXTURE" ;;
+esac
 STUB
 chmod +x "$SESSION_LIST_STUB"
 export ADHOC_REAPER_SESSION_LIST_SCRIPT="$SESSION_LIST_STUB"
+export AHR_LIST_MODE
 
 # fresh created_at helpers (RFC3339 Z)
 old_ts()   { python3 -c 'import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"))'; }
 fresh_ts() { python3 -c 'import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ"))'; }
 
+# AHR_LOG (ga-dd2h0 gate-feedback round 1): previously the reaper's jsonl always went
+# to the real production path ($CITY/.gc/logs/...) even under test — "harmless" since
+# no scenario asserted on it, but not hermetic, and it made the log unusable as a test
+# observable (a concurrent real sweep could interleave). Routing it through the
+# already-existing ADHOC_REAPER_LOG override into the stub dir fixes both: isolated
+# per-run (truncated before each call below) and safe to assert on.
+AHR_LOG="$STUBDIR/reaper.jsonl"
+
 run_reaper() { # $1=enabled $2=peekmode ; uses exported $AHR_FIXTURE
   : > "$AHR_CLOSE_LOG"
-  # The reaper writes its jsonl to $CITY/.gc/logs/adhoc-session-reaper.jsonl (a log
-  # only — harmless). The observable we assert on is the close-log the gc stub fills.
+  : > "$AHR_LOG"
   AHR_PEEK_MODE="$2" ADHOC_REAPER_ENABLED="$1" ADHOC_REAPER_MIN_AGE_MIN=30 ADHOC_REAPER_IDLE_MIN=20 \
+    ADHOC_REAPER_LOG="$AHR_LOG" \
     bash "$REAPER" >/dev/null 2>&1
+}
+
+# log_last_reason → the "reason" field of the last jsonl line this run wrote (empty
+# if none). Plain grep, no jq dependency — reason values here are always bare
+# identifiers with no characters that need escaping.
+log_last_reason() {
+  tail -1 "$AHR_LOG" 2>/dev/null | grep -oE '"reason":"[^"]*"' | head -1 | sed -E 's/"reason":"([^"]*)"/\1/'
 }
 
 # last_active helpers: idle_ts = stale (well past IDLE_MIN=20 → reapable if active),
@@ -322,6 +344,58 @@ if [ "$(closed_count)" = "4" ] && closed_has "ga-wisp-f1" && closed_has "ga-wisp
   ok "(f) mixed batch → reaped f1(asleep)+f2(draining)+f6(active-idle)+f7(never-claimed poll-only), kept oracle/working-active/fresh"
 else
   nope "(f) mixed batch wrong: closed=[$(tr '\n' ' ' < "$AHR_CLOSE_LOG")] count=$(closed_count)"
+fi
+
+# ---- list_sessions() failure-mode distinction (ga-dd2h0 gate-feedback round 1) ----
+# GATE-FEEDBACK blocking issue 1: a census FAILURE (list command errors, unparseable
+# JSON, missing "sessions" key) used to log the exact same event as a genuinely empty
+# session list ("noop"/"no_sessions_or_list_failed") — indistinguishable in the one
+# artifact (this jsonl log) built to tell them apart. These four scenarios prove each
+# path now writes its own reason, and (m) proves the true-empty case still isn't
+# treated as an error.
+
+# (j) the list command itself fails (non-zero exit — e.g. gc-session-list-cached.sh
+#     broke, or Dolt is down) → distinct reason, zero closes.
+AHR_FIXTURE="$STUBDIR/j.json"   # unread in fail mode, but keep run_reaper's contract happy
+printf '{"sessions":[]}' > "$AHR_FIXTURE"
+AHR_LIST_MODE=fail run_reaper 1 dead
+AHR_LIST_MODE=ok
+if [ "$(closed_count)" = "0" ] && [ "$(log_last_reason)" = "list_command_failed" ]; then
+  ok "(j) list command fails → reason=list_command_failed (was indistinguishable from empty)"
+else
+  nope "(j) expected reason=list_command_failed, got '$(log_last_reason)' closed=$(closed_count)"
+fi
+
+# (k) the list command succeeds but emits unparseable JSON → distinct reason.
+AHR_FIXTURE="$STUBDIR/k.json"
+printf 'not valid json at all' > "$AHR_FIXTURE"
+run_reaper 1 dead
+if [ "$(closed_count)" = "0" ] && [ "$(log_last_reason)" = "unparseable_json" ]; then
+  ok "(k) unparseable JSON → reason=unparseable_json"
+else
+  nope "(k) expected reason=unparseable_json, got '$(log_last_reason)' closed=$(closed_count)"
+fi
+
+# (l) valid JSON but no "sessions" key at all → distinct reason (schema drift in
+#     gc-session-list-cached.sh's output must be visible, never silently read as zero).
+AHR_FIXTURE="$STUBDIR/l.json"
+printf '{"foo":"bar"}' > "$AHR_FIXTURE"
+run_reaper 1 dead
+if [ "$(closed_count)" = "0" ] && [ "$(log_last_reason)" = "missing_sessions_key" ]; then
+  ok "(l) missing sessions key → reason=missing_sessions_key"
+else
+  nope "(l) expected reason=missing_sessions_key, got '$(log_last_reason)' closed=$(closed_count)"
+fi
+
+# (m) control: genuinely empty sessions list (parsed fine, nothing to do) must NOT
+#     share a reason with any of (j)/(k)/(l) above — the one truly benign case.
+AHR_FIXTURE="$STUBDIR/m.json"
+printf '{"sessions":[]}' > "$AHR_FIXTURE"
+run_reaper 1 dead
+if [ "$(closed_count)" = "0" ] && [ "$(log_last_reason)" = "no_eligible_sessions" ]; then
+  ok "(m) control: genuinely empty sessions → reason=no_eligible_sessions (distinct from j/k/l)"
+else
+  nope "(m) expected reason=no_eligible_sessions, got '$(log_last_reason)' closed=$(closed_count)"
 fi
 
 rm -rf "$STUBDIR" /tmp/_ahr_gc_stub_unit 2>/dev/null
