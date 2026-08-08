@@ -122,19 +122,24 @@ session_peek_reports_dead() {
   esac
 }
 
-# title_shows_no_task <title> <name> → 1 (session never claimed a task) | 0 (title was
-# overwritten to describe real work). Pure; no I/O. ga-dd2h0: a self-serve adhoc
-# session that only ever polls for work and finds none stays state="active" and keeps
-# refreshing last_active with each poll — idle_minutes(last_active) can therefore NEVER
-# clear IDLE_MIN for it, so the idle-floor check below is permanently defeated for
-# exactly this session class. title is not vulnerable to that: empirically confirmed
-# against ga-qfewi's actual record (the session that triggered this bead) that a
-# self-serve session's title starts out EQUAL to its own session name and is only
-# overwritten once it claims a task (e.g. "gate-reviewer-1: crew/oracle/wa-54egz").
-# Empty title (no descriptor ever set) reads the same way.
+# title_shows_no_task <title> <name> → 1 (CONFIRMED: session never claimed a task) | 0
+# (has a task-bearing title, OR we don't have positive evidence it doesn't — fail
+# SAFE, same as every other unknown in this script). Pure; no I/O. ga-dd2h0: a
+# self-serve adhoc session that only ever polls for work and finds none stays
+# state="active" and keeps refreshing last_active with each poll —
+# idle_minutes(last_active) can therefore NEVER clear IDLE_MIN for it, so the
+# idle-floor check below is permanently defeated for exactly this session class.
+# title is not vulnerable to that: empirically confirmed against ga-qfewi's actual
+# record (the session that triggered this bead) that a self-serve session's title
+# starts out EQUAL to its own session name and is only overwritten once it claims a
+# task (e.g. "gate-reviewer-1: crew/oracle/wa-54egz"). Deliberately NOT extended to
+# "title is empty" — that pattern is never confirmed against a real no-task session
+# (only title==name is), and treating an unconfirmed shape as equivalent to a
+# confirmed one is exactly the collapsed-third-state bug this script exists to avoid
+# elsewhere (idle_minutes, session_peek_reports_dead). An empty title falls through
+# to the existing idle-based check below, same as before this fix.
 title_shows_no_task() {
   local title="$1" name="$2"
-  [ -z "$title" ] && { echo 1; return 0; }
   [ "$title" = "$name" ] && { echo 1; return 0; }
   echo 0
 }

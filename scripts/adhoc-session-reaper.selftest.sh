@@ -62,8 +62,11 @@ _im_old="$(python3 -c 'import datetime;print((datetime.datetime.now(datetime.tim
 # title_shows_no_task (ga-dd2h0) — empirically confirmed against ga-qfewi's actual
 # record (the session that triggered this bead): a self-serve session's title starts
 # out EQUAL to its own session name and is only overwritten once it claims a task.
+# Empty title is deliberately NOT treated as confirmed-no-task (unconfirmed shape,
+# not the empirically-observed one) — must fail safe to 0, same as every other
+# "don't know" in this script.
 [ "$(title_shows_no_task "gate-reviewer-adhoc-x" "gate-reviewer-adhoc-x")" = "1" ] && ok "no_task: title==name → 1" || nope "title==name should mean no task ever claimed"
-[ "$(title_shows_no_task "" "gate-reviewer-adhoc-x")" = "1" ] && ok "no_task: empty title → 1" || nope "empty title should mean no task ever claimed"
+[ "$(title_shows_no_task "" "gate-reviewer-adhoc-x")" = "0" ] && ok "no_task: empty title → 0 (unconfirmed, fail safe)" || nope "empty title is NOT confirmed no-task — must fail safe, not auto-reap"
 [ "$(title_shows_no_task "gate-reviewer-1: crew/oracle/wa-54egz" "gate-reviewer-adhoc-x")" = "0" ] && ok "no_task: real task title → 0" || nope "task-bearing title should not read as no_task"
 
 # ---- integration scenarios via a programmable gc stub ---------------------------
@@ -269,15 +272,25 @@ EOF
 run_reaper 1 dead
 if [ "$(closed_count)" = "0" ]; then ok "(i2) control: same timing as (i) but title shows a real task → kept (ACEITE #2)"; else nope "(i2) CRITICAL: session WITH a real task was reaped (count=$(closed_count)) — collateral damage"; fi
 
-# (i3) empty title (no descriptor ever set — the other half of title_shows_no_task)
-#      combined with a non-"active" idle-candidate state (idle), to confirm the fix
+# (i3) title==name but a non-"active" idle-candidate state (idle), to confirm the fix
 #      isn't accidentally narrowed to state="active" only → REAPED.
 AHR_FIXTURE="$STUBDIR/i3.json"
 cat > "$AHR_FIXTURE" <<EOF
-{"sessions":[{"id":"ga-wisp-i3","name":"auto-refiner-adhoc-i3i3","state":"idle","closed":false,"created_at":"$(old_ts)","last_active":"$(recent_ts)","title":""}]}
+{"sessions":[{"id":"ga-wisp-i3","name":"auto-refiner-adhoc-i3i3","state":"idle","closed":false,"created_at":"$(old_ts)","last_active":"$(recent_ts)","title":"auto-refiner-adhoc-i3i3"}]}
 EOF
 run_reaper 1 dead
-if [ "$(closed_count)" = "1" ] && closed_has "ga-wisp-i3"; then ok "(i3) empty title + idle state + old + recently-active → REAPED"; else nope "(i3) empty-title never-claimed idle session was NOT reaped (count=$(closed_count))"; fi
+if [ "$(closed_count)" = "1" ] && closed_has "ga-wisp-i3"; then ok "(i3) title==name + idle state (not active) + old + recently-active → REAPED"; else nope "(i3) never-claimed idle-state session was NOT reaped (count=$(closed_count))"; fi
+
+# (i5) empty title is NOT the same evidence as title==name — only the latter is
+#      empirically confirmed against a real no-task session (ga-qfewi). An empty
+#      title must fail safe to the existing idle-based check (kept here, since
+#      last_active is recent), not auto-reap on an unconfirmed shape.
+AHR_FIXTURE="$STUBDIR/i5.json"
+cat > "$AHR_FIXTURE" <<EOF
+{"sessions":[{"id":"ga-wisp-i5","name":"auto-refiner-adhoc-i5i5","state":"active","closed":false,"created_at":"$(old_ts)","last_active":"$(recent_ts)","title":""}]}
+EOF
+run_reaper 1 dead
+if [ "$(closed_count)" = "0" ]; then ok "(i5) empty title + old + recently-active → kept (unconfirmed shape must fail safe, not auto-reap)"; else nope "(i5) empty-title session was reaped on an unconfirmed signal (count=$(closed_count)) — third-state regression"; fi
 
 # (i4) title==name but FRESH (<MIN_AGE) → still KEPT. The age floor is a separate,
 #      independent gate (ACEITE #1 requires "idade > MIN_AGE") — this fix must not
