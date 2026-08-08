@@ -391,6 +391,110 @@ def _should_close_molecule(bead, target_status, live, now, gated=frozenset()):
     return True, ("orphan: target %s is %s (no active build possible), age=%.0fmin" % (target, disp, age))
 
 
+def _deps(bead, kind):
+    """Ids this bead DEPENDS ON via `kind` edges.
+
+    ga-mpnhh: `bd list --json` spells the edge kind `type` and the target
+    `depends_on_id`; `bd show --json` spells them `dependency_type` and `id`.
+    Reading only one spelling yields an EMPTY set for half the call sites — and
+    empty is the KEEP/no-parent answer here, so the bug would hide as inaction
+    instead of surfacing as an error. Both spellings, always.
+    """
+    out = set()
+    for dep in (bead.get("dependencies") or []):
+        if not isinstance(dep, dict):
+            continue
+        if (dep.get("dependency_type") or dep.get("type") or "").lower() != kind:
+            continue
+        target = dep.get("depends_on_id") or dep.get("id")
+        if target:
+            out.add(str(target))
+    return out
+
+
+def _step_parent(bead):
+    """Parent molecule id of a STEP bead, or None (None ⇒ never orphan-eligible).
+
+    Auto-auditoria do próprio diff: a primeira versão fazia `sorted(parents)[0]`,
+    escolhendo UM pai arbitrário quando havia mais de um. Isso é o mesmo colapso
+    de terceiro estado que esta função existe pra evitar, só que introduzido por
+    mim: com dois pais, um FECHADO e outro ABERTO, o step viraria "órfão" por
+    sorteio alfabético e o trabalho vivo do outro pai seria fechado junto.
+    Mais de um pai é estrutura que eu não sei ler ⇒ None ⇒ KEEP.
+    """
+    if (bead.get("issue_type") or bead.get("type") or "").lower() != "step":
+        return None
+    parents = _deps(bead, "parent-child")
+    return next(iter(parents)) if len(parents) == 1 else None
+
+
+def _should_close_step(bead, parent_status, live, gated=frozenset()):
+    """Is this step bead an orphan left behind by a CLOSED molecule? -> (bool, why)
+
+    ga-mpnhh. When a molecule closes, its still-open steps are not closed with it.
+    They survive as type=step / status=open / no assignee — indistinguishable from
+    available work, and their BODY is executable instruction ("read bead X, branch,
+    implement, gate-done"). A worker that claims one re-implements finished work and
+    submits a DUPLICATE gate marker. Measured 2026-08-07: 13 such steps from 7 closed
+    molecules were 100% of the WA rig's apparently-free pool.
+
+    The orphan condition is structural, not temporal: a legitimately in-flight step
+    has an OPEN parent molecule. No age heuristic is needed or wanted.
+
+    Deliberately NARROWER than the molecule rule (_ORPHAN_TARGET_STATUSES, which also
+    treats deferred/missing as orphan-eligible): for a STEP only `closed` qualifies.
+    A DEFERRED molecule is frozen, not finished — closing its steps would destroy a
+    molecule that is meant to resume, which is the ga-yg585 failure (repairing without
+    distinguishing 'lost' from 'legitimately in transition' breaks working things).
+    An UNRESOLVED parent is the third state and always KEEPs.
+    """
+    bid = bead.get("id") or ""
+    if (bead.get("status") or "").lower() != "open":
+        return False, "não está open (in_progress é trabalho de alguém, não armadilha)"
+    asg = bead.get("assignee") or ""
+    if asg:
+        return False, "tem assignee (%s)%s" % (asg, " — sessão viva" if asg in live else "")
+    if bid in gated:
+        return False, "referenciado por um quality-gate-marker aberto"
+    if _ACTIVE_LABELS & set(bead.get("labels") or []):
+        return False, "carrega label de trabalho rastreado"
+    if parent_status is None or parent_status == _TARGET_MISSING:
+        # O terceiro estado: "não consegui saber" NUNCA pode produzir o mesmo
+        # resultado que "sei que a mãe fechou". Sob dúvida, inerte.
+        return False, "status da molecule-pai indeterminado — KEEP (inerte sob dúvida)"
+    if parent_status == "closed":
+        return True, "molecule-pai CLOSED"
+    return False, "molecule-pai ainda %s — step in-flight legítimo" % parent_status
+
+
+def _order_step_orphans(orphans):
+    """Blockers first. -> (ordered, unresolvable)
+
+    `bd close` REFUSES a step still blocked by a sibling (do-work blocks drain), and
+    that refusal is CORRECT — it is exactly the guard that stops a step whose
+    dependency is genuinely alive from being closed. So this orders around the guard
+    instead of pushing --force through it, which would also trample the real case.
+
+    `orphans` is [(store, bead)]. Emits layers whose blocking deps within THIS sweep
+    are already emitted. Anything still unemitted when a layer comes up empty (a
+    cycle) is returned as `unresolvable` and left alone — never forced.
+    """
+    by_id = {b.get("id"): (store, b) for store, b in orphans if b.get("id")}
+    pending = set(by_id)
+    ordered, emitted = [], set()
+    while pending:
+        layer = sorted(
+            bid for bid in pending
+            if not ((_deps(by_id[bid][1], "blocks") & set(by_id)) - emitted)
+        )
+        if not layer:
+            break
+        ordered.extend(by_id[bid] for bid in layer)
+        emitted.update(layer)
+        pending -= set(layer)
+    return ordered, [by_id[bid] for bid in sorted(pending)]
+
+
 def _try_close(store, bid, why, reason, closed):
     """Shared cap-check + close + log for both the sling-stub and molecule paths in
     run_cycle. Only call once do_close is already True. Returns (new_closed_count,
@@ -489,7 +593,70 @@ def run_cycle(now):
             targets_by_store.setdefault(target_store, set()).add(target)
         target_statuses = _target_statuses(targets_by_store)
 
+    # ── ga-mpnhh: steps órfãos de molecule FECHADA ────────────────────────────
+    # Este janitor é quem fecha as molecules órfãs — e até aqui deixava os steps
+    # delas para trás, abertos e sem assignee, isto é, indistinguíveis de trabalho
+    # disponível. Limpar atrás de si é a outra ponta do mesmo ciclo, e sai de graça
+    # aqui: o sweep já enumerou todo store e todo bead aberto. Um poller NOVO teria
+    # custo de poll próprio, e foi exatamente isso que já derrubou o `bd` da cidade
+    # (ga-y0g5x, 4 instâncias empilhadas).
+    #
+    # O pai de um step vive SEMPRE no mesmo store que o step (engine cria os dois
+    # juntos) — diferente do alvo de uma molecule, que carrega gc.var.rig_name
+    # justamente por poder ser cross-store. Logo não há resolução de rig aqui.
+    #
+    # LIMITE CONHECIDO (não é descuido, é escolha): os status dos pais são lidos no
+    # INÍCIO do sweep. Uma molecule que ESTE mesmo sweep fechar mais abaixo ainda
+    # aparece como aberta aqui, então os steps dela só são varridos no sweep
+    # SEGUINTE. Converge sozinho, e a janela passa a ser um intervalo de sweep
+    # contra os 12–24 dias medidos. Re-resolver depois do laço principal daria
+    # limpeza no mesmo sweep ao custo de mais uma rodada de bd show por ciclo —
+    # trocar isso é uma mudança consciente, não um bug a "consertar" por reflexo.
+    step_refs = []  # (store, bead, parent_id)
+    for store, beads in store_beads.items():
+        for b in beads:
+            if not isinstance(b, dict):
+                continue
+            pid = _step_parent(b)
+            if pid:
+                step_refs.append((store, b, pid))
+
+    step_parent_statuses = {}
+    if step_refs:
+        by_store = {}
+        for store, _b, pid in step_refs:
+            by_store.setdefault(store, set()).add(pid)
+        step_parent_statuses = _target_statuses(by_store)
+
     closed = 0
+    step_orphans = []
+    for store, b, pid in step_refs:
+        do_close, why = _should_close_step(b, step_parent_statuses.get(pid), live, gated)
+        if do_close:
+            step_orphans.append((store, b))
+        else:
+            _log("  KEEP %s/%s (step): %s" % (os.path.basename(store), b.get("id", "?"), why))
+
+    if step_orphans:
+        ordered, unresolvable = _order_step_orphans(step_orphans)
+        for store, b in unresolvable:
+            _log("  KEEP %s/%s (step): ciclo de dependência entre órfãos — não forçado"
+                 % (os.path.basename(store), b.get("id", "?")))
+        for store, b in ordered:
+            reason = (
+                "Orphan step cleanup (sling-task-janitor, ga-mpnhh): a molecule-pai deste "
+                "step está CLOSED, e o step ficou aberto e sem assignee — indistinguível de "
+                "trabalho disponível no pool. O corpo de um step é instrução executável, "
+                "então quem o claimasse re-implementaria trabalho já pronto e submeteria um "
+                "gate marker DUPLICADO. Fechado na ordem de dependência (bloqueadores "
+                "primeiro), sem --force: o guard que recusa fechar step bloqueado está certo "
+                "e é preservado."
+            )
+            closed, hit_cap = _try_close(store, b.get("id", "?"), "molecule-pai CLOSED", reason, closed)
+            if hit_cap:
+                return closed
+
+
     for store, beads in store_beads.items():
         for b in beads:
             if not isinstance(b, dict):
@@ -854,6 +1021,113 @@ print(json.dumps(found))
         _ok("Z: closed the live-assignee stub end-to-end once its parent resolved as confirmed-closed")
     else:
         _bad("Z: run_cycle did not close the parent-closed live-assignee stub", "closed=%s" % closed_idsZ)
+    _target_status_fn = None
+
+    # ── ga-mpnhh: steps órfãos de molecule fechada ────────────────────────────
+    def mkstep(bid, parent, assignee="", status="open", blocks=(), show_spelling=False):
+        """Step bead. `show_spelling` usa as chaves do `bd show` (dependency_type/id);
+        o default usa as do `bd list` (type/depends_on_id) — as DUAS existem no ar."""
+        def edge(target, kind):
+            if show_spelling:
+                return {"id": target, "dependency_type": kind}
+            return {"issue_id": bid, "depends_on_id": target, "type": kind}
+        deps = [edge(parent, "parent-child")] + [edge(b, "blocks") for b in blocks]
+        return {"id": bid, "title": "do-work", "issue_type": "step", "labels": [],
+                "assignee": assignee, "status": status, "updated_at": OLD,
+                "metadata": {"gc.step_ref": "mol-do-work.do-work"}, "dependencies": deps}
+
+    print("Scenario AA: step aberto e sem assignee cuja molecule-pai está CLOSED → CLOSE "
+          "(ga-mpnhh: 13 desses eram 100% do pool 'disponível' do rig WA)")
+    c, why = _should_close_step(mkstep("s1", "mol1"), "closed", set())
+    _ok("AA: fecha o step órfão") if c else _bad("AA: não fechou o órfão", why)
+
+    print("Scenario AB: molecule-pai ABERTA → KEEP (step in-flight legítimo)")
+    c, why = _should_close_step(mkstep("s2", "mol2"), "open", set())
+    _bad("AB: fechou step de molecule viva", why) if c else _ok("AB: mantém step de molecule aberta")
+
+    print("Scenario AC: status da molecule-pai NÃO RESOLVIDO → KEEP (terceiro estado: "
+          "'não consegui saber' não pode produzir o mesmo resultado que 'sei que fechou')")
+    for unknown in (None, _TARGET_MISSING):
+        c, why = _should_close_step(mkstep("s3", "mol3"), unknown, set())
+        _bad("AC: fechou com pai indeterminado (%r)" % unknown, why) if c else \
+            _ok("AC: mantém step com pai indeterminado (%r)" % unknown)
+
+    print("Scenario AD: molecule-pai DEFERRED → KEEP. Deliberadamente MAIS ESTRITO que a regra "
+          "de molecule (_ORPHAN_TARGET_STATUSES aceita deferred/missing): molecule congelada não "
+          "é molecule terminada, e fechar os steps dela destrói uma molecule feita pra retomar "
+          "(família ga-yg585)")
+    c, why = _should_close_step(mkstep("s4", "mol4"), "deferred", set())
+    _bad("AD: fechou steps de uma molecule só congelada", why) if c else _ok("AD: mantém step de molecule deferred")
+
+    print("Scenario AE: step COM assignee → KEEP (trabalho de alguém, não armadilha)")
+    c, why = _should_close_step(mkstep("s5", "mol5", assignee="dog-live"), "closed", {"dog-live"})
+    _bad("AE: fechou step assignado", why) if c else _ok("AE: mantém step com assignee")
+
+    print("Scenario AE2: step in_progress sem assignee → KEEP (só 'open' é a superfície claimável)")
+    c, why = _should_close_step(mkstep("s5b", "mol5b", status="in_progress"), "closed", set())
+    _bad("AE2: fechou step in_progress", why) if c else _ok("AE2: mantém step in_progress")
+
+    print("Scenario AF: as DUAS grafias de aresta são lidas (bd list usa type/depends_on_id; "
+          "bd show usa dependency_type/id) — ler só uma devolve 'sem pai', que é a resposta KEEP, "
+          "então o bug se esconderia como inação")
+    for spell in (False, True):
+        p = _step_parent(mkstep("s6", "molX", show_spelling=spell))
+        _ok("AF: acha o pai na grafia %s" % ("show" if spell else "list")) if p == "molX" else \
+            _bad("AF: não achou o pai na grafia %s" % ("show" if spell else "list"), repr(p))
+
+    print("Scenario AF2: DOIS pais → KEEP. Achado auditando o próprio diff: a 1ª versão fazia "
+          "sorted(parents)[0] e escolhia um pai por sorteio alfabético — com um pai fechado e "
+          "outro aberto, o step viraria órfão por acaso e trabalho vivo seria fechado junto")
+    two = mkstep("s7", "molA")
+    two["dependencies"].append({"issue_id": "s7", "depends_on_id": "molB", "type": "parent-child"})
+    p = _step_parent(two)
+    _ok("AF2: pai ambíguo devolve None (KEEP)") if p is None else \
+        _bad("AF2: escolheu um pai arbitrário", repr(p))
+
+    print("Scenario AG: ordem de dependência — drain é bloqueado por do-work, então do-work fecha "
+          "PRIMEIRO. `bd close` recusa step bloqueado, e essa recusa está CERTA: ordenar em volta "
+          "dela, nunca --force (que atropelaria também o caso real)")
+    dowork = mkstep("sd1", "mol6")
+    drain = mkstep("sd2", "mol6", blocks=("sd1",))
+    ordered, unresolvable = _order_step_orphans([("HQ", drain), ("HQ", dowork)])
+    seq = [b.get("id") for _s, b in ordered]
+    _ok("AG: fecha do-work antes do drain (%s)" % seq) if seq == ["sd1", "sd2"] and not unresolvable else \
+        _bad("AG: ordem errada", "seq=%s unresolvable=%s" % (seq, [b.get('id') for _s, b in unresolvable]))
+
+    print("Scenario AH: ciclo entre órfãos → nenhum é forçado (devolvidos como unresolvable)")
+    c1 = mkstep("sc1", "mol7", blocks=("sc2",))
+    c2 = mkstep("sc2", "mol7", blocks=("sc1",))
+    ordered, unresolvable = _order_step_orphans([("HQ", c1), ("HQ", c2)])
+    _ok("AH: ciclo não é forçado") if not ordered and len(unresolvable) == 2 else \
+        _bad("AH: ciclo não tratado", "ordered=%s" % [b.get('id') for _s, b in ordered])
+
+    print("Scenario AI: run_cycle END-TO-END fecha os dois steps órfãos na ordem certa. É o cenário "
+          "que reprova contra o HEAD anterior — lá o run_cycle não fechava step nenhum")
+    closed_idsAI = []
+    _rigs_fn = lambda: ["HQ"]
+    _bd_list_open_fn = lambda store: [drain, dowork]   # molecule fechada NÃO aparece no listing de abertos
+    _sessions_fn = lambda: set()
+    _bd_close_fn = lambda store, bid, reason: (closed_idsAI.append(bid) or True)
+    _do_notify_fn = lambda m, p: None
+    _target_status_fn = lambda targets_by_store: {"mol6": "closed"}
+    run_cycle(NOW)
+    if closed_idsAI == ["sd1", "sd2"]:
+        _ok("AI: run_cycle fechou do-work e depois drain")
+    else:
+        _bad("AI: run_cycle não limpou os steps órfãos", "closed=%s" % closed_idsAI)
+    _target_status_fn = None
+
+    print("Scenario AJ: run_cycle NÃO toca step cuja molecule-pai segue ABERTA (guarda contra "
+          "reintroduzir a falha oposta, ga-yg585: reparar sem distinguir 'perdido' de 'em "
+          "transição legítima' quebra coisa boa)")
+    closed_idsAJ = []
+    live_step = mkstep("sl1", "mol8")
+    _bd_list_open_fn = lambda store: [live_step]
+    _bd_close_fn = lambda store, bid, reason: (closed_idsAJ.append(bid) or True)
+    _target_status_fn = lambda targets_by_store: {"mol8": "open"}
+    run_cycle(NOW)
+    _ok("AJ: não tocou step de molecule aberta") if closed_idsAJ == [] else \
+        _bad("AJ: fechou trabalho vivo", "closed=%s" % closed_idsAJ)
     _target_status_fn = None
 
     print("\n[sling-janitor selftest] %d passed, %d failed" % (ok[0], bad[0]))
