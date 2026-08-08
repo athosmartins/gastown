@@ -2817,10 +2817,24 @@ branch_bead_commit_verdict() {
   local count="$1" messages="$2" bead="$3"
   case "$count" in ''|*[!0-9]*|0) printf 'skip'; return 0 ;; esac
   [ -z "$bead" ] && { printf 'skip'; return 0; }
-  case "$messages" in
-    *"$bead"*) printf 'yes' ;;
-    *)         printf 'no' ;;
-  esac
+  # ga-unjpf (gate review fix-attempt-3 FAIL, caught live): anchor the match
+  # on non-alnum boundaries. The old `case "$messages" in *"$bead"*)` matched
+  # $bead as a bare substring ANYWHERE, so a longer sibling ID that merely
+  # STARTS with the target (bead='ga-3b8', commit mentions 'ga-3b812') wrongly
+  # returned 'yes' — a false negative for exactly the mismatch this function
+  # exists to catch. Same risk on the left side too (bead='ga-3b8' inside
+  # 'omega-3b8'), so both sides are anchored, not just the one the reviewer's
+  # repro hit. POSIX ERE only — no \b, which is a GNU regex extension not
+  # portable across regex engines (this file's other regexes, e.g. the
+  # GATE_Y9A1D_SUSPECTS extraction below, already avoid it the same way).
+  # Bead IDs are always system-generated ([a-z]+-[a-z0-9]+, bd's own ID
+  # scheme) so $bead is never regex-special and needs no escaping here.
+  local _anchored='(^|[^A-Za-z0-9])'"$bead"'([^A-Za-z0-9]|$)'
+  if [[ "$messages" =~ $_anchored ]]; then
+    printf 'yes'
+  else
+    printf 'no'
+  fi
 }
 
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
@@ -3541,6 +3555,30 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       # No-op when main did not move (CUR_MAIN == the claim-time value).
       MAIN_HEAD_SHA="$CUR_MAIN"
 
+      # ga-pfgnv: branch-content-coherence check for the paths ga-y9a1d's other
+      # 2 guards don't cover — direct-FF (IS_ANC was already "yes" above, so
+      # the whole rebase block never ran) and the post-rebase fallthrough
+      # (already checked once against the OLD pre-rebase CUR_MAIN via the
+      # Site-A guard above, but CUR_MAIN was just re-resolved fresh 2 lines up
+      # — if main moved again in that narrow window, this catches it against
+      # the CURRENT baseline instead of the stale one). This is the actual
+      # push about to happen: Step 10's own check (near the top of this file)
+      # is a cheap early-exit keyed on $BRANCH_SHA, which can be hours stale
+      # by merge time; this one checks what's actually about to be pushed,
+      # right before it's pushed. Skip (empty/not-diverged range) is
+      # legitimate here — unlike Site-A above, this call site doesn't already
+      # know the branch has unique commits, so an empty range just means
+      # nothing new to check, not a collapse.
+      local FF_PUSH_COUNT FF_PUSH_MSGS FF_PUSH_VERDICT
+      FF_PUSH_COUNT=$(git_rig rev-list --count "${CUR_MAIN}..${CUR_BRANCH}" 2>/dev/null || echo "")
+      FF_PUSH_MSGS=$(git_rig log --format='%B' "${CUR_MAIN}..${CUR_BRANCH}" 2>/dev/null || echo "")
+      FF_PUSH_VERDICT=$(branch_bead_commit_verdict "$FF_PUSH_COUNT" "$FF_PUSH_MSGS" "$BEAD_ID")
+      if [ "$FF_PUSH_VERDICT" = "no" ]; then
+        err "  FF push refused (ga-pfgnv): $CUR_BRANCH's $FF_PUSH_COUNT unique commit(s) vs $DEFAULT_BRANCH never mention bead $BEAD_ID — branch-content-coherence check caught at the actual push point."
+        MERGE_RESULT="failed_branch_content_mismatch"
+        return 1
+      fi
+
       # FF push
       if git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH" 2>/dev/null; then
         git_rig fetch origin 2>/dev/null || warn "Post-FF-push fetch failed"
@@ -3641,7 +3679,8 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       # Only retry on push-race or stale-after-rebase; give up on conflict/worktree failure
       if [ "$MERGE_RESULT" = "failed_merge_time_conflict" ] || \
          [ "$MERGE_RESULT" = "failed_merge_time_rebase" ] || \
-         [ "$MERGE_RESULT" = "failed_sha_resolution" ]; then
+         [ "$MERGE_RESULT" = "failed_sha_resolution" ] || \
+         [ "$MERGE_RESULT" = "failed_branch_content_mismatch" ]; then
         log "  Non-retryable failure ($MERGE_RESULT). Stopping retry loop."
         break
       fi
@@ -3654,7 +3693,17 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
     if [[ "$MERGE_RESULT" = failed* ]]; then
       # Merge failed despite all-PASS verdict — degrade to FAIL
       OVERALL_VERDICT="FAIL"
-      FAIL_REASONS="Merge failed after all-PASS verdict. Merge result: $MERGE_RESULT. Check git state of rig $RIG."
+      if [ "$MERGE_RESULT" = "failed_branch_content_mismatch" ]; then
+        # ga-pfgnv: same diagnostic spirit as Step 10's ga-y9a1d check (a
+        # human needs to know this is a content-mismatch, not a generic git
+        # failure) without duplicating its labeling/mail code — this flows
+        # through the SAME generic gate:needs-fix pipeline every other
+        # FAIL_REASONS in this file already uses (labels/mails downstream,
+        # keyed off OVERALL_VERDICT+FAIL_REASONS generically).
+        FAIL_REASONS="Branch $BRANCH's own commits do not reference source bead $BEAD_ID, caught at the actual FF-push point (ga-pfgnv: do_merge_ff's direct-FF/post-rebase-fallthrough path — the branch-content-coherence gap Step 10's own check, keyed on a potentially-stale \$BRANCH_SHA, does not cover). This is the same branch-reused-by-unrelated-work signature ga-y9a1d describes. Not merging $BRANCH. A human must verify: is this bead's real fix still on some other ref (check \`git log --all -S '<known marker text>'\`), or does $BEAD_ID need a fresh submission?"
+      else
+        FAIL_REASONS="Merge failed after all-PASS verdict. Merge result: $MERGE_RESULT. Check git state of rig $RIG."
+      fi
       warn "All-PASS verdict but merge failed ($MERGE_RESULT). Setting gate to failed."
     fi
 

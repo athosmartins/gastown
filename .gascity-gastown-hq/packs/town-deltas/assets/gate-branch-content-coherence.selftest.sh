@@ -92,6 +92,30 @@ CREW_BRANCH_MSGS="$(printf 'skill-template additions, no bead reference\n\nfix(w
 eq "persistent crew/* branch carrying OTHER beads' history too, current bead present somewhere → yes" \
   "$(branch_bead_commit_verdict "3" "$CREW_BRANCH_MSGS" "wa-xy2cb")" "yes"
 
+# ── 1b. ga-unjpf regression: unanchored substring match (gate fix-attempt-3
+#       FAIL, caught live by the reviewer). The old `case ... in *"$bead"*)`
+#       matched $bead as a bare substring ANYWHERE — a longer sibling bead ID
+#       that merely STARTS with the target satisfied the match, wrongly
+#       returning 'yes' for exactly the mismatch this function exists to
+#       catch. The reviewer's own repro: bead='ga-3b8', commit mentions
+#       'ga-3b812'. "ACEITE COM CONTROLE" (Mayor, re-arming attempt 4): the
+#       legitimate case (messages genuinely citing 'ga-3b8') must still
+#       return 'yes' — a test that only covers the collision would pass with
+#       a function that always returns 'no', which proves nothing.
+echo "── 1b. branch_bead_commit_verdict: anchored match (ga-unjpf) ──"
+eq "prefix collision: target ga-3b8, commit mentions ga-3b812 (longer sibling id) → no, not yes" \
+  "$(branch_bead_commit_verdict "1" "fix(ga-3b812): unrelated work" "ga-3b8")" "no"
+eq "control (required by the Mayor's re-arm): target ga-3b8, commit genuinely mentions ga-3b8 → still yes" \
+  "$(branch_bead_commit_verdict "1" "fix(ga-3b8): the real fix" "ga-3b8")" "yes"
+eq "left-side collision (same class, not the reviewer's exact repro but the same unanchored-match bug): target ga-3b8 mid-word inside an unrelated token → no" \
+  "$(branch_bead_commit_verdict "1" "chore: omega-3b8 migration notes" "ga-3b8")" "no"
+eq "boundary: bead at the very start of the messages blob (no preceding char) → yes" \
+  "$(branch_bead_commit_verdict "1" "ga-3b8: fix at start of line" "ga-3b8")" "yes"
+eq "boundary: bead at the very end of the messages blob (no trailing char) → yes" \
+  "$(branch_bead_commit_verdict "1" "fix for ga-3b8" "ga-3b8")" "yes"
+eq "punctuation boundary: bead wrapped in parens (the file's own dominant commit style) still matches → yes" \
+  "$(branch_bead_commit_verdict "1" "fix(ga-3b8): parenthesized" "ga-3b8")" "yes"
+
 # ── 2. Git-plumbing composition against a REAL temp repo (incident-shaped) ───
 echo "── 2. real-git integration: reproduce the incident's exact ref shape ──"
 
@@ -286,6 +310,52 @@ else
   fi
   rm -f "$PROBE_SCRIPT"
 fi
+
+# ── 9. DRIFT GUARD: ga-pfgnv — do_merge_ff's direct-FF/post-rebase-fallthrough
+#      push is ALSO gated. Site A (section 6 above) only runs inside the
+#      `IS_ANC != "yes"` rebase block; when the branch was ALREADY a clean
+#      fast-forward (the common, no-conflict case — arguably more likely to
+#      recur in than the rebase shape, per the original ga-pfgnv filing), that
+#      whole block is skipped and execution fell straight through to the FF
+#      push with zero branch_bead_commit_verdict coverage. This section proves
+#      the gap is closed: a 3rd call site sits right before the actual push,
+#      after (not nested inside) the rebase if-block, so it fires on BOTH
+#      paths — the one property that makes it close the gap Site A cannot.
+echo "── 9. drift guard: ga-pfgnv — do_merge_ff's direct-FF/post-rebase-fallthrough push is ALSO gated ──"
+has "$DISPATCHER" 'branch_bead_commit_verdict "\$FF_PUSH_COUNT" "\$FF_PUSH_MSGS" "\$BEAD_ID"' \
+  "do_merge_ff calls branch_bead_commit_verdict immediately before the FF push (ga-pfgnv 4th call site)"
+has "$DISPATCHER" 'MERGE_RESULT="failed_branch_content_mismatch"' \
+  "a 'no' verdict at the FF-push site sets a distinct, greppable MERGE_RESULT"
+has "$DISPATCHER" '"\$MERGE_RESULT" = "failed_branch_content_mismatch"' \
+  "failed_branch_content_mismatch is checked (non-retryable list + FAIL_REASONS enrichment — a real content mismatch can't be fixed by retrying)"
+
+FFPUSH_CHECK_LN=$(grep -n 'branch_bead_commit_verdict "\$FF_PUSH_COUNT"' "$DISPATCHER" | head -1 | cut -d: -f1)
+FFPUSH_LN=$(grep -n '# FF push$' "$DISPATCHER" | head -1 | cut -d: -f1)
+MAIN_HEAD_LN=$(grep -n '^      MAIN_HEAD_SHA="\$CUR_MAIN"$' "$DISPATCHER" | head -1 | cut -d: -f1)
+
+if [ -n "$FFPUSH_CHECK_LN" ] && [ -n "$FFPUSH_LN" ] && [ "$FFPUSH_CHECK_LN" -lt "$FFPUSH_LN" ]; then
+  ok "FF-push content-coherence check (line $FFPUSH_CHECK_LN) precedes the actual push (line $FFPUSH_LN)"
+else
+  bad "FF-push content-coherence check must precede the actual push (check=$FFPUSH_CHECK_LN push=$FFPUSH_LN)"
+fi
+
+# The gap this closes specifically: IS_ANC=="yes" (direct FF) skips do_merge_ff's
+# ENTIRE rebase if-block (where Site A's 2 guards live). Anchor on
+# MAIN_HEAD_SHA="$CUR_MAIN" — a line whose own comment ("No-op when main did
+# not move") only makes sense if it runs on the direct-FF path too, proving it
+# sits AFTER the rebase if-block closes, not inside it. If the new check came
+# BEFORE this line (or, worse, were nested inside the rebase-only branch), it
+# would inherit the exact blind spot it exists to close.
+if [ -n "$MAIN_HEAD_LN" ] && [ -n "$FFPUSH_CHECK_LN" ] && [ "$MAIN_HEAD_LN" -lt "$FFPUSH_CHECK_LN" ]; then
+  ok "FF-push check (line $FFPUSH_CHECK_LN) comes after the post-rebase-block MAIN_HEAD_SHA refresh (line $MAIN_HEAD_LN) — runs on BOTH the direct-FF and post-rebase-fallthrough paths, not nested inside the rebase-only branch"
+else
+  bad "expected FF-push check after the MAIN_HEAD_SHA refresh that follows the rebase if-block (main_head=$MAIN_HEAD_LN check=$FFPUSH_CHECK_LN)"
+fi
+
+eq "pure function: FF-push site's own failure shape (unique commits present, none mention the bead) → no" \
+  "$(branch_bead_commit_verdict "2" "$REAL_INCIDENT_MSGS" "ga-fic5d")" "no"
+eq "pure function: FF-push site on an already-caught-up branch (empty range) → skip, not a false failure (unlike Site A, this call site doesn't already know the branch has unique commits)" \
+  "$(branch_bead_commit_verdict "0" "" "ga-fic5d")" "skip"
 
 echo ""
 echo "──────────────────────────────────────────"
