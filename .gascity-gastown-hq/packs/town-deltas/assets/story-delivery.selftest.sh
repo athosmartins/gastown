@@ -52,10 +52,25 @@ done
 echo "── 1. task_reconciler_verdict (pure verdict) ──"
 eq "DoD#1: unverified, not contradicted → keep (never trust label alone)" \
    "$(task_reconciler_verdict 0 0)" "keep:merge-not-verified"
-eq "DoD#2: contradicted, unverified → keep (contradiction guard)" \
+eq "DoD#2: contradicted, unverified → keep (contradiction guard, never guess)" \
    "$(task_reconciler_verdict 1 0)" "keep:contradicted-by-gate-failed-or-needs-fix"
-eq "DoD#2: contradicted EVEN IF merge-verified → keep (contradiction wins)" \
-   "$(task_reconciler_verdict 1 1)" "keep:contradicted-by-gate-failed-or-needs-fix"
+# ga-tuk26: this assertion used to read "contradicted EVEN IF merge-verified →
+# keep (contradiction wins)" — i.e. is_merge_verified was IGNORED once
+# contradicted. That input combination was UNREACHABLE from the real call
+# site at the time (it hard-coded is_merge_verified=0 whenever contradicted,
+# never even running the check — the exact bug ga-tuk26 fixes), so this test
+# could assert a verdict the live code could never actually need. Now that
+# the caller always verifies, a contradicted bead that IS independently
+# proven merged must resolve, not stay stuck forever on a stale label — see
+# ga-tuk26 (measured live 6x in one night: wa-6cx36, wa-8ok7u, ga-dnc2m,
+# wa-3xd3w, wa-ze2u1, wa-iochp). DoD#2's actual invariant — never trust the
+# label pair alone, in EITHER direction — is what the line above (unverified
+# → keep, unconditionally) and section 4's real-git e2e case below continue
+# to prove; this line specifically now proves the OPPOSITE direction: verified
+# → resolves, with a distinct verdict string so the caller knows to also
+# clear the stale labels.
+eq "ga-tuk26: contradicted BUT independently merge-verified → close (proven stale, not guessed)" \
+   "$(task_reconciler_verdict 1 1)" "close:contradicted-but-commit-verified-in-origin-main"
 eq "DoD#3: verified, not contradicted → close (no regression on real merges)" \
    "$(task_reconciler_verdict 0 1)" "close:commit-in-origin-main"
 eq "verb-only check: unverified is keep"     "$(task_reconciler_verdict 0 0 | cut -d: -f1)" "keep"
@@ -141,11 +156,17 @@ fi
 eq "DoD#1 e2e: never-landed bead → keep verdict (not closed)" \
    "$(task_reconciler_verdict 0 "$UNMERGED_VERIFIED")" "keep:merge-not-verified"
 
-# A bead that DID land (by content) but ALSO carries gate:needs-fix must still
-# be kept — contradiction beats even real merge evidence (DoD#2, no regression
-# vs DoD#3's independent proof that the content-check machinery itself works).
-eq "DoD#2 e2e: merged bead but contradicted by gate:needs-fix → keep" \
-   "$(task_reconciler_verdict 1 "$MERGED_VERIFIED")" "keep:contradicted-by-gate-failed-or-needs-fix"
+# A bead that DID land (by content, proven against the REAL git repo built in
+# section 3 — not a synthetic boolean) but ALSO carries gate:needs-fix used to
+# stay kept forever (DoD#2) regardless of that proof — the exact ga-tuk26 bug:
+# a contradicted bead could never earn independent evidence because the real
+# call site never even ran scan_commit_subject_for_bead for it. ga-tuk26 fixes
+# the call site (always verifies now) and this function (trusts real proof
+# over a stale label) together; this e2e case is the sibling of DoD#3's
+# real-git close case just above, now proving the contradiction-resolution
+# path against real git history instead of a synthetic MERGED_VERIFIED=1.
+eq "ga-tuk26 e2e: merged bead (real git) contradicted by gate:needs-fix → close, not stuck forever" \
+   "$(task_reconciler_verdict 1 "$MERGED_VERIFIED")" "close:contradicted-but-commit-verified-in-origin-main"
 
 # ── 5. extract_gate_merge_info — gate-comment parsing (ga-mmdm2) ────────────
 # gate:passed is a LABEL; the sha it actually merged lives only in the gate

@@ -3543,6 +3543,18 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
       # gate:passed is BOTH the success label AND story-delivery's pickup signal
       # (story-delivery selects story:approved + gate:passed, excluding story:done).
       bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
+      # ga-tuk26: clear residue from an EARLIER failed cycle on this SAME bead.
+      # gate:failed/gate:needs-fix are only ever ADDED on FAIL (~line 3923/3987
+      # above), never REMOVED on a later PASS — so a bead that fails once then
+      # passes on retry kept BOTH labels forever. That is the exact
+      # contradiction story-delivery.sh's ga-266z8 guard then refuses to close
+      # (never trusts gate:passed alone when a fail-label coexists) — measured
+      # live 6x in one night (Mayor, 2026-08-08): wa-6cx36, wa-8ok7u, ga-dnc2m,
+      # wa-3xd3w, wa-ze2u1, wa-iochp, each unstuck by hand before this fix.
+      # label remove is idempotent/best-effort (`-q ... || true`) so this is a
+      # safe no-op on a bead that never failed.
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:failed" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:needs-fix" -q 2>/dev/null || true
       bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED. Branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA) via autonomous dispatcher (gate_run=$GATE_RUN_ID)." 2>/dev/null || true
 
       # Read the source bead state authoritatively (labels + live assignee).
@@ -5516,6 +5528,10 @@ if [ "$NEEDS_REBASE_COUNT" -gt 0 ]; then
             # STORY → hand off to story-delivery, same as Step 4b's already-merged
             # path: gate:passed is delivery's pickup signal; do not close here.
             bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
+            # ga-tuk26: clear residue from an earlier failed cycle — see the
+            # PASS-path sibling (ga-esbg block, ~line 3545) for full rationale.
+            bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:failed" -q 2>/dev/null || true
+            bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:needs-fix" -q 2>/dev/null || true
             bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $NR_BRANCH already in $DEFAULT_BRANCH — gate skipped (marker $NR_MARKER_ID superseded, reaped from stranded needs-rebase). STORY: handed off to story-delivery (gate:passed set; story:approved kept; story:in-flight stripped). (ga-88sl7)" 2>/dev/null || true
           else
             bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
@@ -6347,6 +6363,10 @@ if [ "$ALREADY_MERGED" = "1" ]; then
           # gate:superseded on a story: that label is a non-delivery word the painel
           # would mis-route, and superseded is not the story's outcome (it WAS merged).
           bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
+          # ga-tuk26: clear residue from an earlier failed cycle — see the
+          # PASS-path sibling (ga-esbg block, ~line 3545) for full rationale.
+          bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:failed" -q 2>/dev/null || true
+          bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:needs-fix" -q 2>/dev/null || true
           bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate skipped (marker $MARKER_ID superseded), but this is a STORY: handed off to story-delivery (gate:passed set; story:approved kept; story:in-flight stripped; builder assignee cleared). Delivery will deploy + prod-test, then mark story:done and CLOSE with a delivery reason so it reaches painel Done (ga-i53ua)." 2>/dev/null || true
           log "Already-merged STORY $BEAD_ID handed off to delivery (gate:passed set; story:approved kept for delivery pickup)."
         else

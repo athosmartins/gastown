@@ -570,10 +570,33 @@ eq "2-arg call unaffected: verified → close"  "$(task_reconciler_verdict 0 1)"
 
 eq "partial beats merge-verified (scope, not artifact, is the question)" \
    "$(task_reconciler_verdict 0 1 1)" "keep:partial-delivery"
-eq "contradiction still wins over partial (stale label is not a scope signal either)" \
-   "$(task_reconciler_verdict 1 1 1)" "keep:contradicted-by-gate-failed-or-needs-fix"
+
+# ga-tuk26: this specific input combination — is_contradicted=1 AND
+# is_merge_verified=1 — used to be UNREACHABLE from the real call site: the
+# caller hard-coded is_merge_verified=0 whenever contradicted (never even ran
+# the check; see story-delivery.sh's Step 1b, pre-ga-tuk26). ga-tuk26 fixes
+# that caller gap (verification now always runs), which makes this
+# combination real, and changes what "contradiction wins" must mean: once
+# independently PROVEN stale (a real commit for this bead verified in
+# origin/main), the contradiction is resolved, and the bead falls through to
+# the SAME rules as any other verified bead — including this partial-scope
+# hold, which still applies. This is NOT a regression of this test's original
+# point ("stale label is not a scope signal either") — it is the same point,
+# now correctly scoped to the case where the label is ACTUALLY proven stale
+# rather than merely absent from this synthetic input. The other half of the
+# original point — an UNVERIFIED contradiction still wins over everything,
+# unconditionally, never guessing — is asserted immediately below and MUST
+# NOT regress.
+eq "resolved contradiction (independently verified) still respects the partial-scope hold (ga-tuk26)" \
+   "$(task_reconciler_verdict 1 1 1)" "keep:partial-delivery"
+eq "UNVERIFIED contradiction still wins over partial, unconditionally — never guess (ga-tuk26 fail-safe half)" \
+   "$(task_reconciler_verdict 1 0 1)" "keep:contradicted-by-gate-failed-or-needs-fix"
 eq "not partial + verified → close (no regression)" \
    "$(task_reconciler_verdict 0 1 0)" "close:commit-in-origin-main"
+eq "contradicted + verified + NOT partial → close with distinct verdict string (ga-tuk26)" \
+   "$(task_reconciler_verdict 1 1 0)" "close:contradicted-but-commit-verified-in-origin-main"
+eq "contradicted + UNVERIFIED + not partial → still kept, unconditionally (ga-tuk26 fail-safe control)" \
+   "$(task_reconciler_verdict 1 0 0)" "keep:contradicted-by-gate-failed-or-needs-fix"
 
 echo ""
 echo "== gate-delivery-partial-scope: PASS=$PASS FAIL=$FAIL =="

@@ -110,18 +110,34 @@ EOF
 
 # task_reconciler_verdict <is_contradicted> <is_merge_verified> [is_partial] —
 # pure decision: echoes "close:<reason>" iff gate:passed may be trusted,
-# "keep:<reason>" otherwise. A contradicting gate:failed/gate:needs-fix label
-# always wins (gate:passed is then stale/propagated, not evidence). Absent
-# that, ga-k2wjn: a bead whose body looks like it enumerates multiple
-# approved deliverables is kept regardless of merge-verification — "this diff
-# is verified merged" and "this bead's full scope is done" are different
-# claims, and closing on the former silently drops the rest of the latter.
+# "keep:<reason>" otherwise.
+#
+# ga-tuk26: a contradicting gate:failed/gate:needs-fix label used to ALWAYS
+# win outright — before this fix, the caller never even computed
+# is_merge_verified when contradicted (see the call site above this
+# function), so a contradicted bead could NEVER earn independent proof and
+# sat stuck forever, even after whatever wrote the stale label stopped
+# recurring (measured live 6x in one night — wa-6cx36, wa-8ok7u, ga-dnc2m,
+# wa-3xd3w, wa-ze2u1, wa-iochp — each unstuck by hand). Fixed on BOTH sides:
+# the caller now always runs verification, and this function only trusts
+# is_contradicted=1 outright when is_merge_verified is NOT "1" — i.e. it
+# never guesses: an unverified contradiction still wins unconditionally
+# (fail-safe, unchanged). Once independently PROVEN stale (a real commit for
+# this bead verified in origin/<default_branch>), the contradiction is
+# resolved and the bead falls through to the SAME rules as any other
+# verified bead below — including the ga-k2wjn partial-scope check: a
+# resolved contradiction is not a scope signal, so a bead whose body looks
+# like it enumerates multiple approved deliverables is still kept
+# (keep:partial-delivery) rather than closed outright. Absent partial too,
+# the verified-merged bead closes — with a distinct verdict string
+# (close:contradicted-but-...) so the caller knows to also clear the stale
+# labels as part of closing.
 # is_partial defaults to "0" so existing 2-arg call sites are unaffected.
-# Absent both of those, the bead must show independent content proof before
-# the sweep may close it.
+# Absent all of the above, the bead must show independent content proof
+# before the sweep may close it.
 task_reconciler_verdict() {
   local is_contradicted="$1" is_merge_verified="$2" is_partial="${3:-0}"
-  if [ "$is_contradicted" = "1" ]; then
+  if [ "$is_contradicted" = "1" ] && [ "$is_merge_verified" != "1" ]; then
     echo "keep:contradicted-by-gate-failed-or-needs-fix"
     return 0
   fi
@@ -130,7 +146,11 @@ task_reconciler_verdict() {
     return 0
   fi
   if [ "$is_merge_verified" = "1" ]; then
-    echo "close:commit-in-origin-main"
+    if [ "$is_contradicted" = "1" ]; then
+      echo "close:contradicted-but-commit-verified-in-origin-main"
+    else
+      echo "close:commit-in-origin-main"
+    fi
     return 0
   fi
   echo "keep:merge-not-verified"
@@ -535,26 +555,54 @@ if [ -z "$FORCE_STORY_ID" ]; then
       #       for a task bead to run merge-base --is-ancestor against.
       TASK_CONTRADICTED=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | any(. == "gate:failed" or . == "gate:needs-fix")) then "1" else "0" end' 2>/dev/null || echo "0")
 
+      # ga-tuk26: run content-verification UNCONDITIONALLY, even when
+      # TASK_CONTRADICTED=1. This used to be gated on `!= "1"`, which meant a
+      # contradicted bead's TASK_MERGE_VERIFIED stayed hard-coded 0 forever —
+      # task_reconciler_verdict()'s contradiction check then short-circuited
+      # before that value was ever meaningful, so the bead could NEVER earn
+      # the independent proof that would let it resolve (it just sat stuck,
+      # even after whatever wrote the stale gate:failed/gate:needs-fix
+      # stopped recurring). This never trusts the label pair alone in the
+      # OTHER direction either: task_reconciler_verdict still keeps an
+      # unverified contradicted bead stuck, unconditionally — see that
+      # function for the fail-safe half of this fix.
       TASK_MERGE_VERIFIED=0
-      TASK_DEFAULT_BRANCH="main"
-      if [ "$TASK_CONTRADICTED" != "1" ]; then
-        TASK_DEFAULT_BRANCH=$(echo "$RIG_LIST_JSON" | jq -r --arg p "$TASK_STORE" '(.rigs[] | select(.path==$p) | .default_branch) // "main"' 2>/dev/null || echo "main")
-        [ -z "$TASK_DEFAULT_BRANCH" ] && TASK_DEFAULT_BRANCH="main"
-        TASK_GITDIR_PAIR=$(rig_gitdir "$TASK_STORE")
-        TASK_GDIR="${TASK_GITDIR_PAIR%$'\t'*}"
-        TASK_CONTAINER="${TASK_GITDIR_PAIR#*$'\t'}"
-        case " $TASK_FETCHED_STORES " in
-          *" $TASK_STORE "*) : ;;
-          *)
-            timeout 30 sh -c '
-              if [ "$3" = "1" ]; then git --git-dir="$1" fetch origin "$2" --quiet; else git -C "$1" fetch origin "$2" --quiet; fi
-            ' _ "$TASK_GDIR" "$TASK_DEFAULT_BRANCH" "$TASK_CONTAINER" 2>/dev/null \
-              || warn "Task reconciler: fetch origin/$TASK_DEFAULT_BRANCH failed/timed out for $TASK_STORE (non-fatal — verifying against last-known ref)."
-            TASK_FETCHED_STORES="$TASK_FETCHED_STORES $TASK_STORE"
-            ;;
-        esac
-        if scan_commit_subject_for_bead "$TASK_GDIR" "$TASK_CONTAINER" "origin/$TASK_DEFAULT_BRANCH" "$TASK_BEAD_ID" >/dev/null 2>&1; then
-          TASK_MERGE_VERIFIED=1
+      TASK_DEFAULT_BRANCH=$(echo "$RIG_LIST_JSON" | jq -r --arg p "$TASK_STORE" '(.rigs[] | select(.path==$p) | .default_branch) // "main"' 2>/dev/null || echo "main")
+      [ -z "$TASK_DEFAULT_BRANCH" ] && TASK_DEFAULT_BRANCH="main"
+      TASK_GITDIR_PAIR=$(rig_gitdir "$TASK_STORE")
+      TASK_GDIR="${TASK_GITDIR_PAIR%$'\t'*}"
+      TASK_CONTAINER="${TASK_GITDIR_PAIR#*$'\t'}"
+      case " $TASK_FETCHED_STORES " in
+        *" $TASK_STORE "*) : ;;
+        *)
+          timeout 30 sh -c '
+            if [ "$3" = "1" ]; then git --git-dir="$1" fetch origin "$2" --quiet; else git -C "$1" fetch origin "$2" --quiet; fi
+          ' _ "$TASK_GDIR" "$TASK_DEFAULT_BRANCH" "$TASK_CONTAINER" 2>/dev/null \
+            || warn "Task reconciler: fetch origin/$TASK_DEFAULT_BRANCH failed/timed out for $TASK_STORE (non-fatal — verifying against last-known ref)."
+          TASK_FETCHED_STORES="$TASK_FETCHED_STORES $TASK_STORE"
+          ;;
+      esac
+      if scan_commit_subject_for_bead "$TASK_GDIR" "$TASK_CONTAINER" "origin/$TASK_DEFAULT_BRANCH" "$TASK_BEAD_ID" >/dev/null 2>&1; then
+        TASK_MERGE_VERIFIED=1
+      fi
+
+      # ga-tuk26: if the contradiction is now independently PROVEN stale
+      # (contradicted AND the commit really did land), clear the residual
+      # gate:failed/gate:needs-fix labels regardless of the eventual verdict
+      # below (close, or kept for an unrelated reason like partial-scope) —
+      # a bead should never sit there LOOKING contradicted once we have
+      # positive proof it is not. Never runs in the unverified case (stays
+      # maximally conservative — see task_reconciler_verdict).
+      TASK_CONTRADICTION_RESOLVED=0
+      if [ "$TASK_CONTRADICTED" = "1" ] && [ "$TASK_MERGE_VERIFIED" = "1" ]; then
+        TASK_CONTRADICTION_RESOLVED=1
+        log "Task reconciler: $TASK_BEAD_ID contradiction (gate:failed/gate:needs-fix) proven STALE — a commit for this bead is verified in origin/$TASK_DEFAULT_BRANCH (ga-tuk26). Clearing residual labels."
+        if [ "$DRY_RUN" = "1" ]; then
+          log "DRY_RUN=1 — WOULD: bd -C $TASK_STORE label remove $TASK_BEAD_ID gate:failed / gate:needs-fix (ga-tuk26 stale-contradiction clear)"
+        else
+          bd -C "$TASK_STORE" label remove "$TASK_BEAD_ID" "gate:failed" -q 2>/dev/null || true
+          bd -C "$TASK_STORE" label remove "$TASK_BEAD_ID" "gate:needs-fix" -q 2>/dev/null || true
+          bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-tuk26): gate:failed/gate:needs-fix cleared — independently verified a commit for this bead IS in origin/$TASK_DEFAULT_BRANCH (content check, ga-266z8 discipline), proving the coexisting gate:passed reflects the latest cycle and the earlier FAIL-cycle residue was stale." 2>/dev/null || true
         fi
       fi
 

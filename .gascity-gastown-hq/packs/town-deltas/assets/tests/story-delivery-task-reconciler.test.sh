@@ -13,9 +13,21 @@
 #   T4 NO_TASK_BEADS          — bd list returns [] → TASK_COUNT=0, no bd close.
 #   T5 DRY_RUN_SKIPS_CLOSE    — DRY_RUN=1 with a task bead → bd close NOT called.
 #   T6 FORCE_ID_SKIPS_BLOCK   — FORCE_STORY_ID set → reconciler skips entirely.
+#   T7 CONTRADICTED_VERIFIED  — ga-tuk26: gate:passed + gate:failed +
+#                               gate:needs-fix, but a real commit for this bead
+#                               IS in origin/main (content-verified) → residual
+#                               labels cleared AND bd close called.
+#   T8 CONTRADICTED_UNVERIFIED— ga-tuk26: same contradictory label triple, but
+#                               NO commit anywhere verifies it → stays stuck,
+#                               unchanged (fail-safe control — this must NOT
+#                               regress, or the fix becomes "trust the label
+#                               pair alone" in different clothes).
 #
 # This is the ga-tjqe acceptance test: "a regression test simulates a gate:passed
-# task/bug bead and asserts delivery closes it in the same sweep".
+# task/bug bead and asserts delivery closes it in the same sweep". T7/T8 are the
+# ga-tuk26 acceptance test: "a fixture reproducing wa-iochp's exact label set
+# resolves iff independently verifiable; the same fixture without a verifiable
+# commit stays stuck, unchanged."
 
 set -uo pipefail
 
@@ -105,6 +117,15 @@ TASK_BEAD_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","
 STORY_WITH_GATE_JSON='[{"id":"ga-test-story","title":"Add feature X","status":"open","issue_type":null,"labels":["gate:passed","story:approved"]}]'
 DONE_WITH_GATE_JSON='[{"id":"ga-test-done","title":"Old fix","status":"in_progress","issue_type":"task","labels":["gate:passed","story:done"]}]'
 EMPTY_JSON='[]'
+# ga-tuk26: same id as TASK_BEAD_JSON ("ga-test-task") — run_block's synthetic
+# git repo (below) commits with subject scoped to exactly this id, so this
+# fixture IS independently verifiable. Reproduces wa-iochp's real label set
+# (gate:passed + gate:failed + gate:needs-fix + gate:fix-attempt:1).
+CONTRADICTED_VERIFIED_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","labels":["gate:passed","gate:failed","gate:needs-fix","gate:fix-attempt:1","lane:small"]}]'
+# ga-tuk26: a DIFFERENT id ("ga-test-task-nocommit") that run_block's synthetic
+# repo has no commit for — the fail-safe control. Same contradictory labels,
+# but nothing anywhere proves the fail-cycle residue is stale.
+CONTRADICTED_UNVERIFIED_JSON='[{"id":"ga-test-task-nocommit","title":"unrelated task, never merged","status":"in_progress","issue_type":"task","labels":["gate:passed","gate:failed","gate:needs-fix","lane:small"]}]'
 
 # ── T1: Task bead with gate:passed → close called ─────────────────────────────
 run_block "$TASK_BEAD_JSON" 0 ""
@@ -138,6 +159,37 @@ run_block "$TASK_BEAD_JSON" 1 ""
 run_block "$TASK_BEAD_JSON" 0 "ga-some-story"
 ! echo "$LAST_BD" | grep -q "close" && ok "T6 FORCE_ID_SKIPS_BLOCK → no bd close (reconciler skipped)" || nok "T6 force-id-closed" "$LAST_BD"
 [ "${RUN_TASK_COUNT:-0}" = "0" ] && ok "T6 TASK_COUNT=0 (FORCE_STORY_ID skips block)" || nok "T6 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
+
+# ── T7: contradicted but independently VERIFIED → residue cleared + closed ──
+# ga-tuk26 AC1: "a fixture reproducing wa-iochp's exact label set (gate:passed
+# + gate:failed + gate:needs-fix, in_progress) with an independently-verifiable
+# merged commit resolves: stale labels cleared, bd close called."
+run_block "$CONTRADICTED_VERIFIED_JSON" 0 ""
+echo "$LAST_BD" | grep -q 'label remove ga-test-task "\?gate:failed"\?' \
+  && ok "T7 CONTRADICTED_VERIFIED → gate:failed cleared" || nok "T7 gate:failed not cleared" "$LAST_BD"
+echo "$LAST_BD" | grep -q 'label remove ga-test-task "\?gate:needs-fix"\?' \
+  && ok "T7 CONTRADICTED_VERIFIED → gate:needs-fix cleared" || nok "T7 gate:needs-fix not cleared" "$LAST_BD"
+echo "$LAST_BD" | grep -q "close ga-test-task" \
+  && ok "T7 CONTRADICTED_VERIFIED → bd close called (contradiction proven stale)" || nok "T7 bd-close missing" "$LAST_BD"
+[ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T7 TASK_COUNT=1" || nok "T7 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
+
+# ── T8: contradicted, NOT verifiable anywhere → stays stuck, unchanged ──────
+# ga-tuk26 AC2 (fail-safe control): "the SAME fixture WITHOUT a verifiable
+# commit stays stuck, unchanged — proves this isn't 'trust the label pair
+# alone' in different clothes."
+run_block "$CONTRADICTED_UNVERIFIED_JSON" 0 ""
+! echo "$LAST_BD" | grep -q "close ga-test-task-nocommit" \
+  && ok "T8 CONTRADICTED_UNVERIFIED → bd close NOT called (never guess)" || nok "T8 spurious-close" "$LAST_BD"
+! echo "$LAST_BD" | grep -q "label remove ga-test-task-nocommit" \
+  && ok "T8 CONTRADICTED_UNVERIFIED → labels left untouched" || nok "T8 spurious-label-remove" "$LAST_BD"
+# TASK_COUNT is `jq 'length'` on the raw candidate list (set once, before the
+# loop runs — see story-delivery.sh ~line 504) — it reflects how many
+# candidates the QUERY surfaced, not whether the loop acted on them. T1/T5/T7
+# also assert TASK_COUNT=1 for the same reason: one gate:passed, non-story,
+# non-done bead is present in the stubbed `bd list` response. Distinguishing
+# "kept, not closed" from "closed" is what the two assertions above already
+# do (no close call, no label remove) — TASK_COUNT is not that signal.
+[ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T8 TASK_COUNT=1 (candidate found, but kept — not the same as acted)" || nok "T8 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
 
 echo ""
 echo "story-delivery task-reconciler tests: $PASS passed, $FAIL failed"
