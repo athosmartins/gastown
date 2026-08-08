@@ -2769,6 +2769,60 @@ branch_tip_is_merge_commit() {
   fi
 }
 
+# ── ga-y9a1d: BRANCH-CONTENT-COHERENCE (the merge-time safety net) ───────────
+# Confirmed incident (Mayor, 2026-08-08): a P0 fix was submitted to the gate on
+# branch fix/ga-fic5d-delivery-comment-read. Hours later, `git ls-remote` still
+# showed that exact branch name on origin, `gate-status` still looked normal,
+# and no command had ever failed — but the branch's tip on origin was, byte for
+# byte, a DIFFERENT bead's own commit (fix(ga-nawd3): ...), stacked on two more
+# unrelated beads' commits below it (ga-jeicm, ga-hhj7u). The P0 fix itself had
+# been displaced from the ref entirely: `git show <origin-tip>:<file> | grep -c
+# <marker>` was 0, on that branch AND on origin/main. Had a deploy-block alert
+# not prompted a manual check, the gate would have reviewed and MERGED that
+# unrelated content believing it was the P0 — a bead closed as done while the
+# actual fix silently never shipped. Root cause of HOW the ref got reused was
+# never pinned down (name collision in some submission path vs. a worker
+# reusing a stale shared checkout are both plausible — see
+# dog-gatedone-shared-root-commit-hazard for a documented mechanism that
+# produces exactly this shape) — this is the defense that catches the RESULT
+# regardless of mechanism, right before the point of no return (the merge).
+#
+# The bug's own two candidate fixes are both explicitly wrong in isolation:
+# refusing to reuse a branch NAME is too blunt (a marker resubmission
+# legitimately reuses its own branch name — see ga-e2n96 in ga-kyxih's
+# history), and stamping the expected SHA on the marker breaks the legitimate
+# gate auto-rebase/auto-merge (ga-kyxih), which changes the sha ON PURPOSE
+# between attempts. The correct discriminator is CONTENT, keyed on the source
+# BEAD, not the branch name or the sha: does this branch's own new work, the
+# commits unique to it relative to main, actually mention the bead this
+# gate-run claims to be for? A legitimate rebase/merge preserves the original
+# commit's message verbatim (new sha, same text) — passes. A multi-commit fix
+# where only the first commit repeats the bead id — passes (checks "at least
+# one", not "every commit"; a "address review comment" follow-up commit that
+# doesn't repeat the id must not false-positive). A persistent crew/* branch
+# that also carries older, unrelated beads' commits mixed in — passes, as
+# long as ITS current work for THIS bead is present somewhere in the range.
+# Only the real incident's signature — new commits exist, but NONE of them,
+# anywhere in the range, mention the bead at all — trips this.
+#
+# branch_bead_commit_verdict <unique_commit_count> <messages_blob> <bead_id>
+#   Pure (no IO — plain string/count matching, no git call of its own).
+#     skip — count is 0/empty/unparseable (nothing unique to check — an
+#            already-merged or not-yet-diverged branch is Step 4b/Step 0a-4's
+#            job, not this check's; also the fail-open case for a bead_id we
+#            couldn't resolve), or bead is empty.
+#     yes  — bead_id appears somewhere in messages_blob (normal case).
+#     no   — count > 0 but bead_id appears nowhere — ga-y9a1d's signature.
+branch_bead_commit_verdict() {
+  local count="$1" messages="$2" bead="$3"
+  case "$count" in ''|*[!0-9]*|0) printf 'skip'; return 0 ;; esac
+  [ -z "$bead" ] && { printf 'skip'; return 0; }
+  case "$messages" in
+    *"$bead"*) printf 'yes' ;;
+    *)         printf 'no' ;;
+  esac
+}
+
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
 # above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
 # GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
@@ -3220,6 +3274,50 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; the
   fi
 fi
 
+# ── ga-y9a1d: BRANCH-CONTENT-COHERENCE — verify this branch's own new commits
+# actually reference the bead this gate-run claims to be for, before merging.
+# See branch_bead_commit_verdict()'s header comment (above the lib-only guard)
+# for the full incident and reasoning. Runs last among the pre-merge PASS
+# gates, right before the point of no return — merge-base is recomputed fresh
+# here (not reused from Step 4c, which can be stale by merge time; ga-3b8
+# right below re-fetches for the same reason) so this reflects the ACTUAL
+# content about to be merged, including anything Step 4c's auto-rebase/merge
+# changed. Fails OPEN (skips, never blocks) on any git resolution failure —
+# this is a new, additive safety net, not a load-bearing check; it must never
+# itself become a new false-FAIL source (ga-nooaw's own class of bug).
+if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH_SHA" ]; then
+  GATE_Y9A1D_BASE=$(git_rig merge-base "$BRANCH_SHA" "origin/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+  if [ -n "$GATE_Y9A1D_BASE" ]; then
+    GATE_Y9A1D_COUNT=$(git_rig rev-list --count "${GATE_Y9A1D_BASE}..${BRANCH_SHA}" 2>/dev/null || echo "")
+    GATE_Y9A1D_MSGS=$(git_rig log --format='%B' "${GATE_Y9A1D_BASE}..${BRANCH_SHA}" 2>/dev/null || echo "")
+    GATE_Y9A1D_VERDICT=$(branch_bead_commit_verdict "$GATE_Y9A1D_COUNT" "$GATE_Y9A1D_MSGS" "$BEAD_ID")
+    if [ "$GATE_Y9A1D_VERDICT" = "no" ]; then
+      # Diagnostic value-add: surface which OTHER bead(s) the content actually
+      # looks like, so a human doesn't have to re-derive it by hand (the
+      # original incident cost the Mayor a manual git-archaeology session).
+      GATE_Y9A1D_SUSPECTS=$(printf '%s' "$GATE_Y9A1D_MSGS" | grep -oE '\b(ga|wa|dc|lexbh|marketing)-[a-z0-9]{4,7}\b' | sort -u | tr '\n' ' ')
+      OVERALL_VERDICT="FAIL"
+      FAIL_REASONS="Branch $BRANCH's own commits (${GATE_Y9A1D_COUNT} unique vs $DEFAULT_BRANCH) do not reference source bead $BEAD_ID anywhere (ga-y9a1d: branch-content-coherence). This is the exact signature of a branch ref silently reused by unrelated work — nothing else failed, the branch name is intact, but the content is not this bead's. Not merging $BRANCH.${GATE_Y9A1D_SUSPECTS:+ Content instead references: $GATE_Y9A1D_SUSPECTS.} A human must verify: is this bead's real fix still on some other ref (check \`git log --all -S '<known marker text>'\`), or does $BEAD_ID need a fresh submission?"
+      bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-human"                        -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-human:branch-content-mismatch" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Dispatcher (ga-y9a1d): held $BRANCH at merge time — its own commits (${GATE_Y9A1D_COUNT} unique vs $DEFAULT_BRANCH) never mention $BEAD_ID.${GATE_Y9A1D_SUSPECTS:+ Content instead looks like: $GATE_Y9A1D_SUSPECTS.} This is the branch-reused-by-other-work signature (ga-y9a1d) — the gate refused to merge unrelated content believing it was this bead's fix. A human must reconcile: locate the real fix (it may still exist as an unreferenced local commit or a differently-named branch/ref) and resubmit, or confirm this bead needs fresh work." 2>/dev/null || true
+      gc --city "$GC_CITY" mail send mayor \
+        -s "Gate needs-human: branch content mismatch on $BEAD_ID (ga-y9a1d)" \
+        -m "$(printf 'Branch %s (rig %s) reached the gate merge step for bead %s, but its own commits do not reference that bead at all.\n\n%s\n\nThis is the exact incident ga-y9a1d described: a branch ref silently reused by unrelated work, with the branch name intact and nothing else failing. Labeled gate:needs-human on %s; the Pilot will not re-dispatch it.\n\nBead: %s   Rig: %s\nBranch: %s (sha %s, gate run %s)\nBase (merge-base with %s): %s' \
+          "$BRANCH" "$RIG" "$BEAD_ID" "$FAIL_REASONS" "$BEAD_ID" "$BEAD_ID" "$RIG" "$BRANCH" "$BRANCH_SHA" "$GATE_RUN_ID" "$DEFAULT_BRANCH" "$GATE_Y9A1D_BASE")" \
+        2>/dev/null || warn "Could not mail Mayor escalation for branch-content mismatch on $BEAD_ID (ga-y9a1d)"
+      if [ -n "$NOTIFY_AUTHOR" ]; then
+        gc --city "$GC_CITY" mail send "$NOTIFY_AUTHOR" \
+          -s "Your gate submission is held: branch content mismatch on $BEAD_ID (ga-y9a1d)" \
+          -m "$(printf 'Your branch %s reached the gate merge step for bead %s, but its own commits do not reference that bead at all.\n\n%s\n\nNothing to do from your side unless you recognize this — a human is reconciling. If your real fix is still sitting as a local/unpushed commit somewhere, it is not lost: `git log --all -S '"'"'<a distinctive string from your fix>'"'"'` will find it on any ref, including ones never merged.\n\nBead: %s   Rig: %s\nBranch: %s (sha %s, gate run %s)' \
+            "$BRANCH" "$BEAD_ID" "$FAIL_REASONS" "$BEAD_ID" "$RIG" "$BRANCH" "$BRANCH_SHA" "$GATE_RUN_ID")" \
+          2>/dev/null || warn "Could not mail author $NOTIFY_AUTHOR for branch-content mismatch on $BEAD_ID (ga-y9a1d)"
+      fi
+      warn "ga-y9a1d: branch $BRANCH's $GATE_Y9A1D_COUNT unique commit(s) never mention bead $BEAD_ID (suspects: ${GATE_Y9A1D_SUSPECTS:-none found}) — downgrading PASS to FAIL, labeling gate:needs-human."
+    fi
+  fi
+fi
+
 if [ "$OVERALL_VERDICT" = "PASS" ]; then
   log "ALL PASS — proceeding to merge branch $BRANCH → $DEFAULT_BRANCH ..."
 
@@ -3318,10 +3416,45 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
             if git -C "$TMP_MR_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
               local NEW_TIP_MR
               NEW_TIP_MR=$(git -C "$TMP_MR_WT" rev-parse HEAD 2>/dev/null || echo "")
-              if [ -n "$NEW_TIP_MR" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
+              # ga-y9a1d: verify the rebase actually PRESERVED this bead's own
+              # work before trusting it enough to push. `git rebase` silently
+              # DROPS any replayed commit whose patch becomes empty relative
+              # to the new upstream — if this branch's own commit(s) collapse
+              # that way (e.g. unrelated work that just landed on
+              # $DEFAULT_BRANCH happens to make this bead's patch a no-op),
+              # NEW_TIP_MR ends up being $CUR_MAIN verbatim, with zero trace
+              # this branch was ever ahead — confirmed mechanism for the
+              # ga-fic5d incident (branch silently collapsed onto whatever 3
+              # unrelated beads' commits main had at that exact moment, byte
+              # for byte). Below is the belt-and-suspenders post-merge
+              # integrity check's blind spot: it diffs against MAIN_HEAD_SHA,
+              # which gets reassigned to this same post-rebase CUR_MAIN right
+              # after this block — so a collapse here poisons its own later
+              # baseline instead of being caught by it. Catch it HERE,
+              # against the CUR_MAIN captured before this rebase, before any
+              # push happens at all.
+              local NEW_TIP_MR_VERDICT
+              NEW_TIP_MR_VERDICT=$(branch_bead_commit_verdict \
+                "$(git -C "$TMP_MR_WT" rev-list --count "${CUR_MAIN}..${NEW_TIP_MR}" 2>/dev/null || echo "")" \
+                "$(git -C "$TMP_MR_WT" log --format='%B' "${CUR_MAIN}..${NEW_TIP_MR}" 2>/dev/null || echo "")" \
+                "$BEAD_ID")
+              # ga-y9a1d (self-audit catch): require an explicit "yes", not
+              # merely "not no". If this rebase COMPLETELY collapses
+              # (NEW_TIP_MR ends up literally equal to CUR_MAIN — zero
+              # commits unique to the branch, not just zero MATCHING ones),
+              # the range above is empty and the verdict is "skip", which
+              # `!= "no"` would have let through unguarded — the exact
+              # complete-collapse shape this whole fix exists to catch. This
+              # call site already KNOWS the branch was ahead before this
+              # rebase attempt (that's why IS_ANC sent us into this block at
+              # all), so "skip" here is never legitimate the way it can be
+              # at the Step-10 gate (which has no such prior and treats
+              # "skip" as "nothing to check, someone else's job").
+              if [ -n "$NEW_TIP_MR" ] && [ "$NEW_TIP_MR_VERDICT" = "yes" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
                 MR_OK=1
                 log "  Merge-time rebase: pushed $BRANCH → $NEW_TIP_MR"
               else
+                [ "$NEW_TIP_MR_VERDICT" != "yes" ] && err "  Merge-time rebase (ga-y9a1d): rebase onto $CUR_MAIN did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$NEW_TIP_MR_VERDICT) — refusing to push a branch that might silently lose this bead's fix."
                 git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
               fi
             else
@@ -3335,10 +3468,22 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
             if git -C "$TMP_MR_WT" -c user.email="gate-dispatcher@gascity.local" -c user.name="Gate Dispatcher" rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
               local NEW_TIP_MR_SR
               NEW_TIP_MR_SR=$(git -C "$TMP_MR_WT" rev-parse HEAD 2>/dev/null || echo "")
-              if [ -n "$NEW_TIP_MR_SR" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
+              # ga-y9a1d: see the container-rig branch above for the full
+              # rationale — same collapse risk, same fix, self-repo git access.
+              local NEW_TIP_MR_SR_VERDICT
+              NEW_TIP_MR_SR_VERDICT=$(branch_bead_commit_verdict \
+                "$(git -C "$TMP_MR_WT" rev-list --count "${CUR_MAIN}..${NEW_TIP_MR_SR}" 2>/dev/null || echo "")" \
+                "$(git -C "$TMP_MR_WT" log --format='%B' "${CUR_MAIN}..${NEW_TIP_MR_SR}" 2>/dev/null || echo "")" \
+                "$BEAD_ID")
+              # ga-y9a1d (self-audit catch): see the container-rig branch
+              # above for the full rationale — require an explicit "yes",
+              # not merely "not no" (a complete collapse yields "skip", an
+              # empty range, which "!= no" alone would miss).
+              if [ -n "$NEW_TIP_MR_SR" ] && [ "$NEW_TIP_MR_SR_VERDICT" = "yes" ] && git -C "$TMP_MR_WT" push origin "HEAD:refs/heads/$BRANCH" --force-with-lease 2>/dev/null; then
                 MR_OK=1
                 log "  Merge-time rebase (self-repo): pushed $BRANCH → $NEW_TIP_MR_SR"
               else
+                [ "$NEW_TIP_MR_SR_VERDICT" != "yes" ] && err "  Merge-time rebase (self-repo, ga-y9a1d): rebase onto $CUR_MAIN did not verifiably preserve $BRANCH's own commit(s) for bead $BEAD_ID (verdict=$NEW_TIP_MR_SR_VERDICT) — refusing to push a branch that might silently lose this bead's fix."
                 git -C "$TMP_MR_WT" rebase --abort 2>/dev/null || true
               fi
             else
