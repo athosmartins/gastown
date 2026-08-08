@@ -50,6 +50,25 @@ r=$(reconcile_zero_verdict_run_action 30 15 claimed);     [ "$r" = "supersede:re
 r=$(reconcile_zero_verdict_run_action 30 15 '');          [ "$r" = "skip" ] && ok "aged+empty-status → skip (fail-safe, never guess)" || bad "empty status got '$r'"
 r=$(reconcile_zero_verdict_run_action 30 15 reviewing);   [ "$r" = "skip" ] && ok "aged+unrecognized-status → skip (fail-safe)" || bad "unrecognized status got '$r'"
 
+# ── marker_status_from_labels <labels> — ga-i0n83 ambiguity guard ────────────
+# set_gate_status now ADDs before it REMOVEs (ga-i0n83), so an interrupted
+# transition can leave a marker with TWO gate-status:* labels instead of the
+# pre-existing zero-label failure mode. Both must route to the SAME safe
+# "skip" outcome via reconcile_zero_verdict_run_action — never guess between
+# two candidates via a blind first-match pick.
+echo "marker_status_from_labels: exactly-one-match extraction, never a blind first-match guess"
+r=$(marker_status_from_labels 'type:quality-gate-marker gate-status:queued branch:fix/x');
+[ "$r" = "queued" ] && ok "single gate-status label → extracted cleanly (the common case, unchanged)" || bad "single-label got '$r'"
+r=$(marker_status_from_labels 'type:quality-gate-marker branch:fix/x');
+[ "$r" = "" ] && ok "zero gate-status labels → empty (the pre-existing ga-5jyo8 invisible-forever case)" || bad "zero-label got '$r'"
+r=$(marker_status_from_labels 'gate-status:claimed gate-status:queued type:quality-gate-marker');
+[ "$r" = "" ] && ok "TWO gate-status labels (mid-transition, ga-i0n83) → empty, NEVER a blind head-1 guess between claimed/queued" || bad "REGRESSION ga-i0n83: two-label input resolved to '$r' instead of empty — a blind pick could feed reconcile_zero_verdict_run_action a stale status"
+r=$(marker_status_from_labels '');
+[ "$r" = "" ] && ok "empty label string → empty (no crash, no false match)" || bad "empty input got '$r'"
+# End-to-end: the two-label case must reach the SAME safe outcome as zero-label.
+r=$(reconcile_zero_verdict_run_action 30 15 "$(marker_status_from_labels 'gate-status:claimed gate-status:queued')")
+[ "$r" = "skip" ] && ok "end-to-end: two-label marker_status feeds reconcile_zero_verdict_run_action → skip (never supersede:requeue-marker on an ambiguous read)" || bad "REGRESSION ga-i0n83: two-label chain produced '$r', not skip"
+
 # ── dedup_gaterun_action <group_count> <is_newest> — ga-f1ngu ────────────────
 # This is what retires the guard's own claim-receipt bead (gate-status:claimed
 # as of ga-f1ngu) the sweep after a real gate-run bead (gate-status:running)

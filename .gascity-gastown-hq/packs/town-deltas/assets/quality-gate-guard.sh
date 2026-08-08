@@ -193,6 +193,28 @@ reconcile_zero_verdict_run_action() {
   esac
 }
 
+# marker_status_from_labels <labels-string> — pure text extraction (ga-i0n83).
+# Feeds reconcile_zero_verdict_run_action's marker_status arg. Returns the
+# single gate-status:* value IFF exactly one is present in <labels-string>;
+# otherwise empty. Never guesses between ambiguous candidates: a marker
+# mid-transition (set_gate_status now adds the new label BEFORE removing the
+# old one, ga-i0n83) can briefly carry TWO gate-status:* labels — a blind
+# `head -1` pick could feed reconcile_zero_verdict_run_action a stale status
+# and fire supersede:requeue-marker against a marker that isn't actually
+# stranded. Zero matches (the pre-existing invisible-forever case, ga-5jyo8)
+# already collapses to empty the same way — that function's `*)` case already
+# treats empty as a safe no-op, so "ambiguous" and "absent" share one outcome.
+marker_status_from_labels() {
+  local labels="$1" matches n
+  matches=$(printf '%s\n' "$labels" | grep -oE "gate-status:[a-z-]+" || true)
+  n=$(printf '%s\n' "$matches" | grep -c .)
+  if [ "$n" = "1" ]; then
+    printf '%s\n' "$matches" | sed 's/^gate-status://'
+  else
+    printf ''
+  fi
+}
+
 # verdict_count_from_query <rc> <stdout> — pure companion to
 # verdict_bead_count_for_run (ga-jfo7, gate-feedback attempt 2). Maps a `bd list`
 # OUTCOME to a verdict-bead count, or "unknown" when the count cannot be trusted.
@@ -295,11 +317,22 @@ set_gate_status() {
   [ -z "$_id" ] && return 0
   _cur=$(bd -C "$GC_CITY" show "$_id" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]? | select(startswith("gate-status:"))' 2>/dev/null || true)
+  # ga-i0n83: ADD the new label BEFORE removing the old one(s) — the reverse
+  # order (remove-then-add, pre-fix) has a window where an interrupted
+  # transition (crash, Dolt hiccup between the two bd calls) leaves the bead
+  # with ZERO gate-status:* labels: "unreachable by construction" (ga-5jyo8) —
+  # invisible to every dispatcher/guard query that selects by
+  # --label-any gate-status:{...}, undetected for days until a human manually
+  # re-labels it. Add-then-remove trades that for a strictly safer failure
+  # mode: an interrupted transition leaves AT MOST two gate-status labels
+  # (old+new) — still selected by every existing query, still discoverable,
+  # and the exact "duplicate label" shape this function already tolerates/
+  # cleans up (strips ALL gate-status:* down to one) on its next successful run.
+  bd -C "$GC_CITY" label add "$_id" "gate-status:$_new" -q 2>/dev/null || true
   for _lbl in $_cur; do
     [ "$_lbl" = "gate-status:$_new" ] && continue
     bd -C "$GC_CITY" label remove "$_id" "$_lbl" -q 2>/dev/null || true
   done
-  bd -C "$GC_CITY" label add "$_id" "gate-status:$_new" -q 2>/dev/null || true
 }
 
 # classify_inflight_gap1 <status> <has_gate_passed> <has_live_assignee> <branch_merged>
@@ -1615,8 +1648,11 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
 
     # ── ga-jfo7: zero-verdict-bead early check ──────────────────────────────
     # Reused below for logging even when this branch doesn't fire the action.
-    MARKER_STATUS=$(printf '%s\n' "$MARKER_LABELS" \
-      | grep -oE "gate-status:[a-z-]+" | head -1 | sed 's/^gate-status://' || true)
+    # ga-i0n83: routed through marker_status_from_labels (defined above,
+    # alongside reconcile_zero_verdict_run_action) instead of a raw `head -1`
+    # — see that function's docstring for why an ambiguous (0 or 2+) label set
+    # must never be guessed at.
+    MARKER_STATUS=$(marker_status_from_labels "$MARKER_LABELS")
     if [ "$MARKER_ACTIVE" = "1" ]; then
       ZV_TOTAL=$(verdict_bead_count_for_run "$GR_ID")
       case "$ZV_TOTAL" in ''|*[!0-9]*) ZV_TOTAL=1 ;; esac  # unreadable → fail-safe, defer to the existing path below

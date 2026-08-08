@@ -848,6 +848,50 @@ printf '%s\n' $_MOCK_LABELS | grep -qx 'gate-status:passed' && ok "surviving gat
 printf '%s\n' $_MOCK_LABELS | grep -qx 'other:keepme'       && ok "non-gate-status labels left untouched"            || bad "set_gate_status clobbered a non-gate-status label"
 unset -f bd
 
+# (D-unit-2, ga-i0n83) The ADD must run BEFORE the removes — the reverse order
+# (remove-then-add, pre-fix) has a window where an interruption between the two
+# bd calls (crash, Dolt hiccup, launchd timeout kill — NOT a bd exit code, which
+# both orders already tolerate via `|| true`) leaves the bead with ZERO
+# gate-status:* labels: "unreachable by construction" (ga-5jyo8) — invisible to
+# every dispatcher/guard --label-any gate-status:{...} query, undetected for
+# days until a human manually re-labels it. A single failing bd call can't
+# distinguish the two orders (both already swallow it and keep going), so
+# observe the ACTUAL call order instead, via a mock bd that logs every label
+# mutation it sees, in sequence.
+echo "── 8c. set_gate_status ADDs before it REMOVEs (ga-i0n83) ──"
+GC_CITY=/tmp/ga-jhyu-fake-city
+_MOCK_LABELS="gate-status:dispatching"
+_CALL_LOG=""
+bd() {
+  local verb="$3"
+  if [ "$verb" = "show" ]; then
+    local arr="" l
+    for l in $_MOCK_LABELS; do arr="${arr}\"$l\","; done
+    printf '[{"labels":[%s]}]' "${arr%,}"
+    return 0
+  fi
+  if [ "$verb" = "label" ]; then
+    local op="$4" lbl="$6"
+    _CALL_LOG="$_CALL_LOG $op:$lbl"
+    case "$op" in
+      remove) _MOCK_LABELS=$(printf '%s\n' $_MOCK_LABELS | grep -vx "$lbl" | tr '\n' ' ' || true) ;;
+      add)    printf '%s\n' $_MOCK_LABELS | grep -qx "$lbl" || _MOCK_LABELS="$_MOCK_LABELS $lbl" ;;
+    esac
+    return 0
+  fi
+  return 0
+}
+set_gate_status fake-bead-2 queued
+ADD_POS=$(printf '%s\n' $_CALL_LOG | grep -n '^add:gate-status:queued$'      | head -1 | cut -d: -f1)
+REMOVE_POS=$(printf '%s\n' $_CALL_LOG | grep -n '^remove:gate-status:dispatching$' | head -1 | cut -d: -f1)
+[ -n "$ADD_POS" ] && [ -n "$REMOVE_POS" ] && [ "$ADD_POS" -lt "$REMOVE_POS" ] \
+  && ok "add lands BEFORE remove — no window where the bead has zero gate-status labels (ga-i0n83)" \
+  || bad "REGRESSION ga-i0n83: remove ran before (or without) add — reintroduces the zero-gate-status window (ga-5jyo8)"
+# End-state sanity (unchanged behavior): still converges to exactly one label.
+_n=$(printf '%s\n' $_MOCK_LABELS | grep -c '^gate-status:' || true)
+eq "still exactly ONE gate-status:* label once both calls land" "$_n" "1"
+unset -f bd
+
 echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"

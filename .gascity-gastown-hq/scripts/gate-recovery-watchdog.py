@@ -1383,7 +1383,16 @@ def set_gate_status_py(bead_id, new_status):
     """Python mirror of the shell set_gate_status (byte-for-byte SEMANTICS, ga-jhyu):
     strip EVERY gate-status:* label currently on the bead, then add exactly the one
     target — so a bead never leaks two gate-status labels (observed live: done+failed,
-    passed+superseded). Best-effort; never raises."""
+    passed+superseded). Best-effort; never raises.
+
+    ga-i0n83: the ADD runs BEFORE the removes (mirrors the shell twin's fix in
+    quality-gate-guard.sh's set_gate_status). The old remove-then-add order left a
+    window where a crash/Dolt-hiccup between the two bd calls dropped a bead to
+    ZERO gate-status:* labels — unreachable by construction (ga-5jyo8: invisible
+    to every --label-any gate-status:{...} query, undetected for days). Add-first
+    means an interrupted transition can at worst leave two labels (old+new) —
+    still selected by every query, and the exact shape this function already
+    tolerates/cleans up on its next successful run."""
     if not bead_id:
         return
     r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "show", bead_id, "--json"])  # ga-h199q
@@ -1394,11 +1403,11 @@ def set_gate_status_py(bead_id, new_status):
         cur = [l for l in (row.get("labels") or []) if str(l).startswith("gate-status:")]
     except Exception:
         cur = []
+    sh(["bd", "-C", CITY, "label", "add", bead_id, "gate-status:%s" % new_status, "-q"])
     for lbl in cur:
         if lbl == "gate-status:%s" % new_status:
             continue
         sh(["bd", "-C", CITY, "label", "remove", bead_id, lbl, "-q"])
-    sh(["bd", "-C", CITY, "label", "add", bead_id, "gate-status:%s" % new_status, "-q"])
 
 
 def _bead_is_open(bead_id):
@@ -1565,10 +1574,19 @@ def _source_review_state(bead_id, rig_name=""):
     """(resolved, closed, has_reviewing, store) for a marker's source bead — ONE read,
     used by FIX 4 both to decide (close-source-done vs clear-stale-reviewing) and to know
     WHICH store to clear the label in (the source lives in its RIG, not HQ). resolved=
-    False on any failure → FIX 4 fail-safe keeps the marker untouched."""
+    False on any failure → FIX 4 fail-safe keeps the marker untouched.
+
+    ga-i0n83: rig resolution now falls back to _rig_path_by_prefix (matching
+    _source_bead_state's strategy) when rig_name is empty/unrecognized — a
+    non-HQ-rig source is "NOT reliably labeled with their rig" (ga-c1s8), so
+    without this fallback a marker missing/wrong on bead-rig: silently resolved
+    HERE (fail-safe 'keep') while _source_bead_state — called separately by FIX 4
+    for the needs_human signal — WOULD have resolved it. That mismatch gated the
+    whole verdict on the weaker of the two reads, making park-source-needs-human
+    unreachable for exactly the marker shape most likely to need it."""
     if not bead_id:
         return (False, False, False, CITY)
-    rigp = _rig_paths().get(rig_name) if rig_name else None
+    rigp = (_rig_paths().get(rig_name) if rig_name else None) or _rig_path_by_prefix(_bead_id_prefix(bead_id))
     tries = [CITY] + ([rigp] if (rigp and rigp != CITY) else [])
     for st in tries:
         r = sh(["bash", BD_LIST_CACHED, "-C", st, "show", bead_id, "--json"])  # ga-h199q
@@ -1629,23 +1647,42 @@ def _branch_merged_state(branch, rig_name=""):
 
 
 def orphan_marker_verdict(age_sec, min_sec, resolved, source_closed, source_reviewing,
-                          branch_state="unknown"):
+                          branch_state="unknown", source_needs_human=False):
     """PURE decision (no I/O, unit-tested) for FIX 4, on a gate-status:queued marker:
-      'close-source-done'     — source CLOSED **and the branch actually merged** (or is
-                                gone) → the marker is moot; close it (phantom depth).
-      'recover-stranded'      — source CLOSED but the branch EXISTS and is NOT merged →
-                                a FALSE close (the sling-task-janitor closes fix-task
-                                beads as 'orphan' without the branch merging, which used
-                                to make FIX 4 false-close the marker as 'merged' and
-                                STRAND a complete fix — ga-w5agg/ga-d2jil 2026-07-02).
-                                Re-land it, NEVER close.
-      'clear-stale-reviewing' — source OPEN + carries gate:reviewing while the marker
-                                sits QUEUED (contradictory) → leaked label; clear it.
-      'wait'                  — younger than min_sec.
-      'keep'                  — source unreadable / branch state unknown (fail-safe) or
-                                nothing to do — NEVER close on a can't-verify.
+      'close-source-done'      — source CLOSED **and the branch actually merged** (or is
+                                 gone) → the marker is moot; close it (phantom depth).
+      'recover-stranded'       — source CLOSED but the branch EXISTS and is NOT merged →
+                                 a FALSE close (the sling-task-janitor closes fix-task
+                                 beads as 'orphan' without the branch merging, which used
+                                 to make FIX 4 false-close the marker as 'merged' and
+                                 STRAND a complete fix — ga-w5agg/ga-d2jil 2026-07-02).
+                                 Re-land it, NEVER close.
+      'park-source-needs-human'— source still OPEN but carries an explicit human-park
+                                 signal (gate:needs-human*) → NOT covered by
+                                 close-source-done (source isn't closed) — the marker was
+                                 previously left sitting in gate-status:queued/ready/
+                                 claimed FOREVER, silently counted as phantom "in gate"
+                                 depth by the painel/dispatcher (ga-i0n83: "source
+                                 PARKEADO needs-rebase-cleanup" case). Park the marker
+                                 (gate-status:parked-needs-human — the SAME terminal
+                                 status FIX 6 already uses for the analogous
+                                 dead-reviewer-cap escalation) so it stops being counted
+                                 as active-in-gate. NEVER touch the source's own label —
+                                 it's the veto (doctrine: never strip veto-dispatch
+                                 labels); resuming happens by re-submitting a fresh gate
+                                 marker once a human resolves the park (the same recovery
+                                 path quality-gate-guard.sh Step 5a already documents for
+                                 its own parked-needs-human markers).
+      'clear-stale-reviewing'  — source OPEN + carries gate:reviewing while the marker
+                                 sits QUEUED (contradictory) → leaked label; clear it.
+      'wait'                   — younger than min_sec.
+      'keep'                   — source unreadable / branch state unknown (fail-safe) or
+                                 nothing to do — NEVER close on a can't-verify.
     branch_state ∈ {'merged','unmerged','missing','unknown'}: a source being closed does
-    NOT prove the work landed — the branch's ancestry vs origin/main is the truth."""
+    NOT prove the work landed — the branch's ancestry vs origin/main is the truth.
+    source_needs_human takes priority over source_reviewing when both are true (mirrors
+    the ga-c1s8 circuit-break carve-out precedence already used by FIX 2/5/9: an explicit
+    human park always wins over a merely-stale automatic signal)."""
     if age_sec < min_sec:
         return "wait"
     if not resolved:
@@ -1656,6 +1693,8 @@ def orphan_marker_verdict(age_sec, min_sec, resolved, source_closed, source_revi
         if branch_state == "unmerged":
             return "recover-stranded"    # real branch, not merged → stranded fix, never false-close
         return "keep"                    # unknown → fail-safe, NEVER false-close as 'merged'
+    if source_needs_human:
+        return "park-source-needs-human"
     if source_reviewing:
         return "clear-stale-reviewing"
     return "keep"
@@ -2457,12 +2496,14 @@ def _requeue_run_after_frozen_kill(killed_session, sid, now, rstate, open_runnin
 
 def reap_orphan_and_stale_markers(now):
     """FIX 4: for each open gate-status:queued/ready/claimed marker older than
-    ORPHAN_MARKER_MIN_MINUTES, either close it (SOURCE already closed → orphaned/phantom
-    depth) or clear a leaked gate:reviewing on its OPEN source (the head-of-line
-    STARVATION root — a reviewer drained during startup and left the label, so the
-    dispatcher skips re-dispatch forever). FIX 1/2 don't cover this (they handle
-    running-run reaps + gate-status:error). Bounded, dry-run-aware, fully fail-safe:
-    an unreadable source → keep; a query failure → skip the whole sweep."""
+    ORPHAN_MARKER_MIN_MINUTES: close it (SOURCE already closed → orphaned/phantom
+    depth), park it (SOURCE still open but explicitly human-parked, gate:needs-human*
+    — ga-i0n83: was previously left as silent phantom-in-gate depth forever), or clear
+    a leaked gate:reviewing on its OPEN source (the head-of-line STARVATION root — a
+    reviewer drained during startup and left the label, so the dispatcher skips
+    re-dispatch forever). FIX 1/2 don't cover this (they handle running-run reaps +
+    gate-status:error). Bounded, dry-run-aware, fully fail-safe: an unreadable source →
+    keep; a query failure → skip the whole sweep."""
     if not GRW_ENABLED or not GRW_REAP_ORPHAN_ENABLED:
         return
     r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "--all", "-l", "type:quality-gate-marker",  # ga-h199q
@@ -2486,13 +2527,18 @@ def reap_orphan_and_stale_markers(now):
         src = _label_value(m, "source-bead:")
         rig = _label_value(m, "bead-rig:") or _label_value(m, "rig:")
         resolved, closed, reviewing, store = _source_review_state(src, rig)
+        # ga-i0n83: a SEPARATE lookup (not folded into _source_review_state, which two
+        # other call sites also use unchanged) — cheap, since _source_bead_state routes
+        # through the SAME read-cache shim (ga-h199q) and the source was almost
+        # certainly just fetched into that cache by the call above.
+        _, _, needs_human = _source_bead_state(src, rig)
         branch = _label_value(m, "branch:")
         # Pay for the git-ancestry check ONLY when the source is CLOSED — the sole case
         # where 'source closed' could be a FALSE 'merged' (the sling-task-janitor closes
         # fix-task beads without the branch landing). Otherwise it's irrelevant.
         branch_state = _branch_merged_state(branch, rig) if (resolved and closed) else "unknown"
         v = orphan_marker_verdict(age, ORPHAN_MARKER_MIN_MINUTES * 60, resolved, closed,
-                                  reviewing, branch_state)
+                                  reviewing, branch_state, needs_human)
         if v in ("wait", "keep"):
             continue
         if GRW_DRY_RUN:
@@ -2522,6 +2568,27 @@ def reap_orphan_and_stale_markers(now):
             _recovery_ledger("close_orphan_marker", {"marker": mid, "source_bead": src, "branch": branch, "branch_state": branch_state, "age_min": age // 60})
             notify("Gate self-heal: marker órfão fechado (%s — fonte %s concluída, merge confirmado). Profundidade-fantasma removida." % (mid, src), 3)
             print("[watchdog] FIX4 CLOSED orphan marker=%s (source %s closed, branch %s, %dm) — phantom depth removed" % (mid, src, branch_state, age // 60), flush=True)
+        elif v == "park-source-needs-human":
+            # ga-i0n83: source is still OPEN (not closed — that's close-source-done's
+            # job above) but carries an explicit human park (gate:needs-human*). This
+            # marker was previously left sitting in queued/ready/claimed FOREVER,
+            # silently counted as phantom "in gate" depth by the painel/dispatcher —
+            # the "source PARKEADO needs-rebase-cleanup" case from the original report.
+            # Reuse the SAME terminal status FIX 6 already uses for its own park
+            # escalation (gate-status:parked-needs-human) — never invent new vocabulary.
+            # Never touch the source's own gate:needs-human label: it's the veto
+            # (doctrine: never strip veto-dispatch labels). Recovery path is the one
+            # quality-gate-guard.sh Step 5a already documents: re-submit a fresh gate
+            # marker once a human resolves the park.
+            cur_status = _label_value(m, "gate-status:") or "?"
+            set_gate_status_py(mid, "parked-needs-human")
+            sh(["bd", "-C", CITY, "comment", mid,
+                "gate-recovery-watchdog FIX4-park: source %s carries gate:needs-human (explicit human park) while this marker sat gate-status:%s for %dm — parking the marker (gate-status:parked-needs-human) so the dispatcher stops re-picking it and the painel stops counting it as active-in-gate. Source label untouched (it's the veto, ga-i0n83) — re-submit a fresh gate marker once the park is resolved."
+                % (src, cur_status, age // 60)], timeout=25)
+            _recovery_ledger("park_source_needs_human_marker",
+                             {"marker": mid, "source_bead": src, "prior_status": cur_status, "age_min": age // 60})
+            notify("Gate self-heal: marker %s parkeado (fonte %s aguardando decisão humana) — não conta mais como 'em gate' fantasma." % (mid, src), 3)
+            print("[watchdog] FIX4 PARKED marker=%s (source %s needs-human, was gate-status:%s, %dm) — removed from active-in-gate count" % (mid, src, cur_status, age // 60), flush=True)
         else:  # clear-stale-reviewing
             sh(["bd", "-C", store, "label", "remove", src, "gate:reviewing", "-q"], timeout=20)
             sh(["bd", "-C", store, "comment", src,
@@ -3658,6 +3725,55 @@ def _selftest():
     ok(orphan_marker_verdict(572 * 60, M, True, False, True) == "clear-stale-reviewing", "old + source OPEN + gate:reviewing → clear stale (the wa-ya17c case)")
     ok(orphan_marker_verdict(572 * 60, M, True, False, False) == "keep", "old + source open + no reviewing → keep (nothing stale)")
     ok(orphan_marker_verdict(600 * 60, M, False, False, False) == "keep", "source UNREADABLE → keep (fail-safe, never blind-close)")
+    # ga-i0n83: source OPEN + explicit human park (gate:needs-human*) — the marker was
+    # previously left sitting queued/ready/claimed forever as silent phantom-in-gate
+    # depth (the "source PARKEADO needs-rebase-cleanup" case from the original report).
+    ok(orphan_marker_verdict(572 * 60, M, True, False, False, "unknown", True) == "park-source-needs-human",
+       "old + source OPEN + needs-human (explicit park) → park the marker, stop counting as active-in-gate (ga-i0n83)")
+    ok(orphan_marker_verdict(572 * 60, M, True, False, True, "unknown", True) == "park-source-needs-human",
+       "needs-human WINS over reviewing when both present (mirrors the ga-c1s8 circuit-break carve-out precedence)")
+    ok(orphan_marker_verdict(9 * 60, M, True, False, False, "unknown", True) == "wait",
+       "needs-human still respects the young-marker spin-up window (9m<15m)")
+    ok(orphan_marker_verdict(600 * 60, M, True, True, False, "merged", True) == "close-source-done",
+       "source CLOSED + branch merged WINS over needs-human (closed-and-landed is decisive regardless of a stale park label)")
+    ok(orphan_marker_verdict(600 * 60, M, False, False, False, "unknown", True) == "keep",
+       "source UNREADABLE still fail-safes to keep even if needs_human was somehow True (can't-verify wins)")
+    # ga-i0n83 (Python twin of the shell set_gate_status fix): the ADD must run
+    # BEFORE the removes — an interruption (crash/Dolt hiccup) between the two
+    # bd calls must never leave a bead with ZERO gate-status:* labels
+    # (unreachable by construction, ga-5jyo8). A single failing bd call can't
+    # distinguish the two orders (both already swallow a bad returncode via
+    # sh()'s own exception handling and keep going), so observe the ACTUAL call
+    # order via a fake sh() that logs every subprocess invocation it sees.
+    _sgs_calls = []
+    def _fake_sh_sgs(args, timeout=20, stdin=None):
+        _sgs_calls.append(list(args))
+        if len(args) > 4 and args[4] == "show":
+            return subprocess.CompletedProcess(args=args, returncode=0,
+                stdout='[{"labels":["gate-status:dispatching","other:keepme"]}]')
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="")
+    _real_sh_sgs = globals()["sh"]
+    try:
+        globals()["sh"] = _fake_sh_sgs
+        set_gate_status_py("fake-bead-3", "queued")
+        label_calls = [c for c in _sgs_calls if len(c) > 3 and c[3] == "label"]
+        add_idx = next((i for i, c in enumerate(label_calls) if c[4] == "add"), None)
+        remove_idx = next((i for i, c in enumerate(label_calls) if c[4] == "remove"), None)
+        ok(add_idx is not None and remove_idx is not None and add_idx < remove_idx,
+           "set_gate_status_py ADDs before it REMOVEs (ga-i0n83, Python twin) — no zero-gate-status window")
+    finally:
+        globals()["sh"] = _real_sh_sgs
+    # ga-i0n83: _source_review_state must resolve rigs the SAME way
+    # _source_bead_state does (prefix fallback) — without this, FIX 4's
+    # needs_human read (via _source_bead_state, called separately in
+    # reap_orphan_and_stale_markers) can resolve a source that
+    # _source_review_state's weaker resolved= flag then discards, making
+    # park-source-needs-human unreachable for exactly the marker shape most
+    # likely to need it (a non-HQ-rig source missing/wrong on bead-rig:,
+    # ga-c1s8). Structural check (not a full mock — both functions shell out
+    # the same way): the two must stay textually in sync on rig resolution.
+    ok("_rig_path_by_prefix(_bead_id_prefix(" in inspect.getsource(_source_review_state),
+       "_source_review_state falls back to _rig_path_by_prefix like _source_bead_state does (ga-i0n83) — without this the needs_human signal FIX 4 computes separately can never reach a verdict for a source _source_review_state alone couldn't resolve")
     # _branch_merged_state (shared by FIX 4 + FIX 9) — ga-7b19e attempt 3 root-cause fix.
     # GATE-FEEDBACK (attempt 2 FAIL): sh() returning None (subprocess exception/timeout)
     # on the rev-parse call fell into the SAME branch as a confirmed-absent ref, so a
