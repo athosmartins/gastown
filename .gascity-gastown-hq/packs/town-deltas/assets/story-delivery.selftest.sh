@@ -170,6 +170,58 @@ eq "multiple merge comments: picks the LAST (most recent) sha" "${INFO#*$'\t'}" 
 rc1 extract_gate_merge_info "Quality gate PASSED. Branch fix/x could not determine rig automatically."
 rc1 extract_gate_merge_info ""
 
+# ── ga-fic5d: A LINHA QUEBRADA — o caso que deixou o bug passar por aqui ──────
+# Todos os fixtures acima são de UMA LINHA SÓ, e por isso passavam mesmo com o
+# defeito presente. Em produção o comentário do gate é longo, e `bd comments`
+# (o canal que story-delivery usava para lê-lo) quebra o texto em ~80 colunas —
+# a quebra caía exatamente entre "merged to" e "<rig>/<branch> (sha=…)", então
+# o regex NUNCA casava e toda entrega travava com "no gate merge comment found".
+#
+# Este teste fixa as DUAS metades do contrato:
+#   (a) com a quebra, extract_gate_merge_info NÃO deve inventar um resultado —
+#       falha honesta é correta, a função só vê o texto que recebe;
+#   (b) e é por isso que o CHAMADOR tem de ler por --json (não formatado). O
+#       guard de fonte abaixo prova que ele lê.
+BROKEN_COMMENT="Quality gate PASSED. Branch crew/oracle/wa-8ok7u merged to
+whatsapp_automation/main (sha=fc40e581f79635ad5f0e33c76a51a7438ade7743) via autonomous gate."
+rc1 extract_gate_merge_info "$BROKEN_COMMENT"
+
+# A mesma linha ÍNTEGRA (como o --json entrega) tem de casar — senão o conserto
+# não serviu de nada.
+WHOLE_COMMENT="Quality gate PASSED. Branch crew/oracle/wa-8ok7u merged to whatsapp_automation/main (sha=fc40e581f79635ad5f0e33c76a51a7438ade7743) via autonomous gate."
+INFO=$(extract_gate_merge_info "$WHOLE_COMMENT")
+eq "linha íntegra (via --json): rig/branch" "${INFO%%$'\t'*}" "whatsapp_automation/main"
+eq "linha íntegra (via --json): sha"        "${INFO#*$'\t'}"  "fc40e581f79635ad5f0e33c76a51a7438ade7743"
+
+# DRIFT-GUARD: o chamador precisa continuar lendo por um canal NÃO formatado.
+# Se alguém voltar a alimentar extract_gate_merge_info com `bd comments`, o bug
+# ressurge inteiro e silenciosamente — nenhum teste de unidade acima o pegaria.
+if grep -qE 'STORY_COMMENTS_TEXT=\$\(bd -C "\$STORY_STORE" show .* --json --include-comments' "$SCRIPT" 2>/dev/null; then
+  ok "merge-verification lê comentários por --json (não pelo formatado)"
+else
+  bad "merge-verification NÃO lê por --json — o bug ga-fic5d ressuscitou (bd comments quebra a linha)"
+fi
+
+# SEGUNDO sítio, achado varrendo o idioma e não o sintoma: a derivação do RIG
+# ("merged to <rig>/main") lia pelo mesmo canal formatado. Com a quebra caindo no
+# "merged to", RIG saía vazio e a entrega falhava ANTES da verificação de merge —
+# um modo de falha diferente, mesma causa. Guardar os dois separadamente: consertar
+# um e deixar o outro foi exatamente como este bug sobreviveu ao primeiro passe.
+if grep -qE '_SD_COMMENTS=\$\(bd -C "\$STORY_STORE" show .* --json --include-comments' "$SCRIPT" 2>/dev/null; then
+  ok "derivação do RIG lê comentários por --json (não pelo formatado)"
+else
+  bad "derivação do RIG NÃO lê por --json — segundo sítio do ga-fic5d regrediu"
+fi
+
+# E os fallbacks para o canal formatado DEVEM continuar existindo: se o JSON
+# render vazio (bd antigo, jq ausente, Dolt fora), o pior caso tem de ser o bug
+# conhecido — nunca um resultado vazio silencioso por um caminho novo.
+if [ "$(grep -c 'comments "\$STORY_ID" 2>/dev/null || echo ""' "$SCRIPT" 2>/dev/null)" -ge 2 ]; then
+  ok "ambos os sítios mantêm fallback explícito para o canal formatado"
+else
+  bad "fallback para o canal formatado sumiu — falha do JSON viraria vazio silencioso"
+fi
+
 # A "merged to X/Y" mention that ISN'T immediately followed by "(sha=...)"
 # must not false-positive — e.g. a comment discussing gate-sha-failed (the sha
 # that FAILED, not what merged) in prose near an unrelated "merged to" phrase.
