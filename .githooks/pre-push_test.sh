@@ -386,6 +386,99 @@ local_sha=$(get_sha HEAD)
 assert_block "Default-branch push touching orphan tree blocked" run_hook "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
 cleanup
 
+# Tests 25-29 mirror 20-24 exactly, but for the second orphan-tree guard
+# added by ga-oj73m: outer-root scripts/ (repo root), which shadows the
+# canonical .gascity-gastown-hq/scripts/ deployed tree via the same
+# git-worktree-nested-city-path trap as packs/town-deltas/.
+
+# Test 25: New branch adding a file under scripts/ (orphan, repo root) —
+# blocked. Exercises the merge-base range path (remote_sha=zero).
+echo "Test 25: New branch adding a file under scripts/ (orphan) — blocked"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b fix/ga-99999-scripts-orphan-add >/dev/null 2>&1
+mkdir -p scripts
+echo "orphan script" > scripts/new-script.sh
+git add scripts/new-script.sh && git commit -m "add orphan script" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+assert_block "New file under scripts/ blocked" run_hook "refs/heads/fix/ga-99999-scripts-orphan-add" "$local_sha" "refs/heads/fix/ga-99999-scripts-orphan-add" "0000000000000000000000000000000000000000"
+cleanup
+
+# Test 26: Same shape, but under .gascity-gastown-hq/scripts/ (the
+# CANONICAL tree) — allowed. Regression test for the anchor: a naive
+# unanchored match on "scripts/" would false-positive here.
+echo "Test 26: New branch adding a file under .gascity-gastown-hq/scripts/ (canonical) — allowed"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b fix/ga-99999-scripts-canonical-add >/dev/null 2>&1
+mkdir -p .gascity-gastown-hq/scripts
+echo "canonical script" > .gascity-gastown-hq/scripts/new-script.sh
+git add .gascity-gastown-hq/scripts/new-script.sh && git commit -m "add canonical script" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+assert_pass "New file under .gascity-gastown-hq/scripts/ allowed" run_hook "refs/heads/fix/ga-99999-scripts-canonical-add" "$local_sha" "refs/heads/fix/ga-99999-scripts-canonical-add" "0000000000000000000000000000000000000000"
+cleanup
+
+# Test 27: Deleting a pre-existing file from scripts/ (cleanup) — allowed.
+# Exercises the remote_sha..local_sha range path plus --diff-filter=ACM
+# excluding pure deletions.
+echo "Test 27: Deleting a file from scripts/ (cleanup) — allowed"
+setup_repos
+cd "$TMPDIR/local"
+mkdir -p scripts
+echo "stale script" > scripts/stale.sh
+git add scripts/stale.sh && git commit -m "pre-existing orphan file" >/dev/null 2>&1
+# Bypass needed here: this is test SETUP (establishing pre-existing remote
+# state), not the behavior under test — the real installed hook would
+# otherwise correctly block this push too, since it's an ADD.
+GT_SKIP_ORPHAN_TREE_GUARD=1 git push origin "$DEFAULT_BRANCH" >/dev/null 2>&1
+remote_sha=$(get_sha HEAD)
+git rm scripts/stale.sh >/dev/null 2>&1
+git commit -m "cleanup: remove stale orphan file" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+assert_pass "Deleting orphan-tree file allowed" run_hook "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+# Test 28: GT_SKIP_ORPHAN_TREE_GUARD=1 bypasses the scripts/ guard too (same
+# bypass var as packs/town-deltas/ — one escape hatch for both trees).
+echo "Test 28: GT_SKIP_ORPHAN_TREE_GUARD=1 bypasses the scripts/ guard"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b fix/ga-99999-scripts-bypass >/dev/null 2>&1
+mkdir -p scripts
+echo "orphan script" > scripts/new-script.sh
+git add scripts/new-script.sh && git commit -m "add orphan script" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+GT_SKIP_ORPHAN_TREE_GUARD=1 assert_pass "Bypass env var allows scripts/ orphan-tree push" run_hook "refs/heads/fix/ga-99999-scripts-bypass" "$local_sha" "refs/heads/fix/ga-99999-scripts-bypass" "0000000000000000000000000000000000000000"
+cleanup
+
+# Test 29: Default-branch push touching scripts/ (orphan) — still blocked.
+# Proves the content guard applies independent of the branch-name allowlist.
+echo "Test 29: Default-branch push touching scripts/ (orphan) — blocked"
+setup_repos
+cd "$TMPDIR/local"
+remote_sha=$(get_sha HEAD)
+mkdir -p scripts
+echo "orphan on main" > scripts/direct.sh
+git add scripts/direct.sh && git commit -m "oops direct to main" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+assert_block "Default-branch push touching scripts/ orphan tree blocked" run_hook "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+# Test 30: A push touching BOTH orphan trees at once still blocks (on the
+# first-checked tree, packs/town-deltas/) rather than erroring or only
+# reporting one arbitrarily — proves the two checks compose safely.
+echo "Test 30: Push touching both orphan trees at once — still blocked"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b fix/ga-99999-both-orphans >/dev/null 2>&1
+mkdir -p packs/town-deltas/assets scripts
+echo "orphan 1" > packs/town-deltas/assets/a.sh
+echo "orphan 2" > scripts/b.sh
+git add packs/town-deltas/assets/a.sh scripts/b.sh && git commit -m "touch both orphan trees" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+assert_block "Push touching both orphan trees blocked" run_hook "refs/heads/fix/ga-99999-both-orphans" "$local_sha" "refs/heads/fix/ga-99999-both-orphans" "0000000000000000000000000000000000000000"
+cleanup
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [[ $FAIL -gt 0 ]]; then
