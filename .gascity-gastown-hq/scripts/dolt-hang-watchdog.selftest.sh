@@ -87,8 +87,15 @@ fi
 # Por isso os asserts abaixo rodam SEM override de veto-file, que e o caso real. ──
 echo "ga-153cq: DRY_RUN e side-effect-free de ponta a ponta (sem override de estado)"
 if [ -f "$SRC" ]; then
-  # (a) ordem no fonte: a interceptacao do DRY_RUN tem de vir ANTES do write e dos notify
-  _dry_ln=$(grep -n 'DOLT_WATCHDOG_DRY_RUN:-0' "$SRC" | head -1 | cut -d: -f1)
+  # (a) ordem no fonte: a interceptacao do DRY_RUN tem de vir ANTES do write e dos notify.
+  # ga-153cq gate-FAIL 2: isto costumava dar grep em 'DOLT_WATCHDOG_DRY_RUN:-0', que
+  # apos o fix vira a definicao da variavel DRY_RUN la no topo do arquivo — sempre
+  # "antes" de qualquer coisa por construcao, o que teria tornado este assert
+  # verdadeiro pra sempre e mudo (nao prova mais nada sobre O GATE DA SECAO DE VETO
+  # especificamente). Agora ha 4 call-sites de `if is_dry_run` (recuperacao saudavel,
+  # saturacao, escrita de strike, veto/restart, nessa ordem linear no arquivo) — o
+  # ULTIMO e o da secao de veto, entao pega o ultimo, nao o primeiro.
+  _dry_ln=$(grep -n 'if is_dry_run' "$SRC" | tail -1 | cut -d: -f1)
   _wr_ln=$(grep -n 'echo "\$_vetoes" > "\$CPU_VETO_FILE"' "$SRC" | head -1 | cut -d: -f1)
   _nt_ln=$(grep -n 'notify -p [45] -t .Dolt hang-watchdog.' "$SRC" | head -1 | cut -d: -f1)
   if [ -n "$_dry_ln" ] && [ -n "$_wr_ln" ] && [ "$_dry_ln" -lt "$_wr_ln" ]; then
@@ -103,20 +110,28 @@ if [ -f "$SRC" ]; then
   fi
 
   # (b) comportamento real: dry run SEM override de veto-file nao pode criar/mexer no arquivo
+  # ga-153cq gate-FAIL 2: precisa de DOLT_WATCHDOG_MAX_STRIKES=1 agora — antes, estas
+  # 3 chamadas alcancavam o ramo de veto por ACUMULAR no STRIKES_FILE scratch entre
+  # as 3 (1, depois 2, depois 3=MAX_STRIKES). Mas isso so funcionava por causa do
+  # PROPRIO bug do blocking-issue-1 (a escrita de strike era incondicional mesmo sob
+  # DRY_RUN=1) — com esse bug corrigido, um dry run nunca mais persiste strike
+  # nenhum, entao as 3 chamadas releriam sempre o mesmo "0" e nunca acumulariam.
+  # MAX_STRIKES=1 faz CADA chamada alcancar "confirmado" sozinha, sem depender de
+  # acumulo — e continua sem tocar o contador real (e disso que este teste trata).
   _real_veto="/tmp/dolt-hang-watchdog.cpuveto"
   _had=$([ -f "$_real_veto" ] && cat "$_real_veto" 2>/dev/null || echo "__ausente__")
   _tmpd=$(mktemp -d)
-  env DOLT_WATCHDOG_DRY_RUN=1 \
+  env DOLT_WATCHDOG_DRY_RUN=1 DOLT_WATCHDOG_MAX_STRIKES=1 \
       DOLT_WATCHDOG_LOG="$_tmpd/l" DOLT_WATCHDOG_STRIKES_FILE="$_tmpd/s" \
       DOLT_WATCHDOG_PROBE_TIMEOUT=1 DOLT_WATCHDOG_SERVE_CONFIRM=2 BEADS_DOLT_PORT=1 \
       DOLT_WATCHDOG_CPU_ALIVE_PCT=0 \
       bash "$SRC" >/dev/null 2>&1
-  env DOLT_WATCHDOG_DRY_RUN=1 \
+  env DOLT_WATCHDOG_DRY_RUN=1 DOLT_WATCHDOG_MAX_STRIKES=1 \
       DOLT_WATCHDOG_LOG="$_tmpd/l" DOLT_WATCHDOG_STRIKES_FILE="$_tmpd/s" \
       DOLT_WATCHDOG_PROBE_TIMEOUT=1 DOLT_WATCHDOG_SERVE_CONFIRM=2 BEADS_DOLT_PORT=1 \
       DOLT_WATCHDOG_CPU_ALIVE_PCT=0 \
       bash "$SRC" >/dev/null 2>&1
-  env DOLT_WATCHDOG_DRY_RUN=1 \
+  env DOLT_WATCHDOG_DRY_RUN=1 DOLT_WATCHDOG_MAX_STRIKES=1 \
       DOLT_WATCHDOG_LOG="$_tmpd/l" DOLT_WATCHDOG_STRIKES_FILE="$_tmpd/s" \
       DOLT_WATCHDOG_PROBE_TIMEOUT=1 DOLT_WATCHDOG_SERVE_CONFIRM=2 BEADS_DOLT_PORT=1 \
       DOLT_WATCHDOG_CPU_ALIVE_PCT=0 \
@@ -130,6 +145,117 @@ if [ -f "$SRC" ]; then
   rm -rf "$_tmpd"
 else
   bad "nao achei o script ao lado — asserts de DRY_RUN nao rodaram"
+fi
+
+# ── ga-153cq gate-FAIL 2: o teste acima protegia o contador de VETO contra
+# escrita real, mas ainda passava DOLT_WATCHDOG_STRIKES_FILE pra um scratch dir —
+# ou seja, protegia exatamente o contador que este bloco existe pra checar. O
+# reviewer confirmou por busca no repo: o UNICO lugar que pareia DRY_RUN=1 com
+# um override de STRIKES era este proprio selftest. Nenhum plist/wrapper real
+# da esse override — entao o uso "natural" (`DOLT_WATCHDOG_DRY_RUN=1 bash
+# dolt-hang-watchdog.sh`, exatamente o caso de uso documentado no topo do
+# arquivo) escreve no MESMO /tmp/dolt-hang-watchdog.strikes que o cron real de
+# 60s le. Este bloco testa isso de verdade — SEM overridar STRIKES_FILE — e
+# protege o arquivo real com snapshot+restore (trap) pra nao deixar o
+# contador de producao pior do que achou, mesmo que o codigo sob teste esteja
+# quebrado (o proprio ponto do teste). Um `gc` falso no PATH torna probe_ok()
+# deterministico (sem race contra latencia real do `gc dolt health`, ao
+# contrario do teste acima que depende de PROBE_TIMEOUT=1 vencer essa corrida). ──
+echo "ga-153cq gate-FAIL 2: DRY_RUN e side-effect-free tambem pro contador de STRIKES (sem override, caminho real)"
+if [ -f "$SRC" ]; then
+  _tmpd2=$(mktemp -d)
+  mkdir -p "$_tmpd2/bin"
+  cat > "$_tmpd2/bin/gc" <<'FAKE'
+#!/usr/bin/env bash
+# Fake `gc`: forca probe_ok() a FALHAR de forma deterministica (unreachable),
+# sem depender de vencer corrida nenhuma contra o `gc dolt health` de verdade.
+if [ "${1:-}" = "dolt" ] && [ "${2:-}" = "health" ]; then
+  echo '{"server":{"reachable":false}}'
+  exit 0
+fi
+exit 1
+FAKE
+  chmod +x "$_tmpd2/bin/gc"
+
+  _real_strikes="/tmp/dolt-hang-watchdog.strikes"
+  _snap=$([ -f "$_real_strikes" ] && cat "$_real_strikes" 2>/dev/null || echo "__ausente__")
+  _restore_real_strikes() {
+    if [ "$_snap" = "__ausente__" ]; then rm -f "$_real_strikes"; else echo "$_snap" > "$_real_strikes"; fi
+  }
+  trap _restore_real_strikes EXIT
+
+  # DOLT_WATCHDOG_MAX_STRIKES=1 so faz ESTA invocacao decidir "confirmado" em 1
+  # tiro (alcanca o ramo mais fundo do DRY_RUN, o que o gate-FAIL 2 relatou) sem
+  # precisar de 3 chamadas — o override e so do LIMIAR de decisao desta run, nao
+  # muda o que fica de fato gravado no contador real.
+  env PATH="$_tmpd2/bin:$PATH" \
+      DOLT_WATCHDOG_DRY_RUN=1 DOLT_WATCHDOG_MAX_STRIKES=1 \
+      DOLT_WATCHDOG_LOG="$_tmpd2/l" \
+      DOLT_WATCHDOG_SERVE_CONFIRM=2 BEADS_DOLT_PORT=1 \
+      bash "$SRC" >/dev/null 2>&1
+  _now=$([ -f "$_real_strikes" ] && cat "$_real_strikes" 2>/dev/null || echo "__ausente__")
+  [ "$_snap" = "$_now" ] && ok "dry run confirmado (sem override de STRIKES_FILE) NAO tocou o contador real ($_snap)" \
+                         || bad "ga-153cq regressao: dry run avancou o contador REAL de strikes de producao ($_snap -> $_now)"
+  grep -qE 'DRY-RUN: would (advance strike counter|kill -QUIT)' "$_tmpd2/l" 2>/dev/null \
+    && ok "dry run REPORTA a simulacao de strike (nao ficou mudo)" \
+    || bad "dry run nao reportou nada sobre o strike simulado — perde o valor de diagnostico"
+  _restore_real_strikes
+  trap - EXIT
+  rm -rf "$_tmpd2"
+else
+  bad "nao achei o script ao lado — asserts de STRIKES/DRY_RUN nao rodaram"
+fi
+
+# ── ga-153cq gate-FAIL 2, blocking issue 2: os ramos de RECUPERACAO (saude
+# provada, saturacao provada) tambem limpavam STRIKES/CPU_VETO_FILE sem checar
+# DRY_RUN — mesma classe, variavel diferente, mesmo arquivo, mesmo commit que
+# so consertou a escrita de strike. Nao arma nada destrutivo (so reseta um
+# contador de seguranca pra MAIS cautela, nunca menos) mas ainda mente sob a
+# flag que promete zero efeito colateral. Testado 100% isolado (arquivos
+# scratch com sentinela pre-existente + `gc` falso) porque este ramo especifico
+# exige um probe_ok() BEM-SUCEDIDO — nao ha razao pra depender da saude real do
+# Dolt neste host no momento exato em que o selftest roda. ──
+echo "ga-153cq gate-FAIL 2 (blocking issue 2): ramo de recuperacao saudavel nao limpa STRIKES/veto sob DRY_RUN"
+if [ -f "$SRC" ]; then
+  _tmpd3=$(mktemp -d)
+  mkdir -p "$_tmpd3/bin"
+  cat > "$_tmpd3/bin/gc" <<'FAKE'
+#!/usr/bin/env bash
+# Fake `gc`: forca probe_ok() a SUCEDER de forma deterministica (saudavel),
+# pra exercitar o ramo de recuperacao sem depender da saude real do Dolt.
+if [ "${1:-}" = "dolt" ] && [ "${2:-}" = "health" ]; then
+  echo '{"server":{"reachable":true}}'
+  exit 0
+fi
+exit 1
+FAKE
+  chmod +x "$_tmpd3/bin/gc"
+  echo 2 > "$_tmpd3/s"   # sentinela: contador de strikes PRE-EXISTENTE (scratch, isolado)
+  echo 3 > "$_tmpd3/v"   # sentinela: contador de veto PRE-EXISTENTE (scratch, isolado)
+  env PATH="$_tmpd3/bin:$PATH" \
+      DOLT_WATCHDOG_DRY_RUN=1 \
+      DOLT_WATCHDOG_LOG="$_tmpd3/l" \
+      DOLT_WATCHDOG_STRIKES_FILE="$_tmpd3/s" DOLT_WATCHDOG_CPU_VETO_FILE="$_tmpd3/v" \
+      bash "$SRC" >/dev/null 2>&1
+  [ "$(cat "$_tmpd3/s" 2>/dev/null)" = "2" ] && ok "ramo saudavel: DRY_RUN nao zerou o contador de strikes pre-existente" \
+                                  || bad "ga-153cq regressao: ramo saudavel zerou/mexeu em strikes mesmo sob DRY_RUN"
+  [ "$(cat "$_tmpd3/v" 2>/dev/null)" = "3" ] && ok "ramo saudavel: DRY_RUN nao zerou o contador de veto pre-existente" \
+                                  || bad "ga-153cq regressao: ramo saudavel zerou/mexeu no veto mesmo sob DRY_RUN"
+  grep -qE 'DRY-RUN: Dolt healthy' "$_tmpd3/l" 2>/dev/null \
+    && ok "dry run REPORTA o ramo de recuperacao saudavel que teria tomado (nao ficou mudo)" \
+    || bad "dry run nao reportou o ramo de recuperacao saudavel — perde o valor de diagnostico"
+  rm -rf "$_tmpd3"
+else
+  bad "nao achei o script ao lado — asserts do ramo de recuperacao nao rodaram"
+fi
+
+# (b) checagem estatica de cobertura: os 4 pontos de mutacao conhecidos (recuperacao
+# saudavel, saturacao, escrita de strike, veto/restart) tem de estar TODOS atras do
+# mesmo helper — nao 3 de 4, que foi exatamente o estado que passou pelo attempt 1.
+if [ -f "$SRC" ]; then
+  _gate_count=$(grep -cE '^[[:space:]]*if is_dry_run' "$SRC")
+  [ "$_gate_count" -eq 4 ] && ok "4/4 pontos de mutacao conhecidos usam is_dry_run (nenhum novo ficou de fora)" \
+                            || bad "ga-153cq regressao: esperava 4 call-sites de 'if is_dry_run', achei ${_gate_count} — algum ramo de mutacao ficou sem gate"
 fi
 
 echo

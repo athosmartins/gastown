@@ -45,6 +45,20 @@ CPU_ALIVE_PCT="${DOLT_WATCHDOG_CPU_ALIVE_PCT:-20}"
 CPU_VETO_MAX="${DOLT_WATCHDOG_CPU_VETO_MAX:-5}"
 CPU_VETO_FILE="${DOLT_WATCHDOG_CPU_VETO_FILE:-/tmp/dolt-hang-watchdog.cpuveto}"
 
+# ga-153cq (gate attempt 2 FAIL, reviewer was right again): DRY_RUN was only
+# gated at the kill -QUIT decision point, deep in the script. But STRIKES and
+# CPU_VETO_FILE are also mutated in THREE other places this file can exit
+# from — the healthy-recovery branch, the saturation branch, and the strike
+# counter's own write — and each ran unconditionally regardless of DRY_RUN. A
+# flag that promises "side-effect-free end to end" has to be consulted at
+# EVERY mutation, not just the destructive one, or the promise is only as
+# true as whichever branch was last audited. One variable, one helper, one
+# call-site pattern (`if is_dry_run`) used at every write below — grep for it
+# to audit coverage; there are exactly 4 (probe_ok recovery, saturation
+# recovery, strike write, veto/restart) and the selftest asserts that count.
+DRY_RUN="${DOLT_WATCHDOG_DRY_RUN:-0}"
+is_dry_run() { [ "$DRY_RUN" = "1" ]; }
+
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null; }
 
@@ -100,12 +114,22 @@ dolt_cpu_pct() {
 }
 
 if probe_ok; then
-  if [ -f "$STRIKES" ]; then log "Dolt healthy again — clearing $(cat "$STRIKES" 2>/dev/null) strike(s)."; rm -f "$STRIKES"; fi
   # ga-153cq: the veto counter must reset on recovery too. It counts CONSECUTIVE
   # vetoed confirmations; if it survived a healthy period it would carry stale
   # pressure into an unrelated future episode and exhaust the veto early —
   # turning a safety valve into a countdown to the very restart it prevents.
-  rm -f "$CPU_VETO_FILE" 2>/dev/null || true
+  #
+  # ga-153cq (gate attempt 2): both clears below used to run unconditionally,
+  # so DOLT_WATCHDOG_DRY_RUN=1 against an actually-healthy Dolt still zeroed
+  # the real counters — a real mutation under a flag that promises none.
+  # Gated like every other write site now (see is_dry_run() above).
+  if is_dry_run; then
+    [ -f "$STRIKES" ] && log "DRY-RUN: Dolt healthy — would clear $(cat "$STRIKES" 2>/dev/null) strike(s). Left on disk, not written."
+    [ -f "$CPU_VETO_FILE" ] && log "DRY-RUN: Dolt healthy — would clear CPU veto counter ($(cat "$CPU_VETO_FILE" 2>/dev/null)). Left on disk, not written."
+  else
+    if [ -f "$STRIKES" ]; then log "Dolt healthy again — clearing $(cat "$STRIKES" 2>/dev/null) strike(s)."; rm -f "$STRIKES"; fi
+    rm -f "$CPU_VETO_FILE" 2>/dev/null || true
+  fi
   exit 0
 fi
 
@@ -114,13 +138,32 @@ fi
 if dolt_actually_serving; then
   _cpu=$(ps -p "$(pgrep -f 'dolt sql-server' | head -1)" -o %cpu= 2>/dev/null | tr -d ' ')
   log "Health-probe failed but Dolt SERVES a raw SELECT 1 (cpu=${_cpu:-?}%) — saturation, NOT a hang. Skipping strike/restart."
-  [ -f "$STRIKES" ] && rm -f "$STRIKES"
-  rm -f "$CPU_VETO_FILE" 2>/dev/null || true   # ga-153cq: proven serving = clean slate
+  # ga-153cq (gate attempt 2): same class as the probe_ok branch above — proven
+  # serving means "clean slate" for real, but only when we're not simulating.
+  if is_dry_run; then
+    [ -f "$STRIKES" ] && log "DRY-RUN: saturation, not a hang — would clear $(cat "$STRIKES" 2>/dev/null) strike(s). Left on disk, not written."
+    [ -f "$CPU_VETO_FILE" ] && log "DRY-RUN: saturation, not a hang — would clear CPU veto counter. Left on disk, not written."
+  else
+    [ -f "$STRIKES" ] && rm -f "$STRIKES"
+    rm -f "$CPU_VETO_FILE" 2>/dev/null || true   # ga-153cq: proven serving = clean slate
+  fi
   exit 0
 fi
 
+# ga-153cq (gate attempt 2 FAIL, reviewer was right): this write used to be
+# unconditional, sitting well ABOVE the only DRY_RUN gate that existed at the
+# time (the kill -QUIT decision point ~60 lines down). So every path that
+# reached that gate had ALREADY advanced the real strike count on the same
+# invocation — the dry-run report down there claiming "strikes ... left
+# intact" was false. `n` (in-memory) is still computed and used below either
+# way, to report/simulate what the count WOULD become; only persistence is
+# conditional.
 n=$(( $(cat "$STRIKES" 2>/dev/null || echo 0) + 1 ))
-echo "$n" > "$STRIKES"
+if is_dry_run; then
+  log "DRY-RUN: would advance strike counter to ${n}/${MAX_STRIKES}. Not written — on-disk value left intact."
+else
+  echo "$n" > "$STRIKES"
+fi
 _strike_cpu="$(dolt_cpu_pct)"
 # ga-153cq: record CPU on the STRIKE path too, not only on the saturation path.
 # Until now CPU was logged only where we decided NOT to restart, so after 87 real
@@ -180,9 +223,18 @@ _vetoes=$(cat "$CPU_VETO_FILE" 2>/dev/null || echo 0)
 # looked clean. A test that supplies the override cannot discover that the override
 # is REQUIRED. The selftest now asserts the no-override case.
 #
+# ga-153cq (gate attempt 2 FAIL): fixing THIS gate wasn't enough — the STRIKES
+# write above and the two recovery branches earlier in the file had the exact
+# same unconditional-mutation shape, just on a different variable. Reviewer
+# caught it on the very next attempt. All four sites now share one helper
+# (is_dry_run(), defined near the top) instead of four independent copies of
+# the same env-var check, specifically so a future audit is "grep for the
+# helper" instead of "re-read the whole file and hope nothing was missed" —
+# which is exactly what missed these two sites the first time.
+#
 # So decide first, THEN act — with the dry run intercepting before any write or
 # notify, while still reporting which branch it would have taken.
-if [ "${DOLT_WATCHDOG_DRY_RUN:-0}" = "1" ]; then
+if is_dry_run; then
   if [ -n "$_cpu_now" ] && [ "$_cpu_now" -ge "$CPU_ALIVE_PCT" ] && [ "$_vetoes" -lt "$CPU_VETO_MAX" ]; then
     log "DRY-RUN: would VETO the restart — Dolt at ${_cpu_now}% CPU (>=${CPU_ALIVE_PCT}%), veto would become $(( _vetoes + 1 ))/${CPU_VETO_MAX}. No counter written, no notify sent."
   else
