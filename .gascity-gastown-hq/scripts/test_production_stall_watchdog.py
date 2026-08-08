@@ -13,6 +13,7 @@ Run: python3 -m unittest test_production_stall_watchdog -v
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 import tempfile
@@ -124,6 +125,79 @@ class TestDeployBlockShallow(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertIn("AHEAD", result)
         self.assertNotIn("SHALLOW", result)
+
+
+class TestStuckExecutionWho(unittest.TestCase):
+    """Covers ga-5r96t: stuck_execution() must name the ASSIGNEE — whoever is
+    actually holding the stuck in_progress slot, the thing `gc session
+    peek/kill` can act on — as the stuck party. The owner is just who created
+    the bead (often a human with no session to peek/kill); a real incident
+    had the watchdog telling an operator to kill the bead creator's
+    nonexistent session while the actual stuck session (a gate-reviewer) went
+    unnamed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.psw = _load_psw()
+
+    def setUp(self):
+        self._orig_sh = self.psw.sh
+        self._orig_stuck_sec = self.psw.STUCK_EXEC_SEC
+        self.psw.STUCK_EXEC_SEC = 60  # deterministic 1min threshold for the test
+
+    def tearDown(self):
+        self.psw.sh = self._orig_sh
+        self.psw.STUCK_EXEC_SEC = self._orig_stuck_sec
+
+    def _stub_bd_list(self, bead):
+        payload = json.dumps([bead])
+
+        def _fake_sh(args, timeout=20):
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=payload, stderr="")
+
+        self.psw.sh = _fake_sh
+
+    def test_assignee_and_owner_diverge_reports_assignee(self):
+        """AC1: bead com assignee=<sessão> e owner=<humano> reporta a SESSÃO
+        como travada (o flagrante real: ga-vvmc4, owner=athosmartins@gmail.com,
+        assignee=gate-reviewer-adhoc-a38fd89154)."""
+        self._stub_bd_list({
+            "id": "ga-vvmc4",
+            "owner": "athosmartins@gmail.com",
+            "assignee": "gate-reviewer-adhoc-a38fd89154",
+            "updated_at": "1970-01-01T00:00:00Z",
+        })
+        result = self.psw.stuck_execution(now=100000.0)
+        self.assertIsNotNone(result)
+        self.assertIn(
+            "ga-vvmc4 (assignee=gate-reviewer-adhoc-a38fd89154 "
+            "(owner=athosmartins@gmail.com)) parado há", result)
+
+    def test_no_assignee_falls_back_to_owner(self):
+        """AC2: bead sem assignee cai no owner — comportamento atual
+        preservado para o caso em que não há sessão nenhuma segurando o slot."""
+        self._stub_bd_list({
+            "id": "ga-orphan",
+            "owner": "athosmartins@gmail.com",
+            "assignee": None,
+            "updated_at": "1970-01-01T00:00:00Z",
+        })
+        result = self.psw.stuck_execution(now=100000.0)
+        self.assertIsNotNone(result)
+        self.assertIn("ga-orphan (owner=athosmartins@gmail.com) parado há", result)
+
+    def test_both_empty_reports_unknown(self):
+        """AC3: owner e assignee ambos ausentes → '?', nunca uma string vazia
+        ou um valor que pareça um dado real."""
+        self._stub_bd_list({
+            "id": "ga-noone",
+            "owner": "",
+            "assignee": "",
+            "updated_at": "1970-01-01T00:00:00Z",
+        })
+        result = self.psw.stuck_execution(now=100000.0)
+        self.assertIsNotNone(result)
+        self.assertIn("ga-noone (?) parado há", result)
 
 
 if __name__ == "__main__":

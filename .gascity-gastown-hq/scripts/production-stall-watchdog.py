@@ -320,8 +320,19 @@ def stuck_execution(now=None):
             continue  # can't age it → don't flag (fail-safe)
         age = now - e
         if age > STUCK_EXEC_SEC:
-            who = b.get("owner") or b.get("assignee") or "?"
-            stuck.append("%s (owner=%s) parado há %dh" % (b.get("id", "?"), who, int(age // 3600)))
+            # ga-5r96t: assignee is who's actually holding the stuck slot (the
+            # thing "gc session peek/kill" can act on) — owner is just who
+            # created the bead, often a human with no session to peek/kill.
+            assignee, owner = b.get("assignee"), b.get("owner")
+            if assignee:
+                label = "assignee=%s" % assignee
+                if owner and owner != assignee:
+                    label += " (owner=%s)" % owner
+            elif owner:
+                label = "owner=%s" % owner
+            else:
+                label = "?"
+            stuck.append("%s (%s) parado há %dh" % (b.get("id", "?"), label, int(age // 3600)))
     if not stuck:
         return None
     return ("bead(s) in_progress sem update há >%dh — atribuídos mas sem progresso: %s"
