@@ -1998,7 +1998,18 @@ if [ "$DEAD_VERDICT_COUNT" -gt 0 ]; then
     DV=$(printf '%s\n' "$DEAD_VERDICT_JSON" | jq ".[$_dvi]")
     DV_ID=$(printf '%s\n' "$DV" | jq -r '.id // ""')
     DV_ASSIGNEE=$(printf '%s\n' "$DV" | jq -r '.assignee // ""')
-    DV_CREATED=$(printf '%s\n' "$DV" | jq -r '.created_at // ""')
+    # ga-1olmq gate-feedback (non-blocking note, addressed): updated_at, NOT
+    # created_at. Same CONTRACT reconcile_zero_verdict_run_action's own
+    # docstring above already documents for the sibling grace check (ga-jfo7
+    # attempt 1) — age_min must reflect time-IN-CURRENT-STATE. A verdict
+    # bead's created_at never changes across repeated release/re-convene
+    # cycles on the same id; anchoring the boot-grace check to it would work
+    # correctly ONLY on the very first assignment, then permanently defeat
+    # the grace window on every later reassignment (a freshly re-convoked
+    # reviewer's own ~210s boot time would be judged against the ORIGINAL
+    # assignment's age, not its own, and get yanked before it ever has a
+    # fair chance to appear).
+    DV_UPDATED=$(printf '%s\n' "$DV" | jq -r '.updated_at // ""')
     DV_LABELS=$(printf '%s\n' "$DV" | jq -r '(.labels // []) | join(" ")')
     [ -z "$DV_ID" ] && continue
     # Empty assignee: out of scope (see comment block above) — nothing to
@@ -2010,7 +2021,7 @@ if [ "$DEAD_VERDICT_COUNT" -gt 0 ]; then
     DV_ALIVE=$(session_alive_for_assignee "$DV_ASSIGNEE" "$SESS_SNAP_JSON")
     [ "$DV_ALIVE" = "1" ] && continue
 
-    DV_AGE=$(age_minutes_of "$DV_CREATED" "$NOW_EPOCH")
+    DV_AGE=$(age_minutes_of "$DV_UPDATED" "$NOW_EPOCH")
     case "$DV_AGE" in ''|*[!0-9]*) DV_AGE=0 ;; esac
     if [ "$DV_AGE" -le "$GATE_DEAD_VERDICT_GRACE_MINUTES" ]; then
       continue
@@ -2036,7 +2047,24 @@ if [ "$DEAD_VERDICT_COUNT" -gt 0 ]; then
       release)
         warn "ga-u07fn: releasing stuck verdict $DV_ID (age=${DV_AGE}m, assignee=$DV_ASSIGNEE not alive, parent run $DV_GR_ID active [gate-status:${DV_GR_STATUS:-?}]) for re-convocation."
         bd -C "$GC_CITY" comment "$DV_ID" "ga-u07fn: verdict released — assignee $DV_ASSIGNEE has no live session after ${DV_AGE}m (grace=${GATE_DEAD_VERDICT_GRACE_MINUTES}m) and parent gate-run $DV_GR_ID is still active (gate-status:${DV_GR_STATUS:-?}). Freed for re-convocation by a fresh reviewer. Self-healed by guard." 2>/dev/null || true
-        bd -C "$GC_CITY" unclaim "$DV_ID" --force --if-assignee "$DV_ASSIGNEE" -r "ga-u07fn: dead-reviewer reap — no live session after ${DV_AGE}m, parent run still active" 2>/dev/null || \
+        # ga-1olmq gate-feedback (blocking, fixed): --force and --if-assignee
+        # are documented as MUTUALLY EXCLUSIVE by `bd unclaim --help`
+        # ("cannot be combined with --force (they encode contradictory
+        # intent)") and empirically confirmed to error on every invocation,
+        # not just races (`bd unclaim <id> --force --if-assignee <x>` ->
+        # "Error: if any flags in the group [force if-assignee] are set none
+        # of the others can be" — verified live against the real bd 1.1.0
+        # binary this guard invokes). The prior version's `2>/dev/null ||
+        # warn "...benign race..."` masked a GUARANTEED failure as a rare
+        # timing issue, so release never actually happened. --if-assignee
+        # ALONE already provides the atomic compare-and-swap this call
+        # wants — verified empirically (throwaway test bead): a matching
+        # assignee releases successfully as a third party (no --force
+        # needed), a mismatched one fails cleanly with no state change,
+        # naming the actual current holder. Dropping --force is not a
+        # weaker guard than the original intent; it is the only combination
+        # bd actually accepts for this operation.
+        bd -C "$GC_CITY" unclaim "$DV_ID" --if-assignee "$DV_ASSIGNEE" -r "ga-u07fn: dead-reviewer reap — no live session after ${DV_AGE}m, parent run still active" 2>/dev/null || \
           warn "ga-u07fn: unclaim of $DV_ID did not apply (assignee likely changed since the liveness check moments ago — benign race, next sweep re-evaluates fresh)."
         ;;
       close)
