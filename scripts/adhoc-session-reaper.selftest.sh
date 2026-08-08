@@ -59,6 +59,13 @@ _im_old="$(python3 -c 'import datetime;print((datetime.datetime.now(datetime.tim
 [ "$(session_peek_reports_dead 'gc session peek: session not found: ga-x')" = "1" ] && ok "peek_dead: not-found=1" || nope "not-found should be dead"
 [ "$(session_peek_reports_dead 'real scrollback here')" = "0" ] && ok "peek_dead: scrollback=0" || nope "scrollback should be alive"
 
+# title_shows_no_task (ga-dd2h0) — empirically confirmed against ga-qfewi's actual
+# record (the session that triggered this bead): a self-serve session's title starts
+# out EQUAL to its own session name and is only overwritten once it claims a task.
+[ "$(title_shows_no_task "gate-reviewer-adhoc-x" "gate-reviewer-adhoc-x")" = "1" ] && ok "no_task: title==name → 1" || nope "title==name should mean no task ever claimed"
+[ "$(title_shows_no_task "" "gate-reviewer-adhoc-x")" = "1" ] && ok "no_task: empty title → 1" || nope "empty title should mean no task ever claimed"
+[ "$(title_shows_no_task "gate-reviewer-1: crew/oracle/wa-54egz" "gate-reviewer-adhoc-x")" = "0" ] && ok "no_task: real task title → 0" || nope "task-bearing title should not read as no_task"
+
 # ---- integration scenarios via a programmable gc stub ---------------------------
 # The stub reads $AHR_FIXTURE (a JSON sessions doc) for `session list --json`,
 # returns $AHR_PEEK_MODE for `session peek`, records `session close` calls to
@@ -237,6 +244,51 @@ EOF
 run_reaper 1 dead
 if [ "$(closed_count)" = "0" ]; then ok "(h) active+old+idle-unknown → kept (fail safe)"; else nope "(h) idle-unknown active session was reaped (count=$(closed_count)) — unsafe"; fi
 
+# (i) THE ga-dd2h0 BUG: self-serve session that NEVER claimed a task (title==name) —
+#     old created_at, but last_active is RECENT because its own poll-for-work loop
+#     keeps refreshing it. The idle floor above can NEVER fire for this session (idle
+#     stays < IDLE_MIN forever), which is exactly why it leaked (observed live:
+#     40-58min alive, 0 beads ever assigned) → REAPED on age alone once title shows no
+#     task was ever claimed.
+AHR_FIXTURE="$STUBDIR/i.json"
+cat > "$AHR_FIXTURE" <<EOF
+{"sessions":[{"id":"ga-wisp-i","name":"gate-reviewer-adhoc-iii","state":"active","closed":false,"created_at":"$(old_ts)","last_active":"$(recent_ts)","title":"gate-reviewer-adhoc-iii"}]}
+EOF
+run_reaper 1 dead
+if [ "$(closed_count)" = "1" ] && closed_has "ga-wisp-i"; then ok "(i) ga-dd2h0: never-claimed poll-only session (title==name) + old + recently-active → REAPED"; else nope "(i) THE ga-dd2h0 BUG: poll-only never-claimed session was NOT reaped (count=$(closed_count))"; fi
+
+# (i2) control, paired with (i): IDENTICAL timing (same old created_at, same recent
+#      last_active) but title shows a REAL task → must stay KEPT. Isolates that the
+#      reap trigger is title==name specifically, not just "old+active+recent" —
+#      the control ACEITE #2 requires so this fix can't become the ga-dd2h0-class
+#      collateral-damage bug it's meant to prevent.
+AHR_FIXTURE="$STUBDIR/i2.json"
+cat > "$AHR_FIXTURE" <<EOF
+{"sessions":[{"id":"ga-wisp-i2","name":"gate-reviewer-adhoc-i2i2","state":"active","closed":false,"created_at":"$(old_ts)","last_active":"$(recent_ts)","title":"gate-reviewer-1: crew/oracle/wa-54egz"}]}
+EOF
+run_reaper 1 dead
+if [ "$(closed_count)" = "0" ]; then ok "(i2) control: same timing as (i) but title shows a real task → kept (ACEITE #2)"; else nope "(i2) CRITICAL: session WITH a real task was reaped (count=$(closed_count)) — collateral damage"; fi
+
+# (i3) empty title (no descriptor ever set — the other half of title_shows_no_task)
+#      combined with a non-"active" idle-candidate state (idle), to confirm the fix
+#      isn't accidentally narrowed to state="active" only → REAPED.
+AHR_FIXTURE="$STUBDIR/i3.json"
+cat > "$AHR_FIXTURE" <<EOF
+{"sessions":[{"id":"ga-wisp-i3","name":"auto-refiner-adhoc-i3i3","state":"idle","closed":false,"created_at":"$(old_ts)","last_active":"$(recent_ts)","title":""}]}
+EOF
+run_reaper 1 dead
+if [ "$(closed_count)" = "1" ] && closed_has "ga-wisp-i3"; then ok "(i3) empty title + idle state + old + recently-active → REAPED"; else nope "(i3) empty-title never-claimed idle session was NOT reaped (count=$(closed_count))"; fi
+
+# (i4) title==name but FRESH (<MIN_AGE) → still KEPT. The age floor is a separate,
+#      independent gate (ACEITE #1 requires "idade > MIN_AGE") — this fix must not
+#      bypass it.
+AHR_FIXTURE="$STUBDIR/i4.json"
+cat > "$AHR_FIXTURE" <<EOF
+{"sessions":[{"id":"ga-wisp-i4","name":"gate-reviewer-adhoc-i4i4","state":"active","closed":false,"created_at":"$(fresh_ts)","last_active":"$(recent_ts)","title":"gate-reviewer-adhoc-i4i4"}]}
+EOF
+run_reaper 1 dead
+if [ "$(closed_count)" = "0" ]; then ok "(i4) fresh (<MIN_AGE) + title==name → kept (age floor still applies)"; else nope "(i4) age floor was bypassed for a never-claimed session (count=$(closed_count))"; fi
+
 # (f) mixed batch: reaps eligible+old+drained AND eligible+old+idle-stale-active; leaves
 #     crew + recently-active + fresh + idle-unknown.
 AHR_FIXTURE="$STUBDIR/f.json"
@@ -247,13 +299,14 @@ cat > "$AHR_FIXTURE" <<EOF
  {"id":"ga-wisp-f3","name":"oracle-wa-x","state":"asleep","closed":false,"created_at":"$(old_ts)","last_active":"$(zero_ts)","title":"crew oracle"},
  {"id":"ga-wisp-f4","name":"gate-reviewer-adhoc-f4","state":"active","closed":false,"created_at":"$(old_ts)","last_active":"$(recent_ts)","title":"reviewer ga-4"},
  {"id":"ga-wisp-f5","name":"auto-refiner-adhoc-f5","state":"asleep","closed":false,"created_at":"$(fresh_ts)","last_active":"$(zero_ts)","title":"auto-refiner ga-5"},
- {"id":"ga-wisp-f6","name":"refino-gate-reviewer-adhoc-f6","state":"active","closed":false,"created_at":"$(old_ts)","last_active":"$(idle_ts)","title":"refino-reviewer ga-6 (finished)"}
+ {"id":"ga-wisp-f6","name":"refino-gate-reviewer-adhoc-f6","state":"active","closed":false,"created_at":"$(old_ts)","last_active":"$(idle_ts)","title":"refino-reviewer ga-6 (finished)"},
+ {"id":"ga-wisp-f7","name":"gate-reviewer-adhoc-f7","state":"active","closed":false,"created_at":"$(old_ts)","last_active":"$(recent_ts)","title":"gate-reviewer-adhoc-f7"}
 ]}
 EOF
 run_reaper 1 dead
-if [ "$(closed_count)" = "3" ] && closed_has "ga-wisp-f1" && closed_has "ga-wisp-f2" && closed_has "ga-wisp-f6" \
+if [ "$(closed_count)" = "4" ] && closed_has "ga-wisp-f1" && closed_has "ga-wisp-f2" && closed_has "ga-wisp-f6" && closed_has "ga-wisp-f7" \
    && ! closed_has "ga-wisp-f3" && ! closed_has "ga-wisp-f4" && ! closed_has "ga-wisp-f5"; then
-  ok "(f) mixed batch → reaped f1(asleep)+f2(draining)+f6(active-idle), kept oracle/working-active/fresh"
+  ok "(f) mixed batch → reaped f1(asleep)+f2(draining)+f6(active-idle)+f7(never-claimed poll-only), kept oracle/working-active/fresh"
 else
   nope "(f) mixed batch wrong: closed=[$(tr '\n' ' ' < "$AHR_CLOSE_LOG")] count=$(closed_count)"
 fi

@@ -122,6 +122,23 @@ session_peek_reports_dead() {
   esac
 }
 
+# title_shows_no_task <title> <name> → 1 (session never claimed a task) | 0 (title was
+# overwritten to describe real work). Pure; no I/O. ga-dd2h0: a self-serve adhoc
+# session that only ever polls for work and finds none stays state="active" and keeps
+# refreshing last_active with each poll — idle_minutes(last_active) can therefore NEVER
+# clear IDLE_MIN for it, so the idle-floor check below is permanently defeated for
+# exactly this session class. title is not vulnerable to that: empirically confirmed
+# against ga-qfewi's actual record (the session that triggered this bead) that a
+# self-serve session's title starts out EQUAL to its own session name and is only
+# overwritten once it claims a task (e.g. "gate-reviewer-1: crew/oracle/wa-54egz").
+# Empty title (no descriptor ever set) reads the same way.
+title_shows_no_task() {
+  local title="$1" name="$2"
+  [ -z "$title" ] && { echo 1; return 0; }
+  [ "$title" = "$name" ] && { echo 1; return 0; }
+  echo 0
+}
+
 # age_minutes <created_at_rfc3339> → integer minutes since created | "" on failure.
 # asleep sessions report last_active as the zero time (0001-01-01), so created_at is
 # the only reliable age anchor. Mirrors the gate's _ts_to_epoch (python3 canonical,
@@ -242,28 +259,36 @@ while IFS=$'\t' read -r id name state closed created last_active title; do
   # work refreshes it constantly, so a large idle gap means the turn ended and it is
   # parked at an empty prompt. Reap only when idle >= IDLE_MIN; unknown idle → fail SAFE.
   if [ "$is_drained" != "1" ]; then   # idle-candidate (active/idle/waiting/ready)
-    idle=$(idle_minutes "$last_active")
-    if [ -z "$idle" ]; then
-      # can't establish idle (no/zero/unparseable last_active) → fail SAFE, keep it.
-      # A truly working session would have a fresh last_active; absence is treated as
-      # "might be live" rather than "finished".
-      kept_active=$((kept_active+1))
-      log "$(printf '{"ts":"%s","event":"keep","reason":"idle_unknown","id":"%s","name":"%s","state":"%s","age_min":%s}' "$(ts)" "$id" "$name" "$state" "$age")"
-      continue
+    if [ "$(title_shows_no_task "$title" "$name")" = "1" ]; then
+      # ga-dd2h0: never claimed a task, so the idle floor below is defeated by its own
+      # poll-for-work loop (see title_shows_no_task's comment) — the age floor already
+      # passed above, and that's the only signal left that still means anything here.
+      log "$(printf '{"ts":"%s","event":"reap_no_task","id":"%s","name":"%s","state":"%s","age_min":%s}' "$(ts)" "$id" "$name" "$state" "$age")"
+      # fall through to the close block
+    else
+      idle=$(idle_minutes "$last_active")
+      if [ -z "$idle" ]; then
+        # can't establish idle (no/zero/unparseable last_active) → fail SAFE, keep it.
+        # A truly working session would have a fresh last_active; absence is treated as
+        # "might be live" rather than "finished".
+        kept_active=$((kept_active+1))
+        log "$(printf '{"ts":"%s","event":"keep","reason":"idle_unknown","id":"%s","name":"%s","state":"%s","age_min":%s}' "$(ts)" "$id" "$name" "$state" "$age")"
+        continue
+      fi
+      if [ "$idle" -lt "$IDLE_MIN" ]; then
+        # recently active → still working (or between rapid turns) → KEEP
+        kept_active=$((kept_active+1))
+        log "$(printf '{"ts":"%s","event":"keep","reason":"recently_active","id":"%s","name":"%s","state":"%s","age_min":%s,"idle_min":%s,"min_idle":%s}' "$(ts)" "$id" "$name" "$state" "$age" "$idle" "$IDLE_MIN")"
+        continue
+      fi
+      # idle past the floor → finished-but-not-asleep. A peek that reports "session not
+      # found" only confirms it; scrollback is just the leftover transcript of the
+      # finished turn, so (unlike the drained path) it does NOT veto the reap here — the
+      # idle floor already established the turn is over. Inconclusive/glitch is fine.
+      peek_err="$("$GC_BIN" --city "$CITY" session peek "$id" --lines 1 2>&1 >/dev/null || true)"
+      log "$(printf '{"ts":"%s","event":"reap_active_idle","id":"%s","name":"%s","state":"%s","age_min":%s,"idle_min":%s}' "$(ts)" "$id" "$name" "$state" "$age" "$idle")"
+      # fall through to the close block
     fi
-    if [ "$idle" -lt "$IDLE_MIN" ]; then
-      # recently active → still working (or between rapid turns) → KEEP
-      kept_active=$((kept_active+1))
-      log "$(printf '{"ts":"%s","event":"keep","reason":"recently_active","id":"%s","name":"%s","state":"%s","age_min":%s,"idle_min":%s,"min_idle":%s}' "$(ts)" "$id" "$name" "$state" "$age" "$idle" "$IDLE_MIN")"
-      continue
-    fi
-    # idle past the floor → finished-but-not-asleep. A peek that reports "session not
-    # found" only confirms it; scrollback is just the leftover transcript of the
-    # finished turn, so (unlike the drained path) it does NOT veto the reap here — the
-    # idle floor already established the turn is over. Inconclusive/glitch is fine.
-    peek_err="$("$GC_BIN" --city "$CITY" session peek "$id" --lines 1 2>&1 >/dev/null || true)"
-    log "$(printf '{"ts":"%s","event":"reap_active_idle","id":"%s","name":"%s","state":"%s","age_min":%s,"idle_min":%s}' "$(ts)" "$id" "$name" "$state" "$age" "$idle")"
-    # fall through to the close block
   else
     # drained-family path (UNCHANGED): peek is a VETO-only guard.
     # Confirmatory liveness probe (ga-h9o17 discriminator): a peek that errors
