@@ -716,7 +716,19 @@ fi
 
 if [ -z "$RIG" ]; then
   # Parse the gate dispatcher comment: "merged to property_scrapers/main (sha=...)"
-  GATE_COMMENT=$(bd -C "$STORY_STORE" comments "$STORY_ID" 2>/dev/null \
+  #
+  # ga-fic5d (Mayor, 2026-08-07): SEGUNDO sítio com o mesmo defeito do bloco de
+  # merge-verification (~linha 929) — achado varrendo o IDIOMA, não pelo sintoma.
+  # `bd comments` quebra o texto em ~80 colunas, a quebra cai entre "merged to" e
+  # "<rig>/main", o grep não acha, RIG fica vazio e a entrega falha ANTES de
+  # chegar à verificação de merge. Ler por --json, que não formata.
+  #
+  # Fallback pro formatado se o JSON render vazio: o pior caso volta a ser o bug
+  # conhecido, nunca um RIG silenciosamente vazio por um caminho novo.
+  _SD_COMMENTS=$(bd -C "$STORY_STORE" show "$STORY_ID" --json --include-comments 2>/dev/null \
+    | jq -r '(if type=="array" then .[0] else . end).comments[]?.text // empty' 2>/dev/null || echo "")
+  [ -z "$_SD_COMMENTS" ] && _SD_COMMENTS=$(bd -C "$STORY_STORE" comments "$STORY_ID" 2>/dev/null || echo "")
+  GATE_COMMENT=$(printf '%s\n' "$_SD_COMMENTS" \
     | grep -oE "merged to [a-z_]+/main" | head -1 || echo "")
   if [ -n "$GATE_COMMENT" ]; then
     RIG=$(echo "$GATE_COMMENT" | sed 's/merged to //' | sed 's|/main||')
@@ -896,7 +908,38 @@ MERGE_FAIL_MSG=""
 if [ -z "$RUNTIME_DIR" ] || ! git -C "$RUNTIME_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   MERGE_FAIL_MSG="RUNTIME_DIR ('$RUNTIME_DIR') for rig $RIG is unset or not a git work tree — cannot verify the story's commit reached $RIG's main."
 else
-  STORY_COMMENTS_TEXT=$(bd -C "$STORY_STORE" comments "$STORY_ID" 2>/dev/null || echo "")
+  # ga-fic5d (Mayor, 2026-08-07): LER POR --json, NUNCA por `bd comments`.
+  #
+  # `bd comments` formata para leitura humana e QUEBRA a linha em ~80 colunas. O
+  # comentário de merge do gate é longo, e a quebra caía no ponto fatal:
+  #     "Quality gate PASSED. Branch crew/oracle/wa-8ok7u merged to"
+  #     "whatsapp_automation/main (sha=fc40e581...)"
+  # O regex de extract_gate_merge_info exige "merged to <rig>/<branch> (sha=…)"
+  # TUDO NA MESMA LINHA — com a quebra ali, nunca casa. O guard então concluía
+  # "nenhum comentário de merge existe" e travava a entrega de stories cujo merge
+  # estava feito e verificável.
+  #
+  # Medido no mesmo bead, no mesmo instante:
+  #     bd comments <id>  -> 43871 bytes, exit 0, ZERO linhas casam
+  #     bd show --json    -> as MESMAS duas linhas casam
+  # E story_merge_verdict, com o sha extraído do JSON, devolve 'verified'. Todo o
+  # resto do guard já estava correto; só a leitura era cega.
+  #
+  # ⚠️ "não existe comentário de merge" e "existe, mas li por um canal que o
+  # mutila" produziam a MESMA mensagem. E o custo era permanente: delivery:failed
+  # não auto-retenta, então cada story afetado travava até intervenção manual.
+  #
+  # NÃO troque por `tr -d '\n'` sobre a saída formatada: isso junta comentários
+  # DIFERENTES e pode fabricar um "merged to" que ninguém escreveu — pior que o
+  # bug original. O canal tem que ser o que não formata.
+  STORY_COMMENTS_TEXT=$(bd -C "$STORY_STORE" show "$STORY_ID" --json --include-comments 2>/dev/null \
+    | jq -r '(if type=="array" then .[0] else . end).comments[]?.text // empty' 2>/dev/null || echo "")
+  # Fail-open explícito: se o caminho JSON não render nada (bd sem
+  # --include-comments, jq ausente, Dolt fora), cai no formatado. O pior caso
+  # volta a ser o bug conhecido — nunca uma regressão silenciosa para vazio.
+  if [ -z "$STORY_COMMENTS_TEXT" ]; then
+    STORY_COMMENTS_TEXT=$(bd -C "$STORY_STORE" comments "$STORY_ID" 2>/dev/null || echo "")
+  fi
   if MERGE_INFO=$(extract_gate_merge_info "$STORY_COMMENTS_TEXT"); then
     MERGE_RIG_BRANCH="${MERGE_INFO%%$'\t'*}"
     MERGE_SHA="${MERGE_INFO#*$'\t'}"
