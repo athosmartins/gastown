@@ -213,10 +213,97 @@ fi
 
 HOLD_COUNT=$(grep -c 'GATE_SHA_FAIL_CLASS="hold"' "$DISPATCHER" || true)
 HOLD_COUNT=${HOLD_COUNT:-0}
-if [ "$HOLD_COUNT" -ge 3 ]; then
-  ok "all 3 ga-lxz5w administrative downgrades (closed bead / live park / sibling-race) classify as hold ($HOLD_COUNT sites found)"
+# Sanity floor only (the known sites as of ga-3ipxu's review: closed bead,
+# live park, sibling-race, ga-y9a1d branch-content-coherence, the
+# merge-mechanical failed* block, post-merge integrity-revert). This does
+# NOT prove completeness — a hard count is exactly the gap 6c below exists
+# to close; see that check for the actual regression guard.
+if [ "$HOLD_COUNT" -ge 6 ]; then
+  ok "at least the 6 known administrative downgrades classify as hold ($HOLD_COUNT sites found)"
 else
-  bad "expected >=3 GATE_SHA_FAIL_CLASS=\"hold\" sites (closed bead, live park, sibling-race), found $HOLD_COUNT"
+  bad "expected >=6 GATE_SHA_FAIL_CLASS=\"hold\" sites (closed bead, live park, sibling-race, ga-y9a1d, merge-mechanical, post-merge integrity), found $HOLD_COUNT"
+fi
+
+# ── 6c. DRIFT GUARD (ga-4cy2t gate-fix-1, ga-3ipxu review): EVERY
+# OVERALL_VERDICT="FAIL" site inside gate_finalize_run() must classify
+# GATE_SHA_FAIL_CLASS, not just whatever count 6b happens to hard-code. 6b's
+# plain tally was exactly the gap the review caught: 3 sites covered, 4
+# more silently defaulting to "code" via the untouched top-of-function
+# reset, with zero regression signal — a future site added the same way
+# would go missing again just as quietly. This check instead structurally
+# ties every FAIL site to a nearby classification, so a new unclassified
+# site fails LOUDLY instead of silently inheriting "code". The one
+# legitimate exception (the ga-nooaw self-check, which relies on
+# gate_bead_has_prior_sha_fail already having filtered to code-only-or-
+# legacy shas before it ever sets OVERALL_VERDICT — see that block's own
+# header comment) is allowlisted by proximity to that specific call, not by
+# position, so reordering the function doesn't silently break the exemption.
+echo "── 6c. drift guard: every FAIL site in gate_finalize_run() is classified (or the one documented exemption) ──"
+
+FINALIZE_START=$(grep -n '^gate_finalize_run() {' "$DISPATCHER" | head -1 | cut -d: -f1 || true)
+FINALIZE_START=${FINALIZE_START:-0}
+FINALIZE_REL_END=""
+if [ "$FINALIZE_START" -gt 0 ]; then
+  FINALIZE_REL_END=$(tail -n "+$((FINALIZE_START + 1))" "$DISPATCHER" | grep -n '^[A-Za-z_][A-Za-z0-9_]*() {' | head -1 | cut -d: -f1 || true)
+fi
+
+if [ "$FINALIZE_START" -eq 0 ] || [ -z "$FINALIZE_REL_END" ]; then
+  bad "could not bound gate_finalize_run()'s body (renamed/moved?) — drift guard 6c cannot run"
+else
+  FINALIZE_END=$((FINALIZE_START + FINALIZE_REL_END))  # absolute line of the NEXT top-level function (exclusive bound)
+
+  VERDICT_REL_LINES=$(sed -n "${FINALIZE_START},$((FINALIZE_END - 1))p" "$DISPATCHER" | grep -n 'OVERALL_VERDICT="FAIL"' | cut -d: -f1 || true)
+  VERDICT_LINES=()
+  for rel in $VERDICT_REL_LINES; do
+    VERDICT_LINES+=($((FINALIZE_START + rel - 1)))
+  done
+  SITE_COUNT=${#VERDICT_LINES[@]}
+
+  # Floor, not an exact count: legitimate new FAIL sites (properly
+  # classified) grow this without needing to touch the test. A drop below
+  # the known-good count, or an extraction that silently returns zero, is
+  # what this guards against — the latter would otherwise make the per-site
+  # loop below vacuously "pass" by iterating zero times.
+  if [ "$SITE_COUNT" -ge 7 ]; then
+    ok "found $SITE_COUNT OVERALL_VERDICT=\"FAIL\" sites in gate_finalize_run() (>=7 floor)"
+  else
+    bad "expected >=7 OVERALL_VERDICT=\"FAIL\" sites in gate_finalize_run(), found $SITE_COUNT — extraction broken (function renamed?), or a real site disappeared"
+  fi
+
+  for i in "${!VERDICT_LINES[@]}"; do
+    L=${VERDICT_LINES[$i]}
+    NEXTIDX=$((i + 1))
+    if [ "$NEXTIDX" -lt "$SITE_COUNT" ]; then
+      NEXT=${VERDICT_LINES[$NEXTIDX]}
+    else
+      NEXT=$FINALIZE_END
+    fi
+    LOOKBACK=$((L - 10))
+    [ "$LOOKBACK" -lt "$FINALIZE_START" ] && LOOKBACK=$FINALIZE_START
+
+    # Captured into variables, not piped straight into `grep -q`: `grep -q`
+    # exits as soon as it finds a match, which can SIGPIPE an upstream `sed`
+    # still writing the rest of a large range — under this script's own
+    # `set -o pipefail`, that flips the PIPELINE's exit status to non-zero
+    # even though grep itself DID find the match (reproduced live: failed
+    # only on the two largest windows, ~370 and ~728 lines, where the match
+    # sits near the top — small windows finished writing before grep could
+    # close early, so they never tripped it). A drift guard giving a false
+    # NEGATIVE on its own account is worse than not existing — same
+    # misattributed-exit-status family as `cmd | head; echo $?`.
+    EXEMPT_WINDOW=$(sed -n "${LOOKBACK},${L}p" "$DISPATCHER")
+    if [[ "$EXEMPT_WINDOW" == *gate_bead_has_prior_sha_fail* ]]; then
+      ok "FAIL site at line $L: documented exemption (ga-nooaw self-check, already gated to code-only-or-legacy shas)"
+      continue
+    fi
+
+    CLASS_WINDOW=$(sed -n "${L},$((NEXT - 1))p" "$DISPATCHER")
+    if [[ "$CLASS_WINDOW" == *GATE_SHA_FAIL_CLASS=* ]]; then
+      ok "FAIL site at line $L: classifies GATE_SHA_FAIL_CLASS before line $NEXT"
+    else
+      bad "FAIL site at line $L sets OVERALL_VERDICT=\"FAIL\" but never assigns GATE_SHA_FAIL_CLASS before line $NEXT — silently defaults to \"code\" via the top-of-function reset (the exact ga-3ipxu review class of bug). Classify it explicitly, or if it's a genuine code-content rejection needing the default, extend this guard's exemption check with a named reason instead of leaving it silently unclassified."
+    fi
+  done
 fi
 
 # ── 7. syntax ──────────────────────────────────────────────────────────────

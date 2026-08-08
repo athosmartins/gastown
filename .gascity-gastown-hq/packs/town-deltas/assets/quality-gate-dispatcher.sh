@@ -3232,13 +3232,20 @@ fi
 # Defaults to "code" — if OVERALL_VERDICT is already FAIL here, it came from
 # the reviewer/content verdict computed earlier in this same run (Phase C or
 # the fast path, both above), a genuine code rejection. Only the specific
-# administrative downgrades further down (ga-lxz5w: closed bead, live
-# park/needs-human, sibling-branch race) override this to "hold" — see
-# gate_sha_fail_label's header for what each class means. Reset
-# unconditionally on every entry to this function: gate_finalize_run() runs
-# once per in-flight run bead in a sweep loop (see the quota-stop comment
-# above), so a "hold" set while finalizing a PRIOR bead this sweep must never
-# leak into THIS bead's stamp.
+# downgrades further down override this to "hold" — every one of them is a
+# post-hoc/administrative outcome unrelated to whether the fix's content is
+# good (ga-lxz5w: closed bead, live park/needs-human, sibling-branch race;
+# ga-y9a1d: branch-content-coherence mismatch; merge-mechanical failure —
+# any failed_* MERGE_RESULT; post-merge diff-integrity revert) — see
+# gate_sha_fail_label's header for what each class means. This list is the
+# complete set as of gate-fix-attempt-1 (ga-3ipxu review); if a new
+# downgrade site is added below without touching GATE_SHA_FAIL_CLASS, it
+# silently defaults to "code" here — update this comment AND the
+# GATE_HOLD_SITE_COUNT drift-guard in gate-sha-fail-lock.selftest.sh when
+# adding one. Reset unconditionally on every entry to this function:
+# gate_finalize_run() runs once per in-flight run bead in a sweep loop (see
+# the quota-stop comment above), so a "hold" set while finalizing a PRIOR
+# bead this sweep must never leak into THIS bead's stamp.
 GATE_SHA_FAIL_CLASS="code"
 
 # ── ga-nooaw: FAIL-CLOSED BY SHA ─────────────────────────────────────────────
@@ -3365,6 +3372,8 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH_SHA" ];
       # most likely to occur. Guarded now, matching its siblings.
       GATE_Y9A1D_SUSPECTS=$(printf '%s' "$GATE_Y9A1D_MSGS" | grep -oE '\b(ga|wa|dc|lexbh|marketing)-[a-z0-9]{4,7}\b' | sort -u | tr '\n' ' ' || echo "")
       OVERALL_VERDICT="FAIL"
+      GATE_SHA_FAIL_CLASS="hold"  # ga-4cy2t (gate-fix-1): bookkeeping/ref mismatch, not a code rejection —
+      # "nothing else failed... content is not this bead's" is the block's own diagnosis, see comment above
       FAIL_REASONS="Branch $BRANCH's own commits (${GATE_Y9A1D_COUNT} unique vs $DEFAULT_BRANCH) do not reference source bead $BEAD_ID anywhere (ga-y9a1d: branch-content-coherence). This is the exact signature of a branch ref silently reused by unrelated work — nothing else failed, the branch name is intact, but the content is not this bead's. Not merging $BRANCH.${GATE_Y9A1D_SUSPECTS:+ Content instead references: $GATE_Y9A1D_SUSPECTS.} A human must verify: is this bead's real fix still on some other ref (check \`git log --all -S '<known marker text>'\`), or does $BEAD_ID need a fresh submission?"
       bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-human"                        -q 2>/dev/null || true
       bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-human:branch-content-mismatch" -q 2>/dev/null || true
@@ -3733,6 +3742,11 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
     if [[ "$MERGE_RESULT" = failed* ]]; then
       # Merge failed despite all-PASS verdict — degrade to FAIL
       OVERALL_VERDICT="FAIL"
+      GATE_SHA_FAIL_CLASS="hold"  # ga-4cy2t (gate-fix-1): every failed_* MERGE_RESULT here (push-race,
+      # landing-not-verified, sha-resolution, durable-resolution/updateref/audit_local/audit_origin,
+      # merge-time-conflict/rebase, branch-content-mismatch) is a git/infra outcome — the code itself
+      # already PASSED review; nothing here judged the fix's content. Applies to the whole block
+      # regardless of which sub-reason below fires.
       if [ "$MERGE_RESULT" = "failed_branch_content_mismatch" ]; then
         # ga-pfgnv: same diagnostic spirit as Step 10's ga-y9a1d check (a
         # human needs to know this is a content-mismatch, not a generic git
@@ -3825,6 +3839,9 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
         fi
 
         OVERALL_VERDICT="FAIL"
+        GATE_SHA_FAIL_CLASS="hold"  # ga-4cy2t (gate-fix-1): git's own conflict resolution silently
+        # dropped the branch's changes AFTER an all-PASS verdict and a nominally successful merge —
+        # an infra/mechanical outcome, not a rejection of the fix's content.
         REVERT_STATUS=$([ "$REVERT_OK" = "1" ] && echo "REVERTED (main restored to $MAIN_HEAD_SHA)" || echo "REVERT FAILED — manual fix required")
         FAIL_REASONS="Post-merge integrity check failed: merge silently dropped branch changes.
 Files with dropped changes:
