@@ -118,23 +118,36 @@ if [ -f "$SRC" ]; then
   # nenhum, entao as 3 chamadas releriam sempre o mesmo "0" e nunca acumulariam.
   # MAX_STRIKES=1 faz CADA chamada alcancar "confirmado" sozinha, sem depender de
   # acumulo — e continua sem tocar o contador real (e disso que este teste trata).
+  #
+  # ga-153cq gate-FAIL 3 (reviewer right a third time, same block): DOLT_WATCHDOG_
+  # CPU_ALIVE_PCT=0 below makes ANY cpu reading qualify as "alive", but until now
+  # that reading itself came from dolt_cpu_pct()'s raw, unscoped pgrep — so this
+  # assertion only reached the veto branch when the REVIEW HOST happened to have a
+  # live 'dolt sql-server' process. No live Dolt (bare CI box, mid-outage debugging
+  # — exactly when this script matters) meant dolt_cpu_pct() correctly returned ""
+  # and the veto branch was silently never exercised at all: pass/fail decoupled
+  # from the code under test, decided by ambient host state instead. Fixed at the
+  # source (DOLT_WATCHDOG_CPU_PID override, see dolt-hang-watchdog.sh) rather than
+  # patched here alone — DOLT_WATCHDOG_CPU_PID=$$ points dolt_cpu_pct() at THIS
+  # selftest's own PID, always alive for the duration of the call, so `ps` always
+  # returns a real (if near-zero) reading independent of whether Dolt is running.
   _real_veto="/tmp/dolt-hang-watchdog.cpuveto"
   _had=$([ -f "$_real_veto" ] && cat "$_real_veto" 2>/dev/null || echo "__ausente__")
   _tmpd=$(mktemp -d)
   env DOLT_WATCHDOG_DRY_RUN=1 DOLT_WATCHDOG_MAX_STRIKES=1 \
       DOLT_WATCHDOG_LOG="$_tmpd/l" DOLT_WATCHDOG_STRIKES_FILE="$_tmpd/s" \
       DOLT_WATCHDOG_PROBE_TIMEOUT=1 DOLT_WATCHDOG_SERVE_CONFIRM=2 BEADS_DOLT_PORT=1 \
-      DOLT_WATCHDOG_CPU_ALIVE_PCT=0 \
+      DOLT_WATCHDOG_CPU_ALIVE_PCT=0 DOLT_WATCHDOG_CPU_PID=$$ \
       bash "$SRC" >/dev/null 2>&1
   env DOLT_WATCHDOG_DRY_RUN=1 DOLT_WATCHDOG_MAX_STRIKES=1 \
       DOLT_WATCHDOG_LOG="$_tmpd/l" DOLT_WATCHDOG_STRIKES_FILE="$_tmpd/s" \
       DOLT_WATCHDOG_PROBE_TIMEOUT=1 DOLT_WATCHDOG_SERVE_CONFIRM=2 BEADS_DOLT_PORT=1 \
-      DOLT_WATCHDOG_CPU_ALIVE_PCT=0 \
+      DOLT_WATCHDOG_CPU_ALIVE_PCT=0 DOLT_WATCHDOG_CPU_PID=$$ \
       bash "$SRC" >/dev/null 2>&1
   env DOLT_WATCHDOG_DRY_RUN=1 DOLT_WATCHDOG_MAX_STRIKES=1 \
       DOLT_WATCHDOG_LOG="$_tmpd/l" DOLT_WATCHDOG_STRIKES_FILE="$_tmpd/s" \
       DOLT_WATCHDOG_PROBE_TIMEOUT=1 DOLT_WATCHDOG_SERVE_CONFIRM=2 BEADS_DOLT_PORT=1 \
-      DOLT_WATCHDOG_CPU_ALIVE_PCT=0 \
+      DOLT_WATCHDOG_CPU_ALIVE_PCT=0 DOLT_WATCHDOG_CPU_PID=$$ \
       bash "$SRC" >/dev/null 2>&1
   _now=$([ -f "$_real_veto" ] && cat "$_real_veto" 2>/dev/null || echo "__ausente__")
   [ "$_had" = "$_now" ] && ok "3 dry runs sem override NAO tocaram o contador real ($_had)" \

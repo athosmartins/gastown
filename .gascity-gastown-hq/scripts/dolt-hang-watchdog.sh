@@ -44,6 +44,18 @@ SERVE_CONFIRM_TIMEOUT="${DOLT_WATCHDOG_SERVE_CONFIRM:-25}"
 CPU_ALIVE_PCT="${DOLT_WATCHDOG_CPU_ALIVE_PCT:-20}"
 CPU_VETO_MAX="${DOLT_WATCHDOG_CPU_VETO_MAX:-5}"
 CPU_VETO_FILE="${DOLT_WATCHDOG_CPU_VETO_FILE:-/tmp/dolt-hang-watchdog.cpuveto}"
+# ga-153cq (gate attempt 3 FAIL, reviewer right a third time in this same file):
+# the CPU reading itself was the one remaining unmockable input. dolt_cpu_pct()
+# did a raw, unscoped `pgrep -f 'dolt sql-server'` with no override — so the
+# selftest's veto-branch assertion only passed when the REVIEW HOST happened to
+# have a live Dolt process, and would silently fail to even exercise the veto
+# branch (not "fail loud" — just never reach it) on a host without one: a bare
+# CI box, or mid-outage when Dolt is actually down, exactly when this script
+# matters most. Test-only seam, same shape as every other override above: unset
+# in production (real pgrep lookup, unchanged), set by the selftest to a
+# controlled, always-alive PID (its own $$) so the assertion is hermetic instead
+# of host-state-contingent.
+CPU_PID_OVERRIDE="${DOLT_WATCHDOG_CPU_PID:-}"
 
 # ga-153cq (gate attempt 2 FAIL, reviewer was right again): DRY_RUN was only
 # gated at the kill -QUIT decision point, deep in the script. But STRIKES and
@@ -106,7 +118,8 @@ PY
 # lets the destructive branch use it too.
 dolt_cpu_pct() {
   local _pid _cpu
-  _pid=$(pgrep -f 'dolt sql-server' 2>/dev/null | head -1)
+  _pid="$CPU_PID_OVERRIDE"
+  [ -z "$_pid" ] && _pid=$(pgrep -f 'dolt sql-server' 2>/dev/null | head -1)
   [ -z "$_pid" ] && { printf ''; return; }
   _cpu=$(ps -p "$_pid" -o %cpu= 2>/dev/null | tr -d ' ')
   [ -z "$_cpu" ] && { printf ''; return; }
