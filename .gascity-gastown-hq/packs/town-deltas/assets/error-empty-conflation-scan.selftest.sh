@@ -485,9 +485,16 @@ cp "$FIXDIR/mixed/good_c4_has_limit.sh" "$FIXDIR/clean/"
 # ga-q0n6a: multi-line continuation shape (this codebase's own dominant
 # style) — --limit 0 lives on a continuation line, not the first physical
 # line. Proves _join_continued_lines actually closes the gap it exists for.
+# ga-ndv99 gate-feedback: --limit 0 previously sat on line 1 alongside
+# --json, so this fixture passed even with the joiner completely broken
+# (line 1 alone was already sufficient) — same false-reassurance class the
+# neighboring ga-a4gfd control pair below exists to avoid. Now on line 2
+# ONLY: line 1 alone (`bd ... list --json --all --include-infra \`) is
+# insufficient, so this genuinely falsifies the joiner, not just the
+# detector's other flag checks.
 cat > "$FIXDIR/mixed/good_c4_multiline_has_limit.sh" <<'EOF'
-if ! MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all --limit 0 --include-infra \
-  -l type:quality-gate-marker \
+if ! MARKERS_JSON=$(bd -C "$GC_CITY" list --json --all --include-infra \
+  -l type:quality-gate-marker --limit 0 \
   --label-any gate-status:ready \
   2>/dev/null); then
   warn "query failed"
