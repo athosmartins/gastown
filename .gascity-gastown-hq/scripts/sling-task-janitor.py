@@ -473,7 +473,57 @@ def _should_close_step(bead, parent_status, live, gated=frozenset()):
     return False, "molecule-pai ainda %s — step in-flight legítimo" % parent_status
 
 
-def _order_step_orphans(orphans):
+def _blocking_verdict(bead, blocker_status, in_sweep=frozenset()):
+    """Can `bd close` succeed on this bead right now? -> (ok_to_try, why)
+
+    ga-0bhon. `bd close` refuses a bead that is still blocked ("cannot close blocked
+    issue: X is blocked by [Y]"), and that refusal is CORRECT — it is the guard that
+    stops a bead whose dependency is genuinely alive from being closed. The janitor
+    used to discover this the expensive way: call close, get refused, log
+    "WARN: failed to close … (non-fatal; retry next sweep)", and try again 900s later.
+    Forever. Measured in the live log: 798 such WARNs across 8 beads, 125 of them on
+    ga-rbce8 alone — blocked by ga-s2eri, the engine-window bead, which is not closing
+    any time soon.
+
+    Two costs, and the second is the one that bites: the wasted `bd close` per sweep is
+    small, but the bead is NEVER cleaned, so the janitor carries a permanent sublist of
+    work it can never finish while reporting a clean "sweep done" each time. 798 WARNs
+    also train the reader to filter this janitor's WARNs — and then a NEW, real one is
+    invisible.
+
+    The blocking edge is already in the `bd list` payload we hold, so this is decided
+    BEFORE spending the call, not after failing it.
+
+    Three states, kept apart on purpose:
+      • blocker CLOSED               → gone; it cannot refuse the close.
+      • blocker still open/anything  → real block; do not try (KEEP, quiet).
+      • blocker status UNRESOLVED    → do not try either. "I could not find out" must
+                                       never produce the same action as "I know it is
+                                       gone" — and the inert choice here is to not call.
+    A blocker that is ITSELF an orphan in this sweep (`in_sweep`) is not a reason to
+    skip: _order_orphans_by_blockers closes it first, and then this bead is closable in
+    the same sweep. That is the only case where "blocked" resolves itself.
+    """
+    blockers = _deps(bead, "blocks")
+    if not blockers:
+        return True, ""
+    unresolved = []
+    for bid in sorted(blockers):
+        if bid in in_sweep:
+            continue                      # fecha antes, nesta mesma varredura
+        st = (blocker_status or {}).get(bid)
+        if st == "closed":
+            continue                      # bloqueador já foi: não recusa nada
+        if st is None or st == _TARGET_MISSING:
+            unresolved.append("%s (status indeterminado)" % bid)
+        else:
+            unresolved.append("%s (%s)" % (bid, st))
+    if unresolved:
+        return False, "bloqueado por %s — `bd close` recusaria; não gasto a chamada" % ", ".join(unresolved)
+    return True, ""
+
+
+def _order_orphans_by_blockers(orphans):
     """Blockers first. -> (ordered, unresolvable)
 
     `bd close` REFUSES a step still blocked by a sibling (do-work blocks drain), and
@@ -634,6 +684,21 @@ def run_cycle(now):
             by_store.setdefault(store, set()).add(pid)
         step_parent_statuses = _target_statuses(by_store)
 
+    # ── ga-0bhon: resolver os BLOQUEADORES antes de gastar qualquer `bd close` ────
+    # A aresta `blocks` já vem no payload do `bd list` que temos em mãos, então só
+    # falta o STATUS de cada bloqueador — uma batch por store. Medido no ar: 11
+    # bloqueadores distintos em HQ e 1 no WA, contra 275 beads abertos. O custo é
+    # ínfimo perto do que substitui (798 `bd close` que não podiam dar certo).
+    blocker_refs = {}  # store -> {blocker_id}
+    for store, beads in store_beads.items():
+        for b in beads:
+            if not isinstance(b, dict):
+                continue
+            blockers = _deps(b, "blocks")
+            if blockers:
+                blocker_refs.setdefault(store, set()).update(blockers)
+    blocker_status = _target_statuses(blocker_refs) if blocker_refs else {}
+
     closed = 0
     step_orphans = []
     for store, b, pid in step_refs:
@@ -644,11 +709,16 @@ def run_cycle(now):
             _log("  KEEP %s/%s (step): %s" % (os.path.basename(store), b.get("id", "?"), why))
 
     if step_orphans:
-        ordered, unresolvable = _order_step_orphans(step_orphans)
+        ordered, unresolvable = _order_orphans_by_blockers(step_orphans)
         for store, b in unresolvable:
             _log("  KEEP %s/%s (step): ciclo de dependência entre órfãos — não forçado"
                  % (os.path.basename(store), b.get("id", "?")))
+        in_sweep_steps = {b.get("id") for _s, b in ordered if b.get("id")}
         for store, b in ordered:
+            ok_to_try, blocked_why = _blocking_verdict(b, blocker_status, in_sweep_steps)
+            if not ok_to_try:
+                _log("  KEEP %s/%s (step): %s" % (os.path.basename(store), b.get("id", "?"), blocked_why))
+                continue
             reason = (
                 "Orphan step cleanup (sling-task-janitor, ga-mpnhh): a molecule-pai deste "
                 "step está CLOSED, e o step ficou aberto e sem assignee — indistinguível de "
@@ -674,6 +744,12 @@ def run_cycle(now):
                 do_close, why = _should_close(b, inflight, live, now, gated, parent_statuses)
                 if not do_close:
                     _log("  KEEP %s/%s: %s" % (os.path.basename(store), bid, why))
+                    continue
+                # ga-0bhon: era AQUI que os 798 WARN nasciam — o stub passava por
+                # todas as regras de órfão e só então batia no guard de bloqueio.
+                ok_to_try, blocked_why = _blocking_verdict(b, blocker_status)
+                if not ok_to_try:
+                    _log("  KEEP %s/%s: %s" % (os.path.basename(store), bid, blocked_why))
                     continue
                 labels_b = set(b.get("labels") or [])
                 asg_b = b.get("assignee") or ""
@@ -704,6 +780,16 @@ def run_cycle(now):
                 do_close, why = _should_close_molecule(b, target_statuses.get(target), live, now, gated)
                 if not do_close:
                     _log("  KEEP %s/%s: %s" % (os.path.basename(store), bid, why))
+                    continue
+                # ga-0bhon: DEPOIS de decidir que é órfã, nunca antes. Auto-auditoria
+                # do próprio diff: eu tinha posto esta checagem acima do
+                # _should_close_molecule, e aí uma molecule perfeitamente saudável
+                # logaria "bloqueado por X" em vez da razão real de estar sendo mantida.
+                # Comentário/log que descreve outra coisa que não o que está acontecendo
+                # é pior que log nenhum — faz o próximo leitor parar de procurar.
+                ok_to_try, blocked_why = _blocking_verdict(b, blocker_status)
+                if not ok_to_try:
+                    _log("  KEEP %s/%s: %s" % (os.path.basename(store), bid, blocked_why))
                     continue
                 tstatus = target_statuses.get(target)
                 disp = "missing" if tstatus == _TARGET_MISSING else tstatus
@@ -1095,7 +1181,7 @@ print(json.dumps(found))
           "dela, nunca --force (que atropelaria também o caso real)")
     dowork = mkstep("sd1", "mol6")
     drain = mkstep("sd2", "mol6", blocks=("sd1",))
-    ordered, unresolvable = _order_step_orphans([("HQ", drain), ("HQ", dowork)])
+    ordered, unresolvable = _order_orphans_by_blockers([("HQ", drain), ("HQ", dowork)])
     seq = [b.get("id") for _s, b in ordered]
     _ok("AG: fecha do-work antes do drain (%s)" % seq) if seq == ["sd1", "sd2"] and not unresolvable else \
         _bad("AG: ordem errada", "seq=%s unresolvable=%s" % (seq, [b.get('id') for _s, b in unresolvable]))
@@ -1103,7 +1189,7 @@ print(json.dumps(found))
     print("Scenario AH: ciclo entre órfãos → nenhum é forçado (devolvidos como unresolvable)")
     c1 = mkstep("sc1", "mol7", blocks=("sc2",))
     c2 = mkstep("sc2", "mol7", blocks=("sc1",))
-    ordered, unresolvable = _order_step_orphans([("HQ", c1), ("HQ", c2)])
+    ordered, unresolvable = _order_orphans_by_blockers([("HQ", c1), ("HQ", c2)])
     _ok("AH: ciclo não é forçado") if not ordered and len(unresolvable) == 2 else \
         _bad("AH: ciclo não tratado", "ordered=%s" % [b.get('id') for _s, b in ordered])
 
@@ -1134,6 +1220,63 @@ print(json.dumps(found))
     run_cycle(NOW)
     _ok("AJ: não tocou step de molecule aberta") if closed_idsAJ == [] else \
         _bad("AJ: fechou trabalho vivo", "closed=%s" % closed_idsAJ)
+    _target_status_fn = None
+
+    # ── ga-0bhon: bloqueio é decidido ANTES do close, não descoberto falhando ────
+    def mkblocked(bid, blocker, itype="task", title="fix bug ga-target"):
+        return {"id": bid, "title": title, "issue_type": itype, "labels": [],
+                "assignee": "", "status": "open", "updated_at": OLD,
+                "dependencies": [{"issue_id": bid, "depends_on_id": blocker, "type": "blocks"}]}
+
+    print("Scenario BA: bloqueador ABERTO → nem tenta fechar (era o WARN infinito: 798 no log "
+          "vivo, 125 só no ga-rbce8, bloqueado pelo ga-s2eri da janela de engine)")
+    okt, why = _blocking_verdict(mkblocked("b1", "ga-s2eri"), {"ga-s2eri": "open"})
+    _bad("BA: tentaria fechar bead bloqueado", why) if okt else _ok("BA: não gasta a chamada (%s)" % why[:48])
+
+    print("Scenario BB: bloqueador CLOSED → pode fechar (o bloqueio saiu do caminho)")
+    okt, why = _blocking_verdict(mkblocked("b2", "ga-done"), {"ga-done": "closed"})
+    _ok("BB: libera o close quando o bloqueador já fechou") if okt else _bad("BB: bloqueou à toa", why)
+
+    print("Scenario BC: status do bloqueador INDETERMINADO → não tenta. 'Não consegui saber' não "
+          "pode produzir a mesma ação que 'sei que fechou' — e a ação inerte aqui é não chamar")
+    for unknown in ({}, {"ga-x": _TARGET_MISSING}):
+        okt, why = _blocking_verdict(mkblocked("b3", "ga-x"), unknown)
+        _bad("BC: tentou com bloqueador indeterminado (%r)" % unknown, why) if okt else \
+            _ok("BC: inerte sob dúvida (%r)" % (unknown or "vazio"))
+
+    print("Scenario BD: sem aresta blocks → passa direto (não inventa bloqueio onde não há)")
+    okt, _w = _blocking_verdict(mk("b4", "fix bug ga-y"), {})
+    _ok("BD: bead sem bloqueador segue closable") if okt else _bad("BD: bloqueou bead sem aresta")
+
+    print("Scenario BE: bloqueador é ele mesmo órfão DESTE sweep → não é motivo pra pular; "
+          "_order_orphans_by_blockers fecha o bloqueador antes e o bead fica closable no mesmo sweep")
+    okt, _w = _blocking_verdict(mkblocked("b5", "b6"), {"b6": "open"}, in_sweep={"b6"})
+    _ok("BE: bloqueador órfão do sweep não trava o bead") if okt else _bad("BE: pulou um bead que o sweep ia destravar", _w)
+
+    print("Scenario BF: run_cycle END-TO-END — o stub bloqueado por bead VIVO não gera mais "
+          "chamada de close (é o cenário que reprova contra o HEAD anterior: lá ele chamava, "
+          "falhava e logava WARN … retry next sweep, para sempre)")
+    closed_idsBF, blocked_stub = [], mkblocked("bs1", "ga-alive")
+    _rigs_fn = lambda: ["HQ"]
+    _bd_list_open_fn = lambda store: [blocked_stub]
+    _sessions_fn = lambda: set()
+    _bd_close_fn = lambda store, bid, reason: (closed_idsBF.append(bid) or True)
+    _do_notify_fn = lambda m, p: None
+    _target_status_fn = lambda targets_by_store: {"ga-alive": "open", "ga-target": "closed"}
+    run_cycle(NOW)
+    _ok("BF: nenhuma chamada de close desperdiçada") if closed_idsBF == [] else \
+        _bad("BF: ainda tenta fechar bead bloqueado", "closed=%s" % closed_idsBF)
+    _target_status_fn = None
+
+    print("Scenario BG: run_cycle ainda FECHA o órfão equivalente que NÃO está bloqueado — a "
+          "guarda nova não pode virar desculpa pra não limpar nada")
+    closed_idsBG = []
+    _bd_list_open_fn = lambda store: [mk("bs2", "fix bug ga-target")]
+    _bd_close_fn = lambda store, bid, reason: (closed_idsBG.append(bid) or True)
+    _target_status_fn = lambda targets_by_store: {"ga-target": "closed"}
+    run_cycle(NOW)
+    _ok("BG: segue limpando o órfão não-bloqueado") if closed_idsBG == ["bs2"] else \
+        _bad("BG: parou de limpar", "closed=%s" % closed_idsBG)
     _target_status_fn = None
 
     print("\n[sling-janitor selftest] %d passed, %d failed" % (ok[0], bad[0]))
