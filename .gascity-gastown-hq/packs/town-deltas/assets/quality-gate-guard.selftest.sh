@@ -152,6 +152,52 @@ r=$(classify_external_pr_gap3 OPEN CHANGES_REQUESTED); [ "$r" = "flag:changes-re
 r=$(classify_external_pr_gap3 ''); [ "$r" = "skip:indeterminate" ] && ok "empty pr_state (gh call failed / PR not found) → skip:indeterminate (fail-safe, never guess)" || bad "empty pr_state got '$r'"
 r=$(classify_external_pr_gap3 DRAFT); [ "$r" = "skip:indeterminate" ] && ok "unrecognized pr_state → skip:indeterminate (fail-safe)" || bad "unrecognized pr_state got '$r'"
 
+# ── reconcile_dead_reviewer_verdict_action <age> <grace> <reviewer_alive> <parent_terminal> ─
+# ga-u07fn: verdict-scoped sibling of reconcile_gaterun_action — releases ONE
+# stuck verdict for re-convocation (parent run still alive) or closes it
+# (parent run terminal), instead of Vector B's only option of superseding the
+# WHOLE run. Worked examples are the live cases Mayor triaged by hand
+# (ga-jeicm comment, 2026-08-07T23:29:11Z) that this function must reproduce.
+echo "reconcile_dead_reviewer_verdict_action: release vs close vs skip, verdict-scoped"
+r=$(reconcile_dead_reviewer_verdict_action 63 15 0 0); [ "$r" = "release" ] && ok "ga-k2na1 case: 63min dead, run active → release" || bad "ga-k2na1 case got '$r'"
+r=$(reconcile_dead_reviewer_verdict_action 88 15 0 1); [ "$r" = "close" ] && ok "ga-u8e1h case: 88min dead, run terminal → close" || bad "ga-u8e1h case got '$r'"
+r=$(reconcile_dead_reviewer_verdict_action 13 15 0 0); [ "$r" = "skip" ] && ok "ga-vvmc4 case: 13min, no live session, run active → skip (still might be booting, 13<=15 grace)" || bad "ga-vvmc4 case got '$r'"
+r=$(reconcile_dead_reviewer_verdict_action 13 15 0 1); [ "$r" = "skip" ] && ok "young + run terminal → still skip (grace wins regardless of parent state)" || bad "young+terminal got '$r'"
+r=$(reconcile_dead_reviewer_verdict_action 999 15 1 0); [ "$r" = "skip" ] && ok "reviewer_alive=1 wins over everything, even a very old verdict → skip (nothing wrong)" || bad "alive-old got '$r'"
+r=$(reconcile_dead_reviewer_verdict_action 999 15 1 1); [ "$r" = "skip" ] && ok "reviewer_alive=1 + parent terminal → still skip (a live reviewer on a run that just closed isn't THIS function's problem)" || bad "alive-terminal got '$r'"
+r=$(reconcile_dead_reviewer_verdict_action 16 15 0 0); [ "$r" = "release" ] && ok "just past grace (16>15), run active → release" || bad "just-past-grace-active got '$r'"
+r=$(reconcile_dead_reviewer_verdict_action 15 15 0 0); [ "$r" = "skip" ] && ok "exactly at grace boundary (15<=15) → skip (inclusive, mirrors reconcile_zero_verdict_run_action's own <= convention)" || bad "boundary got '$r'"
+
+# ── session_alive_for_assignee <assignee> <sess_snap_json> — single-assignee liveness ─
+echo "session_alive_for_assignee: matches id/session_name/session_id, excludes closed"
+SNAP='[{"id":"gate-reviewer-adhoc-abc123","closed":false},{"session_name":"gate-reviewer-adhoc-dead999","closed":true},{"session_id":"gate-reviewer-adhoc-xyz","closed":false}]'
+r=$(session_alive_for_assignee "gate-reviewer-adhoc-abc123" "$SNAP"); [ "$r" = "1" ] && ok "matches by .id, open → alive" || bad "id-match got '$r'"
+r=$(session_alive_for_assignee "gate-reviewer-adhoc-xyz" "$SNAP"); [ "$r" = "1" ] && ok "matches by .session_id, open → alive" || bad "session_id-match got '$r'"
+r=$(session_alive_for_assignee "gate-reviewer-adhoc-dead999" "$SNAP"); [ "$r" = "0" ] && ok "matches by .session_name but closed:true → NOT alive" || bad "closed-session got '$r'"
+r=$(session_alive_for_assignee "gate-reviewer-adhoc-nowhere" "$SNAP"); [ "$r" = "0" ] && ok "no matching session at all → not alive" || bad "no-match got '$r'"
+r=$(session_alive_for_assignee "" "$SNAP"); [ "$r" = "0" ] && ok "empty assignee → not alive, no crash (never was assigned to anyone)" || bad "empty-assignee got '$r'"
+r=$(session_alive_for_assignee "gate-reviewer-adhoc-abc123" '{"sessions":[{"id":"gate-reviewer-adhoc-abc123","closed":false}]}'); [ "$r" = "1" ] && ok "wrapped {sessions:[...]} shape (not bare array) → still matches" || bad "wrapped-shape got '$r'"
+r=$(session_alive_for_assignee "gate-reviewer-adhoc-abc123" 'not json'); [ "$r" = "0" ] && ok "unparseable snapshot → fail-safe not-alive (never crashes the sweep)" || bad "unparseable-snap got '$r'"
+r=$(session_alive_for_assignee "gate-reviewer-adhoc-abc123" ''); [ "$r" = "0" ] && ok "empty snapshot → fail-safe not-alive" || bad "empty-snap got '$r'"
+
+# ── gaterun_status_terminal <gate-status-value> — exhaustive gate-run vocabulary ─
+# The 4 terminal + 2 non-terminal values below are the FULL set ever assigned
+# to a gate-run bead (verified by grepping every set_gate_status "$GR_ID"/
+# "$GATE_RUN_ID" call site — see the function's own docstring). Marker-only
+# values (error, done, queued, ready, ...) deliberately are NOT tested here as
+# "non-terminal" cases — a gate-run is never observed carrying them, so what
+# this function does with them is moot; the fail-safe default (non-terminal)
+# just happens to also cover that hypothetical.
+echo "gaterun_status_terminal: exhaustive real gate-run vocabulary"
+r=$(gaterun_status_terminal superseded); [ "$r" = "1" ] && ok "superseded → terminal" || bad "superseded got '$r'"
+r=$(gaterun_status_terminal aborted);    [ "$r" = "1" ] && ok "aborted → terminal" || bad "aborted got '$r'"
+r=$(gaterun_status_terminal passed);     [ "$r" = "1" ] && ok "passed → terminal" || bad "passed got '$r'"
+r=$(gaterun_status_terminal failed);     [ "$r" = "1" ] && ok "failed → terminal" || bad "failed got '$r'"
+r=$(gaterun_status_terminal running);    [ "$r" = "0" ] && ok "running → NOT terminal (live run)" || bad "running got '$r'"
+r=$(gaterun_status_terminal claimed);    [ "$r" = "0" ] && ok "claimed → NOT terminal (guard's own tracking bead, still live)" || bad "claimed got '$r'"
+r=$(gaterun_status_terminal '');         [ "$r" = "0" ] && ok "empty/unreadable → fail-safe NOT terminal (never close a verdict on a guess)" || bad "empty got '$r'"
+r=$(gaterun_status_terminal weird-future-status); [ "$r" = "0" ] && ok "unrecognized future value → fail-safe NOT terminal" || bad "unrecognized got '$r'"
+
 echo ""
 echo "Results: $P passed, $F failed"
 [ "$F" -eq 0 ] && { echo "SELFTEST PASS"; exit 0; } || { echo "SELFTEST FAIL"; exit 1; }

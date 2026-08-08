@@ -59,6 +59,27 @@ GATE_ZOMBIE_AGE_MINUTES=$(( GATE_VERDICT_TIMEOUT_MINUTES + GATE_DEAD_REVIEWER_MA
 # defer, ga-cw4pm — the marker is correctly still queued the whole time).
 GATE_ZERO_VERDICT_GRACE_MINUTES="${GATE_ZERO_VERDICT_GRACE_MINUTES:-15}"
 
+# ga-u07fn: grace window for the dead-reviewer VERDICT reap (distinct from
+# Vector B's whole-RUN zombie check above, and from GATE_ZERO_VERDICT_GRACE_
+# MINUTES above — that one gates a run with NO verdict bead at all; this one
+# gates an EXISTING verdict bead whose specific assignee session isn't found
+# alive). A freshly-spawned reviewer can take ~210s to appear in the session
+# snapshot under load (ga-flfo/ga-xwdl); the grace window must clear that with
+# a comfortable margin so the sweep never releases/closes a booting reviewer's
+# own verdict bead out from under it.
+#
+# Deliberately matches GATE_ZERO_VERDICT_GRACE_MINUTES's value (15), not the
+# bead's own "5-10min" prose suggestion: Mayor's live triage (ga-jeicm,
+# 2026-08-07T23:29:11Z) explicitly left a 13-minute-old dead-looking verdict
+# (ga-vvmc4) untouched as "still might be booting" — a 5-10min threshold would
+# have wrongly caught it (13 > 10). 15 is the smallest round value consistent
+# with ALL three of Mayor's worked examples: 13min → skip (still might be
+# booting), 63min and 88min → act (long past any boot doubt). Reusing the
+# already-battle-tested sibling constant's value, rather than picking a fresh
+# number from the prose alone, is also just fewer independent magic numbers
+# for the next reader to reconcile.
+GATE_DEAD_VERDICT_GRACE_MINUTES="${GATE_DEAD_VERDICT_GRACE_MINUTES:-15}"
+
 # ── Pure decision functions (loaded in GATE_GUARD_LIB_ONLY=1 mode by tests/dispatcher) ──
 
 # age_minutes_of <ts_Z> <now_epoch>
@@ -190,6 +211,98 @@ reconcile_zero_verdict_run_action() {
     queued)              echo "supersede:still-queued" ;;
     claimed|dispatching) echo "supersede:requeue-marker" ;;
     *)                   echo "skip" ;;
+  esac
+}
+
+# reconcile_dead_reviewer_verdict_action <verdict_age_min> <grace_min> \
+#                                         <reviewer_alive: 0|1> <parent_run_terminal: 0|1>
+# Pure decision (ga-u07fn): what to do with a SINGLE `type:quality-gate-verdict`
+# bead (still verdict:pending) whose specific assignee reviewer session might be
+# dead. This is deliberately verdict-scoped, not run-scoped — it is the sibling
+# ga-jeicm/Mayor asked for alongside Vector B's reconcile_gaterun_action above,
+# because that function's action vocabulary is {skip, supersede-the-WHOLE-run,
+# abort-by-TTL}: it has no way to free ONE stuck verdict while leaving a still-
+# legitimate run (or a run with other live reviewers) alone. Two DIFFERENT
+# recoveries share the same trigger (assignee session gone) and are told apart
+# ONLY by whether the parent gate-run is still alive:
+#   - parent run still active  → release: the run is legitimately still being
+#     reviewed (or recoverable), so free the verdict bead for re-convocation
+#     rather than tearing down and re-dispatching the whole run.
+#   - parent run terminal      → close: the run already ended (closed/
+#     superseded/error) — this verdict is leftover state holding a stale
+#     assignee, not a stuck review anyone is coming back to finish.
+# Live-measured worked examples this function's grace/action split must match
+# (Mayor, ga-jeicm comment, 2026-08-07T23:29:11Z — mirrored as regression
+# cases in the selftest): ga-vvmc4 (13min, run active) → skip (still-booting
+# doubt); ga-k2na1 (63min, run active) → release; ga-u8e1h (88min, run
+# terminal) → close.
+#
+# Priority (most-specific / safest first — mirrors reconcile_gaterun_action's
+# own ordering above):
+#   1. reviewer_alive=1            → skip  (nothing wrong, don't touch)
+#   2. verdict_age_min <= grace_min → skip  (could still be booting, ~210s
+#                                     typical — see GATE_DEAD_VERDICT_GRACE_
+#                                     MINUTES above for why 15, not the boot
+#                                     estimate itself)
+#   3. parent_run_terminal=1        → close   (nothing left to finish)
+#   4. else                         → release (run is alive; free for re-convocation)
+reconcile_dead_reviewer_verdict_action() {
+  local age_min="$1" grace_min="$2" reviewer_alive="$3" parent_run_terminal="$4"
+  [ "$reviewer_alive" = "1" ] && { echo "skip"; return; }
+  [ "$age_min" -le "$grace_min" ] && { echo "skip"; return; }
+  [ "$parent_run_terminal" = "1" ] && { echo "close"; return; }
+  echo "release"
+}
+
+# session_alive_for_assignee <assignee> <sess_snap_json> — pure given the
+# snapshot as data (ga-u07fn). Single-assignee liveness check: is <assignee> a
+# still-open (non-closed) session in <sess_snap_json>? Same snapshot shape and
+# same match rule (id/session_name/session_id) as reviewers_alive_for_run's
+# inner loop below, deliberately kept as an independent standalone helper
+# rather than refactoring that function to share it — reviewers_alive_for_run
+# is live/tested code answering a different question (is ANY of N assignees
+# for a RUN alive), and collapsing the two into one shared helper is out of
+# scope for this bead (systematic-debugging: one change at a time, no bundled
+# refactor of working code). Takes the snapshot as a plain arg rather than
+# reading a global so it stays testable without sourcing the live gc-session-
+# list-cached.sh I/O path.
+session_alive_for_assignee() {
+  local a="$1" snap="$2" present
+  [ -z "$a" ] && { echo 0; return; }
+  present=$(printf '%s\n' "$snap" \
+    | jq -r --arg s "$a" 'if type=="array" then . else (.sessions // []) end
+        | map(select((.id==$s) or (.session_name==$s) or (.session_id==$s))
+              | select((.closed // false) != true)) | length' \
+    2>/dev/null || echo 0)
+  case "$present" in ''|*[!0-9]*) present=0 ;; esac
+  [ "$present" -ge 1 ] && { echo 1; return; }
+  echo 0
+}
+
+# gaterun_status_terminal <gate-status-value> — pure text classification
+# (ga-u07fn). Feeds reconcile_dead_reviewer_verdict_action's parent_run_
+# terminal arg from a gate-run bead's single gate-status:* label (extract via
+# marker_status_from_labels below, which already solves the ga-i0n83
+# ambiguous/mid-transition-label problem generically for any bead type, not
+# just markers, despite its name). Terminal = the run will never produce a
+# verdict; anything else (including empty/unrecognized, fail-safe) is treated
+# as still-active so this reaper never closes a verdict out from under a run
+# that might just be using a status word this function doesn't recognize yet.
+#
+# The four values below are EXHAUSTIVE for gate-run beads specifically, not
+# guessed from the (much larger) marker vocabulary — verified by grepping
+# every `set_gate_status "$GR_ID"/"$GATE_RUN_ID"` call site in both this file
+# and quality-gate-dispatcher.sh (plus confirming no direct `label add
+# "$GR_ID"/"$GATE_RUN_ID"` bypasses set_gate_status anywhere): a gate-run only
+# ever carries running|claimed (non-terminal, the two GATE_RUNS_JSON already
+# filters on) or superseded|aborted|passed|failed (terminal). error/done/
+# queued/ready/dispatching/needs-rebase/parked-needs-human etc. are real
+# gate-status values too, but only ever applied to MARKER beads via
+# set_gate_status "$MARKER_ID" — never observed on a gate-run.
+gaterun_status_terminal() {
+  case "$1" in
+    superseded|aborted|passed|failed) echo 1 ;;
+    *)                                echo 0 ;;
   esac
 }
 
@@ -1801,6 +1914,144 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
         ;;
       skip)
         log "  Gate-run $GR_ID active (age=${GR_AGE}m, marker_active=${MARKER_ACTIVE}, reviewers_alive=${REVIEWERS_ALIVE}) — skipping."
+        ;;
+    esac
+  done
+fi
+
+# ── Step 0b.1 (ga-u07fn): dead-reviewer VERDICT reap ─────────────────────────
+# Sibling of Vector B above, at verdict granularity instead of run granularity.
+# Vector B's only actions are {skip, supersede-the-WHOLE-run, abort-by-TTL} —
+# it cannot free ONE stuck verdict while leaving a still-legitimate run (or a
+# run with other live reviewers) alone. This step queries every still-pending
+# type:quality-gate-verdict bead, and for any whose specific assignee session
+# is confirmed dead AND has had at least GATE_DEAD_VERDICT_GRACE_MINUTES to
+# boot, either releases it (parent run still active — re-convocation
+# candidate) or closes it (parent run terminal — leftover state). See
+# reconcile_dead_reviewer_verdict_action's docstring above for the full
+# decision table and the live worked examples it mirrors (ga-jeicm, Mayor,
+# 2026-08-07T23:29:11Z).
+#
+# Scope: NON-EMPTY assignee only (ga-u07fn investigation). A live sweep of
+# today's actual verdict:pending population found 45 of 46 open verdicts with
+# assignee=="" and gate-run labels referencing ga-wisp-* ids that don't
+# resolve via `bd show` (ages up to ~40 days) — these do NOT match the bead's
+# own framing ("assignee sessão gate-reviewer-* sem sessão viva") or any of
+# Mayor's three worked examples, all of which had a real gate-reviewer-*
+# assignee. That population looks like a different, older, unexplained issue
+# (dangling reference to an already-reaped parent wisp, most likely) and is
+# OUT OF SCOPE here — touching beads whose root cause I haven't verified would
+# be exactly the "guess instead of measure" failure mode this codebase's own
+# doctrine warns against. Filed as a separate follow-up: ga-u07fn's own
+# tracking comment cross-references the new bead. Do not fold that population
+# into this reap without its own investigation.
+#
+# Deliberately placed AFTER Vector B's own loop (not interleaved) so that any
+# gate-run Vector B just superseded in THIS sweep already reads as terminal
+# when this step looks it up — collapsing what would otherwise be a one-cycle
+# race (release now, close next sweep) into a same-sweep correct close.
+#
+# verdict beads are NOT ephemeral (dispatcher creates them deliberately non-
+# ephemeral, ga-vephl — see the create call's own comment) so this query needs
+# no --include-infra. Must NOT add --status open: verified live that a
+# claimed-but-not-yet-formally-in_progress verdict sits at status=="open" as
+# its normal resting state (assign_verdict_bead_verified sets in_progress only
+# on the ga-cvhoj re-convene path) — `--status open` would silently exclude
+# genuine in_progress verdicts, the exact shape this step exists to catch.
+# --limit 0 matters (ga-21kmp): today's live count (46) is already close to
+# the 50-row default truncation.
+log "Step 0b.1 (ga-u07fn): dead-reviewer verdict reap — grace=${GATE_DEAD_VERDICT_GRACE_MINUTES}m..."
+
+# ga-u07fn self-audit fix: capture query success/failure explicitly, same
+# idiom as the GATE_RUNS_JSON fetch above (ga-qj1xh) — a FAILED query
+# (Dolt timeout/contention) must never silently read the same as a
+# CONFIRMED-empty result. The consequence here is benign either way (this
+# step just takes no action, which is the safe/inert default) but SILENT
+# fail-open is still wrong per the third-state rule: it must be visible,
+# not indistinguishable from "genuinely nothing to do this sweep".
+if DEAD_VERDICT_JSON=$(bd -C "$GC_CITY" list --json --limit 0 \
+    -l type:quality-gate-verdict -l verdict:pending \
+    2>/dev/null); then
+  DEAD_VERDICT_COUNT=$(printf '%s\n' "$DEAD_VERDICT_JSON" | jq 'length' 2>/dev/null || echo "0")
+  case "$DEAD_VERDICT_COUNT" in
+    ''|*[!0-9]*)
+      warn "ga-u07fn: verdict-reap query returned unparseable output — skipping this sweep rather than guessing a count."
+      DEAD_VERDICT_COUNT=0
+      ;;
+  esac
+else
+  warn "ga-u07fn: verdict-reap query FAILED (Dolt timeout/contention?) — skipping this sweep; next sweep in ~2min will retry. Not a confirmed-empty result."
+  DEAD_VERDICT_JSON="[]"
+  DEAD_VERDICT_COUNT=0
+fi
+
+if [ "$DEAD_VERDICT_COUNT" -gt 0 ]; then
+  # NOW_EPOCH/SESS_SNAP_JSON may already be set by the Vector B block above —
+  # but that block only runs when GATE_RUN_COUNT>0, so this step cannot rely
+  # on either being set and must fall back to fetching its own.
+  NOW_EPOCH="${NOW_EPOCH:-$(date +%s)}"
+  if [ -z "${SESS_SNAP_JSON:-}" ]; then
+    SESS_SNAP_JSON=$(bash "$GC_CITY/scripts/gc-session-list-cached.sh" 2>/dev/null || echo '{}')
+  fi
+
+  for _dvi in $(seq 0 $((DEAD_VERDICT_COUNT - 1))); do
+    DV=$(printf '%s\n' "$DEAD_VERDICT_JSON" | jq ".[$_dvi]")
+    DV_ID=$(printf '%s\n' "$DV" | jq -r '.id // ""')
+    DV_ASSIGNEE=$(printf '%s\n' "$DV" | jq -r '.assignee // ""')
+    DV_CREATED=$(printf '%s\n' "$DV" | jq -r '.created_at // ""')
+    DV_LABELS=$(printf '%s\n' "$DV" | jq -r '(.labels // []) | join(" ")')
+    [ -z "$DV_ID" ] && continue
+    # Empty assignee: out of scope (see comment block above) — nothing to
+    # release (there is no live claim to break) and closing on parent-
+    # terminal-alone belongs to the separate follow-up investigation, not
+    # silently folded in here.
+    [ -z "$DV_ASSIGNEE" ] && continue
+
+    DV_ALIVE=$(session_alive_for_assignee "$DV_ASSIGNEE" "$SESS_SNAP_JSON")
+    [ "$DV_ALIVE" = "1" ] && continue
+
+    DV_AGE=$(age_minutes_of "$DV_CREATED" "$NOW_EPOCH")
+    case "$DV_AGE" in ''|*[!0-9]*) DV_AGE=0 ;; esac
+    if [ "$DV_AGE" -le "$GATE_DEAD_VERDICT_GRACE_MINUTES" ]; then
+      continue
+    fi
+
+    DV_GR_ID=$(printf '%s\n' "$DV_LABELS" | grep -oE 'gate-run:[A-Za-z0-9._-]+' | head -1 | sed 's/^gate-run://')
+    if [ -z "$DV_GR_ID" ]; then
+      warn "ga-u07fn: verdict $DV_ID (age=${DV_AGE}m, assignee=$DV_ASSIGNEE not alive) carries no gate-run:<id> label — cannot determine parent liveness, skipping rather than guessing."
+      continue
+    fi
+    DV_GR_JSON=$(bd -C "$GC_CITY" show "$DV_GR_ID" --json 2>/dev/null)
+    DV_GR_FOUND_ID=$(printf '%s\n' "$DV_GR_JSON" | jq -r 'if type=="array" then (.[0].id // empty) else (.id // empty) end' 2>/dev/null)
+    if [ -z "$DV_GR_FOUND_ID" ]; then
+      warn "ga-u07fn: verdict $DV_ID's parent gate-run $DV_GR_ID unresolvable via bd show — skipping this sweep rather than guessing release-vs-close on an unreadable parent (root-class:error-vs-empty)."
+      continue
+    fi
+    DV_GR_LABELS=$(printf '%s\n' "$DV_GR_JSON" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null)
+    DV_GR_STATUS=$(marker_status_from_labels "$DV_GR_LABELS")
+    DV_GR_TERMINAL=$(gaterun_status_terminal "$DV_GR_STATUS")
+
+    DV_ACTION=$(reconcile_dead_reviewer_verdict_action "$DV_AGE" "$GATE_DEAD_VERDICT_GRACE_MINUTES" "$DV_ALIVE" "$DV_GR_TERMINAL")
+    case "$DV_ACTION" in
+      release)
+        warn "ga-u07fn: releasing stuck verdict $DV_ID (age=${DV_AGE}m, assignee=$DV_ASSIGNEE not alive, parent run $DV_GR_ID active [gate-status:${DV_GR_STATUS:-?}]) for re-convocation."
+        bd -C "$GC_CITY" comment "$DV_ID" "ga-u07fn: verdict released — assignee $DV_ASSIGNEE has no live session after ${DV_AGE}m (grace=${GATE_DEAD_VERDICT_GRACE_MINUTES}m) and parent gate-run $DV_GR_ID is still active (gate-status:${DV_GR_STATUS:-?}). Freed for re-convocation by a fresh reviewer. Self-healed by guard." 2>/dev/null || true
+        bd -C "$GC_CITY" unclaim "$DV_ID" --force --if-assignee "$DV_ASSIGNEE" -r "ga-u07fn: dead-reviewer reap — no live session after ${DV_AGE}m, parent run still active" 2>/dev/null || \
+          warn "ga-u07fn: unclaim of $DV_ID did not apply (assignee likely changed since the liveness check moments ago — benign race, next sweep re-evaluates fresh)."
+        ;;
+      close)
+        warn "ga-u07fn: closing stuck verdict $DV_ID (age=${DV_AGE}m, assignee=$DV_ASSIGNEE not alive, parent run $DV_GR_ID terminal [gate-status:${DV_GR_STATUS:-?}]) — leftover state, nothing left to finish."
+        bd -C "$GC_CITY" comment "$DV_ID" "ga-u07fn: verdict closed — assignee $DV_ASSIGNEE has no live session after ${DV_AGE}m and parent gate-run $DV_GR_ID is already terminal (gate-status:${DV_GR_STATUS:-?}). This verdict was leftover state, not a stuck review. Self-healed by guard." 2>/dev/null || true
+        # ga-u07fn self-audit fix: the comment above already asserts "verdict
+        # closed" — if the close call below fails, that comment becomes a
+        # claim the code didn't deliver (exactly the "comment promises more
+        # than the code does" defect). Mirror the release branch's existing
+        # explicit-warn-on-failure pattern instead of a bare `|| true`.
+        bd -C "$GC_CITY" close "$DV_ID" -r "gate-run $DV_GR_ID terminal (gate-status:${DV_GR_STATUS:-?}), verdict was leftover assignee state. Closed by guard (ga-u07fn)." 2>/dev/null || \
+          warn "ga-u07fn: close of $DV_ID FAILED — the comment above claims it closed but the bead is still open. Next sweep will retry."
+        ;;
+      skip)
+        : # reviewer_alive/grace already filtered above via early `continue`s; reconcile fn's own skip branch is defense-in-depth, nothing further to do
         ;;
     esac
   done
