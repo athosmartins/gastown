@@ -32,7 +32,8 @@ set +e  # the harness counts its own pass/fail
 
 for fn in scan_shell_query_masking scan_js_empty_catch scan_py_bare_except scan_launchd_no_notify \
   scan_bd_list_no_limit scan_bd_gate_no_infra scan_bd_formatted_output_parsed scan_pipe_then_exit_code \
-  scan_jq_length_as_existence scan_git_stale_cache_check _allowlisted _join_continued_lines run_scan; do
+  scan_jq_length_as_existence scan_git_stale_cache_check _allowlisted _allowlisted_range \
+  _join_continued_lines _split_statements run_scan; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by scanner"; exit 1; }
 done
 
@@ -639,6 +640,34 @@ echo "$x" | grep -q foo; bd show "$ID"
 EOF
 cp "$FIXDIR/mixed/good_a4gfd_c6_unrelated_pipe_before_bd_show.sh" "$FIXDIR/clean/"
 
+# ── ga-j34ml gate-feedback (round 2): ga-a4gfd's per-statement split only
+# covered ';' — '&&' and '||' chain independent statements just as commonly
+# in this exact codebase's own idiom (this file's own C1/C2 detectors exist
+# BECAUSE of '|| true'/'|| echo' masking) and were left fully unsplit, so
+# the identical masking bug reproduced unchanged for them. Same 3 shapes as
+# the ga-a4gfd fixtures above, operator swapped to '&&' (C4/C5/C6) and '||'
+# (C4 again, since the reviewer's own repro covered both for that detector).
+cat > "$FIXDIR/mixed/bad_j34ml_c4_and_two_calls.sh" <<'EOF'
+bd -C "$A" list --json --limit 0 2>/dev/null && bd -C "$B" list --json 2>/dev/null
+EOF
+
+cat > "$FIXDIR/mixed/bad_j34ml_c4_oror_two_calls.sh" <<'EOF'
+bd -C "$A" list --json --limit 0 2>/dev/null || bd -C "$B" list --json 2>/dev/null
+EOF
+
+# ga-j34ml: both calls carry --limit 0 so this is an ISOLATED C5 test (same
+# convention as bad_c5_no_infra.sh above) — without it, neither statement
+# would have --limit 0 and C4 would ALSO fire on both, making this fixture
+# silently prove two detectors at once instead of the one its name claims.
+cat > "$FIXDIR/mixed/bad_j34ml_c5_and_two_calls.sh" <<'EOF'
+bd -C "$A" list --json --all --limit 0 --include-infra -l type:quality-gate-run 2>/dev/null && bd -C "$B" list --json --all --limit 0 -l type:quality-gate-run 2>/dev/null
+EOF
+
+cat > "$FIXDIR/mixed/good_j34ml_c6_and_unrelated_pipe.sh" <<'EOF'
+ps aux | grep proc && bd show "$ID"
+EOF
+cp "$FIXDIR/mixed/good_j34ml_c6_and_unrelated_pipe.sh" "$FIXDIR/clean/"
+
 # ═════════════════════════════════════════════════════════════════════════
 # 1. Direct pure-function detection tests
 # ═════════════════════════════════════════════════════════════════════════
@@ -829,6 +858,41 @@ r="$(scan_bd_formatted_output_parsed "$FIXDIR/mixed/good_a4gfd_c6_unrelated_pipe
     "(per-statement scoping; whole-line reasoning used to false-positive here)" \
   || bad "ga-a4gfd REGRESSION: false positive reproduced — unrelated pipe misattributed to bd show: '$r'"
 
+echo "── _split_statements (ga-j34ml direct unit test — the actual shared helper) ──"
+n="$(_split_statements 'a; b && c || d' | grep -c .)"
+[ "$n" = "4" ] && ok "ga-j34ml: ';', '&&', '||' mixed on one fragment → splits into all 4 statements" \
+  || bad "ga-j34ml REGRESSION: expected 4 statements from mixed ';'/'&&'/'||', got $n"
+case "$(_split_statements 'a; b && c || d')" in
+  *a*) : ;; *) bad "ga-j34ml: first statement 'a' missing from split output" ;;
+esac
+case "$(_split_statements 'a; b && c || d')" in
+  *d*) ok "ga-j34ml: all 3 operators (';', '&&', '||') recognized as statement separators by one shared helper" ;;
+  *) bad "ga-j34ml REGRESSION: last statement 'd' missing — an operator was not split" ;;
+esac
+
+echo "── ga-j34ml gate-feedback (round 2): && / || coverage for C4/C5/C6 ──"
+r="$(scan_bd_list_no_limit "$FIXDIR/mixed/bad_j34ml_c4_and_two_calls.sh")"
+case "$r" in *'$B'*) ok "ga-j34ml FIX: 2 &&-chained bd calls, first fixed second not → flags the SECOND" ;;
+  '') bad "ga-j34ml REGRESSION: && false negative reproduced — first call's --limit 0 masked the second's absence" ;;
+  *) bad "ga-j34ml: flagged something unexpected for &&: '$r'" ;;
+esac
+
+r="$(scan_bd_list_no_limit "$FIXDIR/mixed/bad_j34ml_c4_oror_two_calls.sh")"
+case "$r" in *'$B'*) ok "ga-j34ml FIX: 2 ||-chained bd calls, first fixed second not → flags the SECOND" ;;
+  '') bad "ga-j34ml REGRESSION: || false negative reproduced — first call's --limit 0 masked the second's absence" ;;
+  *) bad "ga-j34ml: flagged something unexpected for ||: '$r'" ;;
+esac
+
+r="$(scan_bd_gate_no_infra "$FIXDIR/mixed/bad_j34ml_c5_and_two_calls.sh")"
+case "$r" in *'$B'*) ok "ga-j34ml FIX: 2 &&-chained bd calls, first has --include-infra second not → flags the SECOND" ;;
+  '') bad "ga-j34ml REGRESSION: && false negative reproduced for C5 — first call's --include-infra masked the second's absence" ;;
+  *) bad "ga-j34ml: C5 flagged something unexpected for &&: '$r'" ;;
+esac
+
+r="$(scan_bd_formatted_output_parsed "$FIXDIR/mixed/good_j34ml_c6_and_unrelated_pipe.sh")"
+[ -z "$r" ] && ok "ga-j34ml FIX: unrelated pipe (ps|grep) before a bare 'bd show', joined by && → NOT flagged" \
+  || bad "ga-j34ml REGRESSION: && false positive reproduced — unrelated pipe misattributed to bd show: '$r'"
+
 echo "── run_scan end-to-end (mixed fixture dir) ──"
 MIXED_OUT="$(mktemp)"
 run_scan "$MIXED_OUT" "$FIXDIR/mixed"
@@ -872,8 +936,19 @@ mixed_count=$(wc -l <"$MIXED_OUT" | tr -d '[:space:]')
 # good_a4gfd_multiline_allowlisted.sh and good_a4gfd_c6_unrelated_pipe_
 # before_bd_show.sh add 0 (verified individually above, AND via the
 # clean-dir falsification below — both are ALSO copied into $FIXDIR/clean).
-[ "$mixed_count" = "27" ] && ok "mixed fixture dir → 27 findings (25 pre-ga-a4gfd + 2 from the gate-feedback regression fixtures), nothing missed or double-counted" \
-  || bad "expected 27 findings in mixed dir, got $mixed_count"
+# ga-j34ml: +3 for the round-2 gate-feedback fixtures — bad_j34ml_c4_and_
+# two_calls.sh and bad_j34ml_c4_oror_two_calls.sh (the '&&'/'||' split fix
+# for C4, each flags exactly the second bd call — same shape as ga-a4gfd's
+# ';' case, operators swapped) + bad_j34ml_c5_and_two_calls.sh (same fix
+# for C5's '&&' case; both its bd calls carry --limit 0 so it stays an
+# ISOLATED C5 test, same convention as bad_c5_no_infra.sh above — without
+# that, neither call would have --limit 0 and C4 would ALSO fire on both,
+# making this one fixture silently prove two detectors instead of the one
+# its name claims) — bringing 27 to 30. good_j34ml_c6_and_unrelated_pipe.sh
+# adds 0 (verified individually above, AND via the clean-dir falsification
+# below — also copied into $FIXDIR/clean).
+[ "$mixed_count" = "30" ] && ok "mixed fixture dir → 30 findings (27 pre-ga-j34ml + 3 from the round-2 gate-feedback fixtures), nothing missed or double-counted" \
+  || bad "expected 30 findings in mixed dir, got $mixed_count"
 
 case "$(cat "$MIXED_OUT")" in
   *fixture_shape.selftest.sh*) bad "ga-6jfuo REGRESSION: *.selftest.sh file was scanned by run_scan (should be find-excluded): $(grep 'fixture_shape.selftest.sh' "$MIXED_OUT")" ;;
@@ -920,8 +995,8 @@ rm -f "$CLEAN_OUT"
 echo "── CLI wrapper ──"
 out="$(bash "$SCANNER" --path "$FIXDIR/mixed" --quiet)"; rc=$?
 [ "$rc" = "0" ] && ok "CLI exits 0 on a completed scan with findings" || bad "CLI exit code was $rc, expected 0"
-printf '%s\n' "$out" | grep -q '^error-empty-conflation-scan: 27 finding(s)$' \
-  && ok "CLI summary line reports 27 finding(s)" || bad "CLI summary line unexpected: $(printf '%s\n' "$out" | head -1)"
+printf '%s\n' "$out" | grep -q '^error-empty-conflation-scan: 30 finding(s)$' \
+  && ok "CLI summary line reports 30 finding(s)" || bad "CLI summary line unexpected: $(printf '%s\n' "$out" | head -1)"
 
 bash "$SCANNER" --path "$FIXDIR/does-not-exist" --quiet >/tmp/.conflation-selftest-missing-path.$$ 2>&1
 rc=$?

@@ -134,6 +134,33 @@ _allowlisted_range() {
   return 1
 }
 
+# _split_statements <fragment> — pure text transform (ga-j34ml gate-feedback
+# fix, round 2 on the ga-a4gfd per-statement scoping). ga-a4gfd's own fix
+# split on ';' only, independently at 3 call sites (C4/C5/C6) — each site
+# was fixed the same INCOMPLETE way, because the split logic wasn't
+# centralized. Reproduced live: ';', '&&', and '||' all chain independent
+# statements in this exact codebase's own idiom interchangeably (this
+# file's own C1/C2 detectors exist BECAUSE of `|| true`/`|| echo` masking —
+# `||` is not a rare shape here), so a ';'-only split left the identical
+# masking bug (one call's fix hides a different call's real violation)
+# fully alive for '&&'/'||'-chained statements in all 3 functions.
+#
+# ONE shared helper now, not 3 independent copies — so a future 4th
+# operator (if one is ever demonstrated to matter) is fixed once, not
+# missed at 2 of 3 sites the way this one was. Splits on any of ';', '&&',
+# '||' via a single sed pass (sed -E, not bash's [[ =~ ]] regex engine —
+# consistent with this file's own documented bash-3.2 caution above).
+# Deliberately does NOT split on a bare '&' (backgrounding) — not
+# demonstrated as a real shape in this codebase's actual style, and
+# distinguishing it from '&&' safely would add real complexity for a
+# problem nobody has shown exists; if that changes, extend here, in this
+# one place. Naive (does not respect quoting) — the same accepted
+# limitation as the original ';'-only split, matching this file's own
+# "heuristic, not a parser" house style.
+_split_statements() {
+  printf '%s' "$1" | sed -E 's/(;|&&|\|\|)/\n/g'
+}
+
 # ga-q0n6a: join backslash-line-continued shell statements into one logical
 # line before scanning, for detectors where it matters (C4/C5/C9 below — all
 # of which look for an ABSENT flag/word anywhere in a `bd`/`git` invocation
@@ -465,19 +492,18 @@ scan_launchd_no_notify() {
 # there are now only a handful of candidates, not hundreds).
 #
 # ga-a4gfd gate-feedback fix: the precise check below now scopes to each
-# `;`-separated STATEMENT within a candidate line/block independently,
-# rather than reasoning over the whole joined line. Reproduced live before
-# fixing: `bd -C "$A" list --json --limit 0 2>/dev/null; bd -C "$B" list
-# --json 2>/dev/null` — two independent bd calls, one fixed, one not — used
-# to report ZERO findings, because the first call's --limit 0 satisfied the
+# STATEMENT within a candidate line/block independently (via
+# _split_statements above — ';'/'&&'/'||', not just ';'; see ga-j34ml's
+# round-2 fix on that helper's own docstring for why), rather than
+# reasoning over the whole joined line. Reproduced live before fixing:
+# `bd -C "$A" list --json --limit 0 2>/dev/null; bd -C "$B" list --json
+# 2>/dev/null` — two independent bd calls, one fixed, one not — used to
+# report ZERO findings, because the first call's --limit 0 satisfied the
 # whole-line check and silently masked the second call's real, unaddressed
 # truncation risk (the exact ga-21kmp class this detector exists for). This
 # is the identical scoping mistake _c2_scan_substitutions's own docstring
 # above documents already diagnosing and fixing once, for C1/C2 (ga-50m2) —
-# reintroduced here in new code that didn't inherit that fix. Split is a
-# naive `tr ';' '\n'` (does not respect quoting — an accepted limitation
-# matching this file's own house style; a bd list/show invocation's own
-# arguments are not expected to contain a literal semicolon in practice).
+# reintroduced here in new code that didn't inherit that fix.
 scan_bd_list_no_limit() {
   local file="$1" joined="${2:-}" start end frag stmt
   [ -z "$joined" ] && joined="$(_join_continued_lines "$file")"
@@ -490,7 +516,7 @@ scan_bd_list_no_limit() {
       printf '%s' "$stmt" | grep -Eq -- '--limit[[:space:]]+0|-n[[:space:]]+0|--limit=0' && continue
       _allowlisted_range "$file" "$start" "$end" && continue
       echo "${file}:${start}:C4:${stmt}"
-    done < <(printf '%s' "$frag" | tr ';' '\n')
+    done < <(_split_statements "$frag")
   done < <(printf '%s\n' "$joined" \
     | grep -E "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]]list([[:space:]]|\$)" \
     | grep -F -- '--json')
@@ -526,7 +552,7 @@ scan_bd_gate_no_infra() {
       printf '%s' "$stmt" | grep -Eq -- '--include-infra' && continue
       _allowlisted_range "$file" "$start" "$end" && continue
       echo "${file}:${start}:C5:${stmt}"
-    done < <(printf '%s' "$frag" | tr ';' '\n')
+    done < <(_split_statements "$frag")
   done < <(printf '%s\n' "$joined" \
     | grep -E "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]](list|show)([[:space:]]|\$)" \
     | grep -F -- 'type:quality-gate-')
@@ -569,7 +595,7 @@ scan_bd_formatted_output_parsed() {
       printf '%s' "$stmt" | grep -Eq '\|[[:space:]]*(grep|egrep|sed|awk)([^A-Za-z0-9_]|$)' || continue
       _allowlisted_range "$file" "$start" "$end" && continue
       echo "${file}:${start}:C6:${stmt}"
-    done < <(printf '%s' "$frag" | tr ';' '\n')
+    done < <(_split_statements "$frag")
   done < <(printf '%s\n' "$joined" \
     | grep -E "([^A-Za-z0-9_]|^)bd([^A-Za-z0-9_].*)?[[:space:]](comments|show)([[:space:]]|\$)" \
     | grep -E '\|[[:space:]]*(grep|egrep|sed|awk)([^A-Za-z0-9_]|$)')
