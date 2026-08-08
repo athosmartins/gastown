@@ -130,7 +130,45 @@ GOLW_STORES="${GOLW_STORES:-$HQ /Users/athos/gt/whatsapp_automation /Users/athos
 # scripts/ + packs/town-deltas/assets/ found zero write-sites for it in any
 # quality-gate-*/pilot-dispatcher code, confirming it's outside that pipeline
 # entirely. Space-separated, env-overridable if another such family turns up.
-GOLW_EXCLUDE_LABEL_PREFIXES="${GOLW_EXCLUDE_LABEL_PREFIXES:-gate:prod-deploy:}"
+#
+# ga-h8rcp (Mayor, 2026-08-08): + gate:passed. Unlike gate:prod-deploy: this one
+# IS inside the pipeline — it is the state in which having no active marker is
+# CORRECT, so flagging it inverts the watchdog's own question. gate:passed is
+# terminal SUCCESS: the gate is done with the bead by design. The bead may then
+# legitimately stay open (ga-7j5vf: delivery:partial + scope:needs-review — one
+# slice landed, more scope pending) or close hours later (wa-f2fc8 closed 5h
+# after passing). Neither is anything a human can triage.
+#
+# That is why the alert count only ever GREW through a day (8 -> 10 in one
+# night) and never correlated with any label-transition window: it was counting
+# delivered work. Measured across HQ+wa+ps: the 8 flagged beads were exactly
+# 7x [gate:passed] + 1x [gate:fix-attempt:1,gate:passed]; zero real strands.
+#
+# ⚠️ KNOWN RESIDUAL, measured not assumed: this kills 7 of the 8, not 8 of 8.
+# gate:fix-attempt:N is a COUNTER, never cleared, so a bead that needed one fix
+# and then passed keeps [gate:fix-attempt:1,gate:passed] and still alerts until
+# it closes. It is NOT added to this list because gate:fix-attempt:1 is the
+# default fixture label in ~25 selftest scenarios below — excluding it would
+# silently un-flag most of this file's own regression coverage. The right fix
+# is a separate NEUTRAL-prefix concept (counters ignored when deciding whether
+# every remaining gate:* label is excluded), which needs its own tests; tracked
+# on ga-h8rcp rather than smuggled in here.
+#
+# ⚠️ The safety property comes from the ALL-must-match semantics below, NOT
+# from this list: a bead is excluded only when EVERY one of its gate:* labels
+# falls in an excluded family. So the anomalies stay visible —
+# [gate:passed,gate:queued] (the ga-i0n83 contradiction) and
+# [gate:failed,gate:fix-attempt:1,gate:needs-fix] both keep alerting, because
+# queued/failed/needs-fix are not excluded. Do NOT "simplify" this into a
+# per-label skip: that would silence the contradiction this watchdog exists to
+# catch, and I cleaned that contradiction by hand 7x in one night.
+#
+# ⚠️ Excluding gate:passed does NOT blind the city to "merged but never closed"
+# — merged-bead-janitor.sh owns that class and is live (verified sweeping,
+# closing beads and pruning branches, 2026-08-08 04:50). Checked before
+# removing the signal, because a detector deleted on the assumption that
+# something else covers it is how a gap opens silently.
+GOLW_EXCLUDE_LABEL_PREFIXES="${GOLW_EXCLUDE_LABEL_PREFIXES:-gate:prod-deploy: gate:passed}"
 
 LOG="${GOLW_LOG:-$HQ/.gc/logs/gate-orphaned-label-watchdog.log}"
 NOTIFY_BIN="${GOLW_NOTIFY_BIN:-/Users/athos/.local/bin/notify}"
@@ -362,9 +400,12 @@ run_sweep() {
     #      "different namespace" alone does NOT separate target beads from
     #      artifact beads — the type:* label must be excluded explicitly or a
     #      marker misreads as a stranded target.
-    #  (b) GOLW_EXCLUDE_LABEL_PREFIXES (default gate:prod-deploy:) — confirmed
-    #      non-pipeline gate:*-prefixed families that will never carry a
-    #      quality-gate-marker by design (see config comment above). Only
+    #  (b) GOLW_EXCLUDE_LABEL_PREFIXES (default: gate:prod-deploy: gate:passed)
+    #      — gate:*-prefixed families for which "no active marker" is the
+    #      CORRECT state, so flagging them is always noise: non-pipeline
+    #      families that never carry a marker by design (gate:prod-deploy:),
+    #      plus the terminal success state gate:passed (see config comment
+    #      above for the live measurement). Only
     #      excludes a bead when ALL of its gate:*-prefixed labels fall in this
     #      family — a bead mixing e.g. gate:prod-deploy:* with a real pipeline
     #      label like gate:queued still gets evaluated, since the pipeline
@@ -835,6 +876,51 @@ BDSTUB
   GOLW_TEST_NOTIFIED="$NOTIF5D" GOLW_TEST_MAILED="$TMP/mail5d" GOLW_TEST_COMMENTS_LOG="$TMP/comm5d" run_sweep
   rc=$?
   [ "$rc" -eq 1 ] && ok "scenario 5d: mixed-label bead with a real pipeline label still flagged (return 1)" || bad "scenario 5d: a bead with gate:queued alongside gate:prod-deploy:* should still be evaluated on its own merits, got $rc"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 5e (ga-h8rcp, live-measured 2026-08-08): a bead whose ONLY
+  # gate:* label is gate:passed must NOT be flagged. gate:passed is terminal
+  # SUCCESS — the gate is done with it by design, so "no active marker" is the
+  # expected state, not a strand. This was 7 of the 8 live false positives in
+  # one night (ga-7j5vf shape: passed + still open on delivery:partial). ──────
+  echo "Scenario 5e: bead with ONLY gate:passed is excluded (terminal success, not an orphan)"
+  printf '[%s]' "$(mk_candidate cand-passed "$TMP/hq" "gate:passed,delivery:partial,scope:needs-review" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-passed.json"
+  NOTIF5E="$TMP/notif5e"; : > "$NOTIF5E"
+  GOLW_TEST_NOTIFIED="$NOTIF5E" GOLW_TEST_MAILED="$TMP/mail5e" GOLW_TEST_COMMENTS_LOG="$TMP/comm5e" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 5e: gate:passed-only bead excluded (return 0)" || bad "scenario 5e (ga-h8rcp regression): a gate:passed-only bead was misflagged as orphaned, got $rc"
+  [ ! -s "$NOTIF5E" ] && ok "scenario 5e: no notify for delivered work" || bad "scenario 5e: notify fired for a gate:passed-only bead (false positive)"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 5f (ga-h8rcp AC2 — the control that keeps 5e honest):
+  # gate:passed ALONGSIDE a real pipeline label (gate:queued) is the ga-i0n83
+  # CONTRADICTION — passed and queued at once — and MUST still alert. This is
+  # the case the naive fix ("just skip any bead carrying gate:passed") would
+  # silence, and it is exactly the residue I cleaned by hand 7x in one night.
+  # The ALL-must-match semantics of the exclusion is what preserves it. ───────
+  echo "Scenario 5f: gate:passed TOGETHER with gate:queued still alerts (the ga-i0n83 contradiction)"
+  printf '[%s]' "$(mk_candidate cand-contra "$TMP/hq" "gate:passed,gate:queued" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-contra.json"
+  NOTIF5F="$TMP/notif5f"; : > "$NOTIF5F"
+  GOLW_TEST_NOTIFIED="$NOTIF5F" GOLW_TEST_MAILED="$TMP/mail5f" GOLW_TEST_COMMENTS_LOG="$TMP/comm5f" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 5f: passed+queued contradiction still flagged (return 1)" || bad "scenario 5f (ga-h8rcp AC2 regression): excluding gate:passed also silenced the passed+queued contradiction, got $rc"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 5g (ga-h8rcp AC3): a REAL strand must be unaffected. gate:queued
+  # with no active artifact is the shape the watchdog exists to catch; if this
+  # ever stops alerting, the exclusion list has been over-broadened. ──────────
+  echo "Scenario 5g: a real strand (gate:queued, no artifact) is unaffected by the exclusion"
+  printf '[%s]' "$(mk_candidate cand-real "$TMP/hq" "gate:queued" "$OLD_TS")" > "$TMP/fixtures/candidates-hq.json"
+  echo '[]' > "$TMP/fixtures/candidates-wa.json"
+  echo '[]' > "$TMP/fixtures/artifacts-cand-real.json"
+  NOTIF5G="$TMP/notif5g"; : > "$NOTIF5G"
+  GOLW_TEST_NOTIFIED="$NOTIF5G" GOLW_TEST_MAILED="$TMP/mail5g" GOLW_TEST_COMMENTS_LOG="$TMP/comm5g" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 5g: real gate:queued strand still flagged (return 1)" || bad "scenario 5g (ga-h8rcp AC3 regression): the exclusion swallowed a real strand, got $rc"
   rm -f "$STATE_FILE" 2>/dev/null
 
   # ── Scenario 6: COOLDOWN — same bead flagged twice, 2nd run within cooldown suppresses re-alert ──
