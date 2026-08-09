@@ -17,6 +17,11 @@ sentence-transformers/tiktoken live only in $GC_CITY_PATH/.gc/recall-venv):
     $GC_CITY_PATH/.gc/recall-venv/bin/python3 recall.py "<query>"
 
 or via the `recall` wrapper on PATH, which does that for you.
+
+Exit codes — do not conflate these (wa-h9dc1): 0 = ran fine, including the
+legitimate "No matching closed beads found." outcome; 2 = CLI usage error
+(argparse, e.g. empty query); 3 = could NOT search at all (e.g. embedding
+model unavailable) — callers must treat this differently from "0 results".
 """
 from __future__ import annotations
 
@@ -80,12 +85,18 @@ def main(argv=None) -> int:
             print(msg, file=sys.stderr)
 
     t0 = time.time()
-    idx = ensure_index(args.rebuild, progress)
-
-    model = rl.load_model()
-    results = rl.hybrid_retrieve(query, idx, model=model, k=args.k)
-    for r in results:
-        r["top_comments"] = rl.top_comments(r["bead"], query, model=model, n=2)
+    try:
+        idx = ensure_index(args.rebuild, progress)
+        model = rl.load_model()
+        results = rl.hybrid_retrieve(query, idx, model=model, k=args.k)
+        for r in results:
+            r["top_comments"] = rl.top_comments(r["bead"], query, model=model, n=2)
+    except rl.RecallModelUnavailableError as e:
+        # Distinct from "ran fine, 0 results" (exit 0) and from argparse's
+        # usage-error convention (exit 2) — callers must not read this as
+        # "no matching beads" (wa-h9dc1).
+        print(f"recall: unavailable — could not search: {e}", file=sys.stderr)
+        return 3
 
     elapsed = time.time() - t0
     rl.log_usage(query, results, idx, elapsed)

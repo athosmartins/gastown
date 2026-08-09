@@ -14,6 +14,7 @@ or via scripts/recall.selftest.sh.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -117,6 +118,61 @@ class TestKeywordsAndChunking(unittest.TestCase):
     def test_full_text_skips_empty_fields(self):
         bead = {"title": "T", "description": "", "comments": []}
         self.assertEqual(rl.full_text(bead), "T")
+
+
+# ---------------------------------------------------------------------------
+# load_model() bootstrap/self-heal contract (wa-h9dc1) — mocked
+# SentenceTransformer, no real network or model weights needed. Real-model
+# loading is already exercised by TestHybridRetrievalQuality.setUpClass;
+# these tests isolate rl._MODEL and the HF env vars per-test so they run
+# safely regardless of test execution order relative to that class.
+# ---------------------------------------------------------------------------
+class TestLoadModelBootstrap(unittest.TestCase):
+    def setUp(self):
+        self._saved_model = rl._MODEL
+        self._saved_env = {k: os.environ.get(k) for k in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")}
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        rl._MODEL = None
+
+    def tearDown(self):
+        rl._MODEL = self._saved_model
+        for k, v in self._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_offline_success_never_goes_online(self):
+        with mock.patch("sentence_transformers.SentenceTransformer", return_value="fake-model") as st:
+            model = rl.load_model()
+        self.assertEqual(model, "fake-model")
+        st.assert_called_once_with(rl.MODEL_NAME)
+        self.assertEqual(os.environ.get("HF_HUB_OFFLINE"), "1")
+
+    def test_cache_miss_self_heals_via_one_time_online_fetch(self):
+        seen_offline_flag = []
+
+        def fake_ctor(name):
+            seen_offline_flag.append(os.environ.get("HF_HUB_OFFLINE"))
+            if len(seen_offline_flag) == 1:
+                raise OSError("cache miss under offline")
+            return "fake-model-fetched-online"
+
+        with mock.patch("sentence_transformers.SentenceTransformer", side_effect=fake_ctor):
+            model = rl.load_model()
+        self.assertEqual(model, "fake-model-fetched-online")
+        self.assertEqual(seen_offline_flag, ["1", "0"])  # offline attempt first, then online
+        self.assertEqual(os.environ.get("HF_HUB_OFFLINE"), "1")  # restored after self-heal
+        self.assertEqual(os.environ.get("TRANSFORMERS_OFFLINE"), "1")
+
+    def test_no_network_raises_clear_error_not_raw_traceback(self):
+        with mock.patch("sentence_transformers.SentenceTransformer", side_effect=OSError("cache miss under offline")):
+            with self.assertRaises(rl.RecallModelUnavailableError) as ctx:
+                rl.load_model()
+        self.assertIn(rl.MODEL_NAME, str(ctx.exception))
+        self.assertIsNone(rl._MODEL)  # failed load must not poison the cache
+        self.assertEqual(os.environ.get("HF_HUB_OFFLINE"), "1")  # restored even on failure
 
 
 # ---------------------------------------------------------------------------

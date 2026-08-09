@@ -197,20 +197,62 @@ def chunk_words(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
 # ---------------------------------------------------------------------------
 # Model loading (lazy — this is the expensive import/load)
 # ---------------------------------------------------------------------------
+class RecallModelUnavailableError(RuntimeError):
+    """The embedding model could not be loaded — cache miss under offline
+    mode AND the one-time online fetch also failed. Raised instead of
+    letting the raw huggingface_hub/transformers traceback surface, so
+    callers can tell "searched, found nothing" (exit 0) apart from
+    "could not search at all" (wa-h9dc1) instead of collapsing both into
+    the same outcome."""
+
+
 def load_model():
-    """Local embeddings only — no external API (see recall_lib.py header).
-    Force HF offline mode before import: without this, sentence-transformers
-    silently phones home to the HF Hub on every load to check for model
-    updates ("sending unauthenticated requests to the HF Hub"), which both
-    adds ~1-2s of avoidable latency and makes `recall` depend on network
-    reachability it should never need (weights are already cached locally
-    from the ga-ps28g experiment run)."""
+    """Local embeddings only in steady state — no external API (see
+    recall_lib.py header). Force HF offline mode before import: without
+    this, sentence-transformers silently phones home to the HF Hub on
+    every load to check for model updates ("sending unauthenticated
+    requests to the HF Hub"), which both adds ~1-2s of avoidable latency
+    and makes `recall` depend on network reachability it should never need
+    once the weights are cached.
+
+    Bootstrap/self-heal (wa-h9dc1): a fresh machine, a wiped cache, or a
+    new user has no cached weights yet, and forced-offline turned that into
+    a permanent failure with no recovery path (nothing else in the repo
+    downloads the weights). So on a cache-miss under offline, retry once
+    with offline disabled to fetch them — after that one-time fetch the
+    cache is warm and every later call in this and future processes is
+    offline again. If the online retry also fails (no network), raise
+    RecallModelUnavailableError rather than letting the raw
+    huggingface_hub traceback surface."""
     global _MODEL
-    if _MODEL is None:
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-        from sentence_transformers import SentenceTransformer
+    if _MODEL is not None:
+        return _MODEL
+
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    from sentence_transformers import SentenceTransformer
+
+    try:
         _MODEL = SentenceTransformer(MODEL_NAME)
+    except Exception as offline_err:
+        try:
+            os.environ["HF_HUB_OFFLINE"] = "0"
+            os.environ["TRANSFORMERS_OFFLINE"] = "0"
+            _MODEL = SentenceTransformer(MODEL_NAME)
+        except Exception as online_err:
+            raise RecallModelUnavailableError(
+                f"embedding model '{MODEL_NAME}' is not in the local HF cache "
+                f"and the one-time online fetch failed (no network?). Populate "
+                f"the cache manually with:\n"
+                f"  HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "
+                f"{GC_CITY_PATH}/.gc/recall-venv/bin/python3 -c "
+                f"\"from sentence_transformers import SentenceTransformer; "
+                f"SentenceTransformer('{MODEL_NAME}')\"\n"
+                f"offline error: {offline_err}\nonline error: {online_err}"
+            ) from online_err
+        finally:
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
     return _MODEL
 
 
