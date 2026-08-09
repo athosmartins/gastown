@@ -232,7 +232,9 @@ context_check_lifecycle_skip() {
 
 # context_check_is_parked <labels_csv>
 #   emit "yes" iff the bead has been deliberately PARKED — needs-human,
-#   pool:refused:<any reason>, story:blocked, or pilot:no-auto-dispatch. A
+#   pool:refused:<any reason>, story:blocked, pilot:no-auto-dispatch,
+#   blocked:<reason>, pilot:refused-reason:<slug>, needs:engine-window, or
+#   gate:needs-human(:<reason>) (ga-7mbry). A
 #   parked bead must NEVER be (re)armed with ctx:ready/exec:auto (ga-ipm4):
 #   parking and arming are orthogonal states that must never coexist, and
 #   today the ONLY way a parked bead loses ctx:ready is a human/dog explicitly
@@ -284,6 +286,29 @@ context_check_is_parked() {
       # an un-globbed label instead of a stripped one.
       needs-human|needs-human:*|needs-human-*|story:blocked|pilot:no-auto-dispatch) echo "yes"; return ;;
       pool:refused:*) echo "yes"; return ;;
+      # ga-7mbry (3rd occurrence of this bug class): four more park signals
+      # this function was blind to, each already a real, established label
+      # elsewhere in this town — not invented for this fix. blocked:<reason>
+      # mirrors pilot-dispatcher.sh's own human-gate check (ga-4iw15, same
+      # "blocked:[^,]*" prefix scope — e.g. the ga-9uwbw incident's
+      # blocked:needs-remeasure); deliberately colon-only, NOT a "blocked-*"
+      # glob, so an unrelated dependency-pointer label like "blocked-by:*"
+      # (a different label family entirely — what blocks it, not "this bead
+      # IS blocked") can't false-positive through here. pilot:refused-reason:
+      # <slug> is inflight-reclaim-guard.py's PERMANENT refusal audit label
+      # (ga-uvfs6) — its presence means a dog already refused this bead, not
+      # merely never-judged. needs:engine-window is pilot-dispatcher.sh's
+      # static exclude-label for a Mayor/operator-coordinated engine rebuild
+      # no pool worker may build (ga-vhyd) — used as an exact label town-wide,
+      # no observed suffixed variant. gate:needs-human is already caught bare
+      # by context_check_lifecycle_skip above, but that check is an exact
+      # comma-wrapped match only; the colon-suffixed sub-reason family
+      # (gate:needs-human:technical, :partial-delivery, :diverging, :product,
+      # :sibling-race, :mayor-fixing, :refused, :fix-attempt:N — all real,
+      # tested in quality-gate-park-unapproved.selftest.sh for a sibling
+      # guard) falls through lifecycle_skip's exact match; repeated bare here
+      # too so this function doesn't depend on lifecycle_skip's coverage.
+      blocked:*|pilot:refused-reason:*|needs:engine-window|gate:needs-human|gate:needs-human:*) echo "yes"; return ;;
     esac
   done
   echo "no"

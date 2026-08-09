@@ -149,6 +149,35 @@ echo "Scenario 4a: park-exclusion — needs-human/pool:refused:*/story:blocked/p
 [ "$(context_check_is_parked "area:infra,pilot:no-auto-dispatch,epic:ga-05604")" = "yes" ] \
   && ok "ga-0x4tv post-strip label set (no ctx:*, no exec:*, no story:approved) → still parked" || bad "ga-0x4tv post-strip set → expected parked"
 
+# ── Scenario 4a3 (ga-7mbry, 3rd occurrence): blocked:*/pilot:refused-reason:*/
+# needs:engine-window/gate:needs-human:* — four more park signals this function
+# was blind to. wa-ic1uw repro: a bead parked with `blocked:external-quota-
+# motherduck` (ctx:ready/exec:auto already stripped) read as "fresh, never
+# judged" on the next sweep and was re-armed — an operator/wa-worker reclaimed
+# it a 7th time before this fix.
+echo "Scenario 4a3: park-exclusion (ga-7mbry) — blocked:*/pilot:refused-reason:*/needs:engine-window/gate:needs-human:* never re-armed"
+[ "$(context_check_is_parked "blocked:external-quota-motherduck")" = "yes" ] && ok "blocked:<reason> → parked (ga-7mbry, wa-ic1uw repro)" || bad "blocked:<reason> → expected parked"
+[ "$(context_check_is_parked "blocked:needs-remeasure")" = "yes" ] && ok "blocked:<other reason> prefix matches any suffix" || bad "blocked:<other> → expected parked"
+[ "$(context_check_is_parked "lane:small,blocked:external-quota-motherduck,area:infra")" = "yes" ] && ok "blocked:<reason> mixed with unrelated labels → parked" || bad "mixed labels → expected parked"
+# Negative control: "blocked-by:*" is a DIFFERENT label family (points at what
+# blocks a bead, not "this bead IS blocked") — must not false-positive through
+# the colon-only blocked:* match, mirroring the needs-humanoid negative control
+# above and pilot-dispatcher.sh's own ga-4iw15 "blocked:[^,]*" scope (colon only).
+[ "$(context_check_is_parked "blocked-by:wa-10srb")" = "no" ] \
+  && ok "blocked-by:<id> (different label family) → NOT parked, no over-match (ga-7mbry)" || bad "blocked-by:<id> → expected NOT parked"
+[ "$(context_check_is_parked "pilot:refused-reason:oracle-named-executor")" = "yes" ] && ok "pilot:refused-reason:<slug> → parked (ga-uvfs6 audit label)" || bad "pilot:refused-reason:<slug> → expected parked"
+[ "$(context_check_is_parked "story:in-flight,pilot:refused-reason:cross-rig-framework")" = "yes" ] && ok "pilot:refused-reason:<slug> mixed with unrelated labels → parked" || bad "mixed labels → expected parked"
+[ "$(context_check_is_parked "needs:engine-window")" = "yes" ] && ok "needs:engine-window → parked (ga-vhyd exact label)" || bad "needs:engine-window → expected parked"
+[ "$(context_check_is_parked "framework,lane:small,needs:engine-window")" = "yes" ] && ok "needs:engine-window mixed with unrelated labels → parked" || bad "mixed labels → expected parked"
+[ "$(context_check_is_parked "gate:needs-human:technical")" = "yes" ] && ok "gate:needs-human:<reason> (colon-suffixed) → parked" || bad "gate:needs-human:<reason> → expected parked"
+[ "$(context_check_is_parked "gate:needs-human:partial-delivery")" = "yes" ] && ok "gate:needs-human:<other reason> prefix matches any suffix" || bad "gate:needs-human:<other> → expected parked"
+[ "$(context_check_is_parked "gate:needs-human")" = "yes" ] && ok "gate:needs-human bare (redundant w/ lifecycle_skip, still recognized here)" || bad "gate:needs-human bare → expected parked"
+# is_candidate-level integration test — the exact wa-ic1uw shape: ctx:ready/
+# exec:auto already stripped, only the park label remains.
+[ "$(context_check_is_candidate "wa-ic1uw" "bug" "blocked:external-quota-motherduck,lane:small" "false" "no")" = "no" ] \
+  && ok "wa-ic1uw-shaped bead (parked via blocked:*, ctx:* stripped) → NOT a candidate (no re-arm, ga-7mbry)" \
+  || bad "REGRESSION ga-7mbry: blocked:*-parked bead with ctx:* stripped would be re-judged and re-armed"
+
 # ── Scenario 4a2: sling-stub detection (ga-mzkx2) ──────────────────────────────
 echo "Scenario 4a2: context_check_is_sling_stub — Pilot-minted dispatch stubs are by-design empty, not thin"
 [ "$(context_check_is_sling_stub "task" "fix bug ga-mzkx2: sling-task-janitor closes ctx:thin dispatch stubs" 0)" = "yes" ] \
