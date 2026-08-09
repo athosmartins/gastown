@@ -124,18 +124,49 @@ def crew_of(actor: str, known_crews: frozenset) -> str | None:
     return base if base in known_crews else None
 
 
-def derive(bead: dict, live_sessions: frozenset = frozenset(),
+def holder_is_alive(assignee: str, live_sessions) -> bool | None:
+    """O detentor do bead está vivo? True / False / None = NÃO DÁ PRA SABER.
+
+    ⚠️ DOIS ERROS MEDIDOS EM 09/08, os dois produzindo "abandonado" com confiança
+    sobre trabalho VIVO — que é o pior falso-positivo que este módulo pode ter,
+    porque a ação que ele autoriza é RECLAMAR o bead de quem está trabalhando nele.
+
+    1. NOME COM SUFIXO. O assignee é o nome do crew (`mila-wa`); a sessão viva
+       chama-se `mila-wa-awispm94omdp`. A comparação era `assignee in live_sessions`,
+       igualdade exata — então para crew ela era praticamente SEMPRE falsa. Casamos
+       agora por prefixo nos dois sentidos.
+    2. FONTE INCOMPLETA. Montei a lista de vivos com `tmux -L gascity ls` e classifiquei
+       como abandonado um gate-reviewer que estava VIVO fora do tmux (PID 34105,
+       terminal s011). Uma fonte incompleta não devolve "não sei": devolve um veredito
+       ERRADO. Por isso `live_sessions=None` agora significa NÃO CONSULTEI, é distinto
+       de `frozenset()` = CONSULTEI E NÃO HÁ NINGUÉM, e só o segundo pode concluir
+       "abandonado". Quem passa uma lista precisa cobrir tmux E processos soltos (ps).
+    """
+    if live_sessions is None:
+        return None
+    if not assignee:
+        return False
+    for s in live_sessions:
+        if s == assignee or s.startswith(assignee + "-") or assignee.startswith(s + "-"):
+            return True
+    return False
+
+
+def derive(bead: dict, live_sessions=None,
            known_crews: frozenset = frozenset(),
            merged: bool | None = None) -> dict:
     """Estado canônico. PURA — todo fato de runtime entra por parâmetro.
 
+    live_sessions: conjunto de sessões vivas, ou None = NÃO CONSULTEI. None nunca
+            vira "ninguém vivo" — ver holder_is_alive().
     merged: True/False se o chamador verificou o merge; None = não verificou.
             None NUNCA é tratado como False (erro ≠ vazio).
     """
     L = _labels(bead)
     status = bead.get("status") or ""
     assignee = bead.get("assignee") or ""
-    holder_alive = bool(assignee) and assignee in live_sessions
+    alive = holder_is_alive(assignee, live_sessions)
+    holder_alive = alive is True
     actions, reasons = [], {}
 
     def offer(name, ok, why=""):
@@ -180,7 +211,12 @@ def derive(bead: dict, live_sessions: frozenset = frozenset(),
     if L & GATE_FAILED:
         crew = crew_of(assignee, known_crews) or crew_of(bead.get("owner") or "", known_crews)
         offer("cutucar_crew", bool(crew), "nenhum crew real identificável (assignee é efêmero e owner não resolve)")
-        offer("devolver_pro_pool", not holder_alive, f"{assignee} está VIVO e trabalhando nesta bead")
+        # Só devolve pro pool com PROVA de que o detentor morreu. `alive is None`
+        # (não consultei) NÃO autoriza: reclamar bead de quem está trabalhando nela
+        # é o dano irreversível deste módulo.
+        offer("devolver_pro_pool", alive is False,
+              f"{assignee} está VIVO e trabalhando nesta bead" if alive
+              else "vivacidade do detentor NÃO foi consultada — não dá pra afirmar que morreu")
         offer("regatear", False, "nada mudou no código desde a reprovação — re-gatear reprova igual")
         return {"state": "gate_failed", "turn": ("crew:" + crew) if crew else "mayor",
                 "actions": actions, "reasons": reasons}
@@ -189,11 +225,16 @@ def derive(bead: dict, live_sessions: frozenset = frozenset(),
     if L & GATE_ACTIVE:
         return {"state": "at_gate", "turn": "nobody", "actions": [], "reasons": {}}
 
-    # 7. EM EXECUÇÃO — exige detentor VIVO. Sem isso, não está sendo executado.
+    # 7. EM EXECUÇÃO — 'stranded' exige PROVA de que o detentor morreu.
+    # `alive is None` (não consultei) resolve para 'executing', não para 'stranded':
+    # o default seguro é presumir que o trabalho está vivo, porque a ação que
+    # 'stranded' autoriza é tirar o bead de quem o segura.
     if status == "in_progress":
-        if holder_alive:
-            return {"state": "executing", "turn": "crew:" + (crew_of(assignee, known_crews) or assignee),
-                    "actions": ["cutucar"], "reasons": {}}
+        if alive is not False:
+            return {"state": "executing", "turn": "crew:" + (crew_of(assignee, known_crews) or assignee or "?"),
+                    "actions": ["cutucar"],
+                    "reasons": {} if alive else {
+                        "_incerteza": "vivacidade não consultada — 'executando' é o default seguro"}}
         return {"state": "stranded", "turn": "mayor",
                 "actions": ["liberar_para_pool"],
                 "reasons": {}}
