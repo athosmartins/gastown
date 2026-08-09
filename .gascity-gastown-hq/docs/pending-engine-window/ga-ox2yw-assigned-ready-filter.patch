@@ -1,0 +1,174 @@
+diff --git a/internal/config/config.go b/internal/config/config.go
+index f03f22035..f6c526c0d 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -3344,10 +3344,21 @@ func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) strin
+ 		`done; `
+ }
+ 
++// ga-ox2yw: applies poolDemandLabelFilterJQ to the assigned-ready tier — the
++// third and last instance of the same bug class ga-ael6v fixed for
++// assigned-in-progress and ga-avvu2 fixed for routed-pool. A refused bead
++// (pool:refused:<reason>) keeps its assignee after reclaim; Step 1a now
++// filters that case for the in-progress tier, but Step 1b (this function)
++// read straight from `bd ready` with no filter, so the SAME refused bead
++// re-surfaces here the moment reclaim flips status back to open. Observed
++// live 3+ times in one day on the same bead/pool-slot (ga-mww6n, dog pool
++// gastown.dog-3) before this fix. --limit=1 widened to 20 for the same
++// reason as routedReadyTierCommand/standardAssignedInProgressWorkQueryScript:
++// a filtered-out top row must not hide real ready work behind it.
+ func standardAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
+ 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
+ 		`[ -z "$id" ] && continue; ` +
+-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json --limit=1 2>/dev/null); ` +
++		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json --limit=20 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+ 		ephemeralAssignedReadyProbeScript("id", includeEphemeralReady) +
+ 		`done; `
+@@ -3371,13 +3382,16 @@ func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool)
+ 		`done; `
+ }
+ 
++// ga-ox2yw: same fix as standardAssignedReadyWorkQueryScript, applied to the
++// control-dispatcher/workflow-control legacy identity fallback — mirrors how
++// ga-ael6v treated its in-progress counterpart (legacyControlAssignedInProgressWorkQueryScript).
+ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
+ 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
+ 		`[ -z "$id" ] && continue; ` +
+ 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
+ 		`for cand in "$id" "$legacy"; do ` +
+ 		`[ -z "$cand" ] && continue; ` +
+-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json --limit=1 2>/dev/null); ` +
++		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json --limit=20 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+ 		ephemeralAssignedReadyProbeScript("cand", includeEphemeralReady) +
+ 		`done; ` +
+@@ -3391,13 +3405,20 @@ func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralRea
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
+ }
+ 
++// ga-ox2yw: filter-then-slice, not slice-then-filter (same reasoning as
++// ephemeralAssignedInProgressProbeScript/routedReadyTierCommand). The prior
++// version baked assignee-match + slice-to-1 into a single legacyEphemeralReadyFilterJQ
++// call with no pool:refused check at all; limit widened to 0 (no pre-slice) so
++// the pool:refused/pilot:held predicate sees every assignee-matched candidate
++// before anything is dropped, then a separate jq call takes the first survivor.
+ func ephemeralAssignedReadyProbeScript(shellVar string, includeEphemeralReady bool) string {
+ 	if includeEphemeralReady {
+ 		return ""
+ 	}
+-	filter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1)
++	filter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 0)
+ 	return `r=$(` + bdQueryEphemeralStatusQuietShell("open") + ` | ` +
+-		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
++		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null | ` +
++		poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
+ }
+ 
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 729ae6ffd..481a7b0f1 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -1750,7 +1750,7 @@ func TestEffectiveWorkQueryBD105CompatibilityOptIn(t *testing.T) {
+ 	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --json --sort oldest --limit=20`) {
+ 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral routed probe: %q", got)
+ 	}
+-	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=1`) {
++	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=20`) {
+ 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral assigned probe: %q", got)
+ 	}
+ }
+@@ -1841,9 +1841,17 @@ func TestEffectiveAssignedReadyQueryDefault(t *testing.T) {
+ 	if strings.Contains(got, `--include-ephemeral`) {
+ 		t.Fatalf("EffectiveAssignedReadyQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
+ 	}
+-	if !strings.Contains(got, `bd ready --assignee="$id" --json --limit=1`) {
++	if !strings.Contains(got, `bd ready --assignee="$id" --json --limit=20`) {
+ 		t.Fatalf("EffectiveAssignedReadyQuery() missing assigned-ready tier: %q", got)
+ 	}
++	// ga-ox2yw: the assigned-ready ("Step 1b") tier must apply the same
++	// pool:refused:*/pilot:held* prefix filter as the assigned-in-progress
++	// (ga-ael6v) and routed-pool (ga-g7yt/ga-y8qh) tiers — see
++	// TestEffectiveAssignedReadyQuerySkipsPoolRefusedBead below for the
++	// empirical (fake-bd-driven) proof.
++	if !strings.Contains(got, `startswith("pool:refused")`) {
++		t.Fatalf("EffectiveAssignedReadyQuery() missing pool:refused filter: %q", got)
++	}
+ 	if strings.Contains(got, "gc.routed_to") {
+ 		t.Fatalf("EffectiveAssignedReadyQuery() should not include routed pool demand: %q", got)
+ 	}
+@@ -1853,7 +1861,7 @@ func TestEffectiveAssignedReadyQueryDefault(t *testing.T) {
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  "ready --assignee=worker-session --json --limit=1") printf '[{"id":"assigned-ready"}]' ;;
++  "ready --assignee=worker-session --json --limit=20") printf '[{"id":"assigned-ready"}]' ;;
+   *) printf '[]' ;;
+ esac
+ `)
+@@ -1862,10 +1870,35 @@ esac
+ 	}
+ }
+ 
++// TestEffectiveAssignedReadyQuerySkipsPoolRefusedBead (ga-ox2yw): same
++// empirical bar as TestEffectiveAssignedInProgressQuerySkipsPoolRefusedBead
++// (ga-ael6v) — a bead carrying pool:refused:* must not be re-offered via
++// Step 1b, proven by driving the actual generated shell command through a
++// fake `bd`, reproducing the ga-mww6n incident (a refused bead re-surfaced
++// to the same deterministic pool-slot session 3+ times in one day) as a
++// regression test.
++func TestEffectiveAssignedReadyQuerySkipsPoolRefusedBead(t *testing.T) {
++	a := Agent{Name: "worker", Dir: "hello-world"}
++	got := a.EffectiveAssignedReadyQuery()
++
++	out := runShellWithFakeBd(t, got, map[string]string{
++		"GC_SESSION_ID": "worker-bead",
++	}, `#!/bin/sh
++set -eu
++case "$*" in
++  "ready --assignee=worker-bead --json --limit=20") printf '[{"id":"ga-mww6n","labels":["pool:refused:engine-rebuild-required"]}]' ;;
++  *) printf '[]' ;;
++esac
++`)
++	if strings.TrimSpace(out) != `[]` {
++		t.Fatalf("EffectiveAssignedReadyQuery() output = %q, want [] (pool:refused bead must not be re-offered)", out)
++	}
++}
++
+ func TestEffectiveAssignedReadyQueryForBeadsBD105Compatibility(t *testing.T) {
+ 	a := Agent{Name: "worker", Dir: "hello-world"}
+ 	got := a.EffectiveAssignedReadyQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
+-	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=1`) {
++	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=20`) {
+ 		t.Fatalf("EffectiveAssignedReadyQueryForBeads(bd-1.0.5) missing include-ephemeral assigned-ready tier: %q", got)
+ 	}
+ }
+@@ -1992,12 +2025,12 @@ func TestEffectiveAssignedReadyQueryControlDispatcherClaimsLegacyAssignedWork(t
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  "ready --assignee=gascity--control-dispatcher --json --limit=1"|\
+-  "ready --assignee=gascity/control-dispatcher --json --limit=1")
++  "ready --assignee=gascity--control-dispatcher --json --limit=20"|\
++  "ready --assignee=gascity/control-dispatcher --json --limit=20")
+     printf '[]'
+     ;;
+-  "ready --assignee=gascity--workflow-control --json --limit=1"|\
+-  "ready --assignee=gascity/workflow-control --json --limit=1")
++  "ready --assignee=gascity--workflow-control --json --limit=20"|\
++  "ready --assignee=gascity/workflow-control --json --limit=20")
+     printf '[{"id":"ga-legacy-ready"}]'
+     ;;
+   *)
+@@ -2127,8 +2160,8 @@ case "$*" in
+   "list --status in_progress --assignee=gascity/workflow-control --json --limit=1")
+     printf '[]'
+     ;;
+-  "ready --assignee=gascity--workflow-control --json --limit=1"|\
+-  "ready --assignee=gascity/workflow-control --json --limit=1")
++  "ready --assignee=gascity--workflow-control --json --limit=20"|\
++  "ready --assignee=gascity/workflow-control --json --limit=20")
+     printf '[{"id":"ga-legacy-ready"}]'
+     ;;
+   *)
