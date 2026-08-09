@@ -39,11 +39,37 @@
 # same call dolt-hang-watchdog.sh already makes) — negligible next to the
 # 9-15-concurrent-HELD-connection knee this alarm exists to catch.
 #
-# THRESHOLDS ARE NOT PERMANENT: 500ms / 12 connections are ga-7j5vf's own proposed
-# knee for THIS machine, in THIS Dolt state (14G data), with gc running degraded
-# under ga-9ae7o's still-open native_store_unavailable (extra bd-process-per-gc-call
-# base load). Re-measure and recalibrate DOLT_LATENCY_ALARM_MS / DOLT_CONN_ALARM_COUNT
-# once ga-9ae7o lands — don't treat these as gospel.
+# THRESHOLDS ARE NOT PERMANENT — RECALIBRATED 2026-08-09 (ga-sfgh4) POST-ga-9ae7o:
+# ga-7j5vf's original 500ms/12-conn knee was measured WHILE ga-9ae7o's
+# native_store_unavailable bug was still open (extra bd-process-per-gc-call base
+# load inflating everything). With that fixed, live remeasurement (17 SELECT-1
+# samples, ~2min, current natural city load) found: median 3 concurrent bd
+# processes, median 412ms latency (healthy, no failures) — but median 52 TCP
+# ESTABLISHED connections on the Dolt port, RANGE 44-78, i.e. already 4-6x over
+# the old CONN_ALARM_COUNT=12 under completely normal conditions. Cross-checked
+# against `SHOW FULL PROCESSLIST`: 30 total connections, 27 Command='Sleep'
+# (idle), only 3 actually working — matching bd-process count almost exactly.
+#
+# CONCLUSION: CONN_ALARM_COUNT was measuring the wrong thing even before
+# ga-9ae7o — TCP-ESTABLISHED counts idle-but-open connections (kept alive up to
+# 20s by SetConnMaxIdleTime, ga-aov9u) as if they were concurrent load. Real
+# concurrency tracks ACTIVE queries (Command<>'Sleep'), not open connections —
+# same root-cause class independently confirmed the same week on ga-yxuab's
+# nudge-poll "load" metric (also a connection-count proxy that turned out to be
+# ~85% idle connections). Bumped CONN_ALARM_COUNT to 100 as a CONSERVATIVE
+# stopgap (comfortably above the 44-78 observed-healthy range, not a re-derived
+# knee) so the alarm stops false-firing on normal traffic; did NOT touch
+# LATENCY_ALARM_MS=500, which the same live data doesn't contradict (412ms
+# median sits well under it). The durable fix is switching this alarm's
+# connection signal from lsof/TCP-ESTABLISHED to an active-query count
+# (`SELECT COUNT(*) FROM information_schema.processlist WHERE Command<>'Sleep'`)
+# — NOT attempted here (behavior change to a launchd-scheduled prod monitor,
+# deserves its own review) — tracked as a follow-up, not done in this pass.
+# The upper knee itself (9-15 bd-concurrent, pre-fix) was NOT re-derived: doing
+# so safely requires either passive longitudinal observation as natural load
+# varies, or a deliberate/authorized load test — a dog does not manufacture
+# load against shared production Dolt to find out where it breaks. Full
+# methodology + raw data: ga-sfgh4 bead comments.
 #
 # Kill switch: DOLT_LATENCY_ALARM_ENABLED=0 -> probe + log only, never notify.
 set -uo pipefail
@@ -53,7 +79,7 @@ LOG="$CITY/.gc/logs/dolt-latency-alarm.log"
 DOLT_PORT_DEFAULT="${BEADS_DOLT_PORT:-52756}"
 
 LATENCY_ALARM_MS="${DOLT_LATENCY_ALARM_MS:-500}"
-CONN_ALARM_COUNT="${DOLT_CONN_ALARM_COUNT:-12}"
+CONN_ALARM_COUNT="${DOLT_CONN_ALARM_COUNT:-100}"
 LATENCY_ALARM_WINDOW="${DOLT_LATENCY_ALARM_WINDOW:-5}"
 # ga-7j5vf review: a bare median_of() on a fresh window is a NOOP protection at
 # NR=1 (median of one reading is that reading) — the exact single-sample noise
