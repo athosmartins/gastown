@@ -120,13 +120,22 @@ def escalate_emergency(
         print(f"[ESCALATE] [DRY_RUN] class={emergency_class} title={title!r}", flush=True)
         return True
 
+    # notify_ok tracks whether the push subprocess actually exited 0 — NOT
+    # end-to-end delivery certainty (that's only knowable from notify's own
+    # history.db), but distinct from "we don't know", which a bare
+    # try/except-and-forget would silently collapse into "succeeded".
+    notify_ok = False
     try:
         env = dict(os.environ)
         env["NOTIFY_FORCE_PUSH"] = "1"
-        subprocess.run(
+        result = subprocess.run(
             [NOTIFY, "-t", notify_title, "-p", "5", message],
             capture_output=True, text=True, timeout=NOTIFY_TIMEOUT, env=env,
         )
+        notify_ok = result.returncode == 0
+        if not notify_ok:
+            print(f"[ESCALATE] [WARN] notify exited {result.returncode}: {result.stderr.strip()}",
+                  file=sys.stderr, flush=True)
     except Exception as exc:
         print(f"[ESCALATE] [ERROR] notify failed: {exc}", file=sys.stderr, flush=True)
 
@@ -139,8 +148,8 @@ def escalate_emergency(
         except Exception as exc:
             print(f"[ESCALATE] [WARN] mail mayor failed: {exc}", file=sys.stderr, flush=True)
 
-    print(f"[ESCALATE] class={emergency_class} title={title!r}", flush=True)
-    return True
+    print(f"[ESCALATE] class={emergency_class} title={title!r} notify_ok={notify_ok}", flush=True)
+    return notify_ok
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -302,6 +311,25 @@ def _selftest() -> int:
             ok("T8b: CLI joins positional message args with spaces")
         else:
             bad(f"T8b: expected joined message 'hello world', got {sent_msg!r}")
+
+    # T9: return value reflects the ACTUAL notify exit code — not a blanket
+    # True regardless of outcome (the third-state bug: "couldn't confirm" and
+    # "confirmed it worked" must not collapse to the same return value).
+    with mock.patch.object(subprocess, "run") as m_run, \
+         mock.patch.object(this_module, "_ledger_append"):
+        m_run.return_value = subprocess.CompletedProcess([], returncode=0)
+        result_ok = escalate_emergency("town-halted", "T9-ok", "body", mail_mayor=False)
+        if result_ok is True:
+            ok("T9a: notify returncode=0 -> escalate_emergency returns True")
+        else:
+            bad(f"T9a: expected True, got {result_ok!r}")
+
+        m_run.return_value = subprocess.CompletedProcess([], returncode=1, stderr="boom")
+        result_fail = escalate_emergency("town-halted", "T9-fail", "body", mail_mayor=False)
+        if result_fail is False:
+            ok("T9b: notify returncode=1 -> escalate_emergency returns False (not silently True)")
+        else:
+            bad(f"T9b: expected False, got {result_fail!r}")
 
     print(f"\n=== RESULT: PASS={PASS} FAIL={FAIL} ===")
     return 0 if FAIL == 0 else 1
