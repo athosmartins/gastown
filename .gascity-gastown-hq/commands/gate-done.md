@@ -194,12 +194,26 @@ esac
 RIG_LIST_JSON=$(gc --city "$GC_CITY_PATH" rig list --json 2>/dev/null || echo '{}')
 if [ -n "$BEAD_ID" ]; then
   _BEAD_ID_RESOLVED=""
+  # ga-kpu1g: remember WHICH store resolved the bead, not just that one did.
+  # This loop already probes every registered rig, so it is the only place
+  # in the script that can positively identify a bead's home rig when that
+  # rig is neither HQ nor the code-rig derived below (e.g. a fix/* self-fix
+  # branch authored from HQ that closes a bead living in a third rig). The
+  # BEAD_RIG derivation further down reuses this instead of re-probing with
+  # just 2 candidates.
+  _BEAD_HOME_RIG=""
+  _BEAD_HOME_RIG_PATH=""
   if bd -C "$GC_CITY_PATH" show "$BEAD_ID" >/dev/null 2>&1; then
     _BEAD_ID_RESOLVED=1
+    _BEAD_HOME_RIG="gascity"
+    _BEAD_HOME_RIG_PATH="$GC_CITY_PATH"
   else
     for _RIG_PATH in $(printf '%s' "$RIG_LIST_JSON" | jq -r '.rigs[].path // empty' 2>/dev/null); do
       if bd -C "$_RIG_PATH" show "$BEAD_ID" >/dev/null 2>&1; then
         _BEAD_ID_RESOLVED=1
+        _BEAD_HOME_RIG=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg p "$_RIG_PATH" \
+          '.rigs[] | select(.path == $p) | .name' 2>/dev/null | head -1 || echo "")
+        _BEAD_HOME_RIG_PATH="$_RIG_PATH"
         break
       fi
     done
@@ -207,6 +221,8 @@ if [ -n "$BEAD_ID" ]; then
   if [ -z "$_BEAD_ID_RESOLVED" ]; then
     echo "Note: '$BEAD_ID' parsed from branch '$BRANCH' does not resolve to a real bead — discarding, will try fallback."
     BEAD_ID=""
+    _BEAD_HOME_RIG=""
+    _BEAD_HOME_RIG_PATH=""
   fi
 fi
 
@@ -307,8 +323,20 @@ esac
 # rig so a store-aware consumer targets the right DB. Fail-soft: a store-aware
 # dispatcher probes independently, so we only WARN if neither store resolves it.
 BEAD_RIG=""
-if bd -C "$GC_CITY_PATH" show "$BEAD_ID" >/dev/null 2>&1; then
+# ga-kpu1g: prefer the store already confirmed during BEAD_ID validation above.
+# That loop probes ALL registered rigs; the 2-candidate probe below (HQ, then
+# just $RIG) collapses to a single store whenever the ga-ljbx self-fix pin
+# forces RIG=gascity for a fix/* branch, which silently misses beads living in
+# a third rig and stamps bead_rig=unknown. Only fall back to the narrow probe
+# when validation didn't run (BEAD_ID came from the session-assignee fallback
+# instead of the branch name) — that fallback only ever finds HQ-store beads,
+# so the first bd show below still covers it correctly.
+if [ -n "${_BEAD_HOME_RIG:-}" ]; then
+  BEAD_RIG="$_BEAD_HOME_RIG"
+  _BEAD_RIG_PATH="$_BEAD_HOME_RIG_PATH"
+elif bd -C "$GC_CITY_PATH" show "$BEAD_ID" >/dev/null 2>&1; then
   BEAD_RIG="gascity"
+  _BEAD_RIG_PATH="$GC_CITY_PATH"
 else
   _BEAD_RIG_PATH=$(printf '%s' "$RIG_LIST_JSON" | jq -r --arg r "$RIG" \
     '.rigs[] | select(.name == $r) | .path' 2>/dev/null | head -1 || echo "")
