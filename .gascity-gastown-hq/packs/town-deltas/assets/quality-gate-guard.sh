@@ -2680,8 +2680,13 @@ BEAD_ID=$(extract "bead_id")
 MARKER_AUTHOR=$(extract "author")  # Self-declared — used for logging only, NOT for exclusion
 BASE_COMMIT=$(extract "base_commit")
 RIG=$(extract "rig")
+# wa-2ddr0 (mirrors quality-gate-dispatcher.sh Step 2): the bead's OWN store,
+# independent of $RIG (the code rig) — feeds resolve_bead_city's 3rd probe
+# candidate below. Empty on a marker predating this fix; resolve_bead_city
+# then degrades to its pre-existing RIG_PATH/GC_CITY behavior, unchanged.
+BEAD_RIG=$(extract "bead_rig")
 
-log "  branch=$BRANCH  bead_id=$BEAD_ID  marker_author=${MARKER_AUTHOR:-<EMPTY>}  rig=$RIG"
+log "  branch=$BRANCH  bead_id=$BEAD_ID  marker_author=${MARKER_AUTHOR:-<EMPTY>}  rig=$RIG  bead_rig=${BEAD_RIG:-<EMPTY>}"
 
 # ── Step 4: Input validation (security: prevent injection) ──────────────────
 
@@ -3011,16 +3016,30 @@ if { [ -z "$RIG_PATH" ] || [ ! -d "$RIG_PATH" ]; } && [ -n "$RIG" ] && printf '%
 fi
 [ -d "$RIG_PATH" ] || RIG_PATH=""   # never hand a non-existent dir to resolve_bead_city
 
+# wa-2ddr0 (mirrors quality-gate-dispatcher.sh's gate_resolve_rig_context): resolve
+# BEAD_RIG into a path too, independent of RIG_PATH above. Same rationale as the
+# dispatcher — "gascity" is itself a registered self-repo rig (path == $GC_CITY)
+# so it round-trips through this same lookup with no special-casing; "unknown" is
+# /gate-done's explicit could-not-determine sentinel, never a real rig name.
+BEAD_RIG_PATH=""
+if [ -n "${BEAD_RIG:-}" ] && [ "$BEAD_RIG" != "unknown" ]; then
+  BEAD_RIG_PATH=$(echo "$RIG_LIST_JSON" \
+    | jq -r --arg r "$BEAD_RIG" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
+fi
+[ -d "$BEAD_RIG_PATH" ] || BEAD_RIG_PATH=""
+
 # resolve_bead_city <bead-id> — echo the store dir whose Dolt DB owns <bead-id>.
-# Probes RIG_PATH first (rig-native beads), then GC_CITY (HQ). A store "owns" the
+# Probes BEAD_RIG_PATH first (wa-2ddr0: the bead's own resolved store — the
+# strongest signal, since /gate-done computed it by actually probing at submit
+# time), then RIG_PATH (rig-native beads), then GC_CITY (HQ). A store "owns" the
 # bead iff `bd -C <store> show` yields a record with non-empty .status; a
 # not-found probe returns {"error":...} (no .status → skip). Falls back to a
-# bead-id prefix heuristic (ga-* → HQ; else rig) only when NEITHER store resolves
+# bead-id prefix heuristic (ga-* → HQ; else rig) only when NO store resolves
 # (transient Dolt hiccup). Mirrors quality-gate-dispatcher.sh:resolve_bead_city.
 resolve_bead_city() {
   local bead="$1" store st
   [ -z "$bead" ] && { echo "$GC_CITY"; return 0; }
-  for store in "${RIG_PATH:-}" "$GC_CITY"; do
+  for store in "${BEAD_RIG_PATH:-}" "${RIG_PATH:-}" "$GC_CITY"; do
     [ -z "$store" ] && continue
     st=$(bd -C "$store" show "$bead" --json 2>/dev/null \
       | jq -r 'if type=="array" then (.[0] // {}) else . end | .status // empty' 2>/dev/null)

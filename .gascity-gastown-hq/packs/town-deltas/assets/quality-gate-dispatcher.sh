@@ -4569,7 +4569,19 @@ log "=== Gate run complete: gate_run=$GATE_RUN_ID branch=$BRANCH verdict=$OVERAL
 resolve_bead_city() {
   local bead="$1" store st
   [ -z "$bead" ] && { echo "$GC_CITY"; return 0; }
-  for store in "${RIG_PATH:-}" "$GC_CITY"; do
+  # wa-2ddr0: BEAD_RIG_PATH (derived from the marker's own bead_rig: field, see
+  # gate_resolve_rig_context) is probed FIRST — it is the strongest signal we
+  # have, since /gate-done computed it by actually probing which store showed
+  # the bead at SUBMIT time. Without it, a marker whose code-rig IS gascity
+  # (RIG_PATH == GC_CITY, e.g. an HQ-code fix for a wa-* bead) collapses to a
+  # single effective candidate — the loop probes the same HQ store twice,
+  # never tries the rig the bead actually lives in, and falls through to the
+  # prefix heuristic, which gets it wrong for any non-ga- bead. Probing
+  # BEAD_RIG_PATH first can only ADD a correct resolution: it is skipped when
+  # empty/unset (unchanged callers), and even when set, a wrong/stale value is
+  # harmless because the probe below only trusts a store that actually shows
+  # the bead — never a match, falls through exactly as before.
+  for store in "${BEAD_RIG_PATH:-}" "${RIG_PATH:-}" "$GC_CITY"; do
     [ -z "$store" ] && continue
     # ga-h199q: routed through the read-cache shim — pure store-discovery probe
     # (which DB has this bead), not a state decision; a bead's home store never
@@ -4915,6 +4927,23 @@ fi
 # empty → skip). Falls back to a bead-id prefix heuristic (ga-* → HQ) only when
 # NEITHER store resolves (e.g. transient Dolt hiccup), so the close still targets
 # the most-likely-correct store rather than blindly trusting RIG_PATH.
+
+# ── wa-2ddr0: resolve BEAD_RIG (the bead's OWN store) into a path ──────────────
+# RIG_PATH (just above) is the CODE rig — where the fix's branch lives. BEAD_RIG
+# is a SEPARATE field /gate-done writes (commands/gate-done.md Step 2/3),
+# recording which store the source bead itself resolved to at submit time. The
+# two are usually equal (same-store change) but diverge for a bead fixed by
+# code living in a different repo (e.g. bead=wa-*, fix in the gascity/HQ repo:
+# rig=gascity, bead_rig=whatsapp_automation). "gascity" is itself a registered
+# self-repo rig (path == $GC_CITY), so it round-trips through the exact same
+# RIG_LIST_JSON lookup as RIG_PATH above — no special-casing needed. "unknown"
+# is /gate-done's own explicit could-not-determine sentinel (never a real rig
+# name) — skip the lookup rather than issuing one guaranteed to miss.
+BEAD_RIG_PATH=""
+if [ -n "${BEAD_RIG:-}" ] && [ "$BEAD_RIG" != "unknown" ]; then
+  BEAD_RIG_PATH=$(echo "$RIG_LIST_JSON" \
+    | jq -r --arg r "$BEAD_RIG" '.rigs[] | select(.name == $r or .prefix == $r) | .path' 2>/dev/null | head -1 || echo "")
+fi
 
 BEAD_CITY="$(resolve_bead_city "$BEAD_ID")"
 if [ "$BEAD_CITY" != "${RIG_PATH:-$GC_CITY}" ]; then
@@ -5299,6 +5328,11 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       BEAD_ID=$(extract "source_bead")
       AUTHOR=$(extract "author")
       RIG=$(extract "rig")
+      # wa-2ddr0: recovered the same way as RIG above — empty on a gate-run
+      # bead created before this fix shipped (Step 6 didn't write the field
+      # yet), which is fine: resolve_bead_city degrades to its pre-fix
+      # RIG_PATH/GC_CITY probing exactly as it always did for this run.
+      BEAD_RIG=$(extract "bead_rig")
       BRANCH=$(extract "branch")
       if [ -z "$BRANCH" ] && [ -n "$BEAD_ID" ]; then
         # ga-eqjo (code-review fix): backward-compat fallback for gate-run
@@ -5860,15 +5894,20 @@ if [ "$NEEDS_REBASE_COUNT" -gt 0 ]; then
     NR_BRANCH=$(extract "branch")
     NR_BEAD_ID=$(extract "bead_id")
     NR_RIG=$(extract "rig")
+    NR_BEAD_RIG=$(extract "bead_rig")
     [ -z "$NR_BRANCH" ] && continue
 
     # Resolve THIS candidate's rig context fresh — gate_resolve_rig_context
-    # reads/writes $RIG/$BEAD_ID/$RIG_PATH/$GIT_DIR_PATH/$IS_CONTAINER_RIG/
-    # $DEFAULT_BRANCH/$BEAD_CITY as globals. Step 0b/Step 2/Step 4 below
-    # re-derive all of these fresh from the sweep's OWN candidate before use,
-    # so leaving them set to this loop's last iteration here is safe.
+    # reads/writes $RIG/$BEAD_ID/$BEAD_RIG/$RIG_PATH/$GIT_DIR_PATH/
+    # $IS_CONTAINER_RIG/$DEFAULT_BRANCH/$BEAD_CITY as globals. Step 0b/Step 2/
+    # Step 4 below re-derive all of these fresh from the sweep's OWN candidate
+    # before use, so leaving them set to this loop's last iteration here is
+    # safe. wa-2ddr0: BEAD_RIG feeds resolve_bead_city's 3rd probe candidate —
+    # without it, the label-remove/assignee-release below (which use
+    # $BEAD_CITY) inherit the same cross-store no-op bug as the PASS-close path.
     RIG="$NR_RIG"
     BEAD_ID="$NR_BEAD_ID"
+    BEAD_RIG="$NR_BEAD_RIG"
     if ! gate_resolve_rig_context; then
       log "  Step 0a-4: cannot resolve rig context for marker $NR_MARKER_ID (rig=$NR_RIG) — skipping this sweep."
       continue
@@ -6211,6 +6250,12 @@ BRANCH=$(extract "branch")
 BEAD_ID=$(extract "bead_id")
 BASE_COMMIT=$(extract "base_commit")
 RIG=$(extract "rig")
+# wa-2ddr0: the bead's OWN store, independent of $RIG (the code rig) — see
+# gate_resolve_rig_context's BEAD_RIG_PATH derivation. /gate-done's canonical
+# writer always emits this field (commands/gate-done.md Step 3); empty here
+# just means an older/hand-created marker, and resolve_bead_city degrades
+# to its pre-existing RIG_PATH/GC_CITY behavior exactly as before this fix.
+BEAD_RIG=$(extract "bead_rig")
 # ga-6dp9: self-declared author line, mirroring guard.sh's MARKER_AUTHOR. Used
 # ONLY as a last-mile candidate for the rebase-liveness check (resolve_rebase_author
 # below) — NEVER for self-review-exclusion (that AUTHOR derivation, below, keeps
@@ -6260,7 +6305,7 @@ if [ -z "$BRANCH" ] || [ -z "$BEAD_ID" ] || [ -z "$RIG" ]; then
 fi
 # SELFTEST-EXTRACT label-fallback: END
 
-log "  branch=$BRANCH  bead_id=$BEAD_ID  rig=${RIG:-unknown}"
+log "  branch=$BRANCH  bead_id=$BEAD_ID  rig=${RIG:-unknown}  bead_rig=${BEAD_RIG:-unknown}"
 
 # ── Step 2b: Schema-drift diagnostic for hand-created markers (ga-kefn) ──────
 # /gate-done's canonical writer (commands/gate-done.md Step 3) always emits
@@ -8025,6 +8070,7 @@ GATE_RUN_ID=$(bd -C "$GC_CITY" create \
 source_bead: $BEAD_ID
 author: $AUTHOR
 rig: $RIG
+bead_rig: ${BEAD_RIG:-}
 branch: $BRANCH
 tier: $TIER
 required_reviewers: $REQUIRED_REVIEWERS
