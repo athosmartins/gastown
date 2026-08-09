@@ -140,7 +140,18 @@ def holder_is_alive(assignee: str, live_sessions) -> bool | None:
        terminal s011). Uma fonte incompleta não devolve "não sei": devolve um veredito
        ERRADO. Por isso `live_sessions=None` agora significa NÃO CONSULTEI, é distinto
        de `frozenset()` = CONSULTEI E NÃO HÁ NINGUÉM, e só o segundo pode concluir
-       "abandonado". Quem passa uma lista precisa cobrir tmux E processos soltos (ps).
+       "abandonado".
+
+    ⭐ FONTE CANÔNICA DE VIVACIDADE — use esta, não invente a sua:
+           gc session list --json      → 72 sessões (medido 09/08)
+           tmux -L gascity ls          → 13  ⚠️ perde ~80% dos agentes
+       Foi o tmux que me enganou. O inflight-reclaim-guard.py já usava
+       `gc session list --json` e já tinha teste pra "consulta falhou → não reclama
+       nada" (DD-7) — ele estava CERTO antes deste módulo existir.
+       ⚠️ Caveat que aquele guard documenta e vale herdar: sessão pode ficar
+       state=active produzindo zero saída (zumbi com quota estourada). VIVO ≠
+       TRABALHANDO; para decisão de reclaim, vivacidade é condição necessária, não
+       suficiente.
     """
     if live_sessions is None:
         return None
