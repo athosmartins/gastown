@@ -526,6 +526,12 @@ log "Found $COUNT story/stories awaiting delivery"
 # typically in_progress (builder claimed them), not open. bd list default shows
 # only open; without --status open,in_progress they are invisible.
 TASK_COUNT=0
+# ga-s1qb2: cap on consecutive bd-close failures for the SAME task bead before
+# the reconciler stops auto-retrying and escalates to a human instead — see
+# the close:* verdict branch below. Each failed attempt used to still post a
+# "Closed by delivery sweep" comment (never true) and retry forever, one Dolt
+# commit per sweep (~5min cadence; wa-l30yr: 8+ in under 3 hours).
+TASK_CLOSE_MAX_RETRIES=3
 if [ -z "$FORCE_STORY_ID" ]; then
   # Fan-out over ALL stores (ga-mt03s): task beads in ps-/wa-/etc. rigs live in
   # their own stores, not HQ. Inject _store so mutations target the right store.
@@ -560,6 +566,17 @@ if [ -z "$FORCE_STORY_ID" ]; then
       TASK_BEAD_TITLE=$(echo "$TASK_BEAD" | jq -r '.title // "untitled"' | head -c 80)
       TASK_STORE=$(echo "$TASK_BEAD" | jq -r '._store // ""')
       [ -z "$TASK_STORE" ] && TASK_STORE="$GC_CITY"
+      # ga-s1qb2: already escalated after TASK_CLOSE_MAX_RETRIES failed close
+      # attempts (see the close:* verdict branch below) — a human has been
+      # notified; do not keep re-attempting (that IS the infinite-loop bug
+      # this fixes). Skip without acting so the sweep tries the next
+      # candidate, same "iterate past unsuitable candidates" discipline
+      # ga-266z8 already established for this loop.
+      TASK_CLOSE_EXHAUSTED=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | contains(["delivery:close-retry-exhausted"])) then "1" else "0" end' 2>/dev/null || echo "0")
+      if [ "$TASK_CLOSE_EXHAUSTED" = "1" ]; then
+        log "Task reconciler: $TASK_BEAD_ID already escalated (delivery:close-retry-exhausted, ga-s1qb2) — close kept failing after $TASK_CLOSE_MAX_RETRIES attempts and a human was notified. Skipping; checking next candidate this sweep."
+        continue
+      fi
       # ga-iwv0 (done==deployed, not merged): a gate:passed bead that ALSO carries
       # delivery:deploy-pending went THROUGH delivery and the DEPLOY did not complete (a hot-path
       # daemon needs a guarded restart / did not come up fresh → merged code is NOT live). It is a
@@ -701,20 +718,87 @@ if [ -z "$FORCE_STORY_ID" ]; then
           if [ "$DRY_RUN" = "1" ]; then
             log "DRY_RUN=1 — WOULD: bd -C $TASK_STORE close $TASK_BEAD_ID (gate:passed task reconciler, ga-tjqe; ancestry-verified ga-266z8)"
           else
-            bd -C "$TASK_STORE" close "$TASK_BEAD_ID" \
-              -r "Delivery task reconciler (ga-tjqe): gate:passed non-story bead closed — merge verified by content-in-origin-$TASK_DEFAULT_BRANCH check (ga-266z8), not the label alone. Gate dispatcher's direct-close (ga-esbg) was the primary path; this sweep catches beads the dispatcher did not close (e.g., crash between gate:passed + bd close)." \
-              2>/dev/null || warn "Task reconciler: could not close $TASK_BEAD_ID (non-fatal; will retry next sweep)"
-            bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-tjqe): gate:passed is set and this bead is not a story (no story:approved). Verified merged by scanning origin/$TASK_DEFAULT_BRANCH for a commit scoped to this bead id (ga-266z8 — the label alone is never trusted). Closed by delivery sweep — terminal for artifact tasks." 2>/dev/null || true
-            log "Task reconciler: closed $TASK_BEAD_ID"
-            mkdir -p "$(dirname "$DELIVERY_LOG")"
-            jq -c -n \
-              --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              --arg task_id "$TASK_BEAD_ID" \
-              --arg task_title "$TASK_BEAD_TITLE" \
-              --arg result "task_closed" \
-              --arg dry_run "$DRY_RUN" \
-              '{ts: $ts, event: "task_reconcile", task_id: $task_id, task_title: $task_title, result: $result, dry_run: $dry_run}' \
-              >> "$DELIVERY_LOG" 2>/dev/null || true
+            # ga-s1qb2: verify the close's OWN exit code before claiming
+            # success below — this used to be `... || warn "..."` (a
+            # non-fatal log line), after which the comment+log+delivery-log
+            # calls ran UNCONDITIONALLY, so a FAILED close (e.g. bd's own
+            # ownership guard refusing because assignee/actor are the same
+            # agent under two identity forms) still got a bead comment
+            # claiming "Closed by delivery sweep" and a delivery-log entry
+            # claiming result:"task_closed" — neither true. Since nothing
+            # about the bead's own state changed, the next sweep re-selected
+            # it and repeated the exact same false claim: wa-l30yr collected
+            # 8+ identical comments (one Dolt commit each) in under 3 hours
+            # before a human noticed and force-closed it by hand.
+            # `if ! VAR=$(cmd); then` (not a bare `VAR=$(cmd) || ...`) is
+            # this file's own established idiom for capturing a failing
+            # command's output without tripping `set -euo pipefail` — see
+            # the story_merge_verdict call above for the same pattern with
+            # its own explanatory comment.
+            TASK_CLOSE_STDERR=""
+            if ! TASK_CLOSE_STDERR=$(bd -C "$TASK_STORE" close "$TASK_BEAD_ID" \
+                  -r "Delivery task reconciler (ga-tjqe): gate:passed non-story bead closed — merge verified by content-in-origin-$TASK_DEFAULT_BRANCH check (ga-266z8), not the label alone. Gate dispatcher's direct-close (ga-esbg) was the primary path; this sweep catches beads the dispatcher did not close (e.g., crash between gate:passed + bd close)." \
+                  2>&1 >/dev/null); then
+              # Third state (ga-s1qb2): "refused by bd's own ownership guard
+              # because assignee/actor are the same agent under two identity
+              # forms" is a KNOWN, expected, non-error condition — distinct
+              # from an unrecognized/generic failure. Neither is silently
+              # discarded (the old `2>/dev/null` did exactly that); both are
+              # recorded, and the reason is quoted verbatim to whoever
+              # eventually has to act on it.
+              case "$TASK_CLOSE_STDERR" in
+                *"reclaim or use --force to override"*) TASK_CLOSE_REASON="ownership-refused" ;;
+                *) TASK_CLOSE_REASON="error" ;;
+              esac
+              TASK_CLOSE_RETRY=$(echo "$TASK_BEAD" | jq -r '
+                (.labels // []) | map(select(startswith("delivery:close-retry:"))) | .[0] // ""
+                | if . == "" then "0" else ltrimstr("delivery:close-retry:") end
+              ' 2>/dev/null || echo "0")
+              TASK_CLOSE_RETRY_NEXT=$((TASK_CLOSE_RETRY + 1))
+              warn "Task reconciler: could not close $TASK_BEAD_ID ($TASK_CLOSE_REASON, attempt $TASK_CLOSE_RETRY_NEXT/$TASK_CLOSE_MAX_RETRIES): $TASK_CLOSE_STDERR"
+              if [ "$TASK_CLOSE_RETRY_NEXT" -ge "$TASK_CLOSE_MAX_RETRIES" ]; then
+                # Cap reached (ga-s1qb2 item c): stop retrying — the early
+                # delivery:close-retry-exhausted skip-check above prevents
+                # this bead from ever reaching this branch again. Escalate to
+                # Mayor exactly like the keep:partial-delivery verdict below
+                # already does for its own "reconciler stuck, needs a human"
+                # case — same shape, same file, same mail convention.
+                [ "$TASK_CLOSE_RETRY" -gt 0 ] && bd -C "$TASK_STORE" label remove "$TASK_BEAD_ID" "delivery:close-retry:$TASK_CLOSE_RETRY" -q 2>/dev/null || true
+                bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "delivery:close-retry-exhausted" -q 2>/dev/null || true
+                bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-s1qb2): gate:passed and independently merge-verified, but bd close has now failed $TASK_CLOSE_RETRY_NEXT/$TASK_CLOSE_MAX_RETRIES times ($TASK_CLOSE_REASON) — NOT retrying further to avoid an unbounded loop of identical comments (this replaced a prior version of this sweep that retried forever). Last error: $TASK_CLOSE_STDERR. A human needs to close this bead manually (or resolve the ownership conflict) once ready; remove the delivery:close-retry-exhausted label to let the reconciler try again automatically." 2>/dev/null || true
+                gc --city "$GC_CITY" mail send mayor \
+                  -s "Delivery reconciler: close retries exhausted for $TASK_BEAD_ID" \
+                  -m "$(printf 'Task bead %s (%s) is gate:passed and independently merge-verified, but the delivery task reconciler could not close it after %s attempts (%s). Last error: %s\n\nStore: %s\n\nThis bead will no longer be auto-retried (ga-s1qb2 retry cap) — close it manually once the underlying issue (likely an ownership/actor identity mismatch — see bd close --help) is resolved, or remove label delivery:close-retry-exhausted to let the reconciler try again.' \
+                    "$TASK_BEAD_ID" "$TASK_BEAD_TITLE" "$TASK_CLOSE_MAX_RETRIES" "$TASK_CLOSE_REASON" "$TASK_CLOSE_STDERR" "$TASK_STORE")" \
+                  2>/dev/null || warn "Task reconciler: could not mail Mayor close-retry-exhausted escalation for $TASK_BEAD_ID (ga-s1qb2)"
+              else
+                [ "$TASK_CLOSE_RETRY" -gt 0 ] && bd -C "$TASK_STORE" label remove "$TASK_BEAD_ID" "delivery:close-retry:$TASK_CLOSE_RETRY" -q 2>/dev/null || true
+                bd -C "$TASK_STORE" label add "$TASK_BEAD_ID" "delivery:close-retry:$TASK_CLOSE_RETRY_NEXT" -q 2>/dev/null || true
+              fi
+              mkdir -p "$(dirname "$DELIVERY_LOG")"
+              jq -c -n \
+                --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --arg task_id "$TASK_BEAD_ID" \
+                --arg task_title "$TASK_BEAD_TITLE" \
+                --arg result "task_close_failed" \
+                --arg reason "$TASK_CLOSE_REASON" \
+                --arg attempt "$TASK_CLOSE_RETRY_NEXT" \
+                --arg dry_run "$DRY_RUN" \
+                '{ts: $ts, event: "task_reconcile", task_id: $task_id, task_title: $task_title, result: $result, reason: $reason, attempt: ($attempt | tonumber), dry_run: $dry_run}' \
+                >> "$DELIVERY_LOG" 2>/dev/null || true
+            else
+              bd -C "$TASK_STORE" comment "$TASK_BEAD_ID" "Delivery task reconciler (ga-tjqe): gate:passed is set and this bead is not a story (no story:approved). Verified merged by scanning origin/$TASK_DEFAULT_BRANCH for a commit scoped to this bead id (ga-266z8 — the label alone is never trusted). Closed by delivery sweep — terminal for artifact tasks." 2>/dev/null || true
+              log "Task reconciler: closed $TASK_BEAD_ID"
+              mkdir -p "$(dirname "$DELIVERY_LOG")"
+              jq -c -n \
+                --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --arg task_id "$TASK_BEAD_ID" \
+                --arg task_title "$TASK_BEAD_TITLE" \
+                --arg result "task_closed" \
+                --arg dry_run "$DRY_RUN" \
+                '{ts: $ts, event: "task_reconcile", task_id: $task_id, task_title: $task_title, result: $result, dry_run: $dry_run}' \
+                >> "$DELIVERY_LOG" 2>/dev/null || true
+            fi
           fi
           TASK_ACTED=1
           ;;

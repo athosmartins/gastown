@@ -66,15 +66,20 @@ BLOCK="$(sed -n '/# ── Step 1b: Task\/bug reconciler/,/# ── End Step 1b/
 [ -n "$BLOCK" ] || { echo "FAIL: could not extract Step 1b block"; exit 1; }
 
 # ── Helper: run the block with a bd list stub that returns given JSON ──────────
-# run_block <bd_list_json> [dry_run] [force_story_id]
+# run_block <bd_list_json> [dry_run] [force_story_id] [close_fail_stderr]
 #   bd_list_json: JSON array the bd-list stub will return.
 #   dry_run: 0 or 1 (default 0).
 #   force_story_id: non-empty to simulate FORCE_STORY_ID (default empty).
+#   close_fail_stderr: ga-s1qb2 — when non-empty, `bd ... close ...` returns
+#     rc=1 with this text on stderr instead of succeeding (simulates a real
+#     bd close failure, e.g. the ownership-guard refusal message). Empty
+#     (default) preserves every pre-existing test's always-succeeds behavior.
 # Sets globals: RUN_TASK_COUNT, LAST_BD
 run_block() {
   local bd_list_json="$1"
   local dry_run="${2:-0}"
   local force_id="${3:-}"
+  local close_fail_stderr="${4:-}"
   local T; T="$(mktemp -d)"
   local BD_LOG="$T/bd.log"
 
@@ -86,8 +91,22 @@ run_block() {
       *list*--json*)
         printf '%s' "$bd_list_json"
         ;;
+      *close*)
+        # ga-s1qb2: simulate a real bd-close failure (e.g. the ownership
+        # guard's "reclaim or use --force to override" refusal) so the
+        # reconciler's verify-before-claiming-success path can be exercised.
+        if [ -n "$close_fail_stderr" ]; then
+          echo "$close_fail_stderr" >&2
+          return 1
+        fi
+        ;;
     esac
   }
+  # ga-s1qb2: the close-retry-exhausted path mails Mayor — stub `gc` so a
+  # test run can never reach a real Dolt server / send real mail, and so the
+  # attempt itself is observable via BD_LOG (reused for simplicity: this is
+  # a "commands issued" log, not literally bd-only).
+  gc() { echo "gc $*" >> "$BD_LOG"; }
   log()  { :; }
   warn() { :; }
   err()  { :; }
@@ -121,7 +140,7 @@ run_block() {
   RUN_TASK_COUNT=$(grep '^TASK_COUNT=' "$T/out.txt" 2>/dev/null | tail -1 | sed 's/TASK_COUNT=//' || echo "0")
   LAST_BD="$(cat "$BD_LOG" 2>/dev/null || echo "")"
 
-  unset -f bd log warn err jq
+  unset -f bd gc log warn err jq
   rm -rf "$T"
 }
 
@@ -229,6 +248,58 @@ run_block "$CONTRADICTED_SHA_SCOPED_JSON" 0 ""
 ! echo "$LAST_BD" | grep -q "close ga-test-task" \
   && ok "T9 SHA_SCOPED_OVERRIDES → bd close NOT called (bead-scoped hit overridden)" || nok "T9 spurious-close" "$LAST_BD"
 [ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T9 TASK_COUNT=1 (candidate found, but kept)" || nok "T9 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
+
+# ── T10/T11/T12 (ga-s1qb2): bd-close FAILS — verify-before-claiming-success ──
+# wa-l30yr incident: `bd close` refused (bd's own ownership guard — assignee
+# is a role name, actor is a session name for the same agent) but the
+# reconciler still posted "Closed by delivery sweep" and retried forever, one
+# Dolt commit per sweep. These prove (a) a failed close never gets a
+# false-success comment, (b) the failure reason is captured, not sent to
+# /dev/null, and (c) retries stop at TASK_CLOSE_MAX_RETRIES with an
+# escalation instead of continuing forever.
+CLOSE_FAIL_STDERR='cannot close ga-test-task: assignee is "role-x", actor is "role-x-session1"; reclaim or use --force to override'
+CLOSE_FIRST_ATTEMPT_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","labels":["gate:passed","lane:small"]}]'
+# Same bead, but already carries delivery:close-retry:2 — this failure is the
+# 3rd (TASK_CLOSE_MAX_RETRIES=3), the one that must trip the cap.
+CLOSE_LAST_ATTEMPT_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","labels":["gate:passed","lane:small","delivery:close-retry:2"]}]'
+# Already escalated on a PRIOR sweep — the early skip-check must fire before
+# ever attempting another close.
+CLOSE_EXHAUSTED_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","labels":["gate:passed","lane:small","delivery:close-retry-exhausted"]}]'
+
+# ── T10: first close failure → no false-success comment, retry-count bumped,
+#         no escalation yet (1 of 3) ──────────────────────────────────────────
+run_block "$CLOSE_FIRST_ATTEMPT_JSON" 0 "" "$CLOSE_FAIL_STDERR"
+echo "$LAST_BD" | grep -q "close ga-test-task" \
+  && ok "T10 close IS attempted" || nok "T10 close not attempted" "$LAST_BD"
+! echo "$LAST_BD" | grep -q "Closed by delivery sweep" \
+  && ok "T10 CLOSE_FAILS → no false-success 'Closed by delivery sweep' comment" || nok "T10 false-success comment posted despite failed close" "$LAST_BD"
+echo "$LAST_BD" | grep -q 'label add ga-test-task "\?delivery:close-retry:1"\?' \
+  && ok "T10 retry-count bumped to delivery:close-retry:1" || nok "T10 retry-count not bumped" "$LAST_BD"
+! echo "$LAST_BD" | grep -q "close-retry-exhausted" \
+  && ok "T10 NOT yet exhausted (1st of 3 allowed attempts)" || nok "T10 wrongly marked exhausted on 1st failure" "$LAST_BD"
+! echo "$LAST_BD" | grep -q "gc.*mail send mayor" \
+  && ok "T10 no Mayor escalation yet (cap not reached)" || nok "T10 escalated too early" "$LAST_BD"
+
+# ── T11: 3rd consecutive failure (cap=3) → escalate, stop retrying ──────────
+run_block "$CLOSE_LAST_ATTEMPT_JSON" 0 "" "$CLOSE_FAIL_STDERR"
+echo "$LAST_BD" | grep -q "close ga-test-task" \
+  && ok "T11 close IS attempted (3rd time)" || nok "T11 close not attempted" "$LAST_BD"
+! echo "$LAST_BD" | grep -q "Closed by delivery sweep" \
+  && ok "T11 CLOSE_FAILS 3x → still no false-success comment" || nok "T11 false-success comment posted" "$LAST_BD"
+echo "$LAST_BD" | grep -q 'label remove ga-test-task "\?delivery:close-retry:2"\?' \
+  && ok "T11 stale delivery:close-retry:2 removed" || nok "T11 stale retry-count label not removed" "$LAST_BD"
+echo "$LAST_BD" | grep -q 'label add ga-test-task "\?delivery:close-retry-exhausted"\?' \
+  && ok "T11 CAP REACHED → delivery:close-retry-exhausted added" || nok "T11 exhausted label not added" "$LAST_BD"
+echo "$LAST_BD" | grep -q "comment ga-test-task" \
+  && ok "T11 escalation comment posted (honest — describes failure, not success)" || nok "T11 no escalation comment" "$LAST_BD"
+echo "$LAST_BD" | grep -q "gc.*mail send mayor" \
+  && ok "T11 Mayor notified (ga-s1qb2 escalation, same convention as keep:partial-delivery)" || nok "T11 no Mayor mail on cap" "$LAST_BD"
+
+# ── T12: already exhausted (prior sweep escalated) → skip entirely, no retry ─
+run_block "$CLOSE_EXHAUSTED_JSON" 0 ""
+! echo "$LAST_BD" | grep -q "close ga-test-task" \
+  && ok "T12 ALREADY_EXHAUSTED → bd close NOT attempted at all (early skip)" || nok "T12 spurious close attempt on exhausted bead" "$LAST_BD"
+[ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T12 TASK_COUNT=1 (candidate found, but skipped — not the same as acted)" || nok "T12 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
 
 echo ""
 echo "story-delivery task-reconciler tests: $PASS passed, $FAIL failed"
