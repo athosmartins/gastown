@@ -305,11 +305,34 @@ fi
 # in the gascity (HQ) repo. If the cwd-based derivation ever mis-resolves them to
 # another rig (e.g. gastown), the gate would look for the branch in the wrong repo
 # and strand it. Pin explicitly so self-fixes always route to gascity.
+#
+# ga-3dhdg: the pin above used to fire on the BRANCH NAME PREFIX alone, but
+# fix/* is also the everyday convention in non-HQ rigs (whatsapp_automation
+# alone has 54 origin/fix/* branches) — so it stomped a correctly-derived
+# non-HQ RIG from the PRIMARY (ga-owfll) derivation above with "gascity",
+# stranding the marker in the wrong repo. Gate this on WHERE THE CODE ACTUALLY
+# IS, not the branch text: CWD_TOP (git toplevel) can't do this — HQ's
+# registered rig path ($GC_CITY_PATH) is a tracked SUBDIR of the git
+# toplevel, never equal to it — so compare the physical cwd instead.
+#
+# Guard `-n "$GC_CITY_PATH"` before the comparison: an EMPTY GC_CITY_PATH
+# would make the `"$GC_CITY_PATH"/*` glob collapse to the bare pattern `/*`,
+# which matches every physical cwd on this system — a confidently-WRONG pin
+# from a value the script doesn't actually have, exactly the "don't know
+# collapses into a verdict" shape the Pre-flight Self-Audit above exists to
+# catch.
+CWD_PHYSICAL=$(pwd -P 2>/dev/null || pwd)
 case "$BRANCH" in
   fix/*)
-    if [ "$RIG" != "gascity" ]; then
-      echo "Note: framework self-fix branch ($BRANCH) — pinning rig=gascity (was: ${RIG:-unknown})."
-      RIG="gascity"
+    if [ -n "$GC_CITY_PATH" ]; then
+      case "$CWD_PHYSICAL" in
+        "$GC_CITY_PATH"|"$GC_CITY_PATH"/*)
+          if [ "$RIG" != "gascity" ]; then
+            echo "Note: framework self-fix branch ($BRANCH) authored inside HQ ($CWD_PHYSICAL) — pinning rig=gascity (was: ${RIG:-unknown})."
+            RIG="gascity"
+          fi
+          ;;
+      esac
     fi
     ;;
 esac

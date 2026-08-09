@@ -32,6 +32,9 @@
 #        pipe) unless `.path` is bound to a local var before the pipe; a single
 #        crashing rig-list element poisons the whole `[...]` array construction,
 #        so this fired on nearly every invocation, masked by the fallbacks.
+#   (P)  ga-3dhdg: the ga-ljbx fix/*-branch rig=gascity pin only fires when the
+#        physical cwd is actually inside HQ, not merely because the branch
+#        name starts with fix/ (also the everyday convention in non-HQ rigs).
 #
 # Exit 0 iff every assertion holds.
 set -uo pipefail
@@ -777,6 +780,117 @@ if [ -f "$GATE_DONE" ]; then
   fi
 else
   bad "(O) gate-done.md not found at $GATE_DONE"
+fi
+
+# ── (P) ga-3dhdg: the ga-ljbx pin only fires when CWD is ACTUALLY inside HQ,
+#    not merely because the branch name starts with fix/.
+#
+# Root bug (ga-3dhdg, filed by the Mayor from a live near-miss): fix/* is also
+# the everyday branch convention in non-HQ rigs (whatsapp_automation alone has
+# 54 origin/fix/* branches). The pin fired on the branch text alone and
+# stomped a correctly-derived non-HQ RIG with "gascity", stranding the marker
+# in the wrong repo — concretely, fix/ga-c1yqp-panel-canonical-state (code in
+# whatsapp_automation/daemons/painel_visibilidade.py) would have shipped with
+# rig=gascity had the builder not hand-authored the marker to work around it
+# (ga-v1i9b).
+
+# apply_ljbx_pin <branch> <cwd_physical> <rig> <gc_city_path> — replica of the
+# FIXED pin: gate on cwd_physical being INSIDE gc_city_path, not branch text.
+# Also replicates the `-n "$gc_city_path"` guard: an empty gc_city_path must
+# NEVER match (the "$gc_city_path"/* glob would otherwise collapse to the
+# match-everything pattern `/*`).
+apply_ljbx_pin() {
+  local branch="$1" cwd_physical="$2" rig="$3" gc_city_path="$4"
+  case "$branch" in
+    fix/*)
+      if [ -n "$gc_city_path" ]; then
+        case "$cwd_physical" in
+          "$gc_city_path"|"$gc_city_path"/*)
+            [ "$rig" != "gascity" ] && rig="gascity"
+            ;;
+        esac
+      fi
+      ;;
+  esac
+  printf '%s' "$rig"
+}
+
+# apply_ljbx_pin_prebug <branch> <rig> — replica of the ORIGINAL (buggy) pin,
+# used only by the (P5) mutation guard to prove (P1) would have caught the
+# regression, not just happened to pass either way.
+apply_ljbx_pin_prebug() {
+  local branch="$1" rig="$2"
+  case "$branch" in
+    fix/*) [ "$rig" != "gascity" ] && rig="gascity" ;;
+  esac
+  printf '%s' "$rig"
+}
+
+GC_CITY_PATH_STUB="/Users/athos/gt/.gascity-gastown-hq"
+
+# (P1) the exact repro: fix/* branch, cwd physically inside whatsapp_automation
+# (a real, separate git repo — PRIMARY correctly derives it), must NOT be
+# stomped to gascity.
+R=$(apply_ljbx_pin "fix/ga-c1yqp-panel-canonical-state" "/Users/athos/gt/whatsapp_automation" "whatsapp_automation" "$GC_CITY_PATH_STUB")
+[ "$R" = "whatsapp_automation" ] \
+  && ok "(P1) fix/* branch authored in whatsapp_automation keeps RIG=whatsapp_automation (got: $R)" \
+  || bad "(P1) fix/* branch in whatsapp_automation → expected whatsapp_automation, got: $R (ga-3dhdg regression)"
+
+# (P2) genuine HQ self-fix: cwd physically inside gascity's registered path
+# (e.g. a worktree nested under it) — the pin must STILL fire, preserving
+# ga-ljbx's original protective intent for the case it was written for.
+R=$(apply_ljbx_pin "fix/ga-3dhdg" "$GC_CITY_PATH_STUB/.gc-worktrees/fix-ga-3dhdg-gate-rig-pin/.gascity-gastown-hq" "unknown" "$GC_CITY_PATH_STUB")
+[ "$R" = "gascity" ] \
+  && ok "(P2) fix/* branch authored inside HQ still pins to gascity (got: $R)" \
+  || bad "(P2) fix/* branch inside HQ → expected gascity, got: $R (ga-ljbx protection lost)"
+
+# (P3) exact cwd == gc_city_path (no trailing subdir) also pins — boundary
+# case for the equality arm of the case pattern.
+R=$(apply_ljbx_pin "fix/ga-owfll" "$GC_CITY_PATH_STUB" "unknown" "$GC_CITY_PATH_STUB")
+[ "$R" = "gascity" ] \
+  && ok "(P3) fix/* branch with cwd EXACTLY at gc_city_path pins to gascity (got: $R)" \
+  || bad "(P3) fix/* branch cwd == gc_city_path → expected gascity, got: $R"
+
+# (P4) non-fix branch (e.g. crew/*/*) is never touched by the pin regardless
+# of cwd — control, proves the outer case-branch gating is unchanged.
+R=$(apply_ljbx_pin "crew/batista/wa-27jn" "$GC_CITY_PATH_STUB" "whatsapp_automation" "$GC_CITY_PATH_STUB")
+[ "$R" = "whatsapp_automation" ] \
+  && ok "(P4) non-fix/* branch is never touched by the pin (got: $R)" \
+  || bad "(P4) non-fix/* branch → expected untouched whatsapp_automation, got: $R"
+
+# (P5) mutation guard: the ORIGINAL (pre-fix) pin, given the EXACT (P1) repro
+# inputs, DOES incorrectly stomp to gascity — proves (P1) would have caught
+# ga-3dhdg, not just happened to pass either way.
+R=$(apply_ljbx_pin_prebug "fix/ga-c1yqp-panel-canonical-state" "whatsapp_automation")
+[ "$R" = "gascity" ] \
+  && ok "(P5) mutation check: pre-fix pin stomps the (P1) repro to gascity, reproducing ga-3dhdg" \
+  || bad "(P5) mutation check: pre-fix pin unexpectedly did not stomp — (P1) would not catch a reversion"
+
+# (P6) third-state edge case: an EMPTY gc_city_path must never match (the
+# "$gc_city_path"/* glob would otherwise collapse to `/*`, matching every
+# physical cwd — a confidently-wrong pin from a value the guard doesn't
+# actually have).
+R=$(apply_ljbx_pin "fix/ga-c1yqp-panel-canonical-state" "/Users/athos/gt/whatsapp_automation" "whatsapp_automation" "")
+[ "$R" = "whatsapp_automation" ] \
+  && ok "(P6) empty gc_city_path never false-positive-matches (got: $R)" \
+  || bad "(P6) empty gc_city_path → expected untouched whatsapp_automation, got: $R (glob-collapse regression)"
+
+# ── (Q) ga-3dhdg source drift-guard: deployed gate-done.md gates the ga-ljbx
+#    pin on the physical cwd being inside $GC_CITY_PATH, not on branch text
+#    alone.
+if [ -f "$GATE_DONE" ]; then
+  src=$(cat "$GATE_DONE")
+  printf '%s' "$src" | grep -qF 'CWD_PHYSICAL=$(pwd -P' \
+    && ok "(Q1) gate-done.md computes CWD_PHYSICAL via pwd -P for the ga-ljbx pin" \
+    || bad "(Q1) gate-done.md missing CWD_PHYSICAL computation (ga-3dhdg regression)"
+  printf '%s' "$src" | grep -qF '"$GC_CITY_PATH"|"$GC_CITY_PATH"/*)' \
+    && ok "(Q2) gate-done.md's ga-ljbx pin gates on CWD_PHYSICAL being inside \$GC_CITY_PATH, not branch text alone" \
+    || bad "(Q2) gate-done.md's ga-ljbx pin missing the GC_CITY_PATH containment gate (ga-3dhdg regression)"
+  printf '%s' "$src" | grep -qF -- '-n "$GC_CITY_PATH"' \
+    && ok "(Q3) gate-done.md guards the ga-ljbx pin against an empty \$GC_CITY_PATH (no glob-collapse false-positive)" \
+    || bad "(Q3) gate-done.md's ga-ljbx pin missing the empty-GC_CITY_PATH guard (P6 regression)"
+else
+  bad "(Q) gate-done.md not found at $GATE_DONE"
 fi
 
 echo
