@@ -1,103 +1,108 @@
 #!/usr/bin/env python3
 """panel_state_divergence.py — compara o veredito do PAINEL com o do modelo canônico.
 
-Este é o passo que precede a migração do painel para scripts/bead_state.py: antes de
-trocar o interpretador, MEDIR onde os dois discordam e exigir justificativa por
-divergência. Migração sem esta medição seria trocar um interpretador não-verificado
-por outro não-verificado.
+⚠️ ESTE SCRIPT JÁ MENTIU UMA VEZ. LEIA ANTES DE CONFIAR EM QUALQUER NÚMERO DAQUI.
 
-O lado "painel" é reimplementado FIELMENTE a partir das constantes do próprio
-painel_visibilidade.py (LIFECYCLE_STAGES, _SUAVEZ_LABELS, _TRIAGEM_KEY) — lidas do
-arquivo, não de memória. Se elas mudarem, este script precisa ser re-derivado; por isso
-ele imprime as constantes que usou, para o leitor conferir contra a fonte.
+A 1ª versão REIMPLEMENTAVA as regras de coluna do painel (lia as constantes do
+arquivo-fonte e reproduzia a lógica: "sem story:* → Triagem"). Ela reportou **239
+beads nas colunas que o Athos olha e que não eram dele**. O painel REAL, rodado no
+mesmo instante sobre os mesmos dados, tinha **1** em Sua vez, 0 na Vez do criador,
+9 na esteira e 73 em Travadas. Erro de ~240x.
+
+A reimplementação era permissiva demais: o fetch real da Triagem passa por
+`_is_automation_bead`, `_KANBAN_VISIBLE_TYPES`, filtro de status, e `_is_auto_dispatch_card`
+levanta parte para APROVADAS — nada disso existia na cópia.
+
+O erro é EXATAMENTE a doença que este script existe para diagnosticar: um
+interpretador privado divergindo do consumidor real. Escrever um segundo
+interpretador para auditar o primeiro só cria um terceiro. Por isso agora ele
+**IMPORTA E RODA `_load_kanban()`** — a única fonte que não pode divergir do painel,
+porque é o painel.
+
+REGRA GERAL QUE FICA: para auditar um consumidor, EXECUTE o consumidor. Se você
+precisou reescrever a lógica dele para medi-la, você está medindo a sua reescrita.
 
 USO:  python3 panel_state_divergence.py
 """
-import json
-import re
 import subprocess
 import sys
 
-PANEL = "/Users/athos/gt/whatsapp_automation/daemons/painel_visibilidade.py"
+PANEL_DIR = "/Users/athos/gt/whatsapp_automation"
 sys.path.insert(0, "/Users/athos/gt/.gascity-gastown-hq/scripts")
+sys.path.insert(0, PANEL_DIR + "/daemons")
+
 from bead_state import derive  # noqa: E402
 
-STORES = (
-    "/Users/athos/gt/whatsapp_automation",
-    "/Users/athos/gt/.gascity-gastown-hq",
-    "/Users/athos/gt/property_scrapers",
-)
+CREWS = frozenset({"batista-wa", "digo-wa", "mila-wa", "oracle-wa", "peter-wa",
+                   "thies-wa", "batista-ps", "batista-lx", "mayor"})
+
+# Colunas que o HUMANO olha esperando que sejam trabalho DELE.
+HUMAN_COLUMNS = ("sua:vez",)
 
 
-def panel_constants():
-    """Lê as constantes de coluna DO ARQUIVO do painel — não hardcode."""
-    src = open(PANEL, encoding="utf-8").read()
-    stages = re.findall(r'\(\s*"(story:[a-z-]+)",\s*"([^"]+)"\)', src)
-    suavez = set(re.findall(r'_SUAVEZ_APPROVAL_LABEL = "([^"]+)"', src))
-    suavez |= set(re.findall(r'_SUAVEZ_ESCALATED_LABELS = frozenset\(\{([^}]*)\}', src)[0]
-                  .replace('"', "").replace(" ", "").split(",")) if re.findall(
-        r'_SUAVEZ_ESCALATED_LABELS = frozenset\(\{([^}]*)\}', src) else set()
-    return dict(stages), {s for s in suavez if s}
-
-
-def panel_column(bead, stages, suavez):
-    """Coluna que o painel atribui, pelas regras dele."""
-    L = set(bead.get("labels") or [])
-    if L & suavez:
-        return "Sua vez"
-    for lbl, col in stages.items():
-        if lbl in L:
-            return col
-    if not any(l.startswith("story:") for l in L):
-        return "Triagem"
-    return "(nenhuma)"
-
-
-def main():
-    stages, suavez = panel_constants()
-    print("CONSTANTES LIDAS DO PAINEL (confira contra a fonte):")
-    print("  Sua vez  ←", sorted(suavez))
-    for k, v in stages.items():
-        print("  %-24s → %s" % (k, v))
-    live = set()
+def live_sessions() -> frozenset:
     try:
         out = subprocess.run(["tmux", "-L", "gascity", "ls"], capture_output=True,
                              text=True, timeout=20).stdout
-        live = {l.split(":")[0] for l in out.splitlines() if l.strip()}
+        return frozenset(l.split(":")[0] for l in out.splitlines() if l.strip())
     except Exception:
-        pass
-    crews = {"batista-wa", "digo-wa", "mila-wa", "oracle-wa", "peter-wa",
-             "thies-wa", "batista-ps", "batista-lx", "mayor"}
-    beads = {}
-    for s in STORES:
-        p = subprocess.run(["bd", "-C", s, "list", "--all", "--json", "--limit", "0"],
-                           capture_output=True, text=True, timeout=90)
-        try:
-            for b in json.loads(p.stdout):
-                if b.get("status") != "closed":
-                    beads[b.get("id")] = b
-        except Exception:
-            pass
+        # Erro ≠ vazio: sem a lista de sessões, "detentor vivo" é indeterminado e o
+        # modelo classificaria trabalho vivo como abandonado. Aborta em vez de medir
+        # errado — um número errado aqui é pior que nenhum número.
+        print("ERRO: não consegui listar as sessões vivas. Sem isso a derivação de "
+              "'executing' vs 'stranded' é inválida. Abortando.", file=sys.stderr)
+        raise SystemExit(2)
 
-    div = {}
-    for i, b in sorted(beads.items()):
-        col = panel_column(b, stages, suavez)
-        st = derive(b, frozenset(live), frozenset(crews))
-        key = (col, st["state"], st["turn"].split(":")[0])
-        div.setdefault(key, []).append(i)
 
-    print("\n%-12s %-22s %-9s %5s  exemplos" % ("PAINEL", "MODELO(state)", "vez de", "n"))
+def main():
+    import painel_visibilidade as pv
+
+    print("modelo canônico carregado no painel:",
+          "SIM" if getattr(pv, "_CANONICAL_STATE_FN", None) else "NÃO (painel roda label-driven)")
+    board, degraded = pv._load_kanban()
+    if degraded:
+        print("⚠️  buckets degradados nesta leitura (números parciais):", degraded)
+    if not board:
+        print("ERRO: _load_kanban devolveu vazio — isso é falha da leitura, não "
+              "'quadro vazio'. Abortando.", file=sys.stderr)
+        raise SystemExit(2)
+
+    live = live_sessions()
+    print("\n%-22s %5s" % ("COLUNA DO PAINEL", "n"))
+    print("-" * 30)
+    for key, cards in board.items():
+        if isinstance(cards, list):
+            print("%-22s %5d" % (key, len(cards)))
+
+    print("\nDIVERGÊNCIA por coluna (o que o painel põe ali × de quem o modelo diz que é a vez)")
     print("-" * 78)
-    for (col, state, turn), ids in sorted(div.items(), key=lambda x: -len(x[1])):
-        print("%-12s %-22s %-9s %5d  %s" % (col, state, turn, len(ids), ", ".join(ids[:3])))
+    for key, cards in board.items():
+        if not isinstance(cards, list) or not cards:
+            continue
+        if key in ("story:done", "story:cancelled"):
+            continue
+        buckets = {}
+        for c in cards:
+            st = derive(c, live, CREWS)
+            buckets.setdefault((st["state"], st["turn"]), []).append(c.get("id"))
+        for (state, turn), ids in sorted(buckets.items(), key=lambda x: -len(x[1])):
+            print("  %-20s %-20s vez=%-10s %4d  %s"
+                  % (key, state, turn, len(ids), ", ".join(i for i in ids[:3] if i)))
 
-    # O achado que importa pro Athos: o que ELE vê e que não é dele.
-    not_his = [i for (col, state, turn), ids in div.items()
-               if col in ("Sua vez", "Triagem") and turn != "athos" for i in ids]
-    his = [i for (col, state, turn), ids in div.items() if turn == "athos" for i in ids]
-    print("\n⭐ nas colunas que o Athos olha (Sua vez + Triagem) e que NÃO são dele: %d"
-          % len(not_his))
-    print("⭐ que o modelo diz serem DELE: %d %s" % (len(his), his or ""))
+    # O achado que importa: card na coluna DELE que o modelo não atribui a ele.
+    print()
+    bad = []
+    for key in HUMAN_COLUMNS:
+        for c in board.get(key, []):
+            st = derive(c, live, CREWS)
+            if st["turn"] != "athos":
+                bad.append((key, c.get("id"), st["state"], st["turn"], st["actions"]))
+    if not bad:
+        print("✅ nenhuma bead na coluna do Athos que não seja dele.")
+    else:
+        print("⭐ NA COLUNA DO ATHOS E NÃO É DELE: %d" % len(bad))
+        for key, i, state, turn, acts in bad:
+            print("   %-10s %-14s modelo=%-18s vez=%-8s acoes=%s" % (key, i, state, turn, acts))
 
 
 if __name__ == "__main__":
