@@ -2194,8 +2194,95 @@ def _remove_label_verified(bd_prefix, bead_id, label, attempts=4, delay_secs=1.0
     return False
 
 
+def _close_orphaned_sling(bd_prefix, sling_bead_id, target_bead_id, hold_secs):
+    """Close sling_bead_id if it is still open and unclaimed (ga-xlnkf).
+
+    Called only when do_reclaim() reclaims AND HOLDS a target bead (pilot:held
+    stamped, step 3b below). The sling wrapper `gc sling` minted for the
+    dispatch that just got reclaimed now points at a bead sitting in a
+    reloop-cooldown hold — nothing can claim it productively for the hold's
+    duration — but this guard only ever watches the TARGET's progress, never
+    the sling's own claim status, so pre-fix the sling stayed open+unassigned
+    for the full cooldown. A pool worker's self-serve probe
+    (`bd ready --metadata-field gc.routed_to=... --unassigned`) can claim that
+    orphaned sling, discover the target is held, and burn a whole pool cycle
+    recognizing it as stale before closing it by hand. The existing
+    sling-task-janitor daemon is a backstop for this same class of orphan, but
+    it never acts on a stub younger than 60min (SLING_MIN_AGE_MIN) and only
+    sweeps every 15min — far slower than a pool worker can respawn and
+    re-claim. Closing the sling HERE, synchronously with the hold, removes the
+    race instead of just waiting it out.
+
+    Returns True only if this call actually closed the sling. False covers
+    every other outcome — no sling metadata, already claimed/in_progress,
+    already closed, or a probe/close error — and is the expected, harmless
+    result in most of those cases, not a failure signal. Never raises:
+    mirrors this file's fail-open contract so a sling-cleanup hiccup can never
+    block or corrupt the target's own reclaim.
+
+    CONTROL (ga-xlnkf AC2): a sling already in_progress may have a live
+    worker on it RIGHT NOW — reclaiming live work out from under a worker is
+    the single most expensive mistake in this domain. This only ever acts on
+    status=="open" with an empty assignee, read FRESH via `bd show` — the
+    sling was never part of Pass 1's bead snapshot (that query only ever
+    fetches TARGET beads), so there is no stale-snapshot risk here, but the
+    live read-back is also what makes the in_progress guard trustworthy.
+
+    CONTROL (ga-xlnkf AC3): a target reclaimed without sling metadata
+    (sling_bead_id falsy) is a normal case — not every in-flight bead was
+    dispatched via `gc sling` — and must not raise or otherwise disturb the
+    caller's own reclaim.
+    """
+    if not sling_bead_id:
+        return False  # ga-xlnkf AC3: no sling metadata is normal, not an error
+    try:
+        r = subprocess.run(bd_prefix + ["show", sling_bead_id, "--json"],
+                            capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            raise RuntimeError(f"bd show rc={r.returncode}: {(r.stderr or '').strip()[:200]}")
+        data = json.loads(r.stdout)
+        sling = data[0] if isinstance(data, list) else data
+        if not isinstance(sling, dict) or "status" not in sling:
+            raise RuntimeError(f"bd show did not return a bead object with a status "
+                                f"field (got: {str(data)[:200]})")
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] warn: could not read sling {sling_bead_id} "
+              f"(target {target_bead_id}) — leaving it alone: {exc}", flush=True)
+        return False
+
+    # ga-xlnkf AC2: status must still be open with nobody claiming it — a
+    # sling in_progress may have a live worker RIGHT NOW; a closed sling
+    # needs no action either. Only the exact open+unassigned shape qualifies.
+    if sling.get("status") != "open" or (sling.get("assignee") or ""):
+        return False
+
+    try:
+        r = subprocess.run(
+            bd_prefix + ["close", sling_bead_id, "--reason",
+             f"superseded-by-reclaim-hold: target bead {target_bead_id} was reclaimed "
+             f"and held (pilot:held, {hold_secs // 60}min cooldown) by "
+             f"inflight-reclaim-guard (ga-xlnkf) while this sling sat open and "
+             f"unclaimed — closing here avoids a pool worker later self-claiming it "
+             f"and burning a cycle discovering the held target."],
+            capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            print(f"[INFLIGHT-RECLAIM] warn: close orphaned sling {sling_bead_id} "
+                  f"(target {target_bead_id}) rc={r.returncode}: "
+                  f"{(r.stderr or '').strip()[:200]}", flush=True)
+            return False
+    except Exception as exc:
+        print(f"[INFLIGHT-RECLAIM] warn: close orphaned sling {sling_bead_id} "
+              f"(target {target_bead_id}): {exc}", flush=True)
+        return False
+
+    print(f"[INFLIGHT-RECLAIM] ga-xlnkf: closed orphaned sling {sling_bead_id} "
+          f"(superseded-by-reclaim-hold, target {target_bead_id})", flush=True)
+    return True
+
+
 def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=None,
-                has_explicit_refusal=False, refusal_count=0, bridge_sources=None):
+                has_explicit_refusal=False, refusal_count=0, bridge_sources=None,
+                sling_bead_id=None):
     """Strip story:in-flight (+pilot:dispatched if present), clear assignee,
     bump reclaim label.
 
@@ -2230,6 +2317,14 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     Aborting before assignee/status are touched means a failed reclaim now
     leaves the bead exactly as it was (still reads in-flight+assigned, safe,
     retried next sweep) instead of half-done.
+
+    ga-xlnkf: sling_bead_id, when given, is this bead's OWN
+    metadata.pilot.sling_bead — the dispatch-sling wrapper `gc sling` minted
+    to hand this bead to a builder. On a reclaim that also stamps pilot:held
+    (reclaim_count >= 1, step 3b below), that sling is now orphaned — see
+    _close_orphaned_sling()'s docstring — and gets closed here if it is still
+    open and unclaimed. Optional: most in-flight beads were never dispatched
+    via `gc sling`, and this parameter is simply absent for those (AC3).
 
     Returns True if all bd ops succeeded, False if any failed (still best-effort).
     """
@@ -2359,6 +2454,7 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
     #     behaviour (Pilot may re-dispatch, which is acceptable on a first-time transient).
     #     Env-gate: RECLAIM_RELOOP_HOLD_SECS (default 3600 = 1h). Set 0 to disable.
     _reloop_hold = int(os.environ.get("RECLAIM_RELOOP_HOLD_SECS", "3600"))
+    _sling_closed = False
     if reclaim_count >= 1 and _reloop_hold > 0:
         _held_until = int(time.time()) + _reloop_hold
         try:
@@ -2374,11 +2470,21 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
             print(f"[INFLIGHT-RECLAIM] warn: could not stamp pilot:held cooldown on {bead_id}: {_exc}",
                   flush=True)
 
+        # ga-xlnkf: the sling wrapper that dispatched THIS attempt is now
+        # orphaned — the hold above means nothing can claim it productively
+        # until it expires. Close it now instead of leaving it for a pool
+        # worker to discover and waste a cycle on, or for the much-slower
+        # sling-task-janitor backstop (60min min-age, 15min sweep) to catch.
+        _sling_closed = _close_orphaned_sling(_bd, sling_bead_id, bead_id, _reloop_hold)
+
     # 4. Audit comment
     cleared = " + ".join(l for l in ("story:in-flight", "pilot:dispatched")
                          if l in labels) or "(no in-flight label)"
     _hold_note = (f" pilot:held stamped for {_reloop_hold//60}min cooldown to prevent re-loop (reclaim {new_count-1}+)."
                   if reclaim_count >= 1 and _reloop_hold > 0 else "")
+    _sling_note = (f" Its dispatch sling {sling_bead_id} was also closed "
+                   f"(superseded-by-reclaim-hold, ga-xlnkf)."
+                   if _sling_closed else "")
     _preserve_note = (" Preserved unpushed work (ga-ufr7): " + "; ".join(_preserved) + "."
                        if _preserved else "")
     _refusal_note = (
@@ -2395,6 +2501,7 @@ def do_reclaim(bead_id, bead_title, reclaim_count, idle_min, labels, rig_root=No
              f"(> {RECLAIM_TTL//60}min TTL). {cleared} "
              f"cleared; assignee unset; status reset to open (ga-vw26y)."
              f"{_hold_note}"
+             f"{_sling_note}"
              f"{_preserve_note}"
              f"{_refusal_note} "
              f"Pilot will re-dispatch. (reclaim {new_count}/{MAX_RECLAIMS})"],
@@ -2907,10 +3014,17 @@ def reclaim_dead_dog_claims(exclude_session_ids=None, sessions=None,
                     # reintroduced under its own trigger condition. Mirror run_cycle's
                     # audited pattern (below, "ok = do_reclaim(...)"): only count/log a
                     # reclaim that actually happened.
+                    # ga-xlnkf: this fast-reclaim path can ALSO hit reclaim_count >= 1
+                    # (a bead can zombie multiple times across either reclaim path) and
+                    # trigger do_reclaim's own pilot:held stamp — thread the same sling
+                    # resolution run_cycle's Pass 1 does so that path's orphan-sling
+                    # cleanup fires here too, not just from run_cycle.
+                    _sling_bead_id = (b.get("metadata") or {}).get("pilot.sling_bead") or ""
                     ok = do_reclaim(bead_id, b.get("title", "")[:60], reclaim_count,
                                      0.0, labels, rig_root=b.get("rig_root"),
                                      has_explicit_refusal=has_explicit_refusal,
-                                     refusal_count=refusal_count)
+                                     refusal_count=refusal_count,
+                                     sling_bead_id=_sling_bead_id)
                     if ok:
                         reclaimed.append(bead_id)
                         print(f"[DOG-PREFLIGHT] gt-fppb0: reclaimed provably-dead dog "
@@ -3012,7 +3126,7 @@ def run_cycle(state, escalated_alerted):
     stranded_count = 0
     active_bead_ids = set()
     # ga-dbibq: two-pass structure so pool-dead alert fires BEFORE per-bead actuation.
-    classified = []    # (bead_id, title, labels, assignee, action, idle_min, reclaim_count, rig_root, bridge_sources)
+    classified = []    # (bead_id, title, labels, assignee, action, idle_min, reclaim_count, rig_root, bridge_sources, sling_bead_id)
     pool_zombies = {}  # pool -> [bead_id] for beads classified zombie this cycle
 
     # --- Pass 1: classify all beads (no actuation yet) ---
@@ -3055,6 +3169,10 @@ def run_cycle(state, escalated_alerted):
         assignee = bead.get("assignee") or ""
         title = bead.get("title", "")[:60]
         rig_root = bead.get("rig_root")  # ga-mfeip: None=HQ-native, path=rig store
+        # ga-xlnkf: resolve the sling wrapper `gc sling` minted for this
+        # bead's dispatch (if any) so Pass 2 can close it should this cycle
+        # reclaim+HOLD the target — see _close_orphaned_sling()'s docstring.
+        sling_bead_id = (bead.get("metadata") or {}).get("pilot.sling_bead") or ""
 
         # --- Safety flags ---
         # ga-hkpwv: catch gate:needs-human:* prefix variants (e.g. :on-device, :routing)
@@ -3201,9 +3319,12 @@ def run_cycle(state, escalated_alerted):
 
         # Include assignee + rig_root in classified tuple for Pass 2 (ga-hkpwv, ga-mfeip).
         # bridge_sources (ga-9d80l gate-fix-2) lets Pass 2 consume a bridged
-        # refusal at its sling source when it actually promotes it.
+        # refusal at its sling source when it actually promotes it. sling_bead_id
+        # (ga-xlnkf) lets Pass 2 close this bead's OWN dispatch sling if this
+        # cycle reclaims+holds it — a different sling than bridge_sources', which
+        # is about a refusal LABEL bridged FROM a sling, not the sling's identity.
         classified.append((bead_id, title, labels, assignee, action, idle_min, reclaim_count,
-                            rig_root, bridge_sources))
+                            rig_root, bridge_sources, sling_bead_id))
 
     # --- Pool-dead alert (BEFORE per-bead actuation, ga-dbibq) ---
     # Emits [POOL-DEAD] Mayor mail when >= POOL_DEAD_MIN beads from the same pool
@@ -3212,7 +3333,7 @@ def run_cycle(state, escalated_alerted):
 
     # --- Pass 2: per-bead actuation (logic unchanged from prior single-pass) ---
     for (bead_id, title, labels, assignee, action, idle_min, reclaim_count,
-         rig_root, bridge_sources) in classified:
+         rig_root, bridge_sources, sling_bead_id) in classified:
         # ga-be4x: re-derive from labels (already in the tuple — no new fields
         # needed) so actuation makes the SAME refusal-vs-death distinction
         # Pass 1 used to classify the action in the first place.
@@ -3222,7 +3343,7 @@ def run_cycle(state, escalated_alerted):
         if action == "reclaim":
             ok = do_reclaim(bead_id, title, reclaim_count, idle_min, labels, rig_root=rig_root,
                              has_explicit_refusal=has_explicit_refusal, refusal_count=refusal_count,
-                             bridge_sources=bridge_sources)
+                             bridge_sources=bridge_sources, sling_bead_id=sling_bead_id)
             status = "RECLAIMED" if ok else "RECLAIM-FAILED"
             _refusal_tag = (f" refusal={refusal_count + 1}/{REFUSAL_ESCALATE_THRESHOLD}"
                              if has_explicit_refusal else "")
@@ -6081,6 +6202,152 @@ def _selftest():
           "same dead session both end up fully released",
           _rco_state_a["assignee"] == "" and _rco_state_b["assignee"] == "",
           f"a={_rco_state_a} b={_rco_state_b}")
+
+    # -----------------------------------------------------------------------
+    # Section 13: ga-xlnkf — inflight-reclaim-guard orphans the dispatch SLING
+    # when it reclaims+HOLDS a target bead. The guard only ever watches the
+    # TARGET's own progress; it never touched the SLING wrapper `gc sling`
+    # minted for that dispatch, so a reclaimed+held target left its sling
+    # open+unassigned for the full cooldown — a pool worker's self-serve
+    # probe could claim that stale sling, discover the target is held, and
+    # burn a cycle recognizing it as stale before closing it by hand.
+    # do_reclaim() now resolves the target's metadata.pilot.sling_bead and,
+    # ONLY on a reclaim that also stamps pilot:held (reclaim_count >= 1),
+    # closes it IF it is still open and unclaimed (SLC-*).
+    # -----------------------------------------------------------------------
+    class _SlcResult:
+        def __init__(self, rc=0, out="", err=""):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = err
+
+    def _make_slc_stub(sling_id, sling_status="open", sling_assignee=""):
+        """Only the SLING's state is modeled (status/assignee, mutated by a
+        `close`). Any `bd show` for a DIFFERENT id — i.e. do_reclaim's own
+        _remove_label_verified() read-back on the TARGET bead itself — reports
+        the label already gone, so step 1 verifies clean and execution reaches
+        step 3b, the thing this section actually exercises (Section 9b/12
+        already cover the target's own label/status/assignee mechanics)."""
+        sling_state = {"status": sling_status, "assignee": sling_assignee}
+        calls = []
+
+        def _run(cmd, **kw):
+            if not isinstance(cmd, (list, tuple)):
+                return _SlcResult(0, "")
+            calls.append(list(cmd))
+            if cmd and cmd[0] == "bd":
+                args = list(cmd[1:])
+                sub = args[0] if args else ""
+                if sub == "show" and len(args) >= 2:
+                    if args[1] == sling_id:
+                        return _SlcResult(0, json.dumps([
+                            {"id": sling_id, "status": sling_state["status"],
+                             "assignee": sling_state["assignee"]}]))
+                    return _SlcResult(0, json.dumps([{"id": args[1], "labels": []}]))
+                if sub == "close" and len(args) >= 2 and args[1] == sling_id:
+                    sling_state["status"] = "closed"
+                    return _SlcResult(0, "")
+                return _SlcResult(0, "")  # label/update/assign/comment: accept, no-op
+            return _SlcResult(0, "")      # e.g. git, from preserve_unpushed_branch
+        return _run, calls, sling_state
+
+    _orig_run_slc = subprocess.run
+    # Hermetic regardless of the real operator shell's environment (this var
+    # is unset by default, but a stray export must never make this section
+    # flaky) — save/restore around every SLC-* call below.
+    _orig_reloop_env = os.environ.get("RECLAIM_RELOOP_HOLD_SECS")
+    os.environ["RECLAIM_RELOOP_HOLD_SECS"] = "3600"
+    try:
+        # SLC-1 (AC1): reclaim_count=1 (2nd reclaim -> hold fires this cycle)
+        # + sling open, unassigned -> the sling gets closed, citing the
+        # target id and the superseded-by-reclaim-hold reason.
+        subprocess.run, _slc_calls1, _ = _make_slc_stub("ga-sling1", "open", "")
+        try:
+            do_reclaim("ga-target1", "some bead", reclaim_count=1, idle_min=40.0,
+                        labels=["story:in-flight"], sling_bead_id="ga-sling1")
+        finally:
+            subprocess.run = _orig_run_slc
+        _slc1_close = [c for c in _slc_calls1 if len(c) >= 3 and c[0] == "bd"
+                       and c[1] == "close" and c[2] == "ga-sling1"]
+        check("SLC-1a (ga-xlnkf AC1): reclaim+hold closes the open+unassigned sling",
+              len(_slc1_close) == 1, f"calls={_slc_calls1!r}")
+        check("SLC-1b: close reason cites superseded-by-reclaim-hold and the target id",
+              len(_slc1_close) == 1
+              and "superseded-by-reclaim-hold" in _slc1_close[0][-1]
+              and "ga-target1" in _slc1_close[0][-1],
+              f"close_call={_slc1_close!r}")
+
+        # SLC-2 (AC2 control): sling already in_progress — a live worker may
+        # be on it RIGHT NOW — must NEVER be touched, even though this reclaim
+        # holds the target.
+        subprocess.run, _slc_calls2, _ = _make_slc_stub("ga-sling2", "in_progress", "dog-live")
+        try:
+            do_reclaim("ga-target2", "some bead", reclaim_count=1, idle_min=40.0,
+                        labels=["story:in-flight"], sling_bead_id="ga-sling2")
+        finally:
+            subprocess.run = _orig_run_slc
+        _slc2_close = [c for c in _slc_calls2 if len(c) >= 2 and c[0] == "bd" and c[1] == "close"]
+        check("SLC-2 (ga-xlnkf AC2): sling in_progress with a live assignee is NEVER closed",
+              len(_slc2_close) == 0, f"calls={_slc_calls2!r}")
+
+        # SLC-3 (idempotency): sling already closed (e.g. by an earlier
+        # reclaim cycle) -> no redundant close attempt, no crash, and the
+        # target's own reclaim still completes normally.
+        subprocess.run, _slc_calls3, _ = _make_slc_stub("ga-sling3", "closed", "")
+        try:
+            _slc3_ok = do_reclaim("ga-target3", "some bead", reclaim_count=1, idle_min=40.0,
+                                   labels=["story:in-flight"], sling_bead_id="ga-sling3")
+        finally:
+            subprocess.run = _orig_run_slc
+        _slc3_close = [c for c in _slc_calls3 if len(c) >= 2 and c[0] == "bd" and c[1] == "close"]
+        check("SLC-3: an already-closed sling is left alone (no redundant close) "
+              "and the reclaim itself still succeeds",
+              _slc3_ok is True and len(_slc3_close) == 0, f"ok={_slc3_ok} calls={_slc_calls3!r}")
+
+        # SLC-4 (AC3 control): target reclaimed with NO sling metadata at all
+        # — the common case, since not every in-flight bead was dispatched
+        # via `gc sling` — must not crash, must not attempt any show/close
+        # against a sling, and the reclaim itself must still complete.
+        subprocess.run, _slc_calls4, _ = _make_slc_stub("ga-sling4-unused")
+        try:
+            _slc4_ok = do_reclaim("ga-target4", "some bead", reclaim_count=1, idle_min=40.0,
+                                   labels=["story:in-flight"], sling_bead_id=None)
+        finally:
+            subprocess.run = _orig_run_slc
+        _slc4_sling_calls = [c for c in _slc_calls4
+                             if len(c) >= 3 and c[0] == "bd" and c[1] in ("show", "close")
+                             and c[2] == "ga-sling4-unused"]
+        check("SLC-4 (ga-xlnkf AC3): no sling metadata -> no show/close attempted, "
+              "guard unaffected, reclaim still succeeds",
+              _slc4_ok is True and len(_slc4_sling_calls) == 0,
+              f"ok={_slc4_ok} calls={_slc_calls4!r}")
+
+        # SLC-5 (scope boundary): reclaim_count=0 is the FIRST reclaim —
+        # do_reclaim's own step 3b gate (reclaim_count >= 1) means pilot:held
+        # is NOT stamped this cycle. The bug this bead fixes is specifically
+        # "reclaimed AND HELD" (see the bead body's repro), so the sling-close
+        # must not fire here either, even though the sling is open+unassigned
+        # and would otherwise qualify — proves the fix is scoped to the hold,
+        # not to every reclaim.
+        subprocess.run, _slc_calls5, _ = _make_slc_stub("ga-sling5", "open", "")
+        try:
+            do_reclaim("ga-target5", "some bead", reclaim_count=0, idle_min=30.0,
+                        labels=["story:in-flight"], sling_bead_id="ga-sling5")
+        finally:
+            subprocess.run = _orig_run_slc
+        _slc5_sling_calls = [c for c in _slc_calls5
+                             if len(c) >= 3 and c[0] == "bd" and c[1] in ("show", "close")
+                             and c[2] == "ga-sling5"]
+        check("SLC-5 (ga-xlnkf scope): a FIRST reclaim (no hold stamped) never touches "
+              "the sling, even if it is open+unassigned — this fix is scoped to "
+              "reclaim+HOLD, not every reclaim",
+              len(_slc5_sling_calls) == 0, f"calls={_slc_calls5!r}")
+    finally:
+        subprocess.run = _orig_run_slc
+        if _orig_reloop_env is None:
+            os.environ.pop("RECLAIM_RELOOP_HOLD_SECS", None)
+        else:
+            os.environ["RECLAIM_RELOOP_HOLD_SECS"] = _orig_reloop_env
 
     print(f"\nResults: {PASS} passed, {FAIL} failed")
     return FAIL == 0
