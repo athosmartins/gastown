@@ -81,7 +81,19 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # human-gate signal is the BARE needs-human label instead of story:needs-human — this
 # probe bypasses Pilot's _filter_candidates entirely (same class as ga-nf4x5's
 # wa-6xn82 near-miss), so the bare-label exclusion must live here too, independently.
-bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:held"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end))] | .[:1]'
+# ga-7ha7g: --exclude-type=epic checks issue_type only. Bead authors routinely
+# title/label a bead as an epic (Portuguese "ÉPICO:", English "EPIC:", or the
+# story:epic label) without setting issue_type=epic — confirmed live: ga-9pyg2
+# (issue_type=task, label story:epic, title "ÉPICO: migração v55 do engine...",
+# labels ctx:ready+exec:auto — required a Mayor-coordinated engine rebuild,
+# exactly the class of work a pool worker must never execute off its own hook
+# per ga-vhyd) and gh-ai2 (issue_type=task, title "EPIC: migrar crew GT...", no
+# story:epic label — the title-only half of the same gap). Both the exact
+# --exclude-label "story:epic" below and the jq title-regex select are needed —
+# neither alone would have caught both live instances. The regex is anchored
+# to the start with a :/whitespace delimiter so a title merely containing
+# "epic" mid-sentence is never over-matched.
+bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --json --sort oldest --limit=20 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:held"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not)] | .[:1]'
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
