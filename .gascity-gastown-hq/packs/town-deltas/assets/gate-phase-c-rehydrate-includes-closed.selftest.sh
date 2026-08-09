@@ -131,14 +131,19 @@ import sys
 path = sys.argv[1]
 with open(path) as f:
     c = f.read()
-# The exact production rehydration query WITH --all.
-anchor = 'bd -C "$GC_CITY" list --json --all -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID"'
+# The exact production rehydration query WITH --all. A later, unrelated fix
+# inserted --include-infra right after --all (so infra-type verdict beads
+# aren't dropped either) — the anchor tracks that addition too, since this
+# mutation test cares only about --all specifically, not about being the
+# single byte-for-byte string that has ever existed on this line.
+anchor = 'bd -C "$GC_CITY" list --json --all --include-infra -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID"'
 n = c.count(anchor)
 if n != 1:
     print("ANCHOR_NOT_UNIQUE count=%d" % n, file=sys.stderr)
     sys.exit(1)
-# Strip --all to reproduce the pre-fix (broken) query.
-mutant = 'bd -C "$GC_CITY" list --json -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID"'
+# Strip --all ONLY to reproduce the pre-fix (broken) query — --include-infra
+# stays, since that flag is not what this test is proving.
+mutant = 'bd -C "$GC_CITY" list --json --include-infra -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID"'
 c2 = c.replace(anchor, mutant, 1)
 if c2 == c:
     print("SWAP_NO_OP", file=sys.stderr)

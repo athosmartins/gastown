@@ -82,6 +82,76 @@ GATE_DEAD_VERDICT_GRACE_MINUTES="${GATE_DEAD_VERDICT_GRACE_MINUTES:-15}"
 
 # ── Pure decision functions (loaded in GATE_GUARD_LIB_ONLY=1 mode by tests/dispatcher) ──
 
+# gc_json_or_unknown <cmd...>
+#
+# ga-07509: `VAR=$(gc ... --json 2>/dev/null || echo "")` does not protect
+# against a failing `gc` call — gc still prints a JSON envelope to STDOUT
+# even when it exits non-zero (e.g. {"ok":false,"error":{...}}, or for
+# `gc bd <sub>` a bare {"error":"..."} with no "ok" key at all), so the
+# command substitution already captured that non-empty envelope before
+# `|| echo` ever runs. The envelope then parses as valid JSON, and a
+# downstream `.field | length` read on it silently returns 0 —
+# indistinguishable from "queried successfully, zero results".
+#
+# This wrapper captures the REAL exit code before anything can discard it
+# (via `if VAR=$(...); then`, exempt from this file's `set -e` the same way
+# the rest of its guard clauses are), and additionally checks the envelope's
+# own `ok` field (some gc paths print an error envelope and still exit 0).
+# It resolves to exactly one of three states — never collapses the last two:
+#   - valid data / legitimate-empty: prints the raw JSON to stdout, returns
+#     0. The JSON may legitimately describe an empty result (e.g.
+#     {"sessions": []}) — that is for the CALLER to determine via its own
+#     field-specific jq query, exactly as before this fix. This helper only
+#     answers "did the call itself succeed", not "was the result empty".
+#   - FAILURE: prints nothing, returns 1. Callers MUST treat this distinctly
+#     from a legitimate empty result — never proceed as if the answer was
+#     "no data" (defer/retry/explicit fail-open per call site's own policy).
+#
+# Usage:
+#   if _OUT=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json); then
+#     ... use $_OUT, e.g. echo "$_OUT" | jq '.sessions | length' ...
+#   else
+#     ... gc call FAILED — decide explicitly what this call site does ...
+#   fi
+# Or, for a memoized cache that should retry-on-failure rather than pin an
+# empty sentinel: CACHE=$(gc_json_or_unknown gc ...) || true; [ -z "$CACHE" ]
+# unambiguously means "failed" — a real success is never an empty string
+# (this helper's own success path always prints at least "{}"/"[]").
+#
+# ga-07rb3: relocated once already (was defined AFTER validate_rig, its first
+# caller further down — a "command not found" for validate_rig's own use).
+# ga-zdkn1: relocated AGAIN, all the way to the top of the pure-decision-
+# functions section — resolve_author_agent_alias() (ga-pyzo) was added to
+# THIS section later and calls gc_json_or_unknown too, but this section loads
+# under GATE_GUARD_LIB_ONLY=1 (tests/dispatcher lib-only sourcing), which
+# returns before reaching the OLD location further down in the file. Same
+# defect class as ga-07rb3, one section up: production execution always
+# sources the whole file top-to-bottom before calling anything, so it never
+# saw this; only lib-only-mode callers did (confirmed: this function's own
+# selftest — gate-recycled-session-author-fallback.selftest.sh — silently
+# read every real resolution as empty, "command not found" swallowed by the
+# call site's own `|| true`). Defining it once, at the very top of this
+# section, keeps every in-file caller working regardless of call order OR
+# sourcing mode.
+gc_json_or_unknown() {
+  local _gjou_out _gjou_rc
+  if _gjou_out=$("$@" 2>/dev/null); then
+    _gjou_rc=0
+  else
+    _gjou_rc=$?
+  fi
+  [ "$_gjou_rc" -eq 0 ] || return 1
+  [ -n "$_gjou_out" ] || return 1
+  if ! printf '%s' "$_gjou_out" | jq -e . >/dev/null 2>&1; then
+    return 1   # exit 0 but unparseable — never hand malformed JSON upstream
+  fi
+  if printf '%s' "$_gjou_out" | jq -e 'has("ok") and (.ok == false)' >/dev/null 2>&1; then
+    return 1   # exit 0 but envelope explicitly says ok:false
+  fi
+  printf '%s' "$_gjou_out"
+  return 0
+}
+
 # age_minutes_of <ts_Z> <now_epoch>
 # Returns age of a UTC bead timestamp in whole minutes.
 # Uses date -j -u -f (macOS BSD, UTC) to avoid the TZ-offset bug where local-time
@@ -1375,67 +1445,6 @@ validate_bead_id() {
     return 0
   fi
   return 1
-}
-
-# gc_json_or_unknown <cmd...>
-#
-# ga-07509: `VAR=$(gc ... --json 2>/dev/null || echo "")` does not protect
-# against a failing `gc` call — gc still prints a JSON envelope to STDOUT
-# even when it exits non-zero (e.g. {"ok":false,"error":{...}}, or for
-# `gc bd <sub>` a bare {"error":"..."} with no "ok" key at all), so the
-# command substitution already captured that non-empty envelope before
-# `|| echo` ever runs. The envelope then parses as valid JSON, and a
-# downstream `.field | length` read on it silently returns 0 —
-# indistinguishable from "queried successfully, zero results".
-#
-# This wrapper captures the REAL exit code before anything can discard it
-# (via `if VAR=$(...); then`, exempt from this file's `set -e` the same way
-# the rest of its guard clauses are), and additionally checks the envelope's
-# own `ok` field (some gc paths print an error envelope and still exit 0).
-# It resolves to exactly one of three states — never collapses the last two:
-#   - valid data / legitimate-empty: prints the raw JSON to stdout, returns
-#     0. The JSON may legitimately describe an empty result (e.g.
-#     {"sessions": []}) — that is for the CALLER to determine via its own
-#     field-specific jq query, exactly as before this fix. This helper only
-#     answers "did the call itself succeed", not "was the result empty".
-#   - FAILURE: prints nothing, returns 1. Callers MUST treat this distinctly
-#     from a legitimate empty result — never proceed as if the answer was
-#     "no data" (defer/retry/explicit fail-open per call site's own policy).
-#
-# Usage:
-#   if _OUT=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json); then
-#     ... use $_OUT, e.g. echo "$_OUT" | jq '.sessions | length' ...
-#   else
-#     ... gc call FAILED — decide explicitly what this call site does ...
-#   fi
-# Or, for a memoized cache that should retry-on-failure rather than pin an
-# empty sentinel: CACHE=$(gc_json_or_unknown gc ...) || true; [ -z "$CACHE" ]
-# unambiguously means "failed" — a real success is never an empty string
-# (this helper's own success path always prints at least "{}"/"[]").
-#
-# ga-07rb3: relocated from near the bottom of this file (was defined AFTER
-# validate_rig, its first caller here — harmless for the two call sites that
-# already existed further down, but would have been a "command not found" at
-# runtime for validate_rig's own use added by this same story). Defining it
-# once, early, keeps every in-file caller — this one plus the two below —
-# working regardless of call order.
-gc_json_or_unknown() {
-  local _gjou_out _gjou_rc
-  if _gjou_out=$("$@" 2>/dev/null); then
-    _gjou_rc=0
-  else
-    _gjou_rc=$?
-  fi
-  [ "$_gjou_rc" -eq 0 ] || return 1
-  [ -n "$_gjou_out" ] || return 1
-  if ! printf '%s' "$_gjou_out" | jq -e . >/dev/null 2>&1; then
-    return 1   # exit 0 but unparseable — never hand malformed JSON upstream
-  fi
-  if printf '%s' "$_gjou_out" | jq -e 'has("ok") and (.ok == false)' >/dev/null 2>&1; then
-    return 1   # exit 0 but envelope explicitly says ok:false
-  fi
-  printf '%s' "$_gjou_out"
-  return 0
 }
 
 # Validate rig name against the known registered rigs.

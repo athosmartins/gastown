@@ -188,25 +188,43 @@ echo "── 7. drift-guard: companion fix — dispatcher mails AUTHOR at needs-
 if [ -f "$DISPATCHER" ]; then
   # ga-4op40 (3rd occurrence of this exact drift: 4→5→6, now 8): a hardcoded
   # magic-number count needs a human to hand-bump it every time the dispatcher
-  # legitimately grows a new gate:needs-human site — the DURABLE fix already
-  # adopted by gate-selfheal.selftest.sh's own copy of this check (ga-huaxo,
-  # a full bijection scan) is to stop comparing against a literal number at
-  # all. Here: compare the AUTHOR-mail count against an INDEPENDENT count of
-  # the same pattern class it is meant to track — the base gate:needs-human
-  # label-add sites in this same file (the trailing quote in the pattern
-  # already excludes gate:needs-human:<subkind> variants, verified: 8 base
-  # sites, 0 accidental subkind matches). A legitimate new site adds one of
-  # each in lockstep so this never drifts again; a SILENT site (label added,
-  # no mail) breaks the count match and fails loudly instead of staying red
-  # forever waiting for a human to notice and re-bump a number.
-  # ga-409f4: count "mail send \$AUTHOR" OR "mail send \$NOTIFY_AUTHOR" — the
-  # branch-author-aware variable now used at some (not all) of these sites is
-  # the same durable-mail-to-a-real-identity signal this check tracks, just no
-  # longer always the bead-assignee-derived variable (see quality-gate-dispatcher.sh's
-  # gate_finalize_run header comment for why the two variables coexist).
-  NEEDS_HUMAN_SITE_COUNT=$(grep -cE 'label add[[:space:]]+"\$BEAD_ID"[[:space:]]+"gate:needs-human"' "$DISPATCHER")
-  eq "dispatcher mails AUTHOR at every gate:needs-human site ($NEEDS_HUMAN_SITE_COUNT, ga-u4yi/ga-huaxo self-consistent count)" \
-     "$(grep -cE 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"' "$DISPATCHER")" "$NEEDS_HUMAN_SITE_COUNT"
+  # legitimately grows a new gate:needs-human site. This file's own attempt at
+  # a durable fix (comparing the AUTHOR-mail count against an independent
+  # count of gate:needs-human label-add sites) was STILL a bidirectional
+  # count match — and count matches break the moment either side gains an
+  # UNRELATED occurrence. ga-6dpoa added an AUTHOR/NOTIFY_AUTHOR mail for the
+  # scope-hold path (delivery:partial + scope:needs-review) that is
+  # DELIBERATELY kept outside the gate:needs-human label family (it used to
+  # collide with the lifecycle-coherence-janitor R7 rule — see that call
+  # site's own comment) — a legitimate site with no gate:needs-human label at
+  # all, which the mail-side count still picks up. 9 label-add sites, 10
+  # mails: count equality can never distinguish that from a real silent site.
+  #
+  # ga-huaxo already solved this properly in gate-selfheal.selftest.sh's copy
+  # of this same check: a one-directional BIJECTION, not a count match. Ported
+  # here verbatim (same 40-line window, measured site→mail distance 9-21
+  # lines across all current sites). This is immune to unrelated mail sends
+  # anywhere else in the file, because it never counts total mails — it only
+  # asks, per gate:needs-human site, "is there an AUTHOR mail nearby?".
+  # ga-409f4: mail send "$AUTHOR" OR "$NOTIFY_AUTHOR" — the branch-author-aware
+  # variable now used at some (not all) sites is the same durable-mail-to-a-
+  # real-identity signal, just no longer always the bead-assignee-derived one
+  # (see quality-gate-dispatcher.sh's gate_finalize_run header comment for why
+  # the two variables coexist).
+  NEEDS_HUMAN_SITES=$(grep -nE 'label add[[:space:]]+"\$BEAD_ID"[[:space:]]+"gate:needs-human"' "$DISPATCHER" \
+    | grep -v 'gate:needs-human:' | cut -d: -f1)
+  _bij_ok=1; _bij_bad_line=""
+  for _site in $NEEDS_HUMAN_SITES; do
+    if ! sed -n "${_site},$((_site + 40))p" "$DISPATCHER" | grep -Eq 'mail send "\$(AUTHOR|NOTIFY_AUTHOR)"'; then
+      _bij_ok=0; _bij_bad_line="$_site"; break
+    fi
+  done
+  _n_sites=$(printf '%s\n' "$NEEDS_HUMAN_SITES" | grep -c .)
+  if [ "$_bij_ok" = 1 ] && [ "$_n_sites" -ge 1 ]; then
+    ok "every gate:needs-human site ($_n_sites) has an adjacent AUTHOR mail (ga-huaxo bijection, no magic count)"
+  else
+    bad "gate:needs-human site at line $_bij_bad_line has NO AUTHOR mail within 40 lines — a SILENT park (ga-u4yi/ga-huaxo)"
+  fi
 else
   bad "dispatcher not found at $DISPATCHER"
 fi

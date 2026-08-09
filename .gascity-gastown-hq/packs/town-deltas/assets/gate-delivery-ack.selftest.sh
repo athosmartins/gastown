@@ -57,8 +57,27 @@ has "$GATE" 'REVIEWER_PEEK_BASELINE'                   "pre-delivery peek baseli
 has "$GATE" 'verdict:pending'                          "strong ACK keys off verdict:pending progression"
 has "$GATE" 'session peek .* --lines'                  "soft ACK samples session output"
 has "$GATE" 'nudge "\$_sid" "\$\{REVIEW_TASKS\[\$k\]\}" --delivery queue' "idle session re-queued with its exact task"
-# set -euo pipefail discipline: the re-queue nudge must be || true-guarded.
-has "$GATE" 'nudge "\$_sid" "\$\{REVIEW_TASKS\[\$k\]\}" --delivery queue 2>/dev/null \|\| true' "re-queue nudge is || true-guarded (set -e safe)"
+# set -euo pipefail discipline: the re-queue nudge must be guarded so a failed
+# re-queue can't kill the ACK loop under set -e. ga-vne2 (2026-08-08) changed
+# the guard from a bare `|| true` to `|| warn "..."` on purpose: swallowing
+# the failure alongside the diagnostic hid WHY a re-queue didn't land (dead
+# session vs a real nudge failure) — see the dispatcher's own comment at the
+# call site. The call now also goes through the gate_nudge() wrapper (still
+# matched above by substring), and its `2>/dev/null \` + `|| warn ...` guard
+# spans two physical lines (backslash continuation), so join lines before
+# grepping instead of freezing one single-line literal that the wrapper/warn
+# refactor already broke twice.
+GATE_JOINED=$(awk '{ if (sub(/\\$/, "")) { printf "%s ", $0; next } else { print } }' "$GATE")
+if echo "$GATE_JOINED" | grep -qE 'REVIEW_TASKS\[\$k\]\}" --delivery queue 2>/dev/null[[:space:]]*\|\| warn'; then
+  ok "re-queue nudge failure is diagnosed via warn, not silently swallowed (ga-vne2)"
+else
+  bad "re-queue nudge failure is diagnosed via warn, not silently swallowed (ga-vne2) — pattern not found"
+fi
+if echo "$GATE_JOINED" | grep -qE 'REVIEW_TASKS\[\$k\]\}" --delivery queue 2>/dev/null[[:space:]]*\|\| true([[:space:]]|$)'; then
+  bad "re-queue nudge does not silently swallow failure — forbidden pattern present: || true"
+else
+  ok "re-queue nudge does not silently swallow failure with a bare || true"
+fi
 
 echo "── 4. MONITOR: idle-reviewer watchdog closes the :dispatching blind spot ──"
 has "$MON" 'VERDICT_STALL_SEC'        "verdict-stall threshold defined"

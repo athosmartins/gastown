@@ -161,8 +161,27 @@ has "$DISPATCHER" 'GATE_NUDGE_TIMEOUT="\$\{GATE_NUDGE_TIMEOUT:-timeout \$GATE_NU
 # Every reviewer task-delivery nudge/submit must carry the prefix. There are
 # exactly THREE delivery sites: initial spawn (queue+submit), ACK re-queue, and
 # re-convene (queue+submit) = 5 calls total.
-DELIVERY_PREFIXED=$(grep -cE '\$GATE_NUDGE_TIMEOUT gc --city "\$GC_CITY" session (nudge|submit)' "$DISPATCHER")
-eq "all 5 reviewer delivery calls carry the timeout prefix" "$DELIVERY_PREFIXED" "5"
+# ga-vne2 (2026-08-08) centralized the 3 `nudge` sites (initial-spawn-queue,
+# ACK-re-queue, re-convene-queue) behind a single gate_nudge() wrapper that
+# applies the prefix once, internally — so a flat grep of the raw inline
+# pattern now only sees the 2 remaining `submit` fallbacks plus the wrapper's
+# own one definition line (3), not 5. Count logical delivery sites instead of
+# raw literal occurrences: raw `submit` sites (still inline) + gate_nudge()
+# call sites (each timeout-bound via the wrapper) — verifying the wrapper
+# itself is bound separately, so the split can't silently both drift.
+GATE_NUDGE_DEF_LN=$(grep -n '^gate_nudge() {' "$DISPATCHER" | head -1 | cut -d: -f1)
+GATE_NUDGE_BODY_TIMEOUT_LN=$(grep -n '\$GATE_NUDGE_TIMEOUT gc --city "\$GC_CITY" session nudge "\$@"' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$GATE_NUDGE_DEF_LN" ] && [ -n "$GATE_NUDGE_BODY_TIMEOUT_LN" ] \
+   && [ "$GATE_NUDGE_BODY_TIMEOUT_LN" -gt "$GATE_NUDGE_DEF_LN" ] \
+   && [ $((GATE_NUDGE_BODY_TIMEOUT_LN - GATE_NUDGE_DEF_LN)) -le 30 ]; then
+  ok "gate_nudge() wrapper (line $GATE_NUDGE_DEF_LN) applies the timeout prefix internally (line $GATE_NUDGE_BODY_TIMEOUT_LN)"
+else
+  bad "gate_nudge() wrapper must apply \$GATE_NUDGE_TIMEOUT internally (def=$GATE_NUDGE_DEF_LN body=$GATE_NUDGE_BODY_TIMEOUT_LN)"
+fi
+RAW_SUBMIT_SITES=$(grep -cE '\$GATE_NUDGE_TIMEOUT gc --city "\$GC_CITY" session submit' "$DISPATCHER")
+GATE_NUDGE_CALLSITES=$(grep -cE '\bgate_nudge "' "$DISPATCHER")
+DELIVERY_PREFIXED=$((RAW_SUBMIT_SITES + GATE_NUDGE_CALLSITES))
+eq "all 5 reviewer delivery sites are timeout-bounded (raw submit + gate_nudge call sites)" "$DELIVERY_PREFIXED" "5"
 # No reviewer task-delivery nudge/submit may call gc WITHOUT the prefix. (Author
 # notifications use --delivery wait-idle and are intentionally excluded.)
 UNGUARDED=$(grep -nE 'gc --city "\$GC_CITY" session (nudge|submit) "\$(SESSION_ID|_new_sid|_sid)"' "$DISPATCHER" \
