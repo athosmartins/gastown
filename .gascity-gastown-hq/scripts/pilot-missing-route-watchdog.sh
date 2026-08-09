@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # pilot-missing-route-watchdog.sh — detects beads that are ARMED (carry both
 # ctx:ready AND exec:auto) and OPEN, but carry NO gc.routed_to metadata, for
-# longer than a configurable grace period.
+# longer than a configurable grace period. Attempts to SELF-HEAL each one
+# (ga-9tgos) before falling back to alert-only — see "WHY AUTO-REPAIR IS NOW
+# SAFE" below.
 #
 # WHY THIS EXISTS (ga-f54ui): a bead only becomes visible to a pool worker's
 # own self-serve discovery (`bd ready --metadata-field gc.routed_to=<target>
@@ -165,26 +167,98 @@
 # criterion is "detected in minutes, not days," and every real incident above
 # was hours-to-days old, so a defensive few-minute buffer costs nothing.
 #
-# WHY DETECTION-ONLY, NOT AUTO-REPAIR: ga-f54ui's own FIX section offers an
-# optional repair path — derive the route from the branch owner
-# (crew/<name>/<bead> -> <name>-wa, "que e o que fiz a mao"). Tempting (it's
-# exactly what the Mayor did by hand to unstick the 8 known cases), but
-# LESS safe to automate than even GMMSW's already-deferred repair: GMMSW's
-# would-be auto-fix is "add back one well-known label", this one requires
-# PARSING a branch name and INFERRING an owner/pool target — more surface for
-# a wrong guess, and a wrong route is not obviously safer than no route (a
-# bead mis-routed to the wrong pool can be claimed by a worker that can't
-# actually build it, burning a cycle that looks like progress but isn't).
-# Same precedent as GMMSW/GOLW's own headers: detection-only is the safer
-# starting point; auto-remediation, if ever wanted, is a separate decision
-# made later with real detector data in hand.
+# WHY AUTO-REPAIR IS NOW SAFE (ga-9tgos, 2026-08-09) — this section used to
+# say DETECTION-ONLY and explain why NOT to auto-repair; both the objection
+# and the population it applied to have since changed. Rewritten instead of
+# left stale: a comment describing code that no longer matches is the exact
+# defect class this city's own gate reviews most often bounce (a promise the
+# code beside it doesn't keep is worse than no comment at all).
 #
-# ALERTING: per-bead durable `bd comment` (new-or-cooldown-expired only,
-# via --stdin — never a positional-arg `bd comment <id> <text>` invocation,
-# which silently fuzzy-matches an invalid id and lands on an unrelated bead;
-# --stdin has no id/text positional ambiguity to mis-derive) + aggregate
-# `notify -p 2` + `gc mail send mayor`, cooldown-gated. Same shape as
-# GMMSW/GOLW.
+# THE ORIGINAL OBJECTION DOESN'T APPLY TO THIS REPAIR. It was: deriving a
+# route requires PARSING a branch name (crew/<name>/<bead> -> <name>-wa) and
+# INFERRING an owner/pool target — more surface for a wrong guess than
+# GMMSW's "add back one well-known label". This repair does neither. It calls
+# _pmrw_default_route_for_store(), a pure, already-vetted, already-shipped
+# function — the EXACT mapping quality-gate-dispatcher.sh's own
+# default_pool_route_for_rig() already uses in production to restore
+# gc.routed_to on its gate-FAIL-return-to-pool path (ga-f54ui). Nothing here
+# reads a branch name or guesses; the mapping is a static 3-way switch
+# (whatsapp_automation->wa-worker, property_scrapers->ps-worker, else->
+# gastown.dog) already trusted to write real bead metadata today.
+#
+# WHY REPAIR, NOT JUST A BETTER DETECTOR: ga-9tgos's own investigation (2026-
+# 08-06 through 09, 29 comments) found the population this bug touches is
+# much larger than "a handful of known cases a human fixes by hand" — the
+# Mayor's own overnight count went 8 -> 10 -> 12 -> 20 armed-but-unrouted
+# beads, several of them beads the Mayor had JUST manually re-routed hours
+# earlier, silently losing the route again. Re-routing by hand is Sisyphean
+# under a cause that keeps rewriting the fix (this city's own doctrine:
+# "quando um problema aparece 2x, pare de limpar e construa o guard") — and
+# unlike GMMSW's create-time-only defect, this one recurs at MULTIPLE points
+# in a bead's lifecycle (ga-f54ui's own note: dispatch-time skip, or ANY
+# later bd update — see below), so a one-time manual fix is never durable.
+# Detection alone cannot keep the count from climbing; only repair can.
+#
+# WHY EVEN THE "SAFE" WRITE FORM NEEDS A RETRY LOOP, NOT ONE ATTEMPT:
+# quality-gate-dispatcher.sh's existing restore-on-gate-FAIL path already
+# writes via --set-metadata and verifies the result — but does NOT retry on
+# a confirmed-not-stuck write, just logs "needs investigation" and moves on.
+# ga-9tgos's own concurrent-write reproduction (100 concurrent --set-metadata
+# writers against one disposable bead) found only a handful survived — the
+# per-key-safe form is measurably BETTER than the bare --metadata form (zero
+# of 100 concurrent bare writes survived the same run) but not immune to the
+# underlying race. _pmrw_repair_route() retries up to
+# PMRW_REPAIR_MAX_ATTEMPTS times specifically because the race is transient
+# (a moment-in-time pre-read landing empty) — a later attempt's pre-read is
+# not guaranteed to lose the same race twice.
+#
+# WHAT REMAINS UNKNOWN, STATED PLAINLY RATHER THAN OVERCLAIMED: the exact
+# trigger for a TITLE-ONLY `bd update` wiping unrelated metadata (reproduced
+# live twice by the Mayor: `bd update <id> --title "..."`, no --metadata flag
+# at all, gc.routed_to still flipped to none while the CLI reported "✓
+# Updated issue") is NOT explained by the one confirmed client-side bug
+# (third_party/beads/cmd/bd/update.go's mergeMetadata() skip, gated behind
+# `regularUpdates["metadata"]` being present — which a title-only call never
+# populates). Source reading (both the prior investigation and a fresh pass
+# for this fix, via GitHub MCP against the vendored tree) ruled out the `gc`
+# CLI wrapper (cmd/gc/cmd_bd.go is a byte-for-byte argv passthrough to `bd`,
+# confirmed by reading it directly — not a read-modify-write) and left a
+# server/proxy-side write path (third_party/beads/internal/storage/dbproxy)
+# unexamined and plausible, since this HQ runs `bd` against a shared managed
+# Dolt server rather than an embedded store. THIS REPAIR IS A MITIGATION, NOT
+# A ROOT-CAUSE FIX — closing that gap needs upstream/engine-side
+# investigation, already explicitly out of scope for a dog session (Mayor's
+# own 2026-08-09 05:41Z decision: no local `bd` rebuild, since the vendored
+# tree already matches the live binary commit and would ship the identical
+# bug).
+#
+# SAFETY BOUNDS KEPT: repair only ever fires on a candidate that ALREADY
+# survived every one of the twelve exclusion filters above — same population
+# a human would have fixed by hand, nothing broader. PMRW_AUTO_REPAIR=0 is an
+# independent kill switch (separate from PMRW_ENABLED) for instant rollback
+# to pure detection-only if this ever misbehaves in production, with no code
+# change needed. Retries are bounded (PMRW_REPAIR_MAX_ATTEMPTS, default 3),
+# never a spin loop. A write is never trusted from the CLI's exit code alone
+# — every attempt re-reads the bead before declaring success, failure, or
+# unverified (ga-p5q3: an unreadable state is its own third state).
+#
+# ALERTING (repair-failed/unverified beads only — a REPAIRED bead never
+# reaches this path, see next paragraph): per-bead durable `bd comment`
+# (new-or-cooldown-expired only, via --stdin — never a positional-arg
+# `bd comment <id> <text>` invocation, which silently fuzzy-matches an
+# invalid id and lands on an unrelated bead; --stdin has no id/text
+# positional ambiguity to mis-derive) + aggregate `notify -p 2` +
+# `gc mail send mayor`, cooldown-gated. Same shape as GMMSW/GOLW.
+#
+# REPAIR AUDIT TRAIL (ga-9tgos, separate from ALERTING above and NOT
+# cooldown-gated — repair is attempted every sweep regardless of whether a
+# prior sweep already alerted on the same bead): a SUCCESSFULLY repaired
+# bead gets its own one-time `bd comment` ("SELF-HEALED...") posted directly
+# on it and is logged, but deliberately does NOT trigger notify/mail — a
+# repair is the routine, expected outcome this whole mechanism exists to
+# produce, not an event that should page anyone (same "no side effect for a
+# routine outcome" convention scenario 2 already established for a bead that
+# was never broken in the first place).
 #
 # MULTI-STORE RESOLUTION CORRECTNESS (mirrors GOLW's ga-tqe4j fix exactly):
 # a bead tracked in state that's absent from THIS sweep's flagged set is only
@@ -219,6 +293,16 @@ PMRW_NOTIFY_PRIORITY="${PMRW_NOTIFY_PRIORITY:-2}"
 # — see header). Default 240min/4h — the measured split from this bug's own
 # incident, not a guess (see header for the full derivation).
 PMRW_DISPATCH_RECENCY_MINUTES="${PMRW_DISPATCH_RECENCY_MINUTES:-240}"
+# ga-9tgos: auto-repair config (see header "WHY AUTO-REPAIR IS NOW SAFE").
+# Default ON — a candidate that survives every exclusion above gets a
+# write+verify repair attempt BEFORE falling back to alert-only.
+PMRW_AUTO_REPAIR="${PMRW_AUTO_REPAIR:-1}"
+# The underlying race (ga-9tgos) is transient by nature (a moment-in-time
+# pre-read landing empty), so a bounded retry has real recovery odds — one
+# attempt alone (what quality-gate-dispatcher.sh's own restore-on-gate-FAIL
+# path already does) does not.
+PMRW_REPAIR_MAX_ATTEMPTS="${PMRW_REPAIR_MAX_ATTEMPTS:-3}"
+PMRW_REPAIR_RETRY_SLEEP_S="${PMRW_REPAIR_RETRY_SLEEP_S:-1}"
 
 HQ="${PMRW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 # Same store set as GOLW (gate-orphaned-label-watchdog.sh), same rationale:
@@ -371,6 +455,101 @@ _bead_recheck_status() {
     ' 2>/dev/null
 }
 
+# _pmrw_default_route_for_store <store_path>
+# ga-9tgos: what gc.routed_to should be RESTORED to for a candidate this
+# sweep already confirmed is armed+open+unrouted+aged and survived every
+# exclusion filter. Mirrors quality-gate-dispatcher.sh's
+# default_pool_route_for_rig() / pilot-dispatcher.sh's
+# rig_to_builder()+wa_worker_template() EXACTLY (same three-way split) —
+# duplicated on purpose, not sourced, same tradeoff that function's own
+# header already documents (independently-running daemons, no shared-lib
+# chokepoint today; confirmed absent again for THIS fix by direct source
+# search, not assumed). Keyed on the STORE's basename rather than a $RIG
+# variable, since PMRW_STORES is a set of filesystem paths, not rig names —
+# same unit _store_name() already uses everywhere else in this script.
+_pmrw_default_route_for_store() {
+  local _s; _s="$(_store_name "$1")"
+  case "$_s" in
+    whatsapp_automation|wa) printf 'wa-worker' ;;
+    property_scrapers|ps)   printf 'ps-worker' ;;
+    *)                      printf 'gastown.dog' ;;
+  esac
+}
+
+# _pmrw_repair_route <bead_id> <store>
+# ga-9tgos: attempts to RESTORE gc.routed_to on a candidate run_sweep's
+# per-bead loop already confirmed survived every exclusion filter (called
+# from there only — never speculatively). Writes via --set-metadata (the
+# per-key-safe form this whole script family already standardizes on — see
+# _GFAIL_ROUTE in quality-gate-dispatcher.sh), THEN VERIFIES via a fresh
+# read through the exact same _bead_recheck_status this script already uses
+# for resolve-tracking. Never trusts the CLI's own exit code alone: ga-9tgos's
+# own core finding, reproduced live by the Mayor (bd update <id> --title "..."
+# — untouched metadata — flipped gc.routed_to to none while the CLI reported
+# "✓ Updated issue"), is that a write can report success while silently not
+# persisting. Retries up to PMRW_REPAIR_MAX_ATTEMPTS times on a confirmed-
+# not-stuck write: the underlying race is transient (a moment-in-time
+# pre-read landing empty), so a later attempt's pre-read is not guaranteed to
+# lose the same race — and even the "safe" --set-metadata form is not immune
+# (ga-9tgos's own concurrent-write repro: of 100 concurrent --set-metadata
+# writers against one bead, only a handful survived), so a single attempt
+# with no retry (quality-gate-dispatcher.sh's existing gate-FAIL restore path)
+# is not enough on its own either.
+# Prints ONE token to stdout, nothing else:
+#   repaired         — write verified stuck; bead now carries gc.routed_to.
+#   already-resolved — bead closed/gone/no-longer-armed between detection and
+#                       repair (something else already handled it, or it
+#                       simply isn't armed anymore) — not a failure, just
+#                       moot; caller must not alert on this.
+#   failed            — exhausted retries; gc.routed_to confirmed still empty
+#                       (a verify read succeeded and said "present" every
+#                       time).
+#   unverified        — exhausted retries; every verify read itself failed
+#                       (ga-p5q3 discipline: an unreadable state is its own
+#                       third state, never folded into "failed" — the write
+#                       may well have stuck; this watchdog just could not
+#                       confirm it).
+# Never touches state or alert plumbing — the caller (run_sweep) decides what
+# to do with the outcome.
+_pmrw_repair_route() {
+  local _bid="$1" _store="$2" _route _attempt _status
+  _route="$(_pmrw_default_route_for_store "$_store")"
+  _status="error"
+  _attempt=1
+  while [ "$_attempt" -le "${PMRW_REPAIR_MAX_ATTEMPTS:-3}" ]; do
+    "$BD_BIN" -C "$_store" update "$_bid" --set-metadata "gc.routed_to=$_route" -q 2>/dev/null || true
+    _status="$(_bead_recheck_status "$_bid" "$_store")"
+    case "$_status" in
+      routed)
+        printf 'repaired'
+        return 0
+        ;;
+      closed|gone|not-armed)
+        printf 'already-resolved'
+        return 0
+        ;;
+      present)
+        log "  - REPAIR $_bid ($(_store_name "$_store")): attempt ${_attempt}/${PMRW_REPAIR_MAX_ATTEMPTS} wrote gc.routed_to=$_route but verify still shows it absent — retrying"
+        ;;
+      *)
+        log "  - REPAIR $_bid ($(_store_name "$_store")): attempt ${_attempt}/${PMRW_REPAIR_MAX_ATTEMPTS} verify read failed (error) — retrying"
+        ;;
+    esac
+    _attempt=$((_attempt + 1))
+    if [ "$_attempt" -le "${PMRW_REPAIR_MAX_ATTEMPTS:-3}" ] && [ "${PMRW_REPAIR_RETRY_SLEEP_S:-0}" != "0" ]; then
+      sleep "$PMRW_REPAIR_RETRY_SLEEP_S"
+    fi
+  done
+  # Exhausted retries — distinguish failed (confirmed still empty) from
+  # unverified (last read errored) using the LAST $_status observed above.
+  if [ "$_status" = "present" ]; then
+    printf 'failed'
+  else
+    printf 'unverified'
+  fi
+  return 1
+}
+
 # _pmrw_resolve_tracked_state <state_json> <flagged_ids_json>
 # ga-tqe4j pattern: the single choke point run_sweep funnels through before
 # pruning anything from state. For every id in <state_json> NOT present in
@@ -438,6 +617,16 @@ run_sweep() {
 
   # Accumulate flagged candidates as TSV: id, store, age_min, labels, issue_type
   local flagged_tsv=""
+  local repaired_tsv=""
+  # ga-9tgos: computed once — under PMRW_AUTO_REPAIR=1 and not dry-run, EVERY
+  # candidate that reaches the alert path below did so via a failed/
+  # unverified repair attempt (the per-bead loop's repair block only ever
+  # falls through to flagged_tsv on those two outcomes) — so the alert
+  # wording only needs to know the MODE, never a per-bead lookup.
+  local _pmrw_repair_was_active=0
+  if [ "${PMRW_AUTO_REPAIR:-1}" = "1" ] && [ "${PMRW_DRY_RUN:-0}" != "1" ]; then
+    _pmrw_repair_was_active=1
+  fi
   local store cand_json sel_json
   for store in $PMRW_STORES; do
     # Re-stamp the lock heartbeat once per store (mirrors quality-gate-
@@ -502,7 +691,7 @@ run_sweep() {
           ] | @tsv
       ' 2>/dev/null)
     [ -z "${rows:-}" ] && continue
-    local gate_active dispatched_at sling_bead dispatch_age_s recency_threshold_s sling_status sling_override sling_note
+    local gate_active dispatched_at sling_bead dispatch_age_s recency_threshold_s sling_status sling_override sling_note repair_status
     while IFS=$'\t' read -r bid blabels btype age_min dispatched_at sling_bead; do
       [ -z "${bid:-}" ] && continue
 
@@ -543,9 +732,59 @@ run_sweep() {
         log "  - SKIP $bid ($(_store_name "$store")): active gate marker/run in flight — already dispatched+built+submitted, not a routing gap"
         continue
       fi
+
+      # ga-9tgos: repair before falling back to alert-only. Skipped entirely
+      # in DRY_RUN (dry-run's whole contract is detect-but-touch-nothing —
+      # see scenario 16) and via PMRW_AUTO_REPAIR=0 (independent rollback
+      # switch, kept separate from PMRW_DRY_RUN so an operator can force
+      # detection-only in production without also silencing alerts).
+      if [ "$_pmrw_repair_was_active" = "1" ]; then
+        repair_status="$(_pmrw_repair_route "$bid" "$store")"
+        case "$repair_status" in
+          repaired)
+            repaired_tsv="${repaired_tsv}${bid}\t${store}\t$(_pmrw_default_route_for_store "$store")\n"
+            log "  - REPAIRED $bid ($(_store_name "$store")): gc.routed_to restored to $(_pmrw_default_route_for_store "$store") and verified — not flagging this sweep"
+            continue
+            ;;
+          already-resolved)
+            log "  - SKIP $bid ($(_store_name "$store")): no longer armed/open by the time repair ran — moot, not flagging"
+            continue
+            ;;
+          failed)
+            log "  - REPAIR FAILED $bid ($(_store_name "$store")): exhausted ${PMRW_REPAIR_MAX_ATTEMPTS} attempt(s), gc.routed_to confirmed still absent — falling through to alert"
+            ;;
+          *)
+            log "  - REPAIR UNVERIFIED $bid ($(_store_name "$store")): exhausted ${PMRW_REPAIR_MAX_ATTEMPTS} attempt(s), could not confirm outcome — falling through to alert"
+            ;;
+        esac
+      fi
+
       flagged_tsv="${flagged_tsv}${bid}\t${store}\t${age_min}\t${blabels}\t${btype}\n"
     done <<< "$rows"
   done
+
+  # ── ga-9tgos: log + comment the repaired set (audit trail only — never
+  # alarms; a repaired bead is working again, same "no side effect for a
+  # routine, expected outcome" convention as e.g. scenario 2's routed-bead-
+  # never-flags). Runs regardless of whether flagged_tsv ends up empty or
+  # not — a sweep can both repair some candidates AND still have others fall
+  # through to alert. ─────────────────────────────────────────────────────
+  local repaired_count; repaired_count="$(printf '%b' "${repaired_tsv:-}" | grep -c . || true)"
+  [ -z "${repaired_count:-}" ] && repaired_count=0
+  if [ "${repaired_count:-0}" -gt 0 ]; then
+    log "REPAIRED: ${repaired_count} bead(s) had gc.routed_to auto-restored this sweep (ga-9tgos)"
+    local rbid rstore2 rroute
+    while IFS=$'\t' read -r rbid rstore2 rroute; do
+      [ -z "${rbid:-}" ] && continue
+      log "  - $rbid ($(_store_name "$rstore2")): gc.routed_to -> $rroute"
+      if [ -n "${PMRW_TEST_COMMENTS_LOG:-}" ]; then
+        echo "repaired:${rbid}" >> "$PMRW_TEST_COMMENTS_LOG" 2>/dev/null || true
+      else
+        printf '%s' "pilot-missing-route-watchdog (ga-f54ui/ga-9tgos): this bead was armed (ctx:ready + exec:auto) and open, but gc.routed_to had gone missing. SELF-HEALED this sweep: restored to '${rroute}' and verified by re-reading the bead after the write — not assumed from the CLI's exit code (ga-9tgos's own finding is that a write can report success while silently not persisting). No human action needed; recorded here for the audit trail." \
+          | "$BD_BIN" -C "$rstore2" comment "$rbid" --stdin 2>/dev/null || log "WARN: bd comment (repair audit) failed for $rbid"
+      fi
+    done < <(printf '%b' "$repaired_tsv")
+  fi
 
   # Build the flagged-ids set once, used both for the empty-branch prune pass
   # and the non-empty branch below — always run resolution, even when this
@@ -567,10 +806,10 @@ run_sweep() {
   [ -z "${resolved_count:-}" ] && resolved_count=0
 
   if [ -z "${flagged_tsv:-}" ]; then
-    if [ "$resolved_count" -eq 0 ] && [ "$state" = "{}" ]; then
+    if [ "$resolved_count" -eq 0 ] && [ "${repaired_count:-0}" -eq 0 ] && [ "$state" = "{}" ]; then
       log "OK: 0 armed-but-unrouted bead(s) found across ${#PMRW_STORES} store(s)"
     else
-      log "OK: 0 armed-but-unrouted bead(s) this sweep (${resolved_count} resolved)"
+      log "OK: 0 armed-but-unrouted bead(s) this sweep (${resolved_count} resolved, ${repaired_count:-0} auto-repaired)"
     fi
     if [ "${PMRW_DRY_RUN:-0}" != "1" ]; then
       mkdir -p "$PMRW_STATE_DIR" 2>/dev/null || true
@@ -580,7 +819,16 @@ run_sweep() {
         printf '%s' "$state" > "$STATE_FILE" 2>/dev/null || true
       fi
     fi
-    [ "$resolved_count" -gt 0 ] && return 1 || return 0
+    # Explicit if/else, not a chained &&/|| — this file's own lock-section
+    # header documents a real regression from exactly this collapsed-OR
+    # shape ("faz quanto tempo?" vs "ainda existe?" are different
+    # questions; same family here: "resolved something?" vs "repaired
+    # something?" must both independently make this a non-trivial sweep).
+    if [ "$resolved_count" -gt 0 ] || [ "${repaired_count:-0}" -gt 0 ]; then
+      return 1
+    else
+      return 0
+    fi
   fi
 
   # ── cooldown/state: alert only new-or-cooldown-expired, log the FULL
@@ -626,7 +874,17 @@ run_sweep() {
   local msg
   while IFS=$'\t' read -r bid store2 age_min labels btype; do
     [ -z "${bid:-}" ] && continue
-    msg="pilot-missing-route-watchdog (ga-f54ui): this bead is armed (ctx:ready + exec:auto, labels=[${labels}]) and open, but carries NO gc.routed_to metadata. ARMED BUT UNREACHABLE: a pool worker's self-serve discovery (bd ready --metadata-field gc.routed_to=<target> --unassigned) will never find it without that field, and the Pilot's own re-dispatch pass may separately skip it if a stale pilot.dispatched_at is present — this can look 'ready' in every listing and the panel while nothing ever picks it up. age=${age_min}min type=${btype} store=$(_store_name "$store2"). Detection-only report — no metadata was changed by this watchdog. A human/Mayor should confirm the intended route (commonly derivable from an existing crew/<name>/<bead> branch owner, or wa-worker/ps-worker/dog for pool-eligible work) and set gc.routed_to to un-strand this bead."
+    if [ "$_pmrw_repair_was_active" = "1" ]; then
+      # ga-9tgos: every bead reaching this loop under active-repair mode
+      # already went through a failed/unverified write+verify repair
+      # attempt in the per-bead loop above — "no metadata was changed" is
+      # no longer true here and must not be claimed (this codebase's own
+      # doctrine: a comment promising something the code doesn't do is
+      # worse than none).
+      msg="pilot-missing-route-watchdog (ga-f54ui): this bead is armed (ctx:ready + exec:auto, labels=[${labels}]) and open, but carries NO gc.routed_to metadata. ARMED BUT UNREACHABLE: a pool worker's self-serve discovery (bd ready --metadata-field gc.routed_to=<target> --unassigned) will never find it without that field, and the Pilot's own re-dispatch pass may separately skip it if a stale pilot.dispatched_at is present — this can look 'ready' in every listing and the panel while nothing ever picks it up. age=${age_min}min type=${btype} store=$(_store_name "$store2"). AUTO-REPAIR WAS ATTEMPTED this sweep (up to ${PMRW_REPAIR_MAX_ATTEMPTS} write+verify tries, ga-9tgos) and did NOT verifiably stick — see the watchdog log for per-attempt detail; this likely means sustained write contention specific to this bead, not a one-off blip. A human/Mayor should investigate and set gc.routed_to to un-strand this bead (commonly derivable from an existing crew/<name>/<bead> branch owner, or wa-worker/ps-worker/dog for pool-eligible work)."
+    else
+      msg="pilot-missing-route-watchdog (ga-f54ui): this bead is armed (ctx:ready + exec:auto, labels=[${labels}]) and open, but carries NO gc.routed_to metadata. ARMED BUT UNREACHABLE: a pool worker's self-serve discovery (bd ready --metadata-field gc.routed_to=<target> --unassigned) will never find it without that field, and the Pilot's own re-dispatch pass may separately skip it if a stale pilot.dispatched_at is present — this can look 'ready' in every listing and the panel while nothing ever picks it up. age=${age_min}min type=${btype} store=$(_store_name "$store2"). Detection-only this sweep (auto-repair disabled via PMRW_AUTO_REPAIR=0 or suppressed by PMRW_DRY_RUN=1) — no metadata was changed by this watchdog. A human/Mayor should confirm the intended route (commonly derivable from an existing crew/<name>/<bead> branch owner, or wa-worker/ps-worker/dog for pool-eligible work) and set gc.routed_to to un-strand this bead."
+    fi
     if [ -n "${PMRW_TEST_COMMENTS_LOG:-}" ]; then
       echo "comment:${bid}" >> "$PMRW_TEST_COMMENTS_LOG" 2>/dev/null || true
     else
@@ -645,10 +903,18 @@ run_sweep() {
       "${NOTIFY_BIN}" -t "Pilot: armed bead(s) missing route" -p "${PMRW_NOTIFY_PRIORITY}" "$summary" 2>/dev/null || true
   fi
 
-  local mail_body="PILOT MISSING-ROUTE WATCHDOG — detection-only report (ga-f54ui).
+  local mail_body
+  if [ "$_pmrw_repair_was_active" = "1" ]; then
+    mail_body="PILOT MISSING-ROUTE WATCHDOG — auto-repair report (ga-f54ui/ga-9tgos). Every bead below already had a failed/unverified repair attempt.
 
 ${summary}
 "
+  else
+    mail_body="PILOT MISSING-ROUTE WATCHDOG — detection-only report (ga-f54ui).
+
+${summary}
+"
+  fi
   if [ "${new_count:-0}" -gt 0 ]; then
     local new_lines; new_lines="$(printf '%b' "$to_alert_tsv" | while IFS=$'\t' read -r bid store2 age_min labels btype; do
       [ -z "${bid:-}" ] && continue
@@ -674,13 +940,27 @@ ${resolved_lines}
 +${unchanged_count} already reported previously, unchanged — see the log for the full current list.
 "
   fi
+  if [ "$_pmrw_repair_was_active" = "1" ]; then
+    mail_body="${mail_body}
+AUTO-REPAIR (ga-9tgos) was ACTIVE this sweep: every bead listed above already
+had a write+verify repair attempt (up to ${PMRW_REPAIR_MAX_ATTEMPTS} tries)
+that did NOT verifiably stick before being reported here — this is the
+residual AFTER repair, not a detection-only list."
+    if [ "${repaired_count:-0}" -gt 0 ]; then
+      mail_body="${mail_body} ${repaired_count} other bead(s) this
+sweep WERE successfully self-healed and are intentionally not listed above
+(each carries its own 'SELF-HEALED' comment; see the log for the full
+repaired list)."
+    fi
+  else
+    mail_body="${mail_body}
+This is DETECTION-ONLY this sweep (PMRW_AUTO_REPAIR=0 or PMRW_DRY_RUN=1) — no
+gc.routed_to was set on any bead by this watchdog."
+  fi
   mail_body="${mail_body}
-This is DETECTION-ONLY — no gc.routed_to was set on any bead by this
-watchdog (see the script header for why auto-repair from branch-owner
-inference was considered and deferred). Per-bead detail for NEW/DUE beads is
-also posted as a comment on each bead. Re-alerts for an already-flagged bead
-are suppressed for ${PMRW_ALERT_COOLDOWN_S}s (state: ${STATE_FILE}). Full
-current list always in the log: ${LOG}"
+Per-bead detail for NEW/DUE beads is also posted as a comment on each bead.
+Re-alerts for an already-flagged bead are suppressed for ${PMRW_ALERT_COOLDOWN_S}s
+(state: ${STATE_FILE}). Full current list always in the log: ${LOG}"
 
   if [ -n "${PMRW_TEST_MAILED:-}" ]; then
     { echo "mail:pilot-missing-route:$summary"; printf '%s\n' "$mail_body"; } >> "$PMRW_TEST_MAILED" 2>/dev/null || true
@@ -713,6 +993,14 @@ if [ "${1:-}" = "--selftest" ] || [ "${PMRW_SELFTEST:-0}" = "1" ]; then
   PMRW_DRY_RUN=0
   PMRW_GRACE_MINUTES=10
   PMRW_ALERT_COOLDOWN_S=21600
+  # ga-9tgos: repair defaults to ON in production (matches PMRW_AUTO_REPAIR's
+  # own default), but with retry sleep forced to 0 here — a real 1s-per-
+  # attempt sleep would otherwise add many real seconds across the dozens of
+  # scenarios below that now also exercise the (by-default-failing, see the
+  # bd stub's `update)` case) repair path before falling through to alert.
+  PMRW_AUTO_REPAIR=1
+  PMRW_REPAIR_MAX_ATTEMPTS=3
+  PMRW_REPAIR_RETRY_SLEEP_S=0
   PMRW_STATE_DIR="$TMP/state"
   STATE_FILE="$TMP/state/pmrw.state.json"
   HQ="$TMP/hq"
@@ -739,11 +1027,32 @@ case "$verb" in
       # recheck form: bd -C <store> list --id <id> --all --json
       idval="${args[4]:-}"
       f="$PMRW_TEST_RECHECK_DIR/${storekey}-${idval}.json"
-      if [ -f "$f" ] && grep -qx '__BD_FAIL__' "$f" 2>/dev/null; then
-        echo "simulated bd failure: connection refused" >&2
-        exit 1
+      if [ -f "$f" ]; then
+        if grep -qx '__BD_FAIL__' "$f" 2>/dev/null; then
+          echo "simulated bd failure: connection refused" >&2
+          exit 1
+        fi
+        cat "$f"
+      else
+        # ga-9tgos: no DEDICATED recheck fixture for this id — fall back to
+        # reflecting the id's current entry in the MAIN store fixture,
+        # rather than unconditionally "[]" (which _bead_recheck_status reads
+        # as "gone"). Realistic default: a recheck against the SAME live
+        # store should normally see the SAME thing the main sweep just saw,
+        # unless a scenario explicitly seeds a dedicated recheck fixture to
+        # simulate drift between sweeps (scenarios 13/14/33/34/35 already
+        # do this and are unaffected — this fallback only fires in the
+        # absent case). Without this, every scenario whose bead now also
+        # goes through the repair path (any "flagged" scenario, since
+        # repair is attempted before every alert) would read as "gone" on
+        # its FIRST verify call and be wrongly treated as already-resolved.
+        mainf="$PMRW_TEST_FIXTURES_DIR/${storekey}.json"
+        if [ -f "$mainf" ] && ! grep -qx '__BD_FAIL__' "$mainf" 2>/dev/null; then
+          jq -c --arg id "$idval" '[.[] | select(.id==$id)]' "$mainf" 2>/dev/null || echo "[]"
+        else
+          echo "[]"
+        fi
       fi
-      [ -f "$f" ] && cat "$f" || echo "[]"
     elif { sbid=""; for ((j=0; j<${#args[@]}; j++)); do
              if [ "${args[$j]}" = "-l" ] && [[ "${args[$((j+1))]:-}" == source-bead:* ]]; then
                sbid="${args[$((j+1))]#source-bead:}"; break
@@ -769,6 +1078,57 @@ case "$verb" in
     bid="$4"
     echo "comment:${bid}" >> "${PMRW_TEST_COMMENTS_LOG:-/dev/null}"
     ;;
+  update)
+    # ga-9tgos: bd -C <store> update <id> --set-metadata k=v -q — the ONLY
+    # form _pmrw_repair_route() calls. Tracked unconditionally (even when
+    # PMRW_TEST_REPAIR_FAILCOUNT_DIR isn't set) so a kill-switch scenario can
+    # assert ZERO update calls were even attempted.
+    bid="$4"
+    echo "update:${bid}" >> "${PMRW_TEST_UPDATE_CALLS_LOG:-/dev/null}"
+    kv=""
+    for ((i=0; i<${#args[@]}; i++)); do
+      if [ "${args[$i]}" = "--set-metadata" ]; then kv="${args[$((i+1))]}"; fi
+    done
+    key="${kv%%=*}"; val="${kv#*=}"
+    # Default behavior (no failcount fixture seeded for this store+id): a
+    # SILENT NO-OP — the CLI still exits 0, but the write never persists.
+    # This mirrors this bug's own worst-case, measured signature ("todas as
+    # escritas sairam com exit 0. Ninguem soube que perdeu.") and is
+    # deliberately the DEFAULT so every EXISTING selftest scenario (written
+    # before repair existed) keeps exercising the OLD alert-path outcome
+    # unchanged — repair is attempted, silently fails every time by default,
+    # falls through to alert exactly as before. Scenarios that want to
+    # exercise a SUCCESSFUL (immediate or after-N-retries) repair opt in
+    # explicitly via a countdown file at
+    # PMRW_TEST_REPAIR_FAILCOUNT_DIR/<storekey>-<id> containing the number
+    # of times to keep failing before succeeding (0 = succeed immediately).
+    persist=0
+    if [ -n "${PMRW_TEST_REPAIR_FAILCOUNT_DIR:-}" ] && [ -n "$key" ]; then
+      fcfile="$PMRW_TEST_REPAIR_FAILCOUNT_DIR/${storekey}-${bid}"
+      if [ -f "$fcfile" ]; then
+        n="$(cat "$fcfile" 2>/dev/null || echo 0)"
+        case "$n" in ''|*[!0-9]*) n=0 ;; esac
+        if [ "$n" -le 0 ]; then
+          persist=1
+        else
+          echo $((n - 1)) > "$fcfile"
+        fi
+      fi
+    fi
+    if [ "$persist" = "1" ]; then
+      base="$PMRW_TEST_RECHECK_DIR/${storekey}-${bid}.json"
+      cur=""
+      if [ -f "$base" ] && ! grep -qx '__BD_FAIL__' "$base" 2>/dev/null; then
+        cur="$(jq -c '.[0] // empty' "$base" 2>/dev/null)"
+      fi
+      if [ -z "$cur" ]; then
+        mainf="$PMRW_TEST_FIXTURES_DIR/${storekey}.json"
+        [ -f "$mainf" ] && cur="$(jq -c --arg id "$bid" '[.[] | select(.id==$id)][0] // empty' "$mainf" 2>/dev/null)"
+      fi
+      [ -z "$cur" ] && cur="{\"id\":\"${bid}\",\"status\":\"open\",\"labels\":[\"ctx:ready\",\"exec:auto\"],\"issue_type\":\"bug\",\"metadata\":{}}"
+      printf '[%s]' "$(printf '%s' "$cur" | jq -c --arg k "$key" --arg v "$val" '.metadata[$k] = $v')" > "$base"
+    fi
+    ;;
   *) echo "[]" ;;
 esac
 BDSTUB
@@ -780,7 +1140,8 @@ BDSTUB
   export PMRW_TEST_FIXTURES_DIR="$TMP/fixtures"
   export PMRW_TEST_RECHECK_DIR="$TMP/recheck"
   export PMRW_TEST_GATEPROBE_DIR="$TMP/gateprobe"
-  mkdir -p "$PMRW_TEST_FIXTURES_DIR" "$PMRW_TEST_RECHECK_DIR" "$PMRW_TEST_GATEPROBE_DIR"
+  export PMRW_TEST_REPAIR_FAILCOUNT_DIR="$TMP/repair-failcount"
+  mkdir -p "$PMRW_TEST_FIXTURES_DIR" "$PMRW_TEST_RECHECK_DIR" "$PMRW_TEST_GATEPROBE_DIR" "$PMRW_TEST_REPAIR_FAILCOUNT_DIR"
 
   OLD_TS="$(date -u -v-1H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)"
   FRESH_TS="$(date -u -v-1M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%SZ)"
@@ -1259,6 +1620,131 @@ BDSTUB
   [ "$rc" -eq 0 ] && ok "scenario 35: sling probe failure fails open toward no-alarm (return 0)" || bad "scenario 35: a failed sling probe must not force a flag, got $rc"
   [ ! -s "$C35" ] && ok "scenario 35: no comment posted despite probe failure" || bad "scenario 35: comment posted off an unconfirmed (failed) sling probe"
   grep -q "sling ga-35-sling checked: error" "$LOG" 2>/dev/null && ok "scenario 35: log names the probe failure explicitly (not folded into the confirmed-open case)" || bad "scenario 35: log does not distinguish probe-failed from confirmed-open"
+
+  # ── Scenario 36 (ga-9tgos): repair succeeds IMMEDIATELY → self-healed,
+  # never reaches the alert path at all (no comment/notify/mail for the
+  # ARMED-BUT-UNREACHABLE alarm — only its own one-time audit comment).
+  echo "Scenario 36 (ga-9tgos): armed+unrouted+aged, repair write persists immediately → self-healed, not alerted"
+  reset_stores
+  printf '[%s]' "$(mk ga-36 open 'ctx:ready,exec:auto' "$OLD_TS")" > "$TMP/fixtures/store-a.json"
+  echo 0 > "$PMRW_TEST_REPAIR_FAILCOUNT_DIR/store-a-ga-36"
+  N36="$TMP/notif36"; M36="$TMP/mail36"; C36="$TMP/comm36"; U36="$TMP/upd36"; : > "$N36"; : > "$M36"; : > "$C36"; : > "$U36"
+  PMRW_TEST_NOTIFIED="$N36" PMRW_TEST_MAILED="$M36" PMRW_TEST_COMMENTS_LOG="$C36" PMRW_TEST_UPDATE_CALLS_LOG="$U36" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 36: repair-only sweep still returns 1 (noteworthy activity)" || bad "scenario 36: expected return 1, got $rc"
+  grep -qx "update:ga-36" "$U36" 2>/dev/null && ok "scenario 36: a repair write was attempted" || bad "scenario 36: no update call attempted"
+  grep -qx "repaired:ga-36" "$C36" 2>/dev/null && ok "scenario 36: self-heal audit comment posted" || bad "scenario 36: no self-heal audit comment"
+  grep -q "^comment:ga-36$" "$C36" 2>/dev/null && bad "scenario 36 (false alarm): the ARMED-BUT-UNREACHABLE alert comment fired for a bead that was self-healed" || ok "scenario 36: no alarm comment fired"
+  [ ! -s "$N36" ] && ok "scenario 36: no notify fired for a routine self-heal" || bad "scenario 36: notify fired for a routine self-heal"
+  [ ! -s "$M36" ] && ok "scenario 36: no mail fired for a routine self-heal" || bad "scenario 36: mail fired for a routine self-heal"
+  grep -q "REPAIRED: 1 bead(s)" "$LOG" 2>/dev/null && ok "scenario 36: REPAIRED summary logged" || bad "scenario 36: no REPAIRED summary in log"
+  grep -q "ga-36 (store-a): gc.routed_to -> gastown.dog" "$LOG" 2>/dev/null && ok "scenario 36: default (non-wa/ps) store maps to gastown.dog" || bad "scenario 36: wrong or missing route in log"
+
+  # ── Scenario 37 (ga-9tgos): store->route mapping mirrors quality-gate-
+  # dispatcher.sh's default_pool_route_for_rig() exactly for the two named
+  # rigs. Overrides PMRW_STORES for this call only, restored after.
+  echo "Scenario 37 (ga-9tgos): store basename 'whatsapp_automation' -> wa-worker, 'property_scrapers' -> ps-worker"
+  STORE_WA="$TMP/whatsapp_automation"; STORE_PS="$TMP/property_scrapers"
+  mkdir -p "$STORE_WA" "$STORE_PS"
+  rm -f "$STATE_FILE" 2>/dev/null
+  printf '[%s]' "$(mk wa-37 open 'ctx:ready,exec:auto' "$OLD_TS")" > "$TMP/fixtures/whatsapp_automation.json"
+  printf '[%s]' "$(mk ps-37 open 'ctx:ready,exec:auto' "$OLD_TS")" > "$TMP/fixtures/property_scrapers.json"
+  echo 0 > "$PMRW_TEST_REPAIR_FAILCOUNT_DIR/whatsapp_automation-wa-37"
+  echo 0 > "$PMRW_TEST_REPAIR_FAILCOUNT_DIR/property_scrapers-ps-37"
+  N37="$TMP/notif37"; M37="$TMP/mail37"; C37="$TMP/comm37"; : > "$N37"; : > "$M37"; : > "$C37"
+  PMRW_STORES="$STORE_WA $STORE_PS" PMRW_TEST_NOTIFIED="$N37" PMRW_TEST_MAILED="$M37" PMRW_TEST_COMMENTS_LOG="$C37" run_sweep >/dev/null
+  grep -q "wa-37 (whatsapp_automation): gc.routed_to -> wa-worker" "$LOG" 2>/dev/null && ok "scenario 37: whatsapp_automation -> wa-worker" || bad "scenario 37: wrong/missing route for whatsapp_automation store"
+  grep -q "ps-37 (property_scrapers): gc.routed_to -> ps-worker" "$LOG" 2>/dev/null && ok "scenario 37: property_scrapers -> ps-worker" || bad "scenario 37: wrong/missing route for property_scrapers store"
+  rm -f "$TMP/fixtures/whatsapp_automation.json" "$TMP/fixtures/property_scrapers.json"
+  rm -f "$STATE_FILE" 2>/dev/null
+
+  # ── Scenario 38 (ga-9tgos): repair write fails twice, succeeds on the 3rd
+  # (last) attempt within the default PMRW_REPAIR_MAX_ATTEMPTS=3 budget —
+  # proves retry actually recovers from the bug's own transient-race shape,
+  # not just that a first-try success path exists.
+  echo "Scenario 38 (ga-9tgos): repair write fails 2x, succeeds on attempt 3/3 → self-healed via retry"
+  reset_stores
+  printf '[%s]' "$(mk ga-38 open 'ctx:ready,exec:auto' "$OLD_TS")" > "$TMP/fixtures/store-a.json"
+  echo 2 > "$PMRW_TEST_REPAIR_FAILCOUNT_DIR/store-a-ga-38"
+  : > "$LOG"
+  N38="$TMP/notif38"; M38="$TMP/mail38"; C38="$TMP/comm38"; : > "$N38"; : > "$M38"; : > "$C38"
+  PMRW_TEST_NOTIFIED="$N38" PMRW_TEST_MAILED="$M38" PMRW_TEST_COMMENTS_LOG="$C38" run_sweep >/dev/null
+  grep -qx "repaired:ga-38" "$C38" 2>/dev/null && ok "scenario 38: eventually self-healed after retries" || bad "scenario 38: retry did not recover the repair"
+  [ "$(grep -c "REPAIR ga-38.*retrying" "$LOG" 2>/dev/null)" -eq 2 ] && ok "scenario 38: exactly 2 retry attempts logged before success" || bad "scenario 38: expected exactly 2 retry log lines"
+
+  # ── Scenario 39 (ga-9tgos): repair exhausts all attempts, write never
+  # sticks → falls through to alert, with the UPDATED (not "no metadata was
+  # changed") wording path and a distinct FAILED log line.
+  echo "Scenario 39 (ga-9tgos): repair exhausts all attempts (write never persists) → falls through to alert"
+  reset_stores
+  printf '[%s]' "$(mk ga-39 open 'ctx:ready,exec:auto' "$OLD_TS")" > "$TMP/fixtures/store-a.json"
+  : > "$LOG"
+  N39="$TMP/notif39"; M39="$TMP/mail39"; C39="$TMP/comm39"; U39="$TMP/upd39"; : > "$N39"; : > "$M39"; : > "$C39"; : > "$U39"
+  PMRW_TEST_NOTIFIED="$N39" PMRW_TEST_MAILED="$M39" PMRW_TEST_COMMENTS_LOG="$C39" PMRW_TEST_UPDATE_CALLS_LOG="$U39" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 39: exhausted repair still flags (return 1)" || bad "scenario 39: expected return 1, got $rc"
+  [ "$(grep -cx "update:ga-39" "$U39" 2>/dev/null)" -eq 3 ] && ok "scenario 39: exactly 3 repair write attempts made" || bad "scenario 39: expected exactly 3 update attempts"
+  grep -q "^comment:ga-39$" "$C39" 2>/dev/null && ok "scenario 39: alert comment posted after exhausted repair" || bad "scenario 39: no alert comment"
+  grep -q "REPAIR FAILED ga-39.*exhausted 3 attempt(s), gc.routed_to confirmed still absent" "$LOG" 2>/dev/null && ok "scenario 39: REPAIR FAILED logged with confirmed-absent detail" || bad "scenario 39: no REPAIR FAILED log line"
+
+  # ── Scenario 40 (ga-9tgos): every verify-read during repair itself fails
+  # (not just the write) → UNVERIFIED, distinct from FAILED, ga-p5q3
+  # discipline — still falls through to alert (fail-safe: never silently
+  # drop a candidate just because verification was unreadable).
+  echo "Scenario 40 (ga-9tgos): repair verify-read fails every attempt → UNVERIFIED, falls through to alert"
+  reset_stores
+  printf '[%s]' "$(mk ga-40 open 'ctx:ready,exec:auto' "$OLD_TS")" > "$TMP/fixtures/store-a.json"
+  echo '__BD_FAIL__' > "$TMP/recheck/store-a-ga-40.json"
+  : > "$LOG"
+  N40="$TMP/notif40"; M40="$TMP/mail40"; C40="$TMP/comm40"; : > "$N40"; : > "$M40"; : > "$C40"
+  PMRW_TEST_NOTIFIED="$N40" PMRW_TEST_MAILED="$M40" PMRW_TEST_COMMENTS_LOG="$C40" run_sweep
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "scenario 40: unverified repair still flags (return 1)" || bad "scenario 40: expected return 1, got $rc"
+  grep -q "^comment:ga-40$" "$C40" 2>/dev/null && ok "scenario 40: alert comment posted after unverified repair" || bad "scenario 40: no alert comment"
+  grep -q "REPAIR UNVERIFIED ga-40.*exhausted 3 attempt(s), could not confirm outcome" "$LOG" 2>/dev/null && ok "scenario 40: REPAIR UNVERIFIED logged" || bad "scenario 40: no REPAIR UNVERIFIED log line"
+  rm -f "$TMP/recheck/store-a-ga-40.json"
+
+  # ── Scenario 41 (ga-9tgos): bead resolves (closes) between detection and
+  # the repair attempt → already-resolved, moot — no alert, no false
+  # self-heal claim either (nothing to heal).
+  echo "Scenario 41 (ga-9tgos): bead closes between detection and repair attempt → already-resolved, no alert"
+  reset_stores
+  printf '[%s]' "$(mk ga-41 open 'ctx:ready,exec:auto' "$OLD_TS")" > "$TMP/fixtures/store-a.json"
+  printf '[{"id":"ga-41","status":"closed"}]' > "$TMP/recheck/store-a-ga-41.json"
+  : > "$LOG"
+  N41="$TMP/notif41"; M41="$TMP/mail41"; C41="$TMP/comm41"; : > "$N41"; : > "$M41"; : > "$C41"
+  PMRW_TEST_NOTIFIED="$N41" PMRW_TEST_MAILED="$M41" PMRW_TEST_COMMENTS_LOG="$C41" run_sweep
+  [ ! -s "$C41" ] && ok "scenario 41: no comment at all (neither alarm nor self-heal)" || bad "scenario 41: unexpected comment posted for an already-resolved bead"
+  grep -q "SKIP ga-41.*no longer armed/open by the time repair ran — moot" "$LOG" 2>/dev/null && ok "scenario 41: already-resolved logged as moot" || bad "scenario 41: no already-resolved log line"
+  rm -f "$TMP/recheck/store-a-ga-41.json"
+
+  # ── Scenario 42 (ga-9tgos): PMRW_AUTO_REPAIR=0 kill switch → ZERO update
+  # calls attempted, detection-only alert still fires exactly as before this
+  # fix existed — the independent rollback path.
+  echo "Scenario 42 (ga-9tgos): PMRW_AUTO_REPAIR=0 → no repair attempted at all, old detection-only alert still fires"
+  reset_stores
+  printf '[%s]' "$(mk ga-42 open 'ctx:ready,exec:auto' "$OLD_TS")" > "$TMP/fixtures/store-a.json"
+  : > "$LOG"
+  N42="$TMP/notif42"; M42="$TMP/mail42"; C42="$TMP/comm42"; U42="$TMP/upd42"; : > "$N42"; : > "$M42"; : > "$C42"; : > "$U42"
+  PMRW_AUTO_REPAIR=0 PMRW_TEST_NOTIFIED="$N42" PMRW_TEST_MAILED="$M42" PMRW_TEST_COMMENTS_LOG="$C42" PMRW_TEST_UPDATE_CALLS_LOG="$U42" run_sweep
+  rc=$?
+  PMRW_AUTO_REPAIR=1
+  [ "$rc" -eq 1 ] && ok "scenario 42: kill-switched sweep still flags (return 1)" || bad "scenario 42: expected return 1, got $rc"
+  [ ! -s "$U42" ] && ok "scenario 42: zero update calls attempted with the kill switch off" || bad "scenario 42 (kill switch violated): a repair write was attempted"
+  grep -q "^comment:ga-42$" "$C42" 2>/dev/null && ok "scenario 42: alert comment still posted" || bad "scenario 42: no alert comment"
+  grep -q "notify:" "$N42" 2>/dev/null && ok "scenario 42: notify still fires" || bad "scenario 42: notify did not fire"
+
+  # ── Scenario 43 (ga-9tgos): PMRW_DRY_RUN=1 also suppresses repair (not
+  # just comment/notify/mail/state, already covered by scenario 16) — dry-
+  # run's contract is detect-but-touch-NOTHING, and a repair write is a
+  # touch.
+  echo "Scenario 43 (ga-9tgos): PMRW_DRY_RUN=1 → no repair write attempted either"
+  reset_stores
+  printf '[%s]' "$(mk ga-43 open 'ctx:ready,exec:auto' "$OLD_TS")" > "$TMP/fixtures/store-a.json"
+  U43="$TMP/upd43"; : > "$U43"
+  PMRW_DRY_RUN=1 PMRW_TEST_UPDATE_CALLS_LOG="$U43" run_sweep >/dev/null
+  PMRW_DRY_RUN=0
+  [ ! -s "$U43" ] && ok "scenario 43: dry-run attempted zero repair writes" || bad "scenario 43 (dry-run violated): a repair write was attempted"
 
   echo ""
   echo "pilot-missing-route-watchdog selftest: PASS=$PASS FAIL=$FAIL"
