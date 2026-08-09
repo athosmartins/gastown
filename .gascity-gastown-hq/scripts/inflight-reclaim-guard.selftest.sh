@@ -58,7 +58,8 @@ class FakeResult:
 
 def install_fake_run(fail_labels=None, raise_labels=None, label_beads=None, bad_json_labels=None, non_list_labels=None):
     """Monkeypatch m.subprocess.run to simulate per-label bd-list outcomes.
-    cmd shape: ["bd","list","--label","type:quality-gate-marker","--label",gate_lbl,"--json"]
+    cmd shape (current, ga-vm20x): ["bd","list","--include-infra","--label",
+    "type:quality-gate-marker","--label",gate_lbl,"--json","--limit","0"]
     """
     fail_labels = fail_labels or set()
     raise_labels = raise_labels or set()
@@ -67,7 +68,21 @@ def install_fake_run(fail_labels=None, raise_labels=None, label_beads=None, bad_
     non_list_labels = non_list_labels or set()
 
     def fake_run(cmd, capture_output=True, text=True, timeout=20):
-        gate_lbl = cmd[5]
+        # gate_lbl is the value after the SECOND "--label" flag (the first is
+        # always type:quality-gate-marker). Found by flag name, not fixed
+        # position (ga-vm20x/ga-z30sv): a hardcoded cmd[5] was correct before
+        # --include-infra was inserted at index 2, shifting every later index
+        # by one — cmd[5] then silently read the literal string "--label"
+        # instead of the real gate_lbl, so no scenario's fail_labels/
+        # raise_labels/bad_json_labels/non_list_labels ever matched and every
+        # sub-query silently fell through to the empty-success default,
+        # regardless of what the scenario intended to simulate. Mirrors the
+        # same by-flag-name fix already proven correct in this file's sibling
+        # stub, inflight-reclaim-guard.py's own _stub_bd() (Section 6, SB-7b).
+        _label_positions = [i for i, a in enumerate(cmd) if a == "--label"]
+        gate_lbl = (cmd[_label_positions[1] + 1]
+                    if len(_label_positions) >= 2 and _label_positions[1] + 1 < len(cmd)
+                    else "")
         if gate_lbl in raise_labels:
             raise RuntimeError("simulated subprocess crash for %s" % gate_lbl)
         if gate_lbl in fail_labels:
