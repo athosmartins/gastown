@@ -3866,6 +3866,34 @@ Action required: rebase $BRANCH onto current main, resolve conflicts explicitly,
       fi
     fi
   fi
+fi
+# ga-xxgej: closes the `if [ "$OVERALL_VERDICT" = "PASS" ]` opened above
+# ("attempt merge") HERE instead of letting it span the ~1100 lines down to
+# the FAIL path. Root cause of the non-termination bug this fixes: the
+# ORIGINAL single if/else let a MID-MERGE "PASS -> FAIL" mutation of
+# OVERALL_VERDICT (set by the failed_* merge-retry block above — e.g.
+# GATE_SHA_FAIL_CLASS="hold" for failed_sha_resolution) sail past a branch
+# bash had already committed to at entry; the re-check immediately below
+# (text unchanged, previously nested one level deeper inside THIS if) had no
+# else of its own, so a mid-merge FAIL fell through to nothing — no
+# set_gate_status, no bd close, no notify. Phase C's `-l gate-status:running`
+# sweep then re-discovered and re-ran the SAME already-failed gate_run every
+# ~60-90s, forever: live-confirmed, ga-j1isp/ga-7ha7g looped 9x over ~15min
+# on 2026-08-08 before the underlying transient git race happened not to
+# recur on a later attempt — pure luck, not a fix, and GATE_SHA_FAIL_CLASS
+# has exactly one consumer in this whole file (the now-newly-reachable FAIL
+# path below), so setting it was previously a complete no-op for this case.
+# Splitting into two SEQUENTIAL ifs (this one, then the re-check below) makes
+# the re-check the SOLE, always-reached decision point for PASS-terminal vs
+# FAIL-terminal handling — its own `else` (added below) now reaches the
+# EXISTING close/notify/fix-attempt-cap logic that already correctly runs
+# for the OTHER way to reach FAIL (a reviewer rejection, no merge ever
+# attempted — verdict was already FAIL before entering this function).
+# Indentation below is intentionally left as inherited from the old nesting
+# rather than reflowed to top-level: every line's CONTENT is unchanged, only
+# where the enclosing if/else/fi boundaries fall — in a file where a wrong
+# guess risks breaking gate processing city-wide, a smaller diff is a more
+# reviewable one.
 
   if [ "$OVERALL_VERDICT" = "PASS" ]; then
     # ── ga-lzj2e: durable merge-survival ledger (async shared-remote defense) ──
@@ -4211,10 +4239,12 @@ $PARTIAL_EVIDENCE" 2>/dev/null || true
       log "Gate PASSED: branch=$BRANCH tier=$TIER merge_sha=$MERGE_SHA elapsed=${ELAPSED_S}s"
     fi
     supersede_sibling_runs "$MARKER_ID" "$BRANCH" "$BEAD_ID"
-  fi
-
 else
   # ── FAIL path ─────────────────────────────────────────────────────────────
+  # ga-xxgej: now also reached when OVERALL_VERDICT became FAIL mid-merge
+  # (e.g. failed_sha_resolution after an all-PASS verdict), not only when it
+  # was FAIL from before this function's outer merge-attempt check — see the
+  # long comment at the newly-inserted `fi` above this if for the full story.
   log "Gate FAILED: $FAIL_REASONS"
 
   set_gate_status "$MARKER_ID" "failed"
