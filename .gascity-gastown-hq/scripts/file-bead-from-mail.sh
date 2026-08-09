@@ -70,6 +70,19 @@ MAIL_JSON=$(bd show "$MAIL_ID" --json 2>/dev/null) || {
     exit 1
 }
 
+# bd show fuzzy-matches an id that doesn't exactly resolve to the nearest
+# existing bead id/title substring instead of erroring (confirmed live:
+# `bd show ga-wisp-y5ywrq` — one character short of a real id — silently
+# returned a DIFFERENT real bead, ga-wisp-y5ywrq3, exit 0). A typo'd
+# --mail-id could otherwise attribute authorship to a real but WRONG
+# sender, which is worse than the original no-attribution bug this script
+# exists to fix. Refuse unless the resolved id is an exact match.
+RESOLVED_ID=$(echo "$MAIL_JSON" | jq -r '.[0].id // ""' 2>/dev/null)
+if [ "$RESOLVED_ID" != "$MAIL_ID" ]; then
+    echo "file-bead-from-mail: '$MAIL_ID' did not resolve exactly — bd fuzzy-matched it to a DIFFERENT bead ('$RESOLVED_ID'). Refusing rather than risk attributing the wrong author. Verify the id with 'bd show $MAIL_ID'." >&2
+    exit 1
+fi
+
 MAIL_TYPE=$(echo "$MAIL_JSON" | jq -r '.[0].issue_type // ""' 2>/dev/null)
 if [ "$MAIL_TYPE" != "message" ]; then
     echo "file-bead-from-mail: '$MAIL_ID' has issue_type='$MAIL_TYPE', not 'message' — refusing to treat a non-mail bead as a mail source. Pass the actual mail bead id, or drop --mail-id if this new bead has no mail origin." >&2

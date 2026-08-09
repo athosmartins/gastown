@@ -30,6 +30,13 @@ cat > "$WORKDIR/bin/bd" <<'STUB'
 case "$1" in
   show)
     id="$2"
+    if [ "$id" = "test-mail-typo" ]; then
+      # Simulates bd's real, confirmed-live fuzzy-match behavior: an id
+      # that doesn't exactly exist silently resolves to a DIFFERENT real
+      # bead (here: test-mail-good's content, under the WRONG requested id).
+      cat "$FIXTURE_DIR/test-mail-good.json"
+      exit 0
+    fi
     f="$FIXTURE_DIR/$id.json"
     if [ -f "$f" ]; then
       cat "$f"
@@ -111,6 +118,18 @@ RC=$(run_script --mail-id test-mail-good)
   || bad "zero extra args exited $RC — $(cat "$WORKDIR/stderr.log")"
 META=$(metadata_of)
 [ "$(echo "$META" | jq -r '."mail.author"')" = "oracle-wa" ] && ok "zero extra args still carries mail.author" || bad "zero extra args: metadata wrong: $META"
+
+# ── refuses a fuzzy-matched id (bd's real, confirmed-live behavior: an id
+# ── that doesn't exactly exist silently resolves to a DIFFERENT bead
+# ── instead of erroring) — this is the highest-severity case: silently
+# ── attributing authorship to the WRONG real person is worse than the
+# ── original no-attribution bug ─────────────────────────────────────────
+echo "── --mail-id is a typo that fuzzy-matches a DIFFERENT real bead ──"
+rm -f "$WORKDIR/create-call.json"
+RC=$(run_script --mail-id test-mail-typo "Title")
+[ "$RC" -ne 0 ] && ok "fuzzy-matched id is refused (nonzero exit)" || bad "fuzzy-matched id was NOT refused — WRONG AUTHOR could be attributed"
+[ -f "$WORKDIR/create-call.json" ] && bad "bd create was called despite the fuzzy-match mismatch" || ok "bd create was never called for a fuzzy-matched id"
+grep -qi "fuzzy-matched" "$WORKDIR/stderr.log" && ok "stderr explains the fuzzy-match refusal" || bad "no stderr explanation for the fuzzy-match refusal"
 
 # ── refuses a non-mail bead as a mail source ───────────────────────────────
 echo "── --mail-id points at a non-message bead ──"
